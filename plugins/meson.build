@@ -1,0 +1,6 @@
+subdir('db/postgresql')
+subdir('method/irc')
+subdir('bot/command')
+subdir('service/openweather')
+subdir('misc/math')
+subdir('misc/smallgames')
