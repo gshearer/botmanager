@@ -46,6 +46,7 @@ void console_output_unlock(void);
 #include "pool.h"
 #include "task.h"
 #include "userns.h"
+#include "version.h"
 
 #include <readline/readline.h>
 #include <readline/history.h>
@@ -63,7 +64,7 @@ static method_inst_t *con_method_inst = NULL;
 static pthread_mutex_t con_output_mutex = PTHREAD_MUTEX_INITIALIZER;
 
 // Dynamic prompt string built from attach/associate state.
-#define CON_PROMPT_SZ  128
+#define CON_PROMPT_SZ  512
 static char con_prompt[CON_PROMPT_SZ];
 
 // True while readline() is blocking for input.
@@ -79,8 +80,9 @@ static char con_history_path[CON_HISTORY_PATH_SZ];
 static uint32_t con_history_size = 1000;
 
 // Cached KV values for prompt customization.
-#define CON_PROMPT_FMT_SZ  64
-static char    con_prompt_fmt[CON_PROMPT_FMT_SZ] = "{bot}:{user}> ";
+#define CON_PROMPT_FMT_SZ  256
+static char con_prompt_fmt[CON_PROMPT_FMT_SZ] =
+    "{gray}[{cyan}{time}{gray}] {green}{bot}{gray}:{cyan}{user}{reset}> ";
 static uint8_t con_prompt_color = 1;
 
 // --- Attach/associate state ---
@@ -93,8 +95,12 @@ static char con_associated_user[USERNS_USER_SZ] = USERNS_OWNER_USER;
 
 // Forward declarations.
 static void  con_input_cb(task_t *t);
+static void  con_process_line(char *line);
+static void  con_process_pasted(char *raw);
 static void  con_dispatch(char *line);
-static void  con_build_prompt(void);
+static void   con_build_prompt(void);
+static size_t con_prompt_ansi(char **out, size_t *rem, const char *ansi);
+static size_t con_prompt_str(char **out, size_t *rem, const char *val);
 static int   con_check_shutdown(void);
 static void  con_kv_changed(const char *key, void *data);
 static void  con_load_config(void);
@@ -104,6 +110,7 @@ static void  con_cmd_attach(const cmd_ctx_t *ctx);
 static void  con_cmd_unattach(const cmd_ctx_t *ctx);
 static void  con_cmd_associate(const cmd_ctx_t *ctx);
 static void  con_cmd_unassociate(const cmd_ctx_t *ctx);
+static void  con_cmd_prompt(const cmd_ctx_t *ctx);
 static void  con_cmd_history(const cmd_ctx_t *ctx);
 static void  con_cmd_history_list(const cmd_ctx_t *ctx);
 static void  con_cmd_history_clear(const cmd_ctx_t *ctx);

@@ -129,6 +129,16 @@ void curl_register_config(void);
 // be joined (via pool_exit) before calling this.
 void curl_exit(void);
 
+// Active request iteration callback type. Invoked once per in-flight
+// request while the submit queue lock is held — must be fast.
+typedef void (*curl_iter_cb_t)(const char *url, curl_method_t method,
+    uint32_t elapsed_secs, void *data);
+
+// Iterate active and queued curl requests. Thread-safe.
+// cb: callback invoked for each request
+// data: opaque user data passed to callback
+void curl_iterate_active(curl_iter_cb_t cb, void *data);
+
 #ifdef CURL_INTERNAL
 
 #include "common.h"

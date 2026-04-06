@@ -744,14 +744,12 @@ task_cmd_show(const cmd_ctx_t *ctx)
 void
 task_register_commands(void)
 {
-  cmd_register_system("task", "tasks",
+  cmd_register("task", "tasks",
       "show tasks",
       "List all active tasks",
-      "Shows all tasks in the task system with their state, kind,\n"
-      "type, priority, run count, age, and scheduling details.\n"
-      "Tasks include persistent threads, periodic timers, deferred\n"
-      "jobs, and one-shot work items.",
-      USERNS_GROUP_ADMIN, 100, CMD_SCOPE_ANY, METHOD_T_ANY, task_cmd_show, NULL, "show", "t", NULL, 0);
+      NULL,
+      USERNS_GROUP_ADMIN, 100, CMD_SCOPE_ANY, METHOD_T_ANY,
+      task_cmd_show, NULL, "show", "t", NULL, 0);
 }
 
 // Initialize the task subsystem.

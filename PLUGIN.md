@@ -392,12 +392,10 @@ static bool
 np_init(void)
 {
   if(cmd_register("newplugin", "hello",
-      "hello",
       "Say hello",
-      NULL,
-      USERNS_GROUP_EVERYONE, 0, CMD_SCOPE_ANY, np_cmd_hello, NULL,
-      NULL, NULL,
-      NULL, 0) != SUCCESS)
+      "hello",
+      USERNS_GROUP_EVERYONE, 0, CMD_SCOPE_ANY, METHOD_T_ANY,
+      np_cmd_hello, NULL, NULL, NULL, NULL, 0) != SUCCESS)
     return(FAIL);
 
   clam(CLAM_INFO, NP_CTX, "newplugin initialized");
@@ -454,7 +452,7 @@ subdir('service/newplugin')
 4. Create `meson.build` (shared_library, include dirs, dependencies)
 5. Add `subdir('<type>/<kind>')` to `plugins/meson.build`
 6. Build with `ninja -C build` and verify zero warnings from your files
-7. Test: start botmanager, verify plugin loads and commands appear in `!help`
+7. Test: start botmanager, verify plugin loads and commands appear in `/help`
 
 ## Key Files Reference
 

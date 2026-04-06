@@ -552,3 +552,32 @@ db_get_pool_stats(db_pool_stats_t *out)
   out->queries = __atomic_load_n(&db_stat_queries, __ATOMIC_RELAXED);
   out->errors  = __atomic_load_n(&db_stat_errors, __ATOMIC_RELAXED);
 }
+
+// Iterate database connection pool slots. For each slot that has an
+// active connection (handle != NULL), the callback receives the slot
+// index, state, per-slot query count, creation time, and last use time.
+// cb: iteration callback (must be fast — slot mutex is held briefly)
+// data: opaque user data forwarded to callback
+void
+db_iterate_pool(db_pool_iter_cb_t cb, void *data)
+{
+  if(cb == NULL || pool == NULL)
+    return;
+
+  for(uint16_t i = 0; i < db_pcfg.max_conns; i++)
+  {
+    db_conn_t *c = &pool[i];
+
+    if(pthread_mutex_trylock(&c->mutex) != 0)
+    {
+      // Cannot lock — likely active. Report what we can.
+      cb(i, DB_CONN_ACTIVE, 0, 0, 0, data);
+      continue;
+    }
+
+    if(c->handle != NULL)
+      cb(i, c->state, c->queries, c->created, c->last_used, data);
+
+    pthread_mutex_unlock(&c->mutex);
+  }
+}

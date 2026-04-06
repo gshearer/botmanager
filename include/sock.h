@@ -4,6 +4,7 @@
 #include <stdbool.h>
 #include <stddef.h>
 #include <stdint.h>
+#include <time.h>
 
 // Opaque session handle.
 typedef struct sock_session sock_session_t;
@@ -129,6 +130,21 @@ void sock_register_config(void);
 // (via pool_exit) before calling this.
 void sock_exit(void);
 
+// returns: human-readable name of a socket state
+// state: internal state enum value (cast from sock_state_t)
+const char *sock_state_name(int state);
+
+// Session iteration callback type. Invoked once per active session
+// while the session list lock is held — must be fast.
+typedef void (*sock_iter_cb_t)(uint32_t id, sock_type_t type, int state,
+    const char *remote, uint64_t bytes_in, uint64_t bytes_out,
+    bool tls, time_t connected_at, void *data);
+
+// Iterate all active socket sessions. Thread-safe.
+// cb: callback invoked for each session
+// data: opaque user data passed to callback
+void sock_iterate(sock_iter_cb_t cb, void *data);
+
 #ifdef SOCK_INTERNAL
 
 #include "common.h"
@@ -219,6 +235,7 @@ struct sock_session
 
   // Timeouts and activity tracking.
   time_t              connect_started;
+  time_t              connected_at;
   time_t              last_activity;
 
   // Statistics.

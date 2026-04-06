@@ -22,6 +22,9 @@
 #include "util.h"
 #include "version.h"
 
+// Program start timestamp (global, extern declared in main.h).
+time_t bm_start_time = 0;
+
 // print the version string to stdout
 static void
 print_version(void)
@@ -71,7 +74,7 @@ main(int argc, char *argv[])
 
   // --- 2. Initialize core subsystems (DESIGN.md §Startup) ---
 
-  time_t start_time = time(NULL);
+  bm_start_time = time(NULL);
 
   // CLAM first — logging must be available for everything else.
   clam_init();
@@ -286,7 +289,7 @@ main(int argc, char *argv[])
 
   // Console method registration — must be after method_init and cmd_init
   // so console can register as a method and the input reader can dispatch.
-  console_register_method(start_time);
+  console_register_method(bm_start_time);
 
   // Botmanctl method registration — Unix domain socket for programmatic
   // operator control. Must be after method_init and cmd_init.
@@ -414,7 +417,7 @@ shutdown:
 
   // Log uptime.
   {
-    time_t uptime = time(NULL) - start_time;
+    time_t uptime = time(NULL) - bm_start_time;
 
     clam(CLAM_INFO, "main", "shutdown complete (uptime: %lum %lus)",
         (unsigned long)(uptime / 60), (unsigned long)(uptime % 60));

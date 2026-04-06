@@ -283,10 +283,11 @@ void method_iterate_drivers(method_driver_iter_cb_t cb, void *data);
 // msg_in: total inbound messages delivered
 // msg_out: total outbound messages sent
 // sub_count: current subscriber count
+// connected_at: timestamp when instance became AVAILABLE (0 if not)
 // data: opaque user data
 typedef void (*method_inst_iter_cb_t)(const char *name, const char *kind,
     method_state_t state, uint64_t msg_in, uint64_t msg_out,
-    uint32_t sub_count, void *data);
+    uint32_t sub_count, time_t connected_at, void *data);
 
 // Iterate all registered method instances. Locks method_mutex for
 // the duration of the iteration.
@@ -343,6 +344,7 @@ struct method_inst
   uint32_t                sub_count;
   uint64_t                msg_in;    // total messages delivered
   uint64_t                msg_out;   // total messages sent
+  time_t                  connected_at; // timestamp of METHOD_AVAILABLE, 0 if not
   struct method_inst     *next;
 };
 

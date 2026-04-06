@@ -254,6 +254,7 @@ sock_tls_handshake(sock_session_t *s)
     // Handshake complete.
     s->state = SOCK_STATE_CONNECTED;
     s->last_activity = time(NULL);
+    s->connected_at  = s->last_activity;
 
     sock_worker_t *w = &sock_workers[s->worker_id];
     sock_epoll_rearm(w, s, false);
@@ -335,6 +336,7 @@ sock_unix_connect_task(task_t *t)
     s->fd = fd;
     s->state = SOCK_STATE_CONNECTED;
     s->last_activity = time(NULL);
+    s->connected_at  = s->last_activity;
 
     // Register with epoll.
     sock_worker_t *w = &sock_workers[s->worker_id];
@@ -495,6 +497,7 @@ sock_resolve_done(const resolve_result_t *result)
     {
       s->state = SOCK_STATE_CONNECTED;
       s->last_activity = time(NULL);
+      s->connected_at  = s->last_activity;
 
       clam(CLAM_INFO, "sock", "[%s] connected to %s:%u",
           s->name, s->host, s->port);
@@ -747,6 +750,7 @@ sock_epoll_task(task_t *t)
           {
             s->state = SOCK_STATE_CONNECTED;
             s->last_activity = time(NULL);
+            s->connected_at  = s->last_activity;
             sock_epoll_rearm(w, s, false);
 
             clam(CLAM_INFO, "sock", "[%s] connected to %s:%u",
@@ -1368,6 +1372,59 @@ sock_event_name(sock_event_type_t type)
     case SOCK_EVENT_ERROR:      return("error");
     default:                    return("unknown");
   }
+}
+
+// returns: human-readable name for an internal socket state
+// state: sock_state_t cast to int (public API uses int to avoid
+//        exposing the internal enum)
+const char *
+sock_state_name(int state)
+{
+  switch((sock_state_t)state)
+  {
+    case SOCK_STATE_CREATED:       return("created");
+    case SOCK_STATE_RESOLVING:     return("resolving");
+    case SOCK_STATE_CONNECTING:    return("connecting");
+    case SOCK_STATE_CONNECTED:     return("connected");
+    case SOCK_STATE_TLS_HANDSHAKE: return("tls_handshake");
+    case SOCK_STATE_CLOSING:       return("closing");
+    case SOCK_STATE_CLOSED:        return("closed");
+    default:                       return("unknown");
+  }
+}
+
+// Iterate all active socket sessions under the session list lock.
+// Each session's id, type, state, remote address, byte counters,
+// TLS flag, and connection timestamp are passed to the callback.
+// cb: iteration callback (must be fast — lock is held)
+// data: opaque user data forwarded to callback
+void
+sock_iterate(sock_iter_cb_t cb, void *data)
+{
+  if(cb == NULL)
+    return;
+
+  pthread_mutex_lock(&sock_mutex);
+
+  uint32_t id = 0;
+
+  for(sock_session_t *s = sock_list; s != NULL; s = s->next)
+  {
+    char remote[SOCK_HOST_SZ + 16];
+
+    if(s->type == SOCK_UNIX)
+      snprintf(remote, sizeof(remote), "%s", s->path);
+    else if(s->host[0] != '\0')
+      snprintf(remote, sizeof(remote), "%s:%u", s->host, s->port);
+    else
+      remote[0] = '\0';
+
+    cb(id++, s->type, (int)s->state, remote,
+        s->bytes_in, s->bytes_out, s->tls_enabled,
+        s->connected_at, data);
+  }
+
+  pthread_mutex_unlock(&sock_mutex);
 }
 
 // -----------------------------------------------------------------------

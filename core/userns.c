@@ -17,6 +17,12 @@ pthread_mutex_t  userns_mutex;
 uint32_t         userns_total = 0;
 bool             userns_ready = false;
 
+// Lifetime counters for statistics (atomic, no lock needed).
+uint64_t userns_stat_auth_attempts = 0;
+uint64_t userns_stat_auth_failures = 0;
+uint64_t userns_stat_mfa_matches   = 0;
+uint64_t userns_stat_discoveries   = 0;
+
 // -----------------------------------------------------------------------
 // Validate a namespace name: alphanumeric only, 1..USERNS_NAME_SZ-1.
 // returns: SUCCESS or FAIL
@@ -626,14 +632,56 @@ load_all(void)
 // Public API
 // -----------------------------------------------------------------------
 
+// Get user namespace subsystem statistics (thread-safe snapshot).
+// out: destination for the snapshot
+void
+userns_get_stats(userns_stats_t *out)
+{
+  if(out == NULL)
+    return;
+
+  pthread_mutex_lock(&userns_mutex);
+  out->namespaces = userns_total;
+  pthread_mutex_unlock(&userns_mutex);
+
+  // Count total users via DB (lightweight aggregate query).
+  out->users = 0;
+  db_result_t *r = db_result_alloc();
+
+  if(db_query("SELECT COUNT(*) FROM userns_user", r) == SUCCESS
+      && r->rows > 0)
+  {
+    const char *val = db_result_get(r, 0, 0);
+
+    if(val != NULL)
+      out->users = (uint32_t)strtoul(val, NULL, 10);
+  }
+
+  db_result_free(r);
+
+  out->auth_attempts = __atomic_load_n(&userns_stat_auth_attempts,
+      __ATOMIC_RELAXED);
+  out->auth_failures = __atomic_load_n(&userns_stat_auth_failures,
+      __ATOMIC_RELAXED);
+  out->mfa_matches   = __atomic_load_n(&userns_stat_mfa_matches,
+      __ATOMIC_RELAXED);
+  out->discoveries   = __atomic_load_n(&userns_stat_discoveries,
+      __ATOMIC_RELAXED);
+}
+
 // Initialize the user namespace subsystem.
 // returns: SUCCESS or FAIL
 bool
 userns_init(void)
 {
   pthread_mutex_init(&userns_mutex, NULL);
-  userns_list = NULL;
+  userns_list  = NULL;
   userns_total = 0;
+
+  userns_stat_auth_attempts = 0;
+  userns_stat_auth_failures = 0;
+  userns_stat_mfa_matches   = 0;
+  userns_stat_discoveries   = 0;
 
   if(ensure_tables() != SUCCESS)
   {
@@ -1229,6 +1277,8 @@ userns_auth_t
 userns_auth(const userns_t *ns, const char *username,
     const char *password, const char *method_ctx)
 {
+  __atomic_add_fetch(&userns_stat_auth_attempts, 1, __ATOMIC_RELAXED);
+
   if(!userns_ready || ns == NULL || username == NULL || password == NULL)
     return(USERNS_AUTH_ERR);
 
@@ -1260,6 +1310,7 @@ userns_auth(const userns_t *ns, const char *username,
   if(r->rows == 0)
   {
     db_result_free(r);
+    __atomic_add_fetch(&userns_stat_auth_failures, 1, __ATOMIC_RELAXED);
     clam(CLAM_DEBUG, "userns_auth",
         "user '%s' not found in '%s'", username, ns->name);
     return(USERNS_AUTH_BAD_USER);
@@ -1287,6 +1338,7 @@ userns_auth(const userns_t *ns, const char *username,
 
   if(match != SUCCESS)
   {
+    __atomic_add_fetch(&userns_stat_auth_failures, 1, __ATOMIC_RELAXED);
     clam(CLAM_DEBUG, "userns_auth",
         "password mismatch for '%s' in '%s'", username, ns->name);
     return(USERNS_AUTH_BAD_PASS);

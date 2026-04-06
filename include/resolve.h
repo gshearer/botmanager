@@ -126,6 +126,21 @@ const char *resolve_type_name(resolve_type_t type);
 // out: destination for parsed type
 bool resolve_type_parse(const char *str, resolve_type_t *out);
 
+// Number of distinct resolve_type_t values for per-type counters.
+#define RESOLVE_TYPE_COUNT  9
+
+// Resolver subsystem statistics.
+typedef struct
+{
+  uint64_t queries;                       // lifetime total lookups
+  uint64_t failures;                      // lifetime lookup failures
+  uint64_t by_type[RESOLVE_TYPE_COUNT];   // queries per record type (indexed by resolve_type_t)
+} resolve_stats_t;
+
+// Get resolver subsystem statistics (thread-safe snapshot).
+// out: destination for the snapshot
+void resolve_get_stats(resolve_stats_t *out);
+
 // Initialize the resolver subsystem. Call after task_init()/pool_init().
 void resolve_init(void);
 
@@ -192,6 +207,11 @@ static pthread_mutex_t     resolve_req_lock;
 static uint32_t            resolve_pending  = 0;
 static resolve_cfg_t       resolve_cfg;
 
+// Lifetime counters for statistics (atomic, no lock needed).
+static uint64_t            resolve_stat_queries  = 0;
+static uint64_t            resolve_stat_failures = 0;
+static uint64_t            resolve_stat_by_type[RESOLVE_TYPE_COUNT] = {0};
+
 // Maximum records accumulated across parallel queries for the
 // !resolve user command.
 #define RESOLVE_CMD_MAX_RECORDS  128
@@ -224,14 +244,8 @@ typedef struct resolve_cmd_request
 static resolve_cmd_request_t *resolve_cmd_free = NULL;
 static pthread_mutex_t        resolve_cmd_free_mu;
 
-// Arg descriptor for the !resolve command.
+// Validates a resolve target (hostname or IP address).
 static bool resolve_validate_target(const char *str);
-static bool resolve_validate_verbose(const char *str);
-
-static const cmd_arg_desc_t resolve_cmd_ad[] = {
-  { "target",  CMD_ARG_CUSTOM, CMD_ARG_REQUIRED, 0, resolve_validate_target },
-  { "-v",      CMD_ARG_CUSTOM, CMD_ARG_OPTIONAL, 0, resolve_validate_verbose },
-};
 
 #endif // RESOLVE_INTERNAL
 

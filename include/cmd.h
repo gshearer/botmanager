@@ -11,8 +11,6 @@
 #define CMD_NAME_SZ      32
 #define CMD_MODULE_SZ    32
 #define CMD_USAGE_SZ     128
-#define CMD_HELP_SZ      256
-#define CMD_HELP_LONG_SZ 1024
 #define CMD_PREFIX_SZ    8
 #define CMD_MAX_ARGS     8
 #define CMD_ARG_SZ       256
@@ -87,6 +85,7 @@ typedef struct
   const char          *args;      // raw arguments after command name
   const char          *username;  // authenticated username, or NULL
   const cmd_args_t    *parsed;    // pre-parsed args, or NULL if no spec
+  void                *data;      // opaque callback data from registration
 } cmd_ctx_t;
 
 // Command callback. Invoked on a worker thread via the task system.
@@ -94,23 +93,28 @@ typedef struct
 typedef void (*cmd_cb_t)(const cmd_ctx_t *ctx);
 
 // -----------------------------------------------------------------------
-// Global command registration (called by plugins)
+// Command registration
 // -----------------------------------------------------------------------
 
-// Register a command globally. Commands must be enabled per bot instance
-// before they can be dispatched (unless system or built-in).
+// Register a command in the unified command tree.
+//
+// All commands — show views, set handlers, actions — use this single
+// registration function. Tree position is determined by parent_path:
+//   NULL       — root-level command
+//   "bot"      — child of root command "bot"
+//   "irc/network" — child of "network" under root command "irc"
 //
 // Every command has a default group and permission level. To use the
 // command, a user must be a member of the group with at least the
 // specified level. Unauthenticated users can only access commands in
 // the "everyone" group at level 0.
 //
-// returns: SUCCESS or FAIL (duplicate name, invalid args)
+// returns: SUCCESS or FAIL (duplicate name, invalid args, parent not found)
 // module: name of the providing module (e.g., "admin", "irc", "command")
-// name: command name (case-insensitive, e.g., "weather")
-// usage: brief one-line usage syntax (e.g., "weather <zipcode>")
-// help: brief description (e.g., "Get current weather for a location")
-// help_long: multi-line verbose help text (may be NULL)
+// name: command name (case-insensitive, e.g., "bot")
+// usage: single-line syntax string (static, e.g., "bot add <name> <kind>")
+// description: single-line human-friendly description (static, for table)
+// help_long: multi-line verbose help text (static, NULL if none)
 // group: default group name (e.g., "everyone", "admin", "user")
 // level: default minimum group privilege level (uint16_t)
 // scope: CMD_SCOPE_ANY, CMD_SCOPE_PRIVATE, or CMD_SCOPE_PUBLIC
@@ -118,98 +122,41 @@ typedef void (*cmd_cb_t)(const cmd_ctx_t *ctx);
 //          (METHOD_T_ANY for all, or e.g. METHOD_T_CONSOLE | METHOD_T_IRC)
 // cb: command callback
 // data: opaque data passed to callback via ctx
-// parent_name: name of parent command for subcommand registration
-//              (NULL for root-level commands)
+// parent_path: slash-delimited path to parent (NULL for root)
 // abbrev: optional abbreviation for the command (NULL for none).
-//         Must be unique across all names and abbreviations.
+//         Must be unique among siblings.
 // arg_desc: array of argument descriptors (NULL = no validation spec)
 // arg_count: number of entries in arg_desc (0 = no validation spec)
 bool cmd_register(const char *module, const char *name,
-    const char *usage, const char *help,
-    const char *help_long, const char *group, uint16_t level,
+    const char *usage, const char *description,
+    const char *help_long,
+    const char *group, uint16_t level,
     cmd_scope_t scope, method_type_t methods, cmd_cb_t cb, void *data,
-    const char *parent_name, const char *abbrev,
+    const char *parent_path, const char *abbrev,
     const cmd_arg_desc_t *arg_desc, uint8_t arg_count);
 
-// Register a system-level command. System commands are always dispatchable
-// (like built-ins) without needing per-bot enablement. They are accessible
-// from the console and from any method if the user has sufficient privileges.
-// returns: SUCCESS or FAIL (duplicate name, invalid args)
-// module: name of the providing module (e.g., "admin", "irc")
-// name: command name (e.g., "set", "status")
-// usage: brief one-line usage syntax (e.g., "set <key> <value>")
-// help: brief description
-// help_long: multi-line verbose help text (may be NULL)
-// group: default group name
-// level: default minimum group privilege level (uint16_t)
-// scope: CMD_SCOPE_ANY, CMD_SCOPE_PRIVATE, or CMD_SCOPE_PUBLIC
-// methods: bitmask of method types this command is visible on
-// cb: command callback
-// data: opaque data passed to callback via ctx
-// parent_name: name of parent command for subcommand registration
-//              (NULL for root-level commands)
-// abbrev: optional abbreviation for the command (NULL for none).
-//         Must be unique across all names and abbreviations.
-// arg_desc: array of argument descriptors (NULL = no validation spec)
-// arg_count: number of entries in arg_desc (0 = no validation spec)
-bool cmd_register_system(const char *module, const char *name,
-    const char *usage, const char *help,
-    const char *help_long, const char *group, uint16_t level,
-    cmd_scope_t scope, method_type_t methods, cmd_cb_t cb, void *data,
-    const char *parent_name, const char *abbrev,
-    const cmd_arg_desc_t *arg_desc, uint8_t arg_count);
-
-// Unregister a command. Automatically disables it on all bot instances.
+// Unregister a command.
 // returns: SUCCESS or FAIL (not found)
 // name: command name
 bool cmd_unregister(const char *name);
 
-// Find a registered command by name.
+// Find a registered command by name (root-level lookup).
 // returns: command definition, or NULL if not found
 // name: command name
 const cmd_def_t *cmd_find(const char *name);
+
+// Find a child command by name under a specific parent.
+// returns: child definition, or NULL if not found
+// parent: parent command to search under
+// name: child command name or abbreviation
+const cmd_def_t *cmd_find_child(const cmd_def_t *parent, const char *name);
 
 // Get the number of globally registered commands.
 // returns: command count
 uint32_t cmd_count(void);
 
-// -----------------------------------------------------------------------
-// Per-bot instance command management
-// -----------------------------------------------------------------------
-
-// Enable a registered command on a bot instance. The command must be
-// registered globally before it can be enabled.
-// returns: SUCCESS or FAIL (not found, already enabled)
-// inst: bot instance
-// cmd_name: command name to enable
-bool cmd_enable(bot_inst_t *inst, const char *cmd_name);
-
-// Disable a command on a bot instance.
-// returns: SUCCESS or FAIL (not enabled)
-// inst: bot instance
-// cmd_name: command name to disable
-bool cmd_disable(bot_inst_t *inst, const char *cmd_name);
-
-// Check if a command is enabled on a bot instance.
-// returns: true if enabled (or if the command is built-in)
-// inst: bot instance
-// cmd_name: command name
-bool cmd_is_enabled(const bot_inst_t *inst, const char *cmd_name);
-
-// Get the number of commands enabled on a bot instance (excluding
-// built-in commands).
-// returns: enabled command count
-// inst: bot instance
-uint32_t cmd_enabled_count(const bot_inst_t *inst);
-
-// Enable all registered user commands (non-builtin, non-system,
-// top-level) on a bot instance.
-// returns: number of commands enabled
-// inst: bot instance
-uint32_t cmd_enable_all(bot_inst_t *inst);
-
-// Clean up all per-bot command state. Called when a bot instance is
-// destroyed. Frees all bindings for this instance.
+// Clean up per-bot command state (prefix set). Called when a bot
+// instance is destroyed.
 // inst: bot instance
 void cmd_bot_cleanup(bot_inst_t *inst);
 
@@ -233,13 +180,12 @@ const char *cmd_get_prefix(const bot_inst_t *inst);
 // -----------------------------------------------------------------------
 
 // Dispatch a message as a potential command for a bot instance. Parses
-// the command prefix and name from msg->text, checks if the command is
-// enabled (or built-in or system), verifies permissions, and submits a
-// task to the work queue for non-blocking execution.
+// the command prefix and name from msg->text, verifies permissions, and
+// submits a task to the work queue for non-blocking execution.
 //
 // returns: SUCCESS if a command was dispatched, FAIL if:
 //          - message does not start with the command prefix
-//          - command not found or not enabled
+//          - command not found
 //          - permission denied
 //          - task submission failed
 // inst: bot instance
@@ -247,14 +193,14 @@ const char *cmd_get_prefix(const bot_inst_t *inst);
 bool cmd_dispatch(bot_inst_t *inst, const method_msg_t *msg);
 
 // Dispatch a system command directly (used by the console). The command
-// is executed synchronously as the @owner identity. System and built-in
-// commands are dispatchable; bot-specific commands are not.
+// is executed synchronously as the @owner identity. Any command in the
+// tree is dispatchable; access is purely permission-based.
 // returns: SUCCESS if command was found and executed, FAIL otherwise
 // cmd_name: command name (without prefix)
 // args: argument string (may be empty)
 bool cmd_dispatch_system(const char *cmd_name, const char *args);
 
-// Dispatch a system command as @owner on an arbitrary method instance.
+// Dispatch a command as @owner on an arbitrary method instance.
 // Identical to cmd_dispatch_system() but routes replies through the
 // specified method instance instead of the console.
 // returns: SUCCESS if command was found and executed, FAIL otherwise
@@ -284,16 +230,16 @@ bool cmd_reply(const cmd_ctx_t *ctx, const char *text);
 // returns: module string, or NULL if def is NULL
 const char *cmd_get_module(const cmd_def_t *def);
 
-// Get the usage string for a command.
+// Get the single-line description for a command.
+// returns: description string, or NULL if def is NULL
+const char *cmd_get_description(const cmd_def_t *def);
+
+// Get the single-line usage/syntax for a command.
 // returns: usage string, or NULL if def is NULL
 const char *cmd_get_usage(const cmd_def_t *def);
 
-// Get the brief help text for a command.
-// returns: help string, or NULL if def is NULL
-const char *cmd_get_help(const cmd_def_t *def);
-
-// Get the verbose help text for a command.
-// returns: help_long string (empty if not set), or NULL if def is NULL
+// Get the multi-line verbose help text for a command.
+// returns: help_long string, or NULL if def is NULL or not set
 const char *cmd_get_help_long(const cmd_def_t *def);
 
 // Get the name for a command.
@@ -341,15 +287,10 @@ cmd_scope_t cmd_get_scope(const cmd_def_t *def);
 // data: opaque user data
 typedef void (*cmd_iter_cb_t)(const cmd_def_t *def, void *data);
 
-// Iterate top-level system commands (skips subcommands).
-// cb: callback invoked for each system command
+// Iterate top-level root commands (parent == NULL).
+// cb: callback invoked for each root command
 // data: opaque user data passed to cb
-void cmd_iterate_system(cmd_iter_cb_t cb, void *data);
-
-// Iterate all system commands including subcommands.
-// cb: callback invoked for each system command
-// data: opaque user data passed to cb
-void cmd_iterate_system_all(cmd_iter_cb_t cb, void *data);
+void cmd_iterate_root(cmd_iter_cb_t cb, void *data);
 
 // Iterate children (subcommands) of a specific command.
 // parent: parent command definition
@@ -357,14 +298,6 @@ void cmd_iterate_system_all(cmd_iter_cb_t cb, void *data);
 // data: opaque user data passed to cb
 void cmd_iterate_children(const cmd_def_t *parent, cmd_iter_cb_t cb,
     void *data);
-
-// Iterate top-level commands enabled on a bot instance.
-// Includes built-in commands (help, version) and explicitly
-// enabled plugin commands. Skips subcommands.
-// inst: bot instance
-// cb: callback invoked for each enabled command
-// data: opaque user data passed to cb
-void cmd_iterate_bot(const bot_inst_t *inst, cmd_iter_cb_t cb, void *data);
 
 // -----------------------------------------------------------------------
 // Console method integration
@@ -379,9 +312,21 @@ void cmd_set_console_inst(method_inst_t *inst);
 // Subsystem lifecycle
 // -----------------------------------------------------------------------
 
-// Initialize the command subsystem. Registers built-in commands
-// (help, version). Must be called after bot_init().
+// Initialize the command subsystem. Registers the built-in root
+// commands (/help, /show, /set). Must be called after bot_init().
 void cmd_init(void);
+
+// Command subsystem statistics.
+typedef struct
+{
+  uint32_t registered;        // total command definitions
+  uint64_t dispatches;        // lifetime successful dispatches
+  uint64_t denials;           // lifetime permission/method-type rejections
+} cmd_stats_t;
+
+// Get command subsystem statistics (thread-safe snapshot).
+// out: destination for the snapshot
+void cmd_get_stats(cmd_stats_t *out);
 
 // Get lifetime command dispatch counters (thread-safe, atomic reads).
 // dispatches: output for successful dispatch count (may be NULL)
@@ -389,7 +334,7 @@ void cmd_init(void);
 void cmd_get_dispatch_stats(uint64_t *dispatches, uint64_t *denials);
 
 // Shut down the command subsystem. Unregisters all commands and frees
-// all per-bot bindings.
+// all per-bot prefix sets.
 void cmd_exit(void);
 
 // -----------------------------------------------------------------------
@@ -413,16 +358,14 @@ struct cmd_def
   char        module[CMD_MODULE_SZ];    // providing module name
   char        name[CMD_NAME_SZ];
   char        abbrev[CMD_NAME_SZ];      // abbreviation (may be empty)
-  char        usage[CMD_USAGE_SZ];
-  char        help[CMD_HELP_SZ];
-  char        help_long[CMD_HELP_LONG_SZ];
+  const char *usage;                    // single-line syntax (static)
+  const char *description;              // single-line description (static)
+  const char *help_long;                // multi-line verbose help (static, may be NULL)
   char        group[USERNS_GROUP_SZ];   // required group
   uint16_t    level;                    // minimum group level
   cmd_scope_t scope;                    // public/private visibility
   cmd_cb_t    cb;
   void       *data;                     // opaque callback data
-  bool        builtin;                  // true for help/version
-  bool        system;                   // true for system-level commands
   method_type_t methods;                // bitmask of method types visible on
   const cmd_arg_desc_t *arg_desc;       // argument descriptors (NULL = none)
   uint8_t     arg_count;                // number of entries in arg_desc
@@ -432,20 +375,11 @@ struct cmd_def
   cmd_def_t  *next;                     // next in global list
 };
 
-// Per-bot enabled command entry.
-typedef struct cmd_binding
-{
-  char                name[CMD_NAME_SZ];   // references a cmd_def by name
-  struct cmd_binding *next;
-} cmd_binding_t;
-
-// Per-bot command set: prefix + enabled commands.
+// Per-bot command set: prefix for the bot instance.
 typedef struct cmd_set
 {
   const bot_inst_t  *inst;
   char               prefix[CMD_PREFIX_SZ];
-  cmd_binding_t     *bindings;
-  uint32_t           count;
   struct cmd_set    *next;
 } cmd_set_t;
 
@@ -458,7 +392,7 @@ typedef struct
   method_msg_t   msg;                        // copy of the message
   char           args[METHOD_TEXT_SZ];        // parsed arguments
   char           username[USERNS_USER_SZ];   // authenticated username
-  char           usage[CMD_USAGE_SZ];        // usage string for error replies
+  const char    *usage;                      // usage string (static, not copied)
   const cmd_arg_desc_t *arg_desc;            // argument descriptors (NULL = none)
   uint8_t        arg_count;                  // number of arg descriptors
   char           arg_bufs[CMD_MAX_ARGS][CMD_ARG_SZ]; // token storage
@@ -475,8 +409,6 @@ static bool             cmd_ready        = false;
 static method_inst_t   *cmd_console_inst = NULL;
 
 // Freelists.
-static cmd_binding_t   *cmd_bind_freelist    = NULL;
-static uint32_t         cmd_bind_free_count  = 0;
 static cmd_set_t       *cmd_set_freelist     = NULL;
 static uint32_t         cmd_set_free_count   = 0;
 

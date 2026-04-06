@@ -796,6 +796,26 @@ curl_get_stats(curl_stats_t *out)
   pthread_mutex_unlock(&curl_submit_mutex);
 }
 
+// Iterate queued curl requests. Active requests are managed by the
+// multi handle and not directly enumerable from outside the multi
+// loop thread, so only queued requests are yielded individually.
+// Use curl_get_stats() for aggregate active/queued counts.
+// cb: iteration callback (must be fast — submit queue lock is held)
+// data: opaque user data forwarded to callback
+void
+curl_iterate_active(curl_iter_cb_t cb, void *data)
+{
+  if(cb == NULL)
+    return;
+
+  pthread_mutex_lock(&curl_submit_mutex);
+
+  for(curl_request_t *r = curl_submit_head; r != NULL; r = r->next)
+    cb(r->url, r->method, 0, data);
+
+  pthread_mutex_unlock(&curl_submit_mutex);
+}
+
 // Return the human-readable name for an HTTP method enum value.
 // returns: static string ("GET", "POST", etc.) or "UNKNOWN"
 // method: method enum value

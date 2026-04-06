@@ -24,10 +24,12 @@ void admin_exit(void);
 #include "cmd.h"
 #include "db.h"
 #include "kv.h"
+#include "main.h"
 #include "mem.h"
 #include "method.h"
 #include "plugin.h"
 #include "pool.h"
+#include "resolve.h"
 #include "sock.h"
 #include "task.h"
 #include "userns.h"
@@ -50,6 +52,27 @@ typedef struct
   const cmd_ctx_t *ctx;
   uint32_t         count;
 } methodlist_state_t;
+
+// Iteration state for /show sockets.
+typedef struct
+{
+  const cmd_ctx_t *ctx;
+  uint32_t         count;
+} socklist_state_t;
+
+// Iteration state for /show curl.
+typedef struct
+{
+  const cmd_ctx_t *ctx;
+  uint32_t         count;
+} curllist_state_t;
+
+// Iteration state for /show db.
+typedef struct
+{
+  const cmd_ctx_t *ctx;
+  uint32_t         count;
+} dblist_state_t;
 
 // Single KV entry for /show output.
 typedef struct
@@ -94,35 +117,18 @@ typedef struct
   uint32_t         count;
 } mfa_list_state_t;
 
-// Collected command entry for the help table.
+// Iteration state for /show sessions.
 typedef struct
 {
-  char     name[CMD_NAME_SZ];
-  char     abbrev[CMD_NAME_SZ];
-  char     module[CMD_MODULE_SZ];
-  char     help[CMD_HELP_SZ];
-  char     group[USERNS_GROUP_SZ];
-  uint16_t level;
-} help_cmd_entry_t;
-
-// Maximum commands shown in the help table.
-#define HELP_CMD_MAX 128
-
-typedef struct
-{
-  help_cmd_entry_t entries[HELP_CMD_MAX];
+  const cmd_ctx_t *ctx;
   uint32_t         count;
-  method_type_t    caller_type;   // filter: only collect matching commands
-} help_cmd_state_t;
+} sessionlist_state_t;
 
 // Register user/group/MFA management commands. Called from admin_init().
 void admin_register_user_commands(void);
 
 // Register bot management commands and /quit. Called from admin_init().
 void admin_register_bot_commands(void);
-
-// Register help commands. Called from admin_init().
-void admin_register_help_commands(void);
 
 #endif // ADMIN_INTERNAL
 

@@ -3,6 +3,7 @@
 
 #include <stdbool.h>
 #include <stdint.h>
+#include <time.h>
 
 #define DB_ERROR_SZ  256
 
@@ -155,6 +156,16 @@ char *db_escape(const char *input);
 // Get pool statistics (thread-safe snapshot).
 // out: destination for the snapshot
 void db_get_pool_stats(db_pool_stats_t *out);
+
+// Pool slot iteration callback type. Invoked once per pool slot
+// while the slot's mutex is held — must be fast.
+typedef void (*db_pool_iter_cb_t)(uint16_t slot, db_conn_state_t state,
+    uint64_t queries, time_t created, time_t last_used, void *data);
+
+// Iterate database connection pool slots. Thread-safe.
+// cb: callback invoked for each pool slot that has been used
+// data: opaque user data passed to callback
+void db_iterate_pool(db_pool_iter_cb_t cb, void *data);
 
 #ifdef DB_INTERNAL
 

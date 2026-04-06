@@ -97,19 +97,7 @@ math_init(void)
   if(cmd_register(MATH_CTX, "math",
       "math <expression>",
       "Evaluate a mathematical expression",
-      "Evaluates the given mathematical expression and returns\n"
-      "the result. Supports standard arithmetic operators\n"
-      "(+, -, *, /, ^, %), parentheses, and built-in functions:\n"
-      "\n"
-      "  abs, acos, asin, atan, atan2, ceil, cos, cosh, e, exp,\n"
-      "  fac, floor, ln, log, log10, ncr, npr, pi, pow, sin,\n"
-      "  sinh, sqrt, tan, tanh\n"
-      "\n"
-      "Examples:\n"
-      "  !math 2 + 3 * 4\n"
-      "  !math sqrt(144)\n"
-      "  !math pi * 2^8\n"
-      "  !math ncr(10, 3)",
+      NULL,
       "everyone", 0, CMD_SCOPE_ANY, METHOD_T_ANY, math_cmd, NULL, NULL, "ma",
       math_ad, 1) != SUCCESS)
     return(FAIL);

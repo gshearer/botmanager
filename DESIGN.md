@@ -93,7 +93,17 @@ Several subsystems already follow the `_get_stats()` pattern: `mem_get_stats()`,
 
 ## Method Type Registry
 
-Each method type (console, botmanctl, irc, etc.) has a human-friendly description string registered in a static table in `method.c`. This table is used by `method_type_bit()`, `method_type_desc()`, and `method_iterate_types()` to map between driver names, type bitmasks, and descriptions. The `/show methods` command displays all known method types with their descriptions and lists active method instances with per-instance statistics (messages in/out, subscriber count, state).
+Each method type (console, botmanctl, irc, etc.) has a human-friendly description string registered in a static table in `method.c`. This table is used by `method_type_bit()`, `method_type_desc()`, and `method_iterate_types()` to map between driver names, type bitmasks, and descriptions. The `/show methods` command displays all known method types with their descriptions and lists active method instances with per-instance statistics (messages in/out, subscriber count, state, uptime since becoming AVAILABLE).
+
+## Per-Instance Enrichment
+
+Method instances track a `connected_at` timestamp set when the instance transitions to `METHOD_AVAILABLE` and cleared on disconnect. This provides uptime reporting in `/show methods` as a human-readable duration.
+
+Bot instances track `cmd_count` (lifetime commands dispatched, incremented atomically in `cmd_dispatch()`) and `last_activity` (timestamp of last message received, updated in `bot_msg_handler()`). Both are exposed via `bot_iterate()` and displayed in `/show bots`.
+
+The `/status` command displays program uptime (from `bm_start_time` in main.c) and total messages processed (sum of all method instances' `msg_in`).
+
+The `/show sessions <botname>` command lists active authenticated sessions for a bot instance, showing username, method, authentication duration, and idle time. It uses `bot_session_iterate()` which walks the session linked list under `bot_mutex`.
 
 # Core
 
@@ -104,7 +114,7 @@ The "core" of BotManager provides the foundational infrastructure upon which all
 - A task-based work scheduler that performs most all work required by the core itself and plugins (See Task System below).
 - Database access via an abstracted API. Plugins provide database-specific compatibility such as MySQL, PostgreSQL, SQLite, etc. (See DB below).
 - A subscriber-based Central Logging and Messaging (CLAM) system that serves as the message bus of the entire system (See CLAM below).
-- A libcurl-based API for access to services such as REST and WebSocket APIs.
+- A libcurl-based API for access to services such as REST and WebSocket APIs. A single dedicated thread drives the `curl_multi` event loop, multiplexing all HTTP transfers via non-blocking I/O. Completion callbacks execute synchronously on this thread — a slow callback blocks the entire curl subsystem. Callbacks that need to perform expensive work (DB writes, chained HTTP requests, heavy parsing, etc.) must submit a task to the task system rather than doing that work inline.
 - A high-performance socket communication API for non-libcurl-based I/O with TLS support.
 - A universal key/value DB schema for managing configuration and persistent data (See DB below).
 - A universal user authentication/authorization system that leverages the DB subsystem (See User Namespaces below).
@@ -534,12 +544,12 @@ On connect, the IRC method iterates `bot.<botname>.method.irc.chan.*`, finds all
 Bot plugins define bot behavior. The bot's kind determines how it interprets incoming messages — the core and method plugins are uninvolved in this decision.
 
 - Bot plugins have a "kind" sub-category that defines their purpose at a high level.
-- All bot kinds that interact with humans share a set of built-in commands: help and version. Additional commands can be registered by other plugins and enabled per bot instance. Administrative commands (set, show, status, quit, help) are registered by the admin module (`admin.c`) as system-level commands that are always dispatchable.
-- Command registrations include: default group name, default permission level (uint16_t), a brief one-line usage syntax, a brief help description, an optional verbose help string (up to 1024 characters), an optional parent command name (for subcommands), and an optional abbreviation. Command code must be non-blocking and thread-safe.
+- All bot kinds that interact with humans share a set of built-in commands: help and version. Additional commands can be registered by other plugins and enabled per bot instance. Administrative commands (set, show, bot, quit, help) are registered by the admin module (`admin.c`) and are always dispatchable from the console.
+- Command registrations include: default group name, default permission level (uint16_t), a single-line description, a single-line usage syntax, an optional parent path (slash-delimited for multi-level nesting), and an optional abbreviation. Command code must be non-blocking and thread-safe.
 
 ### Hierarchical Subcommands
 
-Commands support a parent/child hierarchy via the `parent_name` parameter in `cmd_register()` and `cmd_register_system()`. When `parent_name` is non-NULL, the new command is linked as a child of the specified parent. During dispatch, if a matched command has children, the next token from the argument string is checked against the parent's children. If a child matches, dispatch continues to the child with the remaining arguments. If no child matches, the parent's callback is invoked with the original arguments.
+Commands support a parent/child hierarchy via the `parent_path` parameter in `cmd_register()`. When `parent_path` is non-NULL, the new command is linked as a child of the specified parent. The path is slash-delimited and supports multi-level nesting (e.g., `"help/bot"` places the command under the `bot` child of `/help`). During dispatch, if a matched command has children, the next token from the argument string is checked against the parent's children. If a child matches, dispatch continues to the child with the remaining arguments. If no child matches, the parent's callback is invoked with the original arguments.
 
 Subcommand resolution is iterative, supporting multi-level nesting (e.g., `/show irc networks` resolves `show` → `irc` → `networks`). Parent commands typically implement a handler that lists available subcommands when invoked without arguments.
 
@@ -548,6 +558,44 @@ Name collision detection is scope-aware: root-level commands only collide with o
 ### Command Abbreviations
 
 Each command can declare an optional abbreviation (e.g., "show" → "sh", "status" → "stat"). Abbreviations are checked during command lookup: exact name match takes priority, then abbreviation match. Abbreviation uniqueness is enforced within the same scope (root-level or siblings). The help system displays abbreviations alongside command names.
+
+### Help System
+
+Help is integrated into the unified command tree. `/help`, `/show`, and `/set` are root commands registered by `cmd_init()`. Subsystems register children under these as needed — there is no separate help mirror tree.
+
+**Help behavior:**
+
+- `/help` — table index of all root commands (permission-filtered)
+- `/help bot` — looks for a child "bot" under `/help`; if found, calls its callback. Otherwise, looks up root command "bot" and shows its usage + description.
+- `/help bot add` — walks `/help` → `bot` → `add` and shows its usage line
+- `/help -v bot add` — calls the callback registered at `help/bot/add` for extended verbose text
+
+**Show/Set behavior:**
+
+- `/show bot` — elegant table of bots and state
+- `/show bot mybot` — detailed info page for one bot
+- `/set bot <attr> <val>` — live-modify, immediately effective
+- `/set kv <key> <val>` — raw KV store write (DB only, no live reload)
+
+**Registration pattern.** Subsystems register entries under `/help`, `/show`, and `/set` using the standard `cmd_register()` with appropriate `parent_path`:
+
+```c
+// Register /help bot entry
+cmd_register("admin", "bot",
+    "Bot management help",
+    "help bot",
+    USERNS_GROUP_OWNER, USERNS_OWNER_LEVEL, CMD_SCOPE_ANY, METHOD_T_ANY,
+    admin_cmd_help_bot, NULL, "help", NULL, NULL, 0);
+
+// Register /show bot entry
+cmd_register("admin", "bot",
+    "Show bot instances",
+    "show bot [name]",
+    USERNS_GROUP_OWNER, USERNS_OWNER_LEVEL, CMD_SCOPE_ANY, METHOD_T_ANY,
+    admin_cmd_show_bot, NULL, "show", NULL, NULL, 0);
+```
+
+**Accessors.** `cmd_get_description()` returns the single-line description. `cmd_get_usage()` returns the single-line syntax string. Both are `const char *` pointers to static storage set at registration time.
 
 ### Per-Method Command Prefix
 
@@ -665,7 +713,7 @@ All user-facing commands — whether received via IRC, botmanctl, the console, o
 This principle applies universally to all current and future commands that accept user-provided arguments. Specifically:
 
 - Plugin commands registered via `cmd_register()` that accept user arguments (e.g., `!weather <zipcode>`, `!forecast [-h] <zipcode>`).
-- System commands registered via `cmd_register_system()` that accept arguments (e.g., `/set`, `/bot add`, `/useradd`).
+- Administrative commands registered via `cmd_register()` that accept arguments (e.g., `/set`, `/bot add`, `/user add`).
 - Any future command, service plugin, or bot kind that processes external input.
 
 System commands invoked via the console or botmanctl operate in a trusted context (the operator), but should still validate arguments to prevent accidental misconfiguration and to maintain consistent defensive coding practices.
@@ -690,7 +738,7 @@ Commands can declare their expected arguments at registration time via `cmd_arg_
 
 ### Registration
 
-`cmd_register()` and `cmd_register_system()` accept two additional parameters: `const cmd_arg_desc_t *arg_desc` (array of descriptors, or NULL) and `uint8_t arg_count` (number of entries, or 0). Commands that pass NULL/0 work exactly as before — the handler receives `ctx->args` as a raw string and `ctx->parsed` is NULL.
+`cmd_register()` accepts two additional parameters: `const cmd_arg_desc_t *arg_desc` (array of descriptors, or NULL) and `uint8_t arg_count` (number of entries, or 0). Commands that pass NULL/0 work exactly as before — the handler receives `ctx->args` as a raw string and `ctx->parsed` is NULL.
 
 ### Argument Descriptor
 
@@ -750,11 +798,11 @@ static const cmd_arg_desc_t ad_useradd[] = {
   { "password",  CMD_ARG_NONE,  CMD_ARG_REQUIRED | CMD_ARG_REST, 0, NULL },
 };
 
-cmd_register_system("admin", "useradd",
-    "useradd <namespace> <username> <password>",
-    "Create a user in a namespace", NULL,
-    USERNS_GROUP_ADMIN, 100, admin_cmd_useradd, NULL, NULL, NULL,
-    ad_useradd, 3);
+cmd_register("admin", "add",
+    "Create a user in a namespace",
+    "user add <namespace> <username> <password>",
+    USERNS_GROUP_ADMIN, 100, CMD_SCOPE_ANY, METHOD_T_ANY,
+    admin_cmd_useradd, NULL, "user", NULL, ad_useradd, 3);
 
 // Handler — no manual parsing needed:
 static void admin_cmd_useradd(const cmd_ctx_t *ctx)

@@ -15,7 +15,7 @@ User commands live in either:
 - **Core modules** (e.g., `core/resolve.c`) -- registered via a `_register_commands()` function called from `main.c`
 - **Service plugins** (e.g., `plugins/service/openweather/`) -- registered in the plugin's `init()` callback
 
-Do NOT use `cmd_register_system()` for user commands. System commands are for administrative/console operations (e.g., `/set`, `/bot add`).
+All commands — user, admin, help entries, show views — use the single `cmd_register()` function. Tree position is determined by `parent_path`.
 
 ## Registration API
 
@@ -23,15 +23,15 @@ Do NOT use `cmd_register_system()` for user commands. System commands are for ad
 bool cmd_register(
     const char *module,       // module name (e.g., "resolve", "openweather")
     const char *name,         // command name, case-insensitive (e.g., "resolve")
-    const char *usage,        // one-line usage (e.g., "resolve <target>")
-    const char *help,         // brief description (max 256 chars)
-    const char *help_long,    // multi-line help (max 1024 chars, may be NULL)
+    const char *description,  // single-line description (static storage)
+    const char *usage,        // single-line syntax (static storage)
     const char *group,        // permission group (use USERNS_GROUP_EVERYONE for public)
     uint16_t level,           // minimum privilege level (0 for public)
     cmd_scope_t scope,        // CMD_SCOPE_ANY, CMD_SCOPE_PRIVATE, or CMD_SCOPE_PUBLIC
+    method_type_t methods,    // bitmask of method types (METHOD_T_ANY for all)
     cmd_cb_t cb,              // callback function
     void *data,               // opaque data (usually NULL)
-    const char *parent_name,  // parent command for subcommands (NULL for root)
+    const char *parent_path,  // slash-delimited path to parent (NULL for root)
     const char *abbrev,       // short alias (NULL for none)
     const cmd_arg_desc_t *arg_desc,  // argument descriptors (NULL = no validation)
     uint8_t arg_count         // number of arg descriptors (0 = no validation)
@@ -331,14 +331,10 @@ void
 mymod_register_commands(void)
 {
   cmd_register("mymod", "mycmd",
-      "mycmd <thing>",
       "Brief description of mycmd",
-      "Detailed multi-line help text.\n"
-      "\n"
-      "Example: !mycmd foo",
-      USERNS_GROUP_EVERYONE, 0, CMD_SCOPE_ANY, mymod_cmd_handler, NULL,
-      NULL, NULL,
-      mymod_cmd_ad, 1);
+      "mycmd <thing>",
+      USERNS_GROUP_EVERYONE, 0, CMD_SCOPE_ANY, METHOD_T_ANY,
+      mymod_cmd_handler, NULL, NULL, NULL, mymod_cmd_ad, 1);
 }
 
 // In main.c, after mem_register_commands():

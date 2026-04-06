@@ -4,6 +4,9 @@
 // Forward declaration — avoids circular include with cmd.h.
 extern void cmd_get_dispatch_stats(uint64_t *dispatches, uint64_t *denials);
 
+// Forward declaration — userns lifetime discovery counter.
+extern uint64_t userns_stat_discoveries;
+
 // -----------------------------------------------------------------------
 // Method binding freelist management.
 // -----------------------------------------------------------------------
@@ -106,6 +109,7 @@ bot_msg_handler(const method_msg_t *msg, void *data)
     return;
 
   bot->msg_count++;
+  bot->last_activity = time(NULL);
   bot->driver->on_message(bot->handle, msg);
 }
 
@@ -760,6 +764,7 @@ bot_discover_user(bot_inst_t *inst, const char *mfa_string)
   userns_user_add_mfa(ns, candidate, mfa_string);
 
   bot_stat_discoveries++;
+  __atomic_add_fetch(&userns_stat_discoveries, 1, __ATOMIC_RELAXED);
 
   clam(CLAM_INFO, "bot_discover_user",
       "'%s': discovered user '%s' from '%s'",
@@ -844,6 +849,30 @@ bot_session_count(const bot_inst_t *inst)
     return(0);
 
   return(inst->session_count);
+}
+
+// Iterate active sessions for a bot instance.
+// inst: bot instance
+// cb: callback invoked for each session
+// data: opaque user data
+void
+bot_session_iterate(const bot_inst_t *inst,
+    bot_session_iter_cb_t cb, void *data)
+{
+  if(inst == NULL || cb == NULL)
+    return;
+
+  pthread_mutex_lock(&bot_mutex);
+
+  for(bot_session_t *s = inst->sessions; s != NULL; s = s->next)
+  {
+    const char *mname = (s->method != NULL)
+        ? method_inst_name(s->method) : "(unknown)";
+
+    cb(s->username, mname, s->auth_time, s->last_seen, data);
+  }
+
+  pthread_mutex_unlock(&bot_mutex);
 }
 
 // -----------------------------------------------------------------------
@@ -1105,7 +1134,8 @@ bot_iterate(bot_iter_cb_t cb, void *data)
         ? b->userns->name : NULL;
 
     cb(b->name, drv_name, b->state, b->method_count,
-        b->session_count, ns_name, data);
+        b->session_count, ns_name, b->cmd_count,
+        b->last_activity, data);
   }
 
   pthread_mutex_unlock(&bot_mutex);
@@ -1133,6 +1163,15 @@ bot_method_count(const bot_inst_t *inst)
     return(0);
 
   return(inst->method_count);
+}
+
+// Increment the command dispatch counter for a bot instance.
+// inst: bot instance
+void
+bot_inc_cmd_count(bot_inst_t *inst)
+{
+  if(inst != NULL)
+    __atomic_add_fetch(&inst->cmd_count, 1, __ATOMIC_RELAXED);
 }
 
 // -----------------------------------------------------------------------

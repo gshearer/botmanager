@@ -322,6 +322,13 @@ method_set_state(method_inst_t *inst, method_state_t state)
   method_state_t old = inst->state;
   inst->state = state;
 
+  // Track connection timestamp for uptime reporting.
+  if(state == METHOD_AVAILABLE && old != METHOD_AVAILABLE)
+    inst->connected_at = time(NULL);
+
+  else if(state != METHOD_AVAILABLE)
+    inst->connected_at = 0;
+
   clam(CLAM_DEBUG, "method_set_state", "'%s': %s -> %s",
       inst->name, method_state_name(old), method_state_name(state));
 }
@@ -584,7 +591,7 @@ method_iterate_instances(method_inst_iter_cb_t cb, void *data)
         ? m->driver->name : "(unknown)";
 
     cb(m->name, kind, m->state, m->msg_in, m->msg_out,
-        m->sub_count, data);
+        m->sub_count, m->connected_at, data);
   }
 
   pthread_mutex_unlock(&method_mutex);

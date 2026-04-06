@@ -8,7 +8,7 @@
 
 // Current plugin API version. Plugins built against a different
 // version are rejected at load time.
-#define PLUGIN_API_VERSION   9
+#define PLUGIN_API_VERSION   11
 
 // Entry point symbol that every plugin must export.
 #define PLUGIN_ENTRY_SYMBOL  "bm_plugin_desc"
@@ -110,6 +110,19 @@ typedef struct
   const plugin_kv_group_t *kv_groups;
   uint32_t                 kv_groups_count;
 } plugin_desc_t;
+
+// Plugin subsystem statistics.
+typedef struct
+{
+  uint32_t loaded;            // currently loaded plugins
+  uint32_t discovered;        // lifetime plugins found during scan
+  uint32_t rejected;          // lifetime API version mismatches
+  uint32_t load_errors;       // lifetime dlopen/symbol failures
+} plugin_stats_t;
+
+// Get plugin subsystem statistics (thread-safe snapshot).
+// out: destination for the snapshot
+void plugin_get_stats(plugin_stats_t *out);
 
 // returns: SUCCESS or FAIL
 // path: file path to the .so shared library
@@ -269,6 +282,11 @@ typedef struct plugin_rec
 static plugin_rec_t *plugins      = NULL;
 static uint32_t      n_plugins    = 0;
 static bool          plugin_ready = false;
+
+// Lifetime counters for statistics.
+static uint32_t      n_discovered  = 0;
+static uint32_t      n_rejected    = 0;
+static uint32_t      n_load_errors = 0;
 
 #endif // PLUGIN_INTERNAL
 

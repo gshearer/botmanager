@@ -2,41 +2,6 @@
 #include "cmd.h"
 
 // -----------------------------------------------------------------------
-// Binding freelist management.
-// -----------------------------------------------------------------------
-
-// Get a binding struct from the freelist or allocate a new one.
-// returns: zeroed struct
-static cmd_binding_t *
-bind_get(void)
-{
-  cmd_binding_t *b;
-
-  if(cmd_bind_freelist != NULL)
-  {
-    b = cmd_bind_freelist;
-    cmd_bind_freelist = b->next;
-    cmd_bind_free_count--;
-    memset(b, 0, sizeof(*b));
-    return(b);
-  }
-
-  b = mem_alloc("cmd", "binding", sizeof(*b));
-  memset(b, 0, sizeof(*b));
-  return(b);
-}
-
-// Return a binding struct to the freelist.
-// b: struct to recycle
-static void
-bind_put(cmd_binding_t *b)
-{
-  b->next = cmd_bind_freelist;
-  cmd_bind_freelist = b;
-  cmd_bind_free_count++;
-}
-
-// -----------------------------------------------------------------------
 // Command set freelist management.
 // -----------------------------------------------------------------------
 
@@ -123,10 +88,6 @@ def_find_locked(const char *name)
   {
     if(strncasecmp(d->name, name, CMD_NAME_SZ) == 0)
     {
-      // System commands take priority over built-ins on name collision.
-      if(d->system)
-        return(d);
-
       if(name_match == NULL)
         name_match = d;
     }
@@ -162,6 +123,57 @@ def_name_collides_locked(const char *str, cmd_def_t *parent)
   }
 
   return(false);
+}
+
+// Forward declaration (defined after def_find_locked, used below).
+static cmd_def_t *def_find_child_locked(cmd_def_t *parent, const char *name);
+
+// Internal: resolve a slash-delimited parent path (e.g. "irc/network")
+// to a cmd_def_t by walking the command tree. Single-segment paths like
+// "bot" are also handled. Caller must hold cmd_mutex.
+// returns: the resolved command, or NULL if any segment is not found
+static cmd_def_t *
+resolve_parent_path_locked(const char *path)
+{
+  if(path == NULL || path[0] == '\0')
+    return(NULL);
+
+  // Copy path so we can tokenize on '/'.
+  char buf[CMD_USAGE_SZ];
+  strncpy(buf, path, sizeof(buf) - 1);
+  buf[sizeof(buf) - 1] = '\0';
+
+  // First segment: root-level lookup.
+  char *tok = buf;
+  char *slash = strchr(tok, '/');
+
+  if(slash != NULL)
+    *slash = '\0';
+
+  cmd_def_t *d = def_find_locked(tok);
+
+  if(d == NULL)
+    return(NULL);
+
+  // Subsequent segments: child lookups.
+  while(slash != NULL)
+  {
+    tok = slash + 1;
+    slash = strchr(tok, '/');
+
+    if(slash != NULL)
+      *slash = '\0';
+
+    if(tok[0] == '\0')
+      continue;
+
+    d = def_find_child_locked(d, tok);
+
+    if(d == NULL)
+      return(NULL);
+  }
+
+  return(d);
 }
 
 // -----------------------------------------------------------------------
@@ -222,40 +234,15 @@ reg_validate_args(const char *name, const cmd_arg_desc_t *arg_desc,
 // name: command name
 // abbrev: abbreviation (NULL or empty for none)
 // parent: parent command (NULL for root-level)
-// is_system: whether this is a system command
 // returns: true if no collision (ok to proceed), false on collision
 static bool
 reg_check_collisions_locked(const char *name, const char *abbrev,
-    cmd_def_t *parent, bool is_system)
+    cmd_def_t *parent)
 {
-  // Check name collision within the same scope (siblings or root).
-  // System commands are allowed to shadow built-in commands of the
-  // same name -- the built-in remains for per-bot dispatch while the
-  // system command takes priority in owner/system dispatch paths.
   if(def_name_collides_locked(name, parent))
   {
-    // Allow system command to coexist with a same-named built-in.
-    bool shadow_ok = false;
-
-    if(is_system && parent == NULL)
-    {
-      for(cmd_def_t *e = cmd_list; e != NULL; e = e->next)
-      {
-        if(e->parent == NULL
-            && strncasecmp(e->name, name, CMD_NAME_SZ) == 0
-            && e->builtin)
-        {
-          shadow_ok = true;
-          break;
-        }
-      }
-    }
-
-    if(!shadow_ok)
-    {
-      clam(CLAM_WARN, "cmd_register", "duplicate command: '%s'", name);
-      return(false);
-    }
+    clam(CLAM_WARN, "cmd_register", "duplicate command: '%s'", name);
+    return(false);
   }
 
   // Check abbreviation collision within the same scope.
@@ -279,10 +266,10 @@ reg_check_collisions_locked(const char *name, const char *abbrev,
 // returns: the new definition (already linked)
 static cmd_def_t *
 reg_populate_def(const char *module, const char *name,
-    const char *usage, const char *help,
+    const char *usage, const char *description,
     const char *help_long, const char *group, uint16_t level,
     cmd_scope_t scope, method_type_t methods, cmd_cb_t cb, void *data,
-    bool is_system, const char *abbrev, const cmd_arg_desc_t *arg_desc,
+    const char *abbrev, const cmd_arg_desc_t *arg_desc,
     uint8_t arg_count, cmd_def_t *parent)
 {
   cmd_def_t *d = mem_alloc("cmd", "def", sizeof(*d));
@@ -296,20 +283,15 @@ reg_populate_def(const char *module, const char *name,
   if(abbrev != NULL && abbrev[0] != '\0')
     strncpy(d->abbrev, abbrev, CMD_NAME_SZ - 1);
 
-  if(usage != NULL)
-    strncpy(d->usage, usage, CMD_USAGE_SZ - 1);
-  if(help != NULL)
-    strncpy(d->help, help, CMD_HELP_SZ - 1);
-  if(help_long != NULL)
-    strncpy(d->help_long, help_long, CMD_HELP_LONG_SZ - 1);
+  d->usage       = usage;
+  d->description = description;
+  d->help_long   = help_long;
 
   strncpy(d->group, group, USERNS_GROUP_SZ - 1);
   d->level   = level;
   d->scope   = scope;
   d->cb      = cb;
   d->data    = data;
-  d->builtin   = false;
-  d->system    = is_system;
   d->arg_desc  = arg_desc;
   d->arg_count = arg_count;
 
@@ -339,16 +321,13 @@ reg_populate_def(const char *module, const char *name,
   return(d);
 }
 
-// Internal registration helper.
-// is_system: if true, command is system-level (always dispatchable)
-// parent_name: name of parent command (NULL for root-level commands)
-// abbrev: optional abbreviation (NULL or empty for none)
-static bool
-cmd_register_internal(const char *module, const char *name,
-    const char *usage, const char *help,
+// Register a command globally.
+bool
+cmd_register(const char *module, const char *name,
+    const char *usage, const char *description,
     const char *help_long, const char *group, uint16_t level,
     cmd_scope_t scope, method_type_t methods, cmd_cb_t cb, void *data,
-    bool is_system, const char *parent_name, const char *abbrev,
+    const char *parent_path, const char *abbrev,
     const cmd_arg_desc_t *arg_desc, uint8_t arg_count)
 {
   if(name == NULL || name[0] == '\0' || cb == NULL)
@@ -376,66 +355,38 @@ cmd_register_internal(const char *module, const char *name,
   // Resolve parent if specified (needed for scoped collision check).
   cmd_def_t *parent = NULL;
 
-  if(parent_name != NULL && parent_name[0] != '\0')
+  if(parent_path != NULL && parent_path[0] != '\0')
   {
-    parent = def_find_locked(parent_name);
+    parent = resolve_parent_path_locked(parent_path);
 
     if(parent == NULL)
     {
       pthread_mutex_unlock(&cmd_mutex);
       clam(CLAM_WARN, "cmd_register",
-          "'%s': parent command '%s' not found", name, parent_name);
+          "'%s': parent command '%s' not found", name, parent_path);
       return(FAIL);
     }
   }
 
-  if(!reg_check_collisions_locked(name, abbrev, parent, is_system))
+  if(!reg_check_collisions_locked(name, abbrev, parent))
   {
     pthread_mutex_unlock(&cmd_mutex);
     return(FAIL);
   }
 
-  cmd_def_t *d = reg_populate_def(module, name, usage, help, help_long,
-      group, level, scope, methods, cb, data, is_system, abbrev, arg_desc,
-      arg_count, parent);
+  cmd_def_t *d = reg_populate_def(module, name, usage, description,
+      help_long, group, level, scope, methods, cb, data, abbrev,
+      arg_desc, arg_count, parent);
 
   pthread_mutex_unlock(&cmd_mutex);
 
   clam(CLAM_DEBUG, "cmd_register",
-      "registered '%s' (module: %s, group: %s, level: %u%s%s%s)", name,
+      "registered '%s' (module: %s, group: %s, level: %u%s%s)", name,
       module ? module : "(none)", group,
-      (unsigned)level, is_system ? ", system" : "",
+      (unsigned)level,
       d->parent ? ", parent: " : "",
       d->parent ? d->parent->name : "");
   return(SUCCESS);
-}
-
-// Register a command globally.
-bool
-cmd_register(const char *module, const char *name,
-    const char *usage, const char *help,
-    const char *help_long, const char *group, uint16_t level,
-    cmd_scope_t scope, method_type_t methods, cmd_cb_t cb, void *data,
-    const char *parent_name, const char *abbrev,
-    const cmd_arg_desc_t *arg_desc, uint8_t arg_count)
-{
-  return(cmd_register_internal(module, name, usage, help, help_long, group,
-      level, scope, methods, cb, data, false, parent_name, abbrev, arg_desc,
-      arg_count));
-}
-
-// Register a system-level command.
-bool
-cmd_register_system(const char *module, const char *name,
-    const char *usage, const char *help,
-    const char *help_long, const char *group, uint16_t level,
-    cmd_scope_t scope, method_type_t methods, cmd_cb_t cb, void *data,
-    const char *parent_name, const char *abbrev,
-    const cmd_arg_desc_t *arg_desc, uint8_t arg_count)
-{
-  return(cmd_register_internal(module, name, usage, help, help_long, group,
-      level, scope, methods, cb, data, true, parent_name, abbrev, arg_desc,
-      arg_count));
 }
 
 // Unregister a command. Removes it from all bot instance bindings.
@@ -460,28 +411,6 @@ cmd_unregister(const char *name)
   {
     pthread_mutex_unlock(&cmd_mutex);
     return(FAIL);
-  }
-
-  // Remove from all bot instance bindings.
-  for(cmd_set_t *s = cmd_sets; s != NULL; s = s->next)
-  {
-    cmd_binding_t *b = NULL;
-    cmd_binding_t *bprev = NULL;
-
-    for(b = s->bindings; b != NULL; bprev = b, b = b->next)
-    {
-      if(strncasecmp(b->name, name, CMD_NAME_SZ) == 0)
-      {
-        if(bprev != NULL)
-          bprev->next = b->next;
-        else
-          s->bindings = b->next;
-
-        s->count--;
-        bind_put(b);
-        break;
-      }
-    }
   }
 
   // Unlink from parent's children list if this is a subcommand.
@@ -547,217 +476,7 @@ cmd_count(void)
   return(cmd_def_count);
 }
 
-// -----------------------------------------------------------------------
-// Per-bot instance command management
-// -----------------------------------------------------------------------
-
-// Enable a registered command on a bot instance.
-bool
-cmd_enable(bot_inst_t *inst, const char *cmd_name)
-{
-  if(inst == NULL || cmd_name == NULL || cmd_name[0] == '\0')
-  {
-    clam(CLAM_WARN, "cmd_enable", "invalid arguments");
-    return(FAIL);
-  }
-
-  pthread_mutex_lock(&cmd_mutex);
-
-  // Verify the command exists.
-  cmd_def_t *d = def_find_locked(cmd_name);
-
-  if(d == NULL)
-  {
-    pthread_mutex_unlock(&cmd_mutex);
-    clam(CLAM_WARN, "cmd_enable",
-        "'%s': command '%s' not registered",
-        bot_inst_name(inst), cmd_name);
-    return(FAIL);
-  }
-
-  // Built-in commands are always available; enabling is a no-op.
-  if(d->builtin)
-  {
-    pthread_mutex_unlock(&cmd_mutex);
-    return(SUCCESS);
-  }
-
-  cmd_set_t *s = set_ensure_locked(inst);
-
-  // Check for duplicate.
-  for(cmd_binding_t *b = s->bindings; b != NULL; b = b->next)
-  {
-    if(strncasecmp(b->name, cmd_name, CMD_NAME_SZ) == 0)
-    {
-      pthread_mutex_unlock(&cmd_mutex);
-      clam(CLAM_WARN, "cmd_enable",
-          "'%s': command '%s' already enabled",
-          bot_inst_name(inst), cmd_name);
-      return(FAIL);
-    }
-  }
-
-  cmd_binding_t *b = bind_get();
-  strncpy(b->name, cmd_name, CMD_NAME_SZ - 1);
-  b->next = s->bindings;
-  s->bindings = b;
-  s->count++;
-
-  pthread_mutex_unlock(&cmd_mutex);
-
-  clam(CLAM_DEBUG, "cmd_enable",
-      "'%s': enabled command '%s'", bot_inst_name(inst), cmd_name);
-  return(SUCCESS);
-}
-
-// Enable all registered user commands on a bot instance.
-uint32_t
-cmd_enable_all(bot_inst_t *inst)
-{
-  if(inst == NULL)
-    return(0);
-
-  uint32_t count = 0;
-
-  pthread_mutex_lock(&cmd_mutex);
-
-  for(cmd_def_t *d = cmd_list; d != NULL; d = d->next)
-  {
-    // Skip built-in, system, and subcommands.
-    if(d->builtin || d->system || d->parent != NULL)
-      continue;
-
-    // Check for duplicate (already enabled).
-    cmd_set_t *s = set_ensure_locked(inst);
-    bool already = false;
-
-    for(cmd_binding_t *b = s->bindings; b != NULL; b = b->next)
-    {
-      if(strncasecmp(b->name, d->name, CMD_NAME_SZ) == 0)
-      {
-        already = true;
-        break;
-      }
-    }
-
-    if(already)
-      continue;
-
-    cmd_binding_t *b = bind_get();
-    strncpy(b->name, d->name, CMD_NAME_SZ - 1);
-    b->next = s->bindings;
-    s->bindings = b;
-    s->count++;
-    count++;
-  }
-
-  pthread_mutex_unlock(&cmd_mutex);
-
-  clam(CLAM_DEBUG, "cmd_enable_all",
-      "'%s': enabled %u command(s)", bot_inst_name(inst), count);
-  return(count);
-}
-
-// Disable a command on a bot instance.
-bool
-cmd_disable(bot_inst_t *inst, const char *cmd_name)
-{
-  if(inst == NULL || cmd_name == NULL || cmd_name[0] == '\0')
-    return(FAIL);
-
-  pthread_mutex_lock(&cmd_mutex);
-
-  cmd_set_t *s = set_find_locked(inst);
-
-  if(s == NULL)
-  {
-    pthread_mutex_unlock(&cmd_mutex);
-    return(FAIL);
-  }
-
-  cmd_binding_t *b = NULL;
-  cmd_binding_t *prev = NULL;
-
-  for(b = s->bindings; b != NULL; prev = b, b = b->next)
-  {
-    if(strncasecmp(b->name, cmd_name, CMD_NAME_SZ) == 0)
-    {
-      if(prev != NULL)
-        prev->next = b->next;
-      else
-        s->bindings = b->next;
-
-      s->count--;
-      bind_put(b);
-      pthread_mutex_unlock(&cmd_mutex);
-
-      clam(CLAM_DEBUG, "cmd_disable",
-          "'%s': disabled command '%s'",
-          bot_inst_name(inst), cmd_name);
-      return(SUCCESS);
-    }
-  }
-
-  pthread_mutex_unlock(&cmd_mutex);
-  return(FAIL);
-}
-
-// Check if a command is enabled on a bot instance.
-bool
-cmd_is_enabled(const bot_inst_t *inst, const char *cmd_name)
-{
-  if(inst == NULL || cmd_name == NULL || cmd_name[0] == '\0')
-    return(false);
-
-  pthread_mutex_lock(&cmd_mutex);
-
-  // Built-in commands are always enabled.
-  cmd_def_t *d = def_find_locked(cmd_name);
-
-  if(d != NULL && d->builtin)
-  {
-    pthread_mutex_unlock(&cmd_mutex);
-    return(true);
-  }
-
-  cmd_set_t *s = set_find_locked(inst);
-
-  if(s == NULL)
-  {
-    pthread_mutex_unlock(&cmd_mutex);
-    return(false);
-  }
-
-  for(cmd_binding_t *b = s->bindings; b != NULL; b = b->next)
-  {
-    if(strncasecmp(b->name, cmd_name, CMD_NAME_SZ) == 0)
-    {
-      pthread_mutex_unlock(&cmd_mutex);
-      return(true);
-    }
-  }
-
-  pthread_mutex_unlock(&cmd_mutex);
-  return(false);
-}
-
-// Get enabled command count for a bot instance.
-uint32_t
-cmd_enabled_count(const bot_inst_t *inst)
-{
-  if(inst == NULL)
-    return(0);
-
-  pthread_mutex_lock(&cmd_mutex);
-
-  cmd_set_t *s = set_find_locked(inst);
-  uint32_t count = (s != NULL) ? s->count : 0;
-
-  pthread_mutex_unlock(&cmd_mutex);
-  return(count);
-}
-
-// Clean up all per-bot command state.
+// Clean up per-bot command state (prefix set).
 void
 cmd_bot_cleanup(bot_inst_t *inst)
 {
@@ -786,16 +505,6 @@ cmd_bot_cleanup(bot_inst_t *inst)
     prev->next = s->next;
   else
     cmd_sets = s->next;
-
-  // Free all bindings.
-  cmd_binding_t *b = s->bindings;
-
-  while(b != NULL)
-  {
-    cmd_binding_t *next = b->next;
-    bind_put(b);
-    b = next;
-  }
 
   set_put(s);
 
@@ -1005,7 +714,7 @@ cmd_parse_args(const char *args, const cmd_arg_desc_t *desc,
       if(!(desc[i].flags & CMD_ARG_OPTIONAL))
       {
         char buf[CMD_USAGE_SZ + 16];
-        snprintf(buf, sizeof(buf), "Usage: %s", usage);
+        snprintf(buf, sizeof(buf), "usage: /%s", usage);
         cmd_reply(ctx, buf);
         return false;
       }
@@ -1116,8 +825,8 @@ cmd_task_cb(task_t *t)
 // -----------------------------------------------------------------------
 
 // Dispatch a message as a potential command for a bot instance. Parses
-// the prefix and command name, checks enablement and permissions, and
-// submits a task for async execution.
+// the prefix and command name, checks permissions, and submits a task
+// for async execution.
 // returns: SUCCESS if dispatched, FAIL if not a command or denied
 // inst: bot instance
 // msg: full message context
@@ -1205,6 +914,66 @@ cmd_dispatch(bot_inst_t *inst, const method_msg_t *msg)
   // Resolve subcommand if the matched command has children.
   resolve_subcmd_locked(&d, &args);
 
+  // Check for "help" trailing keyword — redirect to help system.
+  {
+    const char *ha = args;
+    while(*ha == ' ' || *ha == '\t') ha++;
+    if(strncasecmp(ha, "help", 4) == 0
+        && (ha[4] == '\0' || ha[4] == ' ' || ha[4] == '\t'))
+    {
+      // Build the resolved command path for the help system.
+      // Walk up the parent chain to build the path.
+      char help_args[METHOD_TEXT_SZ] = {0};
+      char *parts[16];
+      int depth = 0;
+
+      for(cmd_def_t *p = d; p != NULL && depth < 16; p = p->parent)
+        parts[depth++] = p->name;
+
+      size_t off = 0;
+      for(int pi = depth - 1; pi >= 0; pi--)
+      {
+        size_t nlen = strlen(parts[pi]);
+        if(off + nlen + 1 < sizeof(help_args))
+        {
+          if(off > 0)
+            help_args[off++] = ' ';
+          memcpy(help_args + off, parts[pi], nlen);
+          off += nlen;
+        }
+      }
+      help_args[off] = '\0';
+
+      // Find the help command and dispatch to it.
+      cmd_def_t *help_cmd = def_find_locked("help");
+      if(help_cmd != NULL && help_cmd->cb != NULL)
+      {
+        cmd_cb_t help_cb = help_cmd->cb;
+        pthread_mutex_unlock(&cmd_mutex);
+
+        // Build a synthetic context with the path as args.
+        cmd_ctx_t help_ctx = {
+          .bot = inst,
+          .msg = msg,
+          .args = help_args,
+          .username = NULL,
+          .parsed = NULL,
+          .data = help_cmd->data,
+        };
+
+        // For console origin, set username to owner.
+        if(msg->console_origin)
+          help_ctx.username = USERNS_OWNER_USER;
+
+        help_cb(&help_ctx);
+        __atomic_fetch_add(&cmd_stat_dispatches, 1, __ATOMIC_RELAXED);
+        return(SUCCESS);
+      }
+      pthread_mutex_unlock(&cmd_mutex);
+      return(FAIL);
+    }
+  }
+
   // Method type check: reject if the command is not visible on this method.
   method_type_t inst_type = method_inst_type(msg->inst);
 
@@ -1212,31 +981,6 @@ cmd_dispatch(bot_inst_t *inst, const method_msg_t *msg)
   {
     pthread_mutex_unlock(&cmd_mutex);
     return(FAIL);
-  }
-
-  // Check if command is enabled: built-in and system commands are
-  // always available; others must be explicitly enabled per bot.
-  if(!d->builtin && !d->system)
-  {
-    bool enabled = false;
-
-    if(s != NULL)
-    {
-      for(cmd_binding_t *b = s->bindings; b != NULL; b = b->next)
-      {
-        if(strncasecmp(b->name, d->name, CMD_NAME_SZ) == 0)
-        {
-          enabled = true;
-          break;
-        }
-      }
-    }
-
-    if(!enabled)
-    {
-      pthread_mutex_unlock(&cmd_mutex);
-      return(FAIL);
-    }
   }
 
   // Copy what we need from the definition before releasing the lock.
@@ -1249,9 +993,7 @@ cmd_dispatch(bot_inst_t *inst, const method_msg_t *msg)
   memcpy(group, d->group, USERNS_GROUP_SZ);
   const cmd_arg_desc_t *arg_desc = d->arg_desc;
   uint8_t arg_count = d->arg_count;
-  char usage[CMD_USAGE_SZ];
-  memset(usage, 0, sizeof(usage));
-  memcpy(usage, d->usage, CMD_USAGE_SZ);
+  const char *usage = d->usage;
 
   pthread_mutex_unlock(&cmd_mutex);
 
@@ -1403,7 +1145,7 @@ dispatch:
 
   td->arg_desc  = arg_desc;
   td->arg_count = arg_count;
-  memcpy(td->usage, usage, CMD_USAGE_SZ);
+  td->usage     = usage;
 
   // Submit task.
   char task_name[TASK_NAME_SZ];
@@ -1458,368 +1200,292 @@ cmd_reply(const cmd_ctx_t *ctx, const char *text)
 // Built-in commands
 // -----------------------------------------------------------------------
 
-// Show verbose help for a single command.
-// Looks up the command by name (with subcommand resolution), checks
-// accessibility, and sends detailed usage/help/permissions to the caller.
-// ctx: command context
-// args: argument string naming the command (e.g. "bot add")
-static void
-help_show_command(const cmd_ctx_t *ctx, const char *args)
+// Permission check: can the caller see this command?
+static bool
+help_check_access(const cmd_ctx_t *ctx, const cmd_def_t *d)
 {
-  // Parse first token as command name.
-  char help_name[CMD_NAME_SZ] = {0};
-  const char *hp = args;
-  size_t hi = 0;
+  // Console bypasses all checks.
+  if(ctx->msg != NULL && ctx->msg->console_origin)
+    return true;
 
-  while(hp[hi] != '\0' && hp[hi] != ' ' && hp[hi] != '\t'
-      && hi < CMD_NAME_SZ - 1)
-  {
-    help_name[hi] = hp[hi];
-    hi++;
-  }
-
-  const char *help_rest = hp + hi;
-
-  while(*help_rest == ' ' || *help_rest == '\t')
-    help_rest++;
-
-  pthread_mutex_lock(&cmd_mutex);
-  cmd_def_t *d = def_find_locked(help_name);
-
-  // Resolve subcommand if remaining args and parent has children.
-  if(d != NULL && d->children != NULL && help_rest[0] != '\0')
-    resolve_subcmd_locked(&d, &help_rest);
-
-  if(d == NULL)
-  {
-    pthread_mutex_unlock(&cmd_mutex);
-    char buf[CMD_NAME_SZ + 32];
-    snprintf(buf, sizeof(buf), "unknown command: %s", args);
-    cmd_reply(ctx, buf);
-    return;
-  }
-
-  // Method type check: reject commands not visible on this method.
+  // Method type filter.
   method_type_t mt = (ctx->msg != NULL && ctx->msg->inst != NULL)
       ? method_inst_type(ctx->msg->inst) : METHOD_T_ANY;
-
   if(mt != 0 && !(d->methods & mt))
+    return false;
+
+  // Owner sees everything.
+  if(ctx->username != NULL
+      && strcmp(ctx->username, USERNS_OWNER_USER) == 0)
+    return true;
+
+  // "everyone" at level 0 is always visible.
+  if(strcmp(d->group, USERNS_GROUP_EVERYONE) == 0 && d->level == 0)
+    return true;
+
+  // Authenticated: check group membership.
+  if(ctx->username != NULL && ctx->bot != NULL)
   {
-    pthread_mutex_unlock(&cmd_mutex);
-    char buf[CMD_NAME_SZ + 32];
-    snprintf(buf, sizeof(buf), "unknown command: %s", args);
-    cmd_reply(ctx, buf);
-    return;
-  }
-
-  // Check that command is accessible (built-in, system, or enabled).
-  if(!d->builtin && !d->system)
-  {
-    cmd_set_t *s = set_find_locked(ctx->bot);
-    bool enabled = false;
-
-    if(s != NULL)
+    userns_t *ns = bot_get_userns(ctx->bot);
+    if(ns != NULL)
     {
-      for(cmd_binding_t *b = s->bindings; b != NULL; b = b->next)
-      {
-        if(strncasecmp(b->name, args, CMD_NAME_SZ) == 0)
-        {
-          enabled = true;
-          break;
-        }
-      }
-    }
-
-    if(!enabled)
-    {
-      pthread_mutex_unlock(&cmd_mutex);
-      char buf[CMD_NAME_SZ + 32];
-      snprintf(buf, sizeof(buf), "unknown command: %s", args);
-      cmd_reply(ctx, buf);
-      return;
+      int32_t ulevel = userns_member_level(ns, ctx->username, d->group);
+      if(ulevel >= 0 && (uint16_t)ulevel >= d->level)
+        return true;
     }
   }
 
-  // Copy fields while holding the lock.
-  char module_name[CMD_MODULE_SZ];
-  char usage[CMD_USAGE_SZ];
-  char help[CMD_HELP_SZ];
-  char help_long[CMD_HELP_LONG_SZ];
-  char group[USERNS_GROUP_SZ];
-  uint16_t level = d->level;
-
-  strncpy(module_name, d->module, CMD_MODULE_SZ);
-  strncpy(usage, d->usage, CMD_USAGE_SZ);
-  strncpy(help, d->help, CMD_HELP_SZ);
-  strncpy(help_long, d->help_long, CMD_HELP_LONG_SZ);
-  strncpy(group, d->group, USERNS_GROUP_SZ);
-
-  pthread_mutex_unlock(&cmd_mutex);
-
-  // Display command details.
-  char line[CMD_USAGE_SZ + 16];
-  snprintf(line, sizeof(line), "usage: %s", usage);
-  cmd_reply(ctx, line);
-  cmd_reply(ctx, help);
-
-  if(help_long[0] != '\0')
-  {
-    // Send verbose help line-by-line (newlines delimit lines).
-    char *text = help_long;
-    char *nl;
-
-    while((nl = strchr(text, '\n')) != NULL)
-    {
-      *nl = '\0';
-      cmd_reply(ctx, text);
-      text = nl + 1;
-    }
-
-    // Send any remaining text after the last newline.
-    if(*text != '\0')
-      cmd_reply(ctx, text);
-  }
-
-  char module_line[CMD_MODULE_SZ + 16];
-  snprintf(module_line, sizeof(module_line), "module: %s",
-      module_name[0] != '\0' ? module_name : "core");
-  cmd_reply(ctx, module_line);
-
-  char perms[USERNS_GROUP_SZ + 32];
-  snprintf(perms, sizeof(perms), "requires: %s (level %u)",
-      group, (unsigned)level);
-  cmd_reply(ctx, perms);
+  return false;
 }
 
-// Collect unique module names from available commands into an array.
-// Caller must hold cmd_mutex.
-// bot: bot instance (for enabled-command lookup)
-// mt: caller's method type bitmask (filter out non-matching commands)
-// modules: output array of module name buffers
-// returns: number of unique modules found
+// Print child table for a command. Returns number of children shown.
 static uint32_t
-help_collect_modules(const bot_inst_t *bot, method_type_t mt,
-    char modules[][CMD_MODULE_SZ])
+help_show_children(const cmd_ctx_t *ctx, const cmd_def_t *d)
 {
-  uint32_t mod_count = 0;
+  uint32_t count = 0;
+  bool header_sent = false;
 
-  // Scan built-in commands for modules. Skip subcommands (they are
-  // listed under their parent) and method-filtered commands.
-  for(cmd_def_t *d = cmd_list; d != NULL; d = d->next)
-  {
-    if(!d->builtin || d->parent != NULL)
-      continue;
-
-    if(mt != 0 && !(d->methods & mt))
-      continue;
-
-    const char *mod = d->module[0] != '\0' ? d->module : "core";
-    bool found = false;
-
-    for(uint32_t i = 0; i < mod_count; i++)
-    {
-      if(strcmp(modules[i], mod) == 0)
-      {
-        found = true;
-        break;
-      }
-    }
-
-    if(!found && mod_count < 64)
-    {
-      snprintf(modules[mod_count], CMD_MODULE_SZ, "%s", mod);
-      mod_count++;
-    }
-  }
-
-  // Scan enabled commands for modules (skip subcommands).
-  cmd_set_t *s = set_find_locked(bot);
-
-  if(s != NULL)
-  {
-    for(cmd_binding_t *b = s->bindings; b != NULL; b = b->next)
-    {
-      cmd_def_t *d = def_find_locked(b->name);
-
-      if(d == NULL || d->parent != NULL)
-        continue;
-
-      if(mt != 0 && !(d->methods & mt))
-        continue;
-
-      const char *mod = d->module[0] != '\0' ? d->module : "core";
-      bool found = false;
-
-      for(uint32_t i = 0; i < mod_count; i++)
-      {
-        if(strcmp(modules[i], mod) == 0)
-        {
-          found = true;
-          break;
-        }
-      }
-
-      if(!found && mod_count < 64)
-      {
-        snprintf(modules[mod_count], CMD_MODULE_SZ, "%s", mod);
-        mod_count++;
-      }
-    }
-  }
-
-  return(mod_count);
-}
-
-// Print commands for a single module group. Lists built-in commands
-// first, then enabled commands for the bot instance.
-// Caller must hold cmd_mutex.
-// ctx: command context (for replies)
-// mod_name: module name to filter on (bounded to CMD_MODULE_SZ)
-// mt: caller's method type bitmask (filter out non-matching commands)
-// s: bot's command set (may be NULL)
-static void
-help_list_module_locked(const cmd_ctx_t *ctx,
-    const char mod_name[CMD_MODULE_SZ], method_type_t mt,
-    const cmd_set_t *s)
-{
-  char hdr[CMD_MODULE_SZ + 4];
-  snprintf(hdr, sizeof(hdr), "[%s]", mod_name);
-
-  pthread_mutex_unlock(&cmd_mutex);
-  cmd_reply(ctx, hdr);
   pthread_mutex_lock(&cmd_mutex);
-
-  // List built-in commands in this module (skip subcommands).
-  for(cmd_def_t *d = cmd_list; d != NULL; d = d->next)
+  for(cmd_def_t *c = d->children; c != NULL; c = c->sibling)
   {
-    if(!d->builtin || d->parent != NULL)
+    if(!help_check_access(ctx, c))
       continue;
 
-    if(mt != 0 && !(d->methods & mt))
-      continue;
+    const char *cname = c->name;
+    const char *cabbrev = (c->abbrev[0] != '\0') ? c->abbrev : "-";
+    const char *cdesc = c->description ? c->description : "";
+    char line[256];
 
-    const char *mod = d->module[0] != '\0' ? d->module : "core";
-
-    if(strcmp(mod, mod_name) != 0)
-      continue;
-
-    char line[CMD_USAGE_SZ + CMD_HELP_SZ + 8];
-    snprintf(line, sizeof(line), "  %s — %s", d->usage, d->help);
-
-    pthread_mutex_unlock(&cmd_mutex);
-    cmd_reply(ctx, line);
-    pthread_mutex_lock(&cmd_mutex);
-  }
-
-  // List enabled commands in this module (skip subcommands).
-  if(s != NULL)
-  {
-    for(const cmd_binding_t *b = s->bindings; b != NULL; b = b->next)
+    if(!header_sent)
     {
-      cmd_def_t *d = def_find_locked(b->name);
-
-      if(d == NULL || d->parent != NULL)
-        continue;
-
-      if(mt != 0 && !(d->methods & mt))
-        continue;
-
-      const char *mod = d->module[0] != '\0' ? d->module : "core";
-
-      if(strcmp(mod, mod_name) != 0)
-        continue;
-
-      char line[CMD_USAGE_SZ + CMD_HELP_SZ + 8];
-      snprintf(line, sizeof(line), "  %s — %s", d->usage, d->help);
-
+      snprintf(line, sizeof(line), "  %-20s %-12s %s",
+          "COMMAND", "ABBREV", "DESCRIPTION");
       pthread_mutex_unlock(&cmd_mutex);
       cmd_reply(ctx, line);
       pthread_mutex_lock(&cmd_mutex);
+      header_sent = true;
     }
+
+    snprintf(line, sizeof(line), "  %-20s %-12s %s", cname, cabbrev, cdesc);
+    pthread_mutex_unlock(&cmd_mutex);
+    cmd_reply(ctx, line);
+    pthread_mutex_lock(&cmd_mutex);
+    count++;
   }
+  pthread_mutex_unlock(&cmd_mutex);
+
+  return count;
 }
 
 // Built-in: help -- list all available commands, or show verbose help
 // for a specific command.
 //
 // Usage:
-//   !help            -- list all available commands
-//   !help <command>   -- show verbose help for a specific command
+//   /help            -- list all root commands
+//   /help <command>  -- show usage and subcommands
+//   /help -v <cmd>   -- verbose help (description + help_long)
 static void
 cmd_builtin_help(const cmd_ctx_t *ctx)
 {
-  // If an argument was provided, show verbose help for that command.
-  if(ctx->args != NULL && ctx->args[0] != '\0')
+  // No arguments: list all root commands.
+  if(ctx->args == NULL || ctx->args[0] == '\0')
   {
-    help_show_command(ctx, ctx->args);
+    cmd_reply(ctx, "Available commands:");
+
+    char hdr[256];
+    snprintf(hdr, sizeof(hdr), "  %-20s %-12s %s",
+        "COMMAND", "ABBREV", "DESCRIPTION");
+    cmd_reply(ctx, hdr);
+    uint32_t count = 0;
+
+    pthread_mutex_lock(&cmd_mutex);
+    for(cmd_def_t *d = cmd_list; d != NULL; d = d->next)
+    {
+      if(d->parent != NULL)
+        continue;
+      if(!help_check_access(ctx, d))
+        continue;
+
+      const char *name = d->name;
+      const char *abbrev = (d->abbrev[0] != '\0') ? d->abbrev : "-";
+      const char *desc = d->description ? d->description : "";
+      char line[256];
+      snprintf(line, sizeof(line), "  %-20s %-12s %s", name, abbrev, desc);
+
+      pthread_mutex_unlock(&cmd_mutex);
+      cmd_reply(ctx, line);
+      pthread_mutex_lock(&cmd_mutex);
+      count++;
+    }
+    pthread_mutex_unlock(&cmd_mutex);
+
+    char count_line[32];
+    snprintf(count_line, sizeof(count_line), "%u command(s)", count);
+    cmd_reply(ctx, count_line);
+    cmd_reply(ctx, "Use /help <command> for detailed information.");
     return;
   }
 
-  // No argument: list all available commands, grouped by module.
+  // Parse -v flag.
+  const char *args = ctx->args;
+  bool verbose = false;
+
+  if(strncmp(args, "-v ", 3) == 0 || strncmp(args, "-v\t", 3) == 0)
+  {
+    verbose = true;
+    args += 3;
+    while(*args == ' ' || *args == '\t')
+      args++;
+  }
+  else if(strcmp(args, "-v") == 0)
+  {
+    // -v with no command argument: error.
+    cmd_reply(ctx, "usage: /help [-v] [command ...]");
+    return;
+  }
+
+  // Resolve command path (e.g., "bot add" -> root "bot", child "add").
+  char cmd_path[CMD_USAGE_SZ] = {0};
+  const char *hp = args;
+  size_t hi = 0;
+
+  while(hp[hi] != '\0' && hp[hi] != ' ' && hp[hi] != '\t'
+      && hi < CMD_NAME_SZ - 1)
+  {
+    cmd_path[hi] = hp[hi];
+    hi++;
+  }
+
+  const char *rest = hp + hi;
+  while(*rest == ' ' || *rest == '\t')
+    rest++;
+
   pthread_mutex_lock(&cmd_mutex);
+  cmd_def_t *d = def_find_locked(cmd_path);
 
-  cmd_reply(ctx, "Available commands:");
+  if(d == NULL || d->parent != NULL)
+  {
+    pthread_mutex_unlock(&cmd_mutex);
+    char buf[CMD_NAME_SZ + 32];
+    snprintf(buf, sizeof(buf), "unknown command: %s", args);
+    cmd_reply(ctx, buf);
+    return;
+  }
 
-  method_type_t mt = (ctx->msg != NULL && ctx->msg->inst != NULL)
-      ? method_inst_type(ctx->msg->inst) : METHOD_T_ANY;
+  // Resolve subcommand path, building full path string.
+  while(d->children != NULL && rest[0] != '\0')
+  {
+    char tok[CMD_NAME_SZ] = {0};
+    size_t ti = 0;
 
-  char modules[64][CMD_MODULE_SZ];
-  uint32_t mod_count = help_collect_modules(ctx->bot, mt, modules);
+    while(rest[ti] != '\0' && rest[ti] != ' ' && rest[ti] != '\t'
+        && ti < CMD_NAME_SZ - 1)
+    {
+      tok[ti] = rest[ti];
+      ti++;
+    }
 
-  cmd_set_t *s = set_find_locked(ctx->bot);
+    cmd_def_t *child = def_find_child_locked(d, tok);
+    if(child == NULL)
+      break;
 
-  for(uint32_t m = 0; m < mod_count; m++)
-    help_list_module_locked(ctx, modules[m], mt, s);
+    size_t plen = strlen(cmd_path);
+    if(plen + 1 + ti < sizeof(cmd_path))
+    {
+      cmd_path[plen] = ' ';
+      memcpy(cmd_path + plen + 1, tok, ti);
+      cmd_path[plen + 1 + ti] = '\0';
+    }
+
+    d = child;
+    rest += ti;
+    while(*rest == ' ' || *rest == '\t')
+      rest++;
+  }
+
+  // Copy fields while holding the lock.
+  const char *usage = d->usage;
+  const char *description = d->description;
+  const char *help_long = d->help_long;
+  bool has_children = (d->children != NULL);
 
   pthread_mutex_unlock(&cmd_mutex);
 
-  cmd_reply(ctx, "Use help <command> for detailed information.");
+  // Always show usage line.
+  if(usage != NULL && usage[0] != '\0')
+  {
+    char line[CMD_USAGE_SZ + 16];
+    snprintf(line, sizeof(line), "usage: /%s", usage);
+    cmd_reply(ctx, line);
+  }
+
+  // Verbose: show description, help_long.
+  if(verbose)
+  {
+    if(description != NULL && description[0] != '\0')
+      cmd_reply(ctx, description);
+
+    if(help_long != NULL && help_long[0] != '\0')
+    {
+      cmd_reply(ctx, "");
+      // Send help_long line-by-line (split on newlines).
+      size_t len = strlen(help_long);
+      char *buf = mem_alloc("cmd", "help_buf", len + 1);
+      memcpy(buf, help_long, len + 1);
+
+      char *text = buf;
+      char *nl;
+      while((nl = strchr(text, '\n')) != NULL)
+      {
+        *nl = '\0';
+        cmd_reply(ctx, text);
+        text = nl + 1;
+      }
+      if(*text != '\0')
+        cmd_reply(ctx, text);
+
+      mem_free(buf);
+    }
+  }
+
+  // Show child table.
+  if(has_children)
+  {
+    cmd_reply(ctx, "");
+
+    char shdr[CMD_USAGE_SZ + 32];
+    snprintf(shdr, sizeof(shdr), "subcommands of /%s:", cmd_path);
+    cmd_reply(ctx, shdr);
+
+    uint32_t child_count = help_show_children(ctx, d);
+
+    char count_buf[32];
+    snprintf(count_buf, sizeof(count_buf), "%u subcommand(s)", child_count);
+    cmd_reply(ctx, count_buf);
+  }
 }
 
-// Built-in: version — show program version.
+// Built-in: version -- show program version.
 static void
 cmd_builtin_version(const cmd_ctx_t *ctx)
 {
   cmd_reply(ctx, BM_VERSION_STR);
 }
 
-// Register a built-in command (internal helper).
-// module: providing module name
-// name: command name
-// usage: usage string
-// help: help text
-// help_long: verbose help text (may be NULL)
-// group: default group
-// level: default level
-// cb: callback
+// Built-in: show -- container for /show subcommands.
 static void
-register_builtin(const char *module, const char *name,
-    const char *usage, const char *help,
-    const char *help_long, const char *group, uint16_t level, cmd_cb_t cb)
+cmd_builtin_show(const cmd_ctx_t *ctx)
 {
-  cmd_def_t *d = mem_alloc("cmd", "def_builtin", sizeof(*d));
-  memset(d, 0, sizeof(*d));
-
-  if(module != NULL)
-    strncpy(d->module, module, CMD_MODULE_SZ - 1);
-
-  strncpy(d->name, name, CMD_NAME_SZ - 1);
-  strncpy(d->usage, usage, CMD_USAGE_SZ - 1);
-  strncpy(d->help, help, CMD_HELP_SZ - 1);
-
-  if(help_long != NULL)
-    strncpy(d->help_long, help_long, CMD_HELP_LONG_SZ - 1);
-
-  strncpy(d->group, group, USERNS_GROUP_SZ - 1);
-  d->level = level;
-  d->cb = cb;
-  d->builtin = true;
-  d->methods = METHOD_T_ANY;
-
-  d->next = cmd_list;
-  cmd_list = d;
-  cmd_def_count++;
+  cmd_reply(ctx, "usage: /show <subcommand> ...");
 }
+
+// Built-in: set -- container for /set subcommands.
+static void
+cmd_builtin_set(const cmd_ctx_t *ctx)
+{
+  cmd_reply(ctx, "usage: /set <subcommand> ...");
+}
+
 
 // -----------------------------------------------------------------------
 // Command definition accessors
@@ -1843,13 +1509,13 @@ cmd_get_usage(const cmd_def_t *def)
   return(def != NULL ? def->usage : NULL);
 }
 
-// Get the brief help text for a command definition.
-// returns: help string, or NULL if def is NULL
+// Get the single-line description for a command definition.
+// returns: description string, or NULL if def is NULL
 // def: command definition
 const char *
-cmd_get_help(const cmd_def_t *def)
+cmd_get_description(const cmd_def_t *def)
 {
-  return(def != NULL ? def->help : NULL);
+  return(def != NULL ? def->description : NULL);
 }
 
 // Get the verbose help text for a command definition.
@@ -1944,11 +1610,11 @@ cmd_get_scope(const cmd_def_t *def)
 // Command iteration
 // -----------------------------------------------------------------------
 
-// Iterate top-level system commands, invoking cb for each.
-// cb: callback invoked for each system command
+// Iterate top-level root commands (parent == NULL).
+// cb: callback invoked for each root command
 // data: opaque user data passed to cb
 void
-cmd_iterate_system(cmd_iter_cb_t cb, void *data)
+cmd_iterate_root(cmd_iter_cb_t cb, void *data)
 {
   if(cb == NULL)
     return;
@@ -1957,31 +1623,7 @@ cmd_iterate_system(cmd_iter_cb_t cb, void *data)
 
   for(cmd_def_t *d = cmd_list; d != NULL; d = d->next)
   {
-    if(!d->system || d->parent != NULL)
-      continue;
-
-    pthread_mutex_unlock(&cmd_mutex);
-    cb(d, data);
-    pthread_mutex_lock(&cmd_mutex);
-  }
-
-  pthread_mutex_unlock(&cmd_mutex);
-}
-
-// Iterate all system commands including subcommands.
-// cb: callback invoked for each system command
-// data: opaque user data passed to cb
-void
-cmd_iterate_system_all(cmd_iter_cb_t cb, void *data)
-{
-  if(cb == NULL)
-    return;
-
-  pthread_mutex_lock(&cmd_mutex);
-
-  for(cmd_def_t *d = cmd_list; d != NULL; d = d->next)
-  {
-    if(!d->system)
+    if(d->parent != NULL)
       continue;
 
     pthread_mutex_unlock(&cmd_mutex);
@@ -2015,52 +1657,6 @@ cmd_iterate_children(const cmd_def_t *parent, cmd_iter_cb_t cb, void *data)
   pthread_mutex_unlock(&cmd_mutex);
 }
 
-// Iterate top-level commands enabled on a bot instance.
-// Includes built-in commands and explicitly enabled plugin commands.
-// Skips subcommands.
-// inst: bot instance
-// cb: callback invoked for each enabled command
-// data: opaque user data passed to cb
-void
-cmd_iterate_bot(const bot_inst_t *inst, cmd_iter_cb_t cb, void *data)
-{
-  if(inst == NULL || cb == NULL)
-    return;
-
-  pthread_mutex_lock(&cmd_mutex);
-
-  // Yield built-in commands (always available on all bots).
-  for(cmd_def_t *d = cmd_list; d != NULL; d = d->next)
-  {
-    if(!d->builtin || d->parent != NULL)
-      continue;
-
-    pthread_mutex_unlock(&cmd_mutex);
-    cb(d, data);
-    pthread_mutex_lock(&cmd_mutex);
-  }
-
-  // Yield explicitly enabled commands.
-  cmd_set_t *s = set_find_locked(inst);
-
-  if(s != NULL)
-  {
-    for(cmd_binding_t *b = s->bindings; b != NULL; b = b->next)
-    {
-      cmd_def_t *d = def_find_locked(b->name);
-
-      if(d == NULL || d->parent != NULL || d->builtin)
-        continue;
-
-      pthread_mutex_unlock(&cmd_mutex);
-      cb(d, data);
-      pthread_mutex_lock(&cmd_mutex);
-    }
-  }
-
-  pthread_mutex_unlock(&cmd_mutex);
-}
-
 // -----------------------------------------------------------------------
 // Console method integration
 // -----------------------------------------------------------------------
@@ -2077,8 +1673,8 @@ cmd_set_console_inst(method_inst_t *inst)
 // System command dispatch (owner path)
 // -----------------------------------------------------------------------
 
-// Dispatch a system or built-in command as @owner on a given method instance.
-// Executes synchronously. Only system and built-in commands are allowed.
+// Dispatch a command as @owner on a given method instance.
+// Executes synchronously.
 // returns: SUCCESS if command was found and executed, FAIL otherwise
 // cmd_name: command name (without prefix)
 // args: argument string (may be empty or NULL)
@@ -2106,13 +1702,6 @@ cmd_dispatch_owner(const char *cmd_name, const char *args,
     return(FAIL);
   }
 
-  // Only system and built-in commands are dispatchable via this path.
-  if(!d->system && !d->builtin)
-  {
-    pthread_mutex_unlock(&cmd_mutex);
-    return(FAIL);
-  }
-
   // Resolve subcommand if the matched command has children.
   resolve_subcmd_locked(&d, &args);
 
@@ -2128,9 +1717,7 @@ cmd_dispatch_owner(const char *cmd_name, const char *args,
   cmd_cb_t cb = d->cb;
   const cmd_arg_desc_t *ad = d->arg_desc;
   uint8_t ac = d->arg_count;
-  char usage[CMD_USAGE_SZ];
-  memset(usage, 0, sizeof(usage));
-  memcpy(usage, d->usage, CMD_USAGE_SZ);
+  const char *usage = d->usage;
 
   pthread_mutex_unlock(&cmd_mutex);
 
@@ -2191,17 +1778,29 @@ cmd_init(void)
 {
   pthread_mutex_init(&cmd_mutex, NULL);
 
-  // Register built-in commands (always available per-bot).
-  register_builtin("core", "help", "help [command]",
-      "List available commands",
-      "Lists all commands available on this bot instance, including\n"
-      "built-in and enabled commands. Use help <command> to see\n"
-      "detailed usage, description, and permission requirements\n"
-      "for a specific command.",
-      USERNS_GROUP_EVERYONE, 0, cmd_builtin_help);
-  register_builtin("core", "version", "version", "Show program version",
-      NULL,
-      USERNS_GROUP_EVERYONE, 0, cmd_builtin_version);
+  // Register core built-in commands.
+  cmd_register("core", "help", "help [-v] [command ...]",
+      "Command reference",
+      "Lists all commands available on this bot instance.\n"
+      "Use /help <command> to see usage and subcommands.\n"
+      "Use /help -v <command> for verbose help.",
+      USERNS_GROUP_EVERYONE, 0, CMD_SCOPE_ANY, METHOD_T_ANY,
+      cmd_builtin_help, NULL, NULL, "h", NULL, 0);
+
+  cmd_register("core", "show", "show <subcommand> ...",
+      "Show system information", NULL,
+      USERNS_GROUP_ADMIN, 100, CMD_SCOPE_ANY, METHOD_T_ANY,
+      cmd_builtin_show, NULL, NULL, "sh", NULL, 0);
+
+  cmd_register("core", "set", "set <subcommand> ...",
+      "Configure system settings", NULL,
+      USERNS_GROUP_ADMIN, 100, CMD_SCOPE_ANY, METHOD_T_ANY,
+      cmd_builtin_set, NULL, NULL, NULL, NULL, 0);
+
+  cmd_register("core", "version", "version",
+      "Show program version", NULL,
+      USERNS_GROUP_EVERYONE, 0, CMD_SCOPE_ANY, METHOD_T_ANY,
+      cmd_builtin_version, NULL, NULL, NULL, NULL, 0);
 
   cmd_ready = true;
 
@@ -2210,6 +1809,21 @@ cmd_init(void)
 }
 
 // Get lifetime command dispatch counters (thread-safe, atomic reads).
+// Get command subsystem statistics (thread-safe snapshot).
+void
+cmd_get_stats(cmd_stats_t *out)
+{
+  if(out == NULL)
+    return;
+
+  pthread_mutex_lock(&cmd_mutex);
+  out->registered = cmd_def_count;
+  pthread_mutex_unlock(&cmd_mutex);
+
+  out->dispatches = __atomic_load_n(&cmd_stat_dispatches, __ATOMIC_RELAXED);
+  out->denials    = __atomic_load_n(&cmd_stat_denials, __ATOMIC_RELAXED);
+}
+
 // dispatches: output for successful dispatch count (may be NULL)
 // denials: output for permission denial count (may be NULL)
 void
@@ -2236,10 +1850,8 @@ cmd_exit(void)
     set_count++;
 
   clam(CLAM_INFO, "cmd_exit",
-      "shutting down (%u commands, %u bot sets, "
-      "%u freelisted bindings, %u freelisted sets)",
-      cmd_def_count, set_count,
-      cmd_bind_free_count, cmd_set_free_count);
+      "shutting down (%u commands, %u bot sets, %u freelisted sets)",
+      cmd_def_count, set_count, cmd_set_free_count);
 
   cmd_ready = false;
 
@@ -2249,17 +1861,6 @@ cmd_exit(void)
   while(s != NULL)
   {
     cmd_set_t *snext = s->next;
-
-    // Free bindings.
-    cmd_binding_t *b = s->bindings;
-
-    while(b != NULL)
-    {
-      cmd_binding_t *bnext = b->next;
-      mem_free(b);
-      b = bnext;
-    }
-
     mem_free(s);
     s = snext;
   }
@@ -2278,19 +1879,6 @@ cmd_exit(void)
 
   cmd_list = NULL;
   cmd_def_count = 0;
-
-  // Free binding freelist.
-  cmd_binding_t *b = cmd_bind_freelist;
-
-  while(b != NULL)
-  {
-    cmd_binding_t *bnext = b->next;
-    mem_free(b);
-    b = bnext;
-  }
-
-  cmd_bind_freelist = NULL;
-  cmd_bind_free_count = 0;
 
   // Free set freelist.
   cmd_set_t *sf = cmd_set_freelist;

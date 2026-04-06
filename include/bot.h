@@ -199,6 +199,24 @@ void bot_session_clear(bot_inst_t *inst);
 // inst: bot instance
 uint32_t bot_session_count(const bot_inst_t *inst);
 
+// Callback for session iteration.
+// username: authenticated username
+// method_name: method instance name the session is on
+// auth_time: when the user authenticated
+// last_seen: last activity timestamp
+// data: opaque user data
+typedef void (*bot_session_iter_cb_t)(const char *username,
+    const char *method_name, time_t auth_time, time_t last_seen,
+    void *data);
+
+// Iterate active sessions for a bot instance. Locks bot_mutex for
+// the duration of the iteration.
+// inst: bot instance
+// cb: callback invoked for each active session
+// data: opaque user data passed to cb
+void bot_session_iterate(const bot_inst_t *inst,
+    bot_session_iter_cb_t cb, void *data);
+
 // -----------------------------------------------------------------------
 // Lifecycle
 // -----------------------------------------------------------------------
@@ -243,10 +261,13 @@ void bot_get_stats(bot_stats_t *out);
 // method_count: number of bound methods
 // session_count: number of active sessions
 // userns_name: bound user namespace name, or NULL
+// cmd_count: lifetime commands dispatched for this bot
+// last_activity: timestamp of last message received (0 if never)
 // data: opaque user data
 typedef void (*bot_iter_cb_t)(const char *name, const char *driver_name,
     bot_state_t state, uint32_t method_count, uint32_t session_count,
-    const char *userns_name, void *data);
+    const char *userns_name, uint64_t cmd_count, time_t last_activity,
+    void *data);
 
 // Iterate all bot instances, calling cb for each.
 // cb: callback invoked for each instance
@@ -262,6 +283,11 @@ const char *bot_driver_name(const bot_inst_t *inst);
 // returns: method count
 // inst: bot instance
 uint32_t bot_method_count(const bot_inst_t *inst);
+
+// Increment the command dispatch counter for a bot instance.
+// Called by cmd_dispatch() on successful command dispatch.
+// inst: bot instance
+void bot_inc_cmd_count(bot_inst_t *inst);
 
 // -----------------------------------------------------------------------
 // Lifecycle
@@ -343,6 +369,8 @@ struct bot_inst
   bot_session_t         *sessions;     // active authenticated sessions
   uint32_t               session_count;
   uint64_t               msg_count;    // total messages received
+  uint64_t               cmd_count;    // total commands dispatched
+  time_t                 last_activity; // last message received
   struct bot_inst       *next;
 };
 

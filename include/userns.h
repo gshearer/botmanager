@@ -54,6 +54,21 @@ typedef struct userns
   struct userns *next;                // linked list chain
 } userns_t;
 
+// User namespace subsystem statistics.
+typedef struct
+{
+  uint32_t namespaces;        // loaded namespaces
+  uint32_t users;             // total users across namespaces (from DB)
+  uint64_t auth_attempts;     // lifetime identify attempts
+  uint64_t auth_failures;     // lifetime failed attempts
+  uint64_t mfa_matches;       // lifetime successful MFA auto-matches
+  uint64_t discoveries;       // lifetime user discovery events
+} userns_stats_t;
+
+// Get user namespace subsystem statistics (thread-safe snapshot).
+// out: destination for the snapshot
+void userns_get_stats(userns_stats_t *out);
+
 // Initialize the user namespace subsystem. Must be called after db_init().
 // Loads all existing namespaces from the database.
 // returns: SUCCESS or FAIL
@@ -427,6 +442,12 @@ extern userns_t        *userns_list;
 extern pthread_mutex_t  userns_mutex;
 extern uint32_t         userns_total;
 extern bool             userns_ready;
+
+// Lifetime counters for statistics (atomic, no lock needed).
+extern uint64_t         userns_stat_auth_attempts;
+extern uint64_t         userns_stat_auth_failures;
+extern uint64_t         userns_stat_mfa_matches;
+extern uint64_t         userns_stat_discoveries;
 
 // Argon2id parameters.
 #define ARGON2_T_COST    3          // iterations
