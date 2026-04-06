@@ -152,7 +152,8 @@ admin_cmd_bot_del(const cmd_ctx_t *ctx)
 static void
 botlist_cb(const char *name, const char *driver_name,
     bot_state_t state, uint32_t method_count, uint32_t session_count,
-    const char *userns_name, void *data)
+    const char *userns_name, uint64_t cmd_count, time_t last_activity,
+    void *data)
 {
   botlist_state_t *st = data;
   char line[256];
@@ -481,14 +482,6 @@ static void
 admin_cmd_bot(const cmd_ctx_t *ctx)
 {
   cmd_reply(ctx, "usage: /bot <subcommand> ...");
-  cmd_reply(ctx, "  add <name> <kind>        — create a bot instance");
-  cmd_reply(ctx, "  del <name>               — destroy a bot instance");
-  cmd_reply(ctx, "  list                     — list all bot instances");
-  cmd_reply(ctx, "  start <name>             — start a bot instance");
-  cmd_reply(ctx, "  stop <name>              — stop a bot instance");
-  cmd_reply(ctx, "  bind <bot> <method>      — bind a method to a bot");
-  cmd_reply(ctx, "  unbind <bot> <method>    — unbind a method from a bot");
-  cmd_reply(ctx, "  userns <bot> <namespace> — set user namespace for a bot");
 }
 
 // -----------------------------------------------------------------------
@@ -510,13 +503,13 @@ void
 admin_register_bot_commands(void)
 {
   // Bot management: parent command + subcommands.
-  cmd_register_system("admin", "bot",
+  cmd_register("admin", "bot",
       "bot <subcommand> ...",
       "Manage bot instances",
       NULL,
       USERNS_GROUP_ADMIN, 100, CMD_SCOPE_ANY, METHOD_T_ANY, admin_cmd_bot, NULL, NULL, NULL, NULL, 0);
 
-  cmd_register_system("admin", "add",
+  cmd_register("admin", "add",
       "bot add <name> <kind>",
       "Create a bot instance",
       "Creates a new bot instance with the given name and kind.\n"
@@ -525,7 +518,7 @@ admin_register_bot_commands(void)
       USERNS_GROUP_ADMIN, 100, CMD_SCOPE_ANY, METHOD_T_ANY, admin_cmd_bot_add, NULL, "bot", NULL,
       ad_bot_name_kind, 2);
 
-  cmd_register_system("admin", "del",
+  cmd_register("admin", "del",
       "bot del <name>",
       "Destroy a bot instance",
       "Stops (if running) and destroys a bot instance.\n"
@@ -533,14 +526,14 @@ admin_register_bot_commands(void)
       USERNS_GROUP_ADMIN, 100, CMD_SCOPE_ANY, METHOD_T_ANY, admin_cmd_bot_del, NULL, "bot", NULL,
       ad_bot_name, 1);
 
-  cmd_register_system("admin", "list",
+  cmd_register("admin", "list",
       "bot list",
       "List all bot instances",
       "Shows all bot instances with their state, method count,\n"
       "session count, and user namespace.",
       USERNS_GROUP_ADMIN, 100, CMD_SCOPE_ANY, METHOD_T_ANY, admin_cmd_bot_list, NULL, "bot", "ls", NULL, 0);
 
-  cmd_register_system("admin", "start",
+  cmd_register("admin", "start",
       "bot start <name>",
       "Start a bot instance",
       "Starts a bot instance. Creates method instances and\n"
@@ -549,7 +542,7 @@ admin_register_bot_commands(void)
       USERNS_GROUP_ADMIN, 100, CMD_SCOPE_ANY, METHOD_T_ANY, admin_cmd_bot_start, NULL, "bot", NULL,
       ad_bot_name, 1);
 
-  cmd_register_system("admin", "stop",
+  cmd_register("admin", "stop",
       "bot stop <name>",
       "Stop a bot instance",
       "Stops a running bot instance. Disconnects method\n"
@@ -557,7 +550,7 @@ admin_register_bot_commands(void)
       USERNS_GROUP_ADMIN, 100, CMD_SCOPE_ANY, METHOD_T_ANY, admin_cmd_bot_stop, NULL, "bot", NULL,
       ad_bot_name, 1);
 
-  cmd_register_system("admin", "bind",
+  cmd_register("admin", "bind",
       "bot bind <bot> <method>",
       "Bind a method to a bot",
       "Binds a method plugin to a bot instance. The bot must\n"
@@ -567,7 +560,7 @@ admin_register_bot_commands(void)
       USERNS_GROUP_ADMIN, 100, CMD_SCOPE_ANY, METHOD_T_ANY, admin_cmd_bot_bind, NULL, "bot", NULL,
       ad_bot_method, 2);
 
-  cmd_register_system("admin", "unbind",
+  cmd_register("admin", "unbind",
       "bot unbind <bot> <method>",
       "Unbind a method from a bot",
       "Unbinds a method from a bot instance. The bot must\n"
@@ -575,7 +568,7 @@ admin_register_bot_commands(void)
       USERNS_GROUP_ADMIN, 100, CMD_SCOPE_ANY, METHOD_T_ANY, admin_cmd_bot_unbind, NULL, "bot", NULL,
       ad_bot_method, 2);
 
-  cmd_register_system("admin", "userns",
+  cmd_register("admin", "userns",
       "bot userns <bot> <namespace>",
       "Set user namespace for a bot",
       "Sets the user namespace for a bot instance. The namespace\n"
@@ -585,7 +578,7 @@ admin_register_bot_commands(void)
       USERNS_GROUP_ADMIN, 100, CMD_SCOPE_ANY, METHOD_T_ANY, admin_cmd_bot_userns, NULL, "bot",
       NULL, ad_bot_userns, 2);
 
-  cmd_register_system("admin", "quit", "quit",
+  cmd_register("admin", "quit", "quit",
       "Graceful shutdown",
       "Initiates a graceful shutdown of BotManager. All in-flight\n"
       "work is drained, plugins are unloaded in reverse dependency\n"

@@ -530,10 +530,7 @@ mfa_list_cb(const char *pattern, void *data)
 static void
 admin_cmd_mfa(const cmd_ctx_t *ctx)
 {
-  cmd_reply(ctx, "usage: /mfa <add|del|list> ...");
-  cmd_reply(ctx, "  add <ns> <user> <pattern>  — add an MFA pattern");
-  cmd_reply(ctx, "  del <ns> <user> <pattern>  — remove an MFA pattern");
-  cmd_reply(ctx, "  list <ns> <user>           — list MFA patterns");
+  cmd_reply(ctx, "usage: /mfa <subcommand> ...");
 }
 
 // /mfa add <namespace> <username> <pattern>
@@ -651,7 +648,7 @@ void
 admin_register_user_commands(void)
 {
   // User management commands.
-  cmd_register_system("admin", "useradd",
+  cmd_register("admin", "useradd",
       "useradd <namespace> <username> <password>",
       "Create a user in a namespace",
       "Creates a new user in the specified namespace. The password\n"
@@ -661,7 +658,7 @@ admin_register_user_commands(void)
       USERNS_GROUP_ADMIN, 100, CMD_SCOPE_ANY, METHOD_T_ANY, admin_cmd_useradd, NULL, NULL, NULL,
       ad_useradd, 3);
 
-  cmd_register_system("admin", "userdel",
+  cmd_register("admin", "userdel",
       "userdel <namespace> <username>",
       "Delete a user from a namespace",
       "Deletes a user and all their group memberships from the\n"
@@ -669,7 +666,7 @@ admin_register_user_commands(void)
       USERNS_GROUP_ADMIN, 100, CMD_SCOPE_ANY, METHOD_T_ANY, admin_cmd_userdel, NULL, NULL, NULL,
       ad_ns_user, 2);
 
-  cmd_register_system("admin", "userlist",
+  cmd_register("admin", "userlist",
       "userlist <namespace>",
       "List users in a namespace",
       "Lists all users in the specified namespace with their\n"
@@ -677,7 +674,7 @@ admin_register_user_commands(void)
       USERNS_GROUP_ADMIN, 100, CMD_SCOPE_ANY, METHOD_T_ANY, admin_cmd_userlist, NULL, NULL, NULL,
       ad_ns, 1);
 
-  cmd_register_system("admin", "userinfo",
+  cmd_register("admin", "userinfo",
       "userinfo <namespace> <username>",
       "Show user details and group memberships",
       "Displays information about a user including all group\n"
@@ -685,7 +682,7 @@ admin_register_user_commands(void)
       USERNS_GROUP_ADMIN, 100, CMD_SCOPE_ANY, METHOD_T_ANY, admin_cmd_userinfo, NULL, NULL, NULL,
       ad_ns_user, 2);
 
-  cmd_register_system("admin", "passwd",
+  cmd_register("admin", "passwd",
       "passwd <namespace> <username> <newpassword>",
       "Reset a user's password",
       "Administratively resets a user's password without requiring\n"
@@ -695,7 +692,7 @@ admin_register_user_commands(void)
       ad_passwd, 3);
 
   // Group management commands.
-  cmd_register_system("admin", "groupadd",
+  cmd_register("admin", "groupadd",
       "groupadd <namespace> <name> [description]",
       "Create a group in a namespace",
       "Creates a new group in the specified namespace. An optional\n"
@@ -704,7 +701,7 @@ admin_register_user_commands(void)
       USERNS_GROUP_ADMIN, 100, CMD_SCOPE_ANY, METHOD_T_ANY, admin_cmd_groupadd, NULL, NULL, NULL,
       ad_groupadd, 3);
 
-  cmd_register_system("admin", "groupdel",
+  cmd_register("admin", "groupdel",
       "groupdel <namespace> <name>",
       "Delete a group from a namespace",
       "Deletes a group and all its memberships from the specified\n"
@@ -713,7 +710,7 @@ admin_register_user_commands(void)
       USERNS_GROUP_ADMIN, 100, CMD_SCOPE_ANY, METHOD_T_ANY, admin_cmd_groupdel, NULL, NULL, NULL,
       ad_ns_user, 2);
 
-  cmd_register_system("admin", "grouplist",
+  cmd_register("admin", "grouplist",
       "grouplist <namespace>",
       "List groups in a namespace",
       "Lists all groups in the specified namespace with their\n"
@@ -722,7 +719,7 @@ admin_register_user_commands(void)
       ad_ns, 1);
 
   // Membership commands.
-  cmd_register_system("admin", "grant",
+  cmd_register("admin", "grant",
       "grant <namespace> <username> <group> <level>",
       "Grant group membership to a user",
       "Adds a user to a group with the specified privilege level\n"
@@ -731,7 +728,7 @@ admin_register_user_commands(void)
       USERNS_GROUP_ADMIN, 100, CMD_SCOPE_ANY, METHOD_T_ANY, admin_cmd_grant, NULL, NULL, NULL,
       ad_grant, 4);
 
-  cmd_register_system("admin", "revoke",
+  cmd_register("admin", "revoke",
       "revoke <namespace> <username> <group>",
       "Revoke group membership from a user",
       "Removes a user from a group. The user will no longer have\n"
@@ -740,7 +737,7 @@ admin_register_user_commands(void)
       ad_revoke, 3);
 
   // MFA management: parent command + subcommands.
-  cmd_register_system("admin", "mfa",
+  cmd_register("admin", "mfa",
       "mfa <add|del|list> ...",
       "Manage user MFA patterns",
       "Manages glob-based MFA patterns in handle!username@hostname\n"
@@ -749,21 +746,21 @@ admin_register_user_commands(void)
       "configurable via core.userns.max_mfa (default 10).",
       USERNS_GROUP_ADMIN, 100, CMD_SCOPE_ANY, METHOD_T_ANY, admin_cmd_mfa, NULL, NULL, NULL, NULL, 0);
 
-  cmd_register_system("admin", "add",
+  cmd_register("admin", "add",
       "mfa add <namespace> <username> <pattern>",
       "Add an MFA pattern to a user",
       NULL,
       USERNS_GROUP_ADMIN, 100, CMD_SCOPE_ANY, METHOD_T_ANY, admin_cmd_mfa_add, NULL, "mfa", NULL,
       ad_mfa_add, 3);
 
-  cmd_register_system("admin", "del",
+  cmd_register("admin", "del",
       "mfa del <namespace> <username> <pattern>",
       "Remove an MFA pattern from a user",
       NULL,
       USERNS_GROUP_ADMIN, 100, CMD_SCOPE_ANY, METHOD_T_ANY, admin_cmd_mfa_del, NULL, "mfa", NULL,
       ad_mfa_add, 3);
 
-  cmd_register_system("admin", "list",
+  cmd_register("admin", "list",
       "mfa list <namespace> <username>",
       "List MFA patterns for a user",
       NULL,

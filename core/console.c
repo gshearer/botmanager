@@ -564,22 +564,12 @@ con_complete_command(const char *text)
   else
   {
     m.prefix     = text;
-    m.with_slash = true;   // always return /name for system commands
+    m.with_slash = true;   // always return /name for commands
   }
 
   m.prefix_len = strlen(m.prefix);
 
-  cmd_iterate_system(con_comp_cmd_cb, &m);
-
-  // When attached, also include bot-level commands.
-  if(con_attached_bot != NULL)
-  {
-    con_cmd_match_t bm;
-    bm.prefix     = m.prefix;
-    bm.prefix_len = m.prefix_len;
-    bm.with_slash = true;
-    cmd_iterate_bot(con_attached_bot, con_comp_cmd_cb, &bm);
-  }
+  cmd_iterate_root(con_comp_cmd_cb, &m);
 }
 
 // Collect subcommand names matching a prefix under a parent command.
@@ -609,7 +599,8 @@ typedef struct
 static void
 con_comp_bot_cb(const char *name, const char *driver_name,
     bot_state_t state, uint32_t method_count,
-    uint32_t session_count, const char *userns_name, void *data)
+    uint32_t session_count, const char *userns_name,
+    uint64_t cmd_count, time_t last_activity, void *data)
 {
   (void)driver_name;
   (void)method_count;
@@ -1409,7 +1400,7 @@ static const method_driver_t console_driver = {
 static void
 console_register_commands(void)
 {
-  cmd_register_system("console", "console",
+  cmd_register("console", "console",
       "console <subcommand> ...",
       "Console attach/associate management",
       "Manage console bot attachment and user association.\n"
@@ -1419,7 +1410,7 @@ console_register_commands(void)
       METHOD_T_CONSOLE | METHOD_T_BOTMANCTL,
       con_cmd_console, NULL, NULL, "con", NULL, 0);
 
-  cmd_register_system("console", "attach",
+  cmd_register("console", "attach",
       "console attach <botname>",
       "Attach console to a bot instance",
       "Attaches the console to a running bot instance. All subsequent\n"
@@ -1430,7 +1421,7 @@ console_register_commands(void)
       METHOD_T_ANY,
       con_cmd_attach, NULL, "console", "at", con_ad_attach, 1);
 
-  cmd_register_system("console", "unattach",
+  cmd_register("console", "unattach",
       "console unattach",
       "Detach console from bot",
       "Detaches the console from the currently attached bot.\n"
@@ -1439,7 +1430,7 @@ console_register_commands(void)
       METHOD_T_ANY,
       con_cmd_unattach, NULL, "console", "uat", NULL, 0);
 
-  cmd_register_system("console", "associate",
+  cmd_register("console", "associate",
       "console associate <username>",
       "Set console user identity",
       "Sets the user identity for console commands dispatched to the\n"
@@ -1450,7 +1441,7 @@ console_register_commands(void)
       METHOD_T_ANY,
       con_cmd_associate, NULL, "console", "as", con_ad_associate, 1);
 
-  cmd_register_system("console", "unassociate",
+  cmd_register("console", "unassociate",
       "console unassociate",
       "Reset console user to @owner",
       "Resets the console user identity to the built-in @owner user.\n"
@@ -1460,7 +1451,7 @@ console_register_commands(void)
       con_cmd_unassociate, NULL, "console", "uas", NULL, 0);
 
   // /history parent and subcommands.
-  cmd_register_system("console", "history",
+  cmd_register("console", "history",
       "history <subcommand> ...",
       "Command history management",
       "View, search, and manage console command history.\n"
@@ -1469,7 +1460,7 @@ console_register_commands(void)
       METHOD_T_CONSOLE,
       con_cmd_history, NULL, NULL, "hist", NULL, 0);
 
-  cmd_register_system("console", "list",
+  cmd_register("console", "list",
       "history list [count]",
       "Show recent history entries",
       "Displays the last N history entries (default 20).\n"
@@ -1479,7 +1470,7 @@ console_register_commands(void)
       con_cmd_history_list, NULL, "history", "ls",
       con_ad_history_list, 1);
 
-  cmd_register_system("console", "clear",
+  cmd_register("console", "clear",
       "history clear",
       "Clear all command history",
       "Clears the in-memory history and removes the history file.",
@@ -1487,7 +1478,7 @@ console_register_commands(void)
       METHOD_T_ANY,
       con_cmd_history_clear, NULL, "history", "cl", NULL, 0);
 
-  cmd_register_system("console", "search",
+  cmd_register("console", "search",
       "history search <pattern>",
       "Search history for a substring",
       "Searches all history entries for the given substring and\n"
@@ -1498,7 +1489,7 @@ console_register_commands(void)
       con_ad_history_search, 1);
 
   // /clear — clear the terminal screen.
-  cmd_register_system("console", "clear",
+  cmd_register("console", "clear",
       "clear",
       "Clear the terminal screen",
       "Clears the terminal screen and redraws the prompt.",
@@ -1609,6 +1600,11 @@ console_register_method(time_t start_time)
     read_history(con_history_path);
 
   stifle_history((int)con_history_size);
+
+  // Disable bracketed paste mode so multi-line paste (e.g., from
+  // bottest.txt) is processed line-by-line instead of being treated
+  // as a single input block.
+  rl_variable_bind("enable-bracketed-paste", "off");
 
   // Install custom tab completion.
   rl_attempted_completion_function = con_completion;

@@ -1,6 +1,12 @@
 #ifndef BM_MAIN_H
 #define BM_MAIN_H
 
+#include <time.h>
+
+// Program start timestamp, set once at startup.
+// Used for uptime reporting in /status.
+extern time_t bm_start_time;
+
 #ifdef MAIN_INTERNAL
 
 #include "common.h"

@@ -444,13 +444,12 @@ mem_cmd_show(const cmd_ctx_t *ctx)
 void
 mem_register_commands(void)
 {
-  cmd_register_system("mem", "memory",
+  cmd_register("mem", "memory",
       "show memory",
       "Show memory utilization",
-      "Displays a table of tracked heap allocations aggregated\n"
-      "by module and allocation name, showing the count and total\n"
-      "bytes for each category.",
-      USERNS_GROUP_ADMIN, 100, CMD_SCOPE_ANY, METHOD_T_ANY, mem_cmd_show, NULL, "show", "mem", NULL, 0);
+      NULL,
+      USERNS_GROUP_ADMIN, 100, CMD_SCOPE_ANY, METHOD_T_ANY,
+      mem_cmd_show, NULL, "show", "mem", NULL, 0);
 }
 
 // Initialize the memory subsystem. Must be called before any mem_alloc.

@@ -182,9 +182,6 @@ cmdbot_create(bot_inst_t *inst)
   if(prefix != NULL && prefix[0] != '\0')
     cmd_set_prefix(inst, prefix);
 
-  // Enable all registered user commands (auth, service, etc.).
-  cmd_enable_all(inst);
-
   return(st);
 }
 
@@ -254,10 +251,7 @@ cmdbot_init(void)
   if(cmd_register("command", "identify",
         "identify <username> <password>",
         "Authenticate with the bot",
-        "Authenticate with the bot's user namespace using your\n"
-        "username and password. Once authenticated, you can use\n"
-        "commands that require group membership or elevated\n"
-        "privileges. Use deauth to end your session.",
+        NULL,
         USERNS_GROUP_EVERYONE, 0, CMD_SCOPE_PRIVATE, METHOD_T_ANY, cmd_identify, NULL,
         NULL, NULL, cmdbot_ad_identify, 2) != SUCCESS)
     return(FAIL);
@@ -265,10 +259,7 @@ cmdbot_init(void)
   if(cmd_register("command", "deauth",
         "deauth",
         "End your authenticated session",
-        "Ends your current authenticated session on this method.\n"
-        "After deauthenticating, you are treated as an anonymous\n"
-        "user and can only access commands in the everyone group\n"
-        "at level 0.",
+        NULL,
         USERNS_GROUP_EVERYONE, 0, CMD_SCOPE_ANY, METHOD_T_ANY, cmd_deauth, NULL, NULL,
         NULL, NULL, 0) != SUCCESS)
   {
@@ -279,10 +270,7 @@ cmdbot_init(void)
   if(cmd_register("command", "register",
         "register <password>",
         "Set password for a discovered account",
-        "Set the initial password for your auto-discovered account.\n"
-        "This command is for users whose accounts were created via\n"
-        "user discovery (MFA pattern matching). Once a password is\n"
-        "set, use identify to authenticate in future sessions.",
+        NULL,
         USERNS_GROUP_EVERYONE, 0, CMD_SCOPE_PRIVATE, METHOD_T_ANY, cmd_register_user,
         NULL, NULL, "reg", cmdbot_ad_register, 1) != SUCCESS)
   {

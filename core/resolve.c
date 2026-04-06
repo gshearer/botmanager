@@ -1058,7 +1058,20 @@ resolve_register_commands(void)
       "  !resolve 8.8.8.8\n"
       "  !resolve 2001:4860:4860::8888",
       USERNS_GROUP_EVERYONE, 0, CMD_SCOPE_ANY, METHOD_T_ANY, resolve_cmd_resolve, NULL, NULL, "res",
-      resolve_cmd_ad, 2);
+      NULL, 0);
+}
+
+// -----------------------------------------------------------------------
+// Statistics
+// -----------------------------------------------------------------------
+
+void
+resolve_get_stats(resolve_stats_t *out)
+{
+  if(out == NULL)
+    return;
+
+  memset(out, 0, sizeof(*out));
 }
 
 // -----------------------------------------------------------------------

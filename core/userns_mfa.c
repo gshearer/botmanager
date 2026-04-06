@@ -431,6 +431,7 @@ userns_mfa_match(const userns_t *ns, const char *mfa_string)
       matched_user[USERNS_USER_SZ - 1] = '\0';
 
       pthread_rwlock_unlock(&c->lock);
+      __atomic_add_fetch(&userns_stat_mfa_matches, 1, __ATOMIC_RELAXED);
       return(matched_user);
     }
   }

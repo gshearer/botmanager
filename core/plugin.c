@@ -695,6 +695,16 @@ plugin_count(void)
   return(n_plugins);
 }
 
+void
+plugin_get_stats(plugin_stats_t *out)
+{
+  if(out == NULL)
+    return;
+
+  memset(out, 0, sizeof(*out));
+  out->loaded = n_plugins;
+}
+
 // returns: human-readable name of a plugin type
 // t: plugin type enum value
 const char *
@@ -1529,63 +1539,7 @@ static const cmd_arg_desc_t ad_plugin_cmd_name[] = {
 static void
 plugin_cmd_plugin(const cmd_ctx_t *ctx)
 {
-  (void)ctx;
   cmd_reply(ctx, "usage: /plugin <subcommand> ...");
-  cmd_reply(ctx, "  load <name>    — load a plugin from disk");
-  cmd_reply(ctx, "  unload <name>  — unload a running plugin");
-}
-
-// State for collecting bot names during iteration.
-#define PLUGIN_BOT_COLLECT_MAX 32
-
-typedef struct
-{
-  char names[PLUGIN_BOT_COLLECT_MAX][BOT_NAME_SZ];
-  uint32_t count;
-} plugin_bot_collect_t;
-
-// bot_iterate callback: collect bot names.
-static void
-plugin_collect_bot_cb(const char *name, const char *driver_name,
-    bot_state_t state, uint32_t method_count, uint32_t session_count,
-    const char *userns_name, void *data)
-{
-  (void)driver_name;
-  (void)state;
-  (void)method_count;
-  (void)session_count;
-  (void)userns_name;
-
-  plugin_bot_collect_t *c = data;
-
-  if(c->count < PLUGIN_BOT_COLLECT_MAX)
-  {
-    strncpy(c->names[c->count], name, BOT_NAME_SZ - 1);
-    c->names[c->count][BOT_NAME_SZ - 1] = '\0';
-    c->count++;
-  }
-}
-
-// Re-enable user commands on all active bot instances.
-// Called after a plugin is loaded at runtime so that any commands
-// the plugin registered during init become available.
-static void
-plugin_enable_bot_commands(void)
-{
-  // Collect bot names first (bot_iterate holds bot_mutex, so we
-  // cannot call bot_find or cmd_enable_all inside the callback).
-  plugin_bot_collect_t bots;
-
-  memset(&bots, 0, sizeof(bots));
-  bot_iterate(plugin_collect_bot_cb, &bots);
-
-  for(uint32_t i = 0; i < bots.count; i++)
-  {
-    bot_inst_t *inst = bot_find(bots.names[i]);
-
-    if(inst != NULL)
-      cmd_enable_all(inst);
-  }
 }
 
 // /plugin load <name> — find, load, resolve, init, and start a plugin.
@@ -1659,11 +1613,6 @@ plugin_cmd_load(const cmd_ctx_t *ctx)
     plugin_unload(name);
     return;
   }
-
-  // Re-enable user commands on all active bot instances.
-  // The newly loaded plugin may have registered commands via
-  // cmd_register() during init; those need bindings on each bot.
-  plugin_enable_bot_commands();
 
   snprintf(buf, sizeof(buf), CLR_GREEN "loaded" CLR_RESET " "
       CLR_BOLD "%s" CLR_RESET, name);
@@ -1817,7 +1766,7 @@ void
 plugin_register_commands(void)
 {
   // /show plugin — read-only subcommand of /show.
-  cmd_register_system("plugin", "plugin",
+  cmd_register("plugin", "plugin",
       "show plugin [all | <name>]",
       "List installed plugins or show plugin details",
       "Shows loaded plugins with type, kind, state, and approximate\n"
@@ -1832,14 +1781,14 @@ plugin_register_commands(void)
       plugin_cmd_show, NULL, "show", "plug", ad_show_plugin, 1);
 
   // /plugin — root command for plugin management.
-  cmd_register_system("plugin", "plugin",
+  cmd_register("plugin", "plugin",
       "plugin <subcommand> ...",
       "Manage plugins",
       NULL,
       USERNS_GROUP_OWNER, USERNS_OWNER_LEVEL, CMD_SCOPE_ANY, METHOD_T_ANY,
       plugin_cmd_plugin, NULL, NULL, "plug", NULL, 0);
 
-  cmd_register_system("plugin", "load",
+  cmd_register("plugin", "load",
       "plugin load <name>",
       "Load a plugin",
       "Loads a plugin by name from the plugin directory. The .so\n"
@@ -1849,7 +1798,7 @@ plugin_register_commands(void)
       USERNS_GROUP_OWNER, USERNS_OWNER_LEVEL, CMD_SCOPE_ANY, METHOD_T_ANY,
       plugin_cmd_load, NULL, "plugin", NULL, ad_plugin_cmd_name, 1);
 
-  cmd_register_system("plugin", "unload",
+  cmd_register("plugin", "unload",
       "plugin unload <name>",
       "Unload a plugin",
       "Unloads a plugin by name. The plugin is stopped, deinitialized,\n"

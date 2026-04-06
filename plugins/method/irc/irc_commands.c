@@ -697,9 +697,6 @@ static void
 irc_cmd_channel(const cmd_ctx_t *ctx)
 {
   cmd_reply(ctx, "usage: /irc channel <subcommand> ...");
-  cmd_reply(ctx, "  add <bot> <#channel> [key]  — add a channel");
-  cmd_reply(ctx, "  del <bot> <#channel>        — remove a channel");
-  cmd_reply(ctx, "  list <bot>                  — list channels");
 }
 
 // -----------------------------------------------------------------------
@@ -711,12 +708,6 @@ static void
 irc_cmd_irc(const cmd_ctx_t *ctx)
 {
   cmd_reply(ctx, "usage: /irc <subcommand> ...");
-  cmd_reply(ctx, "  network <list|del> [name]         (net)  — manage networks");
-  cmd_reply(ctx, "  server <add|del|list> ...          (srv)  — manage servers");
-  cmd_reply(ctx, "  channel <add|del|list> ...         (ch)   — manage channels");
-  cmd_reply(ctx, "  join <bot> <#channel>                     — join a channel");
-  cmd_reply(ctx, "  part <bot> <#channel>                     — leave a channel");
-  cmd_reply(ctx, "  schema [group]                     (sc)   — show entity schemas");
 }
 
 // /irc schema [group] — show entity schemas declared by the IRC plugin.
@@ -795,8 +786,6 @@ static void
 irc_cmd_show_irc(const cmd_ctx_t *ctx)
 {
   cmd_reply(ctx, "usage: /show irc <subcommand> ...");
-  cmd_reply(ctx, "  networks [name]       (n)  — list IRC networks");
-  cmd_reply(ctx, "  servers [network]     (s)  — list IRC servers");
 }
 
 // /show irc networks — list defined networks.
@@ -823,7 +812,7 @@ void
 irc_register_commands(void)
 {
   // Register /irc root parent command.
-  cmd_register_system("irc", "irc",
+  cmd_register("irc", "irc",
       "irc <subcommand> ...",
       "IRC plugin commands",
       "Manage IRC networks, servers, and channels.\n"
@@ -837,7 +826,7 @@ irc_register_commands(void)
       NULL, NULL, NULL, NULL, 0);
 
   // Register subcommands under /irc.
-  cmd_register_system("irc", "network",
+  cmd_register("irc", "network",
       "irc network <list|del> [name]",
       "Manage IRC networks",
       "Manage the IRC network registry. Networks are named groups\n"
@@ -847,21 +836,21 @@ irc_register_commands(void)
       USERNS_GROUP_ADMIN, 500, CMD_SCOPE_ANY, METHOD_T_ANY, irc_cmd_network,
       NULL, "irc", "net", NULL, 0);
 
-  cmd_register_system("irc", "list",
+  cmd_register("irc", "list",
       "irc network list",
       "List all IRC networks",
       NULL,
       USERNS_GROUP_ADMIN, 500, CMD_SCOPE_ANY, METHOD_T_ANY,
       irc_cmd_network_list, NULL, "network", "l", NULL, 0);
 
-  cmd_register_system("irc", "del",
+  cmd_register("irc", "del",
       "irc network del <name>",
       "Delete a network and its servers",
       NULL,
       USERNS_GROUP_ADMIN, 500, CMD_SCOPE_ANY, METHOD_T_ANY,
       irc_cmd_network_del, NULL, "network", "d", ad_irc_netname, 1);
 
-  cmd_register_system("irc", "server",
+  cmd_register("irc", "server",
       "irc server <add|del|list> ...",
       "Manage IRC servers",
       "Manage IRC servers within networks.\n"
@@ -871,28 +860,28 @@ irc_register_commands(void)
       USERNS_GROUP_ADMIN, 500, CMD_SCOPE_ANY, METHOD_T_ANY, irc_cmd_server,
       NULL, "irc", "srv", NULL, 0);
 
-  cmd_register_system("irc", "add",
+  cmd_register("irc", "add",
       "irc server add <network> <host> [port]",
       "Add a server to a network",
       NULL,
       USERNS_GROUP_ADMIN, 500, CMD_SCOPE_ANY, METHOD_T_ANY,
       irc_cmd_server_add, NULL, "server", "a", ad_irc_srv_add, 3);
 
-  cmd_register_system("irc", "del",
+  cmd_register("irc", "del",
       "irc server del <network> <host>",
       "Remove a server from a network",
       NULL,
       USERNS_GROUP_ADMIN, 500, CMD_SCOPE_ANY, METHOD_T_ANY,
       irc_cmd_server_del, NULL, "server", "d", ad_irc_srv_del, 2);
 
-  cmd_register_system("irc", "list",
+  cmd_register("irc", "list",
       "irc server list [network]",
       "List servers",
       NULL,
       USERNS_GROUP_ADMIN, 500, CMD_SCOPE_ANY, METHOD_T_ANY,
       irc_cmd_server_list, NULL, "server", "l", ad_irc_srv_list, 1);
 
-  cmd_register_system("irc", "channel",
+  cmd_register("irc", "channel",
       "irc channel <add|del|list> ...",
       "Manage IRC channels for a bot",
       "Manage IRC channel configuration for bot instances.\n"
@@ -902,28 +891,28 @@ irc_register_commands(void)
       USERNS_GROUP_ADMIN, 500, CMD_SCOPE_ANY, METHOD_T_ANY,
       irc_cmd_channel, NULL, "irc", "ch", NULL, 0);
 
-  cmd_register_system("irc", "add",
+  cmd_register("irc", "add",
       "irc channel add <bot> <#channel> [key]",
       "Add a channel to a bot",
       NULL,
       USERNS_GROUP_ADMIN, 500, CMD_SCOPE_ANY, METHOD_T_ANY,
       irc_cmd_channel_add, NULL, "channel", "a", ad_irc_chan_add, 3);
 
-  cmd_register_system("irc", "del",
+  cmd_register("irc", "del",
       "irc channel del <bot> <#channel>",
       "Remove a channel from a bot",
       NULL,
       USERNS_GROUP_ADMIN, 500, CMD_SCOPE_ANY, METHOD_T_ANY,
       irc_cmd_channel_del, NULL, "channel", "d", ad_irc_chan_del, 2);
 
-  cmd_register_system("irc", "list",
+  cmd_register("irc", "list",
       "irc channel list <bot>",
       "List channels for a bot",
       NULL,
       USERNS_GROUP_ADMIN, 500, CMD_SCOPE_ANY, METHOD_T_ANY,
       irc_cmd_channel_list, NULL, "channel", "l", ad_irc_chan_list, 1);
 
-  cmd_register_system("irc", "join",
+  cmd_register("irc", "join",
       "irc join <bot> <#channel>",
       "Instruct a bot to join a channel",
       "Sends a JOIN command for the specified channel on the bot's\n"
@@ -932,7 +921,7 @@ irc_register_commands(void)
       USERNS_GROUP_ADMIN, 500, CMD_SCOPE_ANY, METHOD_T_ANY, irc_cmd_join,
       NULL, "irc", NULL, ad_irc_chan_del, 2);
 
-  cmd_register_system("irc", "part",
+  cmd_register("irc", "part",
       "irc part <bot> <#channel>",
       "Instruct a bot to leave a channel",
       "Sends a PART command for the specified channel on the bot's\n"
@@ -940,7 +929,7 @@ irc_register_commands(void)
       USERNS_GROUP_ADMIN, 500, CMD_SCOPE_ANY, METHOD_T_ANY, irc_cmd_part,
       NULL, "irc", NULL, ad_irc_chan_del, 2);
 
-  cmd_register_system("irc", "irc-schema",
+  cmd_register("irc", "irc-schema",
       "irc schema [group]",
       "Show IRC entity schemas",
       "Display configurable properties for IRC entities.\n"
@@ -953,7 +942,7 @@ irc_register_commands(void)
   // Register /show irc subcommand tree.
   // Internal name "show-irc" avoids collision with root /irc.
   // Abbreviation "irc" allows /show irc resolution.
-  cmd_register_system("irc", "show-irc",
+  cmd_register("irc", "show-irc",
       "show irc <subcommand> ...",
       "IRC network and server information",
       "Display IRC network and server configuration.\n"
@@ -962,7 +951,7 @@ irc_register_commands(void)
       USERNS_GROUP_ADMIN, 100, CMD_SCOPE_ANY, METHOD_T_ANY,
       irc_cmd_show_irc, NULL, "show", "irc", NULL, 0);
 
-  cmd_register_system("irc", "networks",
+  cmd_register("irc", "networks",
       "show irc networks",
       "List IRC networks",
       "Lists all defined IRC networks and the number of servers\n"
@@ -970,7 +959,7 @@ irc_register_commands(void)
       USERNS_GROUP_ADMIN, 100, CMD_SCOPE_ANY, METHOD_T_ANY,
       irc_cmd_show_networks, NULL, "show-irc", "n", NULL, 0);
 
-  cmd_register_system("irc", "servers",
+  cmd_register("irc", "servers",
       "show irc servers [network]",
       "List IRC servers",
       "Lists IRC servers with address, port, priority, and TLS\n"
