@@ -1,3 +1,5 @@
+// botmanager — MIT
+// User-namespace subsystem: accounts, groups, permissions.
 #define USERNS_INTERNAL
 #include "userns.h"
 
@@ -23,18 +25,14 @@ uint64_t userns_stat_auth_failures = 0;
 uint64_t userns_stat_mfa_matches   = 0;
 uint64_t userns_stat_discoveries   = 0;
 
-// -----------------------------------------------------------------------
-// Validate a namespace name: alphanumeric only, 1..USERNS_NAME_SZ-1.
-// returns: SUCCESS or FAIL
-// name: candidate namespace name
-// -----------------------------------------------------------------------
 static bool
 validate_name(const char *name)
 {
+  size_t len;
   if(name == NULL || name[0] == '\0')
     return(FAIL);
 
-  size_t len = 0;
+  len = 0;
 
   for(const char *p = name; *p != '\0'; p++)
   {
@@ -51,50 +49,32 @@ validate_name(const char *name)
   return(SUCCESS);
 }
 
-// -----------------------------------------------------------------------
 // Find a namespace by name in the in-memory list.
 // Must be called with userns_mutex held.
-// returns: namespace pointer or NULL
-// name: namespace name
-// -----------------------------------------------------------------------
 static userns_t *
 find_locked(const char *name)
 {
   for(userns_t *ns = userns_list; ns != NULL; ns = ns->next)
-  {
     if(strcmp(ns->name, name) == 0)
       return(ns);
-  }
 
   return(NULL);
 }
 
-// -----------------------------------------------------------------------
 // Find a namespace by DB id in the in-memory list.
 // Must be called with userns_mutex held.
-// returns: namespace pointer or NULL
-// id: database primary key
-// -----------------------------------------------------------------------
 static userns_t *
 find_id_locked(uint32_t id)
 {
   for(userns_t *ns = userns_list; ns != NULL; ns = ns->next)
-  {
     if(ns->id == id)
       return(ns);
-  }
 
   return(NULL);
 }
 
-// -----------------------------------------------------------------------
 // Allocate a userns_t and prepend it to the list.
 // Must be called with userns_mutex held.
-// returns: new namespace pointer
-// id: database primary key
-// name: namespace name
-// created: creation timestamp
-// -----------------------------------------------------------------------
 static userns_t *
 list_add(uint32_t id, const char *name, time_t created)
 {
@@ -112,12 +92,9 @@ list_add(uint32_t id, const char *name, time_t created)
   return(ns);
 }
 
-// -----------------------------------------------------------------------
 // Remove a namespace from the in-memory list and free it.
 // Must be called with userns_mutex held.
 // returns: SUCCESS or FAIL (not found)
-// name: namespace name
-// -----------------------------------------------------------------------
 static bool
 list_remove(const char *name)
 {
@@ -140,18 +117,14 @@ list_remove(const char *name)
   return(FAIL);
 }
 
-// -----------------------------------------------------------------------
-// Validate a username: alphanumeric only, 1..USERNS_USER_SZ-1.
-// returns: SUCCESS or FAIL
-// username: candidate username
-// -----------------------------------------------------------------------
 static bool
 validate_username(const char *username)
 {
+  size_t len;
   if(username == NULL || username[0] == '\0')
     return(FAIL);
 
-  size_t len = 0;
+  len = 0;
 
   for(const char *p = username; *p != '\0'; p++)
   {
@@ -168,12 +141,6 @@ validate_username(const char *username)
   return(SUCCESS);
 }
 
-// -----------------------------------------------------------------------
-// Generate cryptographically random salt bytes.
-// returns: SUCCESS or FAIL
-// buf: destination buffer
-// len: number of bytes to generate
-// -----------------------------------------------------------------------
 static bool
 gen_salt(uint8_t *buf, size_t len)
 {
@@ -185,25 +152,19 @@ gen_salt(uint8_t *buf, size_t len)
   return(SUCCESS);
 }
 
-// -----------------------------------------------------------------------
-// Hash a password with argon2id.
-// returns: SUCCESS or FAIL
-// password: cleartext password
-// encoded: output buffer for encoded hash string
-// encoded_len: size of output buffer
-// -----------------------------------------------------------------------
 static bool
 hash_password(const char *password, char *encoded, size_t encoded_len)
 {
   uint8_t salt[ARGON2_SALT_LEN];
 
+  int ret;
   if(gen_salt(salt, sizeof(salt)) != SUCCESS)
   {
     clam(CLAM_WARN, "userns", "failed to generate salt");
     return(FAIL);
   }
 
-  int ret = argon2id_hash_encoded(
+  ret = argon2id_hash_encoded(
       ARGON2_T_COST, ARGON2_M_COST, ARGON2_P_COST,
       password, strlen(password),
       salt, sizeof(salt),
@@ -219,12 +180,6 @@ hash_password(const char *password, char *encoded, size_t encoded_len)
   return(SUCCESS);
 }
 
-// -----------------------------------------------------------------------
-// Verify a password against an encoded argon2id hash.
-// returns: SUCCESS (password matches) or FAIL
-// encoded: stored encoded hash string
-// password: cleartext password to verify
-// -----------------------------------------------------------------------
 static bool
 verify_password(const char *encoded, const char *password)
 {
@@ -233,10 +188,6 @@ verify_password(const char *encoded, const char *password)
   return((ret == ARGON2_OK) ? SUCCESS : FAIL);
 }
 
-// -----------------------------------------------------------------------
-// Run core DDL statements to create userns tables.
-// returns: SUCCESS or FAIL
-// -----------------------------------------------------------------------
 static bool
 create_core_tables(void)
 {
@@ -251,7 +202,14 @@ create_core_tables(void)
       "id SERIAL PRIMARY KEY, "
       "ns_id INTEGER NOT NULL REFERENCES userns(id) ON DELETE CASCADE, "
       "username VARCHAR(64) NOT NULL, "
+      "uuid VARCHAR(36) NOT NULL DEFAULT '', "
       "passhash TEXT, "
+      "description VARCHAR(101) NOT NULL DEFAULT '', "
+      "passphrase VARCHAR(101) NOT NULL DEFAULT '', "
+      "autoidentify BOOLEAN NOT NULL DEFAULT FALSE, "
+      "lastseen TIMESTAMPTZ, "
+      "lastseen_method VARCHAR(64) NOT NULL DEFAULT '', "
+      "lastseen_mfa VARCHAR(200) NOT NULL DEFAULT '', "
       "created TIMESTAMPTZ NOT NULL DEFAULT NOW(), "
       "UNIQUE(ns_id, username))",
 
@@ -259,6 +217,7 @@ create_core_tables(void)
       "id SERIAL PRIMARY KEY, "
       "ns_id INTEGER NOT NULL REFERENCES userns(id) ON DELETE CASCADE, "
       "name VARCHAR(64) NOT NULL, "
+      "description VARCHAR(101) NOT NULL DEFAULT '', "
       "created TIMESTAMPTZ NOT NULL DEFAULT NOW(), "
       "UNIQUE(ns_id, name))",
 
@@ -294,217 +253,6 @@ create_core_tables(void)
   return(SUCCESS);
 }
 
-// -----------------------------------------------------------------------
-// Try to add a column via ALTER TABLE. If the probe query succeeds, the
-// column already exists and nothing is done.
-// returns: SUCCESS or FAIL
-// probe: SELECT query that tests for the column (e.g. "SELECT col FROM t LIMIT 0")
-// alter: ALTER TABLE statement to add the column
-// label: human-readable label for log messages
-// -----------------------------------------------------------------------
-static bool
-migrate_add_column(const char *probe, const char *alter, const char *label)
-{
-  db_result_t *r = db_result_alloc();
-
-  if(db_query(probe, r) == SUCCESS)
-  {
-    db_result_free(r);
-    return(SUCCESS);
-  }
-
-  db_result_free(r);
-  r = db_result_alloc();
-
-  if(db_query(alter, r) != SUCCESS)
-  {
-    clam(CLAM_WARN, "userns", "migration: %s: %s", label, r->error);
-    db_result_free(r);
-    return(FAIL);
-  }
-
-  db_result_free(r);
-  clam(CLAM_INFO, "userns", "migration: %s", label);
-  return(SUCCESS);
-}
-
-// -----------------------------------------------------------------------
-// Migration: add uuid column and backfill existing rows.
-// returns: SUCCESS or FAIL
-// -----------------------------------------------------------------------
-static bool
-migrate_uuid_column(void)
-{
-  db_result_t *r = db_result_alloc();
-
-  if(db_query("SELECT uuid FROM userns_user LIMIT 0", r) == SUCCESS)
-  {
-    db_result_free(r);
-    return(SUCCESS);
-  }
-
-  db_result_free(r);
-  r = db_result_alloc();
-
-  if(db_query("ALTER TABLE userns_user "
-               "ADD COLUMN uuid VARCHAR(36) NOT NULL DEFAULT ''",
-               r) != SUCCESS)
-  {
-    clam(CLAM_WARN, "userns",
-        "migration: cannot add uuid column: %s", r->error);
-    db_result_free(r);
-    return(FAIL);
-  }
-
-  clam(CLAM_INFO, "userns",
-      "migration: added uuid column to userns_user");
-
-  // Generate UUIDs for existing users that have empty uuid.
-  db_result_free(r);
-  r = db_result_alloc();
-
-  if(db_query("SELECT id FROM userns_user WHERE uuid = ''",
-               r) == SUCCESS)
-  {
-    for(uint32_t i = 0; i < r->rows; i++)
-    {
-      const char *id_str = db_result_get(r, i, 0);
-
-      if(id_str == NULL)
-        continue;
-
-      uuid_t uu;
-      char uuid_str[USERNS_UUID_SZ];
-
-      uuid_generate(uu);
-      uuid_unparse_lower(uu, uuid_str);
-
-      char sql[256];
-
-      snprintf(sql, sizeof(sql),
-          "UPDATE userns_user SET uuid = '%s' WHERE id = %s",
-          uuid_str, id_str);
-
-      db_result_t *ur = db_result_alloc();
-
-      db_query(sql, ur);
-      db_result_free(ur);
-    }
-
-    clam(CLAM_INFO, "userns",
-        "migration: generated UUIDs for %u existing user(s)", r->rows);
-  }
-
-  db_result_free(r);
-  return(SUCCESS);
-}
-
-// -----------------------------------------------------------------------
-// Migration: copy legacy mfa field values into user_mfa table.
-// returns: SUCCESS or FAIL
-// -----------------------------------------------------------------------
-static bool
-migrate_legacy_mfa(void)
-{
-  db_result_t *r = db_result_alloc();
-
-  if(db_query("SELECT id, mfa FROM userns_user "
-               "WHERE mfa != '' AND mfa IS NOT NULL "
-               "AND id NOT IN (SELECT user_id FROM user_mfa)",
-               r) != SUCCESS || r->rows == 0)
-  {
-    db_result_free(r);
-    return(SUCCESS);
-  }
-
-  uint32_t migrated = 0;
-
-  for(uint32_t i = 0; i < r->rows; i++)
-  {
-    const char *id_str  = db_result_get(r, i, 0);
-    const char *mfa_str = db_result_get(r, i, 1);
-
-    if(id_str == NULL || mfa_str == NULL || mfa_str[0] == '\0')
-      continue;
-
-    char *esc_mfa = db_escape(mfa_str);
-
-    if(esc_mfa == NULL)
-      continue;
-
-    char sql[512];
-
-    snprintf(sql, sizeof(sql),
-        "INSERT INTO user_mfa (user_id, pattern) "
-        "VALUES (%s, '%s') ON CONFLICT DO NOTHING",
-        id_str, esc_mfa);
-
-    mem_free(esc_mfa);
-
-    db_result_t *mr = db_result_alloc();
-
-    if(db_query(sql, mr) == SUCCESS)
-      migrated++;
-
-    db_result_free(mr);
-  }
-
-  if(migrated > 0)
-    clam(CLAM_INFO, "userns",
-        "migration: migrated %u legacy MFA value(s) to user_mfa",
-        migrated);
-
-  db_result_free(r);
-  return(SUCCESS);
-}
-
-// -----------------------------------------------------------------------
-// Create the userns tables if they do not exist, then run migrations.
-// returns: SUCCESS or FAIL
-// -----------------------------------------------------------------------
-static bool
-ensure_tables(void)
-{
-  if(create_core_tables() != SUCCESS)
-    return(FAIL);
-
-  if(migrate_add_column(
-      "SELECT level FROM userns_member LIMIT 0",
-      "ALTER TABLE userns_member "
-        "ADD COLUMN level INTEGER NOT NULL DEFAULT 0",
-      "added level column to userns_member") != SUCCESS)
-    return(FAIL);
-
-  if(migrate_add_column(
-      "SELECT description FROM userns_group LIMIT 0",
-      "ALTER TABLE userns_group "
-        "ADD COLUMN description VARCHAR(101) NOT NULL DEFAULT ''",
-      "added description column to userns_group") != SUCCESS)
-    return(FAIL);
-
-  if(migrate_add_column(
-      "SELECT description FROM userns_user LIMIT 0",
-      "ALTER TABLE userns_user "
-        "ADD COLUMN description VARCHAR(101) NOT NULL DEFAULT '', "
-        "ADD COLUMN mfa VARCHAR(101) NOT NULL DEFAULT '', "
-        "ADD COLUMN passphrase VARCHAR(101) NOT NULL DEFAULT ''",
-      "added description/mfa/passphrase to userns_user") != SUCCESS)
-    return(FAIL);
-
-  if(migrate_uuid_column() != SUCCESS)
-    return(FAIL);
-
-  if(migrate_legacy_mfa() != SUCCESS)
-    return(FAIL);
-
-  return(SUCCESS);
-}
-
-// -----------------------------------------------------------------------
-// Seed built-in groups for a namespace. Idempotent — skips groups
-// that already exist.
-// ns: namespace to seed
-// -----------------------------------------------------------------------
 static void
 seed_builtin_groups(const userns_t *ns)
 {
@@ -524,26 +272,26 @@ seed_builtin_groups(const userns_t *ns)
   }
 }
 
-// -----------------------------------------------------------------------
-// Seed the @owner user for a namespace. Inserts directly via SQL
-// since the @ prefix fails alphanumeric validation. Idempotent.
-// ns: namespace to seed
-// -----------------------------------------------------------------------
 static void
 seed_owner_user(const userns_t *ns)
 {
   // Check if @owner already exists.
+  uuid_t uu;
+  char sql[384];
+  db_result_t *r;
+  static const char *group_names[] = {
+    USERNS_GROUP_OWNER, USERNS_GROUP_ADMIN,
+    USERNS_GROUP_USER, USERNS_GROUP_EVERYONE,
+  };
+  char uuid_str[USERNS_UUID_SZ];
   if(userns_user_exists(ns, USERNS_OWNER_USER))
     return;
 
   // Insert @owner with no password (cannot authenticate via methods).
-  uuid_t uu;
-  char uuid_str[USERNS_UUID_SZ];
 
   uuid_generate(uu);
   uuid_unparse_lower(uu, uuid_str);
 
-  char sql[384];
 
   snprintf(sql, sizeof(sql),
       "INSERT INTO userns_user (ns_id, username, uuid) "
@@ -551,7 +299,7 @@ seed_owner_user(const userns_t *ns)
       "ON CONFLICT DO NOTHING",
       ns->id, USERNS_OWNER_USER, uuid_str);
 
-  db_result_t *r = db_result_alloc();
+  r = db_result_alloc();
 
   if(db_query(sql, r) != SUCCESS)
   {
@@ -564,10 +312,6 @@ seed_owner_user(const userns_t *ns)
   db_result_free(r);
 
   // Add @owner to all built-in groups at maximum level.
-  static const char *group_names[] = {
-    USERNS_GROUP_OWNER, USERNS_GROUP_ADMIN,
-    USERNS_GROUP_USER, USERNS_GROUP_EVERYONE,
-  };
 
   for(size_t i = 0; i < sizeof(group_names) / sizeof(group_names[0]); i++)
     userns_member_add(ns, USERNS_OWNER_USER, group_names[i],
@@ -576,10 +320,6 @@ seed_owner_user(const userns_t *ns)
   clam(CLAM_INFO, "userns", "seeded @owner in namespace '%s'", ns->name);
 }
 
-// -----------------------------------------------------------------------
-// Load all existing namespaces from the database into memory.
-// returns: SUCCESS or FAIL
-// -----------------------------------------------------------------------
 static bool
 load_all(void)
 {
@@ -601,11 +341,13 @@ load_all(void)
     const char *name_str = db_result_get(r, i, 1);
     const char *ts_str   = db_result_get(r, i, 2);
 
+    uint32_t id;
+    time_t created;
     if(id_str == NULL || name_str == NULL || ts_str == NULL)
       continue;
 
-    uint32_t id = (uint32_t)strtoul(id_str, NULL, 10);
-    time_t created = (time_t)strtoll(ts_str, NULL, 10);
+    id = (uint32_t)strtoul(id_str, NULL, 10);
+    created = (time_t)strtoll(ts_str, NULL, 10);
 
     list_add(id, name_str, created);
   }
@@ -628,15 +370,13 @@ load_all(void)
   return(SUCCESS);
 }
 
-// -----------------------------------------------------------------------
 // Public API
-// -----------------------------------------------------------------------
 
 // Get user namespace subsystem statistics (thread-safe snapshot).
-// out: destination for the snapshot
 void
 userns_get_stats(userns_stats_t *out)
 {
+  db_result_t *r;
   if(out == NULL)
     return;
 
@@ -646,7 +386,7 @@ userns_get_stats(userns_stats_t *out)
 
   // Count total users via DB (lightweight aggregate query).
   out->users = 0;
-  db_result_t *r = db_result_alloc();
+  r = db_result_alloc();
 
   if(db_query("SELECT COUNT(*) FROM userns_user", r) == SUCCESS
       && r->rows > 0)
@@ -669,8 +409,6 @@ userns_get_stats(userns_stats_t *out)
       __ATOMIC_RELAXED);
 }
 
-// Initialize the user namespace subsystem.
-// returns: SUCCESS or FAIL
 bool
 userns_init(void)
 {
@@ -683,7 +421,7 @@ userns_init(void)
   userns_stat_mfa_matches   = 0;
   userns_stat_discoveries   = 0;
 
-  if(ensure_tables() != SUCCESS)
+  if(create_core_tables() != SUCCESS)
   {
     clam(CLAM_FATAL, "userns_init", "cannot create schema");
     pthread_mutex_destroy(&userns_mutex);
@@ -708,6 +446,8 @@ userns_init(void)
 void
 userns_exit(void)
 {
+  uint32_t freed;
+  userns_t *ns;
   if(!userns_ready)
     return;
 
@@ -715,8 +455,8 @@ userns_exit(void)
 
   pthread_mutex_lock(&userns_mutex);
 
-  uint32_t freed = 0;
-  userns_t *ns = userns_list;
+  freed = 0;
+  ns = userns_list;
 
   while(ns != NULL)
   {
@@ -740,12 +480,17 @@ userns_exit(void)
       "user namespace subsystem shut down (%u freed)", freed);
 }
 
-// Find or create a namespace by name.
-// returns: namespace pointer, or NULL on failure
-// name: namespace name (alphanumeric, max USERNS_NAME_SZ-1 chars)
 userns_t *
 userns_get(const char *name)
 {
+  userns_t *ns;
+  char *esc_name;
+  char sql[256];
+  db_result_t *r;
+  const char *id_str;
+  uint32_t id;
+  const char *ts_str;
+  time_t created;
   if(!userns_ready)
     return(NULL);
 
@@ -758,7 +503,7 @@ userns_get(const char *name)
 
   // Check if already loaded.
   pthread_mutex_lock(&userns_mutex);
-  userns_t *ns = find_locked(name);
+  ns = find_locked(name);
 
   if(ns != NULL)
   {
@@ -769,12 +514,11 @@ userns_get(const char *name)
   pthread_mutex_unlock(&userns_mutex);
 
   // Not found — create in database.
-  char *esc_name = db_escape(name);
+  esc_name = db_escape(name);
 
   if(esc_name == NULL)
     return(NULL);
 
-  char sql[256];
 
   snprintf(sql, sizeof(sql),
       "INSERT INTO userns (name) VALUES ('%s') "
@@ -783,7 +527,7 @@ userns_get(const char *name)
 
   mem_free(esc_name);
 
-  db_result_t *r = db_result_alloc();
+  r = db_result_alloc();
 
   if(db_query(sql, r) != SUCCESS)
   {
@@ -801,8 +545,8 @@ userns_get(const char *name)
     return(NULL);
   }
 
-  const char *id_str = db_result_get(r, 0, 0);
-  const char *ts_str = db_result_get(r, 0, 1);
+  id_str = db_result_get(r, 0, 0);
+  ts_str = db_result_get(r, 0, 1);
 
   if(id_str == NULL || ts_str == NULL)
   {
@@ -810,8 +554,8 @@ userns_get(const char *name)
     return(NULL);
   }
 
-  uint32_t id = (uint32_t)strtoul(id_str, NULL, 10);
-  time_t created = (time_t)strtoll(ts_str, NULL, 10);
+  id = (uint32_t)strtoul(id_str, NULL, 10);
+  created = (time_t)strtoll(ts_str, NULL, 10);
 
   db_result_free(r);
 
@@ -830,49 +574,46 @@ userns_get(const char *name)
   return(ns);
 }
 
-// Find a namespace by name (does not create).
-// returns: namespace pointer, or NULL if not found
-// name: namespace name
 userns_t *
 userns_find(const char *name)
 {
+  userns_t *ns;
   if(!userns_ready || name == NULL)
     return(NULL);
 
   pthread_mutex_lock(&userns_mutex);
-  userns_t *ns = find_locked(name);
+  ns = find_locked(name);
   pthread_mutex_unlock(&userns_mutex);
 
   return(ns);
 }
 
-// Find a namespace by DB id.
-// returns: namespace pointer, or NULL if not found
-// id: database primary key
 userns_t *
 userns_find_id(uint32_t id)
 {
+  userns_t *ns;
   if(!userns_ready)
     return(NULL);
 
   pthread_mutex_lock(&userns_mutex);
-  userns_t *ns = find_id_locked(id);
+  ns = find_id_locked(id);
   pthread_mutex_unlock(&userns_mutex);
 
   return(ns);
 }
 
-// Delete a namespace and all its users, groups, and memberships.
-// returns: SUCCESS or FAIL
-// name: namespace name
 bool
 userns_delete(const char *name)
 {
+  userns_t *ns;
+  uint32_t id;
+  char sql[128];
+  db_result_t *r;
   if(!userns_ready || name == NULL)
     return(FAIL);
 
   pthread_mutex_lock(&userns_mutex);
-  userns_t *ns = find_locked(name);
+  ns = find_locked(name);
 
   if(ns == NULL)
   {
@@ -881,16 +622,15 @@ userns_delete(const char *name)
     return(FAIL);
   }
 
-  uint32_t id = ns->id;
+  id = ns->id;
 
   pthread_mutex_unlock(&userns_mutex);
 
   // Delete from database (CASCADE removes users, groups, memberships).
-  char sql[128];
 
   snprintf(sql, sizeof(sql), "DELETE FROM userns WHERE id = %u", id);
 
-  db_result_t *r = db_result_alloc();
+  r = db_result_alloc();
 
   if(db_query(sql, r) != SUCCESS)
   {
@@ -913,32 +653,40 @@ userns_delete(const char *name)
   return(SUCCESS);
 }
 
-// returns: number of loaded namespaces
 uint32_t
 userns_count(void)
 {
+  uint32_t n;
   pthread_mutex_lock(&userns_mutex);
-  uint32_t n = userns_total;
+  n = userns_total;
   pthread_mutex_unlock(&userns_mutex);
 
   return(n);
 }
 
-// -----------------------------------------------------------------------
-// Password policy
-// -----------------------------------------------------------------------
+// Return the first loaded namespace, or NULL if none exist. Used by
+// system-level dispatchers (e.g., botmanctl) that don't bind to a
+// specific bot but still need a userns to resolve identity against.
+userns_t *
+userns_first(void)
+{
+  userns_t *ns;
+  pthread_mutex_lock(&userns_mutex);
+  ns = userns_list;
+  pthread_mutex_unlock(&userns_mutex);
+  return(ns);
+}
 
-// Validate a password against the password policy.
-// Requirement: minimum length (core.userns.pass_min, default 8).
-// returns: SUCCESS if password meets all requirements, FAIL otherwise
-// password: candidate password to check
+// Password policy
+
 bool
 userns_password_check(const char *password)
 {
+  size_t len;
   if(password == NULL)
     return(FAIL);
 
-  size_t len = strlen(password);
+  len = strlen(password);
 
   if(len < userns_cfg.pass_min || len > userns_cfg.pass_max)
     return(FAIL);
@@ -946,19 +694,19 @@ userns_password_check(const char *password)
   return(SUCCESS);
 }
 
-// -----------------------------------------------------------------------
 // User operations
-// -----------------------------------------------------------------------
 
-// Create a user in a namespace.
-// returns: SUCCESS or FAIL
-// ns: target namespace
-// username: alphanumeric, max USERNS_USER_SZ-1 chars
-// password: must meet password policy requirements
 bool
 userns_user_create(const userns_t *ns, const char *username,
     const char *password)
 {
+  char encoded[ARGON2_ENC_LEN];
+  uuid_t uu;
+  char *esc_user;
+  char sql[512];
+  db_result_t *r;
+  char uuid_str[USERNS_UUID_SZ];
+  char *esc_hash;
   if(!userns_ready || ns == NULL)
     return(FAIL);
 
@@ -977,21 +725,18 @@ userns_user_create(const userns_t *ns, const char *username,
   }
 
   // Hash the password.
-  char encoded[ARGON2_ENC_LEN];
 
   if(hash_password(password, encoded, sizeof(encoded)) != SUCCESS)
     return(FAIL);
 
   // Generate UUID for the new user.
-  uuid_t uu;
-  char uuid_str[USERNS_UUID_SZ];
 
   uuid_generate(uu);
   uuid_unparse_lower(uu, uuid_str);
 
   // Escape inputs.
-  char *esc_user = db_escape(username);
-  char *esc_hash = db_escape(encoded);
+  esc_user = db_escape(username);
+  esc_hash = db_escape(encoded);
 
   if(esc_user == NULL || esc_hash == NULL)
   {
@@ -1000,7 +745,6 @@ userns_user_create(const userns_t *ns, const char *username,
     return(FAIL);
   }
 
-  char sql[512];
 
   snprintf(sql, sizeof(sql),
       "INSERT INTO userns_user (ns_id, username, passhash, uuid) "
@@ -1010,7 +754,7 @@ userns_user_create(const userns_t *ns, const char *username,
   mem_free(esc_user);
   mem_free(esc_hash);
 
-  db_result_t *r = db_result_alloc();
+  r = db_result_alloc();
 
   if(db_query(sql, r) != SUCCESS)
   {
@@ -1034,11 +778,14 @@ userns_user_create(const userns_t *ns, const char *username,
   return(SUCCESS);
 }
 
-// Create a user without a password (for user discovery).
-// returns: SUCCESS or FAIL
 bool
 userns_user_create_nopass(const userns_t *ns, const char *username)
 {
+  uuid_t uu;
+  char *esc_user;
+  char sql[512];
+  db_result_t *r;
+  char uuid_str[USERNS_UUID_SZ];
   if(!userns_ready || ns == NULL)
     return(FAIL);
 
@@ -1050,19 +797,16 @@ userns_user_create_nopass(const userns_t *ns, const char *username)
   }
 
   // Generate UUID.
-  uuid_t uu;
-  char uuid_str[USERNS_UUID_SZ];
 
   uuid_generate(uu);
   uuid_unparse_lower(uu, uuid_str);
 
   // Escape username.
-  char *esc_user = db_escape(username);
+  esc_user = db_escape(username);
 
   if(esc_user == NULL)
     return(FAIL);
 
-  char sql[512];
 
   snprintf(sql, sizeof(sql),
       "INSERT INTO userns_user (ns_id, username, passhash, uuid) "
@@ -1071,7 +815,7 @@ userns_user_create_nopass(const userns_t *ns, const char *username)
 
   mem_free(esc_user);
 
-  db_result_t *r = db_result_alloc();
+  r = db_result_alloc();
 
   if(db_query(sql, r) != SUCCESS)
   {
@@ -1096,22 +840,21 @@ userns_user_create_nopass(const userns_t *ns, const char *username)
   return(SUCCESS);
 }
 
-// Delete a user from a namespace.
-// returns: SUCCESS or FAIL
-// ns: target namespace
-// username: user to delete
 bool
 userns_user_delete(const userns_t *ns, const char *username)
 {
+  char *esc_user;
+  char sql[256];
+  db_result_t *r;
+  bool deleted;
   if(!userns_ready || ns == NULL || username == NULL)
     return(FAIL);
 
-  char *esc_user = db_escape(username);
+  esc_user = db_escape(username);
 
   if(esc_user == NULL)
     return(FAIL);
 
-  char sql[256];
 
   snprintf(sql, sizeof(sql),
       "DELETE FROM userns_user WHERE ns_id = %u AND username = '%s'",
@@ -1119,7 +862,7 @@ userns_user_delete(const userns_t *ns, const char *username)
 
   mem_free(esc_user);
 
-  db_result_t *r = db_result_alloc();
+  r = db_result_alloc();
 
   if(db_query(sql, r) != SUCCESS)
   {
@@ -1130,7 +873,7 @@ userns_user_delete(const userns_t *ns, const char *username)
     return(FAIL);
   }
 
-  bool deleted = (r->rows_affected > 0);
+  deleted = (r->rows_affected > 0);
 
   db_result_free(r);
 
@@ -1148,22 +891,21 @@ userns_user_delete(const userns_t *ns, const char *username)
   return(SUCCESS);
 }
 
-// Check if a user exists in a namespace.
-// returns: true if user exists
-// ns: target namespace
-// username: user to check
 bool
 userns_user_exists(const userns_t *ns, const char *username)
 {
+  char *esc_user;
+  char sql[256];
+  db_result_t *r;
+  bool exists;
   if(!userns_ready || ns == NULL || username == NULL)
     return(false);
 
-  char *esc_user = db_escape(username);
+  esc_user = db_escape(username);
 
   if(esc_user == NULL)
     return(false);
 
-  char sql[256];
 
   snprintf(sql, sizeof(sql),
       "SELECT 1 FROM userns_user WHERE ns_id = %u AND username = '%s'",
@@ -1171,7 +913,7 @@ userns_user_exists(const userns_t *ns, const char *username)
 
   mem_free(esc_user);
 
-  db_result_t *r = db_result_alloc();
+  r = db_result_alloc();
 
   if(db_query(sql, r) != SUCCESS)
   {
@@ -1179,28 +921,28 @@ userns_user_exists(const userns_t *ns, const char *username)
     return(false);
   }
 
-  bool exists = (r->rows > 0);
+  exists = (r->rows > 0);
 
   db_result_free(r);
 
   return(exists);
 }
 
-// Change a user's password.
-// returns: SUCCESS or FAIL
-// ns: target namespace
-// username: user whose password to change
-// old_password: current password (must verify)
-// new_password: replacement password (must meet policy)
 bool
 userns_user_set_password(const userns_t *ns, const char *username,
     const char *old_password, const char *new_password)
 {
+  userns_auth_t result;
+  char encoded[ARGON2_ENC_LEN];
+  char *esc_user;
+  char sql[512];
+  db_result_t *r;
+  char *esc_hash;
   if(!userns_ready || ns == NULL || username == NULL)
     return(FAIL);
 
   // Verify old password first.
-  userns_auth_t result = userns_auth(ns, username, old_password, NULL);
+  result = userns_auth(ns, username, old_password, NULL);
 
   if(result != USERNS_AUTH_OK)
   {
@@ -1219,14 +961,13 @@ userns_user_set_password(const userns_t *ns, const char *username,
   }
 
   // Hash the new password.
-  char encoded[ARGON2_ENC_LEN];
 
   if(hash_password(new_password, encoded, sizeof(encoded)) != SUCCESS)
     return(FAIL);
 
   // Update in database.
-  char *esc_user = db_escape(username);
-  char *esc_hash = db_escape(encoded);
+  esc_user = db_escape(username);
+  esc_hash = db_escape(encoded);
 
   if(esc_user == NULL || esc_hash == NULL)
   {
@@ -1235,7 +976,6 @@ userns_user_set_password(const userns_t *ns, const char *username,
     return(FAIL);
   }
 
-  char sql[512];
 
   snprintf(sql, sizeof(sql),
       "UPDATE userns_user SET passhash = '%s' "
@@ -1245,7 +985,7 @@ userns_user_set_password(const userns_t *ns, const char *username,
   mem_free(esc_user);
   mem_free(esc_hash);
 
-  db_result_t *r = db_result_alloc();
+  r = db_result_alloc();
 
   if(db_query(sql, r) != SUCCESS)
   {
@@ -1263,32 +1003,29 @@ userns_user_set_password(const userns_t *ns, const char *username,
   return(SUCCESS);
 }
 
-// -----------------------------------------------------------------------
 // Authentication
-// -----------------------------------------------------------------------
 
-// Authenticate a user against stored credentials.
-// returns: USERNS_AUTH_OK on success, or an error code
-// ns: target namespace
-// username: user attempting to authenticate
-// password: cleartext password to verify
-// method_ctx: method-contributed context string, or NULL
 userns_auth_t
 userns_auth(const userns_t *ns, const char *username,
     const char *password, const char *method_ctx)
 {
+  char *esc_user;
+  char sql[256];
+  db_result_t *r;
+  const char *stored_hash;
+  char *hash_copy;
+  bool match;
   __atomic_add_fetch(&userns_stat_auth_attempts, 1, __ATOMIC_RELAXED);
 
   if(!userns_ready || ns == NULL || username == NULL || password == NULL)
     return(USERNS_AUTH_ERR);
 
   // Fetch the stored hash from the database.
-  char *esc_user = db_escape(username);
+  esc_user = db_escape(username);
 
   if(esc_user == NULL)
     return(USERNS_AUTH_ERR);
 
-  char sql[256];
 
   snprintf(sql, sizeof(sql),
       "SELECT passhash FROM userns_user "
@@ -1297,7 +1034,7 @@ userns_auth(const userns_t *ns, const char *username,
 
   mem_free(esc_user);
 
-  db_result_t *r = db_result_alloc();
+  r = db_result_alloc();
 
   if(db_query(sql, r) != SUCCESS)
   {
@@ -1316,7 +1053,7 @@ userns_auth(const userns_t *ns, const char *username,
     return(USERNS_AUTH_BAD_USER);
   }
 
-  const char *stored_hash = db_result_get(r, 0, 0);
+  stored_hash = db_result_get(r, 0, 0);
 
   if(stored_hash == NULL || stored_hash[0] == '\0')
   {
@@ -1327,12 +1064,12 @@ userns_auth(const userns_t *ns, const char *username,
   }
 
   // Copy hash before freeing result (pointer invalidated by free).
-  char *hash_copy = mem_strdup("userns", "hash", stored_hash);
+  hash_copy = mem_strdup("userns", "hash", stored_hash);
 
   db_result_free(r);
 
   // Verify password against stored hash.
-  bool match = verify_password(hash_copy, password);
+  match = verify_password(hash_copy, password);
 
   mem_free(hash_copy);
 
@@ -1357,20 +1094,16 @@ userns_auth(const userns_t *ns, const char *username,
   return(USERNS_AUTH_OK);
 }
 
-// -----------------------------------------------------------------------
 // Group operations
-// -----------------------------------------------------------------------
 
-// Validate a group name: alphanumeric only, 1..USERNS_GROUP_SZ-1.
-// returns: SUCCESS or FAIL
-// name: candidate group name
 static bool
 validate_groupname(const char *name)
 {
+  size_t len;
   if(name == NULL || name[0] == '\0')
     return(FAIL);
 
-  size_t len = 0;
+  len = 0;
 
   for(const char *p = name; *p != '\0'; p++)
   {
@@ -1387,13 +1120,12 @@ validate_groupname(const char *name)
   return(SUCCESS);
 }
 
-// Create a group in a namespace.
-// returns: SUCCESS or FAIL
-// ns: target namespace
-// name: alphanumeric group name, max USERNS_GROUP_SZ-1 chars
 bool
 userns_group_create(const userns_t *ns, const char *name)
 {
+  char *esc_name;
+  char sql[256];
+  db_result_t *r;
   if(!userns_ready || ns == NULL)
     return(FAIL);
 
@@ -1404,12 +1136,11 @@ userns_group_create(const userns_t *ns, const char *name)
     return(FAIL);
   }
 
-  char *esc_name = db_escape(name);
+  esc_name = db_escape(name);
 
   if(esc_name == NULL)
     return(FAIL);
 
-  char sql[256];
 
   snprintf(sql, sizeof(sql),
       "INSERT INTO userns_group (ns_id, name) VALUES (%u, '%s')",
@@ -1417,7 +1148,7 @@ userns_group_create(const userns_t *ns, const char *name)
 
   mem_free(esc_name);
 
-  db_result_t *r = db_result_alloc();
+  r = db_result_alloc();
 
   if(db_query(sql, r) != SUCCESS)
   {
@@ -1436,13 +1167,13 @@ userns_group_create(const userns_t *ns, const char *name)
   return(SUCCESS);
 }
 
-// Delete a group from a namespace.
-// returns: SUCCESS or FAIL
-// ns: target namespace
-// name: group to delete
 bool
 userns_group_delete(const userns_t *ns, const char *name)
 {
+  char *esc_name;
+  char sql[256];
+  db_result_t *r;
+  bool deleted;
   if(!userns_ready || ns == NULL || name == NULL)
     return(FAIL);
 
@@ -1453,12 +1184,11 @@ userns_group_delete(const userns_t *ns, const char *name)
     return(FAIL);
   }
 
-  char *esc_name = db_escape(name);
+  esc_name = db_escape(name);
 
   if(esc_name == NULL)
     return(FAIL);
 
-  char sql[256];
 
   snprintf(sql, sizeof(sql),
       "DELETE FROM userns_group WHERE ns_id = %u AND name = '%s'",
@@ -1466,7 +1196,7 @@ userns_group_delete(const userns_t *ns, const char *name)
 
   mem_free(esc_name);
 
-  db_result_t *r = db_result_alloc();
+  r = db_result_alloc();
 
   if(db_query(sql, r) != SUCCESS)
   {
@@ -1477,7 +1207,7 @@ userns_group_delete(const userns_t *ns, const char *name)
     return(FAIL);
   }
 
-  bool deleted = (r->rows_affected > 0);
+  deleted = (r->rows_affected > 0);
 
   db_result_free(r);
 
@@ -1494,22 +1224,21 @@ userns_group_delete(const userns_t *ns, const char *name)
   return(SUCCESS);
 }
 
-// Check if a group exists in a namespace.
-// returns: true if group exists
-// ns: target namespace
-// name: group to check
 bool
 userns_group_exists(const userns_t *ns, const char *name)
 {
+  char *esc_name;
+  char sql[256];
+  db_result_t *r;
+  bool exists;
   if(!userns_ready || ns == NULL || name == NULL)
     return(false);
 
-  char *esc_name = db_escape(name);
+  esc_name = db_escape(name);
 
   if(esc_name == NULL)
     return(false);
 
-  char sql[256];
 
   snprintf(sql, sizeof(sql),
       "SELECT 1 FROM userns_group WHERE ns_id = %u AND name = '%s'",
@@ -1517,7 +1246,7 @@ userns_group_exists(const userns_t *ns, const char *name)
 
   mem_free(esc_name);
 
-  db_result_t *r = db_result_alloc();
+  r = db_result_alloc();
 
   if(db_query(sql, r) != SUCCESS)
   {
@@ -1525,31 +1254,29 @@ userns_group_exists(const userns_t *ns, const char *name)
     return(false);
   }
 
-  bool exists = (r->rows > 0);
+  exists = (r->rows > 0);
 
   db_result_free(r);
 
   return(exists);
 }
 
-// -----------------------------------------------------------------------
 // Membership operations
-// -----------------------------------------------------------------------
 
-// Add a user to a group. Both must exist in the same namespace.
-// returns: SUCCESS or FAIL
-// ns: target namespace
-// username: user to add
-// group: group to add user to
 bool
 userns_member_add(const userns_t *ns, const char *username,
     const char *group, uint16_t level)
 {
+  char *esc_user;
+  char sql[512];
+  db_result_t *r;
+  bool added;
+  char *esc_group;
   if(!userns_ready || ns == NULL || username == NULL || group == NULL)
     return(FAIL);
 
-  char *esc_user = db_escape(username);
-  char *esc_group = db_escape(group);
+  esc_user = db_escape(username);
+  esc_group = db_escape(group);
 
   if(esc_user == NULL || esc_group == NULL)
   {
@@ -1558,7 +1285,6 @@ userns_member_add(const userns_t *ns, const char *username,
     return(FAIL);
   }
 
-  char sql[512];
 
   snprintf(sql, sizeof(sql),
       "INSERT INTO userns_member (user_id, group_id, level) "
@@ -1571,7 +1297,7 @@ userns_member_add(const userns_t *ns, const char *username,
   mem_free(esc_user);
   mem_free(esc_group);
 
-  db_result_t *r = db_result_alloc();
+  r = db_result_alloc();
 
   if(db_query(sql, r) != SUCCESS)
   {
@@ -1582,7 +1308,7 @@ userns_member_add(const userns_t *ns, const char *username,
     return(FAIL);
   }
 
-  bool added = (r->rows_affected > 0);
+  added = (r->rows_affected > 0);
 
   db_result_free(r);
 
@@ -1601,20 +1327,20 @@ userns_member_add(const userns_t *ns, const char *username,
   return(SUCCESS);
 }
 
-// Remove a user from a group.
-// returns: SUCCESS or FAIL
-// ns: target namespace
-// username: user to remove
-// group: group to remove user from
 bool
 userns_member_remove(const userns_t *ns, const char *username,
     const char *group)
 {
+  char *esc_user;
+  char sql[512];
+  db_result_t *r;
+  bool removed;
+  char *esc_group;
   if(!userns_ready || ns == NULL || username == NULL || group == NULL)
     return(FAIL);
 
-  char *esc_user = db_escape(username);
-  char *esc_group = db_escape(group);
+  esc_user = db_escape(username);
+  esc_group = db_escape(group);
 
   if(esc_user == NULL || esc_group == NULL)
   {
@@ -1623,7 +1349,6 @@ userns_member_remove(const userns_t *ns, const char *username,
     return(FAIL);
   }
 
-  char sql[512];
 
   snprintf(sql, sizeof(sql),
       "DELETE FROM userns_member "
@@ -1638,7 +1363,7 @@ userns_member_remove(const userns_t *ns, const char *username,
   mem_free(esc_user);
   mem_free(esc_group);
 
-  db_result_t *r = db_result_alloc();
+  r = db_result_alloc();
 
   if(db_query(sql, r) != SUCCESS)
   {
@@ -1649,7 +1374,7 @@ userns_member_remove(const userns_t *ns, const char *username,
     return(FAIL);
   }
 
-  bool removed = (r->rows_affected > 0);
+  removed = (r->rows_affected > 0);
 
   db_result_free(r);
 
@@ -1668,20 +1393,21 @@ userns_member_remove(const userns_t *ns, const char *username,
   return(SUCCESS);
 }
 
-// Get a user's privilege level in a group.
-// returns: level (>= 0) if member, -1 if not a member or error
-// ns: target namespace
-// username: user to check
-// group: group to check membership in
 int32_t
 userns_member_level(const userns_t *ns, const char *username,
     const char *group)
 {
+  char *esc_user;
+  char sql[512];
+  db_result_t *r;
+  const char *val;
+  char *esc_group;
+  int32_t level;
   if(!userns_ready || ns == NULL || username == NULL || group == NULL)
     return(-1);
 
-  char *esc_user = db_escape(username);
-  char *esc_group = db_escape(group);
+  esc_user = db_escape(username);
+  esc_group = db_escape(group);
 
   if(esc_user == NULL || esc_group == NULL)
   {
@@ -1690,7 +1416,6 @@ userns_member_level(const userns_t *ns, const char *username,
     return(-1);
   }
 
-  char sql[512];
 
   snprintf(sql, sizeof(sql),
       "SELECT m.level FROM userns_member m "
@@ -1703,7 +1428,7 @@ userns_member_level(const userns_t *ns, const char *username,
   mem_free(esc_user);
   mem_free(esc_group);
 
-  db_result_t *r = db_result_alloc();
+  r = db_result_alloc();
 
   if(db_query(sql, r) != SUCCESS)
   {
@@ -1717,19 +1442,14 @@ userns_member_level(const userns_t *ns, const char *username,
     return(-1);
   }
 
-  const char *val = db_result_get(r, 0, 0);
-  int32_t level = (val != NULL) ? (int32_t)atoi(val) : 0;
+  val = db_result_get(r, 0, 0);
+  level = (val != NULL) ? (int32_t)atoi(val) : 0;
 
   db_result_free(r);
 
   return(level);
 }
 
-// Check if a user is a member of a group (convenience wrapper).
-// returns: true if user is a member of the group
-// ns: target namespace
-// username: user to check
-// group: group to check membership in
 bool
 userns_member_check(const userns_t *ns, const char *username,
     const char *group)
@@ -1737,15 +1457,15 @@ userns_member_check(const userns_t *ns, const char *username,
   return(userns_member_level(ns, username, group) >= 0);
 }
 
-// Create a group in a namespace with a description.
-// returns: SUCCESS or FAIL
-// ns: target namespace
-// name: alphanumeric group name, max USERNS_GROUP_SZ-1 chars
-// description: group description, max USERNS_DESC_SZ-1 chars (or NULL)
 bool
 userns_group_create_desc(const userns_t *ns, const char *name,
     const char *description)
 {
+  char *esc_name;
+  const char *desc;
+  char sql[512];
+  db_result_t *r;
+  char *esc_desc;
   if(!userns_ready || ns == NULL)
     return(FAIL);
 
@@ -1756,13 +1476,13 @@ userns_group_create_desc(const userns_t *ns, const char *name,
     return(FAIL);
   }
 
-  char *esc_name = db_escape(name);
+  esc_name = db_escape(name);
 
   if(esc_name == NULL)
     return(FAIL);
 
-  const char *desc = (description != NULL) ? description : "";
-  char *esc_desc = db_escape(desc);
+  desc = (description != NULL) ? description : "";
+  esc_desc = db_escape(desc);
 
   if(esc_desc == NULL)
   {
@@ -1770,7 +1490,6 @@ userns_group_create_desc(const userns_t *ns, const char *name,
     return(FAIL);
   }
 
-  char sql[512];
 
   snprintf(sql, sizeof(sql),
       "INSERT INTO userns_group (ns_id, name, description) "
@@ -1780,7 +1499,7 @@ userns_group_create_desc(const userns_t *ns, const char *name,
   mem_free(esc_name);
   mem_free(esc_desc);
 
-  db_result_t *r = db_result_alloc();
+  r = db_result_alloc();
 
   if(db_query(sql, r) != SUCCESS)
   {
@@ -1799,9 +1518,6 @@ userns_group_create_desc(const userns_t *ns, const char *name,
   return(SUCCESS);
 }
 
-// Check if a group name is one of the four built-in groups.
-// returns: true if name is owner, admin, user, or everyone
-// name: group name to check
 bool
 userns_group_is_builtin(const char *name)
 {
@@ -1814,21 +1530,79 @@ userns_group_is_builtin(const char *name)
       || strcmp(name, USERNS_GROUP_EVERYONE) == 0);
 }
 
-// Update a user's privilege level in a group.
-// returns: SUCCESS or FAIL (not a member, DB error)
-// ns: target namespace
-// username: user whose level to update
-// group: group to update level in
-// level: new privilege level
+bool
+userns_group_set_description(const userns_t *ns, const char *name,
+    const char *description)
+{
+  char *esc_name;
+  char *esc_desc;
+  char sql[512];
+  db_result_t *r;
+  if(!userns_ready || ns == NULL || name == NULL || description == NULL)
+    return(FAIL);
+
+  if(!userns_group_exists(ns, name))
+  {
+    clam(CLAM_WARN, "userns_group_set_desc",
+        "group '%s' not found in '%s'", name, ns->name);
+    return(FAIL);
+  }
+
+  esc_name = db_escape(name);
+
+  if(esc_name == NULL)
+    return(FAIL);
+
+  esc_desc = db_escape(description);
+
+  if(esc_desc == NULL)
+  {
+    mem_free(esc_name);
+    return(FAIL);
+  }
+
+
+  snprintf(sql, sizeof(sql),
+      "UPDATE userns_group SET description = '%s' "
+      "WHERE ns_id = %u AND name = '%s'",
+      esc_desc, ns->id, esc_name);
+
+  mem_free(esc_name);
+  mem_free(esc_desc);
+
+  r = db_result_alloc();
+
+  if(db_query(sql, r) != SUCCESS)
+  {
+    clam(CLAM_WARN, "userns_group_set_desc",
+        "cannot update group '%s' in '%s': %s",
+        name, ns->name, r->error);
+    db_result_free(r);
+    return(FAIL);
+  }
+
+  db_result_free(r);
+
+  clam(CLAM_INFO, "userns_group_set_desc",
+      "updated description for group '%s' in '%s'", name, ns->name);
+
+  return(SUCCESS);
+}
+
 bool
 userns_member_set_level(const userns_t *ns, const char *username,
     const char *group, uint16_t level)
 {
+  char *esc_user;
+  char sql[512];
+  db_result_t *r;
+  bool updated;
+  char *esc_group;
   if(!userns_ready || ns == NULL || username == NULL || group == NULL)
     return(FAIL);
 
-  char *esc_user = db_escape(username);
-  char *esc_group = db_escape(group);
+  esc_user = db_escape(username);
+  esc_group = db_escape(group);
 
   if(esc_user == NULL || esc_group == NULL)
   {
@@ -1837,7 +1611,6 @@ userns_member_set_level(const userns_t *ns, const char *username,
     return(FAIL);
   }
 
-  char sql[512];
 
   snprintf(sql, sizeof(sql),
       "UPDATE userns_member SET level = %u "
@@ -1852,7 +1625,7 @@ userns_member_set_level(const userns_t *ns, const char *username,
   mem_free(esc_user);
   mem_free(esc_group);
 
-  db_result_t *r = db_result_alloc();
+  r = db_result_alloc();
 
   if(db_query(sql, r) != SUCCESS)
   {
@@ -1863,7 +1636,7 @@ userns_member_set_level(const userns_t *ns, const char *username,
     return(FAIL);
   }
 
-  bool updated = (r->rows_affected > 0);
+  updated = (r->rows_affected > 0);
 
   db_result_free(r);
 
@@ -1882,20 +1655,20 @@ userns_member_set_level(const userns_t *ns, const char *username,
   return(SUCCESS);
 }
 
-// -----------------------------------------------------------------------
 // Admin password reset
-// -----------------------------------------------------------------------
 
 // Reset a user's password without requiring the old password.
 // Intended for administrative use only. New password must meet policy.
-// returns: SUCCESS or FAIL
-// ns: target namespace
-// username: user whose password to reset
 // new_password: replacement password (must meet policy)
 bool
 userns_user_reset_password(const userns_t *ns, const char *username,
     const char *new_password)
 {
+  char encoded[ARGON2_ENC_LEN];
+  char *esc_user;
+  char sql[512];
+  db_result_t *r;
+  char *esc_hash;
   if(!userns_ready || ns == NULL || username == NULL
       || new_password == NULL)
     return(FAIL);
@@ -1914,13 +1687,12 @@ userns_user_reset_password(const userns_t *ns, const char *username,
     return(FAIL);
   }
 
-  char encoded[ARGON2_ENC_LEN];
 
   if(hash_password(new_password, encoded, sizeof(encoded)) != SUCCESS)
     return(FAIL);
 
-  char *esc_user = db_escape(username);
-  char *esc_hash = db_escape(encoded);
+  esc_user = db_escape(username);
+  esc_hash = db_escape(encoded);
 
   if(esc_user == NULL || esc_hash == NULL)
   {
@@ -1929,7 +1701,6 @@ userns_user_reset_password(const userns_t *ns, const char *username,
     return(FAIL);
   }
 
-  char sql[512];
 
   snprintf(sql, sizeof(sql),
       "UPDATE userns_user SET passhash = '%s' "
@@ -1939,7 +1710,7 @@ userns_user_reset_password(const userns_t *ns, const char *username,
   mem_free(esc_user);
   mem_free(esc_hash);
 
-  db_result_t *r = db_result_alloc();
+  r = db_result_alloc();
 
   if(db_query(sql, r) != SUCCESS)
   {
@@ -1957,19 +1728,25 @@ userns_user_reset_password(const userns_t *ns, const char *username,
   return(SUCCESS);
 }
 
-// Get the DB user id for a user in a namespace.
-// returns: user id, or 0 on failure
-// ns: target namespace
-// username: user to look up
+uint32_t
+userns_user_id(const userns_t *ns, const char *username)
+{
+  if(ns == NULL || username == NULL || username[0] == '\0') return(0);
+  return(userns_get_user_id(ns, username));
+}
+
 uint32_t
 userns_get_user_id(const userns_t *ns, const char *username)
 {
   char *esc_user = db_escape(username);
 
+  char sql[256];
+  db_result_t *r;
+  const char *id_str;
+  uint32_t id;
   if(esc_user == NULL)
     return(0);
 
-  char sql[256];
 
   snprintf(sql, sizeof(sql),
       "SELECT id FROM userns_user WHERE ns_id = %u AND username = '%s'",
@@ -1977,7 +1754,7 @@ userns_get_user_id(const userns_t *ns, const char *username)
 
   mem_free(esc_user);
 
-  db_result_t *r = db_result_alloc();
+  r = db_result_alloc();
 
   if(db_query(sql, r) != SUCCESS || r->rows == 0)
   {
@@ -1985,17 +1762,15 @@ userns_get_user_id(const userns_t *ns, const char *username)
     return(0);
   }
 
-  const char *id_str = db_result_get(r, 0, 0);
-  uint32_t id = (id_str != NULL) ? (uint32_t)strtoul(id_str, NULL, 10) : 0;
+  id_str = db_result_get(r, 0, 0);
+  id = (id_str != NULL) ? (uint32_t)strtoul(id_str, NULL, 10) : 0;
 
   db_result_free(r);
 
   return(id);
 }
 
-// -----------------------------------------------------------------------
 // KV configuration
-// -----------------------------------------------------------------------
 
 // Load password policy and MFA configuration from the KV store.
 // Clamps values to sane bounds (pass_min >= 4, max_mfa 1..100).
@@ -2015,9 +1790,6 @@ userns_load_config(void)
   if(userns_cfg.max_mfa > 100)  userns_cfg.max_mfa = 100;
 }
 
-// KV change callback. Reloads configuration when any userns key changes.
-// key: changed KV key (unused)
-// data: opaque user data (unused)
 static void
 userns_kv_changed(const char *key, void *data)
 {
@@ -2031,8 +1803,11 @@ userns_kv_changed(const char *key, void *data)
 void
 userns_register_config(void)
 {
-  kv_register("core.userns.pass_min", KV_UINT32, "8",   userns_kv_changed, NULL);
-  kv_register("core.userns.pass_max", KV_UINT32, "128", userns_kv_changed, NULL);
-  kv_register("core.userns.max_mfa",  KV_UINT32, "10",  userns_kv_changed, NULL);
+  kv_register("core.userns.pass_min", KV_UINT32, "8",   userns_kv_changed, NULL,
+      "Minimum password length");
+  kv_register("core.userns.pass_max", KV_UINT32, "128", userns_kv_changed, NULL,
+      "Maximum password length");
+  kv_register("core.userns.max_mfa",  KV_UINT32, "10",  userns_kv_changed, NULL,
+      "Maximum MFA tokens per user");
   userns_load_config();
 }

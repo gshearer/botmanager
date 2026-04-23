@@ -1,26 +1,30 @@
 # Sources for the core static library (everything except main.c).
 libcore_sources = [
-  'admin.c',
-  'admin_bot.c',
-  'admin_help.c',
-  'admin_user.c',
+  'bot_cmd.c',
+  'cmd_misc.c',
+  'cmd_set.c',
+  'cmd_show.c',
+  'userns_cmd.c',
   'bconf.c',
   'bot.c',
   'botmanctl.c',
   'clam.c',
+  'clam_cmd.c',
   'colors.c',
   'cmd.c',
-  'console.c',
   'curl.c',
   'db.c',
+  'json.c',
   'kv.c',
-  'mem.c',
+  'alloc.c',
   'method.c',
   'plugin.c',
+  'proc.c',
   'pool.c',
   'resolve.c',
   'sig.c',
   'sock.c',
+  'sse.c',
   'task.c',
   'userns.c',
   'userns_cache.c',
@@ -32,7 +36,7 @@ libcore_sources = [
 ]
 
 # All external dependencies needed by core modules.
-core_deps = [dl_dep, argon2_dep, openssl_dep, curl_dep, resolv_dep, uuid_dep, m_dep, readline_dep]
+core_deps = [dl_dep, argon2_dep, openssl_dep, curl_dep, resolv_dep, uuid_dep, m_dep, json_c_dep]
 
 # Static library used by both the main binary and all tests.
 libcore = static_library('core',
@@ -47,7 +51,7 @@ botman = executable('botman',
   'main.c',
   gen_version,
   include_directories : [gen_include, inc_include],
-  link_with : [libcore],
+  link_whole : [libcore],
   dependencies : core_deps,
   export_dynamic : true,
   install : true,

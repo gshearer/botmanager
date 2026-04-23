@@ -1,16 +1,5 @@
-// ircspy — Minimal IRC client for AI agent observation and debugging.
-//
-// Usage:
-//   ircspy [options]
-//
-// Connects to an IRC server, joins a channel, and relays traffic to stdout.
-// Designed for non-interactive use via stdin/stdout pipes.
-//
-// Examples:
-//   ircspy                                          # defaults
-//   ircspy -n claude -c "#test"                     # custom nick/channel
-//   echo -e "!help\n/quit" | timeout 15 ircspy      # piped commands
-//   ircspy -r > /tmp/raw.log 2>&1 &                 # raw protocol log
+// botmanager — MIT
+// Minimal IRC client for AI-agent observation: reads stdin, relays to stdout.
 
 #define IRCSPY_INTERNAL
 #include "ircspy.h"
@@ -29,9 +18,7 @@
 
 #include <openssl/err.h>
 
-// ---------------------------------------------------------------------------
 // Signal handler
-// ---------------------------------------------------------------------------
 
 static void
 sig_handler(int sig)
@@ -40,12 +27,8 @@ sig_handler(int sig)
   g_quit = 1;
 }
 
-// ---------------------------------------------------------------------------
 // I/O helpers
-// ---------------------------------------------------------------------------
 
-// Write len bytes to the IRC connection.
-// returns: number of bytes written, or -1 on error.
 static int
 irc_write(const void *buf, int len)
 {
@@ -55,8 +38,6 @@ irc_write(const void *buf, int len)
   return((int)write(g_fd, buf, (size_t)len));
 }
 
-// Read up to len bytes from the IRC connection.
-// returns: number of bytes read, 0 on EOF, or -1 on error.
 static int
 irc_read(void *buf, int len)
 {
@@ -72,9 +53,10 @@ irc_send(const char *fmt, ...)
 {
   char buf[CMD_SZ];
   va_list ap;
+  int n;
 
   va_start(ap, fmt);
-  int n = vsnprintf(buf, sizeof(buf) - 2, fmt, ap);
+  n = vsnprintf(buf, sizeof(buf) - 2, fmt, ap);
   va_end(ap);
 
   if(n < 0)
@@ -87,32 +69,27 @@ irc_send(const char *fmt, ...)
     fprintf(stderr, "irc_send: write error\n");
 }
 
-// ---------------------------------------------------------------------------
 // TCP connection
-// ---------------------------------------------------------------------------
 
-// Connect to host:port via TCP.
-// returns: socket fd on success, -1 on failure.
 static int
 tcp_connect(const char *host, uint16_t port)
 {
   char portstr[8];
+  struct addrinfo hints;
+  struct addrinfo *res = NULL;
+  int fd = -1;
+
   snprintf(portstr, sizeof(portstr), "%u", port);
 
-  struct addrinfo hints;
   memset(&hints, 0, sizeof(hints));
   hints.ai_family   = AF_UNSPEC;
   hints.ai_socktype = SOCK_STREAM;
-
-  struct addrinfo *res = NULL;
 
   if(getaddrinfo(host, portstr, &hints, &res) != 0 || res == NULL)
   {
     fprintf(stderr, "ircspy: cannot resolve %s:%u\n", host, port);
     return(-1);
   }
-
-  int fd = -1;
 
   for(struct addrinfo *rp = res; rp != NULL; rp = rp->ai_next)
   {
@@ -137,12 +114,9 @@ tcp_connect(const char *host, uint16_t port)
   return(fd);
 }
 
-// ---------------------------------------------------------------------------
 // TLS setup
-// ---------------------------------------------------------------------------
 
 // Initialize TLS on an existing socket fd.
-// returns: 0 on success, -1 on failure.
 static int
 tls_setup(int fd, int verify)
 {
@@ -179,14 +153,8 @@ tls_setup(int fd, int verify)
   return(0);
 }
 
-// ---------------------------------------------------------------------------
 // IRC message parsing helpers
-// ---------------------------------------------------------------------------
 
-// Extract the nick portion from a :nick!user@host prefix.
-// src: full prefix (without leading colon)
-// dst: destination buffer
-// sz: buffer size
 static void
 parse_nick(const char *src, char *dst, size_t sz)
 {
@@ -201,19 +169,17 @@ parse_nick(const char *src, char *dst, size_t sz)
   dst[i] = '\0';
 }
 
-// ---------------------------------------------------------------------------
 // Control socket helpers
-// ---------------------------------------------------------------------------
 
-// Create and bind the control socket.
-// path: Unix socket path
-// returns: 0 on success, -1 on failure.
 static int
 ctl_setup(const char *path)
 {
+  int fd;
+  struct sockaddr_un addr;
+
   unlink(path);
 
-  int fd = socket(AF_UNIX, SOCK_STREAM, 0);
+  fd = socket(AF_UNIX, SOCK_STREAM, 0);
 
   if(fd < 0)
   {
@@ -221,7 +187,6 @@ ctl_setup(const char *path)
     return(-1);
   }
 
-  struct sockaddr_un addr;
   memset(&addr, 0, sizeof(addr));
   addr.sun_family = AF_UNIX;
   snprintf(addr.sun_path, sizeof(addr.sun_path), "%s", path);
@@ -269,8 +234,6 @@ ctl_cleanup(void)
   }
 }
 
-// Send a line to the control client (if one is collecting).
-// text: NUL-terminated string (newline is appended)
 static void
 ctl_send_line(const char *text)
 {
@@ -294,10 +257,10 @@ ctl_send_line(const char *text)
 static void
 ctl_flush(void)
 {
+  char nul = '\0';
+
   if(g_ctl_client < 0)
     return;
-
-  char nul = '\0';
 
   if(write(g_ctl_client, &nul, 1) < 0)
   {
@@ -308,13 +271,8 @@ ctl_flush(void)
   g_ctl_deadline = 0;
 }
 
-// ---------------------------------------------------------------------------
 // IRC formatting stripping (for terminal display)
-// ---------------------------------------------------------------------------
 
-// Strip mIRC formatting codes (\003NN,NN colors, \002 bold, etc.)
-// from text in-place for clean terminal output.
-// text: NUL-terminated string (modified in-place)
 static void
 strip_irc_fmt(char *text)
 {
@@ -352,12 +310,8 @@ strip_irc_fmt(char *text)
   *w = '\0';
 }
 
-// ---------------------------------------------------------------------------
 // Handle a complete IRC protocol line from the server
-// ---------------------------------------------------------------------------
 
-// Handle numeric 001 (registration complete).
-// returns: 1 if handled, 0 otherwise.
 static int
 handle_numeric_001(bool raw_mode)
 {
@@ -372,8 +326,6 @@ handle_numeric_001(bool raw_mode)
   return(1);
 }
 
-// Handle numeric 433 (nick in use) by retrying with a suffix.
-// returns: 1 if handled, 0 otherwise.
 static int
 handle_numeric_433(bool raw_mode)
 {
@@ -390,6 +342,7 @@ handle_numeric_433(bool raw_mode)
       fflush(stdout);
     }
   }
+
   else
   {
     fprintf(stderr, "ircspy: all nicks exhausted\n");
@@ -405,12 +358,16 @@ handle_privmsg(const char *params, const char *nick)
 {
   const char *target = params;
   const char *sp     = strchr(params, ' ');
+  char chan[CMD_SZ];
+  size_t tlen;
+  const char *text;
+  char clean[BUF_SZ];
+  char fmtline[BUF_SZ];
 
   if(sp == NULL)
     return;
 
-  char chan[CMD_SZ];
-  size_t tlen = (size_t)(sp - target);
+  tlen = (size_t)(sp - target);
 
   if(tlen >= sizeof(chan))
     tlen = sizeof(chan) - 1;
@@ -418,17 +375,14 @@ handle_privmsg(const char *params, const char *nick)
   memcpy(chan, target, tlen);
   chan[tlen] = '\0';
 
-  const char *text = sp + 1;
+  text = sp + 1;
 
   if(text[0] == ':')
     text++;
 
   // Copy and strip IRC formatting for display.
-  char clean[BUF_SZ];
   snprintf(clean, sizeof(clean), "%s", text);
   strip_irc_fmt(clean);
-
-  char fmtline[BUF_SZ];
 
   snprintf(fmtline, sizeof(fmtline), "[%s] <%s> %s", chan, nick, clean);
   printf("%s\n", fmtline);
@@ -441,17 +395,16 @@ static void
 handle_notice(const char *params, const char *nick)
 {
   const char *text = strchr(params, ':');
+  char clean[BUF_SZ];
+  char fmtline[BUF_SZ];
 
   if(text != NULL)
     text++;
   else
     text = params;
 
-  char clean[BUF_SZ];
   snprintf(clean, sizeof(clean), "%s", text);
   strip_irc_fmt(clean);
-
-  char fmtline[BUF_SZ];
 
   snprintf(fmtline, sizeof(fmtline), "--- Notice(%s): %s", nick, clean);
   printf("%s\n", fmtline);
@@ -475,10 +428,9 @@ handle_join(const char *params, const char *nick)
     // Track current channel.
     snprintf(g_channel, sizeof(g_channel), "%s", chan);
   }
+
   else
-  {
     printf("--- %s has joined %s\n", nick, chan);
-  }
 
   fflush(stdout);
 }
@@ -515,6 +467,12 @@ handle_quit_msg(const char *params, const char *nick)
 static void
 handle_server_line(const char *line, bool raw_mode)
 {
+  const char *prefix = NULL;
+  const char *cmd    = line;
+  const char *params;
+  size_t cmdlen;
+  char nick[CMD_SZ];
+
   if(raw_mode)
   {
     printf("%s\n", line);
@@ -530,9 +488,6 @@ handle_server_line(const char *line, bool raw_mode)
 
   // Parse prefix and command.
   // Format: [:prefix] command [params...]
-  const char *prefix = NULL;
-  const char *cmd    = line;
-
   if(line[0] == ':')
   {
     prefix = line + 1;
@@ -545,22 +500,20 @@ handle_server_line(const char *line, bool raw_mode)
   }
 
   // Skip to parameters.
-  const char *params = strchr(cmd, ' ');
+  params = strchr(cmd, ' ');
 
   // Identify the command token length.
-  size_t cmdlen = params != NULL ? (size_t)(params - cmd) : strlen(cmd);
+  cmdlen = params != NULL ? (size_t)(params - cmd) : strlen(cmd);
 
   if(params != NULL)
     params++;
 
-  // Numeric: 001 — registration complete.
   if(cmdlen == 3 && strncmp(cmd, "001", 3) == 0)
   {
     handle_numeric_001(raw_mode);
     return;
   }
 
-  // Numeric: 433 — nick in use.
   if(cmdlen == 3 && strncmp(cmd, "433", 3) == 0)
   {
     handle_numeric_433(raw_mode);
@@ -584,8 +537,6 @@ handle_server_line(const char *line, bool raw_mode)
 
     return;
   }
-
-  char nick[CMD_SZ];
 
   if(prefix != NULL)
     parse_nick(prefix, nick, sizeof(nick));
@@ -644,9 +595,7 @@ handle_server_line(const char *line, bool raw_mode)
   }
 }
 
-// ---------------------------------------------------------------------------
 // Handle user input from stdin
-// ---------------------------------------------------------------------------
 
 static void
 handle_user_input(const char *line)
@@ -697,12 +646,13 @@ handle_user_input(const char *line)
     if(strncmp(arg, "msg ", 4) == 0)
     {
       const char *rest = arg + 4;
+      const char *sp;
 
       while(*rest == ' ')
         rest++;
 
       // Target is first word, text is the remainder.
-      const char *sp = strchr(rest, ' ');
+      sp = strchr(rest, ' ');
 
       if(sp != NULL)
         irc_send("PRIVMSG %.*s :%s", (int)(sp - rest), rest, sp + 1);
@@ -719,6 +669,27 @@ handle_user_input(const char *line)
 
       snprintf(g_nick, sizeof(g_nick), "%s", nn);
       irc_send("NICK %s", nn);
+      return;
+    }
+
+    if(strncmp(arg, "me ", 3) == 0)
+    {
+      const char *text = arg + 3;
+
+      while(*text == ' ')
+        text++;
+
+      if(g_channel[0] == '\0')
+      {
+        fprintf(stderr, "ircspy: no channel joined, use /join first\n");
+        return;
+      }
+
+      // CTCP ACTION: \x01ACTION <text>\x01 inside a PRIVMSG. The
+      // literals are split across adjacent string tokens so the \x01
+      // escape isn't absorbed into a two-digit hex escape with the
+      // following 'A' of ACTION.
+      irc_send("PRIVMSG %s :\x01" "ACTION %s\x01", g_channel, text);
       return;
     }
 
@@ -740,9 +711,7 @@ handle_user_input(const char *line)
     fprintf(stderr, "ircspy: no channel joined, use /join first\n");
 }
 
-// ---------------------------------------------------------------------------
 // Process buffered data from the IRC socket
-// ---------------------------------------------------------------------------
 
 static void
 process_lines(bool raw_mode)
@@ -751,6 +720,7 @@ process_lines(bool raw_mode)
   for(;;)
   {
     char *crlf = NULL;
+    int consumed;
 
     for(int i = 0; i < g_lineoff - 1; i++)
     {
@@ -769,7 +739,7 @@ process_lines(bool raw_mode)
     handle_server_line(g_linebuf, raw_mode);
 
     // Shift remainder forward.
-    int consumed = (int)(crlf - g_linebuf) + 2;
+    consumed = (int)(crlf - g_linebuf) + 2;
     g_lineoff -= consumed;
 
     if(g_lineoff > 0)
@@ -777,23 +747,9 @@ process_lines(bool raw_mode)
   }
 }
 
-// ---------------------------------------------------------------------------
-// Main loop — poll set construction and per-source event handlers
-// ---------------------------------------------------------------------------
+// Main loop — poll set construction and per-source event handlers.
+// struct poll_idx is declared in ircspy.h's IRCSPY_INTERNAL block.
 
-// Poll index tracker for the dynamic poll set.
-struct poll_idx
-{
-  int irc;
-  int stdin_fd;
-  int ctl_listen;
-  int ctl_client;
-  int nfds;
-};
-
-// Build the dynamic poll set for the main loop.
-// fds: pollfd array (must hold at least 4 entries)
-// returns: populated poll_idx with per-source indices (-1 if absent).
 static struct poll_idx
 build_poll_set(struct pollfd *fds)
 {
@@ -840,6 +796,7 @@ handle_irc_data(struct pollfd *fds, const struct poll_idx *idx, bool raw_mode)
     for(;;)
     {
       int space = (int)sizeof(g_linebuf) - g_lineoff;
+      int n;
 
       if(space <= 0)
       {
@@ -847,7 +804,7 @@ handle_irc_data(struct pollfd *fds, const struct poll_idx *idx, bool raw_mode)
         break;
       }
 
-      int n = irc_read(g_linebuf + g_lineoff, space);
+      n = irc_read(g_linebuf + g_lineoff, space);
 
       if(n <= 0)
       {
@@ -886,10 +843,9 @@ stdin_eof(void)
     irc_send("QUIT :leaving");
     g_quit = 1;
   }
+
   else
-  {
     g_stdin_open = false;
-  }
 }
 
 // Read and process data from stdin.
@@ -909,17 +865,14 @@ handle_stdin_data(struct pollfd *fds, const struct poll_idx *idx)
 
       handle_user_input(input);
     }
+
     else
-    {
       stdin_eof();
-    }
   }
 
   if(idx->stdin_fd >= 0
       && (fds[idx->stdin_fd].revents & (POLLERR | POLLHUP)))
-  {
     stdin_eof();
-  }
 }
 
 // Accept a new control client and read commands from an existing one.
@@ -947,6 +900,7 @@ handle_ctl_events(struct pollfd *fds, const struct poll_idx *idx)
       g_ctl_client = -1;
       g_ctl_deadline = 0;
     }
+
     else
     {
       input[n] = '\0';
@@ -1006,9 +960,7 @@ irc_loop(const struct irc_cfg *cfg)
   }
 }
 
-// ---------------------------------------------------------------------------
 // Cleanup
-// ---------------------------------------------------------------------------
 
 static void
 cleanup(void)
@@ -1033,9 +985,7 @@ cleanup(void)
   }
 }
 
-// ---------------------------------------------------------------------------
 // Usage
-// ---------------------------------------------------------------------------
 
 static void
 print_usage(void)
@@ -1054,15 +1004,13 @@ print_usage(void)
     DEFAULT_PORT);
 }
 
-// ---------------------------------------------------------------------------
 // Main — argument parsing, connection setup, registration
-// ---------------------------------------------------------------------------
 
-// Parse command-line arguments into cfg.
-// returns: 0 on success, 1 if help was printed, -1 on error.
 static int
 parse_args(int argc, char *argv[], struct irc_cfg *cfg)
 {
+  int opt;
+
   cfg->host       = DEFAULT_HOST;
   cfg->port       = DEFAULT_PORT;
   cfg->nick       = DEFAULT_NICK;
@@ -1073,8 +1021,6 @@ parse_args(int argc, char *argv[], struct irc_cfg *cfg)
   cfg->use_tls    = true;
   cfg->tls_verify = false;
   cfg->raw_mode   = false;
-
-  int opt;
 
   while((opt = getopt(argc, argv, "s:p:n:c:C:TVrh")) != -1)
   {
@@ -1100,8 +1046,6 @@ parse_args(int argc, char *argv[], struct irc_cfg *cfg)
   return(0);
 }
 
-// Establish the TCP (and optionally TLS) connection and print status.
-// returns: 0 on success, -1 on failure.
 static int
 irc_connect(const struct irc_cfg *cfg)
 {
@@ -1126,6 +1070,7 @@ irc_connect(const struct irc_cfg *cfg)
       fflush(stdout);
     }
   }
+
   else
   {
     if(!cfg->raw_mode)
@@ -1138,8 +1083,6 @@ irc_connect(const struct irc_cfg *cfg)
   return(0);
 }
 
-// Send NICK/USER and wait for 001 (registration complete).
-// returns: 0 on success, -1 on failure or timeout.
 static int
 wait_for_registration(const struct irc_cfg *cfg)
 {
@@ -1149,10 +1092,14 @@ wait_for_registration(const struct irc_cfg *cfg)
   while(!g_registered && !g_quit)
   {
     struct pollfd pfd;
+    int ret;
+    int space;
+    int n;
+
     pfd.fd     = g_fd;
     pfd.events = POLLIN;
 
-    int ret = poll(&pfd, 1, 30000);
+    ret = poll(&pfd, 1, 30000);
 
     if(ret <= 0)
     {
@@ -1160,8 +1107,8 @@ wait_for_registration(const struct irc_cfg *cfg)
       return(-1);
     }
 
-    int space = (int)sizeof(g_linebuf) - g_lineoff;
-    int n     = irc_read(g_linebuf + g_lineoff, space);
+    space = (int)sizeof(g_linebuf) - g_lineoff;
+    n     = irc_read(g_linebuf + g_lineoff, space);
 
     if(n <= 0)
     {
@@ -1183,8 +1130,10 @@ int
 main(int argc, char *argv[])
 {
   struct irc_cfg cfg;
+  struct sigaction sa;
+  int pa;
 
-  int pa = parse_args(argc, argv, &cfg);
+  pa = parse_args(argc, argv, &cfg);
 
   if(pa != 0)
     return(pa < 0 ? 1 : 0);
@@ -1194,18 +1143,15 @@ main(int argc, char *argv[])
   g_channel[0] = '\0';
 
   // Install signal handlers.
-  struct sigaction sa;
   memset(&sa, 0, sizeof(sa));
   sa.sa_handler = sig_handler;
   sigaction(SIGINT,  &sa, NULL);
   sigaction(SIGTERM, &sa, NULL);
 
   // Control socket.
-  if(cfg.ctl_path != NULL && cfg.ctl_path[0] != '\0')
-  {
-    if(ctl_setup(cfg.ctl_path) != 0)
-      fprintf(stderr, "ircspy: control socket disabled\n");
-  }
+  if(cfg.ctl_path != NULL && cfg.ctl_path[0] != '\0'
+      && ctl_setup(cfg.ctl_path) != 0)
+    fprintf(stderr, "ircspy: control socket disabled\n");
 
   // Establish connection.
   if(irc_connect(&cfg) != 0)

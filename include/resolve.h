@@ -7,18 +7,9 @@
 #include <arpa/inet.h>
 #include <sys/socket.h>
 
-// -----------------------------------------------------------------------
-// Constants
-// -----------------------------------------------------------------------
-
 #define RESOLVE_NAME_SZ  256
 #define RESOLVE_TXT_SZ   512
 
-// -----------------------------------------------------------------------
-// Types
-// -----------------------------------------------------------------------
-
-// DNS record types supported by the resolver.
 typedef enum
 {
   RESOLVE_A,          // IPv4 address
@@ -32,7 +23,7 @@ typedef enum
   RESOLVE_SOA         // start of authority
 } resolve_type_t;
 
-// Individual DNS record. Tagged union keyed by type.
+// Tagged union keyed by type.
 typedef struct
 {
   resolve_type_t type;
@@ -86,8 +77,8 @@ typedef struct
   };
 } resolve_record_t;
 
-// Result delivered to the completion callback. The records array and the
-// result itself are valid only for the duration of the callback.
+// The records array and the result itself are valid only for the
+// duration of the callback.
 typedef struct
 {
   char              name[RESOLVE_NAME_SZ];  // queried hostname
@@ -99,37 +90,22 @@ typedef struct
   void             *user_data;              // caller's opaque pointer
 } resolve_result_t;
 
-// Completion callback. Invoked on a worker thread. Result is valid only
-// for the duration of the callback; callers must copy what they need.
+// Invoked on a worker thread. Result is valid only for the duration
+// of the callback; callers must copy what they need.
 typedef void (*resolve_cb_t)(const resolve_result_t *result);
 
-// -----------------------------------------------------------------------
-// Public API
-// -----------------------------------------------------------------------
-
-// Submit an async DNS lookup. Thread-safe.
-// returns: SUCCESS or FAIL (subsystem not ready, bad params, at capacity)
-// name: hostname to resolve
-// qtype: record type to query
-// cb: completion callback (invoked on a worker thread)
-// user_data: opaque data passed through to callback
+// Thread-safe.
 bool resolve_lookup(const char *name, resolve_type_t qtype,
     resolve_cb_t cb, void *user_data);
 
-// returns: human-readable name of a record type ("A", "AAAA", "MX", ...)
-// type: record type enum value
 const char *resolve_type_name(resolve_type_t type);
 
-// Parse a record type string into an enum value (case-insensitive).
-// returns: SUCCESS or FAIL (unrecognized type)
-// str: type name (e.g., "a", "MX", "srv")
-// out: destination for parsed type
+// Case-insensitive.
 bool resolve_type_parse(const char *str, resolve_type_t *out);
 
 // Number of distinct resolve_type_t values for per-type counters.
 #define RESOLVE_TYPE_COUNT  9
 
-// Resolver subsystem statistics.
 typedef struct
 {
   uint64_t queries;                       // lifetime total lookups
@@ -137,25 +113,19 @@ typedef struct
   uint64_t by_type[RESOLVE_TYPE_COUNT];   // queries per record type (indexed by resolve_type_t)
 } resolve_stats_t;
 
-// Get resolver subsystem statistics (thread-safe snapshot).
-// out: destination for the snapshot
 void resolve_get_stats(resolve_stats_t *out);
 
-// Initialize the resolver subsystem. Call after task_init()/pool_init().
+// Call after task_init()/pool_init().
 void resolve_init(void);
 
-// Register resolver KV configuration. Call after kv_load().
+// Call after kv_load().
 void resolve_register_config(void);
 
-// Shut down the resolver. Drains the freelist.
+// Drains the freelist.
 void resolve_exit(void);
 
-// Register the "resolve" user command. Call after cmd_init().
+// Call after cmd_init().
 void resolve_register_commands(void);
-
-// -----------------------------------------------------------------------
-// Internal (only available to resolve.c)
-// -----------------------------------------------------------------------
 
 #ifdef RESOLVE_INTERNAL
 
@@ -164,7 +134,7 @@ void resolve_register_commands(void);
 #include "common.h"
 #include "clam.h"
 #include "kv.h"
-#include "mem.h"
+#include "alloc.h"
 #include "method.h"
 #include "task.h"
 #include "validate.h"
@@ -182,7 +152,7 @@ void resolve_register_commands(void);
 // DNS wire-format answer buffer size.
 #define RESOLVE_ANSWER_SZ   4096
 
-// Pending resolve request (freelist-managed).
+// Freelist-managed.
 typedef struct resolve_request
 {
   char                    name[RESOLVE_NAME_SZ];
@@ -193,21 +163,19 @@ typedef struct resolve_request
   struct resolve_request *next;
 } resolve_request_t;
 
-// Runtime configuration.
 typedef struct
 {
   uint32_t timeout;       // per-query timeout in seconds
   uint32_t max_pending;   // max concurrent resolve tasks
 } resolve_cfg_t;
 
-// Module state.
 static bool                resolve_ready    = false;
 static resolve_request_t  *resolve_req_free = NULL;
 static pthread_mutex_t     resolve_req_lock;
 static uint32_t            resolve_pending  = 0;
 static resolve_cfg_t       resolve_cfg;
 
-// Lifetime counters for statistics (atomic, no lock needed).
+// Atomic, no lock needed.
 static uint64_t            resolve_stat_queries  = 0;
 static uint64_t            resolve_stat_failures = 0;
 static uint64_t            resolve_stat_by_type[RESOLVE_TYPE_COUNT] = {0};
@@ -222,8 +190,8 @@ static uint64_t            resolve_stat_by_type[RESOLVE_TYPE_COUNT] = {0};
 // Reply line buffer size.
 #define RESOLVE_CMD_REPLY_SZ     512
 
-// Per-command request context. Tracks outstanding parallel queries
-// and accumulates records from all callbacks.
+// Tracks outstanding parallel queries and accumulates records from
+// all callbacks.
 typedef struct resolve_cmd_request
 {
   cmd_ctx_t           ctx;                                  // saved cmd context
@@ -240,11 +208,9 @@ typedef struct resolve_cmd_request
   struct resolve_cmd_request *next;                         // freelist linkage
 } resolve_cmd_request_t;
 
-// Command request freelist.
 static resolve_cmd_request_t *resolve_cmd_free = NULL;
 static pthread_mutex_t        resolve_cmd_free_mu;
 
-// Validates a resolve target (hostname or IP address).
 static bool resolve_validate_target(const char *str);
 
 #endif // RESOLVE_INTERNAL

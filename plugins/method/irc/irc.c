@@ -1,21 +1,22 @@
+// botmanager — MIT
+// IRC method plugin: socket lifecycle, protocol dispatch, per-channel state.
 #define IRC_INTERNAL
 #include "irc.h"
 
-// Resolve server host/port/tls from the network definition at the
-// current server_idx. Collects all servers in the network, sorts by
-// priority, and picks the entry at server_idx (wrapping if needed).
-// returns: SUCCESS or FAIL (no servers defined)
 static bool
 irc_resolve_server(irc_state_t *st)
 {
   char prefix[KV_KEY_SZ];
   char key[KV_KEY_SZ];
   const char *v;
+  irc_srv_list_t srvs;
+  irc_srv_entry_t entries[IRC_MAX_SRVS];
+  uint32_t idx;
+  const char *srv;
 
   // Collect server names for this network.
   snprintf(prefix, sizeof(prefix), IRC_NET_PREFIX "%s.", st->network);
 
-  irc_srv_list_t srvs;
   memset(&srvs, 0, sizeof(srvs));
   kv_iterate_prefix(prefix, irc_srv_list_cb, &srvs);
 
@@ -23,8 +24,6 @@ irc_resolve_server(irc_state_t *st)
     return(FAIL);
 
   // Build sortable entries with priorities.
-  irc_srv_entry_t entries[IRC_MAX_SRVS];
-
   for(uint32_t i = 0; i < srvs.count; i++)
   {
     snprintf(entries[i].name, IRC_SRV_NAME_SZ, "%s", srvs.names[i]);
@@ -49,8 +48,8 @@ irc_resolve_server(irc_state_t *st)
   }
 
   // Pick server at server_idx, wrapping around.
-  uint32_t idx = st->server_idx % srvs.count;
-  const char *srv = entries[idx].name;
+  idx = st->server_idx % srvs.count;
+  srv = entries[idx].name;
 
   // Read address.
   snprintf(key, sizeof(key), IRC_NET_PREFIX "%s.%s.address",
@@ -83,9 +82,6 @@ irc_resolve_server(irc_state_t *st)
   return(SUCCESS);
 }
 
-// Read KV configuration into state struct. Called at each connect attempt
-// so reconnections pick up config changes.
-// returns: SUCCESS or FAIL (network/nick missing or no servers defined)
 static bool
 irc_load_config(irc_state_t *st)
 {
@@ -177,343 +173,26 @@ irc_load_config(irc_state_t *st)
   return(SUCCESS);
 }
 
-// -----------------------------------------------------------------------
-// IRC protocol parsing
-// -----------------------------------------------------------------------
 
-// Parse prefix: nick!user@host
-// prefix: input prefix string (without leading ':')
-// nick, user, host: output buffers
-static void
-irc_parse_prefix(const char *prefix, char *nick, char *user, char *host)
-{
-  nick[0] = '\0';
-  user[0] = '\0';
-  host[0] = '\0';
-
-  const char *bang = strchr(prefix, '!');
-  const char *at   = strchr(prefix, '@');
-
-  if(bang != NULL && at != NULL && at > bang)
-  {
-    size_t nlen = (size_t)(bang - prefix);
-    size_t ulen = (size_t)(at - bang - 1);
-
-    if(nlen >= IRC_NICK_SZ) nlen = IRC_NICK_SZ - 1;
-    if(ulen >= IRC_NICK_SZ) ulen = IRC_NICK_SZ - 1;
-
-    memcpy(nick, prefix, nlen);
-    nick[nlen] = '\0';
-
-    memcpy(user, bang + 1, ulen);
-    user[ulen] = '\0';
-
-    snprintf(host, IRC_HOST_SZ, "%s", at + 1);
-  }
-
-  else
-  {
-    // Server name only, or malformed prefix.
-    snprintf(nick, IRC_NICK_SZ, "%s", prefix);
-  }
-}
-
-// Parse a single IRC line (CRLF already stripped).
-// line: input line
-// out: parsed message output
-static void
-irc_parse_line(const char *line, irc_parsed_msg_t *out)
-{
-  memset(out, 0, sizeof(*out));
-
-  const char *pos = line;
-
-  // Optional prefix.
-  if(*pos == ':')
-  {
-    pos++;
-    const char *end = strchr(pos, ' ');
-
-    if(end == NULL)
-      return;
-
-    size_t plen = (size_t)(end - pos);
-
-    if(plen >= IRC_PREFIX_SZ) plen = IRC_PREFIX_SZ - 1;
-
-    memcpy(out->prefix, pos, plen);
-    out->prefix[plen] = '\0';
-
-    irc_parse_prefix(out->prefix, out->nick, out->user, out->host);
-    pos = end + 1;
-
-    // Skip extra spaces.
-    while(*pos == ' ')
-      pos++;
-  }
-
-  // Command.
-  {
-    const char *end = strchr(pos, ' ');
-
-    if(end == NULL)
-    {
-      strncpy(out->command, pos, sizeof(out->command) - 1);
-      return;
-    }
-
-    size_t clen = (size_t)(end - pos);
-
-    if(clen >= sizeof(out->command)) clen = sizeof(out->command) - 1;
-
-    memcpy(out->command, pos, clen);
-    out->command[clen] = '\0';
-    pos = end + 1;
-
-    while(*pos == ' ')
-      pos++;
-  }
-
-  // Params and trailing.
-  {
-    const char *trail = strstr(pos, " :");
-
-    if(trail != NULL)
-    {
-      // Everything before " :" is params, after is trailing.
-      size_t plen = (size_t)(trail - pos);
-
-      if(plen >= IRC_LINE_SZ) plen = IRC_LINE_SZ - 1;
-
-      memcpy(out->params, pos, plen);
-      out->params[plen] = '\0';
-
-      strncpy(out->trailing, trail + 2, IRC_LINE_SZ - 1);
-      out->trailing[IRC_LINE_SZ - 1] = '\0';
-      out->has_trailing = true;
-    }
-
-    else if(*pos == ':')
-    {
-      // No params, just trailing.
-      strncpy(out->trailing, pos + 1, IRC_LINE_SZ - 1);
-      out->trailing[IRC_LINE_SZ - 1] = '\0';
-      out->has_trailing = true;
-    }
-
-    else
-    {
-      // All remaining text is params.
-      strncpy(out->params, pos, IRC_LINE_SZ - 1);
-      out->params[IRC_LINE_SZ - 1] = '\0';
-    }
-  }
-}
-
-// -----------------------------------------------------------------------
-// Send helpers (via core socket service)
-// -----------------------------------------------------------------------
-
-// Send a raw IRC line. Appends \r\n. Thread-safe (sock_send is safe).
-// returns: SUCCESS or FAIL
-bool
-irc_send_raw(irc_state_t *st, const char *fmt, ...)
-{
-  char line[IRC_LINE_SZ];
-  va_list ap;
-
-  va_start(ap, fmt);
-  int n = vsnprintf(line, sizeof(line) - 2, fmt, ap);
-  va_end(ap);
-
-  if(n < 0)
-    return(FAIL);
-
-  if((size_t)n > sizeof(line) - 3)
-    n = (int)(sizeof(line) - 3);
-
-  line[n]     = '\r';
-  line[n + 1] = '\n';
-  line[n + 2] = '\0';
-
-  size_t total = (size_t)(n + 2);
-
-  if(st->session == NULL || !st->connected)
-    return(FAIL);
-
-  if(sock_send(st->session, line, total) != SUCCESS)
-  {
-    clam(CLAM_WARN, "irc", "send failed");
-    return(FAIL);
-  }
-
-  clam(CLAM_DEBUG3, "irc", ">> %.*s", n, line);
-  return(SUCCESS);
-}
-
-// Send a PRIVMSG, splitting long messages to stay within 512-byte limit.
-// returns: SUCCESS or FAIL
-static bool
-irc_send_privmsg(irc_state_t *st, const char *target, const char *text)
-{
-  // Overhead: "PRIVMSG <target> :<text>\r\n"
-  // 10 = strlen("PRIVMSG ") + strlen(" :") = 8 + 2
-  size_t overhead = 10 + strlen(target) + 2;  // +2 for \r\n
-  size_t max_text = 510 - 10 - strlen(target);
-
-  if(max_text < 1 || overhead > 510)
-  {
-    clam(CLAM_WARN, "irc", "target too long for PRIVMSG: '%s'", target);
-    return(FAIL);
-  }
-
-  size_t text_len = strlen(text);
-
-  if(text_len <= max_text)
-    return(irc_send_raw(st, "PRIVMSG %s :%s", target, text));
-
-  // Split into multiple messages.
-  const char *pos = text;
-  size_t remaining = text_len;
-
-  while(remaining > 0)
-  {
-    size_t chunk = remaining;
-
-    if(chunk > max_text)
-    {
-      chunk = max_text;
-
-      // Try to split on a space boundary.
-      size_t last_space = chunk;
-
-      while(last_space > 0 && pos[last_space - 1] != ' ')
-        last_space--;
-
-      if(last_space > max_text / 2)
-        chunk = last_space;
-    }
-
-    char buf[IRC_LINE_SZ];
-    size_t copy = chunk;
-
-    if(copy >= sizeof(buf))
-      copy = sizeof(buf) - 1;
-
-    memcpy(buf, pos, copy);
-    buf[copy] = '\0';
-
-    if(irc_send_raw(st, "PRIVMSG %s :%s", target, buf) != SUCCESS)
-      return(FAIL);
-
-    pos += chunk;
-    remaining -= chunk;
-  }
-
-  return(SUCCESS);
-}
-
-// -----------------------------------------------------------------------
-// IRC registration and channel management
-// -----------------------------------------------------------------------
-
-// Send PASS, NICK, USER registration commands.
-static void
-irc_send_registration(irc_state_t *st)
-{
-  if(st->pass[0] != '\0')
-    irc_send_raw(st, "PASS %s", st->pass);
-
-  strncpy(st->cur_nick, st->nick, IRC_NICK_SZ - 1);
-  st->cur_nick[IRC_NICK_SZ - 1] = '\0';
-
-  irc_send_raw(st, "NICK %s", st->cur_nick);
-  irc_send_raw(st, "USER %s 0 * :%s", st->user, st->realname);
-}
-
-// Expand ${var} variables in a template string.
-// Supported: ${name} (bot name), ${version}, ${nick}, ${channel}.
-// Unknown variables are left as-is.
-static void
-irc_expand_vars(const char *tmpl, char *out, size_t out_sz,
-    const irc_state_t *st, const char *channel)
-{
-  // Derive bot name from inst_name by stripping "_irc" suffix.
-  char botname[METHOD_NAME_SZ] = {0};
-  const char *suffix = "_irc";
-  size_t nlen = strlen(st->inst_name);
-  size_t slen = strlen(suffix);
-
-  if(nlen > slen &&
-      strcmp(st->inst_name + nlen - slen, suffix) == 0)
-  {
-    memcpy(botname, st->inst_name, nlen - slen);
-    botname[nlen - slen] = '\0';
-  }
-  else
-    strncpy(botname, st->inst_name, METHOD_NAME_SZ - 1);
-
-  size_t pos = 0;
-  const char *p = tmpl;
-
-  while(*p != '\0' && pos < out_sz - 1)
-  {
-    if(p[0] == '$' && p[1] == '{')
-    {
-      const char *end = strchr(p + 2, '}');
-
-      if(end != NULL)
-      {
-        size_t vlen = (size_t)(end - p - 2);
-        const char *replacement = NULL;
-
-        if(vlen == 4 && strncmp(p + 2, "name", 4) == 0)
-          replacement = botname;
-        else if(vlen == 7 && strncmp(p + 2, "version", 7) == 0)
-          replacement = BM_VERSION_STR;
-        else if(vlen == 4 && strncmp(p + 2, "nick", 4) == 0)
-          replacement = st->cur_nick;
-        else if(vlen == 7 && strncmp(p + 2, "channel", 7) == 0)
-          replacement = channel;
-
-        if(replacement != NULL)
-        {
-          size_t rlen = strlen(replacement);
-
-          if(pos + rlen < out_sz)
-          {
-            memcpy(out + pos, replacement, rlen);
-            pos += rlen;
-          }
-
-          p = end + 1;
-          continue;
-        }
-      }
-    }
-
-    out[pos++] = *p++;
-  }
-
-  out[pos] = '\0';
-}
-
-// Handle a self-JOIN: check announce config and send announcetext.
-// channel: full channel name including '#' prefix.
 static void
 irc_handle_self_join(irc_state_t *st, const char *channel)
 {
+  const char *channame;
+  char key[KV_KEY_SZ];
+  uint64_t announce;
+  const char *text;
+  char expanded[IRC_LINE_SZ];
+
   if(channel == NULL || channel[0] != '#')
     return;
 
   // Strip '#' for KV key lookup.
-  const char *channame = channel + 1;
-  char key[KV_KEY_SZ];
+  channame = channel + 1;
 
   // Check announce flag.
   snprintf(key, sizeof(key), "%schan.%s.announce",
       st->kv_prefix, channame);
-  uint64_t announce = kv_get_uint(key);
+  announce = kv_get_uint(key);
 
   if(announce == 0)
     return;
@@ -521,13 +200,12 @@ irc_handle_self_join(irc_state_t *st, const char *channel)
   // Read announcetext.
   snprintf(key, sizeof(key), "%schan.%s.announcetext",
       st->kv_prefix, channame);
-  const char *text = kv_get_str(key);
+  text = kv_get_str(key);
 
   if(text == NULL || text[0] == '\0')
     return;
 
   // Expand variables and send.
-  char expanded[IRC_LINE_SZ];
   irc_expand_vars(text, expanded, sizeof(expanded), st, channel);
 
   if(expanded[0] != '\0')
@@ -541,51 +219,49 @@ void
 irc_chan_collect_cb(const char *key, kv_type_t type,
     const char *value_str, void *data)
 {
+  irc_chan_collect_t *cc = data;
+  const char *suffix;
+  const char *dot;
+  size_t nlen;
+
   (void)type;
   (void)value_str;
-
-  irc_chan_collect_t *cc = data;
 
   if(cc->count >= IRC_MAX_CHANS)
     return;
 
   // Extract channel name: everything between prefix and the next '.'.
-  const char *suffix = key + cc->prefix_len;
-  const char *dot = strchr(suffix, '.');
+  suffix = key + cc->prefix_len;
+  dot = strchr(suffix, '.');
 
   if(dot == NULL)
     return;
 
-  size_t nlen = (size_t)(dot - suffix);
+  nlen = (size_t)(dot - suffix);
 
   if(nlen == 0 || nlen >= IRC_CHAN_SZ)
     return;
 
-  // Deduplicate: check if we already have this channel.
   for(uint32_t i = 0; i < cc->count; i++)
-  {
     if(strncmp(cc->names[i], suffix, nlen) == 0 &&
         cc->names[i][nlen] == '\0')
       return;
-  }
 
   memcpy(cc->names[cc->count], suffix, nlen);
   cc->names[cc->count][nlen] = '\0';
   cc->count++;
 }
 
-// Join channels with autojoin enabled from per-channel KV config.
-// Reads: bot.<botname>.irc.chan.<name>.autojoin
-//        bot.<botname>.irc.chan.<name>.key
 static void
 irc_join_channels(irc_state_t *st)
 {
   // Build the channel prefix: "bot.<botname>.irc.chan."
   char chan_prefix[KV_KEY_SZ];
+  irc_chan_collect_t cc;
+
   snprintf(chan_prefix, sizeof(chan_prefix), "%schan.", st->kv_prefix);
 
   // Discover all configured channels.
-  irc_chan_collect_t cc;
   memset(&cc, 0, sizeof(cc));
   cc.prefix_len = strlen(chan_prefix);
 
@@ -598,17 +274,19 @@ irc_join_channels(irc_state_t *st)
   for(uint32_t i = 0; i < cc.count; i++)
   {
     char key[KV_KEY_SZ];
+    uint64_t autojoin;
+    const char *chankey;
 
     // Check autojoin.
     snprintf(key, sizeof(key), "%s%s.autojoin", chan_prefix, cc.names[i]);
-    uint64_t autojoin = kv_get_uint(key);
+    autojoin = kv_get_uint(key);
 
     if(autojoin == 0)
       continue;
 
     // Read channel key (password).
     snprintf(key, sizeof(key), "%s%s.key", chan_prefix, cc.names[i]);
-    const char *chankey = kv_get_str(key);
+    chankey = kv_get_str(key);
 
     if(chankey != NULL && chankey[0] != '\0')
     {
@@ -624,49 +302,26 @@ irc_join_channels(irc_state_t *st)
   }
 }
 
-// -----------------------------------------------------------------------
-// Context cache (nick -> host mapping for MFA)
-// -----------------------------------------------------------------------
-
-// Update the nick -> host ring buffer.
-static void
-irc_ctx_update(irc_state_t *st, const char *nick, const char *host)
-{
-  if(nick[0] == '\0' || host[0] == '\0')
-    return;
-
-  pthread_mutex_lock(&st->ctx_mutex);
-
-  uint32_t idx = st->ctx_idx % IRC_CTX_CACHE;
-
-  snprintf(st->ctx_cache[idx].nick, IRC_NICK_SZ, "%s", nick);
-  snprintf(st->ctx_cache[idx].host, IRC_HOST_SZ, "%s", host);
-
-  st->ctx_idx++;
-
-  pthread_mutex_unlock(&st->ctx_mutex);
-}
-
-// -----------------------------------------------------------------------
 // IRC message handling
-// -----------------------------------------------------------------------
 
 // Handle a PRIVMSG: deliver to subscribers via method abstraction.
 static void
 irc_handle_privmsg(irc_state_t *st, const irc_parsed_msg_t *p)
 {
+  method_msg_t msg;
+  char target[METHOD_CHANNEL_SZ];
+  const char *body;
+
   // Update context cache with sender's host.
   irc_ctx_update(st, p->nick, p->host);
 
   // Build message context on stack.
-  method_msg_t msg;
   memset(&msg, 0, sizeof(msg));
 
   strncpy(msg.sender, p->nick, METHOD_SENDER_SZ - 1);
 
   // Determine channel: if the target is our nick, it's a DM (leave empty).
   // Extract the first word from params as the target.
-  char target[METHOD_CHANNEL_SZ];
   {
     const char *end = strchr(p->params, ' ');
     size_t tlen = end ? (size_t)(end - p->params) : strlen(p->params);
@@ -679,11 +334,34 @@ irc_handle_privmsg(irc_state_t *st, const irc_parsed_msg_t *p)
 
   if(target[0] != '\0' &&
       strncasecmp(target, st->cur_nick, IRC_NICK_SZ) != 0)
-  {
     memcpy(msg.channel, target, METHOD_CHANNEL_SZ);
+
+  // Detect CTCP ACTION ("\x01ACTION <text>\x01" or unterminated variant).
+  // Flag the message as an action and strip the CTCP markers so subscribers
+  // see only the human-readable text. Non-ACTION CTCPs are dropped: we do
+  // not want to accidentally deliver PING/VERSION payloads as chat lines.
+  body = p->trailing;
+  if(body[0] == '\001')
+  {
+    const char *after = body + 1;
+    if(strncmp(after, "ACTION ", 7) == 0 || strcmp(after, "ACTION") == 0)
+    {
+      const char *at = after + (after[6] == ' ' ? 7 : 6);
+      size_t len = strlen(at);
+      if(len > 0 && at[len - 1] == '\001') len--;  // strip trailing marker
+      if(len >= METHOD_TEXT_SZ) len = METHOD_TEXT_SZ - 1;
+      memcpy(msg.text, at, len);
+      msg.text[len] = '\0';
+      msg.is_action = true;
+    }
+
+    else
+      // Non-ACTION CTCP — ignore (PING, VERSION, etc. are not chat lines).
+      return;
   }
 
-  strncpy(msg.text, p->trailing, METHOD_TEXT_SZ - 1);
+  else
+    strncpy(msg.text, body, METHOD_TEXT_SZ - 1);
   msg.timestamp = time(NULL);
 
   // Store full prefix in metadata for diagnostics / auth context.
@@ -692,97 +370,829 @@ irc_handle_privmsg(irc_state_t *st, const irc_parsed_msg_t *p)
   method_deliver(st->inst, &msg);
 }
 
-// Handle a single parsed IRC line.
+// Kick-unidentified deferred task
+
+// Closure for the delayed kick check.
+typedef struct
+{
+  char inst_name[METHOD_NAME_SZ]; // method instance name (e.g. "mybot_irc")
+  char channel[IRC_CHAN_SZ + 1];  // full channel name including '#'
+  char nick[IRC_NICK_SZ];        // nick at time of join
+  char host[IRC_HOST_SZ];        // host at time of join (for MFA context)
+} irc_kick_check_t;
+
+// Derive the bot name from an IRC method instance name by stripping "_irc".
+// out: output buffer (must be at least METHOD_NAME_SZ)
+static void
+irc_botname_from_inst(const char *inst_name, char *out, size_t out_sz)
+{
+  const char *suffix = "_irc";
+  size_t nlen = strlen(inst_name);
+  size_t slen = strlen(suffix);
+
+  if(nlen > slen && strcmp(inst_name + nlen - slen, suffix) == 0)
+  {
+    size_t copy = nlen - slen;
+
+    if(copy >= out_sz)
+      copy = out_sz - 1;
+
+    memcpy(out, inst_name, copy);
+    out[copy] = '\0';
+  }
+
+  else
+  {
+    strncpy(out, inst_name, out_sz - 1);
+    out[out_sz - 1] = '\0';
+  }
+}
+
+// Deferred task callback: check if user is still unidentified, kick if so.
+static void
+irc_kick_unident_task(task_t *t)
+{
+  irc_kick_check_t *kc = t->data;
+  method_inst_t *inst;
+  irc_state_t *st;
+  irc_channel_t *ch;
+  bool have_ops;
+  bool still_here = false;
+  char botname[METHOD_NAME_SZ] = {0};
+  bot_inst_t *bot;
+  char mfa[IRC_PREFIX_SZ];
+  const char *user;
+  const char *channame;
+  char key[KV_KEY_SZ];
+  const char *msg;
+
+  t->state = TASK_ENDED;
+
+  if(kc == NULL)
+    return;
+
+  // Resolve method instance.
+  inst = method_find(kc->inst_name);
+
+  if(inst == NULL)
+  {
+    mem_free(kc);
+    return;
+  }
+
+  st = method_get_handle(inst);
+
+  if(st == NULL || !st->connected)
+  {
+    mem_free(kc);
+    return;
+  }
+
+  // Check bot still has ops on the channel.
+  pthread_mutex_lock(&st->chan_mutex);
+
+  ch = irc_chan_find(st, kc->channel);
+  have_ops = (ch != NULL) ? ch->have_ops : false;
+
+  if(ch != NULL)
+    still_here = (irc_member_find(ch, kc->nick) != NULL);
+
+  pthread_mutex_unlock(&st->chan_mutex);
+
+  if(!have_ops || !still_here)
+  {
+    mem_free(kc);
+    return;
+  }
+
+  // Check if user is now identified.
+  irc_botname_from_inst(kc->inst_name, botname, sizeof(botname));
+
+  bot = bot_find(botname);
+
+  if(bot == NULL)
+  {
+    mem_free(kc);
+    return;
+  }
+
+  // Build MFA context string (nick!user@host format).
+  snprintf(mfa, sizeof(mfa), "%s!*@%s", kc->nick,
+      kc->host[0] ? kc->host : "*");
+
+  user = bot_session_find_ex(bot, inst, kc->nick, mfa, NULL);
+
+  if(user != NULL)
+  {
+    // User identified in time.
+    mem_free(kc);
+    return;
+  }
+
+  // Still unidentified — kick.
+  channame = (kc->channel[0] == '#') ?
+      kc->channel + 1 : kc->channel;
+
+  snprintf(key, sizeof(key), "%schan.%s.admin.kick_unident_msg",
+      st->kv_prefix, channame);
+  msg = kv_get_str(key);
+
+  if(msg == NULL || msg[0] == '\0')
+    msg = "You must identify to use this channel";
+
+  irc_send_raw(st, "KICK %s %s :%s", kc->channel, kc->nick, msg);
+  clam(CLAM_INFO, "irc", "%s: kicked unidentified user %s",
+      kc->channel, kc->nick);
+
+  mem_free(kc);
+}
+
+static void irc_handle_ping    (irc_state_t *, const irc_parsed_msg_t *);
+static void irc_handle_welcome (irc_state_t *, const irc_parsed_msg_t *);
+static void irc_handle_namreply(irc_state_t *, const irc_parsed_msg_t *);
+static void irc_handle_endnames(irc_state_t *, const irc_parsed_msg_t *);
+static void irc_handle_topic332(irc_state_t *, const irc_parsed_msg_t *);
+static void irc_handle_join    (irc_state_t *, const irc_parsed_msg_t *);
+static void irc_handle_part    (irc_state_t *, const irc_parsed_msg_t *);
+static void irc_handle_quit    (irc_state_t *, const irc_parsed_msg_t *);
+static void irc_handle_kick    (irc_state_t *, const irc_parsed_msg_t *);
+static void irc_handle_nick    (irc_state_t *, const irc_parsed_msg_t *);
+static void irc_handle_topic   (irc_state_t *, const irc_parsed_msg_t *);
+static void irc_handle_mode    (irc_state_t *, const irc_parsed_msg_t *);
+static void irc_handle_nickinuse(irc_state_t *, const irc_parsed_msg_t *);
+static void irc_handle_error   (irc_state_t *, const irc_parsed_msg_t *);
+
+static const struct {
+  const char *cmd;
+  void      (*fn)(irc_state_t *, const irc_parsed_msg_t *);
+} irc_cmd_table[] = {
+  { "PING",    irc_handle_ping     },
+  { "001",     irc_handle_welcome  },
+  { "353",     irc_handle_namreply },
+  { "366",     irc_handle_endnames },
+  { "332",     irc_handle_topic332 },
+  { "JOIN",    irc_handle_join     },
+  { "PART",    irc_handle_part     },
+  { "QUIT",    irc_handle_quit     },
+  { "KICK",    irc_handle_kick     },
+  { "NICK",    irc_handle_nick     },
+  { "TOPIC",   irc_handle_topic    },
+  { "MODE",    irc_handle_mode     },
+  { "PRIVMSG", irc_handle_privmsg  },
+  { "433",     irc_handle_nickinuse},
+  { "ERROR",   irc_handle_error    },
+  { NULL,      NULL                }
+};
+
+static void
+irc_handle_ping(irc_state_t *st, const irc_parsed_msg_t *pp)
+{
+  const irc_parsed_msg_t p = *pp;
+
+  irc_send_raw(st, "PONG :%s", p.has_trailing ? p.trailing : "");
+}
+
+static void
+irc_handle_welcome(irc_state_t *st, const irc_parsed_msg_t *pp)
+{
+  (void)pp;
+  st->registered = true;
+  clam(CLAM_INFO, "irc", "registered as %s on %s", st->cur_nick, st->host);
+  method_set_state(st->inst, METHOD_AVAILABLE);
+  irc_join_channels(st);
+}
+
+static void
+irc_handle_namreply(irc_state_t *st, const irc_parsed_msg_t *pp)
+{
+  const irc_parsed_msg_t p = *pp;
+  // Find the channel name (last word in params starting with # or &).
+  const char *chan = NULL;
+  const char *s = p.params;
+
+  while(*s != '\0')
+  {
+    if(*s == '#' || *s == '&')
+    {
+      chan = s;
+      break;
+    }
+
+    s++;
+  }
+
+  if(chan == NULL || !p.has_trailing)
+    return;
+
+  // Extract channel name (up to space or end).
+  char channel[IRC_CHAN_SZ + 1];
+  size_t i = 0;
+  const char *p_nick;
+
+  while(chan[i] != '\0' && chan[i] != ' ' && i < IRC_CHAN_SZ)
+  {
+    channel[i] = chan[i];
+    i++;
+  }
+
+  channel[i] = '\0';
+
+  // Parse nicks from trailing, capturing mode prefixes (@+%~&).
+  p_nick = p.trailing;
+
+  while(*p_nick != '\0')
+  {
+    uint8_t flags = 0;
+    char nick[IRC_NICK_SZ];
+    size_t nlen = 0;
+
+    while(*p_nick == ' ')
+      p_nick++;
+
+    if(*p_nick == '\0')
+      break;
+
+    while(*p_nick == '@' || *p_nick == '+' || *p_nick == '%' ||
+          *p_nick == '~' || *p_nick == '&')
+    {
+      if(*p_nick == '@') flags |= IRC_MFLAG_OP;
+      else if(*p_nick == '+') flags |= IRC_MFLAG_VOICE;
+      else if(*p_nick == '%') flags |= IRC_MFLAG_HALFOP;
+      else if(*p_nick == '~') flags |= IRC_MFLAG_OWNER;
+      else if(*p_nick == '&') flags |= IRC_MFLAG_ADMIN;
+      p_nick++;
+    }
+
+    while(*p_nick != '\0' && *p_nick != ' ' && nlen < IRC_NICK_SZ - 1)
+      nick[nlen++] = *p_nick++;
+
+    nick[nlen] = '\0';
+
+    if(nlen == 0)
+      continue;
+
+    irc_chan_add_nick(st, channel, nick);
+
+    if(flags != 0)
+    {
+      irc_channel_t *ch;
+
+      pthread_mutex_lock(&st->chan_mutex);
+
+      ch = irc_chan_find(st, channel);
+
+      if(ch != NULL)
+      {
+        irc_member_t *m = irc_member_find(ch, nick);
+
+        if(m != NULL)
+          m->mode_flags = flags;
+      }
+
+      pthread_mutex_unlock(&st->chan_mutex);
+    }
+  }
+}
+
+static void
+irc_handle_endnames(irc_state_t *st, const irc_parsed_msg_t *pp)
+{
+  const irc_parsed_msg_t p = *pp;
+  const char *s = p.params;
+  char channel[IRC_CHAN_SZ + 1];
+  size_t ci = 0;
+  irc_channel_t *ch;
+  bool has_ops;
+
+  while(*s != '\0' && *s != ' ')
+    s++;
+
+  while(*s == ' ')
+    s++;
+
+  while(*s != '\0' && *s != ' ' && ci < IRC_CHAN_SZ)
+  {
+    channel[ci] = *s++;
+    ci++;
+  }
+
+  channel[ci] = '\0';
+
+  if(channel[0] != '#' && channel[0] != '&')
+    return;
+
+  pthread_mutex_lock(&st->chan_mutex);
+
+  ch = irc_chan_find(st, channel);
+
+  if(ch != NULL)
+  {
+    irc_member_t *self = irc_member_find(ch, st->cur_nick);
+
+    if(self != NULL && (self->mode_flags & IRC_MFLAG_OP))
+      ch->have_ops = true;
+  }
+
+  has_ops = (ch != NULL) ? ch->have_ops : false;
+
+  pthread_mutex_unlock(&st->chan_mutex);
+
+  if(has_ops)
+    irc_apply_chan_admin(st, channel);
+}
+
+static void
+irc_handle_topic332(irc_state_t *st, const irc_parsed_msg_t *pp)
+{
+  const irc_parsed_msg_t p = *pp;
+  const char *s = p.params;
+  char channel[IRC_CHAN_SZ + 1];
+  size_t ci = 0;
+  irc_channel_t *ch;
+
+  while(*s != '\0' && *s != ' ')
+    s++;
+
+  while(*s == ' ')
+    s++;
+
+  while(*s != '\0' && *s != ' ' && ci < IRC_CHAN_SZ)
+  {
+    channel[ci] = *s++;
+    ci++;
+  }
+
+  channel[ci] = '\0';
+
+  if(!p.has_trailing || (channel[0] != '#' && channel[0] != '&'))
+    return;
+
+  pthread_mutex_lock(&st->chan_mutex);
+
+  ch = irc_chan_find(st, channel);
+
+  if(ch != NULL)
+  {
+    strncpy(ch->topic, p.trailing, IRC_LINE_SZ - 1);
+    ch->topic[IRC_LINE_SZ - 1] = '\0';
+  }
+
+  pthread_mutex_unlock(&st->chan_mutex);
+}
+
+static void
+irc_handle_join(irc_state_t *st, const irc_parsed_msg_t *pp)
+{
+  const irc_parsed_msg_t p = *pp;
+  // Channel is in trailing or params depending on server.
+  const char *channel = p.has_trailing ? p.trailing : p.params;
+  const char *channame;
+  char key[KV_KEY_SZ];
+  irc_channel_t *ch;
+  bool have_ops;
+  char botname[METHOD_NAME_SZ] = {0};
+  bot_inst_t *bot;
+  char mfa[IRC_PREFIX_SZ];
+  const char *user;
+  uint32_t delay;
+  irc_kick_check_t *kc;
+
+  if(channel[0] == '\0')
+    return;
+
+  irc_chan_add_nick(st, channel, p.nick);
+
+  // Handle our own joins.
+  if(strncasecmp(p.nick, st->cur_nick, IRC_NICK_SZ) == 0)
+  {
+    clam(CLAM_INFO, "irc", "joined %s", channel);
+    irc_handle_self_join(st, channel);
+    return;
+  }
+
+  if(channel[0] != '#')
+    return;
+
+  // Kick-unident enforcement: unidentified joiner on an admin-managed channel.
+  channame = channel + 1;
+  snprintf(key, sizeof(key), "%schan.%s.admin.enabled",
+      st->kv_prefix, channame);
+
+  if(kv_get_uint(key) == 0)
+    return;
+
+  snprintf(key, sizeof(key), "%schan.%s.admin.kick_unident",
+      st->kv_prefix, channame);
+
+  if(kv_get_uint(key) == 0)
+    return;
+
+  pthread_mutex_lock(&st->chan_mutex);
+  ch = irc_chan_find(st, channel);
+  have_ops = (ch != NULL) ? ch->have_ops : false;
+  pthread_mutex_unlock(&st->chan_mutex);
+
+  if(!have_ops)
+    return;
+
+  irc_botname_from_inst(st->inst_name, botname, sizeof(botname));
+  bot = bot_find(botname);
+  snprintf(mfa, sizeof(mfa), "%s!%s@%s", p.nick, p.user, p.host);
+  user = (bot != NULL) ?
+      bot_session_find_ex(bot, st->inst, p.nick, mfa, NULL) : NULL;
+
+  if(user != NULL)
+    return;
+
+  snprintf(key, sizeof(key), "%schan.%s.admin.kick_unident_delay",
+      st->kv_prefix, channame);
+  delay = (uint32_t)kv_get_uint(key);
+
+  if(delay == 0)
+    delay = 30;
+
+  kc = mem_alloc("irc", "kick_check", sizeof(*kc));
+  strncpy(kc->inst_name, st->inst_name, METHOD_NAME_SZ - 1);
+  kc->inst_name[METHOD_NAME_SZ - 1] = '\0';
+  strncpy(kc->channel, channel, IRC_CHAN_SZ);
+  kc->channel[IRC_CHAN_SZ] = '\0';
+  strncpy(kc->nick, p.nick, IRC_NICK_SZ - 1);
+  kc->nick[IRC_NICK_SZ - 1] = '\0';
+  strncpy(kc->host, p.host, IRC_HOST_SZ - 1);
+  kc->host[IRC_HOST_SZ - 1] = '\0';
+
+  task_add_deferred("irc-kick-unident",
+      TASK_ANY, 200, delay * 1000, irc_kick_unident_task, kc);
+}
+
+static void
+irc_handle_part(irc_state_t *st, const irc_parsed_msg_t *pp)
+{
+  const irc_parsed_msg_t p = *pp;
+  char channel[IRC_CHAN_SZ + 1];
+  size_t i = 0;
+
+  while(p.params[i] != '\0' && p.params[i] != ' ' && i < IRC_CHAN_SZ)
+  {
+    channel[i] = p.params[i];
+    i++;
+  }
+
+  channel[i] = '\0';
+
+  if(strncasecmp(p.nick, st->cur_nick, IRC_NICK_SZ) == 0)
+    irc_chan_remove(st, channel);
+  else
+    irc_chan_remove_nick(st, channel, p.nick);
+}
+
+static void
+irc_handle_quit(irc_state_t *st, const irc_parsed_msg_t *pp)
+{
+  const irc_parsed_msg_t p = *pp;
+
+  irc_chan_remove_nick_all(st, p.nick);
+}
+
+static void
+irc_handle_kick(irc_state_t *st, const irc_parsed_msg_t *pp)
+{
+  const irc_parsed_msg_t p = *pp;
+  char channel[IRC_CHAN_SZ + 1];
+  char kicked[IRC_NICK_SZ];
+  size_t i = 0;
+  const char *k;
+  size_t j = 0;
+
+  while(p.params[i] != '\0' && p.params[i] != ' ' && i < IRC_CHAN_SZ)
+  {
+    channel[i] = p.params[i];
+    i++;
+  }
+
+  channel[i] = '\0';
+
+  k = p.params + i;
+
+  while(*k == ' ')
+    k++;
+
+  while(*k != '\0' && *k != ' ' && j < IRC_NICK_SZ - 1)
+    kicked[j++] = *k++;
+
+  kicked[j] = '\0';
+
+  if(strncasecmp(kicked, st->cur_nick, IRC_NICK_SZ) == 0)
+    irc_chan_remove(st, channel);
+  else
+    irc_chan_remove_nick(st, channel, kicked);
+}
+
+static void
+irc_handle_nick(irc_state_t *st, const irc_parsed_msg_t *pp)
+{
+  const irc_parsed_msg_t p = *pp;
+  const char *new_nick = p.has_trailing ? p.trailing : p.params;
+  method_msg_t nmsg;
+
+  if(new_nick[0] == '\0')
+    return;
+
+  irc_chan_rename_nick(st, p.nick, new_nick);
+
+  if(strncasecmp(p.nick, st->cur_nick, IRC_NICK_SZ) == 0)
+  {
+    strncpy(st->cur_nick, new_nick, IRC_NICK_SZ - 1);
+    st->cur_nick[IRC_NICK_SZ - 1] = '\0';
+  }
+
+  // Deliver NICK_CHANGE so dossier-aware bots can merge both identities.
+  memset(&nmsg, 0, sizeof(nmsg));
+  nmsg.kind = METHOD_MSG_NICK_CHANGE;
+  strncpy(nmsg.sender, p.nick, METHOD_SENDER_SZ - 1);
+  strncpy(nmsg.text,   new_nick, METHOD_TEXT_SZ - 1);
+  snprintf(nmsg.metadata, METHOD_META_SZ, "%s!%s@%s",
+      new_nick, p.user, p.host);
+  strncpy(nmsg.prev_metadata, p.prefix, METHOD_META_SZ - 1);
+  nmsg.timestamp = time(NULL);
+  method_deliver(st->inst, &nmsg);
+}
+
+static void
+irc_handle_topic(irc_state_t *st, const irc_parsed_msg_t *pp)
+{
+  const irc_parsed_msg_t p = *pp;
+  char channel[IRC_CHAN_SZ + 1];
+  size_t ci = 0;
+  const char *new_topic;
+  irc_channel_t *ch;
+  bool have_ops = false;
+  const char *channame;
+  const char *wanted;
+  char key[KV_KEY_SZ];
+
+  while(p.params[ci] != '\0' && p.params[ci] != ' ' && ci < IRC_CHAN_SZ)
+  {
+    channel[ci] = p.params[ci];
+    ci++;
+  }
+
+  channel[ci] = '\0';
+
+  if(channel[0] != '#' && channel[0] != '&')
+    return;
+
+  new_topic = p.has_trailing ? p.trailing : "";
+
+  pthread_mutex_lock(&st->chan_mutex);
+
+  ch = irc_chan_find(st, channel);
+
+  if(ch != NULL)
+  {
+    strncpy(ch->topic, new_topic, IRC_LINE_SZ - 1);
+    ch->topic[IRC_LINE_SZ - 1] = '\0';
+    have_ops = ch->have_ops;
+  }
+
+  pthread_mutex_unlock(&st->chan_mutex);
+
+  if(!have_ops || strncasecmp(p.nick, st->cur_nick, IRC_NICK_SZ) == 0)
+    return;
+
+  channame = channel + 1;
+  snprintf(key, sizeof(key), "%schan.%s.admin.enabled",
+      st->kv_prefix, channame);
+
+  if(kv_get_uint(key) == 0)
+    return;
+
+  snprintf(key, sizeof(key), "%schan.%s.admin.topic.enabled",
+      st->kv_prefix, channame);
+
+  if(kv_get_uint(key) == 0)
+    return;
+
+  snprintf(key, sizeof(key), "%schan.%s.admin.topic.value",
+      st->kv_prefix, channame);
+  wanted = kv_get_str(key);
+
+  if(wanted != NULL && wanted[0] != '\0' && strcmp(new_topic, wanted) != 0)
+  {
+    irc_send_raw(st, "TOPIC %s :%s", channel, wanted);
+    clam(CLAM_INFO, "irc", "%s: restored topic (changed by %s)",
+        channel, p.nick);
+  }
+}
+
+static void
+irc_handle_mode(irc_state_t *st, const irc_parsed_msg_t *pp)
+{
+  const irc_parsed_msg_t p = *pp;
+  char channel[IRC_CHAN_SZ + 1];
+  size_t ci = 0;
+  const char *mp;
+  const char *mode_str;
+  bool adding = true;
+  bool key_removed = false;
+  const char *param_ptr;
+  bool is_self;
+  irc_channel_t *ch;
+  bool had_ops;
+  bool now_has_ops;
+  const char *channame;
+  const char *val;
+  char key[KV_KEY_SZ];
+
+  while(p.params[ci] != '\0' && p.params[ci] != ' ' && ci < IRC_CHAN_SZ)
+  {
+    channel[ci] = p.params[ci];
+    ci++;
+  }
+
+  channel[ci] = '\0';
+
+  if(channel[0] != '#' && channel[0] != '&')
+    return;
+
+  mp = p.params + ci;
+
+  while(*mp == ' ')
+    mp++;
+
+  if(*mp == '\0')
+    return;
+
+  mode_str = mp;
+
+  while(*mp != '\0' && *mp != ' ')
+    mp++;
+
+  while(*mp == ' ')
+    mp++;
+
+  // mp now points at the first parameter nick (or '\0').
+  param_ptr = mp;
+  is_self = (strncasecmp(p.nick, st->cur_nick, IRC_NICK_SZ) == 0);
+
+  pthread_mutex_lock(&st->chan_mutex);
+
+  ch = irc_chan_find(st, channel);
+  had_ops = (ch != NULL) ? ch->have_ops : false;
+
+  for(const char *mc = mode_str; *mc != '\0' && *mc != ' '; mc++)
+  {
+    uint8_t flag;
+    bool takes_param;
+
+    if(*mc == '+')
+    {
+      adding = true;
+      continue;
+    }
+
+    if(*mc == '-')
+    {
+      adding = false;
+      continue;
+    }
+
+    flag = irc_mode_to_flag(*mc);
+
+    takes_param = (*mc == 'o' || *mc == 'v' || *mc == 'h' ||
+        *mc == 'q' || *mc == 'a' || *mc == 'k' || *mc == 'b' ||
+        (*mc == 'l' && adding));
+
+    if(*mc == 'k' && !adding)
+      key_removed = true;
+
+    if(takes_param)
+    {
+      char param_nick[IRC_NICK_SZ];
+      size_t pn = 0;
+
+      while(*param_ptr != '\0' && *param_ptr != ' ' &&
+          pn < IRC_NICK_SZ - 1)
+        param_nick[pn++] = *param_ptr++;
+
+      param_nick[pn] = '\0';
+
+      while(*param_ptr == ' ')
+        param_ptr++;
+
+      if(flag != 0 && ch != NULL && pn > 0)
+      {
+        irc_member_t *m = irc_member_find(ch, param_nick);
+
+        if(m != NULL)
+        {
+          if(adding)
+            m->mode_flags |= flag;
+          else
+            m->mode_flags &= ~flag;
+        }
+
+        if(flag == IRC_MFLAG_OP &&
+            strncasecmp(param_nick, st->cur_nick, IRC_NICK_SZ) == 0)
+        {
+          ch->have_ops = adding;
+
+          if(!adding)
+            clam(CLAM_INFO, "irc", "%s: lost ops (deopped by %s)",
+                channel, p.nick);
+        }
+      }
+    }
+  }
+
+  now_has_ops = (ch != NULL) ? ch->have_ops : false;
+
+  pthread_mutex_unlock(&st->chan_mutex);
+
+  if(!had_ops && now_has_ops)
+    irc_apply_chan_admin(st, channel);
+
+  if(!key_removed || !now_has_ops || is_self)
+    return;
+
+  channame = (channel[0] == '#') ? channel + 1 : channel;
+  snprintf(key, sizeof(key), "%schan.%s.admin.enabled",
+      st->kv_prefix, channame);
+
+  if(kv_get_uint(key) == 0)
+    return;
+
+  snprintf(key, sizeof(key), "%schan.%s.admin.key.enabled",
+      st->kv_prefix, channame);
+
+  if(kv_get_uint(key) == 0)
+    return;
+
+  snprintf(key, sizeof(key), "%schan.%s.admin.key.value",
+      st->kv_prefix, channame);
+  val = kv_get_str(key);
+
+  if(val != NULL && val[0] != '\0')
+  {
+    irc_send_raw(st, "MODE %s +k %s", channel, val);
+    clam(CLAM_INFO, "irc", "%s: restored channel key (removed by %s)",
+        channel, p.nick);
+  }
+}
+
+static void
+irc_handle_nickinuse(irc_state_t *st, const irc_parsed_msg_t *pp)
+{
+  const char *next = NULL;
+
+  (void)pp;
+  st->nick_attempt++;
+
+  if(st->nick_attempt == 1 && st->nick2[0] != '\0')
+    next = st->nick2;
+  else if(st->nick_attempt == 2 && st->nick3[0] != '\0')
+    next = st->nick3;
+
+  if(next != NULL)
+  {
+    strncpy(st->cur_nick, next, IRC_NICK_SZ - 1);
+    st->cur_nick[IRC_NICK_SZ - 1] = '\0';
+    clam(CLAM_WARN, "irc", "nick in use, trying '%s'", st->cur_nick);
+    irc_send_raw(st, "NICK %s", st->cur_nick);
+  }
+
+  else
+    clam(CLAM_WARN, "irc", "all configured nicks are in use");
+}
+
+static void
+irc_handle_error(irc_state_t *st, const irc_parsed_msg_t *pp)
+{
+  const irc_parsed_msg_t p = *pp;
+
+  clam(CLAM_WARN, "irc", "server error: %s",
+      p.has_trailing ? p.trailing : p.params);
+  st->connected = false;
+}
+
 static void
 irc_handle_line(irc_state_t *st, const char *line)
 {
   irc_parsed_msg_t p;
-  irc_parse_line(line, &p);
+  size_t i;
 
+  irc_parse_line(line, &p);
   clam(CLAM_DEBUG3, "irc", "<< %s", line);
 
-  // PING — respond immediately.
-  if(strcmp(p.command, "PING") == 0)
+  for(i = 0; irc_cmd_table[i].cmd != NULL; i++)
   {
-    irc_send_raw(st, "PONG :%s", p.has_trailing ? p.trailing : "");
-    return;
-  }
-
-  // 001 RPL_WELCOME — registration complete.
-  if(strcmp(p.command, "001") == 0)
-  {
-    st->registered = true;
-    clam(CLAM_INFO, "irc", "registered as %s on %s",
-        st->cur_nick, st->host);
-    method_set_state(st->inst, METHOD_AVAILABLE);
-    irc_join_channels(st);
-    return;
-  }
-
-  // JOIN — check if we joined a channel, handle announce.
-  if(strcmp(p.command, "JOIN") == 0)
-  {
-    // Only handle our own joins.
-    if(strncasecmp(p.nick, st->cur_nick, IRC_NICK_SZ) == 0)
+    if(strcmp(p.command, irc_cmd_table[i].cmd) == 0)
     {
-      // Channel is in trailing or params depending on server.
-      const char *channel = p.has_trailing ? p.trailing : p.params;
-
-      if(channel[0] != '\0')
-      {
-        clam(CLAM_INFO, "irc", "joined %s", channel);
-        irc_handle_self_join(st, channel);
-      }
+      irc_cmd_table[i].fn(st, &p);
+      return;
     }
-
-    return;
   }
 
-  // PRIVMSG — deliver to subscribers.
-  if(strcmp(p.command, "PRIVMSG") == 0)
-  {
-    irc_handle_privmsg(st, &p);
-    return;
-  }
-
-  // 433 ERR_NICKNAMEINUSE — try fallback nicks in order.
-  if(strcmp(p.command, "433") == 0)
-  {
-    const char *next = NULL;
-
-    st->nick_attempt++;
-
-    if(st->nick_attempt == 1 && st->nick2[0] != '\0')
-      next = st->nick2;
-    else if(st->nick_attempt == 2 && st->nick3[0] != '\0')
-      next = st->nick3;
-
-    if(next != NULL)
-    {
-      strncpy(st->cur_nick, next, IRC_NICK_SZ - 1);
-      st->cur_nick[IRC_NICK_SZ - 1] = '\0';
-      clam(CLAM_WARN, "irc", "nick in use, trying '%s'", st->cur_nick);
-      irc_send_raw(st, "NICK %s", st->cur_nick);
-    }
-
-    else
-    {
-      clam(CLAM_WARN, "irc", "all configured nicks are in use");
-    }
-
-    return;
-  }
-
-  // ERROR — server is disconnecting us.
-  if(strcmp(p.command, "ERROR") == 0)
-  {
-    clam(CLAM_WARN, "irc", "server error: %s",
-        p.has_trailing ? p.trailing : p.params);
-    st->connected = false;
-    return;
-  }
-
-  // Other messages — log at debug level.
   clam(CLAM_DEBUG2, "irc", "%s %s %s%s%s",
       p.command, p.params,
       p.has_trailing ? ":" : "",
@@ -790,9 +1200,7 @@ irc_handle_line(irc_state_t *st, const char *line)
       "");
 }
 
-// -----------------------------------------------------------------------
 // Buffer processing
-// -----------------------------------------------------------------------
 
 // Extract complete lines from the read buffer and dispatch them.
 static void
@@ -800,6 +1208,7 @@ irc_process_buffer(irc_state_t *st)
 {
   char *start = st->buf;
   char *end;
+  size_t remaining;
 
   while((end = strstr(start, "\r\n")) != NULL)
   {
@@ -812,14 +1221,13 @@ irc_process_buffer(irc_state_t *st)
   }
 
   // Shift remaining data to front of buffer.
-  size_t remaining = (size_t)(st->buf + st->buf_len - start);
+  remaining = (size_t)(st->buf + st->buf_len - start);
 
   if(remaining > 0 && start != st->buf)
     memmove(st->buf, start, remaining);
 
   st->buf_len = remaining;
 
-  // Safety: discard if buffer fills without a complete line.
   if(st->buf_len >= IRC_BUF_SZ - 1)
   {
     clam(CLAM_WARN, "irc", "read buffer overflow, discarding %zu bytes",
@@ -828,14 +1236,8 @@ irc_process_buffer(irc_state_t *st)
   }
 }
 
-// -----------------------------------------------------------------------
 // Socket event callback (invoked on epoll worker thread)
-// -----------------------------------------------------------------------
 
-// Handle socket events from the core socket service. Dispatches
-// connect, data, disconnect, and error events for the IRC session.
-// event: socket event descriptor (type, data, error info)
-// user_data: irc_state_t pointer for this connection
 static void
 irc_sock_cb(const sock_event_t *event, void *user_data)
 {
@@ -881,7 +1283,8 @@ irc_sock_cb(const sock_event_t *event, void *user_data)
         clam(CLAM_INFO, "irc",
             "reconnecting in %us", st->reconnect_delay);
 
-        task_add_deferred("irc_reconnect", TASK_THREAD, 100,
+        st->reconnect_task = task_add_deferred("irc_reconnect",
+            TASK_THREAD, 100,
             st->reconnect_delay * 1000, irc_reconnect_task, st);
       }
 
@@ -902,7 +1305,8 @@ irc_sock_cb(const sock_event_t *event, void *user_data)
         clam(CLAM_INFO, "irc",
             "reconnecting in %us", st->reconnect_delay);
 
-        task_add_deferred("irc_reconnect", TASK_THREAD, 100,
+        st->reconnect_task = task_add_deferred("irc_reconnect",
+            TASK_THREAD, 100,
             st->reconnect_delay * 1000, irc_reconnect_task, st);
       }
 
@@ -910,9 +1314,7 @@ irc_sock_cb(const sock_event_t *event, void *user_data)
   }
 }
 
-// -----------------------------------------------------------------------
 // Connection and reconnection
-// -----------------------------------------------------------------------
 
 // Attempt to connect to the IRC server via the core socket service.
 static void
@@ -930,7 +1332,7 @@ irc_attempt_connect(irc_state_t *st)
     {
       char tname[METHOD_NAME_SZ + 16];
       snprintf(tname, sizeof(tname), "irc_recon_%s", st->inst_name);
-      task_add_deferred(tname, TASK_THREAD, 100,
+      st->reconnect_task = task_add_deferred(tname, TASK_THREAD, 100,
           st->reconnect_delay * 1000, irc_reconnect_task, st);
     }
     return;
@@ -945,7 +1347,8 @@ irc_attempt_connect(irc_state_t *st)
     {
       clam(CLAM_WARN, "irc", "failed to create socket session");
 
-      task_add_deferred("irc_reconnect", TASK_THREAD, 100,
+      st->reconnect_task = task_add_deferred("irc_reconnect",
+          TASK_THREAD, 100,
           st->reconnect_delay * 1000, irc_reconnect_task, st);
       return;
     }
@@ -964,7 +1367,7 @@ irc_attempt_connect(irc_state_t *st)
     {
       char tname[METHOD_NAME_SZ + 16];
       snprintf(tname, sizeof(tname), "irc_recon_%s", st->inst_name);
-      task_add_deferred(tname, TASK_THREAD, 100,
+      st->reconnect_task = task_add_deferred(tname, TASK_THREAD, 100,
           st->reconnect_delay * 1000, irc_reconnect_task, st);
     }
     return;
@@ -979,6 +1382,18 @@ irc_reconnect_task(task_t *t)
 {
   irc_state_t *st = t->data;
 
+  // Clear the pending-task handle so irc_disconnect does not try to
+  // neutralise a task that is already firing.
+  st->reconnect_task = NULL;
+
+  // Another path (explicit stop, shutdown) may have disabled us
+  // between scheduling and firing. Bail before touching the session.
+  if(st->shutdown || pool_shutting_down())
+  {
+    t->state = TASK_ENDED;
+    return;
+  }
+
   // Destroy stale session before reconnecting.
   if(st->session != NULL)
   {
@@ -990,28 +1405,23 @@ irc_reconnect_task(task_t *t)
   t->state = TASK_ENDED;
 }
 
-// -----------------------------------------------------------------------
 // Method driver callbacks
-// -----------------------------------------------------------------------
 
-// Allocate and initialize a new IRC method instance state.
-// Derives the bot name and KV prefix from the instance name.
-// returns: opaque irc_state_t handle
-// inst_name: method instance name (e.g. "mybot_irc")
 static void *
 irc_create(const char *inst_name)
 {
   irc_state_t *st = mem_alloc("irc", "state", sizeof(*st));
+  const char *suffix = "_irc";
+  size_t nlen = strlen(inst_name);
+  size_t slen = strlen(suffix);
+  char botname[BOT_NAME_SZ] = {0};
+
   memset(st, 0, sizeof(*st));
 
   strncpy(st->inst_name, inst_name, METHOD_NAME_SZ - 1);
 
   // Derive bot name from inst_name by stripping the trailing "_irc".
   // Convention: inst_name = "{botname}_irc" (set by admin_cmd_bot_bind).
-  const char *suffix = "_irc";
-  size_t nlen = strlen(inst_name);
-  size_t slen = strlen(suffix);
-  char botname[BOT_NAME_SZ] = {0};
 
   if(nlen > slen &&
       strcmp(inst_name + nlen - slen, suffix) == 0)
@@ -1025,23 +1435,26 @@ irc_create(const char *inst_name)
   st->reconnect_delay = 30;
 
   pthread_mutex_init(&st->ctx_mutex, NULL);
+  pthread_mutex_init(&st->chan_mutex, NULL);
   return(st);
 }
 
-// Free an IRC method instance state and its resources.
-// handle: irc_state_t pointer returned by irc_create
 static void
 irc_destroy(void *handle)
 {
   irc_state_t *st = handle;
 
+  irc_chan_clear_all(st);
+  pthread_mutex_destroy(&st->chan_mutex);
   pthread_mutex_destroy(&st->ctx_mutex);
   mem_free(st);
 }
 
 // Gracefully disconnect from the IRC server. Sends a QUIT message
-// and closes the socket. Sets the shutdown flag to prevent reconnection.
-// handle: irc_state_t pointer
+// when registration was complete, tears down any socket (even
+// half-open sessions mid-handshake to avoid leaked fds that remain
+// visible to the peer), and neutralises any pending reconnect task
+// so it does not fire after the method has been stopped.
 static void
 irc_disconnect(void *handle)
 {
@@ -1049,20 +1462,31 @@ irc_disconnect(void *handle)
 
   st->shutdown = true;
 
-  if(st->session != NULL && st->connected)
+  // Neutralise any pending deferred reconnect. The task callback
+  // checks st->shutdown at entry and bails; marking it TASK_ENDED
+  // here tells the scheduler not to dispatch it at all when the
+  // delay expires. Without this, a stop/start cycle during the
+  // reconnect backoff could fire a spurious second connection
+  // (previously observed on Libera as a stale pacmanpundit_ nick).
+  if(st->reconnect_task != NULL)
   {
-    // Best-effort QUIT message.
-    irc_send_raw(st, "QUIT :shutting down");
+    st->reconnect_task->state = TASK_ENDED;
+    st->reconnect_task = NULL;
+  }
+
+  irc_chan_clear_all(st);
+
+  // Always close an existing session, connected or not. A half-open
+  // session whose fd we leak here remains visible to the peer and
+  // only clears on ping-timeout (several minutes on Libera).
+  if(st->session != NULL)
+  {
+    if(st->connected)
+      irc_send_raw(st, "QUIT :shutting down");
     sock_close(st->session);
   }
 }
 
-// Send a PRIVMSG to the given target (channel or nick).
-// Requires the connection to be registered before sending.
-// returns: SUCCESS or FAIL
-// handle: irc_state_t pointer
-// target: destination channel or nick
-// text: message text to send
 static bool
 irc_send(void *handle, const char *target, const char *text)
 {
@@ -1074,13 +1498,26 @@ irc_send(void *handle, const char *target, const char *text)
   return(irc_send_privmsg(st, target, text));
 }
 
-// Look up a sender's host from the nick->host context cache.
-// Used by the auth subsystem for host-based identity verification.
-// returns: SUCCESS if found, FAIL if sender not in cache
-// handle: irc_state_t pointer
-// sender: nick to look up
-// ctx: output buffer for the host string
-// ctx_sz: size of the output buffer
+// Send a CTCP ACTION (the on-the-wire form of /me) to the given target.
+// The text is wrapped in CTCP \x01 markers inside a normal PRIVMSG.
+static bool
+irc_send_emote(void *handle, const char *target, const char *text)
+{
+  irc_state_t *st = handle;
+  char buf[IRC_LINE_SZ];
+  int n;
+
+  if(!st->connected || !st->registered)
+    return(FAIL);
+
+  // Keep within IRC's 512-byte wire limit; the 9-byte overhead for
+  // "ACTION " + two \x01 is small, so split on spaces if needed.
+  n = snprintf(buf, sizeof(buf), "\001ACTION %s\001", text);
+  if(n < 0) return(FAIL);
+
+  return(irc_send_privmsg(st, target, buf));
+}
+
 static bool
 irc_get_context(void *handle, const char *sender,
     char *ctx, size_t ctx_sz)
@@ -1105,14 +1542,83 @@ irc_get_context(void *handle, const char *sender,
   return(FAIL);
 }
 
-// -----------------------------------------------------------------------
-// IRC network/server configuration management
-// -----------------------------------------------------------------------
+// List members of an IRC channel, invoking cb for each nick.
+static void
+irc_list_channel(void *handle, const char *channel,
+    method_chan_member_cb_t cb, void *data)
+{
+  irc_state_t *st = handle;
+  irc_channel_t *ch;
 
-// Validate a network name: alphanumeric, dash, underscore only.
-// No dots allowed (they are the KV key separator).
-// returns: true if valid
-// name: name to validate
+  pthread_mutex_lock(&st->chan_mutex);
+
+  ch = irc_chan_find(st, channel);
+
+  if(ch == NULL)
+  {
+    pthread_mutex_unlock(&st->chan_mutex);
+    return;
+  }
+
+  for(irc_member_t *m = ch->members; m != NULL; m = m->next)
+    cb(m->nick, data);
+
+  pthread_mutex_unlock(&st->chan_mutex);
+}
+
+// List channels the bot is currently joined to. Entries are added on
+// JOIN and removed on PART/KICK/QUIT/disconnect, so the list reflects
+// live membership — not the autojoin KV configuration. Callback runs
+// with chan_mutex held; it must not acquire additional IRC locks or
+// call back into the IRC driver.
+static void
+irc_list_joined_channels(void *handle,
+    method_joined_channel_cb_t cb, void *data)
+{
+  irc_state_t *st = handle;
+
+  pthread_mutex_lock(&st->chan_mutex);
+
+  for(irc_channel_t *ch = st->channels; ch != NULL; ch = ch->next)
+    cb(ch->name, data);
+
+  pthread_mutex_unlock(&st->chan_mutex);
+}
+
+// Build an identity signature JSON from an inbound message. The
+// message metadata carries the full IRC prefix ("nick!ident@host") —
+// see the PRIVMSG handling in irc_handle_line. Delegates the JSON
+// shaping to irc_dossier_build_signature so the unit tests can
+// exercise the same code path without loading the plugin.
+//
+// Registered with the chat plugin's identity registry at plugin_start
+// (see irc_start below); signature matches chat_identity_signer_t.
+static bool
+irc_identity_signature(const method_msg_t *msg,
+    char *out_json, size_t out_sz)
+{
+  if(msg == NULL)
+    return(FAIL);
+
+  return(irc_dossier_build_signature(msg->metadata, out_json, out_sz));
+}
+
+// Get the bot's current IRC nickname.
+static bool
+irc_get_self(void *handle, char *buf, size_t buf_sz)
+{
+  irc_state_t *st = handle;
+
+  if(st->cur_nick[0] == '\0')
+    return(FAIL);
+
+  strncpy(buf, st->cur_nick, buf_sz - 1);
+  buf[buf_sz - 1] = '\0';
+  return(SUCCESS);
+}
+
+// IRC network/server configuration management
+
 bool
 irc_valid_name(const char *name)
 {
@@ -1120,18 +1626,12 @@ irc_valid_name(const char *name)
     return(false);
 
   for(const char *p = name; *p != '\0'; p++)
-  {
     if(!isalnum((unsigned char)*p) && *p != '-' && *p != '_')
       return(false);
-  }
 
   return(true);
 }
 
-// Convert an address (hostname or IP) to a KV-safe key.
-// Dots and colons are replaced with dashes.
-// out: output buffer
-// out_sz: output buffer size
 void
 irc_address_to_key(const char *address, char *out, size_t out_sz)
 {
@@ -1148,20 +1648,14 @@ irc_address_to_key(const char *address, char *out, size_t out_sz)
   out[i] = '\0';
 }
 
-// -----------------------------------------------------------------------
-
-// Extract the Nth dot-separated segment from a key string.
-// returns: SUCCESS or FAIL
-// key: full key string (e.g., "irc.net.freenode.srv1.address")
-// segment: 0-indexed segment number
-// out: output buffer
-// out_sz: output buffer size
 bool
 irc_extract_segment(const char *key, uint32_t segment,
     char *out, size_t out_sz)
 {
   const char *p = key;
   uint32_t seg = 0;
+  const char *end;
+  size_t len;
 
   while(seg < segment)
   {
@@ -1174,8 +1668,8 @@ irc_extract_segment(const char *key, uint32_t segment,
     seg++;
   }
 
-  const char *end = strchr(p, '.');
-  size_t len = end ? (size_t)(end - p) : strlen(p);
+  end = strchr(p, '.');
+  len = end ? (size_t)(end - p) : strlen(p);
 
   if(len == 0 || len >= out_sz)
     return(FAIL);
@@ -1191,6 +1685,7 @@ void
 irc_init_networks(void)
 {
   db_result_t *r = db_result_alloc();
+  uint32_t restored = 0;
 
   if(db_query("SELECT key, type, value FROM kv "
                "WHERE key LIKE 'irc.net.%'", r) != SUCCESS)
@@ -1199,20 +1694,19 @@ irc_init_networks(void)
     return;
   }
 
-  uint32_t restored = 0;
-
   for(uint32_t i = 0; i < r->rows; i++)
   {
     const char *db_key  = db_result_get(r, i, 0);
     const char *db_type = db_result_get(r, i, 1);
     const char *db_val  = db_result_get(r, i, 2);
+    kv_type_t type;
 
     if(db_key == NULL || db_type == NULL || db_val == NULL)
       continue;
 
-    kv_type_t type = (kv_type_t)atoi(db_type);
+    type = (kv_type_t)atoi(db_type);
 
-    if(kv_register(db_key, type, db_val, NULL, NULL) == SUCCESS)
+    if(kv_register(db_key, type, db_val, NULL, NULL, NULL) == SUCCESS)
       restored++;
   }
 
@@ -1229,11 +1723,11 @@ void
 irc_srv_list_cb(const char *key, kv_type_t type,
     const char *val, void *data)
 {
-  (void)type;
-  (void)val;
-
   irc_srv_list_t *list = data;
   char name[IRC_SRV_NAME_SZ];
+
+  (void)type;
+  (void)val;
 
   // Key format: irc.net.<NETWORK>.<SERVER>.<PROPERTY>
   // Server is segment 3.
@@ -1242,10 +1736,8 @@ irc_srv_list_cb(const char *key, kv_type_t type,
 
   // Deduplicate.
   for(uint32_t i = 0; i < list->count; i++)
-  {
     if(strcmp(list->names[i], name) == 0)
       return;
-  }
 
   if(list->count < IRC_MAX_SRVS)
   {
@@ -1254,14 +1746,11 @@ irc_srv_list_cb(const char *key, kv_type_t type,
   }
 }
 
-// -----------------------------------------------------------------------
 // Driver struct
-// -----------------------------------------------------------------------
 
 // Initiate an IRC connection. Resolves the method instance back-pointer
 // and begins the async connect sequence (config load, DNS, TCP).
 // returns: SUCCESS or FAIL (instance not found)
-// handle: irc_state_t pointer
 static bool
 irc_connect(void *handle)
 {
@@ -1281,13 +1770,40 @@ irc_connect(void *handle)
   return(SUCCESS);
 }
 
-// -----------------------------------------------------------------------
-// Plugin lifecycle callbacks
-// -----------------------------------------------------------------------
+// KV callbacks
 
-// Initialize the IRC plugin. Restores network KV entries from the
-// database and registers all /irc and /show irc console commands.
-// returns: SUCCESS
+// When the primary nick is set, auto-populate nick2 (nick_) and nick3
+// (nick__) so the bot always has alternate nicknames available.
+void
+irc_nick_kv_cb(const char *key, void *data)
+{
+  const char *nick;
+  char key2[KV_KEY_SZ];
+  char key3[KV_KEY_SZ];
+  char val2[IRC_NICK_SZ];
+  char val3[IRC_NICK_SZ];
+
+  (void)data;
+
+  nick = kv_get_str(key);
+
+  if(nick == NULL || nick[0] == '\0')
+    return;
+
+  // key is "bot.<botname>.irc.nick" — derive nick2/nick3 by appending
+  // "2" and "3" to the key, and "_" / "__" to the nick value.
+  snprintf(key2, sizeof(key2), "%s2", key);
+  snprintf(key3, sizeof(key3), "%s3", key);
+
+  snprintf(val2, sizeof(val2), "%s_", nick);
+  snprintf(val3, sizeof(val3), "%s__", nick);
+
+  kv_set_str(key2, val2);
+  kv_set_str(key3, val3);
+}
+
+// Plugin lifecycle callbacks
+
 static bool
 irc_init(void)
 {
@@ -1297,18 +1813,49 @@ irc_init(void)
   // them. Must happen before kv_load() which runs after all plugins init.
   irc_init_networks();
 
-  // Register all /irc and /show irc console commands.
+  // Register all /irc and /show irc operator commands.
   irc_register_commands();
 
   return(SUCCESS);
 }
 
-// Start the IRC plugin. The driver is already available via the plugin
-// descriptor; instances are created on demand when bots bind to IRC.
-// returns: SUCCESS
+// Function-pointer typedef for the chat plugin's chat_identity_register
+// entry point. Matches plugins/bot/chat/identity.h exactly; declared
+// locally so the IRC plugin does not need to include a chat-plugin
+// header across the RTLD_LOCAL boundary. The typedefs for the signer
+// and scorer signatures match the contract-level types already used by
+// the IRC scorer functions (dossier_method_sig_t etc.).
+typedef bool (*irc_chat_identity_signer_t)(const method_msg_t *msg,
+    char *out_json, size_t out_sz);
+typedef float (*irc_chat_identity_scorer_t)(
+    const dossier_method_sig_t *a, const dossier_method_sig_t *b);
+typedef float (*irc_chat_identity_token_scorer_t)(const char *token,
+    const dossier_method_sig_t *sig);
+typedef bool (*irc_chat_identity_register_fn_t)(const char *method_kind,
+    irc_chat_identity_signer_t       signer,
+    irc_chat_identity_scorer_t       scorer,
+    irc_chat_identity_token_scorer_t token_scorer);
+
 static bool
 irc_start(void)
 {
+  irc_chat_identity_register_fn_t reg;
+  union { void *obj; irc_chat_identity_register_fn_t fn; } u;
+
+  // Publish the IRC identity triple to the chat plugin's identity
+  // registry. Chat may not be loaded (command-bot-only deployment); in
+  // that case dlsym returns NULL and we silently skip — identity
+  // resolution just won't work for this method_kind in this run.
+  u.obj = plugin_dlsym("chat", "chat_identity_register");
+  reg   = u.fn;
+
+  if(reg != NULL)
+  {
+    if(reg("irc", irc_identity_signature,
+           irc_identity_score, irc_identity_token_score) != SUCCESS)
+      clam(CLAM_WARN, "irc", "chat_identity_register('irc') failed");
+  }
+
   // The IRC driver is made available through the plugin descriptor's
   // ext field. Method instances are created on demand by bot_start()
   // when a bot binds to IRC.
@@ -1316,9 +1863,6 @@ irc_start(void)
   return(SUCCESS);
 }
 
-// Stop the IRC plugin. Per-instance disconnection is handled by the
-// driver disconnect callback when bot_stop() or bot_destroy() runs.
-// returns: SUCCESS
 static bool
 irc_stop(void)
 {
@@ -1327,7 +1871,7 @@ irc_stop(void)
   return(SUCCESS);
 }
 
-// Tear down the IRC plugin. Unregisters all console commands
+// Tear down the IRC plugin. Unregisters all operator commands
 // in leaf-first order to avoid dangling parent references.
 static void
 irc_deinit(void)
@@ -1365,9 +1909,7 @@ irc_deinit(void)
   cmd_unregister("irc");
 }
 
-// -----------------------------------------------------------------------
 // KV schema and plugin descriptor
-// -----------------------------------------------------------------------
 
 // No plugin-level KV schema. IRC network definitions
 // (plugin.irc.network.<name>.server.<N>.host, etc.) are dynamic and

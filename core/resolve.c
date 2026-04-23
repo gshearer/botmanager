@@ -1,12 +1,10 @@
+// botmanager — MIT
+// Name resolution helpers: map bot/user/method tokens to records.
 #define RESOLVE_INTERNAL
 #include "resolve.h"
 
-// -----------------------------------------------------------------------
 // Freelist helpers
-// -----------------------------------------------------------------------
 
-// Allocate a resolve request from the freelist, or heap if empty.
-// returns: zeroed resolve_request_t pointer
 static resolve_request_t *
 resolve_req_alloc(void)
 {
@@ -30,8 +28,6 @@ resolve_req_alloc(void)
   return(req);
 }
 
-// Return a resolve request to the freelist.
-// req: request to release
 static void
 resolve_req_release(resolve_request_t *req)
 {
@@ -42,9 +38,7 @@ resolve_req_release(resolve_request_t *req)
   pthread_mutex_unlock(&resolve_req_lock);
 }
 
-// -----------------------------------------------------------------------
 // KV configuration
-// -----------------------------------------------------------------------
 
 // Load resolver configuration from the KV store, applying defaults
 // for any unset values.
@@ -61,9 +55,6 @@ resolve_load_config(void)
     resolve_cfg.max_pending = 64;
 }
 
-// KV change callback; reloads resolver configuration.
-// key: changed key (unused)
-// data: callback context (unused)
 static void
 resolve_kv_changed(const char *key, void *data)
 {
@@ -72,18 +63,15 @@ resolve_kv_changed(const char *key, void *data)
   resolve_load_config();
 }
 
-// -----------------------------------------------------------------------
 // A/AAAA resolution via getaddrinfo
-// -----------------------------------------------------------------------
 
-// Resolve A/AAAA records using getaddrinfo. Populates result with
-// address records and sockaddr storage suitable for connect().
-// req: pending request with hostname and query type
-// result: output structure filled with records or error info
 static void
 resolve_via_getaddrinfo(resolve_request_t *req, resolve_result_t *result)
 {
   struct addrinfo hints, *res, *rp;
+  int              rc;
+  time_t           elapsed;
+  uint32_t         count;
 
   memset(&hints, 0, sizeof(hints));
 
@@ -96,12 +84,12 @@ resolve_via_getaddrinfo(resolve_request_t *req, resolve_result_t *result)
 
   hints.ai_socktype = SOCK_STREAM;
 
-  int rc = getaddrinfo(req->name, NULL, &hints, &res);
+  rc = getaddrinfo(req->name, NULL, &hints, &res);
 
   // Check timeout.
   if(resolve_cfg.timeout > 0)
   {
-    time_t elapsed = time(NULL) - req->submitted;
+    elapsed = time(NULL) - req->submitted;
 
     if(elapsed > (time_t)resolve_cfg.timeout)
     {
@@ -122,13 +110,11 @@ resolve_via_getaddrinfo(resolve_request_t *req, resolve_result_t *result)
   }
 
   // Count results.
-  uint32_t count = 0;
+  count = 0;
 
   for(rp = res; rp != NULL; rp = rp->ai_next)
-  {
     if(rp->ai_family == AF_INET || rp->ai_family == AF_INET6)
       count++;
-  }
 
   if(count == 0)
   {
@@ -179,13 +165,8 @@ resolve_via_getaddrinfo(resolve_request_t *req, resolve_result_t *result)
   result->status = 0;
 }
 
-// -----------------------------------------------------------------------
 // All other types via res_query
-// -----------------------------------------------------------------------
 
-// Map resolve_type_t to DNS wire type (qtype_ns).
-// returns: ns_type value, or -1 for unsupported types
-// qtype: resolver query type enum
 static int
 resolve_to_qtype_ns(resolve_type_t qtype)
 {
@@ -205,15 +186,17 @@ resolve_to_qtype_ns(resolve_type_t qtype)
   return(-1);
 }
 
-// Resolve non-A/AAAA record types (MX, TXT, CNAME, etc.) using
-// res_query and manual DNS wire-format parsing.
-// req: pending request with hostname and query type
-// result: output structure filled with parsed records or error info
 static void
 resolve_via_res_query(resolve_request_t *req, resolve_result_t *result)
 {
   unsigned char answer[RESOLVE_ANSWER_SZ];
-  int qtype_ns = resolve_to_qtype_ns(req->qtype);
+  int           qtype_ns;
+  int           len;
+  time_t        elapsed;
+  ns_msg        msg;
+  int           an_count;
+
+  qtype_ns = resolve_to_qtype_ns(req->qtype);
 
   if(qtype_ns < 0)
   {
@@ -222,12 +205,12 @@ resolve_via_res_query(resolve_request_t *req, resolve_result_t *result)
     return;
   }
 
-  int len = res_query(req->name, ns_c_in, qtype_ns, answer, sizeof(answer));
+  len = res_query(req->name, ns_c_in, qtype_ns, answer, sizeof(answer));
 
   // Check timeout.
   if(resolve_cfg.timeout > 0)
   {
-    time_t elapsed = time(NULL) - req->submitted;
+    elapsed = time(NULL) - req->submitted;
 
     if(elapsed > (time_t)resolve_cfg.timeout)
     {
@@ -254,8 +237,6 @@ resolve_via_res_query(resolve_request_t *req, resolve_result_t *result)
   }
 
   // Parse the DNS response.
-  ns_msg msg;
-
   if(ns_initparse(answer, len, &msg) < 0)
   {
     result->status = -1;
@@ -263,7 +244,7 @@ resolve_via_res_query(resolve_request_t *req, resolve_result_t *result)
     return;
   }
 
-  int an_count = ns_msg_count(msg, ns_s_an);
+  an_count = ns_msg_count(msg, ns_s_an);
 
   if(an_count <= 0)
   {
@@ -281,34 +262,40 @@ resolve_via_res_query(resolve_request_t *req, resolve_result_t *result)
 
   for(int i = 0; i < an_count; i++)
   {
-    ns_rr rr;
+    ns_rr                rr;
+    unsigned             rr_type;
+    resolve_record_t    *rec;
+    const unsigned char *rdata;
+    uint16_t             rdlen;
+    char                 dname[RESOLVE_NAME_SZ];
 
     if(ns_parserr(&msg, ns_s_an, i, &rr) < 0)
       continue;
 
     // Skip records that don't match the queried type.
-    unsigned rr_type = ns_rr_type(rr);
+    rr_type = ns_rr_type(rr);
 
     if(rr_type != (unsigned)qtype_ns)
       continue;
 
-    resolve_record_t *rec = &result->records[result->count];
+    rec = &result->records[result->count];
     memset(rec, 0, sizeof(*rec));
     rec->type = req->qtype;
     rec->ttl  = ns_rr_ttl(rr);
 
-    const unsigned char *rdata = ns_rr_rdata(rr);
-    uint16_t rdlen = ns_rr_rdlen(rr);
-    char dname[RESOLVE_NAME_SZ];
+    rdata = ns_rr_rdata(rr);
+    rdlen = ns_rr_rdlen(rr);
 
     switch(req->qtype)
     {
       case RESOLVE_A:
         if(rdlen >= 4)
         {
+          struct sockaddr_in *sa4;
+
           inet_ntop(AF_INET, rdata, rec->a.addr, sizeof(rec->a.addr));
 
-          struct sockaddr_in *sa4 = (struct sockaddr_in *)&rec->a.sa;
+          sa4 = (struct sockaddr_in *)&rec->a.sa;
           sa4->sin_family = AF_INET;
           memcpy(&sa4->sin_addr, rdata, 4);
           rec->a.sa_len = sizeof(struct sockaddr_in);
@@ -319,9 +306,11 @@ resolve_via_res_query(resolve_request_t *req, resolve_result_t *result)
       case RESOLVE_AAAA:
         if(rdlen >= 16)
         {
+          struct sockaddr_in6 *sa6;
+
           inet_ntop(AF_INET6, rdata, rec->aaaa.addr, sizeof(rec->aaaa.addr));
 
-          struct sockaddr_in6 *sa6 = (struct sockaddr_in6 *)&rec->aaaa.sa;
+          sa6 = (struct sockaddr_in6 *)&rec->aaaa.sa;
           sa6->sin6_family = AF_INET6;
           memcpy(&sa6->sin6_addr, rdata, 16);
           rec->aaaa.sa_len = sizeof(struct sockaddr_in6);
@@ -439,13 +428,8 @@ resolve_via_res_query(resolve_request_t *req, resolve_result_t *result)
   result->status = 0;
 }
 
-// -----------------------------------------------------------------------
 // Task callback
-// -----------------------------------------------------------------------
 
-// Task worker callback. Performs the DNS lookup, delivers the result
-// to the caller's callback, then cleans up.
-// t: task whose data field points to a resolve_request_t
 static void
 resolve_task(task_t *t)
 {
@@ -464,17 +448,13 @@ resolve_task(task_t *t)
     resolve_via_res_query(req, &result);
 
   if(result.status != 0)
-  {
     clam(CLAM_DEBUG, "resolve", "%s %s: %s",
         resolve_type_name(req->qtype), req->name,
         result.error ? result.error : "unknown error");
-  }
 
   else
-  {
     clam(CLAM_DEBUG, "resolve", "%s %s: %u record(s)",
         resolve_type_name(req->qtype), req->name, result.count);
-  }
 
   // Deliver to caller.
   req->cb(&result);
@@ -487,21 +467,20 @@ resolve_task(task_t *t)
   t->state = TASK_ENDED;
 }
 
-// -----------------------------------------------------------------------
 // Public API
-// -----------------------------------------------------------------------
 
 // Submit an asynchronous DNS lookup. The callback is invoked on a
 // worker thread once the query completes or times out.
 // returns: SUCCESS, or FAIL if not ready, bad params, or at capacity
 // name: hostname to resolve (must be non-empty)
-// qtype: DNS record type to query
 // cb: completion callback (invoked on a worker thread)
-// user_data: opaque pointer passed through to the callback
 bool
 resolve_lookup(const char *name, resolve_type_t qtype,
     resolve_cb_t cb, void *user_data)
 {
+  bool               at_cap;
+  resolve_request_t *req;
+
   if(!resolve_ready || name == NULL || cb == NULL)
     return(FAIL);
 
@@ -510,7 +489,7 @@ resolve_lookup(const char *name, resolve_type_t qtype,
 
   // Capacity check.
   pthread_mutex_lock(&resolve_req_lock);
-  bool at_cap = (resolve_pending >= resolve_cfg.max_pending);
+  at_cap = (resolve_pending >= resolve_cfg.max_pending);
   pthread_mutex_unlock(&resolve_req_lock);
 
   if(at_cap)
@@ -521,7 +500,7 @@ resolve_lookup(const char *name, resolve_type_t qtype,
     return(FAIL);
   }
 
-  resolve_request_t *req = resolve_req_alloc();
+  req = resolve_req_alloc();
   strncpy(req->name, name, RESOLVE_NAME_SZ - 1);
   req->qtype     = qtype;
   req->cb        = cb;
@@ -532,9 +511,6 @@ resolve_lookup(const char *name, resolve_type_t qtype,
   return(SUCCESS);
 }
 
-// Return the human-readable name for a DNS record type.
-// returns: static string ("A", "AAAA", "MX", etc.), or "UNKNOWN"
-// type: record type enum value
 const char *
 resolve_type_name(resolve_type_t type)
 {
@@ -555,18 +531,16 @@ resolve_type_name(resolve_type_t type)
 }
 
 // Parse a DNS record type string into its enum value (case-insensitive).
-// returns: SUCCESS, or FAIL if str is NULL, out is NULL, or unrecognized
-// str: type name (e.g., "a", "MX", "srv")
-// out: destination for parsed resolve_type_t value
 bool
 resolve_type_parse(const char *str, resolve_type_t *out)
 {
+  char   upper[16];
+  size_t i;
+
   if(str == NULL || out == NULL)
     return(FAIL);
 
   // Case-insensitive comparison.
-  char upper[16];
-  size_t i;
 
   for(i = 0; str[i] != '\0' && i < sizeof(upper) - 1; i++)
     upper[i] = (char)toupper((unsigned char)str[i]);
@@ -586,21 +560,16 @@ resolve_type_parse(const char *str, resolve_type_t *out)
   return(FAIL);
 }
 
-// -----------------------------------------------------------------------
 // User command: !resolve
-// -----------------------------------------------------------------------
 
-// Validate a resolve target. Accepts valid hostnames, IPv4, and IPv6.
-// returns: true if valid
-// str: NUL-terminated target string
 static bool
 resolve_validate_target(const char *str)
 {
-  if(str == NULL || str[0] == '\0')
-    return false;
-
   struct in_addr  v4;
   struct in6_addr v6;
+
+  if(str == NULL || str[0] == '\0')
+    return false;
 
   if(inet_pton(AF_INET, str, &v4) == 1)
     return true;
@@ -611,9 +580,6 @@ resolve_validate_target(const char *str)
   return validate_hostname(str);
 }
 
-// Validate verbose flag. Only accepts "-v".
-// returns: true if str is exactly "-v"
-// str: NUL-terminated argument string
 static bool
 resolve_validate_verbose(const char *str)
 {
@@ -623,34 +589,28 @@ resolve_validate_verbose(const char *str)
   return(strcmp(str, "-v") == 0);
 }
 
-// Convert an IPv4 address to in-addr.arpa form for reverse lookup.
-// returns: bytes written (excluding NUL), or 0 on failure
-// ip: dotted-decimal IPv4 string
-// buf: output buffer
-// sz: buffer size
 static int
 resolve_ipv4_to_arpa(const char *ip, char *buf, size_t sz)
 {
-  struct in_addr addr;
+  struct in_addr  addr;
+  uint8_t        *o;
 
   if(inet_pton(AF_INET, ip, &addr) != 1)
     return(0);
 
-  uint8_t *o = (uint8_t *)&addr.s_addr;
+  o = (uint8_t *)&addr.s_addr;
 
   return(snprintf(buf, sz, "%u.%u.%u.%u.in-addr.arpa",
       o[3], o[2], o[1], o[0]));
 }
 
 // Convert an IPv6 address to ip6.arpa form for reverse lookup.
-// returns: bytes written (excluding NUL), or 0 on failure
-// ip: IPv6 address string
 // buf: output buffer (must be at least 74 bytes)
-// sz: buffer size
 static int
 resolve_ipv6_to_arpa(const char *ip, char *buf, size_t sz)
 {
-  struct in6_addr addr;
+  struct in6_addr  addr;
+  char            *p;
 
   if(inet_pton(AF_INET6, ip, &addr) != 1)
     return(0);
@@ -658,7 +618,7 @@ resolve_ipv6_to_arpa(const char *ip, char *buf, size_t sz)
   if(sz < 74)
     return(0);
 
-  char *p = buf;
+  p = buf;
 
   for(int i = 15; i >= 0; i--)
   {
@@ -679,8 +639,6 @@ resolve_ipv6_to_arpa(const char *ip, char *buf, size_t sz)
   return((int)(p - buf));
 }
 
-// Allocate a zeroed command request from the freelist or fresh memory.
-// returns: zeroed resolve_cmd_request_t
 static resolve_cmd_request_t *
 resolve_cmd_req_alloc(void)
 {
@@ -705,8 +663,6 @@ resolve_cmd_req_alloc(void)
   return(r);
 }
 
-// Return a command request to the freelist.
-// r: request to release
 static void
 resolve_cmd_req_release(resolve_cmd_request_t *r)
 {
@@ -718,11 +674,6 @@ resolve_cmd_req_release(resolve_cmd_request_t *r)
   pthread_mutex_unlock(&resolve_cmd_free_mu);
 }
 
-// Format a TTL as a human-friendly duration string.
-// returns: bytes written
-// buf: output buffer
-// sz: buffer size
-// ttl: TTL in seconds
 static int
 resolve_fmt_ttl(char *buf, size_t sz, uint32_t ttl)
 {
@@ -738,13 +689,17 @@ resolve_fmt_ttl(char *buf, size_t sz, uint32_t ttl)
   return(snprintf(buf, sz, "%us", ttl));
 }
 
-// Format and send all accumulated records to the user.
-// r: completed request with records
 static void
 resolve_cmd_format(resolve_cmd_request_t *r)
 {
   char line[RESOLVE_CMD_REPLY_SZ];
   char ttl_buf[32];
+
+  // Display records in type order for clean grouping.
+  static const resolve_type_t type_order[] = {
+    RESOLVE_A, RESOLVE_AAAA, RESOLVE_CNAME, RESOLVE_MX,
+    RESOLVE_NS, RESOLVE_TXT, RESOLVE_PTR, RESOLVE_SRV, RESOLVE_SOA
+  };
 
   // Header.
   if(r->is_reverse)
@@ -759,12 +714,6 @@ resolve_cmd_format(resolve_cmd_request_t *r)
     cmd_reply(&r->ctx, CLR_GRAY "  No records found" CLR_RESET);
     return;
   }
-
-  // Display records in type order for clean grouping.
-  static const resolve_type_t type_order[] = {
-    RESOLVE_A, RESOLVE_AAAA, RESOLVE_CNAME, RESOLVE_MX,
-    RESOLVE_NS, RESOLVE_TXT, RESOLVE_PTR, RESOLVE_SRV, RESOLVE_SOA
-  };
 
   for(uint32_t t = 0; t < sizeof(type_order) / sizeof(type_order[0]); t++)
   {
@@ -871,6 +820,7 @@ static void
 resolve_cmd_cb(const resolve_result_t *result)
 {
   resolve_cmd_request_t *r = result->user_data;
+  bool                   done;
 
   pthread_mutex_lock(&r->mu);
 
@@ -886,13 +836,12 @@ resolve_cmd_cb(const resolve_result_t *result)
       r->count++;
     }
   }
+
   else if(result->status != 0)
-  {
     r->errors++;
-  }
 
   r->pending--;
-  bool done = (r->pending == 0);
+  done = (r->pending == 0);
 
   pthread_mutex_unlock(&r->mu);
 
@@ -906,25 +855,37 @@ resolve_cmd_cb(const resolve_result_t *result)
           CLR_RED "Lookup failed for %s" CLR_RESET, r->target);
       cmd_reply(&r->ctx, line);
     }
+
     else
-    {
       resolve_cmd_format(r);
-    }
 
     resolve_cmd_req_release(r);
   }
 }
 
-// !resolve <target> [-v] -- DNS lookup for a hostname or IP address.
-// ctx: command context
 static void
 resolve_cmd_resolve(const cmd_ctx_t *ctx)
 {
-  const char *target = ctx->parsed->argv[0];
-  bool verbose = (ctx->parsed->argc > 1 && ctx->parsed->argv[1] != NULL
-      && strcmp(ctx->parsed->argv[1], "-v") == 0);
+  static const resolve_type_t qtypes_all[] = {
+    RESOLVE_A, RESOLVE_AAAA, RESOLVE_MX, RESOLVE_TXT,
+    RESOLVE_NS, RESOLVE_CNAME, RESOLVE_SOA
+  };
 
-  resolve_cmd_request_t *req = resolve_cmd_req_alloc();
+  static const resolve_type_t qtypes_default[] = {
+    RESOLVE_A
+  };
+
+  const char            *target  = ctx->parsed->argv[0];
+  bool                   verbose = (ctx->parsed->argc > 1
+      && ctx->parsed->argv[1] != NULL
+      && strcmp(ctx->parsed->argv[1], "-v") == 0);
+  resolve_cmd_request_t *req     = resolve_cmd_req_alloc();
+  struct in_addr         v4;
+  struct in6_addr        v6;
+  char                   arpa[RESOLVE_NAME_SZ];
+  const resolve_type_t  *qtypes;
+  uint8_t                qcount;
+  uint8_t                submitted;
 
   snprintf(req->target, sizeof(req->target), "%s", target);
   req->verbose = verbose;
@@ -936,9 +897,6 @@ resolve_cmd_resolve(const cmd_ctx_t *ctx)
   req->ctx.username = NULL;
 
   // Detect input type.
-  struct in_addr  v4;
-  struct in6_addr v6;
-  char arpa[RESOLVE_NAME_SZ];
 
   if(inet_pton(AF_INET, target, &v4) == 1)
   {
@@ -987,23 +945,12 @@ resolve_cmd_resolve(const cmd_ctx_t *ctx)
   }
 
   // Hostname -- query A only by default, all types with -v.
-  static const resolve_type_t qtypes_all[] = {
-    RESOLVE_A, RESOLVE_AAAA, RESOLVE_MX, RESOLVE_TXT,
-    RESOLVE_NS, RESOLVE_CNAME, RESOLVE_SOA
-  };
-
-  static const resolve_type_t qtypes_default[] = {
-    RESOLVE_A
-  };
-
-  const resolve_type_t *qtypes;
-  uint8_t qcount;
-
   if(verbose)
   {
     qtypes = qtypes_all;
     qcount = RESOLVE_CMD_HOST_QTYPES;
   }
+
   else
   {
     qtypes = qtypes_default;
@@ -1013,13 +960,11 @@ resolve_cmd_resolve(const cmd_ctx_t *ctx)
   req->is_reverse = false;
   req->pending    = qcount;
 
-  uint8_t submitted = 0;
+  submitted = 0;
 
   for(uint8_t i = 0; i < qcount; i++)
-  {
     if(resolve_lookup(target, qtypes[i], resolve_cmd_cb, req) == SUCCESS)
       submitted++;
-  }
 
   if(submitted == 0)
   {
@@ -1058,12 +1003,10 @@ resolve_register_commands(void)
       "  !resolve 8.8.8.8\n"
       "  !resolve 2001:4860:4860::8888",
       USERNS_GROUP_EVERYONE, 0, CMD_SCOPE_ANY, METHOD_T_ANY, resolve_cmd_resolve, NULL, NULL, "res",
-      NULL, 0);
+      NULL, 0, NULL, NULL);
 }
 
-// -----------------------------------------------------------------------
 // Statistics
-// -----------------------------------------------------------------------
 
 void
 resolve_get_stats(resolve_stats_t *out)
@@ -1074,9 +1017,7 @@ resolve_get_stats(resolve_stats_t *out)
   memset(out, 0, sizeof(*out));
 }
 
-// -----------------------------------------------------------------------
 // Lifecycle
-// -----------------------------------------------------------------------
 
 // Initialize the resolver subsystem. Sets up the freelist mutex,
 // applies default configuration, and marks the subsystem as ready.
@@ -1100,9 +1041,11 @@ void
 resolve_register_config(void)
 {
   kv_register("core.resolve.timeout",     KV_UINT32, "10",
-      resolve_kv_changed, NULL);
+      resolve_kv_changed, NULL,
+      "DNS resolution timeout in seconds");
   kv_register("core.resolve.max_pending", KV_UINT32, "64",
-      resolve_kv_changed, NULL);
+      resolve_kv_changed, NULL,
+      "Maximum concurrent pending DNS lookups");
 
   resolve_load_config();
 }

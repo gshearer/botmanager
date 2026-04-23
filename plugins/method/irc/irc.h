@@ -30,6 +30,14 @@
 
 // Channel name size (without # prefix) for KV key segments.
 #define IRC_CHAN_SZ     64
+#define IRC_CHAN_MAX_MEMBERS 512
+
+// Member mode flags (tracked from NAMES prefixes and MODE changes).
+#define IRC_MFLAG_OP     0x01  // @ — channel operator
+#define IRC_MFLAG_VOICE  0x02  // + — voiced
+#define IRC_MFLAG_HALFOP 0x04  // % — half-operator
+#define IRC_MFLAG_OWNER  0x08  // ~ — channel owner
+#define IRC_MFLAG_ADMIN  0x10  // & — channel admin (protected)
 
 // Parsed IRC protocol message.
 typedef struct
@@ -43,6 +51,24 @@ typedef struct
   char trailing[IRC_LINE_SZ];      // text after final ':'
   bool has_trailing;
 } irc_parsed_msg_t;
+
+// Per-channel member tracking.
+typedef struct irc_member
+{
+  char                nick[IRC_NICK_SZ];
+  uint8_t             mode_flags;     // IRC_MFLAG_* bitmask
+  struct irc_member  *next;
+} irc_member_t;
+
+typedef struct irc_channel
+{
+  char                 name[IRC_CHAN_SZ + 1]; // includes '#' prefix
+  irc_member_t        *members;
+  uint32_t             member_count;
+  bool                 have_ops;      // true when bot has +o on this channel
+  char                 topic[IRC_LINE_SZ]; // current topic (from 332/TOPIC)
+  struct irc_channel  *next;
+} irc_channel_t;
 
 // IRC method instance state (opaque handle).
 typedef struct
@@ -81,6 +107,16 @@ typedef struct
   uint32_t          reconnect_delay;          // resolved from network
   uint32_t          server_idx;               // current server index in network
 
+  // Pending reconnect task. Set when task_add_deferred schedules a
+  // reconnect; cleared by the task itself when it fires, and
+  // neutralised (state=TASK_ENDED) by irc_disconnect so the task
+  // doesn't fire after the method has been stopped.
+  task_t           *reconnect_task;
+
+  // Channel member tracking.
+  irc_channel_t    *channels;
+  pthread_mutex_t   chan_mutex;
+
   // nick -> host cache for get_context() (ring buffer).
   struct
   {
@@ -97,7 +133,7 @@ typedef struct
 #include "clam.h"
 #include "cmd.h"
 #include "db.h"
-#include "mem.h"
+#include "alloc.h"
 #include "plugin.h"
 #include "pool.h"
 #include "task.h"
@@ -106,6 +142,7 @@ typedef struct
 #include <ctype.h>
 #include <stdarg.h>
 #include "validate.h"
+#include "irc_dossier.h"
 
 // Forward declarations (irc.c only).
 static void irc_sock_cb(const sock_event_t *event, void *user_data);
@@ -131,6 +168,14 @@ bool irc_send_raw(irc_state_t *st, const char *fmt, ...)
     __attribute__((format(printf, 2, 3)));
 void irc_register_commands(void);
 
+// Protocol helpers (defined in irc_protocol.c).
+void irc_parse_prefix(const char *prefix, char *nick, char *user, char *host);
+void irc_parse_line(const char *line, irc_parsed_msg_t *out);
+bool irc_send_privmsg(irc_state_t *st, const char *target, const char *text);
+void irc_send_registration(irc_state_t *st);
+void irc_expand_vars(const char *tmpl, char *out, size_t out_sz,
+    const irc_state_t *st, const char *channel);
+
 // Server entry for sorting by priority during resolution.
 typedef struct
 {
@@ -153,25 +198,39 @@ typedef struct
   uint32_t count;
 } irc_net_list_t;
 
+void irc_nick_kv_cb(const char *key, void *data);
+
 // Instance-level KV schema: bare suffixes cloned into
 // "bot.<botname>.irc.<suffix>" when a bot binds to IRC.
 static const plugin_kv_entry_t irc_inst_kv_schema[] = {
-  { "network",   KV_STR,    ""           },
-  { "nick",      KV_STR,    ""           },
-  { "nick2",     KV_STR,    ""           },
-  { "nick3",     KV_STR,    ""           },
-  { "user",      KV_STR,    ""           },
-  { "realname",  KV_STR,    "BotManager" },
-  { "prefix",    KV_STR,    "!"          },
+  { "network",   KV_STR,    "",           "IRC network name to connect to",  NULL },
+  { "nick",      KV_STR,    "",           "Primary nickname",                irc_nick_kv_cb },
+  { "nick2",     KV_STR,    "",           "First alternate nickname",        NULL },
+  { "nick3",     KV_STR,    "",           "Second alternate nickname",       NULL },
+  { "user",      KV_STR,    "",           "IRC username (ident)",            NULL },
+  { "realname",  KV_STR,    "BotManager", "IRC realname (GECOS) field",      NULL },
+  { "prefix",    KV_STR,    "!",          "Command prefix character for this bot on IRC", NULL },
 };
 
 // Per-channel KV schema: suffixes appended to
 // "bot.<botname>.irc.chan.<channel>." when a channel is added.
 static const plugin_kv_entry_t irc_chan_kv_schema[] = {
-  { "autojoin",     KV_UINT8,  "1" },
-  { "key",          KV_STR,    ""  },
-  { "announce",     KV_UINT8,  "0" },
-  { "announcetext", KV_STR,    ""  },
+  { "autojoin",     KV_BOOL,   "true",  "Auto-join this channel on connect (true/false)" },
+  { "key",          KV_STR,    "",      "Channel key (password) for joining" },
+  { "announce",     KV_BOOL,   "false", "Send announce text on join (true/false)" },
+  { "announcetext", KV_STR,    "",      "Text to send to channel on join" },
+
+  // Channel administration (enforced when bot has +o).
+  { "admin.enabled",            KV_BOOL,   "false", "Enable channel administration when bot has ops" },
+  { "admin.key.enabled",        KV_BOOL,   "false", "Maintain a channel key (+k)" },
+  { "admin.key.value",          KV_STR,    "",      "Channel key to enforce" },
+  { "admin.topic.enabled",      KV_BOOL,   "false", "Maintain channel topic" },
+  { "admin.topic.value",        KV_STR,    "",      "Topic to enforce" },
+  { "admin.kick_unident",       KV_BOOL,   "false", "Kick users who are not identified to the bot" },
+  { "admin.kick_unident_delay", KV_UINT16, "30",    "Seconds to wait before kicking unidentified user" },
+  { "admin.kick_unident_msg",   KV_STR,
+      "You must identify to use this channel",
+      "Kick message for unidentified users" },
 };
 
 #define IRC_CHAN_KV_COUNT \
@@ -180,11 +239,11 @@ static const plugin_kv_entry_t irc_chan_kv_schema[] = {
 // Per-server KV schema: suffixes appended to
 // "irc.net.<network>.<server>." when a server is added.
 static const plugin_kv_entry_t irc_srv_kv_schema[] = {
-  { "address",    KV_STR,    ""     },
-  { "port",       KV_UINT16, "6667" },
-  { "priority",   KV_UINT16, "100"  },
-  { "tls",        KV_UINT8,  "0"    },
-  { "tls_verify", KV_UINT8,  "1"    },
+  { "address",    KV_STR,    "",     "Server hostname or IP address" },
+  { "port",       KV_UINT16, "6667", "Server port number" },
+  { "priority",   KV_UINT16, "100",  "Server selection priority (lower = preferred)" },
+  { "tls",        KV_BOOL,   "false", "Enable TLS encryption (true/false)" },
+  { "tls_verify", KV_BOOL,   "true",  "Verify TLS certificate (true/false)" },
 };
 
 #define IRC_SRV_KV_COUNT \
@@ -215,6 +274,22 @@ static const plugin_kv_group_t irc_kv_groups[] = {
 #define IRC_KV_GROUPS_COUNT \
     (sizeof(irc_kv_groups) / sizeof(irc_kv_groups[0]))
 
+// Channel member tracking helpers (defined in irc_channel.c).
+irc_channel_t *irc_chan_find(irc_state_t *st, const char *channel);
+irc_channel_t *irc_chan_get(irc_state_t *st, const char *channel);
+irc_member_t  *irc_member_find(irc_channel_t *ch, const char *nick);
+void irc_chan_add_nick(irc_state_t *st, const char *channel, const char *nick);
+void irc_chan_remove_nick(irc_state_t *st, const char *channel, const char *nick);
+void irc_chan_remove_nick_all(irc_state_t *st, const char *nick);
+void irc_chan_rename_nick(irc_state_t *st, const char *old_nick, const char *new_nick);
+void irc_chan_remove(irc_state_t *st, const char *channel);
+void irc_chan_clear_all(irc_state_t *st);
+
+// Context cache + mode/admin helpers (defined in irc_channel.c).
+void    irc_ctx_update(irc_state_t *st, const char *nick, const char *host);
+uint8_t irc_mode_to_flag(char mode);
+void    irc_apply_chan_admin(irc_state_t *st, const char *channel);
+
 // Shared validation (defined in irc.c, used by arg descriptors).
 bool irc_valid_name(const char *name);
 void irc_address_to_key(const char *address, char *out, size_t out_sz);
@@ -225,8 +300,19 @@ static void irc_destroy(void *handle);
 static bool irc_connect(void *handle);
 static void irc_disconnect(void *handle);
 static bool irc_send(void *handle, const char *target, const char *text);
+static bool irc_send_emote(void *handle, const char *target, const char *text);
 static bool irc_get_context(void *handle, const char *sender,
     char *ctx, size_t ctx_sz);
+static void irc_list_channel(void *handle, const char *channel,
+    method_chan_member_cb_t cb, void *data);
+static void irc_list_joined_channels(void *handle,
+    method_joined_channel_cb_t cb, void *data);
+static bool irc_get_self(void *handle, char *buf, size_t buf_sz);
+
+// Identity signer for the chat plugin's identity registry (ND4).
+// Not part of the method_driver_t vtable.
+static bool irc_identity_signature(const method_msg_t *msg,
+    char *out_json, size_t out_sz);
 
 // Argument specs for IRC subcommands.
 static const cmd_arg_desc_t ad_irc_netname[] = {
@@ -278,16 +364,24 @@ static const color_table_t irc_colors = {
   .reset  = IRC_RESET,
 };
 
-// IRC method driver vtable.
+// IRC method driver vtable. Identity hooks (signer + scorer +
+// token-scorer) are registered with the chat plugin's identity
+// registry at plugin_start via plugin_dlsym, not published through
+// method_driver_t; the vtable carries protocol essentials only.
 static const method_driver_t irc_driver = {
-  .name        = "irc",
-  .colors      = &irc_colors,
-  .create      = irc_create,
-  .destroy     = irc_destroy,
-  .connect     = irc_connect,
-  .disconnect  = irc_disconnect,
-  .send        = irc_send,
-  .get_context = irc_get_context,
+  .name          = "irc",
+  .caps          = METHOD_CAP_EMOTE,
+  .colors        = &irc_colors,
+  .create        = irc_create,
+  .destroy       = irc_destroy,
+  .connect       = irc_connect,
+  .disconnect    = irc_disconnect,
+  .send          = irc_send,
+  .send_emote    = irc_send_emote,
+  .get_context   = irc_get_context,
+  .list_channel  = irc_list_channel,
+  .list_joined_channels = irc_list_joined_channels,
+  .get_self      = irc_get_self,
 };
 
 #endif // IRC_INTERNAL

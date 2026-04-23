@@ -1,45 +1,57 @@
+// botmanager — MIT
+// CLAM event bus: in-process publish/subscribe for log + telemetry events.
 #define CLAM_INTERNAL
 #include "clam.h"
-#include "console.h"
-#include "kv.h"
 
-// -----------------------------------------------------------------------
-// Built-in stdinout subscriber: color-coded stdout output.
-// -----------------------------------------------------------------------
+#include <errno.h>
 
-// Stdinout subscriber callback: writes color-coded output to stdout.
-// Uses console_output_lock/unlock to avoid corrupting the readline
-// input line when log messages arrive on other threads.
-// m: incoming clam message
+// Callback-watchdog threshold. A subscriber callback that runs longer
+// than this under clam_mutex stalls every other thread emitting clam
+// events. Warn via stderr (NOT clam()) since the mutex is held here.
+#define CLAM_CB_WATCHDOG_MS 200
+
+// Per-thread recursion guard. clam_mutex is a non-recursive mutex held
+// across the subscriber dispatch loop. If a subscriber callback's
+// downstream path re-enters clam() on the same thread (e.g. a user
+// subscription routed to an IRC destination, which triggers
+// method_send → irc_send_raw → clam(DEBUG3, ...)), the re-entry would
+// self-deadlock. This flag causes re-entrant clam() calls on the same
+// thread to be dropped silently, breaking the recursion. Events emitted
+// from inside a subscriber callback are inherently un-deliverable safely
+// — dropping them is the correct behaviour.
+static __thread int clam_in_cb = 0;
+
+// File logger state.
+
+static FILE *clam_log_fp = NULL;
+
 static void
-stdinout_cb(const clam_msg_t *m)
+clam_file_cb(const clam_msg_t *m)
 {
-  uint8_t sev = m->sev;
+  uint8_t   sev;
+  struct tm tm;
+  time_t    now;
+
+  if(clam_log_fp == NULL)
+    return;
+
+  sev = m->sev;
 
   if(sev > CLAM_DEBUG5)
     sev = CLAM_DEBUG5;
 
-  struct tm tm;
-  time_t    now = time(NULL);
-
+  now = time(NULL);
   localtime_r(&now, &tm);
 
-  console_output_lock();
-
-  printf("%02d:%02d:%02d %s%s %-*s%s %s\n",
+  fprintf(clam_log_fp,
+      "%04d-%02d-%02d %02d:%02d:%02d %s %-*s %s\n",
+      tm.tm_year + 1900, tm.tm_mon + 1, tm.tm_mday,
       tm.tm_hour, tm.tm_min, tm.tm_sec,
-      sev_color[sev], sev_label[sev],
-      CLAM_CTX_SZ, m->context,
-      CON_RESET, m->msg);
+      sev_label[sev], CLAM_CTX_SZ, m->context, m->msg);
 
-  console_output_unlock();
+  fflush(clam_log_fp);
 }
 
-// -----------------------------------------------------------------------
-// Get a subscriber struct from the freelist or malloc a new one.
-// CLAM is below the mem subsystem in the init order, so it uses raw malloc.
-// returns: zeroed subscriber struct (never NULL — aborts on OOM)
-// -----------------------------------------------------------------------
 static clam_sub_t *
 sub_get(void)
 {
@@ -58,6 +70,7 @@ sub_get(void)
     return(s);
   }
 
+  // intentional: mem_alloc depends on clam for logging; raw malloc breaks the cycle
   s = malloc(sizeof(*s));
 
   if(s == NULL)
@@ -70,10 +83,6 @@ sub_get(void)
   return(s);
 }
 
-// -----------------------------------------------------------------------
-// Return a subscriber struct to the freelist.
-// s: subscriber to recycle
-// -----------------------------------------------------------------------
 static void
 sub_put(clam_sub_t *s)
 {
@@ -82,19 +91,22 @@ sub_put(clam_sub_t *s)
   clam_free_count++;
 }
 
-// -----------------------------------------------------------------------
 // Public API
-// -----------------------------------------------------------------------
 
-// Publish a message to all matching subscribers.
-// sev: severity level
-// context: subsystem name
-// fmt: printf-style format string
 void
 clam(uint8_t sev, const char *context, const char *fmt, ...)
 {
   clam_msg_t m;
-  va_list ap;
+  va_list    ap;
+  time_t     now;
+  char       haystack[CLAM_CTX_SZ + CLAM_MSG_SZ + 2];
+  bool       haystack_built = false;
+
+  // Re-entry guard: if we're already inside a subscriber dispatch on
+  // this thread, drop the event rather than self-deadlock on the
+  // non-recursive clam_mutex. See clam_in_cb declaration for why.
+  if(clam_in_cb > 0)
+    return;
 
   memset(&m, 0, sizeof(m));
   m.sev = sev;
@@ -114,10 +126,17 @@ clam(uint8_t sev, const char *context, const char *fmt, ...)
     return;
   }
 
-  time_t now = time(NULL);
+  now = time(NULL);
 
+  // Regex runs against "<context> <msg>" so subscribers can filter by
+  // subsystem (e.g. "^curl ") as well as message body. Built lazily —
+  // only when at least one subscriber has a regex — to keep the common
+  // no-filter path cheap.
   for(clam_sub_t *s = clam_subs; s != NULL; s = s->next)
   {
+    struct timespec ts_before, ts_after;
+    long            elapsed_ms;
+
     // Skip if message severity is below subscriber threshold.
     if(sev > s->sev)
       continue;
@@ -125,23 +144,40 @@ clam(uint8_t sev, const char *context, const char *fmt, ...)
     // FATAL always bypasses regex filtering.
     if(sev != CLAM_FATAL && s->has_regex)
     {
-      if(regexec(&s->regex_compiled, m.msg, 0, NULL, 0) != 0)
+      if(!haystack_built)
+      {
+        snprintf(haystack, sizeof(haystack), "%s %s", m.context, m.msg);
+        haystack_built = true;
+      }
+      if(regexec(&s->regex_compiled, haystack, 0, NULL, 0) != 0)
         continue;
     }
 
     s->count++;
     s->last = now;
+
+    clock_gettime(CLOCK_MONOTONIC, &ts_before);
+    clam_in_cb++;
     s->cb(&m);
+    clam_in_cb--;
+    clock_gettime(CLOCK_MONOTONIC, &ts_after);
+
+    elapsed_ms =
+        (ts_after.tv_sec  - ts_before.tv_sec)  * 1000L +
+        (ts_after.tv_nsec - ts_before.tv_nsec) / 1000000L;
+
+    if(elapsed_ms >= CLAM_CB_WATCHDOG_MS)
+      fprintf(stderr,
+          "[WARN clam] subscriber '%s' cb took %ld ms"
+          " (ctx=%s sev=%u)\n",
+          s->name, elapsed_ms, m.context, (unsigned)m.sev);
   }
 
   pthread_mutex_unlock(&clam_mutex);
 }
 
 // Subscribe to CLAM messages.
-// name: subscriber identifier (used for unsubscribe)
-// sev: maximum severity to receive
-// regex: optional regex filter on message text (NULL = match all)
-// cb: callback invoked for each matching message
+//        (NULL = match all). FATAL bypasses the filter.
 void
 clam_subscribe(const char *name, uint8_t sev, const char *regex,
     clam_cb_t cb)
@@ -160,9 +196,7 @@ clam_subscribe(const char *name, uint8_t sev, const char *regex,
     strncpy(s->regex_str, regex, CLAM_REGEX_SZ - 1);
 
     if(regcomp(&s->regex_compiled, regex, REG_EXTENDED | REG_NOSUB) == 0)
-    {
       s->has_regex = true;
-    }
 
     else
     {
@@ -182,8 +216,6 @@ clam_subscribe(const char *name, uint8_t sev, const char *regex,
       name, sev, (regex != NULL && regex[0] != '\0') ? regex : "*");
 }
 
-// returns: SUCCESS or FAIL
-// name: subscriber identifier to remove
 bool
 clam_unsubscribe(const char *name)
 {
@@ -215,7 +247,7 @@ clam_unsubscribe(const char *name)
   return(FAIL);
 }
 
-// Initialize CLAM subsystem and register the built-in stdinout subscriber.
+// Initialize CLAM subsystem.
 // Must be called before any other clam function.
 void
 clam_init(void)
@@ -223,84 +255,41 @@ clam_init(void)
   pthread_mutex_init(&clam_mutex, NULL);
   clam_ready = true;
 
-  // Register the built-in stdinout subscriber (all severities, no regex).
-  stdinout_sub = sub_get();
-  stdinout_sub->sev = CLAM_DEBUG5;
-  stdinout_sub->cb = stdinout_cb;
-  strncpy(stdinout_sub->name, "stdinout", CLAM_SUB_NAME_SZ - 1);
-  stdinout_sub->next = clam_subs;
-  clam_subs = stdinout_sub;
-  clam_sub_count++;
-
   clam(CLAM_INFO, "clam_init",
       "central logging and messaging initialized (max_msg: %u)",
       CLAM_MSG_SZ);
 }
 
-// -----------------------------------------------------------------------
-// KV callback: reload stdinout subscriber settings from KV store.
-// key: changed key name
-// data: unused
-// -----------------------------------------------------------------------
-static void
-stdinout_kv_changed(const char *key, void *data)
+bool
+clam_open_log(const char *path)
 {
-  (void)key;
-  (void)data;
+  if(path == NULL || path[0] == '\0')
+    return(FAIL);
 
-  if(stdinout_sub == NULL)
-    return;
+  clam_log_fp = fopen(path, "a");
 
-  uint8_t sev = (uint8_t)kv_get_uint("core.clam.stdinout.severity");
-  const char *regex = kv_get_str("core.clam.stdinout.regex");
-
-  pthread_mutex_lock(&clam_mutex);
-
-  stdinout_sub->sev = sev;
-
-  // Update regex. Treat ".*" or empty as "match all" (no compiled regex).
-  if(stdinout_sub->has_regex)
+  if(clam_log_fp == NULL)
   {
-    regfree(&stdinout_sub->regex_compiled);
-    stdinout_sub->has_regex = false;
-    stdinout_sub->regex_str[0] = '\0';
+    fprintf(stderr, "clam: cannot open log file: %s: %s\n",
+        path, strerror(errno));
+    return(FAIL);
   }
 
-  if(regex != NULL && regex[0] != '\0'
-      && strcmp(regex, ".*") != 0)
-  {
-    strncpy(stdinout_sub->regex_str, regex, CLAM_REGEX_SZ - 1);
-
-    if(regcomp(&stdinout_sub->regex_compiled, regex,
-          REG_EXTENDED | REG_NOSUB) == 0)
-    {
-      stdinout_sub->has_regex = true;
-    }
-
-    else
-    {
-      stdinout_sub->has_regex = false;
-      stdinout_sub->regex_str[0] = '\0';
-    }
-  }
-
-  pthread_mutex_unlock(&clam_mutex);
+  clam_subscribe("logfile", CLAM_DEBUG5, NULL, clam_file_cb);
+  return(SUCCESS);
 }
 
-// Register KV settings for the stdinout subscriber and apply initial values.
-// Must be called after kv_init()/kv_load().
+// Close the log file and unsubscribe. Called during shutdown.
 void
-clam_register_config(void)
+clam_close_log(void)
 {
-  kv_register("core.clam.stdinout.severity", KV_UINT8, "7",
-      stdinout_kv_changed, NULL);
-  kv_register("core.clam.stdinout.regex", KV_STR, ".*",
-      stdinout_kv_changed, NULL);
+  if(clam_log_fp == NULL)
+    return;
 
-  // Apply loaded values (KV may have DB overrides from kv_load).
-  stdinout_kv_changed(NULL, NULL);
+  clam_unsubscribe("logfile");
 
-  clam(CLAM_DEBUG, "clam", "stdinout KV config registered");
+  fclose(clam_log_fp);
+  clam_log_fp = NULL;
 }
 
 // Shut down CLAM. Frees all active subscribers and freelist entries.
@@ -317,6 +306,9 @@ clam_exit(void)
 
   clam_ready = false;
 
+  // Close log file before freeing subscribers.
+  clam_close_log();
+
   // Free active subscribers.
   s = clam_subs;
 
@@ -332,7 +324,6 @@ clam_exit(void)
   }
 
   clam_subs = NULL;
-  stdinout_sub = NULL;
   clam_sub_count = 0;
 
   // Free the freelist.

@@ -3,21 +3,18 @@
 
 #include <stdbool.h>
 
-// Initialize signal handling. Installs handlers for POSIX signals.
-// SIGTERM and SIGINT trigger graceful shutdown.
+// Installs handlers for POSIX signals. SIGTERM and SIGINT trigger
+// graceful shutdown.
 void sig_init(void);
 
-// Restore default signal dispositions.
 void sig_exit(void);
 
-// returns: true if a graceful shutdown has been requested via signal
 bool sig_shutdown_requested(void);
 
-// returns: the signal number that triggered shutdown, or 0 if none
+// The signal number that triggered shutdown, or 0 if none.
 int sig_caught(void);
 
-// returns: human-readable name of a signal number, or "UNKNOWN"
-// signum: signal number to look up
+// Returns "UNKNOWN" for unrecognized signals.
 const char *sig_name(int signum);
 
 #ifdef SIG_INTERNAL
@@ -28,14 +25,13 @@ const char *sig_name(int signum);
 #include <signal.h>
 #include <unistd.h>
 
-// Signal name entry for lookup table.
 typedef struct
 {
   int         signum;
   const char *name;
 } sig_entry_t;
 
-// Signal name table for human-readable logging.
+// For human-readable logging.
 static const sig_entry_t sig_table[] = {
   { SIGHUP,  "SIGHUP"  },
   { SIGINT,  "SIGINT"  },
@@ -60,7 +56,6 @@ static const sig_entry_t sig_table[] = {
   { 0,       NULL      },
 };
 
-// Signals that request graceful shutdown.
 static const int shutdown_signals[] = { SIGTERM, SIGINT, SIGHUP, 0 };
 
 // Fatal signals: log and re-raise with default handler for core dump.

@@ -17,10 +17,11 @@
 #ifdef COMMAND_INTERNAL
 
 #include "bot.h"
+#include "clam.h"
 #include "cmd.h"
 #include "common.h"
 #include "kv.h"
-#include "mem.h"
+#include "alloc.h"
 #include "method.h"
 #include "plugin.h"
 #include "userns.h"
@@ -33,7 +34,8 @@ typedef struct
 
 // KV schema for the command bot plugin.
 static const plugin_kv_entry_t cmdbot_kv_schema[] = {
-  { "plugin.command.prefix", KV_STR, "!" },
+  { "plugin.command.prefix", KV_STR, "!",
+    "Default command prefix for the command bot plugin" },
 };
 
 // Bot driver vtable.
@@ -47,6 +49,10 @@ static const cmd_arg_desc_t cmdbot_ad_identify[] = {
 
 static const cmd_arg_desc_t cmdbot_ad_register[] = {
   { "password", CMD_ARG_NONE, CMD_ARG_REQUIRED | CMD_ARG_REST, 0, NULL },
+};
+
+static const cmd_arg_desc_t cmdbot_ad_id[] = {
+  { "nickname", CMD_ARG_ALNUM, CMD_ARG_OPTIONAL, METHOD_SENDER_SZ, NULL },
 };
 
 #endif // COMMAND_INTERNAL

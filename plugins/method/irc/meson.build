@@ -1,7 +1,10 @@
 irc_plugin = shared_library('irc',
   'irc.c',
+  'irc_channel.c',
+  'irc_protocol.c',
   'irc_commands.c',
-  include_directories : [gen_include, inc_include],
+  'irc_dossier.c',
+  include_directories : [gen_include, inc_include, plugin_contracts_include],
   override_options : ['b_lundef=false'],
   install : true,
 )

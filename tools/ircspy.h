@@ -75,6 +75,18 @@ static time_t g_ctl_deadline = 0;   // response collection deadline (monotonic)
 static bool   g_stdin_open  = true;  // false after stdin EOF
 static char   g_ctl_path[256];      // socket path for cleanup
 
+// Poll index tracker for the dynamic poll set built each iteration of
+// the main loop. Slots default to -1 when the corresponding source is
+// not in the poll set this iteration.
+struct poll_idx
+{
+  int irc;
+  int stdin_fd;
+  int ctl_listen;
+  int ctl_client;
+  int nfds;
+};
+
 #endif // IRCSPY_INTERNAL
 
 #endif // BM_TOOLS_IRCSPY_H

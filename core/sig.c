@@ -1,10 +1,10 @@
+// botmanager — MIT
+// Signal-handler installation and async-safe dispatch to the main loop.
 #define SIG_INTERNAL
 #include "sig.h"
 
-// -----------------------------------------------------------------------
 // Async-signal-safe handler for SIGTERM/SIGINT/SIGHUP: record signal.
 // signum: the signal number received
-// -----------------------------------------------------------------------
 static void
 sig_shutdown_handler(int signum)
 {
@@ -12,15 +12,14 @@ sig_shutdown_handler(int signum)
     shutdown_signal = signum;
 }
 
-// -----------------------------------------------------------------------
 // Async-signal-safe handler for fatal signals: write to stderr, re-raise.
 // Uses only write() which is async-signal-safe.
 // signum: the signal number received
-// -----------------------------------------------------------------------
 static void
 sig_fatal_handler(int signum)
 {
   const char *name = "UNKNOWN";
+  struct sigaction sa;
 
   for(int i = 0; sig_table[i].name != NULL; i++)
   {
@@ -36,20 +35,12 @@ sig_fatal_handler(int signum)
   write(STDERR_FILENO, name, strlen(name));
   write(STDERR_FILENO, "\n", 1);
 
-  // Restore default handler and re-raise for core dump.
-  struct sigaction sa;
-
   memset(&sa, 0, sizeof(sa));
   sa.sa_handler = SIG_DFL;
   sigaction(signum, &sa, NULL);
   raise(signum);
 }
 
-// -----------------------------------------------------------------------
-// Install a handler for a signal via sigaction.
-// signum: signal number to handle
-// handler: function pointer or SIG_DFL/SIG_IGN
-// -----------------------------------------------------------------------
 static void
 install_handler(int signum, void (*handler)(int))
 {
@@ -63,32 +54,24 @@ install_handler(int signum, void (*handler)(int))
   sigaction(signum, &sa, NULL);
 }
 
-// -----------------------------------------------------------------------
 // Public API
-// -----------------------------------------------------------------------
 
-// returns: human-readable signal name, or "UNKNOWN"
-// signum: signal number to look up
 const char *
 sig_name(int signum)
 {
   for(int i = 0; sig_table[i].name != NULL; i++)
-  {
     if(sig_table[i].signum == signum)
       return(sig_table[i].name);
-  }
 
   return("UNKNOWN");
 }
 
-// returns: true if a shutdown signal has been received
 bool
 sig_shutdown_requested(void)
 {
   return(shutdown_signal != 0);
 }
 
-// returns: signal number that triggered shutdown, or 0 if none
 int
 sig_caught(void)
 {

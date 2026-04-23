@@ -1,15 +1,13 @@
+// botmanager — MIT
+// Task subsystem: worker pool, scheduling, deferred execution.
 #define TASK_INTERNAL
 #include "task.h"
 
 #include "pool.h"
 #include "util.h"
 
-// -----------------------------------------------------------------------
 // Name helpers
-// -----------------------------------------------------------------------
 
-// returns: human-readable name of a task state
-// s: task state enum value
 const char *
 task_state_name(task_state_t s)
 {
@@ -24,8 +22,6 @@ task_state_name(task_state_t s)
   }
 }
 
-// returns: human-readable name of a task type
-// t: task type enum value
 const char *
 task_type_name(task_type_t t)
 {
@@ -38,8 +34,6 @@ task_type_name(task_type_t t)
   }
 }
 
-// returns: human-readable name of a task kind
-// k: task kind enum value
 const char *
 task_kind_name(task_kind_t k)
 {
@@ -53,11 +47,8 @@ task_kind_name(task_kind_t k)
   }
 }
 
-// -----------------------------------------------------------------------
 // Sorted insert into the ready queue (by priority ascending).
 // Must be called with task_lock held.
-// t: task to insert
-// -----------------------------------------------------------------------
 static void
 ready_insert(task_t *t)
 {
@@ -70,11 +61,8 @@ ready_insert(task_t *t)
   *pp = t;
 }
 
-// -----------------------------------------------------------------------
 // Sorted insert into the timer queue (by sleep_until ascending).
 // Must be called with task_lock held.
-// t: task to insert
-// -----------------------------------------------------------------------
 static void
 timer_insert(task_t *t)
 {
@@ -87,10 +75,8 @@ timer_insert(task_t *t)
   *pp = t;
 }
 
-// -----------------------------------------------------------------------
 // Promote expired timers from the timer queue to the ready queue.
 // Must be called with task_lock held.
-// -----------------------------------------------------------------------
 static void
 timer_promote(void)
 {
@@ -111,10 +97,6 @@ timer_promote(void)
   }
 }
 
-// -----------------------------------------------------------------------
-// Free a linked task chain (for shutdown cleanup).
-// t: head of the linked chain
-// -----------------------------------------------------------------------
 static void
 free_chain(task_t *t)
 {
@@ -127,12 +109,6 @@ free_chain(task_t *t)
   }
 }
 
-// -----------------------------------------------------------------------
-// Check if a task type is compatible with the requested type.
-// returns: true if the types match
-// task_type: the task's declared type
-// request_type: the type the caller is looking for
-// -----------------------------------------------------------------------
 static bool
 type_matches(task_type_t task_type, task_type_t request_type)
 {
@@ -141,16 +117,8 @@ type_matches(task_type_t task_type, task_type_t request_type)
       || request_type == TASK_ANY);
 }
 
-// -----------------------------------------------------------------------
 // Public API
-// -----------------------------------------------------------------------
 
-// returns: allocated task in TASK_WAITING state (not yet submitted)
-// name: human-readable task name
-// type: which workers may execute this task
-// priority: 0 = highest, 254 = lowest
-// cb: callback function
-// data: opaque user data passed to callback
 task_t *
 task_create(const char *name, task_type_t type, uint8_t priority,
     task_cb_t cb, void *data)
@@ -230,12 +198,6 @@ task_submit(task_t *t)
       t->priority);
 }
 
-// returns: submitted task pointer
-// name: human-readable task name
-// type: which workers may execute this task
-// priority: 0 = highest, 254 = lowest
-// cb: callback function
-// data: opaque user data passed to callback
 task_t *
 task_add(const char *name, task_type_t type, uint8_t priority,
     task_cb_t cb, void *data)
@@ -247,11 +209,6 @@ task_add(const char *name, task_type_t type, uint8_t priority,
 }
 
 // Create and spawn a persistent task on a dedicated thread.
-// returns: task pointer, or NULL on failure
-// name: human-readable task name
-// priority: 0 = highest, 254 = lowest
-// cb: callback (loops internally, sets TASK_ENDED when done)
-// data: opaque user data
 task_t *
 task_add_persist(const char *name, uint8_t priority,
     task_cb_t cb, void *data)
@@ -305,14 +262,6 @@ task_add_persist(const char *name, uint8_t priority,
   return(t);
 }
 
-// Create and submit a periodic task that runs on an interval.
-// returns: submitted task pointer
-// name: human-readable task name
-// type: which workers may execute (TASK_THREAD or TASK_ANY)
-// priority: 0 = highest, 254 = lowest
-// interval_ms: milliseconds between executions (minimum effective: 1000)
-// cb: callback function
-// data: opaque user data
 task_t *
 task_add_periodic(const char *name, task_type_t type,
     uint8_t priority, uint32_t interval_ms, task_cb_t cb, void *data)
@@ -326,14 +275,6 @@ task_add_periodic(const char *name, task_type_t type,
   return(t);
 }
 
-// Create and submit a deferred task (runs once after a delay).
-// returns: submitted task pointer
-// name: human-readable task name
-// type: which workers may execute this task
-// priority: 0 = highest, 254 = lowest
-// delay_ms: milliseconds before the task becomes eligible to run
-// cb: callback function
-// data: opaque user data
 task_t *
 task_add_deferred(const char *name, task_type_t type,
     uint8_t priority, uint32_t delay_ms, task_cb_t cb, void *data)
@@ -351,11 +292,11 @@ task_add_deferred(const char *name, task_type_t type,
   return(t);
 }
 
-// returns: task in RUNNING state, or NULL if none available
-// type: task type to match against
 task_t *
 task_assign(task_type_t type)
 {
+  task_t **pp;
+
   pthread_mutex_lock(&task_lock);
 
   // Promote any expired timers to the ready queue.
@@ -363,7 +304,7 @@ task_assign(task_type_t type)
 
   // Walk the ready queue (sorted by priority) and find the first
   // task whose type matches.
-  task_t **pp = &ready_head;
+  pp = &ready_head;
 
   while(*pp != NULL)
   {
@@ -396,13 +337,11 @@ task_assign(task_type_t type)
   return(NULL);
 }
 
-// Block until work may be available or timeout_ms expires.
-// Promotes expired sleeping tasks internally.
-// timeout_ms: maximum milliseconds to wait
 void
 task_wait(uint32_t timeout_ms)
 {
   struct timespec ts;
+  uint32_t        wait_ms = timeout_ms;
 
   clock_gettime(CLOCK_REALTIME, &ts);
 
@@ -418,11 +357,9 @@ task_wait(uint32_t timeout_ms)
 
   // Wait until the earliest timer fires or the caller's timeout,
   // whichever comes first.
-  uint32_t wait_ms = timeout_ms;
-
   if(timer_head != NULL)
   {
-    time_t now = time(NULL);
+    time_t   now      = time(NULL);
     uint32_t timer_ms = (uint32_t)(timer_head->sleep_until - now) * 1000;
 
     if(timer_ms < wait_ms)
@@ -455,12 +392,6 @@ task_wake_all(void)
   pthread_mutex_unlock(&task_lock);
 }
 
-// Complete a task after callback execution. Handles re-queuing,
-// timer insertion, linked task promotion, or cleanup.
-// For TASK_PERIODIC tasks, TASK_ENDED means "iteration done" and
-// the task is rescheduled into the timer queue.
-// returns: the state set by the callback
-// t: task to finish (pointer invalid after ENDED/FATAL for TASK_ONCE)
 task_state_t
 task_finish(task_t *t)
 {
@@ -566,7 +497,6 @@ task_finish(task_t *t)
 }
 
 // Get current task statistics (thread-safe snapshot).
-// out: destination for the snapshot
 void
 task_get_stats(task_stats_t *out)
 {
@@ -575,9 +505,6 @@ task_get_stats(task_stats_t *out)
   pthread_mutex_unlock(&task_lock);
 }
 
-// Iterate all tasks (running, waiting, sleeping) under lock.
-// cb: callback invoked for each task
-// data: opaque user data passed to cb
 void
 task_iterate(task_iter_cb_t cb, void *data)
 {
@@ -607,9 +534,7 @@ task_iterate(task_iter_cb_t cb, void *data)
   pthread_mutex_unlock(&task_lock);
 }
 
-// -----------------------------------------------------------------------
 // "show tasks" command
-// -----------------------------------------------------------------------
 
 // Colorize a task state name.
 static const char *
@@ -639,20 +564,6 @@ task_kind_color(task_kind_t k)
   }
 }
 
-
-// Callback for task_iterate() used by the "show tasks" command.
-// Formats one task as a colorized line and sends it via cmd_reply.
-// name: task name
-// state: current task state
-// kind: task kind (once, persist, periodic, deferred)
-// type: task type (parent, thread, any)
-// priority: task priority
-// run_count: number of times the task has run
-// interval_ms: repeat interval for periodic tasks
-// created: creation timestamp
-// last_run: last execution timestamp
-// sleep_until: wake-up timestamp for sleeping tasks
-// data: pointer to task_show_state_t accumulator
 static void
 task_show_cb(const char *name, task_state_t state, task_kind_t kind,
     task_type_t type, uint8_t priority, uint32_t run_count,
@@ -660,20 +571,18 @@ task_show_cb(const char *name, task_state_t state, task_kind_t kind,
     time_t sleep_until, void *data)
 {
   task_show_state_t *st = data;
-  char line[512];
-  time_t now = time(NULL);
+  char               line[512];
+  time_t             now = time(NULL);
+  char               age[16];
+  char               extra[32] = "";
 
   (void)last_run;
 
   // Age: time since creation.
-  char age[16];
-
   util_fmt_duration(now - created, age, sizeof(age));
 
   // Extra detail column: interval for periodic, sleep remaining for
   // sleeping, blank otherwise.
-  char extra[32] = "";
-
   if(kind == TASK_PERIODIC && interval_ms > 0)
     snprintf(extra, sizeof(extra), "every %us", interval_ms / 1000);
   else if(state == TASK_SLEEPING && sleep_until > now)
@@ -697,17 +606,14 @@ task_show_cb(const char *name, task_state_t state, task_kind_t kind,
   st->count++;
 }
 
-// Command handler for "show tasks". Prints a summary header with
-// task statistics followed by a line for each active task.
-// ctx: command context for sending replies
 static void
 task_cmd_show(const cmd_ctx_t *ctx)
 {
-  task_stats_t ts;
+  task_stats_t      ts;
+  char              hdr[256];
+  task_show_state_t st = { .ctx = ctx, .count = 0 };
 
   task_get_stats(&ts);
-
-  char hdr[256];
 
   snprintf(hdr, sizeof(hdr),
       CLR_BOLD "tasks:" CLR_RESET
@@ -732,8 +638,6 @@ task_cmd_show(const cmd_ctx_t *ctx)
     return;
   }
 
-  task_show_state_t st = { .ctx = ctx, .count = 0 };
-
   task_iterate(task_show_cb, &st);
 
   if(st.count == 0)
@@ -749,7 +653,7 @@ task_register_commands(void)
       "List all active tasks",
       NULL,
       USERNS_GROUP_ADMIN, 100, CMD_SCOPE_ANY, METHOD_T_ANY,
-      task_cmd_show, NULL, "show", "t", NULL, 0);
+      task_cmd_show, NULL, "show", "t", NULL, 0, NULL, NULL);
 }
 
 // Initialize the task subsystem.
@@ -774,10 +678,10 @@ task_init(void)
 void
 task_exit(void)
 {
+  task_stats_t s;
+
   if(!task_ready)
     return;
-
-  task_stats_t s;
 
   task_get_stats(&s);
 

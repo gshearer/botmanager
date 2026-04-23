@@ -6,10 +6,8 @@
 #include <stdint.h>
 #include <time.h>
 
-// Opaque session handle.
 typedef struct sock_session sock_session_t;
 
-// Socket types.
 typedef enum
 {
   SOCK_TCP,
@@ -18,7 +16,6 @@ typedef enum
   SOCK_UNIX
 } sock_type_t;
 
-// Event types delivered to consumers.
 typedef enum
 {
   SOCK_EVENT_CONNECTED,       // connection established
@@ -27,8 +24,8 @@ typedef enum
   SOCK_EVENT_ERROR            // error condition
 } sock_event_type_t;
 
-// Event structure passed to callbacks. Valid for the duration of the
-// callback only — consumers must copy any data they need.
+// Valid for the duration of the callback only — consumers must copy
+// any data they need.
 typedef struct
 {
   sock_event_type_t  type;
@@ -38,62 +35,42 @@ typedef struct
   int                err;     // errno for SOCK_EVENT_ERROR
 } sock_event_t;
 
-// Consumer callback type. Invoked on the epoll worker thread —
-// callbacks must be fast and non-blocking.
+// Invoked on the epoll worker thread — callbacks must be fast and
+// non-blocking.
 typedef void (*sock_cb_t)(const sock_event_t *event, void *user_data);
 
-// Create a new session. Does not connect yet.
-// returns: session pointer, or NULL on failure
-// name: human-readable label (for logging/tracking, max 39 chars)
-// type: socket type
-// cb: event callback
-// user_data: opaque data passed to callback
+// Does not connect yet. name is a human-readable label for logging
+// (max 39 chars).
 sock_session_t *sock_create(const char *name, sock_type_t type,
     sock_cb_t cb, void *user_data);
 
-// Enable TLS on a session. Must be called after sock_create() and
-// before sock_connect(). The TLS handshake is performed automatically
-// after the TCP connection completes.
-// returns: SUCCESS or FAIL
-// session: session handle
-// verify: if true, verify the server certificate against the system CA store
+// Must be called after sock_create() and before sock_connect(). The
+// TLS handshake is performed automatically after the TCP connection
+// completes. If verify is true, verify the server certificate against
+// the system CA store.
 bool sock_set_tls(sock_session_t *session, bool verify);
 
-// Initiate connection to a remote host (TCP/UDP) or unix socket path.
 // DNS resolution and connect happen asynchronously. The consumer is
 // notified via SOCK_EVENT_CONNECTED or SOCK_EVENT_ERROR.
-// returns: SUCCESS or FAIL (invalid session state or params)
-// session: session handle
-// host: hostname or IP address (NULL for SOCK_UNIX)
-// port: port number (0 for SOCK_UNIX)
-// path: unix socket path (NULL for TCP/UDP/ICMP)
+// host is NULL for SOCK_UNIX; path is NULL for TCP/UDP/ICMP.
 bool sock_connect(sock_session_t *session, const char *host, uint16_t port,
     const char *path);
 
-// Queue data for sending. Thread-safe; may be called from any thread.
-// Data is copied internally and sent asynchronously.
-// returns: SUCCESS or FAIL (session not connected, or send queue full)
-// session: session handle
-// buf: data to send
-// len: number of bytes
+// Thread-safe; may be called from any thread. Data is copied
+// internally and sent asynchronously.
 bool sock_send(sock_session_t *session, const void *buf, size_t len);
 
 // Initiate graceful close. SOCK_EVENT_DISCONNECT is delivered when
 // teardown completes. Do not call sock_send() after this.
-// session: session handle
 void sock_close(sock_session_t *session);
 
-// Destroy a session and free all resources. Must not be called from
-// within a callback for the same session. If the session is still
-// connected, it is force-closed first.
-// session: session handle
+// Must not be called from within a callback for the same session. If
+// the session is still connected, it is force-closed first.
 void sock_destroy(sock_session_t *session);
 
-// returns: fd for the session, or -1 if not connected
-// session: session handle
+// Returns -1 if not connected.
 int sock_get_fd(const sock_session_t *session);
 
-// Socket subsystem statistics.
 typedef struct
 {
   uint32_t sessions;          // total active sessions
@@ -106,43 +83,31 @@ typedef struct
   uint32_t tls_sessions;      // active TLS-wrapped sessions
 } sock_stats_t;
 
-// Get socket subsystem statistics (thread-safe snapshot).
-// out: destination for the snapshot
 void sock_get_stats(sock_stats_t *out);
 
-// returns: human-readable name of a socket type
-// type: socket type enum value
 const char *sock_type_name(sock_type_t type);
-
-// returns: human-readable name of a socket event type
-// type: event type enum value
 const char *sock_event_name(sock_event_type_t type);
 
-// Initialize the socket subsystem. Must be called after pool_init().
+// Must be called after pool_init().
 void sock_init(void);
 
-// Register KV configuration keys and load values. Must be called
-// after kv_init() and plugin_init_all() (so KV store is populated).
+// Must be called after kv_init() and plugin_init_all() (so KV store
+// is populated).
 void sock_register_config(void);
 
-// Shut down the socket subsystem. Closes all active sessions and
-// frees resources. The epoll worker thread must already be joined
-// (via pool_exit) before calling this.
+// Closes all active sessions and frees resources. The epoll worker
+// thread must already be joined (via pool_exit) before calling this.
 void sock_exit(void);
 
-// returns: human-readable name of a socket state
-// state: internal state enum value (cast from sock_state_t)
+// state is cast from sock_state_t.
 const char *sock_state_name(int state);
 
-// Session iteration callback type. Invoked once per active session
-// while the session list lock is held — must be fast.
+// Invoked once per active session while the session list lock is
+// held — must be fast.
 typedef void (*sock_iter_cb_t)(uint32_t id, sock_type_t type, int state,
     const char *remote, uint64_t bytes_in, uint64_t bytes_out,
     bool tls, time_t connected_at, void *data);
 
-// Iterate all active socket sessions. Thread-safe.
-// cb: callback invoked for each session
-// data: opaque user data passed to callback
 void sock_iterate(sock_iter_cb_t cb, void *data);
 
 #ifdef SOCK_INTERNAL
@@ -150,7 +115,7 @@ void sock_iterate(sock_iter_cb_t cb, void *data);
 #include "common.h"
 #include "clam.h"
 #include "kv.h"
-#include "mem.h"
+#include "alloc.h"
 #include "pool.h"
 #include "resolve.h"
 #include "task.h"
@@ -168,7 +133,6 @@ void sock_iterate(sock_iter_cb_t cb, void *data);
 #include <openssl/ssl.h>
 #include <openssl/err.h>
 
-// Configuration defaults.
 #define SOCK_DEF_CONNECT_TIMEOUT   10
 #define SOCK_DEF_READ_BUF_SZ      4096
 #define SOCK_DEF_SEND_QUEUE_MAX    65536
@@ -184,7 +148,6 @@ void sock_iterate(sock_iter_cb_t cb, void *data);
 #define SOCK_PATH_SZ       108   // sun_path max
 #define SOCK_MAX_WORKERS   16
 
-// Session states (internal lifecycle).
 typedef enum
 {
   SOCK_STATE_CREATED,         // created, not yet connecting
@@ -196,7 +159,6 @@ typedef enum
   SOCK_STATE_CLOSED           // fd closed, awaiting destroy
 } sock_state_t;
 
-// Send queue entry.
 typedef struct sock_sendbuf
 {
   uint8_t             *data;
@@ -205,7 +167,6 @@ typedef struct sock_sendbuf
   struct sock_sendbuf *next;
 } sock_sendbuf_t;
 
-// Session structure.
 struct sock_session
 {
   char                name[SOCK_NAME_SZ];
@@ -213,7 +174,6 @@ struct sock_session
   sock_state_t        state;
   int                 fd;
 
-  // Consumer callback.
   sock_cb_t           cb;
   void               *cb_data;
 
@@ -233,29 +193,24 @@ struct sock_session
   uint32_t            send_queued;    // bytes currently queued
   bool                epollout_armed;
 
-  // Timeouts and activity tracking.
   time_t              connect_started;
   time_t              connected_at;
   time_t              last_activity;
 
-  // Statistics.
   uint64_t            bytes_in;
   uint64_t            bytes_out;
 
-  // Worker assignment (for future multi-worker distribution).
+  // For future multi-worker distribution.
   uint8_t             worker_id;
 
-  // TLS state.
   SSL_CTX            *tls_ctx;
   SSL                *tls;
   bool                tls_enabled;
   bool                tls_verify;
 
-  // Linked list for session tracking.
   struct sock_session *next;
 };
 
-// Worker thread state.
 typedef struct
 {
   uint8_t   id;
@@ -264,7 +219,6 @@ typedef struct
   task_t   *task;             // persist task handle
 } sock_worker_t;
 
-// Cached configuration values (read from KV).
 typedef struct
 {
   uint32_t connect_timeout;
@@ -278,7 +232,6 @@ typedef struct
   uint32_t epoll_workers;
 } sock_cfg_t;
 
-// Module state.
 static sock_session_t  *sock_list         = NULL;
 static pthread_mutex_t  sock_mutex;
 static uint32_t         sock_count        = 0;
@@ -288,17 +241,14 @@ static uint8_t          sock_next_worker  = 0;   // round-robin counter
 static bool             sock_ready        = false;
 static sock_cfg_t       sock_cfg;
 
-// Global stats.
 static uint64_t         sock_total_in     = 0;
 static uint64_t         sock_total_out    = 0;
 static uint64_t         sock_total_conn   = 0;
 static uint64_t         sock_total_disc   = 0;
 
-// Send buffer freelist.
 static sock_sendbuf_t  *sock_sbuf_free    = NULL;
 static pthread_mutex_t  sock_sbuf_mutex;
 
-// Forward declarations.
 static void sock_epoll_task(task_t *t);
 static void sock_unix_connect_task(task_t *t);
 static void sock_resolve_done(const resolve_result_t *result);

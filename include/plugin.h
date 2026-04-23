@@ -6,20 +6,17 @@
 
 #include "kv.h"
 
-// Current plugin API version. Plugins built against a different
-// version are rejected at load time.
-#define PLUGIN_API_VERSION   11
+// Plugins built against a different version are rejected at load time.
+#define PLUGIN_API_VERSION   12
 
 // Entry point symbol that every plugin must export.
 #define PLUGIN_ENTRY_SYMBOL  "bm_plugin_desc"
 
-// Limits.
 #define PLUGIN_NAME_SZ       64
 #define PLUGIN_VER_SZ        32
 #define PLUGIN_FEATURE_SZ    64
 #define PLUGIN_MAX_FEATURES  16
 
-// Plugin types.
 typedef enum
 {
   PLUGIN_CORE,          // extends core functionality
@@ -31,7 +28,6 @@ typedef enum
   PLUGIN_PERSONALITY    // language/messaging personality
 } plugin_type_t;
 
-// Plugin lifecycle states.
 typedef enum
 {
   PLUGIN_DISCOVERED,    // .so file found on disk
@@ -42,18 +38,20 @@ typedef enum
   PLUGIN_UNLOADED       // dlclose'd
 } plugin_state_t;
 
-// Feature declaration for dependency resolution.
 typedef struct
 {
   char name[PLUGIN_FEATURE_SZ];
 } plugin_feature_t;
 
-// KV schema entry: a configuration key the plugin declares.
+// A configuration key the plugin declares.
 typedef struct
 {
   const char *key;
   kv_type_t   type;
   const char *default_val;
+  const char *help;          // human-readable help (static, may be NULL)
+  kv_cb_t     cb;            // optional change callback (NULL for none)
+  const kv_nl_t *nl;         // optional NL responder; NULL = not NL-visible
 } plugin_kv_entry_t;
 
 // Named KV schema group: describes the configuration keys for a
@@ -71,8 +69,8 @@ typedef struct
   uint32_t                 schema_count;
 } plugin_kv_group_t;
 
-// Plugin descriptor. Every plugin exports a const instance of this
-// struct as the PLUGIN_ENTRY_SYMBOL symbol.
+// Every plugin exports a const instance of this struct as the
+// PLUGIN_ENTRY_SYMBOL symbol.
 typedef struct
 {
   uint32_t             api_version;
@@ -97,7 +95,6 @@ typedef struct
   const plugin_kv_entry_t *kv_inst_schema;
   uint32_t                 kv_inst_schema_count;
 
-  // Lifecycle callbacks.
   bool (*init)(void);     // register state, set up internals
   bool (*start)(void);    // begin active operation
   bool (*stop)(void);     // drain in-flight work
@@ -111,7 +108,6 @@ typedef struct
   uint32_t                 kv_groups_count;
 } plugin_desc_t;
 
-// Plugin subsystem statistics.
 typedef struct
 {
   uint32_t loaded;            // currently loaded plugins
@@ -120,133 +116,78 @@ typedef struct
   uint32_t load_errors;       // lifetime dlopen/symbol failures
 } plugin_stats_t;
 
-// Get plugin subsystem statistics (thread-safe snapshot).
-// out: destination for the snapshot
 void plugin_get_stats(plugin_stats_t *out);
-
-// returns: SUCCESS or FAIL
-// path: file path to the .so shared library
 bool plugin_load(const char *path);
-
-// returns: SUCCESS or FAIL (not found)
-// name: plugin name to unload
 bool plugin_unload(const char *name);
-
-// returns: number of plugins successfully loaded
-// dir: directory to scan for .so files (recursive)
 uint32_t plugin_discover(const char *dir);
-
-// returns: plugin descriptor, or NULL
-// name: plugin name to find
 const plugin_desc_t *plugin_find(const char *name);
-
-// returns: descriptor of the plugin providing the feature, or NULL
-// feature: feature name to search for
 const plugin_desc_t *plugin_find_feature(const char *feature);
 
-// returns: descriptor of matching plugin, or NULL
-// type: plugin type to match
-// kind: optional kind filter (NULL or "" for any)
 const plugin_desc_t *plugin_find_type(plugin_type_t type, const char *kind);
 
-// returns: plugin lifecycle state (PLUGIN_UNLOADED if not found)
-// name: plugin name to query
+// Returns PLUGIN_UNLOADED if not found.
 plugin_state_t plugin_get_state(const char *name);
 
-// returns: number of currently loaded plugins
+// Resolve a symbol from a loaded plugin's .so, by plugin name. Plugins
+// are dlopen'd with RTLD_LOCAL, so host code that wants to call into a
+// plugin-resident helper (e.g. the searxng plugin's sxng_search) has no
+// direct link-time reference and must look the symbol up at runtime.
+// Returns NULL when the plugin is not loaded or the symbol is absent;
+// both cases are silent — the caller decides the severity of a miss.
+void *plugin_dlsym(const char *plugin_name, const char *symbol);
+
 uint32_t plugin_count(void);
 
-// Callback for plugin iteration.
-// name: plugin name
-// version: plugin version string
-// path: file path to the .so
-// type: plugin type enum
-// kind: plugin kind string
-// state: current lifecycle state
-// data: opaque user data
 typedef void (*plugin_iterate_cb_t)(const char *name, const char *version,
     const char *path, plugin_type_t type, const char *kind,
     plugin_state_t state, void *data);
 
-// Iterate all loaded plugins.
-// cb: callback invoked for each plugin
-// data: opaque user data passed to callback
 void plugin_iterate(plugin_iterate_cb_t cb, void *data);
 
-// Register plugin commands (/show plugin, /plugin load|unload).
 // Must be called after admin_init().
 void plugin_register_commands(void);
 
-// Register plugin KV keys (core.plugin.autoload).
 void plugin_register_config(void);
 
 // Load plugins listed in core.plugin.autoload that are not already loaded.
-// returns: number of additionally loaded plugins
-// plugin_dir: directory to scan for .so files
+// Returns the number of additionally loaded plugins.
 uint32_t plugin_load_autoload(const char *plugin_dir);
 
-// returns: human-readable name of a plugin type
-// t: plugin type enum value
 const char *plugin_type_name(plugin_type_t t);
-
-// returns: human-readable name of a plugin state
-// s: plugin state enum value
 const char *plugin_state_name(plugin_state_t s);
 
-// Resolve plugin dependency order. Topologically sorts loaded plugins
-// so that providers precede their dependents. Validates all required
-// features are satisfied.
-// returns: SUCCESS or FAIL (unsatisfied or circular dependency)
+// Topologically sorts loaded plugins so that providers precede their
+// dependents. Validates all required features are satisfied.
 bool plugin_resolve(void);
 
-// Initialize all loaded plugins in dependency order.
 // Calls init callback on each LOADED plugin, transitioning to INITIALIZED.
-// returns: SUCCESS or FAIL (if any plugin's init callback fails)
 bool plugin_init_all(void);
 
-// Start all initialized plugins in dependency order.
 // Calls start callback on each INITIALIZED plugin, transitioning to RUNNING.
-// returns: SUCCESS or FAIL (if any plugin's start callback fails)
 bool plugin_start_all(void);
 
-// Stop all running plugins in reverse dependency order.
-// Calls stop callback on each RUNNING plugin, transitioning to STOPPING.
+// Reverse dependency order; transitions RUNNING -> STOPPING.
 void plugin_stop_all(void);
 
-// Deinitialize all initialized/stopping plugins in reverse dependency order.
-// Calls deinit callback, transitioning to LOADED.
+// Reverse dependency order; transitions to LOADED.
 void plugin_deinit_all(void);
 
-// returns: schema group descriptor, or NULL if not found
-// plugin_name: name of the plugin to search
-// group_name: schema group name (e.g., "channel")
 const plugin_kv_group_t *plugin_kv_group_find(const char *plugin_name,
     const char *group_name);
 
 // Register KV entries for a new entity instance using a schema group.
 // Builds keys by applying varargs to the group's key_prefix pattern,
 // then appending each schema entry's suffix.
-// returns: number of entries successfully registered
-// group: schema group to instantiate
-// ...: string arguments for the key_prefix format placeholders
 uint32_t plugin_kv_group_register(const plugin_kv_group_t *group, ...);
 
-// Callback for schema group iteration.
-// plugin: descriptor of the plugin owning the group
-// group: schema group being visited
-// data: opaque user data
 typedef void (*plugin_kv_group_iter_cb_t)(const plugin_desc_t *plugin,
     const plugin_kv_group_t *group, void *data);
 
-// Iterate all schema groups across all loaded plugins.
-// cb: callback invoked for each group
-// data: opaque user data passed to callback
 void plugin_kv_group_iterate(plugin_kv_group_iter_cb_t cb, void *data);
 
-// Initialize the plugin subsystem.
 void plugin_init(void);
 
-// Shut down: stop, deinit, and unload all plugins in reverse dependency order.
+// Stop, deinit, and unload all plugins in reverse dependency order.
 void plugin_exit(void);
 
 #ifdef PLUGIN_INTERNAL
@@ -257,7 +198,7 @@ void plugin_exit(void);
 #include "clam.h"
 #include "cmd.h"
 #include "colors.h"
-#include "mem.h"
+#include "alloc.h"
 #include "userns.h"
 
 #include <dlfcn.h>
@@ -268,7 +209,6 @@ void plugin_exit(void);
 
 #define PLUGIN_PATH_SZ  512
 
-// Internal plugin record.
 typedef struct plugin_rec
 {
   char                  path[PLUGIN_PATH_SZ];
@@ -278,12 +218,10 @@ typedef struct plugin_rec
   struct plugin_rec    *next;
 } plugin_rec_t;
 
-// Module state.
 static plugin_rec_t *plugins      = NULL;
 static uint32_t      n_plugins    = 0;
 static bool          plugin_ready = false;
 
-// Lifetime counters for statistics.
 static uint32_t      n_discovered  = 0;
 static uint32_t      n_rejected    = 0;
 static uint32_t      n_load_errors = 0;

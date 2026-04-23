@@ -1,14 +1,5 @@
-// math_expr.c — Recursive descent math expression evaluator.
-// Single-pass direct evaluation: no AST, no heap allocations.
-//
-// Grammar:
-//   expr    = term (('+' | '-') term)*
-//   term    = unary (('*' | '/' | '%') unary)*
-//   unary   = ('-' | '+')* power
-//   power   = call ('^' power)?          // right-associative
-//   call    = IDENT '(' args ')' | IDENT power | primary
-//   primary = NUMBER | '(' expr ')'
-//   args    = expr (',' expr)*
+// botmanager — MIT
+// Recursive-descent math expression evaluator: single-pass, no AST, no heap.
 
 #define MATH_EXPR_INTERNAL
 #include "math_expr.h"
@@ -27,37 +18,33 @@
 #define INFINITY (1.0/0.0)
 #endif
 
-// -----------------------------------------------------------------------
 // Built-in constants and helper functions
-// -----------------------------------------------------------------------
 
-// returns: pi (3.14159...)
 static double
 const_pi(void)
 {
   return 3.14159265358979323846;
 }
 
-// returns: Euler's number e (2.71828...)
 static double
 const_e(void)
 {
   return 2.71828182845904523536;
 }
 
-// returns: factorial of a, NAN if negative, INFINITY on overflow
-// a: non-negative integer value
 static double
 fn_fac(double a)
 {
+  unsigned int  n;
+  unsigned long result = 1;
+
   if(a < 0.0)
     return NAN;
 
   if(a > (double)UINT_MAX)
     return INFINITY;
 
-  unsigned int n = (unsigned int)a;
-  unsigned long result = 1;
+  n = (unsigned int)a;
 
   for(unsigned int i = 1; i <= n; i++)
   {
@@ -70,25 +57,25 @@ fn_fac(double a)
   return (double)result;
 }
 
-// returns: n choose r (combinations), NAN on invalid input
-// n: total items (non-negative)
 // r: items chosen (non-negative, must not exceed n)
 static double
 fn_ncr(double n, double r)
 {
+  unsigned int  un;
+  unsigned int  ur;
+  unsigned long result = 1;
+
   if(n < 0.0 || r < 0.0 || n < r)
     return NAN;
 
   if(n > (double)UINT_MAX || r > (double)UINT_MAX)
     return INFINITY;
 
-  unsigned int un = (unsigned int)n;
-  unsigned int ur = (unsigned int)r;
+  un = (unsigned int)n;
+  ur = (unsigned int)r;
 
   if(ur > un / 2)
     ur = un - ur;
-
-  unsigned long result = 1;
 
   for(unsigned int i = 1; i <= ur; i++)
   {
@@ -102,8 +89,6 @@ fn_ncr(double n, double r)
   return (double)result;
 }
 
-// returns: n permute r (permutations), NAN on invalid input
-// n: total items (non-negative)
 // r: items chosen (non-negative, must not exceed n)
 static double
 fn_npr(double n, double r)
@@ -140,8 +125,6 @@ static const builtin_t builtins[] = {
   { "tanh",  1, { .f1 = tanh    } },
 };
 
-// returns: pointer to matching builtin entry, or NULL if not found
-// name: NUL-terminated function/constant name to look up
 static const builtin_t *
 find_builtin(const char *name)
 {
@@ -165,13 +148,8 @@ find_builtin(const char *name)
   return NULL;
 }
 
-// -----------------------------------------------------------------------
 // Tokenizer
-// -----------------------------------------------------------------------
 
-// Advance the parser to the next token, updating p->tok and the
-// associated value field (p->num for TOK_NUM, p->ident for TOK_IDENT).
-// p: parser state to advance
 static void
 advance(parser_t *p)
 {
@@ -237,29 +215,38 @@ advance(parser_t *p)
   }
 }
 
-// -----------------------------------------------------------------------
-// Recursive descent parser — direct evaluation
-// -----------------------------------------------------------------------
+// Recursive-descent parser — direct evaluation.
+//
+// Grammar:
+//   expr    = term (('+' | '-') term)*
+//   term    = unary (('*' | '/' | '%') unary)*
+//   unary   = ('-' | '+')* power
+//   power   = call ('^' power)?          // right-associative
+//   call    = IDENT '(' args ')' | IDENT power | primary
+//   primary = NUMBER | '(' expr ')'
+//   args    = expr (',' expr)*
 
-// returns: evaluated result of additive expression
 // p: parser state (tok must be primed by advance())
 static double
 parse_expr(parser_t *p)
 {
+  double val;
+
   if(++p->depth > MATH_DEPTH_MAX)
   {
     p->tok = TOK_ERR;
     return NAN;
   }
 
-  double val = parse_term(p);
+  val = parse_term(p);
 
   while(p->tok == TOK_PLUS || p->tok == TOK_MINUS)
   {
-    int op = p->tok;
+    int    op = p->tok;
+    double rhs;
 
     advance(p);
-    double rhs = parse_term(p);
+    rhs = parse_term(p);
 
     if(op == TOK_PLUS)
       val += rhs;
@@ -271,8 +258,6 @@ parse_expr(parser_t *p)
   return val;
 }
 
-// returns: evaluated result of multiplicative expression
-// p: parser state
 static double
 parse_term(parser_t *p)
 {
@@ -281,10 +266,11 @@ parse_term(parser_t *p)
   while(p->tok == TOK_STAR || p->tok == TOK_SLASH
       || p->tok == TOK_PERCENT)
   {
-    int op = p->tok;
+    int    op = p->tok;
+    double rhs;
 
     advance(p);
-    double rhs = parse_unary(p);
+    rhs = parse_unary(p);
 
     if(op == TOK_STAR)
       val *= rhs;
@@ -299,12 +285,11 @@ parse_term(parser_t *p)
   return val;
 }
 
-// returns: evaluated result after consuming any leading +/- signs
-// p: parser state
 static double
 parse_unary(parser_t *p)
 {
-  int sign = 1;
+  int    sign = 1;
+  double val;
 
   while(p->tok == TOK_PLUS || p->tok == TOK_MINUS)
   {
@@ -314,28 +299,30 @@ parse_unary(parser_t *p)
     advance(p);
   }
 
-  double val = parse_power(p);
+  val = parse_power(p);
 
   return sign < 0 ? -val : val;
 }
 
-// returns: evaluated result of right-associative exponentiation
-// p: parser state
 static double
 parse_power(parser_t *p)
 {
+  double base;
+
   if(++p->depth > MATH_DEPTH_MAX)
   {
     p->tok = TOK_ERR;
     return NAN;
   }
 
-  double base = parse_call(p);
+  base = parse_call(p);
 
   if(p->tok == TOK_CARET)
   {
+    double exponent;
+
     advance(p);
-    double exponent = parse_power(p);
+    exponent = parse_power(p);
     p->depth--;
     return pow(base, exponent);
   }
@@ -344,19 +331,20 @@ parse_power(parser_t *p)
   return base;
 }
 
-// returns: evaluated result of function call, constant, or primary
-// p: parser state
 static double
 parse_call(parser_t *p)
 {
+  char             name[IDENT_MAX];
+  const builtin_t *fn;
+  double           a0;
+  double           a1;
+
   if(p->tok != TOK_IDENT)
     return parse_primary(p);
 
-  char name[IDENT_MAX];
-
   memcpy(name, p->ident, IDENT_MAX);
 
-  const builtin_t *fn = find_builtin(name);
+  fn = find_builtin(name);
 
   if(fn == NULL)
   {
@@ -390,8 +378,10 @@ parse_call(parser_t *p)
   {
     if(p->tok == TOK_LPAREN)
     {
+      double arg;
+
       advance(p);
-      double arg = parse_expr(p);
+      arg = parse_expr(p);
 
       if(p->tok != TOK_RPAREN)
       {
@@ -415,7 +405,7 @@ parse_call(parser_t *p)
 
   advance(p);
 
-  double a0 = parse_expr(p);
+  a0 = parse_expr(p);
 
   for(int i = 1; i < fn->arity; i++)
   {
@@ -428,7 +418,7 @@ parse_call(parser_t *p)
     advance(p);
   }
 
-  double a1 = parse_expr(p);
+  a1 = parse_expr(p);
 
   if(p->tok != TOK_RPAREN)
   {
@@ -440,8 +430,6 @@ parse_call(parser_t *p)
   return fn->f2(a0, a1);
 }
 
-// returns: evaluated numeric literal or parenthesised sub-expression
-// p: parser state
 static double
 parse_primary(parser_t *p)
 {
@@ -455,8 +443,10 @@ parse_primary(parser_t *p)
 
   if(p->tok == TOK_LPAREN)
   {
+    double val;
+
     advance(p);
-    double val = parse_expr(p);
+    val = parse_expr(p);
 
     if(p->tok != TOK_RPAREN)
     {
@@ -472,16 +462,14 @@ parse_primary(parser_t *p)
   return NAN;
 }
 
-// -----------------------------------------------------------------------
 // Public API
-// -----------------------------------------------------------------------
 
-// returns: evaluated result, or NAN on parse error
-// expression: NUL-terminated math expression string
-// error: if non-NULL, set to 0 on success or 1-based error position
 double
 math_eval(const char *expression, int *error)
 {
+  parser_t p;
+  double   result;
+
   if(expression == NULL || *expression == '\0')
   {
     if(error)
@@ -500,14 +488,12 @@ math_eval(const char *expression, int *error)
     return NAN;
   }
 
-  parser_t p;
-
   p.start = expression;
   p.pos   = expression;
   p.depth = 0;
   advance(&p);
 
-  double result = parse_expr(&p);
+  result = parse_expr(&p);
 
   if(p.tok == TOK_ERR || p.tok != TOK_END)
   {

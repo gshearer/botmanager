@@ -51,8 +51,8 @@
 #define CLR_BOLD    "\x01" "b"
 #define CLR_RESET   "\x01" "X"
 
-// Color table: maps abstract markers to method-specific color strings.
-// Each method driver provides a static instance of this struct.
+// Maps abstract markers to method-specific color strings. Each method
+// driver provides a static instance of this struct.
 typedef struct
 {
   const char *red;

@@ -7,6 +7,11 @@ project('botmanager', 'c',
   ],
 )
 
+# C99 zero-inits unspecified fields in designated initialisers. The
+# project uses that idiom heavily (json_spec_t tables, plugin_kv_entry_t
+# schemas, cmd_arg_desc_t specs) — silence the cosmetic warning.
+add_project_arguments('-Wno-missing-field-initializers', language : 'c')
+
 bm_version_major = '0'
 bm_version_minor = '1'
 
@@ -30,6 +35,11 @@ gen_include = include_directories('.')
 
 # Public headers used by core and plugins.
 inc_include = include_directories('include')
+
+# Inter-plugin contract headers (e.g. contracts/dossier_method.h).
+# Plugins that consume a contract add this to their include_directories
+# and reference the header as `#include "contracts/<name>.h"`.
+plugin_contracts_include = include_directories('plugins')
 
 # libdl for plugin loading (dlopen/dlclose).
 cc = meson.get_compiler('c')
@@ -56,10 +66,10 @@ uuid_dep = dependency('uuid', required : true)
 # libm for math functions (math_expr core module).
 m_dep = cc.find_library('m', required : false)
 
-# GNU Readline for console line editing and history.
-readline_dep = dependency('readline', required : true)
+# libxml2 for RSS/Atom + HTML parsing (inference plugin: acquire feeds).
+xml2_dep = dependency('libxml-2.0', required : true)
+
 
 subdir('core')
 subdir('plugins')
 subdir('tools')
-subdir('tests')

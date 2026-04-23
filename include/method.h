@@ -13,7 +13,6 @@
 #define METHOD_TEXT_SZ     2048
 #define METHOD_META_SZ     512
 
-// Method instance states visible to the rest of the system.
 typedef enum
 {
   METHOD_ENABLED,     // plugin loaded, instance configured
@@ -25,17 +24,34 @@ typedef enum
 // Used by cmd_def_t.methods to scope command visibility per method.
 typedef uint32_t method_type_t;
 
-#define METHOD_T_CONSOLE   ((method_type_t)1U << 0)
 #define METHOD_T_BOTMANCTL ((method_type_t)1U << 1)
 #define METHOD_T_IRC       ((method_type_t)1U << 2)
 #define METHOD_T_ANY       ((method_type_t)UINT32_MAX)
 
-// Full message context delivered to subscribers.
-// Created by method plugins when a message arrives, passed to bot
-// callbacks. Contains everything needed for the bot to interpret the
-// message and reply on the originating method.
+// Method capability bitmask: declares optional features a driver supports,
+// so bots can tailor their behavior per method. Drivers set these in the
+// driver vtable's .caps field.
+typedef uint32_t method_cap_t;
+
+#define METHOD_CAP_EMOTE   ((method_cap_t)1U << 0)  // third-person action (IRC CTCP ACTION, Discord italics, etc.)
+
+// Discriminator for the kind of event a method_msg_t carries. The
+// default (zero) is a normal chat/DM line. Other kinds describe
+// protocol-level identity events that bots may want to observe but do
+// not inject into chat history (e.g., IRC NICK changes that collapse
+// into the same per-identity record at confidence 1.0).
+typedef enum
+{
+  METHOD_MSG_MESSAGE     = 0,  // normal chat line (PRIVMSG, DM, etc.)
+  METHOD_MSG_NICK_CHANGE = 1,  // sender renamed; see method_msg_t notes
+} method_msg_kind_t;
+
 typedef struct method_inst method_inst_t;
 
+// Full message context delivered to subscribers. Created by method
+// plugins when a message arrives, passed to bot callbacks. Contains
+// everything needed for the bot to interpret the message and reply on
+// the originating method.
 typedef struct
 {
   method_inst_t *inst;                    // originating method instance
@@ -44,60 +60,68 @@ typedef struct
   char           text[METHOD_TEXT_SZ];        // raw message text
   time_t         timestamp;                   // message timestamp
   char           metadata[METHOD_META_SZ];    // method-specific data
-  bool           console_origin;              // true = bypass privilege checks
+  bool           is_action;                   // true when the message is an emote/action (e.g., IRC CTCP ACTION)
+  method_msg_kind_t kind;                     // default METHOD_MSG_MESSAGE
+  // Previous protocol-level identity string, set on METHOD_MSG_NICK_CHANGE.
+  // For IRC: the "oldnick!ident@host" prefix. metadata holds the new
+  // identity ("newnick!ident@host"), sender is the old nick, text is
+  // the new nick, and channel is empty. Unused for other kinds.
+  char           prev_metadata[METHOD_META_SZ];
 } method_msg_t;
 
-// Subscriber callback for incoming messages. Invoked synchronously by
-// method_deliver() for each matching subscriber.
-// msg: the message context (valid for the duration of the callback)
-// data: opaque user data registered with method_subscribe()
+// Invoked synchronously by method_deliver() for each matching
+// subscriber. msg is valid for the duration of the callback.
 typedef void (*method_msg_cb_t)(const method_msg_t *msg, void *data);
 
-// Driver interface: functions a method plugin must implement.
-// Stored in plugin_desc_t.ext for PLUGIN_METHOD plugins.
+typedef void (*method_chan_member_cb_t)(const char *nick, void *data);
+
+typedef void (*method_joined_channel_cb_t)(const char *channel, void *data);
+
+// Functions a method plugin must implement. Stored in plugin_desc_t.ext
+// for PLUGIN_METHOD plugins.
 typedef struct
 {
   const char *name;
+  method_cap_t caps;            // optional capability bitmask (METHOD_CAP_*)
   const color_table_t *colors;  // abstract-to-native color mapping
 
-  // Create instance-specific state. Returns opaque handle stored in
-  // the method_inst_t. Called during method_register().
-  // inst_name: unique instance name
-  // returns: opaque handle, or NULL on failure
   void *(*create)(const char *inst_name);
-
-  // Destroy instance-specific state. Called during method_unregister().
-  // handle: opaque handle from create()
   void (*destroy)(void *handle);
 
-  // Connect to the platform / start processing.
   // Called when the method should transition toward AVAILABLE.
-  // returns: SUCCESS or FAIL
-  // handle: opaque handle from create()
   bool (*connect)(void *handle);
-
-  // Disconnect from the platform / stop processing.
-  // handle: opaque handle from create()
   void (*disconnect)(void *handle);
 
-  // Send a message to a target (channel or user).
-  // returns: SUCCESS or FAIL
-  // handle: opaque handle from create()
-  // target: destination identifier (channel name, user, etc.)
-  // text: message text to send
   bool (*send)(void *handle, const char *target, const char *text);
 
-  // Get method context for authentication (e.g., hostname/IP from IRC).
-  // returns: SUCCESS or FAIL (context unavailable)
-  // handle: opaque handle from create()
-  // sender: protocol-level sender identity
-  // ctx: buffer to fill with context string
-  // ctx_sz: size of ctx buffer
+  // Send a third-person action/emote. Optional — if NULL,
+  // method_send_emote falls back to a plain send with the text wrapped
+  // in asterisks. Drivers that implement this should also advertise
+  // METHOD_CAP_EMOTE in the caps field above. `text` is already
+  // stripped of any leading "/me ".
+  bool (*send_emote)(void *handle, const char *target, const char *text);
+
+  // Method context for authentication (e.g., hostname/IP from IRC).
   bool (*get_context)(void *handle, const char *sender,
       char *ctx, size_t ctx_sz);
+
+  // List members of a channel. If not implemented (NULL), the channel
+  // has no member tracking.
+  void (*list_channel)(void *handle, const char *channel,
+      method_chan_member_cb_t cb, void *data);
+
+  // List the channels this bot is currently joined to. If not
+  // implemented (NULL), the driver has no notion of multi-channel
+  // membership. Implementations must guarantee that `cb` is invoked
+  // synchronously and that the callback returns before the next
+  // invocation — the caller may hold no locks across cb.
+  void (*list_joined_channels)(void *handle,
+      method_joined_channel_cb_t cb, void *data);
+
+  // Get the bot's own identity on this method (e.g., current IRC nick).
+  bool (*get_self)(void *handle, char *buf, size_t buf_sz);
 } method_driver_t;
 
-// Method subscriber statistics.
 typedef struct
 {
   uint32_t instances;     // registered method instances
@@ -106,223 +130,110 @@ typedef struct
   uint64_t total_msg_out; // sum of all instances' msg_out
 } method_stats_t;
 
-// -----------------------------------------------------------------------
-// Instance management
-// -----------------------------------------------------------------------
-
-// Register a new method instance. The driver's create() callback is
-// invoked to produce instance-specific state.
-// returns: instance pointer, or NULL on failure
-// drv: driver interface (must not be NULL)
-// name: unique instance name
 method_inst_t *method_register(const method_driver_t *drv, const char *name);
 
-// Unregister a method instance. Disconnects if running/available,
-// invokes driver destroy(), and removes all subscribers.
-// returns: SUCCESS or FAIL (not found)
-// name: instance name
+// Disconnects if running/available, invokes driver destroy(), removes
+// all subscribers.
 bool method_unregister(const char *name);
 
-// Find an instance by name.
-// returns: instance pointer, or NULL if not found
-// name: instance name
 method_inst_t *method_find(const char *name);
-
-// Get the name of an instance.
-// returns: instance name string
-// inst: method instance
 const char *method_inst_name(const method_inst_t *inst);
 
-// Get the driver kind of an instance (e.g., "irc", "console").
-// returns: driver name string
-// inst: method instance
+// Driver kind of an instance (e.g., "irc", "botmanctl").
 const char *method_inst_kind(const method_inst_t *inst);
 
-// Map a driver name to its method type bit.
-// returns: type bit, or 0 if the driver name is unrecognized
-// name: driver name string (e.g., "console", "irc")
+// Returns 0 if the driver name is unrecognized.
 method_type_t method_type_bit(const char *name);
 
-// Get the human-friendly description for a method type by driver name.
-// returns: description string, or NULL if the driver name is unrecognized
-// name: driver name string (e.g., "console", "irc")
+// Returns NULL if the driver name is unrecognized.
 const char *method_type_desc(const char *name);
 
-// Get the method type bitmask for a method instance.
-// returns: type bit derived from driver name, or 0 if unrecognized
-// inst: method instance
+// Returns 0 if unrecognized.
 method_type_t method_inst_type(const method_inst_t *inst);
 
-// Get the driver-specific handle for an instance.
-// returns: opaque handle pointer, or NULL
-// inst: method instance
 void *method_get_handle(const method_inst_t *inst);
 
-// -----------------------------------------------------------------------
-// State management
-// -----------------------------------------------------------------------
+// Does nothing if the driver does not support member listing.
+void method_list_channel(method_inst_t *inst, const char *channel,
+    method_chan_member_cb_t cb, void *data);
 
-// Get current state of an instance.
-// returns: current method state
-// inst: method instance
+// Does nothing if the driver does not support joined-channel listing.
+void method_list_joined_channels(method_inst_t *inst,
+    method_joined_channel_cb_t cb, void *data);
+
+bool method_get_self(method_inst_t *inst, char *buf, size_t buf_sz);
+
 method_state_t method_get_state(const method_inst_t *inst);
 
-// Set the state of an instance. Typically called by the method plugin
-// itself as it progresses through its lifecycle (connecting, connected,
-// disconnected).
-// inst: method instance
-// state: new state
+// Typically called by the method plugin itself as it progresses
+// through its lifecycle (connecting, connected, disconnected).
 void method_set_state(method_inst_t *inst, method_state_t state);
 
-// returns: human-readable name of a method state
-// s: method state enum value
 const char *method_state_name(method_state_t s);
 
-// -----------------------------------------------------------------------
-// Message delivery
-// -----------------------------------------------------------------------
-
-// Subscribe to messages from a method instance.
-// returns: SUCCESS or FAIL (duplicate name, instance not found)
-// inst: method instance to subscribe to
-// name: unique subscriber name
-// cb: callback invoked for each message
-// data: opaque user data passed to callback
 bool method_subscribe(method_inst_t *inst, const char *name,
     method_msg_cb_t cb, void *data);
 
-// Unsubscribe from a method instance.
-// returns: SUCCESS or FAIL (not found)
-// inst: method instance
-// name: subscriber name
 bool method_unsubscribe(method_inst_t *inst, const char *name);
 
-// Deliver a message to all subscribers of a method instance.
 // Called by method plugins when a message arrives from the platform.
-// inst: method instance the message arrived on
-// msg: message context (inst field is set automatically)
+// msg->inst is set automatically.
 void method_deliver(method_inst_t *inst, method_msg_t *msg);
 
-// -----------------------------------------------------------------------
-// Connection management
-// -----------------------------------------------------------------------
-
-// Connect a method instance. Routes through the driver's connect()
-// callback. Typically called by bot_start() for on-demand instances.
-// returns: SUCCESS or FAIL
-// inst: method instance
+// Routes through the driver's connect() callback. Typically called by
+// bot_start() for on-demand instances.
 bool method_connect(method_inst_t *inst);
 
-// -----------------------------------------------------------------------
-// Outbound messaging
-// -----------------------------------------------------------------------
-
-// Send a message via a method instance. Routes through the driver's
-// send() callback.
-// returns: SUCCESS or FAIL
-// inst: method instance to send on
-// target: destination (channel, user, etc.)
-// text: message text
 bool method_send(method_inst_t *inst, const char *target, const char *text);
 
-// -----------------------------------------------------------------------
-// Authentication context
-// -----------------------------------------------------------------------
+// Routes through the driver's send_emote() callback when available;
+// otherwise falls back to a plain send with the text wrapped in
+// asterisks so it still reads as an action on methods without native
+// support. `text` must not include any leading "/me " prefix.
+bool method_send_emote(method_inst_t *inst, const char *target,
+    const char *text);
 
-// Get method context for a sender (e.g., hostname/IP). Routes through
-// the driver's get_context() callback. Used by the auth system as a
-// second factor.
-// returns: SUCCESS or FAIL
-// inst: method instance
-// sender: protocol-level sender identity
-// ctx: buffer to fill
-// ctx_sz: buffer size
+// METHOD_CAP_* bits, or 0 if inst/driver is NULL.
+method_cap_t method_inst_caps(const method_inst_t *inst);
+
+// Method context for a sender (e.g., hostname/IP). Used by the auth
+// system as a second factor.
 bool method_get_context(method_inst_t *inst, const char *sender,
     char *ctx, size_t ctx_sz);
 
-// -----------------------------------------------------------------------
-// Type registry iteration
-// -----------------------------------------------------------------------
-
-// Callback for method type table iteration.
-// name: driver kind string (e.g., "console", "irc")
-// bit: method_type_t bitmask for this type
-// desc: human-friendly description
-// data: opaque user data
 typedef void (*method_type_iter_cb_t)(const char *name, method_type_t bit,
     const char *desc, void *data);
 
-// Iterate the static method type registry.
-// cb: callback invoked for each registered type
-// data: opaque user data passed to cb
 void method_iterate_types(method_type_iter_cb_t cb, void *data);
 
-// -----------------------------------------------------------------------
-// Driver iteration
-// -----------------------------------------------------------------------
-
-// Callback for driver name iteration.
-// kind: driver kind string (e.g., "irc", "console")
-// data: opaque user data
 typedef void (*method_driver_iter_cb_t)(const char *kind, void *data);
 
-// Iterate unique method driver kinds across all registered instances.
 // Each driver kind is yielded at most once.
-// cb: callback invoked for each unique driver kind
-// data: opaque user data passed to cb
 void method_iterate_drivers(method_driver_iter_cb_t cb, void *data);
 
-// -----------------------------------------------------------------------
-// Instance iteration
-// -----------------------------------------------------------------------
-
-// Callback for method instance iteration.
-// name: instance name
-// kind: driver kind string
-// state: current instance state
-// msg_in: total inbound messages delivered
-// msg_out: total outbound messages sent
-// sub_count: current subscriber count
-// connected_at: timestamp when instance became AVAILABLE (0 if not)
-// data: opaque user data
 typedef void (*method_inst_iter_cb_t)(const char *name, const char *kind,
     method_state_t state, uint64_t msg_in, uint64_t msg_out,
     uint32_t sub_count, time_t connected_at, void *data);
 
-// Iterate all registered method instances. Locks method_mutex for
-// the duration of the iteration.
-// cb: callback invoked for each instance
-// data: opaque user data passed to cb
+// Locks method_mutex for the duration of the iteration.
 void method_iterate_instances(method_inst_iter_cb_t cb, void *data);
 
-// -----------------------------------------------------------------------
-// Statistics
-// -----------------------------------------------------------------------
-
-// Get method subsystem statistics (thread-safe snapshot).
-// out: destination for the snapshot
 void method_get_stats(method_stats_t *out);
 
-// -----------------------------------------------------------------------
-// Lifecycle
-// -----------------------------------------------------------------------
-
-// Initialize the method subsystem.
 void method_init(void);
 
-// Shut down the method subsystem. Unregisters all instances.
+// Unregisters all instances.
 void method_exit(void);
 
 #ifdef METHOD_INTERNAL
 
 #include "common.h"
 #include "clam.h"
-#include "mem.h"
+#include "alloc.h"
 
 #define METHOD_SUB_NAME_SZ  64
 #define METHOD_MAX_SUBS     32
 
-// Per-instance message subscriber.
 typedef struct method_sub
 {
   char               name[METHOD_SUB_NAME_SZ];
@@ -348,13 +259,11 @@ struct method_inst
   struct method_inst     *next;
 };
 
-// Module state.
 static method_inst_t   *method_list  = NULL;
 static pthread_mutex_t  method_mutex;
 static uint32_t         method_count = 0;
 static bool             method_ready = false;
 
-// Subscriber freelist for reuse.
 static method_sub_t    *method_sub_freelist = NULL;
 static uint32_t         method_sub_free_count = 0;
 

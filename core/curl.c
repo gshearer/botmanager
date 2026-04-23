@@ -1,12 +1,10 @@
+// botmanager — MIT
+// libcurl multi-handle wrapper and HTTP request helpers.
 #define CURL_INTERNAL
 #include "curl.h"
 
-// -----------------------------------------------------------------------
 // Request freelist helpers
-// -----------------------------------------------------------------------
 
-// Allocate a curl_request_t from the freelist, or heap if empty.
-// returns: zeroed request structure, never NULL
 static curl_request_t *
 curl_req_alloc(void)
 {
@@ -35,6 +33,8 @@ curl_req_alloc(void)
 static void
 curl_request_release(curl_request_t *req)
 {
+  curl_hdr_t *hdr;
+
   // Free heap-allocated fields.
   if(req->req_body != NULL)
   {
@@ -49,11 +49,11 @@ curl_request_release(curl_request_t *req)
   }
 
   // Free custom header list.
-  curl_hdr_t *hdr = req->headers;
-
+  hdr = req->headers;
   while(hdr != NULL)
   {
     curl_hdr_t *next = hdr->next;
+
     mem_free(hdr->value);
     mem_free(hdr);
     hdr = next;
@@ -78,25 +78,130 @@ curl_request_release(curl_request_t *req)
   pthread_mutex_unlock(&curl_req_mutex);
 }
 
-// -----------------------------------------------------------------------
+// Header callback for libcurl. Captures only ETag and Last-Modified.
+// libcurl delivers each header line including the trailing CRLF; the
+// match is case-insensitive, the value is copied into the fixed request
+// buffer (bounded, NUL-terminated, CRLF-trimmed).
+static size_t
+curl_header_cb(char *buf, size_t size, size_t nitems, void *userdata)
+{
+  curl_request_t *req;
+  size_t total;
+
+  req   = (curl_request_t *)userdata;
+  total = size * nitems;
+
+  // Ignore empty lines, status lines, and anything short of "X: v".
+  if(total < 4)
+    return(total);
+
+  // Match header name prefix case-insensitively; locate the colon and
+  // skip linear whitespace after it.
+  {
+    size_t name_len;
+    char  *dst;
+    size_t dst_cap;
+    size_t i;
+    size_t vstart;
+    size_t vend;
+
+    if(strncasecmp(buf, "ETag:", 5) == 0)
+    {
+      name_len = 5;
+      dst      = req->resp_etag;
+      dst_cap  = sizeof(req->resp_etag);
+    }
+
+    else if(strncasecmp(buf, "Last-Modified:", 14) == 0)
+    {
+      name_len = 14;
+      dst      = req->resp_last_modified;
+      dst_cap  = sizeof(req->resp_last_modified);
+    }
+
+    else
+      return(total);
+
+    // Skip leading whitespace after the colon.
+    vstart = name_len;
+
+    while(vstart < total && (buf[vstart] == ' ' || buf[vstart] == '\t'))
+      vstart++;
+
+    // Trim trailing CRLF + any trailing whitespace.
+    vend = total;
+
+    while(vend > vstart
+        && (buf[vend - 1] == '\r' || buf[vend - 1] == '\n'
+            || buf[vend - 1] == ' ' || buf[vend - 1] == '\t'))
+      vend--;
+
+    if(vend <= vstart)
+      return(total);
+
+    i = vend - vstart;
+
+    if(i >= dst_cap)
+      i = dst_cap - 1;
+
+    memcpy(dst, buf + vstart, i);
+    dst[i] = '\0';
+  }
+
+  return(total);
+}
+
 // Write callback for libcurl (accumulates response body)
-// -----------------------------------------------------------------------
 
 // libcurl write callback: accumulates response body into req->resp_body.
 // Enforces max_response_sz; returns 0 to abort if exceeded.
-// returns: number of bytes consumed, or 0 to abort transfer
-// ptr: incoming data from libcurl
-// size: always 1
-// nmemb: number of bytes received
-// userdata: pointer to the owning curl_request_t
 static size_t
 curl_write_cb(char *ptr, size_t size, size_t nmemb, void *userdata)
 {
-  curl_request_t *req = (curl_request_t *)userdata;
-  size_t bytes = size * nmemb;
+  curl_request_t *req;
+  size_t bytes;
+  size_t needed;
+
+  req = (curl_request_t *)userdata;
+  bytes = size * nmemb;
 
   if(bytes == 0)
     return(0);
+
+  // Deliver to streaming chunk callback before accumulation so the
+  // callback sees the new bytes independent of the response buffer.
+  if(req->chunk_cb != NULL)
+  {
+    curl_response_t partial;
+
+    memset(&partial, 0, sizeof(partial));
+    partial.request   = req;
+    partial.status    = 0;   // not final yet
+    partial.curl_code = 0;
+    partial.error     = NULL;
+    partial.user_data = req->cb_data;
+
+    if(req->accumulate && req->resp_body != NULL)
+    {
+      partial.body     = req->resp_body;
+      partial.body_len = req->resp_body_len;
+    }
+
+    if(req->easy != NULL)
+    {
+      char *ct = NULL;
+
+      curl_easy_getinfo(req->easy, CURLINFO_CONTENT_TYPE, &ct);
+      partial.content_type = ct;
+    }
+
+    req->chunk_cb(&partial, ptr, bytes, req->chunk_user);
+  }
+
+  // When accumulation is disabled, skip buffering and the size cap
+  // entirely — chunk_cb is the sole data sink.
+  if(!req->accumulate)
+    return(bytes);
 
   // Enforce max response size.
   if(req->resp_body_len + bytes > curl_cfg.max_response_sz)
@@ -107,12 +212,12 @@ curl_write_cb(char *ptr, size_t size, size_t nmemb, void *userdata)
   }
 
   // Grow buffer if needed (always keep room for NUL terminator).
-  size_t needed = req->resp_body_len + bytes + 1;
-
+  needed = req->resp_body_len + bytes + 1;
   if(needed > req->resp_body_cap)
   {
-    size_t newcap = req->resp_body_cap;
+    size_t newcap;
 
+    newcap = req->resp_body_cap;
     if(newcap == 0)
       newcap = CURL_RESP_INIT_CAP;
 
@@ -133,42 +238,38 @@ curl_write_cb(char *ptr, size_t size, size_t nmemb, void *userdata)
   return(bytes);
 }
 
-// -----------------------------------------------------------------------
 // Public request API
-// -----------------------------------------------------------------------
 
 // Create a new HTTP request in CURL_REQ_CREATED state.
-// returns: request handle, or NULL if url or cb is NULL
-// method: HTTP method (GET, POST, PUT, DELETE, PATCH)
-// url: full URL string (copied into fixed-size buffer)
-// cb: completion callback invoked when transfer finishes
-// user_data: opaque pointer passed through to the callback
 curl_request_t *
 curl_request_create(curl_method_t method, const char *url,
     curl_done_cb_t cb, void *user_data)
 {
+  curl_request_t *req;
+
   if(url == NULL || cb == NULL)
     return(NULL);
 
-  curl_request_t *req = curl_req_alloc();
-
-  req->method  = method;
-  req->state   = CURL_REQ_CREATED;
-  req->cb      = cb;
-  req->cb_data = user_data;
+  req = curl_req_alloc();
+  req->method     = method;
+  req->state      = CURL_REQ_CREATED;
+  req->cb         = cb;
+  req->cb_data    = user_data;
+  req->chunk_cb   = NULL;
+  req->chunk_user = NULL;
+  req->accumulate = true;
+  req->follow_redirects = true;
 
   snprintf(req->url, sizeof(req->url), "%s", url);
+
+  clam(CLAM_DEBUG5, "curl", "create: %s", url);
 
   return(req);
 }
 
 // Attach a request body and optional Content-Type. Must be called
 // before curl_request_submit(). Body data is copied internally.
-// returns: SUCCESS or FAIL
 // req: request handle (must be in CREATED state)
-// content_type: Content-Type header value, or NULL to omit
-// body: request body data, or NULL for no body
-// body_len: length of body in bytes
 bool
 curl_request_set_body(curl_request_t *req, const char *content_type,
     const char *body, size_t body_len)
@@ -191,16 +292,16 @@ curl_request_set_body(curl_request_t *req, const char *content_type,
 
 // Prepend a custom header to the request's header list.
 // May be called multiple times before submit.
-// returns: SUCCESS or FAIL
 // req: request handle (must be in CREATED state)
-// header: header line, e.g. "Authorization: Bearer xxx"
 bool
 curl_request_add_header(curl_request_t *req, const char *header)
 {
+  curl_hdr_t *hdr;
+
   if(req == NULL || header == NULL || req->state != CURL_REQ_CREATED)
     return(FAIL);
 
-  curl_hdr_t *hdr = mem_alloc("curl", "header", sizeof(*hdr));
+  hdr = mem_alloc("curl", "header", sizeof(*hdr));
   hdr->value = mem_strdup("curl", "hdr_val", header);
   hdr->next  = req->headers;
   req->headers = hdr;
@@ -209,9 +310,7 @@ curl_request_add_header(curl_request_t *req, const char *header)
 }
 
 // Set a per-request timeout, overriding the global KV default.
-// returns: SUCCESS or FAIL
 // req: request handle (must be in CREATED state)
-// timeout_secs: timeout in seconds (0 = use global default)
 bool
 curl_request_set_timeout(curl_request_t *req, uint32_t timeout_secs)
 {
@@ -224,9 +323,7 @@ curl_request_set_timeout(curl_request_t *req, uint32_t timeout_secs)
 }
 
 // Set a per-request User-Agent, overriding the global KV default.
-// returns: SUCCESS or FAIL
 // req: request handle (must be in CREATED state)
-// ua: User-Agent string (copied internally, NULL = use default)
 bool
 curl_request_set_user_agent(curl_request_t *req, const char *ua)
 {
@@ -237,6 +334,51 @@ curl_request_set_user_agent(curl_request_t *req, const char *ua)
     snprintf(req->user_agent, sizeof(req->user_agent), "%s", ua);
   else
     req->user_agent[0] = '\0';
+
+  return(SUCCESS);
+}
+
+// Attach a streaming chunk callback. The done callback still fires at
+// transfer end with final status; when accumulate is false, the done
+// callback's body will be NULL and body_len 0.
+// req: request handle (must be in CREATED state)
+bool
+curl_request_set_chunk_cb(curl_request_t *req,
+    curl_chunk_cb_t cb, void *user_data)
+{
+  if(req == NULL || req->state != CURL_REQ_CREATED)
+    return(FAIL);
+
+  req->chunk_cb   = cb;
+  req->chunk_user = user_data;
+
+  return(SUCCESS);
+}
+
+// Toggle response body accumulation. Default true. Set false to skip
+// growing resp_body; the chunk callback becomes the sole data sink and
+// the max_response_sz cap no longer applies.
+// req: request handle (must be in CREATED state)
+bool
+curl_request_set_accumulate(curl_request_t *req, bool accumulate)
+{
+  if(req == NULL || req->state != CURL_REQ_CREATED)
+    return(FAIL);
+
+  req->accumulate = accumulate;
+
+  return(SUCCESS);
+}
+
+// Toggle following of HTTP Location: redirects. Default true.
+// req: request handle (must be in CREATED state)
+bool
+curl_request_set_follow_redirects(curl_request_t *req, bool follow)
+{
+  if(req == NULL || req->state != CURL_REQ_CREATED)
+    return(FAIL);
+
+  req->follow_redirects = follow;
 
   return(SUCCESS);
 }
@@ -283,49 +425,88 @@ curl_request_submit(curl_request_t *req)
   pthread_mutex_unlock(&curl_submit_mutex);
 
   // Wake the multi loop.
-  uint64_t val = 1;
-  (void)write(curl_wake_fd, &val, sizeof(val));
+  {
+    uint64_t val = 1;
+    (void)write(curl_wake_fd, &val, sizeof(val));
+  }
 
   return(SUCCESS);
 }
 
-// -----------------------------------------------------------------------
 // Convenience functions
-// -----------------------------------------------------------------------
 
-// Convenience: create and submit a GET request in one call.
-// returns: SUCCESS or FAIL
-// url: full URL
-// cb: completion callback
-// user_data: opaque pointer passed to callback
+// Blocking variant of curl_request_submit. When the submit queue is
+// full, waits on curl_slot_cond instead of returning FAIL. The drain
+// thread broadcasts this condition when it clears the queue, so
+// waiters wake naturally without polling and without generating the
+// "queue full" WARN that the fast-fail path emits on every rejection.
+//
+// Spurious wakeups are handled by the while-loop; false is returned
+// only when the subsystem has shut down.
+//
+// Does not call curl_request_submit (which would log the WARN on
+// every transient queue-full condition). Duplicates the enqueue path
+// instead — ~15 lines of acceptable duplication for clean semantics.
+bool
+curl_request_submit_wait(curl_request_t *req)
+{
+  if(req == NULL || req->state != CURL_REQ_CREATED)
+    return(FAIL);
+
+  pthread_mutex_lock(&curl_submit_mutex);
+
+  while(curl_ready && curl_submit_count >= curl_cfg.max_queued)
+    pthread_cond_wait(&curl_slot_cond, &curl_submit_mutex);
+
+  if(!curl_ready)
+  {
+    pthread_mutex_unlock(&curl_submit_mutex);
+    curl_request_release(req);
+    return(FAIL);
+  }
+
+  req->state = CURL_REQ_QUEUED;
+  req->next  = NULL;
+
+  if(curl_submit_tail != NULL)
+    curl_submit_tail->next = req;
+  else
+    curl_submit_head = req;
+
+  curl_submit_tail = req;
+  curl_submit_count++;
+
+  pthread_mutex_unlock(&curl_submit_mutex);
+
+  // Wake the multi loop (same as curl_request_submit).
+  {
+    uint64_t val = 1;
+    (void)write(curl_wake_fd, &val, sizeof(val));
+  }
+
+  return(SUCCESS);
+}
+
 bool
 curl_get(const char *url, curl_done_cb_t cb, void *user_data)
 {
-  curl_request_t *req = curl_request_create(CURL_METHOD_GET, url,
-      cb, user_data);
+  curl_request_t *req;
 
+  req = curl_request_create(CURL_METHOD_GET, url, cb, user_data);
   if(req == NULL)
     return(FAIL);
 
   return(curl_request_submit(req));
 }
 
-// Convenience: create, attach body, and submit a POST request.
-// returns: SUCCESS or FAIL
-// url: full URL
-// content_type: Content-Type header value
-// body: request body data
-// body_len: body length in bytes
-// cb: completion callback
-// user_data: opaque pointer passed to callback
 bool
 curl_post(const char *url, const char *content_type,
     const char *body, size_t body_len,
     curl_done_cb_t cb, void *user_data)
 {
-  curl_request_t *req = curl_request_create(CURL_METHOD_POST, url,
-      cb, user_data);
+  curl_request_t *req;
 
+  req = curl_request_create(CURL_METHOD_POST, url, cb, user_data);
   if(req == NULL)
     return(FAIL);
 
@@ -338,13 +519,9 @@ curl_post(const char *url, const char *content_type,
   return(curl_request_submit(req));
 }
 
-// -----------------------------------------------------------------------
 // Multi-loop internals
-// -----------------------------------------------------------------------
 
 // Finish a completed transfer: build response, invoke callback, release.
-// req: the completed request
-// result: libcurl result code for the transfer
 static void
 curl_finish_request(curl_request_t *req, CURLcode result)
 {
@@ -357,24 +534,34 @@ curl_finish_request(curl_request_t *req, CURLcode result)
 
   if(result == CURLE_OK)
   {
+    char *ct = NULL;
+    curl_off_t dl = 0, ul = 0;
+    curl_off_t time_us = 0;
+
     curl_easy_getinfo(req->easy, CURLINFO_RESPONSE_CODE, &resp.status);
 
-    char *ct = NULL;
     curl_easy_getinfo(req->easy, CURLINFO_CONTENT_TYPE, &ct);
     resp.content_type = ct;
 
+    // Conditional-GET headers captured during transfer. Empty buffer
+    // means "not present"; surface NULL so callers can cheaply test
+    // for presence.
+    resp.etag = req->resp_etag[0]
+        ? req->resp_etag : NULL;
+    resp.last_modified = req->resp_last_modified[0]
+        ? req->resp_last_modified : NULL;
+
     // Byte counters.
-    curl_off_t dl = 0, ul = 0;
     curl_easy_getinfo(req->easy, CURLINFO_SIZE_DOWNLOAD_T, &dl);
     curl_easy_getinfo(req->easy, CURLINFO_SIZE_UPLOAD_T, &ul);
     curl_stat_in  += (uint64_t)dl;
     curl_stat_out += (uint64_t)ul;
 
     // Response time.
-    curl_off_t time_us = 0;
     curl_easy_getinfo(req->easy, CURLINFO_TOTAL_TIME_T, &time_us);
     curl_stat_time_ms += (uint64_t)(time_us / 1000);
   }
+
   else
   {
     resp.error = req->curl_errbuf[0] ? req->curl_errbuf
@@ -386,8 +573,17 @@ curl_finish_request(curl_request_t *req, CURLcode result)
         resp.error);
   }
 
-  resp.body     = req->resp_body ? req->resp_body : "";
-  resp.body_len = req->resp_body_len;
+  if(req->accumulate)
+  {
+    resp.body     = req->resp_body ? req->resp_body : "";
+    resp.body_len = req->resp_body_len;
+  }
+
+  else
+  {
+    resp.body     = NULL;
+    resp.body_len = 0;
+  }
 
   curl_stat_total++;
 
@@ -411,22 +607,37 @@ static void
 curl_drain_queue(void)
 {
   // Snapshot the queue under lock.
+  curl_request_t *head;
+  uint64_t val;
+
   pthread_mutex_lock(&curl_submit_mutex);
 
-  curl_request_t *head  = curl_submit_head;
+  head  = curl_submit_head;
   curl_submit_head  = NULL;
   curl_submit_tail  = NULL;
   curl_submit_count = 0;
 
+  // Queue just dropped to empty — wake any blocking submitters so
+  // they can take the freshly-opened slots. Broadcast (not signal)
+  // because N waiters may race for the max_queued slots we just
+  // freed; each will re-check the count under the mutex and either
+  // enqueue or wait again.
+  pthread_cond_broadcast(&curl_slot_cond);
+
   pthread_mutex_unlock(&curl_submit_mutex);
 
   // Consume the eventfd so it doesn't keep firing.
-  uint64_t val;
   (void)read(curl_wake_fd, &val, sizeof(val));
 
   while(head != NULL)
   {
-    curl_request_t *req = head;
+    curl_request_t *req;
+    CURL *easy;
+    uint32_t timeout;
+    const char *ua;
+    CURLMcode mc;
+
+    req = head;
     head = req->next;
     req->next = NULL;
 
@@ -459,15 +670,17 @@ curl_drain_queue(void)
       break;
     }
 
-    // Allocate response buffer.
-    req->resp_body = mem_alloc("curl", "resp_body", CURL_RESP_INIT_CAP);
-    req->resp_body[0]  = '\0';
-    req->resp_body_len = 0;
-    req->resp_body_cap = CURL_RESP_INIT_CAP;
+    // Allocate response buffer (skipped when streaming without accumulation).
+    if(req->accumulate)
+    {
+      req->resp_body = mem_alloc("curl", "resp_body", CURL_RESP_INIT_CAP);
+      req->resp_body[0]  = '\0';
+      req->resp_body_len = 0;
+      req->resp_body_cap = CURL_RESP_INIT_CAP;
+    }
 
     // Create easy handle.
-    CURL *easy = curl_easy_init();
-
+    easy = curl_easy_init();
     if(easy == NULL)
     {
       clam(CLAM_WARN, "curl", "curl_easy_init failed for %s", req->url);
@@ -513,6 +726,7 @@ curl_drain_queue(void)
     if(req->content_type[0] != '\0')
     {
       char ct_header[CURL_CT_SZ + 16];
+
       snprintf(ct_header, sizeof(ct_header), "Content-Type: %s",
           req->content_type);
       req->curl_headers = curl_slist_append(req->curl_headers, ct_header);
@@ -525,23 +739,30 @@ curl_drain_queue(void)
       curl_easy_setopt(easy, CURLOPT_HTTPHEADER, req->curl_headers);
 
     // Timeouts.
-    uint32_t timeout = req->timeout_secs > 0
+    timeout = req->timeout_secs > 0
         ? req->timeout_secs : curl_cfg.timeout;
 
     curl_easy_setopt(easy, CURLOPT_TIMEOUT, (long)timeout);
     curl_easy_setopt(easy, CURLOPT_CONNECTTIMEOUT,
         (long)curl_cfg.connect_timeout);
+    curl_easy_setopt(easy, CURLOPT_FOLLOWLOCATION,
+        req->follow_redirects ? 1L : 0L);
 
     // Write callback.
     curl_easy_setopt(easy, CURLOPT_WRITEFUNCTION, curl_write_cb);
     curl_easy_setopt(easy, CURLOPT_WRITEDATA, req);
 
+    // Header callback — captures ETag + Last-Modified into req's fixed
+    // buffers for conditional-GET support on the next fetch.
+    curl_easy_setopt(easy, CURLOPT_HEADERFUNCTION, curl_header_cb);
+    curl_easy_setopt(easy, CURLOPT_HEADERDATA, req);
+
     // Error buffer.
     req->curl_errbuf[0] = '\0';
     curl_easy_setopt(easy, CURLOPT_ERRORBUFFER, req->curl_errbuf);
 
-    // Follow redirects.
-    curl_easy_setopt(easy, CURLOPT_FOLLOWLOCATION, 1L);
+    // Cap redirects regardless of whether following is enabled
+    // (CURLOPT_FOLLOWLOCATION is set above based on req->follow_redirects).
     curl_easy_setopt(easy, CURLOPT_MAXREDIRS, 10L);
 
     // Accept compressed responses.
@@ -555,14 +776,13 @@ curl_drain_queue(void)
       curl_easy_setopt(easy, CURLOPT_VERBOSE, 1L);
 
     // User-Agent: per-request override, or global default.
-    const char *ua = req->user_agent[0] != '\0'
+    ua = req->user_agent[0] != '\0'
         ? req->user_agent : curl_cfg.user_agent;
 
     curl_easy_setopt(easy, CURLOPT_USERAGENT, ua);
 
     // Add to multi handle.
-    CURLMcode mc = curl_multi_add_handle(curl_multi_handle, easy);
-
+    mc = curl_multi_add_handle(curl_multi_handle, easy);
     if(mc != CURLM_OK)
     {
       clam(CLAM_WARN, "curl", "multi_add_handle failed: %s",
@@ -581,12 +801,11 @@ curl_drain_queue(void)
   }
 }
 
-// Persist task: drives the curl_multi event loop.
-// Runs until pool_shutting_down(), then cleans up all handles.
-// t: task handle (set to TASK_FATAL on init failure, TASK_ENDED on exit)
 static void
 curl_multi_loop(task_t *t)
 {
+  struct curl_waitfd extra;
+
   curl_multi_handle = curl_multi_init();
 
   if(curl_multi_handle == NULL)
@@ -614,36 +833,36 @@ curl_multi_loop(task_t *t)
     return;
   }
 
-  struct curl_waitfd extra;
   extra.fd      = curl_wake_fd;
   extra.events  = CURL_WAIT_POLLIN;
   extra.revents = 0;
 
   while(!pool_shutting_down())
   {
+    int numfds = 0;
+    int running = 0;
+    int msgs_left;
+    CURLMsg *msg;
+
     // 1. Drain any newly submitted requests into multi.
     curl_drain_queue();
 
     // 2. Wait for activity.
-    int numfds = 0;
     curl_multi_poll(curl_multi_handle, &extra, 1,
         (int)curl_cfg.poll_timeout, &numfds);
 
     // 3. Drive all transfers forward.
-    int running = 0;
     curl_multi_perform(curl_multi_handle, &running);
 
     // 4. Check for completed transfers.
-    int msgs_left;
-    CURLMsg *msg;
-
     while((msg = curl_multi_info_read(curl_multi_handle, &msgs_left))
         != NULL)
     {
+      curl_request_t *req = NULL;
+
       if(msg->msg != CURLMSG_DONE)
         continue;
 
-      curl_request_t *req = NULL;
       curl_easy_getinfo(msg->easy_handle, CURLINFO_PRIVATE, &req);
 
       if(req != NULL)
@@ -663,6 +882,7 @@ curl_multi_loop(task_t *t)
       if(msg->msg == CURLMSG_DONE)
       {
         curl_request_t *req = NULL;
+
         curl_easy_getinfo(msg->easy_handle, CURLINFO_PRIVATE, &req);
 
         if(req != NULL)
@@ -673,9 +893,11 @@ curl_multi_loop(task_t *t)
 
   // Drain remaining submit queue without executing.
   {
+    curl_request_t *head;
+
     pthread_mutex_lock(&curl_submit_mutex);
 
-    curl_request_t *head = curl_submit_head;
+    head = curl_submit_head;
     curl_submit_head  = NULL;
     curl_submit_tail  = NULL;
     curl_submit_count = 0;
@@ -685,6 +907,7 @@ curl_multi_loop(task_t *t)
     while(head != NULL)
     {
       curl_request_t *next = head->next;
+
       curl_request_release(head);
       head = next;
     }
@@ -699,13 +922,8 @@ curl_multi_loop(task_t *t)
   t->state = TASK_ENDED;
 }
 
-// -----------------------------------------------------------------------
 // KV configuration
-// -----------------------------------------------------------------------
 
-// KV change callback: reload all curl config when any key changes.
-// key: the changed key name (unused)
-// data: callback user data (unused)
 static void
 curl_kv_changed(const char *key, void *data)
 {
@@ -719,25 +937,25 @@ static void
 curl_register_kv(void)
 {
   kv_register("core.curl.timeout",         KV_UINT32, "30",
-      curl_kv_changed, NULL);
+      curl_kv_changed, NULL, "HTTP request timeout in seconds");
   kv_register("core.curl.connect_timeout", KV_UINT32, "10",
-      curl_kv_changed, NULL);
+      curl_kv_changed, NULL, "HTTP connect timeout in seconds");
   kv_register("core.curl.max_active",      KV_UINT32, "32",
-      curl_kv_changed, NULL);
+      curl_kv_changed, NULL, "Maximum concurrent HTTP transfers");
   kv_register("core.curl.max_queued",      KV_UINT32, "256",
-      curl_kv_changed, NULL);
+      curl_kv_changed, NULL, "Maximum queued HTTP requests");
   kv_register("core.curl.max_response_sz", KV_UINT32, "4194304",
-      curl_kv_changed, NULL);
+      curl_kv_changed, NULL, "Maximum HTTP response body size in bytes");
   kv_register("core.curl.poll_timeout",    KV_UINT32, "500",
-      curl_kv_changed, NULL);
+      curl_kv_changed, NULL, "Curl multi poll timeout in milliseconds");
   kv_register("core.curl.max_conns",       KV_UINT32, "64",
-      curl_kv_changed, NULL);
+      curl_kv_changed, NULL, "Maximum total connections in the pool");
   kv_register("core.curl.max_host_conns",  KV_UINT32, "8",
-      curl_kv_changed, NULL);
-  kv_register("core.curl.verbose",         KV_UINT32, "0",
-      curl_kv_changed, NULL);
-  kv_register("core.curl.user_agent",     KV_STR,    CURL_DEF_USER_AGENT,
-      curl_kv_changed, NULL);
+      curl_kv_changed, NULL, "Maximum connections per host");
+  kv_register("core.curl.verbose",         KV_BOOL, "false",
+      curl_kv_changed, NULL, "Enable curl verbose debug output (true/false)");
+  kv_register("core.curl.user_agent",      KV_STR,    CURL_DEF_USER_AGENT,
+      curl_kv_changed, NULL, "HTTP User-Agent header string");
 }
 
 // Load all curl config values from KV into curl_cfg.
@@ -745,6 +963,8 @@ curl_register_kv(void)
 static void
 curl_load_config(void)
 {
+  const char *ua;
+
   curl_cfg.timeout         = (uint32_t)kv_get_uint("core.curl.timeout");
   curl_cfg.connect_timeout = (uint32_t)kv_get_uint("core.curl.connect_timeout");
   curl_cfg.max_active      = (uint32_t)kv_get_uint("core.curl.max_active");
@@ -755,7 +975,7 @@ curl_load_config(void)
   curl_cfg.max_host_conns  = (uint32_t)kv_get_uint("core.curl.max_host_conns");
   curl_cfg.verbose         = (uint32_t)kv_get_uint("core.curl.verbose");
 
-  const char *ua = kv_get_str("core.curl.user_agent");
+  ua = kv_get_str("core.curl.user_agent");
 
   if(ua != NULL && ua[0] != '\0')
     snprintf(curl_cfg.user_agent, sizeof(curl_cfg.user_agent), "%s", ua);
@@ -773,12 +993,8 @@ curl_load_config(void)
   }
 }
 
-// -----------------------------------------------------------------------
 // Statistics and utility
-// -----------------------------------------------------------------------
 
-// Snapshot curl subsystem statistics into caller-provided struct.
-// out: destination struct (zeroed and filled)
 void
 curl_get_stats(curl_stats_t *out)
 {
@@ -801,7 +1017,6 @@ curl_get_stats(curl_stats_t *out)
 // loop thread, so only queued requests are yielded individually.
 // Use curl_get_stats() for aggregate active/queued counts.
 // cb: iteration callback (must be fast — submit queue lock is held)
-// data: opaque user data forwarded to callback
 void
 curl_iterate_active(curl_iter_cb_t cb, void *data)
 {
@@ -816,9 +1031,6 @@ curl_iterate_active(curl_iter_cb_t cb, void *data)
   pthread_mutex_unlock(&curl_submit_mutex);
 }
 
-// Return the human-readable name for an HTTP method enum value.
-// returns: static string ("GET", "POST", etc.) or "UNKNOWN"
-// method: method enum value
 const char *
 curl_method_name(curl_method_t method)
 {
@@ -833,9 +1045,7 @@ curl_method_name(curl_method_t method)
   }
 }
 
-// -----------------------------------------------------------------------
 // Lifecycle
-// -----------------------------------------------------------------------
 
 // Initialize the curl subsystem: global libcurl init, mutexes,
 // default config, and spawn the multi-loop persist task.
@@ -851,6 +1061,7 @@ curl_init(void)
 
   pthread_mutex_init(&curl_submit_mutex, NULL);
   pthread_mutex_init(&curl_req_mutex, NULL);
+  pthread_cond_init(&curl_slot_cond, NULL);
 
   // Set defaults before KV may be available.
   curl_cfg.timeout         = CURL_DEF_TIMEOUT;
@@ -898,6 +1109,13 @@ curl_exit(void)
 
   curl_ready = false;
 
+  // Wake any threads waiting in curl_request_submit_wait so they
+  // notice the shutdown and exit cleanly instead of sleeping through
+  // it forever.
+  pthread_mutex_lock(&curl_submit_mutex);
+  pthread_cond_broadcast(&curl_slot_cond);
+  pthread_mutex_unlock(&curl_submit_mutex);
+
   // Free request freelist.
   pthread_mutex_lock(&curl_req_mutex);
 
@@ -910,6 +1128,7 @@ curl_exit(void)
 
   pthread_mutex_unlock(&curl_req_mutex);
 
+  pthread_cond_destroy(&curl_slot_cond);
   pthread_mutex_destroy(&curl_submit_mutex);
   pthread_mutex_destroy(&curl_req_mutex);
 

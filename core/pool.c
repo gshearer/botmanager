@@ -1,10 +1,10 @@
+// botmanager — MIT
+// Fixed-size object-pool allocator for hot-path reuse.
 #define POOL_INTERNAL
 #include "pool.h"
 
-// -----------------------------------------------------------------------
 // Reap any retired worker threads (join and free slot).
 // Must be called with pool_mutex held.
-// -----------------------------------------------------------------------
 static void
 reap_retired_locked(void)
 {
@@ -21,11 +21,8 @@ reap_retired_locked(void)
   }
 }
 
-// -----------------------------------------------------------------------
 // Create a worker thread in an unused slot.
 // Must be called with pool_mutex held.
-// returns: true on success, false if no slot available or creation fails
-// -----------------------------------------------------------------------
 static bool
 spawn_worker_locked(void)
 {
@@ -61,21 +58,17 @@ spawn_worker_locked(void)
   return(false);
 }
 
-// -----------------------------------------------------------------------
-// Check if a worker should retire due to idleness.
-// Called when a worker has no work (task_assign returned NULL).
-// returns: true if the worker should exit
-// w: the worker to evaluate
-// -----------------------------------------------------------------------
 static bool
 should_retire(worker_t *w)
 {
+  bool can_retire;
+
   if(w->id == 0)
     return(false);
 
   pthread_mutex_lock(&pool_mutex);
 
-  bool can_retire = (pool_size > pool_cfg.min_threads)
+  can_retire = (pool_size > pool_cfg.min_threads)
       && (pool_idle >= pool_cfg.min_spare);
 
   pthread_mutex_unlock(&pool_mutex);
@@ -86,10 +79,8 @@ should_retire(worker_t *w)
   return((time(NULL) - w->last_active) > (time_t)pool_cfg.max_idle_secs);
 }
 
-// -----------------------------------------------------------------------
 // Check if spare workers are below threshold and spawn if needed.
 // Called after a worker picks up work.
-// -----------------------------------------------------------------------
 static void
 check_spare(void)
 {
@@ -112,23 +103,23 @@ check_spare(void)
   pthread_mutex_unlock(&pool_mutex);
 }
 
-// -----------------------------------------------------------------------
-// Worker thread entry point (elastic pool).
-// returns: NULL (thread exit)
-// arg: pointer to the worker's worker_t slot
-// -----------------------------------------------------------------------
 static void *
 worker_entry(void *arg)
 {
   worker_t *w = (worker_t *)arg;
   uint8_t id = w->id;
   task_type_t type = (id == 0) ? TASK_PARENT : TASK_THREAD;
+  uint8_t  exit_id;
+  uint64_t exit_jobs;
 
   clam(CLAM_DEBUG, "pool", "worker %u started", id);
 
   while(!pool_stopping)
   {
-    task_t *t = task_assign(type);
+    task_t       *t;
+    task_state_t  result;
+
+    t = task_assign(type);
 
     if(t == NULL)
     {
@@ -156,7 +147,7 @@ worker_entry(void *arg)
 
     // Execute the callback.
     t->cb(t);
-    task_state_t result = task_finish(t);
+    result = task_finish(t);
 
     w->jobs++;
     w->last_active = time(NULL);
@@ -169,8 +160,8 @@ worker_entry(void *arg)
   }
 
   // Worker is exiting.
-  uint8_t  exit_id   = w->id;
-  uint64_t exit_jobs = w->jobs;
+  exit_id   = w->id;
+  exit_jobs = w->jobs;
 
   pthread_mutex_lock(&pool_mutex);
   w->wstate = WORKER_RETIRING;
@@ -188,16 +179,11 @@ worker_entry(void *arg)
   return(NULL);
 }
 
-// -----------------------------------------------------------------------
-// Persist thread entry point. Runs a single TASK_PERSIST task.
-// The callback contains its own loop and returns when done.
-// returns: NULL (thread exit)
-// arg: pointer to the task
-// -----------------------------------------------------------------------
 static void *
 persist_entry(void *arg)
 {
-  task_t *t = (task_t *)arg;
+  task_t       *t = (task_t *)arg;
+  task_state_t  result;
 
   t->state    = TASK_RUNNING;
   t->last_run = time(NULL);
@@ -208,7 +194,7 @@ persist_entry(void *arg)
   // Execute the callback (blocks until the task exits its loop).
   t->cb(t);
 
-  task_state_t result = t->state;
+  result = t->state;
 
   clam(CLAM_DEBUG, "pool", "persist thread '%s' exiting (state: %s)",
       t->name, task_state_name(result));
@@ -227,13 +213,9 @@ persist_entry(void *arg)
   return(NULL);
 }
 
-// -----------------------------------------------------------------------
 // Public API
-// -----------------------------------------------------------------------
 
 // Override pool limits. Must be called before pool_init().
-// max_threads: maximum worker threads
-// min_threads: minimum worker threads
 // min_spare: minimum idle workers before scaling up
 // max_idle_secs: seconds before an idle worker retires
 void
@@ -284,10 +266,8 @@ pool_init(void)
   pthread_mutex_lock(&pool_mutex);
 
   for(uint16_t i = 0; i < pool_cfg.min_threads; i++)
-  {
     if(!spawn_worker_locked())
       break;
-  }
 
   pthread_mutex_unlock(&pool_mutex);
 
@@ -305,6 +285,7 @@ void
 pool_run_parent(void)
 {
   worker_t *parent = &workers[0];
+  task_t   *t;
 
   parent->wstate      = WORKER_RUNNING;
   parent->thread      = pthread_self();
@@ -315,12 +296,14 @@ pool_run_parent(void)
 
   while(!pool_stopping && !sig_shutdown_requested())
   {
-    task_t *t = task_assign(TASK_PARENT);
+    task_state_t result;
+
+    t = task_assign(TASK_PARENT);
 
     if(t != NULL)
     {
       t->cb(t);
-      task_state_t result = task_finish(t);
+      result = task_finish(t);
 
       parent->jobs++;
       parent->last_active = time(NULL);
@@ -333,9 +316,7 @@ pool_run_parent(void)
     }
 
     else
-    {
       task_wait(pool_cfg.wait_ms);
-    }
   }
 
   clam(CLAM_DEBUG, "pool", "parent exiting worker loop (jobs: %lu)",
@@ -356,8 +337,6 @@ pool_shutdown(void)
   clam(CLAM_INFO, "pool_shutdown", "shutdown requested, waking workers");
 }
 
-// Check whether pool shutdown has been requested.
-// returns: true if shutdown is in progress
 bool
 pool_shutting_down(void)
 {
@@ -452,7 +431,6 @@ pool_exit(void)
 }
 
 // Get pool statistics (thread-safe snapshot).
-// out: destination for the snapshot
 void
 pool_get_stats(pool_stats_t *out)
 {
@@ -478,9 +456,7 @@ pool_get_stats(pool_stats_t *out)
   pthread_mutex_unlock(&pool_mutex);
 }
 
-// -----------------------------------------------------------------------
 // KV configuration
-// -----------------------------------------------------------------------
 
 // Load pool configuration from the KV store and apply sanity clamps.
 // Updates pool_cfg with clamped values.
@@ -509,9 +485,6 @@ pool_load_config(void)
   pool_cfg.wait_ms       = wait_ms;
 }
 
-// KV change callback. Reloads pool configuration when any pool key changes.
-// key: the KV key that changed (unused)
-// data: callback context (unused)
 static void
 pool_kv_changed(const char *key, void *data)
 {
@@ -525,11 +498,16 @@ pool_kv_changed(const char *key, void *data)
 static void
 pool_register_kv(void)
 {
-  kv_register("core.pool.max_threads",   KV_UINT16, "64",   pool_kv_changed, NULL);
-  kv_register("core.pool.min_threads",   KV_UINT16, "1",    pool_kv_changed, NULL);
-  kv_register("core.pool.min_spare",     KV_UINT16, "1",    pool_kv_changed, NULL);
-  kv_register("core.pool.max_idle_secs", KV_UINT32, "300",  pool_kv_changed, NULL);
-  kv_register("core.pool.wait_ms",       KV_UINT32, "1000", pool_kv_changed, NULL);
+  kv_register("core.pool.max_threads",   KV_UINT16, "64",
+      pool_kv_changed, NULL, "Maximum worker threads in the pool");
+  kv_register("core.pool.min_threads",   KV_UINT16, "1",
+      pool_kv_changed, NULL, "Minimum worker threads kept alive");
+  kv_register("core.pool.min_spare",     KV_UINT16, "1",
+      pool_kv_changed, NULL, "Minimum idle spare threads to maintain");
+  kv_register("core.pool.max_idle_secs", KV_UINT32, "300",
+      pool_kv_changed, NULL, "Seconds before excess idle threads exit");
+  kv_register("core.pool.wait_ms",       KV_UINT32, "1000",
+      pool_kv_changed, NULL, "Thread work-queue wait timeout in milliseconds");
 }
 
 // Register KV keys and load initial pool configuration from the store.

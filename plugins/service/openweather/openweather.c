@@ -1,23 +1,25 @@
+// botmanager — MIT
+// OpenWeather service plugin: OneCall 3.0 fetch + geocode cache.
 #define OW_INTERNAL
 #include "openweather.h"
 #include "util.h"
 
-// -----------------------------------------------------------------------
-// Input validation
-// -----------------------------------------------------------------------
+#include <ctype.h>
+#include <errno.h>
+#include <pthread.h>
+#include <string.h>
 
-// Validate a zipcode string.  Accepts 1-10 alphanumeric characters,
-// optionally followed by a comma and a 2-letter ISO country code
-// (e.g., "45069", "SW1A1AA,GB").  Rejects everything else.
-// returns: true if valid, false otherwise
-// s: NUL-terminated zipcode string
+// Input validation
+
 static bool
 ow_validate_zipcode(const char *s)
 {
-  if(s == NULL || s[0] == '\0')
-    return false;
+  int i;
 
-  int i = 0;
+  if(s == NULL || s[0] == '\0')
+    return(false);
+
+  i = 0;
 
   // Accept 1-10 alphanumeric characters.
   while(i < 10 && ((s[i] >= '0' && s[i] <= '9')
@@ -26,49 +28,47 @@ ow_validate_zipcode(const char *s)
     i++;
 
   if(i == 0)
-    return false;
+    return(false);
 
   // End of string — valid.
   if(s[i] == '\0')
-    return true;
+    return(true);
 
   // Optional comma + 2-letter country code.
   if(s[i] != ',')
-    return false;
+    return(false);
 
   i++;
 
   if(!((s[i] >= 'A' && s[i] <= 'Z') || (s[i] >= 'a' && s[i] <= 'z')))
-    return false;
+    return(false);
 
   i++;
 
   if(!((s[i] >= 'A' && s[i] <= 'Z') || (s[i] >= 'a' && s[i] <= 'z')))
-    return false;
+    return(false);
 
   i++;
 
-  return s[i] == '\0';
+  return(s[i] == '\0');
 }
 
-// -----------------------------------------------------------------------
 // Geocode cache helpers
-// -----------------------------------------------------------------------
-
 
 // returns: cache entry if found and not expired, NULL otherwise.
 //          expired entries are freed. must be called under lock.
-// zipcode: zipcode string to look up
 static ow_geocache_t *
 ow_geo_lookup(const char *zipcode)
 {
+  uint32_t idx;
+  ow_geocache_t **pp;
   uint32_t ttl = (uint32_t)kv_get_uint("plugin.openweather.geo_cache_ttl");
 
   if(ttl == 0)
     return(NULL);
 
-  uint32_t idx = util_fnv1a(zipcode) % OW_GEO_CACHE_BUCKETS;
-  ow_geocache_t **pp = &ow_geo_cache[idx];
+  idx = util_fnv1a(zipcode) % OW_GEO_CACHE_BUCKETS;
+  pp = &ow_geo_cache[idx];
 
   while(*pp != NULL)
   {
@@ -79,7 +79,6 @@ ow_geo_lookup(const char *zipcode)
       if((time(NULL) - e->cached_at) < (time_t)ttl)
         return(e);
 
-      // Expired — remove and free.
       *pp = e->next;
       mem_free(e);
       return(NULL);
@@ -92,16 +91,12 @@ ow_geo_lookup(const char *zipcode)
 }
 
 // Insert or update a geocode cache entry. Must be called under lock.
-// zipcode: zipcode string key
-// lat: latitude
-// lon: longitude
-// name: location name
 static void
 ow_geo_insert(const char *zipcode, double lat, double lon, const char *name)
 {
+  ow_geocache_t *e;
   uint32_t idx = util_fnv1a(zipcode) % OW_GEO_CACHE_BUCKETS;
 
-  // Check for existing entry to update.
   for(ow_geocache_t *e = ow_geo_cache[idx]; e != NULL; e = e->next)
   {
     if(strcmp(e->zipcode, zipcode) == 0)
@@ -114,8 +109,7 @@ ow_geo_insert(const char *zipcode, double lat, double lon, const char *name)
     }
   }
 
-  // New entry.
-  ow_geocache_t *e = mem_alloc("openweather", "geocache", sizeof(*e));
+  e = mem_alloc("openweather", "geocache", sizeof(*e));
 
   snprintf(e->zipcode, sizeof(e->zipcode), "%s", zipcode);
   e->lat       = lat;
@@ -127,11 +121,8 @@ ow_geo_insert(const char *zipcode, double lat, double lon, const char *name)
   ow_geo_cache[idx] = e;
 }
 
-// -----------------------------------------------------------------------
 // Request freelist helpers
-// -----------------------------------------------------------------------
 
-// returns: zeroed request from freelist or fresh allocation
 static ow_request_t *
 ow_req_alloc(void)
 {
@@ -155,8 +146,6 @@ ow_req_alloc(void)
   return(r);
 }
 
-// Return a request to the freelist.
-// r: request to release
 static void
 ow_req_release(ow_request_t *r)
 {
@@ -166,602 +155,242 @@ ow_req_release(ow_request_t *r)
   pthread_mutex_unlock(&ow_free_mu);
 }
 
-// -----------------------------------------------------------------------
-// Reply helper
-// -----------------------------------------------------------------------
+// Callback delivery helpers
 
-// Send a reply using the saved command context.
-// r: request carrying the context
-// text: reply text
 static void
-ow_reply(ow_request_t *r, const char *text)
+ow_deliver_current_err(ow_request_t *r, const char *msg)
 {
-  cmd_reply(&r->ctx, text);
+  openweather_current_result_t res;
+
+  memset(&res, 0, sizeof(res));
+  snprintf(res.err, sizeof(res.err), "%s", msg);
+
+  if(r->cb.current != NULL)
+    r->cb.current(&res, r->user);
 }
 
-// -----------------------------------------------------------------------
-// Unit display helpers
-// -----------------------------------------------------------------------
-
-// returns: temperature unit suffix for the given unit system
-// units: "imperial", "metric", or "standard"
-static const char *
-ow_temp_unit(const char *units)
-{
-  if(strcmp(units, "metric") == 0)
-    return("C");
-
-  if(strcmp(units, "standard") == 0)
-    return("K");
-
-  return("F");
-}
-
-// returns: wind speed unit for the given unit system
-// units: "imperial", "metric", or "standard"
-static const char *
-ow_speed_unit(const char *units)
-{
-  if(strcmp(units, "imperial") == 0)
-    return("mph");
-
-  return("m/s");
-}
-
-// -----------------------------------------------------------------------
-// Wind direction from degrees
-// -----------------------------------------------------------------------
-
-// returns: cardinal/intercardinal direction string
-// deg: wind direction in degrees (0-360)
-static const char *
-ow_wind_dir(double deg)
-{
-  static const char *dirs[] = {
-    "N", "NNE", "NE", "ENE", "E", "ESE", "SE", "SSE",
-    "S", "SSW", "SW", "WSW", "W", "WNW", "NW", "NNW"
-  };
-
-  int idx = ((int)((deg + 11.25) / 22.5)) % 16;
-
-  return(dirs[idx]);
-}
-
-// -----------------------------------------------------------------------
-// Time formatting
-// -----------------------------------------------------------------------
-
-// Format a Unix timestamp to HH:MM using the given timezone offset.
-// ts: Unix timestamp
-// tz_offset: timezone offset in seconds from UTC
-// buf: output buffer
-// sz: buffer size
 static void
-ow_format_time(time_t ts, int tz_offset, char *buf, size_t sz)
+ow_deliver_forecast_err(ow_request_t *r, const char *msg)
 {
-  time_t local = ts + tz_offset;
-  struct tm tm;
+  openweather_forecast_result_t res;
 
-  gmtime_r(&local, &tm);
-  snprintf(buf, sz, "%02d:%02d", tm.tm_hour, tm.tm_min);
+  memset(&res, 0, sizeof(res));
+  snprintf(res.err, sizeof(res.err), "%s", msg);
+
+  if(r->cb.forecast != NULL)
+    r->cb.forecast(&res, r->user);
 }
 
-// -----------------------------------------------------------------------
-// Temperature color helpers
-// -----------------------------------------------------------------------
+// JSON → typed payload parsers
 
-// Convert a temperature to Fahrenheit for color threshold comparison.
-// temp: temperature in the given unit system
-// units: "imperial", "metric", or "standard"
-static double
-ow_to_fahrenheit(double temp, const char *units)
+// Weather description from a "weather" JSON array (uses [0]).
+static void
+ow_fill_desc(struct json_object *jweather, char *desc_out, size_t desc_sz,
+    int32_t *cond_id_out)
 {
-  if(strcmp(units, "metric") == 0)
-    return(temp * 9.0 / 5.0 + 32.0);
+  int32_t id = 0;
+  struct json_object *w0;
 
-  if(strcmp(units, "standard") == 0)
-    return((temp - 273.15) * 9.0 / 5.0 + 32.0);
+  desc_out[0] = '\0';
+  *cond_id_out = 0;
 
-  return(temp);
-}
-
-// returns: color prefix string for a temperature in Fahrenheit.
-//          Uses a smooth 8-tier gradient from extreme heat to extreme cold.
-// temp_f: temperature in Fahrenheit
-static const char *
-ow_temp_color(double temp_f)
-{
-  if(temp_f >= 100.0) return(CLR_BOLD CLR_RED);
-  if(temp_f >=  90.0) return(CLR_RED);
-  if(temp_f >=  80.0) return(CLR_ORANGE);
-  if(temp_f >=  70.0) return(CLR_YELLOW);
-  if(temp_f <    0.0) return(CLR_BOLD CLR_PURPLE);
-  if(temp_f <   25.0) return(CLR_BOLD CLR_BLUE);
-  if(temp_f <   40.0) return(CLR_BLUE);
-  if(temp_f <   55.0) return(CLR_CYAN);
-
-  return("");
-}
-
-// Format a colored temperature value into buf.
-// returns: number of bytes written (excluding NUL)
-// buf: output buffer
-// sz: buffer size
-// temp: temperature in the user's unit system
-// units: "imperial", "metric", or "standard"
-static int
-ow_fmt_temp(char *buf, size_t sz, double temp, const char *units)
-{
-  const char *clr = ow_temp_color(ow_to_fahrenheit(temp, units));
-
-  // The bold toggle pair (CLR_BOLD CLR_BOLD) between the color code
-  // and the digit prevents IRC clients from consuming temperature
-  // digits as part of the \003NN color parameter sequence.
-  if(*clr != '\0')
-    return(snprintf(buf, sz, "%s" CLR_BOLD CLR_BOLD "%.0f%s",
-        clr, temp, CLR_RESET));
-
-  return(snprintf(buf, sz, "%.0f", temp));
-}
-
-// -----------------------------------------------------------------------
-// Weather description helper
-// -----------------------------------------------------------------------
-
-// Extract the description string from a "weather" JSON array.
-// returns: description string (pointer into JSON, valid until json_object_put)
-// jweather: the "weather" array from the API response
-static const char *
-ow_get_desc(struct json_object *jweather)
-{
-  if(jweather == NULL || !json_object_is_type(jweather, json_type_array)
+  if(jweather == NULL
+      || !json_object_is_type(jweather, json_type_array)
       || json_object_array_length(jweather) == 0)
-    return("unknown");
+  {
+    snprintf(desc_out, desc_sz, "unknown");
+    return;
+  }
 
-  struct json_object *w0 = json_object_array_get_idx(jweather, 0);
-  struct json_object *jdesc = NULL;
+  w0 = json_object_array_get_idx(jweather, 0);
 
-  if(w0 != NULL && json_object_object_get_ex(w0, "description", &jdesc))
-    return(json_object_get_string(jdesc));
+  if(w0 == NULL)
+  {
+    snprintf(desc_out, desc_sz, "unknown");
+    return;
+  }
 
-  return("unknown");
+  json_get_int(w0, "id", &id);
+  *cond_id_out = id;
+
+  if(!json_get_str(w0, "description", desc_out, desc_sz))
+    snprintf(desc_out, desc_sz, "unknown");
 }
 
-// -----------------------------------------------------------------------
-// Weather condition helpers
-// -----------------------------------------------------------------------
-
-// Extract the weather condition ID from a "weather" JSON array.
-// returns: condition ID (e.g. 800 for clear), or 0 if unavailable
-// jweather: the "weather" array from the API response
-static int
-ow_get_condition_id(struct json_object *jweather)
-{
-  if(jweather == NULL || !json_object_is_type(jweather, json_type_array)
-      || json_object_array_length(jweather) == 0)
-    return(0);
-
-  struct json_object *w0 = json_object_array_get_idx(jweather, 0);
-  struct json_object *jid = NULL;
-
-  if(w0 != NULL && json_object_object_get_ex(w0, "id", &jid))
-    return(json_object_get_int(jid));
-
-  return(0);
-}
-
-// Map a weather condition ID to a Unicode weather emoji (UTF-8).
-// All emoji include VS16 (\xef\xb8\x8f) for consistent 2-cell
-// rendering. Must be placed at the START of each line so variable
-// emoji width does not break column alignment.
-// returns: UTF-8 emoji string
-// id: OpenWeather condition ID (2xx-8xx)
-static const char *
-ow_condition_icon(int id)
-{
-  if(id >= 200 && id < 300)
-    return("\xf0\x9f\x8c\xa9\xef\xb8\x8f");  // 🌩️ thunderstorm
-
-  if(id >= 300 && id < 400)
-    return("\xf0\x9f\x8c\xa7\xef\xb8\x8f");  // 🌧️ drizzle
-
-  if(id >= 500 && id < 600)
-    return("\xf0\x9f\x8c\xa7\xef\xb8\x8f");  // 🌧️ rain
-
-  if(id >= 600 && id < 700)
-    return("\xf0\x9f\x8c\xa8\xef\xb8\x8f");  // 🌨️ snow
-
-  if(id >= 700 && id < 800)
-    return("\xf0\x9f\x8c\xab\xef\xb8\x8f");  // 🌫️ fog/mist/haze
-
-  if(id == 800)
-    return("\xe2\x98\x80\xef\xb8\x8f");       // ☀️  clear
-
-  if(id == 801 || id == 802)
-    return("\xf0\x9f\x8c\xa5\xef\xb8\x8f");  // 🌥️ few/scattered
-
-  if(id >= 803)
-    return("\xf0\x9f\x8c\xa5\xef\xb8\x8f");  // 🌥️ overcast
-
-  return("\xf0\x9f\x8c\xa1\xef\xb8\x8f");    // 🌡️ fallback
-}
-
-// Map a weather condition ID to an abstract color prefix.
-// returns: abstract color marker string (may be empty)
-// id: OpenWeather condition ID
-static const char *
-ow_condition_color(int id)
-{
-  if(id >= 200 && id < 300) return(CLR_RED);        // thunderstorm
-  if(id >= 300 && id < 400) return(CLR_CYAN);       // drizzle
-  if(id >= 500 && id < 600) return(CLR_CYAN);       // rain
-  if(id >= 600 && id < 700) return(CLR_BOLD);       // snow (bold white)
-  if(id >= 700 && id < 800) return(CLR_PURPLE);     // fog/mist/haze
-  if(id == 800)             return(CLR_YELLOW);      // clear sky
-  if(id == 801)             return(CLR_YELLOW);      // few clouds
-  if(id == 802)             return(CLR_GRAY);        // scattered clouds
-  if(id >= 803)             return(CLR_GRAY);        // overcast
-
-  return("");
-}
-
-// -----------------------------------------------------------------------
-// AM/PM time formatting
-// -----------------------------------------------------------------------
-
-// Format a Unix timestamp to h:MMam/pm using the given timezone offset.
-// ts: Unix timestamp
-// tz_offset: timezone offset in seconds from UTC
-// buf: output buffer
-// sz: buffer size
-static void
-ow_format_time_ampm(time_t ts, int tz_offset, char *buf, size_t sz)
-{
-  time_t local = ts + tz_offset;
-  struct tm tm;
-
-  gmtime_r(&local, &tm);
-
-  int h = tm.tm_hour % 12;
-
-  if(h == 0)
-    h = 12;
-
-  snprintf(buf, sz, "%d:%02d%s", h, tm.tm_min,
-      tm.tm_hour < 12 ? "am" : "pm");
-}
-
-// -----------------------------------------------------------------------
-// Shared helpers for weather/forecast handlers
-// -----------------------------------------------------------------------
-
-// Extract timezone_offset from a OneCall JSON root.
-// returns: offset in seconds, or 0 if absent
-// root: parsed OneCall JSON root
-static int
+static int32_t
 ow_get_tz_offset(struct json_object *root)
 {
-  struct json_object *jtz = NULL;
+  int32_t tz = 0;
 
-  json_object_object_get_ex(root, "timezone_offset", &jtz);
-
-  return(jtz ? json_object_get_int(jtz) : 0);
+  json_get_int(root, "timezone_offset", &tz);
+  return(tz);
 }
 
-// Reply with a bold location header line.
-// r: request context
-// subtitle: e.g. "7-day forecast" or "24-hour forecast"
-static void
-ow_reply_header(ow_request_t *r, const char *subtitle)
-{
-  char buf[OW_REPLY_SZ];
-
-  snprintf(buf, sizeof(buf),
-      CLR_BOLD "%s" CLR_RESET " (%s) "
-      "\xe2\x80\x94 " CLR_BOLD "%s" CLR_RESET,
-      r->location_name, r->zipcode, subtitle);
-  ow_reply(r, buf);
-}
-
-// Format a precipitation-chance suffix into buf.
-// Writes an empty string when pop is zero.
-// buf: output buffer
-// sz: buffer size
-// pop: probability of precipitation 0-100
-static void
-ow_fmt_precip(char *buf, size_t sz, int pop)
-{
-  if(pop > 0)
-    snprintf(buf, sz, " " CLR_CYAN "%d%% precip" CLR_RESET, pop);
-  else
-    buf[0] = '\0';
-}
-
-// Pad/truncate a description to a fixed-width column.
-// buf: output buffer (should be at least width+2 bytes)
-// sz: buffer size
-// desc: description string
-// width: column width
-static void
-ow_fmt_desc_pad(char *buf, size_t sz, const char *desc, int width)
-{
-  snprintf(buf, sz, "%-*.*s", width, width, desc);
-}
-
-// Extract hi/lo temperatures from a daily "temp" JSON object.
-// returns: true if both max and min were found
-// jtemp_obj: the "temp" object from a daily entry
-// hi: output high temperature
-// lo: output low temperature
 static bool
 ow_get_hilo(struct json_object *jtemp_obj, double *hi, double *lo)
 {
-  if(jtemp_obj == NULL)
-    return(false);
-
-  struct json_object *jhi = NULL, *jlo = NULL;
-
-  json_object_object_get_ex(jtemp_obj, "max", &jhi);
-  json_object_object_get_ex(jtemp_obj, "min", &jlo);
-
-  if(jhi == NULL || jlo == NULL)
-    return(false);
-
-  *hi = json_object_get_double(jhi);
-  *lo = json_object_get_double(jlo);
-
-  return(true);
+  return(json_get_double(jtemp_obj, "max", hi)
+      && json_get_double(jtemp_obj, "min", lo));
 }
 
-// Reply with weather alerts (up to 3) from a OneCall response.
-// r: request context
-// root: parsed OneCall JSON root
 static void
-ow_reply_alerts(ow_request_t *r, struct json_object *root)
+ow_parse_alerts(struct json_object *root, openweather_alert_set_t *out)
 {
-  struct json_object *jalerts = NULL;
+  int n;
+  int i;
+  struct json_object *jalerts = json_get_array(root, "alerts");
 
-  if(!json_object_object_get_ex(root, "alerts", &jalerts)
-      || !json_object_is_type(jalerts, json_type_array))
+  out->count = 0;
+
+  if(jalerts == NULL)
     return;
 
-  int n = (int)json_object_array_length(jalerts);
-  char buf[OW_REPLY_SZ];
+  n = (int)json_object_array_length(jalerts);
 
-  for(int i = 0; i < n && i < 3; i++)
+  for(i = 0; i < n && out->count < OPENWEATHER_ALERT_MAX; i++)
   {
     struct json_object *alert = json_object_array_get_idx(jalerts, i);
-    struct json_object *jevent = NULL;
+    openweather_alert_t *slot = &out->alerts[out->count];
 
-    if(alert != NULL
-        && json_object_object_get_ex(alert, "event", &jevent))
-    {
-      snprintf(buf, sizeof(buf),
-          "  " CLR_BOLD CLR_RED "\xe2\x9a\xa0" CLR_RESET " "
-          CLR_BOLD CLR_YELLOW "ALERT:" CLR_RESET " %s",
-          json_object_get_string(jevent));
-      ow_reply(r, buf);
-    }
+    if(alert == NULL)
+      continue;
+
+    slot->event[0] = '\0';
+
+    if(json_get_str(alert, "event", slot->event, sizeof(slot->event)))
+      out->count++;
   }
 }
 
-// -----------------------------------------------------------------------
-// OnCall response handler: !weather
-// -----------------------------------------------------------------------
-
-// Parse current weather from a OneCall response and reply.
-// Two-line display with weather emoji, color-coded temperatures,
-// and hi/lo from daily data when available.
-// r: request context
-// root: parsed JSON root object
 static void
-ow_handle_weather(ow_request_t *r, struct json_object *root)
+ow_parse_current(ow_request_t *r, struct json_object *root,
+    openweather_current_result_t *out)
 {
-  struct json_object *current = NULL;
+  int64_t sunrise_ts = 0;
+  int64_t sunset_ts = 0;
+  double temp = 0.0;
+  double feels = 0.0;
+  double wind = 0.0;
+  double wind_d = 0.0;
+  int32_t humidity = 0;
+  int32_t tz_offset;
+  double hi = 0.0;
+  double lo = 0.0;
+  bool have_hilo = false;
+  struct json_object *current = json_get_obj(root, "current");
+  struct json_object *jweather;
+  struct json_object *daily;
 
-  if(!json_object_object_get_ex(root, "current", &current))
+  memset(out, 0, sizeof(*out));
+
+  if(current == NULL)
   {
-    ow_reply(r, "Error: no current weather data in response");
+    snprintf(out->err, sizeof(out->err),
+        "Error: no current weather data in response");
     return;
   }
 
-  struct json_object *jtemp = NULL, *jfeels = NULL, *jhumid = NULL;
-  struct json_object *jwind = NULL, *jwind_deg = NULL;
-  struct json_object *jsunrise = NULL, *jsunset = NULL;
-  struct json_object *jweather = NULL;
+  json_get_double(current, "temp",       &temp);
+  json_get_double(current, "feels_like", &feels);
+  json_get_int   (current, "humidity",   &humidity);
+  json_get_double(current, "wind_speed", &wind);
+  json_get_double(current, "wind_deg",   &wind_d);
+  json_get_int64 (current, "sunrise",    &sunrise_ts);
+  json_get_int64 (current, "sunset",     &sunset_ts);
 
-  json_object_object_get_ex(current, "temp", &jtemp);
-  json_object_object_get_ex(current, "feels_like", &jfeels);
-  json_object_object_get_ex(current, "humidity", &jhumid);
-  json_object_object_get_ex(current, "wind_speed", &jwind);
-  json_object_object_get_ex(current, "wind_deg", &jwind_deg);
-  json_object_object_get_ex(current, "sunrise", &jsunrise);
-  json_object_object_get_ex(current, "sunset", &jsunset);
-  json_object_object_get_ex(current, "weather", &jweather);
+  jweather = json_get_array(current, "weather");
+  tz_offset = ow_get_tz_offset(root);
 
-  double temp      = jtemp     ? json_object_get_double(jtemp)     : 0.0;
-  double feels     = jfeels    ? json_object_get_double(jfeels)    : 0.0;
-  int    humidity  = jhumid    ? json_object_get_int(jhumid)       : 0;
-  double wind      = jwind     ? json_object_get_double(jwind)     : 0.0;
-  double wind_d    = jwind_deg ? json_object_get_double(jwind_deg) : 0.0;
-  int    tz_offset = ow_get_tz_offset(root);
+  // Try to extract today's hi/lo from daily[0].
+  daily = json_get_array(root, "daily");
 
-  const char *desc = ow_get_desc(jweather);
-  int cond_id      = ow_get_condition_id(jweather);
-
-  // Sunrise / sunset as AM/PM.
-  char sunrise[12] = "?", sunset[12] = "?";
-
-  if(jsunrise != NULL)
-    ow_format_time_ampm(json_object_get_int64(jsunrise), tz_offset,
-        sunrise, sizeof(sunrise));
-
-  if(jsunset != NULL)
-    ow_format_time_ampm(json_object_get_int64(jsunset), tz_offset,
-        sunset, sizeof(sunset));
-
-  const char *tu   = ow_temp_unit(r->units);
-  const char *su   = ow_speed_unit(r->units);
-  const char *icon = ow_condition_icon(cond_id);
-  const char *dclr = ow_condition_color(cond_id);
-
-  // Format colored temperatures.
-  char ct[32], cf[32];
-
-  ow_fmt_temp(ct, sizeof(ct), temp, r->units);
-  ow_fmt_temp(cf, sizeof(cf), feels, r->units);
-
-  char buf[OW_REPLY_SZ];
-
-  // Try to extract today's hi/lo from daily data.
-  double hi = 0.0, lo = 0.0;
-  bool have_hilo = false;
-  struct json_object *daily = NULL;
-
-  if(json_object_object_get_ex(root, "daily", &daily)
-      && json_object_is_type(daily, json_type_array)
-      && json_object_array_length(daily) > 0)
+  if(daily != NULL && json_object_array_length(daily) > 0)
   {
     struct json_object *today = json_object_array_get_idx(daily, 0);
-    struct json_object *jtemp_obj = NULL;
+    struct json_object *jtemp_obj = json_get_obj(today, "temp");
 
-    if(today != NULL
-        && json_object_object_get_ex(today, "temp", &jtemp_obj))
-      have_hilo = ow_get_hilo(jtemp_obj, &hi, &lo);
+    have_hilo = ow_get_hilo(jtemp_obj, &hi, &lo);
   }
 
-  // --- Line 1: icon + location + condition + temperature ---
-  //
-  // ☀️  Springfield (45069) — clear sky · 79°F (feels 79°F)
-  snprintf(buf, sizeof(buf),
-      "%s " CLR_BOLD "%s" CLR_RESET " (%s) "
-      "\xe2\x80\x94 %s%s" CLR_RESET
-      " " CLR_GRAY "\xc2\xb7" CLR_RESET " "
-      "%s\xc2\xb0%s (feels %s\xc2\xb0%s)",
-      icon, r->location_name, r->zipcode,
-      dclr, desc,
-      ct, tu, cf, tu);
+  out->current.temp       = temp;
+  out->current.feels_like = feels;
+  out->current.wind_speed = wind;
+  out->current.wind_deg   = wind_d;
+  out->current.humidity   = humidity;
+  out->current.sunrise    = (time_t)sunrise_ts;
+  out->current.sunset     = (time_t)sunset_ts;
+  out->current.tz_offset  = tz_offset;
+  out->current.have_hilo  = have_hilo;
+  out->current.temp_hi    = hi;
+  out->current.temp_lo    = lo;
 
-  ow_reply(r, buf);
+  ow_fill_desc(jweather, out->current.condition_desc,
+      sizeof(out->current.condition_desc), &out->current.condition_id);
 
-  // --- Line 2: hi/lo + humidity + wind + sunrise/sunset ---
-  //
-  // With hi/lo:
-  //   Hi 85°/Lo 62° · Humidity 45% · Wind 12mph SSW · ☀ 7:20am ☽ 8:01pm
-  //
-  // Without hi/lo:
-  //   Humidity 45% · Wind 12mph SSW · ☀ 7:20am ☽ 8:01pm
-  if(have_hilo)
-  {
-    char chi[32], clo[32];
+  snprintf(out->current.place_name, sizeof(out->current.place_name),
+      "%s", r->location_name);
+  snprintf(out->current.zipcode, sizeof(out->current.zipcode),
+      "%s", r->zipcode);
+  snprintf(out->current.units, sizeof(out->current.units),
+      "%s", r->units);
 
-    ow_fmt_temp(chi, sizeof(chi), hi, r->units);
-    ow_fmt_temp(clo, sizeof(clo), lo, r->units);
-
-    snprintf(buf, sizeof(buf),
-        "  Hi %s\xc2\xb0/Lo %s\xc2\xb0%s"
-        " " CLR_GRAY "\xc2\xb7" CLR_RESET " "
-        CLR_CYAN "Humidity" CLR_RESET " %d%%"
-        " " CLR_GRAY "\xc2\xb7" CLR_RESET " "
-        CLR_GREEN "Wind" CLR_RESET " %.0f%s %s"
-        " " CLR_GRAY "\xc2\xb7" CLR_RESET " "
-        CLR_YELLOW "Rise" CLR_RESET " %s "
-        CLR_PURPLE "Set" CLR_RESET " %s",
-        chi, clo, tu,
-        humidity,
-        wind, su, ow_wind_dir(wind_d),
-        sunrise, sunset);
-  }
-  else
-  {
-    snprintf(buf, sizeof(buf),
-        "  "
-        CLR_CYAN "Humidity" CLR_RESET " %d%%"
-        " " CLR_GRAY "\xc2\xb7" CLR_RESET " "
-        CLR_GREEN "Wind" CLR_RESET " %.0f%s %s"
-        " " CLR_GRAY "\xc2\xb7" CLR_RESET " "
-        CLR_YELLOW "Rise" CLR_RESET " %s "
-        CLR_PURPLE "Set" CLR_RESET " %s",
-        humidity,
-        wind, su, ow_wind_dir(wind_d),
-        sunrise, sunset);
-  }
-
-  ow_reply(r, buf);
-
-  // --- Alerts (if any) ---
-  ow_reply_alerts(r, root);
+  ow_parse_alerts(root, &out->alerts);
 }
 
-// -----------------------------------------------------------------------
-// OnCall response handler: !forecast
-// -----------------------------------------------------------------------
-
-// Parse daily forecast from a OneCall response and reply.
-// Uses weather emoji, color-coded hi/lo temps, aligned columns,
-// humidity, wind, and precipitation chance.
-// r: request context
-// root: parsed JSON root object
 static void
-ow_handle_forecast(ow_request_t *r, struct json_object *root)
+ow_parse_forecast_daily(ow_request_t *r, struct json_object *root,
+    openweather_forecast_result_t *out)
 {
-  struct json_object *daily = NULL;
+  int n;
+  int i;
+  int32_t tz_offset;
+  struct json_object *daily = json_get_array(root, "daily");
 
-  if(!json_object_object_get_ex(root, "daily", &daily)
-      || !json_object_is_type(daily, json_type_array))
+  memset(out, 0, sizeof(*out));
+
+  if(daily == NULL)
   {
-    ow_reply(r, "Error: no daily forecast data in response");
+    snprintf(out->err, sizeof(out->err),
+        "Error: no daily forecast data in response");
     return;
   }
 
-  const char *tu = ow_temp_unit(r->units);
-  const char *su = ow_speed_unit(r->units);
-  int n = (int)json_object_array_length(daily);
+  tz_offset = ow_get_tz_offset(root);
+  n = (int)json_object_array_length(daily);
 
-  ow_reply_header(r, "7-day forecast");
+  out->forecast.tz_offset = tz_offset;
+  snprintf(out->forecast.place_name, sizeof(out->forecast.place_name),
+      "%s", r->location_name);
+  snprintf(out->forecast.zipcode, sizeof(out->forecast.zipcode),
+      "%s", r->zipcode);
+  snprintf(out->forecast.units, sizeof(out->forecast.units),
+      "%s", r->units);
 
-  static const char *day_names[] = {
-    "Sunday", "Monday", "Tuesday", "Wednesday",
-    "Thursday", "Friday", "Saturday"
-  };
-
-  int tz_offset = ow_get_tz_offset(root);
-
-  // Show up to 7 days.
-  for(int i = 0; i < n && i < 7; i++)
+  for(i = 0; i < n && out->forecast.day_count < OPENWEATHER_FCAST_DAYS; i++)
   {
+    int64_t dt_ts = 0;
+    double wind = 0.0;
+    double wdir = 0.0;
+    double pop = 0.0;
+    int32_t humid = 0;
+    double hi = 0.0;
+    double lo = 0.0;
+    openweather_forecast_day_t *slot;
     struct json_object *day = json_object_array_get_idx(daily, i);
+    struct json_object *jtemp_obj;
+    struct json_object *jweather;
 
     if(day == NULL)
       continue;
 
-    struct json_object *jdt = NULL, *jtemp_obj = NULL;
-    struct json_object *jweather = NULL, *jhumid = NULL;
-    struct json_object *jwind = NULL, *jwind_deg = NULL;
-    struct json_object *jpop = NULL;
+    json_get_int64 (day, "dt",         &dt_ts);
+    json_get_int   (day, "humidity",   &humid);
+    json_get_double(day, "wind_speed", &wind);
+    json_get_double(day, "wind_deg",   &wdir);
+    json_get_double(day, "pop",        &pop);
 
-    json_object_object_get_ex(day, "dt", &jdt);
-    json_object_object_get_ex(day, "temp", &jtemp_obj);
-    json_object_object_get_ex(day, "weather", &jweather);
-    json_object_object_get_ex(day, "humidity", &jhumid);
-    json_object_object_get_ex(day, "wind_speed", &jwind);
-    json_object_object_get_ex(day, "wind_deg", &jwind_deg);
-    json_object_object_get_ex(day, "pop", &jpop);
-
-    // Day name.
-    const char *day_name = "???";
-
-    if(jdt != NULL)
-    {
-      time_t dt = json_object_get_int64(jdt) + tz_offset;
-      struct tm tm;
-
-      gmtime_r(&dt, &tm);
-      day_name = day_names[tm.tm_wday];
-    }
-
-    // Temperature high/low.
-    double hi = 0.0, lo = 0.0;
+    jtemp_obj = json_get_obj  (day, "temp");
+    jweather  = json_get_array(day, "weather");
 
     if(!ow_get_hilo(jtemp_obj, &hi, &lo))
     {
@@ -769,190 +398,110 @@ ow_handle_forecast(ow_request_t *r, struct json_object *root)
       lo = 0.0;
     }
 
-    const char *desc  = ow_get_desc(jweather);
-    int    cond_id    = ow_get_condition_id(jweather);
-    int    humid      = jhumid    ? json_object_get_int(jhumid)       : 0;
-    double wind       = jwind     ? json_object_get_double(jwind)     : 0.0;
-    double wdir       = jwind_deg ? json_object_get_double(jwind_deg) : 0.0;
-    int    pop        = jpop ? (int)(json_object_get_double(jpop) * 100) : 0;
+    slot = &out->forecast.days[out->forecast.day_count];
 
-    const char *icon  = ow_condition_icon(cond_id);
-    const char *dclr  = ow_condition_color(cond_id);
+    slot->dt         = (time_t)dt_ts;
+    slot->temp_hi    = hi;
+    slot->temp_lo    = lo;
+    slot->wind_speed = wind;
+    slot->wind_deg   = wdir;
+    slot->pop        = pop;
+    slot->humidity   = humid;
 
-    // Format colored hi/lo temperatures.
-    char chi[32], clo[32];
+    ow_fill_desc(jweather, slot->condition_desc,
+        sizeof(slot->condition_desc), &slot->condition_id);
 
-    ow_fmt_temp(chi, sizeof(chi), hi, r->units);
-    ow_fmt_temp(clo, sizeof(clo), lo, r->units);
-
-    char desc_pad[24];
-
-    ow_fmt_desc_pad(desc_pad, sizeof(desc_pad), desc, 22);
-
-    char precip[24];
-
-    ow_fmt_precip(precip, sizeof(precip), pop);
-
-    // Icon at line start for consistent emoji width handling.
-    // 🌧️ Thursday   79/49°F  light rain            60%  17mph SSW 100% precip
-    char buf[OW_REPLY_SZ];
-
-    snprintf(buf, sizeof(buf),
-        "%s %-9.9s  %s/%s\xc2\xb0%s"
-        "  %s%s" CLR_RESET
-        "  %2d%%"
-        "  %2.0f%s %-3s"
-        "%s",
-        icon, day_name, chi, clo, tu,
-        dclr, desc_pad,
-        humid,
-        wind, su, ow_wind_dir(wdir),
-        precip);
-
-    ow_reply(r, buf);
+    out->forecast.day_count++;
   }
+
+  ow_parse_alerts(root, &out->alerts);
 }
 
-// -----------------------------------------------------------------------
-// OnCall response handler: !forecast -h (hourly)
-// -----------------------------------------------------------------------
-
-// Parse hourly forecast from a OneCall response and reply.
-// Uses weather emoji, color-coded temperatures, and aligned columns.
-// r: request context
-// root: parsed JSON root object
 static void
-ow_handle_forecast_hourly(ow_request_t *r, struct json_object *root)
+ow_parse_forecast_hourly(ow_request_t *r, struct json_object *root,
+    openweather_forecast_result_t *out)
 {
-  struct json_object *hourly = NULL;
+  int n;
+  int i;
+  int32_t tz_offset;
+  struct json_object *hourly = json_get_array(root, "hourly");
 
-  if(!json_object_object_get_ex(root, "hourly", &hourly)
-      || !json_object_is_type(hourly, json_type_array))
+  memset(out, 0, sizeof(*out));
+
+  if(hourly == NULL)
   {
-    ow_reply(r, "Error: no hourly forecast data in response");
+    snprintf(out->err, sizeof(out->err),
+        "Error: no hourly forecast data in response");
     return;
   }
 
-  const char *tu = ow_temp_unit(r->units);
-  const char *su = ow_speed_unit(r->units);
-  int n = (int)json_object_array_length(hourly);
+  tz_offset = ow_get_tz_offset(root);
+  n = (int)json_object_array_length(hourly);
 
-  ow_reply_header(r, "24-hour forecast");
+  out->forecast.tz_offset = tz_offset;
+  snprintf(out->forecast.place_name, sizeof(out->forecast.place_name),
+      "%s", r->location_name);
+  snprintf(out->forecast.zipcode, sizeof(out->forecast.zipcode),
+      "%s", r->zipcode);
+  snprintf(out->forecast.units, sizeof(out->forecast.units),
+      "%s", r->units);
 
-  static const char *day_names[] = {
-    "Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"
-  };
-
-  int tz_offset = ow_get_tz_offset(root);
-  int prev_wday = -1;
-
-  // Show up to 24 hours.
-  for(int i = 0; i < n && i < 24; i++)
+  for(i = 0; i < n && out->forecast.hour_count < OPENWEATHER_FCAST_HOURS; i++)
   {
+    int64_t dt_ts = 0;
+    double temp = 0.0;
+    double wind = 0.0;
+    double wdir = 0.0;
+    double pop = 0.0;
+    int32_t humid = 0;
+    openweather_forecast_hour_t *slot;
     struct json_object *hour = json_object_array_get_idx(hourly, i);
+    struct json_object *jweather;
 
     if(hour == NULL)
       continue;
 
-    struct json_object *jdt = NULL, *jtemp = NULL;
-    struct json_object *jweather = NULL, *jhumid = NULL;
-    struct json_object *jwind = NULL, *jwind_deg = NULL;
-    struct json_object *jpop = NULL;
+    json_get_int64 (hour, "dt",         &dt_ts);
+    json_get_double(hour, "temp",       &temp);
+    json_get_int   (hour, "humidity",   &humid);
+    json_get_double(hour, "wind_speed", &wind);
+    json_get_double(hour, "wind_deg",   &wdir);
+    json_get_double(hour, "pop",        &pop);
 
-    json_object_object_get_ex(hour, "dt", &jdt);
-    json_object_object_get_ex(hour, "temp", &jtemp);
-    json_object_object_get_ex(hour, "weather", &jweather);
-    json_object_object_get_ex(hour, "humidity", &jhumid);
-    json_object_object_get_ex(hour, "wind_speed", &jwind);
-    json_object_object_get_ex(hour, "wind_deg", &jwind_deg);
-    json_object_object_get_ex(hour, "pop", &jpop);
+    jweather = json_get_array(hour, "weather");
 
-    // Format local time.
-    const char *day_name = "???";
-    char time_str[8] = "??";
+    slot = &out->forecast.hours[out->forecast.hour_count];
 
-    if(jdt != NULL)
-    {
-      time_t dt = json_object_get_int64(jdt) + tz_offset;
-      struct tm tm;
+    slot->dt         = (time_t)dt_ts;
+    slot->temp       = temp;
+    slot->wind_speed = wind;
+    slot->wind_deg   = wdir;
+    slot->pop        = pop;
+    slot->humidity   = humid;
 
-      gmtime_r(&dt, &tm);
-      day_name = day_names[tm.tm_wday];
+    ow_fill_desc(jweather, slot->condition_desc,
+        sizeof(slot->condition_desc), &slot->condition_id);
 
-      int h = tm.tm_hour % 12;
-
-      if(h == 0) h = 12;
-      snprintf(time_str, sizeof(time_str), "%2d%s",
-          h, tm.tm_hour < 12 ? "am" : "pm");
-
-      // Insert a blank line at day boundary.
-      if(prev_wday >= 0 && tm.tm_wday != prev_wday)
-        ow_reply(r, " ");
-
-      prev_wday = tm.tm_wday;
-    }
-
-    double temp    = jtemp     ? json_object_get_double(jtemp)     : 0.0;
-    int    humid   = jhumid    ? json_object_get_int(jhumid)       : 0;
-    double wind    = jwind     ? json_object_get_double(jwind)     : 0.0;
-    double wdir    = jwind_deg ? json_object_get_double(jwind_deg) : 0.0;
-    int    pop     = jpop      ? (int)(json_object_get_double(jpop) * 100) : 0;
-    int    cond_id = ow_get_condition_id(jweather);
-
-    const char *desc = ow_get_desc(jweather);
-    const char *icon = ow_condition_icon(cond_id);
-    const char *dclr = ow_condition_color(cond_id);
-
-    // Format colored temperature.
-    char ct[32];
-
-    ow_fmt_temp(ct, sizeof(ct), temp, r->units);
-
-    char desc_pad[24];
-
-    ow_fmt_desc_pad(desc_pad, sizeof(desc_pad), desc, 20);
-
-    char precip[24];
-
-    ow_fmt_precip(precip, sizeof(precip), pop);
-
-    char buf[OW_REPLY_SZ];
-
-    snprintf(buf, sizeof(buf),
-        "%s %s %s  %s\xc2\xb0%s"
-        "  %s%s" CLR_RESET
-        "  %2d%%"
-        "  %2.0f%s %-3s"
-        "%s",
-        icon, day_name, time_str, ct, tu,
-        dclr, desc_pad,
-        humid,
-        wind, su, ow_wind_dir(wdir),
-        precip);
-
-    ow_reply(r, buf);
+    out->forecast.hour_count++;
   }
+
+  ow_parse_alerts(root, &out->alerts);
 }
 
-// -----------------------------------------------------------------------
-// Step 2: submit OneCall API request
-// -----------------------------------------------------------------------
+// OneCall submit + completion
 
-// Build the OneCall URL and submit an async GET.
-// r: request with lat/lon populated
 static void
 ow_submit_onecall(ow_request_t *r)
 {
-  const char *exclude;
+  char url[OW_URL_SZ];
+  const char *exclude = "minutely,hourly";
 
   switch(r->type)
   {
-    case OW_REQ_WEATHER:          exclude = "minutely,hourly";          break;
-    case OW_REQ_FORECAST:         exclude = "minutely,hourly,current"; break;
+    case OW_REQ_WEATHER:          exclude = "minutely,hourly";         break;
+    case OW_REQ_FORECAST_DAILY:   exclude = "minutely,hourly,current"; break;
     case OW_REQ_FORECAST_HOURLY:  exclude = "minutely,daily,current";  break;
   }
-
-  char url[OW_URL_SZ];
 
   snprintf(url, sizeof(url),
       "%s?lat=%.6f&lon=%.6f&exclude=%s&units=%s&appid=%s",
@@ -961,64 +510,83 @@ ow_submit_onecall(ow_request_t *r)
 
   if(curl_get(url, ow_onecall_done, r) != SUCCESS)
   {
-    ow_reply(r, "Error: failed to submit weather request");
+    if(r->type == OW_REQ_WEATHER)
+      ow_deliver_current_err(r, "Error: failed to submit weather request");
+    else
+      ow_deliver_forecast_err(r, "Error: failed to submit weather request");
+
     ow_req_release(r);
   }
 }
 
-// -----------------------------------------------------------------------
-// Step 2 callback: OneCall API response
-// -----------------------------------------------------------------------
-
-// Handle the OneCall API response, parse JSON, dispatch to weather
-// or forecast handler.
-// resp: curl response
 static void
 ow_onecall_done(const curl_response_t *resp)
 {
+  struct json_object *root;
+  char errbuf[128];
   ow_request_t *r = (ow_request_t *)resp->user_data;
+  bool is_current = (r->type == OW_REQ_WEATHER);
 
   if(resp->curl_code != 0)
   {
-    char buf[OW_REPLY_SZ];
+    snprintf(errbuf, sizeof(errbuf), "Weather API error: %s", resp->error);
 
-    snprintf(buf, sizeof(buf), "Weather API error: %s", resp->error);
-    ow_reply(r, buf);
+    if(is_current)
+      ow_deliver_current_err(r, errbuf);
+    else
+      ow_deliver_forecast_err(r, errbuf);
+
     ow_req_release(r);
     return;
   }
 
   if(resp->status == 401)
   {
-    ow_reply(r, "Error: invalid API key");
+    if(is_current)
+      ow_deliver_current_err(r, "Error: invalid API key");
+    else
+      ow_deliver_forecast_err(r, "Error: invalid API key");
+
     ow_req_release(r);
     return;
   }
 
   if(resp->status == 429)
   {
-    ow_reply(r, "Error: API rate limit exceeded, try again later");
+    if(is_current)
+      ow_deliver_current_err(r,
+          "Error: API rate limit exceeded, try again later");
+    else
+      ow_deliver_forecast_err(r,
+          "Error: API rate limit exceeded, try again later");
+
     ow_req_release(r);
     return;
   }
 
   if(resp->status != 200)
   {
-    char buf[OW_REPLY_SZ];
+    snprintf(errbuf, sizeof(errbuf),
+        "Weather API returned HTTP %ld", resp->status);
 
-    snprintf(buf, sizeof(buf), "Weather API returned HTTP %ld",
-        resp->status);
-    ow_reply(r, buf);
+    if(is_current)
+      ow_deliver_current_err(r, errbuf);
+    else
+      ow_deliver_forecast_err(r, errbuf);
+
     ow_req_release(r);
     return;
   }
 
-  // Parse JSON.
-  struct json_object *root = json_tokener_parse(resp->body);
+  root = json_parse_buf(resp->body, resp->body_len, OW_CTX);
 
   if(root == NULL)
   {
-    ow_reply(r, "Error: malformed JSON from weather API");
+    if(is_current)
+      ow_deliver_current_err(r, "Error: malformed JSON from weather API");
+    else
+      ow_deliver_forecast_err(r, "Error: malformed JSON from weather API");
+
     ow_req_release(r);
     return;
   }
@@ -1026,109 +594,140 @@ ow_onecall_done(const curl_response_t *resp)
   switch(r->type)
   {
     case OW_REQ_WEATHER:
-      ow_handle_weather(r, root);
-      break;
+    {
+      openweather_current_result_t res;
 
-    case OW_REQ_FORECAST:
-      ow_handle_forecast(r, root);
+      ow_parse_current(r, root, &res);
+
+      if(r->cb.current != NULL)
+        r->cb.current(&res, r->user);
       break;
+    }
+
+    case OW_REQ_FORECAST_DAILY:
+    {
+      openweather_forecast_result_t res;
+
+      ow_parse_forecast_daily(r, root, &res);
+
+      if(r->cb.forecast != NULL)
+        r->cb.forecast(&res, r->user);
+      break;
+    }
 
     case OW_REQ_FORECAST_HOURLY:
-      ow_handle_forecast_hourly(r, root);
+    {
+      openweather_forecast_result_t res;
+
+      ow_parse_forecast_hourly(r, root, &res);
+
+      if(r->cb.forecast != NULL)
+        r->cb.forecast(&res, r->user);
       break;
+    }
   }
 
   json_object_put(root);
   ow_req_release(r);
 }
 
-// -----------------------------------------------------------------------
-// Step 1 callback: Geocoding API response
-// -----------------------------------------------------------------------
-
-// Handle the geocoding response, parse lat/lon, cache result,
-// then submit the OneCall request.
-// resp: curl response
 static void
 ow_geocode_done(const curl_response_t *resp)
 {
+  struct json_object *root;
+  bool have_lat;
+  bool have_lon;
+  char errbuf[128];
   ow_request_t *r = (ow_request_t *)resp->user_data;
+  bool is_current = (r->type == OW_REQ_WEATHER);
 
   if(resp->curl_code != 0)
   {
-    char buf[OW_REPLY_SZ];
+    snprintf(errbuf, sizeof(errbuf), "Geocoding error: %s", resp->error);
 
-    snprintf(buf, sizeof(buf), "Geocoding error: %s", resp->error);
-    ow_reply(r, buf);
+    if(is_current)
+      ow_deliver_current_err(r, errbuf);
+    else
+      ow_deliver_forecast_err(r, errbuf);
+
     ow_req_release(r);
     return;
   }
 
   if(resp->status == 401)
   {
-    ow_reply(r, "Error: invalid API key");
+    if(is_current)
+      ow_deliver_current_err(r, "Error: invalid API key");
+    else
+      ow_deliver_forecast_err(r, "Error: invalid API key");
+
     ow_req_release(r);
     return;
   }
 
   if(resp->status == 404)
   {
-    char buf[OW_REPLY_SZ];
+    snprintf(errbuf, sizeof(errbuf),
+        "Zipcode %s not found", r->zipcode);
 
-    snprintf(buf, sizeof(buf), "Zipcode %s not found", r->zipcode);
-    ow_reply(r, buf);
+    if(is_current)
+      ow_deliver_current_err(r, errbuf);
+    else
+      ow_deliver_forecast_err(r, errbuf);
+
     ow_req_release(r);
     return;
   }
 
   if(resp->status != 200)
   {
-    char buf[OW_REPLY_SZ];
+    snprintf(errbuf, sizeof(errbuf),
+        "Geocoding API returned HTTP %ld", resp->status);
 
-    snprintf(buf, sizeof(buf), "Geocoding API returned HTTP %ld",
-        resp->status);
-    ow_reply(r, buf);
+    if(is_current)
+      ow_deliver_current_err(r, errbuf);
+    else
+      ow_deliver_forecast_err(r, errbuf);
+
     ow_req_release(r);
     return;
   }
 
-  // Parse geocoding JSON.
-  struct json_object *root = json_tokener_parse(resp->body);
+  root = json_parse_buf(resp->body, resp->body_len, OW_CTX);
 
   if(root == NULL)
   {
-    ow_reply(r, "Error: malformed JSON from geocoding API");
+    if(is_current)
+      ow_deliver_current_err(r, "Error: malformed JSON from geocoding API");
+    else
+      ow_deliver_forecast_err(r, "Error: malformed JSON from geocoding API");
+
     ow_req_release(r);
     return;
   }
 
-  struct json_object *jlat = NULL, *jlon = NULL, *jname = NULL;
+  have_lat = json_get_double(root, "lat", &r->lat);
+  have_lon = json_get_double(root, "lon", &r->lon);
 
-  json_object_object_get_ex(root, "lat", &jlat);
-  json_object_object_get_ex(root, "lon", &jlon);
-  json_object_object_get_ex(root, "name", &jname);
-
-  if(jlat == NULL || jlon == NULL)
+  if(!have_lat || !have_lon)
   {
-    ow_reply(r, "Error: geocoding response missing lat/lon");
     json_object_put(root);
+
+    if(is_current)
+      ow_deliver_current_err(r,
+          "Error: geocoding response missing lat/lon");
+    else
+      ow_deliver_forecast_err(r,
+          "Error: geocoding response missing lat/lon");
+
     ow_req_release(r);
     return;
   }
 
-  r->lat = json_object_get_double(jlat);
-  r->lon = json_object_get_double(jlon);
-
-  const char *name = "";
-
-  if(jname != NULL)
-    name = json_object_get_string(jname);
-
-  snprintf(r->location_name, sizeof(r->location_name), "%s", name);
+  json_get_str(root, "name", r->location_name, sizeof(r->location_name));
 
   json_object_put(root);
 
-  // Cache the geocode result.
   pthread_mutex_lock(&ow_geo_cache_mu);
   ow_geo_insert(r->zipcode, r->lat, r->lon, r->location_name);
   pthread_mutex_unlock(&ow_geo_cache_mu);
@@ -1136,88 +735,67 @@ ow_geocode_done(const curl_response_t *resp)
   clam(CLAM_DEBUG2, OW_CTX, "geocode %s -> %s (%.4f, %.4f) [cached]",
       r->zipcode, r->location_name, r->lat, r->lon);
 
-  // Step 2: query OneCall API.
   ow_submit_onecall(r);
 }
 
-// -----------------------------------------------------------------------
-// Common command handler: validates args, starts geocode chain
-// -----------------------------------------------------------------------
-
-// Validate arguments, check API key, check geocode cache, and either
-// skip straight to the OneCall request or start the geocode chain.
-// ctx: command context (valid only for duration of this call)
-// type: weather or forecast
-static void
-ow_cmd_common(const cmd_ctx_t *ctx, ow_req_type_t type)
+// Populate a freshly-allocated request with api key / units / cached
+// or fresh geocode. Returns SUCCESS if ow_submit_onecall has already
+// been scheduled (cache hit), FAIL on any setup error, and leaves the
+// caller to kick off the geocode leg on a cache miss.
+//
+// Protocol:
+//   SUCCESS + r scheduled  — onecall already in flight
+//   FAIL                   — caller MUST release r and report error
+//   other (returns bool)   — geocode needed, caller submits it
+//
+// Simpler to express as three explicit states; see public fetch fns.
+typedef enum
 {
-  const char *zipcode = NULL;
+  OW_PREP_ERR,
+  OW_PREP_CACHE_HIT,
+  OW_PREP_NEED_GEOCODE
+} ow_prep_result_t;
 
-  // When called from a command with an arg spec (weather), use parsed args.
-  // When called from forecast (no spec), fall back to manual validation.
-  if(ctx->parsed != NULL)
+static ow_prep_result_t
+ow_prepare_request(ow_request_t *r, const char *zipcode,
+    char *errbuf, size_t errsz)
+{
+  const char *apikey;
+  const char *units;
+  ow_geocache_t *cached;
+
+  if(zipcode == NULL || zipcode[0] == '\0')
   {
-    zipcode = ctx->parsed->argv[0];
-  }
-  else
-  {
-    if(ctx->args == NULL || ctx->args[0] == '\0')
-    {
-      if(type == OW_REQ_WEATHER)
-        cmd_reply(ctx, "Usage: weather <zipcode>");
-      else
-        cmd_reply(ctx, "Usage: forecast [-h] <zipcode>");
-      return;
-    }
-
-    // Validate zipcode format before any API calls.
-    if(!ow_validate_zipcode(ctx->args))
-    {
-      if(type == OW_REQ_WEATHER)
-        cmd_reply(ctx, "Invalid zipcode. Usage: weather <zipcode>");
-      else
-        cmd_reply(ctx, "Invalid zipcode. Usage: forecast [-h] <zipcode>");
-      return;
-    }
-
-    zipcode = ctx->args;
+    snprintf(errbuf, errsz, "Error: missing zipcode");
+    return(OW_PREP_ERR);
   }
 
-  // Check API key.
-  const char *apikey = kv_get_str("plugin.openweather.apikey");
+  if(!ow_validate_zipcode(zipcode))
+  {
+    snprintf(errbuf, errsz, "Error: invalid zipcode");
+    return(OW_PREP_ERR);
+  }
+
+  apikey = kv_get_str("plugin.openweather.apikey");
 
   if(apikey == NULL || apikey[0] == '\0')
   {
-    cmd_reply(ctx,
+    snprintf(errbuf, errsz,
         "Error: OpenWeather API key not configured. "
         "Set plugin.openweather.apikey via /set");
-    return;
+    return(OW_PREP_ERR);
   }
 
-  // Allocate request and save command context.
-  ow_request_t *r = ow_req_alloc();
-
-  r->type = type;
   snprintf(r->zipcode, sizeof(r->zipcode), "%s", zipcode);
-  snprintf(r->apikey, sizeof(r->apikey), "%s", apikey);
+  snprintf(r->apikey,  sizeof(r->apikey),  "%s", apikey);
 
-  const char *units = kv_get_str("plugin.openweather.units");
+  units = kv_get_str("plugin.openweather.units");
 
   snprintf(r->units, sizeof(r->units), "%s",
       (units != NULL && units[0] != '\0') ? units : "imperial");
 
-  // Deep-copy the command context.  The args and username pointers
-  // reference the cmd_task_data_t which is freed after this callback
-  // returns, so NULL them out (zipcode is already in r->zipcode).
-  memcpy(&r->msg, ctx->msg, sizeof(r->msg));
-  r->ctx.bot      = ctx->bot;
-  r->ctx.msg      = &r->msg;
-  r->ctx.args     = NULL;
-  r->ctx.username = NULL;
-
-  // Check geocode cache before making an API call.
   pthread_mutex_lock(&ow_geo_cache_mu);
-  ow_geocache_t *cached = ow_geo_lookup(r->zipcode);
+  cached = ow_geo_lookup(r->zipcode);
 
   if(cached != NULL)
   {
@@ -1230,127 +808,924 @@ ow_cmd_common(const cmd_ctx_t *ctx, ow_req_type_t type)
     clam(CLAM_DEBUG2, OW_CTX, "geocode %s -> %s (%.4f, %.4f) [cache hit]",
         r->zipcode, r->location_name, r->lat, r->lon);
 
-    // Skip step 1, go directly to OneCall.
-    ow_submit_onecall(r);
-    return;
+    return(OW_PREP_CACHE_HIT);
   }
 
   pthread_mutex_unlock(&ow_geo_cache_mu);
+  return(OW_PREP_NEED_GEOCODE);
+}
 
-  // Step 1: geocode the zipcode via API.
+static bool
+ow_kick_off(ow_request_t *r)
+{
   char url[OW_URL_SZ];
 
   snprintf(url, sizeof(url), "%s?zip=%s&appid=%s",
       OW_GEO_URL, r->zipcode, r->apikey);
 
   if(curl_get(url, ow_geocode_done, r) != SUCCESS)
+    return(FAIL);
+
+  return(SUCCESS);
+}
+
+// Public async fetches
+
+bool
+openweather_fetch_current(const char *zipcode,
+    openweather_done_current_cb_t done_cb, void *user)
+{
+  char errbuf[128];
+  ow_prep_result_t pr;
+  ow_request_t *r;
+
+  if(done_cb == NULL)
+    return(FAIL);
+
+  r = ow_req_alloc();
+  r->type       = OW_REQ_WEATHER;
+  r->cb.current = done_cb;
+  r->user       = user;
+
+  pr = ow_prepare_request(r, zipcode, errbuf, sizeof(errbuf));
+
+  if(pr == OW_PREP_ERR)
   {
-    cmd_reply(ctx, "Error: failed to submit geocoding request");
+    clam(CLAM_DEBUG, OW_CTX, "fetch_current(%s): %s",
+        zipcode != NULL ? zipcode : "(null)", errbuf);
     ow_req_release(r);
+    return(FAIL);
   }
-}
 
-// -----------------------------------------------------------------------
-// Command callbacks
-// -----------------------------------------------------------------------
-
-// !weather <zipcode> — current conditions.
-// ctx: command context
-static void
-ow_cmd_weather(const cmd_ctx_t *ctx)
-{
-  ow_cmd_common(ctx, OW_REQ_WEATHER);
-}
-
-// !forecast [-h] <zipcode> — daily or hourly forecast.
-// ctx: command context
-static void
-ow_cmd_forecast(const cmd_ctx_t *ctx)
-{
-  ow_req_type_t type = OW_REQ_FORECAST;
-  const char *args = ctx->args;
-
-  // Check for -h flag at start of args.
-  if(args != NULL && strncmp(args, "-h", 2) == 0
-      && (args[2] == ' ' || args[2] == '\0'))
+  if(pr == OW_PREP_CACHE_HIT)
   {
-    type = OW_REQ_FORECAST_HOURLY;
-    args = args + 2;
-
-    while(*args == ' ')
-      args++;
-
-    if(*args == '\0')
-      args = NULL;
+    ow_submit_onecall(r);
+    return(SUCCESS);
   }
 
-  cmd_ctx_t fctx = *ctx;
+  if(ow_kick_off(r) != SUCCESS)
+  {
+    ow_req_release(r);
+    return(FAIL);
+  }
 
-  fctx.args = args;
-  ow_cmd_common(&fctx, type);
+  return(SUCCESS);
 }
 
-// -----------------------------------------------------------------------
-// Plugin lifecycle
-// -----------------------------------------------------------------------
+static bool
+ow_fetch_forecast_common(ow_req_type_t type, const char *zipcode,
+    openweather_done_forecast_cb_t done_cb, void *user)
+{
+  char errbuf[128];
+  ow_prep_result_t pr;
+  ow_request_t *r;
 
-// returns: SUCCESS or FAIL
+  if(done_cb == NULL)
+    return(FAIL);
+
+  r = ow_req_alloc();
+  r->type        = type;
+  r->cb.forecast = done_cb;
+  r->user        = user;
+
+  pr = ow_prepare_request(r, zipcode, errbuf, sizeof(errbuf));
+
+  if(pr == OW_PREP_ERR)
+  {
+    clam(CLAM_DEBUG, OW_CTX, "fetch_forecast(%s): %s",
+        zipcode != NULL ? zipcode : "(null)", errbuf);
+    ow_req_release(r);
+    return(FAIL);
+  }
+
+  if(pr == OW_PREP_CACHE_HIT)
+  {
+    ow_submit_onecall(r);
+    return(SUCCESS);
+  }
+
+  if(ow_kick_off(r) != SUCCESS)
+  {
+    ow_req_release(r);
+    return(FAIL);
+  }
+
+  return(SUCCESS);
+}
+
+bool
+openweather_fetch_forecast_daily(const char *zipcode,
+    openweather_done_forecast_cb_t done_cb, void *user)
+{
+  return(ow_fetch_forecast_common(OW_REQ_FORECAST_DAILY,
+      zipcode, done_cb, user));
+}
+
+bool
+openweather_fetch_forecast_hourly(const char *zipcode,
+    openweather_done_forecast_cb_t done_cb, void *user)
+{
+  return(ow_fetch_forecast_common(OW_REQ_FORECAST_HOURLY,
+      zipcode, done_cb, user));
+}
+
+const char *
+openweather_units_kv_value(void)
+{
+  const char *units = kv_get_str("plugin.openweather.units");
+
+  if(units == NULL || units[0] == '\0')
+    return("imperial");
+
+  return(units);
+}
+
+// String helpers (local to the city-name path)
+
+static void
+ow_str_lower(char *dst, size_t cap, const char *src)
+{
+  size_t i;
+
+  if(cap == 0)
+    return;
+
+  i = 0;
+
+  for(; src[i] != '\0' && i + 1 < cap; i++)
+  {
+    unsigned char c = (unsigned char)src[i];
+
+    dst[i] = (char)tolower(c);
+  }
+
+  dst[i] = '\0';
+}
+
+static size_t
+ow_url_escape(const char *in, char *out, size_t cap)
+{
+  static const char hex[] = "0123456789ABCDEF";
+  size_t n = 0;
+
+  if(cap == 0)
+    return(0);
+
+  for(const unsigned char *p = (const unsigned char *)in;
+      *p != '\0';
+      p++)
+  {
+    unsigned char c = *p;
+    bool unreserved = (c >= 'A' && c <= 'Z')
+                   || (c >= 'a' && c <= 'z')
+                   || (c >= '0' && c <= '9')
+                   || c == '-' || c == '_' || c == '.' || c == '~';
+
+    if(unreserved)
+    {
+      if(n + 1 < cap)
+        out[n] = (char)c;
+      n++;
+      continue;
+    }
+
+    if(n + 3 < cap)
+    {
+      out[n]     = '%';
+      out[n + 1] = hex[c >> 4];
+      out[n + 2] = hex[c & 0x0f];
+    }
+
+    n += 3;
+  }
+
+  out[n < cap ? n : cap - 1] = '\0';
+
+  return(n);
+}
+
+// US state name -> ISO 3166-2 subdivision code.
+static const struct
+{
+  const char *name;
+  const char *code;
+} ow_us_states[] = {
+  { "alabama",              "AL" },
+  { "alaska",               "AK" },
+  { "arizona",              "AZ" },
+  { "arkansas",             "AR" },
+  { "california",           "CA" },
+  { "colorado",             "CO" },
+  { "connecticut",          "CT" },
+  { "delaware",             "DE" },
+  { "district of columbia", "DC" },
+  { "florida",              "FL" },
+  { "georgia",              "GA" },
+  { "hawaii",               "HI" },
+  { "idaho",                "ID" },
+  { "illinois",             "IL" },
+  { "indiana",              "IN" },
+  { "iowa",                 "IA" },
+  { "kansas",               "KS" },
+  { "kentucky",             "KY" },
+  { "louisiana",            "LA" },
+  { "maine",                "ME" },
+  { "maryland",             "MD" },
+  { "massachusetts",        "MA" },
+  { "michigan",             "MI" },
+  { "minnesota",            "MN" },
+  { "mississippi",          "MS" },
+  { "missouri",             "MO" },
+  { "montana",              "MT" },
+  { "nebraska",             "NE" },
+  { "nevada",               "NV" },
+  { "new hampshire",        "NH" },
+  { "new jersey",           "NJ" },
+  { "new mexico",           "NM" },
+  { "new york",             "NY" },
+  { "north carolina",       "NC" },
+  { "north dakota",         "ND" },
+  { "ohio",                 "OH" },
+  { "oklahoma",             "OK" },
+  { "oregon",               "OR" },
+  { "pennsylvania",         "PA" },
+  { "rhode island",         "RI" },
+  { "south carolina",       "SC" },
+  { "south dakota",         "SD" },
+  { "tennessee",            "TN" },
+  { "texas",                "TX" },
+  { "utah",                 "UT" },
+  { "vermont",              "VT" },
+  { "virginia",             "VA" },
+  { "washington",           "WA" },
+  { "west virginia",        "WV" },
+  { "wisconsin",            "WI" },
+  { "wyoming",              "WY" },
+};
+
+static const char *
+ow_us_state_code(const char *s)
+{
+  size_t i;
+  size_t n = sizeof(ow_us_states) / sizeof(ow_us_states[0]);
+
+  if(s == NULL || s[0] == '\0')
+    return(NULL);
+
+  if(s[1] != '\0' && s[2] == '\0'
+      && isalpha((unsigned char)s[0])
+      && isalpha((unsigned char)s[1]))
+  {
+    for(i = 0; i < n; i++)
+    {
+      if(toupper((unsigned char)s[0]) == ow_us_states[i].code[0]
+          && toupper((unsigned char)s[1]) == ow_us_states[i].code[1])
+        return(ow_us_states[i].code);
+    }
+
+    return(NULL);
+  }
+
+  for(i = 0; i < n; i++)
+  {
+    if(strcasecmp(s, ow_us_states[i].name) == 0)
+      return(ow_us_states[i].code);
+  }
+
+  return(NULL);
+}
+
+static char *
+ow_str_trim(char *s)
+{
+  size_t n;
+  char *p;
+
+  if(s == NULL)
+    return(s);
+
+  p = s;
+
+  while(*p == ' ' || *p == '\t' || *p == '\r' || *p == '\n')
+    p++;
+
+  if(p != s)
+    memmove(s, p, strlen(p) + 1);
+
+  n = strlen(s);
+
+  while(n > 0 && (s[n - 1] == ' ' || s[n - 1] == '\t'
+      || s[n - 1] == '\r' || s[n - 1] == '\n'))
+    s[--n] = '\0';
+
+  return(s);
+}
+
+// Canonicalize a user-provided location query for OpenWeather's
+// direct-geocode endpoint. See the old inline comment for the full
+// rationale; the short version is: OpenWeather's `q` parameter takes
+// {city},{state_code},{country_code} with no spaces. Fuzzy values
+// silently resolve to unrelated locales.
+static void
+ow_canon_query(const char *in, char *out, size_t out_sz)
+{
+  char city[OW_CITY_SZ];
+  char part2[OW_CITY_SZ];
+  char part3[OW_CITY_SZ];
+  const char *state_code;
+  const char *comma;
+  size_t city_len;
+
+  if(out_sz == 0)
+    return;
+
+  out[0] = '\0';
+
+  if(in == NULL)
+    return;
+
+  comma = strchr(in, ',');
+
+  if(comma == NULL)
+  {
+    snprintf(out, out_sz, "%s", in);
+    ow_str_trim(out);
+    return;
+  }
+
+  city_len = (size_t)(comma - in);
+
+  if(city_len >= sizeof(city))
+    city_len = sizeof(city) - 1;
+
+  memcpy(city, in, city_len);
+  city[city_len] = '\0';
+  ow_str_trim(city);
+
+  {
+    const char *rest = comma + 1;
+    const char *comma2 = strchr(rest, ',');
+
+    part2[0] = '\0';
+    part3[0] = '\0';
+
+    if(comma2 == NULL)
+    {
+      snprintf(part2, sizeof(part2), "%s", rest);
+    }
+
+    else
+    {
+      size_t p2_len = (size_t)(comma2 - rest);
+
+      if(p2_len >= sizeof(part2))
+        p2_len = sizeof(part2) - 1;
+
+      memcpy(part2, rest, p2_len);
+      part2[p2_len] = '\0';
+      snprintf(part3, sizeof(part3), "%s", comma2 + 1);
+    }
+
+    ow_str_trim(part2);
+    ow_str_trim(part3);
+  }
+
+  if(strcasecmp(part3, "united states") == 0
+      || strcasecmp(part3, "usa") == 0
+      || strcasecmp(part3, "u.s.a.") == 0
+      || strcasecmp(part3, "u.s.") == 0
+      || strcasecmp(part3, "us") == 0)
+    snprintf(part3, sizeof(part3), "US");
+
+  state_code = ow_us_state_code(part2);
+
+  // Precision specifiers cap each field so gcc can see the total output
+  // stays under OW_CITY_SZ even when all three parts are maxed out.
+  if(state_code != NULL
+      && (part3[0] == '\0' || strcasecmp(part3, "US") == 0))
+  {
+    snprintf(out, out_sz, "%.24s,%.3s,US", city, state_code);
+    return;
+  }
+
+  if(part3[0] != '\0')
+    snprintf(out, out_sz, "%.24s,%.24s,%.24s", city, part2, part3);
+  else
+    snprintf(out, out_sz, "%.40s,%.40s", city, part2);
+}
+
+// City cache (shares ow_geo_cache_mu)
+
+static const ow_citycache_t *
+ow_city_lookup_locked(const char *city_lc)
+{
+  uint32_t idx;
+  ow_citycache_t **pp;
+  uint32_t ttl = (uint32_t)kv_get_uint("plugin.openweather.geo_cache_ttl");
+
+  if(ttl == 0)
+    return(NULL);
+
+  idx = util_fnv1a(city_lc) % OW_CITY_CACHE_BUCKETS;
+  pp = &ow_city_cache[idx];
+
+  while(*pp != NULL)
+  {
+    ow_citycache_t *e = *pp;
+
+    if(strcmp(e->city, city_lc) == 0)
+    {
+      if((time(NULL) - e->cached_at) < (time_t)ttl)
+        return(e);
+
+      *pp = e->next;
+      mem_free(e);
+      return(NULL);
+    }
+
+    pp = &e->next;
+  }
+
+  return(NULL);
+}
+
+static void
+ow_city_insert_locked(const char *city_lc, const char *zipcode)
+{
+  ow_citycache_t *e;
+  uint32_t idx = util_fnv1a(city_lc) % OW_CITY_CACHE_BUCKETS;
+
+  for(ow_citycache_t *e = ow_city_cache[idx]; e != NULL; e = e->next)
+  {
+    if(strcmp(e->city, city_lc) == 0)
+    {
+      snprintf(e->zipcode, sizeof(e->zipcode), "%s", zipcode);
+      e->cached_at = time(NULL);
+      return;
+    }
+  }
+
+  e = mem_alloc("openweather", "citycache", sizeof(*e));
+
+  snprintf(e->city,    sizeof(e->city),    "%s", city_lc);
+  snprintf(e->zipcode, sizeof(e->zipcode), "%s", zipcode);
+  e->cached_at = time(NULL);
+  e->next      = ow_city_cache[idx];
+
+  ow_city_cache[idx] = e;
+}
+
+// Sync curl wrapper (plugin-local)
+//
+// The city-name path must block until the geocode round-trip completes,
+// and include/curl.h offers only async submission, so we wrap one GET
+// in a refcounted condvar rendezvous. MUST be called from a worker-pool
+// thread; calling from the curl multi-loop thread itself self-deadlocks
+// against the request it submits.
+
+typedef struct ow_sync_slot
+{
+  pthread_mutex_t  mu;
+  pthread_cond_t   cv;
+  int              refcount;
+  bool             done;
+  bool             abandoned;
+  long             status;
+  char            *body;
+  size_t           body_len;
+} ow_sync_slot_t;
+
+static void
+ow_slot_unref(ow_sync_slot_t *slot)
+{
+  int remaining;
+
+  pthread_mutex_lock(&slot->mu);
+  remaining = --slot->refcount;
+  pthread_mutex_unlock(&slot->mu);
+
+  if(remaining > 0)
+    return;
+
+  if(slot->body != NULL)
+    mem_free(slot->body);
+
+  pthread_cond_destroy(&slot->cv);
+  pthread_mutex_destroy(&slot->mu);
+  mem_free(slot);
+}
+
+static void
+ow_sync_cb(const curl_response_t *resp)
+{
+  ow_sync_slot_t *slot = (ow_sync_slot_t *)resp->user_data;
+
+  pthread_mutex_lock(&slot->mu);
+
+  if(!slot->abandoned)
+  {
+    slot->status = resp->status;
+
+    if(resp->body != NULL && resp->body_len > 0)
+    {
+      slot->body = mem_alloc("openweather", "sync_body",
+          resp->body_len + 1);
+      memcpy(slot->body, resp->body, resp->body_len);
+      slot->body[resp->body_len] = '\0';
+      slot->body_len = resp->body_len;
+    }
+
+    slot->done = true;
+    pthread_cond_signal(&slot->cv);
+  }
+
+  pthread_mutex_unlock(&slot->mu);
+
+  ow_slot_unref(slot);
+}
+
+static char *
+ow_http_get_sync(const char *url, uint32_t timeout_secs,
+    size_t *body_len, long *http_status)
+{
+  struct timespec deadline;
+  int rc;
+  char *body;
+  ow_sync_slot_t *slot = mem_alloc("openweather", "sync_slot",
+      sizeof(*slot));
+
+  memset(slot, 0, sizeof(*slot));
+  pthread_mutex_init(&slot->mu, NULL);
+  pthread_cond_init(&slot->cv, NULL);
+  slot->refcount = 2;
+
+  if(curl_get(url, ow_sync_cb, slot) != SUCCESS)
+  {
+    ow_slot_unref(slot);
+    ow_slot_unref(slot);
+    return(NULL);
+  }
+
+  clock_gettime(CLOCK_REALTIME, &deadline);
+  deadline.tv_sec += (time_t)timeout_secs;
+
+  pthread_mutex_lock(&slot->mu);
+
+  rc = 0;
+  while(!slot->done && rc == 0)
+    rc = pthread_cond_timedwait(&slot->cv, &slot->mu, &deadline);
+
+  body = NULL;
+
+  if(slot->done)
+  {
+    body       = slot->body;
+    slot->body = NULL;
+
+    if(body_len != NULL)
+      *body_len = slot->body_len;
+    if(http_status != NULL)
+      *http_status = slot->status;
+  }
+
+  else
+  {
+    slot->abandoned = true;
+    clam(CLAM_WARN, OW_CTX,
+        "sync GET timed out after %us: %s (abandoned, cb will clean)",
+        timeout_secs, url);
+  }
+
+  pthread_mutex_unlock(&slot->mu);
+  ow_slot_unref(slot);
+
+  if(body != NULL && http_status != NULL
+      && (*http_status < 200 || *http_status >= 300))
+  {
+    mem_free(body);
+    return(NULL);
+  }
+
+  return(body);
+}
+
+static bool
+ow_parse_direct_geo(const char *body, size_t body_len,
+    char *name_out, size_t name_sz,
+    char *zip_out, size_t zip_sz,
+    double *lat, double *lon)
+{
+  bool have_lon;
+  struct json_object *e0;
+  bool have_lat;
+  struct json_object *root = json_parse_buf(body, body_len, OW_CTX);
+
+  if(root == NULL)
+    return(FAIL);
+
+  if(!json_object_is_type(root, json_type_array)
+      || json_object_array_length(root) == 0)
+  {
+    json_object_put(root);
+    return(FAIL);
+  }
+
+  e0 = json_object_array_get_idx(root, 0);
+
+  if(e0 == NULL)
+  {
+    json_object_put(root);
+    return(FAIL);
+  }
+
+  have_lat = json_get_double(e0, "lat", lat);
+  have_lon = json_get_double(e0, "lon", lon);
+
+  if(!have_lat || !have_lon)
+  {
+    json_object_put(root);
+    return(FAIL);
+  }
+
+  name_out[0] = '\0';
+  json_get_str(e0, "name", name_out, name_sz);
+
+  zip_out[0] = '\0';
+
+  if(!json_get_str(e0, "zip", zip_out, zip_sz))
+    json_get_str(e0, "postcode", zip_out, zip_sz);
+
+  json_object_put(root);
+
+  return(SUCCESS);
+}
+
+// Public sync geocode: CITY → ZIP.
+bool
+openweather_geocode_city_sync(const char *city, char *zip_out, size_t zip_sz)
+{
+  char canon[OW_CITY_SZ];
+  char city_lc[OW_CITY_SZ];
+  char encoded[OW_CITY_SZ * 3 + 1];
+  bool parsed;
+  char url[OW_URL_SZ];
+  double lon;
+  char *body;
+  double lat;
+  char zip[OW_ZIPCODE_SZ];
+  char name[OW_NAME_SZ];
+  long http_stat;
+  const ow_citycache_t *hit;
+  const char *apikey;
+  size_t body_len;
+
+  if(city == NULL || city[0] == '\0' || zip_out == NULL || zip_sz < 2)
+    return(FAIL);
+
+  ow_canon_query(city, canon, sizeof(canon));
+
+  if(canon[0] == '\0')
+    return(FAIL);
+
+  ow_str_lower(city_lc, sizeof(city_lc), canon);
+
+  pthread_mutex_lock(&ow_geo_cache_mu);
+
+  hit = ow_city_lookup_locked(city_lc);
+
+  if(hit != NULL)
+  {
+    snprintf(zip_out, zip_sz, "%s", hit->zipcode);
+    pthread_mutex_unlock(&ow_geo_cache_mu);
+    clam(CLAM_DEBUG2, OW_CTX, "city geocode %s -> %s [cache hit]",
+        city_lc, zip_out);
+    return(SUCCESS);
+  }
+
+  pthread_mutex_unlock(&ow_geo_cache_mu);
+
+  apikey = kv_get_str("plugin.openweather.apikey");
+
+  if(apikey == NULL || apikey[0] == '\0')
+  {
+    clam(CLAM_DEBUG, OW_CTX,
+        "city geocode '%s': apikey not configured; abort",
+        city_lc);
+    return(FAIL);
+  }
+
+  ow_url_escape(canon, encoded, sizeof(encoded));
+
+  snprintf(url, sizeof(url), "%s?q=%s&limit=1&appid=%s",
+      OW_GEO_DIRECT_URL, encoded, apikey);
+
+  body_len = 0;
+  http_stat = 0;
+  body = ow_http_get_sync(url, OW_CITY_TIMEOUT_SECS,
+                          &body_len, &http_stat);
+
+  if(body == NULL)
+  {
+    clam(CLAM_DEBUG, OW_CTX,
+        "city geocode '%s': direct GET failed (status=%ld)",
+        city_lc, http_stat);
+    return(FAIL);
+  }
+
+  lat = 0.0;
+  lon = 0.0;
+
+  parsed = ow_parse_direct_geo(body, body_len,
+      name, sizeof(name), zip, sizeof(zip), &lat, &lon);
+
+  mem_free(body);
+
+  if(parsed != SUCCESS)
+  {
+    clam(CLAM_DEBUG, OW_CTX,
+        "city geocode '%s': direct response unparsable / empty",
+        city_lc);
+    return(FAIL);
+  }
+
+  if(zip[0] == '\0')
+  {
+    bool rparsed;
+    double rev_lon;
+    char *rb;
+    double rev_lat;
+    char rev_name[OW_NAME_SZ];
+    long rb_stat;
+    size_t rb_len;
+    char rev_url[OW_URL_SZ];
+
+    snprintf(rev_url, sizeof(rev_url),
+        "%s?lat=%.6f&lon=%.6f&limit=1&appid=%s",
+        OW_GEO_REVERSE_URL, lat, lon, apikey);
+
+    rb_len = 0;
+    rb_stat = 0;
+    rb = ow_http_get_sync(rev_url, OW_CITY_TIMEOUT_SECS,
+                         &rb_len, &rb_stat);
+
+    if(rb == NULL)
+    {
+      clam(CLAM_DEBUG, OW_CTX,
+          "city geocode '%s': reverse GET failed (status=%ld)",
+          city_lc, rb_stat);
+      return(FAIL);
+    }
+
+    rev_lat = 0.0;
+    rev_lon = 0.0;
+
+    rparsed = ow_parse_direct_geo(rb, rb_len,
+        rev_name, sizeof(rev_name), zip, sizeof(zip),
+        &rev_lat, &rev_lon);
+
+    mem_free(rb);
+
+    // Neither endpoint returned a postcode — synthesize a stable
+    // 9-char key so the zip→lat/lon cache short-circuits the next
+    // lookup. Passes ow_validate_zipcode.
+    if(rparsed != SUCCESS || zip[0] == '\0')
+    {
+      char   latlon[48];
+      uint32_t h;
+
+      snprintf(latlon, sizeof(latlon), "%.6f,%.6f", lat, lon);
+      h = util_fnv1a(latlon);
+      snprintf(zip, sizeof(zip), "G%08X", (unsigned)h);
+
+      clam(CLAM_DEBUG, OW_CTX,
+          "city geocode '%s': no postcode, synthesized '%s' "
+          "(lat=%.4f lon=%.4f)",
+          city_lc, zip, lat, lon);
+    }
+  }
+
+  pthread_mutex_lock(&ow_geo_cache_mu);
+  ow_city_insert_locked(city_lc, zip);
+  ow_geo_insert(zip, lat, lon, name[0] != '\0' ? name : city);
+  pthread_mutex_unlock(&ow_geo_cache_mu);
+
+  snprintf(zip_out, zip_sz, "%s", zip);
+
+  clam(CLAM_DEBUG, OW_CTX,
+      "city geocode %s -> %s (%.4f, %.4f) [cached]",
+      city_lc, zip, lat, lon);
+
+  return(SUCCESS);
+}
+
+// Public sync geocode: ZIP → lat/lon/name. Uses the cache when warm;
+// on a miss issues one sync GET against the zip geocoder. name_out
+// may be NULL.
+bool
+openweather_geocode_zip_sync(const char *zipcode,
+    double *lat_out, double *lon_out,
+    char *name_out, size_t name_sz)
+{
+  ow_geocache_t *cached;
+  const char *apikey;
+  char url[OW_URL_SZ];
+  char *body;
+  size_t body_len = 0;
+  long http_stat = 0;
+  struct json_object *root;
+  double lat;
+  double lon;
+  char name[OW_NAME_SZ];
+
+  if(zipcode == NULL || zipcode[0] == '\0'
+      || lat_out == NULL || lon_out == NULL)
+    return(FAIL);
+
+  if(!ow_validate_zipcode(zipcode))
+    return(FAIL);
+
+  pthread_mutex_lock(&ow_geo_cache_mu);
+  cached = ow_geo_lookup(zipcode);
+
+  if(cached != NULL)
+  {
+    *lat_out = cached->lat;
+    *lon_out = cached->lon;
+
+    if(name_out != NULL && name_sz > 0)
+      snprintf(name_out, name_sz, "%s", cached->name);
+
+    pthread_mutex_unlock(&ow_geo_cache_mu);
+    return(SUCCESS);
+  }
+
+  pthread_mutex_unlock(&ow_geo_cache_mu);
+
+  apikey = kv_get_str("plugin.openweather.apikey");
+
+  if(apikey == NULL || apikey[0] == '\0')
+    return(FAIL);
+
+  snprintf(url, sizeof(url), "%s?zip=%s&appid=%s",
+      OW_GEO_URL, zipcode, apikey);
+
+  body = ow_http_get_sync(url, OW_CITY_TIMEOUT_SECS,
+                          &body_len, &http_stat);
+
+  if(body == NULL)
+    return(FAIL);
+
+  root = json_parse_buf(body, body_len, OW_CTX);
+  mem_free(body);
+
+  if(root == NULL)
+    return(FAIL);
+
+  lat = 0.0;
+  lon = 0.0;
+  name[0] = '\0';
+
+  if(!json_get_double(root, "lat", &lat)
+      || !json_get_double(root, "lon", &lon))
+  {
+    json_object_put(root);
+    return(FAIL);
+  }
+
+  json_get_str(root, "name", name, sizeof(name));
+  json_object_put(root);
+
+  pthread_mutex_lock(&ow_geo_cache_mu);
+  ow_geo_insert(zipcode, lat, lon, name);
+  pthread_mutex_unlock(&ow_geo_cache_mu);
+
+  *lat_out = lat;
+  *lon_out = lon;
+
+  if(name_out != NULL && name_sz > 0)
+    snprintf(name_out, name_sz, "%s", name);
+
+  return(SUCCESS);
+}
+
+// Plugin lifecycle
+
 static bool
 ow_init(void)
 {
   pthread_mutex_init(&ow_free_mu, NULL);
   pthread_mutex_init(&ow_geo_cache_mu, NULL);
-  memset(ow_geo_cache, 0, sizeof(ow_geo_cache));
-
-  if(cmd_register("openweather", "weather",
-      "weather <zipcode>",
-      "Show current weather for a US zipcode",
-      "Queries the OpenWeather OneCall 3.0 API for current\n"
-      "conditions at the given zipcode. Displays temperature,\n"
-      "humidity, wind, sunrise/sunset, and any active alerts.\n"
-      "\n"
-      "Requires plugin.openweather.apikey to be set.\n"
-      "Units controlled by plugin.openweather.units (imperial/metric).\n"
-      "\n"
-      "Example: !weather 90210",
-      "everyone", 0, CMD_SCOPE_ANY, METHOD_T_ANY, ow_cmd_weather, NULL, NULL, "w",
-      ow_ad_weather, 1) != SUCCESS)
-    return(FAIL);
-
-  if(cmd_register("openweather", "forecast",
-      "forecast [-h] <zipcode>",
-      "Show forecast for a US zipcode (daily or hourly with -h)",
-      "Queries the OpenWeather OneCall 3.0 API for the forecast\n"
-      "at the given zipcode.\n"
-      "\n"
-      "  !forecast <zipcode>      7-day daily forecast\n"
-      "  !forecast -h <zipcode>   24-hour hourly forecast\n"
-      "\n"
-      "Requires plugin.openweather.apikey to be set.\n"
-      "Units controlled by plugin.openweather.units (imperial/metric).\n"
-      "\n"
-      "Example: !forecast 10001\n"
-      "         !forecast -h 90210",
-      "everyone", 0, CMD_SCOPE_ANY, METHOD_T_ANY, ow_cmd_forecast, NULL, NULL, "f",
-      NULL, 0) != SUCCESS)
-  {
-    cmd_unregister("weather");
-    return(FAIL);
-  }
+  memset(ow_geo_cache,  0, sizeof(ow_geo_cache));
+  memset(ow_city_cache, 0, sizeof(ow_city_cache));
 
   clam(CLAM_INFO, OW_CTX, "openweather plugin initialized");
 
   return(SUCCESS);
 }
 
-// Tear down the openweather plugin. Unregisters commands, frees the
-// request freelist and geocode cache, and destroys mutexes.
 static void
 ow_deinit(void)
 {
-  cmd_unregister("forecast");
-  cmd_unregister("weather");
-
   // Free the request freelist.
   pthread_mutex_lock(&ow_free_mu);
 
@@ -1365,7 +1740,6 @@ ow_deinit(void)
   pthread_mutex_unlock(&ow_free_mu);
   pthread_mutex_destroy(&ow_free_mu);
 
-  // Free geocode cache.
   for(uint32_t i = 0; i < OW_GEO_CACHE_BUCKETS; i++)
   {
     ow_geocache_t *e = ow_geo_cache[i];
@@ -1381,25 +1755,37 @@ ow_deinit(void)
     ow_geo_cache[i] = NULL;
   }
 
+  for(uint32_t i = 0; i < OW_CITY_CACHE_BUCKETS; i++)
+  {
+    ow_citycache_t *e = ow_city_cache[i];
+
+    while(e != NULL)
+    {
+      ow_citycache_t *next = e->next;
+
+      mem_free(e);
+      e = next;
+    }
+
+    ow_city_cache[i] = NULL;
+  }
+
   pthread_mutex_destroy(&ow_geo_cache_mu);
 
   clam(CLAM_INFO, OW_CTX, "openweather plugin deinitialized");
 }
 
-// -----------------------------------------------------------------------
 // Plugin descriptor
-// -----------------------------------------------------------------------
 
 const plugin_desc_t bm_plugin_desc = {
   .api_version     = PLUGIN_API_VERSION,
   .name            = "openweather",
-  .version         = "1.0",
+  .version         = "2.0",
   .type            = PLUGIN_SERVICE,
   .kind            = "openweather",
   .provides        = { { .name = "service_openweather" } },
   .provides_count  = 1,
-  .requires        = { { .name = "bot_command" } },
-  .requires_count  = 1,
+  .requires_count  = 0,
   .kv_schema       = ow_kv_schema,
   .kv_schema_count = 3,
   .init            = ow_init,

@@ -1,20 +1,5 @@
-// ircspyctl — CLI client for controlling a running ircspy session.
-//
-// Usage:
-//   ircspyctl [options] [message]
-//
-// One-shot mode (arguments provided):
-//   ircspyctl "!weather 90210"
-//   ircspyctl "!forecast -h 10001"
-//
-// Interactive mode (no arguments):
-//   ircspyctl
-//   irc> !weather 90210
-//   irc> /quit
-//
-// Connects to ircspy's control socket, sends messages, and prints
-// the collected IRC output.  Each command waits for a NUL-delimited
-// response (ircspy flushes after a few seconds of channel silence).
+// botmanager — MIT
+// CLI client for controlling a running ircspy session over its control socket.
 
 #include "ircspyctl.h"
 
@@ -26,13 +11,11 @@
 #include <sys/un.h>
 #include <unistd.h>
 
-// Connect to the ircspy control socket.
-// path: Unix socket path
-// returns: fd on success, -1 on failure
 static int
 ctl_connect(const char *path)
 {
   int fd = socket(AF_UNIX, SOCK_STREAM, 0);
+  struct sockaddr_un addr;
 
   if(fd < 0)
   {
@@ -40,7 +23,6 @@ ctl_connect(const char *path)
     return(-1);
   }
 
-  struct sockaddr_un addr;
   memset(&addr, 0, sizeof(addr));
   addr.sun_family = AF_UNIX;
   snprintf(addr.sun_path, sizeof(addr.sun_path), "%s", path);
@@ -55,15 +37,13 @@ ctl_connect(const char *path)
   return(fd);
 }
 
-// Send a message and print the collected response.
-// fd: connected socket fd
-// msg: message to send (without trailing newline)
-// returns: 0 on success, -1 on error/disconnect
 static int
 ctl_send_recv(int fd, const char *msg)
 {
   size_t len = strlen(msg);
   char sendbuf[CMD_SZ + 2];
+  ssize_t w;
+  char buf[BUF_SZ];
 
   if(len >= CMD_SZ)
   {
@@ -74,7 +54,7 @@ ctl_send_recv(int fd, const char *msg)
   memcpy(sendbuf, msg, len);
   sendbuf[len] = '\n';
 
-  ssize_t w = write(fd, sendbuf, len + 1);
+  w = write(fd, sendbuf, len + 1);
 
   if(w < 0)
   {
@@ -83,8 +63,6 @@ ctl_send_recv(int fd, const char *msg)
   }
 
   // Read response until NUL byte delimiter.
-  char buf[BUF_SZ];
-
   for(;;)
   {
     ssize_t n = read(fd, buf, sizeof(buf));
@@ -117,8 +95,6 @@ ctl_send_recv(int fd, const char *msg)
   }
 }
 
-// print_usage: display command-line usage and examples
-// prog: program name (argv[0])
 static void
 print_usage(const char *prog)
 {
@@ -132,15 +108,13 @@ print_usage(const char *prog)
       prog, DEFAULT_SOCK_PATH, prog, prog);
 }
 
-// main: connect to ircspy control socket and send messages
-// argc: argument count
-// argv: argument vector (optional socket path and message)
-// returns: 0 on success, 1 on failure
 int
 main(int argc, char *argv[])
 {
   const char *sock_path = DEFAULT_SOCK_PATH;
   int opt;
+  int fd;
+  char line[CMD_SZ];
 
   while((opt = getopt(argc, argv, "s:h")) != -1)
   {
@@ -160,7 +134,7 @@ main(int argc, char *argv[])
     }
   }
 
-  int fd = ctl_connect(sock_path);
+  fd = ctl_connect(sock_path);
 
   if(fd < 0)
     return(1);
@@ -170,13 +144,16 @@ main(int argc, char *argv[])
   {
     char cmd[CMD_SZ];
     size_t off = 0;
+    int rc;
 
     for(int i = optind; i < argc; i++)
     {
+      size_t arglen;
+
       if(i > optind && off < sizeof(cmd) - 1)
         cmd[off++] = ' ';
 
-      size_t arglen = strlen(argv[i]);
+      arglen = strlen(argv[i]);
 
       if(off + arglen >= sizeof(cmd) - 1)
       {
@@ -191,24 +168,24 @@ main(int argc, char *argv[])
 
     cmd[off] = '\0';
 
-    int rc = ctl_send_recv(fd, cmd);
+    rc = ctl_send_recv(fd, cmd);
 
     close(fd);
     return(rc < 0 ? 1 : 0);
   }
 
   // Interactive mode.
-  char line[CMD_SZ];
-
   for(;;)
   {
+    size_t len;
+
     fputs(PROMPT, stdout);
     fflush(stdout);
 
     if(fgets(line, (int)sizeof(line), stdin) == NULL)
       break;
 
-    size_t len = strlen(line);
+    len = strlen(line);
 
     while(len > 0 && (line[len - 1] == '\n' || line[len - 1] == '\r'))
       line[--len] = '\0';

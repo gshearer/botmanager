@@ -2,12 +2,14 @@
 #define BM_KV_H
 
 #include <stdbool.h>
+#include <stddef.h>
 #include <stdint.h>
+
+#include "nl.h"
 
 #define KV_KEY_SZ  128
 #define KV_STR_SZ  256
 
-// Value types.
 typedef enum
 {
   KV_INT8,    KV_UINT8,
@@ -15,112 +17,121 @@ typedef enum
   KV_INT32,   KV_UINT32,
   KV_INT64,   KV_UINT64,
   KV_FLOAT,   KV_DOUBLE,   KV_LDOUBLE,
-  KV_STR
+  KV_STR,
+  KV_BOOL
 } kv_type_t;
 
-// Update callback: invoked when a value changes.
+// Invoked when a value changes.
 typedef void (*kv_cb_t)(const char *key, void *data);
 
-// returns: SUCCESS or FAIL (bad default for type, or key already exists)
-// key: configuration key
-// type: value type
-// default_val: default value as a string
-// cb: optional callback invoked on value change (NULL for none)
-// cb_data: opaque data passed to callback
+// Fails if the key already exists or the default is bad for the type.
+// help must be static storage; cb may be NULL.
 bool kv_register(const char *key, kv_type_t type, const char *default_val,
-    kv_cb_t cb, void *cb_data);
+    kv_cb_t cb, void *cb_data, const char *help);
 
-// returns: signed integer value (0 for missing or type-mismatched keys)
-// key: configuration key
+// Returns 0 for missing or type-mismatched keys.
 int64_t kv_get_int(const char *key);
 
-// returns: unsigned integer value (0 for missing or type-mismatched keys)
-// key: configuration key
+// Returns 0 for missing or type-mismatched keys.
 uint64_t kv_get_uint(const char *key);
 
-// returns: double value (0.0 for missing or type-mismatched keys)
-// key: configuration key
+// Returns 0.0 for missing or type-mismatched keys.
 double kv_get_double(const char *key);
 
-// returns: long double value (0.0 for missing or type-mismatched keys)
-// key: configuration key
+// Returns 0.0 for missing or type-mismatched keys.
 long double kv_get_ldouble(const char *key);
 
-// returns: pointer to internal storage (valid until value changes), or NULL
-// key: configuration key
+// Returns pointer to internal storage (valid until value changes), or NULL.
 const char *kv_get_str(const char *key);
 
-// returns: SUCCESS or FAIL
-// key: configuration key
-// val: new value as a string
 bool kv_set(const char *key, const char *val);
 
-// returns: SUCCESS or FAIL (key not found, type mismatch, or out of range)
-// key: configuration key
-// val: new signed integer value
+// Fails on key not found, type mismatch, or out of range.
 bool kv_set_int(const char *key, int64_t val);
 
-// returns: SUCCESS or FAIL (key not found, type mismatch, or out of range)
-// key: configuration key
-// val: new unsigned integer value
+// Fails on key not found, type mismatch, or out of range.
 bool kv_set_uint(const char *key, uint64_t val);
 
-// returns: SUCCESS or FAIL (key not found or type mismatch)
-// key: configuration key
-// val: new floating-point value
+// Fails on key not found or type mismatch.
 bool kv_set_float(const char *key, long double val);
 
-// returns: SUCCESS or FAIL
-// key: configuration key
-// val: new string value
 bool kv_set_str(const char *key, const char *val);
 
-// returns: true if key is registered
-// key: configuration key
 bool kv_exists(const char *key);
 
-// Callback type for kv_iterate_prefix(). Called once per matching entry.
+// Returns help text pointer (may be NULL), or NULL if key not found.
+const char *kv_get_help(const char *key);
+
+// Returns NULL if key not found.
+const char *kv_get_type_name(const char *key);
+
+// Serialize a KV entry's current value into buf as a string.
+bool kv_get_val_str(const char *key, char *buf, size_t bufsz);
+
+// Key must already be registered. cb NULL clears.
+bool kv_set_cb(const char *key, kv_cb_t cb, void *cb_data);
+
 // WARNING: invoked under the KV lock — do NOT call kv_* functions.
-// key: entry key
-// type: entry type
-// value_str: serialized value string
-// data: opaque user data
 typedef void (*kv_iter_cb_t)(const char *key, kv_type_t type,
     const char *value_str, void *data);
 
-// Iterate all entries whose key starts with prefix. Calls cb for each.
-// returns: number of entries visited
-// prefix: key prefix to match
-// cb: callback function
-// data: opaque data passed to callback
+// Returns the number of entries visited.
 uint32_t kv_iterate_prefix(const char *prefix, kv_iter_cb_t cb, void *data);
 
-// Delete all KV entries whose key starts with the given prefix.
-// Also deletes matching rows from the database if available.
-// returns: number of entries deleted
-// prefix: key prefix to match (e.g., "bot.mybot.")
+// Also deletes matching rows from the database if available. Returns
+// the number of entries deleted.
 uint32_t kv_delete_prefix(const char *prefix);
 
-// returns: human-readable name of a KV type
-// type: KV type enum value
 const char *kv_type_name(kv_type_t type);
 
-// returns: SUCCESS or FAIL
+// Natural-language responder metadata attached to a KV. A KV becomes
+// NL-bridge visible (/kv <suffix>) only when an nl_t is attached via
+// kv_register_nl. All strings and arrays are static / caller-owned;
+// the registry stores pointers only and never copies.
+typedef struct
+{
+  const char         *when;              // REQUIRED — LLM cue
+  const nl_example_t *examples;          // REQUIRED — >=1 entry
+  uint8_t             example_count;
+
+  // Response template with literal "$value" substitution for the KV's
+  // serialized value. NULL = emit the value verbatim.
+  const char         *response_template;
+} kv_nl_t;
+
+// Attach NL metadata to an already-registered KV. Fails (and logs) when
+// the key has not been registered. nl storage must be static for the
+// process lifetime — the registry retains the pointer.
+bool kv_register_nl(const char *key, const kv_nl_t *nl);
+
+// Return the NL metadata attached to a key, or NULL if the key has no
+// NL responder attached (covers unregistered keys too).
+const kv_nl_t *kv_get_nl(const char *key);
+
+// Callback type for kv_iterate_nl. Invoked once per NL-capable KV.
+// The callback is invoked UNDER NO LOCK — it may safely call other
+// kv_* APIs (the registry is snapshotted before dispatch).
+typedef void (*kv_nl_iter_cb_t)(const char *key, const kv_nl_t *nl,
+    void *data);
+
+// Iterate every KV that has an NL responder attached. See the callback
+// type above for locking semantics.
+void kv_iterate_nl(kv_nl_iter_cb_t cb, void *data);
+
 bool kv_load(void);
 
 // Register all remaining pending DB entries that were not claimed by
 // explicit kv_register() calls. Call after bot restore to pick up
-// dynamic keys (e.g., per-channel IRC configuration).
-// returns: number of entries claimed
+// dynamic keys (e.g., per-channel IRC configuration). Returns the
+// number of entries claimed.
 uint32_t kv_claim_pending(void);
 
-// returns: SUCCESS or FAIL
 bool kv_flush(void);
 
-// Initialize the KV subsystem. Must be called after mem_init().
+// Must be called after mem_init().
 void kv_init(void);
 
-// Shut down: flush if DB is available, free all entries.
+// Flushes if DB is available, then frees all entries.
 void kv_exit(void);
 
 #ifdef KV_INTERNAL
@@ -128,14 +139,14 @@ void kv_exit(void);
 #include "common.h"
 #include "clam.h"
 #include "db.h"
-#include "mem.h"
+#include "alloc.h"
 
 #include <limits.h>
 
 #define KV_BUCKETS    64
 #define KV_VAL_BUF    300    // serialization buffer
 
-// Value union — str member makes this 256 bytes.
+// str member makes this 256 bytes.
 typedef union
 {
   int8_t      i8;
@@ -159,8 +170,9 @@ typedef struct kv_entry
   kv_val_t         val;
   kv_cb_t          cb;
   void            *cb_data;
+  const char      *help;     // human-readable help (static, may be NULL)
   bool             dirty;
-  struct kv_entry *next;    // hash chain
+  struct kv_entry *next;     // hash chain
 } kv_entry_t;
 
 static kv_entry_t      *kv_table[KV_BUCKETS];
@@ -168,8 +180,8 @@ static pthread_mutex_t   kv_mutex;
 static uint32_t          kv_count = 0;
 static bool              kv_ready = false;
 
-// Pending DB values: rows loaded by kv_load() before their key was
-// registered. Consumed by kv_register() when a matching key appears.
+// Rows loaded by kv_load() before their key was registered. Consumed
+// by kv_register() when a matching key appears.
 typedef struct kv_pending
 {
   char               key[KV_KEY_SZ];

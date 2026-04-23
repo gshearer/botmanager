@@ -1,5 +1,7 @@
 #!/bin/bash
 
-wc -l core/*.c include/*.h plugins/method/irc/{*.c,*.h} plugins/service/openweather/{*.c,*.h} plugins/bot/command/{*.c,*.h} plugins/db/postgresql/{*.c,*.h}
+cd /mnt/fast/doc/projects/botmanager
+
+wc -l $(find . -type d \( -name "old" -o -name "tests" -o -name ".claude" \) -prune -o \( -name "*.c" -o -name "*.h" \) -print)
 
 exit 0

@@ -1,34 +1,30 @@
+// botmanager — MIT
+// PostgreSQL DB plugin: connection pool and query execution.
 #define PG_INTERNAL
 #include "pg.h"
 
-// -----------------------------------------------------------------------
 // Driver callbacks
-// -----------------------------------------------------------------------
 
-// returns: connection handle, or NULL on failure
-// host: database server hostname
-// port: database server port
-// dbname: database name
-// user: authentication username
-// pass: authentication password
 static void *
 pg_connect(const char *host, uint16_t port, const char *dbname,
     const char *user, const char *pass)
 {
+  PGconn *conn;
   char connstr[1024];
 
   snprintf(connstr, sizeof(connstr),
       "host=%s port=%u dbname=%s user=%s password=%s connect_timeout=5",
       host, port, dbname, user, pass);
 
-  PGconn *conn = PQconnectdb(connstr);
+  conn = PQconnectdb(connstr);
 
   if(PQstatus(conn) != CONNECTION_OK)
   {
+    size_t len;
     snprintf(pg_last_error, DB_ERROR_SZ, "%s", PQerrorMessage(conn));
 
     // Trim trailing newline that libpq adds.
-    size_t len = strlen(pg_last_error);
+    len = strlen(pg_last_error);
 
     if(len > 0 && pg_last_error[len - 1] == '\n')
       pg_last_error[len - 1] = '\0';
@@ -41,23 +37,18 @@ pg_connect(const char *host, uint16_t port, const char *dbname,
   return(conn);
 }
 
-// handle: connection handle to close
 static void
 pg_disconnect(void *handle)
 {
   PQfinish((PGconn *)handle);
 }
 
-// returns: SUCCESS or FAIL
-// handle: connection handle
 static bool
 pg_ping(void *handle)
 {
   return(PQstatus((PGconn *)handle) == CONNECTION_OK ? SUCCESS : FAIL);
 }
 
-// returns: SUCCESS or FAIL
-// handle: connection handle
 static bool
 pg_reset(void *handle)
 {
@@ -65,13 +56,11 @@ pg_reset(void *handle)
   return(PQstatus((PGconn *)handle) == CONNECTION_OK ? SUCCESS : FAIL);
 }
 
-// returns: SUCCESS or FAIL
-// handle: connection handle
-// sql: SQL query string
-// result: destination for query results
 static bool
 pg_query(void *handle, const char *sql, db_result_t *result)
 {
+  ExecStatusType status;
+  size_t len;
   PGconn *conn = (PGconn *)handle;
   PGresult *res = PQexec(conn, sql);
 
@@ -82,10 +71,11 @@ pg_query(void *handle, const char *sql, db_result_t *result)
     return(FAIL);
   }
 
-  ExecStatusType status = PQresultStatus(res);
+  status = PQresultStatus(res);
 
   if(status == PGRES_TUPLES_OK)
   {
+    const char *tuples;
     uint32_t rows = (uint32_t)PQntuples(res);
     uint32_t cols = (uint32_t)PQnfields(res);
 
@@ -97,17 +87,15 @@ pg_query(void *handle, const char *sql, db_result_t *result)
     for(uint32_t r = 0; r < rows; r++)
     {
       for(uint32_t c = 0; c < cols; c++)
-      {
         if(!PQgetisnull(res, (int)r, (int)c))
           db_result_set_value(result, r, c,
               PQgetvalue(res, (int)r, (int)c));
-      }
     }
 
     result->ok = true;
     result->rows_affected = 0;
 
-    const char *tuples = PQcmdTuples(res);
+    tuples = PQcmdTuples(res);
 
     if(tuples != NULL && tuples[0] != '\0')
       result->rows_affected = (uint32_t)strtoul(tuples, NULL, 10);
@@ -118,10 +106,11 @@ pg_query(void *handle, const char *sql, db_result_t *result)
 
   if(status == PGRES_COMMAND_OK)
   {
+    const char *tuples;
     result->ok = true;
     result->rows_affected = 0;
 
-    const char *tuples = PQcmdTuples(res);
+    tuples = PQcmdTuples(res);
 
     if(tuples != NULL && tuples[0] != '\0')
       result->rows_affected = (uint32_t)strtoul(tuples, NULL, 10);
@@ -135,7 +124,7 @@ pg_query(void *handle, const char *sql, db_result_t *result)
   snprintf(result->error, DB_ERROR_SZ, "%s", PQerrorMessage(conn));
 
   // Trim trailing newline.
-  size_t len = strlen(result->error);
+  len = strlen(result->error);
 
   if(len > 0 && result->error[len - 1] == '\n')
     result->error[len - 1] = '\0';
@@ -145,8 +134,6 @@ pg_query(void *handle, const char *sql, db_result_t *result)
 }
 
 // returns: escaped string (caller must free), or NULL on error
-// handle: connection handle
-// input: string to escape
 static char *
 pg_escape(void *handle, const char *input)
 {
@@ -166,8 +153,6 @@ pg_escape(void *handle, const char *input)
   return(out);
 }
 
-// returns: human-readable error string
-// handle: connection handle (may be NULL)
 static const char *
 pg_error(void *handle)
 {
@@ -177,9 +162,7 @@ pg_error(void *handle)
   return(pg_last_error[0] != '\0' ? pg_last_error : "unknown error");
 }
 
-// -----------------------------------------------------------------------
 // Driver struct
-// -----------------------------------------------------------------------
 
 const db_driver_t pg_driver = {
   .name       = "postgresql",
@@ -192,9 +175,7 @@ const db_driver_t pg_driver = {
   .error      = pg_error,
 };
 
-// -----------------------------------------------------------------------
 // Plugin descriptor
-// -----------------------------------------------------------------------
 
 const plugin_desc_t bm_plugin_desc = {
   .api_version     = PLUGIN_API_VERSION,

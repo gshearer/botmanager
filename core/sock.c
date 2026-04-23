@@ -1,9 +1,9 @@
+// botmanager — MIT
+// Unix-domain control socket listener and client session reader.
 #define SOCK_INTERNAL
 #include "sock.h"
 
-// -----------------------------------------------------------------------
 // Send buffer freelist helpers
-// -----------------------------------------------------------------------
 
 static sock_sendbuf_t *
 sock_sbuf_alloc(const void *data, size_t len)
@@ -46,22 +46,20 @@ sock_sbuf_release(sock_sendbuf_t *sb)
   pthread_mutex_unlock(&sock_sbuf_mutex);
 }
 
-// -----------------------------------------------------------------------
 // Internal helpers
-// -----------------------------------------------------------------------
 
 // Deliver an event to the session's consumer callback.
 static void
 sock_deliver(sock_session_t *s, sock_event_type_t type,
     const uint8_t *data, size_t len, int err)
 {
+  sock_event_t ev;
+
   if(type == SOCK_EVENT_CONNECTED)
     __atomic_add_fetch(&sock_total_conn, 1, __ATOMIC_RELAXED);
 
   else if(type == SOCK_EVENT_DISCONNECT)
     __atomic_add_fetch(&sock_total_disc, 1, __ATOMIC_RELAXED);
-
-  sock_event_t ev;
 
   memset(&ev, 0, sizeof(ev));
   ev.type     = type;
@@ -106,8 +104,6 @@ sock_session_close_fd(sock_session_t *s)
   s->state = SOCK_STATE_CLOSED;
 }
 
-// Drain the send queue for a session. Called from the epoll thread.
-// returns: true if the queue was fully drained.
 static bool
 sock_drain_sendq(sock_session_t *s)
 {
@@ -191,11 +187,11 @@ static void
 sock_epoll_rearm(sock_worker_t *w, sock_session_t *s, bool want_out)
 {
   uint32_t events = EPOLLIN | EPOLLET;
+  struct epoll_event ev;
 
   if(want_out)
     events |= EPOLLOUT;
 
-  struct epoll_event ev;
   ev.events  = events;
   ev.data.ptr = s;
 
@@ -207,21 +203,20 @@ sock_epoll_rearm(sock_worker_t *w, sock_session_t *s, bool want_out)
 static void
 sock_set_keepalive(int fd, uint32_t interval)
 {
+  int yes = 1;
+  int cnt = 3;
+
   if(interval == 0)
     return;
 
-  int yes = 1;
   setsockopt(fd, SOL_SOCKET, SO_KEEPALIVE, &yes, sizeof(yes));
   setsockopt(fd, IPPROTO_TCP, TCP_KEEPIDLE, &interval, sizeof(interval));
   setsockopt(fd, IPPROTO_TCP, TCP_KEEPINTVL, &interval, sizeof(interval));
 
-  int cnt = 3;
   setsockopt(fd, IPPROTO_TCP, TCP_KEEPCNT, &cnt, sizeof(cnt));
 }
 
-// -----------------------------------------------------------------------
 // TLS helpers
-// -----------------------------------------------------------------------
 
 // Free TLS resources for a session.
 static void
@@ -247,8 +242,13 @@ sock_tls_cleanup(sock_session_t *s)
 static bool
 sock_tls_handshake(sock_session_t *s)
 {
-  int rc = SSL_connect(s->tls);
+  int rc;
+  int err;
+  sock_worker_t *w;
+  unsigned long ssl_err;
+  char errbuf[128];
 
+  rc = SSL_connect(s->tls);
   if(rc == 1)
   {
     // Handshake complete.
@@ -256,7 +256,7 @@ sock_tls_handshake(sock_session_t *s)
     s->last_activity = time(NULL);
     s->connected_at  = s->last_activity;
 
-    sock_worker_t *w = &sock_workers[s->worker_id];
+    w = &sock_workers[s->worker_id];
     sock_epoll_rearm(w, s, false);
 
     clam(CLAM_INFO, "sock", "[%s] TLS handshake complete (%s)",
@@ -266,26 +266,23 @@ sock_tls_handshake(sock_session_t *s)
     return(true);
   }
 
-  int err = SSL_get_error(s->tls, rc);
-
+  err = SSL_get_error(s->tls, rc);
   if(err == SSL_ERROR_WANT_READ)
   {
-    sock_worker_t *w = &sock_workers[s->worker_id];
+    w = &sock_workers[s->worker_id];
     sock_epoll_rearm(w, s, false);
     return(false);
   }
 
   if(err == SSL_ERROR_WANT_WRITE)
   {
-    sock_worker_t *w = &sock_workers[s->worker_id];
+    w = &sock_workers[s->worker_id];
     sock_epoll_rearm(w, s, true);
     return(false);
   }
 
   // Fatal handshake error.
-  unsigned long ssl_err = ERR_get_error();
-  char errbuf[128];
-
+  ssl_err = ERR_get_error();
   if(ssl_err != 0)
     ERR_error_string_n(ssl_err, errbuf, sizeof(errbuf));
   else
@@ -301,17 +298,17 @@ sock_tls_handshake(sock_session_t *s)
   return(true);
 }
 
-// -----------------------------------------------------------------------
 // Unix domain socket connect task (runs on a pool worker thread)
-// -----------------------------------------------------------------------
 
 static void
 sock_unix_connect_task(task_t *t)
 {
   sock_session_t *s = t->data;
+  int fd;
+  int rc;
+  struct sockaddr_un addr;
 
-  int fd = socket(AF_UNIX, SOCK_STREAM | SOCK_NONBLOCK | SOCK_CLOEXEC, 0);
-
+  fd = socket(AF_UNIX, SOCK_STREAM | SOCK_NONBLOCK | SOCK_CLOEXEC, 0);
   if(fd < 0)
   {
     clam(CLAM_WARN, "sock", "[%s] socket(AF_UNIX) failed: %s",
@@ -322,16 +319,16 @@ sock_unix_connect_task(task_t *t)
     return;
   }
 
-  struct sockaddr_un addr;
-
   memset(&addr, 0, sizeof(addr));
   addr.sun_family = AF_UNIX;
   snprintf(addr.sun_path, sizeof(addr.sun_path), "%s", s->path);
 
-  int rc = connect(fd, (struct sockaddr *)&addr, sizeof(addr));
-
+  rc = connect(fd, (struct sockaddr *)&addr, sizeof(addr));
   if(rc == 0)
   {
+    sock_worker_t *w = &sock_workers[s->worker_id];
+    struct epoll_event ev;
+
     // Immediate connect.
     s->fd = fd;
     s->state = SOCK_STATE_CONNECTED;
@@ -339,8 +336,6 @@ sock_unix_connect_task(task_t *t)
     s->connected_at  = s->last_activity;
 
     // Register with epoll.
-    sock_worker_t *w = &sock_workers[s->worker_id];
-    struct epoll_event ev;
     ev.events   = EPOLLIN | EPOLLET;
     ev.data.ptr = s;
     epoll_ctl(w->epoll_fd, EPOLL_CTL_ADD, fd, &ev);
@@ -350,11 +345,12 @@ sock_unix_connect_task(task_t *t)
 
   else if(errno == EINPROGRESS)
   {
+    sock_worker_t *w = &sock_workers[s->worker_id];
+    struct epoll_event ev;
+
     s->fd = fd;
     s->state = SOCK_STATE_CONNECTING;
 
-    sock_worker_t *w = &sock_workers[s->worker_id];
-    struct epoll_event ev;
     ev.events   = EPOLLOUT | EPOLLET;
     ev.data.ptr = s;
     epoll_ctl(w->epoll_fd, EPOLL_CTL_ADD, fd, &ev);
@@ -373,14 +369,16 @@ sock_unix_connect_task(task_t *t)
   t->state = TASK_ENDED;
 }
 
-// -----------------------------------------------------------------------
 // Resolve callback for TCP/UDP connections
-// -----------------------------------------------------------------------
 
 static void
 sock_resolve_done(const resolve_result_t *result)
 {
   sock_session_t *s = result->user_data;
+  int socktype;
+  int fd = -1;
+  int rc = -1;
+  sock_worker_t *w;
 
   if(result->status != 0 || result->count == 0)
   {
@@ -393,8 +391,6 @@ sock_resolve_done(const resolve_result_t *result)
   }
 
   // Determine socket type for socket() call.
-  int socktype;
-
   if(s->type == SOCK_TCP)
     socktype = SOCK_STREAM;
   else if(s->type == SOCK_UDP)
@@ -409,14 +405,12 @@ sock_resolve_done(const resolve_result_t *result)
   }
 
   // Try each resolved address.
-  int fd = -1;
-  int rc = -1;
-
   for(uint32_t i = 0; i < result->count; i++)
   {
     const resolve_record_t *rec = &result->records[i];
     const struct sockaddr_storage *sa;
     socklen_t sa_len;
+    struct sockaddr_storage sa_copy;
 
     if(rec->type == RESOLVE_A)
     {
@@ -434,7 +428,6 @@ sock_resolve_done(const resolve_result_t *result)
       continue;
 
     // Set port in the sockaddr (resolve doesn't know it).
-    struct sockaddr_storage sa_copy;
     memcpy(&sa_copy, sa, sa_len);
 
     if(sa_copy.ss_family == AF_INET)
@@ -472,12 +465,13 @@ sock_resolve_done(const resolve_result_t *result)
   if(s->type == SOCK_TCP)
     sock_set_keepalive(fd, sock_cfg.keepalive);
 
-  sock_worker_t *w = &sock_workers[s->worker_id];
+  w = &sock_workers[s->worker_id];
 
   if(rc == 0)
   {
-    // Immediate connect.
     struct epoll_event ev;
+
+    // Immediate connect.
     ev.events   = EPOLLIN | EPOLLET;
     ev.data.ptr = s;
     epoll_ctl(w->epoll_fd, EPOLL_CTL_ADD, fd, &ev);
@@ -508,10 +502,11 @@ sock_resolve_done(const resolve_result_t *result)
 
   else
   {
+    struct epoll_event ev;
+
     // EINPROGRESS — register for EPOLLOUT to detect completion.
     s->state = SOCK_STATE_CONNECTING;
 
-    struct epoll_event ev;
     ev.events   = EPOLLOUT | EPOLLET;
     ev.data.ptr = s;
     epoll_ctl(w->epoll_fd, EPOLL_CTL_ADD, fd, &ev);
@@ -519,18 +514,19 @@ sock_resolve_done(const resolve_result_t *result)
   }
 }
 
-// -----------------------------------------------------------------------
 // Timeout checking (called from epoll loop)
-// -----------------------------------------------------------------------
 
 static void
 sock_check_timeouts(void)
 {
-  time_t now = time(NULL);
+  time_t now;
+  sock_session_t *s;
+
+  now = time(NULL);
 
   pthread_mutex_lock(&sock_mutex);
 
-  sock_session_t *s = sock_list;
+  s = sock_list;
 
   while(s != NULL)
   {
@@ -591,14 +587,8 @@ sock_check_timeouts(void)
   pthread_mutex_unlock(&sock_mutex);
 }
 
-// -----------------------------------------------------------------------
 // Epoll worker thread (persistent task)
-// -----------------------------------------------------------------------
 
-// Persistent task running the epoll event loop for one worker thread.
-// Handles connect completion, TLS handshakes, read/write I/O, and
-// timeout checking. Runs until pool shutdown is signaled.
-// t: task handle (t->data is the sock_worker_t for this worker)
 static void
 sock_epoll_task(task_t *t)
 {
@@ -625,15 +615,21 @@ sock_epoll_task(task_t *t)
   }
 
   // Register wake_fd with epoll.
-  struct epoll_event wake_ev;
-  wake_ev.events  = EPOLLIN;
-  wake_ev.data.ptr = &w->wake_fd;
-  epoll_ctl(w->epoll_fd, EPOLL_CTL_ADD, w->wake_fd, &wake_ev);
+  {
+    struct epoll_event wake_ev;
+
+    wake_ev.events  = EPOLLIN;
+    wake_ev.data.ptr = &w->wake_fd;
+    epoll_ctl(w->epoll_fd, EPOLL_CTL_ADD, w->wake_fd, &wake_ev);
+  }
 
   clam(CLAM_INFO, "sock", "epoll worker %u started", w->id);
 
-  struct epoll_event *events = mem_alloc("sock", "epoll_events",
-      sizeof(struct epoll_event) * sock_cfg.epoll_max_events);
+  {
+    struct epoll_event *events;
+
+    events = mem_alloc("sock", "epoll_events",
+        sizeof(struct epoll_event) * sock_cfg.epoll_max_events);
 
   while(!pool_shutting_down())
   {
@@ -657,11 +653,13 @@ sock_epoll_task(task_t *t)
       if(ev->data.ptr == &w->wake_fd)
       {
         uint64_t val;
+        sock_session_t *s;
+
         (void)read(w->wake_fd, &val, sizeof(val));
 
         // Arm EPOLLOUT for any session with pending sends.
         pthread_mutex_lock(&sock_mutex);
-        sock_session_t *s = sock_list;
+        s = sock_list;
 
         while(s != NULL)
         {
@@ -669,8 +667,10 @@ sock_epoll_task(task_t *t)
               s->state == SOCK_STATE_CONNECTED &&
               s->fd >= 0 && !s->epollout_armed)
           {
+            bool has_data;
+
             pthread_mutex_lock(&s->send_lock);
-            bool has_data = (s->send_head != NULL);
+            has_data = (s->send_head != NULL);
             pthread_mutex_unlock(&s->send_lock);
 
             if(has_data)
@@ -685,6 +685,7 @@ sock_epoll_task(task_t *t)
       }
 
       // Session event.
+      {
       sock_session_t *s = ev->data.ptr;
 
       if(s->state == SOCK_STATE_CLOSED || s->fd < 0)
@@ -697,6 +698,7 @@ sock_epoll_task(task_t *t)
         {
           int err = 0;
           socklen_t errlen = sizeof(err);
+
           getsockopt(s->fd, SOL_SOCKET, SO_ERROR, &err, &errlen);
 
           clam(CLAM_WARN, "sock", "[%s] connect failed: %s",
@@ -761,9 +763,7 @@ sock_epoll_task(task_t *t)
         }
 
         else if(s->state == SOCK_STATE_TLS_HANDSHAKE)
-        {
           sock_tls_handshake(s);
-        }
 
         else if(s->state == SOCK_STATE_CONNECTED)
         {
@@ -867,6 +867,7 @@ sock_epoll_task(task_t *t)
             break;
         }
       }
+      }
     }
 
     // Check timeouts each iteration.
@@ -874,6 +875,7 @@ sock_epoll_task(task_t *t)
   }
 
   mem_free(events);
+  }
 
   close(w->wake_fd);
   w->wake_fd = -1;
@@ -884,9 +886,7 @@ sock_epoll_task(task_t *t)
   t->state = TASK_ENDED;
 }
 
-// -----------------------------------------------------------------------
 // KV configuration
-// -----------------------------------------------------------------------
 
 // Read all core.sock.* KV settings into the cached sock_cfg struct
 // and apply sanity clamps to keep values within safe bounds.
@@ -929,10 +929,6 @@ sock_load_config(void)
     sock_cfg.epoll_workers = SOCK_MAX_WORKERS;
 }
 
-// KV change callback — reloads all socket configuration when any
-// core.sock.* key is modified at runtime.
-// key: the changed KV key (unused, we reload all)
-// data: callback context (unused)
 static void
 sock_kv_changed(const char *key, void *data)
 {
@@ -946,32 +942,37 @@ sock_kv_changed(const char *key, void *data)
 static void
 sock_register_kv(void)
 {
-  kv_register("core.sock.connect_timeout",  KV_UINT32, "10",    sock_kv_changed, NULL);
-  kv_register("core.sock.read_buf_sz",      KV_UINT32, "4096",  sock_kv_changed, NULL);
-  kv_register("core.sock.send_queue_max",   KV_UINT32, "65536", sock_kv_changed, NULL);
-  kv_register("core.sock.idle_timeout",     KV_UINT32, "0",     sock_kv_changed, NULL);
-  kv_register("core.sock.keepalive",        KV_UINT32, "0",     sock_kv_changed, NULL);
-  kv_register("core.sock.max_sessions",     KV_UINT32, "256",   sock_kv_changed, NULL);
-  kv_register("core.sock.epoll_max_events", KV_UINT32, "64",    sock_kv_changed, NULL);
-  kv_register("core.sock.epoll_timeout",    KV_UINT32, "500",   sock_kv_changed, NULL);
-  kv_register("core.sock.epoll_workers",   KV_UINT32, "1",     NULL,            NULL);
+  kv_register("core.sock.connect_timeout",  KV_UINT32, "10",
+      sock_kv_changed, NULL, "TCP connect timeout in seconds");
+  kv_register("core.sock.read_buf_sz",      KV_UINT32, "4096",
+      sock_kv_changed, NULL, "Per-socket read buffer size in bytes");
+  kv_register("core.sock.send_queue_max",   KV_UINT32, "65536",
+      sock_kv_changed, NULL, "Maximum send queue size in bytes per socket");
+  kv_register("core.sock.idle_timeout",     KV_UINT32, "0",
+      sock_kv_changed, NULL, "Idle socket timeout in seconds (0=disabled)");
+  kv_register("core.sock.keepalive",        KV_UINT32, "0",
+      sock_kv_changed, NULL, "TCP keepalive interval in seconds (0=disabled)");
+  kv_register("core.sock.max_sessions",     KV_UINT32, "256",
+      sock_kv_changed, NULL, "Maximum concurrent socket sessions");
+  kv_register("core.sock.epoll_max_events", KV_UINT32, "64",
+      sock_kv_changed, NULL, "Maximum events returned per epoll_wait call");
+  kv_register("core.sock.epoll_timeout",    KV_UINT32, "500",
+      sock_kv_changed, NULL, "Epoll wait timeout in milliseconds");
+  kv_register("core.sock.epoll_workers",    KV_UINT32, "1",
+      NULL, NULL, "Number of epoll worker threads (read-only at startup)");
 }
 
-// -----------------------------------------------------------------------
 // Public API
-// -----------------------------------------------------------------------
 
 // Create a new socket session. Allocates the session struct, read buffer,
 // and assigns a worker via round-robin. Does not connect yet.
-// returns: session pointer, or NULL on failure
-// name: human-readable label for logging (max SOCK_NAME_SZ-1 chars)
-// type: socket type (TCP, UDP, ICMP, UNIX)
 // cb: event callback invoked on the epoll worker thread
-// user_data: opaque pointer passed to cb
 sock_session_t *
 sock_create(const char *name, sock_type_t type,
     sock_cb_t cb, void *user_data)
 {
+  sock_session_t *s;
+
   if(cb == NULL || !sock_ready)
     return(NULL);
 
@@ -982,7 +983,7 @@ sock_create(const char *name, sock_type_t type,
     return(NULL);
   }
 
-  sock_session_t *s = mem_alloc("sock", "session", sizeof(*s));
+  s = mem_alloc("sock", "session", sizeof(*s));
   memset(s, 0, sizeof(*s));
 
   strncpy(s->name, name ? name : "unnamed", SOCK_NAME_SZ - 1);
@@ -1019,12 +1020,12 @@ sock_create(const char *name, sock_type_t type,
 // Enable TLS on a session. Must be called after sock_create() and before
 // sock_connect(). Creates SSL_CTX and SSL objects; the actual handshake
 // occurs after TCP connect completes.
-// returns: SUCCESS or FAIL
-// session: session handle
-// verify: true to verify server certificate against system CA store
 bool
 sock_set_tls(sock_session_t *session, bool verify)
 {
+  SSL_CTX *ctx;
+  SSL *ssl;
+
   if(session == NULL)
     return(FAIL);
 
@@ -1043,8 +1044,7 @@ sock_set_tls(sock_session_t *session, bool verify)
   }
 
   // Create an SSL_CTX with a modern TLS method.
-  SSL_CTX *ctx = SSL_CTX_new(TLS_client_method());
-
+  ctx = SSL_CTX_new(TLS_client_method());
   if(ctx == NULL)
   {
     clam(CLAM_WARN, "sock", "[%s] SSL_CTX_new failed", session->name);
@@ -1061,13 +1061,10 @@ sock_set_tls(sock_session_t *session, bool verify)
   }
 
   else
-  {
     SSL_CTX_set_verify(ctx, SSL_VERIFY_NONE, NULL);
-  }
 
   // Create the SSL object.
-  SSL *ssl = SSL_new(ctx);
-
+  ssl = SSL_new(ctx);
   if(ssl == NULL)
   {
     clam(CLAM_WARN, "sock", "[%s] SSL_new failed", session->name);
@@ -1089,11 +1086,6 @@ sock_set_tls(sock_session_t *session, bool verify)
 // Initiate an asynchronous connection. For TCP/UDP, submits a DNS resolve
 // request; for UNIX, spawns a direct connect task. The consumer is notified
 // via SOCK_EVENT_CONNECTED or SOCK_EVENT_ERROR.
-// returns: SUCCESS or FAIL (invalid state or parameters)
-// session: session handle
-// host: hostname or IP (NULL for SOCK_UNIX)
-// port: port number (0 for SOCK_UNIX)
-// path: unix socket path (NULL for TCP/UDP)
 bool
 sock_connect(sock_session_t *session, const char *host, uint16_t port,
     const char *path)
@@ -1172,12 +1164,12 @@ sock_connect(sock_session_t *session, const char *host, uint16_t port,
 // any thread. Data is copied into a send buffer and drained by the epoll
 // worker. Wakes the worker if EPOLLOUT is not already armed.
 // returns: SUCCESS or FAIL (not connected, or send queue limit exceeded)
-// session: session handle
-// buf: data to send (copied internally)
-// len: number of bytes to send
 bool
 sock_send(sock_session_t *session, const void *buf, size_t len)
 {
+  sock_sendbuf_t *sb;
+  bool need_wake;
+
   if(session == NULL || buf == NULL || len == 0)
     return(FAIL);
 
@@ -1193,7 +1185,7 @@ sock_send(sock_session_t *session, const void *buf, size_t len)
     return(FAIL);
   }
 
-  sock_sendbuf_t *sb = sock_sbuf_alloc(buf, len);
+  sb = sock_sbuf_alloc(buf, len);
 
   pthread_mutex_lock(&session->send_lock);
 
@@ -1206,7 +1198,7 @@ sock_send(sock_session_t *session, const void *buf, size_t len)
   session->send_tail = sb;
   session->send_queued += (uint32_t)len;
 
-  bool need_wake = !session->epollout_armed;
+  need_wake = !session->epollout_armed;
 
   pthread_mutex_unlock(&session->send_lock);
 
@@ -1247,6 +1239,9 @@ sock_close(sock_session_t *session)
 void
 sock_destroy(sock_session_t *session)
 {
+  sock_session_t **pp;
+  sock_sendbuf_t *sb;
+
   if(session == NULL)
     return;
 
@@ -1257,7 +1252,7 @@ sock_destroy(sock_session_t *session)
   // Remove from session list.
   pthread_mutex_lock(&sock_mutex);
 
-  sock_session_t **pp = &sock_list;
+  pp = &sock_list;
 
   while(*pp != NULL)
   {
@@ -1275,11 +1270,12 @@ sock_destroy(sock_session_t *session)
 
   // Free send queue.
   pthread_mutex_lock(&session->send_lock);
-  sock_sendbuf_t *sb = session->send_head;
+  sb = session->send_head;
 
   while(sb != NULL)
   {
     sock_sendbuf_t *next = sb->next;
+
     sock_sbuf_release(sb);
     sb = next;
   }
@@ -1300,8 +1296,6 @@ sock_destroy(sock_session_t *session)
   mem_free(session);
 }
 
-// returns: the underlying file descriptor, or -1 if not connected
-// session: session handle (NULL returns -1)
 int
 sock_get_fd(const sock_session_t *session)
 {
@@ -1312,15 +1306,16 @@ sock_get_fd(const sock_session_t *session)
 }
 
 // Collect a thread-safe snapshot of socket subsystem statistics.
-// out: destination struct (zeroed and populated)
 void
 sock_get_stats(sock_stats_t *out)
 {
+  sock_session_t *s;
+
   memset(out, 0, sizeof(*out));
 
   pthread_mutex_lock(&sock_mutex);
 
-  sock_session_t *s = sock_list;
+  s = sock_list;
 
   while(s != NULL)
   {
@@ -1344,8 +1339,6 @@ sock_get_stats(sock_stats_t *out)
   out->workers       = sock_worker_count;
 }
 
-// returns: human-readable name for a socket type enum value
-// type: SOCK_TCP, SOCK_UDP, SOCK_ICMP, or SOCK_UNIX
 const char *
 sock_type_name(sock_type_t type)
 {
@@ -1359,8 +1352,6 @@ sock_type_name(sock_type_t type)
   }
 }
 
-// returns: human-readable name for a socket event type enum value
-// type: SOCK_EVENT_CONNECTED, _DATA, _DISCONNECT, or _ERROR
 const char *
 sock_event_name(sock_event_type_t type)
 {
@@ -1374,9 +1365,6 @@ sock_event_name(sock_event_type_t type)
   }
 }
 
-// returns: human-readable name for an internal socket state
-// state: sock_state_t cast to int (public API uses int to avoid
-//        exposing the internal enum)
 const char *
 sock_state_name(int state)
 {
@@ -1397,16 +1385,15 @@ sock_state_name(int state)
 // Each session's id, type, state, remote address, byte counters,
 // TLS flag, and connection timestamp are passed to the callback.
 // cb: iteration callback (must be fast — lock is held)
-// data: opaque user data forwarded to callback
 void
 sock_iterate(sock_iter_cb_t cb, void *data)
 {
+  uint32_t id = 0;
+
   if(cb == NULL)
     return;
 
   pthread_mutex_lock(&sock_mutex);
-
-  uint32_t id = 0;
 
   for(sock_session_t *s = sock_list; s != NULL; s = s->next)
   {
@@ -1427,9 +1414,7 @@ sock_iterate(sock_iter_cb_t cb, void *data)
   pthread_mutex_unlock(&sock_mutex);
 }
 
-// -----------------------------------------------------------------------
 // Subsystem lifecycle
-// -----------------------------------------------------------------------
 
 // Initialize the socket subsystem. Sets up mutexes, applies default
 // configuration, initializes worker slots, and spawns the initial set
@@ -1465,11 +1450,13 @@ sock_init(void)
   }
 
   // Spawn the configured number of epoll worker threads.
-  uint8_t want = (uint8_t)sock_cfg.epoll_workers;
+  {
+    uint8_t want = (uint8_t)sock_cfg.epoll_workers;
 
   for(uint8_t i = 0; i < want; i++)
   {
     char name[TASK_NAME_SZ];
+
     snprintf(name, sizeof(name), "sock_epoll_%u", i);
 
     sock_workers[i].task = task_add_persist(name, 50,
@@ -1482,6 +1469,7 @@ sock_init(void)
     }
 
     sock_worker_count++;
+  }
   }
 
   sock_ready = true;
@@ -1535,16 +1523,19 @@ sock_exit(void)
 void
 sock_register_config(void)
 {
+  uint8_t want;
+
   sock_register_kv();
   sock_load_config();
 
   // Scale up workers if config asks for more than we started.
-  uint8_t want = (uint8_t)sock_cfg.epoll_workers;
+  want = (uint8_t)sock_cfg.epoll_workers;
 
   while(sock_worker_count < want)
   {
     uint8_t i = sock_worker_count;
     char name[TASK_NAME_SZ];
+
     snprintf(name, sizeof(name), "sock_epoll_%u", i);
 
     sock_workers[i].task = task_add_persist(name, 50,

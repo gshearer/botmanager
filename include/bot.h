@@ -9,7 +9,6 @@
 
 #define BOT_NAME_SZ       64
 
-// Bot instance states.
 typedef enum
 {
   BOT_CREATED,    // instance exists, configured but not started
@@ -17,44 +16,31 @@ typedef enum
   BOT_STOPPING    // stop() called, draining in-flight work
 } bot_state_t;
 
-// Forward declaration.
 typedef struct bot_inst bot_inst_t;
 
-// Driver interface: functions a bot plugin must implement.
-// Stored in plugin_desc_t.ext for PLUGIN_BOT plugins.
+// Functions a bot plugin must implement. Stored in plugin_desc_t.ext
+// for PLUGIN_BOT plugins.
 typedef struct
 {
   const char *name;
 
-  // Create instance-specific state. Called during bot_create().
-  // inst: the bot instance being created
-  // returns: opaque handle, or NULL on failure
+  // Create instance-specific state. Returns opaque handle, or NULL on failure.
   void *(*create)(bot_inst_t *inst);
 
-  // Destroy instance-specific state. Called during bot_destroy().
-  // handle: opaque handle from create()
   void (*destroy)(void *handle);
 
-  // Start active operation. The bot is already subscribed to its
-  // methods at this point. Called during bot_start().
-  // returns: SUCCESS or FAIL
-  // handle: opaque handle from create()
+  // The bot is already subscribed to its methods at this point.
   bool (*start)(void *handle);
 
-  // Stop active operation, drain in-flight work. Called during bot_stop().
-  // handle: opaque handle from create()
   void (*stop)(void *handle);
 
-  // Incoming message from a subscribed method. This is the main entry
-  // point for bot behavior. The bot plugin decides what to do with
-  // the message (parse commands, forward to LLM, etc.) and is
-  // responsible for submitting tasks to the work queue as needed.
-  // handle: opaque handle from create()
-  // msg: full message context (valid for duration of callback)
+  // Incoming message from a subscribed method. The bot plugin decides
+  // what to do with the message (parse commands, forward to LLM, etc.)
+  // and is responsible for submitting tasks to the work queue as
+  // needed. msg is valid for the duration of the callback.
   void (*on_message)(void *handle, const method_msg_t *msg);
 } bot_driver_t;
 
-// Bot subsystem statistics.
 typedef struct
 {
   uint32_t instances;         // total bot instances
@@ -66,93 +52,49 @@ typedef struct
   uint64_t cmd_denials;       // lifetime permission denials
 } bot_stats_t;
 
-// -----------------------------------------------------------------------
-// Instance management
-// -----------------------------------------------------------------------
-
-// Create a new bot instance. The driver's create() callback is invoked
-// to produce instance-specific state.
-// returns: instance pointer, or NULL on failure
-// drv: bot driver interface (must not be NULL)
-// name: unique instance name (becomes KV prefix bot.name.*)
+// name becomes KV prefix bot.<name>.*
 bot_inst_t *bot_create(const bot_driver_t *drv, const char *name);
 
-// Destroy a bot instance. Stops if running, unsubscribes from all
-// methods, invokes driver destroy(), deletes KV namespace bot.name.*
-// returns: SUCCESS or FAIL (not found)
-// name: instance name
+// Stops if running, unsubscribes from all methods, invokes driver
+// destroy(), deletes KV namespace bot.<name>.*
 bool bot_destroy(const char *name);
 
-// Find an instance by name.
-// returns: instance pointer, or NULL if not found
-// name: instance name
 bot_inst_t *bot_find(const char *name);
-
-// Get the name of an instance.
-// returns: instance name string
-// inst: bot instance
 const char *bot_inst_name(const bot_inst_t *inst);
 
-// -----------------------------------------------------------------------
-// Method binding
-// -----------------------------------------------------------------------
-
-// Bind a method instance to this bot. The bot will subscribe to the
-// method when bot_start() is called. Can only be called while CREATED.
-// returns: SUCCESS or FAIL (duplicate, wrong state, at limit)
-// inst: bot instance
-// method_name: name of a registered method instance
-// method_kind: method plugin kind (e.g., "irc")
+// Can only be called while CREATED.
 bool bot_bind_method(bot_inst_t *inst, const char *method_name,
     const char *method_kind);
 
-// Unbind a method from this bot. Can only be called while CREATED.
-// returns: SUCCESS or FAIL (not found, wrong state)
-// inst: bot instance
-// method_name: method to unbind
+// Can only be called while CREATED.
 bool bot_unbind_method(bot_inst_t *inst, const char *method_name);
 
-// -----------------------------------------------------------------------
-// Namespace binding
-// -----------------------------------------------------------------------
-
-// Set the user namespace for this bot instance. Can only be called
-// while CREATED. Uses userns_get() which creates the namespace if
-// it does not exist.
-// returns: SUCCESS or FAIL
-// inst: bot instance
-// ns_name: user namespace name (NULL to clear)
+// Can only be called while CREATED. The namespace must already exist
+// (use userns_find). ns_name NULL clears.
 bool bot_set_userns(bot_inst_t *inst, const char *ns_name);
 
-// Get the user namespace bound to this bot instance.
-// returns: userns pointer, or NULL if none bound
-// inst: bot instance
 userns_t *bot_get_userns(const bot_inst_t *inst);
 
-// -----------------------------------------------------------------------
-// Session tracking
-// -----------------------------------------------------------------------
+// Clear the userns pointer on all bots bound to the named namespace.
+// Used when a namespace is deleted. Works regardless of bot state.
+void bot_clear_userns(const char *ns_name);
 
 // Authenticate a user and create an active session. Uses the bot's
 // bound user namespace for credential verification. If the sender
 // already has a session on this method, it is replaced.
 // Anonymous-by-default: no session exists until this succeeds.
-// returns: USERNS_AUTH_OK on success, or an auth error code.
-//          USERNS_AUTH_ERR if no namespace is bound or limits exceeded.
-// inst: bot instance (must be RUNNING, must have a user namespace)
-// method: the method instance the user is authenticating from
-// sender: protocol-level sender identity (e.g., IRC nick)
-// username: credential username
-// password: credential password
+// Returns USERNS_AUTH_ERR if no namespace is bound or limits exceeded.
 userns_auth_t bot_session_auth(bot_inst_t *inst, method_inst_t *method,
     const char *sender, const char *username, const char *password);
 
-// Find an active session by method and sender. This is the primary
-// lookup used by bots to check if a message sender is authenticated.
-// returns: authenticated username, or NULL if anonymous
-// inst: bot instance
-// method: method instance the message arrived on
-// sender: protocol-level sender identity
+// Create an authenticated session without password verification.
+// Used by the autoidentify system when a user's MFA pattern matches
+// and their autoidentify flag is enabled. Bot must be RUNNING.
+bool bot_session_create(bot_inst_t *inst, method_inst_t *method,
+    const char *sender, const char *username);
+
+// Primary lookup used by bots to check if a message sender is
+// authenticated. Returns authenticated username, or NULL if anonymous.
 const char *bot_session_find(const bot_inst_t *inst,
     const method_inst_t *method, const char *sender);
 
@@ -160,167 +102,142 @@ const char *bot_session_find(const bot_inst_t *inst,
 // authenticated session (same as bot_session_find). If none is found
 // and the bot has a user namespace, attempts MFA pattern matching
 // against the sender's full method context (e.g., "nick!user@host").
-// The is_authed flag (if non-NULL) is set to true for authenticated
-// sessions, false for MFA-matched-but-not-authenticated users.
-// returns: username, or NULL if anonymous and no MFA match
-// inst: bot instance
-// method: method instance the message arrived on
-// sender: protocol-level sender identity
-// mfa_string: full MFA context string (e.g., "nick!user@host"), or NULL
-// is_authed: output flag — true if from authenticated session, false if MFA match
+// is_authed (if non-NULL) is set to true for authenticated sessions,
+// false for MFA-matched-but-not-authenticated users.
 const char *bot_session_find_ex(const bot_inst_t *inst,
     const method_inst_t *method, const char *sender,
     const char *mfa_string, bool *is_authed);
+
+// Refresh the last_seen timestamp on a session matching a given
+// username and method. Called when the bot witnesses activity from
+// a user whose MFA string matches an active session, extending
+// their identity cache.
+bool bot_session_refresh_mfa(bot_inst_t *inst, method_inst_t *method,
+    const char *username);
 
 // Attempt user discovery from an MFA string. If the bot has user
 // discovery enabled (bot.<name>.userdiscovery != 0), a user namespace
 // bound, and the MFA string does not match any existing user, auto-
 // creates a user from the handle portion of the MFA string, adds the
-// MFA pattern, and returns the new username.
-// returns: discovered username (static buffer), or NULL if not discovered
-// inst: bot instance (must be RUNNING with a user namespace)
-// mfa_string: full MFA context (e.g., "nick!user@host")
+// MFA pattern, and returns the new username (static buffer).
 const char *bot_discover_user(bot_inst_t *inst, const char *mfa_string);
 
-// Remove an active session (logout). Identified by method + sender.
-// returns: SUCCESS or FAIL (no such session)
-// inst: bot instance
-// method: method instance
-// sender: protocol-level sender identity
+// Logout — identified by method + sender.
 bool bot_session_remove(bot_inst_t *inst, const method_inst_t *method,
     const char *sender);
 
-// Remove all active sessions for a bot instance.
-// inst: bot instance
 void bot_session_clear(bot_inst_t *inst);
-
-// Get the number of active sessions for a bot instance.
-// returns: session count
-// inst: bot instance
 uint32_t bot_session_count(const bot_inst_t *inst);
 
-// Callback for session iteration.
-// username: authenticated username
-// method_name: method instance name the session is on
-// auth_time: when the user authenticated
-// last_seen: last activity timestamp
-// data: opaque user data
 typedef void (*bot_session_iter_cb_t)(const char *username,
     const char *method_name, time_t auth_time, time_t last_seen,
     void *data);
 
-// Iterate active sessions for a bot instance. Locks bot_mutex for
-// the duration of the iteration.
-// inst: bot instance
-// cb: callback invoked for each active session
-// data: opaque user data passed to cb
+// Locks bot_mutex for the duration of the iteration.
 void bot_session_iterate(const bot_inst_t *inst,
     bot_session_iter_cb_t cb, void *data);
 
-// -----------------------------------------------------------------------
-// Lifecycle
-// -----------------------------------------------------------------------
+// Returns namespace name, or empty string if not set.
+const char *bot_session_get_userns_cd(const bot_inst_t *inst,
+    const method_inst_t *method, const char *sender);
 
-// Start a bot instance. Resolves and subscribes to all bound methods,
-// calls driver start(). Transitions CREATED -> RUNNING.
-// returns: SUCCESS or FAIL
-// inst: bot instance
+// ns_name NULL or empty clears.
+bool bot_session_set_userns_cd(bot_inst_t *inst,
+    const method_inst_t *method, const char *sender,
+    const char *ns_name);
+
+// Resolves and subscribes to all bound methods, calls driver start().
+// Transitions CREATED -> RUNNING.
 bool bot_start(bot_inst_t *inst);
 
-// Stop a bot instance. Calls driver stop(), unsubscribes from all
-// methods. Transitions RUNNING -> STOPPING -> CREATED.
-// returns: SUCCESS or FAIL
-// inst: bot instance
+// Calls driver stop(), unsubscribes from all methods.
+// Transitions RUNNING -> STOPPING -> CREATED.
 bool bot_stop(bot_inst_t *inst);
 
-// -----------------------------------------------------------------------
-// State and statistics
-// -----------------------------------------------------------------------
-
-// Get current state of an instance.
-// returns: current bot state
-// inst: bot instance
 bot_state_t bot_get_state(const bot_inst_t *inst);
-
-// returns: human-readable name of a bot state
-// s: bot state enum value
 const char *bot_state_name(bot_state_t s);
 
-// Get bot subsystem statistics (thread-safe snapshot).
-// out: destination for the snapshot
 void bot_get_stats(bot_stats_t *out);
 
-// -----------------------------------------------------------------------
-// Iteration
-// -----------------------------------------------------------------------
-
-// Callback for bot instance iteration.
-// name: instance name
-// driver_name: bot driver name (e.g., "command")
-// state: current instance state
-// method_count: number of bound methods
-// session_count: number of active sessions
-// userns_name: bound user namespace name, or NULL
-// cmd_count: lifetime commands dispatched for this bot
-// last_activity: timestamp of last message received (0 if never)
-// data: opaque user data
 typedef void (*bot_iter_cb_t)(const char *name, const char *driver_name,
     bot_state_t state, uint32_t method_count, uint32_t session_count,
     const char *userns_name, uint64_t cmd_count, time_t last_activity,
     void *data);
 
-// Iterate all bot instances, calling cb for each.
-// cb: callback invoked for each instance
-// data: opaque user data passed to cb
 void bot_iterate(bot_iter_cb_t cb, void *data);
 
-// Get the driver name for a bot instance.
-// returns: driver name string
-// inst: bot instance
 const char *bot_driver_name(const bot_inst_t *inst);
-
-// Get the number of bound methods for a bot instance.
-// returns: method count
-// inst: bot instance
 uint32_t bot_method_count(const bot_inst_t *inst);
 
-// Increment the command dispatch counter for a bot instance.
+// Returns the first bound method, or NULL. Useful for driver-side
+// helpers (e.g. chatbot volunteer speech) that need a valid
+// method_inst_t for an outbound channel send without reconstructing
+// the routing layer.
+method_inst_t *bot_first_method(const bot_inst_t *inst);
+
+// Resolve a method instance bound to this bot from `key`, which may be
+// either a method instance name (e.g. "drow") or a method kind (e.g.
+// "irc"). Instance name wins when both interpretations are plausible;
+// the kind match returns the first binding of that kind. Intended for
+// user-facing destination specs like "<bot>:<key>:<target>" where the
+// user shouldn't need to know whether they wrote an instance name or a
+// kind.
+method_inst_t *bot_resolve_method(const bot_inst_t *inst, const char *key);
+
 // Called by cmd_dispatch() on successful command dispatch.
-// inst: bot instance
 void bot_inc_cmd_count(bot_inst_t *inst);
 
-// -----------------------------------------------------------------------
-// Lifecycle
-// -----------------------------------------------------------------------
+uint64_t bot_cmd_count(const bot_inst_t *inst);
+time_t bot_last_activity(const bot_inst_t *inst);
 
-// Initialize the bot subsystem.
+// Opaque handle from driver create(), or NULL. Used by show verb
+// handlers that need to pull stats from the driver's private state
+// (e.g. llm's in-flight counter).
+void *bot_get_handle(const bot_inst_t *inst);
+
 void bot_init(void);
 
 // Register per-bot method KV keys by copying the method plugin's KV
 // schema into the bot's namespace. Transforms bare suffix keys
 // to bot.<botname>.<kind>.* with the same types and defaults.
-// returns: number of keys registered (0 if plugin not found or no schema)
-// botname: bot instance name
-// method_kind: method plugin kind (e.g., "irc")
+// Returns 0 if plugin not found or no schema.
 uint32_t bot_register_method_kv(const char *botname, const char *method_kind);
 
-// Create bot persistence tables in the database.
+// Register a bot driver's kv_inst_schema (e.g., llm's per-instance
+// keys) under "bot.<botname>." after a bot is created.
+uint32_t bot_register_driver_kv(const char *botname, const char *bot_kind);
+
 // Must be called after db_init().
-// returns: SUCCESS or FAIL
 bool bot_ensure_tables(void);
 
 // Restore bot instances from database. Creates instances, binds
 // methods, sets user namespaces, and auto-starts previously running
 // bots. Must be called after plugins are started and KV is loaded.
-// returns: SUCCESS or FAIL
 bool bot_restore(void);
 
-// Register KV configuration keys and load values. Must be called
-// after kv_init() and kv_load().
+// Must be called after kv_init() and kv_load().
 void bot_register_config(void);
 
-// Shut down the bot subsystem. Stops and destroys all instances.
+// Stops and destroys all instances.
 void bot_exit(void);
+
+// Must be called after cmd_init().
+void bot_register_commands(void);
+
+// Kind-scoped bot verbs:
+// Bot-kind-specific verbs (e.g. llm's "personas" and "memories")
+// register as children of "show/bot" or "bot" via cmd_register() with
+// a non-NULL kind_filter. Dispatchers in core/bot_cmd.c resolve them
+// with cmd_find_child_for_kind() so only children whose filter admits
+// the bot's driver kind match.
+
+// Forward decl: cmd_ctx_t lives in cmd.h (tagged struct) and is
+// passed through opaque where needed.
+struct cmd_ctx;
+#ifndef BM_CMD_CTX_T_DEFINED
+#define BM_CMD_CTX_T_DEFINED
+typedef struct cmd_ctx cmd_ctx_t;
+#endif
 
 #ifdef BOT_INTERNAL
 
@@ -328,12 +245,11 @@ void bot_exit(void);
 #include "clam.h"
 #include "db.h"
 #include "kv.h"
-#include "mem.h"
+#include "alloc.h"
 #include "plugin.h"
 #include "pool.h"
 #include "task.h"
 
-// Per-instance method binding record.
 typedef struct bot_method
 {
   char               method_name[METHOD_NAME_SZ];
@@ -344,7 +260,6 @@ typedef struct bot_method
   struct bot_method *next;
 } bot_method_t;
 
-// Active authenticated session.
 typedef struct bot_session
 {
   char                username[USERNS_USER_SZ];    // authenticated username
@@ -353,10 +268,10 @@ typedef struct bot_session
   time_t              login_time;                   // session creation time
   time_t              auth_time;                    // authentication timestamp
   time_t              last_seen;                    // last activity timestamp
+  char                userns_cd[USERNS_NAME_SZ];   // /user cd override (empty = use bot default)
   struct bot_session *next;
 } bot_session_t;
 
-// Bot instance.
 struct bot_inst
 {
   char                   name[BOT_NAME_SZ];
@@ -374,7 +289,6 @@ struct bot_inst
   struct bot_inst       *next;
 };
 
-// Cached configuration (loaded from KV).
 typedef struct
 {
   uint32_t max_methods;
@@ -386,23 +300,42 @@ static bot_cfg_t bot_cfg = {
   .max_sessions = 256,
 };
 
-// Module state.
 static bot_inst_t      *bot_list  = NULL;
 static pthread_mutex_t  bot_mutex;
 static uint32_t         bot_count = 0;
 static bool             bot_ready = false;
 
-// Method binding freelist.
 static bot_method_t    *bot_method_freelist    = NULL;
 static uint32_t         bot_method_free_count  = 0;
 
-// Session freelist.
 static bot_session_t   *bot_session_freelist   = NULL;
 static uint32_t         bot_session_free_count = 0;
 
-// Lifetime counters.
 static uint32_t         bot_stat_discoveries   = 0;
 
 #endif // BOT_INTERNAL
+
+#ifdef BOT_CMD_INTERNAL
+
+#include "common.h"
+#include "cmd.h"
+#include "colors.h"
+#include "db.h"
+#include "kv.h"
+#include "alloc.h"
+#include "plugin.h"
+#include "pool.h"
+#include "validate.h"
+
+#include <stdio.h>
+#include <string.h>
+
+typedef struct
+{
+  const cmd_ctx_t *ctx;
+  uint32_t         count;
+} bot_cmd_list_state_t;
+
+#endif // BOT_CMD_INTERNAL
 
 #endif // BM_BOT_H

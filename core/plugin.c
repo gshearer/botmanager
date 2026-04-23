@@ -1,30 +1,19 @@
+// botmanager — MIT
+// Plugin loader: dlopen, descriptor registration, lifecycle dispatch.
 #define PLUGIN_INTERNAL
 #include "plugin.h"
 #include "util.h"
 
-// -----------------------------------------------------------------------
-// Find a plugin record by name.
-// returns: plugin record pointer, or NULL
-// name: plugin name to find
-// -----------------------------------------------------------------------
 static plugin_rec_t *
 find_by_name(const char *name)
 {
   for(plugin_rec_t *p = plugins; p != NULL; p = p->next)
-  {
     if(strcmp(p->desc->name, name) == 0)
       return(p);
-  }
 
   return(NULL);
 }
 
-// -----------------------------------------------------------------------
-// Validate a plugin descriptor.
-// returns: SUCCESS or FAIL
-// desc: descriptor to validate
-// path: file path (for diagnostics)
-// -----------------------------------------------------------------------
 static bool
 validate_desc(const plugin_desc_t *desc, const char *path)
 {
@@ -79,20 +68,21 @@ validate_desc(const plugin_desc_t *desc, const char *path)
   return(SUCCESS);
 }
 
-// -----------------------------------------------------------------------
 // Public API
-// -----------------------------------------------------------------------
 
-// returns: SUCCESS or FAIL
-// path: file path to the .so shared library
 bool
 plugin_load(const char *path)
 {
+  void                *handle;
+  const plugin_desc_t *desc;
+  const char          *err;
+  plugin_rec_t        *rec;
+
   if(path == NULL || !plugin_ready)
     return(FAIL);
 
   // dlopen the shared library.
-  void *handle = dlopen(path, RTLD_NOW | RTLD_LOCAL);
+  handle = dlopen(path, RTLD_NOW | RTLD_LOCAL);
 
   if(handle == NULL)
   {
@@ -102,8 +92,8 @@ plugin_load(const char *path)
 
   // Resolve the entry point symbol.
   dlerror();  // clear any prior error
-  const plugin_desc_t *desc = dlsym(handle, PLUGIN_ENTRY_SYMBOL);
-  const char *err = dlerror();
+  desc = dlsym(handle, PLUGIN_ENTRY_SYMBOL);
+  err = dlerror();
 
   if(err != NULL || desc == NULL)
   {
@@ -122,7 +112,7 @@ plugin_load(const char *path)
   }
 
   // Create a plugin record.
-  plugin_rec_t *rec = mem_alloc("plugin", "record", sizeof(plugin_rec_t));
+  rec = mem_alloc("plugin", "record", sizeof(plugin_rec_t));
 
   strncpy(rec->path, path, PLUGIN_PATH_SZ - 1);
   rec->path[PLUGIN_PATH_SZ - 1] = '\0';
@@ -148,15 +138,16 @@ plugin_load(const char *path)
   return(SUCCESS);
 }
 
-// returns: SUCCESS or FAIL (not found, or has active dependents)
-// name: plugin name to unload
 bool
 plugin_unload(const char *name)
 {
+  plugin_rec_t  *target;
+  plugin_rec_t **pp;
+
   if(name == NULL || !plugin_ready)
     return(FAIL);
 
-  plugin_rec_t *target = find_by_name(name);
+  target = find_by_name(name);
 
   if(target == NULL)
   {
@@ -208,7 +199,7 @@ plugin_unload(const char *name)
   }
 
   // Remove from list.
-  plugin_rec_t **pp = &plugins;
+  pp = &plugins;
 
   while(*pp != NULL)
   {
@@ -216,7 +207,10 @@ plugin_unload(const char *name)
     {
       *pp = target->next;
       clam(CLAM_INFO, "plugin", "unloading '%s'", name);
-      dlclose(target->handle);
+
+      if(target->handle != NULL)
+        dlclose(target->handle);  // synthetic providers have no handle
+
       mem_free(target);
       n_plugins--;
       return(SUCCESS);
@@ -228,15 +222,17 @@ plugin_unload(const char *name)
   return(FAIL);  // unreachable
 }
 
-// returns: number of plugins successfully loaded
-// dir: directory to scan for .so files (recursive)
 uint32_t
 plugin_discover(const char *dir)
 {
+  DIR           *d;
+  uint32_t       loaded = 0;
+  struct dirent *ent;
+
   if(dir == NULL || !plugin_ready)
     return(0);
 
-  DIR *d = opendir(dir);
+  d = opendir(dir);
 
   if(d == NULL)
   {
@@ -245,21 +241,18 @@ plugin_discover(const char *dir)
     return(0);
   }
 
-  uint32_t loaded = 0;
-  struct dirent *ent;
-
   while((ent = readdir(d)) != NULL)
   {
+    char        path[PLUGIN_PATH_SZ];
+    struct stat st;
+    size_t      len;
+
     if(ent->d_name[0] == '.')
       continue;
-
-    char path[PLUGIN_PATH_SZ];
 
     snprintf(path, sizeof(path), "%s/%s", dir, ent->d_name);
 
     // Recurse into subdirectories.
-    struct stat st;
-
     if(stat(path, &st) != 0)
       continue;
 
@@ -273,7 +266,7 @@ plugin_discover(const char *dir)
       continue;
 
     // Only consider .so files.
-    size_t len = strlen(ent->d_name);
+    len = strlen(ent->d_name);
 
     if(len < 4 || strcmp(ent->d_name + len - 3, ".so") != 0)
       continue;
@@ -286,62 +279,45 @@ plugin_discover(const char *dir)
   return(loaded);
 }
 
-// Check if a feature is provided by any plugin in a subset.
-// returns: true if found
-// feature: feature name to search for
-// arr: array of plugin records
-// indices: array of indices into arr to search
-// n: number of indices
 static bool
 resolve_feature_in(const char *feature, plugin_rec_t **arr,
     const uint32_t *indices, uint32_t n)
 {
   for(uint32_t j = 0; j < n; j++)
   {
-    const plugin_desc_t *pd = arr[indices[j]]->desc;
+    const plugin_desc_t *pd;
+
+    pd = arr[indices[j]]->desc;
 
     for(uint32_t k = 0; k < pd->provides_count; k++)
-    {
       if(strcmp(pd->provides[k].name, feature) == 0)
         return(true);
-    }
   }
 
   return(false);
 }
 
-// Check if a feature is provided by any plugin in the full array,
-// excluding the plugin at skip_idx.
-// returns: true if found
-// feature: feature name to search for
-// arr: array of plugin records
-// count: total plugins
-// skip_idx: index to skip (the requester itself)
 static bool
 resolve_feature_exists(const char *feature, plugin_rec_t **arr,
     uint32_t count, uint32_t skip_idx)
 {
   for(uint32_t j = 0; j < count; j++)
   {
+    const plugin_desc_t *pd;
+
     if(j == skip_idx)
       continue;
 
-    const plugin_desc_t *pd = arr[j]->desc;
+    pd = arr[j]->desc;
 
     for(uint32_t k = 0; k < pd->provides_count; k++)
-    {
       if(strcmp(pd->provides[k].name, feature) == 0)
         return(true);
-    }
   }
 
   return(false);
 }
 
-// Reorder the global plugin list to match the resolved order and log it.
-// arr: array of plugin records
-// order: resolved index order
-// count: total plugins
 static void
 resolve_apply_order(plugin_rec_t **arr, const uint32_t *order,
     uint32_t count)
@@ -361,11 +337,6 @@ resolve_apply_order(plugin_rec_t **arr, const uint32_t *order,
         arr[order[i]]->desc->name);
 }
 
-// Report unsatisfied dependencies and detect circular dependencies
-// among unplaced plugins.
-// arr: array of plugin records
-// placed: per-plugin placement flags
-// count: total plugins
 static void
 resolve_report_failures(plugin_rec_t **arr, const bool *placed,
     uint32_t count)
@@ -374,10 +345,12 @@ resolve_report_failures(plugin_rec_t **arr, const bool *placed,
 
   for(uint32_t i = 0; i < count; i++)
   {
+    const plugin_desc_t *desc;
+
     if(placed[i])
       continue;
 
-    const plugin_desc_t *desc = arr[i]->desc;
+    desc = arr[i]->desc;
 
     for(uint32_t r = 0; r < desc->requires_count; r++)
     {
@@ -396,58 +369,57 @@ resolve_report_failures(plugin_rec_t **arr, const bool *placed,
     clam(CLAM_WARN, "plugin", "circular dependency detected");
 }
 
-// -----------------------------------------------------------------------
-// Resolve plugin dependency order.
-// Topologically sorts loaded plugins so providers precede dependents.
-// returns: SUCCESS or FAIL (unsatisfied or circular dependency)
-// -----------------------------------------------------------------------
 bool
 plugin_resolve(void)
 {
+  uint32_t        count;
+  plugin_rec_t  **arr;
+  uint32_t        idx = 0;
+  bool           *placed;
+  uint32_t       *order;
+  uint32_t        n_placed = 0;
+  bool            progress = true;
+  bool            result;
+
   if(!plugin_ready)
     return(FAIL);
 
   if(n_plugins == 0)
     return(SUCCESS);
 
-  uint32_t count = n_plugins;
+  count = n_plugins;
 
   // Collect all plugin records into an array for sorting.
-  plugin_rec_t **arr = mem_alloc("plugin", "resolve",
+  arr = mem_alloc("plugin", "resolve",
       count * sizeof(plugin_rec_t *));
-
-  uint32_t idx = 0;
 
   for(plugin_rec_t *p = plugins; p != NULL; p = p->next)
     arr[idx++] = p;
 
-  bool     *placed = mem_alloc("plugin", "placed", count * sizeof(bool));
-  uint32_t *order  = mem_alloc("plugin", "order", count * sizeof(uint32_t));
-  uint32_t  n_placed = 0;
+  placed = mem_alloc("plugin", "placed", count * sizeof(bool));
+  order  = mem_alloc("plugin", "order", count * sizeof(uint32_t));
 
   memset(placed, 0, count * sizeof(bool));
 
   // Kahn's-style: repeatedly place plugins whose requirements are met
   // by already-placed plugins.
-  bool progress = true;
-
   while(progress && n_placed < count)
   {
     progress = false;
 
     for(uint32_t i = 0; i < count; i++)
     {
+      const plugin_desc_t *desc;
+      bool                 satisfied = true;
+
       if(placed[i])
         continue;
 
-      const plugin_desc_t *desc = arr[i]->desc;
-      bool satisfied = true;
+      desc = arr[i]->desc;
 
       for(uint32_t r = 0; r < desc->requires_count && satisfied; r++)
-      {
         if(!resolve_feature_in(desc->requires[r].name, arr, order, n_placed))
           satisfied = false;
-      }
 
       if(satisfied)
       {
@@ -457,8 +429,6 @@ plugin_resolve(void)
       }
     }
   }
-
-  bool result;
 
   if(n_placed == count)
   {
@@ -478,10 +448,6 @@ plugin_resolve(void)
   return(result);
 }
 
-// -----------------------------------------------------------------------
-// Lifecycle: init all loaded plugins (dependency order, head to tail).
-// returns: SUCCESS or FAIL
-// -----------------------------------------------------------------------
 bool
 plugin_init_all(void)
 {
@@ -501,7 +467,10 @@ plugin_init_all(void)
       for(uint32_t i = 0; i < p->desc->kv_schema_count; i++)
       {
         const plugin_kv_entry_t *e = &p->desc->kv_schema[i];
-        kv_register(e->key, e->type, e->default_val, NULL, NULL);
+
+        if(kv_register(e->key, e->type, e->default_val, e->cb, NULL,
+            e->help) == SUCCESS && e->nl != NULL)
+          kv_register_nl(e->key, e->nl);
       }
 
       clam(CLAM_DEBUG, "plugin", "'%s' registered %u KV key(s)",
@@ -521,10 +490,6 @@ plugin_init_all(void)
   return(SUCCESS);
 }
 
-// -----------------------------------------------------------------------
-// Lifecycle: start all initialized plugins (dependency order, head to tail).
-// returns: SUCCESS or FAIL
-// -----------------------------------------------------------------------
 bool
 plugin_start_all(void)
 {
@@ -551,20 +516,19 @@ plugin_start_all(void)
   return(SUCCESS);
 }
 
-// -----------------------------------------------------------------------
-// Lifecycle: stop all running plugins (reverse dependency order).
-// -----------------------------------------------------------------------
 void
 plugin_stop_all(void)
 {
+  uint32_t       count;
+  plugin_rec_t **arr;
+  uint32_t       idx = 0;
+
   if(!plugin_ready || n_plugins == 0)
     return;
 
-  uint32_t count = n_plugins;
-  plugin_rec_t **arr = mem_alloc("plugin", "stop_all",
+  count = n_plugins;
+  arr = mem_alloc("plugin", "stop_all",
       count * sizeof(plugin_rec_t *));
-
-  uint32_t idx = 0;
 
   for(plugin_rec_t *p = plugins; p != NULL; p = p->next)
     arr[idx++] = p;
@@ -587,21 +551,19 @@ plugin_stop_all(void)
   mem_free(arr);
 }
 
-// -----------------------------------------------------------------------
-// Lifecycle: deinit all initialized/stopping plugins (reverse dependency
-// order).
-// -----------------------------------------------------------------------
 void
 plugin_deinit_all(void)
 {
+  uint32_t       count;
+  plugin_rec_t **arr;
+  uint32_t       idx = 0;
+
   if(!plugin_ready || n_plugins == 0)
     return;
 
-  uint32_t count = n_plugins;
-  plugin_rec_t **arr = mem_alloc("plugin", "deinit_all",
+  count = n_plugins;
+  arr = mem_alloc("plugin", "deinit_all",
       count * sizeof(plugin_rec_t *));
-
-  uint32_t idx = 0;
 
   for(plugin_rec_t *p = plugins; p != NULL; p = p->next)
     arr[idx++] = p;
@@ -624,21 +586,19 @@ plugin_deinit_all(void)
   mem_free(arr);
 }
 
-// returns: plugin descriptor, or NULL
-// name: plugin name to find
 const plugin_desc_t *
 plugin_find(const char *name)
 {
+  plugin_rec_t *rec;
+
   if(name == NULL)
     return(NULL);
 
-  plugin_rec_t *rec = find_by_name(name);
+  rec = find_by_name(name);
 
   return(rec ? rec->desc : NULL);
 }
 
-// returns: descriptor of the plugin providing the feature, or NULL
-// feature: feature name to search for
 const plugin_desc_t *
 plugin_find_feature(const char *feature)
 {
@@ -648,18 +608,13 @@ plugin_find_feature(const char *feature)
   for(plugin_rec_t *p = plugins; p != NULL; p = p->next)
   {
     for(uint32_t i = 0; i < p->desc->provides_count; i++)
-    {
       if(strcmp(p->desc->provides[i].name, feature) == 0)
         return(p->desc);
-    }
   }
 
   return(NULL);
 }
 
-// returns: descriptor of matching plugin, or NULL
-// type: plugin type to match
-// kind: optional kind filter (NULL or "" for any)
 const plugin_desc_t *
 plugin_find_type(plugin_type_t type, const char *kind)
 {
@@ -675,24 +630,46 @@ plugin_find_type(plugin_type_t type, const char *kind)
   return(NULL);
 }
 
-// returns: plugin lifecycle state (PLUGIN_UNLOADED if not found)
-// name: plugin name to query
 plugin_state_t
 plugin_get_state(const char *name)
 {
+  plugin_rec_t *rec;
+
   if(name == NULL)
     return(PLUGIN_UNLOADED);
 
-  plugin_rec_t *rec = find_by_name(name);
+  rec = find_by_name(name);
 
   return(rec ? rec->state : PLUGIN_UNLOADED);
 }
 
-// returns: number of currently loaded plugins
 uint32_t
 plugin_count(void)
 {
   return(n_plugins);
+}
+
+// Resolve a symbol out of a named plugin's .so. Plugins are dlopen'd
+// with RTLD_LOCAL, so host code cannot rely on link-time reference to
+// plugin-resident helpers — the resolution happens here instead.
+//
+// returns: symbol pointer or NULL (plugin not loaded, or symbol missing)
+void *
+plugin_dlsym(const char *plugin_name, const char *symbol)
+{
+  plugin_rec_t *rec;
+
+  if(plugin_name == NULL || symbol == NULL)
+    return(NULL);
+
+  rec = find_by_name(plugin_name);
+
+  if(rec == NULL || rec->handle == NULL)
+    return(NULL);
+
+  // Clear any pending dlerror so a NULL return is unambiguous.
+  dlerror();
+  return(dlsym(rec->handle, symbol));
 }
 
 void
@@ -705,8 +682,6 @@ plugin_get_stats(plugin_stats_t *out)
   out->loaded = n_plugins;
 }
 
-// returns: human-readable name of a plugin type
-// t: plugin type enum value
 const char *
 plugin_type_name(plugin_type_t t)
 {
@@ -724,8 +699,6 @@ plugin_type_name(plugin_type_t t)
   return("unknown");
 }
 
-// returns: human-readable name of a plugin state
-// s: plugin state enum value
 const char *
 plugin_state_name(plugin_state_t s)
 {
@@ -742,73 +715,61 @@ plugin_state_name(plugin_state_t s)
   return("unknown");
 }
 
-// -----------------------------------------------------------------------
 // KV schema group helpers
-// -----------------------------------------------------------------------
 
-// returns: schema group descriptor, or NULL if not found
-// plugin_name: name of the plugin to search
-// group_name: schema group name (e.g., "channel")
 const plugin_kv_group_t *
 plugin_kv_group_find(const char *plugin_name, const char *group_name)
 {
+  const plugin_desc_t *pd;
+
   if(plugin_name == NULL || group_name == NULL)
     return(NULL);
 
-  const plugin_desc_t *pd = plugin_find(plugin_name);
+  pd = plugin_find(plugin_name);
 
   if(pd == NULL || pd->kv_groups == NULL || pd->kv_groups_count == 0)
     return(NULL);
 
   for(uint32_t i = 0; i < pd->kv_groups_count; i++)
-  {
     if(strcmp(pd->kv_groups[i].name, group_name) == 0)
       return(&pd->kv_groups[i]);
-  }
 
   return(NULL);
 }
 
-// returns: number of entries successfully registered
-// group: schema group to instantiate
-// ...: string arguments for the key_prefix format placeholders
 uint32_t
 plugin_kv_group_register(const plugin_kv_group_t *group, ...)
 {
+  char     prefix[KV_KEY_SZ];
+  va_list  args;
+  uint32_t registered = 0;
+
   if(group == NULL || group->schema == NULL || group->schema_count == 0)
     return(0);
 
   // Build the concrete prefix from the format pattern + varargs.
-  char prefix[KV_KEY_SZ];
-  va_list args;
-
   va_start(args, group);
   vsnprintf(prefix, sizeof(prefix), group->key_prefix, args);
   va_end(args);
 
-  uint32_t registered = 0;
-
   for(uint32_t i = 0; i < group->schema_count; i++)
   {
     const plugin_kv_entry_t *e = &group->schema[i];
+    char                     key[KV_KEY_SZ];
 
     if(e->key == NULL)
       continue;
 
-    char key[KV_KEY_SZ];
-
     snprintf(key, sizeof(key), "%s%s", prefix, e->key);
 
-    if(kv_register(key, e->type, e->default_val, NULL, NULL) == SUCCESS)
+    if(kv_register(key, e->type, e->default_val, e->cb, NULL,
+        e->help) == SUCCESS)
       registered++;
   }
 
   return(registered);
 }
 
-// Iterate all schema groups across all loaded plugins.
-// cb: callback invoked for each group
-// data: opaque user data passed to callback
 void
 plugin_kv_group_iterate(plugin_kv_group_iter_cb_t cb, void *data)
 {
@@ -825,13 +786,8 @@ plugin_kv_group_iterate(plugin_kv_group_iter_cb_t cb, void *data)
   }
 }
 
-// -----------------------------------------------------------------------
 // Plugin iteration
-// -----------------------------------------------------------------------
 
-// Iterate all loaded plugins.
-// cb: callback invoked for each plugin
-// data: opaque user data passed to callback
 void
 plugin_iterate(plugin_iterate_cb_t cb, void *data)
 {
@@ -839,15 +795,11 @@ plugin_iterate(plugin_iterate_cb_t cb, void *data)
     return;
 
   for(plugin_rec_t *p = plugins; p != NULL; p = p->next)
-  {
     cb(p->desc->name, p->desc->version, p->path,
         p->desc->type, p->desc->kind, p->state, data);
-  }
 }
 
-// -----------------------------------------------------------------------
 // /show plugin command
-// -----------------------------------------------------------------------
 
 #define PLUGIN_SHOW_MAX 64
 
@@ -881,10 +833,10 @@ static void
 plugin_mem_sum_cb(const char *module, const char *name,
     size_t sz, time_t timestamp, void *data)
 {
+  plugin_mem_match_t *m = data;
+
   (void)name;
   (void)timestamp;
-
-  plugin_mem_match_t *m = data;
 
   if(strcmp(module, m->module) == 0)
     m->total += sz;
@@ -896,14 +848,16 @@ plugin_show_iter_cb(const char *name, const char *version,
     const char *path, plugin_type_t type, const char *kind,
     plugin_state_t state, void *data)
 {
-  (void)path;
-
   plugin_show_state_t *st = data;
+  plugin_show_row_t   *r;
+  plugin_mem_match_t   mm;
+
+  (void)path;
 
   if(st->count >= PLUGIN_SHOW_MAX)
     return;
 
-  plugin_show_row_t *r = &st->rows[st->count];
+  r = &st->rows[st->count];
 
   strncpy(r->name, name, PLUGIN_NAME_SZ - 1);
   r->name[PLUGIN_NAME_SZ - 1] = '\0';
@@ -917,15 +871,14 @@ plugin_show_iter_cb(const char *name, const char *version,
   r->state[sizeof(r->state) - 1] = '\0';
 
   // Sum memory allocations whose module matches the plugin kind.
-  plugin_mem_match_t mm = { .module = kind[0] != '\0' ? kind : name,
-                            .total  = 0 };
+  mm = (plugin_mem_match_t){ .module = kind[0] != '\0' ? kind : name,
+                             .total  = 0 };
 
   mem_iterate(plugin_mem_sum_cb, &mm);
   r->mem_bytes = mm.total;
 
   st->count++;
 }
-
 
 // qsort comparator: sort plugin rows by name.
 static int
@@ -937,47 +890,40 @@ plugin_show_cmp(const void *a, const void *b)
   return(strcmp(ra->name, rb->name));
 }
 
-// Check if a .so filename corresponds to a loaded plugin by comparing
-// against loaded plugin paths.
-// returns: true if the .so is already loaded
 static bool
 plugin_is_loaded_path(const char *path)
 {
   for(plugin_rec_t *p = plugins; p != NULL; p = p->next)
-  {
     if(strcmp(p->path, path) == 0)
       return(true);
-  }
 
   return(false);
 }
 
-// Recursively scan a directory for .so files not currently loaded and
-// emit them as "available" rows.
-// dir: directory to scan
-// ctx: command context for reply
-// count: running count of available plugins found
 static void
 plugin_show_scan_available(const char *dir, const cmd_ctx_t *ctx,
     uint32_t *count)
 {
-  DIR *d = opendir(dir);
+  DIR           *d;
+  struct dirent *ent;
+
+  d = opendir(dir);
 
   if(d == NULL)
     return;
 
-  struct dirent *ent;
-
   while((ent = readdir(d)) != NULL)
   {
+    char        path[PLUGIN_PATH_SZ];
+    struct stat st;
+    size_t      len;
+    char        line[256];
+    void       *handle;
+
     if(ent->d_name[0] == '.')
       continue;
 
-    char path[PLUGIN_PATH_SZ];
-
     snprintf(path, sizeof(path), "%s/%s", dir, ent->d_name);
-
-    struct stat st;
 
     if(stat(path, &st) != 0)
       continue;
@@ -991,7 +937,7 @@ plugin_show_scan_available(const char *dir, const cmd_ctx_t *ctx,
     if(!S_ISREG(st.st_mode))
       continue;
 
-    size_t len = strlen(ent->d_name);
+    len = strlen(ent->d_name);
 
     if(len < 4 || strcmp(ent->d_name + len - 3, ".so") != 0)
       continue;
@@ -1000,36 +946,35 @@ plugin_show_scan_available(const char *dir, const cmd_ctx_t *ctx,
       continue;
 
     // Temporarily dlopen to read the plugin descriptor.
-    char line[256];
-    void *handle = dlopen(path, RTLD_LAZY | RTLD_LOCAL);
+    handle = dlopen(path, RTLD_LAZY | RTLD_LOCAL);
 
     if(handle != NULL)
     {
+      const plugin_desc_t *desc;
+
       dlerror();
-      const plugin_desc_t *desc = dlsym(handle, PLUGIN_ENTRY_SYMBOL);
+      desc = dlsym(handle, PLUGIN_ENTRY_SYMBOL);
 
       if(desc != NULL && dlerror() == NULL)
-      {
         snprintf(line, sizeof(line),
             "  %-16s %-8s %-11s %-16s "
             CLR_YELLOW "%-11s" CLR_RESET " %8s",
             desc->name, desc->version,
             plugin_type_name(desc->type), desc->kind,
             "available", "0B");
-      }
+
       else
       {
         // Strip "lib" prefix and ".so" extension for fallback display.
         const char *base = ent->d_name;
-        size_t base_len  = len - 3;
+        size_t      base_len  = len - 3;
+        char        display[PLUGIN_NAME_SZ];
 
         if(strncmp(base, "lib", 3) == 0)
         {
           base     += 3;
           base_len -= 3;
         }
-
-        char display[PLUGIN_NAME_SZ];
 
         snprintf(display, sizeof(display), "%.*s", (int)base_len, base);
         snprintf(line, sizeof(line),
@@ -1041,19 +986,19 @@ plugin_show_scan_available(const char *dir, const cmd_ctx_t *ctx,
 
       dlclose(handle);
     }
+
     else
     {
       // dlopen failed — show filename with error state.
       const char *base = ent->d_name;
-      size_t base_len  = len - 3;
+      size_t      base_len  = len - 3;
+      char        display[PLUGIN_NAME_SZ];
 
       if(strncmp(base, "lib", 3) == 0)
       {
         base     += 3;
         base_len -= 3;
       }
-
-      char display[PLUGIN_NAME_SZ];
 
       snprintf(display, sizeof(display), "%.*s", (int)base_len, base);
       snprintf(line, sizeof(line),
@@ -1077,33 +1022,31 @@ static const cmd_arg_desc_t ad_show_plugin[] = {
 
 // Recursively scan a directory for a .so whose descriptor name matches.
 // Copies the full path into out_path on success.
-// returns: true if found
-// dir: directory to scan
-// name: plugin name to match (case-insensitive)
-// out_path: buffer to receive the matched .so path
-// out_sz: size of out_path buffer
 static bool
 plugin_find_so_by_name(const char *dir, const char *name,
     char *out_path, size_t out_sz)
 {
-  DIR *d = opendir(dir);
+  DIR           *d;
+  struct dirent *ent;
+  bool           found = false;
+
+  d = opendir(dir);
 
   if(d == NULL)
     return(false);
 
-  struct dirent *ent;
-  bool found = false;
-
   while((ent = readdir(d)) != NULL && !found)
   {
+    char                 path[PLUGIN_PATH_SZ];
+    struct stat          st;
+    size_t               len;
+    void                *handle;
+    const plugin_desc_t *desc;
+
     if(ent->d_name[0] == '.')
       continue;
 
-    char path[PLUGIN_PATH_SZ];
-
     snprintf(path, sizeof(path), "%s/%s", dir, ent->d_name);
-
-    struct stat st;
 
     if(stat(path, &st) != 0)
       continue;
@@ -1117,18 +1060,18 @@ plugin_find_so_by_name(const char *dir, const char *name,
     if(!S_ISREG(st.st_mode))
       continue;
 
-    size_t len = strlen(ent->d_name);
+    len = strlen(ent->d_name);
 
     if(len < 4 || strcmp(ent->d_name + len - 3, ".so") != 0)
       continue;
 
-    void *handle = dlopen(path, RTLD_LAZY | RTLD_LOCAL);
+    handle = dlopen(path, RTLD_LAZY | RTLD_LOCAL);
 
     if(handle == NULL)
       continue;
 
     dlerror();
-    const plugin_desc_t *desc = dlsym(handle, PLUGIN_ENTRY_SYMBOL);
+    desc = dlsym(handle, PLUGIN_ENTRY_SYMBOL);
 
     if(desc != NULL && dlerror() == NULL
         && strcasecmp(desc->name, name) == 0)
@@ -1152,9 +1095,11 @@ static void
 plugin_show_detail_emit(const cmd_ctx_t *ctx,
     const plugin_desc_t *pd, bool loaded)
 {
-  plugin_state_t state = loaded ? plugin_get_state(pd->name)
-                                : PLUGIN_DISCOVERED;
-  char line[512];
+  plugin_state_t  state = loaded ? plugin_get_state(pd->name)
+                                 : PLUGIN_DISCOVERED;
+  char            line[512];
+  const char     *state_str;
+  const char     *state_clr;
 
   // Title.
   snprintf(line, sizeof(line),
@@ -1162,14 +1107,13 @@ plugin_show_detail_emit(const cmd_ctx_t *ctx,
   cmd_reply(ctx, line);
 
   // State (colorized).
-  const char *state_str;
-  const char *state_clr;
 
   if(!loaded)
   {
     state_str = "available";
     state_clr = CLR_YELLOW;
   }
+
   else
   {
     state_str = plugin_state_name(state);
@@ -1212,14 +1156,15 @@ plugin_show_detail_emit(const cmd_ctx_t *ctx,
       .total  = 0
     };
 
-    mem_iterate(plugin_mem_sum_cb, &mm);
+    {
+      char mem_str[16];
 
-    char mem_str[16];
-
-    util_fmt_bytes(mm.total, mem_str, sizeof(mem_str));
-    snprintf(line, sizeof(line),
-        "  " CLR_GRAY "memory:" CLR_RESET "   %s", mem_str);
-    cmd_reply(ctx, line);
+      mem_iterate(plugin_mem_sum_cb, &mm);
+      util_fmt_bytes(mm.total, mem_str, sizeof(mem_str));
+      snprintf(line, sizeof(line),
+          "  " CLR_GRAY "memory:" CLR_RESET "   %s", mem_str);
+      cmd_reply(ctx, line);
+    }
   }
 
   // Provides.
@@ -1321,8 +1266,9 @@ plugin_show_detail_emit(const cmd_ctx_t *ctx,
     }
   }
 
+  {
   // Lifecycle callbacks present.
-  char cbs[64] = "";
+  char   cbs[64] = "";
   size_t cbs_len = 0;
 
   if(pd->init != NULL)
@@ -1344,6 +1290,7 @@ plugin_show_detail_emit(const cmd_ctx_t *ctx,
         "  " CLR_GRAY "lifecycle:" CLR_RESET " %s", cbs);
     cmd_reply(ctx, line);
   }
+  }
 }
 
 // Recursively scan a directory for a .so whose descriptor name matches
@@ -1352,24 +1299,27 @@ static bool
 plugin_show_find_available(const char *dir, const cmd_ctx_t *ctx,
     const char *name)
 {
-  DIR *d = opendir(dir);
+  DIR           *d;
+  struct dirent *ent;
+  bool           found = false;
+
+  d = opendir(dir);
 
   if(d == NULL)
     return(false);
 
-  struct dirent *ent;
-  bool found = false;
-
   while((ent = readdir(d)) != NULL && !found)
   {
+    char                 path[PLUGIN_PATH_SZ];
+    struct stat          st;
+    size_t               len;
+    void                *handle;
+    const plugin_desc_t *desc;
+
     if(ent->d_name[0] == '.')
       continue;
 
-    char path[PLUGIN_PATH_SZ];
-
     snprintf(path, sizeof(path), "%s/%s", dir, ent->d_name);
-
-    struct stat st;
 
     if(stat(path, &st) != 0)
       continue;
@@ -1383,18 +1333,18 @@ plugin_show_find_available(const char *dir, const cmd_ctx_t *ctx,
     if(!S_ISREG(st.st_mode))
       continue;
 
-    size_t len = strlen(ent->d_name);
+    len = strlen(ent->d_name);
 
     if(len < 4 || strcmp(ent->d_name + len - 3, ".so") != 0)
       continue;
 
-    void *handle = dlopen(path, RTLD_LAZY | RTLD_LOCAL);
+    handle = dlopen(path, RTLD_LAZY | RTLD_LOCAL);
 
     if(handle == NULL)
       continue;
 
     dlerror();
-    const plugin_desc_t *desc = dlsym(handle, PLUGIN_ENTRY_SYMBOL);
+    desc = dlsym(handle, PLUGIN_ENTRY_SYMBOL);
 
     if(desc != NULL && dlerror() == NULL
         && strcasecmp(desc->name, name) == 0)
@@ -1414,8 +1364,11 @@ plugin_show_find_available(const char *dir, const cmd_ctx_t *ctx,
 static void
 plugin_show_detail(const cmd_ctx_t *ctx, const char *name)
 {
+  const plugin_desc_t *pd;
+  const char          *plugin_dir;
+
   // Try loaded plugins first.
-  const plugin_desc_t *pd = plugin_find(name);
+  pd = plugin_find(name);
 
   if(pd != NULL)
   {
@@ -1424,7 +1377,7 @@ plugin_show_detail(const cmd_ctx_t *ctx, const char *name)
   }
 
   // Fall back to scanning the plugin directory for unloaded .so files.
-  const char *plugin_dir = bconf_get("PLUGIN_PATH");
+  plugin_dir = bconf_get("PLUGIN_PATH");
 
   if(plugin_dir == NULL)
     plugin_dir = "./plugins";
@@ -1432,17 +1385,22 @@ plugin_show_detail(const cmd_ctx_t *ctx, const char *name)
   if(plugin_show_find_available(plugin_dir, ctx, name))
     return;
 
-  char buf[PLUGIN_NAME_SZ + 32];
+  {
+    char buf[PLUGIN_NAME_SZ + 32];
 
-  snprintf(buf, sizeof(buf), "unknown plugin: %s", name);
-  cmd_reply(ctx, buf);
+    snprintf(buf, sizeof(buf), "unknown plugin: %s", name);
+    cmd_reply(ctx, buf);
+  }
 }
 
 // Command handler for /show plugin.
 static void
 plugin_cmd_show(const cmd_ctx_t *ctx)
 {
-  bool show_all = false;
+  bool                show_all = false;
+  plugin_show_state_t st;
+  char                hdr[128];
+  char                line[256];
 
   if(ctx->parsed && ctx->parsed->argc > 0)
   {
@@ -1456,23 +1414,17 @@ plugin_cmd_show(const cmd_ctx_t *ctx)
   }
 
   // Collect loaded plugins.
-  plugin_show_state_t st;
-
   memset(&st, 0, sizeof(st));
   plugin_iterate(plugin_show_iter_cb, &st);
 
   qsort(st.rows, st.count, sizeof(plugin_show_row_t), plugin_show_cmp);
 
   // Header.
-  char hdr[128];
-
   snprintf(hdr, sizeof(hdr),
       CLR_BOLD "plugins:" CLR_RESET " %u loaded", st.count);
   cmd_reply(ctx, hdr);
 
   // Table header.
-  char line[256];
-
   snprintf(line, sizeof(line),
       "  " CLR_BOLD "%-16s %-8s %-11s %-16s %-11s %8s" CLR_RESET,
       "NAME", "VERSION", "TYPE", "KIND", "STATE", "MEM");
@@ -1482,12 +1434,12 @@ plugin_cmd_show(const cmd_ctx_t *ctx)
   for(uint32_t i = 0; i < st.count; i++)
   {
     plugin_show_row_t *r = &st.rows[i];
-    char mem_str[16];
+    char               mem_str[16];
+    const char        *state_clr = CLR_RESET;
 
     util_fmt_bytes(r->mem_bytes, mem_str, sizeof(mem_str));
 
     // Color the state column based on lifecycle.
-    const char *state_clr = CLR_RESET;
 
     if(strcmp(r->state, "running") == 0)
       state_clr = CLR_GREEN;
@@ -1508,27 +1460,25 @@ plugin_cmd_show(const cmd_ctx_t *ctx)
   // Show available (unloaded) .so files when "all" is specified.
   if(show_all)
   {
-    const char *plugin_dir = bconf_get("PLUGIN_PATH");
+    const char *plugin_dir;
+    uint32_t    avail = 0;
+
+    plugin_dir = bconf_get("PLUGIN_PATH");
 
     if(plugin_dir == NULL)
       plugin_dir = "./plugins";
-
-    uint32_t avail = 0;
 
     plugin_show_scan_available(plugin_dir, ctx, &avail);
 
     if(avail == 0 && st.count == 0)
       cmd_reply(ctx, "  (none)");
   }
+
   else if(st.count == 0)
-  {
     cmd_reply(ctx, "  (none)");
-  }
 }
 
-// -----------------------------------------------------------------------
 // /plugin command — load/unload plugins at runtime
-// -----------------------------------------------------------------------
 
 // Argument descriptor for /plugin load and /plugin unload.
 static const cmd_arg_desc_t ad_plugin_cmd_name[] = {
@@ -1547,7 +1497,9 @@ static void
 plugin_cmd_load(const cmd_ctx_t *ctx)
 {
   const char *name = ctx->parsed->argv[0];
-  char buf[PLUGIN_NAME_SZ + 128];
+  char        buf[PLUGIN_NAME_SZ + PLUGIN_PATH_SZ + 64];
+  const char *plugin_dir;
+  char        path[PLUGIN_PATH_SZ];
 
   // Already loaded?
   if(plugin_find(name) != NULL)
@@ -1559,12 +1511,10 @@ plugin_cmd_load(const cmd_ctx_t *ctx)
   }
 
   // Locate the .so file.
-  const char *plugin_dir = bconf_get("PLUGIN_PATH");
+  plugin_dir = bconf_get("PLUGIN_PATH");
 
   if(plugin_dir == NULL)
     plugin_dir = "./plugins";
-
-  char path[PLUGIN_PATH_SZ];
 
   if(!plugin_find_so_by_name(plugin_dir, name, path, sizeof(path)))
   {
@@ -1678,9 +1628,7 @@ plugin_cmd_unload(const cmd_ctx_t *ctx)
   cmd_reply(ctx, buf);
 }
 
-// -----------------------------------------------------------------------
 // KV configuration: autoload list
-// -----------------------------------------------------------------------
 
 // KV change callback (no-op; autoload is only consulted at startup).
 static void
@@ -1696,38 +1644,37 @@ void
 plugin_register_config(void)
 {
   kv_register("core.plugin.autoload", KV_STR, "",
-      plugin_autoload_changed, NULL);
+      plugin_autoload_changed, NULL,
+      "Comma-separated list of plugins to load automatically at startup");
 }
 
-// Load plugins listed in core.plugin.autoload that are not already loaded.
-// returns: number of additionally loaded plugins
-// plugin_dir: directory to scan for .so files
 uint32_t
 plugin_load_autoload(const char *plugin_dir)
 {
   const char *list = kv_get_str("core.plugin.autoload");
+  char        buf[KV_STR_SZ];
+  uint32_t    loaded = 0;
+  char       *saveptr = NULL;
 
   if(list == NULL || list[0] == '\0')
     return(0);
 
   // Work on a mutable copy for tokenization.
-  char buf[KV_STR_SZ];
-
   strncpy(buf, list, sizeof(buf) - 1);
   buf[sizeof(buf) - 1] = '\0';
-
-  uint32_t loaded = 0;
-  char *saveptr = NULL;
 
   for(char *tok = strtok_r(buf, ",", &saveptr); tok != NULL;
       tok = strtok_r(NULL, ",", &saveptr))
   {
+    char *end;
+    char  path[PLUGIN_PATH_SZ];
+
     // Trim leading whitespace.
     while(*tok == ' ' || *tok == '\t')
       tok++;
 
     // Trim trailing whitespace.
-    char *end = tok + strlen(tok) - 1;
+    end = tok + strlen(tok) - 1;
 
     while(end > tok && (*end == ' ' || *end == '\t'))
       *end-- = '\0';
@@ -1738,8 +1685,6 @@ plugin_load_autoload(const char *plugin_dir)
     // Skip if already loaded.
     if(plugin_find(tok) != NULL)
       continue;
-
-    char path[PLUGIN_PATH_SZ];
 
     if(!plugin_find_so_by_name(plugin_dir, tok, path, sizeof(path)))
     {
@@ -1757,9 +1702,7 @@ plugin_load_autoload(const char *plugin_dir)
   return(loaded);
 }
 
-// -----------------------------------------------------------------------
 // Command registration
-// -----------------------------------------------------------------------
 
 // Register plugin commands. Must be called after admin_init().
 void
@@ -1778,7 +1721,7 @@ plugin_register_commands(void)
       "a specific plugin including features, config keys, schema\n"
       "groups, and lifecycle callbacks.",
       USERNS_GROUP_OWNER, USERNS_OWNER_LEVEL, CMD_SCOPE_ANY, METHOD_T_ANY,
-      plugin_cmd_show, NULL, "show", "plug", ad_show_plugin, 1);
+      plugin_cmd_show, NULL, "show", "plug", ad_show_plugin, 1, NULL, NULL);
 
   // /plugin — root command for plugin management.
   cmd_register("plugin", "plugin",
@@ -1786,7 +1729,7 @@ plugin_register_commands(void)
       "Manage plugins",
       NULL,
       USERNS_GROUP_OWNER, USERNS_OWNER_LEVEL, CMD_SCOPE_ANY, METHOD_T_ANY,
-      plugin_cmd_plugin, NULL, NULL, "plug", NULL, 0);
+      plugin_cmd_plugin, NULL, NULL, "plug", NULL, 0, NULL, NULL);
 
   cmd_register("plugin", "load",
       "plugin load <name>",
@@ -1796,7 +1739,7 @@ plugin_register_commands(void)
       "the requested name. After loading, the plugin is resolved,\n"
       "initialized, and started automatically.",
       USERNS_GROUP_OWNER, USERNS_OWNER_LEVEL, CMD_SCOPE_ANY, METHOD_T_ANY,
-      plugin_cmd_load, NULL, "plugin", NULL, ad_plugin_cmd_name, 1);
+      plugin_cmd_load, NULL, "plugin", NULL, ad_plugin_cmd_name, 1, NULL, NULL);
 
   cmd_register("plugin", "unload",
       "plugin unload <name>",
@@ -1805,7 +1748,80 @@ plugin_register_commands(void)
       "and removed from memory. Fails if another loaded plugin depends\n"
       "on a feature this plugin provides.",
       USERNS_GROUP_OWNER, USERNS_OWNER_LEVEL, CMD_SCOPE_ANY, METHOD_T_ANY,
-      plugin_cmd_unload, NULL, "plugin", NULL, ad_plugin_cmd_name, 1);
+      plugin_cmd_unload, NULL, "plugin", NULL, ad_plugin_cmd_name, 1, NULL, NULL);
+}
+
+// Synthetic core providers.
+//
+// Core subsystems are not plugins, but plugins can declare
+// `.requires = { "core_<feature>" }` for self-documentation and so
+// that a future minimal build stripping a core service fails to
+// resolve its dependents.  We insert one synthetic record per
+// stable core feature before `plugin_discover()` runs.  Synthetic
+// records carry no dlopen handle, no lifecycle callbacks, and sit
+// at PLUGIN_RUNNING so `plugin_init_all()` / `plugin_start_all()`
+// skip them.
+static const char *const BM_CORE_PROVIDERS[] =
+{
+  "core_alloc",     "core_bot",       "core_botmanctl", "core_clam",
+  "core_cmd",       "core_curl",      "core_db",        "core_kv",
+  "core_method",    "core_plugin",    "core_pool",      "core_resolve",
+  "core_sig",       "core_sock",      "core_task",      "core_userns",
+  "core_util",      "core_json",      "core_sse",
+};
+
+#define BM_CORE_PROVIDER_COUNT                                    \
+    (sizeof(BM_CORE_PROVIDERS) / sizeof(BM_CORE_PROVIDERS[0]))
+
+static plugin_desc_t bm_core_descs[BM_CORE_PROVIDER_COUNT];
+
+static bool
+plugin_register_synthetic(uint32_t slot, const char *feature_name)
+{
+  plugin_desc_t *d;
+  plugin_rec_t  *rec;
+
+  if(slot >= BM_CORE_PROVIDER_COUNT)
+    return(FAIL);
+
+  d = &bm_core_descs[slot];
+
+  memset(d, 0, sizeof(*d));
+  d->api_version = PLUGIN_API_VERSION;
+  d->type        = PLUGIN_CORE;
+  snprintf(d->name,    sizeof(d->name),    "%s", feature_name);
+  snprintf(d->version, sizeof(d->version), "core");
+  snprintf(d->kind,    sizeof(d->kind),    "%s", feature_name);
+  snprintf(d->provides[0].name,
+      sizeof(d->provides[0].name), "%s", feature_name);
+  d->provides_count = 1;
+  d->requires_count = 0;
+
+  rec = mem_alloc("plugin", "synthetic",
+      sizeof(plugin_rec_t));
+
+  memset(rec, 0, sizeof(*rec));
+  rec->desc   = d;
+  rec->handle = NULL;         // synthetic: no .so backing
+  rec->state  = PLUGIN_RUNNING; // synthetic: always "running"
+
+  rec->next = plugins;
+  plugins   = rec;
+  n_plugins++;
+  return(SUCCESS);
+}
+
+static void
+plugin_register_core_providers(void)
+{
+  for(uint32_t i = 0; i < BM_CORE_PROVIDER_COUNT; i++)
+    if(plugin_register_synthetic(i, BM_CORE_PROVIDERS[i]) != SUCCESS)
+      clam(CLAM_WARN, "plugin",
+          "failed to register synthetic provider '%s'",
+          BM_CORE_PROVIDERS[i]);
+
+  clam(CLAM_DEBUG, "plugin", "registered %u synthetic core providers",
+      (uint32_t)BM_CORE_PROVIDER_COUNT);
 }
 
 void
@@ -1814,6 +1830,11 @@ plugin_init(void)
   plugins      = NULL;
   n_plugins    = 0;
   plugin_ready = true;
+
+  // Core-provided features must exist before `plugin_discover()`
+  // so that discovered plugins can resolve `.requires = "core_*"`.
+  plugin_register_core_providers();
+
   clam(CLAM_DEBUG, "plugin", "subsystem initialized");
 }
 
@@ -1841,10 +1862,14 @@ plugin_exit(void)
 
     for(uint32_t i = count; i > 0; i--)
     {
-      clam(CLAM_DEBUG, "plugin", "unloading '%s'",
-          arr[i - 1]->desc->name);
-      dlclose(arr[i - 1]->handle);
-      mem_free(arr[i - 1]);
+      plugin_rec_t *r = arr[i - 1];
+
+      clam(CLAM_DEBUG, "plugin", "unloading '%s'", r->desc->name);
+
+      if(r->handle != NULL)
+        dlclose(r->handle);  // synthetic providers have no handle
+
+      mem_free(r);
     }
 
     mem_free(arr);

@@ -1,34 +1,23 @@
-// irc_commands.c — IRC plugin console command handlers.
-//
-// Network, server, channel, and schema management commands for the
-// IRC method plugin. These are registered as system commands under
-// the /irc parent and /show irc subcommands.
+// botmanager — MIT
+// IRC plugin operator commands: /irc network|server|channel, /show irc.
 
 #define IRC_INTERNAL
 #include "irc.h"
 
 #include <string.h>
 
-// -----------------------------------------------------------------------
 // Server KV registration helper
-// -----------------------------------------------------------------------
 
-// Register KV entries for one IRC server using the schema group.
-// After registration, overrides address and port with caller values.
-// returns: SUCCESS or FAIL
-// network: network name
-// server: server label
-// address: server address (or "" for default)
-// port: port string (or "6667" for default)
 static bool
 irc_register_server_kv(const char *network, const char *server,
     const char *address, const char *port)
 {
+  char key[KV_KEY_SZ];
+
   if(plugin_kv_group_register(&irc_kv_groups[1], network, server) == 0)
     return(FAIL);
 
   // Override address and port with caller-provided values.
-  char key[KV_KEY_SZ];
 
   if(address != NULL && address[0] != '\0')
   {
@@ -47,25 +36,17 @@ irc_register_server_kv(const char *network, const char *server,
   return(SUCCESS);
 }
 
-// -----------------------------------------------------------------------
 // Network list callback (local to commands)
-// -----------------------------------------------------------------------
 
-// KV iteration callback: collect unique network names from irc.net.* keys.
-// Extracts the network name (segment 2) and deduplicates into the list.
-// key: full KV key string
-// type: KV value type (unused)
-// val: KV value string (unused)
-// data: irc_net_list_t pointer for collecting names
 static void
 irc_net_list_cb(const char *key, kv_type_t type,
     const char *val, void *data)
 {
-  (void)type;
-  (void)val;
-
   irc_net_list_t *list = data;
   char name[IRC_NET_NAME_SZ];
+
+  (void)type;
+  (void)val;
 
   // Key format: irc.net.<NETWORK>.<SERVER>.<PROPERTY>
   // Network is segment 2.
@@ -74,10 +55,8 @@ irc_net_list_cb(const char *key, kv_type_t type,
 
   // Deduplicate.
   for(uint32_t i = 0; i < list->count; i++)
-  {
     if(strcmp(list->names[i], name) == 0)
       return;
-  }
 
   if(list->count < IRC_MAX_NETS)
   {
@@ -86,9 +65,7 @@ irc_net_list_cb(const char *key, kv_type_t type,
   }
 }
 
-// -----------------------------------------------------------------------
-// /network console command
-// -----------------------------------------------------------------------
+// /network operator command
 
 // /network list — display all configured IRC networks.
 static void
@@ -114,12 +91,11 @@ irc_cmd_network_list(const cmd_ctx_t *ctx)
     // Count servers for this network.
     char prefix[KV_KEY_SZ];
     irc_srv_list_t srvs;
+    char line[128];
 
     memset(&srvs, 0, sizeof(srvs));
     snprintf(prefix, sizeof(prefix), IRC_NET_PREFIX "%s.", nets.names[i]);
     kv_iterate_prefix(prefix, irc_srv_list_cb, &srvs);
-
-    char line[128];
 
     snprintf(line, sizeof(line), "  %s (%u server%s)",
         nets.names[i], srvs.count,
@@ -134,15 +110,15 @@ irc_cmd_network_del(const cmd_ctx_t *ctx)
 {
   const char *name = ctx->parsed->argv[0];
   char prefix[KV_KEY_SZ];
+  uint32_t deleted;
+  char buf[128];
 
   snprintf(prefix, sizeof(prefix), IRC_NET_PREFIX "%s.", name);
 
-  uint32_t deleted = kv_delete_prefix(prefix);
+  deleted = kv_delete_prefix(prefix);
 
   if(deleted > 0)
   {
-    char buf[128];
-
     snprintf(buf, sizeof(buf),
         "deleted network '%s' (%u entries removed)", name, deleted);
     cmd_reply(ctx, buf);
@@ -151,8 +127,6 @@ irc_cmd_network_del(const cmd_ctx_t *ctx)
 
   else
   {
-    char buf[128];
-
     snprintf(buf, sizeof(buf), "network not found: %s", name);
     cmd_reply(ctx, buf);
   }
@@ -166,9 +140,7 @@ irc_cmd_network(const cmd_ctx_t *ctx)
   irc_cmd_network_list(ctx);
 }
 
-// -----------------------------------------------------------------------
-// /server console command
-// -----------------------------------------------------------------------
+// /server operator command
 
 // /irc server add <network> <host> [port]
 static void
@@ -178,20 +150,18 @@ irc_cmd_server_add(const cmd_ctx_t *ctx)
   const char *address = ctx->parsed->argv[1];
   const char *port    = ctx->parsed->argc > 2 ? ctx->parsed->argv[2] : NULL;
   char srvkey[IRC_SRV_NAME_SZ] = {0};
+  char check_key[KV_KEY_SZ];
+  char buf[256];
 
   // Derive KV key from address (dots/colons become dashes).
   irc_address_to_key(address, srvkey, sizeof(srvkey));
 
   // Check if server already exists.
-  char check_key[KV_KEY_SZ];
-
   snprintf(check_key, sizeof(check_key),
       IRC_NET_PREFIX "%s.%s.address", network, srvkey);
 
   if(kv_exists(check_key))
   {
-    char buf[128];
-
     snprintf(buf, sizeof(buf),
         "server '%s' already exists in network '%s'", address, network);
     cmd_reply(ctx, buf);
@@ -202,8 +172,6 @@ irc_cmd_server_add(const cmd_ctx_t *ctx)
   if(irc_register_server_kv(network, srvkey, address,
       port != NULL ? port : "6667") != SUCCESS)
   {
-    char buf[128];
-
     snprintf(buf, sizeof(buf),
         "failed to register server '%s' in network '%s'",
         address, network);
@@ -212,8 +180,6 @@ irc_cmd_server_add(const cmd_ctx_t *ctx)
   }
 
   kv_flush();
-
-  char buf[256];
 
   snprintf(buf, sizeof(buf), "added server '%s' to network '%s':",
       address, network);
@@ -247,21 +213,20 @@ irc_cmd_server_del(const cmd_ctx_t *ctx)
   const char *network = ctx->parsed->argv[0];
   const char *address = ctx->parsed->argv[1];
   char srvkey[IRC_SRV_NAME_SZ] = {0};
+  char prefix[KV_KEY_SZ];
+  uint32_t deleted;
+  char buf[128];
 
   // Derive KV key from address.
   irc_address_to_key(address, srvkey, sizeof(srvkey));
 
-  char prefix[KV_KEY_SZ];
-
   snprintf(prefix, sizeof(prefix),
       IRC_NET_PREFIX "%s.%s.", network, srvkey);
 
-  uint32_t deleted = kv_delete_prefix(prefix);
+  deleted = kv_delete_prefix(prefix);
 
   if(deleted > 0)
   {
-    char buf[128];
-
     snprintf(buf, sizeof(buf),
         "deleted server '%s' from network '%s' (%u entries removed)",
         address, network, deleted);
@@ -271,18 +236,12 @@ irc_cmd_server_del(const cmd_ctx_t *ctx)
 
   else
   {
-    char buf[128];
-
     snprintf(buf, sizeof(buf),
         "server '%s' not found in network '%s'", address, network);
     cmd_reply(ctx, buf);
   }
 }
 
-// Display one server's properties for a given network.
-// network: network name for KV key lookup
-// server: server label within the network
-// ctx: command context for reply output
 static void
 irc_show_server_entry(const char *network, const char *server,
     const cmd_ctx_t *ctx)
@@ -293,6 +252,7 @@ irc_show_server_entry(const char *network, const char *server,
   uint16_t prio = 100;
   uint8_t  tls = 0;
   uint8_t  tlsv = 1;
+  char line[256];
 
   snprintf(key, sizeof(key),
       IRC_NET_PREFIX "%s.%s.address", network, server);
@@ -317,8 +277,6 @@ irc_show_server_entry(const char *network, const char *server,
       IRC_NET_PREFIX "%s.%s.tls_verify", network, server);
   tlsv = (uint8_t)kv_get_uint(key);
 
-  char line[256];
-
   snprintf(line, sizeof(line),
       "  %s:%u priority=%u tls=%s verify=%s",
       addr, port, prio,
@@ -326,10 +284,6 @@ irc_show_server_entry(const char *network, const char *server,
   cmd_reply(ctx, line);
 }
 
-// List servers for a single network. Collects server names under the
-// network's KV prefix and displays each server's properties.
-// network: network name
-// ctx: command context for reply output
 static void
 irc_show_network_servers(const char *network, const cmd_ctx_t *ctx)
 {
@@ -380,10 +334,8 @@ irc_cmd_server_list(const cmd_ctx_t *ctx)
   }
 
   else
-  {
     // All networks.
     kv_iterate_prefix(IRC_NET_PREFIX, irc_net_list_cb, &nets);
-  }
 
   if(nets.count == 0)
   {
@@ -403,22 +355,17 @@ irc_cmd_server(const cmd_ctx_t *ctx)
   irc_cmd_server_list(ctx);
 }
 
-// -----------------------------------------------------------------------
 // Helpers
-// -----------------------------------------------------------------------
 
-// Find the IRC state for a bot by name. Resolves the method instance
-// using the "{botname}_irc" naming convention.
-// returns: irc_state_t pointer, or NULL if not found / not connected
-// botname: bot instance name
 static irc_state_t *
 irc_find_state_for_bot(const char *botname)
 {
   char inst_name[METHOD_NAME_SZ];
+  method_inst_t *inst;
 
   snprintf(inst_name, sizeof(inst_name), "%s_irc", botname);
 
-  method_inst_t *inst = method_find(inst_name);
+  inst = method_find(inst_name);
 
   if(inst == NULL)
     return(NULL);
@@ -426,9 +373,7 @@ irc_find_state_for_bot(const char *botname)
   return(method_get_handle(inst));
 }
 
-// -----------------------------------------------------------------------
-// /channel console command
-// -----------------------------------------------------------------------
+// /channel operator command
 
 // /irc channel add <bot> <#channel> [key]
 static void
@@ -437,9 +382,13 @@ irc_cmd_channel_add(const cmd_ctx_t *ctx)
   const char *botname  = ctx->parsed->argv[0];
   const char *raw_chan  = ctx->parsed->argv[1];
   const char *chankey   = ctx->parsed->argc > 2 ? ctx->parsed->argv[2] : NULL;
+  const char *channel;
+  char prefix[KV_KEY_SZ];
+  char key[KV_KEY_SZ];
+  char buf[256];
 
   // Strip leading '#' if present.
-  const char *channel = (raw_chan[0] == '#') ? raw_chan + 1 : raw_chan;
+  channel = (raw_chan[0] == '#') ? raw_chan + 1 : raw_chan;
 
   if(channel[0] == '\0')
   {
@@ -448,20 +397,14 @@ irc_cmd_channel_add(const cmd_ctx_t *ctx)
   }
 
   // Build the KV prefix for this bot's IRC channels.
-  char prefix[KV_KEY_SZ];
-
   snprintf(prefix, sizeof(prefix),
       "bot.%s.irc.chan.%s.", botname, channel);
 
   // Check if channel already exists.
-  char key[KV_KEY_SZ];
-
   snprintf(key, sizeof(key), "%sautojoin", prefix);
 
   if(kv_exists(key))
   {
-    char buf[128];
-
     snprintf(buf, sizeof(buf),
         "channel '#%s' already configured for bot '%s'",
         channel, botname);
@@ -485,8 +428,6 @@ irc_cmd_channel_add(const cmd_ctx_t *ctx)
 
   kv_flush();
 
-  char buf[256];
-
   snprintf(buf, sizeof(buf),
       "added channel '#%s' to bot '%s' (autojoin enabled)",
       channel, botname);
@@ -502,20 +443,22 @@ irc_cmd_channel_del(const cmd_ctx_t *ctx)
 {
   const char *botname  = ctx->parsed->argv[0];
   const char *raw_chan  = ctx->parsed->argv[1];
+  const char *channel;
+  char prefix[KV_KEY_SZ];
+  uint32_t deleted;
+  char buf[128];
 
   // Strip leading '#' if present.
-  const char *channel = (raw_chan[0] == '#') ? raw_chan + 1 : raw_chan;
-
-  char prefix[KV_KEY_SZ];
+  channel = (raw_chan[0] == '#') ? raw_chan + 1 : raw_chan;
 
   snprintf(prefix, sizeof(prefix),
       "bot.%s.irc.chan.%s.", botname, channel);
 
-  uint32_t deleted = kv_delete_prefix(prefix);
+  deleted = kv_delete_prefix(prefix);
 
   if(deleted > 0)
   {
-    char buf[128];
+    irc_state_t *st;
 
     snprintf(buf, sizeof(buf),
         "removed channel '#%s' from bot '%s' (%u entries removed)",
@@ -524,7 +467,7 @@ irc_cmd_channel_del(const cmd_ctx_t *ctx)
     kv_flush();
 
     // If the bot is connected, depart the channel.
-    irc_state_t *st = irc_find_state_for_bot(botname);
+    st = irc_find_state_for_bot(botname);
 
     if(st != NULL && st->connected)
     {
@@ -537,8 +480,6 @@ irc_cmd_channel_del(const cmd_ctx_t *ctx)
 
   else
   {
-    char buf[128];
-
     snprintf(buf, sizeof(buf),
         "channel '#%s' not found for bot '%s'", channel, botname);
     cmd_reply(ctx, buf);
@@ -550,36 +491,29 @@ static void
 irc_cmd_channel_list(const cmd_ctx_t *ctx)
 {
   const char *botname = ctx->parsed->argv[0];
+  char chan_prefix[KV_KEY_SZ];
+  irc_chan_collect_t cc;
+  char buf[128];
 
   // Build the channel prefix for this bot.
-  char chan_prefix[KV_KEY_SZ];
-
   snprintf(chan_prefix, sizeof(chan_prefix),
       "bot.%s.irc.chan.", botname);
 
   // Discover all configured channels.
-  irc_chan_collect_t cc;
-
   memset(&cc, 0, sizeof(cc));
   cc.prefix_len = strlen(chan_prefix);
   kv_iterate_prefix(chan_prefix, irc_chan_collect_cb, &cc);
 
   if(cc.count == 0)
   {
-    char buf[128];
-
     snprintf(buf, sizeof(buf),
         "no channels configured for bot '%s'", botname);
     cmd_reply(ctx, buf);
     return;
   }
 
-  {
-    char buf[128];
-
-    snprintf(buf, sizeof(buf), "%s:", botname);
-    cmd_reply(ctx, buf);
-  }
+  snprintf(buf, sizeof(buf), "%s:", botname);
+  cmd_reply(ctx, buf);
 
   for(uint32_t c = 0; c < cc.count; c++)
   {
@@ -587,6 +521,9 @@ irc_cmd_channel_list(const cmd_ctx_t *ctx)
     uint8_t autojoin = 0;
     uint8_t announce = 0;
     const char *text = "";
+    const char *has_key;
+    char line[256];
+    uint8_t admin;
 
     snprintf(key, sizeof(key), "%s%s.autojoin",
         chan_prefix, cc.names[c]);
@@ -598,13 +535,11 @@ irc_cmd_channel_list(const cmd_ctx_t *ctx)
 
     snprintf(key, sizeof(key), "%s%s.key",
         chan_prefix, cc.names[c]);
-    const char *has_key = kv_get_str(key);
+    has_key = kv_get_str(key);
 
     snprintf(key, sizeof(key), "%s%s.announcetext",
         chan_prefix, cc.names[c]);
     text = kv_get_str(key);
-
-    char line[256];
 
     snprintf(line, sizeof(line),
         "  #%s: autojoin=%s key=%s announce=%s",
@@ -619,6 +554,47 @@ irc_cmd_channel_list(const cmd_ctx_t *ctx)
       snprintf(line, sizeof(line), "    announcetext: %s", text);
       cmd_reply(ctx, line);
     }
+
+    // Show admin settings if admin is enabled.
+    snprintf(key, sizeof(key), "%s%s.admin.enabled",
+        chan_prefix, cc.names[c]);
+    admin = (uint8_t)kv_get_uint(key);
+
+    if(admin)
+    {
+      uint8_t key_en;
+      const char *key_val;
+      uint8_t topic_en;
+      const char *topic_val;
+      uint8_t kick_un;
+
+      snprintf(key, sizeof(key), "%s%s.admin.key.enabled",
+          chan_prefix, cc.names[c]);
+      key_en = (uint8_t)kv_get_uint(key);
+
+      snprintf(key, sizeof(key), "%s%s.admin.key.value",
+          chan_prefix, cc.names[c]);
+      key_val = kv_get_str(key);
+
+      snprintf(key, sizeof(key), "%s%s.admin.topic.enabled",
+          chan_prefix, cc.names[c]);
+      topic_en = (uint8_t)kv_get_uint(key);
+
+      snprintf(key, sizeof(key), "%s%s.admin.topic.value",
+          chan_prefix, cc.names[c]);
+      topic_val = kv_get_str(key);
+
+      snprintf(key, sizeof(key), "%s%s.admin.kick_unident",
+          chan_prefix, cc.names[c]);
+      kick_un = (uint8_t)kv_get_uint(key);
+
+      snprintf(line, sizeof(line),
+          "    admin: key=%s topic=%s kick_unident=%s",
+          key_en ? ((key_val && key_val[0]) ? "(set)" : "(empty!)") : "off",
+          topic_en ? ((topic_val && topic_val[0]) ? "(set)" : "(empty!)") : "off",
+          kick_un ? "on" : "off");
+      cmd_reply(ctx, line);
+    }
   }
 }
 
@@ -628,16 +604,19 @@ irc_cmd_join(const cmd_ctx_t *ctx)
 {
   const char *botname = ctx->parsed->argv[0];
   const char *raw_chan = ctx->parsed->argv[1];
+  const char *channel;
+  irc_state_t *st;
+  char key[KV_KEY_SZ];
+  const char *chankey;
+  char buf[128];
 
   // Strip leading '#' if present.
-  const char *channel = (raw_chan[0] == '#') ? raw_chan + 1 : raw_chan;
+  channel = (raw_chan[0] == '#') ? raw_chan + 1 : raw_chan;
 
-  irc_state_t *st = irc_find_state_for_bot(botname);
+  st = irc_find_state_for_bot(botname);
 
   if(st == NULL || !st->connected)
   {
-    char buf[128];
-
     snprintf(buf, sizeof(buf),
         "bot '%s' is not connected to IRC", botname);
     cmd_reply(ctx, buf);
@@ -645,18 +624,14 @@ irc_cmd_join(const cmd_ctx_t *ctx)
   }
 
   // Check for a channel key in the KV config.
-  char key[KV_KEY_SZ];
-
   snprintf(key, sizeof(key), "bot.%s.irc.chan.%s.key", botname, channel);
 
-  const char *chankey = kv_get_str(key);
+  chankey = kv_get_str(key);
 
   if(chankey != NULL && chankey[0] != '\0')
     irc_send_raw(st, "JOIN #%s %s", channel, chankey);
   else
     irc_send_raw(st, "JOIN #%s", channel);
-
-  char buf[128];
 
   snprintf(buf, sizeof(buf), "joining '#%s' on bot '%s'", channel, botname);
   cmd_reply(ctx, buf);
@@ -668,23 +643,22 @@ irc_cmd_part(const cmd_ctx_t *ctx)
 {
   const char *botname = ctx->parsed->argv[0];
   const char *raw_chan = ctx->parsed->argv[1];
+  const char *channel;
+  irc_state_t *st;
+  char buf[128];
 
   // Strip leading '#' if present.
-  const char *channel = (raw_chan[0] == '#') ? raw_chan + 1 : raw_chan;
+  channel = (raw_chan[0] == '#') ? raw_chan + 1 : raw_chan;
 
-  irc_state_t *st = irc_find_state_for_bot(botname);
+  st = irc_find_state_for_bot(botname);
 
   if(st == NULL || !st->connected)
   {
-    char buf[128];
-
     snprintf(buf, sizeof(buf),
         "bot '%s' is not connected to IRC", botname);
     cmd_reply(ctx, buf);
     return;
   }
-
-  char buf[128];
 
   snprintf(buf, sizeof(buf), "parting '#%s' on bot '%s'", channel, botname);
   cmd_reply(ctx, buf);
@@ -699,9 +673,7 @@ irc_cmd_channel(const cmd_ctx_t *ctx)
   cmd_reply(ctx, "usage: /irc channel <subcommand> ...");
 }
 
-// -----------------------------------------------------------------------
 // /irc root and /show irc subcommands
-// -----------------------------------------------------------------------
 
 // /irc — root parent handler, lists available subcommands.
 static void
@@ -715,6 +687,8 @@ static void
 irc_cmd_schema(const cmd_ctx_t *ctx)
 {
   const char *group_name = ctx->args;
+  const plugin_kv_group_t *g = NULL;
+  char hdr[256];
 
   if(group_name == NULL || group_name[0] == '\0')
   {
@@ -736,8 +710,6 @@ irc_cmd_schema(const cmd_ctx_t *ctx)
   }
 
   // Find the specific schema group.
-  const plugin_kv_group_t *g = NULL;
-
   for(uint32_t i = 0; i < IRC_KV_GROUPS_COUNT; i++)
   {
     if(strcmp(irc_kv_groups[i].name, group_name) == 0)
@@ -757,8 +729,6 @@ irc_cmd_schema(const cmd_ctx_t *ctx)
   }
 
   // Show schema detail.
-  char hdr[256];
-
   snprintf(hdr, sizeof(hdr), "schema: %s — %s", g->name, g->description);
   cmd_reply(ctx, hdr);
 
@@ -803,11 +773,9 @@ irc_cmd_show_servers(const cmd_ctx_t *ctx)
   irc_cmd_server_list(ctx);
 }
 
-// -----------------------------------------------------------------------
 // Command registration
-// -----------------------------------------------------------------------
 
-// Register all /irc and /show irc console commands. Called from irc_init().
+// Register all /irc and /show irc operator commands. Called from irc_init().
 void
 irc_register_commands(void)
 {
@@ -823,7 +791,7 @@ irc_register_commands(void)
       "  /irc part ...     — leave a channel\n"
       "  /irc schema  ...  — show entity schemas",
       USERNS_GROUP_ADMIN, 100, CMD_SCOPE_ANY, METHOD_T_ANY, irc_cmd_irc,
-      NULL, NULL, NULL, NULL, 0);
+      NULL, NULL, NULL, NULL, 0, NULL, NULL);
 
   // Register subcommands under /irc.
   cmd_register("irc", "network",
@@ -834,21 +802,21 @@ irc_register_commands(void)
       "  /irc network list        — list all networks\n"
       "  /irc network del <name>  — delete a network and its servers",
       USERNS_GROUP_ADMIN, 500, CMD_SCOPE_ANY, METHOD_T_ANY, irc_cmd_network,
-      NULL, "irc", "net", NULL, 0);
+      NULL, "irc", "net", NULL, 0, NULL, NULL);
 
   cmd_register("irc", "list",
       "irc network list",
       "List all IRC networks",
       NULL,
       USERNS_GROUP_ADMIN, 500, CMD_SCOPE_ANY, METHOD_T_ANY,
-      irc_cmd_network_list, NULL, "network", "l", NULL, 0);
+      irc_cmd_network_list, NULL, "network", "l", NULL, 0, NULL, NULL);
 
   cmd_register("irc", "del",
       "irc network del <name>",
       "Delete a network and its servers",
       NULL,
       USERNS_GROUP_ADMIN, 500, CMD_SCOPE_ANY, METHOD_T_ANY,
-      irc_cmd_network_del, NULL, "network", "d", ad_irc_netname, 1);
+      irc_cmd_network_del, NULL, "network", "d", ad_irc_netname, 1, NULL, NULL);
 
   cmd_register("irc", "server",
       "irc server <add|del|list> ...",
@@ -858,28 +826,28 @@ irc_register_commands(void)
       "  /irc server del <net> <host>         — remove a server\n"
       "  /irc server list [net]               — list servers",
       USERNS_GROUP_ADMIN, 500, CMD_SCOPE_ANY, METHOD_T_ANY, irc_cmd_server,
-      NULL, "irc", "srv", NULL, 0);
+      NULL, "irc", "srv", NULL, 0, NULL, NULL);
 
   cmd_register("irc", "add",
       "irc server add <network> <host> [port]",
       "Add a server to a network",
       NULL,
       USERNS_GROUP_ADMIN, 500, CMD_SCOPE_ANY, METHOD_T_ANY,
-      irc_cmd_server_add, NULL, "server", "a", ad_irc_srv_add, 3);
+      irc_cmd_server_add, NULL, "server", "a", ad_irc_srv_add, 3, NULL, NULL);
 
   cmd_register("irc", "del",
       "irc server del <network> <host>",
       "Remove a server from a network",
       NULL,
       USERNS_GROUP_ADMIN, 500, CMD_SCOPE_ANY, METHOD_T_ANY,
-      irc_cmd_server_del, NULL, "server", "d", ad_irc_srv_del, 2);
+      irc_cmd_server_del, NULL, "server", "d", ad_irc_srv_del, 2, NULL, NULL);
 
   cmd_register("irc", "list",
       "irc server list [network]",
       "List servers",
       NULL,
       USERNS_GROUP_ADMIN, 500, CMD_SCOPE_ANY, METHOD_T_ANY,
-      irc_cmd_server_list, NULL, "server", "l", ad_irc_srv_list, 1);
+      irc_cmd_server_list, NULL, "server", "l", ad_irc_srv_list, 1, NULL, NULL);
 
   cmd_register("irc", "channel",
       "irc channel <add|del|list> ...",
@@ -889,28 +857,28 @@ irc_register_commands(void)
       "  /irc channel del <bot> <#channel>        — remove a channel\n"
       "  /irc channel list <bot>                  — list channels",
       USERNS_GROUP_ADMIN, 500, CMD_SCOPE_ANY, METHOD_T_ANY,
-      irc_cmd_channel, NULL, "irc", "ch", NULL, 0);
+      irc_cmd_channel, NULL, "irc", "ch", NULL, 0, NULL, NULL);
 
   cmd_register("irc", "add",
       "irc channel add <bot> <#channel> [key]",
       "Add a channel to a bot",
       NULL,
       USERNS_GROUP_ADMIN, 500, CMD_SCOPE_ANY, METHOD_T_ANY,
-      irc_cmd_channel_add, NULL, "channel", "a", ad_irc_chan_add, 3);
+      irc_cmd_channel_add, NULL, "channel", "a", ad_irc_chan_add, 3, NULL, NULL);
 
   cmd_register("irc", "del",
       "irc channel del <bot> <#channel>",
       "Remove a channel from a bot",
       NULL,
       USERNS_GROUP_ADMIN, 500, CMD_SCOPE_ANY, METHOD_T_ANY,
-      irc_cmd_channel_del, NULL, "channel", "d", ad_irc_chan_del, 2);
+      irc_cmd_channel_del, NULL, "channel", "d", ad_irc_chan_del, 2, NULL, NULL);
 
   cmd_register("irc", "list",
       "irc channel list <bot>",
       "List channels for a bot",
       NULL,
       USERNS_GROUP_ADMIN, 500, CMD_SCOPE_ANY, METHOD_T_ANY,
-      irc_cmd_channel_list, NULL, "channel", "l", ad_irc_chan_list, 1);
+      irc_cmd_channel_list, NULL, "channel", "l", ad_irc_chan_list, 1, NULL, NULL);
 
   cmd_register("irc", "join",
       "irc join <bot> <#channel>",
@@ -919,7 +887,7 @@ irc_register_commands(void)
       "IRC connection. If a channel key is configured, it is sent\n"
       "automatically. The bot must be connected to IRC.",
       USERNS_GROUP_ADMIN, 500, CMD_SCOPE_ANY, METHOD_T_ANY, irc_cmd_join,
-      NULL, "irc", NULL, ad_irc_chan_del, 2);
+      NULL, "irc", NULL, ad_irc_chan_del, 2, NULL, NULL);
 
   cmd_register("irc", "part",
       "irc part <bot> <#channel>",
@@ -927,7 +895,7 @@ irc_register_commands(void)
       "Sends a PART command for the specified channel on the bot's\n"
       "IRC connection. The bot must be connected to IRC.",
       USERNS_GROUP_ADMIN, 500, CMD_SCOPE_ANY, METHOD_T_ANY, irc_cmd_part,
-      NULL, "irc", NULL, ad_irc_chan_del, 2);
+      NULL, "irc", NULL, ad_irc_chan_del, 2, NULL, NULL);
 
   cmd_register("irc", "irc-schema",
       "irc schema [group]",
@@ -937,7 +905,7 @@ irc_register_commands(void)
       "  /irc schema channel  — show channel properties\n"
       "  /irc schema server   — show server properties",
       USERNS_GROUP_ADMIN, 100, CMD_SCOPE_ANY, METHOD_T_ANY, irc_cmd_schema,
-      NULL, "irc", "schema", NULL, 0);
+      NULL, "irc", "schema", NULL, 0, NULL, NULL);
 
   // Register /show irc subcommand tree.
   // Internal name "show-irc" avoids collision with root /irc.
@@ -949,7 +917,7 @@ irc_register_commands(void)
       "  /show irc networks  — list defined networks\n"
       "  /show irc servers   — list servers (optionally by network)",
       USERNS_GROUP_ADMIN, 100, CMD_SCOPE_ANY, METHOD_T_ANY,
-      irc_cmd_show_irc, NULL, "show", "irc", NULL, 0);
+      irc_cmd_show_irc, NULL, "show", "irc", NULL, 0, NULL, NULL);
 
   cmd_register("irc", "networks",
       "show irc networks",
@@ -957,7 +925,7 @@ irc_register_commands(void)
       "Lists all defined IRC networks and the number of servers\n"
       "configured for each.",
       USERNS_GROUP_ADMIN, 100, CMD_SCOPE_ANY, METHOD_T_ANY,
-      irc_cmd_show_networks, NULL, "show-irc", "n", NULL, 0);
+      irc_cmd_show_networks, NULL, "show-irc", "n", NULL, 0, NULL, NULL);
 
   cmd_register("irc", "servers",
       "show irc servers [network]",
@@ -966,5 +934,5 @@ irc_register_commands(void)
       "settings. If a network name is given, only servers for\n"
       "that network are shown.",
       USERNS_GROUP_ADMIN, 100, CMD_SCOPE_ANY, METHOD_T_ANY,
-      irc_cmd_show_servers, NULL, "show-irc", "s", ad_irc_srv_list, 1);
+      irc_cmd_show_servers, NULL, "show-irc", "s", ad_irc_srv_list, 1, NULL, NULL);
 }

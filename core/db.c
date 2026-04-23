@@ -1,11 +1,10 @@
+// botmanager — MIT
+// Database abstraction facade over registered DB plugins.
 #define DB_INTERNAL
 #include "db.h"
 
-// -----------------------------------------------------------------------
 // Close a connection and clear its slot.
 // Connection must be locked by caller.
-// c: connection to close
-// -----------------------------------------------------------------------
 static void
 conn_close(db_conn_t *c)
 {
@@ -18,11 +17,8 @@ conn_close(db_conn_t *c)
   c->state = DB_CONN_IDLE;
 }
 
-// -----------------------------------------------------------------------
 // Release a connection back to the pool.
 // Connection must be locked by caller.
-// c: connection to release
-// -----------------------------------------------------------------------
 static void
 conn_release(db_conn_t *c)
 {
@@ -31,11 +27,9 @@ conn_release(db_conn_t *c)
   pthread_mutex_unlock(&c->mutex);
 }
 
-// -----------------------------------------------------------------------
 // Acquire a connection from the pool.
 // Two passes: first reuse an idle connection, then create a new one.
 // returns: locked connection in ACTIVE state, or NULL if none available
-// -----------------------------------------------------------------------
 static db_conn_t *
 conn_acquire(void)
 {
@@ -95,20 +89,14 @@ conn_acquire(void)
   return(NULL);
 }
 
-// -----------------------------------------------------------------------
-// Free all dynamic data inside a result (but not the struct itself).
-// r: result to clear
-// -----------------------------------------------------------------------
 static void
 result_clear(db_result_t *r)
 {
   if(r->col_names != NULL)
   {
     for(uint32_t i = 0; i < r->cols; i++)
-    {
       if(r->col_names[i] != NULL)
         mem_free(r->col_names[i]);
-    }
 
     mem_free(r->col_names);
     r->col_names = NULL;
@@ -119,31 +107,27 @@ result_clear(db_result_t *r)
     uint32_t total = r->rows * r->cols;
 
     for(uint32_t i = 0; i < total; i++)
-    {
       if(r->data[i] != NULL)
         mem_free(r->data[i]);
-    }
 
     mem_free(r->data);
     r->data = NULL;
   }
 }
 
-// -----------------------------------------------------------------------
-// Idle connection reaper task callback.
-// t: the reaper task
-// -----------------------------------------------------------------------
 static void
 reaper_cb(task_t *t)
 {
+  time_t   now;
+  uint16_t reaped = 0;
+
   if(!db_ready)
   {
     t->state = TASK_ENDED;
     return;
   }
 
-  time_t now = time(NULL);
-  uint16_t reaped = 0;
+  now = time(NULL);
 
   for(uint16_t i = 0; i < db_pcfg.max_conns; i++)
   {
@@ -171,16 +155,16 @@ reaper_cb(task_t *t)
   t->sleep_until = now + db_pcfg.reap_interval;
 }
 
-// -----------------------------------------------------------------------
 // Async query task callback.
-// t: the async query task
-// -----------------------------------------------------------------------
 static void
 async_cb(task_t *t)
 {
   db_async_ctx_t *ctx = t->data;
+  db_conn_t      *c;
+  db_result_t    *result;
+  bool            ok;
 
-  db_conn_t *c = conn_acquire();
+  c = conn_acquire();
 
   if(c == NULL)
   {
@@ -190,9 +174,8 @@ async_cb(task_t *t)
     return;
   }
 
-  db_result_t *result = db_result_alloc();
-
-  bool ok = driver->query(c->handle, ctx->sql, result);
+  result = db_result_alloc();
+  ok = driver->query(c->handle, ctx->sql, result);
 
   __atomic_add_fetch(&db_stat_queries, 1, __ATOMIC_RELAXED);
 
@@ -211,14 +194,10 @@ async_cb(task_t *t)
   t->state = TASK_ENDED;
 }
 
-// -----------------------------------------------------------------------
 // Public API
-// -----------------------------------------------------------------------
 
 // Override pool configuration. Must be called before db_init().
-// max_conns: maximum connections in pool
 // idle_timeout_secs: seconds before idle connection is reaped
-// reap_interval_secs: seconds between reaper runs
 void
 db_set_pool_config(uint16_t max_conns, uint32_t idle_timeout_secs,
     uint32_t reap_interval_secs)
@@ -231,11 +210,14 @@ db_set_pool_config(uint16_t max_conns, uint32_t idle_timeout_secs,
   db_pcfg.reap_interval = reap_interval_secs;
 }
 
-// returns: SUCCESS or FAIL
 // drv: database driver interface (must not be NULL)
 bool
 db_init(const db_driver_t *drv)
 {
+  const char *v;
+  int         pmax;
+  int         pidle;
+
   if(drv == NULL)
   {
     clam(CLAM_FATAL, "db_init", "no driver provided");
@@ -245,8 +227,6 @@ db_init(const db_driver_t *drv)
   driver = drv;
 
   // Read credentials from bootstrap config.
-  const char *v;
-
   v = bconf_get("DBHOST");
   strncpy(creds.host, v ? v : "localhost", sizeof(creds.host) - 1);
 
@@ -268,12 +248,12 @@ db_init(const db_driver_t *drv)
     strncpy(creds.pass, v, sizeof(creds.pass) - 1);
 
   // Read optional pool configuration from bootstrap config.
-  int pmax = bconf_get_int("DBPOOL", 0);
+  pmax = bconf_get_int("DBPOOL", 0);
 
   if(pmax > 0)
     db_pcfg.max_conns = (uint16_t)pmax;
 
-  int pidle = bconf_get_int("DBIDLE", 0);
+  pidle = bconf_get_int("DBIDLE", 0);
 
   if(pidle > 0)
     db_pcfg.idle_timeout = (uint32_t)pidle;
@@ -309,13 +289,14 @@ db_init(const db_driver_t *drv)
 void
 db_exit(void)
 {
+  uint16_t closed = 0;
+
   if(!db_ready)
     return;
 
   db_ready = false;
 
   // Close all connections.
-  uint16_t closed = 0;
 
   for(uint16_t i = 0; i < db_pcfg.max_conns; i++)
   {
@@ -342,7 +323,6 @@ db_exit(void)
   clam(CLAM_INFO, "db_exit", "shut down (%u connection(s) closed)", closed);
 }
 
-// returns: zeroed result struct
 db_result_t *
 db_result_alloc(void)
 {
@@ -361,10 +341,6 @@ db_result_free(db_result_t *r)
   mem_free(r);
 }
 
-// returns: cell value string, or NULL if out of bounds
-// r: query result
-// row: row index
-// col: column index
 const char *
 db_result_get(const db_result_t *r, uint32_t row, uint32_t col)
 {
@@ -374,9 +350,6 @@ db_result_get(const db_result_t *r, uint32_t row, uint32_t col)
   return(r->data[row * r->cols + col]);
 }
 
-// returns: column name string, or NULL if out of bounds
-// r: query result
-// col: column index
 const char *
 db_result_col_name(const db_result_t *r, uint32_t col)
 {
@@ -386,10 +359,6 @@ db_result_col_name(const db_result_t *r, uint32_t col)
   return(r->col_names[col]);
 }
 
-// Allocate internal storage for rows and columns in a result.
-// r: result to populate
-// rows: number of rows
-// cols: number of columns
 void
 db_result_set_size(db_result_t *r, uint32_t rows, uint32_t cols)
 {
@@ -403,10 +372,6 @@ db_result_set_size(db_result_t *r, uint32_t rows, uint32_t cols)
     r->data = mem_alloc("db", "data", sizeof(char *) * rows * cols);
 }
 
-// Set a column name (mem_strdup'd internally).
-// r: result to populate
-// col: column index
-// name: column name string
 void
 db_result_set_col_name(db_result_t *r, uint32_t col, const char *name)
 {
@@ -414,11 +379,6 @@ db_result_set_col_name(db_result_t *r, uint32_t col, const char *name)
     r->col_names[col] = mem_strdup("db", "col_name", name);
 }
 
-// Set a cell value (mem_strdup'd internally). NULL for SQL NULL.
-// r: result to populate
-// row: row index
-// col: column index
-// val: cell value string (or NULL)
 void
 db_result_set_value(db_result_t *r, uint32_t row, uint32_t col,
     const char *val)
@@ -427,12 +387,12 @@ db_result_set_value(db_result_t *r, uint32_t row, uint32_t col,
     r->data[row * r->cols + col] = mem_strdup("db", "cell", val);
 }
 
-// returns: SUCCESS or FAIL
-// sql: SQL query string
-// result: pre-allocated result struct
 bool
 db_query(const char *sql, db_result_t *result)
 {
+  db_conn_t *c;
+  bool       ret;
+
   if(!db_ready || driver == NULL)
   {
     if(result != NULL)
@@ -443,7 +403,7 @@ db_query(const char *sql, db_result_t *result)
     return(FAIL);
   }
 
-  db_conn_t *c = conn_acquire();
+  c = conn_acquire();
 
   if(c == NULL)
   {
@@ -457,7 +417,7 @@ db_query(const char *sql, db_result_t *result)
 
   clam(CLAM_DEBUG, "db_query", "sql: %s", sql);
 
-  bool ret = driver->query(c->handle, sql, result);
+  ret = driver->query(c->handle, sql, result);
 
   __atomic_add_fetch(&db_stat_queries, 1, __ATOMIC_RELAXED);
 
@@ -470,17 +430,15 @@ db_query(const char *sql, db_result_t *result)
   return(ret);
 }
 
-// returns: SUCCESS (task submitted) or FAIL
-// sql: SQL query string
-// cb: callback to receive the result
-// data: opaque user data passed to callback
 bool
 db_query_async(const char *sql, db_cb_t cb, void *data)
 {
+  db_async_ctx_t *ctx;
+
   if(!db_ready || driver == NULL || sql == NULL || cb == NULL)
     return(FAIL);
 
-  db_async_ctx_t *ctx = mem_alloc("db", "async_ctx", sizeof(db_async_ctx_t));
+  ctx = mem_alloc("db", "async_ctx", sizeof(db_async_ctx_t));
 
   ctx->sql  = mem_strdup("db", "async_sql", sql);
   ctx->cb   = cb;
@@ -493,19 +451,21 @@ db_query_async(const char *sql, db_cb_t cb, void *data)
 }
 
 // returns: mem_alloc'd escaped string (caller frees), or NULL on failure
-// input: string to escape
 char *
 db_escape(const char *input)
 {
+  db_conn_t *c;
+  char      *escaped;
+
   if(!db_ready || driver == NULL || input == NULL)
     return(NULL);
 
-  db_conn_t *c = conn_acquire();
+  c = conn_acquire();
 
   if(c == NULL)
     return(NULL);
 
-  char *escaped = driver->escape(c->handle, input);
+  escaped = driver->escape(c->handle, input);
 
   conn_release(c);
 
@@ -513,7 +473,6 @@ db_escape(const char *input)
 }
 
 // Get pool statistics (thread-safe snapshot).
-// out: destination for the snapshot
 void
 db_get_pool_stats(db_pool_stats_t *out)
 {
@@ -557,7 +516,6 @@ db_get_pool_stats(db_pool_stats_t *out)
 // active connection (handle != NULL), the callback receives the slot
 // index, state, per-slot query count, creation time, and last use time.
 // cb: iteration callback (must be fast — slot mutex is held briefly)
-// data: opaque user data forwarded to callback
 void
 db_iterate_pool(db_pool_iter_cb_t cb, void *data)
 {

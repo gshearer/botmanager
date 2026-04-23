@@ -2,10 +2,10 @@
 
 This document is for AI agents implementing new plugins. It covers the plugin descriptor, lifecycle, dependency resolution, KV configuration, driver interfaces, and build integration.
 
-For adding user commands specifically, see USERCMD.md.
+For adding user commands specifically, see CMD.md.
 
 **Working reference implementations** (always up-to-date with actual API):
-- Misc: `plugins/misc/math/`
+- Command-surface: `plugins/cmd/math/`
 - Service: `plugins/service/openweather/`
 - Method: `plugins/method/irc/`
 - Bot: `plugins/bot/command/`
@@ -17,6 +17,71 @@ Plugins are shared libraries (`.so`) loaded at runtime via `dlopen()`. Each expo
 
 Plugins live under `plugins/<type>/<kind>/` and are built as shared libraries via meson.
 
+## Layer Rules
+
+botmanager plugins are organised into layers, with strict `#include`
+and `plugin_dlsym` directionality. The rule is simple: **dependencies
+flow downward only**.
+
+| Layer | Directory | Role | May depend on |
+|---|---|---|---|
+| Core | `core/`, `include/` | Daemon process + unified command registry + subsystems (bot, method, cmd, task, kv, sock, db, clam, ...) | itself |
+| Service | `plugins/service/*/` | Pure API connectivity (HTTP / REST / transport to an external provider). Exposes a mechanism API in `<name>_api.h`. | core |
+| Command-surface | `plugins/cmd/*/` | Registers user commands that wrap service-plugin mechanisms or contain self-contained domain logic (math, smallgames). | core + any service plugin's `*_api.h` |
+| Behavior | `plugins/bot/*/` | Owns bot-kind-specific state and the commands that mutate it (chat plugin's `/dossier`, `/llm`, `/memory`). | core + service |
+| Inference | `plugins/inference/` | LLM, knowledge, acquire mechanism APIs (dlsym shims). | core + service |
+| Method | `plugins/method/*/` | Wire protocols (IRC, botmanctl). | core + service |
+| DB | `plugins/db/*/` | Database drivers (postgresql, ...). | core + service |
+
+Hard rules:
+
+1. **Service plugins register zero user commands.** Move the command
+   surface into `plugins/cmd/<name>/` and `plugin_dlsym` *down* into
+   the service plugin's `<name>_api.h`. Rationale: as soon as a
+   service plugin owns a command, it is tempted to produce
+   chat-specific side effects (dossier facts, memory upserts) after
+   the command runs — a structural violation of downward-only
+   dependencies. Keeping service plugins mechanism-only prevents the
+   whole category. See `plugins/service/AGENTS.md`.
+2. **No upward includes or `plugin_dlsym`.** Service, method, db, and
+   inference plugins must not `#include` headers from behavior
+   plugins, must not reference behavior-plugin types, and must not
+   resolve behavior-plugin symbols via `plugin_dlsym`. A leak in that
+   direction is an architectural bug.
+3. **Chat-specific side effects live in the chat plugin's NL bridge.**
+   If the requirement is "after `/foo` runs, record a dossier fact
+   about the sender", the observer belongs in
+   `plugins/bot/chat/nl_observe.c`, attached to the typed slot metadata
+   carried on `cmd_nl_t`. See the `CMD_NL_ARG_LOCATION` observer as
+   the reference implementation.
+
+Grep audits (from `plugins/service/AGENTS.md`) that must stay clean:
+
+```sh
+# Service / method / db plugins must not reference behavior-plugin state.
+grep -rn 'dossier\|memory_\|chatbot\|chat_user' \
+    plugins/service/ plugins/method/ plugins/db/
+# expected: 0 matches (outside prose comments explaining the rule)
+
+# Service plugins must not register commands.
+grep -rn 'cmd_register\|cmd_unregister' plugins/service/
+# expected: 0 matches
+
+# Downward-only plugin_dlsym: nothing upstream resolves "chat".
+grep -rn 'plugin_dlsym[[:space:]]*(.*"chat"' \
+    plugins/service/ plugins/method/ plugins/db/ plugins/inference/
+# expected: 0 matches
+
+# Cross-plugin includes: service/method/db/inference must not include
+# behavior-plugin headers.
+grep -rn '#include[[:space:]]*"dossier.h"\|#include[[:space:]]*"memory.h"\|#include[[:space:]]*"chatbot.h"' \
+    plugins/service/ plugins/method/ plugins/db/ plugins/inference/
+# expected: 0 matches
+```
+
+`AGENTS.md §Plugin Layers` is a quick-reference summary of this
+section.
+
 ## Plugin Types
 
 ```c
@@ -26,7 +91,7 @@ typedef enum {
   PLUGIN_METHOD,       // human interaction method (ext = method_driver_t*)
   PLUGIN_BOT,          // bot behavior (ext = bot_driver_t*)
   PLUGIN_SERVICE,      // external API integration (ext usually NULL)
-  PLUGIN_USERCMD,      // user command extension (registers commands)
+  PLUGIN_MISC,         // miscellaneous user command extension (registers commands)
   PLUGIN_PERSONALITY   // language/messaging personality
 } plugin_type_t;
 ```
@@ -118,6 +183,44 @@ Plugins declare features they provide and features they require. The core uses t
 | Misc | `misc_<kind>` | `misc_misc_math` |
 | DB | `db_<kind>` | `db_postgresql` |
 
+The `core_` prefix is **reserved** for synthetic providers
+registered by the core binary itself.
+
+### Core-provided features
+
+The core binary registers a fixed set of synthetic providers at
+startup so plugins can declare core dependencies in the same
+`.requires` list they use for plugin-to-plugin dependencies.
+
+Declaring `.requires = { { .name = "core_llm" } }` has two
+effects:
+
+1. **Self-documentation.** An agent reading the descriptor sees
+   which core services the plugin consumes without grepping.
+2. **Future-proofing.** If a future build strips out a core
+   service (e.g. a minimal build without `llm`), `plugin_resolve()`
+   will refuse to load dependents.
+
+Synthetic providers carry no `.so` handle and no lifecycle
+callbacks — they are pure dependency-graph markers. They appear
+in `/show plugin` with `type=core`, an empty `kind=core_<feature>`,
+state `running`, and no path.
+
+Currently registered:
+
+```
+core_alloc     core_bot       core_botmanctl  core_clam
+core_cmd       core_curl      core_db         core_json
+core_kv        core_method    core_plugin     core_pool
+core_resolve   core_sig       core_sock       core_sse
+core_task      core_userns    core_util
+```
+
+Full list with subsystem notes: `include/AGENTS.md`. The former
+`core_llm`, `core_knowledge`, and `core_acquire` entries were retired
+when those subsystems moved into the `plugins/inference/` plugin;
+dependents now declare `.requires = { "inference" }` instead.
+
 ### Common Dependency Patterns
 
 **Service plugin depending on command bot:**
@@ -138,6 +241,68 @@ Plugins declare features they provide and features they require. The core uses t
 ```
 
 Circular dependencies are detected and rejected at resolve time.
+
+### Plugin-to-Plugin Calls (dlsym shims)
+
+Once plugin A declares `.requires = { "B" }`, the loader guarantees
+that B's `init()` has run by the time A's `init()` runs. Calling
+from A into B is then a matter of resolving B's symbols across the
+`RTLD_LOCAL` boundary. The project convention is a **dlsym-shim
+public header**: B ships a single header in its plugin directory
+whose entries are `static inline` wrappers that resolve the real
+symbol on first call and cache it atomically.
+
+The worked example is `plugins/inference/inference.h`. Callers
+`#include "inference/inference.h"` and call `llm_chat_submit(...)` /
+`knowledge_retrieve_top_k(...)` / `acquire_register_topics(...)` as
+if they were direct function calls. Under the hood, each shim looks
+like this (reference: `plugins/inference/inference.h`, and the
+original pattern from
+`plugins/inference/acquire_reactive.c:acq_sxng_resolve`):
+
+```c
+static inline RET
+<public_symbol>(ARGS)
+{
+  typedef RET (*fn_t)(ARGS);
+  static fn_t cached = NULL;
+  fn_t fn = __atomic_load_n(&cached, __ATOMIC_ACQUIRE);
+
+  if(fn == NULL)
+  {
+    union { void *obj; fn_t fn; } u;
+    u.obj = plugin_dlsym("inference", "<public_symbol>");
+    if(u.obj == NULL)
+    {
+      clam(CLAM_FATAL, "inference",
+          "dlsym failed: <public_symbol>");
+      abort();
+    }
+    fn = u.fn;
+    __atomic_store_n(&cached, fn, __ATOMIC_RELEASE);
+  }
+  return(fn(ARGS_UNPACKED));
+}
+```
+
+Notes:
+- `plugin_dlsym` (see `core/plugin.c:plugin_dlsym`) does the actual
+  cross-plugin symbol resolution.
+- The `union` launders the `void*`↔function-pointer conversion
+  that strict POSIX forbids via a plain cast.
+- Two threads entering a cold shim race benignly: both resolve,
+  both `__atomic_store_n` the same pointer.
+- Same-plugin translation units inside `plugins/inference/` don't
+  want the shim block (it would collide with the real function
+  bodies). The inference header gates that block behind an
+  `INFERENCE_INTERNAL` macro which the plugin's own `*_priv.h`
+  files define before including `inference.h`.
+
+No new framework mechanism was added to support this pattern — it is
+the same `plugin_dlsym` + `.requires`/`.provides` + topologically
+ordered init that was already used for the `core_*` synthetic
+providers. The inference plugin is just the first plugin-to-plugin
+consumer of it at significant scale.
 
 ## KV Configuration
 
@@ -340,7 +505,7 @@ Plugin internal declarations go in a `.h` file under a `#ifdef PLUGIN_INTERNAL` 
 #include "clam.h"
 #include "cmd.h"
 #include "common.h"
-#include "mem.h"
+#include "alloc.h"
 #include "plugin.h"
 
 // Constants, structs, statics, forward declarations here.
@@ -368,7 +533,7 @@ The `.c` file starts with:
 #include "clam.h"
 #include "cmd.h"
 #include "common.h"
-#include "mem.h"
+#include "alloc.h"
 #include "plugin.h"
 
 #define NP_CTX "newplugin"
@@ -391,12 +556,22 @@ np_cmd_hello(const cmd_ctx_t *ctx)
 static bool
 np_init(void)
 {
+  // Kind-agnostic: trailing kind_filter = NULL.
   if(cmd_register("newplugin", "hello",
-      "Say hello",
-      "hello",
+      "hello",                                           // usage
+      "Say hello",                                       // description
+      NULL,                                              // help_long
       USERNS_GROUP_EVERYONE, 0, CMD_SCOPE_ANY, METHOD_T_ANY,
-      np_cmd_hello, NULL, NULL, NULL, NULL, 0) != SUCCESS)
+      np_cmd_hello, NULL, NULL, NULL,
+      NULL, 0,                                           // arg_desc, arg_count
+      NULL) != SUCCESS)                                  // kind_filter
     return(FAIL);
+
+  // Kind-filtered variant (chat-kind bots only). `chat_kinds` is
+  // static so the registry can keep the pointer.
+  //
+  //   static const char *const chat_kinds[] = { "chat", NULL };
+  //   cmd_register(..., NULL, 0, chat_kinds);
 
   clam(CLAM_INFO, NP_CTX, "newplugin initialized");
   return(SUCCESS);

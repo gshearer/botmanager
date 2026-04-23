@@ -9,7 +9,7 @@ extern const db_driver_t pg_driver;
 #ifdef PG_INTERNAL
 
 #include "common.h"
-#include "mem.h"
+#include "alloc.h"
 #include "plugin.h"
 
 #include <libpq-fe.h>

@@ -5,7 +5,6 @@
 #include <stddef.h>
 #include <stdint.h>
 
-// HTTP methods.
 typedef enum
 {
   CURL_METHOD_GET,
@@ -15,11 +14,10 @@ typedef enum
   CURL_METHOD_PATCH
 } curl_method_t;
 
-// Opaque request handle.
 typedef struct curl_request curl_request_t;
 
-// Response delivered to completion callback. Valid for the duration
-// of the callback only -- caller must copy any data they need.
+// Delivered to completion callback. Valid for the duration of the
+// callback only -- caller must copy any data they need.
 typedef struct
 {
   curl_request_t *request;      // originating request
@@ -27,78 +25,85 @@ typedef struct
   const char     *body;         // response body (NUL-terminated)
   size_t          body_len;     // response body length in bytes
   const char     *content_type; // Content-Type header value (or NULL)
+  const char     *etag;         // ETag header value (or NULL)
+  const char     *last_modified;// Last-Modified header value (or NULL)
   int             curl_code;    // CURLcode (0 = CURLE_OK)
   const char     *error;        // human-readable error (NULL on success)
   void           *user_data;    // caller's opaque pointer
 } curl_response_t;
 
-// Completion callback type. Invoked on the curl multi worker thread.
-// Callbacks must be fast and non-blocking.
+// Invoked on the curl multi worker thread. Callbacks must be fast and
+// non-blocking.
 typedef void (*curl_done_cb_t)(const curl_response_t *resp);
 
-// Create a new HTTP request. Does not execute yet.
-// returns: request handle, or NULL on failure
-// method: HTTP method
-// url: full URL (copied internally)
-// cb: completion callback
-// user_data: opaque data passed to callback
+// Per-chunk callback for streaming responses. Invoked on the curl multi
+// worker thread as body bytes arrive. partial->body/body_len reflect
+// what has accumulated so far (NULL/0 if accumulate disabled). chunk
+// points to the newly received bytes only. Must be fast, non-blocking.
+typedef void (*curl_chunk_cb_t)(const curl_response_t *partial,
+    const char *chunk, size_t chunk_len, void *user_data);
+
+// url is copied internally.
 curl_request_t *curl_request_create(curl_method_t method, const char *url,
     curl_done_cb_t cb, void *user_data);
 
-// Set request body. Must be called before curl_request_submit().
-// returns: SUCCESS or FAIL
-// req: request handle
-// content_type: Content-Type header value (e.g., "application/json")
-// body: request body data (copied internally)
-// body_len: length of body in bytes
+// Must be called before curl_request_submit(). body is copied internally.
 bool curl_request_set_body(curl_request_t *req, const char *content_type,
     const char *body, size_t body_len);
 
-// Add a custom header. May be called multiple times before submit.
-// returns: SUCCESS or FAIL
-// req: request handle
-// header: header line (e.g., "Authorization: Bearer xxx")
+// May be called multiple times before submit.
 bool curl_request_add_header(curl_request_t *req, const char *header);
 
-// Set per-request timeout, overriding the KV default.
-// returns: SUCCESS or FAIL
-// req: request handle
-// timeout_secs: timeout in seconds (0 = use default)
+// timeout_secs of 0 uses the KV default.
 bool curl_request_set_timeout(curl_request_t *req, uint32_t timeout_secs);
 
-// Set per-request User-Agent, overriding the KV default.
-// returns: SUCCESS or FAIL
-// req: request handle
-// ua: User-Agent string (copied internally, NULL = use default)
+// ua is copied internally; NULL uses the KV default.
 bool curl_request_set_user_agent(curl_request_t *req, const char *ua);
 
-// Submit a request for async execution. Thread-safe; may be called
-// from any thread. Ownership transfers to the curl subsystem -- the
-// caller must not use req after this call.
-// returns: SUCCESS or FAIL (subsystem not ready, or queue full)
-// req: request handle
+// The done callback still fires at transfer end with final status.
+// Safe to call before submit only. cb NULL clears.
+bool curl_request_set_chunk_cb(curl_request_t *req,
+    curl_chunk_cb_t cb, void *user_data);
+
+// Default true. Set false to skip growing resp_body — the chunk
+// callback becomes the sole data sink, and the 4 MiB response cap is
+// bypassed (useful for long streams). The done callback will still
+// fire with partial->body == NULL / len == 0. Request must be in
+// CREATED state.
+bool curl_request_set_accumulate(curl_request_t *req, bool accumulate);
+
+// Default: true (follow Location: redirects). Set false for a
+// security-sensitive fetch that must not be redirected to a new
+// origin. Safe to call before submit only.
+bool curl_request_set_follow_redirects(curl_request_t *req, bool follow);
+
+// Thread-safe; may be called from any thread. Ownership transfers to
+// the curl subsystem -- the caller must not use req after this call.
 bool curl_request_submit(curl_request_t *req);
 
-// Convenience: create and submit a GET request in one call.
-// returns: SUCCESS or FAIL
-// url: full URL
-// cb: completion callback
-// user_data: opaque data
+// Blocking variant of curl_request_submit. When the submit queue is
+// full, waits on an internal condition variable instead of returning
+// FAIL. Wakes when the drain thread frees slots. Designed for bulk
+// pipelines (e.g. knowledge corpus ingest) where the caller prefers
+// backpressure to silent drops and has the luxury of a dedicated
+// worker thread.
+//
+// Does NOT log a queue-full WARN -- the whole point is to wait
+// quietly. On successful enqueue, ownership transfers to the curl
+// subsystem as usual. Returns FAIL only when the subsystem itself is
+// shutting down (curl_ready goes false); on FAIL the request is
+// released internally.
+//
+// Thread-safe. May be called from any thread except the curl multi
+// loop's own worker (that would deadlock).
+bool curl_request_submit_wait(curl_request_t *req);
+
 bool curl_get(const char *url, curl_done_cb_t cb, void *user_data);
 
-// Convenience: create and submit a POST request in one call.
-// returns: SUCCESS or FAIL
-// url: full URL
-// content_type: Content-Type header value
-// body: request body
-// body_len: body length
-// cb: completion callback
-// user_data: opaque data
 bool curl_post(const char *url, const char *content_type,
     const char *body, size_t body_len,
     curl_done_cb_t cb, void *user_data);
 
-// Curl subsystem statistics.
 typedef struct
 {
   uint32_t active;          // in-flight requests
@@ -110,33 +115,25 @@ typedef struct
   uint64_t total_response_ms; // cumulative response time in milliseconds
 } curl_stats_t;
 
-// Get curl subsystem statistics (thread-safe snapshot).
-// out: destination for the snapshot
 void curl_get_stats(curl_stats_t *out);
 
-// returns: human-readable name of an HTTP method
-// method: method enum value
 const char *curl_method_name(curl_method_t method);
 
-// Initialize the curl subsystem. Must be called after pool_init().
+// Must be called after pool_init().
 void curl_init(void);
 
-// Register KV configuration keys and load values.
 // Must be called after kv_init() and plugin_init_all().
 void curl_register_config(void);
 
-// Shut down the curl subsystem. The multi worker thread must already
-// be joined (via pool_exit) before calling this.
+// The multi worker thread must already be joined (via pool_exit)
+// before calling this.
 void curl_exit(void);
 
-// Active request iteration callback type. Invoked once per in-flight
-// request while the submit queue lock is held — must be fast.
+// Invoked once per in-flight request while the submit queue lock is
+// held — must be fast.
 typedef void (*curl_iter_cb_t)(const char *url, curl_method_t method,
     uint32_t elapsed_secs, void *data);
 
-// Iterate active and queued curl requests. Thread-safe.
-// cb: callback invoked for each request
-// data: opaque user data passed to callback
 void curl_iterate_active(curl_iter_cb_t cb, void *data);
 
 #ifdef CURL_INTERNAL
@@ -144,7 +141,7 @@ void curl_iterate_active(curl_iter_cb_t cb, void *data);
 #include "common.h"
 #include "clam.h"
 #include "kv.h"
-#include "mem.h"
+#include "alloc.h"
 #include "pool.h"
 #include "task.h"
 
@@ -153,12 +150,11 @@ void curl_iterate_active(curl_iter_cb_t cb, void *data);
 #include <sys/eventfd.h>
 #include <unistd.h>
 
-// Configuration defaults.
 #define CURL_DEF_TIMEOUT         30
 #define CURL_DEF_CONNECT_TIMEOUT 10
 #define CURL_DEF_MAX_ACTIVE      32
 #define CURL_DEF_MAX_QUEUED      256
-#define CURL_DEF_MAX_RESP_SZ     (4 * 1024 * 1024)   // 4 MiB
+#define CURL_DEF_MAX_RESP_SZ     (10 * 1024 * 1024)  // 10 MiB
 #define CURL_DEF_POLL_TIMEOUT    500
 #define CURL_DEF_MAX_CONNS       64
 #define CURL_DEF_MAX_HOST_CONNS  8
@@ -172,7 +168,6 @@ void curl_iterate_active(curl_iter_cb_t cb, void *data);
 #define CURL_CT_SZ            128
 #define CURL_UA_SZ            128
 
-// Request states (internal lifecycle).
 typedef enum
 {
   CURL_REQ_CREATED,       // created, not yet submitted
@@ -181,14 +176,12 @@ typedef enum
   CURL_REQ_DONE           // transfer complete, callback delivered
 } curl_req_state_t;
 
-// Custom header list node.
 typedef struct curl_hdr
 {
   char            *value;
   struct curl_hdr *next;
 } curl_hdr_t;
 
-// Request structure.
 struct curl_request
 {
   curl_method_t       method;
@@ -197,33 +190,40 @@ struct curl_request
   uint32_t            timeout_secs;     // 0 = use default
   char                user_agent[CURL_UA_SZ]; // empty = use default
 
-  // Request body (heap-allocated, owned by request).
+  // Heap-allocated, owned by request.
   char               *req_body;
   size_t              req_body_len;
   char                content_type[CURL_CT_SZ];
 
-  // Custom headers.
   curl_hdr_t         *headers;
   struct curl_slist  *curl_headers;     // built at submit time
 
-  // Response accumulator (grown via mem_realloc).
+  // Grown via mem_realloc.
   char               *resp_body;
   size_t              resp_body_len;
   size_t              resp_body_cap;
 
-  // Callback.
+  // Captured response headers of interest. Populated by the header
+  // callback during transfer; surfaced on the delivered curl_response_t
+  // as `etag` / `last_modified`. Empty string means "not present".
+  char                resp_etag          [128];
+  char                resp_last_modified [64];
+
   curl_done_cb_t      cb;
   void               *cb_data;
 
-  // libcurl easy handle (created at submit, owned by multi).
+  curl_chunk_cb_t     chunk_cb;
+  void               *chunk_user;
+  bool                accumulate;   // default true
+  bool                follow_redirects; // default true
+
+  // Created at submit, owned by multi.
   CURL               *easy;
   char                curl_errbuf[CURL_ERROR_SIZE];
 
-  // Submit queue linkage.
   struct curl_request *next;
 };
 
-// Cached configuration values (from KV).
 typedef struct
 {
   uint32_t timeout;           // default request timeout (seconds)
@@ -238,7 +238,6 @@ typedef struct
   char     user_agent[CURL_UA_SZ]; // default User-Agent string
 } curl_cfg_t;
 
-// Module state.
 static CURLM             *curl_multi_handle = NULL;
 static task_t            *curl_task         = NULL;
 static int                curl_wake_fd      = -1;
@@ -250,27 +249,30 @@ static curl_request_t    *curl_submit_head  = NULL;
 static curl_request_t    *curl_submit_tail  = NULL;
 static uint32_t           curl_submit_count = 0;
 static pthread_mutex_t    curl_submit_mutex;
+// Signalled whenever the submit queue's fill drops (drain thread runs,
+// subsystem shuts down) so threads blocked in curl_request_submit_wait
+// can re-check capacity without polling or generating log noise.
+static pthread_cond_t     curl_slot_cond;
 
-// Active count (only touched by multi loop thread).
+// Only touched by multi loop thread.
 static uint32_t           curl_active_count = 0;
 
-// Statistics.
 static uint64_t           curl_stat_total   = 0;
 static uint64_t           curl_stat_errors  = 0;
 static uint64_t           curl_stat_in      = 0;
 static uint64_t           curl_stat_out     = 0;
 static uint64_t           curl_stat_time_ms = 0;
 
-// Request freelist.
 static curl_request_t    *curl_req_free     = NULL;
 static pthread_mutex_t    curl_req_mutex;
 
-// Forward declarations.
 static void    curl_multi_loop(task_t *t);
 static void    curl_drain_queue(void);
 static void    curl_finish_request(curl_request_t *req, CURLcode result);
 static void    curl_request_release(curl_request_t *req);
 static size_t  curl_write_cb(char *ptr, size_t size, size_t nmemb,
+                   void *userdata);
+static size_t  curl_header_cb(char *buf, size_t size, size_t nitems,
                    void *userdata);
 static void    curl_register_kv(void);
 static void    curl_load_config(void);
