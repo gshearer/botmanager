@@ -744,6 +744,12 @@ cb_ws_reader(task_t *t)
       continue;
     }
 
+    // Re-read the wall clock: the open path above can advance
+    // last_frame_ms past the now_ms we captured before the handshake,
+    // which would wrap the unsigned subtraction below and trip the
+    // watchdog on a fresh session.
+    now_ms = cb_ws_now_ms();
+
     // Idle-timeout watchdog. A session that has gone quiet beyond the
     // configured idle window is presumed wedged; drop and reconnect.
     if(now_ms - w->last_frame_ms > CB_WS_IDLE_TIMEOUT_MS)

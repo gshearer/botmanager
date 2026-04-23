@@ -302,13 +302,11 @@ wm_market_init(whenmoon_state_t *st)
     memcpy(ctx->product_id, pids[i], sizeof(ctx->product_id));
     ctx->product_id[sizeof(ctx->product_id) - 1] = '\0';
 
-    if(coinbase_fetch_candles_async(ctx->product_id, COINBASE_GRAN_1M,
-           0, 0, wm_market_on_candles, ctx) != SUCCESS)
-    {
-      clam(CLAM_INFO, WHENMOON_CTX,
-          "market %s: backfill submit failed", ctx->product_id);
-      mem_free(ctx);
-    }
+    // On FAIL, coinbase invokes wm_market_on_candles with res->err set
+    // and that callback frees ctx. Do not touch ctx or log from here —
+    // doing so would double-free and read freed memory.
+    (void)coinbase_fetch_candles_async(ctx->product_id, COINBASE_GRAN_1M,
+        0, 0, wm_market_on_candles, ctx);
   }
 
   // One combined subscription across every configured product.

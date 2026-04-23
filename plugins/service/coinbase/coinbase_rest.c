@@ -247,7 +247,7 @@ cb_submit_public(cb_request_t *req, const char *path, curl_done_cb_t done_cb)
   char            url [CB_URL_SZ];
   int             n;
 
-  if(!cb_rest_base_url(base, sizeof(base)))
+  if(cb_rest_base_url(base, sizeof(base)) != SUCCESS)
   {
     clam(CLAM_WARN, CB_CTX, "submit: REST base URL not configured");
     return(FAIL);
@@ -305,7 +305,7 @@ cb_submit_private(cb_request_t *req, curl_method_t method,
   if(!cb_apikey_configured())
     return(FAIL);
 
-  if(!cb_rest_base_url(base, sizeof(base)))
+  if(cb_rest_base_url(base, sizeof(base)) != SUCCESS)
   {
     clam(CLAM_WARN, CB_CTX, "private submit: REST base URL not configured");
     return(FAIL);

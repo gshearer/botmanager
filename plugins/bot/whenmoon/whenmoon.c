@@ -26,11 +26,11 @@
 // Per-instance schema: keys registered as bot.<name>.whenmoon.<suffix>
 // at bot-create time. See plugin.h for the kv_inst_schema contract.
 static const plugin_kv_entry_t whenmoon_inst_schema[] = {
-  { "markets", KV_STR, "",
+  { "whenmoon.markets", KV_STR, "",
     "Comma-separated list of Coinbase product ids (e.g."
     " \"BTC-USD,ETH-USD\") this bot watches. Empty = no markets.",
     NULL, NULL },
-  { "account.refresh_sec", KV_UINT32, "30",
+  { "whenmoon.account.refresh_sec", KV_UINT32, "30",
     "Seconds between coinbase /accounts polls for this bot. Minimum"
     " effective value is 5. Ignored when no coinbase apikey is"
     " configured.", NULL, NULL },
@@ -59,25 +59,10 @@ whenmoon_create(bot_inst_t *inst)
   if(name != NULL)
     snprintf(st->bot_name, sizeof(st->bot_name), "%s", name);
 
-  if(wm_market_init(st) != SUCCESS)
-  {
-    clam(CLAM_INFO, WHENMOON_CTX,
-        "bot %s: wm_market_init failed", st->bot_name);
-    wm_market_destroy(st);
-    mem_free(st);
-    return(NULL);
-  }
-
-  if(wm_account_init(st) != SUCCESS)
-  {
-    clam(CLAM_INFO, WHENMOON_CTX,
-        "bot %s: wm_account_init failed", st->bot_name);
-    wm_market_destroy(st);
-    wm_account_destroy(st);
-    mem_free(st);
-    return(NULL);
-  }
-
+  // Market + account init is deferred to whenmoon_start_cb so that KVs
+  // set by the same config batch land before we read them. `bot add`
+  // fires create; the per-bot KVs often land after. Starting the
+  // subsystems early would observe an empty markets list.
   return(st);
 }
 
@@ -98,7 +83,25 @@ whenmoon_destroy(void *handle)
 static bool
 whenmoon_start_cb(void *handle)
 {
-  (void)handle;
+  whenmoon_state_t *st = handle;
+
+  if(st == NULL)
+    return(FAIL);
+
+  if(st->markets == NULL && wm_market_init(st) != SUCCESS)
+  {
+    clam(CLAM_INFO, WHENMOON_CTX, "bot %s: wm_market_init failed",
+        st->bot_name);
+    return(FAIL);
+  }
+
+  if(st->account == NULL && wm_account_init(st) != SUCCESS)
+  {
+    clam(CLAM_INFO, WHENMOON_CTX, "bot %s: wm_account_init failed",
+        st->bot_name);
+    return(FAIL);
+  }
+
   return(SUCCESS);
 }
 
