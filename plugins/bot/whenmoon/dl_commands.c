@@ -839,7 +839,7 @@ static void
 wm_dl_parent_cb_bot(const cmd_ctx_t *ctx)
 {
   wm_dl_parent_walk(ctx, "bot", NULL,
-      "usage: /bot <name> download <trades|cancel> ...");
+      "usage: /bot <name> download <trades|candles|cancel> ...");
 }
 
 static void

@@ -69,6 +69,12 @@ m_dep = cc.find_library('m', required : false)
 # libxml2 for RSS/Atom + HTML parsing (inference plugin: acquire feeds).
 xml2_dep = dependency('libxml-2.0', required : true)
 
+# TA-Lib (BSD-3) for technical indicators (whenmoon plugin). System-
+# packaged on Arch via the AUR `ta-lib` package; pkg-config exposes
+# the include path and the libta-lib.so.0 link line. We do NOT vendor;
+# operators install the dep before building.
+talib_dep = dependency('ta-lib', required : true)
+
 
 subdir('core')
 subdir('plugins')

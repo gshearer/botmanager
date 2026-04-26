@@ -137,9 +137,11 @@ whenmoon_start_cb(void *handle)
   }
 
   // Restore the running-market set from the DB. Each add() here fires
-  // a WS subscribe, a live-ring backfill, and a catch-up
-  // DL_JOB_CANDLES (when prior history is present) — which is exactly
-  // what we want post-restart. Restore never blocks start on DB
+  // a WS subscribe and a live-ring backfill (300 rows of 1m candles
+  // via REST). History coverage for trading is the strategy layer's
+  // responsibility (WM-LT-3); operators can drive the
+  // `/bot <name> download candles ...` verbs explicitly when a
+  // deeper history is wanted. Restore never blocks start on DB
   // contents: a restore failure is logged but the bot still runs.
   if(wm_market_restore(st) != SUCCESS)
     clam(CLAM_INFO, WHENMOON_CTX,

@@ -31,9 +31,9 @@ typedef struct
   char                  product_id[COINBASE_PRODUCT_ID_SZ];
 
   // Registry id from wm_market (Postgres). Cached at add-time so the
-  // market verbs + catch-up logic don't re-resolve on every call.
-  // -1 means "not resolved yet" (should not happen once wm_market_add
-  // returns SUCCESS).
+  // market verbs and ad-hoc download verbs don't re-resolve on every
+  // call. -1 means "not resolved yet" (should not happen once
+  // wm_market_add returns SUCCESS).
   int32_t               market_id;
 
   // Candle ring. `candles` holds WM_MARKET_CANDLE_CAP rows. `n_candles`
@@ -93,12 +93,17 @@ void wm_market_destroy(struct whenmoon_state *st);
 // Effects: (1) resolve/create the wm_market registry row, (2) grow and
 // append to `st->markets->arr`, (3) INSERT into wm_bot_market if
 // `persist`, (4) rebuild the WS subscription with the updated product
-// list, (5) kick a one-shot backfill for the new product (live ring),
-// (6) if `st->dl_ready` and the bot already has stored 1m candles for
-// this market, enqueue a catch-up DL_JOB_CANDLES from the last local
-// ts to NULL (= "now"). Dedup: silently returns SUCCESS if the product
-// is already in the running set. FAIL on DB/alloc errors; writes a
-// terse diagnostic into `err` (optional; pass NULL to suppress).
+// list, (5) kick a one-shot live-ring backfill for the new product
+// (300 rows of 1m candles via REST).
+//
+// History coverage for trading is the strategy layer's responsibility
+// (WM-LT-3) — this function does NOT enqueue any catch-up download.
+// Operators who need a deeper history can drive the
+// `/bot <name> download candles …` verbs explicitly.
+//
+// Dedup: silently returns SUCCESS if the product is already in the
+// running set. FAIL on DB/alloc errors; writes a terse diagnostic
+// into `err` (optional; pass NULL to suppress).
 bool wm_market_add(struct whenmoon_state *st,
     const char *exchange, const char *base, const char *quote,
     const char *product_id, bool persist,
@@ -115,10 +120,8 @@ bool wm_market_remove(struct whenmoon_state *st,
     char *err, size_t err_cap);
 
 // Bot-start restore: enumerate the bot's rows in wm_bot_market and
-// call wm_market_add(..., persist=false) for each. Must run AFTER
-// wm_dl_scheduler_init so the catch-up enqueue path has a live
-// scheduler to enqueue into. SUCCESS even when the bot has zero
-// running markets; FAIL only on a hard DB error.
+// call wm_market_add(..., persist=false) for each. SUCCESS even when
+// the bot has zero running markets; FAIL only on a hard DB error.
 bool wm_market_restore(struct whenmoon_state *st);
 
 // Async callback invoked by coinbase on backfill completion. `user` is

@@ -1,17 +1,18 @@
 // botmanager — MIT
-// whenmoon per-market state: live set, WS fanout, catch-up dispatcher.
+// whenmoon per-market state: live set, WS fanout, live-ring backfill.
 //
 // Running markets are owned by the DB (`wm_bot_market`), not a KV.
-// The user drives the set through `/bot <name> market start|stop`.
-// `wm_market_restore` replays it on bot start and fires one catch-up
-// DL_JOB_CANDLES per market when the local 1m-candle table has at
-// least one stored row.
+// The user drives the set through `/bot <name> market start|stop`;
+// `wm_market_restore` replays it on bot start. Adding a market
+// triggers a 1m-candle live-ring backfill (300 rows via REST) but
+// no history catch-up — historical coverage is the strategy layer's
+// responsibility (WM-LT-3) and the user-facing `/bot … download …`
+// verbs.
 
 #define WHENMOON_INTERNAL
 #include "whenmoon.h"
 #include "market.h"
 #include "dl_schema.h"
-#include "dl_scheduler.h"
 
 #include "db.h"
 
@@ -189,109 +190,6 @@ wm_market_kick_backfill(whenmoon_state_t *st, const char *product_id)
   // and that callback frees ctx. Do NOT touch ctx after this call.
   (void)coinbase_fetch_candles_async(ctx->product_id, COINBASE_GRAN_1M,
       0, 0, wm_market_on_candles, ctx);
-}
-
-// Query the most recent stored 1m-candle ts for the market. Writes a
-// TIMESTAMPTZ canonical string into `out` and returns SUCCESS iff the
-// table exists and has at least one row. Anything else (missing table,
-// empty table, DB error) is FAIL with `out` untouched.
-static bool
-wm_market_last_local_candle_ts(int32_t market_id, char *out, size_t cap)
-{
-  char         table[WM_DL_TABLE_SZ];
-  char        *e_table = NULL;
-  db_result_t *res     = NULL;
-  char         sql[256];
-  bool         ok      = FAIL;
-  const char  *s;
-  int          n;
-
-  if(out == NULL || cap == 0)
-    return(FAIL);
-
-  if(wm_candle_table_name(market_id, COINBASE_GRAN_1M,
-         table, sizeof(table)) != SUCCESS)
-    return(FAIL);
-
-  e_table = db_escape(table);
-
-  if(e_table == NULL)
-    goto out;
-
-  n = snprintf(sql, sizeof(sql),
-      "SELECT to_char(MAX(ts), 'YYYY-MM-DD HH24:MI:SS+00')"
-      "  FROM %s",
-      e_table);
-
-  if(n < 0 || (size_t)n >= sizeof(sql))
-    goto out;
-
-  res = db_result_alloc();
-
-  if(res == NULL)
-    goto out;
-
-  if(db_query(sql, res) != SUCCESS || !res->ok || res->rows == 0)
-    goto out;
-
-  s = db_result_get(res, 0, 0);
-
-  if(s == NULL || s[0] == '\0')
-    goto out;
-
-  snprintf(out, cap, "%s", s);
-  ok = SUCCESS;
-
-out:
-  if(res     != NULL) db_result_free(res);
-  if(e_table != NULL) mem_free(e_table);
-
-  return(ok);
-}
-
-// Enqueue a catch-up DL_JOB_CANDLES covering (last_local_ts, now].
-// No-op when the downloader isn't ready, when the local table is
-// empty, or when scheduler enqueue fails for any reason (we log and
-// move on — the market is still live on WS).
-static void
-wm_market_kick_catchup(whenmoon_state_t *st, int32_t market_id,
-    const char *exchange, const char *product_id)
-{
-  char    last_ts[40];
-  char    err[128];
-  int64_t job_id = 0;
-
-  if(st == NULL || st->downloader == NULL || !st->dl_ready)
-    return;
-
-  if(exchange == NULL || product_id == NULL)
-    return;
-
-  if(wm_market_last_local_candle_ts(market_id,
-         last_ts, sizeof(last_ts)) != SUCCESS)
-  {
-    clam(CLAM_INFO, WHENMOON_CTX,
-        "bot %s: market %s: no local candles, skipping catch-up"
-        " (use /bot %s download candles ... to backfill history)",
-        st->bot_name, product_id, st->bot_name);
-    return;
-  }
-
-  if(wm_dl_job_enqueue(st, DL_JOB_CANDLES, market_id,
-         COINBASE_GRAN_1M, exchange, product_id,
-         last_ts, "",
-         "catchup", &job_id, err, sizeof(err)) != SUCCESS)
-  {
-    clam(CLAM_INFO, WHENMOON_CTX,
-        "bot %s: market %s: catch-up enqueue failed: %s",
-        st->bot_name, product_id,
-        err[0] != '\0' ? err : "unknown");
-    return;
-  }
-
-  clam(CLAM_INFO, WHENMOON_CTX,
-      "bot %s: market %s: catch-up job %" PRId64 " (from %s)",
-      st->bot_name, product_id, job_id, last_ts);
 }
 
 // ------------------------------------------------------------------ //
@@ -639,7 +537,6 @@ wm_market_add(whenmoon_state_t *st,
 
   wm_market_resub_ws(st);
   wm_market_kick_backfill(st, product_id);
-  wm_market_kick_catchup(st, market_id, exchange, product_id);
 
   clam(CLAM_INFO, WHENMOON_CTX,
       "bot %s: market %s started (market_id=%" PRId32 "%s)",

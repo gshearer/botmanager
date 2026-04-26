@@ -211,7 +211,7 @@ wm_market_register_verbs(void)
   if(cmd_register("whenmoon", "market",
         "bot <name> market <start|stop> <exch>:<asset>:<cur>",
         "Add or remove a live market assignment for this bot."
-        " Starts: WS subscribe + candle backfill + catch-up download."
+        " Starts: WS subscribe + live-ring 1m backfill."
         " Stops: unsubscribe + drop DB row.",
         NULL,
         USERNS_GROUP_ADMIN, 100, CMD_SCOPE_ANY, METHOD_T_ANY,
@@ -221,9 +221,11 @@ wm_market_register_verbs(void)
 
   if(cmd_register("whenmoon", "start",
         "bot <name> market start <exch>:<asset>:<cur>",
-        "Start a market: WS subscribe, backfill the live ring, enqueue"
-        " a catch-up candles download (if the local history is populated),"
-        " and persist the assignment so it survives daemon restarts.",
+        "Start a market: WS subscribe, backfill the live ring (300 rows"
+        " of 1m candles), and persist the assignment so it survives"
+        " daemon restarts. History catch-up is not automatic — drive"
+        " `/bot <name> download candles ...` if a deeper history is"
+        " wanted.",
         NULL,
         USERNS_GROUP_ADMIN, 100, CMD_SCOPE_ANY, METHOD_T_ANY,
         wm_market_cmd_start, NULL, "bot/market", NULL,

@@ -6,7 +6,10 @@ System packages (Arch names; equivalent on other distros):
 - `meson`, `ninja`
 - `gcc` (or clang) supporting `-std=gnu11`
 - `libargon2`, `openssl`, `libcurl`, `json-c`, `libresolv`, `libuuid`,
-  `libdl`, `libm`
+  `libdl`, `libm`, `libxml2`
+- `ta-lib` (BSD-3 technical-indicator library — AUR on Arch:
+  `yay -S ta-lib`. Used by the whenmoon plugin only; meson reports
+  `Run-time dependency ta-lib found: YES <ver>` at setup.)
 
 DB driver (currently the only one, runtime-loadable plugin):
 - `postgresql` client library (`libpq`)

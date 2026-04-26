@@ -91,8 +91,9 @@ static const char *const wm_dl_ddl_core[] = {
 
   // Running-market assignments. A row exists iff the named bot has
   // started the market and not yet stopped it. Rows survive daemon
-  // restarts (wm_market_restore re-subscribes + fires a catch-up
-  // download at bot start). wm_market_remove(persist=true) deletes.
+  // restarts (wm_market_restore re-subscribes + live-ring backfill;
+  // history catch-up is the strategy layer's responsibility).
+  // wm_market_remove(persist=true) deletes.
   "CREATE TABLE IF NOT EXISTS wm_bot_market ("
   " bot_name   VARCHAR(64)  NOT NULL,"
   " market_id  INT          NOT NULL REFERENCES wm_market(id),"
