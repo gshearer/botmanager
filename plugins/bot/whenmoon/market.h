@@ -10,6 +10,7 @@
 
 #ifdef WHENMOON_INTERNAL
 
+#include "aggregator.h"
 #include "coinbase_api.h"
 
 #include <pthread.h>
@@ -17,16 +18,14 @@
 #include <stdint.h>
 #include <time.h>
 
-// Ring-buffer capacity for candles. Backfill lands COINBASE_MAX_CANDLES
-// rows at most (300); we keep the buffer at 512 so live 1m-bar inserts
-// after backfill do not immediately wrap over fresh data in a restart.
-#define WM_MARKET_CANDLE_CAP   512
-
 // Initial capacity for the per-bot market array. Grows via
 // mem_realloc as `wm_market_add` inserts; there is no hard cap.
 #define WM_MARKET_INIT_CAP       8
 
-typedef struct
+// Forward decl — defined in trade_persist.h, opaque to most callers.
+struct wm_trade_persist;
+
+typedef struct whenmoon_market
 {
   char                  product_id[COINBASE_PRODUCT_ID_SZ];
 
@@ -36,13 +35,24 @@ typedef struct
   // wm_market_add returns SUCCESS).
   int32_t               market_id;
 
-  // Candle ring. `candles` holds WM_MARKET_CANDLE_CAP rows. `n_candles`
-  // saturates at WM_MARKET_CANDLE_CAP; `write_pos` is the next slot to
-  // overwrite. Consumers reading for a snapshot should lock `lock`,
-  // walk `[write_pos - n_candles, write_pos)` modulo cap, then unlock.
-  coinbase_candle_t     candles[WM_MARKET_CANDLE_CAP];
-  uint32_t              n_candles;
-  uint32_t              write_pos;
+  // Multi-grain candle rings. `grain_cap[g]` slots of
+  // `wm_candle_full_t`; `grain_n[g]` populated, oldest at index 0,
+  // newest at `grain_n[g] - 1`. Once full, the aggregator shifts the
+  // ring left by one to make room for the new bar (memmove cost is
+  // small at 200-day capacities and avoids ring-buffer wrap-around in
+  // the indicator computation hot path).
+  wm_candle_full_t     *grain_arr[WM_GRAN_MAX];
+  uint32_t              grain_n[WM_GRAN_MAX];
+  uint32_t              grain_cap[WM_GRAN_MAX];
+
+  // Owned per-market aggregator. NULL until wm_aggregator_init runs in
+  // wm_market_add; teardown via wm_aggregator_destroy in
+  // wm_market_remove / wm_market_destroy.
+  wm_aggregator_t      *aggregator;
+
+  // Buffered trade-persist ring. Allocated by wm_trade_persist_init
+  // from wm_market_add; freed by wm_trade_persist_destroy.
+  struct wm_trade_persist *trade_persist;
 
   // Last observed ticker price (0.0 until the first ticker event
   // lands). last_tick_ms is the event timestamp coinbase_ws_ticker_t

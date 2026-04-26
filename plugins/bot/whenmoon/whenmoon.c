@@ -12,11 +12,14 @@
 #include "dl_scheduler.h"
 #include "dl_commands.h"
 #include "market_cmds.h"
+#include "trade_persist.h"
 
 #include "cmd.h"
 #include "colors.h"
 #include "kv.h"
 #include "userns.h"
+
+#include <ta-lib/ta_libc.h>
 
 #include <inttypes.h>
 #include <stdio.h>
@@ -210,17 +213,26 @@ whenmoon_show_markets_cmd(const cmd_ctx_t *ctx)
     whenmoon_market_t *mk = &m->arr[i];
     double   px;
     int64_t  tick_ms;
-    uint32_t ncandles;
+    uint32_t g1m, g5m, g15m, g1h, g6h, g1d;
+    uint32_t cap1m;
 
     pthread_mutex_lock(&mk->lock);
     px       = mk->last_px;
     tick_ms  = mk->last_tick_ms;
-    ncandles = mk->n_candles;
+    g1m      = mk->grain_n[WM_GRAN_1M];
+    g5m      = mk->grain_n[WM_GRAN_5M];
+    g15m     = mk->grain_n[WM_GRAN_15M];
+    g1h      = mk->grain_n[WM_GRAN_1H];
+    g6h      = mk->grain_n[WM_GRAN_6H];
+    g1d      = mk->grain_n[WM_GRAN_1D];
+    cap1m    = mk->grain_cap[WM_GRAN_1M];
     pthread_mutex_unlock(&mk->lock);
 
     snprintf(line, sizeof(line),
-        "  %-12s  last_px=%-14.8g  candles=%-4u  last_tick_ms=%" PRId64,
-        mk->product_id, px, ncandles, tick_ms);
+        "  %-12s  last_px=%-14.8g  bars 1m=%u/%u 5m=%u 15m=%u"
+        " 1h=%u 6h=%u 1d=%u  last_tick_ms=%" PRId64,
+        mk->product_id, px, g1m, cap1m, g5m, g15m, g1h, g6h, g1d,
+        tick_ms);
     cmd_reply(ctx, line);
   }
 }
@@ -356,6 +368,21 @@ whenmoon_register_show_verbs(void)
 static bool
 whenmoon_init(void)
 {
+  TA_RetCode rc = TA_Initialize();
+
+  if(rc != TA_SUCCESS)
+  {
+    clam(CLAM_INFO, WHENMOON_CTX, "TA_Initialize failed: rc=%d", rc);
+    return(FAIL);
+  }
+
+  if(wm_trade_persist_global_init() != SUCCESS)
+  {
+    clam(CLAM_INFO, WHENMOON_CTX, "trade-persist global init failed");
+    TA_Shutdown();
+    return(FAIL);
+  }
+
   if(whenmoon_register_show_verbs() != SUCCESS)
   {
     clam(CLAM_INFO, WHENMOON_CTX, "show-verb registration failed");
@@ -381,6 +408,8 @@ whenmoon_init(void)
 static void
 whenmoon_deinit(void)
 {
+  wm_trade_persist_global_destroy();
+  TA_Shutdown();
   clam(CLAM_INFO, WHENMOON_CTX, "whenmoon plugin deinitialized");
 }
 

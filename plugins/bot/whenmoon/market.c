@@ -11,10 +11,13 @@
 
 #define WHENMOON_INTERNAL
 #include "whenmoon.h"
+#include "aggregator.h"
 #include "market.h"
 #include "dl_schema.h"
+#include "trade_persist.h"
 
 #include "db.h"
+#include "task.h"
 
 #include <inttypes.h>
 #include <stdio.h>
@@ -329,16 +332,25 @@ wm_market_on_candles(const coinbase_candles_result_t *res, void *user)
 
   pthread_mutex_lock(&mk->lock);
 
-  // Coinbase returns candles newest-first; push them in reverse so the
-  // ring buffer ends up with newest at write_pos-1 and oldest at
-  // write_pos after wrap.
+  // Coinbase returns candles newest-first; replay oldest-first so the
+  // aggregator's idempotency check (skip ts <= last_close_ms) prunes
+  // duplicates correctly when a later REST page overlaps a prior
+  // warm-up. The replay path drives the cascade so 5m/15m/1h/6h/1d
+  // grains backfill from this single 1m feed.
   for(i = res->count; i > 0; i--)
   {
-    mk->candles[mk->write_pos] = res->rows[i - 1];
-    mk->write_pos = (mk->write_pos + 1) % WM_MARKET_CANDLE_CAP;
+    const coinbase_candle_t *cb = &res->rows[i - 1];
+    wm_candle_full_t         bar;
 
-    if(mk->n_candles < WM_MARKET_CANDLE_CAP)
-      mk->n_candles++;
+    memset(&bar, 0, sizeof(bar));
+    bar.ts_close_ms = (cb->time + 60) * 1000;   // 1m bucket close
+    bar.open        = cb->open;
+    bar.high        = cb->high;
+    bar.low         = cb->low;
+    bar.close       = cb->close;
+    bar.volume      = cb->volume;
+
+    wm_aggregator_replay_bar(mk, WM_GRAN_1M, &bar);
   }
 
   pthread_mutex_unlock(&mk->lock);
@@ -400,8 +412,21 @@ wm_market_on_event(const coinbase_ws_event_t *ev, void *user)
         break;
 
       pthread_mutex_lock(&mk->lock);
+
       mk->last_px      = m->price;
       mk->last_tick_ms = m->time_ms;
+
+      // Drive the multi-grain cascade. Aggregator owns the close +
+      // indicator pass; this hot path stays under one lock acquire.
+      if(mk->aggregator != NULL)
+        wm_aggregator_on_trade(mk, m->time_ms, m->price, m->size);
+
+      // Append to the per-market trade-persist ring; flushed by the
+      // plugin-global periodic task. _async never blocks; on overflow
+      // it drops oldest unflushed and emits one rate-limited warn.
+      if(mk->trade_persist != NULL)
+        wm_trade_persist_async(mk, m);
+
       pthread_mutex_unlock(&mk->lock);
 
       clam(CLAM_DEBUG2, WHENMOON_CTX,
@@ -458,7 +483,23 @@ wm_market_destroy(whenmoon_state_t *st)
   if(m->arr != NULL)
   {
     for(i = 0; i < m->n_markets; i++)
-      pthread_mutex_destroy(&m->arr[i].lock);
+    {
+      whenmoon_market_t *mk = &m->arr[i];
+
+      // Order: persist before aggregator. The flush task reads
+      // mk->trade_persist under a global tick walker, so removing the
+      // aggregator first would leave an in-flight flush dereferencing a
+      // destroyed slot only via the persist pointer (which is fine);
+      // tearing persist down first removes that pointer entirely, so
+      // the next walker iteration skips this slot cleanly.
+      if(mk->trade_persist != NULL)
+        wm_trade_persist_destroy(mk);
+
+      if(mk->aggregator != NULL)
+        wm_aggregator_destroy(mk);
+
+      pthread_mutex_destroy(&mk->lock);
+    }
 
     mem_free(m->arr);
   }
@@ -535,8 +576,63 @@ wm_market_add(whenmoon_state_t *st,
     }
   }
 
+  // Allocate aggregator + trade-persist buffers. Both must be in place
+  // before resub_ws so the first WS event can already feed them.
+  if(wm_aggregator_init(mk, WM_AGG_DEFAULT_HISTORY_1D) != SUCCESS)
+  {
+    if(persist)
+      (void)wm_bot_market_delete(st->bot_name, market_id);
+
+    pthread_mutex_destroy(&mk->lock);
+    memset(mk, 0, sizeof(*mk));
+    m->n_markets--;
+    if(err != NULL) snprintf(err, err_cap, "aggregator init failed");
+    return(FAIL);
+  }
+
+  if(wm_trade_persist_init(mk) != SUCCESS)
+  {
+    wm_aggregator_destroy(mk);
+
+    if(persist)
+      (void)wm_bot_market_delete(st->bot_name, market_id);
+
+    pthread_mutex_destroy(&mk->lock);
+    memset(mk, 0, sizeof(*mk));
+    m->n_markets--;
+    if(err != NULL) snprintf(err, err_cap, "trade persist init failed");
+    return(FAIL);
+  }
+
   wm_market_resub_ws(st);
   wm_market_kick_backfill(st, product_id);
+
+  // Schedule the DB warm-up: replay 1m bars from
+  // wm_candles_<id>_60 chronologically into the aggregator. The
+  // deferred task re-resolves the market by product_id at run-time so
+  // a stop-before-warm-up bails cleanly. 50 ms after the live-ring
+  // backfill kick gives REST a head start without blocking the verb.
+  {
+    wm_warmup_ctx_t *wctx = mem_alloc("whenmoon", "warmup_ctx",
+        sizeof(*wctx));
+
+    if(wctx != NULL)
+    {
+      wctx->st        = st;
+      wctx->market_id = market_id;
+      snprintf(wctx->product_id, sizeof(wctx->product_id),
+          "%s", product_id);
+
+      if(task_add_deferred("wm_warmup", TASK_ANY, 100, 50,
+             wm_aggregator_load_history_task, wctx) == TASK_HANDLE_NONE)
+      {
+        clam(CLAM_INFO, WHENMOON_CTX,
+            "bot %s: market %s warmup task submit failed",
+            st->bot_name, product_id);
+        mem_free(wctx);
+      }
+    }
+  }
 
   clam(CLAM_INFO, WHENMOON_CTX,
       "bot %s: market %s started (market_id=%" PRId32 "%s)",
@@ -578,6 +674,15 @@ wm_market_remove(whenmoon_state_t *st, const char *product_id,
 
   idx       = (uint32_t)(mk - m->arr);
   market_id = mk->market_id;
+
+  // Same teardown order as wm_market_destroy: persist first, then
+  // aggregator. Both lock the slot's mutex internally, so destroy them
+  // before pthread_mutex_destroy(&mk->lock).
+  if(mk->trade_persist != NULL)
+    wm_trade_persist_destroy(mk);
+
+  if(mk->aggregator != NULL)
+    wm_aggregator_destroy(mk);
 
   pthread_mutex_destroy(&mk->lock);
 
