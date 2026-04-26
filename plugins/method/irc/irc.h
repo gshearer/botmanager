@@ -109,9 +109,9 @@ typedef struct
 
   // Pending reconnect task. Set when task_add_deferred schedules a
   // reconnect; cleared by the task itself when it fires, and
-  // neutralised (state=TASK_ENDED) by irc_disconnect so the task
-  // doesn't fire after the method has been stopped.
-  task_t           *reconnect_task;
+  // cancelled by irc_disconnect so the task doesn't fire after the
+  // method has been stopped.
+  task_handle_t     reconnect_task;
 
   // Channel member tracking.
   irc_channel_t    *channels;

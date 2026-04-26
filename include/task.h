@@ -7,6 +7,13 @@
 
 #define TASK_NAME_SZ  40
 
+// Opaque handle for cancellable scheduled tasks. Zero is reserved to
+// mean "no task"; live tasks receive a non-zero monotonic id at
+// creation time. Handles remain usable across the task's lifetime —
+// task_cancel of a stale handle is a harmless no-op.
+typedef uint64_t task_handle_t;
+#define TASK_HANDLE_NONE ((task_handle_t)0)
+
 typedef enum
 {
   TASK_WAITING,     // ready to be picked up by a worker
@@ -69,6 +76,8 @@ struct task
   task_t         *link;
 
   // Managed by the task system — read-only for callers.
+  task_handle_t   id;               // non-zero monotonic, assigned at creation
+  bool            cancelled;        // set by task_cancel; honoured at task_finish
   time_t          created;
   time_t          last_run;
   uint32_t        run_count;
@@ -105,13 +114,23 @@ task_t *task_add_persist(const char *name, uint8_t priority,
 
 // Create and submit a periodic task that runs on an interval.
 // Callback sets TASK_ENDED to mean "iteration done, reschedule".
-// interval_ms minimum effective value: 1000.
-task_t *task_add_periodic(const char *name, task_type_t type,
+// interval_ms minimum effective value: 1000. Returns a cancellation
+// handle, or TASK_HANDLE_NONE on submit failure.
+task_handle_t task_add_periodic(const char *name, task_type_t type,
     uint8_t priority, uint32_t interval_ms, task_cb_t cb, void *data);
 
 // Create and submit a deferred task (runs once after delay_ms).
-task_t *task_add_deferred(const char *name, task_type_t type,
+// Returns a cancellation handle, or TASK_HANDLE_NONE on submit failure.
+task_handle_t task_add_deferred(const char *name, task_type_t type,
     uint8_t priority, uint32_t delay_ms, task_cb_t cb, void *data);
+
+// Cancel a scheduled periodic or deferred task. Safe to call from any
+// thread. TASK_HANDLE_NONE is a no-op. If the task is queued (ready or
+// timer), it is unlinked and freed immediately. If the task is
+// currently running, a flag is set so task_finish treats the next
+// TASK_ENDED return as terminal rather than rescheduling. Does not
+// block waiting for a running callback to complete.
+void task_cancel(task_handle_t h);
 
 // Returns a task in RUNNING state, or NULL if none available.
 task_t *task_assign(task_type_t type);

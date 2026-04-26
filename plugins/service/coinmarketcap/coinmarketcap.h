@@ -100,7 +100,7 @@ static cmc_request_t   *cmc_free     = NULL;
 static pthread_mutex_t  cmc_free_mu;
 
 // Polling task handle.
-static task_t          *cmc_poll_task = NULL;
+static task_handle_t    cmc_poll_task = TASK_HANDLE_NONE;
 
 // KV schema
 

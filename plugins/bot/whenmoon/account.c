@@ -69,16 +69,11 @@ wm_account_tick(task_t *t)
 {
   whenmoon_state_t *st = t->data;
 
-  // State destroyed between ticks — end the task so the task system
-  // drops it. task_add_periodic's TASK_ENDED-to-reschedule contract
-  // means "done and free" only when we explicitly break out; because
-  // the destroy path nulls st->account, fall through to the cb which
-  // no-ops, then END (reschedule). Cleaner: if account is gone, tell
-  // the task system we're done for good — but task.h periodic is
-  // always-reschedule. Submit a final TASK_ENDED; the destroy path is
-  // expected to have already detached the pointer so this is the last
-  // time we see `st` safely.
-  if(st == NULL || st->account == NULL)
+  // wm_account_destroy now task_cancel()s the handle, so the task
+  // system guarantees this callback will not fire after destroy. Keep
+  // a belt-and-braces null check on `st` (never freed while the bot
+  // lives, but cheap to verify).
+  if(st == NULL)
   {
     t->state = TASK_ENDED;
     return;
@@ -151,7 +146,7 @@ wm_account_init(whenmoon_state_t *st)
   acc->refresh_task = task_add_periodic(tname, TASK_ANY, 200,
       refresh_secs * 1000, wm_account_tick, st);
 
-  if(acc->refresh_task == NULL)
+  if(acc->refresh_task == TASK_HANDLE_NONE)
     clam(CLAM_INFO, WHENMOON_CTX,
         "bot %s: account periodic task submit failed", st->bot_name);
 
@@ -179,12 +174,10 @@ wm_account_destroy(whenmoon_state_t *st)
 
   acc = st->account;
 
-  // The periodic task cannot be unscheduled synchronously from here
-  // (task.h offers no cancel); it observes NULL state on its next
-  // tick and returns TASK_ENDED, which in task_add_periodic semantics
-  // means reschedule. This leaves one stale periodic until the daemon
-  // shuts down. Acceptable pre-1.0; revisit when task cancel lands.
-  acc->refresh_task = NULL;
+  // Cancel the periodic synchronously so no stale tick fires after
+  // the struct is freed.
+  task_cancel(acc->refresh_task);
+  acc->refresh_task = TASK_HANDLE_NONE;
 
   // Detach first so a racing wm_account_on_accounts callback sees
   // st->account == NULL via the state pointer and bails before

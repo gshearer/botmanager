@@ -76,6 +76,7 @@ typedef enum
 {
   CB_REQ_PRODUCTS,
   CB_REQ_CANDLES,
+  CB_REQ_TRADES,          // WM-S3
   CB_REQ_TICKER,
   CB_REQ_PLACE_ORDER,
   CB_REQ_CANCEL_ORDER,
@@ -90,11 +91,12 @@ typedef struct cb_request
 {
   cb_req_type_t  type;
 
-  // Candle / ticker selectors.
+  // Candle / ticker / trade selectors.
   char           product_id[COINBASE_PRODUCT_ID_SZ];
   int32_t        granularity;
   int64_t        start_ts;
   int64_t        end_ts;
+  int64_t        after;      // WM-S3: trade cursor (0 = newest page)
 
   // CB3: signed POST/DELETE body. JSON already rendered by the caller.
   char          *body;
@@ -109,6 +111,7 @@ typedef struct cb_request
   {
     coinbase_done_products_cb_t  products;
     coinbase_done_candles_cb_t   candles;
+    coinbase_done_trades_cb_t    trades;      // WM-S3
     coinbase_done_ticker_cb_t    ticker;
     coinbase_done_order_cb_t     order;
     coinbase_done_orders_cb_t    orders;

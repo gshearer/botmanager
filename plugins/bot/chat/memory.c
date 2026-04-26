@@ -32,7 +32,7 @@ uint64_t                 memory_stat_sweeps  = 0;
 uint64_t                 memory_stat_forgets = 0;
 
 // Decay sweep periodic task (if scheduled).
-static task_t           *memory_sweep_task  = NULL;
+static task_handle_t     memory_sweep_task  = TASK_HANDLE_NONE;
 time_t                   memory_last_sweep  = 0;
 
 // Small utilities
@@ -1403,7 +1403,7 @@ memory_exit(void)
 
   // Periodic task is joined by the task system during shutdown; nothing
   // to flush in this chunk (all DB writes are synchronous).
-  memory_sweep_task = NULL;
+  memory_sweep_task = TASK_HANDLE_NONE;
 
   pthread_mutex_destroy(&memory_cfg_mutex);
   pthread_mutex_destroy(&memory_stat_mutex);

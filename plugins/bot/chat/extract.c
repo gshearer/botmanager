@@ -940,10 +940,10 @@ extract_fetch_batch(const char *bot_name, uint32_t ns_id,
 
 typedef struct extract_sched
 {
-  char      bot_name[EXTRACT_SCHED_BOT_SZ];
-  uint32_t  ns_id;
-  bool      active;
-  task_t   *task;
+  char          bot_name[EXTRACT_SCHED_BOT_SZ];
+  uint32_t      ns_id;
+  bool          active;
+  task_handle_t task;
 
   // Rate-limit: ring buffer of wall-clock seconds when extract_run_once
   // last executed for this bot. Counts entries within the last 3600s.
@@ -1121,7 +1121,6 @@ extract_schedule(const char *bot_name, uint32_t ns_id,
     uint32_t interval_secs)
 {
   bool need_task;
-  task_t *existing;
   extract_sched_t *s;
 
   if(!extract_ready || bot_name == NULL || bot_name[0] == '\0')
@@ -1151,15 +1150,13 @@ extract_schedule(const char *bot_name, uint32_t ns_id,
 
   // If a task is already running for this bot, let it continue; we've
   // replaced the data it reads. Otherwise, spawn one.
-  need_task = (s->task == NULL);
-  existing = s->task;
-  (void)existing;
+  need_task = (s->task == TASK_HANDLE_NONE);
   pthread_mutex_unlock(&extract_sched_mutex);
 
   if(need_task)
   {
     char tname[64];
-    task_t *t;
+    task_handle_t t;
 
     snprintf(tname, sizeof(tname), "extract.%.32s", bot_name);
 

@@ -53,6 +53,9 @@
 // Max rows returned per candles call (Coinbase limit).
 #define COINBASE_MAX_CANDLES      300
 
+// Max rows returned per trades call (Coinbase limit).
+#define COINBASE_MAX_TRADES      1000
+
 // Max rows returned per /orders list call. Coinbase's default page size
 // is 100; we do not implement cursor pagination in CB3 — callers who
 // need more than the first page should filter on server side via status
@@ -85,6 +88,21 @@ typedef struct
   double  close;
   double  volume;
 } coinbase_candle_t;
+
+typedef struct
+{
+  int64_t trade_id;    // Coinbase global trade id
+  int64_t time_us;     // microseconds since epoch (preserved from ISO-8601)
+
+  // CRITICAL: price and size are stored as DECIMAL STRINGS, not doubles.
+  // Coinbase returns them as JSON strings ("12345.67"), and WM-S4 writes
+  // them into Postgres NUMERIC columns. Converting to `double` here would
+  // introduce binary-float round-trip error that NUMERIC cannot recover.
+  // Reviewers will expect `double` — DO NOT "fix" this.
+  char    price[40];   // decimal string, as wire
+  char    size [40];   // decimal string, as wire
+  char    side [8];    // "buy" / "sell"
+} coinbase_trade_t;
 
 typedef struct
 {
@@ -273,6 +291,15 @@ typedef struct
 
 typedef struct
 {
+  char              err[128];
+  uint32_t          count;        // rows returned (0..1000)
+  coinbase_trade_t  rows[COINBASE_MAX_TRADES];  // newest-first:
+                                                // rows[0]   = largest trade_id
+                                                // rows[n-1] = smallest (= next cursor)
+} coinbase_trades_result_t;
+
+typedef struct
+{
   char               err[128];
   coinbase_ticker_t  ticker;
 } coinbase_ticker_result_t;
@@ -304,6 +331,9 @@ typedef void (*coinbase_done_products_cb_t)(
 
 typedef void (*coinbase_done_candles_cb_t)(
     const coinbase_candles_result_t *res, void *user);
+
+typedef void (*coinbase_done_trades_cb_t)(
+    const coinbase_trades_result_t *res, void *user);
 
 typedef void (*coinbase_done_ticker_cb_t)(
     const coinbase_ticker_result_t *res, void *user);
@@ -346,6 +376,29 @@ bool coinbase_fetch_products_async(coinbase_done_products_cb_t cb,
 bool coinbase_fetch_candles_async(const char *product_id,
     int32_t granularity, int64_t start_ts, int64_t end_ts,
     coinbase_done_candles_cb_t cb, void *user);
+
+// Fetch a page of historical trades for one product.
+//
+// Pagination: Coinbase orders the response newest-first (rows[0] has the
+// largest trade_id). Callers walking backward through history take
+// rows[count-1].trade_id and pass it as `after` on the next call, which
+// returns the next 1000 older trades. Coinbase also emits cb-before /
+// cb-after response headers carrying the same values, but the curl
+// subsystem only exposes etag + last-modified (see curl.h resp_etag /
+// resp_last_modified), so we rely on the in-body trade_ids — they are
+// equally authoritative and require no core-subsystem change.
+//
+//   after = 0   -> fetch the newest page.
+//   after > 0   -> fetch the page of trades with trade_id < `after`.
+//
+// `limit` is clamped to [1, 1000]; 0 -> 1000 (matches server default).
+//
+// Returns FAIL when product_id is invalid or the request could not be
+// queued; on FAIL the callback IS invoked with a descriptive res->err
+// (same contract as coinbase_fetch_candles_async).
+bool coinbase_fetch_trades_async(const char *product_id,
+    int64_t after, uint32_t limit,
+    coinbase_done_trades_cb_t cb, void *user);
 
 // Fetch the latest ticker snapshot for one product.
 bool coinbase_fetch_ticker_async(const char *product_id,
@@ -509,6 +562,33 @@ coinbase_fetch_candles_async(const char *product_id, int32_t granularity,
     __atomic_store_n(&cached, fn, __ATOMIC_RELEASE);
   }
   return(fn(product_id, granularity, start_ts, end_ts, cb, user));
+}
+
+static inline bool
+coinbase_fetch_trades_async(const char *product_id,
+    int64_t after, uint32_t limit,
+    coinbase_done_trades_cb_t cb, void *user)
+{
+  typedef bool (*fn_t)(const char *, int64_t, uint32_t,
+      coinbase_done_trades_cb_t, void *);
+  static fn_t cached = NULL;
+  fn_t        fn     = __atomic_load_n(&cached, __ATOMIC_ACQUIRE);
+
+  if(fn == NULL)
+  {
+    union { void *obj; fn_t fn; } u;
+
+    u.obj = plugin_dlsym("coinbase", "coinbase_fetch_trades_async");
+    if(u.obj == NULL)
+    {
+      clam(CLAM_FATAL, "coinbase",
+          "dlsym failed: coinbase_fetch_trades_async");
+      abort();
+    }
+    fn = u.fn;
+    __atomic_store_n(&cached, fn, __ATOMIC_RELEASE);
+  }
+  return(fn(product_id, after, limit, cb, user));
 }
 
 static inline bool

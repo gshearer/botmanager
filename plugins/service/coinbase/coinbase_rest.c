@@ -14,6 +14,7 @@
 #include "curl.h"
 #include "json.h"
 
+#include <inttypes.h>
 #include <pthread.h>
 #include <stdio.h>
 #include <string.h>
@@ -91,6 +92,65 @@ cb_products_cache_valid(void)
     ttl = 5;
 
   return((time(NULL) - cb_products_time) < (time_t)ttl);
+}
+
+// ISO-8601 → microseconds parser
+//
+// Coinbase trade timestamps are ISO-8601 with 0..9 fractional digits,
+// e.g. "2024-01-15T12:34:56.123456Z". Convert to microseconds since
+// epoch. Returns 0 on any parse failure — a zero timestamp is a valid
+// "unknown time" signal; the row still carries the authoritative
+// trade_id. Shape mirrors cb_ws_parse_iso8601_ms in
+// coinbase_ws_channels.c; only the fractional divisor and seconds
+// multiplier change.
+
+static int64_t
+cb_parse_iso8601_us(const char *s)
+{
+  struct tm    tm = {0};
+  int          y, M, d, h, m, sec;
+  long         frac_us = 0;
+  const char  *p;
+  time_t       t;
+
+  if(s == NULL || s[0] == '\0')
+    return(0);
+
+  if(sscanf(s, "%4d-%2d-%2dT%2d:%2d:%2d", &y, &M, &d, &h, &m, &sec) != 6)
+    return(0);
+
+  tm.tm_year = y - 1900;
+  tm.tm_mon  = M - 1;
+  tm.tm_mday = d;
+  tm.tm_hour = h;
+  tm.tm_min  = m;
+  tm.tm_sec  = sec;
+
+  t = timegm(&tm);
+  if(t == (time_t)-1)
+    return(0);
+
+  // Optional fractional seconds; up to 9 digits (ns), truncated to us.
+  p = strchr(s, '.');
+  if(p != NULL)
+  {
+    long ns     = 0;
+    int  digits = 0;
+    int  i;
+
+    p++;
+    while(*p >= '0' && *p <= '9' && digits < 9)
+    {
+      ns = ns * 10 + (*p - '0');
+      p++;
+      digits++;
+    }
+    for(i = digits; i < 9; i++)
+      ns *= 10;
+    frac_us = ns / 1000;
+  }
+
+  return((int64_t)t * 1000000 + frac_us);
 }
 
 // JSON specs
@@ -215,6 +275,19 @@ cb_deliver_candles_fail(cb_request_t *r, const char *err)
 
   if(r->cb.candles != NULL)
     r->cb.candles(&res, r->user);
+
+  cb_req_release(r);
+}
+
+static void
+cb_deliver_trades_fail(cb_request_t *r, const char *err)
+{
+  coinbase_trades_result_t res = { 0 };
+
+  snprintf(res.err, sizeof(res.err), "%s", err);
+
+  if(r->cb.trades != NULL)
+    r->cb.trades(&res, r->user);
 
   cb_req_release(r);
 }
@@ -532,6 +605,112 @@ cb_candles_done(const curl_response_t *resp)
   cb_req_release(r);
 }
 
+// Curl completion: trades
+//
+// Coinbase returns a bare array of objects, newest-first:
+//   [{ "time":"…","trade_id":N,"price":"…","size":"…","side":"buy|sell" }, …]
+// We copy price/size/side verbatim as decimal strings (see
+// coinbase_trade_t commentary in coinbase_api.h) and parse `time` to a
+// microsecond timestamp via cb_parse_iso8601_us. Rows missing a
+// trade_id are skipped so every row in rows[0..count) has a valid id.
+
+static void
+cb_trades_done(const curl_response_t *resp)
+{
+  cb_request_t             *r   = (cb_request_t *)resp->user_data;
+  coinbase_trades_result_t  res = { 0 };
+  char                      errbuf[CB_ERR_SZ];
+  const char               *err;
+  struct json_object       *root;
+  int                       len;
+  uint32_t                  kept = 0;
+
+  err = cb_classify_http(resp, errbuf, sizeof(errbuf));
+
+  if(err != NULL)
+  {
+    cb_deliver_trades_fail(r, err);
+    return;
+  }
+
+  root = json_parse_buf(resp->body, resp->body_len, CB_CTX);
+
+  if(root == NULL)
+  {
+    cb_deliver_trades_fail(r,
+        "Error: malformed JSON from Coinbase trades");
+    return;
+  }
+
+  if(!json_object_is_type(root, json_type_array))
+  {
+    json_object_put(root);
+    cb_deliver_trades_fail(r,
+        "Error: unexpected Coinbase trades response format");
+    return;
+  }
+
+  len = (int)json_object_array_length(root);
+
+  for(int i = 0; i < len && kept < COINBASE_MAX_TRADES; i++)
+  {
+    struct json_object *row = json_object_array_get_idx(root, i);
+    struct json_object *e;
+    coinbase_trade_t   *t   = &res.rows[kept];
+    const char         *s;
+
+    if(row == NULL || !json_object_is_type(row, json_type_object))
+      continue;
+
+    if(!json_object_object_get_ex(row, "trade_id", &e))
+      continue;   // required
+
+    t->trade_id = (int64_t)json_object_get_int64(e);
+
+    if(json_object_object_get_ex(row, "time", &e))
+    {
+      s = json_object_get_string(e);
+      if(s != NULL)
+        t->time_us = cb_parse_iso8601_us(s);
+    }
+
+    if(json_object_object_get_ex(row, "price", &e))
+    {
+      s = json_object_get_string(e);
+      if(s != NULL)
+        snprintf(t->price, sizeof(t->price), "%s", s);
+    }
+
+    if(json_object_object_get_ex(row, "size", &e))
+    {
+      s = json_object_get_string(e);
+      if(s != NULL)
+        snprintf(t->size, sizeof(t->size), "%s", s);
+    }
+
+    if(json_object_object_get_ex(row, "side", &e))
+    {
+      s = json_object_get_string(e);
+      if(s != NULL)
+        snprintf(t->side, sizeof(t->side), "%s", s);
+    }
+
+    kept++;
+  }
+
+  res.count = kept;
+
+  clam(CLAM_DEBUG2, CB_CTX,
+       "trades: %s after=%" PRId64 " -> %u row(s)",
+       r->product_id, r->after, kept);
+
+  if(r->cb.trades != NULL)
+    r->cb.trades(&res, r->user);
+
+  json_object_put(root);
+  cb_req_release(r);
+}
+
 // Curl completion: ticker
 
 static void
@@ -663,6 +842,52 @@ coinbase_fetch_candles_async(const char *product_id, int32_t granularity,
   {
     cb_deliver_candles_fail(r,
         "Error: failed to submit Coinbase candles request");
+    return(FAIL);
+  }
+
+  return(SUCCESS);
+}
+
+bool
+coinbase_fetch_trades_async(const char *product_id,
+    int64_t after, uint32_t limit,
+    coinbase_done_trades_cb_t cb, void *user)
+{
+  cb_request_t *r;
+  char          path[CB_URL_SZ];
+  int           n;
+
+  if(product_id == NULL || product_id[0] == '\0')
+    return(FAIL);
+
+  // Limit clamp: 0 -> 1000 (server default); >1000 -> 1000.
+  if(limit == 0 || limit > COINBASE_MAX_TRADES)
+    limit = COINBASE_MAX_TRADES;
+
+  if(after > 0)
+    n = snprintf(path, sizeof(path),
+        "/products/%s/trades?limit=%u&after=%" PRId64,
+        product_id, (unsigned)limit, after);
+
+  else
+    n = snprintf(path, sizeof(path),
+        "/products/%s/trades?limit=%u",
+        product_id, (unsigned)limit);
+
+  if(n < 0 || (size_t)n >= sizeof(path))
+    return(FAIL);
+
+  r = cb_req_alloc();
+  r->type      = CB_REQ_TRADES;
+  r->after     = after;
+  r->cb.trades = cb;
+  r->user      = user;
+  snprintf(r->product_id, sizeof(r->product_id), "%s", product_id);
+
+  if(cb_submit_public(r, path, cb_trades_done) != SUCCESS)
+  {
+    cb_deliver_trades_fail(r,
+        "Error: failed to submit Coinbase trades request");
     return(FAIL);
   }
 

@@ -1,12 +1,23 @@
 // botmanager — MIT
-// whenmoon per-market state: candle backfill + live WS fanout.
+// whenmoon per-market state: live set, WS fanout, catch-up dispatcher.
+//
+// Running markets are owned by the DB (`wm_bot_market`), not a KV.
+// The user drives the set through `/bot <name> market start|stop`.
+// `wm_market_restore` replays it on bot start and fires one catch-up
+// DL_JOB_CANDLES per market when the local 1m-candle table has at
+// least one stored row.
 
 #define WHENMOON_INTERNAL
 #include "whenmoon.h"
 #include "market.h"
+#include "dl_schema.h"
+#include "dl_scheduler.h"
 
-#include "kv.h"
+#include "db.h"
 
+#include <inttypes.h>
+#include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 
 // Per-product backfill context. Heap-owned; the completion callback is
@@ -15,59 +26,22 @@
 // state is destroyed before coinbase fires the callback, the callback
 // still runs (coinbase owns its request queue) and must not touch the
 // state. We therefore track the state pointer but also the market
-// index; on callback we re-lookup the product id in the live state to
-// decide whether to commit.
+// product_id; on callback we re-lookup the product id in the live
+// state to decide whether to commit.
 typedef struct
 {
-  whenmoon_state_t   *st;            // borrow; checked via product_id match
+  whenmoon_state_t   *st;
   char                product_id[COINBASE_PRODUCT_ID_SZ];
 } wm_market_backfill_ctx_t;
 
-// ------------------------------------------------------------------ //
-// KV parsing                                                         //
-// ------------------------------------------------------------------ //
-
-static uint32_t
-wm_parse_markets_kv(const char *raw, char out[][COINBASE_PRODUCT_ID_SZ],
-    uint32_t out_cap)
-{
-  char buf[512];
-  char *saveptr;
-  char *tok;
-  uint32_t n;
-
-  if(raw == NULL || raw[0] == '\0')
-    return(0);
-
-  snprintf(buf, sizeof(buf), "%s", raw);
-
-  n = 0;
-  saveptr = NULL;
-
-  for(tok = strtok_r(buf, ", \t", &saveptr);
-      tok != NULL;
-      tok = strtok_r(NULL, ", \t", &saveptr))
-  {
-    if(tok[0] == '\0')
-      continue;
-
-    if(n >= out_cap)
-    {
-      clam(CLAM_INFO, WHENMOON_CTX,
-          "market list truncated at cap=%u (dropped '%s')",
-          out_cap, tok);
-      break;
-    }
-
-    snprintf(out[n], COINBASE_PRODUCT_ID_SZ, "%s", tok);
-    n++;
-  }
-
-  return(n);
-}
+static const coinbase_ws_channel_t wm_ws_channels[] = {
+  COINBASE_CH_HEARTBEAT,
+  COINBASE_CH_TICKER,
+  COINBASE_CH_MATCHES,
+};
 
 // ------------------------------------------------------------------ //
-// Lookup                                                             //
+// Container helpers                                                  //
 // ------------------------------------------------------------------ //
 
 static whenmoon_market_t *
@@ -88,16 +62,345 @@ wm_market_find(whenmoon_markets_t *m, const char *product_id)
   return(NULL);
 }
 
+// Grow `arr` to hold at least `needed` slots. Existing rows are
+// copied by mem_realloc; freshly-added tail bytes are zeroed so their
+// pthread_mutex_t fields are in a defined "not yet initialised" state
+// until wm_market_add fills them. Returns SUCCESS or FAIL.
+static bool
+wm_market_grow(whenmoon_markets_t *m, uint32_t needed)
+{
+  whenmoon_market_t *next;
+  uint32_t           new_cap;
+  size_t             new_sz;
+  size_t             old_sz;
+
+  if(m == NULL)
+    return(FAIL);
+
+  if(needed <= m->cap)
+    return(SUCCESS);
+
+  new_cap = m->cap == 0 ? WM_MARKET_INIT_CAP : m->cap;
+
+  while(new_cap < needed)
+    new_cap *= 2;
+
+  new_sz = (size_t)new_cap * sizeof(*m->arr);
+
+  if(m->arr == NULL)
+  {
+    next = mem_alloc("whenmoon", "market_arr", new_sz);
+
+    if(next == NULL)
+      return(FAIL);
+
+    memset(next, 0, new_sz);
+  }
+
+  else
+  {
+    old_sz = (size_t)m->cap * sizeof(*m->arr);
+
+    next = mem_realloc(m->arr, new_sz);
+
+    if(next == NULL)
+      return(FAIL);
+
+    memset((char *)next + old_sz, 0, new_sz - old_sz);
+  }
+
+  m->arr = next;
+  m->cap = new_cap;
+  return(SUCCESS);
+}
+
+// Rebuild the WS subscription with the current product set. Called
+// after every add/remove. Unsubscribing the old handle first is safe:
+// wm_market_on_event shorts on st->markets == NULL, which stays set,
+// but the handle close means no new events will fire in parallel.
+static void
+wm_market_resub_ws(whenmoon_state_t *st)
+{
+  whenmoon_markets_t *m;
+  const char        **pid_ptrs = NULL;
+  uint32_t            i;
+
+  if(st == NULL || st->markets == NULL)
+    return;
+
+  m = st->markets;
+
+  if(m->ws_sub != NULL)
+  {
+    coinbase_ws_unsubscribe(m->ws_sub);
+    m->ws_sub = NULL;
+  }
+
+  if(m->n_markets == 0)
+    return;
+
+  pid_ptrs = mem_alloc("whenmoon", "ws_pids",
+      sizeof(*pid_ptrs) * m->n_markets);
+
+  if(pid_ptrs == NULL)
+  {
+    clam(CLAM_INFO, WHENMOON_CTX,
+        "bot %s: ws resub alloc failed (no live stream)",
+        st->bot_name);
+    return;
+  }
+
+  for(i = 0; i < m->n_markets; i++)
+    pid_ptrs[i] = m->arr[i].product_id;
+
+  m->ws_sub = coinbase_ws_subscribe(wm_ws_channels,
+      sizeof(wm_ws_channels) / sizeof(wm_ws_channels[0]),
+      pid_ptrs, m->n_markets,
+      wm_market_on_event, st);
+
+  if(m->ws_sub == NULL)
+    clam(CLAM_INFO, WHENMOON_CTX,
+        "bot %s: ws subscribe failed (no live stream)",
+        st->bot_name);
+
+  mem_free(pid_ptrs);
+}
+
+// Fire a one-shot candle backfill into the per-market live ring.
+// Used on add (fresh product) and indirectly on restore. Callback
+// frees the ctx.
+static void
+wm_market_kick_backfill(whenmoon_state_t *st, const char *product_id)
+{
+  wm_market_backfill_ctx_t *ctx;
+
+  if(st == NULL || product_id == NULL)
+    return;
+
+  ctx = mem_alloc("whenmoon", "backfill_ctx", sizeof(*ctx));
+
+  if(ctx == NULL)
+    return;
+
+  ctx->st = st;
+  snprintf(ctx->product_id, sizeof(ctx->product_id), "%s", product_id);
+
+  // On FAIL, coinbase invokes wm_market_on_candles with res->err set
+  // and that callback frees ctx. Do NOT touch ctx after this call.
+  (void)coinbase_fetch_candles_async(ctx->product_id, COINBASE_GRAN_1M,
+      0, 0, wm_market_on_candles, ctx);
+}
+
+// Query the most recent stored 1m-candle ts for the market. Writes a
+// TIMESTAMPTZ canonical string into `out` and returns SUCCESS iff the
+// table exists and has at least one row. Anything else (missing table,
+// empty table, DB error) is FAIL with `out` untouched.
+static bool
+wm_market_last_local_candle_ts(int32_t market_id, char *out, size_t cap)
+{
+  char         table[WM_DL_TABLE_SZ];
+  char        *e_table = NULL;
+  db_result_t *res     = NULL;
+  char         sql[256];
+  bool         ok      = FAIL;
+  const char  *s;
+  int          n;
+
+  if(out == NULL || cap == 0)
+    return(FAIL);
+
+  if(wm_candle_table_name(market_id, COINBASE_GRAN_1M,
+         table, sizeof(table)) != SUCCESS)
+    return(FAIL);
+
+  e_table = db_escape(table);
+
+  if(e_table == NULL)
+    goto out;
+
+  n = snprintf(sql, sizeof(sql),
+      "SELECT to_char(MAX(ts), 'YYYY-MM-DD HH24:MI:SS+00')"
+      "  FROM %s",
+      e_table);
+
+  if(n < 0 || (size_t)n >= sizeof(sql))
+    goto out;
+
+  res = db_result_alloc();
+
+  if(res == NULL)
+    goto out;
+
+  if(db_query(sql, res) != SUCCESS || !res->ok || res->rows == 0)
+    goto out;
+
+  s = db_result_get(res, 0, 0);
+
+  if(s == NULL || s[0] == '\0')
+    goto out;
+
+  snprintf(out, cap, "%s", s);
+  ok = SUCCESS;
+
+out:
+  if(res     != NULL) db_result_free(res);
+  if(e_table != NULL) mem_free(e_table);
+
+  return(ok);
+}
+
+// Enqueue a catch-up DL_JOB_CANDLES covering (last_local_ts, now].
+// No-op when the downloader isn't ready, when the local table is
+// empty, or when scheduler enqueue fails for any reason (we log and
+// move on — the market is still live on WS).
+static void
+wm_market_kick_catchup(whenmoon_state_t *st, int32_t market_id,
+    const char *exchange, const char *product_id)
+{
+  char    last_ts[40];
+  char    err[128];
+  int64_t job_id = 0;
+
+  if(st == NULL || st->downloader == NULL || !st->dl_ready)
+    return;
+
+  if(exchange == NULL || product_id == NULL)
+    return;
+
+  if(wm_market_last_local_candle_ts(market_id,
+         last_ts, sizeof(last_ts)) != SUCCESS)
+  {
+    clam(CLAM_INFO, WHENMOON_CTX,
+        "bot %s: market %s: no local candles, skipping catch-up"
+        " (use /bot %s download candles ... to backfill history)",
+        st->bot_name, product_id, st->bot_name);
+    return;
+  }
+
+  if(wm_dl_job_enqueue(st, DL_JOB_CANDLES, market_id,
+         COINBASE_GRAN_1M, exchange, product_id,
+         last_ts, "",
+         "catchup", &job_id, err, sizeof(err)) != SUCCESS)
+  {
+    clam(CLAM_INFO, WHENMOON_CTX,
+        "bot %s: market %s: catch-up enqueue failed: %s",
+        st->bot_name, product_id,
+        err[0] != '\0' ? err : "unknown");
+    return;
+  }
+
+  clam(CLAM_INFO, WHENMOON_CTX,
+      "bot %s: market %s: catch-up job %" PRId64 " (from %s)",
+      st->bot_name, product_id, job_id, last_ts);
+}
+
 // ------------------------------------------------------------------ //
-// Candle backfill callback                                           //
+// DB persistence helpers                                             //
+// ------------------------------------------------------------------ //
+
+static bool
+wm_bot_market_insert(const char *bot_name, int32_t market_id)
+{
+  db_result_t *res = NULL;
+  char        *e_bot = NULL;
+  char         sql[256];
+  bool         ok = FAIL;
+  int          n;
+
+  if(bot_name == NULL || market_id < 0)
+    return(FAIL);
+
+  e_bot = db_escape(bot_name);
+
+  if(e_bot == NULL)
+    goto out;
+
+  n = snprintf(sql, sizeof(sql),
+      "INSERT INTO wm_bot_market (bot_name, market_id)"
+      " VALUES ('%s', %" PRId32 ")"
+      " ON CONFLICT (bot_name, market_id) DO NOTHING",
+      e_bot, market_id);
+
+  if(n < 0 || (size_t)n >= sizeof(sql))
+    goto out;
+
+  res = db_result_alloc();
+
+  if(res == NULL)
+    goto out;
+
+  if(db_query(sql, res) == SUCCESS && res->ok)
+    ok = SUCCESS;
+
+  else
+    clam(CLAM_WARN, WHENMOON_CTX,
+        "wm_bot_market insert failed (bot=%s market_id=%" PRId32 "): %s",
+        bot_name, market_id,
+        res->error[0] != '\0' ? res->error : "(no driver error)");
+
+out:
+  if(res   != NULL) db_result_free(res);
+  if(e_bot != NULL) mem_free(e_bot);
+
+  return(ok);
+}
+
+static bool
+wm_bot_market_delete(const char *bot_name, int32_t market_id)
+{
+  db_result_t *res = NULL;
+  char        *e_bot = NULL;
+  char         sql[256];
+  bool         ok = FAIL;
+  int          n;
+
+  if(bot_name == NULL || market_id < 0)
+    return(FAIL);
+
+  e_bot = db_escape(bot_name);
+
+  if(e_bot == NULL)
+    goto out;
+
+  n = snprintf(sql, sizeof(sql),
+      "DELETE FROM wm_bot_market"
+      " WHERE bot_name = '%s' AND market_id = %" PRId32,
+      e_bot, market_id);
+
+  if(n < 0 || (size_t)n >= sizeof(sql))
+    goto out;
+
+  res = db_result_alloc();
+
+  if(res == NULL)
+    goto out;
+
+  if(db_query(sql, res) == SUCCESS && res->ok)
+    ok = SUCCESS;
+
+  else
+    clam(CLAM_WARN, WHENMOON_CTX,
+        "wm_bot_market delete failed (bot=%s market_id=%" PRId32 "): %s",
+        bot_name, market_id,
+        res->error[0] != '\0' ? res->error : "(no driver error)");
+
+out:
+  if(res   != NULL) db_result_free(res);
+  if(e_bot != NULL) mem_free(e_bot);
+
+  return(ok);
+}
+
+// ------------------------------------------------------------------ //
+// Callbacks                                                          //
 // ------------------------------------------------------------------ //
 
 void
 wm_market_on_candles(const coinbase_candles_result_t *res, void *user)
 {
   wm_market_backfill_ctx_t *ctx = user;
-  whenmoon_market_t *mk;
-  uint32_t i;
+  whenmoon_market_t        *mk;
+  uint32_t                  i;
 
   if(ctx == NULL)
     return;
@@ -112,8 +415,6 @@ wm_market_on_candles(const coinbase_candles_result_t *res, void *user)
     return;
   }
 
-  // The state pointer is borrowed; destroy may have nulled `markets`
-  // before this callback fired. Check both.
   if(ctx->st == NULL || ctx->st->markets == NULL)
   {
     mem_free(ctx);
@@ -151,14 +452,10 @@ wm_market_on_candles(const coinbase_candles_result_t *res, void *user)
   mem_free(ctx);
 }
 
-// ------------------------------------------------------------------ //
-// WebSocket event fanout                                             //
-// ------------------------------------------------------------------ //
-
 void
 wm_market_on_event(const coinbase_ws_event_t *ev, void *user)
 {
-  whenmoon_state_t *st = user;
+  whenmoon_state_t  *st = user;
   whenmoon_market_t *mk;
 
   if(ev == NULL || st == NULL || st->markets == NULL)
@@ -167,8 +464,6 @@ wm_market_on_event(const coinbase_ws_event_t *ev, void *user)
   switch(ev->channel)
   {
     case COINBASE_CH_HEARTBEAT:
-      // Liveness only — nothing to record. Could timestamp a
-      // per-market keepalive in a future chunk.
       break;
 
     case COINBASE_CH_TICKER:
@@ -206,8 +501,6 @@ wm_market_on_event(const coinbase_ws_event_t *ev, void *user)
       if(mk == NULL)
         break;
 
-      // A match is also a price print; fold it into last_px so a silent
-      // ticker channel still moves the bot's view.
       pthread_mutex_lock(&mk->lock);
       mk->last_px      = m->price;
       mk->last_tick_ms = m->time_ms;
@@ -220,8 +513,6 @@ wm_market_on_event(const coinbase_ws_event_t *ev, void *user)
     }
 
     default:
-      // Unsubscribed channels — ignore. The subscription set is fixed
-      // at init, so this branch is defensive against upstream additions.
       break;
   }
 }
@@ -233,26 +524,10 @@ wm_market_on_event(const coinbase_ws_event_t *ev, void *user)
 bool
 wm_market_init(whenmoon_state_t *st)
 {
-  char key[128];
-  const char *raw;
-  char pids[WM_MARKET_MAX][COINBASE_PRODUCT_ID_SZ];
-  const char *pid_ptrs[WM_MARKET_MAX];
-  uint32_t n;
-  uint32_t i;
   whenmoon_markets_t *m;
-  static const coinbase_ws_channel_t chans[] = {
-    COINBASE_CH_HEARTBEAT,
-    COINBASE_CH_TICKER,
-    COINBASE_CH_MATCHES,
-  };
 
   if(st == NULL)
     return(FAIL);
-
-  snprintf(key, sizeof(key), "bot.%s.whenmoon.markets", st->bot_name);
-  raw = kv_get_str(key);
-
-  n = wm_parse_markets_kv(raw, pids, WM_MARKET_MAX);
 
   m = mem_alloc("whenmoon", "markets", sizeof(*m));
 
@@ -260,64 +535,7 @@ wm_market_init(whenmoon_state_t *st)
     return(FAIL);
 
   memset(m, 0, sizeof(*m));
-
   st->markets = m;
-
-  if(n == 0)
-  {
-    clam(CLAM_INFO, WHENMOON_CTX,
-        "bot %s: no markets configured (bot.%s.whenmoon.markets empty)",
-        st->bot_name, st->bot_name);
-    return(SUCCESS);
-  }
-
-  m->arr = mem_alloc("whenmoon", "market_arr", sizeof(*m->arr) * n);
-
-  if(m->arr == NULL)
-    return(FAIL);
-
-  memset(m->arr, 0, sizeof(*m->arr) * n);
-  m->n_markets = n;
-
-  for(i = 0; i < n; i++)
-  {
-    memcpy(m->arr[i].product_id, pids[i], sizeof(m->arr[i].product_id));
-    m->arr[i].product_id[sizeof(m->arr[i].product_id) - 1] = '\0';
-    pthread_mutex_init(&m->arr[i].lock, NULL);
-    pid_ptrs[i] = m->arr[i].product_id;
-  }
-
-  // Kick off one backfill per product. Each gets its own ctx; the
-  // coinbase plugin owns the request until its callback runs.
-  for(i = 0; i < n; i++)
-  {
-    wm_market_backfill_ctx_t *ctx;
-
-    ctx = mem_alloc("whenmoon", "backfill_ctx", sizeof(*ctx));
-
-    if(ctx == NULL)
-      continue;
-
-    ctx->st = st;
-    memcpy(ctx->product_id, pids[i], sizeof(ctx->product_id));
-    ctx->product_id[sizeof(ctx->product_id) - 1] = '\0';
-
-    // On FAIL, coinbase invokes wm_market_on_candles with res->err set
-    // and that callback frees ctx. Do not touch ctx or log from here —
-    // doing so would double-free and read freed memory.
-    (void)coinbase_fetch_candles_async(ctx->product_id, COINBASE_GRAN_1M,
-        0, 0, wm_market_on_candles, ctx);
-  }
-
-  // One combined subscription across every configured product.
-  m->ws_sub = coinbase_ws_subscribe(chans,
-      sizeof(chans) / sizeof(chans[0]),
-      pid_ptrs, n,
-      wm_market_on_event, st);
-
-  if(m->ws_sub == NULL)
-    clam(CLAM_INFO, WHENMOON_CTX,
-        "bot %s: ws subscribe failed (no live stream)", st->bot_name);
 
   return(SUCCESS);
 }
@@ -326,15 +544,13 @@ void
 wm_market_destroy(whenmoon_state_t *st)
 {
   whenmoon_markets_t *m;
-  uint32_t i;
+  uint32_t            i;
 
   if(st == NULL || st->markets == NULL)
     return;
 
   m = st->markets;
 
-  // Tear down the subscription first so wm_market_on_event stops
-  // firing before we destroy the per-market mutexes.
   if(m->ws_sub != NULL)
   {
     coinbase_ws_unsubscribe(m->ws_sub);
@@ -355,4 +571,229 @@ wm_market_destroy(whenmoon_state_t *st)
   st->markets = NULL;
 
   mem_free(m);
+}
+
+// ------------------------------------------------------------------ //
+// Dynamic add / remove / restore                                     //
+// ------------------------------------------------------------------ //
+
+bool
+wm_market_add(whenmoon_state_t *st,
+    const char *exchange, const char *base, const char *quote,
+    const char *product_id, bool persist,
+    char *err, size_t err_cap)
+{
+  whenmoon_markets_t *m;
+  whenmoon_market_t  *mk;
+  int32_t             market_id;
+
+  if(err != NULL && err_cap > 0)
+    err[0] = '\0';
+
+  if(st == NULL || st->markets == NULL || exchange == NULL ||
+     base == NULL || quote == NULL || product_id == NULL)
+  {
+    if(err != NULL) snprintf(err, err_cap, "bad args");
+    return(FAIL);
+  }
+
+  m = st->markets;
+
+  if(wm_market_find(m, product_id) != NULL)
+    return(SUCCESS);   // already present; benign no-op
+
+  market_id = wm_market_lookup_or_create(exchange, base, quote, product_id);
+
+  if(market_id < 0)
+  {
+    if(err != NULL) snprintf(err, err_cap, "market registry failed");
+    return(FAIL);
+  }
+
+  if(wm_market_grow(m, m->n_markets + 1) != SUCCESS)
+  {
+    if(err != NULL) snprintf(err, err_cap, "alloc failed");
+    return(FAIL);
+  }
+
+  mk = &m->arr[m->n_markets];
+  memset(mk, 0, sizeof(*mk));
+  snprintf(mk->product_id, sizeof(mk->product_id), "%s", product_id);
+  mk->market_id = market_id;
+  pthread_mutex_init(&mk->lock, NULL);
+  m->n_markets++;
+
+  if(persist)
+  {
+    if(wm_bot_market_insert(st->bot_name, market_id) != SUCCESS)
+    {
+      // DB failure -- roll back the in-memory slot so the running set
+      // matches the persisted state.
+      pthread_mutex_destroy(&mk->lock);
+      memset(mk, 0, sizeof(*mk));
+      m->n_markets--;
+      if(err != NULL) snprintf(err, err_cap, "DB insert failed");
+      return(FAIL);
+    }
+  }
+
+  wm_market_resub_ws(st);
+  wm_market_kick_backfill(st, product_id);
+  wm_market_kick_catchup(st, market_id, exchange, product_id);
+
+  clam(CLAM_INFO, WHENMOON_CTX,
+      "bot %s: market %s started (market_id=%" PRId32 "%s)",
+      st->bot_name, product_id, market_id,
+      persist ? "" : ", restored");
+
+  return(SUCCESS);
+}
+
+bool
+wm_market_remove(whenmoon_state_t *st, const char *product_id,
+    bool persist, bool *was_present, char *err, size_t err_cap)
+{
+  whenmoon_markets_t *m;
+  whenmoon_market_t  *mk;
+  uint32_t            idx;
+  int32_t             market_id;
+
+  if(was_present != NULL)
+    *was_present = false;
+
+  if(err != NULL && err_cap > 0)
+    err[0] = '\0';
+
+  if(st == NULL || st->markets == NULL || product_id == NULL)
+  {
+    if(err != NULL) snprintf(err, err_cap, "bad args");
+    return(FAIL);
+  }
+
+  m  = st->markets;
+  mk = wm_market_find(m, product_id);
+
+  if(mk == NULL)
+    return(SUCCESS);  // benign no-op; was_present stays false
+
+  if(was_present != NULL)
+    *was_present = true;
+
+  idx       = (uint32_t)(mk - m->arr);
+  market_id = mk->market_id;
+
+  pthread_mutex_destroy(&mk->lock);
+
+  // Compact the tail over the removed slot. Memmove is safe across
+  // overlapping regions. The vacated tail slot is zeroed so a future
+  // grow doesn't inherit a bogus mutex.
+  if(idx + 1 < m->n_markets)
+    memmove(&m->arr[idx], &m->arr[idx + 1],
+        sizeof(*m->arr) * (m->n_markets - idx - 1));
+
+  memset(&m->arr[m->n_markets - 1], 0, sizeof(*m->arr));
+  m->n_markets--;
+
+  if(persist && market_id >= 0)
+  {
+    if(wm_bot_market_delete(st->bot_name, market_id) != SUCCESS)
+    {
+      // In-memory removal already committed; leaving the DB row would
+      // cause the market to resurrect on next restart. Log and keep
+      // going; the operator can `/bot … market stop` again.
+      if(err != NULL)
+        snprintf(err, err_cap, "DB delete failed (live set already updated)");
+    }
+  }
+
+  wm_market_resub_ws(st);
+
+  clam(CLAM_INFO, WHENMOON_CTX,
+      "bot %s: market %s stopped (market_id=%" PRId32 "%s)",
+      st->bot_name, product_id, market_id,
+      persist ? "" : ", untracked");
+
+  return(SUCCESS);
+}
+
+// ------------------------------------------------------------------ //
+// Restore                                                            //
+// ------------------------------------------------------------------ //
+
+bool
+wm_market_restore(whenmoon_state_t *st)
+{
+  db_result_t *res   = NULL;
+  char        *e_bot = NULL;
+  char         sql[512];
+  uint32_t     i;
+  uint32_t     n_restored = 0;
+  bool         ok = SUCCESS;
+
+  if(st == NULL || st->bot_name[0] == '\0')
+    return(FAIL);
+
+  e_bot = db_escape(st->bot_name);
+
+  if(e_bot == NULL)
+    return(FAIL);
+
+  snprintf(sql, sizeof(sql),
+      "SELECT wm.exchange, wm.base_asset, wm.quote_asset,"
+      "       wm.exchange_symbol"
+      "  FROM wm_bot_market bm"
+      "  JOIN wm_market     wm ON bm.market_id = wm.id"
+      " WHERE bm.bot_name = '%s'"
+      " ORDER BY bm.added_at",
+      e_bot);
+
+  res = db_result_alloc();
+
+  if(res == NULL)
+  {
+    ok = FAIL;
+    goto out;
+  }
+
+  if(db_query(sql, res) != SUCCESS || !res->ok)
+  {
+    clam(CLAM_WARN, WHENMOON_CTX,
+        "bot %s: market restore query failed: %s",
+        st->bot_name,
+        res->error[0] != '\0' ? res->error : "(no driver error)");
+    ok = FAIL;
+    goto out;
+  }
+
+  for(i = 0; i < res->rows; i++)
+  {
+    const char *exch  = db_result_get(res, i, 0);
+    const char *base  = db_result_get(res, i, 1);
+    const char *quote = db_result_get(res, i, 2);
+    const char *sym   = db_result_get(res, i, 3);
+
+    if(exch == NULL || base == NULL || quote == NULL || sym == NULL)
+      continue;
+
+    if(wm_market_add(st, exch, base, quote, sym,
+           false, NULL, 0) != SUCCESS)
+    {
+      clam(CLAM_INFO, WHENMOON_CTX,
+          "bot %s: market %s restore failed — skipping",
+          st->bot_name, sym);
+      continue;
+    }
+
+    n_restored++;
+  }
+
+  clam(CLAM_INFO, WHENMOON_CTX,
+      "bot %s: %u running market(s) restored",
+      st->bot_name, n_restored);
+
+out:
+  if(res   != NULL) db_result_free(res);
+  if(e_bot != NULL) mem_free(e_bot);
+
+  return(ok);
 }

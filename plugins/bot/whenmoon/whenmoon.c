@@ -8,6 +8,10 @@
 #include "whenmoon.h"
 #include "market.h"
 #include "account.h"
+#include "dl_schema.h"
+#include "dl_scheduler.h"
+#include "dl_commands.h"
+#include "market_cmds.h"
 
 #include "cmd.h"
 #include "colors.h"
@@ -25,15 +29,29 @@
 
 // Per-instance schema: keys registered as bot.<name>.whenmoon.<suffix>
 // at bot-create time. See plugin.h for the kv_inst_schema contract.
+//
+// Running markets live in the `wm_bot_market` DB table (not a KV).
+// Use `/bot <name> market start|stop` to change the live set.
 static const plugin_kv_entry_t whenmoon_inst_schema[] = {
-  { "whenmoon.markets", KV_STR, "",
-    "Comma-separated list of Coinbase product ids (e.g."
-    " \"BTC-USD,ETH-USD\") this bot watches. Empty = no markets.",
-    NULL, NULL },
   { "whenmoon.account.refresh_sec", KV_UINT32, "30",
     "Seconds between coinbase /accounts polls for this bot. Minimum"
     " effective value is 5. Ignored when no coinbase apikey is"
     " configured.", NULL, NULL },
+
+  { "whenmoon.downloader.enabled", KV_BOOL, "true",
+    "Enable the trade/candle history downloader engine for this bot.",
+    NULL, NULL },
+  { "whenmoon.downloader.max_concurrent_jobs", KV_UINT32, "4",
+    "Maximum number of jobs in 'running' state at once (1..32). Token"
+    " bucket caps effective throughput regardless; higher values mean"
+    " more interleaving of pairs rather than more throughput.",
+    NULL, NULL },
+  { "whenmoon.downloader.rate_limit_rps", KV_UINT32, "8",
+    "Sustained requests/sec budget for this bot's downloader (1..10)."
+    " Coinbase public cap is 10; default 8 leaves headroom for the"
+    " bot's non-downloader traffic. Bucket depth is 1.5x this value"
+    " to absorb bursts.",
+    NULL, NULL },
 };
 
 // ------------------------------------------------------------------ //
@@ -74,6 +92,8 @@ whenmoon_destroy(void *handle)
   if(st == NULL)
     return;
 
+  wm_dl_scheduler_destroy(st);
+  wm_dl_destroy(st);
   wm_market_destroy(st);
   wm_account_destroy(st);
 
@@ -101,6 +121,30 @@ whenmoon_start_cb(void *handle)
         st->bot_name);
     return(FAIL);
   }
+
+  if(!st->dl_ready && wm_dl_init(st) != SUCCESS)
+  {
+    clam(CLAM_INFO, WHENMOON_CTX, "bot %s: wm_dl_init failed",
+        st->bot_name);
+    return(FAIL);
+  }
+
+  if(st->downloader == NULL && wm_dl_scheduler_init(st) != SUCCESS)
+  {
+    clam(CLAM_INFO, WHENMOON_CTX,
+        "bot %s: wm_dl_scheduler_init failed", st->bot_name);
+    return(FAIL);
+  }
+
+  // Restore the running-market set from the DB. Each add() here fires
+  // a WS subscribe, a live-ring backfill, and a catch-up
+  // DL_JOB_CANDLES (when prior history is present) — which is exactly
+  // what we want post-restart. Restore never blocks start on DB
+  // contents: a restore failure is logged but the bot still runs.
+  if(wm_market_restore(st) != SUCCESS)
+    clam(CLAM_INFO, WHENMOON_CTX,
+        "bot %s: wm_market_restore failed (bot starts with no markets)",
+        st->bot_name);
 
   return(SUCCESS);
 }
@@ -153,7 +197,7 @@ whenmoon_show_markets_cmd(const cmd_ctx_t *ctx)
   {
     cmd_reply(ctx,
         "whenmoon: no markets configured"
-        " (set bot.<name>.whenmoon.markets)");
+        " (use /bot <name> market start <exch>:<asset>:<cur>)");
     return;
   }
 
@@ -313,6 +357,18 @@ whenmoon_init(void)
   if(whenmoon_register_show_verbs() != SUCCESS)
   {
     clam(CLAM_INFO, WHENMOON_CTX, "show-verb registration failed");
+    return(FAIL);
+  }
+
+  if(wm_dl_register_verbs() != SUCCESS)
+  {
+    clam(CLAM_INFO, WHENMOON_CTX, "downloader verb registration failed");
+    return(FAIL);
+  }
+
+  if(wm_market_register_verbs() != SUCCESS)
+  {
+    clam(CLAM_INFO, WHENMOON_CTX, "market verb registration failed");
     return(FAIL);
   }
 

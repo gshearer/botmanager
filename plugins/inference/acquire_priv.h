@@ -214,7 +214,7 @@ typedef struct acquire_bot_entry
   acquire_topic_t           *topics;
   size_t                     n_topics;
   bool                       active;
-  task_t                    *task;
+  task_handle_t              task;
   uint32_t                   tick_count;   // per-bot tick counter
 
   // A6R — on-demand drain gate. Set under acquire_entries_lock (write)

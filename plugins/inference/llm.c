@@ -1457,7 +1457,7 @@ llm_curl_done_cb(const curl_response_t *resp)
       && (!req->streaming || req->bytes_seen == 0))
   {
     uint32_t backoff;
-    task_t *t;
+    task_handle_t t;
     req->attempt++;
 
     backoff = llm_cfg.retry_backoff_ms << req->attempt;
@@ -1472,7 +1472,7 @@ llm_curl_done_cb(const curl_response_t *resp)
     t = task_add_deferred("llm_retry", TASK_ANY, 50,
         backoff, llm_retry_task, req);
 
-    if(t != NULL)
+    if(t != TASK_HANDLE_NONE)
       return;
 
     // Retry scheduling failed — fall through to deliver failure.

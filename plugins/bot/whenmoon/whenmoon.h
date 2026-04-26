@@ -20,6 +20,7 @@
 // WHENMOON_INTERNAL-gated, and are only visible inside the plugin.
 typedef struct whenmoon_markets whenmoon_markets_t;
 typedef struct whenmoon_account whenmoon_account_t;
+typedef struct dl_scheduler     dl_scheduler_t;
 
 // Per-instance state.
 typedef struct whenmoon_state
@@ -29,6 +30,18 @@ typedef struct whenmoon_state
 
   whenmoon_markets_t *markets;   // owned; NULL when market init failed
   whenmoon_account_t *account;   // owned; NULL when account init failed
+
+  // Downloader schema + registry readiness. Flipped to true by
+  // wm_dl_init() once the core metadata tables exist (CREATE IF NOT
+  // EXISTS is per-daemon; the flag is per-bot). Cleared by
+  // wm_dl_destroy() at bot teardown. WM-S4+ gate all downloader entry
+  // points on this bit so a bot whose init failed cannot enqueue jobs.
+  bool                dl_ready;
+
+  // Per-bot download scheduler. Spawned after wm_dl_init succeeds in
+  // whenmoon_start_cb; torn down from whenmoon_destroy before the DDL
+  // readiness flag drops.
+  dl_scheduler_t     *downloader;
 } whenmoon_state_t;
 
 // Bot driver vtable — defined in whenmoon.c.

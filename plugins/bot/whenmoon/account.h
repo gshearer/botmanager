@@ -27,10 +27,11 @@ struct whenmoon_account
   time_t                last_refresh_ts;
   char                  last_err[128];   // empty on success
 
-  // Periodic task handle. NULL when credentials are not configured and
-  // the account feed is disabled; set when the periodic task has been
-  // submitted.
-  task_t               *refresh_task;
+  // Periodic task handle. TASK_HANDLE_NONE when credentials are not
+  // configured and the account feed is disabled; set when the periodic
+  // task has been submitted. Cancelled synchronously in
+  // wm_account_destroy so no stale tick fires after free.
+  task_handle_t         refresh_task;
 
   pthread_mutex_t       lock;
 };
@@ -43,9 +44,9 @@ struct whenmoon_state;
 // otherwise; FAIL only on allocation failure.
 bool wm_account_init(struct whenmoon_state *st);
 
-// Destroy: clears task pointer (task cancels itself on next tick when
-// it observes the state), destroys the mutex, frees the struct. Safe on
-// a state whose account pointer is NULL.
+// Destroy: cancels the refresh task synchronously, destroys the
+// mutex, frees the struct. Safe on a state whose account pointer is
+// NULL.
 void wm_account_destroy(struct whenmoon_state *st);
 
 // Async callback invoked by coinbase on accounts fetch completion.

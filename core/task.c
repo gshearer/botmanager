@@ -6,6 +6,9 @@
 #include "pool.h"
 #include "util.h"
 
+#include <inttypes.h>
+#include <string.h>
+
 // Name helpers
 
 const char *
@@ -117,6 +120,21 @@ type_matches(task_type_t task_type, task_type_t request_type)
       || request_type == TASK_ANY);
 }
 
+// Monotonic id source. Guarded by task_lock. Zero is reserved for
+// TASK_HANDLE_NONE; wrap skips it.
+static uint64_t task_next_id = 1;
+
+static task_handle_t
+task_alloc_id_locked(void)
+{
+  task_handle_t id = (task_handle_t)task_next_id++;
+
+  if(task_next_id == 0)
+    task_next_id = 1;
+
+  return(id);
+}
+
 // Public API
 
 task_t *
@@ -138,8 +156,13 @@ task_create(const char *name, task_type_t type, uint8_t priority,
   t->last_run    = 0;
   t->sleep_until = 0;
   t->run_count   = 0;
+  t->cancelled   = false;
   t->link        = NULL;
   t->next        = NULL;
+
+  pthread_mutex_lock(&task_lock);
+  t->id = task_alloc_id_locked();
+  pthread_mutex_unlock(&task_lock);
 
   return(t);
 }
@@ -262,7 +285,7 @@ task_add_persist(const char *name, uint8_t priority,
   return(t);
 }
 
-task_t *
+task_handle_t
 task_add_periodic(const char *name, task_type_t type,
     uint8_t priority, uint32_t interval_ms, task_cb_t cb, void *data)
 {
@@ -272,10 +295,10 @@ task_add_periodic(const char *name, task_type_t type,
   t->interval_ms = interval_ms;
 
   task_submit(t);
-  return(t);
+  return(t->id);
 }
 
-task_t *
+task_handle_t
 task_add_deferred(const char *name, task_type_t type,
     uint8_t priority, uint32_t delay_ms, task_cb_t cb, void *data)
 {
@@ -289,7 +312,115 @@ task_add_deferred(const char *name, task_type_t type,
     t->sleep_until = time(NULL) + 1;
 
   task_submit(t);
-  return(t);
+  return(t->id);
+}
+
+// Unlink `t` from the singly-linked list headed at `*head` if present.
+// Returns true on success. Caller must hold task_lock.
+static bool
+list_unlink(task_t **head, task_t *t)
+{
+  for(task_t **pp = head; *pp != NULL; pp = &(*pp)->next)
+  {
+    if(*pp == t)
+    {
+      *pp = t->next;
+      t->next = NULL;
+      return(true);
+    }
+  }
+
+  return(false);
+}
+
+void
+task_cancel(task_handle_t h)
+{
+  task_t *t;
+  bool    found_queued = false;
+  bool    found_running = false;
+  char    name_copy[TASK_NAME_SZ] = {0};
+  task_kind_t kind = TASK_ONCE;
+
+  if(h == TASK_HANDLE_NONE)
+    return;
+
+  pthread_mutex_lock(&task_lock);
+
+  // Ready queue.
+  for(t = ready_head; t != NULL; t = t->next)
+  {
+    if(t->id == h)
+    {
+      list_unlink(&ready_head, t);
+      kind = t->kind;
+      snprintf(name_copy, sizeof(name_copy), "%s", t->name);
+      stats.waiting--;
+      stats.total--;
+      if(kind == TASK_PERIODIC)
+        stats.periodic--;
+      free_chain(t->link);
+      mem_free(t);
+      found_queued = true;
+      break;
+    }
+  }
+
+  // Timer queue.
+  if(!found_queued)
+  {
+    for(t = timer_head; t != NULL; t = t->next)
+    {
+      if(t->id == h)
+      {
+        list_unlink(&timer_head, t);
+        kind = t->kind;
+        snprintf(name_copy, sizeof(name_copy), "%s", t->name);
+        stats.sleeping--;
+        stats.total--;
+        if(kind == TASK_PERIODIC)
+          stats.periodic--;
+        free_chain(t->link);
+        mem_free(t);
+        found_queued = true;
+        break;
+      }
+    }
+  }
+
+  // Running list — mark cancelled; task_finish will treat the next
+  // TASK_ENDED as terminal. Do NOT free here; the worker owns the
+  // struct while the callback is on the stack.
+  if(!found_queued)
+  {
+    for(t = running_head; t != NULL; t = t->next)
+    {
+      if(t->id == h)
+      {
+        t->cancelled = true;
+        snprintf(name_copy, sizeof(name_copy), "%s", t->name);
+        kind = t->kind;
+        found_running = true;
+        break;
+      }
+    }
+  }
+
+  pthread_mutex_unlock(&task_lock);
+
+  if(found_queued)
+    clam(CLAM_DEBUG, "task_cancel", "'%s' (%s) removed from queue",
+        name_copy, task_kind_name(kind));
+
+  else if(found_running)
+    clam(CLAM_DEBUG, "task_cancel",
+        "'%s' (%s) flagged cancelled; terminates on next return",
+        name_copy, task_kind_name(kind));
+
+  else
+    clam(CLAM_DEBUG, "task_cancel",
+        "handle %" PRIu64 " not found (already ended or invalid)",
+        (uint64_t)h);
 }
 
 task_t *
@@ -416,8 +547,10 @@ task_finish(task_t *t)
   switch(result)
   {
     case TASK_ENDED:
-      // Periodic tasks reschedule instead of ending, unless shutting down.
-      if(t->kind == TASK_PERIODIC && !pool_shutting_down())
+      // Periodic tasks reschedule instead of ending, unless shutting
+      // down or cancelled. A cancelled periodic becomes terminal on
+      // its next TASK_ENDED return — same path as shutdown.
+      if(t->kind == TASK_PERIODIC && !pool_shutting_down() && !t->cancelled)
       {
         t->state = TASK_SLEEPING;
         t->sleep_until = time(NULL)

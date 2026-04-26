@@ -663,7 +663,10 @@ cmc_poll_tick(task_t *t)
   if(!(uint8_t)kv_get_uint("plugin.coinmarketcap.poll"))
   {
     clam(CLAM_INFO, CMC_CTX, "polling disabled, stopping poll task");
-    cmc_poll_task = NULL;
+    // Cancel self so task_finish treats the TASK_ENDED return below
+    // as terminal instead of rescheduling the periodic.
+    task_cancel(cmc_poll_task);
+    cmc_poll_task = TASK_HANDLE_NONE;
     t->state = TASK_ENDED;
     return;
   }
@@ -945,7 +948,7 @@ cmc_kv_changed(const char *key, void *data)
 
   poll = (uint8_t)kv_get_uint("plugin.coinmarketcap.poll");
 
-  if(poll && cmc_poll_task == NULL)
+  if(poll && cmc_poll_task == TASK_HANDLE_NONE)
   {
     uint32_t ttl = (uint32_t)kv_get_uint("plugin.coinmarketcap.cache_ttl");
 
@@ -957,7 +960,7 @@ cmc_kv_changed(const char *key, void *data)
 
     clam(CLAM_INFO, CMC_CTX, "polling enabled via KV change");
   }
-  else if(!poll && cmc_poll_task != NULL)
+  else if(!poll && cmc_poll_task != TASK_HANDLE_NONE)
     clam(CLAM_INFO, CMC_CTX, "polling will stop at next tick (KV change)");
 }
 

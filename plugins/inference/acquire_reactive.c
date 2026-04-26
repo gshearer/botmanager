@@ -1102,7 +1102,7 @@ acq_bot_kick_submit_deferred(acquire_bot_entry_t *e)
 {
   bool need_submit;
   char tname[TASK_NAME_SZ];
-  task_t *t;
+  task_handle_t t;
   if(!acquire_ready || e == NULL)
     return;
 
@@ -1132,7 +1132,7 @@ acq_bot_kick_submit_deferred(acquire_bot_entry_t *e)
   t = task_add_deferred(tname, TASK_ANY, 200,
       ACQUIRE_KICK_DELAY_MS, acq_bot_kick_drain, e);
 
-  if(t == NULL)
+  if(t == TASK_HANDLE_NONE)
   {
     // Submit failure: roll back the flag so a later enqueue can try
     // again. Rare path — task_add_deferred failures mean pool is tearing

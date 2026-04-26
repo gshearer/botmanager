@@ -63,11 +63,11 @@ static uint32_t              acquire_dedup_cap  = 0;    // effective size
 static uint32_t              acquire_dedup_next = 0;    // LRU write cursor
 
 // A8 — engine-global corpus-lifecycle sweep task handle. Spawned in
-// acquire_register_config once the KV is loaded. The task subsystem
-// does not support mid-life cancellation, so acquire_exit does not
-// tear this down; the callback becomes a no-op once acquire_ready is
-// cleared (mirrors the per-bot tick pattern).
-static task_t               *acquire_sweep_task = NULL;
+// acquire_register_config once the KV is loaded. Cleared to
+// TASK_HANDLE_NONE on acquire_exit after cancelling; a no-op check on
+// acquire_ready in the callback covers any in-flight tick that
+// started before cancel.
+static task_handle_t         acquire_sweep_task = TASK_HANDLE_NONE;
 
 // Forward declarations
 
@@ -542,7 +542,7 @@ acquire_register_topics(const char *bot_name,
     const char *dest_corpus)
 {
   acquire_bot_entry_t *e;
-  task_t *task_ref;
+  task_handle_t task_ref;
   bool created;
   if(!acquire_ready)
     return(FAIL);
@@ -648,12 +648,12 @@ acquire_register_topics(const char *bot_name,
   // Spawn the periodic task outside the rwlock — task_add_periodic
   // may allocate and lock task_lock internally, and we want the
   // smallest possible critical section.
-  if(task_ref == NULL)
+  if(task_ref == TASK_HANDLE_NONE)
   {
     char tname[TASK_NAME_SZ];
 
     uint32_t cadence_secs;
-    task_t *t;
+    task_handle_t t;
     snprintf(tname, sizeof(tname), "acquire:%s", bot_name);
 
     pthread_mutex_lock(&acquire_cfg_mutex);
@@ -904,7 +904,7 @@ acquire_register_config(void)
   if(sweep_interval < ACQUIRE_MIN_SWEEP_INTERVAL_SECS)
     sweep_interval = ACQUIRE_MIN_SWEEP_INTERVAL_SECS;
 
-  if(acquire_sweep_task == NULL)
+  if(acquire_sweep_task == TASK_HANDLE_NONE)
     acquire_sweep_task = task_add_periodic("acquire.sweep",
         TASK_ANY, 200, sweep_interval * 1000,
         acquire_sweep_tick, NULL);

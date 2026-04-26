@@ -1383,8 +1383,10 @@ irc_reconnect_task(task_t *t)
   irc_state_t *st = t->data;
 
   // Clear the pending-task handle so irc_disconnect does not try to
-  // neutralise a task that is already firing.
-  st->reconnect_task = NULL;
+  // cancel a task that is already firing. A stale handle would still
+  // be safe (task_cancel on an already-ended id is a debug-logged
+  // no-op), but zeroing avoids the spurious log line.
+  st->reconnect_task = TASK_HANDLE_NONE;
 
   // Another path (explicit stop, shutdown) may have disabled us
   // between scheduling and firing. Bail before touching the session.
@@ -1462,16 +1464,14 @@ irc_disconnect(void *handle)
 
   st->shutdown = true;
 
-  // Neutralise any pending deferred reconnect. The task callback
-  // checks st->shutdown at entry and bails; marking it TASK_ENDED
-  // here tells the scheduler not to dispatch it at all when the
-  // delay expires. Without this, a stop/start cycle during the
-  // reconnect backoff could fire a spurious second connection
+  // Cancel any pending deferred reconnect so the scheduler drops it
+  // before the delay expires. Without this, a stop/start cycle during
+  // the reconnect backoff could fire a spurious second connection
   // (previously observed on Libera as a stale pacmanpundit_ nick).
-  if(st->reconnect_task != NULL)
+  if(st->reconnect_task != TASK_HANDLE_NONE)
   {
-    st->reconnect_task->state = TASK_ENDED;
-    st->reconnect_task = NULL;
+    task_cancel(st->reconnect_task);
+    st->reconnect_task = TASK_HANDLE_NONE;
   }
 
   irc_chan_clear_all(st);
