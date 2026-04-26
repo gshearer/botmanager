@@ -264,7 +264,7 @@ while(my_free != NULL)
 
 1. Create `plugins/service/<name>/` with `<name>.c`, `<name>.h`, and `meson.build`.
 2. Add `subdir('service/<name>')` to `plugins/meson.build`.
-3. Plugin descriptor: type `PLUGIN_SERVICE`, requires `"bot_command"`.
+3. Plugin descriptor: type `PLUGIN_SERVICE`, requires `"method_command"`.
 4. Register commands in the `init()` callback via `cmd_register()`.
 5. Unregister commands in `deinit()` via `cmd_unregister()`.
 
@@ -294,7 +294,7 @@ const plugin_desc_t bm_plugin_desc = {
   .kind            = "myplugin",
   .provides        = { { .name = "service_myplugin" } },
   .provides_count  = 1,
-  .requires        = { { .name = "bot_command" } },
+  .requires        = { { .name = "method_command" } },
   .requires_count  = 1,
   .kv_schema       = NULL,         // or pointer to plugin_kv_entry_t array
   .kv_schema_count = 0,
@@ -375,4 +375,4 @@ shim shape.
 | `core/cmd.c` | `cmd_reply()`, dispatch logic |
 | `core/resolve.c` | Reference: core module with async user command |
 | `plugins/service/openweather/openweather.c` | Reference: service plugin with async user command |
-| `plugins/bot/command/command.c` | Command bot plugin (enables user commands on bot instances) |
+| `plugins/method/command/command.c` | Command method plugin (enables user commands on bot instances) |

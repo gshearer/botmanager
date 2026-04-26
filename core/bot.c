@@ -1247,7 +1247,7 @@ bot_start(bot_inst_t *inst)
     if(m->inst == NULL && m->method_kind[0] != '\0')
     {
       const plugin_desc_t *pd =
-          plugin_find_type(PLUGIN_METHOD, m->method_kind);
+          plugin_find_type(PLUGIN_PROTOCOL, m->method_kind);
 
       if(pd != NULL && pd->ext != NULL)
       {
@@ -1663,8 +1663,8 @@ bot_register_method_kv(const char *botname, const char *method_kind)
      method_kind == NULL || method_kind[0] == '\0')
     return(0);
 
-  // Find the method plugin by kind.
-  pd = plugin_find_type(PLUGIN_METHOD, method_kind);
+  // Find the protocol plugin by kind.
+  pd = plugin_find_type(PLUGIN_PROTOCOL, method_kind);
 
   if(pd == NULL || pd->kv_inst_schema == NULL ||
      pd->kv_inst_schema_count == 0)
@@ -1715,7 +1715,10 @@ bot_register_driver_kv(const char *botname, const char *bot_kind)
      bot_kind == NULL || bot_kind[0] == '\0')
     return(0);
 
-  pd = plugin_find_type(PLUGIN_BOT, bot_kind);
+  pd = plugin_find_type(PLUGIN_METHOD, bot_kind);
+
+  if(pd == NULL)
+    pd = plugin_find_type(PLUGIN_FEATURE, bot_kind);
 
   if(pd == NULL || pd->kv_inst_schema == NULL ||
      pd->kv_inst_schema_count == 0)
@@ -1824,8 +1827,11 @@ bot_restore_instances(char auto_names[][BOT_NAME_SZ],
     if(name == NULL || kind == NULL)
       continue;
 
-    // Find the bot plugin by kind.
-    pd = plugin_find_type(PLUGIN_BOT, kind);
+    // Find the method or feature plugin by kind.
+    pd = plugin_find_type(PLUGIN_METHOD, kind);
+
+    if(pd == NULL)
+      pd = plugin_find_type(PLUGIN_FEATURE, kind);
 
     if(pd == NULL || pd->ext == NULL)
     {

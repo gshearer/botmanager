@@ -7,7 +7,7 @@
 #include "kv.h"
 
 // Plugins built against a different version are rejected at load time.
-#define PLUGIN_API_VERSION   12
+#define PLUGIN_API_VERSION   13
 
 // Entry point symbol that every plugin must export.
 #define PLUGIN_ENTRY_SYMBOL  "bm_plugin_desc"
@@ -21,11 +21,13 @@ typedef enum
 {
   PLUGIN_CORE,          // extends core functionality
   PLUGIN_DB,            // database engine driver
-  PLUGIN_METHOD,        // human interaction method (IRC, Slack, etc.)
-  PLUGIN_BOT,           // bot behavior (command, scraper, etc.)
+  PLUGIN_PROTOCOL,      // human interaction protocol (IRC, Slack, etc.)
+  PLUGIN_METHOD,        // bot interaction method (chat, command, etc.)
   PLUGIN_SERVICE,       // external API integration (REST, WebSocket, etc.)
   PLUGIN_MISC,          // miscellaneous user command extension (registers commands)
-  PLUGIN_PERSONALITY    // language/messaging personality
+  PLUGIN_PERSONALITY,   // language/messaging personality
+  PLUGIN_FEATURE,       // capability layer composed atop methods (whenmoon, etc.)
+  PLUGIN_EXCHANGE       // exchange-facing protocol (coinbase, kraken, etc.)
 } plugin_type_t;
 
 typedef enum

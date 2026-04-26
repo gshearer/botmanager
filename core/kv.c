@@ -20,6 +20,54 @@ typedef struct kv_nl_reg
 static kv_nl_reg_t     *kv_nl_head  = NULL;
 static pthread_mutex_t  kv_nl_mutex = PTHREAD_MUTEX_INITIALIZER;
 
+const char *KV_REDACTED_VALUE = "***";
+
+static __thread bool kv_admin_active = false;
+
+void
+kv_admin_context_set(bool active)
+{
+  kv_admin_active = active;
+}
+
+bool
+kv_admin_context_active(void)
+{
+  return(kv_admin_active);
+}
+
+bool
+kv_is_secret_key(const char *key)
+{
+  const char *p;
+  const char *seg;
+
+  if(key == NULL || key[0] == '\0')
+    return(false);
+
+  // Walk dot-separated segments. A segment is "secret-bearing" iff it
+  // equals "creds" AND is not the trailing segment (i.e., is followed
+  // by another '.').
+  seg = key;
+
+  for(p = key; *p != '\0'; p++)
+  {
+    if(*p == '.')
+    {
+      size_t len = (size_t)(p - seg);
+
+      if(len == 5 && memcmp(seg, "creds", 5) == 0)
+        return(true);
+
+      seg = p + 1;
+    }
+  }
+
+  // Tail segment intentionally not checked — a key whose final segment
+  // is "creds" is NOT secret per the rule.
+  return(false);
+}
+
 static inline uint32_t
 hash_key(const char *key)
 {
@@ -317,6 +365,7 @@ kv_register(const char *key, kv_type_t type, const char *default_val,
   e->cb_data = cb_data;
   e->help    = help;
   e->dirty   = true;   // new entries need DB persistence
+  e->secret  = kv_is_secret_key(key);
 
   // Insert into hash table.
   bucket = hash_key(key);
@@ -486,16 +535,50 @@ kv_get_str(const char *key)
 {
   const char *result = NULL;
   kv_entry_t *e;
+  bool        redact = false;
 
   pthread_mutex_lock(&kv_mutex);
   e = find_locked(key);
 
   if(e != NULL && e->type == KV_STR)
-    result = e->val.str;
+  {
+    if(e->secret && !kv_admin_active)
+      redact = true;
+    else
+      result = e->val.str;
+  }
 
   pthread_mutex_unlock(&kv_mutex);
 
+  if(redact)
+    return(KV_REDACTED_VALUE);
+
   return(result);
+}
+
+const char *
+kv_get_secret(const char *key)
+{
+  const char *s = kv_get_str(key);
+
+  return(s != NULL ? s : KV_REDACTED_VALUE);
+}
+
+bool
+kv_set_secret(const char *key, const char *val)
+{
+  kv_entry_t *e;
+
+  pthread_mutex_lock(&kv_mutex);
+
+  e = find_locked(key);
+
+  if(e != NULL)
+    e->secret = true;
+
+  pthread_mutex_unlock(&kv_mutex);
+
+  return(kv_set(key, val));
 }
 
 bool
@@ -754,7 +837,15 @@ kv_get_val_str(const char *key, char *buf, size_t bufsz)
     return(FAIL);
   }
 
-  val_to_str(e->type, &e->val, buf, bufsz);
+  if(e->secret && !kv_admin_active)
+  {
+    strncpy(buf, KV_REDACTED_VALUE, bufsz - 1);
+    buf[bufsz - 1] = '\0';
+  }
+
+  else
+    val_to_str(e->type, &e->val, buf, bufsz);
+
   pthread_mutex_unlock(&kv_mutex);
   return(SUCCESS);
 }
@@ -954,7 +1045,15 @@ kv_iterate_prefix(const char *prefix, kv_iter_cb_t cb, void *data)
       {
         char val_str[KV_VAL_BUF];
 
-        val_to_str(e->type, &e->val, val_str, sizeof(val_str));
+        if(e->secret && !kv_admin_active)
+        {
+          strncpy(val_str, KV_REDACTED_VALUE, sizeof(val_str) - 1);
+          val_str[sizeof(val_str) - 1] = '\0';
+        }
+
+        else
+          val_to_str(e->type, &e->val, val_str, sizeof(val_str));
+
         cb(e->key, e->type, val_str, data);
         count++;
       }

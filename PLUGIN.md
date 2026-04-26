@@ -7,8 +7,9 @@ For adding user commands specifically, see CMD.md.
 **Working reference implementations** (always up-to-date with actual API):
 - Command-surface: `plugins/cmd/math/`
 - Service: `plugins/service/openweather/`
-- Method: `plugins/method/irc/`
-- Bot: `plugins/bot/command/`
+- Protocol: `plugins/protocol/irc/`
+- Method: `plugins/method/command/`
+- Feature: `plugins/feature/whenmoon/`
 - DB: `plugins/db/postgresql/`
 
 ## Overview
@@ -27,10 +28,12 @@ flow downward only**.
 |---|---|---|---|
 | Core | `core/`, `include/` | Daemon process + unified command registry + subsystems (bot, method, cmd, task, kv, sock, db, clam, ...) | itself |
 | Service | `plugins/service/*/` | Pure API connectivity (HTTP / REST / transport to an external provider). Exposes a mechanism API in `<name>_api.h`. | core |
+| Exchange | `plugins/exchange/*/` | Exchange-facing protocols (Coinbase, Kraken, ...). Exposes a mechanism API in `<name>_api.h`. | core + service |
 | Command-surface | `plugins/cmd/*/` | Registers user commands that wrap service-plugin mechanisms or contain self-contained domain logic (math, smallgames). | core + any service plugin's `*_api.h` |
-| Behavior | `plugins/bot/*/` | Owns bot-kind-specific state and the commands that mutate it (chat plugin's `/dossier`, `/llm`, `/memory`). | core + service |
+| Method | `plugins/method/*/` | Owns bot-interaction-method-specific state and the commands that mutate it (chat plugin's `/dossier`, `/llm`, `/memory`; command plugin's slash dispatcher). | core + service + feature |
+| Feature | `plugins/feature/*/` | Capability layers composed atop methods (whenmoon trading, future inference-as-feature). | core + service + exchange |
 | Inference | `plugins/inference/` | LLM, knowledge, acquire mechanism APIs (dlsym shims). | core + service |
-| Method | `plugins/method/*/` | Wire protocols (IRC, botmanctl). | core + service |
+| Protocol | `plugins/protocol/*/` | Wire protocols (IRC, botmanctl). | core + service |
 | DB | `plugins/db/*/` | Database drivers (postgresql, ...). | core + service |
 
 Hard rules:
@@ -43,24 +46,24 @@ Hard rules:
    the command runs — a structural violation of downward-only
    dependencies. Keeping service plugins mechanism-only prevents the
    whole category. See `plugins/service/AGENTS.md`.
-2. **No upward includes or `plugin_dlsym`.** Service, method, db, and
-   inference plugins must not `#include` headers from behavior
-   plugins, must not reference behavior-plugin types, and must not
-   resolve behavior-plugin symbols via `plugin_dlsym`. A leak in that
-   direction is an architectural bug.
+2. **No upward includes or `plugin_dlsym`.** Service, protocol, db,
+   and inference plugins must not `#include` headers from method or
+   feature plugins, must not reference method/feature-plugin types,
+   and must not resolve method/feature-plugin symbols via
+   `plugin_dlsym`. A leak in that direction is an architectural bug.
 3. **Chat-specific side effects live in the chat plugin's NL bridge.**
    If the requirement is "after `/foo` runs, record a dossier fact
    about the sender", the observer belongs in
-   `plugins/bot/chat/nl_observe.c`, attached to the typed slot metadata
-   carried on `cmd_nl_t`. See the `CMD_NL_ARG_LOCATION` observer as
-   the reference implementation.
+   `plugins/method/chat/nl_observe.c`, attached to the typed slot
+   metadata carried on `cmd_nl_t`. See the `CMD_NL_ARG_LOCATION`
+   observer as the reference implementation.
 
 Grep audits (from `plugins/service/AGENTS.md`) that must stay clean:
 
 ```sh
-# Service / method / db plugins must not reference behavior-plugin state.
+# Service / protocol / db plugins must not reference method-plugin state.
 grep -rn 'dossier\|memory_\|chatbot\|chat_user' \
-    plugins/service/ plugins/method/ plugins/db/
+    plugins/service/ plugins/protocol/ plugins/db/
 # expected: 0 matches (outside prose comments explaining the rule)
 
 # Service plugins must not register commands.
@@ -69,13 +72,13 @@ grep -rn 'cmd_register\|cmd_unregister' plugins/service/
 
 # Downward-only plugin_dlsym: nothing upstream resolves "chat".
 grep -rn 'plugin_dlsym[[:space:]]*(.*"chat"' \
-    plugins/service/ plugins/method/ plugins/db/ plugins/inference/
+    plugins/service/ plugins/protocol/ plugins/db/ plugins/inference/
 # expected: 0 matches
 
-# Cross-plugin includes: service/method/db/inference must not include
-# behavior-plugin headers.
+# Cross-plugin includes: service/protocol/db/inference must not include
+# method-plugin headers.
 grep -rn '#include[[:space:]]*"dossier.h"\|#include[[:space:]]*"memory.h"\|#include[[:space:]]*"chatbot.h"' \
-    plugins/service/ plugins/method/ plugins/db/ plugins/inference/
+    plugins/service/ plugins/protocol/ plugins/db/ plugins/inference/
 # expected: 0 matches
 ```
 
@@ -88,11 +91,13 @@ section.
 typedef enum {
   PLUGIN_CORE,         // extends core functionality
   PLUGIN_DB,           // database engine driver (ext = db_driver_t*)
-  PLUGIN_METHOD,       // human interaction method (ext = method_driver_t*)
-  PLUGIN_BOT,          // bot behavior (ext = bot_driver_t*)
+  PLUGIN_PROTOCOL,     // human interaction protocol (ext = method_driver_t*)
+  PLUGIN_METHOD,       // bot interaction method (ext = bot_driver_t*)
   PLUGIN_SERVICE,      // external API integration (ext usually NULL)
   PLUGIN_MISC,         // miscellaneous user command extension (registers commands)
-  PLUGIN_PERSONALITY   // language/messaging personality
+  PLUGIN_PERSONALITY,  // language/messaging personality
+  PLUGIN_FEATURE,      // capability layer composed atop methods (ext = bot_driver_t*)
+  PLUGIN_EXCHANGE      // exchange-facing protocol (ext usually NULL)
 } plugin_type_t;
 ```
 
@@ -102,7 +107,7 @@ Every plugin exports this struct as the `bm_plugin_desc` symbol:
 
 ```c
 const plugin_desc_t bm_plugin_desc = {
-  .api_version     = PLUGIN_API_VERSION,   // must match (currently 8)
+  .api_version     = PLUGIN_API_VERSION,   // must match (currently 13)
   .name            = "myplugin",           // unique name (max 64 chars)
   .version         = "1.0",               // version string (max 32 chars)
   .type            = PLUGIN_SERVICE,       // plugin type
@@ -110,7 +115,7 @@ const plugin_desc_t bm_plugin_desc = {
 
   .provides        = { { .name = "service_myplugin" } },
   .provides_count  = 1,
-  .requires        = { { .name = "bot_command" } },  // or .requires_count = 0
+  .requires        = { { .name = "method_command" } },  // or .requires_count = 0
   .requires_count  = 1,
 
   .kv_schema       = my_kv_schema,         // plugin-level config (or NULL)
@@ -124,7 +129,7 @@ const plugin_desc_t bm_plugin_desc = {
   .stop            = NULL,                 // drain work (or NULL)
   .deinit          = my_deinit,            // final cleanup (or NULL)
 
-  .ext             = NULL,                 // driver vtable for METHOD/BOT/DB types
+  .ext             = NULL,                 // driver vtable for PROTOCOL/METHOD/FEATURE/DB types
 
   .kv_groups       = NULL,                 // dynamic entity schemas (or NULL)
   .kv_groups_count = 0,
@@ -135,7 +140,7 @@ const plugin_desc_t bm_plugin_desc = {
 
 | Constant | Value | Used For |
 |----------|-------|----------|
-| `PLUGIN_API_VERSION` | 8 | Must match at load time |
+| `PLUGIN_API_VERSION` | 13 | Must match at load time |
 | `PLUGIN_NAME_SZ` | 64 | name, kind |
 | `PLUGIN_VER_SZ` | 32 | version |
 | `PLUGIN_FEATURE_SZ` | 64 | feature names |
@@ -177,8 +182,10 @@ Plugins declare features they provide and features they require. The core uses t
 
 | Plugin Type | Provides Pattern | Example |
 |-------------|-----------------|---------|
-| Method | `method_<kind>` | `method_irc` |
-| Bot | `bot_<kind>` | `bot_command` |
+| Protocol | `protocol_<kind>` | `protocol_irc` |
+| Method | `method_<kind>` | `method_chat`, `method_command` |
+| Feature | `feature_<kind>` | `feature_whenmoon` |
+| Exchange | `exchange_<kind>` | `exchange_coinbase` |
 | Service | `service_<kind>` | `service_openweather` |
 | Misc | `misc_<kind>` | `misc_misc_math` |
 | DB | `db_<kind>` | `db_postgresql` |
@@ -223,9 +230,9 @@ dependents now declare `.requires = { "inference" }` instead.
 
 ### Common Dependency Patterns
 
-**Service plugin depending on command bot:**
+**Service plugin depending on command method:**
 ```c
-.requires = { { .name = "bot_command" } },
+.requires = { { .name = "method_command" } },
 .requires_count = 1,
 ```
 
@@ -335,7 +342,7 @@ static const plugin_kv_entry_t my_inst_kv_schema[] = {
 
 When bot "mybot" binds to method kind "myplugin", these become `bot.mybot.myplugin.host`, `bot.mybot.myplugin.port`, etc.
 
-Only relevant for `PLUGIN_METHOD` plugins. Service and bot plugins typically use plugin-level KV only.
+Relevant for `PLUGIN_PROTOCOL` plugins (per-bot connection identity, e.g. nick/network/channels) and `PLUGIN_METHOD` plugins (per-bot method state). Service and feature plugins typically use plugin-level KV only.
 
 ### KV Types
 
@@ -370,7 +377,7 @@ static const plugin_kv_group_t my_kv_groups[] = {
 
 ## Driver Interfaces
 
-### Method Driver (`PLUGIN_METHOD`)
+### Protocol Driver (`PLUGIN_PROTOCOL`)
 
 Set `ext = &my_method_driver` in the descriptor.
 
@@ -402,9 +409,10 @@ static const color_table_t my_colors = {
 };
 ```
 
-### Bot Driver (`PLUGIN_BOT`)
+### Bot-Behaviour Driver (`PLUGIN_METHOD` / `PLUGIN_FEATURE`)
 
-Set `ext = &my_bot_driver` in the descriptor.
+Set `ext = &my_bot_driver` in the descriptor. Methods (chat, command)
+and features (whenmoon) share the same vtable shape.
 
 ```c
 typedef struct {
@@ -426,7 +434,7 @@ Set `ext = &my_db_driver` in the descriptor. See `include/db.h` for `db_driver_t
 
 ### Service Plugins (`PLUGIN_SERVICE`)
 
-Typically set `ext = NULL`. Service plugins register commands in `init()` and do their work via those command callbacks. They depend on `bot_command` to make their commands available.
+Typically set `ext = NULL`. Service plugins register commands in `init()` and do their work via those command callbacks. They depend on `method_command` to make their commands available.
 
 ## Build System
 
@@ -592,7 +600,7 @@ const plugin_desc_t bm_plugin_desc = {
   .kind            = "newplugin",
   .provides        = { { .name = "service_newplugin" } },
   .provides_count  = 1,
-  .requires        = { { .name = "bot_command" } },
+  .requires        = { { .name = "method_command" } },
   .requires_count  = 1,
   .kv_schema       = NULL,
   .kv_schema_count = 0,
@@ -642,5 +650,6 @@ subdir('service/newplugin')
 | `core/plugin.c` | Discovery, loading, resolution, lifecycle management |
 | `plugins/meson.build` | Plugin subdirectory list |
 | `plugins/service/openweather/` | Reference: service plugin with KV config, commands, async work |
-| `plugins/method/irc/` | Reference: method plugin with driver, instance KV, KV groups |
-| `plugins/bot/command/` | Reference: bot plugin with driver, command dispatch |
+| `plugins/protocol/irc/` | Reference: protocol plugin with driver, instance KV, KV groups |
+| `plugins/method/command/` | Reference: method plugin with driver, command dispatch |
+| `plugins/feature/whenmoon/` | Reference: feature plugin with bot driver, market lifecycle |

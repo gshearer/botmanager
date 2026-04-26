@@ -988,12 +988,33 @@ cmd_parse_args(const char *args, const cmd_arg_desc_t *desc,
   return true;
 }
 
+// True iff the resolved caller is an admin in the bot's userns. Used to
+// arm the thread-local admin context so secret-tier KVs deredact for the
+// duration of the command callback.
+static bool
+cmd_caller_is_admin(bot_inst_t *bot, const char *username)
+{
+  userns_t *ns;
+
+  if(bot == NULL || username == NULL || username[0] == '\0')
+    return(false);
+
+  ns = bot_get_userns(bot);
+
+  if(ns == NULL)
+    return(false);
+
+  return(userns_member_check(ns, username, USERNS_GROUP_ADMIN));
+}
+
 // Task callback for async command execution. Parses args if the command
 // has an arg spec, then invokes the command callback.
 static void
 cmd_task_cb(task_t *t)
 {
   cmd_task_data_t *d = (cmd_task_data_t *)t->data;
+  const char      *uname;
+  bool             admin;
 
   cmd_ctx_t ctx = {
     .bot      = d->bot,
@@ -1020,7 +1041,17 @@ cmd_task_cb(task_t *t)
     ctx.parsed = &parsed;
   }
 
+  uname = (d->username[0] != '\0') ? d->username : NULL;
+  admin = cmd_caller_is_admin(d->bot, uname);
+
+  if(admin)
+    kv_admin_context_set(true);
+
   d->cb(&ctx);
+
+  if(admin)
+    kv_admin_context_set(false);
+
   mem_free(d);
 
   t->state = TASK_ENDED;
@@ -2095,7 +2126,19 @@ cmd_dispatch_as(const char *cmd_name, const char *args,
     ctx.parsed = &parsed;
   }
 
-  cb(&ctx);
+  {
+    bool admin = (ns != NULL && username != NULL && username[0] != '\0' &&
+        userns_member_check(ns, username, USERNS_GROUP_ADMIN));
+
+    if(admin)
+      kv_admin_context_set(true);
+
+    cb(&ctx);
+
+    if(admin)
+      kv_admin_context_set(false);
+  }
+
   __atomic_add_fetch(&cmd_stat_dispatches, 1, __ATOMIC_RELAXED);
   return(SUCCESS);
 }

@@ -2,9 +2,9 @@
 
 BotManager is a modular framework written in C for Linux. It functions as a microkernel for bots: a minimal, stable core provides infrastructure services while plugins supply all bot behavior, interaction methods, and extended functionality.
 
-**Microkernel discipline.** A subsystem belongs in core only if multiple bot kinds consume it. Subsystems specific to a single bot kind live alongside that bot's plugin code, not in core. Practical test: could an agent launched in `plugins/bot/<kind>/` be productive without reading anything outside that directory? If not, the boundary is in the wrong place.
+**Microkernel discipline.** A subsystem belongs in core only if multiple bot kinds consume it. Subsystems specific to a single bot kind live alongside that kind's plugin code, not in core. Practical test: could an agent launched in `plugins/method/<kind>/` (or `plugins/feature/<kind>/`) be productive without reading anything outside that directory? If not, the boundary is in the wrong place.
 
-Worked example: the LLM client, knowledge store, and acquisition engine were originally in `core/` but were consumed only by `plugins/bot/chat/`. Per the rule above, they moved to a single `plugins/inference/` plugin — consumed today by the chat bot, and planned to be shared with the future trading bot. Chat declares `.requires = { "inference" }`; the inference plugin's public header `plugins/inference/inference.h` is a set of dlsym-shim inlines over the plugin's real symbols.
+Worked example: the LLM client, knowledge store, and acquisition engine were originally in `core/` but were consumed only by `plugins/method/chat/`. Per the rule above, they moved to a single `plugins/inference/` plugin — consumed today by the chat method, and planned to be shared with the future trading feature. Chat declares `.requires = { "inference" }`; the inference plugin's public header `plugins/inference/inference.h` is a set of dlsym-shim inlines over the plugin's real symbols.
 
 Support for other platforms is strictly out-of-scope; this program targets the modern Linux kernel and its ecosystem.
 
@@ -28,7 +28,7 @@ A bot that drives a configurable persona over a chat method via an LLM. Classifi
 
 **Personality and contract.** A persona is defined by a personality body and an output contract (wire-format rules: no narration, no parentheticals, the SKIP sentinel for opting out). Both are loaded from `personalities/*.txt` at startup; the contract is stored inline on the personality row — there is no separate runtime contract entity.
 
-**Memory layers** (chat-plugin-owned): `memory.c` owns `conversation_log` + `user_facts`/`dossier_facts` + embedding tables; `dossier.c` provides identity/mention resolution; `extract.c` converts raw log rows into structured facts via an LLM. These three compose with two core-owned services: `knowledge.c` (per-corpus RAG) and `acquire.c` (topic → SearXNG → digest → ingest pipeline). See `CHATBOT.md`, `plugins/bot/chat/MEMSTORE.md`, `KNOWLEDGE.md`, `ACQUIRE.md` for reference detail.
+**Memory layers** (chat-plugin-owned): `memory.c` owns `conversation_log` + `user_facts`/`dossier_facts` + embedding tables; `dossier.c` provides identity/mention resolution; `extract.c` converts raw log rows into structured facts via an LLM. These three compose with two core-owned services: `knowledge.c` (per-corpus RAG) and `acquire.c` (topic → SearXNG → digest → ingest pipeline). See `CHATBOT.md`, `plugins/method/chat/MEMSTORE.md`, `KNOWLEDGE.md`, `ACQUIRE.md` for reference detail.
 
 ### Asset Trading Bot — separate project
 
@@ -156,15 +156,17 @@ Plugins provide all bot behavior, interaction methods, DB engines, external API 
 
 ## Plugin Layer Model
 
-Plugins live in four strictly-layered categories with downward-only
-dependencies: **service** (`plugins/service/*`) exposes API mechanisms,
-**command-surface** (`plugins/cmd/*`) registers user commands that
-wrap those mechanisms, **behavior** (`plugins/bot/*`) owns
-bot-kind-specific state, and the supporting **inference / method / db**
-plugins. Service plugins register zero user commands; chat-specific
-side effects (dossier facts) live in the chat plugin's NL bridge
-observer. See `PLUGIN.md §Layer Rules` for the authoritative rules and
-grep audits.
+Plugins live in strictly-layered categories with downward-only
+dependencies: **service** (`plugins/service/*`) and **exchange**
+(`plugins/exchange/*`) expose API mechanisms, **command-surface**
+(`plugins/cmd/*`) registers user commands that wrap those mechanisms,
+**method** (`plugins/method/*`) owns bot-interaction-method state
+(chat, command), **feature** (`plugins/feature/*`) owns capability
+layers atop methods (whenmoon), with supporting **inference /
+protocol / db** plugins beneath. Service plugins register zero user
+commands; chat-specific side effects (dossier facts) live in the chat
+plugin's NL bridge observer. See `PLUGIN.md §Layer Rules` for the
+authoritative rules and grep audits.
 
 ## Plugin API
 
@@ -179,7 +181,7 @@ Each plugin exports a `plugin_desc_t` (symbol `bm_plugin_desc`) containing:
 ## Plugin Dependencies
 
 ### Plugin-to-plugin
-A plugin's `.requires` entry names a feature that another plugin `.provides`. Service plugins typically require `bot_command`. Dependencies are resolved at load time.
+A plugin's `.requires` entry names a feature that another plugin `.provides`. Service plugins typically require `method_command`. Dependencies are resolved at load time.
 
 ### Core-provided features
 Core registers synthetic providers at startup (`core_llm`, `core_kv`, `core_db`, `core_userns`, etc.). Plugins can declare these in `.requires`; they resolve as no-op edges in the topo-sort. A typo in a `core_*` name fails `plugin_resolve()` immediately. Full list: `include/AGENTS.md`.
@@ -192,9 +194,9 @@ Current contracts:
 
 | Header | Implemented by | Consumed by |
 |--------|----------------|-------------|
-| `plugins/contracts/dossier_method.h` | Method plugins (IRC) | `plugins/bot/chat/` |
+| `plugins/contracts/dossier_method.h` | Protocol plugins (IRC) | `plugins/method/chat/` |
 
-Method plugins publish optional dossier scorers through `method_driver_t.dossier_scorer` / `.dossier_token_scorer` (void-typed in `method.h` to keep core free of chat-type dependencies). The chat plugin casts and registers them at start time.
+Protocol plugins publish optional dossier scorers through `method_driver_t.dossier_scorer` / `.dossier_token_scorer` (void-typed in `method.h` to keep core free of chat-type dependencies). The chat plugin casts and registers them at start time.
 
 ## Runtime Service Extension
 

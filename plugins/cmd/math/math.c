@@ -136,7 +136,7 @@ const plugin_desc_t bm_plugin_desc = {
   .kind            = "misc_math",
   .provides        = { { .name = "misc_misc_math" } },
   .provides_count  = 1,
-  .requires        = { { .name = "bot_command" } },
+  .requires        = { { .name = "method_command" } },
   .requires_count  = 1,
   .kv_schema       = NULL,
   .kv_schema_count = 0,

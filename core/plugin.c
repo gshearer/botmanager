@@ -689,11 +689,13 @@ plugin_type_name(plugin_type_t t)
   {
     case PLUGIN_CORE:        return("core");
     case PLUGIN_DB:          return("db");
+    case PLUGIN_PROTOCOL:    return("protocol");
     case PLUGIN_METHOD:      return("method");
-    case PLUGIN_BOT:         return("bot");
     case PLUGIN_SERVICE:     return("service");
     case PLUGIN_MISC:        return("misc");
     case PLUGIN_PERSONALITY: return("personality");
+    case PLUGIN_FEATURE:     return("feature");
+    case PLUGIN_EXCHANGE:    return("exchange");
   }
 
   return("unknown");

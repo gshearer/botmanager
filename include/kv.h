@@ -10,6 +10,26 @@
 #define KV_KEY_SZ  128
 #define KV_STR_SZ  256
 
+// Substituted for any secret KV value when read without an active admin
+// context. Pointer-stable string literal — callers must not free.
+extern const char *KV_REDACTED_VALUE;
+
+// True iff any non-tail dot-separated segment of key equals "creds".
+// "plugin.foo.creds.api_secret" is secret; "plugin.foo.creds" is not.
+bool kv_is_secret_key(const char *key);
+
+bool kv_set_secret(const char *key, const char *val);
+
+// Like kv_get_str but for a secret key without admin context, returns
+// KV_REDACTED_VALUE. Always non-NULL on a registered KV_STR key.
+const char *kv_get_secret(const char *key);
+
+// Thread-local admin-context flag. cmd dispatch sets this around the
+// command callback so secret-tier KV reads return real values; all other
+// readers see KV_REDACTED_VALUE.
+void kv_admin_context_set(bool active);
+bool kv_admin_context_active(void);
+
 typedef enum
 {
   KV_INT8,    KV_UINT8,
@@ -172,6 +192,7 @@ typedef struct kv_entry
   void            *cb_data;
   const char      *help;     // human-readable help (static, may be NULL)
   bool             dirty;
+  bool             secret;   // value redacted from non-admin readers
   struct kv_entry *next;     // hash chain
 } kv_entry_t;
 

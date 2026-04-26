@@ -77,8 +77,8 @@ typedef void (*method_chan_member_cb_t)(const char *nick, void *data);
 
 typedef void (*method_joined_channel_cb_t)(const char *channel, void *data);
 
-// Functions a method plugin must implement. Stored in plugin_desc_t.ext
-// for PLUGIN_METHOD plugins.
+// Functions a protocol plugin must implement. Stored in
+// plugin_desc_t.ext for PLUGIN_PROTOCOL plugins (IRC, Slack, etc.).
 typedef struct
 {
   const char *name;

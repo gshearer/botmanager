@@ -66,7 +66,11 @@ admin_cmd_bot_add(const cmd_ctx_t *ctx)
     return;
   }
 
-  pd = plugin_find_type(PLUGIN_BOT, kind);
+  pd = plugin_find_type(PLUGIN_METHOD, kind);
+
+  if(pd == NULL)
+    pd = plugin_find_type(PLUGIN_FEATURE, kind);
+
   if(pd == NULL || pd->ext == NULL)
   {
     snprintf(buf, sizeof(buf), "no bot plugin with kind: %s", kind);

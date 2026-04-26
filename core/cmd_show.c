@@ -1001,7 +1001,7 @@ cmd_show_status(const cmd_ctx_t *ctx)
 }
 
 // /show extract {root,stats} was hosted here until R2; the handlers and
-// registration moved into the chat plugin (plugins/bot/chat/show_verbs.c)
+// registration moved into the chat plugin (plugins/method/chat/show_verbs.c)
 // since the extract subsystem itself lives there now.
 
 // Registration

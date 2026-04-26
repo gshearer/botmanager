@@ -240,7 +240,7 @@ main(int argc, char *argv[])
   // lifecycle callbacks; core no longer touches them directly.
 
   // Memory subsystem lives in the chat plugin (R1) -- init / exit
-  // wiring has moved into plugins/bot/chat/chatbot.c. Core no longer
+  // wiring has moved into plugins/method/chat/chatbot.c. Core no longer
   // touches it directly.
 
   // Fact extraction lives in the chat plugin as of R2 — chat plugin
