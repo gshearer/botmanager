@@ -1,5 +1,20 @@
 // botmanager — MIT
-// Per-bot download scheduler: token bucket + periodic tick + job store.
+// Per-bot download scheduler: token bucket + event-driven dispatcher.
+//
+// No periodic tick. The dispatch chain is driven by:
+//   1. wm_dl_job_enqueue — kicks a freshly-queued job.
+//   2. wm_dl_scheduler_init — kicks any persisted queued/running rows
+//      restored on bot start.
+//   3. completion callbacks (wm_dl_trades_on_page,
+//      wm_dl_candles_on_page) — chain to the next page after the prior
+//      one returns.
+//   4. wm_dl_retry_task_cb — a one-shot deferred re-entry when the
+//      bucket was empty at the time of an earlier dispatch attempt.
+//
+// All four routes call wm_dl_dispatch_next, which is the single
+// take-token + pick-job + submit primitive. On bucket-empty (or a rare
+// synchronous submit failure) it arms `retry_task` for a delayed
+// re-entry; once the bucket refills the chain resumes naturally.
 
 #define WHENMOON_INTERNAL
 #include "whenmoon.h"
@@ -28,7 +43,6 @@
 // Forward decls                                                       //
 // ------------------------------------------------------------------ //
 
-static void wm_dl_scheduler_tick(task_t *t);
 static void wm_dl_bucket_refill_locked(dl_scheduler_t *s);
 static bool wm_dl_load_jobs(dl_scheduler_t *s);
 static bool wm_dl_insert_job(const char *bot_name, dl_job_kind_t kind,
@@ -40,6 +54,8 @@ static bool wm_dl_has_running_trades_for_market_locked(dl_scheduler_t *s,
 static const char *wm_dl_state_str(dl_job_state_t s);
 static dl_job_state_t wm_dl_state_from_str(const char *s);
 static void wm_dl_free_job_list(dl_job_t *head);
+static void wm_dl_arm_retry(dl_scheduler_t *s);
+static void wm_dl_retry_task_cb(task_t *t);
 
 // ------------------------------------------------------------------ //
 // State <-> SQL mapping                                               //
@@ -179,30 +195,69 @@ wm_dl_find_job_locked(dl_scheduler_t *s, int64_t id)
 }
 
 // ------------------------------------------------------------------ //
-// Tick                                                                //
+// Event-driven dispatcher                                             //
 // ------------------------------------------------------------------ //
 
+// Arm the deferred retry. At-most-one-outstanding semantics: callers
+// race-safely no-op when retry_task is already armed. Cancellation is
+// the destroy path's responsibility.
 static void
-wm_dl_scheduler_tick(task_t *t)
+wm_dl_arm_retry(dl_scheduler_t *s)
+{
+  pthread_mutex_lock(&s->lock);
+
+  if(s->destroying || !s->enabled || s->retry_task != TASK_HANDLE_NONE)
+  {
+    pthread_mutex_unlock(&s->lock);
+    return;
+  }
+
+  s->retry_task = task_add_deferred("wm_dl_retry", TASK_ANY, 120,
+      WM_DL_RETRY_DELAY_MS, wm_dl_retry_task_cb, s);
+
+  pthread_mutex_unlock(&s->lock);
+}
+
+static void
+wm_dl_retry_task_cb(task_t *t)
 {
   dl_scheduler_t *s = t->data;
-  dl_job_t       *j;
+
+  if(s == NULL)
+  {
+    t->state = TASK_ENDED;
+    return;
+  }
+
+  pthread_mutex_lock(&s->lock);
+  s->retry_task = TASK_HANDLE_NONE;
+  pthread_mutex_unlock(&s->lock);
+
+  // wm_dl_dispatch_next short-circuits on destroying / pool_shutting_down,
+  // so no extra guard needed here.
+  wm_dl_dispatch_next(s);
+
+  t->state = TASK_ENDED;
+}
+
+void
+wm_dl_dispatch_next(dl_scheduler_t *s)
+{
+  dl_job_t *j;
+  bool      submitted = false;
 
   if(s == NULL || s->destroying || pool_shutting_down())
-  {
-    t->state = TASK_ENDED;
     return;
-  }
 
   if(!s->enabled)
-  {
-    t->state = TASK_ENDED;
     return;
-  }
 
   if(!wm_dl_bucket_take(s))
   {
-    t->state = TASK_ENDED;
+    // Bucket empty: arm a retry so the chain resumes once tokens
+    // refill. Completion callbacks may also re-enter this function in
+    // the meantime — first-come-first-served.
+    wm_dl_arm_retry(s);
     return;
   }
 
@@ -219,7 +274,9 @@ wm_dl_scheduler_tick(task_t *t)
 
   if(j == NULL)
   {
-    // Refund the token — no job needed it this tick.
+    // No eligible job — refund the token. Caller (a completion
+    // callback or enqueue path) has nothing to chain; the next event
+    // in the system will re-enter this function.
     pthread_mutex_lock(&s->lock);
     s->tokens += 1.0;
 
@@ -227,33 +284,32 @@ wm_dl_scheduler_tick(task_t *t)
       s->tokens = s->tokens_cap;
 
     pthread_mutex_unlock(&s->lock);
-    t->state = TASK_ENDED;
     return;
   }
 
-  // Dispatch off-lock. Completion callback clears in_flight, commits
-  // rows, and advances the cursor.
+  // Dispatch off-lock. The async REST submit's completion callback
+  // (wm_dl_trades_on_page / wm_dl_candles_on_page) will clear
+  // in_flight, commit rows, and re-enter wm_dl_dispatch_next to fire
+  // the next page in the chain.
   if(j->kind == DL_JOB_TRADES)
-  {
-    if(wm_dl_trades_dispatch_one(s, j) != SUCCESS)
-      wm_dl_job_clear_in_flight(s, j);
-  }
+    submitted = (wm_dl_trades_dispatch_one(s, j) == SUCCESS);
 
   else if(j->kind == DL_JOB_CANDLES)
-  {
-    if(wm_dl_candles_dispatch_one(s, j) != SUCCESS)
-      wm_dl_job_clear_in_flight(s, j);
-  }
+    submitted = (wm_dl_candles_dispatch_one(s, j) == SUCCESS);
 
   else
-  {
     clam(CLAM_WARN, WM_DL_CTX,
-        "scheduler tick: unknown job kind %d for job %" PRId64,
+        "dispatch_next: unknown job kind %d for job %" PRId64,
         (int)j->kind, j->id);
-    wm_dl_job_clear_in_flight(s, j);
-  }
 
-  t->state = TASK_ENDED;
+  if(!submitted)
+  {
+    // Synchronous submit failure — clear the slot and arm a retry so
+    // the chain doesn't stall. Don't recurse: a deterministic
+    // synchronous failure would otherwise spin without bound.
+    wm_dl_job_clear_in_flight(s, j);
+    wm_dl_arm_retry(s);
+  }
 }
 
 void
@@ -767,6 +823,10 @@ wm_dl_job_enqueue(whenmoon_state_t *st,
   wm_dl_job_list_append_locked(s, j);
   pthread_mutex_unlock(&s->lock);
 
+  // Kick the dispatcher so the new job's first page fires immediately
+  // rather than waiting on a tick or a completion of some other job.
+  wm_dl_dispatch_next(s);
+
   *out_job_id = new_id;
   return(SUCCESS);
 }
@@ -923,7 +983,7 @@ wm_dl_scheduler_init(whenmoon_state_t *st)
   s->tokens          = s->tokens_cap;
   s->enabled         = enabled;
   s->max_concurrent  = max_concurrent;
-  s->tick_task       = TASK_HANDLE_NONE;
+  s->retry_task      = TASK_HANDLE_NONE;
 
   clock_gettime(CLOCK_MONOTONIC, &s->last_refill);
 
@@ -945,12 +1005,6 @@ wm_dl_scheduler_init(whenmoon_state_t *st)
   // Load persisted queued/running jobs into memory.
   wm_dl_load_jobs(s);
 
-  if(enabled)
-  {
-    s->tick_task = task_add_periodic("whenmoon.dl.tick",
-        TASK_ANY, 120, WM_DL_TICK_MS, wm_dl_scheduler_tick, s);
-  }
-
   if(rps_clamped)
     clam(CLAM_INFO, WM_DL_CTX,
         "bot %s: rate_limit_rps clamped to [%d,%d]",
@@ -960,6 +1014,12 @@ wm_dl_scheduler_init(whenmoon_state_t *st)
       "bot %s: downloader ready (rps=%u burst=%u max_concurrent=%u%s)",
       st->bot_name, rps, (unsigned)s->tokens_cap, max_concurrent,
       enabled ? "" : " [disabled]");
+
+  // Kick the chain for any restored queued jobs. Disabled scheduler
+  // bails inside wm_dl_dispatch_next; queued jobs sit dormant until a
+  // future enable+enqueue (current behaviour: enabled is read at init
+  // only).
+  wm_dl_dispatch_next(s);
 
   return(SUCCESS);
 }
@@ -976,10 +1036,10 @@ wm_dl_scheduler_destroy(whenmoon_state_t *st)
 
   s = st->downloader;
 
-  if(s->tick_task != TASK_HANDLE_NONE)
+  if(s->retry_task != TASK_HANDLE_NONE)
   {
-    task_cancel(s->tick_task);
-    s->tick_task = TASK_HANDLE_NONE;
+    task_cancel(s->retry_task);
+    s->retry_task = TASK_HANDLE_NONE;
   }
 
   // Under the lock: flag destroying, PAUSE every live job so completion

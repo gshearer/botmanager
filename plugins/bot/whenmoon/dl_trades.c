@@ -309,6 +309,10 @@ wm_dl_trades_on_page(const coinbase_trades_result_t *res, void *user)
     }
 
     mem_free(ctx);
+
+    // Re-kick: this job is paused/cancelled, but other queued jobs may
+    // be eligible. dispatch_next bails on destroying.
+    wm_dl_dispatch_next(s);
     return;
   }
 
@@ -380,6 +384,9 @@ wm_dl_trades_on_page(const coinbase_trades_result_t *res, void *user)
     pthread_cond_broadcast(&s->drain);
     pthread_mutex_unlock(&s->lock);
     mem_free(ctx);
+
+    // Re-kick: see bail path above.
+    wm_dl_dispatch_next(s);
     return;
   }
 
@@ -425,4 +432,8 @@ wm_dl_trades_on_page(const coinbase_trades_result_t *res, void *user)
   wm_dl_job_persist(s, j);
   wm_dl_job_clear_in_flight(s, j);
   mem_free(ctx);
+
+  // Chain to the next page. With self-clocked dispatch, sustained
+  // throughput is paced by the token bucket rather than a 1 s tick.
+  wm_dl_dispatch_next(s);
 }

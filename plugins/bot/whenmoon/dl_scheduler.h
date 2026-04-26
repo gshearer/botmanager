@@ -13,11 +13,19 @@
 #include <stdint.h>
 #include <time.h>
 
-#define WM_DL_TICK_MS          1000
 #define WM_DL_DEFAULT_RPS         8
 #define WM_DL_BURST_MULT        1.5
 #define WM_DL_PAGE_RETRY_MAX      5
 #define WM_DL_JOBS_MAX           32
+
+// Deferred retry pacing. The token bucket would say "wait 1/rps seconds
+// for the next token", but the task system clamps sub-second deferred
+// delays up to 1 s, so any value below 1000 effectively becomes 1 s.
+// A retry that fires before a fresh token has refilled is harmless —
+// the retry callback re-evaluates and may schedule another retry — so
+// we just request a 1 s delay and rely on the natural pacing of
+// completion-callback re-entries to drive throughput at the rps cap.
+#define WM_DL_RETRY_DELAY_MS    1000
 
 // Max rps the scheduler accepts; Coinbase public API cap.
 #define WM_DL_RPS_MIN             1
@@ -74,8 +82,8 @@ struct dl_job
 
   // Outstanding-request guard: a job may have at most one in-flight
   // coinbase_fetch_*_async at a time. Set true when dispatch submits,
-  // cleared by the completion callback. Prevents the tick from
-  // double-dispatching while a prior page is still in transit.
+  // cleared by the completion callback. Prevents wm_dl_dispatch_next
+  // from double-dispatching while a prior page is still in transit.
   bool             in_flight;
 
   // Lazy per-pair DDL marker for candles. Parallel to `table_ensured`
@@ -113,7 +121,13 @@ typedef struct dl_scheduler
   struct timespec        last_refill;
 
   // Scheduler state.
-  task_handle_t          tick_task;     // TASK_HANDLE_NONE when idle
+  //
+  // retry_task is a one-shot deferred handle armed when
+  // wm_dl_dispatch_next finds the bucket empty (or hits a synchronous
+  // submit failure). It re-enters wm_dl_dispatch_next on fire so the
+  // chain resumes once tokens are available again. TASK_HANDLE_NONE
+  // when no retry is pending. Cancelled by wm_dl_scheduler_destroy.
+  task_handle_t          retry_task;
   bool                   enabled;
   bool                   destroying;    // set by wm_dl_scheduler_destroy
   uint32_t               max_concurrent;
@@ -153,10 +167,20 @@ dl_job_t *wm_dl_find_job_locked(dl_scheduler_t *s, int64_t id);
 void wm_dl_bucket_refill(dl_scheduler_t *s);
 bool wm_dl_bucket_take(dl_scheduler_t *s);
 
+// Bucket-gated dispatcher. Takes one token, picks the next eligible
+// job, fires its next page. Safe to call from any thread; no-op when
+// the scheduler is destroying, disabled, or all jobs are in-flight /
+// the concurrency cap is hit. On bucket-empty arms a one-shot retry
+// task that re-enters this function once the bucket has refilled.
+//
+// Replaces the old periodic tick: callers chain through completion
+// callbacks and explicit kicks at enqueue + init time.
+void wm_dl_dispatch_next(dl_scheduler_t *s);
+
 // Persist an in-memory job's state + cursor + progress to the DB row.
 // Called from completion callbacks on the curl worker thread; uses
-// db_query (sync) — the worker already ate a token for this cycle and
-// the next page dispatch goes through the tick, not this thread.
+// db_query (sync). The completion callback re-enters
+// wm_dl_dispatch_next afterward to chain to the next page.
 void wm_dl_job_persist(dl_scheduler_t *s, const dl_job_t *j);
 
 // Called by a completion callback to release the in-flight slot for
