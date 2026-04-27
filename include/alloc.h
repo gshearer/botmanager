@@ -60,8 +60,16 @@ typedef struct mem_entry
   struct mem_entry *next;
 } mem_entry_t;
 
+// Hash-indexed active set. The chain through mem_entry_t.next either threads
+// a hash bucket (when the entry is active) or the freelist (when recycled).
+// Sized so chains stay short at 100k+ live allocations; iteration walks all
+// buckets so /show memory remains correct, just unordered.
+#define MEM_HASH_BITS    16
+#define MEM_HASH_BUCKETS (1u << MEM_HASH_BITS)
+#define MEM_HASH_MASK    (MEM_HASH_BUCKETS - 1u)
+
 static pthread_mutex_t mem_mutex;
-static mem_entry_t    *mem_active   = NULL;  // tracked allocations
+static mem_entry_t   **mem_buckets  = NULL;  // hash table of active allocations
 static mem_entry_t    *mem_freelist = NULL;  // recycled journal entries
 static uint64_t        mem_active_count   = 0;
 static uint64_t        mem_freelist_count = 0;

@@ -6,6 +6,16 @@
 #include "colors.h"
 #include "util.h"
 
+// Fibonacci hash on the pointer. Shifts off the 16-byte malloc alignment
+// before spreading with the golden-ratio multiplier; takes the top
+// MEM_HASH_BITS of the 64-bit product.
+static inline size_t
+mem_hash(const void *ptr)
+{
+  uintptr_t v = (uintptr_t)ptr >> 4;
+  return((size_t)((v * 0x9E3779B97F4A7C15ull) >> (64 - MEM_HASH_BITS)));
+}
+
 static mem_entry_t *
 journal_get(void)
 {
@@ -56,11 +66,12 @@ journal_put(mem_entry_t *e)
 static mem_entry_t *
 journal_remove(void *ptr)
 {
+  size_t       bucket = mem_hash(ptr);
   mem_entry_t *e, *prev = NULL;
 
   pthread_mutex_lock(&mem_mutex);
 
-  for(e = mem_active; e != NULL; prev = e, e = e->next)
+  for(e = mem_buckets[bucket]; e != NULL; prev = e, e = e->next)
   {
     if(e->ptr == ptr)
     {
@@ -68,7 +79,7 @@ journal_remove(void *ptr)
         prev->next = e->next;
 
       else
-        mem_active = e->next;
+        mem_buckets[bucket] = e->next;
 
       mem_active_count--;
       pthread_mutex_unlock(&mem_mutex);
@@ -86,7 +97,8 @@ void *
 mem_alloc(const char *module, const char *name, size_t sz)
 {
   mem_entry_t *e;
-  void *ptr;
+  void        *ptr;
+  size_t       bucket;
 
   if(!mem_ready)
   {
@@ -119,9 +131,11 @@ mem_alloc(const char *module, const char *name, size_t sz)
   strncpy(e->module, module, MEM_MODULE_SZ - 1);
   strncpy(e->name, name, MEM_NAME_SZ - 1);
 
+  bucket = mem_hash(ptr);
+
   pthread_mutex_lock(&mem_mutex);
-  e->next = mem_active;
-  mem_active = e;
+  e->next = mem_buckets[bucket];
+  mem_buckets[bucket] = e;
   mem_active_count++;
   mem_total_allocs++;
   mem_heap_sz += sz;
@@ -138,7 +152,8 @@ void *
 mem_realloc(void *ptr, size_t sz)
 {
   mem_entry_t *e;
-  void *newptr;
+  void        *newptr;
+  size_t       bucket;
 
   if(!mem_ready)
   {
@@ -175,12 +190,14 @@ mem_realloc(void *ptr, size_t sz)
     abort();
   }
 
+  bucket = mem_hash(newptr);
+
   pthread_mutex_lock(&mem_mutex);
   mem_heap_sz = mem_heap_sz - e->sz + sz;
   e->sz = sz;
   e->ptr = newptr;
-  e->next = mem_active;
-  mem_active = e;
+  e->next = mem_buckets[bucket];
+  mem_buckets[bucket] = e;
   mem_active_count++;
 
   if(mem_heap_sz > mem_peak_heap_sz)
@@ -267,8 +284,11 @@ mem_iterate(mem_iterate_cb cb, void *data)
 {
   pthread_mutex_lock(&mem_mutex);
 
-  for(mem_entry_t *e = mem_active; e != NULL; e = e->next)
-    cb(e->module, e->name, e->sz, e->timestamp, data);
+  for(size_t i = 0; i < MEM_HASH_BUCKETS; i++)
+  {
+    for(mem_entry_t *e = mem_buckets[i]; e != NULL; e = e->next)
+      cb(e->module, e->name, e->sz, e->timestamp, data);
+  }
 
   pthread_mutex_unlock(&mem_mutex);
 }
@@ -416,6 +436,17 @@ void
 mem_init(void)
 {
   pthread_mutex_init(&mem_mutex, NULL);
+
+  mem_buckets = calloc(MEM_HASH_BUCKETS, sizeof(*mem_buckets));
+
+  if(mem_buckets == NULL)
+  {
+    fprintf(stderr,
+        "[FATAL] mem_init: OOM allocating hash table (%zu bytes)\n",
+        (size_t)(MEM_HASH_BUCKETS * sizeof(*mem_buckets)));
+    abort();
+  }
+
   mem_ready = true;
   fprintf(stdout, "[INFO] mem_init: memory manager initialized\n");
 }
@@ -433,23 +464,29 @@ mem_exit(void)
 
   mem_ready = false;
 
-  // Report and free any remaining tracked allocations (leaks).
-  e = mem_active;
-
-  while(e != NULL)
+  // Walk every bucket; report and free any remaining tracked allocations.
+  for(size_t i = 0; i < MEM_HASH_BUCKETS; i++)
   {
-    next = e->next;
-    leaked++;
-    fprintf(stderr,
-        "[WARN] mem_exit: LEAK: '%s/%s' %zu bytes (allocated at %ld)\n",
-        e->module, e->name, e->sz, (long)e->timestamp);
-    mem_heap_sz -= e->sz;
-    free(e->ptr);
-    free(e);
-    e = next;
+    e = mem_buckets[i];
+
+    while(e != NULL)
+    {
+      next = e->next;
+      leaked++;
+      fprintf(stderr,
+          "[WARN] mem_exit: LEAK: '%s/%s' %zu bytes (allocated at %ld)\n",
+          e->module, e->name, e->sz, (long)e->timestamp);
+      mem_heap_sz -= e->sz;
+      free(e->ptr);
+      free(e);
+      e = next;
+    }
+
+    mem_buckets[i] = NULL;
   }
 
-  mem_active = NULL;
+  free(mem_buckets);
+  mem_buckets = NULL;
   mem_active_count = 0;
 
   // Free the freelist entries themselves.
