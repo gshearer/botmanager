@@ -19,8 +19,6 @@
 #include "coinbase.h"
 #include "exchange_api.h"
 
-#include <curl/curl.h>
-
 #include "curl.h"
 
 #include <stdio.h>
@@ -65,7 +63,7 @@ cb_exchange_curl_done(const curl_response_t *resp)
 
   if(cb != NULL)
   {
-    if(resp->curl_code == (int)CURLE_ABORTED_BY_CALLBACK)
+    if(resp->cancelled)
     {
       // Cancelled by the curl shutdown drain. Surface http_status=-1
       // so exchange_classify_status maps to FAIL (no retry); a

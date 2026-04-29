@@ -617,6 +617,7 @@ curl_finish_request(curl_request_t *req, CURLcode result)
   memset(&resp, 0, sizeof(resp));
   resp.request   = req;
   resp.curl_code = (int)result;
+  resp.cancelled = (result == CURLE_ABORTED_BY_CALLBACK);
   resp.user_data = req->cb_data;
 
   if(result == CURLE_OK)
@@ -718,6 +719,7 @@ curl_finish_cancelled(curl_request_t *req)
   memset(&resp, 0, sizeof(resp));
   resp.request   = req;
   resp.curl_code = (int)CURLE_ABORTED_BY_CALLBACK;
+  resp.cancelled = true;
   resp.user_data = req->cb_data;
   resp.error     = curl_easy_strerror(CURLE_ABORTED_BY_CALLBACK);
   resp.body      = NULL;

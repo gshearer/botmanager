@@ -43,6 +43,10 @@ typedef struct
   int             curl_code;    // CURLcode (0 = CURLE_OK)
   const char     *error;        // human-readable error (NULL on success)
   void           *user_data;    // caller's opaque pointer
+  bool            cancelled;    // true if cancelled by curl_begin_shutdown
+                                // (shutdown drain) — distinct from a
+                                // generic transport error so callers
+                                // don't re-enter the retry path
 } curl_response_t;
 
 // Invoked on the curl multi worker thread. Callbacks must be fast and
