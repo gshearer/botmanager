@@ -3,6 +3,54 @@
 #define CURL_INTERNAL
 #include "curl.h"
 
+// Submit-queue priority helpers
+
+// Map a curl_prio_t value to its sub-queue index. Index 0 drains
+// first; higher indices drain later. The defensive default keeps the
+// drain loop safe even if a request somehow carries an unknown enum
+// value — the public setter is the gate that rejects unknowns.
+static uint32_t
+curl_prio_to_idx(curl_prio_t p)
+{
+  switch(p)
+  {
+    case CURL_PRIO_TRANSACTIONAL: return(0);
+    case CURL_PRIO_NORMAL:        return(1);
+    case CURL_PRIO_BULK:          return(2);
+    default:                      return(1);
+  }
+}
+
+// Pop the head of the highest-priority non-empty sub-queue. Must be
+// called with curl_submit_mutex held. Returns NULL when every
+// sub-queue is empty.
+static curl_request_t *
+curl_submit_pop_highest(void)
+{
+  for(uint32_t i = 0; i < CURL_PRIO__COUNT; i++)
+  {
+    curl_submit_q_t *q = &curl_submit_qs[i];
+    curl_request_t  *r;
+
+    if(q->head == NULL)
+      continue;
+
+    r = q->head;
+    q->head = r->next;
+
+    if(q->head == NULL)
+      q->tail = NULL;
+
+    q->count--;
+    curl_submit_total--;
+
+    r->next = NULL;
+    return(r);
+  }
+
+  return(NULL);
+}
+
 // Request freelist helpers
 
 static curl_request_t *
@@ -253,6 +301,7 @@ curl_request_create(curl_method_t method, const char *url,
   req = curl_req_alloc();
   req->method     = method;
   req->state      = CURL_REQ_CREATED;
+  req->prio       = CURL_PRIO_NORMAL;
   req->cb         = cb;
   req->cb_data    = user_data;
   req->chunk_cb   = NULL;
@@ -383,6 +432,26 @@ curl_request_set_follow_redirects(curl_request_t *req, bool follow)
   return(SUCCESS);
 }
 
+// Set the request's submit-queue priority. CREATED-state only; rejects
+// any value not one of the named curl_prio_t constants so the drain
+// loop never has to handle stray bytes.
+// req: request handle (must be in CREATED state)
+bool
+curl_request_set_prio(curl_request_t *req, curl_prio_t prio)
+{
+  if(req == NULL || req->state != CURL_REQ_CREATED)
+    return(FAIL);
+
+  if(prio != CURL_PRIO_TRANSACTIONAL &&
+     prio != CURL_PRIO_NORMAL &&
+     prio != CURL_PRIO_BULK)
+    return(FAIL);
+
+  req->prio = prio;
+
+  return(SUCCESS);
+}
+
 // Submit a request for async execution. Thread-safe. Ownership of
 // req transfers to the curl subsystem; caller must not use it after.
 // returns: SUCCESS or FAIL (not ready, queue full, or invalid state)
@@ -402,7 +471,7 @@ curl_request_submit(curl_request_t *req)
 
   pthread_mutex_lock(&curl_submit_mutex);
 
-  if(curl_submit_count >= curl_cfg.max_queued)
+  if(curl_submit_total >= curl_cfg.max_queued)
   {
     pthread_mutex_unlock(&curl_submit_mutex);
     clam(CLAM_WARN, "curl", "submit rejected: queue full (%u)",
@@ -414,13 +483,18 @@ curl_request_submit(curl_request_t *req)
   req->state = CURL_REQ_QUEUED;
   req->next  = NULL;
 
-  if(curl_submit_tail != NULL)
-    curl_submit_tail->next = req;
-  else
-    curl_submit_head = req;
+  {
+    curl_submit_q_t *q = &curl_submit_qs[curl_prio_to_idx(req->prio)];
 
-  curl_submit_tail = req;
-  curl_submit_count++;
+    if(q->tail != NULL)
+      q->tail->next = req;
+    else
+      q->head = req;
+
+    q->tail = req;
+    q->count++;
+    curl_submit_total++;
+  }
 
   pthread_mutex_unlock(&curl_submit_mutex);
 
@@ -455,7 +529,7 @@ curl_request_submit_wait(curl_request_t *req)
 
   pthread_mutex_lock(&curl_submit_mutex);
 
-  while(curl_ready && curl_submit_count >= curl_cfg.max_queued)
+  while(curl_ready && curl_submit_total >= curl_cfg.max_queued)
     pthread_cond_wait(&curl_slot_cond, &curl_submit_mutex);
 
   if(!curl_ready)
@@ -468,13 +542,18 @@ curl_request_submit_wait(curl_request_t *req)
   req->state = CURL_REQ_QUEUED;
   req->next  = NULL;
 
-  if(curl_submit_tail != NULL)
-    curl_submit_tail->next = req;
-  else
-    curl_submit_head = req;
+  {
+    curl_submit_q_t *q = &curl_submit_qs[curl_prio_to_idx(req->prio)];
 
-  curl_submit_tail = req;
-  curl_submit_count++;
+    if(q->tail != NULL)
+      q->tail->next = req;
+    else
+      q->head = req;
+
+    q->tail = req;
+    q->count++;
+    curl_submit_total++;
+  }
 
   pthread_mutex_unlock(&curl_submit_mutex);
 
@@ -601,74 +680,35 @@ curl_finish_request(curl_request_t *req, CURLcode result)
   curl_request_release(req);
 }
 
-// Drain the submit queue: build easy handles and add to multi.
-// Re-enqueues excess requests when max_active is reached.
+// Drain the submit queue: pop pending requests highest-priority-first
+// and add them to the multi handle. Stops on capacity (max_active) or
+// empty queue. Holds curl_submit_mutex between pops; releases it
+// during per-request setup so submitters on other threads aren't
+// blocked behind the multi-handle prep.
 static void
 curl_drain_queue(void)
 {
-  // Snapshot the queue under lock.
-  curl_request_t *head;
-  uint64_t val;
-
   pthread_mutex_lock(&curl_submit_mutex);
 
-  head  = curl_submit_head;
-  curl_submit_head  = NULL;
-  curl_submit_tail  = NULL;
-  curl_submit_count = 0;
-
-  // Queue just dropped to empty — wake any blocking submitters so
-  // they can take the freshly-opened slots. Broadcast (not signal)
-  // because N waiters may race for the max_queued slots we just
-  // freed; each will re-check the count under the mutex and either
-  // enqueue or wait again.
-  pthread_cond_broadcast(&curl_slot_cond);
-
-  pthread_mutex_unlock(&curl_submit_mutex);
-
-  // Consume the eventfd so it doesn't keep firing.
-  (void)read(curl_wake_fd, &val, sizeof(val));
-
-  while(head != NULL)
+  for(;;)
   {
     curl_request_t *req;
-    CURL *easy;
-    uint32_t timeout;
-    const char *ua;
-    CURLMcode mc;
+    CURL           *easy;
+    uint32_t        timeout;
+    const char     *ua;
+    CURLMcode       mc;
 
-    req = head;
-    head = req->next;
-    req->next = NULL;
-
-    // Respect max_active: if at capacity, re-enqueue.
+    // Capacity gate: respect max_active. curl_active_count is only
+    // mutated on this (multi-loop) thread, so reading it under the
+    // submit lock is conservative but harmless.
     if(curl_active_count >= curl_cfg.max_active)
-    {
-      pthread_mutex_lock(&curl_submit_mutex);
-
-      req->next = curl_submit_head;
-      curl_submit_head = req;
-
-      if(curl_submit_tail == NULL)
-        curl_submit_tail = req;
-
-      curl_submit_count++;
-
-      // Re-enqueue remaining chain too.
-      while(head != NULL)
-      {
-        curl_request_t *r = head;
-        head = r->next;
-        r->next = NULL;
-
-        curl_submit_tail->next = r;
-        curl_submit_tail = r;
-        curl_submit_count++;
-      }
-
-      pthread_mutex_unlock(&curl_submit_mutex);
       break;
-    }
+
+    req = curl_submit_pop_highest();
+    if(req == NULL)
+      break;
+
+    pthread_mutex_unlock(&curl_submit_mutex);
 
     // Allocate response buffer (skipped when streaming without accumulation).
     if(req->accumulate)
@@ -685,6 +725,7 @@ curl_drain_queue(void)
     {
       clam(CLAM_WARN, "curl", "curl_easy_init failed for %s", req->url);
       curl_request_release(req);
+      pthread_mutex_lock(&curl_submit_mutex);
       continue;
     }
 
@@ -790,6 +831,7 @@ curl_drain_queue(void)
       curl_easy_cleanup(easy);
       req->easy = NULL;
       curl_request_release(req);
+      pthread_mutex_lock(&curl_submit_mutex);
       continue;
     }
 
@@ -798,6 +840,20 @@ curl_drain_queue(void)
 
     clam(CLAM_DEBUG2, "curl", "%s %s (active: %u)",
         curl_method_name(req->method), req->url, curl_active_count);
+
+    pthread_mutex_lock(&curl_submit_mutex);
+  }
+
+  // Wake any blocking submitters: pops above dropped curl_submit_total
+  // by however many requests we dispatched. Broadcast (not signal) so
+  // every waiter re-checks under the mutex.
+  pthread_cond_broadcast(&curl_slot_cond);
+  pthread_mutex_unlock(&curl_submit_mutex);
+
+  // Consume the eventfd so it doesn't keep firing.
+  {
+    uint64_t val;
+    (void)read(curl_wake_fd, &val, sizeof(val));
   }
 }
 
@@ -891,16 +947,32 @@ curl_multi_loop(task_t *t)
     }
   }
 
-  // Drain remaining submit queue without executing.
+  // Drain remaining submit queue without executing. Walk every
+  // sub-queue, splice into a single chain, then release outside the
+  // lock so callers blocked on curl_slot_cond wake quickly.
   {
-    curl_request_t *head;
+    curl_request_t *head = NULL;
 
     pthread_mutex_lock(&curl_submit_mutex);
 
-    head = curl_submit_head;
-    curl_submit_head  = NULL;
-    curl_submit_tail  = NULL;
-    curl_submit_count = 0;
+    for(uint32_t i = 0; i < CURL_PRIO__COUNT; i++)
+    {
+      curl_submit_q_t *q = &curl_submit_qs[i];
+
+      if(q->head == NULL)
+        continue;
+
+      // Splice this sub-queue's chain onto the front of `head`. The
+      // ordering here doesn't matter — we're shutting down.
+      q->tail->next = head;
+      head = q->head;
+
+      q->head  = NULL;
+      q->tail  = NULL;
+      q->count = 0;
+    }
+
+    curl_submit_total = 0;
 
     pthread_mutex_unlock(&curl_submit_mutex);
 
@@ -1008,7 +1080,7 @@ curl_get_stats(curl_stats_t *out)
   out->total_response_ms = curl_stat_time_ms;
 
   pthread_mutex_lock(&curl_submit_mutex);
-  out->queued = curl_submit_count;
+  out->queued = curl_submit_total;
   pthread_mutex_unlock(&curl_submit_mutex);
 }
 
@@ -1016,6 +1088,8 @@ curl_get_stats(curl_stats_t *out)
 // multi handle and not directly enumerable from outside the multi
 // loop thread, so only queued requests are yielded individually.
 // Use curl_get_stats() for aggregate active/queued counts.
+// Walks every priority sub-queue in drain order (TRANSACTIONAL first,
+// BULK last) so the resulting list reflects what would dispatch next.
 // cb: iteration callback (must be fast — submit queue lock is held)
 void
 curl_iterate_active(curl_iter_cb_t cb, void *data)
@@ -1025,8 +1099,11 @@ curl_iterate_active(curl_iter_cb_t cb, void *data)
 
   pthread_mutex_lock(&curl_submit_mutex);
 
-  for(curl_request_t *r = curl_submit_head; r != NULL; r = r->next)
-    cb(r->url, r->method, 0, data);
+  for(uint32_t i = 0; i < CURL_PRIO__COUNT; i++)
+  {
+    for(curl_request_t *r = curl_submit_qs[i].head; r != NULL; r = r->next)
+      cb(r->url, r->method, 0, data);
+  }
 
   pthread_mutex_unlock(&curl_submit_mutex);
 }

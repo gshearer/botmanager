@@ -14,6 +14,20 @@ typedef enum
   CURL_METHOD_PATCH
 } curl_method_t;
 
+// Per-request priority. Lower value = higher priority. The byte values
+// are deliberately aligned with feature_exchange's EXCHANGE_PRIO_*
+// constants so a passed-through priority byte means the same thing on
+// both sides (CURL-PRIO-3 will trickle exchange's priority straight
+// through).
+typedef enum
+{
+  CURL_PRIO_TRANSACTIONAL = 0,    // must-drain on shutdown (semantics
+                                  //   land in CURL-PRIO-2)
+  CURL_PRIO_NORMAL        = 50,   // default; recoverable on retry
+  CURL_PRIO_BULK          = 254,  // long / idempotent; first to drop
+  CURL_PRIO__COUNT        = 3
+} curl_prio_t;
+
 typedef struct curl_request curl_request_t;
 
 // Delivered to completion callback. Valid for the duration of the
@@ -76,6 +90,11 @@ bool curl_request_set_accumulate(curl_request_t *req, bool accumulate);
 // security-sensitive fetch that must not be redirected to a new
 // origin. Safe to call before submit only.
 bool curl_request_set_follow_redirects(curl_request_t *req, bool follow);
+
+// Set the request's priority. CREATED-state only. Default after
+// curl_request_create is CURL_PRIO_NORMAL. Returns FAIL if state is
+// not CREATED, or prio is not one of the named enum values.
+bool curl_request_set_prio(curl_request_t *req, curl_prio_t prio);
 
 // Thread-safe; may be called from any thread. Ownership transfers to
 // the curl subsystem -- the caller must not use req after this call.
@@ -186,6 +205,7 @@ struct curl_request
 {
   curl_method_t       method;
   curl_req_state_t    state;
+  curl_prio_t         prio;
   char                url[CURL_URL_SZ];
   uint32_t            timeout_secs;     // 0 = use default
   char                user_agent[CURL_UA_SZ]; // empty = use default
@@ -244,10 +264,19 @@ static int                curl_wake_fd      = -1;
 static bool               curl_ready        = false;
 static curl_cfg_t         curl_cfg;
 
-// Submit queue: requests added from any thread, consumed by multi loop.
-static curl_request_t    *curl_submit_head  = NULL;
-static curl_request_t    *curl_submit_tail  = NULL;
-static uint32_t           curl_submit_count = 0;
+// Submit queue: per-priority FIFO sub-queues. Drained in priority
+// order (TRANSACTIONAL first, BULK last). Indexed via
+// curl_prio_to_idx; back-pressure is global (curl_submit_total
+// against curl_cfg.max_queued).
+typedef struct
+{
+  curl_request_t *head;
+  curl_request_t *tail;
+  uint32_t        count;
+} curl_submit_q_t;
+
+static curl_submit_q_t    curl_submit_qs[CURL_PRIO__COUNT];
+static uint32_t           curl_submit_total = 0;
 static pthread_mutex_t    curl_submit_mutex;
 // Signalled whenever the submit queue's fill drops (drain thread runs,
 // subsystem shuts down) so threads blocked in curl_request_submit_wait
