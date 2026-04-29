@@ -64,7 +64,7 @@ typedef struct
   uint32_t inputs_required;
 } wm_work_bucket_t;
 
-typedef struct
+typedef struct wm_aggregator
 {
   wm_pending_bucket_t  pending_1m;
 

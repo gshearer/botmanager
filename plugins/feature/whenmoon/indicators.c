@@ -140,9 +140,17 @@ wm_indicators_compute_bar(const wm_candle_full_t *ring,
   (void)opens;   // not needed by TA-Lib calls below, but kept for VWAP-style additions
 
   // SMA family ------------------------------------------------------
+  rc = TA_SMA(0, (int)take - 1, closes, 7,
+      &beg, &nb, out);
+  bar->ind[WM_IND_SMA_7]   = wm_ta_pick_last(rc, nb, out);
+
   rc = TA_SMA(0, (int)take - 1, closes, 20,
       &beg, &nb, out);
   bar->ind[WM_IND_SMA_20]  = wm_ta_pick_last(rc, nb, out);
+
+  rc = TA_SMA(0, (int)take - 1, closes, 25,
+      &beg, &nb, out);
+  bar->ind[WM_IND_SMA_25]  = wm_ta_pick_last(rc, nb, out);
 
   rc = TA_SMA(0, (int)take - 1, closes, 50,
       &beg, &nb, out);

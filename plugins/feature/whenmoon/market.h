@@ -1,17 +1,31 @@
 // market.h — per-market state (candles, live px) for whenmoon bots.
 //
-// Internal to the whenmoon plugin. Consumers outside this plugin must
-// NOT include this header; cross-plugin access would have to go through
-// a future public `whenmoon_api.h` dlsym shim, which does not yet
-// exist. Gate: WHENMOON_INTERNAL.
+// Public to strategy plugins. The strategy ABI (whenmoon_strategy.h)
+// hands strategies a `const struct whenmoon_market *mkt` on every
+// bar / trade callback; that pointer's fields are defined here. The
+// per-grain bar rings (`grain_arr[g]`) are the supported way for a
+// strategy to read history: oldest bar at index 0, newest at
+// `grain_arr[g][grain_n[g] - 1]`. The aggregator shifts the ring
+// left on overflow, so the newest slot stays addressable as
+// `grain_n[g] - 1` always.
+//
+// Lifecycle / mutation functions further down in this header are
+// whenmoon-internal and must not be called from strategy plugins.
+// Strategies treat opaque pointers (aggregator, trade_persist) as
+// pointers they neither dereference nor free.
 
 #ifndef BM_WHENMOON_MARKET_H
 #define BM_WHENMOON_MARKET_H
 
-#ifdef WHENMOON_INTERNAL
+#include "whenmoon_strategy.h"   // wm_candle_full_t + wm_gran_t + WM_GRAN_MAX
 
+// Whenmoon-internal translation units pull the full aggregator + coinbase
+// types transitively. Strategy plugins don't define WHENMOON_INTERNAL and
+// see only the opaque forward decls below.
+#ifdef WHENMOON_INTERNAL
 #include "aggregator.h"
 #include "coinbase_api.h"
+#endif
 
 #include <pthread.h>
 #include <stdbool.h>
@@ -28,14 +42,22 @@
 // for KV path interpolation.
 #define WM_MARKET_ID_STR_SZ      64
 
-// Forward decl — defined in trade_persist.h, opaque to most callers.
+// Wire-form product id buffer (e.g. "BTC-USD"). Sized to the largest
+// exchange convention we support; coinbase uses 16 bytes (see
+// COINBASE_PRODUCT_ID_SZ in plugins/service/coinbase/coinbase_api.h).
+// Defined here so this header is independent of any exchange plugin.
+#define WM_PRODUCT_ID_SZ         16
+
+// Forward decls — opaque to strategy plugins.
 struct wm_trade_persist;
+struct wm_aggregator;
+struct coinbase_ws_sub;
 
 typedef struct whenmoon_market
 {
   // Wire-form symbol the exchange uses on the WS / REST APIs. For
   // Coinbase this is the uppercase dash form, e.g. "BTC-USD".
-  char                  product_id[COINBASE_PRODUCT_ID_SZ];
+  char                  product_id[WM_PRODUCT_ID_SZ];
 
   // Canonical id — the user-facing form, lowercase dash-joined with
   // the exchange prefix: "coinbase-btc-usd". This is what shows up in
@@ -58,10 +80,11 @@ typedef struct whenmoon_market
   uint32_t              grain_n[WM_GRAN_MAX];
   uint32_t              grain_cap[WM_GRAN_MAX];
 
-  // Owned per-market aggregator. NULL until wm_aggregator_init runs in
-  // wm_market_add; teardown via wm_aggregator_destroy in
-  // wm_market_remove / wm_market_destroy.
-  wm_aggregator_t      *aggregator;
+  // Owned per-market aggregator. Opaque to strategies (forward-decl
+  // only) — the bar rings above are the supported strategy surface.
+  // NULL until wm_aggregator_init runs in wm_market_add; teardown via
+  // wm_aggregator_destroy in wm_market_remove / wm_market_destroy.
+  struct wm_aggregator *aggregator;
 
   // Buffered trade-persist ring. Allocated by wm_trade_persist_init
   // from wm_market_add; freed by wm_trade_persist_destroy.
@@ -78,15 +101,16 @@ typedef struct whenmoon_market
 
 struct whenmoon_markets
 {
-  whenmoon_market_t    *arr;       // n_markets live, `cap` allocated
-  uint32_t              n_markets;
-  uint32_t              cap;
+  whenmoon_market_t       *arr;       // n_markets live, `cap` allocated
+  uint32_t                 n_markets;
+  uint32_t                 cap;
 
   // One shared WebSocket subscription covering every product_id +
   // {HEARTBEAT, TICKER, MATCHES}. NULL when n_markets == 0 or
   // coinbase_ws_subscribe failed at resub time. Rebuilt on every
   // add/remove via coinbase_ws_unsubscribe + coinbase_ws_subscribe.
-  coinbase_ws_sub_t    *ws_sub;
+  // Opaque to strategy plugins.
+  struct coinbase_ws_sub  *ws_sub;
 };
 
 // Forward decl to keep this header independent of whenmoon.h.
@@ -159,9 +183,14 @@ bool wm_market_parse_id(const char *id,
 void wm_market_format_id(const char *exchange, const char *base,
     const char *quote, char *out, size_t out_sz);
 
+// Coinbase-callback hooks — whenmoon-internal. Gated so strategy
+// plugins don't pull in coinbase types just by including market.h.
+#ifdef WHENMOON_INTERNAL
+
 // Async callback invoked by coinbase on backfill completion. `user` is
 // a heap-owned wm_market_backfill_ctx_t* that the callback frees.
-void wm_market_on_candles(const coinbase_candles_result_t *res, void *user);
+void wm_market_on_candles(const coinbase_candles_result_t *res,
+    void *user);
 
 // WebSocket event fanout — one handler shared across every product.
 // `user` is the whenmoon_state_t*. Invoked on the coinbase WS reader

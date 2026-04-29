@@ -57,7 +57,7 @@ extern "C" {
 // here so strategy plugins do not need an include path into the
 // internal whenmoon directory.
 
-#define WM_INDICATOR_SCHEMA_VERSION  1
+#define WM_INDICATOR_SCHEMA_VERSION  2
 
 typedef enum
 {
@@ -143,9 +143,16 @@ enum
   WM_IND_UPPER_WICK_PCT,
   WM_IND_LOWER_WICK_PCT,
 
-  // reserved (15 slots) — append new indicators here so existing slot
-  // ids stay stable. Bump WM_INDICATOR_SCHEMA_VERSION on any change.
+  // reserved — append new indicators here so existing slot ids stay
+  // stable. Bump WM_INDICATOR_SCHEMA_VERSION on any change.
   WM_IND_RESERVED_BASE,
+
+  // Schema v2 additions (2026-04-29): short-period SMAs for prototype
+  // strategies that want fast/slow crossovers without rolling their
+  // own ring. The aggregator computes these once per bar close on
+  // every grain.
+  WM_IND_SMA_7  = WM_IND_RESERVED_BASE,
+  WM_IND_SMA_25,
 
   WM_IND_COUNT = 50
 };
