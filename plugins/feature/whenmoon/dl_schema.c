@@ -104,6 +104,32 @@ static const char *const wm_dl_ddl_core[] = {
 
   "CREATE INDEX IF NOT EXISTS idx_wm_job_state"
   " ON wm_download_job(state, created)",
+
+  // Backtest run history (WM-LT-5). One row per single-iteration
+  // backtest. params and metrics carry full JSONB blobs; the surface-
+  // level columns (n_trades, realized_pnl, sharpe, ...) are denormalised
+  // for cheap ranked listings via /show whenmoon backtest list.
+  "CREATE TABLE IF NOT EXISTS wm_backtest_run ("
+  " run_id        BIGSERIAL    PRIMARY KEY,"
+  " market_id     INT          NOT NULL,"
+  " strategy_name VARCHAR(64)  NOT NULL,"
+  " range_start   TIMESTAMPTZ  NOT NULL,"
+  " range_end     TIMESTAMPTZ  NOT NULL,"
+  " bars_replayed INT          NOT NULL,"
+  " n_trades      INT          NOT NULL,"
+  " realized_pnl  DOUBLE PRECISION NOT NULL,"
+  " final_equity  DOUBLE PRECISION NOT NULL,"
+  " max_drawdown  DOUBLE PRECISION NOT NULL,"
+  " sharpe        DOUBLE PRECISION NOT NULL,"
+  " sortino       DOUBLE PRECISION NOT NULL,"
+  " wallclock_ms  BIGINT       NOT NULL,"
+  " params        JSONB,"
+  " metrics       JSONB        NOT NULL,"
+  " created_at    TIMESTAMPTZ  NOT NULL DEFAULT NOW()"
+  ")",
+
+  "CREATE INDEX IF NOT EXISTS idx_wm_backtest_run_market"
+  " ON wm_backtest_run(market_id, strategy_name, created_at DESC)",
 };
 
 // ------------------------------------------------------------------ //

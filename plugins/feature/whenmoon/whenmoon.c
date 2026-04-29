@@ -3,12 +3,14 @@
 
 #define WHENMOON_INTERNAL
 #include "whenmoon.h"
+#include "backtest.h"
 #include "market.h"
 #include "account.h"
 #include "dl_schema.h"
 #include "dl_jobtable.h"
 #include "dl_commands.h"
 #include "market_cmds.h"
+#include "order.h"
 #include "strategy.h"
 #include "trade_persist.h"
 
@@ -203,9 +205,10 @@ static void
 whenmoon_root_cb(const cmd_ctx_t *ctx)
 {
   cmd_reply(ctx,
-      "usage: /whenmoon <market|download|strategy> ..."
+      "usage: /whenmoon <market|download|strategy|trade|backtest> ..."
       " (market start|stop, download trades|candles|cancel,"
-      " strategy attach|detach|reload)");
+      " strategy attach|detach|reload, trade mode|reset,"
+      " backtest run)");
 }
 
 static void
@@ -213,8 +216,8 @@ whenmoon_show_root_cb(const cmd_ctx_t *ctx)
 {
   cmd_reply(ctx,
       "usage: /show whenmoon"
-      " <markets|balances|indicators|download|strategy> ..."
-      " (download has subverbs: status, gaps, candles)");
+      " <markets|balances|indicators|download|strategy|trade|backtest>"
+      " ... (download has subverbs: status, gaps, candles)");
 }
 
 // ------------------------------------------------------------------ //
@@ -284,8 +287,11 @@ whenmoon_subsystems_destroy(whenmoon_state_t *st)
 
   // Mirror the order from the previous per-bot teardown: strategies
   // first (they may hold dispatch references into market state), then
-  // job table, downloader DDL flag, markets, account.
+  // job table, downloader DDL flag, markets, account. The trade engine
+  // is plugin-global and outlives subsystems by a hair so any final
+  // strategy-detach paths can drop their books cleanly.
   wm_strategy_registry_destroy(st);
+  wm_trade_engine_destroy();
   wm_dl_jobtable_destroy(st);
   wm_dl_destroy(st);
   wm_market_destroy(st);
@@ -358,6 +364,16 @@ whenmoon_init(void)
     goto fail;
   }
 
+  // WM-LT-4: trade engine. Plugin-global registry of (market, strategy)
+  // trade books. Init order: after the strategy registry so the detach
+  // hooks have somewhere to call into; before verb registration so the
+  // /whenmoon trade … verbs find an initialized engine.
+  if(wm_trade_engine_init() != SUCCESS)
+  {
+    clam(CLAM_INFO, WHENMOON_CTX, "wm_trade_engine_init failed");
+    goto fail;
+  }
+
   if(whenmoon_register_root_verbs() != SUCCESS)
   {
     clam(CLAM_INFO, WHENMOON_CTX, "root verb registration failed");
@@ -385,6 +401,23 @@ whenmoon_init(void)
   if(wm_strategy_register_verbs() != SUCCESS)
   {
     clam(CLAM_INFO, WHENMOON_CTX, "strategy verb registration failed");
+    goto fail;
+  }
+
+  if(wm_trade_register_verbs() != SUCCESS)
+  {
+    clam(CLAM_INFO, WHENMOON_CTX, "trade verb registration failed");
+    goto fail;
+  }
+
+  // WM-LT-5: backtest verbs. Registered after the trade engine + strategy
+  // verbs so cmd_register's parent path ("whenmoon") and sibling
+  // resolution see a steady state. The backtest runtime relies on the
+  // strategy registry + trade engine + downloader DDL, all of which
+  // are already initialised by this point.
+  if(wm_backtest_register_verbs() != SUCCESS)
+  {
+    clam(CLAM_INFO, WHENMOON_CTX, "backtest verb registration failed");
     goto fail;
   }
 
@@ -434,7 +467,7 @@ whenmoon_deinit(void)
 const plugin_desc_t bm_plugin_desc = {
   .api_version          = PLUGIN_API_VERSION,
   .name                 = "whenmoon",
-  .version              = "0.5-lt3",
+  .version              = "0.7-lt5",
   .type                 = PLUGIN_FEATURE,
   .kind                 = "whenmoon",
   .provides             = { { .name = "feature_whenmoon" } },

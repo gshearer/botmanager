@@ -80,6 +80,11 @@ typedef struct
 
   // index 0 (1m) has no upstream and is unused.
   wm_work_bucket_t  work[WM_GRAN_MAX];
+
+  // WM-LT-5: when false, wm_aggregator_push_bar skips the live strategy
+  // fan-out. Backtest snapshot construction sets this off so warmup
+  // bars don't trigger live attachments. Default true for live markets.
+  bool  dispatch_strategies;
 } wm_aggregator_t;
 
 // Default history requirement until WM-LT-3 lets strategies declare it.

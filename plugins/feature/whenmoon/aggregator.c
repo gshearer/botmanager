@@ -79,7 +79,8 @@ wm_aggregator_init(whenmoon_market_t *mk, uint32_t history_1d_min)
     return(FAIL);
 
   memset(a, 0, sizeof(*a));
-  a->history_1d = history_1d_min;
+  a->history_1d           = history_1d_min;
+  a->dispatch_strategies  = true;
 
   // memory: 200 days x 1440 bars x sizeof(wm_candle_full_t) (~280 B)
   // = ~80 MB per market for the 1m grain alone. All six grains together
@@ -361,6 +362,11 @@ wm_aggregator_push_bar(whenmoon_market_t *mk, wm_gran_t gran,
   // Strategy fan-out — fed the just-pushed bar (now in the ring at
   // index n, with indicators populated). Cheap when no strategies are
   // attached; the registry iterates a tiny list under its lock.
+  // WM-LT-5: backtest snapshot construction flips dispatch_strategies
+  // off so warmup bars don't fire live attachments.
+  if(!mk->aggregator->dispatch_strategies)
+    return;
+
   st = whenmoon_get_state();
 
   if(st != NULL)

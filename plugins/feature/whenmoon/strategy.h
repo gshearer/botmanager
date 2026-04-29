@@ -78,6 +78,15 @@ struct wm_strategy_ctx
   int64_t               last_bar_ts_ms;
   wm_strategy_signal_t  last_signal;
   bool                  has_last_signal;
+
+  // WM-LT-4: cached mark for the trade engine. Populated on every
+  // bar-close (bar->close / bar->ts_close_ms) and trade-tick
+  // (trade->price / trade->ts_ms) dispatch right before the
+  // strategy callback runs. wm_strategy_emit_signal_impl reads
+  // these so the signal handler does not need its own market lock
+  // to find the mark.
+  double                last_mark_px;
+  int64_t               last_mark_ms;
 };
 
 // -----------------------------------------------------------------------

@@ -23,6 +23,7 @@
 #include "strategy.h"
 
 #include "market.h"
+#include "order.h"
 #include "whenmoon.h"
 
 #include "alloc.h"
@@ -298,6 +299,13 @@ wm_strategy_emit_signal_impl(wm_strategy_ctx_t *ctx,
   ctx->last_signal       = *sig;
   ctx->has_last_signal   = true;
   ctx->signals_emitted++;
+
+  // WM-LT-4: route the signal to the trade engine. The engine looks up
+  // the (market, strategy) trade book; no-op when no book exists or
+  // mode == OFF, so a strategy that emits without anyone having
+  // configured a trade mode stays purely informational.
+  wm_trade_engine_on_signal(ctx->market_id_str, ctx->strategy_name,
+      ctx->last_mark_px, ctx->last_mark_ms, sig);
 }
 
 void
@@ -923,6 +931,12 @@ wm_strategy_detach(whenmoon_state_t *st,
 
   pthread_mutex_unlock(&reg->lock);
 
+  // WM-LT-4: drop the matching trade book (no-op if no /whenmoon trade
+  // verb was ever issued for this attachment). Outside the registry
+  // lock so the trade engine never inverts strategy_registry ->
+  // trade_registry.
+  wm_trade_book_remove(market_id_str, strategy_name);
+
   clam(CLAM_INFO, WHENMOON_CTX,
       "strategy detach: %s -> %s", strategy_name, market_id_str);
 
@@ -972,6 +986,11 @@ wm_strategy_detach_market(whenmoon_state_t *st,
   }
 
   pthread_mutex_unlock(&reg->lock);
+
+  // WM-LT-4: drop every trade book bound to this market. Mirrors the
+  // attachment auto-detach so a market stop tears down both layers
+  // atomically (from the operator's perspective).
+  wm_trade_books_remove_market(market_id_str);
 
   if(n_detached > 0)
     clam(CLAM_INFO, WHENMOON_CTX,
@@ -1190,6 +1209,12 @@ wm_strategy_dispatch_bar(whenmoon_state_t *st,
       att->ctx.bars_seen++;
       att->ctx.last_bar_ts_ms   = bar->ts_close_ms;
 
+      // WM-LT-4: cache the mark for the trade engine. Bar close is
+      // the natural mark for a bar-close-driven signal; the engine
+      // reads this from the ctx if the strategy emits a signal.
+      att->ctx.last_mark_px = bar->close;
+      att->ctx.last_mark_ms = bar->ts_close_ms;
+
       // The callback may emit a signal via wm_strategy_emit_signal,
       // which writes to att->ctx.last_signal in place. The "be fast"
       // contract keeps this hold time bounded.
@@ -1227,6 +1252,11 @@ wm_strategy_dispatch_trade(whenmoon_state_t *st,
         continue;
 
       att->ctx.mkt = mkt;
+
+      // WM-LT-4: trade-tick mark for the trade engine.
+      att->ctx.last_mark_px = trade->price;
+      att->ctx.last_mark_ms = trade->ts_ms;
+
       ls->on_trade_fn(&att->ctx, mkt, trade);
     }
   }
