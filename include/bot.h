@@ -19,8 +19,7 @@ typedef enum
 typedef struct bot_inst bot_inst_t;
 
 // Functions a bot-behaviour plugin must implement. Stored in
-// plugin_desc_t.ext for PLUGIN_METHOD plugins (chat, command) and
-// PLUGIN_FEATURE plugins (whenmoon).
+// plugin_desc_t.ext for PLUGIN_METHOD plugins (chat, command).
 typedef struct
 {
   const char *name;

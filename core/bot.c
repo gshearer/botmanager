@@ -1717,9 +1717,6 @@ bot_register_driver_kv(const char *botname, const char *bot_kind)
 
   pd = plugin_find_type(PLUGIN_METHOD, bot_kind);
 
-  if(pd == NULL)
-    pd = plugin_find_type(PLUGIN_FEATURE, bot_kind);
-
   if(pd == NULL || pd->kv_inst_schema == NULL ||
      pd->kv_inst_schema_count == 0)
     return(0);
@@ -1827,16 +1824,13 @@ bot_restore_instances(char auto_names[][BOT_NAME_SZ],
     if(name == NULL || kind == NULL)
       continue;
 
-    // Find the method or feature plugin by kind.
+    // Find the method plugin by kind.
     pd = plugin_find_type(PLUGIN_METHOD, kind);
-
-    if(pd == NULL)
-      pd = plugin_find_type(PLUGIN_FEATURE, kind);
 
     if(pd == NULL || pd->ext == NULL)
     {
       clam(CLAM_WARN, "bot_restore",
-          "'%s': no bot plugin with kind '%s'", name, kind);
+          "'%s': no method plugin with kind '%s'", name, kind);
       continue;
     }
 

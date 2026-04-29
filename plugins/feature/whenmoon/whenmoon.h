@@ -18,9 +18,10 @@
 
 // Forward decls — the full structs live in market.h / account.h, both
 // WHENMOON_INTERNAL-gated, and are only visible inside the plugin.
-typedef struct whenmoon_markets whenmoon_markets_t;
-typedef struct whenmoon_account whenmoon_account_t;
-typedef struct dl_jobtable      dl_jobtable_t;
+typedef struct whenmoon_markets        whenmoon_markets_t;
+typedef struct whenmoon_account        whenmoon_account_t;
+typedef struct dl_jobtable             dl_jobtable_t;
+typedef struct wm_strategy_registry    wm_strategy_registry_t;
 
 // Plugin-global singleton state. Allocated in whenmoon_init, freed in
 // whenmoon_deinit. Markets, account, and downloader are now plugin-
@@ -42,6 +43,11 @@ typedef struct whenmoon_state
   // feature_exchange; this struct is purely the job list + concurrency
   // cap.
   dl_jobtable_t      *downloader;
+
+  // WM-LT-3: strategy registry. Tracks loaded PLUGIN_STRATEGY plugins
+  // and their per-(market, strategy) attachments. Bar-close fan-out
+  // from aggregator.c routes through here.
+  wm_strategy_registry_t *strategies;
 } whenmoon_state_t;
 
 // Plugin-global singleton accessor. Returns NULL before whenmoon_init

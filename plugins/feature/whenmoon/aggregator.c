@@ -18,6 +18,7 @@
 #include "dl_schema.h"
 #include "indicators.h"
 #include "market.h"
+#include "strategy.h"
 #include "whenmoon.h"
 
 #include "db.h"
@@ -292,7 +293,6 @@ wm_aggregator_close_1m(whenmoon_market_t *mk)
 static void
 wm_aggregator_emit_empty_1m(whenmoon_market_t *mk, int64_t bar_start_ms)
 {
-  wm_aggregator_t  *a = mk->aggregator;
   wm_candle_full_t  bar;
   double            prev_close = 0.0;
   uint32_t          n;
@@ -319,8 +319,6 @@ wm_aggregator_emit_empty_1m(whenmoon_market_t *mk, int64_t bar_start_ms)
   if(mk->grain_n[WM_GRAN_1M] > 0)
     wm_aggregator_cascade_to(mk, WM_GRAN_5M,
         &mk->grain_arr[WM_GRAN_1M][mk->grain_n[WM_GRAN_1M] - 1]);
-
-  (void)a;
 }
 
 // ------------------------------------------------------------------ //
@@ -329,7 +327,13 @@ wm_aggregator_emit_empty_1m(whenmoon_market_t *mk, int64_t bar_start_ms)
 
 // Append `bar` to grain_arr[gran], shifting the ring left by one if at
 // capacity (so newest is always at grain_n[gran]-1). Then run the
-// TA-Lib indicator pass for that bar.
+// TA-Lib indicator pass for that bar and fan the closed bar out to
+// every attached strategy whose grains_mask includes `gran`.
+//
+// The strategy fan-out runs under both mk->lock (already held by the
+// caller) and the strategy registry lock. Lock order is enforced
+// market_lock -> registry_lock; strategy admin commands take only
+// the registry lock so the order is consistent.
 static void
 wm_aggregator_push_bar(whenmoon_market_t *mk, wm_gran_t gran,
     const wm_candle_full_t *bar)
@@ -337,6 +341,7 @@ wm_aggregator_push_bar(whenmoon_market_t *mk, wm_gran_t gran,
   wm_candle_full_t *ring = mk->grain_arr[gran];
   uint32_t          cap  = mk->grain_cap[gran];
   uint32_t          n    = mk->grain_n[gran];
+  whenmoon_state_t *st;
 
   if(ring == NULL || cap == 0 || bar == NULL)
     return;
@@ -352,6 +357,14 @@ wm_aggregator_push_bar(whenmoon_market_t *mk, wm_gran_t gran,
   mk->aggregator->last_close_ms[gran] = bar->ts_close_ms;
 
   wm_indicators_compute_bar(ring, n + 1, n);
+
+  // Strategy fan-out — fed the just-pushed bar (now in the ring at
+  // index n, with indicators populated). Cheap when no strategies are
+  // attached; the registry iterates a tiny list under its lock.
+  st = whenmoon_get_state();
+
+  if(st != NULL)
+    wm_strategy_dispatch_bar(st, mk, gran, &ring[n]);
 }
 
 // ------------------------------------------------------------------ //

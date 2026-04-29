@@ -1,10 +1,5 @@
 // botmanager — MIT
 // whenmoon trading plugin (PLUGIN_FEATURE, kind: whenmoon).
-//
-// WM-G1: globalized — markets, account, and downloader are plugin-
-// scoped singletons. The bot_driver_t vtable is preserved as a shell
-// so `bot add wm whenmoon` still works under the REN-1 PLUGIN_FEATURE
-// fallback, but every callback is trivial; per-bot state went away.
 
 #define WHENMOON_INTERNAL
 #include "whenmoon.h"
@@ -14,6 +9,7 @@
 #include "dl_jobtable.h"
 #include "dl_commands.h"
 #include "market_cmds.h"
+#include "strategy.h"
 #include "trade_persist.h"
 
 #include "cmd.h"
@@ -40,11 +36,6 @@ whenmoon_get_state(void)
   return(whenmoon_state);
 }
 
-// Sentinel handle returned by whenmoon_create. The bot driver no longer
-// owns any state, but bot_inst_t expects a non-NULL handle to flag a
-// successful create. Address-stable + harmless to "free".
-static int whenmoon_bot_handle_sentinel;
-
 // ------------------------------------------------------------------ //
 // Plugin-global KV schema                                             //
 // ------------------------------------------------------------------ //
@@ -63,57 +54,6 @@ static const plugin_kv_entry_t whenmoon_plugin_schema[] = {
     " throughput. EX-1: rate-limit knobs now live under"
     " plugin.exchange.<name>.rate_limit_rps.",
     NULL, NULL },
-};
-
-// ------------------------------------------------------------------ //
-// Bot driver shell                                                    //
-// ------------------------------------------------------------------ //
-//
-// Markets/account/downloader live on the plugin singleton, not per-bot.
-// The driver still exists so `bot add wm whenmoon` works under the
-// REN-1 PLUGIN_METHOD->PLUGIN_FEATURE fallback in core/bot.c, but the
-// callbacks carry no state.
-
-static void *
-whenmoon_create(bot_inst_t *inst)
-{
-  (void)inst;
-  return(&whenmoon_bot_handle_sentinel);
-}
-
-static void
-whenmoon_destroy(void *handle)
-{
-  (void)handle;
-}
-
-static bool
-whenmoon_start_cb(void *handle)
-{
-  (void)handle;
-  return(SUCCESS);
-}
-
-static void
-whenmoon_stop_cb(void *handle)
-{
-  (void)handle;
-}
-
-static void
-whenmoon_on_message(void *handle, const method_msg_t *msg)
-{
-  (void)handle;
-  (void)msg;
-}
-
-static const bot_driver_t whenmoon_driver = {
-  .name       = "whenmoon",
-  .create     = whenmoon_create,
-  .destroy    = whenmoon_destroy,
-  .start      = whenmoon_start_cb,
-  .stop       = whenmoon_stop_cb,
-  .on_message = whenmoon_on_message,
 };
 
 // ------------------------------------------------------------------ //
@@ -263,15 +203,17 @@ static void
 whenmoon_root_cb(const cmd_ctx_t *ctx)
 {
   cmd_reply(ctx,
-      "usage: /whenmoon <market|download> ..."
-      " (subcommands: market start|stop, download trades|candles|cancel)");
+      "usage: /whenmoon <market|download|strategy> ..."
+      " (market start|stop, download trades|candles|cancel,"
+      " strategy attach|detach|reload)");
 }
 
 static void
 whenmoon_show_root_cb(const cmd_ctx_t *ctx)
 {
   cmd_reply(ctx,
-      "usage: /show whenmoon <markets|balances|indicators|download> ..."
+      "usage: /show whenmoon"
+      " <markets|balances|indicators|download|strategy> ..."
       " (download has subverbs: status, gaps, candles)");
 }
 
@@ -285,10 +227,10 @@ whenmoon_register_root_verbs(void)
   // /whenmoon — state-changing parent.
   if(cmd_register("whenmoon", "whenmoon",
         "whenmoon <subcommand> ...",
-        "Whenmoon market + downloader controls.",
-        "Subcommands: market, download.",
+        "Whenmoon market + downloader + strategy controls.",
+        "Subcommands: market, download, strategy.",
         USERNS_GROUP_ADMIN, 100, CMD_SCOPE_ANY, METHOD_T_ANY,
-        whenmoon_root_cb, NULL, NULL, NULL,
+        whenmoon_root_cb, NULL, NULL, "wm",
         NULL, 0, NULL, NULL) != SUCCESS)
     return(FAIL);
 
@@ -297,9 +239,9 @@ whenmoon_register_root_verbs(void)
   if(cmd_register("whenmoon", "whenmoon",
         "show whenmoon <subcommand> ...",
         "Whenmoon read-only state.",
-        "Subcommands: markets, balances, indicators, download.",
+        "Subcommands: markets, balances, indicators, download, strategy.",
         USERNS_GROUP_ADMIN, 100, CMD_SCOPE_ANY, METHOD_T_ANY,
-        whenmoon_show_root_cb, NULL, "show", NULL,
+        whenmoon_show_root_cb, NULL, "show", "wm",
         NULL, 0, NULL, NULL) != SUCCESS)
     return(FAIL);
 
@@ -340,8 +282,10 @@ whenmoon_subsystems_destroy(whenmoon_state_t *st)
   if(st == NULL)
     return;
 
-  // Mirror the order from the previous per-bot teardown: job table
-  // before downloader DDL flag, markets, account.
+  // Mirror the order from the previous per-bot teardown: strategies
+  // first (they may hold dispatch references into market state), then
+  // job table, downloader DDL flag, markets, account.
+  wm_strategy_registry_destroy(st);
   wm_dl_jobtable_destroy(st);
   wm_dl_destroy(st);
   wm_market_destroy(st);
@@ -408,6 +352,12 @@ whenmoon_init(void)
     goto fail;
   }
 
+  if(wm_strategy_registry_init(st) != SUCCESS)
+  {
+    clam(CLAM_INFO, WHENMOON_CTX, "wm_strategy_registry_init failed");
+    goto fail;
+  }
+
   if(whenmoon_register_root_verbs() != SUCCESS)
   {
     clam(CLAM_INFO, WHENMOON_CTX, "root verb registration failed");
@@ -431,6 +381,17 @@ whenmoon_init(void)
     clam(CLAM_INFO, WHENMOON_CTX, "market verb registration failed");
     goto fail;
   }
+
+  if(wm_strategy_register_verbs() != SUCCESS)
+  {
+    clam(CLAM_INFO, WHENMOON_CTX, "strategy verb registration failed");
+    goto fail;
+  }
+
+  // Discover strategies that the core loader has already brought up.
+  // This is idempotent and safe even when zero strategy plugins are
+  // present (the iteration finds no PLUGIN_STRATEGY records).
+  wm_strategy_registry_scan(st);
 
   // Restore last; logs but does not fail init if the DB query errors.
   if(wm_market_restore(st) != SUCCESS)
@@ -473,7 +434,7 @@ whenmoon_deinit(void)
 const plugin_desc_t bm_plugin_desc = {
   .api_version          = PLUGIN_API_VERSION,
   .name                 = "whenmoon",
-  .version              = "0.4-ex1",
+  .version              = "0.5-lt3",
   .type                 = PLUGIN_FEATURE,
   .kind                 = "whenmoon",
   .provides             = { { .name = "feature_whenmoon" } },
@@ -492,5 +453,5 @@ const plugin_desc_t bm_plugin_desc = {
   .start                = NULL,
   .stop                 = NULL,
   .deinit               = whenmoon_deinit,
-  .ext                  = &whenmoon_driver,
+  .ext                  = NULL,
 };

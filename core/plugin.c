@@ -695,7 +695,7 @@ plugin_type_name(plugin_type_t t)
     case PLUGIN_MISC:        return("misc");
     case PLUGIN_PERSONALITY: return("personality");
     case PLUGIN_FEATURE:     return("feature");
-    case PLUGIN_EXCHANGE:    return("exchange");
+    case PLUGIN_STRATEGY:    return("strategy");
   }
 
   return("unknown");

@@ -21,7 +21,7 @@
 // future strategy engine) only ever call the four public functions
 // declared below.
 //
-// Shim shape mirrors plugins/exchange/coinbase/coinbase_api.h: per-
+// Shim shape mirrors plugins/service/coinbase/coinbase_api.h: per-
 // symbol atomic cache guard, union to launder void*↔function-pointer
 // conversion, FATAL + abort on a dlsym miss (which implies a broken
 // plugin-dependency graph).
@@ -111,7 +111,7 @@ typedef struct
 // Real function declarations — visible only inside the exchange
 // plugin (where EXCHANGE_INTERNAL is defined). External consumers go
 // through the static-inline dlsym shims defined further down. Pattern
-// matches plugins/exchange/coinbase/coinbase_api.h.
+// matches plugins/service/coinbase/coinbase_api.h.
 // ------------------------------------------------------------------
 
 #ifdef EXCHANGE_INTERNAL

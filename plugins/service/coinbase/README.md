@@ -1,6 +1,6 @@
 # coinbase — Coinbase Exchange Plugin
 
-Exchange-protocol plugin (`PLUGIN_EXCHANGE`) for the Coinbase Exchange
+Service plugin (`PLUGIN_SERVICE`) for the Coinbase Exchange
 (the former Coinbase Pro / GDAX product, not Advanced Trade or Prime).
 Exposes a mechanism API over both REST and a WebSocket feed so
 consumers — `plugins/feature/whenmoon/`, future `plugins/cmd/coinbase/`
@@ -8,13 +8,12 @@ command surfaces, other internal callers — can access products,
 candles, live trades, order books, accounts, and place orders without
 knowing how Coinbase authentication or streaming works.
 
-## EX-1 layout (post-migration)
+## Layout
 
-This plugin moved from `plugins/service/coinbase/` to
-`plugins/exchange/coinbase/` in the EX-1 chunk. Type changed from
-`PLUGIN_SERVICE` to `PLUGIN_EXCHANGE`; provides changed from
-`service_coinbase` to `exchange_coinbase`; a hard `requires` on
-`feature_exchange` was added so the abstraction is up before init.
+`plugins/service/coinbase/` (`PLUGIN_SERVICE`, kind `coinbase`).
+Provides the `exchange_coinbase` capability tag. A hard `requires`
+on `feature_exchange` ensures the dispatch abstraction is up before
+this plugin's init runs.
 
 Candle + trade traffic now routes through the feature_exchange
 priority queue + token bucket via `cb_exchange_register_vtable()` in

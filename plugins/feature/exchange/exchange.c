@@ -1,12 +1,12 @@
 // botmanager — MIT
 // feature_exchange plugin: cross-exchange dispatch abstraction.
 //
-// EX-1: owns the priority queue, token bucket, and 429/5xx retry policy
-// for every PLUGIN_EXCHANGE plugin. Coinbase moved to plugins/exchange/
-// coinbase/ in this same chunk and self-registers via
-// exchange_register("coinbase", &cb_vtable) at its own init time. The
+// Owns the priority queue, token bucket, and 429/5xx retry policy for
+// every service plugin that provides an exchange interface. Each such
+// plugin (e.g. plugins/service/coinbase/) self-registers via
+// exchange_register("<name>", &vtable) at its own init time. The
 // abstraction's only job at init is to stand up the registry + KV
-// schema; protocol plugins do their own bookkeeping.
+// schema; provider plugins do their own bookkeeping.
 
 #define EXCHANGE_INTERNAL
 #include "exchange.h"

@@ -62,12 +62,11 @@ Expected subsystems, each growing as one or a few source files:
 
 Exchange REST/WS adapters are **not** part of this plugin. Each
 exchange (Coinbase first, Kraken + Gemini later) lives as its own
-`plugins/exchange/<kind>/` plugin exposing a `<kind>_api.h` dlsym-shim
-header, consumed here via `.requires`. EX-1 added a thin abstraction
-plugin `plugins/feature/exchange/` that owns rate-limited dispatch
-across every exchange-protocol plugin; whenmoon's downloader routes
-through `coinbase_fetch_*_async`, which routes through
-`exchange_request()`.
+`plugins/service/<kind>/` plugin exposing a `<kind>_api.h` dlsym-shim
+header, consumed here via `.requires`. The `plugins/feature/exchange/`
+abstraction owns rate-limited dispatch across every exchange-providing
+service; whenmoon's downloader routes through `coinbase_fetch_*_async`,
+which routes through `exchange_request()`.
 
 User-facing commands registered into the unified command tree stay
 inside this plugin rather than a sibling `plugins/cmd/whenmoon/`,
@@ -85,11 +84,10 @@ the chat method follows for `/dossier`, `/memory`, `/llm`.
 | Home directory | `plugins/feature/whenmoon/` |
 | Shared library | `libwhenmoon.so` |
 
-Downward-only dependencies apply (core + service + exchange +
-inference). No includes or `plugin_dlsym` into other
-`plugins/feature/*/` or `plugins/method/*/` plugins; no upward
-references from `plugins/service/*/`, `plugins/exchange/*/`, or
-`plugins/protocol/*/` into this directory.
+Downward-only dependencies apply (core + service + inference). No
+includes or `plugin_dlsym` into other `plugins/feature/*/` or
+`plugins/method/*/` plugins; no upward references from
+`plugins/service/*/` or `plugins/protocol/*/` into this directory.
 
 ## External Dependencies (planned, not yet wired)
 

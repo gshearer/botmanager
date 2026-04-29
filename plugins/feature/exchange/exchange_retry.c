@@ -1,6 +1,6 @@
 // botmanager — MIT
 // HTTP status classification + exponential backoff schedule used by the
-// exchange dispatch loop. Generalised from plugins/exchange/coinbase/
+// exchange dispatch loop. Generalised from plugins/service/coinbase/
 // coinbase_rest.c::cb_classify_http (which was Coinbase-specific in
 // wording only — the policy is the same: 429/5xx retry, 4xx-other surface).
 

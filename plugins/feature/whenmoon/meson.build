@@ -7,6 +7,11 @@ candle_upsample_sql_h = custom_target(
              '@INPUT@', '@OUTPUT@'],
 )
 
+# Exported for strategy plugins (PLUGIN_STRATEGY) so they can find
+# whenmoon_strategy.h — the public ABI header that publishes the
+# bar / grain / indicator types and the dlsym shim helpers.
+whenmoon_include = include_directories('.')
+
 whenmoon_plugin = shared_library('whenmoon',
   'whenmoon.c',
   'market.c',
@@ -23,11 +28,12 @@ whenmoon_plugin = shared_library('whenmoon',
   'dl_commands.c',
   'market_cmds.c',
   'strategy.c',
+  'strategy_cmds.c',
   candle_upsample_sql_h,
   include_directories : [
     inc_include,
-    include_directories('.'),
-    include_directories('../../exchange/coinbase'),
+    whenmoon_include,
+    include_directories('../../service/coinbase'),
     include_directories('../exchange'),
   ],
   dependencies : [

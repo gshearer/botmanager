@@ -107,7 +107,7 @@ const plugin_desc_t bm_plugin_desc = {
   .api_version     = PLUGIN_API_VERSION,
   .name            = "coinbase",
   .version         = "0.2-ex1",
-  .type            = PLUGIN_EXCHANGE,
+  .type            = PLUGIN_SERVICE,
   .kind            = "coinbase",
   .provides        = { { .name = "exchange_coinbase" } },
   .provides_count  = 1,

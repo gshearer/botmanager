@@ -7,7 +7,7 @@
 #include "kv.h"
 
 // Plugins built against a different version are rejected at load time.
-#define PLUGIN_API_VERSION   13
+#define PLUGIN_API_VERSION   14
 
 // Entry point symbol that every plugin must export.
 #define PLUGIN_ENTRY_SYMBOL  "bm_plugin_desc"
@@ -27,7 +27,7 @@ typedef enum
   PLUGIN_MISC,          // miscellaneous user command extension (registers commands)
   PLUGIN_PERSONALITY,   // language/messaging personality
   PLUGIN_FEATURE,       // capability layer composed atop methods (whenmoon, etc.)
-  PLUGIN_EXCHANGE       // exchange-facing protocol (coinbase, kraken, etc.)
+  PLUGIN_STRATEGY       // trading strategy module (whenmoon-attached, etc.)
 } plugin_type_t;
 
 typedef enum

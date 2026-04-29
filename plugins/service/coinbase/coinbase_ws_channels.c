@@ -796,23 +796,20 @@ void
 cb_ws_channels_dispatch(const char *buf, size_t len)
 {
   struct json_object *root;
-  struct json_object *type_obj;
-  const char         *type;
+  char                type[64];
 
   if(!cb_ws_ch.initialized || buf == NULL || len == 0) return;
 
   root = json_parse_buf(buf, len, "coinbase:ws_recv");
   if(root == NULL) return;
 
-  type_obj = json_get_obj(root, "type");
-  if(type_obj == NULL
-      || !json_object_is_type(type_obj, json_type_string))
+  // The "type" field is a string. json_get_obj only returns nested
+  // json objects, so it would silently NULL-out and drop every frame.
+  if(!json_get_str(root, "type", type, sizeof(type)))
   {
     json_object_put(root);
     return;
   }
-
-  type = json_object_get_string(type_obj);
 
   // Server control messages.
   if(strcmp(type, "subscriptions") == 0)

@@ -13,6 +13,7 @@
 #include "whenmoon.h"
 #include "aggregator.h"
 #include "market.h"
+#include "strategy.h"
 #include "dl_schema.h"
 #include "trade_persist.h"
 
@@ -755,6 +756,12 @@ wm_market_remove(whenmoon_state_t *st, const char *product_id,
   idx       = (uint32_t)(mk - m->arr);
   market_id = mk->market_id;
   snprintf(id_str, sizeof(id_str), "%s", mk->market_id_str);
+
+  // Auto-detach any strategy attachments bound to this market. Done
+  // before tearing down market state so finalize_fn callbacks fire
+  // while the (about-to-be-freed) ctx still has a valid id_str. The
+  // ctx->mkt pointer is invalidated regardless.
+  wm_strategy_detach_market(st, id_str);
 
   // Same teardown order as wm_market_destroy: persist first, then
   // aggregator. Both lock the slot's mutex internally, so destroy them
