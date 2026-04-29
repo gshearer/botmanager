@@ -469,6 +469,13 @@ curl_request_submit(curl_request_t *req)
     return(FAIL);
   }
 
+  if(curl_shutting_down)
+  {
+    clam(CLAM_WARN, "curl", "submit rejected: shutdown drain in progress");
+    curl_request_release(req);
+    return(FAIL);
+  }
+
   pthread_mutex_lock(&curl_submit_mutex);
 
   if(curl_submit_total >= curl_cfg.max_queued)
@@ -529,10 +536,11 @@ curl_request_submit_wait(curl_request_t *req)
 
   pthread_mutex_lock(&curl_submit_mutex);
 
-  while(curl_ready && curl_submit_total >= curl_cfg.max_queued)
+  while(curl_ready && !curl_shutting_down &&
+        curl_submit_total >= curl_cfg.max_queued)
     pthread_cond_wait(&curl_slot_cond, &curl_submit_mutex);
 
-  if(!curl_ready)
+  if(!curl_ready || curl_shutting_down)
   {
     pthread_mutex_unlock(&curl_submit_mutex);
     curl_request_release(req);
@@ -675,7 +683,51 @@ curl_finish_request(curl_request_t *req, CURLcode result)
   curl_easy_cleanup(req->easy);
   req->easy = NULL;
 
-  curl_active_count--;
+  curl_active_qs[curl_prio_to_idx(req->prio)]--;
+
+  // Unlink from the in-flight list. The drain enumerates this list to
+  // cancel non-TRANSACTIONAL handles, so it must stay accurate for
+  // every active request — natural completions included.
+  if(curl_active_head == req)
+    curl_active_head = req->next;
+  else
+  {
+    for(curl_request_t *p = curl_active_head; p != NULL; p = p->next)
+    {
+      if(p->next == req)
+      {
+        p->next = req->next;
+        break;
+      }
+    }
+  }
+  req->next = NULL;
+
+  curl_request_release(req);
+}
+
+// Cancel a queued-but-never-active request: fire the caller's callback
+// with the supplied CURLcode (always CURLE_ABORTED_BY_CALLBACK today)
+// and release. No easy handle to clean up — the request never made it
+// into curl_multi.
+static void
+curl_finish_cancelled(curl_request_t *req)
+{
+  curl_response_t resp;
+
+  memset(&resp, 0, sizeof(resp));
+  resp.request   = req;
+  resp.curl_code = (int)CURLE_ABORTED_BY_CALLBACK;
+  resp.user_data = req->cb_data;
+  resp.error     = curl_easy_strerror(CURLE_ABORTED_BY_CALLBACK);
+  resp.body      = NULL;
+  resp.body_len  = 0;
+
+  curl_stat_total++;
+  curl_stat_errors++;
+
+  req->state = CURL_REQ_DONE;
+  req->cb(&resp);
 
   curl_request_release(req);
 }
@@ -698,11 +750,16 @@ curl_drain_queue(void)
     const char     *ua;
     CURLMcode       mc;
 
-    // Capacity gate: respect max_active. curl_active_count is only
-    // mutated on this (multi-loop) thread, so reading it under the
-    // submit lock is conservative but harmless.
-    if(curl_active_count >= curl_cfg.max_active)
-      break;
+    // Capacity gate: respect max_active. The per-prio in-flight
+    // counters are only mutated on this (multi-loop) thread, so
+    // summing them under the submit lock is conservative but harmless.
+    {
+      uint32_t total = 0;
+      for(uint32_t i = 0; i < CURL_PRIO__COUNT; i++)
+        total += curl_active_qs[i];
+      if(total >= curl_cfg.max_active)
+        break;
+    }
 
     req = curl_submit_pop_highest();
     if(req == NULL)
@@ -836,10 +893,21 @@ curl_drain_queue(void)
     }
 
     req->state = CURL_REQ_ACTIVE;
-    curl_active_count++;
+    curl_active_qs[curl_prio_to_idx(req->prio)]++;
 
-    clam(CLAM_DEBUG2, "curl", "%s %s (active: %u)",
-        curl_method_name(req->method), req->url, curl_active_count);
+    // Push onto the in-flight list. The shutdown drain walks this list
+    // to cancel non-TRANSACTIONAL handles, and curl_finish_request
+    // unlinks on completion.
+    req->next = curl_active_head;
+    curl_active_head = req;
+
+    {
+      uint32_t total = 0;
+      for(uint32_t i = 0; i < CURL_PRIO__COUNT; i++)
+        total += curl_active_qs[i];
+      clam(CLAM_DEBUG2, "curl", "%s %s (active: %u)",
+          curl_method_name(req->method), req->url, total);
+    }
 
     pthread_mutex_lock(&curl_submit_mutex);
   }
@@ -855,6 +923,149 @@ curl_drain_queue(void)
     uint64_t val;
     (void)read(curl_wake_fd, &val, sizeof(val));
   }
+}
+
+// Wall-clock millisecond reader used by the shutdown drain to enforce
+// CURL_DRAIN_DEADLINE_MS without coupling to the per-plugin clocks.
+static uint64_t
+curl_now_ms(void)
+{
+  struct timespec ts;
+  clock_gettime(CLOCK_MONOTONIC, &ts);
+  return((uint64_t)ts.tv_sec * 1000ULL +
+         (uint64_t)ts.tv_nsec / 1000000ULL);
+}
+
+// Run the shutdown drain. Invoked once per multi-loop lifetime, on the
+// multi-loop thread, when curl_drain_initiated becomes true.
+//
+// Sequence:
+//   1. Splice every non-TRANSACTIONAL queued sub-queue onto a cancel
+//      list and fire CURLE_ABORTED_BY_CALLBACK callbacks for each.
+//   2. Walk the in-flight list; cancel every non-TRANSACTIONAL handle
+//      via curl_finish_request (which removes it from the multi handle
+//      and fires the callback).
+//   3. Pump curl_multi_poll/perform/info_read until in-flight
+//      TRANSACTIONAL drains, capped at CURL_DRAIN_DEADLINE_MS.
+//   4. Force-cancel any remaining TRANSACTIONAL with a CLAM_WARN.
+//   5. Set curl_drain_complete and wake curl_begin_shutdown.
+//
+// Queued TRANSACTIONAL requests stay on their sub-queue and are picked
+// up by curl_drain_queue on the next loop iteration so they have a
+// chance to complete before pool_shutting_down hits.
+static void
+curl_run_shutdown_drain(void)
+{
+  curl_request_t *cancel_list = NULL;
+
+  // 1. Splice non-TRANSACTIONAL queued requests off every sub-queue.
+  pthread_mutex_lock(&curl_submit_mutex);
+
+  for(uint32_t i = 0; i < CURL_PRIO__COUNT; i++)
+  {
+    curl_submit_q_t *q = &curl_submit_qs[i];
+
+    if(q->head == NULL)
+      continue;
+
+    // The first sub-queue index is TRANSACTIONAL by curl_prio_to_idx
+    // construction; skip it. Defensive: also check the head's prio.
+    if(q->head->prio == CURL_PRIO_TRANSACTIONAL)
+      continue;
+
+    q->tail->next = cancel_list;
+    cancel_list = q->head;
+
+    curl_submit_total -= q->count;
+    q->head = q->tail = NULL;
+    q->count = 0;
+  }
+
+  // Wake any submit-wait waiters so they observe curl_shutting_down
+  // and exit cleanly instead of blocking on curl_slot_cond.
+  pthread_cond_broadcast(&curl_slot_cond);
+  pthread_mutex_unlock(&curl_submit_mutex);
+
+  while(cancel_list != NULL)
+  {
+    curl_request_t *next = cancel_list->next;
+    cancel_list->next = NULL;
+    curl_finish_cancelled(cancel_list);
+    cancel_list = next;
+  }
+
+  // 2. Cancel in-flight non-TRANSACTIONAL. curl_finish_request unlinks
+  // each request from curl_active_head and zeroes its next pointer, so
+  // we cache the next pointer before the call.
+  {
+    curl_request_t *p = curl_active_head;
+
+    while(p != NULL)
+    {
+      curl_request_t *next = p->next;
+
+      if(p->prio != CURL_PRIO_TRANSACTIONAL)
+        curl_finish_request(p, CURLE_ABORTED_BY_CALLBACK);
+
+      p = next;
+    }
+  }
+
+  // 3. Pump the loop until TRANSACTIONAL drains or the deadline fires.
+  {
+    uint64_t deadline = curl_now_ms() + CURL_DRAIN_DEADLINE_MS;
+    uint32_t t_idx    = curl_prio_to_idx(CURL_PRIO_TRANSACTIONAL);
+
+    while(curl_active_qs[t_idx] > 0)
+    {
+      uint64_t now = curl_now_ms();
+      int      poll_ms;
+      int      numfds = 0, running = 0, msgs_left;
+      CURLMsg *msg;
+
+      if(now >= deadline)
+        break;
+
+      poll_ms = (int)(deadline - now);
+      if(poll_ms > 200) poll_ms = 200;  // bound so we re-check often
+
+      curl_multi_poll(curl_multi_handle, NULL, 0, poll_ms, &numfds);
+      curl_multi_perform(curl_multi_handle, &running);
+
+      while((msg = curl_multi_info_read(curl_multi_handle, &msgs_left))
+          != NULL)
+      {
+        curl_request_t *req = NULL;
+
+        if(msg->msg != CURLMSG_DONE)
+          continue;
+
+        curl_easy_getinfo(msg->easy_handle, CURLINFO_PRIVATE, &req);
+
+        if(req != NULL)
+          curl_finish_request(req, msg->data.result);
+      }
+    }
+
+    // 4. Force-cancel any remaining TRANSACTIONAL.
+    if(curl_active_qs[t_idx] > 0)
+    {
+      clam(CLAM_WARN, "curl",
+          "shutdown drain deadline (%u ms) exceeded; "
+          "force-cancelling %u TRANSACTIONAL request(s)",
+          (unsigned)CURL_DRAIN_DEADLINE_MS,
+          (unsigned)curl_active_qs[t_idx]);
+
+      while(curl_active_head != NULL)
+        curl_finish_request(curl_active_head, CURLE_ABORTED_BY_CALLBACK);
+    }
+  }
+
+  // 5. Signal the waiter.
+  pthread_mutex_lock(&curl_submit_mutex);
+  curl_drain_complete = true;
+  pthread_cond_broadcast(&curl_drain_cond);
+  pthread_mutex_unlock(&curl_submit_mutex);
 }
 
 static void
@@ -899,6 +1110,14 @@ curl_multi_loop(task_t *t)
     int running = 0;
     int msgs_left;
     CURLMsg *msg;
+
+    // 0. Run the shutdown drain once if curl_begin_shutdown has been
+    // called. The drain pumps its own multi_poll/perform/info_read
+    // loop, so by the time it returns curl_active_qs is settled and
+    // the surrounding loop can resume normally for any straggler
+    // queued TRANSACTIONAL traffic until pool_shutting_down hits.
+    if(curl_drain_initiated && !curl_drain_complete)
+      curl_run_shutdown_drain();
 
     // 1. Drain any newly submitted requests into multi.
     curl_drain_queue();
@@ -1072,7 +1291,12 @@ curl_get_stats(curl_stats_t *out)
 {
   memset(out, 0, sizeof(*out));
 
-  out->active           = curl_active_count;
+  {
+    uint32_t total = 0;
+    for(uint32_t i = 0; i < CURL_PRIO__COUNT; i++)
+      total += curl_active_qs[i];
+    out->active = total;
+  }
   out->total_requests   = curl_stat_total;
   out->total_errors     = curl_stat_errors;
   out->bytes_in         = curl_stat_in;
@@ -1139,6 +1363,7 @@ curl_init(void)
   pthread_mutex_init(&curl_submit_mutex, NULL);
   pthread_mutex_init(&curl_req_mutex, NULL);
   pthread_cond_init(&curl_slot_cond, NULL);
+  pthread_cond_init(&curl_drain_cond, NULL);
 
   // Set defaults before KV may be available.
   curl_cfg.timeout         = CURL_DEF_TIMEOUT;
@@ -1175,6 +1400,75 @@ curl_register_config(void)
   curl_load_config();
 }
 
+// Initiate shutdown drain. Must run BEFORE pool_exit (the multi worker
+// thread does the drain work, and pool_exit will join it). After this
+// call returns, any in-flight non-TRANSACTIONAL request has already
+// fired its completion callback with CURLE_ABORTED_BY_CALLBACK, so
+// plugin destroy hooks that wait on those callbacks (e.g. the
+// whenmoon downloader's per-page completion callback decrementing
+// in_flight_count) can complete instead of deadlocking against a
+// torn-down curl thread. Idempotent.
+void
+curl_begin_shutdown(void)
+{
+  if(!curl_ready)
+    return;
+
+  pthread_mutex_lock(&curl_submit_mutex);
+
+  if(curl_drain_initiated)
+  {
+    pthread_mutex_unlock(&curl_submit_mutex);
+    return;
+  }
+
+  // Refuse new submits before the multi loop sees the drain trigger
+  // so any thread mid-submit observes the shutdown synchronously.
+  curl_shutting_down   = true;
+  curl_drain_initiated = true;
+
+  // Wake submit-wait waiters so they exit instead of blocking forever
+  // on curl_slot_cond once the drain starts cancelling traffic.
+  pthread_cond_broadcast(&curl_slot_cond);
+  pthread_mutex_unlock(&curl_submit_mutex);
+
+  // Wake the multi loop so it picks up curl_drain_initiated this turn
+  // rather than after the next poll timeout.
+  if(curl_wake_fd >= 0)
+  {
+    uint64_t one = 1;
+    (void)write(curl_wake_fd, &one, sizeof(one));
+  }
+
+  // Wait for the multi loop to finish the drain. The drain itself is
+  // bounded by CURL_DRAIN_DEADLINE_MS for in-flight TRANSACTIONAL
+  // requests; everything else completes synchronously inside the
+  // drain. Add a one-second cushion for scheduling jitter and the
+  // poll-timeout-rounded check intervals.
+  pthread_mutex_lock(&curl_submit_mutex);
+  {
+    struct timespec deadline;
+
+    clock_gettime(CLOCK_REALTIME, &deadline);
+    deadline.tv_sec += (CURL_DRAIN_DEADLINE_MS / 1000) + 1;
+
+    while(!curl_drain_complete)
+    {
+      int rc = pthread_cond_timedwait(&curl_drain_cond,
+          &curl_submit_mutex, &deadline);
+
+      if(rc == ETIMEDOUT)
+      {
+        clam(CLAM_WARN, "curl",
+            "curl_begin_shutdown: drain didn't complete within "
+            "deadline; proceeding anyway");
+        break;
+      }
+    }
+  }
+  pthread_mutex_unlock(&curl_submit_mutex);
+}
+
 // Shut down the curl subsystem: drain the request freelist,
 // destroy mutexes, and call curl_global_cleanup().
 // The multi worker thread must already be joined via pool_exit().
@@ -1206,6 +1500,7 @@ curl_exit(void)
   pthread_mutex_unlock(&curl_req_mutex);
 
   pthread_cond_destroy(&curl_slot_cond);
+  pthread_cond_destroy(&curl_drain_cond);
   pthread_mutex_destroy(&curl_submit_mutex);
   pthread_mutex_destroy(&curl_req_mutex);
 

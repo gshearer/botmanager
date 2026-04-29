@@ -19,6 +19,8 @@
 #include "coinbase.h"
 #include "exchange_api.h"
 
+#include <curl/curl.h>
+
 #include "curl.h"
 
 #include <stdio.h>
@@ -63,7 +65,18 @@ cb_exchange_curl_done(const curl_response_t *resp)
 
   if(cb != NULL)
   {
-    if(transport_err)
+    if(resp->curl_code == (int)CURLE_ABORTED_BY_CALLBACK)
+    {
+      // Cancelled by the curl shutdown drain. Surface http_status=-1
+      // so exchange_classify_status maps to FAIL (no retry); a
+      // re-submit would be rejected by the same gate that fired the
+      // cancellation.
+      cb(-1, NULL, 0,
+          resp->error != NULL ? resp->error : "request cancelled",
+          user);
+    }
+
+    else if(transport_err)
     {
       // Surface a transport error with http_status==0 so the
       // abstraction's classifier kicks the retry path.

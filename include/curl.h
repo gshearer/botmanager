@@ -21,8 +21,7 @@ typedef enum
 // through).
 typedef enum
 {
-  CURL_PRIO_TRANSACTIONAL = 0,    // must-drain on shutdown (semantics
-                                  //   land in CURL-PRIO-2)
+  CURL_PRIO_TRANSACTIONAL = 0,    // must-drain on shutdown
   CURL_PRIO_NORMAL        = 50,   // default; recoverable on retry
   CURL_PRIO_BULK          = 254,  // long / idempotent; first to drop
   CURL_PRIO__COUNT        = 3
@@ -144,6 +143,21 @@ void curl_init(void);
 // Must be called after kv_init() and plugin_init_all().
 void curl_register_config(void);
 
+// Initiate the orderly shutdown drain. Must be called BEFORE pool_exit
+// (the curl multi worker thread does the drain work). After this call:
+//   - new submits are refused
+//   - queued + in-flight non-TRANSACTIONAL requests are cancelled and
+//     their completion callbacks fire with curl_code = CURLE_ABORTED_
+//     BY_CALLBACK so plugins waiting on those callbacks (e.g. the
+//     whenmoon downloader's per-page completions) can finish their
+//     own teardown
+//   - in-flight TRANSACTIONAL requests are given up to
+//     CURL_DRAIN_DEADLINE_MS to complete; remaining are force-cancelled
+//     with a CLAM_WARN when the deadline expires
+// Idempotent. Returns when the drain has completed (or its deadline
+// has fired).
+void curl_begin_shutdown(void);
+
 // The multi worker thread must already be joined (via pool_exit)
 // before calling this.
 void curl_exit(void);
@@ -182,6 +196,11 @@ void curl_iterate_active(curl_iter_cb_t cb, void *data);
 #define CURL_DEF_USER_AGENT      "libp0ada/2.0"
 
 #define CURL_RESP_INIT_CAP       4096
+
+// Wall-clock budget for the in-flight TRANSACTIONAL drain inside
+// curl_begin_shutdown. Non-TRANSACTIONAL cancellation completes
+// synchronously and isn't subject to this budget.
+#define CURL_DRAIN_DEADLINE_MS   10000
 
 #define CURL_URL_SZ           2048
 #define CURL_CT_SZ            128
@@ -283,8 +302,24 @@ static pthread_mutex_t    curl_submit_mutex;
 // can re-check capacity without polling or generating log noise.
 static pthread_cond_t     curl_slot_cond;
 
-// Only touched by multi loop thread.
-static uint32_t           curl_active_count = 0;
+// Shutdown drain bookkeeping. Set by curl_begin_shutdown (any thread);
+// observed by the multi loop, which performs the cancellation work and
+// signals curl_drain_cond when finished. curl_shutting_down is checked
+// by curl_request_submit / _submit_wait to refuse new traffic from
+// every thread once the drain is initiated.
+static volatile bool      curl_shutting_down   = false;
+static volatile bool      curl_drain_initiated = false;
+static volatile bool      curl_drain_complete  = false;
+static pthread_cond_t     curl_drain_cond;
+
+// In-flight bookkeeping. Only touched by the multi loop thread, so no
+// extra mutex is required. curl_active_qs is per-priority so the
+// shutdown drain can wait on TRANSACTIONAL specifically;
+// curl_active_head is the singly-linked in-flight list (chained via
+// curl_request.next while the request is in CURL_REQ_ACTIVE) used by
+// the drain to enumerate non-TRANSACTIONAL handles for cancellation.
+static uint32_t           curl_active_qs[CURL_PRIO__COUNT] = {0};
+static curl_request_t    *curl_active_head = NULL;
 
 static uint64_t           curl_stat_total   = 0;
 static uint64_t           curl_stat_errors  = 0;
@@ -298,6 +333,8 @@ static pthread_mutex_t    curl_req_mutex;
 static void    curl_multi_loop(task_t *t);
 static void    curl_drain_queue(void);
 static void    curl_finish_request(curl_request_t *req, CURLcode result);
+static void    curl_finish_cancelled(curl_request_t *req);
+static void    curl_run_shutdown_drain(void);
 static void    curl_request_release(curl_request_t *req);
 static size_t  curl_write_cb(char *ptr, size_t size, size_t nmemb,
                    void *userdata);

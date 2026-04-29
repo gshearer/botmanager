@@ -505,6 +505,14 @@ shutdown:
   // 3. User namespaces.
   userns_exit();
 
+  // 3b. Drain in-flight curl traffic so plugin destroy hooks (run at
+  //     plugin_deinit_all below, after pool_exit joins the multi
+  //     thread) don't deadlock waiting on completion callbacks that
+  //     can no longer fire. Cancels queued + in-flight non-
+  //     TRANSACTIONAL with CURLE_ABORTED_BY_CALLBACK; waits up to
+  //     CURL_DRAIN_DEADLINE_MS for in-flight TRANSACTIONAL to complete.
+  curl_begin_shutdown();
+
   // 4. Thread pool: workers finish current tasks, join persist threads.
   pool_exit();
 

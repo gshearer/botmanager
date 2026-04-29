@@ -12,6 +12,15 @@
 exchange_outcome_t
 exchange_classify_status(int http_status, bool transport_err)
 {
+  // Negative http_status is a sentinel for "request cancelled" used by
+  // protocol plugins to signal that the underlying transfer was aborted
+  // (e.g. curl shutdown drain returning CURLE_ABORTED_BY_CALLBACK). Map
+  // to FAIL: a re-submit would be rejected by the same gate that
+  // cancelled it, so retrying just leaks an exchange_req_t and pins
+  // upstream consumers waiting on their completion callback.
+  if(http_status < 0)
+    return(EXCHANGE_OUTCOME_FAIL);
+
   if(transport_err)
     return(EXCHANGE_OUTCOME_RETRY);
 
