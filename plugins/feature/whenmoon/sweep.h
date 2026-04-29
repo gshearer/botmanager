@@ -125,11 +125,22 @@ typedef struct
   uint32_t              indices[WM_BT_SWEEP_MAX_PARAMS];
   uint64_t              wallclock_ms;
   uint32_t              bars_replayed;
+  uint32_t              n_windows;          // 1 for full/oos head
   double                score;
   int64_t               run_id_db;          // 0 if persist failed
   bool                  ok;                 // false on iteration failure
   char                  err[160];           // populated when !ok
   wm_trade_snapshot_t   trade;
+
+  // WM-LT-7 OOS post-pass output. have_oos = true when this row was
+  // selected as top-K and its OOS validation iteration completed.
+  bool                  have_oos;
+  double                oos_score;
+  double                oos_realized;
+  uint32_t              oos_n_trades;
+  char                  oos_err[160];       // populated when have_oos
+                                            // is intended but the
+                                            // validation iter failed
 } wm_bt_sweep_result_t;
 
 // Score extraction from a snapshot. NaN/inf collapse to 0.0.
@@ -146,6 +157,27 @@ double wm_bt_sweep_score_value(const wm_trade_snapshot_t *snap,
 void wm_bt_sweep_cleanup_stale_kv(void);
 
 // ----------------------------------------------------------------------- //
+// Sweep run mode (WM-LT-7)                                                //
+// ----------------------------------------------------------------------- //
+//
+// Three modes share the iteration loop with different window scopes:
+//   * FULL: every iteration walks the full snapshot range.
+//   * WALK_FORWARD: every iteration walks `walk.windows` test slices
+//     back-to-back through one trade book per param vector.
+//   * OOS: head sweep iterates over `oos_head` only; after the sweep
+//     finishes, the caller runs `wm_bt_sweep_run_oos_validation` to
+//     re-iterate the top-K rows against `oos_tail` and patch
+//     wm_backtest_run with the OOS columns.
+
+typedef struct
+{
+  wm_bt_run_mode_t    mode;
+  wm_bt_window_set_t  walk;
+  wm_bt_window_t      oos_head;
+  wm_bt_window_t      oos_tail;
+} wm_bt_sweep_mode_t;
+
+// ----------------------------------------------------------------------- //
 // Sweep run                                                               //
 // ----------------------------------------------------------------------- //
 
@@ -156,14 +188,39 @@ void wm_bt_sweep_cleanup_stale_kv(void);
 // finishes. Returns SUCCESS when the orchestration completes; per-
 // iteration failures are recorded in result.ok / .err.
 //
+// `mode` carries the run-mode + window scope. NULL = legacy WM-LT-6
+// behaviour (FULL mode, no windows).
+//
 // out_results storage is caller-owned; cap = plan->total_iters.
 bool wm_bt_sweep_run(struct whenmoon_state *st,
     wm_backtest_snapshot_t *snap,
     const char *strategy_name,
     int32_t market_id_db,
     const wm_bt_sweep_plan_t *plan,
+    const wm_bt_sweep_mode_t *mode,
     const wm_backtest_params_t *base_params,
     wm_bt_sweep_result_t *out_results,
+    char *err, size_t err_cap);
+
+// OOS post-pass. Called after wm_bt_sweep_run completes in OOS mode.
+// Takes the same plan + results table, picks the top-K by score,
+// re-runs each one against `oos_tail`, and patches wm_backtest_run
+// with the OOS columns via wm_backtest_persist_oos_update. Stamps
+// each top-K result's `oos_*` fields in `results` so the renderer
+// can show them inline.
+//
+// Returns SUCCESS if every top-K validation iteration completed; FAIL
+// (with err) if no top-K was eligible (e.g. all head iterations
+// failed). Per-row OOS failures are recorded in `results[i].oos_err`
+// and do not cause the overall pass to FAIL.
+bool wm_bt_sweep_run_oos_validation(struct whenmoon_state *st,
+    wm_backtest_snapshot_t *snap,
+    const char *strategy_name,
+    int32_t market_id_db,
+    const wm_bt_sweep_plan_t *plan,
+    const wm_bt_window_t *oos_tail,
+    const wm_backtest_params_t *base_params,
+    wm_bt_sweep_result_t *results,
     char *err, size_t err_cap);
 
 // ----------------------------------------------------------------------- //
@@ -175,6 +232,7 @@ bool wm_bt_sweep_run(struct whenmoon_state *st,
 
 void wm_bt_sweep_render_topk(const struct cmd_ctx *ctx,
     const wm_bt_sweep_plan_t *plan,
+    const wm_bt_sweep_mode_t *mode,
     const wm_bt_sweep_result_t *results, uint32_t n);
 
 // ----------------------------------------------------------------------- //

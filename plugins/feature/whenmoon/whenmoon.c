@@ -474,7 +474,7 @@ whenmoon_deinit(void)
 const plugin_desc_t bm_plugin_desc = {
   .api_version          = PLUGIN_API_VERSION,
   .name                 = "whenmoon",
-  .version              = "0.8-lt6",
+  .version              = "0.9-lt7",
   .type                 = PLUGIN_FEATURE,
   .kind                 = "whenmoon",
   .provides             = { { .name = "feature_whenmoon" } },

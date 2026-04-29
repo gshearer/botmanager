@@ -41,6 +41,81 @@
 #define WM_BACKTEST_HISTORY_HEADROOM_DAYS  30
 
 // ----------------------------------------------------------------------- //
+// Run mode + window types (WM-LT-7)                                       //
+// ----------------------------------------------------------------------- //
+
+typedef enum
+{
+  WM_BT_MODE_FULL          = 0,
+  WM_BT_MODE_WALK_FORWARD  = 1,
+  WM_BT_MODE_OOS           = 2,
+} wm_bt_run_mode_t;
+
+// One time slice in milliseconds. start_ts_ms is inclusive,
+// end_ts_ms is exclusive — matches the candle ring's ts_close_ms
+// semantics (a bar with ts_close_ms == window.end_ts_ms falls in
+// the next window, not this one).
+typedef struct
+{
+  int64_t  start_ts_ms;
+  int64_t  end_ts_ms;
+} wm_bt_window_t;
+
+// Walk-forward windows-per-iteration cap. 256 covers any realistic
+// step/test ratio over a multi-year range.
+#define WM_BT_WALK_MAX_WINDOWS    256u
+
+// Reject test windows that contain fewer than this many 1m bars.
+// 60 = one hour; below that any one-bar trade dominates the score.
+#define WM_BT_WALK_MIN_TEST_BARS    60u
+
+typedef struct
+{
+  uint32_t        n;
+  wm_bt_window_t  windows[WM_BT_WALK_MAX_WINDOWS];
+} wm_bt_window_set_t;
+
+// Parsed --walk-forward train=Td:test=Md:step=Sd. Days, not ms.
+typedef struct
+{
+  uint32_t  train_days;
+  uint32_t  test_days;
+  uint32_t  step_days;
+} wm_bt_walk_spec_t;
+
+// Parsed --oos-tail P. P is the percent of the supplied range
+// reserved as out-of-sample (1..50).
+typedef struct
+{
+  uint32_t  pct;
+} wm_bt_oos_spec_t;
+
+// Build the test-window slice list for a walk-forward run. Walk:
+// window i trains on [start + i*step, start + i*step + train], tests
+// on [train_end, train_end + test], stepping by `step` until the
+// next test window would extend past `range_end`. Out-of-history /
+// short-test windows are dropped per WM_BT_WALK_MIN_TEST_BARS.
+//
+// Returns SUCCESS when at least one window is produced; FAIL with err
+// populated otherwise. err covers cap overflow (> WALK_MAX_WINDOWS),
+// zero windows produced (range too short for the spec), and the
+// strategy-min-history deficit case (train_days < strategy's
+// min_history requirement on any subscribed grain).
+bool wm_bt_walk_build_windows(const wm_bt_walk_spec_t *spec,
+    int64_t range_start_ms, int64_t range_end_ms,
+    const loaded_strategy_t *ls,
+    wm_bt_window_set_t *out, char *err, size_t err_cap);
+
+// Split a range at the OOS-tail boundary. head_window covers the
+// first (100-pct)% of the range; tail_window covers the last pct%.
+// Returns SUCCESS when both windows have non-zero duration; FAIL on
+// pct out of [1, 50] or zero-duration head/tail.
+bool wm_bt_oos_split_range(const wm_bt_oos_spec_t *spec,
+    int64_t range_start_ms, int64_t range_end_ms,
+    wm_bt_window_t *out_head, wm_bt_window_t *out_tail,
+    char *err, size_t err_cap);
+
+// ----------------------------------------------------------------------- //
 // Snapshot type                                                           //
 // ----------------------------------------------------------------------- //
 
@@ -160,18 +235,28 @@ bool wm_backtest_run_iteration(struct whenmoon_state *st,
     char *err, size_t err_cap);
 
 // Same as wm_backtest_run_iteration but with an externally allocated
-// synthetic id. The sweep planner (WM-LT-6) uses this so it can write
-// per-iteration KV overrides keyed on the same id BEFORE the
-// iteration's strategy init reads them.
+// synthetic id and an optional window set. The sweep planner uses
+// this so it can write per-iteration KV overrides keyed on the same
+// id BEFORE the iteration's strategy init reads them, and so walk-
+// forward / OOS layers can scope the on_bar firing to specific test
+// windows.
 //
 // `synth_id` must match the "bt:<N>" pattern produced by
 // wm_backtest_alloc_synthetic_id and must be unique within the
 // process lifetime (the trade book registry lookups use it directly).
+//
+// `windows` (optional, NULL = full-range) restricts on_bar callbacks
+// to bars whose ts_close_ms falls within at least one window slice.
+// The cursor still walks every bar in the snapshot (the aggregator
+// state advances naturally), but the strategy callback fires only
+// for bars inside a window. Use NULL or n_windows == 0 for the
+// single full-range path.
 bool wm_backtest_run_iteration_with_id(struct whenmoon_state *st,
     wm_backtest_snapshot_t *snap,
     const char *strategy_name,
     const char *synth_id,
     const wm_backtest_params_t *params,
+    const wm_bt_window_t *windows, uint32_t n_windows,
     wm_backtest_result_t *out,
     char *err, size_t err_cap);
 
@@ -195,15 +280,31 @@ typedef struct wm_backtest_record
   double   sharpe;
   double   sortino;
   double   final_equity;
+  char     window_kind[16];     // 'full' | 'walk' | 'oos'
+  uint32_t n_windows;
+  bool     have_oos;            // false until wm_backtest_persist_oos_update
+  double   oos_score;
+  double   oos_realized;
+  uint32_t oos_n_trades;
   char     created_at[40];
 } wm_backtest_record_t;
 
 // Insert one wm_backtest_run row. params_json is optional (pass NULL
-// to insert SQL NULL); metrics_json is required. On SUCCESS,
-// *out_run_id is populated with the assigned BIGSERIAL.
+// to insert SQL NULL); metrics_json is required. window_kind +
+// n_windows are taken from `rec`; OOS columns are inserted as NULL
+// (top-K rows get them populated later via
+// wm_backtest_persist_oos_update). On SUCCESS, *out_run_id is
+// populated with the assigned BIGSERIAL.
 bool wm_backtest_persist_run(const wm_backtest_record_t *rec,
     const char *params_json, const char *metrics_json,
     int64_t *out_run_id);
+
+// Patch the OOS columns + flip window_kind to 'oos' on an existing
+// wm_backtest_run row. Used by the OOS post-pass to record the
+// out-of-sample validation score for a top-K head-iteration row.
+// Returns SUCCESS on a one-row update; FAIL otherwise.
+bool wm_backtest_persist_oos_update(int64_t run_id,
+    double oos_score, double oos_realized, uint32_t oos_n_trades);
 
 // Load up to `cap` recent runs (newest first). Returns the count
 // written. 0 on no rows or query error.

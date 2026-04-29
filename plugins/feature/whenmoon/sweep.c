@@ -811,7 +811,18 @@ typedef struct
   const char                 *strategy_name;
   int32_t                     market_id_db;
   const wm_bt_sweep_plan_t   *plan;
+  const wm_bt_sweep_mode_t   *mode;       // NULL = legacy FULL
   const wm_backtest_params_t *base_params;
+
+  // Window scope each worker iter passes into the iteration. Resolved
+  // from `mode` once at sweep start; never written by workers.
+  const wm_bt_window_t       *iter_windows;
+  uint32_t                    iter_n_windows;
+
+  // window_kind / n_windows per persisted row. The iteration's
+  // wallclock counts every iter-side window the worker ran.
+  const char                 *window_kind;
+  uint32_t                    n_windows_per_iter;
 
   // Shared outputs: workers write into out_results[iter] only, no
   // collisions.
@@ -866,6 +877,7 @@ wm_bt_sweep_run_one(wm_bt_pool_t *pool, uint32_t iter,
   err[0] = '\0';
   iter_ok = wm_backtest_run_iteration_with_id(pool->st, pool->snap,
       pool->strategy_name, synth_id, pool->base_params,
+      pool->iter_windows, pool->iter_n_windows,
       &bt_result, err, sizeof(err)) == SUCCESS;
 
   // Unbind + destroy the registry regardless of outcome — workers
@@ -886,6 +898,7 @@ wm_bt_sweep_run_one(wm_bt_pool_t *pool, uint32_t iter,
   result->trade         = bt_result.trade;
   result->wallclock_ms  = bt_result.wallclock_ms;
   result->bars_replayed = bt_result.bars_replayed;
+  result->n_windows     = pool->n_windows_per_iter;
   result->score         = wm_bt_sweep_score_value(&bt_result.trade,
       pool->plan->score);
 
@@ -911,6 +924,9 @@ wm_bt_sweep_run_one(wm_bt_pool_t *pool, uint32_t iter,
     rec.sharpe        = bt_result.trade.metrics.sharpe;
     rec.sortino       = bt_result.trade.metrics.sortino;
     rec.final_equity  = bt_result.trade.equity;
+    snprintf(rec.window_kind, sizeof(rec.window_kind),
+        "%s", pool->window_kind);
+    rec.n_windows     = pool->n_windows_per_iter;
 
     wm_bt_sweep_render_params_json(pool->plan, indices,
         params_json, sizeof(params_json));
@@ -951,6 +967,7 @@ wm_bt_sweep_run(whenmoon_state_t *st,
     const char *strategy_name,
     int32_t market_id_db,
     const wm_bt_sweep_plan_t *plan,
+    const wm_bt_sweep_mode_t *mode,
     const wm_backtest_params_t *base_params,
     wm_bt_sweep_result_t *out_results,
     char *err, size_t err_cap)
@@ -960,6 +977,7 @@ wm_bt_sweep_run(whenmoon_state_t *st,
   uint32_t          spawned = 0;
   uint32_t          i;
   bool              ok = SUCCESS;
+  wm_bt_run_mode_t  mode_val = WM_BT_MODE_FULL;
 
   if(err != NULL && err_cap > 0)
     err[0] = '\0';
@@ -971,6 +989,9 @@ wm_bt_sweep_run(whenmoon_state_t *st,
       snprintf(err, err_cap, "bad sweep inputs");
     return(FAIL);
   }
+
+  if(mode != NULL)
+    mode_val = mode->mode;
 
   // Coordinate with /whenmoon backtest reload. Take the reload lock
   // briefly so reload cannot be mid-dlclose when we register
@@ -987,8 +1008,54 @@ wm_bt_sweep_run(whenmoon_state_t *st,
   pool.strategy_name = strategy_name;
   pool.market_id_db  = market_id_db;
   pool.plan          = plan;
+  pool.mode          = mode;
   pool.base_params   = base_params;
   pool.results       = out_results;
+
+  // Resolve the per-iteration window scope + the persisted
+  // window_kind / n_windows once. Workers see read-only fields.
+  switch(mode_val)
+  {
+    case WM_BT_MODE_WALK_FORWARD:
+      if(mode == NULL || mode->walk.n == 0)
+      {
+        wm_bt_sweep_active_dec();
+
+        if(err != NULL)
+          snprintf(err, err_cap,
+              "walk-forward mode requires at least one window");
+        return(FAIL);
+      }
+      pool.iter_windows       = mode->walk.windows;
+      pool.iter_n_windows     = mode->walk.n;
+      pool.window_kind        = "walk";
+      pool.n_windows_per_iter = mode->walk.n;
+      break;
+
+    case WM_BT_MODE_OOS:
+      if(mode == NULL || mode->oos_head.end_ts_ms <= mode->oos_head.start_ts_ms)
+      {
+        wm_bt_sweep_active_dec();
+
+        if(err != NULL)
+          snprintf(err, err_cap,
+              "oos mode requires a non-empty head window");
+        return(FAIL);
+      }
+      pool.iter_windows       = &mode->oos_head;
+      pool.iter_n_windows     = 1;
+      pool.window_kind        = "oos";
+      pool.n_windows_per_iter = 1;
+      break;
+
+    case WM_BT_MODE_FULL:
+    default:
+      pool.iter_windows       = NULL;
+      pool.iter_n_windows     = 0;
+      pool.window_kind        = "full";
+      pool.n_windows_per_iter = 1;
+      break;
+  }
 
   threads = mem_alloc("whenmoon.sweep", "threads",
       sizeof(*threads) * plan->workers);
@@ -1066,6 +1133,7 @@ wm_bt_sweep_compare_desc(const void *a, const void *b)
 void
 wm_bt_sweep_render_topk(const cmd_ctx_t *ctx,
     const wm_bt_sweep_plan_t *plan,
+    const wm_bt_sweep_mode_t *mode,
     const wm_bt_sweep_result_t *results, uint32_t n)
 {
   wm_bt_sweep_result_t *sorted;
@@ -1074,9 +1142,12 @@ wm_bt_sweep_render_topk(const cmd_ctx_t *ctx,
   uint32_t              top_k;
   uint32_t              i;
   uint32_t              n_ok = 0;
+  bool                  is_oos;
 
   if(ctx == NULL || plan == NULL || results == NULL || n == 0)
     return;
+
+  is_oos = (mode != NULL && mode->mode == WM_BT_MODE_OOS);
 
   for(i = 0; i < n; i++)
     if(results[i].ok)
@@ -1097,8 +1168,9 @@ wm_bt_sweep_render_topk(const cmd_ctx_t *ctx,
   top_k = plan->top_k > n ? n : plan->top_k;
 
   snprintf(line, sizeof(line),
-      CLR_BOLD "top %u of %u (score=%s, ok=%u)" CLR_RESET,
-      top_k, n, wm_bt_sweep_score_name(plan->score), n_ok);
+      CLR_BOLD "top %u of %u (score=%s, ok=%u%s)" CLR_RESET,
+      top_k, n, wm_bt_sweep_score_name(plan->score), n_ok,
+      is_oos ? ", oos validated" : "");
   cmd_reply(ctx, line);
 
   for(i = 0; i < top_k; i++)
@@ -1138,20 +1210,259 @@ wm_bt_sweep_render_topk(const cmd_ctx_t *ctx,
       continue;
     }
 
-    snprintf(line, sizeof(line),
-        "  #%-3u %s  %s=%+.4f"
-        " realized=%+.4f trades=%-3u equity=%.2f"
-        " ms=%-5" PRIu64 "%s%" PRId64,
-        i + 1, param_buf,
-        wm_bt_sweep_score_name(plan->score), r->score,
-        r->trade.metrics.realized_pnl, r->trade.metrics.n_trades,
-        r->trade.equity, r->wallclock_ms,
-        r->run_id_db > 0 ? " run=" : "",
-        r->run_id_db > 0 ? r->run_id_db : (int64_t)0);
+    if(is_oos && r->have_oos)
+    {
+      // Head + OOS row format. The OOS score uses the same metric
+      // as the head score so the in-sample / out-of-sample gap is
+      // legible at a glance.
+      snprintf(line, sizeof(line),
+          "  #%-3u %s  head_%s=%+.4f oos_%s=%+.4f"
+          " trades=%-3u/%-3u equity=%.2f"
+          " ms=%-5" PRIu64 "%s%" PRId64,
+          i + 1, param_buf,
+          wm_bt_sweep_score_name(plan->score), r->score,
+          wm_bt_sweep_score_name(plan->score), r->oos_score,
+          r->trade.metrics.n_trades, r->oos_n_trades,
+          r->trade.equity, r->wallclock_ms,
+          r->run_id_db > 0 ? " run=" : "",
+          r->run_id_db > 0 ? r->run_id_db : (int64_t)0);
+    }
+    else if(is_oos)
+    {
+      // Top-K row whose OOS pass failed to run (e.g. snapshot has
+      // no bars in the tail). Show the head score with an OOS
+      // diagnostic blob.
+      snprintf(line, sizeof(line),
+          "  #%-3u %s  head_%s=%+.4f oos=FAIL: %.40s"
+          " trades=%-3u equity=%.2f ms=%-5" PRIu64 "%s%" PRId64,
+          i + 1, param_buf,
+          wm_bt_sweep_score_name(plan->score), r->score,
+          r->oos_err[0] != '\0' ? r->oos_err : "n/a",
+          r->trade.metrics.n_trades, r->trade.equity,
+          r->wallclock_ms,
+          r->run_id_db > 0 ? " run=" : "",
+          r->run_id_db > 0 ? r->run_id_db : (int64_t)0);
+    }
+    else
+    {
+      snprintf(line, sizeof(line),
+          "  #%-3u %s  %s=%+.4f"
+          " realized=%+.4f trades=%-3u equity=%.2f"
+          " ms=%-5" PRIu64 "%s%" PRId64,
+          i + 1, param_buf,
+          wm_bt_sweep_score_name(plan->score), r->score,
+          r->trade.metrics.realized_pnl, r->trade.metrics.n_trades,
+          r->trade.equity, r->wallclock_ms,
+          r->run_id_db > 0 ? " run=" : "",
+          r->run_id_db > 0 ? r->run_id_db : (int64_t)0);
+    }
+
     cmd_reply(ctx, line);
   }
 
   mem_free(sorted);
+}
+
+// ----------------------------------------------------------------------- //
+// OOS validation post-pass (WM-LT-7)                                      //
+// ----------------------------------------------------------------------- //
+//
+// After the head sweep finishes, pick the top-K results (sorted by
+// score), run a single iteration on the OOS tail for each, and patch
+// the corresponding wm_backtest_run row with the OOS columns. The
+// validation iteration uses the same param vector (same KV slot path
+// derived from a fresh synth_id) and the same private-registry
+// pattern as the head sweep — no contention with anything else.
+
+bool
+wm_bt_sweep_run_oos_validation(whenmoon_state_t *st,
+    wm_backtest_snapshot_t *snap,
+    const char *strategy_name,
+    int32_t market_id_db,
+    const wm_bt_sweep_plan_t *plan,
+    const wm_bt_window_t *oos_tail,
+    const wm_backtest_params_t *base_params,
+    wm_bt_sweep_result_t *results,
+    char *err, size_t err_cap)
+{
+  uint32_t  *top_idx = NULL;
+  double    *top_score = NULL;
+  uint32_t   top_k;
+  uint32_t   i;
+  uint32_t   j;
+  uint32_t   n;
+  uint32_t   n_validated = 0;
+
+  (void)market_id_db;
+
+  if(err != NULL && err_cap > 0)
+    err[0] = '\0';
+
+  if(st == NULL || snap == NULL || strategy_name == NULL ||
+     plan == NULL || oos_tail == NULL || results == NULL)
+  {
+    if(err != NULL)
+      snprintf(err, err_cap, "bad oos validation inputs");
+    return(FAIL);
+  }
+
+  if(oos_tail->end_ts_ms <= oos_tail->start_ts_ms)
+  {
+    if(err != NULL)
+      snprintf(err, err_cap, "oos tail empty");
+    return(FAIL);
+  }
+
+  n     = plan->total_iters;
+  top_k = plan->top_k > n ? n : plan->top_k;
+
+  if(top_k == 0)
+  {
+    if(err != NULL)
+      snprintf(err, err_cap, "top_k = 0; nothing to validate");
+    return(FAIL);
+  }
+
+  top_idx   = mem_alloc("whenmoon.sweep", "oos_top_idx",
+      sizeof(*top_idx)   * (size_t)top_k);
+  top_score = mem_alloc("whenmoon.sweep", "oos_top_score",
+      sizeof(*top_score) * (size_t)top_k);
+
+  if(top_idx == NULL || top_score == NULL)
+  {
+    if(top_idx   != NULL) mem_free(top_idx);
+    if(top_score != NULL) mem_free(top_score);
+
+    if(err != NULL)
+      snprintf(err, err_cap, "oos validation alloc failed");
+    return(FAIL);
+  }
+
+  for(i = 0; i < top_k; i++)
+  {
+    top_idx[i]   = UINT32_MAX;
+    top_score[i] = -DBL_MAX;
+  }
+
+  // Insertion-sort top-K — O(N*K) is fine at this scale (N ≤ 1<<20,
+  // K ≤ 64), and we want stable behaviour with the renderer's
+  // qsort comparator (score desc, wallclock asc on tie).
+  for(i = 0; i < n; i++)
+  {
+    if(!results[i].ok || results[i].score <= -DBL_MAX)
+      continue;
+
+    for(j = 0; j < top_k; j++)
+    {
+      if(top_idx[j] == UINT32_MAX || results[i].score > top_score[j])
+      {
+        // Shift down + insert.
+        uint32_t k_;
+        for(k_ = top_k - 1; k_ > j; k_--)
+        {
+          top_idx[k_]   = top_idx[k_ - 1];
+          top_score[k_] = top_score[k_ - 1];
+        }
+        top_idx[j]   = i;
+        top_score[j] = results[i].score;
+        break;
+      }
+    }
+  }
+
+  // Validate each top-K against the OOS tail. Each iteration runs in
+  // its own private registry; the synth_id is fresh per validation
+  // so per-iter KV slots don't collide with the head sweep's.
+  for(i = 0; i < top_k; i++)
+  {
+    uint32_t              src_iter;
+    uint32_t              indices[WM_BT_SWEEP_MAX_PARAMS] = {0};
+    char                  synth_id[WM_MARKET_ID_STR_SZ];
+    wm_trade_registry_t  *reg;
+    wm_backtest_result_t  bt_result;
+    char                  iter_err[160];
+    bool                  iter_ok;
+
+    if(top_idx[i] == UINT32_MAX)
+      continue;
+
+    src_iter = top_idx[i];
+
+    wm_bt_sweep_iter_indices(plan, src_iter, indices);
+
+    wm_backtest_alloc_synthetic_id(synth_id, sizeof(synth_id));
+
+    iter_err[0] = '\0';
+
+    if(wm_bt_sweep_apply_iter_kv(synth_id, strategy_name, plan,
+           indices, iter_err, sizeof(iter_err)) != SUCCESS)
+    {
+      snprintf(results[src_iter].oos_err,
+          sizeof(results[src_iter].oos_err),
+          "%s", iter_err[0] != '\0' ? iter_err : "kv apply failed");
+      wm_bt_sweep_drop_iter_kv(synth_id);
+      continue;
+    }
+
+    reg = wm_trade_registry_create();
+
+    if(reg == NULL)
+    {
+      snprintf(results[src_iter].oos_err,
+          sizeof(results[src_iter].oos_err),
+          "private registry alloc failed");
+      wm_bt_sweep_drop_iter_kv(synth_id);
+      continue;
+    }
+
+    wm_trade_engine_use_registry(reg);
+
+    iter_err[0] = '\0';
+    iter_ok = wm_backtest_run_iteration_with_id(st, snap,
+        strategy_name, synth_id, base_params,
+        oos_tail, 1, &bt_result, iter_err, sizeof(iter_err))
+        == SUCCESS;
+
+    wm_trade_engine_use_registry(NULL);
+    wm_trade_registry_destroy(reg);
+
+    wm_bt_sweep_drop_iter_kv(synth_id);
+
+    if(!iter_ok)
+    {
+      snprintf(results[src_iter].oos_err,
+          sizeof(results[src_iter].oos_err),
+          "%s", iter_err[0] != '\0' ? iter_err : "oos iter failed");
+      continue;
+    }
+
+    results[src_iter].have_oos     = true;
+    results[src_iter].oos_score    =
+        wm_bt_sweep_score_value(&bt_result.trade, plan->score);
+    results[src_iter].oos_realized = bt_result.trade.metrics.realized_pnl;
+    results[src_iter].oos_n_trades = bt_result.trade.metrics.n_trades;
+
+    if(results[src_iter].run_id_db > 0)
+      wm_backtest_persist_oos_update(results[src_iter].run_id_db,
+          results[src_iter].oos_score,
+          results[src_iter].oos_realized,
+          results[src_iter].oos_n_trades);
+
+    n_validated++;
+  }
+
+  mem_free(top_idx);
+  mem_free(top_score);
+
+  if(n_validated == 0)
+  {
+    if(err != NULL)
+      snprintf(err, err_cap,
+          "oos validation: no eligible top-K rows could complete");
+    return(FAIL);
+  }
+
+  return(SUCCESS);
 }
 
 // ----------------------------------------------------------------------- //

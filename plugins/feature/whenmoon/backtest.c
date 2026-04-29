@@ -471,7 +471,29 @@ wm_backtest_run_iteration(whenmoon_state_t *st,
 
   wm_backtest_alloc_synthetic_id(synth_id, sizeof(synth_id));
   return(wm_backtest_run_iteration_with_id(st, snap, strategy_name,
-      synth_id, params, out, err, err_cap));
+      synth_id, params, NULL, 0, out, err, err_cap));
+}
+
+// Return true when ts_ms falls inside at least one window. n_windows
+// is small (<= WM_BT_WALK_MAX_WINDOWS = 256), and windows are sorted
+// chronologically; a tighter binary search is unnecessary at v1
+// scale, but the linear scan still short-circuits on the first hit.
+static inline bool
+wm_bt_in_any_window(const wm_bt_window_t *w, uint32_t n, int64_t ts_ms)
+{
+  uint32_t i;
+
+  for(i = 0; i < n; i++)
+  {
+    if(ts_ms >= w[i].start_ts_ms && ts_ms < w[i].end_ts_ms)
+      return(true);
+
+    // Windows sorted ascending — bail once we pass the bar's ts.
+    if(w[i].start_ts_ms > ts_ms)
+      return(false);
+  }
+
+  return(false);
 }
 
 bool
@@ -480,6 +502,7 @@ wm_backtest_run_iteration_with_id(whenmoon_state_t *st,
     const char *strategy_name,
     const char *synth_id,
     const wm_backtest_params_t *params,
+    const wm_bt_window_t *windows, uint32_t n_windows,
     wm_backtest_result_t *out,
     char *err, size_t err_cap)
 {
@@ -620,15 +643,28 @@ wm_backtest_run_iteration_with_id(whenmoon_state_t *st,
     // Match wm_strategy_dispatch_bar: ctx fields update only for
     // grains the strategy subscribes to (un-subscribed grains keep
     // the cursor moving but never touch the strategy's mark cache).
+    //
+    // Walk-forward / OOS gating: when a window set is supplied, the
+    // strategy callback fires only for bars whose ts falls inside a
+    // test window. Bars outside the windows still advance their
+    // cursor — the aggregator and ctx mark caches stay coherent —
+    // but the strategy never sees them, so the trade book records
+    // fills only during windowed ranges.
     if(cursors[g].subscribed)
     {
-      ctx.bars_seen++;
-      ctx.last_bar_ts_ms = bar->ts_close_ms;
-      ctx.last_mark_px   = bar->close;
-      ctx.last_mark_ms   = bar->ts_close_ms;
+      bool in_window = (n_windows == 0) ||
+          wm_bt_in_any_window(windows, n_windows, bar->ts_close_ms);
 
-      on_bar_fn(&ctx, &snap->mkt, g, bar);
-      bars_replayed++;
+      if(in_window)
+      {
+        ctx.bars_seen++;
+        ctx.last_bar_ts_ms = bar->ts_close_ms;
+        ctx.last_mark_px   = bar->close;
+        ctx.last_mark_ms   = bar->ts_close_ms;
+
+        on_bar_fn(&ctx, &snap->mkt, g, bar);
+        bars_replayed++;
+      }
     }
 
     cursors[g].idx++;
@@ -676,11 +712,14 @@ wm_backtest_persist_run(const wm_backtest_record_t *rec,
     int64_t *out_run_id)
 {
   db_result_t *res = NULL;
-  char        *e_strategy = NULL;
-  char        *e_start    = NULL;
-  char        *e_end      = NULL;
-  char        *e_params   = NULL;
-  char        *e_metrics  = NULL;
+  char        *e_strategy   = NULL;
+  char        *e_start      = NULL;
+  char        *e_end        = NULL;
+  char        *e_window_knd = NULL;
+  char        *e_params     = NULL;
+  char        *e_metrics    = NULL;
+  const char  *window_kind;
+  uint32_t     n_windows;
   char         sql[2048];
   int          n;
   bool         ok = FAIL;
@@ -688,13 +727,19 @@ wm_backtest_persist_run(const wm_backtest_record_t *rec,
   if(rec == NULL || metrics_json == NULL)
     return(FAIL);
 
-  e_strategy = db_escape(rec->strategy_name);
-  e_start    = db_escape(rec->range_start);
-  e_end      = db_escape(rec->range_end);
-  e_metrics  = db_escape(metrics_json);
+  // Defaults preserve WM-LT-5 behaviour for callers that don't set
+  // these fields (e.g. anything pre-WM-LT-7 that zeros the record).
+  window_kind = (rec->window_kind[0] != '\0') ? rec->window_kind : "full";
+  n_windows   = (rec->n_windows > 0)          ? rec->n_windows  : 1;
+
+  e_strategy   = db_escape(rec->strategy_name);
+  e_start      = db_escape(rec->range_start);
+  e_end        = db_escape(rec->range_end);
+  e_window_knd = db_escape(window_kind);
+  e_metrics    = db_escape(metrics_json);
 
   if(e_strategy == NULL || e_start == NULL || e_end == NULL ||
-     e_metrics == NULL)
+     e_window_knd == NULL || e_metrics == NULL)
     goto out;
 
   if(params_json != NULL)
@@ -705,17 +750,21 @@ wm_backtest_persist_run(const wm_backtest_record_t *rec,
       goto out;
   }
 
-  // The seven scalar columns are sourced directly off the record so a
-  // /show whenmoon backtest list can render them without a JSONB
-  // round-trip; full metrics live in the JSONB column for detail view.
+  // The denormalised scalar columns let /show whenmoon backtest list
+  // render without a JSONB round-trip; full metrics live in the JSONB
+  // column for the detail view. OOS columns insert as SQL NULL — the
+  // post-pass UPDATE (wm_backtest_persist_oos_update) populates them
+  // for top-K rows that completed the validation iteration.
   n = snprintf(sql, sizeof(sql),
       "INSERT INTO wm_backtest_run"
       " (market_id, strategy_name, range_start, range_end,"
       "  bars_replayed, n_trades, realized_pnl, final_equity,"
       "  max_drawdown, sharpe, sortino, wallclock_ms,"
+      "  window_kind, n_windows,"
       "  params, metrics)"
       " VALUES (%" PRId32 ", '%s', TIMESTAMPTZ '%s', TIMESTAMPTZ '%s',"
       " %u, %u, %.10g, %.10g, %.10g, %.10g, %.10g, %" PRId64 ","
+      " '%s', %u,"
       " %s%s%s, '%s'::jsonb)"
       " RETURNING run_id",
       rec->market_id, e_strategy, e_start, e_end,
@@ -723,6 +772,7 @@ wm_backtest_persist_run(const wm_backtest_record_t *rec,
       rec->realized_pnl, rec->final_equity,
       rec->max_drawdown, rec->sharpe, rec->sortino,
       rec->wallclock_ms,
+      e_window_knd, n_windows,
       e_params != NULL ? "'" : "NULL",
       e_params != NULL ? e_params : "",
       e_params != NULL ? "'::jsonb" : "",
@@ -757,13 +807,60 @@ wm_backtest_persist_run(const wm_backtest_record_t *rec,
   }
 
 out:
-  if(res        != NULL) db_result_free(res);
-  if(e_strategy != NULL) mem_free(e_strategy);
-  if(e_start    != NULL) mem_free(e_start);
-  if(e_end      != NULL) mem_free(e_end);
-  if(e_params   != NULL) mem_free(e_params);
-  if(e_metrics  != NULL) mem_free(e_metrics);
+  if(res          != NULL) db_result_free(res);
+  if(e_strategy   != NULL) mem_free(e_strategy);
+  if(e_start      != NULL) mem_free(e_start);
+  if(e_end        != NULL) mem_free(e_end);
+  if(e_window_knd != NULL) mem_free(e_window_knd);
+  if(e_params     != NULL) mem_free(e_params);
+  if(e_metrics    != NULL) mem_free(e_metrics);
 
+  return(ok);
+}
+
+bool
+wm_backtest_persist_oos_update(int64_t run_id,
+    double oos_score, double oos_realized, uint32_t oos_n_trades)
+{
+  db_result_t *res = NULL;
+  char         sql[512];
+  int          n;
+  bool         ok = FAIL;
+
+  if(run_id <= 0)
+    return(FAIL);
+
+  // Top-K OOS validation row: flip window_kind to 'oos' (the head
+  // sweep had already inserted under 'oos' too — this is idempotent
+  // and matches the post-pass invariant).
+  n = snprintf(sql, sizeof(sql),
+      "UPDATE wm_backtest_run"
+      "   SET oos_score    = %.10g,"
+      "       oos_realized = %.10g,"
+      "       oos_n_trades = %u,"
+      "       window_kind  = 'oos'"
+      " WHERE run_id = %" PRId64,
+      oos_score, oos_realized, oos_n_trades, run_id);
+
+  if(n < 0 || (size_t)n >= sizeof(sql))
+  {
+    clam(CLAM_WARN, WM_BT_CTX, "oos update sql overflow");
+    return(FAIL);
+  }
+
+  res = db_result_alloc();
+
+  if(res == NULL)
+    return(FAIL);
+
+  if(db_query(sql, res) == SUCCESS && res->ok)
+    ok = SUCCESS;
+  else
+    clam(CLAM_WARN, WM_BT_CTX, "wm_backtest_run oos update failed: %s",
+        (res != NULL && res->error[0] != '\0') ? res->error
+                                               : "(no driver error)");
+
+  db_result_free(res);
   return(ok);
 }
 
@@ -774,6 +871,7 @@ out:
     " to_char(range_end,   'YYYY-MM-DD HH24:MI:SS+00') AS range_end,"  \
     " bars_replayed, n_trades, realized_pnl, final_equity,"            \
     " max_drawdown, sharpe, sortino, wallclock_ms,"                    \
+    " window_kind, n_windows, oos_score, oos_realized, oos_n_trades,"  \
     " to_char(created_at,  'YYYY-MM-DD HH24:MI:SS+00') AS created_at"
 
 static void
@@ -840,6 +938,30 @@ wm_bt_record_from_row(const db_result_t *res, uint32_t row,
   if(s != NULL) out->wallclock_ms = (int64_t)strtoll(s, NULL, 10);
 
   s = db_result_get(res, row, 13);
+  if(s != NULL)
+  {
+    slen = strnlen(s, sizeof(out->window_kind) - 1);
+    memcpy(out->window_kind, s, slen);
+    out->window_kind[slen] = '\0';
+  }
+
+  s = db_result_get(res, row, 14);
+  if(s != NULL) out->n_windows = (uint32_t)strtoul(s, NULL, 10);
+
+  s = db_result_get(res, row, 15);
+  if(s != NULL)
+  {
+    out->oos_score = strtod(s, NULL);
+    out->have_oos  = true;
+  }
+
+  s = db_result_get(res, row, 16);
+  if(s != NULL) out->oos_realized = strtod(s, NULL);
+
+  s = db_result_get(res, row, 17);
+  if(s != NULL) out->oos_n_trades = (uint32_t)strtoul(s, NULL, 10);
+
+  s = db_result_get(res, row, 18);
   if(s != NULL)
   {
     slen = strnlen(s, sizeof(out->created_at) - 1);
@@ -952,14 +1074,235 @@ wm_backtest_lookup_run(int64_t run_id, wm_backtest_record_t *out,
     wm_bt_record_from_row(res, 0, out);
 
     if(out_metrics_json != NULL)
-      *out_metrics_json = wm_bt_dup_cell(res, 0, 14);
+      *out_metrics_json = wm_bt_dup_cell(res, 0, 19);
 
     if(out_params_json != NULL)
-      *out_params_json = wm_bt_dup_cell(res, 0, 15);
+      *out_params_json = wm_bt_dup_cell(res, 0, 20);
 
     ok = SUCCESS;
   }
 
   db_result_free(res);
   return(ok);
+}
+
+// ----------------------------------------------------------------------- //
+// Walk-forward + OOS windowing helpers                                    //
+// ----------------------------------------------------------------------- //
+//
+// Walk-forward: window i has train range [start + i*step, start + i*step
+// + train], test range [train_end, train_end + test]. A window is
+// admitted only if its test range fits inside the snapshot's range
+// AND covers at least WM_BT_WALK_MIN_TEST_BARS 1m bars.
+//
+// 1m bars in a window = floor(window_duration / 60s). The 60-second
+// minimum is conservative — a partial bar at the boundary contributes
+// no real signal.
+
+static const int64_t WM_BT_DAY_MS = 86400LL * 1000LL;
+static const int64_t WM_BT_MIN_MS = 60LL    * 1000LL;
+
+bool
+wm_bt_walk_build_windows(const wm_bt_walk_spec_t *spec,
+    int64_t range_start_ms, int64_t range_end_ms,
+    const loaded_strategy_t *ls,
+    wm_bt_window_set_t *out, char *err, size_t err_cap)
+{
+  int64_t  train_ms;
+  int64_t  test_ms;
+  int64_t  step_ms;
+  int64_t  cur;
+  uint32_t n = 0;
+  uint32_t bars_per_test;
+
+  if(err != NULL && err_cap > 0)
+    err[0] = '\0';
+
+  if(spec == NULL || out == NULL || range_end_ms <= range_start_ms)
+  {
+    if(err != NULL)
+      snprintf(err, err_cap, "bad walk-forward inputs");
+    return(FAIL);
+  }
+
+  if(spec->train_days == 0 || spec->test_days == 0 || spec->step_days == 0)
+  {
+    if(err != NULL)
+      snprintf(err, err_cap,
+          "walk-forward train/test/step all must be > 0");
+    return(FAIL);
+  }
+
+  train_ms = (int64_t)spec->train_days * WM_BT_DAY_MS;
+  test_ms  = (int64_t)spec->test_days  * WM_BT_DAY_MS;
+  step_ms  = (int64_t)spec->step_days  * WM_BT_DAY_MS;
+
+  // Strategy min_history pre-flight. The 1d grain is the most
+  // restrictive; convert each grain's required bars back to days
+  // worth of training. WM-LT-7 v1 only enforces against subscribed
+  // grains — un-subscribed grains have no min_history requirement.
+  if(ls != NULL)
+  {
+    static const int64_t bar_ms[WM_GRAN_MAX] = {
+      [WM_GRAN_1M]   = 60LL    * 1000LL,
+      [WM_GRAN_5M]   = 300LL   * 1000LL,
+      [WM_GRAN_15M]  = 900LL   * 1000LL,
+      [WM_GRAN_1H]   = 3600LL  * 1000LL,
+      [WM_GRAN_6H]   = 21600LL * 1000LL,
+      [WM_GRAN_1D]   = 86400LL * 1000LL,
+    };
+
+    uint32_t g;
+
+    for(g = 0; g < WM_GRAN_MAX; g++)
+    {
+      int64_t  needed_ms;
+      uint32_t needed_days;
+
+      if((ls->meta.grains_mask & (uint16_t)(1u << g)) == 0)
+        continue;
+
+      if(ls->meta.min_history[g] == 0)
+        continue;
+
+      needed_ms   = (int64_t)ls->meta.min_history[g] * bar_ms[g];
+      needed_days = (uint32_t)((needed_ms + WM_BT_DAY_MS - 1) / WM_BT_DAY_MS);
+
+      if(spec->train_days < needed_days)
+      {
+        if(err != NULL)
+          snprintf(err, err_cap,
+              "train=%ud insufficient: strategy needs %u %s bars"
+              " (~%ud)", spec->train_days,
+              ls->meta.min_history[g],
+              g == WM_GRAN_1M  ? "1m"  : g == WM_GRAN_5M  ? "5m"  :
+              g == WM_GRAN_15M ? "15m" : g == WM_GRAN_1H  ? "1h"  :
+              g == WM_GRAN_6H  ? "6h"  : "1d",
+              needed_days);
+        return(FAIL);
+      }
+    }
+  }
+
+  bars_per_test = (uint32_t)(test_ms / WM_BT_MIN_MS);
+
+  if(bars_per_test < WM_BT_WALK_MIN_TEST_BARS)
+  {
+    if(err != NULL)
+      snprintf(err, err_cap,
+          "test window too short: %ud yields %u 1m bars (min %u)",
+          spec->test_days, bars_per_test,
+          (unsigned)WM_BT_WALK_MIN_TEST_BARS);
+    return(FAIL);
+  }
+
+  // Walk: each iter builds [train_start, train_end] then
+  // [train_end, train_end + test], advancing by step until the next
+  // test would extend past range_end.
+  cur = range_start_ms;
+
+  while(n < WM_BT_WALK_MAX_WINDOWS)
+  {
+    int64_t train_start = cur;
+    int64_t train_end   = train_start + train_ms;
+    int64_t test_start  = train_end;
+    int64_t test_end    = test_start + test_ms;
+
+    // Last partial window: clip test_end against range_end and drop
+    // if the clipped window contains < MIN_TEST_BARS.
+    if(test_end > range_end_ms)
+      test_end = range_end_ms;
+
+    if(test_end <= test_start)
+      break;
+
+    if((uint32_t)((test_end - test_start) / WM_BT_MIN_MS)
+       < WM_BT_WALK_MIN_TEST_BARS)
+      break;
+
+    if(train_end > range_end_ms)
+      break;
+
+    out->windows[n].start_ts_ms = test_start;
+    out->windows[n].end_ts_ms   = test_end;
+    n++;
+
+    cur += step_ms;
+
+    // Sanity: if step is so small the next window's test range
+    // overlaps the previous one's end heavily, we still admit it —
+    // overlapping test ranges are a deliberate walk-forward design
+    // choice (when step < test). The cap handles the runaway case.
+  }
+
+  if(n == 0)
+  {
+    if(err != NULL)
+      snprintf(err, err_cap,
+          "walk-forward produced no windows; range too short for"
+          " train=%ud test=%ud step=%ud",
+          spec->train_days, spec->test_days, spec->step_days);
+    return(FAIL);
+  }
+
+  if(n >= WM_BT_WALK_MAX_WINDOWS)
+  {
+    if(err != NULL)
+      snprintf(err, err_cap,
+          "walk-forward window count cap (%u) hit; raise step or"
+          " shorten range", (unsigned)WM_BT_WALK_MAX_WINDOWS);
+    return(FAIL);
+  }
+
+  out->n = n;
+  return(SUCCESS);
+}
+
+bool
+wm_bt_oos_split_range(const wm_bt_oos_spec_t *spec,
+    int64_t range_start_ms, int64_t range_end_ms,
+    wm_bt_window_t *out_head, wm_bt_window_t *out_tail,
+    char *err, size_t err_cap)
+{
+  int64_t  range_ms;
+  int64_t  tail_ms;
+  int64_t  split_ms;
+
+  if(err != NULL && err_cap > 0)
+    err[0] = '\0';
+
+  if(spec == NULL || out_head == NULL || out_tail == NULL ||
+     range_end_ms <= range_start_ms)
+  {
+    if(err != NULL)
+      snprintf(err, err_cap, "bad oos-tail inputs");
+    return(FAIL);
+  }
+
+  if(spec->pct == 0 || spec->pct > 50)
+  {
+    if(err != NULL)
+      snprintf(err, err_cap,
+          "oos-tail %u%% out of range (expected 1..50)", spec->pct);
+    return(FAIL);
+  }
+
+  range_ms = range_end_ms - range_start_ms;
+  tail_ms  = range_ms * (int64_t)spec->pct / 100;
+  split_ms = range_end_ms - tail_ms;
+
+  if(split_ms <= range_start_ms || split_ms >= range_end_ms)
+  {
+    if(err != NULL)
+      snprintf(err, err_cap,
+          "oos-tail %u%% leaves zero-duration head or tail", spec->pct);
+    return(FAIL);
+  }
+
+  out_head->start_ts_ms = range_start_ms;
+  out_head->end_ts_ms   = split_ms;
+  out_tail->start_ts_ms = split_ms;
+  out_tail->end_ts_ms   = range_end_ms;
+
+  return(SUCCESS);
 }

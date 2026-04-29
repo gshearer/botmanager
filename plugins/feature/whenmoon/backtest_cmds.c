@@ -213,6 +213,115 @@ wm_bt_parse_double_flag(const char *tok, double *out_v, bool *out_have)
   return(SUCCESS);
 }
 
+// Parse "train=Td:test=Md:step=Sd" into a wm_bt_walk_spec_t.
+// Each segment must use a 'd' suffix; days, not weeks/hours. Returns
+// SUCCESS on a clean parse with all three keys present.
+static bool
+wm_bt_parse_walk_spec(const char *tok, wm_bt_walk_spec_t *out)
+{
+  char     buf[160];
+  char    *save = NULL;
+  char    *seg;
+  uint32_t got_mask = 0;
+
+  if(tok == NULL || out == NULL)
+    return(FAIL);
+
+  if(strlen(tok) >= sizeof(buf))
+    return(FAIL);
+
+  snprintf(buf, sizeof(buf), "%s", tok);
+  memset(out, 0, sizeof(*out));
+
+  for(seg = strtok_r(buf, ":", &save); seg != NULL;
+      seg = strtok_r(NULL, ":", &save))
+  {
+    char     *eq = strchr(seg, '=');
+    char     *end = NULL;
+    char      key[16];
+    long      v;
+    size_t    klen;
+
+    if(eq == NULL)
+      return(FAIL);
+
+    klen = (size_t)(eq - seg);
+
+    if(klen == 0 || klen >= sizeof(key))
+      return(FAIL);
+
+    memcpy(key, seg, klen);
+    key[klen] = '\0';
+
+    errno = 0;
+    v     = strtol(eq + 1, &end, 10);
+
+    if(end == eq + 1 || errno != 0 || v <= 0)
+      return(FAIL);
+
+    // Tolerate a trailing 'd' (the documented suffix); reject others.
+    if(*end == 'd' && *(end + 1) == '\0')
+      ;  // ok
+    else if(*end != '\0')
+      return(FAIL);
+
+    if(strcmp(key, "train") == 0)
+    {
+      out->train_days = (uint32_t)v;
+      got_mask |= 1u;
+    }
+    else if(strcmp(key, "test") == 0)
+    {
+      out->test_days = (uint32_t)v;
+      got_mask |= 2u;
+    }
+    else if(strcmp(key, "step") == 0)
+    {
+      out->step_days = (uint32_t)v;
+      got_mask |= 4u;
+    }
+    else
+      return(FAIL);
+  }
+
+  return((got_mask == 7u) ? SUCCESS : FAIL);
+}
+
+// Parse "YYYY-MM-DD HH:MM:SS+00" -> ms epoch. Returns SUCCESS on a
+// clean parse. Mirrors the parser inside backtest.c; duplicated here
+// because that one is static.
+static bool
+wm_bt_parse_ts_ms(const char *in, int64_t *out_ms)
+{
+  struct tm tm;
+  unsigned  yyyy, mo, dd, hh, mm, ss;
+  int       consumed = 0;
+  time_t    t;
+
+  if(in == NULL || out_ms == NULL)
+    return(FAIL);
+
+  if(sscanf(in, "%u-%u-%u %u:%u:%u%n",
+        &yyyy, &mo, &dd, &hh, &mm, &ss, &consumed) != 6 || consumed < 19)
+    return(FAIL);
+
+  memset(&tm, 0, sizeof(tm));
+  tm.tm_year = (int)yyyy - 1900;
+  tm.tm_mon  = (int)mo - 1;
+  tm.tm_mday = (int)dd;
+  tm.tm_hour = (int)hh;
+  tm.tm_min  = (int)mm;
+  tm.tm_sec  = (int)ss;
+
+  t = timegm(&tm);
+
+  if(t == (time_t)-1)
+    return(FAIL);
+
+  *out_ms = (int64_t)t * 1000;
+  return(SUCCESS);
+}
+
 static void
 wm_bt_cmd_run(const cmd_ctx_t *ctx)
 {
@@ -238,7 +347,12 @@ wm_bt_cmd_run(const cmd_ctx_t *ctx)
   wm_backtest_result_t    result;
   loaded_strategy_t      *ls;
   wm_bt_sweep_plan_t      sweep_plan;
-  bool                    have_sweep = false;
+  wm_bt_sweep_mode_t      sweep_mode;
+  wm_bt_walk_spec_t       walk_spec;
+  wm_bt_oos_spec_t        oos_spec;
+  bool                    have_sweep        = false;
+  bool                    have_walk_forward = false;
+  bool                    have_oos_tail     = false;
   uint32_t                min_history_1d = 0;
 
   st = whenmoon_get_state();
@@ -269,7 +383,9 @@ wm_bt_cmd_run(const cmd_ctx_t *ctx)
         " [--size-frac F] [--cash N]"
         " [--sweep <param>=<v1,v2,...>|<lo:step:hi>] (repeatable)"
         " [--workers N] [--score realized|sharpe|sortino|equity|pf]"
-        " [--top K]");
+        " [--top K]"
+        " [--walk-forward train=Td:test=Md:step=Sd]"
+        " [--oos-tail PCT]");
     return;
   }
 
@@ -343,8 +459,11 @@ wm_bt_cmd_run(const cmd_ctx_t *ctx)
 
   // Parse optional --flag value pairs. The economic knobs apply to
   // every iteration; --sweep / --workers / --score / --top control the
-  // sweep planner.
+  // sweep planner. --walk-forward / --oos-tail set window scope.
   memset(&params,     0, sizeof(params));
+  memset(&sweep_mode, 0, sizeof(sweep_mode));
+  memset(&walk_spec,  0, sizeof(walk_spec));
+  memset(&oos_spec,   0, sizeof(oos_spec));
   wm_bt_sweep_plan_init(&sweep_plan);
 
   while(wm_dl_next_token(&p, flag_tok, sizeof(flag_tok)))
@@ -449,19 +568,64 @@ wm_bt_cmd_run(const cmd_ctx_t *ctx)
 
       sweep_plan.top_k = (uint32_t)k;
     }
+    else if(strcmp(flag_tok, "--walk-forward") == 0)
+    {
+      if(wm_bt_parse_walk_spec(val_tok, &walk_spec) != SUCCESS)
+      {
+        cmd_reply(ctx,
+            "bad --walk-forward (expected"
+            " train=Td:test=Md:step=Sd, days)");
+        return;
+      }
+      have_walk_forward = true;
+    }
+    else if(strcmp(flag_tok, "--oos-tail") == 0)
+    {
+      char *end = NULL;
+      long  pct;
+
+      errno = 0;
+      pct   = strtol(val_tok, &end, 10);
+
+      if(end == val_tok || errno != 0 || *end != '\0' ||
+         pct < 1 || pct > 50)
+      {
+        cmd_reply(ctx, "bad --oos-tail (expected integer 1..50)");
+        return;
+      }
+
+      oos_spec.pct  = (uint32_t)pct;
+      have_oos_tail = true;
+    }
     else
     {
       snprintf(reply, sizeof(reply),
           "unknown flag '%s' (expected --fee-bps/--slip-bps/"
-          "--size-frac/--cash/--sweep/--workers/--score/--top)",
+          "--size-frac/--cash/--sweep/--workers/--score/--top/"
+          "--walk-forward/--oos-tail)",
           flag_tok);
       cmd_reply(ctx, reply);
       return;
     }
   }
 
+  if(have_walk_forward && have_oos_tail)
+  {
+    cmd_reply(ctx,
+        "--walk-forward and --oos-tail are mutually exclusive");
+    return;
+  }
+
   // Default top_k for sweeps when caller didn't specify.
   if(have_sweep && sweep_plan.top_k == 1)
+    sweep_plan.top_k = WM_BT_DEFAULT_TOP_K;
+
+  // OOS validation needs at least a few top-K rows to be useful.
+  // When --oos-tail is set without --sweep or --top, default top to
+  // a small number so the post-pass actually has work to do.
+  if(have_oos_tail && sweep_plan.top_k == 1 && !have_sweep)
+    sweep_plan.top_k = 1;
+  else if(have_oos_tail && sweep_plan.top_k == 1)
     sweep_plan.top_k = WM_BT_DEFAULT_TOP_K;
 
   if(wm_bt_sweep_plan_finalize(&sweep_plan, err, sizeof(err)) != SUCCESS)
@@ -470,6 +634,61 @@ wm_bt_cmd_run(const cmd_ctx_t *ctx)
         "error: %s", err[0] != '\0' ? err : "sweep finalize failed");
     cmd_reply(ctx, reply);
     return;
+  }
+
+  // Build the sweep mode + windows. Resolves +/- the in-memory range
+  // bounds in ms epoch so the window builders can slice deterministically.
+  {
+    int64_t range_start_ms = 0;
+    int64_t range_end_ms   = 0;
+
+    sweep_mode.mode = WM_BT_MODE_FULL;
+
+    if(have_walk_forward || have_oos_tail)
+    {
+      if(wm_bt_parse_ts_ms(start_ts, &range_start_ms) != SUCCESS ||
+         wm_bt_parse_ts_ms(end_ts,   &range_end_ms)   != SUCCESS)
+      {
+        cmd_reply(ctx, "internal: range timestamp parse failed");
+        return;
+      }
+    }
+
+    if(have_walk_forward)
+    {
+      err[0] = '\0';
+
+      if(wm_bt_walk_build_windows(&walk_spec, range_start_ms,
+             range_end_ms, ls, &sweep_mode.walk,
+             err, sizeof(err)) != SUCCESS)
+      {
+        snprintf(reply, sizeof(reply),
+            "walk-forward error: %s",
+            err[0] != '\0' ? err : "(unknown)");
+        cmd_reply(ctx, reply);
+        return;
+      }
+
+      sweep_mode.mode = WM_BT_MODE_WALK_FORWARD;
+    }
+
+    else if(have_oos_tail)
+    {
+      err[0] = '\0';
+
+      if(wm_bt_oos_split_range(&oos_spec, range_start_ms, range_end_ms,
+             &sweep_mode.oos_head, &sweep_mode.oos_tail,
+             err, sizeof(err)) != SUCCESS)
+      {
+        snprintf(reply, sizeof(reply),
+            "oos-tail error: %s",
+            err[0] != '\0' ? err : "(unknown)");
+        cmd_reply(ctx, reply);
+        return;
+      }
+
+      sweep_mode.mode = WM_BT_MODE_OOS;
+    }
   }
 
   if(min_history_1d == 0)
@@ -499,19 +718,40 @@ wm_bt_cmd_run(const cmd_ctx_t *ctx)
     return;
   }
 
-  if(have_sweep)
+  if(have_sweep || have_walk_forward || have_oos_tail)
   {
     wm_bt_sweep_result_t *sweep_results;
     struct timespec       t0, t1;
     uint64_t              wallclock_ms;
     uint32_t              i;
     uint32_t              n_ok = 0;
+    const char           *mode_label =
+        sweep_mode.mode == WM_BT_MODE_WALK_FORWARD ? "walk" :
+        sweep_mode.mode == WM_BT_MODE_OOS          ? "oos"  :
+                                                     "full";
 
-    snprintf(reply, sizeof(reply),
-        "snapshot ready: %u 1m bars; sweep N=%u workers=%u"
-        " score=%s top=%u",
-        snap->bars_loaded_1m, sweep_plan.total_iters, sweep_plan.workers,
-        wm_bt_sweep_score_name(sweep_plan.score), sweep_plan.top_k);
+    if(sweep_mode.mode == WM_BT_MODE_WALK_FORWARD)
+      snprintf(reply, sizeof(reply),
+          "snapshot ready: %u 1m bars; walk-forward N=%u windows=%u"
+          " workers=%u score=%s top=%u",
+          snap->bars_loaded_1m, sweep_plan.total_iters,
+          sweep_mode.walk.n,
+          sweep_plan.workers,
+          wm_bt_sweep_score_name(sweep_plan.score), sweep_plan.top_k);
+    else if(sweep_mode.mode == WM_BT_MODE_OOS)
+      snprintf(reply, sizeof(reply),
+          "snapshot ready: %u 1m bars; oos head N=%u (oos_tail=%u%%)"
+          " workers=%u score=%s top=%u",
+          snap->bars_loaded_1m, sweep_plan.total_iters,
+          oos_spec.pct, sweep_plan.workers,
+          wm_bt_sweep_score_name(sweep_plan.score), sweep_plan.top_k);
+    else
+      snprintf(reply, sizeof(reply),
+          "snapshot ready: %u 1m bars; sweep N=%u workers=%u"
+          " score=%s top=%u",
+          snap->bars_loaded_1m, sweep_plan.total_iters,
+          sweep_plan.workers,
+          wm_bt_sweep_score_name(sweep_plan.score), sweep_plan.top_k);
     cmd_reply(ctx, reply);
 
     sweep_results = mem_alloc("whenmoon.backtest", "sweep_results",
@@ -529,7 +769,8 @@ wm_bt_cmd_run(const cmd_ctx_t *ctx)
     clock_gettime(CLOCK_MONOTONIC, &t0);
 
     if(wm_bt_sweep_run(st, snap, name_tok, market_id, &sweep_plan,
-           &params, sweep_results, err, sizeof(err)) != SUCCESS)
+           &sweep_mode, &params, sweep_results,
+           err, sizeof(err)) != SUCCESS)
     {
       snprintf(reply, sizeof(reply),
           "sweep run failed: %s",
@@ -550,15 +791,32 @@ wm_bt_cmd_run(const cmd_ctx_t *ctx)
         n_ok++;
 
     snprintf(reply, sizeof(reply),
-        "sweep complete: %u/%u ok in %" PRIu64 " ms"
-        " (%.1f iter/s)",
+        "%s complete: %u/%u ok in %" PRIu64 " ms (%.1f iter/s)",
+        mode_label,
         n_ok, sweep_plan.total_iters, wallclock_ms,
         wallclock_ms > 0
             ? (double)sweep_plan.total_iters * 1000.0 / (double)wallclock_ms
             : 0.0);
     cmd_reply(ctx, reply);
 
-    wm_bt_sweep_render_topk(ctx, &sweep_plan, sweep_results,
+    if(sweep_mode.mode == WM_BT_MODE_OOS && n_ok > 0)
+    {
+      err[0] = '\0';
+
+      if(wm_bt_sweep_run_oos_validation(st, snap, name_tok, market_id,
+             &sweep_plan, &sweep_mode.oos_tail, &params,
+             sweep_results, err, sizeof(err)) != SUCCESS)
+      {
+        snprintf(reply, sizeof(reply),
+            "oos validation: %s",
+            err[0] != '\0' ? err : "(no eligible top-K)");
+        cmd_reply(ctx, reply);
+      }
+      else
+        cmd_reply(ctx, "oos validation: top-K patched with oos columns");
+    }
+
+    wm_bt_sweep_render_topk(ctx, &sweep_plan, &sweep_mode, sweep_results,
         sweep_plan.total_iters);
 
     mem_free(sweep_results);
@@ -802,6 +1060,20 @@ wm_bt_show_detail(const cmd_ctx_t *ctx, int64_t run_id)
       rec.max_drawdown, rec.sharpe, rec.sortino);
   cmd_reply(ctx, line);
 
+  snprintf(line, sizeof(line),
+      "  window:   kind=%s n_windows=%u",
+      rec.window_kind[0] != '\0' ? rec.window_kind : "full",
+      rec.n_windows > 0 ? rec.n_windows : 1);
+  cmd_reply(ctx, line);
+
+  if(rec.have_oos)
+  {
+    snprintf(line, sizeof(line),
+        "  oos:      score=%+.4f realized=%+9.4f trades=%u",
+        rec.oos_score, rec.oos_realized, rec.oos_n_trades);
+    cmd_reply(ctx, line);
+  }
+
   if(params_json != NULL && params_json[0] != '\0' &&
      strcmp(params_json, "null") != 0)
   {
@@ -877,8 +1149,11 @@ wm_backtest_register_verbs(void)
         " [--fee-bps N] [--slip-bps N] [--size-frac F] [--cash N]"
         " [--sweep <param>=<v1,v2,...>|<lo:step:hi>] (repeatable)"
         " [--workers N] [--score realized|sharpe|sortino|equity|pf]"
-        " [--top K]",
-        "Run a single backtest or a parameter sweep.",
+        " [--top K]"
+        " [--walk-forward train=Td:test=Md:step=Sd]"
+        " [--oos-tail PCT]",
+        "Run a single backtest, a parameter sweep, walk-forward, or"
+        " an OOS-tail validation.",
         "Builds an isolated market snapshot from wm_candles_<id>_60"
         " over the given range and runs the strategy through a paper"
         " trade book in PAPER mode. With one or more --sweep axes,"
@@ -889,6 +1164,15 @@ wm_backtest_register_verbs(void)
         "--score selects the ranking metric (default realized).\n"
         "--top selects the top-K rows shown after the run (default 20"
         " when sweeping, 1 otherwise).\n"
+        "--walk-forward expands each param vector into N test windows"
+        " (train days warm the strategy state but only test windows"
+        " accumulate fills); the recorded score is the cumulative"
+        " test-window result.\n"
+        "--oos-tail PCT reserves the last PCT%% of the range as out-of"
+        "-sample; the sweep optimises on the head, then the post-pass"
+        " runs the top-K on the tail and patches the persisted row"
+        " with the OOS columns. PCT clamped to [1, 50].\n"
+        "--walk-forward and --oos-tail are mutually exclusive.\n"
         "Every iteration is persisted to wm_backtest_run; --top only"
         " controls render volume. Pre-flight gap check fails fast with"
         " the canonical /whenmoon download candles invocation when 1m"

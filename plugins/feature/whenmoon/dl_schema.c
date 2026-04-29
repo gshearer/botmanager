@@ -105,10 +105,17 @@ static const char *const wm_dl_ddl_core[] = {
   "CREATE INDEX IF NOT EXISTS idx_wm_job_state"
   " ON wm_download_job(state, created)",
 
-  // Backtest run history (WM-LT-5). One row per single-iteration
-  // backtest. params and metrics carry full JSONB blobs; the surface-
-  // level columns (n_trades, realized_pnl, sharpe, ...) are denormalised
-  // for cheap ranked listings via /show whenmoon backtest list.
+  // Backtest run history (WM-LT-5 + WM-LT-7). One row per iteration
+  // (single-iteration, walk-forward param vector, or OOS head pass).
+  // params + metrics carry full JSONB blobs; surface-level columns
+  // are denormalised for cheap ranked listings via
+  // /show whenmoon backtest list.
+  //
+  // window_kind: 'full' = single iteration over the full range;
+  // 'walk' = one row per param vector across all walk-forward test
+  // windows (n_windows > 1); 'oos' = head iteration of an OOS run
+  // (oos_* columns are non-NULL for top-K rows that completed the
+  // out-of-sample validation pass).
   "CREATE TABLE IF NOT EXISTS wm_backtest_run ("
   " run_id        BIGSERIAL    PRIMARY KEY,"
   " market_id     INT          NOT NULL,"
@@ -123,6 +130,11 @@ static const char *const wm_dl_ddl_core[] = {
   " sharpe        DOUBLE PRECISION NOT NULL,"
   " sortino       DOUBLE PRECISION NOT NULL,"
   " wallclock_ms  BIGINT       NOT NULL,"
+  " window_kind   VARCHAR(16)  NOT NULL DEFAULT 'full',"
+  " n_windows     INT          NOT NULL DEFAULT 1,"
+  " oos_score     DOUBLE PRECISION,"
+  " oos_realized  DOUBLE PRECISION,"
+  " oos_n_trades  INT,"
   " params        JSONB,"
   " metrics       JSONB        NOT NULL,"
   " created_at    TIMESTAMPTZ  NOT NULL DEFAULT NOW()"
