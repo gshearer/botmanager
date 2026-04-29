@@ -99,10 +99,13 @@ dossier_ensure_tables(void)
       " id            BIGSERIAL    PRIMARY KEY,"
       " dossier_id    BIGINT       NOT NULL REFERENCES dossier(id) ON DELETE CASCADE,"
       " method_kind   VARCHAR(64)  NOT NULL,"
-      " sig_json      TEXT         NOT NULL,"
+      " nickname      VARCHAR(64)  NOT NULL DEFAULT '',"
+      " username      VARCHAR(64)  NOT NULL DEFAULT '',"
+      " hostname      VARCHAR(128) NOT NULL DEFAULT '',"
+      " verified_id   VARCHAR(128) NOT NULL DEFAULT '',"
       " seen_count    INTEGER      NOT NULL DEFAULT 1,"
       " last_seen     TIMESTAMPTZ  NOT NULL DEFAULT NOW(),"
-      " UNIQUE(dossier_id, method_kind, sig_json)"
+      " UNIQUE(dossier_id, method_kind, nickname, username, hostname, verified_id)"
       ")");
 
   dossier_run_ddl(
@@ -111,6 +114,10 @@ dossier_ensure_tables(void)
   dossier_run_ddl(
       "CREATE INDEX IF NOT EXISTS idx_dossier_sig_mk"
       " ON dossier_signature(method_kind)");
+  dossier_run_ddl(
+      "CREATE INDEX IF NOT EXISTS idx_dossier_sig_verified"
+      " ON dossier_signature(method_kind, verified_id)"
+      " WHERE verified_id <> ''");
 
   dossier_run_ddl(
       "CREATE TABLE IF NOT EXISTS dossier_facts ("
@@ -150,22 +157,48 @@ dossier_ensure_tables(void)
       " END $$");
 }
 
-// Small helpers: escape two strings, free both, report OOM.
+// Small helpers: escape every quad-tuple field plus method_kind for
+// safe SQL embedding, free any partial allocation on failure.
 
-// Escape sig->method_kind into *out_mk and sig->sig_json into *out_sig.
-// On failure, any already-allocated string is freed and both outputs
-// are NULLed.
-static bool
-dossier_escape_sig(const dossier_sig_t *sig, char **out_mk, char **out_sig)
+typedef struct
 {
-  *out_mk  = db_escape(sig->method_kind);
-  *out_sig = db_escape(sig->sig_json);
+  char *method_kind;
+  char *nickname;
+  char *username;
+  char *hostname;
+  char *verified_id;
+} dossier_sig_escaped_t;
 
-  if(*out_mk == NULL || *out_sig == NULL)
+static void
+dossier_sig_escaped_free(dossier_sig_escaped_t *e)
+{
+  if(e->method_kind) mem_free(e->method_kind);
+  if(e->nickname)    mem_free(e->nickname);
+  if(e->username)    mem_free(e->username);
+  if(e->hostname)    mem_free(e->hostname);
+  if(e->verified_id) mem_free(e->verified_id);
+  memset(e, 0, sizeof(*e));
+}
+
+// Escape every borrowed string on `sig` for safe SQL embedding. On any
+// db_escape() OOM, every already-allocated buffer is freed and the
+// caller sees zeroed pointers — same shape as a fresh, unused struct.
+static bool
+dossier_sig_escape(const dossier_sig_t *sig, dossier_sig_escaped_t *out)
+{
+  memset(out, 0, sizeof(*out));
+
+  out->method_kind = db_escape(sig->method_kind);
+  out->nickname    = db_escape(sig->nickname    != NULL ? sig->nickname    : "");
+  out->username    = db_escape(sig->username    != NULL ? sig->username    : "");
+  out->hostname    = db_escape(sig->hostname    != NULL ? sig->hostname    : "");
+  out->verified_id = db_escape(sig->verified_id != NULL ? sig->verified_id : "");
+
+  if(out->method_kind == NULL || out->nickname    == NULL
+      || out->username == NULL || out->hostname    == NULL
+      || out->verified_id == NULL)
   {
-    if(*out_mk)  mem_free(*out_mk);
-    if(*out_sig) mem_free(*out_sig);
-    *out_mk = *out_sig = NULL;
+    dossier_sig_escaped_free(out);
     return(FAIL);
   }
 
@@ -181,8 +214,6 @@ dossier_create(uint32_t ns_id, const dossier_sig_t *sig,
     const char *display_label)
 {
   char *e_label = db_escape(display_label != NULL ? display_label : "");
-  char *e_mk;
-  char *e_sig;
   db_result_t *res;
   dossier_id_t new_id;
   char sql[DOSSIER_SQL_SZ];
@@ -217,23 +248,26 @@ dossier_create(uint32_t ns_id, const dossier_sig_t *sig,
     return(0);
 
   // Insert initial signature row.
-  e_mk = NULL;
-  e_sig = NULL;
-
-  if(dossier_escape_sig(sig, &e_mk, &e_sig) != SUCCESS)
   {
-    clam(CLAM_WARN, "dossier", "create: escape failed for sig");
-    return(new_id);   // dossier row is there; signature will be added on next sighting
+    dossier_sig_escaped_t e;
+
+    if(dossier_sig_escape(sig, &e) != SUCCESS)
+    {
+      clam(CLAM_WARN, "dossier", "create: escape failed for sig");
+      return(new_id);   // dossier row is there; signature will be added on next sighting
+    }
+
+    snprintf(sql, sizeof(sql),
+        "INSERT INTO dossier_signature"
+        " (dossier_id, method_kind, nickname, username, hostname, verified_id)"
+        " VALUES (%" PRId64 ", '%s', '%s', '%s', '%s', '%s')"
+        " ON CONFLICT (dossier_id, method_kind, nickname, username, hostname,"
+        "              verified_id) DO NOTHING",
+        (int64_t)new_id, e.method_kind, e.nickname, e.username,
+        e.hostname, e.verified_id);
+
+    dossier_sig_escaped_free(&e);
   }
-
-  snprintf(sql, sizeof(sql),
-      "INSERT INTO dossier_signature (dossier_id, method_kind, sig_json)"
-      " VALUES (%" PRId64 ", '%s', '%s')"
-      " ON CONFLICT (dossier_id, method_kind, sig_json) DO NOTHING",
-      (int64_t)new_id, e_mk, e_sig);
-
-  mem_free(e_mk);
-  mem_free(e_sig);
 
   res = db_result_alloc();
 
@@ -257,29 +291,27 @@ dossier_record_sighting(dossier_id_t dossier_id, const dossier_sig_t *sig)
   db_result_t *res;
   bool ok;
   char sql[DOSSIER_SQL_SZ];
-  char *e_mk;
-  char *e_sig;
+  dossier_sig_escaped_t e;
 
   if(!dossier_ready || dossier_id <= 0 || sig == NULL
-      || sig->method_kind == NULL || sig->sig_json == NULL)
+      || sig->method_kind == NULL)
     return(FAIL);
 
-  e_mk = NULL;
-  e_sig = NULL;
-
-  if(dossier_escape_sig(sig, &e_mk, &e_sig) != SUCCESS)
+  if(dossier_sig_escape(sig, &e) != SUCCESS)
     return(FAIL);
 
   snprintf(sql, sizeof(sql),
-      "INSERT INTO dossier_signature (dossier_id, method_kind, sig_json)"
-      " VALUES (%" PRId64 ", '%s', '%s')"
-      " ON CONFLICT (dossier_id, method_kind, sig_json) DO UPDATE"
+      "INSERT INTO dossier_signature"
+      " (dossier_id, method_kind, nickname, username, hostname, verified_id)"
+      " VALUES (%" PRId64 ", '%s', '%s', '%s', '%s', '%s')"
+      " ON CONFLICT (dossier_id, method_kind, nickname, username, hostname,"
+      "              verified_id) DO UPDATE"
       " SET seen_count = dossier_signature.seen_count + 1,"
       "     last_seen  = NOW()",
-      (int64_t)dossier_id, e_mk, e_sig);
+      (int64_t)dossier_id, e.method_kind, e.nickname, e.username,
+      e.hostname, e.verified_id);
 
-  mem_free(e_mk);
-  mem_free(e_sig);
+  dossier_sig_escaped_free(&e);
 
   res = db_result_alloc();
   ok = (db_query(sql, res) == SUCCESS) && res->ok;
@@ -323,39 +355,66 @@ dossier_resolve(uint32_t ns_id, const dossier_sig_t *sig,
   float        best_score;
   char sql[DOSSIER_SQL_SZ];
   char *e_mk;
-  chat_identity_scorer_t scorer;
+  bool any_field;
 
   if(!dossier_ready || sig == NULL
-      || sig->method_kind == NULL || sig->method_kind[0] == '\0'
-      || sig->sig_json    == NULL || sig->sig_json[0]    == '\0')
+      || sig->method_kind == NULL || sig->method_kind[0] == '\0')
+    return(0);
+
+  // Refuse a fully-empty quad-tuple. Otherwise every protocol that
+  // didn't successfully parse its identity would collide on the same
+  // empty-tuple dossier.
+  any_field =
+      (sig->nickname    != NULL && sig->nickname   [0] != '\0')
+      || (sig->username    != NULL && sig->username   [0] != '\0')
+      || (sig->hostname    != NULL && sig->hostname   [0] != '\0')
+      || (sig->verified_id != NULL && sig->verified_id[0] != '\0');
+
+  if(!any_field)
     return(0);
 
   dossier_stat_bump_resolves();
 
-  scorer = chat_identity_scorer_lookup(sig->method_kind);
-
-  // No scorer registered: cannot match existing dossiers. Create a
-  // fresh one if asked, otherwise bail. This keeps method plugins in
-  // charge of their own identity semantics.
-  if(scorer == NULL)
-  {
-    if(create_if_missing)
-      return(dossier_create(ns_id, sig, display_label));
-
-    return(0);
-  }
-
   e_mk = db_escape(sig->method_kind);
-
   if(e_mk == NULL)
     return(0);
 
-  snprintf(sql, sizeof(sql),
-      "SELECT ps.dossier_id, ps.sig_json"
-      " FROM dossier_signature ps"
-      " JOIN dossier p ON p.id = ps.dossier_id"
-      " WHERE p.ns_id = %u AND ps.method_kind = '%s'",
-      ns_id, e_mk);
+  // Two-stage candidate fetch. When the inbound sig has a verified_id,
+  // we can short-circuit to "any signature in this namespace with the
+  // same method_kind and the same verified_id" — that's the strongest
+  // possible signal and chat_identity_score returns 1.0 for it.
+  // Otherwise walk every signature in the (ns_id, method_kind) bucket.
+  if(sig->verified_id != NULL && sig->verified_id[0] != '\0')
+  {
+    char *e_vid = db_escape(sig->verified_id);
+
+    if(e_vid == NULL)
+    {
+      mem_free(e_mk);
+      return(0);
+    }
+
+    snprintf(sql, sizeof(sql),
+        "SELECT ps.dossier_id, ps.nickname, ps.username, ps.hostname,"
+        "       ps.verified_id"
+        " FROM dossier_signature ps"
+        " JOIN dossier p ON p.id = ps.dossier_id"
+        " WHERE p.ns_id = %u AND ps.method_kind = '%s'"
+        "   AND ps.verified_id = '%s'",
+        ns_id, e_mk, e_vid);
+
+    mem_free(e_vid);
+  }
+  else
+  {
+    snprintf(sql, sizeof(sql),
+        "SELECT ps.dossier_id, ps.nickname, ps.username, ps.hostname,"
+        "       ps.verified_id"
+        " FROM dossier_signature ps"
+        " JOIN dossier p ON p.id = ps.dossier_id"
+        " WHERE p.ns_id = %u AND ps.method_kind = '%s'",
+        ns_id, e_mk);
+  }
 
   mem_free(e_mk);
 
@@ -368,22 +427,23 @@ dossier_resolve(uint32_t ns_id, const dossier_sig_t *sig,
     for(uint32_t i = 0; i < res->rows; i++)
     {
       const char *pid_s = db_result_get(res, i, 0);
-      const char *sig_s = db_result_get(res, i, 1);
+      const char *nick  = db_result_get(res, i, 1);
+      const char *uname = db_result_get(res, i, 2);
+      const char *hname = db_result_get(res, i, 3);
+      const char *vid   = db_result_get(res, i, 4);
       dossier_sig_t existing;
-      float score;
+      float         score;
 
-      if(pid_s == NULL || sig_s == NULL)
+      if(pid_s == NULL)
         continue;
 
       existing.method_kind = sig->method_kind;
-      existing.sig_json    = sig_s;
+      existing.nickname    = nick  != NULL ? nick  : "";
+      existing.username    = uname != NULL ? uname : "";
+      existing.hostname    = hname != NULL ? hname : "";
+      existing.verified_id = vid   != NULL ? vid   : "";
 
-      // dossier_sig_t and dossier_method_sig_t are layout-compatible
-      // ({const char *method_kind; const char *sig_json;}); the cast
-      // launders the pointer type so the contract-typed scorer can
-      // consume the chat-plugin-local struct without copying.
-      score = scorer((const dossier_method_sig_t *)sig,
-          (const dossier_method_sig_t *)&existing);
+      score = chat_identity_score(sig, &existing);
       dossier_stat_bump_scorer();
 
       if(score > best_score)
@@ -467,7 +527,10 @@ dossier_merge_one(dossier_id_t survivor, dossier_id_t source)
       " AND NOT EXISTS (SELECT 1 FROM dossier_signature ps2"
       "                  WHERE ps2.dossier_id  = %" PRId64
       "                    AND ps2.method_kind = ps.method_kind"
-      "                    AND ps2.sig_json    = ps.sig_json)",
+      "                    AND ps2.nickname    = ps.nickname"
+      "                    AND ps2.username    = ps.username"
+      "                    AND ps2.hostname    = ps.hostname"
+      "                    AND ps2.verified_id = ps.verified_id)",
       (int64_t)survivor, (int64_t)source, (int64_t)survivor);
 
   res = db_result_alloc();
@@ -809,7 +872,8 @@ dossier_find_candidates(uint32_t ns_id,
     return(0);
 
   snprintf(sql, sizeof(sql),
-      "SELECT ps.dossier_id, ps.method_kind, ps.sig_json"
+      "SELECT ps.dossier_id, ps.method_kind, ps.nickname, ps.username,"
+      "       ps.hostname, ps.verified_id"
       " FROM dossier_signature ps"
       " JOIN dossier p ON p.id = ps.dossier_id"
       " WHERE p.ns_id = %u"
@@ -825,10 +889,14 @@ dossier_find_candidates(uint32_t ns_id,
     {
       const char *pid_s = db_result_get(res, i, 0);
       const char *mk_s  = db_result_get(res, i, 1);
-      const char *sig_s = db_result_get(res, i, 2);
+      const char *nick  = db_result_get(res, i, 2);
+      const char *uname = db_result_get(res, i, 3);
+      const char *hname = db_result_get(res, i, 4);
+      const char *vid   = db_result_get(res, i, 5);
       dossier_id_t pid;
+      dossier_sig_t sig;
 
-      if(pid_s == NULL || mk_s == NULL || sig_s == NULL)
+      if(pid_s == NULL || mk_s == NULL)
         continue;
 
       pid = (dossier_id_t)strtoll(pid_s, NULL, 10);
@@ -836,7 +904,13 @@ dossier_find_candidates(uint32_t ns_id,
       if(dossier_ids_contains(out_ids, n_out, pid))
         continue;
 
-      if(filter(mk_s, sig_s, user))
+      sig.method_kind = mk_s;
+      sig.nickname    = nick  != NULL ? nick  : "";
+      sig.username    = uname != NULL ? uname : "";
+      sig.hostname    = hname != NULL ? hname : "";
+      sig.verified_id = vid   != NULL ? vid   : "";
+
+      if(filter(&sig, user))
         out_ids[n_out++] = pid;
     }
   }
@@ -906,7 +980,6 @@ dossier_next_token(const char *src, char *out, size_t out_sz)
 
 static void
 dossier_mention_score_dossier(dossier_id_t pid, const char *method_kind,
-    chat_identity_token_scorer_t scorer,
     const char *tokens[], size_t n_tokens,
     dossier_id_t *out_ids, size_t *n_out, size_t max)
 {
@@ -921,7 +994,8 @@ dossier_mention_score_dossier(dossier_id_t pid, const char *method_kind,
   if(e_mk == NULL) return;
 
   snprintf(sql, sizeof(sql),
-      "SELECT sig_json FROM dossier_signature"
+      "SELECT nickname, username, hostname, verified_id"
+      " FROM dossier_signature"
       " WHERE dossier_id = %" PRId64 " AND method_kind = '%s'",
       (int64_t)pid, e_mk);
   mem_free(e_mk);
@@ -931,15 +1005,21 @@ dossier_mention_score_dossier(dossier_id_t pid, const char *method_kind,
   {
     for(uint32_t i = 0; i < res->rows; i++)
     {
-      const char *sig_s = db_result_get(res, i, 0);
-      dossier_sig_t sig = { .method_kind = method_kind, .sig_json = sig_s };
-
-      if(sig_s == NULL) continue;
+      const char *nick  = db_result_get(res, i, 0);
+      const char *uname = db_result_get(res, i, 1);
+      const char *hname = db_result_get(res, i, 2);
+      const char *vid   = db_result_get(res, i, 3);
+      dossier_sig_t sig = {
+        .method_kind = method_kind,
+        .nickname    = nick  != NULL ? nick  : "",
+        .username    = uname != NULL ? uname : "",
+        .hostname    = hname != NULL ? hname : "",
+        .verified_id = vid   != NULL ? vid   : "",
+      };
 
       for(size_t t = 0; t < n_tokens; t++)
       {
-        // layout-compat reinterpret; see resolve-path cast above
-        if(scorer(tokens[t], (const dossier_method_sig_t *)&sig)
+        if(chat_identity_token_score(tokens[t], &sig)
             >= DOSSIER_MENTION_THRESHOLD)
         {
           out_ids[(*n_out)++] = pid;
@@ -965,14 +1045,10 @@ dossier_find_mentions(uint32_t ns_id, const char *method_kind,
   const char *tokens[32];
   size_t n_tokens;
   const char *p;
-  chat_identity_token_scorer_t scorer;
 
   if(!dossier_ready || method_kind == NULL || text == NULL
       || out_ids == NULL || max == 0)
     return(0);
-
-  scorer = chat_identity_token_scorer_lookup(method_kind);
-  if(scorer == NULL) return(0);
 
   // Tokenize once.
   n_tokens = 0;
@@ -1021,7 +1097,7 @@ dossier_find_mentions(uint32_t ns_id, const char *method_kind,
       pid = (dossier_id_t)strtoll(pid_s, NULL, 10);
       if(pid <= 0) continue;
 
-      dossier_mention_score_dossier(pid, method_kind, scorer,
+      dossier_mention_score_dossier(pid, method_kind,
           tokens, n_tokens, out_ids, &n_out, max);
     }
   }

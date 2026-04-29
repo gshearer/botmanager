@@ -367,6 +367,18 @@ irc_handle_privmsg(irc_state_t *st, const irc_parsed_msg_t *p)
   // Store full prefix in metadata for diagnostics / auth context.
   strncpy(msg.metadata, p->prefix, METHOD_META_SZ - 1);
 
+  // Project the prefix onto the generic identity tuple consumers see.
+  // Failure (malformed prefix, unsafe bytes) leaves all four fields
+  // empty — the message still delivers, but identity matching cannot
+  // tie it to a dossier. That's acceptable: the chat plugin treats an
+  // empty tuple as "unknown sender" and either creates an anonymous
+  // dossier or skips depending on the bot's anonymous_dossiers knob.
+  (void)irc_identity_fill_quad(p->prefix,
+      msg.nickname,    sizeof(msg.nickname),
+      msg.username,    sizeof(msg.username),
+      msg.hostname,    sizeof(msg.hostname),
+      msg.verified_id, sizeof(msg.verified_id));
+
   method_deliver(st->inst, &msg);
 }
 
@@ -907,13 +919,29 @@ irc_handle_nick(irc_state_t *st, const irc_parsed_msg_t *pp)
   }
 
   // Deliver NICK_CHANGE so dossier-aware bots can merge both identities.
+  // The new identity goes in the regular nickname/username/hostname/
+  // verified_id fields; the old identity goes in prev_*. Chat collapses
+  // both into the same dossier without re-running the scorer.
   memset(&nmsg, 0, sizeof(nmsg));
   nmsg.kind = METHOD_MSG_NICK_CHANGE;
-  strncpy(nmsg.sender, p.nick, METHOD_SENDER_SZ - 1);
-  strncpy(nmsg.text,   new_nick, METHOD_TEXT_SZ - 1);
+  strncpy(nmsg.sender, p.nick,    METHOD_SENDER_SZ - 1);
+  strncpy(nmsg.text,   new_nick,  METHOD_TEXT_SZ   - 1);
   snprintf(nmsg.metadata, METHOD_META_SZ, "%s!%s@%s",
       new_nick, p.user, p.host);
   strncpy(nmsg.prev_metadata, p.prefix, METHOD_META_SZ - 1);
+
+  (void)irc_identity_fill_quad(nmsg.metadata,
+      nmsg.nickname,    sizeof(nmsg.nickname),
+      nmsg.username,    sizeof(nmsg.username),
+      nmsg.hostname,    sizeof(nmsg.hostname),
+      nmsg.verified_id, sizeof(nmsg.verified_id));
+
+  (void)irc_identity_fill_quad(nmsg.prev_metadata,
+      nmsg.prev_nickname,    sizeof(nmsg.prev_nickname),
+      nmsg.prev_username,    sizeof(nmsg.prev_username),
+      nmsg.prev_hostname,    sizeof(nmsg.prev_hostname),
+      nmsg.prev_verified_id, sizeof(nmsg.prev_verified_id));
+
   nmsg.timestamp = time(NULL);
   method_deliver(st->inst, &nmsg);
 }
@@ -1585,24 +1613,6 @@ irc_list_joined_channels(void *handle,
   pthread_mutex_unlock(&st->chan_mutex);
 }
 
-// Build an identity signature JSON from an inbound message. The
-// message metadata carries the full IRC prefix ("nick!ident@host") —
-// see the PRIVMSG handling in irc_handle_line. Delegates the JSON
-// shaping to irc_dossier_build_signature so the unit tests can
-// exercise the same code path without loading the plugin.
-//
-// Registered with the chat plugin's identity registry at plugin_start
-// (see irc_start below); signature matches chat_identity_signer_t.
-static bool
-irc_identity_signature(const method_msg_t *msg,
-    char *out_json, size_t out_sz)
-{
-  if(msg == NULL)
-    return(FAIL);
-
-  return(irc_dossier_build_signature(msg->metadata, out_json, out_sz));
-}
-
 // Get the bot's current IRC nickname.
 static bool
 irc_get_self(void *handle, char *buf, size_t buf_sz)
@@ -1819,46 +1829,14 @@ irc_init(void)
   return(SUCCESS);
 }
 
-// Function-pointer typedef for the chat plugin's chat_identity_register
-// entry point. Matches plugins/method/chat/identity.h exactly; declared
-// locally so the IRC plugin does not need to include a chat-plugin
-// header across the RTLD_LOCAL boundary. The typedefs for the signer
-// and scorer signatures match the contract-level types already used by
-// the IRC scorer functions (dossier_method_sig_t etc.).
-typedef bool (*irc_chat_identity_signer_t)(const method_msg_t *msg,
-    char *out_json, size_t out_sz);
-typedef float (*irc_chat_identity_scorer_t)(
-    const dossier_method_sig_t *a, const dossier_method_sig_t *b);
-typedef float (*irc_chat_identity_token_scorer_t)(const char *token,
-    const dossier_method_sig_t *sig);
-typedef bool (*irc_chat_identity_register_fn_t)(const char *method_kind,
-    irc_chat_identity_signer_t       signer,
-    irc_chat_identity_scorer_t       scorer,
-    irc_chat_identity_token_scorer_t token_scorer);
-
 static bool
 irc_start(void)
 {
-  irc_chat_identity_register_fn_t reg;
-  union { void *obj; irc_chat_identity_register_fn_t fn; } u;
-
-  // Publish the IRC identity triple to the chat plugin's identity
-  // registry. Chat may not be loaded (command-bot-only deployment); in
-  // that case dlsym returns NULL and we silently skip — identity
-  // resolution just won't work for this method_kind in this run.
-  u.obj = plugin_dlsym("chat", "chat_identity_register");
-  reg   = u.fn;
-
-  if(reg != NULL)
-  {
-    if(reg("irc", irc_identity_signature,
-           irc_identity_score, irc_identity_token_score) != SUCCESS)
-      clam(CLAM_WARN, "irc", "chat_identity_register('irc') failed");
-  }
-
   // The IRC driver is made available through the plugin descriptor's
   // ext field. Method instances are created on demand by bot_start()
-  // when a bot binds to IRC.
+  // when a bot binds to IRC. Identity scoring is now done generically
+  // by the chat plugin against the quad-tuple fields we populate on
+  // each delivered method_msg_t — no cross-plugin registration here.
   clam(CLAM_INFO, "irc", "method plugin started (driver available)");
   return(SUCCESS);
 }

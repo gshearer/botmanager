@@ -7,7 +7,6 @@
 #include "colors.h"
 #include "db.h"
 #include "dossier.h"
-#include "json.h"
 #include "userns.h"
 
 #include <inttypes.h>
@@ -194,7 +193,8 @@ render_dossier_detail(const cmd_ctx_t *ctx, dossier_id_t did)
 
   // Signatures.
   snprintf(sql, sizeof(sql),
-      "SELECT method_kind, sig_json, seen_count,"
+      "SELECT method_kind, nickname, username, hostname, verified_id,"
+      " seen_count,"
       " EXTRACT(EPOCH FROM last_seen)::bigint"
       " FROM dossier_signature WHERE dossier_id = %" PRId64
       " ORDER BY last_seen DESC",
@@ -206,13 +206,21 @@ render_dossier_detail(const cmd_ctx_t *ctx, dossier_id_t did)
     cmd_reply(ctx, "  " CLR_CYAN "signatures:" CLR_RESET);
     for(uint32_t i = 0; i < res->rows; i++)
     {
-      const char *mk = db_result_get(res, i, 0);
-      const char *sj = db_result_get(res, i, 1);
-      const char *sc = db_result_get(res, i, 2);
+      const char *mk    = db_result_get(res, i, 0);
+      const char *nick  = db_result_get(res, i, 1);
+      const char *uname = db_result_get(res, i, 2);
+      const char *hname = db_result_get(res, i, 3);
+      const char *vid   = db_result_get(res, i, 4);
+      const char *sc    = db_result_get(res, i, 5);
       char line[512];
       snprintf(line, sizeof(line),
-          "    [%s] seen=%s  %s",
-          mk ? mk : "?", sc ? sc : "?", sj ? sj : "");
+          "    [%s] seen=%s  nick=%s user=%s host=%s verified=%s",
+          mk    ? mk    : "?",
+          sc    ? sc    : "?",
+          nick  ? nick  : "",
+          uname ? uname : "",
+          hname ? hname : "",
+          vid   ? vid   : "");
       cmd_reply(ctx, line);
     }
   }
@@ -310,35 +318,28 @@ typedef struct
   const char     *username;
 } mfa_filter_t;
 
-// Build an MFA string "nick!ident@host_tail" from an IRC signature and
-// test it against the target user's patterns. Non-IRC method_kinds are
-// skipped until their scorers learn candidate semantics.
+// Build an MFA string "nick!user@host" from an IRC signature and test
+// it against the target user's patterns. Non-IRC method_kinds are
+// skipped — MFA patterns are written assuming IRC's hostmask shape.
+// Alias rows (empty username/hostname) are skipped: they aren't real
+// observations and shouldn't be matched against an MFA pattern.
 static bool
-mfa_sig_filter(const char *method_kind, const char *sig_json, void *user)
+mfa_sig_filter(const dossier_sig_t *sig, void *user)
 {
   mfa_filter_t *f = user;
   char mfa[320];
-  char nick[64] = {0};
-  char ident[64] = {0};
-  char host[128] = {0};
-  bool ok;
-  struct json_object *root;
 
-  if(strcmp(method_kind, "irc") != 0) return(false);
+  if(sig == NULL || strcmp(sig->method_kind, "irc") != 0)
+    return(false);
 
-  root = json_parse_buf(sig_json, strlen(sig_json),
-      "dossier:candidates");
+  if(sig->nickname == NULL || sig->nickname[0] == '\0'
+      || sig->username == NULL || sig->username[0] == '\0'
+      || sig->hostname == NULL || sig->hostname[0] == '\0')
+    return(false);
 
-  if(root == NULL) return(false);
+  snprintf(mfa, sizeof(mfa), "%s!%s@%s",
+      sig->nickname, sig->username, sig->hostname);
 
-  ok = json_get_str(root, "nick",      nick,  sizeof(nick))
-         && json_get_str(root, "ident",     ident, sizeof(ident))
-         && json_get_str(root, "host_tail", host,  sizeof(host));
-
-  json_object_put(root);
-  if(!ok) return(false);
-
-  snprintf(mfa, sizeof(mfa), "%s!%s@%s", nick, ident, host);
   return(userns_user_mfa_match(f->ns, f->username, mfa));
 }
 

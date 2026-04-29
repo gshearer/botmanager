@@ -402,15 +402,23 @@ extract_alias_validate(uint32_t ns_id, int64_t dossier_id,
     if(!isalnum((unsigned char)alias[i]))
       return(false);
 
-  // Walk every IRC signature in this namespace. For the target
-  // dossier we reject on matching any of its own non-alias nicks
-  // (regurgitation guard). For other dossiers in the namespace we
-  // reject on matching their real nick (cross-contamination guard).
+  // Walk every IRC signature in this namespace whose nickname matches.
+  // Alias rows are identifiable by their empty username/hostname/
+  // verified_id fields (see how aliases are stored below): they're
+  // skipped here so we only flag true regurgitation against real
+  // observed nicks, never against another known alias.
+  //
+  // (alias's safety against being matched as an inbound sender comes
+  // from the generic scorer in chat/identity.c — username-match is
+  // required for any score above 0, and an alias row carries empty
+  // username, so an inbound IRC sighting can never resolve to an alias
+  // row even when nicknames coincide.)
   snprintf(sql, sizeof(sql),
-      "SELECT ps.dossier_id, ps.sig_json"
+      "SELECT ps.dossier_id, ps.nickname"
       " FROM dossier_signature ps"
       " JOIN dossier p ON p.id = ps.dossier_id"
       " WHERE p.ns_id = %u AND ps.method_kind = 'irc'"
+      "   AND ps.username <> ''"
       " LIMIT 1024",
       ns_id);
 
@@ -427,28 +435,9 @@ extract_alias_validate(uint32_t ns_id, int64_t dossier_id,
 
   for(uint32_t i = 0; i < r->rows; i++)
   {
-    const char *sj = db_result_get(r, i, 1);
-    struct json_object *sj_root;
-    bool    is_alias_row;
-    char    nick[128];
+    const char *nick = db_result_get(r, i, 1);
 
-    if(sj == NULL)
-      continue;
-
-    sj_root = json_parse_buf(sj, strlen(sj), "alias_validate");
-
-    if(sj_root == NULL)
-      continue;
-
-    is_alias_row = false;
-    nick[0] = '\0';
-
-    (void)json_get_bool(sj_root, "alias", &is_alias_row);
-    (void)json_get_str (sj_root, "nick",  nick, sizeof(nick));
-
-    json_object_put(sj_root);
-
-    if(is_alias_row || nick[0] == '\0')
+    if(nick == NULL || nick[0] == '\0')
       continue;
 
     // Step (b) self-collision OR step (c) cross-namespace collision:
@@ -464,21 +453,6 @@ extract_alias_validate(uint32_t ns_id, int64_t dossier_id,
 
   db_result_free(r);
   return(ok);
-}
-
-static size_t
-alias_build_sig_json(const char *alias, char *out, size_t out_sz)
-{
-  // Stable JSON key order so ON CONFLICT upsert on (dossier_id,
-  // method_kind, sig_json) works. Empty ident/host_tail/cloak are
-  // the safety guard: the IRC pair scorer requires ident or cloak
-  // evidence to return above DOSSIER_MATCH_THRESHOLD, so this row
-  // can never misroute an inbound IRC message. The "alias":true tag
-  // is audit-only; scorers ignore unknown fields.
-  return((size_t)snprintf(out, out_sz,
-      "{\"nick\":\"%s\",\"ident\":\"\",\"host_tail\":\"\","
-      "\"cloak\":\"\",\"alias\":true}",
-      alias));
 }
 
 // Dispatch: blocking LLM call + parse + upsert
@@ -683,7 +657,6 @@ extract_dispatch(const char *bot_name, uint32_t ns_id,
 
   for(size_t i = 0; i < n_aliases; i++)
   {
-    char           sig_buf[256];
     dossier_sig_t  sig;
 
     if(!extract_alias_validate(ns_id, aliases[i].dossier_id,
@@ -696,10 +669,17 @@ extract_dispatch(const char *bot_name, uint32_t ns_id,
       continue;
     }
 
-    alias_build_sig_json(aliases[i].alias, sig_buf, sizeof(sig_buf));
-
+    // Aliases are stored as signature rows whose only populated field
+    // is nickname. The empty username/hostname/verified_id fields keep
+    // the row out of inbound-sender resolution (the generic scorer
+    // requires a username match for any non-zero score) while still
+    // letting the token scorer find the dossier when someone says the
+    // alias in chat.
     sig.method_kind = "irc";
-    sig.sig_json    = sig_buf;
+    sig.nickname    = aliases[i].alias;
+    sig.username    = "";
+    sig.hostname    = "";
+    sig.verified_id = "";
 
     if(dossier_record_sighting(aliases[i].dossier_id, &sig) == SUCCESS)
     {

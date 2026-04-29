@@ -1428,7 +1428,7 @@ chatbot_consider_speaking(chatbot_state_t *st, const method_msg_t *msg,
 }
 
 // Resolve the dossier for an inbound message. See chatbot.h for the
-// contract. Returns 0 if the driver does not produce signatures, the
+// contract. Returns 0 if the message carries no identity tuple, the
 // namespace is missing, or the sender has no match and the
 // anonymous_dossiers toggle is off.
 dossier_id_t
@@ -1443,7 +1443,6 @@ chatbot_resolve_dossier(chatbot_state_t *st, const method_msg_t *msg)
   const char *matched_user;
   uint32_t    matched_uid;
   const char *method_kind;
-  char sig_json[512];
   userns_t *ns;
 
   if(st == NULL || msg == NULL || msg->inst == NULL)
@@ -1453,12 +1452,15 @@ chatbot_resolve_dossier(chatbot_state_t *st, const method_msg_t *msg)
   if(ns == NULL)
     return(0);
 
-  if(chat_identity_signature_build(msg, sig_json, sizeof(sig_json))
-      != SUCCESS)
-    return(0);
-
   method_kind = method_inst_kind(msg->inst);
   if(method_kind == NULL || method_kind[0] == '\0')
+    return(0);
+
+  // No identity tuple at all (parser failed, protocol couldn't fill
+  // anything) -- refuse rather than collapse every empty-tuple speaker
+  // onto a single dossier.
+  if(msg->nickname[0]    == '\0' && msg->username[0]    == '\0'
+      && msg->hostname[0] == '\0' && msg->verified_id[0] == '\0')
     return(0);
 
   // MFA match gates automatic dossier creation for registered users.
@@ -1483,7 +1485,10 @@ chatbot_resolve_dossier(chatbot_state_t *st, const method_msg_t *msg)
   label = matched_user != NULL ? matched_user : msg->sender;
 
   sig.method_kind = method_kind;
-  sig.sig_json = sig_json;
+  sig.nickname    = msg->nickname;
+  sig.username    = msg->username;
+  sig.hostname    = msg->hostname;
+  sig.verified_id = msg->verified_id;
 
   pid = dossier_resolve(ns->id, &sig, label, create);
   if(pid == 0)
@@ -1508,11 +1513,8 @@ bool
 chatbot_handle_nick_change(chatbot_state_t *st, const method_msg_t *msg)
 {
   dossier_sig_t new_sig;
-  char new_sig_json[512];
   dossier_sig_t old_sig;
   dossier_id_t pid;
-  char old_sig_json[512];
-  method_msg_t scratch;
   const char *method_kind;
   userns_t *ns;
 
@@ -1521,8 +1523,7 @@ chatbot_handle_nick_change(chatbot_state_t *st, const method_msg_t *msg)
   // Rename engagement slots before the dossier work. The ring is a
   // bot-local feature — independent of userns, dossier, and method_kind
   // — and we want the rename even when the old nick has no prior
-  // dossier. msg->sender is the old nick, msg->text the new nick
-  // (see plugins/method/irc/irc.c:1601-1602).
+  // dossier. msg->sender is the old nick, msg->text the new nick.
   chatbot_engagement_rename(&st->engagement, msg->sender, msg->text);
 
   ns = bot_get_userns(st->inst);
@@ -1531,28 +1532,29 @@ chatbot_handle_nick_change(chatbot_state_t *st, const method_msg_t *msg)
   method_kind = method_inst_kind(msg->inst);
   if(method_kind == NULL || method_kind[0] == '\0') return(SUCCESS);
 
-  // Build the old signature: reuse chat_identity_signature_build by
-  // constructing a scratch msg whose metadata is the old identity.
-  scratch = *msg;
-  snprintf(scratch.metadata, sizeof(scratch.metadata), "%s", msg->prev_metadata);
-
-  if(chat_identity_signature_build(&scratch,
-        old_sig_json, sizeof(old_sig_json)) != SUCCESS)
+  // The protocol plugin populated both halves of the rename on the
+  // delivered msg: prev_* for the old identity, the regular fields for
+  // the new identity. If the old identity carried no usable tuple we
+  // can't look it up — skip the merge.
+  if(msg->prev_nickname[0]    == '\0' && msg->prev_username[0]    == '\0'
+      && msg->prev_hostname[0] == '\0' && msg->prev_verified_id[0] == '\0')
     return(SUCCESS);
 
   old_sig.method_kind = method_kind;
-  old_sig.sig_json = old_sig_json;
+  old_sig.nickname    = msg->prev_nickname;
+  old_sig.username    = msg->prev_username;
+  old_sig.hostname    = msg->prev_hostname;
+  old_sig.verified_id = msg->prev_verified_id;
 
   pid = dossier_resolve(ns->id, &old_sig, "", false);
   if(pid == 0)
     return(SUCCESS);   // no prior dossier to collapse into -- fine
 
-  if(chat_identity_signature_build(msg,
-        new_sig_json, sizeof(new_sig_json)) != SUCCESS)
-    return(SUCCESS);
-
   new_sig.method_kind = method_kind;
-  new_sig.sig_json = new_sig_json;
+  new_sig.nickname    = msg->nickname;
+  new_sig.username    = msg->username;
+  new_sig.hostname    = msg->hostname;
+  new_sig.verified_id = msg->verified_id;
 
   dossier_record_sighting(pid, &new_sig);
   clam(CLAM_DEBUG, "chatbot",
@@ -2264,12 +2266,6 @@ chatbot_plugin_init(void)
   extract_init();
   extract_register_config();
 
-  // Identity registry (ND4): method plugins publish their per-kind
-  // signer + scorer + token-scorer triples into this registry at
-  // plugin_start time via plugin_dlsym. Must be up before any method
-  // plugin starts.
-  chat_identity_init();
-
   // Dossier subsystem (moved from libcore into the chat plugin in R4).
   // Order at init time: bring up in-memory state and register commands
   // (cmd subsystem is already up). DDL must wait until userns_init has
@@ -2285,7 +2281,6 @@ chatbot_plugin_init(void)
   if(chatbot_reply_init() != SUCCESS)
   {
     dossier_exit();
-    chat_identity_exit();
     extract_exit();
     memory_exit();
     return(FAIL);
@@ -2298,7 +2293,6 @@ chatbot_plugin_init(void)
   {
     chatbot_reply_deinit();
     dossier_exit();
-    chat_identity_exit();
     extract_exit();
     memory_exit();
     return(FAIL);
@@ -2309,7 +2303,6 @@ chatbot_plugin_init(void)
     chatbot_volunteer_deinit();
     chatbot_reply_deinit();
     dossier_exit();
-    chat_identity_exit();
     extract_exit();
     memory_exit();
     return(FAIL);
@@ -2321,7 +2314,6 @@ chatbot_plugin_init(void)
     chatbot_volunteer_deinit();
     chatbot_reply_deinit();
     dossier_exit();
-    chat_identity_exit();
     extract_exit();
     memory_exit();
     return(FAIL);
@@ -2333,7 +2325,6 @@ chatbot_plugin_init(void)
     chatbot_volunteer_deinit();
     chatbot_reply_deinit();
     dossier_exit();
-    chat_identity_exit();
     extract_exit();
     memory_exit();
     return(FAIL);
@@ -2345,7 +2336,6 @@ chatbot_plugin_init(void)
     chatbot_volunteer_deinit();
     chatbot_reply_deinit();
     dossier_exit();
-    chat_identity_exit();
     extract_exit();
     memory_exit();
     return(FAIL);
@@ -2365,7 +2355,6 @@ chatbot_plugin_deinit(void)
   // extract may hold sweep-state pointing at memory types; extract owns
   // no DB state the memory teardown needs.
   dossier_exit();
-  chat_identity_exit();
   extract_exit();
   memory_exit();
 }

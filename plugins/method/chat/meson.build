@@ -12,8 +12,7 @@ chat_plugin = shared_library('chat',
   # inference include dir exposes plugins/inference/inference.h (the
   # dlsym-shim public surface for llm/knowledge/acquire).
   include_directories : [include_directories('.'), inc_include,
-                         inference_include,
-                         plugin_contracts_include],
+                         inference_include],
   override_options : ['b_lundef=false'],
   install : true,
 )

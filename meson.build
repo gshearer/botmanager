@@ -36,11 +36,6 @@ gen_include = include_directories('.')
 # Public headers used by core and plugins.
 inc_include = include_directories('include')
 
-# Inter-plugin contract headers (e.g. contracts/dossier_method.h).
-# Plugins that consume a contract add this to their include_directories
-# and reference the header as `#include "contracts/<name>.h"`.
-plugin_contracts_include = include_directories('plugins')
-
 # libdl for plugin loading (dlopen/dlclose).
 cc = meson.get_compiler('c')
 dl_dep = cc.find_library('dl', required : false)

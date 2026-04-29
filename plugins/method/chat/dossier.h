@@ -8,33 +8,31 @@
 
 // Overview
 //
-// The dossier subsystem is the llm bot's single source of truth for
+// The dossier subsystem is the chat bot's single source of truth for
 // participant memory. Each dossier represents one real person observed
-// in chat, identified by a pluggable per-method signature:
-//
-//   - IRC       -> { nick, ident, host_tail }
-//   - Discord   -> { user_id }  (future)
-//   - Slack     -> { team_id, user_id }  (future)
+// in chat, identified by the generic four-field identity tuple every
+// protocol plugin emits per inbound message (nickname, username,
+// hostname, verified_id). The protocol owns how it projects its native
+// identity onto those fields — see plugins/protocol/<kind>/AGENTS.md
+// for the per-protocol contract — and the chat plugin owns scoring.
 //
 // A dossier optionally links to a registered userns_user via user_id;
 // when set, the dossier is the canonical identity for that user. Until
 // a registration happens, dossiers are anonymous and may later be
-// consolidated into a user via dossier_merge() (see Chunk D).
+// consolidated into a user via dossier_merge().
 //
 // Matching model
 //
-// Each method plugin pushes a signer + pair-scorer + token-scorer
-// triple into the chat plugin's identity registry (see identity.h) at
-// plugin_start time via plugin_dlsym("chat", "chat_identity_register").
 // dossier_resolve() walks every stored signature of the given
-// method_kind in the given namespace, calls the registered scorer
-// against the inbound signature, and picks the highest-scoring dossier
-// whose confidence clears DOSSIER_MATCH_THRESHOLD. On match, last_seen
-// and message_count are bumped and the signature's seen_count is
-// bumped (or a new signature row is inserted if this exact sig_json
-// has not been observed for that dossier yet). On miss -- and only
-// when create_if_missing is true -- a new dossier and its first
-// signature row are created and the fresh dossier_id is returned.
+// method_kind in the given namespace, calls chat_identity_score()
+// (identity.h) against the inbound signature, and picks the
+// highest-scoring dossier whose confidence clears
+// DOSSIER_MATCH_THRESHOLD. On match, last_seen and message_count are
+// bumped, and the matched signature's seen_count is bumped (or a new
+// signature row is inserted if this exact tuple has not been observed
+// for that dossier yet). On miss -- and only when create_if_missing
+// is true -- a new dossier and its first signature row are created
+// and the fresh dossier_id is returned.
 //
 // Thresholds
 
@@ -48,10 +46,8 @@
 // threshold since token context is thinner.
 #define DOSSIER_MENTION_THRESHOLD  0.7f
 
-// Bounds for various string fields carried on dossier_sig_t. The JSON
-// body itself is not length-capped here -- storage is TEXT -- but
-// method plugins should keep signatures compact (a few hundred bytes)
-// since they are compared O(N) per inbound message.
+// Bounds. method_kind tracks the originating protocol plugin; the
+// quad-tuple field bounds match METHOD_*_SZ in include/method.h.
 #define DOSSIER_METHOD_KIND_SZ  64
 #define DOSSIER_LABEL_SZ        128
 
@@ -60,18 +56,20 @@
 // A dossier identifier. 0 indicates "no dossier" / "not resolved".
 typedef int64_t dossier_id_t;
 
-// A single method-specific identity signature. method_kind names the
-// method plugin (e.g., "irc"); sig_json is a method-defined JSON
-// payload. Both fields are borrowed references -- the dossier layer
-// copies what it needs.
-typedef struct
+// A single protocol-level identity signature. Mirrors the four-field
+// tuple on method_msg_t (nickname, username, hostname, verified_id)
+// plus the originating method_kind. All char* fields are borrowed
+// references -- the dossier layer copies what it needs.
+typedef struct dossier_sig
 {
   const char *method_kind;
-  const char *sig_json;
+  const char *nickname;
+  const char *username;
+  const char *hostname;
+  const char *verified_id;
 } dossier_sig_t;
 
-typedef bool (*dossier_sig_filter_t)(const char *method_kind,
-    const char *sig_json, void *user);
+typedef bool (*dossier_sig_filter_t)(const dossier_sig_t *sig, void *user);
 
 // Summary row returned by dossier_get(). Facts are retrieved via the
 // memory_retrieve_dossier() API, not duplicated here.
@@ -119,8 +117,8 @@ void dossier_exit(void);
 // method_kind that scores >= DOSSIER_MATCH_THRESHOLD against sig, the
 // match's dossier_id is returned and its last_seen / message_count
 // are bumped (and the signature row's seen_count, or a fresh row is
-// inserted when the exact sig_json has not been observed for that
-// dossier yet).
+// inserted when the exact identity tuple has not been observed for
+// that dossier yet).
 //
 // If no match clears the threshold and create_if_missing is true, a
 // new dossier is created (with its initial signature row) and the new
@@ -145,9 +143,9 @@ bool dossier_set_user(dossier_id_t dossier_id, int user_id);
 // facts are reassigned, message_count is summed, first_seen/last_seen
 // are unified, and absorbed rows are deleted. Absorbed rows must be
 // in the same namespace as the survivor (and must not include the
-// survivor itself). Deduplicates on (dossier_id, method_kind, sig_json)
-// and (dossier_id, kind, fact_key) via ON CONFLICT during the
-// reassignment.
+// survivor itself). Deduplicates on (dossier_id, method_kind, nickname,
+// username, hostname, verified_id) and (dossier_id, kind, fact_key)
+// via ON CONFLICT during the reassignment.
 bool dossier_merge(dossier_id_t survivor_id,
     const dossier_id_t *absorbed_ids, size_t n_absorbed);
 

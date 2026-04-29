@@ -13,6 +13,16 @@
 #define METHOD_TEXT_SZ     2048
 #define METHOD_META_SZ     512
 
+// Quad-tuple identity field bounds. Each protocol fills whatever it
+// has, leaves the rest empty. The chat plugin's identity scorer treats
+// nickname/username/hostname as a similarity tuple and verified_id as
+// an authoritative short-circuit (server-attested, unforgeable handle:
+// IRC SASL account, Slack user_id, Matrix MXID, etc.).
+#define METHOD_NICKNAME_SZ    64
+#define METHOD_USERNAME_SZ    64
+#define METHOD_HOSTNAME_SZ    128
+#define METHOD_VERIFIED_ID_SZ 128
+
 typedef enum
 {
   METHOD_ENABLED,     // plugin loaded, instance configured
@@ -59,14 +69,31 @@ typedef struct
   char           channel[METHOD_CHANNEL_SZ];  // channel/group (empty for DM)
   char           text[METHOD_TEXT_SZ];        // raw message text
   time_t         timestamp;                   // message timestamp
-  char           metadata[METHOD_META_SZ];    // method-specific data
+  char           metadata[METHOD_META_SZ];    // method-specific data (diagnostic / auth context)
   bool           is_action;                   // true when the message is an emote/action (e.g., IRC CTCP ACTION)
   method_msg_kind_t kind;                     // default METHOD_MSG_MESSAGE
-  // Previous protocol-level identity string, set on METHOD_MSG_NICK_CHANGE.
-  // For IRC: the "oldnick!ident@host" prefix. metadata holds the new
-  // identity ("newnick!ident@host"), sender is the old nick, text is
-  // the new nick, and channel is empty. Unused for other kinds.
-  char           prev_metadata[METHOD_META_SZ];
+
+  // Generic protocol-level identity for the sender. The protocol plugin
+  // populates whatever it has; consumers (chat, audit, etc.) treat the
+  // tuple uniformly. nickname is the user's current display label;
+  // username is their client-claimed login; hostname is the origin /
+  // homeserver / workspace identifier; verified_id is the server-
+  // attested unforgeable handle (IRC SASL account, Slack user_id,
+  // Matrix MXID, ...) and is empty when the protocol cannot attest.
+  char nickname    [METHOD_NICKNAME_SZ];
+  char username    [METHOD_USERNAME_SZ];
+  char hostname    [METHOD_HOSTNAME_SZ];
+  char verified_id [METHOD_VERIFIED_ID_SZ];
+
+  // Previous protocol-level identity, set on METHOD_MSG_NICK_CHANGE.
+  // The new identity lives in the fields above and metadata holds the
+  // new raw prefix; sender is the old display label, text is the new
+  // display label, channel is empty. Unused for other kinds.
+  char prev_metadata    [METHOD_META_SZ];
+  char prev_nickname    [METHOD_NICKNAME_SZ];
+  char prev_username    [METHOD_USERNAME_SZ];
+  char prev_hostname    [METHOD_HOSTNAME_SZ];
+  char prev_verified_id [METHOD_VERIFIED_ID_SZ];
 } method_msg_t;
 
 // Invoked synchronously by method_deliver() for each matching

@@ -142,7 +142,7 @@ typedef struct
 #include <ctype.h>
 #include <stdarg.h>
 #include "validate.h"
-#include "irc_dossier.h"
+#include "irc_identity.h"
 
 // Forward declarations (irc.c only).
 static void irc_sock_cb(const sock_event_t *event, void *user_data);
@@ -309,11 +309,6 @@ static void irc_list_joined_channels(void *handle,
     method_joined_channel_cb_t cb, void *data);
 static bool irc_get_self(void *handle, char *buf, size_t buf_sz);
 
-// Identity signer for the chat plugin's identity registry (ND4).
-// Not part of the method_driver_t vtable.
-static bool irc_identity_signature(const method_msg_t *msg,
-    char *out_json, size_t out_sz);
-
 // Argument specs for IRC subcommands.
 static const cmd_arg_desc_t ad_irc_netname[] = {
   { "name", CMD_ARG_CUSTOM, CMD_ARG_REQUIRED, IRC_NET_NAME_SZ, irc_valid_name },
@@ -364,10 +359,10 @@ static const color_table_t irc_colors = {
   .reset  = IRC_RESET,
 };
 
-// IRC method driver vtable. Identity hooks (signer + scorer +
-// token-scorer) are registered with the chat plugin's identity
-// registry at plugin_start via plugin_dlsym, not published through
-// method_driver_t; the vtable carries protocol essentials only.
+// IRC method driver vtable. Identity is published per-message through
+// method_msg_t's nickname/username/hostname/verified_id fields (filled
+// by irc_identity_fill_quad on delivery), so the driver itself carries
+// only the protocol essentials.
 static const method_driver_t irc_driver = {
   .name          = "irc",
   .caps          = METHOD_CAP_EMOTE,
