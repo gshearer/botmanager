@@ -344,6 +344,59 @@ void wm_trade_books_iterate(wm_trade_book_iter_cb_t cb, void *user);
 // Count of registered books.
 uint32_t wm_trade_books_count(void);
 
+// ----------------------------------------------------------------------- //
+// Reconciliation (WM-PT-2)                                                //
+// ----------------------------------------------------------------------- //
+//
+// Walk the fills ring + book state and verify the book's cash + position
+// + fees match the math derived from first principles over the fills.
+// Read-only; runs entirely under the registry lock with no allocations
+// beyond the supplied result struct.
+//
+// When fill_n <= WM_FILL_RING_CAP, every lifetime fill is in the ring,
+// so the walk starts from starting_cash + flat position and produces a
+// full reconciliation. When fill_n > WM_FILL_RING_CAP, the oldest fills
+// have been overwritten; the walk anchors at the ring's oldest live
+// fill's (cash_after, position_after) and replays the cap-1 fills that
+// follow. expected_fees is not reconstructable from the ring alone in
+// this mode and is reported as not-reconciled.
+
+#define WM_TRADE_RECONCILE_EPS  1e-6
+
+typedef struct wm_trade_reconcile
+{
+  char     market_id_str[WM_MARKET_ID_STR_SZ];
+  char     strategy_name[WM_STRATEGY_NAME_SZ];
+
+  // Math derived from walking the fills ring oldest-first.
+  double   expected_cash;
+  double   expected_position;     // signed (long > 0, short < 0)
+  double   expected_fees;
+
+  // Live state read from the book at lock-held time.
+  double   actual_cash;
+  double   actual_position;       // signed
+  double   actual_fees;
+
+  // Deltas (actual - expected). status is OK iff every reconciled
+  // delta has |x| < WM_TRADE_RECONCILE_EPS. In ring-truncated mode
+  // fee_delta is not reconciled (set to 0 with fees_reconciled=false).
+  double   cash_delta;
+  double   position_delta;
+  double   fee_delta;
+
+  uint32_t fills_walked;          // entries walked in the ring
+  uint64_t fills_total;           // book->fill_n at lock time
+  bool     ring_truncated;        // true when fill_n > WM_FILL_RING_CAP
+  bool     fees_reconciled;       // false in ring-truncated mode
+  bool     ok;                    // every reconciled delta within EPS
+} wm_trade_reconcile_t;
+
+// Reconcile one book. Returns SUCCESS when the book exists; FAIL
+// otherwise (out is left untouched on FAIL).
+bool wm_trade_book_reconcile(const char *market_id_str,
+    const char *strategy_name, wm_trade_reconcile_t *out);
+
 // Verb registration (called from whenmoon_init). Registers the
 // /whenmoon trade {mode, reset} and /show whenmoon trade verbs. The
 // implementations live in trade_cmds.c.

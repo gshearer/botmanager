@@ -1110,3 +1110,148 @@ wm_trade_books_count(void)
 
   return(n);
 }
+
+// ----------------------------------------------------------------------- //
+// Reconciliation (WM-PT-2)                                                //
+// ----------------------------------------------------------------------- //
+
+// Fold one fill into the running expected_* accumulators. Used by the
+// reconcile walker for both full and ring-truncated modes.
+static void
+wm_trade_reconcile_apply_fill(const wm_fill_t *f,
+    double *expected_cash, double *expected_position,
+    double *expected_fees)
+{
+  double signed_qty;
+
+  signed_qty = (f->side == 'b') ?  f->qty
+             : (f->side == 's') ? -f->qty
+                                :  0.0;
+
+  *expected_cash     -= signed_qty * f->price;
+  *expected_cash     -= f->fee;
+  *expected_position += signed_qty;
+  *expected_fees     += f->fee;
+}
+
+static bool
+wm_trade_reconcile_within_eps(double delta)
+{
+  return((delta < 0.0 ? -delta : delta) < WM_TRADE_RECONCILE_EPS);
+}
+
+// Reconcile a book against its fills ring. Caller holds the registry
+// lock. Pure compute; no allocations beyond the supplied result struct.
+static void
+wm_trade_book_reconcile_locked(const wm_trade_book_t *b,
+    wm_trade_reconcile_t *out)
+{
+  uint32_t i;
+  uint32_t walk;
+  uint32_t src_idx;
+  double   signed_pos;
+
+  memset(out, 0, sizeof(*out));
+
+  snprintf(out->market_id_str, sizeof(out->market_id_str),
+      "%s", b->market_id_str);
+  snprintf(out->strategy_name, sizeof(out->strategy_name),
+      "%s", b->strategy_name);
+
+  out->fills_total     = b->fill_n;
+  out->ring_truncated  = b->fill_n > WM_FILL_RING_CAP;
+  out->fees_reconciled = !out->ring_truncated;
+
+  // Live state captured under the lock.
+  signed_pos = (b->position.side == WM_POS_LONG)  ?  b->position.qty
+             : (b->position.side == WM_POS_SHORT) ? -b->position.qty
+                                                  :  0.0;
+
+  out->actual_cash     = b->cash;
+  out->actual_position = signed_pos;
+  out->actual_fees     = b->pnl != NULL ? b->pnl->fees_paid : 0.0;
+
+  if(!out->ring_truncated)
+  {
+    // Full walk: every lifetime fill is in the ring, so we start from
+    // starting_cash + flat position and apply every fill in order.
+    out->expected_cash     = b->starting_cash;
+    out->expected_position = 0.0;
+    out->expected_fees     = 0.0;
+
+    walk = (uint32_t)b->fill_n;
+
+    for(i = 0; i < walk; i++)
+      wm_trade_reconcile_apply_fill(&b->fills[i],
+          &out->expected_cash, &out->expected_position,
+          &out->expected_fees);
+
+    out->fills_walked = walk;
+  }
+  else
+  {
+    // Ring-truncated walk. The ring's oldest live fill sits at the
+    // next-write slot (fill_head); everything older was overwritten.
+    // Anchor at that fill's (cash_after, position_after) — the state
+    // *just after* the oldest fill executed — and replay the cap-1
+    // fills that follow it. expected_fees can't be reconstructed from
+    // a partial walk against the lifetime fees_paid accumulator, so
+    // the fee delta is left unreconciled.
+    const wm_fill_t *anchor = &b->fills[b->fill_head];
+
+    out->expected_cash     = anchor->cash_after;
+    out->expected_position = anchor->position_after;
+    out->expected_fees     = 0.0;
+
+    for(i = 1; i < WM_FILL_RING_CAP; i++)
+    {
+      src_idx = (b->fill_head + i) % WM_FILL_RING_CAP;
+      wm_trade_reconcile_apply_fill(&b->fills[src_idx],
+          &out->expected_cash, &out->expected_position,
+          &out->expected_fees);
+    }
+
+    out->fills_walked = WM_FILL_RING_CAP;
+  }
+
+  out->cash_delta     = out->actual_cash     - out->expected_cash;
+  out->position_delta = out->actual_position - out->expected_position;
+  out->fee_delta      = out->fees_reconciled
+      ? out->actual_fees - out->expected_fees : 0.0;
+
+  out->ok = wm_trade_reconcile_within_eps(out->cash_delta) &&
+            wm_trade_reconcile_within_eps(out->position_delta) &&
+            (!out->fees_reconciled ||
+                wm_trade_reconcile_within_eps(out->fee_delta));
+}
+
+bool
+wm_trade_book_reconcile(const char *market_id_str,
+    const char *strategy_name, wm_trade_reconcile_t *out)
+{
+  wm_trade_registry_t *reg;
+  wm_trade_book_t     *b;
+  bool                 ok = FAIL;
+
+  if(out == NULL)
+    return(FAIL);
+
+  reg = wm_trade_get_active_registry();
+
+  if(reg == NULL)
+    return(FAIL);
+
+  pthread_mutex_lock(&reg->lock);
+
+  b = wm_trade_book_find(reg, market_id_str, strategy_name);
+
+  if(b != NULL)
+  {
+    wm_trade_book_reconcile_locked(b, out);
+    ok = SUCCESS;
+  }
+
+  pthread_mutex_unlock(&reg->lock);
+
+  return(ok);
+}

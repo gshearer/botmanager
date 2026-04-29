@@ -415,6 +415,102 @@ wm_trade_show_detail(const cmd_ctx_t *ctx,
 }
 
 // ----------------------------------------------------------------------- //
+// /show whenmoon trade reconcile (WM-PT-2)                                //
+// ----------------------------------------------------------------------- //
+
+static const char *
+wm_trade_reconcile_marker(double delta)
+{
+  return((delta < 0.0 ? -delta : delta) < WM_TRADE_RECONCILE_EPS
+         ? "ok" : "MISMATCH");
+}
+
+static void
+wm_trade_show_reconcile(const cmd_ctx_t *ctx,
+    const char *market_id_str, const char *strategy_name)
+{
+  wm_trade_reconcile_t rec;
+  char                 line[224];
+  const char          *fee_mark;
+
+  if(wm_trade_book_reconcile(market_id_str, strategy_name, &rec)
+         != SUCCESS)
+  {
+    snprintf(line, sizeof(line),
+        "reconcile: no book for %s/%s",
+        market_id_str, strategy_name);
+    cmd_reply(ctx, line);
+    return;
+  }
+
+  snprintf(line, sizeof(line),
+      CLR_BOLD "reconcile %s/%s" CLR_RESET,
+      rec.market_id_str, rec.strategy_name);
+  cmd_reply(ctx, line);
+
+  snprintf(line, sizeof(line),
+      "  expected_cash     = %15.4f", rec.expected_cash);
+  cmd_reply(ctx, line);
+  snprintf(line, sizeof(line),
+      "  actual_cash       = %15.4f", rec.actual_cash);
+  cmd_reply(ctx, line);
+  snprintf(line, sizeof(line),
+      "  cash_delta        = %15.4f  [%s]",
+      rec.cash_delta, wm_trade_reconcile_marker(rec.cash_delta));
+  cmd_reply(ctx, line);
+
+  snprintf(line, sizeof(line),
+      "  expected_position = %15.6f", rec.expected_position);
+  cmd_reply(ctx, line);
+  snprintf(line, sizeof(line),
+      "  actual_position   = %15.6f", rec.actual_position);
+  cmd_reply(ctx, line);
+  snprintf(line, sizeof(line),
+      "  position_delta    = %15.6f  [%s]",
+      rec.position_delta, wm_trade_reconcile_marker(rec.position_delta));
+  cmd_reply(ctx, line);
+
+  if(rec.fees_reconciled)
+  {
+    fee_mark = wm_trade_reconcile_marker(rec.fee_delta);
+
+    snprintf(line, sizeof(line),
+        "  expected_fees     = %15.4f", rec.expected_fees);
+    cmd_reply(ctx, line);
+    snprintf(line, sizeof(line),
+        "  actual_fees       = %15.4f", rec.actual_fees);
+    cmd_reply(ctx, line);
+    snprintf(line, sizeof(line),
+        "  fee_delta         = %15.4f  [%s]",
+        rec.fee_delta, fee_mark);
+    cmd_reply(ctx, line);
+  }
+  else
+  {
+    snprintf(line, sizeof(line),
+        "  actual_fees       = %15.4f  [n/a (ring-truncated)]",
+        rec.actual_fees);
+    cmd_reply(ctx, line);
+  }
+
+  if(rec.ring_truncated)
+    snprintf(line, sizeof(line),
+        "  fills_walked      = %u (of %d-cap ring, lifetime=%" PRIu64 ")",
+        rec.fills_walked, WM_FILL_RING_CAP, rec.fills_total);
+  else
+    snprintf(line, sizeof(line),
+        "  fills_walked      = %u (of %d-cap ring)",
+        rec.fills_walked, WM_FILL_RING_CAP);
+  cmd_reply(ctx, line);
+
+  snprintf(line, sizeof(line),
+      "  status            = %s%s",
+      rec.ok ? "OK" : "MISMATCH",
+      rec.ring_truncated ? "  (mode=ring-truncated)" : "");
+  cmd_reply(ctx, line);
+}
+
+// ----------------------------------------------------------------------- //
 // /show whenmoon trade dispatcher                                         //
 // ----------------------------------------------------------------------- //
 
@@ -422,26 +518,50 @@ static void
 wm_trade_cmd_show(const cmd_ctx_t *ctx)
 {
   const char *p;
+  char        first_tok[32]                 = {0};
   char        id_tok[64]                    = {0};
   char        name_tok[WM_STRATEGY_NAME_SZ] = {0};
-  bool        have_id;
+  bool        have_first;
   bool        have_name;
 
   p = ctx->args != NULL ? ctx->args : "";
 
-  have_id   = wm_dl_next_token(&p, id_tok,   sizeof(id_tok));
-  have_name = wm_dl_next_token(&p, name_tok, sizeof(name_tok));
+  have_first = wm_dl_next_token(&p, first_tok, sizeof(first_tok));
 
-  if(have_id && have_name)
+  // Sub-verb: reconcile <market_id> <strategy_name>.
+  if(have_first && strcmp(first_tok, "reconcile") == 0)
   {
-    wm_trade_show_detail(ctx, id_tok, name_tok);
+    if(!wm_dl_next_token(&p, id_tok, sizeof(id_tok)) ||
+       !wm_dl_next_token(&p, name_tok, sizeof(name_tok)))
+    {
+      cmd_reply(ctx,
+          "usage: /show whenmoon trade reconcile <market_id>"
+          " <strategy_name>");
+      return;
+    }
+
+    wm_trade_show_reconcile(ctx, id_tok, name_tok);
     return;
   }
 
-  if(have_id && !have_name)
+  // No sub-verb: first token (if any) is the market_id; second is
+  // the strategy name. List view when both are absent; detail view
+  // when both are present.
+  if(have_first)
   {
+    snprintf(id_tok, sizeof(id_tok), "%s", first_tok);
+    have_name = wm_dl_next_token(&p, name_tok, sizeof(name_tok));
+
+    if(have_name)
+    {
+      wm_trade_show_detail(ctx, id_tok, name_tok);
+      return;
+    }
+
     cmd_reply(ctx,
-        "usage: /show whenmoon trade [<market_id> <strategy_name>]");
+        "usage: /show whenmoon trade"
+        " [reconcile <market_id> <strategy_name>"
+        " | <market_id> <strategy_name>]");
     return;
   }
 
@@ -495,13 +615,18 @@ wm_trade_register_verbs(void)
 
   // /show whenmoon trade
   if(cmd_register("whenmoon", "trade",
-        "show whenmoon trade [<market_id> <strategy_name>]",
-        "List every trade book (no args) or render full detail for"
-        " one (mode, position, equity, recent fills, PnL metrics).",
+        "show whenmoon trade [reconcile] [<market_id> <strategy_name>]",
+        "List every trade book (no args), render full detail for one,"
+        " or reconcile a book against its fills ring (WM-PT-2).",
         "List view: one row per (market, strategy) book with mode,"
         " cash, position, lifetime trade count, realized PnL.\n"
         "Detail view: refreshes the mark from the live ticker before"
-        " rendering so unrealized PnL reflects the current price.",
+        " rendering so unrealized PnL reflects the current price.\n"
+        "Reconcile view: walks the fills ring and recomputes expected"
+        " cash + position + fees from first principles, reporting"
+        " deltas vs the live book. When the ring has wrapped"
+        " (lifetime fills > 256) the walk anchors at the oldest live"
+        " fill and reports mode=ring-truncated.",
         USERNS_GROUP_ADMIN, 100, CMD_SCOPE_ANY, METHOD_T_ANY,
         wm_trade_cmd_show, NULL, "show/whenmoon", NULL,
         NULL, 0, NULL, NULL) != SUCCESS)
