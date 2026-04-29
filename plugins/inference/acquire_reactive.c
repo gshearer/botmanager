@@ -731,13 +731,31 @@ acq_reactive_sxng_done(const sxng_response_t *resp)
       src->page_url[ulen] = '\0';
     }
 
-    if(curl_get(r->url, acq_reactive_curl_done, src) != SUCCESS)
     {
-      clam(CLAM_WARN, ACQUIRE_CTX,
-          "%s: curl_get failed url='%s'", acq_ctx_mode(ctx), r->url);
-      mem_free(src);
-      reactive_job_release_source(ctx);
-      continue;
+      curl_request_t *cr = curl_request_create(CURL_METHOD_GET, r->url,
+          acq_reactive_curl_done, src);
+
+      if(cr == NULL)
+      {
+        clam(CLAM_WARN, ACQUIRE_CTX,
+            "%s: curl_request_create failed url='%s'",
+            acq_ctx_mode(ctx), r->url);
+        mem_free(src);
+        reactive_job_release_source(ctx);
+        continue;
+      }
+
+      (void)curl_request_set_prio(cr, CURL_PRIO_BULK);
+
+      if(curl_request_submit(cr) != SUCCESS)
+      {
+        clam(CLAM_WARN, ACQUIRE_CTX,
+            "%s: curl_request_submit failed url='%s'",
+            acq_ctx_mode(ctx), r->url);
+        mem_free(src);
+        reactive_job_release_source(ctx);
+        continue;
+      }
     }
 
     submitted++;

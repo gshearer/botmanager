@@ -171,7 +171,12 @@ bool    cb_submit_private(cb_request_t *req, curl_method_t method,
 // caller-supplied pointer, exactly as for cb_submit_private. EX-1
 // promoted this from a file-scope static — no thin wrappers per
 // AGENTS.md `feedback_no_thin_wrappers.md`.
-bool    cb_submit_public(void *user_data, const char *path,
+//
+// `prio` is the curl request priority (one of CURL_PRIO_*; byte values
+// match EXCHANGE_PRIO_* on purpose so the exchange-vtable submit can
+// pass its 8-bit priority through unchanged). Legacy typed callers
+// (products / ticker) pass CURL_PRIO_NORMAL.
+bool    cb_submit_public(void *user_data, uint8_t prio, const char *path,
             curl_done_cb_t done_cb);
 
 // coinbase_exchange.c — vtable registration with the feature_exchange

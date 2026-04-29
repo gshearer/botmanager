@@ -329,7 +329,8 @@ cb_deliver_ticker_fail(cb_request_t *r, const char *err)
 // exchange-vtable path surfaces failure via the abstraction).
 
 bool
-cb_submit_public(void *user_data, const char *path, curl_done_cb_t done_cb)
+cb_submit_public(void *user_data, uint8_t prio, const char *path,
+    curl_done_cb_t done_cb)
 {
   curl_request_t *cr;
   char            base[CB_URL_SZ];
@@ -360,6 +361,7 @@ cb_submit_public(void *user_data, const char *path, curl_done_cb_t done_cb)
   }
 
   curl_request_add_header(cr, "Accept: application/json");
+  (void)curl_request_set_prio(cr, (curl_prio_t)prio);
 
   if(curl_request_submit(cr) != SUCCESS)
   {
@@ -800,7 +802,8 @@ coinbase_fetch_products_async(coinbase_done_products_cb_t cb, void *user)
   r->cb.products = cb;
   r->user        = user;
 
-  if(cb_submit_public(r, CB_PATH_PRODUCTS, cb_products_done) != SUCCESS)
+  if(cb_submit_public(r, CURL_PRIO_NORMAL, CB_PATH_PRODUCTS,
+        cb_products_done) != SUCCESS)
   {
     cb_deliver_products_fail(r,
         "Error: failed to submit Coinbase products request");
@@ -946,7 +949,7 @@ coinbase_fetch_ticker_async(const char *product_id,
   r->user       = user;
   snprintf(r->product_id, sizeof(r->product_id), "%s", product_id);
 
-  if(cb_submit_public(r, path, cb_ticker_done) != SUCCESS)
+  if(cb_submit_public(r, CURL_PRIO_NORMAL, path, cb_ticker_done) != SUCCESS)
   {
     cb_deliver_ticker_fail(r,
         "Error: failed to submit Coinbase ticker request");

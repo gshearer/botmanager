@@ -402,7 +402,7 @@ exchange_dispatch(exchange_t *exch)
     return;
   }
 
-  submitted = exch->vt->submit(r->proto_handle,
+  submitted = exch->vt->submit(r->proto_handle, r->prio,
       exchange_internal_response_cb, r);
 
   if(submitted != SUCCESS)

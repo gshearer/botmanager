@@ -164,7 +164,8 @@ cb_exchange_build_request(exchange_op_kind_t kind, const char *path,
 }
 
 static bool
-cb_exchange_submit(void *handle, exchange_response_cb_t cb, void *user)
+cb_exchange_submit(void *handle, uint8_t prio,
+    exchange_response_cb_t cb, void *user)
 {
   cb_exchange_handle_t *h = handle;
   bool                  is_private;
@@ -193,8 +194,9 @@ cb_exchange_submit(void *handle, exchange_response_cb_t cb, void *user)
 
   // Public GET — the simple path. cb_submit_public gives the curl
   // request `h` as its user_data, so cb_exchange_curl_done sees the
-  // exchange handle directly.
-  if(cb_submit_public(h, h->path, cb_exchange_curl_done) != SUCCESS)
+  // exchange handle directly. The exchange's priority byte threads
+  // through to the curl request unchanged (CURL-PRIO-3).
+  if(cb_submit_public(h, prio, h->path, cb_exchange_curl_done) != SUCCESS)
     return(FAIL);
 
   return(SUCCESS);

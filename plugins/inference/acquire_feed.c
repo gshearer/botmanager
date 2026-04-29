@@ -402,6 +402,7 @@ acq_feed_fire(acq_feed_ctx_t *f)
 
   (void)curl_request_set_user_agent(req, ACQ_FEED_USER_AGENT);
   (void)curl_request_set_timeout(req, ACQ_FEED_FETCH_TIMEOUT_SECS);
+  (void)curl_request_set_prio(req, CURL_PRIO_BULK);
 
   if(f->etag[0] != '\0')
   {

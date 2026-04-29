@@ -90,6 +90,11 @@ typedef void (*exchange_response_cb_t)(int http_status,
 // applies retry policy, and finally invokes the caller's
 // exchange_response_cb_t with the raw body.
 //
+// `prio` is the priority byte from exchange_request(); the protocol
+// plugin forwards it to the underlying transport so curl-level priority
+// matches exchange-level priority (CURL-PRIO-3). The byte values match
+// CURL_PRIO_* by design.
+//
 // `advertised_rps` / `advertised_burst` are static knobs read once at
 // `exchange_register()` time. The abstraction sizes its token bucket
 // from these (with a small headroom subtracted from `rps`).
@@ -99,7 +104,8 @@ typedef struct
       const char *path, const char *body_json,
       void **out_handle);
 
-  bool (*submit)(void *handle, exchange_response_cb_t cb, void *user);
+  bool (*submit)(void *handle, uint8_t prio,
+      exchange_response_cb_t cb, void *user);
 
   void (*free_request)(void *handle);
 
