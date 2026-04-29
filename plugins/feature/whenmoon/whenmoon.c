@@ -12,6 +12,7 @@
 #include "market_cmds.h"
 #include "order.h"
 #include "strategy.h"
+#include "sweep.h"
 #include "trade_persist.h"
 
 #include "cmd.h"
@@ -426,6 +427,12 @@ whenmoon_init(void)
   // present (the iteration finds no PLUGIN_STRATEGY records).
   wm_strategy_registry_scan(st);
 
+  // WM-LT-6: drop any per-iteration KV slots left over from a prior
+  // crashed sweep so kv_register on a freshly-allocated synthetic id
+  // never trips on a stale row. Safe at boot — no other thread is
+  // touching those keys yet.
+  wm_bt_sweep_cleanup_stale_kv();
+
   // Restore last; logs but does not fail init if the DB query errors.
   if(wm_market_restore(st) != SUCCESS)
     clam(CLAM_INFO, WHENMOON_CTX,
@@ -467,7 +474,7 @@ whenmoon_deinit(void)
 const plugin_desc_t bm_plugin_desc = {
   .api_version          = PLUGIN_API_VERSION,
   .name                 = "whenmoon",
-  .version              = "0.7-lt5",
+  .version              = "0.8-lt6",
   .type                 = PLUGIN_FEATURE,
   .kind                 = "whenmoon",
   .provides             = { { .name = "feature_whenmoon" } },

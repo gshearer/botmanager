@@ -63,11 +63,15 @@
 
 static atomic_uint_fast64_t g_bt_iter_counter = 0;
 
-static void
-wm_bt_make_synthetic_id(char *out, size_t cap)
+void
+wm_backtest_alloc_synthetic_id(char *out, size_t cap)
 {
-  uint64_t n = atomic_fetch_add(&g_bt_iter_counter, 1) + 1;
+  uint64_t n;
 
+  if(out == NULL || cap == 0)
+    return;
+
+  n = atomic_fetch_add(&g_bt_iter_counter, 1) + 1;
   snprintf(out, cap, WM_BACKTEST_ID_PREFIX "%" PRIu64, n);
 }
 
@@ -463,6 +467,22 @@ wm_backtest_run_iteration(whenmoon_state_t *st,
     wm_backtest_result_t *out,
     char *err, size_t err_cap)
 {
+  char synth_id[WM_MARKET_ID_STR_SZ];
+
+  wm_backtest_alloc_synthetic_id(synth_id, sizeof(synth_id));
+  return(wm_backtest_run_iteration_with_id(st, snap, strategy_name,
+      synth_id, params, out, err, err_cap));
+}
+
+bool
+wm_backtest_run_iteration_with_id(whenmoon_state_t *st,
+    wm_backtest_snapshot_t *snap,
+    const char *strategy_name,
+    const char *synth_id,
+    const wm_backtest_params_t *params,
+    wm_backtest_result_t *out,
+    char *err, size_t err_cap)
+{
   loaded_strategy_t              *ls;
   int                           (*init_fn)(wm_strategy_ctx_t *);
   void                          (*finalize_fn)(wm_strategy_ctx_t *);
@@ -473,7 +493,6 @@ wm_backtest_run_iteration(whenmoon_state_t *st,
   uint16_t                        grains_mask;
   wm_strategy_ctx_t               ctx;
   wm_trade_book_t                *book;
-  char                            synth_id[WM_MARKET_ID_STR_SZ];
   char                            strat_copy[WM_STRATEGY_NAME_SZ];
   wm_bt_cursor_t                  cursors[WM_GRAN_MAX];
   const wm_candle_full_t         *rings[WM_GRAN_MAX];
@@ -486,7 +505,8 @@ wm_backtest_run_iteration(whenmoon_state_t *st,
   if(out != NULL)
     memset(out, 0, sizeof(*out));
 
-  if(st == NULL || snap == NULL || strategy_name == NULL || out == NULL)
+  if(st == NULL || snap == NULL || strategy_name == NULL ||
+     synth_id == NULL || synth_id[0] == '\0' || out == NULL)
   {
     if(err != NULL)
       snprintf(err, err_cap, "bad iteration inputs");
@@ -496,7 +516,7 @@ wm_backtest_run_iteration(whenmoon_state_t *st,
   // Resolve the strategy + cache its function pointers under the
   // registry lock, then release. The function pointers are stable for
   // the lifetime of the loaded_strategy_t — a reload would invalidate
-  // them, but the WM-LT-5 surface does not expose reload mid-iteration.
+  // them; sweep callers gate reload via the active-counter in sweep.c.
   pthread_mutex_lock(&st->strategies->lock);
 
   ls = wm_strategy_find_loaded(st, strategy_name);
@@ -520,10 +540,10 @@ wm_backtest_run_iteration(whenmoon_state_t *st,
 
   pthread_mutex_unlock(&st->strategies->lock);
 
-  // Allocate a synthetic market_id and prime the backtest book in the
-  // trade registry. PAPER mode reuses the live fill engine.
-  wm_bt_make_synthetic_id(synth_id, sizeof(synth_id));
-
+  // Use the caller-supplied synthetic id; prime the backtest book in
+  // the active trade registry. PAPER mode reuses the live fill engine.
+  // The sweep worker has bound a private registry via
+  // wm_trade_engine_use_registry beforehand.
   book = wm_trade_book_get_or_create(synth_id, strat_copy);
 
   if(book == NULL)

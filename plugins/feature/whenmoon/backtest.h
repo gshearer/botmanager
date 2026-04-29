@@ -128,6 +128,17 @@ void wm_backtest_snapshot_free(wm_backtest_snapshot_t *snap);
 // Iteration                                                               //
 // ----------------------------------------------------------------------- //
 
+// Allocate a fresh synthetic market id for one backtest iteration.
+// Format: "bt:<N>" where N is a process-monotonic counter. The returned
+// id is unique for the daemon's lifetime; reuse across the sweep
+// planner is safe because the counter never wraps in any realistic
+// runtime (uint64).
+//
+// Used by the sweep planner (sweep.c) to pre-allocate an id so it can
+// register per-iteration KV override slots BEFORE handing the id to
+// wm_backtest_run_iteration_with_id below.
+void wm_backtest_alloc_synthetic_id(char *out, size_t cap);
+
 // Run one iteration against `snap`. Looks up the loaded strategy by
 // name, allocates a fresh wm_strategy_ctx_t, calls init / on_bar (per
 // snapshot bar in chronological order across every grain the strategy
@@ -138,9 +149,28 @@ void wm_backtest_snapshot_free(wm_backtest_snapshot_t *snap);
 //
 // Returns SUCCESS on a completed iteration; FAIL on setup or run
 // errors. err (when non-NULL) is populated on FAIL.
+//
+// Uses an auto-allocated synthetic id; thin wrapper around
+// wm_backtest_run_iteration_with_id (same behaviour as WM-LT-5).
 bool wm_backtest_run_iteration(struct whenmoon_state *st,
     wm_backtest_snapshot_t *snap,
     const char *strategy_name,
+    const wm_backtest_params_t *params,
+    wm_backtest_result_t *out,
+    char *err, size_t err_cap);
+
+// Same as wm_backtest_run_iteration but with an externally allocated
+// synthetic id. The sweep planner (WM-LT-6) uses this so it can write
+// per-iteration KV overrides keyed on the same id BEFORE the
+// iteration's strategy init reads them.
+//
+// `synth_id` must match the "bt:<N>" pattern produced by
+// wm_backtest_alloc_synthetic_id and must be unique within the
+// process lifetime (the trade book registry lookups use it directly).
+bool wm_backtest_run_iteration_with_id(struct whenmoon_state *st,
+    wm_backtest_snapshot_t *snap,
+    const char *strategy_name,
+    const char *synth_id,
     const wm_backtest_params_t *params,
     wm_backtest_result_t *out,
     char *err, size_t err_cap);

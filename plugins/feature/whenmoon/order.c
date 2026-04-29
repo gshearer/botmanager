@@ -45,18 +45,35 @@
 #define WM_TRADE_DEF_STARTING_CASH   10000.0
 
 // ----------------------------------------------------------------------- //
-// Registry singleton                                                      //
+// Registry — global singleton + TLS active-registry plumbing              //
 // ----------------------------------------------------------------------- //
-
-typedef struct
-{
-  pthread_mutex_t   lock;
-  wm_trade_book_t  *head;
-  uint32_t          n_books;
-  bool              initialized;
-} wm_trade_registry_t;
+//
+// Every public book API resolves the calling thread's "active" registry
+// via wm_trade_get_active_registry. Threads that have never bound a
+// private registry (live + paper paths, cmd workers, etc.) see the
+// global. Backtest iterations (WM-LT-6) bind a freshly-created private
+// registry via wm_trade_engine_use_registry; subsequent ops on that
+// thread, including signal emission from inside a strategy callback,
+// route to the private book without touching the global mutex.
 
 static wm_trade_registry_t g_registry;
+static pthread_key_t       g_bt_registry_key;
+static bool                g_bt_registry_key_inited = false;
+
+static wm_trade_registry_t *
+wm_trade_get_active_registry(void)
+{
+  wm_trade_registry_t *r;
+
+  if(!g_registry.initialized)
+    return(NULL);
+
+  if(!g_bt_registry_key_inited)
+    return(&g_registry);
+
+  r = (wm_trade_registry_t *)pthread_getspecific(g_bt_registry_key);
+  return(r != NULL ? r : &g_registry);
+}
 
 // ----------------------------------------------------------------------- //
 // Mode helpers                                                            //
@@ -103,9 +120,20 @@ wm_trade_engine_init(void)
   if(pthread_mutex_init(&g_registry.lock, NULL) != 0)
     return(FAIL);
 
-  g_registry.head        = NULL;
-  g_registry.n_books     = 0;
-  g_registry.initialized = true;
+  // Per-thread active-registry slot. The destructor is NULL — every
+  // caller that pins a private registry via use_registry is responsible
+  // for unbinding before its thread exits (and for destroying the
+  // registry).
+  if(pthread_key_create(&g_bt_registry_key, NULL) != 0)
+  {
+    pthread_mutex_destroy(&g_registry.lock);
+    return(FAIL);
+  }
+
+  g_bt_registry_key_inited = true;
+  g_registry.head          = NULL;
+  g_registry.n_books       = 0;
+  g_registry.initialized   = true;
 
   clam(CLAM_INFO, WM_TRADE_CTX, "trade engine initialized");
   return(SUCCESS);
@@ -149,9 +177,83 @@ wm_trade_engine_destroy(void)
   pthread_mutex_unlock(&g_registry.lock);
   pthread_mutex_destroy(&g_registry.lock);
 
+  if(g_bt_registry_key_inited)
+  {
+    pthread_key_delete(g_bt_registry_key);
+    g_bt_registry_key_inited = false;
+  }
+
   g_registry.initialized = false;
 
   clam(CLAM_INFO, WM_TRADE_CTX, "trade engine destroyed");
+}
+
+// ----------------------------------------------------------------------- //
+// Private registry lifecycle (WM-LT-6)                                    //
+// ----------------------------------------------------------------------- //
+
+wm_trade_registry_t *
+wm_trade_registry_create(void)
+{
+  wm_trade_registry_t *r;
+
+  if(!g_registry.initialized)
+    return(NULL);
+
+  r = mem_alloc("whenmoon", "trade_registry", sizeof(*r));
+
+  if(r == NULL)
+    return(NULL);
+
+  memset(r, 0, sizeof(*r));
+
+  if(pthread_mutex_init(&r->lock, NULL) != 0)
+  {
+    mem_free(r);
+    return(NULL);
+  }
+
+  r->initialized = true;
+  return(r);
+}
+
+void
+wm_trade_registry_destroy(wm_trade_registry_t *r)
+{
+  wm_trade_book_t *b;
+  wm_trade_book_t *next;
+
+  if(r == NULL)
+    return;
+
+  pthread_mutex_lock(&r->lock);
+
+  b = r->head;
+
+  while(b != NULL)
+  {
+    next = b->next;
+    wm_trade_book_free_locked(b);
+    b    = next;
+  }
+
+  r->head        = NULL;
+  r->n_books     = 0;
+  r->initialized = false;
+
+  pthread_mutex_unlock(&r->lock);
+  pthread_mutex_destroy(&r->lock);
+
+  mem_free(r);
+}
+
+void
+wm_trade_engine_use_registry(wm_trade_registry_t *r)
+{
+  if(!g_bt_registry_key_inited)
+    return;
+
+  pthread_setspecific(g_bt_registry_key, r);
 }
 
 // ----------------------------------------------------------------------- //
@@ -159,14 +261,15 @@ wm_trade_engine_destroy(void)
 // ----------------------------------------------------------------------- //
 
 wm_trade_book_t *
-wm_trade_book_find(const char *market_id_str, const char *strategy_name)
+wm_trade_book_find(wm_trade_registry_t *reg,
+    const char *market_id_str, const char *strategy_name)
 {
   wm_trade_book_t *b;
 
-  if(market_id_str == NULL || strategy_name == NULL)
+  if(reg == NULL || market_id_str == NULL || strategy_name == NULL)
     return(NULL);
 
-  for(b = g_registry.head; b != NULL; b = b->next)
+  for(b = reg->head; b != NULL; b = b->next)
   {
     if(strncmp(b->market_id_str, market_id_str,
            sizeof(b->market_id_str)) != 0)
@@ -238,14 +341,21 @@ wm_trade_book_refresh_kv_locked(wm_trade_book_t *book)
 void
 wm_trade_book_refresh_kv(wm_trade_book_t *book)
 {
-  pthread_mutex_lock(&g_registry.lock);
+  wm_trade_registry_t *reg;
+
+  reg = wm_trade_get_active_registry();
+
+  if(reg == NULL)
+    return;
+
+  pthread_mutex_lock(&reg->lock);
   wm_trade_book_refresh_kv_locked(book);
-  pthread_mutex_unlock(&g_registry.lock);
+  pthread_mutex_unlock(&reg->lock);
 }
 
 static wm_trade_book_t *
-wm_trade_book_create_locked(const char *market_id_str,
-    const char *strategy_name)
+wm_trade_book_create_locked(wm_trade_registry_t *reg,
+    const char *market_id_str, const char *strategy_name)
 {
   wm_trade_book_t *book;
 
@@ -276,9 +386,9 @@ wm_trade_book_create_locked(const char *market_id_str,
   wm_trade_book_refresh_kv_locked(book);
 
   // Link.
-  book->next       = g_registry.head;
-  g_registry.head  = book;
-  g_registry.n_books++;
+  book->next  = reg->head;
+  reg->head   = book;
+  reg->n_books++;
 
   clam(CLAM_INFO, WM_TRADE_CTX,
       "book created: %s/%s mode=%s cash=%.2f size_frac=%.4f"
@@ -294,20 +404,25 @@ wm_trade_book_t *
 wm_trade_book_get_or_create(const char *market_id_str,
     const char *strategy_name)
 {
-  wm_trade_book_t *b;
+  wm_trade_registry_t *reg;
+  wm_trade_book_t     *b;
 
-  if(!g_registry.initialized || market_id_str == NULL ||
-     strategy_name == NULL)
+  if(market_id_str == NULL || strategy_name == NULL)
     return(NULL);
 
-  pthread_mutex_lock(&g_registry.lock);
+  reg = wm_trade_get_active_registry();
 
-  b = wm_trade_book_find(market_id_str, strategy_name);
+  if(reg == NULL)
+    return(NULL);
+
+  pthread_mutex_lock(&reg->lock);
+
+  b = wm_trade_book_find(reg, market_id_str, strategy_name);
 
   if(b == NULL)
-    b = wm_trade_book_create_locked(market_id_str, strategy_name);
+    b = wm_trade_book_create_locked(reg, market_id_str, strategy_name);
 
-  pthread_mutex_unlock(&g_registry.lock);
+  pthread_mutex_unlock(&reg->lock);
 
   return(b);
 }
@@ -319,16 +434,21 @@ wm_trade_book_get_or_create(const char *market_id_str,
 void
 wm_trade_book_remove(const char *market_id_str, const char *strategy_name)
 {
-  wm_trade_book_t **pp;
-  wm_trade_book_t  *target = NULL;
+  wm_trade_registry_t  *reg;
+  wm_trade_book_t     **pp;
+  wm_trade_book_t      *target = NULL;
 
-  if(!g_registry.initialized || market_id_str == NULL ||
-     strategy_name == NULL)
+  if(market_id_str == NULL || strategy_name == NULL)
     return;
 
-  pthread_mutex_lock(&g_registry.lock);
+  reg = wm_trade_get_active_registry();
 
-  pp = &g_registry.head;
+  if(reg == NULL)
+    return;
+
+  pthread_mutex_lock(&reg->lock);
+
+  pp = &reg->head;
 
   while(*pp != NULL)
   {
@@ -339,7 +459,7 @@ wm_trade_book_remove(const char *market_id_str, const char *strategy_name)
     {
       target = *pp;
       *pp    = target->next;
-      g_registry.n_books--;
+      reg->n_books--;
       break;
     }
 
@@ -349,7 +469,7 @@ wm_trade_book_remove(const char *market_id_str, const char *strategy_name)
   if(target != NULL)
     wm_trade_book_free_locked(target);
 
-  pthread_mutex_unlock(&g_registry.lock);
+  pthread_mutex_unlock(&reg->lock);
 
   if(target != NULL)
     clam(CLAM_INFO, WM_TRADE_CTX,
@@ -359,15 +479,21 @@ wm_trade_book_remove(const char *market_id_str, const char *strategy_name)
 uint32_t
 wm_trade_books_remove_market(const char *market_id_str)
 {
-  wm_trade_book_t **pp;
-  uint32_t          n_removed = 0;
+  wm_trade_registry_t  *reg;
+  wm_trade_book_t     **pp;
+  uint32_t              n_removed = 0;
 
-  if(!g_registry.initialized || market_id_str == NULL)
+  if(market_id_str == NULL)
     return(0);
 
-  pthread_mutex_lock(&g_registry.lock);
+  reg = wm_trade_get_active_registry();
 
-  pp = &g_registry.head;
+  if(reg == NULL)
+    return(0);
+
+  pthread_mutex_lock(&reg->lock);
+
+  pp = &reg->head;
 
   while(*pp != NULL)
   {
@@ -377,7 +503,7 @@ wm_trade_books_remove_market(const char *market_id_str)
            sizeof(cur->market_id_str)) == 0)
     {
       *pp = cur->next;
-      g_registry.n_books--;
+      reg->n_books--;
       wm_trade_book_free_locked(cur);
       n_removed++;
       continue;
@@ -386,7 +512,7 @@ wm_trade_books_remove_market(const char *market_id_str)
     pp = &cur->next;
   }
 
-  pthread_mutex_unlock(&g_registry.lock);
+  pthread_mutex_unlock(&reg->lock);
 
   if(n_removed > 0)
     clam(CLAM_INFO, WM_TRADE_CTX,
@@ -404,33 +530,36 @@ bool
 wm_trade_book_set_mode(const char *market_id_str,
     const char *strategy_name, wm_trade_mode_t mode)
 {
-  wm_trade_book_t *b;
-  wm_trade_mode_t  prev;
-
-  if(!g_registry.initialized)
-    return(FAIL);
+  wm_trade_registry_t *reg;
+  wm_trade_book_t     *b;
+  wm_trade_mode_t      prev;
 
   if(mode != WM_TRADE_MODE_OFF && mode != WM_TRADE_MODE_PAPER &&
      mode != WM_TRADE_MODE_BACKTEST && mode != WM_TRADE_MODE_LIVE)
     return(FAIL);
 
-  pthread_mutex_lock(&g_registry.lock);
+  reg = wm_trade_get_active_registry();
 
-  b = wm_trade_book_find(market_id_str, strategy_name);
+  if(reg == NULL)
+    return(FAIL);
+
+  pthread_mutex_lock(&reg->lock);
+
+  b = wm_trade_book_find(reg, market_id_str, strategy_name);
 
   if(b == NULL)
-    b = wm_trade_book_create_locked(market_id_str, strategy_name);
+    b = wm_trade_book_create_locked(reg, market_id_str, strategy_name);
 
   if(b == NULL)
   {
-    pthread_mutex_unlock(&g_registry.lock);
+    pthread_mutex_unlock(&reg->lock);
     return(FAIL);
   }
 
   prev    = b->mode;
   b->mode = mode;
 
-  pthread_mutex_unlock(&g_registry.lock);
+  pthread_mutex_unlock(&reg->lock);
 
   clam(CLAM_INFO, WM_TRADE_CTX,
       "%s/%s mode %s -> %s",
@@ -448,14 +577,17 @@ wm_trade_book_override_params(const char *market_id_str,
     bool have_size_frac,     double size_frac,
     bool have_starting_cash, double starting_cash)
 {
-  wm_trade_book_t *b;
+  wm_trade_registry_t *reg;
+  wm_trade_book_t     *b;
 
-  if(!g_registry.initialized)
+  reg = wm_trade_get_active_registry();
+
+  if(reg == NULL)
     return;
 
-  pthread_mutex_lock(&g_registry.lock);
+  pthread_mutex_lock(&reg->lock);
 
-  b = wm_trade_book_find(market_id_str, strategy_name);
+  b = wm_trade_book_find(reg, market_id_str, strategy_name);
 
   if(b != NULL)
   {
@@ -475,20 +607,23 @@ wm_trade_book_override_params(const char *market_id_str,
         b->fee_bps, b->slip_bps, b->size_frac, b->cash);
   }
 
-  pthread_mutex_unlock(&g_registry.lock);
+  pthread_mutex_unlock(&reg->lock);
 }
 
 void
 wm_trade_book_reset(const char *market_id_str, const char *strategy_name)
 {
-  wm_trade_book_t *b;
+  wm_trade_registry_t *reg;
+  wm_trade_book_t     *b;
 
-  if(!g_registry.initialized)
+  reg = wm_trade_get_active_registry();
+
+  if(reg == NULL)
     return;
 
-  pthread_mutex_lock(&g_registry.lock);
+  pthread_mutex_lock(&reg->lock);
 
-  b = wm_trade_book_find(market_id_str, strategy_name);
+  b = wm_trade_book_find(reg, market_id_str, strategy_name);
 
   if(b != NULL)
   {
@@ -515,7 +650,7 @@ wm_trade_book_reset(const char *market_id_str, const char *strategy_name)
         market_id_str, strategy_name, b->cash);
   }
 
-  pthread_mutex_unlock(&g_registry.lock);
+  pthread_mutex_unlock(&reg->lock);
 }
 
 // ----------------------------------------------------------------------- //
@@ -722,21 +857,27 @@ wm_trade_engine_on_signal(const char *market_id_str,
     const char *strategy_name, double mark_px, int64_t mark_ms,
     const wm_strategy_signal_t *sig)
 {
-  wm_trade_book_t  *b;
-  wm_sizer_intent_t intent;
-  double            equity_pre;
-  double            signed_pos;
+  wm_trade_registry_t *reg;
+  wm_trade_book_t     *b;
+  wm_sizer_intent_t    intent;
+  double               equity_pre;
+  double               signed_pos;
 
-  if(!g_registry.initialized || sig == NULL)
+  if(sig == NULL)
     return;
 
-  pthread_mutex_lock(&g_registry.lock);
+  reg = wm_trade_get_active_registry();
 
-  b = wm_trade_book_find(market_id_str, strategy_name);
+  if(reg == NULL)
+    return;
+
+  pthread_mutex_lock(&reg->lock);
+
+  b = wm_trade_book_find(reg, market_id_str, strategy_name);
 
   if(b == NULL || b->mode == WM_TRADE_MODE_OFF)
   {
-    pthread_mutex_unlock(&g_registry.lock);
+    pthread_mutex_unlock(&reg->lock);
     return;
   }
 
@@ -763,13 +904,13 @@ wm_trade_engine_on_signal(const char *market_id_str,
   // recorded but no fills (the safe behaviour).
   if(b->mode != WM_TRADE_MODE_PAPER)
   {
-    pthread_mutex_unlock(&g_registry.lock);
+    pthread_mutex_unlock(&reg->lock);
     return;
   }
 
   if(mark_px <= 0.0)
   {
-    pthread_mutex_unlock(&g_registry.lock);
+    pthread_mutex_unlock(&reg->lock);
     return;
   }
 
@@ -779,23 +920,29 @@ wm_trade_engine_on_signal(const char *market_id_str,
     wm_trade_apply_paper_fill_locked(b, &intent, mark_px, sig->ts_ms,
         sig);
 
-  pthread_mutex_unlock(&g_registry.lock);
+  pthread_mutex_unlock(&reg->lock);
 }
 
 void
 wm_trade_book_update_mark(const char *market_id_str,
     const char *strategy_name, double mark_px, int64_t mark_ms)
 {
-  wm_trade_book_t *b;
-  double           signed_pos;
-  double           equity;
+  wm_trade_registry_t *reg;
+  wm_trade_book_t     *b;
+  double               signed_pos;
+  double               equity;
 
-  if(!g_registry.initialized || mark_px <= 0.0)
+  if(mark_px <= 0.0)
     return;
 
-  pthread_mutex_lock(&g_registry.lock);
+  reg = wm_trade_get_active_registry();
 
-  b = wm_trade_book_find(market_id_str, strategy_name);
+  if(reg == NULL)
+    return;
+
+  pthread_mutex_lock(&reg->lock);
+
+  b = wm_trade_book_find(reg, market_id_str, strategy_name);
 
   if(b != NULL)
   {
@@ -810,7 +957,7 @@ wm_trade_book_update_mark(const char *market_id_str,
     wm_pnl_acc_record_equity(b->pnl, equity);
   }
 
-  pthread_mutex_unlock(&g_registry.lock);
+  pthread_mutex_unlock(&reg->lock);
 }
 
 // ----------------------------------------------------------------------- //
@@ -893,15 +1040,21 @@ bool
 wm_trade_book_snapshot(const char *market_id_str,
     const char *strategy_name, wm_trade_snapshot_t *out)
 {
-  wm_trade_book_t *b;
-  bool             ok = FAIL;
+  wm_trade_registry_t *reg;
+  wm_trade_book_t     *b;
+  bool                 ok = FAIL;
 
-  if(out == NULL || !g_registry.initialized)
+  if(out == NULL)
     return(FAIL);
 
-  pthread_mutex_lock(&g_registry.lock);
+  reg = wm_trade_get_active_registry();
 
-  b = wm_trade_book_find(market_id_str, strategy_name);
+  if(reg == NULL)
+    return(FAIL);
+
+  pthread_mutex_lock(&reg->lock);
+
+  b = wm_trade_book_find(reg, market_id_str, strategy_name);
 
   if(b != NULL)
   {
@@ -909,7 +1062,7 @@ wm_trade_book_snapshot(const char *market_id_str,
     ok = SUCCESS;
   }
 
-  pthread_mutex_unlock(&g_registry.lock);
+  pthread_mutex_unlock(&reg->lock);
 
   return(ok);
 }
@@ -917,34 +1070,43 @@ wm_trade_book_snapshot(const char *market_id_str,
 void
 wm_trade_books_iterate(wm_trade_book_iter_cb_t cb, void *user)
 {
-  wm_trade_book_t    *b;
-  wm_trade_snapshot_t snap;
+  wm_trade_registry_t *reg;
+  wm_trade_book_t     *b;
+  wm_trade_snapshot_t  snap;
 
-  if(cb == NULL || !g_registry.initialized)
+  if(cb == NULL)
     return;
 
-  pthread_mutex_lock(&g_registry.lock);
+  reg = wm_trade_get_active_registry();
 
-  for(b = g_registry.head; b != NULL; b = b->next)
+  if(reg == NULL)
+    return;
+
+  pthread_mutex_lock(&reg->lock);
+
+  for(b = reg->head; b != NULL; b = b->next)
   {
     wm_trade_book_snapshot_locked(b, &snap);
     cb(&snap, user);
   }
 
-  pthread_mutex_unlock(&g_registry.lock);
+  pthread_mutex_unlock(&reg->lock);
 }
 
 uint32_t
 wm_trade_books_count(void)
 {
-  uint32_t n;
+  wm_trade_registry_t *reg;
+  uint32_t             n;
 
-  if(!g_registry.initialized)
+  reg = wm_trade_get_active_registry();
+
+  if(reg == NULL)
     return(0);
 
-  pthread_mutex_lock(&g_registry.lock);
-  n = g_registry.n_books;
-  pthread_mutex_unlock(&g_registry.lock);
+  pthread_mutex_lock(&reg->lock);
+  n = reg->n_books;
+  pthread_mutex_unlock(&reg->lock);
 
   return(n);
 }

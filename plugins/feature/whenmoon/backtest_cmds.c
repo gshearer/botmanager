@@ -20,6 +20,8 @@
 #include "dl_schema.h"
 #include "market.h"
 #include "order.h"
+#include "strategy.h"
+#include "sweep.h"
 
 #include "cmd.h"
 #include "colors.h"
@@ -32,6 +34,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
 
 // Default list view depth. The /show whenmoon backtest list command
 // renders the most-recent N rows; raise via WM_BT_LIST_DEFAULT below.
@@ -220,7 +223,7 @@ wm_bt_cmd_run(const cmd_ctx_t *ctx)
   char                    start_tok[32]               = {0};
   char                    end_tok[32]                 = {0};
   char                    flag_tok[32]                = {0};
-  char                    val_tok[32]                 = {0};
+  char                    val_tok[256]                = {0};
   char                    exch[32]                    = {0};
   char                    base[16]                    = {0};
   char                    quote[16]                   = {0};
@@ -234,6 +237,8 @@ wm_bt_cmd_run(const cmd_ctx_t *ctx)
   wm_backtest_snapshot_t *snap;
   wm_backtest_result_t    result;
   loaded_strategy_t      *ls;
+  wm_bt_sweep_plan_t      sweep_plan;
+  bool                    have_sweep = false;
   uint32_t                min_history_1d = 0;
 
   st = whenmoon_get_state();
@@ -261,7 +266,10 @@ wm_bt_cmd_run(const cmd_ctx_t *ctx)
         "usage: /whenmoon backtest run <market_id> <strategy_name>"
         " <MM/dd/yyyy> <MM/dd/yyyy>"
         " [--fee-bps N] [--slip-bps N]"
-        " [--size-frac F] [--cash N]");
+        " [--size-frac F] [--cash N]"
+        " [--sweep <param>=<v1,v2,...>|<lo:step:hi>] (repeatable)"
+        " [--workers N] [--score realized|sharpe|sortino|equity|pf]"
+        " [--top K]");
     return;
   }
 
@@ -302,10 +310,42 @@ wm_bt_cmd_run(const cmd_ctx_t *ctx)
     return;
   }
 
-  // Parse optional --flag value pairs. We stop on the first token that
-  // is not a recognised flag — silently ignored to keep parsing
-  // forgiving (the operator can rerun if a typo got eaten).
-  memset(&params, 0, sizeof(params));
+  // The strategy must be loaded BEFORE we can validate sweep axes
+  // against its declared param schema. Resolve here + cache the
+  // min-history requirement so the snapshot sizing is right.
+  market_id = wm_market_lookup_or_create(exch, base, quote, symbol);
+
+  if(market_id < 0)
+  {
+    cmd_reply(ctx, "market lookup/create failed");
+    return;
+  }
+
+  pthread_mutex_lock(&st->strategies->lock);
+  ls = wm_strategy_find_loaded(st, name_tok);
+
+  if(ls != NULL)
+  {
+    uint32_t i;
+
+    for(i = 0; i < WM_GRAN_MAX; i++)
+      if(ls->meta.min_history[i] > min_history_1d)
+        min_history_1d = ls->meta.min_history[i];
+  }
+  pthread_mutex_unlock(&st->strategies->lock);
+
+  if(ls == NULL)
+  {
+    snprintf(reply, sizeof(reply), "strategy %s not loaded", name_tok);
+    cmd_reply(ctx, reply);
+    return;
+  }
+
+  // Parse optional --flag value pairs. The economic knobs apply to
+  // every iteration; --sweep / --workers / --score / --top control the
+  // sweep planner.
+  memset(&params,     0, sizeof(params));
+  wm_bt_sweep_plan_init(&sweep_plan);
 
   while(wm_dl_next_token(&p, flag_tok, sizeof(flag_tok)))
   {
@@ -353,41 +393,81 @@ wm_bt_cmd_run(const cmd_ctx_t *ctx)
         return;
       }
     }
+    else if(strcmp(flag_tok, "--sweep") == 0)
+    {
+      err[0] = '\0';
+
+      if(wm_bt_sweep_axis_add(&sweep_plan, ls, val_tok,
+             err, sizeof(err)) != SUCCESS)
+      {
+        snprintf(reply, sizeof(reply),
+            "error: %s", err[0] != '\0' ? err : "bad --sweep value");
+        cmd_reply(ctx, reply);
+        return;
+      }
+
+      have_sweep = true;
+    }
+    else if(strcmp(flag_tok, "--workers") == 0)
+    {
+      char *end = NULL;
+      long  w;
+
+      errno = 0;
+      w     = strtol(val_tok, &end, 10);
+
+      if(end == val_tok || errno != 0 || w < 0)
+      {
+        cmd_reply(ctx, "bad --workers value");
+        return;
+      }
+
+      sweep_plan.workers = w == 0 ? 1u : (uint32_t)w;
+    }
+    else if(strcmp(flag_tok, "--score") == 0)
+    {
+      if(wm_bt_sweep_score_parse(val_tok, &sweep_plan.score) != SUCCESS)
+      {
+        cmd_reply(ctx,
+            "bad --score (expected realized|sharpe|sortino|equity|pf)");
+        return;
+      }
+    }
+    else if(strcmp(flag_tok, "--top") == 0)
+    {
+      char *end = NULL;
+      long  k;
+
+      errno = 0;
+      k     = strtol(val_tok, &end, 10);
+
+      if(end == val_tok || errno != 0 || k < 0)
+      {
+        cmd_reply(ctx, "bad --top value");
+        return;
+      }
+
+      sweep_plan.top_k = (uint32_t)k;
+    }
     else
     {
       snprintf(reply, sizeof(reply),
           "unknown flag '%s' (expected --fee-bps/--slip-bps/"
-          "--size-frac/--cash)", flag_tok);
+          "--size-frac/--cash/--sweep/--workers/--score/--top)",
+          flag_tok);
       cmd_reply(ctx, reply);
       return;
     }
   }
 
-  market_id = wm_market_lookup_or_create(exch, base, quote, symbol);
+  // Default top_k for sweeps when caller didn't specify.
+  if(have_sweep && sweep_plan.top_k == 1)
+    sweep_plan.top_k = WM_BT_DEFAULT_TOP_K;
 
-  if(market_id < 0)
+  if(wm_bt_sweep_plan_finalize(&sweep_plan, err, sizeof(err)) != SUCCESS)
   {
-    cmd_reply(ctx, "market lookup/create failed");
-    return;
-  }
-
-  // Strategy must be loaded and we need its min-history requirement.
-  pthread_mutex_lock(&st->strategies->lock);
-  ls = wm_strategy_find_loaded(st, name_tok);
-
-  if(ls != NULL)
-  {
-    uint32_t i;
-
-    for(i = 0; i < WM_GRAN_MAX; i++)
-      if(ls->meta.min_history[i] > min_history_1d)
-        min_history_1d = ls->meta.min_history[i];
-  }
-  pthread_mutex_unlock(&st->strategies->lock);
-
-  if(ls == NULL)
-  {
-    snprintf(reply, sizeof(reply), "strategy %s not loaded", name_tok);
+    snprintf(reply, sizeof(reply),
+        "error: %s", err[0] != '\0' ? err : "sweep finalize failed");
     cmd_reply(ctx, reply);
     return;
   }
@@ -416,6 +496,73 @@ wm_bt_cmd_run(const cmd_ctx_t *ctx)
     snprintf(reply, sizeof(reply), "snapshot build failed: %s",
         err[0] != '\0' ? err : "unknown");
     cmd_reply(ctx, reply);
+    return;
+  }
+
+  if(have_sweep)
+  {
+    wm_bt_sweep_result_t *sweep_results;
+    struct timespec       t0, t1;
+    uint64_t              wallclock_ms;
+    uint32_t              i;
+    uint32_t              n_ok = 0;
+
+    snprintf(reply, sizeof(reply),
+        "snapshot ready: %u 1m bars; sweep N=%u workers=%u"
+        " score=%s top=%u",
+        snap->bars_loaded_1m, sweep_plan.total_iters, sweep_plan.workers,
+        wm_bt_sweep_score_name(sweep_plan.score), sweep_plan.top_k);
+    cmd_reply(ctx, reply);
+
+    sweep_results = mem_alloc("whenmoon.backtest", "sweep_results",
+        sizeof(*sweep_results) * (size_t)sweep_plan.total_iters);
+
+    if(sweep_results == NULL)
+    {
+      cmd_reply(ctx, "out of memory allocating sweep result table");
+      wm_backtest_snapshot_free(snap);
+      return;
+    }
+
+    err[0] = '\0';
+
+    clock_gettime(CLOCK_MONOTONIC, &t0);
+
+    if(wm_bt_sweep_run(st, snap, name_tok, market_id, &sweep_plan,
+           &params, sweep_results, err, sizeof(err)) != SUCCESS)
+    {
+      snprintf(reply, sizeof(reply),
+          "sweep run failed: %s",
+          err[0] != '\0' ? err : "unknown");
+      cmd_reply(ctx, reply);
+      mem_free(sweep_results);
+      wm_backtest_snapshot_free(snap);
+      return;
+    }
+
+    clock_gettime(CLOCK_MONOTONIC, &t1);
+
+    wallclock_ms = (uint64_t)((int64_t)(t1.tv_sec - t0.tv_sec) * 1000
+                 + (int64_t)(t1.tv_nsec - t0.tv_nsec) / 1000000);
+
+    for(i = 0; i < sweep_plan.total_iters; i++)
+      if(sweep_results[i].ok)
+        n_ok++;
+
+    snprintf(reply, sizeof(reply),
+        "sweep complete: %u/%u ok in %" PRIu64 " ms"
+        " (%.1f iter/s)",
+        n_ok, sweep_plan.total_iters, wallclock_ms,
+        wallclock_ms > 0
+            ? (double)sweep_plan.total_iters * 1000.0 / (double)wallclock_ms
+            : 0.0);
+    cmd_reply(ctx, reply);
+
+    wm_bt_sweep_render_topk(ctx, &sweep_plan, sweep_results,
+        sweep_plan.total_iters);
+
+    mem_free(sweep_results);
+    wm_backtest_snapshot_free(snap);
     return;
   }
 
@@ -495,6 +642,60 @@ wm_bt_cmd_run(const cmd_ctx_t *ctx)
         result.trade.metrics.realized_pnl, result.trade.equity);
     cmd_reply(ctx, reply);
   }
+}
+
+// ----------------------------------------------------------------------- //
+// /whenmoon backtest reload <strategy_name>                               //
+// ----------------------------------------------------------------------- //
+//
+// Mirrors /whenmoon strategy reload but runs through the sweep gate
+// (waits for in-flight sweeps to drain before dlclose). The strategy
+// reload path itself is shared.
+
+static void
+wm_bt_cmd_reload(const cmd_ctx_t *ctx)
+{
+  whenmoon_state_t *st;
+  const char       *p;
+  char              name_tok[WM_STRATEGY_NAME_SZ] = {0};
+  char              err[192];
+  char              reply[256];
+  uint32_t          n_detached = 0;
+
+  st = whenmoon_get_state();
+
+  if(st == NULL || st->strategies == NULL)
+  {
+    cmd_reply(ctx, "whenmoon: strategy registry not ready");
+    return;
+  }
+
+  p = ctx->args != NULL ? ctx->args : "";
+
+  if(!wm_dl_next_token(&p, name_tok, sizeof(name_tok)))
+  {
+    cmd_reply(ctx,
+        "usage: /whenmoon backtest reload <strategy_name>");
+    return;
+  }
+
+  err[0] = '\0';
+
+  if(wm_bt_sweep_reload_strategy(st, name_tok, &n_detached,
+         err, sizeof(err)) != SUCCESS)
+  {
+    snprintf(reply, sizeof(reply), "reload failed: %s",
+        err[0] != '\0' ? err : "unknown");
+    cmd_reply(ctx, reply);
+    return;
+  }
+
+  snprintf(reply, sizeof(reply),
+      "reloaded %s (n_detached=%u, dlclose+dlopen ok)",
+      name_tok, n_detached);
+  cmd_reply(ctx, reply);
+  cmd_reply(ctx,
+      "  re-attach: /whenmoon strategy attach <market_id> <name>");
 }
 
 // ----------------------------------------------------------------------- //
@@ -662,9 +863,9 @@ wm_backtest_register_verbs(void)
   // /whenmoon backtest parent.
   if(cmd_register("whenmoon", "backtest",
         "whenmoon backtest <verb> ...",
-        "Backtest runner (WM-LT-5).",
-        "Subcommands: run <market_id> <strat> <start> <end>"
-        " [--fee-bps N] [--slip-bps N] [--size-frac F] [--cash N].",
+        "Backtest runner + sweep planner.",
+        "Subcommands: run <market_id> <strat> <start> <end> [...],"
+        " reload <strat>.",
         USERNS_GROUP_ADMIN, 100, CMD_SCOPE_ANY, METHOD_T_ANY,
         wm_bt_parent_cb, NULL, "whenmoon", NULL,
         NULL, 0, NULL, NULL) != SUCCESS)
@@ -673,19 +874,41 @@ wm_backtest_register_verbs(void)
   if(cmd_register("whenmoon", "run",
         "whenmoon backtest run <market_id> <strategy_name>"
         " <MM/dd/yyyy> <MM/dd/yyyy>"
-        " [--fee-bps N] [--slip-bps N] [--size-frac F] [--cash N]",
-        "Run a single-iteration backtest synchronously.",
+        " [--fee-bps N] [--slip-bps N] [--size-frac F] [--cash N]"
+        " [--sweep <param>=<v1,v2,...>|<lo:step:hi>] (repeatable)"
+        " [--workers N] [--score realized|sharpe|sortino|equity|pf]"
+        " [--top K]",
+        "Run a single backtest or a parameter sweep.",
         "Builds an isolated market snapshot from wm_candles_<id>_60"
-        " over the given range, runs the strategy through a paper"
-        " trade book in PAPER mode, and persists the result into"
-        " wm_backtest_run. The strategy must already be loaded"
-        " (visible via /show whenmoon strategy).\n"
-        "Pre-flight: fails fast with the exact /whenmoon download"
-        " candles invocation needed when 1m coverage has gaps.\n"
-        "Optional flags override the strategy KV defaults for this"
-        " one run only.",
+        " over the given range and runs the strategy through a paper"
+        " trade book in PAPER mode. With one or more --sweep axes,"
+        " expands the cartesian product of values and dispatches each"
+        " iteration through a worker pool (--workers, default 1; max"
+        " 64). Each iteration runs on a private trade-book registry so"
+        " parallel workers do not contend on a global mutex.\n"
+        "--score selects the ranking metric (default realized).\n"
+        "--top selects the top-K rows shown after the run (default 20"
+        " when sweeping, 1 otherwise).\n"
+        "Every iteration is persisted to wm_backtest_run; --top only"
+        " controls render volume. Pre-flight gap check fails fast with"
+        " the canonical /whenmoon download candles invocation when 1m"
+        " coverage has gaps.",
         USERNS_GROUP_ADMIN, 100, CMD_SCOPE_ANY, METHOD_T_ANY,
         wm_bt_cmd_run, NULL, "whenmoon/backtest", NULL,
+        NULL, 0, NULL, NULL) != SUCCESS)
+    return(FAIL);
+
+  if(cmd_register("whenmoon", "reload",
+        "whenmoon backtest reload <strategy_name>",
+        "Reload a strategy plugin under the sweep gate.",
+        "Detaches all attachments, dlclose+dlopen+resolve+init the"
+        " strategy plugin, then re-scans the registry. Acquires the"
+        " global reload lock first and waits for in-flight sweep runs"
+        " to drain (CLAM_INFO every 5s while waiting) — this prevents"
+        " a dlclose from invalidating function pointers cached for an"
+        " active worker iteration. Re-attach manually after reload.",
+        USERNS_GROUP_ADMIN, 100, CMD_SCOPE_ANY, METHOD_T_ANY,
+        wm_bt_cmd_reload, NULL, "whenmoon/backtest", NULL,
         NULL, 0, NULL, NULL) != SUCCESS)
     return(FAIL);
 

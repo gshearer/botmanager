@@ -40,6 +40,7 @@
 #include "pnl.h"
 #include "whenmoon_strategy.h"
 
+#include <pthread.h>
 #include <stdbool.h>
 #include <stdint.h>
 
@@ -144,6 +145,55 @@ typedef struct wm_trade_book
 } wm_trade_book_t;
 
 // ----------------------------------------------------------------------- //
+// Trade-book registry                                                     //
+// ----------------------------------------------------------------------- //
+//
+// The trade engine owns a process-global registry — every book created by
+// the live + paper paths lives here, serialised on a single mutex. Any
+// book op (create, signal, snapshot) takes that mutex.
+//
+// WM-LT-6 promotes the registry struct to a public type so the backtest
+// + sweep planner can allocate private registries and pin them to a
+// worker thread via a pthread_key. With one private registry per worker
+// thread, parallel sweep iterations see no cross-thread contention on
+// the global mutex; live + paper traffic still routes to the global
+// registry as before.
+//
+// Routing is implicit. Every public book API reads the calling thread's
+// TLS slot (see wm_trade_engine_use_registry below); when the slot is
+// NULL it falls back to the global registry. Strategy-callback emission
+// rides the same TLS read inside wm_trade_engine_on_signal, so a sweep
+// iteration that fires emit_signal lands on the worker's private book.
+
+typedef struct wm_trade_registry
+{
+  pthread_mutex_t   lock;
+  wm_trade_book_t  *head;
+  uint32_t          n_books;
+  bool              initialized;
+} wm_trade_registry_t;
+
+// Allocate + initialise a private registry. The returned pointer is
+// owned by the caller; it is NOT linked into any global list. Pass it
+// to wm_trade_engine_use_registry on the worker thread that will
+// dispatch through it. Returns NULL on OOM or if the engine has not
+// been initialised.
+wm_trade_registry_t *wm_trade_registry_create(void);
+
+// Drop every book held in the registry, destroy its mutex, and free
+// the registry struct. Safe to call NULL (no-op). Caller must ensure
+// no thread still has this registry bound via use_registry.
+void wm_trade_registry_destroy(wm_trade_registry_t *r);
+
+// Bind `r` for the calling thread. Subsequent book + signal calls on
+// this thread route to `r` instead of the global registry. Pass NULL
+// to restore default (global) routing. Idempotent within a thread.
+//
+// The TLS slot is per-thread; one worker can pin its own private
+// registry without affecting any other thread.
+void wm_trade_engine_use_registry(wm_trade_registry_t *r);
+
+// ----------------------------------------------------------------------- //
 // Engine lifecycle                                                        //
 // ----------------------------------------------------------------------- //
 
@@ -154,15 +204,15 @@ void wm_trade_engine_destroy(void);
 // Book lookup / lifecycle                                                 //
 // ----------------------------------------------------------------------- //
 
-// Find an existing book. Returns NULL if absent. Caller MUST hold the
-// registry lock and MUST NOT free the returned pointer; the registry
+// Find an existing book in `reg`. Returns NULL if absent. Caller MUST
+// hold reg->lock and MUST NOT free the returned pointer; the registry
 // owns it. Pointer is stable until wm_trade_book_remove fires for the
 // same (market, strategy).
 //
 // Most callers should use the higher-level on-signal / snapshot APIs
-// below, which take the registry lock internally.
-wm_trade_book_t *wm_trade_book_find(const char *market_id_str,
-    const char *strategy_name);
+// below, which resolve the active registry + take the lock internally.
+wm_trade_book_t *wm_trade_book_find(wm_trade_registry_t *reg,
+    const char *market_id_str, const char *strategy_name);
 
 // Find or create. On miss, allocates a fresh book in mode OFF with
 // cash = starting_cash (resolved from KV) and a flat position. Returns
