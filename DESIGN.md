@@ -30,9 +30,11 @@ A bot that drives a configurable persona over a chat method via an LLM. Classifi
 
 **Memory layers** (chat-plugin-owned): `memory.c` owns `conversation_log` + `user_facts`/`dossier_facts` + embedding tables; `dossier.c` provides identity/mention resolution; `extract.c` converts raw log rows into structured facts via an LLM. These three compose with two core-owned services: `knowledge.c` (per-corpus RAG) and `acquire.c` (topic → SearXNG → digest → ingest pipeline). See `CHATBOT.md`, `plugins/method/chat/MEMSTORE.md`, `KNOWLEDGE.md`, `ACQUIRE.md` for reference detail.
 
-### Asset Trading Bot — separate project
+### Whenmoon Trading + Backtesting (kind: feature) — in scope
 
-A separate project. The framework must support concurrent REST/WebSocket, operational fault tolerance, high-frequency task scheduling, and plugin-kind-agnostic corpus acquisition via the same `acquire_register_topics` API the chat bot uses.
+A capability layer, not a bot. Whenmoon lives at `plugins/feature/whenmoon/` and is consumed via `/whenmoon` (abbrev `/wm`) verbs from any operator session — there is no whenmoon bot instance. It owns market state, multi-grain candle aggregation (1m → 5m → 15m → 1h → 6h → 1d), a downloader (history backfill with pre-flight gap detection and resume), the strategy registry (loadable `PLUGIN_STRATEGY` plugins), a per-(market, strategy) trade-book registry with paper-mode fill engine, and a snapshot/replay backtest runtime. Strategies emit signals; the trade engine consumes them and fires fills against a synthetic mark for paper, or via the exchange abstraction at `EXCHANGE_PRIO_TRANSACTIONAL` for live (the live gate is unimplemented as of this writing). The exchange abstraction itself is a separate feature plugin at `plugins/feature/exchange/` — it provides a per-exchange priority queue + token bucket + reserved slots over service plugins like coinbase.
+
+This is the canonical "feature plugin" use case: cross-cutting state and verbs that belong to the framework itself, exposed to operators (and to bots via the same command registry) without being mediated by a bot kind. A future "Asset Trading Bot" that converses about trading remains out of scope; whenmoon is the trading runtime, not a chat persona.
 
 # Data Flow
 
@@ -62,7 +64,7 @@ Core provides infrastructure services consumed by two or more bot kinds. Source:
 - Task-based work scheduler (see Task System).
 - Database access via an abstracted API; DB plugins provide engine compatibility.
 - CLAM: publish-subscribe message bus for logging and inter-plugin communication.
-- libcurl-based API for REST and WebSocket. A single thread drives the `curl_multi` event loop; slow callbacks must submit a task.
+- libcurl-based API for REST and WebSocket. A single thread drives the `curl_multi` event loop; slow callbacks must submit a task. Priority-aware: per-request priority byte (`CURL_PRIO_TRANSACTIONAL = 0`, `CURL_PRIO_NORMAL = 50`, `CURL_PRIO_BULK = 254`) selects one of three FIFO sub-queues drained highest-priority first. The shutdown drain (`curl_begin_shutdown`) cancels queued + in-flight non-TRANSACTIONAL requests with `CURLE_ABORTED_BY_CALLBACK` so callers can distinguish abort from generic transport error, and waits up to `CURL_DRAIN_DEADLINE_MS` for in-flight TRANSACTIONAL requests (e.g. order placement) to settle before exit.
 - High-performance socket API for non-libcurl I/O with TLS support.
 - Universal KV schema for runtime configuration.
 - Universal user auth/authz via the DB subsystem.
@@ -157,16 +159,18 @@ Plugins provide all bot behavior, interaction methods, DB engines, external API 
 ## Plugin Layer Model
 
 Plugins live in strictly-layered categories with downward-only
-dependencies: **service** (`plugins/service/*`) and **exchange**
-(`plugins/exchange/*`) expose API mechanisms, **command-surface**
-(`plugins/cmd/*`) registers user commands that wrap those mechanisms,
-**method** (`plugins/method/*`) owns bot-interaction-method state
-(chat, command), **feature** (`plugins/feature/*`) owns capability
-layers atop methods (whenmoon), with supporting **inference /
-protocol / db** plugins beneath. Service plugins register zero user
-commands; chat-specific side effects (dossier facts) live in the chat
-plugin's NL bridge observer. See `PLUGIN.md §Layer Rules` for the
-authoritative rules and grep audits.
+dependencies. **service** (`plugins/service/*`) exposes API mechanisms
+to external providers; **command-surface** (`plugins/cmd/*`) registers
+user commands that wrap those mechanisms; **method**
+(`plugins/method/*`) owns bot-interaction-method state (chat, command);
+**feature** (`plugins/feature/*`) owns capability layers atop methods
+or composed across services (whenmoon trading, exchange abstraction);
+**strategy** (`plugins/feature/whenmoon/strategy/<name>/`) plugins are
+loadable trading-strategy modules consumed by whenmoon; with supporting
+**inference / protocol / db** plugins beneath. Service plugins register
+zero user commands; chat-specific side effects (dossier facts) live in
+the chat plugin's NL bridge observer. See `PLUGIN.md §Layer Rules` for
+the authoritative rules and grep audits.
 
 ## Plugin API
 
@@ -215,15 +219,19 @@ If any module fails in a way that cannot be recovered, the entire program gracef
 
 ## Plugin Types
 
+`plugin_type_t` (in `include/plugin.h`):
+
 | Type | Role |
 |------|------|
-| `core` | Synthetic providers (`core_llm`, etc.) registered by the plugin subsystem. No `.so` on disk. |
-| `db` | Low-level DB engine driver. |
-| `method` | Human interaction method (IRC, Slack, Telegram, XMPP, etc.). |
-| `bot` | Bot behavior (command, llm, scraper, etc.). |
-| `service` | External API integration (REST, WebSocket). |
-| `misc` | Registers user commands only — no external API, no KV, no async state. |
+| `core` | Synthetic providers (`core_llm`, `core_kv`, etc.) registered by the plugin subsystem. No `.so` on disk. |
+| `db` | Low-level DB engine driver (postgresql). |
+| `protocol` | Wire protocols (IRC, botmanctl). |
+| `method` | Bot-interaction methods (chat, command). |
+| `service` | External API integrations (coinbase, openweather, coinmarketcap, searxng, ...). |
+| `misc` | Command-surface plugins under `plugins/cmd/<name>/`: register commands wrapping a service plugin's `*_api.h`, no external API of their own. |
 | `personality` | Language/messaging personality. |
+| `feature` | Capability layers atop methods or composed across services (whenmoon, exchange). |
+| `strategy` | Loadable trading-strategy module consumed by whenmoon. |
 
 # Plugin Type: Method
 
@@ -269,13 +277,14 @@ Bot plugins define how incoming messages are interpreted. All bot kinds share bu
 
 ## Bot Kinds
 
+A bot's *kind* names the method plugin it binds. Adding a method plugin (e.g., a future `xmpp` or `telegram`) automatically becomes a usable bot kind — there is no separate bot-kind taxonomy.
+
 | Kind | Description |
 |------|-------------|
-| `command` | Structured user commands. Initial implementation target. |
-| `chat` | LLM-powered conversational bot with configurable persona. |
-| `scraper` | HTTP/HTTPS scraper. |
-| `rest` | REST API client. |
-| `websocket` | WebSocket client. |
+| `command` | Structured slash-command bot. The default kind for operator-driven bots. |
+| `chat` | LLM-powered conversational bot with configurable persona, dossier, fact extraction, RAG over knowledge corpora and conversation log. |
+
+Cross-cutting capabilities that are not bot interactions live as **feature** plugins (whenmoon, exchange) and are reached via verbs at the unified command registry, not via a bot instance.
 
 # Plugin Type: Service
 
