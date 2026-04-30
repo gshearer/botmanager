@@ -107,7 +107,13 @@ wm_dl_trades_dispatch_one(dl_jobtable_t *t, dl_job_t *j)
   ctx = mem_alloc("whenmoon.dl", "trade_ctx", sizeof(*ctx));
 
   if(ctx == NULL)
+  {
+    // WM-DL-RACE-1: alloc failure short-circuits the async chain so the
+    // user callback won't fire — record the error here so the kick
+    // doesn't park the job in RUNNING+!in_flight indefinitely.
+    wm_dl_record_dispatch_error(t, j, "trade ctx alloc failed");
     return(FAIL);
+  }
 
   ctx->table  = t;
   ctx->job_id = j->id;
@@ -118,6 +124,10 @@ wm_dl_trades_dispatch_one(dl_jobtable_t *t, dl_job_t *j)
     if(wm_trade_table_ensure(j->market_id) != SUCCESS)
     {
       mem_free(ctx);
+
+      // WM-DL-RACE-1: same as ctx-alloc — the callback won't fire so
+      // we must surface the error through the job's retry budget.
+      wm_dl_record_dispatch_error(t, j, "trade table_ensure failed");
       return(FAIL);
     }
 
@@ -130,7 +140,8 @@ wm_dl_trades_dispatch_one(dl_jobtable_t *t, dl_job_t *j)
   {
     // The coinbase shim contract says the callback fires with err on
     // FAIL, so `ctx` is owned by the callback even in the failure
-    // path — DO NOT free it here.
+    // path — DO NOT free it here. The callback's own error path
+    // increments consecutive_errors, so we don't double-record.
     return(FAIL);
   }
 

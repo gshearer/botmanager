@@ -109,14 +109,28 @@ wm_dl_jobtable_pick_next(dl_jobtable_t *t)
       running++;
 
   if(running >= t->max_concurrent)
+  {
+#ifdef WM_DL_TRACE_PICK
+    clam(CLAM_DEBUG2, WM_DL_CTX,
+        "pick: cap reached running=%u max=%u",
+        running, t->max_concurrent);
+#endif
     return(NULL);
+  }
 
   // Walk the list once picking the first RUNNING && !in_flight job;
   // promote queued jobs to RUNNING as slots open.
   for(j = t->jobs_head; j != NULL; j = j->next)
   {
     if(j->state == DL_JOB_RUNNING && !j->in_flight)
+    {
+#ifdef WM_DL_TRACE_PICK
+      clam(CLAM_DEBUG2, WM_DL_CTX,
+          "pick: running id=%" PRId64 " consecutive_errors=%d",
+          j->id, j->consecutive_errors);
+#endif
       return(j);
+    }
   }
 
   // No running job ready — promote a queued one if there is slack.
@@ -125,11 +139,67 @@ wm_dl_jobtable_pick_next(dl_jobtable_t *t)
     if(j->state == DL_JOB_QUEUED && running < t->max_concurrent)
     {
       j->state = DL_JOB_RUNNING;
+#ifdef WM_DL_TRACE_PICK
+      clam(CLAM_DEBUG2, WM_DL_CTX,
+          "pick: promote id=%" PRId64 " QUEUED->RUNNING running=%u/%u",
+          j->id, running, t->max_concurrent);
+#endif
       return(j);
     }
   }
 
+#ifdef WM_DL_TRACE_PICK
+  clam(CLAM_DEBUG2, WM_DL_CTX,
+      "pick: empty (running=%u/%u, n_jobs=%u)",
+      running, t->max_concurrent, t->n_jobs);
+#endif
   return(NULL);
+}
+
+// WM-DL-RACE-1: fold a synchronous-dispatch failure into the same
+// retry budget the async error path uses (consecutive_errors +
+// last_err + DL_JOB_FAILED at the cap), persist the new state to the
+// DB row, and reap the in-memory entry on terminal failure. Without
+// this, a silent dispatch_one FAIL leaves the job parked in RUNNING+
+// !in_flight with no DB error trail. Manages t->lock internally; the
+// snapshot pattern mirrors wm_dl_job_cancel so persist runs outside
+// the lock without racing wm_dl_jobtable_destroy.
+void
+wm_dl_record_dispatch_error(dl_jobtable_t *t, dl_job_t *j,
+    const char *errmsg)
+{
+  dl_job_t snap;
+  bool     became_failed = false;
+
+  if(t == NULL || j == NULL)
+    return;
+
+  pthread_mutex_lock(&t->lock);
+
+  j->consecutive_errors++;
+  snprintf(j->last_err, sizeof(j->last_err), "%s",
+      errmsg != NULL ? errmsg : "dispatch_one sync fail");
+
+  if(j->consecutive_errors >= WM_DL_PAGE_RETRY_MAX)
+  {
+    j->state      = DL_JOB_FAILED;
+    became_failed = true;
+  }
+
+  snap = *j;
+  snap.next = NULL;
+
+  pthread_mutex_unlock(&t->lock);
+
+  clam(CLAM_WARN, WM_DL_CTX,
+      "dispatch sync-fail job=%" PRId64 " errs=%d/%d state=%s reason=\"%s\"",
+      snap.id, snap.consecutive_errors, WM_DL_PAGE_RETRY_MAX,
+      wm_dl_state_str(snap.state), snap.last_err);
+
+  wm_dl_job_persist(t, &snap);
+
+  if(became_failed)
+    wm_dl_job_clear_in_flight(t, j);
 }
 
 dl_job_t *
@@ -202,9 +272,14 @@ wm_dl_kick(dl_jobtable_t *t)
     {
       // Synchronous submit failure — clear the slot and stop the
       // walk; a deterministic synchronous failure would otherwise
-      // spin without bound. The next event in the system (a
-      // completion callback or the next /whenmoon enqueue) will
-      // re-enter kick.
+      // spin without bound on the same job. The dispatch_one's own
+      // FAIL paths now advance the job's consecutive_errors via
+      // wm_dl_record_dispatch_error (or via the coinbase shim's
+      // synchronous cb_deliver_*_fail when applicable), so within
+      // WM_DL_PAGE_RETRY_MAX kicks the job FAILs and gets reaped. The
+      // next event in the system (a completion callback, the next
+      // /whenmoon enqueue, or a supervisor tick spotting a RUNNING+
+      // !in_flight zombie) re-enters kick to drive the next attempt.
       wm_dl_job_clear_in_flight(t, j);
       return;
     }
@@ -846,6 +921,12 @@ wm_dl_job_cancel(whenmoon_state_t *st, int64_t job_id,
   // completion callback will short-circuit on the missing job. The
   // supervisor disarms itself if the list is now empty.
   wm_dl_remove_completed(t);
+
+  // WM-DL-RACE-1: hand sibling QUEUED/RUNNING+!in_flight jobs a chance
+  // to run. Without this kick, cancelling a not-yet-in-flight job
+  // leaves siblings sitting until the next external event (sibling
+  // completion, supervisor tick, or a new enqueue).
+  wm_dl_kick(t);
 
   return(SUCCESS);
 }

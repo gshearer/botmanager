@@ -145,7 +145,11 @@ wm_dl_candles_dispatch_one(dl_jobtable_t *t, dl_job_t *j)
   if(!j->candle_table_ensured)
   {
     if(wm_candle_table_ensure(j->market_id, gran) != SUCCESS)
+    {
+      // WM-DL-RACE-1: callback won't fire so record the error here.
+      wm_dl_record_dispatch_error(t, j, "candle table_ensure failed");
       return(FAIL);
+    }
 
     j->candle_table_ensured = true;
   }
@@ -153,7 +157,11 @@ wm_dl_candles_dispatch_one(dl_jobtable_t *t, dl_job_t *j)
   ctx = mem_alloc("whenmoon.dl", "candle_ctx", sizeof(*ctx));
 
   if(ctx == NULL)
+  {
+    // WM-DL-RACE-1: same as the table_ensure path.
+    wm_dl_record_dispatch_error(t, j, "candle ctx alloc failed");
     return(FAIL);
+  }
 
   ctx->table          = t;
   ctx->job_id         = j->id;
@@ -168,7 +176,8 @@ wm_dl_candles_dispatch_one(dl_jobtable_t *t, dl_job_t *j)
   {
     // On submit failure the coinbase shim still fires the completion
     // callback synchronously with res->err set, so `ctx` ownership has
-    // already transferred — DO NOT free it here.
+    // already transferred — DO NOT free it here. The callback's own
+    // error path increments consecutive_errors.
     return(FAIL);
   }
 

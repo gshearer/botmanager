@@ -173,6 +173,19 @@ void wm_dl_kick(dl_jobtable_t *t);
 // afterward to chain to the next page.
 void wm_dl_job_persist(dl_jobtable_t *t, const dl_job_t *j);
 
+// WM-DL-RACE-1: record a synchronous-dispatch failure on a job whose
+// completion callback will NOT fire (ctx alloc, table_ensure failures
+// inside wm_dl_*_dispatch_one). Mirrors the async error path on
+// dl_trades.c / dl_candles.c on_page handlers: increments
+// consecutive_errors, copies `errmsg` to last_err, transitions to
+// DL_JOB_FAILED at WM_DL_PAGE_RETRY_MAX, persists the new state to
+// the DB row, and reaps the job from the in-memory list on terminal
+// failure. Without this, the job sits in RUNNING+!in_flight forever,
+// retried every kick with no progress and no error trail in the DB.
+// Manages t->lock internally; callers must NOT hold the lock at entry.
+void wm_dl_record_dispatch_error(dl_jobtable_t *t, dl_job_t *j,
+    const char *errmsg);
+
 // Called by a completion callback to release the in-flight slot for
 // a job. Signals the drain condvar so wm_dl_jobtable_destroy can
 // safely free the list after all outstanding requests complete.

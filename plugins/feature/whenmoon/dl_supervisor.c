@@ -58,7 +58,8 @@ wm_dl_supervisor_tick(task_t *t)
   dl_jobtable_t *jt;
   dl_job_t      *j;
   int64_t        now_ms;
-  uint32_t       recovered = 0;
+  uint32_t       recovered        = 0;
+  bool           unfilled_running = false;
 
   pthread_mutex_lock(&s_lock);
   s_in_tick = true;
@@ -82,8 +83,18 @@ wm_dl_supervisor_tick(task_t *t)
   {
     int64_t age;
 
+    // WM-DL-RACE-1: a job in RUNNING+!in_flight is the post-bail state
+    // wm_dl_kick leaves behind on a synchronous dispatch_one failure.
+    // Without a re-kick, a "lone" job with no siblings driving
+    // completion callbacks would sit here forever (the existing stall
+    // check below filters by in_flight, so it ignores zombies). Note
+    // it now and fire one kick at the tail of the tick.
     if(!j->in_flight)
+    {
+      if(j->state == DL_JOB_RUNNING)
+        unfilled_running = true;
       continue;
+    }
 
     age = now_ms - j->last_progress_ms;
 
@@ -111,7 +122,7 @@ wm_dl_supervisor_tick(task_t *t)
 
   pthread_mutex_unlock(&jt->lock);
 
-  if(recovered > 0)
+  if(recovered > 0 || unfilled_running)
     wm_dl_kick(jt);
 
   // Reap any FAILED / DONE jobs whose in-flight slot we just freed.
