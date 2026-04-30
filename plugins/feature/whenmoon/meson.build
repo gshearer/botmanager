@@ -45,6 +45,7 @@ whenmoon_plugin = shared_library('whenmoon',
   ],
   dependencies : [
     talib_dep,
+    json_c_dep,
   ],
   override_options : ['b_lundef=false'],
   install : true,

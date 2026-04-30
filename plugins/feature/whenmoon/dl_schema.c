@@ -142,6 +142,45 @@ static const char *const wm_dl_ddl_core[] = {
 
   "CREATE INDEX IF NOT EXISTS idx_wm_backtest_run_market"
   " ON wm_backtest_run(market_id, strategy_name, created_at DESC)",
+
+  // Trade book state (WM-PT-3). Durable snapshot of one (market_id,
+  // strategy_name) trade book — cash, position, mark cache, fills ring,
+  // PnL accumulators, last signal — written debounced by the live +
+  // paper paths and re-hydrated on book create. Backtest books (mode
+  // BACKTEST or market_id_str starting with "bt:") are NOT persisted;
+  // those books live only inside per-iteration private registries.
+  //
+  // The market_id column matches the wm_market.id integer foreign key
+  // for production books. Backtest books synthesize a string id ("bt:N")
+  // and never reach this table, so the market_id column carries the
+  // numeric id directly. fills_ring + last_signal + pnl carry JSONB so
+  // future field additions are forward-compatible without ALTER TABLE
+  // (per pre-1.0 freshstart policy in feedback_no_migration_planning.md).
+  "CREATE TABLE IF NOT EXISTS wm_trade_book_state ("
+  " market_id          INT              NOT NULL,"
+  " strategy_name      VARCHAR(64)      NOT NULL,"
+  " mode               VARCHAR(16)      NOT NULL,"
+  " starting_cash      DOUBLE PRECISION NOT NULL,"
+  " cash               DOUBLE PRECISION NOT NULL,"
+  " position_side      VARCHAR(8)       NOT NULL,"
+  " position_qty       DOUBLE PRECISION NOT NULL,"
+  " position_avg       DOUBLE PRECISION NOT NULL,"
+  " position_opened_ms BIGINT           NOT NULL,"
+  " fee_bps            DOUBLE PRECISION NOT NULL,"
+  " slip_bps           DOUBLE PRECISION NOT NULL,"
+  " size_frac          DOUBLE PRECISION NOT NULL,"
+  " max_position       DOUBLE PRECISION NOT NULL,"
+  " last_mark_px       DOUBLE PRECISION NOT NULL,"
+  " last_mark_ms       BIGINT           NOT NULL,"
+  " last_signal        JSONB,"
+  " has_last_signal    BOOLEAN          NOT NULL,"
+  " fill_n             BIGINT           NOT NULL,"
+  " fill_head          INT              NOT NULL,"
+  " fills_ring         JSONB            NOT NULL,"
+  " pnl                JSONB            NOT NULL,"
+  " updated_at         TIMESTAMPTZ      NOT NULL DEFAULT NOW(),"
+  " PRIMARY KEY (market_id, strategy_name)"
+  ")",
 };
 
 // ------------------------------------------------------------------ //

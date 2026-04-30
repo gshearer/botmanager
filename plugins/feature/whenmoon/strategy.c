@@ -873,6 +873,18 @@ wm_strategy_attach(whenmoon_state_t *st,
 
   pthread_mutex_unlock(&reg->lock);
 
+  // WM-PT-3: pre-warm the trade book so a re-attach after SIGTERM
+  // hydrates from wm_trade_book_state immediately, and the strategy
+  // sees the prior cash/position/fills/PnL/mode rather than waiting
+  // for the operator to also re-issue /whenmoon trade mode. For a
+  // brand-new attachment with no DB row, this creates a fresh book
+  // in mode OFF (no DB write triggered until the first
+  // mode-set/fill/reset). Backtest does NOT route through
+  // wm_strategy_attach (backtest builds its own ctx + calls init_fn
+  // directly in backtest.c) so this path runs only on the cmd-verb
+  // /whenmoon strategy attach flow against the global registry.
+  (void)wm_trade_book_get_or_create(market_id_str, strategy_name);
+
   clam(CLAM_INFO, WHENMOON_CTX,
       "strategy attach: %s -> %s", strategy_name, market_id_str);
 

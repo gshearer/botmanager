@@ -94,9 +94,25 @@ static pthread_mutex_t       wm_tp_g_lock = PTHREAD_MUTEX_INITIALIZER;
 static struct wm_trade_persist *wm_tp_g_head = NULL;
 static task_handle_t         wm_tp_g_task = TASK_HANDLE_NONE;
 
+// Book-state queue (WM-PT-3). Linked list of pending UPSERT/DELETE
+// statements keyed by (market_id, strategy_name). Coalesced — a second
+// enqueue for the same key replaces the first and frees its old SQL.
+typedef struct wm_book_persist_entry
+{
+  int32_t                        market_id;
+  char                           strategy_name[WM_STRATEGY_NAME_SZ];
+  char                          *sql;       // owned; mem_free on drain
+  struct wm_book_persist_entry  *next;
+} wm_book_persist_entry_t;
+
+static pthread_mutex_t           wm_bp_g_lock = PTHREAD_MUTEX_INITIALIZER;
+static wm_book_persist_entry_t  *wm_bp_g_head = NULL;
+
 static void wm_tp_flush_task(task_t *t);
 static void wm_tp_flush_instance(struct wm_trade_persist *tp);
 static void wm_tp_ms_to_tstz(int64_t time_ms, char *out, size_t cap);
+static void wm_bp_drain_locked(wm_book_persist_entry_t **head_out);
+static void wm_bp_run_drained(wm_book_persist_entry_t *head);
 
 bool
 wm_trade_persist_global_init(void)
@@ -119,6 +135,13 @@ wm_trade_persist_global_init(void)
 void
 wm_trade_persist_global_destroy(void)
 {
+  // Flush any pending book-state UPSERTs synchronously before
+  // canceling the periodic task. The trade-tape rings are best-effort
+  // (WS replays drops after reconnect) but the book state is the
+  // authoritative restart record — losing the final upsert would
+  // diverge cash + position + fills across SIGTERM.
+  wm_book_persist_flush_all();
+
   if(wm_tp_g_task != TASK_HANDLE_NONE)
   {
     task_cancel(wm_tp_g_task);
@@ -277,6 +300,7 @@ static void
 wm_tp_flush_task(task_t *t)
 {
   struct wm_trade_persist *tp;
+  wm_book_persist_entry_t *bp_drained = NULL;
 
   if(t == NULL)
     return;
@@ -287,6 +311,15 @@ wm_tp_flush_task(task_t *t)
     wm_tp_flush_instance(tp);
 
   pthread_mutex_unlock(&wm_tp_g_lock);
+
+  // Detach the book-state queue under its own lock then run the SQL
+  // off-lock so DB latency doesn't block enqueues from on-fill paths.
+  pthread_mutex_lock(&wm_bp_g_lock);
+  wm_bp_drain_locked(&bp_drained);
+  pthread_mutex_unlock(&wm_bp_g_lock);
+
+  if(bp_drained != NULL)
+    wm_bp_run_drained(bp_drained);
 
   t->state = TASK_ENDED;
 }
@@ -450,4 +483,182 @@ wm_tp_ms_to_tstz(int64_t time_ms, char *out, size_t cap)
   snprintf(out, cap, "%04d-%02d-%02d %02d:%02d:%02d.%03d+00",
       year, tm.tm_mon + 1, tm.tm_mday,
       tm.tm_hour, tm.tm_min, tm.tm_sec, msec);
+}
+
+// ------------------------------------------------------------------ //
+// Book-state persist queue (WM-PT-3)                                 //
+// ------------------------------------------------------------------ //
+//
+// Producers (paper fill apply, mode-set, reset, remove) hand off a
+// fully-formed SQL statement keyed by (market_id, strategy_name).
+// Coalescing: a second enqueue for the same key replaces the first
+// and frees its prior SQL. Pending list size is bounded by the live
+// book count.
+//
+// Drain runs on the trade-flush task tick (1 s) AND inline at SIGTERM
+// via wm_book_persist_flush_all so no snapshot is lost across restart.
+
+static wm_book_persist_entry_t *
+wm_bp_find_locked(int32_t market_id, const char *strategy_name)
+{
+  wm_book_persist_entry_t *e;
+
+  for(e = wm_bp_g_head; e != NULL; e = e->next)
+  {
+    if(e->market_id != market_id)
+      continue;
+
+    if(strncmp(e->strategy_name, strategy_name,
+           sizeof(e->strategy_name)) != 0)
+      continue;
+
+    return(e);
+  }
+
+  return(NULL);
+}
+
+bool
+wm_book_persist_enqueue(int32_t market_id, const char *strategy_name,
+    char *sql_owned)
+{
+  wm_book_persist_entry_t *e;
+
+  if(strategy_name == NULL || sql_owned == NULL)
+    return(FAIL);
+
+  pthread_mutex_lock(&wm_bp_g_lock);
+
+  e = wm_bp_find_locked(market_id, strategy_name);
+
+  if(e != NULL)
+  {
+    // Coalesce: drop the prior pending statement, take the new one.
+    if(e->sql != NULL)
+      mem_free(e->sql);
+
+    e->sql = sql_owned;
+    pthread_mutex_unlock(&wm_bp_g_lock);
+    return(SUCCESS);
+  }
+
+  e = mem_alloc("whenmoon", "book_persist_entry", sizeof(*e));
+
+  if(e == NULL)
+  {
+    pthread_mutex_unlock(&wm_bp_g_lock);
+    return(FAIL);
+  }
+
+  memset(e, 0, sizeof(*e));
+  e->market_id = market_id;
+  snprintf(e->strategy_name, sizeof(e->strategy_name), "%s", strategy_name);
+  e->sql       = sql_owned;
+  e->next      = wm_bp_g_head;
+  wm_bp_g_head = e;
+
+  pthread_mutex_unlock(&wm_bp_g_lock);
+  return(SUCCESS);
+}
+
+bool
+wm_book_persist_drop(int32_t market_id, const char *strategy_name)
+{
+  char  *sql;
+  size_t cap = 256;
+  char  *escaped;
+
+  if(strategy_name == NULL)
+    return(FAIL);
+
+  escaped = db_escape(strategy_name);
+
+  if(escaped == NULL)
+    return(FAIL);
+
+  sql = mem_alloc("whenmoon", "book_persist_drop_sql", cap);
+
+  if(sql == NULL)
+  {
+    mem_free(escaped);
+    return(FAIL);
+  }
+
+  snprintf(sql, cap,
+      "DELETE FROM wm_trade_book_state"
+      " WHERE market_id = %" PRId32
+      "   AND strategy_name = '%s'",
+      market_id, escaped);
+
+  mem_free(escaped);
+
+  if(wm_book_persist_enqueue(market_id, strategy_name, sql) != SUCCESS)
+  {
+    mem_free(sql);
+    return(FAIL);
+  }
+
+  return(SUCCESS);
+}
+
+static void
+wm_bp_drain_locked(wm_book_persist_entry_t **head_out)
+{
+  if(head_out == NULL)
+    return;
+
+  *head_out    = wm_bp_g_head;
+  wm_bp_g_head = NULL;
+}
+
+static void
+wm_bp_run_drained(wm_book_persist_entry_t *head)
+{
+  wm_book_persist_entry_t *e;
+  wm_book_persist_entry_t *next;
+  db_result_t             *res;
+
+  for(e = head; e != NULL; e = next)
+  {
+    next = e->next;
+
+    if(e->sql != NULL)
+    {
+      res = db_result_alloc();
+
+      if(res != NULL)
+      {
+        if(db_query(e->sql, res) != SUCCESS || !res->ok)
+          clam(CLAM_WARN, WHENMOON_CTX,
+              "book-state persist failed (market_id=%" PRId32
+              " strategy=%s): %s",
+              e->market_id, e->strategy_name,
+              res->error[0] != '\0' ? res->error : "(no driver error)");
+        else
+          clam(CLAM_DEBUG2, WHENMOON_CTX,
+              "book-state persisted (market_id=%" PRId32
+              " strategy=%s, affected=%u)",
+              e->market_id, e->strategy_name, res->rows_affected);
+
+        db_result_free(res);
+      }
+
+      mem_free(e->sql);
+    }
+
+    mem_free(e);
+  }
+}
+
+void
+wm_book_persist_flush_all(void)
+{
+  wm_book_persist_entry_t *drained = NULL;
+
+  pthread_mutex_lock(&wm_bp_g_lock);
+  wm_bp_drain_locked(&drained);
+  pthread_mutex_unlock(&wm_bp_g_lock);
+
+  if(drained != NULL)
+    wm_bp_run_drained(drained);
 }

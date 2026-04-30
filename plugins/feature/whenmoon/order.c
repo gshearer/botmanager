@@ -18,18 +18,26 @@
 #define WHENMOON_INTERNAL
 #include "order.h"
 
+#include "backtest.h"
+#include "market.h"
 #include "pnl.h"
 #include "sizer.h"
 #include "strategy.h"
+#include "trade_persist.h"
+#include "whenmoon.h"
 
 #include "alloc.h"
 #include "clam.h"
 #include "common.h"
+#include "db.h"
 
 #include <inttypes.h>
+#include <json-c/json.h>
 #include <math.h>
 #include <pthread.h>
+#include <stdarg.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 
 #define WM_TRADE_CTX        "whenmoon.trade"
@@ -149,6 +157,925 @@ wm_trade_book_free_locked(wm_trade_book_t *book)
     wm_pnl_acc_free(book->pnl);
 
   mem_free(book);
+}
+
+// Forward decl for the WM-PT-3 hydrate path; the body lives near the
+// other static helpers below the persist + hydrate block.
+static void wm_trade_book_refresh_kv_locked(wm_trade_book_t *book);
+
+// ----------------------------------------------------------------------- //
+// Book-state durable persist (WM-PT-3)                                    //
+// ----------------------------------------------------------------------- //
+//
+// Live + paper books are snapshotted into wm_trade_book_state on every
+// state-changing event (paper fill, mode set, reset). Backtest books
+// (mode BACKTEST or market_id_str starting with "bt:") and books living
+// in private registries (sweep workers) are skipped — those exist only
+// for the lifetime of one iteration.
+//
+// Coalescing + async write happens in trade_persist.c's book queue;
+// this layer just decides "should we persist" and builds the UPSERT.
+// All persist helpers are called UNDER the registry lock so the
+// snapshot is consistent.
+
+#define WM_BOOK_PERSIST_SQL_INIT_CAP  (16 * 1024)
+#define WM_BOOK_JSON_BUF_INIT_CAP     (8  * 1024)
+
+typedef struct
+{
+  char  *buf;
+  size_t off;
+  size_t cap;
+  bool   oom;
+} wm_book_buf_t;
+
+static bool
+wm_book_buf_grow(wm_book_buf_t *b, size_t need)
+{
+  size_t  new_cap;
+  char   *p;
+
+  if(b == NULL || b->oom)
+    return(FAIL);
+
+  if(b->off + need + 1 <= b->cap)
+    return(SUCCESS);
+
+  new_cap = b->cap > 0 ? b->cap : 1024;
+
+  while(new_cap < b->off + need + 1)
+    new_cap *= 2;
+
+  p = mem_realloc(b->buf, new_cap);
+
+  if(p == NULL)
+  {
+    b->oom = true;
+    return(FAIL);
+  }
+
+  b->buf = p;
+  b->cap = new_cap;
+  return(SUCCESS);
+}
+
+static void
+wm_book_buf_putc(wm_book_buf_t *b, char c)
+{
+  if(b == NULL || b->oom)
+    return;
+
+  if(wm_book_buf_grow(b, 1) != SUCCESS)
+    return;
+
+  b->buf[b->off++] = c;
+  b->buf[b->off]   = '\0';
+}
+
+static void
+wm_book_buf_puts(wm_book_buf_t *b, const char *s)
+{
+  size_t n;
+
+  if(b == NULL || s == NULL || b->oom)
+    return;
+
+  n = strlen(s);
+
+  if(wm_book_buf_grow(b, n) != SUCCESS)
+    return;
+
+  memcpy(b->buf + b->off, s, n);
+  b->off            += n;
+  b->buf[b->off]     = '\0';
+}
+
+static void
+wm_book_buf_printf(wm_book_buf_t *b, const char *fmt, ...)
+{
+  va_list ap;
+  va_list ap2;
+  int     n;
+
+  if(b == NULL || fmt == NULL || b->oom)
+    return;
+
+  va_start(ap, fmt);
+  va_copy(ap2, ap);
+
+  n = vsnprintf(NULL, 0, fmt, ap);
+  va_end(ap);
+
+  if(n < 0)
+  {
+    va_end(ap2);
+    b->oom = true;
+    return;
+  }
+
+  if(wm_book_buf_grow(b, (size_t)n) != SUCCESS)
+  {
+    va_end(ap2);
+    return;
+  }
+
+  vsnprintf(b->buf + b->off, b->cap - b->off, fmt, ap2);
+  va_end(ap2);
+
+  b->off += (size_t)n;
+}
+
+// JSON-escape a string into the buffer (no surrounding quotes — caller
+// emits them). Backslash, double-quote, and control chars (< 0x20) are
+// escaped per RFC 8259. Non-ASCII bytes pass through untouched (UTF-8
+// is valid JSON when consumers are byte-clean).
+static void
+wm_book_json_escape(wm_book_buf_t *b, const char *src)
+{
+  const unsigned char *p;
+
+  if(b == NULL || src == NULL)
+    return;
+
+  for(p = (const unsigned char *)src; *p != '\0'; p++)
+  {
+    switch(*p)
+    {
+      case '"':  wm_book_buf_puts(b, "\\\"");  break;
+      case '\\': wm_book_buf_puts(b, "\\\\");  break;
+      case '\b': wm_book_buf_puts(b, "\\b");   break;
+      case '\f': wm_book_buf_puts(b, "\\f");   break;
+      case '\n': wm_book_buf_puts(b, "\\n");   break;
+      case '\r': wm_book_buf_puts(b, "\\r");   break;
+      case '\t': wm_book_buf_puts(b, "\\t");   break;
+      default:
+        if(*p < 0x20)
+          wm_book_buf_printf(b, "\\u%04x", (unsigned)*p);
+        else
+          wm_book_buf_putc(b, (char)*p);
+        break;
+    }
+  }
+}
+
+// Embed a JSON blob inside a single-quoted SQL literal — doubles every
+// single quote, brackets the result with the literal cast suffix.
+static void
+wm_book_emit_json_in_sql(wm_book_buf_t *out, const char *json)
+{
+  const char *p;
+
+  if(out == NULL || json == NULL)
+  {
+    wm_book_buf_puts(out, "'null'::jsonb");
+    return;
+  }
+
+  wm_book_buf_putc(out, '\'');
+
+  for(p = json; *p != '\0'; p++)
+  {
+    if(*p == '\'')
+      wm_book_buf_putc(out, '\'');
+
+    wm_book_buf_putc(out, *p);
+  }
+
+  wm_book_buf_puts(out, "'::jsonb");
+}
+
+static const char *
+wm_book_pos_side_name(wm_position_side_t s)
+{
+  switch(s)
+  {
+    case WM_POS_FLAT:  return("flat");
+    case WM_POS_LONG:  return("long");
+    case WM_POS_SHORT: return("short");
+  }
+
+  return("flat");
+}
+
+static wm_position_side_t
+wm_book_pos_side_parse(const char *s)
+{
+  if(s == NULL)                  return(WM_POS_FLAT);
+  if(strcasecmp(s, "long")  == 0) return(WM_POS_LONG);
+  if(strcasecmp(s, "short") == 0) return(WM_POS_SHORT);
+  return(WM_POS_FLAT);
+}
+
+// Resolve market_id_str → wm_market.id (int) by walking the live
+// markets container. -1 if not found. Caller must hold no market locks
+// (the container itself is unlocked; element pointers are stable
+// because add/remove serialise on the cmd worker thread).
+static int32_t
+wm_book_resolve_market_id(const char *market_id_str)
+{
+  whenmoon_state_t   *st;
+  whenmoon_markets_t *m;
+  uint32_t            i;
+
+  if(market_id_str == NULL)
+    return(-1);
+
+  st = whenmoon_get_state();
+
+  if(st == NULL || st->markets == NULL)
+    return(-1);
+
+  m = st->markets;
+
+  for(i = 0; i < m->n_markets; i++)
+    if(strncmp(m->arr[i].market_id_str, market_id_str,
+           WM_MARKET_ID_STR_SZ) == 0)
+      return(m->arr[i].market_id);
+
+  return(-1);
+}
+
+// Should this (registry, book) be persisted? Three guards layered:
+// 1) the registry is the global one (private registries belong to
+//    sweep workers and never persist),
+// 2) the book's market_id_str does not start with WM_BACKTEST_ID_PREFIX
+//    (synthetic backtest ids never reach DB),
+// 3) the mode is not WM_TRADE_MODE_BACKTEST (operator-set backtest
+//    on a real id; treat as transient).
+static bool
+wm_book_should_persist(wm_trade_registry_t *reg,
+    const wm_trade_book_t *book)
+{
+  if(reg != &g_registry)
+    return(false);
+
+  if(book == NULL)
+    return(false);
+
+  if(book->mode == WM_TRADE_MODE_BACKTEST)
+    return(false);
+
+  if(strncmp(book->market_id_str, WM_BACKTEST_ID_PREFIX,
+         strlen(WM_BACKTEST_ID_PREFIX)) == 0)
+    return(false);
+
+  return(true);
+}
+
+static void
+wm_book_json_signal(wm_book_buf_t *out, const wm_strategy_signal_t *sig)
+{
+  if(out == NULL)
+    return;
+
+  if(sig == NULL)
+  {
+    wm_book_buf_puts(out, "null");
+    return;
+  }
+
+  wm_book_buf_puts(out, "{\"ts_ms\":");
+  wm_book_buf_printf(out, "%" PRId64, sig->ts_ms);
+  wm_book_buf_puts(out, ",\"score\":");
+  wm_book_buf_printf(out, "%.10g", sig->score);
+  wm_book_buf_puts(out, ",\"confidence\":");
+  wm_book_buf_printf(out, "%.10g", sig->confidence);
+  wm_book_buf_puts(out, ",\"reason\":\"");
+  wm_book_json_escape(out, sig->reason);
+  wm_book_buf_puts(out, "\"}");
+}
+
+// Encode the full fills ring as a JSON array. The on-disk shape is the
+// raw ring (capacity = WM_FILL_RING_CAP) — fill_n + fill_head index
+// into it on hydrate so the ring is reconstructed byte-equivalent.
+// Slots beyond the populated count carry zeroed defaults (qty=0).
+static void
+wm_book_json_fills(wm_book_buf_t *out, const wm_trade_book_t *book)
+{
+  uint32_t i;
+  uint32_t n = WM_FILL_RING_CAP;
+
+  if(out == NULL || book == NULL)
+  {
+    wm_book_buf_puts(out, "[]");
+    return;
+  }
+
+  wm_book_buf_putc(out, '[');
+
+  for(i = 0; i < n; i++)
+  {
+    const wm_fill_t *f = &book->fills[i];
+
+    if(i > 0)
+      wm_book_buf_putc(out, ',');
+
+    wm_book_buf_puts(out, "{\"ts_ms\":");
+    wm_book_buf_printf(out, "%" PRId64, f->ts_ms);
+    wm_book_buf_puts(out, ",\"side\":\"");
+    wm_book_buf_putc(out, f->side != '\0' ? f->side : 'b');
+    wm_book_buf_puts(out, "\",\"qty\":");
+    wm_book_buf_printf(out, "%.10g", f->qty);
+    wm_book_buf_puts(out, ",\"price\":");
+    wm_book_buf_printf(out, "%.10g", f->price);
+    wm_book_buf_puts(out, ",\"fee\":");
+    wm_book_buf_printf(out, "%.10g", f->fee);
+    wm_book_buf_puts(out, ",\"slippage\":");
+    wm_book_buf_printf(out, "%.10g", f->slippage);
+    wm_book_buf_puts(out, ",\"realized_pnl\":");
+    wm_book_buf_printf(out, "%.10g", f->realized_pnl);
+    wm_book_buf_puts(out, ",\"cash_after\":");
+    wm_book_buf_printf(out, "%.10g", f->cash_after);
+    wm_book_buf_puts(out, ",\"position_after\":");
+    wm_book_buf_printf(out, "%.10g", f->position_after);
+    wm_book_buf_puts(out, ",\"reason\":\"");
+    wm_book_json_escape(out, f->reason);
+    wm_book_buf_puts(out, "\"}");
+  }
+
+  wm_book_buf_putc(out, ']');
+}
+
+static void
+wm_book_json_pnl(wm_book_buf_t *out, const wm_pnl_acc_t *acc)
+{
+  uint32_t i;
+
+  if(out == NULL)
+    return;
+
+  if(acc == NULL)
+  {
+    wm_book_buf_puts(out, "null");
+    return;
+  }
+
+  wm_book_buf_puts(out, "{\"n_trades\":");
+  wm_book_buf_printf(out, "%u", acc->n_trades);
+  wm_book_buf_puts(out, ",\"n_wins\":");
+  wm_book_buf_printf(out, "%u", acc->n_wins);
+  wm_book_buf_puts(out, ",\"n_losses\":");
+  wm_book_buf_printf(out, "%u", acc->n_losses);
+  wm_book_buf_puts(out, ",\"realized_pnl\":");
+  wm_book_buf_printf(out, "%.10g", acc->realized_pnl);
+  wm_book_buf_puts(out, ",\"gross_profit\":");
+  wm_book_buf_printf(out, "%.10g", acc->gross_profit);
+  wm_book_buf_puts(out, ",\"gross_loss\":");
+  wm_book_buf_printf(out, "%.10g", acc->gross_loss);
+  wm_book_buf_puts(out, ",\"fees_paid\":");
+  wm_book_buf_printf(out, "%.10g", acc->fees_paid);
+  wm_book_buf_puts(out, ",\"equity_peak\":");
+  wm_book_buf_printf(out, "%.10g", acc->equity_peak);
+  wm_book_buf_puts(out, ",\"max_drawdown\":");
+  wm_book_buf_printf(out, "%.10g", acc->max_drawdown);
+  wm_book_buf_puts(out, ",\"have_peak\":");
+  wm_book_buf_puts(out, acc->have_peak ? "true" : "false");
+  wm_book_buf_puts(out, ",\"returns_n\":");
+  wm_book_buf_printf(out, "%u", acc->returns_n);
+  wm_book_buf_puts(out, ",\"returns_head\":");
+  wm_book_buf_printf(out, "%u", acc->returns_head);
+  wm_book_buf_puts(out, ",\"returns\":[");
+
+  if(acc->returns != NULL)
+  {
+    for(i = 0; i < acc->returns_cap; i++)
+    {
+      if(i > 0)
+        wm_book_buf_putc(out, ',');
+
+      wm_book_buf_printf(out, "%.10g", acc->returns[i]);
+    }
+  }
+
+  wm_book_buf_puts(out, "]}");
+}
+
+// Serialize one book to a heap-allocated UPSERT statement. Returns
+// NULL on alloc failure or unresolvable market_id. Caller takes
+// ownership of the returned buffer.
+static char *
+wm_book_persist_build_sql_locked(const wm_trade_book_t *book,
+    int32_t market_id)
+{
+  wm_book_buf_t  signal_buf = { 0 };
+  wm_book_buf_t  fills_buf  = { 0 };
+  wm_book_buf_t  pnl_buf    = { 0 };
+  wm_book_buf_t  sql        = { 0 };
+  char          *escaped_strat = NULL;
+
+  if(book == NULL)
+    return(NULL);
+
+  // Build JSON sub-blobs first so the final SQL pass is a single
+  // grow-and-emit. JSON content needs SQL-escape (single-quote
+  // doubling) at the embedding boundary.
+  signal_buf.buf = mem_alloc("whenmoon", "book_persist_sig_json",
+      WM_BOOK_JSON_BUF_INIT_CAP);
+  fills_buf.buf  = mem_alloc("whenmoon", "book_persist_fills_json",
+      WM_BOOK_JSON_BUF_INIT_CAP);
+  pnl_buf.buf    = mem_alloc("whenmoon", "book_persist_pnl_json",
+      WM_BOOK_JSON_BUF_INIT_CAP);
+  sql.buf        = mem_alloc("whenmoon", "book_persist_sql",
+      WM_BOOK_PERSIST_SQL_INIT_CAP);
+
+  if(signal_buf.buf == NULL || fills_buf.buf == NULL ||
+     pnl_buf.buf    == NULL || sql.buf       == NULL)
+    goto fail;
+
+  signal_buf.cap = fills_buf.cap = pnl_buf.cap = WM_BOOK_JSON_BUF_INIT_CAP;
+  sql.cap        = WM_BOOK_PERSIST_SQL_INIT_CAP;
+  signal_buf.buf[0] = fills_buf.buf[0] = pnl_buf.buf[0] = sql.buf[0] = '\0';
+
+  if(book->has_last_signal)
+    wm_book_json_signal(&signal_buf, &book->last_signal);
+  else
+    wm_book_buf_puts(&signal_buf, "null");
+
+  wm_book_json_fills(&fills_buf, book);
+  wm_book_json_pnl(&pnl_buf, book->pnl);
+
+  if(signal_buf.oom || fills_buf.oom || pnl_buf.oom)
+    goto fail;
+
+  escaped_strat = db_escape(book->strategy_name);
+
+  if(escaped_strat == NULL)
+    goto fail;
+
+  // INSERT … ON CONFLICT DO UPDATE so the per-(market, strategy) row
+  // is owned exclusively by the trade book; subsequent fills overwrite
+  // their own row in place. EXCLUDED is the proposed-insert tuple.
+  wm_book_buf_printf(&sql,
+      "INSERT INTO wm_trade_book_state ("
+      "market_id, strategy_name, mode, starting_cash, cash,"
+      " position_side, position_qty, position_avg, position_opened_ms,"
+      " fee_bps, slip_bps, size_frac, max_position,"
+      " last_mark_px, last_mark_ms,"
+      " last_signal, has_last_signal,"
+      " fill_n, fill_head, fills_ring, pnl, updated_at)"
+      " VALUES (%" PRId32 ", '%s', '%s',"
+      " %.10g, %.10g, '%s', %.10g, %.10g, %" PRId64 ","
+      " %.10g, %.10g, %.10g, %.10g,"
+      " %.10g, %" PRId64 ", ",
+      market_id, escaped_strat, wm_trade_mode_name(book->mode),
+      book->starting_cash, book->cash,
+      wm_book_pos_side_name(book->position.side),
+      book->position.qty, book->position.avg_entry_px,
+      book->position.opened_at_ms,
+      book->fee_bps, book->slip_bps, book->size_frac, book->max_position,
+      book->last_mark_px, book->last_mark_ms);
+
+  wm_book_emit_json_in_sql(&sql, signal_buf.buf);
+  wm_book_buf_puts(&sql, ", ");
+  wm_book_buf_puts(&sql, book->has_last_signal ? "true" : "false");
+  wm_book_buf_printf(&sql, ", %" PRIu64 ", %u, ",
+      book->fill_n, book->fill_head);
+  wm_book_emit_json_in_sql(&sql, fills_buf.buf);
+  wm_book_buf_puts(&sql, ", ");
+  wm_book_emit_json_in_sql(&sql, pnl_buf.buf);
+  wm_book_buf_puts(&sql,
+      ", NOW())"
+      " ON CONFLICT (market_id, strategy_name) DO UPDATE SET"
+      " mode = EXCLUDED.mode,"
+      " starting_cash = EXCLUDED.starting_cash,"
+      " cash = EXCLUDED.cash,"
+      " position_side = EXCLUDED.position_side,"
+      " position_qty = EXCLUDED.position_qty,"
+      " position_avg = EXCLUDED.position_avg,"
+      " position_opened_ms = EXCLUDED.position_opened_ms,"
+      " fee_bps = EXCLUDED.fee_bps,"
+      " slip_bps = EXCLUDED.slip_bps,"
+      " size_frac = EXCLUDED.size_frac,"
+      " max_position = EXCLUDED.max_position,"
+      " last_mark_px = EXCLUDED.last_mark_px,"
+      " last_mark_ms = EXCLUDED.last_mark_ms,"
+      " last_signal = EXCLUDED.last_signal,"
+      " has_last_signal = EXCLUDED.has_last_signal,"
+      " fill_n = EXCLUDED.fill_n,"
+      " fill_head = EXCLUDED.fill_head,"
+      " fills_ring = EXCLUDED.fills_ring,"
+      " pnl = EXCLUDED.pnl,"
+      " updated_at = NOW()");
+
+  if(sql.oom)
+    goto fail;
+
+  mem_free(signal_buf.buf);
+  mem_free(fills_buf.buf);
+  mem_free(pnl_buf.buf);
+  mem_free(escaped_strat);
+
+  return(sql.buf);
+
+fail:
+  if(signal_buf.buf != NULL) mem_free(signal_buf.buf);
+  if(fills_buf.buf  != NULL) mem_free(fills_buf.buf);
+  if(pnl_buf.buf    != NULL) mem_free(pnl_buf.buf);
+  if(sql.buf        != NULL) mem_free(sql.buf);
+  if(escaped_strat  != NULL) mem_free(escaped_strat);
+  return(NULL);
+}
+
+// Public-within-file: gate, build, enqueue. Caller holds reg->lock.
+static void
+wm_book_persist_locked(wm_trade_registry_t *reg,
+    const wm_trade_book_t *book)
+{
+  int32_t  market_id;
+  char    *sql;
+
+  if(!wm_book_should_persist(reg, book))
+    return;
+
+  market_id = wm_book_resolve_market_id(book->market_id_str);
+
+  if(market_id < 0)
+  {
+    clam(CLAM_DEBUG2, WM_TRADE_CTX,
+        "book persist skipped (market_id unresolved): %s/%s",
+        book->market_id_str, book->strategy_name);
+    return;
+  }
+
+  sql = wm_book_persist_build_sql_locked(book, market_id);
+
+  if(sql == NULL)
+  {
+    clam(CLAM_WARN, WM_TRADE_CTX,
+        "book persist sql alloc failed: %s/%s",
+        book->market_id_str, book->strategy_name);
+    return;
+  }
+
+  if(wm_book_persist_enqueue(market_id, book->strategy_name, sql)
+         != SUCCESS)
+  {
+    mem_free(sql);
+    clam(CLAM_WARN, WM_TRADE_CTX,
+        "book persist enqueue failed: %s/%s",
+        book->market_id_str, book->strategy_name);
+  }
+}
+
+// Enqueue a DELETE for the (market, strategy) row. Same gating as
+// persist. Called under reg->lock from book-remove paths.
+static void
+wm_book_persist_drop_locked(wm_trade_registry_t *reg,
+    const wm_trade_book_t *book)
+{
+  int32_t market_id;
+
+  // Drop has a looser gate than persist: a row may exist in DB even
+  // for a book that's now in BACKTEST mode (transition via set_mode),
+  // and we want the DELETE to clean it up. Skip only when the
+  // registry isn't the global one OR the market id is synthetic.
+  if(reg != &g_registry || book == NULL)
+    return;
+
+  if(strncmp(book->market_id_str, WM_BACKTEST_ID_PREFIX,
+         strlen(WM_BACKTEST_ID_PREFIX)) == 0)
+    return;
+
+  market_id = wm_book_resolve_market_id(book->market_id_str);
+
+  if(market_id < 0)
+    return;
+
+  if(wm_book_persist_drop(market_id, book->strategy_name) != SUCCESS)
+    clam(CLAM_WARN, WM_TRADE_CTX,
+        "book persist-drop enqueue failed: %s/%s",
+        book->market_id_str, book->strategy_name);
+}
+
+// ----------------------------------------------------------------------- //
+// Book-state hydrate (WM-PT-3)                                            //
+// ----------------------------------------------------------------------- //
+//
+// Decode a wm_trade_book_state row into a freshly-allocated book and
+// link it into `reg`. Returns the book pointer on success, NULL when
+// no row exists OR on decode failure (caller falls back to fresh
+// create). Caller holds reg->lock.
+
+static void
+wm_book_hydrate_signal(json_object *root, wm_strategy_signal_t *out)
+{
+  json_object *v;
+
+  if(root == NULL || out == NULL)
+    return;
+
+  memset(out, 0, sizeof(*out));
+
+  if(json_object_object_get_ex(root, "ts_ms", &v))
+    out->ts_ms = (int64_t)json_object_get_int64(v);
+  if(json_object_object_get_ex(root, "score", &v))
+    out->score = json_object_get_double(v);
+  if(json_object_object_get_ex(root, "confidence", &v))
+    out->confidence = json_object_get_double(v);
+  if(json_object_object_get_ex(root, "reason", &v))
+  {
+    const char *s = json_object_get_string(v);
+
+    if(s != NULL)
+      snprintf(out->reason, sizeof(out->reason), "%s", s);
+  }
+}
+
+static void
+wm_book_hydrate_fills(json_object *arr, wm_trade_book_t *book)
+{
+  size_t n;
+  size_t i;
+
+  if(arr == NULL || book == NULL ||
+     json_object_get_type(arr) != json_type_array)
+    return;
+
+  n = json_object_array_length(arr);
+
+  if(n > WM_FILL_RING_CAP)
+    n = WM_FILL_RING_CAP;
+
+  for(i = 0; i < n; i++)
+  {
+    json_object *e = json_object_array_get_idx(arr, i);
+    wm_fill_t   *f = &book->fills[i];
+    json_object *v;
+    const char  *s;
+
+    memset(f, 0, sizeof(*f));
+
+    if(e == NULL || json_object_get_type(e) != json_type_object)
+      continue;
+
+    if(json_object_object_get_ex(e, "ts_ms", &v))
+      f->ts_ms = (int64_t)json_object_get_int64(v);
+    if(json_object_object_get_ex(e, "side", &v))
+    {
+      s = json_object_get_string(v);
+      f->side = (s != NULL && s[0] != '\0') ? s[0] : 'b';
+    }
+    if(json_object_object_get_ex(e, "qty", &v))
+      f->qty = json_object_get_double(v);
+    if(json_object_object_get_ex(e, "price", &v))
+      f->price = json_object_get_double(v);
+    if(json_object_object_get_ex(e, "fee", &v))
+      f->fee = json_object_get_double(v);
+    if(json_object_object_get_ex(e, "slippage", &v))
+      f->slippage = json_object_get_double(v);
+    if(json_object_object_get_ex(e, "realized_pnl", &v))
+      f->realized_pnl = json_object_get_double(v);
+    if(json_object_object_get_ex(e, "cash_after", &v))
+      f->cash_after = json_object_get_double(v);
+    if(json_object_object_get_ex(e, "position_after", &v))
+      f->position_after = json_object_get_double(v);
+    if(json_object_object_get_ex(e, "reason", &v))
+    {
+      s = json_object_get_string(v);
+      if(s != NULL)
+        snprintf(f->reason, sizeof(f->reason), "%s", s);
+    }
+  }
+}
+
+static void
+wm_book_hydrate_pnl(json_object *root, wm_pnl_acc_t *acc)
+{
+  json_object *v;
+
+  if(root == NULL || acc == NULL ||
+     json_object_get_type(root) != json_type_object)
+    return;
+
+  if(json_object_object_get_ex(root, "n_trades", &v))
+    acc->n_trades = (uint32_t)json_object_get_int(v);
+  if(json_object_object_get_ex(root, "n_wins", &v))
+    acc->n_wins = (uint32_t)json_object_get_int(v);
+  if(json_object_object_get_ex(root, "n_losses", &v))
+    acc->n_losses = (uint32_t)json_object_get_int(v);
+  if(json_object_object_get_ex(root, "realized_pnl", &v))
+    acc->realized_pnl = json_object_get_double(v);
+  if(json_object_object_get_ex(root, "gross_profit", &v))
+    acc->gross_profit = json_object_get_double(v);
+  if(json_object_object_get_ex(root, "gross_loss", &v))
+    acc->gross_loss = json_object_get_double(v);
+  if(json_object_object_get_ex(root, "fees_paid", &v))
+    acc->fees_paid = json_object_get_double(v);
+  if(json_object_object_get_ex(root, "equity_peak", &v))
+    acc->equity_peak = json_object_get_double(v);
+  if(json_object_object_get_ex(root, "max_drawdown", &v))
+    acc->max_drawdown = json_object_get_double(v);
+  if(json_object_object_get_ex(root, "have_peak", &v))
+    acc->have_peak = json_object_get_boolean(v);
+  if(json_object_object_get_ex(root, "returns_n", &v))
+    acc->returns_n = (uint32_t)json_object_get_int(v);
+  if(json_object_object_get_ex(root, "returns_head", &v))
+    acc->returns_head = (uint32_t)json_object_get_int(v);
+
+  if(acc->returns_n > acc->returns_cap)
+    acc->returns_n = acc->returns_cap;
+  if(acc->returns_head >= acc->returns_cap)
+    acc->returns_head = 0;
+
+  if(json_object_object_get_ex(root, "returns", &v) &&
+     json_object_get_type(v) == json_type_array && acc->returns != NULL)
+  {
+    size_t n = json_object_array_length(v);
+    size_t i;
+
+    if(n > acc->returns_cap)
+      n = acc->returns_cap;
+
+    for(i = 0; i < n; i++)
+    {
+      json_object *e = json_object_array_get_idx(v, i);
+
+      acc->returns[i] = (e != NULL) ? json_object_get_double(e) : 0.0;
+    }
+  }
+}
+
+static wm_trade_book_t *
+wm_book_hydrate_locked(wm_trade_registry_t *reg,
+    const char *market_id_str, const char *strategy_name)
+{
+  int32_t          market_id;
+  char            *escaped_strat = NULL;
+  char             sql[512];
+  db_result_t     *res = NULL;
+  wm_trade_book_t *book = NULL;
+  json_tokener    *tok = NULL;
+  json_object     *parsed = NULL;
+  const char      *cell;
+
+  if(reg != &g_registry || market_id_str == NULL || strategy_name == NULL)
+    return(NULL);
+
+  market_id = wm_book_resolve_market_id(market_id_str);
+
+  if(market_id < 0)
+    return(NULL);
+
+  escaped_strat = db_escape(strategy_name);
+
+  if(escaped_strat == NULL)
+    return(NULL);
+
+  snprintf(sql, sizeof(sql),
+      "SELECT mode, starting_cash, cash, position_side, position_qty,"
+      " position_avg, position_opened_ms, fee_bps, slip_bps, size_frac,"
+      " max_position, last_mark_px, last_mark_ms, last_signal,"
+      " has_last_signal, fill_n, fill_head, fills_ring, pnl"
+      "  FROM wm_trade_book_state"
+      " WHERE market_id = %" PRId32 " AND strategy_name = '%s'",
+      market_id, escaped_strat);
+
+  mem_free(escaped_strat);
+  escaped_strat = NULL;
+
+  res = db_result_alloc();
+
+  if(res == NULL)
+    return(NULL);
+
+  if(db_query(sql, res) != SUCCESS || !res->ok || res->rows == 0)
+    goto cleanup;
+
+  book = mem_alloc("whenmoon", "trade_book", sizeof(*book));
+
+  if(book == NULL)
+    goto cleanup;
+
+  memset(book, 0, sizeof(*book));
+  snprintf(book->market_id_str, sizeof(book->market_id_str), "%s",
+      market_id_str);
+  snprintf(book->strategy_name, sizeof(book->strategy_name), "%s",
+      strategy_name);
+
+  book->pnl = wm_pnl_acc_create(0);
+
+  if(book->pnl == NULL)
+  {
+    mem_free(book);
+    book = NULL;
+    goto cleanup;
+  }
+
+  // Scalar columns (col index follows the SELECT order above).
+  {
+    wm_trade_mode_t mode;
+
+    cell = db_result_get(res, 0, 0);
+    if(cell != NULL && wm_trade_mode_parse(cell, &mode) == SUCCESS)
+      book->mode = mode;
+  }
+  if((cell = db_result_get(res, 0, 1)) != NULL)
+    book->starting_cash = strtod(cell, NULL);
+  if((cell = db_result_get(res, 0, 2)) != NULL)
+    book->cash = strtod(cell, NULL);
+  if((cell = db_result_get(res, 0, 3)) != NULL)
+    book->position.side = wm_book_pos_side_parse(cell);
+  if((cell = db_result_get(res, 0, 4)) != NULL)
+    book->position.qty = strtod(cell, NULL);
+  if((cell = db_result_get(res, 0, 5)) != NULL)
+    book->position.avg_entry_px = strtod(cell, NULL);
+  if((cell = db_result_get(res, 0, 6)) != NULL)
+    book->position.opened_at_ms = (int64_t)strtoll(cell, NULL, 10);
+  if((cell = db_result_get(res, 0, 7)) != NULL)
+    book->fee_bps = strtod(cell, NULL);
+  if((cell = db_result_get(res, 0, 8)) != NULL)
+    book->slip_bps = strtod(cell, NULL);
+  if((cell = db_result_get(res, 0, 9)) != NULL)
+    book->size_frac = strtod(cell, NULL);
+  if((cell = db_result_get(res, 0, 10)) != NULL)
+    book->max_position = strtod(cell, NULL);
+  if((cell = db_result_get(res, 0, 11)) != NULL)
+    book->last_mark_px = strtod(cell, NULL);
+  if((cell = db_result_get(res, 0, 12)) != NULL)
+    book->last_mark_ms = (int64_t)strtoll(cell, NULL, 10);
+
+  // last_signal JSONB (col 13) — parse if non-null.
+  if((cell = db_result_get(res, 0, 13)) != NULL && cell[0] != '\0')
+  {
+    tok    = json_tokener_new();
+    parsed = (tok != NULL) ? json_tokener_parse_ex(tok, cell,
+        (int)strlen(cell)) : NULL;
+
+    if(parsed != NULL && json_object_get_type(parsed) == json_type_object)
+      wm_book_hydrate_signal(parsed, &book->last_signal);
+
+    if(parsed != NULL) json_object_put(parsed);
+    if(tok    != NULL) json_tokener_free(tok);
+    parsed = NULL;
+    tok    = NULL;
+  }
+
+  if((cell = db_result_get(res, 0, 14)) != NULL)
+    book->has_last_signal = (cell[0] == 't' || cell[0] == 'T' ||
+                             cell[0] == '1');
+  if((cell = db_result_get(res, 0, 15)) != NULL)
+    book->fill_n = (uint64_t)strtoull(cell, NULL, 10);
+  if((cell = db_result_get(res, 0, 16)) != NULL)
+    book->fill_head = (uint32_t)strtoul(cell, NULL, 10);
+
+  if(book->fill_head >= WM_FILL_RING_CAP)
+    book->fill_head = 0;
+
+  // fills_ring JSONB (col 17).
+  if((cell = db_result_get(res, 0, 17)) != NULL && cell[0] != '\0')
+  {
+    tok    = json_tokener_new();
+    parsed = (tok != NULL) ? json_tokener_parse_ex(tok, cell,
+        (int)strlen(cell)) : NULL;
+
+    if(parsed != NULL && json_object_get_type(parsed) == json_type_array)
+      wm_book_hydrate_fills(parsed, book);
+
+    if(parsed != NULL) json_object_put(parsed);
+    if(tok    != NULL) json_tokener_free(tok);
+    parsed = NULL;
+    tok    = NULL;
+  }
+
+  // pnl JSONB (col 18).
+  if((cell = db_result_get(res, 0, 18)) != NULL && cell[0] != '\0')
+  {
+    tok    = json_tokener_new();
+    parsed = (tok != NULL) ? json_tokener_parse_ex(tok, cell,
+        (int)strlen(cell)) : NULL;
+
+    if(parsed != NULL && json_object_get_type(parsed) == json_type_object)
+      wm_book_hydrate_pnl(parsed, book->pnl);
+
+    if(parsed != NULL) json_object_put(parsed);
+    if(tok    != NULL) json_tokener_free(tok);
+    parsed = NULL;
+    tok    = NULL;
+  }
+
+  // Link into registry.
+  book->next = reg->head;
+  reg->head  = book;
+  reg->n_books++;
+
+  // Re-resolve fee/slip/size/max_position from live KV so an operator
+  // who edited those between sessions gets the new values. cash,
+  // position, fills, pnl, mode, starting_cash all stick at the
+  // hydrated values (DB is authoritative for runtime state; KV is
+  // authoritative for live config knobs).
+  wm_trade_book_refresh_kv_locked(book);
+
+  clam(CLAM_INFO, WM_TRADE_CTX,
+      "book hydrated: %s/%s mode=%s cash=%.2f pos=%s/%.6g fills=%" PRIu64,
+      market_id_str, strategy_name,
+      wm_trade_mode_name(book->mode), book->cash,
+      wm_book_pos_side_name(book->position.side),
+      book->position.qty, book->fill_n);
+
+cleanup:
+  if(res != NULL)
+    db_result_free(res);
+  return(book);
 }
 
 void
@@ -400,6 +1327,26 @@ wm_trade_book_create_locked(wm_trade_registry_t *reg,
   return(book);
 }
 
+// Find-or-create with hydrate. On miss, tries to hydrate from
+// wm_trade_book_state (global registry only); on hydrate miss falls
+// through to fresh create. Caller holds reg->lock.
+static wm_trade_book_t *
+wm_trade_book_find_or_create_locked(wm_trade_registry_t *reg,
+    const char *market_id_str, const char *strategy_name)
+{
+  wm_trade_book_t *b;
+
+  b = wm_trade_book_find(reg, market_id_str, strategy_name);
+
+  if(b == NULL)
+    b = wm_book_hydrate_locked(reg, market_id_str, strategy_name);
+
+  if(b == NULL)
+    b = wm_trade_book_create_locked(reg, market_id_str, strategy_name);
+
+  return(b);
+}
+
 wm_trade_book_t *
 wm_trade_book_get_or_create(const char *market_id_str,
     const char *strategy_name)
@@ -416,12 +1363,8 @@ wm_trade_book_get_or_create(const char *market_id_str,
     return(NULL);
 
   pthread_mutex_lock(&reg->lock);
-
-  b = wm_trade_book_find(reg, market_id_str, strategy_name);
-
-  if(b == NULL)
-    b = wm_trade_book_create_locked(reg, market_id_str, strategy_name);
-
+  b = wm_trade_book_find_or_create_locked(reg, market_id_str,
+      strategy_name);
   pthread_mutex_unlock(&reg->lock);
 
   return(b);
@@ -545,10 +1488,8 @@ wm_trade_book_set_mode(const char *market_id_str,
 
   pthread_mutex_lock(&reg->lock);
 
-  b = wm_trade_book_find(reg, market_id_str, strategy_name);
-
-  if(b == NULL)
-    b = wm_trade_book_create_locked(reg, market_id_str, strategy_name);
+  b = wm_trade_book_find_or_create_locked(reg, market_id_str,
+      strategy_name);
 
   if(b == NULL)
   {
@@ -558,6 +1499,14 @@ wm_trade_book_set_mode(const char *market_id_str,
 
   prev    = b->mode;
   b->mode = mode;
+
+  // WM-PT-3: persist the new mode (or drop the row when transitioning
+  // to BACKTEST / "bt:" id, which the persist gate forbids — emit a
+  // DELETE so the stale row is collected).
+  if(wm_book_should_persist(reg, b))
+    wm_book_persist_locked(reg, b);
+  else
+    wm_book_persist_drop_locked(reg, b);
 
   pthread_mutex_unlock(&reg->lock);
 
@@ -644,6 +1593,10 @@ wm_trade_book_reset(const char *market_id_str, const char *strategy_name)
     // Re-pull cached params in case the user adjusted KV between
     // attach and reset.
     wm_trade_book_refresh_kv_locked(b);
+
+    // WM-PT-3: snapshot the post-reset book so a restart sees the
+    // cleared state, not the prior accumulated one.
+    wm_book_persist_locked(reg, b);
 
     clam(CLAM_INFO, WM_TRADE_CTX,
         "%s/%s reset (cash=%.2f)",
@@ -917,8 +1870,15 @@ wm_trade_engine_on_signal(const char *market_id_str,
   wm_sizer_compute(b, mark_px, sig, &intent);
 
   if(intent.action != WM_SIZER_HOLD)
+  {
     wm_trade_apply_paper_fill_locked(b, &intent, mark_px, sig->ts_ms,
         sig);
+
+    // WM-PT-3: snapshot the post-fill book to wm_trade_book_state.
+    // Async via the trade-persist worker; coalesces across rapid
+    // fills within one 1 s tick.
+    wm_book_persist_locked(reg, b);
+  }
 
   pthread_mutex_unlock(&reg->lock);
 }

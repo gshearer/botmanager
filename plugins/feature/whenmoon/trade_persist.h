@@ -46,6 +46,36 @@ void wm_trade_persist_destroy(struct whenmoon_market *mk);
 void wm_trade_persist_async(struct whenmoon_market *mk,
     const coinbase_ws_match_t *m);
 
+// ----------------------------------------------------------------------- //
+// Book-state queue (WM-PT-3)                                              //
+// ----------------------------------------------------------------------- //
+//
+// Durable trade-book state — one row per (market_id, strategy_name) in
+// `wm_trade_book_state`. Producers (paper fill apply, mode-set, reset)
+// hand off a fully-formed SQL statement; the flush task drains the
+// queue alongside the trade-tape rings on the same 1 s tick.
+//
+// Coalescing: at most one pending statement per (market_id,
+// strategy_name) key — a second enqueue replaces the first and frees
+// its prior SQL. This bounds the pending size to the live book count.
+//
+// `sql_owned` ownership transfers to the persist subsystem on every
+// successful enqueue (return SUCCESS). On FAIL the caller still owns
+// the buffer and is responsible for freeing it.
+bool wm_book_persist_enqueue(int32_t market_id, const char *strategy_name,
+    char *sql_owned);
+
+// Drop the (market_id, strategy_name) row. Issued at book-remove. The
+// persist subsystem allocates the DELETE SQL itself; caller passes
+// keys only.
+bool wm_book_persist_drop(int32_t market_id, const char *strategy_name);
+
+// Drain every pending book-state entry synchronously and run each
+// statement on the calling thread. Used at SIGTERM (called from
+// wm_trade_persist_global_destroy before task_cancel) so no pending
+// snapshot is lost across restart.
+void wm_book_persist_flush_all(void);
+
 #endif // WHENMOON_INTERNAL
 
 #endif // BM_WHENMOON_TRADE_PERSIST_H
