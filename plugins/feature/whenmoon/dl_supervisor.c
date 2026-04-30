@@ -112,6 +112,8 @@ wm_dl_supervisor_tick(task_t *t)
     if(jt->in_flight_count > 0)
       jt->in_flight_count--;
 
+    WM_FS_TRACE_INFLIGHT("supervisor_stall", j->id, -1, jt->in_flight_count);
+
     // Only RUNNING jobs need re-dispatch — DONE / FAILED jobs whose
     // in-flight request is being abandoned just need their slot freed
     // so wm_dl_remove_completed can reap them on the way out of the

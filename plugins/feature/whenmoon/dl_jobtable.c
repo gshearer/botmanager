@@ -243,6 +243,7 @@ wm_dl_kick(dl_jobtable_t *t)
       j->in_flight        = true;
       j->last_progress_ms = wm_dl_now_ms();
       t->in_flight_count++;
+      WM_FS_TRACE_INFLIGHT("kick", j->id, +1, t->in_flight_count);
     }
 
     pthread_mutex_unlock(&t->lock);
@@ -297,6 +298,8 @@ wm_dl_job_clear_in_flight(dl_jobtable_t *t, dl_job_t *j)
 
     if(t->in_flight_count > 0)
       t->in_flight_count--;
+
+    WM_FS_TRACE_INFLIGHT("clear_in_flight", j->id, -1, t->in_flight_count);
   }
 
   pthread_cond_broadcast(&t->drain);
@@ -1070,8 +1073,15 @@ wm_dl_jobtable_destroy(whenmoon_state_t *st)
       j->state = DL_JOB_PAUSED;
   }
 
+  WM_FS_TRACE_DRAIN("enter", t->in_flight_count);
+
   while(t->in_flight_count > 0)
+  {
     pthread_cond_wait(&t->drain, &t->lock);
+    WM_FS_TRACE_DRAIN("wake", t->in_flight_count);
+  }
+
+  WM_FS_TRACE_DRAIN("exit", t->in_flight_count);
 
   head = t->jobs_head;
   t->jobs_head = NULL;

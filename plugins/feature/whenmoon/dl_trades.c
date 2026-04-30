@@ -350,6 +350,9 @@ wm_dl_trades_on_page(const coinbase_trades_result_t *res, void *user)
       if(t->in_flight_count > 0)
         t->in_flight_count--;
 
+      WM_FS_TRACE_INFLIGHT("trades_bail_p1_jnull", -1, -1,
+          t->in_flight_count);
+
       pthread_cond_broadcast(&t->drain);
       pthread_mutex_unlock(&t->lock);
     }
@@ -439,10 +442,17 @@ wm_dl_trades_on_page(const coinbase_trades_result_t *res, void *user)
 
       if(t->in_flight_count > 0)
         t->in_flight_count--;
+
+      WM_FS_TRACE_INFLIGHT("trades_lost_race_jset", j->id, -1,
+          t->in_flight_count);
     }
 
     else if(j == NULL && t->in_flight_count > 0)
+    {
       t->in_flight_count--;
+      WM_FS_TRACE_INFLIGHT("trades_lost_race_jnull", -1, -1,
+          t->in_flight_count);
+    }
 
     pthread_cond_broadcast(&t->drain);
     pthread_mutex_unlock(&t->lock);

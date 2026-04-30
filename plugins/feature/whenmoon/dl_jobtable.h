@@ -22,6 +22,29 @@
 #include <stdint.h>
 #include <time.h>
 
+// WM-FS-DEADLOCK-1 instrumentation. Off unless built with
+// -DWM_FS_DEADLOCK_TRACE. Tracks every in_flight_count mutation site
+// plus the wm_dl_jobtable_destroy cond_wait entry / wake / exit so a
+// trace diff can reveal whether the destroy drain wedge is a missing
+// decrement (counts unbalanced) or a lost signal (counts balanced but
+// the cond_wait never wakes).
+#ifdef WM_FS_DEADLOCK_TRACE
+#  include "clam.h"
+#  include "dl_schema.h"
+#  include <inttypes.h>
+#  define WM_FS_TRACE_INFLIGHT(site, jid, delta, count_after)             \
+     clam(CLAM_DEBUG2, WM_DL_CTX,                                         \
+         "fs_deadlock: %s j=%" PRId64 " delta=%+d count=%u",              \
+         (site), (int64_t)(jid), (int)(delta), (unsigned)(count_after))
+#  define WM_FS_TRACE_DRAIN(label, count_now)                             \
+     clam(CLAM_DEBUG2, WM_DL_CTX,                                         \
+         "fs_deadlock: drain %s count=%u",                                \
+         (label), (unsigned)(count_now))
+#else
+#  define WM_FS_TRACE_INFLIGHT(site, jid, delta, count_after) ((void)0)
+#  define WM_FS_TRACE_DRAIN(label, count_now)                 ((void)0)
+#endif
+
 #define WM_DL_PAGE_RETRY_MAX      5
 #define WM_DL_JOBS_MAX           32
 
