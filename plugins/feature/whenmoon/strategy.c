@@ -885,6 +885,23 @@ wm_strategy_attach(whenmoon_state_t *st,
   // /whenmoon strategy attach flow against the global registry.
   (void)wm_trade_book_get_or_create(market_id_str, strategy_name);
 
+  // WM-SR-1: copy the persisted last_signal cursor from the (now-
+  // hydrated) book into the per-attachment ctx. wm_strategy_dispatch_bar
+  // uses this cursor to drop replay bars whose ts_close_ms is at or
+  // before the last signal — without it, the REST candles backfill
+  // (300 bars per market start) and the wm_aggregator_load_history_task
+  // re-fire every prior signal as the warmup replays through dispatch.
+  {
+    wm_trade_snapshot_t snap;
+
+    if(wm_trade_book_snapshot(market_id_str, strategy_name, &snap)
+           == SUCCESS && snap.has_last_signal)
+    {
+      att->ctx.last_signal     = snap.last_signal;
+      att->ctx.has_last_signal = true;
+    }
+  }
+
   clam(CLAM_INFO, WHENMOON_CTX,
       "strategy attach: %s -> %s", strategy_name, market_id_str);
 
@@ -1212,6 +1229,18 @@ wm_strategy_dispatch_bar(whenmoon_state_t *st,
       // across stop/start cycles, so it is the resilient key.
       if(strncmp(att->ctx.market_id_str, mkt->market_id_str,
              sizeof(att->ctx.market_id_str)) != 0)
+        continue;
+
+      // WM-SR-1: drop replay bars that already produced a signal in a
+      // prior session. The REST candles backfill + DB warmup task feed
+      // historical bars through dispatch_bar with their original
+      // ts_close_ms; without this gate every persisted attachment
+      // re-emits its prior signals and the paper book accrues
+      // duplicate-timestamp fills on every restart. The attach path
+      // hydrates last_signal from the persisted book, so a fresh
+      // attach with no prior signals still sees every bar.
+      if(att->ctx.has_last_signal
+          && bar->ts_close_ms <= att->ctx.last_signal.ts_ms)
         continue;
 
       // Refresh the cached pointer so the strategy callback sees the
