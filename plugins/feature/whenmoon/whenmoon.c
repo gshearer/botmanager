@@ -333,8 +333,8 @@ whenmoon_init(void)
   whenmoon_state = st;
 
   // Order: markets container first (no DB or KV reads), then account,
-  // then downloader DDL + scheduler. wm_market_restore runs last so it
-  // can resubscribe over a complete WS handler set.
+  // then downloader DDL + scheduler. wm_market_restore runs in
+  // whenmoon_start (post-kv_load) so it sees the persisted sandbox flag.
   if(wm_market_init(st) != SUCCESS)
   {
     clam(CLAM_INFO, WHENMOON_CTX, "wm_market_init failed");
@@ -433,11 +433,6 @@ whenmoon_init(void)
   // touching those keys yet.
   wm_bt_sweep_cleanup_stale_kv();
 
-  // Restore last; logs but does not fail init if the DB query errors.
-  if(wm_market_restore(st) != SUCCESS)
-    clam(CLAM_INFO, WHENMOON_CTX,
-        "wm_market_restore failed (plugin starts with no markets)");
-
   clam(CLAM_INFO, WHENMOON_CTX, "whenmoon plugin initialized");
   return(SUCCESS);
 
@@ -448,6 +443,25 @@ fail:
   wm_trade_persist_global_destroy();
   TA_Shutdown();
   return(FAIL);
+}
+
+// WM-MR-1: restore runs in start (post-kv_load) so coinbase_sandbox_active
+// reads the persisted plugin.coinbase.sandbox value rather than the
+// kv_register default. Init runs before kv_load and would skip every
+// row whose env doesn't match the (always-default) prod environment.
+static bool
+whenmoon_start(void)
+{
+  whenmoon_state_t *st = whenmoon_state;
+
+  if(st == NULL)
+    return(SUCCESS);
+
+  if(wm_market_restore(st) != SUCCESS)
+    clam(CLAM_INFO, WHENMOON_CTX,
+        "wm_market_restore failed (plugin starts with no markets)");
+
+  return(SUCCESS);
 }
 
 static void
@@ -490,7 +504,7 @@ const plugin_desc_t bm_plugin_desc = {
   .kv_inst_schema       = NULL,
   .kv_inst_schema_count = 0,
   .init                 = whenmoon_init,
-  .start                = NULL,
+  .start                = whenmoon_start,
   .stop                 = NULL,
   .deinit               = whenmoon_deinit,
   .ext                  = NULL,

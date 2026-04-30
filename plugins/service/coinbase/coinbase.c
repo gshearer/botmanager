@@ -51,15 +51,26 @@ static const plugin_kv_entry_t cb_kv_schema[] = {
 static bool
 cb_init(void)
 {
-  // WM-DC-1: latch the active exchange name from the sandbox KV before
-  // any exchange_register / exchange_request call so the registration
-  // and every internal dispatch share a single name. Flipping the
-  // sandbox flag at runtime is out of scope; freshstart is required.
-  cb_active_name_init();
-
   cb_rest_init();
   cb_ws_init();
   cb_ws_channels_init();
+
+  clam(CLAM_INFO, CB_CTX, "coinbase plugin initialized");
+
+  return(SUCCESS);
+}
+
+static bool
+cb_start(void)
+{
+  // WM-MR-1: KV values from DB are loaded by now (kv_load runs between
+  // plugin_init_all and plugin_start_all). Latching the active exchange
+  // name and registering with feature_exchange happens here so the slot
+  // matches the persisted plugin.coinbase.sandbox value, not the
+  // kv_register default. WM-DC-1's invariant (registration name shared
+  // with every dispatch) still holds — both reads use the same latched
+  // value.
+  cb_active_name_init();
 
   // EX-1: self-register with the feature_exchange abstraction so
   // candle + trade traffic gets the priority queue + token bucket.
@@ -72,15 +83,9 @@ cb_init(void)
     return(FAIL);
   }
 
-  clam(CLAM_INFO, CB_CTX, "coinbase plugin initialized as %s",
+  clam(CLAM_INFO, CB_CTX, "coinbase plugin started as %s",
       cb_active_exchange_name());
 
-  return(SUCCESS);
-}
-
-static bool
-cb_start(void)
-{
   cb_ws_start();
 
   return(SUCCESS);
