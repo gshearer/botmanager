@@ -814,8 +814,10 @@ bool
 wm_market_restore(whenmoon_state_t *st)
 {
   db_result_t *res = NULL;
+  bool         sandbox;
   uint32_t     i;
   uint32_t     n_restored = 0;
+  uint32_t     n_skipped  = 0;
   bool         ok = SUCCESS;
 
   if(st == NULL)
@@ -839,6 +841,8 @@ wm_market_restore(whenmoon_state_t *st)
     goto out;
   }
 
+  sandbox = coinbase_sandbox_active();
+
   for(i = 0; i < res->rows; i++)
   {
     const char *exch  = db_result_get(res, i, 0);
@@ -848,6 +852,27 @@ wm_market_restore(whenmoon_state_t *st)
 
     if(exch == NULL || base == NULL || quote == NULL || sym == NULL)
       continue;
+
+    // WM-DC-1: skip rows that don't match the active coinbase
+    // environment so a freshstart on the opposite side doesn't try to
+    // bring up a market whose WS feed (and trade table) belong to the
+    // other env. Only pinning coinbase-family rows here — future
+    // exchanges pass through unchanged.
+    if(sandbox && strcmp(exch, "coinbase") == 0)
+    {
+      clam(CLAM_INFO, WHENMOON_CTX,
+          "market %s skipped — prod row, sandbox active", sym);
+      n_skipped++;
+      continue;
+    }
+
+    if(!sandbox && strcmp(exch, "coinbase-sb") == 0)
+    {
+      clam(CLAM_INFO, WHENMOON_CTX,
+          "market %s skipped — sandbox row, prod active", sym);
+      n_skipped++;
+      continue;
+    }
 
     if(wm_market_add(st, exch, base, quote, sym,
            false, NULL, 0) != SUCCESS)
@@ -861,7 +886,9 @@ wm_market_restore(whenmoon_state_t *st)
   }
 
   clam(CLAM_INFO, WHENMOON_CTX,
-      "%u running market(s) restored", n_restored);
+      "%u running market(s) restored, %u env-mismatched skipped"
+      " (sandbox=%s)",
+      n_restored, n_skipped, sandbox ? "true" : "false");
 
 out:
   if(res != NULL) db_result_free(res);

@@ -42,6 +42,13 @@ void wm_dl_destroy(struct whenmoon_state *st);
 // For "coinbase" entries the create path consults the product cache to
 // fill in base_increment / quote_increment; other exchanges INSERT
 // with NULL increments.
+//
+// WM-DC-1: when `exchange == "coinbase"` and coinbase_sandbox_active()
+// is true, the resolver stores `wm_market.exchange = "coinbase-sb"`
+// so sandbox markets occupy a distinct registry slot (and therefore a
+// distinct wm_trades_<id> table) from prod. Already-qualified inputs
+// ("coinbase-sb") pass through unchanged so wm_market_restore can
+// re-add rows without double-suffixing.
 int32_t wm_market_lookup_or_create(const char *exchange,
     const char *base_asset, const char *quote_asset,
     const char *exchange_symbol);

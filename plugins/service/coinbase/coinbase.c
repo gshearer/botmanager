@@ -51,6 +51,12 @@ static const plugin_kv_entry_t cb_kv_schema[] = {
 static bool
 cb_init(void)
 {
+  // WM-DC-1: latch the active exchange name from the sandbox KV before
+  // any exchange_register / exchange_request call so the registration
+  // and every internal dispatch share a single name. Flipping the
+  // sandbox flag at runtime is out of scope; freshstart is required.
+  cb_active_name_init();
+
   cb_rest_init();
   cb_ws_init();
   cb_ws_channels_init();
@@ -66,7 +72,8 @@ cb_init(void)
     return(FAIL);
   }
 
-  clam(CLAM_INFO, CB_CTX, "coinbase plugin initialized");
+  clam(CLAM_INFO, CB_CTX, "coinbase plugin initialized as %s",
+      cb_active_exchange_name());
 
   return(SUCCESS);
 }
@@ -92,7 +99,9 @@ cb_deinit(void)
 {
   // Drop our exchange registration first so any in-flight queue is
   // failed back to consumers before we tear down the curl pipeline.
-  exchange_unregister("coinbase");
+  // Use the latched active name so prod and sandbox unregister against
+  // the slot they registered into.
+  exchange_unregister(cb_active_exchange_name());
 
   cb_ws_deinit();            // stops reader, frees transport state
   cb_ws_channels_deinit();   // drops every sub handle + slot state

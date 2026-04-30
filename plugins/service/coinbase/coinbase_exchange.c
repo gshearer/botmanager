@@ -229,5 +229,9 @@ static const exchange_protocol_vtable_t cb_vtable = {
 bool
 cb_exchange_register_vtable(void)
 {
-  return(exchange_register("coinbase", &cb_vtable));
+  // WM-DC-1: register under the latched name so sandbox and prod
+  // occupy distinct registry slots. cb_active_exchange_name() resolves
+  // to "coinbase-sb" when plugin.coinbase.sandbox is true at plugin
+  // init, "coinbase" otherwise.
+  return(exchange_register(cb_active_exchange_name(), &cb_vtable));
 }

@@ -133,6 +133,15 @@ bool    cb_sign_request(const char *method, const char *path,
             const char *body, size_t body_len, const char *ts,
             char *sig_out, size_t sig_cap);
 
+// Latch the active exchange name from the sandbox KV. Idempotent;
+// must run before cb_exchange_register_vtable() and before any
+// exchange_request() call inside the plugin. Called from cb_init().
+void          cb_active_name_init(void);
+
+// Stable for the daemon's lifetime: "coinbase" or "coinbase-sb".
+// Returned pointer is to a file-scope static; callers must not free.
+const char *  cb_active_exchange_name(void);
+
 // coinbase_rest.c
 
 // Lifecycle. Paired with cb_init / cb_deinit in coinbase.c.

@@ -453,6 +453,13 @@ wm_candle_table_ensure(int32_t market_id, int32_t gran_secs)
 // On miss, INSERT ... RETURNING id, filling increments from the
 // coinbase product cache when available. Never composes SQL with raw
 // user-supplied tokens — every string goes through db_escape first.
+//
+// WM-DC-1: bare "coinbase" inputs are auto-qualified to "coinbase-sb"
+// when sandbox is active so the (exchange, exchange_symbol) unique
+// key isolates sandbox and prod into distinct rows. Already-qualified
+// names pass through unchanged so a sandbox row reloaded by
+// wm_market_restore re-resolves to the same id without double-
+// suffixing.
 int32_t
 wm_market_lookup_or_create(const char *exchange, const char *base_asset,
     const char *quote_asset, const char *exchange_symbol)
@@ -463,7 +470,9 @@ wm_market_lookup_or_create(const char *exchange, const char *base_asset,
   char                *e_quote    = NULL;
   char                *e_symbol   = NULL;
   coinbase_product_t  *cache      = NULL;
+  char                 qual_exchange[32];
   char                 sql[1024];
+  bool                 is_coinbase_family = false;
   int32_t              id        = -1;
   double               base_inc  = 0.0;
   double               quote_inc = 0.0;
@@ -473,7 +482,20 @@ wm_market_lookup_or_create(const char *exchange, const char *base_asset,
      quote_asset == NULL || exchange_symbol == NULL)
     return(-1);
 
-  e_exchange = db_escape(exchange);
+  // Qualifier resolution: bare "coinbase" picks up the "-sb" suffix
+  // when sandbox is active so sandbox rows land in their own slot.
+  // Anything else (already-qualified "coinbase-sb", or a future
+  // non-coinbase exchange) passes through verbatim.
+  if(strcmp(exchange, "coinbase") == 0 && coinbase_sandbox_active())
+    snprintf(qual_exchange, sizeof(qual_exchange), "coinbase-sb");
+
+  else
+    snprintf(qual_exchange, sizeof(qual_exchange), "%s", exchange);
+
+  is_coinbase_family = (strcmp(qual_exchange, "coinbase") == 0
+                     || strcmp(qual_exchange, "coinbase-sb") == 0);
+
+  e_exchange = db_escape(qual_exchange);
   e_base     = db_escape(base_asset);
   e_quote    = db_escape(quote_asset);
   e_symbol   = db_escape(exchange_symbol);
@@ -507,11 +529,12 @@ wm_market_lookup_or_create(const char *exchange, const char *base_asset,
 
   // Create path -----------------------------------------------------
   // Pull increments from the coinbase product cache when available.
-  // Other exchanges (or an empty/stale cache) fall through to the
-  // NULL-increments INSERT; a later cache refresh plus a follow-up
-  // refresh command (not in S1) can backfill.
-  if(strcmp(exchange, "coinbase") == 0 &&
-     coinbase_products_cache_fresh())
+  // Both "coinbase" and "coinbase-sb" share the same cache surface —
+  // the active environment determines which products list is in
+  // memory, and the same product ids (e.g. "BTC-USD") trade on both
+  // sides. Other exchanges (or an empty/stale cache) fall through to
+  // the NULL-increments INSERT.
+  if(is_coinbase_family && coinbase_products_cache_fresh())
   {
     uint32_t n = 0;
 
@@ -566,7 +589,7 @@ wm_market_lookup_or_create(const char *exchange, const char *base_asset,
   else
     clam(CLAM_WARN, WM_DL_CTX,
         "market create failed for %s:%s:%s (%s): %s",
-        exchange, base_asset, quote_asset, exchange_symbol,
+        qual_exchange, base_asset, quote_asset, exchange_symbol,
         (res != NULL && res->error[0] != '\0')
             ? res->error : "(no driver error)");
 
