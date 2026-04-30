@@ -31,10 +31,23 @@ typedef struct
   int64_t         job_id;
 } wm_dl_trades_ctx_t;
 
+// Tri-valued insert outcome (WM-DC-3). The pre-WM-DC-3 helper folded
+// "all rows duplicate" and "DB error" both into return value 0, so the
+// caller silently extended coverage with rows that never landed in the
+// table. WM_DL_INSERT_OK now means "rows are confirmed present" — any
+// of N>0 written, all-duplicates (already there), or empty page; the
+// caller is safe to extend coverage. WM_DL_INSERT_FAIL means the DB
+// rejected or dropped the statement; coverage MUST NOT be extended.
+typedef enum
+{
+  WM_DL_INSERT_OK   = 0,
+  WM_DL_INSERT_FAIL = 1
+} wm_dl_insert_status_t;
+
 static void wm_dl_trades_on_page(const coinbase_trades_result_t *res,
     void *user);
-static uint32_t wm_dl_trades_insert_page(int32_t market_id,
-    const coinbase_trades_result_t *res);
+static wm_dl_insert_status_t wm_dl_trades_insert_page(int32_t market_id,
+    const coinbase_trades_result_t *res, uint32_t *out_written);
 static void wm_dl_us_to_tstz(int64_t time_us, char *out, size_t cap);
 
 // ------------------------------------------------------------------ //
@@ -128,9 +141,9 @@ wm_dl_trades_dispatch_one(dl_jobtable_t *t, dl_job_t *j)
 // Row insert                                                          //
 // ------------------------------------------------------------------ //
 
-static uint32_t
+static wm_dl_insert_status_t
 wm_dl_trades_insert_page(int32_t market_id,
-    const coinbase_trades_result_t *res)
+    const coinbase_trades_result_t *res, uint32_t *out_written)
 {
   char         table[WM_DL_TABLE_SZ];
   db_result_t *dbres;
@@ -140,16 +153,25 @@ wm_dl_trades_insert_page(int32_t market_id,
   uint32_t     written = 0;
   uint32_t     i;
 
+  if(out_written != NULL)
+    *out_written = 0;
+
+  // Empty page is OK: nothing to write, nothing to fail.
   if(res == NULL || res->count == 0)
-    return(0);
+    return(WM_DL_INSERT_OK);
 
   if(wm_trade_table_name(market_id, table, sizeof(table)) != SUCCESS)
-    return(0);
+  {
+    clam(CLAM_WARN, WM_DL_CTX,
+        "trade insert: cannot resolve table name (market=%" PRId32 ")",
+        market_id);
+    return(WM_DL_INSERT_FAIL);
+  }
 
   sql = mem_alloc("whenmoon.dl", "trade_insert", cap);
 
   if(sql == NULL)
-    return(0);
+    return(WM_DL_INSERT_FAIL);
 
   len += (size_t)snprintf(sql + len, cap - len,
       "INSERT INTO %s (trade_id, ts, side, price, size, source)"
@@ -173,7 +195,7 @@ wm_dl_trades_insert_page(int32_t market_id,
       if(new_sql == NULL)
       {
         mem_free(sql);
-        return(0);
+        return(WM_DL_INSERT_FAIL);
       }
 
       sql = new_sql;
@@ -192,7 +214,7 @@ wm_dl_trades_insert_page(int32_t market_id,
     if(n < 0)
     {
       mem_free(sql);
-      return(0);
+      return(WM_DL_INSERT_FAIL);
     }
 
     len += (size_t)n;
@@ -206,7 +228,7 @@ wm_dl_trades_insert_page(int32_t market_id,
     if(new_sql == NULL)
     {
       mem_free(sql);
-      return(0);
+      return(WM_DL_INSERT_FAIL);
     }
 
     sql = new_sql;
@@ -221,21 +243,34 @@ wm_dl_trades_insert_page(int32_t market_id,
   if(dbres == NULL)
   {
     mem_free(sql);
-    return(0);
+    return(WM_DL_INSERT_FAIL);
   }
 
+  // PostgreSQL `INSERT ... ON CONFLICT DO NOTHING` is atomic per
+  // statement: either the whole batch lands (rows_affected == N) or
+  // the whole batch is rejected (ok=false). All-duplicates returns
+  // ok=true, rows_affected=0 — the rows are confirmed present so
+  // coverage extension is sound.
   if(db_query(sql, dbres) == SUCCESS && dbres->ok)
+  {
     written = dbres->rows_affected;
+    db_result_free(dbres);
+    mem_free(sql);
 
-  else
-    clam(CLAM_WARN, WM_DL_CTX,
-        "trade insert failed (market=%" PRId32 "): %s",
-        market_id,
-        dbres->error[0] != '\0' ? dbres->error : "(no driver error)");
+    if(out_written != NULL)
+      *out_written = written;
+
+    return(WM_DL_INSERT_OK);
+  }
+
+  clam(CLAM_WARN, WM_DL_CTX,
+      "trade insert failed (market=%" PRId32 "): %s",
+      market_id,
+      dbres->error[0] != '\0' ? dbres->error : "(no driver error)");
 
   db_result_free(dbres);
   mem_free(sql);
-  return(written);
+  return(WM_DL_INSERT_FAIL);
 }
 
 // ------------------------------------------------------------------ //
@@ -334,29 +369,46 @@ wm_dl_trades_on_page(const coinbase_trades_result_t *res, void *user)
     empty_page = true;
   }
 
-  // Phase 3: insert rows (off-lock; DB is the long op).
+  // Phase 3: insert rows (off-lock; DB is the long op). WM-DC-3:
+  // distinguish "all rows are present" (OK — extend coverage) from
+  // "DB rejected the batch" (FAIL — leave coverage untouched and let
+  // the consecutive_errors retry path handle transients).
   if(!hit_err && !empty_page)
   {
-    inserted           = wm_dl_trades_insert_page(market_id, res);
-    oldest_id_on_page  = res->rows[res->count - 1].trade_id;
-    newest_id_on_page  = res->rows[0].trade_id;
-    wm_dl_us_to_tstz(res->rows[res->count - 1].time_us,
-        oldest_ts_on_page, sizeof(oldest_ts_on_page));
-    wm_dl_us_to_tstz(res->rows[0].time_us,
-        newest_ts_on_page, sizeof(newest_ts_on_page));
+    wm_dl_insert_status_t st = wm_dl_trades_insert_page(market_id, res,
+        &inserted);
 
-    // Extend coverage with the range we just stored.
+    if(st == WM_DL_INSERT_FAIL)
     {
-      wm_coverage_t iv;
+      hit_err = true;
+      snprintf(errmsg, sizeof(errmsg), "db insert failed");
+    }
 
-      memset(&iv, 0, sizeof(iv));
-      iv.market_id      = market_id;
-      iv.first_trade_id = oldest_id_on_page;
-      iv.last_trade_id  = newest_id_on_page;
-      snprintf(iv.first_ts, sizeof(iv.first_ts), "%s", oldest_ts_on_page);
-      snprintf(iv.last_ts,  sizeof(iv.last_ts),  "%s", newest_ts_on_page);
-      snprintf(iv.source,   sizeof(iv.source),   "api");
-      wm_coverage_add(WM_COV_TRADES, &iv);
+    else
+    {
+      oldest_id_on_page  = res->rows[res->count - 1].trade_id;
+      newest_id_on_page  = res->rows[0].trade_id;
+      wm_dl_us_to_tstz(res->rows[res->count - 1].time_us,
+          oldest_ts_on_page, sizeof(oldest_ts_on_page));
+      wm_dl_us_to_tstz(res->rows[0].time_us,
+          newest_ts_on_page, sizeof(newest_ts_on_page));
+
+      // Extend coverage with the range we just stored. Safe whether
+      // `inserted` is N or 0 — all-duplicates means rows are already
+      // present (a prior write established coverage); a fresh write
+      // means we just produced them.
+      {
+        wm_coverage_t iv;
+
+        memset(&iv, 0, sizeof(iv));
+        iv.market_id      = market_id;
+        iv.first_trade_id = oldest_id_on_page;
+        iv.last_trade_id  = newest_id_on_page;
+        snprintf(iv.first_ts, sizeof(iv.first_ts), "%s", oldest_ts_on_page);
+        snprintf(iv.last_ts,  sizeof(iv.last_ts),  "%s", newest_ts_on_page);
+        snprintf(iv.source,   sizeof(iv.source),   "api");
+        wm_coverage_add(WM_COV_TRADES, &iv);
+      }
     }
   }
 

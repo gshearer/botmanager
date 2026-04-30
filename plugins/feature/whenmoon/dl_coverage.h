@@ -18,6 +18,17 @@
 #define WM_COV_TS_SZ      40    // "2026-04-22 00:00:00+00" + slack
 #define WM_COV_SOURCE_SZ  16    // matches schema VARCHAR(16)
 
+// Coverage-merge gap thresholds. Adjacent paginations are unioned in
+// place; non-adjacent intervals stay separate rows. Trades enforce
+// touching in BOTH ID space AND timestamp space; a row that touches in
+// only one dimension signals a corrupted boundary and rejects the
+// merge with CLAM_WARN. Candles have no ID axis so the timestamp-only
+// predicate is widened to 2*gran with a 30-day sanity check that no
+// touching row's range can pull iv past a multi-year jump.
+#define WM_COV_ID_MERGE_GAP          64     // trade-id slack
+#define WM_COV_TS_MERGE_GAP_SECONDS  600    // 10 min wall-clock slack
+#define WM_COV_TS_SANITY_DAYS        30     // candle out-of-band ceiling
+
 typedef enum
 {
   WM_COV_TRADES  = 0,

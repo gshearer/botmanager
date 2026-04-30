@@ -199,7 +199,10 @@ wm_dl_cmd_download_trades(const cmd_ctx_t *ctx)
   }
 
   // Coverage short-circuit: if the requested window is fully covered,
-  // don't write a job.
+  // don't write a job. Post-WM-DC-4, "covered" means the coverage row
+  // not only claims the window in timestamp space but is also backed
+  // by physically-present rows in wm_trades_<market_id> at its
+  // boundary trade_ids; an unbacked row no longer short-circuits.
   if(oldest_ts[0] != '\0' && newest_ts[0] != '\0')
   {
     wm_coverage_t gaps[4];
