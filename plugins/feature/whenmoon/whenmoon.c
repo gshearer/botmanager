@@ -57,6 +57,30 @@ static const plugin_kv_entry_t whenmoon_plugin_schema[] = {
     " throughput. EX-1: rate-limit knobs now live under"
     " plugin.exchange.<name>.rate_limit_rps.",
     NULL, NULL },
+
+  // WM-CD-1 Phase 1: per-granularity max-lookback cache. 0 = unknown
+  // (not yet probed). Populated by `/whenmoon candles probe-depth
+  // <market>` (admin verb, runtime probe of the candles endpoint).
+  // Consumed by the `... max` sugar verb so it never asks for a window
+  // Coinbase will reject. Re-probe when suspected stale.
+  { "plugin.whenmoon.candles.60.max_lookback_days",     KV_UINT32, "0",
+    "Probed depth cap for 1m candles (days). 0 = not yet probed.",
+    NULL, NULL },
+  { "plugin.whenmoon.candles.300.max_lookback_days",    KV_UINT32, "0",
+    "Probed depth cap for 5m candles (days). 0 = not yet probed.",
+    NULL, NULL },
+  { "plugin.whenmoon.candles.900.max_lookback_days",    KV_UINT32, "0",
+    "Probed depth cap for 15m candles (days). 0 = not yet probed.",
+    NULL, NULL },
+  { "plugin.whenmoon.candles.3600.max_lookback_days",   KV_UINT32, "0",
+    "Probed depth cap for 1h candles (days). 0 = not yet probed.",
+    NULL, NULL },
+  { "plugin.whenmoon.candles.21600.max_lookback_days",  KV_UINT32, "0",
+    "Probed depth cap for 6h candles (days). 0 = not yet probed.",
+    NULL, NULL },
+  { "plugin.whenmoon.candles.86400.max_lookback_days",  KV_UINT32, "0",
+    "Probed depth cap for 1d candles (days). 0 = not yet probed.",
+    NULL, NULL },
 };
 
 // ------------------------------------------------------------------ //

@@ -10,6 +10,7 @@
 #include "dl_schema.h"
 #include "dl_coverage.h"
 #include "dl_candles.h"
+#include "cd_probe.h"
 
 #include "exchange_api.h"
 
@@ -248,6 +249,7 @@ wm_dl_cmd_download_candles(const cmd_ctx_t *ctx)
   char              pair[64]      = {0};
   char              old_tok[32]   = {0};
   char              new_tok[32]   = {0};
+  char              gran_tok[16]  = {0};
   char              exch[32]      = {0};
   char              base[16]      = {0};
   char              quote[16]     = {0};
@@ -257,6 +259,7 @@ wm_dl_cmd_download_candles(const cmd_ctx_t *ctx)
   char              reply[256];
   char              err[128];
   int32_t           market_id;
+  int32_t           gran   = WM_DL_CANDLE_GRAN_S5;
   int64_t           job_id = 0;
 
   st = whenmoon_get_state();
@@ -273,12 +276,13 @@ wm_dl_cmd_download_candles(const cmd_ctx_t *ctx)
   {
     cmd_reply(ctx,
         "usage: /whenmoon download candles <exch>-<base>-<quote>"
-        " [MM/dd/yyyy [MM/dd/yyyy]]");
+        " [MM/dd/yyyy [MM/dd/yyyy [gran_secs]]]");
     return;
   }
 
   (void)wm_dl_next_token(&p, old_tok, sizeof(old_tok));
   (void)wm_dl_next_token(&p, new_tok, sizeof(new_tok));
+  (void)wm_dl_next_token(&p, gran_tok, sizeof(gran_tok));
 
   if(wm_dl_parse_market_id(pair, exch, sizeof(exch),
          base, sizeof(base), quote, sizeof(quote),
@@ -309,6 +313,22 @@ wm_dl_cmd_download_candles(const cmd_ctx_t *ctx)
     return;
   }
 
+  if(gran_tok[0] != '\0')
+  {
+    int64_t gran_parsed = (int64_t)strtoll(gran_tok, NULL, 10);
+
+    if(gran_parsed <= 0 || gran_parsed > INT32_MAX ||
+       !wm_dl_granularity_valid((int32_t)gran_parsed))
+    {
+      cmd_reply(ctx,
+          "invalid gran_secs;"
+          " must be 60, 300, 900, 3600, 21600, or 86400");
+      return;
+    }
+
+    gran = (int32_t)gran_parsed;
+  }
+
   market_id = wm_market_lookup_or_create(exch, base, quote, symbol);
 
   if(market_id < 0)
@@ -318,7 +338,7 @@ wm_dl_cmd_download_candles(const cmd_ctx_t *ctx)
   }
 
   if(wm_dl_job_enqueue(st, DL_JOB_CANDLES, market_id,
-         WM_DL_CANDLE_GRAN_S5,
+         gran,
          EXCHANGE_PRIO_USER_DOWNLOAD,
          exch, symbol,
          oldest_ts[0] != '\0' ? oldest_ts : NULL,
@@ -335,10 +355,69 @@ wm_dl_cmd_download_candles(const cmd_ctx_t *ctx)
   }
 
   snprintf(reply, sizeof(reply),
-      "candles job %" PRId64 " queued (%s gran=%d oldest=%s newest=%s)",
-      job_id, symbol, WM_DL_CANDLE_GRAN_S5,
+      "candles job %" PRId64 " queued (%s gran=%" PRId32
+      " oldest=%s newest=%s)",
+      job_id, symbol, gran,
       oldest_ts[0] != '\0' ? oldest_ts : "epoch",
       newest_ts[0] != '\0' ? newest_ts : "now");
+  cmd_reply(ctx, reply);
+}
+
+// ------------------------------------------------------------------ //
+// /whenmoon candles probe-depth <market>                              //
+// WM-CD-1 Phase 1: kick off the per-granularity bisection probe and   //
+// publish discovered max_lookback_days to KV.                          //
+// ------------------------------------------------------------------ //
+
+static void
+wm_cd_cmd_probe_depth(const cmd_ctx_t *ctx)
+{
+  whenmoon_state_t *st;
+  const char       *p;
+  char              pair[64]   = {0};
+  char              exch[32]   = {0};
+  char              base[16]   = {0};
+  char              quote[16]  = {0};
+  char              symbol[32] = {0};
+  char              reply[192];
+
+  st = whenmoon_get_state();
+
+  if(st == NULL || !st->dl_ready)
+  {
+    cmd_reply(ctx, "whenmoon: downloader not ready");
+    return;
+  }
+
+  p = ctx->args != NULL ? ctx->args : "";
+
+  if(!wm_dl_next_token(&p, pair, sizeof(pair)))
+  {
+    cmd_reply(ctx,
+        "usage: /whenmoon candles probe-depth"
+        " <exch>-<base>-<quote>");
+    return;
+  }
+
+  if(wm_dl_parse_market_id(pair, exch, sizeof(exch),
+         base, sizeof(base), quote, sizeof(quote),
+         symbol, sizeof(symbol)) != SUCCESS)
+  {
+    cmd_reply(ctx, "bad market id (expected <exch>-<base>-<quote>)");
+    return;
+  }
+
+  if(wm_cd_probe_run(symbol) != SUCCESS)
+  {
+    cmd_reply(ctx, "probe submit failed");
+    return;
+  }
+
+  snprintf(reply, sizeof(reply),
+      "probing %s depth on 6 granularities;"
+      " results land in plugin.whenmoon.candles.<gran>.max_lookback_days"
+      " (and the daemon log) within ~60s",
+      symbol);
   cmd_reply(ctx, reply);
 }
 
@@ -717,6 +796,13 @@ wm_dl_parent_download(const cmd_ctx_t *ctx)
 }
 
 static void
+wm_cd_parent_candles(const cmd_ctx_t *ctx)
+{
+  cmd_reply(ctx,
+      "usage: /whenmoon candles <probe-depth> ...");
+}
+
+static void
 wm_dl_parent_show_download(const cmd_ctx_t *ctx)
 {
   cmd_reply(ctx,
@@ -752,8 +838,10 @@ wm_dl_register_verbs(void)
 
   if(cmd_register("whenmoon", "candles",
         "whenmoon download candles <exch>-<base>-<quote>"
-        " [MM/dd/yyyy [MM/dd/yyyy]]",
-        "Enqueue a 1-minute candle backfill job.",
+        " [MM/dd/yyyy [MM/dd/yyyy [gran_secs]]]",
+        "Enqueue a candle backfill job. Optional gran_secs is one of"
+        " 60 (1m, default), 300 (5m), 900 (15m), 3600 (1h),"
+        " 21600 (6h), 86400 (1d).",
         NULL,
         USERNS_GROUP_ADMIN, 100, CMD_SCOPE_ANY, METHOD_T_ANY,
         wm_dl_cmd_download_candles, NULL, "whenmoon/download", NULL,
@@ -766,6 +854,27 @@ wm_dl_register_verbs(void)
         NULL,
         USERNS_GROUP_ADMIN, 100, CMD_SCOPE_ANY, METHOD_T_ANY,
         wm_dl_cmd_download_cancel, NULL, "whenmoon/download", NULL,
+        NULL, 0, NULL, NULL) != SUCCESS)
+    return(FAIL);
+
+  // /whenmoon candles parent + probe-depth leaf (WM-CD-1 Phase 1).
+  if(cmd_register("whenmoon", "candles",
+        "whenmoon candles <verb> ...",
+        "Candle-pipeline admin verbs (depth probe, future: bulk).",
+        NULL,
+        USERNS_GROUP_ADMIN, 100, CMD_SCOPE_ANY, METHOD_T_ANY,
+        wm_cd_parent_candles, NULL, "whenmoon", NULL,
+        NULL, 0, NULL, NULL) != SUCCESS)
+    return(FAIL);
+
+  if(cmd_register("whenmoon", "probe-depth",
+        "whenmoon candles probe-depth <exch>-<base>-<quote>",
+        "Probe Coinbase candle history depth per granularity."
+        " Results land in plugin.whenmoon.candles.<gran>"
+        ".max_lookback_days and the daemon log within ~60s.",
+        NULL,
+        USERNS_GROUP_ADMIN, 100, CMD_SCOPE_ANY, METHOD_T_ANY,
+        wm_cd_cmd_probe_depth, NULL, "whenmoon/candles", NULL,
         NULL, 0, NULL, NULL) != SUCCESS)
     return(FAIL);
 
