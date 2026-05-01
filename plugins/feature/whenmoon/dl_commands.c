@@ -17,6 +17,7 @@
 #include "cmd.h"
 #include "colors.h"
 #include "common.h"
+#include "kv.h"
 #include "userns.h"
 
 #include <ctype.h>
@@ -24,6 +25,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
 
 // Default admin-gap window when the user didn't provide one.
 #define WM_DL_DEFAULT_GAP_YEARS   5
@@ -241,6 +243,99 @@ wm_dl_cmd_download_trades(const cmd_ctx_t *ctx)
   cmd_reply(ctx, reply);
 }
 
+// WM-CD-1 Phase 2: `whenmoon download candles <market> max` sugar.
+// Reads each per-granularity max_lookback_days cap from KV (populated
+// by Phase 1 probe-depth) and fans out one DL_JOB_CANDLES per
+// granularity whose cap is non-zero, with oldest_ts = now - cap_days
+// and newest_ts = NULL (= now). Errors politely if no cap has been
+// probed yet.
+static const int32_t WM_CD_MAX_GRANS[] = {
+  60, 300, 900, 3600, 21600, 86400
+};
+#define WM_CD_MAX_GRAN_N \
+  ((int32_t)(sizeof(WM_CD_MAX_GRANS) / sizeof(WM_CD_MAX_GRANS[0])))
+
+static void
+wm_dl_cmd_download_candles_max(const cmd_ctx_t *ctx,
+    whenmoon_state_t *st,
+    const char *exch, const char *symbol, int32_t market_id)
+{
+  char    reply[256];
+  char    err[128];
+  char    key[80];
+  char    oldest_ts[40];
+  time_t  now;
+  int32_t i;
+  int32_t fanout = 0;
+  int32_t failed = 0;
+
+  now = time(NULL);
+
+  for(i = 0; i < WM_CD_MAX_GRAN_N; i++)
+  {
+    int32_t   gran = WM_CD_MAX_GRANS[i];
+    uint64_t  cap_days;
+    time_t    oldest;
+    struct tm tm;
+    int64_t   job_id = 0;
+
+    snprintf(key, sizeof(key),
+        "plugin.whenmoon.candles.%" PRId32 ".max_lookback_days", gran);
+
+    cap_days = kv_get_uint(key);
+
+    if(cap_days == 0)
+      continue;
+
+    oldest = now - (time_t)cap_days * 86400;
+
+    if(gmtime_r(&oldest, &tm) == NULL)
+    {
+      failed++;
+      continue;
+    }
+
+    snprintf(oldest_ts, sizeof(oldest_ts),
+        "%04d-%02d-%02d %02d:%02d:%02d+00",
+        tm.tm_year + 1900, tm.tm_mon + 1, tm.tm_mday,
+        tm.tm_hour, tm.tm_min, tm.tm_sec);
+
+    err[0] = '\0';
+
+    if(wm_dl_job_enqueue(st, DL_JOB_CANDLES, market_id, gran,
+           EXCHANGE_PRIO_USER_DOWNLOAD,
+           exch, symbol, oldest_ts, NULL,
+           ctx->username != NULL ? ctx->username : "",
+           &job_id, err, sizeof(err)) != SUCCESS)
+    {
+      snprintf(reply, sizeof(reply),
+          "gran=%" PRId32 " enqueue failed: %s", gran,
+          err[0] != '\0' ? err : "unknown");
+      cmd_reply(ctx, reply);
+      failed++;
+      continue;
+    }
+
+    snprintf(reply, sizeof(reply),
+        "candles job %" PRId64 " queued (%s gran=%" PRId32
+        " oldest=%s newest=now cap=%" PRIu64 "d)",
+        job_id, symbol, gran, oldest_ts, cap_days);
+    cmd_reply(ctx, reply);
+    fanout++;
+  }
+
+  if(fanout == 0 && failed == 0)
+    cmd_reply(ctx,
+        "no probed depth caps yet;"
+        " run /whenmoon candles probe-depth <market> first");
+  else
+  {
+    snprintf(reply, sizeof(reply),
+        "%" PRId32 " job(s) queued, %" PRId32 " failed", fanout, failed);
+    cmd_reply(ctx, reply);
+  }
+}
+
 static void
 wm_dl_cmd_download_candles(const cmd_ctx_t *ctx)
 {
@@ -276,7 +371,7 @@ wm_dl_cmd_download_candles(const cmd_ctx_t *ctx)
   {
     cmd_reply(ctx,
         "usage: /whenmoon download candles <exch>-<base>-<quote>"
-        " [MM/dd/yyyy [MM/dd/yyyy [gran_secs]]]");
+        " [MM/dd/yyyy [MM/dd/yyyy [gran_secs]] | max]");
     return;
   }
 
@@ -289,6 +384,22 @@ wm_dl_cmd_download_candles(const cmd_ctx_t *ctx)
          symbol, sizeof(symbol)) != SUCCESS)
   {
     cmd_reply(ctx, "bad market id (expected <exch>-<base>-<quote>)");
+    return;
+  }
+
+  // WM-CD-1 Phase 2: `max` sugar. Resolve market then fan out across
+  // every granularity that has a probed cap.
+  if(strcmp(old_tok, "max") == 0)
+  {
+    market_id = wm_market_lookup_or_create(exch, base, quote, symbol);
+
+    if(market_id < 0)
+    {
+      cmd_reply(ctx, "market lookup/create failed");
+      return;
+    }
+
+    wm_dl_cmd_download_candles_max(ctx, st, exch, symbol, market_id);
     return;
   }
 
@@ -838,10 +949,12 @@ wm_dl_register_verbs(void)
 
   if(cmd_register("whenmoon", "candles",
         "whenmoon download candles <exch>-<base>-<quote>"
-        " [MM/dd/yyyy [MM/dd/yyyy [gran_secs]]]",
+        " [MM/dd/yyyy [MM/dd/yyyy [gran_secs]] | max]",
         "Enqueue a candle backfill job. Optional gran_secs is one of"
         " 60 (1m, default), 300 (5m), 900 (15m), 3600 (1h),"
-        " 21600 (6h), 86400 (1d).",
+        " 21600 (6h), 86400 (1d). `max` fans out one job per"
+        " granularity using the probed depth caps from"
+        " /whenmoon candles probe-depth.",
         NULL,
         USERNS_GROUP_ADMIN, 100, CMD_SCOPE_ANY, METHOD_T_ANY,
         wm_dl_cmd_download_candles, NULL, "whenmoon/download", NULL,
