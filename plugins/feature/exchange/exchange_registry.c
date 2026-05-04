@@ -179,6 +179,15 @@ exchange_unregister(const char *name)
   e->q_head = NULL;
   e->q_count = 0;
 
+  {
+    task_handle_t h = e->pump_handle;
+
+    e->pump_handle = TASK_HANDLE_NONE;
+
+    if(h != TASK_HANDLE_NONE)
+      task_cancel(h);
+  }
+
   pthread_mutex_unlock(&e->lock);
 
   // Fail every queued request off-lock so user callbacks can take other

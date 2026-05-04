@@ -39,6 +39,16 @@
 // matches the legacy whenmoon default of 8 rps.
 #define EXCHANGE_RPS_HEADROOM        2
 
+// Stall-pump delay: when exchange_dispatch leaves a non-empty queue
+// because the bucket is dry, schedule a deferred re-dispatch this many
+// ms in the future so queued requests drain even if no completion fires
+// (the chain otherwise stays parked until a new submit or completion
+// triggers exchange_dispatch — which may be ~minutes when the
+// downloader saturated the burst in one kick round and is then waiting
+// on the supervisor's stall release). task_add_deferred clamps to a
+// 1 s minimum, so anything <= 1000 here is equivalent.
+#define EXCHANGE_PUMP_DELAY_MS    1000
+
 // Internal forward decls.
 typedef struct exchange_req       exchange_req_t;
 typedef struct exchange_limiter   exchange_limiter_t;
@@ -126,6 +136,12 @@ struct exchange
   // fail and pending requests to fan out as failures on
   // exchange_unregister().
   bool                              dead;
+
+  // Stall-pump task handle. Non-zero when a deferred re-dispatch is
+  // armed for the moment the bucket refills. Set under e->lock; cleared
+  // under e->lock from the pump callback (or by exchange_unregister
+  // during teardown). Read/written only under e->lock.
+  task_handle_t                     pump_handle;
 
   exchange_t                       *next;   // registry list
 };

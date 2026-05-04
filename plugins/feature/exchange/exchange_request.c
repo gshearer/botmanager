@@ -207,6 +207,60 @@ exchange_q_pop_eligible_locked(exchange_t *exch)
 }
 
 // ------------------------------------------------------------------ //
+// Stall pump                                                          //
+// ------------------------------------------------------------------ //
+//
+// When exchange_dispatch finishes with a non-empty queue because no
+// request could take a token, no future event is guaranteed to wake the
+// queue — completions only fire while requests are at the protocol
+// transport, and all of those just completed. Without a pump, the
+// queue parks until a new submit (or an unrelated completion) calls
+// exchange_dispatch again. Symptom: the whenmoon downloader saturates
+// the burst on the supervisor stall release, then the next page only
+// fires ~60 s later when the supervisor stalls again. (See WM-CD-2.)
+//
+// Fix: schedule a deferred dispatch ~1 s out whenever pop_eligible
+// returns NULL with q_count > 0. `pump_handle` is the bookkeeping that
+// keeps us from piling up duplicate timers — at most one outstanding
+// per exchange. The cb clears the handle then re-enters dispatch, which
+// is safe even if something else (a fresh enqueue or a completion)
+// already drained the queue in the meantime.
+
+static void
+exchange_pump_cb(task_t *t)
+{
+  exchange_t *exch = t->data;
+
+  t->state = TASK_ENDED;
+
+  if(exch == NULL)
+    return;
+
+  pthread_mutex_lock(&exch->lock);
+  exch->pump_handle = TASK_HANDLE_NONE;
+  pthread_mutex_unlock(&exch->lock);
+
+  if(exch->dead)
+    return;
+
+  exchange_dispatch(exch);
+}
+
+// Arm the stall-pump if not already armed. Caller must hold exch->lock.
+static void
+exchange_arm_pump_locked(exchange_t *exch)
+{
+  if(exch == NULL || exch->dead)
+    return;
+
+  if(exch->pump_handle != TASK_HANDLE_NONE)
+    return;
+
+  exch->pump_handle = task_add_deferred("exchange_pump", TASK_ANY, 120,
+      EXCHANGE_PUMP_DELAY_MS, exchange_pump_cb, exch);
+}
+
+// ------------------------------------------------------------------ //
 // Retry path                                                          //
 // ------------------------------------------------------------------ //
 
@@ -363,6 +417,14 @@ exchange_dispatch(exchange_t *exch)
 
   pthread_mutex_lock(&exch->lock);
   r = exchange_q_pop_eligible_locked(exch);
+
+  // Pop returned NULL with a non-empty queue: tokens are dry, no
+  // request could be promoted. Arm the stall pump so we re-enter
+  // dispatch once the bucket has had time to refill — see the long
+  // comment above exchange_pump_cb. Cheap when armed; idempotent.
+  if(r == NULL && exch->q_count > 0)
+    exchange_arm_pump_locked(exch);
+
   pthread_mutex_unlock(&exch->lock);
 
   if(r == NULL)
