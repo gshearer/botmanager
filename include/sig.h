@@ -11,6 +11,15 @@ void sig_exit(void);
 
 bool sig_shutdown_requested(void);
 
+// Request shutdown programmatically (e.g. /quit). Has the same effect
+// on pool_run_parent as catching SIGTERM, so main.c's shutdown sequence
+// runs in order — critically, curl_begin_shutdown() executes while the
+// multi-loop thread is still alive and can run the drain. Calling
+// pool_shutdown() directly from outside main.c races the curl drain
+// (the multi loop exits on pool_shutting_down() before the drain
+// trigger arrives) and wedges shutdown for ~11s.
+void sig_request_shutdown(void);
+
 // The signal number that triggered shutdown, or 0 if none.
 int sig_caught(void);
 
@@ -62,6 +71,14 @@ static const int shutdown_signals[] = { SIGTERM, SIGINT, SIGHUP, 0 };
 static const int fatal_signals[] = { SIGQUIT, SIGILL, SIGBUS, SIGFPE, SIGSEGV, 0 };
 
 static volatile sig_atomic_t shutdown_signal = 0;
+
+// Set by sig_request_shutdown() — programmatic shutdown requests
+// (e.g. /quit). Read by pool_run_parent via sig_shutdown_requested().
+// Volatile because it's written on a worker thread and read on the
+// parent thread without taking a lock; task_wake_all() in
+// sig_request_shutdown() provides the ordering guarantee.
+static volatile bool internal_shutdown = false;
+
 static bool sig_active = false;
 
 #endif // SIG_INTERNAL

@@ -4,6 +4,7 @@
 #define BOT_CMD_INTERNAL
 #include "bot.h"
 #include "cmd.h"
+#include "sig.h"
 
 // Resolve a bot by name from argv[0]. Emits an error reply and returns
 // NULL when not found. Every bot-scoped subcommand takes an explicit
@@ -949,12 +950,18 @@ cmd_show_bot(const cmd_ctx_t *ctx)
 // Both apply to every method binding. No dedicated commands -- all
 // configuration lives in /set kv / /show kv.
 
-// /quit — graceful shutdown
+// /quit — graceful shutdown. Routes through sig_request_shutdown() so
+// pool_run_parent exits the same way as on SIGTERM and main.c's
+// shutdown sequence runs in order. Calling pool_shutdown() here
+// instead would set pool_stopping immediately, the curl multi loop
+// would exit on pool_shutting_down() before main reached
+// curl_begin_shutdown(), and the drain wait would stall ~11s waiting
+// on a thread that already left.
 static void
 admin_cmd_quit(const cmd_ctx_t *ctx)
 {
   cmd_reply(ctx, "operator requested shutdown");
-  pool_shutdown();
+  sig_request_shutdown();
 }
 
 // NL hints

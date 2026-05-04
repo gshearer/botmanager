@@ -2,6 +2,7 @@
 // Signal-handler installation and async-safe dispatch to the main loop.
 #define SIG_INTERNAL
 #include "sig.h"
+#include "task.h"
 
 // Async-signal-safe handler for SIGTERM/SIGINT/SIGHUP: record signal.
 // signum: the signal number received
@@ -69,13 +70,24 @@ sig_name(int signum)
 bool
 sig_shutdown_requested(void)
 {
-  return(shutdown_signal != 0);
+  return(shutdown_signal != 0 || internal_shutdown);
 }
 
 int
 sig_caught(void)
 {
   return((int)shutdown_signal);
+}
+
+void
+sig_request_shutdown(void)
+{
+  internal_shutdown = true;
+
+  // Wake the parent loop (which is sleeping in task_wait) so it
+  // notices the flag immediately instead of waiting up to wait_ms.
+  // Mirrors what pool_shutdown() does for its own flag.
+  task_wake_all();
 }
 
 void
@@ -92,8 +104,9 @@ sig_init(void)
   // SIGPIPE is ignored — essential for socket I/O.
   install_handler(SIGPIPE, SIG_IGN);
 
-  sig_active = true;
-  shutdown_signal = 0;
+  sig_active        = true;
+  shutdown_signal   = 0;
+  internal_shutdown = false;
 
   clam(CLAM_INFO, "sig_init", "signal handling initialized");
 }
