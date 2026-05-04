@@ -181,10 +181,15 @@ typedef enum
 // valid for the duration of the callback. Consumers that need to keep
 // it must copy. Variant selected by `channel`.
 //
-// `gap` is true when the channel multiplexer detected a break in the
-// per-(channel, product) `sequence` monotonic order. Consumers that
-// care about exact state (e.g. a level2 order book) should snapshot-
-// refresh when this flips; price-only consumers can ignore it.
+// `gap` is reserved for future use and currently always false.
+// Coinbase's `sequence` is per-product-global (advances on every event
+// for the product across all channels), so per-(channel, product) gap
+// detection produces false positives on any partial subscription. True
+// integrity tracking requires a `full` subscription and per-product
+// (not per-channel) bookkeeping; we don't subscribe to `full` for
+// trading. The field is kept for ABI stability so consumers that
+// currently read it continue to compile and behave correctly (no gaps
+// reported = no spurious order-book snapshot refreshes).
 typedef struct
 {
   coinbase_ws_channel_t channel;
@@ -366,8 +371,8 @@ bool coinbase_apikey_configured(void);
 // exchange-vtable registration at plugin init; freshstart is required
 // to switch environments. Cross-plugin callers (whenmoon) use this to
 // qualify per-environment data such as wm_market.exchange so sandbox
-// and prod rows occupy distinct registry slots and distinct
-// wm_trades_<id> tables.
+// and prod rows occupy distinct registry slots and distinct per-pair
+// candle tables.
 bool coinbase_sandbox_active(void);
 
 // Refresh the in-memory product list from GET /products. On success

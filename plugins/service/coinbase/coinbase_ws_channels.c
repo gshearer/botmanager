@@ -10,8 +10,18 @@
 //
 // Parses each inbound text frame into a typed event and fans it out
 // to every local subscriber whose channel + product set matches.
-// Sequence gaps on ticker / matches / heartbeat are detected per
-// (channel, product) and surface via `coinbase_ws_event_t.gap`.
+//
+// Sequence gap detection is intentionally not performed. Coinbase's
+// `sequence` field is per-product-global — every event for a product
+// across every channel increments it — so any consumer subscribed to
+// a strict subset (e.g. heartbeat + ticker without matches/level2)
+// will observe huge "gaps" on every unsubscribed-channel event. Doing
+// per-(channel, product) gap detection produces a flood of false
+// positives at production volumes (hundreds/sec on a busy pair).
+// True per-message integrity needs a `full` subscription and per-
+// product (not per-channel) tracking; we don't subscribe to `full`
+// for trading, so the check is skipped. The `coinbase_ws_event_t.gap`
+// field is preserved as an ABI placeholder and remains false.
 
 #define CB_INTERNAL
 #include "coinbase.h"
@@ -63,7 +73,6 @@ typedef struct
   coinbase_ws_channel_t channel;
   char                  product_id[COINBASE_PRODUCT_ID_SZ];
   uint32_t              refcount;
-  int64_t               last_sequence;
   bool                  sent_upstream;
 } cb_ws_slot_t;
 
@@ -505,44 +514,6 @@ cb_ws_fanout_locked(const coinbase_ws_event_t *ev)
   }
 }
 
-// Update the per-(channel, product) sequence tracker. Sets *gap_out
-// when a gap was observed (new sequence > last+1) AND we had a prior
-// sequence to compare against. Missing or zero sequence is a no-op.
-static void
-cb_ws_check_sequence_locked(coinbase_ws_channel_t ch,
-    const char *product_id, int64_t seq, bool *gap_out)
-{
-  cb_ws_slot_t *s;
-  int32_t       idx;
-
-  *gap_out = false;
-
-  if(seq <= 0) return;
-
-  idx = cb_ws_slot_find_locked(ch, product_id);
-
-  if(idx < 0)
-  {
-    // No local subscriber — still track under a transient slot? No; if
-    // nobody subscribed, the event will be dropped in fanout anyway.
-    return;
-  }
-
-  s = &cb_ws_ch.slots[idx];
-
-  if(s->last_sequence != 0 && seq > s->last_sequence + 1)
-  {
-    clam(CLAM_WARN, CB_CTX,
-        "ws sequence gap ch=%s product=%s prev=%" PRId64 " now=%" PRId64
-        " (skipped=%" PRId64 ")",
-        cb_ws_channel_name(ch), product_id,
-        s->last_sequence, seq, seq - s->last_sequence - 1);
-    *gap_out = true;
-  }
-
-  s->last_sequence = seq;
-}
-
 // --- per-channel parsers ---
 
 static void
@@ -551,8 +522,6 @@ cb_ws_dispatch_heartbeat_locked(struct json_object *root)
   coinbase_ws_heartbeat_t hb = {0};
   coinbase_ws_event_t     ev = {0};
   char                    time_str[40];
-  int64_t                 seq = 0;
-  bool                    gap = false;
 
   json_get_str   (root, "product_id", hb.product_id, sizeof(hb.product_id));
   json_get_int64 (root, "sequence",     &hb.sequence);
@@ -561,14 +530,10 @@ cb_ws_dispatch_heartbeat_locked(struct json_object *root)
   if(json_get_str(root, "time", time_str, sizeof(time_str)))
     hb.time_ms = cb_ws_parse_iso8601_ms(time_str);
 
-  seq = hb.sequence;
-  cb_ws_check_sequence_locked(COINBASE_CH_HEARTBEAT,
-      hb.product_id, seq, &gap);
-
   ev.channel    = COINBASE_CH_HEARTBEAT;
   ev.product_id = hb.product_id[0] ? hb.product_id : NULL;
-  ev.sequence   = seq;
-  ev.gap        = gap;
+  ev.sequence   = hb.sequence;
+  ev.gap        = false;
   ev.payload    = &hb;
 
   cb_ws_fanout_locked(&ev);
@@ -582,7 +547,6 @@ cb_ws_dispatch_ticker_locked(struct json_object *root,
   coinbase_ws_event_t   ev = {0};
   char                  time_str[40];
   char                  num[32];
-  bool                  gap = false;
 
   json_get_str(root, "product_id", t.product_id, sizeof(t.product_id));
   json_get_int64(root, "sequence",  &t.sequence);
@@ -597,12 +561,10 @@ cb_ws_dispatch_ticker_locked(struct json_object *root,
   if(json_get_str(root, "time", time_str, sizeof(time_str)))
     t.time_ms = cb_ws_parse_iso8601_ms(time_str);
 
-  cb_ws_check_sequence_locked(ch, t.product_id, t.sequence, &gap);
-
   ev.channel    = ch;
   ev.product_id = t.product_id[0] ? t.product_id : NULL;
   ev.sequence   = t.sequence;
-  ev.gap        = gap;
+  ev.gap        = false;
   ev.payload    = &t;
 
   cb_ws_fanout_locked(&ev);
@@ -615,7 +577,6 @@ cb_ws_dispatch_match_locked(struct json_object *root)
   coinbase_ws_event_t  ev = {0};
   char                 time_str[40];
   char                 num[32];
-  bool                 gap = false;
 
   json_get_str  (root, "product_id", m.product_id, sizeof(m.product_id));
   json_get_str  (root, "side",       m.side,       sizeof(m.side));
@@ -628,13 +589,10 @@ cb_ws_dispatch_match_locked(struct json_object *root)
   if(json_get_str(root, "time", time_str, sizeof(time_str)))
     m.time_ms = cb_ws_parse_iso8601_ms(time_str);
 
-  cb_ws_check_sequence_locked(COINBASE_CH_MATCHES,
-      m.product_id, m.sequence, &gap);
-
   ev.channel    = COINBASE_CH_MATCHES;
   ev.product_id = m.product_id[0] ? m.product_id : NULL;
   ev.sequence   = m.sequence;
-  ev.gap        = gap;
+  ev.gap        = false;
   ev.payload    = &m;
 
   cb_ws_fanout_locked(&ev);
