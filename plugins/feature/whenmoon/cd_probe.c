@@ -55,7 +55,10 @@ cd_probe_publish(const cd_probe_state_t *s)
       "plugin.whenmoon.candles.%" PRId32 ".max_lookback_days",
       s->gran);
 
-  if(kv_set_uint(key, (uint64_t)s->lo_days) != true)
+  // SUCCESS/FAIL convention is inverted (SUCCESS=false): test against
+  // SUCCESS, not `true`. The earlier `!= true` check fired the WARN on
+  // every successful set.
+  if(kv_set_uint(key, (uint64_t)s->lo_days) != SUCCESS)
     clam(CLAM_WARN, WM_DL_CTX,
         "cd_probe: kv_set_uint failed for %s val=%" PRId32,
         key, s->lo_days);
@@ -73,7 +76,19 @@ cd_probe_done(const coinbase_candles_result_t *res, void *user)
   bool              reachable;
 
   if(s == NULL)
+  {
+    clam(CLAM_WARN, WM_DL_CTX,
+        "cd_probe: done user=NULL res=%p", (const void *)res);
     return;
+  }
+
+  clam(CLAM_DEBUG, WM_DL_CTX,
+      "cd_probe: done gran=%" PRId32 "s symbol=%s iter=%" PRId32
+      " res=%s err='%s' count=%u",
+      s->gran, s->symbol, s->iter,
+      res == NULL ? "NULL" : "ok",
+      res == NULL ? "" : res->err,
+      res == NULL ? 0u : res->count);
 
   if(res == NULL)
   {
@@ -92,9 +107,6 @@ cd_probe_done(const coinbase_candles_result_t *res, void *user)
     // 400, which is exactly the signal we are bisecting on. Continue
     // the bisection so we still narrow the cap even if the deepest
     // probe returns an error rather than an empty body.
-    clam(CLAM_DEBUG, WM_DL_CTX,
-        "cd_probe: gran=%" PRId32 "s mid=%" PRId32 " err=%s",
-        s->gran, s->mid_days, res->err);
     reachable = false;
   }
   else
@@ -145,12 +157,24 @@ cd_probe_fire(cd_probe_state_t *s)
   if(start_s < 0)
     start_s = 0;
 
+  clam(CLAM_DEBUG, WM_DL_CTX,
+      "cd_probe: fire gran=%" PRId32 "s symbol=%s iter=%" PRId32
+      " lo=%" PRId32 " hi=%" PRId32 " mid=%" PRId32
+      " start=%" PRId64 " end=%" PRId64,
+      s->gran, s->symbol, s->iter,
+      s->lo_days, s->hi_days, s->mid_days, start_s, end_s);
+
   if(end_s <= start_s)
   {
     // Probe window collapsed (mid pushed end_s back past epoch+window).
     // Treat as unreachable; advance the bisection rather than firing.
     s->hi_days = s->mid_days;
     s->iter++;
+
+    clam(CLAM_INFO, WM_DL_CTX,
+        "cd_probe: window collapsed; gran=%" PRId32 "s iter=%" PRId32
+        " lo=%" PRId32 " hi=%" PRId32,
+        s->gran, s->iter, s->lo_days, s->hi_days);
 
     if(s->hi_days - s->lo_days <= 1 || s->iter >= CD_PROBE_MAX_ITERS)
     {
@@ -173,6 +197,10 @@ cd_probe_fire(cd_probe_state_t *s)
     // The shim contract: on submit failure the completion callback
     // fires synchronously with res->err set, so ownership has already
     // transferred. Do NOT free here.
+    clam(CLAM_INFO, WM_DL_CTX,
+        "cd_probe: submit returned FAIL; gran=%" PRId32 "s iter=%"
+        PRId32 " (cd_probe_done is firing synchronously per shim contract)",
+        s->gran, s->iter);
   }
 }
 
@@ -205,6 +233,10 @@ wm_cd_probe_run(const char *symbol)
     s->hi_days  = CD_PROBE_MAX_DAYS;
     s->mid_days = 0;
     s->iter     = 0;
+
+    clam(CLAM_DEBUG, WM_DL_CTX,
+        "cd_probe: launching gran=%" PRId32 "s symbol=%s",
+        s->gran, s->symbol);
 
     fired++;
     cd_probe_fire(s);
