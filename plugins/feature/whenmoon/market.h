@@ -49,7 +49,6 @@
 #define WM_PRODUCT_ID_SZ         16
 
 // Forward decls — opaque to strategy plugins.
-struct wm_trade_persist;
 struct wm_aggregator;
 struct coinbase_ws_sub;
 
@@ -85,10 +84,6 @@ typedef struct whenmoon_market
   // NULL until wm_aggregator_init runs in wm_market_add; teardown via
   // wm_aggregator_destroy in wm_market_remove / wm_market_destroy.
   struct wm_aggregator *aggregator;
-
-  // Buffered trade-persist ring. Allocated by wm_trade_persist_init
-  // from wm_market_add; freed by wm_trade_persist_destroy.
-  struct wm_trade_persist *trade_persist;
 
   // Last observed ticker price (0.0 until the first ticker event
   // lands). last_tick_ms is the event timestamp coinbase_ws_ticker_t

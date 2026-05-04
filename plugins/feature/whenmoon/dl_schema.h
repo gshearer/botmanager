@@ -16,10 +16,10 @@
 
 #define WM_DL_CTX         "whenmoon.dl"
 
-// Buffer size for per-pair table names. The widest name we render is
-// "wm_candles_<int32_t>_<int32_t>" where both int32_ts max out at 10
-// decimal digits: 11 ("wm_candles_") + 10 + 1 ("_") + 10 + NUL = 33.
-// 40 gives us comfortable slack and aligns nicely.
+// Buffer size for per-pair candle table names. The widest name we
+// render is "wm_candles_<int32_t>_<int32_t>" where both int32_ts max
+// out at 10 decimal digits: 11 ("wm_candles_") + 10 + 1 ("_") + 10 +
+// NUL = 33. 40 gives us comfortable slack and aligns nicely.
 #define WM_DL_TABLE_SZ    40
 
 struct whenmoon_state;
@@ -45,26 +45,24 @@ void wm_dl_destroy(struct whenmoon_state *st);
 //
 // WM-DC-1: when `exchange == "coinbase"` and coinbase_sandbox_active()
 // is true, the resolver stores `wm_market.exchange = "coinbase-sb"`
-// so sandbox markets occupy a distinct registry slot (and therefore a
-// distinct wm_trades_<id> table) from prod. Already-qualified inputs
-// ("coinbase-sb") pass through unchanged so wm_market_restore can
-// re-add rows without double-suffixing.
+// so sandbox markets occupy a distinct registry slot (and therefore
+// distinct wm_candles_<id>_<gran> tables) from prod. Already-
+// qualified inputs ("coinbase-sb") pass through unchanged so
+// wm_market_restore can re-add rows without double-suffixing.
 int32_t wm_market_lookup_or_create(const char *exchange,
     const char *base_asset, const char *quote_asset,
     const char *exchange_symbol);
 
-// Table-name rendering. Writes "wm_trades_<id>" / "wm_candles_<id>_<g>"
-// into `out`. Returns SUCCESS on success, FAIL when `out`/`cap` cannot
+// Candle table-name rendering. Writes "wm_candles_<id>_<gran>" into
+// `out`. Returns SUCCESS on success, FAIL when `out`/`cap` cannot
 // hold the result or `market_id` / `gran_secs` are negative.
-bool wm_trade_table_name(int32_t market_id, char *out, size_t cap);
 bool wm_candle_table_name(int32_t market_id, int32_t gran_secs,
     char *out, size_t cap);
 
-// Lazy per-pair DDL. Idempotent (CREATE TABLE IF NOT EXISTS + CREATE
-// INDEX IF NOT EXISTS); safe to call on every page insert. Callers
-// SHOULD cache the "ensured" bit per-job to avoid hammering Postgres
-// with redundant DDL runs in the hot path.
-bool wm_trade_table_ensure(int32_t market_id);
+// Lazy per-pair DDL. Idempotent (CREATE TABLE IF NOT EXISTS); safe
+// to call on every page insert. Callers SHOULD cache the "ensured"
+// bit per-job to avoid hammering Postgres with redundant DDL runs in
+// the hot path.
 bool wm_candle_table_ensure(int32_t market_id, int32_t gran_secs);
 
 #endif // WHENMOON_INTERNAL

@@ -139,9 +139,9 @@ wm_dl_candles_dispatch_one(dl_jobtable_t *t, dl_job_t *j)
     start_s = 0;
 
   // Ensure the per-pair candle table exists before the first page.
-  // Mirrors wm_dl_trades_dispatch_one's pattern: synchronous DDL on
-  // the dispatch thread, idempotent (CREATE TABLE IF NOT EXISTS), then
-  // flip the cached marker so subsequent pages skip the round-trip.
+  // Synchronous DDL on the dispatch thread, idempotent (CREATE TABLE
+  // IF NOT EXISTS); flip the cached marker so subsequent pages skip
+  // the round-trip.
   if(!j->candle_table_ensured)
   {
     if(wm_candle_table_ensure(j->market_id, gran) != SUCCESS)
@@ -343,8 +343,8 @@ wm_dl_candles_on_page(const coinbase_candles_result_t *res, void *user)
 
   if(bail)
   {
-    // Mirror wm_dl_trades_on_page's drain-safe release: decrement the
-    // jobtable-wide counter even if the job vanished from the list.
+    // Drain-safe release: decrement the jobtable-wide counter even if
+    // the job vanished from the list.
     if(j != NULL)
       wm_dl_job_clear_in_flight(t, j);
 
@@ -407,8 +407,7 @@ wm_dl_candles_on_page(const coinbase_candles_result_t *res, void *user)
     iv.granularity = gran;
     wm_dl_s_to_tstz(ctx->window_start_s, iv.first_ts, sizeof(iv.first_ts));
     wm_dl_s_to_tstz(ctx->window_end_s,   iv.last_ts,  sizeof(iv.last_ts));
-    snprintf(iv.source, sizeof(iv.source), "api");
-    wm_coverage_add(WM_COV_CANDLES, &iv);
+    wm_coverage_add(&iv);
   }
 
   oldest_requested_s = oldest_bound[0] != '\0'

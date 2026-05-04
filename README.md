@@ -153,9 +153,9 @@ It owns:
 - **Multi-grain candle aggregation** — 1m → 5m → 15m → 1h → 6h → 1d
   fanned out by a single aggregator from a single 1m source.
 - **A history downloader** — pre-flight gap detection over
-  `wm_trades_*` and `wm_candles_*`, resume on partial completion,
-  per-page row commit, and a runtime depth probe that bisects
-  Coinbase's per-granularity history caps and caches them in KV.
+  `wm_candles_*`, resume on partial completion, per-page row commit,
+  and a runtime depth probe that bisects Coinbase's per-granularity
+  history caps and caches them in KV.
 - **A strategy registry** — loadable `PLUGIN_STRATEGY` plugins
   discovered via `plugin_find_type(PLUGIN_STRATEGY, ...)`. Each
   strategy declares its parameters; whenmoon registers them under

@@ -4,6 +4,7 @@
 #define WHENMOON_INTERNAL
 #include "whenmoon.h"
 #include "backtest.h"
+#include "book_persist.h"
 #include "market.h"
 #include "account.h"
 #include "dl_schema.h"
@@ -13,7 +14,6 @@
 #include "order.h"
 #include "strategy.h"
 #include "sweep.h"
-#include "trade_persist.h"
 
 #include "cmd.h"
 #include "colors.h"
@@ -231,7 +231,7 @@ whenmoon_root_cb(const cmd_ctx_t *ctx)
 {
   cmd_reply(ctx,
       "usage: /whenmoon <market|download|strategy|trade|backtest> ..."
-      " (market start|stop, download trades|candles|cancel,"
+      " (market start|stop, download candles|cancel,"
       " strategy attach|detach|reload, trade mode|reset,"
       " backtest run)");
 }
@@ -242,7 +242,7 @@ whenmoon_show_root_cb(const cmd_ctx_t *ctx)
   cmd_reply(ctx,
       "usage: /show whenmoon"
       " <markets|balances|indicators|download|strategy|trade|backtest>"
-      " ... (download has subverbs: status, gaps, candles)");
+      " ... (download has subverbs: status, candles)");
 }
 
 // ------------------------------------------------------------------ //
@@ -337,9 +337,9 @@ whenmoon_init(void)
     return(FAIL);
   }
 
-  if(wm_trade_persist_global_init() != SUCCESS)
+  if(wm_book_persist_global_init() != SUCCESS)
   {
-    clam(CLAM_INFO, WHENMOON_CTX, "trade-persist global init failed");
+    clam(CLAM_INFO, WHENMOON_CTX, "book-persist global init failed");
     TA_Shutdown();
     return(FAIL);
   }
@@ -348,7 +348,7 @@ whenmoon_init(void)
 
   if(st == NULL)
   {
-    wm_trade_persist_global_destroy();
+    wm_book_persist_global_destroy();
     TA_Shutdown();
     return(FAIL);
   }
@@ -464,7 +464,7 @@ fail:
   whenmoon_subsystems_destroy(st);
   whenmoon_state = NULL;
   mem_free(st);
-  wm_trade_persist_global_destroy();
+  wm_book_persist_global_destroy();
   TA_Shutdown();
   return(FAIL);
 }
@@ -500,7 +500,7 @@ whenmoon_deinit(void)
     mem_free(st);
   }
 
-  wm_trade_persist_global_destroy();
+  wm_book_persist_global_destroy();
   TA_Shutdown();
   clam(CLAM_INFO, WHENMOON_CTX, "whenmoon plugin deinitialized");
 }

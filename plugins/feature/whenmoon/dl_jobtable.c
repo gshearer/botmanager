@@ -14,7 +14,6 @@
 #include "dl_jobtable.h"
 #include "dl_schema.h"
 #include "dl_supervisor.h"
-#include "dl_trades.h"
 #include "dl_candles.h"
 #include "dl_coverage.h"
 
@@ -24,7 +23,6 @@
 #include "db.h"
 #include "kv.h"
 #include "pool.h"
-#include "task.h"
 
 #include <inttypes.h>
 #include <pthread.h>
@@ -38,12 +36,10 @@
 // ------------------------------------------------------------------ //
 
 static bool wm_dl_load_jobs(dl_jobtable_t *t);
-static bool wm_dl_insert_job(dl_job_kind_t kind,
-    int32_t market_id, int32_t granularity, const char *oldest_ts,
-    const char *newest_ts, const char *requested_by, int64_t *out_id);
+static bool wm_dl_insert_job(int32_t market_id, int32_t granularity,
+    const char *oldest_ts, const char *newest_ts,
+    const char *requested_by, int64_t *out_id);
 static void wm_dl_job_list_append_locked(dl_jobtable_t *t, dl_job_t *j);
-static bool wm_dl_has_running_trades_for_market_locked(dl_jobtable_t *t,
-    int32_t market_id);
 static const char *wm_dl_state_str(dl_job_state_t s);
 static dl_job_state_t wm_dl_state_from_str(const char *s);
 static void wm_dl_free_job_list(dl_job_t *head);
@@ -252,22 +248,9 @@ wm_dl_kick(dl_jobtable_t *t)
       return;
 
     // Dispatch off-lock. The async REST submit's completion callback
-    // (wm_dl_trades_on_page / wm_dl_candles_on_page) will clear
-    // in_flight, commit rows, and re-enter wm_dl_kick to fire the
-    // next page in the chain.
-    if(j->kind == DL_JOB_TRADES)
-      submitted = (wm_dl_trades_dispatch_one(t, j) == SUCCESS);
-
-    else if(j->kind == DL_JOB_CANDLES)
-      submitted = (wm_dl_candles_dispatch_one(t, j) == SUCCESS);
-
-    else
-    {
-      clam(CLAM_WARN, WM_DL_CTX,
-          "kick: unknown job kind %d for job %" PRId64,
-          (int)j->kind, j->id);
-      submitted = false;
-    }
+    // (wm_dl_candles_on_page) will clear in_flight, commit rows, and
+    // re-enter wm_dl_kick to fire the next page in the chain.
+    submitted = (wm_dl_candles_dispatch_one(t, j) == SUCCESS);
 
     if(!submitted)
     {
@@ -332,6 +315,10 @@ wm_dl_load_jobs(dl_jobtable_t *t)
   if(res == NULL)
     goto out;
 
+  // Trade-tape downloads were retired alongside the per-pair trade
+  // tables; legacy rows where kind = 'trades' are filtered out at
+  // load time so the in-memory list only carries candle jobs the
+  // dispatcher knows how to drive.
   if(db_query(
          "SELECT j.id, j.market_id, j.kind, COALESCE(j.granularity, 0),"
          "       COALESCE(to_char(j.oldest_ts AT TIME ZONE 'UTC',"
@@ -349,6 +336,7 @@ wm_dl_load_jobs(dl_jobtable_t *t)
          "  FROM wm_download_job j"
          "  JOIN wm_market m ON m.id = j.market_id"
          " WHERE j.state IN ('queued', 'running')"
+         "   AND j.kind = 'candles'"
          " ORDER BY j.id", res) != SUCCESS || !res->ok)
   {
     clam(CLAM_WARN, WM_DL_CTX, "job load failed: %s",
@@ -376,9 +364,10 @@ wm_dl_load_jobs(dl_jobtable_t *t)
     v = db_result_get(res, i, 1);
     if(v != NULL) j->market_id = (int32_t)strtol(v, NULL, 10);
 
-    v = db_result_get(res, i, 2);
-    j->kind = (v != NULL && strcmp(v, "candles") == 0)
-        ? DL_JOB_CANDLES : DL_JOB_TRADES;
+    // Filtered to kind='candles' in the SELECT above; this column
+    // remains for symmetry with the schema and future kinds.
+    (void)db_result_get(res, i, 2);
+    j->kind = DL_JOB_CANDLES;
 
     v = db_result_get(res, i, 3);
     if(v != NULL) j->granularity = (int32_t)strtol(v, NULL, 10);
@@ -464,24 +453,6 @@ wm_dl_job_list_append_locked(dl_jobtable_t *t, dl_job_t *j)
   *pp = j;
   j->next = NULL;
   t->n_jobs++;
-}
-
-static bool
-wm_dl_has_running_trades_for_market_locked(dl_jobtable_t *t,
-    int32_t market_id)
-{
-  dl_job_t *j;
-
-  for(j = t->jobs_head; j != NULL; j = j->next)
-  {
-    if(j->market_id != market_id || j->kind != DL_JOB_TRADES)
-      continue;
-
-    if(j->state == DL_JOB_QUEUED || j->state == DL_JOB_RUNNING)
-      return(true);
-  }
-
-  return(false);
 }
 
 static void
@@ -614,20 +585,19 @@ wm_dl_job_persist(dl_jobtable_t *t, const dl_job_t *j)
 // ------------------------------------------------------------------ //
 
 static bool
-wm_dl_insert_job(dl_job_kind_t kind,
-    int32_t market_id, int32_t granularity, const char *oldest_ts,
-    const char *newest_ts, const char *requested_by, int64_t *out_id)
+wm_dl_insert_job(int32_t market_id, int32_t granularity,
+    const char *oldest_ts, const char *newest_ts,
+    const char *requested_by, int64_t *out_id)
 {
-  db_result_t *res       = NULL;
-  char        *e_old     = NULL;
-  char        *e_new     = NULL;
-  char        *e_req     = NULL;
+  db_result_t *res   = NULL;
+  char        *e_old = NULL;
+  char        *e_new = NULL;
+  char        *e_req = NULL;
   char         sql[2048];
   char         gran_lit[24];
   char         old_lit[96];
   char         new_lit[96];
-  bool         ok        = FAIL;
-  const char  *kind_str  = (kind == DL_JOB_CANDLES) ? "candles" : "trades";
+  bool         ok    = FAIL;
   int          n;
 
   e_req = db_escape(requested_by != NULL ? requested_by : "");
@@ -664,10 +634,10 @@ wm_dl_insert_job(dl_job_kind_t kind,
       " (market_id, kind, granularity,"
       "  oldest_ts, newest_ts, state, cursor_after, pages_fetched,"
       "  rows_written, requested_by)"
-      " VALUES (%" PRId32 ", '%s', %s,"
+      " VALUES (%" PRId32 ", 'candles', %s,"
       "         %s, %s, 'queued', 0, 0, 0, '%s')"
       " RETURNING id",
-      market_id, kind_str, gran_lit,
+      market_id, gran_lit,
       old_lit, new_lit, e_req);
 
   if(n < 0 || (size_t)n >= sizeof(sql))
@@ -735,35 +705,21 @@ wm_dl_job_enqueue(whenmoon_state_t *st,
 
   t = st->downloader;
 
-  // Reject a second trades job for the same market while one is live.
-  if(kind == DL_JOB_TRADES)
+  pthread_mutex_lock(&t->lock);
+
+  if(t->n_jobs >= WM_DL_JOBS_MAX)
   {
-    pthread_mutex_lock(&t->lock);
-
-    if(wm_dl_has_running_trades_for_market_locked(t, market_id))
-    {
-      pthread_mutex_unlock(&t->lock);
-      snprintf(err, err_cap,
-          "market %" PRId32 " already has a running trades job",
-          market_id);
-      return(FAIL);
-    }
-
-    if(t->n_jobs >= WM_DL_JOBS_MAX)
-    {
-      pthread_mutex_unlock(&t->lock);
-      snprintf(err, err_cap, "job table full (max %u)", WM_DL_JOBS_MAX);
-      return(FAIL);
-    }
-
     pthread_mutex_unlock(&t->lock);
+    snprintf(err, err_cap, "job table full (max %u)", WM_DL_JOBS_MAX);
+    return(FAIL);
   }
+
+  pthread_mutex_unlock(&t->lock);
 
   // Candles pre-flight: clamp future newest_ts to now (logged once per
   // enqueue), default missing newest_ts to now, and short-circuit if
   // coverage is already complete. Gran is authoritative for the gap
   // lookup; cursor_end_ts starts at newest_effective.
-  if(kind == DL_JOB_CANDLES)
   {
     time_t          now = time(NULL);
     struct tm       tm;
@@ -807,7 +763,7 @@ wm_dl_job_enqueue(whenmoon_state_t *st,
     newest_for_insert = newest_effective;
   }
 
-  if(wm_dl_insert_job(kind, market_id, granularity,
+  if(wm_dl_insert_job(market_id, granularity,
          oldest_ts, newest_for_insert, requested_by, &new_id) != SUCCESS)
   {
     snprintf(err, err_cap, "db insert failed");
@@ -844,13 +800,10 @@ wm_dl_job_enqueue(whenmoon_state_t *st,
     snprintf(j->exchange_symbol, sizeof(j->exchange_symbol),
         "%s", exchange_symbol);
 
-  if(kind == DL_JOB_CANDLES)
-  {
-    j->cursor_after         = 0;
-    j->candle_table_ensured = false;
-    snprintf(j->cursor_end_ts, sizeof(j->cursor_end_ts),
-        "%s", newest_effective);
-  }
+  j->cursor_after         = 0;
+  j->candle_table_ensured = false;
+  snprintf(j->cursor_end_ts, sizeof(j->cursor_end_ts),
+      "%s", newest_effective);
 
   pthread_mutex_lock(&t->lock);
   wm_dl_job_list_append_locked(t, j);

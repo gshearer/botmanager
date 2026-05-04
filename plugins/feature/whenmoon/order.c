@@ -19,11 +19,11 @@
 #include "order.h"
 
 #include "backtest.h"
+#include "book_persist.h"
 #include "market.h"
 #include "pnl.h"
 #include "sizer.h"
 #include "strategy.h"
-#include "trade_persist.h"
 #include "whenmoon.h"
 
 #include "alloc.h"

@@ -6,9 +6,8 @@
 // feature_exchange plugin (plugins/feature/exchange) — what remains
 // here is the in-memory job list, persistence, and the
 // "kick the dispatch" surface that hands runnable jobs off to
-// dl_trades_dispatch_one / dl_candles_dispatch_one. Those, in turn,
-// route through coinbase_fetch_*_async, which routes through
-// exchange_request().
+// dl_candles_dispatch_one. That, in turn, routes through
+// coinbase_fetch_*_async, which routes through exchange_request().
 
 #ifndef BM_WHENMOON_DL_JOBTABLE_H
 #define BM_WHENMOON_DL_JOBTABLE_H
@@ -59,7 +58,6 @@ typedef enum
 
 typedef enum
 {
-  DL_JOB_TRADES,
   DL_JOB_CANDLES
 } dl_job_kind_t;
 
@@ -71,7 +69,7 @@ struct dl_job
   int64_t          id;                  // wm_download_job.id
   int32_t          market_id;
   dl_job_kind_t    kind;
-  int32_t          granularity;         // candles only; 0 for trades
+  int32_t          granularity;         // candles bucket size (seconds)
 
   // EX-1: priority for the request queue. Set by the enqueue path
   // (EXCHANGE_PRIO_USER_DOWNLOAD for /whenmoon download …,
@@ -79,18 +77,18 @@ struct dl_job
   uint8_t          priority;
 
   // User-provided window. Empty strings mean "no bound".
-  //   trades oldest_ts  = "" -> walk to exchange inception
-  //   trades newest_ts  = "" -> start at "now"
+  //   oldest_ts = "" -> walk to exchange inception
+  //   newest_ts = "" -> start at "now"
   char             oldest_ts[40];
   char             newest_ts[40];
 
   dl_job_state_t   state;
 
-  // Pagination cursor:
-  //   trades  — cursor_after is the trade_id for the NEXT ?after= call
-  //             (0 = first page).
-  //   candles — cursor_end_ts is the exclusive end bound for the next
-  //             300-bucket window (initial = newest_ts).
+  // Pagination cursor: cursor_end_ts is the exclusive end bound for
+  // the next 300-bucket candle window (initial = newest_ts).
+  // cursor_after is unused now that the trade page loop is gone, but
+  // the column survives in the wm_download_job row for forward
+  // compatibility.
   int64_t          cursor_after;
   char             cursor_end_ts[40];
 
@@ -114,18 +112,14 @@ struct dl_job
   // whose value is older than WM_DL_STALL_THRESHOLD_MS.
   int64_t          last_progress_ms;
 
-  // Lazy per-pair DDL marker for candles. Parallel to `table_ensured`
-  // but tracked separately because the candle table name includes the
-  // granularity suffix.
+  // Lazy per-pair DDL marker for candles. The candle table name
+  // includes the granularity suffix, so the marker travels with the
+  // job instead of being globally cached.
   bool             candle_table_ensured;
 
   // Cached exchange symbol used in the hot loop (e.g. "BTC-USD").
   char             exchange_symbol[32];
   char             exchange[32];
-
-  // Lazy per-pair DDL marker — the trade table is ensured once per
-  // job lifetime instead of on every page.
-  bool             table_ensured;
 
   // List linkage (insertion order).
   dl_job_t        *next;

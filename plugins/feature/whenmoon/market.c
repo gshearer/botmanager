@@ -15,7 +15,6 @@
 #include "market.h"
 #include "strategy.h"
 #include "dl_schema.h"
-#include "trade_persist.h"
 
 #include "db.h"
 #include "task.h"
@@ -501,12 +500,6 @@ wm_market_on_event(const coinbase_ws_event_t *ev, void *user)
       if(mk->aggregator != NULL)
         wm_aggregator_on_trade(mk, m->time_ms, m->price, m->size);
 
-      // Append to the per-market trade-persist ring; flushed by the
-      // plugin-global periodic task. _async never blocks; on overflow
-      // it drops oldest unflushed and emits one rate-limited warn.
-      if(mk->trade_persist != NULL)
-        wm_trade_persist_async(mk, m);
-
       pthread_mutex_unlock(&mk->lock);
 
       clam(CLAM_DEBUG2, WHENMOON_CTX,
@@ -565,15 +558,6 @@ wm_market_destroy(whenmoon_state_t *st)
     for(i = 0; i < m->n_markets; i++)
     {
       whenmoon_market_t *mk = &m->arr[i];
-
-      // Order: persist before aggregator. The flush task reads
-      // mk->trade_persist under a global tick walker, so removing the
-      // aggregator first would leave an in-flight flush dereferencing a
-      // destroyed slot only via the persist pointer (which is fine);
-      // tearing persist down first removes that pointer entirely, so
-      // the next walker iteration skips this slot cleanly.
-      if(mk->trade_persist != NULL)
-        wm_trade_persist_destroy(mk);
 
       if(mk->aggregator != NULL)
         wm_aggregator_destroy(mk);
@@ -658,8 +642,8 @@ wm_market_add(whenmoon_state_t *st,
     }
   }
 
-  // Allocate aggregator + trade-persist buffers. Both must be in place
-  // before resub_ws so the first WS event can already feed them.
+  // Aggregator must be in place before resub_ws so the first WS event
+  // can already feed it.
   if(wm_aggregator_init(mk, WM_AGG_DEFAULT_HISTORY_1D) != SUCCESS)
   {
     if(persist)
@@ -669,20 +653,6 @@ wm_market_add(whenmoon_state_t *st,
     memset(mk, 0, sizeof(*mk));
     m->n_markets--;
     if(err != NULL) snprintf(err, err_cap, "aggregator init failed");
-    return(FAIL);
-  }
-
-  if(wm_trade_persist_init(mk) != SUCCESS)
-  {
-    wm_aggregator_destroy(mk);
-
-    if(persist)
-      (void)wm_market_set_enabled(market_id, false);
-
-    pthread_mutex_destroy(&mk->lock);
-    memset(mk, 0, sizeof(*mk));
-    m->n_markets--;
-    if(err != NULL) snprintf(err, err_cap, "trade persist init failed");
     return(FAIL);
   }
 
@@ -763,12 +733,8 @@ wm_market_remove(whenmoon_state_t *st, const char *product_id,
   // ctx->mkt pointer is invalidated regardless.
   wm_strategy_detach_market(st, id_str);
 
-  // Same teardown order as wm_market_destroy: persist first, then
-  // aggregator. Both lock the slot's mutex internally, so destroy them
+  // Aggregator locks the slot's mutex internally, so destroy it
   // before pthread_mutex_destroy(&mk->lock).
-  if(mk->trade_persist != NULL)
-    wm_trade_persist_destroy(mk);
-
   if(mk->aggregator != NULL)
     wm_aggregator_destroy(mk);
 

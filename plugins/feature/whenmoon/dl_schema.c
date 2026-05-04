@@ -51,17 +51,6 @@ static const char *const wm_dl_ddl_core[] = {
   " ON wm_market(exchange, base_asset, quote_asset)",
 
   // Coverage --------------------------------------------------------
-  "CREATE TABLE IF NOT EXISTS wm_trade_coverage ("
-  " market_id      INT          NOT NULL REFERENCES wm_market(id),"
-  " first_trade_id BIGINT       NOT NULL,"
-  " last_trade_id  BIGINT       NOT NULL,"
-  " first_ts       TIMESTAMPTZ  NOT NULL,"
-  " last_ts        TIMESTAMPTZ  NOT NULL,"
-  " source         VARCHAR(16)  NOT NULL,"
-  " completed_at   TIMESTAMPTZ  NOT NULL DEFAULT NOW(),"
-  " PRIMARY KEY (market_id, first_trade_id)"
-  ")",
-
   "CREATE TABLE IF NOT EXISTS wm_candle_coverage ("
   " market_id    INT          NOT NULL REFERENCES wm_market(id),"
   " granularity  INT          NOT NULL,"
@@ -186,19 +175,6 @@ static const char *const wm_dl_ddl_core[] = {
 // ------------------------------------------------------------------ //
 // Per-pair DDL templates                                             //
 // ------------------------------------------------------------------ //
-
-static const char wm_trade_table_ddl_fmt[] =
-  "CREATE TABLE IF NOT EXISTS %s ("
-  " trade_id  BIGINT         PRIMARY KEY,"
-  " ts        TIMESTAMPTZ    NOT NULL,"
-  " side      CHAR(1)        NOT NULL,"
-  " price     NUMERIC(24,10) NOT NULL,"
-  " size      NUMERIC(28,10) NOT NULL,"
-  " source    SMALLINT       NOT NULL DEFAULT 0"
-  ")";
-
-static const char wm_trade_idx_ddl_fmt[] =
-  "CREATE INDEX IF NOT EXISTS %s_ts_idx ON %s(ts)";
 
 static const char wm_candle_table_ddl_fmt[] =
   "CREATE TABLE IF NOT EXISTS %s ("
@@ -400,22 +376,6 @@ wm_dl_destroy(whenmoon_state_t *st)
 // ------------------------------------------------------------------ //
 
 bool
-wm_trade_table_name(int32_t market_id, char *out, size_t cap)
-{
-  int n;
-
-  if(out == NULL || cap == 0 || market_id < 0)
-    return(FAIL);
-
-  n = snprintf(out, cap, "wm_trades_%" PRId32, market_id);
-
-  if(n < 0 || (size_t)n >= cap)
-    return(FAIL);
-
-  return(SUCCESS);
-}
-
-bool
 wm_candle_table_name(int32_t market_id, int32_t gran_secs,
     char *out, size_t cap)
 {
@@ -436,34 +396,6 @@ wm_candle_table_name(int32_t market_id, int32_t gran_secs,
 // ------------------------------------------------------------------ //
 // Per-pair table DDL (lazy)                                          //
 // ------------------------------------------------------------------ //
-
-bool
-wm_trade_table_ensure(int32_t market_id)
-{
-  char  name[WM_DL_TABLE_SZ];
-  char  sql[512];
-  int   n;
-
-  if(wm_trade_table_name(market_id, name, sizeof(name)) != SUCCESS)
-    return(FAIL);
-
-  n = snprintf(sql, sizeof(sql), wm_trade_table_ddl_fmt, name);
-
-  if(n < 0 || (size_t)n >= sizeof(sql))
-    return(FAIL);
-
-  if(wm_dl_run_ddl(sql) != SUCCESS)
-    return(FAIL);
-
-  // Secondary index on ts — the primary key covers trade_id lookups;
-  // range scans (coverage stitching, newest-first pagination) want ts.
-  n = snprintf(sql, sizeof(sql), wm_trade_idx_ddl_fmt, name, name);
-
-  if(n < 0 || (size_t)n >= sizeof(sql))
-    return(FAIL);
-
-  return(wm_dl_run_ddl(sql));
-}
 
 bool
 wm_candle_table_ensure(int32_t market_id, int32_t gran_secs)

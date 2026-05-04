@@ -1,6 +1,6 @@
 // botmanager — MIT
-// Whenmoon downloader admin verbs (state-changing under /whenmoon
-// download; observability under /show whenmoon download).
+// Whenmoon candle-downloader admin verbs (state-changing under
+// /whenmoon download; observability under /show whenmoon download).
 
 #define WHENMOON_INTERNAL
 #include "whenmoon.h"
@@ -8,7 +8,6 @@
 #include "dl_commands.h"
 #include "dl_jobtable.h"
 #include "dl_schema.h"
-#include "dl_coverage.h"
 #include "dl_candles.h"
 #include "cd_probe.h"
 
@@ -26,9 +25,6 @@
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
-
-// Default admin-gap window when the user didn't provide one.
-#define WM_DL_DEFAULT_GAP_YEARS   5
 
 // ------------------------------------------------------------------ //
 // Small helpers                                                       //
@@ -123,125 +119,6 @@ wm_dl_parse_date(const char *in, char *out, size_t cap)
 // ------------------------------------------------------------------ //
 // Handlers                                                            //
 // ------------------------------------------------------------------ //
-
-static void
-wm_dl_cmd_download_trades(const cmd_ctx_t *ctx)
-{
-  whenmoon_state_t *st;
-  const char       *p;
-  char              pair[64]   = {0};
-  char              old_tok[32] = {0};
-  char              new_tok[32] = {0};
-  char              exch[32]   = {0};
-  char              base[16]   = {0};
-  char              quote[16]  = {0};
-  char              symbol[32] = {0};
-  char              oldest_ts[40] = {0};
-  char              newest_ts[40] = {0};
-  char              reply[256];
-  char              err[128];
-  int32_t           market_id;
-  int64_t           job_id = 0;
-
-  st = whenmoon_get_state();
-
-  if(st == NULL || !st->dl_ready || st->downloader == NULL)
-  {
-    cmd_reply(ctx, "whenmoon: downloader not ready");
-    return;
-  }
-
-  p = ctx->args != NULL ? ctx->args : "";
-
-  if(!wm_dl_next_token(&p, pair, sizeof(pair)))
-  {
-    cmd_reply(ctx,
-        "usage: /whenmoon download trades <exch>-<base>-<quote>"
-        " [MM/dd/yyyy [MM/dd/yyyy]]");
-    return;
-  }
-
-  (void)wm_dl_next_token(&p, old_tok, sizeof(old_tok));
-  (void)wm_dl_next_token(&p, new_tok, sizeof(new_tok));
-
-  if(wm_dl_parse_market_id(pair, exch, sizeof(exch),
-         base, sizeof(base), quote, sizeof(quote),
-         symbol, sizeof(symbol)) != SUCCESS)
-  {
-    cmd_reply(ctx, "bad market id (expected <exch>-<base>-<quote>)");
-    return;
-  }
-
-  if(old_tok[0] != '\0' &&
-     wm_dl_parse_date(old_tok, oldest_ts, sizeof(oldest_ts)) != SUCCESS)
-  {
-    cmd_reply(ctx, "bad oldest date (expected MM/dd/yyyy)");
-    return;
-  }
-
-  if(new_tok[0] != '\0' &&
-     wm_dl_parse_date(new_tok, newest_ts, sizeof(newest_ts)) != SUCCESS)
-  {
-    cmd_reply(ctx, "bad newest date (expected MM/dd/yyyy)");
-    return;
-  }
-
-  if(oldest_ts[0] != '\0' && newest_ts[0] != '\0' &&
-     strcmp(oldest_ts, newest_ts) > 0)
-  {
-    cmd_reply(ctx, "oldest date must not be after newest date");
-    return;
-  }
-
-  market_id = wm_market_lookup_or_create(exch, base, quote, symbol);
-
-  if(market_id < 0)
-  {
-    cmd_reply(ctx, "market lookup/create failed");
-    return;
-  }
-
-  // Coverage short-circuit: if the requested window is fully covered,
-  // don't write a job. Post-WM-DC-4, "covered" means the coverage row
-  // not only claims the window in timestamp space but is also backed
-  // by physically-present rows in wm_trades_<market_id> at its
-  // boundary trade_ids; an unbacked row no longer short-circuits.
-  if(oldest_ts[0] != '\0' && newest_ts[0] != '\0')
-  {
-    wm_coverage_t gaps[4];
-    uint32_t      n;
-
-    n = wm_coverage_gaps_trades(market_id, oldest_ts, newest_ts,
-        gaps, (uint32_t)(sizeof(gaps) / sizeof(gaps[0])));
-
-    if(n == 0)
-    {
-      cmd_reply(ctx, "coverage complete, nothing to fetch");
-      return;
-    }
-  }
-
-  if(wm_dl_job_enqueue(st, DL_JOB_TRADES, market_id, 0,
-         EXCHANGE_PRIO_USER_DOWNLOAD,
-         exch, symbol, oldest_ts, newest_ts,
-         ctx->username != NULL ? ctx->username : "",
-         &job_id, err, sizeof(err)) != SUCCESS)
-  {
-    char buf[192];
-
-    snprintf(buf, sizeof(buf), "enqueue failed: %s",
-        err[0] != '\0' ? err : "unknown");
-    cmd_reply(ctx, buf);
-    return;
-  }
-
-  snprintf(reply, sizeof(reply),
-      "job %" PRId64 " queued (%s oldest=%s newest=%s)",
-      job_id, symbol,
-      oldest_ts[0] != '\0' ? oldest_ts : "inception",
-      newest_ts[0] != '\0' ? newest_ts : "now");
-  cmd_reply(ctx, reply);
-}
 
 // WM-CD-1 Phase 2: `whenmoon download candles <market> max` sugar.
 // Reads each per-granularity max_lookback_days cap from KV (populated
@@ -611,10 +488,9 @@ wm_dl_status_row(const dl_job_t *j, void *user)
   char                  line[384];
 
   snprintf(line, sizeof(line),
-      "  job %-6" PRId64 " %-7s %-12s state=%-8s pages=%-4" PRId32
+      "  job %-6" PRId64 " candles %-12s state=%-8s pages=%-4" PRId32
       " rows=%-10" PRId64 " err=%s",
       j->id,
-      j->kind == DL_JOB_TRADES ? "trades" : "candles",
       j->exchange_symbol[0] != '\0' ? j->exchange_symbol : "?",
       wm_dl_state_label(j->state),
       j->pages_fetched,
@@ -645,125 +521,6 @@ wm_dl_cmd_show_download_status(const cmd_ctx_t *ctx)
 
   if(sstate.count == 0)
     cmd_reply(ctx, "  (no jobs)");
-}
-
-// ------------------------------------------------------------------ //
-// /show whenmoon download gaps <id>                                   //
-// ------------------------------------------------------------------ //
-
-typedef struct
-{
-  const cmd_ctx_t *ctx;
-  uint32_t         covered;
-} wm_dl_cov_state_t;
-
-static void
-wm_dl_cov_row(const wm_coverage_t *row, void *user)
-{
-  wm_dl_cov_state_t *s = user;
-  char               line[256];
-
-  snprintf(line, sizeof(line),
-      "  covered: first_id=%-12" PRId64 " last_id=%-12" PRId64
-      " %s .. %s",
-      row->first_trade_id, row->last_trade_id,
-      row->first_ts, row->last_ts);
-  cmd_reply(s->ctx, line);
-  s->covered++;
-}
-
-static void
-wm_dl_cmd_show_download_gaps(const cmd_ctx_t *ctx)
-{
-  whenmoon_state_t   *st;
-  const char         *p;
-  char                pair[64] = {0};
-  char                exch[32], base[16], quote[16], symbol[32];
-  int32_t             market_id;
-  wm_coverage_t       gaps[32];
-  uint32_t            n_gaps;
-  time_t              now;
-  struct tm           tm;
-  char                range_end[40];
-  char                range_start[40];
-  wm_dl_cov_state_t   cstate = { .ctx = ctx, .covered = 0 };
-  uint32_t            i;
-
-  st = whenmoon_get_state();
-
-  if(st == NULL || !st->dl_ready)
-  {
-    cmd_reply(ctx, "whenmoon: downloader not ready");
-    return;
-  }
-
-  p = ctx->args != NULL ? ctx->args : "";
-
-  if(!wm_dl_next_token(&p, pair, sizeof(pair)))
-  {
-    cmd_reply(ctx,
-        "usage: /show whenmoon download gaps <exch>-<base>-<quote>");
-    return;
-  }
-
-  if(wm_dl_parse_market_id(pair, exch, sizeof(exch),
-         base, sizeof(base), quote, sizeof(quote),
-         symbol, sizeof(symbol)) != SUCCESS)
-  {
-    cmd_reply(ctx, "bad market id (expected <exch>-<base>-<quote>)");
-    return;
-  }
-
-  market_id = wm_market_lookup_or_create(exch, base, quote, symbol);
-
-  if(market_id < 0)
-  {
-    cmd_reply(ctx, "market lookup/create failed");
-    return;
-  }
-
-  // Default window: [now - 5y, now]. UTC canonical.
-  now = time(NULL);
-
-  if(gmtime_r(&now, &tm) == NULL)
-  {
-    cmd_reply(ctx, "time error");
-    return;
-  }
-
-  snprintf(range_end, sizeof(range_end),
-      "%04d-%02d-%02d %02d:%02d:%02d+00",
-      tm.tm_year + 1900, tm.tm_mon + 1, tm.tm_mday,
-      tm.tm_hour, tm.tm_min, tm.tm_sec);
-
-  snprintf(range_start, sizeof(range_start),
-      "%04d-%02d-%02d %02d:%02d:%02d+00",
-      tm.tm_year + 1900 - WM_DL_DEFAULT_GAP_YEARS,
-      tm.tm_mon + 1, tm.tm_mday,
-      tm.tm_hour, tm.tm_min, tm.tm_sec);
-
-  cmd_reply(ctx, CLR_BOLD "coverage" CLR_RESET);
-  wm_coverage_iterate(WM_COV_TRADES, market_id, 0, wm_dl_cov_row, &cstate);
-
-  if(cstate.covered == 0)
-    cmd_reply(ctx, "  (none)");
-
-  n_gaps = wm_coverage_gaps_trades(market_id, range_start, range_end,
-      gaps, (uint32_t)(sizeof(gaps) / sizeof(gaps[0])));
-
-  cmd_reply(ctx, CLR_BOLD "gaps (last 5y)" CLR_RESET);
-
-  if(n_gaps == 0)
-    cmd_reply(ctx, "  (no gaps)");
-
-  for(i = 0; i < n_gaps; i++)
-  {
-    char line[192];
-
-    snprintf(line, sizeof(line), "  gap: %s .. %s",
-        gaps[i].first_ts, gaps[i].last_ts);
-    cmd_reply(ctx, line);
-  }
 }
 
 // ------------------------------------------------------------------ //
@@ -903,7 +660,7 @@ static void
 wm_dl_parent_download(const cmd_ctx_t *ctx)
 {
   cmd_reply(ctx,
-      "usage: /whenmoon download <trades|candles|cancel> ...");
+      "usage: /whenmoon download <candles|cancel> ...");
 }
 
 static void
@@ -917,7 +674,7 @@ static void
 wm_dl_parent_show_download(const cmd_ctx_t *ctx)
 {
   cmd_reply(ctx,
-      "usage: /show whenmoon download <status|gaps|candles> ...");
+      "usage: /show whenmoon download <status|candles> ...");
 }
 
 // ------------------------------------------------------------------ //
@@ -930,20 +687,10 @@ wm_dl_register_verbs(void)
   // /whenmoon download parent.
   if(cmd_register("whenmoon", "download",
         "whenmoon download <verb> ...",
-        "Trade/candle history download controls.",
+        "Candle history download controls.",
         NULL,
         USERNS_GROUP_ADMIN, 100, CMD_SCOPE_ANY, METHOD_T_ANY,
         wm_dl_parent_download, NULL, "whenmoon", NULL,
-        NULL, 0, NULL, NULL) != SUCCESS)
-    return(FAIL);
-
-  if(cmd_register("whenmoon", "trades",
-        "whenmoon download trades <exch>-<base>-<quote>"
-        " [MM/dd/yyyy [MM/dd/yyyy]]",
-        "Enqueue a trade-history backfill job.",
-        NULL,
-        USERNS_GROUP_ADMIN, 100, CMD_SCOPE_ANY, METHOD_T_ANY,
-        wm_dl_cmd_download_trades, NULL, "whenmoon/download", NULL,
         NULL, 0, NULL, NULL) != SUCCESS)
     return(FAIL);
 
@@ -1007,16 +754,6 @@ wm_dl_register_verbs(void)
         NULL,
         USERNS_GROUP_ADMIN, 100, CMD_SCOPE_ANY, METHOD_T_ANY,
         wm_dl_cmd_show_download_status, NULL,
-        "show/whenmoon/download", NULL,
-        NULL, 0, NULL, NULL) != SUCCESS)
-    return(FAIL);
-
-  if(cmd_register("whenmoon", "gaps",
-        "show whenmoon download gaps <exch>-<base>-<quote>",
-        "Coverage + gaps for one market over the default window.",
-        NULL,
-        USERNS_GROUP_ADMIN, 100, CMD_SCOPE_ANY, METHOD_T_ANY,
-        wm_dl_cmd_show_download_gaps, NULL,
         "show/whenmoon/download", NULL,
         NULL, 0, NULL, NULL) != SUCCESS)
     return(FAIL);
