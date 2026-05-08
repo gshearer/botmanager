@@ -209,6 +209,67 @@ wm_trade_cmd_reset(const cmd_ctx_t *ctx)
 }
 
 // ----------------------------------------------------------------------- //
+// /whenmoon trade testfire — diagnostic synthetic-signal injection         //
+// ----------------------------------------------------------------------- //
+//
+// Used by verify protocols (e.g. WM-LT-8 verify steps 3-4) where the
+// strategy's natural emission cadence is too slow to exercise the
+// trade engine in a reasonable time. Synthesizes a wm_strategy_signal_t
+// from the live mark + a caller-supplied score and dispatches it
+// through wm_trade_engine_on_signal as if the strategy had emitted it.
+// The book's mode determines downstream behaviour exactly as for a
+// real signal.
+
+static void
+wm_trade_cmd_testfire(const cmd_ctx_t *ctx)
+{
+  const char            *p;
+  char                   id_tok[64]                    = {0};
+  char                   name_tok[WM_STRATEGY_NAME_SZ] = {0};
+  char                   score_tok[16]                 = {0};
+  double                 score = 1.0;
+  double                 mark_px;
+  int64_t                mark_ms;
+  wm_strategy_signal_t   sig                          = {0};
+  char                   reply[192];
+
+  p = ctx->args != NULL ? ctx->args : "";
+
+  if(!wm_dl_next_token(&p, id_tok, sizeof(id_tok)) ||
+     !wm_dl_next_token(&p, name_tok, sizeof(name_tok)))
+  {
+    cmd_reply(ctx,
+        "usage: /whenmoon trade testfire <market_id>"
+        " <strategy_name> [score]");
+    return;
+  }
+
+  if(wm_dl_next_token(&p, score_tok, sizeof(score_tok)))
+    score = strtod(score_tok, NULL);
+
+  if(!wm_trade_lookup_mark(id_tok, &mark_px, &mark_ms))
+  {
+    snprintf(reply, sizeof(reply),
+        "trade testfire: %s has no live mark (start the market first)",
+        id_tok);
+    cmd_reply(ctx, reply);
+    return;
+  }
+
+  sig.ts_ms      = mark_ms;
+  sig.score      = score;
+  sig.confidence = 1.0;
+  snprintf(sig.reason, sizeof(sig.reason), "testfire score=%.3f", score);
+
+  wm_trade_engine_on_signal(id_tok, name_tok, mark_px, mark_ms, &sig);
+
+  snprintf(reply, sizeof(reply),
+      "trade testfire: %s/%s dispatched score=%.3f mark=%.4f",
+      id_tok, name_tok, score, mark_px);
+  cmd_reply(ctx, reply);
+}
+
+// ----------------------------------------------------------------------- //
 // /whenmoon trade parent                                                  //
 // ----------------------------------------------------------------------- //
 
@@ -610,6 +671,18 @@ wm_trade_register_verbs(void)
         NULL,
         USERNS_GROUP_ADMIN, 100, CMD_SCOPE_ANY, METHOD_T_ANY,
         wm_trade_cmd_reset, NULL, "whenmoon/trade", NULL,
+        NULL, 0, NULL, NULL) != SUCCESS)
+    return(FAIL);
+
+  if(cmd_register("whenmoon", "testfire",
+        "whenmoon trade testfire <market_id> <strategy_name> [score]",
+        "Diagnostic: synthesize a strategy signal and dispatch it"
+        " through the trade engine. Used by verify protocols when the"
+        " natural strategy cadence is too slow.",
+        "score defaults to 1.0 (long bias). Mode-specific paths fire"
+        " exactly as for a real emission.",
+        USERNS_GROUP_ADMIN, 100, CMD_SCOPE_ANY, METHOD_T_ANY,
+        wm_trade_cmd_testfire, NULL, "whenmoon/trade", NULL,
         NULL, 0, NULL, NULL) != SUCCESS)
     return(FAIL);
 

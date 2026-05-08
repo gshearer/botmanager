@@ -191,6 +191,15 @@ wm_live_kill_switch_open(const char *exchange)
   snprintf(path, sizeof(path),
       "plugin.whenmoon.exchange.%s.live", exchange);
 
+  // Lazy-register the bool default=false so the operator can flip it
+  // via /set kv. kv_register is a no-op when the key already exists.
+  if(!kv_exists(path))
+    (void)kv_register(path, KV_BOOL, "false", NULL, NULL,
+        "Real-trading kill switch for the named exchange. Default"
+        " false: the live (real) trade path FAILs closed. Flip to"
+        " true ONLY after multi-week paper coverage per"
+        " feedback_paper_before_live.md.");
+
   return(kv_get_uint(path) != 0);
 }
 
@@ -203,6 +212,12 @@ wm_live_get_daily_loss_bps(const wm_trade_book_t *book)
   snprintf(path, sizeof(path),
       "plugin.whenmoon.market.%s.strategy.%s.daily_loss_bps",
       book->market_id_str, book->strategy_name);
+
+  if(!kv_exists(path))
+    (void)kv_register(path, KV_DOUBLE, "200.0", NULL, NULL,
+        "Daily realized-loss cap, basis points of starting_cash."
+        " Real-mode signals FAIL closed when realized PnL since the"
+        " live engine's day-anchor breaches -starting_cash * bps/10000.");
 
   bps = kv_get_double(path);
   if(bps > 0.0) return(bps);
@@ -218,6 +233,12 @@ wm_live_get_max_notional(const wm_trade_book_t *book)
   snprintf(path, sizeof(path),
       "plugin.whenmoon.market.%s.strategy.%s.max_notional",
       book->market_id_str, book->strategy_name);
+
+  if(!kv_exists(path))
+    (void)kv_register(path, KV_DOUBLE, "0.0", NULL, NULL,
+        "Per-order notional cap (quote currency). 0 = uncapped."
+        " When |intent.qty * mark| exceeds this, qty is clipped to"
+        " fit; the order is NOT rejected.");
 
   return(kv_get_double(path));
 }
@@ -376,13 +397,21 @@ wm_live_engine_on_signal_locked(wm_trade_book_t *book,
     return(FAIL);
   }
 
-  // Re-anchor on UTC midnight rollover.
+  // Daily-loss anchor. On first contact (anchor uninitialised) we leave
+  // both fields at zero so realized_today equals lifetime realized PnL —
+  // this conservatively surfaces any losses already on the book at boot
+  // time. Once the daemon has been alive across a UTC midnight, the
+  // anchor advances to that midnight's realized PnL and subsequent
+  // checks are properly "since midnight". Persisting the anchor across
+  // reboots is a future refinement; v1 errs on the side of fail-closed.
   today_start = wm_live_utc_day_start_ms(mark_ms > 0 ? mark_ms
       : (int64_t)time(NULL) * 1000);
 
   realized_pnl = (book->pnl != NULL) ? book->pnl->realized_pnl : 0.0;
 
-  if(lb->day_anchor_utc_ms != today_start)
+  if(lb->day_anchor_utc_ms == 0)
+    lb->day_anchor_utc_ms = today_start;
+  else if(lb->day_anchor_utc_ms != today_start)
   {
     lb->day_anchor_utc_ms       = today_start;
     lb->day_anchor_realized_pnl = realized_pnl;
@@ -440,7 +469,7 @@ wm_live_engine_on_signal_locked(wm_trade_book_t *book,
     }
   }
 
-  side_str = (intent.action == WM_SIZER_BUY) ? "BUY" : "SELL";
+  side_str = (intent.action == WM_SIZER_BUY) ? "buy" : "sell";
 
   // Wire-form product id is the uppercase dash form. Build into a
   // tightly-sized intermediate so the compiler can prove no truncation
@@ -505,16 +534,14 @@ wm_live_engine_on_signal_locked(wm_trade_book_t *book,
 
   if(coinbase_place_order_async(&req, wm_live_order_done, ctx) != SUCCESS)
   {
+    // coinbase_place_order_async fires the done callback synchronously
+    // with res->err set when it returns FAIL — the done_cb has already
+    // dropped the pending row and freed ctx by the time we get here.
+    // Do NOT free ctx again or roll back pending_n; both have happened.
     clam(CLAM_WARN, WM_LIVE_CTX,
-        "%s/%s coinbase_place_order_async submit failed",
+        "%s/%s coinbase_place_order_async returned FAIL"
+        " (done_cb already fired)",
         book->market_id_str, book->strategy_name);
-
-    mem_free(ctx);
-
-    pthread_mutex_lock(&g_live.mu);
-    if(lb->pending_n > 0) lb->pending_n--;
-    pthread_mutex_unlock(&g_live.mu);
-
     return(FAIL);
   }
 
