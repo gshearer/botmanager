@@ -51,6 +51,14 @@ uint64_t util_ms_since(const struct timespec *start);
 size_t util_b64_encode(const void *in, size_t in_len,
     char *out, size_t out_cap);
 
+// Base64url-encode in into out. RFC 4648 §5 URL-safe alphabet
+// (`+`→`-`, `/`→`_`) with the trailing `=` padding stripped — the
+// shape JWTs require. Returns bytes written excluding the trailing
+// NUL, or 0 on buffer overflow. out_cap must be >=
+// ((in_len + 2) / 3) * 4 + 1.
+size_t util_b64url_encode(const void *in, size_t in_len,
+    char *out, size_t out_cap);
+
 // Scan text for the first image URL (case-insensitive match on
 // https?://[^\s<>"']+\.(jpe?g|png|gif|webp)(\?[^\s<>"']*)?). Copies
 // the URL into out (NUL-terminated). Returns true on hit.

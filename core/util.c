@@ -203,6 +203,27 @@ util_b64_encode(const void *in, size_t in_len, char *out, size_t out_cap)
   return(o);
 }
 
+size_t
+util_b64url_encode(const void *in, size_t in_len, char *out, size_t out_cap)
+{
+  size_t n = util_b64_encode(in, in_len, out, out_cap);
+  size_t i;
+
+  if(n == 0) return(0);
+
+  for(i = 0; i < n; i++)
+  {
+    if(out[i] == '+')      out[i] = '-';
+    else if(out[i] == '/') out[i] = '_';
+  }
+
+  // Strip RFC 4648 §5 padding — JWT b64url is unpadded.
+  while(n > 0 && out[n - 1] == '=')
+    out[--n] = '\0';
+
+  return(n);
+}
+
 // URL helpers
 
 // True if c is a URL-body character (non-delimiter, non-whitespace).

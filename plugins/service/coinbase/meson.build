@@ -6,6 +6,7 @@ coinbase_plugin = shared_library('coinbase',
   'coinbase_orders.c',
   'coinbase_rest.c',
   'coinbase_sign.c',
+  'coinbase_sign_cdp.c',
   'coinbase_ws.c',
   'coinbase_ws_channels.c',
   include_directories : [
