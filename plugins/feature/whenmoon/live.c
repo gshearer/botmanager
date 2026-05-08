@@ -29,7 +29,6 @@
 // it, at which point the body learns to update the trade book.
 
 #define WHENMOON_INTERNAL
-#define CB_INTERNAL
 #include "live.h"
 
 #include "market.h"
