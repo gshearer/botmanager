@@ -17,24 +17,31 @@
 // the core convention.
 
 static const plugin_kv_entry_t cb_kv_schema[] = {
-  // Endpoint selection.
+  // Endpoint selection. Sandbox is for code-shape verification only —
+  // many Advanced Trade endpoints behave differently or are absent
+  // entirely; production testing requires a real key against prod.
   { "plugin.coinbase.sandbox", KV_BOOL, "false", NULL, NULL, NULL },
   { "plugin.coinbase.rest_url_prod", KV_STR,
-    "https://api.exchange.coinbase.com", NULL, NULL, NULL },
+    "https://api.coinbase.com", NULL, NULL, NULL },
   { "plugin.coinbase.rest_url_sandbox", KV_STR,
-    "https://api-public.sandbox.exchange.coinbase.com", NULL, NULL, NULL },
+    "https://api-sandbox.coinbase.com", NULL, NULL, NULL },
   { "plugin.coinbase.ws_url_prod", KV_STR,
-    "wss://ws-feed.exchange.coinbase.com", NULL, NULL, NULL },
+    "wss://advanced-trade-ws.coinbase.com", NULL, NULL, NULL },
   { "plugin.coinbase.ws_url_sandbox", KV_STR,
-    "wss://ws-feed-public.sandbox.exchange.coinbase.com",
-    NULL, NULL, NULL },
+    "wss://advanced-trade-ws-sandbox.coinbase.com", NULL, NULL, NULL },
 
-  // Authentication. apisecret is the base64 secret exactly as issued
-  // by Coinbase; base64-decode happens at signing time. Empty values
-  // keep the plugin in public-only mode (market data is unauthenticated).
-  { "plugin.coinbase.apikey",     KV_STR, "", NULL, NULL, NULL },
-  { "plugin.coinbase.apisecret",  KV_STR, "", NULL, NULL, NULL },
-  { "plugin.coinbase.passphrase", KV_STR, "", NULL, NULL, NULL },
+  // Coinbase Developer Platform (CDP) creds. Per-request JWT/ES256
+  // signed against `plugin.coinbase.creds.private_key_pem`,
+  // identified by `plugin.coinbase.creds.key_name` (the
+  // `organizations/<org>/apiKeys/<uuid>` opaque kid). The `creds`
+  // segment makes both auto-secret-tier via kv_is_secret_key. PEM
+  // may be a single line with literal `\n` escape sequences — the
+  // signer translates them to real newlines before parsing. Empty
+  // values keep the plugin in public-only mode.
+  { "plugin.coinbase.creds.key_name",        KV_STR, "",
+    NULL, NULL, NULL },
+  { "plugin.coinbase.creds.private_key_pem", KV_STR, "",
+    NULL, NULL, NULL },
 
   // Subsystem toggles.
   { "plugin.coinbase.rest_enabled", KV_BOOL, "true",  NULL, NULL, NULL },
@@ -111,6 +118,7 @@ cb_deinit(void)
   cb_ws_deinit();            // stops reader, frees transport state
   cb_ws_channels_deinit();   // drops every sub handle + slot state
   cb_rest_deinit();
+  cb_cdp_deinit();
 
   clam(CLAM_INFO, CB_CTX, "coinbase plugin deinitialized");
 }

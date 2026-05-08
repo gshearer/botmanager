@@ -1,12 +1,19 @@
-# coinbase — Coinbase Exchange Plugin
+# coinbase — Coinbase Advanced Trade Plugin
 
-Service plugin (`PLUGIN_SERVICE`) for the Coinbase Exchange
-(the former Coinbase Pro / GDAX product, not Advanced Trade or Prime).
-Exposes a mechanism API over both REST and a WebSocket feed so
-consumers — `plugins/feature/whenmoon/`, future `plugins/cmd/coinbase/`
-command surfaces, other internal callers — can access products,
-candles, live trades, order books, accounts, and place orders without
+Service plugin (`PLUGIN_SERVICE`) for Coinbase Advanced Trade (the
+retail-facing successor to Coinbase Pro / GDAX, served at
+`api.coinbase.com/api/v3/brokerage/...`). Exposes a mechanism API
+over both REST and a WebSocket feed so consumers —
+`plugins/feature/whenmoon/`, future `plugins/cmd/coinbase/` command
+surfaces, other internal callers — can access products, candles,
+live trades, order books, accounts, and place orders without
 knowing how Coinbase authentication or streaming works.
+
+Auth is **CDP-only**: a per-request JWT signed with an EC P-256
+private key. The legacy Coinbase Exchange HMAC scheme
+(`apikey`+`apisecret`+`passphrase` against `api.exchange.coinbase.com`)
+is not supported — Exchange is institutional-only and most retail
+accounts cannot mint keys for it.
 
 ## Layout
 
@@ -15,7 +22,7 @@ Provides the `exchange_coinbase` capability tag. A hard `requires`
 on `feature_exchange` ensures the dispatch abstraction is up before
 this plugin's init runs.
 
-Candle + trade traffic now routes through the feature_exchange
+Candle + trade traffic routes through the feature_exchange
 priority queue + token bucket via `cb_exchange_register_vtable()` in
 `coinbase_init`. Other typed APIs (products, ticker, orders, accounts)
 keep the legacy direct-curl path until the live-trading framework is
@@ -27,12 +34,14 @@ Two surfaces, served by the same plugin:
 
 | Surface | URL | Auth | Purpose |
 |---------|-----|------|---------|
-| REST (Exchange API) | `https://api.exchange.coinbase.com` | HMAC-SHA256 headers `CB-ACCESS-KEY`, `CB-ACCESS-SIGN`, `CB-ACCESS-TIMESTAMP`, `CB-ACCESS-PASSPHRASE` | Historical data (candles, trades), snapshots (products, ticker, book), order management, account balances |
-| WebSocket Feed | `wss://ws-feed.exchange.coinbase.com` | Optional HMAC signature in the `subscribe` message | Live streams: ticker, level2 order book, matches, heartbeat, and authenticated user/full channels |
+| REST (Advanced Trade) | `https://api.coinbase.com` | `Authorization: Bearer <jwt>`; per-request ES256 JWT signed by the CDP key | Snapshots (products, ticker, book), historical candles, order management, account balances |
+| WebSocket Feed | `wss://advanced-trade-ws.coinbase.com` | Public channels are unauthenticated; the `user` channel embeds a JWT in the subscribe payload | Live streams: `ticker`, `level2`, `market_trades`, `heartbeats`, `candles`, `status`, authenticated `user` |
 
-Sandbox URLs (`api-public.sandbox.exchange.coinbase.com`,
-`ws-feed-public.sandbox.exchange.coinbase.com`) are selectable via
-the `plugin.coinbase.sandbox` KV toggle.
+Sandbox URLs (`api-sandbox.coinbase.com`,
+`advanced-trade-ws-sandbox.coinbase.com`) are selectable via the
+`plugin.coinbase.sandbox` KV toggle. Sandbox is for code-shape
+verification only — many endpoints behave differently or are absent
+entirely; production testing requires a real key against prod.
 
 ## Layering
 
@@ -40,8 +49,8 @@ the `plugin.coinbase.sandbox` KV toggle.
 |--------|-------|
 | Plugin type | `PLUGIN_SERVICE` |
 | Plugin kind | `coinbase` |
-| Provides feature | `service_coinbase` |
-| Requires | *(none — libcurl/openssl/json-c link at the meson level)* |
+| Provides feature | `exchange_coinbase` |
+| Requires | `feature_exchange` |
 | Home directory | `plugins/service/coinbase/` |
 | Shared library | `libcoinbase.so` |
 
@@ -49,47 +58,55 @@ Hard layering rules apply (`plugins/service/AGENTS.md`):
 
 1. **Zero user commands.** Coinbase-related `/` commands (if any
    are added) belong either in `plugins/feature/whenmoon/` (when they
-   mutate whenmoon bot state) or `plugins/cmd/coinbase/` (for
+   mutate whenmoon state) or `plugins/cmd/coinbase/` (for
    standalone users).
 2. **No upward includes or `plugin_dlsym`.** Service plugins stay
    pure mechanism.
 3. **KV schema is ours.** All operator-facing knobs sit under
    `plugin.coinbase.*`.
 
-## KV Knobs (scaffolded today)
+## KV Knobs
 
 | Key | Type | Default | Role |
 |-----|------|---------|------|
 | `plugin.coinbase.sandbox` | BOOL | `false` | Use sandbox URLs. |
-| `plugin.coinbase.rest_url_prod` | STR | `https://api.exchange.coinbase.com` | REST base URL (prod). |
-| `plugin.coinbase.rest_url_sandbox` | STR | `https://api-public.sandbox.exchange.coinbase.com` | REST base URL (sandbox). |
-| `plugin.coinbase.ws_url_prod` | STR | `wss://ws-feed.exchange.coinbase.com` | WebSocket URL (prod). |
-| `plugin.coinbase.ws_url_sandbox` | STR | `wss://ws-feed-public.sandbox.exchange.coinbase.com` | WebSocket URL (sandbox). |
-| `plugin.coinbase.apikey` | STR | `` | API key. Empty = public-only mode. |
-| `plugin.coinbase.apisecret` | STR | `` | Base64 secret exactly as issued; decoded at sign time. |
-| `plugin.coinbase.passphrase` | STR | `` | Passphrase assigned at key creation. |
+| `plugin.coinbase.rest_url_prod` | STR | `https://api.coinbase.com` | REST base URL (prod). |
+| `plugin.coinbase.rest_url_sandbox` | STR | `https://api-sandbox.coinbase.com` | REST base URL (sandbox). |
+| `plugin.coinbase.ws_url_prod` | STR | `wss://advanced-trade-ws.coinbase.com` | WebSocket URL (prod). |
+| `plugin.coinbase.ws_url_sandbox` | STR | `wss://advanced-trade-ws-sandbox.coinbase.com` | WebSocket URL (sandbox). |
+| `plugin.coinbase.creds.key_name` | STR (secret) | `` | CDP key id (`organizations/<org>/apiKeys/<uuid>`). Empty = public-only mode. |
+| `plugin.coinbase.creds.private_key_pem` | STR (secret) | `` | EC P-256 PEM. Literal `\n` escape sequences are unescaped at parse time. |
 | `plugin.coinbase.rest_enabled` | BOOL | `true` | Enable REST dispatcher. |
 | `plugin.coinbase.ws_enabled` | BOOL | `false` | Enable WebSocket reader. |
 | `plugin.coinbase.cache_ttl` | UINT32 | `5` | Seconds before a snapshot is refreshed on demand. |
 | `plugin.coinbase.ws_reconnect_ms` | UINT32 | `2000` | Initial WebSocket reconnect backoff. |
 | `plugin.coinbase.request_timeout` | UINT32 | `15` | Per-call REST timeout. |
 
-### Authoritative API credentials
+The `creds.*` keys are auto-secret via `kv_is_secret_key` (the
+`creds` segment is non-tail). Reads without admin context return
+`KV_REDACTED_VALUE`.
 
-The three keys read by `cb_sign_request` (`coinbase_sign.c:124`) and
-`cb_apikey_configured` (`coinbase_sign.c:90`) for HMAC-SHA256 auth
-against `api.exchange.coinbase.com`:
+### CDP credentials
+
+Mint a CDP key at coinbase.com → Settings → API → "Create CDP key".
+Coinbase emits a JSON file containing the `name`
+(`organizations/<org-uuid>/apiKeys/<key-uuid>`) and a PEM-encoded EC
+private key. Both go straight into KV:
 
 ```
-plugin.coinbase.apikey
-plugin.coinbase.apisecret
-plugin.coinbase.passphrase
+set kv plugin.coinbase.creds.key_name organizations/<org>/apiKeys/<uuid>
+set kv plugin.coinbase.creds.private_key_pem -----BEGIN EC PRIVATE KEY-----\n...\n-----END EC PRIVATE KEY-----\n
 ```
 
-**All three must be non-empty.** `cb_apikey_configured()` short-circuits
-any private call to `CB_ERR_NO_CREDS` if any one is missing. This is
-Coinbase Exchange (formerly Coinbase Pro) auth — not the newer CDP /
-Advanced Trade JWT+ECDSA scheme.
+The PEM may be a single line with literal `\n` escape sequences —
+`coinbase_sign_cdp.c::cb_pem_unescape` translates them to real
+newlines before `PEM_read_bio_PrivateKey`. JWTs are minted per
+request (`cb_sign_jwt`), valid for 120s, with a fresh 32-hex
+`nonce` from `getrandom(2)`.
+
+`cb_apikey_configured()` (alias for `cb_cdp_configured()`)
+short-circuits any private call to `CB_ERR_NO_CREDS` if either KV
+is empty.
 
 ## Namespace split: `plugin.coinbase.*` vs `plugin.whenmoon.exchange.coinbase.*`
 
@@ -100,7 +117,7 @@ plugins and serve different purposes — neither is redundant:
   service plugin). Configures *the thing that talks to Coinbase*:
   REST/WS URLs, credentials, sandbox toggle, REST cache TTL, WS
   reconnect backoff. Anything that changes bytes-on-the-wire toward
-  `api.exchange.coinbase.com` lives here.
+  `api.coinbase.com` lives here.
 
 - **`plugin.whenmoon.exchange.coinbase.*`** — owned by the *whenmoon
   feature plugin* (`plugins/feature/whenmoon/`). Configures
@@ -117,25 +134,20 @@ coinbase calls, it belongs in `plugin.whenmoon.exchange.coinbase.*`.
 
 ## External Dependencies
 
-- `libcurl` (≥7.86 for the WebSocket client used in CB4; the
-  project ships against 8.x).
-- `libcrypto` via OpenSSL — HMAC-SHA256 + base64 for request
-  signing.
+- `libcurl` (≥7.86 for the WebSocket client; the project ships
+  against 8.x).
+- `libcrypto` via OpenSSL — ECDSA-P256 sign + base64 for JWT
+  construction. No libjwt dependency; the JWT minter is ~250 LOC of
+  EVP calls in `coinbase_sign_cdp.c`.
 - `json-c` — response parsing.
 
-No libjwt dependency here — the Exchange API predates CDP JWT and
-uses HMAC. The Advanced Trade API (`api.coinbase.com/api/v3/…`)
-would pull in libjwt, and we are deliberately *not* targeting it
-for whenmoon's first exchange.
+## Consumer Access Shapes
 
-## Consumer Access Shapes (planned)
-
-Two access patterns will coexist, both routed through
-`coinbase_api.h`:
+Two access patterns coexist, both routed through `coinbase_api.h`:
 
 1. **Pull (REST)**: `coinbase_fetch_candles_async(…)`,
-   `coinbase_fetch_ticker_async(…)`, etc. Consumer supplies a
-   typed completion callback; delivery happens on the curl worker.
+   `coinbase_fetch_ticker_async(…)`, etc. Consumer supplies a typed
+   completion callback; delivery happens on the curl worker.
 2. **Push (WebSocket)**: `coinbase_ws_subscribe(channels[],
    product_ids[], cb, user)` registers a durable subscription.
    Events arrive via `coinbase_ws_event_cb_t` on the WS reader
@@ -150,6 +162,7 @@ never via direct linker references.
 
 - Do not register `cmd_register` / `cmd_unregister` calls here;
   this is a service plugin.
-- Do not textually reference `old/whenmoon/exch_cbat.c` for API
-  shape; that code targeted the Advanced Trade endpoint, not the
-  Exchange API we're wrapping here.
+- Do not reintroduce HMAC auth, the `apikey`/`apisecret`/
+  `passphrase` KV triple, or any reference to
+  `api.exchange.coinbase.com`. Exchange is dead for retail; CDP is
+  the only supported auth path.

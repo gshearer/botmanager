@@ -391,11 +391,8 @@ cb_submit_private(void *user_data, uint8_t prio,
   curl_request_t *cr;
   char            base[CB_URL_SZ];
   char            url [CB_URL_SZ];
-  char            ts  [CB_TS_SZ];
-  char            sig [CB_SIG_SZ];
-  char            hdr [CB_URL_SZ];
-  const char     *apikey;
-  const char     *passphrase;
+  char            jwt [CB_JWT_SZ];
+  char            auth_hdr[CB_JWT_SZ + 32];
   int             n;
 
   if(!cb_apikey_configured())
@@ -416,14 +413,11 @@ cb_submit_private(void *user_data, uint8_t prio,
     return(FAIL);
   }
 
-  if(cb_timestamp_str(ts, sizeof(ts)) == 0)
-    return(FAIL);
-
-  if(!cb_sign_request(curl_method_name(method), path,
-        body, body_len, ts, sig, sizeof(sig)))
+  if(cb_sign_jwt(curl_method_name(method), path,
+        jwt, sizeof(jwt)) != SUCCESS)
   {
     clam(CLAM_WARN, CB_CTX,
-         "private submit: signing failed method=%s path='%s'",
+         "private submit: cdp sign failed method=%s path='%s'",
          curl_method_name(method), path);
     return(FAIL);
   }
@@ -439,23 +433,8 @@ cb_submit_private(void *user_data, uint8_t prio,
 
   (void)curl_request_set_prio(cr, (curl_prio_t)prio);
 
-  apikey     = kv_get_str("plugin.coinbase.apikey");
-  passphrase = kv_get_str("plugin.coinbase.passphrase");
-
-  snprintf(hdr, sizeof(hdr), "CB-ACCESS-KEY: %s",
-      apikey != NULL ? apikey : "");
-  curl_request_add_header(cr, hdr);
-
-  snprintf(hdr, sizeof(hdr), "CB-ACCESS-SIGN: %s", sig);
-  curl_request_add_header(cr, hdr);
-
-  snprintf(hdr, sizeof(hdr), "CB-ACCESS-TIMESTAMP: %s", ts);
-  curl_request_add_header(cr, hdr);
-
-  snprintf(hdr, sizeof(hdr), "CB-ACCESS-PASSPHRASE: %s",
-      passphrase != NULL ? passphrase : "");
-  curl_request_add_header(cr, hdr);
-
+  snprintf(auth_hdr, sizeof(auth_hdr), "Authorization: Bearer %s", jwt);
+  curl_request_add_header(cr, auth_hdr);
   curl_request_add_header(cr, "Accept: application/json");
 
   if(body != NULL && body_len > 0)

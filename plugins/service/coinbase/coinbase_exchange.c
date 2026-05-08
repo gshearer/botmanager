@@ -34,7 +34,7 @@
 #include <string.h>
 
 #define CB_EXCHANGE_PATH_SZ  CB_URL_SZ
-#define CB_EXCHANGE_BODY_SZ  CB_PRESIGN_SZ
+#define CB_EXCHANGE_BODY_SZ  CB_BODY_SZ
 
 typedef struct
 {

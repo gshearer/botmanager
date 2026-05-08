@@ -25,19 +25,13 @@
 #define CB_CTX "coinbase"
 
 // Size limits.
-// Base64-encoded HMAC-SHA256 is always 44 chars + NUL. 64 leaves slack
-// for any defensive code that rounds up.
-#define CB_SIG_SZ        64
-// Upper bound on the signed prehash (ts + METHOD + path + body). Order
-// bodies sit well under 1 KiB in practice; 4 KiB gives headroom for
-// future endpoints (e.g. bulk cancel) without risking silent truncation.
-#define CB_PRESIGN_SZ    4096
 // REST / WebSocket base URL buffer. Matches the convention used by
 // the coinmarketcap and openweather plugins.
 #define CB_URL_SZ        512
-// ISO-style seconds-since-epoch string: "1745432821" ≈ 10 chars; pick
-// 32 to absorb future formats (e.g. decimal fractional seconds).
-#define CB_TS_SZ         32
+// Upper bound on a signed REST request body (the JSON payload of a
+// place-order or batch_cancel call). Coinbase order bodies sit well
+// under 1 KiB; 4 KiB gives headroom for bulk operations.
+#define CB_BODY_SZ       4096
 // Error message buffer for transient classifier output. Matches the
 // CMC convention.
 #define CB_ERR_SZ        128
@@ -122,16 +116,34 @@ typedef struct cb_request
   struct cb_request *next;   // freelist linkage
 } cb_request_t;
 
-// coinbase_sign.c
+// coinbase_sign.c — URL + credential helpers.
 
 bool    cb_sandbox_enabled(void);
 bool    cb_rest_base_url(char *out, size_t cap);
 bool    cb_ws_base_url(char *out, size_t cap);
 bool    cb_apikey_configured(void);
-size_t  cb_timestamp_str(char *out, size_t cap);
-bool    cb_sign_request(const char *method, const char *path,
-            const char *body, size_t body_len, const char *ts,
-            char *sig_out, size_t sig_cap);
+
+// coinbase_sign_cdp.c — Advanced Trade JWT/ES256 signer.
+//
+// Buffer size for a rendered JWT including the two dots and the
+// trailing NUL. ~600-700 B in practice for our claim set; 1024 leaves
+// slack for a long key_name string.
+#define CB_JWT_SZ        1024
+
+// Build a fresh CDP-style JWT for `method path` against the configured
+// REST host. `method` is uppercase ("GET"/"POST"/"DELETE"); `path` is
+// the absolute path including any query. `out` receives a
+// NUL-terminated JWT on SUCCESS; contents are unspecified on FAIL.
+bool    cb_sign_jwt(const char *method, const char *path,
+            char *out, size_t cap);
+
+// True iff both plugin.coinbase.creds.key_name and
+// plugin.coinbase.creds.private_key_pem are set. Safe to call at any
+// time (does not parse the PEM).
+bool    cb_cdp_configured(void);
+
+// Release the cached EVP_PKEY + PEM snapshot. Idempotent.
+void    cb_cdp_deinit(void);
 
 // Latch the active exchange name from the sandbox KV. Idempotent;
 // must run before cb_exchange_register_vtable() and before any

@@ -366,27 +366,6 @@ static bool cb_ws_pred_needs_unsub(const cb_ws_slot_t *s)
 }
 
 // ----------------------------------------------------------------------
-// Auth signing helper
-// ----------------------------------------------------------------------
-
-// Produce signature / timestamp for an authenticated subscribe. The
-// prehash matches Coinbase's documented rule: ts + "GET" + "/users/self/verify".
-// Returns SUCCESS when both values fit in the caller's buffers.
-static bool
-cb_ws_auth_sign(char *ts_out, size_t ts_cap,
-    char *sig_out, size_t sig_cap)
-{
-  if(cb_timestamp_str(ts_out, ts_cap) == 0)
-    return(FAIL);
-
-  if(cb_sign_request("GET", "/users/self/verify", NULL, 0, ts_out,
-        sig_out, sig_cap) != SUCCESS)
-    return(FAIL);
-
-  return(SUCCESS);
-}
-
-// ----------------------------------------------------------------------
 // Reconcile — emit subscribe / unsubscribe frames for pending deltas
 // ----------------------------------------------------------------------
 
@@ -437,40 +416,11 @@ cb_ws_send_delta_locked(const char *op, cb_ws_slot_pred_t pred,
     }
   }
 
-  // --- auth half (only if credentials are configured) ---
-  if(!cb_apikey_configured())
-    return;
-
-  char ts [CB_TS_SZ];
-  char sig[CB_SIG_SZ];
-
-  if(cb_ws_auth_sign(ts, sizeof(ts), sig, sizeof(sig)) != SUCCESS)
-  {
-    clam(CLAM_WARN, CB_CTX, "ws %s auth sign failed", op);
-    return;
-  }
-
-  const char *apikey     = kv_get_str("plugin.coinbase.apikey");
-  const char *passphrase = kv_get_str("plugin.coinbase.passphrase");
-
-  len = cb_ws_render_frame_locked(frame, sizeof(frame), op, /* auth_only */ true,
-      pred, sig, apikey, passphrase, ts);
-
-  if(len == 0)
-    return;
-
-  ok = (cb_ws_send_json(frame, len) == SUCCESS);
-
-  if(ok)
-  {
-    cb_ws_mark_slots_locked(pred, /* auth_only */ true, new_sent_state);
-    clam(CLAM_INFO, CB_CTX, "ws %s (auth, %zu bytes)", op, len);
-  }
-  else
-  {
-    clam(CLAM_DEBUG, CB_CTX,
-        "ws %s (auth) held: session not open", op);
-  }
+  // Advanced Trade `user`-channel subscribe uses a JWT in the
+  // subscribe payload itself, not transport-level headers. That
+  // wiring is part of WM-LT-8-B; until it lands, no auth-only
+  // channels are reconciled here. Public channels (heartbeats /
+  // ticker / matches / level2) flow through the half above.
 }
 
 // ----------------------------------------------------------------------
