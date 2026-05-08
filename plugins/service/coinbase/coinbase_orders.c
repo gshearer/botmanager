@@ -526,7 +526,7 @@ coinbase_place_order_async(const coinbase_place_order_req_t *req,
   r->body     = body;
   r->body_len = body_len;
 
-  if(cb_submit_private(r, CURL_METHOD_POST, "/orders",
+  if(cb_submit_private(r, CURL_PRIO_NORMAL, CURL_METHOD_POST, "/orders",
         body, body_len, cb_order_done) != SUCCESS)
   {
     cb_deliver_order_fail(r,
@@ -568,7 +568,7 @@ coinbase_cancel_order_async(const char *order_id,
     return(FAIL);
   }
 
-  if(cb_submit_private(r, CURL_METHOD_DELETE, path,
+  if(cb_submit_private(r, CURL_PRIO_NORMAL, CURL_METHOD_DELETE, path,
         NULL, 0, cb_order_done) != SUCCESS)
   {
     cb_deliver_order_fail(r,
@@ -610,7 +610,7 @@ coinbase_get_order_async(const char *order_id,
     return(FAIL);
   }
 
-  if(cb_submit_private(r, CURL_METHOD_GET, path,
+  if(cb_submit_private(r, CURL_PRIO_NORMAL, CURL_METHOD_GET, path,
         NULL, 0, cb_order_done) != SUCCESS)
   {
     cb_deliver_order_fail(r,
@@ -687,7 +687,7 @@ coinbase_list_orders_async(const char *status, const char *product_id,
     }
   }
 
-  if(cb_submit_private(r, CURL_METHOD_GET, path,
+  if(cb_submit_private(r, CURL_PRIO_NORMAL, CURL_METHOD_GET, path,
         NULL, 0, cb_orders_list_done) != SUCCESS)
   {
     cb_deliver_orders_fail(r,
@@ -714,7 +714,7 @@ coinbase_get_accounts_async(coinbase_done_accounts_cb_t cb, void *user)
     return(FAIL);
   }
 
-  if(cb_submit_private(r, CURL_METHOD_GET, "/accounts",
+  if(cb_submit_private(r, CURL_PRIO_NORMAL, CURL_METHOD_GET, "/accounts",
         NULL, 0, cb_accounts_done) != SUCCESS)
   {
     cb_deliver_accounts_fail(r,

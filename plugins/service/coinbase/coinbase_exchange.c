@@ -8,6 +8,15 @@
 // them is deferred until the live-trading framework is unpaused (see
 // EX-1 outcomes in TODO.md).
 //
+// WM-LT-8-A: lifted the is_private → FAIL gate. With cb_submit_private
+// now mirroring cb_submit_public's (void *user_data, uint8_t prio)
+// shape, EXCHANGE_OP_PRIVATE_REST_{GET,POST,DELETE} routes through
+// cb_submit_private exactly as public traffic routes through
+// cb_submit_public. The kill-switch + risk gates that prevent live
+// trading from emitting actual orders live in WM-LT-8-B at the
+// whenmoon trade-engine layer, not here — this layer is intentionally
+// thin (build/submit/free + curl→exchange response adapter).
+//
 // The vtable handle is a small heap struct that holds the (kind, path,
 // body) triple plus the abstraction's response cb + user pointer.
 // build_request just allocates the handle (no curl work yet); submit
@@ -163,6 +172,21 @@ cb_exchange_build_request(exchange_op_kind_t kind, const char *path,
   return(SUCCESS);
 }
 
+// WM-LT-8-A: map exchange op-kind to curl HTTP method for the private
+// (signed) submit path. Public ops are GET-only and do not pass
+// through here.
+static curl_method_t
+cb_exchange_method_for_kind(exchange_op_kind_t kind)
+{
+  switch(kind)
+  {
+    case EXCHANGE_OP_PRIVATE_REST_POST:   return(CURL_METHOD_POST);
+    case EXCHANGE_OP_PRIVATE_REST_DELETE: return(CURL_METHOD_DELETE);
+    case EXCHANGE_OP_PRIVATE_REST_GET:    return(CURL_METHOD_GET);
+    default:                              return(CURL_METHOD_GET);
+  }
+}
+
 static bool
 cb_exchange_submit(void *handle, uint8_t prio,
     exchange_response_cb_t cb, void *user)
@@ -180,24 +204,22 @@ cb_exchange_submit(void *handle, uint8_t prio,
              || h->kind == EXCHANGE_OP_PRIVATE_REST_POST
              || h->kind == EXCHANGE_OP_PRIVATE_REST_DELETE);
 
+  // The handle `h` is the curl request's user_data either way, so
+  // cb_exchange_curl_done sees it directly. Priority byte threads
+  // through unchanged (CURL-PRIO-3).
   if(is_private)
   {
-    // EX-1 scope: only public REST routes through the abstraction
-    // (candles + trades). Routing signed traffic through here requires
-    // refactoring cb_submit_private's user_data plumbing — deferred
-    // until the live-trading framework is unpaused. See the EX-1
-    // outcomes section in TODO.md.
-    clam(CLAM_WARN, CB_CTX,
-        "exchange submit: private op routed but not supported in EX-1");
-    return(FAIL);
+    if(cb_submit_private(h, prio,
+          cb_exchange_method_for_kind(h->kind),
+          h->path, h->body, h->body_len,
+          cb_exchange_curl_done) != SUCCESS)
+      return(FAIL);
   }
-
-  // Public GET — the simple path. cb_submit_public gives the curl
-  // request `h` as its user_data, so cb_exchange_curl_done sees the
-  // exchange handle directly. The exchange's priority byte threads
-  // through to the curl request unchanged (CURL-PRIO-3).
-  if(cb_submit_public(h, prio, h->path, cb_exchange_curl_done) != SUCCESS)
-    return(FAIL);
+  else
+  {
+    if(cb_submit_public(h, prio, h->path, cb_exchange_curl_done) != SUCCESS)
+      return(FAIL);
+  }
 
   return(SUCCESS);
 }

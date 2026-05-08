@@ -167,11 +167,23 @@ const char *    cb_classify_http(const curl_response_t *resp,
 // appended to the selected base URL. `body` may be NULL for GET /
 // DELETE paths; if non-NULL, `body_len` bytes are used verbatim for
 // both the signing prehash and the POSTFIELDS payload. `done_cb` fires
-// on the curl worker thread. Returns FAIL if credentials are missing,
-// the base URL is unset, or the request could not be queued; caller
-// is responsible for emitting the typed failure callback on FAIL.
-bool    cb_submit_private(cb_request_t *req, curl_method_t method,
-            const char *path, const char *body, size_t body_len,
+// on the curl worker thread with `user_data` echoed back via
+// `curl_response_t::user_data`. Returns FAIL if credentials are
+// missing, the base URL is unset, or the request could not be queued;
+// caller is responsible for emitting the typed failure callback on
+// FAIL.
+//
+// WM-LT-8-A: signature mirrors cb_submit_public — `void *user_data` +
+// `uint8_t prio` so the exchange-vtable submit hook can route
+// EXCHANGE_OP_PRIVATE_REST_* traffic through here without a typed
+// adapter. `prio` byte values match CURL_PRIO_* / EXCHANGE_PRIO_* on
+// purpose. Legacy typed callers (orders / accounts) pass their
+// `cb_request_t *` as `user_data` and CURL_PRIO_NORMAL as `prio`; the
+// exchange-vtable path passes its own handle and the abstraction's
+// per-request priority byte.
+bool    cb_submit_private(void *user_data, uint8_t prio,
+            curl_method_t method, const char *path,
+            const char *body, size_t body_len,
             curl_done_cb_t done_cb);
 
 // Build and submit a public (unauthenticated) REST GET. Mirror of

@@ -378,9 +378,14 @@ cb_submit_public(void *user_data, uint8_t prio, const char *path,
 // Coinbase Exchange signs the string `ts + METHOD + requestPath + body`
 // where `requestPath` is the full path including any query string. The
 // body is attached unchanged (verbatim bytes) as application/json.
+//
+// WM-LT-8-A: `user_data` is echoed back to `done_cb` via
+// `curl_response_t::user_data`. Legacy typed callers pass their
+// `cb_request_t *`; the exchange-vtable path passes its own handle.
 bool
-cb_submit_private(cb_request_t *req, curl_method_t method,
-    const char *path, const char *body, size_t body_len,
+cb_submit_private(void *user_data, uint8_t prio,
+    curl_method_t method, const char *path,
+    const char *body, size_t body_len,
     curl_done_cb_t done_cb)
 {
   curl_request_t *cr;
@@ -423,7 +428,7 @@ cb_submit_private(cb_request_t *req, curl_method_t method,
     return(FAIL);
   }
 
-  cr = curl_request_create(method, url, done_cb, req);
+  cr = curl_request_create(method, url, done_cb, user_data);
 
   if(cr == NULL)
   {
@@ -431,6 +436,8 @@ cb_submit_private(cb_request_t *req, curl_method_t method,
          "private submit: curl_request_create failed url='%s'", url);
     return(FAIL);
   }
+
+  (void)curl_request_set_prio(cr, (curl_prio_t)prio);
 
   apikey     = kv_get_str("plugin.coinbase.apikey");
   passphrase = kv_get_str("plugin.coinbase.passphrase");

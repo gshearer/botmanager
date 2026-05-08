@@ -74,6 +74,47 @@ Hard layering rules apply (`plugins/service/AGENTS.md`):
 | `plugin.coinbase.ws_reconnect_ms` | UINT32 | `2000` | Initial WebSocket reconnect backoff. |
 | `plugin.coinbase.request_timeout` | UINT32 | `15` | Per-call REST timeout. |
 
+### Authoritative API credentials
+
+The three keys read by `cb_sign_request` (`coinbase_sign.c:124`) and
+`cb_apikey_configured` (`coinbase_sign.c:90`) for HMAC-SHA256 auth
+against `api.exchange.coinbase.com`:
+
+```
+plugin.coinbase.apikey
+plugin.coinbase.apisecret
+plugin.coinbase.passphrase
+```
+
+**All three must be non-empty.** `cb_apikey_configured()` short-circuits
+any private call to `CB_ERR_NO_CREDS` if any one is missing. This is
+Coinbase Exchange (formerly Coinbase Pro) auth — not the newer CDP /
+Advanced Trade JWT+ECDSA scheme.
+
+## Namespace split: `plugin.coinbase.*` vs `plugin.whenmoon.exchange.coinbase.*`
+
+Two distinct KV namespaces touch coinbase. They belong to different
+plugins and serve different purposes — neither is redundant:
+
+- **`plugin.coinbase.*`** — owned by *this plugin* (the coinbase
+  service plugin). Configures *the thing that talks to Coinbase*:
+  REST/WS URLs, credentials, sandbox toggle, REST cache TTL, WS
+  reconnect backoff. Anything that changes bytes-on-the-wire toward
+  `api.exchange.coinbase.com` lives here.
+
+- **`plugin.whenmoon.exchange.coinbase.*`** — owned by the *whenmoon
+  feature plugin* (`plugins/feature/whenmoon/`). Configures
+  whenmoon's *consumer-side* policy when calling through coinbase:
+  account-poll cadence (`account.refresh_sec`), per-exchange
+  rate-limit (`rate_limit_rps`), and the WM-LT-8 live-trading
+  kill-switch (`live`). These knobs change *how whenmoon uses*
+  coinbase, not how coinbase itself is configured.
+
+Rule of thumb: if a knob would still apply to a hypothetical second
+consumer of the coinbase service plugin, it belongs in
+`plugin.coinbase.*`. If it's specific to whenmoon's behavior around
+coinbase calls, it belongs in `plugin.whenmoon.exchange.coinbase.*`.
+
 ## External Dependencies
 
 - `libcurl` (≥7.86 for the WebSocket client used in CB4; the
