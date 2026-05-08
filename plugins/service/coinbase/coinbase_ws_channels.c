@@ -654,6 +654,166 @@ cb_ws_dispatch_l2_locked(struct json_object *event, int64_t frame_time_ms)
   cb_ws_fanout_locked(&ev);
 }
 
+// Pull a JSON field that the gateway emits as either a quoted decimal
+// ("50000.00") or a bare JSON number (50000.00). Advanced Trade is
+// inconsistent across endpoints; the user channel in particular has
+// historically flipped representations between minor SDK versions.
+static double
+cb_ws_get_decimal_loose(struct json_object *obj, const char *key)
+{
+  char    s[64];
+  double  d = 0.0;
+
+  if(json_get_str(obj, key, s, sizeof(s)))
+    return(strtod(s, NULL));
+
+  if(json_get_double(obj, key, &d))
+    return(d);
+
+  return(0.0);
+}
+
+// Parse one entry from `events[].orders[]`. The AT user channel order
+// shape carries the full order lifecycle: status transitions
+// (OPEN → FILLED / CANCELLED / EXPIRED / FAILED) plus running totals
+// (cumulative_quantity, leaves_quantity, avg_price, total_fees). Live-
+// trading consumers derive fill-deltas from successive cumulative_qty
+// observations on the same order_id when no separate `fills[]` array
+// is present.
+static void
+cb_ws_dispatch_user_order_locked(struct json_object *order_obj,
+    int64_t frame_time_ms)
+{
+  coinbase_ws_user_event_t  evp = {0};
+  coinbase_ws_user_order_t *o   = &evp.u.order;
+  coinbase_ws_event_t       pe  = {0};
+  char                      buf[64];
+
+  evp.kind = COINBASE_WS_USER_KIND_ORDER;
+
+  json_get_str(order_obj, "order_id",        o->order_id,
+      sizeof(o->order_id));
+  json_get_str(order_obj, "client_order_id", o->client_order_id,
+      sizeof(o->client_order_id));
+  json_get_str(order_obj, "product_id",      o->product_id,
+      sizeof(o->product_id));
+  json_get_str(order_obj, "status",          o->status,
+      sizeof(o->status));
+
+  if(json_get_str(order_obj, "order_side", o->side, sizeof(o->side)))
+    cb_ws_lower_ascii(o->side);
+
+  o->limit_price         = cb_ws_get_decimal_loose(order_obj, "limit_price");
+  o->cumulative_quantity = cb_ws_get_decimal_loose(order_obj,
+      "cumulative_quantity");
+  o->leaves_quantity     = cb_ws_get_decimal_loose(order_obj,
+      "leaves_quantity");
+  o->avg_price           = cb_ws_get_decimal_loose(order_obj, "avg_price");
+  o->total_fees          = cb_ws_get_decimal_loose(order_obj, "total_fees");
+
+  if(json_get_str(order_obj, "creation_time", buf, sizeof(buf)))
+    o->creation_time_ms = cb_ws_parse_iso8601_ms(buf);
+
+  o->time_ms = frame_time_ms;
+
+  pe.channel    = COINBASE_CH_USER;
+  pe.product_id = o->product_id[0] ? o->product_id : NULL;
+  pe.sequence   = 0;
+  pe.gap        = false;
+  pe.payload    = &evp;
+
+  cb_ws_fanout_locked(&pe);
+}
+
+// Parse one entry from `events[].fills[]`. Coinbase's AT docs describe
+// this array as forthcoming / SDK-version-dependent; whether and when it
+// fires is gateway-controlled. The parser lands ahead of consumers so
+// the live engine sees fills the moment the gateway starts emitting
+// them. Until then, fill detail is derived from order-update deltas.
+static void
+cb_ws_dispatch_user_fill_locked(struct json_object *fill_obj,
+    int64_t frame_time_ms)
+{
+  coinbase_ws_user_event_t  evp = {0};
+  coinbase_ws_user_fill_t  *f   = &evp.u.fill;
+  coinbase_ws_event_t       pe  = {0};
+  char                      buf[64];
+
+  evp.kind = COINBASE_WS_USER_KIND_FILL;
+
+  json_get_str(fill_obj, "order_id",        f->order_id,
+      sizeof(f->order_id));
+  json_get_str(fill_obj, "client_order_id", f->client_order_id,
+      sizeof(f->client_order_id));
+  json_get_str(fill_obj, "product_id",      f->product_id,
+      sizeof(f->product_id));
+
+  if(json_get_str(fill_obj, "side", f->side, sizeof(f->side)))
+    cb_ws_lower_ascii(f->side);
+
+  if(json_get_str(fill_obj, "trade_id", buf, sizeof(buf)))
+    f->trade_id = (int64_t)strtoll(buf, NULL, 10);
+
+  f->price = cb_ws_get_decimal_loose(fill_obj, "price");
+  f->size  = cb_ws_get_decimal_loose(fill_obj, "size");
+  f->fee   = cb_ws_get_decimal_loose(fill_obj, "fee");
+
+  if(json_get_str(fill_obj, "time", buf, sizeof(buf)))
+    f->time_ms = cb_ws_parse_iso8601_ms(buf);
+
+  if(f->time_ms == 0) f->time_ms = frame_time_ms;
+
+  pe.channel    = COINBASE_CH_USER;
+  pe.product_id = f->product_id[0] ? f->product_id : NULL;
+  pe.sequence   = 0;
+  pe.gap        = false;
+  pe.payload    = &evp;
+
+  cb_ws_fanout_locked(&pe);
+}
+
+static void
+cb_ws_dispatch_user_locked(struct json_object *event,
+    int64_t frame_time_ms)
+{
+  struct json_object *orders;
+  struct json_object *fills;
+  size_t              n;
+  size_t              i;
+
+  orders = json_get_array(event, "orders");
+
+  if(orders != NULL)
+  {
+    n = json_object_array_length(orders);
+
+    for(i = 0; i < n; i++)
+    {
+      struct json_object *o = json_object_array_get_idx(orders, i);
+
+      if(o == NULL) continue;
+
+      cb_ws_dispatch_user_order_locked(o, frame_time_ms);
+    }
+  }
+
+  fills = json_get_array(event, "fills");
+
+  if(fills != NULL)
+  {
+    n = json_object_array_length(fills);
+
+    for(i = 0; i < n; i++)
+    {
+      struct json_object *f = json_object_array_get_idx(fills, i);
+
+      if(f == NULL) continue;
+
+      cb_ws_dispatch_user_fill_locked(f, frame_time_ms);
+    }
+  }
+}
+
 static void
 cb_ws_dispatch_status_locked(struct json_object *event,
     int64_t frame_time_ms)
@@ -845,7 +1005,7 @@ cb_ws_channels_dispatch(const char *buf, size_t len)
     else if(strcmp(channel, "status") == 0)
       cb_ws_dispatch_status_locked(event, frame_time_ms);
     else if(strcmp(channel, "user") == 0)
-      ;  // user-channel parsing lands in WM-LT-8-B
+      cb_ws_dispatch_user_locked(event, frame_time_ms);
     else
       clam(CLAM_DEBUG3, CB_CTX, "ws ignoring channel=%s", channel);
   }

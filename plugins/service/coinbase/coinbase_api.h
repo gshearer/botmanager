@@ -269,6 +269,59 @@ typedef struct
   int64_t time_ms;
 } coinbase_ws_status_t;
 
+// `user` channel event (Advanced Trade — authenticated, requires CDP
+// JWT). The AT user channel emits per-order lifecycle updates inside an
+// `events[].orders[]` array, and per-fill detail inside an optional
+// `events[].fills[]` array. Each parsed entry surfaces as a single
+// fanout event keyed by `kind` so the consumer can switch and read the
+// matching union arm. `product_id` on the wrapping `coinbase_ws_event_t`
+// mirrors the order's / fill's product so the existing fanout product
+// filter applies as for any other per-product channel.
+typedef enum
+{
+  COINBASE_WS_USER_KIND_ORDER = 0,
+  COINBASE_WS_USER_KIND_FILL  = 1
+} coinbase_ws_user_kind_t;
+
+typedef struct
+{
+  char    order_id[COINBASE_ORDER_ID_SZ];
+  char    client_order_id[COINBASE_CLIENT_OID_SZ];
+  char    product_id[COINBASE_PRODUCT_ID_SZ];
+  char    side[COINBASE_SIDE_SZ];        // "buy" / "sell" (lowercased)
+  char    status[COINBASE_STATUS_SZ];    // OPEN/FILLED/CANCELLED/EXPIRED/FAILED
+  double  limit_price;
+  double  cumulative_quantity;           // total filled so far
+  double  leaves_quantity;               // unfilled remainder
+  double  avg_price;                     // VWAP across fills so far
+  double  total_fees;
+  int64_t creation_time_ms;
+  int64_t time_ms;                       // envelope timestamp
+} coinbase_ws_user_order_t;
+
+typedef struct
+{
+  char    order_id[COINBASE_ORDER_ID_SZ];
+  char    client_order_id[COINBASE_CLIENT_OID_SZ];
+  char    product_id[COINBASE_PRODUCT_ID_SZ];
+  char    side[COINBASE_SIDE_SZ];        // "buy" / "sell" (lowercased)
+  int64_t trade_id;
+  double  price;
+  double  size;
+  double  fee;
+  int64_t time_ms;
+} coinbase_ws_user_fill_t;
+
+typedef struct
+{
+  coinbase_ws_user_kind_t kind;
+  union
+  {
+    coinbase_ws_user_order_t order;
+    coinbase_ws_user_fill_t  fill;
+  } u;
+} coinbase_ws_user_event_t;
+
 // WebSocket event callback. Invoked on the plugin's WS reader — fast,
 // non-blocking, no recursive calls back into coinbase_ws_subscribe().
 typedef void (*coinbase_ws_event_cb_t)(const coinbase_ws_event_t *ev,
