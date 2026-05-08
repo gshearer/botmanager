@@ -137,6 +137,12 @@ bool    cb_apikey_configured(void);
 bool    cb_sign_jwt(const char *method, const char *path,
             char *out, size_t cap);
 
+// Mint a CDP JWT suitable for the Advanced Trade WS subscribe payload.
+// The "uri" claim is omitted — Advanced Trade WS accepts a single JWT
+// per subscribe regardless of channel. Caller mints per subscribe and
+// embeds the result in the JSON {... "jwt": "<jwt>"}.
+bool    cb_sign_jwt_ws(char *out, size_t cap);
+
 // True iff both plugin.coinbase.creds.key_name and
 // plugin.coinbase.creds.private_key_pem are set. Safe to call at any
 // time (does not parse the PEM).

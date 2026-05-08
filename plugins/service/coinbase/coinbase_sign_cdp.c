@@ -337,22 +337,15 @@ cb_url_host(const char *url, char *out, size_t cap)
   return(SUCCESS);
 }
 
-// Build a fresh CDP-style JWT for the given (method, path) tuple
-// against the configured REST host. `method` should be one of
-// "GET" / "POST" / "DELETE" (uppercase — Coinbase rejects lowercase).
-// `path` is the absolute path component of the request, including
-// any query string.
-//
-// On SUCCESS, `out` is a NUL-terminated JWT (header.payload.sig)
-// fitting in `cap`. On FAIL the buffer contents are unspecified.
-bool
-cb_sign_jwt(const char *method, const char *path,
-    char *out, size_t cap)
+// Inner JWT builder. When `uri_claim` is non-NULL it is embedded
+// verbatim as the payload's "uri" claim (REST minting passes
+// "<METHOD> <host><path>"); when NULL the claim is omitted (Advanced
+// Trade WebSocket auth).
+static bool
+cb_sign_jwt_inner(const char *uri_claim, char *out, size_t cap)
 {
   EVP_PKEY      *pk;
   const char    *key_name;
-  char           host[256];
-  char           rest_url[CB_URL_SZ];
   char           nonce[CB_JWT_NONCE_HEX + 1];
   char           header_json[256];
   char           payload_json[512];
@@ -368,10 +361,9 @@ cb_sign_jwt(const char *method, const char *path,
   size_t         sb_len;
   time_t         now;
 
-  if(method == NULL || path == NULL || out == NULL || cap == 0)
+  if(out == NULL || cap == 0)
     return(FAIL);
 
-  // Credentials must be present.
   kv_admin_context_set(true);
   key_name = kv_get_str("plugin.coinbase.creds.key_name");
   kv_admin_context_set(false);
@@ -379,17 +371,9 @@ cb_sign_jwt(const char *method, const char *path,
   if(key_name == NULL || key_name[0] == '\0')
     return(FAIL);
 
-  if(cb_rest_base_url(rest_url, sizeof(rest_url)) != SUCCESS)
-    return(FAIL);
-
-  if(cb_url_host(rest_url, host, sizeof(host)) != SUCCESS)
-    return(FAIL);
-
   if(cb_random_hex(nonce, CB_JWT_NONCE_HEX) != SUCCESS)
     return(FAIL);
 
-  // Header. JSON keys are quoted, no embedded special chars from
-  // either kid or nonce (kid is opaque CDP identifier, nonce is hex).
   n = snprintf(header_json, sizeof(header_json),
       "{\"alg\":\"ES256\",\"typ\":\"JWT\",\"kid\":\"%s\",\"nonce\":\"%s\"}",
       key_name, nonce);
@@ -403,17 +387,27 @@ cb_sign_jwt(const char *method, const char *path,
   if(hb_len == 0)
     return(FAIL);
 
-  // Payload.
   now = time(NULL);
 
-  n = snprintf(payload_json, sizeof(payload_json),
-      "{\"iss\":\"cdp\",\"sub\":\"%s\","
-      "\"nbf\":%lld,\"exp\":%lld,"
-      "\"uri\":\"%s %s%s\"}",
-      key_name,
-      (long long)now,
-      (long long)now + CB_JWT_LIFETIME_SEC,
-      method, host, path);
+  if(uri_claim != NULL)
+  {
+    n = snprintf(payload_json, sizeof(payload_json),
+        "{\"iss\":\"cdp\",\"sub\":\"%s\","
+        "\"nbf\":%lld,\"exp\":%lld,\"uri\":\"%s\"}",
+        key_name,
+        (long long)now,
+        (long long)now + CB_JWT_LIFETIME_SEC,
+        uri_claim);
+  }
+  else
+  {
+    n = snprintf(payload_json, sizeof(payload_json),
+        "{\"iss\":\"cdp\",\"sub\":\"%s\","
+        "\"nbf\":%lld,\"exp\":%lld}",
+        key_name,
+        (long long)now,
+        (long long)now + CB_JWT_LIFETIME_SEC);
+  }
 
   if(n < 0 || (size_t)n >= sizeof(payload_json))
     return(FAIL);
@@ -457,13 +451,51 @@ cb_sign_jwt(const char *method, const char *path,
   if(sb_len == 0)
     return(FAIL);
 
-  // Final JWT.
   n = snprintf(out, cap, "%s.%s", signing_input, sig_b64);
 
   if(n < 0 || (size_t)n >= cap)
     return(FAIL);
 
   return(SUCCESS);
+}
+
+// Build a fresh CDP JWT for a REST request. `method` is uppercase
+// ("GET" / "POST" / "DELETE"); `path` is the absolute path including
+// any query string. The "uri" claim binds the JWT to that exact
+// request, so callers must mint per-request.
+bool
+cb_sign_jwt(const char *method, const char *path, char *out, size_t cap)
+{
+  char rest_url[CB_URL_SZ];
+  char host[256];
+  char uri[1024];
+  int  n;
+
+  if(method == NULL || path == NULL)
+    return(FAIL);
+
+  if(cb_rest_base_url(rest_url, sizeof(rest_url)) != SUCCESS)
+    return(FAIL);
+
+  if(cb_url_host(rest_url, host, sizeof(host)) != SUCCESS)
+    return(FAIL);
+
+  n = snprintf(uri, sizeof(uri), "%s %s%s", method, host, path);
+
+  if(n < 0 || (size_t)n >= sizeof(uri))
+    return(FAIL);
+
+  return(cb_sign_jwt_inner(uri, out, cap));
+}
+
+// Build a fresh CDP JWT for a WebSocket subscribe payload. Advanced
+// Trade WS auth omits the "uri" claim — the same JWT is valid against
+// any subscribe within its lifetime. Mint fresh per subscribe (cheap;
+// avoids re-auth races on long-lived sessions).
+bool
+cb_sign_jwt_ws(char *out, size_t cap)
+{
+  return(cb_sign_jwt_inner(NULL, out, cap));
 }
 
 bool

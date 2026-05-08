@@ -1,5 +1,5 @@
 // botmanager — MIT
-// Coinbase Exchange: WebSocket channel multiplexer (CB5).
+// Coinbase Advanced Trade: WebSocket channel multiplexer (CB5).
 //
 // Layered on top of CB4's single-session transport. Owns the list of
 // local subscribers and a dedup table of (channel, product) slots so
@@ -8,20 +8,21 @@
 // upstream. On reconnect the slot table drives a full resubscribe so
 // consumer callbacks never miss a beat across a flap.
 //
-// Parses each inbound text frame into a typed event and fans it out
-// to every local subscriber whose channel + product set matches.
+// Wire format is Advanced Trade: one channel per subscribe frame,
+//   {"type":"subscribe","product_ids":["BTC-USD"],
+//    "channel":"ticker","jwt":"<jwt>"}
+// — every subscribe (public or private) requires a fresh CDP JWT.
+// Inbound events are wrapped in an envelope:
+//   {"channel":"<name>","timestamp":"...","sequence_num":N,
+//    "events":[{...}]}
+// where the per-event payload depends on the channel.
 //
-// Sequence gap detection is intentionally not performed. Coinbase's
-// `sequence` field is per-product-global — every event for a product
-// across every channel increments it — so any consumer subscribed to
-// a strict subset (e.g. heartbeat + ticker without matches/level2)
-// will observe huge "gaps" on every unsubscribed-channel event. Doing
-// per-(channel, product) gap detection produces a flood of false
-// positives at production volumes (hundreds/sec on a busy pair).
-// True per-message integrity needs a `full` subscription and per-
-// product (not per-channel) tracking; we don't subscribe to `full`
-// for trading, so the check is skipped. The `coinbase_ws_event_t.gap`
-// field is preserved as an ABI placeholder and remains false.
+// Sequence gap detection is intentionally not performed. The
+// envelope's `sequence_num` is per-channel-per-connection (advances on
+// every frame the gateway sends us) — useful for connection-level
+// integrity but not directly comparable across consumer subsets. The
+// `coinbase_ws_event_t.gap` field is preserved as an ABI placeholder
+// and remains false.
 
 #define CB_INTERNAL
 #include "coinbase.h"
@@ -93,20 +94,24 @@ static struct
 // Channel metadata
 // ----------------------------------------------------------------------
 
+// Channel-name mapping uses Advanced Trade names on the wire. The
+// public ABI enum still carries CB_FULL / CB_LEVEL2_BATCH for legacy
+// source compatibility, but Advanced Trade has no equivalent — those
+// slots return NULL and are silently skipped at subscribe time.
 static const char *
 cb_ws_channel_name(coinbase_ws_channel_t ch)
 {
   switch(ch)
   {
-    case COINBASE_CH_HEARTBEAT:    return("heartbeat");
+    case COINBASE_CH_HEARTBEAT:    return("heartbeats");
     case COINBASE_CH_STATUS:       return("status");
     case COINBASE_CH_TICKER:       return("ticker");
     case COINBASE_CH_TICKER_BATCH: return("ticker_batch");
     case COINBASE_CH_LEVEL2:       return("level2");
-    case COINBASE_CH_LEVEL2_BATCH: return("level2_batch");
-    case COINBASE_CH_MATCHES:      return("matches");
-    case COINBASE_CH_FULL:         return("full");
+    case COINBASE_CH_MATCHES:      return("market_trades");
     case COINBASE_CH_USER:         return("user");
+    case COINBASE_CH_LEVEL2_BATCH: return(NULL);
+    case COINBASE_CH_FULL:         return(NULL);
     case COINBASE_CH__COUNT:       break;
   }
   return(NULL);
@@ -115,13 +120,14 @@ cb_ws_channel_name(coinbase_ws_channel_t ch)
 static bool
 cb_ws_channel_is_per_product(coinbase_ws_channel_t ch)
 {
-  return(ch != COINBASE_CH_STATUS);
-}
-
-static bool
-cb_ws_channel_needs_auth(coinbase_ws_channel_t ch)
-{
-  return(ch == COINBASE_CH_FULL || ch == COINBASE_CH_USER);
+  // Advanced Trade requires `product_ids` on every subscribe, including
+  // the channels that *emit* global events (heartbeats fires whenever
+  // any subscribed product has activity; status emits product metadata
+  // for the requested products). Slot-keying still uses the product
+  // id; heartbeats/status events arrive without a product_id field so
+  // fanout sees ev->product_id == NULL and matches any subscriber.
+  (void)ch;
+  return(true);
 }
 
 // Coinbase timestamps are ISO 8601 with optional fractional seconds:
@@ -235,120 +241,87 @@ cb_ws_slots_compact_locked(void)
 // Frame rendering
 // ----------------------------------------------------------------------
 
-// Render a subscribe / unsubscribe frame covering every slot that
-// matches `auth_only` and passes the `include_slot` predicate. Returns
-// bytes written, or 0 when no slot qualifies (caller must not emit an
-// empty frame). Auth frames include the signature block; public frames
-// do not. All identifiers used (channel names, product ids, sig, key,
-// passphrase, ts) are JSON-safe by construction (allowlisted enums or
-// base64) so no escaping is performed.
+// Render one Advanced Trade subscribe / unsubscribe frame for a single
+// channel, listing every product whose slot passes `include_slot`.
+// `jwt` is embedded verbatim and must already be minted. Returns bytes
+// written, or 0 when no slot qualifies for `channel` under `pred`
+// (caller skips the frame). Channel name, product ids, and jwt are
+// JSON-safe by construction (allowlisted enums, base64url, hex).
 typedef bool (*cb_ws_slot_pred_t)(const cb_ws_slot_t *);
 
 static size_t
 cb_ws_render_frame_locked(char *out, size_t cap, const char *type,
-    bool auth_only, cb_ws_slot_pred_t include_slot,
-    const char *sig, const char *apikey, const char *passphrase,
-    const char *ts)
+    coinbase_ws_channel_t channel, cb_ws_slot_pred_t include_slot,
+    const char *jwt)
 {
-  size_t pos = 0;
-  int    n;
-  bool   first_channel = true;
-  bool   any           = false;
+  const char *cname;
+  size_t      pos       = 0;
+  bool        per_product;
+  bool        first_pid = true;
+  bool        any       = false;
+  int         n;
 
-  if(out == NULL || cap == 0) return(0);
+  if(out == NULL || cap == 0 || jwt == NULL)
+    return(0);
+
+  cname = cb_ws_channel_name(channel);
+  if(cname == NULL) return(0);
+
+  per_product = cb_ws_channel_is_per_product(channel);
 
   n = snprintf(out + pos, cap - pos, "{\"type\":\"%s\"", type);
   if(n < 0 || (size_t)n >= cap - pos) return(0);
   pos += (size_t)n;
 
-  if(auth_only)
+  if(per_product)
   {
-    n = snprintf(out + pos, cap - pos,
-        ",\"signature\":\"%s\",\"key\":\"%s\""
-        ",\"passphrase\":\"%s\",\"timestamp\":\"%s\"",
-        (sig != NULL) ? sig : "",
-        (apikey != NULL) ? apikey : "",
-        (passphrase != NULL) ? passphrase : "",
-        (ts != NULL) ? ts : "");
+    n = snprintf(out + pos, cap - pos, ",\"product_ids\":[");
     if(n < 0 || (size_t)n >= cap - pos) return(0);
     pos += (size_t)n;
-  }
 
-  n = snprintf(out + pos, cap - pos, ",\"channels\":[");
-  if(n < 0 || (size_t)n >= cap - pos) return(0);
-  pos += (size_t)n;
-
-  for(int ch = 0; ch < COINBASE_CH__COUNT; ch++)
-  {
-    coinbase_ws_channel_t  cch = (coinbase_ws_channel_t)ch;
-    const char            *cname;
-    bool                   emitted = false;
-
-    if(cb_ws_channel_needs_auth(cch) != auth_only) continue;
-
-    cname = cb_ws_channel_name(cch);
-    if(cname == NULL) continue;
-
-    // Gather product_ids for this channel from the slot table.
     for(uint32_t i = 0; i < cb_ws_ch.n_slots; i++)
     {
       cb_ws_slot_t *s = &cb_ws_ch.slots[i];
 
-      if(s->channel != cch) continue;
-      if(!include_slot(s))  continue;
+      if(s->channel != channel) continue;
+      if(!include_slot(s))      continue;
 
-      if(!emitted)
-      {
-        if(!first_channel)
-        {
-          if(pos >= cap - 1) return(0);
-          out[pos++] = ',';
-        }
-        first_channel = false;
-
-        if(!cb_ws_channel_is_per_product(cch))
-        {
-          n = snprintf(out + pos, cap - pos, "\"%s\"", cname);
-          if(n < 0 || (size_t)n >= cap - pos) return(0);
-          pos += (size_t)n;
-          emitted = true;
-          any     = true;
-          break;           // non-product channel has no product list
-        }
-
-        n = snprintf(out + pos, cap - pos,
-            "{\"name\":\"%s\",\"product_ids\":[", cname);
-        if(n < 0 || (size_t)n >= cap - pos) return(0);
-        pos += (size_t)n;
-
-        n = snprintf(out + pos, cap - pos, "\"%s\"", s->product_id);
-        if(n < 0 || (size_t)n >= cap - pos) return(0);
-        pos += (size_t)n;
-
-        emitted = true;
-        any     = true;
-      }
-      else
-      {
-        n = snprintf(out + pos, cap - pos, ",\"%s\"", s->product_id);
-        if(n < 0 || (size_t)n >= cap - pos) return(0);
-        pos += (size_t)n;
-      }
-    }
-
-    if(emitted && cb_ws_channel_is_per_product(cch))
-    {
-      n = snprintf(out + pos, cap - pos, "]}");
+      n = snprintf(out + pos, cap - pos, "%s\"%s\"",
+          first_pid ? "" : ",", s->product_id);
       if(n < 0 || (size_t)n >= cap - pos) return(0);
       pos += (size_t)n;
+
+      first_pid = false;
+      any       = true;
     }
+
+    if(!any) return(0);
+
+    n = snprintf(out + pos, cap - pos, "]");
+    if(n < 0 || (size_t)n >= cap - pos) return(0);
+    pos += (size_t)n;
+  }
+  else
+  {
+    for(uint32_t i = 0; i < cb_ws_ch.n_slots; i++)
+    {
+      cb_ws_slot_t *s = &cb_ws_ch.slots[i];
+
+      if(s->channel != channel) continue;
+      if(!include_slot(s))      continue;
+      any = true;
+      break;
+    }
+
+    if(!any) return(0);
   }
 
-  n = snprintf(out + pos, cap - pos, "]}");
+  n = snprintf(out + pos, cap - pos,
+      ",\"channel\":\"%s\",\"jwt\":\"%s\"}", cname, jwt);
   if(n < 0 || (size_t)n >= cap - pos) return(0);
   pos += (size_t)n;
 
-  return(any ? pos : 0);
+  return(pos);
 }
 
 // ----------------------------------------------------------------------
@@ -369,58 +342,57 @@ static bool cb_ws_pred_needs_unsub(const cb_ws_slot_t *s)
 // Reconcile — emit subscribe / unsubscribe frames for pending deltas
 // ----------------------------------------------------------------------
 
-// After a successful send for a subscribe frame, mark every slot the
-// frame covered as sent_upstream=true. After an unsubscribe frame,
-// flip sent_upstream=false. The predicate selects the same set used at
-// render time so the state transitions line up with the wire.
-static void
-cb_ws_mark_slots_locked(cb_ws_slot_pred_t pred, bool auth_only,
-    bool sent_state)
-{
-  for(uint32_t i = 0; i < cb_ws_ch.n_slots; i++)
-  {
-    cb_ws_slot_t *s = &cb_ws_ch.slots[i];
-
-    if(cb_ws_channel_needs_auth(s->channel) != auth_only) continue;
-    if(!pred(s)) continue;
-
-    s->sent_upstream = sent_state;
-  }
-}
-
+// One frame per channel. Mints a single JWT covering the whole batch
+// (Advanced Trade accepts the same JWT on every subscribe within its
+// 120 s lifetime; minting once amortises ECDSA signing overhead in the
+// resubscribe-on-reconnect case).
 static void
 cb_ws_send_delta_locked(const char *op, cb_ws_slot_pred_t pred,
     bool new_sent_state)
 {
-  char         frame[CB_WS_CH_TX_BUF_SZ];
-  size_t       len;
-  bool         ok;
+  char    frame[CB_WS_CH_TX_BUF_SZ];
+  char    jwt[CB_JWT_SZ];
+  size_t  len;
+  bool    ok;
 
-  // --- public half ---
-  len = cb_ws_render_frame_locked(frame, sizeof(frame), op, /* auth_only */ false,
-      pred, NULL, NULL, NULL, NULL);
-
-  if(len > 0)
+  if(cb_sign_jwt_ws(jwt, sizeof(jwt)) != SUCCESS)
   {
+    clam(CLAM_WARN, CB_CTX, "ws %s: jwt mint failed (creds missing?)",
+        op);
+    return;
+  }
+
+  for(int ch = 0; ch < COINBASE_CH__COUNT; ch++)
+  {
+    coinbase_ws_channel_t cch = (coinbase_ws_channel_t)ch;
+
+    len = cb_ws_render_frame_locked(frame, sizeof(frame), op, cch, pred,
+        jwt);
+    if(len == 0) continue;
+
     ok = (cb_ws_send_json(frame, len) == SUCCESS);
 
     if(ok)
     {
-      cb_ws_mark_slots_locked(pred, /* auth_only */ false, new_sent_state);
-      clam(CLAM_INFO, CB_CTX, "ws %s (public, %zu bytes)", op, len);
+      for(uint32_t i = 0; i < cb_ws_ch.n_slots; i++)
+      {
+        cb_ws_slot_t *s = &cb_ws_ch.slots[i];
+
+        if(s->channel != cch) continue;
+        if(!pred(s))          continue;
+
+        s->sent_upstream = new_sent_state;
+      }
+      clam(CLAM_INFO, CB_CTX, "ws %s ch=%s (%zu bytes)", op,
+          cb_ws_channel_name(cch), len);
     }
     else
     {
       clam(CLAM_DEBUG, CB_CTX,
-          "ws %s (public) held: session not open (will retry on open)", op);
+          "ws %s ch=%s held: session not open (will retry on open)",
+          op, cb_ws_channel_name(cch));
     }
   }
-
-  // Advanced Trade `user`-channel subscribe uses a JWT in the
-  // subscribe payload itself, not transport-level headers. That
-  // wiring is part of WM-LT-8-B; until it lands, no auth-only
-  // channels are reconciled here. Public channels (heartbeats /
-  // ticker / matches / level2) flow through the half above.
 }
 
 // ----------------------------------------------------------------------
@@ -465,24 +437,48 @@ cb_ws_fanout_locked(const coinbase_ws_event_t *ev)
 }
 
 // --- per-channel parsers ---
+//
+// Each parser handles a single Advanced Trade event object (one entry
+// out of the envelope's `events[]` array). The envelope's per-frame
+// timestamp is threaded in as `frame_time_ms` so per-event payloads
+// without their own `time` field still surface a timestamp.
+
+// Lowercase an ASCII string in place; safe on the small COINBASE_SIDE_SZ
+// buffers fanout consumers expect to be "buy"/"sell".
+static void
+cb_ws_lower_ascii(char *s)
+{
+  size_t i;
+
+  if(s == NULL) return;
+
+  for(i = 0; s[i] != '\0'; i++)
+  {
+    if(s[i] >= 'A' && s[i] <= 'Z')
+      s[i] = (char)(s[i] + 32);
+  }
+}
 
 static void
-cb_ws_dispatch_heartbeat_locked(struct json_object *root)
+cb_ws_dispatch_heartbeats_locked(struct json_object *event,
+    int64_t frame_time_ms)
 {
   coinbase_ws_heartbeat_t hb = {0};
   coinbase_ws_event_t     ev = {0};
-  char                    time_str[40];
+  char                    buf[64];
 
-  json_get_str   (root, "product_id", hb.product_id, sizeof(hb.product_id));
-  json_get_int64 (root, "sequence",     &hb.sequence);
-  json_get_int64 (root, "last_trade_id", &hb.last_trade_id);
+  // Advanced Trade heartbeats carry `current_time` (non-ISO format,
+  // not parsed) and a `heartbeat_counter` string. Surface the counter
+  // in `last_trade_id` so liveness consumers can detect stalls;
+  // fall back to the envelope timestamp for `time_ms`.
+  if(json_get_str(event, "heartbeat_counter", buf, sizeof(buf)))
+    hb.last_trade_id = (int64_t)strtoll(buf, NULL, 10);
 
-  if(json_get_str(root, "time", time_str, sizeof(time_str)))
-    hb.time_ms = cb_ws_parse_iso8601_ms(time_str);
+  hb.time_ms = frame_time_ms;
 
   ev.channel    = COINBASE_CH_HEARTBEAT;
-  ev.product_id = hb.product_id[0] ? hb.product_id : NULL;
-  ev.sequence   = hb.sequence;
+  ev.product_id = NULL;
+  ev.sequence   = 0;
   ev.gap        = false;
   ev.payload    = &hb;
 
@@ -490,92 +486,130 @@ cb_ws_dispatch_heartbeat_locked(struct json_object *root)
 }
 
 static void
-cb_ws_dispatch_ticker_locked(struct json_object *root,
-    coinbase_ws_channel_t ch)
+cb_ws_dispatch_ticker_locked(struct json_object *event,
+    coinbase_ws_channel_t ch, int64_t frame_time_ms)
 {
-  coinbase_ws_ticker_t  t  = {0};
-  coinbase_ws_event_t   ev = {0};
-  char                  time_str[40];
-  char                  num[32];
+  struct json_object *tickers;
+  size_t              n;
+  size_t              i;
 
-  json_get_str(root, "product_id", t.product_id, sizeof(t.product_id));
-  json_get_int64(root, "sequence",  &t.sequence);
+  tickers = json_get_array(event, "tickers");
+  if(tickers == NULL) return;
 
-  if(json_get_str(root, "price", num, sizeof(num)))      t.price      = strtod(num, NULL);
-  if(json_get_str(root, "best_bid", num, sizeof(num)))   t.best_bid   = strtod(num, NULL);
-  if(json_get_str(root, "best_ask", num, sizeof(num)))   t.best_ask   = strtod(num, NULL);
-  if(json_get_str(root, "volume_24h", num, sizeof(num))) t.volume_24h = strtod(num, NULL);
-  if(json_get_str(root, "low_24h", num, sizeof(num)))    t.low_24h    = strtod(num, NULL);
-  if(json_get_str(root, "high_24h", num, sizeof(num)))   t.high_24h   = strtod(num, NULL);
+  n = json_object_array_length(tickers);
 
-  if(json_get_str(root, "time", time_str, sizeof(time_str)))
-    t.time_ms = cb_ws_parse_iso8601_ms(time_str);
-
-  ev.channel    = ch;
-  ev.product_id = t.product_id[0] ? t.product_id : NULL;
-  ev.sequence   = t.sequence;
-  ev.gap        = false;
-  ev.payload    = &t;
-
-  cb_ws_fanout_locked(&ev);
-}
-
-static void
-cb_ws_dispatch_match_locked(struct json_object *root)
-{
-  coinbase_ws_match_t  m  = {0};
-  coinbase_ws_event_t  ev = {0};
-  char                 time_str[40];
-  char                 num[32];
-
-  json_get_str  (root, "product_id", m.product_id, sizeof(m.product_id));
-  json_get_str  (root, "side",       m.side,       sizeof(m.side));
-  json_get_int64(root, "trade_id",   &m.trade_id);
-  json_get_int64(root, "sequence",   &m.sequence);
-
-  if(json_get_str(root, "price", num, sizeof(num))) m.price = strtod(num, NULL);
-  if(json_get_str(root, "size",  num, sizeof(num))) m.size  = strtod(num, NULL);
-
-  if(json_get_str(root, "time", time_str, sizeof(time_str)))
-    m.time_ms = cb_ws_parse_iso8601_ms(time_str);
-
-  ev.channel    = COINBASE_CH_MATCHES;
-  ev.product_id = m.product_id[0] ? m.product_id : NULL;
-  ev.sequence   = m.sequence;
-  ev.gap        = false;
-  ev.payload    = &m;
-
-  cb_ws_fanout_locked(&ev);
-}
-
-static void
-cb_ws_dispatch_l2update_locked(struct json_object *root)
-{
-  coinbase_ws_l2update_t  u  = {0};
-  coinbase_ws_event_t     ev = {0};
-  struct json_object     *changes;
-  char                    time_str[40];
-
-  json_get_str(root, "product_id", u.product_id, sizeof(u.product_id));
-
-  if(json_get_str(root, "time", time_str, sizeof(time_str)))
-    u.time_ms = cb_ws_parse_iso8601_ms(time_str);
-
-  changes = json_get_array(root, "changes");
-
-  if(changes != NULL)
+  for(i = 0; i < n; i++)
   {
-    size_t total = json_object_array_length(changes);
+    struct json_object   *t   = json_object_array_get_idx(tickers, i);
+    coinbase_ws_ticker_t  out = {0};
+    coinbase_ws_event_t   pe  = {0};
+    char                  num[32];
 
-    for(size_t i = 0; i < total; i++)
+    if(t == NULL) continue;
+
+    json_get_str(t, "product_id", out.product_id, sizeof(out.product_id));
+
+    if(json_get_str(t, "price",       num, sizeof(num)))
+      out.price      = strtod(num, NULL);
+    if(json_get_str(t, "best_bid",    num, sizeof(num)))
+      out.best_bid   = strtod(num, NULL);
+    if(json_get_str(t, "best_ask",    num, sizeof(num)))
+      out.best_ask   = strtod(num, NULL);
+    if(json_get_str(t, "volume_24_h", num, sizeof(num)))
+      out.volume_24h = strtod(num, NULL);
+    if(json_get_str(t, "low_24_h",    num, sizeof(num)))
+      out.low_24h    = strtod(num, NULL);
+    if(json_get_str(t, "high_24_h",   num, sizeof(num)))
+      out.high_24h   = strtod(num, NULL);
+
+    out.time_ms = frame_time_ms;
+
+    pe.channel    = ch;
+    pe.product_id = out.product_id[0] ? out.product_id : NULL;
+    pe.sequence   = 0;
+    pe.gap        = false;
+    pe.payload    = &out;
+
+    cb_ws_fanout_locked(&pe);
+  }
+}
+
+static void
+cb_ws_dispatch_market_trades_locked(struct json_object *event,
+    int64_t frame_time_ms)
+{
+  struct json_object *trades;
+  size_t              n;
+  size_t              i;
+
+  trades = json_get_array(event, "trades");
+  if(trades == NULL) return;
+
+  n = json_object_array_length(trades);
+
+  for(i = 0; i < n; i++)
+  {
+    struct json_object  *tr = json_object_array_get_idx(trades, i);
+    coinbase_ws_match_t  m  = {0};
+    coinbase_ws_event_t  pe = {0};
+    char                 num[64];
+
+    if(tr == NULL) continue;
+
+    json_get_str(tr, "product_id", m.product_id, sizeof(m.product_id));
+    json_get_str(tr, "side",       m.side,       sizeof(m.side));
+
+    cb_ws_lower_ascii(m.side);
+
+    if(json_get_str(tr, "trade_id", num, sizeof(num)))
+      m.trade_id = (int64_t)strtoll(num, NULL, 10);
+
+    if(json_get_str(tr, "price", num, sizeof(num)))
+      m.price = strtod(num, NULL);
+    if(json_get_str(tr, "size",  num, sizeof(num)))
+      m.size  = strtod(num, NULL);
+
+    if(json_get_str(tr, "time", num, sizeof(num)))
+      m.time_ms = cb_ws_parse_iso8601_ms(num);
+
+    if(m.time_ms == 0) m.time_ms = frame_time_ms;
+
+    pe.channel    = COINBASE_CH_MATCHES;
+    pe.product_id = m.product_id[0] ? m.product_id : NULL;
+    pe.sequence   = 0;
+    pe.gap        = false;
+    pe.payload    = &m;
+
+    cb_ws_fanout_locked(&pe);
+  }
+}
+
+static void
+cb_ws_dispatch_l2_locked(struct json_object *event, int64_t frame_time_ms)
+{
+  coinbase_ws_l2update_t  u   = {0};
+  coinbase_ws_event_t     ev  = {0};
+  struct json_object     *updates;
+  size_t                  total;
+  size_t                  i;
+
+  json_get_str(event, "product_id", u.product_id, sizeof(u.product_id));
+  u.time_ms = frame_time_ms;
+
+  updates = json_get_array(event, "updates");
+
+  if(updates != NULL)
+  {
+    total = json_object_array_length(updates);
+
+    for(i = 0; i < total; i++)
     {
-      struct json_object *tuple = json_object_array_get_idx(changes, i);
-      const char         *side_s;
-      const char         *price_s;
-      const char         *size_s;
+      struct json_object *up = json_object_array_get_idx(updates, i);
+      char                side[16] = {0};
+      char                price_s[32] = {0};
+      char                qty_s[32] = {0};
 
-      if(tuple == NULL) continue;
-      if(json_object_array_length(tuple) < 3) continue;
+      if(up == NULL) continue;
 
       if(u.n_changes >= COINBASE_WS_L2_MAX_CHANGES)
       {
@@ -583,23 +617,32 @@ cb_ws_dispatch_l2update_locked(struct json_object *root)
         continue;
       }
 
-      side_s  = json_object_get_string(json_object_array_get_idx(tuple, 0));
-      price_s = json_object_get_string(json_object_array_get_idx(tuple, 1));
-      size_s  = json_object_get_string(json_object_array_get_idx(tuple, 2));
+      json_get_str(up, "side",         side,    sizeof(side));
+      json_get_str(up, "price_level",  price_s, sizeof(price_s));
+      json_get_str(up, "new_quantity", qty_s,   sizeof(qty_s));
 
-      if(side_s == NULL || price_s == NULL || size_s == NULL) continue;
+      // Map Advanced Trade "bid" / "offer" onto legacy "buy" / "sell"
+      // so existing consumers that switch on side strings keep working.
+      if(strcmp(side, "bid") == 0)
+        snprintf(u.changes[u.n_changes].side,
+            sizeof(u.changes[u.n_changes].side), "buy");
+      else if(strcmp(side, "offer") == 0 || strcmp(side, "ask") == 0)
+        snprintf(u.changes[u.n_changes].side,
+            sizeof(u.changes[u.n_changes].side), "sell");
+      else
+        snprintf(u.changes[u.n_changes].side,
+            sizeof(u.changes[u.n_changes].side), "%s", side);
 
-      snprintf(u.changes[u.n_changes].side,
-          sizeof(u.changes[u.n_changes].side), "%s", side_s);
       u.changes[u.n_changes].price = strtod(price_s, NULL);
-      u.changes[u.n_changes].size  = strtod(size_s,  NULL);
+      u.changes[u.n_changes].size  = strtod(qty_s,   NULL);
       u.n_changes++;
     }
 
     if(u.n_changes_dropped > 0)
       clam(CLAM_WARN, CB_CTX,
-          "ws l2update product=%s: %u deltas dropped (cap %d)",
-          u.product_id, u.n_changes_dropped, COINBASE_WS_L2_MAX_CHANGES);
+          "ws l2 product=%s: %u deltas dropped (cap %d)",
+          u.product_id, u.n_changes_dropped,
+          COINBASE_WS_L2_MAX_CHANGES);
   }
 
   ev.channel    = COINBASE_CH_LEVEL2;
@@ -612,14 +655,14 @@ cb_ws_dispatch_l2update_locked(struct json_object *root)
 }
 
 static void
-cb_ws_dispatch_status_locked(struct json_object *root)
+cb_ws_dispatch_status_locked(struct json_object *event,
+    int64_t frame_time_ms)
 {
   coinbase_ws_status_t st = {0};
   coinbase_ws_event_t  ev = {0};
-  char                 time_str[40];
 
-  if(json_get_str(root, "time", time_str, sizeof(time_str)))
-    st.time_ms = cb_ws_parse_iso8601_ms(time_str);
+  (void)event;
+  st.time_ms = frame_time_ms;
 
   ev.channel    = COINBASE_CH_STATUS;
   ev.product_id = NULL;
@@ -704,53 +747,108 @@ void
 cb_ws_channels_dispatch(const char *buf, size_t len)
 {
   struct json_object *root;
-  char                type[64];
+  struct json_object *events;
+  char                type[64]    = {0};
+  char                channel[64] = {0};
+  char                ts[64];
+  int64_t             frame_time_ms = 0;
+  size_t              ev_n;
+  size_t              i;
 
   if(!cb_ws_ch.initialized || buf == NULL || len == 0) return;
 
   root = json_parse_buf(buf, len, "coinbase:ws_recv");
   if(root == NULL) return;
 
-  // The "type" field is a string. json_get_obj only returns nested
-  // json objects, so it would silently NULL-out and drop every frame.
-  if(!json_get_str(root, "type", type, sizeof(type)))
+  // Gateway error frames keep the legacy {type:"error",message:"..."}
+  // shape — surface them before looking for an Advanced Trade envelope.
+  // Dump the full frame at WARN so the operator can see which subscribe
+  // failed (Advanced Trade typically embeds the offending channel name
+  // in the error body).
+  if(json_get_str(root, "type", type, sizeof(type))
+      && strcmp(type, "error") == 0)
+  {
+    char        msg[256]  = "?";
+    const char *raw_json;
+
+    json_get_str(root, "message", msg, sizeof(msg));
+
+    raw_json = json_object_to_json_string_ext(root,
+        JSON_C_TO_STRING_PLAIN | JSON_C_TO_STRING_NOSLASHESCAPE);
+
+    clam(CLAM_WARN, CB_CTX, "ws server error: %s | frame=%s", msg,
+        raw_json != NULL ? raw_json : "?");
+
+    json_object_put(root);
+    return;
+  }
+
+  // Advanced Trade data frames are wrapped in
+  //   {channel:"<name>", timestamp:"...", sequence_num:N, events:[...]}
+  // and the "subscriptions" ack uses the same envelope (channel set to
+  // "subscriptions"). Discriminate on the top-level `channel` field.
+  if(!json_get_str(root, "channel", channel, sizeof(channel)))
   {
     json_object_put(root);
     return;
   }
 
-  // Server control messages.
-  if(strcmp(type, "subscriptions") == 0)
+  if(strcmp(channel, "subscriptions") == 0)
   {
-    clam(CLAM_DEBUG, CB_CTX, "ws subscriptions ack");
+    // Surface the channel list inside the ack so we can correlate
+    // subscribes-out with acks-in and spot the missing channel.
+    const char *raw_json;
+
+    raw_json = json_object_to_json_string_ext(root,
+        JSON_C_TO_STRING_PLAIN | JSON_C_TO_STRING_NOSLASHESCAPE);
+
+    clam(CLAM_DEBUG, CB_CTX, "ws subscriptions ack: %s",
+        raw_json != NULL ? raw_json : "?");
+
     json_object_put(root);
     return;
   }
-  if(strcmp(type, "error") == 0)
+
+  if(json_get_str(root, "timestamp", ts, sizeof(ts)))
+    frame_time_ms = cb_ws_parse_iso8601_ms(ts);
+
+  events = json_get_array(root, "events");
+
+  if(events == NULL)
   {
-    char msg[256] = "?";
-    json_get_str(root, "message", msg, sizeof(msg));
-    clam(CLAM_WARN, CB_CTX, "ws server error: %s", msg);
     json_object_put(root);
     return;
   }
+
+  ev_n = json_object_array_length(events);
 
   pthread_mutex_lock(&cb_ws_ch.mu);
 
-  if(strcmp(type, "heartbeat") == 0)
-    cb_ws_dispatch_heartbeat_locked(root);
-  else if(strcmp(type, "ticker") == 0)
-    cb_ws_dispatch_ticker_locked(root, COINBASE_CH_TICKER);
-  else if(strcmp(type, "ticker_batch") == 0)
-    cb_ws_dispatch_ticker_locked(root, COINBASE_CH_TICKER_BATCH);
-  else if(strcmp(type, "match") == 0 || strcmp(type, "last_match") == 0)
-    cb_ws_dispatch_match_locked(root);
-  else if(strcmp(type, "l2update") == 0 || strcmp(type, "snapshot") == 0)
-    cb_ws_dispatch_l2update_locked(root);
-  else if(strcmp(type, "status") == 0)
-    cb_ws_dispatch_status_locked(root);
-  else
-    clam(CLAM_DEBUG3, CB_CTX, "ws ignoring frame type=%s", type);
+  for(i = 0; i < ev_n; i++)
+  {
+    struct json_object *event = json_object_array_get_idx(events, i);
+
+    if(event == NULL) continue;
+
+    if(strcmp(channel, "heartbeats") == 0)
+      cb_ws_dispatch_heartbeats_locked(event, frame_time_ms);
+    else if(strcmp(channel, "ticker") == 0)
+      cb_ws_dispatch_ticker_locked(event, COINBASE_CH_TICKER,
+          frame_time_ms);
+    else if(strcmp(channel, "ticker_batch") == 0)
+      cb_ws_dispatch_ticker_locked(event, COINBASE_CH_TICKER_BATCH,
+          frame_time_ms);
+    else if(strcmp(channel, "market_trades") == 0)
+      cb_ws_dispatch_market_trades_locked(event, frame_time_ms);
+    else if(strcmp(channel, "l2_data") == 0)
+      cb_ws_dispatch_l2_locked(event, frame_time_ms);
+    else if(strcmp(channel, "status") == 0)
+      cb_ws_dispatch_status_locked(event, frame_time_ms);
+    else if(strcmp(channel, "user") == 0)
+      ;  // user-channel parsing lands in WM-LT-8-B
+    else
+      clam(CLAM_DEBUG3, CB_CTX, "ws ignoring channel=%s", channel);
+  }
 
   pthread_mutex_unlock(&cb_ws_ch.mu);
 
@@ -768,7 +866,6 @@ coinbase_ws_subscribe(const coinbase_ws_channel_t *channels,
 {
   struct coinbase_ws_sub *sub;
   uint32_t                channel_mask     = 0;
-  bool                    need_auth        = false;
   size_t                  i;
   bool                    has_product_chan = false;
 
@@ -794,18 +891,16 @@ coinbase_ws_subscribe(const coinbase_ws_channel_t *channels,
 
   for(i = 0; i < n_channels; i++)
   {
-    if((unsigned)channels[i] >= COINBASE_CH__COUNT)
+    if((unsigned)channels[i] >= COINBASE_CH__COUNT
+        || cb_ws_channel_name(channels[i]) == NULL)
     {
-      clam(CLAM_WARN, CB_CTX, "ws subscribe: invalid channel %d",
-          (int)channels[i]);
+      clam(CLAM_WARN, CB_CTX,
+          "ws subscribe: unsupported channel %d", (int)channels[i]);
       return(NULL);
     }
 
     if(cb_ws_channel_is_per_product(channels[i]))
       has_product_chan = true;
-
-    if(cb_ws_channel_needs_auth(channels[i]))
-      need_auth = true;
 
     channel_mask |= (1u << channels[i]);
   }
@@ -817,14 +912,15 @@ coinbase_ws_subscribe(const coinbase_ws_channel_t *channels,
     return(NULL);
   }
 
-  if(need_auth && !cb_apikey_configured())
-  {
-    clam(CLAM_WARN, CB_CTX,
-        "ws subscribe: auth channel requested but credentials missing");
-    return(NULL);
-  }
+  // Advanced Trade requires a JWT on every subscribe (public channels
+  // included). Creds may not yet be in the KV at subscribe time
+  // (freshstart writes credentials post-launch); the slot still goes
+  // into the table with sent_upstream=false, and cb_ws_send_delta_locked
+  // retries on every reconcile. The creds-changed hook in coinbase_ws.c
+  // schedules a reconnect that lands here via cb_ws_channels_on_open
+  // once credentials arrive.
 
-  // Heartbeat + status are always added to the upstream set for
+  // Heartbeats + status are always added to the upstream set for
   // plugin-local liveness — callers get them in their fanout mask so
   // their own callback can inspect the events if desired.
   channel_mask |= (1u << COINBASE_CH_HEARTBEAT)
