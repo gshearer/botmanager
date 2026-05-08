@@ -20,6 +20,7 @@
 
 #include "backtest.h"
 #include "book_persist.h"
+#include "live.h"
 #include "market.h"
 #include "pnl.h"
 #include "sizer.h"
@@ -1851,33 +1852,44 @@ wm_trade_engine_on_signal(const char *market_id_str,
   b->last_signal     = *sig;
   b->has_last_signal = true;
 
-  // Backtest + live are placeholders for WM-LT-5 + WM-LT-8. Fall
-  // through to the no-op tail rather than firing a paper fill, so an
-  // operator who set a mode that isn't wired yet sees signals
-  // recorded but no fills (the safe behaviour).
-  if(b->mode != WM_TRADE_MODE_PAPER)
-  {
-    pthread_mutex_unlock(&reg->lock);
-    return;
-  }
-
   if(mark_px <= 0.0)
   {
     pthread_mutex_unlock(&reg->lock);
     return;
   }
 
-  wm_sizer_compute(b, mark_px, sig, &intent);
-
-  if(intent.action != WM_SIZER_HOLD)
+  switch(b->mode)
   {
-    wm_trade_apply_paper_fill_locked(b, &intent, mark_px, sig->ts_ms,
-        sig);
+    case WM_TRADE_MODE_PAPER:
+      wm_sizer_compute(b, mark_px, sig, &intent);
 
-    // WM-PT-3: snapshot the post-fill book to wm_trade_book_state.
-    // Async via the trade-persist worker; coalesces across rapid
-    // fills within one 1 s tick.
-    wm_book_persist_locked(reg, b);
+      if(intent.action != WM_SIZER_HOLD)
+      {
+        wm_trade_apply_paper_fill_locked(b, &intent, mark_px, sig->ts_ms,
+            sig);
+
+        // WM-PT-3: snapshot the post-fill book to wm_trade_book_state.
+        // Async via the trade-persist worker; coalesces across rapid
+        // fills within one 1 s tick.
+        wm_book_persist_locked(reg, b);
+      }
+      break;
+
+    case WM_TRADE_MODE_LIVE:
+      // Real-mode: kill-switch + risk gates + place-order. Fills land
+      // later via the user WS channel + REST poll (WM-LT-8-B3).
+      // wm_live_engine_on_signal_locked is called with reg->lock held;
+      // it briefly drops only its own private mutex internally.
+      (void)wm_live_engine_on_signal_locked(b, mark_px, mark_ms, sig);
+      break;
+
+    case WM_TRADE_MODE_OFF:
+    case WM_TRADE_MODE_BACKTEST:
+      // OFF: signal recorded above, no order side effect.
+      // BACKTEST: snapshot replay drives this path through a separate
+      // entry; live signal-emit is a no-op when an attached strategy
+      // momentarily flips a book to backtest mode.
+      break;
   }
 
   pthread_mutex_unlock(&reg->lock);

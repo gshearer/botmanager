@@ -283,6 +283,19 @@ void wm_trade_engine_on_signal(const char *market_id_str,
     const char *strategy_name, double mark_px, int64_t mark_ms,
     const wm_strategy_signal_t *sig);
 
+// External fill entry point (WM-LT-8-B2 ABI). The real-mode submit
+// path leaves an order resting at the exchange and returns; fills land
+// later via the `user` WebSocket channel and a REST `/fills` poll
+// fallback. Both sources funnel here, deduped by exchange-side
+// trade_id by the caller. Updates cash, position, fills ring, and PnL
+// using the actual exchange fill price (no synthetic slip arithmetic).
+// Caller does NOT need to hold the registry lock; this function takes
+// it internally.
+//
+// B2 ships the surface; B3 wires the consumers that call it.
+void wm_trade_engine_record_external_fill(const char *market_id_str,
+    const char *strategy_name, const wm_fill_t *fill);
+
 // Mark refresh path used by /show whenmoon trade so the rendered
 // unrealized PnL line reflects the live ticker rather than the last
 // signal-time mark. Caller passes the current mark; book updates only

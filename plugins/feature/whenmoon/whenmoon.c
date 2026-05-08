@@ -11,6 +11,7 @@
 #include "dl_jobtable.h"
 #include "dl_commands.h"
 #include "market_cmds.h"
+#include "live.h"
 #include "order.h"
 #include "strategy.h"
 #include "sweep.h"
@@ -316,6 +317,7 @@ whenmoon_subsystems_destroy(whenmoon_state_t *st)
   // is plugin-global and outlives subsystems by a hair so any final
   // strategy-detach paths can drop their books cleanly.
   wm_strategy_registry_destroy(st);
+  wm_live_engine_destroy();
   wm_trade_engine_destroy();
   wm_dl_jobtable_destroy(st);
   wm_dl_destroy(st);
@@ -396,6 +398,15 @@ whenmoon_init(void)
   if(wm_trade_engine_init() != SUCCESS)
   {
     clam(CLAM_INFO, WHENMOON_CTX, "wm_trade_engine_init failed");
+    goto fail;
+  }
+
+  // WM-LT-8-B2: real-mode side-table (kill-switch + risk gates +
+  // pending ring). Default kill-switch=false so submission FAILs
+  // closed until an admin flips plugin.whenmoon.exchange.<exch>.live.
+  if(wm_live_engine_init() != SUCCESS)
+  {
+    clam(CLAM_INFO, WHENMOON_CTX, "wm_live_engine_init failed");
     goto fail;
   }
 
