@@ -115,19 +115,16 @@ wm_account_init(whenmoon_state_t *st)
 
   st->account = acc;
 
-  if(!coinbase_apikey_configured())
-  {
-    clam(CLAM_INFO, WHENMOON_CTX,
-        "account refresh disabled — no apikey");
-    return(SUCCESS);
-  }
-
   refresh_secs = (uint32_t)kv_get_uint(
       "plugin.whenmoon.exchange.coinbase.account.refresh_sec");
 
   if(refresh_secs < WM_ACCOUNT_MIN_REFRESH_SECS)
     refresh_secs = WM_ACCOUNT_DEFAULT_REFRESH_SECS;
 
+  // Schedule the periodic unconditionally. Creds are written to the
+  // KV after plugin start (freshstart's post-launch admin commands),
+  // so the no-creds case at this moment is normal — wm_account_tick
+  // re-checks each tick and skips the fetch until creds appear.
   acc->refresh_task = task_add_periodic("wm.acct", TASK_ANY, 200,
       refresh_secs * 1000, wm_account_tick, st);
 
@@ -139,9 +136,8 @@ wm_account_init(whenmoon_state_t *st)
     clam(CLAM_INFO, WHENMOON_CTX,
         "account refresh scheduled every %us", refresh_secs);
 
-  // Kick off an immediate first fetch so the show verb has data
-  // before the first tick fires.
-  if(coinbase_get_accounts_async(wm_account_on_accounts, st) != SUCCESS)
+  if(coinbase_apikey_configured()
+      && coinbase_get_accounts_async(wm_account_on_accounts, st) != SUCCESS)
     clam(CLAM_INFO, WHENMOON_CTX,
         "initial account fetch submit failed");
 
