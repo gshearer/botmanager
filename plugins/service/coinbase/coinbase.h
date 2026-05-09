@@ -125,6 +125,13 @@ bool    cb_rest_base_url(char *out, size_t cap);
 bool    cb_ws_base_url(char *out, size_t cap);
 bool    cb_apikey_configured(void);
 
+// coinbase_rest.c — cache-only probes shared with the exchange-vtable
+// trampolines. `cb_products_count_locked` is internal to the plugin
+// (no public dlsym shim); WM-OR-1's `exchange_get_products_count`
+// hook calls it.
+bool    cb_products_count_locked(uint32_t *out_total,
+            uint32_t *out_active);
+
 // coinbase_sign_cdp.c — Advanced Trade JWT/ES256 signer.
 //
 // Buffer size for a rendered JWT including the two dots and the

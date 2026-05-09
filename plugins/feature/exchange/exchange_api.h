@@ -76,6 +76,156 @@ typedef void (*exchange_response_cb_t)(int http_status,
     const char *body, size_t body_len,
     const char *err, void *user);
 
+// ------------------------------------------------------------------ //
+// Generic semantic types (WM-OR-1).                                    //
+//                                                                      //
+// These mirror the protocol-specific types each exchange plugin uses   //
+// internally (e.g. coinbase_order_t in coinbase_api.h) but live here   //
+// so consumers of the abstraction never pull in protocol headers.     //
+// Sizes are deliberately at-or-above every protocol equivalent so a   //
+// memcpy at the seam never truncates.                                  //
+// ------------------------------------------------------------------ //
+
+#define EXCHANGE_NAME_SZ           32   // matches exchange_t.name[32]
+#define EXCHANGE_PRODUCT_ID_SZ     24   // e.g. "BTC-USD" / "1000PEPE-USDC"
+#define EXCHANGE_CURRENCY_SZ       16
+#define EXCHANGE_ORDER_ID_SZ       64
+#define EXCHANGE_CLIENT_OID_SZ     64
+#define EXCHANGE_SIDE_SZ            8   // "buy" / "sell"
+#define EXCHANGE_TYPE_SZ           16   // "limit" / "market" / "stop" / ...
+#define EXCHANGE_STATUS_SZ         16
+#define EXCHANGE_TIF_SZ             8   // "GTC" / "GTT" / "IOC" / "FOK"
+#define EXCHANGE_ERR_SZ           128
+
+#define EXCHANGE_MAX_ORDERS_LIST  100
+#define EXCHANGE_MAX_FILLS_LIST   100
+#define EXCHANGE_MAX_ACCOUNTS      64
+
+// Capability snapshot returned by exchange_get_capabilities. Reflects
+// the protocol vtable's current view: `has_credentials` consults the
+// optional `is_authenticated` hook (true when hook is NULL — public-
+// only exchanges advertise as "authed" by absence so the auth probe is
+// not their gate; auth-gated verbs FAIL on the hook layer instead).
+// `sandbox` is false when `is_sandbox` hook is NULL.
+typedef struct
+{
+  char     name[EXCHANGE_NAME_SZ];
+  bool     has_credentials;
+  bool     sandbox;
+  uint32_t advertised_rps;
+  uint32_t advertised_burst;
+} exchange_capabilities_t;
+
+// Generic order row. Superset of every supported protocol's order
+// shape; protocol plugins memcpy/snprintf into these fields at the
+// seam. Empty strings + zeroed numerics are valid for fields a given
+// protocol doesn't populate (e.g. `executed_value` is coinbase-only).
+typedef struct
+{
+  char    order_id[EXCHANGE_ORDER_ID_SZ];
+  char    client_oid[EXCHANGE_CLIENT_OID_SZ];
+  char    product_id[EXCHANGE_PRODUCT_ID_SZ];
+  char    side[EXCHANGE_SIDE_SZ];
+  char    type[EXCHANGE_TYPE_SZ];
+  char    status[EXCHANGE_STATUS_SZ];
+  char    tif[EXCHANGE_TIF_SZ];
+  double  price;
+  double  size;
+  double  filled_size;
+  double  executed_value;
+  double  fill_fees;
+  bool    post_only;
+  bool    settled;
+  int64_t created_at_ms;
+} exchange_order_t;
+
+// Generic per-currency balance row.
+typedef struct
+{
+  char    currency[EXCHANGE_CURRENCY_SZ];
+  double  balance;
+  double  hold;
+  double  available;
+} exchange_account_t;
+
+// One executed fill — used by the safety-net poll path that the live
+// engine eventually moves off direct coinbase_list_fills_async calls.
+// `side` lowercased to match the WS user-channel convention.
+typedef struct
+{
+  char    order_id[EXCHANGE_ORDER_ID_SZ];
+  char    client_oid[EXCHANGE_CLIENT_OID_SZ];
+  char    product_id[EXCHANGE_PRODUCT_ID_SZ];
+  char    side[EXCHANGE_SIDE_SZ];
+  int64_t trade_id;
+  double  price;
+  double  size;
+  double  fee;
+  int64_t time_ms;
+} exchange_fill_t;
+
+// Place-order request body. Caller zero-initialises and fills only the
+// fields relevant to the chosen `type`. `client_oid` may be empty —
+// the protocol plugin then mints a UUID before the wire request.
+// Invalid combinations (e.g. post_only=true with type="market") are
+// rejected protocol-side before a signed request leaves.
+typedef struct
+{
+  char    product_id[EXCHANGE_PRODUCT_ID_SZ];
+  char    side[EXCHANGE_SIDE_SZ];        // "buy" or "sell"
+  char    type[EXCHANGE_TYPE_SZ];        // "limit" or "market"
+  char    tif[EXCHANGE_TIF_SZ];          // "GTC" / "IOC" / ...; empty for market
+  double  price;                         // limit only
+  double  size;                          // base-ccy amount (limit + market-sell)
+  double  funds;                         // optional quote-ccy (market-buy)
+  bool    post_only;
+  char    client_oid[EXCHANGE_CLIENT_OID_SZ];
+} exchange_place_order_req_t;
+
+// Async result payloads. Mirror the coinbase_*_result_t pattern: an
+// `err` string populated only on failure (empty on success), plus the
+// typed payload. Callbacks see a const pointer; lifetime is the
+// callback only — copy out anything that needs to persist.
+
+typedef struct
+{
+  char              err[EXCHANGE_ERR_SZ];
+  exchange_order_t  order;
+} exchange_order_result_t;
+
+typedef struct
+{
+  char              err[EXCHANGE_ERR_SZ];
+  uint32_t          count;
+  exchange_order_t  rows[EXCHANGE_MAX_ORDERS_LIST];
+} exchange_orders_result_t;
+
+typedef struct
+{
+  char                err[EXCHANGE_ERR_SZ];
+  uint32_t            count;
+  exchange_account_t  rows[EXCHANGE_MAX_ACCOUNTS];
+} exchange_accounts_result_t;
+
+typedef struct
+{
+  char             err[EXCHANGE_ERR_SZ];
+  uint32_t         count;
+  exchange_fill_t  rows[EXCHANGE_MAX_FILLS_LIST];
+} exchange_fills_result_t;
+
+// Callback signatures. Same threading rules as
+// exchange_response_cb_t — fired on the curl-multi worker thread that
+// completed the underlying transport. Consumers must not block.
+typedef void (*exchange_done_order_cb_t)(
+    const exchange_order_result_t *res, void *user);
+typedef void (*exchange_done_orders_cb_t)(
+    const exchange_orders_result_t *res, void *user);
+typedef void (*exchange_done_accounts_cb_t)(
+    const exchange_accounts_result_t *res, void *user);
+typedef void (*exchange_done_fills_cb_t)(
+    const exchange_fills_result_t *res, void *user);
+
 // Per-exchange protocol vtable.
 //
 // `build_request` prepares an opaque protocol-specific request handle
@@ -98,6 +248,17 @@ typedef void (*exchange_response_cb_t)(int http_status,
 // `advertised_rps` / `advertised_burst` are static knobs read once at
 // `exchange_register()` time. The abstraction sizes its token bucket
 // from these (with a small headroom subtracted from `rps`).
+//
+// **Capability hooks (WM-OR-1)** sit at the bottom of the struct.
+// All are optional — leaving any NULL marks the corresponding verb as
+// unsupported, and the public `exchange_*_async` shim FAILs early
+// without invoking the typed callback. Public-only exchanges (no API
+// keys configured) populate `is_authenticated` returning false; the
+// public shim then FAILs with `error: <name>: api keys not configured`
+// so the caller sees a stable string regardless of which hook is the
+// gate. Hook callbacks fire on the protocol plugin's curl-multi
+// worker thread — same threading rules as the existing typed
+// wrappers.
 typedef struct
 {
   bool (*build_request)(exchange_op_kind_t kind,
@@ -111,6 +272,33 @@ typedef struct
 
   uint32_t advertised_rps;
   uint32_t advertised_burst;
+
+  // Capability hooks. NULL = unsupported by this exchange.
+  bool   (*is_authenticated)(void);
+  bool   (*is_sandbox)(void);
+
+  // Sync — reads protocol-plugin's local product cache. `out_active`
+  // counts rows with `trading_disabled == false`; equal to `out_count`
+  // when the protocol does not surface that flag.
+  bool   (*get_products_count)(uint32_t *out_count, uint32_t *out_active);
+
+  // Async — mirror the protocol's typed wrappers. Fill error reasons
+  // into the result's `err` field; never block the caller.
+  bool   (*place_order_async)(const exchange_place_order_req_t *req,
+                              exchange_done_order_cb_t cb, void *u);
+  bool   (*cancel_order_async)(const char *order_id,
+                               exchange_done_order_cb_t cb, void *u);
+  bool   (*get_order_async)(const char *order_id,
+                            exchange_done_order_cb_t cb, void *u);
+  bool   (*list_orders_async)(const char *status,
+                              const char *product_id,
+                              exchange_done_orders_cb_t cb, void *u);
+  bool   (*list_fills_async)(const char *order_id,
+                             const char *product_id,
+                             int64_t start_ms,
+                             exchange_done_fills_cb_t cb, void *u);
+  bool   (*get_accounts_async)(exchange_done_accounts_cb_t cb,
+                               void *u);
 } exchange_protocol_vtable_t;
 
 // ------------------------------------------------------------------
@@ -146,6 +334,63 @@ bool exchange_register(const char *name,
 // surfaced as failures to their callbacks. Safe to call from the
 // protocol plugin's `deinit()`.
 void exchange_unregister(const char *name);
+
+// ------------------------------------------------------------------ //
+// Capability surface (WM-OR-1).                                        //
+//                                                                      //
+// All `exchange_*_async` capability shims dispatch to the protocol     //
+// vtable's matching hook. FAIL when:                                   //
+//   * `name` is NULL/empty/unknown,                                    //
+//   * the matching vtable hook is NULL,                                //
+//   * the auth hook is non-NULL and reports false, AND the verb is    //
+//     auth-gated (every order verb + accounts + fills).               //
+// On FAIL the typed callback is invoked synchronously with a          //
+// populated `err` string; the function then returns FAIL. SUCCESS     //
+// means the request was queued and the typed callback fires later.    //
+// ------------------------------------------------------------------ //
+
+// Snapshot of capabilities for one named exchange. FAIL when name is
+// unknown.
+bool exchange_get_capabilities(const char *name,
+    exchange_capabilities_t *out);
+
+// Snapshot of every registered exchange name. `out_arr` is an array
+// of EXCHANGE_NAME_SZ-byte buffers; up to `out_cap` rows are written
+// and the total registered count is written to `*out_count` (so the
+// caller can detect truncation when count > cap). Always returns
+// SUCCESS unless out_arr/out_count is NULL.
+bool exchange_name_list(char (*out_arr)[EXCHANGE_NAME_SZ],
+    uint32_t out_cap, uint32_t *out_count);
+
+// Sync read of the protocol's cached product/market list size. FAIL
+// when `name` is unknown or the protocol has no `get_products_count`
+// hook. `out_active` counts entries with trading enabled; the protocol
+// returns it equal to `out_count` if it doesn't track that bit.
+bool exchange_get_products_count(const char *name,
+    uint32_t *out_count, uint32_t *out_active);
+
+bool exchange_place_order_async(const char *name,
+    const exchange_place_order_req_t *req,
+    exchange_done_order_cb_t cb, void *user);
+
+bool exchange_cancel_order_async(const char *name,
+    const char *order_id,
+    exchange_done_order_cb_t cb, void *user);
+
+bool exchange_get_order_async(const char *name,
+    const char *order_id,
+    exchange_done_order_cb_t cb, void *user);
+
+bool exchange_list_orders_async(const char *name,
+    const char *status, const char *product_id,
+    exchange_done_orders_cb_t cb, void *user);
+
+bool exchange_list_fills_async(const char *name,
+    const char *order_id, const char *product_id, int64_t start_ms,
+    exchange_done_fills_cb_t cb, void *user);
+
+bool exchange_get_accounts_async(const char *name,
+    exchange_done_accounts_cb_t cb, void *user);
 
 #endif // EXCHANGE_INTERNAL
 
@@ -229,6 +474,238 @@ exchange_unregister(const char *name)
     __atomic_store_n(&cached, fn, __ATOMIC_RELEASE);
   }
   fn(name);
+}
+
+static inline bool
+exchange_get_capabilities(const char *name, exchange_capabilities_t *out)
+{
+  typedef bool (*fn_t)(const char *, exchange_capabilities_t *);
+  static fn_t cached = NULL;
+  fn_t        fn     = __atomic_load_n(&cached, __ATOMIC_ACQUIRE);
+
+  if(fn == NULL)
+  {
+    union { void *obj; fn_t fn; } u;
+
+    u.obj = plugin_dlsym("exchange", "exchange_get_capabilities");
+    if(u.obj == NULL)
+    {
+      clam(CLAM_FATAL, "exchange",
+          "dlsym failed: exchange_get_capabilities");
+      abort();
+    }
+    fn = u.fn;
+    __atomic_store_n(&cached, fn, __ATOMIC_RELEASE);
+  }
+  return(fn(name, out));
+}
+
+static inline bool
+exchange_name_list(char (*out_arr)[EXCHANGE_NAME_SZ], uint32_t out_cap,
+    uint32_t *out_count)
+{
+  typedef bool (*fn_t)(char (*)[EXCHANGE_NAME_SZ], uint32_t, uint32_t *);
+  static fn_t cached = NULL;
+  fn_t        fn     = __atomic_load_n(&cached, __ATOMIC_ACQUIRE);
+
+  if(fn == NULL)
+  {
+    union { void *obj; fn_t fn; } u;
+
+    u.obj = plugin_dlsym("exchange", "exchange_name_list");
+    if(u.obj == NULL)
+    {
+      clam(CLAM_FATAL, "exchange",
+          "dlsym failed: exchange_name_list");
+      abort();
+    }
+    fn = u.fn;
+    __atomic_store_n(&cached, fn, __ATOMIC_RELEASE);
+  }
+  return(fn(out_arr, out_cap, out_count));
+}
+
+static inline bool
+exchange_get_products_count(const char *name, uint32_t *out_count,
+    uint32_t *out_active)
+{
+  typedef bool (*fn_t)(const char *, uint32_t *, uint32_t *);
+  static fn_t cached = NULL;
+  fn_t        fn     = __atomic_load_n(&cached, __ATOMIC_ACQUIRE);
+
+  if(fn == NULL)
+  {
+    union { void *obj; fn_t fn; } u;
+
+    u.obj = plugin_dlsym("exchange", "exchange_get_products_count");
+    if(u.obj == NULL)
+    {
+      clam(CLAM_FATAL, "exchange",
+          "dlsym failed: exchange_get_products_count");
+      abort();
+    }
+    fn = u.fn;
+    __atomic_store_n(&cached, fn, __ATOMIC_RELEASE);
+  }
+  return(fn(name, out_count, out_active));
+}
+
+static inline bool
+exchange_place_order_async(const char *name,
+    const exchange_place_order_req_t *req,
+    exchange_done_order_cb_t cb, void *user)
+{
+  typedef bool (*fn_t)(const char *, const exchange_place_order_req_t *,
+      exchange_done_order_cb_t, void *);
+  static fn_t cached = NULL;
+  fn_t        fn     = __atomic_load_n(&cached, __ATOMIC_ACQUIRE);
+
+  if(fn == NULL)
+  {
+    union { void *obj; fn_t fn; } u;
+
+    u.obj = plugin_dlsym("exchange", "exchange_place_order_async");
+    if(u.obj == NULL)
+    {
+      clam(CLAM_FATAL, "exchange",
+          "dlsym failed: exchange_place_order_async");
+      abort();
+    }
+    fn = u.fn;
+    __atomic_store_n(&cached, fn, __ATOMIC_RELEASE);
+  }
+  return(fn(name, req, cb, user));
+}
+
+static inline bool
+exchange_cancel_order_async(const char *name, const char *order_id,
+    exchange_done_order_cb_t cb, void *user)
+{
+  typedef bool (*fn_t)(const char *, const char *,
+      exchange_done_order_cb_t, void *);
+  static fn_t cached = NULL;
+  fn_t        fn     = __atomic_load_n(&cached, __ATOMIC_ACQUIRE);
+
+  if(fn == NULL)
+  {
+    union { void *obj; fn_t fn; } u;
+
+    u.obj = plugin_dlsym("exchange", "exchange_cancel_order_async");
+    if(u.obj == NULL)
+    {
+      clam(CLAM_FATAL, "exchange",
+          "dlsym failed: exchange_cancel_order_async");
+      abort();
+    }
+    fn = u.fn;
+    __atomic_store_n(&cached, fn, __ATOMIC_RELEASE);
+  }
+  return(fn(name, order_id, cb, user));
+}
+
+static inline bool
+exchange_get_order_async(const char *name, const char *order_id,
+    exchange_done_order_cb_t cb, void *user)
+{
+  typedef bool (*fn_t)(const char *, const char *,
+      exchange_done_order_cb_t, void *);
+  static fn_t cached = NULL;
+  fn_t        fn     = __atomic_load_n(&cached, __ATOMIC_ACQUIRE);
+
+  if(fn == NULL)
+  {
+    union { void *obj; fn_t fn; } u;
+
+    u.obj = plugin_dlsym("exchange", "exchange_get_order_async");
+    if(u.obj == NULL)
+    {
+      clam(CLAM_FATAL, "exchange",
+          "dlsym failed: exchange_get_order_async");
+      abort();
+    }
+    fn = u.fn;
+    __atomic_store_n(&cached, fn, __ATOMIC_RELEASE);
+  }
+  return(fn(name, order_id, cb, user));
+}
+
+static inline bool
+exchange_list_orders_async(const char *name, const char *status,
+    const char *product_id,
+    exchange_done_orders_cb_t cb, void *user)
+{
+  typedef bool (*fn_t)(const char *, const char *, const char *,
+      exchange_done_orders_cb_t, void *);
+  static fn_t cached = NULL;
+  fn_t        fn     = __atomic_load_n(&cached, __ATOMIC_ACQUIRE);
+
+  if(fn == NULL)
+  {
+    union { void *obj; fn_t fn; } u;
+
+    u.obj = plugin_dlsym("exchange", "exchange_list_orders_async");
+    if(u.obj == NULL)
+    {
+      clam(CLAM_FATAL, "exchange",
+          "dlsym failed: exchange_list_orders_async");
+      abort();
+    }
+    fn = u.fn;
+    __atomic_store_n(&cached, fn, __ATOMIC_RELEASE);
+  }
+  return(fn(name, status, product_id, cb, user));
+}
+
+static inline bool
+exchange_list_fills_async(const char *name, const char *order_id,
+    const char *product_id, int64_t start_ms,
+    exchange_done_fills_cb_t cb, void *user)
+{
+  typedef bool (*fn_t)(const char *, const char *, const char *,
+      int64_t, exchange_done_fills_cb_t, void *);
+  static fn_t cached = NULL;
+  fn_t        fn     = __atomic_load_n(&cached, __ATOMIC_ACQUIRE);
+
+  if(fn == NULL)
+  {
+    union { void *obj; fn_t fn; } u;
+
+    u.obj = plugin_dlsym("exchange", "exchange_list_fills_async");
+    if(u.obj == NULL)
+    {
+      clam(CLAM_FATAL, "exchange",
+          "dlsym failed: exchange_list_fills_async");
+      abort();
+    }
+    fn = u.fn;
+    __atomic_store_n(&cached, fn, __ATOMIC_RELEASE);
+  }
+  return(fn(name, order_id, product_id, start_ms, cb, user));
+}
+
+static inline bool
+exchange_get_accounts_async(const char *name,
+    exchange_done_accounts_cb_t cb, void *user)
+{
+  typedef bool (*fn_t)(const char *, exchange_done_accounts_cb_t, void *);
+  static fn_t cached = NULL;
+  fn_t        fn     = __atomic_load_n(&cached, __ATOMIC_ACQUIRE);
+
+  if(fn == NULL)
+  {
+    union { void *obj; fn_t fn; } u;
+
+    u.obj = plugin_dlsym("exchange", "exchange_get_accounts_async");
+    if(u.obj == NULL)
+    {
+      clam(CLAM_FATAL, "exchange",
+          "dlsym failed: exchange_get_accounts_async");
+      abort();
+    }
+    fn = u.fn;
+    __atomic_store_n(&cached, fn, __ATOMIC_RELEASE);
+  }
+  return(fn(name, cb, user));
 }
 
 #endif // !EXCHANGE_INTERNAL

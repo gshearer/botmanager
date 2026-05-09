@@ -949,6 +949,38 @@ coinbase_fetch_ticker_async(const char *product_id,
   return(SUCCESS);
 }
 
+// Cache-only count probe (WM-OR-1). Used by the exchange-vtable
+// `get_products_count` hook so consumers don't have to allocate a
+// CB_MAX_PRODUCTS-row staging buffer just to read counts. SUCCESS
+// always; an empty cache reports (0, 0).
+bool
+cb_products_count_locked(uint32_t *out_total, uint32_t *out_active)
+{
+  uint32_t total;
+  uint32_t active;
+  uint32_t i;
+
+  if(out_total == NULL || out_active == NULL)
+    return(FAIL);
+
+  pthread_rwlock_rdlock(&cb_products_rwl);
+
+  total  = cb_products_count;
+  active = 0;
+
+  for(i = 0; i < total; i++)
+  {
+    if(!cb_products_cache[i].trading_disabled)
+      active++;
+  }
+
+  pthread_rwlock_unlock(&cb_products_rwl);
+
+  *out_total  = total;
+  *out_active = active;
+  return(SUCCESS);
+}
+
 // Sync cache read
 
 bool
