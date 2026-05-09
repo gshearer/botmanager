@@ -20,30 +20,6 @@
 #include <stdio.h>
 #include <string.h>
 
-// Build the coinbase wire-form symbol "BASE-QUOTE" (uppercase) from
-// already-parsed lowercase base/quote tokens.
-static void
-wm_market_wire_symbol(const char *base, const char *quote,
-    char *out, size_t out_sz)
-{
-  size_t i;
-  int    n;
-
-  if(out == NULL || out_sz == 0)
-    return;
-
-  n = snprintf(out, out_sz, "%s-%s", base, quote);
-
-  if(n < 0 || (size_t)n >= out_sz)
-  {
-    out[0] = '\0';
-    return;
-  }
-
-  for(i = 0; out[i] != '\0'; i++)
-    out[i] = (char)toupper((unsigned char)out[i]);
-}
-
 // Read one market-id token off ctx->args, parse it, and produce the
 // (exch/base/quote) triple plus the coinbase wire-form symbol.
 // Replies on the ctx with `usage` on missing token, "bad market id"

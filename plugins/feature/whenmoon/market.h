@@ -178,6 +178,13 @@ bool wm_market_parse_id(const char *id,
 void wm_market_format_id(const char *exchange, const char *base,
     const char *quote, char *out, size_t out_sz);
 
+// Build the exchange wire-form symbol "BASE-QUOTE" (uppercase) from
+// already-parsed lowercase base/quote tokens. Output is empty on
+// truncation. WM-OR-1: shared between market_cmds.c and the new
+// /whenmoon order verbs.
+void wm_market_wire_symbol(const char *base, const char *quote,
+    char *out, size_t out_sz);
+
 // Coinbase-callback hooks — whenmoon-internal. Gated so strategy
 // plugins don't pull in coinbase types just by including market.h.
 #ifdef WHENMOON_INTERNAL

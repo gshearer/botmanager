@@ -11,6 +11,7 @@
 #include "dl_jobtable.h"
 #include "dl_commands.h"
 #include "market_cmds.h"
+#include "order_cmds.h"
 #include "live.h"
 #include "order.h"
 #include "strategy.h"
@@ -443,6 +444,18 @@ whenmoon_init(void)
   if(wm_trade_register_verbs() != SUCCESS)
   {
     clam(CLAM_INFO, WHENMOON_CTX, "trade verb registration failed");
+    goto fail;
+  }
+
+  if(wm_order_register_verbs() != SUCCESS)
+  {
+    clam(CLAM_INFO, WHENMOON_CTX, "order verb registration failed");
+    goto fail;
+  }
+
+  if(wm_exch_register_verbs() != SUCCESS)
+  {
+    clam(CLAM_INFO, WHENMOON_CTX, "exchange show-verb registration failed");
     goto fail;
   }
 

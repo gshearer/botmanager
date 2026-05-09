@@ -335,6 +335,34 @@ wm_market_format_id(const char *exchange, const char *base,
   out[pos] = '\0';
 }
 
+void
+wm_market_wire_symbol(const char *base, const char *quote,
+    char *out, size_t out_sz)
+{
+  size_t i;
+  int    n;
+
+  if(out == NULL || out_sz == 0)
+    return;
+
+  if(base == NULL || quote == NULL)
+  {
+    out[0] = '\0';
+    return;
+  }
+
+  n = snprintf(out, out_sz, "%s-%s", base, quote);
+
+  if(n < 0 || (size_t)n >= out_sz)
+  {
+    out[0] = '\0';
+    return;
+  }
+
+  for(i = 0; out[i] != '\0'; i++)
+    out[i] = (char)toupper((unsigned char)out[i]);
+}
+
 // ------------------------------------------------------------------ //
 // Enabled-flag persistence on wm_market                              //
 // ------------------------------------------------------------------ //
