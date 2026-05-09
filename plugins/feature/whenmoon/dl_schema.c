@@ -170,6 +170,43 @@ static const char *const wm_dl_ddl_core[] = {
   " updated_at         TIMESTAMPTZ      NOT NULL DEFAULT NOW(),"
   " PRIMARY KEY (market_id, strategy_name)"
   ")",
+
+  // WM-MK-2: per-market session state (position + paper/real ledgers
+  // + fills rings + pending ring + cached params). Replaces the
+  // per-(market, strategy) wm_trade_book_state once WM-MK-3 swaps
+  // consumers and WM-MK-5 rips the legacy table. JSONB carries the
+  // composite blobs so future field additions are forward-compatible
+  // without ALTER TABLE (per the pre-1.0 freshstart policy in
+  // feedback_no_migration_planning.md).
+  "CREATE TABLE IF NOT EXISTS wm_market_state ("
+  " market_id          INT              NOT NULL PRIMARY KEY,"
+  " mode               VARCHAR(16)      NOT NULL,"
+  " position_side      VARCHAR(8)       NOT NULL,"
+  " position_qty       DOUBLE PRECISION NOT NULL,"
+  " position_avg       DOUBLE PRECISION NOT NULL,"
+  " position_opened_ms BIGINT           NOT NULL,"
+  " stats_paper        JSONB            NOT NULL,"
+  " stats_real         JSONB            NOT NULL,"
+  " fills_paper        JSONB            NOT NULL,"
+  " fills_real         JSONB            NOT NULL,"
+  " pending            JSONB            NOT NULL,"
+  " last_mark_px       DOUBLE PRECISION NOT NULL,"
+  " last_mark_ms       BIGINT           NOT NULL,"
+  " last_signal        JSONB,"
+  " has_last_signal    BOOLEAN          NOT NULL,"
+  " fills_n_paper      BIGINT           NOT NULL,"
+  " fills_head_paper   INT              NOT NULL,"
+  " fills_n_real       BIGINT           NOT NULL,"
+  " fills_head_real    INT              NOT NULL,"
+  " fee_bps            DOUBLE PRECISION NOT NULL,"
+  " slip_bps           DOUBLE PRECISION NOT NULL,"
+  " size_frac          DOUBLE PRECISION NOT NULL,"
+  " max_notional       DOUBLE PRECISION NOT NULL,"
+  " daily_loss_bps     DOUBLE PRECISION NOT NULL,"
+  " pending_cap        INT              NOT NULL,"
+  " pending_n          INT              NOT NULL,"
+  " updated_at         TIMESTAMPTZ      NOT NULL DEFAULT NOW()"
+  ")",
 };
 
 // ------------------------------------------------------------------ //

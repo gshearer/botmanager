@@ -14,6 +14,8 @@
 #include "aggregator.h"
 #include "live.h"
 #include "market.h"
+#include "market_engine.h"
+#include "market_persist.h"
 #include "strategy.h"
 #include "dl_schema.h"
 
@@ -26,6 +28,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <strings.h>      // strcasecmp (WM-MK-2 mode parser)
 
 // Per-product backfill context. Heap-owned; the completion callback is
 // the sole owner and frees it after wiring the rows into the market
@@ -201,6 +204,99 @@ wm_market_kick_backfill(whenmoon_state_t *st, const char *product_id)
   (void)coinbase_fetch_candles_async(ctx->product_id, COINBASE_GRAN_1M,
       0, 0, EXCHANGE_PRIO_MARKET_BACKFILL,
       wm_market_on_candles, ctx);
+}
+
+// ------------------------------------------------------------------ //
+// WM-MK-2: session helpers                                           //
+// ------------------------------------------------------------------ //
+
+bool
+wm_market_mode_parse(const char *tok, wm_market_mode_t *out)
+{
+  if(tok == NULL || out == NULL)
+    return(FAIL);
+
+  if(strcasecmp(tok, "manual") == 0)
+  {
+    *out = WM_MARKET_MODE_MANUAL;
+    return(SUCCESS);
+  }
+
+  if(strcasecmp(tok, "paper") == 0)
+  {
+    *out = WM_MARKET_MODE_PAPER;
+    return(SUCCESS);
+  }
+
+  if(strcasecmp(tok, "real") == 0)
+  {
+    *out = WM_MARKET_MODE_REAL;
+    return(SUCCESS);
+  }
+
+  return(FAIL);
+}
+
+const char *
+wm_market_mode_name(wm_market_mode_t m)
+{
+  switch(m)
+  {
+    case WM_MARKET_MODE_MANUAL: return("manual");
+    case WM_MARKET_MODE_PAPER:  return("paper");
+    case WM_MARKET_MODE_REAL:   return("real");
+  }
+
+  return("?");
+}
+
+void
+wm_market_session_init(wm_market_session_t *s)
+{
+  uint32_t i;
+
+  if(s == NULL)
+    return;
+
+  memset(s, 0, sizeof(*s));
+
+  s->mode          = WM_MARKET_MODE_PAPER;
+  s->position.side = WM_MARKET_POS_FLAT;
+
+  for(i = 0; i < WM_MARKET_MODE_COUNT; i++)
+  {
+    s->stats[i].starting_cash   = WM_MARKET_DEFAULT_STARTING_CASH;
+    s->stats[i].cash            = WM_MARKET_DEFAULT_STARTING_CASH;
+    s->stats[i].daily_anchor_ms = 0;
+  }
+
+  s->fee_bps        = WM_MARKET_DEFAULT_FEE_BPS;
+  s->slip_bps       = WM_MARKET_DEFAULT_SLIP_BPS;
+  s->size_frac      = WM_MARKET_DEFAULT_SIZE_FRAC;
+  s->max_notional   = WM_MARKET_DEFAULT_MAX_NOTIONAL;
+  s->daily_loss_bps = WM_MARKET_DEFAULT_DAILY_LOSS_BPS;
+  s->pending_cap    = WM_MARKET_DEFAULT_PENDING_CAP;
+}
+
+whenmoon_market_t *
+wm_market_lookup_by_id(whenmoon_state_t *st, const char *market_id_str)
+{
+  whenmoon_markets_t *m;
+  uint32_t            i;
+
+  if(st == NULL || st->markets == NULL || market_id_str == NULL)
+    return(NULL);
+
+  m = st->markets;
+
+  for(i = 0; i < m->n_markets; i++)
+  {
+    if(strncmp(m->arr[i].market_id_str, market_id_str,
+           WM_MARKET_ID_STR_SZ) == 0)
+      return(&m->arr[i]);
+  }
+
+  return(NULL);
 }
 
 // ------------------------------------------------------------------ //
@@ -659,6 +755,13 @@ wm_market_add(whenmoon_state_t *st,
       mk->market_id_str, sizeof(mk->market_id_str));
   mk->market_id = market_id;
   pthread_mutex_init(&mk->lock, NULL);
+
+  // WM-MK-2: install the per-market position model with default-init
+  // values. Lazy KV refresh (Phase C) replaces cached params on first
+  // engine call. Persistence restore (Phase D) overwrites the session
+  // when a wm_market_state row exists for this market_id.
+  wm_market_session_init(&mk->session);
+
   m->n_markets++;
 
   if(persist)
@@ -688,6 +791,14 @@ wm_market_add(whenmoon_state_t *st,
     if(err != NULL) snprintf(err, err_cap, "aggregator init failed");
     return(FAIL);
   }
+
+  // WM-MK-2: lazy-register + cache per-market KV defaults so operator
+  // /set kv values land in the session immediately. Idempotent across
+  // restarts (kv_register short-circuits on existing keys; KV values
+  // hydrated by kv_load survive); the cached values are also
+  // overwritten by wm_market_persist_restore_all when a state row
+  // exists for this market.
+  wm_market_session_refresh_kv(mk);
 
   wm_market_resub_ws(st);
   wm_market_kick_backfill(st, product_id);
@@ -794,6 +905,10 @@ wm_market_remove(whenmoon_state_t *st, const char *product_id,
         snprintf(err, err_cap,
             "DB disable failed (live set already updated)");
     }
+
+    // WM-MK-2: drop the per-market session row so a stale paper ledger
+    // doesn't resurrect when the operator re-enables the market later.
+    (void)wm_market_persist_drop(market_id);
   }
 
   wm_market_resub_ws(st);

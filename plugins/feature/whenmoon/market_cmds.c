@@ -7,6 +7,7 @@
 #include "aggregator.h"
 #include "market.h"
 #include "market_cmds.h"
+#include "market_engine.h"
 #include "dl_commands.h"
 
 #include "cmd.h"
@@ -385,6 +386,122 @@ wm_market_cmd_indicators(const cmd_ctx_t *ctx)
 }
 
 // ------------------------------------------------------------------ //
+// /whenmoon market mode <id> <manual|paper|real>  (WM-MK-2)           //
+// ------------------------------------------------------------------ //
+
+static void
+wm_market_cmd_mode(const cmd_ctx_t *ctx)
+{
+  whenmoon_state_t *st;
+  const char       *p;
+  char              id_tok[64] = {0};
+  char              mode_tok[16] = {0};
+  char              exch[32];
+  char              base[16];
+  char              quote[16];
+  char              id_str[WM_MARKET_ID_STR_SZ];
+  char              err[160] = {0};
+  char              reply[200];
+  wm_market_mode_t  mode;
+
+  st = whenmoon_get_state();
+
+  if(st == NULL || st->markets == NULL)
+  {
+    cmd_reply(ctx, "whenmoon: no market state");
+    return;
+  }
+
+  p = ctx->args != NULL ? ctx->args : "";
+
+  if(!wm_dl_next_token(&p, id_tok, sizeof(id_tok)) ||
+     !wm_dl_next_token(&p, mode_tok, sizeof(mode_tok)))
+  {
+    cmd_reply(ctx,
+        "usage: /whenmoon market mode <exch>-<base>-<quote>"
+        " <manual|paper|real>");
+    return;
+  }
+
+  if(wm_market_parse_id(id_tok, exch, sizeof(exch), base, sizeof(base),
+         quote, sizeof(quote)) != SUCCESS)
+  {
+    cmd_reply(ctx, "bad market id (expected <exch>-<base>-<quote>)");
+    return;
+  }
+
+  wm_market_format_id(exch, base, quote, id_str, sizeof(id_str));
+
+  if(wm_market_mode_parse(mode_tok, &mode) != SUCCESS)
+  {
+    cmd_reply(ctx, "bad mode (expected manual|paper|real)");
+    return;
+  }
+
+  if(wm_market_set_mode(id_str, mode, err, sizeof(err)) != SUCCESS)
+  {
+    snprintf(reply, sizeof(reply),
+        "market %s mode change FAIL: %s", id_str,
+        err[0] != '\0' ? err : "(no detail)");
+    cmd_reply(ctx, reply);
+    return;
+  }
+
+  snprintf(reply, sizeof(reply),
+      "market %s mode -> %s", id_str, wm_market_mode_name(mode));
+  cmd_reply(ctx, reply);
+}
+
+// ------------------------------------------------------------------ //
+// /whenmoon market selftest <id>  (WM-MK-2; removed in WM-MK-5)       //
+// ------------------------------------------------------------------ //
+
+static void
+wm_market_cmd_selftest(const cmd_ctx_t *ctx)
+{
+  whenmoon_state_t *st;
+  char              exch[32];
+  char              base[16];
+  char              quote[16];
+  char              symbol[COINBASE_PRODUCT_ID_SZ];
+  char              id_str[WM_MARKET_ID_STR_SZ];
+  char              err[192] = {0};
+  char              reply[256];
+
+  st = whenmoon_get_state();
+
+  if(st == NULL || st->markets == NULL)
+  {
+    cmd_reply(ctx, "whenmoon: no market state");
+    return;
+  }
+
+  if(wm_market_take_id_arg(ctx,
+         "usage: /whenmoon market selftest <exch>-<base>-<quote>",
+         exch,   sizeof(exch),
+         base,   sizeof(base),
+         quote,  sizeof(quote),
+         symbol, sizeof(symbol)) != SUCCESS)
+    return;
+
+  wm_market_format_id(exch, base, quote, id_str, sizeof(id_str));
+
+  if(wm_market_engine_selftest(id_str, err, sizeof(err)) != SUCCESS)
+  {
+    snprintf(reply, sizeof(reply),
+        "market %s selftest FAIL: %s", id_str,
+        err[0] != '\0' ? err : "(no detail)");
+    cmd_reply(ctx, reply);
+    return;
+  }
+
+  snprintf(reply, sizeof(reply),
+      "market %s selftest PASS (paper buy 0.1 @ 50000.0,"
+      " sell 0.1 @ 51000.0, realized=100.0)", id_str);
+  cmd_reply(ctx, reply);
+}
+
+// ------------------------------------------------------------------ //
 // Parent stub                                                         //
 // ------------------------------------------------------------------ //
 
@@ -392,7 +509,8 @@ static void
 wm_market_parent_cb(const cmd_ctx_t *ctx)
 {
   cmd_reply(ctx,
-      "usage: /whenmoon market <start|stop> <exch>-<base>-<quote>");
+      "usage: /whenmoon market <start|stop|mode|selftest> ..."
+      " (mode takes <manual|paper|real>)");
 }
 
 // ------------------------------------------------------------------ //
@@ -403,10 +521,13 @@ bool
 wm_market_register_verbs(void)
 {
   if(cmd_register("whenmoon", "market",
-        "whenmoon market <start|stop> <exch>-<base>-<quote>",
-        "Add or remove a live market."
+        "whenmoon market <start|stop|mode|selftest> ...",
+        "Add or remove a live market and manage its session."
         " Starts: WS subscribe + live-ring 1m backfill."
-        " Stops: unsubscribe + clear enabled flag.",
+        " Stops: unsubscribe + clear enabled flag."
+        " Mode: change the market's mode (manual|paper|real)."
+        " Selftest: drive the new market position engine through a"
+        " synthetic paper round-trip (WM-MK-2; removed in WM-MK-5).",
         NULL,
         USERNS_GROUP_ADMIN, 100, CMD_SCOPE_ANY, METHOD_T_ANY,
         wm_market_parent_cb, NULL, "whenmoon", NULL,
@@ -434,6 +555,43 @@ wm_market_register_verbs(void)
         NULL,
         USERNS_GROUP_ADMIN, 100, CMD_SCOPE_ANY, METHOD_T_ANY,
         wm_market_cmd_stop, NULL, "whenmoon/market", NULL,
+        NULL, 0, NULL, NULL) != SUCCESS)
+    return(FAIL);
+
+  // WM-MK-2: per-market mode change. Refuses non-flat transitions to
+  // keep paper / real ledgers from contaminating each other when the
+  // market still holds a position. Persists via market_persist.
+  if(cmd_register("whenmoon", "mode",
+        "whenmoon market mode <exch>-<base>-<quote>"
+        " <manual|paper|real>",
+        "Change a market's mode. PAPER = synthetic fills against the"
+        " cached mark + paper-stats accumulation. REAL = exchange"
+        " submission + risk gates (daily-loss bps, max-notional,"
+        " pending-cap) + real-stats accumulation. MANUAL = strategies"
+        " still receive ticks and log advice but the market takes no"
+        " action; force-trades (WM-MK-4) drive the position. Refused"
+        " when the market currently holds a position — flatten first.",
+        NULL,
+        USERNS_GROUP_ADMIN, 100, CMD_SCOPE_ANY, METHOD_T_ANY,
+        wm_market_cmd_mode, NULL, "whenmoon/market", NULL,
+        NULL, 0, NULL, NULL) != SUCCESS)
+    return(FAIL);
+
+  // WM-MK-2: temporary selftest verb. Drives the new market position
+  // engine through a synthetic paper-mode buy + sell round-trip and
+  // asserts position transitions + stats accumulation. Verb (and
+  // wm_market_engine_selftest) get ripped in WM-MK-5 once WM-MK-3 has
+  // wired strategy advice + live external fills onto the new path.
+  if(cmd_register("whenmoon", "selftest",
+        "whenmoon market selftest <exch>-<base>-<quote>",
+        "Run the market position engine selftest (paper buy + sell"
+        " against the cached mark; asserts position transitions, fills"
+        " ring growth, and cash delta = realized PnL). Requires a flat"
+        " position; restores the prior mode on exit. Temporary verb —"
+        " removed in WM-MK-5.",
+        NULL,
+        USERNS_GROUP_ADMIN, 100, CMD_SCOPE_ANY, METHOD_T_ANY,
+        wm_market_cmd_selftest, NULL, "whenmoon/market", NULL,
         NULL, 0, NULL, NULL) != SUCCESS)
     return(FAIL);
 

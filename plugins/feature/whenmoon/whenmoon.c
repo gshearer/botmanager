@@ -6,6 +6,7 @@
 #include "backtest.h"
 #include "book_persist.h"
 #include "market.h"
+#include "market_persist.h"
 #include "account.h"
 #include "dl_schema.h"
 #include "dl_jobtable.h"
@@ -347,6 +348,14 @@ whenmoon_init(void)
     return(FAIL);
   }
 
+  if(wm_market_persist_global_init() != SUCCESS)
+  {
+    clam(CLAM_INFO, WHENMOON_CTX, "market-persist global init failed");
+    wm_book_persist_global_destroy();
+    TA_Shutdown();
+    return(FAIL);
+  }
+
   st = mem_alloc("whenmoon", "state", sizeof(*st));
 
   if(st == NULL)
@@ -488,6 +497,7 @@ fail:
   whenmoon_subsystems_destroy(st);
   whenmoon_state = NULL;
   mem_free(st);
+  wm_market_persist_global_destroy();
   wm_book_persist_global_destroy();
   TA_Shutdown();
   return(FAIL);
@@ -509,6 +519,13 @@ whenmoon_start(void)
     clam(CLAM_INFO, WHENMOON_CTX,
         "wm_market_restore failed (plugin starts with no markets)");
 
+  // WM-MK-2: hydrate per-market sessions immediately after the running
+  // set is non-empty. Rows whose market_id is not in the running set
+  // are left untouched.
+  if(wm_market_persist_restore_all(st) != SUCCESS)
+    clam(CLAM_INFO, WHENMOON_CTX,
+        "wm_market_persist_restore_all failed (sessions left at default)");
+
   // WM-LT-8-B3: schedule the REST /fills safety-net poll + boot
   // reconcile (advisory list of any open orders left resting at the
   // gateway across a prior daemon life). Idempotent.
@@ -529,6 +546,7 @@ whenmoon_deinit(void)
     mem_free(st);
   }
 
+  wm_market_persist_global_destroy();
   wm_book_persist_global_destroy();
   TA_Shutdown();
   clam(CLAM_INFO, WHENMOON_CTX, "whenmoon plugin deinitialized");
@@ -541,7 +559,7 @@ whenmoon_deinit(void)
 const plugin_desc_t bm_plugin_desc = {
   .api_version          = PLUGIN_API_VERSION,
   .name                 = "whenmoon",
-  .version              = "0.10-strat-bars",
+  .version              = "0.10-mk2",
   .type                 = PLUGIN_FEATURE,
   .kind                 = "whenmoon",
   .provides             = { { .name = "feature_whenmoon" } },
