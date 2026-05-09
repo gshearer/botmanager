@@ -105,15 +105,14 @@ wm_trade_cmd_mode(const cmd_ctx_t *ctx)
   {
     cmd_reply(ctx,
         "usage: /whenmoon trade mode <market_id> <strategy_name>"
-        " <off|paper|backtest|live>");
+        " <manual|paper|real>");
     return;
   }
 
   if(wm_trade_mode_parse(mode_tok, &mode) != SUCCESS)
   {
     snprintf(reply, sizeof(reply),
-        "trade mode: unknown mode '%s' (off|paper|backtest|live)",
-        mode_tok);
+        "trade mode: unknown mode '%s' (manual|paper|real)", mode_tok);
     cmd_reply(ctx, reply);
     return;
   }
@@ -126,14 +125,12 @@ wm_trade_cmd_mode(const cmd_ctx_t *ctx)
     return;
   }
 
-  // Surface the helpful next-step hints. backtest + live are not yet
-  // wired (WM-LT-5 / WM-LT-8); the engine accepts the mode but no
-  // fills will fire until those chunks land.
   switch(mode)
   {
-    case WM_TRADE_MODE_OFF:
+    case WM_TRADE_MODE_MANUAL:
       snprintf(reply, sizeof(reply),
-          "trade %s/%s: mode=off (signals recorded, no fills)",
+          "trade %s/%s: mode=manual (signals recorded; no fills until"
+          " /whenmoon trade buy|sell)",
           id_tok, name_tok);
       break;
 
@@ -144,17 +141,10 @@ wm_trade_cmd_mode(const cmd_ctx_t *ctx)
           id_tok, name_tok);
       break;
 
-    case WM_TRADE_MODE_BACKTEST:
+    case WM_TRADE_MODE_REAL:
       snprintf(reply, sizeof(reply),
-          "trade %s/%s: mode=backtest (placeholder; WM-LT-5 wires"
-          " fills)",
-          id_tok, name_tok);
-      break;
-
-    case WM_TRADE_MODE_LIVE:
-      snprintf(reply, sizeof(reply),
-          "trade %s/%s: mode=live (placeholder; WM-LT-8 wires order"
-          " placement)",
+          "trade %s/%s: mode=real (live orders to the exchange — risk"
+          " gates apply, master force_manual overrides)",
           id_tok, name_tok);
       break;
   }
@@ -206,6 +196,79 @@ wm_trade_cmd_reset(const cmd_ctx_t *ctx)
       "trade %s/%s: reset (cash restored, position flat, pnl cleared)",
       id_tok, name_tok);
   cmd_reply(ctx, reply);
+}
+
+// ----------------------------------------------------------------------- //
+// /whenmoon trade buy / sell — operator-issued order                       //
+// ----------------------------------------------------------------------- //
+
+static void
+wm_trade_cmd_buysell(const cmd_ctx_t *ctx, char side)
+{
+  const char *p;
+  char        id_tok[64]                    = {0};
+  char        name_tok[WM_STRATEGY_NAME_SZ] = {0};
+  char        qty_tok[32]                   = {0};
+  char        px_tok[32]                    = {0};
+  char        reply[256];
+  char        errbuf[160]                   = {0};
+  double      qty;
+  double      limit_px = 0.0;
+
+  p = ctx->args != NULL ? ctx->args : "";
+
+  if(!wm_dl_next_token(&p, id_tok,   sizeof(id_tok))   ||
+     !wm_dl_next_token(&p, name_tok, sizeof(name_tok)) ||
+     !wm_dl_next_token(&p, qty_tok,  sizeof(qty_tok)))
+  {
+    snprintf(reply, sizeof(reply),
+        "usage: /whenmoon trade %s <market_id> <strategy_name> <qty>"
+        " [<limit_px>]", (side == 'b') ? "buy" : "sell");
+    cmd_reply(ctx, reply);
+    return;
+  }
+
+  if(wm_dl_next_token(&p, px_tok, sizeof(px_tok)))
+    limit_px = strtod(px_tok, NULL);
+
+  qty = strtod(qty_tok, NULL);
+  if(qty <= 0.0)
+  {
+    cmd_reply(ctx, "trade buy/sell: qty must be > 0");
+    return;
+  }
+
+  if(wm_trade_engine_operator_order(id_tok, name_tok, side, qty,
+         limit_px, errbuf, sizeof(errbuf)) != SUCCESS)
+  {
+    snprintf(reply, sizeof(reply),
+        "trade %s %s/%s: FAIL: %s",
+        (side == 'b') ? "buy" : "sell",
+        id_tok, name_tok,
+        errbuf[0] ? errbuf : "(no detail)");
+    cmd_reply(ctx, reply);
+    return;
+  }
+
+  snprintf(reply, sizeof(reply),
+      "trade %s %s/%s: qty=%.6g px=%s%s",
+      (side == 'b') ? "buy" : "sell",
+      id_tok, name_tok, qty,
+      limit_px > 0.0 ? "" : "mark",
+      limit_px > 0.0 ? px_tok : "");
+  cmd_reply(ctx, reply);
+}
+
+static void
+wm_trade_cmd_buy(const cmd_ctx_t *ctx)
+{
+  wm_trade_cmd_buysell(ctx, 'b');
+}
+
+static void
+wm_trade_cmd_sell(const cmd_ctx_t *ctx)
+{
+  wm_trade_cmd_buysell(ctx, 's');
 }
 
 // ----------------------------------------------------------------------- //
@@ -641,8 +704,10 @@ wm_trade_register_verbs(void)
         "whenmoon trade <verb> ...",
         "Trade-engine controls (WM-LT-4).",
         "Subcommands: mode <market_id> <strat>"
-        " <off|paper|backtest|live>,"
-        " reset <market_id> <strat>.",
+        " <manual|paper|real>,"
+        " reset <market_id> <strat>,"
+        " buy <market_id> <strat> <qty> [<limit_px>],"
+        " sell <market_id> <strat> <qty> [<limit_px>].",
         USERNS_GROUP_ADMIN, 100, CMD_SCOPE_ANY, METHOD_T_ANY,
         wm_trade_parent_cb, NULL, "whenmoon", NULL,
         NULL, 0, NULL, NULL) != SUCCESS)
@@ -650,12 +715,16 @@ wm_trade_register_verbs(void)
 
   if(cmd_register("whenmoon", "mode",
         "whenmoon trade mode <market_id> <strategy_name>"
-        " <off|paper|backtest|live>",
+        " <manual|paper|real>",
         "Set the trade-engine mode for a (market, strategy) pair.",
-        "off:      signals recorded, no fills.\n"
-        "paper:    synthetic fills against bar/tick mark + slip + fee.\n"
-        "backtest: placeholder (WM-LT-5 wires snapshot replay).\n"
-        "live:     placeholder (WM-LT-8 wires real order placement).\n"
+        "manual: signals recorded, no automated fills. Operator"
+        " drives buys/sells via /whenmoon trade buy|sell.\n"
+        "paper:  synthetic fills against bar/tick mark + slip + fee on"
+        " every signal. Default for fresh books.\n"
+        "real:   live orders to the exchange on every signal. Risk"
+        " gates apply (daily_loss_bps, max_notional, pending_cap)."
+        " Master plugin.whenmoon.force_manual overrides every real"
+        " book to behave as manual until cleared.\n"
         "First call creates the trade book seeded with starting_cash"
         " from the strategy KV (default 10000).",
         USERNS_GROUP_ADMIN, 100, CMD_SCOPE_ANY, METHOD_T_ANY,
@@ -671,6 +740,30 @@ wm_trade_register_verbs(void)
         NULL,
         USERNS_GROUP_ADMIN, 100, CMD_SCOPE_ANY, METHOD_T_ANY,
         wm_trade_cmd_reset, NULL, "whenmoon/trade", NULL,
+        NULL, 0, NULL, NULL) != SUCCESS)
+    return(FAIL);
+
+  if(cmd_register("whenmoon", "buy",
+        "whenmoon trade buy <market_id> <strategy_name> <qty>"
+        " [<limit_px>]",
+        "Operator-issued buy order. Routes by book mode: paper →"
+        " synthetic fill at mark + slip + fee; manual / real → live"
+        " order to the exchange (bypasses sizer + master force_manual;"
+        " risk caps still apply). limit_px omitted = use cached mark.",
+        NULL,
+        USERNS_GROUP_ADMIN, 100, CMD_SCOPE_ANY, METHOD_T_ANY,
+        wm_trade_cmd_buy, NULL, "whenmoon/trade", NULL,
+        NULL, 0, NULL, NULL) != SUCCESS)
+    return(FAIL);
+
+  if(cmd_register("whenmoon", "sell",
+        "whenmoon trade sell <market_id> <strategy_name> <qty>"
+        " [<limit_px>]",
+        "Operator-issued sell order. Symmetric to buy; see"
+        " /whenmoon trade buy for routing details.",
+        NULL,
+        USERNS_GROUP_ADMIN, 100, CMD_SCOPE_ANY, METHOD_T_ANY,
+        wm_trade_cmd_sell, NULL, "whenmoon/trade", NULL,
         NULL, 0, NULL, NULL) != SUCCESS)
     return(FAIL);
 

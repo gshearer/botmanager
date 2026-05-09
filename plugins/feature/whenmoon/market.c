@@ -12,6 +12,7 @@
 #define WHENMOON_INTERNAL
 #include "whenmoon.h"
 #include "aggregator.h"
+#include "live.h"
 #include "market.h"
 #include "strategy.h"
 #include "dl_schema.h"
@@ -166,6 +167,10 @@ wm_market_resub_ws(whenmoon_state_t *st)
   if(m->ws_sub == NULL)
     clam(CLAM_INFO, WHENMOON_CTX,
         "ws subscribe failed (no live stream)");
+
+  // WM-LT-8-B3: piggyback the user-channel resub on the same product
+  // set so live-trader fill events reach the engine.
+  wm_live_ws_resub(st, pid_ptrs, m->n_markets);
 
   mem_free(pid_ptrs);
 }

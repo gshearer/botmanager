@@ -496,6 +496,11 @@ whenmoon_start(void)
     clam(CLAM_INFO, WHENMOON_CTX,
         "wm_market_restore failed (plugin starts with no markets)");
 
+  // WM-LT-8-B3: schedule the REST /fills safety-net poll + boot
+  // reconcile (advisory list of any open orders left resting at the
+  // gateway across a prior daemon life). Idempotent.
+  wm_live_engine_start();
+
   return(SUCCESS);
 }
 

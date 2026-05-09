@@ -1,19 +1,20 @@
-// live.h — real-mode trade execution skeleton (WM-LT-8-B2).
+// live.h — real-mode trade execution skeleton (WM-LT-8-B2/B3).
 //
-// The whenmoon trade engine has two live sub-modes:
-//   PAPER (WM_TRADE_MODE_PAPER) — simulated fills against the cached
-//     mark; no orders leave the daemon. Shipped by WM-LT-4.
-//   REAL  (WM_TRADE_MODE_LIVE)  — orders submitted to the exchange via
-//     coinbase_place_order_async; fills land asynchronously through the
-//     `user` WS channel and a /fills REST poll fallback (WM-LT-8-B3).
+// The whenmoon trade engine has three per-(market, strategy) modes:
+//   MANUAL — book exists, signals do not act. Operator drives via
+//            /whenmoon trade buy|sell.
+//   PAPER  — simulated fills against the cached mark on every signal.
+//   REAL   — orders submitted to the exchange via
+//            coinbase_place_order_async; fills land asynchronously
+//            through the `user` WS channel + /fills REST poll
+//            fallback.
 //
-// This module scaffolds the REAL path. The kill-switch KV defaults to
-// false, so submission FAILs closed unless an admin explicitly flips
-// `plugin.whenmoon.exchange.<exchange>.live=true`. Every gate fails
-// closed in the same direction; there is no way to send an order until
-// every check passes. The pending-order ring is in-memory only — v1
-// hydrates open orders from the gateway on next boot rather than from
-// local state.
+// The plugin-wide master KV `plugin.whenmoon.force_manual` (default
+// false) overrides every REAL book to behave as MANUAL until cleared.
+// Use it as a single-knob "stop all real trading" switch without
+// touching per-book mode state. Risk gates (daily loss bps, max
+// notional, pending cap) layer on top of the master + book-mode gate
+// for any submission that does land.
 //
 // Internal to the whenmoon plugin. WHENMOON_INTERNAL gated.
 
@@ -66,20 +67,49 @@ typedef struct wm_trade_pending
   bool     gateway_accepted;
 } wm_trade_pending_t;
 
+// Trade-id dedup ring per (market, strategy). Sized to absorb the
+// largest realistic burst (one fill per 100ms over a 6s window).
+#define WM_LIVE_TRADE_DEDUP_CAP   64
+
 // Lifecycle: called from whenmoon_init / whenmoon_destroy.
 bool wm_live_engine_init(void);
 void wm_live_engine_destroy(void);
 
+// Late-stage start hook. Called from whenmoon_start (after kv_load).
+// Schedules the REST /fills safety-net poll periodic and runs the boot
+// reconcile (advisory log of any open orders left at the gateway).
+// Idempotent.
+void wm_live_engine_start(void);
+
+// Hook called from market.c after the active product list mutates.
+// (Re)subscribes the user-channel WS for the live trader, gated on
+// credentials — when no creds are configured the hook is a no-op. Pass
+// n_products = 0 to tear the subscription down (e.g. last market
+// removed).
+struct whenmoon_state;
+void wm_live_ws_resub(struct whenmoon_state *st,
+    const char *const *product_ids, size_t n_products);
+
 // Real-mode signal entry point. Caller MUST hold the trade registry
 // lock — i.e. the lock that wm_trade_engine_on_signal already takes.
-// Reads the kill-switch + risk gates, sizes the trade, mints a fresh
-// client_order_id, registers a pending row, and submits the order via
-// coinbase_place_order_async. Returns SUCCESS only when an order was
-// successfully queued at the exchange abstraction; FAIL on any gate
-// trip, sizer-hold, OOM, or submit error. FAIL leaves no pending row
-// and no order in flight.
+// Reads the master force_manual gate + risk caps, sizes the trade,
+// mints a fresh client_order_id, registers a pending row, and submits
+// the order via coinbase_place_order_async. Returns SUCCESS only when
+// an order was successfully queued at the exchange abstraction; FAIL
+// on any gate trip, sizer-hold, OOM, or submit error. FAIL leaves no
+// pending row and no order in flight.
 bool wm_live_engine_on_signal_locked(wm_trade_book_t *book,
     double mark_px, int64_t mark_ms, const wm_strategy_signal_t *sig);
+
+// Operator-issued real submit. Bypasses the sizer (qty + limit_px are
+// supplied) and the master force_manual gate (operator action is
+// explicit). Daily-loss + max_notional + pending-cap gates still
+// apply. `side` is 'b' or 's'. `errbuf` receives a human-readable
+// reason on FAIL (may be NULL). Caller MUST hold the trade registry
+// lock.
+bool wm_live_engine_operator_submit_locked(wm_trade_book_t *book,
+    char side, double qty, double limit_px,
+    char *errbuf, size_t errbuf_sz);
 
 #endif // WHENMOON_INTERNAL
 

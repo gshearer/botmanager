@@ -6,15 +6,24 @@
 // resolved from the two-tier strategy KV.
 //
 // Modes (per book):
-//   - WM_TRADE_MODE_OFF       — record signal, no order side effects
+//   - WM_TRADE_MODE_MANUAL    — book exists, signals do not act. Only
+//                               operator-issued /whenmoon trade buy /
+//                               sell verbs produce fills. Useful for
+//                               shadow-monitoring a strategy or for
+//                               human-in-the-loop trading.
 //   - WM_TRADE_MODE_PAPER     — synthetic fill against the cached mark
-//                               px + slippage + fee; cash + position
-//                               updated in-memory, fill appended to
-//                               the ring
-//   - WM_TRADE_MODE_BACKTEST  — placeholder; WM-LT-5 wires the snapshot
-//                               replay loop through this branch
-//   - WM_TRADE_MODE_LIVE      — placeholder; WM-LT-8 routes here through
-//                               exchange_request(EXCHANGE_PRIO_TRANSACTIONAL)
+//                               px + slippage + fee on every signal;
+//                               cash + position updated in-memory,
+//                               fill appended to the ring. Default.
+//   - WM_TRADE_MODE_REAL      — orders submitted to the exchange via
+//                               coinbase_place_order_async. Fills land
+//                               asynchronously through the user WS
+//                               channel + REST /fills poll fallback.
+//
+// Backtest is NOT a book mode. Backtest dispatch creates synthetic
+// books in WM_TRADE_MODE_PAPER on a per-iteration private registry —
+// the snapshot replay drives signals against the same fill engine
+// paper uses live.
 //
 // Locking discipline:
 //   - One mutex on the trade-book registry. All book reads + writes
@@ -50,14 +59,13 @@
 
 typedef enum
 {
-  WM_TRADE_MODE_OFF      = 0,
-  WM_TRADE_MODE_PAPER    = 1,
-  WM_TRADE_MODE_BACKTEST = 2,
-  WM_TRADE_MODE_LIVE     = 3,
+  WM_TRADE_MODE_MANUAL = 0,
+  WM_TRADE_MODE_PAPER  = 1,
+  WM_TRADE_MODE_REAL   = 2,
 } wm_trade_mode_t;
 
 // Token <-> enum helpers. Parser is case-insensitive; printer returns a
-// pointer to a static string ("off" / "paper" / "backtest" / "live").
+// pointer to a static string ("manual" / "paper" / "real").
 bool        wm_trade_mode_parse(const char *tok, wm_trade_mode_t *out);
 const char *wm_trade_mode_name(wm_trade_mode_t m);
 
@@ -282,6 +290,22 @@ void wm_trade_book_override_params(const char *market_id_str,
 void wm_trade_engine_on_signal(const char *market_id_str,
     const char *strategy_name, double mark_px, int64_t mark_ms,
     const wm_strategy_signal_t *sig);
+
+// Operator-issued buy/sell. Routes by book mode:
+//   PAPER       — synthetic fill at (limit_px > 0 ? limit_px : last
+//                 mark) + slip + fee, applied to the same paper-fill
+//                 engine signal-driven trades use.
+//   MANUAL/REAL — real submit via the exchange. Bypasses the sizer
+//                 (qty/px supplied) and the master force_manual gate.
+//                 Daily-loss + max_notional + pending-cap gates still
+//                 apply.
+// `side` is 'b' (buy) or 's' (sell). `limit_px <= 0.0` means "use the
+// book's cached mark". `errbuf` (may be NULL) receives a human-readable
+// reason on FAIL. Caller does NOT hold the registry lock; this
+// function takes it internally.
+bool wm_trade_engine_operator_order(const char *market_id_str,
+    const char *strategy_name, char side, double qty, double limit_px,
+    char *errbuf, size_t errbuf_sz);
 
 // External fill entry point (WM-LT-8-B2 ABI). The real-mode submit
 // path leaves an order resting at the exchange and returns; fills land

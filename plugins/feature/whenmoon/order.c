@@ -40,6 +40,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
 
 #define WM_TRADE_CTX        "whenmoon.trade"
 
@@ -94,10 +95,9 @@ wm_trade_mode_parse(const char *tok, wm_trade_mode_t *out)
   if(tok == NULL || out == NULL)
     return(FAIL);
 
-  if(strcasecmp(tok, "off")      == 0) { *out = WM_TRADE_MODE_OFF;      return(SUCCESS); }
-  if(strcasecmp(tok, "paper")    == 0) { *out = WM_TRADE_MODE_PAPER;    return(SUCCESS); }
-  if(strcasecmp(tok, "backtest") == 0) { *out = WM_TRADE_MODE_BACKTEST; return(SUCCESS); }
-  if(strcasecmp(tok, "live")     == 0) { *out = WM_TRADE_MODE_LIVE;     return(SUCCESS); }
+  if(strcasecmp(tok, "manual") == 0) { *out = WM_TRADE_MODE_MANUAL; return(SUCCESS); }
+  if(strcasecmp(tok, "paper")  == 0) { *out = WM_TRADE_MODE_PAPER;  return(SUCCESS); }
+  if(strcasecmp(tok, "real")   == 0) { *out = WM_TRADE_MODE_REAL;   return(SUCCESS); }
 
   return(FAIL);
 }
@@ -107,10 +107,9 @@ wm_trade_mode_name(wm_trade_mode_t m)
 {
   switch(m)
   {
-    case WM_TRADE_MODE_OFF:       return("off");
-    case WM_TRADE_MODE_PAPER:     return("paper");
-    case WM_TRADE_MODE_BACKTEST:  return("backtest");
-    case WM_TRADE_MODE_LIVE:      return("live");
+    case WM_TRADE_MODE_MANUAL: return("manual");
+    case WM_TRADE_MODE_PAPER:  return("paper");
+    case WM_TRADE_MODE_REAL:   return("real");
   }
 
   return("?");
@@ -396,13 +395,11 @@ wm_book_resolve_market_id(const char *market_id_str)
   return(-1);
 }
 
-// Should this (registry, book) be persisted? Three guards layered:
+// Should this (registry, book) be persisted? Two guards layered:
 // 1) the registry is the global one (private registries belong to
 //    sweep workers and never persist),
 // 2) the book's market_id_str does not start with WM_BACKTEST_ID_PREFIX
-//    (synthetic backtest ids never reach DB),
-// 3) the mode is not WM_TRADE_MODE_BACKTEST (operator-set backtest
-//    on a real id; treat as transient).
+//    (synthetic backtest ids never reach DB).
 static bool
 wm_book_should_persist(wm_trade_registry_t *reg,
     const wm_trade_book_t *book)
@@ -411,9 +408,6 @@ wm_book_should_persist(wm_trade_registry_t *reg,
     return(false);
 
   if(book == NULL)
-    return(false);
-
-  if(book->mode == WM_TRADE_MODE_BACKTEST)
     return(false);
 
   if(strncmp(book->market_id_str, WM_BACKTEST_ID_PREFIX,
@@ -1214,16 +1208,14 @@ wm_trade_book_find(wm_trade_registry_t *reg,
 }
 
 // Resolve every cached parameter from the strategy KV. Caller holds
-// the registry lock. Mode is reset only when book->mode is OFF (the
-// default initial state); subsequent /whenmoon trade mode calls own
-// the mode field outright.
+// the registry lock. Mode is owned by the runtime (set via
+// /whenmoon trade mode + persisted via book_persist) and is NOT
+// touched here.
 static void
 wm_trade_book_refresh_kv_locked(wm_trade_book_t *book)
 {
-  const char     *mid;
-  const char     *strat;
-  const char     *mode_str;
-  wm_trade_mode_t parsed_mode;
+  const char *mid;
+  const char *strat;
 
   if(book == NULL)
     return;
@@ -1244,9 +1236,8 @@ wm_trade_book_refresh_kv_locked(wm_trade_book_t *book)
       wm_strategy_kv_get_dbl(mid, strat, "max_position",
           WM_TRADE_DEF_MAX_POSITION);
 
-  // starting_cash + mode resolve only on first seed (mode == OFF +
-  // starting_cash == 0 means "fresh book"); after that they are owned
-  // by the runtime.
+  // starting_cash resolves only on first seed (starting_cash == 0
+  // means "fresh book"); after that it is owned by the runtime.
   if(book->starting_cash == 0.0)
   {
     book->starting_cash =
@@ -1257,13 +1248,6 @@ wm_trade_book_refresh_kv_locked(wm_trade_book_t *book)
       book->cash = book->starting_cash;
   }
 
-  if(book->mode == WM_TRADE_MODE_OFF)
-  {
-    mode_str = wm_strategy_kv_get_str(mid, strat, "mode", "off");
-
-    if(wm_trade_mode_parse(mode_str, &parsed_mode) == SUCCESS)
-      book->mode = parsed_mode;
-  }
 }
 
 void
@@ -1299,7 +1283,7 @@ wm_trade_book_create_locked(wm_trade_registry_t *reg,
   snprintf(book->strategy_name, sizeof(book->strategy_name),
       "%s", strategy_name);
 
-  book->mode             = WM_TRADE_MODE_OFF;
+  book->mode             = WM_TRADE_MODE_PAPER;
   book->position.side    = WM_POS_FLAT;
 
   book->pnl = wm_pnl_acc_create(0);
@@ -1478,8 +1462,8 @@ wm_trade_book_set_mode(const char *market_id_str,
   wm_trade_book_t     *b;
   wm_trade_mode_t      prev;
 
-  if(mode != WM_TRADE_MODE_OFF && mode != WM_TRADE_MODE_PAPER &&
-     mode != WM_TRADE_MODE_BACKTEST && mode != WM_TRADE_MODE_LIVE)
+  if(mode != WM_TRADE_MODE_MANUAL && mode != WM_TRADE_MODE_PAPER &&
+     mode != WM_TRADE_MODE_REAL)
     return(FAIL);
 
   reg = wm_trade_get_active_registry();
@@ -1501,9 +1485,8 @@ wm_trade_book_set_mode(const char *market_id_str,
   prev    = b->mode;
   b->mode = mode;
 
-  // WM-PT-3: persist the new mode (or drop the row when transitioning
-  // to BACKTEST / "bt:" id, which the persist gate forbids — emit a
-  // DELETE so the stale row is collected).
+  // WM-PT-3: persist the new mode (or drop the row for synthetic
+  // backtest ids that the persist gate forbids).
   if(wm_book_should_persist(reg, b))
     wm_book_persist_locked(reg, b);
   else
@@ -1803,6 +1786,280 @@ wm_trade_apply_paper_fill_locked(wm_trade_book_t *b,
 }
 
 // ----------------------------------------------------------------------- //
+// Operator-issued buy/sell                                                //
+// ----------------------------------------------------------------------- //
+
+bool
+wm_trade_engine_operator_order(const char *market_id_str,
+    const char *strategy_name, char side, double qty, double limit_px,
+    char *errbuf, size_t errbuf_sz)
+{
+  wm_trade_registry_t *reg;
+  wm_trade_book_t     *b;
+  bool                 ok = FAIL;
+
+  #define ORDER_ERR(...) do { \
+      if(errbuf != NULL && errbuf_sz > 0) \
+        snprintf(errbuf, errbuf_sz, __VA_ARGS__); \
+    } while(0)
+
+  if(market_id_str == NULL || strategy_name == NULL || qty <= 0.0)
+    { ORDER_ERR("invalid args"); return(FAIL); }
+  if(side != 'b' && side != 's')
+    { ORDER_ERR("side must be 'b' or 's'"); return(FAIL); }
+
+  reg = wm_trade_get_active_registry();
+  if(reg == NULL)
+    { ORDER_ERR("trade engine not ready"); return(FAIL); }
+
+  pthread_mutex_lock(&reg->lock);
+
+  b = wm_trade_book_find(reg, market_id_str, strategy_name);
+
+  if(b == NULL)
+    {
+      pthread_mutex_unlock(&reg->lock);
+      ORDER_ERR("no book for %s/%s", market_id_str, strategy_name);
+      return(FAIL);
+    }
+
+  switch(b->mode)
+  {
+    case WM_TRADE_MODE_PAPER:
+    {
+      wm_sizer_intent_t    intent = {0};
+      wm_strategy_signal_t sig    = {0};
+      double               mark_px;
+      int64_t              ts_ms;
+
+      mark_px = (limit_px > 0.0) ? limit_px : b->last_mark_px;
+      if(mark_px <= 0.0)
+        {
+          pthread_mutex_unlock(&reg->lock);
+          ORDER_ERR("no mark px; specify limit_px or wait for tick");
+          return(FAIL);
+        }
+
+      ts_ms = (int64_t)time(NULL) * 1000;
+      if(b->last_mark_ms > ts_ms) ts_ms = b->last_mark_ms;
+
+      intent.action = (side == 'b') ? WM_SIZER_BUY : WM_SIZER_SELL;
+      intent.qty    = qty;
+      sig.ts_ms     = ts_ms;
+      snprintf(sig.reason, sizeof(sig.reason),
+          "operator-%s", (side == 'b') ? "buy" : "sell");
+
+      wm_trade_apply_paper_fill_locked(b, &intent, mark_px, ts_ms, &sig);
+      wm_book_persist_locked(reg, b);
+
+      ok = SUCCESS;
+      break;
+    }
+
+    case WM_TRADE_MODE_MANUAL:
+    case WM_TRADE_MODE_REAL:
+      ok = wm_live_engine_operator_submit_locked(b, side, qty, limit_px,
+          errbuf, errbuf_sz);
+      break;
+  }
+
+  pthread_mutex_unlock(&reg->lock);
+
+  return(ok);
+
+  #undef ORDER_ERR
+}
+
+// ----------------------------------------------------------------------- //
+// External fill apply (live mode — WM-LT-8-B3)                            //
+// ----------------------------------------------------------------------- //
+
+// Apply a confirmed exchange fill to the book. Mirrors the paper-fill
+// engine's bookkeeping but without the slippage synthesis: the actual
+// fill price + fee are authoritative. Called under reg->lock.
+//
+// Side convention: fill->side is 'b' (buy) or 's' (sell).
+static void
+wm_trade_apply_external_fill_locked(wm_trade_book_t *b,
+    const wm_fill_t *fill)
+{
+  wm_fill_t *slot;
+  double     notional;
+  double     signed_pos;
+  double     signed_delta;
+  double     close_qty;
+  double     open_qty;
+  double     realized;
+  double     close_cost;
+  double     equity;
+  double     mark_px;
+  bool       is_buy;
+
+  if(b == NULL || fill == NULL || fill->qty <= 0.0 || fill->price <= 0.0)
+    return;
+
+  is_buy   = (fill->side == 'b' || fill->side == 'B');
+  notional = fill->qty * fill->price;
+
+  signed_pos   = (b->position.side == WM_POS_LONG)  ?  b->position.qty
+               : (b->position.side == WM_POS_SHORT) ? -b->position.qty
+                                                    :  0.0;
+  signed_delta = is_buy ?  fill->qty : -fill->qty;
+
+  close_qty = 0.0;
+  open_qty  = fill->qty;
+  realized  = 0.0;
+
+  if(signed_pos != 0.0 && (signed_pos * signed_delta) < 0.0)
+  {
+    double existing_abs = fabs(signed_pos);
+
+    close_qty = fill->qty <= existing_abs ? fill->qty : existing_abs;
+    open_qty  = fill->qty - close_qty;
+
+    {
+      double pos_sign = signed_pos > 0.0 ? 1.0 : -1.0;
+      realized = pos_sign *
+          (fill->price - b->position.avg_entry_px) * close_qty;
+    }
+  }
+
+  if(is_buy) b->cash -= notional;
+  else       b->cash += notional;
+
+  b->cash -= fill->fee;
+
+  if(close_qty > 0.0 && open_qty == 0.0)
+  {
+    b->position.qty -= close_qty;
+    if(b->position.qty <= 1e-12)
+    {
+      b->position.side         = WM_POS_FLAT;
+      b->position.qty          = 0.0;
+      b->position.avg_entry_px = 0.0;
+      b->position.opened_at_ms = 0;
+    }
+  }
+  else if(close_qty > 0.0 && open_qty > 0.0)
+  {
+    b->position.side         = is_buy ? WM_POS_LONG : WM_POS_SHORT;
+    b->position.qty          = open_qty;
+    b->position.avg_entry_px = fill->price;
+    b->position.opened_at_ms = fill->ts_ms;
+  }
+  else
+  {
+    if(b->position.side == WM_POS_FLAT)
+    {
+      b->position.side         = is_buy ? WM_POS_LONG : WM_POS_SHORT;
+      b->position.qty          = open_qty;
+      b->position.avg_entry_px = fill->price;
+      b->position.opened_at_ms = fill->ts_ms;
+    }
+    else
+    {
+      double new_qty      = b->position.qty + open_qty;
+      double new_notional = b->position.qty * b->position.avg_entry_px
+                          + open_qty * fill->price;
+      b->position.qty          = new_qty;
+      b->position.avg_entry_px = new_notional / new_qty;
+    }
+  }
+
+  signed_pos = (b->position.side == WM_POS_LONG)  ?  b->position.qty
+             : (b->position.side == WM_POS_SHORT) ? -b->position.qty
+                                                  :  0.0;
+
+  slot = &b->fills[b->fill_head];
+  memset(slot, 0, sizeof(*slot));
+  slot->ts_ms          = fill->ts_ms;
+  slot->side           = is_buy ? 'b' : 's';
+  slot->qty            = fill->qty;
+  slot->price          = fill->price;
+  slot->fee            = fill->fee;
+  slot->slippage       = 0.0;       // exchange fill px is authoritative
+  slot->realized_pnl   = realized;
+  slot->cash_after     = b->cash;
+  slot->position_after = signed_pos;
+  snprintf(slot->reason, sizeof(slot->reason), "%s",
+      fill->reason[0] ? fill->reason : "live-fill");
+
+  b->fill_head = (b->fill_head + 1) % WM_FILL_RING_CAP;
+  b->fill_n++;
+
+  wm_pnl_acc_record_fee(b->pnl, fill->fee);
+
+  if(close_qty > 0.0)
+  {
+    close_cost = b->position.avg_entry_px * close_qty;
+    if(close_qty > 0.0 && open_qty > 0.0)
+      close_cost = fill->price * close_qty;
+    wm_pnl_acc_record_close(b->pnl, realized, close_cost);
+  }
+
+  // Use the fill price as the equity mark for live fills — there's no
+  // independent "mark" passed alongside; the executed price is the
+  // freshest price-of-record at fill time.
+  mark_px = fill->price;
+  b->last_mark_px = mark_px;
+  b->last_mark_ms = fill->ts_ms;
+
+  equity = b->cash + signed_pos * mark_px;
+  wm_pnl_acc_record_equity(b->pnl, equity);
+
+  clam(CLAM_INFO, WM_TRADE_CTX,
+      "%s/%s ext-fill: %c qty=%.6g px=%.6g fee=%.4f realized=%.4f"
+      " cash=%.2f pos=%.6g",
+      b->market_id_str, b->strategy_name,
+      slot->side, slot->qty, slot->price, slot->fee,
+      slot->realized_pnl, slot->cash_after, slot->position_after);
+}
+
+void
+wm_trade_engine_record_external_fill(const char *market_id_str,
+    const char *strategy_name, const wm_fill_t *fill)
+{
+  wm_trade_registry_t *reg;
+  wm_trade_book_t     *b;
+
+  if(market_id_str == NULL || strategy_name == NULL || fill == NULL)
+    return;
+
+  reg = wm_trade_get_active_registry();
+  if(reg == NULL)
+    return;
+
+  pthread_mutex_lock(&reg->lock);
+
+  b = wm_trade_book_find(reg, market_id_str, strategy_name);
+
+  if(b == NULL)
+  {
+    pthread_mutex_unlock(&reg->lock);
+    clam(CLAM_WARN, WM_TRADE_CTX,
+        "external fill dropped: no book for %s/%s",
+        market_id_str, strategy_name);
+    return;
+  }
+
+  if(b->mode != WM_TRADE_MODE_REAL)
+  {
+    pthread_mutex_unlock(&reg->lock);
+    clam(CLAM_WARN, WM_TRADE_CTX,
+        "external fill dropped: %s/%s not in real mode (mode=%s)",
+        market_id_str, strategy_name, wm_trade_mode_name(b->mode));
+    return;
+  }
+
+  wm_trade_apply_external_fill_locked(b, fill);
+
+  // WM-PT-3: snapshot post-fill state.
+  wm_book_persist_locked(reg, b);
+
+  pthread_mutex_unlock(&reg->lock);
+}
+
+// ----------------------------------------------------------------------- //
 // Signal entry point                                                      //
 // ----------------------------------------------------------------------- //
 
@@ -1829,7 +2086,7 @@ wm_trade_engine_on_signal(const char *market_id_str,
 
   b = wm_trade_book_find(reg, market_id_str, strategy_name);
 
-  if(b == NULL || b->mode == WM_TRADE_MODE_OFF)
+  if(b == NULL || b->mode == WM_TRADE_MODE_MANUAL)
   {
     pthread_mutex_unlock(&reg->lock);
     return;
@@ -1875,20 +2132,19 @@ wm_trade_engine_on_signal(const char *market_id_str,
       }
       break;
 
-    case WM_TRADE_MODE_LIVE:
-      // Real-mode: kill-switch + risk gates + place-order. Fills land
-      // later via the user WS channel + REST poll (WM-LT-8-B3).
-      // wm_live_engine_on_signal_locked is called with reg->lock held;
-      // it briefly drops only its own private mutex internally.
+    case WM_TRADE_MODE_REAL:
+      // Real-money: master force-manual + risk gates + place-order.
+      // Fills land later via the user WS channel + REST poll
+      // (WM-LT-8-B3). wm_live_engine_on_signal_locked is called with
+      // reg->lock held; it briefly drops only its own private mutex
+      // internally. When the master force-manual KV is set, the gate
+      // FAILs closed and no order is submitted.
       (void)wm_live_engine_on_signal_locked(b, mark_px, mark_ms, sig);
       break;
 
-    case WM_TRADE_MODE_OFF:
-    case WM_TRADE_MODE_BACKTEST:
-      // OFF: signal recorded above, no order side effect.
-      // BACKTEST: snapshot replay drives this path through a separate
-      // entry; live signal-emit is a no-op when an attached strategy
-      // momentarily flips a book to backtest mode.
+    case WM_TRADE_MODE_MANUAL:
+      // Manual: signal recorded above, no order side effect. Operator
+      // drives buys/sells via /whenmoon trade buy|sell.
       break;
   }
 

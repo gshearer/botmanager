@@ -76,6 +76,7 @@ typedef enum
   CB_REQ_CANCEL_ORDER,
   CB_REQ_GET_ORDER,
   CB_REQ_GET_ACCOUNTS,
+  CB_REQ_LIST_FILLS,
 } cb_req_type_t;
 
 // REST request context. Freelist-managed; exactly one callback member
@@ -110,6 +111,7 @@ typedef struct cb_request
     coinbase_done_order_cb_t     order;
     coinbase_done_orders_cb_t    orders;
     coinbase_done_accounts_cb_t  accounts;
+    coinbase_done_fills_cb_t     fills;
   } cb;
   void          *user;
 

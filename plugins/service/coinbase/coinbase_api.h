@@ -62,6 +62,11 @@
 // and product_id.
 #define COINBASE_MAX_ORDERS_LIST  100
 
+// Max rows returned per /orders/historical/fills call. AT default page
+// size is 100; cursor pagination is not implemented — callers should
+// rely on `start_sequence_timestamp` to bound the window.
+#define COINBASE_MAX_FILLS_LIST   100
+
 // Public type stubs. Bodies stay thin until CB2 lands the parser.
 
 typedef struct
@@ -142,6 +147,23 @@ typedef struct
   double  hold;
   double  available;
 } coinbase_account_t;
+
+// One executed fill — emitted by GET /orders/historical/fills (REST
+// safety-net poll for the live trader). `side` is lowercased to match
+// the WS user-channel fill payload. `time_ms` parsed from
+// `sequence_timestamp` (ISO-8601) — the same monotone field AT pages on.
+typedef struct
+{
+  char    order_id[COINBASE_ORDER_ID_SZ];
+  char    client_oid[COINBASE_CLIENT_OID_SZ];
+  char    product_id[COINBASE_PRODUCT_ID_SZ];
+  char    side[COINBASE_SIDE_SZ];
+  int64_t trade_id;
+  double  price;
+  double  size;
+  double  fee;
+  int64_t time_ms;
+} coinbase_fill_t;
 
 // POST /orders request body. Caller zero-initializes, fills in the
 // relevant fields, and passes by const pointer. Invalid combinations
@@ -382,6 +404,13 @@ typedef struct
   coinbase_account_t  rows[64];
 } coinbase_accounts_result_t;
 
+typedef struct
+{
+  char             err[128];
+  uint32_t         count;
+  coinbase_fill_t  rows[COINBASE_MAX_FILLS_LIST];
+} coinbase_fills_result_t;
+
 // Callback signatures. Callbacks run on the curl-multi worker thread
 // owned by the plugin — do not block.
 typedef void (*coinbase_done_products_cb_t)(
@@ -404,6 +433,9 @@ typedef void (*coinbase_done_orders_cb_t)(
 
 typedef void (*coinbase_done_accounts_cb_t)(
     const coinbase_accounts_result_t *res, void *user);
+
+typedef void (*coinbase_done_fills_cb_t)(
+    const coinbase_fills_result_t *res, void *user);
 
 // ------------------------------------------------------------------
 // Real function declarations — visible only inside the coinbase plugin
@@ -520,6 +552,14 @@ bool coinbase_list_orders_async(const char *status, const char *product_id,
 // balance / hold / available.
 bool coinbase_get_accounts_async(coinbase_done_accounts_cb_t cb,
     void *user);
+
+// GET /api/v3/brokerage/orders/historical/fills. Lists executed fills,
+// optionally filtered server-side by product_id and bounded by
+// `start_ms` (start_sequence_timestamp). 0 = unbounded. Newest-first.
+// Up to COINBASE_MAX_FILLS_LIST rows. order_id may be NULL/empty.
+bool coinbase_list_fills_async(const char *order_id,
+    const char *product_id, int64_t start_ms,
+    coinbase_done_fills_cb_t cb, void *user);
 
 // Subscribe to one or more WebSocket channels on one or more products.
 // The channel multiplexer dedups overlapping subscriptions across
@@ -889,6 +929,32 @@ coinbase_get_accounts_async(coinbase_done_accounts_cb_t cb, void *user)
     __atomic_store_n(&cached, fn, __ATOMIC_RELEASE);
   }
   return(fn(cb, user));
+}
+
+static inline bool
+coinbase_list_fills_async(const char *order_id, const char *product_id,
+    int64_t start_ms, coinbase_done_fills_cb_t cb, void *user)
+{
+  typedef bool (*fn_t)(const char *, const char *, int64_t,
+      coinbase_done_fills_cb_t, void *);
+  static fn_t cached = NULL;
+  fn_t        fn     = __atomic_load_n(&cached, __ATOMIC_ACQUIRE);
+
+  if(fn == NULL)
+  {
+    union { void *obj; fn_t fn; } u;
+
+    u.obj = plugin_dlsym("coinbase", "coinbase_list_fills_async");
+    if(u.obj == NULL)
+    {
+      clam(CLAM_FATAL, "coinbase",
+          "dlsym failed: coinbase_list_fills_async");
+      abort();
+    }
+    fn = u.fn;
+    __atomic_store_n(&cached, fn, __ATOMIC_RELEASE);
+  }
+  return(fn(order_id, product_id, start_ms, cb, user));
 }
 
 static inline coinbase_ws_sub_t *

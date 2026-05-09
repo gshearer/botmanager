@@ -1197,3 +1197,254 @@ coinbase_get_accounts_async(coinbase_done_accounts_cb_t cb, void *user)
 
   return(SUCCESS);
 }
+
+// ----------------------------------------------------------------------
+// /api/v3/brokerage/orders/historical/fills (WM-LT-8-B3 REST safety net)
+// ----------------------------------------------------------------------
+//
+// AT response shape:
+//   { "fills": [ { "entry_id": "...", "trade_id": "...",
+//                  "order_id": "...", "client_order_id": "...",
+//                  "trade_time": "ISO-8601",
+//                  "sequence_timestamp": "ISO-8601",
+//                  "trade_type": "FILL",
+//                  "price": "decimal-string",
+//                  "size":  "decimal-string",
+//                  "commission": "decimal-string",
+//                  "product_id": "BTC-USD",
+//                  "side": "BUY"|"SELL",
+//                  ... }, ... ],
+//     "cursor": "..." }
+
+#define CB_PATH_FILLS  "/api/v3/brokerage/orders/historical/fills"
+
+static void
+cb_deliver_fills_fail(cb_request_t *r, const char *err)
+{
+  coinbase_fills_result_t res = { 0 };
+
+  snprintf(res.err, sizeof(res.err), "%s", err);
+
+  if(r->cb.fills != NULL)
+    r->cb.fills(&res, r->user);
+
+  cb_req_release(r);
+}
+
+static bool
+cb_parse_fill(struct json_object *obj, coinbase_fill_t *out)
+{
+  char tmp[64];
+
+  if(obj == NULL || out == NULL)
+    return(FAIL);
+
+  memset(out, 0, sizeof(*out));
+
+  json_get_str(obj, "order_id",        out->order_id,
+      sizeof(out->order_id));
+  json_get_str(obj, "client_order_id", out->client_oid,
+      sizeof(out->client_oid));
+  json_get_str(obj, "product_id",      out->product_id,
+      sizeof(out->product_id));
+  json_get_str(obj, "side",            out->side, sizeof(out->side));
+  cb_str_lowercase(out->side);
+
+  if(json_get_str(obj, "trade_id", tmp, sizeof(tmp)))
+    out->trade_id = strtoll(tmp, NULL, 10);
+
+  if(json_get_str(obj, "price", tmp, sizeof(tmp)))
+    out->price = strtod(tmp, NULL);
+  if(json_get_str(obj, "size", tmp, sizeof(tmp)))
+    out->size = strtod(tmp, NULL);
+  if(json_get_str(obj, "commission", tmp, sizeof(tmp)))
+    out->fee = strtod(tmp, NULL);
+
+  // sequence_timestamp is the AT-monotone field that paginates fills;
+  // trade_time is human-display. Prefer sequence_timestamp; fall back
+  // to trade_time when absent.
+  if(json_get_str(obj, "sequence_timestamp", tmp, sizeof(tmp)))
+    out->time_ms = cb_parse_iso8601_ms(tmp);
+  else if(json_get_str(obj, "trade_time", tmp, sizeof(tmp)))
+    out->time_ms = cb_parse_iso8601_ms(tmp);
+
+  return(out->trade_id != 0);
+}
+
+static void
+cb_fills_list_done(const curl_response_t *resp)
+{
+  cb_request_t            *r = (cb_request_t *)resp->user_data;
+  coinbase_fills_result_t  res = { 0 };
+  char                     errbuf[CB_ERR_SZ];
+  const char              *err;
+  struct json_object      *root;
+  struct json_object      *arr;
+  int                      len;
+  uint32_t                 kept = 0;
+
+  err = cb_classify_http(resp, errbuf, sizeof(errbuf));
+
+  if(err != NULL)
+  {
+    cb_deliver_fills_fail(r, err);
+    return;
+  }
+
+  root = json_parse_buf(resp->body, resp->body_len, CB_CTX);
+
+  if(root == NULL)
+  {
+    cb_deliver_fills_fail(r,
+        "Error: malformed JSON from Coinbase fills list");
+    return;
+  }
+
+  arr = json_get_array(root, "fills");
+
+  if(arr == NULL)
+  {
+    json_object_put(root);
+    cb_deliver_fills_fail(r,
+        "Error: unexpected Coinbase fills list shape");
+    return;
+  }
+
+  len = (int)json_object_array_length(arr);
+
+  for(int i = 0; i < len && kept < COINBASE_MAX_FILLS_LIST; i++)
+  {
+    struct json_object *item = json_object_array_get_idx(arr, i);
+
+    if(item == NULL)
+      continue;
+
+    if(cb_parse_fill(item, &res.rows[kept]))
+      kept++;
+  }
+
+  res.count = kept;
+
+  clam(CLAM_DEBUG2, CB_CTX, "fills list: %u row(s) order_id='%s' product='%s'",
+       kept, r->order_id, r->product_id);
+
+  if(r->cb.fills != NULL)
+    r->cb.fills(&res, r->user);
+
+  json_object_put(root);
+  cb_req_release(r);
+}
+
+// Format `epoch_ms` as RFC3339 UTC ("2026-05-08T12:34:56Z"). `out` must
+// be at least 21 bytes. Returns SUCCESS / FAIL.
+static bool
+cb_format_iso8601_z(int64_t epoch_ms, char *out, size_t cap)
+{
+  time_t    t  = (time_t)(epoch_ms / 1000);
+  struct tm tm = {0};
+
+  if(out == NULL || cap < 21) return(FAIL);
+
+  if(gmtime_r(&t, &tm) == NULL) return(FAIL);
+
+  if(strftime(out, cap, "%Y-%m-%dT%H:%M:%SZ", &tm) == 0)
+    return(FAIL);
+
+  return(SUCCESS);
+}
+
+bool
+coinbase_list_fills_async(const char *order_id, const char *product_id,
+    int64_t start_ms, coinbase_done_fills_cb_t cb, void *user)
+{
+  cb_request_t *r;
+  char          path[CB_URL_SZ];
+  int           n;
+  const char   *sep = "?";
+
+  r = cb_req_alloc();
+  r->type     = CB_REQ_LIST_FILLS;
+  r->cb.fills = cb;
+  r->user     = user;
+
+  if(order_id != NULL && order_id[0] != '\0')
+    snprintf(r->order_id, sizeof(r->order_id), "%s", order_id);
+  if(product_id != NULL && product_id[0] != '\0')
+    snprintf(r->product_id, sizeof(r->product_id), "%s", product_id);
+
+  if(!cb_apikey_configured())
+  {
+    cb_deliver_fills_fail(r, CB_ERR_NO_CREDS);
+    return(FAIL);
+  }
+
+  n = snprintf(path, sizeof(path), "%s", CB_PATH_FILLS);
+
+  if(order_id != NULL && order_id[0] != '\0')
+  {
+    int m = snprintf(path + n, sizeof(path) - (size_t)n,
+        "%sorder_id=%s", sep, order_id);
+    if(m < 0 || (size_t)m >= sizeof(path) - (size_t)n)
+    {
+      cb_deliver_fills_fail(r, "Error: fills query too long");
+      return(FAIL);
+    }
+    n += m;
+    sep = "&";
+  }
+
+  if(product_id != NULL && product_id[0] != '\0')
+  {
+    int m = snprintf(path + n, sizeof(path) - (size_t)n,
+        "%sproduct_id=%s", sep, product_id);
+    if(m < 0 || (size_t)m >= sizeof(path) - (size_t)n)
+    {
+      cb_deliver_fills_fail(r, "Error: fills query too long");
+      return(FAIL);
+    }
+    n += m;
+    sep = "&";
+  }
+
+  if(start_ms > 0)
+  {
+    char ts[32];
+    int  m;
+
+    if(cb_format_iso8601_z(start_ms, ts, sizeof(ts)) != SUCCESS)
+    {
+      cb_deliver_fills_fail(r, "Error: fills start_ms format failed");
+      return(FAIL);
+    }
+
+    m = snprintf(path + n, sizeof(path) - (size_t)n,
+        "%sstart_sequence_timestamp=%s", sep, ts);
+    if(m < 0 || (size_t)m >= sizeof(path) - (size_t)n)
+    {
+      cb_deliver_fills_fail(r, "Error: fills query too long");
+      return(FAIL);
+    }
+    n += m;
+    sep = "&";
+  }
+
+  {
+    int m = snprintf(path + n, sizeof(path) - (size_t)n,
+        "%slimit=%u", sep, (unsigned)COINBASE_MAX_FILLS_LIST);
+    if(m < 0 || (size_t)m >= sizeof(path) - (size_t)n)
+    {
+      cb_deliver_fills_fail(r, "Error: fills query too long");
+      return(FAIL);
+    }
+  }
+
+  if(cb_submit_private(r, CURL_PRIO_NORMAL, CURL_METHOD_GET, path,
+        NULL, 0, cb_fills_list_done) != SUCCESS)
+  {
+    cb_deliver_fills_fail(r,
+        "Error: failed to submit Coinbase list-fills request");
+    return(FAIL);
+  }
+
+  return(SUCCESS);
+}
