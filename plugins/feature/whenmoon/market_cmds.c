@@ -17,7 +17,9 @@
 #include <inttypes.h>
 #include <math.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
+#include <time.h>
 
 // Read one market-id token off ctx->args, parse it, and produce the
 // (exch/base/quote) triple plus the coinbase wire-form symbol.
@@ -500,6 +502,125 @@ wm_market_cmd_selftest(const cmd_ctx_t *ctx)
 }
 
 // ------------------------------------------------------------------ //
+// /whenmoon market force <id> <buy|sell> <qty> [<px>]  (WM-MK-4)      //
+// ------------------------------------------------------------------ //
+
+static void
+wm_market_cmd_force(const cmd_ctx_t *ctx)
+{
+  whenmoon_state_t  *st;
+  whenmoon_market_t *mk;
+  const char        *p;
+  char               id_tok[64]   = {0};
+  char               side_tok[8]  = {0};
+  char               qty_tok[32]  = {0};
+  char               px_tok[32]   = {0};
+  char               exch[32];
+  char               base[16];
+  char               quote[16];
+  char               id_str[WM_MARKET_ID_STR_SZ];
+  char               errbuf[192]  = {0};
+  char               reply[256];
+  double             qty;
+  double             px_override = 0.0;
+  char               side_ch;
+  wm_market_mode_t   mode;
+  int64_t            ts_ms;
+  bool               ok;
+
+  st = whenmoon_get_state();
+
+  if(st == NULL || st->markets == NULL)
+  {
+    cmd_reply(ctx, "whenmoon: no market state");
+    return;
+  }
+
+  p = ctx->args != NULL ? ctx->args : "";
+
+  if(!wm_dl_next_token(&p, id_tok,   sizeof(id_tok))   ||
+     !wm_dl_next_token(&p, side_tok, sizeof(side_tok)) ||
+     !wm_dl_next_token(&p, qty_tok,  sizeof(qty_tok)))
+  {
+    cmd_reply(ctx,
+        "usage: /whenmoon market force <exch>-<base>-<quote>"
+        " <buy|sell> <qty> [<px>]");
+    return;
+  }
+
+  if(wm_dl_next_token(&p, px_tok, sizeof(px_tok)))
+    px_override = strtod(px_tok, NULL);
+
+  if(wm_market_parse_id(id_tok, exch, sizeof(exch), base, sizeof(base),
+         quote, sizeof(quote)) != SUCCESS)
+  {
+    cmd_reply(ctx, "bad market id (expected <exch>-<base>-<quote>)");
+    return;
+  }
+
+  wm_market_format_id(exch, base, quote, id_str, sizeof(id_str));
+
+  if(strcmp(side_tok, "buy") == 0)
+    side_ch = 'b';
+  else if(strcmp(side_tok, "sell") == 0)
+    side_ch = 's';
+  else
+  {
+    cmd_reply(ctx, "force: side must be buy|sell");
+    return;
+  }
+
+  qty = strtod(qty_tok, NULL);
+
+  if(qty <= 0.0)
+  {
+    cmd_reply(ctx, "force: qty must be > 0");
+    return;
+  }
+
+  mk = wm_market_lookup_by_id(st, id_str);
+
+  if(mk == NULL)
+  {
+    snprintf(reply, sizeof(reply),
+        "error: market %s not running", id_str);
+    cmd_reply(ctx, reply);
+    return;
+  }
+
+  ts_ms = (int64_t)time(NULL) * 1000;
+
+  pthread_mutex_lock(&mk->lock);
+  mode = mk->session.mode;
+
+  ok = wm_market_engine_force_trade_locked(mk, side_ch, qty, px_override,
+      ts_ms, "force-operator", errbuf, sizeof(errbuf));
+
+  pthread_mutex_unlock(&mk->lock);
+
+  if(ok != SUCCESS)
+  {
+    snprintf(reply, sizeof(reply),
+        "force %s %s mode=%s FAIL: %s",
+        side_tok, id_str, wm_market_mode_name(mode),
+        errbuf[0] != '\0' ? errbuf : "(no detail)");
+    cmd_reply(ctx, reply);
+    return;
+  }
+
+  if(mode == WM_MARKET_MODE_REAL)
+    snprintf(reply, sizeof(reply),
+        "force %s submitted to %s mode=real: qty=%.10g (awaiting fill)",
+        side_tok, id_str, qty);
+  else
+    snprintf(reply, sizeof(reply),
+        "force %s applied to %s mode=%s: qty=%.10g",
+        side_tok, id_str, wm_market_mode_name(mode), qty);
+
+  cmd_reply(ctx, reply);
+}
+
+// ------------------------------------------------------------------ //
 // Parent stub                                                         //
 // ------------------------------------------------------------------ //
 
@@ -507,7 +628,7 @@ static void
 wm_market_parent_cb(const cmd_ctx_t *ctx)
 {
   cmd_reply(ctx,
-      "usage: /whenmoon market <start|stop|mode|selftest> ..."
+      "usage: /whenmoon market <start|stop|mode|selftest|force> ..."
       " (mode takes <manual|paper|real>)");
 }
 
@@ -519,13 +640,15 @@ bool
 wm_market_register_verbs(void)
 {
   if(cmd_register("whenmoon", "market",
-        "whenmoon market <start|stop|mode|selftest> ...",
+        "whenmoon market <start|stop|mode|selftest|force> ...",
         "Add or remove a live market and manage its session."
         " Starts: WS subscribe + live-ring 1m backfill."
         " Stops: unsubscribe + clear enabled flag."
         " Mode: change the market's mode (manual|paper|real)."
         " Selftest: drive the new market position engine through a"
-        " synthetic paper round-trip (WM-MK-2; removed in WM-MK-5).",
+        " synthetic paper round-trip (WM-MK-2; removed in WM-MK-5)."
+        " Force: operator-issued forced trade (manual+paper synth fill"
+        " or real-mode submit, all gates honored).",
         NULL,
         USERNS_GROUP_ADMIN, 100, CMD_SCOPE_ANY, METHOD_T_ANY,
         wm_market_parent_cb, NULL, "whenmoon", NULL,
@@ -590,6 +713,29 @@ wm_market_register_verbs(void)
         NULL,
         USERNS_GROUP_ADMIN, 100, CMD_SCOPE_ANY, METHOD_T_ANY,
         wm_market_cmd_selftest, NULL, "whenmoon/market", NULL,
+        NULL, 0, NULL, NULL) != SUCCESS)
+    return(FAIL);
+
+  // WM-MK-4: operator-issued forced trade. Bypasses strategy advisors
+  // and the MANUAL mode "no auto-action" rule. Same fill-ledger choke
+  // points as accepted strategy advice — apply_fill_locked for synth
+  // modes, real_submit_locked (with all five gates) for real mode.
+  if(cmd_register("whenmoon", "force",
+        "whenmoon market force <exch>-<base>-<quote>"
+        " <buy|sell> <qty> [<px>]",
+        "Operator-issued forced trade. Bypasses strategy advisors and"
+        " the market's mode gate. Manual + paper modes: synthetic fill"
+        " at <px> or last ticker (paper applies synth slippage only on"
+        " the fallback path). Real mode: limit order via the exchange"
+        " abstraction (master kill-switch, credentials, daily-loss,"
+        " pending-cap, and max-notional gates apply; fill arrives"
+        " asynchronously). Same fill ledger choke point as accepted"
+        " strategy advice — stats accumulate in the current mode's"
+        " ledger. Refused on sell-against-flat (manual+paper) and"
+        " all five real-mode gate trips.",
+        NULL,
+        USERNS_GROUP_ADMIN, 100, CMD_SCOPE_ANY, METHOD_T_ANY,
+        wm_market_cmd_force, NULL, "whenmoon/market", NULL,
         NULL, 0, NULL, NULL) != SUCCESS)
     return(FAIL);
 

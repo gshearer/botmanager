@@ -713,6 +713,158 @@ wm_market_engine_record_external_fill(const char *market_id_str,
 }
 
 // ------------------------------------------------------------------ //
+// Force trade (WM-MK-4)                                              //
+// ------------------------------------------------------------------ //
+
+// Caller MUST hold `mk->lock`. Routes by `mk->session.mode`; see the
+// header for the px-resolution rules and reply contract. Synth modes
+// pre-flight sell-against-flat and detect the apply_fill no-op so the
+// verb can produce a meaningful reply; real mode delegates every gate
+// to `wm_market_engine_real_submit_locked`.
+bool
+wm_market_engine_force_trade_locked(whenmoon_market_t *mk, char side,
+    double qty, double px_override, int64_t ts_ms, const char *reason,
+    char *errbuf, size_t errbuf_sz)
+{
+  wm_market_mode_t mode;
+  double           exec_px;
+  double           slip;
+  double           fee;
+  double           notional;
+  uint64_t         fills_pre;
+  uint64_t         fills_post;
+  bool             is_buy;
+  bool             ok;
+
+  #define ERRSET(...) do { \
+      if(errbuf != NULL && errbuf_sz > 0) \
+        snprintf(errbuf, errbuf_sz, __VA_ARGS__); \
+    } while(0)
+
+  if(errbuf != NULL && errbuf_sz > 0)
+    errbuf[0] = '\0';
+
+  if(mk == NULL || qty <= 0.0)
+  {
+    ERRSET("invalid args");
+    return(FAIL);
+  }
+
+  if(side != 'b' && side != 's')
+  {
+    ERRSET("side must be 'b' or 's'");
+    return(FAIL);
+  }
+
+  is_buy = (side == 'b');
+  mode   = mk->session.mode;
+
+  // Resolve exec / limit px. Operator override always wins; otherwise
+  // fall through to last live ticker, then cached advice mark.
+  exec_px = px_override;
+
+  if(exec_px <= 0.0)
+  {
+    if(mk->last_px > 0.0)
+      exec_px = mk->last_px;
+    else if(mk->session.last_mark_px > 0.0)
+      exec_px = mk->session.last_mark_px;
+    else
+    {
+      ERRSET("market %s has no live mark (no ticker yet and no override)",
+          mk->market_id_str);
+      return(FAIL);
+    }
+  }
+
+  // Real-mode dispatch — sig=NULL is honored by the helper (param
+  // reserved for future audit hooks per live.c:975). All five gates
+  // apply; helper self-logs CLAM_WARN on every gate trip and writes
+  // `errbuf` for the verb to surface verbatim. No persist call here:
+  // wm_market_engine_real_submit_locked already persists the pending
+  // row, and the fill-arrival path persists from
+  // wm_market_engine_record_external_fill.
+  if(mode == WM_MARKET_MODE_REAL)
+  {
+    ok = wm_market_engine_real_submit_locked(mk, side, qty, exec_px,
+        ts_ms, NULL, errbuf, errbuf_sz);
+
+    if(ok == SUCCESS)
+      clam(CLAM_INFO, WHENMOON_CTX,
+          "whenmoon.force: market %s mode=real side=%c qty=%.10g"
+          " px=%.10g (submitted)%s%s%s",
+          mk->market_id_str, side, qty, exec_px,
+          reason != NULL ? " reason=\"" : "",
+          reason != NULL ? reason       : "",
+          reason != NULL ? "\""         : "");
+
+    return(ok);
+  }
+
+  // Manual + paper: pre-flight long-only invariant so the verb can
+  // reply meaningfully. apply_fill_locked drops sell-against-flat
+  // with a CLAM_WARN otherwise and the operator sees no apparent
+  // state change.
+  if(!is_buy && mk->session.position.side == WM_MARKET_POS_FLAT)
+  {
+    ERRSET("%s is flat — nothing to sell", mk->market_id_str);
+    return(FAIL);
+  }
+
+  // Paper applies synth slippage only when there's no operator
+  // override. Manual never applies synth slippage. Fees apply in
+  // both modes (operator bookkeeping consistent with reality).
+  slip = 0.0;
+
+  if(mode == WM_MARKET_MODE_PAPER && px_override <= 0.0)
+    slip = exec_px * (mk->session.slip_bps / 10000.0);
+
+  if(is_buy)
+    exec_px = exec_px + slip;
+  else
+    exec_px = exec_px - slip;
+
+  if(exec_px <= 0.0)
+  {
+    ERRSET("computed exec px <= 0");
+    return(FAIL);
+  }
+
+  notional = qty * exec_px;
+  fee      = notional * (mk->session.fee_bps / 10000.0);
+
+  fills_pre = mk->session.stats[mode].lifetime_fills_count;
+
+  wm_market_apply_fill_locked(mk, mode, side, qty, exec_px, fee, ts_ms,
+      reason != NULL ? reason : "force-operator");
+
+  fills_post = mk->session.stats[mode].lifetime_fills_count;
+
+  // apply_fill_locked drops oversell-against-flat (which we
+  // pre-flighted above) and clips oversell silently. Detect the
+  // no-op path so the verb can report it as a soft FAIL.
+  if(fills_post == fills_pre)
+  {
+    ERRSET("apply_fill no-op (long-only invariant tripped)");
+    return(FAIL);
+  }
+
+  (void)wm_market_persist_locked(mk);
+
+  clam(CLAM_INFO, WHENMOON_CTX,
+      "whenmoon.force: market %s mode=%s side=%c qty=%.10g px=%.10g"
+      "%s%s%s",
+      mk->market_id_str, wm_market_mode_name(mode), side, qty, exec_px,
+      reason != NULL ? " reason=\"" : "",
+      reason != NULL ? reason       : "",
+      reason != NULL ? "\""         : "");
+
+  return(SUCCESS);
+
+  #undef ERRSET
+}
+
+// ------------------------------------------------------------------ //
 // Selftest                                                           //
 // ------------------------------------------------------------------ //
 
