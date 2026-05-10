@@ -4,7 +4,6 @@
 
 #define WHENMOON_INTERNAL
 #include "whenmoon.h"
-#include "aggregator.h"
 #include "market.h"
 #include "market_cmds.h"
 #include "market_engine.h"
@@ -15,7 +14,6 @@
 #include "common.h"
 #include "userns.h"
 
-#include <ctype.h>
 #include <inttypes.h>
 #include <math.h>
 #include <stdio.h>

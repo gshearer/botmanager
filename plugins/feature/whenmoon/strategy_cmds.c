@@ -5,7 +5,6 @@
 #define WHENMOON_INTERNAL
 #include "whenmoon.h"
 #include "strategy.h"
-#include "market.h"
 #include "dl_commands.h"
 
 #include "cmd.h"
@@ -13,8 +12,11 @@
 #include "common.h"
 #include "userns.h"
 
+#include <errno.h>
 #include <inttypes.h>
+#include <stdint.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 
 // Stack-buffer cap for /show whenmoon strategy <name> attachment list.
@@ -33,9 +35,13 @@ wm_strategy_cmd_attach(const cmd_ctx_t *ctx)
   const char        *p;
   char               id_tok[64]   = {0};
   char               name_tok[WM_STRATEGY_NAME_SZ] = {0};
+  char               kw_tok[16]   = {0};
+  char               prio_tok[16] = {0};
   char               err[160];
   char               reply[224];
   wm_attach_result_t r;
+  uint32_t           explicit_priority = 0;
+  uint32_t           chosen_priority   = 0;
 
   st = whenmoon_get_state();
 
@@ -51,18 +57,58 @@ wm_strategy_cmd_attach(const cmd_ctx_t *ctx)
      !wm_dl_next_token(&p, name_tok, sizeof(name_tok)))
   {
     cmd_reply(ctx,
-        "usage: /whenmoon strategy attach <market_id> <strategy_name>");
+        "usage: /whenmoon strategy attach <market_id> <strategy_name>"
+        " [priority <n>]");
     return;
   }
 
+  // Optional trailing `priority <n>`.
+  if(wm_dl_next_token(&p, kw_tok, sizeof(kw_tok)))
+  {
+    if(strcmp(kw_tok, "priority") != 0)
+    {
+      cmd_reply(ctx,
+          "usage: /whenmoon strategy attach <market_id> <strategy_name>"
+          " [priority <n>]");
+      return;
+    }
+
+    if(!wm_dl_next_token(&p, prio_tok, sizeof(prio_tok)))
+    {
+      cmd_reply(ctx, "attach failed: priority requires a value");
+      return;
+    }
+
+    {
+      char     *endp;
+      unsigned long v;
+
+      errno = 0;
+      v = strtoul(prio_tok, &endp, 10);
+
+      if(errno != 0 || endp == prio_tok || *endp != '\0' ||
+         v == 0 || v > UINT32_MAX)
+      {
+        snprintf(reply, sizeof(reply),
+            "attach failed: invalid priority '%s'"
+            " (expect 1..%u)", prio_tok, UINT32_MAX);
+        cmd_reply(ctx, reply);
+        return;
+      }
+
+      explicit_priority = (uint32_t)v;
+    }
+  }
+
   err[0] = '\0';
-  r = wm_strategy_attach(st, id_tok, name_tok, err, sizeof(err));
+  r = wm_strategy_attach(st, id_tok, name_tok, explicit_priority,
+      &chosen_priority, err, sizeof(err));
 
   switch(r)
   {
     case WM_ATTACH_OK:
-      snprintf(reply, sizeof(reply), "attached %s -> %s",
-          name_tok, id_tok);
+      snprintf(reply, sizeof(reply), "attached %s -> %s (priority=%u)",
+          name_tok, id_tok, chosen_priority);
       cmd_reply(ctx, reply);
       break;
 
@@ -71,6 +117,7 @@ wm_strategy_cmd_attach(const cmd_ctx_t *ctx)
     case WM_ATTACH_DUPLICATE:
     case WM_ATTACH_INIT_FAILED:
     case WM_ATTACH_OOM:
+    case WM_ATTACH_PRIORITY_TAKEN:
       snprintf(reply, sizeof(reply), "attach failed: %s",
           err[0] != '\0' ? err : "unknown");
       cmd_reply(ctx, reply);
@@ -526,7 +573,7 @@ wm_strategy_register_verbs(void)
   if(cmd_register("whenmoon", "strategy",
         "whenmoon strategy <verb> ...",
         "Trading-strategy registry controls.",
-        "Subcommands: attach <market_id> <name>,"
+        "Subcommands: attach <market_id> <name> [priority <n>],"
         " detach <market_id> <name>,"
         " reload <name>.",
         USERNS_GROUP_ADMIN, 100, CMD_SCOPE_ANY, METHOD_T_ANY,
@@ -535,12 +582,16 @@ wm_strategy_register_verbs(void)
     return(FAIL);
 
   if(cmd_register("whenmoon", "attach",
-        "whenmoon strategy attach <market_id> <strategy_name>",
+        "whenmoon strategy attach <market_id> <strategy_name>"
+        " [priority <n>]",
         "Attach a strategy to a running market."
         " Registers per-attachment KV override slots at"
         " plugin.whenmoon.market.<id>.strategy.<name>.<param>"
         " and runs the strategy's init() callback. Strategy must"
-        " already be loaded (visible via /show whenmoon strategy).",
+        " already be loaded (visible via /show whenmoon strategy)."
+        " Optional trailing `priority <n>` overrides the auto-picked"
+        " advisor priority (lower = polled first, unique per market);"
+        " omit for the next free slot.",
         NULL,
         USERNS_GROUP_ADMIN, 100, CMD_SCOPE_ANY, METHOD_T_ANY,
         wm_strategy_cmd_attach, NULL, "whenmoon/strategy", NULL,

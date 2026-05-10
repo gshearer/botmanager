@@ -597,6 +597,9 @@ wm_backtest_run_iteration_with_id(whenmoon_state_t *st,
   // wm_strategy_emit_signal_impl forwards to wm_trade_engine_on_signal,
   // so it must match the synthetic id we just registered the book under.
   memset(&ctx, 0, sizeof(ctx));
+  // WM-MK-3 carve-out: backtest stays on the legacy book engine until
+  // WM-MK-5 lands synthetic markets.
+  ctx.backtest_mode = true;
   snprintf(ctx.market_id_str, sizeof(ctx.market_id_str), "%s", synth_id);
   snprintf(ctx.strategy_name, sizeof(ctx.strategy_name), "%s", strat_copy);
   ctx.mkt = &snap->mkt;

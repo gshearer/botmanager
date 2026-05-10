@@ -23,6 +23,7 @@
 
 #ifdef WHENMOON_INTERNAL
 
+#include "market.h"
 #include "order.h"
 #include "whenmoon_strategy.h"
 
@@ -109,6 +110,22 @@ bool wm_live_engine_on_signal_locked(wm_trade_book_t *book,
 // lock.
 bool wm_live_engine_operator_submit_locked(wm_trade_book_t *book,
     char side, double qty, double limit_px,
+    char *errbuf, size_t errbuf_sz);
+
+// WM-MK-3-B: real-mode market-engine submit. The per-market sibling of
+// wm_live_engine_on_signal_locked — reads risk gates from
+// `mk->session`, mints a client_order_id, registers a pending row in
+// `mk->session.pending[]`, and dispatches coinbase_place_order_async at
+// the transactional priority. Caller MUST hold `mk->lock`. Returns
+// SUCCESS only when the order was queued at the exchange abstraction;
+// FAIL on gate trip, sizer hold, OOM, or submit error (errbuf
+// populated when non-NULL). FAIL leaves no pending row.
+//
+// Master kill-switch lives at `plugin.whenmoon.exchange.coinbase.live`
+// (KV_BOOL); when missing or false the helper FAILs closed.
+bool wm_market_engine_real_submit_locked(whenmoon_market_t *mk,
+    char side, double qty, double mark_px, int64_t mark_ms,
+    const wm_strategy_signal_t *sig,
     char *errbuf, size_t errbuf_sz);
 
 #endif // WHENMOON_INTERNAL

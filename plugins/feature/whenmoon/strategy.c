@@ -15,14 +15,25 @@
 //     lock held. The dispatch path takes the registry lock briefly to
 //     find matching attachments, holds it for the iteration (the
 //     "be fast" rule keeps the hold time tiny), then releases.
+//   - WM-MK-3-B: dispatch_bar / dispatch_trade DROP mkt->lock around
+//     the strategy on_bar_fn / on_trade_fn callback so the strategy's
+//     wm_strategy_emit_signal can re-enter wm_market_engine_on_signal
+//     (which takes mkt->lock itself) without deadlocking.
+//     reg->lock stays held to keep `att` valid — wm_strategy_detach_market
+//     takes reg->lock so a concurrent market remove cannot tear down
+//     the attachment under us.
 //   - Strategy admin commands take only the registry lock.
 //   - Lock order: market_lock -> registry_lock. Strategy commands
-//     never take a market lock; nothing inverts this order.
+//     never take a market lock; nothing inverts this order. The
+//     dispatch path's mkt->lock re-acquire (after drop) does NOT
+//     deadlock because no other code path holds mkt->lock and then
+//     tries to take reg->lock.
 
 #define WHENMOON_INTERNAL
 #include "strategy.h"
 
 #include "market.h"
+#include "market_engine.h"
 #include "order.h"
 #include "whenmoon.h"
 
@@ -300,12 +311,15 @@ wm_strategy_emit_signal_impl(wm_strategy_ctx_t *ctx,
   ctx->has_last_signal   = true;
   ctx->signals_emitted++;
 
-  // WM-LT-4: route the signal to the trade engine. The engine looks up
-  // the (market, strategy) trade book; no-op when no book exists or
-  // mode == OFF, so a strategy that emits without anyone having
-  // configured a trade mode stays purely informational.
-  wm_trade_engine_on_signal(ctx->market_id_str, ctx->strategy_name,
-      ctx->last_mark_px, ctx->last_mark_ms, sig);
+  // WM-MK-3: production routes through the per-market engine; backtest
+  // stays on the legacy per-(market, strategy) book engine via the
+  // backtest_mode carve-out (synthetic markets land in WM-MK-5).
+  if(ctx->backtest_mode)
+    wm_trade_engine_on_signal(ctx->market_id_str, ctx->strategy_name,
+        ctx->last_mark_px, ctx->last_mark_ms, sig);
+  else
+    wm_market_engine_on_signal(ctx->market_id_str,
+        ctx->last_mark_px, ctx->last_mark_ms, sig);
 }
 
 void
@@ -767,9 +781,105 @@ wm_strategy_find_market(whenmoon_state_t *st, const char *market_id_str)
 // Attach / detach                                                         //
 // ----------------------------------------------------------------------- //
 
+// WM-MK-3: register the per-attachment priority KV slot. Distinct from
+// wm_strategy_register_attach_param because the default is computed at
+// attach time (next-free-slot or operator-supplied) rather than coming
+// from a static wm_strategy_param_t schema entry.
+static void
+wm_strategy_register_priority_kv(const char *market_id_str,
+    const char *strategy_name, uint32_t priority)
+{
+  char  path[KV_KEY_SZ];
+  char  def[32];
+  int   n;
+
+  n = snprintf(path, sizeof(path),
+      "plugin.whenmoon.market.%s.strategy.%s.priority",
+      market_id_str, strategy_name);
+
+  if(n < 0 || (size_t)n >= sizeof(path))
+  {
+    clam(CLAM_WARN, WHENMOON_CTX,
+        "attach %s/%s: priority key too long, skipped",
+        market_id_str, strategy_name);
+    return;
+  }
+
+  snprintf(def, sizeof(def), "%u", priority);
+
+  if(!kv_exists(path)
+      && kv_register(path, KV_UINT64, def, NULL, NULL,
+             "WM-MK-3 dispatch priority"
+             " (lower = polled first; unique per market)") != SUCCESS)
+    clam(CLAM_WARN, WHENMOON_CTX,
+        "attach %s/%s: kv_register failed: %s",
+        market_id_str, strategy_name, path);
+
+  // Force the value on every attach: kv_register only seeds the
+  // default, so a prior attach + detach cycle leaves the old value
+  // resident. Re-attach with a different priority must take effect.
+  if(kv_set_uint(path, priority) != SUCCESS)
+    clam(CLAM_WARN, WHENMOON_CTX,
+        "attach %s/%s: kv_set_uint failed: %s",
+        market_id_str, strategy_name, path);
+}
+
+// Walk every loaded strategy's attachments, returning the highest
+// priority observed on `market_id_str` (0 if none). Caller holds
+// reg->lock.
+static uint32_t
+wm_strategy_max_priority_on_market_locked(wm_strategy_registry_t *reg,
+    const char *market_id_str)
+{
+  loaded_strategy_t        *ls;
+  wm_strategy_attachment_t *cur;
+  uint32_t                  max_prio = 0;
+
+  for(ls = reg->head; ls != NULL; ls = ls->next)
+  {
+    for(cur = ls->attachments; cur != NULL; cur = cur->next)
+    {
+      if(strncmp(cur->ctx.market_id_str, market_id_str,
+             sizeof(cur->ctx.market_id_str)) != 0)
+        continue;
+
+      if(cur->priority > max_prio)
+        max_prio = cur->priority;
+    }
+  }
+
+  return(max_prio);
+}
+
+// Returns true iff some attachment on `market_id_str` already owns
+// `priority`. Caller holds reg->lock.
+static bool
+wm_strategy_priority_taken_locked(wm_strategy_registry_t *reg,
+    const char *market_id_str, uint32_t priority)
+{
+  loaded_strategy_t        *ls;
+  wm_strategy_attachment_t *cur;
+
+  for(ls = reg->head; ls != NULL; ls = ls->next)
+  {
+    for(cur = ls->attachments; cur != NULL; cur = cur->next)
+    {
+      if(strncmp(cur->ctx.market_id_str, market_id_str,
+             sizeof(cur->ctx.market_id_str)) != 0)
+        continue;
+
+      if(cur->priority == priority)
+        return(true);
+    }
+  }
+
+  return(false);
+}
+
 wm_attach_result_t
 wm_strategy_attach(whenmoon_state_t *st,
     const char *market_id_str, const char *strategy_name,
+    uint32_t explicit_priority, uint32_t *out_priority,
     char *err, size_t err_cap)
 {
   wm_strategy_registry_t   *reg;
@@ -777,10 +887,14 @@ wm_strategy_attach(whenmoon_state_t *st,
   whenmoon_market_t        *mk;
   wm_strategy_attachment_t *att;
   wm_strategy_attachment_t *cur;
+  uint32_t                  chosen_priority;
   uint32_t                  i;
 
   if(err != NULL && err_cap > 0)
     err[0] = '\0';
+
+  if(out_priority != NULL)
+    *out_priority = 0;
 
   if(st == NULL || st->strategies == NULL)
     return(WM_ATTACH_NO_REGISTRY);
@@ -825,6 +939,48 @@ wm_strategy_attach(whenmoon_state_t *st,
     }
   }
 
+  // WM-MK-3 priority pick. The walks span EVERY loaded strategy's
+  // attachments, not just `ls`'s — uniqueness is per market, across
+  // strategies.
+  if(explicit_priority != 0)
+  {
+    if(wm_strategy_priority_taken_locked(reg, market_id_str,
+           explicit_priority))
+    {
+      pthread_mutex_unlock(&reg->lock);
+
+      if(err != NULL)
+        snprintf(err, err_cap,
+            "priority %u already attached on market %s",
+            explicit_priority, market_id_str);
+      return(WM_ATTACH_PRIORITY_TAKEN);
+    }
+
+    chosen_priority = explicit_priority;
+  }
+
+  else
+  {
+    uint32_t max_prio;
+
+    max_prio = wm_strategy_max_priority_on_market_locked(reg,
+        market_id_str);
+
+    if(max_prio == 0)
+      chosen_priority = WM_MK3_PRIORITY_DEFAULT_BASE;
+    else if(max_prio > UINT32_MAX - WM_MK3_PRIORITY_DEFAULT_STEP)
+    {
+      pthread_mutex_unlock(&reg->lock);
+
+      if(err != NULL)
+        snprintf(err, err_cap, "priority space exhausted");
+      return(WM_ATTACH_OOM);
+    }
+
+    else
+      chosen_priority = max_prio + WM_MK3_PRIORITY_DEFAULT_STEP;
+  }
+
   att = mem_alloc("whenmoon", "attach", sizeof(*att));
 
   if(att == NULL)
@@ -837,7 +993,8 @@ wm_strategy_attach(whenmoon_state_t *st,
   }
 
   memset(att, 0, sizeof(*att));
-  att->owner = ls;
+  att->owner    = ls;
+  att->priority = chosen_priority;
   snprintf(att->ctx.market_id_str, sizeof(att->ctx.market_id_str),
       "%s", market_id_str);
   snprintf(att->ctx.strategy_name, sizeof(att->ctx.strategy_name),
@@ -854,6 +1011,11 @@ wm_strategy_attach(whenmoon_state_t *st,
     wm_strategy_register_attach_param(market_id_str, ls->name,
         &ls->meta.params[i]);
   }
+
+  // WM-MK-3: priority KV slot. Default = the just-chosen value so
+  // operators can `/set kv …priority N` without re-attaching.
+  wm_strategy_register_priority_kv(market_id_str, ls->name,
+      chosen_priority);
 
   // wm_strategy_init returns 0 on success (POSIX-style) per the
   // public ABI in whenmoon_strategy.h.
@@ -872,6 +1034,9 @@ wm_strategy_attach(whenmoon_state_t *st,
   ls->n_attachments++;
 
   pthread_mutex_unlock(&reg->lock);
+
+  if(out_priority != NULL)
+    *out_priority = chosen_priority;
 
   // WM-PT-3: pre-warm the trade book so a re-attach after SIGTERM
   // hydrates from wm_trade_book_state immediately, and the strategy
@@ -903,7 +1068,8 @@ wm_strategy_attach(whenmoon_state_t *st,
   }
 
   clam(CLAM_INFO, WHENMOON_CTX,
-      "strategy attach: %s -> %s", strategy_name, market_id_str);
+      "strategy attach: %s -> %s (priority=%u)",
+      strategy_name, market_id_str, chosen_priority);
 
   return(WM_ATTACH_OK);
 }
@@ -1188,8 +1354,168 @@ wm_strategy_reload(whenmoon_state_t *st, const char *strategy_name,
 }
 
 // ----------------------------------------------------------------------- //
-// Bar-close fan-out                                                       //
+// Bar-close fan-out (WM-MK-3 advisor walk)                                //
 // ----------------------------------------------------------------------- //
+
+// Sort callback. Primary key: priority ascending (lower = polled
+// first). Secondary key: pointer value, only as a stable tie-breaker
+// for diagnostics — priorities are unique per market by construction
+// at the verb path, but KV-driven re-prioritize is permissive and may
+// produce a same-priority pair until the operator notices.
+static int
+wm_strategy_attachment_cmp(const void *va, const void *vb)
+{
+  wm_strategy_attachment_t *const *pa = va;
+  wm_strategy_attachment_t *const *pb = vb;
+  const wm_strategy_attachment_t  *a  = *pa;
+  const wm_strategy_attachment_t  *b  = *pb;
+
+  if(a->priority < b->priority) return(-1);
+  if(a->priority > b->priority) return(1);
+
+  if((uintptr_t)a < (uintptr_t)b) return(-1);
+  if((uintptr_t)a > (uintptr_t)b) return(1);
+
+  return(0);
+}
+
+// Refresh `att->priority` from the per-attachment KV slot. KV miss
+// (returns 0) leaves the cached value untouched — explicit zero is
+// not a valid priority.
+static void
+wm_strategy_refresh_priority(wm_strategy_attachment_t *att)
+{
+  uint64_t kv;
+
+  kv = wm_strategy_kv_get_uint(att->ctx.market_id_str,
+      att->owner->name, "priority", 0);
+
+  if(kv != 0 && kv <= UINT32_MAX)
+    att->priority = (uint32_t)kv;
+}
+
+// Render the per-attachment audit line. `sig` may be NULL — that means
+// the attachment was polled but did not emit a fresh signal (HOLD).
+static void
+wm_strategy_log_advice(const whenmoon_market_t *mkt,
+    const wm_strategy_attachment_t *att, int64_t tick_ts_ms,
+    const wm_strategy_signal_t *sig)
+{
+  const char *advice;
+  double      score;
+  double      conf;
+  const char *reason;
+
+  if(sig == NULL || sig->score == 0.0)
+  {
+    advice = "HOLD";
+    score  = 0.0;
+    conf   = 0.0;
+    reason = "";
+  }
+
+  else
+  {
+    advice = sig->score > 0.0 ? "BUY" : "SELL";
+    score  = sig->score;
+    conf   = sig->confidence;
+    reason = sig->reason;
+  }
+
+  clam(CLAM_INFO, WHENMOON_CTX,
+      "whenmoon.advice: market %s strategy=%s prio=%u tick_ts=%" PRId64
+      " advice=%s score=%.4f conf=%.2f reason=\"%s\"",
+      mkt->market_id_str, att->owner->name, att->priority,
+      tick_ts_ms, advice, score, conf, reason);
+}
+
+// Map a wm_gran_t to its grains_mask bit. Caller already validated
+// `gran < WM_GRAN_MAX`.
+static inline uint16_t
+wm_strategy_gran_bit(wm_gran_t gran)
+{
+  return((uint16_t)(1u << (unsigned)gran));
+}
+
+// Common collection body. `gran_bit == 0` means "no grain filter,
+// caller wants the trade-tick variant"; that path filters on
+// `wants_trade_callback` instead. Caller holds reg->lock. Logs
+// CLAM_WARN once and truncates if attachment count exceeds `out_cap`.
+static uint32_t
+wm_strategy_collect_attachments_locked(wm_strategy_registry_t *reg,
+    whenmoon_market_t *mkt, uint16_t gran_bit, bool trade_path,
+    wm_strategy_attachment_t **out, uint32_t out_cap)
+{
+  loaded_strategy_t        *ls;
+  wm_strategy_attachment_t *att;
+  uint32_t                  n         = 0;
+  bool                      truncated = false;
+
+  for(ls = reg->head; ls != NULL; ls = ls->next)
+  {
+    if(trade_path)
+    {
+      if(!ls->meta.wants_trade_callback || ls->on_trade_fn == NULL)
+        continue;
+    }
+
+    else
+    {
+      if((ls->meta.grains_mask & gran_bit) == 0)
+        continue;
+
+      if(ls->on_bar_fn == NULL)
+        continue;
+    }
+
+    for(att = ls->attachments; att != NULL; att = att->next)
+    {
+      if(strncmp(att->ctx.market_id_str, mkt->market_id_str,
+             sizeof(att->ctx.market_id_str)) != 0)
+        continue;
+
+      // Refresh from KV before sorting so an operator-driven
+      // re-prioritize takes effect on this very dispatch.
+      wm_strategy_refresh_priority(att);
+
+      if(n >= out_cap)
+      {
+        truncated = true;
+        continue;
+      }
+
+      out[n++] = att;
+    }
+  }
+
+  if(truncated)
+    clam(CLAM_WARN, WHENMOON_CTX,
+        "dispatch: market %s attachment count exceeds %u, truncating",
+        mkt->market_id_str, out_cap);
+
+  if(n > 1)
+    qsort(out, n, sizeof(out[0]), wm_strategy_attachment_cmp);
+
+  return(n);
+}
+
+static uint32_t
+wm_strategy_collect_market_attachments_locked(
+    wm_strategy_registry_t *reg, whenmoon_market_t *mkt, wm_gran_t gran,
+    wm_strategy_attachment_t **out, uint32_t out_cap)
+{
+  return(wm_strategy_collect_attachments_locked(reg, mkt,
+      wm_strategy_gran_bit(gran), false, out, out_cap));
+}
+
+static uint32_t
+wm_strategy_collect_market_attachments_for_trade_locked(
+    wm_strategy_registry_t *reg, whenmoon_market_t *mkt,
+    wm_strategy_attachment_t **out, uint32_t out_cap)
+{
+  return(wm_strategy_collect_attachments_locked(reg, mkt,
+      0, true, out, out_cap));
+}
 
 void
 wm_strategy_dispatch_bar(whenmoon_state_t *st,
@@ -1197,9 +1523,10 @@ wm_strategy_dispatch_bar(whenmoon_state_t *st,
     const wm_candle_full_t *bar)
 {
   wm_strategy_registry_t   *reg;
-  loaded_strategy_t        *ls;
-  wm_strategy_attachment_t *att;
-  uint16_t                  bit;
+  wm_strategy_attachment_t *attachments[WM_MK3_DISPATCH_MAX_ATTACH];
+  uint32_t                  n;
+  uint32_t                  i;
+  bool                      acted = false;
 
   if(st == NULL || st->strategies == NULL || mkt == NULL || bar == NULL)
     return;
@@ -1208,59 +1535,71 @@ wm_strategy_dispatch_bar(whenmoon_state_t *st,
     return;
 
   reg = st->strategies;
-  bit = (uint16_t)(1u << gran);
 
   pthread_mutex_lock(&reg->lock);
 
-  for(ls = reg->head; ls != NULL; ls = ls->next)
+  n = wm_strategy_collect_market_attachments_locked(reg, mkt, gran,
+      attachments, WM_MK3_DISPATCH_MAX_ATTACH);
+
+  for(i = 0; i < n; i++)
   {
-    // Skip strategies that did not subscribe to this grain.
-    if((ls->meta.grains_mask & bit) == 0)
+    wm_strategy_attachment_t *att = attachments[i];
+    int64_t                   pre_emit_ts;
+    bool                      emitted_this_tick;
+
+    if(acted)
+      // Earlier-priority attachment already advised on this bar.
+      // Per whenmoon_market_model.md the remaining strategies are
+      // not polled.
+      break;
+
+    // WM-SR-1 replay gate: drop bars that already produced a signal in
+    // a prior session. Predates priority and stays per-attachment.
+    if(att->ctx.has_last_signal
+        && bar->ts_close_ms <= att->ctx.last_signal.ts_ms)
       continue;
 
-    if(ls->on_bar_fn == NULL)
-      continue;
+    // Match by id, not pointer: market.c may realloc the markets array
+    // (wm_market_grow). Refresh the cached pointer so the callback
+    // sees the current mkt for this attachment.
+    att->ctx.mkt            = mkt;
+    att->ctx.bars_seen++;
+    att->ctx.last_bar_ts_ms = bar->ts_close_ms;
+    att->ctx.last_mark_px   = bar->close;
+    att->ctx.last_mark_ms   = bar->ts_close_ms;
 
-    for(att = ls->attachments; att != NULL; att = att->next)
+    pre_emit_ts = att->ctx.has_last_signal
+        ? att->ctx.last_signal.ts_ms : 0;
+
+    // WM-MK-3-B: copy the bar onto the stack so the strategy callback
+    // sees a stable view, then drop mkt->lock around the callback. The
+    // callback may emit a signal that re-enters
+    // wm_market_engine_on_signal, which takes mkt->lock itself; without
+    // the drop we'd deadlock. reg->lock stays held to keep `att` valid
+    // (wm_market_remove takes reg->lock via wm_strategy_detach_market
+    // before tearing the slot down, so dropping mkt->lock here cannot
+    // race a market remove). The original `bar` pointer (into mkt's
+    // grain ring) may be invalidated by a concurrent push during the
+    // drop window; post-callback reads use the cached ts_close_ms
+    // snapshot below.
     {
-      // Match by market_id_str rather than pointer: market.c may
-      // realloc the markets array (wm_market_grow), invalidating
-      // `att->ctx.mkt`. The id string is stable across reallocs and
-      // across stop/start cycles, so it is the resilient key.
-      if(strncmp(att->ctx.market_id_str, mkt->market_id_str,
-             sizeof(att->ctx.market_id_str)) != 0)
-        continue;
+      wm_candle_full_t bar_copy   = *bar;
+      int64_t          ts_close_ms = bar->ts_close_ms;
 
-      // WM-SR-1: drop replay bars that already produced a signal in a
-      // prior session. The REST candles backfill + DB warmup task feed
-      // historical bars through dispatch_bar with their original
-      // ts_close_ms; without this gate every persisted attachment
-      // re-emits its prior signals and the paper book accrues
-      // duplicate-timestamp fills on every restart. The attach path
-      // hydrates last_signal from the persisted book, so a fresh
-      // attach with no prior signals still sees every bar.
-      if(att->ctx.has_last_signal
-          && bar->ts_close_ms <= att->ctx.last_signal.ts_ms)
-        continue;
+      pthread_mutex_unlock(&mkt->lock);
+      att->owner->on_bar_fn(&att->ctx, mkt, gran, &bar_copy);
+      pthread_mutex_lock(&mkt->lock);
 
-      // Refresh the cached pointer so the strategy callback sees the
-      // current mkt for this attachment.
-      att->ctx.mkt = mkt;
+      emitted_this_tick = att->ctx.has_last_signal
+          && att->ctx.last_signal.ts_ms != pre_emit_ts
+          && att->ctx.last_signal.ts_ms == ts_close_ms;
 
-      att->ctx.bars_seen++;
-      att->ctx.last_bar_ts_ms   = bar->ts_close_ms;
-
-      // WM-LT-4: cache the mark for the trade engine. Bar close is
-      // the natural mark for a bar-close-driven signal; the engine
-      // reads this from the ctx if the strategy emits a signal.
-      att->ctx.last_mark_px = bar->close;
-      att->ctx.last_mark_ms = bar->ts_close_ms;
-
-      // The callback may emit a signal via wm_strategy_emit_signal,
-      // which writes to att->ctx.last_signal in place. The "be fast"
-      // contract keeps this hold time bounded.
-      ls->on_bar_fn(&att->ctx, mkt, gran, bar);
+      wm_strategy_log_advice(mkt, att, ts_close_ms,
+          emitted_this_tick ? &att->ctx.last_signal : NULL);
     }
+
+    if(emitted_this_tick && att->ctx.last_signal.score != 0.0)
+      acted = true;
   }
 
   pthread_mutex_unlock(&reg->lock);
@@ -1271,8 +1610,10 @@ wm_strategy_dispatch_trade(whenmoon_state_t *st,
     whenmoon_market_t *mkt, const wm_trade_t *trade)
 {
   wm_strategy_registry_t   *reg;
-  loaded_strategy_t        *ls;
-  wm_strategy_attachment_t *att;
+  wm_strategy_attachment_t *attachments[WM_MK3_DISPATCH_MAX_ATTACH];
+  uint32_t                  n;
+  uint32_t                  i;
+  bool                      acted = false;
 
   if(st == NULL || st->strategies == NULL || mkt == NULL || trade == NULL)
     return;
@@ -1281,25 +1622,47 @@ wm_strategy_dispatch_trade(whenmoon_state_t *st,
 
   pthread_mutex_lock(&reg->lock);
 
-  for(ls = reg->head; ls != NULL; ls = ls->next)
+  n = wm_strategy_collect_market_attachments_for_trade_locked(reg, mkt,
+      attachments, WM_MK3_DISPATCH_MAX_ATTACH);
+
+  for(i = 0; i < n; i++)
   {
-    if(!ls->meta.wants_trade_callback || ls->on_trade_fn == NULL)
-      continue;
+    wm_strategy_attachment_t *att = attachments[i];
+    int64_t                   pre_emit_ts;
+    bool                      emitted_this_tick;
 
-    for(att = ls->attachments; att != NULL; att = att->next)
+    if(acted)
+      break;
+
+    att->ctx.mkt          = mkt;
+    att->ctx.last_mark_px = trade->price;
+    att->ctx.last_mark_ms = trade->ts_ms;
+
+    pre_emit_ts = att->ctx.has_last_signal
+        ? att->ctx.last_signal.ts_ms : 0;
+
+    // WM-MK-3-B: copy trade onto stack and drop mkt->lock around the
+    // callback (same shape as dispatch_bar). The trade pointer's
+    // backing storage is the WS event payload — it is not part of
+    // mkt's mutable state — but matching the bar dispatch's
+    // copy-then-drop discipline keeps the locking pattern uniform.
     {
-      if(strncmp(att->ctx.market_id_str, mkt->market_id_str,
-             sizeof(att->ctx.market_id_str)) != 0)
-        continue;
+      wm_trade_t trade_copy = *trade;
+      int64_t    ts_ms      = trade->ts_ms;
 
-      att->ctx.mkt = mkt;
+      pthread_mutex_unlock(&mkt->lock);
+      att->owner->on_trade_fn(&att->ctx, mkt, &trade_copy);
+      pthread_mutex_lock(&mkt->lock);
 
-      // WM-LT-4: trade-tick mark for the trade engine.
-      att->ctx.last_mark_px = trade->price;
-      att->ctx.last_mark_ms = trade->ts_ms;
+      emitted_this_tick = att->ctx.has_last_signal
+          && att->ctx.last_signal.ts_ms != pre_emit_ts;
 
-      ls->on_trade_fn(&att->ctx, mkt, trade);
+      wm_strategy_log_advice(mkt, att, ts_ms,
+          emitted_this_tick ? &att->ctx.last_signal : NULL);
     }
+
+    if(emitted_this_tick && att->ctx.last_signal.score != 0.0)
+      acted = true;
   }
 
   pthread_mutex_unlock(&reg->lock);

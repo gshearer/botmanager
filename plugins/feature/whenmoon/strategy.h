@@ -27,6 +27,16 @@ struct whenmoon_market;
 typedef struct loaded_strategy loaded_strategy_t;
 typedef struct wm_strategy_attachment wm_strategy_attachment_t;
 
+// WM-MK-3 advisor-walk dispatch constants.
+//   _DEFAULT_BASE: priority floor when no explicit value is supplied.
+//   _DEFAULT_STEP: gap between auto-assigned defaults; sparse layout
+//     leaves room for manual interleaving without renumbering.
+//   _DISPATCH_MAX_ATTACH: stack-array cap for per-bar attachment-sort
+//     scratch in wm_strategy_dispatch_bar / _dispatch_trade.
+#define WM_MK3_PRIORITY_DEFAULT_BASE  1000u
+#define WM_MK3_PRIORITY_DEFAULT_STEP  100u
+#define WM_MK3_DISPATCH_MAX_ATTACH    32
+
 // -----------------------------------------------------------------------
 // KV resolver (existing, retained from WM-G1 stub)
 // -----------------------------------------------------------------------
@@ -87,6 +97,10 @@ struct wm_strategy_ctx
   // to find the mark.
   double                last_mark_px;
   int64_t               last_mark_ms;
+
+  // WM-MK-3 carve-out so backtest stays on the legacy book engine;
+  // removed in WM-MK-5 once backtest moves to synthetic markets.
+  bool                  backtest_mode;
 };
 
 // -----------------------------------------------------------------------
@@ -100,6 +114,9 @@ struct wm_strategy_attachment
 
   // Per-attachment context (passed to strategy callbacks).
   wm_strategy_ctx_t         ctx;
+
+  // WM-MK-3 advisor priority; lower = polled first; unique per market.
+  uint32_t                  priority;
 
   // Linkage in the per-strategy attachment list (owner->attachments).
   wm_strategy_attachment_t *next;
@@ -181,10 +198,17 @@ typedef enum
   WM_ATTACH_DUPLICATE,
   WM_ATTACH_INIT_FAILED,
   WM_ATTACH_OOM,
+  WM_ATTACH_PRIORITY_TAKEN,
 } wm_attach_result_t;
 
+// `explicit_priority` 0 means auto-pick the next free slot above the
+// current per-market max. Non-zero is honored verbatim and FAILs with
+// WM_ATTACH_PRIORITY_TAKEN if another attachment on the same market
+// already owns it. `out_priority` (may be NULL) receives the chosen
+// value on WM_ATTACH_OK.
 wm_attach_result_t wm_strategy_attach(struct whenmoon_state *st,
     const char *market_id_str, const char *strategy_name,
+    uint32_t explicit_priority, uint32_t *out_priority,
     char *err, size_t err_cap);
 
 typedef enum

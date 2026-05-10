@@ -356,6 +356,14 @@ void        wm_market_session_init(wm_market_session_t *s);
 whenmoon_market_t *wm_market_lookup_by_id(struct whenmoon_state *st,
     const char *market_id_str);
 
+// Lookup by exchange wire-form product id (e.g. "BTC-USD"). Same
+// contract as wm_market_lookup_by_id — caller does NOT hold any lock;
+// the returned pointer is a snapshot, valid until the next add/remove.
+// NULL on miss. Used by the WS user-channel + REST /fills consumers
+// to resolve the owning market for an incoming fill.
+whenmoon_market_t *wm_market_lookup_by_product_id(struct whenmoon_state *st,
+    const char *product_id);
+
 #endif // WHENMOON_INTERNAL
 
 #endif // BM_WHENMOON_MARKET_H

@@ -10,6 +10,7 @@
 
 #define WHENMOON_INTERNAL
 #include "market_engine.h"
+#include "live.h"
 #include "market.h"
 #include "market_persist.h"
 #include "whenmoon.h"
@@ -516,7 +517,6 @@ wm_market_engine_on_signal(const char *market_id_str, double mark_px,
   whenmoon_market_t *mk;
   wm_mk_advice_t     advice;
   wm_market_mode_t   mode;
-  double             notional_cap;
   double             qty;
   double             slip;
   double             fill_px;
@@ -524,8 +524,6 @@ wm_market_engine_on_signal(const char *market_id_str, double mark_px,
   double             slip_bps;
   double             notional;
   double             fee;
-  double             daily_cap;
-  double             starting_cash;
 
   if(sig == NULL || mark_px <= 0.0)
     return;
@@ -590,49 +588,10 @@ wm_market_engine_on_signal(const char *market_id_str, double mark_px,
   slip_bps = mk->session.slip_bps;
 
   // Sizer: buys open `size_frac * cash / mark`; sells close the full
-  // open long qty. Real-mode notional cap clips buys; daily-loss cap
-  // FAILs the order entirely.
+  // open long qty. Real-mode caps + gate trips are owned by
+  // wm_market_engine_real_submit_locked (single source of truth).
   if(advice == WM_MK_ADVICE_BUY)
-  {
     qty = (mk->session.stats[mode].cash * mk->session.size_frac) / mark_px;
-
-    if(mode == WM_MARKET_MODE_REAL)
-    {
-      notional_cap = mk->session.max_notional;
-
-      if(notional_cap > 0.0 && qty * mark_px > notional_cap)
-        qty = notional_cap / mark_px;
-
-      // Daily-loss gate.
-      starting_cash = mk->session.stats[mode].starting_cash;
-      daily_cap     = starting_cash *
-          (mk->session.daily_loss_bps / 10000.0);
-
-      if(daily_cap > 0.0 &&
-         mk->session.stats[mode].realized_pnl_today <= -daily_cap)
-      {
-        pthread_mutex_unlock(&mk->lock);
-        clam(CLAM_WARN, WHENMOON_CTX,
-            "market %s: real-mode signal FAIL closed (daily loss"
-            " %.4f <= cap %.4f)",
-            mk->market_id_str,
-            mk->session.stats[mode].realized_pnl_today, -daily_cap);
-        return;
-      }
-
-      // Pending-cap gate.
-      if(mk->session.pending_n >= mk->session.pending_cap)
-      {
-        pthread_mutex_unlock(&mk->lock);
-        clam(CLAM_WARN, WHENMOON_CTX,
-            "market %s: real-mode signal FAIL — pending ring full"
-            " (n=%u cap=%u)",
-            mk->market_id_str, mk->session.pending_n,
-            mk->session.pending_cap);
-        return;
-      }
-    }
-  }
 
   else /* sell — close the full open long */
     qty = mk->session.position.qty;
@@ -643,19 +602,38 @@ wm_market_engine_on_signal(const char *market_id_str, double mark_px,
     return;
   }
 
-  // Synthetic slippage: buys pay above mark, sells receive below.
-  // Applied for paper mode only — real-mode fills carry the actual
-  // exchange execution price (recorded via the external-fill entry
-  // point). For WM-MK-2 the real path is a stub that records the
-  // intended fill at mark_px; WM-MK-3 wires the actual submit.
-  if(mode == WM_MARKET_MODE_PAPER)
+  // WM-MK-3-B: real mode dispatches to the live submit path. Risk
+  // gates + pending-row registration live in
+  // wm_market_engine_real_submit_locked. On SUCCESS we do NOT call
+  // apply_fill — the fill arrives asynchronously via the WS
+  // user-channel + REST /fills consumers, which call back through
+  // wm_market_engine_record_external_fill. On FAIL the helper has
+  // already self-logged; just persist (no-op for the fail path) and
+  // unlock.
+  if(mode == WM_MARKET_MODE_REAL)
   {
-    slip    = mark_px * (slip_bps / 10000.0);
-    fill_px = (advice == WM_MK_ADVICE_BUY) ? mark_px + slip
-                                           : mark_px - slip;
+    char errbuf[160];
+
+    // Helper self-logs CLAM_WARN on every gate trip; errbuf is for
+    // operator-issued verbs (not used here) so we drop it on the
+    // floor. On SUCCESS the pending row is registered in mk->session;
+    // the fill arrives asynchronously via the WS user-channel / REST
+    // poll consumers in live.c.
+    (void)wm_market_engine_real_submit_locked(mk,
+        (advice == WM_MK_ADVICE_BUY) ? 'b' : 's',
+        qty, mark_px, sig->ts_ms != 0 ? sig->ts_ms : mark_ms,
+        sig, errbuf, sizeof(errbuf));
+
+    (void)wm_market_persist_locked(mk);
+
+    pthread_mutex_unlock(&mk->lock);
+    return;
   }
-  else
-    fill_px = mark_px;
+
+  // Paper mode: synthetic slippage + immediate apply_fill.
+  slip    = mark_px * (slip_bps / 10000.0);
+  fill_px = (advice == WM_MK_ADVICE_BUY) ? mark_px + slip
+                                         : mark_px - slip;
 
   if(fill_px <= 0.0)
   {

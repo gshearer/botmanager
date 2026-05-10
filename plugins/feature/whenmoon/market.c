@@ -299,6 +299,27 @@ wm_market_lookup_by_id(whenmoon_state_t *st, const char *market_id_str)
   return(NULL);
 }
 
+whenmoon_market_t *
+wm_market_lookup_by_product_id(whenmoon_state_t *st, const char *product_id)
+{
+  whenmoon_markets_t *m;
+  uint32_t            i;
+
+  if(st == NULL || st->markets == NULL || product_id == NULL)
+    return(NULL);
+
+  m = st->markets;
+
+  for(i = 0; i < m->n_markets; i++)
+  {
+    if(strncmp(m->arr[i].product_id, product_id,
+           WM_PRODUCT_ID_SZ) == 0)
+      return(&m->arr[i]);
+  }
+
+  return(NULL);
+}
+
 // ------------------------------------------------------------------ //
 // Canonical id parsing / formatting                                  //
 // ------------------------------------------------------------------ //
