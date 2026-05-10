@@ -199,32 +199,16 @@ clam_cmd_shared_cb(const clam_msg_t *m)
   pthread_mutex_unlock(&clam_cmd_mutex);
 }
 
-static void
-ensure_shared_subscriber_locked(void)
-{
-  if(clam_cmd_shared_registered)
-    return;
-
-  // Subscribe at DEBUG5 with no regex — we filter per-user in the
-  // callback. clam_subscribe is safe to call with clam_cmd_mutex held
-  // because clam's own mutex is independent.
-  clam_subscribe(CLAM_CMD_SHARED_NAME, CLAM_DEBUG5, NULL,
-      clam_cmd_shared_cb);
-  clam_cmd_shared_registered = true;
-}
-
-static void
-maybe_drop_shared_subscriber_locked(void)
-{
-  if(!clam_cmd_shared_registered)
-    return;
-
-  if(clam_cmd_subs != NULL)
-    return;
-
-  clam_unsubscribe(CLAM_CMD_SHARED_NAME);
-  clam_cmd_shared_registered = false;
-}
+// clam_subscribe and clam_unsubscribe MUST be called with clam_cmd_mutex
+// dropped: clam_subscribe (clam.c:215) emits a CLAM_DEBUG "added '%s'"
+// event after registering, which dispatches into clam_cmd_shared_cb —
+// which takes clam_cmd_mutex. Holding clam_cmd_mutex across the call is
+// a self-deadlock on the same thread (clam_cmd_mutex is non-recursive,
+// and clam_in_cb only guards re-entry into clam(), not into clam_cmd).
+// Same hazard for clam_unsubscribe's "removed '%s'" emission. Mirrors
+// the pattern in core/botmanctl.c:158-162. Callers compute their
+// register/unregister decision under the lock, snapshot the booleans,
+// drop the lock, then act.
 
 // Destination parsing
 
@@ -535,9 +519,18 @@ cmd_clam_subscribe(const cmd_ctx_t *ctx)
   s->next = clam_cmd_subs;
   clam_cmd_subs = s;
 
-  ensure_shared_subscriber_locked();
+  // Decide whether we need to register with clam_subscribe. Claim the
+  // slot (set the boolean) before dropping the lock so a concurrent
+  // cmd_clam_subscribe can't try to register a second time.
+  bool need_register = !clam_cmd_shared_registered;
+  if(need_register)
+    clam_cmd_shared_registered = true;
 
   pthread_mutex_unlock(&clam_cmd_mutex);
+
+  if(need_register)
+    clam_subscribe(CLAM_CMD_SHARED_NAME, CLAM_DEBUG5, NULL,
+        clam_cmd_shared_cb);
 
   snprintf(ack, sizeof(ack),
       "subscribed '%s' at sev %u with %zu destination%s",
@@ -582,9 +575,18 @@ cmd_clam_unsubscribe(const cmd_ctx_t *ctx)
     return;
   }
 
-  maybe_drop_shared_subscriber_locked();
+  // Decide whether the last user sub just left and we should detach the
+  // shared clam subscriber. Clear the flag first so a concurrent
+  // unsubscribe can't double-call clam_unsubscribe.
+  bool need_unregister = clam_cmd_shared_registered
+      && clam_cmd_subs == NULL;
+  if(need_unregister)
+    clam_cmd_shared_registered = false;
 
   pthread_mutex_unlock(&clam_cmd_mutex);
+
+  if(need_unregister)
+    clam_unsubscribe(CLAM_CMD_SHARED_NAME);
 
   sub_free(hit);
 
