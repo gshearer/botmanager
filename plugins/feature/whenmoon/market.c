@@ -320,6 +320,71 @@ wm_market_lookup_by_product_id(whenmoon_state_t *st, const char *product_id)
   return(NULL);
 }
 
+bool
+wm_market_session_snapshot(whenmoon_market_t *mk,
+    wm_market_session_snapshot_t *out)
+{
+  wm_market_session_t *s;
+  uint32_t             m;
+
+  memset(out, 0, sizeof(*out));
+
+  pthread_mutex_lock(&mk->lock);
+
+  s = &mk->session;
+
+  snprintf(out->market_id_str, sizeof(out->market_id_str), "%s",
+      mk->market_id_str);
+  snprintf(out->product_id, sizeof(out->product_id), "%s",
+      mk->product_id);
+
+  out->mode     = s->mode;
+  out->position = s->position;
+
+  for(m = 0; m < WM_MARKET_MODE_COUNT; m++)
+    out->stats[m] = s->stats[m];
+
+  // Extract the recent-fills tail per mode in oldest→newest order.
+  // fills_head[m] points at the next write slot, so the newest fill
+  // is at (head - 1) mod cap and the oldest of the tail is at
+  // (head - count) mod cap. count is min(fills_n, RECENT_FILLS).
+  for(m = 0; m < WM_MARKET_MODE_COUNT; m++)
+  {
+    uint32_t total = (s->fills_n[m] > (uint64_t)WM_MARKET_FILL_RING_CAP)
+                   ? WM_MARKET_FILL_RING_CAP
+                   : (uint32_t)s->fills_n[m];
+    uint32_t count = (total > WM_MK_OBS_RECENT_FILLS)
+                   ? WM_MK_OBS_RECENT_FILLS
+                   : total;
+    uint32_t i;
+
+    for(i = 0; i < count; i++)
+    {
+      uint32_t idx = (s->fills_head[m] + WM_MARKET_FILL_RING_CAP
+                      - count + i) % WM_MARKET_FILL_RING_CAP;
+      out->recent_fills[m][i] = s->fills[m][idx];
+    }
+    out->recent_fills_n[m] = count;
+  }
+
+  out->pending_n      = s->pending_n;
+  out->last_mark_px   = s->last_mark_px;
+  out->last_mark_ms   = s->last_mark_ms;
+  out->last_ticker_px = mk->last_px;
+  out->last_ticker_ms = mk->last_tick_ms;
+
+  out->fee_bps        = s->fee_bps;
+  out->slip_bps       = s->slip_bps;
+  out->size_frac      = s->size_frac;
+  out->max_notional   = s->max_notional;
+  out->daily_loss_bps = s->daily_loss_bps;
+  out->pending_cap    = s->pending_cap;
+
+  pthread_mutex_unlock(&mk->lock);
+
+  return(SUCCESS);
+}
+
 // ------------------------------------------------------------------ //
 // Canonical id parsing / formatting                                  //
 // ------------------------------------------------------------------ //

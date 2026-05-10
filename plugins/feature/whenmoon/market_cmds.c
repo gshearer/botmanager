@@ -606,3 +606,217 @@ wm_market_register_verbs(void)
 
   return(SUCCESS);
 }
+
+// ====================================================================== //
+// WM-MK-OBS-1: /show whenmoon market [<id>] per-market session view       //
+// ====================================================================== //
+
+// Render the no-arg list-row for one market.
+static void
+wm_obs_render_row(const cmd_ctx_t *ctx,
+    const wm_market_session_snapshot_t *snap)
+{
+  const wm_market_stats_t *paper = &snap->stats[WM_MARKET_MODE_PAPER];
+  const wm_market_stats_t *real  = &snap->stats[WM_MARKET_MODE_REAL];
+  char line[320];
+
+  if(snap->position.side == WM_MARKET_POS_LONG)
+    snprintf(line, sizeof(line),
+        "  %-24s  mode=%-6s side=long   qty=%-12.8g avg=%-10.4f"
+        " paper:cash=%-9.2f realized=%-+9.2f"
+        " real:cash=%-9.2f realized=%-+9.2f"
+        " pending=%u/%u",
+        snap->market_id_str,
+        wm_market_mode_name(snap->mode),
+        snap->position.qty,
+        snap->position.avg_entry_px,
+        paper->cash, paper->realized_pnl_lifetime,
+        real->cash,  real->realized_pnl_lifetime,
+        snap->pending_n, snap->pending_cap);
+  else
+    snprintf(line, sizeof(line),
+        "  %-24s  mode=%-6s side=flat"
+        "                                    "
+        " paper:cash=%-9.2f realized=%-+9.2f"
+        " real:cash=%-9.2f realized=%-+9.2f"
+        " pending=%u/%u",
+        snap->market_id_str,
+        wm_market_mode_name(snap->mode),
+        paper->cash, paper->realized_pnl_lifetime,
+        real->cash,  real->realized_pnl_lifetime,
+        snap->pending_n, snap->pending_cap);
+
+  cmd_reply(ctx, line);
+}
+
+// Render the recent-fills tail for one mode (paper or real). The
+// snapshot stores fills oldest→newest; we render in that order.
+static void
+wm_obs_render_fills(const cmd_ctx_t *ctx,
+    const wm_market_session_snapshot_t *snap, wm_market_mode_t mode,
+    const char *header)
+{
+  uint32_t i;
+  char     line[256];
+
+  cmd_reply(ctx, header);
+
+  if(snap->recent_fills_n[mode] == 0)
+  {
+    cmd_reply(ctx, "    (none)");
+    return;
+  }
+
+  for(i = 0; i < snap->recent_fills_n[mode]; i++)
+  {
+    const wm_market_fill_t *f = &snap->recent_fills[mode][i];
+
+    snprintf(line, sizeof(line),
+        "    ts=%-13" PRId64 "  %c qty=%-12.8g px=%-10.4f"
+        " fee=%-7.4f realized=%-+8.2f cash=%-10.2f pos=%-+8.6g",
+        f->ts_ms, f->side, f->qty, f->price, f->fee,
+        f->realized_pnl, f->cash_after, f->position_after);
+    cmd_reply(ctx, line);
+  }
+}
+
+// Render the detail card.
+static void
+wm_obs_render_card(const cmd_ctx_t *ctx,
+    const wm_market_session_snapshot_t *snap)
+{
+  const wm_market_stats_t *paper = &snap->stats[WM_MARKET_MODE_PAPER];
+  const wm_market_stats_t *real  = &snap->stats[WM_MARKET_MODE_REAL];
+  char line[320];
+
+  if(snap->position.side == WM_MARKET_POS_LONG)
+    snprintf(line, sizeof(line),
+        CLR_BOLD "%s" CLR_RESET "  mode=%s  position: long"
+        " qty=%.8g entry=%.4f opened_at_ms=%" PRId64,
+        snap->market_id_str, wm_market_mode_name(snap->mode),
+        snap->position.qty, snap->position.avg_entry_px,
+        snap->position.opened_at_ms);
+  else
+    snprintf(line, sizeof(line),
+        CLR_BOLD "%s" CLR_RESET "  mode=%s  position: flat",
+        snap->market_id_str, wm_market_mode_name(snap->mode));
+  cmd_reply(ctx, line);
+
+  snprintf(line, sizeof(line),
+      "  last_mark:    px=%-10.4f ts_ms=%" PRId64
+      "    last_ticker: px=%-10.4f ts_ms=%" PRId64,
+      snap->last_mark_px, snap->last_mark_ms,
+      snap->last_ticker_px, snap->last_ticker_ms);
+  cmd_reply(ctx, line);
+
+  snprintf(line, sizeof(line),
+      "  paper_stats: cash=%.2f starting=%.2f"
+      " realized_lifetime=%+.2f realized_today=%+.2f"
+      " fees=%.4f fills=%" PRIu64 " last_fill_ms=%" PRId64,
+      paper->cash, paper->starting_cash,
+      paper->realized_pnl_lifetime, paper->realized_pnl_today,
+      paper->lifetime_fees, paper->lifetime_fills_count,
+      paper->last_fill_ms);
+  cmd_reply(ctx, line);
+
+  snprintf(line, sizeof(line),
+      "  real_stats:  cash=%.2f starting=%.2f"
+      " realized_lifetime=%+.2f realized_today=%+.2f"
+      " fees=%.4f fills=%" PRIu64 " last_fill_ms=%" PRId64,
+      real->cash, real->starting_cash,
+      real->realized_pnl_lifetime, real->realized_pnl_today,
+      real->lifetime_fees, real->lifetime_fills_count,
+      real->last_fill_ms);
+  cmd_reply(ctx, line);
+
+  snprintf(line, sizeof(line),
+      "  params:      fee_bps=%.1f slip_bps=%.1f size_frac=%.2f"
+      " max_notional=%.2f daily_loss_bps=%.1f pending_cap=%u",
+      snap->fee_bps, snap->slip_bps, snap->size_frac,
+      snap->max_notional, snap->daily_loss_bps, snap->pending_cap);
+  cmd_reply(ctx, line);
+
+  snprintf(line, sizeof(line),
+      "  pending:     %u", snap->pending_n);
+  cmd_reply(ctx, line);
+
+  wm_obs_render_fills(ctx, snap, WM_MARKET_MODE_PAPER,
+      "  recent paper fills (oldest first):");
+  wm_obs_render_fills(ctx, snap, WM_MARKET_MODE_REAL,
+      "  recent real fills (oldest first):");
+}
+
+static void
+wm_show_market_cmd(const cmd_ctx_t *ctx)
+{
+  const char                  *p;
+  char                         id_tok[WM_MARKET_ID_STR_SZ] = {0};
+  whenmoon_state_t            *st;
+  whenmoon_markets_t          *m;
+  wm_market_session_snapshot_t snap;
+  uint32_t                     i;
+
+  st = whenmoon_get_state();
+
+  if(st == NULL || st->markets == NULL)
+  {
+    cmd_reply(ctx, "whenmoon: no market state");
+    return;
+  }
+
+  m = st->markets;
+  p = ctx->args != NULL ? ctx->args : "";
+
+  // Detail-arg form.
+  if(wm_dl_next_token(&p, id_tok, sizeof(id_tok)))
+  {
+    whenmoon_market_t *mk = wm_market_lookup_by_id(st, id_tok);
+    char err[128];
+
+    if(mk == NULL)
+    {
+      snprintf(err, sizeof(err),
+          "error: market %s not running", id_tok);
+      cmd_reply(ctx, err);
+      return;
+    }
+
+    wm_market_session_snapshot(mk, &snap);
+    wm_obs_render_card(ctx, &snap);
+    return;
+  }
+
+  // No-arg list view.
+  if(m->n_markets == 0)
+  {
+    cmd_reply(ctx, "whenmoon: (no markets running)");
+    return;
+  }
+
+  cmd_reply(ctx, CLR_BOLD "whenmoon market sessions" CLR_RESET);
+
+  for(i = 0; i < m->n_markets; i++)
+  {
+    wm_market_session_snapshot(&m->arr[i], &snap);
+    wm_obs_render_row(ctx, &snap);
+  }
+}
+
+bool
+wm_show_market_register_verbs(void)
+{
+  // /show whenmoon market [<id>]  — alias /show whenmoon mk
+  if(cmd_register("whenmoon", "market",
+        "show whenmoon market [<id>]",
+        "Per-market session: mode, position, paper+real stats,"
+        " pending count. With <id>: a detail card mirroring the legacy"
+        " `/show whenmoon trade` layout, plus recent fills tails for"
+        " both paper and real ledgers.",
+        NULL,
+        USERNS_GROUP_ADMIN, 100, CMD_SCOPE_ANY, METHOD_T_ANY,
+        wm_show_market_cmd, NULL, "show/whenmoon", "mk",
+        NULL, 0, NULL, NULL) != SUCCESS)
+    return(FAIL);
+
+  return(SUCCESS);
+}

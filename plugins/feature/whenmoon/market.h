@@ -364,6 +364,57 @@ whenmoon_market_t *wm_market_lookup_by_id(struct whenmoon_state *st,
 whenmoon_market_t *wm_market_lookup_by_product_id(struct whenmoon_state *st,
     const char *product_id);
 
+// ------------------------------------------------------------------ //
+// WM-MK-OBS-1: per-market session snapshot for /show whenmoon market //
+// ------------------------------------------------------------------ //
+
+#define WM_MK_OBS_RECENT_FILLS  16
+
+typedef struct
+{
+  char                  market_id_str[WM_MARKET_ID_STR_SZ];
+  char                  product_id[WM_PRODUCT_ID_SZ];
+
+  wm_market_mode_t      mode;
+  wm_market_position_t  position;
+  wm_market_stats_t     stats[WM_MARKET_MODE_COUNT];
+
+  // Most recent fills, oldest at index 0, newest at recent_fills_n-1.
+  // Capped at WM_MK_OBS_RECENT_FILLS.
+  wm_market_fill_t      recent_fills[WM_MARKET_MODE_COUNT][WM_MK_OBS_RECENT_FILLS];
+  uint32_t              recent_fills_n[WM_MARKET_MODE_COUNT];
+
+  uint32_t              pending_n;
+
+  double                last_mark_px;
+  int64_t               last_mark_ms;
+  double                last_ticker_px;
+  int64_t               last_ticker_ms;
+
+  double                fee_bps;
+  double                slip_bps;
+  double                size_frac;
+  double                max_notional;
+  double                daily_loss_bps;
+  uint32_t              pending_cap;
+} wm_market_session_snapshot_t;
+
+// Take a deep copy of `mk->session` (and a few mk-level fields) under
+// `mk->lock`, releasing before return. Recent fills tails are extracted
+// from the per-mode rings into linear oldest→newest arrays. `mk` must
+// be a live pointer from `wm_market_lookup_by_id`. SUCCESS always; the
+// helper's only failure mode is OS-level mutex breakage which is fatal
+// elsewhere.
+bool wm_market_session_snapshot(whenmoon_market_t *mk,
+    wm_market_session_snapshot_t *out);
+
+// Register the /show whenmoon market verbs (no-arg list + `<id>` detail
+// + `mk` alias). Called from `whenmoon_init` after the existing market
+// verb registration. Returns SUCCESS on full success, FAIL if any
+// cmd_register call fails (matches sibling `wm_market_register_verbs`
+// shape).
+bool wm_show_market_register_verbs(void);
+
 #endif // WHENMOON_INTERNAL
 
 #endif // BM_WHENMOON_MARKET_H

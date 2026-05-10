@@ -444,6 +444,13 @@ whenmoon_init(void)
     goto fail;
   }
 
+  if(wm_show_market_register_verbs() != SUCCESS)
+  {
+    clam(CLAM_INFO, WHENMOON_CTX,
+        "show market verb registration failed");
+    goto fail;
+  }
+
   if(wm_strategy_register_verbs() != SUCCESS)
   {
     clam(CLAM_INFO, WHENMOON_CTX, "strategy verb registration failed");
