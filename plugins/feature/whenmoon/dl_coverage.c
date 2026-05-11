@@ -3,7 +3,7 @@
 
 #define WHENMOON_INTERNAL
 #include "dl_coverage.h"
-#include "dl_schema.h"   // WM_DL_CTX
+#include "dl_schema.h"   // WM_DL_CTX, wm_candle_table_name, _ensure
 
 #include "alloc.h"
 #include "clam.h"
@@ -434,6 +434,136 @@ wm_coverage_gaps_candles(int32_t market_id, int32_t gran_secs,
 
   if(emitted == max_out && strcmp(prev_end, range_end) < 0)
     snprintf(out[max_out - 1].last_ts, WM_COV_TS_SZ, "%s", range_end);
+
+out:
+  if(res     != NULL) db_result_free(res);
+  if(e_start != NULL) mem_free(e_start);
+  if(e_end   != NULL) mem_free(e_end);
+
+  return(emitted);
+}
+
+// --------------------------------------------------------------------
+// Row-level gap walker. Three sub-queries unioned:
+//   A) backward gap   — MIN(ts) > range_start (or table empty)
+//   B) forward gap    — MAX(ts) < range_end
+//   C) internal gaps  — LAG-detected runs of missing rows
+// When the table is empty in the range, A collapses to one gap
+// covering the whole window; B and C contribute nothing. The single
+// PK index on `ts` carries the scan; for a few-million-row table the
+// LAG window streams in sub-second.
+// --------------------------------------------------------------------
+
+uint32_t
+wm_gap_find_row_gaps(int32_t market_id, int32_t gran_secs,
+    const char *range_start, const char *range_end,
+    wm_coverage_t *out, uint32_t max_out)
+{
+  db_result_t *res     = NULL;
+  char        *e_start = NULL;
+  char        *e_end   = NULL;
+  char         table[WM_DL_TABLE_SZ];
+  char         sql[2048];
+  uint32_t     emitted = 0;
+  int          n;
+
+  if(out == NULL || max_out == 0)
+    return(0);
+
+  if(range_start == NULL || range_end == NULL)
+    return(0);
+
+  if(gran_secs <= 0)
+    return(0);
+
+  if(strcmp(range_end, range_start) <= 0)
+    return(0);
+
+  if(wm_candle_table_name(market_id, gran_secs, table, sizeof(table))
+      != SUCCESS)
+    return(0);
+
+  // A brand-new market hits this before any download has created
+  // its candle table; the gap query would fail on a missing
+  // relation. Materialise the table so the empty-range case
+  // resolves cleanly into one whole-window gap.
+  (void)wm_candle_table_ensure(market_id, gran_secs);
+
+  e_start = db_escape(range_start);
+  e_end   = db_escape(range_end);
+
+  if(e_start == NULL || e_end == NULL)
+    goto out;
+
+  n = snprintf(sql, sizeof(sql),
+      "SELECT to_char(first_ts AT TIME ZONE 'UTC',"
+      "               'YYYY-MM-DD HH24:MI:SS.US') || '+00' AS rs,"
+      "       to_char(last_ts  AT TIME ZONE 'UTC',"
+      "               'YYYY-MM-DD HH24:MI:SS.US') || '+00' AS re"
+      "  FROM ("
+      "    SELECT TIMESTAMPTZ '%s' AS first_ts,"
+      "           COALESCE(MIN(ts), TIMESTAMPTZ '%s') AS last_ts"
+      "      FROM %s"
+      "     WHERE ts >= TIMESTAMPTZ '%s' AND ts <= TIMESTAMPTZ '%s'"
+      "    HAVING COALESCE(MIN(ts), TIMESTAMPTZ '%s')"
+      "             > TIMESTAMPTZ '%s'"
+      "    UNION ALL"
+      "    SELECT MAX(ts) AS first_ts,"
+      "           TIMESTAMPTZ '%s' AS last_ts"
+      "      FROM %s"
+      "     WHERE ts >= TIMESTAMPTZ '%s' AND ts <= TIMESTAMPTZ '%s'"
+      "    HAVING MAX(ts) IS NOT NULL"
+      "       AND MAX(ts) < TIMESTAMPTZ '%s'"
+      "    UNION ALL"
+      "    SELECT prev_ts AS first_ts, ts AS last_ts"
+      "      FROM ("
+      "        SELECT ts, LAG(ts) OVER (ORDER BY ts) AS prev_ts"
+      "          FROM %s"
+      "         WHERE ts >= TIMESTAMPTZ '%s' AND ts <= TIMESTAMPTZ '%s'"
+      "      ) lag_q"
+      "     WHERE prev_ts IS NOT NULL"
+      "       AND ts - prev_ts > make_interval(secs => %" PRId32 ")"
+      "  ) gaps"
+      " ORDER BY first_ts ASC",
+      e_start, e_end, table, e_start, e_end, e_end, e_start,
+      e_end, table, e_start, e_end, e_end,
+      table, e_start, e_end, gran_secs);
+
+  if(n < 0 || (size_t)n >= sizeof(sql))
+    goto out;
+
+  res = db_result_alloc();
+
+  if(res == NULL)
+    goto out;
+
+  if(db_query(sql, res) != SUCCESS || !res->ok)
+  {
+    clam(CLAM_WARN, WM_DL_CTX,
+        "row-gap query failed (market=%" PRId32
+        " gran=%" PRId32 "): %s",
+        market_id, gran_secs,
+        res->error[0] != '\0' ? res->error : "(no driver error)");
+    goto out;
+  }
+
+  for(uint32_t i = 0; i < res->rows && emitted < max_out; i++)
+  {
+    const char    *rs = db_result_get(res, i, 0);
+    const char    *re = db_result_get(res, i, 1);
+    wm_coverage_t *g;
+
+    if(rs == NULL || re == NULL)
+      continue;
+
+    g = &out[emitted++];
+
+    memset(g, 0, sizeof(*g));
+    g->market_id   = market_id;
+    g->granularity = gran_secs;
+    snprintf(g->first_ts, WM_COV_TS_SZ, "%s", rs);
+    snprintf(g->last_ts,  WM_COV_TS_SZ, "%s", re);
+  }
 
 out:
   if(res     != NULL) db_result_free(res);

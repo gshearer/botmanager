@@ -158,7 +158,7 @@ wm_backtest_preflight_gap(int32_t market_id_db,
 
     snprintf(err, err_cap,
         "missing 1m coverage in %s..%s; run"
-        " /whenmoon download candles <market_id> %s %s",
+        " /whenmoon download <market_id> %s %s",
         gap.first_ts, gap.last_ts, start_date, end_date);
   }
 
@@ -346,7 +346,7 @@ wm_backtest_snapshot_build(int32_t market_id_db,
     if(err != NULL)
       snprintf(err, err_cap,
           "no 1m candles in %s..%s; run"
-          " /whenmoon download candles ... first",
+          " /whenmoon download <market> first",
           range_start, range_end);
     goto fail;
   }

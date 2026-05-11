@@ -716,15 +716,14 @@ wm_dl_job_enqueue(whenmoon_state_t *st,
 
   pthread_mutex_unlock(&t->lock);
 
-  // Candles pre-flight: clamp future newest_ts to now (logged once per
-  // enqueue), default missing newest_ts to now, and short-circuit if
-  // coverage is already complete. Gran is authoritative for the gap
-  // lookup; cursor_end_ts starts at newest_effective.
+  // Candles pre-flight: clamp future newest_ts to now (logged once
+  // per enqueue) and default a missing newest_ts to now. The caller
+  // has already done row-level gap detection via
+  // wm_gap_find_row_gaps and is asking for this specific window —
+  // no second-guessing here.
   {
-    time_t          now = time(NULL);
-    struct tm       tm;
-    uint32_t        n_gaps;
-    wm_coverage_t   gaps_buf[4];
+    time_t    now = time(NULL);
+    struct tm tm;
 
     if(gmtime_r(&now, &tm) == NULL)
     {
@@ -746,18 +745,6 @@ wm_dl_job_enqueue(whenmoon_state_t *st,
       else
         snprintf(newest_effective, sizeof(newest_effective),
             "%s", newest_ts);
-    }
-
-    n_gaps = wm_coverage_gaps_candles(market_id, granularity,
-        (oldest_ts != NULL && oldest_ts[0] != '\0')
-            ? oldest_ts : "1970-01-01 00:00:00+00",
-        newest_effective, gaps_buf,
-        (uint32_t)(sizeof(gaps_buf) / sizeof(gaps_buf[0])));
-
-    if(n_gaps == 0)
-    {
-      snprintf(err, err_cap, "coverage complete, nothing to fetch");
-      return(FAIL);
     }
 
     newest_for_insert = newest_effective;

@@ -314,7 +314,7 @@ void wm_market_destroy(struct whenmoon_state *st);
 // History coverage for trading is the strategy layer's responsibility
 // (WM-LT-3) — this function does NOT enqueue any catch-up download.
 // Operators who need a deeper history can drive the
-// `/whenmoon download candles …` verbs explicitly.
+// `/whenmoon download <market> [start] [end]` verb explicitly.
 //
 // Dedup: silently returns SUCCESS if the product is already in the
 // running set. FAIL on DB/alloc errors; writes a terse diagnostic

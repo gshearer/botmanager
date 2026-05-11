@@ -1234,8 +1234,8 @@ wm_backtest_register_verbs(void)
         "--walk-forward and --oos-tail are mutually exclusive.\n"
         "Every iteration is persisted to wm_backtest_run; --top only"
         " controls render volume. Pre-flight gap check fails fast with"
-        " the canonical /whenmoon download candles invocation when 1m"
-        " coverage has gaps.",
+        " the canonical /whenmoon download <market> invocation when"
+        " 1m coverage has gaps.",
         USERNS_GROUP_ADMIN, 100, CMD_SCOPE_ANY, METHOD_T_ANY,
         wm_bt_cmd_run, NULL, "whenmoon/backtest", NULL,
         NULL, 0, NULL, NULL) != SUCCESS)

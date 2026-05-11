@@ -52,5 +52,23 @@ uint32_t wm_coverage_gaps_candles(int32_t market_id, int32_t gran_secs,
     const char *range_start, const char *range_end,
     wm_coverage_t *out, uint32_t max_out);
 
+// Row-level gap walker over `wm_candles_<market_id>_<gran_secs>`.
+// Returns the windows where minute-bars are actually missing from the
+// table in `[range_start, range_end]`: a backward gap if the table's
+// MIN(ts) > range_start, a forward gap if MAX(ts) < range_end, and
+// one entry per internal LAG-detected gap. Sorted ascending.
+//
+// Distinct from wm_coverage_gaps_candles: that helper asks "which
+// windows have we never attempted" (coverage-store level); this one
+// asks "which rows are missing right now" (table level). The two can
+// disagree when an attempted window came back with partial data.
+//
+// `out` is caller-allocated, capacity `max_out`; returns count
+// written. Truncates silently at max_out (caller should bump cap and
+// re-run if it cares about completeness).
+uint32_t wm_gap_find_row_gaps(int32_t market_id, int32_t gran_secs,
+    const char *range_start, const char *range_end,
+    wm_coverage_t *out, uint32_t max_out);
+
 #endif // WHENMOON_INTERNAL
 #endif // BM_WHENMOON_DL_COVERAGE_H

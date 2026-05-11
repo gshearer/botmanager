@@ -45,7 +45,13 @@
 #endif
 
 #define WM_DL_PAGE_RETRY_MAX      5
-#define WM_DL_JOBS_MAX           32
+// Bumped from 32 (2026-05-11) when /whenmoon download grew row-level
+// gap detection: a market with several years of history can have
+// hundreds of small gaps that we want enqueued in one shot. 4096 *
+// ~500 bytes ≈ 2 MiB worst-case footprint, which is fine; supervisor
+// + kick walks are O(N) over the in-memory list but each iteration
+// is microseconds.
+#define WM_DL_JOBS_MAX         4096
 
 typedef enum
 {

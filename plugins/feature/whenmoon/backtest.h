@@ -167,7 +167,7 @@ typedef struct wm_backtest_result
 // Pre-flight gap check. SUCCESS when [range_start, range_end] is fully
 // covered by 1m candles for `market_id_db`; FAIL with `err` populated
 // otherwise. `err` (when non-NULL) carries a human-readable summary
-// including the exact /whenmoon download candles invocation that
+// including the exact /whenmoon download <market> invocation that
 // fixes the gap. Returns SUCCESS even when no rows exist if the
 // coverage tracker has no missing intervals — the warmup path will
 // catch the empty case downstream.

@@ -609,7 +609,7 @@ wm_market_register_verbs(void)
         "Start a market: WS subscribe, live-ring backfill (300 rows of"
         " 1m candles via REST), and persist (wm_market.enabled=true)"
         " so it survives daemon restarts. History catch-up is not"
-        " automatic — drive `/whenmoon download candles ...` for a"
+        " automatic — drive `/whenmoon download <market>` for a"
         " deeper history.",
         NULL,
         USERNS_GROUP_ADMIN, 100, CMD_SCOPE_ANY, METHOD_T_ANY,

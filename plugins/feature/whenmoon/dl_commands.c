@@ -9,9 +9,11 @@
 #include "dl_jobtable.h"
 #include "dl_schema.h"
 #include "dl_candles.h"
+#include "dl_coverage.h"
 
 #include "exchange_api.h"
 
+#include "alloc.h"
 #include "cmd.h"
 #include "colors.h"
 #include "common.h"
@@ -23,6 +25,13 @@
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
+
+// Soft cap on how many row-level gap windows we resolve into jobs
+// per invocation. Tunes the operator-visible behaviour when a market
+// has many gaps: the helper returns at most this many, and the caller
+// reports the truncation. Re-running the command after the first
+// batch completes picks up the rest.
+#define WM_DL_GAPS_FANOUT_CAP   1024
 
 // ------------------------------------------------------------------ //
 // Small helpers                                                       //
@@ -118,57 +127,95 @@ wm_dl_parse_date(const char *in, char *out, size_t cap)
 // Handlers                                                            //
 // ------------------------------------------------------------------ //
 
+// Enqueue one DL_JOB_CANDLES per gap window. The job_enqueue path no
+// longer pre-filters against the coverage store, so we honour the
+// gap list exactly as wm_gap_find_row_gaps returned it.
 static void
-wm_dl_cmd_download_candles(const cmd_ctx_t *ctx)
+wm_dl_cmd_download_enqueue_gaps(const cmd_ctx_t *ctx,
+    whenmoon_state_t *st,
+    const char *exch, const char *symbol, int32_t market_id,
+    const wm_coverage_t *gaps, uint32_t n_gaps)
 {
-  whenmoon_state_t *st;
-  const char       *p;
-  char              pair[64]      = {0};
-  char              old_tok[32]   = {0};
-  char              new_tok[32]   = {0};
-  char              gran_tok[16]  = {0};
-  char              exch[32]      = {0};
-  char              base[16]      = {0};
-  char              quote[16]     = {0};
-  char              symbol[32]    = {0};
-  char              oldest_ts[40] = {0};
-  char              newest_ts[40] = {0};
-  char              reply[256];
-  char              err[128];
-  int32_t           market_id;
-  int32_t           gran   = WM_DL_CANDLE_GRAN_S5;
-  int64_t           job_id = 0;
+  char     reply[256];
+  char     err[128];
+  uint32_t i;
+  uint32_t enqueued = 0;
+  uint32_t failed   = 0;
+  int64_t  job_id;
 
-  st = whenmoon_get_state();
-
-  if(st == NULL || !st->dl_ready || st->downloader == NULL)
+  for(i = 0; i < n_gaps; i++)
   {
-    cmd_reply(ctx, "whenmoon: downloader not ready");
-    return;
+    err[0] = '\0';
+    job_id = 0;
+
+    if(wm_dl_job_enqueue(st, DL_JOB_CANDLES, market_id,
+           WM_DL_CANDLE_GRAN_S5, EXCHANGE_PRIO_USER_DOWNLOAD,
+           exch, symbol,
+           gaps[i].first_ts, gaps[i].last_ts,
+           ctx->username != NULL ? ctx->username : "",
+           &job_id, err, sizeof(err)) != SUCCESS)
+    {
+      snprintf(reply, sizeof(reply),
+          "gap %u/%u [%s,%s] enqueue failed: %s",
+          i + 1, n_gaps, gaps[i].first_ts, gaps[i].last_ts,
+          err[0] != '\0' ? err : "unknown");
+      cmd_reply(ctx, reply);
+      failed++;
+      continue;
+    }
+
+    enqueued++;
   }
 
-  p = ctx->args != NULL ? ctx->args : "";
+  snprintf(reply, sizeof(reply),
+      "%s: %u/%u gap%s queued%s",
+      symbol, enqueued, n_gaps, n_gaps == 1 ? "" : "s",
+      failed > 0 ? " (some failed — see above)" : "");
+  cmd_reply(ctx, reply);
+}
 
-  if(!wm_dl_next_token(&p, pair, sizeof(pair)))
-  {
-    cmd_reply(ctx,
-        "usage: /whenmoon download candles <exch>-<base>-<quote>"
-        " [MM/dd/yyyy [MM/dd/yyyy [gran_secs]]]"
-        " — omit dates to walk back until the exchange runs out");
-    return;
-  }
+// /whenmoon download <market> [MM/dd/yyyy [MM/dd/yyyy]]
+//
+// Idempotent: scans `wm_candles_<market_id>_60` for row-level gaps in
+// the requested window (default = epoch to now, since dl_candles'
+// empty-page termination keeps a too-old start from causing extra
+// work) and fires one DL_JOB_CANDLES per gap. Run as many times as
+// you like — each invocation just refetches whatever's still
+// missing. Anything that persists across runs is genuinely absent
+// from the exchange.
+static void
+wm_dl_cmd_download_market(const cmd_ctx_t *ctx, whenmoon_state_t *st,
+    const char *market_tok, const char *rest)
+{
+  const char    *p;
+  char           old_tok[32]    = {0};
+  char           new_tok[32]    = {0};
+  char           exch[32]       = {0};
+  char           base[16]       = {0};
+  char           quote[16]      = {0};
+  char           symbol[32]     = {0};
+  char           oldest_ts[40]  = {0};
+  char           newest_ts[40]  = {0};
+  char           range_start[40];
+  char           range_end[40];
+  char           reply[256];
+  int32_t        market_id;
+  wm_coverage_t *gaps           = NULL;
+  uint32_t       n_gaps;
+  time_t         now;
+  struct tm      tm;
 
-  (void)wm_dl_next_token(&p, old_tok, sizeof(old_tok));
-  (void)wm_dl_next_token(&p, new_tok, sizeof(new_tok));
-  (void)wm_dl_next_token(&p, gran_tok, sizeof(gran_tok));
-
-  if(wm_dl_parse_market_id(pair, exch, sizeof(exch),
+  if(wm_dl_parse_market_id(market_tok, exch, sizeof(exch),
          base, sizeof(base), quote, sizeof(quote),
          symbol, sizeof(symbol)) != SUCCESS)
   {
     cmd_reply(ctx, "bad market id (expected <exch>-<base>-<quote>)");
     return;
   }
+
+  p = rest != NULL ? rest : "";
+  (void)wm_dl_next_token(&p, old_tok, sizeof(old_tok));
+  (void)wm_dl_next_token(&p, new_tok, sizeof(new_tok));
 
   if(old_tok[0] != '\0' &&
      wm_dl_parse_date(old_tok, oldest_ts, sizeof(oldest_ts)) != SUCCESS)
@@ -191,22 +238,6 @@ wm_dl_cmd_download_candles(const cmd_ctx_t *ctx)
     return;
   }
 
-  if(gran_tok[0] != '\0')
-  {
-    int64_t gran_parsed = (int64_t)strtoll(gran_tok, NULL, 10);
-
-    if(gran_parsed <= 0 || gran_parsed > INT32_MAX ||
-       !wm_dl_granularity_valid((int32_t)gran_parsed))
-    {
-      cmd_reply(ctx,
-          "invalid gran_secs;"
-          " must be 60, 300, 900, 3600, 21600, or 86400");
-      return;
-    }
-
-    gran = (int32_t)gran_parsed;
-  }
-
   market_id = wm_market_lookup_or_create(exch, base, quote, symbol);
 
   if(market_id < 0)
@@ -215,51 +246,79 @@ wm_dl_cmd_download_candles(const cmd_ctx_t *ctx)
     return;
   }
 
-  if(wm_dl_job_enqueue(st, DL_JOB_CANDLES, market_id,
-         gran,
-         EXCHANGE_PRIO_USER_DOWNLOAD,
-         exch, symbol,
-         oldest_ts[0] != '\0' ? oldest_ts : NULL,
-         newest_ts[0] != '\0' ? newest_ts : NULL,
-         ctx->username != NULL ? ctx->username : "",
-         &job_id, err, sizeof(err)) != SUCCESS)
-  {
-    char buf[192];
+  if(oldest_ts[0] != '\0')
+    snprintf(range_start, sizeof(range_start), "%s", oldest_ts);
+  else
+    snprintf(range_start, sizeof(range_start),
+        "1970-01-01 00:00:00+00");
 
-    snprintf(buf, sizeof(buf), "enqueue failed: %s",
-        err[0] != '\0' ? err : "unknown");
-    cmd_reply(ctx, buf);
+  if(newest_ts[0] != '\0')
+    snprintf(range_end, sizeof(range_end), "%s", newest_ts);
+  else
+  {
+    now = time(NULL);
+
+    if(gmtime_r(&now, &tm) == NULL)
+    {
+      cmd_reply(ctx, "gmtime_r failed");
+      return;
+    }
+
+    snprintf(range_end, sizeof(range_end),
+        "%04d-%02d-%02d %02d:%02d:%02d+00",
+        tm.tm_year + 1900, tm.tm_mon + 1, tm.tm_mday,
+        tm.tm_hour, tm.tm_min, tm.tm_sec);
+  }
+
+  gaps = mem_alloc(WM_DL_CTX, "gaps",
+      (size_t)WM_DL_GAPS_FANOUT_CAP * sizeof(*gaps));
+
+  if(gaps == NULL)
+  {
+    cmd_reply(ctx, "out of memory");
     return;
   }
 
+  n_gaps = wm_gap_find_row_gaps(market_id, WM_DL_CANDLE_GRAN_S5,
+      range_start, range_end, gaps, WM_DL_GAPS_FANOUT_CAP);
+
+  if(n_gaps == 0)
+  {
+    snprintf(reply, sizeof(reply),
+        "%s: no gaps in [%s, %s]", symbol, range_start, range_end);
+    cmd_reply(ctx, reply);
+    mem_free(gaps);
+    return;
+  }
+
+  if(n_gaps == WM_DL_GAPS_FANOUT_CAP)
+    cmd_reply(ctx,
+        "gap list truncated at fanout cap;"
+        " re-run after these jobs complete to pick up the rest");
+
   snprintf(reply, sizeof(reply),
-      "candles job %" PRId64 " queued (%s gran=%" PRId32
-      " oldest=%s newest=%s)",
-      job_id, symbol, gran,
-      oldest_ts[0] != '\0' ? oldest_ts : "epoch",
-      newest_ts[0] != '\0' ? newest_ts : "now");
+      "%s: %u gap%s in [%s, %s]; enqueueing fetch jobs",
+      symbol, n_gaps, n_gaps == 1 ? "" : "s",
+      range_start, range_end);
   cmd_reply(ctx, reply);
+
+  wm_dl_cmd_download_enqueue_gaps(ctx, st, exch, symbol, market_id,
+      gaps, n_gaps);
+
+  mem_free(gaps);
 }
 
 static void
-wm_dl_cmd_download_cancel(const cmd_ctx_t *ctx)
+wm_dl_cmd_download_cancel(const cmd_ctx_t *ctx, whenmoon_state_t *st,
+    const char *rest)
 {
-  whenmoon_state_t *st;
-  const char       *p;
-  char              tok[32] = {0};
-  char              reply[96];
-  char              err[128];
-  int64_t           job_id;
+  const char *p;
+  char        tok[32] = {0};
+  char        reply[96];
+  char        err[128];
+  int64_t     job_id;
 
-  st = whenmoon_get_state();
-
-  if(st == NULL || st->downloader == NULL)
-  {
-    cmd_reply(ctx, "whenmoon: downloader not ready");
-    return;
-  }
-
-  p = ctx->args != NULL ? ctx->args : "";
+  p = rest != NULL ? rest : "";
 
   if(!wm_dl_next_token(&p, tok, sizeof(tok)))
   {
@@ -287,6 +346,41 @@ wm_dl_cmd_download_cancel(const cmd_ctx_t *ctx)
 
   snprintf(reply, sizeof(reply), "job %" PRId64 " cancelled", job_id);
   cmd_reply(ctx, reply);
+}
+
+static void
+wm_dl_cmd_download(const cmd_ctx_t *ctx)
+{
+  whenmoon_state_t *st;
+  const char       *p;
+  char              first_tok[64] = {0};
+
+  st = whenmoon_get_state();
+
+  if(st == NULL || !st->dl_ready || st->downloader == NULL)
+  {
+    cmd_reply(ctx, "whenmoon: downloader not ready");
+    return;
+  }
+
+  p = ctx->args != NULL ? ctx->args : "";
+
+  if(!wm_dl_next_token(&p, first_tok, sizeof(first_tok)))
+  {
+    cmd_reply(ctx,
+        "usage: /whenmoon download <exch>-<base>-<quote>"
+        " [MM/dd/yyyy [MM/dd/yyyy]]"
+        " | /whenmoon download cancel <job_id>");
+    return;
+  }
+
+  if(strcmp(first_tok, "cancel") == 0)
+  {
+    wm_dl_cmd_download_cancel(ctx, st, p);
+    return;
+  }
+
+  wm_dl_cmd_download_market(ctx, st, first_tok, p);
 }
 
 // ------------------------------------------------------------------ //
@@ -489,13 +583,6 @@ wm_dl_cmd_show_download_candles(const cmd_ctx_t *ctx)
 // ------------------------------------------------------------------ //
 
 static void
-wm_dl_parent_download(const cmd_ctx_t *ctx)
-{
-  cmd_reply(ctx,
-      "usage: /whenmoon download <candles|cancel> ...");
-}
-
-static void
 wm_dl_parent_show_download(const cmd_ctx_t *ctx)
 {
   cmd_reply(ctx,
@@ -509,35 +596,18 @@ wm_dl_parent_show_download(const cmd_ctx_t *ctx)
 bool
 wm_dl_register_verbs(void)
 {
-  // /whenmoon download parent.
+  // /whenmoon download <market> [start] [end]    — gap-fill enqueue
+  // /whenmoon download cancel <job_id>           — cancel job
   if(cmd_register("whenmoon", "download",
-        "whenmoon download <verb> ...",
-        "Candle history download controls.",
+        "whenmoon download <exch>-<base>-<quote>"
+        " [MM/dd/yyyy [MM/dd/yyyy]] | cancel <job_id>",
+        "Idempotent candle backfill: scans wm_candles_<id>_60 for"
+        " row-level gaps in the requested window (default = epoch to"
+        " now) and fires one fetch job per gap. Re-run as needed;"
+        " each invocation only refetches what's still missing.",
         NULL,
         USERNS_GROUP_ADMIN, 100, CMD_SCOPE_ANY, METHOD_T_ANY,
-        wm_dl_parent_download, NULL, "whenmoon", NULL,
-        NULL, 0, NULL, NULL) != SUCCESS)
-    return(FAIL);
-
-  if(cmd_register("whenmoon", "candles",
-        "whenmoon download candles <exch>-<base>-<quote>"
-        " [MM/dd/yyyy [MM/dd/yyyy [gran_secs]]]",
-        "Enqueue a candle backfill job. Optional gran_secs is one of"
-        " 60 (1m, default), 300 (5m), 900 (15m), 3600 (1h),"
-        " 21600 (6h), 86400 (1d). Omit dates to walk back until the"
-        " exchange runs out of history.",
-        NULL,
-        USERNS_GROUP_ADMIN, 100, CMD_SCOPE_ANY, METHOD_T_ANY,
-        wm_dl_cmd_download_candles, NULL, "whenmoon/download", NULL,
-        NULL, 0, NULL, NULL) != SUCCESS)
-    return(FAIL);
-
-  if(cmd_register("whenmoon", "cancel",
-        "whenmoon download cancel <job_id>",
-        "Cancel a running or queued download job.",
-        NULL,
-        USERNS_GROUP_ADMIN, 100, CMD_SCOPE_ANY, METHOD_T_ANY,
-        wm_dl_cmd_download_cancel, NULL, "whenmoon/download", NULL,
+        wm_dl_cmd_download, NULL, "whenmoon", NULL,
         NULL, 0, NULL, NULL) != SUCCESS)
     return(FAIL);
 
