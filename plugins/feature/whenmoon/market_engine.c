@@ -192,6 +192,211 @@ wm_mk_roll_daily_anchor_locked(wm_market_stats_t *st, int64_t ts_ms)
 }
 
 // ------------------------------------------------------------------ //
+// WM-MK-6: risk-adjusted metric helpers                              //
+// ------------------------------------------------------------------ //
+//
+// Sharpe + Sortino walk the shared session equity-samples ring,
+// oldest→newest, and compute simple per-step returns:
+//   r[i] = (eq[i] - eq[i-1]) / eq[i-1]
+// Sharpe   = mean(r) / stddev(r)        (population variance)
+// Sortino  = mean(r) / downside_dev(r)  (sqrt of mean of negative-r²)
+// Both are per-trade / per-fill values — unannualized, matching the
+// legacy wm_pnl_acc_t. Fewer than two samples (zero returns) yield
+// 0.0 so sweep scoring sorts no-trade iterations to the bottom.
+
+static uint32_t
+wm_mk_equity_walk_count(uint64_t total_n)
+{
+  if(total_n > (uint64_t)WM_MARKET_EQUITY_RING_CAP)
+    return(WM_MARKET_EQUITY_RING_CAP);
+
+  return((uint32_t)total_n);
+}
+
+static uint32_t
+wm_mk_equity_first_index(uint64_t total_n, uint32_t head)
+{
+  // Ring not yet wrapped — oldest is at slot 0.
+  if(total_n <= (uint64_t)WM_MARKET_EQUITY_RING_CAP)
+    return(0u);
+
+  // Wrapped — `head` indexes the next write slot, which is also the
+  // oldest live sample after the wrap point.
+  return(head);
+}
+
+double
+wm_market_stats_sharpe(const wm_market_stats_t *st,
+    const wm_market_equity_sample_t *ring, uint64_t total_n,
+    uint32_t head)
+{
+  uint32_t n;
+  uint32_t i;
+  uint32_t first;
+  uint32_t prev_idx;
+  uint32_t curr_idx;
+  uint32_t n_returns;
+  double   prev_eq;
+  double   curr_eq;
+  double   r;
+  double   sum;
+  double   sum_sq;
+  double   mean;
+  double   variance;
+  double   stddev;
+
+  (void)st;
+
+  if(ring == NULL || total_n < 2)
+    return(0.0);
+
+  n = wm_mk_equity_walk_count(total_n);
+
+  if(n < 2)
+    return(0.0);
+
+  first      = wm_mk_equity_first_index(total_n, head);
+  prev_idx   = first;
+  prev_eq    = ring[prev_idx].equity;
+  sum        = 0.0;
+  sum_sq     = 0.0;
+  n_returns  = 0;
+
+  for(i = 1; i < n; i++)
+  {
+    curr_idx = (first + i) % WM_MARKET_EQUITY_RING_CAP;
+    curr_eq  = ring[curr_idx].equity;
+
+    if(prev_eq <= 0.0)
+    {
+      prev_idx = curr_idx;
+      prev_eq  = curr_eq;
+      continue;
+    }
+
+    r = (curr_eq - prev_eq) / prev_eq;
+
+    sum    += r;
+    sum_sq += r * r;
+    n_returns++;
+
+    prev_idx = curr_idx;
+    prev_eq  = curr_eq;
+  }
+
+  if(n_returns < 2)
+    return(0.0);
+
+  mean     = sum / (double)n_returns;
+  variance = (sum_sq / (double)n_returns) - mean * mean;
+
+  if(variance <= 0.0)
+    return(0.0);
+
+  stddev = sqrt(variance);
+
+  if(stddev <= 0.0 || !isfinite(stddev))
+    return(0.0);
+
+  return(mean / stddev);
+}
+
+double
+wm_market_stats_sortino(const wm_market_stats_t *st,
+    const wm_market_equity_sample_t *ring, uint64_t total_n,
+    uint32_t head)
+{
+  uint32_t n;
+  uint32_t i;
+  uint32_t first;
+  uint32_t prev_idx;
+  uint32_t curr_idx;
+  uint32_t n_returns;
+  double   prev_eq;
+  double   curr_eq;
+  double   r;
+  double   sum;
+  double   sum_down_sq;
+  double   mean;
+  double   downside_variance;
+  double   downside_dev;
+
+  (void)st;
+
+  if(ring == NULL || total_n < 2)
+    return(0.0);
+
+  n = wm_mk_equity_walk_count(total_n);
+
+  if(n < 2)
+    return(0.0);
+
+  first       = wm_mk_equity_first_index(total_n, head);
+  prev_idx    = first;
+  prev_eq     = ring[prev_idx].equity;
+  sum         = 0.0;
+  sum_down_sq = 0.0;
+  n_returns   = 0;
+
+  for(i = 1; i < n; i++)
+  {
+    curr_idx = (first + i) % WM_MARKET_EQUITY_RING_CAP;
+    curr_eq  = ring[curr_idx].equity;
+
+    if(prev_eq <= 0.0)
+    {
+      prev_idx = curr_idx;
+      prev_eq  = curr_eq;
+      continue;
+    }
+
+    r = (curr_eq - prev_eq) / prev_eq;
+
+    sum += r;
+
+    if(r < 0.0)
+      sum_down_sq += r * r;
+
+    n_returns++;
+
+    prev_idx = curr_idx;
+    prev_eq  = curr_eq;
+  }
+
+  if(n_returns < 2)
+    return(0.0);
+
+  mean              = sum / (double)n_returns;
+  downside_variance = sum_down_sq / (double)n_returns;
+
+  if(downside_variance <= 0.0)
+    return(0.0);
+
+  downside_dev = sqrt(downside_variance);
+
+  if(downside_dev <= 0.0 || !isfinite(downside_dev))
+    return(0.0);
+
+  return(mean / downside_dev);
+}
+
+double
+wm_market_stats_profit_factor(const wm_market_stats_t *st)
+{
+  double pf;
+
+  if(st == NULL || st->gross_loss <= 0.0)
+    return(0.0);
+
+  pf = st->gross_profit / st->gross_loss;
+
+  if(!isfinite(pf) || pf < 0.0)
+    return(0.0);
+
+  return(pf);
+}
+
+// ------------------------------------------------------------------ //
 // Fill engine                                                        //
 // ------------------------------------------------------------------ //
 
@@ -313,6 +518,23 @@ wm_market_apply_fill_locked(whenmoon_market_t *mk, wm_market_mode_t mode,
   {
     st->realized_pnl_lifetime += realized;
     st->realized_pnl_today    += realized;
+
+    // WM-MK-6: per-mode trade outcome accounting. Only closing fills
+    // count toward n_trades / wins / losses + gross profit/loss — the
+    // legacy wm_pnl_acc_t did the same. Zero-realized closes
+    // (rounding edge) land in neither bucket but still bump n_trades.
+    st->n_trades++;
+
+    if(realized > 0.0)
+    {
+      st->n_wins++;
+      st->gross_profit += realized;
+    }
+    else if(realized < 0.0)
+    {
+      st->n_losses++;
+      st->gross_loss += -realized;
+    }
   }
 
   st->lifetime_fills_count++;
@@ -346,6 +568,34 @@ wm_market_apply_fill_locked(whenmoon_market_t *mk, wm_market_mode_t mode,
   // Update the cached mark — exec_px is the freshest price-of-record.
   s->last_mark_px = exec_px;
   s->last_mark_ms = ts_ms;
+
+  // WM-MK-6: post-fill equity = cash[mode] + position-at-mark. Drives
+  // the per-mode drawdown tracker AND feeds the shared session
+  // equity-samples ring used by Sharpe/Sortino. Ring is shared across
+  // modes (single mode in backtest; live markets that switch modes
+  // accept the mixed-stream simplification per WM-MK-6 scope).
+  {
+    double equity;
+    double drawdown;
+
+    equity = st->cash + position_after * exec_px;
+
+    if(equity > st->equity_peak)
+      st->equity_peak = equity;
+
+    if(st->equity_peak > 0.0)
+    {
+      drawdown = (st->equity_peak - equity) / st->equity_peak;
+
+      if(drawdown > st->max_drawdown)
+        st->max_drawdown = drawdown;
+    }
+
+    s->equity_samples[s->equity_head].ts_ms  = ts_ms;
+    s->equity_samples[s->equity_head].equity = equity;
+    s->equity_head = (s->equity_head + 1u) % WM_MARKET_EQUITY_RING_CAP;
+    s->equity_n++;
+  }
 
   clam(CLAM_INFO, WHENMOON_CTX,
       "market %s [%s] fill: %c qty=%.10g px=%.10g fee=%.6g"

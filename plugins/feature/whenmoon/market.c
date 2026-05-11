@@ -380,6 +380,14 @@ wm_market_session_snapshot(whenmoon_market_t *mk,
   out->daily_loss_bps = s->daily_loss_bps;
   out->pending_cap    = s->pending_cap;
 
+  // WM-MK-6: pre-compute risk-adjusted metrics under the lock so
+  // off-lock renderers + sweep scoring read scalars instead of
+  // re-walking the equity ring (which lives behind `mk->lock`).
+  out->sharpe  = wm_market_stats_sharpe(NULL,
+      s->equity_samples, s->equity_n, s->equity_head);
+  out->sortino = wm_market_stats_sortino(NULL,
+      s->equity_samples, s->equity_n, s->equity_head);
+
   pthread_mutex_unlock(&mk->lock);
 
   return(SUCCESS);

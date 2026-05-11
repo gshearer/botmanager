@@ -25,6 +25,24 @@
 #include <stdbool.h>
 #include <stdint.h>
 
+// WM-MK-6: risk-adjusted metric helpers. Computed from the shared
+// session equity-samples ring + per-mode stats counters. The Sharpe /
+// Sortino helpers walk the ring oldest→newest, compute simple returns
+// r[i] = (eq[i] - eq[i-1]) / eq[i-1], and return the per-trade ratio
+// (unannualized — the legacy wm_pnl_acc_t was per-trade too). Less
+// than two returns yields 0.0. Profit factor is gross_profit /
+// gross_loss; with no losses we return 0.0 (NOSCORE-friendly) so
+// sweep scoring sorts these to the bottom rather than reporting +inf.
+double wm_market_stats_sharpe(const wm_market_stats_t *st,
+    const wm_market_equity_sample_t *ring, uint64_t total_n,
+    uint32_t head);
+
+double wm_market_stats_sortino(const wm_market_stats_t *st,
+    const wm_market_equity_sample_t *ring, uint64_t total_n,
+    uint32_t head);
+
+double wm_market_stats_profit_factor(const wm_market_stats_t *st);
+
 // Apply a fill to the market session under `mk->lock`. Updates
 // position (open/extend/close — long-only in WM-MK-2), updates
 // stats[mode], appends to fills[mode], records the equity sample, and

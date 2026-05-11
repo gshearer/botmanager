@@ -362,6 +362,25 @@ wm_mp_json_one_stats(wm_mp_buf_t *out, const wm_market_stats_t *st)
   wm_mp_buf_printf(out, "%" PRIu64, st->lifetime_fills_count);
   wm_mp_buf_puts(out, ",\"last_fill_ms\":");
   wm_mp_buf_printf(out, "%" PRId64, st->last_fill_ms);
+  // WM-MK-6: round-trip + risk counters. Restored on next plugin start
+  // so live markets carry forward their P&L profile; the equity-samples
+  // ring itself is intentionally NOT persisted (per-iteration synth
+  // markets carry their own ring; live markets begin a fresh window
+  // after restart, which Sharpe/Sortino computes from there).
+  wm_mp_buf_puts(out, ",\"n_trades\":");
+  wm_mp_buf_printf(out, "%u", st->n_trades);
+  wm_mp_buf_puts(out, ",\"n_wins\":");
+  wm_mp_buf_printf(out, "%u", st->n_wins);
+  wm_mp_buf_puts(out, ",\"n_losses\":");
+  wm_mp_buf_printf(out, "%u", st->n_losses);
+  wm_mp_buf_puts(out, ",\"gross_profit\":");
+  wm_mp_buf_printf(out, "%.10g", st->gross_profit);
+  wm_mp_buf_puts(out, ",\"gross_loss\":");
+  wm_mp_buf_printf(out, "%.10g", st->gross_loss);
+  wm_mp_buf_puts(out, ",\"max_drawdown\":");
+  wm_mp_buf_printf(out, "%.10g", st->max_drawdown);
+  wm_mp_buf_puts(out, ",\"equity_peak\":");
+  wm_mp_buf_printf(out, "%.10g", st->equity_peak);
   wm_mp_buf_putc(out, '}');
 }
 
@@ -839,6 +858,16 @@ wm_mp_load_stats(struct json_object *obj, wm_market_stats_t *out)
   out->lifetime_fills_count  = (uint64_t)wm_mp_jint64(obj,
       "lifetime_fills_count", 0);
   out->last_fill_ms          = wm_mp_jint64 (obj, "last_fill_ms",          0);
+  // WM-MK-6: round-trip + risk counters. Missing keys default to 0
+  // so a pre-WM-MK-6 row restores as a clean slate (counters rebuild
+  // as new closing fills land).
+  out->n_trades              = (uint32_t)wm_mp_jint64(obj, "n_trades", 0);
+  out->n_wins                = (uint32_t)wm_mp_jint64(obj, "n_wins",   0);
+  out->n_losses              = (uint32_t)wm_mp_jint64(obj, "n_losses", 0);
+  out->gross_profit          = wm_mp_jdouble(obj, "gross_profit", 0.0);
+  out->gross_loss            = wm_mp_jdouble(obj, "gross_loss",   0.0);
+  out->max_drawdown          = wm_mp_jdouble(obj, "max_drawdown", 0.0);
+  out->equity_peak           = wm_mp_jdouble(obj, "equity_peak",  0.0);
 }
 
 static void

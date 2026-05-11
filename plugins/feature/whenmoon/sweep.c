@@ -28,6 +28,7 @@
 
 #include "backtest.h"
 #include "market.h"
+#include "market_engine.h"
 #include "strategy.h"
 #include "whenmoon.h"
 #include "whenmoon_strategy.h"
@@ -132,15 +133,36 @@ wm_bt_sweep_score_value(const wm_market_session_snapshot_t *snap,
       v              = equity;
       break;
 
-    // Sharpe / Sortino / profit-factor were derived by the legacy
-    // PnL accumulator on closing fills. The per-market session does
-    // not carry the returns ring or gross-profit / gross-loss
-    // split, so these selectors collapse to NOSCORE and sort to
-    // the bottom rather than emit a misleading zero.
+    // WM-MK-6 restores Sharpe / Sortino / PF on top of the per-market
+    // session: snapshot carries pre-computed Sharpe + Sortino from the
+    // shared equity-samples ring; PF derives from the per-mode stats
+    // (gross_profit / gross_loss). Each helper returns 0.0 on degenerate
+    // input (fewer than two returns, zero variance, no losses); we map
+    // that to NOSCORE so zero-trade iterations sort to the bottom
+    // alongside REALIZED's natural-zero handling below.
     case WM_BT_SCORE_SHARPE:
+      v = snap->sharpe;
+
+      if(v == 0.0)
+        return(WM_BT_RESULT_NOSCORE);
+
+      break;
+
     case WM_BT_SCORE_SORTINO:
+      v = snap->sortino;
+
+      if(v == 0.0)
+        return(WM_BT_RESULT_NOSCORE);
+
+      break;
+
     case WM_BT_SCORE_PROFIT_FACTOR:
-      return(WM_BT_RESULT_NOSCORE);
+      v = wm_market_stats_profit_factor(st);
+
+      if(v == 0.0)
+        return(WM_BT_RESULT_NOSCORE);
+
+      break;
 
     default:
       return(WM_BT_RESULT_NOSCORE);
@@ -785,15 +807,20 @@ wm_bt_sweep_render_params_json(const wm_bt_sweep_plan_t *plan,
 }
 
 // Render the per-iteration metrics JSON for the wm_backtest_run.metrics
-// JSONB column. Preserves the legacy schema's keys so existing readers
-// keep working; missing fields (sharpe/sortino/profit_factor/etc.) emit
-// as zero because the per-market session doesn't track them.
+// JSONB column. WM-MK-6 restores the risk-adjusted fields on top of the
+// per-market session: counts derive from the per-mode stats accumulator,
+// Sharpe/Sortino come pre-computed on the snapshot, PF derives from
+// gross_profit / gross_loss.
 static void
 wm_bt_sweep_render_metrics_json(const wm_market_session_snapshot_t *snap,
     char *out, size_t cap)
 {
   const wm_market_stats_t *st;
   double                   equity;
+  double                   win_rate;
+  double                   avg_win;
+  double                   avg_loss;
+  double                   profit_factor;
   int                      n;
 
   if(out == NULL || cap == 0 || snap == NULL)
@@ -802,30 +829,49 @@ wm_bt_sweep_render_metrics_json(const wm_market_session_snapshot_t *snap,
     return;
   }
 
-  st     = &snap->stats[WM_MARKET_MODE_PAPER];
-  equity = wm_bt_synth_equity(snap);
+  st            = &snap->stats[WM_MARKET_MODE_PAPER];
+  equity        = wm_bt_synth_equity(snap);
+  win_rate      = (st->n_trades > 0)
+      ? (double)st->n_wins / (double)st->n_trades
+      : 0.0;
+  avg_win       = (st->n_wins   > 0)
+      ? st->gross_profit /  (double)st->n_wins
+      : 0.0;
+  avg_loss      = (st->n_losses > 0)
+      ? st->gross_loss   / (double)st->n_losses
+      : 0.0;
+  profit_factor = wm_market_stats_profit_factor(st);
 
   n = snprintf(out, cap,
       "{"
-      "\"trades\":%" PRIu64 ","
-      "\"wins\":0,"
-      "\"losses\":0,"
-      "\"win_rate\":0,"
+      "\"trades\":%u,"
+      "\"wins\":%u,"
+      "\"losses\":%u,"
+      "\"win_rate\":%.6f,"
       "\"realized_pnl\":%.6f,"
       "\"fees_paid\":%.6f,"
-      "\"profit_factor\":0,"
-      "\"max_drawdown\":0,"
-      "\"avg_win\":0,"
-      "\"avg_loss\":0,"
-      "\"sharpe\":0,"
-      "\"sortino\":0,"
+      "\"profit_factor\":%.6f,"
+      "\"max_drawdown\":%.6f,"
+      "\"avg_win\":%.6f,"
+      "\"avg_loss\":%.6f,"
+      "\"sharpe\":%.6f,"
+      "\"sortino\":%.6f,"
       "\"final_equity\":%.6f,"
       "\"starting_cash\":%.6f,"
       "\"final_cash\":%.6f"
       "}",
-      st->lifetime_fills_count,
+      st->n_trades,
+      st->n_wins,
+      st->n_losses,
+      win_rate,
       st->realized_pnl_lifetime,
       st->lifetime_fees,
+      profit_factor,
+      st->max_drawdown,
+      avg_win,
+      avg_loss,
+      snap->sharpe,
+      snap->sortino,
       equity,
       st->starting_cash,
       st->cash);
@@ -960,11 +1006,14 @@ wm_bt_sweep_run_one(wm_bt_pool_t *pool, uint32_t iter,
         "%s", pool->snap->range_end);
     rec.wallclock_ms  = (int64_t)bt_result.wallclock_ms;
     rec.bars_replayed = bt_result.bars_replayed;
-    rec.n_trades      = (uint32_t)st_paper->lifetime_fills_count;
+    // WM-MK-6: n_trades is the closing-fill (round-trip) count,
+    // matching the legacy wm_pnl_acc_t semantic. Use lifetime_fills_count
+    // when total fill volume is wanted instead.
+    rec.n_trades      = st_paper->n_trades;
     rec.realized_pnl  = st_paper->realized_pnl_lifetime;
-    rec.max_drawdown  = 0.0;     // not tracked by per-market session
-    rec.sharpe        = 0.0;
-    rec.sortino       = 0.0;
+    rec.max_drawdown  = st_paper->max_drawdown;
+    rec.sharpe        = bt_result.trade.sharpe;
+    rec.sortino       = bt_result.trade.sortino;
     rec.final_equity  = wm_bt_synth_equity(&bt_result.trade);
     snprintf(rec.window_kind, sizeof(rec.window_kind),
         "%s", pool->window_kind);

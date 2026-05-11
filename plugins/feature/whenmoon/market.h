@@ -77,11 +77,41 @@ typedef struct
   double   lifetime_fees;
   uint64_t lifetime_fills_count;
   int64_t  last_fill_ms;
+
+  // WM-MK-6: per-mode trade outcome counters + drawdown tracker.
+  // Incremented inside wm_market_apply_fill_locked on every closing
+  // fill (sell against open long that realized PnL). gross_profit /
+  // gross_loss are lifetime running totals over realized PnL,
+  // partitioned by sign; profit_factor derives as
+  // gross_profit / gross_loss without walking the fills ring.
+  // max_drawdown is the worst observed (equity_peak - equity) /
+  // equity_peak as a positive fraction; equity_peak is the internal
+  // anchor (running max).
+  uint32_t n_trades;
+  uint32_t n_wins;
+  uint32_t n_losses;
+  double   gross_profit;
+  double   gross_loss;
+  double   max_drawdown;
+  double   equity_peak;
 } wm_market_stats_t;
 
-#define WM_MARKET_FILL_RING_CAP  256
-#define WM_MARKET_PENDING_CAP     32
-#define WM_MARKET_TRADE_DEDUP     64
+#define WM_MARKET_FILL_RING_CAP    256
+#define WM_MARKET_PENDING_CAP       32
+#define WM_MARKET_TRADE_DEDUP       64
+
+// WM-MK-6: equity samples ring (shared across modes — see
+// wm_market_session_t below). 8192 entries supports ~5-6 days of
+// 1-fill-per-bar at 1-minute granularity; the ring slides when full
+// so older samples drop out of the Sharpe/Sortino window. Sized to
+// stay inside 128 KB per session, dwarfed by the fills+pending rings.
+#define WM_MARKET_EQUITY_RING_CAP  8192
+
+typedef struct
+{
+  int64_t  ts_ms;
+  double   equity;
+} wm_market_equity_sample_t;
 
 typedef struct
 {
@@ -142,6 +172,22 @@ typedef struct
   double                max_notional;
   double                daily_loss_bps;
   uint32_t              pending_cap;
+
+  // WM-MK-6: equity-samples ring, shared across modes (the chunk's
+  // simplifying scope — a mode-aware ring is future work). Each
+  // wm_market_apply_fill_locked invocation appends one sample with
+  // (ts_ms, equity_after_fill); the ring slides when full so the
+  // Sharpe/Sortino window walks the most recent
+  // WM_MARKET_EQUITY_RING_CAP samples. `equity_n` is the lifetime
+  // append count; the populated length to read is
+  // min(equity_n, WM_MARKET_EQUITY_RING_CAP). `equity_head` indexes
+  // the next write slot (i.e. the oldest sample lives at
+  // equity_head when the ring is full). Not persisted — restored
+  // markets begin with an empty ring; backtest synth markets carry
+  // their own per-iteration ring so determinism is automatic.
+  wm_market_equity_sample_t  equity_samples[WM_MARKET_EQUITY_RING_CAP];
+  uint64_t                   equity_n;
+  uint32_t                   equity_head;
 } wm_market_session_t;
 
 #define WM_MARKET_DEFAULT_STARTING_CASH    10000.0
@@ -394,6 +440,15 @@ typedef struct
   double                max_notional;
   double                daily_loss_bps;
   uint32_t              pending_cap;
+
+  // WM-MK-6: pre-computed risk-adjusted metrics. Computed under
+  // `mk->lock` in wm_market_session_snapshot from the shared equity
+  // ring so off-lock renderers + sweep scoring read scalars rather
+  // than re-walking. Per-mode profit factor is derived in callers
+  // from stats[mode].gross_profit / gross_loss (see
+  // wm_market_stats_profit_factor).
+  double                sharpe;
+  double                sortino;
 } wm_market_session_snapshot_t;
 
 // Take a deep copy of `mk->session` (and a few mk-level fields) under
