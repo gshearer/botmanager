@@ -269,12 +269,6 @@ cb_exch_is_sandbox(void)
   return(cb_sandbox_enabled());
 }
 
-static bool
-cb_exch_get_products_count(uint32_t *out_count, uint32_t *out_active)
-{
-  return(cb_products_count_locked(out_count, out_active));
-}
-
 // Per-call adapter contexts. Sized for trivial forwarding; allocated
 // per dispatch and freed by the adapter cb.
 
@@ -674,7 +668,6 @@ static const exchange_protocol_vtable_t cb_vtable = {
   // WM-OR-1 capability hooks.
   .is_authenticated   = cb_exch_is_authenticated,
   .is_sandbox         = cb_exch_is_sandbox,
-  .get_products_count = cb_exch_get_products_count,
   .place_order_async  = cb_exch_place_order_async,
   .cancel_order_async = cb_exch_cancel_order_async,
   .get_order_async    = cb_exch_get_order_async,

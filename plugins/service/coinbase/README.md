@@ -78,7 +78,6 @@ Hard layering rules apply (`plugins/service/AGENTS.md`):
 | `plugin.coinbase.creds.private_key_pem` | STR (secret) | `` | EC P-256 PEM. Literal `\n` escape sequences are unescaped at parse time. |
 | `plugin.coinbase.rest_enabled` | BOOL | `true` | Enable REST dispatcher. |
 | `plugin.coinbase.ws_enabled` | BOOL | `false` | Enable WebSocket reader. |
-| `plugin.coinbase.cache_ttl` | UINT32 | `5` | Seconds before a snapshot is refreshed on demand. |
 | `plugin.coinbase.ws_reconnect_ms` | UINT32 | `2000` | Initial WebSocket reconnect backoff. |
 | `plugin.coinbase.request_timeout` | UINT32 | `15` | Per-call REST timeout. |
 
@@ -115,8 +114,8 @@ plugins and serve different purposes — neither is redundant:
 
 - **`plugin.coinbase.*`** — owned by *this plugin* (the coinbase
   service plugin). Configures *the thing that talks to Coinbase*:
-  REST/WS URLs, credentials, sandbox toggle, REST cache TTL, WS
-  reconnect backoff. Anything that changes bytes-on-the-wire toward
+  REST/WS URLs, credentials, sandbox toggle, WS reconnect backoff,
+  REST timeout. Anything that changes bytes-on-the-wire toward
   `api.coinbase.com` lives here.
 
 - **`plugin.whenmoon.exchange.coinbase.*`** — owned by the *whenmoon
@@ -145,9 +144,11 @@ coinbase calls, it belongs in `plugin.whenmoon.exchange.coinbase.*`.
 
 Two access patterns coexist, both routed through `coinbase_api.h`:
 
-1. **Pull (REST)**: `coinbase_fetch_candles_async(…)`,
-   `coinbase_fetch_ticker_async(…)`, etc. Consumer supplies a typed
-   completion callback; delivery happens on the curl worker.
+1. **Pull (REST)**: `coinbase_fetch_candles_async(…)` for public
+   market data, and `coinbase_place_order_async`, `coinbase_get_accounts_async`,
+   `coinbase_list_fills_async`, etc. for authenticated endpoints.
+   Consumer supplies a typed completion callback; delivery happens on
+   the curl worker.
 2. **Push (WebSocket)**: `coinbase_ws_subscribe(channels[],
    product_ids[], cb, user)` registers a durable subscription.
    Events arrive via `coinbase_ws_event_cb_t` on the WS reader

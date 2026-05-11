@@ -224,8 +224,6 @@ static void
 wm_show_exchange_render_row(const cmd_ctx_t *ctx, const char *name)
 {
   exchange_capabilities_t caps;
-  uint32_t                products_total  = 0;
-  uint32_t                products_active = 0;
   uint32_t                active_markets;
   char                    line[256];
 
@@ -237,23 +235,15 @@ wm_show_exchange_render_row(const cmd_ctx_t *ctx, const char *name)
     return;
   }
 
-  // Products count is best-effort: cache may be empty before first
-  // refresh has landed. Render 0/0 in that case rather than failing
-  // the whole row.
-  exchange_get_products_count(name, &products_total, &products_active);
-
   active_markets = wm_count_active_markets(name);
 
   snprintf(line, sizeof(line),
-      "  %-12s  sandbox=%-3s  auth=%-3s  rps=%u/%u"
-      "  products=%u/%u  markets=%u",
+      "  %-12s  sandbox=%-3s  auth=%-3s  rps=%u/%u  markets=%u",
       name,
       caps.sandbox          ? "yes" : "no",
       caps.has_credentials  ? "yes" : "no",
       (unsigned)caps.advertised_rps,
       (unsigned)caps.advertised_burst,
-      (unsigned)products_active,
-      (unsigned)products_total,
       (unsigned)active_markets);
   cmd_reply(ctx, line);
 }

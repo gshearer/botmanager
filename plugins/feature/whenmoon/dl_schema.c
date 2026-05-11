@@ -16,13 +16,6 @@
 #include <stdlib.h>
 #include <string.h>
 
-// Cap on the stack-local product scratch buffer used during the
-// create-path cache lookup. coinbase.h reports CB_MAX_PRODUCTS=500 but
-// that macro is CB_INTERNAL-only; we allocate a matching scratch buffer
-// on the heap at lookup time rather than hardcoding the cap outside the
-// plugin. The caller frees before returning.
-#define WM_DL_CB_CACHE_CAP   500
-
 // ------------------------------------------------------------------ //
 // Core metadata DDL (run once per daemon by wm_dl_init)              //
 // ------------------------------------------------------------------ //
@@ -417,9 +410,10 @@ wm_candle_table_ensure(int32_t market_id, int32_t gran_secs)
 // ------------------------------------------------------------------ //
 
 // Resolve (exchange, base, quote, exchange_symbol) to a wm_market.id.
-// On miss, INSERT ... RETURNING id, filling increments from the
-// coinbase product cache when available. Never composes SQL with raw
-// user-supplied tokens — every string goes through db_escape first.
+// On miss, INSERT ... RETURNING id with NULL increments — the increments
+// columns stay NULL until the row is reconciled against a live exchange
+// product list. Never composes SQL with raw user-supplied tokens — every
+// string goes through db_escape first.
 //
 // WM-DC-1: bare "coinbase" inputs are auto-qualified to "coinbase-sb"
 // when sandbox is active so the (exchange, exchange_symbol) unique
@@ -436,14 +430,9 @@ wm_market_lookup_or_create(const char *exchange, const char *base_asset,
   char                *e_base     = NULL;
   char                *e_quote    = NULL;
   char                *e_symbol   = NULL;
-  coinbase_product_t  *cache      = NULL;
   char                 qual_exchange[32];
   char                 sql[1024];
-  bool                 is_coinbase_family = false;
   int32_t              id        = -1;
-  double               base_inc  = 0.0;
-  double               quote_inc = 0.0;
-  bool                 have_increments = false;
 
   if(exchange == NULL || base_asset == NULL ||
      quote_asset == NULL || exchange_symbol == NULL)
@@ -458,9 +447,6 @@ wm_market_lookup_or_create(const char *exchange, const char *base_asset,
 
   else
     snprintf(qual_exchange, sizeof(qual_exchange), "%s", exchange);
-
-  is_coinbase_family = (strcmp(qual_exchange, "coinbase") == 0
-                     || strcmp(qual_exchange, "coinbase-sb") == 0);
 
   e_exchange = db_escape(qual_exchange);
   e_base     = db_escape(base_asset);
@@ -495,52 +481,12 @@ wm_market_lookup_or_create(const char *exchange, const char *base_asset,
     goto out;
 
   // Create path -----------------------------------------------------
-  // Pull increments from the coinbase product cache when available.
-  // Both "coinbase" and "coinbase-sb" share the same cache surface —
-  // the active environment determines which products list is in
-  // memory, and the same product ids (e.g. "BTC-USD") trade on both
-  // sides. Other exchanges (or an empty/stale cache) fall through to
-  // the NULL-increments INSERT.
-  if(is_coinbase_family && coinbase_products_cache_fresh())
-  {
-    uint32_t n = 0;
-
-    cache = mem_alloc("whenmoon", "dl_cb_cache",
-        sizeof(*cache) * WM_DL_CB_CACHE_CAP);
-
-    if(cache != NULL &&
-       coinbase_get_products(cache, WM_DL_CB_CACHE_CAP, &n) == SUCCESS)
-    {
-      for(uint32_t i = 0; i < n; i++)
-      {
-        if(strncmp(cache[i].product_id, exchange_symbol,
-               COINBASE_PRODUCT_ID_SZ) == 0)
-        {
-          base_inc        = cache[i].base_increment;
-          quote_inc       = cache[i].quote_increment;
-          have_increments = true;
-          break;
-        }
-      }
-    }
-  }
-
-  if(have_increments)
-    snprintf(sql, sizeof(sql),
-        "INSERT INTO wm_market"
-        " (exchange, base_asset, quote_asset, exchange_symbol,"
-        "  base_increment, quote_increment)"
-        " VALUES ('%s', '%s', '%s', '%s', %.18g, %.18g)"
-        " RETURNING id",
-        e_exchange, e_base, e_quote, e_symbol, base_inc, quote_inc);
-
-  else
-    snprintf(sql, sizeof(sql),
-        "INSERT INTO wm_market"
-        " (exchange, base_asset, quote_asset, exchange_symbol)"
-        " VALUES ('%s', '%s', '%s', '%s')"
-        " RETURNING id",
-        e_exchange, e_base, e_quote, e_symbol);
+  snprintf(sql, sizeof(sql),
+      "INSERT INTO wm_market"
+      " (exchange, base_asset, quote_asset, exchange_symbol)"
+      " VALUES ('%s', '%s', '%s', '%s')"
+      " RETURNING id",
+      e_exchange, e_base, e_quote, e_symbol);
 
   res = db_result_alloc();
 
@@ -564,7 +510,6 @@ wm_market_lookup_or_create(const char *exchange, const char *base_asset,
   res = NULL;
 
 out:
-  if(cache      != NULL) mem_free(cache);
   if(e_exchange != NULL) mem_free(e_exchange);
   if(e_base     != NULL) mem_free(e_base);
   if(e_quote    != NULL) mem_free(e_quote);

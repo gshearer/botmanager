@@ -4,8 +4,7 @@
 // Public typed verbs that dispatch to the per-protocol vtable hooks
 // (`place_order_async`, `cancel_order_async`, `get_order_async`,
 // `list_orders_async`, `list_fills_async`, `get_accounts_async`) plus
-// the synchronous probes (`get_capabilities`, `name_list`,
-// `get_products_count`).
+// the synchronous probes (`get_capabilities`, `name_list`).
 //
 // Every async verb here is "auth-gated": it FAILs early with
 // `error: <name>: api keys not configured` when the protocol's
@@ -208,29 +207,6 @@ exchange_name_list(char (*out_arr)[EXCHANGE_NAME_SZ], uint32_t out_cap,
 
   *out_count = ctx.total;
   return(SUCCESS);
-}
-
-bool
-exchange_get_products_count(const char *name, uint32_t *out_count,
-    uint32_t *out_active)
-{
-  exchange_t *e;
-
-  if(out_count == NULL || out_active == NULL)
-    return(FAIL);
-
-  *out_count  = 0;
-  *out_active = 0;
-
-  if(name == NULL || name[0] == '\0')
-    return(FAIL);
-
-  e = exchange_find(name);
-
-  if(e == NULL || e->vt == NULL || e->vt->get_products_count == NULL)
-    return(FAIL);
-
-  return(e->vt->get_products_count(out_count, out_active));
 }
 
 // ------------------------------------------------------------------ //

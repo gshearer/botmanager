@@ -35,9 +35,6 @@
 // Error message buffer for transient classifier output. Matches the
 // CMC convention.
 #define CB_ERR_SZ        128
-// Product cache cap. Coinbase currently exposes ~700 products; 500 keeps
-// memory footprint bounded. Caller is expected to filter before ingest.
-#define CB_MAX_PRODUCTS  500
 
 // CB4 — WebSocket transport sizing knobs.
 //
@@ -65,13 +62,10 @@ typedef enum
 } cb_ws_state_t;
 
 // REST request type. Enum values for private endpoints are declared
-// here so CB2's union shape is stable when CB3 wires them in.
+// here so the union shape is stable across the typed callers.
 typedef enum
 {
-  CB_REQ_PRODUCTS,
   CB_REQ_CANDLES,
-  CB_REQ_TRADES,          // WM-S3
-  CB_REQ_TICKER,
   CB_REQ_PLACE_ORDER,
   CB_REQ_CANCEL_ORDER,
   CB_REQ_GET_ORDER,
@@ -80,34 +74,30 @@ typedef enum
 } cb_req_type_t;
 
 // REST request context. Freelist-managed; exactly one callback member
-// is valid per `type`. CB3 will populate the `body`/`body_len` fields
-// when it introduces signed POST paths; CB2 leaves them NULL/0.
+// is valid per `type`. Signed POST paths populate `body`/`body_len`;
+// GETs leave them NULL/0.
 typedef struct cb_request
 {
   cb_req_type_t  type;
 
-  // Candle / ticker / trade selectors.
+  // Candle selectors.
   char           product_id[COINBASE_PRODUCT_ID_SZ];
   int32_t        granularity;
   int64_t        start_ts;
   int64_t        end_ts;
-  int64_t        after;      // WM-S3: trade cursor (0 = newest page)
 
-  // CB3: signed POST/DELETE body. JSON already rendered by the caller.
+  // Signed POST/DELETE body. JSON already rendered by the caller.
   char          *body;
   size_t         body_len;
 
-  // Order selectors (CB3).
+  // Order selectors.
   char           order_id[COINBASE_ORDER_ID_SZ];
   char           status[COINBASE_STATUS_SZ];
 
   // Typed completion callback. Exactly one member is valid per `type`.
   union
   {
-    coinbase_done_products_cb_t  products;
     coinbase_done_candles_cb_t   candles;
-    coinbase_done_trades_cb_t    trades;      // WM-S3
-    coinbase_done_ticker_cb_t    ticker;
     coinbase_done_order_cb_t     order;
     coinbase_done_orders_cb_t    orders;
     coinbase_done_accounts_cb_t  accounts;
@@ -124,13 +114,6 @@ bool    cb_sandbox_enabled(void);
 bool    cb_rest_base_url(char *out, size_t cap);
 bool    cb_ws_base_url(char *out, size_t cap);
 bool    cb_apikey_configured(void);
-
-// coinbase_rest.c — cache-only probes shared with the exchange-vtable
-// trampolines. `cb_products_count_locked` is internal to the plugin
-// (no public dlsym shim); WM-OR-1's `exchange_get_products_count`
-// hook calls it.
-bool    cb_products_count_locked(uint32_t *out_total,
-            uint32_t *out_active);
 
 // coinbase_sign_cdp.c — Advanced Trade JWT/ES256 signer.
 //

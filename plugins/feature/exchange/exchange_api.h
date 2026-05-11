@@ -277,11 +277,6 @@ typedef struct
   bool   (*is_authenticated)(void);
   bool   (*is_sandbox)(void);
 
-  // Sync — reads protocol-plugin's local product cache. `out_active`
-  // counts rows with `trading_disabled == false`; equal to `out_count`
-  // when the protocol does not surface that flag.
-  bool   (*get_products_count)(uint32_t *out_count, uint32_t *out_active);
-
   // Async — mirror the protocol's typed wrappers. Fill error reasons
   // into the result's `err` field; never block the caller.
   bool   (*place_order_async)(const exchange_place_order_req_t *req,
@@ -361,13 +356,6 @@ bool exchange_get_capabilities(const char *name,
 // SUCCESS unless out_arr/out_count is NULL.
 bool exchange_name_list(char (*out_arr)[EXCHANGE_NAME_SZ],
     uint32_t out_cap, uint32_t *out_count);
-
-// Sync read of the protocol's cached product/market list size. FAIL
-// when `name` is unknown or the protocol has no `get_products_count`
-// hook. `out_active` counts entries with trading enabled; the protocol
-// returns it equal to `out_count` if it doesn't track that bit.
-bool exchange_get_products_count(const char *name,
-    uint32_t *out_count, uint32_t *out_active);
 
 bool exchange_place_order_async(const char *name,
     const exchange_place_order_req_t *req,
@@ -523,31 +511,6 @@ exchange_name_list(char (*out_arr)[EXCHANGE_NAME_SZ], uint32_t out_cap,
     __atomic_store_n(&cached, fn, __ATOMIC_RELEASE);
   }
   return(fn(out_arr, out_cap, out_count));
-}
-
-static inline bool
-exchange_get_products_count(const char *name, uint32_t *out_count,
-    uint32_t *out_active)
-{
-  typedef bool (*fn_t)(const char *, uint32_t *, uint32_t *);
-  static fn_t cached = NULL;
-  fn_t        fn     = __atomic_load_n(&cached, __ATOMIC_ACQUIRE);
-
-  if(fn == NULL)
-  {
-    union { void *obj; fn_t fn; } u;
-
-    u.obj = plugin_dlsym("exchange", "exchange_get_products_count");
-    if(u.obj == NULL)
-    {
-      clam(CLAM_FATAL, "exchange",
-          "dlsym failed: exchange_get_products_count");
-      abort();
-    }
-    fn = u.fn;
-    __atomic_store_n(&cached, fn, __ATOMIC_RELEASE);
-  }
-  return(fn(name, out_count, out_active));
 }
 
 static inline bool

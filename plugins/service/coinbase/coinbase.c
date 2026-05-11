@@ -48,7 +48,6 @@ static const plugin_kv_entry_t cb_kv_schema[] = {
   { "plugin.coinbase.ws_enabled",   KV_BOOL, "false", NULL, NULL, NULL },
 
   // Operational budgets.
-  { "plugin.coinbase.cache_ttl",       KV_UINT32, "5",  NULL, NULL, NULL },
   { "plugin.coinbase.ws_reconnect_ms", KV_UINT32, "2000", NULL, NULL, NULL },
   { "plugin.coinbase.request_timeout", KV_UINT32, "15", NULL, NULL, NULL },
 };
@@ -80,9 +79,8 @@ cb_start(void)
   cb_active_name_init();
 
   // EX-1: self-register with the feature_exchange abstraction so
-  // candle + trade traffic gets the priority queue + token bucket.
-  // Other coinbase APIs (products, ticker, orders, accounts) keep the
-  // legacy direct-curl path for now.
+  // candle traffic + private order/account traffic flows through the
+  // priority queue + token bucket.
   if(cb_exchange_register_vtable() != SUCCESS)
   {
     clam(CLAM_WARN, CB_CTX,
