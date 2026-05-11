@@ -470,16 +470,13 @@ wm_dl_candles_on_page(const coinbase_candles_result_t *res, void *user)
     wm_dl_s_to_tstz(ctx->window_start_s, new_cursor, sizeof(new_cursor));
     snprintf(j->cursor_end_ts, sizeof(j->cursor_end_ts), "%s", new_cursor);
 
-    // Terminal decisions. Reaching the user's oldest floor ends the job
-    // regardless of whether the page was empty; an empty page past the
-    // floor also ends it (inception walk).
+    // Terminal decisions. Reaching the user's oldest floor ends the
+    // job; an empty page means the exchange ran out of history and
+    // also ends it (inception walk).
     if(oldest_requested_s > 0 && ctx->window_start_s <= oldest_requested_s)
       j->state = DL_JOB_DONE;
 
-    else if(empty && ctx->window_start_s <= oldest_requested_s)
-      j->state = DL_JOB_DONE;
-
-    else if(oldest_requested_s == 0 && ctx->window_start_s == 0)
+    else if(empty)
       j->state = DL_JOB_DONE;
 
     clam(CLAM_INFO, WM_DL_CTX,

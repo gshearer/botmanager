@@ -9,14 +9,12 @@
 #include "dl_jobtable.h"
 #include "dl_schema.h"
 #include "dl_candles.h"
-#include "cd_probe.h"
 
 #include "exchange_api.h"
 
 #include "cmd.h"
 #include "colors.h"
 #include "common.h"
-#include "kv.h"
 #include "userns.h"
 
 #include <ctype.h>
@@ -120,99 +118,6 @@ wm_dl_parse_date(const char *in, char *out, size_t cap)
 // Handlers                                                            //
 // ------------------------------------------------------------------ //
 
-// WM-CD-1 Phase 2: `whenmoon download candles <market> max` sugar.
-// Reads each per-granularity max_lookback_days cap from KV (populated
-// by Phase 1 probe-depth) and fans out one DL_JOB_CANDLES per
-// granularity whose cap is non-zero, with oldest_ts = now - cap_days
-// and newest_ts = NULL (= now). Errors politely if no cap has been
-// probed yet.
-static const int32_t WM_CD_MAX_GRANS[] = {
-  60, 300, 900, 3600, 21600, 86400
-};
-#define WM_CD_MAX_GRAN_N \
-  ((int32_t)(sizeof(WM_CD_MAX_GRANS) / sizeof(WM_CD_MAX_GRANS[0])))
-
-static void
-wm_dl_cmd_download_candles_max(const cmd_ctx_t *ctx,
-    whenmoon_state_t *st,
-    const char *exch, const char *symbol, int32_t market_id)
-{
-  char    reply[256];
-  char    err[128];
-  char    key[80];
-  char    oldest_ts[40];
-  time_t  now;
-  int32_t i;
-  int32_t fanout = 0;
-  int32_t failed = 0;
-
-  now = time(NULL);
-
-  for(i = 0; i < WM_CD_MAX_GRAN_N; i++)
-  {
-    int32_t   gran = WM_CD_MAX_GRANS[i];
-    uint64_t  cap_days;
-    time_t    oldest;
-    struct tm tm;
-    int64_t   job_id = 0;
-
-    snprintf(key, sizeof(key),
-        "plugin.whenmoon.candles.%" PRId32 ".max_lookback_days", gran);
-
-    cap_days = kv_get_uint(key);
-
-    if(cap_days == 0)
-      continue;
-
-    oldest = now - (time_t)cap_days * 86400;
-
-    if(gmtime_r(&oldest, &tm) == NULL)
-    {
-      failed++;
-      continue;
-    }
-
-    snprintf(oldest_ts, sizeof(oldest_ts),
-        "%04d-%02d-%02d %02d:%02d:%02d+00",
-        tm.tm_year + 1900, tm.tm_mon + 1, tm.tm_mday,
-        tm.tm_hour, tm.tm_min, tm.tm_sec);
-
-    err[0] = '\0';
-
-    if(wm_dl_job_enqueue(st, DL_JOB_CANDLES, market_id, gran,
-           EXCHANGE_PRIO_USER_DOWNLOAD,
-           exch, symbol, oldest_ts, NULL,
-           ctx->username != NULL ? ctx->username : "",
-           &job_id, err, sizeof(err)) != SUCCESS)
-    {
-      snprintf(reply, sizeof(reply),
-          "gran=%" PRId32 " enqueue failed: %s", gran,
-          err[0] != '\0' ? err : "unknown");
-      cmd_reply(ctx, reply);
-      failed++;
-      continue;
-    }
-
-    snprintf(reply, sizeof(reply),
-        "candles job %" PRId64 " queued (%s gran=%" PRId32
-        " oldest=%s newest=now cap=%" PRIu64 "d)",
-        job_id, symbol, gran, oldest_ts, cap_days);
-    cmd_reply(ctx, reply);
-    fanout++;
-  }
-
-  if(fanout == 0 && failed == 0)
-    cmd_reply(ctx,
-        "no probed depth caps yet;"
-        " run /whenmoon candles probe-depth <market> first");
-  else
-  {
-    snprintf(reply, sizeof(reply),
-        "%" PRId32 " job(s) queued, %" PRId32 " failed", fanout, failed);
-    cmd_reply(ctx, reply);
-  }
-}
-
 static void
 wm_dl_cmd_download_candles(const cmd_ctx_t *ctx)
 {
@@ -248,7 +153,8 @@ wm_dl_cmd_download_candles(const cmd_ctx_t *ctx)
   {
     cmd_reply(ctx,
         "usage: /whenmoon download candles <exch>-<base>-<quote>"
-        " [MM/dd/yyyy [MM/dd/yyyy [gran_secs]] | max]");
+        " [MM/dd/yyyy [MM/dd/yyyy [gran_secs]]]"
+        " — omit dates to walk back until the exchange runs out");
     return;
   }
 
@@ -261,22 +167,6 @@ wm_dl_cmd_download_candles(const cmd_ctx_t *ctx)
          symbol, sizeof(symbol)) != SUCCESS)
   {
     cmd_reply(ctx, "bad market id (expected <exch>-<base>-<quote>)");
-    return;
-  }
-
-  // WM-CD-1 Phase 2: `max` sugar. Resolve market then fan out across
-  // every granularity that has a probed cap.
-  if(strcmp(old_tok, "max") == 0)
-  {
-    market_id = wm_market_lookup_or_create(exch, base, quote, symbol);
-
-    if(market_id < 0)
-    {
-      cmd_reply(ctx, "market lookup/create failed");
-      return;
-    }
-
-    wm_dl_cmd_download_candles_max(ctx, st, exch, symbol, market_id);
     return;
   }
 
@@ -348,64 +238,6 @@ wm_dl_cmd_download_candles(const cmd_ctx_t *ctx)
       job_id, symbol, gran,
       oldest_ts[0] != '\0' ? oldest_ts : "epoch",
       newest_ts[0] != '\0' ? newest_ts : "now");
-  cmd_reply(ctx, reply);
-}
-
-// ------------------------------------------------------------------ //
-// /whenmoon candles probe-depth <market>                              //
-// WM-CD-1 Phase 1: kick off the per-granularity bisection probe and   //
-// publish discovered max_lookback_days to KV.                          //
-// ------------------------------------------------------------------ //
-
-static void
-wm_cd_cmd_probe_depth(const cmd_ctx_t *ctx)
-{
-  whenmoon_state_t *st;
-  const char       *p;
-  char              pair[64]   = {0};
-  char              exch[32]   = {0};
-  char              base[16]   = {0};
-  char              quote[16]  = {0};
-  char              symbol[32] = {0};
-  char              reply[192];
-
-  st = whenmoon_get_state();
-
-  if(st == NULL || !st->dl_ready)
-  {
-    cmd_reply(ctx, "whenmoon: downloader not ready");
-    return;
-  }
-
-  p = ctx->args != NULL ? ctx->args : "";
-
-  if(!wm_dl_next_token(&p, pair, sizeof(pair)))
-  {
-    cmd_reply(ctx,
-        "usage: /whenmoon candles probe-depth"
-        " <exch>-<base>-<quote>");
-    return;
-  }
-
-  if(wm_dl_parse_market_id(pair, exch, sizeof(exch),
-         base, sizeof(base), quote, sizeof(quote),
-         symbol, sizeof(symbol)) != SUCCESS)
-  {
-    cmd_reply(ctx, "bad market id (expected <exch>-<base>-<quote>)");
-    return;
-  }
-
-  if(wm_cd_probe_run(symbol) != SUCCESS)
-  {
-    cmd_reply(ctx, "probe submit failed");
-    return;
-  }
-
-  snprintf(reply, sizeof(reply),
-      "probing %s depth on 6 granularities;"
-      " results land in plugin.whenmoon.candles.<gran>.max_lookback_days"
-      " (and the daemon log) within ~60s",
-      symbol);
   cmd_reply(ctx, reply);
 }
 
@@ -664,13 +496,6 @@ wm_dl_parent_download(const cmd_ctx_t *ctx)
 }
 
 static void
-wm_cd_parent_candles(const cmd_ctx_t *ctx)
-{
-  cmd_reply(ctx,
-      "usage: /whenmoon candles <probe-depth> ...");
-}
-
-static void
 wm_dl_parent_show_download(const cmd_ctx_t *ctx)
 {
   cmd_reply(ctx,
@@ -696,12 +521,11 @@ wm_dl_register_verbs(void)
 
   if(cmd_register("whenmoon", "candles",
         "whenmoon download candles <exch>-<base>-<quote>"
-        " [MM/dd/yyyy [MM/dd/yyyy [gran_secs]] | max]",
+        " [MM/dd/yyyy [MM/dd/yyyy [gran_secs]]]",
         "Enqueue a candle backfill job. Optional gran_secs is one of"
         " 60 (1m, default), 300 (5m), 900 (15m), 3600 (1h),"
-        " 21600 (6h), 86400 (1d). `max` fans out one job per"
-        " granularity using the probed depth caps from"
-        " /whenmoon candles probe-depth.",
+        " 21600 (6h), 86400 (1d). Omit dates to walk back until the"
+        " exchange runs out of history.",
         NULL,
         USERNS_GROUP_ADMIN, 100, CMD_SCOPE_ANY, METHOD_T_ANY,
         wm_dl_cmd_download_candles, NULL, "whenmoon/download", NULL,
@@ -714,27 +538,6 @@ wm_dl_register_verbs(void)
         NULL,
         USERNS_GROUP_ADMIN, 100, CMD_SCOPE_ANY, METHOD_T_ANY,
         wm_dl_cmd_download_cancel, NULL, "whenmoon/download", NULL,
-        NULL, 0, NULL, NULL) != SUCCESS)
-    return(FAIL);
-
-  // /whenmoon candles parent + probe-depth leaf (WM-CD-1 Phase 1).
-  if(cmd_register("whenmoon", "candles",
-        "whenmoon candles <verb> ...",
-        "Candle-pipeline admin verbs (depth probe, future: bulk).",
-        NULL,
-        USERNS_GROUP_ADMIN, 100, CMD_SCOPE_ANY, METHOD_T_ANY,
-        wm_cd_parent_candles, NULL, "whenmoon", NULL,
-        NULL, 0, NULL, NULL) != SUCCESS)
-    return(FAIL);
-
-  if(cmd_register("whenmoon", "probe-depth",
-        "whenmoon candles probe-depth <exch>-<base>-<quote>",
-        "Probe Coinbase candle history depth per granularity."
-        " Results land in plugin.whenmoon.candles.<gran>"
-        ".max_lookback_days and the daemon log within ~60s.",
-        NULL,
-        USERNS_GROUP_ADMIN, 100, CMD_SCOPE_ANY, METHOD_T_ANY,
-        wm_cd_cmd_probe_depth, NULL, "whenmoon/candles", NULL,
         NULL, 0, NULL, NULL) != SUCCESS)
     return(FAIL);
 
