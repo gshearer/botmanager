@@ -1,27 +1,25 @@
 // botmanager — MIT
-// Whenmoon backtest snapshot + single-iteration replay (WM-LT-5).
+// Whenmoon backtest snapshot + single-iteration replay.
 //
 // One backtest run = (a) pre-flight gap check on the 1m candle
 // coverage; (b) snapshot construction by replaying 1m candles from
 // `wm_candles_<id>_60` through a dedicated aggregator with strategy
 // fanout disabled; (c) one iteration that walks the snapshot bars
 // chronologically across every grain the strategy subscribes to,
-// firing wm_strategy_on_bar through a backtest-private trade book
+// firing wm_strategy_on_bar through a per-iteration synthetic market
 // (synthetic id "bt:<n>") in PAPER mode; (d) persistence of the
 // resulting metrics into `wm_backtest_run`.
 //
-// The reuse story:
+// The reuse story (post WM-MK-5):
 //   * Aggregator + indicator pass: same code path as live. The flag
 //     `dispatch_strategies` flips fanout off during warmup.
-//   * Trade book + sizer + paper-fill engine: same code path as live.
-//     The synthetic market_id keeps the backtest book in the global
-//     trade registry but isolated from live (market, strategy) keys.
-//   * PnL accumulators: same struct as live; metrics are read out of
-//     the trade snapshot.
-//
-// Single-iteration runs serialize on the trade-book registry lock —
-// fine for WM-LT-5. WM-LT-6 will swap in a private per-iteration
-// registry to enable parallel sweeps.
+//   * Per-iteration synthetic market: a heap-owned `whenmoon_market_t`
+//     that shares the snapshot's grain rings + product id but carries
+//     a fresh session, mutex, and PAPER mode. Strategy emit routes
+//     through `wm_market_engine_on_signal_with_mk(ctx->mkt, ...)` —
+//     the same fill engine production paper trading uses.
+//   * Sweep parallelism: each worker creates its own synth market
+//     per iteration. No shared registry, no cross-thread contention.
 
 #define WHENMOON_INTERNAL
 #include "backtest.h"
@@ -30,8 +28,6 @@
 #include "dl_coverage.h"
 #include "dl_schema.h"
 #include "market.h"
-#include "order.h"
-#include "pnl.h"
 #include "strategy.h"
 #include "whenmoon.h"
 
@@ -474,6 +470,33 @@ wm_backtest_run_iteration(whenmoon_state_t *st,
       synth_id, params, NULL, 0, out, err, err_cap));
 }
 
+// Apply CLI param overrides directly to the synth-market session.
+// Each `have_*` flag selects whether the matching field is
+// overwritten. starting_cash also re-seeds PAPER-mode cash so the
+// iteration begins from the override.
+static void
+wm_market_session_apply_iter_overrides(wm_market_session_t *s,
+    const wm_backtest_params_t *params)
+{
+  if(s == NULL || params == NULL)
+    return;
+
+  if(params->have_fee_bps)
+    s->fee_bps  = params->fee_bps;
+
+  if(params->have_slip_bps)
+    s->slip_bps = params->slip_bps;
+
+  if(params->have_size_frac)
+    s->size_frac = params->size_frac;
+
+  if(params->have_starting_cash)
+  {
+    s->stats[WM_MARKET_MODE_PAPER].starting_cash = params->starting_cash;
+    s->stats[WM_MARKET_MODE_PAPER].cash          = params->starting_cash;
+  }
+}
+
 // Return true when ts_ms falls inside at least one window. n_windows
 // is small (<= WM_BT_WALK_MAX_WINDOWS = 256), and windows are sorted
 // chronologically; a tighter binary search is unnecessary at v1
@@ -515,11 +538,14 @@ wm_backtest_run_iteration_with_id(whenmoon_state_t *st,
                                     const wm_candle_full_t *);
   uint16_t                        grains_mask;
   wm_strategy_ctx_t               ctx;
-  wm_trade_book_t                *book;
+  whenmoon_market_t              *synth_mk = NULL;
+  char                            err_synth[128];
   char                            strat_copy[WM_STRATEGY_NAME_SZ];
   wm_bt_cursor_t                  cursors[WM_GRAN_MAX];
   const wm_candle_full_t         *rings[WM_GRAN_MAX];
   uint32_t                        bars_replayed = 0;
+  uint64_t                        fills_paper;
+  double                          realized_paper;
   struct timespec                 t0, t1;
 
   if(err != NULL && err_cap > 0)
@@ -563,50 +589,31 @@ wm_backtest_run_iteration_with_id(whenmoon_state_t *st,
 
   pthread_mutex_unlock(&st->strategies->lock);
 
-  // Use the caller-supplied synthetic id; prime the backtest book in
-  // the active trade registry. PAPER mode reuses the live fill engine.
-  // The sweep worker has bound a private registry via
-  // wm_trade_engine_use_registry beforehand.
-  book = wm_trade_book_get_or_create(synth_id, strat_copy);
-
-  if(book == NULL)
+  // Build the per-iteration synthetic market. It shares the snapshot's
+  // grain rings + product id but carries an independent session and
+  // mutex; emit_signal_impl routes signals through
+  // wm_market_engine_on_signal_with_mk(synth_mk, ...).
+  if(wm_market_create_synthetic(synth_id, &snap->mkt, &synth_mk,
+         err_synth, sizeof(err_synth)) != SUCCESS)
   {
     if(err != NULL)
-      snprintf(err, err_cap, "trade book create failed");
+      snprintf(err, err_cap, "synth market: %s",
+          err_synth[0] != '\0' ? err_synth : "(no detail)");
     return(FAIL);
   }
 
-  if(params != NULL)
-    wm_trade_book_override_params(synth_id, strat_copy,
-        params->have_fee_bps,        params->fee_bps,
-        params->have_slip_bps,       params->slip_bps,
-        params->have_size_frac,      params->size_frac,
-        params->have_starting_cash,  params->starting_cash);
+  wm_market_session_apply_iter_overrides(&synth_mk->session, params);
 
-  if(wm_trade_book_set_mode(synth_id, strat_copy, WM_TRADE_MODE_PAPER)
-     != SUCCESS)
-  {
-    wm_trade_book_remove(synth_id, strat_copy);
-
-    if(err != NULL)
-      snprintf(err, err_cap, "trade book set_mode failed");
-    return(FAIL);
-  }
-
-  // Build the strategy ctx. The market_id_str on the ctx is what
-  // wm_strategy_emit_signal_impl forwards to wm_trade_engine_on_signal,
-  // so it must match the synthetic id we just registered the book under.
+  // Build the strategy ctx. mkt points at the synth market so the
+  // emit path's direct-pointer dispatch lands on it.
   memset(&ctx, 0, sizeof(ctx));
-  // WM-MK-3 carve-out: backtest stays on the legacy book engine until
-  // WM-MK-5 lands synthetic markets.
-  ctx.backtest_mode = true;
   snprintf(ctx.market_id_str, sizeof(ctx.market_id_str), "%s", synth_id);
   snprintf(ctx.strategy_name, sizeof(ctx.strategy_name), "%s", strat_copy);
-  ctx.mkt = &snap->mkt;
+  ctx.mkt = synth_mk;
 
   if(init_fn(&ctx) != 0)
   {
-    wm_trade_book_remove(synth_id, strat_copy);
+    wm_market_destroy_synthetic(synth_mk);
 
     if(err != NULL)
       snprintf(err, err_cap, "strategy init returned non-zero");
@@ -651,7 +658,7 @@ wm_backtest_run_iteration_with_id(whenmoon_state_t *st,
     // strategy callback fires only for bars whose ts falls inside a
     // test window. Bars outside the windows still advance their
     // cursor — the aggregator and ctx mark caches stay coherent —
-    // but the strategy never sees them, so the trade book records
+    // but the strategy never sees them, so the synth market records
     // fills only during windowed ranges.
     if(cursors[g].subscribed)
     {
@@ -678,29 +685,32 @@ wm_backtest_run_iteration_with_id(whenmoon_state_t *st,
   // Finalize the strategy attachment.
   finalize_fn(&ctx);
 
-  // Snapshot the book before tearing it down.
-  if(wm_trade_book_snapshot(synth_id, strat_copy, &out->trade) != SUCCESS)
+  // Snapshot the synth market's session before tearing it down.
+  if(wm_market_session_snapshot(synth_mk, &out->trade) != SUCCESS)
   {
-    wm_trade_book_remove(synth_id, strat_copy);
+    wm_market_destroy_synthetic(synth_mk);
 
     if(err != NULL)
-      snprintf(err, err_cap, "book snapshot failed");
+      snprintf(err, err_cap, "synth snapshot failed");
     return(FAIL);
   }
+
+  fills_paper    =
+      out->trade.stats[WM_MARKET_MODE_PAPER].lifetime_fills_count;
+  realized_paper =
+      out->trade.stats[WM_MARKET_MODE_PAPER].realized_pnl_lifetime;
 
   out->bars_replayed = bars_replayed;
   out->wallclock_ms  = (uint64_t)((int64_t)(t1.tv_sec - t0.tv_sec) * 1000
                      + (int64_t)(t1.tv_nsec - t0.tv_nsec) / 1000000);
 
-  // Drop the synthetic book — its data has been captured in `out->trade`.
-  wm_trade_book_remove(synth_id, strat_copy);
+  wm_market_destroy_synthetic(synth_mk);
 
   clam(CLAM_INFO, WM_BT_CTX,
-      "iter %s/%s: bars=%u trades=%u realized=%+.4f"
-      " sharpe=%.3f wallclock_ms=%" PRIu64,
+      "iter %s/%s: bars=%u fills=%" PRIu64 " realized=%+.4f"
+      " wallclock_ms=%" PRIu64,
       snap->source_market_id, strat_copy, bars_replayed,
-      out->trade.metrics.n_trades, out->trade.metrics.realized_pnl,
-      out->trade.metrics.sharpe, out->wallclock_ms);
+      fills_paper, realized_paper, out->wallclock_ms);
 
   return(SUCCESS);
 }

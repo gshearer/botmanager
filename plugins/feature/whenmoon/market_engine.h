@@ -57,13 +57,19 @@ void wm_market_reset(const char *market_id_str,
 // reads are independent.
 void wm_market_session_refresh_kv(whenmoon_market_t *mk);
 
-// New signal entry point. Idempotent w.r.t. position direction:
+// Signal entry point. Idempotent w.r.t. position direction:
 // no-op when the strategy advice already matches the current state.
 // Risk gates (daily-loss, max-notional, pending-cap) apply only when
-// `mode == WM_MARKET_MODE_REAL`. **Not yet wired by any production
-// caller** — installed for WM-MK-3 to swap the strategy emit path
-// onto and for the selftest verb to drive directly.
+// `mode == WM_MARKET_MODE_REAL`.
+//
+// The id-based wrapper resolves the live market via
+// wm_market_lookup_by_id then forwards to the direct-pointer entry.
+// Use the _with_mk form when the caller already owns a pointer
+// (production strategy dispatch + backtest synthetic markets).
 void wm_market_engine_on_signal(const char *market_id_str,
+    double mark_px, int64_t mark_ms, const wm_strategy_signal_t *sig);
+
+void wm_market_engine_on_signal_with_mk(whenmoon_market_t *mk,
     double mark_px, int64_t mark_ms, const wm_strategy_signal_t *sig);
 
 // New external-fill entry point (post-confirmation, no synthetic
@@ -105,14 +111,6 @@ void wm_market_engine_record_external_fill(const char *market_id_str,
 bool wm_market_engine_force_trade_locked(whenmoon_market_t *mk,
     char side, double qty, double px_override, int64_t ts_ms,
     const char *reason, char *errbuf, size_t errbuf_sz);
-
-// Selftest body — synthesises a buy + sell against the new path,
-// asserts position transitions and stats accumulation, returns
-// SUCCESS/FAIL. `errbuf` (may be NULL) carries a one-line summary on
-// FAIL. Verb implementation in market_cmds.c calls this; WM-MK-5
-// removes both verb and body.
-bool wm_market_engine_selftest(const char *market_id_str,
-    char *errbuf, size_t errbuf_sz);
 
 #endif // WHENMOON_INTERNAL
 

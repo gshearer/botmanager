@@ -97,10 +97,6 @@ struct wm_strategy_ctx
   // to find the mark.
   double                last_mark_px;
   int64_t               last_mark_ms;
-
-  // WM-MK-3 carve-out so backtest stays on the legacy book engine;
-  // removed in WM-MK-5 once backtest moves to synthetic markets.
-  bool                  backtest_mode;
 };
 
 // -----------------------------------------------------------------------

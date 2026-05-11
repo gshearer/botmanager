@@ -4,7 +4,6 @@
 #define WHENMOON_INTERNAL
 #include "whenmoon.h"
 #include "backtest.h"
-#include "book_persist.h"
 #include "market.h"
 #include "market_persist.h"
 #include "account.h"
@@ -14,7 +13,6 @@
 #include "market_cmds.h"
 #include "order_cmds.h"
 #include "live.h"
-#include "order.h"
 #include "strategy.h"
 #include "sweep.h"
 
@@ -233,9 +231,9 @@ static void
 whenmoon_root_cb(const cmd_ctx_t *ctx)
 {
   cmd_reply(ctx,
-      "usage: /whenmoon <market|download|strategy|trade|backtest> ..."
-      " (market start|stop, download candles|cancel,"
-      " strategy attach|detach|reload, trade mode|reset,"
+      "usage: /whenmoon <market|download|strategy|order|backtest> ..."
+      " (market start|stop|mode|force, download candles|cancel,"
+      " strategy attach|detach|reload, order buy|sell|cancel,"
       " backtest run)");
 }
 
@@ -244,7 +242,8 @@ whenmoon_show_root_cb(const cmd_ctx_t *ctx)
 {
   cmd_reply(ctx,
       "usage: /show whenmoon"
-      " <markets|balances|indicators|download|strategy|trade|backtest>"
+      " <markets|balances|indicators|download|strategy|exchange"
+      "|market|backtest>"
       " ... (download has subverbs: status, candles)");
 }
 
@@ -313,14 +312,11 @@ whenmoon_subsystems_destroy(whenmoon_state_t *st)
   if(st == NULL)
     return;
 
-  // Mirror the order from the previous per-bot teardown: strategies
-  // first (they may hold dispatch references into market state), then
-  // job table, downloader DDL flag, markets, account. The trade engine
-  // is plugin-global and outlives subsystems by a hair so any final
-  // strategy-detach paths can drop their books cleanly.
+  // Teardown order: strategies first (they may hold dispatch
+  // references into market state), then live engine, then job table,
+  // downloader DDL flag, markets, account.
   wm_strategy_registry_destroy(st);
   wm_live_engine_destroy();
-  wm_trade_engine_destroy();
   wm_dl_jobtable_destroy(st);
   wm_dl_destroy(st);
   wm_market_destroy(st);
@@ -341,17 +337,9 @@ whenmoon_init(void)
     return(FAIL);
   }
 
-  if(wm_book_persist_global_init() != SUCCESS)
-  {
-    clam(CLAM_INFO, WHENMOON_CTX, "book-persist global init failed");
-    TA_Shutdown();
-    return(FAIL);
-  }
-
   if(wm_market_persist_global_init() != SUCCESS)
   {
     clam(CLAM_INFO, WHENMOON_CTX, "market-persist global init failed");
-    wm_book_persist_global_destroy();
     TA_Shutdown();
     return(FAIL);
   }
@@ -360,7 +348,7 @@ whenmoon_init(void)
 
   if(st == NULL)
   {
-    wm_book_persist_global_destroy();
+    wm_market_persist_global_destroy();
     TA_Shutdown();
     return(FAIL);
   }
@@ -401,19 +389,9 @@ whenmoon_init(void)
     goto fail;
   }
 
-  // WM-LT-4: trade engine. Plugin-global registry of (market, strategy)
-  // trade books. Init order: after the strategy registry so the detach
-  // hooks have somewhere to call into; before verb registration so the
-  // /whenmoon trade … verbs find an initialized engine.
-  if(wm_trade_engine_init() != SUCCESS)
-  {
-    clam(CLAM_INFO, WHENMOON_CTX, "wm_trade_engine_init failed");
-    goto fail;
-  }
-
-  // WM-LT-8-B2: real-mode side-table (kill-switch + risk gates +
-  // pending ring). Default kill-switch=false so submission FAILs
-  // closed until an admin flips plugin.whenmoon.exchange.<exch>.live.
+  // Real-mode kill-switch + per-market submit path. Master kill-switch
+  // (plugin.whenmoon.exchange.coinbase.live, KV_BOOL) defaults to
+  // false so submission FAILs closed until an operator flips it.
   if(wm_live_engine_init() != SUCCESS)
   {
     clam(CLAM_INFO, WHENMOON_CTX, "wm_live_engine_init failed");
@@ -454,12 +432,6 @@ whenmoon_init(void)
   if(wm_strategy_register_verbs() != SUCCESS)
   {
     clam(CLAM_INFO, WHENMOON_CTX, "strategy verb registration failed");
-    goto fail;
-  }
-
-  if(wm_trade_register_verbs() != SUCCESS)
-  {
-    clam(CLAM_INFO, WHENMOON_CTX, "trade verb registration failed");
     goto fail;
   }
 
@@ -505,7 +477,6 @@ fail:
   whenmoon_state = NULL;
   mem_free(st);
   wm_market_persist_global_destroy();
-  wm_book_persist_global_destroy();
   TA_Shutdown();
   return(FAIL);
 }
@@ -554,7 +525,6 @@ whenmoon_deinit(void)
   }
 
   wm_market_persist_global_destroy();
-  wm_book_persist_global_destroy();
   TA_Shutdown();
   clam(CLAM_INFO, WHENMOON_CTX, "whenmoon plugin deinitialized");
 }

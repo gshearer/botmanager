@@ -4,9 +4,9 @@
 // One sweep = N iterations of wm_backtest_run_iteration_with_id over a
 // shared snapshot. Each iteration uses a different parameter vector
 // drawn from the cartesian product of the declared sweep axes; each
-// runs on its own worker thread with a private wm_trade_registry so
-// the per-iteration trade book never contends with the live registry
-// or with any other worker.
+// runs on its own worker thread. wm_backtest_run_iteration_with_id
+// creates a per-iteration synthetic market internally, so workers
+// never share state.
 //
 // Per-iteration parameter delivery uses the strategy KV resolver's
 // per-market override slot. The worker pre-allocates a synthetic id,
@@ -27,8 +27,7 @@
 #include "sweep.h"
 
 #include "backtest.h"
-#include "order.h"
-#include "pnl.h"
+#include "market.h"
 #include "strategy.h"
 #include "whenmoon.h"
 #include "whenmoon_strategy.h"
@@ -104,22 +103,47 @@ wm_bt_sweep_score_name(wm_bt_sweep_score_t s)
 }
 
 double
-wm_bt_sweep_score_value(const wm_trade_snapshot_t *snap,
+wm_bt_sweep_score_value(const wm_market_session_snapshot_t *snap,
     wm_bt_sweep_score_t score)
 {
-  double v;
+  const wm_market_stats_t *st;
+  double                   v;
+  double                   equity;
+  double                   position_value;
 
   if(snap == NULL)
     return(WM_BT_RESULT_NOSCORE);
 
+  st = &snap->stats[WM_MARKET_MODE_PAPER];
+
   switch(score)
   {
-    case WM_BT_SCORE_REALIZED:      v = snap->metrics.realized_pnl; break;
-    case WM_BT_SCORE_SHARPE:        v = snap->metrics.sharpe;       break;
-    case WM_BT_SCORE_SORTINO:       v = snap->metrics.sortino;      break;
-    case WM_BT_SCORE_EQUITY:        v = snap->equity;               break;
-    case WM_BT_SCORE_PROFIT_FACTOR: v = snap->metrics.profit_factor;break;
-    default:                        return(WM_BT_RESULT_NOSCORE);
+    case WM_BT_SCORE_REALIZED:
+      v = st->realized_pnl_lifetime;
+      break;
+
+    case WM_BT_SCORE_EQUITY:
+      // Match the legacy `wm_trade_snapshot_t.equity` shape:
+      // cash + position * mark.
+      position_value = (snap->position.side == WM_MARKET_POS_LONG)
+          ? snap->position.qty * snap->last_mark_px
+          : 0.0;
+      equity         = st->cash + position_value;
+      v              = equity;
+      break;
+
+    // Sharpe / Sortino / profit-factor were derived by the legacy
+    // PnL accumulator on closing fills. The per-market session does
+    // not carry the returns ring or gross-profit / gross-loss
+    // split, so these selectors collapse to NOSCORE and sort to
+    // the bottom rather than emit a misleading zero.
+    case WM_BT_SCORE_SHARPE:
+    case WM_BT_SCORE_SORTINO:
+    case WM_BT_SCORE_PROFIT_FACTOR:
+      return(WM_BT_RESULT_NOSCORE);
+
+    default:
+      return(WM_BT_RESULT_NOSCORE);
   }
 
   // NaN / -inf collapse to NOSCORE so they sort to the bottom.
@@ -708,6 +732,11 @@ wm_bt_sweep_cleanup_stale_kv(void)
 // JSON serialisers (params / metrics) — used by the worker on persist     //
 // ----------------------------------------------------------------------- //
 
+// Forward declaration: defined inside the worker section because it
+// is also used by wm_bt_sweep_run_one + wm_bt_sweep_render_topk.
+static double
+wm_bt_synth_equity(const wm_market_session_snapshot_t *snap);
+
 static void
 wm_bt_sweep_render_params_json(const wm_bt_sweep_plan_t *plan,
     const uint32_t *indices, char *out, size_t cap)
@@ -755,11 +784,17 @@ wm_bt_sweep_render_params_json(const wm_bt_sweep_plan_t *plan,
     out[cap - 1] = '\0';
 }
 
+// Render the per-iteration metrics JSON for the wm_backtest_run.metrics
+// JSONB column. Preserves the legacy schema's keys so existing readers
+// keep working; missing fields (sharpe/sortino/profit_factor/etc.) emit
+// as zero because the per-market session doesn't track them.
 static void
-wm_bt_sweep_render_metrics_json(const wm_trade_snapshot_t *snap,
+wm_bt_sweep_render_metrics_json(const wm_market_session_snapshot_t *snap,
     char *out, size_t cap)
 {
-  int n;
+  const wm_market_stats_t *st;
+  double                   equity;
+  int                      n;
 
   if(out == NULL || cap == 0 || snap == NULL)
   {
@@ -767,30 +802,33 @@ wm_bt_sweep_render_metrics_json(const wm_trade_snapshot_t *snap,
     return;
   }
 
+  st     = &snap->stats[WM_MARKET_MODE_PAPER];
+  equity = wm_bt_synth_equity(snap);
+
   n = snprintf(out, cap,
       "{"
-      "\"trades\":%u,"
-      "\"wins\":%u,"
-      "\"losses\":%u,"
-      "\"win_rate\":%.6f,"
+      "\"trades\":%" PRIu64 ","
+      "\"wins\":0,"
+      "\"losses\":0,"
+      "\"win_rate\":0,"
       "\"realized_pnl\":%.6f,"
       "\"fees_paid\":%.6f,"
-      "\"profit_factor\":%.6f,"
-      "\"max_drawdown\":%.6f,"
-      "\"avg_win\":%.6f,"
-      "\"avg_loss\":%.6f,"
-      "\"sharpe\":%.6f,"
-      "\"sortino\":%.6f,"
+      "\"profit_factor\":0,"
+      "\"max_drawdown\":0,"
+      "\"avg_win\":0,"
+      "\"avg_loss\":0,"
+      "\"sharpe\":0,"
+      "\"sortino\":0,"
       "\"final_equity\":%.6f,"
       "\"starting_cash\":%.6f,"
       "\"final_cash\":%.6f"
       "}",
-      snap->metrics.n_trades, snap->metrics.n_wins, snap->metrics.n_losses,
-      snap->metrics.win_rate, snap->metrics.realized_pnl,
-      snap->metrics.fees_paid, snap->metrics.profit_factor,
-      snap->metrics.max_drawdown, snap->metrics.avg_win,
-      snap->metrics.avg_loss, snap->metrics.sharpe, snap->metrics.sortino,
-      snap->equity, snap->starting_cash, snap->cash);
+      st->lifetime_fills_count,
+      st->realized_pnl_lifetime,
+      st->lifetime_fees,
+      equity,
+      st->starting_cash,
+      st->cash);
 
   if(n < 0 || (size_t)n >= cap)
     out[cap - 1] = '\0';
@@ -829,12 +867,32 @@ typedef struct
   wm_bt_sweep_result_t       *results;
 } wm_bt_pool_t;
 
+// Compute equity (cash + position * mark) from a synth-market snapshot
+// in PAPER mode. Mirrors the legacy `wm_trade_snapshot_t.equity` shape
+// so persist + render output stay consistent across the rip.
+static double
+wm_bt_synth_equity(const wm_market_session_snapshot_t *snap)
+{
+  const wm_market_stats_t *st;
+  double                   position_value;
+
+  if(snap == NULL)
+    return(0.0);
+
+  st = &snap->stats[WM_MARKET_MODE_PAPER];
+
+  position_value = (snap->position.side == WM_MARKET_POS_LONG)
+      ? snap->position.qty * snap->last_mark_px
+      : 0.0;
+
+  return(st->cash + position_value);
+}
+
 static void
 wm_bt_sweep_run_one(wm_bt_pool_t *pool, uint32_t iter,
     const uint32_t *indices)
 {
   wm_bt_sweep_result_t *result = &pool->results[iter];
-  wm_trade_registry_t  *reg;
   wm_backtest_result_t  bt_result;
   char                  synth_id[WM_MARKET_ID_STR_SZ];
   char                  err[160];
@@ -861,29 +919,11 @@ wm_bt_sweep_run_one(wm_bt_pool_t *pool, uint32_t iter,
     return;
   }
 
-  // Private trade registry for this iteration.
-  reg = wm_trade_registry_create();
-
-  if(reg == NULL)
-  {
-    snprintf(result->err, sizeof(result->err),
-        "private registry alloc failed");
-    wm_bt_sweep_drop_iter_kv(synth_id);
-    return;
-  }
-
-  wm_trade_engine_use_registry(reg);
-
   err[0] = '\0';
   iter_ok = wm_backtest_run_iteration_with_id(pool->st, pool->snap,
       pool->strategy_name, synth_id, pool->base_params,
       pool->iter_windows, pool->iter_n_windows,
       &bt_result, err, sizeof(err)) == SUCCESS;
-
-  // Unbind + destroy the registry regardless of outcome — workers
-  // never share registries.
-  wm_trade_engine_use_registry(NULL);
-  wm_trade_registry_destroy(reg);
 
   if(!iter_ok)
   {
@@ -903,10 +943,12 @@ wm_bt_sweep_run_one(wm_bt_pool_t *pool, uint32_t iter,
       pool->plan->score);
 
   {
-    wm_backtest_record_t rec;
-    char                 metrics_json[1024];
-    char                 params_json[512];
-    int64_t              new_run_id = 0;
+    const wm_market_stats_t *st_paper =
+        &bt_result.trade.stats[WM_MARKET_MODE_PAPER];
+    wm_backtest_record_t     rec;
+    char                     metrics_json[1024];
+    char                     params_json[512];
+    int64_t                  new_run_id = 0;
 
     memset(&rec, 0, sizeof(rec));
     rec.market_id     = pool->market_id_db;
@@ -918,12 +960,12 @@ wm_bt_sweep_run_one(wm_bt_pool_t *pool, uint32_t iter,
         "%s", pool->snap->range_end);
     rec.wallclock_ms  = (int64_t)bt_result.wallclock_ms;
     rec.bars_replayed = bt_result.bars_replayed;
-    rec.n_trades      = bt_result.trade.metrics.n_trades;
-    rec.realized_pnl  = bt_result.trade.metrics.realized_pnl;
-    rec.max_drawdown  = bt_result.trade.metrics.max_drawdown;
-    rec.sharpe        = bt_result.trade.metrics.sharpe;
-    rec.sortino       = bt_result.trade.metrics.sortino;
-    rec.final_equity  = bt_result.trade.equity;
+    rec.n_trades      = (uint32_t)st_paper->lifetime_fills_count;
+    rec.realized_pnl  = st_paper->realized_pnl_lifetime;
+    rec.max_drawdown  = 0.0;     // not tracked by per-market session
+    rec.sharpe        = 0.0;
+    rec.sortino       = 0.0;
+    rec.final_equity  = wm_bt_synth_equity(&bt_result.trade);
     snprintf(rec.window_kind, sizeof(rec.window_kind),
         "%s", pool->window_kind);
     rec.n_windows     = pool->n_windows_per_iter;
@@ -1210,51 +1252,61 @@ wm_bt_sweep_render_topk(const cmd_ctx_t *ctx,
       continue;
     }
 
-    if(is_oos && r->have_oos)
     {
-      // Head + OOS row format. The OOS score uses the same metric
-      // as the head score so the in-sample / out-of-sample gap is
-      // legible at a glance.
-      snprintf(line, sizeof(line),
-          "  #%-3u %s  head_%s=%+.4f oos_%s=%+.4f"
-          " trades=%-3u/%-3u equity=%.2f"
-          " ms=%-5" PRIu64 "%s%" PRId64,
-          i + 1, param_buf,
-          wm_bt_sweep_score_name(plan->score), r->score,
-          wm_bt_sweep_score_name(plan->score), r->oos_score,
-          r->trade.metrics.n_trades, r->oos_n_trades,
-          r->trade.equity, r->wallclock_ms,
-          r->run_id_db > 0 ? " run=" : "",
-          r->run_id_db > 0 ? r->run_id_db : (int64_t)0);
-    }
-    else if(is_oos)
-    {
-      // Top-K row whose OOS pass failed to run (e.g. snapshot has
-      // no bars in the tail). Show the head score with an OOS
-      // diagnostic blob.
-      snprintf(line, sizeof(line),
-          "  #%-3u %s  head_%s=%+.4f oos=FAIL: %.40s"
-          " trades=%-3u equity=%.2f ms=%-5" PRIu64 "%s%" PRId64,
-          i + 1, param_buf,
-          wm_bt_sweep_score_name(plan->score), r->score,
-          r->oos_err[0] != '\0' ? r->oos_err : "n/a",
-          r->trade.metrics.n_trades, r->trade.equity,
-          r->wallclock_ms,
-          r->run_id_db > 0 ? " run=" : "",
-          r->run_id_db > 0 ? r->run_id_db : (int64_t)0);
-    }
-    else
-    {
-      snprintf(line, sizeof(line),
-          "  #%-3u %s  %s=%+.4f"
-          " realized=%+.4f trades=%-3u equity=%.2f"
-          " ms=%-5" PRIu64 "%s%" PRId64,
-          i + 1, param_buf,
-          wm_bt_sweep_score_name(plan->score), r->score,
-          r->trade.metrics.realized_pnl, r->trade.metrics.n_trades,
-          r->trade.equity, r->wallclock_ms,
-          r->run_id_db > 0 ? " run=" : "",
-          r->run_id_db > 0 ? r->run_id_db : (int64_t)0);
+      const wm_market_stats_t *st_paper =
+          &r->trade.stats[WM_MARKET_MODE_PAPER];
+      uint32_t                  n_fills   =
+          (uint32_t)st_paper->lifetime_fills_count;
+      double                    equity    = wm_bt_synth_equity(&r->trade);
+
+      if(is_oos && r->have_oos)
+      {
+        // Head + OOS row format. The OOS score uses the same metric
+        // as the head score so the in-sample / out-of-sample gap is
+        // legible at a glance.
+        snprintf(line, sizeof(line),
+            "  #%-3u %s  head_%s=%+.4f oos_%s=%+.4f"
+            " fills=%-3u/%-3u equity=%.2f"
+            " ms=%-5" PRIu64 "%s%" PRId64,
+            i + 1, param_buf,
+            wm_bt_sweep_score_name(plan->score), r->score,
+            wm_bt_sweep_score_name(plan->score), r->oos_score,
+            n_fills, r->oos_n_trades,
+            equity, r->wallclock_ms,
+            r->run_id_db > 0 ? " run=" : "",
+            r->run_id_db > 0 ? r->run_id_db : (int64_t)0);
+      }
+
+      else if(is_oos)
+      {
+        // Top-K row whose OOS pass failed to run (e.g. snapshot has
+        // no bars in the tail). Show the head score with an OOS
+        // diagnostic blob.
+        snprintf(line, sizeof(line),
+            "  #%-3u %s  head_%s=%+.4f oos=FAIL: %.40s"
+            " fills=%-3u equity=%.2f ms=%-5" PRIu64 "%s%" PRId64,
+            i + 1, param_buf,
+            wm_bt_sweep_score_name(plan->score), r->score,
+            r->oos_err[0] != '\0' ? r->oos_err : "n/a",
+            n_fills, equity,
+            r->wallclock_ms,
+            r->run_id_db > 0 ? " run=" : "",
+            r->run_id_db > 0 ? r->run_id_db : (int64_t)0);
+      }
+
+      else
+      {
+        snprintf(line, sizeof(line),
+            "  #%-3u %s  %s=%+.4f"
+            " realized=%+.4f fills=%-3u equity=%.2f"
+            " ms=%-5" PRIu64 "%s%" PRId64,
+            i + 1, param_buf,
+            wm_bt_sweep_score_name(plan->score), r->score,
+            st_paper->realized_pnl_lifetime, n_fills,
+            equity, r->wallclock_ms,
+            r->run_id_db > 0 ? " run=" : "",
+            r->run_id_db > 0 ? r->run_id_db : (int64_t)0);
+      }
     }
 
     cmd_reply(ctx, line);
@@ -1370,15 +1422,16 @@ wm_bt_sweep_run_oos_validation(whenmoon_state_t *st,
     }
   }
 
-  // Validate each top-K against the OOS tail. Each iteration runs in
-  // its own private registry; the synth_id is fresh per validation
-  // so per-iter KV slots don't collide with the head sweep's.
+  // Validate each top-K against the OOS tail. Each iteration creates
+  // its own per-iteration synthetic market inside
+  // wm_backtest_run_iteration_with_id; the synth_id is fresh per
+  // validation so per-iter KV slots don't collide with the head
+  // sweep's.
   for(i = 0; i < top_k; i++)
   {
     uint32_t              src_iter;
     uint32_t              indices[WM_BT_SWEEP_MAX_PARAMS] = {0};
     char                  synth_id[WM_MARKET_ID_STR_SZ];
-    wm_trade_registry_t  *reg;
     wm_backtest_result_t  bt_result;
     char                  iter_err[160];
     bool                  iter_ok;
@@ -1404,27 +1457,11 @@ wm_bt_sweep_run_oos_validation(whenmoon_state_t *st,
       continue;
     }
 
-    reg = wm_trade_registry_create();
-
-    if(reg == NULL)
-    {
-      snprintf(results[src_iter].oos_err,
-          sizeof(results[src_iter].oos_err),
-          "private registry alloc failed");
-      wm_bt_sweep_drop_iter_kv(synth_id);
-      continue;
-    }
-
-    wm_trade_engine_use_registry(reg);
-
     iter_err[0] = '\0';
     iter_ok = wm_backtest_run_iteration_with_id(st, snap,
         strategy_name, synth_id, base_params,
         oos_tail, 1, &bt_result, iter_err, sizeof(iter_err))
         == SUCCESS;
-
-    wm_trade_engine_use_registry(NULL);
-    wm_trade_registry_destroy(reg);
 
     wm_bt_sweep_drop_iter_kv(synth_id);
 
@@ -1436,11 +1473,17 @@ wm_bt_sweep_run_oos_validation(whenmoon_state_t *st,
       continue;
     }
 
-    results[src_iter].have_oos     = true;
-    results[src_iter].oos_score    =
-        wm_bt_sweep_score_value(&bt_result.trade, plan->score);
-    results[src_iter].oos_realized = bt_result.trade.metrics.realized_pnl;
-    results[src_iter].oos_n_trades = bt_result.trade.metrics.n_trades;
+    {
+      const wm_market_stats_t *st_paper =
+          &bt_result.trade.stats[WM_MARKET_MODE_PAPER];
+
+      results[src_iter].have_oos     = true;
+      results[src_iter].oos_score    =
+          wm_bt_sweep_score_value(&bt_result.trade, plan->score);
+      results[src_iter].oos_realized = st_paper->realized_pnl_lifetime;
+      results[src_iter].oos_n_trades =
+          (uint32_t)st_paper->lifetime_fills_count;
+    }
 
     if(results[src_iter].run_id_db > 0)
       wm_backtest_persist_oos_update(results[src_iter].run_id_db,

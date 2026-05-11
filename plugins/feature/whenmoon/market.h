@@ -83,9 +83,6 @@ typedef struct
 #define WM_MARKET_PENDING_CAP     32
 #define WM_MARKET_TRADE_DEDUP     64
 
-// Mirror of wm_fill_t (order.h:95) — same shape so a future verifier
-// can memcmp rings as a sanity check, but declared here so callers do
-// not pull order.h.
 typedef struct
 {
   int64_t  ts_ms;
@@ -414,6 +411,32 @@ bool wm_market_session_snapshot(whenmoon_market_t *mk,
 // cmd_register call fails (matches sibling `wm_market_register_verbs`
 // shape).
 bool wm_show_market_register_verbs(void);
+
+// ------------------------------------------------------------------ //
+// WM-MK-5: synthetic markets for backtest iterations                  //
+// ------------------------------------------------------------------ //
+//
+// Heap-owned `whenmoon_market_t` instances that share their grain
+// rings with a source live market but carry an independent session
+// (mode, position, ledgers, pending ring). NOT registered in
+// `st->markets->arr` — bypasses WS resub, persistence, and the
+// live-tick fanout. Allocated per-iteration; destroyed by the same
+// worker after snapshotting.
+//
+// Lifetime: `src->grain_arr` pointers are shared (read-only during
+// iteration). The source market's lifetime spans the entire sweep;
+// each iteration is a strict subset. No grain ring is freed before
+// the synth market goes away.
+
+// SUCCESS on alloc + init; FAIL on bad args / OOM (errbuf populated
+// when non-NULL).
+bool wm_market_create_synthetic(const char *market_id_str,
+    const whenmoon_market_t *src, whenmoon_market_t **out_mk,
+    char *errbuf, size_t errbuf_sz);
+
+// Destroy a synthetic market. Caller asserts no other thread holds
+// `mk->lock`. Frees the struct.
+void wm_market_destroy_synthetic(whenmoon_market_t *mk);
 
 #endif // WHENMOON_INTERNAL
 

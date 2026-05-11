@@ -1,36 +1,25 @@
 // botmanager — MIT
-// whenmoon real-mode trade execution.
+// whenmoon real-mode trade execution (per-market path).
 //
-// Two coexisting paths after WM-MK-3-B:
+// One path post-WM-MK-5: wm_market_engine_on_signal calls
+// wm_market_engine_real_submit_locked under mk->lock when
+// session.mode == WM_MARKET_MODE_REAL. That helper runs the master
+// kill-switch + cred + daily-loss + pending-cap + max-notional-clip
+// cascade, registers a wm_market_pending_t in mk->session.pending[],
+// and dispatches coinbase_place_order_async. The done callback
+// (wm_live_market_order_done) reaps the pending row on gateway
+// reject or records gateway_accepted=true on accept. Fills land
+// asynchronously through the WS user-channel + REST /fills consumers
+// (wm_live_handle_ws_fill / wm_live_on_fills) which route into
+// wm_market_engine_record_external_fill.
 //
-//   1. Per-market path (production). wm_market_engine_on_signal calls
-//      wm_market_engine_real_submit_locked under mk->lock when
-//      session.mode == WM_MARKET_MODE_REAL. That helper runs the
-//      master kill-switch + cred + daily-loss + pending-cap +
-//      max-notional-clip cascade, registers a wm_market_pending_t in
-//      mk->session.pending[], and dispatches
-//      coinbase_place_order_async. The done callback
-//      (wm_live_market_order_done) reaps the pending row on gateway
-//      reject or records gateway_accepted=true on accept. Fills land
-//      asynchronously through the WS user-channel + REST /fills
-//      consumers (wm_live_handle_ws_fill / wm_live_on_fills) which
-//      route into wm_market_engine_record_external_fill.
-//
-//   2. Legacy per-(market, strategy) path. wm_live_engine_on_signal_locked
-//      and wm_live_engine_operator_submit_locked back the
-//      `/whenmoon trade *` verb tree. Pending rows live on a private
-//      wm_live_book_t chain in g_live.head (own dedicated mutex).
-//      WM-MK-5 deletes both entry points + the legacy chain.
-//
-// Master kill-switches:
-//   - plugin.whenmoon.force_manual (legacy path; true = block).
-//   - plugin.whenmoon.exchange.coinbase.live (per-market path; true =
-//     allow). Distinct knobs, distinct polarity, distinct subsystems.
+// Master kill-switch: plugin.whenmoon.exchange.coinbase.live (KV_BOOL,
+// default false). Operator must opt in explicitly before any real
+// order leaves the daemon.
 //
 // Locking:
-//   - g_live.mu protects g_live.head (legacy chain) +
-//     g_live.last_fills_cursor_ms.
-//   - mk->lock protects mk->session.pending[] (per-market path).
+//   - g_live.mu protects g_live.last_fills_cursor_ms.
+//   - mk->lock protects mk->session.pending[].
 //   - The two locks are independent; no path takes both.
 
 #define WHENMOON_INTERNAL
@@ -38,9 +27,6 @@
 
 #include "market.h"
 #include "market_engine.h"
-#include "order.h"
-#include "pnl.h"
-#include "sizer.h"
 #include "whenmoon.h"
 #include "whenmoon_strategy.h"
 
@@ -63,44 +49,13 @@
 #define WM_LIVE_CTX  "whenmoon.live"
 
 // ----------------------------------------------------------------------- //
-// Side-table state                                                        //
+// Engine global state                                                     //
 // ----------------------------------------------------------------------- //
-
-// Legacy per-(market, strategy) book row. WM-MK-3-B keeps this for
-// `wm_live_engine_on_signal_locked` + `wm_live_engine_operator_submit_locked`
-// (back the `/whenmoon trade *` verbs); WM-MK-5 rips both entry points
-// and this struct in one cut. The pending ring + daily-loss anchor
-// stay alive on this struct for the legacy path. Trade-id dedup +
-// last_fill_ms tracking moved to per-market state in WM-MK-3-B (see
-// wm_market_session_t.pending[].recorded_trade_ids[] + the global
-// g_live.last_fills_cursor_ms).
-typedef struct wm_live_book
-{
-  char                   market_id_str[WM_MARKET_ID_STR_SZ];
-  char                   strategy_name[WM_STRATEGY_NAME_SZ];
-
-  wm_trade_pending_t     pending[WM_TRADE_PENDING_CAP];
-  uint32_t               pending_n;     // populated rows
-
-  // Daily-loss anchor (UTC). On every signal, if the book's mark ts
-  // crosses a UTC midnight relative to the anchor, we re-anchor to the
-  // current cumulative realized_pnl. realized_today is the difference.
-  int64_t                day_anchor_utc_ms;
-  double                 day_anchor_realized_pnl;
-
-  struct wm_live_book   *next;
-} wm_live_book_t;
 
 static struct
 {
   pthread_mutex_t      mu;
 
-  // Legacy per-(market, strategy) book chain. Used by
-  // wm_live_engine_on_signal_locked + _operator_submit_locked which
-  // back the `/whenmoon trade *` verb tree. WM-MK-3-B left these
-  // entries in place; WM-MK-5 rips both entry points + the chain in
-  // one cut.
-  wm_live_book_t      *head;
   bool                 initialized;
 
   // WS user-channel subscription (one for the entire live trader; AT
@@ -112,11 +67,11 @@ static struct
   // REST /fills safety-net poll periodic.
   task_handle_t        fills_poll_task;
 
-  // WM-MK-3-B: single global cursor for the REST /fills poll. Coinbase
-  // pages /fills globally on sequence_timestamp, not per-product, so a
-  // per-market cursor doesn't help. Initialized to "now - overlap" on
-  // engine start; advanced on every applied fill via the consumers.
-  // Guarded by g_live.mu.
+  // Single global cursor for the REST /fills poll. Coinbase pages
+  // /fills globally on sequence_timestamp, not per-product, so a
+  // per-market cursor wouldn't help. Initialized to "now - overlap"
+  // on engine start; advanced on every applied fill via the
+  // consumers. Guarded by g_live.mu.
   int64_t              last_fills_cursor_ms;
 } g_live;
 
@@ -125,7 +80,7 @@ static void wm_live_ws_user_event_cb(const coinbase_ws_event_t *ev,
     void *user);
 static void wm_live_fills_poll_tick(task_t *t);
 
-#define WM_LIVE_FILLS_POLL_SEC   30
+#define WM_LIVE_FILLS_POLL_SEC         30
 #define WM_LIVE_FILLS_POLL_OVERLAP_MS  (60 * 1000)
 
 // ----------------------------------------------------------------------- //
@@ -158,19 +113,16 @@ wm_live_engine_init(void)
 void
 wm_live_engine_destroy(void)
 {
-  wm_live_book_t *b;
-  wm_live_book_t *next;
-
   if(!g_live.initialized) return;
 
   // Cancel periodic first so no fresh tick fires on freed state.
   task_cancel(g_live.fills_poll_task);
   g_live.fills_poll_task = TASK_HANDLE_NONE;
 
-  // Drop WS subscription before grabbing the lock — coinbase_ws_unsub
-  // can fire callbacks on the WS reader thread; better to let those
-  // see g_live.initialized=false (still true here, but the ws_sub
-  // pointer null-out below means no new events).
+  // Drop WS subscription before destroying the lock — coinbase_ws_unsub
+  // can fire callbacks on the WS reader thread; better to let those see
+  // g_live.initialized = false (still true here, but the ws_sub pointer
+  // null-out below means no new events).
   if(g_live.ws_sub != NULL)
   {
     coinbase_ws_unsubscribe(g_live.ws_sub);
@@ -178,18 +130,6 @@ wm_live_engine_destroy(void)
   }
   g_live.ws_st = NULL;
 
-  pthread_mutex_lock(&g_live.mu);
-
-  b = g_live.head;
-  while(b != NULL)
-  {
-    next = b->next;
-    mem_free(b);
-    b = next;
-  }
-  g_live.head = NULL;
-
-  pthread_mutex_unlock(&g_live.mu);
   pthread_mutex_destroy(&g_live.mu);
   g_live.initialized = false;
 
@@ -197,124 +137,8 @@ wm_live_engine_destroy(void)
 }
 
 // ----------------------------------------------------------------------- //
-// Side-table helpers (caller holds g_live.mu)                             //
+// UUID + place-order builder                                              //
 // ----------------------------------------------------------------------- //
-
-static wm_live_book_t *
-wm_live_book_find_locked(const char *market_id_str,
-    const char *strategy_name)
-{
-  for(wm_live_book_t *lb = g_live.head; lb != NULL; lb = lb->next)
-  {
-    if(strcmp(lb->market_id_str, market_id_str) == 0
-        && strcmp(lb->strategy_name, strategy_name) == 0)
-      return(lb);
-  }
-  return(NULL);
-}
-
-static wm_live_book_t *
-wm_live_book_get_locked(const char *market_id_str,
-    const char *strategy_name)
-{
-  wm_live_book_t *lb;
-
-  lb = wm_live_book_find_locked(market_id_str, strategy_name);
-  if(lb != NULL) return(lb);
-
-  lb = mem_alloc(WM_LIVE_CTX, "live_book", sizeof(*lb));
-  if(lb == NULL) return(NULL);
-
-  memset(lb, 0, sizeof(*lb));
-  snprintf(lb->market_id_str, sizeof(lb->market_id_str), "%s",
-      market_id_str);
-  snprintf(lb->strategy_name, sizeof(lb->strategy_name), "%s",
-      strategy_name);
-
-  lb->next   = g_live.head;
-  g_live.head = lb;
-  return(lb);
-}
-
-// ----------------------------------------------------------------------- //
-// KV + UTC helpers                                                        //
-// ----------------------------------------------------------------------- //
-
-static int64_t
-wm_live_utc_day_start_ms(int64_t epoch_ms)
-{
-  time_t    t  = (time_t)(epoch_ms / 1000);
-  struct tm tm = {0};
-
-  gmtime_r(&t, &tm);
-  tm.tm_hour = 0;
-  tm.tm_min  = 0;
-  tm.tm_sec  = 0;
-
-  return((int64_t)timegm(&tm) * 1000);
-}
-
-// True iff the plugin-wide master "force every real book to behave as
-// manual" KV is set. When true, every WM_TRADE_MODE_REAL book is
-// downgraded for signal-driven submission only — operator-issued
-// /whenmoon trade buy|sell still routes normally (the operator
-// override is explicit and not affected by this knob).
-static bool
-wm_live_force_manual(void)
-{
-  static const char *path = "plugin.whenmoon.force_manual";
-
-  if(!kv_exists(path))
-    (void)kv_register(path, KV_BOOL, "false", NULL, NULL,
-        "Plugin-wide master switch: when true, every real-mode book"
-        " behaves as if it were in manual mode for signal-driven"
-        " trades. Operator-issued /whenmoon trade buy|sell still"
-        " executes normally. Use as a single-knob stop for all real"
-        " trading without touching per-book mode state. Default"
-        " false. Per-book risk caps still apply when this is false.");
-
-  return(kv_get_uint(path) != 0);
-}
-
-static double
-wm_live_get_daily_loss_bps(const wm_trade_book_t *book)
-{
-  char    path[KV_KEY_SZ * 2];
-  double  bps;
-
-  snprintf(path, sizeof(path),
-      "plugin.whenmoon.market.%s.strategy.%s.daily_loss_bps",
-      book->market_id_str, book->strategy_name);
-
-  if(!kv_exists(path))
-    (void)kv_register(path, KV_DOUBLE, "200.0", NULL, NULL,
-        "Daily realized-loss cap, basis points of starting_cash."
-        " Real-mode signals FAIL closed when realized PnL since the"
-        " live engine's day-anchor breaches -starting_cash * bps/10000.");
-
-  bps = kv_get_double(path);
-  if(bps > 0.0) return(bps);
-
-  return((double)WM_TRADE_RISK_DEFAULT_DAILY_LOSS_BPS);
-}
-
-static double
-wm_live_get_max_notional(const wm_trade_book_t *book)
-{
-  char path[KV_KEY_SZ * 2];
-
-  snprintf(path, sizeof(path),
-      "plugin.whenmoon.market.%s.strategy.%s.max_notional",
-      book->market_id_str, book->strategy_name);
-
-  if(!kv_exists(path))
-    (void)kv_register(path, KV_DOUBLE, "0.0", NULL, NULL,
-        "Per-order notional cap (quote currency). 0 = uncapped."
-        " When |intent.qty * mark| exceeds this, qty is clipped to"
-        " fit; the order is NOT rejected.");
-
-  return(kv_get_double(path));
-}
 
 // Mint a v4 UUID into out (caller buffer >= 37 bytes).
 static bool
@@ -377,9 +201,7 @@ wm_live_build_place_order_req(coinbase_place_order_req_t *out,
 // registers `plugin.whenmoon.exchange.coinbase.live` (KV_BOOL, default
 // false) on first read so the operator can flip it via `/set kv`. The
 // helper FAILs closed when the KV is missing or false — explicit opt-in
-// is required to enable real trading. Distinct from the legacy
-// `plugin.whenmoon.force_manual` knob, which the legacy book-engine
-// path uses with the opposite polarity.
+// is required to enable real trading.
 static bool
 wm_live_master_live_enabled(void)
 {
@@ -396,469 +218,7 @@ wm_live_master_live_enabled(void)
 }
 
 // ----------------------------------------------------------------------- //
-// Place-order done callback (curl worker thread)                          //
-// ----------------------------------------------------------------------- //
-
-typedef struct wm_live_done_ctx
-{
-  char  market_id_str[WM_MARKET_ID_STR_SZ];
-  char  strategy_name[WM_STRATEGY_NAME_SZ];
-  char  coid[WM_TRADE_COID_SZ];
-} wm_live_done_ctx_t;
-
-static void
-wm_live_order_done(const coinbase_order_result_t *res, void *user)
-{
-  wm_live_done_ctx_t *ctx;
-  wm_live_book_t     *lb;
-  bool                err;
-
-  ctx = (wm_live_done_ctx_t *)user;
-  if(ctx == NULL) return;
-
-  err = (res != NULL && res->err[0] != '\0');
-
-  pthread_mutex_lock(&g_live.mu);
-
-  lb = wm_live_book_find_locked(ctx->market_id_str, ctx->strategy_name);
-
-  if(lb != NULL)
-  {
-    for(uint32_t i = 0; i < lb->pending_n; i++)
-    {
-      if(strcmp(lb->pending[i].coid, ctx->coid) != 0) continue;
-
-      if(err)
-      {
-        clam(CLAM_WARN, WM_LIVE_CTX,
-            "%s/%s order rejected coid=%s err=%s",
-            lb->market_id_str, lb->strategy_name, ctx->coid, res->err);
-
-        lb->pending[i] = lb->pending[lb->pending_n - 1];
-        lb->pending_n--;
-      }
-      else
-      {
-        snprintf(lb->pending[i].order_id, sizeof(lb->pending[i].order_id),
-            "%s", res->order.order_id);
-        lb->pending[i].gateway_accepted = true;
-
-        clam(CLAM_INFO, WM_LIVE_CTX,
-            "%s/%s order accepted coid=%s order_id=%s",
-            lb->market_id_str, lb->strategy_name,
-            ctx->coid, res->order.order_id);
-      }
-      break;
-    }
-  }
-
-  pthread_mutex_unlock(&g_live.mu);
-  mem_free(ctx);
-}
-
-// ----------------------------------------------------------------------- //
-// Signal entry point                                                      //
-// ----------------------------------------------------------------------- //
-
-bool
-wm_live_engine_on_signal_locked(wm_trade_book_t *book,
-    double mark_px, int64_t mark_ms, const wm_strategy_signal_t *sig)
-{
-  wm_sizer_intent_t           intent;
-  wm_live_book_t             *lb;
-  wm_trade_pending_t         *pending;
-  coinbase_place_order_req_t  req     = {0};
-  wm_live_done_ctx_t         *ctx;
-  char                        exchange[16];
-  char                        base[8];
-  char                        quote[8];
-  char                        wire_product[16];
-  double                      daily_loss_bps;
-  double                      daily_loss_cap;
-  double                      max_notional;
-  double                      realized_pnl;
-  double                      realized_today;
-  int64_t                     today_start;
-  const char                 *side_str;
-  bool                        gate_ok;
-
-  if(book == NULL || sig == NULL || mark_px <= 0.0)
-    return(FAIL);
-
-  if(wm_market_parse_id(book->market_id_str, exchange, sizeof(exchange),
-         base, sizeof(base), quote, sizeof(quote)) != SUCCESS)
-  {
-    clam(CLAM_WARN, WM_LIVE_CTX,
-        "%s: malformed market id, refusing live submit",
-        book->market_id_str);
-    return(FAIL);
-  }
-
-  // Gate 1: master force_manual override.
-  if(wm_live_force_manual())
-  {
-    clam(CLAM_WARN, WM_LIVE_CTX,
-        "real submit suppressed: plugin.whenmoon.force_manual=true"
-        " (book %s/%s temporarily acting as manual)",
-        book->market_id_str, book->strategy_name);
-    return(FAIL);
-  }
-
-  // Gate 2: credentials.
-  if(!coinbase_apikey_configured())
-  {
-    clam(CLAM_WARN, WM_LIVE_CTX,
-        "real submit refused: %s credentials not configured",
-        exchange);
-    return(FAIL);
-  }
-
-  // Gates 3 + 4 require the side-table.
-  pthread_mutex_lock(&g_live.mu);
-
-  lb = wm_live_book_get_locked(book->market_id_str, book->strategy_name);
-  if(lb == NULL)
-  {
-    pthread_mutex_unlock(&g_live.mu);
-    clam(CLAM_WARN, WM_LIVE_CTX, "%s/%s: live state alloc failed",
-        book->market_id_str, book->strategy_name);
-    return(FAIL);
-  }
-
-  // Daily-loss anchor. On first contact (anchor uninitialised) we leave
-  // both fields at zero so realized_today equals lifetime realized PnL —
-  // this conservatively surfaces any losses already on the book at boot
-  // time. Once the daemon has been alive across a UTC midnight, the
-  // anchor advances to that midnight's realized PnL and subsequent
-  // checks are properly "since midnight". Persisting the anchor across
-  // reboots is a future refinement; v1 errs on the side of fail-closed.
-  today_start = wm_live_utc_day_start_ms(mark_ms > 0 ? mark_ms
-      : (int64_t)time(NULL) * 1000);
-
-  realized_pnl = (book->pnl != NULL) ? book->pnl->realized_pnl : 0.0;
-
-  if(lb->day_anchor_utc_ms == 0)
-    lb->day_anchor_utc_ms = today_start;
-  else if(lb->day_anchor_utc_ms != today_start)
-  {
-    lb->day_anchor_utc_ms       = today_start;
-    lb->day_anchor_realized_pnl = realized_pnl;
-  }
-
-  realized_today = realized_pnl - lb->day_anchor_realized_pnl;
-
-  daily_loss_bps = wm_live_get_daily_loss_bps(book);
-  daily_loss_cap = book->starting_cash * daily_loss_bps / 10000.0;
-
-  // Gate 3: daily-loss cap.
-  if(realized_today < -daily_loss_cap)
-  {
-    pthread_mutex_unlock(&g_live.mu);
-    clam(CLAM_WARN, WM_LIVE_CTX,
-        "%s/%s daily loss cap tripped: realized_today=%.4f cap=%.4f",
-        book->market_id_str, book->strategy_name,
-        realized_today, daily_loss_cap);
-    return(FAIL);
-  }
-
-  // Gate 4: pending count.
-  gate_ok = (lb->pending_n < WM_TRADE_PENDING_CAP);
-  pthread_mutex_unlock(&g_live.mu);
-
-  if(!gate_ok)
-  {
-    clam(CLAM_WARN, WM_LIVE_CTX,
-        "%s/%s pending cap reached (%u); dropping signal",
-        book->market_id_str, book->strategy_name,
-        WM_TRADE_PENDING_CAP);
-    return(FAIL);
-  }
-
-  // Gate 5: sizer.
-  wm_sizer_compute(book, mark_px, sig, &intent);
-
-  if(intent.action == WM_SIZER_HOLD)
-    return(FAIL);
-
-  // Gate 6: max-notional clip.
-  max_notional = wm_live_get_max_notional(book);
-
-  if(max_notional > 0.0)
-  {
-    double notional = intent.qty * mark_px;
-    if(notional > max_notional)
-    {
-      double clipped = max_notional / mark_px;
-      clam(CLAM_INFO, WM_LIVE_CTX,
-          "%s/%s notional clip qty %.6g -> %.6g (cap=%.4f mark=%.4f)",
-          book->market_id_str, book->strategy_name,
-          intent.qty, clipped, max_notional, mark_px);
-      intent.qty = clipped;
-    }
-  }
-
-  side_str = (intent.action == WM_SIZER_BUY) ? "buy" : "sell";
-
-  // Wire-form product id is the uppercase dash form. Build into a
-  // tightly-sized intermediate so the compiler can prove no truncation
-  // into req.product_id.
-  snprintf(wire_product, sizeof(wire_product), "%s-%s", base, quote);
-  for(char *p = wire_product; *p != '\0'; p++)
-    if(*p >= 'a' && *p <= 'z') *p = (char)(*p - 32);
-
-  snprintf(req.product_id, sizeof(req.product_id), "%s", wire_product);
-
-  if(wm_live_uuid_v4(req.client_oid, sizeof(req.client_oid)) != SUCCESS)
-  {
-    clam(CLAM_WARN, WM_LIVE_CTX,
-        "%s/%s: client_oid mint failed",
-        book->market_id_str, book->strategy_name);
-    return(FAIL);
-  }
-
-  snprintf(req.side, sizeof(req.side), "%s", side_str);
-  snprintf(req.type, sizeof(req.type), "limit");
-  snprintf(req.tif,  sizeof(req.tif),  "GTC");
-  req.price     = mark_px;
-  req.size      = intent.qty;
-  req.post_only = false;
-
-  // Register the pending row before submit so the done_cb finds it on
-  // the curl worker thread.
-  pthread_mutex_lock(&g_live.mu);
-
-  if(lb->pending_n >= WM_TRADE_PENDING_CAP)
-  {
-    pthread_mutex_unlock(&g_live.mu);
-    return(FAIL);
-  }
-
-  pending = &lb->pending[lb->pending_n++];
-  memset(pending, 0, sizeof(*pending));
-
-  snprintf(pending->coid, sizeof(pending->coid), "%s", req.client_oid);
-  snprintf(pending->side, sizeof(pending->side), "%s",
-      (intent.action == WM_SIZER_BUY) ? "buy" : "sell");
-  pending->limit_px      = mark_px;
-  pending->submitted_qty = intent.qty;
-  pending->submitted_ms  = mark_ms;
-
-  pthread_mutex_unlock(&g_live.mu);
-
-  ctx = mem_alloc(WM_LIVE_CTX, "live_done_ctx", sizeof(*ctx));
-  if(ctx == NULL)
-  {
-    pthread_mutex_lock(&g_live.mu);
-    if(lb->pending_n > 0) lb->pending_n--;
-    pthread_mutex_unlock(&g_live.mu);
-    return(FAIL);
-  }
-
-  snprintf(ctx->market_id_str, sizeof(ctx->market_id_str), "%s",
-      book->market_id_str);
-  snprintf(ctx->strategy_name, sizeof(ctx->strategy_name), "%s",
-      book->strategy_name);
-  snprintf(ctx->coid, sizeof(ctx->coid), "%s", req.client_oid);
-
-  if(coinbase_place_order_async(&req, wm_live_order_done, ctx) != SUCCESS)
-  {
-    // coinbase_place_order_async fires the done callback synchronously
-    // with res->err set when it returns FAIL — the done_cb has already
-    // dropped the pending row and freed ctx by the time we get here.
-    // Do NOT free ctx again or roll back pending_n; both have happened.
-    clam(CLAM_WARN, WM_LIVE_CTX,
-        "%s/%s coinbase_place_order_async returned FAIL"
-        " (done_cb already fired)",
-        book->market_id_str, book->strategy_name);
-    return(FAIL);
-  }
-
-  clam(CLAM_INFO, WM_LIVE_CTX,
-      "%s/%s submit %s qty=%.6g px=%.4f coid=%s",
-      book->market_id_str, book->strategy_name,
-      side_str, intent.qty, mark_px, req.client_oid);
-
-  return(SUCCESS);
-}
-
-// External fill entry point body lives in order.c (it touches the
-// trade-book registry + book persistence directly). See
-// wm_trade_engine_record_external_fill in order.c.
-
-// ----------------------------------------------------------------------- //
-// Operator-issued real submit (manual mode + ad-hoc real)                 //
-// ----------------------------------------------------------------------- //
-
-bool
-wm_live_engine_operator_submit_locked(wm_trade_book_t *book,
-    char side, double qty, double limit_px,
-    char *errbuf, size_t errbuf_sz)
-{
-  wm_live_book_t             *lb;
-  wm_trade_pending_t         *pending;
-  coinbase_place_order_req_t  req     = {0};
-  wm_live_done_ctx_t         *ctx;
-  char                        exchange[16];
-  char                        base[8];
-  char                        quote[8];
-  char                        wire_product[16];
-  double                      daily_loss_bps;
-  double                      daily_loss_cap;
-  double                      max_notional;
-  double                      realized_pnl;
-  double                      realized_today;
-  int64_t                     today_start;
-  int64_t                     now_ms;
-  bool                        gate_ok;
-  bool                        is_buy;
-
-  #define ERRSET(...) do { \
-      if(errbuf != NULL && errbuf_sz > 0) \
-        snprintf(errbuf, errbuf_sz, __VA_ARGS__); \
-    } while(0)
-
-  if(book == NULL || qty <= 0.0)
-    { ERRSET("invalid args"); return(FAIL); }
-
-  if(side != 'b' && side != 's')
-    { ERRSET("side must be 'b' or 's'"); return(FAIL); }
-
-  is_buy = (side == 'b');
-
-  if(wm_market_parse_id(book->market_id_str, exchange, sizeof(exchange),
-         base, sizeof(base), quote, sizeof(quote)) != SUCCESS)
-    { ERRSET("malformed market id"); return(FAIL); }
-
-  // Operator-issued bypasses force_manual; that knob exists to halt
-  // automated signal flow, not to override explicit human action.
-
-  if(!coinbase_apikey_configured())
-    { ERRSET("%s credentials not configured", exchange); return(FAIL); }
-
-  if(limit_px <= 0.0)
-    limit_px = book->last_mark_px;
-  if(limit_px <= 0.0)
-    { ERRSET("no mark price; specify limit_px"); return(FAIL); }
-
-  now_ms = (int64_t)time(NULL) * 1000;
-  if(book->last_mark_ms > now_ms) now_ms = book->last_mark_ms;
-
-  pthread_mutex_lock(&g_live.mu);
-
-  lb = wm_live_book_get_locked(book->market_id_str, book->strategy_name);
-  if(lb == NULL)
-    {
-      pthread_mutex_unlock(&g_live.mu);
-      ERRSET("live state alloc failed");
-      return(FAIL);
-    }
-
-  today_start = wm_live_utc_day_start_ms(now_ms);
-  realized_pnl = (book->pnl != NULL) ? book->pnl->realized_pnl : 0.0;
-
-  if(lb->day_anchor_utc_ms == 0)
-    lb->day_anchor_utc_ms = today_start;
-  else if(lb->day_anchor_utc_ms != today_start)
-    {
-      lb->day_anchor_utc_ms       = today_start;
-      lb->day_anchor_realized_pnl = realized_pnl;
-    }
-
-  realized_today = realized_pnl - lb->day_anchor_realized_pnl;
-  daily_loss_bps = wm_live_get_daily_loss_bps(book);
-  daily_loss_cap = book->starting_cash * daily_loss_bps / 10000.0;
-
-  if(realized_today < -daily_loss_cap)
-    {
-      pthread_mutex_unlock(&g_live.mu);
-      ERRSET("daily loss cap tripped (%.4f < -%.4f)",
-          realized_today, daily_loss_cap);
-      return(FAIL);
-    }
-
-  gate_ok = (lb->pending_n < WM_TRADE_PENDING_CAP);
-  pthread_mutex_unlock(&g_live.mu);
-
-  if(!gate_ok)
-    { ERRSET("pending cap reached (%u)", WM_TRADE_PENDING_CAP);
-      return(FAIL); }
-
-  max_notional = wm_live_get_max_notional(book);
-  if(max_notional > 0.0 && qty * limit_px > max_notional)
-    {
-      double clipped = max_notional / limit_px;
-      clam(CLAM_INFO, WM_LIVE_CTX,
-          "%s/%s operator notional clip qty %.6g -> %.6g",
-          book->market_id_str, book->strategy_name, qty, clipped);
-      qty = clipped;
-    }
-
-  snprintf(wire_product, sizeof(wire_product), "%s-%s", base, quote);
-  for(char *p = wire_product; *p != '\0'; p++)
-    if(*p >= 'a' && *p <= 'z') *p = (char)(*p - 32);
-
-  snprintf(req.product_id, sizeof(req.product_id), "%s", wire_product);
-
-  if(wm_live_uuid_v4(req.client_oid, sizeof(req.client_oid)) != SUCCESS)
-    { ERRSET("client_oid mint failed"); return(FAIL); }
-
-  snprintf(req.side, sizeof(req.side), "%s", is_buy ? "buy" : "sell");
-  snprintf(req.type, sizeof(req.type), "limit");
-  snprintf(req.tif,  sizeof(req.tif),  "GTC");
-  req.price     = limit_px;
-  req.size      = qty;
-  req.post_only = false;
-
-  pthread_mutex_lock(&g_live.mu);
-  if(lb->pending_n >= WM_TRADE_PENDING_CAP)
-    {
-      pthread_mutex_unlock(&g_live.mu);
-      ERRSET("pending cap raced full");
-      return(FAIL);
-    }
-
-  pending = &lb->pending[lb->pending_n++];
-  memset(pending, 0, sizeof(*pending));
-  snprintf(pending->coid, sizeof(pending->coid), "%s", req.client_oid);
-  snprintf(pending->side, sizeof(pending->side), "%s",
-      is_buy ? "buy" : "sell");
-  pending->limit_px      = limit_px;
-  pending->submitted_qty = qty;
-  pending->submitted_ms  = now_ms;
-
-  pthread_mutex_unlock(&g_live.mu);
-
-  ctx = mem_alloc(WM_LIVE_CTX, "live_done_ctx", sizeof(*ctx));
-  if(ctx == NULL)
-    {
-      pthread_mutex_lock(&g_live.mu);
-      if(lb->pending_n > 0) lb->pending_n--;
-      pthread_mutex_unlock(&g_live.mu);
-      ERRSET("oom");
-      return(FAIL);
-    }
-
-  snprintf(ctx->market_id_str, sizeof(ctx->market_id_str), "%s",
-      book->market_id_str);
-  snprintf(ctx->strategy_name, sizeof(ctx->strategy_name), "%s",
-      book->strategy_name);
-  snprintf(ctx->coid, sizeof(ctx->coid), "%s", req.client_oid);
-
-  if(coinbase_place_order_async(&req, wm_live_order_done, ctx) != SUCCESS)
-    { ERRSET("place_order_async returned FAIL"); return(FAIL); }
-
-  clam(CLAM_INFO, WM_LIVE_CTX,
-      "%s/%s operator submit %s qty=%.6g px=%.4f coid=%s",
-      book->market_id_str, book->strategy_name,
-      is_buy ? "buy" : "sell", qty, limit_px, req.client_oid);
-
-  return(SUCCESS);
-
-  #undef ERRSET
-}
-
-// ----------------------------------------------------------------------- //
-// Per-market real-mode submit (WM-MK-3-B)                                 //
+// Per-market real-mode submit                                             //
 // ----------------------------------------------------------------------- //
 
 // Heap-owned ctx for the per-market done callback. Allocated under
@@ -997,9 +357,7 @@ wm_market_engine_real_submit_locked(whenmoon_market_t *mk,
   is_buy   = (side == 'b');
   side_str = is_buy ? "buy" : "sell";
 
-  // Gate 1: master kill-switch. Distinct from the legacy
-  // `plugin.whenmoon.force_manual` knob; this one is the per-market
-  // path's explicit opt-in.
+  // Gate 1: master kill-switch.
   if(!wm_live_master_live_enabled())
   {
     ERRSET("live trading disabled"
@@ -1141,7 +499,7 @@ wm_market_engine_real_submit_locked(whenmoon_market_t *mk,
 }
 
 // ----------------------------------------------------------------------- //
-// Per-market pending lookup (WM-MK-3-B)                                   //
+// Per-market pending lookup                                               //
 // ----------------------------------------------------------------------- //
 
 // Walk every running market looking for a pending row whose coid
@@ -1258,7 +616,7 @@ wm_live_handle_ws_fill(const coinbase_ws_user_fill_t *f)
 
   if(reap)
   {
-    // Shift-down preserving order. Same shape as the legacy reap.
+    // Shift-down preserving order.
     uint32_t shift;
 
     for(shift = pidx + 1; shift < mk->session.pending_n; shift++)

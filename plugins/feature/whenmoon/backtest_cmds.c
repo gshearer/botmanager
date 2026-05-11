@@ -19,7 +19,6 @@
 #include "dl_commands.h"
 #include "dl_schema.h"
 #include "market.h"
-#include "order.h"
 #include "strategy.h"
 #include "sweep.h"
 
@@ -143,13 +142,19 @@ wm_bt_params_to_json(const wm_backtest_params_t *p,
     out[cap-1] = '\0';
 }
 
-// Render the trade snapshot's PnL metrics + headline economics to
-// JSON. Used as the wm_backtest_run.metrics JSONB payload.
+// Render the synth-market snapshot's PnL summary + headline economics
+// to JSON. Used as the wm_backtest_run.metrics JSONB payload. The
+// per-market session does not maintain a returns ring, win/loss split,
+// drawdown peak, or profit-factor gross legs — those fields emit as
+// zero, preserving the schema for any downstream reader.
 static void
-wm_bt_metrics_to_json(const wm_trade_snapshot_t *snap,
+wm_bt_metrics_to_json(const wm_market_session_snapshot_t *snap,
     char *out, size_t cap)
 {
-  int n;
+  const wm_market_stats_t *st;
+  double                   equity;
+  double                   position_value;
+  int                      n;
 
   if(out == NULL || cap == 0 || snap == NULL)
   {
@@ -157,30 +162,36 @@ wm_bt_metrics_to_json(const wm_trade_snapshot_t *snap,
     return;
   }
 
+  st             = &snap->stats[WM_MARKET_MODE_PAPER];
+  position_value = (snap->position.side == WM_MARKET_POS_LONG)
+      ? snap->position.qty * snap->last_mark_px
+      : 0.0;
+  equity         = st->cash + position_value;
+
   n = snprintf(out, cap,
       "{"
-      "\"trades\":%u,"
-      "\"wins\":%u,"
-      "\"losses\":%u,"
-      "\"win_rate\":%.6f,"
+      "\"trades\":%" PRIu64 ","
+      "\"wins\":0,"
+      "\"losses\":0,"
+      "\"win_rate\":0,"
       "\"realized_pnl\":%.6f,"
       "\"fees_paid\":%.6f,"
-      "\"profit_factor\":%.6f,"
-      "\"max_drawdown\":%.6f,"
-      "\"avg_win\":%.6f,"
-      "\"avg_loss\":%.6f,"
-      "\"sharpe\":%.6f,"
-      "\"sortino\":%.6f,"
+      "\"profit_factor\":0,"
+      "\"max_drawdown\":0,"
+      "\"avg_win\":0,"
+      "\"avg_loss\":0,"
+      "\"sharpe\":0,"
+      "\"sortino\":0,"
       "\"final_equity\":%.6f,"
       "\"starting_cash\":%.6f,"
       "\"final_cash\":%.6f"
       "}",
-      snap->metrics.n_trades, snap->metrics.n_wins, snap->metrics.n_losses,
-      snap->metrics.win_rate, snap->metrics.realized_pnl,
-      snap->metrics.fees_paid, snap->metrics.profit_factor,
-      snap->metrics.max_drawdown, snap->metrics.avg_win,
-      snap->metrics.avg_loss, snap->metrics.sharpe, snap->metrics.sortino,
-      snap->equity, snap->starting_cash, snap->cash);
+      st->lifetime_fills_count,
+      st->realized_pnl_lifetime,
+      st->lifetime_fees,
+      equity,
+      st->starting_cash,
+      st->cash);
 
   if(n < 0 || (size_t)n >= cap)
     out[cap - 1] = '\0';
@@ -845,10 +856,19 @@ wm_bt_cmd_run(const cmd_ctx_t *ctx)
   // back on the result struct so the success line names a stable id
   // the operator can dig into via /show whenmoon backtest <id>.
   {
-    wm_backtest_record_t rec;
-    char                 metrics_json[1024];
-    char                 params_json[256];
-    int64_t              new_run_id = 0;
+    const wm_market_stats_t *st_paper =
+        &result.trade.stats[WM_MARKET_MODE_PAPER];
+    double                    position_value;
+    double                    equity;
+    wm_backtest_record_t      rec;
+    char                      metrics_json[1024];
+    char                      params_json[256];
+    int64_t                   new_run_id = 0;
+
+    position_value = (result.trade.position.side == WM_MARKET_POS_LONG)
+        ? result.trade.position.qty * result.trade.last_mark_px
+        : 0.0;
+    equity         = st_paper->cash + position_value;
 
     memset(&rec, 0, sizeof(rec));
     rec.market_id     = market_id;
@@ -857,12 +877,12 @@ wm_bt_cmd_run(const cmd_ctx_t *ctx)
     snprintf(rec.range_end,   sizeof(rec.range_end),   "%s", end_ts);
     rec.wallclock_ms  = (int64_t)result.wallclock_ms;
     rec.bars_replayed = result.bars_replayed;
-    rec.n_trades      = result.trade.metrics.n_trades;
-    rec.realized_pnl  = result.trade.metrics.realized_pnl;
-    rec.max_drawdown  = result.trade.metrics.max_drawdown;
-    rec.sharpe        = result.trade.metrics.sharpe;
-    rec.sortino       = result.trade.metrics.sortino;
-    rec.final_equity  = result.trade.equity;
+    rec.n_trades      = (uint32_t)st_paper->lifetime_fills_count;
+    rec.realized_pnl  = st_paper->realized_pnl_lifetime;
+    rec.max_drawdown  = 0.0;     // not tracked by per-market session
+    rec.sharpe        = 0.0;
+    rec.sortino       = 0.0;
+    rec.final_equity  = equity;
 
     wm_bt_params_to_json(&params, params_json, sizeof(params_json));
     wm_bt_metrics_to_json(&result.trade,
@@ -878,27 +898,39 @@ wm_bt_cmd_run(const cmd_ctx_t *ctx)
 
   wm_backtest_snapshot_free(snap);
 
-  if(result.run_id_db > 0)
   {
-    snprintf(reply, sizeof(reply),
-        "run %" PRId64 ": bars=%u trades=%u realized=%+.4f"
-        " sharpe=%.3f equity=%.2f wallclock_ms=%" PRIu64,
-        result.run_id_db, result.bars_replayed,
-        result.trade.metrics.n_trades,
-        result.trade.metrics.realized_pnl,
-        result.trade.metrics.sharpe, result.trade.equity,
-        result.wallclock_ms);
-    cmd_reply(ctx, reply);
-    cmd_reply(ctx, "  detail: /show whenmoon backtest <run_id>");
-  }
-  else
-  {
-    snprintf(reply, sizeof(reply),
-        "iteration completed but persist failed:"
-        " bars=%u trades=%u realized=%+.4f equity=%.2f",
-        result.bars_replayed, result.trade.metrics.n_trades,
-        result.trade.metrics.realized_pnl, result.trade.equity);
-    cmd_reply(ctx, reply);
+    const wm_market_stats_t *st_paper =
+        &result.trade.stats[WM_MARKET_MODE_PAPER];
+    double                    position_value;
+    double                    equity;
+
+    position_value = (result.trade.position.side == WM_MARKET_POS_LONG)
+        ? result.trade.position.qty * result.trade.last_mark_px
+        : 0.0;
+    equity         = st_paper->cash + position_value;
+
+    if(result.run_id_db > 0)
+    {
+      snprintf(reply, sizeof(reply),
+          "run %" PRId64 ": bars=%u fills=%" PRIu64 " realized=%+.4f"
+          " equity=%.2f wallclock_ms=%" PRIu64,
+          result.run_id_db, result.bars_replayed,
+          st_paper->lifetime_fills_count,
+          st_paper->realized_pnl_lifetime,
+          equity, result.wallclock_ms);
+      cmd_reply(ctx, reply);
+      cmd_reply(ctx, "  detail: /show whenmoon backtest <run_id>");
+    }
+
+    else
+    {
+      snprintf(reply, sizeof(reply),
+          "iteration completed but persist failed:"
+          " bars=%u fills=%" PRIu64 " realized=%+.4f equity=%.2f",
+          result.bars_replayed, st_paper->lifetime_fills_count,
+          st_paper->realized_pnl_lifetime, equity);
+      cmd_reply(ctx, reply);
+    }
   }
 }
 

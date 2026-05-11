@@ -34,7 +34,6 @@
 
 #include "market.h"
 #include "market_engine.h"
-#include "order.h"
 #include "whenmoon.h"
 
 #include "alloc.h"
@@ -311,14 +310,11 @@ wm_strategy_emit_signal_impl(wm_strategy_ctx_t *ctx,
   ctx->has_last_signal   = true;
   ctx->signals_emitted++;
 
-  // WM-MK-3: production routes through the per-market engine; backtest
-  // stays on the legacy per-(market, strategy) book engine via the
-  // backtest_mode carve-out (synthetic markets land in WM-MK-5).
-  if(ctx->backtest_mode)
-    wm_trade_engine_on_signal(ctx->market_id_str, ctx->strategy_name,
-        ctx->last_mark_px, ctx->last_mark_ms, sig);
-  else
-    wm_market_engine_on_signal(ctx->market_id_str,
+  // ctx->mkt is populated by the dispatcher (production: live market
+  // under mk->lock; backtest: heap-owned synth market). The direct-
+  // pointer engine entry skips the lookup-by-id prelude.
+  if(ctx->mkt != NULL)
+    wm_market_engine_on_signal_with_mk(ctx->mkt,
         ctx->last_mark_px, ctx->last_mark_ms, sig);
 }
 
@@ -1038,33 +1034,23 @@ wm_strategy_attach(whenmoon_state_t *st,
   if(out_priority != NULL)
     *out_priority = chosen_priority;
 
-  // WM-PT-3: pre-warm the trade book so a re-attach after SIGTERM
-  // hydrates from wm_trade_book_state immediately, and the strategy
-  // sees the prior cash/position/fills/PnL/mode rather than waiting
-  // for the operator to also re-issue /whenmoon trade mode. For a
-  // brand-new attachment with no DB row, this creates a fresh book
-  // in mode OFF (no DB write triggered until the first
-  // mode-set/fill/reset). Backtest does NOT route through
-  // wm_strategy_attach (backtest builds its own ctx + calls init_fn
-  // directly in backtest.c) so this path runs only on the cmd-verb
-  // /whenmoon strategy attach flow against the global registry.
-  (void)wm_trade_book_get_or_create(market_id_str, strategy_name);
-
-  // WM-SR-1: copy the persisted last_signal cursor from the (now-
-  // hydrated) book into the per-attachment ctx. wm_strategy_dispatch_bar
-  // uses this cursor to drop replay bars whose ts_close_ms is at or
-  // before the last signal — without it, the REST candles backfill
-  // (300 bars per market start) and the wm_aggregator_load_history_task
-  // re-fire every prior signal as the warmup replays through dispatch.
+  // WM-SR-1 cursor hydration: seed the per-attachment ctx with the
+  // market's last-acted signal (if any) so wm_strategy_dispatch_bar
+  // drops replay bars whose ts_close_ms is at or before that cursor.
+  // Without this seed the REST candles backfill (300 bars per market
+  // start) and the wm_aggregator_load_history_task re-fire every
+  // prior signal as the warmup replays through dispatch.
+  if(mk != NULL)
   {
-    wm_trade_snapshot_t snap;
+    pthread_mutex_lock(&mk->lock);
 
-    if(wm_trade_book_snapshot(market_id_str, strategy_name, &snap)
-           == SUCCESS && snap.has_last_signal)
+    if(mk->session.has_last_acted_signal)
     {
-      att->ctx.last_signal     = snap.last_signal;
+      att->ctx.last_signal     = mk->session.last_acted_signal;
       att->ctx.has_last_signal = true;
     }
+
+    pthread_mutex_unlock(&mk->lock);
   }
 
   clam(CLAM_INFO, WHENMOON_CTX,
@@ -1126,12 +1112,6 @@ wm_strategy_detach(whenmoon_state_t *st,
 
   pthread_mutex_unlock(&reg->lock);
 
-  // WM-LT-4: drop the matching trade book (no-op if no /whenmoon trade
-  // verb was ever issued for this attachment). Outside the registry
-  // lock so the trade engine never inverts strategy_registry ->
-  // trade_registry.
-  wm_trade_book_remove(market_id_str, strategy_name);
-
   clam(CLAM_INFO, WHENMOON_CTX,
       "strategy detach: %s -> %s", strategy_name, market_id_str);
 
@@ -1181,11 +1161,6 @@ wm_strategy_detach_market(whenmoon_state_t *st,
   }
 
   pthread_mutex_unlock(&reg->lock);
-
-  // WM-LT-4: drop every trade book bound to this market. Mirrors the
-  // attachment auto-detach so a market stop tears down both layers
-  // atomically (from the operator's perspective).
-  wm_trade_books_remove_market(market_id_str);
 
   if(n_detached > 0)
     clam(CLAM_INFO, WHENMOON_CTX,

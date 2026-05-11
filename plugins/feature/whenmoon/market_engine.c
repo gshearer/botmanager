@@ -515,6 +515,23 @@ wm_market_engine_on_signal(const char *market_id_str, double mark_px,
 {
   whenmoon_state_t  *st;
   whenmoon_market_t *mk;
+
+  if(market_id_str == NULL)
+    return;
+
+  st = whenmoon_get_state();
+  mk = wm_market_lookup_by_id(st, market_id_str);
+
+  if(mk == NULL)
+    return;
+
+  wm_market_engine_on_signal_with_mk(mk, mark_px, mark_ms, sig);
+}
+
+void
+wm_market_engine_on_signal_with_mk(whenmoon_market_t *mk, double mark_px,
+    int64_t mark_ms, const wm_strategy_signal_t *sig)
+{
   wm_mk_advice_t     advice;
   wm_market_mode_t   mode;
   double             qty;
@@ -525,13 +542,7 @@ wm_market_engine_on_signal(const char *market_id_str, double mark_px,
   double             notional;
   double             fee;
 
-  if(sig == NULL || mark_px <= 0.0)
-    return;
-
-  st = whenmoon_get_state();
-  mk = wm_market_lookup_by_id(st, market_id_str);
-
-  if(mk == NULL)
+  if(mk == NULL || sig == NULL || mark_px <= 0.0)
     return;
 
   advice = wm_mk_signal_advice(sig);
@@ -862,200 +873,4 @@ wm_market_engine_force_trade_locked(whenmoon_market_t *mk, char side,
   return(SUCCESS);
 
   #undef ERRSET
-}
-
-// ------------------------------------------------------------------ //
-// Selftest                                                           //
-// ------------------------------------------------------------------ //
-
-bool
-wm_market_engine_selftest(const char *market_id_str, char *errbuf,
-    size_t errbuf_sz)
-{
-  whenmoon_state_t      *st;
-  whenmoon_market_t     *mk;
-  wm_market_mode_t       prev_mode;
-  wm_market_position_t   prev_position;
-  wm_market_stats_t      prev_paper_stats;
-  uint64_t               prev_fills_n;
-  uint32_t               prev_fills_head;
-  double                 prev_last_mark_px;
-  int64_t                prev_last_mark_ms;
-  wm_strategy_signal_t   prev_last_signal;
-  bool                   prev_has_signal;
-  /* Heap-buffer the pre-test fills ring: stack-local would be a
-     few hundred KiB and risks the cmd worker thread stack. */
-  wm_market_fill_t      *prev_fills;
-  double                 buy_px = 50000.0;
-  double                 sell_px = 51000.0;
-  double                 qty = 0.1;
-  int64_t                ts;
-  uint64_t               fills_pre;
-  uint64_t               fills_post;
-  double                 cash_pre;
-  double                 cash_post;
-  double                 realized;
-  bool                   ok = SUCCESS;
-
-  if(errbuf != NULL && errbuf_sz > 0)
-    errbuf[0] = '\0';
-
-  if(market_id_str == NULL)
-  {
-    if(errbuf != NULL) snprintf(errbuf, errbuf_sz, "bad args");
-    return(FAIL);
-  }
-
-  st = whenmoon_get_state();
-  mk = wm_market_lookup_by_id(st, market_id_str);
-
-  if(mk == NULL)
-  {
-    if(errbuf != NULL)
-      snprintf(errbuf, errbuf_sz, "market %s not running", market_id_str);
-    return(FAIL);
-  }
-
-  // Refresh KV before selftest so the run uses operator-edited values.
-  wm_market_session_refresh_kv(mk);
-
-  prev_fills = mem_alloc("whenmoon", "mp_selftest_prev_fills",
-      sizeof(*prev_fills) * WM_MARKET_FILL_RING_CAP);
-
-  if(prev_fills == NULL)
-  {
-    if(errbuf != NULL)
-      snprintf(errbuf, errbuf_sz, "alloc failed");
-    return(FAIL);
-  }
-
-  ts = (int64_t)time(NULL) * 1000;
-
-  pthread_mutex_lock(&mk->lock);
-
-  if(mk->session.position.side != WM_MARKET_POS_FLAT)
-  {
-    pthread_mutex_unlock(&mk->lock);
-    mem_free(prev_fills);
-    if(errbuf != NULL)
-      snprintf(errbuf, errbuf_sz,
-          "selftest requires flat position (current side=%d qty=%.10g)",
-          (int)mk->session.position.side, mk->session.position.qty);
-    return(FAIL);
-  }
-
-  // Snapshot every paper-mode field the test may mutate. The selftest
-  // restores all of them before unlocking + re-persists, so the
-  // operator's durable wm_market_state row is unaffected by the
-  // synthetic round-trip.
-  prev_mode         = mk->session.mode;
-  prev_position     = mk->session.position;
-  prev_paper_stats  = mk->session.stats[WM_MARKET_MODE_PAPER];
-  prev_fills_n      = mk->session.fills_n[WM_MARKET_MODE_PAPER];
-  prev_fills_head   = mk->session.fills_head[WM_MARKET_MODE_PAPER];
-  prev_last_mark_px = mk->session.last_mark_px;
-  prev_last_mark_ms = mk->session.last_mark_ms;
-  prev_last_signal  = mk->session.last_acted_signal;
-  prev_has_signal   = mk->session.has_last_acted_signal;
-  memcpy(prev_fills, mk->session.fills[WM_MARKET_MODE_PAPER],
-      sizeof(*prev_fills) * WM_MARKET_FILL_RING_CAP);
-
-  // Force PAPER mode for selftest — no real-money side effects.
-  mk->session.mode = WM_MARKET_MODE_PAPER;
-
-  fills_pre = mk->session.stats[WM_MARKET_MODE_PAPER].lifetime_fills_count;
-  cash_pre  = mk->session.stats[WM_MARKET_MODE_PAPER].cash;
-
-  wm_market_apply_fill_locked(mk, WM_MARKET_MODE_PAPER, 'b', qty, buy_px,
-      0.0, ts, "selftest-buy");
-
-  if(mk->session.position.side != WM_MARKET_POS_LONG ||
-     fabs(mk->session.position.qty - qty) > 1e-9)
-  {
-    ok = FAIL;
-    if(errbuf != NULL)
-      snprintf(errbuf, errbuf_sz,
-          "selftest buy: expected long qty=%.10g, got side=%d qty=%.10g",
-          qty, (int)mk->session.position.side, mk->session.position.qty);
-  }
-
-  if(ok == SUCCESS)
-  {
-    wm_market_apply_fill_locked(mk, WM_MARKET_MODE_PAPER, 's', qty,
-        sell_px, 0.0, ts + 1000, "selftest-sell");
-
-    realized = (sell_px - buy_px) * qty;
-
-    if(mk->session.position.side != WM_MARKET_POS_FLAT)
-    {
-      ok = FAIL;
-      if(errbuf != NULL)
-        snprintf(errbuf, errbuf_sz,
-            "selftest sell: expected flat, got side=%d qty=%.10g",
-            (int)mk->session.position.side, mk->session.position.qty);
-    }
-
-    fills_post = mk->session.stats[WM_MARKET_MODE_PAPER]
-        .lifetime_fills_count;
-    cash_post  = mk->session.stats[WM_MARKET_MODE_PAPER].cash;
-
-    if(ok == SUCCESS && fills_post != fills_pre + 2)
-    {
-      ok = FAIL;
-      if(errbuf != NULL)
-        snprintf(errbuf, errbuf_sz,
-            "selftest fills: expected %" PRIu64 ", got %" PRIu64,
-            fills_pre + 2, fills_post);
-    }
-
-    if(ok == SUCCESS &&
-       fabs((cash_post - cash_pre) - realized) > 1e-6)
-    {
-      ok = FAIL;
-      if(errbuf != NULL)
-        snprintf(errbuf, errbuf_sz,
-            "selftest cash delta: expected %.6f, got %.6f",
-            realized, cash_post - cash_pre);
-    }
-  }
-
-  // Restore the entire paper-mode session state regardless of outcome
-  // so the operator's durable ledger is untouched.
-  mk->session.mode                              = prev_mode;
-  mk->session.position                          = prev_position;
-  mk->session.stats[WM_MARKET_MODE_PAPER]       = prev_paper_stats;
-  mk->session.fills_n[WM_MARKET_MODE_PAPER]     = prev_fills_n;
-  mk->session.fills_head[WM_MARKET_MODE_PAPER]  = prev_fills_head;
-  mk->session.last_mark_px                      = prev_last_mark_px;
-  mk->session.last_mark_ms                      = prev_last_mark_ms;
-  mk->session.last_acted_signal                 = prev_last_signal;
-  mk->session.has_last_acted_signal             = prev_has_signal;
-  memcpy(mk->session.fills[WM_MARKET_MODE_PAPER], prev_fills,
-      sizeof(*prev_fills) * WM_MARKET_FILL_RING_CAP);
-
-  // Re-enqueue with the restored state. The persist queue coalesces
-  // by market_id, so this overwrites the spurious snapshots that
-  // apply_fill_locked DID NOT enqueue (we moved the persist call out
-  // of apply_fill_locked specifically so this restore is sufficient).
-  // But the periodic flush task may have flushed the pre-test row
-  // mid-test on a slow machine, so a final persist guarantees the
-  // restored state lands.
-  (void)wm_market_persist_locked(mk);
-
-  pthread_mutex_unlock(&mk->lock);
-
-  mem_free(prev_fills);
-
-  if(ok == SUCCESS)
-    clam(CLAM_INFO, WHENMOON_CTX,
-        "market %s selftest PASS (paper buy %.10g @ %.2f, sell @ %.2f"
-        " realized=%.4f; durable state unchanged)",
-        mk->market_id_str, qty, buy_px, sell_px,
-        (sell_px - buy_px) * qty);
-  else
-    clam(CLAM_WARN, WHENMOON_CTX,
-        "market %s selftest FAIL: %s",
-        mk->market_id_str, errbuf != NULL ? errbuf : "(no detail)");
-
-  return(ok);
 }

@@ -3,9 +3,9 @@
 // One sweep = N iterations of wm_backtest_run_iteration over the same
 // snapshot, each with a different parameter vector drawn from the
 // cartesian product of the declared sweep axes. Iterations dispatch
-// through a worker pool; each worker owns a private wm_trade_registry
-// (see order.h) so per-iteration trade books never contend with the
-// live registry.
+// through a worker pool; each worker creates a per-iteration synthetic
+// `whenmoon_market_t` so iterations never contend on the live market
+// registry (see backtest.c).
 //
 // The reload gate prevents a strategy dlclose+dlopen from invalidating
 // cached function pointers held by an in-flight iteration. Sweeps
@@ -126,11 +126,11 @@ typedef struct
   uint64_t              wallclock_ms;
   uint32_t              bars_replayed;
   uint32_t              n_windows;          // 1 for full/oos head
-  double                score;
-  int64_t               run_id_db;          // 0 if persist failed
-  bool                  ok;                 // false on iteration failure
-  char                  err[160];           // populated when !ok
-  wm_trade_snapshot_t   trade;
+  double                       score;
+  int64_t                      run_id_db;          // 0 if persist failed
+  bool                         ok;                 // false on iteration failure
+  char                         err[160];           // populated when !ok
+  wm_market_session_snapshot_t trade;
 
   // WM-LT-7 OOS post-pass output. have_oos = true when this row was
   // selected as top-K and its OOS validation iteration completed.
@@ -143,8 +143,14 @@ typedef struct
                                             // validation iter failed
 } wm_bt_sweep_result_t;
 
-// Score extraction from a snapshot. NaN/inf collapse to 0.0.
-double wm_bt_sweep_score_value(const wm_trade_snapshot_t *snap,
+// Score extraction from a synth-market snapshot. NaN/inf collapse to
+// 0.0. Reads from `.stats[WM_MARKET_MODE_PAPER]`. The legacy book
+// engine published a richer metric package (sharpe, sortino, etc.);
+// the per-market session only carries lifetime realized PnL + cash —
+// the SHARPE / SORTINO / PROFIT_FACTOR selectors collapse to
+// NOSCORE so the renderer sorts them to the bottom rather than
+// misleading the operator with a phantom zero.
+double wm_bt_sweep_score_value(const wm_market_session_snapshot_t *snap,
     wm_bt_sweep_score_t score);
 
 // ----------------------------------------------------------------------- //

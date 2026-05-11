@@ -1,18 +1,13 @@
-// backtest.h — snapshot + single-iteration replay (WM-LT-5).
+// backtest.h — snapshot + single-iteration replay.
 //
 // A backtest is one (market_id, strategy_name, range) replay through
 // historical 1m candles. Bars are fed through a dedicated aggregator
 // (which performs the multi-grain cascade + indicator pass) into a
 // stub `whenmoon_market_t`; the strategy callback fires manually from
-// the replay loop. The strategy's signal dispatch lands on a backtest-
-// private trade book — a regular `wm_trade_book_t` registered under
-// the synthetic id "bt:<run_id>" so it does not collide with live
-// books.
-//
-// WM-LT-5 ships single-iteration synchronous-by-task runs launched
-// from /whenmoon backtest run. WM-LT-6 will add a worker pool, param
-// sweeps, and the dlclose/dlopen reload path; the snapshot type
-// defined here is reused by those layers.
+// the replay loop. The strategy's signal dispatch lands on a per-
+// iteration synthetic `whenmoon_market_t` (heap-owned, NOT in
+// st->markets->arr) created by wm_market_create_synthetic, snapshotted
+// at the end of the iteration, then destroyed.
 //
 // Internal to the whenmoon plugin. WHENMOON_INTERNAL gated.
 
@@ -22,8 +17,6 @@
 #ifdef WHENMOON_INTERNAL
 
 #include "market.h"
-#include "order.h"
-#include "pnl.h"
 #include "strategy.h"
 
 #include <stdbool.h>
@@ -161,10 +154,10 @@ typedef struct wm_backtest_params
 
 typedef struct wm_backtest_result
 {
-  int64_t              run_id_db;        // wm_backtest_run.run_id (post-persist)
-  uint32_t             bars_replayed;
-  uint64_t             wallclock_ms;
-  wm_trade_snapshot_t  trade;            // final book snapshot
+  int64_t                       run_id_db;        // wm_backtest_run.run_id (post-persist)
+  uint32_t                      bars_replayed;
+  uint64_t                      wallclock_ms;
+  wm_market_session_snapshot_t  trade;            // final synth-market snapshot
 } wm_backtest_result_t;
 
 // ----------------------------------------------------------------------- //

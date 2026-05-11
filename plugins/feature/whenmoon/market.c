@@ -1095,3 +1095,70 @@ out:
 
   return(ok);
 }
+
+// ------------------------------------------------------------------ //
+// WM-MK-5: synthetic backtest markets                                 //
+// ------------------------------------------------------------------ //
+
+bool
+wm_market_create_synthetic(const char *market_id_str,
+    const whenmoon_market_t *src, whenmoon_market_t **out_mk,
+    char *errbuf, size_t errbuf_sz)
+{
+  whenmoon_market_t *mk;
+
+  if(out_mk != NULL)
+    *out_mk = NULL;
+
+  if(market_id_str == NULL || src == NULL || out_mk == NULL)
+  {
+    if(errbuf != NULL && errbuf_sz > 0)
+      snprintf(errbuf, errbuf_sz, "bad args");
+    return(FAIL);
+  }
+
+  mk = mem_alloc(WHENMOON_CTX, "market_synth", sizeof(*mk));
+
+  if(mk == NULL)
+  {
+    if(errbuf != NULL && errbuf_sz > 0)
+      snprintf(errbuf, errbuf_sz, "oom");
+    return(FAIL);
+  }
+
+  memset(mk, 0, sizeof(*mk));
+
+  snprintf(mk->market_id_str, sizeof(mk->market_id_str), "%s",
+      market_id_str);
+  snprintf(mk->product_id, sizeof(mk->product_id), "%s", src->product_id);
+  mk->market_id = -1;     // synth has no DB row
+
+  // Share grain rings — read-only during iteration. The source
+  // market's lifetime spans the entire sweep; iteration is a strict
+  // subset.
+  memcpy(mk->grain_arr, src->grain_arr, sizeof(mk->grain_arr));
+  memcpy(mk->grain_n,   src->grain_n,   sizeof(mk->grain_n));
+  memcpy(mk->grain_cap, src->grain_cap, sizeof(mk->grain_cap));
+
+  mk->aggregator   = NULL;
+  mk->last_px      = src->last_px;
+  mk->last_tick_ms = src->last_tick_ms;
+
+  pthread_mutex_init(&mk->lock, NULL);
+
+  wm_market_session_init(&mk->session);
+  mk->session.mode = WM_MARKET_MODE_PAPER;
+
+  *out_mk = mk;
+  return(SUCCESS);
+}
+
+void
+wm_market_destroy_synthetic(whenmoon_market_t *mk)
+{
+  if(mk == NULL)
+    return;
+
+  pthread_mutex_destroy(&mk->lock);
+  mem_free(mk);
+}
