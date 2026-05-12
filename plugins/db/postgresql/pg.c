@@ -56,19 +56,44 @@ pg_reset(void *handle)
   return(PQstatus((PGconn *)handle) == CONNECTION_OK ? SUCCESS : FAIL);
 }
 
+// Roll back any open transaction on `conn`. PQexec runs a multi-statement
+// script under one implicit driver session; if any statement errors it
+// stops the script there and leaves the connection in PQTRANS_INERROR
+// (open, aborted transaction). A BEGIN..COMMIT batch whose COMMIT never
+// ran lands in PQTRANS_INTRANS instead. The botmanager pool releases
+// connections without inspecting transaction state, so either leak
+// poisons the next caller — every subsequent query reports
+// "current transaction is aborted, commands ignored until end of
+// transaction block". Drain the connection here before pg_query returns.
+static void
+pg_drain_txn(PGconn *conn)
+{
+  PGTransactionStatusType txs = PQtransactionStatus(conn);
+  PGresult               *rb;
+
+  if(txs != PQTRANS_INERROR && txs != PQTRANS_INTRANS)
+    return;
+
+  rb = PQexec(conn, "ROLLBACK");
+
+  if(rb != NULL)
+    PQclear(rb);
+}
+
 static bool
 pg_query(void *handle, const char *sql, db_result_t *result)
 {
   ExecStatusType status;
-  size_t len;
-  PGconn *conn = (PGconn *)handle;
-  PGresult *res = PQexec(conn, sql);
+  size_t         len;
+  PGconn        *conn = (PGconn *)handle;
+  PGresult      *res  = PQexec(conn, sql);
+  bool           ret  = FAIL;
 
   if(res == NULL)
   {
     result->ok = false;
     snprintf(result->error, DB_ERROR_SZ, "%s", PQerrorMessage(conn));
-    return(FAIL);
+    goto out;
   }
 
   status = PQresultStatus(res);
@@ -76,8 +101,8 @@ pg_query(void *handle, const char *sql, db_result_t *result)
   if(status == PGRES_TUPLES_OK)
   {
     const char *tuples;
-    uint32_t rows = (uint32_t)PQntuples(res);
-    uint32_t cols = (uint32_t)PQnfields(res);
+    uint32_t    rows = (uint32_t)PQntuples(res);
+    uint32_t    cols = (uint32_t)PQnfields(res);
 
     db_result_set_size(result, rows, cols);
 
@@ -92,7 +117,7 @@ pg_query(void *handle, const char *sql, db_result_t *result)
               PQgetvalue(res, (int)r, (int)c));
     }
 
-    result->ok = true;
+    result->ok            = true;
     result->rows_affected = 0;
 
     tuples = PQcmdTuples(res);
@@ -101,13 +126,14 @@ pg_query(void *handle, const char *sql, db_result_t *result)
       result->rows_affected = (uint32_t)strtoul(tuples, NULL, 10);
 
     PQclear(res);
-    return(SUCCESS);
+    ret = SUCCESS;
+    goto out;
   }
 
   if(status == PGRES_COMMAND_OK)
   {
     const char *tuples;
-    result->ok = true;
+    result->ok            = true;
     result->rows_affected = 0;
 
     tuples = PQcmdTuples(res);
@@ -116,7 +142,8 @@ pg_query(void *handle, const char *sql, db_result_t *result)
       result->rows_affected = (uint32_t)strtoul(tuples, NULL, 10);
 
     PQclear(res);
-    return(SUCCESS);
+    ret = SUCCESS;
+    goto out;
   }
 
   // Failure.
@@ -130,7 +157,10 @@ pg_query(void *handle, const char *sql, db_result_t *result)
     result->error[len - 1] = '\0';
 
   PQclear(res);
-  return(FAIL);
+
+out:
+  pg_drain_txn(conn);
+  return(ret);
 }
 
 // returns: escaped string (caller must free), or NULL on error
