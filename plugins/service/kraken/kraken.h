@@ -17,11 +17,13 @@
 #include "plugin.h"
 
 #include "kraken_api.h"
+#include "kraken_pairs.h"
 #include "kraken_rest.h"
 #include "kraken_sign.h"
 #include "kraken_ws.h"
 #include "kraken_ws_channels.h"
 
+#include <stdbool.h>
 #include <stddef.h>
 #include <stdint.h>
 

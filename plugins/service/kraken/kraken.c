@@ -3,13 +3,15 @@
 //
 // KR-3 ships the plugin descriptor, the KV schema, the lifecycle
 // hooks, the HMAC-SHA512 signer + nonce minter, and an exchange-
-// vtable registration with stubbed required slots. REST endpoints
-// land in KR-4; the WebSocket v2 transport + channel multiplexer
-// land in KR-5. See TODO.md §KR-3..KR-6 for the chunk roadmap and
-// README.md for scope.
+// vtable registration with stubbed required slots. KR-4 lands the
+// REST endpoints (candles, orders, fills, balances, assetpairs); the
+// WebSocket v2 transport + channel multiplexer land in KR-5. See
+// TODO.md §KR-3..KR-6 for the chunk roadmap and README.md for scope.
 #define KR_INTERNAL
 #include "kraken.h"
+
 #include "exchange_api.h"
+#include "task.h"
 
 // KV schema
 //
@@ -60,10 +62,25 @@ static const plugin_kv_entry_t kr_kv_schema[] =
 
 // Plugin lifecycle
 
+// Handle for the periodic assetpairs refresh task. TASK_HANDLE_NONE
+// until kr_start; cancelled in kr_deinit so the daemon shuts down
+// cleanly even if a refresh tick was pending.
+static task_handle_t kr_assetpairs_task = TASK_HANDLE_NONE;
+
+static void
+kr_assetpairs_periodic_cb(task_t *t)
+{
+  // Fire and forget — the response handler updates the cache and logs
+  // any failure. cb=NULL routes to the silent logger in kraken_orders.c.
+  (void)kraken_assetpairs_refresh_async(NULL, NULL);
+  t->state = TASK_ENDED;
+}
+
 static bool
 kr_init(void)
 {
   kr_sign_init();
+  kr_pairs_init();
   kr_rest_init();
   kr_ws_init();
   kr_ws_channels_init();
@@ -76,16 +93,38 @@ kr_init(void)
 static bool
 kr_start(void)
 {
+  uint32_t refresh_sec;
+
   // Self-register with the feature_exchange abstraction so candle
   // traffic + private order/account traffic flows through the
-  // priority queue + token bucket. The required slots are stubbed
-  // FAIL until KR-4 wires the REST surface; the capability hooks
-  // stay NULL until KR-4 / KR-5 fill them.
+  // priority queue + token bucket.
   if(kr_exchange_register_vtable() != SUCCESS)
   {
     clam(CLAM_WARN, KR_CTX,
         "exchange_register failed — kraken traffic will not dispatch");
     return(FAIL);
+  }
+
+  // Prime the assetpairs cache so lookups during the first few minutes
+  // after startup don't fall through to "pass input unchanged" against
+  // Kraken's gateway. Failure here is non-fatal — lookups still pass
+  // through and Kraken responds with EQuery:Unknown asset pair which
+  // surfaces cleanly.
+  (void)kraken_assetpairs_refresh_async(NULL, NULL);
+
+  // Periodic refresh. The cadence KV defaults to 86400 s (one day);
+  // operators can tune via plugin.kraken.assetpairs_refresh_sec.
+  refresh_sec = (uint32_t)kv_get_uint("plugin.kraken.assetpairs_refresh_sec");
+
+  if(refresh_sec > 0)
+  {
+    kr_assetpairs_task = task_add_periodic("kr.assetpairs",
+        TASK_THREAD, 50, refresh_sec * 1000u,
+        kr_assetpairs_periodic_cb, NULL);
+
+    if(kr_assetpairs_task == TASK_HANDLE_NONE)
+      clam(CLAM_WARN, KR_CTX,
+          "assetpairs periodic task submit failed");
   }
 
   clam(CLAM_INFO, KR_CTX, "kraken plugin started");
@@ -99,6 +138,12 @@ kr_start(void)
 static bool
 kr_stop(void)
 {
+  if(kr_assetpairs_task != TASK_HANDLE_NONE)
+  {
+    task_cancel(kr_assetpairs_task);
+    kr_assetpairs_task = TASK_HANDLE_NONE;
+  }
+
   kr_ws_stop();
 
   return(SUCCESS);
@@ -108,13 +153,13 @@ static void
 kr_deinit(void)
 {
   // Drop our exchange registration first so any in-flight queue is
-  // failed back to consumers before we tear down the curl pipeline
-  // (when KR-4 wires it up).
+  // failed back to consumers before we tear down the curl pipeline.
   exchange_unregister("kraken");
 
   kr_ws_deinit();
   kr_ws_channels_deinit();
   kr_rest_deinit();
+  kr_pairs_deinit();
   kr_sign_deinit();
 
   clam(CLAM_INFO, KR_CTX, "kraken plugin deinitialized");
@@ -126,7 +171,7 @@ const plugin_desc_t bm_plugin_desc =
 {
   .api_version     = PLUGIN_API_VERSION,
   .name            = "kraken",
-  .version         = "0.1-kr3",
+  .version         = "0.2-kr4",
   .type            = PLUGIN_SERVICE,
   .kind            = "kraken",
   .provides        = { { .name = "exchange_kraken" } },
