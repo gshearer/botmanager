@@ -178,6 +178,53 @@ zero user commands; chat-specific side effects (dossier facts) live in
 the chat plugin's NL bridge observer. See `PLUGIN.md §Layer Rules` for
 the authoritative rules and grep audits.
 
+## Multi-Exchange Architecture
+
+Exchange connectivity is split across two plugin layers so adding a
+new venue is a self-contained plugin drop — no consumer-side edits.
+
+**Two-layer split:**
+
+- **Service plugins** (`plugins/service/<name>/`) own one wire
+  protocol each. Coinbase Advanced Trade (CDP/JWT) and Kraken Spot
+  (HMAC-SHA512) are the shipped implementations. Each plugin owns its
+  REST dispatcher, WebSocket transport, channel multiplexer,
+  credentials, and request signer. It self-registers an
+  `exchange_protocol_vtable_t` with `feature_exchange` at `start`
+  time.
+- **`plugins/feature/exchange/`** owns the consumer-facing
+  abstraction: a per-exchange priority queue + token bucket +
+  reserved-slot policy + 429/5xx retry schedule + the typed
+  capability surface (`exchange_place_order_async`,
+  `exchange_fetch_candles_async`, `exchange_ws_subscribe`, …).
+  Consumers call `exchange_*_async(name, …)` and the abstraction
+  dispatches to the registered vtable.
+
+Whenmoon talks to *both* exchanges through this seam: `grep -rn
+'coinbase_\|kraken_' plugins/feature/whenmoon/*.c` returns zero
+hits. The `whenmoon_market_t` carries `exchange_name` so every
+candle, account, order, and WS subscription is routed
+per-(exchange, product). Adding Binance or Bybit would be a new
+`plugins/service/<name>/` plugin only.
+
+**Two-tier KV namespace.** Per exchange, two KV namespaces coexist
+and belong to different plugins:
+
+| Namespace | Owner | Configures |
+|-----------|-------|------------|
+| `plugin.<exch>.*` | service plugin (`plugins/service/<exch>/`) | The thing that talks to the venue: REST/WS URLs, credentials, reconnect backoff, REST timeout, signing state. |
+| `plugin.whenmoon.exchange.<exch>.*` | whenmoon (`plugins/feature/whenmoon/`) | Whenmoon's consumer-side policy: account-poll cadence, per-exchange rate limit, live-trading kill-switch (`live`). |
+
+Rule of thumb: if a knob would still apply to a hypothetical second
+consumer of the service plugin, it belongs in `plugin.<exch>.*`. If
+it's specific to whenmoon's behaviour around that exchange, it
+belongs in `plugin.whenmoon.exchange.<exch>.*`.
+
+The live-trading kill-switch is per-exchange
+(`plugin.whenmoon.exchange.<exch>.live`, default false). A single
+operator boot can run coinbase markets live and kraken markets in
+paper, or vice versa.
+
 ## Plugin API
 
 Each plugin exports a `plugin_desc_t` (symbol `bm_plugin_desc`) containing:

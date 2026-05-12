@@ -61,12 +61,18 @@ Expected subsystems, each growing as one or a few source files:
 | *(planned)* `backtest.*` | Replay harness (may instead live as a separate tool) |
 
 Exchange REST/WS adapters are **not** part of this plugin. Each
-exchange (Coinbase first, Kraken + Gemini later) lives as its own
-`plugins/service/<kind>/` plugin exposing a `<kind>_api.h` dlsym-shim
-header, consumed here via `.requires`. The `plugins/feature/exchange/`
-abstraction owns rate-limited dispatch across every exchange-providing
-service; whenmoon's downloader routes through `coinbase_fetch_*_async`,
-which routes through `exchange_request()`.
+exchange lives as its own `plugins/service/<kind>/` plugin (Coinbase
+Advanced Trade and Kraken Spot shipped today; new venues land as
+additional service plugins). Whenmoon's `.c` files contain zero
+direct references to `coinbase_*` or `kraken_*` symbols — every
+candle, account, order, fill, and WS subscription routes through the
+`plugins/feature/exchange/` abstraction
+(`exchange_*_async(name, …)`), which dispatches to the matching
+protocol vtable behind a priority queue + token bucket. The
+KR-2 lift (2026-05-12) completed this seam; the per-exchange policy
+KV namespace `plugin.whenmoon.exchange.<name>.*` configures
+whenmoon's consumer-side behaviour (account-poll cadence, rate
+limit, live kill-switch).
 
 User-facing commands registered into the unified command tree stay
 inside this plugin rather than a sibling `plugins/cmd/whenmoon/`,

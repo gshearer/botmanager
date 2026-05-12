@@ -22,11 +22,15 @@ Provides the `exchange_coinbase` capability tag. A hard `requires`
 on `feature_exchange` ensures the dispatch abstraction is up before
 this plugin's init runs.
 
-Candle + trade traffic routes through the feature_exchange
-priority queue + token bucket via `cb_exchange_register_vtable()` in
-`coinbase_init`. Other typed APIs (products, ticker, orders, accounts)
-keep the legacy direct-curl path until the live-trading framework is
-unpaused — see EX-1 outcomes in `TODO.md` for the rationale.
+All consumer traffic routes through the `feature_exchange` priority
+queue + token bucket via `cb_exchange_register_vtable()` in
+`coinbase_init`. The vtable populates the full capability surface
+(candles, orders, cancels, queries, list_orders, list_fills,
+get_accounts, ws_subscribe / ws_unsubscribe) so consumers stay on
+`exchange_*_async(name, …)` and never reach for the
+`coinbase_*_async` shims directly. Coinbase is one of multiple
+exchange backends; see `plugins/service/kraken/` for the second
+shipped reference implementation.
 
 ## Scope
 

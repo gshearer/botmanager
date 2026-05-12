@@ -8,12 +8,6 @@ vtable with `feature_exchange`. The same kraken plugin handles every
 Kraken interaction — REST (candles, accounts, orders, fills) and WS
 v2 (ticker, trade, ohlc, executions, balances).
 
-Status: **KR-3 scaffolding.** The plugin descriptor, KV schema,
-HMAC-SHA512 signer, nonce minter, and exchange-vtable registration
-are in place. REST traffic still FAILs at the vtable seam — KR-4
-fills in the candle / balance / order / fill endpoints. WebSocket v2
-lands in KR-5. See `TODO.md` §KR-3..KR-6 for the chunk roadmap.
-
 Auth is **HMAC-SHA512** — Kraken's wire scheme is unchanged since the
 v1 REST API:
 
@@ -25,7 +19,8 @@ API-Sign: base64(HMAC-SHA512(
 ```
 
 No JWTs, no per-request asymmetric crypto — this is symmetric MAC
-over a uripath/postdata commitment.
+over a uripath/postdata commitment. Kraken has no sandbox concept;
+production endpoints are the only target.
 
 ## Layout
 
@@ -33,6 +28,24 @@ over a uripath/postdata commitment.
 the `exchange_kraken` capability tag. A hard `requires` on
 `feature_exchange` ensures the dispatch abstraction is up before this
 plugin's `init` runs.
+
+REST traffic routes through `feature_exchange`'s priority queue +
+token bucket via `kr_exchange_register_vtable()` in `kr_start`.
+WebSocket subscriptions are owned by the plugin's channel multiplexer
+and surface to consumers as opaque `exchange_ws_sub_t` handles
+allocated by `kr_ws_subscribe`.
+
+## Scope
+
+Two surfaces, served by the same plugin:
+
+| Surface | URL | Auth | Purpose |
+|---------|-----|------|---------|
+| REST | `https://api.kraken.com` | `API-Key` + `API-Sign` HMAC-SHA512 on every private POST; public GETs are unauthenticated | OHLC candles, BalanceEx, AddOrder, CancelOrder, QueryOrders, Open/ClosedOrders, TradesHistory, AssetPairs cache |
+| WebSocket v2 | `wss://ws.kraken.com/v2` (public), `wss://ws-auth.kraken.com/v2` (private) | Public channels are unauthenticated; private channels embed a token from `POST /0/private/GetWebSocketsToken` in the subscribe payload | Live streams: `ticker`, `trade`, `ohlc`, `executions`, `balances`, `heartbeat` |
+
+Kraken does not publish a sandbox surface. The REST + WS URLs are the
+single production target.
 
 ## Layering
 
@@ -60,13 +73,13 @@ Hard layering rules apply (`plugins/service/AGENTS.md`):
 | Key | Type | Default | Role |
 |-----|------|---------|------|
 | `plugin.kraken.rest_url` | STR | `https://api.kraken.com` | REST base URL. |
-| `plugin.kraken.ws_url_public` | STR | `wss://ws.kraken.com/v2` | Public WebSocket URL (ticker, trade, ohlc, book). |
+| `plugin.kraken.ws_url_public` | STR | `wss://ws.kraken.com/v2` | Public WebSocket URL (ticker, trade, ohlc). |
 | `plugin.kraken.ws_url_private` | STR | `wss://ws-auth.kraken.com/v2` | Private WebSocket URL (executions, balances). |
 | `plugin.kraken.creds.api_key` | STR (secret) | `` | API key string. Sent verbatim in `API-Key`. |
 | `plugin.kraken.creds.private_key` | STR (secret) | `` | Base64-encoded HMAC secret. Decoded once and cached. |
 | `plugin.kraken.rest_enabled` | BOOL | `true` | Enable REST dispatcher. |
 | `plugin.kraken.ws_enabled` | BOOL | `false` | Enable WebSocket reader. |
-| `plugin.kraken.ws_reconnect_ms` | UINT32 | `2000` | Initial WebSocket reconnect backoff. |
+| `plugin.kraken.ws_reconnect_ms` | UINT32 | `2000` | Initial WebSocket reconnect backoff (capped at 60 s). |
 | `plugin.kraken.request_timeout` | UINT32 | `15` | Per-call REST timeout. |
 | `plugin.kraken.assetpairs_refresh_sec` | UINT32 | `86400` | Cadence for the altname/canonical/wsname cache refresh. |
 | `plugin.kraken.last_nonce` | UINT64 | `0` | Last-minted nonce; persisted per-request for restart safety. |
@@ -87,9 +100,24 @@ set kv plugin.kraken.creds.private_key <base64-secret>
 ```
 
 `kraken_apikey_configured()` returns true iff both KVs are non-empty
-AND `creds.private_key` base64-decoded cleanly. The cached decoded
+AND `creds.private_key` base64-decodes cleanly. The cached decoded
 secret is invalidated transparently on any KV-edit — no daemon
 restart needed.
+
+### Symbol formats
+
+Kraken exposes three names per pair:
+
+| Form | Example (BTC/USD) | Where it surfaces |
+|------|-------------------|-------------------|
+| altname | `BTCUSD` | Most REST endpoints accept this. |
+| canonical | `XXBTZUSD` | Legacy fields; some REST endpoints return this. |
+| wsname | `BTC/USD` | WebSocket v2 subscribe payloads. |
+
+The assetpairs cache (`kraken_pairs.c`, capacity 512) maps any of the
+three onto the others. `kr_pair_lookup_rest` / `_ws` translate at the
+call site; cache miss → input passes through unchanged. Refresh on
+`kr_start` + periodically at `plugin.kraken.assetpairs_refresh_sec`.
 
 ## Namespace split: `plugin.kraken.*` vs `plugin.whenmoon.exchange.kraken.*`
 
@@ -114,16 +142,65 @@ specific to whenmoon's behaviour around kraken, it belongs in
 - `libcurl` (≥7.86 for the WebSocket client; the project ships
   against 8.x).
 - `libcrypto` via OpenSSL — HMAC-SHA512 + SHA256 + base64 for
-  request signing.
-- `json-c` — response parsing (added in KR-4).
+  request signing. An in-tree `kr_b64_decode` handles the private-key
+  base64 (OpenSSL's `EVP_DecodeBlock` is not pad-aware).
+- `json-c` — response parsing.
 
 ## Consumer Access Shapes
 
 Consumers (whenmoon, future strategy plugins) go through the
 `feature_exchange` abstraction (`exchange_api.h`) — not through this
-plugin's `kraken_api.h` shims directly. The dlsym surface here is
-for plugin-internal exports + the rare consumer that needs Kraken-
-specific behaviour (e.g. a Kraken-only admin command).
+plugin's `kraken_api.h` shims directly. The dlsym surface here is for
+plugin-internal exports plus the rare consumer that needs Kraken-
+specific behaviour (e.g. a Kraken-only admin command). The abstraction
+translates `exchange_*_async(name, …)` into the matching `kr_*`
+vtable hook based on the resolved `name`.
+
+Two access patterns coexist, both routed via the vtable:
+
+1. **Pull (REST)**: `exchange_fetch_candles_async`,
+   `exchange_get_accounts_async`, `exchange_place_order_async`,
+   `exchange_cancel_order_async`, `exchange_get_order_async`,
+   `exchange_list_orders_async`, `exchange_list_fills_async`. The
+   adapter translates between `exchange_*_t` and `kraken_*_t` at the
+   seam; whenmoon never sees a `kraken_*` type.
+2. **Push (WebSocket v2)**: `exchange_ws_subscribe(name, channels[],
+   product_ids[], cb, user)` returns an opaque `exchange_ws_sub_t *`
+   handle. Events arrive via `exchange_ws_event_cb_t` on the WS
+   reader thread. Reconnect, resubscribe, token refresh, and channel
+   multiplexing are owned by the plugin, not the consumer.
+
+### Channel mapping
+
+| `exchange_ws_channel_t` | Kraken v2 channel |
+|-------------------------|-------------------|
+| `EXCH_WS_TICKER` | `ticker` |
+| `EXCH_WS_TRADES` | `trade` |
+| `EXCH_WS_OHLC_1M` | `ohlc` |
+| `EXCH_WS_USER` | `executions` + `balances` (expanded to two internal slots) |
+| `EXCH_WS_BOOK_L2` | unsupported — `kr_ws_subscribe` FAILs cleanly |
+
+Kraken v2 emits a `heartbeat` channel frame on every subscribed
+session at ~1 Hz; the dispatcher recognises it and returns silently
+(no fanout).
+
+### Sequence gaps
+
+Kraken WS v2 has no per-product sequence number, unlike Coinbase's
+Advanced Trade feed. Recovery for missed bars/trades is via REST
+candles + TradesHistory backfill (whenmoon's existing path). The
+`exchange_ws_event_t::seq_gap` field is always false from Kraken;
+consumers that need authoritative gap detection rely on REST coverage
+queries.
+
+### WS token cache
+
+`POST /0/private/GetWebSocketsToken` mints a private-channel token
+with a documented 15-minute lifetime. The plugin pre-emptively
+refreshes at 14 min; concurrent fetches coalesce via a 32-slot waiter
+queue. Cache is monotonic — never zeroed past the first success — so
+a token-fetch failure during a reconnect doesn't strand existing
+private slots.
 
 ## Do Not
 
@@ -135,3 +212,9 @@ specific behaviour (e.g. a Kraken-only admin command).
 - Do not bypass the `creds`-segment secret tier by reading KV
   outside an admin context — secret-tier reads return
   `KV_REDACTED_VALUE` and the signer FAILs cleanly.
+- Do not reintroduce sequence-gap detection. Kraken v2 has no
+  authoritative per-product sequence; the same shape was ripped from
+  the coinbase WS path in CB-WS-SEQ-1 for the same reason.
+- Do not mix HMAC with any forthcoming v2 auth scheme. If Kraken
+  ships an asymmetric key surface, rip the HMAC path entirely rather
+  than living behind an `#ifdef` wall.
