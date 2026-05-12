@@ -275,49 +275,58 @@ seed_builtin_groups(const userns_t *ns)
 static void
 seed_owner_user(const userns_t *ns)
 {
-  // Check if @owner already exists.
-  uuid_t uu;
-  char sql[384];
-  db_result_t *r;
   static const char *group_names[] = {
     USERNS_GROUP_OWNER, USERNS_GROUP_ADMIN,
     USERNS_GROUP_USER, USERNS_GROUP_EVERYONE,
   };
-  char uuid_str[USERNS_UUID_SZ];
-  if(userns_user_exists(ns, USERNS_OWNER_USER))
-    return;
 
-  // Insert @owner with no password (cannot authenticate via methods).
-
-  uuid_generate(uu);
-  uuid_unparse_lower(uu, uuid_str);
-
-
-  snprintf(sql, sizeof(sql),
-      "INSERT INTO userns_user (ns_id, username, uuid) "
-      "VALUES (%u, '%s', '%s') "
-      "ON CONFLICT DO NOTHING",
-      ns->id, USERNS_OWNER_USER, uuid_str);
-
-  r = db_result_alloc();
-
-  if(db_query(sql, r) != SUCCESS)
+  // Ensure @owner user row exists. Insert is idempotent via ON
+  // CONFLICT — safe to re-run on every boot.
+  if(!userns_user_exists(ns, USERNS_OWNER_USER))
   {
-    clam(CLAM_WARN, "userns", "cannot seed @owner in '%s': %s",
-        ns->name, r->error);
+    uuid_t       uu;
+    char         uuid_str[USERNS_UUID_SZ];
+    char         sql[384];
+    db_result_t *r;
+
+    uuid_generate(uu);
+    uuid_unparse_lower(uu, uuid_str);
+
+    snprintf(sql, sizeof(sql),
+        "INSERT INTO userns_user (ns_id, username, uuid) "
+        "VALUES (%u, '%s', '%s') "
+        "ON CONFLICT DO NOTHING",
+        ns->id, USERNS_OWNER_USER, uuid_str);
+
+    r = db_result_alloc();
+
+    if(db_query(sql, r) != SUCCESS)
+    {
+      clam(CLAM_WARN, "userns", "cannot seed @owner in '%s': %s",
+          ns->name, r->error);
+      db_result_free(r);
+      return;
+    }
+
     db_result_free(r);
-    return;
+
+    clam(CLAM_INFO, "userns", "seeded @owner in namespace '%s'", ns->name);
   }
 
-  db_result_free(r);
-
-  // Add @owner to all built-in groups at maximum level.
-
+  // Ensure @owner is a member of every built-in group at OWNER_LEVEL.
+  // Check-then-add so the (user_id, group_id) PRIMARY KEY in
+  // userns_member doesn't reject the second-boot INSERT. Backfills
+  // memberships left missing by past boots that ran the seed loop
+  // before userns_ready was set, leaving @owner groupless and
+  // OWNER-gated commands like /quit denied for the literal owner.
   for(size_t i = 0; i < sizeof(group_names) / sizeof(group_names[0]); i++)
+  {
+    if(userns_member_check(ns, USERNS_OWNER_USER, group_names[i]))
+      continue;
+
     userns_member_add(ns, USERNS_OWNER_USER, group_names[i],
         USERNS_OWNER_LEVEL);
-
-  clam(CLAM_INFO, "userns", "seeded @owner in namespace '%s'", ns->name);
+  }
 }
 
 static bool
@@ -357,15 +366,6 @@ load_all(void)
   db_result_free(r);
 
   clam(CLAM_INFO, "userns", "loaded %u namespace(s)", userns_total);
-
-  // Seed built-in groups and @owner user for all loaded namespaces,
-  // then populate MFA caches.
-  for(userns_t *ns = userns_list; ns != NULL; ns = ns->next)
-  {
-    seed_builtin_groups(ns);
-    seed_owner_user(ns);
-    userns_cache_ensure(ns);
-  }
 
   return(SUCCESS);
 }
@@ -436,6 +436,20 @@ userns_init(void)
   }
 
   userns_ready = true;
+
+  // Seed built-in groups and @owner user for every loaded namespace,
+  // then populate MFA caches. Must run after userns_ready=true; the
+  // membership-write path (userns_member_add) gates on userns_ready
+  // and would silently bail otherwise, leaving @owner groupless.
+  // Idempotent — re-runs on every boot to backfill any missing
+  // built-in groups or memberships introduced by past code that
+  // ran before this ordering was correct.
+  for(userns_t *ns = userns_list; ns != NULL; ns = ns->next)
+  {
+    seed_builtin_groups(ns);
+    seed_owner_user(ns);
+    userns_cache_ensure(ns);
+  }
 
   clam(CLAM_INFO, "userns_init", "user namespace subsystem initialized");
   return(SUCCESS);

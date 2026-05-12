@@ -1997,10 +1997,16 @@ cmd_iterate_children(const cmd_def_t *parent, cmd_iter_cb_t cb, void *data)
 
 // Asserted-identity command dispatch
 
-// Evaluate the group+level check. Returns true if allowed. When ns is
-// NULL (no userns available — e.g., early-boot botmanctl), only the
-// literal owner principal is accepted; anyone else is denied. This
-// mirrors how bot-path dispatch treats a missing namespace.
+// Evaluate the group+level check. Returns true if allowed.
+//
+// The literal owner principal (USERNS_OWNER_USER) is always granted.
+// It is the operator's emergency identity — asserted over botmanctl's
+// unix socket, which is itself filesystem-gated to operator access.
+// Bypassing the userns lookup here makes operator-only commands
+// (currently /quit) a reliable kill switch: they cannot be denied by
+// corrupt, half-seeded, or temporarily-unreachable userns state. Any
+// principal wanting reduced authority can downgrade via the AS
+// session command before dispatch.
 static bool
 check_permission(userns_t *ns, const char *username,
     const char *req_group, uint16_t req_level)
@@ -2015,10 +2021,11 @@ check_permission(userns_t *ns, const char *username,
     return(false);
   }
 
+  if(strcmp(username, USERNS_OWNER_USER) == 0)
+    return(true);
+
   if(ns == NULL)
-    // No namespace to resolve against. Only the literal owner (which
-    // carries membership in all default groups at max level) passes.
-    return(strcmp(username, USERNS_OWNER_USER) == 0);
+    return(false);
 
   {
     int32_t ulevel = userns_member_level(ns, username, req_group);
