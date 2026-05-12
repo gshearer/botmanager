@@ -33,21 +33,24 @@
 // Per-product backfill context. Heap-owned; the completion callback is
 // the sole owner and frees it after wiring the rows into the market
 // struct. Lifetime decoupled from whenmoon_state_t teardown: if the
-// state is destroyed before coinbase fires the callback, the callback
-// still runs (coinbase owns its request queue) and must not touch the
-// state. We therefore track the state pointer but also the market
-// product_id; on callback we re-lookup the product id in the live
-// state to decide whether to commit.
+// state is destroyed before the exchange fires the callback, the
+// callback still runs (the protocol plugin owns its request queue)
+// and must not touch the state. We therefore track the state pointer
+// but also the market product_id; on callback we re-lookup the
+// product id in the live state to decide whether to commit.
 typedef struct
 {
   whenmoon_state_t   *st;
-  char                product_id[COINBASE_PRODUCT_ID_SZ];
+  char                exchange_name[EXCHANGE_NAME_SZ];
+  char                product_id[WM_PRODUCT_ID_SZ];
 } wm_market_backfill_ctx_t;
 
-static const coinbase_ws_channel_t wm_ws_channels[] = {
-  COINBASE_CH_HEARTBEAT,
-  COINBASE_CH_TICKER,
-  COINBASE_CH_MATCHES,
+// KR-2: heartbeat is implicit at the protocol plugin layer (coinbase
+// adds it for liveness accounting; kraken's own ping/pong handles it).
+// The generic surface exposes only the consumer-visible channels.
+static const exchange_ws_channel_t wm_ws_channels[] = {
+  EXCH_WS_TICKER,
+  EXCH_WS_TRADES,
 };
 
 // ------------------------------------------------------------------ //
@@ -65,7 +68,7 @@ wm_market_find(whenmoon_markets_t *m, const char *product_id)
   for(i = 0; i < m->n_markets; i++)
   {
     if(strncmp(m->arr[i].product_id, product_id,
-           COINBASE_PRODUCT_ID_SZ) == 0)
+           WM_PRODUCT_ID_SZ) == 0)
       return(&m->arr[i]);
   }
 
@@ -128,12 +131,17 @@ wm_market_grow(whenmoon_markets_t *m, uint32_t needed)
 // after every add/remove. Unsubscribing the old handle first is safe:
 // wm_market_on_event shorts on st->markets == NULL, which stays set,
 // but the handle close means no new events will fire in parallel.
+//
+// KR-2 single-exchange limitation: the current running set must share
+// one exchange. wm_market_add rejects a second exchange until KR-5
+// partitions wsub state per exchange.
 static void
 wm_market_resub_ws(whenmoon_state_t *st)
 {
   whenmoon_markets_t *m;
   const char        **pid_ptrs = NULL;
   uint32_t            i;
+  const char         *bind_exch;
 
   if(st == NULL || st->markets == NULL)
     return;
@@ -142,12 +150,15 @@ wm_market_resub_ws(whenmoon_state_t *st)
 
   if(m->ws_sub != NULL)
   {
-    coinbase_ws_unsubscribe(m->ws_sub);
-    m->ws_sub = NULL;
+    exchange_ws_unsubscribe(m->ws_exchange, m->ws_sub);
+    m->ws_sub          = NULL;
+    m->ws_exchange[0]  = '\0';
   }
 
   if(m->n_markets == 0)
     return;
+
+  bind_exch = m->arr[0].exchange_name;
 
   pid_ptrs = mem_alloc("whenmoon", "ws_pids",
       sizeof(*pid_ptrs) * m->n_markets);
@@ -162,18 +173,26 @@ wm_market_resub_ws(whenmoon_state_t *st)
   for(i = 0; i < m->n_markets; i++)
     pid_ptrs[i] = m->arr[i].product_id;
 
-  m->ws_sub = coinbase_ws_subscribe(wm_ws_channels,
-      sizeof(wm_ws_channels) / sizeof(wm_ws_channels[0]),
-      pid_ptrs, m->n_markets,
-      wm_market_on_event, st);
-
-  if(m->ws_sub == NULL)
+  if(exchange_ws_subscribe(bind_exch,
+        wm_ws_channels,
+        sizeof(wm_ws_channels) / sizeof(wm_ws_channels[0]),
+        pid_ptrs, m->n_markets,
+        wm_market_on_event, st,
+        &m->ws_sub) != SUCCESS || m->ws_sub == NULL)
+  {
     clam(CLAM_INFO, WHENMOON_CTX,
-        "ws subscribe failed (no live stream)");
+        "ws subscribe failed for %s (no live stream)", bind_exch);
+    m->ws_sub = NULL;
+  }
+  else
+  {
+    snprintf(m->ws_exchange, sizeof(m->ws_exchange), "%s", bind_exch);
+  }
 
   // WM-LT-8-B3: piggyback the user-channel resub on the same product
-  // set so live-trader fill events reach the engine.
-  wm_live_ws_resub(st, pid_ptrs, m->n_markets);
+  // set so live-trader fill events reach the engine. Bound to the same
+  // exchange; KR-5 will partition.
+  wm_live_ws_resub(st, bind_exch, pid_ptrs, m->n_markets);
 
   mem_free(pid_ptrs);
 }
@@ -182,11 +201,12 @@ wm_market_resub_ws(whenmoon_state_t *st)
 // Used on add (fresh product) and indirectly on restore. Callback
 // frees the ctx.
 static void
-wm_market_kick_backfill(whenmoon_state_t *st, const char *product_id)
+wm_market_kick_backfill(whenmoon_state_t *st,
+    const char *exchange_name, const char *product_id)
 {
   wm_market_backfill_ctx_t *ctx;
 
-  if(st == NULL || product_id == NULL)
+  if(st == NULL || exchange_name == NULL || product_id == NULL)
     return;
 
   ctx = mem_alloc("whenmoon", "backfill_ctx", sizeof(*ctx));
@@ -195,15 +215,18 @@ wm_market_kick_backfill(whenmoon_state_t *st, const char *product_id)
     return;
 
   ctx->st = st;
+  snprintf(ctx->exchange_name, sizeof(ctx->exchange_name), "%s",
+      exchange_name);
   snprintf(ctx->product_id, sizeof(ctx->product_id), "%s", product_id);
 
-  // On FAIL, coinbase invokes wm_market_on_candles with res->err set
-  // and that callback frees ctx. Do NOT touch ctx after this call.
-  // EX-1: market backfill is system-initiated catchup at start, route
-  // through the exchange abstraction at the backfill priority.
-  (void)coinbase_fetch_candles_async(ctx->product_id, COINBASE_GRAN_1M,
-      0, 0, EXCHANGE_PRIO_MARKET_BACKFILL,
-      wm_market_on_candles, ctx);
+  // On FAIL, the exchange abstraction fires wm_market_on_candles with
+  // res->err set and that callback frees ctx. Do NOT touch ctx after
+  // this call. Backfill priority is honoured inside the protocol
+  // adapter (the public shim does not surface a priority arg today —
+  // candle fetches are always EXCHANGE_PRIO_MARKET_BACKFILL on the
+  // coinbase adapter).
+  (void)exchange_fetch_candles_async(ctx->exchange_name, ctx->product_id,
+      EXCH_GRAN_1M, 0, 0, wm_market_on_candles, ctx);
 }
 
 // ------------------------------------------------------------------ //
@@ -397,12 +420,33 @@ wm_market_session_snapshot(whenmoon_market_t *mk,
 // Canonical id parsing / formatting                                  //
 // ------------------------------------------------------------------ //
 
-// Allowlist of exchange tokens accepted by the parser. EX-1 promotes
-// this to a registry lookup against loaded exchange plugins.
-static const char *const wm_market_exchange_allowlist[] = {
-  "coinbase",
-  NULL,
-};
+// KR-2: validate an exchange token against the live registry instead
+// of a hard-coded list. A new exchange becomes acceptable the moment
+// its plugin self-registers via exchange_register() — no whenmoon
+// edit required.
+#define WM_EXCH_LIST_CAP   8
+
+static bool
+wm_market_exchange_is_known(const char *name)
+{
+  char     names[WM_EXCH_LIST_CAP][EXCHANGE_NAME_SZ];
+  uint32_t count = 0;
+  uint32_t i;
+
+  if(name == NULL || name[0] == '\0')
+    return(FAIL);
+
+  if(exchange_name_list(names, WM_EXCH_LIST_CAP, &count) != SUCCESS)
+    return(FAIL);
+
+  for(i = 0; i < count && i < WM_EXCH_LIST_CAP; i++)
+  {
+    if(strcmp(names[i], name) == 0)
+      return(SUCCESS);
+  }
+
+  return(FAIL);
+}
 
 static bool
 wm_market_lower_token_copy(const char *src, size_t len,
@@ -436,8 +480,6 @@ wm_market_parse_id(const char *id,
   const char *d1;
   const char *d2;
   size_t      len;
-  uint32_t    i;
-  bool        allowed = false;
 
   if(id == NULL || exchange == NULL || base == NULL || quote == NULL)
     return(FAIL);
@@ -471,16 +513,7 @@ wm_market_parse_id(const char *id,
   if(wm_market_lower_token_copy(d2 + 1, len, quote, quote_sz) != SUCCESS)
     return(FAIL);
 
-  for(i = 0; wm_market_exchange_allowlist[i] != NULL; i++)
-  {
-    if(strcmp(exchange, wm_market_exchange_allowlist[i]) == 0)
-    {
-      allowed = true;
-      break;
-    }
-  }
-
-  if(!allowed)
+  if(wm_market_exchange_is_known(exchange) != SUCCESS)
     return(FAIL);
 
   return(SUCCESS);
@@ -599,7 +632,7 @@ wm_market_set_enabled(int32_t market_id, bool enabled)
 // ------------------------------------------------------------------ //
 
 void
-wm_market_on_candles(const coinbase_candles_result_t *res, void *user)
+wm_market_on_candles(const exchange_candles_result_t *res, void *user)
 {
   wm_market_backfill_ctx_t *ctx = user;
   whenmoon_market_t        *mk;
@@ -638,19 +671,20 @@ wm_market_on_candles(const coinbase_candles_result_t *res, void *user)
   // aggregator's idempotency check (skip ts <= last_close_ms) prunes
   // duplicates correctly when a later REST page overlaps a prior
   // warm-up. The replay path drives the cascade so 5m/15m/1h/6h/1d
-  // grains backfill from this single 1m feed.
+  // grains backfill from this single 1m feed. exchange_candle_t carries
+  // bucket open in ms, so bar close = open + 60s.
   for(i = res->count; i > 0; i--)
   {
-    const coinbase_candle_t *cb = &res->rows[i - 1];
+    const exchange_candle_t *src = &res->rows[i - 1];
     wm_candle_full_t         bar;
 
     memset(&bar, 0, sizeof(bar));
-    bar.ts_close_ms = (cb->time + 60) * 1000;   // 1m bucket close
-    bar.open        = cb->open;
-    bar.high        = cb->high;
-    bar.low         = cb->low;
-    bar.close       = cb->close;
-    bar.volume      = cb->volume;
+    bar.ts_close_ms = src->ts_open_ms + 60 * 1000;
+    bar.open        = src->open;
+    bar.high        = src->high;
+    bar.low         = src->low;
+    bar.close       = src->close;
+    bar.volume      = src->volume;
 
     wm_aggregator_replay_bar(mk, WM_GRAN_1M, &bar);
   }
@@ -665,7 +699,7 @@ wm_market_on_candles(const coinbase_candles_result_t *res, void *user)
 }
 
 void
-wm_market_on_event(const coinbase_ws_event_t *ev, void *user)
+wm_market_on_event(const exchange_ws_event_t *ev, void *user)
 {
   whenmoon_state_t  *st = user;
   whenmoon_market_t *mk;
@@ -675,15 +709,9 @@ wm_market_on_event(const coinbase_ws_event_t *ev, void *user)
 
   switch(ev->channel)
   {
-    case COINBASE_CH_HEARTBEAT:
-      break;
-
-    case COINBASE_CH_TICKER:
+    case EXCH_WS_TICKER:
     {
-      const coinbase_ws_ticker_t *t = ev->payload;
-
-      if(t == NULL)
-        break;
+      const exchange_ws_ticker_t *t = &ev->payload.ticker;
 
       mk = wm_market_find(st->markets, t->product_id);
 
@@ -701,12 +729,9 @@ wm_market_on_event(const coinbase_ws_event_t *ev, void *user)
       break;
     }
 
-    case COINBASE_CH_MATCHES:
+    case EXCH_WS_TRADES:
     {
-      const coinbase_ws_match_t *m = ev->payload;
-
-      if(m == NULL)
-        break;
+      const exchange_ws_match_t *m = &ev->payload.match;
 
       mk = wm_market_find(st->markets, m->product_id);
 
@@ -772,8 +797,9 @@ wm_market_destroy(whenmoon_state_t *st)
 
   if(m->ws_sub != NULL)
   {
-    coinbase_ws_unsubscribe(m->ws_sub);
-    m->ws_sub = NULL;
+    exchange_ws_unsubscribe(m->ws_exchange, m->ws_sub);
+    m->ws_sub          = NULL;
+    m->ws_exchange[0]  = '\0';
   }
 
   if(m->arr != NULL)
@@ -828,6 +854,21 @@ wm_market_add(whenmoon_state_t *st,
   if(wm_market_find(m, product_id) != NULL)
     return(SUCCESS);   // already present; benign no-op
 
+  // KR-2 single-exchange constraint: every market in the running set
+  // must share one exchange. The shared user-channel ws_sub + the
+  // live-trader's single bound exchange need a partition pass before
+  // a second exchange is acceptable (KR-5 work).
+  if(m->n_markets > 0
+      && strncmp(m->arr[0].exchange_name, exchange, EXCHANGE_NAME_SZ) != 0)
+  {
+    if(err != NULL)
+      snprintf(err, err_cap,
+          "multi-exchange running set not supported yet"
+          " (current=%s, requested=%s)",
+          m->arr[0].exchange_name, exchange);
+    return(FAIL);
+  }
+
   market_id = wm_market_lookup_or_create(exchange, base, quote, product_id);
 
   if(market_id < 0)
@@ -844,7 +885,8 @@ wm_market_add(whenmoon_state_t *st,
 
   mk = &m->arr[m->n_markets];
   memset(mk, 0, sizeof(*mk));
-  snprintf(mk->product_id, sizeof(mk->product_id), "%s", product_id);
+  snprintf(mk->exchange_name, sizeof(mk->exchange_name), "%s", exchange);
+  snprintf(mk->product_id,    sizeof(mk->product_id),    "%s", product_id);
   wm_market_format_id(exchange, base, quote,
       mk->market_id_str, sizeof(mk->market_id_str));
   mk->market_id = market_id;
@@ -895,7 +937,7 @@ wm_market_add(whenmoon_state_t *st,
   wm_market_session_refresh_kv(mk);
 
   wm_market_resub_ws(st);
-  wm_market_kick_backfill(st, product_id);
+  wm_market_kick_backfill(st, exchange, product_id);
 
   // Schedule the DB warm-up: replay 1m bars from
   // wm_candles_<id> chronologically into the aggregator. The
@@ -1112,6 +1154,8 @@ wm_market_create_synthetic(const char *market_id_str,
   snprintf(mk->market_id_str, sizeof(mk->market_id_str), "%s",
       market_id_str);
   snprintf(mk->product_id, sizeof(mk->product_id), "%s", src->product_id);
+  snprintf(mk->exchange_name, sizeof(mk->exchange_name), "%s",
+      src->exchange_name);
   mk->market_id = -1;     // synth has no DB row
 
   // Share grain rings — read-only during iteration. The source

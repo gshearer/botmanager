@@ -22,7 +22,10 @@
 #include "whenmoon_strategy.h"
 #undef WHENMOON_STRATEGY_INTERNAL
 
-#include "coinbase_api.h"
+// KR-2: aggregator.h is internal-only; it pulls the exchange types
+// directly to size in-struct buffers without depending on market.h
+// (which has a transitive dep back into aggregator.h).
+#include "exchange_api.h"
 
 #include <stdbool.h>
 #include <stdint.h>
@@ -121,7 +124,7 @@ typedef struct
 {
   struct whenmoon_state *st;
   int32_t                market_id;
-  char                   product_id[COINBASE_PRODUCT_ID_SZ];
+  char                   product_id[EXCHANGE_PRODUCT_ID_SZ];
 } wm_warmup_ctx_t;
 
 void wm_aggregator_load_history_task(struct task *t);

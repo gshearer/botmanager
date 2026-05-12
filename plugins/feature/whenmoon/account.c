@@ -1,45 +1,94 @@
 // botmanager — MIT
-// whenmoon per-bot coinbase account (balance) snapshot refresher.
+// whenmoon per-exchange account (balance) snapshot refresher.
 
 #define WHENMOON_INTERNAL
 #include "whenmoon.h"
 #include "account.h"
 
+#include "exchange_api.h"
 #include "kv.h"
 #include "task.h"
 
+#include <stdio.h>
 #include <string.h>
 
 #define WM_ACCOUNT_DEFAULT_REFRESH_SECS   30
 #define WM_ACCOUNT_MIN_REFRESH_SECS        5
+
+// Per-async-call heap context. Lets wm_account_on_accounts find the
+// matching slot under st->account even if the slot list grew between
+// dispatch and completion. Freed by the callback on every exit path.
+typedef struct
+{
+  struct whenmoon_state *st;
+  char                   exchange_name[EXCHANGE_NAME_SZ];
+} wm_account_refresh_ctx_t;
+
+// ------------------------------------------------------------------ //
+// Slot helpers                                                       //
+// ------------------------------------------------------------------ //
+
+static wm_account_slot_t *
+wm_account_slot_find(whenmoon_account_t *acc, const char *name)
+{
+  uint32_t i;
+
+  if(acc == NULL || name == NULL)
+    return(NULL);
+
+  for(i = 0; i < acc->n_slots; i++)
+  {
+    if(strncmp(acc->slots[i].exchange_name, name,
+           EXCHANGE_NAME_SZ) == 0)
+      return(&acc->slots[i]);
+  }
+
+  return(NULL);
+}
 
 // ------------------------------------------------------------------ //
 // Accounts fetch completion                                          //
 // ------------------------------------------------------------------ //
 
 void
-wm_account_on_accounts(const coinbase_accounts_result_t *res, void *user)
+wm_account_on_accounts(const exchange_accounts_result_t *res, void *user)
 {
-  whenmoon_state_t *st = user;
-  whenmoon_account_t *acc;
-  uint32_t n;
+  wm_account_refresh_ctx_t *ctx = user;
+  whenmoon_state_t         *st;
+  whenmoon_account_t       *acc;
+  wm_account_slot_t        *slot;
+  uint32_t                  n;
+
+  if(ctx == NULL)
+    return;
+
+  st = ctx->st;
 
   if(st == NULL || st->account == NULL)
+  {
+    mem_free(ctx);
     return;
+  }
 
-  acc = st->account;
+  acc  = st->account;
+  slot = wm_account_slot_find(acc, ctx->exchange_name);
 
-  if(res == NULL)
+  if(slot == NULL || res == NULL)
+  {
+    mem_free(ctx);
     return;
+  }
 
   if(res->err[0] != '\0')
   {
-    pthread_mutex_lock(&acc->lock);
-    snprintf(acc->last_err, sizeof(acc->last_err), "%s", res->err);
-    pthread_mutex_unlock(&acc->lock);
+    pthread_mutex_lock(&slot->lock);
+    snprintf(slot->last_err, sizeof(slot->last_err), "%s", res->err);
+    pthread_mutex_unlock(&slot->lock);
 
     clam(CLAM_INFO, WHENMOON_CTX,
-        "account refresh failed: %s", res->err);
+        "account refresh failed (exchange=%s): %s",
+        ctx->exchange_name, res->err);
+    mem_free(ctx);
     return;
   }
 
@@ -48,59 +97,130 @@ wm_account_on_accounts(const coinbase_accounts_result_t *res, void *user)
   if(n > WM_ACCOUNT_ROW_CAP)
     n = WM_ACCOUNT_ROW_CAP;
 
-  pthread_mutex_lock(&acc->lock);
-  memcpy(acc->rows, res->rows, sizeof(acc->rows[0]) * n);
-  acc->n_rows          = n;
-  acc->last_refresh_ts = time(NULL);
-  acc->last_err[0]     = '\0';
-  pthread_mutex_unlock(&acc->lock);
+  pthread_mutex_lock(&slot->lock);
+  memcpy(slot->rows, res->rows, sizeof(slot->rows[0]) * n);
+  slot->n_rows          = n;
+  slot->last_refresh_ts = time(NULL);
+  slot->last_err[0]     = '\0';
+  pthread_mutex_unlock(&slot->lock);
 
   clam(CLAM_DEBUG2, WHENMOON_CTX,
-      "account refresh ok rows=%u", n);
+      "account refresh ok (exchange=%s rows=%u)",
+      ctx->exchange_name, n);
+  mem_free(ctx);
+}
+
+// Build a fresh refresh ctx; caller is responsible for cleanup on the
+// no-dispatch path (FAIL before submit). On dispatch the callback owns
+// the free.
+static wm_account_refresh_ctx_t *
+wm_account_ctx_new(whenmoon_state_t *st, const char *exchange_name)
+{
+  wm_account_refresh_ctx_t *ctx;
+
+  ctx = mem_alloc("whenmoon", "acct.refresh_ctx", sizeof(*ctx));
+
+  if(ctx == NULL)
+    return(NULL);
+
+  ctx->st = st;
+  snprintf(ctx->exchange_name, sizeof(ctx->exchange_name), "%s",
+      exchange_name);
+  return(ctx);
 }
 
 // ------------------------------------------------------------------ //
-// Periodic tick                                                      //
+// Periodic tick (per-slot)                                           //
 // ------------------------------------------------------------------ //
 
 static void
 wm_account_tick(task_t *t)
 {
-  whenmoon_state_t *st = t->data;
+  wm_account_slot_t        *slot;
+  whenmoon_state_t         *st;
+  exchange_capabilities_t   caps;
+  wm_account_refresh_ctx_t *ctx;
 
-  // wm_account_destroy task_cancel()s the handle, so the task system
-  // guarantees this callback will not fire after destroy. The null
-  // check is belt-and-braces.
-  if(st == NULL)
+  // task_cancel runs synchronously, so destroy never frees slot while
+  // this tick is in flight. The null check is belt-and-braces.
+  slot = t->data;
+
+  if(slot == NULL)
   {
     t->state = TASK_ENDED;
     return;
   }
 
-  if(!coinbase_apikey_configured())
+  st = whenmoon_get_state();
+
+  if(st == NULL || st->account == NULL)
   {
-    // Key rotated out at runtime. Leave the task scheduled — it's
-    // cheap — but skip the fetch.
     t->state = TASK_ENDED;
     return;
   }
 
-  if(coinbase_get_accounts_async(wm_account_on_accounts, st) != SUCCESS)
+  // Skip when creds are not configured — the operator may rotate keys
+  // without recreating the slot; the next tick re-checks.
+  if(exchange_get_capabilities(slot->exchange_name, &caps) != SUCCESS
+      || !caps.has_credentials)
+  {
+    t->state = TASK_ENDED;
+    return;
+  }
+
+  ctx = wm_account_ctx_new(st, slot->exchange_name);
+
+  if(ctx == NULL)
+  {
+    t->state = TASK_ENDED;
+    return;
+  }
+
+  if(exchange_get_accounts_async(slot->exchange_name,
+        wm_account_on_accounts, ctx) != SUCCESS)
+  {
+    // exchange_get_accounts_async fires the typed cb synchronously with
+    // err set on FAIL; the cb has already freed ctx. Do not touch.
     clam(CLAM_INFO, WHENMOON_CTX,
-        "account refresh submit failed");
+        "account refresh submit failed (exchange=%s)",
+        slot->exchange_name);
+  }
 
   t->state = TASK_ENDED;
 }
 
+// Refresh cadence (seconds). Reads the per-exchange KV key with a
+// floor of WM_ACCOUNT_MIN_REFRESH_SECS — unset / out-of-range falls to
+// the default.
+static uint32_t
+wm_account_refresh_secs(const char *exchange_name)
+{
+  char     key[160];
+  uint32_t val;
+  int      n;
+
+  n = snprintf(key, sizeof(key),
+      "plugin.whenmoon.exchange.%s.account.refresh_sec", exchange_name);
+
+  if(n < 0 || (size_t)n >= sizeof(key))
+    return(WM_ACCOUNT_DEFAULT_REFRESH_SECS);
+
+  val = (uint32_t)kv_get_uint(key);
+
+  if(val < WM_ACCOUNT_MIN_REFRESH_SECS)
+    val = WM_ACCOUNT_DEFAULT_REFRESH_SECS;
+
+  return(val);
+}
+
 // ------------------------------------------------------------------ //
-// Init / destroy                                                     //
+// Init / start / destroy                                              //
 // ------------------------------------------------------------------ //
 
 bool
 wm_account_init(whenmoon_state_t *st)
 {
   whenmoon_account_t *acc;
-  uint32_t refresh_secs;
 
   if(st == NULL)
     return(FAIL);
@@ -111,35 +231,86 @@ wm_account_init(whenmoon_state_t *st)
     return(FAIL);
 
   memset(acc, 0, sizeof(*acc));
-  pthread_mutex_init(&acc->lock, NULL);
-
   st->account = acc;
+  return(SUCCESS);
+}
 
-  refresh_secs = (uint32_t)kv_get_uint(
-      "plugin.whenmoon.exchange.coinbase.account.refresh_sec");
+bool
+wm_account_start(whenmoon_state_t *st)
+{
+  whenmoon_account_t       *acc;
+  char                      names[WM_ACCOUNT_MAX_EXCHANGES][EXCHANGE_NAME_SZ];
+  uint32_t                  n_names = 0;
+  uint32_t                  i;
 
-  if(refresh_secs < WM_ACCOUNT_MIN_REFRESH_SECS)
-    refresh_secs = WM_ACCOUNT_DEFAULT_REFRESH_SECS;
+  if(st == NULL || st->account == NULL)
+    return(FAIL);
 
-  // Schedule the periodic unconditionally. Creds are written to the
-  // KV after plugin start (freshstart's post-launch admin commands),
-  // so the no-creds case at this moment is normal — wm_account_tick
-  // re-checks each tick and skips the fetch until creds appear.
-  acc->refresh_task = task_add_periodic("wm.acct", TASK_ANY, 200,
-      refresh_secs * 1000, wm_account_tick, st);
+  acc = st->account;
 
-  if(acc->refresh_task == TASK_HANDLE_NONE)
-    clam(CLAM_INFO, WHENMOON_CTX,
-        "account periodic task submit failed");
+  // Idempotent: skip when slots already exist (start can be re-entered
+  // after a freshstart-style reload).
+  if(acc->n_slots > 0)
+    return(SUCCESS);
 
-  else
-    clam(CLAM_INFO, WHENMOON_CTX,
-        "account refresh scheduled every %us", refresh_secs);
+  if(exchange_name_list(names, WM_ACCOUNT_MAX_EXCHANGES, &n_names) != SUCCESS)
+    n_names = 0;
 
-  if(coinbase_apikey_configured()
-      && coinbase_get_accounts_async(wm_account_on_accounts, st) != SUCCESS)
-    clam(CLAM_INFO, WHENMOON_CTX,
-        "initial account fetch submit failed");
+  if(n_names > WM_ACCOUNT_MAX_EXCHANGES)
+  {
+    clam(CLAM_WARN, WHENMOON_CTX,
+        "exchange list overflow (%u > %u); capping",
+        n_names, WM_ACCOUNT_MAX_EXCHANGES);
+    n_names = WM_ACCOUNT_MAX_EXCHANGES;
+  }
+
+  for(i = 0; i < n_names; i++)
+  {
+    wm_account_slot_t       *slot = &acc->slots[acc->n_slots];
+    exchange_capabilities_t  caps;
+    uint32_t                 refresh_secs;
+    bool                     have_creds = false;
+
+    memset(slot, 0, sizeof(*slot));
+    snprintf(slot->exchange_name, sizeof(slot->exchange_name), "%s",
+        names[i]);
+    pthread_mutex_init(&slot->lock, NULL);
+
+    refresh_secs = wm_account_refresh_secs(slot->exchange_name);
+
+    slot->refresh_task = task_add_periodic("wm.acct", TASK_ANY, 200,
+        refresh_secs * 1000, wm_account_tick, slot);
+
+    if(slot->refresh_task == TASK_HANDLE_NONE)
+      clam(CLAM_INFO, WHENMOON_CTX,
+          "account periodic task submit failed (exchange=%s)",
+          slot->exchange_name);
+
+    else
+      clam(CLAM_INFO, WHENMOON_CTX,
+          "account refresh scheduled every %us (exchange=%s)",
+          refresh_secs, slot->exchange_name);
+
+    acc->n_slots++;
+
+    if(exchange_get_capabilities(slot->exchange_name, &caps) == SUCCESS
+        && caps.has_credentials)
+      have_creds = true;
+
+    if(have_creds)
+    {
+      wm_account_refresh_ctx_t *ctx;
+
+      ctx = wm_account_ctx_new(st, slot->exchange_name);
+
+      if(ctx != NULL
+          && exchange_get_accounts_async(slot->exchange_name,
+                wm_account_on_accounts, ctx) != SUCCESS)
+        clam(CLAM_INFO, WHENMOON_CTX,
+            "initial account fetch submit failed (exchange=%s)",
+            slot->exchange_name);
+    }
+  }
 
   return(SUCCESS);
 }
@@ -148,22 +319,27 @@ void
 wm_account_destroy(whenmoon_state_t *st)
 {
   whenmoon_account_t *acc;
+  uint32_t            i;
 
   if(st == NULL || st->account == NULL)
     return;
 
   acc = st->account;
 
-  // Cancel the periodic synchronously so no stale tick fires after
-  // the struct is freed.
-  task_cancel(acc->refresh_task);
-  acc->refresh_task = TASK_HANDLE_NONE;
+  // Cancel every periodic synchronously so no stale tick fires after
+  // the per-slot lock is destroyed below.
+  for(i = 0; i < acc->n_slots; i++)
+  {
+    task_cancel(acc->slots[i].refresh_task);
+    acc->slots[i].refresh_task = TASK_HANDLE_NONE;
+  }
 
   // Detach first so a racing wm_account_on_accounts callback sees
-  // st->account == NULL via the state pointer and bails before
-  // touching freed memory.
+  // st->account == NULL and bails before touching freed memory.
   st->account = NULL;
 
-  pthread_mutex_destroy(&acc->lock);
+  for(i = 0; i < acc->n_slots; i++)
+    pthread_mutex_destroy(&acc->slots[i].lock);
+
   mem_free(acc);
 }

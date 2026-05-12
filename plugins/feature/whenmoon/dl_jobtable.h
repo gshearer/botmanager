@@ -7,7 +7,8 @@
 // here is the in-memory job list, persistence, and the
 // "kick the dispatch" surface that hands runnable jobs off to
 // dl_candles_dispatch_one. That, in turn, routes through
-// coinbase_fetch_*_async, which routes through exchange_request().
+// exchange_fetch_candles_async, which routes through
+// exchange_request() against the bound exchange protocol vtable.
 
 #ifndef BM_WHENMOON_DL_JOBTABLE_H
 #define BM_WHENMOON_DL_JOBTABLE_H
@@ -106,8 +107,8 @@ struct dl_job
   char             last_err[256];
 
   // Outstanding-request guard: a job may have at most one in-flight
-  // coinbase_fetch_*_async at a time. Set true when wm_dl_kick submits,
-  // cleared by the completion callback.
+  // exchange_fetch_candles_async at a time. Set true when wm_dl_kick
+  // submits, cleared by the completion callback.
   bool             in_flight;
 
   // DL-1 stall watchdog: wall-clock ms (CLOCK_MONOTONIC-derived) of the
@@ -156,8 +157,9 @@ void wm_dl_jobtable_destroy(struct whenmoon_state *st);
 // on FAIL writes a terse reason into `err`.
 //
 // `priority` is one of EXCHANGE_PRIO_* (exchange_api.h); it travels
-// with the job and is passed to the underlying coinbase_fetch_*_async
-// calls so the exchange abstraction routes accordingly.
+// with the job and is passed to the underlying
+// exchange_fetch_candles_async calls so the exchange abstraction
+// routes accordingly.
 bool wm_dl_job_enqueue(struct whenmoon_state *st,
     dl_job_kind_t kind, int32_t market_id,
     uint8_t priority,

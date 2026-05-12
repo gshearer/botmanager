@@ -8,7 +8,7 @@
 #include "dl_schema.h"
 #include "dl_coverage.h"
 
-#include "coinbase_api.h"
+#include "exchange_api.h"
 
 #include "alloc.h"
 #include "clam.h"
@@ -122,9 +122,9 @@ wm_dl_candles_dispatch_one(dl_jobtable_t *t, dl_job_t *j)
   if(end_s <= 0)
     end_s = (int64_t)time(NULL);
 
-  end_s   = wm_dl_align_down(end_s, (int64_t)COINBASE_GRAN_1M);
+  end_s   = wm_dl_align_down(end_s, (int64_t)EXCH_GRAN_1M);
   start_s = end_s - (int64_t)WM_DL_CANDLE_WINDOW_BUCKETS
-                  * (int64_t)COINBASE_GRAN_1M;
+                  * (int64_t)EXCH_GRAN_1M;
 
   if(start_s < 0)
     start_s = 0;
@@ -159,13 +159,16 @@ wm_dl_candles_dispatch_one(dl_jobtable_t *t, dl_job_t *j)
   ctx->window_start_s = start_s;
   ctx->window_end_s   = end_s;
 
-  // Coinbase treats `end` as inclusive; subtract one so the boundary
-  // bucket (which starts the next window) doesn't come back twice.
-  if(coinbase_fetch_candles_async(j->exchange_symbol, COINBASE_GRAN_1M,
-        start_s, end_s - 1, j->priority,
+  // Coinbase treats `end` as inclusive at the wire; the coinbase
+  // adapter forwards the half-open ms range as-is, so we subtract one
+  // second on `end_s` to keep the boundary bucket from coming back
+  // twice. Widen the seconds-valued window to milliseconds for the
+  // generic surface.
+  if(exchange_fetch_candles_async(j->exchange, j->exchange_symbol,
+        EXCH_GRAN_1M, start_s * 1000, (end_s - 1) * 1000,
         wm_dl_candles_on_page, ctx) != SUCCESS)
   {
-    // On submit failure the coinbase shim still fires the completion
+    // On submit failure the exchange shim still fires the completion
     // callback synchronously with res->err set, so `ctx` ownership has
     // already transferred — DO NOT free it here. The callback's own
     // error path increments consecutive_errors.
@@ -181,7 +184,7 @@ wm_dl_candles_dispatch_one(dl_jobtable_t *t, dl_job_t *j)
 
 uint32_t
 wm_dl_candles_insert_page(int32_t market_id,
-    const coinbase_candles_result_t *res)
+    const exchange_candles_result_t *res)
 {
   char         table[WM_DL_TABLE_SZ];
   db_result_t *dbres;
@@ -208,7 +211,7 @@ wm_dl_candles_insert_page(int32_t market_id,
 
   for(i = 0; i < res->count; i++)
   {
-    const coinbase_candle_t *c = &res->rows[i];
+    const exchange_candle_t *c = &res->rows[i];
     int                      n;
 
     if(cap - len < 256)
@@ -226,11 +229,14 @@ wm_dl_candles_insert_page(int32_t market_id,
       cap = new_cap;
     }
 
+    // exchange_candle_t carries bucket open in ms; the on-disk schema
+    // stores TIMESTAMPTZ, so we narrow to seconds for to_timestamp().
     n = snprintf(sql + len, cap - len,
         "%s(to_timestamp(%" PRId64 ") AT TIME ZONE 'UTC',"
         " %.17g, %.17g, %.17g, %.17g, %.17g)",
         i > 0 ? "," : "",
-        c->time, c->low, c->high, c->open, c->close, c->volume);
+        c->ts_open_ms / 1000,
+        c->low, c->high, c->open, c->close, c->volume);
 
     if(n < 0)
     {
@@ -286,7 +292,7 @@ wm_dl_candles_insert_page(int32_t market_id,
 // ------------------------------------------------------------------ //
 
 void
-wm_dl_candles_on_page(const coinbase_candles_result_t *res, void *user)
+wm_dl_candles_on_page(const exchange_candles_result_t *res, void *user)
 {
   wm_dl_candles_ctx_t *ctx = user;
   dl_jobtable_t       *t;
@@ -493,7 +499,7 @@ wm_dl_candles_on_page(const coinbase_candles_result_t *res, void *user)
 uint32_t
 wm_dl_candles_query_aggregated(int32_t market_id, int32_t gran_secs,
     const char *start_ts, const char *end_ts,
-    coinbase_candle_t *out, uint32_t cap)
+    exchange_candle_t *out, uint32_t cap)
 {
   char         table[WM_DL_TABLE_SZ];
   char        *e_table = NULL;
@@ -569,18 +575,20 @@ wm_dl_candles_query_aggregated(int32_t market_id, int32_t gran_secs,
 
     memset(&out[i], 0, sizeof(out[i]));
 
+    // Widen the seconds-valued EPOCH back into exchange_candle_t's
+    // ms timestamp so consumers see one uniform shape.
     s = db_result_get(res, i, 0);
-    if(s != NULL) out[i].time   = (int64_t)strtoll(s, NULL, 10);
+    if(s != NULL) out[i].ts_open_ms = (int64_t)strtoll(s, NULL, 10) * 1000;
     s = db_result_get(res, i, 1);
-    if(s != NULL) out[i].low    = strtod(s, NULL);
+    if(s != NULL) out[i].low        = strtod(s, NULL);
     s = db_result_get(res, i, 2);
-    if(s != NULL) out[i].high   = strtod(s, NULL);
+    if(s != NULL) out[i].high       = strtod(s, NULL);
     s = db_result_get(res, i, 3);
-    if(s != NULL) out[i].open   = strtod(s, NULL);
+    if(s != NULL) out[i].open       = strtod(s, NULL);
     s = db_result_get(res, i, 4);
-    if(s != NULL) out[i].close  = strtod(s, NULL);
+    if(s != NULL) out[i].close      = strtod(s, NULL);
     s = db_result_get(res, i, 5);
-    if(s != NULL) out[i].volume = strtod(s, NULL);
+    if(s != NULL) out[i].volume     = strtod(s, NULL);
   }
 
   n = take;

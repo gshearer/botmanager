@@ -19,12 +19,12 @@
 
 #include "whenmoon_strategy.h"   // wm_candle_full_t + wm_gran_t + WM_GRAN_MAX
 
-// Whenmoon-internal translation units pull the full aggregator + coinbase
-// types transitively. Strategy plugins don't define WHENMOON_INTERNAL and
-// see only the opaque forward decls below.
+// Whenmoon-internal translation units pull the full aggregator +
+// exchange-abstraction types transitively. Strategy plugins don't
+// define WHENMOON_INTERNAL and see only the opaque forward decls below.
 #ifdef WHENMOON_INTERNAL
 #include "aggregator.h"
-#include "coinbase_api.h"
+#include "exchange_api.h"
 #endif
 
 #include <pthread.h>
@@ -209,17 +209,27 @@ typedef struct
 #define WM_MARKET_ID_STR_SZ      64
 
 // Wire-form product id buffer (e.g. "BTC-USD"). Sized to the largest
-// exchange convention we support; coinbase uses 16 bytes (see
-// COINBASE_PRODUCT_ID_SZ in plugins/service/coinbase/coinbase_api.h).
-// Defined here so this header is independent of any exchange plugin.
-#define WM_PRODUCT_ID_SZ         16
+// exchange convention we support; the generic
+// EXCHANGE_PRODUCT_ID_SZ (24) bounds Kraken's longest pair strings,
+// Coinbase fits underneath. Strategies see this constant directly.
+#define WM_PRODUCT_ID_SZ         24
 
 // Forward decls — opaque to strategy plugins.
 struct wm_aggregator;
-struct coinbase_ws_sub;
+struct exchange_ws_sub;
 
 typedef struct whenmoon_market
 {
+  // Bound exchange's registered name (e.g. "coinbase", "kraken"). Set
+  // at add-time; used by the live trader to route per-market verbs
+  // through the exchange abstraction. Strategies can read it to gate
+  // venue-specific logic but must not mutate.
+#ifdef WHENMOON_INTERNAL
+  char                  exchange_name[EXCHANGE_NAME_SZ];
+#else
+  char                  exchange_name[32];  // mirror EXCHANGE_NAME_SZ
+#endif
+
   // Wire-form symbol the exchange uses on the WS / REST APIs. For
   // Coinbase this is the uppercase dash form, e.g. "BTC-USD".
   char                  product_id[WM_PRODUCT_ID_SZ];
@@ -252,7 +262,7 @@ typedef struct whenmoon_market
   struct wm_aggregator *aggregator;
 
   // Last observed ticker price (0.0 until the first ticker event
-  // lands). last_tick_ms is the event timestamp coinbase_ws_ticker_t
+  // lands). last_tick_ms is the event timestamp exchange_ws_ticker_t
   // reports; 0 when unparseable.
   double                last_px;
   int64_t               last_tick_ms;
@@ -274,11 +284,21 @@ struct whenmoon_markets
   uint32_t                 cap;
 
   // One shared WebSocket subscription covering every product_id +
-  // {HEARTBEAT, TICKER, MATCHES}. NULL when n_markets == 0 or
-  // coinbase_ws_subscribe failed at resub time. Rebuilt on every
-  // add/remove via coinbase_ws_unsubscribe + coinbase_ws_subscribe.
-  // Opaque to strategy plugins.
-  struct coinbase_ws_sub  *ws_sub;
+  // {TICKER, TRADES}. Bound to the exchange of arr[0] — currently the
+  // entire running set must share one exchange (KR-2 limitation; KR-5
+  // partitions). NULL when n_markets == 0 or exchange_ws_subscribe
+  // failed at resub time. Rebuilt on every add/remove via
+  // exchange_ws_unsubscribe + exchange_ws_subscribe. Opaque to
+  // strategy plugins.
+  struct exchange_ws_sub  *ws_sub;
+
+  // The exchange name `ws_sub` was bound to, so unsubscribe routes
+  // through the right vtable. Set whenever `ws_sub` is non-NULL.
+#ifdef WHENMOON_INTERNAL
+  char                     ws_exchange[EXCHANGE_NAME_SZ];
+#else
+  char                     ws_exchange[32];  // mirror EXCHANGE_NAME_SZ
+#endif
 };
 
 // Forward decl to keep this header independent of whenmoon.h.
@@ -340,8 +360,10 @@ bool wm_market_restore(struct whenmoon_state *st);
 
 // Parse "<exchange>-<base>-<quote>" (lowercase dash form). Splits on
 // '-', requires exactly 3 non-empty tokens, lowercases all output, and
-// validates exchange against the hard-coded allowlist (currently just
-// "coinbase"). Returns SUCCESS on well-formed input, FAIL otherwise.
+// validates the exchange against the live exchange registry — so any
+// registered service plugin (coinbase, kraken, …) is accepted without
+// further code changes here. Returns SUCCESS on well-formed input,
+// FAIL otherwise.
 bool wm_market_parse_id(const char *id,
     char *exchange, size_t exch_sz,
     char *base,     size_t base_sz,
@@ -358,19 +380,20 @@ void wm_market_format_id(const char *exchange, const char *base,
 void wm_market_wire_symbol(const char *base, const char *quote,
     char *out, size_t out_sz);
 
-// Coinbase-callback hooks — whenmoon-internal. Gated so strategy
-// plugins don't pull in coinbase types just by including market.h.
+// Exchange-callback hooks — whenmoon-internal. Gated so strategy
+// plugins don't pull in exchange types just by including market.h.
 #ifdef WHENMOON_INTERNAL
 
-// Async callback invoked by coinbase on backfill completion. `user` is
-// a heap-owned wm_market_backfill_ctx_t* that the callback frees.
-void wm_market_on_candles(const coinbase_candles_result_t *res,
+// Async callback invoked by feature_exchange on backfill completion.
+// `user` is a heap-owned wm_market_backfill_ctx_t* that the callback
+// frees.
+void wm_market_on_candles(const exchange_candles_result_t *res,
     void *user);
 
 // WebSocket event fanout — one handler shared across every product.
-// `user` is the whenmoon_state_t*. Invoked on the coinbase WS reader
-// thread; keep work minimal.
-void wm_market_on_event(const coinbase_ws_event_t *ev, void *user);
+// `user` is the whenmoon_state_t*. Invoked on the protocol plugin's WS
+// reader thread; keep work minimal.
+void wm_market_on_event(const exchange_ws_event_t *ev, void *user);
 
 // ------------------------------------------------------------------ //
 // WM-MK-2: market session helpers                                     //

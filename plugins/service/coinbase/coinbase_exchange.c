@@ -290,6 +290,23 @@ typedef struct
   void                    *user;
 } cb_exch_fills_fwd_t;
 
+typedef struct
+{
+  exchange_done_candles_cb_t cb;
+  void                      *user;
+} cb_exch_candles_fwd_t;
+
+// KR-2: WS subscriber state. The protocol-side coinbase_ws_sub_t is
+// opaque to the exchange layer; we wrap it together with the user-
+// supplied exchange typed callback + user pointer. The wrapper itself
+// IS the `exchange_ws_sub_t` handle exposed upward — we cast it.
+typedef struct exchange_ws_sub
+{
+  coinbase_ws_sub_t       *inner;
+  exchange_ws_event_cb_t   user_cb;
+  void                    *user;
+} cb_exch_ws_sub_t;
+
 // Field-by-field translation. exchange_order_t is a strict superset
 // in slot size; copy via snprintf for strings (no buffer overrun) and
 // direct assignment for scalars.
@@ -337,6 +354,20 @@ cb_to_exch_fill(const coinbase_fill_t *src, exchange_fill_t *dst)
   dst->size     = src->size;
   dst->fee      = src->fee;
   dst->time_ms  = src->time_ms;
+}
+
+// Coinbase candles report `time` in seconds since epoch; widen to ms
+// for the generic surface.
+static void
+cb_to_exch_candle(const coinbase_candle_t *src, exchange_candle_t *dst)
+{
+  memset(dst, 0, sizeof(*dst));
+  dst->ts_open_ms = src->time * 1000;
+  dst->open       = src->open;
+  dst->high       = src->high;
+  dst->low        = src->low;
+  dst->close      = src->close;
+  dst->volume     = src->volume;
 }
 
 // Adapter callbacks.
@@ -442,6 +473,37 @@ cb_exch_fills_done_adapter(const coinbase_fills_result_t *res, void *user)
 
   for(i = 0; i < n; i++)
     cb_to_exch_fill(&res->rows[i], &out.rows[i]);
+
+  out.count = n;
+
+  if(fwd->cb != NULL)
+    fwd->cb(&out, fwd->user);
+
+  mem_free(fwd);
+}
+
+static void
+cb_exch_candles_done_adapter(const coinbase_candles_result_t *res,
+    void *user)
+{
+  cb_exch_candles_fwd_t      *fwd = user;
+  exchange_candles_result_t   out;
+  uint32_t                    i;
+  uint32_t                    n;
+
+  if(fwd == NULL)
+    return;
+
+  memset(&out, 0, sizeof(out));
+  snprintf(out.err, sizeof(out.err), "%s", res->err);
+
+  n = res->count;
+
+  if(n > EXCHANGE_MAX_CANDLES)
+    n = EXCHANGE_MAX_CANDLES;
+
+  for(i = 0; i < n; i++)
+    cb_to_exch_candle(&res->rows[i], &out.rows[i]);
 
   out.count = n;
 
@@ -650,24 +712,376 @@ cb_exch_get_accounts_async(exchange_done_accounts_cb_t cb, void *user)
   return(coinbase_get_accounts_async(cb_exch_accounts_done_adapter, fwd));
 }
 
+// ------------------------------------------------------------------ //
+// KR-2: candle fetch                                                  //
+// ------------------------------------------------------------------ //
+
+static void
+cb_exch_fail_candles(exchange_done_candles_cb_t cb, void *user,
+    const char *err)
+{
+  exchange_candles_result_t res;
+
+  if(cb == NULL)
+    return;
+
+  memset(&res, 0, sizeof(res));
+  snprintf(res.err, sizeof(res.err), "%s", err != NULL ? err : "error");
+  cb(&res, user);
+}
+
+// Map the neutral seconds-valued enum to coinbase's int32 granularity
+// constant. Returns FAIL when the protocol doesn't support `gran`.
+static bool
+cb_exch_map_granularity(exchange_granularity_t gran, int32_t *out)
+{
+  switch(gran)
+  {
+    case EXCH_GRAN_1M:  *out = COINBASE_GRAN_1M;   return(SUCCESS);
+    case EXCH_GRAN_5M:  *out = COINBASE_GRAN_5M;   return(SUCCESS);
+    case EXCH_GRAN_15M: *out = COINBASE_GRAN_15M;  return(SUCCESS);
+    case EXCH_GRAN_1H:  *out = COINBASE_GRAN_1H;   return(SUCCESS);
+    case EXCH_GRAN_1D:  *out = COINBASE_GRAN_1D;   return(SUCCESS);
+
+    // Coinbase Advanced Trade also publishes 6h candles natively; the
+    // generic ladder does not reserve a slot for it, so it has no
+    // EXCH_GRAN_ peer. EXCH_GRAN_30M / _4H / _1W are unsupported by
+    // Coinbase REST today — surface a clean refusal so the caller can
+    // fall back to a different grain or down-sample client-side.
+    case EXCH_GRAN_30M:
+    case EXCH_GRAN_4H:
+    case EXCH_GRAN_1W:
+    default:
+      return(FAIL);
+  }
+}
+
+static bool
+cb_exch_fetch_candles_async(const char *product_id,
+    exchange_granularity_t gran, int64_t since_ms, int64_t until_ms,
+    exchange_done_candles_cb_t cb, void *user)
+{
+  cb_exch_candles_fwd_t *fwd;
+  int32_t                cb_gran = 0;
+  int64_t                start_s;
+  int64_t                end_s;
+
+  if(cb == NULL)
+    return(FAIL);
+
+  if(product_id == NULL || product_id[0] == '\0')
+  {
+    cb_exch_fail_candles(cb, user, "product_id required");
+    return(FAIL);
+  }
+
+  if(cb_exch_map_granularity(gran, &cb_gran) != SUCCESS)
+  {
+    cb_exch_fail_candles(cb, user, "unsupported granularity");
+    return(FAIL);
+  }
+
+  fwd = mem_alloc(CB_CTX, "exch.fwd", sizeof(*fwd));
+
+  if(fwd == NULL)
+  {
+    cb_exch_fail_candles(cb, user, "out of memory");
+    return(FAIL);
+  }
+
+  fwd->cb   = cb;
+  fwd->user = user;
+
+  // Coinbase REST takes seconds (and treats `end` as inclusive); narrow
+  // the millisecond window to seconds for the underlying call. The
+  // upstream `coinbase_fetch_candles_async` shim already enforces the
+  // 300-bucket cap.
+  start_s = since_ms > 0 ? since_ms / 1000 : 0;
+  end_s   = until_ms > 0 ? until_ms / 1000 : 0;
+
+  if(coinbase_fetch_candles_async(product_id, cb_gran, start_s, end_s,
+        EXCHANGE_PRIO_MARKET_BACKFILL,
+        cb_exch_candles_done_adapter, fwd) != SUCCESS)
+  {
+    // coinbase_fetch_candles_async fires the typed cb synchronously with
+    // err set on FAIL; the adapter has already freed `fwd`.
+    return(FAIL);
+  }
+
+  return(SUCCESS);
+}
+
+// ------------------------------------------------------------------ //
+// KR-2: WS subscribe / unsubscribe                                    //
+// ------------------------------------------------------------------ //
+
+static void
+cb_to_exch_ws_ticker(const coinbase_ws_ticker_t *src,
+    exchange_ws_ticker_t *dst)
+{
+  memset(dst, 0, sizeof(*dst));
+  snprintf(dst->product_id, sizeof(dst->product_id), "%s", src->product_id);
+  dst->price      = src->price;
+  dst->best_bid   = src->best_bid;
+  dst->best_ask   = src->best_ask;
+  dst->volume_24h = src->volume_24h;
+  dst->low_24h    = src->low_24h;
+  dst->high_24h   = src->high_24h;
+  dst->time_ms    = src->time_ms;
+}
+
+static void
+cb_to_exch_ws_match(const coinbase_ws_match_t *src,
+    exchange_ws_match_t *dst)
+{
+  memset(dst, 0, sizeof(*dst));
+  snprintf(dst->product_id, sizeof(dst->product_id), "%s", src->product_id);
+  snprintf(dst->side,       sizeof(dst->side),       "%s", src->side);
+  dst->trade_id = src->trade_id;
+  dst->price    = src->price;
+  dst->size     = src->size;
+  dst->time_ms  = src->time_ms;
+}
+
+static void
+cb_to_exch_ws_user_order(const coinbase_ws_user_order_t *src,
+    exchange_ws_user_order_t *dst)
+{
+  memset(dst, 0, sizeof(*dst));
+  snprintf(dst->order_id,        sizeof(dst->order_id),
+      "%s", src->order_id);
+  snprintf(dst->client_order_id, sizeof(dst->client_order_id),
+      "%s", src->client_order_id);
+  snprintf(dst->product_id,      sizeof(dst->product_id),
+      "%s", src->product_id);
+  snprintf(dst->side,            sizeof(dst->side),
+      "%s", src->side);
+  snprintf(dst->status,          sizeof(dst->status),
+      "%s", src->status);
+  dst->limit_price         = src->limit_price;
+  dst->cumulative_quantity = src->cumulative_quantity;
+  dst->leaves_quantity     = src->leaves_quantity;
+  dst->avg_price           = src->avg_price;
+  dst->total_fees          = src->total_fees;
+  dst->creation_time_ms    = src->creation_time_ms;
+  dst->time_ms             = src->time_ms;
+}
+
+static void
+cb_to_exch_ws_user_fill(const coinbase_ws_user_fill_t *src,
+    exchange_ws_user_fill_t *dst)
+{
+  memset(dst, 0, sizeof(*dst));
+  snprintf(dst->order_id,        sizeof(dst->order_id),
+      "%s", src->order_id);
+  snprintf(dst->client_order_id, sizeof(dst->client_order_id),
+      "%s", src->client_order_id);
+  snprintf(dst->product_id,      sizeof(dst->product_id),
+      "%s", src->product_id);
+  snprintf(dst->side,            sizeof(dst->side),
+      "%s", src->side);
+  dst->trade_id = src->trade_id;
+  dst->price    = src->price;
+  dst->size     = src->size;
+  dst->fee      = src->fee;
+  dst->time_ms  = src->time_ms;
+}
+
+// Map the neutral channel enum to the protocol-native value. Returns
+// FAIL when the channel has no coinbase peer (e.g. Kraken-only book/
+// ohlc channels).
+static bool
+cb_exch_map_ws_channel(exchange_ws_channel_t in, coinbase_ws_channel_t *out)
+{
+  switch(in)
+  {
+    case EXCH_WS_TICKER: *out = COINBASE_CH_TICKER;   return(SUCCESS);
+    case EXCH_WS_TRADES: *out = COINBASE_CH_MATCHES;  return(SUCCESS);
+    case EXCH_WS_USER:   *out = COINBASE_CH_USER;     return(SUCCESS);
+
+    // Heartbeat is implicit at the coinbase WS layer (see
+    // coinbase_ws_subscribe docstring). Book/OHLC are not yet wired on
+    // the coinbase side — reject so callers see a deterministic refusal.
+    case EXCH_WS_BOOK_L2:
+    case EXCH_WS_OHLC_1M:
+    default:
+      return(FAIL);
+  }
+}
+
+// Per-event adapter: translate a coinbase WS event into the neutral
+// shape, then invoke the user callback. `user` is the wrapper handle
+// (cb_exch_ws_sub_t *) — sized so we keep both the inner coinbase
+// handle and the user's typed callback in one allocation.
+static void
+cb_exch_ws_event_adapter(const coinbase_ws_event_t *ev, void *user)
+{
+  cb_exch_ws_sub_t    *sub = user;
+  exchange_ws_event_t  out;
+
+  if(sub == NULL || sub->user_cb == NULL || ev == NULL)
+    return;
+
+  memset(&out, 0, sizeof(out));
+
+  if(ev->product_id != NULL)
+    snprintf(out.product_id, sizeof(out.product_id), "%s", ev->product_id);
+
+  switch(ev->channel)
+  {
+    case COINBASE_CH_TICKER:
+    case COINBASE_CH_TICKER_BATCH:
+    {
+      const coinbase_ws_ticker_t *t = ev->payload;
+
+      if(t == NULL)
+        return;
+
+      out.channel = EXCH_WS_TICKER;
+      cb_to_exch_ws_ticker(t, &out.payload.ticker);
+      break;
+    }
+
+    case COINBASE_CH_MATCHES:
+    {
+      const coinbase_ws_match_t *m = ev->payload;
+
+      if(m == NULL)
+        return;
+
+      out.channel = EXCH_WS_TRADES;
+      cb_to_exch_ws_match(m, &out.payload.match);
+      break;
+    }
+
+    case COINBASE_CH_USER:
+    {
+      const coinbase_ws_user_event_t *u = ev->payload;
+
+      if(u == NULL)
+        return;
+
+      out.channel = EXCH_WS_USER;
+
+      switch(u->kind)
+      {
+        case COINBASE_WS_USER_KIND_ORDER:
+          out.payload.user.kind = EXCH_WS_USER_KIND_ORDER;
+          cb_to_exch_ws_user_order(&u->u.order, &out.payload.user.u.order);
+          break;
+        case COINBASE_WS_USER_KIND_FILL:
+          out.payload.user.kind = EXCH_WS_USER_KIND_FILL;
+          cb_to_exch_ws_user_fill(&u->u.fill, &out.payload.user.u.fill);
+          break;
+      }
+      break;
+    }
+
+    // Heartbeat / status / book / full are implicit or unhandled — the
+    // coinbase plugin still fires them but the abstraction has no
+    // consumer surface for them, so drop on the floor.
+    default:
+      return;
+  }
+
+  sub->user_cb(&out, sub->user);
+}
+
+static bool
+cb_exch_ws_subscribe(const exchange_ws_channel_t *channels,
+    uint32_t n_channels, const char *const *product_ids,
+    uint32_t n_products, exchange_ws_event_cb_t cb, void *user,
+    exchange_ws_sub_t **out_handle)
+{
+  cb_exch_ws_sub_t      *sub;
+  coinbase_ws_channel_t  cb_chans[COINBASE_CH__COUNT];
+  uint32_t               cb_n = 0;
+  uint32_t               i;
+
+  if(out_handle == NULL)
+    return(FAIL);
+
+  *out_handle = NULL;
+
+  if(cb == NULL || channels == NULL || n_channels == 0)
+    return(FAIL);
+
+  for(i = 0; i < n_channels && cb_n < COINBASE_CH__COUNT; i++)
+  {
+    coinbase_ws_channel_t mapped;
+
+    if(cb_exch_map_ws_channel(channels[i], &mapped) != SUCCESS)
+    {
+      clam(CLAM_WARN, CB_CTX,
+          "ws_subscribe: channel %d not supported on coinbase",
+          (int)channels[i]);
+      return(FAIL);
+    }
+
+    cb_chans[cb_n++] = mapped;
+  }
+
+  sub = mem_alloc(CB_CTX, "exch.ws_sub", sizeof(*sub));
+
+  if(sub == NULL)
+    return(FAIL);
+
+  sub->user_cb = cb;
+  sub->user    = user;
+  sub->inner   = coinbase_ws_subscribe(cb_chans, cb_n,
+      product_ids, n_products,
+      cb_exch_ws_event_adapter, sub);
+
+  if(sub->inner == NULL)
+  {
+    mem_free(sub);
+    return(FAIL);
+  }
+
+  // The wrapper IS the handle exposed upward — cast directly. The
+  // opaque `exchange_ws_sub_t` forward-decl in exchange_api.h binds to
+  // this struct at the cb_exch_ws_sub_t typedef site.
+  *out_handle = sub;
+  return(SUCCESS);
+}
+
+static void
+cb_exch_ws_unsubscribe(exchange_ws_sub_t *handle)
+{
+  cb_exch_ws_sub_t *sub = handle;
+
+  if(sub == NULL)
+    return;
+
+  if(sub->inner != NULL)
+    coinbase_ws_unsubscribe(sub->inner);
+
+  mem_free(sub);
+}
+
 // File-scope vtable. Static storage so the abstraction can keep the
 // pointer; advertised_rps reflects Coinbase Exchange's public-API cap.
 static const exchange_protocol_vtable_t cb_vtable = {
-  .build_request      = cb_exchange_build_request,
-  .submit             = cb_exchange_submit,
-  .free_request       = cb_exchange_free_request,
-  .advertised_rps     = 10,
-  .advertised_burst   = 15,
+  .build_request       = cb_exchange_build_request,
+  .submit              = cb_exchange_submit,
+  .free_request        = cb_exchange_free_request,
+  .advertised_rps      = 10,
+  .advertised_burst    = 15,
 
   // WM-OR-1 capability hooks.
-  .is_authenticated   = cb_exch_is_authenticated,
-  .is_sandbox         = NULL,
-  .place_order_async  = cb_exch_place_order_async,
-  .cancel_order_async = cb_exch_cancel_order_async,
-  .get_order_async    = cb_exch_get_order_async,
-  .list_orders_async  = cb_exch_list_orders_async,
-  .list_fills_async   = cb_exch_list_fills_async,
-  .get_accounts_async = cb_exch_get_accounts_async,
+  .is_authenticated    = cb_exch_is_authenticated,
+  .is_sandbox          = NULL,
+  .place_order_async   = cb_exch_place_order_async,
+  .cancel_order_async  = cb_exch_cancel_order_async,
+  .get_order_async     = cb_exch_get_order_async,
+  .list_orders_async   = cb_exch_list_orders_async,
+  .list_fills_async    = cb_exch_list_fills_async,
+  .get_accounts_async  = cb_exch_get_accounts_async,
+
+  // KR-2 capability hooks.
+  .fetch_candles_async = cb_exch_fetch_candles_async,
+  .ws_subscribe        = cb_exch_ws_subscribe,
+  .ws_unsubscribe      = cb_exch_ws_unsubscribe,
 };
 
 bool

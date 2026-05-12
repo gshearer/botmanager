@@ -472,7 +472,7 @@ wm_dl_cmd_show_download_candles(const cmd_ctx_t *ctx)
   int32_t            market_id;
   uint32_t           n;
   uint32_t           i;
-  coinbase_candle_t *rows;
+  exchange_candle_t *rows;
 
   st = whenmoon_get_state();
 
@@ -554,9 +554,12 @@ wm_dl_cmd_show_download_candles(const cmd_ctx_t *ctx)
 
   for(i = 0; i < n; i++)
   {
+    // Narrow ms back to seconds for the operator-visible CSV "ts_epoch"
+    // column so the rendered output matches what /show … download
+    // candles produced pre-KR-2.
     snprintf(line, sizeof(line),
         "%" PRId64 ",%.10g,%.10g,%.10g,%.10g,%.10g",
-        rows[i].time, rows[i].low, rows[i].high,
+        rows[i].ts_open_ms / 1000, rows[i].low, rows[i].high,
         rows[i].open, rows[i].close, rows[i].volume);
     cmd_reply(ctx, line);
   }

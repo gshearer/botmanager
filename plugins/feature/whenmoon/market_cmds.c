@@ -72,7 +72,7 @@ wm_market_cmd_start(const cmd_ctx_t *ctx)
   char              exch[32];
   char              base[16];
   char              quote[16];
-  char              symbol[COINBASE_PRODUCT_ID_SZ];
+  char              symbol[WM_PRODUCT_ID_SZ];
   char              err[128] = {0};
   char              reply[192];
   char              id_str[WM_MARKET_ID_STR_SZ];
@@ -116,7 +116,7 @@ wm_market_cmd_stop(const cmd_ctx_t *ctx)
   char              exch[32];
   char              base[16];
   char              quote[16];
-  char              symbol[COINBASE_PRODUCT_ID_SZ];
+  char              symbol[WM_PRODUCT_ID_SZ];
   char              err[128] = {0};
   char              reply[192];
   char              id_str[WM_MARKET_ID_STR_SZ];
@@ -199,7 +199,7 @@ wm_market_cmd_indicators(const cmd_ctx_t *ctx)
   char                exch[32];
   char                base[16];
   char                quote[16];
-  char                symbol[COINBASE_PRODUCT_ID_SZ];
+  char                symbol[WM_PRODUCT_ID_SZ];
   char                id_tok[64] = {0};
   char                gran_tok[8] = {0};
   char                tail_tok[16] = {0};
@@ -264,7 +264,7 @@ wm_market_cmd_indicators(const cmd_ctx_t *ctx)
   for(i = 0; i < m->n_markets; i++)
   {
     if(strncmp(m->arr[i].product_id, symbol,
-           COINBASE_PRODUCT_ID_SZ) == 0)
+           WM_PRODUCT_ID_SZ) == 0)
     {
       mk = &m->arr[i];
       break;

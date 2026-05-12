@@ -6,16 +6,20 @@
 // session.mode == WM_MARKET_MODE_REAL. That helper runs the master
 // kill-switch + cred + daily-loss + pending-cap + max-notional-clip
 // cascade, registers a wm_market_pending_t in mk->session.pending[],
-// and dispatches coinbase_place_order_async. The done callback
-// (wm_live_market_order_done) reaps the pending row on gateway
-// reject or records gateway_accepted=true on accept. Fills land
-// asynchronously through the WS user-channel + REST /fills consumers
-// (wm_live_handle_ws_fill / wm_live_on_fills) which route into
-// wm_market_engine_record_external_fill.
+// and dispatches exchange_place_order_async on mk->exchange_name.
+// The done callback (wm_live_market_order_done) reaps the pending row
+// on gateway reject or records gateway_accepted=true on accept. Fills
+// land asynchronously through the WS user-channel + REST /fills
+// consumers (wm_live_handle_ws_fill / wm_live_on_fills) which route
+// into wm_market_engine_record_external_fill.
 //
-// Master kill-switch: plugin.whenmoon.exchange.coinbase.live (KV_BOOL,
-// default false). Operator must opt in explicitly before any real
-// order leaves the daemon.
+// Master kill-switch: plugin.whenmoon.exchange.<exch>.live (KV_BOOL,
+// default false), one per registered exchange. Operator must opt in
+// explicitly per exchange before any real order leaves the daemon.
+//
+// KR-2 single-exchange WS state: g_live owns one user-channel sub at
+// a time, bound to whichever exchange the market set shares. KR-5
+// will partition this when a second exchange enters the running set.
 //
 // Locking:
 //   - g_live.mu protects g_live.last_fills_cursor_ms.
@@ -36,7 +40,7 @@
 #include "kv.h"
 #include "task.h"
 
-#include "coinbase_api.h"
+#include "exchange_api.h"
 
 #include <pthread.h>
 #include <stdint.h>
@@ -48,6 +52,10 @@
 
 #define WM_LIVE_CTX  "whenmoon.live"
 
+// Compile-time ceiling on the per-exchange list the boot reconciler
+// walks. Mirrors the account refresher's cap.
+#define WM_LIVE_MAX_EXCHANGES   8
+
 // ----------------------------------------------------------------------- //
 // Engine global state                                                     //
 // ----------------------------------------------------------------------- //
@@ -58,16 +66,16 @@ static struct
 
   bool                 initialized;
 
-  // WS user-channel subscription (one for the entire live trader; AT
-  // user channel emits across every product the auth principal owns).
-  // Refreshed by wm_live_ws_resub when the market product set changes.
-  coinbase_ws_sub_t   *ws_sub;
+  // WS user-channel subscription. Bound to whichever exchange the
+  // running market set shares (one at a time today; KR-5 partitions).
+  exchange_ws_sub_t   *ws_sub;
+  char                 ws_exchange[EXCHANGE_NAME_SZ];
   whenmoon_state_t    *ws_st;
 
   // REST /fills safety-net poll periodic.
   task_handle_t        fills_poll_task;
 
-  // Single global cursor for the REST /fills poll. Coinbase pages
+  // Single global cursor for the REST /fills poll. Exchanges page
   // /fills globally on sequence_timestamp, not per-product, so a
   // per-market cursor wouldn't help. Initialized to "now - overlap"
   // on engine start; advanced on every applied fill via the
@@ -76,7 +84,7 @@ static struct
 } g_live;
 
 // Forward declarations — definitions further down.
-static void wm_live_ws_user_event_cb(const coinbase_ws_event_t *ev,
+static void wm_live_ws_user_event_cb(const exchange_ws_event_t *ev,
     void *user);
 static void wm_live_fills_poll_tick(task_t *t);
 
@@ -96,16 +104,6 @@ wm_live_engine_init(void)
   pthread_mutex_init(&g_live.mu, NULL);
   g_live.initialized = true;
 
-  // Pre-register the master kill-switch KV so operators can `/set kv`
-  // it at any time, including before the first real-mode signal would
-  // have lazy-registered it. wm_live_master_live_enabled() still calls
-  // the lazy path defensively if init order regresses.
-  (void)kv_register("plugin.whenmoon.exchange.coinbase.live", KV_BOOL,
-      "false", NULL, NULL,
-      "Master kill-switch for the per-market real-mode submit path."
-      " Default false; flip to true to enable live order placement on"
-      " coinbase. Per-market risk caps still apply when this is true.");
-
   clam(CLAM_DEBUG, WM_LIVE_CTX, "live engine initialized");
   return(SUCCESS);
 }
@@ -119,15 +117,16 @@ wm_live_engine_destroy(void)
   task_cancel(g_live.fills_poll_task);
   g_live.fills_poll_task = TASK_HANDLE_NONE;
 
-  // Drop WS subscription before destroying the lock — coinbase_ws_unsub
-  // can fire callbacks on the WS reader thread; better to let those see
-  // g_live.initialized = false (still true here, but the ws_sub pointer
-  // null-out below means no new events).
+  // Drop WS subscription before destroying the lock — the WS reader
+  // can fire callbacks on a worker thread; better to let those see
+  // g_live.initialized = false (still true here, but the ws_sub
+  // pointer null-out below means no new events).
   if(g_live.ws_sub != NULL)
   {
-    coinbase_ws_unsubscribe(g_live.ws_sub);
+    exchange_ws_unsubscribe(g_live.ws_exchange, g_live.ws_sub);
     g_live.ws_sub = NULL;
   }
+  g_live.ws_exchange[0] = '\0';
   g_live.ws_st = NULL;
 
   pthread_mutex_destroy(&g_live.mu);
@@ -165,13 +164,13 @@ wm_live_uuid_v4(char *out, size_t cap)
   return(SUCCESS);
 }
 
-// Build a coinbase_place_order_req_t for a GTC limit order. Pure
+// Build an exchange_place_order_req_t for a GTC limit order. Pure
 // plumbing — no state reads, no allocation. `product_id` is the wire-
 // form ("BTC-USD"), `side_str` is "buy" or "sell", `coid` is a
 // pre-minted v4 UUID. Caller zero-inits `out` before calling; this
 // helper overwrites the whole struct.
 static void
-wm_live_build_place_order_req(coinbase_place_order_req_t *out,
+wm_live_build_place_order_req(exchange_place_order_req_t *out,
     const char *product_id, const char *side_str, double qty,
     double limit_px, const char *coid, bool post_only)
 {
@@ -197,22 +196,33 @@ wm_live_build_place_order_req(coinbase_place_order_req_t *out,
   out->post_only = post_only;
 }
 
-// Master kill-switch for the per-market real submit path. Lazy-
-// registers `plugin.whenmoon.exchange.coinbase.live` (KV_BOOL, default
-// false) on first read so the operator can flip it via `/set kv`. The
-// helper FAILs closed when the KV is missing or false — explicit opt-in
-// is required to enable real trading.
+// Master kill-switch for the per-market real submit path. Reads the
+// per-exchange KV at plugin.whenmoon.exchange.<exch>.live (KV_BOOL,
+// default false). Lazy-registers on first read so the operator can
+// flip it via `/set kv` even before any other code has touched it.
+// FAILs closed when the KV is missing or false — explicit opt-in is
+// required per exchange.
 static bool
-wm_live_master_live_enabled(void)
+wm_live_master_live_enabled(const char *exchange_name)
 {
-  static const char *path = "plugin.whenmoon.exchange.coinbase.live";
+  char path[160];
+  int  n;
+
+  if(exchange_name == NULL || exchange_name[0] == '\0')
+    return(FAIL);
+
+  n = snprintf(path, sizeof(path),
+      "plugin.whenmoon.exchange.%s.live", exchange_name);
+
+  if(n < 0 || (size_t)n >= sizeof(path))
+    return(FAIL);
 
   if(!kv_exists(path))
     (void)kv_register(path, KV_BOOL, "false", NULL, NULL,
         "Master kill-switch for the per-market real-mode submit"
-        " path. Default false; flip to true to enable live order"
-        " placement on coinbase. Per-market risk caps still apply"
-        " when this is true.");
+        " path on this exchange. Default false; flip to true to"
+        " enable live order placement. Per-market risk caps still"
+        " apply when this is true.");
 
   return(kv_get_uint(path) != 0);
 }
@@ -227,7 +237,7 @@ wm_live_master_live_enabled(void)
 typedef struct wm_live_market_done_ctx
 {
   char  market_id_str[WM_MARKET_ID_STR_SZ];
-  char  coid[COINBASE_CLIENT_OID_SZ];
+  char  coid[EXCHANGE_CLIENT_OID_SZ];
 } wm_live_market_done_ctx_t;
 
 // Done callback for the per-market submit path. Runs on the curl
@@ -236,13 +246,13 @@ typedef struct wm_live_market_done_ctx
 // records `order_id` + sets `gateway_accepted = true` so the WS
 // user-channel order updates land on a populated row.
 //
-// FAIL semantics from coinbase_place_order_async: on synchronous-FAIL
+// FAIL semantics from exchange_place_order_async: on synchronous-FAIL
 // the caller pre-fills `res->err` and the done_cb is invoked
 // synchronously; the caller must not touch the pending row or ctx
 // after the call returns. On asynchronous failures the same callback
 // fires off-thread.
 static void
-wm_live_market_order_done(const coinbase_order_result_t *res, void *user)
+wm_live_market_order_done(const exchange_order_result_t *res, void *user)
 {
   wm_live_market_done_ctx_t *ctx;
   whenmoon_state_t          *st;
@@ -323,7 +333,8 @@ wm_market_engine_real_submit_locked(whenmoon_market_t *mk,
     const wm_strategy_signal_t *sig,
     char *errbuf, size_t errbuf_sz)
 {
-  coinbase_place_order_req_t  req;
+  exchange_place_order_req_t  req;
+  exchange_capabilities_t     caps;
   wm_live_market_done_ctx_t  *ctx;
   wm_market_pending_t        *pending;
   double                      starting_cash;
@@ -348,6 +359,12 @@ wm_market_engine_real_submit_locked(whenmoon_market_t *mk,
     return(FAIL);
   }
 
+  if(mk->exchange_name[0] == '\0')
+  {
+    ERRSET("market %s has no bound exchange", mk->market_id_str);
+    return(FAIL);
+  }
+
   if(side != 'b' && side != 's')
   {
     ERRSET("side must be 'b' or 's'");
@@ -357,24 +374,26 @@ wm_market_engine_real_submit_locked(whenmoon_market_t *mk,
   is_buy   = (side == 'b');
   side_str = is_buy ? "buy" : "sell";
 
-  // Gate 1: master kill-switch.
-  if(!wm_live_master_live_enabled())
+  // Gate 1: master kill-switch for this exchange.
+  if(!wm_live_master_live_enabled(mk->exchange_name))
   {
     ERRSET("live trading disabled"
-        " (plugin.whenmoon.exchange.coinbase.live=false)");
+        " (plugin.whenmoon.exchange.%s.live=false)",
+        mk->exchange_name);
     clam(CLAM_WARN, WM_LIVE_CTX,
-        "%s real submit refused: live=false",
-        mk->market_id_str);
+        "%s real submit refused: live=false (%s)",
+        mk->market_id_str, mk->exchange_name);
     return(FAIL);
   }
 
-  // Gate 2: credentials.
-  if(!coinbase_apikey_configured())
+  // Gate 2: credentials — consult the exchange capability surface.
+  if(exchange_get_capabilities(mk->exchange_name, &caps) != SUCCESS
+      || !caps.has_credentials)
   {
-    ERRSET("no exchange credentials");
+    ERRSET("no exchange credentials (%s)", mk->exchange_name);
     clam(CLAM_WARN, WM_LIVE_CTX,
-        "%s real submit refused: coinbase credentials not configured",
-        mk->market_id_str);
+        "%s real submit refused: %s credentials not configured",
+        mk->market_id_str, mk->exchange_name);
     return(FAIL);
   }
 
@@ -440,7 +459,7 @@ wm_market_engine_real_submit_locked(whenmoon_market_t *mk,
   // Mint COID into a local buffer first; only commit to the pending
   // row after every fail-able op succeeds.
   {
-    char coid[COINBASE_CLIENT_OID_SZ];
+    char coid[EXCHANGE_CLIENT_OID_SZ];
 
     if(wm_live_uuid_v4(coid, sizeof(coid)) != SUCCESS)
     {
@@ -477,14 +496,14 @@ wm_market_engine_real_submit_locked(whenmoon_market_t *mk,
     snprintf(ctx->coid, sizeof(ctx->coid), "%s", coid);
   }
 
-  if(coinbase_place_order_async(&req, wm_live_market_order_done, ctx)
-      != SUCCESS)
+  if(exchange_place_order_async(mk->exchange_name, &req,
+        wm_live_market_order_done, ctx) != SUCCESS)
   {
-    // coinbase_place_order_async fires the done_cb synchronously with
+    // exchange_place_order_async fires the done_cb synchronously with
     // res->err set when it returns FAIL. The done_cb has already
     // reaped the pending row + freed ctx by the time we get here.
     // Do NOT touch state.
-    ERRSET("coinbase_place_order_async returned FAIL"
+    ERRSET("exchange_place_order_async returned FAIL"
         " (done_cb already fired)");
     return(FAIL);
   }
@@ -564,7 +583,7 @@ wm_live_find_pending_by_coid_market_locked(const char *coid,
 // ----------------------------------------------------------------------- //
 
 static void
-wm_live_handle_ws_fill(const coinbase_ws_user_fill_t *f)
+wm_live_handle_ws_fill(const exchange_ws_user_fill_t *f)
 {
   whenmoon_market_t   *mk = NULL;
   uint32_t             pidx = 0;
@@ -581,7 +600,7 @@ wm_live_handle_ws_fill(const coinbase_ws_user_fill_t *f)
          &mk, &pidx))
   {
     // Orphan: WS may have raced ahead of submit, or this fill belongs
-    // to an unrelated principal (the AT user channel emits per-account,
+    // to an unrelated principal (the user channel emits per-account,
     // not per-product). REST /fills poll handles late-bound dedup.
     clam(CLAM_DEBUG, WM_LIVE_CTX,
         "ws fill orphan coid=%s order_id=%s tid=%lld"
@@ -646,7 +665,7 @@ wm_live_handle_ws_fill(const coinbase_ws_user_fill_t *f)
 }
 
 static void
-wm_live_handle_ws_order(const coinbase_ws_user_order_t *o)
+wm_live_handle_ws_order(const exchange_ws_user_order_t *o)
 {
   whenmoon_market_t   *mk = NULL;
   uint32_t             pidx = 0;
@@ -705,24 +724,20 @@ wm_live_handle_ws_order(const coinbase_ws_user_order_t *o)
 }
 
 static void
-wm_live_ws_user_event_cb(const coinbase_ws_event_t *ev, void *user)
+wm_live_ws_user_event_cb(const exchange_ws_event_t *ev, void *user)
 {
-  const coinbase_ws_user_event_t *u;
-
   (void)user;
 
-  if(ev == NULL || ev->channel != COINBASE_CH_USER || ev->payload == NULL)
+  if(ev == NULL || ev->channel != EXCH_WS_USER)
     return;
 
-  u = ev->payload;
-
-  switch(u->kind)
+  switch(ev->payload.user.kind)
   {
-    case COINBASE_WS_USER_KIND_ORDER:
-      wm_live_handle_ws_order(&u->u.order);
+    case EXCH_WS_USER_KIND_ORDER:
+      wm_live_handle_ws_order(&ev->payload.user.u.order);
       break;
-    case COINBASE_WS_USER_KIND_FILL:
-      wm_live_handle_ws_fill(&u->u.fill);
+    case EXCH_WS_USER_KIND_FILL:
+      wm_live_handle_ws_fill(&ev->payload.user.u.fill);
       break;
   }
 }
@@ -733,44 +748,58 @@ wm_live_ws_user_event_cb(const coinbase_ws_event_t *ev, void *user)
 
 void
 wm_live_ws_resub(whenmoon_state_t *st,
+    const char *exchange_name,
     const char *const *product_ids, size_t n_products)
 {
-  static const coinbase_ws_channel_t channels[] = { COINBASE_CH_USER };
+  static const exchange_ws_channel_t channels[] = { EXCH_WS_USER };
+  exchange_capabilities_t            caps;
 
   if(!g_live.initialized) return;
 
   if(g_live.ws_sub != NULL)
   {
-    coinbase_ws_unsubscribe(g_live.ws_sub);
-    g_live.ws_sub = NULL;
+    exchange_ws_unsubscribe(g_live.ws_exchange, g_live.ws_sub);
+    g_live.ws_sub          = NULL;
+    g_live.ws_exchange[0]  = '\0';
   }
 
   g_live.ws_st = st;
 
-  if(n_products == 0 || product_ids == NULL)
+  if(n_products == 0 || product_ids == NULL
+      || exchange_name == NULL || exchange_name[0] == '\0')
     return;
 
-  // CDP creds are required for the user channel; AT subscribe FAILs
-  // closed when they are absent. Skip silently — once creds appear the
-  // next market mutation (or whenmoon_start re-entry) will retry.
-  if(!coinbase_apikey_configured())
+  // Creds are required for the user channel; the exchange-side
+  // subscribe FAILs closed when they are absent. Skip silently — once
+  // creds appear the next market mutation will retry.
+  if(exchange_get_capabilities(exchange_name, &caps) != SUCCESS
+      || !caps.has_credentials)
   {
     clam(CLAM_DEBUG, WM_LIVE_CTX,
-        "user-channel sub deferred: no CDP creds yet");
+        "user-channel sub deferred: no creds for %s yet",
+        exchange_name);
     return;
   }
 
-  g_live.ws_sub = coinbase_ws_subscribe(channels,
-      sizeof(channels) / sizeof(channels[0]),
-      product_ids, n_products,
-      wm_live_ws_user_event_cb, NULL);
-
-  if(g_live.ws_sub == NULL)
+  if(exchange_ws_subscribe(exchange_name, channels,
+        sizeof(channels) / sizeof(channels[0]),
+        product_ids, (uint32_t)n_products,
+        wm_live_ws_user_event_cb, NULL,
+        &g_live.ws_sub) != SUCCESS || g_live.ws_sub == NULL)
+  {
     clam(CLAM_WARN, WM_LIVE_CTX,
-        "user-channel WS subscribe failed (n_products=%zu)", n_products);
+        "user-channel WS subscribe failed (exchange=%s n_products=%zu)",
+        exchange_name, n_products);
+    g_live.ws_sub = NULL;
+  }
   else
+  {
+    snprintf(g_live.ws_exchange, sizeof(g_live.ws_exchange), "%s",
+        exchange_name);
     clam(CLAM_INFO, WM_LIVE_CTX,
-        "user-channel WS subscribed (n_products=%zu)", n_products);
+        "user-channel WS subscribed (exchange=%s n_products=%zu)",
+        exchange_name, n_products);
+  }
 }
 
 // ----------------------------------------------------------------------- //
@@ -780,7 +809,8 @@ wm_live_ws_resub(whenmoon_state_t *st,
 typedef struct wm_live_fills_ctx
 {
   char  market_id_str[WM_MARKET_ID_STR_SZ];
-  char  product_id[16];
+  char  exchange_name[EXCHANGE_NAME_SZ];
+  char  product_id[WM_PRODUCT_ID_SZ];
 } wm_live_fills_ctx_t;
 
 // True iff any running market has already recorded this trade_id on
@@ -838,7 +868,7 @@ wm_live_trade_id_seen_any_market(int64_t trade_id)
 }
 
 static void
-wm_live_on_fills(const coinbase_fills_result_t *res, void *user)
+wm_live_on_fills(const exchange_fills_result_t *res, void *user)
 {
   wm_live_fills_ctx_t *ctx = user;
 
@@ -853,7 +883,7 @@ wm_live_on_fills(const coinbase_fills_result_t *res, void *user)
 
   for(uint32_t i = 0; i < res->count; i++)
   {
-    const coinbase_fill_t *f = &res->rows[i];
+    const exchange_fill_t *f = &res->rows[i];
     whenmoon_market_t     *mk = NULL;
     uint32_t               pidx = 0;
     wm_market_pending_t   *p;
@@ -953,9 +983,8 @@ wm_live_fills_poll_tick(task_t *t)
 
   if(st == NULL || st->markets == NULL) return;
   if(!g_live.initialized) return;
-  if(!coinbase_apikey_configured()) return;
 
-  // Single global cursor: AT pages /fills globally on
+  // Single global cursor: exchanges page /fills globally on
   // sequence_timestamp, not per-product. Subtract the overlap window so
   // we don't miss a fill whose envelope timestamp jitters slightly
   // backward between polls.
@@ -972,17 +1001,29 @@ wm_live_fills_poll_tick(task_t *t)
 
   for(uint32_t i = 0; i < mkts->n_markets; i++)
   {
-    wm_live_fills_ctx_t *ctx;
+    wm_live_fills_ctx_t    *ctx;
+    exchange_capabilities_t caps;
+
+    if(mkts->arr[i].exchange_name[0] == '\0')
+      continue;
+
+    // Skip when creds are not configured for this exchange.
+    if(exchange_get_capabilities(mkts->arr[i].exchange_name,
+           &caps) != SUCCESS || !caps.has_credentials)
+      continue;
 
     ctx = mem_alloc(WM_LIVE_CTX, "fills_ctx", sizeof(*ctx));
     if(ctx == NULL) continue;
 
     snprintf(ctx->market_id_str, sizeof(ctx->market_id_str), "%s",
         mkts->arr[i].market_id_str);
+    snprintf(ctx->exchange_name, sizeof(ctx->exchange_name), "%s",
+        mkts->arr[i].exchange_name);
     snprintf(ctx->product_id, sizeof(ctx->product_id), "%s",
         mkts->arr[i].product_id);
 
-    if(coinbase_list_fills_async(NULL, ctx->product_id, cursor_ms,
+    if(exchange_list_fills_async(ctx->exchange_name, NULL,
+           ctx->product_id, cursor_ms,
            wm_live_on_fills, ctx) != SUCCESS)
     {
       // wm_live_on_fills already invoked synchronously with res->err
@@ -996,33 +1037,35 @@ wm_live_fills_poll_tick(task_t *t)
 // ----------------------------------------------------------------------- //
 
 static void
-wm_live_boot_reconcile_cb(const coinbase_orders_result_t *res, void *user)
+wm_live_boot_reconcile_cb(const exchange_orders_result_t *res, void *user)
 {
-  (void)user;
+  const char *exchange_name = user;
 
-  if(res == NULL) return;
+  if(res == NULL || exchange_name == NULL) return;
 
   if(res->err[0] != '\0')
   {
     clam(CLAM_DEBUG, WM_LIVE_CTX,
-        "boot reconcile (list orders) err=%s", res->err);
+        "boot reconcile (%s list orders) err=%s",
+        exchange_name, res->err);
     return;
   }
 
   if(res->count == 0)
   {
     clam(CLAM_INFO, WM_LIVE_CTX,
-        "boot reconcile: no resting orders at gateway");
+        "boot reconcile (%s): no resting orders at gateway",
+        exchange_name);
     return;
   }
 
   clam(CLAM_WARN, WM_LIVE_CTX,
-      "boot reconcile: %u open order(s) found at gateway:",
-      res->count);
+      "boot reconcile (%s): %u open order(s) found at gateway:",
+      exchange_name, res->count);
 
   for(uint32_t i = 0; i < res->count; i++)
   {
-    const coinbase_order_t *o = &res->rows[i];
+    const exchange_order_t *o = &res->rows[i];
 
     clam(CLAM_WARN, WM_LIVE_CTX,
         "  order_id=%s coid=%s product=%s side=%s status=%s"
@@ -1032,9 +1075,15 @@ wm_live_boot_reconcile_cb(const coinbase_orders_result_t *res, void *user)
   }
 
   clam(CLAM_WARN, WM_LIVE_CTX,
-      "boot reconcile: not auto-attaching to local pending state."
-      " Inspect via Coinbase UI; cancel manually if undesired.");
+      "boot reconcile (%s): not auto-attaching to local pending state."
+      " Inspect via exchange UI; cancel manually if undesired.",
+      exchange_name);
 }
+
+// Static storage for the per-exchange reconcile user-pointer. The
+// callback receives the const char * by-ref so we don't need to heap
+// the name; the slots live for the lifetime of the daemon.
+static char wm_live_reconcile_names[WM_LIVE_MAX_EXCHANGES][EXCHANGE_NAME_SZ];
 
 // ----------------------------------------------------------------------- //
 // Late-stage start                                                        //
@@ -1045,11 +1094,40 @@ wm_live_engine_start(void)
 {
   whenmoon_state_t *st;
   int64_t           now_ms;
+  char              names[WM_LIVE_MAX_EXCHANGES][EXCHANGE_NAME_SZ];
+  uint32_t          n_names = 0;
+  uint32_t          i;
 
   if(!g_live.initialized) return;
 
   st = whenmoon_get_state();
   if(st == NULL) return;
+
+  // Pre-register the master kill-switch KV per registered exchange so
+  // operators can `/set kv` it at any time. Lazy-register in
+  // wm_live_master_live_enabled still guards against init-order
+  // regressions.
+  if(exchange_name_list(names, WM_LIVE_MAX_EXCHANGES, &n_names) != SUCCESS)
+    n_names = 0;
+
+  if(n_names > WM_LIVE_MAX_EXCHANGES)
+    n_names = WM_LIVE_MAX_EXCHANGES;
+
+  for(i = 0; i < n_names; i++)
+  {
+    char path[160];
+    int  n;
+
+    n = snprintf(path, sizeof(path),
+        "plugin.whenmoon.exchange.%s.live", names[i]);
+
+    if(n > 0 && (size_t)n < sizeof(path))
+      (void)kv_register(path, KV_BOOL, "false", NULL, NULL,
+          "Master kill-switch for the per-market real-mode submit"
+          " path on this exchange. Default false; flip to true to"
+          " enable live order placement. Per-market risk caps still"
+          " apply when this is true.");
+  }
 
   // Seed the global REST-poll cursor at "now - overlap" so the first
   // poll fetches the recent past. Without this seed the first poll
@@ -1086,13 +1164,23 @@ wm_live_engine_start(void)
           "fills-poll scheduled every %us", WM_LIVE_FILLS_POLL_SEC);
   }
 
-  // Boot reconcile: list open orders at gateway. Advisory-only (does
-  // not auto-attach to pending state in v1).
-  if(coinbase_apikey_configured())
+  // Boot reconcile: list open orders at gateway, per credentialed
+  // exchange. Advisory-only (does not auto-attach to pending state).
+  for(i = 0; i < n_names; i++)
   {
-    if(coinbase_list_orders_async("OPEN", NULL,
-           wm_live_boot_reconcile_cb, NULL) != SUCCESS)
+    exchange_capabilities_t caps;
+
+    if(exchange_get_capabilities(names[i], &caps) != SUCCESS
+        || !caps.has_credentials)
+      continue;
+
+    snprintf(wm_live_reconcile_names[i],
+        sizeof(wm_live_reconcile_names[i]), "%s", names[i]);
+
+    if(exchange_list_orders_async(names[i], "OPEN", NULL,
+           wm_live_boot_reconcile_cb,
+           wm_live_reconcile_names[i]) != SUCCESS)
       clam(CLAM_DEBUG, WM_LIVE_CTX,
-          "boot reconcile submit failed");
+          "boot reconcile submit failed (%s)", names[i]);
   }
 }

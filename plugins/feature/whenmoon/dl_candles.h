@@ -6,7 +6,7 @@
 
 #ifdef WHENMOON_INTERNAL
 
-#include "coinbase_api.h"
+#include "exchange_api.h"
 #include "dl_jobtable.h"
 
 #include <stdbool.h>
@@ -37,13 +37,13 @@ bool     wm_dl_candles_dispatch_one(dl_jobtable_t *t, dl_job_t *j);
 // curl-multi worker completion; re-resolves the job under the lock,
 // inserts rows off-lock, extends coverage, advances the cursor, decides
 // terminal state. Takes ownership of `user` (mem_free on exit).
-void     wm_dl_candles_on_page(const coinbase_candles_result_t *res,
+void     wm_dl_candles_on_page(const exchange_candles_result_t *res,
     void *user);
 
 // Batched INSERT of a 0..300-row page. Returns rows_affected (never the
 // page count — ON CONFLICT collapses duplicates).
 uint32_t wm_dl_candles_insert_page(int32_t market_id,
-    const coinbase_candles_result_t *res);
+    const exchange_candles_result_t *res);
 
 // WM-S6: read the stored 1m-candle table through the
 // wm_candle_upsample plpgsql function and fill `out`. Returns the
@@ -55,7 +55,7 @@ uint32_t wm_dl_candles_insert_page(int32_t market_id,
 // empty rather than failing with "relation does not exist".
 uint32_t wm_dl_candles_query_aggregated(int32_t market_id,
     int32_t gran_secs, const char *start_ts, const char *end_ts,
-    coinbase_candle_t *out, uint32_t cap);
+    exchange_candle_t *out, uint32_t cap);
 
 #endif // WHENMOON_INTERNAL
 #endif // BM_WHENMOON_DL_CANDLES_H

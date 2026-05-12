@@ -128,14 +128,9 @@ whenmoon_show_markets_cmd(const cmd_ctx_t *ctx)
 static void
 whenmoon_show_balances_cmd(const cmd_ctx_t *ctx)
 {
-  whenmoon_state_t    *st;
-  whenmoon_account_t  *acc;
-  coinbase_account_t   rows[WM_ACCOUNT_ROW_CAP];
-  uint32_t             n;
-  time_t               ts;
-  char                 err[128];
-  char                 line[256];
-  uint32_t             i;
+  whenmoon_state_t   *st;
+  whenmoon_account_t *acc;
+  uint32_t            si;
 
   st = whenmoon_get_state();
 
@@ -147,55 +142,81 @@ whenmoon_show_balances_cmd(const cmd_ctx_t *ctx)
 
   acc = st->account;
 
-  pthread_mutex_lock(&acc->lock);
-  n = acc->n_rows;
-
-  if(n > WM_ACCOUNT_ROW_CAP)
-    n = WM_ACCOUNT_ROW_CAP;
-
-  memcpy(rows, acc->rows, sizeof(rows[0]) * n);
-  ts = acc->last_refresh_ts;
-  snprintf(err, sizeof(err), "%s", acc->last_err);
-  pthread_mutex_unlock(&acc->lock);
-
-  if(!coinbase_apikey_configured())
+  if(acc->n_slots == 0)
   {
     cmd_reply(ctx,
-        "whenmoon: account refresh disabled — no coinbase apikey");
+        "whenmoon: no registered exchanges (account refresh disabled)");
     return;
   }
 
   cmd_reply(ctx, CLR_BOLD "whenmoon balances" CLR_RESET);
 
-  if(err[0] != '\0')
+  for(si = 0; si < acc->n_slots; si++)
   {
+    wm_account_slot_t       *slot = &acc->slots[si];
+    exchange_account_t       rows[WM_ACCOUNT_ROW_CAP];
+    char                     header[160];
+    char                     line[256];
+    char                     err[128];
+    time_t                   ts;
+    uint32_t                 n;
+    uint32_t                 i;
+    exchange_capabilities_t  caps;
+    bool                     have_creds = false;
+
+    pthread_mutex_lock(&slot->lock);
+    n = slot->n_rows;
+
+    if(n > WM_ACCOUNT_ROW_CAP)
+      n = WM_ACCOUNT_ROW_CAP;
+
+    memcpy(rows, slot->rows, sizeof(rows[0]) * n);
+    ts = slot->last_refresh_ts;
+    snprintf(err, sizeof(err), "%s", slot->last_err);
+    pthread_mutex_unlock(&slot->lock);
+
+    if(exchange_get_capabilities(slot->exchange_name, &caps) == SUCCESS
+        && caps.has_credentials)
+      have_creds = true;
+
+    snprintf(header, sizeof(header),
+        CLR_BOLD "  %s" CLR_RESET " %s",
+        slot->exchange_name,
+        have_creds ? "" : "(no creds)");
+    cmd_reply(ctx, header);
+
+    if(err[0] != '\0')
+    {
+      snprintf(line, sizeof(line),
+          "    " CLR_YELLOW "last_err:" CLR_RESET " %s", err);
+      cmd_reply(ctx, line);
+    }
+
+    if(n == 0)
+    {
+      cmd_reply(ctx,
+          have_creds ? "    (no rows yet)" : "    (no creds — no fetch)");
+      continue;
+    }
+
     snprintf(line, sizeof(line),
-        "  " CLR_YELLOW "last_err:" CLR_RESET " %s", err);
+        "    refreshed: %ld", (long)ts);
     cmd_reply(ctx, line);
-  }
 
-  if(n == 0)
-  {
-    cmd_reply(ctx, "  (no rows yet)");
-    return;
-  }
+    for(i = 0; i < n; i++)
+    {
+      char   ccy[EXCHANGE_CURRENCY_SZ];
+      size_t clen;
 
-  snprintf(line, sizeof(line),
-      "  refreshed: %ld", (long)ts);
-  cmd_reply(ctx, line);
+      clen = strnlen(rows[i].currency, sizeof(ccy) - 1);
+      memcpy(ccy, rows[i].currency, clen);
+      ccy[clen] = '\0';
 
-  for(i = 0; i < n; i++)
-  {
-    char ccy[COINBASE_CURRENCY_SZ];
-    size_t clen = strnlen(rows[i].currency, sizeof(ccy) - 1);
-
-    memcpy(ccy, rows[i].currency, clen);
-    ccy[clen] = '\0';
-
-    snprintf(line, sizeof(line),
-        "  %-8s  balance=%-16.8g  hold=%-16.8g  available=%-16.8g",
-        ccy, rows[i].balance, rows[i].hold, rows[i].available);
-    cmd_reply(ctx, line);
+      snprintf(line, sizeof(line),
+          "    %-8s  balance=%-16.8g  hold=%-16.8g  available=%-16.8g",
+          ccy, rows[i].balance, rows[i].hold, rows[i].available);
+      cmd_reply(ctx, line);
+    }
   }
 }
 
@@ -477,6 +498,14 @@ whenmoon_start(void)
   if(wm_market_persist_restore_all(st) != SUCCESS)
     clam(CLAM_INFO, WHENMOON_CTX,
         "wm_market_persist_restore_all failed (sessions left at default)");
+
+  // KR-2: per-exchange account slot setup happens in start (post coinbase
+  // / kraken `cb_start` so the exchange registry is populated). Init
+  // could only allocate the empty container; this is where slots get
+  // their periodic tasks and an initial fetch where creds are present.
+  if(wm_account_start(st) != SUCCESS)
+    clam(CLAM_INFO, WHENMOON_CTX,
+        "wm_account_start failed (account refresh disabled)");
 
   // WM-LT-8-B3: schedule the REST /fills safety-net poll + boot
   // reconcile (advisory list of any open orders left resting at the

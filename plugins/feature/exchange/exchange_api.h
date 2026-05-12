@@ -101,6 +101,12 @@ typedef void (*exchange_response_cb_t)(int http_status,
 #define EXCHANGE_MAX_FILLS_LIST   100
 #define EXCHANGE_MAX_ACCOUNTS      64
 
+// KR-2: candle page cap. Sized at 720 to fit Kraken's largest single-page
+// reply; Coinbase's 300-row cap fits comfortably underneath. Whenmoon's
+// downloader window (WM_DL_CANDLE_WINDOW_BUCKETS = 300) is still the
+// constraint that bounds a single dispatch.
+#define EXCHANGE_MAX_CANDLES      720
+
 // Capability snapshot returned by exchange_get_capabilities. Reflects
 // the protocol vtable's current view: `has_credentials` consults the
 // optional `is_authenticated` hook (true when hook is NULL — public-
@@ -214,6 +220,150 @@ typedef struct
   exchange_fill_t  rows[EXCHANGE_MAX_FILLS_LIST];
 } exchange_fills_result_t;
 
+// ------------------------------------------------------------------ //
+// Candle types (KR-2).                                                //
+//                                                                      //
+// Granularity is a neutral seconds count; protocol adapters map to    //
+// their native enum. `ts_open_ms` is the bucket open timestamp in     //
+// milliseconds since epoch (uniform with the rest of the abstraction; //
+// coinbase's seconds-since-epoch is widened on translation).          //
+// ------------------------------------------------------------------ //
+
+typedef enum
+{
+  EXCH_GRAN_1M  = 60,
+  EXCH_GRAN_5M  = 300,
+  EXCH_GRAN_15M = 900,
+  EXCH_GRAN_30M = 1800,
+  EXCH_GRAN_1H  = 3600,
+  EXCH_GRAN_4H  = 14400,
+  EXCH_GRAN_1D  = 86400,
+  EXCH_GRAN_1W  = 604800
+} exchange_granularity_t;
+
+typedef struct
+{
+  int64_t ts_open_ms;   // bucket open, ms since epoch
+  double  open;
+  double  high;
+  double  low;
+  double  close;
+  double  volume;
+} exchange_candle_t;
+
+typedef struct
+{
+  char               err[EXCHANGE_ERR_SZ];
+  uint32_t           count;
+  exchange_candle_t  rows[EXCHANGE_MAX_CANDLES];
+} exchange_candles_result_t;
+
+// ------------------------------------------------------------------ //
+// WebSocket types (KR-2).                                             //
+//                                                                      //
+// Channel enum is the neutral surface; protocol plugins map to native //
+// channel names. Only the channels whenmoon consumes today have       //
+// payload types defined — book/ohlc forward-look the Kraken work but  //
+// are not exposed yet.                                                 //
+// ------------------------------------------------------------------ //
+
+typedef enum
+{
+  EXCH_WS_TICKER,
+  EXCH_WS_TRADES,
+  EXCH_WS_BOOK_L2,
+  EXCH_WS_OHLC_1M,
+  EXCH_WS_USER
+} exchange_ws_channel_t;
+
+typedef struct
+{
+  char    product_id[EXCHANGE_PRODUCT_ID_SZ];
+  double  price;
+  double  best_bid;
+  double  best_ask;
+  double  volume_24h;
+  double  low_24h;
+  double  high_24h;
+  int64_t time_ms;
+} exchange_ws_ticker_t;
+
+typedef struct
+{
+  char    product_id[EXCHANGE_PRODUCT_ID_SZ];
+  char    side[EXCHANGE_SIDE_SZ];      // "buy" / "sell"
+  int64_t trade_id;
+  double  price;
+  double  size;
+  int64_t time_ms;
+} exchange_ws_match_t;
+
+// Authenticated user-channel sub-payloads. Discriminated by
+// exchange_ws_user_event_t::kind below.
+typedef enum
+{
+  EXCH_WS_USER_KIND_ORDER = 0,
+  EXCH_WS_USER_KIND_FILL  = 1
+} exchange_ws_user_kind_t;
+
+typedef struct
+{
+  char    order_id[EXCHANGE_ORDER_ID_SZ];
+  char    client_order_id[EXCHANGE_CLIENT_OID_SZ];
+  char    product_id[EXCHANGE_PRODUCT_ID_SZ];
+  char    side[EXCHANGE_SIDE_SZ];          // "buy" / "sell"
+  char    status[EXCHANGE_STATUS_SZ];      // OPEN/FILLED/CANCELLED/EXPIRED/FAILED
+  double  limit_price;
+  double  cumulative_quantity;
+  double  leaves_quantity;
+  double  avg_price;
+  double  total_fees;
+  int64_t creation_time_ms;
+  int64_t time_ms;                         // envelope timestamp
+} exchange_ws_user_order_t;
+
+typedef struct
+{
+  char    order_id[EXCHANGE_ORDER_ID_SZ];
+  char    client_order_id[EXCHANGE_CLIENT_OID_SZ];
+  char    product_id[EXCHANGE_PRODUCT_ID_SZ];
+  char    side[EXCHANGE_SIDE_SZ];          // "buy" / "sell"
+  int64_t trade_id;
+  double  price;
+  double  size;
+  double  fee;
+  int64_t time_ms;
+} exchange_ws_user_fill_t;
+
+typedef struct
+{
+  exchange_ws_user_kind_t kind;
+  union
+  {
+    exchange_ws_user_order_t order;
+    exchange_ws_user_fill_t  fill;
+  } u;
+} exchange_ws_user_event_t;
+
+// Wrapping fanout event. `channel` discriminates the payload union;
+// `product_id` mirrors the inner payload's product where applicable so
+// fanout subscribers can switch on the wrapper alone.
+typedef struct
+{
+  exchange_ws_channel_t channel;
+  char                  product_id[EXCHANGE_PRODUCT_ID_SZ];
+  union
+  {
+    exchange_ws_ticker_t      ticker;     // EXCH_WS_TICKER
+    exchange_ws_match_t       match;      // EXCH_WS_TRADES
+    exchange_ws_user_event_t  user;       // EXCH_WS_USER
+  } payload;
+} exchange_ws_event_t;
+
+// Opaque subscription handle. The protocol plugin defines the concrete
+// struct internally; the abstraction layer treats it as void*.
+typedef struct exchange_ws_sub exchange_ws_sub_t;
+
 // Callback signatures. Same threading rules as
 // exchange_response_cb_t — fired on the curl-multi worker thread that
 // completed the underlying transport. Consumers must not block.
@@ -225,6 +375,13 @@ typedef void (*exchange_done_accounts_cb_t)(
     const exchange_accounts_result_t *res, void *user);
 typedef void (*exchange_done_fills_cb_t)(
     const exchange_fills_result_t *res, void *user);
+typedef void (*exchange_done_candles_cb_t)(
+    const exchange_candles_result_t *res, void *user);
+
+// WebSocket fanout callback. Fires on the protocol plugin's WS reader
+// thread; treat payload pointers as valid only for the call duration.
+typedef void (*exchange_ws_event_cb_t)(const exchange_ws_event_t *ev,
+    void *user);
 
 // Per-exchange protocol vtable.
 //
@@ -294,6 +451,22 @@ typedef struct
                              exchange_done_fills_cb_t cb, void *u);
   bool   (*get_accounts_async)(exchange_done_accounts_cb_t cb,
                                void *u);
+
+  // KR-2 capability hooks. Candles are public market data; WS subscribe
+  // is gated per-channel by the protocol plugin (e.g. user channel
+  // requires credentials). Both slots may be NULL — the public shim
+  // FAILs with a stable error in that case.
+  bool   (*fetch_candles_async)(const char *product_id,
+                                exchange_granularity_t gran,
+                                int64_t since_ms, int64_t until_ms,
+                                exchange_done_candles_cb_t cb, void *u);
+  bool   (*ws_subscribe)(const exchange_ws_channel_t *channels,
+                         uint32_t n_channels,
+                         const char *const *product_ids,
+                         uint32_t n_products,
+                         exchange_ws_event_cb_t cb, void *u,
+                         exchange_ws_sub_t **out_handle);
+  void   (*ws_unsubscribe)(exchange_ws_sub_t *handle);
 } exchange_protocol_vtable_t;
 
 // ------------------------------------------------------------------
@@ -379,6 +552,31 @@ bool exchange_list_fills_async(const char *name,
 
 bool exchange_get_accounts_async(const char *name,
     exchange_done_accounts_cb_t cb, void *user);
+
+// KR-2: candle fetch — public market data; no auth gate. On pre-flight
+// FAIL (unknown exchange, missing vtable hook, unsupported granularity),
+// the typed callback fires synchronously with `err` populated and the
+// function returns FAIL. Otherwise SUCCESS means the request was queued
+// and the callback will fire asynchronously.
+bool exchange_fetch_candles_async(const char *name, const char *product_id,
+    exchange_granularity_t gran, int64_t since_ms, int64_t until_ms,
+    exchange_done_candles_cb_t cb, void *user);
+
+// KR-2: WS subscribe. The protocol plugin is responsible for per-channel
+// auth gating (user channel requires creds; ticker/trades are public).
+// On FAIL `*out_handle` is NULL and the function returns FAIL — the
+// fanout callback never fires. On SUCCESS the handle is non-NULL and
+// every matching event fires `cb` until exchange_ws_unsubscribe(handle).
+bool exchange_ws_subscribe(const char *name,
+    const exchange_ws_channel_t *channels, uint32_t n_channels,
+    const char *const *product_ids, uint32_t n_products,
+    exchange_ws_event_cb_t cb, void *user,
+    exchange_ws_sub_t **out_handle);
+
+// Release a subscription handle. No-op on NULL. Tolerates "plugin
+// already unregistered" — outstanding handles may be invalidated by
+// exchange_unregister, in which case this call simply returns.
+void exchange_ws_unsubscribe(const char *name, exchange_ws_sub_t *handle);
 
 #endif // EXCHANGE_INTERNAL
 
@@ -669,6 +867,88 @@ exchange_get_accounts_async(const char *name,
     __atomic_store_n(&cached, fn, __ATOMIC_RELEASE);
   }
   return(fn(name, cb, user));
+}
+
+static inline bool
+exchange_fetch_candles_async(const char *name, const char *product_id,
+    exchange_granularity_t gran, int64_t since_ms, int64_t until_ms,
+    exchange_done_candles_cb_t cb, void *user)
+{
+  typedef bool (*fn_t)(const char *, const char *, exchange_granularity_t,
+      int64_t, int64_t, exchange_done_candles_cb_t, void *);
+  static fn_t cached = NULL;
+  fn_t        fn     = __atomic_load_n(&cached, __ATOMIC_ACQUIRE);
+
+  if(fn == NULL)
+  {
+    union { void *obj; fn_t fn; } u;
+
+    u.obj = plugin_dlsym("exchange", "exchange_fetch_candles_async");
+    if(u.obj == NULL)
+    {
+      clam(CLAM_FATAL, "exchange",
+          "dlsym failed: exchange_fetch_candles_async");
+      abort();
+    }
+    fn = u.fn;
+    __atomic_store_n(&cached, fn, __ATOMIC_RELEASE);
+  }
+  return(fn(name, product_id, gran, since_ms, until_ms, cb, user));
+}
+
+static inline bool
+exchange_ws_subscribe(const char *name,
+    const exchange_ws_channel_t *channels, uint32_t n_channels,
+    const char *const *product_ids, uint32_t n_products,
+    exchange_ws_event_cb_t cb, void *user,
+    exchange_ws_sub_t **out_handle)
+{
+  typedef bool (*fn_t)(const char *, const exchange_ws_channel_t *,
+      uint32_t, const char *const *, uint32_t,
+      exchange_ws_event_cb_t, void *, exchange_ws_sub_t **);
+  static fn_t cached = NULL;
+  fn_t        fn     = __atomic_load_n(&cached, __ATOMIC_ACQUIRE);
+
+  if(fn == NULL)
+  {
+    union { void *obj; fn_t fn; } u;
+
+    u.obj = plugin_dlsym("exchange", "exchange_ws_subscribe");
+    if(u.obj == NULL)
+    {
+      clam(CLAM_FATAL, "exchange",
+          "dlsym failed: exchange_ws_subscribe");
+      abort();
+    }
+    fn = u.fn;
+    __atomic_store_n(&cached, fn, __ATOMIC_RELEASE);
+  }
+  return(fn(name, channels, n_channels, product_ids, n_products,
+      cb, user, out_handle));
+}
+
+static inline void
+exchange_ws_unsubscribe(const char *name, exchange_ws_sub_t *handle)
+{
+  typedef void (*fn_t)(const char *, exchange_ws_sub_t *);
+  static fn_t cached = NULL;
+  fn_t        fn     = __atomic_load_n(&cached, __ATOMIC_ACQUIRE);
+
+  if(fn == NULL)
+  {
+    union { void *obj; fn_t fn; } u;
+
+    u.obj = plugin_dlsym("exchange", "exchange_ws_unsubscribe");
+    if(u.obj == NULL)
+    {
+      clam(CLAM_FATAL, "exchange",
+          "dlsym failed: exchange_ws_unsubscribe");
+      abort();
+    }
+    fn = u.fn;
+    __atomic_store_n(&cached, fn, __ATOMIC_RELEASE);
+  }
+  fn(name, handle);
 }
 
 #endif // !EXCHANGE_INTERNAL

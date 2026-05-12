@@ -84,6 +84,46 @@ fail_fills_cb(exchange_done_fills_cb_t cb, void *user, const char *err)
   cb(&res, user);
 }
 
+static void
+fail_candles_cb(exchange_done_candles_cb_t cb, void *user, const char *err)
+{
+  exchange_candles_result_t res;
+
+  if(cb == NULL)
+    return;
+
+  memset(&res, 0, sizeof(res));
+  snprintf(res.err, sizeof(res.err), "%s", err != NULL ? err : "error");
+  cb(&res, user);
+}
+
+// Resolve `name` without any auth check. Used by public market-data
+// verbs (candles, public WS channels). Writes a human-readable error
+// into `errbuf` on FAIL.
+static bool
+resolve_exchange(const char *name, exchange_t **out_e,
+    char *errbuf, size_t errbuf_sz)
+{
+  exchange_t *e;
+
+  if(name == NULL || name[0] == '\0')
+  {
+    snprintf(errbuf, errbuf_sz, "exchange name required");
+    return(FAIL);
+  }
+
+  e = exchange_find(name);
+
+  if(e == NULL || e->vt == NULL)
+  {
+    snprintf(errbuf, errbuf_sz, "%s: not registered", name);
+    return(FAIL);
+  }
+
+  *out_e = e;
+  return(SUCCESS);
+}
+
 // Resolve `name` and check `is_authenticated`. Writes a human-readable
 // error into `errbuf` on FAIL. Caller uses `errbuf` when firing the
 // synthetic typed callback so the message reaches the consumer.
@@ -411,4 +451,110 @@ exchange_get_accounts_async(const char *name,
     return(FAIL);
 
   return(SUCCESS);
+}
+
+// ------------------------------------------------------------------ //
+// KR-2: candle fetch (public market data — no auth gate)              //
+// ------------------------------------------------------------------ //
+
+bool
+exchange_fetch_candles_async(const char *name, const char *product_id,
+    exchange_granularity_t gran, int64_t since_ms, int64_t until_ms,
+    exchange_done_candles_cb_t cb, void *user)
+{
+  exchange_t *e = NULL;
+  char        err[EXCHANGE_ERR_SZ];
+
+  if(cb == NULL)
+    return(FAIL);
+
+  if(product_id == NULL || product_id[0] == '\0')
+  {
+    fail_candles_cb(cb, user, "product_id required");
+    return(FAIL);
+  }
+
+  if(resolve_exchange(name, &e, err, sizeof(err)) != SUCCESS)
+  {
+    fail_candles_cb(cb, user, err);
+    return(FAIL);
+  }
+
+  if(e->vt->fetch_candles_async == NULL)
+  {
+    snprintf(err, sizeof(err),
+        "%s: fetch_candles not supported", name);
+    fail_candles_cb(cb, user, err);
+    return(FAIL);
+  }
+
+  if(e->vt->fetch_candles_async(product_id, gran, since_ms, until_ms,
+        cb, user) != SUCCESS)
+    return(FAIL);
+
+  return(SUCCESS);
+}
+
+// ------------------------------------------------------------------ //
+// KR-2: WS subscribe / unsubscribe                                    //
+//                                                                      //
+// Per-channel auth gating lives in the protocol plugin's adapter      //
+// (e.g. the user channel FAILs without credentials). The abstraction  //
+// only enforces basic shape: known exchange, non-empty subscriber     //
+// set, vtable hook present.                                           //
+// ------------------------------------------------------------------ //
+
+bool
+exchange_ws_subscribe(const char *name,
+    const exchange_ws_channel_t *channels, uint32_t n_channels,
+    const char *const *product_ids, uint32_t n_products,
+    exchange_ws_event_cb_t cb, void *user,
+    exchange_ws_sub_t **out_handle)
+{
+  exchange_t *e = NULL;
+  char        err[EXCHANGE_ERR_SZ];
+
+  if(out_handle != NULL)
+    *out_handle = NULL;
+
+  if(cb == NULL || out_handle == NULL || channels == NULL ||
+     n_channels == 0)
+    return(FAIL);
+
+  if(resolve_exchange(name, &e, err, sizeof(err)) != SUCCESS)
+  {
+    clam(CLAM_INFO, "exchange", "ws_subscribe FAIL: %s", err);
+    return(FAIL);
+  }
+
+  if(e->vt->ws_subscribe == NULL)
+  {
+    clam(CLAM_INFO, "exchange",
+        "ws_subscribe FAIL: %s: ws_subscribe not supported", name);
+    return(FAIL);
+  }
+
+  if(e->vt->ws_subscribe(channels, n_channels, product_ids, n_products,
+        cb, user, out_handle) != SUCCESS)
+    return(FAIL);
+
+  return(SUCCESS);
+}
+
+void
+exchange_ws_unsubscribe(const char *name, exchange_ws_sub_t *handle)
+{
+  exchange_t *e;
+
+  if(handle == NULL || name == NULL || name[0] == '\0')
+    return;
+
+  e = exchange_find(name);
+
+  // Tolerate "plugin already unregistered" — handle invalidated by
+  // exchange_unregister; nothing further to do.
+  if(e == NULL || e->vt == NULL || e->vt->ws_unsubscribe == NULL)
+    return;
+
+  e->vt->ws_unsubscribe(handle);
 }

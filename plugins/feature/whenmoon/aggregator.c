@@ -496,7 +496,7 @@ wm_warmup_find_market(whenmoon_state_t *st, const char *product_id)
   for(i = 0; i < m->n_markets; i++)
   {
     if(strncmp(m->arr[i].product_id, product_id,
-           COINBASE_PRODUCT_ID_SZ) == 0)
+           WM_PRODUCT_ID_SZ) == 0)
       return(&m->arr[i]);
   }
 
