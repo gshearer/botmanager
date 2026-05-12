@@ -809,9 +809,11 @@ static const exchange_protocol_vtable_t kr_vtable =
   .get_accounts_async  = kr_exch_get_accounts_async,
   .fetch_candles_async = kr_exch_fetch_candles_async,
 
-  // WS slots — KR-5 wires these.
-  .ws_subscribe        = NULL,
-  .ws_unsubscribe      = NULL,
+  // KR-5: WS slots forward directly into the channel multiplexer; the
+  // multiplexer owns its own opaque handle (`exchange_ws_sub_t`) so no
+  // extra trampoline is needed at this layer.
+  .ws_subscribe        = kr_ws_subscribe,
+  .ws_unsubscribe      = kr_ws_unsubscribe,
 };
 
 bool

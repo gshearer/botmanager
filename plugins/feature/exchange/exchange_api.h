@@ -298,6 +298,22 @@ typedef struct
   int64_t time_ms;
 } exchange_ws_match_t;
 
+// KR-5: complete-bar payload. Surfaced by exchanges whose WS
+// supports OHLC subscriptions (Kraken). Coinbase aggregates from
+// `market_trades` and never emits this payload.
+typedef struct
+{
+  char     product_id[EXCHANGE_PRODUCT_ID_SZ];
+  int64_t  ts_open_ms;        // bucket open, ms since epoch
+  double   open;
+  double   high;
+  double   low;
+  double   close;
+  double   volume;
+  uint32_t interval_min;      // 1, 5, 15, 30, 60, 240, 1440, 10080
+  int64_t  time_ms;           // envelope timestamp
+} exchange_ws_ohlc_t;
+
 // Authenticated user-channel sub-payloads. Discriminated by
 // exchange_ws_user_event_t::kind below.
 typedef enum
@@ -356,6 +372,7 @@ typedef struct
   {
     exchange_ws_ticker_t      ticker;     // EXCH_WS_TICKER
     exchange_ws_match_t       match;      // EXCH_WS_TRADES
+    exchange_ws_ohlc_t        ohlc;       // EXCH_WS_OHLC_1M
     exchange_ws_user_event_t  user;       // EXCH_WS_USER
   } payload;
 } exchange_ws_event_t;

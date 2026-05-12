@@ -129,7 +129,9 @@ kr_start(void)
 
   clam(CLAM_INFO, KR_CTX, "kraken plugin started");
 
-  // WS start deferred to KR-5 wiring; kr_ws_start is a no-op today.
+  // KR-5: spawns the persist reader if plugin.kraken.ws_enabled is set.
+  // The reader idles in DISCONNECTED until the toggle flips on; flipping
+  // the KV at runtime triggers a config-reload via kr_ws_kv_cb.
   kr_ws_start();
 
   return(SUCCESS);
@@ -171,7 +173,7 @@ const plugin_desc_t bm_plugin_desc =
 {
   .api_version     = PLUGIN_API_VERSION,
   .name            = "kraken",
-  .version         = "0.2-kr4",
+  .version         = "0.3-kr5",
   .type            = PLUGIN_SERVICE,
   .kind            = "kraken",
   .provides        = { { .name = "exchange_kraken" } },
