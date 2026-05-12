@@ -57,17 +57,23 @@ static const exchange_ws_channel_t wm_ws_channels[] = {
 // Container helpers                                                  //
 // ------------------------------------------------------------------ //
 
+// Find by (exchange, product_id) tuple. Multi-exchange running sets
+// can carry the same product_id (e.g. "BTC-USD") on more than one
+// exchange — the tuple is the unique key.
 static whenmoon_market_t *
-wm_market_find(whenmoon_markets_t *m, const char *product_id)
+wm_market_find(whenmoon_markets_t *m,
+    const char *exchange_name, const char *product_id)
 {
   uint32_t i;
 
-  if(m == NULL || product_id == NULL)
+  if(m == NULL || exchange_name == NULL || product_id == NULL)
     return(NULL);
 
   for(i = 0; i < m->n_markets; i++)
   {
-    if(strncmp(m->arr[i].product_id, product_id,
+    if(strncmp(m->arr[i].exchange_name, exchange_name,
+           EXCHANGE_NAME_SZ) == 0
+        && strncmp(m->arr[i].product_id, product_id,
            WM_PRODUCT_ID_SZ) == 0)
       return(&m->arr[i]);
   }
@@ -127,38 +133,45 @@ wm_market_grow(whenmoon_markets_t *m, uint32_t needed)
   return(SUCCESS);
 }
 
-// Rebuild the WS subscription with the current product set. Called
-// after every add/remove. Unsubscribing the old handle first is safe:
-// wm_market_on_event shorts on st->markets == NULL, which stays set,
-// but the handle close means no new events will fire in parallel.
+// Rebuild the WS subscription set with the current running markets.
+// Called after every add/remove. Tearing down the prior bindings first
+// is safe: wm_market_on_event shorts on st->markets == NULL (which
+// stays set), but the handle close means no new events fire in
+// parallel.
 //
-// KR-2 single-exchange limitation: the current running set must share
-// one exchange. wm_market_add rejects a second exchange until KR-5
-// partitions wsub state per exchange.
+// One ws_sub per distinct exchange in the running set; products owned
+// by that exchange ride a single subscribe call. The live trader's
+// user-channel reconcile (wm_live_ws_resub_all) runs once at the end
+// against the same partitioning.
 static void
 wm_market_resub_ws(whenmoon_state_t *st)
 {
   whenmoon_markets_t *m;
   const char        **pid_ptrs = NULL;
   uint32_t            i;
-  const char         *bind_exch;
+  uint32_t            j;
 
   if(st == NULL || st->markets == NULL)
     return;
 
   m = st->markets;
 
-  if(m->ws_sub != NULL)
+  for(i = 0; i < m->n_ws_bindings; i++)
   {
-    exchange_ws_unsubscribe(m->ws_exchange, m->ws_sub);
-    m->ws_sub          = NULL;
-    m->ws_exchange[0]  = '\0';
+    if(m->ws_bindings[i].ws_sub != NULL)
+      exchange_ws_unsubscribe(m->ws_bindings[i].exchange_name,
+          m->ws_bindings[i].ws_sub);
+
+    m->ws_bindings[i].ws_sub           = NULL;
+    m->ws_bindings[i].exchange_name[0] = '\0';
   }
+  m->n_ws_bindings = 0;
 
   if(m->n_markets == 0)
+  {
+    wm_live_ws_resub_all(st);
     return;
-
-  bind_exch = m->arr[0].exchange_name;
+  }
 
   pid_ptrs = mem_alloc("whenmoon", "ws_pids",
       sizeof(*pid_ptrs) * m->n_markets);
@@ -167,34 +180,79 @@ wm_market_resub_ws(whenmoon_state_t *st)
   {
     clam(CLAM_INFO, WHENMOON_CTX,
         "ws resub alloc failed (no live stream)");
+    wm_live_ws_resub_all(st);
     return;
   }
 
+  // For each distinct exchange in the running set, gather its
+  // product_ids and issue one subscribe. The "have we already bound
+  // this exchange?" check is O(n_ws_bindings) which is bounded by 8;
+  // O(N²) over the running set is fine at these scales.
   for(i = 0; i < m->n_markets; i++)
-    pid_ptrs[i] = m->arr[i].product_id;
-
-  if(exchange_ws_subscribe(bind_exch,
-        wm_ws_channels,
-        sizeof(wm_ws_channels) / sizeof(wm_ws_channels[0]),
-        pid_ptrs, m->n_markets,
-        wm_market_on_event, st,
-        &m->ws_sub) != SUCCESS || m->ws_sub == NULL)
   {
-    clam(CLAM_INFO, WHENMOON_CTX,
-        "ws subscribe failed for %s (no live stream)", bind_exch);
-    m->ws_sub = NULL;
-  }
-  else
-  {
-    snprintf(m->ws_exchange, sizeof(m->ws_exchange), "%s", bind_exch);
-  }
+    const char             *exch = m->arr[i].exchange_name;
+    wm_market_ws_binding_t *b;
+    uint32_t                n_pids;
+    bool                    seen;
 
-  // WM-LT-8-B3: piggyback the user-channel resub on the same product
-  // set so live-trader fill events reach the engine. Bound to the same
-  // exchange; KR-5 will partition.
-  wm_live_ws_resub(st, bind_exch, pid_ptrs, m->n_markets);
+    seen = false;
+    for(j = 0; j < m->n_ws_bindings; j++)
+    {
+      if(strncmp(m->ws_bindings[j].exchange_name, exch,
+            EXCHANGE_NAME_SZ) == 0)
+      {
+        seen = true;
+        break;
+      }
+    }
+
+    if(seen)
+      continue;
+
+    if(m->n_ws_bindings >= WM_MARKET_MAX_WS_BINDINGS)
+    {
+      clam(CLAM_WARN, WHENMOON_CTX,
+          "ws bindings cap (%u) exceeded; %s skipped",
+          (unsigned)WM_MARKET_MAX_WS_BINDINGS, exch);
+      continue;
+    }
+
+    n_pids = 0;
+    for(j = i; j < m->n_markets; j++)
+    {
+      if(strncmp(m->arr[j].exchange_name, exch, EXCHANGE_NAME_SZ) == 0)
+        pid_ptrs[n_pids++] = m->arr[j].product_id;
+    }
+
+    b = &m->ws_bindings[m->n_ws_bindings];
+    snprintf(b->exchange_name, sizeof(b->exchange_name), "%s", exch);
+    b->ws_sub = NULL;
+
+    // Pass the binding pointer as user so wm_market_on_event can read
+    // the originating exchange directly. Binding slot is stable for
+    // the binding's lifetime: tear-down zeroes the slot before the
+    // next rebuild reuses it, and exchange_ws_unsubscribe is
+    // synchronous w.r.t. callbacks (kraken_ws_channels.c +
+    // coinbase_ws_channels.c both drain inflight callbacks before
+    // returning).
+    if(exchange_ws_subscribe(exch,
+          wm_ws_channels,
+          sizeof(wm_ws_channels) / sizeof(wm_ws_channels[0]),
+          pid_ptrs, n_pids,
+          wm_market_on_event, b,
+          &b->ws_sub) != SUCCESS || b->ws_sub == NULL)
+    {
+      clam(CLAM_INFO, WHENMOON_CTX,
+          "ws subscribe failed for %s (no live stream)", exch);
+      b->ws_sub = NULL;
+    }
+
+    m->n_ws_bindings++;
+  }
 
   mem_free(pid_ptrs);
+
+  wm_live_ws_resub_all(st);
 }
 
 // Fire a one-shot candle backfill into the per-market live ring.
@@ -657,7 +715,8 @@ wm_market_on_candles(const exchange_candles_result_t *res, void *user)
     return;
   }
 
-  mk = wm_market_find(ctx->st->markets, ctx->product_id);
+  mk = wm_market_find(ctx->st->markets, ctx->exchange_name,
+      ctx->product_id);
 
   if(mk == NULL)
   {
@@ -701,10 +760,18 @@ wm_market_on_candles(const exchange_candles_result_t *res, void *user)
 void
 wm_market_on_event(const exchange_ws_event_t *ev, void *user)
 {
-  whenmoon_state_t  *st = user;
-  whenmoon_market_t *mk;
+  const wm_market_ws_binding_t *binding = user;
+  whenmoon_state_t             *st;
+  whenmoon_market_t            *mk;
+  const char                   *exch;
 
-  if(ev == NULL || st == NULL || st->markets == NULL)
+  if(ev == NULL || binding == NULL)
+    return;
+
+  exch = binding->exchange_name;
+  st   = whenmoon_get_state();
+
+  if(st == NULL || st->markets == NULL || exch == NULL || exch[0] == '\0')
     return;
 
   switch(ev->channel)
@@ -713,7 +780,7 @@ wm_market_on_event(const exchange_ws_event_t *ev, void *user)
     {
       const exchange_ws_ticker_t *t = &ev->payload.ticker;
 
-      mk = wm_market_find(st->markets, t->product_id);
+      mk = wm_market_find(st->markets, exch, t->product_id);
 
       if(mk == NULL)
         break;
@@ -724,8 +791,8 @@ wm_market_on_event(const exchange_ws_event_t *ev, void *user)
       pthread_mutex_unlock(&mk->lock);
 
       clam(CLAM_DEBUG2, WHENMOON_CTX,
-          "tick %s px=%.8g",
-          t->product_id, t->price);
+          "tick %s/%s px=%.8g",
+          exch, t->product_id, t->price);
       break;
     }
 
@@ -733,7 +800,7 @@ wm_market_on_event(const exchange_ws_event_t *ev, void *user)
     {
       const exchange_ws_match_t *m = &ev->payload.match;
 
-      mk = wm_market_find(st->markets, m->product_id);
+      mk = wm_market_find(st->markets, exch, m->product_id);
 
       if(mk == NULL)
         break;
@@ -751,8 +818,8 @@ wm_market_on_event(const exchange_ws_event_t *ev, void *user)
       pthread_mutex_unlock(&mk->lock);
 
       clam(CLAM_DEBUG2, WHENMOON_CTX,
-          "match %s %s px=%.8g sz=%.8g",
-          m->product_id, m->side, m->price, m->size);
+          "match %s/%s %s px=%.8g sz=%.8g",
+          exch, m->product_id, m->side, m->price, m->size);
       break;
     }
 
@@ -795,12 +862,15 @@ wm_market_destroy(whenmoon_state_t *st)
 
   m = st->markets;
 
-  if(m->ws_sub != NULL)
+  for(i = 0; i < m->n_ws_bindings; i++)
   {
-    exchange_ws_unsubscribe(m->ws_exchange, m->ws_sub);
-    m->ws_sub          = NULL;
-    m->ws_exchange[0]  = '\0';
+    if(m->ws_bindings[i].ws_sub != NULL)
+      exchange_ws_unsubscribe(m->ws_bindings[i].exchange_name,
+          m->ws_bindings[i].ws_sub);
+    m->ws_bindings[i].ws_sub           = NULL;
+    m->ws_bindings[i].exchange_name[0] = '\0';
   }
+  m->n_ws_bindings = 0;
 
   if(m->arr != NULL)
   {
@@ -851,23 +921,8 @@ wm_market_add(whenmoon_state_t *st,
 
   m = st->markets;
 
-  if(wm_market_find(m, product_id) != NULL)
+  if(wm_market_find(m, exchange, product_id) != NULL)
     return(SUCCESS);   // already present; benign no-op
-
-  // KR-2 single-exchange constraint: every market in the running set
-  // must share one exchange. The shared user-channel ws_sub + the
-  // live-trader's single bound exchange need a partition pass before
-  // a second exchange is acceptable (KR-5 work).
-  if(m->n_markets > 0
-      && strncmp(m->arr[0].exchange_name, exchange, EXCHANGE_NAME_SZ) != 0)
-  {
-    if(err != NULL)
-      snprintf(err, err_cap,
-          "multi-exchange running set not supported yet"
-          " (current=%s, requested=%s)",
-          m->arr[0].exchange_name, exchange);
-    return(FAIL);
-  }
 
   market_id = wm_market_lookup_or_create(exchange, base, quote, product_id);
 
@@ -973,7 +1028,8 @@ wm_market_add(whenmoon_state_t *st,
 }
 
 bool
-wm_market_remove(whenmoon_state_t *st, const char *product_id,
+wm_market_remove(whenmoon_state_t *st,
+    const char *exchange, const char *product_id,
     bool persist, bool *was_present, char *err, size_t err_cap)
 {
   whenmoon_markets_t *m;
@@ -988,14 +1044,15 @@ wm_market_remove(whenmoon_state_t *st, const char *product_id,
   if(err != NULL && err_cap > 0)
     err[0] = '\0';
 
-  if(st == NULL || st->markets == NULL || product_id == NULL)
+  if(st == NULL || st->markets == NULL || exchange == NULL
+      || product_id == NULL)
   {
     if(err != NULL) snprintf(err, err_cap, "bad args");
     return(FAIL);
   }
 
   m  = st->markets;
-  mk = wm_market_find(m, product_id);
+  mk = wm_market_find(m, exchange, product_id);
 
   if(mk == NULL)
     return(SUCCESS);  // benign no-op; was_present stays false

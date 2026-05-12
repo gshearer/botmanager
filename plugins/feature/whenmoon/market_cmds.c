@@ -140,7 +140,7 @@ wm_market_cmd_stop(const cmd_ctx_t *ctx)
 
   wm_market_format_id(exch, base, quote, id_str, sizeof(id_str));
 
-  if(wm_market_remove(st, symbol, true, &was_present,
+  if(wm_market_remove(st, exch, symbol, true, &was_present,
          err, sizeof(err)) != SUCCESS)
   {
     snprintf(reply, sizeof(reply), "market stop failed: %s",

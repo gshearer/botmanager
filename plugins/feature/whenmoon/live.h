@@ -35,15 +35,14 @@ void wm_live_engine_destroy(void);
 void wm_live_engine_start(void);
 
 // Hook called from market.c after the active product list mutates.
-// (Re)subscribes the user-channel WS for the live trader against the
-// supplied `exchange_name`, gated on credentials — when no creds are
-// configured the hook is a no-op. Pass n_products = 0 to tear the
-// subscription down (e.g. last market removed). KR-2 single-exchange
-// limitation: only one bound exchange at a time; KR-5 will partition.
+// Reconciles the user-channel WS bindings against the current running
+// set: tears down all prior bindings, then groups markets by exchange
+// and (re)subscribes one user-channel WS per exchange whose
+// credentials are configured. Exchanges without credentials are
+// skipped silently — once creds appear the next market mutation will
+// retry. Passing a state with zero markets tears every binding down.
 struct whenmoon_state;
-void wm_live_ws_resub(struct whenmoon_state *st,
-    const char *exchange_name,
-    const char *const *product_ids, size_t n_products);
+void wm_live_ws_resub_all(struct whenmoon_state *st);
 
 // Per-market real-mode market-engine submit. Reads risk gates from
 // `mk->session`, mints a client_order_id, registers a pending row in

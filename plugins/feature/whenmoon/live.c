@@ -19,9 +19,11 @@
 // exists — registration of the exchange (creds present, market in
 // REAL mode) is the only gate beyond the per-market risk caps.
 //
-// KR-2 single-exchange WS state: g_live owns one user-channel sub at
-// a time, bound to whichever exchange the market set shares. KR-5
-// will partition this when a second exchange enters the running set.
+// User-channel WS state: g_live carries an array of per-exchange
+// bindings. wm_live_ws_resub_all walks the running market set and
+// reconciles one binding per distinct exchange whose credentials are
+// available. Exchanges without creds are skipped (next market
+// mutation retries).
 //
 // Locking:
 //   - g_live.mu protects g_live.last_fills_cursor_ms.
@@ -61,16 +63,23 @@
 // Engine global state                                                     //
 // ----------------------------------------------------------------------- //
 
+typedef struct
+{
+  char                 exchange_name[EXCHANGE_NAME_SZ];
+  exchange_ws_sub_t   *ws_sub;
+} wm_live_ws_binding_t;
+
 static struct
 {
   pthread_mutex_t      mu;
 
   bool                 initialized;
 
-  // WS user-channel subscription. Bound to whichever exchange the
-  // running market set shares (one at a time today; KR-5 partitions).
-  exchange_ws_sub_t   *ws_sub;
-  char                 ws_exchange[EXCHANGE_NAME_SZ];
+  // Per-exchange user-channel bindings. One slot per distinct
+  // exchange in the running set with credentials configured. Rebuilt
+  // wholesale on every wm_live_ws_resub_all call.
+  wm_live_ws_binding_t ws_bindings[WM_LIVE_MAX_EXCHANGES];
+  uint32_t             n_ws_bindings;
   whenmoon_state_t    *ws_st;
 
   // REST /fills safety-net poll periodic.
@@ -118,17 +127,20 @@ wm_live_engine_destroy(void)
   task_cancel(g_live.fills_poll_task);
   g_live.fills_poll_task = TASK_HANDLE_NONE;
 
-  // Drop WS subscription before destroying the lock — the WS reader
+  // Drop WS subscriptions before destroying the lock — the WS reader
   // can fire callbacks on a worker thread; better to let those see
   // g_live.initialized = false (still true here, but the ws_sub
-  // pointer null-out below means no new events).
-  if(g_live.ws_sub != NULL)
+  // null-out below means no new events).
+  for(uint32_t i = 0; i < g_live.n_ws_bindings; i++)
   {
-    exchange_ws_unsubscribe(g_live.ws_exchange, g_live.ws_sub);
-    g_live.ws_sub = NULL;
+    if(g_live.ws_bindings[i].ws_sub != NULL)
+      exchange_ws_unsubscribe(g_live.ws_bindings[i].exchange_name,
+          g_live.ws_bindings[i].ws_sub);
+    g_live.ws_bindings[i].ws_sub           = NULL;
+    g_live.ws_bindings[i].exchange_name[0] = '\0';
   }
-  g_live.ws_exchange[0] = '\0';
-  g_live.ws_st = NULL;
+  g_live.n_ws_bindings = 0;
+  g_live.ws_st         = NULL;
 
   pthread_mutex_destroy(&g_live.mu);
   g_live.initialized = false;
@@ -705,59 +717,119 @@ wm_live_ws_user_event_cb(const exchange_ws_event_t *ev, void *user)
 // ----------------------------------------------------------------------- //
 
 void
-wm_live_ws_resub(whenmoon_state_t *st,
-    const char *exchange_name,
-    const char *const *product_ids, size_t n_products)
+wm_live_ws_resub_all(whenmoon_state_t *st)
 {
   static const exchange_ws_channel_t channels[] = { EXCH_WS_USER };
-  exchange_capabilities_t            caps;
+  whenmoon_markets_t                *m;
+  const char                       **pid_ptrs;
+  uint32_t                           i;
+  uint32_t                           j;
 
   if(!g_live.initialized) return;
 
-  if(g_live.ws_sub != NULL)
+  for(i = 0; i < g_live.n_ws_bindings; i++)
   {
-    exchange_ws_unsubscribe(g_live.ws_exchange, g_live.ws_sub);
-    g_live.ws_sub          = NULL;
-    g_live.ws_exchange[0]  = '\0';
+    if(g_live.ws_bindings[i].ws_sub != NULL)
+      exchange_ws_unsubscribe(g_live.ws_bindings[i].exchange_name,
+          g_live.ws_bindings[i].ws_sub);
+    g_live.ws_bindings[i].ws_sub           = NULL;
+    g_live.ws_bindings[i].exchange_name[0] = '\0';
   }
+  g_live.n_ws_bindings = 0;
+  g_live.ws_st         = st;
 
-  g_live.ws_st = st;
-
-  if(n_products == 0 || product_ids == NULL
-      || exchange_name == NULL || exchange_name[0] == '\0')
+  if(st == NULL || st->markets == NULL || st->markets->n_markets == 0)
     return;
 
-  // Creds are required for the user channel; the exchange-side
-  // subscribe FAILs closed when they are absent. Skip silently — once
-  // creds appear the next market mutation will retry.
-  if(exchange_get_capabilities(exchange_name, &caps) != SUCCESS
-      || !caps.has_credentials)
+  m = st->markets;
+
+  pid_ptrs = mem_alloc("whenmoon.live", "ws_pids",
+      sizeof(*pid_ptrs) * m->n_markets);
+
+  if(pid_ptrs == NULL)
   {
-    clam(CLAM_DEBUG, WM_LIVE_CTX,
-        "user-channel sub deferred: no creds for %s yet",
-        exchange_name);
+    clam(CLAM_WARN, WM_LIVE_CTX, "user-channel resub alloc failed");
     return;
   }
 
-  if(exchange_ws_subscribe(exchange_name, channels,
-        sizeof(channels) / sizeof(channels[0]),
-        product_ids, (uint32_t)n_products,
-        wm_live_ws_user_event_cb, NULL,
-        &g_live.ws_sub) != SUCCESS || g_live.ws_sub == NULL)
+  // For each distinct exchange in the running set, gather its
+  // product_ids and (if creds are configured) issue one user-channel
+  // subscribe. Capacity, dedup, and skip-on-no-creds mirror the
+  // market-side resub loop.
+  for(i = 0; i < m->n_markets; i++)
   {
-    clam(CLAM_WARN, WM_LIVE_CTX,
-        "user-channel WS subscribe failed (exchange=%s n_products=%zu)",
-        exchange_name, n_products);
-    g_live.ws_sub = NULL;
+    const char             *exch = m->arr[i].exchange_name;
+    exchange_capabilities_t caps;
+    wm_live_ws_binding_t   *b;
+    uint32_t                n_pids;
+    bool                    seen;
+
+    seen = false;
+    for(j = 0; j < g_live.n_ws_bindings; j++)
+    {
+      if(strncmp(g_live.ws_bindings[j].exchange_name, exch,
+            EXCHANGE_NAME_SZ) == 0)
+      {
+        seen = true;
+        break;
+      }
+    }
+
+    if(seen)
+      continue;
+
+    if(g_live.n_ws_bindings >= WM_LIVE_MAX_EXCHANGES)
+    {
+      clam(CLAM_WARN, WM_LIVE_CTX,
+          "user-channel binding cap (%u) reached; %s skipped",
+          (unsigned)WM_LIVE_MAX_EXCHANGES, exch);
+      continue;
+    }
+
+    // Creds are required for the user channel; the exchange-side
+    // subscribe FAILs closed when they are absent. Skip silently —
+    // once creds appear the next market mutation will retry.
+    if(exchange_get_capabilities(exch, &caps) != SUCCESS
+        || !caps.has_credentials)
+    {
+      clam(CLAM_DEBUG, WM_LIVE_CTX,
+          "user-channel sub deferred: no creds for %s yet", exch);
+      continue;
+    }
+
+    n_pids = 0;
+    for(j = i; j < m->n_markets; j++)
+    {
+      if(strncmp(m->arr[j].exchange_name, exch, EXCHANGE_NAME_SZ) == 0)
+        pid_ptrs[n_pids++] = m->arr[j].product_id;
+    }
+
+    b = &g_live.ws_bindings[g_live.n_ws_bindings];
+    snprintf(b->exchange_name, sizeof(b->exchange_name), "%s", exch);
+    b->ws_sub = NULL;
+
+    if(exchange_ws_subscribe(exch, channels,
+          sizeof(channels) / sizeof(channels[0]),
+          pid_ptrs, n_pids,
+          wm_live_ws_user_event_cb, NULL,
+          &b->ws_sub) != SUCCESS || b->ws_sub == NULL)
+    {
+      clam(CLAM_WARN, WM_LIVE_CTX,
+          "user-channel WS subscribe failed (exchange=%s n_products=%u)",
+          exch, (unsigned)n_pids);
+      b->ws_sub = NULL;
+    }
+    else
+    {
+      clam(CLAM_INFO, WM_LIVE_CTX,
+          "user-channel WS subscribed (exchange=%s n_products=%u)",
+          exch, (unsigned)n_pids);
+    }
+
+    g_live.n_ws_bindings++;
   }
-  else
-  {
-    snprintf(g_live.ws_exchange, sizeof(g_live.ws_exchange), "%s",
-        exchange_name);
-    clam(CLAM_INFO, WM_LIVE_CTX,
-        "user-channel WS subscribed (exchange=%s n_products=%zu)",
-        exchange_name, n_products);
-  }
+
+  mem_free(pid_ptrs);
 }
 
 // ----------------------------------------------------------------------- //

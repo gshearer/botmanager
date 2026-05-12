@@ -218,6 +218,25 @@ typedef struct
 struct wm_aggregator;
 struct exchange_ws_sub;
 
+// Per-exchange WebSocket subscription binding. One slot per distinct
+// exchange in the running set; whenmoon_markets carries an array.
+// `exchange_name` mirrors EXCHANGE_NAME_SZ (32) so strategies that
+// include market.h don't need exchange_api.h on the path.
+typedef struct
+{
+#ifdef WHENMOON_INTERNAL
+  char                     exchange_name[EXCHANGE_NAME_SZ];
+#else
+  char                     exchange_name[32];  // mirror EXCHANGE_NAME_SZ
+#endif
+  struct exchange_ws_sub  *ws_sub;
+} wm_market_ws_binding_t;
+
+// Compile-time ceiling on the number of distinct exchanges that can
+// hold an active WS binding. Mirrors WM_LIVE_MAX_EXCHANGES; lifting
+// either is a coordinated change.
+#define WM_MARKET_MAX_WS_BINDINGS  8
+
 typedef struct whenmoon_market
 {
   // Bound exchange's registered name (e.g. "coinbase", "kraken"). Set
@@ -283,22 +302,15 @@ struct whenmoon_markets
   uint32_t                 n_markets;
   uint32_t                 cap;
 
-  // One shared WebSocket subscription covering every product_id +
-  // {TICKER, TRADES}. Bound to the exchange of arr[0] — currently the
-  // entire running set must share one exchange (KR-2 limitation; KR-5
-  // partitions). NULL when n_markets == 0 or exchange_ws_subscribe
-  // failed at resub time. Rebuilt on every add/remove via
-  // exchange_ws_unsubscribe + exchange_ws_subscribe. Opaque to
-  // strategy plugins.
-  struct exchange_ws_sub  *ws_sub;
-
-  // The exchange name `ws_sub` was bound to, so unsubscribe routes
-  // through the right vtable. Set whenever `ws_sub` is non-NULL.
-#ifdef WHENMOON_INTERNAL
-  char                     ws_exchange[EXCHANGE_NAME_SZ];
-#else
-  char                     ws_exchange[32];  // mirror EXCHANGE_NAME_SZ
-#endif
+  // Per-exchange WebSocket bindings covering {TICKER, TRADES}. One
+  // entry per distinct exchange in the running set; the binding's
+  // ws_sub aggregates every product_id from markets bound to that
+  // exchange. Rebuilt wholesale on every add/remove via
+  // wm_market_resub_ws. NULL ws_sub means the most recent subscribe
+  // attempt for that exchange failed; the slot stays so a follow-up
+  // resub retries.
+  wm_market_ws_binding_t   ws_bindings[WM_MARKET_MAX_WS_BINDINGS];
+  uint32_t                 n_ws_bindings;
 };
 
 // Forward decl to keep this header independent of whenmoon.h.
@@ -346,11 +358,14 @@ bool wm_market_add(struct whenmoon_state *st,
 
 // Remove a market from the running set. `persist=true` flips
 // wm_market.enabled = false so the market does not resume on next
-// plugin start. Returns SUCCESS even if the product was not present
-// (benign no-op). When `was_present` is non-NULL, it is set to true
-// iff the product was found in the running set.
+// plugin start. Returns SUCCESS even if the (exchange, product) pair
+// was not present (benign no-op). When `was_present` is non-NULL, it
+// is set to true iff the pair was found in the running set.
+// `exchange` disambiguates same-product entries from different
+// exchanges (e.g. coinbase BTC-USD vs kraken BTC-USD).
 bool wm_market_remove(struct whenmoon_state *st,
-    const char *product_id, bool persist, bool *was_present,
+    const char *exchange, const char *product_id,
+    bool persist, bool *was_present,
     char *err, size_t err_cap);
 
 // Plugin-start restore: enumerate `wm_market` rows with enabled=true
