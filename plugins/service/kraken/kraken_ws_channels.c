@@ -350,8 +350,13 @@ kr_ws_render_frame(char *out, size_t cap, const char *op,
     pos += (size_t)n;
   }
 
+  // Kraken WS v2 requires `req_id` at the top level of the envelope,
+  // not nested inside `params`. A nested req_id is rejected with
+  // "Unsupported field: 'req_id' for subscription type: '<channel>'"
+  // and the subscribe silently fails (no req_id echoed back so the
+  // local ack correlator never gets a hit).
   n = snprintf(out + pos, cap - pos,
-      ",\"req_id\":%u}}", req_id);
+      "},\"req_id\":%u}", req_id);
   if(n < 0 || (size_t)n >= cap - pos) return(0);
   pos += (size_t)n;
 
@@ -451,7 +456,10 @@ kr_ws_reconcile_locked(kr_reconcile_op_t op, const char *token)
 
     s = &kr_ws_ch.slots[i];
 
-    if(!ok)
+    // SUCCESS=false / FAIL=true convention: a raw `!ok` test inverts
+    // the meaning of the return value. Compare against SUCCESS so the
+    // deferred-send branch only fires on actual transport failure.
+    if(ok != SUCCESS)
     {
       clam(CLAM_DEBUG, KR_CTX,
           "ws %s ch=%s sym=%s deferred (send failed; retry on next "
@@ -606,6 +614,26 @@ kr_ws_lower_ascii(char *s)
   }
 }
 
+// Kraken WS v2 emits symbols as `BASE/QUOTE` (e.g. `BTC/USD`), but the
+// abstraction-side product_id used by every downstream consumer
+// (whenmoon's wm_market_find, strategies, the fanout subscriber chain)
+// is the hyphen-separated `BASE-QUOTE` form built by
+// `wm_market_wire_symbol`. Translate in place so consumers can compare
+// product_ids byte-for-byte. Idempotent for already-hyphen forms.
+static void
+kr_ws_symbol_to_abstraction(char *s)
+{
+  size_t i;
+
+  if(s == NULL) return;
+
+  for(i = 0; s[i] != '\0'; i++)
+  {
+    if(s[i] == '/')
+      s[i] = '-';
+  }
+}
+
 // Kraken v2 emits doubles as either bare JSON numbers OR strings
 // (depending on field). Accept both transparently.
 static double
@@ -697,6 +725,8 @@ kr_ws_dispatch_ticker_locked(struct json_object *row, int64_t frame_time_ms)
   if(!json_get_str(row, "symbol", symbol, sizeof(symbol)))
     return;
 
+  kr_ws_symbol_to_abstraction(symbol);
+
   ev.channel = EXCH_WS_TICKER;
   snprintf(ev.product_id, sizeof(ev.product_id), "%s", symbol);
   snprintf(t->product_id, sizeof(t->product_id), "%s", symbol);
@@ -723,6 +753,8 @@ kr_ws_dispatch_trade_row_locked(struct json_object *row, int64_t frame_time_ms)
 
   if(!json_get_str(row, "symbol", symbol, sizeof(symbol)))
     return;
+
+  kr_ws_symbol_to_abstraction(symbol);
 
   ev.channel = EXCH_WS_TRADES;
   snprintf(ev.product_id, sizeof(ev.product_id), "%s", symbol);
@@ -758,6 +790,8 @@ kr_ws_dispatch_ohlc_row_locked(struct json_object *row, int64_t frame_time_ms)
 
   if(!json_get_str(row, "symbol", symbol, sizeof(symbol)))
     return;
+
+  kr_ws_symbol_to_abstraction(symbol);
 
   ev.channel = EXCH_WS_OHLC_1M;
   snprintf(ev.product_id, sizeof(ev.product_id), "%s", symbol);
@@ -814,6 +848,8 @@ kr_ws_dispatch_executions_row_locked(struct json_object *row,
 
   json_get_str(row, "exec_type", exec_type, sizeof(exec_type));
   json_get_str(row, "symbol",    symbol,    sizeof(symbol));
+
+  kr_ws_symbol_to_abstraction(symbol);
 
   is_fill = (strcmp(exec_type, "trade") == 0);
 

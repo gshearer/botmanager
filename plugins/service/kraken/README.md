@@ -110,14 +110,19 @@ Kraken exposes three names per pair:
 
 | Form | Example (BTC/USD) | Where it surfaces |
 |------|-------------------|-------------------|
-| altname | `BTCUSD` | Most REST endpoints accept this. |
+| altname | `XBTUSD` | Most REST endpoints accept this. |
 | canonical | `XXBTZUSD` | Legacy fields; some REST endpoints return this. |
-| wsname | `BTC/USD` | WebSocket v2 subscribe payloads. |
+| wsname | `XBT/USD` | WebSocket v2 subscribe payloads. |
 
-The assetpairs cache (`kraken_pairs.c`, capacity 512) maps any of the
+(`XBT` is Kraken's legacy code for bitcoin. The pair cache normalizes
+abstraction-side ids like `BTC-USD` → `XBTUSD` for matching.)
+
+The assetpairs cache (`kraken_pairs.c`, capacity 2048) maps any of the
 three onto the others. `kr_pair_lookup_rest` / `_ws` translate at the
-call site; cache miss → input passes through unchanged. Refresh on
-`kr_start` + periodically at `plugin.kraken.assetpairs_refresh_sec`.
+call site; cache miss → input passes through unchanged. Refreshed by
+the periodic `kr.assetpairs` task, which fires immediately on
+registration and then on the interval set by
+`plugin.kraken.assetpairs_refresh_sec` (default 86400 s).
 
 ## Namespace split: `plugin.kraken.*` vs `plugin.whenmoon.exchange.kraken.*`
 

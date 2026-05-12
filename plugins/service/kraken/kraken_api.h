@@ -56,9 +56,12 @@
 #define KRAKEN_MAX_FILLS_LIST     100
 #define KRAKEN_MAX_ACCOUNTS        64
 
-// AssetPairs cache capacity. Kraken lists ~700 pairs in 2026; 512 is
-// a soft bound — overflow is logged + the trailing pairs are dropped.
-#define KRAKEN_PAIRS_CAP          512
+// AssetPairs cache capacity. Kraken listed ~1500 online spot pairs as
+// of 2026-05; 2048 leaves headroom for growth. Overflow is logged +
+// the trailing pairs are dropped (which silently breaks lookups for
+// any pair past the cap), so the cap must stay comfortably above
+// Kraken's live count.
+#define KRAKEN_PAIRS_CAP         2048
 
 // Buffer for the err string on every *_result_t. 128 B is enough for
 // the longest Kraken error envelope we surface today.

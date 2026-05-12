@@ -85,7 +85,18 @@ kr_pairs_add(const char *altname, const char *canonical, const char *wsname)
     snprintf(row->canonical, sizeof(row->canonical), "%s", canonical);
 
   if(wsname != NULL)
-    snprintf(row->wsname, sizeof(row->wsname), "%s", wsname);
+  {
+    // Kraken's REST AssetPairs publishes the legacy WebSocket v1 form
+    // (e.g. "XBT/USD"), but WS v2 — which is the only endpoint this
+    // plugin connects to — accepts only the ISO-coded form ("BTC/USD")
+    // and rejects "XBT/USD" with "Currency pair not supported". Strip
+    // the legacy "XBT/" leading prefix before storing so the cache
+    // always returns a v2-compatible wsname.
+    if(strncmp(wsname, "XBT/", 4) == 0)
+      snprintf(row->wsname, sizeof(row->wsname), "BTC/%s", wsname + 4);
+    else
+      snprintf(row->wsname, sizeof(row->wsname), "%s", wsname);
+  }
 
   kr_pairs.count++;
 
@@ -107,15 +118,65 @@ kr_pairs_count(void)
 // ------------------------------------------------------------------
 // Lookups
 //
-// Two reads per lookup are acceptable — the cache is small (~700
-// rows) and refreshes once a day. The linear scan is bounded by the
-// number of registered Kraken pairs.
+// Two reads per lookup are acceptable — the cache refreshes once a
+// day. The linear scan is bounded by the number of registered Kraken
+// pairs (~1500 spot pairs in 2026).
 // ------------------------------------------------------------------
+
+// Normalize a pair token (caller-supplied or cache-row field) for
+// equality comparison: uppercase, strip the conventional separators
+// (`-`, `/`, `_`, space), then rewrite the leading "BTC" → "XBT" so
+// abstraction-side ids that follow ISO conventions (`BTC-USD`) match
+// Kraken's legacy bitcoin code (altname `XBTUSD`, wsname `XBT/USD`).
+//
+// Both sides of the comparison go through the same transform — the
+// canonical form is an internal matching key, never returned to the
+// caller. Output buffer must hold at least 24 chars (Kraken's longest
+// altname is ~16 chars; 24 covers stripped/uppercased headroom).
+static void
+kr_pair_canon(const char *src, char *dst, size_t cap)
+{
+  size_t i;
+  size_t j = 0;
+
+  if(dst == NULL || cap == 0)
+    return;
+
+  dst[0] = '\0';
+
+  if(src == NULL)
+    return;
+
+  for(i = 0; src[i] != '\0' && j + 1 < cap; i++)
+  {
+    char c = src[i];
+
+    if(c == '-' || c == '/' || c == '_' || c == ' ' || c == '.')
+      continue;
+
+    if(c >= 'a' && c <= 'z')
+      c = (char)(c - 32);
+
+    dst[j++] = c;
+  }
+
+  dst[j] = '\0';
+
+  if(j >= 3 && strncmp(dst, "BTC", 3) == 0)
+    memcpy(dst, "XBT", 3);
+}
 
 static const kraken_pair_t *
 kr_pair_find_locked(const char *input)
 {
   uint32_t i;
+  char     want[24];
+  char     have[24];
+
+  kr_pair_canon(input, want, sizeof(want));
+
+  if(want[0] == '\0')
+    return(NULL);
 
   for(i = 0; i < kr_pairs.count; i++)
   {
@@ -127,6 +188,24 @@ kr_pair_find_locked(const char *input)
       return(r);
     if(r->wsname[0]    != '\0' && strcasecmp(input, r->wsname)    == 0)
       return(r);
+
+    kr_pair_canon(r->altname, have, sizeof(have));
+    if(have[0] != '\0' && strcmp(want, have) == 0)
+      return(r);
+
+    if(r->wsname[0] != '\0')
+    {
+      kr_pair_canon(r->wsname, have, sizeof(have));
+      if(have[0] != '\0' && strcmp(want, have) == 0)
+        return(r);
+    }
+
+    if(r->canonical[0] != '\0')
+    {
+      kr_pair_canon(r->canonical, have, sizeof(have));
+      if(have[0] != '\0' && strcmp(want, have) == 0)
+        return(r);
+    }
   }
 
   return(NULL);
