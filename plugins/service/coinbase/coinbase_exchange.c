@@ -263,12 +263,6 @@ cb_exch_is_authenticated(void)
   return(cb_apikey_configured());
 }
 
-static bool
-cb_exch_is_sandbox(void)
-{
-  return(cb_sandbox_enabled());
-}
-
 // Per-call adapter contexts. Sized for trivial forwarding; allocated
 // per dispatch and freed by the adapter cb.
 
@@ -667,7 +661,7 @@ static const exchange_protocol_vtable_t cb_vtable = {
 
   // WM-OR-1 capability hooks.
   .is_authenticated   = cb_exch_is_authenticated,
-  .is_sandbox         = cb_exch_is_sandbox,
+  .is_sandbox         = NULL,
   .place_order_async  = cb_exch_place_order_async,
   .cancel_order_async = cb_exch_cancel_order_async,
   .get_order_async    = cb_exch_get_order_async,
@@ -679,9 +673,5 @@ static const exchange_protocol_vtable_t cb_vtable = {
 bool
 cb_exchange_register_vtable(void)
 {
-  // WM-DC-1: register under the latched name so sandbox and prod
-  // occupy distinct registry slots. cb_active_exchange_name() resolves
-  // to "coinbase-sb" when plugin.coinbase.sandbox is true at plugin
-  // init, "coinbase" otherwise.
-  return(exchange_register(cb_active_exchange_name(), &cb_vtable));
+  return(exchange_register("coinbase", &cb_vtable));
 }

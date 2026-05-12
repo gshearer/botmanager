@@ -110,7 +110,6 @@ typedef struct cb_request
 
 // coinbase_sign.c — URL + credential helpers.
 
-bool    cb_sandbox_enabled(void);
 bool    cb_rest_base_url(char *out, size_t cap);
 bool    cb_ws_base_url(char *out, size_t cap);
 bool    cb_apikey_configured(void);
@@ -142,15 +141,6 @@ bool    cb_cdp_configured(void);
 
 // Release the cached EVP_PKEY + PEM snapshot. Idempotent.
 void    cb_cdp_deinit(void);
-
-// Latch the active exchange name from the sandbox KV. Idempotent;
-// must run before cb_exchange_register_vtable() and before any
-// exchange_request() call inside the plugin. Called from cb_init().
-void          cb_active_name_init(void);
-
-// Stable for the daemon's lifetime: "coinbase" or "coinbase-sb".
-// Returned pointer is to a file-scope static; callers must not free.
-const char *  cb_active_exchange_name(void);
 
 // coinbase_rest.c
 

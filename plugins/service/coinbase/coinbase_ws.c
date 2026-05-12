@@ -169,10 +169,8 @@ cb_ws_init(void)
   // lock-free — the reader polls cb_ws_reconfig_req at the top of each
   // iteration so there is no risk of the caller's thread taking the
   // session lock while kv_set is already holding the KV registry lock.
-  kv_set_cb("plugin.coinbase.ws_enabled",     cb_ws_kv_cb, &cb_ws);
-  kv_set_cb("plugin.coinbase.sandbox",        cb_ws_kv_cb, &cb_ws);
-  kv_set_cb("plugin.coinbase.ws_url_prod",    cb_ws_kv_cb, &cb_ws);
-  kv_set_cb("plugin.coinbase.ws_url_sandbox", cb_ws_kv_cb, &cb_ws);
+  kv_set_cb("plugin.coinbase.ws_enabled", cb_ws_kv_cb, &cb_ws);
+  kv_set_cb("plugin.coinbase.ws_url",      cb_ws_kv_cb, &cb_ws);
 
   // Advanced Trade requires a JWT on every subscribe; if creds arrive
   // after the session opened (freshstart writes them post-launch), a

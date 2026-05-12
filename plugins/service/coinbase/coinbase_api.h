@@ -376,15 +376,6 @@ typedef void (*coinbase_done_fills_cb_t)(
 // and authenticated WebSocket channels are reachable.
 bool coinbase_apikey_configured(void);
 
-// Returns true iff plugin.coinbase.sandbox is set. Stable across the
-// daemon's lifetime — the sandbox flag is read by URL helpers and the
-// exchange-vtable registration at plugin init; freshstart is required
-// to switch environments. Cross-plugin callers (whenmoon) use this to
-// qualify per-environment data such as wm_market.exchange so sandbox
-// and prod rows occupy distinct registry slots and distinct per-pair
-// candle tables.
-bool coinbase_sandbox_active(void);
-
 // Fetch historical candles. `granularity` seconds; `start_ts`/`end_ts`
 // in seconds since epoch (0/0 = server default range ending now). The
 // 300-bucket cap is enforced client-side — violating ranges fail before
@@ -500,30 +491,6 @@ coinbase_apikey_configured(void)
     {
       clam(CLAM_FATAL, "coinbase",
           "dlsym failed: coinbase_apikey_configured");
-      abort();
-    }
-    fn = u.fn;
-    __atomic_store_n(&cached, fn, __ATOMIC_RELEASE);
-  }
-  return(fn());
-}
-
-static inline bool
-coinbase_sandbox_active(void)
-{
-  typedef bool (*fn_t)(void);
-  static fn_t cached = NULL;
-  fn_t        fn     = __atomic_load_n(&cached, __ATOMIC_ACQUIRE);
-
-  if(fn == NULL)
-  {
-    union { void *obj; fn_t fn; } u;
-
-    u.obj = plugin_dlsym("coinbase", "coinbase_sandbox_active");
-    if(u.obj == NULL)
-    {
-      clam(CLAM_FATAL, "coinbase",
-          "dlsym failed: coinbase_sandbox_active");
       abort();
     }
     fn = u.fn;

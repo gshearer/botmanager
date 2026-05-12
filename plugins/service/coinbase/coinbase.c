@@ -17,18 +17,10 @@
 // the core convention.
 
 static const plugin_kv_entry_t cb_kv_schema[] = {
-  // Endpoint selection. Sandbox is for code-shape verification only —
-  // many Advanced Trade endpoints behave differently or are absent
-  // entirely; production testing requires a real key against prod.
-  { "plugin.coinbase.sandbox", KV_BOOL, "false", NULL, NULL, NULL },
-  { "plugin.coinbase.rest_url_prod", KV_STR,
+  { "plugin.coinbase.rest_url", KV_STR,
     "https://api.coinbase.com", NULL, NULL, NULL },
-  { "plugin.coinbase.rest_url_sandbox", KV_STR,
-    "https://api-sandbox.coinbase.com", NULL, NULL, NULL },
-  { "plugin.coinbase.ws_url_prod", KV_STR,
+  { "plugin.coinbase.ws_url",   KV_STR,
     "wss://advanced-trade-ws.coinbase.com", NULL, NULL, NULL },
-  { "plugin.coinbase.ws_url_sandbox", KV_STR,
-    "wss://advanced-trade-ws-sandbox.coinbase.com", NULL, NULL, NULL },
 
   // Coinbase Developer Platform (CDP) creds. Per-request JWT/ES256
   // signed against `plugin.coinbase.creds.private_key_pem`,
@@ -69,15 +61,6 @@ cb_init(void)
 static bool
 cb_start(void)
 {
-  // WM-MR-1: KV values from DB are loaded by now (kv_load runs between
-  // plugin_init_all and plugin_start_all). Latching the active exchange
-  // name and registering with feature_exchange happens here so the slot
-  // matches the persisted plugin.coinbase.sandbox value, not the
-  // kv_register default. WM-DC-1's invariant (registration name shared
-  // with every dispatch) still holds — both reads use the same latched
-  // value.
-  cb_active_name_init();
-
   // EX-1: self-register with the feature_exchange abstraction so
   // candle traffic + private order/account traffic flows through the
   // priority queue + token bucket.
@@ -88,8 +71,7 @@ cb_start(void)
     return(FAIL);
   }
 
-  clam(CLAM_INFO, CB_CTX, "coinbase plugin started as %s",
-      cb_active_exchange_name());
+  clam(CLAM_INFO, CB_CTX, "coinbase plugin started");
 
   cb_ws_start();
 
@@ -109,9 +91,7 @@ cb_deinit(void)
 {
   // Drop our exchange registration first so any in-flight queue is
   // failed back to consumers before we tear down the curl pipeline.
-  // Use the latched active name so prod and sandbox unregister against
-  // the slot they registered into.
-  exchange_unregister(cb_active_exchange_name());
+  exchange_unregister("coinbase");
 
   cb_ws_deinit();            // stops reader, frees transport state
   cb_ws_channels_deinit();   // drops every sub handle + slot state

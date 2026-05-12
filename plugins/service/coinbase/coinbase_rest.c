@@ -510,11 +510,9 @@ coinbase_fetch_candles_async(const char *product_id, int32_t granularity,
   snprintf(r->product_id, sizeof(r->product_id), "%s", product_id);
 
   // Route through the exchange abstraction. The vtable's build_request
-  // / submit will own the curl-level handle; cb_candles_exchange_resp
-  // parses the body and fires r->cb.candles. The active exchange name
-  // (cb_active_exchange_name) matches whichever slot the plugin
-  // registered into at init — "coinbase" or "coinbase-sb" (WM-DC-1).
-  if(exchange_request(cb_active_exchange_name(), prio,
+  // / submit owns the curl-level handle; cb_candles_exchange_resp
+  // parses the body and fires r->cb.candles.
+  if(exchange_request("coinbase", prio,
         EXCHANGE_OP_REST_GET, path, NULL,
         cb_candles_exchange_resp, r) != SUCCESS)
   {

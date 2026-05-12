@@ -37,11 +37,9 @@ Two surfaces, served by the same plugin:
 | REST (Advanced Trade) | `https://api.coinbase.com` | `Authorization: Bearer <jwt>`; per-request ES256 JWT signed by the CDP key | Snapshots (products, ticker, book), historical candles, order management, account balances |
 | WebSocket Feed | `wss://advanced-trade-ws.coinbase.com` | Public channels are unauthenticated; the `user` channel embeds a JWT in the subscribe payload | Live streams: `ticker`, `level2`, `market_trades`, `heartbeats`, `candles`, `status`, authenticated `user` |
 
-Sandbox URLs (`api-sandbox.coinbase.com`,
-`advanced-trade-ws-sandbox.coinbase.com`) are selectable via the
-`plugin.coinbase.sandbox` KV toggle. Sandbox is for code-shape
-verification only — many endpoints behave differently or are absent
-entirely; production testing requires a real key against prod.
+Production endpoints only — Coinbase's sandbox plumbing was ripped in
+KR-1. CDP keys minted against sandbox no longer authenticate; mint a
+prod CDP key if running against this plugin.
 
 ## Layering
 
@@ -69,11 +67,8 @@ Hard layering rules apply (`plugins/service/AGENTS.md`):
 
 | Key | Type | Default | Role |
 |-----|------|---------|------|
-| `plugin.coinbase.sandbox` | BOOL | `false` | Use sandbox URLs. |
-| `plugin.coinbase.rest_url_prod` | STR | `https://api.coinbase.com` | REST base URL (prod). |
-| `plugin.coinbase.rest_url_sandbox` | STR | `https://api-sandbox.coinbase.com` | REST base URL (sandbox). |
-| `plugin.coinbase.ws_url_prod` | STR | `wss://advanced-trade-ws.coinbase.com` | WebSocket URL (prod). |
-| `plugin.coinbase.ws_url_sandbox` | STR | `wss://advanced-trade-ws-sandbox.coinbase.com` | WebSocket URL (sandbox). |
+| `plugin.coinbase.rest_url` | STR | `https://api.coinbase.com` | REST base URL. |
+| `plugin.coinbase.ws_url` | STR | `wss://advanced-trade-ws.coinbase.com` | WebSocket URL. |
 | `plugin.coinbase.creds.key_name` | STR (secret) | `` | CDP key id (`organizations/<org>/apiKeys/<uuid>`). Empty = public-only mode. |
 | `plugin.coinbase.creds.private_key_pem` | STR (secret) | `` | EC P-256 PEM. Literal `\n` escape sequences are unescaped at parse time. |
 | `plugin.coinbase.rest_enabled` | BOOL | `true` | Enable REST dispatcher. |
@@ -114,9 +109,9 @@ plugins and serve different purposes — neither is redundant:
 
 - **`plugin.coinbase.*`** — owned by *this plugin* (the coinbase
   service plugin). Configures *the thing that talks to Coinbase*:
-  REST/WS URLs, credentials, sandbox toggle, WS reconnect backoff,
-  REST timeout. Anything that changes bytes-on-the-wire toward
-  `api.coinbase.com` lives here.
+  REST/WS URLs, credentials, WS reconnect backoff, REST timeout.
+  Anything that changes bytes-on-the-wire toward `api.coinbase.com`
+  lives here.
 
 - **`plugin.whenmoon.exchange.coinbase.*`** — owned by the *whenmoon
   feature plugin* (`plugins/feature/whenmoon/`). Configures

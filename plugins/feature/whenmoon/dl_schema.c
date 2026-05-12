@@ -5,7 +5,6 @@
 #include "whenmoon.h"
 #include "dl_schema.h"
 
-#include "coinbase_api.h"
 #include "db.h"
 
 #include "candle_upsample.sql.h"   // xxd-embedded plpgsql function body
@@ -414,13 +413,6 @@ wm_candle_table_ensure(int32_t market_id, int32_t gran_secs)
 // columns stay NULL until the row is reconciled against a live exchange
 // product list. Never composes SQL with raw user-supplied tokens — every
 // string goes through db_escape first.
-//
-// WM-DC-1: bare "coinbase" inputs are auto-qualified to "coinbase-sb"
-// when sandbox is active so the (exchange, exchange_symbol) unique
-// key isolates sandbox and prod into distinct rows. Already-qualified
-// names pass through unchanged so a sandbox row reloaded by
-// wm_market_restore re-resolves to the same id without double-
-// suffixing.
 int32_t
 wm_market_lookup_or_create(const char *exchange, const char *base_asset,
     const char *quote_asset, const char *exchange_symbol)
@@ -430,7 +422,6 @@ wm_market_lookup_or_create(const char *exchange, const char *base_asset,
   char                *e_base     = NULL;
   char                *e_quote    = NULL;
   char                *e_symbol   = NULL;
-  char                 qual_exchange[32];
   char                 sql[1024];
   int32_t              id        = -1;
 
@@ -438,17 +429,7 @@ wm_market_lookup_or_create(const char *exchange, const char *base_asset,
      quote_asset == NULL || exchange_symbol == NULL)
     return(-1);
 
-  // Qualifier resolution: bare "coinbase" picks up the "-sb" suffix
-  // when sandbox is active so sandbox rows land in their own slot.
-  // Anything else (already-qualified "coinbase-sb", or a future
-  // non-coinbase exchange) passes through verbatim.
-  if(strcmp(exchange, "coinbase") == 0 && coinbase_sandbox_active())
-    snprintf(qual_exchange, sizeof(qual_exchange), "coinbase-sb");
-
-  else
-    snprintf(qual_exchange, sizeof(qual_exchange), "%s", exchange);
-
-  e_exchange = db_escape(qual_exchange);
+  e_exchange = db_escape(exchange);
   e_base     = db_escape(base_asset);
   e_quote    = db_escape(quote_asset);
   e_symbol   = db_escape(exchange_symbol);
@@ -502,7 +483,7 @@ wm_market_lookup_or_create(const char *exchange, const char *base_asset,
   else
     clam(CLAM_WARN, WM_DL_CTX,
         "market create failed for %s:%s:%s (%s): %s",
-        qual_exchange, base_asset, quote_asset, exchange_symbol,
+        exchange, base_asset, quote_asset, exchange_symbol,
         (res != NULL && res->error[0] != '\0')
             ? res->error : "(no driver error)");
 
