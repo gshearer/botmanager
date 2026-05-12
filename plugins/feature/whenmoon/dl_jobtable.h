@@ -54,6 +54,14 @@
 // is microseconds.
 #define WM_DL_JOBS_MAX         4096
 
+// Wall-clock ceiling on wm_dl_jobtable_destroy's drain. By the time
+// destroy runs, curl_begin_shutdown + pool_exit have joined every
+// worker — a non-zero in_flight_count past this point is a leaked
+// decrement, not a slow callback. The destroy logs a per-job snapshot
+// at WARN and proceeds so future regressions are loud instead of
+// silently wedging the daemon.
+#define WM_FS_DRAIN_TIMEOUT_MS  10000
+
 typedef enum
 {
   DL_JOB_QUEUED,

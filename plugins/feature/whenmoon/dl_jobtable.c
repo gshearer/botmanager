@@ -24,6 +24,7 @@
 #include "kv.h"
 #include "pool.h"
 
+#include <errno.h>
 #include <inttypes.h>
 #include <pthread.h>
 #include <stdio.h>
@@ -1004,10 +1005,47 @@ wm_dl_jobtable_destroy(whenmoon_state_t *st)
 
   WM_FS_TRACE_DRAIN("enter", t->in_flight_count);
 
-  while(t->in_flight_count > 0)
+  // Bounded wait: curl_begin_shutdown + pool_exit have already joined
+  // every worker by now, so a non-zero count past the deadline means
+  // a leaked decrement — no callback is coming. Dump per-job state at
+  // WARN so the regression is loud, then proceed; freeing is safe
+  // because no thread can still call wm_dl_job_clear_in_flight.
+  if(t->in_flight_count > 0)
   {
-    pthread_cond_wait(&t->drain, &t->lock);
-    WM_FS_TRACE_DRAIN("wake", t->in_flight_count);
+    struct timespec deadline;
+    int             rc = 0;
+
+    clock_gettime(CLOCK_REALTIME, &deadline);
+    deadline.tv_sec  += WM_FS_DRAIN_TIMEOUT_MS / 1000;
+    deadline.tv_nsec += (long)(WM_FS_DRAIN_TIMEOUT_MS % 1000) * 1000000L;
+
+    if(deadline.tv_nsec >= 1000000000L)
+    {
+      deadline.tv_sec  += 1;
+      deadline.tv_nsec -= 1000000000L;
+    }
+
+    while(t->in_flight_count > 0 && rc != ETIMEDOUT)
+    {
+      rc = pthread_cond_timedwait(&t->drain, &t->lock, &deadline);
+      WM_FS_TRACE_DRAIN("wake", t->in_flight_count);
+    }
+
+    if(t->in_flight_count > 0)
+    {
+      clam(CLAM_WARN, WM_DL_CTX,
+          "destroy drain timed out after %d ms, in_flight=%u —"
+          " proceeding (leaked decrement; per-job snapshot follows)",
+          WM_FS_DRAIN_TIMEOUT_MS, (unsigned)t->in_flight_count);
+
+      for(j = t->jobs_head; j != NULL; j = j->next)
+        clam(CLAM_WARN, WM_DL_CTX,
+            "  job id=%" PRId64 " state=%s in_flight=%d errs=%d/%d"
+            " last_err=\"%s\"",
+            j->id, wm_dl_state_str(j->state),
+            (int)j->in_flight, j->consecutive_errors,
+            WM_DL_PAGE_RETRY_MAX, j->last_err);
+    }
   }
 
   WM_FS_TRACE_DRAIN("exit", t->in_flight_count);
