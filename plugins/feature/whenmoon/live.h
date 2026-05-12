@@ -5,11 +5,11 @@
 //   (under mk->lock) -> exchange_place_order_async(mk->exchange_name, ...).
 //   Fills land asynchronously via the user WS channel + REST /fills poll.
 //
-// Master kill-switch lives at
-// `plugin.whenmoon.exchange.<exchange>.live` (KV_BOOL, default false)
-// — one per registered exchange. Per-market risk caps
-// (daily_loss_bps, max_notional, pending_cap) layer on top once the
-// master is enabled for that exchange.
+// No per-exchange enable switch exists — registration of the exchange
+// (creds present + market in REAL mode) is the only gate beyond the
+// per-market risk caps (daily_loss_bps, max_notional, pending_cap).
+// Operator-side halt is /whenmoon manual, which flips every market into
+// MANUAL mode and short-circuits the real-submit path.
 //
 // Internal to the whenmoon plugin. WHENMOON_INTERNAL gated.
 
@@ -52,11 +52,8 @@ void wm_live_ws_resub(struct whenmoon_state *st,
 // Caller MUST hold `mk->lock`. Returns SUCCESS only when the order was
 // queued at the exchange abstraction; FAIL on gate trip, sizer hold,
 // OOM, or submit error (errbuf populated when non-NULL). FAIL leaves
-// no pending row.
-//
-// Master kill-switch lives at
-// `plugin.whenmoon.exchange.<mk->exchange_name>.live` (KV_BOOL); when
-// missing or false the helper FAILs closed.
+// no pending row. Gate cascade: credentials, daily_loss_bps,
+// pending-cap, max-notional clip.
 bool wm_market_engine_real_submit_locked(whenmoon_market_t *mk,
     char side, double qty, double mark_px, int64_t mark_ms,
     const wm_strategy_signal_t *sig,

@@ -5,6 +5,7 @@
 #include "whenmoon.h"
 #include "backtest.h"
 #include "market.h"
+#include "market_engine.h"
 #include "market_persist.h"
 #include "account.h"
 #include "dl_schema.h"
@@ -228,10 +229,34 @@ static void
 whenmoon_root_cb(const cmd_ctx_t *ctx)
 {
   cmd_reply(ctx,
-      "usage: /whenmoon <market|download|strategy|order|backtest> ..."
-      " (market start|stop|mode|force, download <market>|cancel,"
+      "usage: /whenmoon <market|download|strategy|order|backtest|manual>"
+      " ... (market start|stop|mode|force, download <market>|cancel,"
       " strategy attach|detach|reload, order buy|sell|cancel,"
-      " backtest run)");
+      " backtest run; manual halts every market into MANUAL mode)");
+}
+
+// /whenmoon manual — operator halt. Flips every registered market into
+// MANUAL mode regardless of position state. Synthetic backtest markets
+// are not touched.
+static void
+whenmoon_manual_cb(const cmd_ctx_t *ctx)
+{
+  uint32_t visited       = 0;
+  uint32_t with_position = 0;
+  char     line[160];
+
+  wm_market_halt_all(&visited, &with_position);
+
+  if(visited == 0)
+  {
+    cmd_reply(ctx, "no markets to halt");
+    return;
+  }
+
+  snprintf(line, sizeof(line),
+      "halted %u market%s (%u with open positions)",
+      visited, visited == 1 ? "" : "s", with_position);
+  cmd_reply(ctx, line);
 }
 
 static void
@@ -258,6 +283,25 @@ whenmoon_register_root_verbs(void)
         "Subcommands: market, download, strategy.",
         USERNS_GROUP_ADMIN, 100, CMD_SCOPE_ANY, METHOD_T_ANY,
         whenmoon_root_cb, NULL, NULL, "wm",
+        NULL, 0, NULL, NULL) != SUCCESS)
+    return(FAIL);
+
+  // /whenmoon manual — operator halt. Flips every market in
+  // `whenmoon_state->markets->arr[]` into MANUAL mode, bypassing the
+  // flat-position rule that wm_market_set_mode enforces. Open positions
+  // freeze (no auto-flatten); subsequent strategy signals are
+  // short-circuited at market_engine.c's MANUAL check.
+  if(cmd_register("whenmoon", "manual",
+        "whenmoon manual",
+        "Operator halt: flip every market into MANUAL mode regardless"
+        " of position state. Strategies keep emitting advice but no"
+        " synthetic or real fills are produced. Synthetic backtest"
+        " markets are not touched. Recovery: per-market"
+        " `/whenmoon market mode <id> <paper|real>` (still requires"
+        " flat position) or `/whenmoon market force` to unwind.",
+        NULL,
+        USERNS_GROUP_ADMIN, 100, CMD_SCOPE_ANY, METHOD_T_ANY,
+        whenmoon_manual_cb, NULL, "whenmoon", NULL,
         NULL, 0, NULL, NULL) != SUCCESS)
     return(FAIL);
 
@@ -386,9 +430,10 @@ whenmoon_init(void)
     goto fail;
   }
 
-  // Real-mode kill-switch + per-market submit path. Master kill-switch
-  // (plugin.whenmoon.exchange.coinbase.live, KV_BOOL) defaults to
-  // false so submission FAILs closed until an operator flips it.
+  // Real-mode per-market submit path. Per-market risk caps
+  // (daily_loss_bps, pending-cap, max-notional) gate the cascade;
+  // operator halt is /whenmoon manual which flips every market into
+  // MANUAL mode and short-circuits the submit path on the next signal.
   if(wm_live_engine_init() != SUCCESS)
   {
     clam(CLAM_INFO, WHENMOON_CTX, "wm_live_engine_init failed");

@@ -669,6 +669,66 @@ wm_market_set_mode(const char *market_id_str, wm_market_mode_t mode,
   return(SUCCESS);
 }
 
+// Operator halt. Bypasses wm_market_set_mode's flat-position rule by
+// design — see the header comment.
+void
+wm_market_halt_all(uint32_t *out_visited, uint32_t *out_with_position)
+{
+  whenmoon_state_t   *st;
+  whenmoon_markets_t *m;
+  uint32_t            visited        = 0;
+  uint32_t            with_position  = 0;
+  uint32_t            i;
+
+  st = whenmoon_get_state();
+
+  if(st == NULL || st->markets == NULL)
+    goto out;
+
+  m = st->markets;
+
+  for(i = 0; i < m->n_markets; i++)
+  {
+    whenmoon_market_t *mk = &m->arr[i];
+    wm_market_mode_t   prev;
+    bool               was_long;
+
+    pthread_mutex_lock(&mk->lock);
+
+    prev     = mk->session.mode;
+    was_long = (mk->session.position.side != WM_MARKET_POS_FLAT);
+
+    if(prev != WM_MARKET_MODE_MANUAL)
+      mk->session.mode = WM_MARKET_MODE_MANUAL;
+
+    (void)wm_market_persist_locked(mk);
+
+    pthread_mutex_unlock(&mk->lock);
+
+    visited++;
+
+    if(was_long)
+      with_position++;
+
+    if(prev != WM_MARKET_MODE_MANUAL)
+      clam(CLAM_INFO, WHENMOON_CTX,
+          "market %s mode: %s -> manual (halt%s)",
+          mk->market_id_str, wm_market_mode_name(prev),
+          was_long ? "; position open" : "");
+  }
+
+  clam(CLAM_WARN, WHENMOON_CTX,
+      "operator halt: %u market%s -> manual (%u with open positions)",
+      visited, visited == 1 ? "" : "s", with_position);
+
+out:
+  if(out_visited != NULL)
+    *out_visited = visited;
+
+  if(out_with_position != NULL)
+    *out_with_position = with_position;
+}
+
 void
 wm_market_reset(const char *market_id_str, wm_market_mode_t mode_to_reset)
 {

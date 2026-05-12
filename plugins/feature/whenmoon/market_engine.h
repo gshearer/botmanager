@@ -62,6 +62,21 @@ void wm_market_apply_fill_locked(whenmoon_market_t *mk,
 bool wm_market_set_mode(const char *market_id_str, wm_market_mode_t mode,
     char *errbuf, size_t errbuf_sz);
 
+// Operator halt: flip every registered market into MANUAL mode,
+// bypassing the flat-position rule (the whole point is "stop new
+// orders NOW even on markets mid-trade"). Open positions stay in their
+// current ledger and freeze — strategies still log advice but no new
+// fills are produced until the operator switches the market back
+// (which still requires flat per wm_market_set_mode) or unwinds via
+// /whenmoon market force.
+//
+// Walks `whenmoon_state->markets->arr[]` only (synthetic backtest
+// markets allocated by wm_market_create_synthetic are not in this
+// list and are not touched). Persists each transition. Writes counts
+// into the out-params when non-NULL: total markets visited, count
+// that held an open long position at halt time.
+void wm_market_halt_all(uint32_t *out_visited, uint32_t *out_with_position);
+
 // Reset one stat ledger + clear that mode's fills ring. If
 // `mode_to_reset == mk->session.mode` AND the position is non-flat,
 // the position is also flattened (no synthetic fill — the operator is
@@ -108,8 +123,8 @@ void wm_market_engine_record_external_fill(const char *market_id_str,
 //                     can reply meaningfully; oversell beyond open
 //                     long is silently clipped by apply_fill_locked.
 //   REAL           -> wm_market_engine_real_submit_locked unchanged
-//                     (master kill-switch + credentials + daily-loss
-//                     + pending-cap + max-notional gates apply).
+//                     (credentials + daily-loss + pending-cap +
+//                     max-notional gates apply).
 //
 // Resolved exec px (synth) / limit px (real):
 //   px_override > 0.0   -> use exactly (no synth slippage)

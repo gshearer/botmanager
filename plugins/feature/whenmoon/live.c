@@ -3,19 +3,21 @@
 //
 // One path post-WM-MK-5: wm_market_engine_on_signal calls
 // wm_market_engine_real_submit_locked under mk->lock when
-// session.mode == WM_MARKET_MODE_REAL. That helper runs the master
-// kill-switch + cred + daily-loss + pending-cap + max-notional-clip
-// cascade, registers a wm_market_pending_t in mk->session.pending[],
-// and dispatches exchange_place_order_async on mk->exchange_name.
-// The done callback (wm_live_market_order_done) reaps the pending row
-// on gateway reject or records gateway_accepted=true on accept. Fills
-// land asynchronously through the WS user-channel + REST /fills
-// consumers (wm_live_handle_ws_fill / wm_live_on_fills) which route
-// into wm_market_engine_record_external_fill.
+// session.mode == WM_MARKET_MODE_REAL. That helper runs the cred +
+// daily-loss + pending-cap + max-notional-clip cascade, registers a
+// wm_market_pending_t in mk->session.pending[], and dispatches
+// exchange_place_order_async on mk->exchange_name. The done callback
+// (wm_live_market_order_done) reaps the pending row on gateway reject
+// or records gateway_accepted=true on accept. Fills land asynchronously
+// through the WS user-channel + REST /fills consumers
+// (wm_live_handle_ws_fill / wm_live_on_fills) which route into
+// wm_market_engine_record_external_fill.
 //
-// Master kill-switch: plugin.whenmoon.exchange.<exch>.live (KV_BOOL,
-// default false), one per registered exchange. Operator must opt in
-// explicitly per exchange before any real order leaves the daemon.
+// Operator-side halt: /whenmoon manual flips every market into MANUAL
+// mode (bypassing the flat-position rule), which short-circuits the
+// real-submit path on the next signal. No per-exchange enable switch
+// exists — registration of the exchange (creds present, market in
+// REAL mode) is the only gate beyond the per-market risk caps.
 //
 // KR-2 single-exchange WS state: g_live owns one user-channel sub at
 // a time, bound to whichever exchange the market set shares. KR-5
@@ -37,7 +39,6 @@
 #include "alloc.h"
 #include "clam.h"
 #include "common.h"
-#include "kv.h"
 #include "task.h"
 
 #include "exchange_api.h"
@@ -196,37 +197,6 @@ wm_live_build_place_order_req(exchange_place_order_req_t *out,
   out->post_only = post_only;
 }
 
-// Master kill-switch for the per-market real submit path. Reads the
-// per-exchange KV at plugin.whenmoon.exchange.<exch>.live (KV_BOOL,
-// default false). Lazy-registers on first read so the operator can
-// flip it via `/set kv` even before any other code has touched it.
-// FAILs closed when the KV is missing or false — explicit opt-in is
-// required per exchange.
-static bool
-wm_live_master_live_enabled(const char *exchange_name)
-{
-  char path[160];
-  int  n;
-
-  if(exchange_name == NULL || exchange_name[0] == '\0')
-    return(FAIL);
-
-  n = snprintf(path, sizeof(path),
-      "plugin.whenmoon.exchange.%s.live", exchange_name);
-
-  if(n < 0 || (size_t)n >= sizeof(path))
-    return(FAIL);
-
-  if(!kv_exists(path))
-    (void)kv_register(path, KV_BOOL, "false", NULL, NULL,
-        "Master kill-switch for the per-market real-mode submit"
-        " path on this exchange. Default false; flip to true to"
-        " enable live order placement. Per-market risk caps still"
-        " apply when this is true.");
-
-  return(kv_get_uint(path) != 0);
-}
-
 // ----------------------------------------------------------------------- //
 // Per-market real-mode submit                                             //
 // ----------------------------------------------------------------------- //
@@ -374,19 +344,7 @@ wm_market_engine_real_submit_locked(whenmoon_market_t *mk,
   is_buy   = (side == 'b');
   side_str = is_buy ? "buy" : "sell";
 
-  // Gate 1: master kill-switch for this exchange.
-  if(!wm_live_master_live_enabled(mk->exchange_name))
-  {
-    ERRSET("live trading disabled"
-        " (plugin.whenmoon.exchange.%s.live=false)",
-        mk->exchange_name);
-    clam(CLAM_WARN, WM_LIVE_CTX,
-        "%s real submit refused: live=false (%s)",
-        mk->market_id_str, mk->exchange_name);
-    return(FAIL);
-  }
-
-  // Gate 2: credentials — consult the exchange capability surface.
+  // Gate 1: credentials — consult the exchange capability surface.
   if(exchange_get_capabilities(mk->exchange_name, &caps) != SUCCESS
       || !caps.has_credentials)
   {
@@ -397,7 +355,7 @@ wm_market_engine_real_submit_locked(whenmoon_market_t *mk,
     return(FAIL);
   }
 
-  // Gate 3: daily-loss cap. wm_market_apply_fill_locked maintains the
+  // Gate 2: daily-loss cap. wm_market_apply_fill_locked maintains the
   // daily anchor — we read state here, not compute. Cap of 0 disables
   // the gate.
   starting_cash = mk->session.stats[WM_MARKET_MODE_REAL].starting_cash;
@@ -418,7 +376,7 @@ wm_market_engine_real_submit_locked(whenmoon_market_t *mk,
     return(FAIL);
   }
 
-  // Gate 4: pending-cap.
+  // Gate 3: pending-cap.
   if(mk->session.pending_n >= mk->session.pending_cap)
   {
     ERRSET("pending ring full (n=%u cap=%u)",
@@ -430,7 +388,7 @@ wm_market_engine_real_submit_locked(whenmoon_market_t *mk,
     return(FAIL);
   }
 
-  // Gate 5: max-notional. Clip qty rather than reject — degraded
+  // Gate 4: max-notional. Clip qty rather than reject — degraded
   // sizing matches paper-mode behaviour.
   clipped_qty = qty;
 
@@ -1103,31 +1061,11 @@ wm_live_engine_start(void)
   st = whenmoon_get_state();
   if(st == NULL) return;
 
-  // Pre-register the master kill-switch KV per registered exchange so
-  // operators can `/set kv` it at any time. Lazy-register in
-  // wm_live_master_live_enabled still guards against init-order
-  // regressions.
   if(exchange_name_list(names, WM_LIVE_MAX_EXCHANGES, &n_names) != SUCCESS)
     n_names = 0;
 
   if(n_names > WM_LIVE_MAX_EXCHANGES)
     n_names = WM_LIVE_MAX_EXCHANGES;
-
-  for(i = 0; i < n_names; i++)
-  {
-    char path[160];
-    int  n;
-
-    n = snprintf(path, sizeof(path),
-        "plugin.whenmoon.exchange.%s.live", names[i]);
-
-    if(n > 0 && (size_t)n < sizeof(path))
-      (void)kv_register(path, KV_BOOL, "false", NULL, NULL,
-          "Master kill-switch for the per-market real-mode submit"
-          " path on this exchange. Default false; flip to true to"
-          " enable live order placement. Per-market risk caps still"
-          " apply when this is true.");
-  }
 
   // Seed the global REST-poll cursor at "now - overlap" so the first
   // poll fetches the recent past. Without this seed the first poll

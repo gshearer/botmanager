@@ -32,13 +32,13 @@ A bot that drives a configurable persona over a chat method via an LLM. Classifi
 
 ### Whenmoon Trading + Backtesting (kind: feature) — in scope
 
-A capability layer, not a bot. Whenmoon lives at `plugins/feature/whenmoon/` and is consumed via `/whenmoon` (abbrev `/wm`) verbs from any operator session — there is no whenmoon bot instance. It owns market state, multi-grain candle aggregation (1m → 5m → 15m → 1h → 6h → 1d), a downloader (history backfill with pre-flight gap detection and resume), the strategy registry (loadable `PLUGIN_STRATEGY` plugins), a per-(market, strategy) trade-book registry with paper-mode fill engine, and a snapshot/replay backtest runtime. Strategies emit signals; the trade engine consumes them and fires fills against a synthetic mark for paper, or via the exchange abstraction at `EXCHANGE_PRIO_TRANSACTIONAL` for live (the live gate is unimplemented as of this writing). The exchange abstraction itself is a separate feature plugin at `plugins/feature/exchange/` — it provides a per-exchange priority queue + token bucket + reserved slots over service plugins like coinbase.
+A capability layer, not a bot. Whenmoon lives at `plugins/feature/whenmoon/` and is consumed via `/whenmoon` (abbrev `/wm`) verbs from any operator session — there is no whenmoon bot instance. It owns market state, multi-grain candle aggregation (1m → 5m → 15m → 1h → 6h → 1d), a downloader (history backfill with pre-flight gap detection and resume), the strategy registry (loadable `PLUGIN_STRATEGY` plugins), a single per-market trade engine with three modes (manual / paper / real), and a snapshot/replay backtest runtime. Strategies emit signals; the per-market engine consumes them and either ignores (manual), synthesizes fills against a cached mark (paper), or submits via the exchange abstraction at `EXCHANGE_PRIO_TRANSACTIONAL` (real). Per-market risk caps (daily_loss_bps, max_notional, pending-cap) gate the real path; the operator halt `/whenmoon manual` flips every market into MANUAL mode in one shot, bypassing the flat-position rule. The exchange abstraction itself is a separate feature plugin at `plugins/feature/exchange/` — it provides a per-exchange priority queue + token bucket + reserved slots over service plugins like coinbase and kraken.
 
 **All modes are candle-driven (post-2026-05-03).** Public Coinbase API tiers do not serve deep historical trades, so the bar substrate is built from `wm_candles_<id>_60` and fanned into all higher granularities by the same aggregator that runs live — strategies see the same `mkt->grain_arr[g][i]` surface in every mode. The live WS `matches` channel is consumed in-process by the aggregator (which closes bars and persists them to `wm_candles_<id>_<gran>`) but the per-tick stream is **not** persisted to a `wm_trades_*` tape: the original 2026-04-30 plan kept tick storage for sub-bar microstructure, but no consumer ever read from those rows in any mode, and Coinbase will not sell historical ticks back to fill gaps, so the write path was ripped on 2026-05-03 along with the historical trade-download infrastructure (`DL_JOB_TRADES`, `wm_trade_coverage`, `wm_trade_table_*`, `/whenmoon download trades`). If a future strategy class needs sub-bar features, it adds an in-memory ring keyed off the aggregator and accepts post-startup-only data. Per-granularity history depth is discovered at runtime by `/whenmoon candles probe-depth <market>` (Coinbase's per-gran caps are not authoritatively documented and vary across granularities); cached in `plugin.whenmoon.candles.<gran>.max_lookback_days` and consumed by `/whenmoon download candles <market> max`.
 
 **Strategy ABI (post-2026-04-29).** Strategies are external `.so` plugins so authors can ship closed-source. The supported strategy view of a market is the per-grain bar ring published in `plugins/feature/whenmoon/market.h`: `mkt->grain_arr[g][i]` for `i ∈ [0, grain_n[g])`, with the **newest bar always at `grain_arr[g][grain_n[g] - 1]`** (the aggregator shifts-left on overflow, so the index of the newest slot never drifts). Each `wm_candle_full_t` carries OHLCV plus a fixed 50-slot `ind[]` block populated once per bar close by `wm_indicators_compute_bar` — strategies read `bar->ind[WM_IND_*]` rather than recomputing. The slot enum (SMA-7/20/25/50/200, EMA-9/12/20/26/50, MACD, RSI, Stochastic, CCI, Bollinger + %B, VWAP/OBV/MFI/VPT, ATR/TR/NATR/ADX, ROC/MOM/WILLR/PSAR, microstructure) is versioned via `WM_INDICATOR_SCHEMA_VERSION`; new slots are appended after `WM_IND_RESERVED_BASE` and never shift existing ids. Coinbase / aggregator types stay behind `WHENMOON_INTERNAL` so strategies see only opaque pointers and the public bar surface, not exchange plumbing. The reference strategy at `plugins/feature/whenmoon/strategy/testing/` demonstrates the idiom.
 
-**Trade-book reconcile.** `/show whenmoon trade reconcile <market_id> <strategy>` walks the in-memory book + fills ring under the registry lock and reports cash / position / fees deltas vs the math derived from first principles. Read-only; full reconciliation when `fill_n ≤ WM_FILL_RING_CAP`, anchored at the oldest live fill's `(cash_after, position_after)` when the ring has wrapped (`mode=ring-truncated`). Implementation in `plugins/feature/whenmoon/order.{c,h}`; verb in `trade_cmds.c`.
+**Per-market state inspection.** `/show whenmoon market [<id>]` renders each market's mode, position, last mark, per-mode stats (paper + real ledgers tracked in parallel), and the tail of each mode's fill ring. The WM-MK-5 rip retired the older `/show whenmoon trade *` verb family + per-(market, strategy) `wm_trade_book_t` registry; reconciliation math now lives on `wm_market_session_t` and surfaces through the same observability verb.
 
 This is the canonical "feature plugin" use case: cross-cutting state and verbs that belong to the framework itself, exposed to operators (and to bots via the same command registry) without being mediated by a bot kind. A future "Asset Trading Bot" that converses about trading remains out of scope; whenmoon is the trading runtime, not a chat persona.
 
@@ -213,17 +213,21 @@ and belong to different plugins:
 | Namespace | Owner | Configures |
 |-----------|-------|------------|
 | `plugin.<exch>.*` | service plugin (`plugins/service/<exch>/`) | The thing that talks to the venue: REST/WS URLs, credentials, reconnect backoff, REST timeout, signing state. |
-| `plugin.whenmoon.exchange.<exch>.*` | whenmoon (`plugins/feature/whenmoon/`) | Whenmoon's consumer-side policy: account-poll cadence, per-exchange rate limit, live-trading kill-switch (`live`). |
+| `plugin.whenmoon.exchange.<exch>.*` | whenmoon (`plugins/feature/whenmoon/`) | Whenmoon's consumer-side policy: account-poll cadence, per-exchange rate limit. |
 
 Rule of thumb: if a knob would still apply to a hypothetical second
 consumer of the service plugin, it belongs in `plugin.<exch>.*`. If
 it's specific to whenmoon's behaviour around that exchange, it
 belongs in `plugin.whenmoon.exchange.<exch>.*`.
 
-The live-trading kill-switch is per-exchange
-(`plugin.whenmoon.exchange.<exch>.live`, default false). A single
-operator boot can run coinbase markets live and kraken markets in
-paper, or vice versa.
+Real-money order submission is gated per-market by mode
+(`WM_MARKET_MODE_REAL` on `wm_market_session_t`, set via
+`/whenmoon market mode <id> real`) plus per-market risk caps
+(daily_loss_bps, max_notional, pending-cap). There is no per-exchange
+enable switch — registration of the exchange (creds present, market in
+REAL mode) is sufficient. `/whenmoon manual` is the operator halt:
+flips every market into MANUAL mode in one shot, bypassing the
+flat-position rule.
 
 ## Plugin API
 

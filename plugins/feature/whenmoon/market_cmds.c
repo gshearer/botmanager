@@ -650,7 +650,8 @@ wm_market_register_verbs(void)
   // WM-MK-4: operator-issued forced trade. Bypasses strategy advisors
   // and the MANUAL mode "no auto-action" rule. Same fill-ledger choke
   // points as accepted strategy advice — apply_fill_locked for synth
-  // modes, real_submit_locked (with all five gates) for real mode.
+  // modes, real_submit_locked (with the four real-mode gates) for real
+  // mode.
   if(cmd_register("whenmoon", "force",
         "whenmoon market force <exch>-<base>-<quote>"
         " <buy|sell> <qty> [<px>]",
@@ -658,12 +659,11 @@ wm_market_register_verbs(void)
         " the market's mode gate. Manual + paper modes: synthetic fill"
         " at <px> or last ticker (paper applies synth slippage only on"
         " the fallback path). Real mode: limit order via the exchange"
-        " abstraction (master kill-switch, credentials, daily-loss,"
-        " pending-cap, and max-notional gates apply; fill arrives"
-        " asynchronously). Same fill ledger choke point as accepted"
-        " strategy advice — stats accumulate in the current mode's"
-        " ledger. Refused on sell-against-flat (manual+paper) and"
-        " all five real-mode gate trips.",
+        " abstraction (credentials, daily-loss, pending-cap, and"
+        " max-notional gates apply; fill arrives asynchronously). Same"
+        " fill ledger choke point as accepted strategy advice — stats"
+        " accumulate in the current mode's ledger. Refused on"
+        " sell-against-flat (manual+paper) and any real-mode gate trip.",
         NULL,
         USERNS_GROUP_ADMIN, 100, CMD_SCOPE_ANY, METHOD_T_ANY,
         wm_market_cmd_force, NULL, "whenmoon/market", NULL,
