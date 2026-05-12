@@ -17,17 +17,20 @@
 
 #define WM_COV_LOCK_TAG  "wm_cov:"
 
+// Touching predicate widening for coverage merges. Persistence is
+// 1-minute-only so the gap is fixed at two 1m buckets — adjacent
+// paginations merge even when the boundary candle is half-formed.
+#define WM_COV_TOUCH_GAP_S  (60 * 2)
+
 // Advisory-lock key renderer. Fed to hashtext() via
 // pg_advisory_xact_lock(hashtext(...)) inside the merge transaction.
 // Postgres hashes the bigint result into the lock space; collisions
 // are statistically rare and always harmless (worst case: two
 // unrelated locks serialise briefly).
 static void
-wm_cov_advisory_key(int32_t market_id, int32_t gran_secs,
-    char *out, size_t cap)
+wm_cov_advisory_key(int32_t market_id, char *out, size_t cap)
 {
-  snprintf(out, cap, "%s%" PRId32 ":%" PRId32,
-      WM_COV_LOCK_TAG, market_id, gran_secs);
+  snprintf(out, cap, "%s%" PRId32, WM_COV_LOCK_TAG, market_id);
 }
 
 // --------------------------------------------------------------------
@@ -42,8 +45,8 @@ wm_cov_iv_consistent(const wm_coverage_t *iv)
   {
     clam(CLAM_WARN, WM_DL_CTX,
         "coverage candles iv ts inverted "
-        "(market=%" PRId32 " gran=%" PRId32 " first=%s last=%s)",
-        iv->market_id, iv->granularity, iv->first_ts, iv->last_ts);
+        "(market=%" PRId32 " first=%s last=%s)",
+        iv->market_id, iv->first_ts, iv->last_ts);
     return(FAIL);
   }
 
@@ -65,7 +68,6 @@ wm_cov_check_sanity(const wm_coverage_t *iv)
   char        *e_first_ts = NULL;
   char        *e_last_ts  = NULL;
   char         sql[2048];
-  int32_t      touch_gap  = iv->granularity * 2;
   bool         ok         = SUCCESS;
   int          n;
 
@@ -85,11 +87,10 @@ wm_cov_check_sanity(const wm_coverage_t *iv)
       "               'YYYY-MM-DD HH24:MI:SS.US') || '+00' AS re"
       "  FROM wm_candle_coverage"
       " WHERE market_id = %" PRId32
-      "   AND granularity = %" PRId32
       "   AND range_start <= TIMESTAMPTZ '%s'"
-      "                      + INTERVAL '%" PRId32 " seconds'"
+      "                      + INTERVAL '%d seconds'"
       "   AND range_end   >= TIMESTAMPTZ '%s'"
-      "                      - INTERVAL '%" PRId32 " seconds'"
+      "                      - INTERVAL '%d seconds'"
       "   AND (range_start < TIMESTAMPTZ '%s'"
       "                      - INTERVAL '%d days'"
       "        OR range_end > TIMESTAMPTZ '%s'"
@@ -97,18 +98,16 @@ wm_cov_check_sanity(const wm_coverage_t *iv)
       " ORDER BY range_start"
       " LIMIT 4",
       iv->market_id,
-      iv->granularity,
-      e_last_ts,  touch_gap,
-      e_first_ts, touch_gap,
+      e_last_ts,  WM_COV_TOUCH_GAP_S,
+      e_first_ts, WM_COV_TOUCH_GAP_S,
       e_first_ts, WM_COV_TS_SANITY_DAYS,
       e_last_ts,  WM_COV_TS_SANITY_DAYS);
 
   if(n < 0 || (size_t)n >= sizeof(sql))
   {
     clam(CLAM_WARN, WM_DL_CTX,
-        "coverage sanity sql truncated "
-        "(market=%" PRId32 " gran=%" PRId32 ")",
-        iv->market_id, iv->granularity);
+        "coverage sanity sql truncated (market=%" PRId32 ")",
+        iv->market_id);
     ok = FAIL;
     goto out;
   }
@@ -124,9 +123,8 @@ wm_cov_check_sanity(const wm_coverage_t *iv)
   if(db_query(sql, res) != SUCCESS || !res->ok)
   {
     clam(CLAM_WARN, WM_DL_CTX,
-        "coverage sanity query failed "
-        "(market=%" PRId32 " gran=%" PRId32 "): %s",
-        iv->market_id, iv->granularity,
+        "coverage sanity query failed (market=%" PRId32 "): %s",
+        iv->market_id,
         res->error[0] != '\0' ? res->error : "(no driver error)");
     ok = FAIL;
     goto out;
@@ -136,10 +134,9 @@ wm_cov_check_sanity(const wm_coverage_t *iv)
   {
     clam(CLAM_WARN, WM_DL_CTX,
         "coverage candle merge rejected: %u row(s) >%d days outside iv "
-        "(market=%" PRId32 " gran=%" PRId32 " iv=%s..%s)",
+        "(market=%" PRId32 " iv=%s..%s)",
         res->rows, WM_COV_TS_SANITY_DAYS,
-        iv->market_id, iv->granularity,
-        iv->first_ts, iv->last_ts);
+        iv->market_id, iv->first_ts, iv->last_ts);
 
     for(uint32_t i = 0; i < res->rows; i++)
     {
@@ -180,8 +177,8 @@ out:
 //     has been deleted.
 //   * Exactly one row has been inserted whose interval is the union
 //     of iv and the deleted rows' intervals.
-//   * Per (market, granularity) serialisation held via
-//     pg_advisory_xact_lock for the whole BEGIN...COMMIT.
+//   * Per-market serialisation held via pg_advisory_xact_lock for
+//     the whole BEGIN...COMMIT.
 // --------------------------------------------------------------------
 static bool
 wm_cov_merge_tx(const wm_coverage_t *iv)
@@ -191,12 +188,10 @@ wm_cov_merge_tx(const wm_coverage_t *iv)
   char        *e_last_ts  = NULL;
   char         sql[4096];
   char         lock_key[96];
-  int32_t      touch_gap  = iv->granularity * 2;
   bool         ok = FAIL;
   int          n;
 
-  wm_cov_advisory_key(iv->market_id, iv->granularity,
-      lock_key, sizeof(lock_key));
+  wm_cov_advisory_key(iv->market_id, lock_key, sizeof(lock_key));
 
   e_first_ts = db_escape(iv->first_ts);
   e_last_ts  = db_escape(iv->last_ts);
@@ -205,14 +200,13 @@ wm_cov_merge_tx(const wm_coverage_t *iv)
     goto out;
 
   // Candles touching predicate (timestamp-only — no ID axis to
-  // cross-check). Widened to 2*gran so adjacent paginations merge
-  // even when the boundary candle is half-formed; the sanity
+  // cross-check). Widened to two 1m buckets so adjacent paginations
+  // merge even when the boundary candle is half-formed; the sanity
   // precheck (wm_cov_check_sanity) has already rejected merges that
   // would jump >30 days.
   //   WHERE market_id = :mid
-  //     AND granularity = :gran
-  //     AND range_start <= :iv_end   + :gran*2 seconds
-  //     AND range_end   >= :iv_start - :gran*2 seconds
+  //     AND range_start <= :iv_end   + 120 seconds
+  //     AND range_end   >= :iv_start - 120 seconds
   n = snprintf(sql, sizeof(sql),
     "BEGIN;"
     "SELECT pg_advisory_xact_lock(hashtext('%s'));"
@@ -220,11 +214,10 @@ wm_cov_merge_tx(const wm_coverage_t *iv)
     "  SELECT range_start, range_end"
     "    FROM wm_candle_coverage"
     "   WHERE market_id = %" PRId32
-    "     AND granularity = %" PRId32
     "     AND range_start <= TIMESTAMPTZ '%s'"
-    "                        + INTERVAL '%" PRId32 " seconds'"
+    "                        + INTERVAL '%d seconds'"
     "     AND range_end   >= TIMESTAMPTZ '%s'"
-    "                        - INTERVAL '%" PRId32 " seconds'"
+    "                        - INTERVAL '%d seconds'"
     "   FOR UPDATE"
     "), merged AS ("
     "  SELECT LEAST(MIN(range_start), TIMESTAMPTZ '%s')  AS rs,"
@@ -233,36 +226,32 @@ wm_cov_merge_tx(const wm_coverage_t *iv)
     "), del AS ("
     "  DELETE FROM wm_candle_coverage"
     "   WHERE market_id = %" PRId32
-    "     AND granularity = %" PRId32
     "     AND range_start IN (SELECT range_start FROM touching)"
     "   RETURNING 1"
     ") "
     "INSERT INTO wm_candle_coverage"
-    "   (market_id, granularity, range_start, range_end) "
-    " SELECT %" PRId32 ", %" PRId32 ","
+    "   (market_id, range_start, range_end) "
+    " SELECT %" PRId32 ","
     "        COALESCE((SELECT rs FROM merged), TIMESTAMPTZ '%s'),"
     "        COALESCE((SELECT re FROM merged), TIMESTAMPTZ '%s')"
     " WHERE (SELECT COUNT(*) FROM del) >= 0;"
     "COMMIT;",
     lock_key,
     iv->market_id,
-    iv->granularity,
-    e_last_ts,  touch_gap,
-    e_first_ts, touch_gap,
+    e_last_ts,  WM_COV_TOUCH_GAP_S,
+    e_first_ts, WM_COV_TOUCH_GAP_S,
     e_first_ts,
     e_last_ts,
     iv->market_id,
-    iv->granularity,
     iv->market_id,
-    iv->granularity,
     e_first_ts,
     e_last_ts);
 
   if(n < 0 || (size_t)n >= sizeof(sql))
   {
     clam(CLAM_WARN, WM_DL_CTX,
-        "coverage merge sql truncated (market=%" PRId32 " gran=%" PRId32 ")",
-        iv->market_id, iv->granularity);
+        "coverage merge sql truncated (market=%" PRId32 ")",
+        iv->market_id);
     goto out;
   }
 
@@ -283,8 +272,8 @@ wm_cov_merge_tx(const wm_coverage_t *iv)
     // ROLLBACK needed. libpq reports the first-offending statement's
     // message.
     clam(CLAM_WARN, WM_DL_CTX,
-        "coverage merge failed (market=%" PRId32 " gran=%" PRId32 "): %s",
-        iv->market_id, iv->granularity,
+        "coverage merge failed (market=%" PRId32 "): %s",
+        iv->market_id,
         res->error[0] != '\0' ? res->error : "(no driver error)");
   }
 
@@ -299,7 +288,7 @@ out:
 bool
 wm_coverage_add(const wm_coverage_t *iv)
 {
-  if(iv == NULL || iv->granularity <= 0)
+  if(iv == NULL)
     return(FAIL);
 
   if(wm_cov_iv_consistent(iv) != SUCCESS)
@@ -317,7 +306,6 @@ wm_coverage_add(const wm_coverage_t *iv)
 //   rows := SELECT range_start, range_end
 //             FROM wm_candle_coverage
 //            WHERE market_id   = :mid
-//              AND granularity = :gran
 //              AND range_start < :range_end
 //              AND range_end   > :range_start
 //            ORDER BY range_start
@@ -335,7 +323,7 @@ wm_coverage_add(const wm_coverage_t *iv)
 // --------------------------------------------------------------------
 
 uint32_t
-wm_coverage_gaps_candles(int32_t market_id, int32_t gran_secs,
+wm_coverage_gaps_candles(int32_t market_id,
     const char *range_start, const char *range_end,
     wm_coverage_t *out, uint32_t max_out)
 {
@@ -351,9 +339,6 @@ wm_coverage_gaps_candles(int32_t market_id, int32_t gran_secs,
     return(0);
 
   if(range_start == NULL || range_end == NULL)
-    return(0);
-
-  if(gran_secs <= 0)
     return(0);
 
   if(strcmp(range_end, range_start) <= 0)
@@ -372,11 +357,10 @@ wm_coverage_gaps_candles(int32_t market_id, int32_t gran_secs,
       "               'YYYY-MM-DD HH24:MI:SS.US') || '+00' AS re"
       "  FROM wm_candle_coverage"
       " WHERE market_id = %" PRId32
-      "   AND granularity = %" PRId32
       "   AND range_start < TIMESTAMPTZ '%s'"
       "   AND range_end   > TIMESTAMPTZ '%s'"
       " ORDER BY range_start",
-      market_id, gran_secs, e_end, e_start);
+      market_id, e_end, e_start);
 
   if(n < 0 || (size_t)n >= sizeof(sql))
     goto out;
@@ -389,9 +373,8 @@ wm_coverage_gaps_candles(int32_t market_id, int32_t gran_secs,
   if(db_query(sql, res) != SUCCESS || !res->ok)
   {
     clam(CLAM_WARN, WM_DL_CTX,
-        "coverage gap query failed (market=%" PRId32
-        " gran=%" PRId32 "): %s",
-        market_id, gran_secs,
+        "coverage gap query failed (market=%" PRId32 "): %s",
+        market_id,
         res->error[0] != '\0' ? res->error : "(no driver error)");
     goto out;
   }
@@ -411,8 +394,7 @@ wm_coverage_gaps_candles(int32_t market_id, int32_t gran_secs,
       wm_coverage_t *g = &out[emitted++];
 
       memset(g, 0, sizeof(*g));
-      g->market_id   = market_id;
-      g->granularity = gran_secs;
+      g->market_id = market_id;
       snprintf(g->first_ts, WM_COV_TS_SZ, "%s", prev_end);
       snprintf(g->last_ts,  WM_COV_TS_SZ, "%s", row_first_ts);
     }
@@ -426,8 +408,7 @@ wm_coverage_gaps_candles(int32_t market_id, int32_t gran_secs,
     wm_coverage_t *g = &out[emitted++];
 
     memset(g, 0, sizeof(*g));
-    g->market_id   = market_id;
-    g->granularity = gran_secs;
+    g->market_id = market_id;
     snprintf(g->first_ts, WM_COV_TS_SZ, "%s", prev_end);
     snprintf(g->last_ts,  WM_COV_TS_SZ, "%s", range_end);
   }
@@ -455,7 +436,7 @@ out:
 // --------------------------------------------------------------------
 
 uint32_t
-wm_gap_find_row_gaps(int32_t market_id, int32_t gran_secs,
+wm_gap_find_row_gaps(int32_t market_id,
     const char *range_start, const char *range_end,
     wm_coverage_t *out, uint32_t max_out)
 {
@@ -473,21 +454,17 @@ wm_gap_find_row_gaps(int32_t market_id, int32_t gran_secs,
   if(range_start == NULL || range_end == NULL)
     return(0);
 
-  if(gran_secs <= 0)
-    return(0);
-
   if(strcmp(range_end, range_start) <= 0)
     return(0);
 
-  if(wm_candle_table_name(market_id, gran_secs, table, sizeof(table))
-      != SUCCESS)
+  if(wm_candle_table_name(market_id, table, sizeof(table)) != SUCCESS)
     return(0);
 
   // A brand-new market hits this before any download has created
   // its candle table; the gap query would fail on a missing
   // relation. Materialise the table so the empty-range case
   // resolves cleanly into one whole-window gap.
-  (void)wm_candle_table_ensure(market_id, gran_secs);
+  (void)wm_candle_table_ensure(market_id);
 
   e_start = db_escape(range_start);
   e_end   = db_escape(range_end);
@@ -495,6 +472,7 @@ wm_gap_find_row_gaps(int32_t market_id, int32_t gran_secs,
   if(e_start == NULL || e_end == NULL)
     goto out;
 
+  // Persistence is 1m-only so the LAG gap threshold is fixed at 60s.
   n = snprintf(sql, sizeof(sql),
       "SELECT to_char(first_ts AT TIME ZONE 'UTC',"
       "               'YYYY-MM-DD HH24:MI:SS.US') || '+00' AS rs,"
@@ -522,12 +500,12 @@ wm_gap_find_row_gaps(int32_t market_id, int32_t gran_secs,
       "         WHERE ts >= TIMESTAMPTZ '%s' AND ts <= TIMESTAMPTZ '%s'"
       "      ) lag_q"
       "     WHERE prev_ts IS NOT NULL"
-      "       AND ts - prev_ts > make_interval(secs => %" PRId32 ")"
+      "       AND ts - prev_ts > make_interval(secs => 60)"
       "  ) gaps"
       " ORDER BY first_ts ASC",
       e_start, e_end, table, e_start, e_end, e_end, e_start,
       e_end, table, e_start, e_end, e_end,
-      table, e_start, e_end, gran_secs);
+      table, e_start, e_end);
 
   if(n < 0 || (size_t)n >= sizeof(sql))
     goto out;
@@ -540,9 +518,8 @@ wm_gap_find_row_gaps(int32_t market_id, int32_t gran_secs,
   if(db_query(sql, res) != SUCCESS || !res->ok)
   {
     clam(CLAM_WARN, WM_DL_CTX,
-        "row-gap query failed (market=%" PRId32
-        " gran=%" PRId32 "): %s",
-        market_id, gran_secs,
+        "row-gap query failed (market=%" PRId32 "): %s",
+        market_id,
         res->error[0] != '\0' ? res->error : "(no driver error)");
     goto out;
   }
@@ -559,8 +536,7 @@ wm_gap_find_row_gaps(int32_t market_id, int32_t gran_secs,
     g = &out[emitted++];
 
     memset(g, 0, sizeof(*g));
-    g->market_id   = market_id;
-    g->granularity = gran_secs;
+    g->market_id = market_id;
     snprintf(g->first_ts, WM_COV_TS_SZ, "%s", rs);
     snprintf(g->last_ts,  WM_COV_TS_SZ, "%s", re);
   }

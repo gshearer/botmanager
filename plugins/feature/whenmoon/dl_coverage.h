@@ -24,23 +24,21 @@
 #define WM_COV_TS_SANITY_DAYS        30     // candle out-of-band ceiling
 
 // One contiguous coverage interval. `first_ts` / `last_ts` are
-// authoritative; `granularity` carries the candles bucket size in
-// seconds (must be > 0). All timestamps are Postgres canonical
-// TIMESTAMPTZ strings in UTC form ("YYYY-MM-DD HH:MM:SS+00" or
+// authoritative. All timestamps are Postgres canonical TIMESTAMPTZ
+// strings in UTC form ("YYYY-MM-DD HH:MM:SS+00" or
 // "YYYY-MM-DD HH:MM:SS.ffffff+00").
 typedef struct
 {
   int32_t  market_id;
   char     first_ts[WM_COV_TS_SZ];
   char     last_ts[WM_COV_TS_SZ];
-  int32_t  granularity;
 } wm_coverage_t;
 
 // Merge an interval into the coverage store. Returns SUCCESS on a
 // committed write, FAIL on SQL error. Overlapping and touching rows
 // are unioned under one transaction (see wm_cov_merge_tx for the
 // exact sequence) and serialised against concurrent writers for the
-// same (market, granularity) via pg_advisory_xact_lock.
+// same market via pg_advisory_xact_lock.
 bool wm_coverage_add(const wm_coverage_t *iv);
 
 // Complement of coverage rows in [range_start, range_end). Sorted
@@ -48,15 +46,15 @@ bool wm_coverage_add(const wm_coverage_t *iv);
 // the count actually written. If the complement would exceed max_out,
 // the last slot spans the tail (fine for admin display; callers that
 // need exact lists must grow max_out).
-uint32_t wm_coverage_gaps_candles(int32_t market_id, int32_t gran_secs,
+uint32_t wm_coverage_gaps_candles(int32_t market_id,
     const char *range_start, const char *range_end,
     wm_coverage_t *out, uint32_t max_out);
 
-// Row-level gap walker over `wm_candles_<market_id>_<gran_secs>`.
-// Returns the windows where minute-bars are actually missing from the
-// table in `[range_start, range_end]`: a backward gap if the table's
-// MIN(ts) > range_start, a forward gap if MAX(ts) < range_end, and
-// one entry per internal LAG-detected gap. Sorted ascending.
+// Row-level gap walker over `wm_candles_<market_id>`. Returns the
+// windows where minute-bars are actually missing from the table in
+// `[range_start, range_end]`: a backward gap if the table's MIN(ts)
+// > range_start, a forward gap if MAX(ts) < range_end, and one entry
+// per internal LAG-detected gap. Sorted ascending.
 //
 // Distinct from wm_coverage_gaps_candles: that helper asks "which
 // windows have we never attempted" (coverage-store level); this one
@@ -66,7 +64,7 @@ uint32_t wm_coverage_gaps_candles(int32_t market_id, int32_t gran_secs,
 // `out` is caller-allocated, capacity `max_out`; returns count
 // written. Truncates silently at max_out (caller should bump cap and
 // re-run if it cares about completeness).
-uint32_t wm_gap_find_row_gaps(int32_t market_id, int32_t gran_secs,
+uint32_t wm_gap_find_row_gaps(int32_t market_id,
     const char *range_start, const char *range_end,
     wm_coverage_t *out, uint32_t max_out);
 

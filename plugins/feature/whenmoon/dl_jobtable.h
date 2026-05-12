@@ -75,7 +75,6 @@ struct dl_job
   int64_t          id;                  // wm_download_job.id
   int32_t          market_id;
   dl_job_kind_t    kind;
-  int32_t          granularity;         // candles bucket size (seconds)
 
   // EX-1: priority for the request queue. Set by the enqueue path
   // (EXCHANGE_PRIO_USER_DOWNLOAD for /whenmoon download …,
@@ -118,9 +117,9 @@ struct dl_job
   // whose value is older than WM_DL_STALL_THRESHOLD_MS.
   int64_t          last_progress_ms;
 
-  // Lazy per-pair DDL marker for candles. The candle table name
-  // includes the granularity suffix, so the marker travels with the
-  // job instead of being globally cached.
+  // Lazy per-pair DDL marker for candles. The marker travels with
+  // the job instead of being globally cached so per-market DDL fires
+  // exactly once per job lifetime even on a fresh schema.
   bool             candle_table_ensured;
 
   // Cached exchange symbol used in the hot loop (e.g. "BTC-USD").
@@ -160,7 +159,7 @@ void wm_dl_jobtable_destroy(struct whenmoon_state *st);
 // with the job and is passed to the underlying coinbase_fetch_*_async
 // calls so the exchange abstraction routes accordingly.
 bool wm_dl_job_enqueue(struct whenmoon_state *st,
-    dl_job_kind_t kind, int32_t market_id, int32_t granularity,
+    dl_job_kind_t kind, int32_t market_id,
     uint8_t priority,
     const char *exchange, const char *exchange_symbol,
     const char *oldest_ts, const char *newest_ts,

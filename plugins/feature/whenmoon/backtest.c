@@ -3,7 +3,7 @@
 //
 // One backtest run = (a) pre-flight gap check on the 1m candle
 // coverage; (b) snapshot construction by replaying 1m candles from
-// `wm_candles_<id>_60` through a dedicated aggregator with strategy
+// `wm_candles_<id>` through a dedicated aggregator with strategy
 // fanout disabled; (c) one iteration that walks the snapshot bars
 // chronologically across every grain the strategy subscribes to,
 // firing wm_strategy_on_bar through a per-iteration synthetic market
@@ -142,7 +142,7 @@ wm_backtest_preflight_gap(int32_t market_id_db,
     return(FAIL);
   }
 
-  n = wm_coverage_gaps_candles(market_id_db, 60,
+  n = wm_coverage_gaps_candles(market_id_db,
       range_start, range_end, &gap, 1);
 
   if(n == 0)
@@ -227,8 +227,7 @@ wm_backtest_snapshot_build(int32_t market_id_db,
   if(min_history_1d > history_days)
     history_days = min_history_1d + WM_BACKTEST_HISTORY_HEADROOM_DAYS;
 
-  if(wm_candle_table_name(market_id_db, 60, table, sizeof(table))
-     != SUCCESS)
+  if(wm_candle_table_name(market_id_db, table, sizeof(table)) != SUCCESS)
   {
     if(err != NULL)
       snprintf(err, err_cap, "candle table name overflow");
@@ -238,7 +237,7 @@ wm_backtest_snapshot_build(int32_t market_id_db,
   // Idempotent — the table may not exist if no candles have ever been
   // downloaded (the pre-flight should have caught this, but stay
   // defensive).
-  if(wm_candle_table_ensure(market_id_db, 60) != SUCCESS)
+  if(wm_candle_table_ensure(market_id_db) != SUCCESS)
   {
     if(err != NULL)
       snprintf(err, err_cap, "candle table ensure failed (%s)", table);

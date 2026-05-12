@@ -36,7 +36,7 @@
 // ------------------------------------------------------------------ //
 
 static bool wm_dl_load_jobs(dl_jobtable_t *t);
-static bool wm_dl_insert_job(int32_t market_id, int32_t granularity,
+static bool wm_dl_insert_job(int32_t market_id,
     const char *oldest_ts, const char *newest_ts,
     const char *requested_by, int64_t *out_id);
 static void wm_dl_job_list_append_locked(dl_jobtable_t *t, dl_job_t *j);
@@ -320,7 +320,7 @@ wm_dl_load_jobs(dl_jobtable_t *t)
   // load time so the in-memory list only carries candle jobs the
   // dispatcher knows how to drive.
   if(db_query(
-         "SELECT j.id, j.market_id, j.kind, COALESCE(j.granularity, 0),"
+         "SELECT j.id, j.market_id, j.kind,"
          "       COALESCE(to_char(j.oldest_ts AT TIME ZONE 'UTC',"
          "                        'YYYY-MM-DD HH24:MI:SS') || '+00', ''),"
          "       COALESCE(to_char(j.newest_ts AT TIME ZONE 'UTC',"
@@ -370,41 +370,38 @@ wm_dl_load_jobs(dl_jobtable_t *t)
     j->kind = DL_JOB_CANDLES;
 
     v = db_result_get(res, i, 3);
-    if(v != NULL) j->granularity = (int32_t)strtol(v, NULL, 10);
-
-    v = db_result_get(res, i, 4);
     if(v != NULL) snprintf(j->oldest_ts, sizeof(j->oldest_ts), "%s", v);
 
-    v = db_result_get(res, i, 5);
+    v = db_result_get(res, i, 4);
     if(v != NULL) snprintf(j->newest_ts, sizeof(j->newest_ts), "%s", v);
 
-    v = db_result_get(res, i, 6);
+    v = db_result_get(res, i, 5);
     j->state = wm_dl_state_from_str(v);
 
-    v = db_result_get(res, i, 7);
+    v = db_result_get(res, i, 6);
     if(v != NULL) j->cursor_after = (int64_t)strtoll(v, NULL, 10);
 
-    v = db_result_get(res, i, 8);
+    v = db_result_get(res, i, 7);
     if(v != NULL)
       snprintf(j->cursor_end_ts, sizeof(j->cursor_end_ts), "%s", v);
 
-    v = db_result_get(res, i, 9);
+    v = db_result_get(res, i, 8);
     if(v != NULL) j->pages_fetched = (int32_t)strtol(v, NULL, 10);
 
-    v = db_result_get(res, i, 10);
+    v = db_result_get(res, i, 9);
     if(v != NULL) j->rows_written = (int64_t)strtoll(v, NULL, 10);
 
-    v = db_result_get(res, i, 11);
+    v = db_result_get(res, i, 10);
     if(v != NULL) snprintf(j->last_err, sizeof(j->last_err), "%s", v);
 
-    v = db_result_get(res, i, 12);
+    v = db_result_get(res, i, 11);
     if(v != NULL) snprintf(j->exchange, sizeof(j->exchange), "%s", v);
 
-    v = db_result_get(res, i, 13);
+    v = db_result_get(res, i, 12);
     if(v != NULL)
       snprintf(j->exchange_symbol, sizeof(j->exchange_symbol), "%s", v);
 
-    v = db_result_get(res, i, 14);
+    v = db_result_get(res, i, 13);
     if(v != NULL) j->last_progress_ms = (int64_t)strtoll(v, NULL, 10);
 
     // Restored jobs default to backfill priority — they survived a
@@ -585,7 +582,7 @@ wm_dl_job_persist(dl_jobtable_t *t, const dl_job_t *j)
 // ------------------------------------------------------------------ //
 
 static bool
-wm_dl_insert_job(int32_t market_id, int32_t granularity,
+wm_dl_insert_job(int32_t market_id,
     const char *oldest_ts, const char *newest_ts,
     const char *requested_by, int64_t *out_id)
 {
@@ -594,7 +591,6 @@ wm_dl_insert_job(int32_t market_id, int32_t granularity,
   char        *e_new = NULL;
   char        *e_req = NULL;
   char         sql[2048];
-  char         gran_lit[24];
   char         old_lit[96];
   char         new_lit[96];
   bool         ok    = FAIL;
@@ -611,12 +607,6 @@ wm_dl_insert_job(int32_t market_id, int32_t granularity,
   if(e_req == NULL)
     goto out;
 
-  if(granularity > 0)
-    snprintf(gran_lit, sizeof(gran_lit), "%" PRId32, granularity);
-
-  else
-    snprintf(gran_lit, sizeof(gran_lit), "NULL");
-
   if(e_old != NULL)
     snprintf(old_lit, sizeof(old_lit), "TIMESTAMPTZ '%s'", e_old);
 
@@ -631,13 +621,13 @@ wm_dl_insert_job(int32_t market_id, int32_t granularity,
 
   n = snprintf(sql, sizeof(sql),
       "INSERT INTO wm_download_job"
-      " (market_id, kind, granularity,"
+      " (market_id, kind,"
       "  oldest_ts, newest_ts, state, cursor_after, pages_fetched,"
       "  rows_written, requested_by)"
-      " VALUES (%" PRId32 ", 'candles', %s,"
+      " VALUES (%" PRId32 ", 'candles',"
       "         %s, %s, 'queued', 0, 0, 0, '%s')"
       " RETURNING id",
-      market_id, gran_lit,
+      market_id,
       old_lit, new_lit, e_req);
 
   if(n < 0 || (size_t)n >= sizeof(sql))
@@ -679,7 +669,7 @@ out:
 
 bool
 wm_dl_job_enqueue(whenmoon_state_t *st,
-    dl_job_kind_t kind, int32_t market_id, int32_t granularity,
+    dl_job_kind_t kind, int32_t market_id,
     uint8_t priority,
     const char *exchange, const char *exchange_symbol,
     const char *oldest_ts, const char *newest_ts,
@@ -750,7 +740,7 @@ wm_dl_job_enqueue(whenmoon_state_t *st,
     newest_for_insert = newest_effective;
   }
 
-  if(wm_dl_insert_job(market_id, granularity,
+  if(wm_dl_insert_job(market_id,
          oldest_ts, newest_for_insert, requested_by, &new_id) != SUCCESS)
   {
     snprintf(err, err_cap, "db insert failed");
@@ -769,7 +759,6 @@ wm_dl_job_enqueue(whenmoon_state_t *st,
   j->id               = new_id;
   j->market_id        = market_id;
   j->kind             = kind;
-  j->granularity      = granularity;
   j->priority         = priority;
   j->state            = DL_JOB_QUEUED;
   j->last_progress_ms = wm_dl_now_ms();

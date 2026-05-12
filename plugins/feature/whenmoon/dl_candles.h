@@ -13,7 +13,6 @@
 #include <stdint.h>
 
 #define WM_DL_CANDLE_WINDOW_BUCKETS   300
-#define WM_DL_CANDLE_GRAN_S5           60
 
 // WM-S6: soft cap on rows wm_dl_candles_query_aggregated will fill.
 // 10k rows * 48 bytes/row = 480 KiB — comfortably sized for a
@@ -44,10 +43,7 @@ void     wm_dl_candles_on_page(const coinbase_candles_result_t *res,
 // Batched INSERT of a 0..300-row page. Returns rows_affected (never the
 // page count — ON CONFLICT collapses duplicates).
 uint32_t wm_dl_candles_insert_page(int32_t market_id,
-    int32_t gran_secs, const coinbase_candles_result_t *res);
-
-// WM-S6: gran_secs whitelist check (Coinbase ladder).
-bool     wm_dl_granularity_valid(int32_t gran_secs);
+    const coinbase_candles_result_t *res);
 
 // WM-S6: read the stored 1m-candle table through the
 // wm_candle_upsample plpgsql function and fill `out`. Returns the

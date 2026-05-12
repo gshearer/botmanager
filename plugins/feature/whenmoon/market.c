@@ -898,7 +898,7 @@ wm_market_add(whenmoon_state_t *st,
   wm_market_kick_backfill(st, product_id);
 
   // Schedule the DB warm-up: replay 1m bars from
-  // wm_candles_<id>_60 chronologically into the aggregator. The
+  // wm_candles_<id> chronologically into the aggregator. The
   // deferred task re-resolves the market by product_id at run-time so
   // a stop-before-warm-up bails cleanly. 50 ms after the live-ring
   // backfill kick gives REST a head start without blocking the verb.

@@ -149,7 +149,7 @@ wm_dl_cmd_download_enqueue_gaps(const cmd_ctx_t *ctx,
     job_id = 0;
 
     if(wm_dl_job_enqueue(st, DL_JOB_CANDLES, market_id,
-           WM_DL_CANDLE_GRAN_S5, EXCHANGE_PRIO_USER_DOWNLOAD,
+           EXCHANGE_PRIO_USER_DOWNLOAD,
            exch, symbol,
            gaps[i].first_ts, gaps[i].last_ts,
            ctx->username != NULL ? ctx->username : "",
@@ -176,7 +176,7 @@ wm_dl_cmd_download_enqueue_gaps(const cmd_ctx_t *ctx,
 
 // /whenmoon download <market> [MM/dd/yyyy [MM/dd/yyyy]]
 //
-// Idempotent: scans `wm_candles_<market_id>_60` for row-level gaps in
+// Idempotent: scans `wm_candles_<market_id>` for row-level gaps in
 // the requested window (default = epoch to now, since dl_candles'
 // empty-page termination keeps a too-old start from causing extra
 // work) and fires one DL_JOB_CANDLES per gap. Run as many times as
@@ -279,7 +279,7 @@ wm_dl_cmd_download_market(const cmd_ctx_t *ctx, whenmoon_state_t *st,
     return;
   }
 
-  n_gaps = wm_gap_find_row_gaps(market_id, WM_DL_CANDLE_GRAN_S5,
+  n_gaps = wm_gap_find_row_gaps(market_id,
       range_start, range_end, gaps, WM_DL_GAPS_FANOUT_CAP);
 
   if(n_gaps == 0)
@@ -459,7 +459,6 @@ wm_dl_cmd_show_download_candles(const cmd_ctx_t *ctx)
   whenmoon_state_t  *st;
   const char        *p;
   char               pair[64]   = {0};
-  char               gran_tok[16] = {0};
   char               start_tok[32] = {0};
   char               end_tok[32]   = {0};
   char               exch[32]   = {0};
@@ -471,8 +470,6 @@ wm_dl_cmd_show_download_candles(const cmd_ctx_t *ctx)
   char               header[160];
   char               line[256];
   int32_t            market_id;
-  int32_t            gran;
-  int64_t            gran_parsed;
   uint32_t           n;
   uint32_t           i;
   coinbase_candle_t *rows;
@@ -488,13 +485,12 @@ wm_dl_cmd_show_download_candles(const cmd_ctx_t *ctx)
   p = ctx->args != NULL ? ctx->args : "";
 
   if(!wm_dl_next_token(&p, pair,      sizeof(pair))      ||
-     !wm_dl_next_token(&p, gran_tok,  sizeof(gran_tok))  ||
      !wm_dl_next_token(&p, start_tok, sizeof(start_tok)) ||
      !wm_dl_next_token(&p, end_tok,   sizeof(end_tok)))
   {
     cmd_reply(ctx,
         "usage: /show whenmoon download candles"
-        " <exch>-<base>-<quote> <gran_secs>"
+        " <exch>-<base>-<quote>"
         " <MM/dd/yyyy> <MM/dd/yyyy>");
     return;
   }
@@ -506,19 +502,6 @@ wm_dl_cmd_show_download_candles(const cmd_ctx_t *ctx)
     cmd_reply(ctx, "bad market id (expected <exch>-<base>-<quote>)");
     return;
   }
-
-  gran_parsed = (int64_t)strtoll(gran_tok, NULL, 10);
-
-  if(gran_parsed <= 0 || gran_parsed > INT32_MAX ||
-     !wm_dl_granularity_valid((int32_t)gran_parsed))
-  {
-    cmd_reply(ctx,
-        "invalid gran_secs;"
-        " must be 60, 300, 900, 3600, 21600, or 86400");
-    return;
-  }
-
-  gran = (int32_t)gran_parsed;
 
   if(wm_dl_parse_date(start_tok, start_ts, sizeof(start_ts)) != SUCCESS ||
      wm_dl_parse_date(end_tok,   end_ts,   sizeof(end_ts))   != SUCCESS)
@@ -550,7 +533,10 @@ wm_dl_cmd_show_download_candles(const cmd_ctx_t *ctx)
     return;
   }
 
-  n = wm_dl_candles_query_aggregated(market_id, gran,
+  // Persistence is 1m-only; surface the raw 1m bars through the
+  // upsample helper at gran=60 (a passthrough) so callers see the
+  // same row shape they always did.
+  n = wm_dl_candles_query_aggregated(market_id, 60,
       start_ts, end_ts, rows, WM_DL_CANDLES_OUT_CAP);
 
   if(n == 0)
@@ -561,8 +547,8 @@ wm_dl_cmd_show_download_candles(const cmd_ctx_t *ctx)
   }
 
   snprintf(header, sizeof(header),
-      "candles %s gran=%" PRId32 " %s -> %s (%u rows, CSV)",
-      symbol, gran, start_ts, end_ts, n);
+      "candles %s %s -> %s (%u rows, CSV)",
+      symbol, start_ts, end_ts, n);
   cmd_reply(ctx, header);
   cmd_reply(ctx, "ts_epoch,low,high,open,close,volume");
 
@@ -601,7 +587,7 @@ wm_dl_register_verbs(void)
   if(cmd_register("whenmoon", "download",
         "whenmoon download <exch>-<base>-<quote>"
         " [MM/dd/yyyy [MM/dd/yyyy]] | cancel <job_id>",
-        "Idempotent candle backfill: scans wm_candles_<id>_60 for"
+        "Idempotent candle backfill: scans wm_candles_<id> for"
         " row-level gaps in the requested window (default = epoch to"
         " now) and fires one fetch job per gap. Re-run as needed;"
         " each invocation only refetches what's still missing.",
@@ -633,11 +619,9 @@ wm_dl_register_verbs(void)
 
   if(cmd_register("whenmoon", "candles",
         "show whenmoon download candles"
-        " <exch>-<base>-<quote> <gran_secs>"
+        " <exch>-<base>-<quote>"
         " <MM/dd/yyyy> <MM/dd/yyyy>",
-        "Print aggregated candles over the window, CSV-style,"
-        " upsampled from the stored 1m table."
-        " gran_secs must be 60, 300, 900, 3600, 21600, or 86400.",
+        "Print the stored 1m candles over the window, CSV-style.",
         NULL,
         USERNS_GROUP_ADMIN, 100, CMD_SCOPE_ANY, METHOD_T_ANY,
         wm_dl_cmd_show_download_candles, NULL,

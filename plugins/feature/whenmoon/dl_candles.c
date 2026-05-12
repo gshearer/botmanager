@@ -23,13 +23,6 @@
 
 #define WM_DL_CANDLE_SQL_CAP      32768
 
-// Coinbase granularity ladder. Kept in ascending order so CSV output
-// and validation messages read naturally. 60=1m, 300=5m, 900=15m,
-// 3600=1h, 21600=6h, 86400=1d.
-static const int32_t WM_DL_CANDLE_GRAN_LADDER[] = {
-  60, 300, 900, 3600, 21600, 86400
-};
-
 // ------------------------------------------------------------------ //
 // Time helpers                                                        //
 // ------------------------------------------------------------------ //
@@ -120,20 +113,18 @@ wm_dl_candles_dispatch_one(dl_jobtable_t *t, dl_job_t *j)
   wm_dl_candles_ctx_t *ctx;
   int64_t              end_s;
   int64_t              start_s;
-  int32_t              gran;
 
   if(t == NULL || j == NULL)
     return(FAIL);
-
-  gran = j->granularity > 0 ? j->granularity : WM_DL_CANDLE_GRAN_S5;
 
   end_s = wm_dl_tstz_to_s(j->cursor_end_ts);
 
   if(end_s <= 0)
     end_s = (int64_t)time(NULL);
 
-  end_s   = wm_dl_align_down(end_s, (int64_t)gran);
-  start_s = end_s - (int64_t)WM_DL_CANDLE_WINDOW_BUCKETS * (int64_t)gran;
+  end_s   = wm_dl_align_down(end_s, (int64_t)COINBASE_GRAN_1M);
+  start_s = end_s - (int64_t)WM_DL_CANDLE_WINDOW_BUCKETS
+                  * (int64_t)COINBASE_GRAN_1M;
 
   if(start_s < 0)
     start_s = 0;
@@ -144,7 +135,7 @@ wm_dl_candles_dispatch_one(dl_jobtable_t *t, dl_job_t *j)
   // the round-trip.
   if(!j->candle_table_ensured)
   {
-    if(wm_candle_table_ensure(j->market_id, gran) != SUCCESS)
+    if(wm_candle_table_ensure(j->market_id) != SUCCESS)
     {
       // WM-DL-RACE-1: callback won't fire so record the error here.
       wm_dl_record_dispatch_error(t, j, "candle table_ensure failed");
@@ -170,7 +161,7 @@ wm_dl_candles_dispatch_one(dl_jobtable_t *t, dl_job_t *j)
 
   // Coinbase treats `end` as inclusive; subtract one so the boundary
   // bucket (which starts the next window) doesn't come back twice.
-  if(coinbase_fetch_candles_async(j->exchange_symbol, gran,
+  if(coinbase_fetch_candles_async(j->exchange_symbol, COINBASE_GRAN_1M,
         start_s, end_s - 1, j->priority,
         wm_dl_candles_on_page, ctx) != SUCCESS)
   {
@@ -189,7 +180,7 @@ wm_dl_candles_dispatch_one(dl_jobtable_t *t, dl_job_t *j)
 // ------------------------------------------------------------------ //
 
 uint32_t
-wm_dl_candles_insert_page(int32_t market_id, int32_t gran_secs,
+wm_dl_candles_insert_page(int32_t market_id,
     const coinbase_candles_result_t *res)
 {
   char         table[WM_DL_TABLE_SZ];
@@ -203,8 +194,7 @@ wm_dl_candles_insert_page(int32_t market_id, int32_t gran_secs,
   if(res == NULL || res->count == 0)
     return(0);
 
-  if(wm_candle_table_name(market_id, gran_secs, table, sizeof(table))
-      != SUCCESS)
+  if(wm_candle_table_name(market_id, table, sizeof(table)) != SUCCESS)
     return(0);
 
   sql = mem_alloc("whenmoon.dl", "candle_insert", cap);
@@ -302,7 +292,6 @@ wm_dl_candles_on_page(const coinbase_candles_result_t *res, void *user)
   dl_jobtable_t       *t;
   dl_job_t            *j;
   int32_t              market_id = 0;
-  int32_t              gran      = WM_DL_CANDLE_GRAN_S5;
   uint32_t             inserted  = 0;
   int64_t              oldest_requested_s = 0;
   char                 oldest_bound[40] = {0};
@@ -333,9 +322,7 @@ wm_dl_candles_on_page(const coinbase_candles_result_t *res, void *user)
 
   else
   {
-    market_id            = j->market_id;
-    gran                 = j->granularity > 0
-                         ? j->granularity : WM_DL_CANDLE_GRAN_S5;
+    market_id = j->market_id;
     snprintf(oldest_bound, sizeof(oldest_bound), "%s", j->oldest_ts);
   }
 
@@ -392,7 +379,7 @@ wm_dl_candles_on_page(const coinbase_candles_result_t *res, void *user)
   // table is ensured synchronously in wm_dl_candles_dispatch_one, so
   // there is no DDL race here.
   if(!hit_err && !empty)
-    inserted = wm_dl_candles_insert_page(market_id, gran, res);
+    inserted = wm_dl_candles_insert_page(market_id, res);
 
   // Coverage extension: use the ATTEMPTED window regardless of
   // res->count. A legitimate zero-tick window would otherwise become a
@@ -403,8 +390,7 @@ wm_dl_candles_on_page(const coinbase_candles_result_t *res, void *user)
     wm_coverage_t iv;
 
     memset(&iv, 0, sizeof(iv));
-    iv.market_id   = market_id;
-    iv.granularity = gran;
+    iv.market_id = market_id;
     wm_dl_s_to_tstz(ctx->window_start_s, iv.first_ts, sizeof(iv.first_ts));
     wm_dl_s_to_tstz(ctx->window_end_s,   iv.last_ts,  sizeof(iv.last_ts));
     wm_coverage_add(&iv);
@@ -504,23 +490,6 @@ wm_dl_candles_on_page(const coinbase_candles_result_t *res, void *user)
 // WM-S6 — aggregated candle query                                     //
 // ------------------------------------------------------------------ //
 
-bool
-wm_dl_granularity_valid(int32_t gran_secs)
-{
-  size_t i;
-
-  for(i = 0;
-      i < sizeof(WM_DL_CANDLE_GRAN_LADDER)
-        / sizeof(WM_DL_CANDLE_GRAN_LADDER[0]);
-      i++)
-  {
-    if(WM_DL_CANDLE_GRAN_LADDER[i] == gran_secs)
-      return(true);
-  }
-
-  return(false);
-}
-
 uint32_t
 wm_dl_candles_query_aggregated(int32_t market_id, int32_t gran_secs,
     const char *start_ts, const char *end_ts,
@@ -538,18 +507,16 @@ wm_dl_candles_query_aggregated(int32_t market_id, int32_t gran_secs,
   int          written;
 
   if(out == NULL || cap == 0 ||
-     start_ts == NULL || end_ts == NULL ||
-     !wm_dl_granularity_valid(gran_secs))
+     start_ts == NULL || end_ts == NULL || gran_secs <= 0)
     return(0);
 
-  if(wm_candle_table_name(market_id,
-         WM_DL_CANDLE_GRAN_S5, table, sizeof(table)) != SUCCESS)
+  if(wm_candle_table_name(market_id, table, sizeof(table)) != SUCCESS)
     return(0);
 
   // Ensure the 1m table exists so the upsample function doesn't fail
   // on an unknown market with "relation does not exist". The caller
   // sees "no data" instead.
-  if(wm_candle_table_ensure(market_id, WM_DL_CANDLE_GRAN_S5) != SUCCESS)
+  if(wm_candle_table_ensure(market_id) != SUCCESS)
     return(0);
 
   e_table = db_escape(table);

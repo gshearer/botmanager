@@ -1213,7 +1213,7 @@ wm_backtest_register_verbs(void)
         " [--oos-tail PCT]",
         "Run a single backtest, a parameter sweep, walk-forward, or"
         " an OOS-tail validation.",
-        "Builds an isolated market snapshot from wm_candles_<id>_60"
+        "Builds an isolated market snapshot from wm_candles_<id>"
         " over the given range and runs the strategy through a paper"
         " trade book in PAPER mode. With one or more --sweep axes,"
         " expands the cartesian product of values and dispatches each"

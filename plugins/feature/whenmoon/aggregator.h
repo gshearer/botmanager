@@ -111,7 +111,7 @@ void wm_aggregator_replay_bar(struct whenmoon_market *mk,
 // Warm-up loader. Heap-owned context; the task frees it when done.
 // Re-resolves the market by product_id under the markets container so
 // that a removed market between scheduling and run bails cleanly. Reads
-// `wm_candles_<market_id>_60` chronologically and replays through
+// `wm_candles_<market_id>` chronologically and replays through
 // wm_aggregator_replay_bar so the cascade backfills 5m..1d before any
 // live trade arrives.
 struct whenmoon_state;

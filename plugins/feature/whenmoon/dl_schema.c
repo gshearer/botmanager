@@ -45,11 +45,10 @@ static const char *const wm_dl_ddl_core[] = {
   // Coverage --------------------------------------------------------
   "CREATE TABLE IF NOT EXISTS wm_candle_coverage ("
   " market_id    INT          NOT NULL REFERENCES wm_market(id),"
-  " granularity  INT          NOT NULL,"
   " range_start  TIMESTAMPTZ  NOT NULL,"
   " range_end    TIMESTAMPTZ  NOT NULL,"
   " completed_at TIMESTAMPTZ  NOT NULL DEFAULT NOW(),"
-  " PRIMARY KEY (market_id, granularity, range_start)"
+  " PRIMARY KEY (market_id, range_start)"
   ")",
 
   // Job state — global (no bot binding post-WM-G1).
@@ -63,7 +62,6 @@ static const char *const wm_dl_ddl_core[] = {
   " id               BIGSERIAL    PRIMARY KEY,"
   " market_id        INT          NOT NULL REFERENCES wm_market(id),"
   " kind             VARCHAR(16)  NOT NULL,"
-  " granularity      INT,"
   " oldest_ts        TIMESTAMPTZ,"
   " newest_ts        TIMESTAMPTZ,"
   " state            VARCHAR(16)  NOT NULL,"
@@ -364,16 +362,14 @@ wm_dl_destroy(whenmoon_state_t *st)
 // ------------------------------------------------------------------ //
 
 bool
-wm_candle_table_name(int32_t market_id, int32_t gran_secs,
-    char *out, size_t cap)
+wm_candle_table_name(int32_t market_id, char *out, size_t cap)
 {
   int n;
 
-  if(out == NULL || cap == 0 || market_id < 0 || gran_secs <= 0)
+  if(out == NULL || cap == 0 || market_id < 0)
     return(FAIL);
 
-  n = snprintf(out, cap, "wm_candles_%" PRId32 "_%" PRId32,
-      market_id, gran_secs);
+  n = snprintf(out, cap, "wm_candles_%" PRId32, market_id);
 
   if(n < 0 || (size_t)n >= cap)
     return(FAIL);
@@ -386,14 +382,13 @@ wm_candle_table_name(int32_t market_id, int32_t gran_secs,
 // ------------------------------------------------------------------ //
 
 bool
-wm_candle_table_ensure(int32_t market_id, int32_t gran_secs)
+wm_candle_table_ensure(int32_t market_id)
 {
   char  name[WM_DL_TABLE_SZ];
   char  sql[512];
   int   n;
 
-  if(wm_candle_table_name(market_id, gran_secs, name, sizeof(name))
-     != SUCCESS)
+  if(wm_candle_table_name(market_id, name, sizeof(name)) != SUCCESS)
     return(FAIL);
 
   n = snprintf(sql, sizeof(sql), wm_candle_table_ddl_fmt, name);

@@ -546,8 +546,8 @@ wm_aggregator_load_history_task(task_t *t)
   cap   = mk->grain_cap[WM_GRAN_1M];
   limit = cap > 0 ? cap : 1;
 
-  if(wm_candle_table_name(wctx->market_id, COINBASE_GRAN_1M,
-         table, sizeof(table)) != SUCCESS)
+  if(wm_candle_table_name(wctx->market_id, table, sizeof(table))
+         != SUCCESS)
   {
     mem_free(wctx);
     t->state = TASK_ENDED;
@@ -557,7 +557,7 @@ wm_aggregator_load_history_task(task_t *t)
   // CREATE IF NOT EXISTS so a market that has never been downloaded
   // queries an empty table cleanly rather than erroring on a missing
   // relation.
-  (void)wm_candle_table_ensure(wctx->market_id, COINBASE_GRAN_1M);
+  (void)wm_candle_table_ensure(wctx->market_id);
 
   n = snprintf(sql, sizeof(sql),
       "SELECT (EXTRACT(EPOCH FROM ts)::BIGINT * 1000) AS ts_ms,"

@@ -13,7 +13,7 @@
 --
 -- Invariants:
 --   * p_table_name must be an existing table that matches the
---     wm_candles_<market_id>_60 shape (ts, low, high, open, close,
+--     wm_candles_<market_id> shape (ts, low, high, open, close,
 --     volume). %I-quoted identifiers in EXECUTE protect against
 --     injection.
 --   * p_gran_secs must be one of 60, 300, 900, 3600, 21600, 86400.

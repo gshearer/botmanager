@@ -17,10 +17,10 @@
 #define WM_DL_CTX         "whenmoon.dl"
 
 // Buffer size for per-pair candle table names. The widest name we
-// render is "wm_candles_<int32_t>_<int32_t>" where both int32_ts max
-// out at 10 decimal digits: 11 ("wm_candles_") + 10 + 1 ("_") + 10 +
-// NUL = 33. 40 gives us comfortable slack and aligns nicely.
-#define WM_DL_TABLE_SZ    40
+// render is "wm_candles_<int32_t>" where the int32_t maxes out at 10
+// decimal digits: 11 ("wm_candles_") + 10 + NUL = 22. 32 gives slack
+// and aligns nicely.
+#define WM_DL_TABLE_SZ    32
 
 struct whenmoon_state;
 
@@ -46,17 +46,16 @@ int32_t wm_market_lookup_or_create(const char *exchange,
     const char *base_asset, const char *quote_asset,
     const char *exchange_symbol);
 
-// Candle table-name rendering. Writes "wm_candles_<id>_<gran>" into
-// `out`. Returns SUCCESS on success, FAIL when `out`/`cap` cannot
-// hold the result or `market_id` / `gran_secs` are negative.
-bool wm_candle_table_name(int32_t market_id, int32_t gran_secs,
-    char *out, size_t cap);
+// Candle table-name rendering. Writes "wm_candles_<id>" into `out`.
+// Returns SUCCESS on success, FAIL when `out`/`cap` cannot hold the
+// result or `market_id` is negative.
+bool wm_candle_table_name(int32_t market_id, char *out, size_t cap);
 
 // Lazy per-pair DDL. Idempotent (CREATE TABLE IF NOT EXISTS); safe
 // to call on every page insert. Callers SHOULD cache the "ensured"
 // bit per-job to avoid hammering Postgres with redundant DDL runs in
 // the hot path.
-bool wm_candle_table_ensure(int32_t market_id, int32_t gran_secs);
+bool wm_candle_table_ensure(int32_t market_id);
 
 #endif // WHENMOON_INTERNAL
 
