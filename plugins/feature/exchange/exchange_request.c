@@ -11,6 +11,18 @@
 
 #include <stdio.h>
 #include <string.h>
+#include <time.h>
+
+// Monotonic ms used for the circuit-breaker deadline. CLOCK_MONOTONIC
+// matches the limiter and is immune to wall-clock skew.
+static int64_t
+exchange_now_ms(void)
+{
+  struct timespec ts;
+
+  clock_gettime(CLOCK_MONOTONIC, &ts);
+  return((int64_t)ts.tv_sec * 1000 + (int64_t)ts.tv_nsec / 1000000);
+}
 
 // ------------------------------------------------------------------ //
 // Request lifecycle                                                   //
@@ -183,11 +195,20 @@ exchange_q_push_locked(exchange_t *exch, exchange_req_t *r)
 // token. Returns NULL when the queue is empty or no eligible request can
 // take a token under the reserved-slot policy. On success the limiter
 // has already consumed one token.
+//
+// Circuit-breaker gate runs first: if a recent burst of failures
+// tripped the breaker, refuse every pop until the cooldown deadline
+// passes. The stall pump re-enters dispatch at that moment so the
+// first queued request becomes the implicit recovery probe.
 static exchange_req_t *
 exchange_q_pop_eligible_locked(exchange_t *exch)
 {
   exchange_req_t **pp;
   exchange_req_t  *r;
+
+  if(exch->breaker_tripped_until_ms > 0
+      && exch->breaker_tripped_until_ms > exchange_now_ms())
+    return(NULL);
 
   for(pp = &exch->q_head; *pp != NULL; pp = &(*pp)->next)
   {
@@ -247,17 +268,32 @@ exchange_pump_cb(task_t *t)
 }
 
 // Arm the stall-pump if not already armed. Caller must hold exch->lock.
+//
+// When the breaker is tripped, stretch the delay out to the cooldown
+// deadline so we don't burn a wakeup every second only to refuse the
+// pop again. The bucket-dry path keeps the default 1 s — its dry
+// state can change on any monotonic-tick refill.
 static void
 exchange_arm_pump_locked(exchange_t *exch)
 {
+  uint32_t delay_ms = EXCHANGE_PUMP_DELAY_MS;
+
   if(exch == NULL || exch->dead)
     return;
 
   if(exch->pump_handle != TASK_HANDLE_NONE)
     return;
 
+  if(exch->breaker_tripped_until_ms > 0)
+  {
+    int64_t remaining = exch->breaker_tripped_until_ms - exchange_now_ms();
+
+    if(remaining > (int64_t)delay_ms)
+      delay_ms = (uint32_t)remaining;
+  }
+
   exch->pump_handle = task_add_deferred("exchange_pump", TASK_ANY, 120,
-      EXCHANGE_PUMP_DELAY_MS, exchange_pump_cb, exch);
+      delay_ms, exchange_pump_cb, exch);
 }
 
 // ------------------------------------------------------------------ //
@@ -357,15 +393,66 @@ exchange_internal_response_cb(int http_status, const char *body,
     return;
   }
 
-  // Decrement in-flight regardless of outcome.
-  pthread_mutex_lock(&exch->lock);
-
-  if(exch->limiter.in_flight > 0)
-    exch->limiter.in_flight--;
-
-  pthread_mutex_unlock(&exch->lock);
-
   outcome = exchange_classify_status(http_status, transport_err);
+
+  // One locked section for in-flight bookkeeping + breaker state.
+  // RETRY and FAIL both bump the consecutive-fails counter; only OK
+  // resets it. Crossing the threshold trips the breaker; a failure
+  // after an already-tripped state re-extends the cooldown so the
+  // probe loss doesn't immediately re-permit a burst.
+  {
+    bool tripped_now    = false;
+    bool recovered_now  = false;
+    uint32_t fails_seen = 0;
+
+    pthread_mutex_lock(&exch->lock);
+
+    if(exch->limiter.in_flight > 0)
+      exch->limiter.in_flight--;
+
+    if(http_status == 429)
+      exchange_limiter_penalty_locked(&exch->limiter, 2.0);
+
+    if(outcome == EXCHANGE_OUTCOME_OK)
+    {
+      if(exch->breaker_tripped_until_ms != 0
+          || exch->breaker_consec_fails >= EXCHANGE_BREAKER_THRESHOLD)
+        recovered_now = true;
+
+      fails_seen                     = exch->breaker_consec_fails;
+      exch->breaker_consec_fails     = 0;
+      exch->breaker_tripped_until_ms = 0;
+    }
+
+    else
+    {
+      exch->breaker_consec_fails++;
+      fails_seen = exch->breaker_consec_fails;
+
+      if(fails_seen >= EXCHANGE_BREAKER_THRESHOLD)
+      {
+        if(exch->breaker_tripped_until_ms == 0)
+          tripped_now = true;
+
+        exch->breaker_tripped_until_ms = exchange_now_ms()
+            + EXCHANGE_BREAKER_COOLDOWN_MS;
+      }
+    }
+
+    pthread_mutex_unlock(&exch->lock);
+
+    if(tripped_now)
+      clam(CLAM_WARN, EXCHANGE_CTX,
+          "'%s' circuit breaker tripped (%u consecutive failures); "
+          "dispatch paused for %u ms",
+          exch->name, (unsigned)fails_seen,
+          (unsigned)EXCHANGE_BREAKER_COOLDOWN_MS);
+
+    else if(recovered_now)
+      clam(CLAM_INFO, EXCHANGE_CTX,
+          "'%s' circuit breaker recovered after %u failure(s)",
+          exch->name, (unsigned)fails_seen);
+  }
 
   switch(outcome)
   {
@@ -374,16 +461,6 @@ exchange_internal_response_cb(int http_status, const char *body,
       break;
 
     case EXCHANGE_OUTCOME_RETRY:
-      // 429 imposes a heavier penalty than a generic 5xx so the bucket
-      // throttles itself even if backoff fires before the next refill
-      // finishes.
-      if(http_status == 429)
-      {
-        pthread_mutex_lock(&exch->lock);
-        exchange_limiter_penalty_locked(&exch->limiter, 2.0);
-        pthread_mutex_unlock(&exch->lock);
-      }
-
       exchange_arm_retry(r);
       break;
 

@@ -49,6 +49,20 @@
 // 1 s minimum, so anything <= 1000 here is equivalent.
 #define EXCHANGE_PUMP_DELAY_MS    1000
 
+// Circuit breaker — second line of defence beyond the token bucket.
+// The bucket caps requests-per-second; it cannot stop us from beating
+// on a genuinely broken (or wrongly-credentialed) backend at the cap
+// until every consumer's per-job retry budget is exhausted. Track
+// consecutive non-OK outcomes (RETRY + FAIL — anything that isn't 2xx)
+// per exchange; once the count hits the threshold the exchange "trips"
+// for a cooldown during which dispatch refuses all pops. The first
+// request after cooldown is an implicit probe — a 2xx resets the
+// counter; another failure re-extends the cooldown. No explicit
+// half-open state needed: at the rate-limited cap, at most ~rps
+// further failures slip through before re-trip, which is acceptable.
+#define EXCHANGE_BREAKER_THRESHOLD     10
+#define EXCHANGE_BREAKER_COOLDOWN_MS   30000
+
 // Internal forward decls.
 typedef struct exchange_req       exchange_req_t;
 typedef struct exchange_limiter   exchange_limiter_t;
@@ -142,6 +156,13 @@ struct exchange
   // under e->lock from the pump callback (or by exchange_unregister
   // during teardown). Read/written only under e->lock.
   task_handle_t                     pump_handle;
+
+  // Circuit-breaker state. Both fields read/written only under e->lock.
+  // `breaker_tripped_until_ms == 0` is the "not tripped" sentinel;
+  // any positive value is a monotonic-ms deadline before which pops
+  // are refused.
+  uint32_t                          breaker_consec_fails;
+  int64_t                           breaker_tripped_until_ms;
 
   exchange_t                       *next;   // registry list
 };
