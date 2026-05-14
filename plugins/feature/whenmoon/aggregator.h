@@ -111,6 +111,16 @@ void wm_aggregator_on_trade(struct whenmoon_market *mk,
 void wm_aggregator_replay_bar(struct whenmoon_market *mk,
     wm_gran_t gran, const wm_candle_full_t *bar);
 
+// WM-WARMUP-1: reset grain `gran`'s ring + cursor and replay `bars`
+// (ascending by ts_close_ms) into it with strategy dispatch + cascade
+// suppressed. Recomputes indicators per bar. Push-only — the warmup
+// path fetches every subscribed grain directly, so cascading a
+// replayed bar would double-count a grain that gets its own fetch.
+// Does not free/realloc grain_arr (synthetic markets share the ring
+// pointers); reset-in-place only. Caller holds mk->lock.
+void wm_aggregator_warmup_grain(struct whenmoon_market *mk,
+    wm_gran_t gran, const wm_candle_full_t *bars, uint32_t n);
+
 // Warm-up loader. Heap-owned context; the task frees it when done.
 // Re-resolves the market by product_id under the markets container so
 // that a removed market between scheduling and run bails cleanly. Reads

@@ -214,9 +214,12 @@ typedef struct
   // wm_strategy_on_bar fires only on grains whose bit is set.
   uint16_t                    grains_mask;
 
-  // Per-grain min history (bars). Indexed by wm_gran_t. The aggregator
-  // already keeps generous history; this is informational so future
-  // chunks can pre-flight backtests against insufficient history.
+  // Per-grain min history (bars). Indexed by wm_gran_t. WM-WARMUP-1:
+  // on strategy attach, whenmoon fetches this many bars per subscribed
+  // grain directly from the exchange (capped at the exchange page size
+  // and the grain ring capacity) and seeds the aggregator ring, so the
+  // strategy's indicators are warm at cold start. Also read by the
+  // backtest pre-flight.
   uint32_t                    min_history[WM_GRAN_MAX];
 
   // Param schema. Storage must be static / process-lifetime; the

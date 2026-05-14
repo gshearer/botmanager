@@ -475,6 +475,45 @@ wm_aggregator_replay_bar(whenmoon_market_t *mk, wm_gran_t gran,
       &mk->grain_arr[WM_GRAN_1M][mk->grain_n[WM_GRAN_1M] - 1]);
 }
 
+// Reset grain `gran`'s ring + cursor, then replay `n` bars (which MUST
+// be ascending by ts_close_ms) into it with strategy dispatch
+// suppressed. Recomputes indicators per bar via push_bar. Push-only:
+// does NOT cascade — warmup fetches every subscribed grain directly,
+// so cascading a replayed 5m bar into 15m would double-count a grain
+// that gets its own fetch. Does not free/realloc grain_arr — synthetic
+// backtest markets share the ring pointers; reset-in-place only.
+// Caller holds mk->lock.
+void
+wm_aggregator_warmup_grain(whenmoon_market_t *mk, wm_gran_t gran,
+    const wm_candle_full_t *bars, uint32_t n)
+{
+  wm_aggregator_t *a;
+  bool             saved;
+  uint32_t         i;
+
+  if(mk == NULL || mk->aggregator == NULL || bars == NULL)
+    return;
+
+  if((unsigned)gran >= WM_GRAN_MAX || mk->grain_arr[gran] == NULL)
+    return;
+
+  a = mk->aggregator;
+
+  // Reset ring length + cursor so the replay overwrites from index 0.
+  mk->grain_n[gran]      = 0;
+  a->last_close_ms[gran] = 0;
+
+  // Suppress fan-out across the replay so historical bars do not fire
+  // wm_strategy_dispatch_bar; restore the prior flag after.
+  saved                  = a->dispatch_strategies;
+  a->dispatch_strategies = false;
+
+  for(i = 0; i < n; i++)
+    wm_aggregator_push_bar(mk, gran, &bars[i]);
+
+  a->dispatch_strategies = saved;
+}
+
 // ------------------------------------------------------------------ //
 // Warm-up loader                                                     //
 // ------------------------------------------------------------------ //
