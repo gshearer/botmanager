@@ -22,11 +22,6 @@
 #include "whenmoon_strategy.h"
 #undef WHENMOON_STRATEGY_INTERNAL
 
-// KR-2: aggregator.h is internal-only; it pulls the exchange types
-// directly to size in-struct buffers without depending on market.h
-// (which has a transitive dep back into aggregator.h).
-#include "exchange_api.h"
-
 #include <stdbool.h>
 #include <stdint.h>
 
@@ -122,7 +117,7 @@ void wm_aggregator_warmup_grain(struct whenmoon_market *mk,
     wm_gran_t gran, const wm_candle_full_t *bars, uint32_t n);
 
 // Warm-up loader. Heap-owned context; the task frees it when done.
-// Re-resolves the market by product_id under the markets container so
+// Re-resolves the market by market_id under the markets container so
 // that a removed market between scheduling and run bails cleanly. Reads
 // `wm_candles_<market_id>` chronologically and replays through
 // wm_aggregator_replay_bar so the cascade backfills 5m..1d before any
@@ -134,7 +129,6 @@ typedef struct
 {
   struct whenmoon_state *st;
   int32_t                market_id;
-  char                   product_id[EXCHANGE_PRODUCT_ID_SZ];
 } wm_warmup_ctx_t;
 
 void wm_aggregator_load_history_task(struct task *t);

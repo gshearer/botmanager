@@ -380,27 +380,6 @@ wm_market_lookup_by_id(whenmoon_state_t *st, const char *market_id_str)
   return(NULL);
 }
 
-whenmoon_market_t *
-wm_market_lookup_by_product_id(whenmoon_state_t *st, const char *product_id)
-{
-  whenmoon_markets_t *m;
-  uint32_t            i;
-
-  if(st == NULL || st->markets == NULL || product_id == NULL)
-    return(NULL);
-
-  m = st->markets;
-
-  for(i = 0; i < m->n_markets; i++)
-  {
-    if(strncmp(m->arr[i].product_id, product_id,
-           WM_PRODUCT_ID_SZ) == 0)
-      return(&m->arr[i]);
-  }
-
-  return(NULL);
-}
-
 bool
 wm_market_session_snapshot(whenmoon_market_t *mk,
     wm_market_session_snapshot_t *out)
@@ -996,7 +975,7 @@ wm_market_add(whenmoon_state_t *st,
 
   // Schedule the DB warm-up: replay 1m bars from
   // wm_candles_<id> chronologically into the aggregator. The
-  // deferred task re-resolves the market by product_id at run-time so
+  // deferred task re-resolves the market by market_id at run-time so
   // a stop-before-warm-up bails cleanly. 50 ms after the live-ring
   // backfill kick gives REST a head start without blocking the verb.
   {
@@ -1007,8 +986,6 @@ wm_market_add(whenmoon_state_t *st,
     {
       wctx->st        = st;
       wctx->market_id = market_id;
-      snprintf(wctx->product_id, sizeof(wctx->product_id),
-          "%s", product_id);
 
       if(task_add_deferred("wm_warmup", TASK_ANY, 100, 50,
              wm_aggregator_load_history_task, wctx) == TASK_HANDLE_NONE)

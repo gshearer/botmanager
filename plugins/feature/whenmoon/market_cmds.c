@@ -193,13 +193,11 @@ static void
 wm_market_cmd_indicators(const cmd_ctx_t *ctx)
 {
   whenmoon_state_t   *st;
-  whenmoon_markets_t *m;
   whenmoon_market_t  *mk = NULL;
   const char         *p;
   char                exch[32];
   char                base[16];
   char                quote[16];
-  char                symbol[WM_PRODUCT_ID_SZ];
   char                id_tok[64] = {0};
   char                gran_tok[8] = {0};
   char                tail_tok[16] = {0};
@@ -207,7 +205,6 @@ wm_market_cmd_indicators(const cmd_ctx_t *ctx)
   wm_gran_t           gran;
   wm_candle_full_t    bar;
   uint32_t            n;
-  uint32_t            i;
   char                line[256];
   char                a[32];
   char                b[32];
@@ -239,7 +236,6 @@ wm_market_cmd_indicators(const cmd_ctx_t *ctx)
     return;
   }
 
-  wm_market_wire_symbol(base, quote, symbol, sizeof(symbol));
   wm_market_format_id(exch, base, quote, id_str, sizeof(id_str));
 
   if(!wm_dl_next_token(&p, gran_tok, sizeof(gran_tok)))
@@ -259,17 +255,7 @@ wm_market_cmd_indicators(const cmd_ctx_t *ctx)
   // Optional `latest` keyword for forward-compat.
   (void)wm_dl_next_token(&p, tail_tok, sizeof(tail_tok));
 
-  m = st->markets;
-
-  for(i = 0; i < m->n_markets; i++)
-  {
-    if(strncmp(m->arr[i].product_id, symbol,
-           WM_PRODUCT_ID_SZ) == 0)
-    {
-      mk = &m->arr[i];
-      break;
-    }
-  }
+  mk = wm_market_lookup_by_id(st, id_str);
 
   if(mk == NULL)
   {

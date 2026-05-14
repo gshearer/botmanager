@@ -518,24 +518,23 @@ wm_aggregator_warmup_grain(whenmoon_market_t *mk, wm_gran_t gran,
 // Warm-up loader                                                     //
 // ------------------------------------------------------------------ //
 
-// Look up a market by product_id under its containing whenmoon state.
+// Look up a market by market_id under its containing whenmoon state.
 // Returns NULL if the bot has been torn down or the market removed
 // since the warmup task was scheduled.
 static whenmoon_market_t *
-wm_warmup_find_market(whenmoon_state_t *st, const char *product_id)
+wm_warmup_find_market(whenmoon_state_t *st, int32_t market_id)
 {
   whenmoon_markets_t *m;
   uint32_t            i;
 
-  if(st == NULL || st->markets == NULL || product_id == NULL)
+  if(st == NULL || st->markets == NULL || market_id < 0)
     return(NULL);
 
   m = st->markets;
 
   for(i = 0; i < m->n_markets; i++)
   {
-    if(strncmp(m->arr[i].product_id, product_id,
-           WM_PRODUCT_ID_SZ) == 0)
+    if(m->arr[i].market_id == market_id)
       return(&m->arr[i]);
   }
 
@@ -567,13 +566,13 @@ wm_aggregator_load_history_task(task_t *t)
     return;
   }
 
-  mk = wm_warmup_find_market(wctx->st, wctx->product_id);
+  mk = wm_warmup_find_market(wctx->st, wctx->market_id);
 
   if(mk == NULL || mk->aggregator == NULL)
   {
     clam(CLAM_INFO, WHENMOON_CTX,
-        "warmup %s: market gone before run, skipping",
-        wctx->product_id);
+        "warmup market_id=%" PRId32 ": market gone before run, skipping",
+        wctx->market_id);
     mem_free(wctx);
     t->state = TASK_ENDED;
     return;
@@ -626,7 +625,7 @@ wm_aggregator_load_history_task(task_t *t)
   {
     clam(CLAM_INFO, WHENMOON_CTX,
         "warmup %s: query failed (%s) — bot starts cold",
-        wctx->product_id,
+        mk->market_id_str,
         res->error[0] != '\0' ? res->error : "(no driver error)");
     db_result_free(res);
     mem_free(wctx);
@@ -638,7 +637,7 @@ wm_aggregator_load_history_task(task_t *t)
   {
     clam(CLAM_INFO, WHENMOON_CTX,
         "warmup %s: no rows in %s — bot starts cold",
-        wctx->product_id, table);
+        mk->market_id_str, table);
     db_result_free(res);
     mem_free(wctx);
     t->state = TASK_ENDED;
@@ -684,7 +683,7 @@ wm_aggregator_load_history_task(task_t *t)
 
   clam(CLAM_INFO, WHENMOON_CTX,
       "warmup %s: replayed %u 1m bars from %s (cap=%u)",
-      wctx->product_id, replayed, table, cap);
+      mk->market_id_str, replayed, table, cap);
 
   db_result_free(res);
   mem_free(wctx);
