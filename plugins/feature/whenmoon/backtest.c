@@ -387,11 +387,11 @@ wm_backtest_snapshot_build(int32_t market_id_db,
 
   clam(CLAM_INFO, WM_BT_CTX,
       "snapshot built: %s [%s..%s] 1m_bars=%u history=%u days"
-      " (5m=%u 15m=%u 1h=%u 6h=%u 1d=%u)",
+      " (5m=%u 15m=%u 1h=%u 4h=%u 1d=%u)",
       source_market_id, range_start, range_end,
       replayed, history_days,
       snap->mkt.grain_n[WM_GRAN_5M], snap->mkt.grain_n[WM_GRAN_15M],
-      snap->mkt.grain_n[WM_GRAN_1H], snap->mkt.grain_n[WM_GRAN_6H],
+      snap->mkt.grain_n[WM_GRAN_1H], snap->mkt.grain_n[WM_GRAN_4H],
       snap->mkt.grain_n[WM_GRAN_1D]);
 
   db_result_free(res);
@@ -1160,7 +1160,7 @@ wm_bt_walk_build_windows(const wm_bt_walk_spec_t *spec,
       [WM_GRAN_5M]   = 300LL   * 1000LL,
       [WM_GRAN_15M]  = 900LL   * 1000LL,
       [WM_GRAN_1H]   = 3600LL  * 1000LL,
-      [WM_GRAN_6H]   = 21600LL * 1000LL,
+      [WM_GRAN_4H]   = 14400LL * 1000LL,
       [WM_GRAN_1D]   = 86400LL * 1000LL,
     };
 
@@ -1189,7 +1189,7 @@ wm_bt_walk_build_windows(const wm_bt_walk_spec_t *spec,
               ls->meta.min_history[g],
               g == WM_GRAN_1M  ? "1m"  : g == WM_GRAN_5M  ? "5m"  :
               g == WM_GRAN_15M ? "15m" : g == WM_GRAN_1H  ? "1h"  :
-              g == WM_GRAN_6H  ? "6h"  : "1d",
+              g == WM_GRAN_4H  ? "4h"  : "1d",
               needed_days);
         return(FAIL);
       }

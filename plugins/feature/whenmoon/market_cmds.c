@@ -173,7 +173,7 @@ wm_market_parse_gran(const char *tok, wm_gran_t *out)
   if(strcmp(tok, "5m")  == 0) { *out = WM_GRAN_5M;  return(SUCCESS); }
   if(strcmp(tok, "15m") == 0) { *out = WM_GRAN_15M; return(SUCCESS); }
   if(strcmp(tok, "1h")  == 0) { *out = WM_GRAN_1H;  return(SUCCESS); }
-  if(strcmp(tok, "6h")  == 0) { *out = WM_GRAN_6H;  return(SUCCESS); }
+  if(strcmp(tok, "4h")  == 0) { *out = WM_GRAN_4H;  return(SUCCESS); }
   if(strcmp(tok, "1d")  == 0) { *out = WM_GRAN_1D;  return(SUCCESS); }
 
   return(FAIL);
@@ -228,7 +228,7 @@ wm_market_cmd_indicators(const cmd_ctx_t *ctx)
   {
     cmd_reply(ctx,
         "usage: /show whenmoon indicators <exch>-<base>-<quote>"
-        " <1m|5m|15m|1h|6h|1d> latest");
+        " <1m|5m|15m|1h|4h|1d> latest");
     return;
   }
 
@@ -246,13 +246,13 @@ wm_market_cmd_indicators(const cmd_ctx_t *ctx)
   {
     cmd_reply(ctx,
         "usage: /show whenmoon indicators <exch>-<base>-<quote>"
-        " <1m|5m|15m|1h|6h|1d> latest");
+        " <1m|5m|15m|1h|4h|1d> latest");
     return;
   }
 
   if(wm_market_parse_gran(gran_tok, &gran) != SUCCESS)
   {
-    cmd_reply(ctx, "bad granularity (expected 1m|5m|15m|1h|6h|1d)");
+    cmd_reply(ctx, "bad granularity (expected 1m|5m|15m|1h|4h|1d)");
     return;
   }
 
@@ -673,7 +673,7 @@ wm_market_register_verbs(void)
   if(cmd_register("whenmoon", "indicators",
         "show whenmoon indicators <exch>-<base>-<quote> <gran> latest",
         "Print the latest closed bar's indicator block for the named"
-        " market and granularity (1m|5m|15m|1h|6h|1d). NaN slots"
+        " market and granularity (1m|5m|15m|1h|4h|1d). NaN slots"
         " indicate insufficient history for that indicator's window.",
         NULL,
         USERNS_GROUP_ADMIN, 100, CMD_SCOPE_ANY, METHOD_T_ANY,

@@ -47,7 +47,7 @@ extern "C" {
 // Bump on ANY change to the structs / function signatures below.
 // whenmoon's loader reads the strategy's wm_strategy_describe and
 // rejects strategies whose abi_version does not match.
-#define WM_STRATEGY_ABI_VERSION  1
+#define WM_STRATEGY_ABI_VERSION  2
 
 // -----------------------------------------------------------------------
 // Bar / grain / indicator types
@@ -65,7 +65,7 @@ typedef enum
   WM_GRAN_5M,
   WM_GRAN_15M,
   WM_GRAN_1H,
-  WM_GRAN_6H,
+  WM_GRAN_4H,
   WM_GRAN_1D,
   WM_GRAN_MAX
 } wm_gran_t;

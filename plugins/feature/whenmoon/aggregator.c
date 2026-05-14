@@ -2,7 +2,7 @@
 // aggregator.c — multi-grain trade -> candle aggregator.
 //
 // One aggregator per running market. Drives the cascade
-//   trade -> 1m bar -> 5m -> 15m -> 1h -> 6h -> 1d
+//   trade -> 1m bar -> 5m -> 15m -> 1h -> 4h -> 1d
 // closing each grain on accumulator-input thresholds (1m feeds 5m on
 // every 5 closed 1m bars; 5m feeds 15m every 3; etc.). Every closed
 // bar gets pushed onto the corresponding grain ring and triggers a
@@ -35,7 +35,7 @@ const int32_t wm_gran_seconds[WM_GRAN_MAX] =
   300,   // 5m
   900,   // 15m
   3600,  // 1h
-  21600, // 6h
+  14400, // 4h
   86400, // 1d
 };
 
@@ -47,8 +47,8 @@ static const uint32_t wm_inputs_per_grain[WM_GRAN_MAX] =
   [WM_GRAN_5M]  = 5,    // 5  * 1m   = 5m
   [WM_GRAN_15M] = 3,    // 3  * 5m   = 15m
   [WM_GRAN_1H]  = 4,    // 4  * 15m  = 1h
-  [WM_GRAN_6H]  = 6,    // 6  * 1h   = 6h
-  [WM_GRAN_1D]  = 4,    // 4  * 6h   = 1d
+  [WM_GRAN_4H]  = 4,    // 4  * 1h   = 4h
+  [WM_GRAN_1D]  = 6,    // 6  * 4h   = 1d
 };
 
 // Forward decls.
@@ -121,11 +121,11 @@ wm_aggregator_init(whenmoon_market_t *mk, uint32_t history_1d_min)
 
   clam(CLAM_INFO, WHENMOON_CTX,
       "bot market %s: aggregator init history_1d=%u"
-      " (1m=%u 5m=%u 15m=%u 1h=%u 6h=%u 1d=%u)",
+      " (1m=%u 5m=%u 15m=%u 1h=%u 4h=%u 1d=%u)",
       mk->product_id, a->history_1d,
       mk->grain_cap[WM_GRAN_1M], mk->grain_cap[WM_GRAN_5M],
       mk->grain_cap[WM_GRAN_15M], mk->grain_cap[WM_GRAN_1H],
-      mk->grain_cap[WM_GRAN_6H], mk->grain_cap[WM_GRAN_1D]);
+      mk->grain_cap[WM_GRAN_4H], mk->grain_cap[WM_GRAN_1D]);
 
   return(SUCCESS);
 }
@@ -380,7 +380,7 @@ wm_aggregator_push_bar(whenmoon_market_t *mk, wm_gran_t gran,
 }
 
 // ------------------------------------------------------------------ //
-// Cascade (1m -> 5m -> 15m -> 1h -> 6h -> 1d)                        //
+// Cascade (1m -> 5m -> 15m -> 1h -> 4h -> 1d)                        //
 // ------------------------------------------------------------------ //
 
 static void

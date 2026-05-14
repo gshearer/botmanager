@@ -270,7 +270,7 @@ wm_strategy_render_min_history(const cmd_ctx_t *ctx,
     const wm_strategy_meta_t *meta)
 {
   static const char *const labels[WM_GRAN_MAX] = {
-    "1m", "5m", "15m", "1h", "6h", "1d"
+    "1m", "5m", "15m", "1h", "4h", "1d"
   };
 
   char     line[160];

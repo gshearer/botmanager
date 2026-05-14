@@ -729,7 +729,7 @@ wm_market_on_candles(const exchange_candles_result_t *res, void *user)
   // Coinbase returns candles newest-first; replay oldest-first so the
   // aggregator's idempotency check (skip ts <= last_close_ms) prunes
   // duplicates correctly when a later REST page overlaps a prior
-  // warm-up. The replay path drives the cascade so 5m/15m/1h/6h/1d
+  // warm-up. The replay path drives the cascade so 5m/15m/1h/4h/1d
   // grains backfill from this single 1m feed. exchange_candle_t carries
   // bucket open in ms, so bar close = open + 60s.
   for(i = res->count; i > 0; i--)

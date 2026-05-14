@@ -16,7 +16,7 @@
 --     wm_candles_<market_id> shape (ts, low, high, open, close,
 --     volume). %I-quoted identifiers in EXECUTE protect against
 --     injection.
---   * p_gran_secs must be one of 60, 300, 900, 3600, 21600, 86400.
+--   * p_gran_secs must be one of 60, 300, 900, 3600, 14400, 86400.
 --     Any other value raises; callers must pre-validate.
 --   * Window is [p_start_ts, p_end_ts) -- end exclusive. Rows outside
 --     the window are filtered BEFORE grouping, so partial edge buckets
@@ -37,7 +37,7 @@ CREATE OR REPLACE FUNCTION wm_candle_upsample(
   volume DOUBLE PRECISION
 ) LANGUAGE plpgsql AS $$
 BEGIN
-  IF p_gran_secs NOT IN (60, 300, 900, 3600, 21600, 86400) THEN
+  IF p_gran_secs NOT IN (60, 300, 900, 3600, 14400, 86400) THEN
     RAISE EXCEPTION
       'wm_candle_upsample: gran_secs=% not in Coinbase ladder',
       p_gran_secs;

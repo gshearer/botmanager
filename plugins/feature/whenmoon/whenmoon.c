@@ -98,7 +98,7 @@ whenmoon_show_markets_cmd(const cmd_ctx_t *ctx)
     whenmoon_market_t *mk = &m->arr[i];
     double   px;
     int64_t  tick_ms;
-    uint32_t g1m, g5m, g15m, g1h, g6h, g1d;
+    uint32_t g1m, g5m, g15m, g1h, g4h, g1d;
     uint32_t cap1m;
 
     pthread_mutex_lock(&mk->lock);
@@ -108,15 +108,15 @@ whenmoon_show_markets_cmd(const cmd_ctx_t *ctx)
     g5m      = mk->grain_n[WM_GRAN_5M];
     g15m     = mk->grain_n[WM_GRAN_15M];
     g1h      = mk->grain_n[WM_GRAN_1H];
-    g6h      = mk->grain_n[WM_GRAN_6H];
+    g4h      = mk->grain_n[WM_GRAN_4H];
     g1d      = mk->grain_n[WM_GRAN_1D];
     cap1m    = mk->grain_cap[WM_GRAN_1M];
     pthread_mutex_unlock(&mk->lock);
 
     snprintf(line, sizeof(line),
         "  %-24s  last_px=%-14.8g  bars 1m=%u/%u 5m=%u 15m=%u"
-        " 1h=%u 6h=%u 1d=%u  last_tick_ms=%" PRId64,
-        mk->market_id_str, px, g1m, cap1m, g5m, g15m, g1h, g6h, g1d,
+        " 1h=%u 4h=%u 1d=%u  last_tick_ms=%" PRId64,
+        mk->market_id_str, px, g1m, cap1m, g5m, g15m, g1h, g4h, g1d,
         tick_ms);
     cmd_reply(ctx, line);
   }
