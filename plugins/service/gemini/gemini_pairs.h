@@ -29,8 +29,14 @@ void    gem_pairs_deinit(void);
 // `gem_pairs_add` calls populate. The pair refresh helper in
 // gemini_orders.c clears first, then adds every entry from the parsed
 // `/v1/symbols/details` responses.
+//
+// gem_pairs_add returns SUCCESS when the row was committed, FAIL when
+// the cache was full, the inputs were invalid, or a per-currency code
+// overflow was detected. Callers use the return value to gate their
+// "kept" tally so post-refresh stats reflect only successfully cached
+// rows.
 void    gem_pairs_clear(void);
-void    gem_pairs_add(const char *native, const char *base, const char *quote);
+bool    gem_pairs_add(const char *native, const char *base, const char *quote);
 
 // Number of rows currently held. Thread-safe.
 uint32_t gem_pairs_count(void);

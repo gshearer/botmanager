@@ -66,7 +66,10 @@ gem_pairs_clear(void)
 // symbol (`btcusd`); `base` and `quote` are the split currency codes
 // (case-insensitive — we upper-case at write time). The abstraction
 // form is composed from the uppercase base + "-" + uppercase quote.
-void
+//
+// Returns SUCCESS on commit, FAIL when validation rejected the inputs
+// or the cache was full.
+bool
 gem_pairs_add(const char *native, const char *base, const char *quote)
 {
   gemini_pair_t *row;
@@ -77,7 +80,7 @@ gem_pairs_add(const char *native, const char *base, const char *quote)
   if(native == NULL || native[0] == '\0'
       || base == NULL || base[0] == '\0'
       || quote == NULL || quote[0] == '\0')
-    return;
+    return(FAIL);
 
   blen = strnlen(base, sizeof(row->base));
   qlen = strnlen(quote, sizeof(row->quote));
@@ -87,7 +90,7 @@ gem_pairs_add(const char *native, const char *base, const char *quote)
     clam(CLAM_WARN, GEM_CTX,
         "symbols cache: currency code overflow base='%s' quote='%s'",
         base, quote);
-    return;
+    return(FAIL);
   }
 
   pthread_mutex_lock(&gem_pairs.lock);
@@ -97,7 +100,7 @@ gem_pairs_add(const char *native, const char *base, const char *quote)
     pthread_mutex_unlock(&gem_pairs.lock);
     clam(CLAM_WARN, GEM_CTX,
         "symbols cache full; dropping '%s'", native);
-    return;
+    return(FAIL);
   }
 
   row = &gem_pairs.rows[gem_pairs.count];
@@ -134,6 +137,8 @@ gem_pairs_add(const char *native, const char *base, const char *quote)
   gem_pairs.count++;
 
   pthread_mutex_unlock(&gem_pairs.lock);
+
+  return(SUCCESS);
 }
 
 uint32_t

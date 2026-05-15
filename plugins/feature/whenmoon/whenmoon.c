@@ -52,6 +52,12 @@ static const plugin_kv_entry_t whenmoon_plugin_schema[] = {
     " value is 5. Ignored when no coinbase apikey is configured.",
     NULL, NULL },
 
+  { "plugin.whenmoon.exchange.gemini.account.refresh_sec",
+    KV_UINT32, "30",
+    "Seconds between gemini /balances polls. Minimum effective"
+    " value is 5. Ignored when no gemini apikey is configured.",
+    NULL, NULL },
+
   { "plugin.whenmoon.downloader.max_concurrent_jobs", KV_UINT32, "4",
     "Maximum number of jobs in 'running' state at once (1..32). The"
     " feature_exchange token bucket caps effective throughput; higher"

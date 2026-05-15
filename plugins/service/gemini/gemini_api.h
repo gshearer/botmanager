@@ -19,6 +19,12 @@
 // generic exchange abstraction (`exchange_api.h`) rather than these
 // symbols directly; the typed surface here is for plugin-internal
 // use plus the rare consumer that needs Gemini-specific behaviour.
+//
+// `exchange_api.h` is pulled in for `exchange_granularity_t` which the
+// candles wrapper signature consumes — this keeps the dlsym shim self-
+// contained for any external consumer that does want the typed path.
+
+#include "exchange_api.h"
 
 #include <stdbool.h>
 #include <stddef.h>
@@ -238,9 +244,44 @@ bool gemini_apikey_configured(void);
 // response lands; partial-failure rows are skipped silently.
 bool gemini_symbols_refresh_async(gemini_done_symbols_cb_t cb, void *user);
 
-// GEM-2 lands the typed REST wrappers (candles, balances, new order,
-// cancel order, order status, active orders, mytrades). The
-// signatures land alongside their implementations.
+// ------------------------------------------------------------------
+// GEM-2 typed REST wrappers (forwarded to by gemini_exchange.c via the
+// vtable capability hooks; also callable directly from other gemini-
+// internal TUs). Each runs the corresponding gem_submit_{public,
+// private} call, parses the response, and fires the typed callback on
+// the curl worker thread.
+// ------------------------------------------------------------------
+
+// Public GET /v2/candles/<native>/<time_frame>. since_ms / until_ms are
+// client-side window bounds applied after parse (Gemini's endpoint has
+// no `since` parameter). `prio` is forwarded to the curl scheduler.
+bool gemini_fetch_candles_async(const char *pair,
+    exchange_granularity_t gran, int64_t since_ms, int64_t until_ms,
+    uint8_t prio, gemini_done_candles_cb_t cb, void *user);
+
+// Private POST /v1/balances.
+bool gemini_get_balance_async(gemini_done_balances_cb_t cb, void *user);
+
+// Private POST /v1/order/new.
+bool gemini_add_order_async(const gemini_place_order_req_t *req,
+    gemini_done_order_cb_t cb, void *user);
+
+// Private POST /v1/order/cancel. `order_id` must be a positive decimal
+// integer in string form (Gemini's wire type is numeric).
+bool gemini_cancel_order_async(const char *order_id,
+    gemini_done_order_cb_t cb, void *user);
+
+// Private POST /v1/order/status.
+bool gemini_query_order_async(const char *order_id,
+    gemini_done_order_cb_t cb, void *user);
+
+// Private POST /v1/orders — Gemini only surfaces OPEN orders here.
+bool gemini_active_orders_async(gemini_done_orders_cb_t cb, void *user);
+
+// Private POST /v1/mytrades. `product_id` is required (Gemini scopes
+// the endpoint per symbol); since_ms is an optional lower bound.
+bool gemini_mytrades_async(const char *product_id, int64_t since_ms,
+    gemini_done_fills_cb_t cb, void *user);
 
 #endif // GEM_INTERNAL
 
@@ -277,6 +318,208 @@ gemini_apikey_configured(void)
     __atomic_store_n(&cached, fn, __ATOMIC_RELEASE);
   }
   return(fn());
+}
+
+static inline bool
+gemini_symbols_refresh_async(gemini_done_symbols_cb_t cb, void *user)
+{
+  typedef bool (*fn_t)(gemini_done_symbols_cb_t, void *);
+  static fn_t cached = NULL;
+  fn_t        fn     = __atomic_load_n(&cached, __ATOMIC_ACQUIRE);
+
+  if(fn == NULL)
+  {
+    union { void *obj; fn_t fn; } u;
+
+    u.obj = plugin_dlsym("gemini", "gemini_symbols_refresh_async");
+    if(u.obj == NULL)
+    {
+      clam(CLAM_FATAL, "gemini",
+          "dlsym failed: gemini_symbols_refresh_async");
+      abort();
+    }
+    fn = u.fn;
+    __atomic_store_n(&cached, fn, __ATOMIC_RELEASE);
+  }
+  return(fn(cb, user));
+}
+
+static inline bool
+gemini_fetch_candles_async(const char *pair, exchange_granularity_t gran,
+    int64_t since_ms, int64_t until_ms, uint8_t prio,
+    gemini_done_candles_cb_t cb, void *user)
+{
+  typedef bool (*fn_t)(const char *, exchange_granularity_t,
+      int64_t, int64_t, uint8_t,
+      gemini_done_candles_cb_t, void *);
+  static fn_t cached = NULL;
+  fn_t        fn     = __atomic_load_n(&cached, __ATOMIC_ACQUIRE);
+
+  if(fn == NULL)
+  {
+    union { void *obj; fn_t fn; } u;
+
+    u.obj = plugin_dlsym("gemini", "gemini_fetch_candles_async");
+    if(u.obj == NULL)
+    {
+      clam(CLAM_FATAL, "gemini",
+          "dlsym failed: gemini_fetch_candles_async");
+      abort();
+    }
+    fn = u.fn;
+    __atomic_store_n(&cached, fn, __ATOMIC_RELEASE);
+  }
+  return(fn(pair, gran, since_ms, until_ms, prio, cb, user));
+}
+
+static inline bool
+gemini_get_balance_async(gemini_done_balances_cb_t cb, void *user)
+{
+  typedef bool (*fn_t)(gemini_done_balances_cb_t, void *);
+  static fn_t cached = NULL;
+  fn_t        fn     = __atomic_load_n(&cached, __ATOMIC_ACQUIRE);
+
+  if(fn == NULL)
+  {
+    union { void *obj; fn_t fn; } u;
+
+    u.obj = plugin_dlsym("gemini", "gemini_get_balance_async");
+    if(u.obj == NULL)
+    {
+      clam(CLAM_FATAL, "gemini",
+          "dlsym failed: gemini_get_balance_async");
+      abort();
+    }
+    fn = u.fn;
+    __atomic_store_n(&cached, fn, __ATOMIC_RELEASE);
+  }
+  return(fn(cb, user));
+}
+
+static inline bool
+gemini_add_order_async(const gemini_place_order_req_t *req,
+    gemini_done_order_cb_t cb, void *user)
+{
+  typedef bool (*fn_t)(const gemini_place_order_req_t *,
+      gemini_done_order_cb_t, void *);
+  static fn_t cached = NULL;
+  fn_t        fn     = __atomic_load_n(&cached, __ATOMIC_ACQUIRE);
+
+  if(fn == NULL)
+  {
+    union { void *obj; fn_t fn; } u;
+
+    u.obj = plugin_dlsym("gemini", "gemini_add_order_async");
+    if(u.obj == NULL)
+    {
+      clam(CLAM_FATAL, "gemini",
+          "dlsym failed: gemini_add_order_async");
+      abort();
+    }
+    fn = u.fn;
+    __atomic_store_n(&cached, fn, __ATOMIC_RELEASE);
+  }
+  return(fn(req, cb, user));
+}
+
+static inline bool
+gemini_cancel_order_async(const char *order_id,
+    gemini_done_order_cb_t cb, void *user)
+{
+  typedef bool (*fn_t)(const char *, gemini_done_order_cb_t, void *);
+  static fn_t cached = NULL;
+  fn_t        fn     = __atomic_load_n(&cached, __ATOMIC_ACQUIRE);
+
+  if(fn == NULL)
+  {
+    union { void *obj; fn_t fn; } u;
+
+    u.obj = plugin_dlsym("gemini", "gemini_cancel_order_async");
+    if(u.obj == NULL)
+    {
+      clam(CLAM_FATAL, "gemini",
+          "dlsym failed: gemini_cancel_order_async");
+      abort();
+    }
+    fn = u.fn;
+    __atomic_store_n(&cached, fn, __ATOMIC_RELEASE);
+  }
+  return(fn(order_id, cb, user));
+}
+
+static inline bool
+gemini_query_order_async(const char *order_id,
+    gemini_done_order_cb_t cb, void *user)
+{
+  typedef bool (*fn_t)(const char *, gemini_done_order_cb_t, void *);
+  static fn_t cached = NULL;
+  fn_t        fn     = __atomic_load_n(&cached, __ATOMIC_ACQUIRE);
+
+  if(fn == NULL)
+  {
+    union { void *obj; fn_t fn; } u;
+
+    u.obj = plugin_dlsym("gemini", "gemini_query_order_async");
+    if(u.obj == NULL)
+    {
+      clam(CLAM_FATAL, "gemini",
+          "dlsym failed: gemini_query_order_async");
+      abort();
+    }
+    fn = u.fn;
+    __atomic_store_n(&cached, fn, __ATOMIC_RELEASE);
+  }
+  return(fn(order_id, cb, user));
+}
+
+static inline bool
+gemini_active_orders_async(gemini_done_orders_cb_t cb, void *user)
+{
+  typedef bool (*fn_t)(gemini_done_orders_cb_t, void *);
+  static fn_t cached = NULL;
+  fn_t        fn     = __atomic_load_n(&cached, __ATOMIC_ACQUIRE);
+
+  if(fn == NULL)
+  {
+    union { void *obj; fn_t fn; } u;
+
+    u.obj = plugin_dlsym("gemini", "gemini_active_orders_async");
+    if(u.obj == NULL)
+    {
+      clam(CLAM_FATAL, "gemini",
+          "dlsym failed: gemini_active_orders_async");
+      abort();
+    }
+    fn = u.fn;
+    __atomic_store_n(&cached, fn, __ATOMIC_RELEASE);
+  }
+  return(fn(cb, user));
+}
+
+static inline bool
+gemini_mytrades_async(const char *product_id, int64_t since_ms,
+    gemini_done_fills_cb_t cb, void *user)
+{
+  typedef bool (*fn_t)(const char *, int64_t,
+      gemini_done_fills_cb_t, void *);
+  static fn_t cached = NULL;
+  fn_t        fn     = __atomic_load_n(&cached, __ATOMIC_ACQUIRE);
+
+  if(fn == NULL)
+  {
+    union { void *obj; fn_t fn; } u;
+
+    u.obj = plugin_dlsym("gemini", "gemini_mytrades_async");
+    if(u.obj == NULL)
+    {
+      clam(CLAM_FATAL, "gemini",
+          "dlsym failed: gemini_mytrades_async");
+      abort();
+    }
+    fn = u.fn;
+    __atomic_store_n(&cached, fn, __ATOMIC_RELEASE);
+  }
+  return(fn(product_id, since_ms, cb, user));
 }
 
 #endif // !GEM_INTERNAL
