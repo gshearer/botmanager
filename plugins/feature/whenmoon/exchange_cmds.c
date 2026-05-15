@@ -238,9 +238,8 @@ wm_show_exchange_render_row(const cmd_ctx_t *ctx, const char *name)
   active_markets = wm_count_active_markets(name);
 
   snprintf(line, sizeof(line),
-      "  %-12s  sandbox=%-3s  auth=%-3s  rps=%u/%u  markets=%u",
+      "  %-12s  auth=%-3s  rps=%u/%u  markets=%u",
       name,
-      caps.sandbox          ? "yes" : "no",
       caps.has_credentials  ? "yes" : "no",
       (unsigned)caps.advertised_rps,
       (unsigned)caps.advertised_burst,

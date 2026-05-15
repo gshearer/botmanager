@@ -1068,9 +1068,8 @@ static const exchange_protocol_vtable_t cb_vtable = {
   .advertised_rps      = 10,
   .advertised_burst    = 15,
 
-  // WM-OR-1 capability hooks.
+  // WM-OR-1 capability hook.
   .is_authenticated    = cb_exch_is_authenticated,
-  .is_sandbox          = NULL,
   .place_order_async   = cb_exch_place_order_async,
   .cancel_order_async  = cb_exch_cancel_order_async,
   .get_order_async     = cb_exch_get_order_async,

@@ -112,12 +112,10 @@ typedef void (*exchange_response_cb_t)(int http_status,
 // optional `is_authenticated` hook (true when hook is NULL — public-
 // only exchanges advertise as "authed" by absence so the auth probe is
 // not their gate; auth-gated verbs FAIL on the hook layer instead).
-// `sandbox` is false when `is_sandbox` hook is NULL.
 typedef struct
 {
   char     name[EXCHANGE_NAME_SZ];
   bool     has_credentials;
-  bool     sandbox;
   uint32_t advertised_rps;
   uint32_t advertised_burst;
 } exchange_capabilities_t;
@@ -447,9 +445,8 @@ typedef struct
   uint32_t advertised_rps;
   uint32_t advertised_burst;
 
-  // Capability hooks. NULL = unsupported by this exchange.
+  // Capability hook. NULL = unsupported by this exchange.
   bool   (*is_authenticated)(void);
-  bool   (*is_sandbox)(void);
 
   // Async — mirror the protocol's typed wrappers. Fill error reasons
   // into the result's `err` field; never block the caller.

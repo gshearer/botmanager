@@ -189,8 +189,6 @@ exchange_get_capabilities(const char *name, exchange_capabilities_t *out)
   out->name[nlen]       = '\0';
   out->has_credentials  = e->vt->is_authenticated != NULL
                        && e->vt->is_authenticated();
-  out->sandbox          = e->vt->is_sandbox != NULL
-                       && e->vt->is_sandbox();
   out->advertised_rps   = e->vt->advertised_rps;
   out->advertised_burst = e->vt->advertised_burst;
   return(SUCCESS);

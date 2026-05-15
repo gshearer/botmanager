@@ -800,7 +800,6 @@ static const exchange_protocol_vtable_t kr_vtable =
   .advertised_burst    = 15,
 
   .is_authenticated    = kr_exch_is_authenticated,
-  .is_sandbox          = NULL,           // Kraken has no sandbox
   .place_order_async   = kr_exch_place_order_async,
   .cancel_order_async  = kr_exch_cancel_order_async,
   .get_order_async     = kr_exch_get_order_async,
