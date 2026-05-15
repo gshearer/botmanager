@@ -66,6 +66,45 @@
 // abstraction. Called from gem_start.
 bool    gem_exchange_register_vtable(void);
 
+// Collapse Gemini's verbose order-type string ("exchange limit" /
+// "exchange market" / "exchange stop") to the abstraction's compact
+// form ("limit" / "market" / "stop"). EXCHANGE_TYPE_SZ is 16 bytes;
+// GEMINI_TYPE_SZ is 24, so a naked memcpy could overrun the
+// destination buffer. Always NUL-terminates.
+//
+// Defined here as static inline so both gemini_exchange.c (REST vtable
+// adapters) and gemini_ws_channels.c (Order Events parser surfacing
+// `exchange_ws_user_order_t.status`/`type`) share the same collapse
+// without growing a second TU.
+static inline void
+gem_type_to_generic(const char *src, char *dst, size_t cap)
+{
+  if(dst == NULL || cap == 0)
+    return;
+
+  dst[0] = '\0';
+
+  if(src == NULL || src[0] == '\0')
+    return;
+
+  if(strcmp(src, "exchange limit") == 0)
+    snprintf(dst, cap, "limit");
+  else if(strcmp(src, "exchange market") == 0)
+    snprintf(dst, cap, "market");
+  else if(strcmp(src, "exchange stop") == 0
+       || strcmp(src, "exchange stop_limit") == 0)
+    snprintf(dst, cap, "stop");
+  else
+  {
+    // Unknown / passthrough — silent truncation if the source happens
+    // to exceed the destination. memcpy + NUL terminator silences gcc's
+    // -Wformat-truncation on the snprintf-of-wider-into-narrower case.
+    size_t n = strnlen(src, cap - 1);
+    memcpy(dst, src, n);
+    dst[n] = '\0';
+  }
+}
+
 #endif // GEM_INTERNAL
 
 #endif // BM_GEMINI_H

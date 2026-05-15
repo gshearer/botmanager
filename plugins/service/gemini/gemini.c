@@ -313,7 +313,7 @@ const plugin_desc_t bm_plugin_desc =
 {
   .api_version     = PLUGIN_API_VERSION,
   .name            = "gemini",
-  .version         = "0.2-gem2",
+  .version         = "0.3-gem3",
   .type            = PLUGIN_SERVICE,
   .kind            = "gemini",
   .provides        = { { .name = "exchange_gemini" } },

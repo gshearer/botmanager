@@ -263,40 +263,10 @@ typedef struct
 
 // ---- typed-to-generic translation helpers ----
 //
-// gem_type_to_generic collapses Gemini's verbose order-type strings
-// ("exchange limit" / "exchange market" / "exchange stop") to the
-// abstraction's compact form ("limit" / "market" / "stop").
-// EXCHANGE_TYPE_SZ is 16 bytes; GEMINI_TYPE_SZ is 24, so a naked
-// memcpy could overrun the destination buffer. Always NUL-terminates.
-
-static void
-gem_type_to_generic(const char *src, char *dst, size_t cap)
-{
-  if(dst == NULL || cap == 0)
-    return;
-
-  dst[0] = '\0';
-
-  if(src == NULL || src[0] == '\0')
-    return;
-
-  if(strcmp(src, "exchange limit") == 0)
-    snprintf(dst, cap, "limit");
-  else if(strcmp(src, "exchange market") == 0)
-    snprintf(dst, cap, "market");
-  else if(strcmp(src, "exchange stop") == 0
-       || strcmp(src, "exchange stop_limit") == 0)
-    snprintf(dst, cap, "stop");
-  else
-  {
-    // Unknown / passthrough — silent truncation if the source happens
-    // to exceed the destination. memcpy + NUL terminator silences gcc's
-    // -Wformat-truncation on the snprintf-of-wider-into-narrower case.
-    size_t n = strnlen(src, cap - 1);
-    memcpy(dst, src, n);
-    dst[n] = '\0';
-  }
-}
+// gem_type_to_generic is hoisted to gemini.h as static inline so both
+// gemini_exchange.c (this TU) and gemini_ws_channels.c (Order Events
+// parser surfacing exchange_ws_user_order_t.status fields) share the
+// same collapse without a second TU.
 
 static void
 gem_to_exch_order(const gemini_order_t *src, exchange_order_t *dst)
@@ -883,11 +853,8 @@ static const exchange_protocol_vtable_t gem_vtable =
   .get_accounts_async  = gem_exch_get_accounts_async,
   .fetch_candles_async = gem_exch_fetch_candles_async,
 
-  // WS slots wired in GEM-3. NULL here means the public exchange WS
-  // shim FAILs synchronously with `ws_subscribe unsupported` — by
-  // design at this chunk.
-  .ws_subscribe        = NULL,
-  .ws_unsubscribe      = NULL,
+  .ws_subscribe        = gem_ws_subscribe,
+  .ws_unsubscribe      = gem_ws_unsubscribe,
 };
 
 bool
