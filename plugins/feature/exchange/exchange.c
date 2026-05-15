@@ -45,6 +45,27 @@ static const plugin_kv_entry_t exchange_kv_schema[] = {
     "Tokens reserved for EXCHANGE_PRIO_MARKET_BACKFILL. P254 user-"
     "download traffic is gated on (1 + reserved.0 + reserved.50).",
     NULL, NULL },
+
+  // Gemini: 5 rps default sits at the conservative midpoint between
+  // Gemini's public (~2/s) and private (~10/s) caps. Range clamped
+  // per-exchange in the limiter (advertised cap minus
+  // EXCHANGE_RPS_HEADROOM).
+  { "plugin.exchange.gemini.rate_limit_rps", KV_UINT32, "5",
+    "Sustained requests/sec budget for the gemini exchange dispatch"
+    " queue. Range 1..10 (Gemini private cap). Bucket depth follows"
+    " the protocol-advertised burst.",
+    NULL, NULL },
+
+  { "plugin.exchange.gemini.reserved_slots.0", KV_UINT32, "1",
+    "Tokens reserved for EXCHANGE_PRIO_TRANSACTIONAL traffic. Lower"
+    " priorities cannot dispatch unless the bucket has at least"
+    " (1 + reserved.0) tokens available.",
+    NULL, NULL },
+
+  { "plugin.exchange.gemini.reserved_slots.50", KV_UINT32, "0",
+    "Tokens reserved for EXCHANGE_PRIO_MARKET_BACKFILL. P254 user-"
+    "download traffic is gated on (1 + reserved.0 + reserved.50).",
+    NULL, NULL },
 };
 
 // Apply the per-exchange KV settings to a freshly registered exchange.
