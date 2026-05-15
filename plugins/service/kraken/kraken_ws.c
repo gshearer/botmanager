@@ -656,12 +656,23 @@ kr_ws_on_frame_locked(kr_ws_t *w, const char *data, size_t len,
     return;
   }
 
-  // bytesleft == 0 means the reassembled frame is complete. Drop the
-  // lock during dispatch so a subscriber callback may call back into
-  // kr_ws_send_text (e.g. a follow-up subscribe) without self-deadlocking.
-  // Safe because this thread is the sole reader, so no concurrent recv
-  // can touch rx_buf while dispatch runs.
-  if(meta->bytesleft == 0 && w->rx_len > 0)
+  // Dispatch only when the LOGICAL message is complete:
+  //   bytesleft == 0   → current frame's payload fully delivered
+  //   !(CURLWS_CONT)   → this is the final fragment of the WS message
+  //                      (CURLWS_CONT is set on every fragment except the
+  //                      last when a single message is split across multiple
+  //                      WS frames). Kraken v2 frames stay small so this
+  //                      hasn't surfaced as a parse-error storm here yet;
+  //                      bug shape identical to GEM-VERIFY-1 + applied for
+  //                      symmetry.
+  //
+  // Drop the lock during dispatch so a subscriber callback may call
+  // back into kr_ws_send_text (e.g. a follow-up subscribe) without
+  // self-deadlocking. Safe because this thread is the sole reader, so
+  // no concurrent recv can touch rx_buf while dispatch runs.
+  if(meta->bytesleft == 0
+      && !(flags & CURLWS_CONT)
+      && w->rx_len > 0)
   {
     const char *payload = w->rx_buf;
     size_t      plen    = w->rx_len;

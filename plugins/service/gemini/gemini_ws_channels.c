@@ -1272,9 +1272,14 @@ gem_ws_channels_dispatch_md(const char *buf, size_t len)
 
   if(!json_get_str(root, "type", type, sizeof(type)))
   {
-    // Some MD envelopes do not carry a "type" key (rare; e.g. server-
-    // side error frames). Log at debug and drop.
-    clam(CLAM_DEBUG3, GEM_CTX ".ws.md",
+    // Post-GEM-VERIFY-1: pre-fix this fired ~61×/connect because the
+    // unfragmented dispatch trigger handed the parser truncated L2
+    // snapshots that happened to parse as valid JSON (no `type` at
+    // the partial top level). With the CURLWS_CONT-gated reassembly
+    // in gem_ws_on_frame_locked, the path is reached only for
+    // genuinely typeless server envelopes (rare). Logged at DBG5 so
+    // it's invisible at default debug verbosity.
+    clam(CLAM_DEBUG5, GEM_CTX ".ws.md",
         "frame without type (%zu bytes)", len);
     json_object_put(root);
     return;

@@ -553,19 +553,15 @@ gem_ws_open_oe_locked(gem_ws_session_t *s)
   char                payload_hdr[576];
   char                sig_hdr[192];
   const char         *api_key;
-  time_t              now;
 
+  // Auth pre-check is owned by the reader (gem_ws_reader) so the
+  // reconnect reason can distinguish "no creds" from a real handshake
+  // failure. If we get here without creds it is a logic bug in the
+  // reader — defend in depth with a hard refusal anyway.
   if(!gem_apikey_configured())
   {
-    // Throttle to once per minute so a long unauthed run doesn't
-    // flood the log.
-    now = time(NULL);
-    if(now - s->last_auth_warn >= 60)
-    {
-      clam(CLAM_INFO, s->log_ctx,
-          "api keys not configured; private stream disabled");
-      s->last_auth_warn = now;
-    }
+    clam(CLAM_WARN, s->log_ctx,
+        "open: reached oe handshake without creds (logic bug)");
     return(FAIL);
   }
 
@@ -944,12 +940,21 @@ gem_ws_on_frame_locked(gem_ws_session_t *s, const char *data, size_t len,
     return;
   }
 
-  // bytesleft == 0 means the reassembled frame is complete. Drop the
-  // lock during dispatch so a subscriber callback may call back into
-  // gem_ws_send_text (e.g. a follow-up subscribe) without self-
-  // deadlocking. Safe because this thread is the sole reader, so no
-  // concurrent recv can touch rx_buf while dispatch runs.
-  if(meta->bytesleft == 0 && s->rx_len > 0)
+  // Dispatch only when the LOGICAL message is complete:
+  //   bytesleft == 0   → current frame's payload fully delivered
+  //   !(CURLWS_CONT)   → this is the final fragment of the WS message
+  //                      (CURLWS_CONT is set on every fragment except the
+  //                      last when a single message is split across multiple
+  //                      WS frames — Gemini's l2 snapshot is the
+  //                      offender that surfaced this in GEM-VERIFY-1).
+  //
+  // Drop the lock during dispatch so a subscriber callback may call
+  // back into gem_ws_send_text (e.g. a follow-up subscribe) without
+  // self-deadlocking. Safe because this thread is the sole reader, so
+  // no concurrent recv can touch rx_buf while dispatch runs.
+  if(meta->bytesleft == 0
+      && !(flags & CURLWS_CONT)
+      && s->rx_len > 0)
   {
     const char *payload = s->rx_buf;
     size_t      plen    = s->rx_len;
@@ -1054,6 +1059,28 @@ gem_ws_reader(task_t *t)
           nanosleep(&ts, NULL);
         }
 
+        continue;
+      }
+
+      // Auth pre-check on the Order Events session: short-circuit
+      // before curl_easy_init when creds are unconfigured so the
+      // reconnect reason reflects what actually blocked the open
+      // (instead of "handshake failed" — there was never a
+      // handshake). Throttle the operator-facing log to one entry
+      // per minute (GEM-VERIFY-1).
+      if(s->sid == GEM_WS_OE && !gem_apikey_configured())
+      {
+        time_t now = time(NULL);
+
+        if(now - s->last_auth_warn >= 60)
+        {
+          clam(CLAM_INFO, s->log_ctx,
+              "api keys not configured; private stream disabled");
+          s->last_auth_warn = now;
+        }
+
+        gem_ws_schedule_reconnect_locked(s, "no creds");
+        pthread_mutex_unlock(&s->lock);
         continue;
       }
 
