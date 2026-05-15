@@ -32,7 +32,7 @@ A bot that drives a configurable persona over a chat method via an LLM. Classifi
 
 ### Whenmoon Trading + Backtesting (kind: feature) — in scope
 
-A capability layer, not a bot. Whenmoon lives at `plugins/feature/whenmoon/` and is consumed via `/whenmoon` (abbrev `/wm`) verbs from any operator session — there is no whenmoon bot instance. It owns market state, multi-grain candle aggregation (1m → 5m → 15m → 1h → 4h → 1d), a downloader (history backfill with pre-flight gap detection and resume), the strategy registry (loadable `PLUGIN_STRATEGY` plugins), a single per-market trade engine with three modes (manual / paper / real), and a snapshot/replay backtest runtime. Strategies emit signals; the per-market engine consumes them and either ignores (manual), synthesizes fills against a cached mark (paper), or submits via the exchange abstraction at `EXCHANGE_PRIO_TRANSACTIONAL` (real). Per-market risk caps (daily_loss_bps, max_notional, pending-cap) gate the real path; the operator halt `/whenmoon manual` flips every market into MANUAL mode in one shot, bypassing the flat-position rule. The exchange abstraction itself is a separate feature plugin at `plugins/feature/exchange/` — it provides a per-exchange priority queue + token bucket + reserved slots over service plugins like coinbase and kraken.
+A capability layer, not a bot. Whenmoon lives at `plugins/feature/whenmoon/` and is consumed via `/whenmoon` (abbrev `/wm`) verbs from any operator session — there is no whenmoon bot instance. It owns market state, multi-grain candle aggregation (1m → 5m → 15m → 1h → 4h → 1d), a downloader (history backfill with pre-flight gap detection and resume), the strategy registry (loadable `PLUGIN_STRATEGY` plugins), a single per-market trade engine with three modes (manual / paper / real), and a snapshot/replay backtest runtime. Strategies emit signals; the per-market engine consumes them and either ignores (manual), synthesizes fills against a cached mark (paper), or submits via the exchange abstraction at `EXCHANGE_PRIO_TRANSACTIONAL` (real). Per-market risk caps (daily_loss_bps, max_notional, pending-cap) gate the real path; the operator halt `/whenmoon manual` flips every market into MANUAL mode in one shot, bypassing the flat-position rule. The exchange abstraction itself is a separate feature plugin at `plugins/feature/exchange/` — it provides a per-exchange priority queue + token bucket + reserved slots over service plugins like coinbase, kraken, and gemini.
 
 **All modes are candle-driven (post-2026-05-03).** Public Coinbase API tiers do not serve deep historical trades, so the bar substrate is built from `wm_candles_<id>_60` and fanned into all higher granularities by the same aggregator that runs live — strategies see the same `mkt->grain_arr[g][i]` surface in every mode. The live WS `matches` channel is consumed in-process by the aggregator (which closes bars and persists them to `wm_candles_<id>_<gran>`) but the per-tick stream is **not** persisted to a `wm_trades_*` tape: the original 2026-04-30 plan kept tick storage for sub-bar microstructure, but no consumer ever read from those rows in any mode, and Coinbase will not sell historical ticks back to fill gaps, so the write path was ripped on 2026-05-03 along with the historical trade-download infrastructure (`DL_JOB_TRADES`, `wm_trade_coverage`, `wm_trade_table_*`, `/whenmoon download trades`). If a future strategy class needs sub-bar features, it adds an in-memory ring keyed off the aggregator and accepts post-startup-only data. Per-granularity history depth is discovered at runtime by `/whenmoon candles probe-depth <market>` (Coinbase's per-gran caps are not authoritatively documented and vary across granularities); cached in `plugin.whenmoon.candles.<gran>.max_lookback_days` and consumed by `/whenmoon download candles <market> max`.
 
@@ -186,12 +186,12 @@ new venue is a self-contained plugin drop — no consumer-side edits.
 **Two-layer split:**
 
 - **Service plugins** (`plugins/service/<name>/`) own one wire
-  protocol each. Coinbase Advanced Trade (CDP/JWT) and Kraken Spot
-  (HMAC-SHA512) are the shipped implementations. Each plugin owns its
-  REST dispatcher, WebSocket transport, channel multiplexer,
-  credentials, and request signer. It self-registers an
-  `exchange_protocol_vtable_t` with `feature_exchange` at `start`
-  time.
+  protocol each. Coinbase Advanced Trade (CDP/JWT), Kraken Spot
+  (HMAC-SHA512), and Gemini Spot (HMAC-SHA384) are the shipped
+  implementations. Each plugin owns its REST dispatcher, WebSocket
+  transport, channel multiplexer, credentials, and request signer. It
+  self-registers an `exchange_protocol_vtable_t` with
+  `feature_exchange` at `start` time.
 - **`plugins/feature/exchange/`** owns the consumer-facing
   abstraction: a per-exchange priority queue + token bucket +
   reserved-slot policy + 429/5xx retry schedule + the typed
@@ -200,9 +200,9 @@ new venue is a self-contained plugin drop — no consumer-side edits.
   Consumers call `exchange_*_async(name, …)` and the abstraction
   dispatches to the registered vtable.
 
-Whenmoon talks to *both* exchanges through this seam: `grep -rn
-'coinbase_\|kraken_' plugins/feature/whenmoon/*.c` returns zero
-hits. The `whenmoon_market_t` carries `exchange_name` so every
+Whenmoon talks to all three exchanges through this seam: `grep -rn
+'coinbase_\|kraken_\|gemini_' plugins/feature/whenmoon/*.c` returns
+zero hits. The `whenmoon_market_t` carries `exchange_name` so every
 candle, account, order, and WS subscription is routed
 per-(exchange, product). Adding Binance or Bybit would be a new
 `plugins/service/<name>/` plugin only.
