@@ -7,6 +7,7 @@ exchange_plugin = shared_library('exchange',
   'exchange_request.c',
   'exchange_retry.c',
   'exchange_caps.c',
+  'exchange_cmds.c',
   include_directories : [
     inc_include,
     exchange_include,

@@ -97,6 +97,16 @@ fail_candles_cb(exchange_done_candles_cb_t cb, void *user, const char *err)
   cb(&res, user);
 }
 
+// MW-1: synchronous failure for the bulk-ticker callback.
+static void
+fail_tickers_cb(exchange_done_tickers_cb_t cb, void *user, const char *err)
+{
+  if(cb == NULL)
+    return;
+
+  cb(false, err != NULL ? err : "error", NULL, 0, user);
+}
+
 // Resolve `name` without any auth check. Used by public market-data
 // verbs (candles, public WS channels). Writes a human-readable error
 // into `errbuf` on FAIL.
@@ -488,6 +498,40 @@ exchange_fetch_candles_async(const char *name, const char *product_id,
 
   if(e->vt->fetch_candles_async(product_id, gran, since_ms, until_ms,
         cb, user) != SUCCESS)
+    return(FAIL);
+
+  return(SUCCESS);
+}
+
+// ------------------------------------------------------------------ //
+// MW-1: bulk-ticker fetch (public market data — no auth gate)         //
+// ------------------------------------------------------------------ //
+
+bool
+exchange_fetch_all_tickers_async(const char *name,
+    exchange_done_tickers_cb_t cb, void *user)
+{
+  exchange_t *e = NULL;
+  char        err[EXCHANGE_ERR_SZ];
+
+  if(cb == NULL)
+    return(FAIL);
+
+  if(resolve_exchange(name, &e, err, sizeof(err)) != SUCCESS)
+  {
+    fail_tickers_cb(cb, user, err);
+    return(FAIL);
+  }
+
+  if(e->vt->fetch_all_tickers == NULL)
+  {
+    snprintf(err, sizeof(err),
+        "%s: fetch_all_tickers not supported", name);
+    fail_tickers_cb(cb, user, err);
+    return(FAIL);
+  }
+
+  if(e->vt->fetch_all_tickers(cb, user) != SUCCESS)
     return(FAIL);
 
   return(SUCCESS);

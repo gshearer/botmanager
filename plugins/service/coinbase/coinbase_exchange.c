@@ -29,7 +29,10 @@
 #include "exchange_api.h"
 
 #include "curl.h"
+#include "json.h"
 
+#include <math.h>
+#include <stdint.h>
 #include <stdio.h>
 #include <string.h>
 
@@ -555,16 +558,40 @@ cb_exch_place_order_async(const exchange_place_order_req_t *req,
   fwd->cb   = cb;
   fwd->user = user;
 
+  // The neutral `req->*` buffers are sized at-or-above coinbase's
+  // per-field caps; copy via memcpy after a bounded strnlen so we
+  // truncate rather than tripping -Wformat-truncation on the snprintf
+  // bound mismatch. The coinbase request path enforces its own length
+  // limits at submit time, so a truncated id surfaces as a clean
+  // server-side rejection.
   memset(&inner, 0, sizeof(inner));
-  snprintf(inner.product_id, sizeof(inner.product_id), "%s", req->product_id);
-  snprintf(inner.side,       sizeof(inner.side),       "%s", req->side);
-  snprintf(inner.type,       sizeof(inner.type),       "%s", req->type);
-  snprintf(inner.tif,        sizeof(inner.tif),        "%s", req->tif);
+  {
+    size_t n;
+
+    n = strnlen(req->product_id, sizeof(inner.product_id) - 1);
+    memcpy(inner.product_id, req->product_id, n);
+    inner.product_id[n] = '\0';
+
+    n = strnlen(req->side, sizeof(inner.side) - 1);
+    memcpy(inner.side, req->side, n);
+    inner.side[n] = '\0';
+
+    n = strnlen(req->type, sizeof(inner.type) - 1);
+    memcpy(inner.type, req->type, n);
+    inner.type[n] = '\0';
+
+    n = strnlen(req->tif, sizeof(inner.tif) - 1);
+    memcpy(inner.tif, req->tif, n);
+    inner.tif[n] = '\0';
+
+    n = strnlen(req->client_oid, sizeof(inner.client_oid) - 1);
+    memcpy(inner.client_oid, req->client_oid, n);
+    inner.client_oid[n] = '\0';
+  }
   inner.price     = req->price;
   inner.size      = req->size;
   inner.funds     = req->funds;
   inner.post_only = req->post_only;
-  snprintf(inner.client_oid, sizeof(inner.client_oid), "%s", req->client_oid);
 
   return(coinbase_place_order_async(&inner,
         cb_exch_order_done_adapter, fwd));
@@ -805,6 +832,248 @@ cb_exch_fetch_candles_async(const char *product_id,
   {
     // coinbase_fetch_candles_async fires the typed cb synchronously with
     // err set on FAIL; the adapter has already freed `fwd`.
+    return(FAIL);
+  }
+
+  return(SUCCESS);
+}
+
+// ------------------------------------------------------------------ //
+// MW-1: bulk-ticker fetch                                              //
+//                                                                      //
+// Calls Coinbase Advanced Trade `GET /api/v3/brokerage/market/products` //
+// (public, unauthenticated) and translates the products array into the //
+// neutral exchange_ticker_snapshot_t shape. Coinbase product_id is     //
+// already canonical (BTC-USD), so no cache lookup is needed. Numeric  //
+// fields arrive as JSON strings; parse with strtod. Fields the         //
+// endpoint does not publish (hi/lo/vwap/trades) are set to the absent //
+// sentinels (NAN / UINT64_MAX) so consumers can distinguish them from //
+// honest zeros. FCM (futures) products are filtered out via            //
+// `product_type == "SPOT"` when the field is present.                  //
+// ------------------------------------------------------------------ //
+
+typedef struct
+{
+  exchange_done_tickers_cb_t  cb;
+  void                       *user;
+} cb_exch_tickers_fwd_t;
+
+static double
+cb_json_str_double_local(struct json_object *obj, const char *key)
+{
+  struct json_object *v;
+  const char         *s;
+
+  if(obj == NULL || !json_object_object_get_ex(obj, key, &v))
+    return(NAN);
+
+  if(json_object_is_type(v, json_type_string))
+  {
+    s = json_object_get_string(v);
+    if(s == NULL || s[0] == '\0')
+      return(NAN);
+    return(strtod(s, NULL));
+  }
+
+  if(json_object_is_type(v, json_type_double) ||
+     json_object_is_type(v, json_type_int))
+    return(json_object_get_double(v));
+
+  return(NAN);
+}
+
+static exchange_ticker_status_t
+cb_map_product_status(const char *s)
+{
+  if(s == NULL || s[0] == '\0')
+    return(EXCH_TICK_UNKNOWN);
+  if(strcmp(s, "online") == 0)
+    return(EXCH_TICK_ONLINE);
+  if(strcmp(s, "trading_disabled") == 0 || strcmp(s, "delisted") == 0)
+    return(EXCH_TICK_OFFLINE);
+  if(strcmp(s, "post_only") == 0)
+    return(EXCH_TICK_POST_ONLY);
+  if(strcmp(s, "limit_only") == 0)
+    return(EXCH_TICK_LIMIT_ONLY);
+  return(EXCH_TICK_UNKNOWN);
+}
+
+static void
+cb_exch_tickers_resp(int http_status, const char *body, size_t body_len,
+    const char *err, void *user)
+{
+  cb_exch_tickers_fwd_t       *fwd = user;
+  struct json_object          *root;
+  struct json_object          *products;
+  struct json_object          *v;
+  exchange_ticker_snapshot_t  *rows = NULL;
+  size_t                       row_cap;
+  size_t                       kept = 0;
+  int                          len;
+  int                          i;
+
+  (void)http_status;
+
+  if(fwd == NULL)
+    return;
+
+  if(err != NULL)
+  {
+    fwd->cb(false, err, NULL, 0, fwd->user);
+    mem_free(fwd);
+    return;
+  }
+
+  root = json_parse_buf(body, body_len, CB_CTX);
+
+  if(root == NULL)
+  {
+    fwd->cb(false, "malformed JSON from Coinbase products", NULL, 0,
+        fwd->user);
+    mem_free(fwd);
+    return;
+  }
+
+  if(!json_object_is_type(root, json_type_object) ||
+     !json_object_object_get_ex(root, "products", &products) ||
+     !json_object_is_type(products, json_type_array))
+  {
+    json_object_put(root);
+    fwd->cb(false, "unexpected Coinbase products response shape",
+        NULL, 0, fwd->user);
+    mem_free(fwd);
+    return;
+  }
+
+  len = (int)json_object_array_length(products);
+
+  if(len <= 0)
+  {
+    json_object_put(root);
+    fwd->cb(true, NULL, NULL, 0, fwd->user);
+    mem_free(fwd);
+    return;
+  }
+
+  row_cap = (size_t)len;
+
+  if(row_cap > EXCHANGE_TICKERS_MAX)
+  {
+    clam(CLAM_WARN, CB_CTX,
+        "tickers: products array %d exceeds cap %d; truncating",
+        len, (int)EXCHANGE_TICKERS_MAX);
+    row_cap = EXCHANGE_TICKERS_MAX;
+  }
+
+  rows = mem_alloc(CB_CTX, "exch.tickers",
+      row_cap * sizeof(*rows));
+
+  if(rows == NULL)
+  {
+    json_object_put(root);
+    fwd->cb(false, "out of memory", NULL, 0, fwd->user);
+    mem_free(fwd);
+    return;
+  }
+
+  for(i = 0; i < len && kept < row_cap; i++)
+  {
+    struct json_object         *row = json_object_array_get_idx(products, i);
+    exchange_ticker_snapshot_t *out;
+    const char                 *pid;
+    const char                 *ptype;
+    const char                 *pstatus;
+    double                      price;
+    double                      vol_base;
+
+    if(row == NULL || !json_object_is_type(row, json_type_object))
+      continue;
+
+    // SPOT-only when product_type is present; tolerate older responses
+    // that omit the field.
+    if(json_object_object_get_ex(row, "product_type", &v) &&
+       json_object_is_type(v, json_type_string))
+    {
+      ptype = json_object_get_string(v);
+      if(ptype != NULL && strcmp(ptype, "SPOT") != 0)
+        continue;
+    }
+
+    if(!json_object_object_get_ex(row, "product_id", &v) ||
+       !json_object_is_type(v, json_type_string))
+      continue;
+
+    pid = json_object_get_string(v);
+    if(pid == NULL || pid[0] == '\0')
+      continue;
+
+    out = &rows[kept];
+    memset(out, 0, sizeof(*out));
+    snprintf(out->product_id, sizeof(out->product_id), "%s", pid);
+
+    price    = cb_json_str_double_local(row, "price");
+    vol_base = cb_json_str_double_local(row, "volume_24h");
+
+    out->price          = price;
+    out->pct_24h        = cb_json_str_double_local(row,
+                              "price_percentage_change_24h");
+    out->vol_24h_base   = vol_base;
+    // Approximate quote-volume from base × last; the products endpoint
+    // does not carry a separate quote-volume field. NaN when either
+    // input is absent so consumers don't multiply garbage.
+    out->vol_24h_quote  = (!isnan(vol_base) && !isnan(price))
+                              ? vol_base * price : NAN;
+    out->hi_24h         = NAN;
+    out->lo_24h         = NAN;
+    out->vwap_24h       = NAN;
+    out->num_trades_24h = UINT64_MAX;
+
+    pstatus = NULL;
+    if(json_object_object_get_ex(row, "status", &v) &&
+       json_object_is_type(v, json_type_string))
+      pstatus = json_object_get_string(v);
+
+    out->status = cb_map_product_status(pstatus);
+    kept++;
+  }
+
+  clam(CLAM_DEBUG2, CB_CTX,
+      "tickers: products=%d kept=%zu", len, kept);
+
+  fwd->cb(true, NULL, rows, kept, fwd->user);
+
+  mem_free(rows);
+  json_object_put(root);
+  mem_free(fwd);
+}
+
+static bool
+cb_exch_fetch_all_tickers_async(exchange_done_tickers_cb_t cb, void *user)
+{
+  cb_exch_tickers_fwd_t *fwd;
+
+  if(cb == NULL)
+    return(FAIL);
+
+  fwd = mem_alloc(CB_CTX, "exch.tickers.fwd", sizeof(*fwd));
+
+  if(fwd == NULL)
+  {
+    cb(false, "out of memory", NULL, 0, user);
+    return(FAIL);
+  }
+
+  fwd->cb   = cb;
+  fwd->user = user;
+
+  if(exchange_request("coinbase", EXCHANGE_PRIO_MARKET_BACKFILL,
+        EXCHANGE_OP_REST_GET,
+        "/api/v3/brokerage/market/products", NULL,
+        cb_exch_tickers_resp, fwd) != SUCCESS)
+  {
+    cb(false, "failed to submit Coinbase products request",
+        NULL, 0, user);
+    mem_free(fwd);
     return(FAIL);
   }
 
@@ -1081,6 +1350,9 @@ static const exchange_protocol_vtable_t cb_vtable = {
   .fetch_candles_async = cb_exch_fetch_candles_async,
   .ws_subscribe        = cb_exch_ws_subscribe,
   .ws_unsubscribe      = cb_exch_ws_unsubscribe,
+
+  // MW-1 capability hook.
+  .fetch_all_tickers   = cb_exch_fetch_all_tickers_async,
 };
 
 bool

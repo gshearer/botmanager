@@ -15,7 +15,7 @@
 #define CLAM_DEBUG5  7
 
 #define CLAM_MSG_SZ       1000
-#define CLAM_CTX_SZ       40
+#define CLAM_CTX_SZ       60
 #define CLAM_SUB_NAME_SZ  40
 #define CLAM_REGEX_SZ     100
 

@@ -16,7 +16,12 @@
 #include "kraken.h"
 
 #include "exchange_api.h"
+#include "json.h"
 
+#include "kraken_pairs.h"
+
+#include <math.h>
+#include <stdint.h>
 #include <stdio.h>
 #include <string.h>
 
@@ -786,6 +791,348 @@ kr_exch_fetch_candles_async(const char *product_id,
 }
 
 // ------------------------------------------------------------------ //
+// MW-1: bulk-ticker fetch                                              //
+//                                                                      //
+// `GET /0/public/Ticker` (no pair= argument → every spot pair). Wire  //
+// shape:                                                               //
+//   { "error": [], "result": {                                         //
+//       "XXBTZUSD": { "a":["..."], "b":["..."],                       //
+//                     "c":[<last>,<lastvol>],                           //
+//                     "v":[<today>,<24h>],                              //
+//                     "p":[<today>,<24h>],                              //
+//                     "t":[<today>,<24h>],                              //
+//                     "l":[<today>,<24h>],                              //
+//                     "h":[<today>,<24h>],                              //
+//                     "o":<open> }, ... } }                            //
+// Every numeric arrives as a JSON string; ts (`t`) is a JSON number.  //
+// Keys are wire pair names that must be re-keyed onto the canonical   //
+// abstraction form (BTC-USD) via the assetpairs cache. Rows whose key //
+// has no cache entry are dropped with one DBG3 line per row.          //
+// ------------------------------------------------------------------ //
+
+typedef struct
+{
+  exchange_done_tickers_cb_t  cb;
+  void                       *user;
+} kr_exch_tickers_fwd_t;
+
+static double
+kr_json_arr_str_double(struct json_object *arr, int idx)
+{
+  struct json_object *v;
+  const char         *s;
+
+  if(arr == NULL || !json_object_is_type(arr, json_type_array))
+    return(NAN);
+
+  if(idx < 0 || idx >= (int)json_object_array_length(arr))
+    return(NAN);
+
+  v = json_object_array_get_idx(arr, idx);
+
+  if(v == NULL)
+    return(NAN);
+
+  if(json_object_is_type(v, json_type_string))
+  {
+    s = json_object_get_string(v);
+    if(s == NULL || s[0] == '\0')
+      return(NAN);
+    return(strtod(s, NULL));
+  }
+
+  if(json_object_is_type(v, json_type_double) ||
+     json_object_is_type(v, json_type_int))
+    return(json_object_get_double(v));
+
+  return(NAN);
+}
+
+static uint64_t
+kr_json_arr_uint64(struct json_object *arr, int idx)
+{
+  struct json_object *v;
+
+  if(arr == NULL || !json_object_is_type(arr, json_type_array))
+    return(UINT64_MAX);
+
+  if(idx < 0 || idx >= (int)json_object_array_length(arr))
+    return(UINT64_MAX);
+
+  v = json_object_array_get_idx(arr, idx);
+
+  if(v == NULL)
+    return(UINT64_MAX);
+
+  if(json_object_is_type(v, json_type_int) ||
+     json_object_is_type(v, json_type_double))
+  {
+    int64_t s = json_object_get_int64(v);
+    return(s < 0 ? 0 : (uint64_t)s);
+  }
+
+  return(UINT64_MAX);
+}
+
+static double
+kr_json_str_double(struct json_object *obj, const char *key)
+{
+  struct json_object *v;
+  const char         *s;
+
+  if(obj == NULL || !json_object_object_get_ex(obj, key, &v))
+    return(NAN);
+
+  if(json_object_is_type(v, json_type_string))
+  {
+    s = json_object_get_string(v);
+    if(s == NULL || s[0] == '\0')
+      return(NAN);
+    return(strtod(s, NULL));
+  }
+
+  if(json_object_is_type(v, json_type_double) ||
+     json_object_is_type(v, json_type_int))
+    return(json_object_get_double(v));
+
+  return(NAN);
+}
+
+static void
+kr_exch_tickers_resp(int http_status, const char *body, size_t body_len,
+    const char *err, void *user)
+{
+  kr_exch_tickers_fwd_t       *fwd = user;
+  struct json_object          *root;
+  struct json_object          *errs;
+  struct json_object          *result;
+  exchange_ticker_snapshot_t  *rows = NULL;
+  size_t                       row_cap;
+  size_t                       kept = 0;
+  size_t                       n_keys;
+
+  (void)http_status;
+
+  if(fwd == NULL)
+    return;
+
+  if(err != NULL)
+  {
+    fwd->cb(false, err, NULL, 0, fwd->user);
+    mem_free(fwd);
+    return;
+  }
+
+  root = json_parse_buf(body, body_len, KR_CTX);
+
+  if(root == NULL)
+  {
+    fwd->cb(false, "malformed JSON from Kraken Ticker",
+        NULL, 0, fwd->user);
+    mem_free(fwd);
+    return;
+  }
+
+  if(!json_object_is_type(root, json_type_object))
+  {
+    json_object_put(root);
+    fwd->cb(false, "unexpected Kraken Ticker response shape",
+        NULL, 0, fwd->user);
+    mem_free(fwd);
+    return;
+  }
+
+  // Kraken returns errors in the top-level "error" array. Non-empty
+  // means the request failed even on HTTP 200.
+  if(json_object_object_get_ex(root, "error", &errs) &&
+     json_object_is_type(errs, json_type_array) &&
+     json_object_array_length(errs) > 0)
+  {
+    char        ebuf[256];
+    size_t      eoff = 0;
+    int         ne   = (int)json_object_array_length(errs);
+    int         i;
+
+    ebuf[0] = '\0';
+    for(i = 0; i < ne && eoff < sizeof(ebuf); i++)
+    {
+      struct json_object *ev = json_object_array_get_idx(errs, i);
+      const char         *es;
+
+      if(ev == NULL || !json_object_is_type(ev, json_type_string))
+        continue;
+
+      es = json_object_get_string(ev);
+      if(es == NULL)
+        continue;
+
+      eoff += (size_t)snprintf(ebuf + eoff, sizeof(ebuf) - eoff,
+          "%s%s", eoff > 0 ? "; " : "", es);
+    }
+
+    json_object_put(root);
+    fwd->cb(false, ebuf[0] != '\0' ? ebuf : "Kraken Ticker error",
+        NULL, 0, fwd->user);
+    mem_free(fwd);
+    return;
+  }
+
+  if(!json_object_object_get_ex(root, "result", &result) ||
+     !json_object_is_type(result, json_type_object))
+  {
+    json_object_put(root);
+    fwd->cb(false, "unexpected Kraken Ticker result shape",
+        NULL, 0, fwd->user);
+    mem_free(fwd);
+    return;
+  }
+
+  // Count keys so we can size the heap array tightly.
+  n_keys = 0;
+  json_object_object_foreach(result, _k0, _v0)
+  {
+    (void)_k0;
+    (void)_v0;
+    n_keys++;
+  }
+
+  if(n_keys == 0)
+  {
+    json_object_put(root);
+    fwd->cb(true, NULL, NULL, 0, fwd->user);
+    mem_free(fwd);
+    return;
+  }
+
+  row_cap = n_keys;
+  if(row_cap > EXCHANGE_TICKERS_MAX)
+  {
+    clam(CLAM_WARN, KR_CTX,
+        "tickers: result map %zu exceeds cap %d; truncating",
+        n_keys, (int)EXCHANGE_TICKERS_MAX);
+    row_cap = EXCHANGE_TICKERS_MAX;
+  }
+
+  rows = mem_alloc(KR_CTX, "exch.tickers",
+      row_cap * sizeof(*rows));
+
+  if(rows == NULL)
+  {
+    json_object_put(root);
+    fwd->cb(false, "out of memory", NULL, 0, fwd->user);
+    mem_free(fwd);
+    return;
+  }
+
+  json_object_object_foreach(result, wire_key, pair_obj)
+  {
+    exchange_ticker_snapshot_t *out;
+    struct json_object         *arr_c;
+    struct json_object         *arr_v;
+    struct json_object         *arr_p;
+    struct json_object         *arr_t;
+    struct json_object         *arr_h;
+    struct json_object         *arr_l;
+    char                        canon[EXCHANGE_PRODUCT_ID_SZ];
+    double                      last;
+    double                      vwap_24h;
+    double                      open;
+
+    if(kept >= row_cap)
+      break;
+
+    if(pair_obj == NULL ||
+       !json_object_is_type(pair_obj, json_type_object))
+      continue;
+
+    if(wire_key == NULL)
+      continue;
+
+    kr_pair_lookup_abstr(wire_key, canon, sizeof(canon));
+
+    if(canon[0] == '\0')
+    {
+      clam(CLAM_DEBUG3, KR_CTX,
+          "tickers: drop uncanonical %s", wire_key);
+      continue;
+    }
+
+    arr_c = NULL; arr_v = NULL; arr_p = NULL;
+    arr_t = NULL; arr_h = NULL; arr_l = NULL;
+    (void)json_object_object_get_ex(pair_obj, "c", &arr_c);
+    (void)json_object_object_get_ex(pair_obj, "v", &arr_v);
+    (void)json_object_object_get_ex(pair_obj, "p", &arr_p);
+    (void)json_object_object_get_ex(pair_obj, "t", &arr_t);
+    (void)json_object_object_get_ex(pair_obj, "h", &arr_h);
+    (void)json_object_object_get_ex(pair_obj, "l", &arr_l);
+
+    last     = kr_json_arr_str_double(arr_c, 0);
+    vwap_24h = kr_json_arr_str_double(arr_p, 1);
+    open     = kr_json_str_double(pair_obj, "o");
+
+    out = &rows[kept];
+    memset(out, 0, sizeof(*out));
+    snprintf(out->product_id, sizeof(out->product_id), "%s", canon);
+
+    out->price          = last;
+    out->pct_24h        = (!isnan(last) && !isnan(open) && open != 0.0)
+                              ? (last - open) / open * 100.0 : NAN;
+    out->vol_24h_base   = kr_json_arr_str_double(arr_v, 1);
+    out->vol_24h_quote  = (!isnan(out->vol_24h_base) && !isnan(vwap_24h))
+                              ? out->vol_24h_base * vwap_24h : NAN;
+    out->hi_24h         = kr_json_arr_str_double(arr_h, 1);
+    out->lo_24h         = kr_json_arr_str_double(arr_l, 1);
+    out->vwap_24h       = vwap_24h;
+    out->num_trades_24h = kr_json_arr_uint64(arr_t, 1);
+    out->status         = EXCH_TICK_ONLINE;
+
+    kept++;
+  }
+
+  clam(CLAM_DEBUG2, KR_CTX,
+      "tickers: keys=%zu kept=%zu", n_keys, kept);
+
+  fwd->cb(true, NULL, rows, kept, fwd->user);
+
+  mem_free(rows);
+  json_object_put(root);
+  mem_free(fwd);
+}
+
+static bool
+kr_exch_fetch_all_tickers_async(exchange_done_tickers_cb_t cb, void *user)
+{
+  kr_exch_tickers_fwd_t *fwd;
+
+  if(cb == NULL)
+    return(FAIL);
+
+  fwd = mem_alloc(KR_CTX, "exch.tickers.fwd", sizeof(*fwd));
+
+  if(fwd == NULL)
+  {
+    cb(false, "out of memory", NULL, 0, user);
+    return(FAIL);
+  }
+
+  fwd->cb   = cb;
+  fwd->user = user;
+
+  // kr_submit_public prepends "/0/public/" — pass only the leaf path.
+  if(exchange_request("kraken", EXCHANGE_PRIO_MARKET_BACKFILL,
+        EXCHANGE_OP_REST_GET, "Ticker", NULL,
+        kr_exch_tickers_resp, fwd) != SUCCESS)
+  {
+    cb(false, "failed to submit Kraken Ticker request",
+        NULL, 0, user);
+    mem_free(fwd);
+    return(FAIL);
+  }
+
+  return(SUCCESS);
+}
+
+// ------------------------------------------------------------------ //
 // File-scope vtable. Static so the abstraction can keep the pointer;  //
 // advertised_rps reflects Kraken Spot's tier-2 public API budget      //
 // (~1 req/s sustained, 15-call burst).                                 //
@@ -813,6 +1160,9 @@ static const exchange_protocol_vtable_t kr_vtable =
   // extra trampoline is needed at this layer.
   .ws_subscribe        = kr_ws_subscribe,
   .ws_unsubscribe      = kr_ws_unsubscribe,
+
+  // MW-1 capability hook.
+  .fetch_all_tickers   = kr_exch_fetch_all_tickers_async,
 };
 
 bool

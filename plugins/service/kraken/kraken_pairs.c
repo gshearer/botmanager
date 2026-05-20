@@ -282,3 +282,43 @@ kr_pair_lookup_ws(const char *input, char *out, size_t cap)
 
   kr_pair_copy(input, out, cap);
 }
+
+// MW-1: abstraction-canonical hyphenated form. Cache miss → empty
+// string (callers drop the row); never pass the wire id through, since
+// the abstraction's contract is that snapshot rows carry canonical IDs.
+void
+kr_pair_lookup_abstr(const char *input, char *out, size_t cap)
+{
+  const kraken_pair_t *r;
+  char                 ws[24];
+  size_t               i;
+
+  if(out == NULL || cap == 0)
+    return;
+
+  out[0] = '\0';
+
+  if(input == NULL || input[0] == '\0')
+    return;
+
+  pthread_mutex_lock(&kr_pairs.lock);
+  r = kr_pair_find_locked(input);
+
+  if(r == NULL || r->wsname[0] == '\0')
+  {
+    pthread_mutex_unlock(&kr_pairs.lock);
+    return;
+  }
+
+  kr_pair_copy(r->wsname, ws, sizeof(ws));
+  pthread_mutex_unlock(&kr_pairs.lock);
+
+  // Rewrite '/' → '-' in place; the wsname is already uppercase ISO.
+  for(i = 0; ws[i] != '\0'; i++)
+  {
+    if(ws[i] == '/')
+      ws[i] = '-';
+  }
+
+  snprintf(out, cap, "%s", ws);
+}

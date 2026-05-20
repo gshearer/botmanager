@@ -151,6 +151,14 @@ static bool
 exchange_init(void)
 {
   exchange_registry_init();
+
+  if(exchange_register_verbs() != SUCCESS)
+  {
+    clam(CLAM_FATAL, EXCHANGE_CTX,
+        "exchange operator verb registration failed");
+    return(FAIL);
+  }
+
   clam(CLAM_INFO, EXCHANGE_CTX, "exchange abstraction initialized");
   return(SUCCESS);
 }

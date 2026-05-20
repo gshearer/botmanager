@@ -16,7 +16,12 @@
 #include "gemini.h"
 
 #include "exchange_api.h"
+#include "json.h"
 
+#include "gemini_pairs.h"
+
+#include <math.h>
+#include <stdint.h>
 #include <stdio.h>
 #include <string.h>
 
@@ -827,6 +832,209 @@ gem_exch_fetch_candles_async(const char *product_id,
 }
 
 // ------------------------------------------------------------------ //
+// MW-1: bulk-ticker fetch                                              //
+//                                                                      //
+// `GET /v1/pricefeed` (public). Response is a flat JSON array of      //
+// {pair, price, percentChange24h}. Numeric fields are JSON strings.   //
+// Pair is the bare lowercase or uppercase concat ("BTCUSD"); the      //
+// abstraction-canonical form is the hyphenated uppercase ISO          //
+// ("BTC-USD"), produced via gem_pair_to_abstr. Pricefeed publishes    //
+// neither volume, hi/lo, vwap, nor trade count — every other field   //
+// is set to the absent sentinel.                                       //
+// ------------------------------------------------------------------ //
+
+typedef struct
+{
+  exchange_done_tickers_cb_t  cb;
+  void                       *user;
+} gem_exch_tickers_fwd_t;
+
+static double
+gem_json_str_double(struct json_object *v)
+{
+  const char *s;
+
+  if(v == NULL)
+    return(NAN);
+
+  if(json_object_is_type(v, json_type_string))
+  {
+    s = json_object_get_string(v);
+    if(s == NULL || s[0] == '\0')
+      return(NAN);
+    return(strtod(s, NULL));
+  }
+
+  if(json_object_is_type(v, json_type_double) ||
+     json_object_is_type(v, json_type_int))
+    return(json_object_get_double(v));
+
+  return(NAN);
+}
+
+static void
+gem_exch_tickers_resp(int http_status, const char *body, size_t body_len,
+    const char *err, void *user)
+{
+  gem_exch_tickers_fwd_t      *fwd = user;
+  struct json_object          *root;
+  exchange_ticker_snapshot_t  *rows = NULL;
+  size_t                       row_cap;
+  size_t                       kept = 0;
+  int                          len;
+  int                          i;
+
+  (void)http_status;
+
+  if(fwd == NULL)
+    return;
+
+  if(err != NULL)
+  {
+    fwd->cb(false, err, NULL, 0, fwd->user);
+    mem_free(fwd);
+    return;
+  }
+
+  root = json_parse_buf(body, body_len, GEM_CTX);
+
+  if(root == NULL)
+  {
+    fwd->cb(false, "malformed JSON from Gemini pricefeed",
+        NULL, 0, fwd->user);
+    mem_free(fwd);
+    return;
+  }
+
+  if(!json_object_is_type(root, json_type_array))
+  {
+    json_object_put(root);
+    fwd->cb(false, "unexpected Gemini pricefeed response shape",
+        NULL, 0, fwd->user);
+    mem_free(fwd);
+    return;
+  }
+
+  len = (int)json_object_array_length(root);
+
+  if(len <= 0)
+  {
+    json_object_put(root);
+    fwd->cb(true, NULL, NULL, 0, fwd->user);
+    mem_free(fwd);
+    return;
+  }
+
+  row_cap = (size_t)len;
+  if(row_cap > EXCHANGE_TICKERS_MAX)
+  {
+    clam(CLAM_WARN, GEM_CTX,
+        "tickers: pricefeed array %d exceeds cap %d; truncating",
+        len, (int)EXCHANGE_TICKERS_MAX);
+    row_cap = EXCHANGE_TICKERS_MAX;
+  }
+
+  rows = mem_alloc(GEM_CTX, "exch.tickers",
+      row_cap * sizeof(*rows));
+
+  if(rows == NULL)
+  {
+    json_object_put(root);
+    fwd->cb(false, "out of memory", NULL, 0, fwd->user);
+    mem_free(fwd);
+    return;
+  }
+
+  for(i = 0; i < len && kept < row_cap; i++)
+  {
+    struct json_object         *row = json_object_array_get_idx(root, i);
+    struct json_object         *v;
+    exchange_ticker_snapshot_t *out;
+    const char                 *pair;
+    char                        canon[EXCHANGE_PRODUCT_ID_SZ];
+
+    if(row == NULL || !json_object_is_type(row, json_type_object))
+      continue;
+
+    if(!json_object_object_get_ex(row, "pair", &v) ||
+       !json_object_is_type(v, json_type_string))
+      continue;
+
+    pair = json_object_get_string(v);
+    if(pair == NULL || pair[0] == '\0')
+      continue;
+
+    gem_pair_to_abstr(pair, canon, sizeof(canon));
+
+    if(canon[0] == '\0')
+    {
+      clam(CLAM_DEBUG3, GEM_CTX,
+          "tickers: drop uncanonical %s", pair);
+      continue;
+    }
+
+    out = &rows[kept];
+    memset(out, 0, sizeof(*out));
+    snprintf(out->product_id, sizeof(out->product_id), "%s", canon);
+
+    out->price = json_object_object_get_ex(row, "price", &v)
+                     ? gem_json_str_double(v) : NAN;
+    out->pct_24h = json_object_object_get_ex(row, "percentChange24h", &v)
+                     ? gem_json_str_double(v) : NAN;
+    out->vol_24h_base   = NAN;
+    out->vol_24h_quote  = NAN;
+    out->hi_24h         = NAN;
+    out->lo_24h         = NAN;
+    out->vwap_24h       = NAN;
+    out->num_trades_24h = UINT64_MAX;
+    out->status         = EXCH_TICK_ONLINE;
+
+    kept++;
+  }
+
+  clam(CLAM_DEBUG2, GEM_CTX,
+      "tickers: pricefeed=%d kept=%zu", len, kept);
+
+  fwd->cb(true, NULL, rows, kept, fwd->user);
+
+  mem_free(rows);
+  json_object_put(root);
+  mem_free(fwd);
+}
+
+static bool
+gem_exch_fetch_all_tickers_async(exchange_done_tickers_cb_t cb, void *user)
+{
+  gem_exch_tickers_fwd_t *fwd;
+
+  if(cb == NULL)
+    return(FAIL);
+
+  fwd = mem_alloc(GEM_CTX, "exch.tickers.fwd", sizeof(*fwd));
+
+  if(fwd == NULL)
+  {
+    cb(false, "out of memory", NULL, 0, user);
+    return(FAIL);
+  }
+
+  fwd->cb   = cb;
+  fwd->user = user;
+
+  if(exchange_request("gemini", EXCHANGE_PRIO_MARKET_BACKFILL,
+        EXCHANGE_OP_REST_GET, "/v1/pricefeed", NULL,
+        gem_exch_tickers_resp, fwd) != SUCCESS)
+  {
+    cb(false, "failed to submit Gemini pricefeed request",
+        NULL, 0, user);
+    mem_free(fwd);
+    return(FAIL);
+  }
+
+  return(SUCCESS);
+}
+
+// ------------------------------------------------------------------ //
 // File-scope vtable.                                                  //
 //                                                                     //
 // advertised_rps = 8 matches Coinbase (Gemini's documented private    //
@@ -855,6 +1063,9 @@ static const exchange_protocol_vtable_t gem_vtable =
 
   .ws_subscribe        = gem_ws_subscribe,
   .ws_unsubscribe      = gem_ws_unsubscribe,
+
+  // MW-1 capability hook.
+  .fetch_all_tickers   = gem_exch_fetch_all_tickers_async,
 };
 
 bool

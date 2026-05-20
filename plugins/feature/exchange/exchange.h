@@ -245,5 +245,10 @@ void          exchange_req_fail(exchange_req_t *r, int http_status,
 void          exchange_req_succeed(exchange_req_t *r, int http_status,
                   const char *body, size_t body_len);
 
+// exchange_cmds.c — register operator verbs (currently just
+// /exchange tickers). Called from exchange_init after the registry is
+// up. Returns FAIL on a duplicate registration or task-pool failure.
+bool          exchange_register_verbs(void);
+
 #endif // EXCHANGE_INTERNAL
 #endif // BM_EXCHANGE_H

@@ -107,6 +107,15 @@ typedef void (*exchange_response_cb_t)(int http_status,
 // constraint that bounds a single dispatch.
 #define EXCHANGE_MAX_CANDLES      720
 
+// MW-1: per-call upper bound on the bulk-ticker snapshot array. Sized
+// well above the largest live exchange surface seen at MW-1 ship time:
+//   Kraken   ~1770 spot pairs (2026-05; was ~600 when chunk was authored)
+//   Coinbase  ~920 spot+stable products
+//   Gemini    ~420 native symbols
+// Acts as a sanity ceiling — adapters allocate dynamically from the
+// parsed row count and drop excess with one WARN if breached.
+#define EXCHANGE_TICKERS_MAX     2048
+
 // Capability snapshot returned by exchange_get_capabilities. Reflects
 // the protocol vtable's current view: `has_credentials` consults the
 // optional `is_authenticated` hook (true when hook is NULL — public-
@@ -255,6 +264,51 @@ typedef struct
   uint32_t           count;
   exchange_candle_t  rows[EXCHANGE_MAX_CANDLES];
 } exchange_candles_result_t;
+
+// ------------------------------------------------------------------ //
+// Bulk-ticker types (MW-1).                                            //
+//                                                                      //
+// One snapshot row per pair returned by an exchange's all-pairs ticker //
+// REST endpoint. Fields the exchange does not publish are reported as  //
+// NAN (doubles) or UINT64_MAX (counts) so consumers can distinguish    //
+// "absent" from "zero". `product_id` is the abstraction-canonical      //
+// hyphenated uppercase form (BTC-USD); adapters canonicalize on the    //
+// way in and drop rows whose wire id has no canonical mapping. The     //
+// snapshot array itself is allocated on the heap by the adapter (sized //
+// to the parsed count) and freed after the typed callback returns.     //
+// ------------------------------------------------------------------ //
+
+typedef enum
+{
+  EXCH_TICK_UNKNOWN     = 0,
+  EXCH_TICK_ONLINE      = 1,
+  EXCH_TICK_OFFLINE     = 2,
+  EXCH_TICK_LIMIT_ONLY  = 3,
+  EXCH_TICK_POST_ONLY   = 4
+} exchange_ticker_status_t;
+
+typedef struct
+{
+  char     product_id[EXCHANGE_PRODUCT_ID_SZ]; // canonical "BTC-USD"
+  double   price;                              // last trade; NAN if absent
+  double   pct_24h;                            // signed; NAN if absent
+  double   vol_24h_base;                       // 24h base-asset vol; NAN if absent
+  double   vol_24h_quote;                      // 24h quote-asset vol; NAN if absent
+  double   hi_24h;                             // NAN if absent
+  double   lo_24h;                             // NAN if absent
+  double   vwap_24h;                           // NAN if absent
+  uint64_t num_trades_24h;                     // UINT64_MAX if absent
+  exchange_ticker_status_t status;
+} exchange_ticker_snapshot_t;
+
+// Callback signature for bulk-ticker results. `snaps` points to a
+// contiguous array of `n` rows owned by the adapter; the pointer is
+// only valid for the duration of the callback. Same threading rules as
+// the other typed callbacks — fired on the protocol plugin's curl
+// worker thread; consumers must not block.
+typedef void (*exchange_done_tickers_cb_t)(bool success,
+    const char *err,
+    const exchange_ticker_snapshot_t *snaps, size_t n, void *user);
 
 // ------------------------------------------------------------------ //
 // WebSocket types (KR-2).                                             //
@@ -481,6 +535,11 @@ typedef struct
                          exchange_ws_event_cb_t cb, void *u,
                          exchange_ws_sub_t **out_handle);
   void   (*ws_unsubscribe)(exchange_ws_sub_t *handle);
+
+  // MW-1 capability hook. Bulk-ticker fetch — single REST call returning
+  // a snapshot row per pair. Public market data; no auth gate. NULL =
+  // unsupported by this exchange (public shim FAILs with a stable error).
+  bool   (*fetch_all_tickers)(exchange_done_tickers_cb_t cb, void *u);
 } exchange_protocol_vtable_t;
 
 // ------------------------------------------------------------------
@@ -575,6 +634,16 @@ bool exchange_get_accounts_async(const char *name,
 bool exchange_fetch_candles_async(const char *name, const char *product_id,
     exchange_granularity_t gran, int64_t since_ms, int64_t until_ms,
     exchange_done_candles_cb_t cb, void *user);
+
+// MW-1: bulk-ticker fetch — single REST call returning all pairs the
+// exchange exposes. Public market data; no auth gate. On pre-flight
+// FAIL (unknown exchange, missing vtable hook), the typed callback
+// fires synchronously with `err` populated and the function returns
+// FAIL. Otherwise SUCCESS means the request was queued and the
+// callback will fire asynchronously on the protocol plugin's curl
+// worker thread.
+bool exchange_fetch_all_tickers_async(const char *name,
+    exchange_done_tickers_cb_t cb, void *user);
 
 // KR-2: WS subscribe. The protocol plugin is responsible for per-channel
 // auth gating (user channel requires creds; ticker/trades are public).
@@ -908,6 +977,31 @@ exchange_fetch_candles_async(const char *name, const char *product_id,
     __atomic_store_n(&cached, fn, __ATOMIC_RELEASE);
   }
   return(fn(name, product_id, gran, since_ms, until_ms, cb, user));
+}
+
+static inline bool
+exchange_fetch_all_tickers_async(const char *name,
+    exchange_done_tickers_cb_t cb, void *user)
+{
+  typedef bool (*fn_t)(const char *, exchange_done_tickers_cb_t, void *);
+  static fn_t cached = NULL;
+  fn_t        fn     = __atomic_load_n(&cached, __ATOMIC_ACQUIRE);
+
+  if(fn == NULL)
+  {
+    union { void *obj; fn_t fn; } u;
+
+    u.obj = plugin_dlsym("exchange", "exchange_fetch_all_tickers_async");
+    if(u.obj == NULL)
+    {
+      clam(CLAM_FATAL, "exchange",
+          "dlsym failed: exchange_fetch_all_tickers_async");
+      abort();
+    }
+    fn = u.fn;
+    __atomic_store_n(&cached, fn, __ATOMIC_RELEASE);
+  }
+  return(fn(name, cb, user));
 }
 
 static inline bool

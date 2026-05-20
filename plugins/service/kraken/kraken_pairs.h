@@ -43,4 +43,11 @@ uint32_t kr_pairs_count(void);
 void    kr_pair_lookup_rest(const char *input, char *out, size_t cap);
 void    kr_pair_lookup_ws  (const char *input, char *out, size_t cap);
 
+// MW-1: abstraction-side canonical form (hyphenated uppercase ISO,
+// e.g. "BTC-USD"). Derived from the cached wsname ("BTC/USD") with
+// `/` rewritten to `-`. On a cache miss `out` is set to the empty
+// string — caller treats that as "drop this row" rather than passing
+// the input through, since uncanonical IDs leak into the abstraction.
+void    kr_pair_lookup_abstr(const char *input, char *out, size_t cap);
+
 #endif // BM_KRAKEN_PAIRS_H
