@@ -208,9 +208,15 @@ not Kraken's `XXBTZUSD` or Gemini's `btcusd`).
 
 | Context pattern | When emitted | Body fields |
 |---|---|---|
-| `mw.<exch>.hot.<id>` | Pair entered HOT state (one or more signals crossed). | `ts, exch, id, price, pct_24h, vel_pct, vel_window_min, hi_24h, lo_24h, vol_24h_q, trigger, state="hot"` |
+| `mw.<exch>.hot.<id>` | Pair entered HOT state (one or more signals crossed). | `ts, exch, id, price, pct_24h, vel_pct, vel_window_min, vol_z, hi_24h, lo_24h, vol_24h_q, trigger, state="hot"` |
 | `mw.<exch>.cool.<id>` | Pair returned to baseline (post-hysteresis + cooldown). | Same shape; `trigger=""`, `state="cool"`. |
 | `mw.<exch>.upd.<id>` | Pair still HOT; throttled re-emit (interval = `upd_throttle_sec`). | Same shape; `state="upd"`. |
+
+`vol_z` is the rolling-mean+stdev z-score of the just-pushed
+`vol_24h_quote` against the per-pair ring history (excluding the
+just-pushed entry). One-sided (positive z only). Renders as `null`
+when the exchange does not ship `vol_24h_quote` (Gemini pricefeed)
+or the ring holds fewer than `MW_VOL_Z_MIN_SAMPLES` finite samples.
 
 ### Trigger token values
 
@@ -221,6 +227,7 @@ that fired on the emitting tick. Possible tokens:
 - `velocity` — short-window % change crossed `vel_pct_thresh_x100`.
 - `brk_hi` — this tick set a new 24h high.
 - `brk_lo` — this tick set a new 24h low.
+- `vol_z` — positive volume z-score crossed `vol_z_thresh_x100`.
 
 ### Pre-allocated future topics
 

@@ -63,6 +63,8 @@
 #define MW_PCT_24H_THRESH_DEFAULT      500       // 5.00 %
 #define MW_VEL_PCT_THRESH_DEFAULT      200       // 2.00 %
 #define MW_VEL_WINDOW_MIN_DEFAULT       10       // minutes
+#define MW_VOL_Z_THRESH_DEFAULT        300       // 3.00 sigma
+#define MW_VOL_Z_MIN_SAMPLES            10       // history floor
 #define MW_MIN_VOL_USD_DEFAULT     1000000ull    // $1M 24h quote-vol
 #define MW_COOLDOWN_SEC_DEFAULT        300
 #define MW_UPD_THROTTLE_SEC_DEFAULT    300
@@ -85,6 +87,7 @@
 #define MW_TRIG_VELOCITY       (1u << 1)
 #define MW_TRIG_BRK_HI         (1u << 2)
 #define MW_TRIG_BRK_LO         (1u << 3)
+#define MW_TRIG_VOL_Z          (1u << 4)
 
 // Per-exchange KV key buffer size. Longest tail is ".enabled" (8
 // bytes) below "plugin.whenmoon.mw." (19) + EXCHANGE_NAME_SZ (32) +
@@ -149,6 +152,7 @@ typedef struct
   uint32_t              pct_24h_thresh_x100;  // signal × 100
   uint32_t              vel_pct_thresh_x100;
   uint32_t              vel_window_ms;
+  uint32_t              vol_z_thresh_x100;    // sigma × 100
   uint64_t              min_vol_usd;
   uint32_t              cooldown_ms;
   uint32_t              upd_throttle_ms;
@@ -216,6 +220,11 @@ mw_load_detector_thresholds(mw_exch_t *ex)
   v = kv_get_uint(key);
   ex->vel_pct_thresh_x100 =
       (uint32_t)(v == 0 ? MW_VEL_PCT_THRESH_DEFAULT : v);
+
+  mw_kv_key(key, sizeof(key), ex->name, "vol_z_thresh_x100");
+  v = kv_get_uint(key);
+  ex->vol_z_thresh_x100 =
+      (uint32_t)(v == 0 ? MW_VOL_Z_THRESH_DEFAULT : v);
 
   mw_kv_key(key, sizeof(key), ex->name, "vel_window_min");
   v = kv_get_uint(key);
@@ -376,6 +385,80 @@ mw_compute_velocity_pct(const mw_pair_t *pp, uint32_t window_ms,
   return(NAN);   // ring shallower than window
 }
 
+// Volume z-score over pp->ring, EXCLUDING the just-pushed entry (it
+// lives at (ring_head - 1) mod ring_n after mw_ring_push). Two-pass
+// mean+stdev — N is small enough (default 60) that a single-pass
+// numerically-stable variant is unnecessary; clarity wins. Sample
+// stdev (N-1 denominator) is conservative for the ring sizes in play.
+//
+// Returns NAN when:
+//   * the just-pushed vol is itself NaN (exchange doesn't ship vol);
+//   * pp->snap_count is below MW_VOL_Z_MIN_SAMPLES + 1 (cold pair);
+//   * fewer than MW_VOL_Z_MIN_SAMPLES finite-vol historical entries
+//     exist (intermittent drops in the ring);
+//   * sample stdev is effectively zero (degenerate constant-vol
+//     history — z-score undefined).
+//
+// Caller holds ex->lock.
+static double
+mw_compute_vol_z(const mw_pair_t *pp, uint32_t ring_n,
+    const exchange_ticker_snapshot_t *snap)
+{
+  uint32_t newest_idx;
+  uint32_t hops;
+  uint32_t idx;
+  uint32_t n_finite = 0;
+  double   sum      = 0.0;
+  double   mean;
+  double   ss       = 0.0;
+  double   var;
+  double   stdev;
+  double   d;
+
+  if(pp->ring == NULL || ring_n == 0)            return(NAN);
+  if(isnan(snap->vol_24h_quote))                 return(NAN);
+  if(pp->snap_count < MW_VOL_Z_MIN_SAMPLES + 1)  return(NAN);
+
+  newest_idx = (pp->ring_head + ring_n - 1) % ring_n;
+
+  // Pass 1: mean of historical (non-newest) finite vol_24h_quote.
+  for(hops = 1; hops < pp->snap_count; hops++)
+  {
+    idx = (newest_idx + ring_n - hops) % ring_n;
+
+    if(!isnan(pp->ring[idx].vol_24h_quote))
+    {
+      sum += pp->ring[idx].vol_24h_quote;
+      n_finite++;
+    }
+  }
+
+  if(n_finite < MW_VOL_Z_MIN_SAMPLES)
+    return(NAN);
+
+  mean = sum / (double)n_finite;
+
+  // Pass 2: sample stdev over the same set.
+  for(hops = 1; hops < pp->snap_count; hops++)
+  {
+    idx = (newest_idx + ring_n - hops) % ring_n;
+
+    if(!isnan(pp->ring[idx].vol_24h_quote))
+    {
+      d   = pp->ring[idx].vol_24h_quote - mean;
+      ss += d * d;
+    }
+  }
+
+  var   = ss / (double)(n_finite - 1);
+  stdev = sqrt(var);
+
+  if(stdev < 1e-9)
+    return(NAN);
+
+  return((snap->vol_24h_quote - mean) / stdev);
+}
+
 // Render `mw.<exch>.<event>.<id>` into out (cap = CLAM_CTX_SZ). On
 // truncation, the rendered string is still NUL-terminated and matches
 // subscribers' prefix regexes — log one WARN per (exch, event) so the
@@ -494,7 +577,14 @@ mw_format_triggers(char *out, size_t sz, uint8_t bits)
   }
 
   if(bits & MW_TRIG_BRK_LO && off < sz)
-    snprintf(out + off, sz - off, "%sbrk_lo", first ? "" : "+");
+  {
+    off += snprintf(out + off, sz - off, "%sbrk_lo",
+        first ? "" : "+");
+    first = false;
+  }
+
+  if(bits & MW_TRIG_VOL_Z && off < sz)
+    snprintf(out + off, sz - off, "%svol_z", first ? "" : "+");
 }
 
 // Render the single-line JSON body. Returns true on full render,
@@ -502,7 +592,7 @@ mw_format_triggers(char *out, size_t sz, uint8_t bits)
 static bool
 mw_format_body(char *out, size_t sz, const mw_exch_t *ex,
     const exchange_ticker_snapshot_t *snap, int64_t now_ms,
-    double vel_pct, uint8_t triggers, const char *state)
+    double vel_pct, double vol_z, uint8_t triggers, const char *state)
 {
   size_t  off = 0;
   char    scratch[160];
@@ -544,6 +634,10 @@ mw_format_body(char *out, size_t sz, const mw_exch_t *ex,
       (unsigned)(ex->vel_window_ms / 60000u));
   if(!mw_body_append(out, sz, &off, scratch)) return(false);
 
+  if(!mw_body_append_dbl(out, sz, &off, "vol_z", "%.2f", vol_z))
+    return(false);
+  if(!mw_body_append(out, sz, &off, ",")) return(false);
+
   if(!mw_body_append_dbl(out, sz, &off, "hi_24h", "%.8g",
         snap->hi_24h)) return(false);
   if(!mw_body_append(out, sz, &off, ",")) return(false);
@@ -572,18 +666,20 @@ mw_format_body(char *out, size_t sz, const mw_exch_t *ex,
 static uint8_t
 mw_compute_triggers(const mw_exch_t *ex, const mw_pair_t *pp,
     const exchange_ticker_snapshot_t *snap, double vel_pct,
-    uint32_t scale_num, uint32_t scale_den)
+    double vol_z, uint32_t scale_num, uint32_t scale_den)
 {
   uint8_t  bits = 0;
   uint64_t pct_thresh;
   uint64_t vel_thresh;
+  uint64_t vol_z_thresh;
 
   // Avoid 0-division if a caller passes a bad scale.
   if(scale_den == 0)
     scale_den = 1;
 
-  pct_thresh = (uint64_t)ex->pct_24h_thresh_x100 * scale_num / scale_den;
-  vel_thresh = (uint64_t)ex->vel_pct_thresh_x100 * scale_num / scale_den;
+  pct_thresh   = (uint64_t)ex->pct_24h_thresh_x100 * scale_num / scale_den;
+  vel_thresh   = (uint64_t)ex->vel_pct_thresh_x100 * scale_num / scale_den;
+  vol_z_thresh = (uint64_t)ex->vol_z_thresh_x100   * scale_num / scale_den;
 
   if(!isnan(snap->pct_24h)
       && (uint64_t)(fabs(snap->pct_24h) * 100.0) >= pct_thresh)
@@ -607,6 +703,14 @@ mw_compute_triggers(const mw_exch_t *ex, const mw_pair_t *pp,
       && snap->price <= pp->prev_lo_24h)
     bits |= MW_TRIG_BRK_LO;
 
+  // One-sided: positive z (high-volume spike) only. Negative z is the
+  // quiet-pair signal, not in scope for this initiative.
+  if(pp->snap_count >= MW_VOL_Z_MIN_SAMPLES + 1
+      && !isnan(vol_z)
+      && vol_z > 0.0
+      && (uint64_t)(vol_z * 100.0) >= vol_z_thresh)
+    bits |= MW_TRIG_VOL_Z;
+
   return(bits);
 }
 
@@ -620,6 +724,7 @@ mw_detect_pair(mw_exch_t *ex, mw_pair_t *pp,
     mw_emit_t *out_emit)
 {
   double   vel_pct;
+  double   vol_z;
   uint8_t  triggers;
   uint8_t  hyst_triggers;
   bool     queued = false;
@@ -627,7 +732,8 @@ mw_detect_pair(mw_exch_t *ex, mw_pair_t *pp,
   const char *state_str = NULL;
 
   vel_pct = mw_compute_velocity_pct(pp, ex->vel_window_ms, now_ms);
-  triggers = mw_compute_triggers(ex, pp, snap, vel_pct, 1, 1);
+  vol_z   = mw_compute_vol_z(pp, mw_g.ring_n, snap);
+  triggers = mw_compute_triggers(ex, pp, snap, vel_pct, vol_z, 1, 1);
 
   // Min-volume gate on HOT entry only. Bypassed when the exchange
   // didn't publish a quote volume (Gemini), to avoid suppressing every
@@ -637,7 +743,7 @@ mw_detect_pair(mw_exch_t *ex, mw_pair_t *pp,
       && snap->vol_24h_quote < (double)ex->min_vol_usd)
     triggers = 0;
 
-  hyst_triggers = mw_compute_triggers(ex, pp, snap, vel_pct,
+  hyst_triggers = mw_compute_triggers(ex, pp, snap, vel_pct, vol_z,
       MW_HOT_HYST_NUM, MW_HOT_HYST_DEN);
 
   // State machine.
@@ -705,7 +811,7 @@ mw_detect_pair(mw_exch_t *ex, mw_pair_t *pp,
       ex->name, event_str, snap->product_id);
 
   if(!mw_format_body(out_emit->body, sizeof(out_emit->body),
-        ex, snap, now_ms, vel_pct, triggers, state_str))
+        ex, snap, now_ms, vel_pct, vol_z, triggers, state_str))
   {
     // Body overflow is unreachable in practice with single-line JSON
     // of ~10 fields, but be loud + drop quietly if it ever fires.
@@ -1153,6 +1259,16 @@ mw_start(void)
     if(kv_register(key, KV_UINT32, "0", NULL, NULL, help) != SUCCESS)
       clam(CLAM_DEBUG, MW_CTX,
           "%s: kv_register .vel_pct_thresh_x100 already present",
+          ex->name);
+
+    mw_kv_key(key, sizeof(key), ex->name, "vol_z_thresh_x100");
+    snprintf(help, sizeof(help),
+        "MW: volume z-score threshold for %s, sigma × 100"
+        " (300 = 3.00 sigma). One-sided (positive z only)."
+        " 0 = MW_VOL_Z_THRESH_DEFAULT.", ex->name);
+    if(kv_register(key, KV_UINT32, "0", NULL, NULL, help) != SUCCESS)
+      clam(CLAM_DEBUG, MW_CTX,
+          "%s: kv_register .vol_z_thresh_x100 already present",
           ex->name);
 
     mw_kv_key(key, sizeof(key), ex->name, "vel_window_min");
@@ -1634,6 +1750,7 @@ mw_render_status_exch(method_inst_t *inst, const char *target,
   uint32_t   pct_24h_thresh_x100;
   uint32_t   vel_pct_thresh_x100;
   uint32_t   vel_window_ms;
+  uint32_t   vol_z_thresh_x100;
   uint64_t   min_vol_usd;
   uint32_t   cooldown_ms;
   uint32_t   upd_throttle_ms;
@@ -1685,6 +1802,7 @@ mw_render_status_exch(method_inst_t *inst, const char *target,
   pct_24h_thresh_x100  = ex->pct_24h_thresh_x100;
   vel_pct_thresh_x100  = ex->vel_pct_thresh_x100;
   vel_window_ms        = ex->vel_window_ms;
+  vol_z_thresh_x100    = ex->vol_z_thresh_x100;
   min_vol_usd          = ex->min_vol_usd;
   cooldown_ms          = ex->cooldown_ms;
   upd_throttle_ms      = ex->upd_throttle_ms;
@@ -1728,10 +1846,11 @@ mw_render_status_exch(method_inst_t *inst, const char *target,
   // botmanctl/IRC paths don't word-wrap on narrower terminals.
   snprintf(line, sizeof(line),
       "  thresholds: pct_24h>=%.2f%% velocity>=%.2f%% window=%us"
-      " min_vol=%" PRIu64 " cooldown=%us upd=%us",
+      " vol_z>=%.2fsig min_vol=%" PRIu64 " cooldown=%us upd=%us",
       (double)pct_24h_thresh_x100 / 100.0,
       (double)vel_pct_thresh_x100 / 100.0,
       (unsigned)(vel_window_ms / 1000u),
+      (double)vol_z_thresh_x100 / 100.0,
       min_vol_usd,
       (unsigned)(cooldown_ms / 1000u),
       (unsigned)(upd_throttle_ms / 1000u));
