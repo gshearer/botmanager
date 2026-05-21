@@ -129,6 +129,13 @@ typedef struct
   int64_t                       last_emit_ms;     // last hot|upd emission
   double                        prev_hi_24h;      // for BRK_HI gate
   double                        prev_lo_24h;      // for BRK_LO gate
+
+  // MW-5: lifecycle bookkeeping. tick_id values gate add/rem detection;
+  // prev_status gates STAT. EXCH_TICK_UNKNOWN as prev_status suppresses
+  // STAT on first observation of the slot.
+  uint64_t                      first_seen_tick;
+  uint64_t                      last_seen_tick;
+  uint8_t                       prev_status;      // exchange_ticker_status_t
 } mw_pair_t;
 
 typedef struct
@@ -159,6 +166,15 @@ typedef struct
   uint64_t              total_emits_hot;
   uint64_t              total_emits_cool;
   uint64_t              total_emits_upd;
+
+  // MW-5: monotonic per-exchange tick counter. tick_id==1 is the
+  // bootstrap tick — ADD + STAT emits are suppressed there and the
+  // rem-sweep is skipped. Reset to 0 in mw_disable_exch so a re-enable
+  // re-triggers the bootstrap path.
+  uint64_t              tick_id;
+  uint64_t              total_emits_add;
+  uint64_t              total_emits_rem;
+  uint64_t              total_emits_stat;
 } mw_exch_t;
 
 // MW-3: one queued CLAM emission. Built under ex->lock, drained
@@ -269,33 +285,78 @@ mw_find_exch_by_name(const char *name)
   return(NULL);
 }
 
+// MW-5: split out of the old mw_pair_find_or_insert so the caller can
+// observe which path it took (find-existing vs new-insert) for ADD
+// detection. Tombstones (product_id[0]=='\0', left behind by
+// mw_rem_sweep) are skipped here and reused first by mw_pair_insert.
 static uint32_t
-mw_pair_find_or_insert(mw_exch_t *ex, const char *product_id)
+mw_pair_find(const mw_exch_t *ex, const char *product_id)
 {
   uint32_t i;
 
   for(i = 0; i < ex->pair_count; i++)
   {
-    if(strncmp(ex->pairs[i].product_id, product_id,
-          EXCHANGE_PRODUCT_ID_SZ) == 0)
+    if(ex->pairs[i].product_id[0] != '\0'
+        && strncmp(ex->pairs[i].product_id, product_id,
+            EXCHANGE_PRODUCT_ID_SZ) == 0)
       return(i);
   }
 
-  if(ex->pair_count >= ex->pair_cap)
-    return(UINT32_MAX);
+  return(UINT32_MAX);
+}
 
-  i = ex->pair_count++;
-  snprintf(ex->pairs[i].product_id, sizeof(ex->pairs[i].product_id),
+// Allocates a slot for product_id. Tombstones are reused before
+// extending the table — keeps pair_count bounded across cycles of
+// listing churn. Returns UINT32_MAX on cap-full. Initializes both
+// the MW-2 detector state and the MW-5 lifecycle fields; ring +
+// ring_ts allocations stay (slot-reuse semantics — ring history
+// does not carry across an add/rem/add cycle because snap_count
+// resets to 0 here).
+//
+// Caller must have already incremented ex->tick_id for this tick so
+// first_seen_tick + last_seen_tick land on the current tick.
+static uint32_t
+mw_pair_insert(mw_exch_t *ex, const char *product_id)
+{
+  uint32_t i;
+  uint32_t slot = UINT32_MAX;
+
+  // Tombstone reuse — scan within the high-water mark for an empty
+  // slot first.
+  for(i = 0; i < ex->pair_count; i++)
+  {
+    if(ex->pairs[i].product_id[0] == '\0')
+    {
+      slot = i;
+      break;
+    }
+  }
+
+  // Fall back to extending pair_count.
+  if(slot == UINT32_MAX)
+  {
+    if(ex->pair_count >= ex->pair_cap)
+      return(UINT32_MAX);
+    slot = ex->pair_count++;
+  }
+
+  snprintf(ex->pairs[slot].product_id, sizeof(ex->pairs[slot].product_id),
       "%s", product_id);
-  ex->pairs[i].snap_count       = 0;
-  ex->pairs[i].ring_head        = 0;
-  ex->pairs[i].state            = MW_PSTATE_COLD;
-  ex->pairs[i].last_trigger     = 0;
-  ex->pairs[i].state_changed_ms = 0;
-  ex->pairs[i].last_emit_ms     = 0;
-  ex->pairs[i].prev_hi_24h      = 0.0;
-  ex->pairs[i].prev_lo_24h      = 0.0;
-  return(i);
+  ex->pairs[slot].snap_count       = 0;
+  ex->pairs[slot].ring_head        = 0;
+  ex->pairs[slot].state            = MW_PSTATE_COLD;
+  ex->pairs[slot].last_trigger     = 0;
+  ex->pairs[slot].state_changed_ms = 0;
+  ex->pairs[slot].last_emit_ms     = 0;
+  ex->pairs[slot].prev_hi_24h      = 0.0;
+  ex->pairs[slot].prev_lo_24h      = 0.0;
+
+  // MW-5 lifecycle init.
+  ex->pairs[slot].first_seen_tick  = ex->tick_id;
+  ex->pairs[slot].last_seen_tick   = ex->tick_id;
+  ex->pairs[slot].prev_status      = EXCH_TICK_UNKNOWN;
+
+  return(slot);
 }
 
 static void
@@ -468,7 +529,10 @@ static void
 mw_format_topic(char *out, size_t sz, const char *exch,
     const char *event, const char *id)
 {
-  static bool warned[4];   // pct_24h doesn't apply — events: hot/cool/upd/add ish
+  // One bucket per event token: hot/cool/upd (MW-3/MW-4) +
+  // add/rem/stat (MW-5). Unknown tokens fall through to the last
+  // bucket.
+  static bool warned[6];
   int   n;
   int   event_idx;
 
@@ -479,10 +543,13 @@ mw_format_topic(char *out, size_t sz, const char *exch,
     // WARN-once per event token. We don't strictly need to scope it
     // per exchange — the per-event guard is enough to prevent log
     // floods; operators rarely add new exchanges.
-    if(strcmp(event, "hot") == 0)        event_idx = 0;
+    if(strcmp(event, "hot")  == 0)       event_idx = 0;
     else if(strcmp(event, "cool") == 0)  event_idx = 1;
-    else if(strcmp(event, "upd") == 0)   event_idx = 2;
-    else                                  event_idx = 3;
+    else if(strcmp(event, "upd")  == 0)  event_idx = 2;
+    else if(strcmp(event, "add")  == 0)  event_idx = 3;
+    else if(strcmp(event, "rem")  == 0)  event_idx = 4;
+    else if(strcmp(event, "stat") == 0)  event_idx = 5;
+    else                                  event_idx = 5;
 
     if(!warned[event_idx])
     {
@@ -502,16 +569,21 @@ static bool
 mw_body_append(char *buf, size_t cap, size_t *off, const char *frag)
 {
   size_t free_cap;
-  size_t fl;
+  size_t frag_len;
+  size_t copy_len;
 
   if(*off >= cap)
     return(false);
 
   free_cap = cap - *off;
-  fl       = strnlen(frag, free_cap);
+  // All call sites pass a NUL-terminated scratch buffer or string
+  // literal; using strlen avoids -Wstringop-overread on inlined
+  // callers where `free_cap` can exceed the scratch's allocation.
+  frag_len = strlen(frag);
+  copy_len = frag_len < free_cap ? frag_len : free_cap;
 
-  memcpy(buf + *off, frag, fl);
-  *off += fl;
+  memcpy(buf + *off, frag, copy_len);
+  *off += copy_len;
 
   if(*off < cap)
     buf[*off] = '\0';
@@ -521,7 +593,7 @@ mw_body_append(char *buf, size_t cap, size_t *off, const char *frag)
     return(false);
   }
 
-  return(fl < strlen(frag) ? false : true);
+  return(copy_len == frag_len);
 }
 
 // Render `%g` / `%f` field or the literal `null` if NaN. Writes into
@@ -658,6 +730,286 @@ mw_format_body(char *out, size_t sz, const mw_exch_t *ex,
 
   return(true);
 }
+
+// ------------------------------------------------------------------ //
+// MW-5: lifecycle (add/rem/stat) renderers + queue helpers            //
+// ------------------------------------------------------------------ //
+
+// Enum → wire string for status fields in MW-5 bodies. Mirrors the
+// canonical token list in plugins/feature/exchange/exchange_cmds.c
+// (exch_tickers_status_name) so operator-facing views stay aligned.
+static const char *
+mw_status_str(uint8_t s)
+{
+  switch((exchange_ticker_status_t)s)
+  {
+    case EXCH_TICK_ONLINE:     return("online");
+    case EXCH_TICK_OFFLINE:    return("offline");
+    case EXCH_TICK_LIMIT_ONLY: return("limit_only");
+    case EXCH_TICK_POST_ONLY:  return("post_only");
+    case EXCH_TICK_UNKNOWN:    /* fall through */
+    default:                   return("unknown");
+  }
+}
+
+// {"ts":..,"exch":"..","id":"..","price":..|null,"status":"..",
+//  "pct_24h":..|null,"vol_24h_q":..|null,"state":"add"}
+static bool
+mw_format_body_add(char *out, size_t sz, const mw_exch_t *ex,
+    const exchange_ticker_snapshot_t *snap)
+{
+  size_t  off = 0;
+  char    scratch[160];
+  int64_t ts_wall_ms = wm_now_ms();
+
+  out[0] = '\0';
+
+  snprintf(scratch, sizeof(scratch),
+      "{\"ts\":%" PRId64 ",\"exch\":\"%s\",\"id\":\"%s\",",
+      ts_wall_ms, ex->name, snap->product_id);
+  if(!mw_body_append(out, sz, &off, scratch)) return(false);
+
+  if(isnan(snap->price))
+    snprintf(scratch, sizeof(scratch), "\"price\":null,");
+  else
+    snprintf(scratch, sizeof(scratch), "\"price\":%.8g,", snap->price);
+  if(!mw_body_append(out, sz, &off, scratch)) return(false);
+
+  snprintf(scratch, sizeof(scratch),
+      "\"status\":\"%s\",", mw_status_str(snap->status));
+  if(!mw_body_append(out, sz, &off, scratch)) return(false);
+
+  if(!mw_body_append_dbl(out, sz, &off, "pct_24h", "%.2f",
+        snap->pct_24h)) return(false);
+  if(!mw_body_append(out, sz, &off, ",")) return(false);
+
+  if(!mw_body_append_dbl(out, sz, &off, "vol_24h_q", "%.2f",
+        snap->vol_24h_quote)) return(false);
+  if(!mw_body_append(out, sz, &off, ",")) return(false);
+
+  if(!mw_body_append(out, sz, &off, "\"state\":\"add\"}")) return(false);
+
+  return(true);
+}
+
+// {"ts":..,"exch":"..","id":"..","last_price":..|null,
+//  "last_status":"..","last_seen_polls":..,"state":"rem"}
+//
+// Built from saved slot state — the pair is no longer in this tick's
+// snap array. last_price reads from the newest ring entry;
+// last_status reads pp->prev_status (the most recent status observed
+// before the pair vanished); last_seen_polls is (tick_id -
+// last_seen_tick), which is the count of consecutive missed ticks
+// (typically 1 — the sweep clears slots immediately so a pair vanish
+// + re-appear cycle produces fresh ADD events, not extended REM gaps).
+static bool
+mw_format_body_rem(char *out, size_t sz, const mw_exch_t *ex,
+    const mw_pair_t *pp)
+{
+  size_t   off = 0;
+  char     scratch[160];
+  int64_t  ts_wall_ms = wm_now_ms();
+  const exchange_ticker_snapshot_t *latest;
+  double   last_price = NAN;
+  uint64_t polls;
+
+  out[0] = '\0';
+
+  latest = mw_pair_latest(pp, mw_g.ring_n);
+  if(latest != NULL)
+    last_price = latest->price;
+
+  polls = ex->tick_id - pp->last_seen_tick;
+
+  snprintf(scratch, sizeof(scratch),
+      "{\"ts\":%" PRId64 ",\"exch\":\"%s\",\"id\":\"%s\",",
+      ts_wall_ms, ex->name, pp->product_id);
+  if(!mw_body_append(out, sz, &off, scratch)) return(false);
+
+  if(isnan(last_price))
+    snprintf(scratch, sizeof(scratch), "\"last_price\":null,");
+  else
+    snprintf(scratch, sizeof(scratch), "\"last_price\":%.8g,",
+        last_price);
+  if(!mw_body_append(out, sz, &off, scratch)) return(false);
+
+  snprintf(scratch, sizeof(scratch),
+      "\"last_status\":\"%s\",\"last_seen_polls\":%" PRIu64
+      ",\"state\":\"rem\"}",
+      mw_status_str(pp->prev_status), polls);
+  if(!mw_body_append(out, sz, &off, scratch)) return(false);
+
+  return(true);
+}
+
+// {"ts":..,"exch":"..","id":"..","price":..|null,
+//  "prev_status":"..","new_status":"..","state":"stat"}
+static bool
+mw_format_body_stat(char *out, size_t sz, const mw_exch_t *ex,
+    const exchange_ticker_snapshot_t *snap, uint8_t prev_status)
+{
+  size_t  off = 0;
+  char    scratch[160];
+  int64_t ts_wall_ms = wm_now_ms();
+
+  out[0] = '\0';
+
+  snprintf(scratch, sizeof(scratch),
+      "{\"ts\":%" PRId64 ",\"exch\":\"%s\",\"id\":\"%s\",",
+      ts_wall_ms, ex->name, snap->product_id);
+  if(!mw_body_append(out, sz, &off, scratch)) return(false);
+
+  if(isnan(snap->price))
+    snprintf(scratch, sizeof(scratch), "\"price\":null,");
+  else
+    snprintf(scratch, sizeof(scratch), "\"price\":%.8g,", snap->price);
+  if(!mw_body_append(out, sz, &off, scratch)) return(false);
+
+  snprintf(scratch, sizeof(scratch),
+      "\"prev_status\":\"%s\",\"new_status\":\"%s\","
+      "\"state\":\"stat\"}",
+      mw_status_str(prev_status), mw_status_str(snap->status));
+  if(!mw_body_append(out, sz, &off, scratch)) return(false);
+
+  return(true);
+}
+
+// Queue an ADD emit into the per-tick pending buffer. Cap-check +
+// body-render-fail are handled here; the caller just sees the
+// counters update. Caller holds ex->lock.
+static void
+mw_queue_emit_add(mw_exch_t *ex,
+    const exchange_ticker_snapshot_t *snap, mw_emit_t *pending,
+    uint32_t *n_pending, uint32_t *n_dropped_emits)
+{
+  if(*n_pending >= MW_EMIT_BUF_CAP)
+  {
+    (*n_dropped_emits)++;
+    return;
+  }
+
+  mw_format_topic(pending[*n_pending].topic,
+      sizeof(pending[*n_pending].topic),
+      ex->name, "add", snap->product_id);
+
+  if(!mw_format_body_add(pending[*n_pending].body,
+        sizeof(pending[*n_pending].body), ex, snap))
+  {
+    clam(CLAM_DEBUG3, MW_CTX, "%s: body render overflow (add %s)",
+        ex->name, snap->product_id);
+    return;
+  }
+
+  (*n_pending)++;
+  ex->total_emits_add++;
+}
+
+// Queue a STAT emit. Same shape as ADD, plus prev_status. Caller
+// holds ex->lock.
+static void
+mw_queue_emit_stat(mw_exch_t *ex,
+    const exchange_ticker_snapshot_t *snap, uint8_t prev_status,
+    mw_emit_t *pending, uint32_t *n_pending,
+    uint32_t *n_dropped_emits)
+{
+  if(*n_pending >= MW_EMIT_BUF_CAP)
+  {
+    (*n_dropped_emits)++;
+    return;
+  }
+
+  mw_format_topic(pending[*n_pending].topic,
+      sizeof(pending[*n_pending].topic),
+      ex->name, "stat", snap->product_id);
+
+  if(!mw_format_body_stat(pending[*n_pending].body,
+        sizeof(pending[*n_pending].body), ex, snap, prev_status))
+  {
+    clam(CLAM_DEBUG3, MW_CTX, "%s: body render overflow (stat %s)",
+        ex->name, snap->product_id);
+    return;
+  }
+
+  (*n_pending)++;
+  ex->total_emits_stat++;
+}
+
+// Queue a REM emit. Different arg shape from add/stat because the
+// pair is no longer in this tick's snap array — body is built from
+// the saved slot state. Caller holds ex->lock.
+static void
+mw_queue_emit_rem(mw_exch_t *ex, const mw_pair_t *pp,
+    mw_emit_t *pending, uint32_t *n_pending,
+    uint32_t *n_dropped_emits)
+{
+  if(*n_pending >= MW_EMIT_BUF_CAP)
+  {
+    (*n_dropped_emits)++;
+    return;
+  }
+
+  mw_format_topic(pending[*n_pending].topic,
+      sizeof(pending[*n_pending].topic),
+      ex->name, "rem", pp->product_id);
+
+  if(!mw_format_body_rem(pending[*n_pending].body,
+        sizeof(pending[*n_pending].body), ex, pp))
+  {
+    clam(CLAM_DEBUG3, MW_CTX, "%s: body render overflow (rem %s)",
+        ex->name, pp->product_id);
+    return;
+  }
+
+  (*n_pending)++;
+  ex->total_emits_rem++;
+}
+
+// Post-loop sweep: emit REM for every populated slot whose
+// last_seen_tick != ex->tick_id (i.e. not refreshed this tick) and
+// != 0 (i.e. observed at least once before). Tombstones the slot
+// after emit so a future re-add starts a fresh cycle. Caller holds
+// ex->lock.
+static void
+mw_rem_sweep(mw_exch_t *ex, mw_emit_t *pending, uint32_t *n_pending,
+    uint32_t *n_dropped_emits)
+{
+  uint32_t i;
+  uint32_t removed = 0;
+
+  for(i = 0; i < ex->pair_count; i++)
+  {
+    if(ex->pairs[i].product_id[0]   == '\0')          continue;
+    if(ex->pairs[i].last_seen_tick  == 0)             continue;
+    if(ex->pairs[i].last_seen_tick  == ex->tick_id)   continue;
+
+    mw_queue_emit_rem(ex, &ex->pairs[i], pending, n_pending,
+        n_dropped_emits);
+
+    // Tombstone the slot. ring + ring_ts allocations are kept (slot
+    // reuse). Counters/state reset so a future re-add starts fresh.
+    ex->pairs[i].product_id[0]    = '\0';
+    ex->pairs[i].first_seen_tick  = 0;
+    ex->pairs[i].last_seen_tick   = 0;
+    ex->pairs[i].prev_status      = EXCH_TICK_UNKNOWN;
+    ex->pairs[i].snap_count       = 0;
+    ex->pairs[i].ring_head        = 0;
+    ex->pairs[i].state            = MW_PSTATE_COLD;
+    ex->pairs[i].last_trigger     = 0;
+    ex->pairs[i].state_changed_ms = 0;
+    ex->pairs[i].last_emit_ms     = 0;
+    ex->pairs[i].prev_hi_24h      = 0.0;
+    ex->pairs[i].prev_lo_24h      = 0.0;
+    removed++;
+  }
+
+  if(removed > 0)
+    clam(CLAM_DEBUG3, MW_CTX, "%s: rem sweep cleared %u slots",
+        ex->name, removed);
+}
+
+// ------------------------------------------------------------------ //
+// MW-3 detector internals (continued)                                 //
+// ------------------------------------------------------------------ //
 
 // Compute the four-bit trigger set against the given threshold scale.
 // `scale_num/scale_den` allow the hysteresis pass to use thresh×NUM/DEN
@@ -890,15 +1242,50 @@ mw_tickers_done_cb(bool success, const char *err,
   ring_n = mw_g.ring_n;
   now_ms = wm_dl_now_ms();
 
+  // MW-5: bump the tick counter before the per-snap loop so freshly
+  // inserted slots land first_seen_tick == ex->tick_id, and so the
+  // rem-sweep at the end compares against the same value. The
+  // bootstrap-suppression sentinel is ex->tick_id == 1.
+  ex->tick_id++;
+
   for(i = 0; i < n; i++)
   {
-    slot = mw_pair_find_or_insert(ex, snaps[i].product_id);
+    bool    just_inserted    = false;
+    bool    status_changed   = false;
+    uint8_t prev_status_save = EXCH_TICK_UNKNOWN;
+
+    slot = mw_pair_find(ex, snaps[i].product_id);
 
     if(slot == UINT32_MAX)
     {
-      drops_this_tick++;
-      continue;
+      slot = mw_pair_insert(ex, snaps[i].product_id);
+
+      if(slot == UINT32_MAX)
+      {
+        drops_this_tick++;
+        continue;
+      }
+
+      just_inserted = true;
     }
+
+    // MW-5: STAT detection — sample prev_status BEFORE the update
+    // below overwrites it. EXCH_TICK_UNKNOWN gates "no STAT on first
+    // real status observation" (works for both just-inserted slots
+    // and previously-tombstoned slots reused this tick).
+    if(!just_inserted
+        && ex->pairs[slot].prev_status != snaps[i].status
+        && ex->pairs[slot].prev_status != EXCH_TICK_UNKNOWN)
+    {
+      status_changed   = true;
+      prev_status_save = ex->pairs[slot].prev_status;
+    }
+
+    // MW-5: slot lifecycle bookkeeping. last_seen_tick must be set
+    // here so the rem-sweep at the end of the cb knows this slot was
+    // refreshed.
+    ex->pairs[slot].last_seen_tick = ex->tick_id;
+    ex->pairs[slot].prev_status    = snaps[i].status;
 
     mw_ring_push(&ex->pairs[slot], &snaps[i], ring_n, now_ms);
 
@@ -906,6 +1293,16 @@ mw_tickers_done_cb(bool success, const char *err,
     // returned `pending[]` slot is consumed AFTER lock release.
     if(pending == NULL)
       continue;
+
+    // MW-5: ADD on first observation of a new slot, suppressed during
+    // the bootstrap tick so we don't flood on enable.
+    if(just_inserted && ex->tick_id > 1)
+      mw_queue_emit_add(ex, &snaps[i], pending, &n_pending,
+          &n_dropped_emits);
+
+    if(status_changed)
+      mw_queue_emit_stat(ex, &snaps[i], prev_status_save, pending,
+          &n_pending, &n_dropped_emits);
 
     if(n_pending < MW_EMIT_BUF_CAP)
     {
@@ -915,6 +1312,21 @@ mw_tickers_done_cb(bool success, const char *err,
     }
     else
       n_dropped_emits++;
+  }
+
+  // MW-5: rem-sweep. Skipped on the bootstrap tick (no prior tick to
+  // compare against). Also skipped on a clearly anomalous empty tick
+  // following a non-trivial population — likely an API outage; we'd
+  // rather surface one WARN than flood the bus with thousands of
+  // false REMs.
+  if(pending != NULL && ex->tick_id > 1)
+  {
+    if(n == 0 && ex->total_pairs_seen >= 100)
+      clam(CLAM_WARN, MW_CTX,
+          "%s: empty tick after %" PRIu64 " pairs last tick — "
+          "skipping rem sweep", ex->name, ex->total_pairs_seen);
+    else
+      mw_rem_sweep(ex, pending, &n_pending, &n_dropped_emits);
   }
 
   ex->last_poll_ms       = now_ms;
@@ -1468,6 +1880,11 @@ mw_disable_exch(const char *name)
 
   ex->pair_count = 0;
 
+  // MW-5: zero the tick counter so the next enable's first tick
+  // takes the bootstrap-suppression path (no ADD/STAT/REM emits on
+  // the first observation after re-enable).
+  ex->tick_id = 0;
+
   pthread_mutex_unlock(&ex->lock);
   pthread_mutex_unlock(&mw_g.mtx);
 
@@ -1757,6 +2174,10 @@ mw_render_status_exch(method_inst_t *inst, const char *target,
   uint64_t   emits_hot;
   uint64_t   emits_cool;
   uint64_t   emits_upd;
+  uint64_t   emits_add;
+  uint64_t   emits_rem;
+  uint64_t   emits_stat;
+  uint64_t   tick_id;
   mw_topn_row_t *rows_pct;
   mw_topn_row_t *rows_vol;
   uint32_t       n_pct;
@@ -1809,6 +2230,10 @@ mw_render_status_exch(method_inst_t *inst, const char *target,
   emits_hot            = ex->total_emits_hot;
   emits_cool           = ex->total_emits_cool;
   emits_upd            = ex->total_emits_upd;
+  emits_add            = ex->total_emits_add;
+  emits_rem            = ex->total_emits_rem;
+  emits_stat           = ex->total_emits_stat;
+  tick_id              = ex->tick_id;
 
   n_pct = mw_build_topn(rows_pct, ex, ring_n, false);
   n_vol = mw_build_topn(rows_vol, ex, ring_n, true);
@@ -1857,8 +2282,11 @@ mw_render_status_exch(method_inst_t *inst, const char *target,
   mw_send(inst, target, line);
 
   snprintf(line, sizeof(line),
-      "  emits: hot=%" PRIu64 " cool=%" PRIu64 " upd=%" PRIu64,
-      emits_hot, emits_cool, emits_upd);
+      "  emits: hot=%" PRIu64 " cool=%" PRIu64 " upd=%" PRIu64
+      " add=%" PRIu64 " rem=%" PRIu64 " stat=%" PRIu64
+      " tick=%" PRIu64,
+      emits_hot, emits_cool, emits_upd,
+      emits_add, emits_rem, emits_stat, tick_id);
   mw_send(inst, target, line);
 
   if(pair_count == 0)

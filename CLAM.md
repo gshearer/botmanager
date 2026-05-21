@@ -198,13 +198,17 @@ regex (the literal context portion, before any `<placeholder>`).
 | `whenmoon.live` | plugins/feature/whenmoon/live.c | live-trading runtime (`WM_LIVE_CTX`) |
 | `whenmoon.sweep` | plugins/feature/whenmoon/sweep.c | strategy sweep runner (`WM_SWEEP_CTX`) |
 
-## Marketwatch event topics — `mw.<exch>.<event>.<id>` (NEW IN MW-3)
+## Marketwatch event topics — `mw.<exch>.<event>.<id>`
 
 These are emitted at `CLAM_INFO` with a single-line JSON body in
 the message. Subscribe with regexes anchored at `^mw\.`. The
 exchange name uses canonical lowercase form (`coinbase`, `kraken`,
 `gemini`); product ids use canonical hyphenated form (`BTC-USD`,
-not Kraken's `XXBTZUSD` or Gemini's `btcusd`).
+not Kraken's `XXBTZUSD` or Gemini's `btcusd`). Every body field
+named `ts` is wall-clock epoch milliseconds (via `wm_now_ms()`),
+not the monotonic clock.
+
+### Price-move detectors (MW-3 / MW-4)
 
 | Context pattern | When emitted | Body fields |
 |---|---|---|
@@ -218,7 +222,7 @@ just-pushed entry). One-sided (positive z only). Renders as `null`
 when the exchange does not ship `vol_24h_quote` (Gemini pricefeed)
 or the ring holds fewer than `MW_VOL_Z_MIN_SAMPLES` finite samples.
 
-### Trigger token values
+#### Trigger token values
 
 `trigger` is a `+`-joined string built from the bitset of signals
 that fired on the emitting tick. Possible tokens:
@@ -229,15 +233,39 @@ that fired on the emitting tick. Possible tokens:
 - `brk_lo` — this tick set a new 24h low.
 - `vol_z` — positive volume z-score crossed `vol_z_thresh_x100`.
 
-### Pre-allocated future topics
+### Lifecycle detectors (MW-5)
 
-MW-5 will introduce these (not yet emitted as of MW-3):
+Pure edge triggers — no state machine, no hysteresis, no
+cooldown — driven by per-pair `last_seen_tick` comparison against
+a monotonic per-exchange tick counter. Emits on the **second** tick
+after a listing/status change is observed; the bootstrap tick on
+enable suppresses all three event types (every pair would
+otherwise emit `add`). A disable + re-enable cycle re-triggers the
+bootstrap path (`tick_id` resets to 0 on disable).
 
-| Context pattern | When emitted (MW-5) |
-|---|---|
-| `mw.<exch>.add.<id>` | New listing appeared. |
-| `mw.<exch>.rem.<id>` | Listing disappeared. |
-| `mw.<exch>.stat.<id>` | Per-pair status flipped (trading_disabled, etc.). |
+| Context pattern | When emitted | Body fields |
+|---|---|---|
+| `mw.<exch>.add.<id>` | New listing appeared (slot inserted on a non-bootstrap tick). | `ts, exch, id, price, status, pct_24h, vol_24h_q, state="add"` |
+| `mw.<exch>.rem.<id>` | Listing disappeared (populated slot not refreshed this tick). | `ts, exch, id, last_price, last_status, last_seen_polls, state="rem"` |
+| `mw.<exch>.stat.<id>` | Per-pair status flipped (`status` differs from the previous observation). | `ts, exch, id, price, prev_status, new_status, state="stat"` |
+
+`status`, `prev_status`, `new_status`, `last_status` use the
+canonical token set from `exchange_ticker_status_t`: `online`,
+`offline`, `limit_only`, `post_only`, `unknown`.
+
+`last_price` reads from the newest entry in the pair's ring at
+the time of removal (the pair's last successful tick). It renders
+`null` when the ring was empty (vanishingly rare — would require
+removal on the very tick the pair was inserted, which is
+suppressed by bootstrap).
+
+`last_seen_polls` is the count of consecutive missed ticks at
+which the REM fired — typically `1`, because the rem-sweep
+tombstones a slot on the first missed tick.
+
+If `n == 0` for a tick but the previous tick observed ≥100 pairs,
+the rem-sweep is **skipped** and a single `WARN` is logged instead
+(treated as a likely API outage rather than a mass-delisting).
 
 ### Example subscriber: IRC channel announcer
 
@@ -246,4 +274,8 @@ MW-5 will introduce these (not yet emitted as of MW-3):
 // for an arbitrary IRC channel.
 clam_subscribe("hotbot", CLAM_INFO, "^mw\\.[^.]+\\.hot\\.",
     my_irc_emit_cb);
+
+// Subscribe to lifecycle events (listings) on a single exchange:
+clam_subscribe("listings-kraken", CLAM_INFO,
+    "^mw\\.kraken\\.(add|rem|stat)\\.", my_listing_cb);
 ```
