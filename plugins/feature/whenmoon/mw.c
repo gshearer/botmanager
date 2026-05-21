@@ -42,6 +42,7 @@
 #include <stdint.h>
 #include <stdio.h>
 #include <string.h>
+#include <time.h>
 
 // ------------------------------------------------------------------ //
 // Constants                                                           //
@@ -511,10 +512,17 @@ mw_format_body(char *out, size_t sz, const mw_exch_t *ex,
   out[0] = '\0';
   mw_format_triggers(trig_buf, sizeof(trig_buf), triggers);
 
+  // The function-level `now_ms` is monotonic — used by detector
+  // bookkeeping. JSON consumers (IRC bridges, log forwarders) need
+  // wall-clock epoch ms or they can't render a real date. Compute
+  // ts_wall_ms locally for the emit.
+  (void)now_ms;
+  int64_t ts_wall_ms = (int64_t)time(NULL) * 1000;
+
   // Open brace + ts + exch + id + price (all required).
   snprintf(scratch, sizeof(scratch),
       "{\"ts\":%" PRId64 ",\"exch\":\"%s\",\"id\":\"%s\",",
-      now_ms, ex->name, snap->product_id);
+      ts_wall_ms, ex->name, snap->product_id);
   if(!mw_body_append(out, sz, &off, scratch)) return(false);
 
   // price: emit verbatim if finite (no exchange ships NaN here, but
