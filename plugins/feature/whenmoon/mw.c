@@ -1,12 +1,16 @@
 // botmanager — MIT
-// Marketwatch substrate (MW-2): per-exchange bulk-ticker polling.
+// Marketwatch substrate (MW-2) + price-move detectors (MW-3): per-
+// exchange bulk-ticker polling, plus a 2-state machine per pair that
+// fires CLAM events on entry to / exit from a "hot" condition.
 //
 // One periodic task per enabled exchange fires
 // `exchange_fetch_all_tickers_async` at the cadence read from KV. The
 // typed response callback walks the snapshot array under the per-
-// exchange lock, finds-or-inserts each pair in a fixed-size table, and
-// pushes the row into the pair's ring. No detection signals, no
-// `mw.*` CLAM emission — that lands in MW-3.
+// exchange lock, finds-or-inserts each pair in a fixed-size table,
+// pushes the row into the pair's ring, runs the MW-3 detectors, and
+// records pending CLAM emissions in a per-tick heap buffer that is
+// drained AFTER the lock is released (so a slow subscriber cb can't
+// extend lock hold time).
 //
 // Threading: one lock per exchange (`ex->lock`) guards pairs[] + ring
 // memory + counters; the global `mw_g.mtx` guards only the exchange
@@ -53,6 +57,35 @@
 #define MW_KV_GLOBAL_ENABLED   "plugin.whenmoon.mw.enabled"
 #define MW_KV_RING_N           "plugin.whenmoon.mw.ring_n"
 
+// MW-3 detector defaults + tunables.
+// Thresholds are stored as `% × 100` (a uint that survives the KV layer);
+// `500` means 5.00%. Windows/cooldowns are in their named units.
+#define MW_PCT_24H_THRESH_DEFAULT      500       // 5.00 %
+#define MW_VEL_PCT_THRESH_DEFAULT      200       // 2.00 %
+#define MW_VEL_WINDOW_MIN_DEFAULT       10       // minutes
+#define MW_MIN_VOL_USD_DEFAULT     1000000ull    // $1M 24h quote-vol
+#define MW_COOLDOWN_SEC_DEFAULT        300
+#define MW_UPD_THROTTLE_SEC_DEFAULT    300
+
+// 50% hysteresis: a HOT pair must drop below thresh * NUM/DEN on all
+// signals for cooldown duration before COOL fires.
+#define MW_HOT_HYST_NUM                  1
+#define MW_HOT_HYST_DEN                  2
+
+// Per-tick stack-bounded emission cap. 256 transitions per exchange
+// per tick is comically high — overflow under defaults only on a
+// pump that converts the entire roster in one breath. Beyond the cap
+// we drop further emissions, log one WARN, and let next tick re-emit
+// (pair state is still updated under the lock).
+#define MW_EMIT_BUF_CAP                256
+
+// Per-signal trigger bitset. Stored on mw_pair_t.last_trigger so the
+// UPD throttle can detect "trigger set changed even though still HOT".
+#define MW_TRIG_PCT_24H        (1u << 0)
+#define MW_TRIG_VELOCITY       (1u << 1)
+#define MW_TRIG_BRK_HI         (1u << 2)
+#define MW_TRIG_BRK_LO         (1u << 3)
+
 // Per-exchange KV key buffer size. Longest tail is ".enabled" (8
 // bytes) below "plugin.whenmoon.mw." (19) + EXCHANGE_NAME_SZ (32) +
 // NUL — comfortably fits 96 bytes.
@@ -68,6 +101,12 @@
 // State                                                               //
 // ------------------------------------------------------------------ //
 
+typedef enum
+{
+  MW_PSTATE_COLD = 0,
+  MW_PSTATE_HOT  = 1
+} mw_pair_state_t;
+
 typedef struct
 {
   char                          product_id[EXCHANGE_PRODUCT_ID_SZ];
@@ -75,6 +114,18 @@ typedef struct
   uint32_t                      snap_count;
   uint32_t                      ring_head;
   exchange_ticker_snapshot_t   *ring;
+
+  // MW-3: per-slot wall-clock timestamps, indexed in lockstep with
+  // pp->ring. Allocated once at mw_start, freed at mw_deinit.
+  int64_t                      *ring_ts;
+
+  // MW-3: detector state.
+  uint8_t                       state;            // mw_pair_state_t
+  uint8_t                       last_trigger;     // MW_TRIG_* bitset
+  int64_t                       state_changed_ms; // last COLD<->HOT flip
+  int64_t                       last_emit_ms;     // last hot|upd emission
+  double                        prev_hi_24h;      // for BRK_HI gate
+  double                        prev_lo_24h;      // for BRK_LO gate
 } mw_pair_t;
 
 typedef struct
@@ -92,7 +143,27 @@ typedef struct
   uint64_t              total_polls;
   uint64_t              total_pairs_seen;
   uint64_t              total_drops_full;
+
+  // MW-3: per-exchange detector thresholds. Read at mw_start +
+  // mw_enable_exch from KV. Counters are bumped under ex->lock.
+  uint32_t              pct_24h_thresh_x100;  // signal × 100
+  uint32_t              vel_pct_thresh_x100;
+  uint32_t              vel_window_ms;
+  uint64_t              min_vol_usd;
+  uint32_t              cooldown_ms;
+  uint32_t              upd_throttle_ms;
+  uint64_t              total_emits_hot;
+  uint64_t              total_emits_cool;
+  uint64_t              total_emits_upd;
 } mw_exch_t;
+
+// MW-3: one queued CLAM emission. Built under ex->lock, drained
+// outside it.
+typedef struct
+{
+  char  topic[CLAM_CTX_SZ];
+  char  body[CLAM_MSG_SZ];
+} mw_emit_t;
 
 typedef struct
 {
@@ -123,6 +194,53 @@ mw_kv_key(char *buf, size_t cap, const char *exch, const char *tail)
   ename[n] = '\0';
 
   snprintf(buf, cap, "plugin.whenmoon.mw.%s.%s", ename, tail);
+}
+
+// MW-3: read all six per-exchange detector thresholds from KV, applying
+// the documented `0 → default` clamp. Caller must already have filled
+// ex->name. Used from mw_start (initial load) and from mw_enable_exch
+// (operator may have set kv * between mw_start and the enable verb,
+// same rationale as poll_sec).
+static void
+mw_load_detector_thresholds(mw_exch_t *ex)
+{
+  char     key[MW_KV_KEY_SZ];
+  uint64_t v;
+
+  mw_kv_key(key, sizeof(key), ex->name, "pct_24h_thresh_x100");
+  v = kv_get_uint(key);
+  ex->pct_24h_thresh_x100 =
+      (uint32_t)(v == 0 ? MW_PCT_24H_THRESH_DEFAULT : v);
+
+  mw_kv_key(key, sizeof(key), ex->name, "vel_pct_thresh_x100");
+  v = kv_get_uint(key);
+  ex->vel_pct_thresh_x100 =
+      (uint32_t)(v == 0 ? MW_VEL_PCT_THRESH_DEFAULT : v);
+
+  mw_kv_key(key, sizeof(key), ex->name, "vel_window_min");
+  v = kv_get_uint(key);
+  ex->vel_window_ms =
+      (uint32_t)((v == 0 ? MW_VEL_WINDOW_MIN_DEFAULT : v) * 60000ull);
+
+  // min_vol_usd: zero is a legitimate operator choice ("don't gate"),
+  // so we map the KV-absent case to MW_MIN_VOL_USD_DEFAULT but allow
+  // an explicit /set kv ... 0 to disable the floor. Distinguishing
+  // "unset" from "set to 0" requires kv_exists.
+  mw_kv_key(key, sizeof(key), ex->name, "min_vol_usd");
+  if(kv_exists(key))
+    ex->min_vol_usd = kv_get_uint(key);
+  else
+    ex->min_vol_usd = MW_MIN_VOL_USD_DEFAULT;
+
+  mw_kv_key(key, sizeof(key), ex->name, "cooldown_sec");
+  v = kv_get_uint(key);
+  ex->cooldown_ms =
+      (uint32_t)((v == 0 ? MW_COOLDOWN_SEC_DEFAULT : v) * 1000u);
+
+  mw_kv_key(key, sizeof(key), ex->name, "upd_throttle_sec");
+  v = kv_get_uint(key);
+  ex->upd_throttle_ms =
+      (uint32_t)((v == 0 ? MW_UPD_THROTTLE_SEC_DEFAULT : v) * 1000u);
 }
 
 static mw_exch_t *
@@ -160,8 +278,14 @@ mw_pair_find_or_insert(mw_exch_t *ex, const char *product_id)
   i = ex->pair_count++;
   snprintf(ex->pairs[i].product_id, sizeof(ex->pairs[i].product_id),
       "%s", product_id);
-  ex->pairs[i].snap_count = 0;
-  ex->pairs[i].ring_head  = 0;
+  ex->pairs[i].snap_count       = 0;
+  ex->pairs[i].ring_head        = 0;
+  ex->pairs[i].state            = MW_PSTATE_COLD;
+  ex->pairs[i].last_trigger     = 0;
+  ex->pairs[i].state_changed_ms = 0;
+  ex->pairs[i].last_emit_ms     = 0;
+  ex->pairs[i].prev_hi_24h      = 0.0;
+  ex->pairs[i].prev_lo_24h      = 0.0;
   return(i);
 }
 
@@ -173,6 +297,14 @@ mw_ring_push(mw_pair_t *pp, const exchange_ticker_snapshot_t *snap,
     return;
 
   memcpy(&pp->ring[pp->ring_head], snap, sizeof(*snap));
+
+  // MW-3: parallel ts[] stays in lockstep with ring[]. ring_ts may be
+  // NULL on the (single) tick that races a freshly-rolled allocation
+  // failure; tolerate that — detectors that need it short-circuit on
+  // pp->snap_count and that gate covers the missing-ts case too.
+  if(pp->ring_ts != NULL)
+    pp->ring_ts[pp->ring_head] = now_ms;
+
   pp->ring_head = (pp->ring_head + 1) % ring_n;
   pp->last_seen_ms = now_ms;
 
@@ -197,6 +329,401 @@ mw_pair_latest(const mw_pair_t *pp, uint32_t ring_n)
 }
 
 // ------------------------------------------------------------------ //
+// MW-3: detectors                                                     //
+// ------------------------------------------------------------------ //
+
+// Walks pp->ring newest-to-oldest from (ring_head - 1), looking for
+// the first snapshot whose stored ts is <= (now_ms - window_ms). Returns
+// (now_price - then_price)/then_price * 100, or NAN when the ring is
+// shallower than the window or the older sample is malformed.
+//
+// Caller holds ex->lock.
+static double
+mw_compute_velocity_pct(const mw_pair_t *pp, uint32_t window_ms,
+    int64_t now_ms)
+{
+  uint32_t                              ring_n = mw_g.ring_n;
+  int64_t                               target_ms = now_ms - (int64_t)window_ms;
+  const exchange_ticker_snapshot_t     *now_snap;
+  const exchange_ticker_snapshot_t     *then_snap;
+  uint32_t                              idx;
+  uint32_t                              hops;
+
+  if(pp->snap_count < 2 || pp->ring == NULL || pp->ring_ts == NULL
+      || ring_n == 0)
+    return(NAN);
+
+  // newest entry was just pushed at (ring_head - 1) mod ring_n
+  idx      = (pp->ring_head + ring_n - 1) % ring_n;
+  now_snap = &pp->ring[idx];
+
+  for(hops = 1; hops < pp->snap_count; hops++)
+  {
+    idx = (idx + ring_n - 1) % ring_n;
+
+    if(pp->ring_ts[idx] <= target_ms)
+    {
+      then_snap = &pp->ring[idx];
+
+      if(then_snap->price <= 0.0 || isnan(then_snap->price))
+        return(NAN);
+
+      return((now_snap->price - then_snap->price)
+          / then_snap->price * 100.0);
+    }
+  }
+
+  return(NAN);   // ring shallower than window
+}
+
+// Render `mw.<exch>.<event>.<id>` into out (cap = CLAM_CTX_SZ). On
+// truncation, the rendered string is still NUL-terminated and matches
+// subscribers' prefix regexes — log one WARN per (exch, event) so the
+// operator can choose to lengthen CLAM_CTX_SZ if real-world product
+// ids start blowing the budget.
+static void
+mw_format_topic(char *out, size_t sz, const char *exch,
+    const char *event, const char *id)
+{
+  static bool warned[4];   // pct_24h doesn't apply — events: hot/cool/upd/add ish
+  int   n;
+  int   event_idx;
+
+  n = snprintf(out, sz, "mw.%s.%s.%s", exch, event, id);
+
+  if(n < 0 || (size_t)n >= sz)
+  {
+    // WARN-once per event token. We don't strictly need to scope it
+    // per exchange — the per-event guard is enough to prevent log
+    // floods; operators rarely add new exchanges.
+    if(strcmp(event, "hot") == 0)        event_idx = 0;
+    else if(strcmp(event, "cool") == 0)  event_idx = 1;
+    else if(strcmp(event, "upd") == 0)   event_idx = 2;
+    else                                  event_idx = 3;
+
+    if(!warned[event_idx])
+    {
+      warned[event_idx] = true;
+      clam(CLAM_WARN, MW_CTX,
+          "topic truncated: mw.%s.%s.%s (cap=%zu)",
+          exch, event, id, sz);
+    }
+  }
+}
+
+// Tiny helper: append `frag` to `buf` at position *off, advancing *off.
+// On truncation, *off is clamped to cap-1 so subsequent appends still
+// see a valid NUL. Returns false when the append did not fully fit
+// (caller may abort).
+static bool
+mw_body_append(char *buf, size_t cap, size_t *off, const char *frag)
+{
+  size_t free_cap;
+  size_t fl;
+
+  if(*off >= cap)
+    return(false);
+
+  free_cap = cap - *off;
+  fl       = strnlen(frag, free_cap);
+
+  memcpy(buf + *off, frag, fl);
+  *off += fl;
+
+  if(*off < cap)
+    buf[*off] = '\0';
+  else
+  {
+    buf[cap - 1] = '\0';
+    return(false);
+  }
+
+  return(fl < strlen(frag) ? false : true);
+}
+
+// Render `%g` / `%f` field or the literal `null` if NaN. Writes into
+// a tiny stack buffer then appends via mw_body_append.
+static bool
+mw_body_append_dbl(char *buf, size_t cap, size_t *off, const char *key,
+    const char *fmt, double v)
+{
+  char  scratch[64];
+
+  if(isnan(v))
+    snprintf(scratch, sizeof(scratch), "\"%s\":null", key);
+  else
+  {
+    char  numbuf[40];
+
+    snprintf(numbuf, sizeof(numbuf), fmt, v);
+    snprintf(scratch, sizeof(scratch), "\"%s\":%s", key, numbuf);
+  }
+
+  return(mw_body_append(buf, cap, off, scratch));
+}
+
+// Build the trigger string ("pct_24h+velocity+brk_hi"...). For an empty
+// bitset (COOL emissions), writes "".
+static void
+mw_format_triggers(char *out, size_t sz, uint8_t bits)
+{
+  size_t off = 0;
+  bool   first = true;
+
+  out[0] = '\0';
+
+  if(bits & MW_TRIG_PCT_24H)
+  {
+    off += snprintf(out + off, sz - off, "%spct_24h",
+        first ? "" : "+");
+    first = false;
+  }
+
+  if(bits & MW_TRIG_VELOCITY && off < sz)
+  {
+    off += snprintf(out + off, sz - off, "%svelocity",
+        first ? "" : "+");
+    first = false;
+  }
+
+  if(bits & MW_TRIG_BRK_HI && off < sz)
+  {
+    off += snprintf(out + off, sz - off, "%sbrk_hi",
+        first ? "" : "+");
+    first = false;
+  }
+
+  if(bits & MW_TRIG_BRK_LO && off < sz)
+    snprintf(out + off, sz - off, "%sbrk_lo", first ? "" : "+");
+}
+
+// Render the single-line JSON body. Returns true on full render,
+// false on truncation (caller should refuse the emit).
+static bool
+mw_format_body(char *out, size_t sz, const mw_exch_t *ex,
+    const exchange_ticker_snapshot_t *snap, int64_t now_ms,
+    double vel_pct, uint8_t triggers, const char *state)
+{
+  size_t  off = 0;
+  char    scratch[160];
+  char    trig_buf[64];
+
+  out[0] = '\0';
+  mw_format_triggers(trig_buf, sizeof(trig_buf), triggers);
+
+  // Open brace + ts + exch + id + price (all required).
+  snprintf(scratch, sizeof(scratch),
+      "{\"ts\":%" PRId64 ",\"exch\":\"%s\",\"id\":\"%s\",",
+      now_ms, ex->name, snap->product_id);
+  if(!mw_body_append(out, sz, &off, scratch)) return(false);
+
+  // price: emit verbatim if finite (no exchange ships NaN here, but
+  // guard anyway so a malformed snap can't drop the trailing }).
+  if(isnan(snap->price))
+    snprintf(scratch, sizeof(scratch), "\"price\":null,");
+  else
+    snprintf(scratch, sizeof(scratch), "\"price\":%.8g,", snap->price);
+  if(!mw_body_append(out, sz, &off, scratch)) return(false);
+
+  // Numeric optional fields.
+  if(!mw_body_append_dbl(out, sz, &off, "pct_24h", "%.2f",
+        snap->pct_24h)) return(false);
+  if(!mw_body_append(out, sz, &off, ",")) return(false);
+
+  if(!mw_body_append_dbl(out, sz, &off, "vel_pct", "%.2f", vel_pct))
+    return(false);
+  if(!mw_body_append(out, sz, &off, ",")) return(false);
+
+  snprintf(scratch, sizeof(scratch), "\"vel_window_min\":%u,",
+      (unsigned)(ex->vel_window_ms / 60000u));
+  if(!mw_body_append(out, sz, &off, scratch)) return(false);
+
+  if(!mw_body_append_dbl(out, sz, &off, "hi_24h", "%.8g",
+        snap->hi_24h)) return(false);
+  if(!mw_body_append(out, sz, &off, ",")) return(false);
+
+  if(!mw_body_append_dbl(out, sz, &off, "lo_24h", "%.8g",
+        snap->lo_24h)) return(false);
+  if(!mw_body_append(out, sz, &off, ",")) return(false);
+
+  if(!mw_body_append_dbl(out, sz, &off, "vol_24h_q", "%.2f",
+        snap->vol_24h_quote)) return(false);
+  if(!mw_body_append(out, sz, &off, ",")) return(false);
+
+  // trigger + state + close brace.
+  snprintf(scratch, sizeof(scratch),
+      "\"trigger\":\"%s\",\"state\":\"%s\"}",
+      trig_buf, state);
+  if(!mw_body_append(out, sz, &off, scratch)) return(false);
+
+  return(true);
+}
+
+// Compute the four-bit trigger set against the given threshold scale.
+// `scale_num/scale_den` allow the hysteresis pass to use thresh×NUM/DEN
+// without touching the real ex->* fields. Caller passes the just-
+// pushed snap; pp is the same pair the snap was pushed into.
+static uint8_t
+mw_compute_triggers(const mw_exch_t *ex, const mw_pair_t *pp,
+    const exchange_ticker_snapshot_t *snap, double vel_pct,
+    uint32_t scale_num, uint32_t scale_den)
+{
+  uint8_t  bits = 0;
+  uint64_t pct_thresh;
+  uint64_t vel_thresh;
+
+  // Avoid 0-division if a caller passes a bad scale.
+  if(scale_den == 0)
+    scale_den = 1;
+
+  pct_thresh = (uint64_t)ex->pct_24h_thresh_x100 * scale_num / scale_den;
+  vel_thresh = (uint64_t)ex->vel_pct_thresh_x100 * scale_num / scale_den;
+
+  if(!isnan(snap->pct_24h)
+      && (uint64_t)(fabs(snap->pct_24h) * 100.0) >= pct_thresh)
+    bits |= MW_TRIG_PCT_24H;
+
+  if(pp->snap_count >= 2 && !isnan(vel_pct)
+      && (uint64_t)(fabs(vel_pct) * 100.0) >= vel_thresh)
+    bits |= MW_TRIG_VELOCITY;
+
+  if(pp->snap_count >= 2
+      && !isnan(snap->hi_24h) && !isnan(pp->prev_hi_24h)
+      && pp->prev_hi_24h > 0.0
+      && snap->hi_24h > pp->prev_hi_24h
+      && snap->price >= pp->prev_hi_24h)
+    bits |= MW_TRIG_BRK_HI;
+
+  if(pp->snap_count >= 2
+      && !isnan(snap->lo_24h) && !isnan(pp->prev_lo_24h)
+      && pp->prev_lo_24h > 0.0
+      && snap->lo_24h < pp->prev_lo_24h
+      && snap->price <= pp->prev_lo_24h)
+    bits |= MW_TRIG_BRK_LO;
+
+  return(bits);
+}
+
+// Detector entry point. Runs the three signals over the just-pushed
+// snap, drives the per-pair state machine, and fills `out_emit` when a
+// transition needs to be communicated. Returns true iff an emit was
+// queued. Caller holds ex->lock.
+static bool
+mw_detect_pair(mw_exch_t *ex, mw_pair_t *pp,
+    const exchange_ticker_snapshot_t *snap, int64_t now_ms,
+    mw_emit_t *out_emit)
+{
+  double   vel_pct;
+  uint8_t  triggers;
+  uint8_t  hyst_triggers;
+  bool     queued = false;
+  const char *event_str = NULL;
+  const char *state_str = NULL;
+
+  vel_pct = mw_compute_velocity_pct(pp, ex->vel_window_ms, now_ms);
+  triggers = mw_compute_triggers(ex, pp, snap, vel_pct, 1, 1);
+
+  // Min-volume gate on HOT entry only. Bypassed when the exchange
+  // didn't publish a quote volume (Gemini), to avoid suppressing every
+  // pair on that backend.
+  if(pp->state == MW_PSTATE_COLD
+      && !isnan(snap->vol_24h_quote)
+      && snap->vol_24h_quote < (double)ex->min_vol_usd)
+    triggers = 0;
+
+  hyst_triggers = mw_compute_triggers(ex, pp, snap, vel_pct,
+      MW_HOT_HYST_NUM, MW_HOT_HYST_DEN);
+
+  // State machine.
+  if(pp->state == MW_PSTATE_COLD)
+  {
+    if(triggers != 0)
+    {
+      pp->state            = MW_PSTATE_HOT;
+      pp->state_changed_ms = now_ms;
+      pp->last_trigger     = triggers;
+      pp->last_emit_ms     = now_ms;
+      event_str = "hot";
+      state_str = "hot";
+      ex->total_emits_hot++;
+      queued = true;
+    }
+  }
+
+  else  // HOT
+  {
+    if((now_ms - pp->state_changed_ms) >= (int64_t)ex->cooldown_ms
+        && hyst_triggers == 0)
+    {
+      pp->state            = MW_PSTATE_COLD;
+      pp->state_changed_ms = now_ms;
+      pp->last_trigger     = 0;
+      event_str = "cool";
+      state_str = "cool";
+      ex->total_emits_cool++;
+      // For COOL we emit with empty trigger set; that gives subscribers
+      // a clear "all clear" signal.
+      triggers = 0;
+      queued = true;
+    }
+
+    else
+    {
+      // Still HOT — throttled UPD. Throttle alone is the gate; we
+      // also refresh last_trigger so the caller can see which signals
+      // are currently active without scraping the body JSON.
+      if((now_ms - pp->last_emit_ms) >= (int64_t)ex->upd_throttle_ms)
+      {
+        pp->last_emit_ms = now_ms;
+        pp->last_trigger = triggers;
+        event_str = "upd";
+        state_str = "upd";
+        ex->total_emits_upd++;
+        queued = true;
+      }
+    }
+  }
+
+  // Always-update high/low watermarks so the next tick has the
+  // freshest comparison point. Preserve previous value when the
+  // exchange dropped the field this tick (NaN).
+  if(!isnan(snap->hi_24h))
+    pp->prev_hi_24h = snap->hi_24h;
+  if(!isnan(snap->lo_24h))
+    pp->prev_lo_24h = snap->lo_24h;
+
+  if(!queued)
+    return(false);
+
+  mw_format_topic(out_emit->topic, sizeof(out_emit->topic),
+      ex->name, event_str, snap->product_id);
+
+  if(!mw_format_body(out_emit->body, sizeof(out_emit->body),
+        ex, snap, now_ms, vel_pct, triggers, state_str))
+  {
+    // Body overflow is unreachable in practice with single-line JSON
+    // of ~10 fields, but be loud + drop quietly if it ever fires.
+    clam(CLAM_DEBUG3, MW_CTX, "%s: body render overflow (%s %s)",
+        ex->name, event_str, snap->product_id);
+    return(false);
+  }
+
+  return(true);
+}
+
+// Drain `n` queued emissions via clam(). Called AFTER pthread_mutex_
+// unlock(&ex->lock) so subscriber callbacks (which fire inline in
+// clam()) cannot lengthen lock-hold time.
+static void
+mw_drain_emits(const mw_emit_t *emits, uint32_t n)
+{
+  uint32_t i;
+
+  for(i = 0; i < n; i++)
+    clam(CLAM_INFO, emits[i].topic, "%s", emits[i].body);
+}
+
+// ------------------------------------------------------------------ //
 // Task callbacks                                                      //
 // ------------------------------------------------------------------ //
 
@@ -205,6 +732,9 @@ mw_tickers_done_cb(bool success, const char *err,
     const exchange_ticker_snapshot_t *snaps, size_t n, void *user)
 {
   mw_exch_t *ex = user;
+  mw_emit_t *pending;
+  uint32_t   n_pending = 0;
+  uint32_t   n_dropped_emits = 0;
   size_t     i;
   uint32_t   slot;
   uint32_t   drops_this_tick = 0;
@@ -221,12 +751,27 @@ mw_tickers_done_cb(bool success, const char *err,
     return;
   }
 
+  // MW-3: heap-allocate the per-tick emit buffer. 256 × ~1060 bytes
+  // ≈ 272 KiB — too large for the curl-worker thread stack on some
+  // distros' default 256 KiB pthread default. On alloc FAIL we skip
+  // detection for this tick (pair state stays untouched so next tick
+  // can still transition) but still update the ring + counters, so
+  // operators see polling continuing in /show whenmoon mw.
+  pending = mem_alloc(WHENMOON_CTX, "mw.emits",
+      (size_t)MW_EMIT_BUF_CAP * sizeof(*pending));
+
+  if(pending == NULL)
+    clam(CLAM_WARN, MW_CTX, "%s: emit buf alloc FAIL — skipping"
+        " detection this tick", ex->name);
+
   pthread_mutex_lock(&ex->lock);
 
   // Disabled between dispatch + completion — drop result.
   if(!ex->enabled)
   {
     pthread_mutex_unlock(&ex->lock);
+    if(pending != NULL)
+      mem_free(pending);
     return;
   }
 
@@ -244,6 +789,20 @@ mw_tickers_done_cb(bool success, const char *err,
     }
 
     mw_ring_push(&ex->pairs[slot], &snaps[i], ring_n, now_ms);
+
+    // MW-3: detector hook. Caller (this loop) holds ex->lock; the
+    // returned `pending[]` slot is consumed AFTER lock release.
+    if(pending == NULL)
+      continue;
+
+    if(n_pending < MW_EMIT_BUF_CAP)
+    {
+      if(mw_detect_pair(ex, &ex->pairs[slot], &snaps[i], now_ms,
+            &pending[n_pending]))
+        n_pending++;
+    }
+    else
+      n_dropped_emits++;
   }
 
   ex->last_poll_ms       = now_ms;
@@ -253,11 +812,25 @@ mw_tickers_done_cb(bool success, const char *err,
 
   pthread_mutex_unlock(&ex->lock);
 
+  // MW-3: drain outside the lock so a slow CLAM subscriber cb cannot
+  // extend ex->lock hold time.
+  if(pending != NULL)
+  {
+    mw_drain_emits(pending, n_pending);
+    mem_free(pending);
+  }
+
+  if(n_dropped_emits > 0)
+    clam(CLAM_WARN, MW_CTX,
+        "%s: emit buf overflow %u (cap=%u)",
+        ex->name, n_dropped_emits, (unsigned)MW_EMIT_BUF_CAP);
+
   if(drops_this_tick > 0)
     clam(CLAM_WARN, MW_CTX, "%s: %u pairs dropped (cap=%u)",
         ex->name, drops_this_tick, (unsigned)MW_PAIRS_CAP);
   else
-    clam(CLAM_DEBUG3, MW_CTX, "%s: tick ok n=%zu", ex->name, n);
+    clam(CLAM_DEBUG3, MW_CTX, "%s: tick ok n=%zu emits=%u",
+        ex->name, n, n_pending);
 }
 
 static void
@@ -338,11 +911,39 @@ mw_exch_alloc_pairs(mw_exch_t *ex, uint32_t ring_n)
 
     if(ex->pairs[i].ring == NULL)
     {
-      // Roll back: free already-allocated rings, then pairs[].
+      // Roll back: free already-allocated rings + ts arrays, then pairs[].
       uint32_t j;
 
       for(j = 0; j < i; j++)
+      {
         mem_free(ex->pairs[j].ring);
+        if(ex->pairs[j].ring_ts != NULL)
+          mem_free(ex->pairs[j].ring_ts);
+      }
+
+      mem_free(ex->pairs);
+      ex->pairs    = NULL;
+      ex->pair_cap = 0;
+      return(FAIL);
+    }
+
+    // MW-3: parallel ts[] for velocity walk-back. Allocated lockstep
+    // with ring[]; freed in the same loop in mw_exch_free_pairs.
+    ex->pairs[i].ring_ts = mem_alloc(WHENMOON_CTX, "mw.ring_ts",
+        (size_t)ring_n * sizeof(*ex->pairs[i].ring_ts));
+
+    if(ex->pairs[i].ring_ts == NULL)
+    {
+      uint32_t j;
+
+      mem_free(ex->pairs[i].ring);
+      ex->pairs[i].ring = NULL;
+
+      for(j = 0; j < i; j++)
+      {
+        mem_free(ex->pairs[j].ring);
+        mem_free(ex->pairs[j].ring_ts);
+      }
 
       mem_free(ex->pairs);
       ex->pairs    = NULL;
@@ -368,6 +969,12 @@ mw_exch_free_pairs(mw_exch_t *ex)
     {
       mem_free(ex->pairs[i].ring);
       ex->pairs[i].ring = NULL;
+    }
+
+    if(ex->pairs[i].ring_ts != NULL)
+    {
+      mem_free(ex->pairs[i].ring_ts);
+      ex->pairs[i].ring_ts = NULL;
     }
   }
 
@@ -520,6 +1127,62 @@ mw_start(void)
       clam(CLAM_DEBUG, MW_CTX,
           "%s: kv_register .poll_sec already present", ex->name);
 
+    // MW-3: per-exchange detector thresholds. Same `0 → default`
+    // convention as poll_sec, except min_vol_usd where 0 is a valid
+    // operator-set value meaning "no floor" (see
+    // mw_load_detector_thresholds for the distinction).
+    mw_kv_key(key, sizeof(key), ex->name, "pct_24h_thresh_x100");
+    snprintf(help, sizeof(help),
+        "MW: 24h-pct threshold for %s, encoded %% × 100"
+        " (0 = MW_PCT_24H_THRESH_DEFAULT).", ex->name);
+    if(kv_register(key, KV_UINT32, "0", NULL, NULL, help) != SUCCESS)
+      clam(CLAM_DEBUG, MW_CTX,
+          "%s: kv_register .pct_24h_thresh_x100 already present",
+          ex->name);
+
+    mw_kv_key(key, sizeof(key), ex->name, "vel_pct_thresh_x100");
+    snprintf(help, sizeof(help),
+        "MW: velocity threshold for %s, encoded %% × 100"
+        " (0 = MW_VEL_PCT_THRESH_DEFAULT).", ex->name);
+    if(kv_register(key, KV_UINT32, "0", NULL, NULL, help) != SUCCESS)
+      clam(CLAM_DEBUG, MW_CTX,
+          "%s: kv_register .vel_pct_thresh_x100 already present",
+          ex->name);
+
+    mw_kv_key(key, sizeof(key), ex->name, "vel_window_min");
+    snprintf(help, sizeof(help),
+        "MW: velocity walk-back window (minutes) for %s"
+        " (0 = MW_VEL_WINDOW_MIN_DEFAULT).", ex->name);
+    if(kv_register(key, KV_UINT32, "0", NULL, NULL, help) != SUCCESS)
+      clam(CLAM_DEBUG, MW_CTX,
+          "%s: kv_register .vel_window_min already present", ex->name);
+
+    mw_kv_key(key, sizeof(key), ex->name, "min_vol_usd");
+    snprintf(help, sizeof(help),
+        "MW: 24h quote-vol floor (USD) for HOT entry on %s"
+        " (unset = MW_MIN_VOL_USD_DEFAULT; 0 disables the gate).",
+        ex->name);
+    if(kv_register(key, KV_UINT64, "0", NULL, NULL, help) != SUCCESS)
+      clam(CLAM_DEBUG, MW_CTX,
+          "%s: kv_register .min_vol_usd already present", ex->name);
+
+    mw_kv_key(key, sizeof(key), ex->name, "cooldown_sec");
+    snprintf(help, sizeof(help),
+        "MW: minimum HOT dwell + COOL latch (s) for %s"
+        " (0 = MW_COOLDOWN_SEC_DEFAULT).", ex->name);
+    if(kv_register(key, KV_UINT32, "0", NULL, NULL, help) != SUCCESS)
+      clam(CLAM_DEBUG, MW_CTX,
+          "%s: kv_register .cooldown_sec already present", ex->name);
+
+    mw_kv_key(key, sizeof(key), ex->name, "upd_throttle_sec");
+    snprintf(help, sizeof(help),
+        "MW: minimum interval (s) between UPD re-emits on still-HOT"
+        " pairs for %s (0 = MW_UPD_THROTTLE_SEC_DEFAULT).", ex->name);
+    if(kv_register(key, KV_UINT32, "0", NULL, NULL, help) != SUCCESS)
+      clam(CLAM_DEBUG, MW_CTX,
+          "%s: kv_register .upd_throttle_sec already present",
+          ex->name);
+
     // Read persisted values back.
     mw_kv_key(key, sizeof(key), ex->name, "enabled");
     ex->enabled = kv_get_uint(key) != 0;
@@ -527,6 +1190,8 @@ mw_start(void)
     mw_kv_key(key, sizeof(key), ex->name, "poll_sec");
     v = kv_get_uint(key);
     ex->poll_sec = v == 0 ? MW_POLL_SEC_DEFAULT : (uint32_t)v;
+
+    mw_load_detector_thresholds(ex);
 
     ex->task = TASK_HANDLE_NONE;
 
@@ -630,6 +1295,13 @@ mw_enable_exch(const char *name)
   ex->enabled = true;
   if(v != 0)
     ex->poll_sec = (uint32_t)v;
+
+  // MW-3: pick up any threshold edits made between mw_start and this
+  // enable verb. Same rationale as poll_sec — operator hits /set kv,
+  // then /whenmoon mw enable; the new values must take effect on the
+  // task that's about to be kicked.
+  mw_load_detector_thresholds(ex);
+
   kick = mw_g.global_enabled;
 
   if(kick)
@@ -953,6 +1625,15 @@ mw_render_status_exch(method_inst_t *inst, const char *target,
   uint32_t   ring_n;
   bool       enabled;
   uint32_t   poll_sec;
+  uint32_t   pct_24h_thresh_x100;
+  uint32_t   vel_pct_thresh_x100;
+  uint32_t   vel_window_ms;
+  uint64_t   min_vol_usd;
+  uint32_t   cooldown_ms;
+  uint32_t   upd_throttle_ms;
+  uint64_t   emits_hot;
+  uint64_t   emits_cool;
+  uint64_t   emits_upd;
   mw_topn_row_t *rows_pct;
   mw_topn_row_t *rows_vol;
   uint32_t       n_pct;
@@ -991,10 +1672,19 @@ mw_render_status_exch(method_inst_t *inst, const char *target,
 
   pthread_mutex_lock(&ex->lock);
 
-  pair_count   = ex->pair_count;
-  polls        = ex->total_polls;
-  drops        = ex->total_drops_full;
-  last_poll_ms = ex->last_poll_ms;
+  pair_count           = ex->pair_count;
+  polls                = ex->total_polls;
+  drops                = ex->total_drops_full;
+  last_poll_ms         = ex->last_poll_ms;
+  pct_24h_thresh_x100  = ex->pct_24h_thresh_x100;
+  vel_pct_thresh_x100  = ex->vel_pct_thresh_x100;
+  vel_window_ms        = ex->vel_window_ms;
+  min_vol_usd          = ex->min_vol_usd;
+  cooldown_ms          = ex->cooldown_ms;
+  upd_throttle_ms      = ex->upd_throttle_ms;
+  emits_hot            = ex->total_emits_hot;
+  emits_cool           = ex->total_emits_cool;
+  emits_upd            = ex->total_emits_upd;
 
   n_pct = mw_build_topn(rows_pct, ex, ring_n, false);
   n_vol = mw_build_topn(rows_vol, ex, ring_n, true);
@@ -1026,6 +1716,24 @@ mw_render_status_exch(method_inst_t *inst, const char *target,
       " last_poll=%s pairs=%u polls=%" PRIu64 " drops=%" PRIu64,
       exch, enabled ? "yes" : "no", poll_sec, age, pair_count,
       polls, drops);
+  mw_send(inst, target, line);
+
+  // MW-3: detector thresholds + emit counters. One line apiece so the
+  // botmanctl/IRC paths don't word-wrap on narrower terminals.
+  snprintf(line, sizeof(line),
+      "  thresholds: pct_24h>=%.2f%% velocity>=%.2f%% window=%us"
+      " min_vol=%" PRIu64 " cooldown=%us upd=%us",
+      (double)pct_24h_thresh_x100 / 100.0,
+      (double)vel_pct_thresh_x100 / 100.0,
+      (unsigned)(vel_window_ms / 1000u),
+      min_vol_usd,
+      (unsigned)(cooldown_ms / 1000u),
+      (unsigned)(upd_throttle_ms / 1000u));
+  mw_send(inst, target, line);
+
+  snprintf(line, sizeof(line),
+      "  emits: hot=%" PRIu64 " cool=%" PRIu64 " upd=%" PRIu64,
+      emits_hot, emits_cool, emits_upd);
   mw_send(inst, target, line);
 
   if(pair_count == 0)
