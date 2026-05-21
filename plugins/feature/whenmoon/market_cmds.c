@@ -525,7 +525,7 @@ wm_market_cmd_force(const cmd_ctx_t *ctx)
     return;
   }
 
-  ts_ms = (int64_t)time(NULL) * 1000;
+  ts_ms = wm_now_ms();
 
   pthread_mutex_lock(&mk->lock);
   mode = mk->session.mode;

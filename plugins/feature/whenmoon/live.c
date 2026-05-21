@@ -1144,7 +1144,7 @@ wm_live_engine_start(void)
   // pulls every fill the server is willing to page back (hundreds of
   // potentially stale rows), and the orphan dedup walk would log them
   // all.
-  now_ms = (int64_t)time(NULL) * 1000;
+  now_ms = wm_now_ms();
 
   pthread_mutex_lock(&g_live.mu);
 

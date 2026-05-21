@@ -56,6 +56,13 @@ typedef struct whenmoon_state
 // plugin-scoped).
 whenmoon_state_t *whenmoon_get_state(void);
 
+// wm_now_ms — wall-clock time in milliseconds since the Unix epoch.
+// Use for timestamps in payloads consumed externally (CLAM body
+// JSON, log forwarders, IRC bridges). NOT suitable for elapsed-time
+// math across runs — use wm_dl_now_ms() (CLOCK_MONOTONIC) for that.
+// See memory wm_dl_now_ms_is_monotonic.
+int64_t wm_now_ms(void);
+
 #endif // WHENMOON_INTERNAL
 
 #endif // BM_WHENMOON_H

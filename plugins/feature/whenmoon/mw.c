@@ -42,7 +42,6 @@
 #include <stdint.h>
 #include <stdio.h>
 #include <string.h>
-#include <time.h>
 
 // ------------------------------------------------------------------ //
 // Constants                                                           //
@@ -514,10 +513,9 @@ mw_format_body(char *out, size_t sz, const mw_exch_t *ex,
 
   // The function-level `now_ms` is monotonic — used by detector
   // bookkeeping. JSON consumers (IRC bridges, log forwarders) need
-  // wall-clock epoch ms or they can't render a real date. Compute
-  // ts_wall_ms locally for the emit.
+  // wall-clock epoch ms or they can't render a real date.
   (void)now_ms;
-  int64_t ts_wall_ms = (int64_t)time(NULL) * 1000;
+  int64_t ts_wall_ms = wm_now_ms();
 
   // Open brace + ts + exch + id + price (all required).
   snprintf(scratch, sizeof(scratch),
