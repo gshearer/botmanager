@@ -14,6 +14,7 @@
 #include "market_cmds.h"
 #include "order_cmds.h"
 #include "live.h"
+#include "mw.h"
 #include "strategy.h"
 #include "sweep.h"
 
@@ -359,6 +360,11 @@ whenmoon_subsystems_destroy(whenmoon_state_t *st)
   if(st == NULL)
     return;
 
+  // MW-2: cancel marketwatch periodic tasks before any other teardown
+  // so in-flight ticker callbacks observe an explicit per-exchange
+  // disable state instead of racing the pair-table free below.
+  mw_stop();
+
   // Teardown order: strategies first (they may hold dispatch
   // references into market state), then live engine, then job table,
   // downloader DDL flag, markets, account.
@@ -368,6 +374,11 @@ whenmoon_subsystems_destroy(whenmoon_state_t *st)
   wm_dl_destroy(st);
   wm_market_destroy(st);
   wm_account_destroy(st);
+
+  // MW-2: free marketwatch state last (mirrors mw_stop early). Safe
+  // when mw_init never ran (mw_g.n_exch == 0 + freshly-zeroed mutex
+  // make this a no-op cascade).
+  mw_deinit();
 }
 
 static bool
@@ -506,6 +517,23 @@ whenmoon_init(void)
     goto fail;
   }
 
+  // MW-2: marketwatch substrate. mw_init registers the two global KVs
+  // (enable + ring_n); per-exchange KVs are registered lazily in
+  // mw_start once the exchange roster is final. Verb registration
+  // happens here so /whenmoon mw and /show whenmoon mw are visible
+  // before any task fires.
+  if(mw_init() != SUCCESS)
+  {
+    clam(CLAM_INFO, WHENMOON_CTX, "mw_init failed");
+    goto fail;
+  }
+
+  if(mw_cmds_register() != SUCCESS)
+  {
+    clam(CLAM_INFO, WHENMOON_CTX, "mw verb registration failed");
+    goto fail;
+  }
+
   // Discover strategies that the core loader has already brought up.
   // This is idempotent and safe even when zero strategy plugins are
   // present (the iteration finds no PLUGIN_STRATEGY records).
@@ -549,6 +577,15 @@ whenmoon_start(void)
   if(wm_market_persist_restore_all(st) != SUCCESS)
     clam(CLAM_INFO, WHENMOON_CTX,
         "wm_market_persist_restore_all failed (sessions left at default)");
+
+  // MW-2: marketwatch start runs after the exchange roster is settled
+  // (each service plugin's start has already registered with
+  // feature_exchange) so mw_start's exchange_name_list sees the final
+  // set. Per-exchange KVs are registered + read here; default is
+  // disabled so an unconfigured deploy emits no traffic.
+  if(mw_start() != SUCCESS)
+    clam(CLAM_INFO, WHENMOON_CTX,
+        "mw_start failed (marketwatch disabled)");
 
   // KR-2: per-exchange account slot setup happens in start (post coinbase
   // / kraken `cb_start` so the exchange registry is populated). Init
