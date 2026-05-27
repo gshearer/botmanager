@@ -3,7 +3,7 @@
 
 // Public mechanism API for the kraken service plugin. Consumers
 // include this header and resolve the symbols at runtime via
-// plugin_dlsym("kraken", …) — the plugin is loaded RTLD_LOCAL.
+// plugin_dlsym_cached("kraken", …, (void **)&cached) — the plugin is loaded RTLD_LOCAL.
 //
 // The shim shape mirrors plugins/service/coinbase/coinbase_api.h:
 // per-symbol atomic cache guard, union to launder void*↔function-
@@ -311,7 +311,7 @@ kraken_apikey_configured(void)
   {
     union { void *obj; fn_t fn; } u;
 
-    u.obj = plugin_dlsym("kraken", "kraken_apikey_configured");
+    u.obj = plugin_dlsym_cached("kraken", "kraken_apikey_configured", (void **)&cached);
     if(u.obj == NULL)
     {
       clam(CLAM_FATAL, "kraken",

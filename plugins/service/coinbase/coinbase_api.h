@@ -3,7 +3,7 @@
 
 // Public mechanism API for the coinbase service plugin. Consumers
 // include this header and resolve the symbols at runtime via
-// plugin_dlsym("coinbase", …) — the plugin is loaded RTLD_LOCAL.
+// plugin_dlsym_cached("coinbase", …, (void **)&cached) — the plugin is loaded RTLD_LOCAL.
 //
 // The shim shape mirrors plugins/service/coinmarketcap/coinmarketcap_api.h
 // and plugins/service/openweather/openweather_api.h: per-symbol atomic
@@ -486,7 +486,7 @@ coinbase_apikey_configured(void)
   {
     union { void *obj; fn_t fn; } u;
 
-    u.obj = plugin_dlsym("coinbase", "coinbase_apikey_configured");
+    u.obj = plugin_dlsym_cached("coinbase", "coinbase_apikey_configured", (void **)&cached);
     if(u.obj == NULL)
     {
       clam(CLAM_FATAL, "coinbase",
@@ -513,7 +513,7 @@ coinbase_fetch_candles_async(const char *product_id, int32_t granularity,
   {
     union { void *obj; fn_t fn; } u;
 
-    u.obj = plugin_dlsym("coinbase", "coinbase_fetch_candles_async");
+    u.obj = plugin_dlsym_cached("coinbase", "coinbase_fetch_candles_async", (void **)&cached);
     if(u.obj == NULL)
     {
       clam(CLAM_FATAL, "coinbase",
@@ -539,7 +539,7 @@ coinbase_place_order_async(const coinbase_place_order_req_t *req,
   {
     union { void *obj; fn_t fn; } u;
 
-    u.obj = plugin_dlsym("coinbase", "coinbase_place_order_async");
+    u.obj = plugin_dlsym_cached("coinbase", "coinbase_place_order_async", (void **)&cached);
     if(u.obj == NULL)
     {
       clam(CLAM_FATAL, "coinbase",
@@ -564,7 +564,7 @@ coinbase_cancel_order_async(const char *order_id,
   {
     union { void *obj; fn_t fn; } u;
 
-    u.obj = plugin_dlsym("coinbase", "coinbase_cancel_order_async");
+    u.obj = plugin_dlsym_cached("coinbase", "coinbase_cancel_order_async", (void **)&cached);
     if(u.obj == NULL)
     {
       clam(CLAM_FATAL, "coinbase",
@@ -589,7 +589,7 @@ coinbase_get_order_async(const char *order_id,
   {
     union { void *obj; fn_t fn; } u;
 
-    u.obj = plugin_dlsym("coinbase", "coinbase_get_order_async");
+    u.obj = plugin_dlsym_cached("coinbase", "coinbase_get_order_async", (void **)&cached);
     if(u.obj == NULL)
     {
       clam(CLAM_FATAL, "coinbase",
@@ -615,7 +615,7 @@ coinbase_list_orders_async(const char *status, const char *product_id,
   {
     union { void *obj; fn_t fn; } u;
 
-    u.obj = plugin_dlsym("coinbase", "coinbase_list_orders_async");
+    u.obj = plugin_dlsym_cached("coinbase", "coinbase_list_orders_async", (void **)&cached);
     if(u.obj == NULL)
     {
       clam(CLAM_FATAL, "coinbase",
@@ -639,7 +639,7 @@ coinbase_get_accounts_async(coinbase_done_accounts_cb_t cb, void *user)
   {
     union { void *obj; fn_t fn; } u;
 
-    u.obj = plugin_dlsym("coinbase", "coinbase_get_accounts_async");
+    u.obj = plugin_dlsym_cached("coinbase", "coinbase_get_accounts_async", (void **)&cached);
     if(u.obj == NULL)
     {
       clam(CLAM_FATAL, "coinbase",
@@ -665,7 +665,7 @@ coinbase_list_fills_async(const char *order_id, const char *product_id,
   {
     union { void *obj; fn_t fn; } u;
 
-    u.obj = plugin_dlsym("coinbase", "coinbase_list_fills_async");
+    u.obj = plugin_dlsym_cached("coinbase", "coinbase_list_fills_async", (void **)&cached);
     if(u.obj == NULL)
     {
       clam(CLAM_FATAL, "coinbase",
@@ -692,7 +692,7 @@ coinbase_ws_subscribe(const coinbase_ws_channel_t *channels,
   {
     union { void *obj; fn_t fn; } u;
 
-    u.obj = plugin_dlsym("coinbase", "coinbase_ws_subscribe");
+    u.obj = plugin_dlsym_cached("coinbase", "coinbase_ws_subscribe", (void **)&cached);
     if(u.obj == NULL)
     {
       clam(CLAM_FATAL, "coinbase",
@@ -716,7 +716,7 @@ coinbase_ws_unsubscribe(coinbase_ws_sub_t *sub)
   {
     union { void *obj; fn_t fn; } u;
 
-    u.obj = plugin_dlsym("coinbase", "coinbase_ws_unsubscribe");
+    u.obj = plugin_dlsym_cached("coinbase", "coinbase_ws_unsubscribe", (void **)&cached);
     if(u.obj == NULL)
     {
       clam(CLAM_FATAL, "coinbase",

@@ -4,7 +4,7 @@
 // Public cross-plugin surface of the inference plugin (llm + knowledge
 // + acquire). Consumers include this header; the `static inline`
 // helpers below resolve the real implementation through
-// `plugin_dlsym("inference", …)` on first use and cache the pointer.
+// `plugin_dlsym_cached("inference", …, (void **)&cached)` on first use and cache the pointer.
 //
 // Shim shape mirrors `plugins/inference/acquire_reactive.c`'s
 // acq_sxng_resolve() pattern: atomic-guarded static cache, union to
@@ -315,7 +315,7 @@ llm_chat_submit(const char *model_name,
   {
     union { void *obj; fn_t fn; } u;
 
-    u.obj = plugin_dlsym("inference", "llm_chat_submit");
+    u.obj = plugin_dlsym_cached("inference", "llm_chat_submit", (void **)&cached);
     if(u.obj == NULL)
     {
       clam(CLAM_FATAL, "inference", "dlsym failed: llm_chat_submit");
@@ -342,7 +342,7 @@ llm_embed_submit(const char *model_name,
   {
     union { void *obj; fn_t fn; } u;
 
-    u.obj = plugin_dlsym("inference", "llm_embed_submit");
+    u.obj = plugin_dlsym_cached("inference", "llm_embed_submit", (void **)&cached);
     if(u.obj == NULL)
     {
       clam(CLAM_FATAL, "inference", "dlsym failed: llm_embed_submit");
@@ -367,7 +367,7 @@ knowledge_corpus_upsert(const char *name, const char *description)
   {
     union { void *obj; fn_t fn; } u;
 
-    u.obj = plugin_dlsym("inference", "knowledge_corpus_upsert");
+    u.obj = plugin_dlsym_cached("inference", "knowledge_corpus_upsert", (void **)&cached);
     if(u.obj == NULL)
     {
       clam(CLAM_FATAL, "inference", "dlsym failed: knowledge_corpus_upsert");
@@ -392,7 +392,7 @@ knowledge_retrieve(const char *corpus_list, const char *query,
   {
     union { void *obj; fn_t fn; } u;
 
-    u.obj = plugin_dlsym("inference", "knowledge_retrieve");
+    u.obj = plugin_dlsym_cached("inference", "knowledge_retrieve", (void **)&cached);
     if(u.obj == NULL)
     {
       clam(CLAM_FATAL, "inference", "dlsym failed: knowledge_retrieve");
@@ -415,7 +415,7 @@ knowledge_cosine(const float *a, const float *b, uint32_t dim)
   {
     union { void *obj; fn_t fn; } u;
 
-    u.obj = plugin_dlsym("inference", "knowledge_cosine");
+    u.obj = plugin_dlsym_cached("inference", "knowledge_cosine", (void **)&cached);
     if(u.obj == NULL)
     {
       clam(CLAM_FATAL, "inference", "dlsym failed: knowledge_cosine");
@@ -438,7 +438,7 @@ knowledge_get_chunk_embedding(int64_t chunk_id, float *out, uint32_t out_cap)
   {
     union { void *obj; fn_t fn; } u;
 
-    u.obj = plugin_dlsym("inference", "knowledge_get_chunk_embedding");
+    u.obj = plugin_dlsym_cached("inference", "knowledge_get_chunk_embedding", (void **)&cached);
     if(u.obj == NULL)
     {
       clam(CLAM_FATAL, "inference", "dlsym failed: knowledge_get_chunk_embedding");
@@ -462,7 +462,7 @@ knowledge_images_for_chunks(const int64_t *chunk_ids, size_t n_ids,
   {
     union { void *obj; fn_t fn; } u;
 
-    u.obj = plugin_dlsym("inference", "knowledge_images_for_chunks");
+    u.obj = plugin_dlsym_cached("inference", "knowledge_images_for_chunks", (void **)&cached);
     if(u.obj == NULL)
     {
       clam(CLAM_FATAL, "inference", "dlsym failed: knowledge_images_for_chunks");
@@ -488,7 +488,7 @@ knowledge_images_by_subject(const char *corpus_list, const char *subject,
   {
     union { void *obj; fn_t fn; } u;
 
-    u.obj = plugin_dlsym("inference", "knowledge_images_by_subject");
+    u.obj = plugin_dlsym_cached("inference", "knowledge_images_by_subject", (void **)&cached);
     if(u.obj == NULL)
     {
       clam(CLAM_FATAL, "inference", "dlsym failed: knowledge_images_by_subject");
@@ -516,7 +516,7 @@ acquire_register_topics(const char *bot_name,
   {
     union { void *obj; fn_t fn; } u;
 
-    u.obj = plugin_dlsym("inference", "acquire_register_topics");
+    u.obj = plugin_dlsym_cached("inference", "acquire_register_topics", (void **)&cached);
     if(u.obj == NULL)
     {
       clam(CLAM_FATAL, "inference", "dlsym failed: acquire_register_topics");
@@ -539,7 +539,7 @@ acquire_unregister_bot(const char *bot_name)
   {
     union { void *obj; fn_t fn; } u;
 
-    u.obj = plugin_dlsym("inference", "acquire_unregister_bot");
+    u.obj = plugin_dlsym_cached("inference", "acquire_unregister_bot", (void **)&cached);
     if(u.obj == NULL)
     {
       clam(CLAM_FATAL, "inference", "dlsym failed: acquire_unregister_bot");
@@ -563,7 +563,7 @@ acquire_enqueue_reactive(const char *bot_name, const char *topic_name,
   {
     union { void *obj; fn_t fn; } u;
 
-    u.obj = plugin_dlsym("inference", "acquire_enqueue_reactive");
+    u.obj = plugin_dlsym_cached("inference", "acquire_enqueue_reactive", (void **)&cached);
     if(u.obj == NULL)
     {
       clam(CLAM_FATAL, "inference", "dlsym failed: acquire_enqueue_reactive");
@@ -586,7 +586,7 @@ acquire_register_ingest_cb(acquire_ingest_cb_t cb, void *user)
   {
     union { void *obj; fn_t fn; } u;
 
-    u.obj = plugin_dlsym("inference", "acquire_register_ingest_cb");
+    u.obj = plugin_dlsym_cached("inference", "acquire_register_ingest_cb", (void **)&cached);
     if(u.obj == NULL)
     {
       clam(CLAM_FATAL, "inference", "dlsym failed: acquire_register_ingest_cb");
@@ -610,7 +610,7 @@ acquire_get_topic_snapshot(const char *bot_name,
   {
     union { void *obj; fn_t fn; } u;
 
-    u.obj = plugin_dlsym("inference", "acquire_get_topic_snapshot");
+    u.obj = plugin_dlsym_cached("inference", "acquire_get_topic_snapshot", (void **)&cached);
     if(u.obj == NULL)
     {
       clam(CLAM_FATAL, "inference", "dlsym failed: acquire_get_topic_snapshot");

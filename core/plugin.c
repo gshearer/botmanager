@@ -1,8 +1,13 @@
 // botmanager — MIT
 // Plugin loader: dlopen, descriptor registration, lifecycle dispatch.
+#define _GNU_SOURCE  // dladdr / Dl_info — GNU extensions; must precede any header
 #define PLUGIN_INTERNAL
 #include "plugin.h"
 #include "util.h"
+
+// Forward decl — defined alongside plugin_dlsym_cached, called from
+// plugin_unload to invalidate dangling shim pointers before dlclose.
+static void dlsym_cache_on_plugin_unload(const plugin_rec_t *target);
 
 static plugin_rec_t *
 find_by_name(const char *name)
@@ -236,6 +241,14 @@ plugin_unload(const char *name)
     for(uint32_t i = 0; i < target->desc->kv_schema_count; i++)
       kv_unregister(target->desc->kv_schema[i].key);
   }
+
+  // Invalidate cross-plugin dlsym shim caches. Consumers (chat,
+  // strategies, …) cache resolved function pointers in static fn_t
+  // slots; without invalidation, dlclose'ing this plugin would dangle
+  // every consumer's cache. Slots belonging to this plugin (i.e. the
+  // consumer is the one being unloaded) are dropped from the registry
+  // entirely — their backing memory is about to go away.
+  dlsym_cache_on_plugin_unload(target);
 
   // Remove from list.
   pp = &plugins;
@@ -709,6 +722,125 @@ plugin_dlsym(const char *plugin_name, const char *symbol)
   // Clear any pending dlerror so a NULL return is unambiguous.
   dlerror();
   return(dlsym(rec->handle, symbol));
+}
+
+// Look up the .so file path containing `addr` via dladdr(3). Returns
+// a mem_alloc'd copy of the path on success, NULL on miss. Caller owns
+// the allocation. Used at dlsym-cache registration time to remember
+// which plugin's text contains a consumer's cache slot.
+static const char *
+dlsym_cache_consumer_so(void *addr)
+{
+  Dl_info     info;
+  size_t      len;
+  char       *out;
+
+  if(addr == NULL)
+    return(NULL);
+
+  if(dladdr(addr, &info) == 0 || info.dli_fname == NULL)
+    return(NULL);
+
+  len = strlen(info.dli_fname);
+  out = mem_alloc("plugin", "dlsym_consumer", len + 1);
+  memcpy(out, info.dli_fname, len + 1);
+  return(out);
+}
+
+void *
+plugin_dlsym_cached(const char *plugin_name, const char *symbol,
+    void **slot)
+{
+  void               *resolved;
+  dlsym_cache_rec_t  *r;
+  bool                already_registered = false;
+
+  if(slot == NULL)
+    return(plugin_dlsym(plugin_name, symbol));
+
+  resolved = plugin_dlsym(plugin_name, symbol);
+
+  if(resolved == NULL)
+    return(NULL);
+
+  pthread_mutex_lock(&dlsym_cache_mutex);
+
+  for(r = dlsym_cache_head; r != NULL; r = r->next)
+  {
+    if(r->slot == slot)
+    {
+      already_registered = true;
+      break;
+    }
+  }
+
+  if(!already_registered)
+  {
+    r = mem_alloc("plugin", "dlsym_cache_rec", sizeof(*r));
+    r->target_plugin = plugin_name;
+    r->slot          = slot;
+    r->consumer_so   = dlsym_cache_consumer_so((void *)slot);
+    r->next          = dlsym_cache_head;
+    dlsym_cache_head = r;
+  }
+
+  pthread_mutex_unlock(&dlsym_cache_mutex);
+
+  // Caller does the atomic store via the union-laundered fn_t to keep
+  // strict aliasing happy; we don't write `*slot` here.
+  return(resolved);
+}
+
+// Walk the dlsym-cache list during a plugin unload. For each entry:
+//   - If the entry's consumer_so matches the unloaded plugin's path,
+//     the slot's memory is about to disappear — drop the entry.
+//   - Else, if the entry's target_plugin matches the unloaded
+//     plugin's name, NULL the slot so the next caller re-resolves
+//     (and gets either the new symbol post-reload or a NULL miss
+//     that the shim's FATAL/abort path handles).
+// Called from plugin_unload with no caller-side locks held.
+static void
+dlsym_cache_on_plugin_unload(const plugin_rec_t *target)
+{
+  dlsym_cache_rec_t **pp;
+  const char         *target_name;
+  const char         *target_path;
+
+  if(target == NULL || target->desc == NULL)
+    return;
+
+  target_name = target->desc->name;
+  target_path = target->path;
+
+  pthread_mutex_lock(&dlsym_cache_mutex);
+
+  pp = &dlsym_cache_head;
+
+  while(*pp != NULL)
+  {
+    dlsym_cache_rec_t *r = *pp;
+    bool consumer_match = (r->consumer_so != NULL
+        && target_path[0] != '\0'
+        && strcmp(r->consumer_so, target_path) == 0);
+
+    if(consumer_match)
+    {
+      *pp = r->next;
+
+      if(r->consumer_so != NULL)
+        mem_free((char *)r->consumer_so);
+
+      mem_free(r);
+      continue;
+    }
+
+    if(strcmp(r->target_plugin, target_name) == 0)
+      __atomic_store_n(r->slot, NULL, __ATOMIC_RELEASE);
+
+    pp = &r->next;
+  }
+
+  pthread_mutex_unlock(&dlsym_cache_mutex);
 }
 
 void

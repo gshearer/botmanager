@@ -330,7 +330,7 @@ wm_strategy_ctx_set_user(wm_strategy_ctx_t *ctx, void *user)
   {
     union { void *obj; fn_t fn; } u;
 
-    u.obj = plugin_dlsym("whenmoon", "wm_strategy_ctx_set_user_impl");
+    u.obj = plugin_dlsym_cached("whenmoon", "wm_strategy_ctx_set_user_impl", (void **)&cached);
     if(u.obj == NULL)
     {
       clam(CLAM_FATAL, "whenmoon",
@@ -354,7 +354,7 @@ wm_strategy_ctx_get_user(wm_strategy_ctx_t *ctx)
   {
     union { void *obj; fn_t fn; } u;
 
-    u.obj = plugin_dlsym("whenmoon", "wm_strategy_ctx_get_user_impl");
+    u.obj = plugin_dlsym_cached("whenmoon", "wm_strategy_ctx_get_user_impl", (void **)&cached);
     if(u.obj == NULL)
     {
       clam(CLAM_FATAL, "whenmoon",
@@ -381,7 +381,7 @@ wm_strategy_ctx_market_id(wm_strategy_ctx_t *ctx)
   {
     union { void *obj; fn_t fn; } u;
 
-    u.obj = plugin_dlsym("whenmoon", "wm_strategy_ctx_market_id_impl");
+    u.obj = plugin_dlsym_cached("whenmoon", "wm_strategy_ctx_market_id_impl", (void **)&cached);
     if(u.obj == NULL)
     {
       clam(CLAM_FATAL, "whenmoon",
@@ -405,8 +405,8 @@ wm_strategy_ctx_strategy_name(wm_strategy_ctx_t *ctx)
   {
     union { void *obj; fn_t fn; } u;
 
-    u.obj = plugin_dlsym("whenmoon",
-        "wm_strategy_ctx_strategy_name_impl");
+    u.obj = plugin_dlsym_cached("whenmoon",
+        "wm_strategy_ctx_strategy_name_impl", (void **)&cached);
     if(u.obj == NULL)
     {
       clam(CLAM_FATAL, "whenmoon",
@@ -436,7 +436,7 @@ wm_strategy_emit_signal(wm_strategy_ctx_t *ctx,
   {
     union { void *obj; fn_t fn; } u;
 
-    u.obj = plugin_dlsym("whenmoon", "wm_strategy_emit_signal_impl");
+    u.obj = plugin_dlsym_cached("whenmoon", "wm_strategy_emit_signal_impl", (void **)&cached);
     if(u.obj == NULL)
     {
       clam(CLAM_FATAL, "whenmoon",
@@ -464,7 +464,7 @@ wm_strategy_kv_get_uint(const char *market_id, const char *strategy,
   {
     union { void *obj; fn_t fn; } u;
 
-    u.obj = plugin_dlsym("whenmoon", "wm_strategy_kv_get_uint");
+    u.obj = plugin_dlsym_cached("whenmoon", "wm_strategy_kv_get_uint", (void **)&cached);
     if(u.obj == NULL)
     {
       clam(CLAM_FATAL, "whenmoon",
@@ -490,7 +490,7 @@ wm_strategy_kv_get_int(const char *market_id, const char *strategy,
   {
     union { void *obj; fn_t fn; } u;
 
-    u.obj = plugin_dlsym("whenmoon", "wm_strategy_kv_get_int");
+    u.obj = plugin_dlsym_cached("whenmoon", "wm_strategy_kv_get_int", (void **)&cached);
     if(u.obj == NULL)
     {
       clam(CLAM_FATAL, "whenmoon",
@@ -515,7 +515,7 @@ wm_strategy_kv_get_dbl(const char *market_id, const char *strategy,
   {
     union { void *obj; fn_t fn; } u;
 
-    u.obj = plugin_dlsym("whenmoon", "wm_strategy_kv_get_dbl");
+    u.obj = plugin_dlsym_cached("whenmoon", "wm_strategy_kv_get_dbl", (void **)&cached);
     if(u.obj == NULL)
     {
       clam(CLAM_FATAL, "whenmoon",
@@ -541,7 +541,7 @@ wm_strategy_kv_get_str(const char *market_id, const char *strategy,
   {
     union { void *obj; fn_t fn; } u;
 
-    u.obj = plugin_dlsym("whenmoon", "wm_strategy_kv_get_str");
+    u.obj = plugin_dlsym_cached("whenmoon", "wm_strategy_kv_get_str", (void **)&cached);
     if(u.obj == NULL)
     {
       clam(CLAM_FATAL, "whenmoon",

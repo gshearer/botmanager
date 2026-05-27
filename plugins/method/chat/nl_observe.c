@@ -51,8 +51,9 @@ resolve_openweather_geocode(void)
   {
     union { void *obj; geocode_city_fn_t fn; } u;
 
-    u.obj = plugin_dlsym("openweather",
-        "openweather_geocode_city_sync");
+    u.obj = plugin_dlsym_cached("openweather",
+        "openweather_geocode_city_sync",
+        (void **)&fn_geocode_city_sync);
     fn_geocode_city_sync = u.fn;
     geocode_resolved = true;
   }

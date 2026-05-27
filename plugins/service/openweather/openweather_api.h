@@ -3,7 +3,7 @@
 
 // Public mechanism API for the openweather service plugin. Consumers
 // include this header and resolve the symbols at runtime via
-// plugin_dlsym("openweather", …) — the plugin is loaded RTLD_LOCAL.
+// plugin_dlsym_cached("openweather", …, (void **)&cached) — the plugin is loaded RTLD_LOCAL.
 //
 // Shim shape mirrors plugins/inference/inference.h: an atomic-guarded
 // static cache per symbol, union to launder void*↔function-pointer
@@ -202,7 +202,7 @@ openweather_geocode_zip_sync(const char *zipcode,
   {
     union { void *obj; fn_t fn; } u;
 
-    u.obj = plugin_dlsym("openweather", "openweather_geocode_zip_sync");
+    u.obj = plugin_dlsym_cached("openweather", "openweather_geocode_zip_sync", (void **)&cached);
     if(u.obj == NULL)
     {
       clam(CLAM_FATAL, "openweather",
@@ -226,7 +226,7 @@ openweather_geocode_city_sync(const char *city, char *zip_out, size_t zip_sz)
   {
     union { void *obj; fn_t fn; } u;
 
-    u.obj = plugin_dlsym("openweather", "openweather_geocode_city_sync");
+    u.obj = plugin_dlsym_cached("openweather", "openweather_geocode_city_sync", (void **)&cached);
     if(u.obj == NULL)
     {
       clam(CLAM_FATAL, "openweather",
@@ -252,7 +252,7 @@ openweather_fetch_current(const char *zipcode,
   {
     union { void *obj; fn_t fn; } u;
 
-    u.obj = plugin_dlsym("openweather", "openweather_fetch_current");
+    u.obj = plugin_dlsym_cached("openweather", "openweather_fetch_current", (void **)&cached);
     if(u.obj == NULL)
     {
       clam(CLAM_FATAL, "openweather",
@@ -278,7 +278,7 @@ openweather_fetch_forecast_daily(const char *zipcode,
   {
     union { void *obj; fn_t fn; } u;
 
-    u.obj = plugin_dlsym("openweather", "openweather_fetch_forecast_daily");
+    u.obj = plugin_dlsym_cached("openweather", "openweather_fetch_forecast_daily", (void **)&cached);
     if(u.obj == NULL)
     {
       clam(CLAM_FATAL, "openweather",
@@ -304,8 +304,8 @@ openweather_fetch_forecast_hourly(const char *zipcode,
   {
     union { void *obj; fn_t fn; } u;
 
-    u.obj = plugin_dlsym("openweather",
-        "openweather_fetch_forecast_hourly");
+    u.obj = plugin_dlsym_cached("openweather",
+        "openweather_fetch_forecast_hourly", (void **)&cached);
     if(u.obj == NULL)
     {
       clam(CLAM_FATAL, "openweather",
@@ -329,7 +329,7 @@ openweather_units_kv_value(void)
   {
     union { void *obj; fn_t fn; } u;
 
-    u.obj = plugin_dlsym("openweather", "openweather_units_kv_value");
+    u.obj = plugin_dlsym_cached("openweather", "openweather_units_kv_value", (void **)&cached);
     if(u.obj == NULL)
     {
       clam(CLAM_FATAL, "openweather",

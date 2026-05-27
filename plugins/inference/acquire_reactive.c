@@ -357,7 +357,8 @@ acq_sxng_resolve(void)
   // dlsym; ISO C is stricter. The union-cast below silences -Wpedantic
   // while keeping the conversion localised and explicit.
 
-  u.obj = plugin_dlsym("searxng", "sxng_search");
+  u.obj = plugin_dlsym_cached("searxng", "sxng_search",
+      (void **)&acquire_sxng_search);
   fn = u.fn;
 
   pthread_mutex_lock(&acquire_cfg_mutex);

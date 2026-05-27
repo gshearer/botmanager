@@ -192,7 +192,7 @@ sxng_search(const char *query, sxng_category_t category, size_t n_wanted,
   {
     union { void *obj; fn_t fn; } u;
 
-    u.obj = plugin_dlsym("searxng", "sxng_search");
+    u.obj = plugin_dlsym_cached("searxng", "sxng_search", (void **)&cached);
     if(u.obj == NULL)
     {
       clam(CLAM_FATAL, "searxng", "dlsym failed: sxng_search");

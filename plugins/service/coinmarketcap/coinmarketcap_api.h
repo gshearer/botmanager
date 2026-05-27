@@ -3,7 +3,7 @@
 
 // Public mechanism API for the coinmarketcap service plugin. Consumers
 // include this header and resolve the symbols at runtime via
-// plugin_dlsym("coinmarketcap", …) — the plugin is loaded RTLD_LOCAL.
+// plugin_dlsym_cached("coinmarketcap", …, (void **)&cached) — the plugin is loaded RTLD_LOCAL.
 //
 // Shim shape mirrors plugins/service/openweather/openweather_api.h: an
 // atomic-guarded static cache per symbol, union to launder
@@ -207,8 +207,8 @@ coinmarketcap_get_coin_by_symbol(const char *symbol,
   {
     union { void *obj; fn_t fn; } u;
 
-    u.obj = plugin_dlsym("coinmarketcap",
-        "coinmarketcap_get_coin_by_symbol");
+    u.obj = plugin_dlsym_cached("coinmarketcap",
+        "coinmarketcap_get_coin_by_symbol", (void **)&cached);
     if(u.obj == NULL)
     {
       clam(CLAM_FATAL, "coinmarketcap",
@@ -232,8 +232,8 @@ coinmarketcap_get_coin_by_rank(int32_t rank, coinmarketcap_coin_t *out)
   {
     union { void *obj; fn_t fn; } u;
 
-    u.obj = plugin_dlsym("coinmarketcap",
-        "coinmarketcap_get_coin_by_rank");
+    u.obj = plugin_dlsym_cached("coinmarketcap",
+        "coinmarketcap_get_coin_by_rank", (void **)&cached);
     if(u.obj == NULL)
     {
       clam(CLAM_FATAL, "coinmarketcap",
@@ -260,8 +260,8 @@ coinmarketcap_get_listings(uint32_t limit, uint8_t sort_col,
   {
     union { void *obj; fn_t fn; } u;
 
-    u.obj = plugin_dlsym("coinmarketcap",
-        "coinmarketcap_get_listings");
+    u.obj = plugin_dlsym_cached("coinmarketcap",
+        "coinmarketcap_get_listings", (void **)&cached);
     if(u.obj == NULL)
     {
       clam(CLAM_FATAL, "coinmarketcap",
@@ -285,7 +285,7 @@ coinmarketcap_get_global(coinmarketcap_global_t *out)
   {
     union { void *obj; fn_t fn; } u;
 
-    u.obj = plugin_dlsym("coinmarketcap", "coinmarketcap_get_global");
+    u.obj = plugin_dlsym_cached("coinmarketcap", "coinmarketcap_get_global", (void **)&cached);
     if(u.obj == NULL)
     {
       clam(CLAM_FATAL, "coinmarketcap",
@@ -309,8 +309,8 @@ coinmarketcap_listings_cache_fresh(void)
   {
     union { void *obj; fn_t fn; } u;
 
-    u.obj = plugin_dlsym("coinmarketcap",
-        "coinmarketcap_listings_cache_fresh");
+    u.obj = plugin_dlsym_cached("coinmarketcap",
+        "coinmarketcap_listings_cache_fresh", (void **)&cached);
     if(u.obj == NULL)
     {
       clam(CLAM_FATAL, "coinmarketcap",
@@ -334,8 +334,8 @@ coinmarketcap_global_cache_fresh(void)
   {
     union { void *obj; fn_t fn; } u;
 
-    u.obj = plugin_dlsym("coinmarketcap",
-        "coinmarketcap_global_cache_fresh");
+    u.obj = plugin_dlsym_cached("coinmarketcap",
+        "coinmarketcap_global_cache_fresh", (void **)&cached);
     if(u.obj == NULL)
     {
       clam(CLAM_FATAL, "coinmarketcap",
@@ -360,8 +360,8 @@ coinmarketcap_fetch_listings_async(
   {
     union { void *obj; fn_t fn; } u;
 
-    u.obj = plugin_dlsym("coinmarketcap",
-        "coinmarketcap_fetch_listings_async");
+    u.obj = plugin_dlsym_cached("coinmarketcap",
+        "coinmarketcap_fetch_listings_async", (void **)&cached);
     if(u.obj == NULL)
     {
       clam(CLAM_FATAL, "coinmarketcap",
@@ -387,8 +387,8 @@ coinmarketcap_fetch_detail_async(const char *symbol, int32_t rank,
   {
     union { void *obj; fn_t fn; } u;
 
-    u.obj = plugin_dlsym("coinmarketcap",
-        "coinmarketcap_fetch_detail_async");
+    u.obj = plugin_dlsym_cached("coinmarketcap",
+        "coinmarketcap_fetch_detail_async", (void **)&cached);
     if(u.obj == NULL)
     {
       clam(CLAM_FATAL, "coinmarketcap",
@@ -413,8 +413,8 @@ coinmarketcap_fetch_global_async(
   {
     union { void *obj; fn_t fn; } u;
 
-    u.obj = plugin_dlsym("coinmarketcap",
-        "coinmarketcap_fetch_global_async");
+    u.obj = plugin_dlsym_cached("coinmarketcap",
+        "coinmarketcap_fetch_global_async", (void **)&cached);
     if(u.obj == NULL)
     {
       clam(CLAM_FATAL, "coinmarketcap",
@@ -438,8 +438,8 @@ coinmarketcap_default_limit_kv_value(void)
   {
     union { void *obj; fn_t fn; } u;
 
-    u.obj = plugin_dlsym("coinmarketcap",
-        "coinmarketcap_default_limit_kv_value");
+    u.obj = plugin_dlsym_cached("coinmarketcap",
+        "coinmarketcap_default_limit_kv_value", (void **)&cached);
     if(u.obj == NULL)
     {
       clam(CLAM_FATAL, "coinmarketcap",
@@ -463,8 +463,8 @@ coinmarketcap_apikey_configured(void)
   {
     union { void *obj; fn_t fn; } u;
 
-    u.obj = plugin_dlsym("coinmarketcap",
-        "coinmarketcap_apikey_configured");
+    u.obj = plugin_dlsym_cached("coinmarketcap",
+        "coinmarketcap_apikey_configured", (void **)&cached);
     if(u.obj == NULL)
     {
       clam(CLAM_FATAL, "coinmarketcap",

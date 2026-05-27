@@ -684,7 +684,7 @@ exchange_request(const char *exchange, uint8_t prio,
   {
     union { void *obj; fn_t fn; } u;
 
-    u.obj = plugin_dlsym("exchange", "exchange_request");
+    u.obj = plugin_dlsym_cached("exchange", "exchange_request", (void **)&cached);
     if(u.obj == NULL)
     {
       clam(CLAM_FATAL, "exchange",
@@ -708,7 +708,7 @@ exchange_register(const char *name, const exchange_protocol_vtable_t *vt)
   {
     union { void *obj; fn_t fn; } u;
 
-    u.obj = plugin_dlsym("exchange", "exchange_register");
+    u.obj = plugin_dlsym_cached("exchange", "exchange_register", (void **)&cached);
     if(u.obj == NULL)
     {
       clam(CLAM_FATAL, "exchange",
@@ -732,7 +732,7 @@ exchange_unregister(const char *name)
   {
     union { void *obj; fn_t fn; } u;
 
-    u.obj = plugin_dlsym("exchange", "exchange_unregister");
+    u.obj = plugin_dlsym_cached("exchange", "exchange_unregister", (void **)&cached);
     if(u.obj == NULL)
     {
       clam(CLAM_FATAL, "exchange",
@@ -756,7 +756,7 @@ exchange_get_capabilities(const char *name, exchange_capabilities_t *out)
   {
     union { void *obj; fn_t fn; } u;
 
-    u.obj = plugin_dlsym("exchange", "exchange_get_capabilities");
+    u.obj = plugin_dlsym_cached("exchange", "exchange_get_capabilities", (void **)&cached);
     if(u.obj == NULL)
     {
       clam(CLAM_FATAL, "exchange",
@@ -781,7 +781,7 @@ exchange_name_list(char (*out_arr)[EXCHANGE_NAME_SZ], uint32_t out_cap,
   {
     union { void *obj; fn_t fn; } u;
 
-    u.obj = plugin_dlsym("exchange", "exchange_name_list");
+    u.obj = plugin_dlsym_cached("exchange", "exchange_name_list", (void **)&cached);
     if(u.obj == NULL)
     {
       clam(CLAM_FATAL, "exchange",
@@ -808,7 +808,7 @@ exchange_place_order_async(const char *name,
   {
     union { void *obj; fn_t fn; } u;
 
-    u.obj = plugin_dlsym("exchange", "exchange_place_order_async");
+    u.obj = plugin_dlsym_cached("exchange", "exchange_place_order_async", (void **)&cached);
     if(u.obj == NULL)
     {
       clam(CLAM_FATAL, "exchange",
@@ -834,7 +834,7 @@ exchange_cancel_order_async(const char *name, const char *order_id,
   {
     union { void *obj; fn_t fn; } u;
 
-    u.obj = plugin_dlsym("exchange", "exchange_cancel_order_async");
+    u.obj = plugin_dlsym_cached("exchange", "exchange_cancel_order_async", (void **)&cached);
     if(u.obj == NULL)
     {
       clam(CLAM_FATAL, "exchange",
@@ -860,7 +860,7 @@ exchange_get_order_async(const char *name, const char *order_id,
   {
     union { void *obj; fn_t fn; } u;
 
-    u.obj = plugin_dlsym("exchange", "exchange_get_order_async");
+    u.obj = plugin_dlsym_cached("exchange", "exchange_get_order_async", (void **)&cached);
     if(u.obj == NULL)
     {
       clam(CLAM_FATAL, "exchange",
@@ -887,7 +887,7 @@ exchange_list_orders_async(const char *name, const char *status,
   {
     union { void *obj; fn_t fn; } u;
 
-    u.obj = plugin_dlsym("exchange", "exchange_list_orders_async");
+    u.obj = plugin_dlsym_cached("exchange", "exchange_list_orders_async", (void **)&cached);
     if(u.obj == NULL)
     {
       clam(CLAM_FATAL, "exchange",
@@ -914,7 +914,7 @@ exchange_list_fills_async(const char *name, const char *order_id,
   {
     union { void *obj; fn_t fn; } u;
 
-    u.obj = plugin_dlsym("exchange", "exchange_list_fills_async");
+    u.obj = plugin_dlsym_cached("exchange", "exchange_list_fills_async", (void **)&cached);
     if(u.obj == NULL)
     {
       clam(CLAM_FATAL, "exchange",
@@ -939,7 +939,7 @@ exchange_get_accounts_async(const char *name,
   {
     union { void *obj; fn_t fn; } u;
 
-    u.obj = plugin_dlsym("exchange", "exchange_get_accounts_async");
+    u.obj = plugin_dlsym_cached("exchange", "exchange_get_accounts_async", (void **)&cached);
     if(u.obj == NULL)
     {
       clam(CLAM_FATAL, "exchange",
@@ -966,7 +966,7 @@ exchange_fetch_candles_async(const char *name, const char *product_id,
   {
     union { void *obj; fn_t fn; } u;
 
-    u.obj = plugin_dlsym("exchange", "exchange_fetch_candles_async");
+    u.obj = plugin_dlsym_cached("exchange", "exchange_fetch_candles_async", (void **)&cached);
     if(u.obj == NULL)
     {
       clam(CLAM_FATAL, "exchange",
@@ -991,7 +991,7 @@ exchange_fetch_all_tickers_async(const char *name,
   {
     union { void *obj; fn_t fn; } u;
 
-    u.obj = plugin_dlsym("exchange", "exchange_fetch_all_tickers_async");
+    u.obj = plugin_dlsym_cached("exchange", "exchange_fetch_all_tickers_async", (void **)&cached);
     if(u.obj == NULL)
     {
       clam(CLAM_FATAL, "exchange",
@@ -1021,7 +1021,7 @@ exchange_ws_subscribe(const char *name,
   {
     union { void *obj; fn_t fn; } u;
 
-    u.obj = plugin_dlsym("exchange", "exchange_ws_subscribe");
+    u.obj = plugin_dlsym_cached("exchange", "exchange_ws_subscribe", (void **)&cached);
     if(u.obj == NULL)
     {
       clam(CLAM_FATAL, "exchange",
@@ -1046,7 +1046,7 @@ exchange_ws_unsubscribe(const char *name, exchange_ws_sub_t *handle)
   {
     union { void *obj; fn_t fn; } u;
 
-    u.obj = plugin_dlsym("exchange", "exchange_ws_unsubscribe");
+    u.obj = plugin_dlsym_cached("exchange", "exchange_ws_unsubscribe", (void **)&cached);
     if(u.obj == NULL)
     {
       clam(CLAM_FATAL, "exchange",

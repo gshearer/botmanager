@@ -138,6 +138,20 @@ plugin_state_t plugin_get_state(const char *name);
 // both cases are silent — the caller decides the severity of a miss.
 void *plugin_dlsym(const char *plugin_name, const char *symbol);
 
+// Like plugin_dlsym, but also registers the caller's `slot` (the
+// address of its `static fn_t cached`) for invalidation on plugin
+// unload. The dlsym-shim pattern (see plugins/inference/inference.h,
+// plugins/feature/whenmoon/whenmoon_strategy.h) caches the resolved
+// function pointer in a static slot inside the consumer; without
+// invalidation that pointer would dangle when the target plugin is
+// unloaded. The caller keeps its existing union-launder +
+// __atomic_store_n(RELEASE) pattern — this function only registers
+// the slot and returns the resolved void*. Registration is idempotent.
+// Returns NULL on lookup miss (same as plugin_dlsym); shim macros
+// log+abort on that path.
+void *plugin_dlsym_cached(const char *plugin_name, const char *symbol,
+    void **slot);
+
 uint32_t plugin_count(void);
 
 typedef void (*plugin_iterate_cb_t)(const char *name, const char *version,
@@ -211,6 +225,21 @@ void plugin_exit(void);
 
 #define PLUGIN_PATH_SZ  512
 
+// Registry of dlsym-shim cache slots. Each entry pairs a target
+// plugin name with the void** slot a consumer is caching its
+// resolved pointer in. On plugin unload, the loader walks this
+// list and either NULLs the slot (when the unloaded plugin is the
+// target — protects against a consumer dispatching into freed
+// .text) or drops the entry (when the unloaded plugin is the
+// consumer — its slot memory is going away with dlclose).
+typedef struct dlsym_cache_rec
+{
+  const char              *target_plugin;  // string literal in consumer's .rodata
+  void                   **slot;           // address of caller's static cache
+  const char              *consumer_so;    // owned copy (mem_alloc); dladdr() at registration
+  struct dlsym_cache_rec  *next;
+} dlsym_cache_rec_t;
+
 typedef struct plugin_rec
 {
   char                  path[PLUGIN_PATH_SZ];
@@ -220,9 +249,11 @@ typedef struct plugin_rec
   struct plugin_rec    *next;
 } plugin_rec_t;
 
-static plugin_rec_t *plugins      = NULL;
-static uint32_t      n_plugins    = 0;
-static bool          plugin_ready = false;
+static plugin_rec_t      *plugins             = NULL;
+static uint32_t           n_plugins           = 0;
+static bool               plugin_ready        = false;
+static dlsym_cache_rec_t *dlsym_cache_head    = NULL;
+static pthread_mutex_t    dlsym_cache_mutex   = PTHREAD_MUTEX_INITIALIZER;
 
 static uint32_t      n_discovered  = 0;
 static uint32_t      n_rejected    = 0;

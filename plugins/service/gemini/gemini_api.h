@@ -3,7 +3,7 @@
 
 // Public mechanism API for the gemini service plugin. Consumers
 // include this header and resolve the symbols at runtime via
-// plugin_dlsym("gemini", …) — the plugin is loaded RTLD_LOCAL.
+// plugin_dlsym_cached("gemini", …, (void **)&cached) — the plugin is loaded RTLD_LOCAL.
 //
 // The shim shape mirrors plugins/service/kraken/kraken_api.h:
 // per-symbol atomic cache guard, union to launder void*↔function-
@@ -307,7 +307,7 @@ gemini_apikey_configured(void)
   {
     union { void *obj; fn_t fn; } u;
 
-    u.obj = plugin_dlsym("gemini", "gemini_apikey_configured");
+    u.obj = plugin_dlsym_cached("gemini", "gemini_apikey_configured", (void **)&cached);
     if(u.obj == NULL)
     {
       clam(CLAM_FATAL, "gemini",
@@ -331,7 +331,7 @@ gemini_symbols_refresh_async(gemini_done_symbols_cb_t cb, void *user)
   {
     union { void *obj; fn_t fn; } u;
 
-    u.obj = plugin_dlsym("gemini", "gemini_symbols_refresh_async");
+    u.obj = plugin_dlsym_cached("gemini", "gemini_symbols_refresh_async", (void **)&cached);
     if(u.obj == NULL)
     {
       clam(CLAM_FATAL, "gemini",
@@ -359,7 +359,7 @@ gemini_fetch_candles_async(const char *pair, exchange_granularity_t gran,
   {
     union { void *obj; fn_t fn; } u;
 
-    u.obj = plugin_dlsym("gemini", "gemini_fetch_candles_async");
+    u.obj = plugin_dlsym_cached("gemini", "gemini_fetch_candles_async", (void **)&cached);
     if(u.obj == NULL)
     {
       clam(CLAM_FATAL, "gemini",
@@ -383,7 +383,7 @@ gemini_get_balance_async(gemini_done_balances_cb_t cb, void *user)
   {
     union { void *obj; fn_t fn; } u;
 
-    u.obj = plugin_dlsym("gemini", "gemini_get_balance_async");
+    u.obj = plugin_dlsym_cached("gemini", "gemini_get_balance_async", (void **)&cached);
     if(u.obj == NULL)
     {
       clam(CLAM_FATAL, "gemini",
@@ -409,7 +409,7 @@ gemini_add_order_async(const gemini_place_order_req_t *req,
   {
     union { void *obj; fn_t fn; } u;
 
-    u.obj = plugin_dlsym("gemini", "gemini_add_order_async");
+    u.obj = plugin_dlsym_cached("gemini", "gemini_add_order_async", (void **)&cached);
     if(u.obj == NULL)
     {
       clam(CLAM_FATAL, "gemini",
@@ -434,7 +434,7 @@ gemini_cancel_order_async(const char *order_id,
   {
     union { void *obj; fn_t fn; } u;
 
-    u.obj = plugin_dlsym("gemini", "gemini_cancel_order_async");
+    u.obj = plugin_dlsym_cached("gemini", "gemini_cancel_order_async", (void **)&cached);
     if(u.obj == NULL)
     {
       clam(CLAM_FATAL, "gemini",
@@ -459,7 +459,7 @@ gemini_query_order_async(const char *order_id,
   {
     union { void *obj; fn_t fn; } u;
 
-    u.obj = plugin_dlsym("gemini", "gemini_query_order_async");
+    u.obj = plugin_dlsym_cached("gemini", "gemini_query_order_async", (void **)&cached);
     if(u.obj == NULL)
     {
       clam(CLAM_FATAL, "gemini",
@@ -483,7 +483,7 @@ gemini_active_orders_async(gemini_done_orders_cb_t cb, void *user)
   {
     union { void *obj; fn_t fn; } u;
 
-    u.obj = plugin_dlsym("gemini", "gemini_active_orders_async");
+    u.obj = plugin_dlsym_cached("gemini", "gemini_active_orders_async", (void **)&cached);
     if(u.obj == NULL)
     {
       clam(CLAM_FATAL, "gemini",
@@ -509,7 +509,7 @@ gemini_mytrades_async(const char *product_id, int64_t since_ms,
   {
     union { void *obj; fn_t fn; } u;
 
-    u.obj = plugin_dlsym("gemini", "gemini_mytrades_async");
+    u.obj = plugin_dlsym_cached("gemini", "gemini_mytrades_async", (void **)&cached);
     if(u.obj == NULL)
     {
       clam(CLAM_FATAL, "gemini",

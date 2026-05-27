@@ -278,7 +278,8 @@ static inline RET
   if(fn == NULL)
   {
     union { void *obj; fn_t fn; } u;
-    u.obj = plugin_dlsym("inference", "<public_symbol>");
+    u.obj = plugin_dlsym_cached("inference", "<public_symbol>",
+        (void **)&cached);
     if(u.obj == NULL)
     {
       clam(CLAM_FATAL, "inference",
@@ -293,8 +294,14 @@ static inline RET
 ```
 
 Notes:
-- `plugin_dlsym` (see `core/plugin.c:plugin_dlsym`) does the actual
-  cross-plugin symbol resolution.
+- `plugin_dlsym_cached` (see `core/plugin.c`) resolves the symbol
+  and registers the consumer's `cached` slot with the loader for
+  invalidation on plugin unload. When the target plugin is
+  unloaded, the loader sets `*slot = NULL` so the next call
+  re-resolves (either picking up the new symbol after a reload or
+  abort()ing via the FATAL path). Plain `plugin_dlsym` is still
+  available for one-shot lookups that don't cache (see
+  `plugins/feature/whenmoon/strategy.c` for that pattern).
 - The `union` launders the `void*`↔function-pointer conversion
   that strict POSIX forbids via a plain cast.
 - Two threads entering a cold shim race benignly: both resolve,
@@ -304,12 +311,6 @@ Notes:
   bodies). The inference header gates that block behind an
   `INFERENCE_INTERNAL` macro which the plugin's own `*_priv.h`
   files define before including `inference.h`.
-
-No new framework mechanism was added to support this pattern — it is
-the same `plugin_dlsym` + `.requires`/`.provides` + topologically
-ordered init that was already used for the `core_*` synthetic
-providers. The inference plugin is just the first plugin-to-plugin
-consumer of it at significant scale.
 
 ## KV Configuration
 
