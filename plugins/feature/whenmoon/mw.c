@@ -74,12 +74,13 @@
 #define MW_HOT_HYST_NUM                  1
 #define MW_HOT_HYST_DEN                  2
 
-// Per-tick stack-bounded emission cap. 256 transitions per exchange
-// per tick is comically high — overflow under defaults only on a
-// pump that converts the entire roster in one breath. Beyond the cap
-// we drop further emissions, log one WARN, and let next tick re-emit
-// (pair state is still updated under the lock).
-#define MW_EMIT_BUF_CAP                256
+// Per-tick heap-allocated emission cap. Sized to MW_PAIRS_CAP so the
+// scheduled UPD-throttle re-emit (every MW_UPD_THROTTLE_SEC) can fan
+// every pair out in a single tick without dropping; price/vol/listing
+// detectors can add a few more entries per pair but rarely all at
+// once. Beyond the cap we drop further emissions, log one WARN, and
+// let next tick re-emit (pair state is still updated under the lock).
+#define MW_EMIT_BUF_CAP             2048
 
 // Per-signal trigger bitset. Stored on mw_pair_t.last_trigger so the
 // UPD throttle can detect "trigger set changed even though still HOT".
