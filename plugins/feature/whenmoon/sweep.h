@@ -26,6 +26,7 @@
 #include <stdbool.h>
 #include <stddef.h>
 #include <stdint.h>
+#include <stdio.h>
 
 struct cmd_ctx;
 struct whenmoon_state;
@@ -252,8 +253,33 @@ bool wm_bt_sweep_run_oos_validation(struct whenmoon_state *st,
 // Render                                                                  //
 // ----------------------------------------------------------------------- //
 //
-// Sort + render the top-K rows under the active score. The render path
-// emits one header row + one per-result row to the cmd ctx.
+// The renderer comes in three pieces (WM-BT-7):
+//
+//   * wm_bt_topk_compute — score-descending sort, returns top-K indices
+//     into `results[]`. Caller owns `out_indices` (cap >= top_n).
+//   * wm_bt_topk_to_ctx — header + per-row colorized cmd_reply.
+//   * wm_bt_topk_to_file — same content, no ANSI, FILE * stream.
+//
+// `wm_bt_sweep_render_topk` is the legacy single-call wrapper retained
+// for `wm_bt_cmd_run`'s immediate-feedback cmd_reply path; it composes
+// compute + to_ctx internally.
+
+uint32_t wm_bt_topk_compute(const wm_bt_sweep_result_t *results,
+    uint32_t n_results, uint32_t top_n, uint32_t *out_indices);
+
+void wm_bt_topk_to_ctx(const struct cmd_ctx *ctx,
+    const wm_bt_sweep_plan_t *plan,
+    const wm_bt_sweep_mode_t *mode,
+    const wm_bt_sweep_result_t *results,
+    const uint32_t *indices, uint32_t top_k,
+    uint32_t n_total, uint32_t n_ok);
+
+bool wm_bt_topk_to_file(FILE *fp,
+    const wm_bt_sweep_plan_t *plan,
+    const wm_bt_sweep_mode_t *mode,
+    const wm_bt_sweep_result_t *results,
+    const uint32_t *indices, uint32_t top_k,
+    uint32_t n_total, uint32_t n_ok);
 
 void wm_bt_sweep_render_topk(const struct cmd_ctx *ctx,
     const wm_bt_sweep_plan_t *plan,

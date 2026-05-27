@@ -22,9 +22,11 @@
 #include "sweep.h"
 #include "whenmoon_strategy.h"
 
+#include "alloc.h"
 #include "common.h"
 #include "kv.h"
 
+#include <dirent.h>
 #include <errno.h>
 #include <fcntl.h>
 #include <inttypes.h>
@@ -286,7 +288,7 @@ wm_bt_sweep_dir_create(const char *report_path, const char *sweep_id,
 
   n = snprintf(charts, sizeof(charts), "%s/charts", out_path);
 
-  if(n < 0 || (size_t)n >= (int)sizeof(charts))
+  if(n < 0 || (size_t)n >= sizeof(charts))
   {
     if(err != NULL)
       snprintf(err, err_cap, "charts subdir path overflow");
@@ -327,7 +329,7 @@ wm_bt_iter_open(wm_bt_iterations_writer_t *w, const char *sweep_dir,
 
   n = snprintf(path, sizeof(path), "%s/iterations.jsonl", sweep_dir);
 
-  if(n < 0 || (size_t)n >= (int)sizeof(path))
+  if(n < 0 || (size_t)n >= sizeof(path))
   {
     if(err != NULL)
       snprintf(err, err_cap, "iterations path overflow");
@@ -756,7 +758,7 @@ wm_bt_manifest_write(const char *sweep_dir,
 
   n = snprintf(path, sizeof(path), "%s/manifest.json", sweep_dir);
 
-  if(n < 0 || (size_t)n >= (int)sizeof(path))
+  if(n < 0 || (size_t)n >= sizeof(path))
   {
     if(err != NULL)
       snprintf(err, err_cap, "manifest path overflow");
@@ -857,37 +859,792 @@ wm_bt_manifest_write(const char *sweep_dir,
 }
 
 // ----------------------------------------------------------------------- //
-// top-N.txt placeholder                                                   //
+// top-N.txt (WM-BT-7)                                                     //
 // ----------------------------------------------------------------------- //
+//
+// ANSI-stripped sibling of the cmd_reply top-N output. Renders the
+// same sorted slice into a tmp file, fsync's, then renames into place
+// so an interrupted write never leaves a partial file.
 
 bool
-wm_bt_top_n_placeholder_write(const char *sweep_dir,
-    const wm_bt_sweep_plan_t *plan)
+wm_bt_render_topn_txt(const char *sweep_dir,
+    const wm_bt_sweep_plan_t *plan, const wm_bt_sweep_mode_t *mode,
+    const wm_bt_sweep_result_t *results, uint32_t n_results,
+    uint32_t n_ok, char *err, size_t err_cap)
 {
-  char  path[1024];
-  FILE *fp;
-  int   n;
+  char       path[1024];
+  char       tmp[1280];
+  uint32_t  *indices  = NULL;
+  uint32_t   top_k;
+  FILE      *fp       = NULL;
+  bool       ok       = SUCCESS;
+  int        fd;
+  int        n;
 
-  if(sweep_dir == NULL || plan == NULL)
+  if(sweep_dir == NULL || plan == NULL || results == NULL ||
+     n_results == 0)
+  {
+    if(err != NULL)
+      snprintf(err, err_cap, "topn_txt: bad args");
     return(FAIL);
+  }
 
   n = snprintf(path, sizeof(path), "%s/top-N.txt", sweep_dir);
 
-  if(n < 0 || (size_t)n >= (int)sizeof(path))
+  if(n < 0 || (size_t)n >= sizeof(path))
+  {
+    if(err != NULL)
+      snprintf(err, err_cap, "top-N.txt path overflow");
     return(FAIL);
+  }
 
-  fp = fopen(path, "w");
+  n = snprintf(tmp, sizeof(tmp), "%s.tmp", path);
+
+  if(n < 0 || (size_t)n >= sizeof(tmp))
+  {
+    if(err != NULL)
+      snprintf(err, err_cap, "top-N.txt tmp path overflow");
+    return(FAIL);
+  }
+
+  indices = mem_alloc(WM_BT_REPORT_CTX, "topn_indices",
+      sizeof(*indices) * (size_t)n_results);
+
+  if(indices == NULL)
+  {
+    if(err != NULL)
+      snprintf(err, err_cap, "topn_indices alloc failed");
+    return(FAIL);
+  }
+
+  top_k = wm_bt_topk_compute(results, n_results, plan->top_k, indices);
+
+  fp = fopen(tmp, "w");
+
+  if(fp == NULL)
+  {
+    if(err != NULL)
+      snprintf(err, err_cap,
+          "fopen('%s') failed: %s", tmp, strerror(errno));
+    ok = FAIL;
+    goto out;
+  }
+
+  if(wm_bt_topk_to_file(fp, plan, mode, results, indices, top_k,
+         n_results, n_ok) != SUCCESS)
+  {
+    if(err != NULL)
+      snprintf(err, err_cap, "top-N.txt: render failed");
+    ok = FAIL;
+    goto out;
+  }
+
+  if(fflush(fp) != 0)
+  {
+    if(err != NULL)
+      snprintf(err, err_cap,
+          "fflush('%s') failed: %s", tmp, strerror(errno));
+    ok = FAIL;
+    goto out;
+  }
+
+  fd = fileno(fp);
+
+  if(fd >= 0 && fsync(fd) != 0)
+  {
+    if(err != NULL)
+      snprintf(err, err_cap,
+          "fsync('%s') failed: %s", tmp, strerror(errno));
+    ok = FAIL;
+    goto out;
+  }
+
+  fclose(fp);
+  fp = NULL;
+
+  if(rename(tmp, path) != 0)
+  {
+    if(err != NULL)
+      snprintf(err, err_cap,
+          "rename('%s' → '%s') failed: %s",
+          tmp, path, strerror(errno));
+    ok = FAIL;
+    goto out;
+  }
+
+out:
+  if(fp != NULL)
+    fclose(fp);
+
+  if(ok != SUCCESS)
+    unlink(tmp);
+
+  if(indices != NULL)
+    mem_free(indices);
+
+  return(ok);
+}
+
+// ----------------------------------------------------------------------- //
+// report.md (WM-BT-7)                                                     //
+// ----------------------------------------------------------------------- //
+//
+// Self-contained markdown summary: header bullets, sweep-axes table,
+// top-N table (mode-aware), per-axis marginal-best tables, failures
+// list. Atomic via tmp + rename.
+
+// Render a comma-separated value list for one axis into `out`. Handles
+// integer + double types per axis->type. Truncates with " (…)" if the
+// resulting string would overflow the buffer.
+static void
+wm_bt_md_render_axis_values(const wm_bt_sweep_axis_t *axis,
+    char *out, size_t cap)
+{
+  size_t   off = 0;
+  uint32_t i;
+  int      w;
+
+  if(out == NULL || cap == 0)
+    return;
+
+  out[0] = '\0';
+
+  for(i = 0; i < axis->n_values; i++)
+  {
+    if(off + 16 >= cap)
+    {
+      // Truncate marker fits.
+      snprintf(out + off, cap - off, " …");
+      return;
+    }
+
+    if(axis->type == WM_PARAM_DOUBLE)
+      w = snprintf(out + off, cap - off,
+          "%s%.6g", i == 0 ? "" : ", ", axis->values[i]);
+    else
+      w = snprintf(out + off, cap - off,
+          "%s%" PRId64,
+          i == 0 ? "" : ", ", (int64_t)llround(axis->values[i]));
+
+    if(w < 0)
+      return;
+
+    off += (size_t)w;
+  }
+}
+
+// Render one cell value for a top-N row. Integer axes drop fractional
+// noise; doubles use compact %.6g.
+static void
+wm_bt_md_render_axis_cell(const wm_bt_sweep_axis_t *axis,
+    double v, char *out, size_t cap)
+{
+  if(out == NULL || cap == 0)
+    return;
+
+  if(axis->type == WM_PARAM_DOUBLE)
+    snprintf(out, cap, "%.6g", v);
+  else
+    snprintf(out, cap, "%" PRId64, (int64_t)llround(v));
+}
+
+// Format a finite double for a markdown cell. NaN/Inf → "-" so the
+// table stays narrow + readable.
+static void
+wm_bt_md_fmt_double(double v, const char *fmt, char *out, size_t cap)
+{
+  if(out == NULL || cap == 0)
+    return;
+
+  if(!isfinite(v))
+  {
+    snprintf(out, cap, "-");
+    return;
+  }
+
+  snprintf(out, cap, fmt, v);
+}
+
+// Write everything accumulated in `fp` atomically: fflush + fsync +
+// fclose + rename. Mirrors wm_bt_write_atomic but for FILE * already
+// open on the tmp path.
+static bool
+wm_bt_finalize_file(FILE *fp, const char *tmp, const char *final_path,
+    char *err, size_t err_cap)
+{
+  int fd;
 
   if(fp == NULL)
     return(FAIL);
 
-  fprintf(fp,
-      "top-N placeholder. WM-BT-7 replaces this with the colored renderer.\n"
-      "score=%s top_n=%u total_iters=%u\n",
-      wm_bt_sweep_score_name(plan->score),
-      plan->top_k, plan->total_iters);
+  if(fflush(fp) != 0)
+  {
+    if(err != NULL)
+      snprintf(err, err_cap,
+          "fflush('%s') failed: %s", tmp, strerror(errno));
+    fclose(fp);
+    unlink(tmp);
+    return(FAIL);
+  }
+
+  fd = fileno(fp);
+
+  if(fd >= 0 && fsync(fd) != 0)
+  {
+    if(err != NULL)
+      snprintf(err, err_cap,
+          "fsync('%s') failed: %s", tmp, strerror(errno));
+    fclose(fp);
+    unlink(tmp);
+    return(FAIL);
+  }
 
   fclose(fp);
+
+  if(rename(tmp, final_path) != 0)
+  {
+    if(err != NULL)
+      snprintf(err, err_cap,
+          "rename('%s' → '%s') failed: %s",
+          tmp, final_path, strerror(errno));
+    unlink(tmp);
+    return(FAIL);
+  }
+
+  return(SUCCESS);
+}
+
+bool
+wm_bt_render_report_md(const char *sweep_dir,
+    const char *sweep_id, const char *wm_path,
+    const wm_backtest_snapshot_t *snap, const char *strategy,
+    const wm_bt_sweep_plan_t *plan, const wm_bt_sweep_mode_t *mode,
+    const wm_bt_sweep_result_t *results, uint32_t n_results,
+    uint32_t n_ok, uint32_t n_fail, uint64_t wallclock_ms,
+    char *err, size_t err_cap)
+{
+  char              path[1024];
+  char              tmp[1280];
+  char              cell[64];
+  char              values_buf[256];
+  char              params_buf[160];
+  uint32_t         *indices    = NULL;
+  uint32_t          top_k      = 0;
+  FILE             *fp         = NULL;
+  wm_bt_run_mode_t  mode_val;
+  bool              is_oos;
+  int               n;
+  uint32_t          i;
+  uint32_t          a;
+  uint32_t          v;
+
+  if(sweep_dir == NULL || sweep_id == NULL || snap == NULL ||
+     strategy == NULL || plan == NULL || results == NULL ||
+     n_results == 0)
+  {
+    if(err != NULL)
+      snprintf(err, err_cap, "report_md: bad args");
+    return(FAIL);
+  }
+
+  mode_val = (mode != NULL) ? mode->mode : WM_BT_MODE_FULL;
+  is_oos   = (mode_val == WM_BT_MODE_OOS);
+
+  n = snprintf(path, sizeof(path), "%s/report.md", sweep_dir);
+
+  if(n < 0 || (size_t)n >= sizeof(path))
+  {
+    if(err != NULL)
+      snprintf(err, err_cap, "report.md path overflow");
+    return(FAIL);
+  }
+
+  n = snprintf(tmp, sizeof(tmp), "%s.tmp", path);
+
+  if(n < 0 || (size_t)n >= sizeof(tmp))
+  {
+    if(err != NULL)
+      snprintf(err, err_cap, "report.md tmp path overflow");
+    return(FAIL);
+  }
+
+  indices = mem_alloc(WM_BT_REPORT_CTX, "report_indices",
+      sizeof(*indices) * (size_t)n_results);
+
+  if(indices == NULL)
+  {
+    if(err != NULL)
+      snprintf(err, err_cap, "report_indices alloc failed");
+    return(FAIL);
+  }
+
+  top_k = wm_bt_topk_compute(results, n_results, plan->top_k, indices);
+
+  fp = fopen(tmp, "w");
+
+  if(fp == NULL)
+  {
+    if(err != NULL)
+      snprintf(err, err_cap,
+          "fopen('%s') failed: %s", tmp, strerror(errno));
+    mem_free(indices);
+    return(FAIL);
+  }
+
+  // Header.
+  fprintf(fp, "# Backtest sweep: %s\n\n", sweep_id);
+
+  fprintf(fp, "- **Strategy:** %s\n", strategy);
+  fprintf(fp, "- **Market:** %s\n", snap->source_market_id);
+
+  if(wm_path != NULL && wm_path[0] != '\0')
+    fprintf(fp, "- **Source file:** `%s`\n", wm_path);
+
+  fprintf(fp,
+      "- **Range:** %s → %s (%u 1m bars)\n",
+      snap->range_start, snap->range_end, snap->bars_loaded_1m);
+  fprintf(fp,
+      "- **Mode:** %s\n", wm_bt_report_mode_str(mode_val));
+  fprintf(fp,
+      "- **Threads:** %u\n", plan->workers);
+  fprintf(fp,
+      "- **Total iterations:** %u (ok=%u, fail=%u)\n",
+      plan->total_iters, n_ok, n_fail);
+  fprintf(fp,
+      "- **Wallclock:** %.3f s\n", (double)wallclock_ms / 1000.0);
+  fprintf(fp,
+      "- **Rank by:** %s\n",
+      wm_bt_sweep_score_name(plan->score));
+
+  if(mode_val == WM_BT_MODE_WALK_FORWARD && mode != NULL)
+    fprintf(fp,
+        "- **Walk-forward windows:** %u\n", mode->walk.n);
+
+  if(is_oos && mode != NULL)
+    fprintf(fp,
+        "- **OOS windows:** head=[%" PRId64 "..%" PRId64
+        "] tail=[%" PRId64 "..%" PRId64 "]\n",
+        mode->oos_head.start_ts_ms, mode->oos_head.end_ts_ms,
+        mode->oos_tail.start_ts_ms, mode->oos_tail.end_ts_ms);
+
+  fputc('\n', fp);
+
+  // Sweep axes.
+  fprintf(fp, "## Sweep axes\n\n");
+
+  if(plan->n_axes == 0)
+    fprintf(fp, "(no sweep axes — single iteration)\n\n");
+  else
+  {
+    fprintf(fp, "| Param | n | Values |\n");
+    fprintf(fp, "|---|---|---|\n");
+
+    for(a = 0; a < plan->n_axes; a++)
+    {
+      const wm_bt_sweep_axis_t *axis = &plan->axes[a];
+
+      wm_bt_md_render_axis_values(axis, values_buf, sizeof(values_buf));
+      fprintf(fp, "| %s | %u | %s |\n",
+          axis->name, axis->n_values, values_buf);
+    }
+
+    fputc('\n', fp);
+  }
+
+  // Top-N table.
+  fprintf(fp, "## Top %u by %s\n\n",
+      top_k, wm_bt_sweep_score_name(plan->score));
+
+  // Header row: Rank, Iter, [Score | Head/OOS Score], <axes>,
+  // trades, fills, realized, sharpe, sortino, pf, drawdown, equity, ms.
+  fputs("| Rank | Iter |", fp);
+
+  if(is_oos)
+    fputs(" Head | OOS |", fp);
+  else
+    fputs(" Score |", fp);
+
+  for(a = 0; a < plan->n_axes; a++)
+    fprintf(fp, " %s |", plan->axes[a].name);
+
+  fputs(" trades | fills | realized | sharpe | sortino | pf |"
+        " drawdown | equity | ms |\n", fp);
+
+  // Separator.
+  fputs("|---|---|", fp);
+
+  if(is_oos)
+    fputs("---|---|", fp);
+  else
+    fputs("---|", fp);
+
+  for(a = 0; a < plan->n_axes; a++)
+    fputs("---|", fp);
+
+  fputs("---|---|---|---|---|---|---|---|---|\n", fp);
+
+  // Rows.
+  for(i = 0; i < top_k; i++)
+  {
+    const wm_bt_sweep_result_t *r = &results[indices[i]];
+    const wm_market_stats_t    *st_paper;
+    uint32_t                    n_round_trips;
+    uint32_t                    n_fills;
+    double                      pf;
+    double                      equity;
+
+    fprintf(fp, "| %u | %" PRId64 " |",
+        i + 1,
+        r->run_id_db > 0 ? r->run_id_db : (int64_t)(indices[i] + 1));
+
+    if(!r->ok)
+    {
+      // FAIL row: collapse the metric columns to "-" so the table
+      // still parses cleanly.
+      if(is_oos)
+        fputs(" - | - |", fp);
+      else
+        fputs(" - |", fp);
+
+      for(a = 0; a < plan->n_axes; a++)
+      {
+        wm_bt_md_render_axis_cell(&plan->axes[a],
+            plan->axes[a].values[r->indices[a]],
+            cell, sizeof(cell));
+        fprintf(fp, " %s |", cell);
+      }
+
+      fputs(" - | - | FAIL | - | - | - | - | - | - |\n", fp);
+      continue;
+    }
+
+    wm_bt_md_fmt_double(r->score, "%+.4f", cell, sizeof(cell));
+    fprintf(fp, " %s |", cell);
+
+    if(is_oos)
+    {
+      if(r->have_oos)
+        wm_bt_md_fmt_double(r->oos_score, "%+.4f", cell, sizeof(cell));
+      else
+        snprintf(cell, sizeof(cell), "n/a");
+      fprintf(fp, " %s |", cell);
+    }
+
+    for(a = 0; a < plan->n_axes; a++)
+    {
+      wm_bt_md_render_axis_cell(&plan->axes[a],
+          plan->axes[a].values[r->indices[a]],
+          cell, sizeof(cell));
+      fprintf(fp, " %s |", cell);
+    }
+
+    st_paper      = &r->trade.stats[WM_MARKET_MODE_PAPER];
+    n_round_trips = st_paper->n_wins + st_paper->n_losses;
+    n_fills       = (uint32_t)st_paper->lifetime_fills_count;
+    pf            = wm_market_stats_profit_factor(st_paper);
+    equity        = wm_bt_compute_equity(&r->trade);
+
+    fprintf(fp, " %u | %u |", n_round_trips, n_fills);
+
+    wm_bt_md_fmt_double(st_paper->realized_pnl_lifetime, "%+.4f",
+        cell, sizeof(cell));
+    fprintf(fp, " %s |", cell);
+
+    wm_bt_md_fmt_double(r->trade.sharpe,  "%.3f", cell, sizeof(cell));
+    fprintf(fp, " %s |", cell);
+
+    wm_bt_md_fmt_double(r->trade.sortino, "%.3f", cell, sizeof(cell));
+    fprintf(fp, " %s |", cell);
+
+    wm_bt_md_fmt_double(pf, "%.3f", cell, sizeof(cell));
+    fprintf(fp, " %s |", cell);
+
+    wm_bt_md_fmt_double(st_paper->max_drawdown, "%.4f",
+        cell, sizeof(cell));
+    fprintf(fp, " %s |", cell);
+
+    wm_bt_md_fmt_double(equity, "%.4f", cell, sizeof(cell));
+    fprintf(fp, " %s |", cell);
+
+    fprintf(fp, " %" PRIu64 " |\n", r->wallclock_ms);
+  }
+
+  fputc('\n', fp);
+
+  // Per-axis marginal best — for each axis, for each value, scan all
+  // iterations and pick the highest score for that value. Skip
+  // single-iteration plans (no axes ⇒ nothing to marginalise).
+  if(plan->n_axes > 0)
+  {
+    fprintf(fp, "## Per-axis marginal best\n\n");
+
+    for(a = 0; a < plan->n_axes; a++)
+    {
+      const wm_bt_sweep_axis_t *axis = &plan->axes[a];
+
+      fprintf(fp, "### %s\n\n", axis->name);
+      fprintf(fp, "| value | best score | iter |\n");
+      fprintf(fp, "|---|---|---|\n");
+
+      for(v = 0; v < axis->n_values; v++)
+      {
+        double   best_score = -INFINITY;
+        int64_t  best_iter  = -1;
+        uint32_t k;
+
+        for(k = 0; k < n_results; k++)
+        {
+          if(!results[k].ok)
+            continue;
+
+          if(results[k].indices[a] != v)
+            continue;
+
+          if(results[k].score > best_score)
+          {
+            best_score = results[k].score;
+            best_iter  = results[k].run_id_db > 0
+                ? results[k].run_id_db
+                : (int64_t)(k + 1);
+          }
+        }
+
+        wm_bt_md_render_axis_cell(axis, axis->values[v],
+            cell, sizeof(cell));
+        fprintf(fp, "| %s |", cell);
+
+        if(best_iter < 0)
+          fputs(" - | - |\n", fp);
+        else
+        {
+          char score_cell[64];
+
+          wm_bt_md_fmt_double(best_score, "%+.4f",
+              score_cell, sizeof(score_cell));
+          fprintf(fp, " %s | %" PRId64 " |\n",
+              score_cell, best_iter);
+        }
+      }
+
+      fputc('\n', fp);
+    }
+  }
+
+  // Failures.
+  fprintf(fp, "## Failures\n\n");
+
+  if(n_fail == 0)
+    fprintf(fp, "(none)\n");
+  else
+  {
+    fprintf(fp, "| Iter | Params | Reason |\n");
+    fprintf(fp, "|---|---|---|\n");
+
+    for(i = 0; i < n_results; i++)
+    {
+      const wm_bt_sweep_result_t *r = &results[i];
+
+      if(r->ok)
+        continue;
+
+      params_buf[0] = '\0';
+
+      for(a = 0; a < plan->n_axes; a++)
+      {
+        size_t off;
+
+        wm_bt_md_render_axis_cell(&plan->axes[a],
+            plan->axes[a].values[r->indices[a]],
+            cell, sizeof(cell));
+
+        off = strlen(params_buf);
+
+        if(off + 1 >= sizeof(params_buf))
+          break;
+
+        snprintf(params_buf + off, sizeof(params_buf) - off,
+            "%s%s=%s", off == 0 ? "" : " ",
+            plan->axes[a].name, cell);
+      }
+
+      fprintf(fp, "| %" PRId64 " | %s | %.120s |\n",
+          r->run_id_db > 0 ? r->run_id_db : (int64_t)(i + 1),
+          params_buf,
+          r->err[0] != '\0' ? r->err : "(unknown)");
+    }
+  }
+
+  mem_free(indices);
+
+  return(wm_bt_finalize_file(fp, tmp, path, err, err_cap));
+}
+
+// ----------------------------------------------------------------------- //
+// wm_bt_dir_listdir (WM-BT-7)                                             //
+// ----------------------------------------------------------------------- //
+
+static int
+wm_bt_strdesc_cmp(const void *a, const void *b)
+{
+  const char *const *sa = a;
+  const char *const *sb = b;
+
+  return(strcmp(*sb, *sa));
+}
+
+static bool
+wm_bt_is_sweep_id_prefix(const char *name)
+{
+  uint8_t i;
+
+  if(name == NULL)
+    return(FAIL);
+
+  for(i = 0; i < 8; i++)
+    if(name[i] < '0' || name[i] > '9')
+      return(FAIL);
+
+  return(name[8] == '-');
+}
+
+void
+wm_bt_dir_listing_free(wm_bt_dir_listing_t *l)
+{
+  uint32_t i;
+
+  if(l == NULL)
+    return;
+
+  if(l->names != NULL)
+  {
+    for(i = 0; i < l->n; i++)
+      mem_free(l->names[i]);
+
+    mem_free(l->names);
+    l->names = NULL;
+  }
+
+  l->n = 0;
+}
+
+bool
+wm_bt_dir_listdir(const char *path, wm_bt_dir_listing_t *out,
+    char *err, size_t err_cap)
+{
+  DIR           *dir;
+  struct dirent *de;
+  char         **names    = NULL;
+  uint32_t       n        = 0;
+  uint32_t       cap      = 0;
+
+  if(path == NULL || out == NULL)
+  {
+    if(err != NULL)
+      snprintf(err, err_cap, "dir_listdir: bad args");
+    return(FAIL);
+  }
+
+  out->names = NULL;
+  out->n     = 0;
+
+  dir = opendir(path);
+
+  if(dir == NULL)
+  {
+    if(err != NULL)
+      snprintf(err, err_cap,
+          "opendir('%s') failed: %s", path, strerror(errno));
+    return(FAIL);
+  }
+
+  while((de = readdir(dir)) != NULL)
+  {
+    char       child[2048];
+    struct stat sb;
+    char       *copy;
+    size_t      len;
+    int         nch;
+
+    if(de->d_name[0] == '.')
+      continue;
+
+    if(!wm_bt_is_sweep_id_prefix(de->d_name))
+      continue;
+
+    nch = snprintf(child, sizeof(child), "%s/%s", path, de->d_name);
+
+    if(nch < 0 || (size_t)nch >= sizeof(child))
+      continue;
+
+    if(stat(child, &sb) != 0 || !S_ISDIR(sb.st_mode))
+      continue;
+
+    if(n == cap)
+    {
+      uint32_t   new_cap = cap == 0 ? 32 : cap * 2;
+      char     **grown;
+
+      grown = mem_alloc(WM_BT_REPORT_CTX, "dir_names",
+          sizeof(*grown) * (size_t)new_cap);
+
+      if(grown == NULL)
+      {
+        closedir(dir);
+
+        if(err != NULL)
+          snprintf(err, err_cap, "dir_names alloc failed");
+
+        if(names != NULL)
+        {
+          uint32_t k;
+          for(k = 0; k < n; k++) mem_free(names[k]);
+          mem_free(names);
+        }
+
+        return(FAIL);
+      }
+
+      if(names != NULL)
+      {
+        memcpy(grown, names, sizeof(*grown) * (size_t)n);
+        mem_free(names);
+      }
+
+      names = grown;
+      cap   = new_cap;
+    }
+
+    len  = strlen(de->d_name);
+    copy = mem_alloc(WM_BT_REPORT_CTX, "dir_name", len + 1);
+
+    if(copy == NULL)
+    {
+      closedir(dir);
+
+      if(err != NULL)
+        snprintf(err, err_cap, "dir_name alloc failed");
+
+      if(names != NULL)
+      {
+        uint32_t k;
+        for(k = 0; k < n; k++) mem_free(names[k]);
+        mem_free(names);
+      }
+
+      return(FAIL);
+    }
+
+    memcpy(copy, de->d_name, len + 1);
+    names[n++] = copy;
+  }
+
+  closedir(dir);
+
+  if(n > 1)
+    qsort(names, n, sizeof(*names), wm_bt_strdesc_cmp);
+
+  out->names = names;
+  out->n     = n;
 
   return(SUCCESS);
 }

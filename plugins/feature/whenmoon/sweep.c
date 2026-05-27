@@ -1323,26 +1323,270 @@ wm_bt_sweep_run(whenmoon_state_t *st,
 // ----------------------------------------------------------------------- //
 // Render top-K                                                            //
 // ----------------------------------------------------------------------- //
+//
+// Three-stage split (WM-BT-7): compute returns sorted top-K indices;
+// to_ctx + to_file render that slice with / without ANSI colors. The
+// legacy single-call wrapper `wm_bt_sweep_render_topk` composes
+// compute + to_ctx for the cmd_reply immediate-feedback path.
 
-// Sort key context. qsort doesn't accept a context, but we only need
-// score-based descending sort which is encoded directly in result->score.
+typedef struct
+{
+  double    score;
+  uint64_t  wallclock_ms;
+  uint32_t  idx;
+} wm_bt_topk_entry_t;
 
 static int
-wm_bt_sweep_compare_desc(const void *a, const void *b)
+wm_bt_topk_compare_desc(const void *a, const void *b)
 {
-  const wm_bt_sweep_result_t *ra = a;
-  const wm_bt_sweep_result_t *rb = b;
+  const wm_bt_topk_entry_t *ea = a;
+  const wm_bt_topk_entry_t *eb = b;
 
   // Failed iterations sink (score = NOSCORE = -DBL_MAX).
-  if(ra->score > rb->score) return(-1);
-  if(ra->score < rb->score) return( 1);
+  if(ea->score > eb->score) return(-1);
+  if(ea->score < eb->score) return( 1);
 
   // Tie-break on wallclock_ms ascending (faster wins) so the rendered
   // order is deterministic across runs.
-  if(ra->wallclock_ms < rb->wallclock_ms) return(-1);
-  if(ra->wallclock_ms > rb->wallclock_ms) return( 1);
+  if(ea->wallclock_ms < eb->wallclock_ms) return(-1);
+  if(ea->wallclock_ms > eb->wallclock_ms) return( 1);
 
   return(0);
+}
+
+uint32_t
+wm_bt_topk_compute(const wm_bt_sweep_result_t *results,
+    uint32_t n_results, uint32_t top_n, uint32_t *out_indices)
+{
+  wm_bt_topk_entry_t *tmp;
+  uint32_t            i;
+  uint32_t            k;
+
+  if(results == NULL || out_indices == NULL ||
+     n_results == 0 || top_n == 0)
+    return(0);
+
+  tmp = mem_alloc("whenmoon.sweep", "topk_entries",
+      sizeof(*tmp) * (size_t)n_results);
+
+  if(tmp == NULL)
+    return(0);
+
+  for(i = 0; i < n_results; i++)
+  {
+    tmp[i].score        = results[i].score;
+    tmp[i].wallclock_ms = results[i].wallclock_ms;
+    tmp[i].idx          = i;
+  }
+
+  qsort(tmp, n_results, sizeof(*tmp), wm_bt_topk_compare_desc);
+
+  k = top_n > n_results ? n_results : top_n;
+
+  for(i = 0; i < k; i++)
+    out_indices[i] = tmp[i].idx;
+
+  mem_free(tmp);
+  return(k);
+}
+
+// Render axis name=value pairs for one row into `buf` (NUL-terminated,
+// truncates on overflow). Shared by every renderer (ctx, file, md).
+static void
+wm_bt_topk_render_params(const wm_bt_sweep_plan_t *plan,
+    const wm_bt_sweep_result_t *r, char *buf, size_t cap)
+{
+  size_t   off = 0;
+  uint32_t a;
+  int      w;
+
+  if(buf == NULL || cap == 0)
+    return;
+
+  buf[0] = '\0';
+
+  for(a = 0; a < plan->n_axes && off + 1 < cap; a++)
+  {
+    const wm_bt_sweep_axis_t *axis = &plan->axes[a];
+    double                    v    = axis->values[r->indices[a]];
+
+    if(axis->type == WM_PARAM_DOUBLE)
+      w = snprintf(buf + off, cap - off,
+          "%s%s=%.6g", a == 0 ? "" : " ", axis->name, v);
+    else
+      w = snprintf(buf + off, cap - off,
+          "%s%s=%" PRId64,
+          a == 0 ? "" : " ", axis->name, (int64_t)llround(v));
+
+    if(w < 0)
+      break;
+
+    off += (size_t)w;
+  }
+}
+
+// Render the header line into `out`. `with_color` toggles the
+// CLR_BOLD/CLR_RESET wrapping so file streams stay ANSI-free.
+static void
+wm_bt_topk_render_header(const wm_bt_sweep_plan_t *plan,
+    uint32_t top_k, uint32_t n_total, uint32_t n_ok,
+    bool is_oos, bool with_color, char *out, size_t cap)
+{
+  if(out == NULL || cap == 0)
+    return;
+
+  if(with_color)
+    snprintf(out, cap,
+        CLR_BOLD "top %u of %u (score=%s, ok=%u%s)" CLR_RESET,
+        top_k, n_total, wm_bt_sweep_score_name(plan->score), n_ok,
+        is_oos ? ", oos validated" : "");
+  else
+    snprintf(out, cap,
+        "top %u of %u (score=%s, ok=%u%s)",
+        top_k, n_total, wm_bt_sweep_score_name(plan->score), n_ok,
+        is_oos ? ", oos validated" : "");
+}
+
+// Render one row into `out`. Format is fixed across ctx/file; the
+// callers differ only in how they emit it.
+static void
+wm_bt_topk_render_row(const wm_bt_sweep_plan_t *plan,
+    const wm_bt_sweep_result_t *r, uint32_t rank, bool is_oos,
+    char *out, size_t cap)
+{
+  char param_buf[160];
+
+  if(out == NULL || cap == 0)
+    return;
+
+  wm_bt_topk_render_params(plan, r, param_buf, sizeof(param_buf));
+
+  if(!r->ok)
+  {
+    snprintf(out, cap, "  #%-3u %s  FAIL: %.120s",
+        rank, param_buf, r->err);
+    return;
+  }
+
+  {
+    const wm_market_stats_t *st_paper =
+        &r->trade.stats[WM_MARKET_MODE_PAPER];
+    uint32_t                  n_fills =
+        (uint32_t)st_paper->lifetime_fills_count;
+    double                    equity  = wm_bt_synth_equity(&r->trade);
+
+    if(is_oos && r->have_oos)
+    {
+      // Head + OOS row format. The OOS score uses the same metric
+      // as the head score so the in-sample / out-of-sample gap is
+      // legible at a glance.
+      snprintf(out, cap,
+          "  #%-3u %s  head_%s=%+.4f oos_%s=%+.4f"
+          " fills=%-3u/%-3u equity=%.2f"
+          " ms=%-5" PRIu64 "%s%" PRId64,
+          rank, param_buf,
+          wm_bt_sweep_score_name(plan->score), r->score,
+          wm_bt_sweep_score_name(plan->score), r->oos_score,
+          n_fills, r->oos_n_trades,
+          equity, r->wallclock_ms,
+          r->run_id_db > 0 ? " run=" : "",
+          r->run_id_db > 0 ? r->run_id_db : (int64_t)0);
+      return;
+    }
+
+    if(is_oos)
+    {
+      // Top-K row whose OOS pass failed to run (e.g. snapshot has
+      // no bars in the tail). Show the head score with an OOS
+      // diagnostic blob.
+      snprintf(out, cap,
+          "  #%-3u %s  head_%s=%+.4f oos=FAIL: %.40s"
+          " fills=%-3u equity=%.2f ms=%-5" PRIu64 "%s%" PRId64,
+          rank, param_buf,
+          wm_bt_sweep_score_name(plan->score), r->score,
+          r->oos_err[0] != '\0' ? r->oos_err : "n/a",
+          n_fills, equity,
+          r->wallclock_ms,
+          r->run_id_db > 0 ? " run=" : "",
+          r->run_id_db > 0 ? r->run_id_db : (int64_t)0);
+      return;
+    }
+
+    snprintf(out, cap,
+        "  #%-3u %s  %s=%+.4f"
+        " realized=%+.4f fills=%-3u equity=%.2f"
+        " ms=%-5" PRIu64 "%s%" PRId64,
+        rank, param_buf,
+        wm_bt_sweep_score_name(plan->score), r->score,
+        st_paper->realized_pnl_lifetime, n_fills,
+        equity, r->wallclock_ms,
+        r->run_id_db > 0 ? " run=" : "",
+        r->run_id_db > 0 ? r->run_id_db : (int64_t)0);
+  }
+}
+
+void
+wm_bt_topk_to_ctx(const cmd_ctx_t *ctx,
+    const wm_bt_sweep_plan_t *plan,
+    const wm_bt_sweep_mode_t *mode,
+    const wm_bt_sweep_result_t *results,
+    const uint32_t *indices, uint32_t top_k,
+    uint32_t n_total, uint32_t n_ok)
+{
+  char     line[320];
+  uint32_t i;
+  bool     is_oos;
+
+  if(ctx == NULL || plan == NULL || results == NULL || indices == NULL)
+    return;
+
+  is_oos = (mode != NULL && mode->mode == WM_BT_MODE_OOS);
+
+  wm_bt_topk_render_header(plan, top_k, n_total, n_ok, is_oos,
+      /*with_color=*/true, line, sizeof(line));
+  cmd_reply(ctx, line);
+
+  for(i = 0; i < top_k; i++)
+  {
+    wm_bt_topk_render_row(plan, &results[indices[i]],
+        i + 1, is_oos, line, sizeof(line));
+    cmd_reply(ctx, line);
+  }
+}
+
+bool
+wm_bt_topk_to_file(FILE *fp,
+    const wm_bt_sweep_plan_t *plan,
+    const wm_bt_sweep_mode_t *mode,
+    const wm_bt_sweep_result_t *results,
+    const uint32_t *indices, uint32_t top_k,
+    uint32_t n_total, uint32_t n_ok)
+{
+  char     line[320];
+  uint32_t i;
+  bool     is_oos;
+
+  if(fp == NULL || plan == NULL || results == NULL || indices == NULL)
+    return(FAIL);
+
+  is_oos = (mode != NULL && mode->mode == WM_BT_MODE_OOS);
+
+  wm_bt_topk_render_header(plan, top_k, n_total, n_ok, is_oos,
+      /*with_color=*/false, line, sizeof(line));
+
+  if(fprintf(fp, "%s\n", line) < 0)
+    return(FAIL);
+
+  for(i = 0; i < top_k; i++)
+  {
+    wm_bt_topk_render_row(plan, &results[indices[i]],
+        i + 1, is_oos, line, sizeof(line));
+
+    if(fprintf(fp, "%s\n", line) < 0)
+      return(FAIL);
+  }
+
+  return(SUCCESS);
 }
 
 void
@@ -1351,141 +1595,31 @@ wm_bt_sweep_render_topk(const cmd_ctx_t *ctx,
     const wm_bt_sweep_mode_t *mode,
     const wm_bt_sweep_result_t *results, uint32_t n)
 {
-  wm_bt_sweep_result_t *sorted;
-  char                  line[320];
-  char                  param_buf[160];
-  uint32_t              top_k;
-  uint32_t              i;
-  uint32_t              n_ok = 0;
-  bool                  is_oos;
+  uint32_t *indices;
+  uint32_t  top_k;
+  uint32_t  n_ok = 0;
+  uint32_t  i;
 
   if(ctx == NULL || plan == NULL || results == NULL || n == 0)
     return;
-
-  is_oos = (mode != NULL && mode->mode == WM_BT_MODE_OOS);
 
   for(i = 0; i < n; i++)
     if(results[i].ok)
       n_ok++;
 
-  sorted = mem_alloc("whenmoon.sweep", "sorted",
-      sizeof(*sorted) * (size_t)n);
+  indices = mem_alloc("whenmoon.sweep", "topk_indices",
+      sizeof(*indices) * (size_t)n);
 
-  if(sorted == NULL)
+  if(indices == NULL)
   {
     cmd_reply(ctx, "render: out of memory");
     return;
   }
 
-  memcpy(sorted, results, sizeof(*sorted) * (size_t)n);
-  qsort(sorted, n, sizeof(*sorted), wm_bt_sweep_compare_desc);
+  top_k = wm_bt_topk_compute(results, n, plan->top_k, indices);
+  wm_bt_topk_to_ctx(ctx, plan, mode, results, indices, top_k, n, n_ok);
 
-  top_k = plan->top_k > n ? n : plan->top_k;
-
-  snprintf(line, sizeof(line),
-      CLR_BOLD "top %u of %u (score=%s, ok=%u%s)" CLR_RESET,
-      top_k, n, wm_bt_sweep_score_name(plan->score), n_ok,
-      is_oos ? ", oos validated" : "");
-  cmd_reply(ctx, line);
-
-  for(i = 0; i < top_k; i++)
-  {
-    const wm_bt_sweep_result_t *r = &sorted[i];
-    size_t                      off = 0;
-    uint32_t                    a;
-    int                         w;
-
-    param_buf[0] = '\0';
-
-    for(a = 0; a < plan->n_axes && off + 1 < sizeof(param_buf); a++)
-    {
-      const wm_bt_sweep_axis_t *axis = &plan->axes[a];
-      double                    v    = axis->values[r->indices[a]];
-
-      if(axis->type == WM_PARAM_DOUBLE)
-        w = snprintf(param_buf + off, sizeof(param_buf) - off,
-            "%s%s=%.6g", a == 0 ? "" : " ", axis->name, v);
-      else
-        w = snprintf(param_buf + off, sizeof(param_buf) - off,
-            "%s%s=%" PRId64,
-            a == 0 ? "" : " ", axis->name, (int64_t)llround(v));
-
-      if(w < 0)
-        break;
-
-      off += (size_t)w;
-    }
-
-    if(!r->ok)
-    {
-      snprintf(line, sizeof(line),
-          "  #%-3u %s  FAIL: %.120s",
-          i + 1, param_buf, r->err);
-      cmd_reply(ctx, line);
-      continue;
-    }
-
-    {
-      const wm_market_stats_t *st_paper =
-          &r->trade.stats[WM_MARKET_MODE_PAPER];
-      uint32_t                  n_fills   =
-          (uint32_t)st_paper->lifetime_fills_count;
-      double                    equity    = wm_bt_synth_equity(&r->trade);
-
-      if(is_oos && r->have_oos)
-      {
-        // Head + OOS row format. The OOS score uses the same metric
-        // as the head score so the in-sample / out-of-sample gap is
-        // legible at a glance.
-        snprintf(line, sizeof(line),
-            "  #%-3u %s  head_%s=%+.4f oos_%s=%+.4f"
-            " fills=%-3u/%-3u equity=%.2f"
-            " ms=%-5" PRIu64 "%s%" PRId64,
-            i + 1, param_buf,
-            wm_bt_sweep_score_name(plan->score), r->score,
-            wm_bt_sweep_score_name(plan->score), r->oos_score,
-            n_fills, r->oos_n_trades,
-            equity, r->wallclock_ms,
-            r->run_id_db > 0 ? " run=" : "",
-            r->run_id_db > 0 ? r->run_id_db : (int64_t)0);
-      }
-
-      else if(is_oos)
-      {
-        // Top-K row whose OOS pass failed to run (e.g. snapshot has
-        // no bars in the tail). Show the head score with an OOS
-        // diagnostic blob.
-        snprintf(line, sizeof(line),
-            "  #%-3u %s  head_%s=%+.4f oos=FAIL: %.40s"
-            " fills=%-3u equity=%.2f ms=%-5" PRIu64 "%s%" PRId64,
-            i + 1, param_buf,
-            wm_bt_sweep_score_name(plan->score), r->score,
-            r->oos_err[0] != '\0' ? r->oos_err : "n/a",
-            n_fills, equity,
-            r->wallclock_ms,
-            r->run_id_db > 0 ? " run=" : "",
-            r->run_id_db > 0 ? r->run_id_db : (int64_t)0);
-      }
-
-      else
-      {
-        snprintf(line, sizeof(line),
-            "  #%-3u %s  %s=%+.4f"
-            " realized=%+.4f fills=%-3u equity=%.2f"
-            " ms=%-5" PRIu64 "%s%" PRId64,
-            i + 1, param_buf,
-            wm_bt_sweep_score_name(plan->score), r->score,
-            st_paper->realized_pnl_lifetime, n_fills,
-            equity, r->wallclock_ms,
-            r->run_id_db > 0 ? " run=" : "",
-            r->run_id_db > 0 ? r->run_id_db : (int64_t)0);
-      }
-    }
-
-    cmd_reply(ctx, line);
-  }
-
-  mem_free(sorted);
+  mem_free(indices);
 }
 
 // ----------------------------------------------------------------------- //

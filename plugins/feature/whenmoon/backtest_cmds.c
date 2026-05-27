@@ -51,6 +51,8 @@
 #include <string.h>
 #include <time.h>
 
+#include <json-c/json.h>
+
 // ----------------------------------------------------------------------- //
 // /whenmoon backtest run                                                  //
 // ----------------------------------------------------------------------- //
@@ -682,7 +684,31 @@ wm_bt_cmd_run(const cmd_ctx_t *ctx)
     cmd_reply(ctx, reply);
   }
 
-  (void)wm_bt_top_n_placeholder_write(sweep_dir, &sweep_plan);
+  err[0] = '\0';
+
+  if(wm_bt_render_topn_txt(sweep_dir, &sweep_plan, &sweep_mode,
+         sweep_results, sweep_plan.total_iters, n_ok,
+         err, sizeof(err)) != SUCCESS)
+  {
+    snprintf(reply, sizeof(reply),
+        "warn: top-N.txt write failed: %s",
+        err[0] != '\0' ? err : "(unknown)");
+    cmd_reply(ctx, reply);
+  }
+
+  err[0] = '\0';
+
+  if(wm_bt_render_report_md(sweep_dir, sweep_id, path_tok, snap,
+         name_tok, &sweep_plan, &sweep_mode,
+         sweep_results, sweep_plan.total_iters,
+         n_ok, n_fail, wallclock_ms,
+         err, sizeof(err)) != SUCCESS)
+  {
+    snprintf(reply, sizeof(reply),
+        "warn: report.md write failed: %s",
+        err[0] != '\0' ? err : "(unknown)");
+    cmd_reply(ctx, reply);
+  }
 
   snprintf(reply, sizeof(reply),
       "complete: %u/%u ok, %u failed in %" PRIu64 " ms"
@@ -1052,13 +1078,198 @@ wm_bt_cmd_inspect(const cmd_ctx_t *ctx)
 }
 
 // ----------------------------------------------------------------------- //
+// /whenmoon backtest list  (WM-BT-7)                                      //
+// ----------------------------------------------------------------------- //
+//
+// Walk the on-disk sweep tree (newest-first) and emit one line per
+// sweep. Each line carries the sweep_id, strategy, total_iters,
+// rank_by, and ok/fail counts pulled from manifest.json. Sweeps with
+// no manifest (interrupted writes or pre-WM-BT-6) are still listed
+// with "(no manifest)" so the operator can see them.
+
+static void
+wm_bt_cmd_list(const cmd_ctx_t *ctx)
+{
+  char                  report_root[1024] = {0};
+  char                  err[320]          = {0};
+  char                  reply[640];
+  char                  manifest_path[2048];
+  wm_bt_dir_listing_t   listing;
+  uint32_t              i;
+
+  if(wm_bt_report_path_resolve(report_root, sizeof(report_root),
+         err, sizeof(err)) != SUCCESS)
+  {
+    snprintf(reply, sizeof(reply),
+        "report path: %s", err[0] != '\0' ? err : "(unknown)");
+    cmd_reply(ctx, reply);
+    return;
+  }
+
+  memset(&listing, 0, sizeof(listing));
+
+  if(wm_bt_dir_listdir(report_root, &listing,
+         err, sizeof(err)) != SUCCESS)
+  {
+    snprintf(reply, sizeof(reply),
+        "list: %s", err[0] != '\0' ? err : "(unknown)");
+    cmd_reply(ctx, reply);
+    return;
+  }
+
+  snprintf(reply, sizeof(reply),
+      "%u sweep%s under %s",
+      listing.n, listing.n == 1 ? "" : "s", report_root);
+  cmd_reply(ctx, reply);
+
+  if(listing.n == 0)
+  {
+    wm_bt_dir_listing_free(&listing);
+    return;
+  }
+
+  for(i = 0; i < listing.n; i++)
+  {
+    struct json_object *manifest = NULL;
+    struct json_object *jv;
+    const char         *strategy   = "?";
+    const char         *rank_by    = "?";
+    int64_t             total_iters = -1;
+    int64_t             ok_count    = -1;
+    int64_t             fail_count  = -1;
+    int                 n_path;
+
+    n_path = snprintf(manifest_path, sizeof(manifest_path),
+        "%s/%s/manifest.json", report_root, listing.names[i]);
+
+    if(n_path > 0 && (size_t)n_path < sizeof(manifest_path))
+      manifest = json_object_from_file(manifest_path);
+
+    if(manifest != NULL)
+    {
+      if(json_object_object_get_ex(manifest, "strategy", &jv))
+        strategy = json_object_get_string(jv);
+
+      if(json_object_object_get_ex(manifest, "rank_by", &jv))
+        rank_by = json_object_get_string(jv);
+
+      if(json_object_object_get_ex(manifest, "total_iters", &jv))
+        total_iters = json_object_get_int64(jv);
+
+      if(json_object_object_get_ex(manifest, "ok_count", &jv))
+        ok_count = json_object_get_int64(jv);
+
+      if(json_object_object_get_ex(manifest, "fail_count", &jv))
+        fail_count = json_object_get_int64(jv);
+    }
+
+    if(manifest == NULL || total_iters < 0)
+      snprintf(reply, sizeof(reply),
+          "  %s  (no manifest)", listing.names[i]);
+    else
+      snprintf(reply, sizeof(reply),
+          "  %s  %s rank=%s n=%" PRId64
+          " ok=%" PRId64 " fail=%" PRId64,
+          listing.names[i], strategy, rank_by,
+          total_iters, ok_count, fail_count);
+
+    cmd_reply(ctx, reply);
+
+    if(manifest != NULL)
+      json_object_put(manifest);
+  }
+
+  wm_bt_dir_listing_free(&listing);
+}
+
+// ----------------------------------------------------------------------- //
+// /whenmoon backtest show  (WM-BT-7)                                      //
+// ----------------------------------------------------------------------- //
+//
+// Cat `<report_root>/<sweep_id>/report.md` line-by-line into cmd_reply.
+// The renderer materialises everything to disk at sweep end so this
+// verb stays minimal: no JSON parsing, no recomputation. Sweeps from
+// before WM-BT-7 land here without a report.md — surface a terse
+// note instead of synthesising one.
+
+static void
+wm_bt_cmd_show(const cmd_ctx_t *ctx)
+{
+  const char *p;
+  char        sweep_tok[160]     = {0};
+  char        report_root[1024]  = {0};
+  char        err[320]           = {0};
+  char        path[2048];
+  char        reply[640];
+  char        line[640];
+  FILE       *fp;
+
+  p = ctx->args != NULL ? ctx->args : "";
+
+  if(!wm_dl_next_token(&p, sweep_tok, sizeof(sweep_tok)))
+  {
+    cmd_reply(ctx, "usage: /whenmoon backtest show <sweep_id>");
+    return;
+  }
+
+  if(wm_bt_report_path_resolve(report_root, sizeof(report_root),
+         err, sizeof(err)) != SUCCESS)
+  {
+    snprintf(reply, sizeof(reply),
+        "report path: %s", err[0] != '\0' ? err : "(unknown)");
+    cmd_reply(ctx, reply);
+    return;
+  }
+
+  // Defensive: reject any token containing '/' or starting with '.'
+  // so the verb cannot read outside the report root.
+  if(sweep_tok[0] == '.' || strchr(sweep_tok, '/') != NULL)
+  {
+    cmd_reply(ctx, "bad sweep id");
+    return;
+  }
+
+  if(snprintf(path, sizeof(path),
+         "%s/%s/report.md", report_root, sweep_tok) >= (int)sizeof(path))
+  {
+    cmd_reply(ctx, "show: path overflow");
+    return;
+  }
+
+  fp = fopen(path, "r");
+
+  if(fp == NULL)
+  {
+    snprintf(reply, sizeof(reply),
+        "no report.md for %s under %s (legacy sweep, or never written)",
+        sweep_tok, report_root);
+    cmd_reply(ctx, reply);
+    return;
+  }
+
+  while(fgets(line, sizeof(line), fp) != NULL)
+  {
+    size_t len = strlen(line);
+
+    if(len > 0 && line[len - 1] == '\n')
+      line[len - 1] = '\0';
+
+    cmd_reply(ctx, line);
+  }
+
+  fclose(fp);
+}
+
+// ----------------------------------------------------------------------- //
 // /whenmoon backtest parent                                               //
 // ----------------------------------------------------------------------- //
 
 static void
 wm_bt_parent_cb(const cmd_ctx_t *ctx)
 {
-  cmd_reply(ctx, "usage: /whenmoon backtest <run|compile|inspect|reload> ...");
+  cmd_reply(ctx,
+      "usage: /whenmoon backtest"
+      " <run|compile|inspect|list|show|reload> ...");
 }
 
 // ----------------------------------------------------------------------- //
@@ -1072,9 +1283,11 @@ wm_backtest_register_verbs(void)
   if(cmd_register("whenmoon", "backtest",
         "whenmoon backtest <verb> ...",
         "Backtest runner + sweep planner.",
-        "Subcommands: run <market_id> <strat> <start> <end> [...],"
+        "Subcommands: run <path.wm> <strat> [name=value ...],"
         " compile <market_id> <path.wm> [<days>],"
         " inspect <path.wm>,"
+        " list,"
+        " show <sweep_id>,"
         " reload <strat>.",
         USERNS_GROUP_ADMIN, 100, CMD_SCOPE_ANY, METHOD_T_ANY,
         wm_bt_parent_cb, NULL, "whenmoon", NULL,
@@ -1182,6 +1395,36 @@ wm_backtest_register_verbs(void)
         " current daemon to refresh the indicator schema.",
         USERNS_GROUP_ADMIN, 100, CMD_SCOPE_ANY, METHOD_T_ANY,
         wm_bt_cmd_inspect, NULL, "whenmoon/backtest", NULL,
+        NULL, 0, NULL, NULL) != SUCCESS)
+    return(FAIL);
+
+  if(cmd_register("whenmoon", "list",
+        "whenmoon backtest list",
+        "List on-disk sweeps, newest-first.",
+        "Walks plugin.whenmoon.backtest.report_path (default"
+        " $HOME/.local/share/botmanager/backtests/) and prints one"
+        " line per sweep directory whose name matches the canonical"
+        " YYYYMMDD-HHMMSS-<strategy>-<short_market> prefix. Each line"
+        " shows the sweep id, strategy, total iterations, ranking"
+        " metric, and ok/fail counts pulled from manifest.json."
+        " Sweeps with no manifest (interrupted writes) still appear,"
+        " tagged '(no manifest)'.",
+        USERNS_GROUP_ADMIN, 100, CMD_SCOPE_ANY, METHOD_T_ANY,
+        wm_bt_cmd_list, NULL, "whenmoon/backtest", NULL,
+        NULL, 0, NULL, NULL) != SUCCESS)
+    return(FAIL);
+
+  if(cmd_register("whenmoon", "show",
+        "whenmoon backtest show <sweep_id>",
+        "Cat <sweep_dir>/report.md line-by-line.",
+        "Looks up <sweep_id> under plugin.whenmoon.backtest.report_path"
+        " and streams its report.md back via cmd_reply. The renderer"
+        " materialises everything to disk at sweep end, so this verb"
+        " stays minimal — no JSON parsing, no recomputation. Sweeps"
+        " from before WM-BT-7 land here without a report.md and"
+        " surface a one-line note instead of a synthesised summary.",
+        USERNS_GROUP_ADMIN, 100, CMD_SCOPE_ANY, METHOD_T_ANY,
+        wm_bt_cmd_show, NULL, "whenmoon/backtest", NULL,
         NULL, 0, NULL, NULL) != SUCCESS)
     return(FAIL);
 

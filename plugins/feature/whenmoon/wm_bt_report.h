@@ -95,10 +95,51 @@ bool wm_bt_manifest_write(const char *sweep_dir,
     uint64_t wallclock_ms, uint32_t ok_count, uint32_t fail_count,
     char *err, size_t err_cap);
 
-// Write the BT-7 placeholder `<sweep_dir>/top-N.txt`. WM-BT-7
-// replaces this with the colored top-N renderer.
-bool wm_bt_top_n_placeholder_write(const char *sweep_dir,
-    const wm_bt_sweep_plan_t *plan);
+// Render `<sweep_dir>/top-N.txt` — ANSI-stripped twin of the
+// cmd_reply top-N output. Writes via tmp + rename so a partial
+// emit is never visible. Uses `wm_bt_topk_compute` to share sorting
+// with the cmd_reply path; columns + row format are byte-identical
+// minus the CLR_BOLD/CLR_RESET wrappers around the header line.
+bool wm_bt_render_topn_txt(const char *sweep_dir,
+    const wm_bt_sweep_plan_t *plan,
+    const wm_bt_sweep_mode_t *mode,
+    const wm_bt_sweep_result_t *results, uint32_t n_results,
+    uint32_t n_ok, char *err, size_t err_cap);
+
+// Render `<sweep_dir>/report.md` — a self-contained sweep summary.
+// Sections: header bullets (strategy/market/range/mode/threads/
+// iterations/wallclock/rank-by), sweep-axes table, top-N markdown
+// table (mode-aware), per-axis marginal-best table (one table per
+// axis), and a failures list (or "(none)"). Atomic write via
+// tmp + rename. `n_ok` + `n_fail` are precomputed by the caller;
+// `wallclock_ms` is the total sweep duration.
+bool wm_bt_render_report_md(const char *sweep_dir,
+    const char *sweep_id, const char *wm_path,
+    const wm_backtest_snapshot_t *snap, const char *strategy,
+    const wm_bt_sweep_plan_t *plan, const wm_bt_sweep_mode_t *mode,
+    const wm_bt_sweep_result_t *results, uint32_t n_results,
+    uint32_t n_ok, uint32_t n_fail, uint64_t wallclock_ms,
+    char *err, size_t err_cap);
+
+// Heap-owned listing of sweep dir entries. names[i] is a NUL-terminated
+// string heap-strdup'd from the on-disk dirent name. Free via
+// wm_bt_dir_listing_free.
+typedef struct
+{
+  char    **names;
+  uint32_t  n;
+} wm_bt_dir_listing_t;
+
+// Read `path` (the report-root) and list every entry whose first 8
+// chars match `[0-9]{8}` (the YYYYMMDD sweep-id prefix). The
+// YYYYMMDD-HHMMSS- prefix is chrono-aligned with lexical order, so a
+// descending lexical sort returns newest-first. Skips dot-prefixed
+// entries and non-directory entries. Returns SUCCESS on a clean
+// listing (possibly empty); FAIL with err populated otherwise.
+bool wm_bt_dir_listdir(const char *path,
+    wm_bt_dir_listing_t *out, char *err, size_t err_cap);
+
+void wm_bt_dir_listing_free(wm_bt_dir_listing_t *l);
 
 #endif // WHENMOON_INTERNAL
 
