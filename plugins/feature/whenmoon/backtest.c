@@ -31,6 +31,7 @@
 #include "market.h"
 #include "strategy.h"
 #include "whenmoon.h"
+#include "wm_bt_file.h"
 
 #include "alloc.h"
 #include "clam.h"
@@ -173,11 +174,22 @@ wm_backtest_preflight_gap(int32_t market_id_db,
 // Free the rings + aggregator + lock owned by the stub market in
 // `snap`. Only invoked on snapshots whose mutex_init + aggregator_init
 // both succeeded (early-failure paths in build clean up directly).
+//
+// WM-BT-2: mmap-loaded snapshots (`is_mapped == true`) borrow their
+// grain rings from the mapped region; the close path lives in
+// wm_bt_file_close which munmap's, closes the fd, and frees the
+// struct. Heap-built snapshots own everything and tear down inline.
 static void
 wm_bt_snapshot_teardown(wm_backtest_snapshot_t *snap)
 {
   if(snap == NULL)
     return;
+
+  if(snap->is_mapped)
+  {
+    wm_bt_file_close(snap);
+    return;
+  }
 
   wm_aggregator_destroy(&snap->mkt);
   pthread_mutex_destroy(&snap->mkt.lock);
@@ -255,6 +267,18 @@ wm_backtest_snapshot_build(int32_t market_id_db,
   }
 
   memset(snap, 0, sizeof(*snap));
+
+  // WM-BT-2: heap-built snapshot — not file-backed. map_fd is -1 to
+  // mirror the closed-fd sentinel used by wm_bt_file_open's failure
+  // paths; range_*_ms stay 0 (heap path uses range_start/range_end
+  // strings; WM-BT-3 will fill these in when the compile verb derives
+  // them from the warmup query).
+  snap->map_base       = NULL;
+  snap->map_size       = 0;
+  snap->map_fd         = -1;
+  snap->is_mapped      = false;
+  snap->range_start_ms = 0;
+  snap->range_end_ms   = 0;
 
   snap->market_id_db = market_id_db;
   snprintf(snap->source_market_id, sizeof(snap->source_market_id),

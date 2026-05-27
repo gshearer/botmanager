@@ -118,6 +118,10 @@ typedef struct wm_backtest_snapshot
   // running with strategy fanout disabled. Built by
   // wm_backtest_snapshot_build and read from during iteration. Lock
   // is initialized but uncontended in single-iter runs.
+  //
+  // When `is_mapped` is true the `mkt.grain_arr[g]` pointers are
+  // borrowed from the mmap'd region (see WM-BT-2); the snapshot does
+  // NOT own those allocations and `mkt.aggregator` stays NULL.
   whenmoon_market_t   mkt;
 
   int32_t             market_id_db;                       // wm_market.id
@@ -129,7 +133,26 @@ typedef struct wm_backtest_snapshot
   char                range_start[40];
   char                range_end[40];
 
+  // WM-BT-2: range epoch ms for downstream consumers (walk-forward
+  // + OOS window math). Populated from header on mmap'd snapshots;
+  // computed from range_start/range_end on heap-built snapshots
+  // (which currently leave both as 0 — WM-BT-3 wires the warmup
+  // path to fill them in when the compile verb lands).
+  int64_t             range_start_ms;
+  int64_t             range_end_ms;
+
   uint32_t            bars_loaded_1m;
+
+  // WM-BT-2: mmap discriminator. `is_mapped` distinguishes a heap-
+  // built snapshot (own the grain rings + aggregator; teardown
+  // calls wm_aggregator_destroy + pthread_mutex_destroy + mem_free)
+  // from a file-backed snapshot opened via wm_bt_file_open (borrow
+  // grain rings from the mapped region; teardown calls
+  // wm_bt_file_close which munmap's and frees the struct).
+  void               *map_base;
+  size_t              map_size;
+  int                 map_fd;
+  bool                is_mapped;
 } wm_backtest_snapshot_t;
 
 // ----------------------------------------------------------------------- //

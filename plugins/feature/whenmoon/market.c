@@ -1192,9 +1192,13 @@ wm_market_create_synthetic(const char *market_id_str,
       src->exchange_name);
   mk->market_id = -1;     // synth has no DB row
 
-  // Share grain rings — read-only during iteration. The source
-  // market's lifetime spans the entire sweep; iteration is a strict
-  // subset.
+  // Share grain rings — POINTERS ARE BORROWED, never copied. The
+  // source market owns the rings; the synth market reads through them
+  // and MUST NOT free or extend them. WM-BT-2 relies on this: when
+  // the source is a `wm_bt_file_open` mmap'd snapshot, the rings are
+  // read-only pages mapped from disk and shared across every sweep
+  // worker. The source market's lifetime spans the entire sweep;
+  // iteration is a strict subset, so the pointers stay valid.
   memcpy(mk->grain_arr, src->grain_arr, sizeof(mk->grain_arr));
   memcpy(mk->grain_n,   src->grain_n,   sizeof(mk->grain_n));
   memcpy(mk->grain_cap, src->grain_cap, sizeof(mk->grain_cap));
