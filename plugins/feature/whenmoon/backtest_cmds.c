@@ -1,19 +1,31 @@
 // botmanager — MIT
-// Whenmoon backtest admin verbs (WM-LT-5).
+// Whenmoon backtest admin verbs.
 //
-//   /whenmoon backtest run <market_id> <strategy_name>
-//                          <MM/dd/yyyy> <MM/dd/yyyy>
-//                          [--fee-bps N] [--slip-bps N]
-//                          [--size-frac F] [--cash N]
+//   /whenmoon backtest run     <path.wm> <strategy>
+//                              [name=value ...] [--flag value ...]
+//   /whenmoon backtest reload  <strategy>
+//   /whenmoon backtest compile <market_id> <path.wm> [<days>]
+//   /whenmoon backtest inspect <path.wm>
 //
-// run executes a single iteration synchronously on the cmd worker
-// thread. The build + replay of one BTC-USD year is on the order of
-// a few seconds; cmd dispatch already runs off the main thread so
-// blocking the worker for that span is acceptable for WM-LT-5.
-// WM-LT-6 will move to a worker pool + async results. WM-BT-1
-// retired the wm_backtest_run DB-persistence surface and its
-// `/show whenmoon backtest` reader verbs; disk-based persistence +
-// new list/show verbs land in WM-BT-6 / WM-BT-7.
+// `run` mmap's a compiled .wm snapshot and dispatches the parameter
+// space (positional `name=value` axes form a cartesian product;
+// N=0 collapses to a single iteration) through the sweep worker
+// pool. Workers each construct a per-iteration synthetic
+// whenmoon_market_t and never touch the live market registry. Each
+// invocation emits a sweep directory under
+// `plugin.whenmoon.backtest.report_path` carrying `manifest.json`,
+// `iterations.jsonl`, a top-N.txt placeholder (BT-7 fills), and an
+// empty `charts/` subdir (BT-8 fills when charts_enabled). Top-N
+// also renders to the caller's cmd_ctx for immediate feedback.
+//
+// History: WM-LT-5 shipped synchronous single-iter on the cmd worker;
+// WM-LT-6 added the worker pool + sweep planner; WM-BT-1 ripped DB
+// persistence; WM-BT-2/3 added the .wm binary format + compile/inspect
+// verbs; WM-BT-4 extended sweep syntax (brackets + JSON --config);
+// WM-BT-5 made the thread pool host-friendly (sysconf-2 default, nice
+// 19 workers); WM-BT-6 collapses the run path to mmap-only + disk
+// artifacts and renames `--workers/--score/--top` to
+// `--threads/--rank-by/--top-n`.
 
 #define WHENMOON_INTERNAL
 #include "whenmoon.h"
@@ -25,6 +37,7 @@
 #include "strategy.h"
 #include "sweep.h"
 #include "wm_bt_file.h"
+#include "wm_bt_report.h"
 
 #include "cmd.h"
 #include "common.h"
@@ -37,42 +50,6 @@
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
-
-// ----------------------------------------------------------------------- //
-// Date helper                                                             //
-// ----------------------------------------------------------------------- //
-
-// "MM/dd/yyyy" -> "YYYY-MM-DD 00:00:00+00". Same shape as the
-// downloader's wm_dl_parse_date but local because dl_commands.c
-// keeps its copy static. Duplicating one tiny helper is preferable
-// to leaking it onto the public surface.
-static bool
-wm_bt_parse_date(const char *in, char *out, size_t cap)
-{
-  unsigned mm, dd, yyyy;
-  int      consumed = 0;
-  int      n;
-
-  if(in == NULL || out == NULL || cap == 0)
-    return(FAIL);
-
-  if(sscanf(in, "%u/%u/%u%n", &mm, &dd, &yyyy, &consumed) != 3)
-    return(FAIL);
-
-  if(in[consumed] != '\0')
-    return(FAIL);
-
-  if(mm < 1 || mm > 12 || dd < 1 || dd > 31 ||
-     yyyy < 1970 || yyyy > 9999)
-    return(FAIL);
-
-  n = snprintf(out, cap, "%04u-%02u-%02u 00:00:00+00", yyyy, mm, dd);
-
-  if(n < 0 || (size_t)n >= cap)
-    return(FAIL);
-
-  return(SUCCESS);
-}
 
 // ----------------------------------------------------------------------- //
 // /whenmoon backtest run                                                  //
@@ -175,83 +152,58 @@ wm_bt_parse_walk_spec(const char *tok, wm_bt_walk_spec_t *out)
   return((got_mask == 7u) ? SUCCESS : FAIL);
 }
 
-// Parse "YYYY-MM-DD HH:MM:SS+00" -> ms epoch. Returns SUCCESS on a
-// clean parse. Mirrors the parser inside backtest.c; duplicated here
-// because that one is static.
-static bool
-wm_bt_parse_ts_ms(const char *in, int64_t *out_ms)
-{
-  struct tm tm;
-  unsigned  yyyy, mo, dd, hh, mm, ss;
-  int       consumed = 0;
-  time_t    t;
-
-  if(in == NULL || out_ms == NULL)
-    return(FAIL);
-
-  if(sscanf(in, "%u-%u-%u %u:%u:%u%n",
-        &yyyy, &mo, &dd, &hh, &mm, &ss, &consumed) != 6 || consumed < 19)
-    return(FAIL);
-
-  memset(&tm, 0, sizeof(tm));
-  tm.tm_year = (int)yyyy - 1900;
-  tm.tm_mon  = (int)mo - 1;
-  tm.tm_mday = (int)dd;
-  tm.tm_hour = (int)hh;
-  tm.tm_min  = (int)mm;
-  tm.tm_sec  = (int)ss;
-
-  t = timegm(&tm);
-
-  if(t == (time_t)-1)
-    return(FAIL);
-
-  *out_ms = (int64_t)t * 1000;
-  return(SUCCESS);
-}
-
+// WM-BT-6 unified entry. argv shape:
+//   <path.wm> <strategy> [name=value ...] [--flag value ...]
+//
+// `name=value` tokens are positional sweep specs handed to
+// wm_bt_sweep_axis_add (same parser as the WM-BT-3..5 `--sweep` flag).
+// Iterations always run through wm_bt_sweep_run — the N=1 "single
+// iter" path is just a sweep_plan with zero axes (total_iters = 1).
+// Range timestamps come from the mmap'd .wm header, so the verb no
+// longer takes start/end dates.
+//
+// Each invocation emits a sweep directory under
+// `plugin.whenmoon.backtest.report_path` (defaulting to
+// `$HOME/.local/share/botmanager/backtests/<sweep_id>/`) containing
+// `manifest.json`, `iterations.jsonl`, `top-N.txt` (BT-7 placeholder),
+// and an empty `charts/` (BT-8 fills it).
 static void
 wm_bt_cmd_run(const cmd_ctx_t *ctx)
 {
-  whenmoon_state_t       *st;
-  const char             *p;
-  char                    pair_tok[64]                = {0};
-  char                    name_tok[WM_STRATEGY_NAME_SZ] = {0};
-  char                    start_tok[32]               = {0};
-  char                    end_tok[32]                 = {0};
-  char                    flag_tok[32]                = {0};
-  char                    val_tok[256]                = {0};
-  char                    exch[32]                    = {0};
-  char                    base[16]                    = {0};
-  char                    quote[16]                   = {0};
-  char                    symbol[32]                  = {0};
-  char                    start_ts[40]                = {0};
-  char                    end_ts[40]                  = {0};
-  char                    err[256];
-  char                    reply[320];
-  int32_t                 market_id;
-  wm_backtest_params_t    params;
-  wm_backtest_snapshot_t *snap;
-  wm_backtest_result_t    result;
-  loaded_strategy_t      *ls;
-  wm_bt_sweep_plan_t      sweep_plan;
-  wm_bt_sweep_mode_t      sweep_mode;
-  wm_bt_walk_spec_t       walk_spec;
-  wm_bt_oos_spec_t        oos_spec;
-  bool                    have_sweep        = false;
-  bool                    have_walk_forward = false;
-  bool                    have_oos_tail     = false;
-  uint32_t                min_history_1d = 0;
+  whenmoon_state_t          *st;
+  const char                *p;
+  char                       path_tok[256]                 = {0};
+  char                       name_tok[WM_STRATEGY_NAME_SZ] = {0};
+  char                       tok[256]                      = {0};
+  char                       val_tok[256]                  = {0};
+  char                       err[320];
+  char                       reply[640];
+  char                       sweep_id[160]                 = {0};
+  char                       report_root[1024]             = {0};
+  char                       sweep_dir[1024]               = {0};
+  wm_backtest_params_t       params;
+  wm_backtest_snapshot_t    *snap          = NULL;
+  loaded_strategy_t         *ls;
+  wm_bt_sweep_plan_t         sweep_plan;
+  wm_bt_sweep_mode_t         sweep_mode;
+  wm_bt_walk_spec_t          walk_spec;
+  wm_bt_oos_spec_t           oos_spec;
+  wm_bt_sweep_result_t      *sweep_results = NULL;
+  wm_bt_iterations_writer_t  writer;
+  struct timespec            t0;
+  struct timespec            t1;
+  uint64_t                   wallclock_ms = 0;
+  uint32_t                   i;
+  uint32_t                   n_ok          = 0;
+  uint32_t                   n_fail        = 0;
+  bool                       writer_open   = false;
+  bool                       have_axes     = false;
+  bool                       have_walk     = false;
+  bool                       have_oos      = false;
 
   st = whenmoon_get_state();
 
-  if(st == NULL || !st->dl_ready)
-  {
-    cmd_reply(ctx, "whenmoon: downloader not ready");
-    return;
-  }
-
-  if(st->strategies == NULL)
+  if(st == NULL || st->strategies == NULL)
   {
     cmd_reply(ctx, "whenmoon: strategy registry not ready");
     return;
@@ -259,85 +211,23 @@ wm_bt_cmd_run(const cmd_ctx_t *ctx)
 
   p = ctx->args != NULL ? ctx->args : "";
 
-  if(!wm_dl_next_token(&p, pair_tok,  sizeof(pair_tok))  ||
-     !wm_dl_next_token(&p, name_tok,  sizeof(name_tok))  ||
-     !wm_dl_next_token(&p, start_tok, sizeof(start_tok)) ||
-     !wm_dl_next_token(&p, end_tok,   sizeof(end_tok)))
+  if(!wm_dl_next_token(&p, path_tok, sizeof(path_tok)) ||
+     !wm_dl_next_token(&p, name_tok, sizeof(name_tok)))
   {
     cmd_reply(ctx,
-        "usage: /whenmoon backtest run <market_id> <strategy_name>"
-        " <MM/dd/yyyy> <MM/dd/yyyy>"
-        " [--fee-bps N] [--slip-bps N]"
-        " [--size-frac F] [--cash N]"
-        " [--sweep <param>=<v1,v2,...>|<[v1,v2,...]>|<lo:step:hi>]"
-        " (repeatable)"
-        " [--config <path.json>]"
-        " [--threads N] [--score realized|sharpe|sortino|equity|pf]"
-        " [--top K]"
+        "usage: /whenmoon backtest run <path.wm> <strategy>"
+        " [<name>=<v|[v,...]|lo:step:hi>] (repeatable)"
+        " [--fee-bps N] [--slip-bps N] [--size-frac F] [--cash N]"
+        " [--config <path.json>] [--threads N]"
+        " [--rank-by realized|sharpe|sortino|equity|pf]"
+        " [--top-n K]"
         " [--walk-forward train=Td:test=Md:step=Sd]"
         " [--oos-tail PCT]");
     return;
   }
 
-  if(wm_market_parse_id(pair_tok, exch, sizeof(exch),
-         base, sizeof(base), quote, sizeof(quote)) != SUCCESS)
-  {
-    cmd_reply(ctx, "bad market id (expected <exch>-<base>-<quote>)");
-    return;
-  }
-
-  // Coinbase wire form is uppercase BASE-QUOTE; mirrors the path in
-  // dl_commands.c. EX-1 deferred lifting this into the exchange
-  // abstraction.
-  {
-    int n = snprintf(symbol, sizeof(symbol), "%s-%s", base, quote);
-    size_t i;
-
-    if(n < 0 || (size_t)n >= sizeof(symbol))
-    {
-      cmd_reply(ctx, "market id overflow");
-      return;
-    }
-
-    for(i = 0; symbol[i] != '\0'; i++)
-      symbol[i] = (char)toupper((unsigned char)symbol[i]);
-  }
-
-  if(wm_bt_parse_date(start_tok, start_ts, sizeof(start_ts)) != SUCCESS ||
-     wm_bt_parse_date(end_tok,   end_ts,   sizeof(end_ts))   != SUCCESS)
-  {
-    cmd_reply(ctx, "bad date (expected MM/dd/yyyy)");
-    return;
-  }
-
-  if(strcmp(start_ts, end_ts) >= 0)
-  {
-    cmd_reply(ctx, "start date must be strictly before end date");
-    return;
-  }
-
-  // The strategy must be loaded BEFORE we can validate sweep axes
-  // against its declared param schema. Resolve here + cache the
-  // min-history requirement so the snapshot sizing is right.
-  market_id = wm_market_lookup_or_create(exch, base, quote, symbol);
-
-  if(market_id < 0)
-  {
-    cmd_reply(ctx, "market lookup/create failed");
-    return;
-  }
-
   pthread_mutex_lock(&st->strategies->lock);
   ls = wm_strategy_find_loaded(st, name_tok);
-
-  if(ls != NULL)
-  {
-    uint32_t i;
-
-    for(i = 0; i < WM_GRAN_MAX; i++)
-      if(ls->meta.min_history[i] > min_history_1d)
-        min_history_1d = ls->meta.min_history[i];
-  }
   pthread_mutex_unlock(&st->strategies->lock);
 
   if(ls == NULL)
@@ -347,447 +237,472 @@ wm_bt_cmd_run(const cmd_ctx_t *ctx)
     return;
   }
 
-  // Parse optional --flag value pairs. The economic knobs apply to
-  // every iteration; --sweep / --threads / --score / --top control the
-  // sweep planner. --walk-forward / --oos-tail set window scope.
-  // --config <file> loads a JSON sweep matrix; inline --sweep entries
-  // override its axes via the replace-on-collision dedup in
-  // wm_bt_sweep_axis_add. To preserve "inline beats file" regardless
-  // of argv order, --config is processed in a dedicated first pass.
+  err[0] = '\0';
+  snap = wm_bt_file_open(path_tok, err, sizeof(err));
+
+  if(snap == NULL)
+  {
+    snprintf(reply, sizeof(reply), ".wm open failed: %s",
+        err[0] != '\0' ? err : path_tok);
+    cmd_reply(ctx, reply);
+    return;
+  }
+
   memset(&params,     0, sizeof(params));
   memset(&sweep_mode, 0, sizeof(sweep_mode));
   memset(&walk_spec,  0, sizeof(walk_spec));
   memset(&oos_spec,   0, sizeof(oos_spec));
   wm_bt_sweep_plan_init(&sweep_plan);
 
-  // Pass 1: --config only. Break (silently) on missing value or any
-  // other malformed input so Pass 2 reports the canonical diagnostic.
+  // Pass 1: --config only. Loaded first so inline `name=value` axes
+  // (parsed in Pass 2) can replace its entries via the
+  // wm_bt_sweep_axis_add replace-on-collision semantic — preserving
+  // "inline beats file" regardless of argv order.
   {
     const char *p_pre = p;
+    char        f1[64];
+    char        v1[256];
 
-    while(wm_dl_next_token(&p_pre, flag_tok, sizeof(flag_tok)))
+    while(wm_dl_next_token(&p_pre, f1, sizeof(f1)))
     {
-      if(!wm_dl_next_token(&p_pre, val_tok, sizeof(val_tok)))
+      if(f1[0] != '-' || f1[1] != '-')
+        continue;
+
+      if(!wm_dl_next_token(&p_pre, v1, sizeof(v1)))
         break;
 
-      if(strcmp(flag_tok, "--config") != 0)
+      if(strcmp(f1, "--config") != 0)
         continue;
 
       err[0] = '\0';
 
-      if(wm_bt_load_config_file(&sweep_plan, ls, val_tok,
+      if(wm_bt_load_config_file(&sweep_plan, ls, v1,
              err, sizeof(err)) != SUCCESS)
       {
         snprintf(reply, sizeof(reply),
             "error: %s", err[0] != '\0' ? err : "bad --config value");
         cmd_reply(ctx, reply);
+        wm_backtest_snapshot_free(snap);
         return;
       }
 
-      have_sweep = true;
+      have_axes = true;
     }
   }
 
-  while(wm_dl_next_token(&p, flag_tok, sizeof(flag_tok)))
+  // Pass 2: positional `name=value` sweep specs + every other --flag.
+  while(wm_dl_next_token(&p, tok, sizeof(tok)))
   {
-    if(!wm_dl_next_token(&p, val_tok, sizeof(val_tok)))
+    if(tok[0] == '-' && tok[1] == '-')
     {
-      snprintf(reply, sizeof(reply),
-          "missing value for %s", flag_tok);
-      cmd_reply(ctx, reply);
-      return;
-    }
+      if(!wm_dl_next_token(&p, val_tok, sizeof(val_tok)))
+      {
+        snprintf(reply, sizeof(reply),
+            "missing value for %s", tok);
+        cmd_reply(ctx, reply);
+        wm_backtest_snapshot_free(snap);
+        return;
+      }
 
-    if(strcmp(flag_tok, "--config") == 0)
-      continue;          // handled in Pass 1
+      if(strcmp(tok, "--config") == 0)
+        continue;          // handled in Pass 1
 
-    if(strcmp(flag_tok, "--fee-bps") == 0)
-    {
-      if(wm_bt_parse_double_flag(val_tok, &params.fee_bps,
-             &params.have_fee_bps) != SUCCESS)
+      if(strcmp(tok, "--fee-bps") == 0)
       {
-        cmd_reply(ctx, "bad --fee-bps value");
+        if(wm_bt_parse_double_flag(val_tok, &params.fee_bps,
+               &params.have_fee_bps) != SUCCESS)
+        {
+          cmd_reply(ctx, "bad --fee-bps value");
+          wm_backtest_snapshot_free(snap);
+          return;
+        }
+      }
+      else if(strcmp(tok, "--slip-bps") == 0)
+      {
+        if(wm_bt_parse_double_flag(val_tok, &params.slip_bps,
+               &params.have_slip_bps) != SUCCESS)
+        {
+          cmd_reply(ctx, "bad --slip-bps value");
+          wm_backtest_snapshot_free(snap);
+          return;
+        }
+      }
+      else if(strcmp(tok, "--size-frac") == 0)
+      {
+        if(wm_bt_parse_double_flag(val_tok, &params.size_frac,
+               &params.have_size_frac) != SUCCESS)
+        {
+          cmd_reply(ctx, "bad --size-frac value");
+          wm_backtest_snapshot_free(snap);
+          return;
+        }
+      }
+      else if(strcmp(tok, "--cash") == 0)
+      {
+        if(wm_bt_parse_double_flag(val_tok, &params.starting_cash,
+               &params.have_starting_cash) != SUCCESS)
+        {
+          cmd_reply(ctx, "bad --cash value");
+          wm_backtest_snapshot_free(snap);
+          return;
+        }
+      }
+      else if(strcmp(tok, "--threads") == 0)
+      {
+        char *end = NULL;
+        long  w;
+
+        errno = 0;
+        w     = strtol(val_tok, &end, 10);
+
+        if(end == val_tok || errno != 0 || w < 0)
+        {
+          cmd_reply(ctx, "bad --threads value");
+          wm_backtest_snapshot_free(snap);
+          return;
+        }
+
+        sweep_plan.workers = w == 0 ? 1u : (uint32_t)w;
+      }
+      else if(strcmp(tok, "--rank-by") == 0)
+      {
+        if(wm_bt_sweep_score_parse(val_tok,
+               &sweep_plan.score) != SUCCESS)
+        {
+          cmd_reply(ctx,
+              "bad --rank-by"
+              " (expected realized|sharpe|sortino|equity|pf)");
+          wm_backtest_snapshot_free(snap);
+          return;
+        }
+      }
+      else if(strcmp(tok, "--top-n") == 0)
+      {
+        char *end = NULL;
+        long  k;
+
+        errno = 0;
+        k     = strtol(val_tok, &end, 10);
+
+        if(end == val_tok || errno != 0 || k < 0)
+        {
+          cmd_reply(ctx, "bad --top-n value");
+          wm_backtest_snapshot_free(snap);
+          return;
+        }
+
+        sweep_plan.top_k = (uint32_t)k;
+      }
+      else if(strcmp(tok, "--walk-forward") == 0)
+      {
+        if(wm_bt_parse_walk_spec(val_tok, &walk_spec) != SUCCESS)
+        {
+          cmd_reply(ctx,
+              "bad --walk-forward"
+              " (expected train=Td:test=Md:step=Sd, days)");
+          wm_backtest_snapshot_free(snap);
+          return;
+        }
+        have_walk = true;
+      }
+      else if(strcmp(tok, "--oos-tail") == 0)
+      {
+        char *end = NULL;
+        long  pct;
+
+        errno = 0;
+        pct   = strtol(val_tok, &end, 10);
+
+        if(end == val_tok || errno != 0 || *end != '\0' ||
+           pct < 1 || pct > 50)
+        {
+          cmd_reply(ctx, "bad --oos-tail (expected integer 1..50)");
+          wm_backtest_snapshot_free(snap);
+          return;
+        }
+
+        oos_spec.pct = (uint32_t)pct;
+        have_oos     = true;
+      }
+      else
+      {
+        snprintf(reply, sizeof(reply),
+            "unknown flag '%s' (expected --fee-bps/--slip-bps/"
+            "--size-frac/--cash/--config/--threads/--rank-by/"
+            "--top-n/--walk-forward/--oos-tail)",
+            tok);
+        cmd_reply(ctx, reply);
+        wm_backtest_snapshot_free(snap);
         return;
       }
     }
-    else if(strcmp(flag_tok, "--slip-bps") == 0)
-    {
-      if(wm_bt_parse_double_flag(val_tok, &params.slip_bps,
-             &params.have_slip_bps) != SUCCESS)
-      {
-        cmd_reply(ctx, "bad --slip-bps value");
-        return;
-      }
-    }
-    else if(strcmp(flag_tok, "--size-frac") == 0)
-    {
-      if(wm_bt_parse_double_flag(val_tok, &params.size_frac,
-             &params.have_size_frac) != SUCCESS)
-      {
-        cmd_reply(ctx, "bad --size-frac value");
-        return;
-      }
-    }
-    else if(strcmp(flag_tok, "--cash") == 0)
-    {
-      if(wm_bt_parse_double_flag(val_tok, &params.starting_cash,
-             &params.have_starting_cash) != SUCCESS)
-      {
-        cmd_reply(ctx, "bad --cash value");
-        return;
-      }
-    }
-    else if(strcmp(flag_tok, "--sweep") == 0)
+    else if(strchr(tok, '=') != NULL)
     {
       err[0] = '\0';
 
-      if(wm_bt_sweep_axis_add(&sweep_plan, ls, val_tok,
+      if(wm_bt_sweep_axis_add(&sweep_plan, ls, tok,
              err, sizeof(err)) != SUCCESS)
       {
         snprintf(reply, sizeof(reply),
-            "error: %s", err[0] != '\0' ? err : "bad --sweep value");
+            "error: %s", err[0] != '\0' ? err : "bad param spec");
         cmd_reply(ctx, reply);
+        wm_backtest_snapshot_free(snap);
         return;
       }
 
-      have_sweep = true;
-    }
-    else if(strcmp(flag_tok, "--threads") == 0)
-    {
-      char *end = NULL;
-      long  w;
-
-      errno = 0;
-      w     = strtol(val_tok, &end, 10);
-
-      if(end == val_tok || errno != 0 || w < 0)
-      {
-        cmd_reply(ctx, "bad --threads value");
-        return;
-      }
-
-      sweep_plan.workers = w == 0 ? 1u : (uint32_t)w;
-    }
-    else if(strcmp(flag_tok, "--score") == 0)
-    {
-      if(wm_bt_sweep_score_parse(val_tok, &sweep_plan.score) != SUCCESS)
-      {
-        cmd_reply(ctx,
-            "bad --score (expected realized|sharpe|sortino|equity|pf)");
-        return;
-      }
-    }
-    else if(strcmp(flag_tok, "--top") == 0)
-    {
-      char *end = NULL;
-      long  k;
-
-      errno = 0;
-      k     = strtol(val_tok, &end, 10);
-
-      if(end == val_tok || errno != 0 || k < 0)
-      {
-        cmd_reply(ctx, "bad --top value");
-        return;
-      }
-
-      sweep_plan.top_k = (uint32_t)k;
-    }
-    else if(strcmp(flag_tok, "--walk-forward") == 0)
-    {
-      if(wm_bt_parse_walk_spec(val_tok, &walk_spec) != SUCCESS)
-      {
-        cmd_reply(ctx,
-            "bad --walk-forward (expected"
-            " train=Td:test=Md:step=Sd, days)");
-        return;
-      }
-      have_walk_forward = true;
-    }
-    else if(strcmp(flag_tok, "--oos-tail") == 0)
-    {
-      char *end = NULL;
-      long  pct;
-
-      errno = 0;
-      pct   = strtol(val_tok, &end, 10);
-
-      if(end == val_tok || errno != 0 || *end != '\0' ||
-         pct < 1 || pct > 50)
-      {
-        cmd_reply(ctx, "bad --oos-tail (expected integer 1..50)");
-        return;
-      }
-
-      oos_spec.pct  = (uint32_t)pct;
-      have_oos_tail = true;
+      have_axes = true;
     }
     else
     {
       snprintf(reply, sizeof(reply),
-          "unknown flag '%s' (expected --fee-bps/--slip-bps/"
-          "--size-frac/--cash/--sweep/--config/--threads/--score/"
-          "--top/--walk-forward/--oos-tail)",
-          flag_tok);
+          "unrecognised token '%s' (expected --flag or name=value)",
+          tok);
       cmd_reply(ctx, reply);
+      wm_backtest_snapshot_free(snap);
       return;
     }
   }
 
-  if(have_walk_forward && have_oos_tail)
+  if(have_walk && have_oos)
   {
     cmd_reply(ctx,
         "--walk-forward and --oos-tail are mutually exclusive");
+    wm_backtest_snapshot_free(snap);
     return;
   }
 
-  // Default top_k for sweeps when caller didn't specify.
-  if(have_sweep && sweep_plan.top_k == 1)
+  // Default top_k when sweeping. When --oos-tail is set together with
+  // sweep axes, the OOS post-pass also wants a non-trivial top-K so
+  // the validation iteration has work to do.
+  if(have_axes && sweep_plan.top_k == 1)
     sweep_plan.top_k = WM_BT_DEFAULT_TOP_K;
 
-  // OOS validation needs at least a few top-K rows to be useful.
-  // When --oos-tail is set without --sweep or --top, default top to
-  // a small number so the post-pass actually has work to do.
-  if(have_oos_tail && sweep_plan.top_k == 1 && !have_sweep)
-    sweep_plan.top_k = 1;
-  else if(have_oos_tail && sweep_plan.top_k == 1)
-    sweep_plan.top_k = WM_BT_DEFAULT_TOP_K;
-
-  if(wm_bt_sweep_plan_finalize(&sweep_plan, err, sizeof(err)) != SUCCESS)
+  if(wm_bt_sweep_plan_finalize(&sweep_plan,
+         err, sizeof(err)) != SUCCESS)
   {
     snprintf(reply, sizeof(reply),
         "error: %s", err[0] != '\0' ? err : "sweep finalize failed");
     cmd_reply(ctx, reply);
+    wm_backtest_snapshot_free(snap);
     return;
   }
 
-  // Build the sweep mode + windows. Resolves +/- the in-memory range
-  // bounds in ms epoch so the window builders can slice deterministically.
+  // Resolve walk / OOS windows off the .wm header range. The header
+  // already carries the timestamps the walk + OOS builders need;
+  // WM-BT-2 promoted range_start_ms / range_end_ms to first-class
+  // snapshot fields so no string→ms reparse is required.
+  sweep_mode.mode = WM_BT_MODE_FULL;
+
+  if(have_walk)
   {
-    int64_t range_start_ms = 0;
-    int64_t range_end_ms   = 0;
+    err[0] = '\0';
 
-    sweep_mode.mode = WM_BT_MODE_FULL;
-
-    if(have_walk_forward || have_oos_tail)
+    if(wm_bt_walk_build_windows(&walk_spec,
+           snap->range_start_ms, snap->range_end_ms,
+           ls, &sweep_mode.walk, err, sizeof(err)) != SUCCESS)
     {
-      if(wm_bt_parse_ts_ms(start_ts, &range_start_ms) != SUCCESS ||
-         wm_bt_parse_ts_ms(end_ts,   &range_end_ms)   != SUCCESS)
-      {
-        cmd_reply(ctx, "internal: range timestamp parse failed");
-        return;
-      }
-    }
-
-    if(have_walk_forward)
-    {
-      err[0] = '\0';
-
-      if(wm_bt_walk_build_windows(&walk_spec, range_start_ms,
-             range_end_ms, ls, &sweep_mode.walk,
-             err, sizeof(err)) != SUCCESS)
-      {
-        snprintf(reply, sizeof(reply),
-            "walk-forward error: %s",
-            err[0] != '\0' ? err : "(unknown)");
-        cmd_reply(ctx, reply);
-        return;
-      }
-
-      sweep_mode.mode = WM_BT_MODE_WALK_FORWARD;
-    }
-
-    else if(have_oos_tail)
-    {
-      err[0] = '\0';
-
-      if(wm_bt_oos_split_range(&oos_spec, range_start_ms, range_end_ms,
-             &sweep_mode.oos_head, &sweep_mode.oos_tail,
-             err, sizeof(err)) != SUCCESS)
-      {
-        snprintf(reply, sizeof(reply),
-            "oos-tail error: %s",
-            err[0] != '\0' ? err : "(unknown)");
-        cmd_reply(ctx, reply);
-        return;
-      }
-
-      sweep_mode.mode = WM_BT_MODE_OOS;
-    }
-  }
-
-  if(min_history_1d == 0)
-    min_history_1d = WM_AGG_DEFAULT_HISTORY_1D;
-
-  // Pre-flight gap check.
-  err[0] = '\0';
-
-  if(wm_backtest_preflight_gap(market_id, start_ts, end_ts,
-         err, sizeof(err)) != SUCCESS)
-  {
-    cmd_reply(ctx, err[0] != '\0' ? err
-                                  : "1m candle coverage missing");
-    return;
-  }
-
-  cmd_reply(ctx, "warming snapshot...");
-
-  snap = wm_backtest_snapshot_build(market_id, pair_tok,
-      start_ts, end_ts, min_history_1d, err, sizeof(err));
-
-  if(snap == NULL)
-  {
-    snprintf(reply, sizeof(reply), "snapshot build failed: %s",
-        err[0] != '\0' ? err : "unknown");
-    cmd_reply(ctx, reply);
-    return;
-  }
-
-  if(have_sweep || have_walk_forward || have_oos_tail)
-  {
-    wm_bt_sweep_result_t *sweep_results;
-    struct timespec       t0, t1;
-    uint64_t              wallclock_ms;
-    uint32_t              i;
-    uint32_t              n_ok = 0;
-    const char           *mode_label =
-        sweep_mode.mode == WM_BT_MODE_WALK_FORWARD ? "walk" :
-        sweep_mode.mode == WM_BT_MODE_OOS          ? "oos"  :
-                                                     "full";
-
-    if(sweep_mode.mode == WM_BT_MODE_WALK_FORWARD)
       snprintf(reply, sizeof(reply),
-          "snapshot ready: %u 1m bars; walk-forward N=%u windows=%u"
-          " threads=%u score=%s top=%u",
-          snap->bars_loaded_1m, sweep_plan.total_iters,
-          sweep_mode.walk.n,
-          sweep_plan.workers,
-          wm_bt_sweep_score_name(sweep_plan.score), sweep_plan.top_k);
-    else if(sweep_mode.mode == WM_BT_MODE_OOS)
-      snprintf(reply, sizeof(reply),
-          "snapshot ready: %u 1m bars; oos head N=%u (oos_tail=%u%%)"
-          " threads=%u score=%s top=%u",
-          snap->bars_loaded_1m, sweep_plan.total_iters,
-          oos_spec.pct, sweep_plan.workers,
-          wm_bt_sweep_score_name(sweep_plan.score), sweep_plan.top_k);
-    else
-      snprintf(reply, sizeof(reply),
-          "snapshot ready: %u 1m bars; sweep N=%u threads=%u"
-          " score=%s top=%u",
-          snap->bars_loaded_1m, sweep_plan.total_iters,
-          sweep_plan.workers,
-          wm_bt_sweep_score_name(sweep_plan.score), sweep_plan.top_k);
-    cmd_reply(ctx, reply);
-
-    sweep_results = mem_alloc("whenmoon.backtest", "sweep_results",
-        sizeof(*sweep_results) * (size_t)sweep_plan.total_iters);
-
-    if(sweep_results == NULL)
-    {
-      cmd_reply(ctx, "out of memory allocating sweep result table");
+          "walk-forward error: %s",
+          err[0] != '\0' ? err : "(unknown)");
+      cmd_reply(ctx, reply);
       wm_backtest_snapshot_free(snap);
       return;
     }
 
+    sweep_mode.mode = WM_BT_MODE_WALK_FORWARD;
+  }
+  else if(have_oos)
+  {
     err[0] = '\0';
 
-    clock_gettime(CLOCK_MONOTONIC, &t0);
-
-    if(wm_bt_sweep_run(st, snap, name_tok, market_id, &sweep_plan,
-           &sweep_mode, &params, sweep_results,
+    if(wm_bt_oos_split_range(&oos_spec,
+           snap->range_start_ms, snap->range_end_ms,
+           &sweep_mode.oos_head, &sweep_mode.oos_tail,
            err, sizeof(err)) != SUCCESS)
     {
       snprintf(reply, sizeof(reply),
-          "sweep run failed: %s",
-          err[0] != '\0' ? err : "unknown");
+          "oos-tail error: %s",
+          err[0] != '\0' ? err : "(unknown)");
       cmd_reply(ctx, reply);
-      mem_free(sweep_results);
       wm_backtest_snapshot_free(snap);
       return;
     }
 
-    clock_gettime(CLOCK_MONOTONIC, &t1);
+    sweep_mode.mode = WM_BT_MODE_OOS;
+  }
 
-    wallclock_ms = (uint64_t)((int64_t)(t1.tv_sec - t0.tv_sec) * 1000
-                 + (int64_t)(t1.tv_nsec - t0.tv_nsec) / 1000000);
+  err[0] = '\0';
 
-    for(i = 0; i < sweep_plan.total_iters; i++)
-      if(sweep_results[i].ok)
-        n_ok++;
-
+  if(wm_bt_report_path_resolve(report_root, sizeof(report_root),
+         err, sizeof(err)) != SUCCESS)
+  {
     snprintf(reply, sizeof(reply),
-        "%s complete: %u/%u ok in %" PRIu64 " ms (%.1f iter/s)",
-        mode_label,
-        n_ok, sweep_plan.total_iters, wallclock_ms,
-        wallclock_ms > 0
-            ? (double)sweep_plan.total_iters * 1000.0 / (double)wallclock_ms
-            : 0.0);
+        "report path: %s", err[0] != '\0' ? err : "(unknown)");
     cmd_reply(ctx, reply);
+    wm_backtest_snapshot_free(snap);
+    return;
+  }
 
-    if(sweep_mode.mode == WM_BT_MODE_OOS && n_ok > 0)
-    {
-      err[0] = '\0';
+  wm_bt_sweep_id_generate(name_tok, snap->source_market_id,
+      sweep_id, sizeof(sweep_id));
 
-      if(wm_bt_sweep_run_oos_validation(st, snap, name_tok, market_id,
-             &sweep_plan, &sweep_mode.oos_tail, &params,
-             sweep_results, err, sizeof(err)) != SUCCESS)
-      {
-        snprintf(reply, sizeof(reply),
-            "oos validation: %s",
-            err[0] != '\0' ? err : "(no eligible top-K)");
-        cmd_reply(ctx, reply);
-      }
-      else
-        cmd_reply(ctx, "oos validation: top-K patched with oos columns");
-    }
+  err[0] = '\0';
 
-    wm_bt_sweep_render_topk(ctx, &sweep_plan, &sweep_mode, sweep_results,
-        sweep_plan.total_iters);
+  if(wm_bt_sweep_dir_create(report_root, sweep_id,
+         sweep_dir, sizeof(sweep_dir), err, sizeof(err)) != SUCCESS)
+  {
+    snprintf(reply, sizeof(reply),
+        "sweep dir: %s", err[0] != '\0' ? err : "(unknown)");
+    cmd_reply(ctx, reply);
+    wm_backtest_snapshot_free(snap);
+    return;
+  }
 
+  sweep_results = mem_alloc("whenmoon.backtest", "sweep_results",
+      sizeof(*sweep_results) * (size_t)sweep_plan.total_iters);
+
+  if(sweep_results == NULL)
+  {
+    cmd_reply(ctx, "out of memory allocating sweep result table");
+    wm_backtest_snapshot_free(snap);
+    return;
+  }
+
+  err[0] = '\0';
+
+  if(wm_bt_iter_open(&writer, sweep_dir, err, sizeof(err)) != SUCCESS)
+  {
+    snprintf(reply, sizeof(reply),
+        "iterations.jsonl: %s",
+        err[0] != '\0' ? err : "(unknown)");
+    cmd_reply(ctx, reply);
     mem_free(sweep_results);
     wm_backtest_snapshot_free(snap);
     return;
   }
 
+  writer_open = true;
+
   snprintf(reply, sizeof(reply),
-      "snapshot ready: %u 1m bars, running iteration...",
-      snap->bars_loaded_1m);
+      "mmap'd %u 1m bars from %s [%s..%s];"
+      " mode=%s N=%u threads=%u rank_by=%s top_n=%u dir=%s",
+      snap->bars_loaded_1m, snap->source_market_id,
+      snap->range_start, snap->range_end,
+      sweep_mode.mode == WM_BT_MODE_WALK_FORWARD ? "walk" :
+      sweep_mode.mode == WM_BT_MODE_OOS          ? "oos"  : "full",
+      sweep_plan.total_iters, sweep_plan.workers,
+      wm_bt_sweep_score_name(sweep_plan.score), sweep_plan.top_k,
+      sweep_id);
   cmd_reply(ctx, reply);
+
+  // Pre-run manifest write — fixed metadata before workers start so a
+  // crash mid-sweep still leaves an audit trail. Post-run rewrite
+  // adds wallclock_ms + ok_count + fail_count.
+  err[0] = '\0';
+
+  if(wm_bt_manifest_write(sweep_dir, sweep_id, path_tok, snap,
+         name_tok, &sweep_plan, &sweep_mode, &params,
+         0, 0, 0, err, sizeof(err)) != SUCCESS)
+  {
+    snprintf(reply, sizeof(reply),
+        "warn: manifest pre-write failed: %s",
+        err[0] != '\0' ? err : "(unknown)");
+    cmd_reply(ctx, reply);
+  }
+
+  clock_gettime(CLOCK_MONOTONIC, &t0);
 
   err[0] = '\0';
 
-  if(wm_backtest_run_iteration(st, snap, name_tok, &params,
-         &result, err, sizeof(err)) != SUCCESS)
+  // market_id_db is unused since WM-BT-1 ripped DB persistence — pass
+  // 0 verbatim until WM-BT-7+ drops it from the wm_bt_sweep_run ABI.
+  if(wm_bt_sweep_run(st, snap, name_tok, /*market_id_db=*/0,
+         &sweep_plan, &sweep_mode, &params, sweep_results,
+         err, sizeof(err)) != SUCCESS)
   {
-    snprintf(reply, sizeof(reply), "iteration failed: %s",
+    snprintf(reply, sizeof(reply),
+        "sweep run failed: %s",
         err[0] != '\0' ? err : "unknown");
     cmd_reply(ctx, reply);
+    wm_bt_iter_close(&writer);
+    mem_free(sweep_results);
     wm_backtest_snapshot_free(snap);
     return;
   }
 
-  wm_backtest_snapshot_free(snap);
+  clock_gettime(CLOCK_MONOTONIC, &t1);
 
+  wallclock_ms = (uint64_t)((int64_t)(t1.tv_sec - t0.tv_sec) * 1000
+               + (int64_t)(t1.tv_nsec - t0.tv_nsec) / 1000000);
+
+  for(i = 0; i < sweep_plan.total_iters; i++)
   {
-    const wm_market_stats_t *st_paper =
-        &result.trade.stats[WM_MARKET_MODE_PAPER];
-    double                    position_value;
-    double                    equity;
+    if(sweep_results[i].ok)
+      n_ok++;
+    else
+      n_fail++;
+  }
 
-    position_value = (result.trade.position.side == WM_MARKET_POS_LONG)
-        ? result.trade.position.qty * result.trade.last_mark_px
-        : 0.0;
-    equity         = st_paper->cash + position_value;
+  if(sweep_mode.mode == WM_BT_MODE_OOS && n_ok > 0)
+  {
+    err[0] = '\0';
 
+    if(wm_bt_sweep_run_oos_validation(st, snap, name_tok, /*market_id_db=*/0,
+           &sweep_plan, &sweep_mode.oos_tail, &params,
+           sweep_results, err, sizeof(err)) != SUCCESS)
+    {
+      snprintf(reply, sizeof(reply),
+          "oos validation: %s",
+          err[0] != '\0' ? err : "(no eligible top-K)");
+      cmd_reply(ctx, reply);
+    }
+    else
+      cmd_reply(ctx, "oos validation: top-K patched with oos columns");
+  }
+
+  // Main-thread JSONL flush — single-writer-by-construction. Workers
+  // never touched the writer; sweep_results is now stable.
+  for(i = 0; i < sweep_plan.total_iters; i++)
+    (void)wm_bt_iter_append(&writer, &sweep_plan, i, &sweep_results[i]);
+
+  wm_bt_iter_close(&writer);
+  writer_open = false;
+
+  // Post-run manifest rewrite with final stats. Atomic via tmp+rename
+  // so a partial pre-write is never visible.
+  err[0] = '\0';
+
+  if(wm_bt_manifest_write(sweep_dir, sweep_id, path_tok, snap,
+         name_tok, &sweep_plan, &sweep_mode, &params,
+         wallclock_ms, n_ok, n_fail, err, sizeof(err)) != SUCCESS)
+  {
     snprintf(reply, sizeof(reply),
-        "iteration complete: bars=%u fills=%" PRIu64
-        " realized=%+.4f equity=%.2f wallclock_ms=%" PRIu64
-        " (disk persistence lands in WM-BT-6)",
-        result.bars_replayed, st_paper->lifetime_fills_count,
-        st_paper->realized_pnl_lifetime,
-        equity, result.wallclock_ms);
+        "warn: manifest post-write failed: %s",
+        err[0] != '\0' ? err : "(unknown)");
     cmd_reply(ctx, reply);
   }
+
+  (void)wm_bt_top_n_placeholder_write(sweep_dir, &sweep_plan);
+
+  snprintf(reply, sizeof(reply),
+      "complete: %u/%u ok, %u failed in %" PRIu64 " ms"
+      " (%.1f iter/s); jsonl=%u rows -> %s/",
+      n_ok, sweep_plan.total_iters, n_fail, wallclock_ms,
+      wallclock_ms > 0
+          ? (double)sweep_plan.total_iters * 1000.0
+              / (double)wallclock_ms
+          : 0.0,
+      sweep_plan.total_iters, sweep_dir);
+  cmd_reply(ctx, reply);
+
+  wm_bt_sweep_render_topk(ctx, &sweep_plan, &sweep_mode, sweep_results,
+      sweep_plan.total_iters);
+
+  if(writer_open)
+    wm_bt_iter_close(&writer);
+
+  mem_free(sweep_results);
+  wm_backtest_snapshot_free(snap);
 }
 
 // ----------------------------------------------------------------------- //
@@ -1167,54 +1082,56 @@ wm_backtest_register_verbs(void)
     return(FAIL);
 
   if(cmd_register("whenmoon", "run",
-        "whenmoon backtest run <market_id> <strategy_name>"
-        " <MM/dd/yyyy> <MM/dd/yyyy>"
+        "whenmoon backtest run <path.wm> <strategy>"
+        " [<name>=<v|[v,...]|lo:step:hi>] (repeatable)"
         " [--fee-bps N] [--slip-bps N] [--size-frac F] [--cash N]"
-        " [--sweep <param>=<v1,v2,...>|<[v1,v2,...]>|<lo:step:hi>]"
-        " (repeatable)"
-        " [--config <path.json>]"
-        " [--threads N] [--score realized|sharpe|sortino|equity|pf]"
-        " [--top K]"
+        " [--config <path.json>] [--threads N]"
+        " [--rank-by realized|sharpe|sortino|equity|pf]"
+        " [--top-n K]"
         " [--walk-forward train=Td:test=Md:step=Sd]"
         " [--oos-tail PCT]",
-        "Run a single backtest, a parameter sweep, walk-forward, or"
-        " an OOS-tail validation.",
-        "Builds an isolated market snapshot from wm_candles_<id>"
-        " over the given range and runs the strategy through a paper"
-        " trade book in PAPER mode. With one or more --sweep axes,"
-        " expands the cartesian product of values and dispatches each"
-        " iteration through a worker pool. --threads defaults to"
-        " max(1, nproc - 2) so the host keeps two cores free,"
-        " further capped by the KV"
+        "Run a backtest against a compiled .wm snapshot — single"
+        " iteration, parameter sweep, walk-forward, or OOS-tail"
+        " validation.",
+        "mmap's the .wm file (compiled via /whenmoon backtest compile)"
+        " and walks the strategy through a paper trade book. Range +"
+        " corpus come from the .wm header; the verb no longer takes"
+        " dates. Positional `name=value` tokens are sweep axes routed"
+        " through the same parser as previous `--sweep` flags;"
+        " accepted value forms are bare list `v1,v2,v3`, bracketed"
+        " list `[v1,v2,v3]`, or range `lo:step:hi`. Zero axes = one"
+        " iteration; N axes = cartesian-product sweep.\n"
+        "--threads defaults to max(1, nproc - 2) so the host keeps"
+        " two cores free, further capped by the KV"
         " plugin.whenmoon.backtest.max_threads (0 = no cap) and"
         " clamped to [1, 64]. Workers run at nice 19 (lowest"
         " priority) so a long sweep never starves IRC, marketwatch,"
         " or the live engine. Each iteration runs on a private"
         " trade-book registry so parallel workers do not contend on"
         " a global mutex.\n"
-        "--sweep accepts three value forms: bare list 'v1,v2,v3',"
-        " bracketed list '[v1,v2,v3]', or range 'lo:step:hi'.\n"
         "--config <path.json> loads a sweep matrix from a JSON file"
         " shaped {\"params\": {\"name\": <scalar|list|{start,step,end}>,"
-        " ...}}. Inline --sweep entries override matching axes loaded"
-        " from --config, regardless of argv order.\n"
-        "--score selects the ranking metric (default realized).\n"
-        "--top selects the top-K rows shown after the run (default 20"
-        " when sweeping, 1 otherwise).\n"
+        " ...}}. Inline `name=value` axes override matching entries"
+        " loaded from --config, regardless of argv order.\n"
+        "--rank-by selects the ranking metric (default realized).\n"
+        "--top-n caps the number of top rows shown after the run"
+        " (default 20 when sweeping, 1 otherwise) and the number of"
+        " rows the OOS post-pass validates.\n"
         "--walk-forward expands each param vector into N test windows"
         " (train days warm the strategy state but only test windows"
         " accumulate fills); the recorded score is the cumulative"
         " test-window result.\n"
         "--oos-tail PCT reserves the last PCT%% of the range as out-of"
         "-sample; the sweep optimises on the head, then the post-pass"
-        " runs the top-K on the tail and stamps the OOS columns on"
-        " each top-K result row. PCT clamped to [1, 50].\n"
+        " runs the top-N on the tail and stamps the OOS columns on"
+        " each row. PCT clamped to [1, 50].\n"
         "--walk-forward and --oos-tail are mutually exclusive.\n"
-        "WM-BT-1 retired DB-backed persistence; disk-based persistence"
-        " lands in WM-BT-6. --top only controls render volume."
-        " Pre-flight gap check fails fast with the canonical"
-        " /whenmoon download <market> invocation when 1m coverage"
-        " has gaps.",
+        "Each invocation writes a sweep directory under"
+        " plugin.whenmoon.backtest.report_path (defaulting to"
+        " $HOME/.local/share/botmanager/backtests/) containing"
+        " manifest.json, iterations.jsonl, top-N.txt (BT-7"
+        " placeholder), and an empty charts/ subdir (filled by"
+        " BT-8 when plugin.whenmoon.backtest.charts_enabled=true).",
         USERNS_GROUP_ADMIN, 100, CMD_SCOPE_ANY, METHOD_T_ANY,
         wm_bt_cmd_run, NULL, "whenmoon/backtest", NULL,
         NULL, 0, NULL, NULL) != SUCCESS)

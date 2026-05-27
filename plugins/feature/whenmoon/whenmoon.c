@@ -565,6 +565,48 @@ whenmoon_init(void)
     goto fail;
   }
 
+  // WM-BT-6: on-disk artifact root. Empty (the registered default)
+  // resolves to $HOME/.local/share/botmanager/backtests at run time.
+  // Set explicitly to override (e.g. a project-scoped corpus dir).
+  if(kv_register("plugin.whenmoon.backtest.report_path",
+         KV_STR, "", NULL, NULL,
+         "Root directory under which each /whenmoon backtest run"
+         " creates a sweep-id subdirectory (manifest.json +"
+         " iterations.jsonl + top-N.txt + charts/). Empty resolves"
+         " to $HOME/.local/share/botmanager/backtests at run time."
+         ) != SUCCESS)
+  {
+    clam(CLAM_INFO, WHENMOON_CTX,
+        "kv_register plugin.whenmoon.backtest.report_path failed");
+    goto fail;
+  }
+
+  // WM-BT-6: chart generation toggle (consumed by WM-BT-8). Registered
+  // alongside the other backtest knobs so a single freshstart picks up
+  // the entire backtest KV surface.
+  if(kv_register("plugin.whenmoon.backtest.charts_enabled",
+         KV_BOOL, "false", NULL, NULL,
+         "Emit Lightweight Charts HTML for the top-N iterations"
+         " (WM-BT-8). Currently parked at false; the runtime"
+         " surface is wired but the renderer is not yet shipped."
+         ) != SUCCESS)
+  {
+    clam(CLAM_INFO, WHENMOON_CTX,
+        "kv_register plugin.whenmoon.backtest.charts_enabled failed");
+    goto fail;
+  }
+
+  if(kv_register("plugin.whenmoon.backtest.charts_top_n",
+         KV_UINT64, "10", NULL, NULL,
+         "How many top-ranked iterations get charts when"
+         " charts_enabled=true (WM-BT-8). Clamped to the actual"
+         " top_n at run time.") != SUCCESS)
+  {
+    clam(CLAM_INFO, WHENMOON_CTX,
+        "kv_register plugin.whenmoon.backtest.charts_top_n failed");
+    goto fail;
+  }
+
   // WM-LT-6: drop any per-iteration KV slots left over from a prior
   // crashed sweep so kv_register on a freshly-allocated synthetic id
   // never trips on a stale row. Safe at boot — no other thread is

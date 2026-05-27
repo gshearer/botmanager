@@ -39,6 +39,7 @@ whenmoon_plugin = shared_library('whenmoon',
   'backtest_cmds.c',
   'sweep.c',
   'wm_bt_file.c',
+  'wm_bt_report.c',
   candle_upsample_sql_h,
   include_directories : [
     inc_include,
