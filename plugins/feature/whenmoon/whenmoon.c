@@ -547,6 +547,20 @@ whenmoon_init(void)
   // present (the iteration finds no PLUGIN_STRATEGY records).
   wm_strategy_registry_scan(st);
 
+  // WM-BT-5: cap for the sweep default thread count. 0 = no cap; the
+  // sweep helper then uses sysconf raw, still bounded by
+  // [WM_BT_WORKERS_MIN, WM_BT_WORKERS_MAX].
+  if(kv_register("plugin.whenmoon.backtest.max_threads",
+         KV_UINT64, "64", NULL, NULL,
+         "Upper bound on the sweep default worker thread count"
+         " (sysconf-derived). 0 = use sysconf raw; clamped to the"
+         " sweep pool's own [1, 64] bounds regardless.") != SUCCESS)
+  {
+    clam(CLAM_INFO, WHENMOON_CTX,
+        "kv_register plugin.whenmoon.backtest.max_threads failed");
+    goto fail;
+  }
+
   // WM-LT-6: drop any per-iteration KV slots left over from a prior
   // crashed sweep so kv_register on a freshly-allocated synthetic id
   // never trips on a stale row. Safe at boot — no other thread is

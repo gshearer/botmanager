@@ -272,7 +272,7 @@ wm_bt_cmd_run(const cmd_ctx_t *ctx)
         " [--sweep <param>=<v1,v2,...>|<[v1,v2,...]>|<lo:step:hi>]"
         " (repeatable)"
         " [--config <path.json>]"
-        " [--workers N] [--score realized|sharpe|sortino|equity|pf]"
+        " [--threads N] [--score realized|sharpe|sortino|equity|pf]"
         " [--top K]"
         " [--walk-forward train=Td:test=Md:step=Sd]"
         " [--oos-tail PCT]");
@@ -348,7 +348,7 @@ wm_bt_cmd_run(const cmd_ctx_t *ctx)
   }
 
   // Parse optional --flag value pairs. The economic knobs apply to
-  // every iteration; --sweep / --workers / --score / --top control the
+  // every iteration; --sweep / --threads / --score / --top control the
   // sweep planner. --walk-forward / --oos-tail set window scope.
   // --config <file> loads a JSON sweep matrix; inline --sweep entries
   // override its axes via the replace-on-collision dedup in
@@ -452,7 +452,7 @@ wm_bt_cmd_run(const cmd_ctx_t *ctx)
 
       have_sweep = true;
     }
-    else if(strcmp(flag_tok, "--workers") == 0)
+    else if(strcmp(flag_tok, "--threads") == 0)
     {
       char *end = NULL;
       long  w;
@@ -462,7 +462,7 @@ wm_bt_cmd_run(const cmd_ctx_t *ctx)
 
       if(end == val_tok || errno != 0 || w < 0)
       {
-        cmd_reply(ctx, "bad --workers value");
+        cmd_reply(ctx, "bad --threads value");
         return;
       }
 
@@ -526,7 +526,7 @@ wm_bt_cmd_run(const cmd_ctx_t *ctx)
     {
       snprintf(reply, sizeof(reply),
           "unknown flag '%s' (expected --fee-bps/--slip-bps/"
-          "--size-frac/--cash/--sweep/--config/--workers/--score/"
+          "--size-frac/--cash/--sweep/--config/--threads/--score/"
           "--top/--walk-forward/--oos-tail)",
           flag_tok);
       cmd_reply(ctx, reply);
@@ -658,7 +658,7 @@ wm_bt_cmd_run(const cmd_ctx_t *ctx)
     if(sweep_mode.mode == WM_BT_MODE_WALK_FORWARD)
       snprintf(reply, sizeof(reply),
           "snapshot ready: %u 1m bars; walk-forward N=%u windows=%u"
-          " workers=%u score=%s top=%u",
+          " threads=%u score=%s top=%u",
           snap->bars_loaded_1m, sweep_plan.total_iters,
           sweep_mode.walk.n,
           sweep_plan.workers,
@@ -666,13 +666,13 @@ wm_bt_cmd_run(const cmd_ctx_t *ctx)
     else if(sweep_mode.mode == WM_BT_MODE_OOS)
       snprintf(reply, sizeof(reply),
           "snapshot ready: %u 1m bars; oos head N=%u (oos_tail=%u%%)"
-          " workers=%u score=%s top=%u",
+          " threads=%u score=%s top=%u",
           snap->bars_loaded_1m, sweep_plan.total_iters,
           oos_spec.pct, sweep_plan.workers,
           wm_bt_sweep_score_name(sweep_plan.score), sweep_plan.top_k);
     else
       snprintf(reply, sizeof(reply),
-          "snapshot ready: %u 1m bars; sweep N=%u workers=%u"
+          "snapshot ready: %u 1m bars; sweep N=%u threads=%u"
           " score=%s top=%u",
           snap->bars_loaded_1m, sweep_plan.total_iters,
           sweep_plan.workers,
@@ -1173,7 +1173,7 @@ wm_backtest_register_verbs(void)
         " [--sweep <param>=<v1,v2,...>|<[v1,v2,...]>|<lo:step:hi>]"
         " (repeatable)"
         " [--config <path.json>]"
-        " [--workers N] [--score realized|sharpe|sortino|equity|pf]"
+        " [--threads N] [--score realized|sharpe|sortino|equity|pf]"
         " [--top K]"
         " [--walk-forward train=Td:test=Md:step=Sd]"
         " [--oos-tail PCT]",
@@ -1183,9 +1183,12 @@ wm_backtest_register_verbs(void)
         " over the given range and runs the strategy through a paper"
         " trade book in PAPER mode. With one or more --sweep axes,"
         " expands the cartesian product of values and dispatches each"
-        " iteration through a worker pool (--workers, default 1; max"
-        " 64). Each iteration runs on a private trade-book registry so"
-        " parallel workers do not contend on a global mutex.\n"
+        " iteration through a worker pool. --threads defaults to"
+        " sysconf(_SC_NPROCESSORS_ONLN), capped by the KV"
+        " plugin.whenmoon.backtest.max_threads (0 = no cap) and"
+        " clamped to [1, 64]. Each iteration runs on a private"
+        " trade-book registry so parallel workers do not contend on"
+        " a global mutex.\n"
         "--sweep accepts three value forms: bare list 'v1,v2,v3',"
         " bracketed list '[v1,v2,v3]', or range 'lo:step:hi'.\n"
         "--config <path.json> loads a sweep matrix from a JSON file"

@@ -50,12 +50,14 @@
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
+#include <unistd.h>
 
 #include <json-c/json.h>
 #include <json-c/json_util.h>
 
 #define WM_SWEEP_CTX                "whenmoon.sweep"
 #define WM_BT_KV_PREFIX             "plugin.whenmoon.market.bt:"
+#define WM_BT_KV_MAX_THREADS        "plugin.whenmoon.backtest.max_threads"
 #define WM_BT_RELOAD_WAIT_LOG_SEC   5
 #define WM_BT_RESULT_NOSCORE        (-DBL_MAX)
 
@@ -182,6 +184,34 @@ wm_bt_sweep_score_value(const wm_market_session_snapshot_t *snap,
 // Plan: init / axis_add / finalize / iter_indices                         //
 // ----------------------------------------------------------------------- //
 
+// Default thread count for new sweep plans (WM-BT-5). Composition order:
+// `sysconf(_SC_NPROCESSORS_ONLN)` for the raw CPU count, then cap by the
+// `plugin.whenmoon.backtest.max_threads` KV (0 = no cap, use sysconf
+// raw), then clamp to [WM_BT_WORKERS_MIN, WM_BT_WORKERS_MAX].
+static uint32_t
+wm_bt_default_thread_count(void)
+{
+  long     n_cpu = sysconf(_SC_NPROCESSORS_ONLN);
+  int64_t  cap   = kv_get_int(WM_BT_KV_MAX_THREADS);
+  uint32_t w;
+
+  if(n_cpu <= 0)
+    n_cpu = 1;
+
+  w = (uint32_t)n_cpu;
+
+  if(cap > 0 && (int64_t)w > cap)
+    w = (uint32_t)cap;
+
+  if(w < WM_BT_WORKERS_MIN)
+    w = WM_BT_WORKERS_MIN;
+
+  if(w > WM_BT_WORKERS_MAX)
+    w = WM_BT_WORKERS_MAX;
+
+  return(w);
+}
+
 void
 wm_bt_sweep_plan_init(wm_bt_sweep_plan_t *plan)
 {
@@ -194,7 +224,7 @@ wm_bt_sweep_plan_init(wm_bt_sweep_plan_t *plan)
   plan->total_iters = 1;
   plan->score       = WM_BT_SCORE_REALIZED;
   plan->top_k       = 1;
-  plan->workers     = 1;
+  plan->workers     = wm_bt_default_thread_count();
 }
 
 static const wm_strategy_param_t *
