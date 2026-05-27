@@ -280,8 +280,7 @@ whenmoon_show_root_cb(const cmd_ctx_t *ctx)
 {
   cmd_reply(ctx,
       "usage: /show whenmoon"
-      " <markets|balances|indicators|download|strategy|exchange"
-      "|market|backtest>"
+      " <markets|balances|indicators|download|strategy|exchange|market>"
       " ... (download has subverbs: status, candles)");
 }
 

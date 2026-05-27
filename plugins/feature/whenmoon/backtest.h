@@ -124,8 +124,8 @@ typedef struct wm_backtest_snapshot
   char                source_market_id[WM_MARKET_ID_STR_SZ];
 
   // Range covered by the warmup, post-pre-flight. Postgres canonical
-  // strings ("YYYY-MM-DD HH:MM:SS+00") so the persistence path can
-  // hand them straight back to the wm_backtest_run insert.
+  // strings ("YYYY-MM-DD HH:MM:SS+00") preserved for downstream
+  // renderers + the upcoming WM-BT-2 .wm header.
   char                range_start[40];
   char                range_end[40];
 
@@ -154,7 +154,10 @@ typedef struct wm_backtest_params
 
 typedef struct wm_backtest_result
 {
-  int64_t                       run_id_db;        // wm_backtest_run.run_id (post-persist)
+  // Iteration index assigned by the sweep planner (1-based). Persisted
+  // run_id semantics retired in WM-BT-1; disk-based persistence lands
+  // in WM-BT-6.
+  int64_t                       run_id_db;
   uint32_t                      bars_replayed;
   uint64_t                      wallclock_ms;
   wm_market_session_snapshot_t  trade;            // final synth-market snapshot
@@ -211,9 +214,7 @@ void wm_backtest_alloc_synthetic_id(char *out, size_t cap);
 // name, allocates a fresh wm_strategy_ctx_t, calls init / on_bar (per
 // snapshot bar in chronological order across every grain the strategy
 // subscribes to) / finalize, drives the trade engine through a
-// backtest-private book, and snapshots the result. Persists a
-// wm_backtest_run row on success and writes the assigned run_id into
-// out->run_id_db.
+// backtest-private book, and snapshots the result.
 //
 // Returns SUCCESS on a completed iteration; FAIL on setup or run
 // errors. err (when non-NULL) is populated on FAIL.
@@ -252,64 +253,6 @@ bool wm_backtest_run_iteration_with_id(struct whenmoon_state *st,
     const wm_bt_window_t *windows, uint32_t n_windows,
     wm_backtest_result_t *out,
     char *err, size_t err_cap);
-
-// ----------------------------------------------------------------------- //
-// Persistence                                                             //
-// ----------------------------------------------------------------------- //
-
-// One row of wm_backtest_run, denormalised for cheap rendering.
-typedef struct wm_backtest_record
-{
-  int64_t  run_id;
-  int32_t  market_id;
-  char     strategy_name[WM_STRATEGY_NAME_SZ];
-  char     range_start[40];
-  char     range_end[40];
-  int64_t  wallclock_ms;
-  uint32_t bars_replayed;
-  uint32_t n_trades;
-  double   realized_pnl;
-  double   max_drawdown;
-  double   sharpe;
-  double   sortino;
-  double   final_equity;
-  char     window_kind[16];     // 'full' | 'walk' | 'oos'
-  uint32_t n_windows;
-  bool     have_oos;            // false until wm_backtest_persist_oos_update
-  double   oos_score;
-  double   oos_realized;
-  uint32_t oos_n_trades;
-  char     created_at[40];
-} wm_backtest_record_t;
-
-// Insert one wm_backtest_run row. params_json is optional (pass NULL
-// to insert SQL NULL); metrics_json is required. window_kind +
-// n_windows are taken from `rec`; OOS columns are inserted as NULL
-// (top-K rows get them populated later via
-// wm_backtest_persist_oos_update). On SUCCESS, *out_run_id is
-// populated with the assigned BIGSERIAL.
-bool wm_backtest_persist_run(const wm_backtest_record_t *rec,
-    const char *params_json, const char *metrics_json,
-    int64_t *out_run_id);
-
-// Patch the OOS columns + flip window_kind to 'oos' on an existing
-// wm_backtest_run row. Used by the OOS post-pass to record the
-// out-of-sample validation score for a top-K head-iteration row.
-// Returns SUCCESS on a one-row update; FAIL otherwise.
-bool wm_backtest_persist_oos_update(int64_t run_id,
-    double oos_score, double oos_realized, uint32_t oos_n_trades);
-
-// Load up to `cap` recent runs (newest first). Returns the count
-// written. 0 on no rows or query error.
-uint32_t wm_backtest_recent_runs(wm_backtest_record_t *out, uint32_t cap);
-
-// Lookup one run by id. SUCCESS on hit, FAIL on miss/error. The
-// out_metrics_json / out_params_json pointers (when non-NULL on call)
-// are populated with mem_alloc'd copies of the JSONB columns; caller
-// frees via mem_free. Pass NULL to skip; pass non-NULL for the JSON
-// detail view.
-bool wm_backtest_lookup_run(int64_t run_id, wm_backtest_record_t *out,
-    char **out_metrics_json, char **out_params_json);
 
 // ----------------------------------------------------------------------- //
 // Verb registration                                                       //

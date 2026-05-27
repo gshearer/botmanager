@@ -127,7 +127,9 @@ typedef struct
   uint32_t              bars_replayed;
   uint32_t              n_windows;          // 1 for full/oos head
   double                       score;
-  int64_t                      run_id_db;          // 0 if persist failed
+  // 1-based iteration index. WM-BT-1 retired the wm_backtest_run
+  // BIGSERIAL semantic; disk-based persistence lands in WM-BT-6.
+  int64_t                      run_id_db;
   bool                         ok;                 // false on iteration failure
   char                         err[160];           // populated when !ok
   wm_market_session_snapshot_t trade;
@@ -172,8 +174,8 @@ void wm_bt_sweep_cleanup_stale_kv(void);
 //     back-to-back through one trade book per param vector.
 //   * OOS: head sweep iterates over `oos_head` only; after the sweep
 //     finishes, the caller runs `wm_bt_sweep_run_oos_validation` to
-//     re-iterate the top-K rows against `oos_tail` and patch
-//     wm_backtest_run with the OOS columns.
+//     re-iterate the top-K rows against `oos_tail` and stamp the
+//     OOS columns on each top-K result row in memory.
 
 typedef struct
 {
@@ -189,10 +191,10 @@ typedef struct
 
 // Run an entire sweep. Spawns plan->workers worker threads; each
 // worker pulls jobs off a FIFO queue, runs one iteration with a fresh
-// private trade registry, persists the row to wm_backtest_run, and
-// records its result into out_results[iter]. Blocks until every worker
-// finishes. Returns SUCCESS when the orchestration completes; per-
-// iteration failures are recorded in result.ok / .err.
+// private trade registry, and records its result into
+// out_results[iter]. Blocks until every worker finishes. Returns
+// SUCCESS when the orchestration completes; per-iteration failures
+// are recorded in result.ok / .err.
 //
 // `mode` carries the run-mode + window scope. NULL = legacy WM-LT-6
 // behaviour (FULL mode, no windows).
@@ -210,10 +212,9 @@ bool wm_bt_sweep_run(struct whenmoon_state *st,
 
 // OOS post-pass. Called after wm_bt_sweep_run completes in OOS mode.
 // Takes the same plan + results table, picks the top-K by score,
-// re-runs each one against `oos_tail`, and patches wm_backtest_run
-// with the OOS columns via wm_backtest_persist_oos_update. Stamps
-// each top-K result's `oos_*` fields in `results` so the renderer
-// can show them inline.
+// re-runs each one against `oos_tail`, and stamps the OOS columns
+// on each top-K result row in memory so the renderer can show them
+// inline.
 //
 // Returns SUCCESS if every top-K validation iteration completed; FAIL
 // (with err) if no top-K was eligible (e.g. all head iterations

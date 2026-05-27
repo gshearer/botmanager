@@ -84,44 +84,6 @@ static const char *const wm_dl_ddl_core[] = {
   "CREATE INDEX IF NOT EXISTS idx_wm_job_state"
   " ON wm_download_job(state, created)",
 
-  // Backtest run history (WM-LT-5 + WM-LT-7). One row per iteration
-  // (single-iteration, walk-forward param vector, or OOS head pass).
-  // params + metrics carry full JSONB blobs; surface-level columns
-  // are denormalised for cheap ranked listings via
-  // /show whenmoon backtest list.
-  //
-  // window_kind: 'full' = single iteration over the full range;
-  // 'walk' = one row per param vector across all walk-forward test
-  // windows (n_windows > 1); 'oos' = head iteration of an OOS run
-  // (oos_* columns are non-NULL for top-K rows that completed the
-  // out-of-sample validation pass).
-  "CREATE TABLE IF NOT EXISTS wm_backtest_run ("
-  " run_id        BIGSERIAL    PRIMARY KEY,"
-  " market_id     INT          NOT NULL,"
-  " strategy_name VARCHAR(64)  NOT NULL,"
-  " range_start   TIMESTAMPTZ  NOT NULL,"
-  " range_end     TIMESTAMPTZ  NOT NULL,"
-  " bars_replayed INT          NOT NULL,"
-  " n_trades      INT          NOT NULL,"
-  " realized_pnl  DOUBLE PRECISION NOT NULL,"
-  " final_equity  DOUBLE PRECISION NOT NULL,"
-  " max_drawdown  DOUBLE PRECISION NOT NULL,"
-  " sharpe        DOUBLE PRECISION NOT NULL,"
-  " sortino       DOUBLE PRECISION NOT NULL,"
-  " wallclock_ms  BIGINT       NOT NULL,"
-  " window_kind   VARCHAR(16)  NOT NULL DEFAULT 'full',"
-  " n_windows     INT          NOT NULL DEFAULT 1,"
-  " oos_score     DOUBLE PRECISION,"
-  " oos_realized  DOUBLE PRECISION,"
-  " oos_n_trades  INT,"
-  " params        JSONB,"
-  " metrics       JSONB        NOT NULL,"
-  " created_at    TIMESTAMPTZ  NOT NULL DEFAULT NOW()"
-  ")",
-
-  "CREATE INDEX IF NOT EXISTS idx_wm_backtest_run_market"
-  " ON wm_backtest_run(market_id, strategy_name, created_at DESC)",
-
   // Per-market session state (position + paper/real ledgers + fills
   // rings + pending ring + cached params). JSONB carries the composite
   // blobs so future field additions are forward-compatible without

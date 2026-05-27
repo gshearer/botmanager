@@ -751,136 +751,6 @@ wm_bt_sweep_cleanup_stale_kv(void)
 }
 
 // ----------------------------------------------------------------------- //
-// JSON serialisers (params / metrics) — used by the worker on persist     //
-// ----------------------------------------------------------------------- //
-
-// Forward declaration: defined inside the worker section because it
-// is also used by wm_bt_sweep_run_one + wm_bt_sweep_render_topk.
-static double
-wm_bt_synth_equity(const wm_market_session_snapshot_t *snap);
-
-static void
-wm_bt_sweep_render_params_json(const wm_bt_sweep_plan_t *plan,
-    const uint32_t *indices, char *out, size_t cap)
-{
-  size_t   off = 0;
-  uint32_t a;
-  int      n;
-
-  if(out == NULL || cap == 0)
-    return;
-
-  n = snprintf(out + off, cap - off, "{");
-  if(n < 0 || (size_t)n >= cap - off) { out[cap - 1] = '\0'; return; }
-  off += (size_t)n;
-
-  for(a = 0; a < plan->n_axes; a++)
-  {
-    const wm_bt_sweep_axis_t *axis = &plan->axes[a];
-    double                    v    = axis->values[indices[a]];
-
-    if(axis->type == WM_PARAM_DOUBLE)
-      n = snprintf(out + off, cap - off,
-          "%s\"%s\":%.10g", a == 0 ? "" : ",", axis->name, v);
-    else
-      n = snprintf(out + off, cap - off,
-          "%s\"%s\":%" PRId64,
-          a == 0 ? "" : ",", axis->name, (int64_t)llround(v));
-
-    if(n < 0 || (size_t)n >= cap - off)
-    {
-      out[cap - 1] = '\0';
-      return;
-    }
-
-    off += (size_t)n;
-  }
-
-  if(off + 1 < cap)
-  {
-    out[off]     = '}';
-    out[off + 1] = '\0';
-  }
-
-  else
-    out[cap - 1] = '\0';
-}
-
-// Render the per-iteration metrics JSON for the wm_backtest_run.metrics
-// JSONB column. WM-MK-6 restores the risk-adjusted fields on top of the
-// per-market session: counts derive from the per-mode stats accumulator,
-// Sharpe/Sortino come pre-computed on the snapshot, PF derives from
-// gross_profit / gross_loss.
-static void
-wm_bt_sweep_render_metrics_json(const wm_market_session_snapshot_t *snap,
-    char *out, size_t cap)
-{
-  const wm_market_stats_t *st;
-  double                   equity;
-  double                   win_rate;
-  double                   avg_win;
-  double                   avg_loss;
-  double                   profit_factor;
-  int                      n;
-
-  if(out == NULL || cap == 0 || snap == NULL)
-  {
-    if(out != NULL && cap > 0) out[0] = '\0';
-    return;
-  }
-
-  st            = &snap->stats[WM_MARKET_MODE_PAPER];
-  equity        = wm_bt_synth_equity(snap);
-  win_rate      = (st->n_trades > 0)
-      ? (double)st->n_wins / (double)st->n_trades
-      : 0.0;
-  avg_win       = (st->n_wins   > 0)
-      ? st->gross_profit /  (double)st->n_wins
-      : 0.0;
-  avg_loss      = (st->n_losses > 0)
-      ? st->gross_loss   / (double)st->n_losses
-      : 0.0;
-  profit_factor = wm_market_stats_profit_factor(st);
-
-  n = snprintf(out, cap,
-      "{"
-      "\"trades\":%u,"
-      "\"wins\":%u,"
-      "\"losses\":%u,"
-      "\"win_rate\":%.6f,"
-      "\"realized_pnl\":%.6f,"
-      "\"fees_paid\":%.6f,"
-      "\"profit_factor\":%.6f,"
-      "\"max_drawdown\":%.6f,"
-      "\"avg_win\":%.6f,"
-      "\"avg_loss\":%.6f,"
-      "\"sharpe\":%.6f,"
-      "\"sortino\":%.6f,"
-      "\"final_equity\":%.6f,"
-      "\"starting_cash\":%.6f,"
-      "\"final_cash\":%.6f"
-      "}",
-      st->n_trades,
-      st->n_wins,
-      st->n_losses,
-      win_rate,
-      st->realized_pnl_lifetime,
-      st->lifetime_fees,
-      profit_factor,
-      st->max_drawdown,
-      avg_win,
-      avg_loss,
-      snap->sharpe,
-      snap->sortino,
-      equity,
-      st->starting_cash,
-      st->cash);
-
-  if(n < 0 || (size_t)n >= cap)
-    out[cap - 1] = '\0';
-}
-
-// ----------------------------------------------------------------------- //
 // Worker pool                                                             //
 // ----------------------------------------------------------------------- //
 
@@ -893,7 +763,6 @@ typedef struct
   whenmoon_state_t           *st;
   wm_backtest_snapshot_t     *snap;
   const char                 *strategy_name;
-  int32_t                     market_id_db;
   const wm_bt_sweep_plan_t   *plan;
   const wm_bt_sweep_mode_t   *mode;       // NULL = legacy FULL
   const wm_backtest_params_t *base_params;
@@ -903,8 +772,8 @@ typedef struct
   const wm_bt_window_t       *iter_windows;
   uint32_t                    iter_n_windows;
 
-  // window_kind / n_windows per persisted row. The iteration's
-  // wallclock counts every iter-side window the worker ran.
+  // window_kind / n_windows per result row. The iteration's wallclock
+  // counts every iter-side window the worker ran.
   const char                 *window_kind;
   uint32_t                    n_windows_per_iter;
 
@@ -979,7 +848,11 @@ wm_bt_sweep_run_one(wm_bt_pool_t *pool, uint32_t iter,
     return;
   }
 
-  // Populate the row + persist.
+  // Populate the row. WM-BT-1 retired DB persistence; disk persistence
+  // lands in WM-BT-6. The run_id_db slot now carries the 1-based
+  // iteration index so the renderer's downstream consumers (top-K
+  // printer, list/show verbs in their post-BT-6 forms) keep a stable
+  // identifier without round-tripping through a missing DB.
   result->ok            = true;
   result->trade         = bt_result.trade;
   result->wallclock_ms  = bt_result.wallclock_ms;
@@ -987,47 +860,7 @@ wm_bt_sweep_run_one(wm_bt_pool_t *pool, uint32_t iter,
   result->n_windows     = pool->n_windows_per_iter;
   result->score         = wm_bt_sweep_score_value(&bt_result.trade,
       pool->plan->score);
-
-  {
-    const wm_market_stats_t *st_paper =
-        &bt_result.trade.stats[WM_MARKET_MODE_PAPER];
-    wm_backtest_record_t     rec;
-    char                     metrics_json[1024];
-    char                     params_json[512];
-    int64_t                  new_run_id = 0;
-
-    memset(&rec, 0, sizeof(rec));
-    rec.market_id     = pool->market_id_db;
-    snprintf(rec.strategy_name, sizeof(rec.strategy_name),
-        "%s", pool->strategy_name);
-    snprintf(rec.range_start, sizeof(rec.range_start),
-        "%s", pool->snap->range_start);
-    snprintf(rec.range_end,   sizeof(rec.range_end),
-        "%s", pool->snap->range_end);
-    rec.wallclock_ms  = (int64_t)bt_result.wallclock_ms;
-    rec.bars_replayed = bt_result.bars_replayed;
-    // WM-MK-6: n_trades is the closing-fill (round-trip) count,
-    // matching the legacy wm_pnl_acc_t semantic. Use lifetime_fills_count
-    // when total fill volume is wanted instead.
-    rec.n_trades      = st_paper->n_trades;
-    rec.realized_pnl  = st_paper->realized_pnl_lifetime;
-    rec.max_drawdown  = st_paper->max_drawdown;
-    rec.sharpe        = bt_result.trade.sharpe;
-    rec.sortino       = bt_result.trade.sortino;
-    rec.final_equity  = wm_bt_synth_equity(&bt_result.trade);
-    snprintf(rec.window_kind, sizeof(rec.window_kind),
-        "%s", pool->window_kind);
-    rec.n_windows     = pool->n_windows_per_iter;
-
-    wm_bt_sweep_render_params_json(pool->plan, indices,
-        params_json, sizeof(params_json));
-    wm_bt_sweep_render_metrics_json(&bt_result.trade,
-        metrics_json, sizeof(metrics_json));
-
-    if(wm_backtest_persist_run(&rec, params_json, metrics_json,
-           &new_run_id) == SUCCESS)
-      result->run_id_db = new_run_id;
-  }
+  result->run_id_db     = (int64_t)iter + 1;
 
   wm_bt_sweep_drop_iter_kv(synth_id);
 }
@@ -1092,12 +925,16 @@ wm_bt_sweep_run(whenmoon_state_t *st,
   wm_bt_sweep_active_inc();
   pthread_mutex_unlock(&g_bt_reload_lock);
 
+  // market_id_db was used by the DB-persistence path WM-BT-1 ripped.
+  // WM-BT-6 will drop the parameter from the public ABI; for now keep
+  // the call sites intact and silence the unused argument.
+  (void)market_id_db;
+
   memset(&pool, 0, sizeof(pool));
   atomic_init(&pool.next_iter, 0);
   pool.st            = st;
   pool.snap          = snap;
   pool.strategy_name = strategy_name;
-  pool.market_id_db  = market_id_db;
   pool.plan          = plan;
   pool.mode          = mode;
   pool.base_params   = base_params;
@@ -1369,8 +1206,8 @@ wm_bt_sweep_render_topk(const cmd_ctx_t *ctx,
 // ----------------------------------------------------------------------- //
 //
 // After the head sweep finishes, pick the top-K results (sorted by
-// score), run a single iteration on the OOS tail for each, and patch
-// the corresponding wm_backtest_run row with the OOS columns. The
+// score), run a single iteration on the OOS tail for each, and stamp
+// the OOS columns on the corresponding result row in memory. The
 // validation iteration uses the same param vector (same KV slot path
 // derived from a fresh synth_id) and the same private-registry
 // pattern as the head sweep — no contention with anything else.
@@ -1533,12 +1370,6 @@ wm_bt_sweep_run_oos_validation(whenmoon_state_t *st,
       results[src_iter].oos_n_trades =
           (uint32_t)st_paper->lifetime_fills_count;
     }
-
-    if(results[src_iter].run_id_db > 0)
-      wm_backtest_persist_oos_update(results[src_iter].run_id_db,
-          results[src_iter].oos_score,
-          results[src_iter].oos_realized,
-          results[src_iter].oos_n_trades);
 
     n_validated++;
   }

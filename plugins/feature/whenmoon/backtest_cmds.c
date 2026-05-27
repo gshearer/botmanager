@@ -5,13 +5,15 @@
 //                          <MM/dd/yyyy> <MM/dd/yyyy>
 //                          [--fee-bps N] [--slip-bps N]
 //                          [--size-frac F] [--cash N]
-//   /show whenmoon backtest [<run_id>|list]
 //
 // run executes a single iteration synchronously on the cmd worker
 // thread. The build + replay of one BTC-USD year is on the order of
 // a few seconds; cmd dispatch already runs off the main thread so
 // blocking the worker for that span is acceptable for WM-LT-5.
-// WM-LT-6 will move to a worker pool + async results.
+// WM-LT-6 will move to a worker pool + async results. WM-BT-1
+// retired the wm_backtest_run DB-persistence surface and its
+// `/show whenmoon backtest` reader verbs; disk-based persistence +
+// new list/show verbs land in WM-BT-6 / WM-BT-7.
 
 #define WHENMOON_INTERNAL
 #include "whenmoon.h"
@@ -19,12 +21,10 @@
 #include "dl_commands.h"
 #include "dl_schema.h"
 #include "market.h"
-#include "market_engine.h"
 #include "strategy.h"
 #include "sweep.h"
 
 #include "cmd.h"
-#include "colors.h"
 #include "common.h"
 #include "userns.h"
 
@@ -35,11 +35,6 @@
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
-
-// Default list view depth. The /show whenmoon backtest list command
-// renders the most-recent N rows; raise via WM_BT_LIST_DEFAULT below.
-#define WM_BT_LIST_DEFAULT  20
-#define WM_BT_LIST_MAX      256
 
 // ----------------------------------------------------------------------- //
 // Date helper                                                             //
@@ -75,151 +70,6 @@ wm_bt_parse_date(const char *in, char *out, size_t cap)
     return(FAIL);
 
   return(SUCCESS);
-}
-
-// ----------------------------------------------------------------------- //
-// JSON serialisers                                                        //
-// ----------------------------------------------------------------------- //
-
-// Render a wm_backtest_params_t to a static-buffer JSON object. Only
-// the `have_*` keys appear; an empty result emits "{}".
-static void
-wm_bt_params_to_json(const wm_backtest_params_t *p,
-    char *out, size_t cap)
-{
-  size_t off = 0;
-  bool   first = true;
-  int    n;
-
-  if(out == NULL || cap == 0)
-    return;
-
-  out[0] = '\0';
-
-  n = snprintf(out + off, cap - off, "{");
-  if(n < 0 || (size_t)n >= cap - off) return;
-  off += (size_t)n;
-
-  if(p != NULL && p->have_fee_bps)
-  {
-    n = snprintf(out + off, cap - off, "%s\"fee_bps\":%.10g",
-        first ? "" : ",", p->fee_bps);
-    if(n < 0 || (size_t)n >= cap - off) return;
-    off += (size_t)n; first = false;
-  }
-
-  if(p != NULL && p->have_slip_bps)
-  {
-    n = snprintf(out + off, cap - off, "%s\"slip_bps\":%.10g",
-        first ? "" : ",", p->slip_bps);
-    if(n < 0 || (size_t)n >= cap - off) return;
-    off += (size_t)n; first = false;
-  }
-
-  if(p != NULL && p->have_size_frac)
-  {
-    n = snprintf(out + off, cap - off, "%s\"size_frac\":%.10g",
-        first ? "" : ",", p->size_frac);
-    if(n < 0 || (size_t)n >= cap - off) return;
-    off += (size_t)n; first = false;
-  }
-
-  if(p != NULL && p->have_starting_cash)
-  {
-    n = snprintf(out + off, cap - off, "%s\"starting_cash\":%.10g",
-        first ? "" : ",", p->starting_cash);
-    if(n < 0 || (size_t)n >= cap - off) return;
-    off += (size_t)n; first = false;
-  }
-
-  (void)first;
-
-  if(off + 1 < cap)
-  {
-    out[off]   = '}';
-    out[off+1] = '\0';
-  }
-  else if(cap > 0)
-    out[cap-1] = '\0';
-}
-
-// Render the synth-market snapshot's PnL summary + headline economics
-// to JSON. Used as the wm_backtest_run.metrics JSONB payload. WM-MK-6
-// restores the risk-adjusted fields: per-mode stats carry n_trades /
-// n_wins / n_losses / gross_profit / gross_loss / max_drawdown, while
-// Sharpe + Sortino come pre-computed on the snapshot from the shared
-// equity-samples ring.
-static void
-wm_bt_metrics_to_json(const wm_market_session_snapshot_t *snap,
-    char *out, size_t cap)
-{
-  const wm_market_stats_t *st;
-  double                   equity;
-  double                   position_value;
-  double                   win_rate;
-  double                   avg_win;
-  double                   avg_loss;
-  double                   profit_factor;
-  int                      n;
-
-  if(out == NULL || cap == 0 || snap == NULL)
-  {
-    if(out != NULL && cap > 0) out[0] = '\0';
-    return;
-  }
-
-  st             = &snap->stats[WM_MARKET_MODE_PAPER];
-  position_value = (snap->position.side == WM_MARKET_POS_LONG)
-      ? snap->position.qty * snap->last_mark_px
-      : 0.0;
-  equity         = st->cash + position_value;
-  win_rate       = (st->n_trades > 0)
-      ? (double)st->n_wins / (double)st->n_trades
-      : 0.0;
-  avg_win        = (st->n_wins   > 0)
-      ? st->gross_profit /  (double)st->n_wins
-      : 0.0;
-  avg_loss       = (st->n_losses > 0)
-      ? st->gross_loss   / (double)st->n_losses
-      : 0.0;
-  profit_factor  = wm_market_stats_profit_factor(st);
-
-  n = snprintf(out, cap,
-      "{"
-      "\"trades\":%u,"
-      "\"wins\":%u,"
-      "\"losses\":%u,"
-      "\"win_rate\":%.6f,"
-      "\"realized_pnl\":%.6f,"
-      "\"fees_paid\":%.6f,"
-      "\"profit_factor\":%.6f,"
-      "\"max_drawdown\":%.6f,"
-      "\"avg_win\":%.6f,"
-      "\"avg_loss\":%.6f,"
-      "\"sharpe\":%.6f,"
-      "\"sortino\":%.6f,"
-      "\"final_equity\":%.6f,"
-      "\"starting_cash\":%.6f,"
-      "\"final_cash\":%.6f"
-      "}",
-      st->n_trades,
-      st->n_wins,
-      st->n_losses,
-      win_rate,
-      st->realized_pnl_lifetime,
-      st->lifetime_fees,
-      profit_factor,
-      st->max_drawdown,
-      avg_win,
-      avg_loss,
-      snap->sharpe,
-      snap->sortino,
-      equity,
-      st->starting_cash,
-      st->cash);
-
-  if(n < 0 || (size_t)n >= cap)
-    out[cap - 1] = '\0';
 }
 
 // ----------------------------------------------------------------------- //
@@ -877,52 +727,6 @@ wm_bt_cmd_run(const cmd_ctx_t *ctx)
     return;
   }
 
-  // Persist. The DDL inserts return the assigned run_id; we stash it
-  // back on the result struct so the success line names a stable id
-  // the operator can dig into via /show whenmoon backtest <id>.
-  {
-    const wm_market_stats_t *st_paper =
-        &result.trade.stats[WM_MARKET_MODE_PAPER];
-    double                    position_value;
-    double                    equity;
-    wm_backtest_record_t      rec;
-    char                      metrics_json[1024];
-    char                      params_json[256];
-    int64_t                   new_run_id = 0;
-
-    position_value = (result.trade.position.side == WM_MARKET_POS_LONG)
-        ? result.trade.position.qty * result.trade.last_mark_px
-        : 0.0;
-    equity         = st_paper->cash + position_value;
-
-    memset(&rec, 0, sizeof(rec));
-    rec.market_id     = market_id;
-    snprintf(rec.strategy_name, sizeof(rec.strategy_name), "%s", name_tok);
-    snprintf(rec.range_start, sizeof(rec.range_start), "%s", start_ts);
-    snprintf(rec.range_end,   sizeof(rec.range_end),   "%s", end_ts);
-    rec.wallclock_ms  = (int64_t)result.wallclock_ms;
-    rec.bars_replayed = result.bars_replayed;
-    // WM-MK-6: round-trip count + risk metrics from the per-market
-    // session — see the matching block in sweep.c:wm_bt_sweep_run_one.
-    rec.n_trades      = st_paper->n_trades;
-    rec.realized_pnl  = st_paper->realized_pnl_lifetime;
-    rec.max_drawdown  = st_paper->max_drawdown;
-    rec.sharpe        = result.trade.sharpe;
-    rec.sortino       = result.trade.sortino;
-    rec.final_equity  = equity;
-
-    wm_bt_params_to_json(&params, params_json, sizeof(params_json));
-    wm_bt_metrics_to_json(&result.trade,
-        metrics_json, sizeof(metrics_json));
-
-    if(wm_backtest_persist_run(&rec,
-           params.have_fee_bps || params.have_slip_bps ||
-           params.have_size_frac || params.have_starting_cash
-               ? params_json : NULL,
-           metrics_json, &new_run_id) == SUCCESS)
-      result.run_id_db = new_run_id;
-  }
-
   wm_backtest_snapshot_free(snap);
 
   {
@@ -936,28 +740,14 @@ wm_bt_cmd_run(const cmd_ctx_t *ctx)
         : 0.0;
     equity         = st_paper->cash + position_value;
 
-    if(result.run_id_db > 0)
-    {
-      snprintf(reply, sizeof(reply),
-          "run %" PRId64 ": bars=%u fills=%" PRIu64 " realized=%+.4f"
-          " equity=%.2f wallclock_ms=%" PRIu64,
-          result.run_id_db, result.bars_replayed,
-          st_paper->lifetime_fills_count,
-          st_paper->realized_pnl_lifetime,
-          equity, result.wallclock_ms);
-      cmd_reply(ctx, reply);
-      cmd_reply(ctx, "  detail: /show whenmoon backtest <run_id>");
-    }
-
-    else
-    {
-      snprintf(reply, sizeof(reply),
-          "iteration completed but persist failed:"
-          " bars=%u fills=%" PRIu64 " realized=%+.4f equity=%.2f",
-          result.bars_replayed, st_paper->lifetime_fills_count,
-          st_paper->realized_pnl_lifetime, equity);
-      cmd_reply(ctx, reply);
-    }
+    snprintf(reply, sizeof(reply),
+        "iteration complete: bars=%u fills=%" PRIu64
+        " realized=%+.4f equity=%.2f wallclock_ms=%" PRIu64
+        " (disk persistence lands in WM-BT-6)",
+        result.bars_replayed, st_paper->lifetime_fills_count,
+        st_paper->realized_pnl_lifetime,
+        equity, result.wallclock_ms);
+    cmd_reply(ctx, reply);
   }
 }
 
@@ -1026,165 +816,6 @@ wm_bt_parent_cb(const cmd_ctx_t *ctx)
 }
 
 // ----------------------------------------------------------------------- //
-// /show whenmoon backtest                                                 //
-// ----------------------------------------------------------------------- //
-
-static void
-wm_bt_show_list(const cmd_ctx_t *ctx, uint32_t cap)
-{
-  wm_backtest_record_t *recs;
-  uint32_t              n;
-  uint32_t              i;
-  char                  line[256];
-  char                  hdr[96];
-
-  if(cap == 0)            cap = WM_BT_LIST_DEFAULT;
-  if(cap > WM_BT_LIST_MAX) cap = WM_BT_LIST_MAX;
-
-  recs = mem_alloc("whenmoon.backtest", "list_buf",
-      sizeof(*recs) * (size_t)cap);
-
-  if(recs == NULL)
-  {
-    cmd_reply(ctx, "out of memory");
-    return;
-  }
-
-  n = wm_backtest_recent_runs(recs, cap);
-
-  snprintf(hdr, sizeof(hdr),
-      CLR_BOLD "whenmoon backtest runs (%u)" CLR_RESET, n);
-  cmd_reply(ctx, hdr);
-
-  if(n == 0)
-  {
-    cmd_reply(ctx,
-        "  (none — issue /whenmoon backtest run <market> <strat>"
-        " <start> <end>)");
-    mem_free(recs);
-    return;
-  }
-
-  for(i = 0; i < n; i++)
-  {
-    const wm_backtest_record_t *r = &recs[i];
-
-    snprintf(line, sizeof(line),
-        "  #%-6" PRId64 " %-24s mid=%-4" PRId32 " %.10s..%.10s"
-        " trades=%-3u realized=%+9.2f equity=%9.2f sharpe=%6.3f",
-        r->run_id, r->strategy_name, r->market_id,
-        r->range_start, r->range_end,
-        r->n_trades, r->realized_pnl, r->final_equity, r->sharpe);
-    cmd_reply(ctx, line);
-  }
-
-  mem_free(recs);
-}
-
-static void
-wm_bt_show_detail(const cmd_ctx_t *ctx, int64_t run_id)
-{
-  wm_backtest_record_t  rec;
-  char                 *metrics_json = NULL;
-  char                 *params_json  = NULL;
-  char                  line[320];
-
-  if(wm_backtest_lookup_run(run_id, &rec, &metrics_json, &params_json)
-     != SUCCESS)
-  {
-    snprintf(line, sizeof(line), "run %" PRId64 " not found", run_id);
-    cmd_reply(ctx, line);
-    return;
-  }
-
-  snprintf(line, sizeof(line),
-      CLR_BOLD "backtest #%" PRId64 CLR_RESET
-      "  %s  market_id=%" PRId32,
-      rec.run_id, rec.strategy_name, rec.market_id);
-  cmd_reply(ctx, line);
-
-  snprintf(line, sizeof(line),
-      "  range:    %s .. %s", rec.range_start, rec.range_end);
-  cmd_reply(ctx, line);
-
-  snprintf(line, sizeof(line),
-      "  created:  %s  wallclock=%" PRId64 " ms  bars_replayed=%u",
-      rec.created_at, rec.wallclock_ms, rec.bars_replayed);
-  cmd_reply(ctx, line);
-
-  snprintf(line, sizeof(line),
-      "  trades=%-3u realized=%+9.4f final_equity=%9.4f"
-      " max_dd=%9.4f sharpe=%6.3f sortino=%6.3f",
-      rec.n_trades, rec.realized_pnl, rec.final_equity,
-      rec.max_drawdown, rec.sharpe, rec.sortino);
-  cmd_reply(ctx, line);
-
-  snprintf(line, sizeof(line),
-      "  window:   kind=%s n_windows=%u",
-      rec.window_kind[0] != '\0' ? rec.window_kind : "full",
-      rec.n_windows > 0 ? rec.n_windows : 1);
-  cmd_reply(ctx, line);
-
-  if(rec.have_oos)
-  {
-    snprintf(line, sizeof(line),
-        "  oos:      score=%+.4f realized=%+9.4f trades=%u",
-        rec.oos_score, rec.oos_realized, rec.oos_n_trades);
-    cmd_reply(ctx, line);
-  }
-
-  if(params_json != NULL && params_json[0] != '\0' &&
-     strcmp(params_json, "null") != 0)
-  {
-    snprintf(line, sizeof(line), "  params:   %s", params_json);
-    cmd_reply(ctx, line);
-  }
-  else
-  {
-    cmd_reply(ctx, "  params:   (defaults)");
-  }
-
-  if(metrics_json != NULL)
-  {
-    snprintf(line, sizeof(line), "  metrics:  %s", metrics_json);
-    cmd_reply(ctx, line);
-  }
-
-  if(metrics_json != NULL) mem_free(metrics_json);
-  if(params_json  != NULL) mem_free(params_json);
-}
-
-static void
-wm_bt_cmd_show(const cmd_ctx_t *ctx)
-{
-  const char *p;
-  char        tok[32] = {0};
-  char       *end     = NULL;
-  int64_t     run_id;
-
-  p = ctx->args != NULL ? ctx->args : "";
-
-  if(!wm_dl_next_token(&p, tok, sizeof(tok)) || tok[0] == '\0' ||
-     strcmp(tok, "list") == 0)
-  {
-    wm_bt_show_list(ctx, WM_BT_LIST_DEFAULT);
-    return;
-  }
-
-  errno  = 0;
-  run_id = (int64_t)strtoll(tok, &end, 10);
-
-  if(end == tok || errno != 0 || run_id <= 0)
-  {
-    cmd_reply(ctx,
-        "usage: /show whenmoon backtest [list|<run_id>]");
-    return;
-  }
-
-  wm_bt_show_detail(ctx, run_id);
-}
-
-// ----------------------------------------------------------------------- //
 // Registration                                                            //
 // ----------------------------------------------------------------------- //
 
@@ -1229,13 +860,14 @@ wm_backtest_register_verbs(void)
         " test-window result.\n"
         "--oos-tail PCT reserves the last PCT%% of the range as out-of"
         "-sample; the sweep optimises on the head, then the post-pass"
-        " runs the top-K on the tail and patches the persisted row"
-        " with the OOS columns. PCT clamped to [1, 50].\n"
+        " runs the top-K on the tail and stamps the OOS columns on"
+        " each top-K result row. PCT clamped to [1, 50].\n"
         "--walk-forward and --oos-tail are mutually exclusive.\n"
-        "Every iteration is persisted to wm_backtest_run; --top only"
-        " controls render volume. Pre-flight gap check fails fast with"
-        " the canonical /whenmoon download <market> invocation when"
-        " 1m coverage has gaps.",
+        "WM-BT-1 retired DB-backed persistence; disk-based persistence"
+        " lands in WM-BT-6. --top only controls render volume."
+        " Pre-flight gap check fails fast with the canonical"
+        " /whenmoon download <market> invocation when 1m coverage"
+        " has gaps.",
         USERNS_GROUP_ADMIN, 100, CMD_SCOPE_ANY, METHOD_T_ANY,
         wm_bt_cmd_run, NULL, "whenmoon/backtest", NULL,
         NULL, 0, NULL, NULL) != SUCCESS)
@@ -1252,19 +884,6 @@ wm_backtest_register_verbs(void)
         " active worker iteration. Re-attach manually after reload.",
         USERNS_GROUP_ADMIN, 100, CMD_SCOPE_ANY, METHOD_T_ANY,
         wm_bt_cmd_reload, NULL, "whenmoon/backtest", NULL,
-        NULL, 0, NULL, NULL) != SUCCESS)
-    return(FAIL);
-
-  // /show whenmoon backtest
-  if(cmd_register("whenmoon", "backtest",
-        "show whenmoon backtest [list|<run_id>]",
-        "List recent backtest runs (no arg or 'list')"
-        " or show detail for one run.",
-        "List view (default 20 rows): run_id, strategy, market_id,"
-        " range, trades, realized PnL, final equity, sharpe.\n"
-        "Detail view: includes params + full JSONB metrics.",
-        USERNS_GROUP_ADMIN, 100, CMD_SCOPE_ANY, METHOD_T_ANY,
-        wm_bt_cmd_show, NULL, "show/whenmoon", NULL,
         NULL, 0, NULL, NULL) != SUCCESS)
     return(FAIL);
 
