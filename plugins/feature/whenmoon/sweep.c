@@ -49,6 +49,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/resource.h>
 #include <time.h>
 #include <unistd.h>
 
@@ -60,6 +61,8 @@
 #define WM_BT_KV_MAX_THREADS        "plugin.whenmoon.backtest.max_threads"
 #define WM_BT_RELOAD_WAIT_LOG_SEC   5
 #define WM_BT_RESULT_NOSCORE        (-DBL_MAX)
+#define WM_BT_HOST_RESERVED_CPUS    2u
+#define WM_BT_WORKER_NICE          19
 
 // ----------------------------------------------------------------------- //
 // Reload-coordination state                                               //
@@ -185,9 +188,11 @@ wm_bt_sweep_score_value(const wm_market_session_snapshot_t *snap,
 // ----------------------------------------------------------------------- //
 
 // Default thread count for new sweep plans (WM-BT-5). Composition order:
-// `sysconf(_SC_NPROCESSORS_ONLN)` for the raw CPU count, then cap by the
-// `plugin.whenmoon.backtest.max_threads` KV (0 = no cap, use sysconf
-// raw), then clamp to [WM_BT_WORKERS_MIN, WM_BT_WORKERS_MAX].
+// raw CPU count from `sysconf(_SC_NPROCESSORS_ONLN)` minus
+// WM_BT_HOST_RESERVED_CPUS so the rest of the daemon (IRC handlers,
+// marketwatch poll, live engine, etc.) and the OS keep two cores free,
+// then cap by the `plugin.whenmoon.backtest.max_threads` KV (0 = no
+// cap), then clamp to [WM_BT_WORKERS_MIN, WM_BT_WORKERS_MAX].
 static uint32_t
 wm_bt_default_thread_count(void)
 {
@@ -198,7 +203,9 @@ wm_bt_default_thread_count(void)
   if(n_cpu <= 0)
     n_cpu = 1;
 
-  w = (uint32_t)n_cpu;
+  w = ((uint32_t)n_cpu > WM_BT_HOST_RESERVED_CPUS)
+      ? (uint32_t)n_cpu - WM_BT_HOST_RESERVED_CPUS
+      : 1u;
 
   if(cap > 0 && (int64_t)w > cap)
     w = (uint32_t)cap;
@@ -1142,6 +1149,13 @@ static void *
 wm_bt_sweep_worker_main(void *arg)
 {
   wm_bt_pool_t *pool = arg;
+
+  // Drop the worker thread to the lowest scheduling priority so a
+  // long sweep never starves IRC, marketwatch, the live engine, or
+  // the OS. Linux interprets PRIO_PROCESS with `who=0` per-thread,
+  // which is what we want (other threads in the daemon stay at
+  // nice 0). Best-effort: ignore errors.
+  (void)setpriority(PRIO_PROCESS, 0, WM_BT_WORKER_NICE);
 
   for(;;)
   {

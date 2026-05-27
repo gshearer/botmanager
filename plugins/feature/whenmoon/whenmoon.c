@@ -547,14 +547,18 @@ whenmoon_init(void)
   // present (the iteration finds no PLUGIN_STRATEGY records).
   wm_strategy_registry_scan(st);
 
-  // WM-BT-5: cap for the sweep default thread count. 0 = no cap; the
-  // sweep helper then uses sysconf raw, still bounded by
-  // [WM_BT_WORKERS_MIN, WM_BT_WORKERS_MAX].
+  // WM-BT-5: cap for the sweep default thread count. The default is
+  // `max(1, nproc - 2)` so the host keeps two cores for IRC,
+  // marketwatch, the live engine, and the OS; this KV further caps
+  // that (0 = no cap, [1, 64] pool bounds still apply).
   if(kv_register("plugin.whenmoon.backtest.max_threads",
          KV_UINT64, "64", NULL, NULL,
-         "Upper bound on the sweep default worker thread count"
-         " (sysconf-derived). 0 = use sysconf raw; clamped to the"
-         " sweep pool's own [1, 64] bounds regardless.") != SUCCESS)
+         "Upper bound on the sweep default worker thread count."
+         " The unbounded default is max(1, nproc - 2) so the host"
+         " keeps two cores free; this KV caps further (0 = no cap)."
+         " Clamped to the sweep pool's [1, 64] bounds regardless."
+         " Workers run at nice 19 so a long sweep never starves"
+         " the rest of the daemon.") != SUCCESS)
   {
     clam(CLAM_INFO, WHENMOON_CTX,
         "kv_register plugin.whenmoon.backtest.max_threads failed");
