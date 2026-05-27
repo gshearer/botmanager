@@ -57,6 +57,12 @@ bool wm_candle_table_name(int32_t market_id, char *out, size_t cap);
 // the hot path.
 bool wm_candle_table_ensure(int32_t market_id);
 
+// Returns the newest / earliest 1m bar's `ts_close_ms` (open + 60000)
+// in `*out_ms`. FAIL when the table is missing, the query errors,
+// or the table is empty; `*out_ms` is set to 0 on FAIL.
+bool wm_bt_latest_1m_bar_ms(int32_t market_id, int64_t *out_ms);
+bool wm_bt_earliest_1m_bar_ms(int32_t market_id, int64_t *out_ms);
+
 #endif // WHENMOON_INTERNAL
 
 #endif // BM_WHENMOON_DL_SCHEMA_H

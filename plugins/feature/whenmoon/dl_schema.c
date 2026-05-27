@@ -362,6 +362,81 @@ wm_candle_table_ensure(int32_t market_id)
 }
 
 // ------------------------------------------------------------------ //
+// Range probes (WM-BT-3)                                             //
+// ------------------------------------------------------------------ //
+
+// Shared SELECT MIN/MAX(ts) helper. `agg` is "MIN" or "MAX" — pasted
+// directly into the SQL (NEVER take this from user input).
+static bool
+wm_bt_bar_ms_one(int32_t market_id, const char *agg, int64_t *out_ms)
+{
+  db_result_t  *res = NULL;
+  char          table[WM_DL_TABLE_SZ];
+  char          sql[256];
+  int           n;
+  bool          ok = FAIL;
+
+  if(out_ms == NULL || agg == NULL)
+    return(FAIL);
+
+  *out_ms = 0;
+
+  if(wm_candle_table_name(market_id, table, sizeof(table)) != SUCCESS)
+    return(FAIL);
+
+  n = snprintf(sql, sizeof(sql),
+      "SELECT (EXTRACT(EPOCH FROM %s(ts))::BIGINT * 1000) AS ts_ms"
+      "  FROM %s",
+      agg, table);
+
+  if(n < 0 || (size_t)n >= sizeof(sql))
+    return(FAIL);
+
+  res = db_result_alloc();
+
+  if(res == NULL)
+    return(FAIL);
+
+  if(db_query(sql, res) != SUCCESS || !res->ok)
+    goto out;
+
+  if(res->rows != 1)
+    goto out;
+
+  {
+    const char *s = db_result_get(res, 0, 0);
+
+    // NULL = empty table (MIN/MAX over zero rows). Not an error per
+    // se — caller distinguishes via the SUCCESS/FAIL return.
+    if(s == NULL || s[0] == '\0')
+      goto out;
+
+    // `s` is the bar's OPEN ms (table stores ts as open). Caller
+    // semantic is close ms — add the 60000 here so consumers don't
+    // need to know the offset.
+    *out_ms = (int64_t)strtoll(s, NULL, 10) + 60000;
+  }
+
+  ok = SUCCESS;
+
+out:
+  db_result_free(res);
+  return(ok);
+}
+
+bool
+wm_bt_latest_1m_bar_ms(int32_t market_id, int64_t *out_ms)
+{
+  return(wm_bt_bar_ms_one(market_id, "MAX", out_ms));
+}
+
+bool
+wm_bt_earliest_1m_bar_ms(int32_t market_id, int64_t *out_ms)
+{
+  return(wm_bt_bar_ms_one(market_id, "MIN", out_ms));
+}
+
+// ------------------------------------------------------------------ //
 // Market registry                                                    //
 // ------------------------------------------------------------------ //
 

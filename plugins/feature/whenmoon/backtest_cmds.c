@@ -17,12 +17,14 @@
 
 #define WHENMOON_INTERNAL
 #include "whenmoon.h"
+#include "aggregator.h"
 #include "backtest.h"
 #include "dl_commands.h"
 #include "dl_schema.h"
 #include "market.h"
 #include "strategy.h"
 #include "sweep.h"
+#include "wm_bt_file.h"
 
 #include "cmd.h"
 #include "common.h"
@@ -806,13 +808,305 @@ wm_bt_cmd_reload(const cmd_ctx_t *ctx)
 }
 
 // ----------------------------------------------------------------------- //
+// /whenmoon backtest compile  (WM-BT-3)                                   //
+// ----------------------------------------------------------------------- //
+
+// `days = 0` sentinel = "all available 1m history".
+#define WM_BT_COMPILE_DEFAULT_DAYS  0u
+
+// Render epoch ms back to the canonical "YYYY-MM-DD HH:MM:SS+00" form
+// the snapshot builder + .wm header carry. Mirrors the formatter at
+// dl_candles.c:74 but inline because that one is static.
+static void
+wm_bt_compile_ms_to_pg(int64_t ms, char *out, size_t cap)
+{
+  struct tm  tm;
+  time_t     t = (time_t)(ms / 1000);
+  int        year;
+
+  if(out == NULL || cap == 0)
+    return;
+
+  if(t < 0) t = 0;
+
+  if(gmtime_r(&t, &tm) == NULL)
+  {
+    snprintf(out, cap, "1970-01-01 00:00:00+00");
+    return;
+  }
+
+  year = tm.tm_year + 1900;
+
+  if(year < 0)    year = 0;
+  if(year > 9999) year = 9999;
+
+  snprintf(out, cap, "%04d-%02d-%02d %02d:%02d:%02d+00",
+      year, tm.tm_mon + 1, tm.tm_mday,
+      tm.tm_hour, tm.tm_min, tm.tm_sec);
+}
+
+static void
+wm_bt_cmd_compile(const cmd_ctx_t *ctx)
+{
+  whenmoon_state_t       *st;
+  const char             *p;
+  char                    pair_tok[64]   = {0};
+  char                    path_tok[256]  = {0};
+  char                    days_tok[32]   = {0};
+  char                    exch[32]       = {0};
+  char                    base[16]       = {0};
+  char                    quote[16]      = {0};
+  char                    symbol[32]     = {0};
+  char                    start_ts[40]   = {0};
+  char                    end_ts[40]     = {0};
+  char                    err[320];
+  char                    reply[512];
+  uint32_t                days = WM_BT_COMPILE_DEFAULT_DAYS;
+  int32_t                 market_id;
+  int64_t                 latest_ms = 0;
+  int64_t                 start_ms = 0;
+  int64_t                 end_ms = 0;
+  wm_backtest_snapshot_t *snap = NULL;
+  size_t                  i;
+
+  st = whenmoon_get_state();
+
+  if(st == NULL || !st->dl_ready)
+  {
+    cmd_reply(ctx, "whenmoon: downloader not ready");
+    return;
+  }
+
+  p = ctx->args != NULL ? ctx->args : "";
+
+  if(!wm_dl_next_token(&p, pair_tok, sizeof(pair_tok)) ||
+     !wm_dl_next_token(&p, path_tok, sizeof(path_tok)))
+  {
+    cmd_reply(ctx,
+        "usage: /whenmoon backtest compile <market> <path.wm> [<days>]");
+    return;
+  }
+
+  // Optional days arg. Absence or "0" means "full available history".
+  if(wm_dl_next_token(&p, days_tok, sizeof(days_tok)))
+  {
+    char  *end_p = NULL;
+    long   v;
+
+    errno = 0;
+    v = strtol(days_tok, &end_p, 10);
+
+    if(end_p == days_tok || errno != 0 || v < 0)
+    {
+      cmd_reply(ctx, "bad <days> (expected non-negative integer)");
+      return;
+    }
+
+    days = (uint32_t)v;
+  }
+
+  if(wm_market_parse_id(pair_tok, exch, sizeof(exch),
+         base, sizeof(base), quote, sizeof(quote)) != SUCCESS)
+  {
+    cmd_reply(ctx, "bad market id (expected <exch>-<base>-<quote>)");
+    return;
+  }
+
+  // Wire-form symbol: uppercase BASE-QUOTE (mirrors run path's
+  // canonicalisation).
+  {
+    int n = snprintf(symbol, sizeof(symbol), "%s-%s", base, quote);
+
+    if(n < 0 || (size_t)n >= sizeof(symbol))
+    {
+      cmd_reply(ctx, "market id overflow");
+      return;
+    }
+
+    for(i = 0; symbol[i] != '\0'; i++)
+      symbol[i] = (char)toupper((unsigned char)symbol[i]);
+  }
+
+  market_id = wm_market_lookup_or_create(exch, base, quote, symbol);
+
+  if(market_id < 0)
+  {
+    cmd_reply(ctx, "market registry lookup failed");
+    return;
+  }
+
+  if(wm_bt_latest_1m_bar_ms(market_id, &latest_ms) != SUCCESS)
+  {
+    snprintf(reply, sizeof(reply),
+        "no 1m candles persisted for %s; run /whenmoon download %s ...",
+        pair_tok, pair_tok);
+    cmd_reply(ctx, reply);
+    return;
+  }
+
+  end_ms = latest_ms;
+
+  if(days == 0)
+  {
+    if(wm_bt_earliest_1m_bar_ms(market_id, &start_ms) != SUCCESS)
+    {
+      cmd_reply(ctx, "earliest-bar probe failed");
+      return;
+    }
+
+    // earliest bar's close ms is one minute after open; the range
+    // is half-open [start, end). Subtract 60s so the earliest bar
+    // is included on the inclusive side of the snapshot range.
+    start_ms -= 60000;
+  }
+  else
+  {
+    start_ms = latest_ms - ((int64_t)days * 86400LL * 1000LL);
+  }
+
+  if(start_ms >= end_ms)
+  {
+    cmd_reply(ctx, "compile range degenerate (start >= end)");
+    return;
+  }
+
+  wm_bt_compile_ms_to_pg(start_ms, start_ts, sizeof(start_ts));
+  wm_bt_compile_ms_to_pg(end_ms,   end_ts,   sizeof(end_ts));
+
+  err[0] = '\0';
+
+  if(wm_backtest_preflight_gap(market_id, start_ts, end_ts,
+         err, sizeof(err)) != SUCCESS)
+  {
+    snprintf(reply, sizeof(reply), "gap: %s",
+        err[0] != '\0' ? err : "(no detail)");
+    cmd_reply(ctx, reply);
+    return;
+  }
+
+  snap = wm_backtest_snapshot_build(market_id, pair_tok,
+      start_ts, end_ts, WM_AGG_DEFAULT_HISTORY_1D,
+      err, sizeof(err));
+
+  if(snap == NULL)
+  {
+    snprintf(reply, sizeof(reply), "snapshot build failed: %s",
+        err[0] != '\0' ? err : "(no detail)");
+    cmd_reply(ctx, reply);
+    return;
+  }
+
+  // Populate range_*_ms before writing so the .wm header carries the
+  // epoch range that downstream walk-forward / OOS plumbing in WM-BT-9
+  // expects to read back from the file. Heap-built snapshots zero
+  // these by default — WM-BT-2 wired the field, WM-BT-3 fills it on
+  // the compile path.
+  snap->range_start_ms = start_ms;
+  snap->range_end_ms   = end_ms;
+
+  err[0] = '\0';
+
+  if(wm_bt_file_write(path_tok, snap, err, sizeof(err)) != SUCCESS)
+  {
+    snprintf(reply, sizeof(reply), "write failed: %s",
+        err[0] != '\0' ? err : "(no detail)");
+    cmd_reply(ctx, reply);
+    wm_backtest_snapshot_free(snap);
+    return;
+  }
+
+  snprintf(reply, sizeof(reply),
+      "compiled %s: 1m_bars=%u (5m=%u 15m=%u 1h=%u 4h=%u 1d=%u)"
+      " range=[%s..%s]",
+      path_tok, snap->bars_loaded_1m,
+      snap->mkt.grain_n[WM_GRAN_5M], snap->mkt.grain_n[WM_GRAN_15M],
+      snap->mkt.grain_n[WM_GRAN_1H], snap->mkt.grain_n[WM_GRAN_4H],
+      snap->mkt.grain_n[WM_GRAN_1D],
+      start_ts, end_ts);
+  cmd_reply(ctx, reply);
+
+  wm_backtest_snapshot_free(snap);
+}
+
+// ----------------------------------------------------------------------- //
+// /whenmoon backtest inspect  (WM-BT-3)                                   //
+// ----------------------------------------------------------------------- //
+
+static void
+wm_bt_cmd_inspect(const cmd_ctx_t *ctx)
+{
+  const char *p;
+  char        path_tok[256] = {0};
+  char        summary[1024];
+  char        err[320];
+  char        line[256];
+  const char *cursor;
+  const char *nl;
+
+  p = ctx->args != NULL ? ctx->args : "";
+
+  if(!wm_dl_next_token(&p, path_tok, sizeof(path_tok)))
+  {
+    cmd_reply(ctx, "usage: /whenmoon backtest inspect <path.wm>");
+    return;
+  }
+
+  err[0] = '\0';
+
+  if(wm_bt_file_inspect(path_tok, summary, sizeof(summary),
+         err, sizeof(err)) != SUCCESS)
+  {
+    char reply[400];
+
+    snprintf(reply, sizeof(reply), "inspect failed: %s",
+        err[0] != '\0' ? err : "(no detail)");
+    cmd_reply(ctx, reply);
+    return;
+  }
+
+  // wm_bt_file_inspect renders a multi-line block; split on '\n' and
+  // emit one cmd_reply per line. The summary always fits in 1024 B
+  // (12 header lines + 6 grain rows, each ~70 chars).
+  cursor = summary;
+
+  while(cursor != NULL && *cursor != '\0')
+  {
+    size_t len;
+
+    nl = strchr(cursor, '\n');
+
+    if(nl == NULL)
+      len = strlen(cursor);
+    else
+      len = (size_t)(nl - cursor);
+
+    if(len >= sizeof(line))
+      len = sizeof(line) - 1u;
+
+    memcpy(line, cursor, len);
+    line[len] = '\0';
+
+    cmd_reply(ctx, line);
+
+    if(nl == NULL)
+      break;
+
+    cursor = nl + 1;
+  }
+
+  // Stale-schema NOTE is in err on a SUCCESS return; surface it.
+  if(err[0] != '\0')
+    cmd_reply(ctx, err);
+}
+
+// ----------------------------------------------------------------------- //
 // /whenmoon backtest parent                                               //
 // ----------------------------------------------------------------------- //
 
 static void
 wm_bt_parent_cb(const cmd_ctx_t *ctx)
 {
-  cmd_reply(ctx, "usage: /whenmoon backtest <run> ...");
+  cmd_reply(ctx, "usage: /whenmoon backtest <run|compile|inspect|reload> ...");
 }
 
 // ----------------------------------------------------------------------- //
@@ -827,6 +1121,8 @@ wm_backtest_register_verbs(void)
         "whenmoon backtest <verb> ...",
         "Backtest runner + sweep planner.",
         "Subcommands: run <market_id> <strat> <start> <end> [...],"
+        " compile <market_id> <path.wm> [<days>],"
+        " inspect <path.wm>,"
         " reload <strat>.",
         USERNS_GROUP_ADMIN, 100, CMD_SCOPE_ANY, METHOD_T_ANY,
         wm_bt_parent_cb, NULL, "whenmoon", NULL,
@@ -884,6 +1180,40 @@ wm_backtest_register_verbs(void)
         " active worker iteration. Re-attach manually after reload.",
         USERNS_GROUP_ADMIN, 100, CMD_SCOPE_ANY, METHOD_T_ANY,
         wm_bt_cmd_reload, NULL, "whenmoon/backtest", NULL,
+        NULL, 0, NULL, NULL) != SUCCESS)
+    return(FAIL);
+
+  if(cmd_register("whenmoon", "compile",
+        "whenmoon backtest compile <market_id> <path.wm> [<days>]",
+        "Compile a .wm snapshot file from persisted 1m candles.",
+        "Builds an isolated wm_backtest_snapshot_t from the"
+        " wm_candles_<id> table over the most recent <days> of 1m"
+        " history (default 0 = all available history), then serialises"
+        " the snapshot to <path.wm> via mmap-friendly host-endian"
+        " binary form (host-portable across daemon restarts; WM-BT-2"
+        " format magic 0x4D4E4257, version 1).\n"
+        "The pre-flight gap check fails fast with the canonical"
+        " /whenmoon download <market> invocation when 1m coverage has"
+        " gaps. Output is atomic via tmp+fsync+rename. Re-runs"
+        " overwrite an existing file at <path>.\n"
+        "Compiled .wm files survive daemon restarts and are the input"
+        " to /whenmoon backtest run in WM-BT-6.",
+        USERNS_GROUP_ADMIN, 100, CMD_SCOPE_ANY, METHOD_T_ANY,
+        wm_bt_cmd_compile, NULL, "whenmoon/backtest", NULL,
+        NULL, 0, NULL, NULL) != SUCCESS)
+    return(FAIL);
+
+  if(cmd_register("whenmoon", "inspect",
+        "whenmoon backtest inspect <path.wm>",
+        "Render the .wm file's header without loading any candles.",
+        "Reads just the wm_bt_file_header_t at offset 0 and prints"
+        " each field on its own line: magic, file_version, indicator"
+        " schema version, bar_size, source_market_id, range, per-grain"
+        " bar counts + offsets. Stale-schema files inspect cleanly"
+        " (emits a NOTE) but cannot be loaded — recompile with the"
+        " current daemon to refresh the indicator schema.",
+        USERNS_GROUP_ADMIN, 100, CMD_SCOPE_ANY, METHOD_T_ANY,
+        wm_bt_cmd_inspect, NULL, "whenmoon/backtest", NULL,
         NULL, 0, NULL, NULL) != SUCCESS)
     return(FAIL);
 
