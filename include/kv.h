@@ -102,6 +102,20 @@ uint32_t kv_iterate_prefix(const char *prefix, kv_iter_cb_t cb, void *data);
 // the number of entries deleted.
 uint32_t kv_delete_prefix(const char *prefix);
 
+// In-memory removal of a registered KV entry — drops the kv_entry_t
+// (including its cached cb pointer, cb_data, and help pointer, all of
+// which may live in plugin .text/.rodata) and any attached NL
+// responder. Does NOT touch the database row; if a plugin reloads and
+// re-registers the same key, the next kv_load() picks the value back
+// up. Returns SUCCESS if the entry existed, FAIL otherwise.
+bool kv_unregister(const char *key);
+
+// Bulk version of kv_unregister — drops every entry whose key starts
+// with `prefix` (and any NL responders attached to those keys). Used
+// by plugin_unload to remove all plugin-owned cb/help pointers before
+// dlclose. Returns the number of entries removed.
+uint32_t kv_unregister_prefix(const char *prefix);
+
 const char *kv_type_name(kv_type_t type);
 
 // Natural-language responder metadata attached to a KV. A KV becomes

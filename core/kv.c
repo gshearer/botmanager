@@ -1133,6 +1133,158 @@ kv_delete_prefix(const char *prefix)
   return(deleted);
 }
 
+// Drop the NL responder attached to `key`, if any. Internal helper —
+// callers must NOT hold kv_nl_mutex. Returns true if one was removed.
+static bool
+kv_nl_unregister_locked_key(const char *key)
+{
+  kv_nl_reg_t  *r;
+  kv_nl_reg_t **pp;
+  bool          dropped = false;
+
+  pthread_mutex_lock(&kv_nl_mutex);
+
+  pp = &kv_nl_head;
+
+  while(*pp != NULL)
+  {
+    r = *pp;
+
+    if(strcmp(r->key, key) == 0)
+    {
+      *pp = r->next;
+      mem_free(r);
+      dropped = true;
+      break;
+    }
+
+    pp = &r->next;
+  }
+
+  pthread_mutex_unlock(&kv_nl_mutex);
+  return(dropped);
+}
+
+bool
+kv_unregister(const char *key)
+{
+  kv_entry_t  *e;
+  kv_entry_t **pp;
+  uint32_t     bucket;
+  bool         found = false;
+
+  if(key == NULL || key[0] == '\0')
+    return(FAIL);
+
+  bucket = hash_key(key);
+
+  pthread_mutex_lock(&kv_mutex);
+
+  pp = &kv_table[bucket];
+
+  while(*pp != NULL)
+  {
+    e = *pp;
+
+    if(strcmp(e->key, key) == 0)
+    {
+      *pp = e->next;
+      mem_free(e);
+      kv_count--;
+      found = true;
+      break;
+    }
+
+    pp = &e->next;
+  }
+
+  pthread_mutex_unlock(&kv_mutex);
+
+  if(found)
+  {
+    kv_nl_unregister_locked_key(key);
+    clam(CLAM_DEBUG, "kv_unregister", "'%s' removed", key);
+  }
+
+  return(found ? SUCCESS : FAIL);
+}
+
+uint32_t
+kv_unregister_prefix(const char *prefix)
+{
+  size_t   plen;
+  uint32_t removed = 0;
+
+  if(prefix == NULL || prefix[0] == '\0')
+    return(0);
+
+  plen = strlen(prefix);
+
+  pthread_mutex_lock(&kv_mutex);
+
+  for(uint32_t b = 0; b < KV_BUCKETS; b++)
+  {
+    kv_entry_t *e = kv_table[b];
+    kv_entry_t *prev = NULL;
+
+    while(e != NULL)
+    {
+      kv_entry_t *next = e->next;
+
+      if(strncmp(e->key, prefix, plen) == 0)
+      {
+        if(prev != NULL)
+          prev->next = next;
+        else
+          kv_table[b] = next;
+
+        mem_free(e);
+        kv_count--;
+        removed++;
+      }
+
+      else
+        prev = e;
+
+      e = next;
+    }
+  }
+
+  pthread_mutex_unlock(&kv_mutex);
+
+  // Walk the NL adapter list separately, dropping any whose key
+  // matches the prefix. Done outside kv_mutex per lock ordering.
+  if(removed > 0)
+  {
+    kv_nl_reg_t **pp;
+
+    pthread_mutex_lock(&kv_nl_mutex);
+
+    pp = &kv_nl_head;
+
+    while(*pp != NULL)
+    {
+      kv_nl_reg_t *r = *pp;
+
+      if(strncmp(r->key, prefix, plen) == 0)
+      {
+        *pp = r->next;
+        mem_free(r);
+      }
+
+      else
+        pp = &r->next;
+    }
+
+    pthread_mutex_unlock(&kv_nl_mutex);
+
+    clam(CLAM_DEBUG, "kv_unregister_prefix",
+        "removed %u entries with prefix '%s'", removed, prefix);
+  }
+
+  return(removed);
+}
+
 static bool
 load_ensure_table(void)
 {

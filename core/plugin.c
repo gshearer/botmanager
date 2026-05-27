@@ -226,6 +226,17 @@ plugin_unload(const char *name)
     target->state = PLUGIN_LOADED;
   }
 
+  // Drop any KV entries the loader registered from the plugin's
+  // declared schema. kv_entry_t's cb / cb_data / help all point into
+  // plugin .text/.rodata; leaving them behind after dlclose would
+  // dangle on the next kv write or `/show kv`. Idempotent — a plugin
+  // that already unregistered its keys in deinit gets no-ops here.
+  if(target->desc->kv_schema != NULL && target->desc->kv_schema_count > 0)
+  {
+    for(uint32_t i = 0; i < target->desc->kv_schema_count; i++)
+      kv_unregister(target->desc->kv_schema[i].key);
+  }
+
   // Remove from list.
   pp = &plugins;
 
