@@ -179,7 +179,7 @@ async_cb(task_t *t)
 
   __atomic_add_fetch(&db_stat_queries, 1, __ATOMIC_RELAXED);
 
-  if(!ok)
+  if(ok != SUCCESS)
     __atomic_add_fetch(&db_stat_errors, 1, __ATOMIC_RELAXED);
 
   c->queries++;
@@ -421,7 +421,7 @@ db_query(const char *sql, db_result_t *result)
 
   __atomic_add_fetch(&db_stat_queries, 1, __ATOMIC_RELAXED);
 
-  if(!ret)
+  if(ret != SUCCESS)
     __atomic_add_fetch(&db_stat_errors, 1, __ATOMIC_RELAXED);
 
   c->queries++;
