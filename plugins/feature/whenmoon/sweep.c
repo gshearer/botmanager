@@ -51,6 +51,9 @@
 #include <string.h>
 #include <time.h>
 
+#include <json-c/json.h>
+#include <json-c/json_util.h>
+
 #define WM_SWEEP_CTX                "whenmoon.sweep"
 #define WM_BT_KV_PREFIX             "plugin.whenmoon.market.bt:"
 #define WM_BT_RELOAD_WAIT_LOG_SEC   5
@@ -265,18 +268,47 @@ wm_bt_sweep_parse_value_list(const char *list,
   char        *save = NULL;
   char        *tok;
   uint32_t     n = 0;
+  size_t       len;
 
   if(list == NULL || axis == NULL)
     return(FAIL);
 
-  if(strlen(list) >= sizeof(buf))
+  // Strip a single matched `[...]` pair so callers can write either
+  // `v1,v2,v3` or `[v1,v2,v3]`; the bracketed form is documented in
+  // the /whenmoon backtest run help text.
+  if(list[0] == '[')
   {
-    if(err != NULL)
-      snprintf(err, err_cap, "value list too long");
-    return(FAIL);
-  }
+    len = strlen(list);
 
-  snprintf(buf, sizeof(buf), "%s", list);
+    if(len < 2 || list[len - 1] != ']')
+    {
+      if(err != NULL)
+        snprintf(err, err_cap,
+            "axis '%s': unterminated '[' in value list", axis->name);
+      return(FAIL);
+    }
+
+    if(len - 2 >= sizeof(buf))
+    {
+      if(err != NULL)
+        snprintf(err, err_cap, "value list too long");
+      return(FAIL);
+    }
+
+    memcpy(buf, list + 1, len - 2);
+    buf[len - 2] = '\0';
+  }
+  else
+  {
+    if(strlen(list) >= sizeof(buf))
+    {
+      if(err != NULL)
+        snprintf(err, err_cap, "value list too long");
+      return(FAIL);
+    }
+
+    snprintf(buf, sizeof(buf), "%s", list);
+  }
 
   for(tok = strtok_r(buf, ",", &save); tok != NULL;
       tok = strtok_r(NULL, ",", &save))
@@ -430,14 +462,6 @@ wm_bt_sweep_axis_add(wm_bt_sweep_plan_t *plan,
   if(plan == NULL || ls == NULL || expr == NULL)
     return(FAIL);
 
-  if(plan->n_axes >= WM_BT_SWEEP_MAX_PARAMS)
-  {
-    if(err != NULL)
-      snprintf(err, err_cap, "too many --sweep axes (max %u)",
-          (unsigned)WM_BT_SWEEP_MAX_PARAMS);
-    return(FAIL);
-  }
-
   if(strlen(expr) >= sizeof(buf))
   {
     if(err != NULL)
@@ -497,33 +521,54 @@ wm_bt_sweep_axis_add(wm_bt_sweep_plan_t *plan,
     return(FAIL);
   }
 
-  // Dedup: same axis named twice in a single run is operator error.
+  // Replace-on-collision: a same-name axis silently overwrites the
+  // earlier entry. The expected usage is `--config <file>` (which
+  // calls this helper internally) followed by inline `--sweep
+  // <name>=...` overrides — inline must win, regardless of argv order
+  // relative to --config, because wm_bt_cmd_run does --config in a
+  // dedicated first pass before the inline flag walk. The same rule
+  // applies to repeated --sweep entries: last write wins. The cap
+  // check below only fires when we are actually appending a new axis.
+  bool replace = false;
   {
     uint32_t i;
 
     for(i = 0; i < plan->n_axes; i++)
       if(strcmp(plan->axes[i].name, buf) == 0)
       {
-        if(err != NULL)
-          snprintf(err, err_cap,
-              "axis '%s' already supplied", buf);
-        return(FAIL);
+        axis    = &plan->axes[i];
+        replace = true;
+        break;
       }
   }
 
-  axis = &plan->axes[plan->n_axes];
+  if(!replace)
+  {
+    if(plan->n_axes >= WM_BT_SWEEP_MAX_PARAMS)
+    {
+      if(err != NULL)
+        snprintf(err, err_cap, "too many sweep axes (max %u)",
+            (unsigned)WM_BT_SWEEP_MAX_PARAMS);
+      return(FAIL);
+    }
+
+    axis = &plan->axes[plan->n_axes];
+  }
+
   memset(axis, 0, sizeof(*axis));
   snprintf(axis->name, sizeof(axis->name), "%s", buf);
   axis->type = p->type;
 
   // Range form (lo:step:hi) when the values text contains ':' before
   // any ',' — colons are not legal inside discrete value lists.
+  // Bracketed lists `[a,b,c]` route to parse_value_list, which strips
+  // the brackets internally.
   {
     const char *vals  = eq + 1;
     const char *colon = strchr(vals, ':');
     const char *comma = strchr(vals, ',');
 
-    if(colon != NULL && (comma == NULL || colon < comma))
+    if(vals[0] != '[' && colon != NULL && (comma == NULL || colon < comma))
     {
       if(wm_bt_sweep_parse_range(vals, axis, err, err_cap) != SUCCESS)
         return(FAIL);
@@ -537,7 +582,9 @@ wm_bt_sweep_axis_add(wm_bt_sweep_plan_t *plan,
     }
   }
 
-  plan->n_axes++;
+  if(!replace)
+    plan->n_axes++;
+
   return(SUCCESS);
 }
 
@@ -579,6 +626,202 @@ wm_bt_sweep_plan_finalize(wm_bt_sweep_plan_t *plan,
     plan->workers = WM_BT_WORKERS_MAX;
 
   return(SUCCESS);
+}
+
+// ----------------------------------------------------------------------- //
+// JSON --config loader (WM-BT-4)                                          //
+// ----------------------------------------------------------------------- //
+//
+// One config file describes a `params` object whose values are scalars,
+// arrays (discrete list), or objects with start/step/end (range). The
+// loader renders each value back to the "name=expr" textual form that
+// wm_bt_sweep_axis_add already understands. Inline --sweep then layers
+// over the file via the replace-on-collision dedup in axis_add.
+
+static bool
+wm_bt_render_jarray(struct json_object *arr, char *out, size_t cap,
+    const char *path, const char *key, char *err, size_t err_cap)
+{
+  size_t  n_elem = (size_t)json_object_array_length(arr);
+  size_t  i;
+  size_t  written = 0;
+  int     m;
+
+  if(n_elem == 0)
+  {
+    if(err != NULL)
+      snprintf(err, err_cap,
+          "config '%s': param '%s' has empty list", path, key);
+    return(FAIL);
+  }
+
+  if(cap < 3)
+    goto too_long;
+
+  out[written++] = '[';
+
+  for(i = 0; i < n_elem; i++)
+  {
+    struct json_object *el  = json_object_array_get_idx(arr, (int)i);
+    enum   json_type    et  = json_object_get_type(el);
+    const  char        *sep = (i == 0) ? "" : ",";
+
+    if(et == json_type_int)
+      m = snprintf(out + written, cap - written,
+          "%s%" PRId64, sep, json_object_get_int64(el));
+
+    else if(et == json_type_double)
+      m = snprintf(out + written, cap - written,
+          "%s%g", sep, json_object_get_double(el));
+
+    else
+    {
+      if(err != NULL)
+        snprintf(err, err_cap,
+            "config '%s': param '%s' list element %zu not a number",
+            path, key, i);
+      return(FAIL);
+    }
+
+    if(m < 0 || (size_t)m >= cap - written)
+      goto too_long;
+
+    written += (size_t)m;
+  }
+
+  if(written + 2 > cap)          // ']' + NUL
+    goto too_long;
+
+  out[written++] = ']';
+  out[written]   = '\0';
+  return(SUCCESS);
+
+too_long:
+  if(err != NULL)
+    snprintf(err, err_cap,
+        "config '%s': param '%s' expression too long", path, key);
+  return(FAIL);
+}
+
+bool
+wm_bt_load_config_file(wm_bt_sweep_plan_t *plan,
+    const loaded_strategy_t *ls, const char *path,
+    char *err, size_t err_cap)
+{
+  struct json_object *root   = NULL;
+  struct json_object *params = NULL;
+  bool                ok     = SUCCESS;
+
+  if(err != NULL && err_cap > 0)
+    err[0] = '\0';
+
+  if(plan == NULL || ls == NULL || path == NULL)
+    return(FAIL);
+
+  root = json_object_from_file(path);
+
+  if(root == NULL)
+  {
+    if(err != NULL)
+      snprintf(err, err_cap,
+          "config '%s' read/parse failed: %s",
+          path, json_util_get_last_err());
+    return(FAIL);
+  }
+
+  if(!json_object_object_get_ex(root, "params", &params) ||
+     !json_object_is_type(params, json_type_object))
+  {
+    if(err != NULL)
+      snprintf(err, err_cap,
+          "config '%s' missing top-level 'params' object", path);
+    json_object_put(root);
+    return(FAIL);
+  }
+
+  json_object_object_foreach(params, key, val)
+  {
+    char            expr[1024];
+    char            vals[768];
+    enum json_type  t   = json_object_get_type(val);
+    int             n   = 0;
+
+    if(t == json_type_int)
+    {
+      n = snprintf(expr, sizeof(expr), "%s=%" PRId64,
+          key, json_object_get_int64(val));
+    }
+
+    else if(t == json_type_double)
+    {
+      n = snprintf(expr, sizeof(expr), "%s=%g",
+          key, json_object_get_double(val));
+    }
+
+    else if(t == json_type_array)
+    {
+      if(wm_bt_render_jarray(val, vals, sizeof(vals), path, key,
+             err, err_cap) != SUCCESS)
+      {
+        ok = FAIL;
+        break;
+      }
+
+      n = snprintf(expr, sizeof(expr), "%s=%s", key, vals);
+    }
+
+    else if(t == json_type_object)
+    {
+      struct json_object *jstart = NULL;
+      struct json_object *jstep  = NULL;
+      struct json_object *jend   = NULL;
+
+      if(!json_object_object_get_ex(val, "start", &jstart) ||
+         !json_object_object_get_ex(val, "step",  &jstep)  ||
+         !json_object_object_get_ex(val, "end",   &jend))
+      {
+        if(err != NULL)
+          snprintf(err, err_cap,
+              "config '%s': param '%s' range needs start/step/end",
+              path, key);
+        ok = FAIL;
+        break;
+      }
+
+      n = snprintf(expr, sizeof(expr), "%s=%g:%g:%g", key,
+          json_object_get_double(jstart),
+          json_object_get_double(jstep),
+          json_object_get_double(jend));
+    }
+
+    else
+    {
+      if(err != NULL)
+        snprintf(err, err_cap,
+            "config '%s': param '%s' unsupported value type"
+            " (need scalar, list, or {start,step,end})", path, key);
+      ok = FAIL;
+      break;
+    }
+
+    if(n < 0 || (size_t)n >= sizeof(expr))
+    {
+      if(err != NULL)
+        snprintf(err, err_cap,
+            "config '%s': param '%s' expression too long", path, key);
+      ok = FAIL;
+      break;
+    }
+
+    if(wm_bt_sweep_axis_add(plan, ls, expr, err, err_cap) != SUCCESS)
+    {
+      ok = FAIL;
+      break;
+    }
+  }
+
+  json_object_put(root);
+  return(ok);
 }
 
 void

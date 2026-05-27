@@ -269,7 +269,9 @@ wm_bt_cmd_run(const cmd_ctx_t *ctx)
         " <MM/dd/yyyy> <MM/dd/yyyy>"
         " [--fee-bps N] [--slip-bps N]"
         " [--size-frac F] [--cash N]"
-        " [--sweep <param>=<v1,v2,...>|<lo:step:hi>] (repeatable)"
+        " [--sweep <param>=<v1,v2,...>|<[v1,v2,...]>|<lo:step:hi>]"
+        " (repeatable)"
+        " [--config <path.json>]"
         " [--workers N] [--score realized|sharpe|sortino|equity|pf]"
         " [--top K]"
         " [--walk-forward train=Td:test=Md:step=Sd]"
@@ -348,11 +350,43 @@ wm_bt_cmd_run(const cmd_ctx_t *ctx)
   // Parse optional --flag value pairs. The economic knobs apply to
   // every iteration; --sweep / --workers / --score / --top control the
   // sweep planner. --walk-forward / --oos-tail set window scope.
+  // --config <file> loads a JSON sweep matrix; inline --sweep entries
+  // override its axes via the replace-on-collision dedup in
+  // wm_bt_sweep_axis_add. To preserve "inline beats file" regardless
+  // of argv order, --config is processed in a dedicated first pass.
   memset(&params,     0, sizeof(params));
   memset(&sweep_mode, 0, sizeof(sweep_mode));
   memset(&walk_spec,  0, sizeof(walk_spec));
   memset(&oos_spec,   0, sizeof(oos_spec));
   wm_bt_sweep_plan_init(&sweep_plan);
+
+  // Pass 1: --config only. Break (silently) on missing value or any
+  // other malformed input so Pass 2 reports the canonical diagnostic.
+  {
+    const char *p_pre = p;
+
+    while(wm_dl_next_token(&p_pre, flag_tok, sizeof(flag_tok)))
+    {
+      if(!wm_dl_next_token(&p_pre, val_tok, sizeof(val_tok)))
+        break;
+
+      if(strcmp(flag_tok, "--config") != 0)
+        continue;
+
+      err[0] = '\0';
+
+      if(wm_bt_load_config_file(&sweep_plan, ls, val_tok,
+             err, sizeof(err)) != SUCCESS)
+      {
+        snprintf(reply, sizeof(reply),
+            "error: %s", err[0] != '\0' ? err : "bad --config value");
+        cmd_reply(ctx, reply);
+        return;
+      }
+
+      have_sweep = true;
+    }
+  }
 
   while(wm_dl_next_token(&p, flag_tok, sizeof(flag_tok)))
   {
@@ -363,6 +397,9 @@ wm_bt_cmd_run(const cmd_ctx_t *ctx)
       cmd_reply(ctx, reply);
       return;
     }
+
+    if(strcmp(flag_tok, "--config") == 0)
+      continue;          // handled in Pass 1
 
     if(strcmp(flag_tok, "--fee-bps") == 0)
     {
@@ -489,8 +526,8 @@ wm_bt_cmd_run(const cmd_ctx_t *ctx)
     {
       snprintf(reply, sizeof(reply),
           "unknown flag '%s' (expected --fee-bps/--slip-bps/"
-          "--size-frac/--cash/--sweep/--workers/--score/--top/"
-          "--walk-forward/--oos-tail)",
+          "--size-frac/--cash/--sweep/--config/--workers/--score/"
+          "--top/--walk-forward/--oos-tail)",
           flag_tok);
       cmd_reply(ctx, reply);
       return;
@@ -1133,7 +1170,9 @@ wm_backtest_register_verbs(void)
         "whenmoon backtest run <market_id> <strategy_name>"
         " <MM/dd/yyyy> <MM/dd/yyyy>"
         " [--fee-bps N] [--slip-bps N] [--size-frac F] [--cash N]"
-        " [--sweep <param>=<v1,v2,...>|<lo:step:hi>] (repeatable)"
+        " [--sweep <param>=<v1,v2,...>|<[v1,v2,...]>|<lo:step:hi>]"
+        " (repeatable)"
+        " [--config <path.json>]"
         " [--workers N] [--score realized|sharpe|sortino|equity|pf]"
         " [--top K]"
         " [--walk-forward train=Td:test=Md:step=Sd]"
@@ -1147,6 +1186,12 @@ wm_backtest_register_verbs(void)
         " iteration through a worker pool (--workers, default 1; max"
         " 64). Each iteration runs on a private trade-book registry so"
         " parallel workers do not contend on a global mutex.\n"
+        "--sweep accepts three value forms: bare list 'v1,v2,v3',"
+        " bracketed list '[v1,v2,v3]', or range 'lo:step:hi'.\n"
+        "--config <path.json> loads a sweep matrix from a JSON file"
+        " shaped {\"params\": {\"name\": <scalar|list|{start,step,end}>,"
+        " ...}}. Inline --sweep entries override matching axes loaded"
+        " from --config, regardless of argv order.\n"
         "--score selects the ranking metric (default realized).\n"
         "--top selects the top-K rows shown after the run (default 20"
         " when sweeping, 1 otherwise).\n"

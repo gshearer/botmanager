@@ -92,11 +92,14 @@ void wm_bt_sweep_plan_init(wm_bt_sweep_plan_t *plan);
 // Parse + add one axis to the plan, validating against `ls`'s param
 // schema. expr forms:
 //   "name=v1,v2,v3"           — discrete value list
+//   "name=[v1,v2,v3]"         — same, with surrounding brackets
 //   "name=lo:step:hi"         — range, inclusive of lo, advancing by
 //                                step until > hi (FP tolerance)
 // Returns SUCCESS on a successful add; FAIL with err populated on parse
 // error, unknown param name, type mismatch, value count overflow, or
-// caps overflow. Lists the available param names on unknown.
+// caps overflow. Lists the available param names on unknown. A second
+// add for the same axis name silently replaces the earlier entry; this
+// is what lets inline --sweep override --config-loaded axes.
 bool wm_bt_sweep_axis_add(wm_bt_sweep_plan_t *plan,
     const loaded_strategy_t *ls, const char *expr,
     char *err, size_t err_cap);
@@ -105,6 +108,21 @@ bool wm_bt_sweep_axis_add(wm_bt_sweep_plan_t *plan,
 // when total > WM_BT_SWEEP_MAX_ITERS. Always succeeds for n_axes == 0
 // (total_iters = 1; the single-iteration baseline).
 bool wm_bt_sweep_plan_finalize(wm_bt_sweep_plan_t *plan,
+    char *err, size_t err_cap);
+
+// Load a JSON sweep config file. Schema:
+//   {"params": {
+//      "fast_period": {"start": 5, "step": 1, "end": 15},
+//      "slow_period": [20, 30, 50],
+//      "fee_bps":     10
+//   }}
+// Each "params" entry is converted to the textual expr form and routed
+// through wm_bt_sweep_axis_add. Scalars become "name=value", arrays
+// become "name=[v1,v2,...]", and {start,step,end} objects become
+// "name=start:step:end". Subsequent inline --sweep overrides win via
+// axis_add's replace-on-collision semantic.
+bool wm_bt_load_config_file(wm_bt_sweep_plan_t *plan,
+    const loaded_strategy_t *ls, const char *path,
     char *err, size_t err_cap);
 
 // ----------------------------------------------------------------------- //
