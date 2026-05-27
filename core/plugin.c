@@ -177,6 +177,34 @@ plugin_unload(const char *name)
     }
   }
 
+  // For PLUGIN_METHOD / PLUGIN_FEATURE plugins, also refuse if any bot
+  // is currently bound to the plugin's bot_driver_t vtable. bot bindings
+  // are runtime state (not in the .provides/.requires graph) so the
+  // dependency check above misses them. After dlclose, inst->driver
+  // would dangle into freed .text.
+  if(target->desc->ext != NULL
+      && (target->desc->type == PLUGIN_METHOD
+          || target->desc->type == PLUGIN_FEATURE))
+  {
+    const bot_driver_t *drv = (const bot_driver_t *)target->desc->ext;
+
+    if(drv->name != NULL)
+    {
+      char        bot_name[BOT_NAME_SZ];
+      bot_state_t bot_state;
+
+      if(bot_find_bound_to_driver(drv->name, bot_name, sizeof(bot_name),
+          &bot_state))
+      {
+        clam(CLAM_WARN, "plugin",
+            "cannot unload '%s': bot '%s' is bound to kind '%s' "
+            "(state=%s); stop and destroy the bot first",
+            name, bot_name, drv->name, bot_state_name(bot_state));
+        return(FAIL);
+      }
+    }
+  }
+
   // Lifecycle teardown based on current state.
   if(target->state == PLUGIN_RUNNING)
   {
@@ -1612,6 +1640,33 @@ plugin_cmd_unload(const cmd_ctx_t *ctx)
           cmd_reply(ctx, buf);
           return;
         }
+      }
+    }
+  }
+
+  // Pre-check bot bindings. Same logic as plugin_unload — mirrored
+  // here for a friendly user-facing error before the loader fires.
+  if(pd->ext != NULL
+      && (pd->type == PLUGIN_METHOD || pd->type == PLUGIN_FEATURE))
+  {
+    const bot_driver_t *drv = (const bot_driver_t *)pd->ext;
+
+    if(drv->name != NULL)
+    {
+      char        bot_name[BOT_NAME_SZ];
+      bot_state_t bot_state;
+
+      if(bot_find_bound_to_driver(drv->name, bot_name, sizeof(bot_name),
+          &bot_state))
+      {
+        snprintf(buf, sizeof(buf),
+            "cannot unload " CLR_BOLD "%s" CLR_RESET
+            ": bot " CLR_BOLD "%s" CLR_RESET
+            " is bound to kind " CLR_CYAN "%s" CLR_RESET
+            " (state=%s); stop and destroy it first",
+            name, bot_name, drv->name, bot_state_name(bot_state));
+        cmd_reply(ctx, buf);
+        return;
       }
     }
   }

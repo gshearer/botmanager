@@ -1438,6 +1438,39 @@ bot_iterate(bot_iter_cb_t cb, void *data)
   pthread_mutex_unlock(&bot_mutex);
 }
 
+bool
+bot_find_bound_to_driver(const char *driver_name, char *out_name,
+    size_t out_cap, bot_state_t *out_state)
+{
+  bool found = false;
+
+  if(driver_name == NULL)
+    return(false);
+
+  pthread_mutex_lock(&bot_mutex);
+
+  for(bot_inst_t *b = bot_list; b != NULL; b = b->next)
+  {
+    if(b->driver == NULL || b->driver->name == NULL)
+      continue;
+
+    if(strcmp(b->driver->name, driver_name) != 0)
+      continue;
+
+    if(out_name != NULL && out_cap > 0)
+      snprintf(out_name, out_cap, "%s", b->name);
+
+    if(out_state != NULL)
+      *out_state = b->state;
+
+    found = true;
+    break;
+  }
+
+  pthread_mutex_unlock(&bot_mutex);
+  return(found);
+}
+
 const char *
 bot_driver_name(const bot_inst_t *inst)
 {

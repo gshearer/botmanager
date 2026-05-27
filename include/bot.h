@@ -169,6 +169,14 @@ void bot_iterate(bot_iter_cb_t cb, void *data);
 const char *bot_driver_name(const bot_inst_t *inst);
 uint32_t bot_method_count(const bot_inst_t *inst);
 
+// Find the first bot whose driver->name matches `driver_name`. Returns
+// true on hit, with out_name (cap out_cap) and out_state populated.
+// Used by the plugin loader to refuse unload of method/feature plugins
+// while any bot still holds a pointer into the plugin's bot_driver_t.
+// out_name / out_state may be NULL if the caller only needs presence.
+bool bot_find_bound_to_driver(const char *driver_name,
+    char *out_name, size_t out_cap, bot_state_t *out_state);
+
 // Returns the first bound method, or NULL. Useful for driver-side
 // helpers (e.g. chatbot volunteer speech) that need a valid
 // method_inst_t for an outbound channel send without reconstructing
