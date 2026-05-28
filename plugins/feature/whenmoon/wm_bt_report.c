@@ -20,6 +20,7 @@
 #include "market.h"
 #include "market_engine.h"
 #include "sweep.h"
+#include "wm_bt_chart.h"
 #include "whenmoon_strategy.h"
 
 #include "alloc.h"
@@ -1473,6 +1474,682 @@ wm_bt_render_report_md(const char *sweep_dir,
           r->err[0] != '\0' ? r->err : "(unknown)");
     }
   }
+
+  mem_free(indices);
+
+  return(wm_bt_finalize_file(fp, tmp, path, err, err_cap));
+}
+
+// ----------------------------------------------------------------------- //
+// index.html — browser-friendly sweep landing page                       //
+// ----------------------------------------------------------------------- //
+//
+// Self-contained, JS-free (native <details> collapsibles) HTML report.
+// Reuses the report.md statics above (axis-cell render, equity compute,
+// double formatting, mode label). Trades are paired from the per-iter
+// deep-fills capture exactly as the chart emitter pairs them, so the
+// generated `charts/iter-K/trade-M-<gran>.html` hrefs line up with the
+// files the chart pass wrote.
+
+// Escape the five HTML-significant characters into `out`. Always
+// NUL-terminates; silently stops at the buffer edge.
+static void
+wm_bt_html_escape(const char *in, char *out, size_t cap)
+{
+  size_t o = 0;
+
+  if(out == NULL || cap == 0)
+    return;
+
+  if(in == NULL)
+    in = "";
+
+  for(; *in != '\0' && o + 1 < cap; in++)
+  {
+    const char *rep = NULL;
+    size_t      rl;
+
+    switch(*in)
+    {
+      case '&':  rep = "&amp;";  break;
+      case '<':  rep = "&lt;";   break;
+      case '>':  rep = "&gt;";   break;
+      case '"':  rep = "&quot;"; break;
+      case '\'': rep = "&#39;";  break;
+      default:
+        out[o++] = *in;
+        continue;
+    }
+
+    rl = strlen(rep);
+
+    if(o + rl >= cap)
+      break;
+
+    memcpy(out + o, rep, rl);
+    o += rl;
+  }
+
+  out[o] = '\0';
+}
+
+// "YYYY-MM-DD HH:MM" UTC, or numeric epoch on gmtime_r failure.
+static void
+wm_bt_idx_fmt_ts(int64_t ts_ms, char *out, size_t cap)
+{
+  time_t    t = (time_t)(ts_ms / 1000);
+  struct tm tm;
+
+  if(gmtime_r(&t, &tm) == NULL)
+  {
+    snprintf(out, cap, "%" PRId64, ts_ms);
+    return;
+  }
+
+  snprintf(out, cap, "%04d-%02d-%02d %02d:%02d",
+      tm.tm_year + 1900, tm.tm_mon + 1, tm.tm_mday,
+      tm.tm_hour, tm.tm_min);
+}
+
+// Compact human duration: "3d 4h", "5h 12m", "47m", "30s".
+static void
+wm_bt_idx_fmt_dur(int64_t ms, char *out, size_t cap)
+{
+  int64_t s = ms / 1000;
+  int64_t d;
+  int64_t h;
+  int64_t m;
+
+  if(s < 0)
+    s = 0;
+
+  d = s / 86400; s %= 86400;
+  h = s / 3600;  s %= 3600;
+  m = s / 60;    s %= 60;
+
+  if(d > 0)
+    snprintf(out, cap, "%" PRId64 "d %" PRId64 "h", d, h);
+  else if(h > 0)
+    snprintf(out, cap, "%" PRId64 "h %" PRId64 "m", h, m);
+  else if(m > 0)
+    snprintf(out, cap, "%" PRId64 "m", m);
+  else
+    snprintf(out, cap, "%" PRId64 "s", s);
+}
+
+// Build "name=val name=val ..." for one iteration from the swept axes.
+static void
+wm_bt_idx_params_str(const wm_bt_sweep_plan_t *plan,
+    const uint32_t *indices, char *out, size_t cap)
+{
+  uint32_t a;
+  size_t   off = 0;
+
+  if(out == NULL || cap == 0)
+    return;
+
+  out[0] = '\0';
+
+  if(plan->n_axes == 0)
+  {
+    snprintf(out, cap, "(defaults)");
+    return;
+  }
+
+  for(a = 0; a < plan->n_axes; a++)
+  {
+    char cell[64];
+    int  w;
+
+    wm_bt_md_render_axis_cell(&plan->axes[a],
+        plan->axes[a].values[indices[a]], cell, sizeof(cell));
+
+    w = snprintf(out + off, cap - off, "%s%s=%s",
+        off == 0 ? "" : " ", plan->axes[a].name, cell);
+
+    if(w < 0 || (size_t)w >= cap - off)
+      break;
+
+    off += (size_t)w;
+  }
+}
+
+// Emit the per-grain chart links for trade `tidx` of charted rank
+// `rank` (1-based). One link per grain in `emit_mask` — BUT only when
+// the chart file actually exists on disk: the chart pass skips a
+// (grain, trade) pair when no bars fall in its slice window (e.g. an
+// intraday trade has no 1d slice), so we stat each candidate to avoid
+// dangling links. `sweep_dir` is the absolute report dir the relative
+// hrefs are anchored to.
+static void
+wm_bt_idx_emit_chart_links(FILE *fp, const char *sweep_dir,
+    uint32_t rank, uint32_t tidx, uint16_t emit_mask)
+{
+  uint32_t g;
+  bool     any = false;
+
+  for(g = 0; g < WM_GRAN_MAX; g++)
+  {
+    const char *gname;
+    char        full[1024];
+    struct stat sb;
+    int         w;
+
+    if(((emit_mask >> g) & 1u) == 0)
+      continue;
+
+    gname = wm_bt_chart_gran_name((wm_gran_t)g);
+
+    w = snprintf(full, sizeof(full),
+        "%s/charts/iter-%u/trade-%u-%s.html", sweep_dir, rank, tidx, gname);
+
+    if(w < 0 || (size_t)w >= sizeof(full))
+      continue;
+
+    if(stat(full, &sb) != 0 || !S_ISREG(sb.st_mode))
+      continue;
+
+    fprintf(fp,
+        "<a class=\"chart-link\" target=\"_blank\""
+        " href=\"charts/iter-%u/trade-%u-%s.html\">%s&#8599;</a>",
+        rank, tidx, gname, gname);
+
+    any = true;
+  }
+
+  if(!any)
+    fputs("<span class=\"muted\">&mdash;</span>", fp);
+}
+
+// One iteration's trade table. Pairs buy→sell over the captured fills
+// ring (long-only / flat ⇒ strict buy/sell alternation, but defensive
+// against an unmatched trailing buy = open-at-end). Returns the number
+// of paired trades rendered.
+static uint32_t
+wm_bt_idx_emit_trades(FILE *fp, const char *sweep_dir,
+    const wm_bt_sweep_result_t *r, uint32_t rank, uint16_t emit_mask)
+{
+  uint32_t f;
+  uint32_t tidx = 0;
+
+  fputs("<table class=\"trades\"><thead><tr>"
+        "<th>#</th><th>entry (UTC)</th><th>exit (UTC)</th><th>held</th>"
+        "<th class=\"num\">entry</th><th class=\"num\">exit</th>"
+        "<th class=\"num\">qty</th><th class=\"num\">P/L</th>"
+        "<th class=\"num\">P/L %</th><th class=\"num\">balance</th>"
+        "<th>exit reason</th><th>chart</th></tr></thead><tbody>\n", fp);
+
+  for(f = 0; f < r->n_fills; f++)
+  {
+    const wm_market_fill_t *entry = &r->fills[f];
+    const wm_market_fill_t *exit_fill = NULL;
+    uint32_t                e;
+    char                    entry_ts[64];
+    char                    exit_ts[64];
+    char                    held[32];
+    char                    reason_esc[128];
+    double                  pnl;
+    double                  notional;
+    double                  pct;
+    const char             *cls;
+
+    if(entry->side != 'b')
+      continue;
+
+    for(e = f + 1; e < r->n_fills; e++)
+    {
+      if(r->fills[e].side == 's')
+      {
+        exit_fill = &r->fills[e];
+        f         = e;
+        break;
+      }
+    }
+
+    tidx++;
+
+    wm_bt_idx_fmt_ts(entry->ts_ms, entry_ts, sizeof(entry_ts));
+    notional = entry->price * entry->qty;
+
+    if(exit_fill != NULL)
+    {
+      pnl = exit_fill->realized_pnl;
+      pct = (notional > 0.0) ? (pnl / notional) * 100.0 : 0.0;
+      cls = (pnl > 0.0) ? "win" : (pnl < 0.0) ? "loss" : "flat";
+
+      wm_bt_idx_fmt_ts(exit_fill->ts_ms, exit_ts, sizeof(exit_ts));
+      wm_bt_idx_fmt_dur(exit_fill->ts_ms - entry->ts_ms,
+          held, sizeof(held));
+      wm_bt_html_escape(exit_fill->reason, reason_esc,
+          sizeof(reason_esc));
+    }
+    else
+    {
+      pnl = 0.0;
+      pct = 0.0;
+      cls = "open";
+      snprintf(exit_ts, sizeof(exit_ts), "(open)");
+      snprintf(held,    sizeof(held),    "&mdash;");
+      wm_bt_html_escape(entry->reason, reason_esc, sizeof(reason_esc));
+    }
+
+    fprintf(fp,
+        "<tr class=\"%s\"><td>%u</td><td>%s</td><td>%s</td><td>%s</td>"
+        "<td class=\"num\">%.2f</td>",
+        cls, tidx, entry_ts, exit_ts, held, entry->price);
+
+    if(exit_fill != NULL)
+      fprintf(fp, "<td class=\"num\">%.2f</td>", exit_fill->price);
+    else
+      fputs("<td class=\"num muted\">&mdash;</td>", fp);
+
+    fprintf(fp, "<td class=\"num\">%.6f</td>", entry->qty);
+
+    if(exit_fill != NULL)
+    {
+      fprintf(fp,
+          "<td class=\"num pnl\">%+.2f</td>"
+          "<td class=\"num pnl\">%+.2f%%</td>"
+          "<td class=\"num\">%.2f</td>",
+          pnl, pct, exit_fill->cash_after);
+    }
+    else
+    {
+      fputs("<td class=\"num muted\">&mdash;</td>"
+            "<td class=\"num muted\">&mdash;</td>"
+            "<td class=\"num muted\">&mdash;</td>", fp);
+    }
+
+    fprintf(fp, "<td class=\"reason\">%s</td><td>", reason_esc);
+    wm_bt_idx_emit_chart_links(fp, sweep_dir, rank, tidx, emit_mask);
+    fputs("</td></tr>\n", fp);
+  }
+
+  fputs("</tbody></table>\n", fp);
+
+  return(tidx);
+}
+
+// The full <style> block + page chrome are static, so they go through
+// fputs (no printf %-escaping headaches with CSS percentages).
+static void
+wm_bt_idx_write_head(FILE *fp, const char *title_esc)
+{
+  fprintf(fp,
+      "<!DOCTYPE html>\n<html lang=\"en\"><head><meta charset=\"utf-8\">\n"
+      "<meta name=\"viewport\" content=\"width=device-width,"
+      "initial-scale=1\">\n<title>%s</title>\n", title_esc);
+
+  fputs(
+      "<style>\n"
+      ":root{--bg:#0e0f13;--surface:#171922;--surface2:#1e2230;"
+      "--border:#2a2f3e;--text:#e6e8ee;--muted:#8b93a7;--accent:#5b8cff;"
+      "--win:#2bb673;--loss:#e0533d;--gold:#f5c451}\n"
+      "*{box-sizing:border-box}\n"
+      "body{margin:0;background:var(--bg);color:var(--text);"
+      "font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,"
+      "Helvetica,Arial,sans-serif;line-height:1.5}\n"
+      ".mono{font-family:ui-monospace,'SF Mono',Menlo,Consolas,monospace}\n"
+      "header{position:sticky;top:0;z-index:10;background:"
+      "rgba(14,15,19,.92);backdrop-filter:blur(8px);"
+      "border-bottom:1px solid var(--border);padding:18px 28px}\n"
+      "header h1{margin:0 0 2px;font-size:19px;font-weight:650}\n"
+      "header .sub{color:var(--muted);font-size:13px}\n"
+      ".wrap{max-width:1180px;margin:0 auto;padding:24px 28px 64px}\n"
+      ".cards{display:grid;grid-template-columns:repeat(auto-fit,"
+      "minmax(150px,1fr));gap:14px;margin:22px 0}\n"
+      ".card{background:var(--surface);border:1px solid var(--border);"
+      "border-radius:12px;padding:14px 16px}\n"
+      ".card .k{color:var(--muted);font-size:12px;text-transform:uppercase;"
+      "letter-spacing:.04em}\n"
+      ".card .v{font-size:23px;font-weight:650;margin-top:4px}\n"
+      ".card .v.mono{font-size:20px}\n"
+      "section{margin:30px 0}\n"
+      "h2{font-size:15px;font-weight:600;color:var(--muted);"
+      "text-transform:uppercase;letter-spacing:.05em;"
+      "border-bottom:1px solid var(--border);padding-bottom:8px}\n"
+      "table{border-collapse:collapse;width:100%;font-size:13px}\n"
+      "th,td{padding:7px 10px;text-align:left;border-bottom:1px solid "
+      "var(--border);white-space:nowrap}\n"
+      "th{color:var(--muted);font-weight:600;font-size:11px;"
+      "text-transform:uppercase;letter-spacing:.03em}\n"
+      ".num{text-align:right;font-family:ui-monospace,'SF Mono',Menlo,"
+      "Consolas,monospace}\n"
+      "td.reason{color:var(--muted);font-size:12px;white-space:normal}\n"
+      ".meta dt{color:var(--muted);font-size:12px;text-transform:uppercase;"
+      "letter-spacing:.03em}\n"
+      ".meta{display:grid;grid-template-columns:repeat(auto-fit,"
+      "minmax(220px,1fr));gap:10px 28px;margin:8px 0}\n"
+      ".meta div{border-bottom:1px solid var(--border);padding:6px 0}\n"
+      ".meta .vv{font-size:14px}\n"
+      "details{background:var(--surface);border:1px solid var(--border);"
+      "border-radius:12px;margin:14px 0;overflow:hidden}\n"
+      "details[open]{box-shadow:0 0 0 1px var(--accent) inset}\n"
+      "summary{cursor:pointer;padding:14px 18px;list-style:none;"
+      "display:flex;align-items:center;gap:14px;flex-wrap:wrap}\n"
+      "summary::-webkit-details-marker{display:none}\n"
+      "summary .rank{background:var(--surface2);border:1px solid "
+      "var(--border);border-radius:8px;padding:2px 10px;font-weight:700;"
+      "font-size:13px}\n"
+      "summary .params{font-size:13px}\n"
+      "summary .spacer{flex:1}\n"
+      ".badge{font-family:ui-monospace,monospace;font-size:13px;"
+      "padding:2px 9px;border-radius:8px;border:1px solid var(--border)}\n"
+      ".badge.win{color:var(--win);border-color:rgba(43,182,115,.4)}\n"
+      ".badge.loss{color:var(--loss);border-color:rgba(224,83,61,.4)}\n"
+      ".strip{display:flex;flex-wrap:wrap;gap:8px 22px;padding:4px 18px "
+      "14px;border-bottom:1px solid var(--border)}\n"
+      ".strip .it{font-size:13px}\n"
+      ".strip .it span{color:var(--muted);margin-right:6px}\n"
+      ".tbl-scroll{max-height:560px;overflow:auto;padding:0 6px 6px}\n"
+      "tr.win td.pnl{color:var(--win)}\n"
+      "tr.loss td.pnl{color:var(--loss)}\n"
+      "tr.win:hover,tr.loss:hover,tr.open:hover{background:var(--surface2)}\n"
+      ".pos{color:var(--win)}.neg{color:var(--loss)}\n"
+      ".muted{color:var(--muted)}\n"
+      "a{color:var(--accent);text-decoration:none}a:hover{text-decoration:"
+      "underline}\n"
+      ".chart-link{font-family:ui-monospace,monospace;font-size:12px;"
+      "margin-right:8px}\n"
+      ".note{color:var(--muted);font-size:12px;padding:10px 18px}\n"
+      "footer{color:var(--muted);font-size:12px;margin-top:40px;"
+      "border-top:1px solid var(--border);padding-top:16px}\n"
+      "</style>\n</head><body>\n", fp);
+}
+
+bool
+wm_bt_render_index_html(const char *sweep_dir,
+    const char *sweep_id, const char *wm_path,
+    const wm_backtest_snapshot_t *snap, const char *strategy,
+    const wm_bt_sweep_plan_t *plan, const wm_bt_sweep_mode_t *mode,
+    const wm_backtest_params_t *fixed_params,
+    const wm_bt_sweep_result_t *results, uint32_t n_results,
+    uint32_t n_ok, uint32_t n_fail, uint64_t wallclock_ms,
+    char *err, size_t err_cap)
+{
+  char              path[1024];
+  char              tmp[1280];
+  char              esc[256];
+  char              esc2[256];
+  uint32_t         *indices = NULL;
+  uint32_t          top_k;
+  uint32_t          cap_kv;
+  uint32_t          top_n;
+  uint16_t          emit_mask;
+  uint32_t          g;
+  FILE             *fp = NULL;
+  wm_bt_run_mode_t  mode_val;
+  int               n;
+  uint32_t          i;
+
+  if(sweep_dir == NULL || sweep_id == NULL || snap == NULL ||
+     strategy == NULL || plan == NULL || results == NULL ||
+     n_results == 0)
+  {
+    if(err != NULL)
+      snprintf(err, err_cap, "index_html: bad args");
+    return(FAIL);
+  }
+
+  mode_val = (mode != NULL) ? mode->mode : WM_BT_MODE_FULL;
+
+  // Mirror the chart pass exactly so every link resolves: cap top-K by
+  // charts_top_n, and chart-link every grain the snapshot carries
+  // (grain_n[g] > 0) rather than just the strategy's subscribed grains.
+  cap_kv = (uint32_t)kv_get_uint("plugin.whenmoon.backtest.charts_top_n");
+  top_n  = plan->top_k;
+
+  if(cap_kv > 0 && top_n > cap_kv)
+    top_n = cap_kv;
+
+  emit_mask = 0;
+
+  for(g = 0; g < WM_GRAN_MAX; g++)
+    if(snap->mkt.grain_n[g] > 0)
+      emit_mask |= (uint16_t)(1u << g);
+
+  n = snprintf(path, sizeof(path), "%s/index.html", sweep_dir);
+
+  if(n < 0 || (size_t)n >= sizeof(path))
+  {
+    if(err != NULL)
+      snprintf(err, err_cap, "index.html path overflow");
+    return(FAIL);
+  }
+
+  n = snprintf(tmp, sizeof(tmp), "%s.tmp", path);
+
+  if(n < 0 || (size_t)n >= sizeof(tmp))
+  {
+    if(err != NULL)
+      snprintf(err, err_cap, "index.html tmp path overflow");
+    return(FAIL);
+  }
+
+  indices = mem_alloc(WM_BT_REPORT_CTX, "index_indices",
+      sizeof(*indices) * (size_t)n_results);
+
+  if(indices == NULL)
+  {
+    if(err != NULL)
+      snprintf(err, err_cap, "index_indices alloc failed");
+    return(FAIL);
+  }
+
+  top_k = wm_bt_topk_compute(results, n_results, top_n, indices);
+
+  fp = fopen(tmp, "w");
+
+  if(fp == NULL)
+  {
+    if(err != NULL)
+      snprintf(err, err_cap,
+          "fopen('%s') failed: %s", tmp, strerror(errno));
+    mem_free(indices);
+    return(FAIL);
+  }
+
+  // ---- head + sticky header ----
+  wm_bt_html_escape(sweep_id, esc, sizeof(esc));
+  wm_bt_idx_write_head(fp, esc);
+
+  wm_bt_html_escape(strategy, esc, sizeof(esc));
+  wm_bt_html_escape(snap->source_market_id, esc2, sizeof(esc2));
+  fprintf(fp,
+      "<header><h1>%s &middot; %s</h1>"
+      "<div class=\"sub\">%s &rarr; %s &middot; %u 1m bars &middot;"
+      " mode <b>%s</b> &middot; ranked by <b>%s</b></div></header>\n",
+      esc, esc2, snap->range_start, snap->range_end,
+      snap->bars_loaded_1m, wm_bt_report_mode_str(mode_val),
+      wm_bt_sweep_score_name(plan->score));
+
+  fputs("<div class=\"wrap\">\n", fp);
+
+  // ---- headline cards (best config = top-K rank 1) ----
+  if(top_k > 0 && results[indices[0]].ok)
+  {
+    const wm_bt_sweep_result_t *best = &results[indices[0]];
+    const wm_market_stats_t    *st   = &best->trade.stats[WM_MARKET_MODE_PAPER];
+    uint32_t rt   = st->n_wins + st->n_losses;
+    double   wr   = rt > 0 ? (double)st->n_wins / (double)rt * 100.0 : 0.0;
+    double   pf   = wm_market_stats_profit_factor(st);
+    double   eq   = wm_bt_compute_equity(&best->trade);
+    double   rpnl = st->realized_pnl_lifetime;
+    const char *ec = eq >= WM_MARKET_DEFAULT_STARTING_CASH ? "pos" : "neg";
+    const char *rc = rpnl >= 0.0 ? "pos" : "neg";
+
+    fputs("<div class=\"cards\">\n", fp);
+    fprintf(fp,
+        "<div class=\"card\"><div class=\"k\">Best equity</div>"
+        "<div class=\"v mono %s\">$%.0f</div></div>\n", ec, eq);
+    fprintf(fp,
+        "<div class=\"card\"><div class=\"k\">Realized P/L</div>"
+        "<div class=\"v mono %s\">%+.0f</div></div>\n", rc, rpnl);
+    fprintf(fp,
+        "<div class=\"card\"><div class=\"k\">Profit factor</div>"
+        "<div class=\"v mono\">%.2f</div></div>\n", pf);
+    fprintf(fp,
+        "<div class=\"card\"><div class=\"k\">Win rate</div>"
+        "<div class=\"v mono\">%.1f%%</div></div>\n", wr);
+    fprintf(fp,
+        "<div class=\"card\"><div class=\"k\">Round trips</div>"
+        "<div class=\"v mono\">%u</div></div>\n", rt);
+    fprintf(fp,
+        "<div class=\"card\"><div class=\"k\">Max drawdown</div>"
+        "<div class=\"v mono\">%.1f%%</div></div>\n",
+        st->max_drawdown * 100.0);
+    fputs("</div>\n", fp);
+  }
+
+  // ---- run metadata ----
+  fputs("<section><h2>Run</h2><div class=\"meta\">\n", fp);
+
+  if(wm_path != NULL && wm_path[0] != '\0')
+  {
+    wm_bt_html_escape(wm_path, esc, sizeof(esc));
+    fprintf(fp, "<div><dt>source</dt><div class=\"vv mono\">%s</div></div>\n",
+        esc);
+  }
+
+  fprintf(fp,
+      "<div><dt>iterations</dt><div class=\"vv\">%u total"
+      " &middot; %u ok &middot; %u failed</div></div>\n",
+      plan->total_iters, n_ok, n_fail);
+  fprintf(fp,
+      "<div><dt>wallclock</dt><div class=\"vv\">%.3f s</div></div>\n",
+      (double)wallclock_ms / 1000.0);
+
+  // Fixed economics — fall through to engine defaults when unset.
+  {
+    double fee  = (fixed_params != NULL && fixed_params->have_fee_bps)
+        ? fixed_params->fee_bps : WM_MARKET_DEFAULT_FEE_BPS;
+    double slip = (fixed_params != NULL && fixed_params->have_slip_bps)
+        ? fixed_params->slip_bps : WM_MARKET_DEFAULT_SLIP_BPS;
+    double sf   = (fixed_params != NULL && fixed_params->have_size_frac)
+        ? fixed_params->size_frac : WM_MARKET_DEFAULT_SIZE_FRAC;
+    double cash = (fixed_params != NULL && fixed_params->have_starting_cash)
+        ? fixed_params->starting_cash : WM_MARKET_DEFAULT_STARTING_CASH;
+
+    fprintf(fp,
+        "<div><dt>economics</dt><div class=\"vv mono\">fee %.1f bps"
+        " &middot; slip %.1f bps &middot; size %.0f%% &middot;"
+        " cash $%.0f</div></div>\n",
+        fee, slip, sf * 100.0, cash);
+  }
+
+  if(mode_val == WM_BT_MODE_WALK_FORWARD && mode != NULL)
+    fprintf(fp,
+        "<div><dt>walk-forward</dt><div class=\"vv\">%u windows</div>"
+        "</div>\n", mode->walk.n);
+
+  fputs("</div></section>\n", fp);
+
+  // ---- per-config detail (charted top-K) ----
+  fprintf(fp,
+      "<section><h2>Configurations &amp; trades (top %u)</h2>\n", top_k);
+
+  if(emit_mask == 0)
+    fputs("<p class=\"note\">No subscribed grains to chart; trade rows"
+          " below have no linked visualizations.</p>\n", fp);
+
+  for(i = 0; i < top_k; i++)
+  {
+    const wm_bt_sweep_result_t *r = &results[indices[i]];
+    const wm_market_stats_t    *st;
+    char     params[256];
+    uint32_t rt;
+    double   wr;
+    double   pf;
+    double   eq;
+    double   rpnl;
+    uint32_t n_trades;
+    const char *bcls;
+
+    wm_bt_idx_params_str(plan, r->indices, params, sizeof(params));
+    wm_bt_html_escape(params, esc, sizeof(esc));
+
+    if(!r->ok)
+    {
+      fprintf(fp,
+          "<details><summary><span class=\"rank\">#%u</span>"
+          "<span class=\"params mono\">%s</span><span class=\"spacer\">"
+          "</span><span class=\"badge loss\">FAIL</span></summary>"
+          "<p class=\"note\">%s</p></details>\n",
+          i + 1, esc, r->err[0] != '\0' ? r->err : "(unknown)");
+      continue;
+    }
+
+    st       = &r->trade.stats[WM_MARKET_MODE_PAPER];
+    rt       = st->n_wins + st->n_losses;
+    wr       = rt > 0 ? (double)st->n_wins / (double)rt * 100.0 : 0.0;
+    pf       = wm_market_stats_profit_factor(st);
+    eq       = wm_bt_compute_equity(&r->trade);
+    rpnl     = st->realized_pnl_lifetime;
+    bcls     = rpnl >= 0.0 ? "win" : "loss";
+
+    fprintf(fp,
+        "<details%s><summary><span class=\"rank\">#%u</span>"
+        "<span class=\"params mono\">%s</span>"
+        "<span class=\"spacer\"></span>"
+        "<span class=\"badge\">PF %.2f</span>"
+        "<span class=\"badge %s\">%+.0f</span>"
+        "<span class=\"badge\">eq $%.0f</span></summary>\n",
+        i == 0 ? " open" : "", i + 1, esc, pf, bcls, rpnl, eq);
+
+    // Metric strip.
+    fprintf(fp,
+        "<div class=\"strip\">"
+        "<div class=\"it\"><span>round trips</span>%u</div>"
+        "<div class=\"it\"><span>win rate</span>%.1f%%</div>"
+        "<div class=\"it\"><span>wins / losses</span>%u / %u</div>"
+        "<div class=\"it\"><span>gross +/-</span>%.0f / -%.0f</div>"
+        "<div class=\"it\"><span>max dd</span>%.1f%%</div>"
+        "<div class=\"it\"><span>sharpe</span>%.3f</div>"
+        "<div class=\"it\"><span>sortino</span>%.3f</div>"
+        "</div>\n",
+        rt, wr, st->n_wins, st->n_losses,
+        st->gross_profit, st->gross_loss, st->max_drawdown * 100.0,
+        r->trade.sharpe, r->trade.sortino);
+
+    if(r->n_fills == 0 || r->fills == NULL)
+    {
+      fputs("<p class=\"note\">No fills captured for this iteration.</p>\n",
+          fp);
+    }
+    else
+    {
+      // Captured fills ring caps at WM_MARKET_FILL_RING_CAP; warn when
+      // the full count exceeded it so the table's partiality is clear.
+      if((uint64_t)st->lifetime_fills_count > (uint64_t)r->n_fills)
+        fprintf(fp,
+            "<p class=\"note\">Showing the most recent %u of %"
+            PRIu64 " fills (capture ring cap); earlier trades omitted."
+            "</p>\n", r->n_fills,
+            (uint64_t)st->lifetime_fills_count);
+
+      fputs("<div class=\"tbl-scroll\">\n", fp);
+      n_trades = wm_bt_idx_emit_trades(fp, sweep_dir, r, i + 1, emit_mask);
+      fputs("</div>\n", fp);
+
+      if(n_trades == 0)
+        fputs("<p class=\"note\">No paired trades.</p>\n", fp);
+    }
+
+    fputs("</details>\n", fp);
+  }
+
+  fputs("</section>\n", fp);
+
+  // ---- footer ----
+  fputs("<footer>Generated by whenmoon backtest &middot; "
+        "siblings: <a href=\"report.md\">report.md</a>, "
+        "<a href=\"manifest.json\">manifest.json</a>, "
+        "<a href=\"iterations.jsonl\">iterations.jsonl</a>, "
+        "<a href=\"top-N.txt\">top-N.txt</a>. Charts use "
+        "Lightweight Charts (loads from CDN; needs network on first "
+        "view).</footer>\n", fp);
+
+  fputs("</div></body></html>\n", fp);
 
   mem_free(indices);
 

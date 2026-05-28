@@ -84,22 +84,6 @@ wm_bt_results_free_fills(wm_bt_sweep_result_t *results, uint32_t n)
   }
 }
 
-// WM-BT-8: highest set bit in the strategy's grain bitmask = primary
-// (visualization) grain. Returns WM_GRAN_MAX if no bits are set.
-static wm_gran_t
-wm_bt_primary_grain(uint16_t grains_mask)
-{
-  int g;
-
-  for(g = (int)WM_GRAN_MAX - 1; g >= 0; g--)
-  {
-    if((grains_mask & (uint16_t)(1u << g)) != 0)
-      return((wm_gran_t)g);
-  }
-
-  return(WM_GRAN_MAX);
-}
-
 // WM-BT-8: linear-scan slice-window builder. Returns the first and
 // one-past-last indices into `ring` such that bars [start, end) cover
 // [entry_ts - WM_BT_CHART_PADDING_BARS, exit_ts + WM_BT_CHART_PADDING_BARS]
@@ -162,16 +146,19 @@ wm_bt_chart_slice_indices(const wm_candle_full_t *ring, uint32_t ring_n,
   return(true);
 }
 
-// WM-BT-8: walk top-K iterations × subscribed grain set × matched
-// buy→sell fill pairs, emit one Lightweight Charts HTML per trade.
+// WM-BT-8: walk top-K iterations × every snapshot grain × matched
+// buy→sell fill pairs, emit one Lightweight Charts HTML per trade. All
+// grains the snapshot carries (1m..1d) are charted, not just the
+// strategy's subscribed grain(s), so a trade can be reviewed across
+// timeframes; empty rings are skipped.
 // Per-iteration directory `<sweep_dir>/charts/iter-K/` (1-based K) is
 // created lazily; mkdir EEXIST is benign. Skips iterations with zero
 // fills + unpairable fill sequences. Caller-visible:
 //   - cmd_reply "charts: emitted N file(s) across K iteration(s)"
 //   - cmd_reply "warn: ..." per chart_emit / mkdir failure (continues)
 //   - cmd_reply "warn: large sweep" once if total file count crosses
-//     WM_BT_CHARTS_WARN_THRESHOLD (a soft signal for operators who
-//     pair `--charts-all-grains` with a 6-grain strategy + huge top-N).
+//     WM_BT_CHARTS_WARN_THRESHOLD (a soft signal — 6 grains × many
+//     trades × a large top-N adds up fast).
 #define WM_BT_CHARTS_WARN_THRESHOLD  1000u
 
 static void
@@ -179,15 +166,13 @@ wm_bt_cmd_run_emit_charts(const cmd_ctx_t *ctx,
     const wm_bt_sweep_result_t *results, uint32_t n_results,
     const wm_bt_sweep_plan_t *plan,
     const wm_backtest_snapshot_t *snap,
-    const loaded_strategy_t *ls,
-    const char *sweep_dir, bool all_grains)
+    const char *sweep_dir)
 {
   uint64_t  cap_kv;
   uint32_t  top_n;
   uint32_t *top_idx;
   uint32_t  actual;
   uint32_t  k;
-  uint16_t  emit_mask;
   uint32_t  charts_emitted = 0;
   bool      warned_threshold = false;
   char      reply[640];
@@ -212,25 +197,10 @@ wm_bt_cmd_run_emit_charts(const cmd_ctx_t *ctx,
 
   actual = wm_bt_topk_compute(results, n_results, top_n, top_idx);
 
-  if(all_grains)
-  {
-    emit_mask = ls->meta.grains_mask;
-  }
-  else
-  {
-    wm_gran_t primary = wm_bt_primary_grain(ls->meta.grains_mask);
-
-    if(primary == WM_GRAN_MAX)
-    {
-      mem_free(top_idx);
-      cmd_reply(ctx,
-          "warn: charts: strategy declares no grains; nothing to plot");
-      return;
-    }
-
-    emit_mask = (uint16_t)(1u << primary);
-  }
-
+  // Chart every grain the snapshot carries (1m..1d), not just the
+  // strategy's subscribed grain(s): the aggregator computes all grains
+  // during warmup regardless of what the strategy reads, so each trade
+  // can be reviewed across timeframes. Empty rings are skipped below.
   for(k = 0; k < actual; k++)
   {
     const wm_bt_sweep_result_t *res = &results[top_idx[k]];
@@ -267,9 +237,6 @@ wm_bt_cmd_run_emit_charts(const cmd_ctx_t *ctx,
       uint32_t                ring_n;
       uint32_t                trade_idx = 0;
       uint32_t                f;
-
-      if(((emit_mask >> g) & 1u) == 0)
-        continue;
 
       ring   = snap->mkt.grain_arr[g];
       ring_n = snap->mkt.grain_n[g];
@@ -507,7 +474,6 @@ wm_bt_cmd_run(const cmd_ctx_t *ctx)
   bool                       have_walk     = false;
   bool                       have_oos      = false;
   bool                       charts_force  = false;  // --charts seen
-  bool                       charts_all_g  = false;  // --charts-all-grains seen
 
   st = whenmoon_get_state();
 
@@ -531,7 +497,7 @@ wm_bt_cmd_run(const cmd_ctx_t *ctx)
         " [--top-n K]"
         " [--walk-forward train=Td:test=Md:step=Sd]"
         " [--oos-tail PCT]"
-        " [--charts] [--charts-all-grains]");
+        " [--charts]");
     return;
   }
 
@@ -609,12 +575,6 @@ wm_bt_cmd_run(const cmd_ctx_t *ctx)
       if(strcmp(tok, "--charts") == 0)
       {
         charts_force = true;
-        continue;
-      }
-
-      if(strcmp(tok, "--charts-all-grains") == 0)
-      {
-        charts_all_g = true;
         continue;
       }
 
@@ -752,8 +712,7 @@ wm_bt_cmd_run(const cmd_ctx_t *ctx)
         snprintf(reply, sizeof(reply),
             "unknown flag '%s' (expected --fee-bps/--slip-bps/"
             "--size-frac/--cash/--config/--threads/--rank-by/"
-            "--top-n/--walk-forward/--oos-tail/--charts/"
-            "--charts-all-grains)",
+            "--top-n/--walk-forward/--oos-tail/--charts)",
             tok);
         cmd_reply(ctx, reply);
         wm_backtest_snapshot_free(snap);
@@ -1050,9 +1009,33 @@ wm_bt_cmd_run(const cmd_ctx_t *ctx)
         : (kv_get_int("plugin.whenmoon.backtest.charts_enabled") != 0);
 
     if(emit_charts)
+    {
       wm_bt_cmd_run_emit_charts(ctx, sweep_results,
-          sweep_plan.total_iters, &sweep_plan, snap, ls,
-          sweep_dir, charts_all_g);
+          sweep_plan.total_iters, &sweep_plan, snap, sweep_dir);
+
+      // index.html ties the emitted charts together: a per-config trade
+      // table where each row links to its chart. Written after the
+      // chart pass so every href points at an existing file.
+      err[0] = '\0';
+
+      if(wm_bt_render_index_html(sweep_dir, sweep_id, path_tok, snap,
+             name_tok, &sweep_plan, &sweep_mode, &params,
+             sweep_results, sweep_plan.total_iters,
+             n_ok, n_fail, wallclock_ms,
+             err, sizeof(err)) != SUCCESS)
+      {
+        snprintf(reply, sizeof(reply),
+            "warn: index.html write failed: %s",
+            err[0] != '\0' ? err : "(unknown)");
+        cmd_reply(ctx, reply);
+      }
+      else
+      {
+        snprintf(reply, sizeof(reply),
+            "index: open %s/index.html", sweep_dir);
+        cmd_reply(ctx, reply);
+      }
+    }
   }
 
   snprintf(reply, sizeof(reply),
@@ -1649,7 +1632,7 @@ wm_backtest_register_verbs(void)
         " [--top-n K]"
         " [--walk-forward train=Td:test=Md:step=Sd]"
         " [--oos-tail PCT]"
-        " [--charts] [--charts-all-grains]",
+        " [--charts]",
         "Run a backtest against a compiled .wm snapshot — single"
         " iteration, parameter sweep, walk-forward, or OOS-tail"
         " validation.",
@@ -1694,13 +1677,17 @@ wm_backtest_register_verbs(void)
         "--charts forces Lightweight Charts HTML emission for this"
         " run (default-off unless"
         " plugin.whenmoon.backtest.charts_enabled=true). One file"
-        " per matched buy→sell trade pair per subscribed grain for"
-        " each top-K iteration, written to charts/iter-K/trade-M-"
-        "<gran>.html. Defaults to the strategy's primary"
-        " (highest-TF) grain; --charts-all-grains widens to every"
-        " subscribed grain (warning: 6-grain strategies + large"
-        " top-N can produce thousands of files). Top-K count is"
-        " also capped by plugin.whenmoon.backtest.charts_top_n.",
+        " per matched buy→sell trade pair, for EVERY grain the"
+        " snapshot carries (1m..1d) — not just the strategy's"
+        " subscribed grain — so each trade can be reviewed across"
+        " timeframes, written to charts/iter-K/trade-M-<gran>.html"
+        " (warning: 6 grains × many trades × large top-N can produce"
+        " thousands of files; cap top-K via"
+        " plugin.whenmoon.backtest.charts_top_n)."
+        " When charts are emitted, an index.html landing page is also"
+        " written at the sweep root: summary cards, per-config swept"
+        " args + metrics, and a per-trade P/L table whose rows link to"
+        " each trade's per-grain charts — open it first.",
         USERNS_GROUP_ADMIN, 100, CMD_SCOPE_ANY, METHOD_T_ANY,
         wm_bt_cmd_run, NULL, "whenmoon/backtest", NULL,
         NULL, 0, NULL, NULL) != SUCCESS)

@@ -121,6 +121,27 @@ bool wm_bt_render_report_md(const char *sweep_dir,
     uint32_t n_ok, uint32_t n_fail, uint64_t wallclock_ms,
     char *err, size_t err_cap);
 
+// Render `<sweep_dir>/index.html` — a self-contained, browser-friendly
+// landing page for the sweep. Summarises the run (market / range / mode
+// / rank-by / fixed economics), lists every charted (top-K) config with
+// its swept arguments + headline metrics, and for each gives a per-trade
+// table (entry/exit time + price, qty, P/L $ and %, exit reason) where
+// each row links to the matching Lightweight-Charts visualization under
+// `charts/iter-K/`. The per-trade chart links are emitted for every
+// grain the snapshot carries (`snap->mkt.grain_n[g] > 0`) — identical
+// to the chart pass — so the generated hrefs point at files that exist.
+// The top-K cap honours `plugin.whenmoon.backtest.charts_top_n` exactly
+// as the chart pass does. Atomic write via tmp + rename. Intended to be
+// called right after chart emission so all linked files are present.
+bool wm_bt_render_index_html(const char *sweep_dir,
+    const char *sweep_id, const char *wm_path,
+    const wm_backtest_snapshot_t *snap, const char *strategy,
+    const wm_bt_sweep_plan_t *plan, const wm_bt_sweep_mode_t *mode,
+    const wm_backtest_params_t *fixed_params,
+    const wm_bt_sweep_result_t *results, uint32_t n_results,
+    uint32_t n_ok, uint32_t n_fail, uint64_t wallclock_ms,
+    char *err, size_t err_cap);
+
 // Heap-owned listing of sweep dir entries. names[i] is a NUL-terminated
 // string heap-strdup'd from the on-disk dirent name. Free via
 // wm_bt_dir_listing_free.

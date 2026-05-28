@@ -571,6 +571,11 @@ wm_backtest_run_iteration_with_id(whenmoon_state_t *st,
   uint64_t                        fills_paper;
   double                          realized_paper;
   struct timespec                 t0, t1;
+  wm_market_session_t            *sess;
+  wm_market_fill_t               *acc_fills;
+  uint32_t                        acc_n;
+  uint32_t                        acc_cap;
+  uint64_t                        prev_fn;
 
   if(err != NULL && err_cap > 0)
     err[0] = '\0';
@@ -657,6 +662,21 @@ wm_backtest_run_iteration_with_id(whenmoon_state_t *st,
     }
   }
 
+  // Lossless fill capture for the chart emitter. The session's PAPER
+  // fills ring only retains the last WM_MARKET_FILL_RING_CAP (256)
+  // fills, so reading it once at the end silently drops the oldest
+  // trades from the charts on any run with > 256 fills. Instead we
+  // drain new fills into this growable buffer right after each
+  // callback, before the ring can wrap. The engine records <= 1 fill
+  // per on_bar, so this loses nothing. acc_fills stays NULL (and
+  // acc_n 0) when the iteration trades nothing — the caller's free
+  // path guards NULL.
+  sess      = &synth_mk->session;
+  acc_fills = NULL;
+  acc_n     = 0;
+  acc_cap   = 0;
+  prev_fn   = sess->fills_n[WM_MARKET_MODE_PAPER];
+
   clock_gettime(CLOCK_MONOTONIC, &t0);
 
   // Merged chronological walk. Equal-ts ties resolve in grain order
@@ -698,6 +718,37 @@ wm_backtest_run_iteration_with_id(whenmoon_state_t *st,
 
         on_bar_fn(&ctx, &snap->mkt, g, bar);
         bars_replayed++;
+
+        // Drain any fill(s) this callback produced into the lossless
+        // accumulator before the 256-slot ring can overwrite them.
+        // back counts down delta..1; each indexes a still-resident
+        // ring slot since the engine adds <= 1 fill per callback.
+        {
+          uint64_t now_fn = sess->fills_n[WM_MARKET_MODE_PAPER];
+
+          while(prev_fn < now_fn)
+          {
+            uint32_t back = (uint32_t)(now_fn - prev_fn);
+            uint32_t ridx = (sess->fills_head[WM_MARKET_MODE_PAPER]
+                             + WM_MARKET_FILL_RING_CAP - back)
+                            % WM_MARKET_FILL_RING_CAP;
+
+            if(acc_n == acc_cap)
+            {
+              uint32_t newcap = acc_cap ? acc_cap * 2u : 256u;
+
+              acc_fills = (acc_cap == 0)
+                  ? mem_alloc("whenmoon.backtest", "iter_fills",
+                        sizeof(*acc_fills) * (size_t)newcap)
+                  : mem_realloc(acc_fills,
+                        sizeof(*acc_fills) * (size_t)newcap);
+              acc_cap = newcap;
+            }
+
+            acc_fills[acc_n++] = sess->fills[WM_MARKET_MODE_PAPER][ridx];
+            prev_fn++;
+          }
+        }
       }
     }
 
@@ -712,6 +763,9 @@ wm_backtest_run_iteration_with_id(whenmoon_state_t *st,
   // Snapshot the synth market's session before tearing it down.
   if(wm_market_session_snapshot(synth_mk, &out->trade) != SUCCESS)
   {
+    if(acc_fills != NULL)
+      mem_free(acc_fills);
+
     wm_market_destroy_synthetic(synth_mk);
 
     if(err != NULL)
@@ -719,51 +773,11 @@ wm_backtest_run_iteration_with_id(whenmoon_state_t *st,
     return(FAIL);
   }
 
-  // WM-BT-8: deep fills capture for the chart emitter. The synth's
-  // PAPER fills ring is the source of truth; the 16-fill recent_fills
-  // tail inside wm_market_session_snapshot_t is too shallow for
-  // charting. We snapshot at most WM_MARKET_FILL_RING_CAP (256) fills
-  // — if the iteration produced more, the live ring already wrapped
-  // and the oldest fills are gone. Oldest-to-newest order so the
-  // chart emitter walks fills in trade-time order. Alloc failure is
-  // non-fatal: charts simply skip this iteration's trades.
-  {
-    wm_market_session_t *s = &synth_mk->session;
-    uint64_t             total_paper =
-        s->fills_n[WM_MARKET_MODE_PAPER];
-    uint32_t             n_capture = (total_paper > WM_MARKET_FILL_RING_CAP)
-                                   ? WM_MARKET_FILL_RING_CAP
-                                   : (uint32_t)total_paper;
-
-    if(n_capture > 0)
-    {
-      wm_market_fill_t *buf = mem_alloc("whenmoon.backtest",
-          "iter_fills", sizeof(*buf) * (size_t)n_capture);
-
-      if(buf != NULL)
-      {
-        uint32_t i;
-
-        for(i = 0; i < n_capture; i++)
-        {
-          uint32_t idx = (s->fills_head[WM_MARKET_MODE_PAPER]
-                          + WM_MARKET_FILL_RING_CAP - n_capture + i)
-                         % WM_MARKET_FILL_RING_CAP;
-          buf[i] = s->fills[WM_MARKET_MODE_PAPER][idx];
-        }
-
-        out->fills   = buf;
-        out->n_fills = n_capture;
-      }
-      else
-      {
-        clam(CLAM_WARN, WM_BT_CTX,
-            "iter %s/%s: fills capture alloc failed (n=%u);"
-            " charts will skip this iteration",
-            snap->source_market_id, strat_copy, n_capture);
-      }
-    }
-  }
+  // Hand the lossless fill accumulator (every PAPER fill, oldest-to-
+  // newest) to the result for the chart emitter. NULL/0 when the
+  // iteration traded nothing; the caller's free path guards NULL.
+  out->fills   = acc_fills;
+  out->n_fills = acc_n;
 
   fills_paper    =
       out->trade.stats[WM_MARKET_MODE_PAPER].lifetime_fills_count;
