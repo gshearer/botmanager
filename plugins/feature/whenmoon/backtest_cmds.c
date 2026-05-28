@@ -308,10 +308,10 @@ wm_bt_cmd_run_emit_charts(const cmd_ctx_t *ctx,
            charts_emitted > WM_BT_CHARTS_WARN_THRESHOLD)
         {
           snprintf(reply, sizeof(reply),
-              "warn: charts: %u files emitted so far across %u top-K"
-              " iter(s); large sweep — consider"
-              " --top-n / single-grain filtering",
-              charts_emitted, actual);
+              "warn: charts: %u files emitted so far (one per round-trip"
+              " trade x every grain); this is a long backtest — the"
+              " charts/ dir will be large",
+              charts_emitted);
           cmd_reply(ctx, reply);
           warned_threshold = true;
         }
@@ -999,16 +999,33 @@ wm_bt_cmd_run(const cmd_ctx_t *ctx)
     cmd_reply(ctx, reply);
   }
 
-  // WM-BT-8: chart emission. --charts forces on; otherwise the KV
-  // `plugin.whenmoon.backtest.charts_enabled` BOOL gate decides.
-  // Skipped when no iterations succeeded (top-K would be empty).
+  // Chart + index.html emission. --charts forces on; otherwise the KV
+  // `plugin.whenmoon.backtest.charts_enabled` BOOL gate decides. Charts
+  // are a per-trade analysis artifact for ONE config — every grain the
+  // snapshot carries is plotted per matched trade, so the file count is
+  // (round-trip trades * grains) for a single run. A parameter sweep
+  // would multiply that by the charted top-K (default 20), producing
+  // tens of thousands of files for a tuning run that wants the ranked
+  // metrics table, not per-trade charts. So charts/index are emitted
+  // ONLY for a single-config run (total_iters == 1); a sweep gets the
+  // metrics artifacts (report.md / iterations.jsonl / top-N) and a note
+  // to re-run the chosen config on its own to chart it. Skipped when no
+  // iterations succeeded (top-K would be empty).
   if(n_ok > 0)
   {
     bool emit_charts = charts_force
         ? true
         : (kv_get_int("plugin.whenmoon.backtest.charts_enabled") != 0);
 
-    if(emit_charts)
+    if(emit_charts && sweep_plan.total_iters > 1)
+    {
+      cmd_reply(ctx,
+          "charts: skipped — this is a parameter sweep; charts + index"
+          " are emitted only for single-config runs (a sweep would emit"
+          " trades x grains x top-K files). Re-run the chosen config with"
+          " no sweep axes to chart it.");
+    }
+    else if(emit_charts)
     {
       wm_bt_cmd_run_emit_charts(ctx, sweep_results,
           sweep_plan.total_iters, &sweep_plan, snap, sweep_dir);
@@ -1676,16 +1693,15 @@ wm_backtest_register_verbs(void)
         " a charts/ subdir.\n"
         "--charts forces Lightweight Charts HTML emission for this"
         " run (default-off unless"
-        " plugin.whenmoon.backtest.charts_enabled=true). One file"
-        " per matched buy→sell trade pair, for EVERY grain the"
-        " snapshot carries (1m..1d) — not just the strategy's"
-        " subscribed grain — so each trade can be reviewed across"
-        " timeframes, written to charts/iter-K/trade-M-<gran>.html"
-        " (warning: 6 grains × many trades × large top-N can produce"
-        " thousands of files; cap top-K via"
-        " plugin.whenmoon.backtest.charts_top_n)."
-        " When charts are emitted, an index.html landing page is also"
-        " written at the sweep root: summary cards, per-config swept"
+        " plugin.whenmoon.backtest.charts_enabled=true). SINGLE-CONFIG"
+        " RUNS ONLY: charts are a per-trade analysis artifact, so a"
+        " parameter sweep skips them (it would emit trades x grains x"
+        " top-K files) and emits only the ranked metrics — re-run the"
+        " chosen config with no sweep axes to chart it. One file per"
+        " matched buy→sell trade pair, for EVERY grain the snapshot"
+        " carries (1m..1d), written to charts/trade-M-<gran>.html, so"
+        " the count is round-trip-trades x grains. An index.html landing"
+        " page is also written at the sweep root: summary cards, swept"
         " args + metrics, and a per-trade P/L table whose rows link to"
         " each trade's per-grain charts — open it first.",
         USERNS_GROUP_ADMIN, 100, CMD_SCOPE_ANY, METHOD_T_ANY,
