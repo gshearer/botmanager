@@ -1142,6 +1142,12 @@ wm_bt_sweep_run_one(wm_bt_pool_t *pool, uint32_t iter,
       pool->plan->score);
   result->run_id_db     = (int64_t)iter + 1;
 
+  // WM-BT-8: transfer ownership of the deep fills buffer to the result
+  // row. wm_bt_cmd_run's post-pass loop walks the table and frees each
+  // row's fills before the table itself.
+  result->fills         = bt_result.fills;
+  result->n_fills       = bt_result.n_fills;
+
   wm_bt_sweep_drop_iter_kv(synth_id);
 }
 
@@ -1790,6 +1796,17 @@ wm_bt_sweep_run_oos_validation(whenmoon_state_t *st,
       results[src_iter].oos_realized = st_paper->realized_pnl_lifetime;
       results[src_iter].oos_n_trades =
           (uint32_t)st_paper->lifetime_fills_count;
+    }
+
+    // WM-BT-8: OOS validation runs a second iteration purely for
+    // scoring; we don't chart the OOS-tail trades (the head sweep's
+    // top-K charts already cover the visualization story). Free the
+    // buffer the iteration captured.
+    if(bt_result.fills != NULL)
+    {
+      mem_free(bt_result.fills);
+      bt_result.fills   = NULL;
+      bt_result.n_fills = 0;
     }
 
     n_validated++;

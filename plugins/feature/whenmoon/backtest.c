@@ -719,6 +719,52 @@ wm_backtest_run_iteration_with_id(whenmoon_state_t *st,
     return(FAIL);
   }
 
+  // WM-BT-8: deep fills capture for the chart emitter. The synth's
+  // PAPER fills ring is the source of truth; the 16-fill recent_fills
+  // tail inside wm_market_session_snapshot_t is too shallow for
+  // charting. We snapshot at most WM_MARKET_FILL_RING_CAP (256) fills
+  // — if the iteration produced more, the live ring already wrapped
+  // and the oldest fills are gone. Oldest-to-newest order so the
+  // chart emitter walks fills in trade-time order. Alloc failure is
+  // non-fatal: charts simply skip this iteration's trades.
+  {
+    wm_market_session_t *s = &synth_mk->session;
+    uint64_t             total_paper =
+        s->fills_n[WM_MARKET_MODE_PAPER];
+    uint32_t             n_capture = (total_paper > WM_MARKET_FILL_RING_CAP)
+                                   ? WM_MARKET_FILL_RING_CAP
+                                   : (uint32_t)total_paper;
+
+    if(n_capture > 0)
+    {
+      wm_market_fill_t *buf = mem_alloc("whenmoon.backtest",
+          "iter_fills", sizeof(*buf) * (size_t)n_capture);
+
+      if(buf != NULL)
+      {
+        uint32_t i;
+
+        for(i = 0; i < n_capture; i++)
+        {
+          uint32_t idx = (s->fills_head[WM_MARKET_MODE_PAPER]
+                          + WM_MARKET_FILL_RING_CAP - n_capture + i)
+                         % WM_MARKET_FILL_RING_CAP;
+          buf[i] = s->fills[WM_MARKET_MODE_PAPER][idx];
+        }
+
+        out->fills   = buf;
+        out->n_fills = n_capture;
+      }
+      else
+      {
+        clam(CLAM_WARN, WM_BT_CTX,
+            "iter %s/%s: fills capture alloc failed (n=%u);"
+            " charts will skip this iteration",
+            snap->source_market_id, strat_copy, n_capture);
+      }
+    }
+  }
+
   fills_paper    =
       out->trade.stats[WM_MARKET_MODE_PAPER].lifetime_fills_count;
   realized_paper =

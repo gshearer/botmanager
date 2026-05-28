@@ -36,11 +36,13 @@
 #include "market.h"
 #include "strategy.h"
 #include "sweep.h"
+#include "wm_bt_chart.h"
 #include "wm_bt_file.h"
 #include "wm_bt_report.h"
 
 #include "cmd.h"
 #include "common.h"
+#include "kv.h"
 #include "userns.h"
 
 #include <ctype.h>
@@ -49,6 +51,8 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/stat.h>
+#include <sys/types.h>
 #include <time.h>
 
 #include <json-c/json.h>
@@ -56,6 +60,306 @@
 // ----------------------------------------------------------------------- //
 // /whenmoon backtest run                                                  //
 // ----------------------------------------------------------------------- //
+
+// WM-BT-8: free every per-row deep fills buffer attached to a sweep
+// results table. Safe on a memset-zeroed table (NULL pointers no-op).
+// Resets pointers + counters so a follow-up double-free attempt also
+// no-ops.
+static void
+wm_bt_results_free_fills(wm_bt_sweep_result_t *results, uint32_t n)
+{
+  uint32_t i;
+
+  if(results == NULL)
+    return;
+
+  for(i = 0; i < n; i++)
+  {
+    if(results[i].fills != NULL)
+    {
+      mem_free(results[i].fills);
+      results[i].fills   = NULL;
+      results[i].n_fills = 0;
+    }
+  }
+}
+
+// WM-BT-8: highest set bit in the strategy's grain bitmask = primary
+// (visualization) grain. Returns WM_GRAN_MAX if no bits are set.
+static wm_gran_t
+wm_bt_primary_grain(uint16_t grains_mask)
+{
+  int g;
+
+  for(g = (int)WM_GRAN_MAX - 1; g >= 0; g--)
+  {
+    if((grains_mask & (uint16_t)(1u << g)) != 0)
+      return((wm_gran_t)g);
+  }
+
+  return(WM_GRAN_MAX);
+}
+
+// WM-BT-8: linear-scan slice-window builder. Returns the first and
+// one-past-last indices into `ring` such that bars [start, end) cover
+// [entry_ts - WM_BT_CHART_PADDING_BARS, exit_ts + WM_BT_CHART_PADDING_BARS]
+// clamped to [0, ring_n). Linear because rings cap at ~tens of
+// thousands at the deepest grain; a tighter binary search would not
+// matter at this scale. Returns false (no slice) when no bars fall
+// inside the window.
+static bool
+wm_bt_chart_slice_indices(const wm_candle_full_t *ring, uint32_t ring_n,
+    int64_t entry_ts_ms, int64_t exit_ts_ms,
+    uint32_t *out_start, uint32_t *out_end)
+{
+  uint32_t b;
+  uint32_t start;
+  uint32_t end;
+
+  if(ring == NULL || ring_n == 0)
+    return(false);
+
+  // First bar whose ts_close_ms >= entry_ts.
+  start = ring_n;
+
+  for(b = 0; b < ring_n; b++)
+  {
+    if(ring[b].ts_close_ms >= entry_ts_ms)
+    {
+      start = b;
+      break;
+    }
+  }
+
+  // Last bar whose ts_close_ms <= exit_ts (end exclusive => +1).
+  end = 0;
+
+  for(b = ring_n; b > 0; b--)
+  {
+    if(ring[b - 1].ts_close_ms <= exit_ts_ms)
+    {
+      end = b;
+      break;
+    }
+  }
+
+  if(start >= ring_n || end <= start)
+    return(false);
+
+  // Pad both sides; clamp to ring bounds.
+  if(start >= WM_BT_CHART_PADDING_BARS)
+    start -= WM_BT_CHART_PADDING_BARS;
+  else
+    start = 0;
+
+  if(end + WM_BT_CHART_PADDING_BARS < ring_n)
+    end += WM_BT_CHART_PADDING_BARS;
+  else
+    end = ring_n;
+
+  *out_start = start;
+  *out_end   = end;
+  return(true);
+}
+
+// WM-BT-8: walk top-K iterations × subscribed grain set × matched
+// buy→sell fill pairs, emit one Lightweight Charts HTML per trade.
+// Per-iteration directory `<sweep_dir>/charts/iter-K/` (1-based K) is
+// created lazily; mkdir EEXIST is benign. Skips iterations with zero
+// fills + unpairable fill sequences. Caller-visible:
+//   - cmd_reply "charts: emitted N file(s) across K iteration(s)"
+//   - cmd_reply "warn: ..." per chart_emit / mkdir failure (continues)
+//   - cmd_reply "warn: large sweep" once if total file count crosses
+//     WM_BT_CHARTS_WARN_THRESHOLD (a soft signal for operators who
+//     pair `--charts-all-grains` with a 6-grain strategy + huge top-N).
+#define WM_BT_CHARTS_WARN_THRESHOLD  1000u
+
+static void
+wm_bt_cmd_run_emit_charts(const cmd_ctx_t *ctx,
+    const wm_bt_sweep_result_t *results, uint32_t n_results,
+    const wm_bt_sweep_plan_t *plan,
+    const wm_backtest_snapshot_t *snap,
+    const loaded_strategy_t *ls,
+    const char *sweep_dir, bool all_grains)
+{
+  uint64_t  cap_kv;
+  uint32_t  top_n;
+  uint32_t *top_idx;
+  uint32_t  actual;
+  uint32_t  k;
+  uint16_t  emit_mask;
+  uint32_t  charts_emitted = 0;
+  bool      warned_threshold = false;
+  char      reply[640];
+
+  if(plan->top_k == 0 || n_results == 0)
+    return;
+
+  cap_kv = kv_get_uint("plugin.whenmoon.backtest.charts_top_n");
+  top_n  = plan->top_k;
+
+  if(cap_kv > 0 && (uint64_t)top_n > cap_kv)
+    top_n = (uint32_t)cap_kv;
+
+  top_idx = mem_alloc("whenmoon.backtest", "charts_top_idx",
+      sizeof(*top_idx) * (size_t)top_n);
+
+  if(top_idx == NULL)
+  {
+    cmd_reply(ctx, "warn: charts: top-K alloc failed");
+    return;
+  }
+
+  actual = wm_bt_topk_compute(results, n_results, top_n, top_idx);
+
+  if(all_grains)
+  {
+    emit_mask = ls->meta.grains_mask;
+  }
+  else
+  {
+    wm_gran_t primary = wm_bt_primary_grain(ls->meta.grains_mask);
+
+    if(primary == WM_GRAN_MAX)
+    {
+      mem_free(top_idx);
+      cmd_reply(ctx,
+          "warn: charts: strategy declares no grains; nothing to plot");
+      return;
+    }
+
+    emit_mask = (uint16_t)(1u << primary);
+  }
+
+  for(k = 0; k < actual; k++)
+  {
+    const wm_bt_sweep_result_t *res = &results[top_idx[k]];
+    char                        iter_dir[1280];
+    int                         n;
+    uint32_t                    g;
+
+    if(res->n_fills == 0 || res->fills == NULL)
+      continue;
+
+    n = snprintf(iter_dir, sizeof(iter_dir),
+        "%s/charts/iter-%u", sweep_dir, k + 1);
+
+    if(n < 0 || (size_t)n >= sizeof(iter_dir))
+    {
+      snprintf(reply, sizeof(reply),
+          "warn: charts: iter-%u dir path overflow", k + 1);
+      cmd_reply(ctx, reply);
+      continue;
+    }
+
+    if(mkdir(iter_dir, 0700) != 0 && errno != EEXIST)
+    {
+      snprintf(reply, sizeof(reply),
+          "warn: charts: mkdir('%.512s') failed: %s",
+          iter_dir, strerror(errno));
+      cmd_reply(ctx, reply);
+      continue;
+    }
+
+    for(g = 0; g < WM_GRAN_MAX; g++)
+    {
+      const wm_candle_full_t *ring;
+      uint32_t                ring_n;
+      uint32_t                trade_idx = 0;
+      uint32_t                f;
+
+      if(((emit_mask >> g) & 1u) == 0)
+        continue;
+
+      ring   = snap->mkt.grain_arr[g];
+      ring_n = snap->mkt.grain_n[g];
+
+      if(ring == NULL || ring_n == 0)
+        continue;
+
+      // Pair walk: buy at f, scan forward for matching sell. The
+      // PAPER market is long-only / flat — sequence is strict
+      // buy/sell/buy/sell — but defensive against unmatched buys
+      // (open-at-end-of-backtest) and stray sells (size mismatch).
+      for(f = 0; f < res->n_fills; f++)
+      {
+        const wm_market_fill_t *entry;
+        const wm_market_fill_t *exit_fill;
+        uint32_t                start_idx;
+        uint32_t                end_idx;
+        uint32_t                slice_n;
+        int64_t                 entry_ts;
+        int64_t                 exit_ts;
+        char                    chart_err[160];
+        uint32_t                e;
+
+        entry     = &res->fills[f];
+        exit_fill = NULL;
+
+        if(entry->side != 'b')
+          continue;
+
+        for(e = f + 1; e < res->n_fills; e++)
+        {
+          if(res->fills[e].side == 's')
+          {
+            exit_fill = &res->fills[e];
+            f         = e;          // skip past closing fill
+            break;
+          }
+        }
+
+        trade_idx++;
+
+        entry_ts = entry->ts_ms;
+        exit_ts  = (exit_fill != NULL) ? exit_fill->ts_ms : entry_ts;
+
+        if(!wm_bt_chart_slice_indices(ring, ring_n,
+               entry_ts, exit_ts, &start_idx, &end_idx))
+          continue;
+
+        slice_n = end_idx - start_idx;
+
+        chart_err[0] = '\0';
+
+        if(wm_bt_chart_emit(iter_dir, k + 1, trade_idx, (wm_gran_t)g,
+               &ring[start_idx], slice_n,
+               entry, exit_fill,
+               chart_err, sizeof(chart_err)) != SUCCESS)
+        {
+          snprintf(reply, sizeof(reply),
+              "warn: charts: iter-%u trade-%u %s: %s",
+              k + 1, trade_idx, wm_bt_chart_gran_name((wm_gran_t)g),
+              chart_err[0] != '\0' ? chart_err : "(unknown)");
+          cmd_reply(ctx, reply);
+          continue;
+        }
+
+        charts_emitted++;
+
+        if(!warned_threshold &&
+           charts_emitted > WM_BT_CHARTS_WARN_THRESHOLD)
+        {
+          snprintf(reply, sizeof(reply),
+              "warn: charts: %u files emitted so far across %u top-K"
+              " iter(s); large sweep — consider"
+              " --top-n / single-grain filtering",
+              charts_emitted, actual);
+          cmd_reply(ctx, reply);
+          warned_threshold = true;
+        }
+      }
+    }
+  }
+
+  mem_free(top_idx);
+
+  snprintf(reply, sizeof(reply),
+      "charts: emitted %u file(s) across %u top-K iteration(s)"
+      " -> %s/charts/",
+      charts_emitted, actual, sweep_dir);
+  cmd_reply(ctx, reply);
+}
 
 // Parse a numeric --flag value. On success, `*out_v` is the parsed
 // double and `*out_have` is set true. On failure, leaves both
@@ -202,6 +506,8 @@ wm_bt_cmd_run(const cmd_ctx_t *ctx)
   bool                       have_axes     = false;
   bool                       have_walk     = false;
   bool                       have_oos      = false;
+  bool                       charts_force  = false;  // --charts seen
+  bool                       charts_all_g  = false;  // --charts-all-grains seen
 
   st = whenmoon_get_state();
 
@@ -224,7 +530,8 @@ wm_bt_cmd_run(const cmd_ctx_t *ctx)
         " [--rank-by realized|sharpe|sortino|equity|pf]"
         " [--top-n K]"
         " [--walk-forward train=Td:test=Md:step=Sd]"
-        " [--oos-tail PCT]");
+        " [--oos-tail PCT]"
+        " [--charts] [--charts-all-grains]");
     return;
   }
 
@@ -297,6 +604,20 @@ wm_bt_cmd_run(const cmd_ctx_t *ctx)
   {
     if(tok[0] == '-' && tok[1] == '-')
     {
+      // Value-less flags (WM-BT-8). Recognise first so they don't
+      // accidentally steal the next flag's value token.
+      if(strcmp(tok, "--charts") == 0)
+      {
+        charts_force = true;
+        continue;
+      }
+
+      if(strcmp(tok, "--charts-all-grains") == 0)
+      {
+        charts_all_g = true;
+        continue;
+      }
+
       if(!wm_dl_next_token(&p, val_tok, sizeof(val_tok)))
       {
         snprintf(reply, sizeof(reply),
@@ -431,7 +752,8 @@ wm_bt_cmd_run(const cmd_ctx_t *ctx)
         snprintf(reply, sizeof(reply),
             "unknown flag '%s' (expected --fee-bps/--slip-bps/"
             "--size-frac/--cash/--config/--threads/--rank-by/"
-            "--top-n/--walk-forward/--oos-tail)",
+            "--top-n/--walk-forward/--oos-tail/--charts/"
+            "--charts-all-grains)",
             tok);
         cmd_reply(ctx, reply);
         wm_backtest_snapshot_free(snap);
@@ -570,6 +892,12 @@ wm_bt_cmd_run(const cmd_ctx_t *ctx)
     return;
   }
 
+  // WM-BT-8: zero the table so the per-row fills pointer starts at
+  // NULL; this lets the free-fills walker run safely on any exit path
+  // even before workers have populated rows.
+  memset(sweep_results, 0,
+      sizeof(*sweep_results) * (size_t)sweep_plan.total_iters);
+
   err[0] = '\0';
 
   if(wm_bt_iter_open(&writer, sweep_dir, err, sizeof(err)) != SUCCESS)
@@ -578,6 +906,7 @@ wm_bt_cmd_run(const cmd_ctx_t *ctx)
         "iterations.jsonl: %s",
         err[0] != '\0' ? err : "(unknown)");
     cmd_reply(ctx, reply);
+    wm_bt_results_free_fills(sweep_results, sweep_plan.total_iters);
     mem_free(sweep_results);
     wm_backtest_snapshot_free(snap);
     return;
@@ -627,6 +956,7 @@ wm_bt_cmd_run(const cmd_ctx_t *ctx)
         err[0] != '\0' ? err : "unknown");
     cmd_reply(ctx, reply);
     wm_bt_iter_close(&writer);
+    wm_bt_results_free_fills(sweep_results, sweep_plan.total_iters);
     mem_free(sweep_results);
     wm_backtest_snapshot_free(snap);
     return;
@@ -710,6 +1040,21 @@ wm_bt_cmd_run(const cmd_ctx_t *ctx)
     cmd_reply(ctx, reply);
   }
 
+  // WM-BT-8: chart emission. --charts forces on; otherwise the KV
+  // `plugin.whenmoon.backtest.charts_enabled` BOOL gate decides.
+  // Skipped when no iterations succeeded (top-K would be empty).
+  if(n_ok > 0)
+  {
+    bool emit_charts = charts_force
+        ? true
+        : (kv_get_int("plugin.whenmoon.backtest.charts_enabled") != 0);
+
+    if(emit_charts)
+      wm_bt_cmd_run_emit_charts(ctx, sweep_results,
+          sweep_plan.total_iters, &sweep_plan, snap, ls,
+          sweep_dir, charts_all_g);
+  }
+
   snprintf(reply, sizeof(reply),
       "complete: %u/%u ok, %u failed in %" PRIu64 " ms"
       " (%.1f iter/s); jsonl=%u rows -> %s/",
@@ -727,6 +1072,7 @@ wm_bt_cmd_run(const cmd_ctx_t *ctx)
   if(writer_open)
     wm_bt_iter_close(&writer);
 
+  wm_bt_results_free_fills(sweep_results, sweep_plan.total_iters);
   mem_free(sweep_results);
   wm_backtest_snapshot_free(snap);
 }
@@ -1302,7 +1648,8 @@ wm_backtest_register_verbs(void)
         " [--rank-by realized|sharpe|sortino|equity|pf]"
         " [--top-n K]"
         " [--walk-forward train=Td:test=Md:step=Sd]"
-        " [--oos-tail PCT]",
+        " [--oos-tail PCT]"
+        " [--charts] [--charts-all-grains]",
         "Run a backtest against a compiled .wm snapshot — single"
         " iteration, parameter sweep, walk-forward, or OOS-tail"
         " validation.",
@@ -1342,9 +1689,18 @@ wm_backtest_register_verbs(void)
         "Each invocation writes a sweep directory under"
         " plugin.whenmoon.backtest.report_path (defaulting to"
         " $HOME/.local/share/botmanager/backtests/) containing"
-        " manifest.json, iterations.jsonl, top-N.txt (BT-7"
-        " placeholder), and an empty charts/ subdir (filled by"
-        " BT-8 when plugin.whenmoon.backtest.charts_enabled=true).",
+        " manifest.json, iterations.jsonl, top-N.txt, report.md, and"
+        " a charts/ subdir.\n"
+        "--charts forces Lightweight Charts HTML emission for this"
+        " run (default-off unless"
+        " plugin.whenmoon.backtest.charts_enabled=true). One file"
+        " per matched buy→sell trade pair per subscribed grain for"
+        " each top-K iteration, written to charts/iter-K/trade-M-"
+        "<gran>.html. Defaults to the strategy's primary"
+        " (highest-TF) grain; --charts-all-grains widens to every"
+        " subscribed grain (warning: 6-grain strategies + large"
+        " top-N can produce thousands of files). Top-K count is"
+        " also capped by plugin.whenmoon.backtest.charts_top_n.",
         USERNS_GROUP_ADMIN, 100, CMD_SCOPE_ANY, METHOD_T_ANY,
         wm_bt_cmd_run, NULL, "whenmoon/backtest", NULL,
         NULL, 0, NULL, NULL) != SUCCESS)

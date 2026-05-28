@@ -162,6 +162,13 @@ typedef struct
   char                  oos_err[160];       // populated when have_oos
                                             // is intended but the
                                             // validation iter failed
+
+  // WM-BT-8: deep fills buffer transferred from wm_backtest_result_t
+  // by wm_bt_sweep_run_one. Owner is the sweep_results table; the
+  // caller (wm_bt_cmd_run) frees each row's buffer before freeing
+  // the table itself.
+  wm_market_fill_t     *fills;
+  uint32_t              n_fills;
 } wm_bt_sweep_result_t;
 
 // Score extraction from a synth-market snapshot. NaN/inf collapse to

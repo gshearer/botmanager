@@ -184,6 +184,15 @@ typedef struct wm_backtest_result
   uint32_t                      bars_replayed;
   uint64_t                      wallclock_ms;
   wm_market_session_snapshot_t  trade;            // final synth-market snapshot
+
+  // WM-BT-8: deep fills buffer for the chart emitter. Captured from the
+  // synth market's PAPER fills ring immediately before
+  // wm_market_destroy_synthetic; oldest-to-newest order. Heap-owned via
+  // mem_alloc; ownership transfers to the caller (the sweep result row
+  // or the OOS validation block frees it). NULL/0 when the iteration
+  // produced no fills.
+  wm_market_fill_t             *fills;
+  uint32_t                      n_fills;
 } wm_backtest_result_t;
 
 // ----------------------------------------------------------------------- //
