@@ -57,7 +57,7 @@ extern "C" {
 // here so strategy plugins do not need an include path into the
 // internal whenmoon directory.
 
-#define WM_INDICATOR_SCHEMA_VERSION  2
+#define WM_INDICATOR_SCHEMA_VERSION  3
 
 typedef enum
 {
@@ -153,6 +153,14 @@ enum
   // every grain.
   WM_IND_SMA_7  = WM_IND_RESERVED_BASE,
   WM_IND_SMA_25,
+
+  // Schema v3 additions (2026-05-28): custom (non-TA-Lib) indicators,
+  // computed in indicators_custom.c alongside the TA-Lib pass. Fisher
+  // Transform (Ehlers): the median price (high+low)/2 is normalized to
+  // its rolling `period`-bar range and mapped through a Gaussian so
+  // turning points are sharp. Unbounded but oscillates roughly within
+  // +-5; readings past about +-3 flag an over-extended move. Period 9.
+  WM_IND_FISHER,
 
   WM_IND_COUNT = 50
 };

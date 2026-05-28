@@ -16,6 +16,7 @@
 
 #define WHENMOON_INTERNAL
 #include "indicators.h"
+#include "indicators_custom.h"
 
 #include <ta-lib/ta_libc.h>
 
@@ -34,58 +35,6 @@ wm_ta_pick_last(TA_RetCode rc, int nb, const double *out)
     return((float)NAN);
 
   return((float)out[nb - 1]);
-}
-
-// ------------------------------------------------------------------ //
-// VWAP / VPT — TA-Lib does not ship these; compute inline.            //
-// ------------------------------------------------------------------ //
-
-// VWAP rolling window: sum(typical_price * volume) / sum(volume) over
-// the last `period` bars. Returns NaN when the window has zero total
-// volume (entirely empty bars).
-static float
-wm_calc_vwap(const double *highs, const double *lows,
-    const double *closes, const double *vols, int n, int period)
-{
-  double pv = 0.0;
-  double v  = 0.0;
-  int    i;
-
-  if(n < period || period <= 0)
-    return((float)NAN);
-
-  for(i = n - period; i < n; i++)
-  {
-    double tp = (highs[i] + lows[i] + closes[i]) / 3.0;
-    pv += tp * vols[i];
-    v  += vols[i];
-  }
-
-  if(v <= 0.0)
-    return((float)NAN);
-
-  return((float)(pv / v));
-}
-
-// VPT cumulative: VPT_t = VPT_{t-1} + V_t * (C_t - C_{t-1}) / C_{t-1}.
-// Computed from the start of the window for stability — strategies
-// reading the value should care about delta, not the absolute level.
-static float
-wm_calc_vpt(const double *closes, const double *vols, int n)
-{
-  double vpt = 0.0;
-  int    i;
-
-  if(n < 2)
-    return((float)NAN);
-
-  for(i = 1; i < n; i++)
-  {
-    if(closes[i - 1] > 0.0)
-      vpt += vols[i] * (closes[i] - closes[i - 1]) / closes[i - 1];
-  }
-
-  return((float)vpt);
 }
 
 // ------------------------------------------------------------------ //
@@ -202,6 +151,10 @@ wm_indicators_compute_bar(const wm_candle_full_t *ring,
   rc = TA_CCI(0, (int)take - 1, highs, lows, closes, 20,
       &beg, &nb, out);
   bar->ind[WM_IND_CCI_20] = wm_ta_pick_last(rc, nb, out);
+
+  // Fisher Transform (custom — indicators_custom.c) -----------------
+  bar->ind[WM_IND_FISHER] =
+      wm_calc_fisher(highs, lows, (int)take, WM_FISHER_PERIOD);
 
   // Bollinger Bands (20, 2, 2, SMA) + %B -----------------------------
   rc = TA_BBANDS(0, (int)take - 1, closes,
