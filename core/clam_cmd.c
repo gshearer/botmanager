@@ -626,45 +626,98 @@ render_dest(const ccd_dest_t *d, char *out, size_t out_sz)
   out[0] = '\0';
 }
 
+#define SHOW_CLAM_LINE_SZ 256
+
+// Append one rendered line into a heap-grown buffer. Each line occupies a
+// fixed SHOW_CLAM_LINE_SZ slot so the whole block is a single allocation.
+static bool
+show_clam_push(char **lines, size_t *n_lines, size_t *cap,
+    const char *text)
+{
+  if(*n_lines == *cap)
+  {
+    size_t  ncap = *cap == 0 ? 16 : *cap * 2;
+    char   *grown;
+
+    // mem_realloc() aborts on a NULL pointer (alloc.c:166) — it is not a
+    // malloc() substitute. Use mem_alloc() for the first block, then grow.
+    if(*lines == NULL)
+      grown = mem_alloc("clam_cmd", "show_lines", ncap * SHOW_CLAM_LINE_SZ);
+    else
+      grown = mem_realloc(*lines, ncap * SHOW_CLAM_LINE_SZ);
+
+    if(grown == NULL)
+      return(false);
+
+    *lines = grown;
+    *cap   = ncap;
+  }
+
+  snprintf(*lines + *n_lines * SHOW_CLAM_LINE_SZ, SHOW_CLAM_LINE_SZ,
+      "%s", text);
+  (*n_lines)++;
+  return(true);
+}
+
 static void
 cmd_show_clam(const cmd_ctx_t *ctx)
 {
+  char    *lines = NULL;
+  size_t   n_lines = 0;
+  size_t   cap = 0;
+  size_t   i;
   uint32_t n = 0;
-  char foot[64];
+  char     foot[64];
 
+  // Render every reply line under clam_cmd_mutex into a local buffer,
+  // release the lock, then emit. cmd_reply routes out via method_send ->
+  // irc_send_raw -> clam(), and clam() dispatches into clam_cmd_shared_cb
+  // which re-locks clam_cmd_mutex. Calling cmd_reply while holding the
+  // lock self-deadlocks this non-recursive mutex on the same thread (and
+  // pins clam_mutex across clam()'s dispatch loop, freezing the daemon).
+  // Same hazard the clam_subscribe / clam_unsubscribe comment warns of.
   pthread_mutex_lock(&clam_cmd_mutex);
-
-  if(clam_cmd_subs == NULL)
-  {
-    pthread_mutex_unlock(&clam_cmd_mutex);
-    cmd_reply(ctx, "  (no user subscriptions)");
-    return;
-  }
 
   for(clam_user_sub_t *s = clam_cmd_subs; s != NULL; s = s->next)
   {
-    char hdr[256];
+    char hdr[SHOW_CLAM_LINE_SZ];
 
     snprintf(hdr, sizeof(hdr),
         "  %-20s sev=%u regex=%s owner=%s",
         s->name, s->sev,
         s->has_regex ? s->regex_str : "*",
         s->owner[0] != '\0' ? s->owner : "-");
-    cmd_reply(ctx, hdr);
 
-    for(size_t i = 0; i < s->n_dests; i++)
+    if(!show_clam_push(&lines, &n_lines, &cap, hdr))
+      break;
+
+    for(size_t d = 0; d < s->n_dests; d++)
     {
-      char line[256];
       char dbuf[192];
+      char line[SHOW_CLAM_LINE_SZ];
 
-      render_dest(&s->dests[i], dbuf, sizeof(dbuf));
+      render_dest(&s->dests[d], dbuf, sizeof(dbuf));
       snprintf(line, sizeof(line), "      -> %s", dbuf);
-      cmd_reply(ctx, line);
+
+      if(!show_clam_push(&lines, &n_lines, &cap, line))
+        break;
     }
+
     n++;
   }
 
   pthread_mutex_unlock(&clam_cmd_mutex);
+
+  if(n == 0)
+  {
+    cmd_reply(ctx, "  (no user subscriptions)");
+    return;
+  }
+
+  for(i = 0; i < n_lines; i++)
+    cmd_reply(ctx, lines + i * SHOW_CLAM_LINE_SZ);
+
+  mem_free(lines);
 
   snprintf(foot, sizeof(foot), "%u subscription%s",
       (unsigned)n, n == 1 ? "" : "s");

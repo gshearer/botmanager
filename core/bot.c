@@ -652,32 +652,49 @@ bot_get_userns(const bot_inst_t *inst)
 void
 bot_clear_userns(const char *ns_name)
 {
+  #define MAX_CLEARED_BOTS 128
+
+  char     cleared[MAX_CLEARED_BOTS][BOT_NAME_SZ];
+  uint32_t n = 0;
+  uint32_t i;
+
   if(ns_name == NULL || ns_name[0] == '\0')
     return;
 
+  // Snapshot matched names + null the binding under the lock; emit
+  // clam() + kv_set_str() (both can log -> re-enter bot_mutex via
+  // clam_cmd_shared_cb -> bot_find) only AFTER releasing bot_mutex.
   pthread_mutex_lock(&bot_mutex);
 
-  for(bot_inst_t *b = bot_list; b != NULL; b = b->next)
+  for(bot_inst_t *b = bot_list; b != NULL && n < MAX_CLEARED_BOTS;
+      b = b->next)
   {
     if(b->userns != NULL
         && strncasecmp(b->userns->name, ns_name, USERNS_NAME_SZ) == 0)
     {
-      clam(CLAM_INFO, "bot_clear_userns",
-          "'%s': namespace '%s' removed, clearing binding",
-          b->name, ns_name);
-      {
-        char key[KV_KEY_SZ];
-
-        b->userns = NULL;
-
-        // Clear the KV key so the binding doesn't persist.
-        snprintf(key, sizeof(key), "bot.%s.userns", b->name);
-        kv_set_str(key, "");
-      }
+      snprintf(cleared[n], sizeof(cleared[n]), "%s", b->name);
+      n++;
+      b->userns = NULL;          // pointer null only — safe under lock
     }
   }
 
   pthread_mutex_unlock(&bot_mutex);
+
+  for(i = 0; i < n; i++)
+  {
+    char key[KV_KEY_SZ];
+
+    clam(CLAM_INFO, "bot_clear_userns",
+        "'%s': namespace '%s' removed, clearing binding", cleared[i], ns_name);
+
+    // Clear the KV key so the binding doesn't persist. Precision bound
+    // keeps -Wformat-truncation quiet across the 2-D snapshot array.
+    snprintf(key, sizeof(key), "bot.%.*s.userns",
+        (int)(sizeof(cleared[i]) - 1), cleared[i]);
+    kv_set_str(key, "");
+  }
+
+  #undef MAX_CLEARED_BOTS
 }
 
 // Session tracking
@@ -1415,27 +1432,74 @@ bot_get_stats(bot_stats_t *out)
 
 // Iteration
 
+// Per-bot snapshot row for bot_iterate. Lets the iteration invoke
+// callbacks with bot_mutex released — a callback may emit (cmd_reply ->
+// method_send -> clam() -> clam_cmd_shared_cb -> bot_find), which
+// re-locks bot_mutex on the same thread; calling the callback under the
+// lock self-deadlocks. Mirrors method_iterate_instances.
+typedef struct
+{
+  char        name[BOT_NAME_SZ];
+  char        driver_name[BOT_NAME_SZ];
+  bot_state_t state;
+  uint32_t    method_count;
+  uint32_t    session_count;
+  char        userns_name[USERNS_NAME_SZ];
+  bool        has_userns;
+  uint64_t    cmd_count;
+  time_t      last_activity;
+} bot_snap_t;
+
 void
 bot_iterate(bot_iter_cb_t cb, void *data)
 {
+  // Cap is generous for a dev instance; excess dropped silently (matches
+  // method_iterate_instances / method_iterate_drivers).
+  #define MAX_ITER_BOTS 128
+
+  bot_snap_t snap[MAX_ITER_BOTS];
+  uint32_t   count = 0;
+  uint32_t   i;
+
   if(cb == NULL)
     return;
 
   pthread_mutex_lock(&bot_mutex);
 
-  for(bot_inst_t *b = bot_list; b != NULL; b = b->next)
+  for(bot_inst_t *b = bot_list; b != NULL && count < MAX_ITER_BOTS;
+      b = b->next)
   {
+    bot_snap_t *s = &snap[count];
     const char *drv_name = (b->driver && b->driver->name)
         ? b->driver->name : "(unknown)";
-    const char *ns_name = (b->userns != NULL)
-        ? b->userns->name : NULL;
 
-    cb(b->name, drv_name, b->state, b->method_count,
-        b->session_count, ns_name, b->cmd_count,
-        b->last_activity, data);
+    snprintf(s->name, sizeof(s->name), "%s", b->name);
+    snprintf(s->driver_name, sizeof(s->driver_name), "%s", drv_name);
+    s->state         = b->state;
+    s->method_count  = b->method_count;
+    s->session_count = b->session_count;
+    s->has_userns    = (b->userns != NULL);
+
+    if(s->has_userns)
+      snprintf(s->userns_name, sizeof(s->userns_name), "%s",
+          b->userns->name);
+    else
+      s->userns_name[0] = '\0';
+
+    s->cmd_count     = b->cmd_count;
+    s->last_activity = b->last_activity;
+    count++;
   }
 
   pthread_mutex_unlock(&bot_mutex);
+
+  for(i = 0; i < count; i++)
+    cb(snap[i].name, snap[i].driver_name, snap[i].state,
+        snap[i].method_count, snap[i].session_count,
+        snap[i].has_userns ? snap[i].userns_name : NULL,
+        snap[i].cmd_count, snap[i].last_activity, data);
+
+  #undef MAX_ITER_BOTS
 }
 
 bool
@@ -1576,16 +1640,35 @@ bot_kv_changed(const char *key, void *data)
 
 // Session idle expiry
 
+// One pending expiry notification, captured under bot_mutex and
+// emitted after the lock is released (clam() + method_send() both log
+// -> re-enter bot_mutex via clam_cmd_shared_cb -> bot_find).
+typedef struct
+{
+  char           bot_name[BOT_NAME_SZ];
+  char           username[USERNS_USER_SZ];
+  char           sender[METHOD_SENDER_SZ];
+  method_inst_t *method;
+  long           idle;
+  uint32_t       timeout;
+} reaper_notify_t;
+
 // Periodic task callback: scan all running bot instances and expire
 // sessions where (now - last_seen) exceeds the bot's maxidleauth.
 static void
 bot_session_reaper(task_t *t)
 {
-  time_t now = time(NULL);
+  #define MAX_REAP_PER_TICK 64
+
+  reaper_notify_t notify[MAX_REAP_PER_TICK];
+  uint32_t        nn = 0;
+  uint32_t        i;
+  time_t          now = time(NULL);
 
   pthread_mutex_lock(&bot_mutex);
 
-  for(bot_inst_t *inst = bot_list; inst != NULL; inst = inst->next)
+  for(bot_inst_t *inst = bot_list;
+      inst != NULL && nn < MAX_REAP_PER_TICK; inst = inst->next)
   {
     char           key[KV_KEY_SZ];
     uint32_t       maxidle;
@@ -1601,7 +1684,7 @@ bot_session_reaper(task_t *t)
 
     s = inst->sessions;
 
-    while(s != NULL)
+    while(s != NULL && nn < MAX_REAP_PER_TICK)
     {
       bot_session_t *next = s->next;
       uint32_t       timeout = 0;
@@ -1630,17 +1713,16 @@ bot_session_reaper(task_t *t)
 
       if((now - s->last_seen) > (time_t)timeout)
       {
-        clam(CLAM_INFO, "bot_session_reaper",
-            "'%s': expired session for '%s' on %s (%s) "
-            "(idle %ld sec, limit %u sec)",
-            inst->name, s->username,
-            method_inst_name(s->method), s->sender,
-            (long)(now - s->last_seen), timeout);
+        // Capture the notification before sess_put recycles s; emit
+        // clam()/method_send() after unlock.
+        reaper_notify_t *rn = &notify[nn++];
 
-        // Notify the user before removing the session.
-        method_send(s->method, s->sender,
-            "Your identity has expired. "
-            "Use identify to re-authenticate.");
+        snprintf(rn->bot_name, sizeof(rn->bot_name), "%s", inst->name);
+        snprintf(rn->username, sizeof(rn->username), "%s", s->username);
+        snprintf(rn->sender,   sizeof(rn->sender),   "%s", s->sender);
+        rn->method  = s->method;
+        rn->idle    = (long)(now - s->last_seen);
+        rn->timeout = timeout;
 
         // Unlink.
         if(prev != NULL)
@@ -1650,7 +1732,7 @@ bot_session_reaper(task_t *t)
 
         inst->session_count--;
 
-        // Return to freelist.
+        // Return to freelist (copies above already taken).
         sess_put(s);
       }
 
@@ -1663,7 +1745,24 @@ bot_session_reaper(task_t *t)
 
   pthread_mutex_unlock(&bot_mutex);
 
+  for(i = 0; i < nn; i++)
+  {
+    clam(CLAM_INFO, "bot_session_reaper",
+        "'%s': expired session for '%s' on %s (%s) "
+        "(idle %ld sec, limit %u sec)",
+        notify[i].bot_name, notify[i].username,
+        method_inst_name(notify[i].method), notify[i].sender,
+        notify[i].idle, notify[i].timeout);
+
+    // Notify the user that their identity expired.
+    method_send(notify[i].method, notify[i].sender,
+        "Your identity has expired. "
+        "Use identify to re-authenticate.");
+  }
+
   t->state = TASK_ENDED;
+
+  #undef MAX_REAP_PER_TICK
 }
 
 // Register bot subsystem KV keys and load initial values. Also

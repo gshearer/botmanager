@@ -368,6 +368,17 @@ method_subscribe(method_inst_t *inst, const char *name,
     }
   }
 
+  // Cap the subscriber count so method_deliver's fixed-size snapshot
+  // array can hold the whole list (no silent truncation on dispatch).
+  if(inst->sub_count >= METHOD_MAX_SUBS)
+  {
+    pthread_mutex_unlock(&method_mutex);
+    clam(CLAM_WARN, "method_subscribe",
+        "'%s' subscriber cap (%d) reached on '%s'",
+        name, METHOD_MAX_SUBS, inst->name);
+    return(FAIL);
+  }
+
   s = sub_get();
   strncpy(s->name, name, METHOD_SUB_NAME_SZ - 1);
   s->cb = cb;
@@ -423,6 +434,11 @@ method_unsubscribe(method_inst_t *inst, const char *name)
 void
 method_deliver(method_inst_t *inst, method_msg_t *msg)
 {
+  method_msg_cb_t  cbs[METHOD_MAX_SUBS];
+  void            *datas[METHOD_MAX_SUBS];
+  size_t           n = 0;
+  size_t           i;
+
   if(inst == NULL || msg == NULL)
     return;
 
@@ -432,17 +448,32 @@ method_deliver(method_inst_t *inst, method_msg_t *msg)
   if(msg->timestamp == 0)
     msg->timestamp = time(NULL);
 
+  // Snapshot the subscriber callbacks under the lock, then release it
+  // before invoking them. A callback may re-enter the method subsystem
+  // on the same thread: a delivery handler can emit a clam() event that
+  // a command-bot clam subscriber routes back out via method_find /
+  // method_send. method_mutex is non-recursive, so holding it across
+  // s->cb() self-deadlocks that thread (and, because clam() holds
+  // clam_mutex across its own dispatch loop, wedges every other thread
+  // that logs). The cap is enforced in method_subscribe, so the list
+  // never outruns the snapshot array.
   pthread_mutex_lock(&method_mutex);
 
-  for(method_sub_t *s = inst->subs; s != NULL; s = s->next)
+  for(method_sub_t *s = inst->subs; s != NULL && n < METHOD_MAX_SUBS;
+      s = s->next)
   {
     s->count++;
-    s->cb(msg, s->data);
+    cbs[n]   = s->cb;
+    datas[n] = s->data;
+    n++;
   }
 
   inst->msg_in++;
 
   pthread_mutex_unlock(&method_mutex);
+
+  for(i = 0; i < n; i++)
+    cbs[i](msg, datas[i]);
 }
 
 // Connection management
@@ -581,24 +612,64 @@ method_iterate_types(method_type_iter_cb_t cb, void *data)
 
 // Instance iteration
 
+// Per-instance snapshot row for iterate_instances. Lets the iteration
+// invoke callbacks with method_mutex released — a callback may emit
+// (cmd_reply -> method_send -> clam() -> clam_cmd_shared_cb ->
+// method_find), which re-locks method_mutex on the same thread; calling
+// the callback under the lock self-deadlocks. Mirrors the snapshot
+// pattern already used by method_iterate_drivers.
+typedef struct
+{
+  char           name[METHOD_NAME_SZ];
+  char           kind[METHOD_NAME_SZ];
+  method_state_t state;
+  uint64_t       msg_in;
+  uint64_t       msg_out;
+  uint32_t       sub_count;
+  time_t         connected_at;
+} method_inst_snap_t;
+
 void
 method_iterate_instances(method_inst_iter_cb_t cb, void *data)
 {
+  // Cap is generous — method instances are inherently few (one per
+  // protocol driver). Excess is dropped silently, matching
+  // method_iterate_drivers' MAX_DRIVER_KINDS behaviour.
+  #define MAX_ITER_INSTANCES 64
+
+  method_inst_snap_t snap[MAX_ITER_INSTANCES];
+  uint32_t           count = 0;
+  uint32_t           i;
+
   if(cb == NULL)
     return;
 
   pthread_mutex_lock(&method_mutex);
 
-  for(method_inst_t *m = method_list; m != NULL; m = m->next)
+  for(method_inst_t *m = method_list;
+      m != NULL && count < MAX_ITER_INSTANCES; m = m->next)
   {
-    const char *kind = (m->driver != NULL && m->driver->name != NULL)
+    method_inst_snap_t *s = &snap[count];
+    const char         *kind = (m->driver != NULL && m->driver->name != NULL)
         ? m->driver->name : "(unknown)";
 
-    cb(m->name, kind, m->state, m->msg_in, m->msg_out,
-        m->sub_count, m->connected_at, data);
+    snprintf(s->name, sizeof(s->name), "%s", m->name);
+    snprintf(s->kind, sizeof(s->kind), "%s", kind);
+    s->state        = m->state;
+    s->msg_in       = m->msg_in;
+    s->msg_out      = m->msg_out;
+    s->sub_count    = m->sub_count;
+    s->connected_at = m->connected_at;
+    count++;
   }
 
   pthread_mutex_unlock(&method_mutex);
+
+  for(i = 0; i < count; i++)
+    cb(snap[i].name, snap[i].kind, snap[i].state, snap[i].msg_in,
+        snap[i].msg_out, snap[i].sub_count, snap[i].connected_at, data);
+
+  #undef MAX_ITER_INSTANCES
 }
 
 // Statistics
