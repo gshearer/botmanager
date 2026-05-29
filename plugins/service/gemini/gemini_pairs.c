@@ -153,6 +153,28 @@ gem_pairs_count(void)
   return(n);
 }
 
+uint32_t
+gem_pairs_snapshot(gemini_pair_t *out, uint32_t cap)
+{
+  uint32_t n;
+
+  if(out == NULL || cap == 0)
+    return(0);
+
+  pthread_mutex_lock(&gem_pairs.lock);
+
+  n = gem_pairs.count;
+
+  if(n > cap)
+    n = cap;
+
+  memcpy(out, gem_pairs.rows, (size_t)n * sizeof(out[0]));
+
+  pthread_mutex_unlock(&gem_pairs.lock);
+
+  return(n);
+}
+
 // ------------------------------------------------------------------
 // Lookups
 // ------------------------------------------------------------------

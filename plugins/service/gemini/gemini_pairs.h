@@ -17,6 +17,8 @@
 #ifndef BM_GEMINI_PAIRS_H
 #define BM_GEMINI_PAIRS_H
 
+#include "gemini_api.h"     // gemini_pair_t (for gem_pairs_snapshot)
+
 #include <stdbool.h>
 #include <stddef.h>
 #include <stdint.h>
@@ -40,6 +42,11 @@ bool    gem_pairs_add(const char *native, const char *base, const char *quote);
 
 // Number of rows currently held. Thread-safe.
 uint32_t gem_pairs_count(void);
+
+// Copy up to `cap` rows into `out` under the cache lock; returns the
+// number of rows written. Used by the persistence layer (EXCH-PRIME-1)
+// to snapshot the cache so the DB write runs without holding the lock.
+uint32_t gem_pairs_snapshot(gemini_pair_t *out, uint32_t cap);
 
 // Lookup native (REST/WS lowercase) form from any of native, abstr, or
 // the bare base/quote-concat form. Writes the result into `out`

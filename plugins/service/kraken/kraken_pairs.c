@@ -115,6 +115,28 @@ kr_pairs_count(void)
   return(n);
 }
 
+uint32_t
+kr_pairs_snapshot(kraken_pair_t *out, uint32_t cap)
+{
+  uint32_t n;
+
+  if(out == NULL || cap == 0)
+    return(0);
+
+  pthread_mutex_lock(&kr_pairs.lock);
+
+  n = kr_pairs.count;
+
+  if(n > cap)
+    n = cap;
+
+  memcpy(out, kr_pairs.rows, (size_t)n * sizeof(out[0]));
+
+  pthread_mutex_unlock(&kr_pairs.lock);
+
+  return(n);
+}
+
 // ------------------------------------------------------------------
 // Lookups
 //

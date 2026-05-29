@@ -10,12 +10,10 @@
 #define GEM_INTERNAL
 #include "gemini.h"
 
+#include "gemini_persist.h"
+
 #include "exchange_api.h"
 #include "task.h"
-
-#include <errno.h>
-#include <pthread.h>
-#include <time.h>
 
 // ------------------------------------------------------------------
 // KV schema
@@ -71,148 +69,16 @@ static task_handle_t gem_symbols_task = TASK_HANDLE_NONE;
 static void
 gem_symbols_periodic_cb(task_t *t)
 {
-  // Fire and forget — the response handler updates the cache and
-  // logs any failure. cb=NULL routes to the silent logger in
-  // gemini_orders.c.
-  (void)gemini_symbols_refresh_async(NULL, NULL);
+  // EXCH-PRIME-1: route through the staleness-aware load path rather
+  // than forcing an unconditional network refresh. task_add_periodic
+  // runs the first tick immediately on submit, so an unconditional
+  // refresh here would hit the network on every (warm) restart; the
+  // load path instead re-checks the persisted snapshot's age and only
+  // refreshes when it is missing or older than the staleness window —
+  // preserving the daily refresh cadence while keeping a warm restart
+  // net-zero.
+  gem_symbols_load_or_refresh_async();
   t->state = TASK_ENDED;
-}
-
-// Synchronous first prime of the symbols cache. Runs from gem_start
-// before any consumer that depends on symbol translation has a chance
-// to dispatch. Bounded by a 10 s timeout so a Gemini outage or DNS
-// hiccup never wedges plugin loading — on timeout / failure, lookups
-// fall through with a heuristic translation and the periodic task
-// re-primes on its interval.
-
-// Heap-allocated + refcounted because the async refresh batch can
-// outlive the prime barrier's timeout. With Gemini's N+1 fan-out
-// (listing + per-symbol detail GETs) the batch routinely takes 30+ s
-// at the 5 rps default rate limit, while the prime barrier expires
-// at 10 s. A stack-allocated sync struct (Kraken's pattern, safe
-// there because Kraken's refresh is one fast REST call) would be
-// reclaimed under the still-running batch's feet — the eventual
-// completion callback would lock a destroyed mutex and write to
-// stale stack memory, crashing the daemon with no coredump because
-// the standard launch path runs under `ulimit -c 0`. Two refs:
-// one for the prime function, one for the callback; whichever side
-// finishes last frees.
-typedef struct
-{
-  pthread_mutex_t lock;
-  pthread_cond_t  cond;
-  bool            done;
-  bool            ok;
-  unsigned        refs;
-  char            err[GEMINI_ERR_SZ];
-} gem_prime_sync_t;
-
-// Drop a ref under the lock; destroy + free when the last holder
-// releases. The mutex/cond must survive every legitimate access, so
-// teardown is the responsibility of the final releaser only.
-static void
-gem_prime_sync_release(gem_prime_sync_t *s)
-{
-  bool last;
-
-  if(s == NULL)
-    return;
-
-  pthread_mutex_lock(&s->lock);
-  s->refs--;
-  last = (s->refs == 0);
-  pthread_mutex_unlock(&s->lock);
-
-  if(last)
-  {
-    pthread_cond_destroy(&s->cond);
-    pthread_mutex_destroy(&s->lock);
-    mem_free(s);
-  }
-}
-
-static void
-gem_prime_done_cb(const gemini_symbols_result_t *res, void *user)
-{
-  gem_prime_sync_t *s = user;
-
-  if(s == NULL)
-    return;
-
-  pthread_mutex_lock(&s->lock);
-
-  s->done = true;
-  s->ok   = (res != NULL && res->err[0] == '\0');
-
-  if(res != NULL)
-    snprintf(s->err, sizeof(s->err), "%s", res->err);
-
-  pthread_cond_signal(&s->cond);
-  pthread_mutex_unlock(&s->lock);
-
-  gem_prime_sync_release(s);
-}
-
-static bool
-gem_prime_symbols_sync(unsigned timeout_ms)
-{
-  gem_prime_sync_t *s;
-  struct timespec   deadline;
-  int               rc = 0;
-  bool              ok;
-
-  s = mem_alloc(GEM_CTX, "prime.sync", sizeof(*s));
-
-  if(s == NULL)
-    return(FAIL);
-
-  memset(s, 0, sizeof(*s));
-  pthread_mutex_init(&s->lock, NULL);
-  pthread_cond_init(&s->cond, NULL);
-  s->refs = 2;          // one for us, one for the callback
-
-  if(gemini_symbols_refresh_async(gem_prime_done_cb, s) != SUCCESS)
-  {
-    // Submit failure already invoked the cb synchronously inside the
-    // refresh function; s->done is true, s->ok is false, and the cb
-    // has already released its ref (refs now == 1, owned by us).
-  }
-
-  clock_gettime(CLOCK_REALTIME, &deadline);
-  deadline.tv_sec  += (time_t)(timeout_ms / 1000u);
-  deadline.tv_nsec += (long)((timeout_ms % 1000u) * 1000000UL);
-
-  if(deadline.tv_nsec >= 1000000000L)
-  {
-    deadline.tv_sec  += 1;
-    deadline.tv_nsec -= 1000000000L;
-  }
-
-  pthread_mutex_lock(&s->lock);
-
-  while(!s->done && rc != ETIMEDOUT)
-    rc = pthread_cond_timedwait(&s->cond, &s->lock, &deadline);
-
-  ok = s->done && s->ok;
-
-  if(!ok)
-  {
-    if(rc == ETIMEDOUT)
-      clam(CLAM_WARN, GEM_CTX,
-          "symbols prime timed out after %u ms; lookups will pass"
-          " through until the periodic refresh succeeds", timeout_ms);
-    else
-      clam(CLAM_WARN, GEM_CTX,
-          "symbols prime failed: %s; lookups will pass through"
-          " until the periodic refresh succeeds",
-          s->err[0] != '\0' ? s->err : "(no error string)");
-  }
-
-  pthread_mutex_unlock(&s->lock);
-
-  gem_prime_sync_release(s);    // drop our ref; cb may still hold one
-
-  return(ok ? SUCCESS : FAIL);
 }
 
 static bool
@@ -223,6 +89,11 @@ gem_init(void)
   gem_rest_init();
   gem_ws_init();           // stub in GEM-1; real body in GEM-3
   gem_ws_channels_init();  // stub in GEM-1; real body in GEM-3
+
+  // EXCH-PRIME-1: ensure the persisted symbol cache table exists. The
+  // DB pool is up by plugin_init_all; this is the only synchronous DB
+  // touch on the startup path.
+  (void)gem_symbols_ensure_table();
 
   clam(CLAM_INFO, GEM_CTX, "gemini plugin initialized");
 
@@ -246,13 +117,18 @@ gem_start(void)
     return(FAIL);
   }
 
-  // Block until the symbols cache is primed (or the prime times out
-  // / fails). Bounded by 10 s — same rationale as
-  // kr_prime_assetpairs_sync (plugins/service/kraken/kraken.c:207).
-  (void)gem_prime_symbols_sync(10000);
-
-  // Periodic refresh. The cadence KV defaults to 86400 s (one day);
-  // operators tune via plugin.gemini.symbols_refresh_sec.
+  // EXCH-PRIME-1: prime the symbols cache from the persisted snapshot
+  // and only refresh from the network when it is missing or stale. No
+  // synchronous network I/O blocks start(), so the operator control
+  // socket comes up without waiting on Gemini's N+1 /v1/symbols fan-out.
+  //
+  // The initial prime runs exactly once: when the periodic task is
+  // created its first tick fires immediately on submit (task_add_periodic
+  // runs the cb at submit time, not after the first interval) and that
+  // tick calls gem_symbols_load_or_refresh_async, so priming it here too
+  // would start a second, concurrent refresh fan-out racing on the shared
+  // gem_pairs cache. When the periodic task is disabled (refresh_sec == 0)
+  // or its submit fails, prime directly.
   refresh_sec = (uint32_t)kv_get_uint("plugin.gemini.symbols_refresh_sec");
 
   if(refresh_sec > 0)
@@ -262,9 +138,15 @@ gem_start(void)
         gem_symbols_periodic_cb, NULL);
 
     if(gem_symbols_task == TASK_HANDLE_NONE)
+    {
       clam(CLAM_WARN, GEM_CTX,
-          "symbols periodic task submit failed");
+          "symbols periodic task submit failed; priming directly");
+      gem_symbols_load_or_refresh_async();
+    }
   }
+
+  else
+    gem_symbols_load_or_refresh_async();
 
   clam(CLAM_INFO, GEM_CTX, "gemini plugin started");
 

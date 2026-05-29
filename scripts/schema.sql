@@ -225,3 +225,33 @@ CREATE TABLE IF NOT EXISTS acquire_topic_stats (
 -- Late-add FK on conversation_log.dossier_id moved into the chat
 -- plugin's memory_ensure_tables alongside the conversation_log table
 -- itself (R1). Nothing to do here.
+
+-- Exchange symbol/pair caches (EXCH-PRIME-1). Each exchange service
+-- plugin persists its symbol/pair listing here so a daemon restart can
+-- prime the in-memory cache from the DB instead of re-hitting the
+-- exchange's REST surface on every boot. The network refresh only fires
+-- when the snapshot is missing or older than the per-exchange
+-- plugin.<exch>.{symbols,assetpairs}_refresh_sec staleness window. The
+-- application mirrors these via CREATE TABLE IF NOT EXISTS on startup
+-- (gem_symbols_ensure_table / kr_assetpairs_ensure_table).
+
+-- Gemini: native concatenated symbol (lowercase, e.g. btcusd) is the
+-- key; base/quote are the split ISO codes. The hyphenated abstraction
+-- form is re-derived by gem_pairs_add on load, so it is not stored.
+CREATE TABLE IF NOT EXISTS gemini_symbols (
+  native     VARCHAR(16)  PRIMARY KEY,
+  base       VARCHAR(8)   NOT NULL,
+  quote      VARCHAR(8)   NOT NULL,
+  fetched_at TIMESTAMPTZ  NOT NULL DEFAULT NOW()
+);
+
+-- Kraken: altname (e.g. XBTUSD) is the key; canonical is the API pair
+-- name (XXBTZUSD), wsname is the WS v2 name with the leading XBT/ →
+-- BTC/ rewrite already applied (kr_pairs_add only rewrites a leading
+-- XBT/, which the stored value no longer carries).
+CREATE TABLE IF NOT EXISTS kraken_assetpairs (
+  altname    VARCHAR(16)  PRIMARY KEY,
+  canonical  VARCHAR(16)  NOT NULL,
+  wsname     VARCHAR(32)  NOT NULL,
+  fetched_at TIMESTAMPTZ  NOT NULL DEFAULT NOW()
+);

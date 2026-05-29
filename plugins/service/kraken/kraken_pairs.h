@@ -15,6 +15,8 @@
 #ifndef BM_KRAKEN_PAIRS_H
 #define BM_KRAKEN_PAIRS_H
 
+#include "kraken_api.h"     // kraken_pair_t (for kr_pairs_snapshot)
+
 #include <stdbool.h>
 #include <stddef.h>
 #include <stdint.h>
@@ -33,6 +35,11 @@ void    kr_pairs_add(const char *altname, const char *canonical,
 
 // Number of rows currently held. Thread-safe.
 uint32_t kr_pairs_count(void);
+
+// Copy up to `cap` rows into `out` under the cache lock; returns the
+// number of rows written. Used by the persistence layer (EXCH-PRIME-1)
+// to snapshot the cache so the DB write runs without holding the lock.
+uint32_t kr_pairs_snapshot(kraken_pair_t *out, uint32_t cap);
 
 // Lookup by any of altname / canonical / wsname. Writes the result
 // form into `out` (NUL-terminated, truncated to cap-1). On a miss the

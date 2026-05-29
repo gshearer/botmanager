@@ -10,12 +10,10 @@
 #define KR_INTERNAL
 #include "kraken.h"
 
+#include "kraken_persist.h"
+
 #include "exchange_api.h"
 #include "task.h"
-
-#include <errno.h>
-#include <pthread.h>
-#include <time.h>
 
 // KV schema
 //
@@ -74,105 +72,16 @@ static task_handle_t kr_assetpairs_task = TASK_HANDLE_NONE;
 static void
 kr_assetpairs_periodic_cb(task_t *t)
 {
-  // Fire and forget — the response handler updates the cache and logs
-  // any failure. cb=NULL routes to the silent logger in kraken_orders.c.
-  (void)kraken_assetpairs_refresh_async(NULL, NULL);
+  // EXCH-PRIME-1: route through the staleness-aware load path rather
+  // than forcing an unconditional network refresh. task_add_periodic
+  // runs the first tick immediately on submit, so an unconditional
+  // refresh here would hit the network on every (warm) restart; the
+  // load path instead re-checks the persisted snapshot's age and only
+  // refreshes when it is missing or older than the staleness window —
+  // preserving the daily refresh cadence while keeping a warm restart
+  // net-zero.
+  kr_assetpairs_load_or_refresh_async();
   t->state = TASK_ENDED;
-}
-
-// Synchronous first prime of the assetpairs cache. Runs from kr_start
-// before any consumer (e.g. wm_market_restore in whenmoon_start) gets
-// a chance to dispatch a request that depends on pair lookup, so the
-// race "OHLC fired with empty cache → pass-through `BTC-USD` →
-// EQuery:Unknown" is eliminated on freshstart. Bounded by a 10 s
-// timeout so a Kraken outage or DNS hiccup never wedges plugin
-// loading — on timeout / failure, lookups still pass through and the
-// periodic task will re-prime on its interval, matching the old
-// behavior.
-
-typedef struct
-{
-  pthread_mutex_t lock;
-  pthread_cond_t  cond;
-  bool            done;
-  bool            ok;
-  char            err[KRAKEN_ERR_SZ];
-} kr_prime_sync_t;
-
-static void
-kr_prime_done_cb(const kraken_assetpairs_result_t *res, void *user)
-{
-  kr_prime_sync_t *s = user;
-
-  if(s == NULL)
-    return;
-
-  pthread_mutex_lock(&s->lock);
-
-  s->done = true;
-  s->ok   = (res != NULL && res->err[0] == '\0');
-
-  if(res != NULL)
-    snprintf(s->err, sizeof(s->err), "%s", res->err);
-
-  pthread_cond_signal(&s->cond);
-  pthread_mutex_unlock(&s->lock);
-}
-
-static bool
-kr_prime_assetpairs_sync(unsigned timeout_ms)
-{
-  kr_prime_sync_t sync;
-  struct timespec deadline;
-  int             rc = 0;
-  bool            ok;
-
-  memset(&sync, 0, sizeof(sync));
-  pthread_mutex_init(&sync.lock, NULL);
-  pthread_cond_init(&sync.cond, NULL);
-
-  if(kraken_assetpairs_refresh_async(kr_prime_done_cb, &sync) != SUCCESS)
-  {
-    // Submit failure already invoked the cb synchronously inside the
-    // refresh function; sync.done is true and sync.ok is false.
-  }
-
-  clock_gettime(CLOCK_REALTIME, &deadline);
-  deadline.tv_sec  += (time_t)(timeout_ms / 1000u);
-  deadline.tv_nsec += (long)((timeout_ms % 1000u) * 1000000UL);
-
-  if(deadline.tv_nsec >= 1000000000L)
-  {
-    deadline.tv_sec  += 1;
-    deadline.tv_nsec -= 1000000000L;
-  }
-
-  pthread_mutex_lock(&sync.lock);
-
-  while(!sync.done && rc != ETIMEDOUT)
-    rc = pthread_cond_timedwait(&sync.cond, &sync.lock, &deadline);
-
-  ok = sync.done && sync.ok;
-
-  if(!ok)
-  {
-    if(rc == ETIMEDOUT)
-      clam(CLAM_WARN, KR_CTX,
-          "assetpairs prime timed out after %u ms; lookups will pass"
-          " through until the periodic refresh succeeds", timeout_ms);
-    else
-      clam(CLAM_WARN, KR_CTX,
-          "assetpairs prime failed: %s; lookups will pass through"
-          " until the periodic refresh succeeds",
-          sync.err[0] != '\0' ? sync.err : "(no error string)");
-  }
-
-  pthread_mutex_unlock(&sync.lock);
-
-  pthread_cond_destroy(&sync.cond);
-  pthread_mutex_destroy(&sync.lock);
-
-  return(ok ? SUCCESS : FAIL);
 }
 
 static bool
@@ -183,6 +92,11 @@ kr_init(void)
   kr_rest_init();
   kr_ws_init();
   kr_ws_channels_init();
+
+  // EXCH-PRIME-1: ensure the persisted assetpairs cache table exists.
+  // The DB pool is up by plugin_init_all; this is the only synchronous
+  // DB touch on the startup path.
+  (void)kr_assetpairs_ensure_table();
 
   clam(CLAM_INFO, KR_CTX, "kraken plugin initialized");
 
@@ -204,23 +118,27 @@ kr_start(void)
     return(FAIL);
   }
 
-  // Block until the assetpairs cache is primed (or the prime times
-  // out / fails). Downstream consumers — most notably
-  // wm_market_restore in whenmoon_start — dispatch OHLC + WS subscribe
-  // requests as soon as their plugin's start hook runs; those requests
-  // route abstraction-side symbols (e.g. `BTC-USD`) through
-  // kr_pair_lookup_rest / _ws, which need the cache populated to map
-  // them onto Kraken altname / wsname forms. Without this barrier,
-  // freshstart-with-existing-markets fires the OHLC backfill with the
-  // raw input and Kraken responds with EQuery:Unknown asset pair.
-  (void)kr_prime_assetpairs_sync(10000);
-
-  // Periodic refresh. The cadence KV defaults to 86400 s (one day);
-  // operators can tune via plugin.kraken.assetpairs_refresh_sec. The
-  // periodic submit fires the callback immediately on task_submit, so
-  // it issues one extra refresh right after the synchronous prime
-  // above — harmless (the cache is cleared + repopulated identically)
-  // and well under the rate-limit budget.
+  // EXCH-PRIME-1: prime the assetpairs cache from the persisted snapshot
+  // and only refresh from the network when it is missing or stale. No
+  // synchronous network I/O blocks start(), so the operator control
+  // socket comes up without waiting on GET /0/public/AssetPairs.
+  //
+  // Downstream consumers (e.g. wm_market_restore in whenmoon_start) may
+  // dispatch OHLC / WS-subscribe requests before the async load lands,
+  // routing abstraction-side symbols (e.g. `BTC-USD`) through
+  // kr_pair_lookup_rest / _ws. On a warm restart the DB snapshot
+  // repopulates the cache within the same boot, so the prior
+  // EQuery:Unknown race is avoided in the common case; a cold/stale
+  // cache falls back to the network refresh and pass-through lookups
+  // until it lands, matching the periodic-refresh behaviour.
+  //
+  // The initial prime runs exactly once: when the periodic task is
+  // created its first tick fires immediately on submit (task_add_periodic
+  // runs the cb at submit time, not after the first interval) and that
+  // tick calls kr_assetpairs_load_or_refresh_async, so priming it here
+  // too would start a second, concurrent refresh racing on the shared
+  // kr_pairs cache. When the periodic task is disabled (refresh_sec == 0)
+  // or its submit fails, prime directly.
   refresh_sec = (uint32_t)kv_get_uint("plugin.kraken.assetpairs_refresh_sec");
 
   if(refresh_sec > 0)
@@ -230,9 +148,15 @@ kr_start(void)
         kr_assetpairs_periodic_cb, NULL);
 
     if(kr_assetpairs_task == TASK_HANDLE_NONE)
+    {
       clam(CLAM_WARN, KR_CTX,
-          "assetpairs periodic task submit failed");
+          "assetpairs periodic task submit failed; priming directly");
+      kr_assetpairs_load_or_refresh_async();
+    }
   }
+
+  else
+    kr_assetpairs_load_or_refresh_async();
 
   clam(CLAM_INFO, KR_CTX, "kraken plugin started");
 
