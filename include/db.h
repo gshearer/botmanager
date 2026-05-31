@@ -30,6 +30,14 @@ typedef struct db_result
 // The callback is responsible for calling db_result_free().
 typedef void (*db_cb_t)(db_result_t *result, void *data);
 
+// Row callback for the streaming read path (db_query_stream). values[c]
+// is the NUL-terminated text of column c, or NULL for SQL NULL; the
+// pointers are valid ONLY for the duration of this call (they point into
+// the driver's per-row buffer, freed right after). Return true to keep
+// streaming, false to stop further callback invocations.
+typedef bool (*db_row_cb_t)(uint32_t row, uint32_t cols,
+    const char *const *values, void *data);
+
 // Functions a DB plugin must implement.
 typedef struct
 {
@@ -42,6 +50,11 @@ typedef struct
   bool (*ping)(void *handle);
   bool (*reset)(void *handle);
   bool (*query)(void *handle, const char *sql, db_result_t *result);
+
+  // Optional streaming read - NULL if the driver doesn't implement it.
+  // Invokes row_cb once per row without materializing a db_result_t.
+  bool (*query_stream)(void *handle, const char *sql,
+      db_row_cb_t row_cb, void *data, char *err, size_t err_cap);
 
   // Returns a mem_alloc'd escaped string (caller frees).
   char *(*escape)(void *handle, const char *input);
@@ -93,6 +106,14 @@ void db_result_set_value(db_result_t *r, uint32_t row, uint32_t col,
 bool db_query(const char *sql, db_result_t *result);
 
 bool db_query_async(const char *sql, db_cb_t cb, void *data);
+
+// Stream a SELECT row-by-row without materializing a db_result_t. Runs
+// synchronously on the calling thread; row_cb is invoked once per row
+// before this returns. Returns SUCCESS if the query ran and all rows
+// were delivered (or row_cb asked to stop), FAIL on no-driver /
+// unsupported / query error (err filled when non-NULL).
+bool db_query_stream(const char *sql, db_row_cb_t row_cb, void *data,
+    char *err, size_t err_cap);
 
 // Returns a mem_alloc'd escaped string (caller frees), or NULL on failure.
 char *db_escape(const char *input);

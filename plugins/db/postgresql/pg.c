@@ -192,17 +192,94 @@ pg_error(void *handle)
   return(pg_last_error[0] != '\0' ? pg_last_error : "unknown error");
 }
 
+#define PG_STREAM_MAX_COLS 64
+
+// Stream a SELECT row-by-row via libpq single-row mode. Each row's cells
+// are handed to row_cb straight from the per-row PGresult (never copied
+// into the tracked allocator), then PQclear'd immediately - so at most
+// one row is resident and mem_mutex is untouched on the read path. We
+// must loop PQgetResult to NULL even on error / early-stop, else the
+// connection is left busy and poisons the next pool user.
+static bool
+pg_query_stream(void *handle, const char *sql, db_row_cb_t row_cb,
+    void *data, char *err, size_t err_cap)
+{
+  PGconn   *conn = (PGconn *)handle;
+  PGresult *res;
+  bool      ret  = SUCCESS;
+  bool      go   = true;     // row_cb has not asked to stop
+  uint32_t  row  = 0;
+
+  if(!PQsendQuery(conn, sql) || !PQsetSingleRowMode(conn))
+  {
+    if(err != NULL)
+      snprintf(err, err_cap, "%s", PQerrorMessage(conn));
+    ret = FAIL;
+    // fall through: still drain to NULL to clear the connection
+  }
+
+  while((res = PQgetResult(conn)) != NULL)
+  {
+    ExecStatusType st = PQresultStatus(res);
+
+    if(st == PGRES_SINGLE_TUPLE)
+    {
+      if(ret == SUCCESS && go)
+      {
+        const char *vals[PG_STREAM_MAX_COLS];
+        int         cols = PQnfields(res);
+        int         ci;
+
+        if(cols > PG_STREAM_MAX_COLS)
+          cols = PG_STREAM_MAX_COLS;
+
+        for(ci = 0; ci < cols; ci++)
+          vals[ci] = PQgetisnull(res, 0, ci)
+              ? NULL : PQgetvalue(res, 0, ci);
+
+        go = row_cb(row, (uint32_t)cols, (const char *const *)vals, data);
+        row++;
+      }
+    }
+    else if(st != PGRES_TUPLES_OK && st != PGRES_COMMAND_OK)
+    {
+      // PGRES_FATAL_ERROR etc. - capture once, keep draining.
+      if(ret == SUCCESS)
+      {
+        size_t len;
+
+        if(err != NULL)
+        {
+          snprintf(err, err_cap, "%s", PQerrorMessage(conn));
+          len = strlen(err);
+
+          if(len > 0 && err[len - 1] == '\n')
+            err[len - 1] = '\0';
+        }
+
+        ret = FAIL;
+      }
+    }
+
+    PQclear(res);
+  }
+
+  pg_drain_txn(conn);
+  return(ret);
+}
+
 // Driver struct
 
 const db_driver_t pg_driver = {
-  .name       = "postgresql",
-  .connect    = pg_connect,
-  .disconnect = pg_disconnect,
-  .ping       = pg_ping,
-  .reset      = pg_reset,
-  .query      = pg_query,
-  .escape     = pg_escape,
-  .error      = pg_error,
+  .name         = "postgresql",
+  .connect      = pg_connect,
+  .disconnect   = pg_disconnect,
+  .ping         = pg_ping,
+  .reset        = pg_reset,
+  .query        = pg_query,
+  .query_stream = pg_query_stream,
+  .escape       = pg_escape,
+  .error        = pg_error,
 };
 
 // Plugin descriptor

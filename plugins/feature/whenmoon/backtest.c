@@ -242,6 +242,47 @@ wm_backtest_snapshot_free(wm_backtest_snapshot_t *snap)
   wm_bt_snapshot_teardown(snap);
 }
 
+// Per-row streaming context for wm_backtest_snapshot_build. The callback
+// runs synchronously on the build thread with snap->mkt.lock held.
+typedef struct
+{
+  whenmoon_market_t *mkt;
+  uint32_t           replayed;
+} wm_bt_stream_ctx_t;
+
+// Per-row sink for the streamed candle history (DB-STREAM-1). Cols
+// 0..5 = ts_ms, low, high, open, close, volume. Mirrors the old
+// materialized loop body; caller holds snap->mkt.lock across the stream.
+static bool
+wm_bt_snapshot_row_cb(uint32_t row, uint32_t cols,
+    const char *const *values, void *data)
+{
+  wm_bt_stream_ctx_t *ctx = data;
+  wm_candle_full_t    bar;
+  int64_t             ts_open_ms;
+
+  (void)row;
+
+  if(cols < 6 ||
+     values[0] == NULL || values[1] == NULL || values[2] == NULL ||
+     values[3] == NULL || values[4] == NULL || values[5] == NULL)
+    return(true);   // skip malformed / NULL row, keep streaming
+
+  ts_open_ms = (int64_t)strtoll(values[0], NULL, 10);
+
+  memset(&bar, 0, sizeof(bar));
+  bar.ts_close_ms = ts_open_ms + 60000;
+  bar.low         = strtod(values[1], NULL);
+  bar.high        = strtod(values[2], NULL);
+  bar.open        = strtod(values[3], NULL);
+  bar.close       = strtod(values[4], NULL);
+  bar.volume      = strtod(values[5], NULL);
+
+  wm_aggregator_replay_bar(ctx->mkt, WM_GRAN_1M, &bar);
+  ctx->replayed++;
+  return(true);
+}
+
 wm_backtest_snapshot_t *
 wm_backtest_snapshot_build(int32_t market_id_db,
     const char *source_market_id,
@@ -250,14 +291,12 @@ wm_backtest_snapshot_build(int32_t market_id_db,
     char *err, size_t err_cap)
 {
   wm_backtest_snapshot_t *snap = NULL;
-  db_result_t            *res  = NULL;
   char                    table[WM_DL_TABLE_SZ];
   char                   *e_start = NULL;
   char                   *e_end   = NULL;
   char                    sql[1024];
   uint32_t                history_days;
   uint32_t                replayed = 0;
-  uint32_t                i;
   int                     n;
 
   if(err != NULL && err_cap > 0)
@@ -388,65 +427,33 @@ wm_backtest_snapshot_build(int32_t market_id_db,
     goto fail;
   }
 
-  res = db_result_alloc();
-
-  if(res == NULL)
+  // Stream the candle history row-by-row - never materialize the whole
+  // result (DB-STREAM-1: a full-history db_result_t storms mem_mutex and
+  // wedges the daemon). snap->mkt.lock is private to this unpublished
+  // stub market, so holding it across the streamed read is uncontended.
   {
-    if(err != NULL)
-      snprintf(err, err_cap, "db_result_alloc failed");
-    goto fail;
+    wm_bt_stream_ctx_t sctx = { .mkt = &snap->mkt, .replayed = 0 };
+    bool               ok;
+
+    pthread_mutex_lock(&snap->mkt.lock);
+    ok = db_query_stream(sql, wm_bt_snapshot_row_cb, &sctx, err, err_cap);
+    pthread_mutex_unlock(&snap->mkt.lock);
+
+    if(ok != SUCCESS)
+      goto fail;   // err already filled by db_query_stream
+
+    if(sctx.replayed == 0)
+    {
+      if(err != NULL)
+        snprintf(err, err_cap,
+            "no 1m candles in %s..%s; run"
+            " /whenmoon download <market> first",
+            range_start, range_end);
+      goto fail;
+    }
+
+    replayed = sctx.replayed;
   }
-
-  if(db_query(sql, res) != SUCCESS || !res->ok)
-  {
-    if(err != NULL)
-      snprintf(err, err_cap, "snapshot query failed: %s",
-          res->error[0] != '\0' ? res->error : "(no driver error)");
-    goto fail;
-  }
-
-  if(res->rows == 0)
-  {
-    if(err != NULL)
-      snprintf(err, err_cap,
-          "no 1m candles in %s..%s; run"
-          " /whenmoon download <market> first",
-          range_start, range_end);
-    goto fail;
-  }
-
-  pthread_mutex_lock(&snap->mkt.lock);
-
-  for(i = 0; i < res->rows; i++)
-  {
-    const char       *s_ts     = db_result_get(res, i, 0);
-    const char       *s_low    = db_result_get(res, i, 1);
-    const char       *s_high   = db_result_get(res, i, 2);
-    const char       *s_open   = db_result_get(res, i, 3);
-    const char       *s_close  = db_result_get(res, i, 4);
-    const char       *s_volume = db_result_get(res, i, 5);
-    wm_candle_full_t  bar;
-    int64_t           ts_open_ms;
-
-    if(s_ts == NULL || s_low == NULL || s_high == NULL ||
-       s_open == NULL || s_close == NULL || s_volume == NULL)
-      continue;
-
-    ts_open_ms = (int64_t)strtoll(s_ts, NULL, 10);
-
-    memset(&bar, 0, sizeof(bar));
-    bar.ts_close_ms = ts_open_ms + 60000;
-    bar.low         = strtod(s_low,    NULL);
-    bar.high        = strtod(s_high,   NULL);
-    bar.open        = strtod(s_open,   NULL);
-    bar.close       = strtod(s_close,  NULL);
-    bar.volume      = strtod(s_volume, NULL);
-
-    wm_aggregator_replay_bar(&snap->mkt, WM_GRAN_1M, &bar);
-    replayed++;
-  }
-
-  pthread_mutex_unlock(&snap->mkt.lock);
 
   snap->bars_loaded_1m = replayed;
 
@@ -459,14 +466,12 @@ wm_backtest_snapshot_build(int32_t market_id_db,
       snap->mkt.grain_n[WM_GRAN_1H], snap->mkt.grain_n[WM_GRAN_4H],
       snap->mkt.grain_n[WM_GRAN_1D]);
 
-  db_result_free(res);
   mem_free(e_start);
   mem_free(e_end);
 
   return(snap);
 
 fail:
-  if(res     != NULL) db_result_free(res);
   if(e_start != NULL) mem_free(e_start);
   if(e_end   != NULL) mem_free(e_end);
 

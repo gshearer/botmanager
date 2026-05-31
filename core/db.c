@@ -450,6 +450,51 @@ db_query_async(const char *sql, db_cb_t cb, void *data)
   return(SUCCESS);
 }
 
+bool
+db_query_stream(const char *sql, db_row_cb_t row_cb, void *data,
+    char *err, size_t err_cap)
+{
+  db_conn_t *c;
+  bool       ret;
+
+  if(!db_ready || driver == NULL || sql == NULL || row_cb == NULL)
+  {
+    if(err != NULL)
+      snprintf(err, err_cap, "db not initialized");
+    return(FAIL);
+  }
+
+  if(driver->query_stream == NULL)
+  {
+    if(err != NULL)
+      snprintf(err, err_cap, "driver lacks streaming reads");
+    return(FAIL);
+  }
+
+  c = conn_acquire();
+
+  if(c == NULL)
+  {
+    if(err != NULL)
+      snprintf(err, err_cap, "no connection available");
+    return(FAIL);
+  }
+
+  clam(CLAM_DEBUG, "db_query_stream", "sql: %s", sql);
+
+  ret = driver->query_stream(c->handle, sql, row_cb, data, err, err_cap);
+
+  __atomic_add_fetch(&db_stat_queries, 1, __ATOMIC_RELAXED);
+
+  if(ret != SUCCESS)
+    __atomic_add_fetch(&db_stat_errors, 1, __ATOMIC_RELAXED);
+
+  c->queries++;
+  conn_release(c);
+
+  return(ret);
+}
+
 // returns: mem_alloc'd escaped string (caller frees), or NULL on failure
 char *
 db_escape(const char *input)
