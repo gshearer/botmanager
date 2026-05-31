@@ -1,10 +1,11 @@
 // dl_coverage.h — candle coverage interval store + gap computation
 // for the whenmoon downloader. Internal; WHENMOON_INTERNAL-gated.
 //
-// Coverage is the single source of truth for "do we have this candle
-// data". Every successful page insert in dl_candles ends with a call
-// to wm_coverage_add(); every pre-dispatch job window passes through
-// wm_coverage_gaps_candles to prune sub-ranges already covered.
+// The coverage interval store records which windows have been
+// attempted: every successful page insert in dl_candles ends with a
+// call to wm_coverage_add(). Authoritative "do we actually have this
+// minute" questions are answered against the candle rows themselves
+// via wm_gap_find_row_gaps / wm_gap_largest_missing, not this store.
 
 #ifndef BM_WHENMOON_DL_COVERAGE_H
 #define BM_WHENMOON_DL_COVERAGE_H
@@ -41,25 +42,13 @@ typedef struct
 // same market via pg_advisory_xact_lock.
 bool wm_coverage_add(const wm_coverage_t *iv);
 
-// Complement of coverage rows in [range_start, range_end). Sorted
-// ascending. `out` is caller-allocated, capacity `max_out`; returns
-// the count actually written. If the complement would exceed max_out,
-// the last slot spans the tail (fine for admin display; callers that
-// need exact lists must grow max_out).
-uint32_t wm_coverage_gaps_candles(int32_t market_id,
-    const char *range_start, const char *range_end,
-    wm_coverage_t *out, uint32_t max_out);
-
 // Row-level gap walker over `wm_candles_<market_id>`. Returns the
 // windows where minute-bars are actually missing from the table in
 // `[range_start, range_end]`: a backward gap if the table's MIN(ts)
 // > range_start, a forward gap if MAX(ts) < range_end, and one entry
-// per internal LAG-detected gap. Sorted ascending.
-//
-// Distinct from wm_coverage_gaps_candles: that helper asks "which
-// windows have we never attempted" (coverage-store level); this one
-// asks "which rows are missing right now" (table level). The two can
-// disagree when an attempted window came back with partial data.
+// per internal LAG-detected gap. Sorted ascending. This is the
+// authoritative "which rows are missing right now" check — it reads
+// the candle rows, not the coverage-attempt store.
 //
 // `out` is caller-allocated, capacity `max_out`; returns count
 // written. Truncates silently at max_out (caller should bump cap and
@@ -67,6 +56,17 @@ uint32_t wm_coverage_gaps_candles(int32_t market_id,
 uint32_t wm_gap_find_row_gaps(int32_t market_id,
     const char *range_start, const char *range_end,
     wm_coverage_t *out, uint32_t max_out);
+
+// Largest single contiguous missing 1m window over the candle rows in
+// `[range_start, range_end]` (same gap classes as wm_gap_find_row_gaps,
+// widest one only). Writes it to *out and returns 1; returns 0 when
+// the range is fully covered at 1m cadence. Truncation-proof — use
+// this when you only need to judge whether a gap is material, so a
+// thin market's many small holes can't crowd the biggest one out of a
+// fixed array.
+uint32_t wm_gap_largest_missing(int32_t market_id,
+    const char *range_start, const char *range_end,
+    wm_coverage_t *out);
 
 #endif // WHENMOON_INTERNAL
 #endif // BM_WHENMOON_DL_COVERAGE_H

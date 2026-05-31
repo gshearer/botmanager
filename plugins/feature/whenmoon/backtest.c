@@ -126,13 +126,33 @@ wm_bt_days_between(const char *start_ts, const char *end_ts)
 // Pre-flight                                                              //
 // ----------------------------------------------------------------------- //
 
+// A market's candle history legitimately has holes, and not just
+// scattered ones: early, illiquid history (e.g. Coinbase BTC-USD in
+// Jan-2015) can go *days* without printing a minute, and re-running
+// /whenmoon download can never conjure trades the exchange never had.
+// Gap size is therefore the wrong thing to gate on — a 38h hole at
+// the dawn of a market is as unfillable as a 2-minute one. The
+// snapshot builder replays around holes regardless, so the only
+// genuine error this pre-flight needs to catch is asking to compile a
+// window that holds *no* rows at all (a typo'd market, or a range
+// entirely before the data exists), which would yield an empty
+// snapshot.
+//
+// wm_gap_largest_missing reports the whole requested window as the
+// single gap exactly when the range is empty; any present row splits
+// that window, so the widest gap can only equal the full span when
+// there is nothing there. That equality is the empty-range signal.
 bool
 wm_backtest_preflight_gap(int32_t market_id_db,
+    const char *market_id_str,
     const char *range_start, const char *range_end,
     char *err, size_t err_cap)
 {
   wm_coverage_t  gap;
-  uint32_t       n;
+  time_t         rs;
+  time_t         re;
+  time_t         gs;
+  time_t         ge;
 
   if(err != NULL && err_cap > 0)
     err[0] = '\0';
@@ -144,24 +164,44 @@ wm_backtest_preflight_gap(int32_t market_id_db,
     return(FAIL);
   }
 
-  n = wm_coverage_gaps_candles(market_id_db,
-      range_start, range_end, &gap, 1);
-
-  if(n == 0)
+  // Authoritative check: walk the actual candle rows, not the
+  // coverage-attempt store. The two can disagree — rows can be present
+  // while the attempt store is empty/stale — and the rows are what the
+  // snapshot builder actually replays. No gap at all → fully covered.
+  if(wm_gap_largest_missing(market_id_db, range_start, range_end,
+         &gap) == 0)
     return(SUCCESS);
 
+  // If any timestamp fails to parse, fail open rather than block a
+  // compile on a formatting quirk.
+  if(wm_bt_parse_ts(range_start,  &rs) != SUCCESS ||
+     wm_bt_parse_ts(range_end,    &re) != SUCCESS ||
+     wm_bt_parse_ts(gap.first_ts, &gs) != SUCCESS ||
+     wm_bt_parse_ts(gap.last_ts,  &ge) != SUCCESS)
+    return(SUCCESS);
+
+  // Some rows present (the widest gap is a strict sub-window) → the
+  // holes are real-but-tolerable; let the compile proceed.
+  if((int64_t)(ge - gs) < (int64_t)(re - rs))
+    return(SUCCESS);
+
+  // Whole requested window is empty — nothing to compile.
   if(err != NULL)
   {
     char start_date[16];
     char end_date[16];
 
+    // YYYY-MM-DD slice; wm_dl_parse_date accepts this ISO form (as
+    // well as MM/dd/yyyy), so the suggested command parses as printed.
     snprintf(start_date, sizeof(start_date), "%.10s", gap.first_ts);
     snprintf(end_date,   sizeof(end_date),   "%.10s", gap.last_ts);
 
     snprintf(err, err_cap,
-        "missing 1m coverage in %s..%s; run"
-        " /whenmoon download <market_id> %s %s",
-        gap.first_ts, gap.last_ts, start_date, end_date);
+        "no 1m candles in %s..%s; run"
+        " /whenmoon download %s %s %s",
+        gap.first_ts, gap.last_ts,
+        market_id_str != NULL ? market_id_str : "<market_id>",
+        start_date, end_date);
   }
 
   return(FAIL);

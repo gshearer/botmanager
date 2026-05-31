@@ -300,129 +300,6 @@ wm_coverage_add(const wm_coverage_t *iv)
   return(wm_cov_merge_tx(iv));
 }
 
-// --------------------------------------------------------------------
-// Gap computation — walker shape:
-//
-//   rows := SELECT range_start, range_end
-//             FROM wm_candle_coverage
-//            WHERE market_id   = :mid
-//              AND range_start < :range_end
-//              AND range_end   > :range_start
-//            ORDER BY range_start
-//
-//   prev_end := range_start
-//   for row in rows:
-//     if row.range_start > prev_end:
-//       emit gap [prev_end, row.range_start)
-//     prev_end := MAX(prev_end, row.range_end)
-//   if prev_end < range_end:
-//     emit gap [prev_end, range_end)
-//
-// Lexicographic compare on canonical TIMESTAMPTZ UTC strings is
-// order-preserving, so a cheap char compare suffices.
-// --------------------------------------------------------------------
-
-uint32_t
-wm_coverage_gaps_candles(int32_t market_id,
-    const char *range_start, const char *range_end,
-    wm_coverage_t *out, uint32_t max_out)
-{
-  db_result_t *res     = NULL;
-  char        *e_start = NULL;
-  char        *e_end   = NULL;
-  char         sql[1024];
-  char         prev_end[WM_COV_TS_SZ];
-  uint32_t     emitted = 0;
-  int          n;
-
-  if(out == NULL || max_out == 0)
-    return(0);
-
-  if(range_start == NULL || range_end == NULL)
-    return(0);
-
-  if(strcmp(range_end, range_start) <= 0)
-    return(0);
-
-  e_start = db_escape(range_start);
-  e_end   = db_escape(range_end);
-
-  if(e_start == NULL || e_end == NULL)
-    goto out;
-
-  n = snprintf(sql, sizeof(sql),
-      "SELECT to_char(range_start AT TIME ZONE 'UTC',"
-      "               'YYYY-MM-DD HH24:MI:SS.US') || '+00' AS rs,"
-      "       to_char(range_end   AT TIME ZONE 'UTC',"
-      "               'YYYY-MM-DD HH24:MI:SS.US') || '+00' AS re"
-      "  FROM wm_candle_coverage"
-      " WHERE market_id = %" PRId32
-      "   AND range_start < TIMESTAMPTZ '%s'"
-      "   AND range_end   > TIMESTAMPTZ '%s'"
-      " ORDER BY range_start",
-      market_id, e_end, e_start);
-
-  if(n < 0 || (size_t)n >= sizeof(sql))
-    goto out;
-
-  res = db_result_alloc();
-
-  if(res == NULL)
-    goto out;
-
-  if(db_query(sql, res) != SUCCESS || !res->ok)
-  {
-    clam(CLAM_WARN, WM_DL_CTX,
-        "coverage gap query failed (market=%" PRId32 "): %s",
-        market_id,
-        res->error[0] != '\0' ? res->error : "(no driver error)");
-    goto out;
-  }
-
-  snprintf(prev_end, sizeof(prev_end), "%s", range_start);
-
-  for(uint32_t i = 0; i < res->rows && emitted < max_out; i++)
-  {
-    const char *row_first_ts = db_result_get(res, i, 0);
-    const char *row_last_ts  = db_result_get(res, i, 1);
-
-    if(row_first_ts == NULL || row_last_ts == NULL)
-      continue;
-
-    if(strcmp(row_first_ts, prev_end) > 0)
-    {
-      wm_coverage_t *g = &out[emitted++];
-
-      memset(g, 0, sizeof(*g));
-      g->market_id = market_id;
-      snprintf(g->first_ts, WM_COV_TS_SZ, "%s", prev_end);
-      snprintf(g->last_ts,  WM_COV_TS_SZ, "%s", row_first_ts);
-    }
-
-    if(strcmp(row_last_ts, prev_end) > 0)
-      snprintf(prev_end, sizeof(prev_end), "%s", row_last_ts);
-  }
-
-  if(emitted < max_out && strcmp(prev_end, range_end) < 0)
-  {
-    wm_coverage_t *g = &out[emitted++];
-
-    memset(g, 0, sizeof(*g));
-    g->market_id = market_id;
-    snprintf(g->first_ts, WM_COV_TS_SZ, "%s", prev_end);
-    snprintf(g->last_ts,  WM_COV_TS_SZ, "%s", range_end);
-  }
-
-  if(emitted == max_out && strcmp(prev_end, range_end) < 0)
-    snprintf(out[max_out - 1].last_ts, WM_COV_TS_SZ, "%s", range_end);
-
-out:
-  if(res     != NULL) db_result_free(res);
-  if(e_start != NULL) mem_free(e_start);
-  if(e_end   != NULL) mem_free(e_end);
-
-  return(emitted);
-}
 
 // --------------------------------------------------------------------
 // Row-level gap walker. Three sub-queries unioned:
@@ -539,6 +416,132 @@ wm_gap_find_row_gaps(int32_t market_id,
     g->market_id = market_id;
     snprintf(g->first_ts, WM_COV_TS_SZ, "%s", rs);
     snprintf(g->last_ts,  WM_COV_TS_SZ, "%s", re);
+  }
+
+out:
+  if(res     != NULL) db_result_free(res);
+  if(e_start != NULL) mem_free(e_start);
+  if(e_end   != NULL) mem_free(e_end);
+
+  return(emitted);
+}
+
+// --------------------------------------------------------------------
+// Largest single contiguous missing 1m window in [range_start,
+// range_end] over `wm_candles_<market_id>`. Considers the same three
+// gap classes as wm_gap_find_row_gaps (leading boundary, trailing
+// boundary, internal LAG runs) but returns only the widest one via
+// ORDER BY (last_ts - first_ts) DESC LIMIT 1. A caller that only
+// needs to judge whether a gap is "material" must not enumerate a
+// low-liquidity market's thousands of tiny holes into a fixed array
+// (the find-all walker truncates at max_out and the biggest gap could
+// sort past the cap); this single-row query is truncation-proof.
+//
+// Writes the window to *out and returns 1; returns 0 when the range
+// is fully covered at 1m cadence. An empty table collapses to one
+// whole-window gap (same as the find-all walker).
+// --------------------------------------------------------------------
+
+uint32_t
+wm_gap_largest_missing(int32_t market_id,
+    const char *range_start, const char *range_end,
+    wm_coverage_t *out)
+{
+  db_result_t *res     = NULL;
+  char        *e_start = NULL;
+  char        *e_end   = NULL;
+  char         table[WM_DL_TABLE_SZ];
+  char         sql[2048];
+  uint32_t     emitted = 0;
+  int          n;
+
+  if(out == NULL || range_start == NULL || range_end == NULL)
+    return(0);
+
+  if(strcmp(range_end, range_start) <= 0)
+    return(0);
+
+  if(wm_candle_table_name(market_id, table, sizeof(table)) != SUCCESS)
+    return(0);
+
+  // Materialise the table so a never-downloaded market resolves into
+  // one whole-window gap rather than failing on a missing relation.
+  (void)wm_candle_table_ensure(market_id);
+
+  e_start = db_escape(range_start);
+  e_end   = db_escape(range_end);
+
+  if(e_start == NULL || e_end == NULL)
+    goto out;
+
+  // Same union as wm_gap_find_row_gaps, wrapped to keep only the
+  // single widest gap. Persistence is 1m-only so the LAG threshold is
+  // a fixed 60s.
+  n = snprintf(sql, sizeof(sql),
+      "SELECT to_char(first_ts AT TIME ZONE 'UTC',"
+      "               'YYYY-MM-DD HH24:MI:SS.US') || '+00' AS rs,"
+      "       to_char(last_ts  AT TIME ZONE 'UTC',"
+      "               'YYYY-MM-DD HH24:MI:SS.US') || '+00' AS re"
+      "  FROM ("
+      "    SELECT TIMESTAMPTZ '%s' AS first_ts,"
+      "           COALESCE(MIN(ts), TIMESTAMPTZ '%s') AS last_ts"
+      "      FROM %s"
+      "     WHERE ts >= TIMESTAMPTZ '%s' AND ts <= TIMESTAMPTZ '%s'"
+      "    HAVING COALESCE(MIN(ts), TIMESTAMPTZ '%s')"
+      "             > TIMESTAMPTZ '%s'"
+      "    UNION ALL"
+      "    SELECT MAX(ts) AS first_ts,"
+      "           TIMESTAMPTZ '%s' AS last_ts"
+      "      FROM %s"
+      "     WHERE ts >= TIMESTAMPTZ '%s' AND ts <= TIMESTAMPTZ '%s'"
+      "    HAVING MAX(ts) IS NOT NULL"
+      "       AND MAX(ts) < TIMESTAMPTZ '%s'"
+      "    UNION ALL"
+      "    SELECT prev_ts AS first_ts, ts AS last_ts"
+      "      FROM ("
+      "        SELECT ts, LAG(ts) OVER (ORDER BY ts) AS prev_ts"
+      "          FROM %s"
+      "         WHERE ts >= TIMESTAMPTZ '%s' AND ts <= TIMESTAMPTZ '%s'"
+      "      ) lag_q"
+      "     WHERE prev_ts IS NOT NULL"
+      "       AND ts - prev_ts > make_interval(secs => 60)"
+      "  ) gaps"
+      " ORDER BY (last_ts - first_ts) DESC"
+      " LIMIT 1",
+      e_start, e_end, table, e_start, e_end, e_end, e_start,
+      e_end, table, e_start, e_end, e_end,
+      table, e_start, e_end);
+
+  if(n < 0 || (size_t)n >= sizeof(sql))
+    goto out;
+
+  res = db_result_alloc();
+
+  if(res == NULL)
+    goto out;
+
+  if(db_query(sql, res) != SUCCESS || !res->ok)
+  {
+    clam(CLAM_WARN, WM_DL_CTX,
+        "largest-gap query failed (market=%" PRId32 "): %s",
+        market_id,
+        res->error[0] != '\0' ? res->error : "(no driver error)");
+    goto out;
+  }
+
+  if(res->rows >= 1)
+  {
+    const char *rs = db_result_get(res, 0, 0);
+    const char *re = db_result_get(res, 0, 1);
+
+    if(rs != NULL && re != NULL)
+    {
+      memset(out, 0, sizeof(*out));
+      out->market_id = market_id;
+      snprintf(out->first_ts, WM_COV_TS_SZ, "%s", rs);
+      snprintf(out->last_ts,  WM_COV_TS_SZ, "%s", re);
+      emitted = 1;
+    }
   }
 
 out:

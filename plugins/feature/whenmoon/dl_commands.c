@@ -92,24 +92,37 @@ wm_dl_parse_market_id(const char *in,
   return(SUCCESS);
 }
 
-// "MM/dd/yyyy" -> "YYYY-MM-DD 00:00:00+00".
+// Accepts "MM/dd/yyyy" or ISO "YYYY-MM-DD"; both normalise to the
+// Postgres canonical "YYYY-MM-DD 00:00:00+00". The ISO form matters
+// because the backtest pre-flight quotes its download suggestion in
+// ISO (it slices a TIMESTAMPTZ), so a user copy-pasting that advice
+// must parse cleanly.
 static bool
 wm_dl_parse_date(const char *in, char *out, size_t cap)
 {
-  unsigned mm;
-  unsigned dd;
-  unsigned yyyy;
+  unsigned mm   = 0;
+  unsigned dd   = 0;
+  unsigned yyyy = 0;
   int      consumed = 0;
   int      n;
 
   if(in == NULL || out == NULL || cap == 0)
     return(FAIL);
 
-  if(sscanf(in, "%u/%u/%u%n", &mm, &dd, &yyyy, &consumed) != 3)
+  if(sscanf(in, "%u/%u/%u%n", &mm, &dd, &yyyy, &consumed) == 3 &&
+     in[consumed] == '\0')
+  {
+    // MM/dd/yyyy — fields land directly in mm, dd, yyyy.
+  }
+  else if(sscanf(in, "%u-%u-%u%n", &yyyy, &mm, &dd, &consumed) == 3 &&
+          in[consumed] == '\0')
+  {
+    // ISO YYYY-MM-DD.
+  }
+  else
+  {
     return(FAIL);
-
-  if(in[consumed] != '\0')
-    return(FAIL);
+  }
 
   if(mm < 1 || mm > 12 || dd < 1 || dd > 31 ||
      yyyy < 1970 || yyyy > 9999)
@@ -174,7 +187,7 @@ wm_dl_cmd_download_enqueue_gaps(const cmd_ctx_t *ctx,
   cmd_reply(ctx, reply);
 }
 
-// /whenmoon download <market> [MM/dd/yyyy [MM/dd/yyyy]]
+// /whenmoon download <market> [<date> [<date>]]  (date: MM/dd/yyyy or ISO)
 //
 // Idempotent: scans `wm_candles_<market_id>` for row-level gaps in
 // the requested window (default = epoch to now, since dl_candles'
@@ -220,14 +233,14 @@ wm_dl_cmd_download_market(const cmd_ctx_t *ctx, whenmoon_state_t *st,
   if(old_tok[0] != '\0' &&
      wm_dl_parse_date(old_tok, oldest_ts, sizeof(oldest_ts)) != SUCCESS)
   {
-    cmd_reply(ctx, "bad oldest date (expected MM/dd/yyyy)");
+    cmd_reply(ctx, "bad oldest date (expected MM/dd/yyyy or YYYY-MM-DD)");
     return;
   }
 
   if(new_tok[0] != '\0' &&
      wm_dl_parse_date(new_tok, newest_ts, sizeof(newest_ts)) != SUCCESS)
   {
-    cmd_reply(ctx, "bad newest date (expected MM/dd/yyyy)");
+    cmd_reply(ctx, "bad newest date (expected MM/dd/yyyy or YYYY-MM-DD)");
     return;
   }
 
@@ -369,8 +382,9 @@ wm_dl_cmd_download(const cmd_ctx_t *ctx)
   {
     cmd_reply(ctx,
         "usage: /whenmoon download <exch>-<base>-<quote>"
-        " [MM/dd/yyyy [MM/dd/yyyy]]"
-        " | /whenmoon download cancel <job_id>");
+        " [<date> [<date>]]"
+        " | /whenmoon download cancel <job_id>"
+        "  (date = MM/dd/yyyy or YYYY-MM-DD)");
     return;
   }
 
@@ -491,7 +505,7 @@ wm_dl_cmd_show_download_candles(const cmd_ctx_t *ctx)
     cmd_reply(ctx,
         "usage: /show whenmoon download candles"
         " <exch>-<base>-<quote>"
-        " <MM/dd/yyyy> <MM/dd/yyyy>");
+        " <date> <date>  (date = MM/dd/yyyy or YYYY-MM-DD)");
     return;
   }
 
@@ -506,7 +520,7 @@ wm_dl_cmd_show_download_candles(const cmd_ctx_t *ctx)
   if(wm_dl_parse_date(start_tok, start_ts, sizeof(start_ts)) != SUCCESS ||
      wm_dl_parse_date(end_tok,   end_ts,   sizeof(end_ts))   != SUCCESS)
   {
-    cmd_reply(ctx, "bad date (expected MM/dd/yyyy)");
+    cmd_reply(ctx, "bad date (expected MM/dd/yyyy or YYYY-MM-DD)");
     return;
   }
 
@@ -589,7 +603,8 @@ wm_dl_register_verbs(void)
   // /whenmoon download cancel <job_id>           — cancel job
   if(cmd_register("whenmoon", "download",
         "whenmoon download <exch>-<base>-<quote>"
-        " [MM/dd/yyyy [MM/dd/yyyy]] | cancel <job_id>",
+        " [<date> [<date>]] | cancel <job_id>"
+        "  (date = MM/dd/yyyy or YYYY-MM-DD)",
         "Idempotent candle backfill: scans wm_candles_<id> for"
         " row-level gaps in the requested window (default = epoch to"
         " now) and fires one fetch job per gap. Re-run as needed;"
@@ -623,7 +638,7 @@ wm_dl_register_verbs(void)
   if(cmd_register("whenmoon", "candles",
         "show whenmoon download candles"
         " <exch>-<base>-<quote>"
-        " <MM/dd/yyyy> <MM/dd/yyyy>",
+        " <date> <date>  (date = MM/dd/yyyy or YYYY-MM-DD)",
         "Print the stored 1m candles over the window, CSV-style.",
         NULL,
         USERNS_GROUP_ADMIN, 100, CMD_SCOPE_ANY, METHOD_T_ANY,

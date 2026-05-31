@@ -199,14 +199,18 @@ typedef struct wm_backtest_result
 // Snapshot lifecycle                                                      //
 // ----------------------------------------------------------------------- //
 
-// Pre-flight gap check. SUCCESS when [range_start, range_end] is fully
-// covered by 1m candles for `market_id_db`; FAIL with `err` populated
-// otherwise. `err` (when non-NULL) carries a human-readable summary
-// including the exact /whenmoon download <market> invocation that
-// fixes the gap. Returns SUCCESS even when no rows exist if the
-// coverage tracker has no missing intervals — the warmup path will
-// catch the empty case downstream.
+// Pre-flight check over the actual 1m candle rows of `market_id_db`.
+// Holes are tolerated at any size — early illiquid history can be
+// missing days that the exchange simply never had, and the snapshot
+// builder replays around gaps. FAIL only when [range_start, range_end]
+// holds *no* rows at all (a typo'd market or a range entirely before
+// the data exists), which would compile an empty snapshot. On FAIL
+// `err` (when non-NULL) carries a human-readable summary including the
+// exact /whenmoon download invocation for the empty window;
+// `market_id_str` is substituted into that suggestion (pass the
+// canonical <exch>-<base>-<quote> id).
 bool wm_backtest_preflight_gap(int32_t market_id_db,
+    const char *market_id_str,
     const char *range_start, const char *range_end,
     char *err, size_t err_cap);
 

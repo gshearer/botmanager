@@ -40,9 +40,12 @@
 #include "wm_bt_file.h"
 #include "wm_bt_report.h"
 
+#include "alloc.h"
+#include "clam.h"
 #include "cmd.h"
 #include "common.h"
 #include "kv.h"
+#include "task.h"
 #include "userns.h"
 
 #include <ctype.h>
@@ -1138,6 +1141,16 @@ wm_bt_cmd_reload(const cmd_ctx_t *ctx)
 // `days = 0` sentinel = "all available 1m history".
 #define WM_BT_COMPILE_DEFAULT_DAYS  0u
 
+// Compile is heavy (millions of rows + indicator pyramid + file
+// write); it runs on a worker task at the lowest possible priority
+// (task.h: 0 = highest, 254 = lowest) so it never delays interactive
+// command dispatch.
+#define WM_BT_COMPILE_TASK_PRIORITY 254u
+
+// clam context for the async compile task (WM_BT_CTX itself is private
+// to backtest.c; mirror its value here).
+#define WM_BT_CMD_CTX  "whenmoon.backtest"
+
 // Render epoch ms back to the canonical "YYYY-MM-DD HH:MM:SS+00" form
 // the snapshot builder + .wm header carry. Mirrors the formatter at
 // dl_candles.c:74 but inline because that one is static.
@@ -1169,29 +1182,153 @@ wm_bt_compile_ms_to_pg(int64_t ms, char *out, size_t cap)
       tm.tm_hour, tm.tm_min, tm.tm_sec);
 }
 
+// Async payload for a backtest-compile task. The command handler
+// validates cheaply, copies the request here, and hands it to a
+// lowest-priority worker so the (multi-second, multi-million-row)
+// snapshot build + .wm write never blocks the issuing IRC/botmanctl
+// session. Owned by the task; freed in wm_bt_compile_task_cb.
+typedef struct
+{
+  int32_t  market_id;
+  uint32_t days;
+  char     market[64];     // canonical <exch>-<base>-<quote> as given
+  char     path[256];      // output .wm path
+} wm_bt_compile_task_t;
+
+// Worker body: derive the range, pre-flight, build the snapshot, write
+// the .wm. All slow work (the DB row scan, indicator pyramid, file
+// write) lives here so the dispatcher returns immediately. There is no
+// live session to reply to once the handler has returned, so outcomes
+// — success and every failure — are reported through the log; progress
+// is observable via /show tasks.
+static void
+wm_bt_compile_task_cb(task_t *t)
+{
+  wm_bt_compile_task_t   *job = t->data;
+  char                    start_ts[40] = {0};
+  char                    end_ts[40]   = {0};
+  char                    err[320];
+  int64_t                 latest_ms = 0;
+  int64_t                 start_ms  = 0;
+  int64_t                 end_ms    = 0;
+  wm_backtest_snapshot_t *snap = NULL;
+
+  if(wm_bt_latest_1m_bar_ms(job->market_id, &latest_ms) != SUCCESS)
+  {
+    clam(CLAM_WARN, WM_BT_CMD_CTX,
+        "compile %s: no 1m candles persisted;"
+        " run /whenmoon download %s ...",
+        job->market, job->market);
+    goto done;
+  }
+
+  end_ms = latest_ms;
+
+  if(job->days == 0)
+  {
+    if(wm_bt_earliest_1m_bar_ms(job->market_id, &start_ms) != SUCCESS)
+    {
+      clam(CLAM_WARN, WM_BT_CMD_CTX,
+          "compile %s: earliest-bar probe failed", job->market);
+      goto done;
+    }
+
+    // earliest bar's close ms is one minute after open; the range
+    // is half-open [start, end). Subtract 60s so the earliest bar
+    // is included on the inclusive side of the snapshot range.
+    start_ms -= 60000;
+  }
+  else
+  {
+    start_ms = latest_ms - ((int64_t)job->days * 86400LL * 1000LL);
+  }
+
+  if(start_ms >= end_ms)
+  {
+    clam(CLAM_WARN, WM_BT_CMD_CTX,
+        "compile %s: range degenerate (start >= end)", job->market);
+    goto done;
+  }
+
+  wm_bt_compile_ms_to_pg(start_ms, start_ts, sizeof(start_ts));
+  wm_bt_compile_ms_to_pg(end_ms,   end_ts,   sizeof(end_ts));
+
+  err[0] = '\0';
+
+  if(wm_backtest_preflight_gap(job->market_id, job->market,
+         start_ts, end_ts, err, sizeof(err)) != SUCCESS)
+  {
+    clam(CLAM_WARN, WM_BT_CMD_CTX, "compile %s gap: %s",
+        job->market, err[0] != '\0' ? err : "(no detail)");
+    goto done;
+  }
+
+  err[0] = '\0';
+
+  snap = wm_backtest_snapshot_build(job->market_id, job->market,
+      start_ts, end_ts, WM_AGG_DEFAULT_HISTORY_1D,
+      err, sizeof(err));
+
+  if(snap == NULL)
+  {
+    clam(CLAM_WARN, WM_BT_CMD_CTX, "compile %s: snapshot build failed: %s",
+        job->market, err[0] != '\0' ? err : "(no detail)");
+    goto done;
+  }
+
+  // Populate range_*_ms before writing so the .wm header carries the
+  // epoch range that downstream walk-forward / OOS plumbing in WM-BT-9
+  // expects to read back from the file. Heap-built snapshots zero
+  // these by default — WM-BT-2 wired the field, WM-BT-3 fills it on
+  // the compile path.
+  snap->range_start_ms = start_ms;
+  snap->range_end_ms   = end_ms;
+
+  err[0] = '\0';
+
+  if(wm_bt_file_write(job->path, snap, err, sizeof(err)) != SUCCESS)
+  {
+    clam(CLAM_WARN, WM_BT_CMD_CTX, "compile %s: write failed: %s",
+        job->market, err[0] != '\0' ? err : "(no detail)");
+    goto done;
+  }
+
+  clam(CLAM_INFO, WM_BT_CMD_CTX,
+      "compiled %s: 1m_bars=%u (5m=%u 15m=%u 1h=%u 4h=%u 1d=%u)"
+      " range=[%s..%s] -> %s",
+      job->market, snap->bars_loaded_1m,
+      snap->mkt.grain_n[WM_GRAN_5M], snap->mkt.grain_n[WM_GRAN_15M],
+      snap->mkt.grain_n[WM_GRAN_1H], snap->mkt.grain_n[WM_GRAN_4H],
+      snap->mkt.grain_n[WM_GRAN_1D],
+      start_ts, end_ts, job->path);
+
+done:
+  if(snap != NULL)
+    wm_backtest_snapshot_free(snap);
+
+  mem_free(job);
+  t->state = TASK_ENDED;
+}
+
 static void
 wm_bt_cmd_compile(const cmd_ctx_t *ctx)
 {
-  whenmoon_state_t       *st;
-  const char             *p;
-  char                    pair_tok[64]   = {0};
-  char                    path_tok[256]  = {0};
-  char                    days_tok[32]   = {0};
-  char                    exch[32]       = {0};
-  char                    base[16]       = {0};
-  char                    quote[16]      = {0};
-  char                    symbol[32]     = {0};
-  char                    start_ts[40]   = {0};
-  char                    end_ts[40]     = {0};
-  char                    err[320];
-  char                    reply[512];
-  uint32_t                days = WM_BT_COMPILE_DEFAULT_DAYS;
-  int32_t                 market_id;
-  int64_t                 latest_ms = 0;
-  int64_t                 start_ms = 0;
-  int64_t                 end_ms = 0;
-  wm_backtest_snapshot_t *snap = NULL;
-  size_t                  i;
+  whenmoon_state_t     *st;
+  const char           *p;
+  char                  pair_tok[64]   = {0};
+  char                  path_tok[256]  = {0};
+  char                  days_tok[32]   = {0};
+  char                  exch[32]       = {0};
+  char                  base[16]       = {0};
+  char                  quote[16]      = {0};
+  char                  symbol[32]     = {0};
+  char                  reply[512];
+  char                  task_name[TASK_NAME_SZ];
+  uint32_t              days = WM_BT_COMPILE_DEFAULT_DAYS;
+  int32_t               market_id;
+  wm_bt_compile_task_t *job;
+  task_t               *t;
+  size_t                i;
 
   st = whenmoon_get_state();
 
@@ -1259,97 +1396,41 @@ wm_bt_cmd_compile(const cmd_ctx_t *ctx)
     return;
   }
 
-  if(wm_bt_latest_1m_bar_ms(market_id, &latest_ms) != SUCCESS)
+  // Hand the heavy lifting — earliest/latest probe, gap pre-flight, the
+  // multi-million-row snapshot build, and the .wm write — to a
+  // lowest-priority worker task so the issuing session returns now.
+  job = mem_alloc("whenmoon.backtest", "compile_task", sizeof(*job));
+
+  if(job == NULL)
   {
-    snprintf(reply, sizeof(reply),
-        "no 1m candles persisted for %s; run /whenmoon download %s ...",
-        pair_tok, pair_tok);
-    cmd_reply(ctx, reply);
+    cmd_reply(ctx, "out of memory");
     return;
   }
 
-  end_ms = latest_ms;
+  memset(job, 0, sizeof(*job));
+  job->market_id = market_id;
+  job->days      = days;
+  snprintf(job->market, sizeof(job->market), "%s", pair_tok);
+  snprintf(job->path,   sizeof(job->path),   "%s", path_tok);
 
-  if(days == 0)
+  snprintf(task_name, sizeof(task_name), "wm-btcompile:%s", pair_tok);
+
+  t = task_add(task_name, TASK_THREAD, WM_BT_COMPILE_TASK_PRIORITY,
+      wm_bt_compile_task_cb, job);
+
+  if(t == NULL)
   {
-    if(wm_bt_earliest_1m_bar_ms(market_id, &start_ms) != SUCCESS)
-    {
-      cmd_reply(ctx, "earliest-bar probe failed");
-      return;
-    }
-
-    // earliest bar's close ms is one minute after open; the range
-    // is half-open [start, end). Subtract 60s so the earliest bar
-    // is included on the inclusive side of the snapshot range.
-    start_ms -= 60000;
-  }
-  else
-  {
-    start_ms = latest_ms - ((int64_t)days * 86400LL * 1000LL);
-  }
-
-  if(start_ms >= end_ms)
-  {
-    cmd_reply(ctx, "compile range degenerate (start >= end)");
-    return;
-  }
-
-  wm_bt_compile_ms_to_pg(start_ms, start_ts, sizeof(start_ts));
-  wm_bt_compile_ms_to_pg(end_ms,   end_ts,   sizeof(end_ts));
-
-  err[0] = '\0';
-
-  if(wm_backtest_preflight_gap(market_id, start_ts, end_ts,
-         err, sizeof(err)) != SUCCESS)
-  {
-    snprintf(reply, sizeof(reply), "gap: %s",
-        err[0] != '\0' ? err : "(no detail)");
-    cmd_reply(ctx, reply);
-    return;
-  }
-
-  snap = wm_backtest_snapshot_build(market_id, pair_tok,
-      start_ts, end_ts, WM_AGG_DEFAULT_HISTORY_1D,
-      err, sizeof(err));
-
-  if(snap == NULL)
-  {
-    snprintf(reply, sizeof(reply), "snapshot build failed: %s",
-        err[0] != '\0' ? err : "(no detail)");
-    cmd_reply(ctx, reply);
-    return;
-  }
-
-  // Populate range_*_ms before writing so the .wm header carries the
-  // epoch range that downstream walk-forward / OOS plumbing in WM-BT-9
-  // expects to read back from the file. Heap-built snapshots zero
-  // these by default — WM-BT-2 wired the field, WM-BT-3 fills it on
-  // the compile path.
-  snap->range_start_ms = start_ms;
-  snap->range_end_ms   = end_ms;
-
-  err[0] = '\0';
-
-  if(wm_bt_file_write(path_tok, snap, err, sizeof(err)) != SUCCESS)
-  {
-    snprintf(reply, sizeof(reply), "write failed: %s",
-        err[0] != '\0' ? err : "(no detail)");
-    cmd_reply(ctx, reply);
-    wm_backtest_snapshot_free(snap);
+    mem_free(job);
+    cmd_reply(ctx, "failed to submit compile task");
     return;
   }
 
   snprintf(reply, sizeof(reply),
-      "compiled %s: 1m_bars=%u (5m=%u 15m=%u 1h=%u 4h=%u 1d=%u)"
-      " range=[%s..%s]",
-      path_tok, snap->bars_loaded_1m,
-      snap->mkt.grain_n[WM_GRAN_5M], snap->mkt.grain_n[WM_GRAN_15M],
-      snap->mkt.grain_n[WM_GRAN_1H], snap->mkt.grain_n[WM_GRAN_4H],
-      snap->mkt.grain_n[WM_GRAN_1D],
-      start_ts, end_ts);
+      "task created: '%s' (pri %u) — compiling %s%s -> %s;"
+      " watch /show tasks, result lands in the log",
+      task_name, WM_BT_COMPILE_TASK_PRIORITY, pair_tok,
+      days == 0 ? " (full history)" : "", path_tok);
   cmd_reply(ctx, reply);
-
-  wm_backtest_snapshot_free(snap);
 }
 
 // ----------------------------------------------------------------------- //
@@ -1725,16 +1806,21 @@ wm_backtest_register_verbs(void)
 
   if(cmd_register("whenmoon", "compile",
         "whenmoon backtest compile <market_id> <path.wm> [<days>]",
-        "Compile a .wm snapshot file from persisted 1m candles.",
-        "Builds an isolated wm_backtest_snapshot_t from the"
+        "Compile a .wm snapshot file from persisted 1m candles (async).",
+        "Validates the request, then returns immediately with a"
+        " 'task created' acknowledgement: the build runs on a worker"
+        " task at the lowest priority (254) so it never delays"
+        " interactive commands. Track it with /show tasks; the result"
+        " (or any failure) is reported in the log on completion.\n"
+        "The task builds an isolated wm_backtest_snapshot_t from the"
         " wm_candles_<id> table over the most recent <days> of 1m"
         " history (default 0 = all available history), then serialises"
         " the snapshot to <path.wm> via mmap-friendly host-endian"
         " binary form (host-portable across daemon restarts; WM-BT-2"
         " format magic 0x4D4E4257, version 1).\n"
-        "The pre-flight gap check fails fast with the canonical"
-        " /whenmoon download <market> invocation when 1m coverage has"
-        " gaps. Output is atomic via tmp+fsync+rename. Re-runs"
+        "The pre-flight tolerates gaps of any size (illiquid early"
+        " history is legitimately sparse) and only refuses an entirely"
+        " empty range. Output is atomic via tmp+fsync+rename. Re-runs"
         " overwrite an existing file at <path>.\n"
         "Compiled .wm files survive daemon restarts and are the input"
         " to /whenmoon backtest run in WM-BT-6.",

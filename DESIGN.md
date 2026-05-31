@@ -38,6 +38,10 @@ A capability layer, not a bot. Whenmoon lives at `plugins/feature/whenmoon/` and
 
 **Strategy ABI (post-2026-04-29).** Strategies are external `.so` plugins so authors can ship closed-source. The supported strategy view of a market is the per-grain bar ring published in `plugins/feature/whenmoon/market.h`: `mkt->grain_arr[g][i]` for `i ∈ [0, grain_n[g])`, with the **newest bar always at `grain_arr[g][grain_n[g] - 1]`** (the aggregator shifts-left on overflow, so the index of the newest slot never drifts). Each `wm_candle_full_t` carries OHLCV plus a fixed 50-slot `ind[]` block populated once per bar close by `wm_indicators_compute_bar` — strategies read `bar->ind[WM_IND_*]` rather than recomputing. The slot enum (SMA-7/20/25/50/200, EMA-9/12/20/26/50, MACD, RSI, Stochastic, CCI, Bollinger + %B, VWAP/OBV/MFI/VPT, ATR/TR/NATR/ADX, ROC/MOM/WILLR/PSAR, microstructure) is versioned via `WM_INDICATOR_SCHEMA_VERSION`; new slots are appended after `WM_IND_RESERVED_BASE` and never shift existing ids. Coinbase / aggregator types stay behind `WHENMOON_INTERNAL` so strategies see only opaque pointers and the public bar surface, not exchange plumbing. The reference strategy at `plugins/feature/whenmoon/strategy/testing/` demonstrates the idiom. On strategy attach, whenmoon kicks a per-grain REST history warmup (`wm_warmup_for_attachment`, `plugins/feature/whenmoon/warmup.c`): for each subscribed grain it fetches the strategy's declared `min_history[g]` bars directly at that grain and seeds the aggregator ring, so indicators are warm at cold start instead of waiting for the live 1m→cascade to accumulate hundreds of higher-grain bars — essential for Kraken-backed markets, whose REST 1m history is too shallow to ever cascade-fill deep 5m/1h/4h/1d rings.
 
+**One indicator path for live and compile (the backtest-fidelity invariant).** A candle is turned into indicators by exactly one function — `wm_indicators_compute_bar` — used **bit-for-bit identically** by the live ingest path (`wm_aggregator_push_bar`, one bar at a time) and the `.wm` compile path (replaying historical bars). This is the foundational invariant of the whole backtesting effort: a backtest is only meaningful if the `.wm` data was produced the same way live data is, so that a strategy validated against a snapshot sees exactly what it will see in production. Both paths compute each bar's indicators over the same trailing ≤`WM_TA_BUF` (256) window — the windowing is deliberately lookahead-free so historical and live bar N see identical inputs. Consequences, which are load-bearing and must not be "optimized" away: there is **no** fast/bulk/continuous compile variant of the indicator math (a full-series TA-Lib pass would compute continuous EMA/RSI/PSAR that diverge from live's rolling-window values — fast, but it silently invalidates every backtest). Any change to indicator computation changes **both** paths together and bumps `WM_INDICATOR_SCHEMA_VERSION`.
+
+**Backtest compile is an offline task, parallelized at job granularity only.** `/whenmoon backtest compile <market> <path.wm> [days]` validates synchronously (market id, range derivation, gap pre-flight) then hands the snapshot build — a replay over the full candle history, millions of bars feeding the per-bar indicator pass above — to a single lowest-priority (254) `TASK_THREAD` worker, replying `task created` immediately and reporting the outcome via CLAM; the job is observable in `/show tasks`. Following the default-to-task principle, a single pair compiles on **one** low-priority thread for as long as it takes (a compile happens once, then is backtested against indefinitely, so its latency does not matter), while different market pairs compile **concurrently as independent tasks** across the pool — that job-level concurrency is the intended parallelism. A single compile is deliberately **not** fanned across workers: it would force a parallel indicator pass, and the only correctness-preserving way to do that is to call the same `wm_indicators_compute_bar` per bar concurrently — added complexity to cut a latency nobody waits on. The gap pre-flight is tolerant by design: it reads the actual candle rows (not the coverage-attempt store) and only refuses a window with *no* rows at all, since early illiquid history legitimately has multi-hour holes the exchange never had.
+
 **Per-market state inspection.** `/show whenmoon market [<id>]` renders each market's mode, position, last mark, per-mode stats (paper + real ledgers tracked in parallel), and the tail of each mode's fill ring. The WM-MK-5 rip retired the older `/show whenmoon trade *` verb family + per-(market, strategy) `wm_trade_book_t` registry; reconciliation math now lives on `wm_market_session_t` and surfaces through the same observability verb.
 
 This is the canonical "feature plugin" use case: cross-cutting state and verbs that belong to the framework itself, exposed to operators (and to bots via the same command registry) without being mediated by a bot kind. A future "Asset Trading Bot" that converses about trading remains out of scope; whenmoon is the trading runtime, not a chat persona.
@@ -88,6 +92,24 @@ The central work scheduler. Nearly all background work submits tasks here.
 - Priority: uint8_t, 0 = highest. Workers service highest-priority available tasks first.
 - Linked tasks: when one completes, its linked task is promoted to WAITING.
 - Sleeping tasks: re-evaluated when their timer expires (periodic work pattern).
+
+**Default-to-task principle.** Any command, job, or operation that may take
+more than trivially bounded time to complete MUST run on the task/worker
+system rather than inline on the dispatching thread. The handler validates
+cheaply, submits a `TASK_THREAD` task, and returns immediately (e.g.
+"task created"); the worker performs the slow work and reports completion
+via CLAM, with progress observable in `/show tasks`. This keeps command
+dispatch — and the issuing IRC/botmanctl session — responsive; lets long
+work be deprioritized (offline/bulk jobs submit at the lowest priority,
+254, so they yield to interactive work); makes every long-running operation
+individually visible and schedulable; and lets independent jobs run
+concurrently across the elastic pool with no extra machinery. Inline
+execution on the dispatch thread is reserved for work that is genuinely
+instant. When in doubt, submit a task. Note this applies at the *job*
+granularity: prefer many independent jobs running as separate tasks over
+fanning a single job across workers — the latter adds barrier/join
+complexity and is only warranted when one job's latency (not throughput)
+must be cut.
 
 # Thread Pool
 
