@@ -576,6 +576,8 @@ wm_backtest_run_iteration_with_id(whenmoon_state_t *st,
   uint32_t                        acc_n;
   uint32_t                        acc_cap;
   uint64_t                        prev_fn;
+  const wm_market_stats_t        *ps;
+  double                          win_rate;
 
   if(err != NULL && err_cap > 0)
     err[0] = '\0';
@@ -790,11 +792,26 @@ wm_backtest_run_iteration_with_id(whenmoon_state_t *st,
 
   wm_market_destroy_synthetic(synth_mk);
 
+  // One summary line per backtest. Counters come from the PAPER ledger
+  // (the synth market trades paper-only). win_rate is the hit rate over
+  // closed round-trip trades (n_wins + n_losses == n_trades). Currency
+  // is realized-only: end == start + profit exactly, so any position
+  // still open at the final bar contributes no unrealized PnL here.
+  // data_days reports the span of 1m history loaded into the snapshot
+  // (1440 1m bars = one day).
+  ps       = &out->trade.stats[WM_MARKET_MODE_PAPER];
+  win_rate = ps->n_trades > 0
+      ? (double)ps->n_wins / (double)ps->n_trades * 100.0 : 0.0;
+
   clam(CLAM_INFO, WM_BT_CTX,
-      "iter %s/%s: bars=%u fills=%" PRIu64 " realized=%+.4f"
-      " wallclock_ms=%" PRIu64,
-      snap->source_market_id, strat_copy, bars_replayed,
-      fills_paper, realized_paper, out->wallclock_ms);
+      "backtest %s/%s: trades=%u wins=%u losses=%u win_rate=%.1f%%"
+      " start=%.2f end=%.2f profit=%+.2f data_days=%.1f"
+      " bars=%u fills=%" PRIu64 " wallclock_ms=%" PRIu64,
+      snap->source_market_id, strat_copy,
+      ps->n_trades, ps->n_wins, ps->n_losses, win_rate,
+      ps->starting_cash, ps->starting_cash + realized_paper,
+      realized_paper, (double)snap->bars_loaded_1m / 1440.0,
+      bars_replayed, fills_paper, out->wallclock_ms);
 
   return(SUCCESS);
 }
