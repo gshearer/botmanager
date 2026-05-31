@@ -114,6 +114,16 @@ struct dl_job
   int              consecutive_errors;
   char             last_err[256];
 
+  // Empty-page accounting (WM-DL-EMPTY-RUN). A single empty (zero-row)
+  // candle page is commonly a legitimate no-trade / outage window — a
+  // ~12h Coinbase gap on 2026-05-08 returned an empty page for every
+  // market at once — so terminating the inception walk on the first one
+  // truncates the download to whatever sits in front of the gap. We
+  // keep walking and only conclude end-of-history after
+  // WM_DL_EMPTY_RUN_MAX consecutive empties; any page with rows resets
+  // the count. In-memory only: a restart re-zeros it, which is harmless.
+  int              consecutive_empties;
+
   // Outstanding-request guard: a job may have at most one in-flight
   // exchange_fetch_candles_async at a time. Set true when wm_dl_kick
   // submits, cleared by the completion callback.

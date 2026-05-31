@@ -462,19 +462,42 @@ wm_dl_candles_on_page(const exchange_candles_result_t *res, void *user)
     wm_dl_s_to_tstz(ctx->window_start_s, new_cursor, sizeof(new_cursor));
     snprintf(j->cursor_end_ts, sizeof(j->cursor_end_ts), "%s", new_cursor);
 
-    // Terminal decisions. Reaching the user's oldest floor ends the
-    // job; an empty page means the exchange ran out of history and
-    // also ends it (inception walk).
+    // Empty-page run accounting (WM-DL-EMPTY-RUN). One empty window is
+    // commonly a legitimate no-trade / outage gap, so we keep walking
+    // past it; any page that returns rows resets the run.
+    if(empty)
+      j->consecutive_empties++;
+
+    else
+      j->consecutive_empties = 0;
+
+    // Terminal decisions, in priority order:
+    //   1. reaching the user's oldest floor,
+    //   2. walking back to the epoch floor (cursor can't go older —
+    //      a 0-valued cursor would re-seed the walk at "now"),
+    //   3. a sustained run of empty pages, which on the inception walk
+    //      means we have genuinely run off the start of history.
     if(oldest_requested_s > 0 && ctx->window_start_s <= oldest_requested_s)
       j->state = DL_JOB_DONE;
 
-    else if(empty)
+    else if(ctx->window_start_s <= 0)
       j->state = DL_JOB_DONE;
 
-    clam(CLAM_INFO, WM_DL_CTX,
-        "candles %s page=%" PRId32 " rows=+%u cursor=%s%s",
-        j->exchange_symbol, j->pages_fetched, inserted,
-        j->cursor_end_ts, empty ? " (empty)" : "");
+    else if(j->consecutive_empties >= WM_DL_EMPTY_RUN_MAX)
+      j->state = DL_JOB_DONE;
+
+    if(empty)
+      clam(CLAM_INFO, WM_DL_CTX,
+          "candles %s page=%" PRId32 " rows=+%u cursor=%s"
+          " (empty %d/%d)",
+          j->exchange_symbol, j->pages_fetched, inserted,
+          j->cursor_end_ts, j->consecutive_empties, WM_DL_EMPTY_RUN_MAX);
+
+    else
+      clam(CLAM_INFO, WM_DL_CTX,
+          "candles %s page=%" PRId32 " rows=+%u cursor=%s",
+          j->exchange_symbol, j->pages_fetched, inserted,
+          j->cursor_end_ts);
   }
 
   pthread_mutex_unlock(&t->lock);

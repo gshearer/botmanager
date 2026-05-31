@@ -14,6 +14,17 @@
 
 #define WM_DL_CANDLE_WINDOW_BUCKETS   300
 
+// WM-DL-EMPTY-RUN: consecutive empty (zero-row) pages the inception walk
+// tolerates before concluding it has reached the start of the exchange's
+// candle record and marking the job DONE. A single empty page is commonly
+// a legitimate no-trade / outage window (a ~12h Coinbase gap on 2026-05-08
+// returned an empty page for every market at once); ending the walk on the
+// first one truncates the download to whatever sits in front of the gap.
+// At WM_DL_CANDLE_WINDOW_BUCKETS=300 (5h per 1m page) this rides out a
+// ~60h contiguous hole while costing only this many wasted requests once
+// the walk genuinely runs off the end of history.
+#define WM_DL_EMPTY_RUN_MAX           12
+
 // WM-S6: soft cap on rows wm_dl_candles_query_aggregated will fill.
 // 10k rows * 48 bytes/row = 480 KiB — comfortably sized for a
 // heap-allocated scratch buffer on the cmd worker.
