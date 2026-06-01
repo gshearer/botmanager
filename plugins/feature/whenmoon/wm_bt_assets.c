@@ -108,6 +108,9 @@ static const char WM_BT_REPORT_CSS[] =
     "transition:none!important}}\n"
     "@media print{header{position:static}details{break-inside:avoid}"
     ".note{color:#444}}\n"
+    // --- equity & drawdown panes (WM-BT-RPT-2) ---
+    ".chartbox{height:320px;margin:6px 0}\n"
+    ".ddbox{height:150px;margin:6px 0 2px}\n"
     // --- per-trade chart page (was the chart TU's inline <style>) ---
     "#chart{height:86vh}\n"
     "body>h1{margin:0;padding:14px 20px;font-size:14px;font-weight:600}\n";
@@ -135,7 +138,73 @@ static const char WM_BT_REPORT_JS[] =
     "function wmFmtDate(unixSec){\n"
     "  return new Date(unixSec*1000).toISOString().slice(0,16)"
     ".replace('T',' ');\n"
-    "}\n";
+    "}\n"
+    // --- WM-BT-RPT-2: equity curve + underwater drawdown ---
+    // Reads the #eq-data JSON island ([{t:sec,e:equity,dd:pct},...]) and
+    // draws an LWC area series (equity) above a baseline series pinned at 0
+    // (drawdown, plotted negative so it hangs underwater). No-ops on pages
+    // without #eq (the per-trade charts), and degrades to a readable .note
+    // when the JSON is missing/bad or the CDN library failed to load.
+    "function wmRenderEquity(){\n"
+    "  const host = document.getElementById('eq');\n"
+    "  const src  = document.getElementById('eq-data');\n"
+    "  if(!host || !src) return;\n"
+    "  let pts = null;\n"
+    "  try { pts = JSON.parse(src.textContent || '[]'); }"
+    " catch(e) { pts = null; }\n"
+    "  if(!Array.isArray(pts) || pts.length === 0){\n"
+    "    host.innerHTML = '<p class=note>No equity data to plot.</p>';"
+    " return;\n"
+    "  }\n"
+    "  if(typeof LightweightCharts === 'undefined'){\n"
+    "    host.innerHTML = '<p class=note>Charts need network"
+    " (Lightweight Charts CDN).</p>';\n"
+    "    return;\n"
+    "  }\n"
+    "  const opts = {\n"
+    "    autoSize:true,\n"
+    "    layout:{background:{color:'#0e0f13'},textColor:'#8b93a7',"
+    "fontSize:11},\n"
+    "    grid:{vertLines:{color:'#1e2230'},horzLines:{color:'#1e2230'}},\n"
+    "    rightPriceScale:{borderColor:'#2a2f3e'},\n"
+    "    timeScale:{borderColor:'#2a2f3e',timeVisible:true,"
+    "secondsVisible:false},\n"
+    "    crosshair:{mode:0},\n"
+    // reduced motion: kill the inertial fling animation, keep panning.
+    "    kineticScroll:{mouse:false,touch:!wmReduceMotion}\n"
+    "  };\n"
+    "  const eqChart = LightweightCharts.createChart(host, opts);\n"
+    "  const eqSeries = eqChart.addAreaSeries({\n"
+    "    lineColor:'#5b8cff',\n"
+    "    topColor:'rgba(91,140,255,0.30)',\n"
+    "    bottomColor:'rgba(91,140,255,0.02)',\n"
+    "    lineWidth:2,\n"
+    "    priceFormat:{type:'price',precision:2,minMove:0.01}\n"
+    "  });\n"
+    "  eqSeries.setData(pts.map(p => ({time:p.t, value:p.e})));\n"
+    "  let ddChart = null;\n"
+    "  const ddHost = document.getElementById('dd');\n"
+    "  if(ddHost){\n"
+    "    ddChart = LightweightCharts.createChart(ddHost, opts);\n"
+    "    const ddSeries = ddChart.addBaselineSeries({\n"
+    "      baseValue:{type:'price',price:0},\n"
+    "      topLineColor:'rgba(224,83,61,0)',\n"
+    "      topFillColor1:'rgba(224,83,61,0)',\n"
+    "      topFillColor2:'rgba(224,83,61,0)',\n"
+    "      bottomLineColor:'#e0533d',\n"
+    "      bottomFillColor1:'rgba(224,83,61,0.05)',\n"
+    "      bottomFillColor2:'rgba(224,83,61,0.38)',\n"
+    "      lineWidth:1,\n"
+    "      priceFormat:{type:'percent'}\n"
+    "    });\n"
+    "    ddSeries.setData(pts.map(p => ({time:p.t,"
+    " value:-Math.abs(p.dd)})));\n"
+    "  }\n"
+    "  eqChart.timeScale().fitContent();\n"
+    "  if(ddChart) ddChart.timeScale().fitContent();\n"
+    "}\n"
+    "if(document.readyState === 'complete') wmRenderEquity();\n"
+    "else document.addEventListener('DOMContentLoaded', wmRenderEquity);\n";
 
 // ----------------------------------------------------------------------- //
 // Document head                                                           //

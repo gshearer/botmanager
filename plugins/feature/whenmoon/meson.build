@@ -43,6 +43,7 @@ whenmoon_plugin = shared_library('whenmoon',
   'wm_bt_report.c',
   'wm_bt_chart.c',
   'wm_bt_assets.c',
+  'wm_bt_metrics.c',
   candle_upsample_sql_h,
   include_directories : [
     inc_include,

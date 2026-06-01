@@ -22,9 +22,11 @@
 #include "sweep.h"
 #include "wm_bt_assets.h"
 #include "wm_bt_chart.h"
+#include "wm_bt_metrics.h"
 #include "whenmoon_strategy.h"
 
 #include "alloc.h"
+#include "clam.h"
 #include "common.h"
 #include "kv.h"
 
@@ -1763,13 +1765,58 @@ wm_bt_idx_emit_trades(FILE *fp, const char *sweep_dir,
   return(tidx);
 }
 
+// Emit the equity/drawdown series as a JSON island that wmRenderEquity
+// (report.js) reads. Time is epoch SECONDS — Lightweight Charts' unit —
+// and must be strictly ascending + unique, so points sharing a second are
+// nudged forward by 1s (display-only; equity/dd values untouched). The
+// builder already drops non-finite equities; the isfinite guard here is
+// the last gate before the chart library, which voids a whole series on a
+// single NaN.
+static void
+wm_bt_emit_equity_json(FILE *fp, const wm_bt_equity_point_t *pts, uint32_t n)
+{
+  int64_t  prev_sec = INT64_MIN;
+  bool     first    = true;
+  uint32_t i;
+
+  if(fp == NULL || pts == NULL)
+    return;
+
+  fputs("<script type=\"application/json\" id=\"eq-data\">[", fp);
+
+  for(i = 0; i < n; i++)
+  {
+    int64_t sec;
+
+    if(!isfinite(pts[i].equity) || !isfinite(pts[i].dd_pct))
+      continue;
+
+    sec = pts[i].t_ms / 1000;
+
+    if(sec <= prev_sec)
+      sec = prev_sec + 1;
+
+    prev_sec = sec;
+
+    fprintf(fp, "%s{\"t\":%" PRId64 ",\"e\":%.4f,\"dd\":%.4f}",
+        first ? "" : ",", sec, pts[i].equity, pts[i].dd_pct);
+
+    first = false;
+  }
+
+  fputs("]</script>\n", fp);
+}
+
 // The shared <head> + design-system stylesheet now live in
-// wm_bt_assets.c; the index links them by relative path and pulls in the
-// shared client bootstrap (report.js).
+// wm_bt_assets.c; the index links them by relative path, pulls in the
+// Lightweight Charts CDN build (deferred, ahead of report.js so it is
+// defined when the equity renderer runs), and the shared client bootstrap
+// (report.js).
 static void
 wm_bt_idx_write_head(FILE *fp, const char *title_esc)
 {
   wm_bt_html_doc_open(fp, title_esc, "assets/report.css");
+  fprintf(fp, "<script defer src=\"%s\"></script>\n", WM_BT_CHART_LIB_URL);
   fputs("<script defer src=\"assets/report.js\"></script>\n", fp);
 }
 
@@ -1923,6 +1970,62 @@ wm_bt_render_index_html(const char *sweep_dir,
         "<div class=\"card\"><div class=\"k\">Max drawdown</div>"
         "<div class=\"v mono\">%s</div></div>\n", dd_str);
     fputs("</div>\n", fp);
+  }
+
+  // ---- equity & drawdown (best config, reconstructed from fills) ----
+  if(top_k > 0 && results[indices[0]].ok)
+  {
+    const wm_bt_sweep_result_t *best = &results[indices[0]];
+    double start_cash =
+        (fixed_params != NULL && fixed_params->have_starting_cash)
+        ? fixed_params->starting_cash
+        : WM_MARKET_DEFAULT_STARTING_CASH;
+
+    fputs("<section><h2>Equity &amp; drawdown</h2>\n", fp);
+
+    if(best->n_fills == 0 || best->fills == NULL)
+    {
+      fputs("<p class=\"note\">No trades to plot.</p>\n", fp);
+    }
+    else
+    {
+      wm_bt_equity_point_t *pts   = NULL;
+      uint32_t              n_pts = 0;
+      char                  eqerr[160];
+      bool                  built;
+
+      built = wm_bt_equity_series_build(best->fills, best->n_fills,
+          start_cash, snap->range_start_ms, &pts, &n_pts,
+          eqerr, sizeof(eqerr));
+
+      if(built == SUCCESS && n_pts > 0)
+      {
+        // A trailing buy with no matching sell leaves the position open
+        // at snapshot end; flag it so the curve's last leg isn't read as
+        // a realized result.
+        bool open_end = (best->fills[best->n_fills - 1].side == 'b');
+
+        fputs("<div id=\"eq\" class=\"chartbox\"></div>\n"
+              "<div id=\"dd\" class=\"ddbox\"></div>\n", fp);
+        fprintf(fp,
+            "<p class=\"note\">Per-fill equity (cash + mark&middot;qty at"
+            " each fill); intra-trade mark-to-market is not sampled.%s</p>\n",
+            open_end ? " Final position still open at snapshot end." : "");
+        wm_bt_emit_equity_json(fp, pts, n_pts);
+      }
+      else
+      {
+        clam(CLAM_WARN, WM_BT_REPORT_CTX,
+            "equity series unavailable: %s",
+            eqerr[0] != '\0' ? eqerr : "(empty)");
+        fputs("<p class=\"note\">Equity curve unavailable.</p>\n", fp);
+      }
+
+      if(pts != NULL)
+        mem_free(pts);
+    }
+
+    fputs("</section>\n", fp);
   }
 
   // ---- run metadata ----

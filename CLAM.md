@@ -195,6 +195,7 @@ regex (the literal context portion, before any `<placeholder>`).
 | `whenmoon` | plugins/feature/whenmoon/ | top-level whenmoon (`WHENMOON_CTX`) |
 | `whenmoon mw` | plugins/feature/whenmoon/mw.c | marketwatch subsystem op log (`MW_CTX`) |
 | `whenmoon.backtest` | plugins/feature/whenmoon/backtest.c | backtest engine (`WM_BT_CTX`) |
+| `whenmoon.bt.report` | plugins/feature/whenmoon/wm_bt_report.c | backtest report emit warnings (`WM_BT_REPORT_CTX`) |
 | `whenmoon.dl` | plugins/feature/whenmoon/dl_coverage.c | download / job-table events (`WM_DL_CTX`) |
 | `whenmoon.live` | plugins/feature/whenmoon/live.c | live-trading runtime (`WM_LIVE_CTX`) |
 | `whenmoon.sweep` | plugins/feature/whenmoon/sweep.c | strategy sweep runner (`WM_SWEEP_CTX`) |

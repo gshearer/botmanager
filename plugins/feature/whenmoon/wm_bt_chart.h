@@ -15,6 +15,14 @@
 // + outcome without the trade dominating the frame.
 #define WM_BT_CHART_PADDING_BARS  100u
 
+// Lightweight Charts v4 CDN. Pinned to the v4 major to avoid v5 API
+// drift breaking sweep artifacts; the browser caches it across every
+// emitted page in a sweep. Shared so the single-config index head
+// (wm_bt_report.c) can load the same library the per-trade charts do.
+#define WM_BT_CHART_LIB_URL \
+    "https://unpkg.com/lightweight-charts@4" \
+    "/dist/lightweight-charts.standalone.production.js"
+
 // Render one trade as `<dir>/trade-<trade_idx>-<gran_name>.html`. Atomic
 // via tmp + fsync + rename.
 //

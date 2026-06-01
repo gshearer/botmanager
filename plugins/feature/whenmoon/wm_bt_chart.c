@@ -33,11 +33,8 @@
 #include <time.h>
 #include <unistd.h>
 
-// Lightweight Charts v4 CDN. Pinned major-version to avoid v5 API
-// drift breaking sweep artifacts; browser caches across files.
-#define WM_BT_CHART_LIB_URL \
-    "https://unpkg.com/lightweight-charts@4" \
-    "/dist/lightweight-charts.standalone.production.js"
+// WM_BT_CHART_LIB_URL moved to wm_bt_chart.h (WM-BT-RPT-2) so the
+// single-config index head can load the same Lightweight Charts build.
 
 // ----------------------------------------------------------------------- //
 // Grain name                                                              //
