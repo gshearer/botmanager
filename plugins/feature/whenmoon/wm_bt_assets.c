@@ -107,11 +107,19 @@ static const char *const WM_BT_REPORT_CSS_PARTS[] = {
     // --- Web Interface Guidelines baseline (WM-BT-RPT-1) ---
     "html{color-scheme:dark}\n"
     ":focus-visible{outline:2px solid var(--accent);outline-offset:2px}\n"
+    ".skip{position:absolute;left:8px;top:-48px;z-index:20;"
+    "background:var(--accent);color:#fff;padding:8px 14px;border-radius:8px;"
+    "transition:top .15s}\n"
+    ".skip:focus{top:8px}\n"
     ".num{font-variant-numeric:tabular-nums}\n"
     "h1,h2{text-wrap:balance}\n"
     "@media (prefers-reduced-motion:reduce){*{animation:none!important;"
     "transition:none!important}}\n"
-    "@media print{header{position:static}details{break-inside:avoid}"
+    "@media print{header{position:static}.tnav{display:none}"
+    "section,details,.card,.verdict{break-inside:avoid}"
+    ".cards{grid-template-columns:repeat(2,1fr)}"
+    ".chartbox,.ddbox,.tc-pane{min-height:180px}"
+    ".tbl-scroll{max-height:none;overflow:visible}"
     ".note{color:#444}}\n"
     // --- equity & drawdown panes (WM-BT-RPT-2) ---
     ".chartbox{height:320px;margin:6px 0}\n"
@@ -174,6 +182,27 @@ static const char *const WM_BT_REPORT_CSS_PARTS[] = {
     ".heat rect.miss{fill:var(--surface2)}\n"
     ".heat .lbl{fill:var(--muted);font-size:11px;"
     "font-family:ui-monospace,monospace}\n",
+    // --- verdict banner + tooltip affordances (WM-BT-RPT-6). The banner
+    // is a flex pill + plain-English takeaway above the headline cards;
+    // win/loss tint the border + pill. th[title]/.k[title] get a help
+    // cursor so the hover-tooltip metric definitions are discoverable. ---
+    ".verdict{display:flex;flex-wrap:wrap;align-items:center;gap:14px;"
+    "margin:22px 0;padding:16px 20px;border:1px solid var(--border);"
+    "border-radius:14px;background:var(--surface)}\n"
+    ".verdict .pill{font-weight:700;font-size:12px;letter-spacing:.05em;"
+    "text-transform:uppercase;padding:5px 13px;border-radius:999px;"
+    "border:1px solid var(--border);white-space:nowrap}\n"
+    ".verdict.win{border-color:rgba(43,182,115,.45)}\n"
+    ".verdict.win .pill{color:var(--win);border-color:rgba(43,182,115,.5);"
+    "background:rgba(43,182,115,.08)}\n"
+    ".verdict.loss{border-color:rgba(224,83,61,.45)}\n"
+    ".verdict.loss .pill{color:var(--loss);border-color:rgba(224,83,61,.5);"
+    "background:rgba(224,83,61,.08)}\n"
+    ".verdict .takeaway{flex:1;min-width:280px;font-size:15px}\n"
+    ".verdict .takeaway b{font-weight:650}\n"
+    ".verdict .takeaway .sub2{display:block;color:var(--muted);"
+    "font-size:13px;margin-top:3px}\n"
+    "th[title],.card .k[title],.strip .it span[title]{cursor:help}\n",
     NULL,
 };
 
@@ -190,6 +219,10 @@ static const char *const WM_BT_REPORT_CSS_PARTS[] = {
 static const char *const WM_BT_REPORT_JS_PARTS[] = {
     "// whenmoon backtest report - shared client bootstrap (WM-BT-RPT-1).\n"
     "'use strict';\n"
+    // Hoisted once (WM-BT-RPT-6 js-hoist-regex): strips everything but a
+    // numeric literal from a sort cell. Global flag, but .replace ignores
+    // lastIndex so the shared instance is reuse-safe.
+    "const wmNumRe = /[^0-9eE.+-]/g;\n"
     "const wmReduceMotion = (typeof window !== 'undefined'"
     " && window.matchMedia)\n"
     "  ? window.matchMedia('(prefers-reduced-motion: reduce)').matches"
@@ -290,7 +323,7 @@ static const char *const WM_BT_REPORT_JS_PARTS[] = {
     "    if(type === 'num'){\n"
     "      const dv = cell.dataset.v;\n"
     "      const raw = (dv !== undefined && dv !== '') ? dv : cell.textContent;\n"
-    "      return parseFloat(String(raw).replace(/[^0-9eE.+-]/g, ''));\n"
+    "      return parseFloat(String(raw).replace(wmNumRe, ''));\n"
     "    }\n"
     "    return cell.textContent.trim();\n"
     "  };\n"
@@ -477,7 +510,11 @@ wm_bt_html_doc_open(FILE *fp, const char *title_esc, const char *css_href)
 
   fprintf(fp, "<link rel=\"stylesheet\" href=\"%s\">\n", css_href);
 
-  fputs("</head><body>\n", fp);
+  // Skip-to-content link (Web Interface Guidelines; WM-BT-RPT-6). Every
+  // page's main landmark carries id="main"; the link is off-screen until
+  // focused (.skip CSS).
+  fputs("</head><body>\n"
+        "<a class=\"skip\" href=\"#main\">Skip to content</a>\n", fp);
 }
 
 // ----------------------------------------------------------------------- //

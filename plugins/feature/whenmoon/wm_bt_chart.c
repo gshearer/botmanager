@@ -670,7 +670,7 @@ wm_bt_chart_write_html(FILE *fp,
   wm_bt_chart_emit_nav(fp, iter_idx, trade_idx, n_trades, gran,
       grains_present);
 
-  fputs("<div class=\"wrap\">\n", fp);
+  fputs("<div class=\"wrap\" id=\"main\">\n", fp);
 
   wm_bt_chart_emit_info_cards(fp, entry_fill, exit_fill, gran);
 

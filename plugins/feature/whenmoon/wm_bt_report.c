@@ -1226,6 +1226,10 @@ wm_bt_render_report_md(const char *sweep_dir,
   // Header.
   fprintf(fp, "# Backtest sweep: %s\n\n", sweep_id);
 
+  // Cross-link to the interactive dashboard (the HTML index links back to
+  // this report.md + the other siblings; WM-BT-RPT-6).
+  fprintf(fp, "> Interactive dashboard: [index.html](index.html)\n\n");
+
   fprintf(fp, "- **Strategy:** %s\n", strategy);
   fprintf(fp, "- **Market:** %s\n", snap->source_market_id);
 
@@ -1940,6 +1944,153 @@ wm_bt_emit_pnl_histogram_svg(FILE *fp, const wm_market_fill_t *fills,
   fputs("</svg>\n", fp);
 }
 
+// WM-BT-RPT-6: one-line plain-English definition for a metric key, used as
+// a `title=` hover tooltip on table headers + card labels across both index
+// surfaces. Strings are ASCII and free of `"`/`<`/`&` so they embed safely
+// in an HTML attribute without escaping. Returns "" for an unknown key
+// (callers suppress the title attribute when the def is empty).
+static const char *
+wm_bt_metric_def(const char *key)
+{
+  static const struct { const char *k; const char *d; } defs[] = {
+    { "equity",       "Account equity at the end: cash plus the marked"
+                      " value of any open position." },
+    { "realized_pnl", "Realized profit/loss: net result of all closed"
+                      " round-trip trades." },
+    { "pf",           "Profit factor: gross profit / gross loss. Above 1"
+                      " is profitable." },
+    { "win_rate",     "Win rate: share of round trips that closed in"
+                      " profit." },
+    { "round_trips",  "Round trips: completed buy-then-sell trades." },
+    { "trades",       "Round trips: completed buy-then-sell trades." },
+    { "max_dd",       "Maximum drawdown: largest peak-to-trough equity"
+                      " drop, as a percent." },
+    { "sharpe",       "Sharpe ratio: return per unit of total volatility."
+                      " Higher is better." },
+    { "sortino",      "Sortino ratio: return per unit of downside"
+                      " volatility. Higher is better." },
+    { "score",        "Ranking score for this run (the metric chosen with"
+                      " --rank-by)." },
+    { "iter",         "Iteration index within the sweep." },
+    { "avg_win",      "Average win: mean profit across winning trades." },
+    { "avg_loss",     "Average loss: mean loss across losing trades." },
+    { "payoff",       "Payoff ratio: average win / average loss." },
+    { "expectancy",   "Expectancy: average profit/loss per round trip." },
+    { "avg_hold",     "Average hold: mean time a position stayed open." },
+    { "best",         "Best trade: largest single-trade profit." },
+    { "worst",        "Worst trade: largest single-trade loss." },
+    { "gross",        "Gross profit and gross loss across all closed"
+                      " trades." },
+    { "held",         "Holding time from the entry fill to the exit"
+                      " fill." },
+    { "pl",           "Profit/loss on this trade, net of fees and"
+                      " slippage." },
+    { "pl_pct",       "Profit/loss on this trade as a percent of the entry"
+                      " value." },
+    { "balance",      "Account balance after this trade closed." },
+    { "entry_px",     "Fill price when the position was opened." },
+    { "exit_px",      "Fill price when the position was closed." },
+    { "qty",          "Position size for this trade, in base units." },
+  };
+  size_t i;
+
+  if(key == NULL)
+    return("");
+
+  for(i = 0; i < sizeof(defs) / sizeof(defs[0]); i++)
+    if(strcmp(defs[i].k, key) == 0)
+      return(defs[i].d);
+
+  return("");
+}
+
+// WM-BT-RPT-6: emit one headline / analytics stat card. `def_key` (NULL or
+// unknown ⇒ no tooltip) adds a hover definition on the label; `vcls` is the
+// extra value class ("pos"/"neg"/""); `value_html` is already formatted +
+// safe. Dedups the per-card fprintf shape shared by both index surfaces.
+static void
+wm_bt_emit_card(FILE *fp, const char *label, const char *def_key,
+    const char *vcls, const char *value_html)
+{
+  const char *def = wm_bt_metric_def(def_key);
+  const char *sep = (vcls != NULL && vcls[0] != '\0') ? " " : "";
+
+  if(vcls == NULL)
+    vcls = "";
+
+  if(def[0] != '\0')
+    fprintf(fp,
+        "<div class=\"card\"><div class=\"k\" title=\"%s\">%s</div>"
+        "<div class=\"v mono%s%s\">%s</div></div>\n",
+        def, label, sep, vcls, value_html);
+  else
+    fprintf(fp,
+        "<div class=\"card\"><div class=\"k\">%s</div>"
+        "<div class=\"v mono%s%s\">%s</div></div>\n",
+        label, sep, vcls, value_html);
+}
+
+// WM-BT-RPT-6: plain-English verdict banner at the very top of both index
+// surfaces. `best` is the rank-1 config's PAPER stats; `final_equity` is its
+// end-of-run equity (wm_bt_compute_equity), `start_cash` the opening
+// balance, `sharpe` the rank-1 Sharpe. Emits a PROFITABLE / UNPROFITABLE
+// pill + a two-line takeaway derived from the stats (active voice, second
+// person, numerals — per the Web Interface Guidelines content rules).
+// No-op on NULL fp / stats.
+static void
+wm_bt_emit_verdict(FILE *fp, const wm_market_stats_t *best,
+    double start_cash, double sharpe, double final_equity)
+{
+  uint32_t rt;
+  double   wr;
+  double   pf;
+  double   ret;
+  bool     win;
+  char     pf_str[32];
+  char     wr_str[32];
+  char     dd_str[32];
+  char     sh_str[32];
+
+  if(fp == NULL || best == NULL)
+    return;
+
+  rt  = best->n_wins + best->n_losses;
+  wr  = rt > 0 ? (double)best->n_wins / (double)rt * 100.0 : 0.0;
+  pf  = wm_market_stats_profit_factor(best);
+  ret = (isfinite(final_equity) && start_cash > 0.0)
+      ? (final_equity - start_cash) / start_cash * 100.0 : 0.0;
+  win = isfinite(final_equity) && final_equity > start_cash;
+
+  if(rt == 0)
+  {
+    fputs("<div class=\"verdict loss\"><span class=\"pill\">No trades"
+          "</span><div class=\"takeaway\"><b>This configuration made no"
+          " completed round trips over the tested range.</b>"
+          "<span class=\"sub2\">There is nothing to evaluate &mdash; widen"
+          " the date range or loosen the entry rules.</span></div></div>\n",
+        fp);
+    return;
+  }
+
+  wm_bt_fmt_pct(wr, 0, wr_str, sizeof(wr_str));
+  wm_bt_fmt_pct(best->max_drawdown * 100.0, 0, dd_str, sizeof(dd_str));
+  wm_bt_fmt_num(pf, 2, pf_str, sizeof(pf_str));
+  wm_bt_fmt_num(isfinite(sharpe) ? sharpe : 0.0, 2, sh_str, sizeof(sh_str));
+
+  fprintf(fp,
+      "<div class=\"verdict %s\"><span class=\"pill\">%s</span>"
+      "<div class=\"takeaway\"><b>This configuration %s %s%.1f%% net.</b>"
+      "<span class=\"sub2\">Profit factor %s &middot; %s win rate &middot;"
+      " %s maximum drawdown &middot; Sharpe %s over %u round trips."
+      "</span></div></div>\n",
+      win ? "win" : "loss",
+      win ? "Profitable" : "Unprofitable",
+      win ? "returned" : "lost",
+      win ? "+" : "",
+      win ? ret : -ret,
+      pf_str, wr_str, dd_str, sh_str, rt);
+}
+
 // Emit the stat-card row + P/L distribution for one config's closed
 // trades (WM-BT-RPT-3). No-op visual when there are no closed trades.
 static void
@@ -1974,27 +2125,13 @@ wm_bt_idx_emit_trade_analytics(FILE *fp, const wm_bt_sweep_result_t *r)
   wm_bt_idx_fmt_dur(s.avg_hold_ms, hold_str, sizeof(hold_str));
 
   fputs("<div class=\"cards\">\n", fp);
-  fprintf(fp,
-      "<div class=\"card\"><div class=\"k\">Avg win</div>"
-      "<div class=\"v mono pos\">%s</div></div>\n", avg_win_str);
-  fprintf(fp,
-      "<div class=\"card\"><div class=\"k\">Avg loss</div>"
-      "<div class=\"v mono neg\">%s</div></div>\n", avg_loss_str);
-  fprintf(fp,
-      "<div class=\"card\"><div class=\"k\">Payoff ratio</div>"
-      "<div class=\"v mono\">%s</div></div>\n", payoff_str);
-  fprintf(fp,
-      "<div class=\"card\"><div class=\"k\">Expectancy</div>"
-      "<div class=\"v mono\">%s</div></div>\n", exp_str);
-  fprintf(fp,
-      "<div class=\"card\"><div class=\"k\">Avg hold</div>"
-      "<div class=\"v mono\">%s</div></div>\n", hold_str);
-  fprintf(fp,
-      "<div class=\"card\"><div class=\"k\">Best</div>"
-      "<div class=\"v mono pos\">%s</div></div>\n", best_str);
-  fprintf(fp,
-      "<div class=\"card\"><div class=\"k\">Worst</div>"
-      "<div class=\"v mono neg\">%s</div></div>\n", worst_str);
+  wm_bt_emit_card(fp, "Avg win",      "avg_win",    "pos", avg_win_str);
+  wm_bt_emit_card(fp, "Avg loss",     "avg_loss",   "neg", avg_loss_str);
+  wm_bt_emit_card(fp, "Payoff ratio", "payoff",     "",    payoff_str);
+  wm_bt_emit_card(fp, "Expectancy",   "expectancy", "",    exp_str);
+  wm_bt_emit_card(fp, "Avg hold",     "avg_hold",   "",    hold_str);
+  wm_bt_emit_card(fp, "Best",         "best",       "pos", best_str);
+  wm_bt_emit_card(fp, "Worst",        "worst",      "neg", worst_str);
   fputs("</div>\n", fp);
 }
 
@@ -2028,25 +2165,32 @@ wm_bt_idx_emit_trades(FILE *fp, const char *sweep_dir,
         "<th aria-sort=\"none\"><button type=\"button\" class=\"sort\""
         " data-col=\"2\" data-type=\"text\">exit (UTC)<span class=\"arrow\""
         " aria-hidden=\"true\"></span></button></th>"
-        "<th aria-sort=\"none\"><button type=\"button\" class=\"sort\""
+        "<th aria-sort=\"none\" title=\"Holding time from the entry fill"
+        " to the exit fill.\"><button type=\"button\" class=\"sort\""
         " data-col=\"3\" data-type=\"num\">held<span class=\"arrow\""
         " aria-hidden=\"true\"></span></button></th>"
-        "<th class=\"num\" aria-sort=\"none\"><button type=\"button\""
+        "<th class=\"num\" aria-sort=\"none\" title=\"Fill price when the"
+        " position was opened.\"><button type=\"button\""
         " class=\"sort\" data-col=\"4\" data-type=\"num\">entry"
         "<span class=\"arrow\" aria-hidden=\"true\"></span></button></th>"
-        "<th class=\"num\" aria-sort=\"none\"><button type=\"button\""
+        "<th class=\"num\" aria-sort=\"none\" title=\"Fill price when the"
+        " position was closed.\"><button type=\"button\""
         " class=\"sort\" data-col=\"5\" data-type=\"num\">exit"
         "<span class=\"arrow\" aria-hidden=\"true\"></span></button></th>"
-        "<th class=\"num\" aria-sort=\"none\"><button type=\"button\""
+        "<th class=\"num\" aria-sort=\"none\" title=\"Position size for"
+        " this trade, in base units.\"><button type=\"button\""
         " class=\"sort\" data-col=\"6\" data-type=\"num\">qty"
         "<span class=\"arrow\" aria-hidden=\"true\"></span></button></th>"
-        "<th class=\"num\" aria-sort=\"none\"><button type=\"button\""
+        "<th class=\"num\" aria-sort=\"none\" title=\"Profit/loss on this"
+        " trade, net of fees and slippage.\"><button type=\"button\""
         " class=\"sort\" data-col=\"7\" data-type=\"num\">P/L"
         "<span class=\"arrow\" aria-hidden=\"true\"></span></button></th>"
-        "<th class=\"num\" aria-sort=\"none\"><button type=\"button\""
+        "<th class=\"num\" aria-sort=\"none\" title=\"Profit/loss on this"
+        " trade as a percent of the entry value.\"><button type=\"button\""
         " class=\"sort\" data-col=\"8\" data-type=\"num\">P/L %"
         "<span class=\"arrow\" aria-hidden=\"true\"></span></button></th>"
-        "<th class=\"num\" aria-sort=\"none\"><button type=\"button\""
+        "<th class=\"num\" aria-sort=\"none\" title=\"Account balance after"
+        " this trade closed.\"><button type=\"button\""
         " class=\"sort\" data-col=\"9\" data-type=\"num\">balance"
         "<span class=\"arrow\" aria-hidden=\"true\"></span></button></th>"
         "<th>exit reason</th><th>chart</th></tr></thead><tbody>\n", fp);
@@ -2298,9 +2442,9 @@ wm_bt_render_index_html(const char *sweep_dir,
       snap->bars_loaded_1m, wm_bt_report_mode_str(mode_val),
       wm_bt_sweep_score_name(plan->score));
 
-  fputs("<div class=\"wrap\">\n", fp);
+  fputs("<div class=\"wrap\" id=\"main\">\n", fp);
 
-  // ---- headline cards (best config = top-K rank 1) ----
+  // ---- verdict banner + headline cards (best config = top-K rank 1) ----
   if(top_k > 0 && results[indices[0]].ok)
   {
     const wm_bt_sweep_result_t *best = &results[indices[0]];
@@ -2310,37 +2454,34 @@ wm_bt_render_index_html(const char *sweep_dir,
     double   pf   = wm_market_stats_profit_factor(st);
     double   eq   = wm_bt_compute_equity(&best->trade);
     double   rpnl = st->realized_pnl_lifetime;
+    double   start_cash =
+        (fixed_params != NULL && fixed_params->have_starting_cash)
+        ? fixed_params->starting_cash : WM_MARKET_DEFAULT_STARTING_CASH;
     const char *ec = eq >= WM_MARKET_DEFAULT_STARTING_CASH ? "pos" : "neg";
     const char *rc = rpnl >= 0.0 ? "pos" : "neg";
     char     eq_str[48];
     char     rpnl_str[48];
     char     wr_str[32];
     char     dd_str[32];
+    char     pf_str[32];
+    char     rt_str[32];
+
+    wm_bt_emit_verdict(fp, st, start_cash, best->trade.sharpe, eq);
 
     wm_bt_fmt_usd(eq,   eq_str,   sizeof(eq_str));
     wm_bt_fmt_usd(rpnl, rpnl_str, sizeof(rpnl_str));
     wm_bt_fmt_pct(wr, 1, wr_str, sizeof(wr_str));
     wm_bt_fmt_pct(st->max_drawdown * 100.0, 1, dd_str, sizeof(dd_str));
+    wm_bt_fmt_num(pf, 2, pf_str, sizeof(pf_str));
+    snprintf(rt_str, sizeof(rt_str), "%u", rt);
 
     fputs("<div class=\"cards\">\n", fp);
-    fprintf(fp,
-        "<div class=\"card\"><div class=\"k\">Best equity</div>"
-        "<div class=\"v mono %s\">%s</div></div>\n", ec, eq_str);
-    fprintf(fp,
-        "<div class=\"card\"><div class=\"k\">Realized P/L</div>"
-        "<div class=\"v mono %s\">%s</div></div>\n", rc, rpnl_str);
-    fprintf(fp,
-        "<div class=\"card\"><div class=\"k\">Profit factor</div>"
-        "<div class=\"v mono\">%.2f</div></div>\n", pf);
-    fprintf(fp,
-        "<div class=\"card\"><div class=\"k\">Win rate</div>"
-        "<div class=\"v mono\">%s</div></div>\n", wr_str);
-    fprintf(fp,
-        "<div class=\"card\"><div class=\"k\">Round trips</div>"
-        "<div class=\"v mono\">%u</div></div>\n", rt);
-    fprintf(fp,
-        "<div class=\"card\"><div class=\"k\">Max drawdown</div>"
-        "<div class=\"v mono\">%s</div></div>\n", dd_str);
+    wm_bt_emit_card(fp, "Best equity",   "equity",       ec, eq_str);
+    wm_bt_emit_card(fp, "Realized P/L",  "realized_pnl", rc, rpnl_str);
+    wm_bt_emit_card(fp, "Profit factor", "pf",           "", pf_str);
+    wm_bt_emit_card(fp, "Win rate",      "win_rate",     "", wr_str);
+    wm_bt_emit_card(fp, "Round trips",   "round_trips",  "", rt_str);
+    wm_bt_emit_card(fp, "Max drawdown",  "max_dd",       "", dd_str);
     fputs("</div>\n", fp);
   }
 
@@ -2503,13 +2644,19 @@ wm_bt_render_index_html(const char *sweep_dir,
     // Metric strip.
     fprintf(fp,
         "<div class=\"strip\">"
-        "<div class=\"it\"><span>round trips</span>%u</div>"
-        "<div class=\"it\"><span>win rate</span>%.1f%%</div>"
+        "<div class=\"it\"><span title=\"Round trips: completed"
+        " buy-then-sell trades.\">round trips</span>%u</div>"
+        "<div class=\"it\"><span title=\"Win rate: share of round trips"
+        " that closed in profit.\">win rate</span>%.1f%%</div>"
         "<div class=\"it\"><span>wins / losses</span>%u / %u</div>"
-        "<div class=\"it\"><span>gross +/-</span>%.0f / -%.0f</div>"
-        "<div class=\"it\"><span>max dd</span>%.1f%%</div>"
-        "<div class=\"it\"><span>sharpe</span>%.3f</div>"
-        "<div class=\"it\"><span>sortino</span>%.3f</div>"
+        "<div class=\"it\"><span title=\"Gross profit / gross loss across"
+        " all closed trades.\">gross +/-</span>%.0f / -%.0f</div>"
+        "<div class=\"it\"><span title=\"Maximum drawdown: largest"
+        " peak-to-trough equity drop.\">max drawdown</span>%.1f%%</div>"
+        "<div class=\"it\"><span title=\"Sharpe ratio: return per unit of"
+        " total volatility. Higher is better.\">Sharpe</span>%.3f</div>"
+        "<div class=\"it\"><span title=\"Sortino ratio: return per unit of"
+        " downside volatility. Higher is better.\">Sortino</span>%.3f</div>"
         "</div>\n",
         rt, wr, st->n_wins, st->n_losses,
         st->gross_profit, st->gross_loss, st->max_drawdown * 100.0,
@@ -3048,15 +3195,25 @@ wm_bt_emit_heatmap_svg(FILE *fp, const wm_bt_sweep_plan_t *plan,
 // One sortable numeric `<th>` for the sweep top-K table. Mirrors the
 // per-trade table header shape (RPT-3) so report.js wmSortTable drives it:
 // data-col is the 0-based column index, data-type is always "num" (every
-// dashboard column sorts numeric). `label` is already HTML-escaped.
+// dashboard column sorts numeric). `label` is already HTML-escaped. `def`
+// (WM-BT-RPT-6; NULL/empty ⇒ none) adds a hover-tooltip metric definition —
+// the dense ~11-col header keeps short labels but carries the meaning here.
 static void
-wm_bt_sweep_th(FILE *fp, int col, const char *label)
+wm_bt_sweep_th(FILE *fp, int col, const char *label, const char *def)
 {
-  fprintf(fp,
-      "<th class=\"num\" aria-sort=\"none\"><button type=\"button\""
-      " class=\"sort\" data-col=\"%d\" data-type=\"num\">%s"
-      "<span class=\"arrow\" aria-hidden=\"true\"></span></button></th>",
-      col, label);
+  if(def != NULL && def[0] != '\0')
+    fprintf(fp,
+        "<th class=\"num\" aria-sort=\"none\" title=\"%s\">"
+        "<button type=\"button\" class=\"sort\" data-col=\"%d\""
+        " data-type=\"num\">%s<span class=\"arrow\" aria-hidden=\"true\">"
+        "</span></button></th>",
+        def, col, label);
+  else
+    fprintf(fp,
+        "<th class=\"num\" aria-sort=\"none\"><button type=\"button\""
+        " class=\"sort\" data-col=\"%d\" data-type=\"num\">%s"
+        "<span class=\"arrow\" aria-hidden=\"true\"></span></button></th>",
+        col, label);
 }
 
 // Emit the sortable top-K table for the sweep dashboard. Reuses class
@@ -3077,22 +3234,23 @@ wm_bt_emit_sweep_topk_table(FILE *fp, const wm_bt_sweep_plan_t *plan,
 
   fputs("<table class=\"trades\"><thead><tr>", fp);
 
-  wm_bt_sweep_th(fp, col++, "#");
-  wm_bt_sweep_th(fp, col++, "iter");
-  wm_bt_sweep_th(fp, col++, "score");
+  wm_bt_sweep_th(fp, col++, "#",      NULL);
+  wm_bt_sweep_th(fp, col++, "iter",   wm_bt_metric_def("iter"));
+  wm_bt_sweep_th(fp, col++, "score",  wm_bt_metric_def("score"));
 
   for(a = 0; a < plan->n_axes; a++)
   {
     wm_bt_html_escape(plan->axes[a].name, aname_esc, sizeof(aname_esc));
-    wm_bt_sweep_th(fp, col++, aname_esc);
+    wm_bt_sweep_th(fp, col++, aname_esc, "Swept parameter value for this"
+        " configuration.");
   }
 
-  wm_bt_sweep_th(fp, col++, "trades");
-  wm_bt_sweep_th(fp, col++, "pf");
-  wm_bt_sweep_th(fp, col++, "sharpe");
-  wm_bt_sweep_th(fp, col++, "sortino");
-  wm_bt_sweep_th(fp, col++, "max dd");
-  wm_bt_sweep_th(fp, col++, "equity");
+  wm_bt_sweep_th(fp, col++, "trades",  wm_bt_metric_def("trades"));
+  wm_bt_sweep_th(fp, col++, "pf",      wm_bt_metric_def("pf"));
+  wm_bt_sweep_th(fp, col++, "sharpe",  wm_bt_metric_def("sharpe"));
+  wm_bt_sweep_th(fp, col++, "sortino", wm_bt_metric_def("sortino"));
+  wm_bt_sweep_th(fp, col++, "max dd",  wm_bt_metric_def("max_dd"));
+  wm_bt_sweep_th(fp, col++, "equity",  wm_bt_metric_def("equity"));
 
   fputs("</tr></thead><tbody>\n", fp);
 
@@ -3258,9 +3416,9 @@ wm_bt_render_sweep_html(const char *sweep_dir,
       snap->bars_loaded_1m, wm_bt_report_mode_str(mode_val),
       plan->total_iters, wm_bt_sweep_score_name(plan->score));
 
-  fputs("<div class=\"wrap\">\n", fp);
+  fputs("<div class=\"wrap\" id=\"main\">\n", fp);
 
-  // ---- headline cards (rank-1 config) ----
+  // ---- verdict banner + headline cards (rank-1 config) ----
   if(top_k > 0 && results[indices[0]].ok)
   {
     const wm_bt_sweep_result_t *best = &results[indices[0]];
@@ -3271,45 +3429,43 @@ wm_bt_render_sweep_html(const char *sweep_dir,
     double      pf   = wm_market_stats_profit_factor(st);
     double      eq   = wm_bt_compute_equity(&best->trade);
     double      rpnl = st->realized_pnl_lifetime;
+    double      start_cash =
+        (fixed_params != NULL && fixed_params->have_starting_cash)
+        ? fixed_params->starting_cash : WM_MARKET_DEFAULT_STARTING_CASH;
     const char *ec   = eq >= WM_MARKET_DEFAULT_STARTING_CASH ? "pos" : "neg";
     const char *rc   = rpnl >= 0.0 ? "pos" : "neg";
     char        eq_str[48];
     char        rpnl_str[48];
     char        wr_str[32];
     char        dd_str[32];
+    char        pf_str[32];
+    char        rt_str[32];
     char        params[256];
+
+    wm_bt_emit_verdict(fp, st, start_cash, best->trade.sharpe, eq);
+
+    wm_bt_idx_params_str(plan, best->indices, params, sizeof(params));
+    wm_bt_html_escape(params, esc, sizeof(esc));
+
+    // Name the winning config (the verdict above describes its result).
+    fprintf(fp,
+        "<p class=\"note\">Best of %u configurations: <span class=\"mono\">"
+        "%s</span></p>\n", plan->total_iters, esc);
 
     wm_bt_fmt_usd(eq,   eq_str,   sizeof(eq_str));
     wm_bt_fmt_usd(rpnl, rpnl_str, sizeof(rpnl_str));
     wm_bt_fmt_pct(wr, 1, wr_str, sizeof(wr_str));
     wm_bt_fmt_pct(st->max_drawdown * 100.0, 1, dd_str, sizeof(dd_str));
-
-    wm_bt_idx_params_str(plan, best->indices, params, sizeof(params));
-    wm_bt_html_escape(params, esc, sizeof(esc));
-
-    fprintf(fp,
-        "<p class=\"note\">Best config (rank 1): <span class=\"mono\">%s"
-        "</span></p>\n", esc);
+    wm_bt_fmt_num(pf, 2, pf_str, sizeof(pf_str));
+    snprintf(rt_str, sizeof(rt_str), "%u", rt);
 
     fputs("<div class=\"cards\">\n", fp);
-    fprintf(fp,
-        "<div class=\"card\"><div class=\"k\">Best equity</div>"
-        "<div class=\"v mono %s\">%s</div></div>\n", ec, eq_str);
-    fprintf(fp,
-        "<div class=\"card\"><div class=\"k\">Realized P/L</div>"
-        "<div class=\"v mono %s\">%s</div></div>\n", rc, rpnl_str);
-    fprintf(fp,
-        "<div class=\"card\"><div class=\"k\">Profit factor</div>"
-        "<div class=\"v mono\">%.2f</div></div>\n", pf);
-    fprintf(fp,
-        "<div class=\"card\"><div class=\"k\">Win rate</div>"
-        "<div class=\"v mono\">%s</div></div>\n", wr_str);
-    fprintf(fp,
-        "<div class=\"card\"><div class=\"k\">Round trips</div>"
-        "<div class=\"v mono\">%u</div></div>\n", rt);
-    fprintf(fp,
-        "<div class=\"card\"><div class=\"k\">Max drawdown</div>"
-        "<div class=\"v mono\">%s</div></div>\n", dd_str);
+    wm_bt_emit_card(fp, "Best equity",   "equity",       ec, eq_str);
+    wm_bt_emit_card(fp, "Realized P/L",  "realized_pnl", rc, rpnl_str);
+    wm_bt_emit_card(fp, "Profit factor", "pf",           "", pf_str);
+    wm_bt_emit_card(fp, "Win rate",      "win_rate",     "", wr_str);
+    wm_bt_emit_card(fp, "Round trips",   "round_trips",  "", rt_str);
+    wm_bt_emit_card(fp, "Max drawdown",  "max_dd",       "", dd_str);
     fputs("</div>\n", fp);
   }
 
