@@ -20,6 +20,7 @@
 #include "market.h"
 #include "market_engine.h"
 #include "sweep.h"
+#include "wm_bt_assets.h"
 #include "wm_bt_chart.h"
 #include "whenmoon_strategy.h"
 
@@ -638,9 +639,11 @@ wm_bt_build_fixed_params_obj(const wm_backtest_params_t *p)
   return(obj);
 }
 
-// Write `json_str` atomically to `path` via tmp + rename.
-static bool
-wm_bt_write_atomic(const char *path, const char *json_str,
+// Write the whole NUL-terminated string `content` atomically to `path`
+// via tmp + fwrite + '\n' + fflush + fsync + rename. A trailing newline is
+// always appended.
+bool
+wm_bt_write_atomic(const char *path, const char *content,
     char *err, size_t err_cap)
 {
   char   tmp[1280];
@@ -649,10 +652,10 @@ wm_bt_write_atomic(const char *path, const char *json_str,
   int    fd;
   int    n;
 
-  if(path == NULL || json_str == NULL)
+  if(path == NULL || content == NULL)
     return(FAIL);
 
-  len = strlen(json_str);
+  len = strlen(content);
 
   n = snprintf(tmp, sizeof(tmp), "%s.tmp", path);
 
@@ -673,7 +676,7 @@ wm_bt_write_atomic(const char *path, const char *json_str,
     return(FAIL);
   }
 
-  if(fwrite(json_str, 1, len, fp) != len ||
+  if(fwrite(content, 1, len, fp) != len ||
      fputc('\n', fp) == EOF)
   {
     if(err != NULL)
@@ -1640,7 +1643,7 @@ wm_bt_idx_emit_chart_links(FILE *fp, const char *sweep_dir,
       continue;
 
     fprintf(fp,
-        "<a class=\"chart-link\" target=\"_blank\""
+        "<a class=\"chart-link\" target=\"_blank\" rel=\"noopener\""
         " href=\"charts/iter-%u/trade-%u-%s.html\">%s&#8599;</a>",
         rank, tidx, gname, gname);
 
@@ -1760,91 +1763,14 @@ wm_bt_idx_emit_trades(FILE *fp, const char *sweep_dir,
   return(tidx);
 }
 
-// The full <style> block + page chrome are static, so they go through
-// fputs (no printf %-escaping headaches with CSS percentages).
+// The shared <head> + design-system stylesheet now live in
+// wm_bt_assets.c; the index links them by relative path and pulls in the
+// shared client bootstrap (report.js).
 static void
 wm_bt_idx_write_head(FILE *fp, const char *title_esc)
 {
-  fprintf(fp,
-      "<!DOCTYPE html>\n<html lang=\"en\"><head><meta charset=\"utf-8\">\n"
-      "<meta name=\"viewport\" content=\"width=device-width,"
-      "initial-scale=1\">\n<title>%s</title>\n", title_esc);
-
-  fputs(
-      "<style>\n"
-      ":root{--bg:#0e0f13;--surface:#171922;--surface2:#1e2230;"
-      "--border:#2a2f3e;--text:#e6e8ee;--muted:#8b93a7;--accent:#5b8cff;"
-      "--win:#2bb673;--loss:#e0533d;--gold:#f5c451}\n"
-      "*{box-sizing:border-box}\n"
-      "body{margin:0;background:var(--bg);color:var(--text);"
-      "font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,"
-      "Helvetica,Arial,sans-serif;line-height:1.5}\n"
-      ".mono{font-family:ui-monospace,'SF Mono',Menlo,Consolas,monospace}\n"
-      "header{position:sticky;top:0;z-index:10;background:"
-      "rgba(14,15,19,.92);backdrop-filter:blur(8px);"
-      "border-bottom:1px solid var(--border);padding:18px 28px}\n"
-      "header h1{margin:0 0 2px;font-size:19px;font-weight:650}\n"
-      "header .sub{color:var(--muted);font-size:13px}\n"
-      ".wrap{max-width:1180px;margin:0 auto;padding:24px 28px 64px}\n"
-      ".cards{display:grid;grid-template-columns:repeat(auto-fit,"
-      "minmax(150px,1fr));gap:14px;margin:22px 0}\n"
-      ".card{background:var(--surface);border:1px solid var(--border);"
-      "border-radius:12px;padding:14px 16px}\n"
-      ".card .k{color:var(--muted);font-size:12px;text-transform:uppercase;"
-      "letter-spacing:.04em}\n"
-      ".card .v{font-size:23px;font-weight:650;margin-top:4px}\n"
-      ".card .v.mono{font-size:20px}\n"
-      "section{margin:30px 0}\n"
-      "h2{font-size:15px;font-weight:600;color:var(--muted);"
-      "text-transform:uppercase;letter-spacing:.05em;"
-      "border-bottom:1px solid var(--border);padding-bottom:8px}\n"
-      "table{border-collapse:collapse;width:100%;font-size:13px}\n"
-      "th,td{padding:7px 10px;text-align:left;border-bottom:1px solid "
-      "var(--border);white-space:nowrap}\n"
-      "th{color:var(--muted);font-weight:600;font-size:11px;"
-      "text-transform:uppercase;letter-spacing:.03em}\n"
-      ".num{text-align:right;font-family:ui-monospace,'SF Mono',Menlo,"
-      "Consolas,monospace}\n"
-      "td.reason{color:var(--muted);font-size:12px;white-space:normal}\n"
-      ".meta dt{color:var(--muted);font-size:12px;text-transform:uppercase;"
-      "letter-spacing:.03em}\n"
-      ".meta{display:grid;grid-template-columns:repeat(auto-fit,"
-      "minmax(220px,1fr));gap:10px 28px;margin:8px 0}\n"
-      ".meta div{border-bottom:1px solid var(--border);padding:6px 0}\n"
-      ".meta .vv{font-size:14px}\n"
-      "details{background:var(--surface);border:1px solid var(--border);"
-      "border-radius:12px;margin:14px 0;overflow:hidden}\n"
-      "details[open]{box-shadow:0 0 0 1px var(--accent) inset}\n"
-      "summary{cursor:pointer;padding:14px 18px;list-style:none;"
-      "display:flex;align-items:center;gap:14px;flex-wrap:wrap}\n"
-      "summary::-webkit-details-marker{display:none}\n"
-      "summary .rank{background:var(--surface2);border:1px solid "
-      "var(--border);border-radius:8px;padding:2px 10px;font-weight:700;"
-      "font-size:13px}\n"
-      "summary .params{font-size:13px}\n"
-      "summary .spacer{flex:1}\n"
-      ".badge{font-family:ui-monospace,monospace;font-size:13px;"
-      "padding:2px 9px;border-radius:8px;border:1px solid var(--border)}\n"
-      ".badge.win{color:var(--win);border-color:rgba(43,182,115,.4)}\n"
-      ".badge.loss{color:var(--loss);border-color:rgba(224,83,61,.4)}\n"
-      ".strip{display:flex;flex-wrap:wrap;gap:8px 22px;padding:4px 18px "
-      "14px;border-bottom:1px solid var(--border)}\n"
-      ".strip .it{font-size:13px}\n"
-      ".strip .it span{color:var(--muted);margin-right:6px}\n"
-      ".tbl-scroll{max-height:560px;overflow:auto;padding:0 6px 6px}\n"
-      "tr.win td.pnl{color:var(--win)}\n"
-      "tr.loss td.pnl{color:var(--loss)}\n"
-      "tr.win:hover,tr.loss:hover,tr.open:hover{background:var(--surface2)}\n"
-      ".pos{color:var(--win)}.neg{color:var(--loss)}\n"
-      ".muted{color:var(--muted)}\n"
-      "a{color:var(--accent);text-decoration:none}a:hover{text-decoration:"
-      "underline}\n"
-      ".chart-link{font-family:ui-monospace,monospace;font-size:12px;"
-      "margin-right:8px}\n"
-      ".note{color:var(--muted);font-size:12px;padding:10px 18px}\n"
-      "footer{color:var(--muted);font-size:12px;margin-top:40px;"
-      "border-top:1px solid var(--border);padding-top:16px}\n"
-      "</style>\n</head><body>\n", fp);
+  wm_bt_html_doc_open(fp, title_esc, "assets/report.css");
+  fputs("<script defer src=\"assets/report.js\"></script>\n", fp);
 }
 
 bool
@@ -1967,27 +1893,35 @@ wm_bt_render_index_html(const char *sweep_dir,
     double   rpnl = st->realized_pnl_lifetime;
     const char *ec = eq >= WM_MARKET_DEFAULT_STARTING_CASH ? "pos" : "neg";
     const char *rc = rpnl >= 0.0 ? "pos" : "neg";
+    char     eq_str[48];
+    char     rpnl_str[48];
+    char     wr_str[32];
+    char     dd_str[32];
+
+    wm_bt_fmt_usd(eq,   eq_str,   sizeof(eq_str));
+    wm_bt_fmt_usd(rpnl, rpnl_str, sizeof(rpnl_str));
+    wm_bt_fmt_pct(wr, 1, wr_str, sizeof(wr_str));
+    wm_bt_fmt_pct(st->max_drawdown * 100.0, 1, dd_str, sizeof(dd_str));
 
     fputs("<div class=\"cards\">\n", fp);
     fprintf(fp,
         "<div class=\"card\"><div class=\"k\">Best equity</div>"
-        "<div class=\"v mono %s\">$%.0f</div></div>\n", ec, eq);
+        "<div class=\"v mono %s\">%s</div></div>\n", ec, eq_str);
     fprintf(fp,
         "<div class=\"card\"><div class=\"k\">Realized P/L</div>"
-        "<div class=\"v mono %s\">%+.0f</div></div>\n", rc, rpnl);
+        "<div class=\"v mono %s\">%s</div></div>\n", rc, rpnl_str);
     fprintf(fp,
         "<div class=\"card\"><div class=\"k\">Profit factor</div>"
         "<div class=\"v mono\">%.2f</div></div>\n", pf);
     fprintf(fp,
         "<div class=\"card\"><div class=\"k\">Win rate</div>"
-        "<div class=\"v mono\">%.1f%%</div></div>\n", wr);
+        "<div class=\"v mono\">%s</div></div>\n", wr_str);
     fprintf(fp,
         "<div class=\"card\"><div class=\"k\">Round trips</div>"
         "<div class=\"v mono\">%u</div></div>\n", rt);
     fprintf(fp,
         "<div class=\"card\"><div class=\"k\">Max drawdown</div>"
-        "<div class=\"v mono\">%.1f%%</div></div>\n",
-        st->max_drawdown * 100.0);
+        "<div class=\"v mono\">%s</div></div>\n", dd_str);
     fputs("</div>\n", fp);
   }
 
@@ -2019,12 +1953,17 @@ wm_bt_render_index_html(const char *sweep_dir,
         ? fixed_params->size_frac : WM_MARKET_DEFAULT_SIZE_FRAC;
     double cash = (fixed_params != NULL && fixed_params->have_starting_cash)
         ? fixed_params->starting_cash : WM_MARKET_DEFAULT_STARTING_CASH;
+    char   size_str[32];
+    char   cash_str[48];
+
+    wm_bt_fmt_pct(sf * 100.0, 0, size_str, sizeof(size_str));
+    wm_bt_fmt_usd(cash, cash_str, sizeof(cash_str));
 
     fprintf(fp,
         "<div><dt>economics</dt><div class=\"vv mono\">fee %.1f bps"
-        " &middot; slip %.1f bps &middot; size %.0f%% &middot;"
-        " cash $%.0f</div></div>\n",
-        fee, slip, sf * 100.0, cash);
+        " &middot; slip %.1f bps &middot; size %s &middot;"
+        " cash %s</div></div>\n",
+        fee, slip, size_str, cash_str);
   }
 
   if(mode_val == WM_BT_MODE_WALK_FORWARD && mode != NULL)

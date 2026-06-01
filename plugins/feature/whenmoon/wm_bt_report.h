@@ -62,6 +62,14 @@ bool wm_bt_sweep_dir_create(const char *report_path,
     const char *sweep_id, char *out_path, size_t cap,
     char *err, size_t err_cap);
 
+// Atomically write the whole NUL-terminated string `content` to `path`
+// (tmp + fwrite + '\n' + fflush + fsync + rename). A trailing newline is
+// always appended. Used for manifest.json and the shared report.css /
+// report.js assets (wm_bt_assets.c). Returns SUCCESS / FAIL with `err`
+// populated on overflow / fopen / write / rename failure.
+bool wm_bt_write_atomic(const char *path, const char *content,
+    char *err, size_t err_cap);
+
 // JSONL writer. Each call to wm_bt_iter_append serializes one row
 // under the writer's mutex; WM-BT-6 drives this from the main-thread
 // post-pass loop (workers must not call it concurrently — see the

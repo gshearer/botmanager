@@ -22,6 +22,7 @@
 #define WHENMOON_INTERNAL
 #include "wm_bt_chart.h"
 
+#include "wm_bt_assets.h"
 #include "common.h"
 
 #include <errno.h>
@@ -237,6 +238,7 @@ wm_bt_chart_write_html(FILE *fp,
   const char *gname = wm_bt_chart_gran_name(gran);
   char        entry_ts[64];
   char        exit_ts[64];
+  char        title[96];
 
   wm_bt_chart_fmt_ts(entry_fill->ts_ms, entry_ts, sizeof(entry_ts));
 
@@ -245,19 +247,15 @@ wm_bt_chart_write_html(FILE *fp,
   else
     snprintf(exit_ts, sizeof(exit_ts), "(open)");
 
-  // Prologue + chart container.
-  fputs(
-      "<!DOCTYPE html>\n"
-      "<html><head><meta charset=\"utf-8\">\n", fp);
-  fprintf(fp,
-      "<title>iter %u trade %u %s</title>\n",
+  // Shared head + design system (wm_bt_assets.c). The chart page sits two
+  // levels under the sweep dir (charts/iter-K/), so it links the assets
+  // via ../../; the page-specific layout (#chart height, the bare-<h1>
+  // trade header) lives in report.css. Title components are integers + a
+  // fixed grain token, so no HTML escaping is needed.
+  snprintf(title, sizeof(title), "iter %u trade %u %s",
       iter_idx, trade_idx, gname);
-  fputs(
-      "<style>html,body{margin:0;background:#0a0a0a;color:#ddd;"
-      "font-family:monospace}\n"
-      "#chart{height:90vh}h1{padding:8px 12px;font-size:14px;"
-      "font-weight:normal}</style>\n"
-      "</head><body>\n", fp);
+  wm_bt_html_doc_open(fp, title, "../../assets/report.css");
+  fputs("<script defer src=\"../../assets/report.js\"></script>\n", fp);
 
   fprintf(fp,
       "<h1>iter %u &middot; trade %u &middot; %s &middot;"

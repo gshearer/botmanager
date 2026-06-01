@@ -36,6 +36,7 @@
 #include "market.h"
 #include "strategy.h"
 #include "sweep.h"
+#include "wm_bt_assets.h"
 #include "wm_bt_chart.h"
 #include "wm_bt_file.h"
 #include "wm_bt_report.h"
@@ -855,6 +856,20 @@ wm_bt_cmd_run(const cmd_ctx_t *ctx)
     cmd_reply(ctx, reply);
     wm_backtest_snapshot_free(snap);
     return;
+  }
+
+  // Shared CSS/JS assets for every emitted HTML page (index + per-trade
+  // charts + the WM-BT-RPT-5 sweep dashboard). Emit once, right after the
+  // sweep dir exists; warn + continue on failure (an unstyled page is
+  // still readable) — same discipline as the manifest pre-write below.
+  err[0] = '\0';
+
+  if(wm_bt_assets_emit(sweep_dir, err, sizeof(err)) != SUCCESS)
+  {
+    snprintf(reply, sizeof(reply),
+        "warn: assets emit failed: %s (pages render unstyled)",
+        err[0] != '\0' ? err : "(unknown)");
+    cmd_reply(ctx, reply);
   }
 
   sweep_results = mem_alloc("whenmoon.backtest", "sweep_results",
