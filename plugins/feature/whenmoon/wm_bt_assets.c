@@ -140,9 +140,30 @@ static const char *const WM_BT_REPORT_CSS_PARTS[] = {
     "th[aria-sort='descending'] .arrow::after{content:'\\2193';opacity:1}\n"
     "tr.hidden{display:none}\n"
     ".tbl-scroll{content-visibility:auto;contain-intrinsic-size:auto 560px}\n"
-    // --- per-trade chart page (was the chart TU's inline <style>) ---
-    "#chart{height:86vh}\n"
-    "body>h1{margin:0;padding:14px 20px;font-size:14px;font-weight:600}\n",
+    // --- per-trade chart page (WM-BT-RPT-4: nav, info cards, panes) ---
+    ".tnav{display:flex;flex-wrap:wrap;align-items:center;gap:8px 14px;"
+    "padding:10px 28px;border-bottom:1px solid var(--border);font-size:13px}\n"
+    ".tnav .grp{display:flex;flex-wrap:wrap;align-items:center;gap:8px}\n"
+    ".tnav .lbl{color:var(--muted);text-transform:uppercase;font-size:11px;"
+    "letter-spacing:.04em}\n"
+    ".tnav .sep{color:var(--border)}\n"
+    ".tnav .spacer{flex:1}\n"
+    ".navlink{padding:3px 10px;border:1px solid var(--border);"
+    "border-radius:8px;color:var(--accent)}\n"
+    ".navlink:hover{background:var(--surface2);text-decoration:none}\n"
+    ".navlink.off{color:var(--muted);opacity:.45;cursor:default}\n"
+    ".navlink.cur{background:var(--surface2);border-color:var(--accent);"
+    "color:var(--text)}\n"
+    ".card .v.txt{font-size:14px;font-weight:550;text-transform:none}\n"
+    ".tc-figure{margin:18px 0 0}\n"
+    ".tc-pane{margin:6px 0;border:1px solid var(--border);border-radius:10px;"
+    "background:var(--surface);overflow:hidden}\n"
+    "#tc-price{height:54vh;min-height:320px}\n"
+    ".tc-sub{height:15vh;min-height:120px}\n"
+    ".tc-cap{color:var(--muted);font-size:12px;margin-top:6px}\n"
+    ".visually-hidden{position:absolute;width:1px;height:1px;margin:-1px;"
+    "padding:0;overflow:hidden;clip:rect(0 0 0 0);clip-path:inset(50%);"
+    "border:0;white-space:nowrap}\n",
     NULL,
 };
 
@@ -301,9 +322,119 @@ static const char *const WM_BT_REPORT_JS_PARTS[] = {
     "        () => wmFilterTrades(grp, chip.dataset.kind)));\n"
     "  });\n"
     "}\n"
-    "function wmInit(){ wmRenderEquity(); wmInitTrades(); }\n"
+    "function wmInit(){ wmRenderEquity(); wmInitTrades();"
+    " wmRenderTradeChart(); }\n"
     "if(document.readyState === 'complete') wmInit();\n"
     "else document.addEventListener('DOMContentLoaded', wmInit);\n",
+    // --- WM-BT-RPT-4: per-trade multi-pane chart (price + volume + RSI +
+    // MACD), stacked LWC charts with a synced time axis. Reads the
+    // #trade-data JSON island; no-ops on pages without #tc-price.
+    "function wmTcOpts(){\n"
+    "  return {\n"
+    "    autoSize:true,\n"
+    "    layout:{background:{color:'#0e0f13'},textColor:'#8b93a7',"
+    "fontSize:11},\n"
+    "    grid:{vertLines:{color:'#1e2230'},horzLines:{color:'#1e2230'}},\n"
+    "    rightPriceScale:{borderColor:'#2a2f3e'},\n"
+    "    timeScale:{borderColor:'#2a2f3e',timeVisible:true,"
+    "secondsVisible:false},\n"
+    "    crosshair:{mode:0},\n"
+    "    kineticScroll:{mouse:false,touch:!wmReduceMotion}\n"
+    "  };\n"
+    "}\n"
+    // Two-way time-axis sync across the stacked panes; a re-entrancy lock
+    // stops the visible-range callbacks from echoing each other. Synced by
+    // *time* range (not logical/index): the oscillator panes drop NaN
+    // warmup bars, so they hold fewer points than price/volume and an
+    // index sync would shift them by the warmup length.
+    "function wmSyncTime(charts){\n"
+    "  let lock = false;\n"
+    "  charts.forEach(src => {\n"
+    "    src.timeScale().subscribeVisibleTimeRangeChange(tr => {\n"
+    "      if(!tr || lock) return;\n"
+    "      lock = true;\n"
+    "      charts.forEach(d => {\n"
+    "        if(d !== src){ try { d.timeScale().setVisibleRange(tr); }"
+    " catch(e) {} }\n"
+    "      });\n"
+    "      lock = false;\n"
+    "    });\n"
+    "  });\n"
+    "}\n",
+    "function wmRenderTradeChart(){\n"
+    "  const host = document.getElementById('tc-price');\n"
+    "  const src  = document.getElementById('trade-data');\n"
+    "  if(!host || !src) return;\n"
+    "  let d = null;\n"
+    "  try { d = JSON.parse(src.textContent || '{}'); }"
+    " catch(e) { d = null; }\n"
+    "  if(!d || !Array.isArray(d.candles) || d.candles.length === 0){\n"
+    "    host.innerHTML = '<p class=note>No candle data to plot.</p>';"
+    " return;\n"
+    "  }\n"
+    "  if(typeof LightweightCharts === 'undefined'){\n"
+    "    host.innerHTML = '<p class=note>Charts need network"
+    " (Lightweight Charts CDN).</p>';\n"
+    "    return;\n"
+    "  }\n"
+    "  const charts = [];\n"
+    "  const price = LightweightCharts.createChart(host, wmTcOpts());\n"
+    "  charts.push(price);\n"
+    "  const candles = price.addCandlestickSeries({upColor:'#2bb673',"
+    "downColor:'#e0533d',borderVisible:false,wickUpColor:'#2bb673',"
+    "wickDownColor:'#e0533d'});\n"
+    "  candles.setData(d.candles);\n"
+    "  const addLine = (arr, color, title) => {\n"
+    "    if(!Array.isArray(arr) || !arr.length) return;\n"
+    "    price.addLineSeries({color:color,lineWidth:1,title:title,"
+    "priceLineVisible:false,lastValueVisible:false}).setData(arr);\n"
+    "  };\n"
+    "  addLine(d.sma20, '#5b8cff', 'SMA 20');\n"
+    "  addLine(d.sma50, '#f5c451', 'SMA 50');\n"
+    "  addLine(d.ema20, '#2bb673', 'EMA 20');\n"
+    "  if(typeof d.entryPx === 'number')"
+    " candles.createPriceLine({price:d.entryPx,color:'#f5c451',"
+    "lineWidth:1,lineStyle:2,title:'entry'});\n"
+    "  if(typeof d.exitPx === 'number')"
+    " candles.createPriceLine({price:d.exitPx,color:'#5b8cff',"
+    "lineWidth:1,lineStyle:2,title:'exit'});\n"
+    "  if(Array.isArray(d.markers) && d.markers.length)"
+    " candles.setMarkers(d.markers);\n"
+    "  const volHost = document.getElementById('tc-vol');\n"
+    "  if(volHost && Array.isArray(d.volume) && d.volume.length){\n"
+    "    const vc = LightweightCharts.createChart(volHost, wmTcOpts());\n"
+    "    charts.push(vc);\n"
+    "    vc.addHistogramSeries({priceFormat:{type:'volume'},"
+    "priceLineVisible:false}).setData(d.volume);\n"
+    "  }\n"
+    "  const rsiHost = document.getElementById('tc-rsi');\n"
+    "  if(rsiHost && Array.isArray(d.rsi) && d.rsi.length){\n"
+    "    const rc = LightweightCharts.createChart(rsiHost, wmTcOpts());\n"
+    "    charts.push(rc);\n"
+    "    const r = rc.addLineSeries({color:'#b48cff',lineWidth:1,"
+    "title:'RSI 14'});\n"
+    "    r.setData(d.rsi);\n"
+    "    r.createPriceLine({price:70,color:'#e0533d',lineWidth:1,"
+    "lineStyle:2,title:'70'});\n"
+    "    r.createPriceLine({price:30,color:'#2bb673',lineWidth:1,"
+    "lineStyle:2,title:'30'});\n"
+    "  }\n"
+    "  const macdHost = document.getElementById('tc-macd');\n"
+    "  if(macdHost && Array.isArray(d.macd) && d.macd.length){\n"
+    "    const mc = LightweightCharts.createChart(macdHost, wmTcOpts());\n"
+    "    charts.push(mc);\n"
+    "    if(Array.isArray(d.macdHist) && d.macdHist.length)\n"
+    "      mc.addHistogramSeries({priceLineVisible:false,"
+    "lastValueVisible:false}).setData(d.macdHist);\n"
+    "    mc.addLineSeries({color:'#5b8cff',lineWidth:1,title:'MACD'})"
+    ".setData(d.macd);\n"
+    "    if(Array.isArray(d.macdSignal) && d.macdSignal.length)\n"
+    "      mc.addLineSeries({color:'#f5c451',lineWidth:1,title:'signal'})"
+    ".setData(d.macdSignal);\n"
+    "  }\n"
+    "  charts.forEach(c => c.timeScale().fitContent());\n"
+    "  wmSyncTime(charts);\n"
+    "}\n",
     NULL,
 };
 
@@ -476,6 +607,46 @@ wm_bt_fmt_pct(double v, int frac, char *out, size_t cap)
     frac = 9;
 
   snprintf(out, cap, "%.*f%%", frac, v);
+}
+
+void
+wm_bt_html_escape(const char *in, char *out, size_t cap)
+{
+  size_t o = 0;
+
+  if(out == NULL || cap == 0)
+    return;
+
+  if(in == NULL)
+    in = "";
+
+  for(; *in != '\0' && o + 1 < cap; in++)
+  {
+    const char *rep = NULL;
+    size_t      rl;
+
+    switch(*in)
+    {
+      case '&':  rep = "&amp;";  break;
+      case '<':  rep = "&lt;";   break;
+      case '>':  rep = "&gt;";   break;
+      case '"':  rep = "&quot;"; break;
+      case '\'': rep = "&#39;";  break;
+      default:
+        out[o++] = *in;
+        continue;
+    }
+
+    rl = strlen(rep);
+
+    if(o + rl >= cap)
+      break;
+
+    memcpy(out + o, rep, rl);
+    o += rl;
+  }
+
+  out[o] = '\0';
 }
 
 // ----------------------------------------------------------------------- //

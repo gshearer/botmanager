@@ -224,9 +224,30 @@ wm_bt_cmd_run_emit_charts(const cmd_ctx_t *ctx,
     char                        iter_dir[1280];
     int                         n;
     uint32_t                    g;
+    uint16_t                    grains_present = 0;
+    uint32_t                    n_trades       = 0;
+    wm_bt_trade_iter_t          count_it;
+    const wm_market_fill_t     *count_entry;
+    const wm_market_fill_t     *count_exit;
 
     if(res->n_fills == 0 || res->fills == NULL)
       continue;
+
+    // Per-iter nav inputs (passed to every chart this iter emits): the
+    // mask of grains with a non-empty ring, and the total round-trip
+    // count. Every present grain charts every trade (the slice walker
+    // only drops an empty ring), so 1..n_trades x grains_present all
+    // resolve to files — the chart nav links them without stat-guards.
+    for(g = 0; g < WM_GRAN_MAX; g++)
+      if(snap->mkt.grain_arr[g] != NULL && snap->mkt.grain_n[g] > 0)
+        grains_present |= (uint16_t)(1u << g);
+
+    count_it.fills = res->fills;
+    count_it.n     = res->n_fills;
+    count_it.pos   = 0;
+
+    while(wm_bt_trade_next(&count_it, &count_entry, &count_exit))
+      n_trades++;
 
     n = snprintf(iter_dir, sizeof(iter_dir),
         "%s/charts/iter-%u", sweep_dir, k + 1);
@@ -294,6 +315,7 @@ wm_bt_cmd_run_emit_charts(const cmd_ctx_t *ctx,
         if(wm_bt_chart_emit(iter_dir, k + 1, trade_idx, (wm_gran_t)g,
                &ring[start_idx], slice_n,
                entry, exit_fill,
+               n_trades, grains_present,
                chart_err, sizeof(chart_err)) != SUCCESS)
         {
           snprintf(reply, sizeof(reply),

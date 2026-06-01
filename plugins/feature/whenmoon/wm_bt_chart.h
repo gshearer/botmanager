@@ -31,7 +31,13 @@
 // to ring bounds). `entry_fill` / `exit_fill` are the matched
 // buy/sell pair; `exit_fill` may be NULL when the iteration's last
 // position never closed (open at snapshot end) — in that case only
-// the entry marker is drawn.
+// the entry marker is drawn and the exit card / guide line are omitted.
+//
+// `n_trades` is the total round-trip count for this iteration (bounds the
+// prev/next nav links — every present grain charts every trade, so
+// trade indices 1..n_trades always resolve). `grains_present` is a
+// bitmask (bit g set => snapshot grain g has a non-empty ring) driving
+// the grain switcher; the chart page emits a link per present grain.
 //
 // SUCCESS on a complete HTML file; FAIL with `err` populated on alloc
 // / fopen / write failure. Empty slices (`n_bars == 0`) and NULL
@@ -41,6 +47,7 @@ bool wm_bt_chart_emit(const char *dir,
     const wm_candle_full_t *bars, uint32_t n_bars,
     const wm_market_fill_t *entry_fill,
     const wm_market_fill_t *exit_fill,
+    uint32_t n_trades, uint16_t grains_present,
     char *err, size_t err_cap);
 
 // Short canonical grain token ("1m", "5m", "15m", "1h", "4h", "1d").

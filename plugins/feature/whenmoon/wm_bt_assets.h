@@ -52,6 +52,12 @@ void wm_bt_fmt_num(double v, int frac, char *out, size_t cap);
 // keep a leading '-'; positives are unsigned. Non-finite -> "n/a".
 void wm_bt_fmt_pct(double v, int frac, char *out, size_t cap);
 
+// Escape the five HTML-significant characters (& < > " ') from `in` into
+// `out`. Always NUL-terminates; silently stops at the buffer edge. NULL
+// `in` is treated as empty. Shared by every report/chart emitter that
+// prints free text (exit reasons, strategy names, paths) into markup.
+void wm_bt_html_escape(const char *in, char *out, size_t cap);
+
 #endif // WHENMOON_INTERNAL
 
 #endif // BM_WHENMOON_WM_BT_ASSETS_H

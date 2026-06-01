@@ -1497,47 +1497,8 @@ wm_bt_render_report_md(const char *sweep_dir,
 // generated `charts/iter-K/trade-M-<gran>.html` hrefs line up with the
 // files the chart pass wrote.
 
-// Escape the five HTML-significant characters into `out`. Always
-// NUL-terminates; silently stops at the buffer edge.
-static void
-wm_bt_html_escape(const char *in, char *out, size_t cap)
-{
-  size_t o = 0;
-
-  if(out == NULL || cap == 0)
-    return;
-
-  if(in == NULL)
-    in = "";
-
-  for(; *in != '\0' && o + 1 < cap; in++)
-  {
-    const char *rep = NULL;
-    size_t      rl;
-
-    switch(*in)
-    {
-      case '&':  rep = "&amp;";  break;
-      case '<':  rep = "&lt;";   break;
-      case '>':  rep = "&gt;";   break;
-      case '"':  rep = "&quot;"; break;
-      case '\'': rep = "&#39;";  break;
-      default:
-        out[o++] = *in;
-        continue;
-    }
-
-    rl = strlen(rep);
-
-    if(o + rl >= cap)
-      break;
-
-    memcpy(out + o, rep, rl);
-    o += rl;
-  }
-
-  out[o] = '\0';
-}
+// wm_bt_html_escape moved to wm_bt_assets.c (WM-BT-RPT-4) — shared by the
+// chart emitter too; declared in wm_bt_assets.h.
 
 // "YYYY-MM-DD HH:MM" UTC, or numeric epoch on gmtime_r failure.
 static void
