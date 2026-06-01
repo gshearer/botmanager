@@ -92,8 +92,11 @@ wm_bt_results_free_fills(wm_bt_sweep_result_t *results, uint32_t n)
 // [entry_ts - WM_BT_CHART_PADDING_BARS, exit_ts + WM_BT_CHART_PADDING_BARS]
 // clamped to [0, ring_n). Linear because rings cap at ~tens of
 // thousands at the deepest grain; a tighter binary search would not
-// matter at this scale. Returns false (no slice) when no bars fall
-// inside the window.
+// matter at this scale. Returns false only when the ring is empty
+// (ring_n == 0); a trade that spans no bar close at this grain (e.g. a
+// sub-day trade never crossing a 00:00 UTC daily close, on the 1d ring)
+// is anchored on the nearest bar so every non-empty grain is still
+// charted with surrounding context.
 static bool
 wm_bt_chart_slice_indices(const wm_candle_full_t *ring, uint32_t ring_n,
     int64_t entry_ts_ms, int64_t exit_ts_ms,
@@ -130,8 +133,18 @@ wm_bt_chart_slice_indices(const wm_candle_full_t *ring, uint32_t ring_n,
     }
   }
 
+  // Empty raw window: the trade falls between two consecutive bar closes
+  // (e.g. a 4h trade on the 1d ring, never crossing a 00:00 UTC daily
+  // close) or sits entirely outside the ring. Anchor on the nearest bar
+  // so the padding below still yields a context window and the grain is
+  // charted, rather than dropping it.
   if(start >= ring_n || end <= start)
-    return(false);
+  {
+    uint32_t anchor = (start < ring_n) ? start : (ring_n - 1);
+
+    start = anchor;
+    end   = anchor + 1;
+  }
 
   // Pad both sides; clamp to ring bounds.
   if(start >= WM_BT_CHART_PADDING_BARS)
@@ -225,7 +238,7 @@ wm_bt_cmd_run_emit_charts(const cmd_ctx_t *ctx,
       continue;
     }
 
-    if(mkdir(iter_dir, 0700) != 0 && errno != EEXIST)
+    if(mkdir(iter_dir, WM_BT_REPORT_DIR_MODE) != 0 && errno != EEXIST)
     {
       snprintf(reply, sizeof(reply),
           "warn: charts: mkdir('%.512s') failed: %s",

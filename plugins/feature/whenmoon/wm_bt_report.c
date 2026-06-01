@@ -46,8 +46,6 @@
 #define WM_BT_REPORT_CTX            "whenmoon.bt.report"
 #define WM_BT_KV_REPORT_PATH        "plugin.whenmoon.backtest.report_path"
 #define WM_BT_REPORT_DEFAULT_REL    ".local/share/botmanager/backtests"
-#define WM_BT_REPORT_DIR_MODE_PUB   ((mode_t)0755)
-#define WM_BT_REPORT_DIR_MODE_PRV   ((mode_t)0700)
 
 // ----------------------------------------------------------------------- //
 // Mode label                                                              //
@@ -95,14 +93,12 @@ wm_bt_obj_add_double(struct json_object *parent, const char *key, double v)
 // ----------------------------------------------------------------------- //
 //
 // Walks the absolute-path string in-place (mutating + restoring a single
-// path-separator byte at a time) and mkdir's each segment with `parent_mode`
-// for every interior segment, `leaf_mode` for the final one. Empty
-// segments (`//`) are skipped. EEXIST is success. Anything else FAILs
-// with errno set.
+// path-separator byte at a time) and mkdir's each segment with `mode`.
+// Empty segments (`//`) are skipped. EEXIST is success. Anything else
+// FAILs with errno set.
 
 static bool
-wm_bt_mkdir_p(char *path, mode_t parent_mode, mode_t leaf_mode,
-    char *err, size_t err_cap)
+wm_bt_mkdir_p(char *path, mode_t mode, char *err, size_t err_cap)
 {
   size_t i;
   size_t len;
@@ -119,20 +115,16 @@ wm_bt_mkdir_p(char *path, mode_t parent_mode, mode_t leaf_mode,
   for(i = 1; i <= len; i++)
   {
     char saved;
-    bool is_last;
 
     if(i < len && path[i] != '/')
       continue;
 
-    is_last = (i == len);
     saved   = path[i];
     path[i] = '\0';
 
     if(path[0] != '\0' && strcmp(path, "/") != 0)
     {
-      mode_t m = is_last ? leaf_mode : parent_mode;
-
-      if(mkdir(path, m) != 0 && errno != EEXIST)
+      if(mkdir(path, mode) != 0 && errno != EEXIST)
       {
         if(err != NULL)
           snprintf(err, err_cap,
@@ -202,9 +194,7 @@ wm_bt_report_path_resolve(char *out, size_t cap, char *err, size_t err_cap)
   while(n > 1 && buf[n - 1] == '/')
     buf[--n] = '\0';
 
-  if(wm_bt_mkdir_p(buf,
-         WM_BT_REPORT_DIR_MODE_PUB, WM_BT_REPORT_DIR_MODE_PRV,
-         err, err_cap) != SUCCESS)
+  if(wm_bt_mkdir_p(buf, WM_BT_REPORT_DIR_MODE, err, err_cap) != SUCCESS)
     return(FAIL);
 
   if((size_t)n >= cap)
@@ -279,7 +269,7 @@ wm_bt_sweep_dir_create(const char *report_path, const char *sweep_id,
     return(FAIL);
   }
 
-  if(mkdir(out_path, WM_BT_REPORT_DIR_MODE_PRV) != 0 && errno != EEXIST)
+  if(mkdir(out_path, WM_BT_REPORT_DIR_MODE) != 0 && errno != EEXIST)
   {
     if(err != NULL)
       snprintf(err, err_cap,
@@ -296,7 +286,7 @@ wm_bt_sweep_dir_create(const char *report_path, const char *sweep_id,
     return(FAIL);
   }
 
-  if(mkdir(charts, WM_BT_REPORT_DIR_MODE_PRV) != 0 && errno != EEXIST)
+  if(mkdir(charts, WM_BT_REPORT_DIR_MODE) != 0 && errno != EEXIST)
   {
     if(err != NULL)
       snprintf(err, err_cap,

@@ -21,13 +21,21 @@
 #include <stddef.h>
 #include <stdint.h>
 #include <stdio.h>
+#include <sys/types.h>
+
+// Mode passed to mkdir() for every backtest output directory (report
+// root, sweep dir, charts/, charts/iter-K/). 0777 so the process umask
+// alone decides the final permissions — the same policy as the 0666
+// the artifact files are written with via fopen. A 022 umask yields
+// 0755 (web-servable); a restrictive umask keeps them private.
+#define WM_BT_REPORT_DIR_MODE   ((mode_t)0777)
 
 // Resolve the report-root directory. Reads
 // `plugin.whenmoon.backtest.report_path`; empty (the registered
 // default) → `$HOME/.local/share/botmanager/backtests/`. Ensures the
-// directory tree exists, creating parents with mode 0755 and the
-// leaf with mode 0700. Writes a NUL-terminated absolute path into
-// `out` with no trailing slash.
+// directory tree exists, creating each path segment with
+// WM_BT_REPORT_DIR_MODE (so the umask decides). Writes a
+// NUL-terminated absolute path into `out` with no trailing slash.
 //
 // Returns SUCCESS on a usable directory; FAIL with `err` populated
 // on `$HOME` missing, alloc failure, or mkdir/stat failure.
@@ -44,8 +52,9 @@ bool wm_bt_report_path_resolve(char *out, size_t cap,
 void wm_bt_sweep_id_generate(const char *strategy,
     const char *source_market_id, char *out, size_t cap);
 
-// Create `<report_path>/<sweep_id>/` (mode 0700) and its `charts/`
-// subdir (also 0700). Writes the sweep-dir path back into `out_path`.
+// Create `<report_path>/<sweep_id>/` and its `charts/` subdir, both
+// with WM_BT_REPORT_DIR_MODE (umask applies). Writes the sweep-dir
+// path back into `out_path`.
 // Idempotent on EEXIST — the timestamped id makes collisions
 // effectively impossible, but defensive against a clock-skewed
 // re-run.
