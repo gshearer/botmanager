@@ -164,6 +164,16 @@ static const char *const WM_BT_REPORT_CSS_PARTS[] = {
     ".visually-hidden{position:absolute;width:1px;height:1px;margin:-1px;"
     "padding:0;overflow:hidden;clip:rect(0 0 0 0);clip-path:inset(50%);"
     "border:0;white-space:nowrap}\n",
+    // --- sweep dashboard: score heatmap (WM-BT-RPT-5). The per-axis
+    // marginal bars reuse the .hist classes above; the heatmap needs its
+    // own surface + muted-cell + label styling. Cell colors are inline
+    // var(--win/--loss/--accent) fills with a scaled fill-opacity. ---
+    ".heat{width:100%;height:auto;display:block;margin:4px 0 8px;"
+    "background:var(--surface);border:1px solid var(--border);"
+    "border-radius:10px;padding:8px}\n"
+    ".heat rect.miss{fill:var(--surface2)}\n"
+    ".heat .lbl{fill:var(--muted);font-size:11px;"
+    "font-family:ui-monospace,monospace}\n",
     NULL,
 };
 

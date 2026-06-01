@@ -186,6 +186,28 @@ bool wm_bt_render_index_html(const char *sweep_dir,
     uint32_t n_ok, uint32_t n_fail, uint64_t wallclock_ms,
     char *err, size_t err_cap);
 
+// Render `<sweep_dir>/index.html` for a parameter SWEEP (total_iters > 1) —
+// the browser-friendly dashboard counterpart to report.md (WM-BT-RPT-5).
+// Unlike wm_bt_render_index_html (one config + per-trade charts), this is a
+// chart-free overview of the whole sweep: headline cards for the rank-1
+// config, a sortable top-K table (rank / iter / score / swept axes / trades
+// / pf / sharpe / sortino / max-dd / equity), one inline-SVG per-axis
+// marginal-best bar chart, and — when n_axes >= 2 — a 2-axis score heatmap
+// over the two widest axes. No per-trade charts are emitted (a sweep would
+// produce trades x grains x top-K files); the page notes a chosen config can
+// be re-run single-config to chart it. Atomic write via tmp + rename. Called
+// from the sweep branch when n_ok > 0, independent of the --charts gate.
+// Graceful: a render FAIL is warn-and-continue at the call site (the metrics
+// artifacts still ship).
+bool wm_bt_render_sweep_html(const char *sweep_dir,
+    const char *sweep_id, const char *wm_path,
+    const wm_backtest_snapshot_t *snap, const char *strategy,
+    const wm_bt_sweep_plan_t *plan, const wm_bt_sweep_mode_t *mode,
+    const wm_backtest_params_t *fixed_params,
+    const wm_bt_sweep_result_t *results, uint32_t n_results,
+    uint32_t n_ok, uint32_t n_fail, uint64_t wallclock_ms,
+    char *err, size_t err_cap);
+
 // Heap-owned listing of sweep dir entries. names[i] is a NUL-terminated
 // string heap-strdup'd from the on-disk dirent name. Free via
 // wm_bt_dir_listing_free.

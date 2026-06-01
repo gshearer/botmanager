@@ -1055,13 +1055,38 @@ wm_bt_cmd_run(const cmd_ctx_t *ctx)
         ? true
         : (kv_get_int("plugin.whenmoon.backtest.charts_enabled") != 0);
 
-    if(emit_charts && sweep_plan.total_iters > 1)
+    if(sweep_plan.total_iters > 1)
     {
-      cmd_reply(ctx,
-          "charts: skipped — this is a parameter sweep; charts + index"
-          " are emitted only for single-config runs (a sweep would emit"
-          " trades x grains x top-K files). Re-run the chosen config with"
-          " no sweep axes to chart it.");
+      // Parameter sweep: emit the chart-free dashboard index.html ALWAYS
+      // (one cheap file from the in-memory results — independent of the
+      // --charts gate, which only governs heavy per-trade charts). The
+      // per-trade charts stay skipped (a sweep would emit trades x grains
+      // x top-K files); note that when they were actually requested.
+      err[0] = '\0';
+
+      if(wm_bt_render_sweep_html(sweep_dir, sweep_id, path_tok, snap,
+             name_tok, &sweep_plan, &sweep_mode, &params,
+             sweep_results, sweep_plan.total_iters,
+             n_ok, n_fail, wallclock_ms,
+             err, sizeof(err)) != SUCCESS)
+      {
+        snprintf(reply, sizeof(reply),
+            "warn: sweep index.html write failed: %s",
+            err[0] != '\0' ? err : "(unknown)");
+        cmd_reply(ctx, reply);
+      }
+      else
+      {
+        snprintf(reply, sizeof(reply),
+            "dashboard: open %s/index.html", sweep_dir);
+        cmd_reply(ctx, reply);
+      }
+
+      if(emit_charts)
+        cmd_reply(ctx,
+            "charts: per-trade charts skipped for a parameter sweep"
+            " (would emit trades x grains x top-K files). Re-run the"
+            " chosen config with no sweep axes to chart it.");
     }
     else if(emit_charts)
     {

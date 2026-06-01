@@ -33,6 +33,7 @@
 #include <dirent.h>
 #include <errno.h>
 #include <fcntl.h>
+#include <float.h>
 #include <inttypes.h>
 #include <math.h>
 #include <pthread.h>
@@ -60,6 +61,30 @@
 #define WM_BT_HIST_PADX             8
 #define WM_BT_HIST_PADT             10
 #define WM_BT_HIST_PADB             28
+
+// Sweep-dashboard inline-SVG geometry (WM-BT-RPT-5). Per-axis marginal
+// best is a zero-baselined bar chart (one bar per swept value); the 2-axis
+// score heatmap is a cell grid with left (y) + bottom (x) tick gutters and
+// a color legend below. Cells are capped per axis so a 64x64 plan stays a
+// sane width (a truncation note is emitted past the cap).
+#define WM_BT_MARG_W                720
+#define WM_BT_MARG_H                200
+#define WM_BT_MARG_PADX             8
+#define WM_BT_MARG_PADT             12
+#define WM_BT_MARG_PADB             30
+#define WM_BT_MARG_LBL_MAX          16u    // most x-axis labels drawn
+#define WM_BT_HEAT_MAX_VALUES       32u    // cells per axis cap (layout)
+#define WM_BT_HEAT_CELL             30     // px per cell
+#define WM_BT_HEAT_PADL             104    // left gutter (y-axis labels)
+#define WM_BT_HEAT_PADT             12
+#define WM_BT_HEAT_PADR             16
+#define WM_BT_HEAT_PADB             64     // bottom gutter (x labels + legend)
+
+// wm_bt_sweep_score_value collapses zero-trade / unavailable-metric
+// iterations to NOSCORE (-DBL_MAX, sweep.c) so they sort to the bottom.
+// -DBL_MAX is finite, so an isfinite() guard alone won't catch it — treat
+// any non-finite or extreme-negative score as "no score" for the visuals.
+#define WM_BT_SCORE_MISSING(s)      (!isfinite(s) || (s) <= -DBL_MAX / 2.0)
 
 // ----------------------------------------------------------------------- //
 // Mode label                                                              //
@@ -2536,6 +2561,903 @@ wm_bt_render_index_html(const char *sweep_dir,
         "<a href=\"top-N.txt\">top-N.txt</a>. Charts use "
         "Lightweight Charts (loads from CDN; needs network on first "
         "view).</footer>\n", fp);
+
+  fputs("</div></body></html>\n", fp);
+
+  mem_free(indices);
+
+  return(wm_bt_finalize_file(fp, tmp, path, err, err_cap));
+}
+
+// ----------------------------------------------------------------------- //
+// index.html — sweep dashboard (WM-BT-RPT-5)                              //
+// ----------------------------------------------------------------------- //
+//
+// The counterpart to wm_bt_render_index_html for a parameter sweep
+// (total_iters > 1): a chart-free overview built entirely from the
+// in-memory results table. Time-series (none here) would need Lightweight
+// Charts; the distributions/marginals/heatmap are static inline SVG, so
+// the dashboard needs no CDN — only the shared assets/report.css + the
+// report.js wmSortTable handler (the top-K table reuses class "trades").
+
+// Format one score value for a cell / label / SVG title. Diverging score
+// metrics (realized P/L, equity) read as currency; ratio metrics (pf,
+// sharpe, sortino) as a grouped 3-decimal number. NOSCORE → "n/a".
+static void
+wm_bt_fmt_score(wm_bt_sweep_score_t sc, double v, char *out, size_t cap)
+{
+  if(WM_BT_SCORE_MISSING(v))
+  {
+    snprintf(out, cap, "n/a");
+    return;
+  }
+
+  if(sc == WM_BT_SCORE_REALIZED || sc == WM_BT_SCORE_EQUITY)
+    wm_bt_fmt_usd(v, out, cap);
+  else
+    wm_bt_fmt_num(v, 3, out, cap);
+}
+
+// Best (highest) score among ok results whose axis `axis` sits at value
+// index `vidx`, with every other axis free. Returns false when no ok,
+// finite-scored iteration matches (caller renders the slot as missing).
+static bool
+wm_bt_marginal_best(const wm_bt_sweep_result_t *results, uint32_t n,
+    uint32_t axis, uint32_t vidx, double *out_best, int64_t *out_iter)
+{
+  double   best = -INFINITY;
+  int64_t  iter = -1;
+  uint32_t k;
+
+  for(k = 0; k < n; k++)
+  {
+    double s;
+
+    if(!results[k].ok || results[k].indices[axis] != vidx)
+      continue;
+
+    s = results[k].score;
+
+    if(WM_BT_SCORE_MISSING(s))
+      continue;
+
+    if(s > best)
+    {
+      best = s;
+      iter = results[k].run_id_db > 0
+          ? results[k].run_id_db : (int64_t)(k + 1);
+    }
+  }
+
+  if(iter < 0)
+    return(false);
+
+  *out_best = best;
+
+  if(out_iter != NULL)
+    *out_iter = iter;
+
+  return(true);
+}
+
+// Best score over the (ax_x == xi, ax_y == yi) slice — the heatmap cell
+// value. Other axes free. Returns false on an empty/all-missing cell.
+static bool
+wm_bt_heat_cell_best(const wm_bt_sweep_result_t *results, uint32_t n,
+    uint32_t ax_x, uint32_t xi, uint32_t ax_y, uint32_t yi,
+    double *out_best)
+{
+  double   best = -INFINITY;
+  bool     any  = false;
+  uint32_t k;
+
+  for(k = 0; k < n; k++)
+  {
+    double s;
+
+    if(!results[k].ok)
+      continue;
+
+    if(results[k].indices[ax_x] != xi || results[k].indices[ax_y] != yi)
+      continue;
+
+    s = results[k].score;
+
+    if(WM_BT_SCORE_MISSING(s))
+      continue;
+
+    if(s > best)
+    {
+      best = s;
+      any  = true;
+    }
+  }
+
+  if(!any)
+    return(false);
+
+  *out_best = best;
+  return(true);
+}
+
+// Per-axis marginal-best bar chart: one zero-baselined bar per swept
+// value, height proportional to that value's best score, win/loss colored
+// by sign. Inline SVG, no JS. Reuses the .hist design-system classes.
+static void
+wm_bt_emit_marginal_svg(FILE *fp, const wm_bt_sweep_plan_t *plan,
+    const wm_bt_sweep_result_t *results, uint32_t n, uint32_t axis_idx)
+{
+  const wm_bt_sweep_axis_t *axis = &plan->axes[axis_idx];
+  const char               *sname = wm_bt_sweep_score_name(plan->score);
+  double    best[WM_BT_SWEEP_MAX_VALUES];
+  bool      have[WM_BT_SWEEP_MAX_VALUES];
+  double    ymin   = 0.0;          // zero is always in range (baseline)
+  double    ymax   = 0.0;
+  double    span;
+  double    plot_w;
+  double    plot_h;
+  double    bar_w;
+  double    zero_y;
+  bool      any    = false;
+  uint32_t  nv     = axis->n_values;
+  uint32_t  step;
+  uint32_t  v;
+  char      aname_esc[64];
+
+  if(fp == NULL || nv == 0)
+    return;
+
+  if(nv > WM_BT_SWEEP_MAX_VALUES)
+    nv = WM_BT_SWEEP_MAX_VALUES;
+
+  for(v = 0; v < nv; v++)
+  {
+    have[v] = wm_bt_marginal_best(results, n, axis_idx, v, &best[v], NULL);
+
+    if(have[v])
+    {
+      any = true;
+      if(best[v] < ymin) ymin = best[v];
+      if(best[v] > ymax) ymax = best[v];
+    }
+  }
+
+  if(!any)
+  {
+    fputs("<p class=\"note\">No scored iterations on this axis.</p>\n", fp);
+    return;
+  }
+
+  span = ymax - ymin;
+
+  if(span <= 0.0)
+    span = (ymax != 0.0) ? fabs(ymax) : 1.0;   // degenerate: avoid /0
+
+  plot_w = (double)(WM_BT_MARG_W - 2 * WM_BT_MARG_PADX);
+  plot_h = (double)(WM_BT_MARG_H - WM_BT_MARG_PADT - WM_BT_MARG_PADB);
+  bar_w  = plot_w / (double)nv;
+  zero_y = (double)WM_BT_MARG_PADT + (ymax - 0.0) / span * plot_h;
+
+  step = (nv + WM_BT_MARG_LBL_MAX - 1u) / WM_BT_MARG_LBL_MAX;
+  if(step == 0u)
+    step = 1u;
+
+  wm_bt_html_escape(axis->name, aname_esc, sizeof(aname_esc));
+
+  fprintf(fp,
+      "<svg class=\"hist\" viewBox=\"0 0 %d %d\" role=\"img\""
+      " aria-label=\"Best %s by %s across %u swept values\""
+      " preserveAspectRatio=\"none\">\n"
+      "<title>Marginal best %s per %s value</title>\n",
+      WM_BT_MARG_W, WM_BT_MARG_H, sname, aname_esc, nv, sname, aname_esc);
+
+  for(v = 0; v < nv; v++)
+  {
+    double      x = (double)WM_BT_MARG_PADX + (double)v * bar_w;
+    double      sy;
+    double      top;
+    double      h;
+    const char *cls;
+    char        vcell[64];
+    char        scell[48];
+
+    wm_bt_md_render_axis_cell(axis, axis->values[v], vcell, sizeof(vcell));
+
+    if(have[v])
+    {
+      sy  = (double)WM_BT_MARG_PADT + (ymax - best[v]) / span * plot_h;
+      cls = best[v] >= 0.0 ? "win" : "loss";
+      top = best[v] >= 0.0 ? sy : zero_y;
+      h   = fabs(sy - zero_y);
+
+      if(h < 0.5)
+        h = 0.5;                   // keep a near-zero bar visible
+
+      wm_bt_fmt_score(plan->score, best[v], scell, sizeof(scell));
+      fprintf(fp,
+          "<rect class=\"%s\" x=\"%.2f\" y=\"%.2f\" width=\"%.2f\""
+          " height=\"%.2f\"><title>%s = %s: best %s</title></rect>\n",
+          cls, x + 0.5, top, bar_w > 1.0 ? bar_w - 1.0 : bar_w, h,
+          aname_esc, vcell, scell);
+    }
+
+    if(v % step == 0u)
+      fprintf(fp,
+          "<text class=\"lbl\" x=\"%.2f\" y=\"%d\" text-anchor=\"middle\">"
+          "%s</text>\n",
+          x + bar_w / 2.0, WM_BT_MARG_H - 8, vcell);
+  }
+
+  fprintf(fp,
+      "<line class=\"axis\" x1=\"%d\" y1=\"%.2f\" x2=\"%d\" y2=\"%.2f\"/>\n",
+      WM_BT_MARG_PADX, zero_y, WM_BT_MARG_W - WM_BT_MARG_PADX, zero_y);
+
+  fputs("</svg>\n", fp);
+}
+
+// Pick the two widest axes (most values) for the heatmap. ax_x is the
+// widest, ax_y the next-widest distinct axis. Stable on ties (lowest
+// index wins). Returns false when fewer than two axes exist.
+static bool
+wm_bt_pick_heatmap_axes(const wm_bt_sweep_plan_t *plan,
+    uint32_t *ax_x, uint32_t *ax_y)
+{
+  uint32_t x;
+  uint32_t y;
+  uint32_t a;
+
+  if(plan->n_axes < 2)
+    return(false);
+
+  x = 0;
+
+  for(a = 1; a < plan->n_axes; a++)
+    if(plan->axes[a].n_values > plan->axes[x].n_values)
+      x = a;
+
+  y = (x == 0) ? 1u : 0u;
+
+  for(a = 0; a < plan->n_axes; a++)
+  {
+    if(a == x)
+      continue;
+
+    if(plan->axes[a].n_values > plan->axes[y].n_values)
+      y = a;
+  }
+
+  *ax_x = x;
+  *ax_y = y;
+  return(true);
+}
+
+// 2-axis score heatmap: a color-scaled cell grid over the two widest
+// axes, with left (y) + bottom (x) tick gutters and a color legend.
+// Diverging metrics (realized/equity) color win above / loss below zero;
+// ratio metrics use a sequential accent ramp. Cells are var(--*) fills
+// with a magnitude-scaled fill-opacity so color lives in the design
+// system. Missing cells are muted. Inline SVG, no JS.
+static void
+wm_bt_emit_heatmap_svg(FILE *fp, const wm_bt_sweep_plan_t *plan,
+    const wm_bt_sweep_result_t *results, uint32_t n,
+    uint32_t ax_x, uint32_t ax_y)
+{
+  const wm_bt_sweep_axis_t *axx = &plan->axes[ax_x];
+  const wm_bt_sweep_axis_t *axy = &plan->axes[ax_y];
+  const char               *sname = wm_bt_sweep_score_name(plan->score);
+  bool      diverging = (plan->score == WM_BT_SCORE_REALIZED ||
+                         plan->score == WM_BT_SCORE_EQUITY);
+  uint32_t  nx        = axx->n_values;
+  uint32_t  ny        = axy->n_values;
+  double    gmin      =  INFINITY;
+  double    gmax      = -INFINITY;
+  bool      any       = false;
+  int       w;
+  int       h;
+  int       grid_w;
+  uint32_t  xstep;
+  uint32_t  ystep;
+  uint32_t  cx;
+  uint32_t  cy;
+  char      axn_esc[64];
+  char      ayn_esc[64];
+  char      lo_str[48];
+  char      hi_str[48];
+
+  if(fp == NULL)
+    return;
+
+  if(nx > WM_BT_HEAT_MAX_VALUES) nx = WM_BT_HEAT_MAX_VALUES;
+  if(ny > WM_BT_HEAT_MAX_VALUES) ny = WM_BT_HEAT_MAX_VALUES;
+
+  // Global score range over rendered cells (drives color scaling + legend).
+  for(cx = 0; cx < nx; cx++)
+    for(cy = 0; cy < ny; cy++)
+    {
+      double s;
+
+      if(!wm_bt_heat_cell_best(results, n, ax_x, cx, ax_y, cy, &s))
+        continue;
+
+      any = true;
+      if(s < gmin) gmin = s;
+      if(s > gmax) gmax = s;
+    }
+
+  if(!any)
+  {
+    fputs("<p class=\"note\">No scored iterations to map.</p>\n", fp);
+    return;
+  }
+
+  grid_w = (int)nx * WM_BT_HEAT_CELL;
+  w      = WM_BT_HEAT_PADL + grid_w + WM_BT_HEAT_PADR;
+  h      = WM_BT_HEAT_PADT + (int)ny * WM_BT_HEAT_CELL + WM_BT_HEAT_PADB;
+
+  xstep = (nx + WM_BT_MARG_LBL_MAX - 1u) / WM_BT_MARG_LBL_MAX;
+  ystep = (ny + WM_BT_MARG_LBL_MAX - 1u) / WM_BT_MARG_LBL_MAX;
+  if(xstep == 0u) xstep = 1u;
+  if(ystep == 0u) ystep = 1u;
+
+  wm_bt_html_escape(axx->name, axn_esc, sizeof(axn_esc));
+  wm_bt_html_escape(axy->name, ayn_esc, sizeof(ayn_esc));
+
+  fprintf(fp,
+      "<svg class=\"heat\" viewBox=\"0 0 %d %d\" role=\"img\""
+      " aria-label=\"Best %s heatmap over %s (x) by %s (y)\">\n"
+      "<title>Best %s by %s and %s</title>\n",
+      w, h, sname, axn_esc, ayn_esc, sname, axn_esc, ayn_esc);
+
+  // Legend gradient definition.
+  if(diverging)
+    fputs("<defs><linearGradient id=\"wmHeat\">"
+          "<stop offset=\"0%\" stop-color=\"var(--loss)\"/>"
+          "<stop offset=\"50%\" stop-color=\"var(--surface2)\"/>"
+          "<stop offset=\"100%\" stop-color=\"var(--win)\"/>"
+          "</linearGradient></defs>\n", fp);
+  else
+    fputs("<defs><linearGradient id=\"wmHeat\">"
+          "<stop offset=\"0%\" stop-color=\"var(--accent)\""
+          " stop-opacity=\"0.12\"/>"
+          "<stop offset=\"100%\" stop-color=\"var(--accent)\""
+          " stop-opacity=\"1\"/></linearGradient></defs>\n", fp);
+
+  // Cells (y value 0 at the bottom row).
+  for(cy = 0; cy < ny; cy++)
+  {
+    int ry = WM_BT_HEAT_PADT + (int)(ny - 1u - cy) * WM_BT_HEAT_CELL;
+
+    for(cx = 0; cx < nx; cx++)
+    {
+      int    rx = WM_BT_HEAT_PADL + (int)cx * WM_BT_HEAT_CELL;
+      double s;
+      char   xcell[64];
+      char   ycell[64];
+      char   scell[48];
+
+      wm_bt_md_render_axis_cell(axx, axx->values[cx], xcell, sizeof(xcell));
+      wm_bt_md_render_axis_cell(axy, axy->values[cy], ycell, sizeof(ycell));
+
+      if(!wm_bt_heat_cell_best(results, n, ax_x, cx, ax_y, cy, &s))
+      {
+        fprintf(fp,
+            "<rect class=\"miss\" x=\"%d\" y=\"%d\" width=\"%d\""
+            " height=\"%d\"><title>%s=%s, %s=%s: no iteration</title>"
+            "</rect>\n",
+            rx, ry, WM_BT_HEAT_CELL - 1, WM_BT_HEAT_CELL - 1,
+            axn_esc, xcell, ayn_esc, ycell);
+        continue;
+      }
+
+      wm_bt_fmt_score(plan->score, s, scell, sizeof(scell));
+
+      if(diverging)
+      {
+        const char *fill = s >= 0.0 ? "var(--win)" : "var(--loss)";
+        double      mag;
+
+        if(s >= 0.0)
+          mag = (gmax > 0.0) ? s / gmax : 0.0;
+        else
+          mag = (gmin < 0.0) ? s / gmin : 0.0;   // both negative → +ratio
+
+        if(mag < 0.12) mag = 0.12;               // floor so small ≠ blank
+        if(mag > 1.0)  mag = 1.0;
+
+        fprintf(fp,
+            "<rect x=\"%d\" y=\"%d\" width=\"%d\" height=\"%d\""
+            " fill=\"%s\" fill-opacity=\"%.3f\">"
+            "<title>%s=%s, %s=%s: %s</title></rect>\n",
+            rx, ry, WM_BT_HEAT_CELL - 1, WM_BT_HEAT_CELL - 1, fill, mag,
+            axn_esc, xcell, ayn_esc, ycell, scell);
+      }
+      else
+      {
+        double range = gmax - gmin;
+        double mag   = (range > 0.0) ? (s - gmin) / range : 1.0;
+
+        if(mag < 0.12) mag = 0.12;
+        if(mag > 1.0)  mag = 1.0;
+
+        fprintf(fp,
+            "<rect x=\"%d\" y=\"%d\" width=\"%d\" height=\"%d\""
+            " fill=\"var(--accent)\" fill-opacity=\"%.3f\">"
+            "<title>%s=%s, %s=%s: %s</title></rect>\n",
+            rx, ry, WM_BT_HEAT_CELL - 1, WM_BT_HEAT_CELL - 1, mag,
+            axn_esc, xcell, ayn_esc, ycell, scell);
+      }
+    }
+  }
+
+  // X tick labels (bottom).
+  for(cx = 0; cx < nx; cx += xstep)
+  {
+    int  lx = WM_BT_HEAT_PADL + (int)cx * WM_BT_HEAT_CELL
+        + WM_BT_HEAT_CELL / 2;
+    char xcell[64];
+
+    wm_bt_md_render_axis_cell(axx, axx->values[cx], xcell, sizeof(xcell));
+    fprintf(fp,
+        "<text class=\"lbl\" x=\"%d\" y=\"%d\" text-anchor=\"middle\">"
+        "%s</text>\n",
+        lx, WM_BT_HEAT_PADT + (int)ny * WM_BT_HEAT_CELL + 15, xcell);
+  }
+
+  // Y tick labels (left).
+  for(cy = 0; cy < ny; cy += ystep)
+  {
+    int  ly = WM_BT_HEAT_PADT + (int)(ny - 1u - cy) * WM_BT_HEAT_CELL
+        + WM_BT_HEAT_CELL / 2 + 4;
+    char ycell[64];
+
+    wm_bt_md_render_axis_cell(axy, axy->values[cy], ycell, sizeof(ycell));
+    fprintf(fp,
+        "<text class=\"lbl\" x=\"%d\" y=\"%d\" text-anchor=\"end\">%s</text>\n",
+        WM_BT_HEAT_PADL - 8, ly, ycell);
+  }
+
+  // Color legend bar + min/max (and 0 for diverging) labels.
+  {
+    int legend_y = WM_BT_HEAT_PADT + (int)ny * WM_BT_HEAT_CELL + 26;
+    int legend_w = grid_w < 240 ? grid_w : 240;
+
+    wm_bt_fmt_score(plan->score, gmin, lo_str, sizeof(lo_str));
+    wm_bt_fmt_score(plan->score, gmax, hi_str, sizeof(hi_str));
+
+    fprintf(fp,
+        "<rect x=\"%d\" y=\"%d\" width=\"%d\" height=\"10\""
+        " fill=\"url(#wmHeat)\" stroke=\"var(--border)\"/>\n",
+        WM_BT_HEAT_PADL, legend_y, legend_w);
+    fprintf(fp,
+        "<text class=\"lbl\" x=\"%d\" y=\"%d\">%s</text>\n",
+        WM_BT_HEAT_PADL, legend_y + 22, lo_str);
+    fprintf(fp,
+        "<text class=\"lbl\" x=\"%d\" y=\"%d\" text-anchor=\"end\">%s</text>\n",
+        WM_BT_HEAT_PADL + legend_w, legend_y + 22, hi_str);
+
+    if(diverging && gmin < 0.0 && gmax > 0.0)
+      fprintf(fp,
+          "<text class=\"lbl\" x=\"%d\" y=\"%d\" text-anchor=\"middle\">0"
+          "</text>\n",
+          WM_BT_HEAT_PADL + legend_w / 2, legend_y + 22);
+  }
+
+  fputs("</svg>\n", fp);
+}
+
+// One sortable numeric `<th>` for the sweep top-K table. Mirrors the
+// per-trade table header shape (RPT-3) so report.js wmSortTable drives it:
+// data-col is the 0-based column index, data-type is always "num" (every
+// dashboard column sorts numeric). `label` is already HTML-escaped.
+static void
+wm_bt_sweep_th(FILE *fp, int col, const char *label)
+{
+  fprintf(fp,
+      "<th class=\"num\" aria-sort=\"none\"><button type=\"button\""
+      " class=\"sort\" data-col=\"%d\" data-type=\"num\">%s"
+      "<span class=\"arrow\" aria-hidden=\"true\"></span></button></th>",
+      col, label);
+}
+
+// Emit the sortable top-K table for the sweep dashboard. Reuses class
+// "trades" so report.js wmInitTrades wires the click-to-sort headers (no
+// filter chips → wmFilterTrades simply never fires). Columns, in order:
+// rank, iter, score, <one per axis>, trades, pf, sharpe, sortino, max-dd,
+// equity. All columns sort numeric; non-finite / NOSCORE cells carry an
+// empty data-v so they fall to the bottom.
+static void
+wm_bt_emit_sweep_topk_table(FILE *fp, const wm_bt_sweep_plan_t *plan,
+    const wm_bt_sweep_result_t *results, const uint32_t *indices,
+    uint32_t top_k)
+{
+  int      col = 0;
+  uint32_t a;
+  uint32_t i;
+  char     aname_esc[64];
+
+  fputs("<table class=\"trades\"><thead><tr>", fp);
+
+  wm_bt_sweep_th(fp, col++, "#");
+  wm_bt_sweep_th(fp, col++, "iter");
+  wm_bt_sweep_th(fp, col++, "score");
+
+  for(a = 0; a < plan->n_axes; a++)
+  {
+    wm_bt_html_escape(plan->axes[a].name, aname_esc, sizeof(aname_esc));
+    wm_bt_sweep_th(fp, col++, aname_esc);
+  }
+
+  wm_bt_sweep_th(fp, col++, "trades");
+  wm_bt_sweep_th(fp, col++, "pf");
+  wm_bt_sweep_th(fp, col++, "sharpe");
+  wm_bt_sweep_th(fp, col++, "sortino");
+  wm_bt_sweep_th(fp, col++, "max dd");
+  wm_bt_sweep_th(fp, col++, "equity");
+
+  fputs("</tr></thead><tbody>\n", fp);
+
+  for(i = 0; i < top_k; i++)
+  {
+    const wm_bt_sweep_result_t *r = &results[indices[i]];
+    const wm_market_stats_t    *st;
+    int64_t  iter;
+    char     cell[64];
+
+    iter = r->run_id_db > 0 ? r->run_id_db : (int64_t)(indices[i] + 1);
+
+    fprintf(fp, "<tr><td class=\"num\">%u</td>"
+        "<td class=\"num\">%" PRId64 "</td>", i + 1, iter);
+
+    // Score.
+    if(!r->ok || WM_BT_SCORE_MISSING(r->score))
+      fputs("<td class=\"num muted\" data-v=\"\">n/a</td>", fp);
+    else
+    {
+      wm_bt_fmt_score(plan->score, r->score, cell, sizeof(cell));
+      fprintf(fp, "<td class=\"num\" data-v=\"%.6f\">%s</td>",
+          r->score, cell);
+    }
+
+    // Axis values (always known, ok or fail).
+    for(a = 0; a < plan->n_axes; a++)
+    {
+      wm_bt_md_render_axis_cell(&plan->axes[a],
+          plan->axes[a].values[r->indices[a]], cell, sizeof(cell));
+      fprintf(fp, "<td class=\"num\">%s</td>", cell);
+    }
+
+    if(!r->ok)
+    {
+      // FAIL row: dash the metric columns, keep the column count.
+      fputs("<td class=\"num muted\" data-v=\"\">&mdash;</td>"
+            "<td class=\"num muted\" data-v=\"\">&mdash;</td>"
+            "<td class=\"num muted\" data-v=\"\">&mdash;</td>"
+            "<td class=\"num muted\" data-v=\"\">&mdash;</td>"
+            "<td class=\"num muted\" data-v=\"\">&mdash;</td>"
+            "<td class=\"num muted\" data-v=\"\">FAIL</td></tr>\n", fp);
+      continue;
+    }
+
+    st = &r->trade.stats[WM_MARKET_MODE_PAPER];
+
+    {
+      uint32_t rt   = st->n_wins + st->n_losses;
+      double   pf   = wm_market_stats_profit_factor(st);
+      double   eq   = wm_bt_compute_equity(&r->trade);
+      char     pf_s[32];
+      char     sh_s[32];
+      char     so_s[32];
+      char     dd_s[32];
+      char     eq_s[48];
+
+      wm_bt_md_fmt_double(pf,             "%.3f", pf_s, sizeof(pf_s));
+      wm_bt_md_fmt_double(r->trade.sharpe,  "%.3f", sh_s, sizeof(sh_s));
+      wm_bt_md_fmt_double(r->trade.sortino, "%.3f", so_s, sizeof(so_s));
+      wm_bt_fmt_pct(st->max_drawdown * 100.0, 1, dd_s, sizeof(dd_s));
+      wm_bt_fmt_usd(eq, eq_s, sizeof(eq_s));
+
+      fprintf(fp,
+          "<td class=\"num\">%u</td>"
+          "<td class=\"num\">%s</td>"
+          "<td class=\"num\">%s</td>"
+          "<td class=\"num\">%s</td>"
+          "<td class=\"num\">%s</td>"
+          "<td class=\"num\" data-v=\"%.4f\">%s</td></tr>\n",
+          rt, pf_s, sh_s, so_s, dd_s, eq, eq_s);
+    }
+  }
+
+  fputs("</tbody></table>\n", fp);
+}
+
+bool
+wm_bt_render_sweep_html(const char *sweep_dir,
+    const char *sweep_id, const char *wm_path,
+    const wm_backtest_snapshot_t *snap, const char *strategy,
+    const wm_bt_sweep_plan_t *plan, const wm_bt_sweep_mode_t *mode,
+    const wm_backtest_params_t *fixed_params,
+    const wm_bt_sweep_result_t *results, uint32_t n_results,
+    uint32_t n_ok, uint32_t n_fail, uint64_t wallclock_ms,
+    char *err, size_t err_cap)
+{
+  char              path[1024];
+  char              tmp[1280];
+  char              esc[256];
+  char              esc2[256];
+  uint32_t         *indices = NULL;
+  uint32_t          top_k;
+  FILE             *fp = NULL;
+  wm_bt_run_mode_t  mode_val;
+  int               n;
+  uint32_t          a;
+
+  if(sweep_dir == NULL || sweep_id == NULL || snap == NULL ||
+     strategy == NULL || plan == NULL || results == NULL ||
+     n_results == 0)
+  {
+    if(err != NULL)
+      snprintf(err, err_cap, "sweep_html: bad args");
+    return(FAIL);
+  }
+
+  mode_val = (mode != NULL) ? mode->mode : WM_BT_MODE_FULL;
+
+  n = snprintf(path, sizeof(path), "%s/index.html", sweep_dir);
+
+  if(n < 0 || (size_t)n >= sizeof(path))
+  {
+    if(err != NULL)
+      snprintf(err, err_cap, "sweep index.html path overflow");
+    return(FAIL);
+  }
+
+  n = snprintf(tmp, sizeof(tmp), "%s.tmp", path);
+
+  if(n < 0 || (size_t)n >= sizeof(tmp))
+  {
+    if(err != NULL)
+      snprintf(err, err_cap, "sweep index.html tmp path overflow");
+    return(FAIL);
+  }
+
+  indices = mem_alloc(WM_BT_REPORT_CTX, "sweep_indices",
+      sizeof(*indices) * (size_t)n_results);
+
+  if(indices == NULL)
+  {
+    if(err != NULL)
+      snprintf(err, err_cap, "sweep_indices alloc failed");
+    return(FAIL);
+  }
+
+  top_k = wm_bt_topk_compute(results, n_results, plan->top_k, indices);
+
+  fp = fopen(tmp, "w");
+
+  if(fp == NULL)
+  {
+    if(err != NULL)
+      snprintf(err, err_cap,
+          "fopen('%s') failed: %s", tmp, strerror(errno));
+    mem_free(indices);
+    return(FAIL);
+  }
+
+  // ---- head + header ----
+  wm_bt_html_escape(sweep_id, esc, sizeof(esc));
+  wm_bt_idx_write_head(fp, esc);
+
+  wm_bt_html_escape(strategy, esc, sizeof(esc));
+  wm_bt_html_escape(snap->source_market_id, esc2, sizeof(esc2));
+  fprintf(fp,
+      "<header><h1>%s &middot; %s</h1>"
+      "<div class=\"sub\">%s &rarr; %s &middot; %u 1m bars &middot;"
+      " mode <b>%s</b> &middot; %u iterations &middot; ranked by"
+      " <b>%s</b></div></header>\n",
+      esc, esc2, snap->range_start, snap->range_end,
+      snap->bars_loaded_1m, wm_bt_report_mode_str(mode_val),
+      plan->total_iters, wm_bt_sweep_score_name(plan->score));
+
+  fputs("<div class=\"wrap\">\n", fp);
+
+  // ---- headline cards (rank-1 config) ----
+  if(top_k > 0 && results[indices[0]].ok)
+  {
+    const wm_bt_sweep_result_t *best = &results[indices[0]];
+    const wm_market_stats_t    *st   =
+        &best->trade.stats[WM_MARKET_MODE_PAPER];
+    uint32_t    rt   = st->n_wins + st->n_losses;
+    double      wr   = rt > 0 ? (double)st->n_wins / (double)rt * 100.0 : 0.0;
+    double      pf   = wm_market_stats_profit_factor(st);
+    double      eq   = wm_bt_compute_equity(&best->trade);
+    double      rpnl = st->realized_pnl_lifetime;
+    const char *ec   = eq >= WM_MARKET_DEFAULT_STARTING_CASH ? "pos" : "neg";
+    const char *rc   = rpnl >= 0.0 ? "pos" : "neg";
+    char        eq_str[48];
+    char        rpnl_str[48];
+    char        wr_str[32];
+    char        dd_str[32];
+    char        params[256];
+
+    wm_bt_fmt_usd(eq,   eq_str,   sizeof(eq_str));
+    wm_bt_fmt_usd(rpnl, rpnl_str, sizeof(rpnl_str));
+    wm_bt_fmt_pct(wr, 1, wr_str, sizeof(wr_str));
+    wm_bt_fmt_pct(st->max_drawdown * 100.0, 1, dd_str, sizeof(dd_str));
+
+    wm_bt_idx_params_str(plan, best->indices, params, sizeof(params));
+    wm_bt_html_escape(params, esc, sizeof(esc));
+
+    fprintf(fp,
+        "<p class=\"note\">Best config (rank 1): <span class=\"mono\">%s"
+        "</span></p>\n", esc);
+
+    fputs("<div class=\"cards\">\n", fp);
+    fprintf(fp,
+        "<div class=\"card\"><div class=\"k\">Best equity</div>"
+        "<div class=\"v mono %s\">%s</div></div>\n", ec, eq_str);
+    fprintf(fp,
+        "<div class=\"card\"><div class=\"k\">Realized P/L</div>"
+        "<div class=\"v mono %s\">%s</div></div>\n", rc, rpnl_str);
+    fprintf(fp,
+        "<div class=\"card\"><div class=\"k\">Profit factor</div>"
+        "<div class=\"v mono\">%.2f</div></div>\n", pf);
+    fprintf(fp,
+        "<div class=\"card\"><div class=\"k\">Win rate</div>"
+        "<div class=\"v mono\">%s</div></div>\n", wr_str);
+    fprintf(fp,
+        "<div class=\"card\"><div class=\"k\">Round trips</div>"
+        "<div class=\"v mono\">%u</div></div>\n", rt);
+    fprintf(fp,
+        "<div class=\"card\"><div class=\"k\">Max drawdown</div>"
+        "<div class=\"v mono\">%s</div></div>\n", dd_str);
+    fputs("</div>\n", fp);
+  }
+
+  // ---- run metadata ----
+  fputs("<section><h2>Run</h2><div class=\"meta\">\n", fp);
+
+  if(wm_path != NULL && wm_path[0] != '\0')
+  {
+    wm_bt_html_escape(wm_path, esc, sizeof(esc));
+    fprintf(fp, "<div><dt>source</dt><div class=\"vv mono\">%s</div></div>\n",
+        esc);
+  }
+
+  fprintf(fp,
+      "<div><dt>iterations</dt><div class=\"vv\">%u total"
+      " &middot; %u ok &middot; %u failed</div></div>\n",
+      plan->total_iters, n_ok, n_fail);
+  fprintf(fp,
+      "<div><dt>threads</dt><div class=\"vv\">%u</div></div>\n",
+      plan->workers);
+  fprintf(fp,
+      "<div><dt>wallclock</dt><div class=\"vv\">%.3f s</div></div>\n",
+      (double)wallclock_ms / 1000.0);
+
+  {
+    double fee  = (fixed_params != NULL && fixed_params->have_fee_bps)
+        ? fixed_params->fee_bps : WM_MARKET_DEFAULT_FEE_BPS;
+    double slip = (fixed_params != NULL && fixed_params->have_slip_bps)
+        ? fixed_params->slip_bps : WM_MARKET_DEFAULT_SLIP_BPS;
+    double sf   = (fixed_params != NULL && fixed_params->have_size_frac)
+        ? fixed_params->size_frac : WM_MARKET_DEFAULT_SIZE_FRAC;
+    double cash = (fixed_params != NULL && fixed_params->have_starting_cash)
+        ? fixed_params->starting_cash : WM_MARKET_DEFAULT_STARTING_CASH;
+    char   size_str[32];
+    char   cash_str[48];
+
+    wm_bt_fmt_pct(sf * 100.0, 0, size_str, sizeof(size_str));
+    wm_bt_fmt_usd(cash, cash_str, sizeof(cash_str));
+
+    fprintf(fp,
+        "<div><dt>economics</dt><div class=\"vv mono\">fee %.1f bps"
+        " &middot; slip %.1f bps &middot; size %s &middot;"
+        " cash %s</div></div>\n",
+        fee, slip, size_str, cash_str);
+  }
+
+  if(mode_val == WM_BT_MODE_WALK_FORWARD && mode != NULL)
+    fprintf(fp,
+        "<div><dt>walk-forward</dt><div class=\"vv\">%u windows</div>"
+        "</div>\n", mode->walk.n);
+
+  fputs("</div></section>\n", fp);
+
+  // ---- swept axes ----
+  fputs("<section><h2>Swept axes</h2><div class=\"meta\">\n", fp);
+
+  if(plan->n_axes == 0)
+    fputs("<div><dt>axes</dt><div class=\"vv\">(none — single config)"
+          "</div></div>\n", fp);
+
+  for(a = 0; a < plan->n_axes; a++)
+  {
+    char vbuf[256];
+
+    wm_bt_md_render_axis_values(&plan->axes[a], vbuf, sizeof(vbuf));
+    wm_bt_html_escape(plan->axes[a].name, esc, sizeof(esc));
+    wm_bt_html_escape(vbuf, esc2, sizeof(esc2));
+    fprintf(fp,
+        "<div><dt>%s</dt><div class=\"vv mono\">%u values: %s</div></div>\n",
+        esc, plan->axes[a].n_values, esc2);
+  }
+
+  fputs("</div></section>\n", fp);
+
+  // ---- top-K table ----
+  fprintf(fp,
+      "<section><h2>Top %u by %s</h2>\n", top_k,
+      wm_bt_sweep_score_name(plan->score));
+
+  if(top_k == 0)
+    fputs("<p class=\"note\">No ranked configurations.</p>\n", fp);
+  else
+  {
+    fputs("<div class=\"tbl-scroll\">\n", fp);
+    wm_bt_emit_sweep_topk_table(fp, plan, results, indices, top_k);
+    fputs("</div>\n", fp);
+  }
+
+  fputs("</section>\n", fp);
+
+  // ---- per-axis marginal best ----
+  if(plan->n_axes > 0)
+  {
+    fputs("<section><h2>Per-axis marginal best</h2>\n", fp);
+    fprintf(fp,
+        "<p class=\"note\">For each swept value, the best %s achieved by"
+        " any iteration holding that value (other axes free).</p>\n",
+        wm_bt_sweep_score_name(plan->score));
+
+    for(a = 0; a < plan->n_axes; a++)
+    {
+      wm_bt_html_escape(plan->axes[a].name, esc, sizeof(esc));
+      fprintf(fp, "<h3 class=\"sub-h\">%s</h3>\n", esc);
+      wm_bt_emit_marginal_svg(fp, plan, results, n_results, a);
+    }
+
+    fputs("</section>\n", fp);
+  }
+
+  // ---- 2-axis score heatmap ----
+  {
+    uint32_t ax_x;
+    uint32_t ax_y;
+
+    if(wm_bt_pick_heatmap_axes(plan, &ax_x, &ax_y))
+    {
+      char xn_esc[64];
+      char yn_esc[64];
+
+      wm_bt_html_escape(plan->axes[ax_x].name, xn_esc, sizeof(xn_esc));
+      wm_bt_html_escape(plan->axes[ax_y].name, yn_esc, sizeof(yn_esc));
+
+      fputs("<section><h2>Score heatmap</h2>\n", fp);
+      fprintf(fp,
+          "<p class=\"note\">Best %s over <b>%s</b> (x) &times; <b>%s</b>"
+          " (y) — the two widest axes; any other axes are free per"
+          " cell.%s%s</p>\n",
+          wm_bt_sweep_score_name(plan->score), xn_esc, yn_esc,
+          plan->axes[ax_x].n_values > WM_BT_HEAT_MAX_VALUES ||
+          plan->axes[ax_y].n_values > WM_BT_HEAT_MAX_VALUES
+              ? " Axes wider than 32 values are truncated to the first 32"
+                " cells." : "",
+          plan->n_axes > 2
+              ? " (>2 axes swept; the remaining axes are marginalised"
+                " into each cell's best.)" : "");
+      wm_bt_emit_heatmap_svg(fp, plan, results, n_results, ax_x, ax_y);
+      fputs("</section>\n", fp);
+    }
+  }
+
+  // ---- footer ----
+  fputs("<footer>Generated by whenmoon backtest &middot; "
+        "siblings: <a href=\"report.md\">report.md</a>, "
+        "<a href=\"manifest.json\">manifest.json</a>, "
+        "<a href=\"iterations.jsonl\">iterations.jsonl</a>, "
+        "<a href=\"top-N.txt\">top-N.txt</a>. Per-trade charts are not "
+        "emitted for a sweep — re-run the chosen config with no sweep "
+        "axes to chart it.</footer>\n", fp);
 
   fputs("</div></body></html>\n", fp);
 
