@@ -50,6 +50,17 @@
 #define WM_BT_KV_REPORT_PATH        "plugin.whenmoon.backtest.report_path"
 #define WM_BT_REPORT_DEFAULT_REL    ".local/share/botmanager/backtests"
 
+// Inline-SVG P/L distribution geometry (WM-BT-RPT-3). Up to _BINS equal-
+// width buckets across a _W x _H viewBox; _PADX/_PADT/_PADB are the
+// left+right / top / bottom plot insets (the bottom inset holds the
+// min/zero/max tick labels).
+#define WM_BT_HIST_BINS             21
+#define WM_BT_HIST_W                720
+#define WM_BT_HIST_H                220
+#define WM_BT_HIST_PADX             8
+#define WM_BT_HIST_PADT             10
+#define WM_BT_HIST_PADB             28
+
 // ----------------------------------------------------------------------- //
 // Mode label                                                              //
 // ----------------------------------------------------------------------- //
@@ -1656,29 +1667,406 @@ wm_bt_idx_emit_chart_links(FILE *fp, const char *sweep_dir,
     fputs("<span class=\"muted\">&mdash;</span>", fp);
 }
 
-// One iteration's trade table. Pairs buy→sell over the captured fills
-// ring (long-only / flat ⇒ strict buy/sell alternation, but defensive
-// against an unmatched trailing buy = open-at-end). Returns the number
-// of paired trades rendered.
+// Shared buy->sell pairing iterator (WM-BT-RPT-3; declared in
+// wm_bt_report.h). See the header for the contract + drive loop.
+bool
+wm_bt_trade_next(wm_bt_trade_iter_t *it,
+    const wm_market_fill_t **entry, const wm_market_fill_t **exit_out)
+{
+  uint32_t f;
+
+  if(it == NULL || it->fills == NULL || entry == NULL || exit_out == NULL)
+    return(false);
+
+  for(f = it->pos; f < it->n; f++)
+  {
+    uint32_t e;
+
+    if(it->fills[f].side != 'b')
+      continue;
+
+    *entry    = &it->fills[f];
+    *exit_out = NULL;
+
+    for(e = f + 1; e < it->n; e++)
+    {
+      if(it->fills[e].side == 's')
+      {
+        *exit_out = &it->fills[e];
+        it->pos   = e + 1;          // resume past the closing sell
+        return(true);
+      }
+    }
+
+    it->pos = f + 1;                 // open-at-end: resume after the buy
+    return(true);
+  }
+
+  it->pos = it->n;
+  return(false);
+}
+
+// Per-trade analytics derived from the captured fills (WM-BT-RPT-3).
+// All fields cover CLOSED round-trips only — an open trade left at
+// snapshot end is excluded from every stat (it counts only in the
+// table's "Open" filter). avg_loss is signed negative; payoff =
+// avg_win / |avg_loss| and is non-finite (rendered "n/a") when there
+// are no losing trades. expectancy is the mean realized P/L per closed
+// trade. avg_hold_ms is the mean (exit - entry) duration.
+typedef struct
+{
+  uint32_t n;
+  uint32_t wins;
+  uint32_t losses;
+  double   avg_win;
+  double   avg_loss;
+  double   best;
+  double   worst;
+  double   expectancy;
+  double   payoff;
+  int64_t  avg_hold_ms;
+} wm_bt_trade_stats_t;
+
+static void
+wm_bt_trade_stats_compute(const wm_market_fill_t *fills, uint32_t n_fills,
+    wm_bt_trade_stats_t *out)
+{
+  wm_bt_trade_iter_t      it = { fills, n_fills, 0 };
+  const wm_market_fill_t *entry;
+  const wm_market_fill_t *exit_fill;
+  double                  sum_pnl  = 0.0;
+  double                  sum_win  = 0.0;
+  double                  sum_loss = 0.0;
+  int64_t                 sum_hold = 0;
+
+  if(out == NULL)
+    return;
+
+  memset(out, 0, sizeof(*out));
+  out->best  = 0.0;
+  out->worst = 0.0;
+
+  while(wm_bt_trade_next(&it, &entry, &exit_fill))
+  {
+    double pnl;
+
+    if(exit_fill == NULL)        // open trade — not a closed round-trip
+      continue;
+
+    pnl = exit_fill->realized_pnl;
+
+    if(out->n == 0)
+    {
+      out->best  = pnl;
+      out->worst = pnl;
+    }
+
+    else
+    {
+      if(pnl > out->best)  out->best  = pnl;
+      if(pnl < out->worst) out->worst = pnl;
+    }
+
+    out->n++;
+    sum_pnl  += pnl;
+    sum_hold += exit_fill->ts_ms - entry->ts_ms;
+
+    if(pnl > 0.0)
+    {
+      out->wins++;
+      sum_win += pnl;
+    }
+
+    else if(pnl < 0.0)
+    {
+      out->losses++;
+      sum_loss += pnl;
+    }
+  }
+
+  if(out->n == 0)
+  {
+    out->payoff = NAN;             // nothing closed -> "n/a"
+    return;
+  }
+
+  out->avg_win     = out->wins   > 0 ? sum_win  / (double)out->wins   : 0.0;
+  out->avg_loss    = out->losses > 0 ? sum_loss / (double)out->losses : 0.0;
+  out->expectancy  = sum_pnl / (double)out->n;
+  out->avg_hold_ms = sum_hold / (int64_t)out->n;
+  out->payoff      = (out->losses > 0 && out->avg_loss != 0.0)
+      ? out->avg_win / fabs(out->avg_loss)
+      : NAN;
+}
+
+// Inline-SVG P/L distribution histogram (WM-BT-RPT-3). Bins closed-trade
+// realized P/L (dollars) into up to WM_BT_HIST_BINS equal-width buckets;
+// bars whose bucket centre is >= 0 use the --win colour, the rest --loss.
+// Three x-axis ticks (min / 0 / max) are labelled via wm_bt_fmt_usd. The
+// SVG scales to its container width (viewBox + width:100%). Caller
+// guarantees at least one closed trade.
+static void
+wm_bt_emit_pnl_histogram_svg(FILE *fp, const wm_market_fill_t *fills,
+    uint32_t n_fills)
+{
+  wm_bt_trade_iter_t      it = { fills, n_fills, 0 };
+  const wm_market_fill_t *entry;
+  const wm_market_fill_t *exit_fill;
+  uint32_t                bins[WM_BT_HIST_BINS];
+  uint32_t                nbins;
+  uint32_t                bmax  = 0;
+  uint32_t                total = 0;
+  uint32_t                b;
+  double                  lo   =  INFINITY;
+  double                  hi   = -INFINITY;
+  double                  span;
+  double                  plot_w;
+  double                  plot_h;
+  double                  bar_w;
+  char                    lo_str[48];
+  char                    hi_str[48];
+
+  if(fp == NULL)
+    return;
+
+  // Pass 1: range of closed-trade P/L.
+  while(wm_bt_trade_next(&it, &entry, &exit_fill))
+  {
+    double pnl;
+
+    if(exit_fill == NULL)
+      continue;
+
+    pnl = exit_fill->realized_pnl;
+
+    if(!isfinite(pnl))
+      continue;
+
+    if(pnl < lo) lo = pnl;
+    if(pnl > hi) hi = pnl;
+  }
+
+  if(!isfinite(lo) || !isfinite(hi))
+    return;                        // no finite closed trades
+
+  span  = hi - lo;
+  nbins = (span <= 0.0) ? 1u : (uint32_t)WM_BT_HIST_BINS;
+
+  for(b = 0; b < nbins; b++)
+    bins[b] = 0;
+
+  // Pass 2: bin.
+  it.pos = 0;
+
+  while(wm_bt_trade_next(&it, &entry, &exit_fill))
+  {
+    double pnl;
+    double frac;
+
+    if(exit_fill == NULL)
+      continue;
+
+    pnl = exit_fill->realized_pnl;
+
+    if(!isfinite(pnl))
+      continue;
+
+    if(span <= 0.0)
+      b = 0;
+    else
+    {
+      frac = (pnl - lo) / span;
+      b    = (uint32_t)(frac * (double)nbins);
+
+      if(b >= nbins)
+        b = nbins - 1;             // hi value lands in the last bin
+    }
+
+    bins[b]++;
+    total++;
+
+    if(bins[b] > bmax)
+      bmax = bins[b];
+  }
+
+  if(bmax == 0)
+    return;
+
+  wm_bt_fmt_usd(lo, lo_str, sizeof(lo_str));
+  wm_bt_fmt_usd(hi, hi_str, sizeof(hi_str));
+
+  plot_w = (double)(WM_BT_HIST_W - 2 * WM_BT_HIST_PADX);
+  plot_h = (double)(WM_BT_HIST_H - WM_BT_HIST_PADT - WM_BT_HIST_PADB);
+  bar_w  = plot_w / (double)nbins;
+
+  fprintf(fp,
+      "<svg class=\"hist\" viewBox=\"0 0 %d %d\" role=\"img\""
+      " aria-label=\"P/L distribution across %u closed trades,"
+      " from %s to %s\" preserveAspectRatio=\"none\">\n"
+      "<title>Per-trade P/L distribution</title>\n",
+      WM_BT_HIST_W, WM_BT_HIST_H, total, lo_str, hi_str);
+
+  for(b = 0; b < nbins; b++)
+  {
+    double      x = (double)WM_BT_HIST_PADX + (double)b * bar_w;
+    double      h = plot_h * ((double)bins[b] / (double)bmax);
+    double      y = (double)WM_BT_HIST_PADT + (plot_h - h);
+    double      centre = (span <= 0.0)
+        ? lo
+        : lo + ((double)b + 0.5) / (double)nbins * span;
+    const char *cls = centre >= 0.0 ? "win" : "loss";
+
+    if(bins[b] == 0)
+      continue;
+
+    fprintf(fp,
+        "<rect class=\"%s\" x=\"%.2f\" y=\"%.2f\" width=\"%.2f\""
+        " height=\"%.2f\"><title>%u trade(s)</title></rect>\n",
+        cls, x + 0.5, y, bar_w > 1.0 ? bar_w - 1.0 : bar_w, h, bins[b]);
+  }
+
+  // Baseline + min/zero/max tick labels.
+  fprintf(fp,
+      "<line class=\"axis\" x1=\"%d\" y1=\"%d\" x2=\"%d\" y2=\"%d\"/>\n",
+      WM_BT_HIST_PADX, WM_BT_HIST_H - WM_BT_HIST_PADB,
+      WM_BT_HIST_W - WM_BT_HIST_PADX, WM_BT_HIST_H - WM_BT_HIST_PADB);
+
+  fprintf(fp,
+      "<text class=\"lbl\" x=\"%d\" y=\"%d\">%s</text>\n",
+      WM_BT_HIST_PADX, WM_BT_HIST_H - 8, lo_str);
+  fprintf(fp,
+      "<text class=\"lbl\" x=\"%d\" y=\"%d\" text-anchor=\"end\">%s</text>\n",
+      WM_BT_HIST_W - WM_BT_HIST_PADX, WM_BT_HIST_H - 8, hi_str);
+
+  if(span > 0.0 && lo < 0.0 && hi > 0.0)
+  {
+    double zx = (double)WM_BT_HIST_PADX + (-lo / span) * plot_w;
+
+    fprintf(fp,
+        "<line class=\"axis\" x1=\"%.2f\" y1=\"%d\" x2=\"%.2f\" y2=\"%d\""
+        " stroke-dasharray=\"3 3\"/>\n",
+        zx, WM_BT_HIST_PADT, zx, WM_BT_HIST_H - WM_BT_HIST_PADB);
+    fprintf(fp,
+        "<text class=\"lbl\" x=\"%.2f\" y=\"%d\" text-anchor=\"middle\">"
+        "$0</text>\n", zx, WM_BT_HIST_H - 8);
+  }
+
+  fputs("</svg>\n", fp);
+}
+
+// Emit the stat-card row + P/L distribution for one config's closed
+// trades (WM-BT-RPT-3). No-op visual when there are no closed trades.
+static void
+wm_bt_idx_emit_trade_analytics(FILE *fp, const wm_bt_sweep_result_t *r)
+{
+  wm_bt_trade_stats_t s;
+  char                avg_win_str[48];
+  char                avg_loss_str[48];
+  char                best_str[48];
+  char                worst_str[48];
+  char                exp_str[48];
+  char                payoff_str[32];
+  char                hold_str[32];
+
+  if(fp == NULL || r->fills == NULL || r->n_fills == 0)
+    return;
+
+  wm_bt_trade_stats_compute(r->fills, r->n_fills, &s);
+
+  if(s.n == 0)
+    return;                        // only open trades — nothing to derive
+
+  fputs("<h3 class=\"sub-h\">P/L distribution</h3>\n", fp);
+  wm_bt_emit_pnl_histogram_svg(fp, r->fills, r->n_fills);
+
+  wm_bt_fmt_usd(s.avg_win,    avg_win_str,  sizeof(avg_win_str));
+  wm_bt_fmt_usd(s.avg_loss,   avg_loss_str, sizeof(avg_loss_str));
+  wm_bt_fmt_usd(s.best,       best_str,     sizeof(best_str));
+  wm_bt_fmt_usd(s.worst,      worst_str,    sizeof(worst_str));
+  wm_bt_fmt_usd(s.expectancy, exp_str,      sizeof(exp_str));
+  wm_bt_fmt_num(s.payoff, 2, payoff_str, sizeof(payoff_str));
+  wm_bt_idx_fmt_dur(s.avg_hold_ms, hold_str, sizeof(hold_str));
+
+  fputs("<div class=\"cards\">\n", fp);
+  fprintf(fp,
+      "<div class=\"card\"><div class=\"k\">Avg win</div>"
+      "<div class=\"v mono pos\">%s</div></div>\n", avg_win_str);
+  fprintf(fp,
+      "<div class=\"card\"><div class=\"k\">Avg loss</div>"
+      "<div class=\"v mono neg\">%s</div></div>\n", avg_loss_str);
+  fprintf(fp,
+      "<div class=\"card\"><div class=\"k\">Payoff ratio</div>"
+      "<div class=\"v mono\">%s</div></div>\n", payoff_str);
+  fprintf(fp,
+      "<div class=\"card\"><div class=\"k\">Expectancy</div>"
+      "<div class=\"v mono\">%s</div></div>\n", exp_str);
+  fprintf(fp,
+      "<div class=\"card\"><div class=\"k\">Avg hold</div>"
+      "<div class=\"v mono\">%s</div></div>\n", hold_str);
+  fprintf(fp,
+      "<div class=\"card\"><div class=\"k\">Best</div>"
+      "<div class=\"v mono pos\">%s</div></div>\n", best_str);
+  fprintf(fp,
+      "<div class=\"card\"><div class=\"k\">Worst</div>"
+      "<div class=\"v mono neg\">%s</div></div>\n", worst_str);
+  fputs("</div>\n", fp);
+}
+
+// One iteration's trade table. Pairs buy→sell via wm_bt_trade_next
+// (long-only / flat ⇒ strict buy/sell alternation, but defensive
+// against an unmatched trailing buy = open-at-end). Rows carry
+// `data-cls` (win/loss/open) + `data-pnl` and the `<th>`s are
+// click-to-sort (report.js wmSortTable); both are progressive
+// enhancement — the server-rendered order + full row set survive with
+// JS off. Returns the number of paired trades rendered.
 static uint32_t
 wm_bt_idx_emit_trades(FILE *fp, const char *sweep_dir,
     const wm_bt_sweep_result_t *r, uint32_t rank, uint16_t emit_mask)
 {
-  uint32_t f;
-  uint32_t tidx = 0;
+  wm_bt_trade_iter_t      it = { r->fills, r->n_fills, 0 };
+  const wm_market_fill_t *entry;
+  const wm_market_fill_t *exit_fill;
+  uint32_t                tidx = 0;
 
+  // Sortable headers: data-col is the 0-based column index, data-type
+  // the sort comparator (num|text). The held column sorts on each row's
+  // data-v (milliseconds) since its text ("2h 5m") isn't numerically
+  // parseable. report.js wires the click/keyboard handlers + arrow.
   fputs("<table class=\"trades\"><thead><tr>"
-        "<th>#</th><th>entry (UTC)</th><th>exit (UTC)</th><th>held</th>"
-        "<th class=\"num\">entry</th><th class=\"num\">exit</th>"
-        "<th class=\"num\">qty</th><th class=\"num\">P/L</th>"
-        "<th class=\"num\">P/L %</th><th class=\"num\">balance</th>"
+        "<th aria-sort=\"none\"><button type=\"button\" class=\"sort\""
+        " data-col=\"0\" data-type=\"num\">#<span class=\"arrow\""
+        " aria-hidden=\"true\"></span></button></th>"
+        "<th aria-sort=\"none\"><button type=\"button\" class=\"sort\""
+        " data-col=\"1\" data-type=\"text\">entry (UTC)<span class=\"arrow\""
+        " aria-hidden=\"true\"></span></button></th>"
+        "<th aria-sort=\"none\"><button type=\"button\" class=\"sort\""
+        " data-col=\"2\" data-type=\"text\">exit (UTC)<span class=\"arrow\""
+        " aria-hidden=\"true\"></span></button></th>"
+        "<th aria-sort=\"none\"><button type=\"button\" class=\"sort\""
+        " data-col=\"3\" data-type=\"num\">held<span class=\"arrow\""
+        " aria-hidden=\"true\"></span></button></th>"
+        "<th class=\"num\" aria-sort=\"none\"><button type=\"button\""
+        " class=\"sort\" data-col=\"4\" data-type=\"num\">entry"
+        "<span class=\"arrow\" aria-hidden=\"true\"></span></button></th>"
+        "<th class=\"num\" aria-sort=\"none\"><button type=\"button\""
+        " class=\"sort\" data-col=\"5\" data-type=\"num\">exit"
+        "<span class=\"arrow\" aria-hidden=\"true\"></span></button></th>"
+        "<th class=\"num\" aria-sort=\"none\"><button type=\"button\""
+        " class=\"sort\" data-col=\"6\" data-type=\"num\">qty"
+        "<span class=\"arrow\" aria-hidden=\"true\"></span></button></th>"
+        "<th class=\"num\" aria-sort=\"none\"><button type=\"button\""
+        " class=\"sort\" data-col=\"7\" data-type=\"num\">P/L"
+        "<span class=\"arrow\" aria-hidden=\"true\"></span></button></th>"
+        "<th class=\"num\" aria-sort=\"none\"><button type=\"button\""
+        " class=\"sort\" data-col=\"8\" data-type=\"num\">P/L %"
+        "<span class=\"arrow\" aria-hidden=\"true\"></span></button></th>"
+        "<th class=\"num\" aria-sort=\"none\"><button type=\"button\""
+        " class=\"sort\" data-col=\"9\" data-type=\"num\">balance"
+        "<span class=\"arrow\" aria-hidden=\"true\"></span></button></th>"
         "<th>exit reason</th><th>chart</th></tr></thead><tbody>\n", fp);
 
-  for(f = 0; f < r->n_fills; f++)
+  while(wm_bt_trade_next(&it, &entry, &exit_fill))
   {
-    const wm_market_fill_t *entry = &r->fills[f];
-    const wm_market_fill_t *exit_fill = NULL;
-    uint32_t                e;
     char                    entry_ts[64];
     char                    exit_ts[64];
     char                    held[32];
@@ -1686,20 +2074,8 @@ wm_bt_idx_emit_trades(FILE *fp, const char *sweep_dir,
     double                  pnl;
     double                  notional;
     double                  pct;
+    int64_t                 hold_ms;
     const char             *cls;
-
-    if(entry->side != 'b')
-      continue;
-
-    for(e = f + 1; e < r->n_fills; e++)
-    {
-      if(r->fills[e].side == 's')
-      {
-        exit_fill = &r->fills[e];
-        f         = e;
-        break;
-      }
-    }
 
     tidx++;
 
@@ -1708,30 +2084,39 @@ wm_bt_idx_emit_trades(FILE *fp, const char *sweep_dir,
 
     if(exit_fill != NULL)
     {
-      pnl = exit_fill->realized_pnl;
-      pct = (notional > 0.0) ? (pnl / notional) * 100.0 : 0.0;
-      cls = (pnl > 0.0) ? "win" : (pnl < 0.0) ? "loss" : "flat";
+      pnl     = exit_fill->realized_pnl;
+      pct     = (notional > 0.0) ? (pnl / notional) * 100.0 : 0.0;
+      hold_ms = exit_fill->ts_ms - entry->ts_ms;
+      cls     = (pnl > 0.0) ? "win" : (pnl < 0.0) ? "loss" : "open";
 
       wm_bt_idx_fmt_ts(exit_fill->ts_ms, exit_ts, sizeof(exit_ts));
-      wm_bt_idx_fmt_dur(exit_fill->ts_ms - entry->ts_ms,
-          held, sizeof(held));
+      wm_bt_idx_fmt_dur(hold_ms, held, sizeof(held));
       wm_bt_html_escape(exit_fill->reason, reason_esc,
           sizeof(reason_esc));
     }
+
     else
     {
-      pnl = 0.0;
-      pct = 0.0;
-      cls = "open";
+      pnl     = 0.0;
+      pct     = 0.0;
+      hold_ms = 0;
+      cls     = "open";
       snprintf(exit_ts, sizeof(exit_ts), "(open)");
       snprintf(held,    sizeof(held),    "&mdash;");
       wm_bt_html_escape(entry->reason, reason_esc, sizeof(reason_esc));
     }
 
+    if(exit_fill != NULL)
+      fprintf(fp, "<tr class=\"%s\" data-cls=\"%s\" data-pnl=\"%.4f\">",
+          cls, cls, pnl);
+    else
+      fprintf(fp, "<tr class=\"open\" data-cls=\"open\" data-pnl=\"\">");
+
     fprintf(fp,
-        "<tr class=\"%s\"><td>%u</td><td>%s</td><td>%s</td><td>%s</td>"
+        "<td>%u</td><td>%s</td><td>%s</td>"
+        "<td data-v=\"%" PRId64 "\">%s</td>"
         "<td class=\"num\">%.2f</td>",
-        cls, tidx, entry_ts, exit_ts, held, entry->price);
+        tidx, entry_ts, exit_ts, hold_ms, held, entry->price);
 
     if(exit_fill != NULL)
       fprintf(fp, "<td class=\"num\">%.2f</td>", exit_fill->price);
@@ -1748,6 +2133,7 @@ wm_bt_idx_emit_trades(FILE *fp, const char *sweep_dir,
           "<td class=\"num\">%.2f</td>",
           pnl, pct, exit_fill->cash_after);
     }
+
     else
     {
       fputs("<td class=\"num muted\">&mdash;</td>"
@@ -2150,14 +2536,23 @@ wm_bt_render_index_html(const char *sweep_dir,
     }
     else
     {
-      // Captured fills ring caps at WM_MARKET_FILL_RING_CAP; warn when
-      // the full count exceeded it so the table's partiality is clear.
-      if((uint64_t)st->lifetime_fills_count > (uint64_t)r->n_fills)
-        fprintf(fp,
-            "<p class=\"note\">Showing the most recent %u of %"
-            PRIu64 " fills (capture ring cap); earlier trades omitted."
-            "</p>\n", r->n_fills,
-            (uint64_t)st->lifetime_fills_count);
+      // Fills are lossless for a backtest (the incremental drain captures
+      // every PAPER fill, so n_fills == lifetime_fills_count) — no
+      // capture-ring truncation note is needed.
+      wm_bt_idx_emit_trade_analytics(fp, r);
+
+      // Filter chips (progressive enhancement — inert + keyboard-
+      // focusable with JS off; report.js wmFilterTrades wires them).
+      fputs("<div class=\"chips\" role=\"group\""
+            " aria-label=\"Filter trades\">"
+            "<button type=\"button\" class=\"chip\" data-kind=\"all\""
+            " aria-pressed=\"true\">All</button>"
+            "<button type=\"button\" class=\"chip\" data-kind=\"win\""
+            " aria-pressed=\"false\">Wins</button>"
+            "<button type=\"button\" class=\"chip\" data-kind=\"loss\""
+            " aria-pressed=\"false\">Losses</button>"
+            "<button type=\"button\" class=\"chip\" data-kind=\"open\""
+            " aria-pressed=\"false\">Open</button></div>\n", fp);
 
       fputs("<div class=\"tbl-scroll\">\n", fp);
       n_trades = wm_bt_idx_emit_trades(fp, sweep_dir, r, i + 1, emit_mask);

@@ -14,6 +14,7 @@
 #ifdef WHENMOON_INTERNAL
 
 #include "backtest.h"
+#include "market.h"   // wm_market_fill_t
 #include "sweep.h"
 
 #include <pthread.h>
@@ -22,6 +23,32 @@
 #include <stdint.h>
 #include <stdio.h>
 #include <sys/types.h>
+
+// Shared buy->sell pairing iterator over a captured fills array
+// (WM-BT-RPT-3). The PAPER backtest market is long-only / flat, so the
+// fill sequence is strict buy/sell/buy/sell — but the walk is defensive
+// against an unmatched trailing buy (a position left open at snapshot
+// end). Replaces the open-coded pair loops in the trade table, the
+// per-trade stats, and the chart pass. Drive it with wm_bt_trade_next
+// until it returns false:
+//
+//   wm_bt_trade_iter_t it = { fills, n_fills, 0 };
+//   const wm_market_fill_t *entry, *exit_fill;
+//   while(wm_bt_trade_next(&it, &entry, &exit_fill)) { ... }
+typedef struct
+{
+  const wm_market_fill_t *fills;   // captured fills (oldest-to-newest)
+  uint32_t                n;       // fill count
+  uint32_t                pos;     // next fill index to examine (init 0)
+} wm_bt_trade_iter_t;
+
+// Advance to the next trade. On a found buy, writes its fill into
+// `*entry`, the matching sell (or NULL when the position is still open
+// at the end of the fills) into `*exit_out`, advances the cursor past
+// the closing sell, and returns true. Returns false once the fills are
+// exhausted. `entry` / `exit_out` must be non-NULL.
+bool wm_bt_trade_next(wm_bt_trade_iter_t *it,
+    const wm_market_fill_t **entry, const wm_market_fill_t **exit_out);
 
 // Mode passed to mkdir() for every backtest output directory (report
 // root, sweep dir, charts/, charts/iter-K/). 0777 so the process umask

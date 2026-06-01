@@ -253,7 +253,9 @@ wm_bt_cmd_run_emit_charts(const cmd_ctx_t *ctx,
       const wm_candle_full_t *ring;
       uint32_t                ring_n;
       uint32_t                trade_idx = 0;
-      uint32_t                f;
+      wm_bt_trade_iter_t      it;
+      const wm_market_fill_t *entry;
+      const wm_market_fill_t *exit_fill;
 
       ring   = snap->mkt.grain_arr[g];
       ring_n = snap->mkt.grain_n[g];
@@ -261,37 +263,20 @@ wm_bt_cmd_run_emit_charts(const cmd_ctx_t *ctx,
       if(ring == NULL || ring_n == 0)
         continue;
 
-      // Pair walk: buy at f, scan forward for matching sell. The
-      // PAPER market is long-only / flat — sequence is strict
-      // buy/sell/buy/sell — but defensive against unmatched buys
-      // (open-at-end-of-backtest) and stray sells (size mismatch).
-      for(f = 0; f < res->n_fills; f++)
+      // Pair walk via the shared iterator (WM-BT-RPT-3): buy -> matching
+      // sell, defensive against an unmatched trailing buy (open-at-end).
+      it.fills = res->fills;
+      it.n     = res->n_fills;
+      it.pos   = 0;
+
+      while(wm_bt_trade_next(&it, &entry, &exit_fill))
       {
-        const wm_market_fill_t *entry;
-        const wm_market_fill_t *exit_fill;
         uint32_t                start_idx;
         uint32_t                end_idx;
         uint32_t                slice_n;
         int64_t                 entry_ts;
         int64_t                 exit_ts;
         char                    chart_err[160];
-        uint32_t                e;
-
-        entry     = &res->fills[f];
-        exit_fill = NULL;
-
-        if(entry->side != 'b')
-          continue;
-
-        for(e = f + 1; e < res->n_fills; e++)
-        {
-          if(res->fills[e].side == 's')
-          {
-            exit_fill = &res->fills[e];
-            f         = e;          // skip past closing fill
-            break;
-          }
-        }
 
         trade_idx++;
 

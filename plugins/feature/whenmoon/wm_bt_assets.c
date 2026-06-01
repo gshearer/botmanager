@@ -7,6 +7,7 @@
 
 #include "wm_bt_report.h"   // wm_bt_write_atomic, WM_BT_REPORT_DIR_MODE
 
+#include "alloc.h"          // mem_alloc / mem_free
 #include "common.h"         // SUCCESS / FAIL
 
 #include <errno.h>
@@ -26,7 +27,11 @@
 // tabular-nums, balanced headings, reduced-motion, print) and the
 // per-trade chart-page rules (formerly the chart TU's own inline style).
 
-static const char WM_BT_REPORT_CSS[] =
+// Split into parts so no single string literal exceeds the C99 4095-byte
+// "minimum maximum" (-Woverlength-strings under -Wpedantic). The parts are
+// joined into one buffer at write time (wm_bt_assets_write_joined). Keep
+// each part comfortably under 4095 as RPT-4..6 grow the stylesheet.
+static const char *const WM_BT_REPORT_CSS_PARTS[] = {
     ":root{--bg:#0e0f13;--surface:#171922;--surface2:#1e2230;"
     "--border:#2a2f3e;--text:#e6e8ee;--muted:#8b93a7;--accent:#5b8cff;"
     "--win:#2bb673;--loss:#e0533d;--gold:#f5c451}\n"
@@ -98,7 +103,7 @@ static const char WM_BT_REPORT_CSS[] =
     "margin-right:8px}\n"
     ".note{color:var(--muted);font-size:12px;padding:10px 18px}\n"
     "footer{color:var(--muted);font-size:12px;margin-top:40px;"
-    "border-top:1px solid var(--border);padding-top:16px}\n"
+    "border-top:1px solid var(--border);padding-top:16px}\n",
     // --- Web Interface Guidelines baseline (WM-BT-RPT-1) ---
     "html{color-scheme:dark}\n"
     ":focus-visible{outline:2px solid var(--accent);outline-offset:2px}\n"
@@ -111,9 +116,35 @@ static const char WM_BT_REPORT_CSS[] =
     // --- equity & drawdown panes (WM-BT-RPT-2) ---
     ".chartbox{height:320px;margin:6px 0}\n"
     ".ddbox{height:150px;margin:6px 0 2px}\n"
+    // --- trade analytics: distribution, chips, sortable table (RPT-3) ---
+    "h3.sub-h{font-size:12px;font-weight:600;color:var(--muted);"
+    "text-transform:uppercase;letter-spacing:.04em;margin:14px 0 4px}\n"
+    ".hist{width:100%;height:auto;display:block;margin:4px 0 8px;"
+    "background:var(--surface);border:1px solid var(--border);"
+    "border-radius:10px}\n"
+    ".hist rect.win{fill:var(--win)}\n"
+    ".hist rect.loss{fill:var(--loss)}\n"
+    ".hist .axis{stroke:var(--border)}\n"
+    ".hist .lbl{fill:var(--muted);font-size:11px;"
+    "font-family:ui-monospace,monospace}\n"
+    ".chips{display:flex;flex-wrap:wrap;gap:8px;padding:4px 0 12px}\n"
+    ".chip{background:var(--surface);border:1px solid var(--border);"
+    "color:var(--text);border-radius:999px;padding:5px 14px;font-size:12px;"
+    "cursor:pointer;font:inherit}\n"
+    ".chip[aria-pressed='true']{background:var(--accent);"
+    "border-color:var(--accent);color:#fff}\n"
+    "th[aria-sort] button.sort{all:unset;cursor:pointer;display:inline-flex;"
+    "align-items:center;gap:4px;color:inherit;font:inherit}\n"
+    "th[aria-sort] .arrow::after{content:'\\2195';opacity:.35}\n"
+    "th[aria-sort='ascending'] .arrow::after{content:'\\2191';opacity:1}\n"
+    "th[aria-sort='descending'] .arrow::after{content:'\\2193';opacity:1}\n"
+    "tr.hidden{display:none}\n"
+    ".tbl-scroll{content-visibility:auto;contain-intrinsic-size:auto 560px}\n"
     // --- per-trade chart page (was the chart TU's inline <style>) ---
     "#chart{height:86vh}\n"
-    "body>h1{margin:0;padding:14px 20px;font-size:14px;font-weight:600}\n";
+    "body>h1{margin:0;padding:14px 20px;font-size:14px;font-weight:600}\n",
+    NULL,
+};
 
 // ----------------------------------------------------------------------- //
 // Shared client bootstrap                                                 //
@@ -123,7 +154,9 @@ static const char WM_BT_REPORT_CSS[] =
 // reduced-motion flag + Intl formatters they will reuse. Single-quoted
 // throughout so the C string literal needs no escaping.
 
-static const char WM_BT_REPORT_JS[] =
+// Split into parts (see WM_BT_REPORT_CSS_PARTS) to stay under the C99
+// 4095-byte literal limit; joined at write time.
+static const char *const WM_BT_REPORT_JS_PARTS[] = {
     "// whenmoon backtest report - shared client bootstrap (WM-BT-RPT-1).\n"
     "'use strict';\n"
     "const wmReduceMotion = (typeof window !== 'undefined'"
@@ -202,9 +235,77 @@ static const char WM_BT_REPORT_JS[] =
     "  }\n"
     "  eqChart.timeScale().fitContent();\n"
     "  if(ddChart) ddChart.timeScale().fitContent();\n"
+    "}\n",
+    // --- WM-BT-RPT-3: sortable + filterable trade table ---
+    // Both are progressive enhancement: the server-rendered row order +
+    // the full row set work with JS off. Sort reads each cell's data-v
+    // (held = ms) when present, else parses the visible text; numeric
+    // NaN cells (open trades, em-dashes) always sink to the bottom.
+    "function wmSortTable(btn){\n"
+    "  const th = btn.closest('th'), table = btn.closest('table');\n"
+    "  if(!th || !table || !table.tBodies[0]) return;\n"
+    "  const col = parseInt(btn.dataset.col, 10);\n"
+    "  const type = btn.dataset.type || 'text';\n"
+    "  const dir = th.getAttribute('aria-sort') === 'ascending'\n"
+    "    ? 'descending' : 'ascending';\n"
+    "  table.querySelectorAll('thead th[aria-sort]').forEach(h => {\n"
+    "    if(h !== th) h.setAttribute('aria-sort', 'none');\n"
+    "  });\n"
+    "  th.setAttribute('aria-sort', dir);\n"
+    "  const sign = dir === 'ascending' ? 1 : -1;\n"
+    "  const val = (row) => {\n"
+    "    const cell = row.cells[col];\n"
+    "    if(!cell) return type === 'num' ? NaN : '';\n"
+    "    if(type === 'num'){\n"
+    "      const dv = cell.dataset.v;\n"
+    "      const raw = (dv !== undefined && dv !== '') ? dv : cell.textContent;\n"
+    "      return parseFloat(String(raw).replace(/[^0-9eE.+-]/g, ''));\n"
+    "    }\n"
+    "    return cell.textContent.trim();\n"
+    "  };\n"
+    "  const tbody = table.tBodies[0];\n"
+    "  const rows = Array.prototype.slice.call(tbody.rows);\n"
+    "  rows.sort((a, b) => {\n"
+    "    const va = val(a), vb = val(b);\n"
+    "    if(type === 'num'){\n"
+    "      const an = isNaN(va), bn = isNaN(vb);\n"
+    "      if(an && bn) return 0;\n"
+    "      if(an) return 1;\n"
+    "      if(bn) return -1;\n"
+    "      return (va - vb) * sign;\n"
+    "    }\n"
+    "    return va.localeCompare(vb) * sign;\n"
+    "  });\n"
+    "  rows.forEach(r => tbody.appendChild(r));\n"
     "}\n"
-    "if(document.readyState === 'complete') wmRenderEquity();\n"
-    "else document.addEventListener('DOMContentLoaded', wmRenderEquity);\n";
+    "function wmFilterTrades(grp, kind){\n"
+    "  const table = grp.parentElement\n"
+    "    ? grp.parentElement.querySelector('table.trades') : null;\n"
+    "  if(!table || !table.tBodies[0]) return;\n"
+    "  Array.prototype.forEach.call(table.tBodies[0].rows, (row) => {\n"
+    "    const show = (kind === 'all') || (row.dataset.cls === kind);\n"
+    "    row.classList.toggle('hidden', !show);\n"
+    "  });\n"
+    "  grp.querySelectorAll('.chip').forEach(c => {\n"
+    "    c.setAttribute('aria-pressed',\n"
+    "      c.dataset.kind === kind ? 'true' : 'false');\n"
+    "  });\n"
+    "}\n"
+    "function wmInitTrades(){\n"
+    "  document.querySelectorAll('table.trades thead button.sort')\n"
+    "    .forEach(btn => btn.addEventListener('click',"
+    " () => wmSortTable(btn)));\n"
+    "  document.querySelectorAll('.chips').forEach(grp => {\n"
+    "    grp.querySelectorAll('.chip').forEach(chip =>\n"
+    "      chip.addEventListener('click',\n"
+    "        () => wmFilterTrades(grp, chip.dataset.kind)));\n"
+    "  });\n"
+    "}\n"
+    "function wmInit(){ wmRenderEquity(); wmInitTrades(); }\n"
+    "if(document.readyState === 'complete') wmInit();\n"
+    "else document.addEventListener('DOMContentLoaded', wmInit);\n",
+    NULL,
+};
 
 // ----------------------------------------------------------------------- //
 // Document head                                                           //
@@ -381,6 +482,50 @@ wm_bt_fmt_pct(double v, int frac, char *out, size_t cap)
 // Asset emit                                                              //
 // ----------------------------------------------------------------------- //
 
+// Join a NULL-terminated array of string parts into one heap buffer and
+// write it atomically (tmp + fsync + rename via wm_bt_write_atomic). The
+// parts are split only to dodge the C99 4095-byte literal cap; on disk
+// they are one contiguous file. Returns SUCCESS / FAIL (err populated).
+static bool
+wm_bt_assets_write_joined(const char *path, const char *const *parts,
+    char *err, size_t err_cap)
+{
+  size_t total = 0;
+  size_t off   = 0;
+  size_t i;
+  char  *buf;
+  bool   rc;
+
+  for(i = 0; parts[i] != NULL; i++)
+    total += strlen(parts[i]);
+
+  buf = mem_alloc("whenmoon.bt.report", "asset_join", total + 1);
+
+  if(buf == NULL)
+  {
+    if(err != NULL)
+      snprintf(err, err_cap, "asset join alloc failed");
+
+    return(FAIL);
+  }
+
+  for(i = 0; parts[i] != NULL; i++)
+  {
+    size_t len = strlen(parts[i]);
+
+    memcpy(buf + off, parts[i], len);
+    off += len;
+  }
+
+  buf[off] = '\0';
+
+  rc = wm_bt_write_atomic(path, buf, err, err_cap);
+
+  mem_free(buf);
+
+  return(rc);
+}
+
 bool
 wm_bt_assets_emit(const char *sweep_dir, char *err, size_t err_cap)
 {
@@ -425,7 +570,8 @@ wm_bt_assets_emit(const char *sweep_dir, char *err, size_t err_cap)
     return(FAIL);
   }
 
-  if(wm_bt_write_atomic(file_path, WM_BT_REPORT_CSS, err, err_cap) != SUCCESS)
+  if(wm_bt_assets_write_joined(file_path, WM_BT_REPORT_CSS_PARTS,
+         err, err_cap) != SUCCESS)
     return(FAIL);
 
   n = snprintf(file_path, sizeof(file_path), "%s/report.js", assets_dir);
@@ -438,7 +584,8 @@ wm_bt_assets_emit(const char *sweep_dir, char *err, size_t err_cap)
     return(FAIL);
   }
 
-  if(wm_bt_write_atomic(file_path, WM_BT_REPORT_JS, err, err_cap) != SUCCESS)
+  if(wm_bt_assets_write_joined(file_path, WM_BT_REPORT_JS_PARTS,
+         err, err_cap) != SUCCESS)
     return(FAIL);
 
   return(SUCCESS);
