@@ -589,27 +589,35 @@ wm_bt_in_any_window(const wm_bt_window_t *w, uint32_t n, int64_t ts_ms)
 }
 
 bool
-wm_backtest_run_iteration_with_id(whenmoon_state_t *st,
+wm_backtest_run_iteration_multi(whenmoon_state_t *st,
     wm_backtest_snapshot_t *snap,
-    const char *strategy_name,
+    const char *const *strategy_names, uint32_t n_strats,
     const char *synth_id,
     const wm_backtest_params_t *params,
     const wm_bt_window_t *windows, uint32_t n_windows,
     wm_backtest_result_t *out,
     char *err, size_t err_cap)
 {
-  loaded_strategy_t              *ls;
-  int                           (*init_fn)(wm_strategy_ctx_t *);
-  void                          (*finalize_fn)(wm_strategy_ctx_t *);
-  void                          (*on_bar_fn)(wm_strategy_ctx_t *,
-                                    const struct whenmoon_market *,
-                                    wm_gran_t,
-                                    const wm_candle_full_t *);
-  uint16_t                        grains_mask;
-  wm_strategy_ctx_t               ctx;
+  // Per-strategy resolved entry points + identity. Priority order ==
+  // array order: strategy_names[0] is polled first (lowest priority
+  // number in the live model), mirroring wm_strategy_dispatch_bar.
+  int      (*init_fn[WM_BT_MAX_LINKED])(wm_strategy_ctx_t *);
+  void     (*finalize_fn[WM_BT_MAX_LINKED])(wm_strategy_ctx_t *);
+  void     (*on_bar_fn[WM_BT_MAX_LINKED])(wm_strategy_ctx_t *,
+               const struct whenmoon_market *,
+               wm_gran_t,
+               const wm_candle_full_t *);
+  uint16_t                        smask[WM_BT_MAX_LINKED];
+  char                            sname[WM_BT_MAX_LINKED][WM_STRATEGY_NAME_SZ];
+  wm_strategy_ctx_t               ctx[WM_BT_MAX_LINKED];
+  bool                            inited[WM_BT_MAX_LINKED] = { false };
+  char                            strat_label[WM_STRATEGY_NAME_SZ
+                                      * WM_BT_MAX_LINKED + WM_BT_MAX_LINKED]
+                                      = {0};
+  uint16_t                        union_mask               = 0;
+  uint32_t                        si;
   whenmoon_market_t              *synth_mk = NULL;
   char                            err_synth[128];
-  char                            strat_copy[WM_STRATEGY_NAME_SZ];
   wm_bt_cursor_t                  cursors[WM_GRAN_MAX];
   const wm_candle_full_t         *rings[WM_GRAN_MAX];
   uint32_t                        bars_replayed = 0;
@@ -630,7 +638,8 @@ wm_backtest_run_iteration_with_id(whenmoon_state_t *st,
   if(out != NULL)
     memset(out, 0, sizeof(*out));
 
-  if(st == NULL || snap == NULL || strategy_name == NULL ||
+  if(st == NULL || snap == NULL || strategy_names == NULL ||
+     n_strats == 0 || n_strats > WM_BT_MAX_LINKED ||
      synth_id == NULL || synth_id[0] == '\0' || out == NULL)
   {
     if(err != NULL)
@@ -638,37 +647,74 @@ wm_backtest_run_iteration_with_id(whenmoon_state_t *st,
     return(FAIL);
   }
 
-  // Resolve the strategy + cache its function pointers under the
+  // Resolve every linked strategy + cache its function pointers under the
   // registry lock, then release. The function pointers are stable for
   // the lifetime of the loaded_strategy_t — a reload would invalidate
   // them; sweep callers gate reload via the active-counter in sweep.c.
   pthread_mutex_lock(&st->strategies->lock);
 
-  ls = wm_strategy_find_loaded(st, strategy_name);
-
-  if(ls == NULL || ls->init_fn == NULL || ls->finalize_fn == NULL ||
-     ls->on_bar_fn == NULL)
+  for(si = 0; si < n_strats; si++)
   {
-    pthread_mutex_unlock(&st->strategies->lock);
+    loaded_strategy_t *ls;
 
-    if(err != NULL)
-      snprintf(err, err_cap, "strategy %s not loaded", strategy_name);
-    return(FAIL);
+    if(strategy_names[si] == NULL)
+    {
+      pthread_mutex_unlock(&st->strategies->lock);
+
+      if(err != NULL)
+        snprintf(err, err_cap, "null strategy name (#%u)", si);
+      return(FAIL);
+    }
+
+    ls = wm_strategy_find_loaded(st, strategy_names[si]);
+
+    if(ls == NULL || ls->init_fn == NULL || ls->finalize_fn == NULL ||
+       ls->on_bar_fn == NULL)
+    {
+      pthread_mutex_unlock(&st->strategies->lock);
+
+      if(err != NULL)
+        snprintf(err, err_cap, "strategy %s not loaded", strategy_names[si]);
+      return(FAIL);
+    }
+
+    init_fn[si]     = ls->init_fn;
+    finalize_fn[si] = ls->finalize_fn;
+    on_bar_fn[si]   = ls->on_bar_fn;
+    smask[si]       = ls->meta.grains_mask;
+    union_mask     |= ls->meta.grains_mask;
+
+    snprintf(sname[si], sizeof(sname[si]), "%s", ls->name);
   }
 
-  init_fn     = ls->init_fn;
-  finalize_fn = ls->finalize_fn;
-  on_bar_fn   = ls->on_bar_fn;
-  grains_mask = ls->meta.grains_mask;
-
-  snprintf(strat_copy, sizeof(strat_copy), "%s", ls->name);
-
   pthread_mutex_unlock(&st->strategies->lock);
+
+  // Build the "a+b" label for the summary log line. The snprintf return
+  // value drives the offset so truncation is handled explicitly (and
+  // -Wformat-truncation stays quiet); the buffer is sized for the full
+  // worst-case concatenation regardless.
+  {
+    size_t off = 0;
+
+    for(si = 0; si < n_strats && off < sizeof(strat_label); si++)
+    {
+      int w = snprintf(strat_label + off, sizeof(strat_label) - off,
+          "%s%.*s", si == 0 ? "" : "+",
+          (int)WM_STRATEGY_NAME_SZ - 1, sname[si]);
+
+      if(w < 0)
+        break;
+
+      off += (size_t)w;
+    }
+  }
 
   // Build the per-iteration synthetic market. It shares the snapshot's
   // grain rings + product id but carries an independent session and
   // mutex; emit_signal_impl routes signals through
-  // wm_market_engine_on_signal_with_mk(synth_mk, ...).
+  // wm_market_engine_on_signal_with_mk(synth_mk, ...). EVERY linked
+  // strategy shares this one market — the market owns the single
+  // position, strategies are advisors (whenmoon_market_model.md).
   if(wm_market_create_synthetic(synth_id, &snap->mkt, &synth_mk,
          err_synth, sizeof(err_synth)) != SUCCESS)
   {
@@ -680,23 +726,41 @@ wm_backtest_run_iteration_with_id(whenmoon_state_t *st,
 
   wm_market_session_apply_iter_overrides(&synth_mk->session, params);
 
-  // Build the strategy ctx. mkt points at the synth market so the
-  // emit path's direct-pointer dispatch lands on it.
-  memset(&ctx, 0, sizeof(ctx));
-  snprintf(ctx.market_id_str, sizeof(ctx.market_id_str), "%s", synth_id);
-  snprintf(ctx.strategy_name, sizeof(ctx.strategy_name), "%s", strat_copy);
-  ctx.mkt = synth_mk;
-
-  if(init_fn(&ctx) != 0)
+  // Build + init each strategy ctx. All point mkt at the shared synth
+  // market so every emit lands on the one book. A failed init unwinds the
+  // already-inited contexts before tearing the market down.
+  for(si = 0; si < n_strats; si++)
   {
-    wm_market_destroy_synthetic(synth_mk);
+    memset(&ctx[si], 0, sizeof(ctx[si]));
+    snprintf(ctx[si].market_id_str, sizeof(ctx[si].market_id_str), "%s",
+        synth_id);
+    // Precision-capped: reading from a 2D-array row loses the per-row
+    // length bound, so cap explicitly to keep -Wformat-truncation quiet.
+    snprintf(ctx[si].strategy_name, sizeof(ctx[si].strategy_name), "%.*s",
+        (int)sizeof(ctx[si].strategy_name) - 1, sname[si]);
+    ctx[si].mkt = synth_mk;
 
-    if(err != NULL)
-      snprintf(err, err_cap, "strategy init returned non-zero");
-    return(FAIL);
+    if(init_fn[si](&ctx[si]) != 0)
+    {
+      uint32_t j;
+
+      for(j = 0; j < si; j++)
+        finalize_fn[j](&ctx[j]);
+
+      wm_market_destroy_synthetic(synth_mk);
+
+      if(err != NULL)
+        snprintf(err, err_cap, "strategy %s init returned non-zero",
+            sname[si]);
+      return(FAIL);
+    }
+
+    inited[si] = true;
   }
 
-  // Set up cursors over each grain ring.
+  // Set up cursors over each grain ring. A grain is walked if ANY linked
+  // strategy subscribes to it (union mask); per-bar each strategy is then
+  // polled only for the grains it individually subscribes to.
   {
     uint32_t g;
 
@@ -704,7 +768,7 @@ wm_backtest_run_iteration_with_id(whenmoon_state_t *st,
     {
       cursors[g].idx        = 0;
       cursors[g].cap        = snap->mkt.grain_n[g];
-      cursors[g].subscribed = (grains_mask & (uint16_t)(1u << g)) != 0;
+      cursors[g].subscribed = (union_mask & (uint16_t)(1u << g)) != 0;
       rings[g]              = snap->mkt.grain_arr[g];
     }
   }
@@ -758,18 +822,44 @@ wm_backtest_run_iteration_with_id(whenmoon_state_t *st,
 
       if(in_window)
       {
-        ctx.bars_seen++;
-        ctx.last_bar_ts_ms = bar->ts_close_ms;
-        ctx.last_mark_px   = bar->close;
-        ctx.last_mark_ms   = bar->ts_close_ms;
+        bool acted = false;
 
-        on_bar_fn(&ctx, &snap->mkt, g, bar);
+        // Priority-walk advisor dispatch, bit-identical to
+        // wm_strategy_dispatch_bar: poll the linked strategies in array
+        // (priority) order, but only those subscribing to THIS grain;
+        // the FIRST to emit a non-zero signal wins and the remaining
+        // strategies are not polled for this bar. Higher grains (4h/1d)
+        // never emit (they only cache regime context), so every
+        // subscriber there runs; the 1h decision grain is where the
+        // break actually bites. A strategy tracks its own internal
+        // position, so on a bar it does not run it simply keeps its
+        // prior state — exactly as in the live walk.
+        for(si = 0; si < n_strats && !acted; si++)
+        {
+          uint64_t pre_emitted;
+
+          if((smask[si] & (uint16_t)(1u << g)) == 0)
+            continue;
+
+          ctx[si].bars_seen++;
+          ctx[si].last_bar_ts_ms = bar->ts_close_ms;
+          ctx[si].last_mark_px   = bar->close;
+          ctx[si].last_mark_ms   = bar->ts_close_ms;
+
+          pre_emitted = ctx[si].signals_emitted;
+          on_bar_fn[si](&ctx[si], &snap->mkt, g, bar);
+
+          if(ctx[si].signals_emitted > pre_emitted &&
+             ctx[si].last_signal.score != 0.0)
+            acted = true;
+        }
+
         bars_replayed++;
 
-        // Drain any fill(s) this callback produced into the lossless
-        // accumulator before the 256-slot ring can overwrite them.
-        // back counts down delta..1; each indexes a still-resident
-        // ring slot since the engine adds <= 1 fill per callback.
+        // Drain the (<= 1) fill this bar produced into the lossless
+        // accumulator before the 256-slot ring can overwrite it. Only
+        // the single winning advisor acts, so the engine adds at most one
+        // fill per bar; the while loop is defensive.
         {
           uint64_t now_fn = sess->fills_n[WM_MARKET_MODE_PAPER];
 
@@ -804,8 +894,10 @@ wm_backtest_run_iteration_with_id(whenmoon_state_t *st,
 
   clock_gettime(CLOCK_MONOTONIC, &t1);
 
-  // Finalize the strategy attachment.
-  finalize_fn(&ctx);
+  // Finalize every linked strategy attachment.
+  for(si = 0; si < n_strats; si++)
+    if(inited[si])
+      finalize_fn[si](&ctx[si]);
 
   // Snapshot the synth market's session before tearing it down.
   if(wm_market_session_snapshot(synth_mk, &out->trade) != SUCCESS)
@@ -852,13 +944,32 @@ wm_backtest_run_iteration_with_id(whenmoon_state_t *st,
       "backtest %s/%s: trades=%u wins=%u losses=%u win_rate=%.1f%%"
       " start=%.2f end=%.2f profit=%+.2f data_days=%.1f"
       " bars=%u fills=%" PRIu64 " wallclock_ms=%" PRIu64,
-      snap->source_market_id, strat_copy,
+      snap->source_market_id, strat_label,
       ps->n_trades, ps->n_wins, ps->n_losses, win_rate,
       ps->starting_cash, ps->starting_cash + realized_paper,
       realized_paper, (double)snap->bars_loaded_1m / 1440.0,
       bars_replayed, fills_paper, out->wallclock_ms);
 
   return(SUCCESS);
+}
+
+// Thin n==1 wrapper so every existing single-strategy caller (the sweep
+// worker, OOS + walk-forward layers) runs the identical engine path as a
+// linked run and stays directly comparable to one.
+bool
+wm_backtest_run_iteration_with_id(whenmoon_state_t *st,
+    wm_backtest_snapshot_t *snap,
+    const char *strategy_name,
+    const char *synth_id,
+    const wm_backtest_params_t *params,
+    const wm_bt_window_t *windows, uint32_t n_windows,
+    wm_backtest_result_t *out,
+    char *err, size_t err_cap)
+{
+  const char *names[1] = { strategy_name };
+
+  return(wm_backtest_run_iteration_multi(st, snap, names, 1u, synth_id,
+      params, windows, n_windows, out, err, err_cap));
 }
 
 // ----------------------------------------------------------------------- //

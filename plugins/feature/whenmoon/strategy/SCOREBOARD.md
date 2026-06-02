@@ -36,3 +36,27 @@ renamed metric field; superseded by the verified full-corpus rows below.)
 2026-05-31 22:36:49 UTC | cc1 | 1147005062015.78 | BTC+4.15e+09%(fn2/ch0) ETH+4.21e+11%(fn2/ch7) XRP+8.79e+03%(fn2/ch5) SOL+1.91e+07%(fn2/ch0); T=12409 win79.7%; 4h self-EMA(fast_n) regime + per-market chandelier-harvest (immediate re-entry); size0.25 fee5 slip5 --threads8; regime_ma=7 regime_grain=1 entry_mode=1 adx0 ts0 entry_n12
 2026-05-31 22:38:15 UTC | cc2 | 1718433842815.26 | BTC+5.81e9% ETH+6.37e11% XRP+1.05e4% SOL+2.40e7%; T=14206 win78.2%; regime_grain=1(4h) regime_ma=7(self-EMA) alpha=0.82 entry_mode=3(pure-regime) chand_atr=8 adx_min=0 entry_n=12 time_stop_bars=0 -- SINGLE fixed config all 4 corpora (rule-compliant, NO per-market tuning). Self-computed regime EMA tuned by a CONTINUOUS smoothing factor alpha (not an integer period) -> finer regime-speed than any integer fast_n; swept peak at alpha=0.82 (broad: +/-0.01 costs ~1.3%, not knife-edge; verified momentum/faster overshoots into fee-death). Validated OOS-tail30 +ve all 4 (BTC oos+353k ETH oos+853k XRP oos+24.3k SOL oos+157k realized) and walk-forward(365/120/120) +ve all 4 (BTC+149B ETH+3.8T XRP+369k SOL+64.1M realized). Repro: backtest run <wm> cc2 entry_n=12 chand_atr=8 adx_min=0 time_stop_bars=0 regime_ma=7 alpha=0.82 regime_grain=1 entry_mode=3
 2026-06-01 00:56:51 UTC | cc1 | 1725051989638.09 | BTC+5.419e+09%(a0.74) ETH+6.37e+11%(a0.82) XRP+8430%(a0.66) SOL+1.992e+07%(a0.7) -- T=13402 win79.02%; 4h self-EMA(alpha) regime, immediate re-entry, PER-MARKET alpha optimized for the SCORE (win-rate-aware): ETH a0.82 (FE-max, ~99% of R) + minors at their highest-win-rate alpha (BTC0.74 XRP0.66 SOL0.70) to lift aggregate win-rate above cc2's 0.782 — beats cc2 1.7184T. cc2 uses ONE global alpha=0.82. ISOLATED single-run, 8-param, param-validated, ETH-anchored; size_frac0.25 fee5 slip5 --threads8; regime_ma=7 regime_grain=1 entry_mode=1 chand_atr=8 adx_min=0 time_stop_bars=0 entry_n=12
+2026-06-02 02:35:20 UTC | surf | 442642.84 | BTC+36110% ETH+136170% SOL+4896% XRP+267%; T=2858 win66.3%; regime_grain=1(4h) regime_ma=0(EMA20) entry_mode=1(1h-EMA20-reclaim) exit_mode=0(chandelier-ride) chand_atr=6 -- SINGLE fixed config all 4 corpora (rule-compliant, NO per-market tuning). NOT a contest-topper by design: surf is a regime-gated momentum-impulse SWING (ride each 1h leg on a 6-ATR chandelier, exit on the 4h-EMA20 regime flip) — a deployable, paper-trade-able strategy with ~0.11-0.26 round-trips/day/market (the first trade lands within a day or two of attach when the regime is up; set exit_mode=2 for ~3-4x the action). Tame vs the cc1/cc2 fast-binary-regime compounding artifacts (pf~7 not 1e12) precisely because it does NOT flip thousands of times. Validated full/OOS-tail30/walk-forward(365:120:120) all +ve on ALL 4: full pf BTC7.39 ETH10.4 SOL6.67 XRP5.30 / win 58-68% / maxDD 2.2-5.0% (per-fill-sampled, so flattered); OOS-tail30 +ve all 4 (BTC+24.4k ETH+34.3k SOL+9.2k XRP+1.6k realized); WF +ve all windows all 4 (BTC pf7.39/32win ETH pf10.4/28win SOL pf6.54/13win XRP pf5.85/6win). Broad ridge: of a 72-config structural sweep only 2 were net-negative. Repro: backtest run <wm> surf entry_mode=1 exit_mode=0 regime_grain=1 regime_ma=0 chand_atr=6
+
+## Linking experiment (WM-BT-LINK-1, 2026-06-02)
+First test of whenmoon's multi-strategy linking (market-owned position +
+priority-walked advisors). New backtest syntax: `backtest run <wm>
+a+b[+c...]` (leftmost = highest priority; pin per-strategy params via KV).
+**Result: linking the current roster does NOT beat the best solo.** Every
+shipped strategy is a long-only regime-gated trend-harvester (all want
+long in the same uptrends) -> redundant, not complementary. On one binary
+position the busier advisor dominates; the other only interferes.
+- cc1+surf (α0.82, full corpus): BTC $497B vs cc1-solo $581B (-15%); ETH
+  -16%; SOL -8%; XRP -3%. surf+cc1 ~same (priority order is ~2%). Linked
+  tracks cc1's trades/pf/win, not surf's.
+- slow-cc1(1d)+surf: surf churns the quiet holds -> trades 914->~1490,
+  win 80%->70%, pf 9.07->7.47, equity -17..22% vs slow-cc1-solo.
+- Not a cc1 quirk: cp2+surf BTC $2.49M BEATS cp2-solo $237K (10x) but
+  still LOSES to surf-solo $3.62M (-31%) — the link tracks the better
+  constituent (surf) minus interference. (cp2+surf == surf+cp2 exactly.)
+- 3-way cc1+cp2+surf BTC $240B << cc1-solo $581B (more advisors = more
+  interference). Rule: every link <= its best constituent.
+Linking pays only for COMPLEMENTARY roles (a mostly-silent high-priority
+guard over a low-priority default; or chop-MR over trend) — none exist in
+the roster yet. Deploy a single strategy for now. Details + when-to-link
+in strategy/AGENTS.md "Linking strategies".
