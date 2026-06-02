@@ -35,7 +35,6 @@
 #include "market.h"
 #include "market_engine.h"
 #include "whenmoon.h"
-#include "warmup.h"
 
 #include "alloc.h"
 #include "clam.h"
@@ -1054,11 +1053,12 @@ wm_strategy_attach(whenmoon_state_t *st,
     pthread_mutex_unlock(&mk->lock);
   }
 
-  // WM-WARMUP-1: fetch each subscribed grain's declared min_history
-  // directly from the exchange so the strategy's indicators are warm
-  // at cold start. Async + best-effort; a grain whose fetch fails
-  // warms via the live cascade instead.
-  wm_warmup_for_attachment(st, mk, ls);
+  // WM-WARMUP-2: warmup is no longer driven from attach. The market
+  // lifecycle (wm_market_warmup_begin) owns it now — DB-first gap-fill
+  // sized to the deepest attached strategy, replayed via the 1m cascade.
+  // The roster auto-attach at market start and the /whenmoon strategy
+  // attach command handler invoke wm_market_warmup_begin after the
+  // attachment lands, so a runtime attach re-warms to the new depth.
 
   clam(CLAM_INFO, WHENMOON_CTX,
       "strategy attach: %s -> %s (priority=%u)",

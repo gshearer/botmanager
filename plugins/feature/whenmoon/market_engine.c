@@ -870,6 +870,17 @@ wm_market_engine_on_signal_with_mk(whenmoon_market_t *mk, double mark_px,
 
   mode = mk->session.mode;
 
+  // WM-WARMUP-2: act on advice only once the market's indicators are
+  // warm. Advice is already cached above for the audit trail, so a
+  // warming market still records (and logs) what it would have done.
+  // Synthetic backtest markets are forced READY at creation, so this
+  // never gates them.
+  if(mk->warmup_state != WM_WARM_READY)
+  {
+    pthread_mutex_unlock(&mk->lock);
+    return;
+  }
+
   // Manual mode: no auto-action. Strategies still log advice via
   // CLAM (above); the operator drives via WM-MK-4 force-trades.
   if(mode == WM_MARKET_MODE_MANUAL)

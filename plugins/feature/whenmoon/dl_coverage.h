@@ -35,6 +35,18 @@ typedef struct
   char     last_ts[WM_COV_TS_SZ];
 } wm_coverage_t;
 
+// Format epoch-milliseconds as a Postgres canonical UTC TIMESTAMPTZ
+// string ("YYYY-MM-DD HH:MM:SS+00") into `out` (>= WM_COV_TS_SZ). Used
+// to build the [now-lookback, now] range passed to wm_gap_find_row_gaps
+// and the oldest/newest_ts args of wm_dl_job_enqueue.
+void wm_pg_ts_from_ms(int64_t ms, char *out, size_t cap);
+
+// Newest candle timestamp (epoch ms) in wm_candles_<market_id>, or 0 if
+// the table is empty/absent. Warmup convergence judges the DB tail
+// current when (now - this) < tolerance — old internal holes are
+// tolerated; only recency matters for a warm replay.
+int64_t wm_candle_newest_ms(int32_t market_id);
+
 // Merge an interval into the coverage store. Returns SUCCESS on a
 // committed write, FAIL on SQL error. Overlapping and touching rows
 // are unioned under one transaction (see wm_cov_merge_tx for the

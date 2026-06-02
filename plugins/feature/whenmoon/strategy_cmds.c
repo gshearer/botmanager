@@ -5,11 +5,14 @@
 #define WHENMOON_INTERNAL
 #include "whenmoon.h"
 #include "strategy.h"
+#include "market.h"
+#include "warmup.h"
 #include "dl_commands.h"
 
 #include "cmd.h"
 #include "colors.h"
 #include "common.h"
+#include "kv.h"
 #include "userns.h"
 
 #include <errno.h>
@@ -23,6 +26,97 @@
 // Far above any realistic per-strategy attachment count; if hit, the
 // view truncates with a continuation note.
 #define WM_STRATEGY_SHOW_MAX_ATTACH  64
+
+// ----------------------------------------------------------------------- //
+// WM-WARMUP-2: per-market strategy roster KV sync                          //
+//                                                                         //
+// The roster `plugin.whenmoon.market.<id>.strategies` (CSV) is the source //
+// of truth for which advisors a market auto-attaches + warms at start.    //
+// Runtime attach/detach keep it in sync so the set survives restart, and  //
+// a runtime attach re-runs the warmup lifecycle to the new depth.         //
+// ----------------------------------------------------------------------- //
+
+static void
+wm_roster_kv_key(const char *market_id_str, char *out, size_t cap)
+{
+  snprintf(out, cap, "plugin.whenmoon.market.%s.strategies", market_id_str);
+}
+
+static bool
+wm_roster_token_present(const char *csv, const char *name)
+{
+  char  src[512];
+  char *save = NULL;
+  char *tok;
+
+  snprintf(src, sizeof(src), "%s", csv);
+
+  for(tok = strtok_r(src, ", \t", &save); tok != NULL;
+      tok = strtok_r(NULL, ", \t", &save))
+    if(strcmp(tok, name) == 0)
+      return(true);
+
+  return(false);
+}
+
+static void
+wm_roster_add(const char *market_id_str, const char *name)
+{
+  char        key[160];
+  const char *cur;
+  char        buf[512];
+
+  wm_roster_kv_key(market_id_str, key, sizeof(key));
+  cur = kv_get_str(key);
+
+  if(cur != NULL && wm_roster_token_present(cur, name))
+    return;
+
+  if(cur == NULL || cur[0] == '\0')
+    snprintf(buf, sizeof(buf), "%s", name);
+
+  else
+    snprintf(buf, sizeof(buf), "%s,%s", cur, name);
+
+  (void)kv_set_str(key, buf);
+}
+
+static void
+wm_roster_remove(const char *market_id_str, const char *name)
+{
+  char    key[160];
+  char    src[512];
+  char    out[512];
+  char   *save = NULL;
+  char   *tok;
+  size_t  off  = 0;
+
+  {
+    const char *cur;
+
+    wm_roster_kv_key(market_id_str, key, sizeof(key));
+    cur = kv_get_str(key);
+
+    if(cur == NULL || cur[0] == '\0')
+      return;
+
+    snprintf(src, sizeof(src), "%s", cur);
+  }
+
+  out[0] = '\0';
+
+  for(tok = strtok_r(src, ", \t", &save); tok != NULL;
+      tok = strtok_r(NULL, ", \t", &save))
+  {
+    if(strcmp(tok, name) == 0)
+      continue;
+
+    off += (size_t)snprintf(out + off, sizeof(out) - off, "%s%s",
+        off > 0 ? "," : "", tok);
+  }
+
+  (void)kv_set_str(key, out);
+}
 
 // ----------------------------------------------------------------------- //
 // /whenmoon strategy attach <market_id> <strategy_name>                   //
@@ -107,10 +201,23 @@ wm_strategy_cmd_attach(const cmd_ctx_t *ctx)
   switch(r)
   {
     case WM_ATTACH_OK:
+    {
+      whenmoon_market_t *mk;
+
+      // Persist into the roster + re-run the warmup lifecycle so the
+      // market warms to this strategy's (possibly deeper) min_history.
+      wm_roster_add(id_tok, name_tok);
+
+      mk = wm_market_lookup_by_id(st, id_tok);
+
+      if(mk != NULL)
+        wm_market_warmup_begin(st, mk);
+
       snprintf(reply, sizeof(reply), "attached %s -> %s (priority=%u)",
           name_tok, id_tok, chosen_priority);
       cmd_reply(ctx, reply);
       break;
+    }
 
     case WM_ATTACH_NO_STRATEGY:
     case WM_ATTACH_NO_MARKET:
@@ -166,6 +273,9 @@ wm_strategy_cmd_detach(const cmd_ctx_t *ctx)
   switch(r)
   {
     case WM_DETACH_OK:
+      // Drop from the roster so it doesn't re-attach on restart. No
+      // re-warm needed — fewer advisors can only lower the demand.
+      wm_roster_remove(id_tok, name_tok);
       snprintf(reply, sizeof(reply), "detached %s -> %s",
           name_tok, id_tok);
       cmd_reply(ctx, reply);

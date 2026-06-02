@@ -17,10 +17,11 @@
 #include "market_engine.h"
 #include "market_persist.h"
 #include "strategy.h"
+#include "warmup.h"
 #include "dl_schema.h"
 
 #include "db.h"
-#include "task.h"
+#include "kv.h"
 #include "exchange_api.h"
 
 #include <ctype.h>
@@ -341,7 +342,10 @@ wm_market_session_init(wm_market_session_t *s)
 
   memset(s, 0, sizeof(*s));
 
-  s->mode          = WM_MARKET_MODE_PAPER;
+  // WM-WARMUP-2: new markets default to MANUAL (disarmed). `manual` is
+  // the safe state — strategies see ticks and log advice but the engine
+  // never auto-acts; the operator arms by switching to paper/real.
+  s->mode          = WM_MARKET_MODE_MANUAL;
   s->position.side = WM_MARKET_POS_FLAT;
 
   for(i = 0; i < WM_MARKET_MODE_COUNT; i++)
@@ -398,8 +402,9 @@ wm_market_session_snapshot(whenmoon_market_t *mk,
   snprintf(out->product_id, sizeof(out->product_id), "%s",
       mk->product_id);
 
-  out->mode     = s->mode;
-  out->position = s->position;
+  out->mode         = s->mode;
+  out->warmup_state = mk->warmup_state;
+  out->position     = s->position;
 
   for(m = 0; m < WM_MARKET_MODE_COUNT; m++)
     out->stats[m] = s->stats[m];
@@ -973,29 +978,54 @@ wm_market_add(whenmoon_state_t *st,
   wm_market_resub_ws(st);
   wm_market_kick_backfill(st, exchange, product_id);
 
-  // Schedule the DB warm-up: replay 1m bars from
-  // wm_candles_<id> chronologically into the aggregator. The
-  // deferred task re-resolves the market by market_id at run-time so
-  // a stop-before-warm-up bails cleanly. 50 ms after the live-ring
-  // backfill kick gives REST a head start without blocking the verb.
+  // WM-WARMUP-2: auto-attach the declared strategy roster, then begin
+  // the warmup lifecycle. The roster KV is the source of truth for which
+  // advisors participate; warmup depth derives from their declared
+  // min_history. Zero strategies = feed-only (manual hand-trade) and
+  // wm_market_warmup_begin promotes straight to READY.
   {
-    wm_warmup_ctx_t *wctx = mem_alloc("whenmoon", "warmup_ctx",
-        sizeof(*wctx));
+    char        roster_key[160];
+    const char *roster;
 
-    if(wctx != NULL)
+    snprintf(roster_key, sizeof(roster_key),
+        "plugin.whenmoon.market.%s.strategies", mk->market_id_str);
+
+    // Register before reading: kv_set (used by the attach/detach roster
+    // sync) rejects unregistered keys, and kv_register adopts any
+    // DB-persisted value so a restored roster is visible here. Idempotent
+    // across restarts.
+    (void)kv_register(roster_key, KV_STR, "", NULL, NULL,
+        "CSV strategy roster auto-attached + warmed on market start");
+
+    roster = kv_get_str(roster_key);
+
+    if(roster != NULL && roster[0] != '\0')
     {
-      wctx->st        = st;
-      wctx->market_id = market_id;
+      char  buf[512];
+      char *save = NULL;
+      char *tok;
 
-      if(task_add_deferred("wm_warmup", TASK_ANY, 100, 50,
-             wm_aggregator_load_history_task, wctx) == TASK_HANDLE_NONE)
+      // Copy out of the KV-owned pointer before the attach loop, which
+      // issues its own KV writes that could invalidate `roster`.
+      snprintf(buf, sizeof(buf), "%s", roster);
+
+      for(tok = strtok_r(buf, ", \t", &save); tok != NULL;
+          tok = strtok_r(NULL, ", \t", &save))
       {
-        clam(CLAM_INFO, WHENMOON_CTX,
-            "market %s warmup task submit failed", mk->market_id_str);
-        mem_free(wctx);
+        char rerr[128];
+
+        rerr[0] = '\0';
+
+        if(wm_strategy_attach(st, mk->market_id_str, tok, 0, NULL,
+               rerr, sizeof(rerr)) != WM_ATTACH_OK)
+          clam(CLAM_INFO, WHENMOON_CTX,
+              "market %s: roster attach '%s' failed: %s",
+              mk->market_id_str, tok, rerr[0] != '\0' ? rerr : "?");
       }
     }
   }
+
+  wm_market_warmup_begin(st, mk);
 
   clam(CLAM_INFO, WHENMOON_CTX,
       "market %s started (market_id=%" PRId32 "%s)",
@@ -1211,6 +1241,11 @@ wm_market_create_synthetic(const char *market_id_str,
 
   wm_market_session_init(&mk->session);
   mk->session.mode = WM_MARKET_MODE_PAPER;
+
+  // WM-WARMUP-2: synthetic markets carry a full pre-loaded ring (the
+  // backtest snapshot), so they are warm by construction. Force READY so
+  // the engine's readiness gate never suppresses backtest fills.
+  mk->warmup_state = WM_WARM_READY;
 
   *out_mk = mk;
   return(SUCCESS);

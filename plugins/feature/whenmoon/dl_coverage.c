@@ -14,8 +14,66 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
 
 #define WM_COV_LOCK_TAG  "wm_cov:"
+
+void
+wm_pg_ts_from_ms(int64_t ms, char *out, size_t cap)
+{
+  time_t    secs;
+  struct tm tmv;
+
+  if(out == NULL || cap == 0)
+    return;
+
+  secs = (time_t)(ms / 1000);
+
+  if(gmtime_r(&secs, &tmv) == NULL)
+  {
+    snprintf(out, cap, "1970-01-01 00:00:00+00");
+    return;
+  }
+
+  if(strftime(out, cap, "%Y-%m-%d %H:%M:%S+00", &tmv) == 0)
+    snprintf(out, cap, "1970-01-01 00:00:00+00");
+}
+
+int64_t
+wm_candle_newest_ms(int32_t market_id)
+{
+  char         table[WM_DL_TABLE_SZ];
+  char         sql[256];
+  db_result_t *res;
+  int64_t      out = 0;
+
+  if(wm_candle_table_name(market_id, table, sizeof(table)) != SUCCESS)
+    return(0);
+
+  (void)wm_candle_table_ensure(market_id);
+
+  snprintf(sql, sizeof(sql),
+      "SELECT COALESCE(EXTRACT(EPOCH FROM MAX(ts))::BIGINT, 0) * 1000"
+      "  FROM %s",
+      table);
+
+  res = db_result_alloc();
+
+  if(res == NULL)
+    return(0);
+
+  if(db_query(sql, res) == SUCCESS && res->ok && res->rows > 0)
+  {
+    const char *s = db_result_get(res, 0, 0);
+
+    if(s != NULL)
+      out = (int64_t)strtoll(s, NULL, 10);
+  }
+
+  db_result_free(res);
+
+  return(out);
+}
 
 // Touching predicate widening for coverage merges. Persistence is
 // 1-minute-only so the gap is fixed at two 1m buckets — adjacent

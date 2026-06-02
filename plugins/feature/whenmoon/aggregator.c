@@ -541,10 +541,16 @@ wm_warmup_find_market(whenmoon_state_t *st, int32_t market_id)
   return(NULL);
 }
 
+// Synchronous DB 1m replay. `limit_override` caps the replay at the
+// newest N 1m bars (0 = the full 1m ring capacity). Cascades 1m→…→1d via
+// wm_aggregator_replay_bar so every grain warms from one source. MUST be
+// called off the cmd thread (issues a DB query + a potentially long
+// replay under mk->lock); WM-WARMUP-2 calls it from the warmup task and
+// from the convergence re-check (both task threads).
 void
-wm_aggregator_load_history_task(task_t *t)
+wm_aggregator_load_history(whenmoon_state_t *st, int32_t market_id,
+    uint32_t limit_override)
 {
-  wm_warmup_ctx_t   *wctx;
   whenmoon_market_t *mk;
   db_result_t       *res = NULL;
   char               table[WM_DL_TABLE_SZ];
@@ -553,73 +559,62 @@ wm_aggregator_load_history_task(task_t *t)
   uint32_t           limit;
   uint32_t           replayed = 0;
   uint32_t           i;
+  uint32_t           g;
   int                n;
+  bool               saved_dispatch;
 
-  if(t == NULL)
-    return;
-
-  wctx = t->data;
-
-  if(wctx == NULL)
-  {
-    t->state = TASK_ENDED;
-    return;
-  }
-
-  mk = wm_warmup_find_market(wctx->st, wctx->market_id);
+  mk = wm_warmup_find_market(st, market_id);
 
   if(mk == NULL || mk->aggregator == NULL)
   {
     clam(CLAM_INFO, WHENMOON_CTX,
         "warmup market_id=%" PRId32 ": market gone before run, skipping",
-        wctx->market_id);
-    mem_free(wctx);
-    t->state = TASK_ENDED;
+        market_id);
     return;
   }
 
-  // Snapshot capacity before issuing the query. The 1m ring sets the
-  // ceiling on what's useful to load — anything older would just shift
-  // off the front of the ring on push.
+  // The 1m ring sets the ceiling on what's useful to load — anything
+  // older would just shift off the front on push. A caller-supplied
+  // override (the deepest strategy's lookback in bars) narrows it
+  // further so we don't replay 200 days to warm a 30-day strategy.
   cap   = mk->grain_cap[WM_GRAN_1M];
   limit = cap > 0 ? cap : 1;
 
-  if(wm_candle_table_name(wctx->market_id, table, sizeof(table))
-         != SUCCESS)
-  {
-    mem_free(wctx);
-    t->state = TASK_ENDED;
+  if(limit_override > 0 && limit_override < limit)
+    limit = limit_override;
+
+  if(wm_candle_table_name(market_id, table, sizeof(table)) != SUCCESS)
     return;
-  }
 
   // CREATE IF NOT EXISTS so a market that has never been downloaded
   // queries an empty table cleanly rather than erroring on a missing
   // relation.
-  (void)wm_candle_table_ensure(wctx->market_id);
+  (void)wm_candle_table_ensure(market_id);
 
+  // Warm-up must prime the indicators on the MOST RECENT bars so the
+  // live grains are contiguous with incoming ticks. Take the newest
+  // `limit` rows (ORDER BY ts DESC LIMIT n) in a subquery, then re-sort
+  // ascending so the replay loop below pushes them chronologically
+  // (oldest -> newest). A bare "ORDER BY ts ASC LIMIT n" would load the
+  // OLDEST n bars — for a full-history table that is years-stale data
+  // and seeds the indicators on prices unrelated to the live tape.
   n = snprintf(sql, sizeof(sql),
-      "SELECT (EXTRACT(EPOCH FROM ts)::BIGINT * 1000) AS ts_ms,"
-      "       low, high, open, close, volume"
-      "  FROM %s"
-      " ORDER BY ts ASC"
-      " LIMIT %u",
+      "SELECT ts_ms, low, high, open, close, volume FROM ("
+      "  SELECT (EXTRACT(EPOCH FROM ts)::BIGINT * 1000) AS ts_ms,"
+      "         low, high, open, close, volume"
+      "    FROM %s"
+      "   ORDER BY ts DESC"
+      "   LIMIT %u"
+      ") sub ORDER BY ts_ms ASC",
       table, limit);
 
   if(n < 0 || (size_t)n >= sizeof(sql))
-  {
-    mem_free(wctx);
-    t->state = TASK_ENDED;
     return;
-  }
 
   res = db_result_alloc();
 
   if(res == NULL)
-  {
-    mem_free(wctx);
-    t->state = TASK_ENDED;
     return;
-  }
 
   if(db_query(sql, res) != SUCCESS || !res->ok)
   {
@@ -628,8 +623,6 @@ wm_aggregator_load_history_task(task_t *t)
         mk->market_id_str,
         res->error[0] != '\0' ? res->error : "(no driver error)");
     db_result_free(res);
-    mem_free(wctx);
-    t->state = TASK_ENDED;
     return;
   }
 
@@ -639,16 +632,32 @@ wm_aggregator_load_history_task(task_t *t)
         "warmup %s: no rows in %s — bot starts cold",
         mk->market_id_str, table);
     db_result_free(res);
-    mem_free(wctx);
-    t->state = TASK_ENDED;
     return;
   }
 
-  // Re-resolve under the lock — the live set could have been mutated
-  // (`/bot ... market stop`) between the find above and acquiring the
-  // lock. Holding mk->lock across the replay is the contract for
+  // Holding mk->lock across the replay is the contract for
   // wm_aggregator_replay_bar; live trade ingest queues briefly.
   pthread_mutex_lock(&mk->lock);
+
+  // Suppress strategy fan-out across the replay. The grains (and their
+  // indicator blocks) still warm via push_bar; we just must not fire
+  // on_bar for thousands of historical closes — that would replay stale
+  // advice into every attached strategy. (Roster strategies are already
+  // attached by the time WM-WARMUP-2 calls this from the convergence
+  // re-check.) Restored after the loop.
+  saved_dispatch = mk->aggregator->dispatch_strategies;
+  mk->aggregator->dispatch_strategies = false;
+
+  // Reset every grain ring + cursor so the replay fully repopulates from
+  // the DB. The live WS may have already advanced the 1m cursor past the
+  // DB's newest bar (replay_bar dedups on last_close_ms) — without this
+  // reset the replay would be a no-op for an already-live market. Live
+  // bars are re-established going forward once warmup hands back.
+  for(g = 0; g < WM_GRAN_MAX; g++)
+  {
+    mk->grain_n[g]                   = 0;
+    mk->aggregator->last_close_ms[g] = 0;
+  }
 
   for(i = 0; i < res->rows; i++)
   {
@@ -679,13 +688,39 @@ wm_aggregator_load_history_task(task_t *t)
     replayed++;
   }
 
+  mk->aggregator->dispatch_strategies = saved_dispatch;
+
   pthread_mutex_unlock(&mk->lock);
 
   clam(CLAM_INFO, WHENMOON_CTX,
-      "warmup %s: replayed %u 1m bars from %s (cap=%u)",
-      mk->market_id_str, replayed, table, cap);
+      "warmup %s: replayed %u 1m bars from %s (limit=%u)",
+      mk->market_id_str, replayed, table, limit);
 
   db_result_free(res);
+}
+
+// Thin task wrapper: replays then frees its heap ctx. Used for the
+// feed-only / no-strategy warm (full ring); the strategy path calls
+// wm_aggregator_load_history directly from the convergence re-check.
+void
+wm_aggregator_load_history_task(task_t *t)
+{
+  wm_warmup_ctx_t *wctx;
+
+  if(t == NULL)
+    return;
+
+  wctx = t->data;
+
+  if(wctx == NULL)
+  {
+    t->state = TASK_ENDED;
+    return;
+  }
+
+  wm_aggregator_load_history(wctx->st, wctx->market_id,
+      wctx->limit_override);
+
   mem_free(wctx);
   t->state = TASK_ENDED;
 }

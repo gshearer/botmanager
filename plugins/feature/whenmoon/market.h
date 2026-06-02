@@ -53,6 +53,21 @@ typedef enum
 
 #define WM_MARKET_MODE_COUNT     3   // for stats[] / fills[] sizing only
 
+// WM-WARMUP-2: per-market warmup lifecycle. Transient — recomputed on
+// every (re)start, never persisted. The trade engine acts on strategy
+// advice only in WM_WARM_READY (see wm_market_engine_on_signal_with_mk);
+// synthetic backtest markets are forced READY at creation since they
+// carry a full pre-loaded ring.
+typedef enum
+{
+  WM_WARM_COLD = 0,   // not started
+  WM_WARM_WARMING,    // bulk DB gap-fill in flight
+  WM_WARM_FINAL,      // backward gap closed; closing the tail to now
+  WM_WARM_READY,      // warm; cleared to act (subject to mode + roster)
+} wm_warmup_state_t;
+
+const char *wm_warmup_state_name(wm_warmup_state_t s);
+
 typedef enum
 {
   WM_MARKET_POS_FLAT = 0,
@@ -294,6 +309,16 @@ typedef struct whenmoon_market
   // wm_market_session_init. Production callers do not yet route here;
   // WM-MK-3 swaps strategy + live-fill consumers onto it.
   wm_market_session_t   session;
+
+  // WM-WARMUP-2: warmup lifecycle (transient; not persisted). Zeroed by
+  // the add/restore memset, so a fresh slot is COLD with warmup_gen 0.
+  // The re-check / tail-fill timers are self-rescheduling deferred tasks
+  // guarded by `warmup_gen`: wm_market_warmup_begin bumps it, so any
+  // in-flight timer from a prior generation (or a stopped market) sees
+  // the mismatch on its next tick, frees its ctx, and stops — no
+  // task_cancel needed (which would leave the heap ctx leaked).
+  wm_warmup_state_t     warmup_state;
+  uint32_t              warmup_gen;
 } whenmoon_market_t;
 
 struct whenmoon_markets
@@ -449,6 +474,7 @@ typedef struct
   char                  product_id[WM_PRODUCT_ID_SZ];
 
   wm_market_mode_t      mode;
+  wm_warmup_state_t     warmup_state;
   wm_market_position_t  position;
   wm_market_stats_t     stats[WM_MARKET_MODE_COUNT];
 

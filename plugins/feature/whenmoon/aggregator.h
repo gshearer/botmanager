@@ -129,7 +129,13 @@ typedef struct
 {
   struct whenmoon_state *st;
   int32_t                market_id;
+  uint32_t               limit_override;   // 0 = full 1m ring capacity
 } wm_warmup_ctx_t;
+
+// Synchronous DB 1m replay (newest `limit_override` bars, or the full 1m
+// ring when 0). Cascades 1m→…→1d. Must run off the cmd thread.
+void wm_aggregator_load_history(struct whenmoon_state *st,
+    int32_t market_id, uint32_t limit_override);
 
 void wm_aggregator_load_history_task(struct task *t);
 

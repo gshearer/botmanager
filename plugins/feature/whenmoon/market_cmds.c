@@ -754,15 +754,17 @@ wm_obs_render_card(const cmd_ctx_t *ctx,
 
   if(snap->position.side == WM_MARKET_POS_LONG)
     snprintf(line, sizeof(line),
-        CLR_BOLD "%s" CLR_RESET "  mode=%s  position: long"
+        CLR_BOLD "%s" CLR_RESET "  mode=%s  warmup=%s  position: long"
         " qty=%.8g entry=%.4f opened_at_ms=%" PRId64,
         snap->market_id_str, wm_market_mode_name(snap->mode),
+        wm_warmup_state_name(snap->warmup_state),
         snap->position.qty, snap->position.avg_entry_px,
         snap->position.opened_at_ms);
   else
     snprintf(line, sizeof(line),
-        CLR_BOLD "%s" CLR_RESET "  mode=%s  position: flat",
-        snap->market_id_str, wm_market_mode_name(snap->mode));
+        CLR_BOLD "%s" CLR_RESET "  mode=%s  warmup=%s  position: flat",
+        snap->market_id_str, wm_market_mode_name(snap->mode),
+        wm_warmup_state_name(snap->warmup_state));
   cmd_reply(ctx, line);
 
   snprintf(line, sizeof(line),
