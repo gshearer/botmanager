@@ -45,7 +45,7 @@ static const char *const WM_BT_REPORT_CSS_PARTS[] = {
     "border-bottom:1px solid var(--border);padding:18px 28px}\n"
     "header h1{margin:0 0 2px;font-size:19px;font-weight:650}\n"
     "header .sub{color:var(--muted);font-size:13px}\n"
-    ".wrap{max-width:1180px;margin:0 auto;padding:24px 28px 64px}\n"
+    ".wrap{max-width:1480px;margin:0 auto;padding:24px 28px 64px}\n"
     ".cards{display:grid;grid-template-columns:repeat(auto-fit,"
     "minmax(150px,1fr));gap:14px;margin:22px 0}\n"
     ".card{background:var(--surface);border:1px solid var(--border);"
