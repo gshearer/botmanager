@@ -460,16 +460,26 @@ cb_sign_jwt_inner(const char *uri_claim, char *out, size_t cap)
 }
 
 // Build a fresh CDP JWT for a REST request. `method` is uppercase
-// ("GET" / "POST" / "DELETE"); `path` is the absolute path including
-// any query string. The "uri" claim binds the JWT to that exact
+// ("GET" / "POST" / "DELETE"); `path` is the absolute request path and
+// MAY carry a query string. The "uri" claim binds the JWT to the
 // request, so callers must mint per-request.
+//
+// CDP computes the claim from METHOD + host + path with the query string
+// EXCLUDED. Including "?..." in the claim makes Coinbase reject the
+// request 401 — which is why query-less endpoints (/accounts) signed fine
+// while every GET with query params (/orders/historical/batch?...,
+// /orders/historical/fills?...) failed. Strip the query here so the URL
+// curl sends keeps it but the signed claim does not.
 bool
 cb_sign_jwt(const char *method, const char *path, char *out, size_t cap)
 {
-  char rest_url[CB_URL_SZ];
-  char host[256];
-  char uri[1024];
-  int  n;
+  char        rest_url[CB_URL_SZ];
+  char        host[256];
+  char        path_noquery[CB_URL_SZ];
+  char        uri[1024];
+  const char *q;
+  size_t      plen;
+  int         n;
 
   if(method == NULL || path == NULL)
     return(FAIL);
@@ -480,7 +490,17 @@ cb_sign_jwt(const char *method, const char *path, char *out, size_t cap)
   if(cb_url_host(rest_url, host, sizeof(host)) != SUCCESS)
     return(FAIL);
 
-  n = snprintf(uri, sizeof(uri), "%s %s%s", method, host, path);
+  // Copy the path up to (but not including) any '?'.
+  q    = strchr(path, '?');
+  plen = (q != NULL) ? (size_t)(q - path) : strlen(path);
+
+  if(plen >= sizeof(path_noquery))
+    plen = sizeof(path_noquery) - 1;
+
+  memcpy(path_noquery, path, plen);
+  path_noquery[plen] = '\0';
+
+  n = snprintf(uri, sizeof(uri), "%s %s%s", method, host, path_noquery);
 
   if(n < 0 || (size_t)n >= sizeof(uri))
     return(FAIL);
