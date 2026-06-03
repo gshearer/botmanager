@@ -61,4 +61,9 @@ bool wm_sync_fetch_wait(wm_sync_fetch_t *w,
 // form "3e-08". Up to 10 fractional digits. Returns `buf`.
 const char *wm_fmt_amount(double v, char *buf, size_t cap);
 
+// Format an elapsed duration (the "vintage" of a cached snapshot) as a
+// compact human age: "3s", "45s", "2m 14s", "1h 03m", "2d 4h". Negative
+// inputs clamp to 0. Returns `buf`.
+const char *wm_fmt_age(int64_t age_ms, char *buf, size_t cap);
+
 #endif

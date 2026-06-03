@@ -309,6 +309,43 @@ uint32_t wm_strategy_snapshot_attachments(struct whenmoon_state *st,
     const char *strategy_name,
     wm_attach_snapshot_t *out, uint32_t cap);
 
+// Market-centric snapshot: every strategy attached to ONE market, in
+// poll order, with its live counters and its *resolved* per-market param
+// values. Rendered by /show whenmoon market <id> — the companion to the
+// strategy-centric /show whenmoon strategy <name>. `source` records which
+// resolver tier supplied each value: 'm' per-market override, 'g' global
+// default, 'd' compiled-in schema default.
+#define WM_MARKET_SNAP_MAX_PARAMS  16
+
+typedef struct
+{
+  char  name[WM_STRATEGY_NAME_SZ];
+  char  value[48];
+  char  source;
+} wm_market_strat_param_t;
+
+typedef struct
+{
+  char                     strategy_name[WM_STRATEGY_NAME_SZ];
+  uint32_t                 priority;
+  uint64_t                 bars_seen;
+  uint64_t                 signals_emitted;
+  int64_t                  last_bar_ts_ms;
+  wm_strategy_signal_t     last_signal;
+  bool                     has_last_signal;
+  wm_market_strat_param_t  params[WM_MARKET_SNAP_MAX_PARAMS];
+  uint32_t                 n_params;
+} wm_market_attach_snapshot_t;
+
+// Copy up to `cap` attached-strategy snapshots for the named market
+// under the registry lock, sorted ascending by advisor priority (the
+// live poll order). Returns the number written; 0 if no strategy is
+// attached to the market. Each strategy's params are resolved against
+// the live KV at snapshot time via the two-tier resolver.
+uint32_t wm_strategy_snapshot_market(struct whenmoon_state *st,
+    const char *market_id_str,
+    wm_market_attach_snapshot_t *out, uint32_t cap);
+
 #endif // WHENMOON_INTERNAL
 
 #endif // BM_WHENMOON_STRATEGY_H

@@ -475,6 +475,19 @@ wm_strategy_render_params(const cmd_ctx_t *ctx,
     }
 
     cmd_reply(ctx, line);
+
+    // The per-param help string carries the semantics an operator needs
+    // to interpret the value (e.g. what each ordinal of an enum-style
+    // uint means). It lives in the ABI but was historically suppressed;
+    // render it on its own indented line so the schema is self-describing.
+    if(p->help != NULL && p->help[0] != '\0')
+    {
+      char hline[320];
+
+      snprintf(hline, sizeof(hline), "      " CLR_GRAY "%s" CLR_RESET,
+          p->help);
+      cmd_reply(ctx, hline);
+    }
   }
 }
 

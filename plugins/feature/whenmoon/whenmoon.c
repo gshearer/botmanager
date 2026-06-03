@@ -3,6 +3,7 @@
 
 #define WHENMOON_INTERNAL
 #include "whenmoon.h"
+#include "account.h"
 #include "backtest.h"
 #include "market.h"
 #include "market_engine.h"
@@ -31,6 +32,7 @@
 #include <pthread.h>
 #include <stdio.h>
 #include <string.h>
+#include <strings.h>
 #include <time.h>
 
 // ------------------------------------------------------------------ //
@@ -130,22 +132,27 @@ whenmoon_show_markets_cmd(const cmd_ctx_t *ctx)
 }
 
 // ------------------------------------------------------------------ //
-// /show whenmoon balances [exchange]                                  //
+// /show whenmoon balances [exchange] [fresh]                          //
 // ------------------------------------------------------------------ //
 //
-// On-demand authenticated /accounts fetch. With no argument every
-// registered exchange is queried; with <exchange> only that one.
+// Cache-first authenticated balance view. By default this reads the
+// per-exchange snapshot cache (account.c) and renders instantly with a
+// vintage line — no network wait. A scheduled poll keeps the cache warm
+// for real-mode exchanges and real fills fast-forward it; see account.h.
 //
-// Why this blocks: the control socket (core/botmanctl.c) routes command
-// replies through a single global reply target that bctl_dispatch clears
-// the instant the synchronous dispatch returns — so a reply emitted from
-// an async curl callback is silently dropped. Balances therefore waits
-// on the dispatch thread until the exchange call completes and formats
-// the reply inline, via the wm_sync_fetch bridge (wm_exch_query.h).
+// Two paths still do a synchronous blocking /accounts fetch:
+//   - `fresh` keyword: the operator forces a live refresh.
+//   - cache miss: no snapshot yet (e.g. an all-paper deploy the poll
+//     gate never warms). The fallback fetch populates the cache so the
+//     next call is instant — this is what fixes the WM-BAL-ONDEMAND-1
+//     paper-mode "empty cache shows nothing" regression.
 //
-// This is an explicit operator action, so the authenticated call is
-// fine for any mode — unlike the background account poll (now removed),
-// which was needless private-endpoint traffic for paper/manual markets.
+// Why the fetch blocks: the control socket (core/botmanctl.c) routes
+// command replies through a single global reply target that bctl_dispatch
+// clears the instant synchronous dispatch returns — a reply emitted from
+// an async curl callback is silently dropped. The fetch therefore waits
+// on the dispatch thread (wm_sync_fetch bridge, wm_exch_query.h) and
+// formats inline. An explicit operator fetch is fine for any mode.
 
 #define WM_BAL_EXCH_CAP  8
 
@@ -169,17 +176,71 @@ wm_bal_on_accounts(const exchange_accounts_result_t *res, void *user)
   }
 }
 
-// Render one exchange's balances (or the reason none are shown). Doubles
-// as a credential check: a clean header means the key authenticated.
+// Render one exchange's balance rows under an "ok" header carrying the
+// snapshot vintage. `from_cache` distinguishes a cached read (shows the
+// age) from a just-completed live fetch (shows "just fetched").
 static void
-wm_bal_render(const cmd_ctx_t *ctx, const char *exchange_name)
+wm_bal_render_rows(const cmd_ctx_t *ctx, const char *exchange_name,
+    const exchange_account_t *rows, uint32_t count, int64_t age_ms,
+    bool from_cache)
+{
+  char     header[256];
+  char     line[256];
+  char     agebuf[32];
+  char     tag[64];
+  uint32_t i;
+  uint32_t shown = 0;
+
+  if(from_cache)
+    snprintf(tag, sizeof(tag), CLR_GRAY "updated %s ago" CLR_RESET,
+        wm_fmt_age(age_ms, agebuf, sizeof(agebuf)));
+  else
+    snprintf(tag, sizeof(tag), CLR_GRAY "just fetched (live)" CLR_RESET);
+
+  snprintf(header, sizeof(header),
+      CLR_BOLD "  %s" CLR_RESET "  " CLR_GREEN "ok" CLR_RESET
+      " (%u currenc%s)  %s",
+      exchange_name, count, count == 1 ? "y" : "ies", tag);
+  cmd_reply(ctx, header);
+
+  for(i = 0; i < count; i++)
+  {
+    char   ccy[EXCHANGE_CURRENCY_SZ];
+    char   bbuf[40], hbuf[40], abuf[40];
+    size_t clen;
+
+    // Hide fully-zero rows so funded balances stand out.
+    if(rows[i].balance == 0.0 && rows[i].hold == 0.0)
+      continue;
+
+    clen = strnlen(rows[i].currency, sizeof(ccy) - 1);
+    memcpy(ccy, rows[i].currency, clen);
+    ccy[clen] = '\0';
+
+    snprintf(line, sizeof(line),
+        "    %-8s  balance=%-18s  hold=%-18s  available=%-18s",
+        ccy,
+        wm_fmt_amount(rows[i].balance,   bbuf, sizeof(bbuf)),
+        wm_fmt_amount(rows[i].hold,      hbuf, sizeof(hbuf)),
+        wm_fmt_amount(rows[i].available, abuf, sizeof(abuf)));
+    cmd_reply(ctx, line);
+    shown++;
+  }
+
+  if(shown == 0)
+    cmd_reply(ctx, "    (all balances zero)");
+}
+
+// Render one exchange's balances. Cache-first unless `force` (operator
+// `fresh`); a cache miss falls back to a blocking live fetch that then
+// populates the cache. Doubles as a credential check: a clean header
+// means the key authenticated.
+static void
+wm_bal_render(const cmd_ctx_t *ctx, const char *exchange_name, bool force)
 {
   exchange_capabilities_t    caps;
   exchange_accounts_result_t res;
   char                       header[256];
-  char                       line[256];
-  uint32_t                   i;
-  uint32_t                   shown = 0;
 
   if(exchange_get_capabilities(exchange_name, &caps) != SUCCESS)
   {
@@ -197,6 +258,23 @@ wm_bal_render(const cmd_ctx_t *ctx, const char *exchange_name)
         exchange_name);
     cmd_reply(ctx, header);
     return;
+  }
+
+  // Cache-first: render the warm snapshot instantly, no network wait.
+  if(!force)
+  {
+    exchange_account_t cached[WM_ACCOUNT_ROW_CAP];
+    uint32_t           n_cached = 0;
+    int64_t            age_ms   = 0;
+
+    if(wm_account_get_snapshot(exchange_name, cached, WM_ACCOUNT_ROW_CAP,
+           &n_cached, &age_ms))
+    {
+      wm_bal_render_rows(ctx, exchange_name, cached, n_cached, age_ms, true);
+      return;
+    }
+    // Cache miss (e.g. a paper-only exchange the poll gate never warms):
+    // fall through to a one-shot blocking fetch.
   }
 
   {
@@ -234,57 +312,47 @@ wm_bal_render(const cmd_ctx_t *ctx, const char *exchange_name)
     return;
   }
 
-  snprintf(header, sizeof(header),
-      CLR_BOLD "  %s" CLR_RESET "  " CLR_GREEN "ok" CLR_RESET
-      " (%u currenc%s)",
-      exchange_name, res.count, res.count == 1 ? "y" : "ies");
-  cmd_reply(ctx, header);
+  // Populate the cache so the next read is instant + carries a vintage,
+  // then render this result as freshly fetched.
+  wm_account_store_snapshot(exchange_name, res.rows, res.count);
 
-  for(i = 0; i < res.count; i++)
-  {
-    char   ccy[EXCHANGE_CURRENCY_SZ];
-    char   bbuf[40], hbuf[40], abuf[40];
-    size_t clen;
+  // Auto-reconcile real cash for flat markets on this exchange from the
+  // snapshot we just fetched (no extra call) — an explicit balance view
+  // also keeps per-market real cash synced.
+  wm_live_reconcile_from_accounts(exchange_name, res.rows, res.count);
 
-    // Hide fully-zero rows so funded balances stand out.
-    if(res.rows[i].balance == 0.0 && res.rows[i].hold == 0.0)
-      continue;
-
-    clen = strnlen(res.rows[i].currency, sizeof(ccy) - 1);
-    memcpy(ccy, res.rows[i].currency, clen);
-    ccy[clen] = '\0';
-
-    snprintf(line, sizeof(line),
-        "    %-8s  balance=%-18s  hold=%-18s  available=%-18s",
-        ccy,
-        wm_fmt_amount(res.rows[i].balance,   bbuf, sizeof(bbuf)),
-        wm_fmt_amount(res.rows[i].hold,      hbuf, sizeof(hbuf)),
-        wm_fmt_amount(res.rows[i].available, abuf, sizeof(abuf)));
-    cmd_reply(ctx, line);
-    shown++;
-  }
-
-  if(shown == 0)
-    cmd_reply(ctx, "    (all balances zero)");
+  wm_bal_render_rows(ctx, exchange_name, res.rows, res.count, 0, false);
 }
 
 static void
 whenmoon_show_balances_cmd(const cmd_ctx_t *ctx)
 {
   const char *p;
+  char        tok[EXCHANGE_NAME_SZ] = {0};
   char        want[EXCHANGE_NAME_SZ] = {0};
+  bool        force = false;
   char        names[WM_BAL_EXCH_CAP][EXCHANGE_NAME_SZ];
   uint32_t    n = 0;
   uint32_t    i;
 
   p = (ctx->args != NULL) ? ctx->args : "";
 
+  // Tokens: an optional exchange name and/or the keyword `fresh` (force
+  // a live refresh), in either order.
+  while(wm_dl_next_token(&p, tok, sizeof(tok)))
+  {
+    if(strcasecmp(tok, "fresh") == 0 || strcasecmp(tok, "sync") == 0)
+      force = true;
+    else if(want[0] == '\0')
+      snprintf(want, sizeof(want), "%s", tok);
+  }
+
   cmd_reply(ctx, CLR_BOLD "whenmoon balances" CLR_RESET);
 
   // Explicit exchange argument: query just that one.
-  if(wm_dl_next_token(&p, want, sizeof(want)))
+  if(want[0] != '\0')
   {
-    wm_bal_render(ctx, want);
+    wm_bal_render(ctx, want, force);
     return;
   }
 
@@ -299,7 +367,7 @@ whenmoon_show_balances_cmd(const cmd_ctx_t *ctx)
     n = WM_BAL_EXCH_CAP;
 
   for(i = 0; i < n; i++)
-    wm_bal_render(ctx, names[i]);
+    wm_bal_render(ctx, names[i], force);
 }
 
 // ------------------------------------------------------------------ //
@@ -412,11 +480,15 @@ whenmoon_register_show_verbs(void)
     return(FAIL);
 
   if(cmd_register("whenmoon", "balances",
-        "show whenmoon balances [exchange]",
-        "On-demand authenticated account-balance snapshot. No arg = every"
-        " registered exchange; <exchange> = just that one. Doubles as a"
-        " key check (per-currency balance/hold/available, or the auth"
-        " error).",
+        "show whenmoon balances [exchange] [fresh]",
+        "Account-balance snapshot. Cache-first: reads the per-exchange"
+        " cache instantly with a vintage line (the scheduled poll keeps"
+        " real-mode exchanges warm; real fills fast-forward it). No arg ="
+        " every registered exchange; <exchange> = just that one. Add"
+        " `fresh` to force a blocking live refresh. A cache miss (e.g. a"
+        " paper-only deploy) also falls back to one blocking fetch."
+        " Doubles as a key check (per-currency balance/hold/available, or"
+        " the auth error).",
         NULL,
         USERNS_GROUP_ADMIN, 100, CMD_SCOPE_ANY, METHOD_T_ANY,
         whenmoon_show_balances_cmd, NULL, "show/whenmoon", NULL,
@@ -443,12 +515,14 @@ whenmoon_subsystems_destroy(whenmoon_state_t *st)
 
   // Teardown order: strategies first (they may hold dispatch
   // references into market state), then live engine, then job table,
-  // downloader DDL flag, markets, account.
+  // downloader DDL flag, markets, account. wm_account_destroy cancels
+  // its per-slot periodics synchronously before the per-slot locks go.
   wm_strategy_registry_destroy(st);
   wm_live_engine_destroy();
   wm_dl_jobtable_destroy(st);
   wm_dl_destroy(st);
   wm_market_destroy(st);
+  wm_account_destroy(st);
 
   // MW-2: free marketwatch state last (mirrors mw_stop early). Safe
   // when mw_init never ran (mw_g.n_exch == 0 + freshly-zeroed mutex
@@ -495,6 +569,12 @@ whenmoon_init(void)
   if(wm_market_init(st) != SUCCESS)
   {
     clam(CLAM_INFO, WHENMOON_CTX, "wm_market_init failed");
+    goto fail;
+  }
+
+  if(wm_account_init(st) != SUCCESS)
+  {
+    clam(CLAM_INFO, WHENMOON_CTX, "wm_account_init failed");
     goto fail;
   }
 
@@ -706,6 +786,14 @@ whenmoon_start(void)
   if(wm_market_persist_restore_all(st) != SUCCESS)
     clam(CLAM_INFO, WHENMOON_CTX,
         "wm_market_persist_restore_all failed (sessions left at default)");
+
+  // Balance cache: schedule the per-exchange poll now that the exchange
+  // roster is settled and per-market session modes are restored (the
+  // real-mode poll gate reads them). Runs after restore_all so the
+  // start-time initial fetch sees the real running state.
+  if(wm_account_start(st) != SUCCESS)
+    clam(CLAM_INFO, WHENMOON_CTX,
+        "wm_account_start failed (balance cache refresh disabled)");
 
   // MW-2: marketwatch start runs after the exchange roster is settled
   // (each service plugin's start has already registered with

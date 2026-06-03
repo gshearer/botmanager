@@ -1718,3 +1718,154 @@ wm_strategy_snapshot_attachments(whenmoon_state_t *st,
 
   return(n);
 }
+
+// Resolve one param's effective value for a market and record which
+// tier supplied it. Mirrors the wm_strategy_kv_get_* resolution order
+// (per-market override -> global default -> compiled default) so the
+// rendered value matches what the strategy's init() actually reads.
+static void
+wm_strategy_resolve_param(const char *market_id, const char *strategy,
+    const wm_strategy_param_t *p, wm_market_strat_param_t *out)
+{
+  char path[KV_KEY_SZ];
+  bool from_market;
+  bool from_global = false;
+
+  snprintf(out->name, sizeof(out->name), "%s", p->name);
+
+  from_market = wm_strategy_per_market_path(market_id, strategy, p->name,
+      path, sizeof(path));
+
+  if(!from_market)
+    from_global = wm_strategy_global_path(strategy, p->name,
+        path, sizeof(path));
+
+  out->source = from_market ? 'm' : (from_global ? 'g' : 'd');
+
+  switch(p->type)
+  {
+    case WM_PARAM_INT:
+      if(out->source == 'd')
+        snprintf(out->value, sizeof(out->value), "%" PRId64,
+            p->default_int);
+      else
+        snprintf(out->value, sizeof(out->value), "%" PRId64,
+            kv_get_int(path));
+      break;
+
+    case WM_PARAM_UINT:
+      if(out->source == 'd')
+        snprintf(out->value, sizeof(out->value), "%" PRIu64,
+            (uint64_t)p->default_int);
+      else
+        snprintf(out->value, sizeof(out->value), "%" PRIu64,
+            kv_get_uint(path));
+      break;
+
+    case WM_PARAM_DOUBLE:
+      if(out->source == 'd')
+        snprintf(out->value, sizeof(out->value), "%.6g", p->default_dbl);
+      else
+        snprintf(out->value, sizeof(out->value), "%.6g",
+            kv_get_double(path));
+      break;
+
+    case WM_PARAM_STR:
+      if(out->source == 'd')
+        snprintf(out->value, sizeof(out->value), "%s",
+            p->default_str != NULL ? p->default_str : "");
+      else
+      {
+        const char *v = kv_get_str(path);
+
+        snprintf(out->value, sizeof(out->value), "%s",
+            v != NULL ? v : "");
+      }
+      break;
+
+    default:
+      out->value[0] = '\0';
+      break;
+  }
+}
+
+uint32_t
+wm_strategy_snapshot_market(whenmoon_state_t *st,
+    const char *market_id_str,
+    wm_market_attach_snapshot_t *out, uint32_t cap)
+{
+  wm_strategy_registry_t   *reg;
+  loaded_strategy_t        *ls;
+  wm_strategy_attachment_t *att;
+  uint32_t                  n = 0;
+  uint32_t                  i;
+
+  if(st == NULL || st->strategies == NULL || market_id_str == NULL ||
+     out == NULL || cap == 0)
+    return(0);
+
+  reg = st->strategies;
+
+  pthread_mutex_lock(&reg->lock);
+
+  for(ls = reg->head; ls != NULL && n < cap; ls = ls->next)
+  {
+    for(att = ls->attachments; att != NULL && n < cap; att = att->next)
+    {
+      wm_market_attach_snapshot_t *snap;
+      uint32_t                     np;
+      uint32_t                     j;
+
+      if(strcmp(att->ctx.market_id_str, market_id_str) != 0)
+        continue;
+
+      snap = &out[n];
+
+      snprintf(snap->strategy_name, sizeof(snap->strategy_name), "%s",
+          ls->name);
+      snap->priority         = att->priority;
+      snap->bars_seen        = att->ctx.bars_seen;
+      snap->signals_emitted  = att->ctx.signals_emitted;
+      snap->last_bar_ts_ms   = att->ctx.last_bar_ts_ms;
+      snap->last_signal      = att->ctx.last_signal;
+      snap->has_last_signal  = att->ctx.has_last_signal;
+
+      np = ls->meta.n_params;
+
+      if(np > WM_MARKET_SNAP_MAX_PARAMS)
+        np = WM_MARKET_SNAP_MAX_PARAMS;
+
+      if(ls->meta.params == NULL)
+        np = 0;
+
+      for(j = 0; j < np; j++)
+        wm_strategy_resolve_param(market_id_str, ls->name,
+            &ls->meta.params[j], &snap->params[j]);
+
+      snap->n_params = np;
+
+      n++;
+    }
+  }
+
+  pthread_mutex_unlock(&reg->lock);
+
+  // Insertion sort by ascending priority (the live poll order). n is
+  // the per-market advisor count — tiny — so an O(n^2) pass is cheaper
+  // than a qsort comparator and keeps the snapshot self-contained.
+  for(i = 1; i < n; i++)
+  {
+    wm_market_attach_snapshot_t key = out[i];
+    uint32_t                    k   = i;
+
+    while(k > 0 && out[k - 1].priority > key.priority)
+    {
+      out[k] = out[k - 1];
+      k--;
+    }
+
+    out[k] = key;
+  }
+
+  return(n);
+}

@@ -21,11 +21,14 @@
 typedef struct whenmoon_markets        whenmoon_markets_t;
 typedef struct dl_jobtable             dl_jobtable_t;
 typedef struct wm_strategy_registry    wm_strategy_registry_t;
+typedef struct whenmoon_account        whenmoon_account_t;
 
 // Plugin-global singleton state. Allocated in whenmoon_init, freed in
 // whenmoon_deinit. Markets and downloader are now plugin-scoped (no
-// per-bot binding) following WM-G1. Account balances are fetched
-// on-demand by `/show whenmoon balances` (no cached account state).
+// per-bot binding) following WM-G1. Account balances are served from a
+// per-exchange cache (account.c): a scheduled poll (real-mode + creds
+// gated) keeps it warm, real fills fast-forward it, and a cache miss
+// falls back to a one-shot on-demand fetch in `/show whenmoon balances`.
 typedef struct whenmoon_state
 {
   whenmoon_markets_t *markets;   // owned; NULL when market init failed
@@ -47,6 +50,11 @@ typedef struct whenmoon_state
   // and their per-(market, strategy) attachments. Bar-close fan-out
   // from aggregator.c routes through here.
   wm_strategy_registry_t *strategies;
+
+  // Per-exchange account-balance cache (account.c). Owned; NULL when
+  // account init failed. Populated by a scheduled poll + real-fill
+  // fast-forward + the on-demand fallback in `/show whenmoon balances`.
+  whenmoon_account_t *account;
 } whenmoon_state_t;
 
 // Plugin-global singleton accessor. Returns NULL before whenmoon_init

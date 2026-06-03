@@ -44,12 +44,15 @@
 #include "task.h"
 
 #include "exchange_api.h"
+#include "market_persist.h"
+#include "wm_exch_query.h"
 
 #include <pthread.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <strings.h>
 #include <sys/random.h>
 #include <time.h>
 
@@ -1198,12 +1201,243 @@ wm_live_engine_start(void)
       continue;
 
     snprintf(wm_live_reconcile_names[i],
-        sizeof(wm_live_reconcile_names[i]), "%s", names[i]);
+        sizeof(wm_live_reconcile_names[i]), "%.*s",
+        (int)(sizeof(wm_live_reconcile_names[i]) - 1), names[i]);
 
     if(exchange_list_orders_async(names[i], "OPEN", NULL,
            wm_live_boot_reconcile_cb,
            wm_live_reconcile_names[i]) != SUCCESS)
       clam(CLAM_DEBUG, WM_LIVE_CTX,
           "boot reconcile submit failed (%s)", names[i]);
+  }
+}
+
+// ----------------------------------------------------------------------- //
+// WM-REAL-CASH-1: real-mode cash reconciliation                           //
+//                                                                         //
+// The market session carries a per-mode cash ledger. Paper mode is a pure //
+// simulation seeded at WM_MARKET_DEFAULT_STARTING_CASH; real mode must    //
+// instead deploy a fraction of the ACTUAL quote-currency balance on the   //
+// bound exchange, or order sizing (size_frac * cash) bets a fictional     //
+// bankroll. This helper pulls the live `available` quote balance into the //
+// real ledger; the synchronous fetch confines it to the command thread.   //
+// ----------------------------------------------------------------------- //
+
+static void
+wm_reconcile_on_accounts(const exchange_accounts_result_t *res, void *user)
+{
+  if(res != NULL)
+  {
+    wm_sync_fetch_complete(user, res, sizeof(*res));
+    return;
+  }
+
+  // A NULL result becomes a typed error so the waiter's copy-out carries a
+  // message rather than a zeroed "ok, 0 currencies" (cf. wm_bal_on_accounts).
+  {
+    exchange_accounts_result_t err;
+
+    memset(&err, 0, sizeof(err));
+    snprintf(err.err, sizeof(err.err), "no result delivered");
+    wm_sync_fetch_complete(user, &err, sizeof(err));
+  }
+}
+
+// Resolve the quote-currency available balance for `market_id` from an
+// accounts snapshot. Case-insensitive: ids are "...-usd" while exchanges
+// report "USD". Returns true + *out_avail on a match.
+static bool
+wm_live_quote_available(const char *market_id,
+    const exchange_account_t *rows, uint32_t n, double *out_avail)
+{
+  char     exch[EXCHANGE_NAME_SZ];
+  char     base[16];
+  char     quote[16];
+  uint32_t i;
+
+  if(market_id == NULL || rows == NULL)
+    return(false);
+
+  if(wm_market_parse_id(market_id, exch, sizeof(exch), base, sizeof(base),
+         quote, sizeof(quote)) != SUCCESS)
+    return(false);
+
+  for(i = 0; i < n; i++)
+    if(strcasecmp(rows[i].currency, quote) == 0)
+    {
+      if(out_avail != NULL)
+        *out_avail = rows[i].available;
+      return(true);
+    }
+
+  return(false);
+}
+
+// Bind the real-mode cash ledger to `avail`. Caller holds mk->lock.
+// `reset_baseline` (true for a deliberate operator reconcile) also
+// re-anchors starting_cash, the daily-loss-cap denominator; the periodic
+// auto-reconcile passes false so it only tracks deployable `cash` and
+// leaves an established risk baseline alone — but the very first sync
+// always anchors it (off real funds, not the $10k placeholder).
+static void
+wm_live_apply_real_cash_locked(whenmoon_market_t *mk, double avail,
+    bool reset_baseline)
+{
+  wm_market_stats_t *rs = &mk->session.stats[WM_MARKET_MODE_REAL];
+
+  rs->cash = avail;
+
+  if(reset_baseline || mk->real_cash_synced_ms == 0)
+    rs->starting_cash = avail;
+
+  mk->real_cash_synced_ms = wm_now_ms();
+  (void)wm_market_persist_locked(mk);
+}
+
+bool
+wm_market_reconcile_real_cash(whenmoon_market_t *mk, double *out_cash,
+    char *errbuf, size_t errbuf_sz)
+{
+  exchange_capabilities_t     caps;
+  exchange_accounts_result_t  res;
+  wm_sync_fetch_t            *w;
+  char                        exch[EXCHANGE_NAME_SZ];
+  char                        base[16];
+  char                        quote[16];
+  double                      avail = -1.0;
+
+  #define RC_ERR(...) do { \
+      if(errbuf != NULL && errbuf_sz > 0) \
+        snprintf(errbuf, errbuf_sz, __VA_ARGS__); \
+    } while(0)
+
+  if(errbuf != NULL && errbuf_sz > 0)
+    errbuf[0] = '\0';
+
+  if(mk == NULL)
+  {
+    RC_ERR("null market");
+    return(FAIL);
+  }
+
+  if(mk->exchange_name[0] == '\0')
+  {
+    RC_ERR("market %s has no bound exchange", mk->market_id_str);
+    return(FAIL);
+  }
+
+  if(wm_market_parse_id(mk->market_id_str, exch, sizeof(exch),
+         base, sizeof(base), quote, sizeof(quote)) != SUCCESS)
+  {
+    RC_ERR("cannot parse quote currency from %s", mk->market_id_str);
+    return(FAIL);
+  }
+
+  // Gate on credentials up front — same check the real submit path makes,
+  // and the reason a paper-only key can't reconcile.
+  if(exchange_get_capabilities(mk->exchange_name, &caps) != SUCCESS
+      || !caps.has_credentials)
+  {
+    RC_ERR("no credentials for %s", mk->exchange_name);
+    return(FAIL);
+  }
+
+  // Synchronous bridge over the async accounts fetch. The handle owns the
+  // result buffer, so a late callback after a timed-out wait cannot
+  // use-after-free our stack (cf. finding_gemini_prime_use_after_free).
+  w = wm_sync_fetch_begin(sizeof(res));
+
+  if(w == NULL)
+  {
+    RC_ERR("out of memory");
+    return(FAIL);
+  }
+
+  (void)exchange_get_accounts_async(mk->exchange_name,
+      wm_reconcile_on_accounts, w);
+
+  if(!wm_sync_fetch_wait(w, &res, sizeof(res), WM_EXCH_QUERY_WAIT_MS))
+  {
+    RC_ERR("account fetch timed out (%s)", mk->exchange_name);
+    return(FAIL);
+  }
+
+  if(res.err[0] != '\0')
+  {
+    RC_ERR("%s", res.err);
+    return(FAIL);
+  }
+
+  if(!wm_live_quote_available(mk->market_id_str, res.rows, res.count,
+         &avail))
+  {
+    RC_ERR("quote currency %s not held on %s", quote, mk->exchange_name);
+    return(FAIL);
+  }
+
+  // Operator-initiated reconcile (mode->real switch or /whenmoon market
+  // sync): re-anchor the full baseline.
+  pthread_mutex_lock(&mk->lock);
+  wm_live_apply_real_cash_locked(mk, avail, true);
+  pthread_mutex_unlock(&mk->lock);
+
+  if(out_cash != NULL)
+    *out_cash = avail;
+
+  clam(CLAM_INFO, WM_LIVE_CTX,
+      "market %s real cash reconciled: %s available=%.2f",
+      mk->market_id_str, quote, avail);
+
+  #undef RC_ERR
+
+  return(SUCCESS);
+}
+
+void
+wm_live_reconcile_from_accounts(const char *exchange,
+    const exchange_account_t *rows, uint32_t n)
+{
+  whenmoon_state_t   *st;
+  whenmoon_markets_t *mkts;
+  uint32_t            i;
+
+  if(exchange == NULL || exchange[0] == '\0' || rows == NULL)
+    return;
+
+  st = whenmoon_get_state();
+
+  if(st == NULL || st->markets == NULL)
+    return;
+
+  mkts = st->markets;
+
+  for(i = 0; i < mkts->n_markets; i++)
+  {
+    whenmoon_market_t *mk = &mkts->arr[i];
+    double             avail = 0.0;
+
+    if(strncmp(mk->exchange_name, exchange, EXCHANGE_NAME_SZ) != 0)
+      continue;
+
+    if(!wm_live_quote_available(mk->market_id_str, rows, n, &avail))
+      continue;
+
+    pthread_mutex_lock(&mk->lock);
+
+    // Reconcile only when flat. An open long means part of the capital
+    // sits in the base asset, so the quote `available` understates the
+    // market's deployable cash; the market's own fill ledger is the
+    // source of truth until it closes flat, when the next snapshot
+    // re-syncs. reset_baseline=false so this never moves an established
+    // daily-loss baseline (only the first sync anchors it).
+    if(mk->session.position.side == WM_MARKET_POS_FLAT)
+    {
+      wm_live_apply_real_cash_locked(mk, avail, false);
+      clam(CLAM_DEBUG2, WM_LIVE_CTX,
+          "market %s real cash auto-reconciled: available=%.2f",
+          mk->market_id_str, avail);
+    }
+
+    pthread_mutex_unlock(&mk->lock);
   }
 }

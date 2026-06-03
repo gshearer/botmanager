@@ -426,9 +426,10 @@ wm_market_session_snapshot(whenmoon_market_t *mk,
   snprintf(out->product_id, sizeof(out->product_id), "%s",
       mk->product_id);
 
-  out->mode         = s->mode;
-  out->warmup_state = mk->warmup_state;
-  out->position     = s->position;
+  out->mode                = s->mode;
+  out->warmup_state        = mk->warmup_state;
+  out->real_cash_synced_ms = mk->real_cash_synced_ms;
+  out->position            = s->position;
 
   for(m = 0; m < WM_MARKET_MODE_COUNT; m++)
     out->stats[m] = s->stats[m];

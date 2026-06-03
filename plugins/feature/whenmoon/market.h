@@ -319,6 +319,14 @@ typedef struct whenmoon_market
   // task_cancel needed (which would leave the heap ctx leaked).
   wm_warmup_state_t     warmup_state;
   uint32_t              warmup_gen;
+
+  // WM-REAL-CASH-1: wall-clock ms of the last successful real-mode cash
+  // reconciliation against the bound exchange balance (0 = never synced;
+  // real cash is still the seeded placeholder). Transient — zeroed by the
+  // add/restore memset, so a restored real market reads "unsynced" until
+  // the operator re-reconciles. The reconciled cash value itself IS
+  // persisted (it lives in session.stats[REAL]).
+  int64_t               real_cash_synced_ms;
 } whenmoon_market_t;
 
 struct whenmoon_markets
@@ -515,6 +523,10 @@ typedef struct
   // wm_market_stats_profit_factor).
   double                sharpe;
   double                sortino;
+
+  // WM-REAL-CASH-1: 0 = real cash never reconciled with the exchange
+  // (stats[REAL].cash is the seeded placeholder, not actual funds).
+  int64_t               real_cash_synced_ms;
 } wm_market_session_snapshot_t;
 
 // Take a deep copy of `mk->session` (and a few mk-level fields) under

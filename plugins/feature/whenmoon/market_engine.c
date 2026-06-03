@@ -10,6 +10,7 @@
 
 #define WHENMOON_INTERNAL
 #include "market_engine.h"
+#include "account.h"
 #include "live.h"
 #include "market.h"
 #include "market_persist.h"
@@ -998,6 +999,7 @@ wm_market_engine_record_external_fill(const char *market_id_str,
   wm_market_pending_t *p;
   uint32_t             i;
   uint8_t              j;
+  char                 exch[EXCHANGE_NAME_SZ];
 
   if(market_id_str == NULL || qty <= 0.0 || exec_px <= 0.0)
     return;
@@ -1041,7 +1043,17 @@ wm_market_engine_record_external_fill(const char *market_id_str,
 
   (void)wm_market_persist_locked(mk);
 
+  // Capture the bound exchange while locked; used post-unlock to
+  // fast-forward the balance cache (a real fill moves cash, so refresh
+  // it immediately rather than waiting for the next scheduled poll).
+  snprintf(exch, sizeof(exch), "%s", mk->exchange_name);
+
   pthread_mutex_unlock(&mk->lock);
+
+  // Outside the lock: never hold mk->lock across the async submit (it
+  // can re-enter clam/registry paths — see the clam-reentry deadlock
+  // class). wm_account_fast_forward re-checks the real-mode + creds gate.
+  wm_account_fast_forward(exch);
 }
 
 // ------------------------------------------------------------------ //

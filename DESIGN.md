@@ -14,7 +14,24 @@ Support for other platforms is strictly out-of-scope; this program targets the m
 - Bot "kinds" are defined entirely by plugins. The core provides the services they need.
 - Bots can interact with humans via multiple methods (IRC, XMPP, Telegram, Slack, and more).
 - A bot instance can have multiple methods but only one user namespace. A given user can interact with the bot via any of its methods; the bot always replies on the originating method.
-- The entire system is asynchronous and non-blocking.
+- **The entire system is asynchronous and non-blocking** — a first-order
+  design principle, not merely a current property. Always prefer the async
+  path: submit work (curl, DB, exchange calls) with a completion callback
+  and let the originating thread return. Never block a dispatch,
+  aggregator, WS, or task-pool thread on I/O, or hold a lock across I/O.
+  One slow exchange gateway must never freeze command dispatch or another
+  market's fills — a blocking call on a shared thread stalls every
+  consumer queued behind it.
+  - Where a synchronous result is genuinely unavoidable — e.g. the
+    botmanctl control socket clears its single global reply target the
+    instant dispatch returns, so a reply emitted from a later async
+    callback is silently dropped — confine the wait to a dedicated
+    operator/command thread, bound it with a timeout, and make the wait
+    context heap-owned + refcounted so a late callback after a timeout
+    cannot use-after-free (pattern:
+    `plugins/feature/whenmoon/wm_exch_query.{c,h}`). Treat such blocking
+    as a localized, documented exception — never a default, and never on a
+    shared thread.
 
 ## Use Cases
 

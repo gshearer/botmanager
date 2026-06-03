@@ -15,7 +15,7 @@
 
 #include "method.h"
 
-#define MW_CTX  "whenmoon mw"
+#define MW_CTX  "marketwatch"
 
 bool mw_init(void);
 bool mw_start(void);

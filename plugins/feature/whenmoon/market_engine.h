@@ -21,6 +21,7 @@
 
 #include "market.h"
 #include "whenmoon_strategy.h"
+#include "exchange_api.h"
 
 #include <stdbool.h>
 #include <stdint.h>
@@ -144,6 +145,39 @@ void wm_market_engine_record_external_fill(const char *market_id_str,
 bool wm_market_engine_force_trade_locked(whenmoon_market_t *mk,
     char side, double qty, double px_override, int64_t ts_ms,
     const char *reason, char *errbuf, size_t errbuf_sz);
+
+// WM-REAL-CASH-1: reconcile a market's REAL-mode cash ledger against the
+// live quote-currency `available` balance on its bound exchange. Real
+// order sizing is `size_frac * stats[REAL].cash`; without this the ledger
+// is the seeded paper placeholder and real orders bet a fictional
+// bankroll. Defined in live.c.
+//
+// Fetches the account snapshot SYNCHRONOUSLY (blocks up to
+// WM_EXCH_QUERY_WAIT_MS) — call only from a command / operator thread,
+// NEVER from the aggregator / bar-close path. Acquires `mk->lock`
+// internally; the caller must NOT hold it. On SUCCESS writes the resolved
+// available balance into stats[REAL].{cash,starting_cash}, stamps
+// mk->real_cash_synced_ms, persists, and (if non-NULL) returns the value
+// via `out_cash`. FAIL with `errbuf` populated on missing credentials,
+// fetch timeout, or the quote currency being absent from the account.
+bool wm_market_reconcile_real_cash(whenmoon_market_t *mk, double *out_cash,
+    char *errbuf, size_t errbuf_sz);
+
+// Auto-reconcile real cash for every FLAT market bound to `exchange` from
+// an already-fetched accounts snapshot — makes NO exchange call (free of
+// the WM-PAPER-GATE-1 polling concern; safe on the curl-worker or a
+// command thread). For each flat market it resolves the quote currency in
+// `rows` and sets stats[REAL].cash to the available balance; starting_cash
+// (the daily-loss-cap baseline) is only re-anchored on the market's first
+// sync, so periodic auto-reconcile never silently moves an established
+// risk baseline. Markets holding an open long are skipped — the quote
+// balance understates deployable cash while capital sits in the base
+// asset; the market's own fill ledger is authoritative until it closes
+// flat. Driven by the balance cache (account.c) so per-market real cash
+// auto-syncs to actual funds without a manual `/whenmoon market sync`.
+// Defined in live.c.
+void wm_live_reconcile_from_accounts(const char *exchange,
+    const exchange_account_t *rows, uint32_t n);
 
 #endif // WHENMOON_INTERNAL
 

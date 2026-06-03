@@ -142,3 +142,28 @@ wm_fmt_amount(double v, char *buf, size_t cap)
 
   return(buf);
 }
+
+const char *
+wm_fmt_age(int64_t age_ms, char *buf, size_t cap)
+{
+  int64_t s;
+
+  if(age_ms < 0)
+    age_ms = 0;
+
+  s = age_ms / 1000;
+
+  if(s < 60)
+    snprintf(buf, cap, "%llds", (long long)s);
+  else if(s < 3600)
+    snprintf(buf, cap, "%lldm %llds",
+        (long long)(s / 60), (long long)(s % 60));
+  else if(s < 86400)
+    snprintf(buf, cap, "%lldh %02lldm",
+        (long long)(s / 3600), (long long)((s % 3600) / 60));
+  else
+    snprintf(buf, cap, "%lldd %lldh",
+        (long long)(s / 86400), (long long)((s % 86400) / 3600));
+
+  return(buf);
+}

@@ -7,6 +7,7 @@
 #include "market.h"
 #include "market_cmds.h"
 #include "market_engine.h"
+#include "strategy.h"
 #include "dl_commands.h"
 
 #include "cmd.h"
@@ -19,6 +20,10 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+
+// Stack-array cap for the attached-strategy advisor stack rendered in
+// /show whenmoon market <id>. Far above any realistic per-market roster.
+#define WM_MARKET_SHOW_MAX_STRAT  16
 #include <time.h>
 
 // Read one market-id token off ctx->args, parse it, and produce the
@@ -436,6 +441,103 @@ wm_market_cmd_mode(const cmd_ctx_t *ctx)
   snprintf(reply, sizeof(reply),
       "market %s mode -> %s", id_str, wm_market_mode_name(mode));
   cmd_reply(ctx, reply);
+
+  // WM-REAL-CASH-1: switching into real mode is the natural point to bind
+  // the cash ledger to actual funds — otherwise real order sizing would
+  // deploy a fraction of the seeded $10k placeholder. The market is flat
+  // here (set_mode enforces it), so the quote `available` is the full
+  // deployable balance. Blocking is fine in this command context. A
+  // failure does NOT revert the mode switch — but it is surfaced loudly,
+  // and the market card shows "UNSYNCED" until a later sync succeeds.
+  if(mode == WM_MARKET_MODE_REAL)
+  {
+    whenmoon_market_t *mk = wm_market_lookup_by_id(st, id_str);
+    double             cash = 0.0;
+    char               rerr[160] = {0};
+
+    if(mk != NULL &&
+       wm_market_reconcile_real_cash(mk, &cash, rerr, sizeof(rerr))
+           == SUCCESS)
+      snprintf(reply, sizeof(reply),
+          "  real cash reconciled to %.2f (real sizing now deploys"
+          " size_frac of actual funds)", cash);
+
+    else
+      snprintf(reply, sizeof(reply),
+          "  WARN real cash UNSYNCED: %s — sizing would use the placeholder;"
+          " run /whenmoon market sync %s",
+          rerr[0] != '\0' ? rerr : "reconcile failed", id_str);
+
+    cmd_reply(ctx, reply);
+  }
+}
+
+// ------------------------------------------------------------------ //
+// /whenmoon market sync <id>  — reconcile real cash (WM-REAL-CASH-1)  //
+// ------------------------------------------------------------------ //
+
+static void
+wm_market_cmd_sync(const cmd_ctx_t *ctx)
+{
+  whenmoon_state_t  *st;
+  whenmoon_market_t *mk;
+  const char        *p;
+  char               id_tok[64] = {0};
+  char               exch[32];
+  char               base[16];
+  char               quote[16];
+  char               id_str[WM_MARKET_ID_STR_SZ];
+  char               err[160] = {0};
+  char               reply[224];
+  double             cash = 0.0;
+
+  st = whenmoon_get_state();
+
+  if(st == NULL || st->markets == NULL)
+  {
+    cmd_reply(ctx, "whenmoon: no market state");
+    return;
+  }
+
+  p = ctx->args != NULL ? ctx->args : "";
+
+  if(!wm_dl_next_token(&p, id_tok, sizeof(id_tok)))
+  {
+    cmd_reply(ctx,
+        "usage: /whenmoon market sync <exch>-<base>-<quote>");
+    return;
+  }
+
+  if(wm_market_parse_id(id_tok, exch, sizeof(exch), base, sizeof(base),
+         quote, sizeof(quote)) != SUCCESS)
+  {
+    cmd_reply(ctx, "bad market id (expected <exch>-<base>-<quote>)");
+    return;
+  }
+
+  wm_market_format_id(exch, base, quote, id_str, sizeof(id_str));
+
+  mk = wm_market_lookup_by_id(st, id_str);
+
+  if(mk == NULL)
+  {
+    snprintf(reply, sizeof(reply), "market %s not running", id_str);
+    cmd_reply(ctx, reply);
+    return;
+  }
+
+  if(wm_market_reconcile_real_cash(mk, &cash, err, sizeof(err)) != SUCCESS)
+  {
+    snprintf(reply, sizeof(reply),
+        "market %s real cash sync FAIL: %s", id_str,
+        err[0] != '\0' ? err : "(no detail)");
+    cmd_reply(ctx, reply);
+    return;
+  }
+
+  snprintf(reply, sizeof(reply),
+      "market %s real cash reconciled to %.2f", id_str, cash);
+  cmd_reply(ctx, reply);
 }
 
 // ------------------------------------------------------------------ //
@@ -565,8 +667,8 @@ static void
 wm_market_parent_cb(const cmd_ctx_t *ctx)
 {
   cmd_reply(ctx,
-      "usage: /whenmoon market <start|stop|mode|force> ..."
-      " (mode takes <manual|paper|real>)");
+      "usage: /whenmoon market <start|stop|mode|force|sync> ..."
+      " (mode takes <manual|paper|real>; sync reconciles real cash)");
 }
 
 // ------------------------------------------------------------------ //
@@ -577,13 +679,16 @@ bool
 wm_market_register_verbs(void)
 {
   if(cmd_register("whenmoon", "market",
-        "whenmoon market <start|stop|mode|force> ...",
+        "whenmoon market <start|stop|mode|force|sync> ...",
         "Add or remove a live market and manage its session."
         " Starts: WS subscribe + live-ring 1m backfill."
         " Stops: unsubscribe + clear enabled flag."
         " Mode: change the market's mode (manual|paper|real)."
         " Force: operator-issued forced trade (manual+paper synth fill"
-        " or real-mode submit, all gates honored).",
+        " or real-mode submit, all gates honored)."
+        " Sync: force a fresh reconcile of real-mode cash + re-anchor the"
+        " daily-loss baseline (usually unnecessary — flat markets"
+        " auto-reconcile from the balance cache).",
         NULL,
         USERNS_GROUP_ADMIN, 100, CMD_SCOPE_ANY, METHOD_T_ANY,
         wm_market_parent_cb, NULL, "whenmoon", NULL,
@@ -653,6 +758,26 @@ wm_market_register_verbs(void)
         NULL,
         USERNS_GROUP_ADMIN, 100, CMD_SCOPE_ANY, METHOD_T_ANY,
         wm_market_cmd_force, NULL, "whenmoon/market", NULL,
+        NULL, 0, NULL, NULL) != SUCCESS)
+    return(FAIL);
+
+  // WM-REAL-CASH-1: on-demand real-cash reconciliation. Binds the real
+  // ledger to the live quote-currency balance so real order sizing
+  // deploys actual funds; also runs implicitly on switching to real mode.
+  if(cmd_register("whenmoon", "sync",
+        "whenmoon market sync <exch>-<base>-<quote>",
+        "Force a fresh reconcile of the market's REAL-mode cash ledger"
+        " against the live quote-currency `available` balance on its bound"
+        " exchange, and re-anchor the daily-loss baseline. Real order"
+        " sizing is size_frac * cash. Usually unnecessary: a flat market"
+        " auto-reconciles from the balance cache (the scheduled poll, an"
+        " on-demand `/show whenmoon balances`, or a real fill), and"
+        " switching into real mode also reconciles. Use this to force a"
+        " refresh after an external deposit/withdrawal. Blocks on an"
+        " authenticated account fetch; requires exchange credentials.",
+        NULL,
+        USERNS_GROUP_ADMIN, 100, CMD_SCOPE_ANY, METHOD_T_ANY,
+        wm_market_cmd_sync, NULL, "whenmoon/market", NULL,
         NULL, 0, NULL, NULL) != SUCCESS)
     return(FAIL);
 
@@ -794,6 +919,23 @@ wm_obs_render_card(const cmd_ctx_t *ctx,
       real->last_fill_ms);
   cmd_reply(ctx, line);
 
+  // WM-REAL-CASH-1: real cash is a seeded placeholder until reconciled
+  // with the exchange. Flag it so the figure above is not mistaken for
+  // actual funds; `/whenmoon market sync <id>` (or switching to real mode)
+  // reconciles it.
+  if(snap->real_cash_synced_ms == 0)
+    cmd_reply(ctx,
+        "               " CLR_RED "^ real cash UNSYNCED" CLR_RESET
+        " — placeholder, not exchange funds (run /whenmoon market sync)");
+
+  else
+  {
+    snprintf(line, sizeof(line),
+        "               " CLR_GRAY "^ real cash reconciled at ms=%"
+        PRId64 CLR_RESET, snap->real_cash_synced_ms);
+    cmd_reply(ctx, line);
+  }
+
   snprintf(line, sizeof(line),
       "  params:      fee_bps=%.1f slip_bps=%.1f size_frac=%.2f"
       " max_notional=%.2f daily_loss_bps=%.1f pending_cap=%u",
@@ -809,6 +951,92 @@ wm_obs_render_card(const cmd_ctx_t *ctx,
       "  recent paper fills (oldest first):");
   wm_obs_render_fills(ctx, snap, WM_MARKET_MODE_REAL,
       "  recent real fills (oldest first):");
+}
+
+// Render the attached-strategy advisor stack for one market: each
+// attachment in poll order (ascending priority) with its live counters,
+// last signal, and resolved per-market param values. The market-centric
+// companion to /show whenmoon strategy <name> — answers "what is advising
+// THIS market and what is each knob actually set to here". Param values
+// carry a source tag: m=per-market override, g=global, d=schema default.
+static void
+wm_obs_render_strategies(const cmd_ctx_t *ctx, whenmoon_state_t *st,
+    const char *market_id_str)
+{
+  wm_market_attach_snapshot_t snaps[WM_MARKET_SHOW_MAX_STRAT];
+  uint32_t                    n;
+  uint32_t                    i;
+
+  n = wm_strategy_snapshot_market(st, market_id_str, snaps,
+      (uint32_t)(sizeof(snaps) / sizeof(snaps[0])));
+
+  if(n == 0)
+  {
+    cmd_reply(ctx, "  strategies:  (none attached — feed-only)");
+    return;
+  }
+
+  cmd_reply(ctx, CLR_GRAY "  strategies (poll order):" CLR_RESET);
+
+  for(i = 0; i < n; i++)
+  {
+    const wm_market_attach_snapshot_t *s = &snaps[i];
+    char     line[320];
+    uint32_t off;
+    uint32_t j;
+    int      w;
+
+    snprintf(line, sizeof(line),
+        "    [%u] " CLR_BOLD "%.*s" CLR_RESET
+        "  bars_seen=%" PRIu64 " signals=%" PRIu64,
+        s->priority, (int)(sizeof(s->strategy_name) - 1),
+        s->strategy_name, s->bars_seen, s->signals_emitted);
+    cmd_reply(ctx, line);
+
+    if(s->has_last_signal)
+    {
+      char    reason[WM_STRATEGY_REASON_SZ];
+      size_t  rlen;
+
+      rlen = strnlen(s->last_signal.reason, sizeof(reason) - 1);
+      memcpy(reason, s->last_signal.reason, rlen);
+      reason[rlen] = '\0';
+
+      snprintf(line, sizeof(line),
+          "        last_signal: score=%+.4f conf=%.4f reason=%s",
+          s->last_signal.score, s->last_signal.confidence,
+          reason[0] != '\0' ? reason : "(none)");
+      cmd_reply(ctx, line);
+    }
+
+    if(s->n_params == 0)
+      continue;
+
+    // Pack resolved params onto one wrapped line: name=value(source).
+    off = (uint32_t)snprintf(line, sizeof(line), "        params:");
+
+    for(j = 0; j < s->n_params; j++)
+    {
+      const wm_market_strat_param_t *p = &s->params[j];
+
+      if(off >= sizeof(line))
+        break;
+
+      w = snprintf(line + off, sizeof(line) - off, " %s=%s(%c)",
+          p->name, p->value, p->source);
+
+      if(w < 0)
+        break;
+
+      off += (uint32_t)w;
+    }
+
+    cmd_reply(ctx, line);
+  }
+
+  cmd_reply(ctx,
+      CLR_GRAY "      param source: m=market-override g=global d=default"
+      CLR_RESET);
 }
 
 static void
@@ -848,6 +1076,7 @@ wm_show_market_cmd(const cmd_ctx_t *ctx)
 
     wm_market_session_snapshot(mk, &snap);
     wm_obs_render_card(ctx, &snap);
+    wm_obs_render_strategies(ctx, st, id_tok);
     return;
   }
 
