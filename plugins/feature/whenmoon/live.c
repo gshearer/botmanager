@@ -1037,6 +1037,13 @@ wm_live_fills_poll_tick(task_t *t)
     if(mkts->arr[i].exchange_name[0] == '\0')
       continue;
 
+    // Only real-mode markets have live fills to reconcile. Paper /
+    // manual markets must never touch the authenticated account —
+    // doing so spams the exchange with reads against an account that
+    // isn't trading, which reads as anomalous to their fraud tooling.
+    if(mkts->arr[i].session.mode != WM_MARKET_MODE_REAL)
+      continue;
+
     // Skip when creds are not configured for this exchange.
     if(exchange_get_capabilities(mkts->arr[i].exchange_name,
            &caps) != SUCCESS || !caps.has_credentials)
@@ -1182,6 +1189,12 @@ wm_live_engine_start(void)
 
     if(exchange_get_capabilities(names[i], &caps) != SUCCESS
         || !caps.has_credentials)
+      continue;
+
+    // Skip exchanges with no real-mode market — an authenticated
+    // open-orders listing against a paper-only account is needless
+    // live-account traffic.
+    if(!wm_market_exchange_has_real_mode(st, names[i]))
       continue;
 
     snprintf(wm_live_reconcile_names[i],

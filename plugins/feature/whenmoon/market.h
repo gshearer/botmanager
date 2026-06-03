@@ -462,6 +462,16 @@ void        wm_market_session_init(wm_market_session_t *s);
 whenmoon_market_t *wm_market_lookup_by_id(struct whenmoon_state *st,
     const char *market_id_str);
 
+// True when at least one market on `exchange_name` is in REAL mode.
+// Gates authenticated background polling (live-fills reconcile, account
+// balance refresh): paper / manual exchanges must never emit
+// authenticated exchange traffic — even when stale credential KVs make
+// is_authenticated() report true — because needless private-endpoint
+// calls against a non-trading account read as anomalous to an
+// exchange's fraud tooling. Caller holds no lock; walks st->markets.
+bool wm_market_exchange_has_real_mode(struct whenmoon_state *st,
+    const char *exchange_name);
+
 // ------------------------------------------------------------------ //
 // WM-MK-OBS-1: per-market session snapshot for /show whenmoon market //
 // ------------------------------------------------------------------ //

@@ -385,6 +385,30 @@ wm_market_lookup_by_id(whenmoon_state_t *st, const char *market_id_str)
 }
 
 bool
+wm_market_exchange_has_real_mode(whenmoon_state_t *st,
+    const char *exchange_name)
+{
+  whenmoon_markets_t *m;
+  uint32_t            i;
+
+  if(st == NULL || st->markets == NULL || exchange_name == NULL)
+    return(false);
+
+  m = st->markets;
+
+  for(i = 0; i < m->n_markets; i++)
+  {
+    if(m->arr[i].session.mode != WM_MARKET_MODE_REAL)
+      continue;
+
+    if(strcmp(m->arr[i].exchange_name, exchange_name) == 0)
+      return(true);
+  }
+
+  return(false);
+}
+
+bool
 wm_market_session_snapshot(whenmoon_market_t *mk,
     wm_market_session_snapshot_t *out)
 {

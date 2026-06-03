@@ -4,6 +4,7 @@
 #define WHENMOON_INTERNAL
 #include "whenmoon.h"
 #include "account.h"
+#include "market.h"
 
 #include "exchange_api.h"
 #include "kv.h"
@@ -159,6 +160,19 @@ wm_account_tick(task_t *t)
     return;
   }
 
+  // Only refresh real balances for exchanges actually trading real
+  // money. Account balances feed real-mode observability only; polling
+  // the authenticated /accounts (or BalanceEx) endpoint for a paper /
+  // manual exchange is needless private-endpoint traffic that reads as
+  // anomalous to the exchange's fraud tooling. This gate is stronger
+  // than the creds check below: stale credential KVs keep
+  // is_authenticated() true long after the operator stops trading.
+  if(!wm_market_exchange_has_real_mode(st, slot->exchange_name))
+  {
+    t->state = TASK_ENDED;
+    return;
+  }
+
   // Skip when creds are not configured — the operator may rotate keys
   // without recreating the slot; the next tick re-checks.
   if(exchange_get_capabilities(slot->exchange_name, &caps) != SUCCESS
@@ -293,7 +307,10 @@ wm_account_start(whenmoon_state_t *st)
 
     acc->n_slots++;
 
-    if(exchange_get_capabilities(slot->exchange_name, &caps) == SUCCESS
+    // Mirror the tick gate: no initial fetch unless a real-mode market
+    // on this exchange exists (and creds are present).
+    if(wm_market_exchange_has_real_mode(st, slot->exchange_name)
+        && exchange_get_capabilities(slot->exchange_name, &caps) == SUCCESS
         && caps.has_credentials)
       have_creds = true;
 
