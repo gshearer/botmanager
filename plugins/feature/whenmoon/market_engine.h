@@ -91,6 +91,26 @@ void wm_market_reset(const char *market_id_str,
 // reads are independent.
 void wm_market_session_refresh_kv(whenmoon_market_t *mk);
 
+// Read a per-market double knob `plugin.whenmoon.market.<id>.<suffix>`,
+// lazy-registering it (with `def_str` + `help`) on first access so the
+// operator can `/set kv …` it without a static registration table;
+// returns `def_val` if registration fails. Exposed for the real-cash
+// reconcile path (live.c), which reads the quote-allocation knobs fresh.
+//
+// WM-QUOTE-ALLOC-1 knob ordering — the three real-mode sizing knobs
+// compose, from bankroll to order:
+//   1. quote_alloc_frac / quote_alloc_max  shape the *bankroll*: bound the
+//      per-market real `cash` ledger to a fraction of, and/or an absolute
+//      ceiling on, the shared quote `available` (most-restrictive wins).
+//      Applied inside wm_live_apply_real_cash_locked at reconcile time, to
+//      both cash and (on a baseline re-anchor) starting_cash — so the
+//      daily-loss cap is relative to allocated capital, not the full
+//      balance.
+//   2. size_frac    sizes each order as a fraction of that capped cash.
+//   3. max_notional caps the resulting per-order notional.
+double wm_mk_kv_get_double(const char *market_id_str, const char *suffix,
+    const char *def_str, double def_val, const char *help);
+
 // Signal entry point. Idempotent w.r.t. position direction:
 // no-op when the strategy advice already matches the current state.
 // Risk gates (daily-loss, max-notional, pending-cap) apply only when

@@ -1273,25 +1273,65 @@ wm_live_quote_available(const char *market_id,
   return(false);
 }
 
-// Bind the real-mode cash ledger to `avail`. Caller holds mk->lock.
-// `reset_baseline` (true for a deliberate operator reconcile) also
-// re-anchors starting_cash, the daily-loss-cap denominator; the periodic
-// auto-reconcile passes false so it only tracks deployable `cash` and
-// leaves an established risk baseline alone — but the very first sync
-// always anchors it (off real funds, not the $10k placeholder).
-static void
+// Bind the real-mode cash ledger to the deployable portion of `avail`,
+// returning the value actually applied (after the WM-QUOTE-ALLOC-1 cap).
+// Caller holds mk->lock. `reset_baseline` (true for a deliberate operator
+// reconcile) also re-anchors starting_cash, the daily-loss-cap denominator;
+// the periodic auto-reconcile passes false so it only tracks deployable
+// `cash` and leaves an established risk baseline alone — but the very first
+// sync always anchors it (off real funds, not the $10k placeholder).
+//
+// WM-QUOTE-ALLOC-1: bound `avail` by the per-market quote-allocation knobs
+// so N flat real markets sharing one quote currency don't each reconcile
+// to the full balance and collectively over-deploy. quote_alloc_frac
+// (default 1.0 = whole balance) and quote_alloc_max (default 0.0 =
+// uncapped) compose — most-restrictive wins. The capped value feeds BOTH
+// cash and starting_cash, so the daily-loss cap is relative to *allocated*
+// capital. Knobs are read FRESH here (not the session-cached params, which
+// only refresh at market start) so an operator `/set kv …quote_alloc_frac`
+// takes effect on the very next reconcile. Reading KV under mk->lock is
+// safe: whenmoon registers every per-market KV with NULL change-callbacks,
+// so kv ops never re-enter market code (mk->lock is a per-market leaf
+// lock; there is no kv->mk lock-ordering path), and reconcile is
+// infrequent.
+static double
 wm_live_apply_real_cash_locked(whenmoon_market_t *mk, double avail,
     bool reset_baseline)
 {
   wm_market_stats_t *rs = &mk->session.stats[WM_MARKET_MODE_REAL];
+  double             frac;
+  double             max;
+  double             capped = avail;
 
-  rs->cash = avail;
+  frac = wm_mk_kv_get_double(mk->market_id_str, "quote_alloc_frac",
+      "1.0", WM_MARKET_DEFAULT_QUOTE_ALLOC_FRAC,
+      "Real-mode quote-balance allocation cap: fraction of the exchange"
+      " 'available' quote balance this market may deploy (1.0 = whole"
+      " balance). Bounds the cash ledger (bankroll); size_frac then sizes"
+      " each order off the capped cash and max_notional caps per-order"
+      " notional. Composes with quote_alloc_max — most-restrictive wins.");
+
+  max = wm_mk_kv_get_double(mk->market_id_str, "quote_alloc_max",
+      "0.0", WM_MARKET_DEFAULT_QUOTE_ALLOC_MAX,
+      "Real-mode quote-balance allocation cap: absolute ceiling in quote"
+      " currency this market may deploy (0 = uncapped). Composes with"
+      " quote_alloc_frac — most-restrictive wins.");
+
+  if(frac >= 0.0 && frac < 1.0 && (avail * frac) < capped)
+    capped = avail * frac;
+
+  if(max > 0.0 && max < capped)
+    capped = max;
+
+  rs->cash = capped;
 
   if(reset_baseline || mk->real_cash_synced_ms == 0)
-    rs->starting_cash = avail;
+    rs->starting_cash = capped;
 
   mk->real_cash_synced_ms = wm_now_ms();
   (void)wm_market_persist_locked(mk);
+
+  return(capped);
 }
 
 bool
@@ -1304,7 +1344,8 @@ wm_market_reconcile_real_cash(whenmoon_market_t *mk, double *out_cash,
   char                        exch[EXCHANGE_NAME_SZ];
   char                        base[16];
   char                        quote[16];
-  double                      avail = -1.0;
+  double                      avail   = -1.0;
+  double                      applied = -1.0;
 
   #define RC_ERR(...) do { \
       if(errbuf != NULL && errbuf_sz > 0) \
@@ -1376,17 +1417,25 @@ wm_market_reconcile_real_cash(whenmoon_market_t *mk, double *out_cash,
   }
 
   // Operator-initiated reconcile (mode->real switch or /whenmoon market
-  // sync): re-anchor the full baseline.
+  // sync): re-anchor the full baseline. The applied (deployable) cash is
+  // the WM-QUOTE-ALLOC-1-capped value, which is what the operator's
+  // bankroll actually becomes — report that, not the raw balance.
   pthread_mutex_lock(&mk->lock);
-  wm_live_apply_real_cash_locked(mk, avail, true);
+  applied = wm_live_apply_real_cash_locked(mk, avail, true);
   pthread_mutex_unlock(&mk->lock);
 
   if(out_cash != NULL)
-    *out_cash = avail;
+    *out_cash = applied;
 
-  clam(CLAM_INFO, WM_LIVE_CTX,
-      "market %s real cash reconciled: %s available=%.2f",
-      mk->market_id_str, quote, avail);
+  if(applied < avail)
+    clam(CLAM_INFO, WM_LIVE_CTX,
+        "market %s real cash reconciled: %s available=%.2f"
+        " deployable=%.2f (capped by quote_alloc)",
+        mk->market_id_str, quote, avail, applied);
+  else
+    clam(CLAM_INFO, WM_LIVE_CTX,
+        "market %s real cash reconciled: %s available=%.2f",
+        mk->market_id_str, quote, avail);
 
   #undef RC_ERR
 
@@ -1432,10 +1481,12 @@ wm_live_reconcile_from_accounts(const char *exchange,
     // daily-loss baseline (only the first sync anchors it).
     if(mk->session.position.side == WM_MARKET_POS_FLAT)
     {
-      wm_live_apply_real_cash_locked(mk, avail, false);
+      double applied = wm_live_apply_real_cash_locked(mk, avail, false);
+
       clam(CLAM_DEBUG2, WM_LIVE_CTX,
-          "market %s real cash auto-reconciled: available=%.2f",
-          mk->market_id_str, avail);
+          "market %s real cash auto-reconciled: available=%.2f"
+          " deployable=%.2f",
+          mk->market_id_str, avail, applied);
     }
 
     pthread_mutex_unlock(&mk->lock);

@@ -213,6 +213,16 @@ typedef struct
 #define WM_MARKET_DEFAULT_MAX_NOTIONAL         0.0
 #define WM_MARKET_DEFAULT_PENDING_CAP            8u
 
+// WM-QUOTE-ALLOC-1: per-market quote-balance allocation cap. When N flat
+// real markets share one quote currency, each would otherwise reconcile
+// its real cash to the FULL quote `available` and collectively over-
+// deploy. These two knobs bound the per-market bankroll; frac (fraction of
+// `available`) and max (absolute ceiling) compose — most-restrictive wins.
+// Defaults = no constraint (whole balance), so behavior is unchanged until
+// an operator sets one. Read fresh at each real-cash reconcile.
+#define WM_MARKET_DEFAULT_QUOTE_ALLOC_FRAC     1.0
+#define WM_MARKET_DEFAULT_QUOTE_ALLOC_MAX      0.0
+
 // Initial capacity for the plugin-global market array. Grows via
 // mem_realloc as `wm_market_add` inserts; there is no hard cap.
 #define WM_MARKET_INIT_CAP       8

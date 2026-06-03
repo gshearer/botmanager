@@ -43,7 +43,9 @@
 
 #define WM_MK_KV_BUF_SZ   (KV_KEY_SZ + 64)
 
-static double
+// Public (declared in market_engine.h): also used by the real-cash
+// reconcile path in live.c to read the quote-allocation knobs fresh.
+double
 wm_mk_kv_get_double(const char *market_id_str, const char *suffix,
     const char *def_str, double def_val, const char *help)
 {
