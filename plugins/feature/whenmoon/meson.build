@@ -14,6 +14,7 @@ whenmoon_include = include_directories('.')
 
 whenmoon_plugin = shared_library('whenmoon',
   'whenmoon.c',
+  'wm_exch_query.c',
   'market.c',
   'aggregator.c',
   'indicators.c',

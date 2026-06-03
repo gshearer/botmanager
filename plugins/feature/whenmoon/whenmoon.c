@@ -16,6 +16,7 @@
 #include "mw.h"
 #include "strategy.h"
 #include "sweep.h"
+#include "wm_exch_query.h"
 
 #include "cmd.h"
 #include "colors.h"
@@ -26,7 +27,6 @@
 
 #include <ta-lib/ta_libc.h>
 
-#include <errno.h>
 #include <inttypes.h>
 #include <pthread.h>
 #include <stdio.h>
@@ -141,115 +141,32 @@ whenmoon_show_markets_cmd(const cmd_ctx_t *ctx)
 // the instant the synchronous dispatch returns — so a reply emitted from
 // an async curl callback is silently dropped. Balances therefore waits
 // on the dispatch thread until the exchange call completes and formats
-// the reply inline. The request is bounded by core.curl.timeout (30 s),
-// and the fetch context is heap-allocated + refcounted so a wait that
-// times out before a late callback cannot use-after-free it (cf. the
-// gemini prime-symbols stack-reclaim crash).
+// the reply inline, via the wm_sync_fetch bridge (wm_exch_query.h).
 //
 // This is an explicit operator action, so the authenticated call is
 // fine for any mode — unlike the background account poll (now removed),
 // which was needless private-endpoint traffic for paper/manual markets.
 
-#define WM_BAL_WAIT_MS   35000
 #define WM_BAL_EXCH_CAP  8
-
-typedef struct
-{
-  pthread_mutex_t            mu;
-  pthread_cond_t             cv;
-  int                        refs;     // waiter + callback
-  bool                       done;
-  exchange_accounts_result_t res;
-} wm_bal_fetch_t;
-
-static void
-wm_bal_fetch_release(wm_bal_fetch_t *w)
-{
-  bool last;
-
-  pthread_mutex_lock(&w->mu);
-  last = (--w->refs == 0);
-  pthread_mutex_unlock(&w->mu);
-
-  if(!last)
-    return;
-
-  pthread_cond_destroy(&w->cv);
-  pthread_mutex_destroy(&w->mu);
-  mem_free(w);
-}
 
 static void
 wm_bal_on_accounts(const exchange_accounts_result_t *res, void *user)
 {
-  wm_bal_fetch_t *w = user;
-
-  pthread_mutex_lock(&w->mu);
-
   if(res != NULL)
-    w->res = *res;
-  else
-    snprintf(w->res.err, sizeof(w->res.err), "no result delivered");
-
-  w->done = true;
-  pthread_cond_signal(&w->cv);
-  pthread_mutex_unlock(&w->mu);
-
-  wm_bal_fetch_release(w);
-}
-
-// Blocking authenticated accounts fetch. Fills `out` (err set on any
-// failure path, including timeout). Caller confirms creds first.
-static void
-wm_bal_fetch_sync(const char *exchange_name, exchange_accounts_result_t *out)
-{
-  wm_bal_fetch_t *w;
-  struct timespec deadline;
-  int             rc = 0;
-
-  memset(out, 0, sizeof(*out));
-
-  w = mem_alloc(WHENMOON_CTX, "bal_fetch", sizeof(*w));
-
-  if(w == NULL)
   {
-    snprintf(out->err, sizeof(out->err), "out of memory");
+    wm_sync_fetch_complete(user, res, sizeof(*res));
     return;
   }
 
-  memset(w, 0, sizeof(*w));
-  pthread_mutex_init(&w->mu, NULL);
-  pthread_cond_init(&w->cv, NULL);
-  w->refs = 2;       // this waiter + the callback
-
-  // exchange_get_accounts_async may invoke wm_bal_on_accounts inline on
-  // a synchronous FAIL, so the lock must not be held across the submit.
-  (void)exchange_get_accounts_async(exchange_name, wm_bal_on_accounts, w);
-
-  clock_gettime(CLOCK_REALTIME, &deadline);
-  deadline.tv_sec  += WM_BAL_WAIT_MS / 1000;
-  deadline.tv_nsec += (long)(WM_BAL_WAIT_MS % 1000) * 1000000L;
-
-  if(deadline.tv_nsec >= 1000000000L)
+  // Translate a NULL result into a typed error so the waiter's copy-out
+  // carries a message rather than a zeroed "ok, 0 currencies".
   {
-    deadline.tv_sec  += 1;
-    deadline.tv_nsec -= 1000000000L;
+    exchange_accounts_result_t err;
+
+    memset(&err, 0, sizeof(err));
+    snprintf(err.err, sizeof(err.err), "no result delivered");
+    wm_sync_fetch_complete(user, &err, sizeof(err));
   }
-
-  pthread_mutex_lock(&w->mu);
-
-  while(!w->done && rc != ETIMEDOUT)
-    rc = pthread_cond_timedwait(&w->cv, &w->mu, &deadline);
-
-  if(w->done)
-    *out = w->res;
-  else
-    snprintf(out->err, sizeof(out->err),
-        "timed out after %d ms waiting for accounts", WM_BAL_WAIT_MS);
-
-  pthread_mutex_unlock(&w->mu);
-
-  wm_bal_fetch_release(w);
 }
 
 // Render one exchange's balances (or the reason none are shown). Doubles
@@ -282,7 +199,31 @@ wm_bal_render(const cmd_ctx_t *ctx, const char *exchange_name)
     return;
   }
 
-  wm_bal_fetch_sync(exchange_name, &res);
+  {
+    wm_sync_fetch_t *w = wm_sync_fetch_begin(sizeof(res));
+
+    if(w == NULL)
+    {
+      snprintf(header, sizeof(header),
+          CLR_BOLD "  %s" CLR_RESET "  " CLR_RED "FAIL" CLR_RESET
+          ": out of memory", exchange_name);
+      cmd_reply(ctx, header);
+      return;
+    }
+
+    // The callback may run inline on a synchronous FAIL; the bridge
+    // tolerates either ordering.
+    (void)exchange_get_accounts_async(exchange_name, wm_bal_on_accounts, w);
+
+    if(!wm_sync_fetch_wait(w, &res, sizeof(res), WM_EXCH_QUERY_WAIT_MS))
+    {
+      snprintf(header, sizeof(header),
+          CLR_BOLD "  %s" CLR_RESET "  " CLR_RED "FAIL" CLR_RESET
+          ": timed out", exchange_name);
+      cmd_reply(ctx, header);
+      return;
+    }
+  }
 
   if(res.err[0] != '\0')
   {
@@ -302,6 +243,7 @@ wm_bal_render(const cmd_ctx_t *ctx, const char *exchange_name)
   for(i = 0; i < res.count; i++)
   {
     char   ccy[EXCHANGE_CURRENCY_SZ];
+    char   bbuf[40], hbuf[40], abuf[40];
     size_t clen;
 
     // Hide fully-zero rows so funded balances stand out.
@@ -313,8 +255,11 @@ wm_bal_render(const cmd_ctx_t *ctx, const char *exchange_name)
     ccy[clen] = '\0';
 
     snprintf(line, sizeof(line),
-        "    %-8s  balance=%-16.8g  hold=%-16.8g  available=%-16.8g",
-        ccy, res.rows[i].balance, res.rows[i].hold, res.rows[i].available);
+        "    %-8s  balance=%-18s  hold=%-18s  available=%-18s",
+        ccy,
+        wm_fmt_amount(res.rows[i].balance,   bbuf, sizeof(bbuf)),
+        wm_fmt_amount(res.rows[i].hold,      hbuf, sizeof(hbuf)),
+        wm_fmt_amount(res.rows[i].available, abuf, sizeof(abuf)));
     cmd_reply(ctx, line);
     shown++;
   }
