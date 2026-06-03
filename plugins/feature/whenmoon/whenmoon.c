@@ -7,7 +7,6 @@
 #include "market.h"
 #include "market_engine.h"
 #include "market_persist.h"
-#include "account.h"
 #include "dl_schema.h"
 #include "dl_jobtable.h"
 #include "dl_commands.h"
@@ -22,10 +21,14 @@
 #include "colors.h"
 #include "kv.h"
 #include "userns.h"
+#include "exchange_api.h"
+#include "alloc.h"
 
 #include <ta-lib/ta_libc.h>
 
+#include <errno.h>
 #include <inttypes.h>
+#include <pthread.h>
 #include <stdio.h>
 #include <string.h>
 #include <time.h>
@@ -56,18 +59,6 @@ wm_now_ms(void)
 // ------------------------------------------------------------------ //
 
 static const plugin_kv_entry_t whenmoon_plugin_schema[] = {
-  { "plugin.whenmoon.exchange.coinbase.account.refresh_sec",
-    KV_UINT32, "30",
-    "Seconds between coinbase /accounts polls. Minimum effective"
-    " value is 5. Ignored when no coinbase apikey is configured.",
-    NULL, NULL },
-
-  { "plugin.whenmoon.exchange.gemini.account.refresh_sec",
-    KV_UINT32, "30",
-    "Seconds between gemini /balances polls. Minimum effective"
-    " value is 5. Ignored when no gemini apikey is configured.",
-    NULL, NULL },
-
   { "plugin.whenmoon.downloader.max_concurrent_jobs", KV_UINT32, "4",
     "Maximum number of jobs in 'running' state at once (1..32). The"
     " feature_exchange token bucket caps effective throughput; higher"
@@ -139,102 +130,231 @@ whenmoon_show_markets_cmd(const cmd_ctx_t *ctx)
 }
 
 // ------------------------------------------------------------------ //
-// /show whenmoon balances                                             //
+// /show whenmoon balances [exchange]                                  //
 // ------------------------------------------------------------------ //
+//
+// On-demand authenticated /accounts fetch. With no argument every
+// registered exchange is queried; with <exchange> only that one.
+//
+// Why this blocks: the control socket (core/botmanctl.c) routes command
+// replies through a single global reply target that bctl_dispatch clears
+// the instant the synchronous dispatch returns — so a reply emitted from
+// an async curl callback is silently dropped. Balances therefore waits
+// on the dispatch thread until the exchange call completes and formats
+// the reply inline. The request is bounded by core.curl.timeout (30 s),
+// and the fetch context is heap-allocated + refcounted so a wait that
+// times out before a late callback cannot use-after-free it (cf. the
+// gemini prime-symbols stack-reclaim crash).
+//
+// This is an explicit operator action, so the authenticated call is
+// fine for any mode — unlike the background account poll (now removed),
+// which was needless private-endpoint traffic for paper/manual markets.
+
+#define WM_BAL_WAIT_MS   35000
+#define WM_BAL_EXCH_CAP  8
+
+typedef struct
+{
+  pthread_mutex_t            mu;
+  pthread_cond_t             cv;
+  int                        refs;     // waiter + callback
+  bool                       done;
+  exchange_accounts_result_t res;
+} wm_bal_fetch_t;
+
+static void
+wm_bal_fetch_release(wm_bal_fetch_t *w)
+{
+  bool last;
+
+  pthread_mutex_lock(&w->mu);
+  last = (--w->refs == 0);
+  pthread_mutex_unlock(&w->mu);
+
+  if(!last)
+    return;
+
+  pthread_cond_destroy(&w->cv);
+  pthread_mutex_destroy(&w->mu);
+  mem_free(w);
+}
+
+static void
+wm_bal_on_accounts(const exchange_accounts_result_t *res, void *user)
+{
+  wm_bal_fetch_t *w = user;
+
+  pthread_mutex_lock(&w->mu);
+
+  if(res != NULL)
+    w->res = *res;
+  else
+    snprintf(w->res.err, sizeof(w->res.err), "no result delivered");
+
+  w->done = true;
+  pthread_cond_signal(&w->cv);
+  pthread_mutex_unlock(&w->mu);
+
+  wm_bal_fetch_release(w);
+}
+
+// Blocking authenticated accounts fetch. Fills `out` (err set on any
+// failure path, including timeout). Caller confirms creds first.
+static void
+wm_bal_fetch_sync(const char *exchange_name, exchange_accounts_result_t *out)
+{
+  wm_bal_fetch_t *w;
+  struct timespec deadline;
+  int             rc = 0;
+
+  memset(out, 0, sizeof(*out));
+
+  w = mem_alloc(WHENMOON_CTX, "bal_fetch", sizeof(*w));
+
+  if(w == NULL)
+  {
+    snprintf(out->err, sizeof(out->err), "out of memory");
+    return;
+  }
+
+  memset(w, 0, sizeof(*w));
+  pthread_mutex_init(&w->mu, NULL);
+  pthread_cond_init(&w->cv, NULL);
+  w->refs = 2;       // this waiter + the callback
+
+  // exchange_get_accounts_async may invoke wm_bal_on_accounts inline on
+  // a synchronous FAIL, so the lock must not be held across the submit.
+  (void)exchange_get_accounts_async(exchange_name, wm_bal_on_accounts, w);
+
+  clock_gettime(CLOCK_REALTIME, &deadline);
+  deadline.tv_sec  += WM_BAL_WAIT_MS / 1000;
+  deadline.tv_nsec += (long)(WM_BAL_WAIT_MS % 1000) * 1000000L;
+
+  if(deadline.tv_nsec >= 1000000000L)
+  {
+    deadline.tv_sec  += 1;
+    deadline.tv_nsec -= 1000000000L;
+  }
+
+  pthread_mutex_lock(&w->mu);
+
+  while(!w->done && rc != ETIMEDOUT)
+    rc = pthread_cond_timedwait(&w->cv, &w->mu, &deadline);
+
+  if(w->done)
+    *out = w->res;
+  else
+    snprintf(out->err, sizeof(out->err),
+        "timed out after %d ms waiting for accounts", WM_BAL_WAIT_MS);
+
+  pthread_mutex_unlock(&w->mu);
+
+  wm_bal_fetch_release(w);
+}
+
+// Render one exchange's balances (or the reason none are shown). Doubles
+// as a credential check: a clean header means the key authenticated.
+static void
+wm_bal_render(const cmd_ctx_t *ctx, const char *exchange_name)
+{
+  exchange_capabilities_t    caps;
+  exchange_accounts_result_t res;
+  char                       header[256];
+  char                       line[256];
+  uint32_t                   i;
+  uint32_t                   shown = 0;
+
+  if(exchange_get_capabilities(exchange_name, &caps) != SUCCESS)
+  {
+    snprintf(header, sizeof(header),
+        CLR_BOLD "  %s" CLR_RESET " (not a registered exchange)",
+        exchange_name);
+    cmd_reply(ctx, header);
+    return;
+  }
+
+  if(!caps.has_credentials)
+  {
+    snprintf(header, sizeof(header),
+        CLR_BOLD "  %s" CLR_RESET " (no credentials configured)",
+        exchange_name);
+    cmd_reply(ctx, header);
+    return;
+  }
+
+  wm_bal_fetch_sync(exchange_name, &res);
+
+  if(res.err[0] != '\0')
+  {
+    snprintf(header, sizeof(header),
+        CLR_BOLD "  %s" CLR_RESET "  " CLR_RED "FAIL" CLR_RESET ": %s",
+        exchange_name, res.err);
+    cmd_reply(ctx, header);
+    return;
+  }
+
+  snprintf(header, sizeof(header),
+      CLR_BOLD "  %s" CLR_RESET "  " CLR_GREEN "ok" CLR_RESET
+      " (%u currenc%s)",
+      exchange_name, res.count, res.count == 1 ? "y" : "ies");
+  cmd_reply(ctx, header);
+
+  for(i = 0; i < res.count; i++)
+  {
+    char   ccy[EXCHANGE_CURRENCY_SZ];
+    size_t clen;
+
+    // Hide fully-zero rows so funded balances stand out.
+    if(res.rows[i].balance == 0.0 && res.rows[i].hold == 0.0)
+      continue;
+
+    clen = strnlen(res.rows[i].currency, sizeof(ccy) - 1);
+    memcpy(ccy, res.rows[i].currency, clen);
+    ccy[clen] = '\0';
+
+    snprintf(line, sizeof(line),
+        "    %-8s  balance=%-16.8g  hold=%-16.8g  available=%-16.8g",
+        ccy, res.rows[i].balance, res.rows[i].hold, res.rows[i].available);
+    cmd_reply(ctx, line);
+    shown++;
+  }
+
+  if(shown == 0)
+    cmd_reply(ctx, "    (all balances zero)");
+}
 
 static void
 whenmoon_show_balances_cmd(const cmd_ctx_t *ctx)
 {
-  whenmoon_state_t   *st;
-  whenmoon_account_t *acc;
-  uint32_t            si;
+  const char *p;
+  char        want[EXCHANGE_NAME_SZ] = {0};
+  char        names[WM_BAL_EXCH_CAP][EXCHANGE_NAME_SZ];
+  uint32_t    n = 0;
+  uint32_t    i;
 
-  st = whenmoon_get_state();
-
-  if(st == NULL || st->account == NULL)
-  {
-    cmd_reply(ctx, "whenmoon: no account state");
-    return;
-  }
-
-  acc = st->account;
-
-  if(acc->n_slots == 0)
-  {
-    cmd_reply(ctx,
-        "whenmoon: no registered exchanges (account refresh disabled)");
-    return;
-  }
+  p = (ctx->args != NULL) ? ctx->args : "";
 
   cmd_reply(ctx, CLR_BOLD "whenmoon balances" CLR_RESET);
 
-  for(si = 0; si < acc->n_slots; si++)
+  // Explicit exchange argument: query just that one.
+  if(wm_dl_next_token(&p, want, sizeof(want)))
   {
-    wm_account_slot_t       *slot = &acc->slots[si];
-    exchange_account_t       rows[WM_ACCOUNT_ROW_CAP];
-    char                     header[160];
-    char                     line[256];
-    char                     err[128];
-    time_t                   ts;
-    uint32_t                 n;
-    uint32_t                 i;
-    exchange_capabilities_t  caps;
-    bool                     have_creds = false;
-
-    pthread_mutex_lock(&slot->lock);
-    n = slot->n_rows;
-
-    if(n > WM_ACCOUNT_ROW_CAP)
-      n = WM_ACCOUNT_ROW_CAP;
-
-    memcpy(rows, slot->rows, sizeof(rows[0]) * n);
-    ts = slot->last_refresh_ts;
-    snprintf(err, sizeof(err), "%s", slot->last_err);
-    pthread_mutex_unlock(&slot->lock);
-
-    if(exchange_get_capabilities(slot->exchange_name, &caps) == SUCCESS
-        && caps.has_credentials)
-      have_creds = true;
-
-    snprintf(header, sizeof(header),
-        CLR_BOLD "  %s" CLR_RESET " %s",
-        slot->exchange_name,
-        have_creds ? "" : "(no creds)");
-    cmd_reply(ctx, header);
-
-    if(err[0] != '\0')
-    {
-      snprintf(line, sizeof(line),
-          "    " CLR_YELLOW "last_err:" CLR_RESET " %s", err);
-      cmd_reply(ctx, line);
-    }
-
-    if(n == 0)
-    {
-      cmd_reply(ctx,
-          have_creds ? "    (no rows yet)" : "    (no creds — no fetch)");
-      continue;
-    }
-
-    snprintf(line, sizeof(line),
-        "    refreshed: %ld", (long)ts);
-    cmd_reply(ctx, line);
-
-    for(i = 0; i < n; i++)
-    {
-      char   ccy[EXCHANGE_CURRENCY_SZ];
-      size_t clen;
-
-      clen = strnlen(rows[i].currency, sizeof(ccy) - 1);
-      memcpy(ccy, rows[i].currency, clen);
-      ccy[clen] = '\0';
-
-      snprintf(line, sizeof(line),
-          "    %-8s  balance=%-16.8g  hold=%-16.8g  available=%-16.8g",
-          ccy, rows[i].balance, rows[i].hold, rows[i].available);
-      cmd_reply(ctx, line);
-    }
+    wm_bal_render(ctx, want);
+    return;
   }
+
+  // No argument: query every registered exchange.
+  if(exchange_name_list(names, WM_BAL_EXCH_CAP, &n) != SUCCESS || n == 0)
+  {
+    cmd_reply(ctx, "  (no exchanges registered)");
+    return;
+  }
+
+  if(n > WM_BAL_EXCH_CAP)
+    n = WM_BAL_EXCH_CAP;
+
+  for(i = 0; i < n; i++)
+    wm_bal_render(ctx, names[i]);
 }
 
 // ------------------------------------------------------------------ //
@@ -347,8 +467,11 @@ whenmoon_register_show_verbs(void)
     return(FAIL);
 
   if(cmd_register("whenmoon", "balances",
-        "show whenmoon balances",
-        "Coinbase /accounts snapshot (per-currency balance/hold/available)",
+        "show whenmoon balances [exchange]",
+        "On-demand authenticated account-balance snapshot. No arg = every"
+        " registered exchange; <exchange> = just that one. Doubles as a"
+        " key check (per-currency balance/hold/available, or the auth"
+        " error).",
         NULL,
         USERNS_GROUP_ADMIN, 100, CMD_SCOPE_ANY, METHOD_T_ANY,
         whenmoon_show_balances_cmd, NULL, "show/whenmoon", NULL,
@@ -381,7 +504,6 @@ whenmoon_subsystems_destroy(whenmoon_state_t *st)
   wm_dl_jobtable_destroy(st);
   wm_dl_destroy(st);
   wm_market_destroy(st);
-  wm_account_destroy(st);
 
   // MW-2: free marketwatch state last (mirrors mw_stop early). Safe
   // when mw_init never ran (mw_g.n_exch == 0 + freshly-zeroed mutex
@@ -428,12 +550,6 @@ whenmoon_init(void)
   if(wm_market_init(st) != SUCCESS)
   {
     clam(CLAM_INFO, WHENMOON_CTX, "wm_market_init failed");
-    goto fail;
-  }
-
-  if(wm_account_init(st) != SUCCESS)
-  {
-    clam(CLAM_INFO, WHENMOON_CTX, "wm_account_init failed");
     goto fail;
   }
 
@@ -654,14 +770,6 @@ whenmoon_start(void)
   if(mw_start() != SUCCESS)
     clam(CLAM_INFO, WHENMOON_CTX,
         "mw_start failed (marketwatch disabled)");
-
-  // KR-2: per-exchange account slot setup happens in start (post coinbase
-  // / kraken `cb_start` so the exchange registry is populated). Init
-  // could only allocate the empty container; this is where slots get
-  // their periodic tasks and an initial fetch where creds are present.
-  if(wm_account_start(st) != SUCCESS)
-    clam(CLAM_INFO, WHENMOON_CTX,
-        "wm_account_start failed (account refresh disabled)");
 
   // WM-LT-8-B3: schedule the REST /fills safety-net poll + boot
   // reconcile (advisory list of any open orders left resting at the

@@ -16,20 +16,19 @@
 
 #define WHENMOON_CTX  "whenmoon"
 
-// Forward decls — the full structs live in market.h / account.h, both
-// WHENMOON_INTERNAL-gated, and are only visible inside the plugin.
+// Forward decls — the full structs live in market.h, WHENMOON_INTERNAL-
+// gated, and are only visible inside the plugin.
 typedef struct whenmoon_markets        whenmoon_markets_t;
-typedef struct whenmoon_account        whenmoon_account_t;
 typedef struct dl_jobtable             dl_jobtable_t;
 typedef struct wm_strategy_registry    wm_strategy_registry_t;
 
 // Plugin-global singleton state. Allocated in whenmoon_init, freed in
-// whenmoon_deinit. Markets, account, and downloader are now plugin-
-// scoped (no per-bot binding) following WM-G1.
+// whenmoon_deinit. Markets and downloader are now plugin-scoped (no
+// per-bot binding) following WM-G1. Account balances are fetched
+// on-demand by `/show whenmoon balances` (no cached account state).
 typedef struct whenmoon_state
 {
   whenmoon_markets_t *markets;   // owned; NULL when market init failed
-  whenmoon_account_t *account;   // owned; NULL when account init failed
 
   // Downloader schema + registry readiness. Flipped to true by
   // wm_dl_init() once the core metadata tables exist. WM-S4+ gates all
