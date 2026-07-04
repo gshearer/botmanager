@@ -46,9 +46,10 @@ anything else.
 > - **END of every round — update it before you're cleared.** Write for your
 >   next context as if briefing a sharp stranger who is *you* but remembers
 >   nothing. Include at minimum:
->   - your current **best config**: exact param string + per-market
->     walk-forward numbers (`final_equity` / `trades` / `n_windows`) + the
->     resulting `avg $/mo` and `trades/mo`;
+>   - your current **best config**: exact param string + its **`robust_ratio`**
+>     and the supporting per-market figures (`mean_fold` / `worst_fold` /
+>     `pos_frac` / `max_drawdown`, `trades/mo`, and whether it survives
+>     2–4× friction) — the §4 score, not the `final_equity` fantasy;
 >   - **what you changed this round** and whether it helped;
 >   - **what you proved does NOT work**, with the *why* — this is gold; it
 >     stops your next self repeating a dead end;
@@ -65,32 +66,38 @@ anything else.
 
 ## 1. The contest, in one paragraph
 
-Build the **best whenmoon trading strategy** and give it a name of your
-choosing. "Best" is scored across the **entire ~10-year history** of
-Coinbase **BTC-USD** and **ETH-USD** (walk-forward, every regime), so the
-winner has to be *robust*, not tuned to one recent market mood. Two
-numbers decide it (exact recipe in §4):
+Build a whenmoon trading strategy **good enough to trade real money**, and
+give it a name of your choosing. **That is the actual goal** — the two best
+strategies run a 1-month live-paper trial, and the winner becomes a
+real-money strategy. So "best" is not the biggest backtest number; it's the
+most **robust, realizable, risk-controlled edge** — scored across the
+**entire ~10-year history** of Coinbase **BTC-USD** and **ETH-USD**
+(walk-forward, every regime). Two numbers decide it (exact recipe in §4):
 
-1. **Average monthly profit** — *primary*. A compounding-neutral monthly
-   profit rate across the whole history, expressed as $/month on a fixed
-   $10k stake. The strategy that reliably brings home the most money,
-   decade in and decade out, wins.
-2. **Average monthly trades** — *secondary*. Among profitable strategies,
-   trading actively is rewarded — the operator wants a strategy that
-   *works the market*, not one that trades twice a year and gets lucky.
+1. **Risk-adjusted per-window robustness** — *primary*. On each 4-month
+   out-of-sample window the strategy earns a plain, non-compounding return
+   on a fixed $10k; we rank on the **consistency of that realizable edge
+   across every regime and both markets** (mean per-window return ÷ its
+   dispersion), behind hard gates on drawdown, worst-window loss, and
+   survival under 2–4× trading costs. Steady and robust beats spiky and
+   huge. **We do NOT score compounded terminal equity** — over a decade it
+   runs to unrealizable fantasy ($10k → billions) and tells you nothing
+   about live performance.
+2. **Average monthly trades** — *secondary*. Among gate-passing strategies,
+   trading actively is rewarded — a strategy that *works the market*, not
+   one that trades twice a year and gets lucky.
 
 The operator runs the competition over **many rounds**, watching the
-standings climb round after round. When the operator calls the final
-round, **1st and 2nd place** go on to a **1-month live paper-trading run**
-in BTC-USD and ETH-USD (built in a later context — out of scope for you
-now, but it's why active, deployable strategies matter: a compounding
-artifact that flips thousands of times in backtest but is fragile live
-is a worse finalist than a robust active trader).
+standings climb. When the operator calls the final round, the **two best
+*and most different*** strategies go on to the **1-month live paper-trading
+run** in BTC-USD and ETH-USD. "Most different" is deliberate: two
+near-identical strategies waste the trial, so a distinctive, robust edge is
+worth far more than tying a leader on a saturated number.
 
 Three coding agents (you're one) compete, each iterating its own strategy
-across rounds. **Play to win**: iterate hard, validate honestly, record
-every result on the scoreboard, and hand your next-round self a strong
-NOTES.md so you keep climbing instead of restarting.
+across rounds. **Play to win**: find an edge no one else has, validate it
+honestly, record every result on the scoreboard, and hand your next-round
+self a strong NOTES.md so you keep climbing instead of restarting.
 
 ---
 
@@ -108,10 +115,14 @@ whenmoon's C source. It covers:
   spiral (~0.2%/round-trip),
 - `backtest run` / `compile` / sweep / `--oos-tail` / `--walk-forward`,
 - overfitting discipline (broad ridges, not knife-edge peaks),
-- worked examples to copy: `example_sma_cross` (minimal), `cp1`
-  (Donchian trend-rider), `cp2` (multi-timeframe), `surf` (active,
-  deployable). **`surf` is the closest template to what wins *this*
-  contest** — validated, active, and net-positive on both markets.
+- worked examples to copy for *mechanics*: `example_sma_cross` (minimal),
+  `cp1` (Donchian trend-rider), `cp2` (multi-timeframe), `surf` (active,
+  deployable). `surf` is a good **robustness** template (net-positive
+  every regime, low drawdown) — but copying it, or the field's existing
+  regime-flipper family, is a losing move here: the score now rewards a
+  **distinct, robust, friction-surviving edge** (§4), and duplicates of a
+  peer's mechanism don't advance. Learn the ABI from these; then build
+  something that isn't them.
 
 Read it now, then come back here for the exact scoring recipe and the
 competition protocol.
@@ -302,13 +313,36 @@ the number. This is deliberately hard to overfit: the winner has to be
 robust across ten years, which is what makes it a good live-paper
 finalist.
 
-**Why not just "profit in dollars"?** Over a decade, fractional-of-equity
-sizing compounds — a good strategy turns $10k into millions, so raw
-"$/month" is dominated by the huge late-stage base and is meaningless
-(e.g. `surf` shows ~$134k/mo, which is just "it compounded to $16M").
-The score is therefore a **compounding-neutral monthly rate**, which we
-also express as **$/month on a fixed $10k stake** so it still reads as
-profit.
+**The end goal, and what the score therefore rewards.** The prize is not
+a backtest number — it's a **strategy that will be handed real money to
+trade live.** The operator picks the **two best *and most different***
+strategies for a 1-month live-paper run; the live winner becomes a
+real-money strategy. So the score is built to predict *live* success, not
+to crown the biggest backtest. We reward a **realizable, risk-adjusted
+edge that holds up in every regime and survives real trading costs**, and
+we deliberately **do not score terminal compounded equity** — it is a
+liquidity-free fantasy (see Step C). A config that "compounds $10k into
+billions" in the sim has told you *nothing* about whether it earns money
+live: the sim fills any size at the bar price, so a fixed-fraction bet
+runs past $1B — long before which you'd own the entire market. What
+predicts live performance is a **steady, positive, low-drawdown return
+window after window across ten years** — including the recent windows the
+live month will resemble. That, not a giant final number, is the target.
+
+> ⚠️ **Why this recipe changed (read if you competed a prior round).** The
+> earlier recipe ranked on *compounding-neutral monthly $/mo*, derived
+> from `final_equity`. Over a decade-long BTC/ETH bull market with
+> long-only fixed sizing, that metric has a single global attractor —
+> "optimally time the regime to harvest the asset's beta" — so every
+> competent trend-follower converges to the *same* ceiling and the metric
+> can't tell them apart (a prior round had two strategies tie to the
+> dollar at a $74-trillion terminal equity). Worse, it rewarded a number
+> no live account can realize while *ignoring* drawdown, risk-adjustment,
+> and cross-regime consistency — the things that actually decide live
+> success. The recipe below fixes that: it scores the realizable per-fold
+> return distribution and its risk, not the fantasy end balance. If a
+> prior round left you "at the ceiling," you are **not** done — the real
+> contest just moved to the axes that matter.
 
 ### Step A — compile the two full-history scoring corpora (once; re-compile only if `/tmp` is cleared or a schema bump invalidates `.wm`)
 
@@ -370,54 +404,104 @@ walk-forward params** — the score must be identical-recipe for everyone.
 - **Where the score numbers live.** Each run writes a result directory
   under `/mnt/fast/web/lame/whenmoon/<timestamp>-<yourname>-<market>/`
   (path printed on the `run queued:` line and repeated in the
-  `run <yourname> complete:` log line). Read the authoritative row from
-  **`iterations.jsonl`** — the walk-forward result is the **aggregate
-  over all out-of-sample test windows**, in the top-level `metrics`
-  object (note: the `oos` object is *not* populated in walk-forward mode
-  — `"oos":{"have":false}` — read `metrics`):
+  `run <yourname> complete:` log line). Read **`iterations.jsonl`**; a
+  walk-forward row carries BOTH a per-fold **`windows[]`** array (what you
+  score on) and an aggregate `metrics` object (for the risk fields):
   ```json
-  "metrics": { "realized_pnl": 2540483, "trades": 1015,
-               "final_equity": 2376686, "max_drawdown": 0.022,
-               "sharpe": 0.25, ... },
+  "windows": [ { "fold": 0, "return": 0.0909, "trades": 35,
+                 "realized_pnl": 908.7, "final_equity": 10817.8,
+                 "start_ts_ms": 1451855160000, "end_ts_ms": 1462223160000 },
+               ... ],                       // one entry per OOS test window
+  "metrics": { "max_drawdown": 0.022, "sortino": 2.27, "sharpe": 0.25,
+               "trades": 1015, "final_equity": 2376686, ... },
   "n_windows": 32
   ```
-  You need three fields per market: **`metrics.final_equity`**,
-  **`metrics.trades`**, and **`n_windows`**. (There is **no** `[oos]`
-  console line — ignore any older doc that says otherwise.)
+  Score on **`windows[].return`** — each is the **non-compounding 120-day
+  return on the $10k stake** for that out-of-sample window (`return =
+  realized_pnl / 10000`), the realizable per-window number — plus
+  **`metrics.max_drawdown`** and **`metrics.sortino`** for the risk gates
+  (Step C). `metrics.final_equity` is **reported but NOT scored** (it's
+  the fantasy compounded balance). (`oos` is not populated in walk-forward
+  — `"oos":{"have":false}`; there is no `[oos]` console line.)
 
-### Step C — compute the score
+### Step C — compute the score (realizable per-fold robustness, NOT terminal equity)
 
-Per market, from `iterations.jsonl` (each market started from a $10k
-stake). Test windows are 120 days; `~30.44` days/month:
+Score the **distribution of per-fold returns** — `windows[].return`, each
+the non-compounding 120-day return on the $10k stake — pooled across both
+markets, plus the aggregate risk fields. Test window = 120 days.
 
+```python
+import json, statistics as st
+def folds(d):                       # d = one market's result dir
+    r  = [json.loads(l) for l in open(d + '/iterations.jsonl') if l.strip()][0]
+    fr = [w['return'] for w in r['windows']]        # non-compounding per-fold returns
+    m  = r['metrics']
+    return fr, m['max_drawdown'], m['sortino'], r['metrics']['trades'], r['n_windows']
+
+fr_btc, dd_btc, sor_btc, tr_btc, nw_btc = folds(btc_dir)
+fr_eth, dd_eth, sor_eth, tr_eth, nw_eth = folds(eth_dir)
+allf = fr_btc + fr_eth                              # pool both markets' folds (~64)
+
+mean_fold  = st.mean(allf)                          # avg realizable 120-day return
+std_fold   = st.pstdev(allf)                        # cross-regime dispersion
+worst_fold = min(allf)                              # worst window (a live-month analog)
+pos_frac   = sum(x > 0 for x in allf) / len(allf)   # consistency across regimes
+
+robust_ratio = mean_fold / std_fold if std_fold else 0.0   # PRIMARY
+
+# readability: mean per-fold return also as $/120-day-window on $10k
+mean_window_profit = mean_fold * 10000
+trades_pm = tr_btc/(nw_btc*120/30.44) + tr_eth/(nw_eth*120/30.44)   # SECONDARY
 ```
-months_m   = n_windows_m * 120 / 30.44                    # OOS months tested
-mo_return_m = (final_equity_m / 10000) ** (1/months_m) - 1  # geometric monthly return
-mo_profit_m = mo_return_m * 10000                         # $/month on a fixed $10k stake
-trades_pm_m = trades_m / months_m
 
-# Combine the two markets (equal-weight $10k each):
-avg_month_profit = (mo_profit_btc + mo_profit_eth) / 2    # PRIMARY  ($/mo per $10k)
-avg_month_trades =  trades_pm_btc + trades_pm_eth         # SECONDARY (trades/mo, both markets)
-```
+**PRIMARY ranking = `robust_ratio`** — mean per-fold return ÷ its
+cross-regime standard deviation, pooled over both markets. It measures a
+**consistent, realizable edge in every regime and both assets** — the
+number a live account would actually size on. Higher wins. (A few monster
+folds no longer buy you the title; steady positive windows do.)
 
-**Primary ranking = `avg_month_profit` (higher wins)** — the
-compounding-neutral monthly profit rate, averaged across both markets.
-**Secondary = `avg_month_trades`** (higher is better, rewards active
-trading). A strategy that ends below $10k on a market has negative
-monthly return there — **profit is the gate.** (Equivalent, since the
-corpus + walk-forward params are identical for everyone: ranking by
-`final_equity` alone ranks you the same; the formula just makes the
-number a readable $/month.)
+**Eligibility GATES — fail ANY and you cannot be a finalist, whatever your
+ratio** (real money can't run a strategy that blows up in one regime or
+evaporates under real costs):
+- **Profit floor:** `mean_fold > 0` on *each* market — positive expected
+  window. Profit is still the gate.
+- **Consistency:** `pos_frac ≥ 0.75` — ≥3 of every 4 windows net-positive.
+- **Worst-window floor:** `worst_fold ≥ −0.10` — no single 120-day window
+  loses more than 10% of the stake.
+- **Drawdown ceiling:** `metrics.max_drawdown ≤ 0.30` on each market.
+- **Friction survival:** re-run the SAME fixed config at 2× and 4× costs
+  (`--fee-bps 10 --slip-bps 10`, then `--fee-bps 20 --slip-bps 20`); it
+  must still clear the profit + consistency gates. An edge that dies under
+  realistic slippage is not an edge — it will not survive live.
+
+**SECONDARY = `trades_pm`** (trades/mo, both markets): among gate-passing
+strategies, actively working the market is still rewarded.
+
+**Reported but NOT scored: `metrics.final_equity`.** It is the fantasy
+compounded balance (no liquidity model → a $10k stake "grows" past $1B).
+Do not optimize it; do not treat a big terminal number as winning. Two
+configs can tie on it while differing wildly on the risk and consistency
+that decide live money.
 
 > **Honesty is the whole game.** The walk-forward *is* your out-of-sample
 > test — but you can still overfit the one fixed config to this exact
 > decade, so favor a config that sits on a **broad param ridge** (a whole
-> neighborhood stays net-positive across the history), not a knife-edge
-> peak. And obey the **lookahead rules** — a strategy that reads the
-> future is disqualified the moment it's caught, and it's easy to catch
-> (its returns are absurd). Record the honest number, not the flattering
-> one.
+> neighborhood stays robust across the history), not a knife-edge peak.
+> Obey the **lookahead rules** — a strategy that reads the future is
+> disqualified the moment it's caught, and it's easy to catch (its returns
+> are absurd). Record the honest number, not the flattering one.
+
+> **Be different — a duplicate is worthless.** The operator advances the
+> two **most different** gate-passing strategies, because the live-paper
+> month is only a real test if it compares genuinely different bets. A
+> strategy that converges onto the *same mechanism* a peer already posted
+> (same regime trigger, same timeframe, same edge) adds nothing — if two
+> configs produce near-identical fold series, at most one can advance.
+> **Do not "defend a ceiling" or tie a leader; find an edge no one else
+> has.** Different timeframe, different inefficiency (mean-reversion,
+> breakout, volatility regime, momentum persistence), different exposure
+> profile, better worst-window behavior, stronger friction survival — the
+> distinctive, robust strategy beats the crowded one every time here.
 
 ---
 
@@ -427,10 +511,18 @@ The scoreboard is **`plugins/feature/whenmoon/strategy/SCOREBOARD.md`**.
 **At the end of each working turn**, append one row for your best
 validated config so far, in the format the file's header specifies (open
 it — the format and the worked example are at the top). Include: your
-competitor number, strategy name, `avg_month_profit`, `avg_month_trades`,
-the per-market walk-forward figures (`final_equity`/`trades`/`n_windows`),
-your fixed param string, and a one-line
-description of the strategy's thesis + how you validated it.
+competitor number, strategy name, the **primary `robust_ratio`**, the
+supporting figures (`mean_fold` / `worst_fold` / `pos_frac` /
+`max_drawdown` per market, and `trades/mo`), a **friction-survival**
+note (does it still pass the gates at 2×/4× costs), your fixed param
+string, and a one-line thesis + how you validated it. (`final_equity` may
+be listed for context but is explicitly **not** the score.)
+
+> **NOTE — the score recipe changed this round** (per-fold robustness +
+> risk, no longer compounded `$/mo`; see §4). The SCOREBOARD.md header may
+> still describe the old `avg_month_profit` recipe until it's re-synced;
+> **§4 of this file is authoritative** — score by §4 and label your new
+> rows with the `robust_ratio` recipe. Leave older rows as historical.
 
 Keep prior rows (the scoreboard is a running log of progress, not just a
 single best line). Never delete a peer's rows.
@@ -449,7 +541,7 @@ operator joins to `#cabal` at startup. The `say` command routes a line
 out through that bot's IRC method to the channel:
 
 ```sh
-build/tools/botmanctl say botman '#cabal' 'cp<N> [<yourname>] avg $/mo=<X> trades/mo=<Y> — <your line>'
+build/tools/botmanctl say botman '#cabal' 'cp<N> [<yourname>] robust_ratio=<X> worst_fold=<W> maxDD=<D> tr/mo=<Y> — <your line>'
 ```
 
 Syntax: `say <bot> <target> <message>` — `<bot>` is the bot instance
@@ -479,8 +571,17 @@ announcement — trash talk is in-bounds and keeps it fun.
   per-market tuning in the scored run.
 - **Default economics** ($10k, size 0.25, 5bps fee, 5bps slip) for the
   official run.
-- **Validate before you believe** — broad ridge + walk-forward /
-  oos. Over-trading bleeds the account on fees; favor conviction.
+- **The score is realizable robustness, not terminal equity** (§4 Step C):
+  primary `robust_ratio` behind hard gates (worst-window floor, max
+  drawdown ≤30%, and **survival at 2–4× friction**). Ignore the compounded
+  `final_equity` fantasy — it is not scored.
+- **Be different — advance on a distinct edge, not a tie.** The two
+  finalists are the most *different* gate-passing strategies; a duplicate
+  of a peer's mechanism advances no one. Don't defend a ceiling; find an
+  edge nobody else has.
+- **Validate before you believe** — broad ridge + walk-forward, consistent
+  across regimes and under friction. Over-trading bleeds the account on
+  fees; favor a real, robust edge.
 - **Scope discipline** — your own strategy dir only; reload, never
   restart; keep `--threads` modest; don't disturb peers.
 - **Record every turn** on the scoreboard and announce to #cabal; **at
