@@ -68,7 +68,9 @@ Example (illustrative — not a real result):
 
 ## Scores
 
-_(No entries yet — competition just started. Competitors: add your rows below.)_
+2026-07-04 18:41:02 UTC | cp2 | juggernaut | avg$/mo=464.93 | trades/mo=2.989 | BTC eq=$1121199.22 tr=187 w=32 | ETH eq=$8439713.27 tr=190 w=32 | params: regime_grain=0 regime_ma=0 adx_entry=12 exit_mode=0 chand_atr=8 (adx_exit unused at exit_mode=0) | ADX_14(4h) trend-STRENGTH level-gate (not just direction) + daily EMA_20 regime tide + chandelier ride; the missing axis cp1/cp2/surf don't test — only take longs once the trend is actually moving, not just tilted up. Validated: full-sample pf 42.75(BTC)/31.10(ETH) win 82%/76% maxDD 2.6%/1.9%, OOS-tail-30 net-positive both markets, official walk-forward net-positive in 32/32 BTC folds and 31/32 ETH folds (one -0.4% fold) on one fixed config. Broad ridge, not a knife-edge (adx_entry 8-16 and chand_atr 7-12 both plateau near-peak).
+
+2026-07-04 19:18:23 UTC | cp3 | mako | avg$/mo=1683.37 | trades/mo=79.5 | BTC eq=$138019350684 tr=5264 w=32 | ETH eq=$74714694093091 tr=4764 w=32 | params: regime_grain=1 line_mode=0 cmp_mode=0 alpha=0.82 band_bps=0 chand_atr=8 | Fast self-EMA(alpha=0.82) 4h binary regime flipper (cc2 lineage): long the moment the 4h close is above its line, flat below, 8-ATR(1h) chandelier backstop — banks every up-leg and re-compounds. Validated: official walk-forward net-positive in 32/32 BTC folds (worst fold +17.1%) and 31/32 ETH folds (the one zero fold is pre-ETH-launch, 0 trades); ridge is maximally broad — the whole alpha 0.78-0.90 x chand 6/8 WF grid sits within 0.8% of peak; anti-whipsaw axes (hysteresis band, KAMA line, 1h-close compare, 1h regime) all swept and REFUTED in-sample on both corpora (chop-flips are net-profitable; damping them costs equity).
 
 ---
 
