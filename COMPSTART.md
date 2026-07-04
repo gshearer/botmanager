@@ -1,23 +1,65 @@
 # COMPSTART.md — Strategy Competition Entry Point
 
-> ## ✅ COMPETITION IS OPEN (operator, 2026-07-04)
+> ## 🔁 COMPETITION CONTINUES — a MULTI-ROUND contest (operator, 2026-07-04)
 >
-> **Go — you may begin competing.** Both engine blockers are fixed and
-> live-verified (`plugins/feature/whenmoon/TODO.md`: WM-DL-CANDLES-CAP-1,
-> WM-BT-WF-PERFOLD-1). The setup below (corpora, scoring recipe, rules) is
-> complete and final. Read this file top to bottom, then read
-> `plugins/feature/whenmoon/strategy/AGENTS.md`, create your strategy, and
-> go win.
+> **This competition runs over many rounds, and you are CONTINUING it, not
+> starting a new one.** At least one round has already concluded. Each
+> round, the competing contexts are `/clear`'d and started fresh, so a
+> competitor remembers **nothing** between rounds except what it wrote to
+> disk. The engine, corpora, scoring recipe, and rules below are stable and
+> final across rounds — what changes round to round is how far each
+> competitor has pushed its strategy and its score.
+>
+> **Before anything else, read your `NOTES.md` if it exists** (see the 📝
+> callout right below) — it's the letter your previous-round self left you.
+> (If there isn't one yet, the notes system is new this round: your
+> committed strategy dir + the scoreboard are your starting point, and you
+> begin the notes habit at this round's end.) Then read this file top to
+> bottom, read `plugins/feature/whenmoon/strategy/AGENTS.md`, and
+> **continue where you left off** — push your score past last round's.
 
 **You are a competitor in the whenmoon trading-strategy competition.**
-The operator started your context fresh and told you your **competitor
+The operator started your fresh context and told you your **competitor
 number (1, 2, or 3)**. This file is your complete entry point: read it,
-then get to work. You do **not** need to read the whole codebase — the
-one other file you must read is the strategy dev-loop guide (linked
-below).
+then pick up where your `NOTES.md` leaves off. You do **not** need to read
+the whole codebase — the one other file you must read is the strategy
+dev-loop guide (linked below).
 
 If your competitor number is unclear, ask the operator before doing
 anything else.
+
+---
+
+> ## 📝 Rounds & your NOTES.md — read it at the start, update it at the end
+>
+> Every round begins from a `/clear`'d (empty) context, so your only memory
+> across rounds is a file you own and maintain:
+> **`plugins/feature/whenmoon/strategy/<yourname>/NOTES.md`**. It lives in
+> your own strategy directory and is committed alongside your strategy, so
+> it survives the clear. Create it the first round; grow it every round.
+>
+> - **START of a round — read it first.** It's the fastest way to avoid
+>   re-deriving what a prior-round you already worked out: your current best
+>   validated config + score, the param ridges you mapped, the dead ends you
+>   already refuted (so you don't burn this round re-testing them), and the
+>   promising ideas you ran out of context to try.
+> - **END of every round — update it before you're cleared.** Write for your
+>   next context as if briefing a sharp stranger who is *you* but remembers
+>   nothing. Include at minimum:
+>   - your current **best config**: exact param string + per-market
+>     walk-forward numbers (`final_equity` / `trades` / `n_windows`) + the
+>     resulting `avg $/mo` and `trades/mo`;
+>   - **what you changed this round** and whether it helped;
+>   - **what you proved does NOT work**, with the *why* — this is gold; it
+>     stops your next self repeating a dead end;
+>   - your **ranked next experiments** — where you'd start with fresh context.
+> - **It is yours alone.** One NOTES.md per competitor, in your own strategy
+>   dir. Do not read or edit a peer's NOTES.md — that's their private edge,
+>   just like their strategy source.
+>
+> The **scoreboard** (§5) is the *public* running record everyone sees;
+> **NOTES.md** is your *private* cross-round working memory. Keep both
+> current — the scoreboard each turn, NOTES.md at least at round's end.
 
 ---
 
@@ -37,15 +79,18 @@ numbers decide it (exact recipe in §4):
    trading actively is rewarded — the operator wants a strategy that
    *works the market*, not one that trades twice a year and gets lucky.
 
-The operator decides when the competition ends and picks **1st and 2nd
-place**. Those two go on to a **1-month live paper-trading run** in
-BTC-USD and ETH-USD (built in a later context — out of scope for you
+The operator runs the competition over **many rounds**, watching the
+standings climb round after round. When the operator calls the final
+round, **1st and 2nd place** go on to a **1-month live paper-trading run**
+in BTC-USD and ETH-USD (built in a later context — out of scope for you
 now, but it's why active, deployable strategies matter: a compounding
 artifact that flips thousands of times in backtest but is fragile live
 is a worse finalist than a robust active trader).
 
-Three coding agents (you're one) compete. **Play to win**: iterate hard,
-validate honestly, and record every result on the scoreboard.
+Three coding agents (you're one) compete, each iterating its own strategy
+across rounds. **Play to win**: iterate hard, validate honestly, record
+every result on the scoreboard, and hand your next-round self a strong
+NOTES.md so you keep climbing instead of restarting.
 
 ---
 
@@ -225,14 +270,22 @@ truth for "is a recovery in progress?" — read and write it there.
 the daemon to "test" something. If you're careful in your own module,
 this never happens.
 
-### Creating your strategy plugin (first time)
+### Your strategy plugin — continue an existing one, or create it (first round only)
 
-Follow **`strategy/AGENTS.md` §"Adding a brand-new strategy"** verbatim
-(copy `example_sma_cross` or `surf`, rename, set the `plugin_desc_t`
-kind/provides, edit its tiny `meson.build`, add the `subdir` line,
-build, first-load). Pick your strategy **name** now — it's your
-`plugin_desc_t` `kind`, your directory name, and how you'll appear on
-the scoreboard and in #cabal. Make it memorable.
+**If your strategy directory already exists** (a prior round —
+`plugins/feature/whenmoon/strategy/<yourname>/` holding your `.c` and your
+`NOTES.md`), you are **not** creating anything: reload it
+(`whenmoon strategy reload <yourname>`), re-read your NOTES.md, and jump
+straight into the dev loop to iterate on what you already have. Your name,
+directory, and scoreboard identity carry over unchanged.
+
+**Only if this is your slot's first round** (no directory yet): follow
+**`strategy/AGENTS.md` §"Adding a brand-new strategy"** verbatim (copy
+`example_sma_cross` or `surf`, rename, set the `plugin_desc_t`
+kind/provides, edit its tiny `meson.build`, add the `subdir` line, build,
+first-load). Pick your strategy **name** now — it's your `plugin_desc_t`
+`kind`, your directory name, and how you'll appear on the scoreboard and
+in #cabal. Make it memorable; you'll carry it across every round.
 
 ---
 
@@ -430,7 +483,10 @@ announcement — trash talk is in-bounds and keeps it fun.
   oos. Over-trading bleeds the account on fees; favor conviction.
 - **Scope discipline** — your own strategy dir only; reload, never
   restart; keep `--threads` modest; don't disturb peers.
-- **Record every turn** on the scoreboard and announce to #cabal.
+- **Record every turn** on the scoreboard and announce to #cabal; **at
+  round's end, update your `NOTES.md`** so your next-round self keeps your
+  progress instead of starting over.
 
-Now read `plugins/feature/whenmoon/strategy/AGENTS.md`, create your
-strategy, and go win. Good luck. 🚀
+Now read `plugins/feature/whenmoon/strategy/AGENTS.md`, then continue your
+strategy where your `NOTES.md` left off (or create it if this is your
+slot's first round), and push your score past last round's. Good luck. 🚀
