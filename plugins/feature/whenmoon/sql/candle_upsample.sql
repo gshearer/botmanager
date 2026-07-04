@@ -8,7 +8,8 @@
 --   wm_candle_upsample(p_table_name TEXT,
 --                      p_gran_secs  INT,
 --                      p_start_ts   TIMESTAMPTZ,
---                      p_end_ts     TIMESTAMPTZ)
+--                      p_end_ts     TIMESTAMPTZ,
+--                      p_limit      INT)
 --   RETURNS TABLE (ts TIMESTAMPTZ, low/high/open/close/volume DOUBLE)
 --
 -- Invariants:
@@ -22,12 +23,25 @@
 --     the window are filtered BEFORE grouping, so partial edge buckets
 --     aggregate only the 1m rows that fall inside the window.
 --   * Output ordering is ascending ts; no caller-side ORDER BY needed.
+--   * p_limit caps the number of rows returned and is pushed INTO the
+--     inner query so it bounds the fetch on BOTH sides -- the DB-side
+--     tuplestore and the client result -- not just a post-fetch trim.
+--     For gran=60 this is an index-bounded `ORDER BY ts LIMIT n` scan
+--     that stops after n rows without materializing the whole window
+--     (WM-DL-CANDLES-CAP-1: a wide-range dump used to build the full
+--     multi-year tuplestore and wedge the shared daemon). Non-positive
+--     p_limit (or NULL) means unlimited.
+
+-- Signature changed 4->5 args (added p_limit); drop the old overload so
+-- the two do not coexist. IF EXISTS -> idempotent no-op after first boot.
+DROP FUNCTION IF EXISTS wm_candle_upsample(TEXT, INT, TIMESTAMPTZ, TIMESTAMPTZ);
 
 CREATE OR REPLACE FUNCTION wm_candle_upsample(
   p_table_name TEXT,
   p_gran_secs  INT,
   p_start_ts   TIMESTAMPTZ,
-  p_end_ts     TIMESTAMPTZ
+  p_end_ts     TIMESTAMPTZ,
+  p_limit      INT
 ) RETURNS TABLE (
   ts     TIMESTAMPTZ,
   low    DOUBLE PRECISION,
@@ -43,14 +57,20 @@ BEGIN
       p_gran_secs;
   END IF;
 
+  -- Non-positive limit -> unlimited (LIMIT NULL is a no-op bound).
+  IF p_limit IS NOT NULL AND p_limit <= 0 THEN
+    p_limit := NULL;
+  END IF;
+
   IF p_gran_secs = 60 THEN
     RETURN QUERY EXECUTE format(
       'SELECT ts, low, high, open, close, volume'
       '  FROM %I'
       ' WHERE ts >= $1 AND ts < $2'
-      ' ORDER BY ts',
+      ' ORDER BY ts'
+      ' LIMIT $3',
       p_table_name
-    ) USING p_start_ts, p_end_ts;
+    ) USING p_start_ts, p_end_ts, p_limit;
     RETURN;
   END IF;
 
@@ -65,9 +85,10 @@ BEGIN
     '  FROM %I c'
     ' WHERE c.ts >= $1 AND c.ts < $2'
     ' GROUP BY bucket_ts'
-    ' ORDER BY bucket_ts',
+    ' ORDER BY bucket_ts'
+    ' LIMIT $4',
     p_table_name
-  ) USING p_start_ts, p_end_ts, p_gran_secs;
+  ) USING p_start_ts, p_end_ts, p_gran_secs, p_limit;
 END;
 $$;
 

@@ -555,13 +555,19 @@ wm_dl_candles_query_aggregated(int32_t market_id, int32_t gran_secs,
   if(e_table == NULL || e_start == NULL || e_end == NULL)
     goto out;
 
+  // Push `cap` into the function as its row LIMIT (5th arg) so the fetch
+  // is bounded on BOTH sides -- the DB-side tuplestore and the client
+  // db_result -- regardless of how wide the requested window is. Without
+  // this a multi-year 1m range materialized millions of rows under the
+  // command mutex and wedged the shared daemon (WM-DL-CANDLES-CAP-1).
   written = snprintf(sql, sizeof(sql),
       "SELECT EXTRACT(EPOCH FROM ts)::BIGINT,"
       "       low, high, open, close, volume"
       "  FROM wm_candle_upsample('%s', %" PRId32 ","
       "                          TIMESTAMPTZ '%s',"
-      "                          TIMESTAMPTZ '%s')",
-      e_table, gran_secs, e_start, e_end);
+      "                          TIMESTAMPTZ '%s',"
+      "                          %" PRIu32 ")",
+      e_table, gran_secs, e_start, e_end, cap);
 
   if(written < 0 || (size_t)written >= sizeof(sql))
     goto out;
@@ -583,12 +589,17 @@ wm_dl_candles_query_aggregated(int32_t market_id, int32_t gran_secs,
 
   take = res->rows;
 
-  if(take > cap)
+  // The SQL LIMIT already bounds res->rows <= cap. Hitting the cap means
+  // the window may hold more bars than we return; warn (the caller also
+  // surfaces this to the operator). The clamp is defense-in-depth on the
+  // fixed-size out[] buffer should a driver ever over-deliver.
+  if(take >= cap)
   {
     clam(CLAM_WARN, WM_DL_CTX,
-        "candle upsample market=%" PRId32 " gran=%" PRId32
-        ": %u rows, truncating to %u",
-        market_id, gran_secs, res->rows, cap);
+        "candle query market=%" PRId32 " gran=%" PRId32
+        ": output capped at %u rows (window may contain more; narrow"
+        " the range or query psql directly)",
+        market_id, gran_secs, cap);
     take = cap;
   }
 

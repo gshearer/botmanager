@@ -578,6 +578,16 @@ wm_dl_cmd_show_download_candles(const cmd_ctx_t *ctx)
     cmd_reply(ctx, line);
   }
 
+  if(n >= WM_DL_CANDLES_OUT_CAP)
+  {
+    snprintf(line, sizeof(line),
+        "note: output capped at %u rows — the window may contain more."
+        " Narrow the date range, or use a direct psql MIN/MAX on"
+        " wm_candles_<id> for span questions.",
+        (uint32_t)WM_DL_CANDLES_OUT_CAP);
+    cmd_reply(ctx, line);
+  }
+
   mem_free(rows);
 }
 
