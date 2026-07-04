@@ -61,6 +61,20 @@
 
 #include <json-c/json.h>
 
+// clam context for the async backtest tasks (WM_BT_CTX itself is private
+// to backtest.c; mirror its value here). Shared by the run + compile
+// task callbacks, which have no live session to reply to.
+#define WM_BT_CMD_CTX  "whenmoon.backtest"
+
+// Backtest run + compile are heavy (a multi-config sweep, or a
+// multi-million-row snapshot build + .wm write); both run on a worker
+// task at the lowest possible priority (task.h: 0 = highest, 254 =
+// lowest) so they never delay interactive command dispatch — and so the
+// single botmanctl control thread is freed the instant the command
+// returns (WM-BT-RUN-ASYNC-1: a synchronous sweep on that thread wedged
+// every other botmanctl client for the backtest's full duration).
+#define WM_BT_RUN_TASK_PRIORITY 254u
+
 // ----------------------------------------------------------------------- //
 // /whenmoon backtest run                                                  //
 // ----------------------------------------------------------------------- //
@@ -186,8 +200,11 @@ wm_bt_chart_slice_indices(const wm_candle_full_t *ring, uint32_t ring_n,
 //     trades × a large top-N adds up fast).
 #define WM_BT_CHARTS_WARN_THRESHOLD  1000u
 
+// Runs inside the async run task (WM-BT-RUN-ASYNC-1) — no live session,
+// so warnings + the summary go to the log (clam), and the actual chart
+// files land on disk under <sweep_dir>/charts/.
 static void
-wm_bt_cmd_run_emit_charts(const cmd_ctx_t *ctx,
+wm_bt_cmd_run_emit_charts(
     const wm_bt_sweep_result_t *results, uint32_t n_results,
     const wm_bt_sweep_plan_t *plan,
     const wm_backtest_snapshot_t *snap,
@@ -200,7 +217,6 @@ wm_bt_cmd_run_emit_charts(const cmd_ctx_t *ctx,
   uint32_t  k;
   uint32_t  charts_emitted = 0;
   bool      warned_threshold = false;
-  char      reply[640];
 
   if(plan->top_k == 0 || n_results == 0)
     return;
@@ -216,7 +232,7 @@ wm_bt_cmd_run_emit_charts(const cmd_ctx_t *ctx,
 
   if(top_idx == NULL)
   {
-    cmd_reply(ctx, "warn: charts: top-K alloc failed");
+    clam(CLAM_WARN, WM_BT_CMD_CTX, "charts: top-K alloc failed");
     return;
   }
 
@@ -262,18 +278,16 @@ wm_bt_cmd_run_emit_charts(const cmd_ctx_t *ctx,
 
     if(n < 0 || (size_t)n >= sizeof(iter_dir))
     {
-      snprintf(reply, sizeof(reply),
-          "warn: charts: iter-%u dir path overflow", k + 1);
-      cmd_reply(ctx, reply);
+      clam(CLAM_WARN, WM_BT_CMD_CTX,
+          "charts: iter-%u dir path overflow", k + 1);
       continue;
     }
 
     if(mkdir(iter_dir, WM_BT_REPORT_DIR_MODE) != 0 && errno != EEXIST)
     {
-      snprintf(reply, sizeof(reply),
-          "warn: charts: mkdir('%.512s') failed: %s",
+      clam(CLAM_WARN, WM_BT_CMD_CTX,
+          "charts: mkdir('%.512s') failed: %s",
           iter_dir, strerror(errno));
-      cmd_reply(ctx, reply);
       continue;
     }
 
@@ -326,11 +340,10 @@ wm_bt_cmd_run_emit_charts(const cmd_ctx_t *ctx,
                n_trades, grains_present,
                chart_err, sizeof(chart_err)) != SUCCESS)
         {
-          snprintf(reply, sizeof(reply),
-              "warn: charts: iter-%u trade-%u %s: %s",
+          clam(CLAM_WARN, WM_BT_CMD_CTX,
+              "charts: iter-%u trade-%u %s: %s",
               k + 1, trade_idx, wm_bt_chart_gran_name((wm_gran_t)g),
               chart_err[0] != '\0' ? chart_err : "(unknown)");
-          cmd_reply(ctx, reply);
           continue;
         }
 
@@ -339,12 +352,11 @@ wm_bt_cmd_run_emit_charts(const cmd_ctx_t *ctx,
         if(!warned_threshold &&
            charts_emitted > WM_BT_CHARTS_WARN_THRESHOLD)
         {
-          snprintf(reply, sizeof(reply),
-              "warn: charts: %u files emitted so far (one per round-trip"
+          clam(CLAM_WARN, WM_BT_CMD_CTX,
+              "charts: %u files emitted so far (one per round-trip"
               " trade x every grain); this is a long backtest — the"
               " charts/ dir will be large",
               charts_emitted);
-          cmd_reply(ctx, reply);
           warned_threshold = true;
         }
       }
@@ -353,11 +365,10 @@ wm_bt_cmd_run_emit_charts(const cmd_ctx_t *ctx,
 
   mem_free(top_idx);
 
-  snprintf(reply, sizeof(reply),
+  clam(CLAM_INFO, WM_BT_CMD_CTX,
       "charts: emitted %u file(s) across %u top-K iteration(s)"
       " -> %s/charts/",
       charts_emitted, actual, sweep_dir);
-  cmd_reply(ctx, reply);
 }
 
 // Parse a numeric --flag value. On success, `*out_v` is the parsed
@@ -734,6 +745,295 @@ wm_bt_cmd_run_linked(const cmd_ctx_t *ctx, whenmoon_state_t *st,
 // `$HOME/.local/share/botmanager/backtests/<sweep_id>/`) containing
 // `manifest.json`, `iterations.jsonl`, `top-N.txt` (BT-7 placeholder),
 // and an empty `charts/` (BT-8 fills it).
+//
+// WM-BT-RUN-ASYNC-1: the handler validates + mmap's the .wm + finalizes
+// the plan/windows + creates the sweep dir SYNCHRONOUSLY (so the caller
+// gets an immediate error on bad input and the result-dir path to poll),
+// then offloads the heavy sweep + render tail to wm_bt_run_task_cb on a
+// lowest-priority worker. This frees the single botmanctl control thread
+// the instant the command returns — previously a synchronous sweep on
+// that thread wedged every other botmanctl client for the run's full
+// duration, serializing all backtests to one at a time.
+
+// Async payload for a backtest-run task. Owned by the task; freed in
+// wm_bt_run_task_cb. `snap` ownership transfers from the handler to the
+// task at task_add() time — the handler must not touch it afterward.
+typedef struct
+{
+  wm_backtest_snapshot_t *snap;          // owned; freed in the cb
+  wm_bt_sweep_plan_t      plan;
+  wm_bt_sweep_mode_t      mode;
+  wm_backtest_params_t    params;
+  bool                    charts_force;
+  char                    name[WM_STRATEGY_NAME_SZ];
+  char                    path[256];
+  char                    sweep_id[160];
+  char                    sweep_dir[1024];
+} wm_bt_run_task_t;
+
+// Worker body: the sweep, the OOS/walk post-passes, the JSONL flush, and
+// every rendered artifact. No live session once the handler has returned,
+// so every outcome — including the "complete" line and every warning —
+// is reported through the log (WM_BT_CMD_CTX); progress is observable via
+// /show tasks, and the ranked results land in <sweep_dir>/iterations.jsonl
+// + report.md + top-N.txt.
+static void
+wm_bt_run_task_cb(task_t *t)
+{
+  wm_bt_run_task_t          *job  = t->data;
+  whenmoon_state_t          *st   = whenmoon_get_state();
+  wm_backtest_snapshot_t    *snap = job->snap;
+  wm_bt_sweep_result_t      *sweep_results = NULL;
+  wm_bt_iterations_writer_t  writer;
+  char                       err[320];
+  struct timespec            t0;
+  struct timespec            t1;
+  uint64_t                   wallclock_ms = 0;
+  uint32_t                   i;
+  uint32_t                   n_ok        = 0;
+  uint32_t                   n_fail      = 0;
+  bool                       writer_open = false;
+
+  if(st == NULL)
+  {
+    clam(CLAM_WARN, WM_BT_CMD_CTX,
+        "run %s: whenmoon state gone; aborting", job->name);
+    goto done;
+  }
+
+  // Shared CSS/JS assets for every emitted HTML page (index + per-trade
+  // charts + the WM-BT-RPT-5 sweep dashboard). Warn + continue on failure
+  // (an unstyled page is still readable).
+  err[0] = '\0';
+
+  if(wm_bt_assets_emit(job->sweep_dir, err, sizeof(err)) != SUCCESS)
+    clam(CLAM_WARN, WM_BT_CMD_CTX,
+        "run %s: assets emit failed: %s (pages render unstyled)",
+        job->name, err[0] != '\0' ? err : "(unknown)");
+
+  sweep_results = mem_alloc("whenmoon.backtest", "sweep_results",
+      sizeof(*sweep_results) * (size_t)job->plan.total_iters);
+
+  if(sweep_results == NULL)
+  {
+    clam(CLAM_WARN, WM_BT_CMD_CTX,
+        "run %s: out of memory allocating sweep result table", job->name);
+    goto done;
+  }
+
+  // WM-BT-8: zero the table so the per-row fills pointer starts at NULL;
+  // this lets the free-fills walker run safely on any exit path even
+  // before workers have populated rows.
+  memset(sweep_results, 0,
+      sizeof(*sweep_results) * (size_t)job->plan.total_iters);
+
+  err[0] = '\0';
+
+  if(wm_bt_iter_open(&writer, job->sweep_dir, err, sizeof(err)) != SUCCESS)
+  {
+    clam(CLAM_WARN, WM_BT_CMD_CTX,
+        "run %s: iterations.jsonl: %s",
+        job->name, err[0] != '\0' ? err : "(unknown)");
+    goto done;
+  }
+
+  writer_open = true;
+
+  // Pre-run manifest write — fixed metadata before workers start so a
+  // crash mid-sweep still leaves an audit trail. Post-run rewrite adds
+  // wallclock_ms + ok_count + fail_count.
+  err[0] = '\0';
+
+  if(wm_bt_manifest_write(job->sweep_dir, job->sweep_id, job->path, snap,
+         job->name, &job->plan, &job->mode, &job->params,
+         0, 0, 0, err, sizeof(err)) != SUCCESS)
+    clam(CLAM_WARN, WM_BT_CMD_CTX,
+        "run %s: manifest pre-write failed: %s",
+        job->name, err[0] != '\0' ? err : "(unknown)");
+
+  clock_gettime(CLOCK_MONOTONIC, &t0);
+
+  err[0] = '\0';
+
+  // market_id_db is unused since WM-BT-1 ripped DB persistence — pass
+  // 0 verbatim until WM-BT-7+ drops it from the wm_bt_sweep_run ABI.
+  if(wm_bt_sweep_run(st, snap, job->name, /*market_id_db=*/0,
+         &job->plan, &job->mode, &job->params, sweep_results,
+         err, sizeof(err)) != SUCCESS)
+  {
+    clam(CLAM_WARN, WM_BT_CMD_CTX,
+        "run %s: sweep run failed: %s",
+        job->name, err[0] != '\0' ? err : "unknown");
+    goto done;
+  }
+
+  clock_gettime(CLOCK_MONOTONIC, &t1);
+
+  wallclock_ms = (uint64_t)((int64_t)(t1.tv_sec - t0.tv_sec) * 1000
+               + (int64_t)(t1.tv_nsec - t0.tv_nsec) / 1000000);
+
+  for(i = 0; i < job->plan.total_iters; i++)
+  {
+    if(sweep_results[i].ok)
+      n_ok++;
+    else
+      n_fail++;
+  }
+
+  if(job->mode.mode == WM_BT_MODE_OOS && n_ok > 0)
+  {
+    err[0] = '\0';
+
+    if(wm_bt_sweep_run_oos_validation(st, snap, job->name, /*market_id_db=*/0,
+           &job->plan, &job->mode.oos_tail, &job->params,
+           sweep_results, err, sizeof(err)) != SUCCESS)
+      clam(CLAM_WARN, WM_BT_CMD_CTX,
+          "run %s: oos validation: %s",
+          job->name, err[0] != '\0' ? err : "(no eligible top-K)");
+    else
+      clam(CLAM_INFO, WM_BT_CMD_CTX,
+          "run %s: oos validation: top-K patched with oos columns",
+          job->name);
+  }
+
+  // WM-BT-WF-PERFOLD-1: independent per-test-window (fold) breakdown for
+  // the top-K rows. A failure is non-fatal (the aggregate row is still
+  // complete).
+  if(job->mode.mode == WM_BT_MODE_WALK_FORWARD && n_ok > 0)
+  {
+    err[0] = '\0';
+
+    if(wm_bt_sweep_run_walk_perfold(st, snap, job->name,
+           &job->plan, &job->mode.walk, &job->params,
+           sweep_results, err, sizeof(err)) != SUCCESS)
+      clam(CLAM_WARN, WM_BT_CMD_CTX,
+          "run %s: walk-forward per-fold: %s",
+          job->name, err[0] != '\0' ? err : "(no eligible top-K)");
+    else
+      clam(CLAM_INFO, WM_BT_CMD_CTX,
+          "run %s: walk-forward per-window (fold) breakdown attached",
+          job->name);
+  }
+
+  // JSONL flush — single-writer-by-construction. Workers never touched
+  // the writer; sweep_results is now stable.
+  for(i = 0; i < job->plan.total_iters; i++)
+    (void)wm_bt_iter_append(&writer, &job->plan, i, &sweep_results[i]);
+
+  wm_bt_iter_close(&writer);
+  writer_open = false;
+
+  // Post-run manifest rewrite with final stats. Atomic via tmp+rename.
+  err[0] = '\0';
+
+  if(wm_bt_manifest_write(job->sweep_dir, job->sweep_id, job->path, snap,
+         job->name, &job->plan, &job->mode, &job->params,
+         wallclock_ms, n_ok, n_fail, err, sizeof(err)) != SUCCESS)
+    clam(CLAM_WARN, WM_BT_CMD_CTX,
+        "run %s: manifest post-write failed: %s",
+        job->name, err[0] != '\0' ? err : "(unknown)");
+
+  err[0] = '\0';
+
+  if(wm_bt_render_topn_txt(job->sweep_dir, &job->plan, &job->mode,
+         sweep_results, job->plan.total_iters, n_ok,
+         err, sizeof(err)) != SUCCESS)
+    clam(CLAM_WARN, WM_BT_CMD_CTX,
+        "run %s: top-N.txt write failed: %s",
+        job->name, err[0] != '\0' ? err : "(unknown)");
+
+  err[0] = '\0';
+
+  if(wm_bt_render_report_md(job->sweep_dir, job->sweep_id, job->path, snap,
+         job->name, &job->plan, &job->mode,
+         sweep_results, job->plan.total_iters,
+         n_ok, n_fail, wallclock_ms,
+         err, sizeof(err)) != SUCCESS)
+    clam(CLAM_WARN, WM_BT_CMD_CTX,
+        "run %s: report.md write failed: %s",
+        job->name, err[0] != '\0' ? err : "(unknown)");
+
+  // Chart + index.html emission. Charts are a per-trade artifact for ONE
+  // config; a sweep gets only the metrics artifacts + a dashboard. See
+  // the long-form rationale at the original synchronous site (git blame).
+  if(n_ok > 0)
+  {
+    bool emit_charts = job->charts_force
+        ? true
+        : (kv_get_int("plugin.whenmoon.backtest.charts_enabled") != 0);
+
+    if(job->plan.total_iters > 1)
+    {
+      err[0] = '\0';
+
+      if(wm_bt_render_sweep_html(job->sweep_dir, job->sweep_id, job->path,
+             snap, job->name, &job->plan, &job->mode, &job->params,
+             sweep_results, job->plan.total_iters,
+             n_ok, n_fail, wallclock_ms,
+             err, sizeof(err)) != SUCCESS)
+        clam(CLAM_WARN, WM_BT_CMD_CTX,
+            "run %s: sweep index.html write failed: %s",
+            job->name, err[0] != '\0' ? err : "(unknown)");
+      else
+        clam(CLAM_INFO, WM_BT_CMD_CTX,
+            "run %s: dashboard -> %s/index.html",
+            job->name, job->sweep_dir);
+
+      if(emit_charts)
+        clam(CLAM_INFO, WM_BT_CMD_CTX,
+            "run %s: per-trade charts skipped for a parameter sweep"
+            " (would emit trades x grains x top-K files); re-run the"
+            " chosen config with no sweep axes to chart it", job->name);
+    }
+    else if(emit_charts)
+    {
+      wm_bt_cmd_run_emit_charts(sweep_results,
+          job->plan.total_iters, &job->plan, snap, job->sweep_dir);
+
+      // index.html ties the emitted charts together; written after the
+      // chart pass so every href points at an existing file.
+      err[0] = '\0';
+
+      if(wm_bt_render_index_html(job->sweep_dir, job->sweep_id, job->path,
+             snap, job->name, &job->plan, &job->mode, &job->params,
+             sweep_results, job->plan.total_iters,
+             n_ok, n_fail, wallclock_ms,
+             err, sizeof(err)) != SUCCESS)
+        clam(CLAM_WARN, WM_BT_CMD_CTX,
+            "run %s: index.html write failed: %s",
+            job->name, err[0] != '\0' ? err : "(unknown)");
+      else
+        clam(CLAM_INFO, WM_BT_CMD_CTX,
+            "run %s: index -> %s/index.html", job->name, job->sweep_dir);
+    }
+  }
+
+  clam(CLAM_INFO, WM_BT_CMD_CTX,
+      "run %s complete: %u/%u ok, %u failed in %" PRIu64 " ms"
+      " (%.1f iter/s); jsonl=%u rows -> %s/",
+      job->name, n_ok, job->plan.total_iters, n_fail, wallclock_ms,
+      wallclock_ms > 0
+          ? (double)job->plan.total_iters * 1000.0 / (double)wallclock_ms
+          : 0.0,
+      job->plan.total_iters, job->sweep_dir);
+
+done:
+  if(writer_open)
+    wm_bt_iter_close(&writer);
+
+  if(sweep_results != NULL)
+  {
+    wm_bt_results_free_fills(sweep_results, job->plan.total_iters);
+    mem_free(sweep_results);
+  }
+
+  if(snap != NULL)
+    wm_backtest_snapshot_free(snap);
+
+  mem_free(job);
+  t->state = TASK_ENDED;
+}
+
 static void
 wm_bt_cmd_run(const cmd_ctx_t *ctx)
 {
@@ -755,15 +1055,6 @@ wm_bt_cmd_run(const cmd_ctx_t *ctx)
   wm_bt_sweep_mode_t         sweep_mode;
   wm_bt_walk_spec_t          walk_spec;
   wm_bt_oos_spec_t           oos_spec;
-  wm_bt_sweep_result_t      *sweep_results = NULL;
-  wm_bt_iterations_writer_t  writer;
-  struct timespec            t0;
-  struct timespec            t1;
-  uint64_t                   wallclock_ms = 0;
-  uint32_t                   i;
-  uint32_t                   n_ok          = 0;
-  uint32_t                   n_fail        = 0;
-  bool                       writer_open   = false;
   bool                       have_axes     = false;
   bool                       have_walk     = false;
   bool                       have_oos      = false;
@@ -1147,299 +1438,68 @@ wm_bt_cmd_run(const cmd_ctx_t *ctx)
     return;
   }
 
-  // Shared CSS/JS assets for every emitted HTML page (index + per-trade
-  // charts + the WM-BT-RPT-5 sweep dashboard). Emit once, right after the
-  // sweep dir exists; warn + continue on failure (an unstyled page is
-  // still readable) — same discipline as the manifest pre-write below.
-  err[0] = '\0';
-
-  if(wm_bt_assets_emit(sweep_dir, err, sizeof(err)) != SUCCESS)
+  // Everything past this point — the sweep itself, the OOS/walk
+  // post-passes, the JSONL flush, and every rendered artifact — is
+  // offloaded to a lowest-priority worker (wm_bt_run_task_cb) so the
+  // issuing session (in particular the single botmanctl control thread)
+  // returns immediately. The .wm is mmap'd and the sweep dir exists, so
+  // the caller gets the result-dir path to poll right now; the run's
+  // outcome + warnings land in the log and the on-disk artifacts.
   {
-    snprintf(reply, sizeof(reply),
-        "warn: assets emit failed: %s (pages render unstyled)",
-        err[0] != '\0' ? err : "(unknown)");
-    cmd_reply(ctx, reply);
-  }
+    wm_bt_run_task_t *job;
+    task_t           *t;
+    char              task_name[TASK_NAME_SZ];
 
-  sweep_results = mem_alloc("whenmoon.backtest", "sweep_results",
-      sizeof(*sweep_results) * (size_t)sweep_plan.total_iters);
+    job = mem_alloc("whenmoon.backtest", "run_task", sizeof(*job));
 
-  if(sweep_results == NULL)
-  {
-    cmd_reply(ctx, "out of memory allocating sweep result table");
-    wm_backtest_snapshot_free(snap);
-    return;
-  }
-
-  // WM-BT-8: zero the table so the per-row fills pointer starts at
-  // NULL; this lets the free-fills walker run safely on any exit path
-  // even before workers have populated rows.
-  memset(sweep_results, 0,
-      sizeof(*sweep_results) * (size_t)sweep_plan.total_iters);
-
-  err[0] = '\0';
-
-  if(wm_bt_iter_open(&writer, sweep_dir, err, sizeof(err)) != SUCCESS)
-  {
-    snprintf(reply, sizeof(reply),
-        "iterations.jsonl: %s",
-        err[0] != '\0' ? err : "(unknown)");
-    cmd_reply(ctx, reply);
-    wm_bt_results_free_fills(sweep_results, sweep_plan.total_iters);
-    mem_free(sweep_results);
-    wm_backtest_snapshot_free(snap);
-    return;
-  }
-
-  writer_open = true;
-
-  snprintf(reply, sizeof(reply),
-      "mmap'd %u 1m bars from %s [%s..%s];"
-      " mode=%s N=%u threads=%u rank_by=%s top_n=%u dir=%s",
-      snap->bars_loaded_1m, snap->source_market_id,
-      snap->range_start, snap->range_end,
-      sweep_mode.mode == WM_BT_MODE_WALK_FORWARD ? "walk" :
-      sweep_mode.mode == WM_BT_MODE_OOS          ? "oos"  : "full",
-      sweep_plan.total_iters, sweep_plan.workers,
-      wm_bt_sweep_score_name(sweep_plan.score), sweep_plan.top_k,
-      sweep_id);
-  cmd_reply(ctx, reply);
-
-  // Pre-run manifest write — fixed metadata before workers start so a
-  // crash mid-sweep still leaves an audit trail. Post-run rewrite
-  // adds wallclock_ms + ok_count + fail_count.
-  err[0] = '\0';
-
-  if(wm_bt_manifest_write(sweep_dir, sweep_id, path_tok, snap,
-         name_tok, &sweep_plan, &sweep_mode, &params,
-         0, 0, 0, err, sizeof(err)) != SUCCESS)
-  {
-    snprintf(reply, sizeof(reply),
-        "warn: manifest pre-write failed: %s",
-        err[0] != '\0' ? err : "(unknown)");
-    cmd_reply(ctx, reply);
-  }
-
-  clock_gettime(CLOCK_MONOTONIC, &t0);
-
-  err[0] = '\0';
-
-  // market_id_db is unused since WM-BT-1 ripped DB persistence — pass
-  // 0 verbatim until WM-BT-7+ drops it from the wm_bt_sweep_run ABI.
-  if(wm_bt_sweep_run(st, snap, name_tok, /*market_id_db=*/0,
-         &sweep_plan, &sweep_mode, &params, sweep_results,
-         err, sizeof(err)) != SUCCESS)
-  {
-    snprintf(reply, sizeof(reply),
-        "sweep run failed: %s",
-        err[0] != '\0' ? err : "unknown");
-    cmd_reply(ctx, reply);
-    wm_bt_iter_close(&writer);
-    wm_bt_results_free_fills(sweep_results, sweep_plan.total_iters);
-    mem_free(sweep_results);
-    wm_backtest_snapshot_free(snap);
-    return;
-  }
-
-  clock_gettime(CLOCK_MONOTONIC, &t1);
-
-  wallclock_ms = (uint64_t)((int64_t)(t1.tv_sec - t0.tv_sec) * 1000
-               + (int64_t)(t1.tv_nsec - t0.tv_nsec) / 1000000);
-
-  for(i = 0; i < sweep_plan.total_iters; i++)
-  {
-    if(sweep_results[i].ok)
-      n_ok++;
-    else
-      n_fail++;
-  }
-
-  if(sweep_mode.mode == WM_BT_MODE_OOS && n_ok > 0)
-  {
-    err[0] = '\0';
-
-    if(wm_bt_sweep_run_oos_validation(st, snap, name_tok, /*market_id_db=*/0,
-           &sweep_plan, &sweep_mode.oos_tail, &params,
-           sweep_results, err, sizeof(err)) != SUCCESS)
+    if(job == NULL)
     {
-      snprintf(reply, sizeof(reply),
-          "oos validation: %s",
-          err[0] != '\0' ? err : "(no eligible top-K)");
-      cmd_reply(ctx, reply);
+      cmd_reply(ctx, "out of memory");
+      wm_backtest_snapshot_free(snap);
+      return;
     }
-    else
-      cmd_reply(ctx, "oos validation: top-K patched with oos columns");
-  }
 
-  // WM-BT-WF-PERFOLD-1: independent per-test-window (fold) breakdown for
-  // the top-K rows. Emits the jsonl `windows[]` array + report table; a
-  // failure is non-fatal (the aggregate row is still complete).
-  if(sweep_mode.mode == WM_BT_MODE_WALK_FORWARD && n_ok > 0)
-  {
-    err[0] = '\0';
+    memset(job, 0, sizeof(*job));
+    job->snap         = snap;      // ownership transfers to the task
+    job->plan         = sweep_plan;
+    job->mode         = sweep_mode;
+    job->params       = params;
+    job->charts_force = charts_force;
+    snprintf(job->name,      sizeof(job->name),      "%s", name_tok);
+    snprintf(job->path,      sizeof(job->path),      "%s", path_tok);
+    snprintf(job->sweep_id,  sizeof(job->sweep_id),  "%s", sweep_id);
+    snprintf(job->sweep_dir, sizeof(job->sweep_dir), "%s", sweep_dir);
 
-    if(wm_bt_sweep_run_walk_perfold(st, snap, name_tok,
-           &sweep_plan, &sweep_mode.walk, &params,
-           sweep_results, err, sizeof(err)) != SUCCESS)
-    {
-      snprintf(reply, sizeof(reply),
-          "warn: walk-forward per-fold: %s",
-          err[0] != '\0' ? err : "(no eligible top-K)");
-      cmd_reply(ctx, reply);
-    }
-    else
-      cmd_reply(ctx, "walk-forward: per-window (fold) breakdown attached");
-  }
+    snprintf(task_name, sizeof(task_name), "wm-btrun:%s", name_tok);
 
-  // Main-thread JSONL flush — single-writer-by-construction. Workers
-  // never touched the writer; sweep_results is now stable.
-  for(i = 0; i < sweep_plan.total_iters; i++)
-    (void)wm_bt_iter_append(&writer, &sweep_plan, i, &sweep_results[i]);
-
-  wm_bt_iter_close(&writer);
-  writer_open = false;
-
-  // Post-run manifest rewrite with final stats. Atomic via tmp+rename
-  // so a partial pre-write is never visible.
-  err[0] = '\0';
-
-  if(wm_bt_manifest_write(sweep_dir, sweep_id, path_tok, snap,
-         name_tok, &sweep_plan, &sweep_mode, &params,
-         wallclock_ms, n_ok, n_fail, err, sizeof(err)) != SUCCESS)
-  {
+    // Build the reply BEFORE task_add: once submitted, the worker owns
+    // `snap` and may free it, so `snap->*` must not be read afterward.
     snprintf(reply, sizeof(reply),
-        "warn: manifest post-write failed: %s",
-        err[0] != '\0' ? err : "(unknown)");
+        "run queued: '%s' (pri %u) — %u 1m bars from %s [%s..%s]"
+        " mode=%s N=%u threads=%u rank_by=%s top_n=%u;"
+        " poll /show tasks, results -> %s/iterations.jsonl",
+        task_name, WM_BT_RUN_TASK_PRIORITY,
+        snap->bars_loaded_1m, snap->source_market_id,
+        snap->range_start, snap->range_end,
+        sweep_mode.mode == WM_BT_MODE_WALK_FORWARD ? "walk" :
+        sweep_mode.mode == WM_BT_MODE_OOS          ? "oos"  : "full",
+        sweep_plan.total_iters, sweep_plan.workers,
+        wm_bt_sweep_score_name(sweep_plan.score), sweep_plan.top_k,
+        sweep_dir);
+
+    t = task_add(task_name, TASK_THREAD, WM_BT_RUN_TASK_PRIORITY,
+        wm_bt_run_task_cb, job);
+
+    if(t == NULL)
+    {
+      mem_free(job);
+      cmd_reply(ctx, "failed to submit backtest run task");
+      wm_backtest_snapshot_free(snap);
+      return;
+    }
+
     cmd_reply(ctx, reply);
   }
-
-  err[0] = '\0';
-
-  if(wm_bt_render_topn_txt(sweep_dir, &sweep_plan, &sweep_mode,
-         sweep_results, sweep_plan.total_iters, n_ok,
-         err, sizeof(err)) != SUCCESS)
-  {
-    snprintf(reply, sizeof(reply),
-        "warn: top-N.txt write failed: %s",
-        err[0] != '\0' ? err : "(unknown)");
-    cmd_reply(ctx, reply);
-  }
-
-  err[0] = '\0';
-
-  if(wm_bt_render_report_md(sweep_dir, sweep_id, path_tok, snap,
-         name_tok, &sweep_plan, &sweep_mode,
-         sweep_results, sweep_plan.total_iters,
-         n_ok, n_fail, wallclock_ms,
-         err, sizeof(err)) != SUCCESS)
-  {
-    snprintf(reply, sizeof(reply),
-        "warn: report.md write failed: %s",
-        err[0] != '\0' ? err : "(unknown)");
-    cmd_reply(ctx, reply);
-  }
-
-  // Chart + index.html emission. --charts forces on; otherwise the KV
-  // `plugin.whenmoon.backtest.charts_enabled` BOOL gate decides. Charts
-  // are a per-trade analysis artifact for ONE config — every grain the
-  // snapshot carries is plotted per matched trade, so the file count is
-  // (round-trip trades * grains) for a single run. A parameter sweep
-  // would multiply that by the charted top-K (default 20), producing
-  // tens of thousands of files for a tuning run that wants the ranked
-  // metrics table, not per-trade charts. So charts/index are emitted
-  // ONLY for a single-config run (total_iters == 1); a sweep gets the
-  // metrics artifacts (report.md / iterations.jsonl / top-N) and a note
-  // to re-run the chosen config on its own to chart it. Skipped when no
-  // iterations succeeded (top-K would be empty).
-  if(n_ok > 0)
-  {
-    bool emit_charts = charts_force
-        ? true
-        : (kv_get_int("plugin.whenmoon.backtest.charts_enabled") != 0);
-
-    if(sweep_plan.total_iters > 1)
-    {
-      // Parameter sweep: emit the chart-free dashboard index.html ALWAYS
-      // (one cheap file from the in-memory results — independent of the
-      // --charts gate, which only governs heavy per-trade charts). The
-      // per-trade charts stay skipped (a sweep would emit trades x grains
-      // x top-K files); note that when they were actually requested.
-      err[0] = '\0';
-
-      if(wm_bt_render_sweep_html(sweep_dir, sweep_id, path_tok, snap,
-             name_tok, &sweep_plan, &sweep_mode, &params,
-             sweep_results, sweep_plan.total_iters,
-             n_ok, n_fail, wallclock_ms,
-             err, sizeof(err)) != SUCCESS)
-      {
-        snprintf(reply, sizeof(reply),
-            "warn: sweep index.html write failed: %s",
-            err[0] != '\0' ? err : "(unknown)");
-        cmd_reply(ctx, reply);
-      }
-      else
-      {
-        snprintf(reply, sizeof(reply),
-            "dashboard: open %s/index.html", sweep_dir);
-        cmd_reply(ctx, reply);
-      }
-
-      if(emit_charts)
-        cmd_reply(ctx,
-            "charts: per-trade charts skipped for a parameter sweep"
-            " (would emit trades x grains x top-K files). Re-run the"
-            " chosen config with no sweep axes to chart it.");
-    }
-    else if(emit_charts)
-    {
-      wm_bt_cmd_run_emit_charts(ctx, sweep_results,
-          sweep_plan.total_iters, &sweep_plan, snap, sweep_dir);
-
-      // index.html ties the emitted charts together: a per-config trade
-      // table where each row links to its chart. Written after the
-      // chart pass so every href points at an existing file.
-      err[0] = '\0';
-
-      if(wm_bt_render_index_html(sweep_dir, sweep_id, path_tok, snap,
-             name_tok, &sweep_plan, &sweep_mode, &params,
-             sweep_results, sweep_plan.total_iters,
-             n_ok, n_fail, wallclock_ms,
-             err, sizeof(err)) != SUCCESS)
-      {
-        snprintf(reply, sizeof(reply),
-            "warn: index.html write failed: %s",
-            err[0] != '\0' ? err : "(unknown)");
-        cmd_reply(ctx, reply);
-      }
-      else
-      {
-        snprintf(reply, sizeof(reply),
-            "index: open %s/index.html", sweep_dir);
-        cmd_reply(ctx, reply);
-      }
-    }
-  }
-
-  snprintf(reply, sizeof(reply),
-      "complete: %u/%u ok, %u failed in %" PRIu64 " ms"
-      " (%.1f iter/s); jsonl=%u rows -> %s/",
-      n_ok, sweep_plan.total_iters, n_fail, wallclock_ms,
-      wallclock_ms > 0
-          ? (double)sweep_plan.total_iters * 1000.0
-              / (double)wallclock_ms
-          : 0.0,
-      sweep_plan.total_iters, sweep_dir);
-  cmd_reply(ctx, reply);
-
-  wm_bt_sweep_render_topk(ctx, &sweep_plan, &sweep_mode, sweep_results,
-      sweep_plan.total_iters);
-
-  if(writer_open)
-    wm_bt_iter_close(&writer);
-
-  wm_bt_results_free_fills(sweep_results, sweep_plan.total_iters);
-  mem_free(sweep_results);
-  wm_backtest_snapshot_free(snap);
 }
 
 // ----------------------------------------------------------------------- //
@@ -1506,12 +1566,9 @@ wm_bt_cmd_reload(const cmd_ctx_t *ctx)
 // Compile is heavy (millions of rows + indicator pyramid + file
 // write); it runs on a worker task at the lowest possible priority
 // (task.h: 0 = highest, 254 = lowest) so it never delays interactive
-// command dispatch.
+// command dispatch. (WM_BT_CMD_CTX is defined once near the top of this
+// file, shared with the async run task.)
 #define WM_BT_COMPILE_TASK_PRIORITY 254u
-
-// clam context for the async compile task (WM_BT_CTX itself is private
-// to backtest.c; mirror its value here).
-#define WM_BT_CMD_CTX  "whenmoon.backtest"
 
 // Render epoch ms back to the canonical "YYYY-MM-DD HH:MM:SS+00" form
 // the snapshot builder + .wm header carry. Mirrors the formatter at

@@ -600,11 +600,20 @@ wm_market_apply_fill_locked(whenmoon_market_t *mk, wm_market_mode_t mode,
     s->equity_n++;
   }
 
-  clam(CLAM_INFO, WHENMOON_CTX,
-      "market %s [%s] fill: %c qty=%.10g px=%.10g fee=%.6g"
-      " realized=%.6g cash=%.4f pos=%.10g",
-      mk->market_id_str, wm_market_mode_name(mode),
-      side, qty, exec_px, fee, realized, st->cash, position_after);
+  // WM-BT-FILLLOG-1: synthetic backtest markets (market_id == -1, set in
+  // wm_market_create_synthetic) fire dozens of fills per simulated second
+  // across N sweep workers. Emitting a per-fill CLAM_INFO here funnels
+  // every worker through clam()'s global non-recursive clam_mutex (I/O
+  // held inside the critical section — printf + a socket write per
+  // attached `botmanctl -S` subscriber), collapsing an N-thread sweep back
+  // to ~1 core. Suppress the per-fill line for synthetics; keep it for
+  // live paper/real markets (low volume, genuinely useful there).
+  if(mk->market_id != -1)
+    clam(CLAM_INFO, WHENMOON_CTX,
+        "market %s [%s] fill: %c qty=%.10g px=%.10g fee=%.6g"
+        " realized=%.6g cash=%.4f pos=%.10g",
+        mk->market_id_str, wm_market_mode_name(mode),
+        side, qty, exec_px, fee, realized, st->cash, position_after);
 
   // Persistence is the caller's responsibility — engine_on_signal +
   // engine_record_external_fill enqueue an upsert after their fills,
