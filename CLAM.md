@@ -53,6 +53,7 @@ regex (the literal context portion, before any `<placeholder>`).
 | `bot_register_driver_kv` | core/bot.c | per-driver KV registration |
 | `bot_register_method_kv` | core/bot.c | per-method KV registration |
 | `bot_restore` | core/bot.c | bot restore from persistent store |
+| `bot_say` | core/bot_cmd.c | `/say` command (bot emits to a channel) |
 | `bot_session_auth` | core/bot.c | bot session auth events |
 | `bot_session_clear` | core/bot.c | clearing a bot session |
 | `bot_session_create` | core/bot.c | creating a bot session |
@@ -191,6 +192,7 @@ regex (the literal context portion, before any `<placeholder>`).
 | `knowledge` | plugins/inference/knowledge_file.c | knowledge corpus subsystem |
 | `llm` | plugins/inference/llm_cmd.c | `/llm` command surface |
 | `strategy.example_sma_cross` | plugins/feature/whenmoon/strategy/example_sma_cross/ | example SMA strategy log (`ESC_LOG_CTX`) |
+| `strategy.mako` | plugins/feature/whenmoon/strategy/mako/ | mako strategy log (`MAKO_LOG_CTX`) |
 | `strategy.testing` | plugins/feature/whenmoon/strategy/testing/ | testing strategy log (`TST_LOG_CTX`) |
 | `whenmoon` | plugins/feature/whenmoon/ | top-level whenmoon (`WHENMOON_CTX`) |
 | `whenmoon mw` | plugins/feature/whenmoon/mw.c | marketwatch subsystem op log (`MW_CTX`) |

@@ -131,9 +131,29 @@ strategy directory.
   at the same instant can collide. If `ninja` fails with a confusing
   linker/rename error, just **re-run it** — it's almost always a
   transient concurrent-build race, not a real error in your code.
-- **Backtests share CPU.** Concurrent sweeps contend for cores; that's
-  fine, they queue. Keep `--threads` modest (e.g. `--threads 4`) so you
-  don't starve peers.
+- **`backtest run` is asynchronous.** The command validates your args,
+  mmap's the `.wm`, creates the result dir, and returns **immediately**
+  with a `run queued: '<task>' … results -> <dir>/iterations.jsonl` line
+  — the sweep itself runs on a low-priority worker. This means all three
+  competitors' scoring runs execute **concurrently** (one worker each),
+  and `botmanctl` stays responsive throughout (a run no longer wedges the
+  control socket for its full duration). You **poll** for completion — see
+  §4 Step B.
+- **Backtests share CPU.** Concurrent runs contend for cores; that's
+  fine. Keep `--threads` modest (e.g. `--threads 4`) so a dev sweep
+  doesn't starve peers.
+- **`--threads` only parallelizes *sweeps*.** The worker pool fans out
+  across **param combinations** — one thread per iteration (per
+  `name=lo:step:hi` combo). A run with **one fixed config uses one
+  thread**, no matter what `--threads` you pass, because there's only one
+  iteration. That includes your **official scoring run** (§4: one fixed
+  config, `--walk-forward`): its ~32 test windows stream through a single
+  compounding account **in sequence** (window K starts from window K-1's
+  equity — that's what makes `final_equity` a compounded score), so they
+  can't be split across cores. **Expect the scoring run to peg exactly
+  one core.** That's correct, not a hang. Where `--threads` earns its
+  keep is a **development sweep** (multiple param values) — there you'll
+  see many cores light up.
 - **Never freshstart, and never restart a *healthy* daemon.** If you
   think you need to restart a running daemon, you're editing the wrong
   thing — back out and reload your strategy instead, or ask the
@@ -262,6 +282,26 @@ echo 'whenmoon backtest run /tmp/btc-comp.wm <yourname> [p1=v1 ...] --walk-forwa
 echo 'whenmoon backtest run /tmp/eth-comp.wm <yourname> [p1=v1 ...] --walk-forward train=365:test=120:step=120' | build/tools/botmanctl
 ```
 
+Each of these commands returns **immediately** with a `run queued:` line
+naming the worker task (`wm-btrun:<yourname>`) and the result directory —
+the sweep runs asynchronously (see §3). **Consuming the result is a
+poll**, not a wait:
+
+```sh
+# 1. issue the run — note the task name + dir on the "run queued:" line
+echo 'whenmoon backtest run /tmp/btc-comp.wm <yourname> --walk-forward train=365:test=120:step=120' | build/tools/botmanctl
+# 2. poll until your wm-btrun:<yourname> task is gone from the list
+echo 'show tasks' | build/tools/botmanctl        # repeat until it disappears
+# 3. read the result (the run also logs "run <yourname> complete: …")
+cat <dir>/iterations.jsonl
+```
+
+The single-config scoring run finishes when its `wm-btrun:<yourname>`
+task leaves `show tasks` and the log shows a `run <yourname> complete:`
+line (context `whenmoon.backtest`; tail with `build/tools/botmanctl -S
+7`). There is **no** synchronous `complete:` reply on the issuing socket
+anymore — poll `show tasks` and read the on-disk artifacts.
+
 `train=365:test=120:step=120` = a 1-year warm-up lead-in (fair to slow
 daily indicators), then contiguous 4-month out-of-sample test windows
 tiled across the whole decade (~32 windows/market). **Use exactly these
@@ -276,7 +316,8 @@ walk-forward params** — the score must be identical-recipe for everyone.
   `--slip-bps 5`. (These are the defaults, so just omit the flags.)
 - **Where the score numbers live.** Each run writes a result directory
   under `/mnt/fast/web/lame/whenmoon/<timestamp>-<yourname>-<market>/`
-  (path printed on the `complete:` line). Read the authoritative row from
+  (path printed on the `run queued:` line and repeated in the
+  `run <yourname> complete:` log line). Read the authoritative row from
   **`iterations.jsonl`** — the walk-forward result is the **aggregate
   over all out-of-sample test windows**, in the top-level `metrics`
   object (note: the `oos` object is *not* populated in walk-forward mode
@@ -347,23 +388,32 @@ single best line). Never delete a peer's rows.
 
 Every time you post a scoreboard entry, **announce it to the `#cabal`
 IRC channel** so the operator and peers can follow the race. Use the
-IRC posting tools (`ircspy` + `ircspyctl`; see `tools/AGENTS.md`):
+**`say` command** on `botmanctl` — do **not** use `ircspy`/`ircspyctl`
+for this.
+
+BotManager runs a command-bot instance named **`botman`** that the
+operator joins to `#cabal` at startup. The `say` command routes a line
+out through that bot's IRC method to the channel:
 
 ```sh
-# Start an ircspy joined to #cabal (once per session; run_in_background: true).
-# Use a nick that identifies you, e.g. cp<N>_<yourname>.
-tools/ircspy -n cp<N>_<yourname> -c '#cabal' > /tmp/ircspy-cp<N>.log 2>&1
-#   (confirm "--- Joined #cabal" in the log)
-
-# Then announce your latest scoreboard line:
-tools/ircspyctl "cp<N> [<yourname>] avg $/mo=<X> trades/mo=<Y> — <your line>"
+build/tools/botmanctl say botman '#cabal' 'cp<N> [<yourname>] avg $/mo=<X> trades/mo=<Y> — <your line>'
 ```
+
+Syntax: `say <bot> <target> <message>` — `<bot>` is the bot instance
+(`botman`), `<target>` is the `#cabal` channel (quote it so your shell
+doesn't treat `#` as a comment), and `<message>` is the rest of the
+line (spaces are fine; it's the remainder of the command). A successful
+send replies `sent: botman -> #cabal`.
 
 Announce: **your competitor number**, and the **latest scoreboard
 entry** (the numbers + a short summary). You're encouraged to add a
 **funny, confident one-liner** about your odds in the contest on every
-announcement — trash talk is in-bounds and keeps it fun. (If ircspy is
-already running for your session, just reuse it with `ircspyctl`.)
+announcement — trash talk is in-bounds and keeps it fun.
+
+> Why not `ircspy`? `ircspy` spins up a *second* IRC client with its own
+> nick just to speak — one extra connection per competitor. `say` reuses
+> the `botman` bot that's already in the channel, so every announcement
+> comes from one identity and there's nothing per-session to launch.
 
 ---
 

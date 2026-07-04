@@ -218,6 +218,63 @@ admin_cmd_bot_stop(const cmd_ctx_t *ctx)
   }
 }
 
+// /say <bot> <target> <message> — make a running bot emit a line to a
+// channel (or nick) over one of its bound methods. The message is the
+// rest of the line. `target` is passed to the method driver verbatim
+// (IRC: a "#channel" the bot has joined, or a nick for a DM). Intended
+// for out-of-band announcements — e.g. the strategy competitors posting
+// their scoreboard row to #cabal via the "botman" command bot.
+static const cmd_arg_desc_t ad_say[] = {
+  { "bot",     CMD_ARG_ALNUM, CMD_ARG_REQUIRED,               BOT_NAME_SZ, NULL },
+  { "target",  CMD_ARG_NONE,  CMD_ARG_REQUIRED,               0,           NULL },
+  { "message", CMD_ARG_NONE,  CMD_ARG_REQUIRED | CMD_ARG_REST, 0,          NULL },
+};
+
+static void
+admin_cmd_say(const cmd_ctx_t *ctx)
+{
+  const char     *name    = ctx->parsed->argv[0];
+  const char     *target  = ctx->parsed->argv[1];
+  const char     *message = ctx->parsed->argv[2];
+  bot_inst_t     *inst;
+  method_inst_t  *method;
+  char            buf[BOT_NAME_SZ + 128];
+
+  inst = resolve_named_bot(ctx, name);
+  if(inst == NULL)
+    return;
+
+  if(bot_get_state(inst) != BOT_RUNNING)
+  {
+    snprintf(buf, sizeof(buf),
+        "bot not running: %s (state=%s)",
+        name, bot_state_name(bot_get_state(inst)));
+    cmd_reply(ctx, buf);
+    return;
+  }
+
+  // First bound method — the announce use-case has a single IRC binding.
+  method = bot_first_method(inst);
+  if(method == NULL)
+  {
+    snprintf(buf, sizeof(buf), "bot has no bound method: %s", name);
+    cmd_reply(ctx, buf);
+    return;
+  }
+
+  if(!method_send(method, target, message))
+  {
+    clam(CLAM_WARN, "bot_say", "send failed: bot=%s target=%s", name, target);
+    snprintf(buf, sizeof(buf), "send failed: %s -> %s", name, target);
+    cmd_reply(ctx, buf);
+    return;
+  }
+
+  clam(CLAM_INFO, "bot_say", "bot=%s target=%s", name, target);
+  snprintf(buf, sizeof(buf), "sent: %s -> %s", name, target);
+  cmd_reply(ctx, buf);
+}
+
 // /bot addmethod <name> <method> — add a method to a bot
 static void
 admin_cmd_bot_bind(const cmd_ctx_t *ctx)
@@ -1090,6 +1147,19 @@ bot_register_commands(void)
   // (e.g. llm personas). Extends /bot (a root command) when /help's
   // tokens don't match a static subcommand.
   cmd_set_help_extender("bot", NULL, help_ext_bot);
+
+  // /say <bot> <target> <message> — out-of-band announce through a
+  // running bot's method (IRC channel post). Top-level command.
+  cmd_register("bot", "say",
+      "say <bot> <target> <message>",
+      "Make a bot emit a line to a channel or nick",
+      "Sends <message> through the named running bot's first bound\n"
+      "method to <target> (an IRC #channel the bot has joined, or a\n"
+      "nick for a DM). Used for out-of-band announcements.\n"
+      "Example: /say botman #cabal cp1 [mako] scored avg $/mo=812",
+      USERNS_GROUP_ADMIN, 100, CMD_SCOPE_ANY, METHOD_T_ANY, admin_cmd_say, NULL,
+      NULL, NULL, ad_say, (uint8_t)(sizeof(ad_say) / sizeof(ad_say[0])),
+      NULL, NULL);
 
   cmd_register("bot", "quit", "quit",
       "Graceful shutdown",
