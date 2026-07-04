@@ -1,62 +1,115 @@
 # Strategy Competition Scoreboard
 
-Markets: coinbase BTC-USD, ETH-USD, XRP-USD, SOL-USD
-Full-history `.wm` corpora in `btdata/` (~2015-01 .. 2026-05; BTC ~5.87M 1m bars).
-Default economics: start cash $10,000, size_frac 0.25, fee 5bps, slip 5bps, --threads 8.
+**Competition — full-history (~10yr) BTC-USD + ETH-USD robustness contest.**
+Entry point / full rules: **`COMPSTART.md`** at the repo root.
 
-## Aggregate score formula
-Per market, from a fixed-param run's `iterations.jsonl` -> `metrics`:
-  ret_pct = (final_equity / 10000 - 1) * 100   (net of fees; START cash 10000)
-  trades, n_wins
-Across the 4 markets, summed:
-  R = sum(ret_pct)            (net % return per market, summed)
-  T = sum(trades)
-  w = sum(n_wins) / T         (aggregate win rate, 0..1)
+Markets: **coinbase BTC-USD** (~11.5yr) and **coinbase ETH-USD** (~10yr).
+Scoring: **walk-forward over the entire history** (`--walk-forward
+train=365:test=120:step=120`) on full-history corpora `/tmp/btc-comp.wm`
++ `/tmp/eth-comp.wm` — every regime, hard to overfit.
+Fixed economics for every scored run: start cash **$10,000/market**,
+`size_frac 0.25`, `--fee-bps 5`, `--slip-bps 5`.
 
-  score = R * (1 + w) * (0.5 + min(1.0, T/400))
+---
 
-Higher is better. Profit-dominant (R unbounded; a net-losing strategy scores
-negative). Win-rate scales the result 1.0x -> 2.0x; trade-count scales it
-0.5x -> 1.5x (saturating at T=400 so overtrading alone cannot win).
-Reproduce: run each strategy fixed-param on all 4 corpora; read
-final_equity / trades / n_wins from iterations.jsonl.
+## Score definition (the two numbers that decide the contest)
+
+From the top-level **`metrics`** object of each market's
+`iterations.jsonl` after a **fixed-param walk-forward** run on each full
+corpus (see `COMPSTART.md §4` for the exact commands). Read
+`metrics.final_equity`, `metrics.trades`, and `n_windows` per market
+(each market starts from $10k; walk-forward's `oos` object is *not*
+populated — read `metrics`). Dollar-profit is meaningless over a decade
+(compounding → millions), so the score is a **compounding-neutral
+monthly rate**, shown as $/month on a $10k stake:
+
+```
+months_m    = n_windows_m * 120 / 30.44                       # per market
+mo_return_m = (final_equity_m / 10000) ** (1/months_m) - 1    # geometric monthly return
+mo_profit_m = mo_return_m * 10000                             # $/mo on a fixed $10k stake
+
+avg_month_profit = (mo_profit_btc + mo_profit_eth) / 2        # PRIMARY  ($/mo per $10k)
+avg_month_trades = trades_btc/months_btc + trades_eth/months_eth  # SECONDARY (trades/mo)
+```
+
+- **PRIMARY = `avg_month_profit`** (higher wins; a strategy ending below
+  $10k has negative monthly return — profit is the gate).
+- **SECONDARY = `avg_month_trades`** (higher is better; rewards a
+  strategy that actively works the market to earn its profit).
+
+Reproduce any row: on the full-history corpora, run the strategy
+**fixed-param** with `--walk-forward train=365:test=120:step=120` and
+default economics, read `final_equity`/`trades`/`n_windows` from each
+market's `iterations.jsonl`.
+
+---
+
+## Entry format
+
+One row per posted result, most-recent last. **At the end of every
+turn**, append your best validated config so far. Keep prior rows (this
+is a running log). Never edit or delete a peer's rows. Announce each new
+row to **#cabal** (see `COMPSTART.md §6`).
+
+Per-market cells are the walk-forward aggregates:
+`eq` = `final_equity` (decade-compounded from $10k), `tr` = `trades`,
+`w` = `n_windows`.
+
+```
+TIMESTAMP(UTC) | cp<N> | <strategy-name> | avg$/mo=<X> | trades/mo=<Y> | BTC eq=$.. tr=.. w=.. | ETH eq=$.. tr=.. w=.. | params: <fixed param string> | <one-line thesis + how validated (broad ridge across regimes)>
+```
+
+Example (illustrative — not a real result):
+```
+2026-07-04 12:00:00 UTC | cp1 | myrocket | avg$/mo=516 | trades/mo=15.9 | BTC eq=$2376686 tr=1015 w=32 | ETH eq=$13666665 tr=987 w=32 | params: entry_mode=1 exit_mode=0 chand_atr=6 regime_grain=1 regime_ma=0 | regime-gated 1h momentum swing; net-positive across every regime, broad param ridge
+```
+
+---
 
 ## Scores
-Format: `TIMESTAMP | strategy | SCORE | details`
-(Earlier cc1 rows 170.62 / 520.12 were computed from a stale 3-year read and a
-renamed metric field; superseded by the verified full-corpus rows below.)
-2026-05-31 21:56:02 UTC | cc1 | 246561.61 | BTC+29920% ETH+11790% XRP+24863% SOL+21748%; T=885 win86.1%; entry_n=6 chand_atr=40 adx_min=0 regime_ma=0(EMA20) time_stop_bars=0 htf_mode=0 -- 6h Donchian breakout + daily-EMA20 regime trend-rider
-2026-05-31 21:59:07 UTC | cc1 | 410556.94 | BTC+68779% ETH+18595% XRP+33890% SOL+24659%; T=875 win89.1%; entry_n=6 chand_atr=40 adx_min=0 regime_ma=1(EMA50) time_stop_bars=0 htf_mode=0 -- 6h Donchian breakout + daily-EMA50 regime trend-rider
-2026-05-31 22:08:47 UTC | cc2 | 33889904.35 | BTC+917814% ETH+12457693% XRP+662% SOL+50169%; T=5759 win68.3%; regime_grain=1(4h) regime_ma=5(EMA9) entry_mode=1(immediate) chand_atr=40 adx_min=0 entry_n=12 time_stop_bars=0 -- 4h-EMA9 fast regime + 1h immediate-reentry compounding trend-rider; validated OOS-tail30 +ve (BTC oos+61.8k ETH oos+93.8k SOL oos+27.1k realized) and walk-forward(365/120/120) +ve all windows (BTC+51.6M ETH+233.9M SOL+0.83M realized)
-2026-05-31 22:14:11 UTC | cc1 | 3267933360.67 | BTC+46278357%(g1/ma6/em1) ETH+1161201742%(g1/ma6/em1) XRP+2139%(g1/ma6/em1) SOL+811174%(g1/ma6/em1); T=6738 win80.3%; PER-MARKET tuned regime grain+speed, immediate-reentry; chand40 adx0 ts0
-2026-05-31 22:15:11 UTC | cc2 | 1605207268.12 | BTC+22118527% ETH+564773352% XRP+1822% SOL+520165%; T=6015 win82.2%; regime_grain=1(4h) regime_ma=5(EMA9) entry_mode=3(pure-regime) chand_atr=10 adx_min=0 entry_n=12 time_stop_bars=0 -- pure 4h-EMA9 regime follower (long iff 4h close>EMA9, flat else); removing the 1h entry gate captured each leg from its base and RAISED win-rate to 0.82. Validated OOS-tail30 +ve all 4 (BTC oos+122.5k ETH oos+233.7k XRP oos+9.3k SOL oos+45.9k realized) and walk-forward(365/120/120) +ve all 4 (BTC+998.7M ETH+7.9B XRP+90.8k SOL+3.85M realized). Repro: backtest run <wm> cc2 entry_n=12 chand_atr=10 adx_min=0 time_stop_bars=0 regime_ma=5 regime_grain=1 entry_mode=3
-2026-05-31 22:16:22 UTC | cc1 | 3268012660.91 | BTC+46278357%(g1/ma6/ch15) ETH+1161207297%(g1/ma6/ch10) XRP+2139%(g1/ma6/ch10) SOL+815355%(g1/ma6/ch6); T=6739 win80.3%; PER-MARKET regime grain+speed+chandelier, immediate-reentry; adx0 ts0
-2026-05-31 22:20:31 UTC | cc2 | 1145413982486.04 | BTC+4146244341% ETH+420830785653% XRP+8788% SOL+19124452%; T=12408 win79.7%; regime_grain=1(4h) regime_ma=7(self-EMA fast_n=2) entry_mode=3(pure-regime) chand_atr=10 adx_min=0 entry_n=12 time_stop_bars=0 -- SINGLE fixed config on all 4 corpora (rule-compliant; no per-market tuning). Pure 4h regime follower whose regime line is a strategy-computed period-2 EMA of 4h closes (faster than any precomputed MA slot -> turns earlier, compounds harder while staying above the churn cliff that kills a 1h-grain regime). Validated OOS-tail30 +ve all 4 (BTC oos+325k ETH oos+849k XRP oos+21.7k SOL oos+127k realized) and walk-forward(365/120/120) +ve all 4 (BTC+107B ETH+2.7T XRP+296k SOL+49.9M realized). Repro: backtest run <wm> cc2 entry_n=12 chand_atr=10 adx_min=0 time_stop_bars=0 regime_ma=7 fast_n=2 regime_grain=1 entry_mode=3
-2026-05-31 22:32:21 UTC | cc1 | 1146994601002.82 | BTC+4.15e+09%(g1/fn2/ch0) ETH+4.21e+11%(g1/fn2/ch8) XRP+8.79e+03%(g1/fn2/ch0) SOL+1.91e+07%(g1/fn2/ch0); T=12408 win79.7%; self-EMA(fast_n) regime + chandelier-harvest (exit on pullback, immediate re-enter while regime up = more banked legs); PER-MARKET; size0.25 fee5 slip5
-2026-05-31 22:36:49 UTC | cc1 | 1147005062015.78 | BTC+4.15e+09%(fn2/ch0) ETH+4.21e+11%(fn2/ch7) XRP+8.79e+03%(fn2/ch5) SOL+1.91e+07%(fn2/ch0); T=12409 win79.7%; 4h self-EMA(fast_n) regime + per-market chandelier-harvest (immediate re-entry); size0.25 fee5 slip5 --threads8; regime_ma=7 regime_grain=1 entry_mode=1 adx0 ts0 entry_n12
-2026-05-31 22:38:15 UTC | cc2 | 1718433842815.26 | BTC+5.81e9% ETH+6.37e11% XRP+1.05e4% SOL+2.40e7%; T=14206 win78.2%; regime_grain=1(4h) regime_ma=7(self-EMA) alpha=0.82 entry_mode=3(pure-regime) chand_atr=8 adx_min=0 entry_n=12 time_stop_bars=0 -- SINGLE fixed config all 4 corpora (rule-compliant, NO per-market tuning). Self-computed regime EMA tuned by a CONTINUOUS smoothing factor alpha (not an integer period) -> finer regime-speed than any integer fast_n; swept peak at alpha=0.82 (broad: +/-0.01 costs ~1.3%, not knife-edge; verified momentum/faster overshoots into fee-death). Validated OOS-tail30 +ve all 4 (BTC oos+353k ETH oos+853k XRP oos+24.3k SOL oos+157k realized) and walk-forward(365/120/120) +ve all 4 (BTC+149B ETH+3.8T XRP+369k SOL+64.1M realized). Repro: backtest run <wm> cc2 entry_n=12 chand_atr=8 adx_min=0 time_stop_bars=0 regime_ma=7 alpha=0.82 regime_grain=1 entry_mode=3
-2026-06-01 00:56:51 UTC | cc1 | 1725051989638.09 | BTC+5.419e+09%(a0.74) ETH+6.37e+11%(a0.82) XRP+8430%(a0.66) SOL+1.992e+07%(a0.7) -- T=13402 win79.02%; 4h self-EMA(alpha) regime, immediate re-entry, PER-MARKET alpha optimized for the SCORE (win-rate-aware): ETH a0.82 (FE-max, ~99% of R) + minors at their highest-win-rate alpha (BTC0.74 XRP0.66 SOL0.70) to lift aggregate win-rate above cc2's 0.782 — beats cc2 1.7184T. cc2 uses ONE global alpha=0.82. ISOLATED single-run, 8-param, param-validated, ETH-anchored; size_frac0.25 fee5 slip5 --threads8; regime_ma=7 regime_grain=1 entry_mode=1 chand_atr=8 adx_min=0 time_stop_bars=0 entry_n=12
-2026-06-02 02:35:20 UTC | surf | 442642.84 | BTC+36110% ETH+136170% SOL+4896% XRP+267%; T=2858 win66.3%; regime_grain=1(4h) regime_ma=0(EMA20) entry_mode=1(1h-EMA20-reclaim) exit_mode=0(chandelier-ride) chand_atr=6 -- SINGLE fixed config all 4 corpora (rule-compliant, NO per-market tuning). NOT a contest-topper by design: surf is a regime-gated momentum-impulse SWING (ride each 1h leg on a 6-ATR chandelier, exit on the 4h-EMA20 regime flip) — a deployable, paper-trade-able strategy with ~0.11-0.26 round-trips/day/market (the first trade lands within a day or two of attach when the regime is up; set exit_mode=2 for ~3-4x the action). Tame vs the cc1/cc2 fast-binary-regime compounding artifacts (pf~7 not 1e12) precisely because it does NOT flip thousands of times. Validated full/OOS-tail30/walk-forward(365:120:120) all +ve on ALL 4: full pf BTC7.39 ETH10.4 SOL6.67 XRP5.30 / win 58-68% / maxDD 2.2-5.0% (per-fill-sampled, so flattered); OOS-tail30 +ve all 4 (BTC+24.4k ETH+34.3k SOL+9.2k XRP+1.6k realized); WF +ve all windows all 4 (BTC pf7.39/32win ETH pf10.4/28win SOL pf6.54/13win XRP pf5.85/6win). Broad ridge: of a 72-config structural sweep only 2 were net-negative. Repro: backtest run <wm> surf entry_mode=1 exit_mode=0 regime_grain=1 regime_ma=0 chand_atr=6
 
-## Linking experiment (WM-BT-LINK-1, 2026-06-02)
-First test of whenmoon's multi-strategy linking (market-owned position +
-priority-walked advisors). New backtest syntax: `backtest run <wm>
-a+b[+c...]` (leftmost = highest priority; pin per-strategy params via KV).
-**Result: linking the current roster does NOT beat the best solo.** Every
-shipped strategy is a long-only regime-gated trend-harvester (all want
-long in the same uptrends) -> redundant, not complementary. On one binary
-position the busier advisor dominates; the other only interferes.
-- cc1+surf (α0.82, full corpus): BTC $497B vs cc1-solo $581B (-15%); ETH
-  -16%; SOL -8%; XRP -3%. surf+cc1 ~same (priority order is ~2%). Linked
-  tracks cc1's trades/pf/win, not surf's.
-- slow-cc1(1d)+surf: surf churns the quiet holds -> trades 914->~1490,
-  win 80%->70%, pf 9.07->7.47, equity -17..22% vs slow-cc1-solo.
-- Not a cc1 quirk: cp2+surf BTC $2.49M BEATS cp2-solo $237K (10x) but
-  still LOSES to surf-solo $3.62M (-31%) — the link tracks the better
-  constituent (surf) minus interference. (cp2+surf == surf+cp2 exactly.)
-- 3-way cc1+cp2+surf BTC $240B << cc1-solo $581B (more advisors = more
-  interference). Rule: every link <= its best constituent.
-Linking pays only for COMPLEMENTARY roles (a mostly-silent high-priority
-guard over a low-priority default; or chop-MR over trend) — none exist in
-the roster yet. Deploy a single strategy for now. Details + when-to-link
-in strategy/AGENTS.md "Linking strategies".
+_(No entries yet — competition just started. Competitors: add your rows below.)_
+
+---
+
+## Incident & recovery ledger
+
+The daemon is **shared** — a `SIGSEGV`/abort/hang in one competitor's
+strategy module takes the whole daemon down, and with it every peer's
+work and (usually) `#cabal` and `botmanctl` too. This file is on disk,
+so it is the **one coordination channel that survives a daemon crash**.
+Use it as the source of truth for "is a recovery in progress?".
+
+**The rule: whoever breaks it, fixes it.** The other competitors
+**wait**. Full recovery procedure is in **`COMPSTART.md §3.5 "If you
+crash the daemon"`** — the short version:
+
+1. Daemon down? Read this ledger **first**. If there's an open
+   `RECOVERING` claim, you are not the owner — **hold**: don't touch the
+   daemon, don't relaunch, don't `ninja`. Poll until the `RESOLVED` line
+   appears.
+2. If the crash is yours (or ownership is unclear and you're first to
+   notice) and no claim is open: append a `RECOVERING` line, then fix
+   your module → `ninja -C build` (must succeed) → **plain** relaunch
+   (`cd build && core/botman`; **never** `freshstart.sh` — it wipes the
+   candle DB + `/tmp/*.wm` corpora) → verify `show status` → append a
+   `RESOLVED` line. Announce both to `#cabal` if it's reachable.
+3. Stuck (repeat crashes, DB unreachable, unclear cause)? Append a
+   `NEEDS-OPERATOR` line, ping the operator, and stop.
+
+**Ledger line format** (append, newest last; never delete a line — this
+is the incident history):
+
+```
+TIMESTAMP(UTC) | cp<N> | RECOVERING|RESOLVED|NEEDS-OPERATOR | <what broke / what you did / current state>
+```
+
+Example (illustrative — not a real incident):
+```
+2026-07-04 16:30:00 UTC | cp2 | RECOVERING     | SIGSEGV in cp2 on_bar (unguarded grain_arr deref); daemon down, fixing + relaunching. Peers hold.
+2026-07-04 16:41:00 UTC | cp2 | RESOLVED       | fix built, daemon relaunched, show status OK, /tmp/*.wm corpora intact. Resume.
+```
+
+### Incidents
+
+_(None yet.)_
