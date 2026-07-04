@@ -32,6 +32,7 @@
 #include "strategy.h"
 #include "whenmoon.h"
 #include "whenmoon_strategy.h"
+#include "wm_bt_report.h"   // wm_bt_compute_equity (per-fold post-pass)
 
 #include "alloc.h"
 #include "clam.h"
@@ -1820,6 +1821,177 @@ wm_bt_sweep_run_oos_validation(whenmoon_state_t *st,
     if(err != NULL)
       snprintf(err, err_cap,
           "oos validation: no eligible top-K rows could complete");
+    return(FAIL);
+  }
+
+  return(SUCCESS);
+}
+
+// ----------------------------------------------------------------------- //
+// WM-BT-WF-PERFOLD-1 — per-test-window (fold) breakdown                   //
+// ----------------------------------------------------------------------- //
+//
+// Measure each walk-forward test window INDEPENDENTLY for the top-K rows,
+// so per-fold PnL is non-compounding (each fold runs on its own book from
+// starting_cash, warmed by the full pre-window history). Mirrors the
+// OOS-validation post-pass: same top-K selection, same per-iteration
+// synth-id + KV apply/drop discipline, single-threaded. The aggregate
+// back-to-back result row (`.trade`) is left untouched.
+
+// Run every window in `walk` as an independent single-window iteration for
+// one result row and fill `row->folds`. Returns true when at least one
+// fold iteration completed (folds allocated); false on alloc failure only.
+static bool
+wm_bt_perfold_one_row(whenmoon_state_t *st, wm_backtest_snapshot_t *snap,
+    const char *strategy_name, const wm_bt_sweep_plan_t *plan,
+    const wm_bt_window_set_t *walk,
+    const wm_backtest_params_t *base_params, uint32_t src_iter,
+    wm_bt_sweep_result_t *row)
+{
+  wm_bt_fold_metric_t *folds;
+  uint32_t             indices[WM_BT_SWEEP_MAX_PARAMS] = {0};
+  uint32_t             w;
+
+  folds = mem_alloc("whenmoon.sweep", "wf_folds",
+      sizeof(*folds) * (size_t)walk->n);
+
+  if(folds == NULL)
+    return(false);
+
+  memset(folds, 0, sizeof(*folds) * (size_t)walk->n);
+
+  wm_bt_sweep_iter_indices(plan, src_iter, indices);
+
+  for(w = 0; w < walk->n; w++)
+  {
+    const wm_bt_window_t *win = &walk->windows[w];
+    char                  synth_id[WM_MARKET_ID_STR_SZ];
+    wm_backtest_result_t  bt_result;
+    char                  iter_err[160];
+    bool                  iter_ok;
+
+    folds[w].start_ts_ms = win->start_ts_ms;
+    folds[w].end_ts_ms   = win->end_ts_ms;
+    folds[w].ok          = false;
+
+    wm_backtest_alloc_synthetic_id(synth_id, sizeof(synth_id));
+
+    iter_err[0] = '\0';
+
+    if(wm_bt_sweep_apply_iter_kv(synth_id, strategy_name, plan,
+           indices, iter_err, sizeof(iter_err)) != SUCCESS)
+    {
+      wm_bt_sweep_drop_iter_kv(synth_id);
+      continue;
+    }
+
+    memset(&bt_result, 0, sizeof(bt_result));
+    iter_err[0] = '\0';
+
+    // Single-window scope: on_bar fires only inside `win`, but the cursor
+    // still walks the whole snapshot so indicators are warmed by the
+    // pre-window history (see wm_backtest_run_iteration_with_id doc).
+    iter_ok = wm_backtest_run_iteration_with_id(st, snap,
+        strategy_name, synth_id, base_params,
+        win, 1, &bt_result, iter_err, sizeof(iter_err)) == SUCCESS;
+
+    wm_bt_sweep_drop_iter_kv(synth_id);
+
+    if(iter_ok)
+    {
+      const wm_market_stats_t *sp =
+          &bt_result.trade.stats[WM_MARKET_MODE_PAPER];
+
+      folds[w].realized_pnl = sp->realized_pnl_lifetime;
+      folds[w].return_frac  = (sp->starting_cash > 0.0)
+          ? sp->realized_pnl_lifetime / sp->starting_cash
+          : 0.0;
+      folds[w].final_equity = wm_bt_compute_equity(&bt_result.trade);
+      folds[w].n_trades     = sp->n_wins + sp->n_losses;
+      folds[w].ok           = true;
+    }
+
+    // Per-fold charts are not needed; free the captured fills buffer.
+    if(bt_result.fills != NULL)
+    {
+      mem_free(bt_result.fills);
+      bt_result.fills   = NULL;
+      bt_result.n_fills = 0;
+    }
+  }
+
+  row->folds   = folds;
+  row->n_folds = walk->n;
+  return(true);
+}
+
+bool
+wm_bt_sweep_run_walk_perfold(whenmoon_state_t *st,
+    wm_backtest_snapshot_t *snap,
+    const char *strategy_name,
+    const wm_bt_sweep_plan_t *plan,
+    const wm_bt_window_set_t *walk,
+    const wm_backtest_params_t *base_params,
+    wm_bt_sweep_result_t *results,
+    char *err, size_t err_cap)
+{
+  uint32_t *top_idx = NULL;
+  uint32_t  top_k;
+  uint32_t  i;
+  uint32_t  n_done = 0;
+
+  if(err != NULL && err_cap > 0)
+    err[0] = '\0';
+
+  if(st == NULL || snap == NULL || strategy_name == NULL ||
+     plan == NULL || walk == NULL || results == NULL)
+  {
+    if(err != NULL)
+      snprintf(err, err_cap, "bad walk-perfold inputs");
+    return(FAIL);
+  }
+
+  if(walk->n == 0)
+  {
+    if(err != NULL)
+      snprintf(err, err_cap, "walk-perfold: no test windows");
+    return(FAIL);
+  }
+
+  top_idx = mem_alloc("whenmoon.sweep", "wf_top_idx",
+      sizeof(*top_idx) * (size_t)plan->total_iters);
+
+  if(top_idx == NULL)
+  {
+    if(err != NULL)
+      snprintf(err, err_cap, "walk-perfold alloc failed");
+    return(FAIL);
+  }
+
+  // Reuse the shared top-K selector (score desc). For the single-config
+  // competition run total_iters == 1 ⇒ top_k == 1 ⇒ the lone row.
+  top_k = wm_bt_topk_compute(results, plan->total_iters, plan->top_k,
+      top_idx);
+
+  for(i = 0; i < top_k; i++)
+  {
+    uint32_t src = top_idx[i];
+
+    if(src >= plan->total_iters || !results[src].ok)
+      continue;
+
+    if(wm_bt_perfold_one_row(st, snap, strategy_name, plan, walk,
+           base_params, src, &results[src]))
+      n_done++;
+  }
+
+  mem_free(top_idx);
+
+  if(n_done == 0)
+  {
+    if(err != NULL)
+      snprintf(err, err_cap,
+          "walk-perfold: no eligible top-K rows could complete");
     return(FAIL);
   }
 

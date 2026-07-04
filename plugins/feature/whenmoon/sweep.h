@@ -136,6 +136,29 @@ void wm_bt_sweep_iter_indices(const wm_bt_sweep_plan_t *plan,
     uint32_t iter, uint32_t *out_indices);
 
 // ----------------------------------------------------------------------- //
+// Per-fold (walk-forward test-window) metric                              //
+// ----------------------------------------------------------------------- //
+//
+// WM-BT-WF-PERFOLD-1: one out-of-sample test window measured
+// INDEPENDENTLY of the others. The walk-forward aggregate runs every
+// test slice back-to-back through one compounding book; this instead
+// re-runs each slice on its own book seeded from `starting_cash` (with
+// the strategy warmed by the full pre-window history), so `realized_pnl`
+// / `return_frac` are non-compounding per-fold readings for the
+// consistency gate. Populated by wm_bt_sweep_run_walk_perfold for the
+// top-K rows only.
+typedef struct
+{
+  int64_t   start_ts_ms;    // test-window bounds (from the walk set)
+  int64_t   end_ts_ms;
+  double    realized_pnl;   // stats[PAPER].realized_pnl_lifetime
+  double    return_frac;    // realized_pnl / starting_cash (0 if cash<=0)
+  double    final_equity;   // wm_bt_compute_equity of the fold snapshot
+  uint32_t  n_trades;       // round-trips = n_wins + n_losses
+  bool      ok;             // false if this fold's iteration failed
+} wm_bt_fold_metric_t;
+
+// ----------------------------------------------------------------------- //
 // Result row                                                              //
 // ----------------------------------------------------------------------- //
 
@@ -169,6 +192,14 @@ typedef struct
   // the table itself.
   wm_market_fill_t     *fills;
   uint32_t              n_fills;
+
+  // WM-BT-WF-PERFOLD-1: per-test-window (fold) OOS metrics for
+  // walk-forward mode; length n_folds (== mode->walk.n). Heap-owned;
+  // owner is the sweep_results table (wm_bt_results_free_fills frees it
+  // alongside `fills`). NULL / 0 for FULL / OOS mode and for
+  // walk-forward rows outside the top-K.
+  wm_bt_fold_metric_t  *folds;
+  uint32_t              n_folds;
 } wm_bt_sweep_result_t;
 
 // Score extraction from a synth-market snapshot. NaN/inf collapse to
@@ -252,6 +283,28 @@ bool wm_bt_sweep_run_oos_validation(struct whenmoon_state *st,
     int32_t market_id_db,
     const wm_bt_sweep_plan_t *plan,
     const wm_bt_window_t *oos_tail,
+    const wm_backtest_params_t *base_params,
+    wm_bt_sweep_result_t *results,
+    char *err, size_t err_cap);
+
+// WM-BT-WF-PERFOLD-1 post-pass. Called after wm_bt_sweep_run completes in
+// WALK_FORWARD mode. Picks the top-K rows by score and, for each, measures
+// every test window INDEPENDENTLY (a fresh single-window iteration per
+// slice, book seeded from starting_cash, strategy warmed by the full
+// pre-window history) and stamps `results[i].folds` / `.n_folds` in
+// memory. Leaves the back-to-back aggregate (`results[i].trade`)
+// untouched. The heap `folds` array is owned by the results table and
+// freed by wm_bt_results_free_fills.
+//
+// Returns SUCCESS when at least one top-K row got a per-fold breakdown;
+// FAIL (with err) when no eligible top-K row could complete. Per-fold
+// iteration failures are recorded in `folds[w].ok = false` and do not
+// FAIL the pass.
+bool wm_bt_sweep_run_walk_perfold(struct whenmoon_state *st,
+    wm_backtest_snapshot_t *snap,
+    const char *strategy_name,
+    const wm_bt_sweep_plan_t *plan,
+    const wm_bt_window_set_t *walk,
     const wm_backtest_params_t *base_params,
     wm_bt_sweep_result_t *results,
     char *err, size_t err_cap);

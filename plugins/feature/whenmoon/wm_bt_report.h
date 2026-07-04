@@ -97,6 +97,12 @@ bool wm_bt_sweep_dir_create(const char *report_path,
 bool wm_bt_write_atomic(const char *path, const char *content,
     char *err, size_t err_cap);
 
+// End-of-run account equity from a session snapshot: PAPER cash plus the
+// mark-to-market value of any open long. Single source of truth shared by
+// the report renderers and the walk-forward per-fold post-pass
+// (WM-BT-WF-PERFOLD-1).
+double wm_bt_compute_equity(const wm_market_session_snapshot_t *snap);
+
 // JSONL writer. Each call to wm_bt_iter_append serializes one row
 // under the writer's mutex; WM-BT-6 drives this from the main-thread
 // post-pass loop (workers must not call it concurrently — see the

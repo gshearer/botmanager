@@ -85,6 +85,14 @@ wm_bt_results_free_fills(wm_bt_sweep_result_t *results, uint32_t n)
       results[i].fills   = NULL;
       results[i].n_fills = 0;
     }
+
+    // WM-BT-WF-PERFOLD-1: same owner, freed on every exit path.
+    if(results[i].folds != NULL)
+    {
+      mem_free(results[i].folds);
+      results[i].folds   = NULL;
+      results[i].n_folds = 0;
+    }
   }
 }
 
@@ -1263,6 +1271,26 @@ wm_bt_cmd_run(const cmd_ctx_t *ctx)
       cmd_reply(ctx, "oos validation: top-K patched with oos columns");
   }
 
+  // WM-BT-WF-PERFOLD-1: independent per-test-window (fold) breakdown for
+  // the top-K rows. Emits the jsonl `windows[]` array + report table; a
+  // failure is non-fatal (the aggregate row is still complete).
+  if(sweep_mode.mode == WM_BT_MODE_WALK_FORWARD && n_ok > 0)
+  {
+    err[0] = '\0';
+
+    if(wm_bt_sweep_run_walk_perfold(st, snap, name_tok,
+           &sweep_plan, &sweep_mode.walk, &params,
+           sweep_results, err, sizeof(err)) != SUCCESS)
+    {
+      snprintf(reply, sizeof(reply),
+          "warn: walk-forward per-fold: %s",
+          err[0] != '\0' ? err : "(no eligible top-K)");
+      cmd_reply(ctx, reply);
+    }
+    else
+      cmd_reply(ctx, "walk-forward: per-window (fold) breakdown attached");
+  }
+
   // Main-thread JSONL flush — single-writer-by-construction. Workers
   // never touched the writer; sweep_results is now stable.
   for(i = 0; i < sweep_plan.total_iters; i++)
@@ -2095,7 +2123,11 @@ wm_backtest_register_verbs(void)
         "--walk-forward expands each param vector into N test windows"
         " (train days warm the strategy state but only test windows"
         " accumulate fills); the recorded score is the cumulative"
-        " test-window result.\n"
+        " test-window result. A post-pass then re-measures each test"
+        " window INDEPENDENTLY (own book from starting cash, warmed by"
+        " prior history) for the top-N rows and emits a non-compounding"
+        " per-fold breakdown as a windows[] array in iterations.jsonl"
+        " plus a per-window table (rank 1) in report.md.\n"
         "--oos-tail PCT reserves the last PCT%% of the range as out-of"
         "-sample; the sweep optimises on the head, then the post-pass"
         " runs the top-N on the tail and stamps the OOS columns on"

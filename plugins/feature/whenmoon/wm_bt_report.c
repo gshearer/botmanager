@@ -434,7 +434,7 @@ wm_bt_build_params_obj(const wm_bt_sweep_plan_t *plan,
   return(obj);
 }
 
-static double
+double
 wm_bt_compute_equity(const wm_market_session_snapshot_t *snap)
 {
   const wm_market_stats_t *st;
@@ -523,6 +523,47 @@ wm_bt_build_oos_obj(const wm_bt_sweep_result_t *result)
   return(obj);
 }
 
+// WM-BT-WF-PERFOLD-1: per-test-window (fold) array for walk-forward rows.
+// One object per fold with the window bounds + independent (non-
+// compounding) realized PnL / return / equity / trade count. Empty array
+// when no folds were measured (non-top-K rows, or non-walk-forward modes).
+static struct json_object *
+wm_bt_build_windows_arr(const wm_bt_sweep_result_t *result)
+{
+  struct json_object *arr = json_object_new_array();
+  uint32_t            i;
+
+  if(arr == NULL)
+    return(NULL);
+
+  for(i = 0; i < result->n_folds; i++)
+  {
+    const wm_bt_fold_metric_t *f   = &result->folds[i];
+    struct json_object        *obj = json_object_new_object();
+
+    if(obj == NULL)
+      continue;
+
+    json_object_object_add(obj, "fold",
+        json_object_new_int64((int64_t)i));
+    json_object_object_add(obj, "start_ts_ms",
+        json_object_new_int64(f->start_ts_ms));
+    json_object_object_add(obj, "end_ts_ms",
+        json_object_new_int64(f->end_ts_ms));
+    json_object_object_add(obj, "ok",
+        json_object_new_boolean(f->ok ? 1 : 0));
+    json_object_object_add(obj, "trades",
+        json_object_new_int64((int64_t)f->n_trades));
+    wm_bt_obj_add_double(obj, "realized_pnl", f->realized_pnl);
+    wm_bt_obj_add_double(obj, "return",       f->return_frac);
+    wm_bt_obj_add_double(obj, "final_equity", f->final_equity);
+
+    json_object_array_add(arr, obj);
+  }
+
+  return(arr);
+}
+
 bool
 wm_bt_iter_append(wm_bt_iterations_writer_t *w,
     const wm_bt_sweep_plan_t *plan, uint32_t iter,
@@ -560,6 +601,11 @@ wm_bt_iter_append(wm_bt_iterations_writer_t *w,
     json_object_object_add(row, "n_windows",
         json_object_new_int64((int64_t)result->n_windows));
     json_object_object_add(row, "oos", wm_bt_build_oos_obj(result));
+
+    // WM-BT-WF-PERFOLD-1: per-fold breakdown (walk-forward top-K rows).
+    if(result->n_folds > 0 && result->folds != NULL)
+      json_object_object_add(row, "windows",
+          wm_bt_build_windows_arr(result));
   }
   else
   {
@@ -1146,6 +1192,11 @@ wm_bt_finalize_file(FILE *fp, const char *tmp, const char *final_path,
   return(SUCCESS);
 }
 
+// Defined below (near the index-html renderers); forward-declared so the
+// walk-forward per-fold table in wm_bt_render_report_md can format window
+// bounds as "YYYY-MM-DD HH:MM" UTC.
+static void wm_bt_idx_fmt_ts(int64_t ts_ms, char *out, size_t cap);
+
 bool
 wm_bt_render_report_md(const char *sweep_dir,
     const char *sweep_id, const char *wm_path,
@@ -1406,6 +1457,76 @@ wm_bt_render_report_md(const char *sweep_dir,
   }
 
   fputc('\n', fp);
+
+  // WM-BT-WF-PERFOLD-1: per-test-window (fold) breakdown for the rank-1
+  // (best-scoring) walk-forward row. Each fold is measured INDEPENDENTLY
+  // (own book from starting_cash, warmed by the full pre-window history),
+  // so realized/return are non-compounding per-regime readings — the
+  // consistency view the aggregate row can't give. Only the top row is
+  // tabled here; every top-K row's folds are in iterations.jsonl.
+  if(mode_val == WM_BT_MODE_WALK_FORWARD && top_k > 0 &&
+     indices != NULL)
+  {
+    const wm_bt_sweep_result_t *best = &results[indices[0]];
+
+    if(best->n_folds > 0 && best->folds != NULL)
+    {
+      uint32_t f;
+      uint32_t n_pos = 0;
+      uint32_t n_ok_folds = 0;
+
+      fprintf(fp, "## Walk-forward per-window (fold) breakdown"
+                  " — rank 1\n\n");
+      fprintf(fp,
+          "Each fold is an INDEPENDENT out-of-sample test window"
+          " (own book from starting cash, strategy warmed by prior"
+          " history); realized PnL / return are non-compounding.\n\n");
+      fprintf(fp, "| Fold | Start (UTC) | End (UTC) | Trades |"
+                  " Realized | Return %% | Equity | ok |\n");
+      fprintf(fp, "|---|---|---|---|---|---|---|---|\n");
+
+      for(f = 0; f < best->n_folds; f++)
+      {
+        const wm_bt_fold_metric_t *fm = &best->folds[f];
+        char start_s[32];
+        char end_s[32];
+
+        wm_bt_idx_fmt_ts(fm->start_ts_ms, start_s, sizeof(start_s));
+        wm_bt_idx_fmt_ts(fm->end_ts_ms,   end_s,   sizeof(end_s));
+
+        fprintf(fp, "| %u | %s | %s | %u |", f, start_s, end_s,
+            fm->n_trades);
+
+        wm_bt_md_fmt_double(fm->realized_pnl, "%+.4f",
+            cell, sizeof(cell));
+        fprintf(fp, " %s |", cell);
+
+        wm_bt_md_fmt_double(fm->return_frac * 100.0, "%+.2f",
+            cell, sizeof(cell));
+        fprintf(fp, " %s |", cell);
+
+        wm_bt_md_fmt_double(fm->final_equity, "%.2f",
+            cell, sizeof(cell));
+        fprintf(fp, " %s | %s |\n", cell, fm->ok ? "y" : "n");
+
+        if(fm->ok)
+        {
+          n_ok_folds++;
+          if(fm->realized_pnl > 0.0)
+            n_pos++;
+        }
+      }
+
+      fputc('\n', fp);
+
+      // Consistency summary the WM-BT-WF-PERFOLD-1 gate keys on.
+      fprintf(fp,
+          "- **Net-positive folds:** %u / %u measured (%.1f%%)\n\n",
+          n_pos, n_ok_folds,
+          n_ok_folds > 0 ? 100.0 * (double)n_pos / (double)n_ok_folds
+                         : 0.0);
+    }
+  }
 
   // Per-axis marginal best — for each axis, for each value, scan all
   // iterations and pick the highest score for that value. Skip
