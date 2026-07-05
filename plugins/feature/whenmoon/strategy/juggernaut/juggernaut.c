@@ -47,6 +47,47 @@
 // again); exit_mode is the one ordinal dial, mirroring cp2/surf's proven
 // "one knob bundles behaviour" pattern for overfit resistance.
 //
+// ── VALIDATED CONFIG (v0.3 defaults, round 2 / robust_ratio recipe) ──────
+//      regime_grain=0 (1d)   regime_ma=0 (EMA_20)   adx_entry=8
+//      chand_atr=3.5   exit_mode=0 (chandelier ride). Official walk-forward
+//      robust_ratio=1.091 (pooled BTC+ETH), worst_fold=0.00%, pos_frac
+//      96.9%, maxDD 3.9%/3.2% -- see SCOREBOARD.md for the full row.
+//      chand_atr=3.5 REVERSES the v0.2/round-1 conclusion that tighter
+//      chandeliers were "strictly worse" -- that was true for compounded
+//      terminal equity (a wide chandelier lets a few mega-trend windows
+//      run further, inflating final_equity) but FALSE for robust_ratio
+//      (mean per-fold return / its cross-regime stddev): a tight
+//      chandelier trims exactly those mega-trend windows, cutting stddev
+//      more than it cuts the mean, and nearly doubles trade count as a
+//      free bonus (3.0 -> 4.68 tr/mo). Confirmed via full chand_atr sweep
+//      1.5-14 (peak ridge 3.0-3.75, all within 5% of each other -- broad,
+//      not a knife-edge) then a matching adx_entry re-sweep at the new
+//      chand_atr (flat plateau 6-9, chosen mid-plateau). LESSON: a metric
+//      change can invert a "REJECTED" conclusion from a prior round --
+//      always re-sweep the axes that metric cares about, don't just carry
+//      the old winner forward.
+//
+// ── ROUND 3 additions (all default OFF -- v0.3 behaviour unchanged unless
+//    swept in) ───────────────────────────────────────────────────────────
+//      d1_adx_min : a second, orthogonal ADX_14 floor measured on the
+//                   cached 1d regime bar (vs. adx_entry's 4h floor) --
+//                   tests whether requiring strength on BOTH the macro and
+//                   decision grain tightens the fold distribution.
+//      min_hold   : suppresses chandelier/ADX-fade/cflip exits for the
+//                   first N 4h bars after entry (regime flip still fires
+//                   unconditionally) -- guards against noise-driven
+//                   premature stop-outs, worth checking now that
+//                   chand_atr=3.5 is tight enough for early whipsaw.
+//      max_hold   : force-exits a long after N 4h bars regardless of
+//                   chandelier/ADX state. Targets the diagnosed cause of
+//                   robust_ratio's remaining dispersion directly: a
+//                   handful of mega-trend windows (BTC 2020-21, ETH
+//                   2017/2020-21) still ride uncapped and dominate
+//                   pooled_std. Capping hold time chunks one giant fold
+//                   into several bounded ones and, if the level-gate is
+//                   still true, re-arms next bar -- same mechanism, more
+//                   (bounded) folds instead of one huge one.
+//
 // LOOKAHEAD SAFETY. Same pattern as surf: the backtest fires on_bar in a
 // merged chronological walk across grains, and on a shared timestamp the
 // FINER grain fires first (4h before 1d). juggernaut caches the 1d regime
@@ -68,7 +109,7 @@
 #include <string.h>
 
 #define JUG_NAME       "juggernaut"
-#define JUG_VERSION    "0.1"
+#define JUG_VERSION    "0.4"
 #define JUG_LOG_CTX    "strategy.juggernaut"
 
 // Per-grain live warm-up history (bars). Backtest snapshots carry the full
@@ -79,11 +120,14 @@
 
 // Defaults -- mirrored in the param schema below.
 #define JUG_DEFAULT_REGIME_GRAIN   0.0    // 0 = 1d regime (slow, robust tide)
-#define JUG_DEFAULT_REGIME_MA      1.0    // 1 = EMA_50 on the regime grain
-#define JUG_DEFAULT_ADX_ENTRY     22.0    // ADX_14(4h) floor to arm entry
+#define JUG_DEFAULT_REGIME_MA      0.0    // 0 = EMA_20 on the regime grain
+#define JUG_DEFAULT_ADX_ENTRY      8.0    // ADX_14(4h) floor to arm entry
 #define JUG_DEFAULT_ADX_EXIT      16.0    // ADX_14(4h) fade level to bank
-#define JUG_DEFAULT_CHAND_ATR      6.0    // chandelier give-back in ATR_14(4h)
+#define JUG_DEFAULT_CHAND_ATR      3.5    // chandelier give-back in ATR_14(4h)
 #define JUG_DEFAULT_EXIT_MODE      0.0    // 0 = chandelier ride
+#define JUG_DEFAULT_D1_ADX_MIN     0.0    // 0 = disabled (round-3 axis)
+#define JUG_DEFAULT_MIN_HOLD       0.0    // 0 = disabled (round-3 axis)
+#define JUG_DEFAULT_MAX_HOLD       0.0    // 0 = disabled (round-3 axis)
 
 typedef struct
 {
@@ -93,18 +137,22 @@ typedef struct
   double   adx_entry;      // ADX_14(4h) floor to arm a long
   double   adx_exit;       // ADX_14(4h) fade level (exit_mode 1/2)
   double   chand_atr;      // chandelier = peak_high - chand_atr*ATR_14 (0=off)
-  int      exit_mode;      // 0 chandelier / 1 ADX-fade / 2 either
+  int      exit_mode;      // 0 chandelier / 1 ADX-fade / 2 either / 3 cflip
+  double   d1_adx_min;     // orthogonal ADX_14(1d) floor (0=disabled)
+  int      min_hold;       // bars (4h) exits suppressed after entry (0=off)
+  int      max_hold;       // bars (4h) forced exit ceiling (0=unbounded)
 
   // Cached 1d regime context. *_have latches once the daily grain produces
   // a bar; values are the readings at that grain's latest close (NaN-
   // guarded on read). Cached unconditionally so flipping regime_grain
   // between 1d/4h needs no rewire (4h regime reads the decision bar
   // itself, see jug_regime_up below).
-  double   d1_close, d1_regma;   bool d1_have;
+  double   d1_close, d1_regma, d1_adx;   bool d1_have;
 
   // 4h position state.
   bool     in_position;
   double   peak_high;      // highest HIGH since entry (chandelier anchor)
+  int      bars_held;      // 4h bars elapsed since entry (min/max_hold)
 } jug_state_t;
 
 // Map the regime_ma ordinal onto a moving-average indicator slot. Same slot
@@ -147,6 +195,7 @@ jug_cache_context(jug_state_t *s, const wm_candle_full_t *bar)
 {
   s->d1_close = bar->close;
   s->d1_regma = bar->ind[s->regma_slot];
+  s->d1_adx   = bar->ind[WM_IND_ADX_14];
   s->d1_have  = true;
 }
 
@@ -175,18 +224,18 @@ static const wm_strategy_param_t jug_params[] = {
     .step_dbl    = 1.0,
     .help        = "Regime MA on the regime grain (close must be above it"
                    " for longs; below it forces exit): 0=EMA_20, 1=EMA_50,"
-                   " 2=SMA_50, 3=SMA_200. Default 1.",
+                   " 2=SMA_50, 3=SMA_200. Default 0.",
   },
   {
     .name        = "adx_entry",
     .type        = WM_PARAM_DOUBLE,
     .default_dbl = JUG_DEFAULT_ADX_ENTRY,
-    .min_dbl     = 12.0,
+    .min_dbl     = 6.0,
     .max_dbl     = 40.0,
     .step_dbl    = 1.0,
     .help        = "ADX_14(4h) floor the trend strength must sit at or"
                    " above to arm a long (direction confirmed by close >"
-                   " EMA_20(4h) the same bar). Default 22.",
+                   " EMA_20(4h) the same bar). Default 8.",
   },
   {
     .name        = "adx_exit",
@@ -208,19 +257,57 @@ static const wm_strategy_param_t jug_params[] = {
     .step_dbl    = 0.5,
     .help        = "Chandelier trailing-stop distance in ATR_14(4h) below"
                    " the highest HIGH since entry (exit_mode 0/2). Default"
-                   " 6.",
+                   " 3.5.",
   },
   {
     .name        = "exit_mode",
     .type        = WM_PARAM_UINT,
     .default_int = (int64_t)JUG_DEFAULT_EXIT_MODE,
     .min_int     = 0,
-    .max_int     = 2,
+    .max_int     = 3,
     .step_dbl    = 1.0,
     .help        = "How a long closes (the regime flip is always a"
                    " backstop): 0=chandelier only (ride the leg), 1=ADX"
                    " fade only (bank each stall), 2=either first (most"
-                   " active). Default 0.",
+                   " active), 3=condition-flip (exit the instant ADX drops"
+                   " below adx_entry OR close drops below EMA_20 -- no"
+                   " ride, no hysteresis; symmetric with the entry test)."
+                   " Default 0.",
+  },
+  {
+    .name        = "d1_adx_min",
+    .type        = WM_PARAM_DOUBLE,
+    .default_dbl = JUG_DEFAULT_D1_ADX_MIN,
+    .min_dbl     = 0.0,
+    .max_dbl     = 40.0,
+    .step_dbl    = 1.0,
+    .help        = "Orthogonal ADX_14(1d) floor entry must also clear (0 ="
+                   " disabled). A second, slower strength confirm alongside"
+                   " adx_entry's 4h floor. Default 0 (off).",
+  },
+  {
+    .name        = "min_hold",
+    .type        = WM_PARAM_UINT,
+    .default_int = (int64_t)JUG_DEFAULT_MIN_HOLD,
+    .min_int     = 0,
+    .max_int     = 60,
+    .step_dbl    = 1.0,
+    .help        = "Bars (4h) after entry during which chandelier/ADX-fade/"
+                   "cflip exits are suppressed -- the regime-flip backstop"
+                   " still fires unconditionally. Guards against"
+                   " noise-driven premature stop-outs. Default 0 (off).",
+  },
+  {
+    .name        = "max_hold",
+    .type        = WM_PARAM_UINT,
+    .default_int = (int64_t)JUG_DEFAULT_MAX_HOLD,
+    .min_int     = 0,
+    .max_int     = 720,
+    .step_dbl    = 8.0,
+    .help        = "Force-exit a long after this many 4h bars regardless of"
+                   " chandelier/ADX state (0 = unbounded). Caps how much of"
+                   " one mega-trend a single fold can capture; re-arms next"
+                   " bar if the entry gate is still true. Default 0 (off).",
   },
 };
 
@@ -278,11 +365,19 @@ wm_strategy_init(wm_strategy_ctx_t *ctx)
       JUG_DEFAULT_CHAND_ATR);
   s->exit_mode = (int)wm_strategy_kv_get_uint(mid, strat, "exit_mode",
       (uint64_t)JUG_DEFAULT_EXIT_MODE);
+  s->d1_adx_min = wm_strategy_kv_get_dbl(mid, strat, "d1_adx_min",
+      JUG_DEFAULT_D1_ADX_MIN);
+  s->min_hold = (int)wm_strategy_kv_get_uint(mid, strat, "min_hold",
+      (uint64_t)JUG_DEFAULT_MIN_HOLD);
+  s->max_hold = (int)wm_strategy_kv_get_uint(mid, strat, "max_hold",
+      (uint64_t)JUG_DEFAULT_MAX_HOLD);
 
   if(s->regime_grain < 0) s->regime_grain = 0;
   if(s->regime_grain > 1) s->regime_grain = 1;
   if(s->exit_mode    < 0) s->exit_mode    = 0;
-  if(s->exit_mode    > 2) s->exit_mode    = 2;
+  if(s->exit_mode    > 3) s->exit_mode    = 3;
+  if(s->min_hold      < 0) s->min_hold      = 0;
+  if(s->max_hold      < 0) s->max_hold      = 0;
 
   s->regma_slot = jug_regma_slot(regime_ma);
 
@@ -290,9 +385,11 @@ wm_strategy_init(wm_strategy_ctx_t *ctx)
 
   clam(CLAM_INFO, JUG_LOG_CTX,
       "init: %s -> %s regime_grain=%d regma_slot=%d adx_entry=%.1f"
-      " adx_exit=%.1f chand_atr=%.2f exit_mode=%d (4h)",
+      " adx_exit=%.1f chand_atr=%.2f exit_mode=%d d1_adx_min=%.1f"
+      " min_hold=%d max_hold=%d (4h)",
       strat, mid, s->regime_grain, s->regma_slot, s->adx_entry,
-      s->adx_exit, s->chand_atr, s->exit_mode);
+      s->adx_exit, s->chand_atr, s->exit_mode, s->d1_adx_min, s->min_hold,
+      s->max_hold);
 
   return(0);
 }
@@ -357,60 +454,81 @@ wm_strategy_on_bar(wm_strategy_ctx_t *ctx,
   memset(&sig, 0, sizeof(sig));
   sig.ts_ms = bar->ts_close_ms;
 
-  if(!s->in_position)
   {
-    bool have_adx = !isnanf(adx);
+    bool have_adx  = !isnanf(adx);
     bool strong    = have_adx && (double)adx >= s->adx_entry;
     bool dir_up    = !isnanf(ema20) && bar->close > (double)ema20;
+    bool d1_strong = (s->d1_adx_min <= 0.0) ||
+                     (s->d1_have && !isnan(s->d1_adx) &&
+                      s->d1_adx >= s->d1_adx_min);
 
-    // Entry: regime up, flat, ADX at/above the strength floor, AND the
-    // confirmed strength is to the upside (ADX alone is direction-
-    // agnostic). A level gate, not a cross -- see file header for why.
-    if(regime_up && strong && dir_up)
+    if(!s->in_position)
     {
-      sig.score      = 1.0;
-      sig.confidence = 0.6;
-      snprintf(sig.reason, sizeof(sig.reason),
-          "in adx%.0f>=%.0f g%d", (double)adx, s->adx_entry,
-          s->regime_grain);
+      // Entry: regime up, flat, ADX at/above the strength floor, AND the
+      // confirmed strength is to the upside (ADX alone is direction-
+      // agnostic). A level gate, not a cross -- see file header for why.
+      // d1_strong is a no-op (always true) unless d1_adx_min > 0.
+      if(regime_up && strong && dir_up && d1_strong)
+      {
+        sig.score      = 1.0;
+        sig.confidence = 0.6;
+        snprintf(sig.reason, sizeof(sig.reason),
+            "in adx%.0f>=%.0f g%d", (double)adx, s->adx_entry,
+            s->regime_grain);
 
-      s->in_position = true;
-      s->peak_high   = bar->high;
-      fire           = true;
+        s->in_position = true;
+        s->peak_high   = bar->high;
+        s->bars_held   = 0;
+        fire           = true;
+      }
     }
-  }
-  else
-  {
-    bool   have_atr   = !isnanf(atr) && atr > 0.0f;
-    bool   have_adx   = !isnanf(adx);
-    double chand_lv   = -1.0;
-    bool   want_fade  = (s->exit_mode == 1 || s->exit_mode == 2);
-    bool   want_chand = (s->exit_mode == 0 || s->exit_mode == 2);
-    bool   hit_fade;
-    bool   hit_chand;
-
-    if(bar->high > s->peak_high)
-      s->peak_high = bar->high;
-
-    if(want_chand && have_atr && s->chand_atr > 0.0)
-      chand_lv = s->peak_high - s->chand_atr * (double)atr;
-
-    hit_fade  = (want_fade && have_adx && (double)adx < s->adx_exit);
-    hit_chand = (chand_lv > 0.0 && bar->close <= chand_lv);
-
-    // The regime flip is an unconditional backstop in every exit mode.
-    if(hit_fade || hit_chand || !regime_up)
+    else
     {
-      const char *why = !regime_up ? "regime" :
-                        hit_fade   ? "adxfade" : "chand";
+      bool   have_atr    = !isnanf(atr) && atr > 0.0f;
+      double chand_lv     = -1.0;
+      bool   want_fade    = (s->exit_mode == 1 || s->exit_mode == 2);
+      bool   want_chand   = (s->exit_mode == 0 || s->exit_mode == 2);
+      bool   want_cflip   = (s->exit_mode == 3);
+      bool   past_minhold = (s->min_hold == 0 || s->bars_held >= s->min_hold);
+      bool   hit_fade;
+      bool   hit_chand;
+      bool   hit_cflip;
+      bool   hit_maxhold;
 
-      sig.score      = -1.0;
-      sig.confidence = 0.5;
-      snprintf(sig.reason, sizeof(sig.reason), "exit %s", why);
+      s->bars_held++;
 
-      s->in_position = false;
-      s->peak_high   = 0.0;
-      fire           = true;
+      if(bar->high > s->peak_high)
+        s->peak_high = bar->high;
+
+      if(want_chand && have_atr && s->chand_atr > 0.0)
+        chand_lv = s->peak_high - s->chand_atr * (double)atr;
+
+      // min_hold suppresses the price/indicator exits only -- the regime
+      // backstop below is never suppressed. max_hold is a ceiling, not
+      // gated by min_hold (the two bound opposite ends of hold time).
+      hit_fade    = past_minhold &&
+                    (want_fade && have_adx && (double)adx < s->adx_exit);
+      hit_chand   = past_minhold && (chand_lv > 0.0 && bar->close <= chand_lv);
+      hit_cflip   = past_minhold && (want_cflip && !(strong && dir_up));
+      hit_maxhold = (s->max_hold > 0 && s->bars_held >= s->max_hold);
+
+      // The regime flip is an unconditional backstop in every exit mode.
+      if(hit_fade || hit_chand || hit_cflip || hit_maxhold || !regime_up)
+      {
+        const char *why = !regime_up   ? "regime"  :
+                          hit_maxhold  ? "maxhold" :
+                          hit_cflip    ? "cflip"   :
+                          hit_fade     ? "adxfade" : "chand";
+
+        sig.score      = -1.0;
+        sig.confidence = 0.5;
+        snprintf(sig.reason, sizeof(sig.reason), "exit %s", why);
+
+        s->in_position = false;
+        s->peak_high   = 0.0;
+        s->bars_held   = 0;
+        fire           = true;
+      }
     }
   }
 
