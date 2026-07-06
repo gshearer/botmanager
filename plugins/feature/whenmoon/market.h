@@ -239,6 +239,18 @@ typedef struct
 // Coinbase fits underneath. Strategies see this constant directly.
 #define WM_PRODUCT_ID_SZ         24
 
+// WM-MI-1: per-instance label buffer. An instance label disambiguates
+// multiple independent strategy sessions running on the SAME
+// (exchange, product_id) — e.g. "coinbase-btc-usd@mako" vs
+// "coinbase-btc-usd@riptide". The label is lowercase [a-z0-9_], no
+// '-'/'@'/'.'/whitespace (those would corrupt the dash-split, the '@'
+// split, or KV path segments). An empty label ("") is the sole/legacy
+// instance: its market_id_str is byte-identical to the old
+// "<exch>-<base>-<quote>" form, so pre-existing markets and their KV /
+// DB paths are untouched. 24 leaves room under WM_MARKET_ID_STR_SZ:
+// "coinbase-btc-usd@<label>" fits comfortably.
+#define WM_INSTANCE_LABEL_SZ     24
+
 // Forward decls — opaque to strategy plugins.
 struct wm_aggregator;
 struct exchange_ws_sub;
@@ -337,6 +349,13 @@ typedef struct whenmoon_market
   // the operator re-reconciles. The reconciled cash value itself IS
   // persisted (it lives in session.stats[REAL]).
   int64_t               real_cash_synced_ms;
+
+  // WM-MI-1: instance label. "" for the sole/legacy instance (id stays
+  // byte-identical); non-empty distinguishes independent sessions on the
+  // same (exchange, product_id). Append-only field — offsets above stay
+  // stable per the WM-MK-2 discipline. Part of the running-set dedup key
+  // (exchange, product_id, instance).
+  char                  instance[WM_INSTANCE_LABEL_SZ];
 } whenmoon_market_t;
 
 struct whenmoon_markets
@@ -391,12 +410,19 @@ void wm_market_destroy(struct whenmoon_state *st);
 // Operators who need a deeper history can drive the
 // `/whenmoon download <market> [start] [end]` verb explicitly.
 //
-// Dedup: silently returns SUCCESS if the product is already in the
-// running set. FAIL on DB/alloc errors; writes a terse diagnostic
-// into `err` (optional; pass NULL to suppress).
+// `instance` (WM-MI-1) is the per-session label disambiguating multiple
+// sessions on the same (exchange, product_id); pass "" (or NULL) for the
+// sole/legacy instance. The running-set dedup key is
+// (exchange, product_id, instance): a fresh instance on an existing
+// product is a NEW session sharing the same wm_market row + candle
+// history.
+//
+// Dedup: silently returns SUCCESS if the (exchange, product, instance)
+// triple is already in the running set. FAIL on DB/alloc errors; writes
+// a terse diagnostic into `err` (optional; pass NULL to suppress).
 bool wm_market_add(struct whenmoon_state *st,
     const char *exchange, const char *base, const char *quote,
-    const char *product_id, bool persist,
+    const char *product_id, const char *instance, bool persist,
     char *err, size_t err_cap);
 
 // Remove a market from the running set. `persist=true` flips
@@ -405,9 +431,11 @@ bool wm_market_add(struct whenmoon_state *st,
 // was not present (benign no-op). When `was_present` is non-NULL, it
 // is set to true iff the pair was found in the running set.
 // `exchange` disambiguates same-product entries from different
-// exchanges (e.g. coinbase BTC-USD vs kraken BTC-USD).
+// exchanges (e.g. coinbase BTC-USD vs kraken BTC-USD); `instance`
+// (WM-MI-1) disambiguates independent sessions on the SAME
+// (exchange, product) — pass "" (or NULL) for the sole/legacy instance.
 bool wm_market_remove(struct whenmoon_state *st,
-    const char *exchange, const char *product_id,
+    const char *exchange, const char *product_id, const char *instance,
     bool persist, bool *was_present,
     char *err, size_t err_cap);
 
@@ -430,6 +458,25 @@ bool wm_market_parse_id(const char *id,
 // Format canonical id from parts. Output is lowercase, dash-joined.
 void wm_market_format_id(const char *exchange, const char *base,
     const char *quote, char *out, size_t out_sz);
+
+// WM-MI-1: parse "<exchange>-<base>-<quote>[@<instance>]". Splits the
+// optional trailing "@<instance>" (via the LAST '@'), validates the
+// label charset ([a-z0-9_]), then delegates the triple to
+// wm_market_parse_id. When no '@' is present `instance` is set to "".
+// `inst_sz` must be >= WM_INSTANCE_LABEL_SZ. Returns SUCCESS on
+// well-formed input, FAIL otherwise (bad triple or bad label).
+bool wm_market_parse_instance_id(const char *id,
+    char *exchange, size_t exch_sz,
+    char *base,     size_t base_sz,
+    char *quote,    size_t quote_sz,
+    char *instance, size_t inst_sz);
+
+// WM-MI-1: format "<exchange>-<base>-<quote>[@<instance>]". Builds the
+// triple via wm_market_format_id, then appends "@<instance>" when
+// `instance` is non-NULL and non-empty. FAIL if the result would exceed
+// out_sz-1 (out left NUL-terminated but truncated); SUCCESS otherwise.
+bool wm_market_format_instance_id(const char *exchange, const char *base,
+    const char *quote, const char *instance, char *out, size_t out_sz);
 
 // Build the exchange wire-form symbol "BASE-QUOTE" (uppercase) from
 // already-parsed lowercase base/quote tokens. Output is empty on

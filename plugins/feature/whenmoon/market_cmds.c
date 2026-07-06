@@ -32,10 +32,11 @@
 // on parse failure, and returns FAIL in both cases.
 static bool
 wm_market_take_id_arg(const cmd_ctx_t *ctx, const char *usage,
-    char *exch,   size_t exch_cap,
-    char *base,   size_t base_cap,
-    char *quote,  size_t quote_cap,
-    char *symbol, size_t sym_cap)
+    char *exch,     size_t exch_cap,
+    char *base,     size_t base_cap,
+    char *quote,    size_t quote_cap,
+    char *symbol,   size_t sym_cap,
+    char *instance, size_t inst_cap)
 {
   const char *p;
   char        id_tok[64] = {0};
@@ -48,10 +49,12 @@ wm_market_take_id_arg(const cmd_ctx_t *ctx, const char *usage,
     return(FAIL);
   }
 
-  if(wm_market_parse_id(id_tok, exch, exch_cap, base, base_cap,
-         quote, quote_cap) != SUCCESS)
+  // WM-MI-1: accept an optional "@<instance>" suffix; empty when absent.
+  if(wm_market_parse_instance_id(id_tok, exch, exch_cap, base, base_cap,
+         quote, quote_cap, instance, inst_cap) != SUCCESS)
   {
-    cmd_reply(ctx, "bad market id (expected <exch>-<base>-<quote>)");
+    cmd_reply(ctx,
+        "bad market id (expected <exch>-<base>-<quote>[@<instance>])");
     return(FAIL);
   }
 
@@ -78,6 +81,7 @@ wm_market_cmd_start(const cmd_ctx_t *ctx)
   char              base[16];
   char              quote[16];
   char              symbol[WM_PRODUCT_ID_SZ];
+  char              instance[WM_INSTANCE_LABEL_SZ] = {0};
   char              err[128] = {0};
   char              reply[192];
   char              id_str[WM_MARKET_ID_STR_SZ];
@@ -91,16 +95,18 @@ wm_market_cmd_start(const cmd_ctx_t *ctx)
   }
 
   if(wm_market_take_id_arg(ctx,
-         "usage: /whenmoon market start <exch>-<base>-<quote>",
-         exch,   sizeof(exch),
-         base,   sizeof(base),
-         quote,  sizeof(quote),
-         symbol, sizeof(symbol)) != SUCCESS)
+         "usage: /whenmoon market start <exch>-<base>-<quote>[@<instance>]",
+         exch,     sizeof(exch),
+         base,     sizeof(base),
+         quote,    sizeof(quote),
+         symbol,   sizeof(symbol),
+         instance, sizeof(instance)) != SUCCESS)
     return;
 
-  wm_market_format_id(exch, base, quote, id_str, sizeof(id_str));
+  wm_market_format_instance_id(exch, base, quote, instance,
+      id_str, sizeof(id_str));
 
-  if(wm_market_add(st, exch, base, quote, symbol,
+  if(wm_market_add(st, exch, base, quote, symbol, instance,
          true, err, sizeof(err)) != SUCCESS)
   {
     snprintf(reply, sizeof(reply), "market start failed: %s",
@@ -122,6 +128,7 @@ wm_market_cmd_stop(const cmd_ctx_t *ctx)
   char              base[16];
   char              quote[16];
   char              symbol[WM_PRODUCT_ID_SZ];
+  char              instance[WM_INSTANCE_LABEL_SZ] = {0};
   char              err[128] = {0};
   char              reply[192];
   char              id_str[WM_MARKET_ID_STR_SZ];
@@ -136,16 +143,18 @@ wm_market_cmd_stop(const cmd_ctx_t *ctx)
   }
 
   if(wm_market_take_id_arg(ctx,
-         "usage: /whenmoon market stop <exch>-<base>-<quote>",
-         exch,   sizeof(exch),
-         base,   sizeof(base),
-         quote,  sizeof(quote),
-         symbol, sizeof(symbol)) != SUCCESS)
+         "usage: /whenmoon market stop <exch>-<base>-<quote>[@<instance>]",
+         exch,     sizeof(exch),
+         base,     sizeof(base),
+         quote,    sizeof(quote),
+         symbol,   sizeof(symbol),
+         instance, sizeof(instance)) != SUCCESS)
     return;
 
-  wm_market_format_id(exch, base, quote, id_str, sizeof(id_str));
+  wm_market_format_instance_id(exch, base, quote, instance,
+      id_str, sizeof(id_str));
 
-  if(wm_market_remove(st, exch, symbol, true, &was_present,
+  if(wm_market_remove(st, exch, symbol, instance, true, &was_present,
          err, sizeof(err)) != SUCCESS)
   {
     snprintf(reply, sizeof(reply), "market stop failed: %s",
@@ -390,6 +399,7 @@ wm_market_cmd_mode(const cmd_ctx_t *ctx)
   char              exch[32];
   char              base[16];
   char              quote[16];
+  char              instance[WM_INSTANCE_LABEL_SZ] = {0};
   char              id_str[WM_MARKET_ID_STR_SZ];
   char              err[160] = {0};
   char              reply[200];
@@ -409,19 +419,22 @@ wm_market_cmd_mode(const cmd_ctx_t *ctx)
      !wm_dl_next_token(&p, mode_tok, sizeof(mode_tok)))
   {
     cmd_reply(ctx,
-        "usage: /whenmoon market mode <exch>-<base>-<quote>"
+        "usage: /whenmoon market mode <exch>-<base>-<quote>[@<instance>]"
         " <manual|paper|real>");
     return;
   }
 
-  if(wm_market_parse_id(id_tok, exch, sizeof(exch), base, sizeof(base),
-         quote, sizeof(quote)) != SUCCESS)
+  if(wm_market_parse_instance_id(id_tok, exch, sizeof(exch),
+         base, sizeof(base), quote, sizeof(quote),
+         instance, sizeof(instance)) != SUCCESS)
   {
-    cmd_reply(ctx, "bad market id (expected <exch>-<base>-<quote>)");
+    cmd_reply(ctx,
+        "bad market id (expected <exch>-<base>-<quote>[@<instance>])");
     return;
   }
 
-  wm_market_format_id(exch, base, quote, id_str, sizeof(id_str));
+  wm_market_format_instance_id(exch, base, quote, instance,
+      id_str, sizeof(id_str));
 
   if(wm_market_mode_parse(mode_tok, &mode) != SUCCESS)
   {

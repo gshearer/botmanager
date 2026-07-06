@@ -44,6 +44,10 @@ typedef struct
   whenmoon_state_t   *st;
   char                exchange_name[EXCHANGE_NAME_SZ];
   char                product_id[WM_PRODUCT_ID_SZ];
+  // WM-MI-1: which instance's live ring to backfill. The re-lookup on
+  // callback keys on (exchange, product, instance) so an add of a
+  // second instance feeds its OWN ring, not the first match's.
+  char                instance[WM_INSTANCE_LABEL_SZ];
 } wm_market_backfill_ctx_t;
 
 // KR-2: heartbeat is implicit at the protocol plugin layer (coinbase
@@ -58,24 +62,32 @@ static const exchange_ws_channel_t wm_ws_channels[] = {
 // Container helpers                                                  //
 // ------------------------------------------------------------------ //
 
-// Find by (exchange, product_id) tuple. Multi-exchange running sets
-// can carry the same product_id (e.g. "BTC-USD") on more than one
-// exchange — the tuple is the unique key.
+// WM-MI-1: find by (exchange, product_id, instance) — the running-set
+// dedup key. Multi-exchange running sets can carry the same product_id
+// (e.g. "BTC-USD") on more than one exchange, and multiple instances can
+// share one (exchange, product); the triple is the unique key. A NULL
+// `instance` is treated as "" (the sole/legacy instance).
 static whenmoon_market_t *
-wm_market_find(whenmoon_markets_t *m,
-    const char *exchange_name, const char *product_id)
+wm_market_find_instance(whenmoon_markets_t *m,
+    const char *exchange_name, const char *product_id,
+    const char *instance)
 {
   uint32_t i;
 
   if(m == NULL || exchange_name == NULL || product_id == NULL)
     return(NULL);
 
+  if(instance == NULL)
+    instance = "";
+
   for(i = 0; i < m->n_markets; i++)
   {
     if(strncmp(m->arr[i].exchange_name, exchange_name,
            EXCHANGE_NAME_SZ) == 0
         && strncmp(m->arr[i].product_id, product_id,
-           WM_PRODUCT_ID_SZ) == 0)
+           WM_PRODUCT_ID_SZ) == 0
+        && strncmp(m->arr[i].instance, instance,
+           WM_INSTANCE_LABEL_SZ) == 0)
       return(&m->arr[i]);
   }
 
@@ -218,10 +230,30 @@ wm_market_resub_ws(whenmoon_state_t *st)
       continue;
     }
 
+    // WM-MI-1: dedup product_ids across instances — N instances of one
+    // product must yield ONE subscription, not N. O(n_pids) inner scan
+    // is fine at these scales (a handful of products per exchange).
     n_pids = 0;
     for(j = i; j < m->n_markets; j++)
     {
-      if(strncmp(m->arr[j].exchange_name, exch, EXCHANGE_NAME_SZ) == 0)
+      uint32_t k;
+      bool     dup;
+
+      if(strncmp(m->arr[j].exchange_name, exch, EXCHANGE_NAME_SZ) != 0)
+        continue;
+
+      dup = false;
+      for(k = 0; k < n_pids; k++)
+      {
+        if(strncmp(pid_ptrs[k], m->arr[j].product_id,
+              WM_PRODUCT_ID_SZ) == 0)
+        {
+          dup = true;
+          break;
+        }
+      }
+
+      if(!dup)
         pid_ptrs[n_pids++] = m->arr[j].product_id;
     }
 
@@ -261,12 +293,16 @@ wm_market_resub_ws(whenmoon_state_t *st)
 // frees the ctx.
 static void
 wm_market_kick_backfill(whenmoon_state_t *st,
-    const char *exchange_name, const char *product_id)
+    const char *exchange_name, const char *product_id,
+    const char *instance)
 {
   wm_market_backfill_ctx_t *ctx;
 
   if(st == NULL || exchange_name == NULL || product_id == NULL)
     return;
+
+  if(instance == NULL)
+    instance = "";
 
   ctx = mem_alloc("whenmoon", "backfill_ctx", sizeof(*ctx));
 
@@ -277,6 +313,7 @@ wm_market_kick_backfill(whenmoon_state_t *st,
   snprintf(ctx->exchange_name, sizeof(ctx->exchange_name), "%s",
       exchange_name);
   snprintf(ctx->product_id, sizeof(ctx->product_id), "%s", product_id);
+  snprintf(ctx->instance, sizeof(ctx->instance), "%s", instance);
 
   // On FAIL, the exchange abstraction fires wm_market_on_candles with
   // res->err set and that callback frees ctx. Do NOT touch ctx after
@@ -625,6 +662,114 @@ wm_market_format_id(const char *exchange, const char *base,
   out[pos] = '\0';
 }
 
+// WM-MI-1: validate an instance label. Non-empty labels must be
+// [a-z0-9_] and fit WM_INSTANCE_LABEL_SZ-1 chars. The empty label is
+// valid (the sole/legacy instance). Rejects '-'/'@'/'.'/whitespace and
+// uppercase, which would corrupt the dash-split, the '@' split, or KV
+// path segments.
+static bool
+wm_market_validate_label(const char *label)
+{
+  size_t i;
+
+  if(label == NULL)
+    return(FAIL);
+
+  if(strlen(label) >= WM_INSTANCE_LABEL_SZ)
+    return(FAIL);
+
+  for(i = 0; label[i] != '\0'; i++)
+  {
+    unsigned char c = (unsigned char)label[i];
+
+    if(!((c >= 'a' && c <= 'z') || (c >= '0' && c <= '9') || c == '_'))
+      return(FAIL);
+  }
+
+  return(SUCCESS);
+}
+
+bool
+wm_market_parse_instance_id(const char *id,
+    char *exchange, size_t exch_sz,
+    char *base,     size_t base_sz,
+    char *quote,    size_t quote_sz,
+    char *instance, size_t inst_sz)
+{
+  const char *at;
+  char        triple[WM_MARKET_ID_STR_SZ];
+  size_t      triple_len;
+
+  if(id == NULL || instance == NULL || inst_sz == 0)
+    return(FAIL);
+
+  instance[0] = '\0';
+
+  // Split on the LAST '@' so a label is unambiguous even if the triple
+  // never contains one (it can't — '@' is rejected everywhere else).
+  at = strrchr(id, '@');
+
+  if(at != NULL)
+  {
+    size_t label_len = strlen(at + 1);
+
+    if(label_len == 0 || label_len >= inst_sz
+        || label_len >= WM_INSTANCE_LABEL_SZ)
+      return(FAIL);
+
+    snprintf(instance, inst_sz, "%s", at + 1);
+
+    if(wm_market_validate_label(instance) != SUCCESS)
+      return(FAIL);
+
+    triple_len = (size_t)(at - id);
+
+    if(triple_len == 0 || triple_len >= sizeof(triple))
+      return(FAIL);
+
+    memcpy(triple, id, triple_len);
+    triple[triple_len] = '\0';
+    id = triple;
+  }
+
+  return(wm_market_parse_id(id, exchange, exch_sz, base, base_sz,
+      quote, quote_sz));
+}
+
+bool
+wm_market_format_instance_id(const char *exchange, const char *base,
+    const char *quote, const char *instance, char *out, size_t out_sz)
+{
+  size_t len;
+
+  if(out == NULL || out_sz == 0)
+    return(FAIL);
+
+  wm_market_format_id(exchange, base, quote, out, out_sz);
+
+  len = strlen(out);
+
+  // wm_market_format_id truncates silently on overflow; a valid triple
+  // is well under WM_MARKET_ID_STR_SZ, but guard anyway.
+  if(len == 0)
+    return(FAIL);
+
+  if(instance == NULL || instance[0] == '\0')
+    return(SUCCESS);
+
+  // "@<label>" must fit: len + 1 ('@') + strlen(label) + 1 (NUL).
+  if(len + 1 + strlen(instance) + 1 > out_sz)
+  {
+    out[len] = '\0';
+    return(FAIL);
+  }
+
+  out[len] = '@';
+  snprintf(out + len + 1, out_sz - len - 1, "%s", instance);
+
+  return(SUCCESS);
+}
+
 void
 wm_market_wire_symbol(const char *base, const char *quote,
     char *out, size_t out_sz)
@@ -724,8 +869,8 @@ wm_market_on_candles(const exchange_candles_result_t *res, void *user)
     return;
   }
 
-  mk = wm_market_find(ctx->st->markets, ctx->exchange_name,
-      ctx->product_id);
+  mk = wm_market_find_instance(ctx->st->markets, ctx->exchange_name,
+      ctx->product_id, ctx->instance);
 
   if(mk == NULL)
   {
@@ -788,16 +933,25 @@ wm_market_on_event(const exchange_ws_event_t *ev, void *user)
     case EXCH_WS_TICKER:
     {
       const exchange_ws_ticker_t *t = &ev->payload.ticker;
+      uint32_t                    i;
 
-      mk = wm_market_find(st->markets, exch, t->product_id);
+      // WM-MI-1: fan the tick out to EVERY instance on this
+      // (exchange, product_id) — each holds its own session/position, so
+      // one wire tick must advance all of them. One lock acquire per
+      // matching market, released before the next: no nested locking.
+      for(i = 0; i < st->markets->n_markets; i++)
+      {
+        mk = &st->markets->arr[i];
 
-      if(mk == NULL)
-        break;
+        if(strncmp(mk->exchange_name, exch, EXCHANGE_NAME_SZ) != 0 ||
+           strncmp(mk->product_id, t->product_id, WM_PRODUCT_ID_SZ) != 0)
+          continue;
 
-      pthread_mutex_lock(&mk->lock);
-      mk->last_px      = t->price;
-      mk->last_tick_ms = t->time_ms;
-      pthread_mutex_unlock(&mk->lock);
+        pthread_mutex_lock(&mk->lock);
+        mk->last_px      = t->price;
+        mk->last_tick_ms = t->time_ms;
+        pthread_mutex_unlock(&mk->lock);
+      }
 
       clam(CLAM_DEBUG2, WHENMOON_CTX,
           "tick %s/%s px=%.8g",
@@ -808,23 +962,32 @@ wm_market_on_event(const exchange_ws_event_t *ev, void *user)
     case EXCH_WS_TRADES:
     {
       const exchange_ws_match_t *m = &ev->payload.match;
+      uint32_t                   i;
 
-      mk = wm_market_find(st->markets, exch, m->product_id);
+      // WM-MI-1: fan the trade out to EVERY instance on this
+      // (exchange, product_id). Each instance owns its aggregator, so it
+      // must see the same trade to advance its own grain cascade +
+      // position. One lock per matching market; no nested locking.
+      for(i = 0; i < st->markets->n_markets; i++)
+      {
+        mk = &st->markets->arr[i];
 
-      if(mk == NULL)
-        break;
+        if(strncmp(mk->exchange_name, exch, EXCHANGE_NAME_SZ) != 0 ||
+           strncmp(mk->product_id, m->product_id, WM_PRODUCT_ID_SZ) != 0)
+          continue;
 
-      pthread_mutex_lock(&mk->lock);
+        pthread_mutex_lock(&mk->lock);
 
-      mk->last_px      = m->price;
-      mk->last_tick_ms = m->time_ms;
+        mk->last_px      = m->price;
+        mk->last_tick_ms = m->time_ms;
 
-      // Drive the multi-grain cascade. Aggregator owns the close +
-      // indicator pass; this hot path stays under one lock acquire.
-      if(mk->aggregator != NULL)
-        wm_aggregator_on_trade(mk, m->time_ms, m->price, m->size);
+        // Drive the multi-grain cascade. Aggregator owns the close +
+        // indicator pass; this hot path stays under one lock acquire.
+        if(mk->aggregator != NULL)
+          wm_aggregator_on_trade(mk, m->time_ms, m->price, m->size);
 
-      pthread_mutex_unlock(&mk->lock);
+        pthread_mutex_unlock(&mk->lock);
+      }
 
       clam(CLAM_DEBUG2, WHENMOON_CTX,
           "match %s/%s %s px=%.8g sz=%.8g",
@@ -911,7 +1074,7 @@ wm_market_destroy(whenmoon_state_t *st)
 bool
 wm_market_add(whenmoon_state_t *st,
     const char *exchange, const char *base, const char *quote,
-    const char *product_id, bool persist,
+    const char *product_id, const char *instance, bool persist,
     char *err, size_t err_cap)
 {
   whenmoon_markets_t *m;
@@ -921,6 +1084,9 @@ wm_market_add(whenmoon_state_t *st,
   if(err != NULL && err_cap > 0)
     err[0] = '\0';
 
+  if(instance == NULL)
+    instance = "";
+
   if(st == NULL || st->markets == NULL || exchange == NULL ||
      base == NULL || quote == NULL || product_id == NULL)
   {
@@ -928,9 +1094,20 @@ wm_market_add(whenmoon_state_t *st,
     return(FAIL);
   }
 
+  // WM-MI-1: reject a malformed instance label up front (the id parser
+  // already validates on the command path, but wm_market_restore and
+  // internal callers reach here directly).
+  if(wm_market_validate_label(instance) != SUCCESS)
+  {
+    if(err != NULL) snprintf(err, err_cap, "bad instance label");
+    return(FAIL);
+  }
+
   m = st->markets;
 
-  if(wm_market_find(m, exchange, product_id) != NULL)
+  // WM-MI-1: dedup on the (exchange, product, instance) triple — a new
+  // instance on an existing product is a distinct session, not a no-op.
+  if(wm_market_find_instance(m, exchange, product_id, instance) != NULL)
     return(SUCCESS);   // already present; benign no-op
 
   market_id = wm_market_lookup_or_create(exchange, base, quote, product_id);
@@ -951,8 +1128,18 @@ wm_market_add(whenmoon_state_t *st,
   memset(mk, 0, sizeof(*mk));
   snprintf(mk->exchange_name, sizeof(mk->exchange_name), "%s", exchange);
   snprintf(mk->product_id,    sizeof(mk->product_id),    "%s", product_id);
-  wm_market_format_id(exchange, base, quote,
-      mk->market_id_str, sizeof(mk->market_id_str));
+  snprintf(mk->instance,      sizeof(mk->instance),      "%s", instance);
+
+  // WM-MI-1: the canonical id carries "@<instance>" for a non-empty
+  // label; the empty-label form is byte-identical to the legacy triple.
+  if(wm_market_format_instance_id(exchange, base, quote, instance,
+         mk->market_id_str, sizeof(mk->market_id_str)) != SUCCESS)
+  {
+    if(err != NULL) snprintf(err, err_cap, "market id too long");
+    memset(mk, 0, sizeof(*mk));
+    return(FAIL);
+  }
+
   mk->market_id = market_id;
   pthread_mutex_init(&mk->lock, NULL);
 
@@ -1001,7 +1188,7 @@ wm_market_add(whenmoon_state_t *st,
   wm_market_session_refresh_kv(mk);
 
   wm_market_resub_ws(st);
-  wm_market_kick_backfill(st, exchange, product_id);
+  wm_market_kick_backfill(st, exchange, product_id, instance);
 
   // WM-WARMUP-2: auto-attach the declared strategy roster, then begin
   // the warmup lifecycle. The roster KV is the source of truth for which
@@ -1061,7 +1248,7 @@ wm_market_add(whenmoon_state_t *st,
 
 bool
 wm_market_remove(whenmoon_state_t *st,
-    const char *exchange, const char *product_id,
+    const char *exchange, const char *product_id, const char *instance,
     bool persist, bool *was_present, char *err, size_t err_cap)
 {
   whenmoon_markets_t *m;
@@ -1076,6 +1263,9 @@ wm_market_remove(whenmoon_state_t *st,
   if(err != NULL && err_cap > 0)
     err[0] = '\0';
 
+  if(instance == NULL)
+    instance = "";
+
   if(st == NULL || st->markets == NULL || exchange == NULL
       || product_id == NULL)
   {
@@ -1084,7 +1274,8 @@ wm_market_remove(whenmoon_state_t *st,
   }
 
   m  = st->markets;
-  mk = wm_market_find(m, exchange, product_id);
+  // WM-MI-1: disambiguate which instance's session to drop.
+  mk = wm_market_find_instance(m, exchange, product_id, instance);
 
   if(mk == NULL)
     return(SUCCESS);  // benign no-op; was_present stays false
@@ -1188,7 +1379,9 @@ wm_market_restore(whenmoon_state_t *st)
     if(exch == NULL || base == NULL || quote == NULL || sym == NULL)
       continue;
 
-    if(wm_market_add(st, exch, base, quote, sym,
+    // WM-MI-1: restore the sole/legacy instance (""). Per-instance
+    // restore of the running set is WM-MI-2.
+    if(wm_market_add(st, exch, base, quote, sym, "",
            false, NULL, 0) != SUCCESS)
     {
       clam(CLAM_INFO, WHENMOON_CTX,
