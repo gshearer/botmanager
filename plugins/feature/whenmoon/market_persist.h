@@ -35,9 +35,12 @@ void wm_market_persist_global_destroy(void);
 // ring serialization stays tight (~32 KiB / market worst case).
 bool wm_market_persist_locked(whenmoon_market_t *mk);
 
-// Drop the row for `market_id`. Issued at `wm_market_remove` so a
-// stopped market does not leave stale state lying around.
-bool wm_market_persist_drop(int32_t market_id);
+// WM-MI-2: mark the (market_id, instance) session out of the running
+// set (enabled=FALSE) while keeping its row. Issued at
+// `wm_market_remove` so a stopped instance no longer restores on the
+// next daemon start, yet its final paper P&L stays inspectable. A later
+// re-start of the same instance overwrites the row from a fresh session.
+bool wm_market_persist_disable(int32_t market_id, const char *instance);
 
 // Drain every pending entry synchronously and run each statement on
 // the calling thread. Used at SIGTERM (called from

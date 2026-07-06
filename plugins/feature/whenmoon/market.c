@@ -1187,6 +1187,19 @@ wm_market_add(whenmoon_state_t *st,
   // exists for this market.
   wm_market_session_refresh_kv(mk);
 
+  // WM-MI-2: write the initial per-instance state row (enabled=TRUE) the
+  // moment the instance joins the running set, so a restart before the
+  // first fill still restores it. The freshly-init session overwrites any
+  // stale disabled row from a prior stop (ON CONFLICT), so no old ledger
+  // resurrects. Restores pass persist=false and rely on
+  // wm_market_persist_restore_all to rehydrate instead.
+  if(persist)
+  {
+    pthread_mutex_lock(&mk->lock);
+    (void)wm_market_persist_locked(mk);
+    pthread_mutex_unlock(&mk->lock);
+  }
+
   wm_market_resub_ws(st);
   wm_market_kick_backfill(st, exchange, product_id, instance);
 
@@ -1254,6 +1267,7 @@ wm_market_remove(whenmoon_state_t *st,
   whenmoon_markets_t *m;
   whenmoon_market_t  *mk;
   char                id_str[WM_MARKET_ID_STR_SZ];
+  char                inst_str[WM_INSTANCE_LABEL_SZ];
   uint32_t            idx;
   int32_t             market_id;
 
@@ -1285,7 +1299,8 @@ wm_market_remove(whenmoon_state_t *st,
 
   idx       = (uint32_t)(mk - m->arr);
   market_id = mk->market_id;
-  snprintf(id_str, sizeof(id_str), "%s", mk->market_id_str);
+  snprintf(id_str,   sizeof(id_str),   "%s", mk->market_id_str);
+  snprintf(inst_str, sizeof(inst_str), "%s", mk->instance);
 
   // Auto-detach any strategy attachments bound to this market. Done
   // before tearing down market state so finalize_fn callbacks fire
@@ -1312,19 +1327,39 @@ wm_market_remove(whenmoon_state_t *st,
 
   if(persist && market_id >= 0)
   {
-    if(wm_market_set_enabled(market_id, false) != SUCCESS)
+    // WM-MI-2: does any OTHER instance of this product still run? The
+    // slot has already been compacted out, so a remaining match in arr
+    // means the product must stay enabled (downloads/candles) even
+    // though this instance is leaving the running set.
+    bool     product_still_live = false;
+    uint32_t k;
+
+    for(k = 0; k < m->n_markets; k++)
+    {
+      if(m->arr[k].market_id == market_id)
+      {
+        product_still_live = true;
+        break;
+      }
+    }
+
+    // Product-level enabled flag (downloads/candles) only flips off when
+    // the LAST instance of the product stops.
+    if(!product_still_live &&
+        wm_market_set_enabled(market_id, false) != SUCCESS)
     {
       // In-memory removal already committed; leaving enabled=true would
-      // cause the market to resurrect on next restart. Log and keep
+      // cause the product to resurrect on next restart. Log and keep
       // going; the operator can `/whenmoon market stop` again.
       if(err != NULL)
         snprintf(err, err_cap,
             "DB disable failed (live set already updated)");
     }
 
-    // WM-MK-2: drop the per-market session row so a stale paper ledger
-    // doesn't resurrect when the operator re-enables the market later.
-    (void)wm_market_persist_drop(market_id);
+    // WM-MI-2: drop THIS instance out of the per-instance running set
+    // (enabled=FALSE) so it no longer restores, while peers on the same
+    // product and this instance's final P&L are preserved.
+    (void)wm_market_persist_disable(market_id, inst_str);
   }
 
   wm_market_resub_ws(st);
@@ -1356,11 +1391,17 @@ wm_market_restore(whenmoon_state_t *st)
   if(res == NULL)
     return(FAIL);
 
+  // WM-MI-2: the per-instance running set lives in wm_market_state
+  // (enabled=TRUE), joined to wm_market for the product coordinates. One
+  // row per running instance — a product with three instances yields
+  // three sessions, each re-added under its own label.
   if(db_query(
-         "SELECT exchange, base_asset, quote_asset, exchange_symbol"
-         "  FROM wm_market"
-         " WHERE enabled = TRUE"
-         " ORDER BY id", res) != SUCCESS || !res->ok)
+         "SELECT m.exchange, m.base_asset, m.quote_asset,"
+         " m.exchange_symbol, s.instance"
+         "  FROM wm_market_state s"
+         "  JOIN wm_market m ON s.market_id = m.id"
+         " WHERE s.enabled = TRUE"
+         " ORDER BY m.id, s.instance", res) != SUCCESS || !res->ok)
   {
     clam(CLAM_WARN, WHENMOON_CTX,
         "market restore query failed: %s",
@@ -1375,17 +1416,25 @@ wm_market_restore(whenmoon_state_t *st)
     const char *base  = db_result_get(res, i, 1);
     const char *quote = db_result_get(res, i, 2);
     const char *sym   = db_result_get(res, i, 3);
+    const char *inst  = db_result_get(res, i, 4);
 
     if(exch == NULL || base == NULL || quote == NULL || sym == NULL)
       continue;
 
-    // WM-MI-1: restore the sole/legacy instance (""). Per-instance
-    // restore of the running set is WM-MI-2.
-    if(wm_market_add(st, exch, base, quote, sym, "",
+    if(inst == NULL)
+      inst = "";
+
+    // Re-add under the persisted instance label. persist=false is
+    // critical: it suppresses wm_market_add's initial-row upsert, which
+    // would otherwise enqueue a CLEAN (freshly-init) session and race
+    // wm_market_persist_restore_all to clobber the persisted P&L. The
+    // mode + full session ledger are rehydrated by restore_all next; the
+    // market sits in warmup until then, so no trade fires meanwhile.
+    if(wm_market_add(st, exch, base, quote, sym, inst,
            false, NULL, 0) != SUCCESS)
     {
       clam(CLAM_INFO, WHENMOON_CTX,
-          "market %s restore failed — skipping", sym);
+          "market %s@%s restore failed — skipping", sym, inst);
       continue;
     }
 

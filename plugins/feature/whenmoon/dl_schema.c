@@ -21,10 +21,12 @@
 
 static const char *const wm_dl_ddl_core[] = {
   // Registry --------------------------------------------------------
-  // `enabled` is the new on/off knob: `/whenmoon market start` flips
-  // it true (and inserts the row if missing); `/whenmoon market stop`
-  // flips it false. wm_market_restore selects WHERE enabled = true on
-  // plugin start so the running set survives daemon restarts.
+  // `enabled` is the product-level on/off knob (downloads + candle
+  // history): `/whenmoon market start` flips it true (and inserts the
+  // row if missing) while >=1 instance runs; the LAST `market stop`
+  // flips it false. WM-MI-2: the per-instance running set now lives in
+  // wm_market_state.enabled — wm_market_restore JOINs that so each
+  // instance survives a daemon restart, not just the product.
   "CREATE TABLE IF NOT EXISTS wm_market ("
   " id              SERIAL       PRIMARY KEY,"
   " exchange        VARCHAR(32)  NOT NULL,"
@@ -90,7 +92,13 @@ static const char *const wm_dl_ddl_core[] = {
   // ALTER TABLE (per the pre-1.0 freshstart policy in
   // feedback_no_migration_planning.md).
   "CREATE TABLE IF NOT EXISTS wm_market_state ("
-  " market_id          INT              NOT NULL PRIMARY KEY,"
+  " market_id          INT              NOT NULL,"
+  // WM-MI-2: per-instance session identity. Multiple instances share one
+  // wm_market row (market_id) but each owns an independent session; the
+  // (market_id, instance) pair is the true key. `enabled` carries the
+  // per-instance running-set membership (restore selects WHERE enabled).
+  " instance           VARCHAR(24)      NOT NULL DEFAULT '',"
+  " enabled            BOOLEAN          NOT NULL DEFAULT FALSE,"
   " mode               VARCHAR(16)      NOT NULL,"
   " position_side      VARCHAR(8)       NOT NULL,"
   " position_qty       DOUBLE PRECISION NOT NULL,"
@@ -116,7 +124,8 @@ static const char *const wm_dl_ddl_core[] = {
   " daily_loss_bps     DOUBLE PRECISION NOT NULL,"
   " pending_cap        INT              NOT NULL,"
   " pending_n          INT              NOT NULL,"
-  " updated_at         TIMESTAMPTZ      NOT NULL DEFAULT NOW()"
+  " updated_at         TIMESTAMPTZ      NOT NULL DEFAULT NOW(),"
+  " PRIMARY KEY (market_id, instance)"
   ")",
 };
 

@@ -465,7 +465,8 @@ wm_mp_build_upsert_locked(const whenmoon_market_t *mk)
   // Build the UPSERT.
   wm_mp_buf_puts(&sql,
       "INSERT INTO wm_market_state ("
-      "market_id, mode, position_side, position_qty, position_avg,"
+      "market_id, instance, enabled, mode,"
+      " position_side, position_qty, position_avg,"
       " position_opened_ms,"
       " stats_paper, stats_real, fills_paper, fills_real, pending,"
       " last_mark_px, last_mark_ms, last_signal, has_last_signal,"
@@ -476,6 +477,12 @@ wm_mp_build_upsert_locked(const whenmoon_market_t *mk)
       " VALUES (");
 
   wm_mp_buf_printf(&sql, "%" PRId32 ",", mk->market_id);
+  // WM-MI-2: instance label is validated [a-z0-9_] on the add path, so
+  // it needs no SQL escaping. A running upsert always carries the
+  // instance into the running set (enabled=TRUE); the LAST-instance stop
+  // is the only writer of enabled=FALSE (wm_market_persist_disable).
+  wm_mp_buf_printf(&sql, "'%s',", mk->instance);
+  wm_mp_buf_puts(&sql, "TRUE,");
   wm_mp_buf_printf(&sql, "'%s',", wm_market_mode_name(s->mode));
   wm_mp_buf_printf(&sql, "'%s',", wm_mp_pos_side_name(s->position.side));
   wm_mp_buf_printf(&sql, "%.10g,", s->position.qty);
@@ -509,7 +516,8 @@ wm_mp_build_upsert_locked(const whenmoon_market_t *mk)
   wm_mp_buf_printf(&sql, "%u,",    s->pending_cap);
   wm_mp_buf_printf(&sql, "%u",     s->pending_n);
 
-  wm_mp_buf_puts(&sql, ") ON CONFLICT (market_id) DO UPDATE SET"
+  wm_mp_buf_puts(&sql, ") ON CONFLICT (market_id, instance) DO UPDATE SET"
+      " enabled = EXCLUDED.enabled,"
       " mode = EXCLUDED.mode,"
       " position_side = EXCLUDED.position_side,"
       " position_qty = EXCLUDED.position_qty,"
@@ -564,6 +572,11 @@ out:
 typedef struct wm_mp_entry
 {
   int32_t              market_id;
+  // WM-MI-2: instances share a market_id but persist independent rows,
+  // so the coalescing key is (market_id, instance) — keying on market_id
+  // alone would let one instance's upsert clobber a peer's still-pending
+  // one before the drain runs.
+  char                 instance[WM_INSTANCE_LABEL_SZ];
   char                *sql;       // owned; mem_free on drain
   struct wm_mp_entry  *next;
 } wm_mp_entry_t;
@@ -573,13 +586,13 @@ static wm_mp_entry_t   *wm_mp_g_head = NULL;
 static task_handle_t    wm_mp_g_task = TASK_HANDLE_NONE;
 
 static wm_mp_entry_t *
-wm_mp_find_locked(int32_t market_id)
+wm_mp_find_locked(int32_t market_id, const char *instance)
 {
   wm_mp_entry_t *e;
 
   for(e = wm_mp_g_head; e != NULL; e = e->next)
   {
-    if(e->market_id == market_id)
+    if(e->market_id == market_id && strcmp(e->instance, instance) == 0)
       return(e);
   }
 
@@ -587,16 +600,20 @@ wm_mp_find_locked(int32_t market_id)
 }
 
 static bool
-wm_mp_enqueue_owned(int32_t market_id, char *sql_owned)
+wm_mp_enqueue_owned(int32_t market_id, const char *instance,
+    char *sql_owned)
 {
   wm_mp_entry_t *e;
 
   if(sql_owned == NULL || market_id < 0)
     return(FAIL);
 
+  if(instance == NULL)
+    instance = "";
+
   pthread_mutex_lock(&wm_mp_g_lock);
 
-  e = wm_mp_find_locked(market_id);
+  e = wm_mp_find_locked(market_id, instance);
 
   if(e != NULL)
   {
@@ -618,6 +635,7 @@ wm_mp_enqueue_owned(int32_t market_id, char *sql_owned)
 
   memset(e, 0, sizeof(*e));
   e->market_id = market_id;
+  snprintf(e->instance, sizeof(e->instance), "%s", instance);
   e->sql       = sql_owned;
   e->next      = wm_mp_g_head;
   wm_mp_g_head = e;
@@ -643,7 +661,7 @@ wm_market_persist_locked(whenmoon_market_t *mk)
     return(FAIL);
   }
 
-  if(wm_mp_enqueue_owned(mk->market_id, sql) != SUCCESS)
+  if(wm_mp_enqueue_owned(mk->market_id, mk->instance, sql) != SUCCESS)
   {
     mem_free(sql);
     return(FAIL);
@@ -653,23 +671,34 @@ wm_market_persist_locked(whenmoon_market_t *mk)
 }
 
 bool
-wm_market_persist_drop(int32_t market_id)
+wm_market_persist_disable(int32_t market_id, const char *instance)
 {
   char  *sql;
-  size_t cap = 128;
+  size_t cap = 160;
 
   if(market_id < 0)
     return(FAIL);
 
-  sql = mem_alloc("whenmoon", "mp_drop_sql", cap);
+  if(instance == NULL)
+    instance = "";
+
+  sql = mem_alloc("whenmoon", "mp_disable_sql", cap);
 
   if(sql == NULL)
     return(FAIL);
 
+  // WM-MI-2: drop this instance out of the running set but KEEP the row
+  // so its final paper P&L stays inspectable. The instance label is
+  // validated [a-z0-9_], so it needs no SQL escaping. A later re-start of
+  // the same instance overwrites the row from a freshly-init session
+  // (wm_market_persist_locked with enabled=TRUE), so no stale ledger
+  // resurrects.
   snprintf(sql, cap,
-      "DELETE FROM wm_market_state WHERE market_id = %" PRId32, market_id);
+      "UPDATE wm_market_state SET enabled = FALSE"
+      " WHERE market_id = %" PRId32 " AND instance = '%s'",
+      market_id, instance);
 
-  if(wm_mp_enqueue_owned(market_id, sql) != SUCCESS)
+  if(wm_mp_enqueue_owned(market_id, instance, sql) != SUCCESS)
   {
     mem_free(sql);
     return(FAIL);
@@ -1058,7 +1087,8 @@ wm_market_persist_restore_all(whenmoon_state_t *st)
          " fills_n_paper, fills_head_paper,"
          " fills_n_real, fills_head_real,"
          " fee_bps, slip_bps, size_frac, max_notional,"
-         " daily_loss_bps, pending_cap, pending_n"
+         " daily_loss_bps, pending_cap, pending_n,"
+         " instance"   // WM-MI-2: col 26, matched against mk->instance
          "  FROM wm_market_state", res) != SUCCESS || !res->ok)
   {
     clam(CLAM_WARN, WHENMOON_CTX,
@@ -1090,13 +1120,24 @@ wm_market_persist_restore_all(whenmoon_state_t *st)
 
     market_id = (int32_t)strtol(cell, NULL, 10);
 
-    // Look up the running market by id (linear walk; small N).
-    for(j = 0; j < st->markets->n_markets; j++)
+    // WM-MI-2: match on the (market_id, instance) pair — a bare
+    // market_id match would hydrate the wrong instance's session onto a
+    // peer sharing the same wm_market row.
     {
-      if(st->markets->arr[j].market_id == market_id)
+      const char *inst = db_result_get(res, i, 26);
+
+      if(inst == NULL)
+        inst = "";
+
+      // Look up the running instance by (id, label) (linear walk; small N).
+      for(j = 0; j < st->markets->n_markets; j++)
       {
-        mk = &st->markets->arr[j];
-        break;
+        if(st->markets->arr[j].market_id == market_id &&
+           strcmp(st->markets->arr[j].instance, inst) == 0)
+        {
+          mk = &st->markets->arr[j];
+          break;
+        }
       }
     }
 
