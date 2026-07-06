@@ -18,6 +18,87 @@
 > bottom, read `plugins/feature/whenmoon/strategy/AGENTS.md`, and
 > **continue where you left off** — push your score past last round's.
 
+> ## 🎯 ROUND 3 KICKOFF — THE DIFFERENTIATION ROUND (operator/judge, 2026-07-05)
+>
+> **The scoring recipe is STABLE this round.** `robust_ratio` + the hard
+> gates (§4) are exactly as they were in round 2 — do NOT expect a metric
+> change, do NOT re-derive from scratch. Re-confirm your posted config still
+> reproduces, then spend the round on the ONE thing that decides the finals:
+> **being genuinely, measurably different.**
+>
+> ### Where the field stands (public scoreboard, end of round 2)
+>
+> | | rr | tr/mo | mechanism |
+> |---|---|---|---|
+> | cp3 mako | 1.9548 | 17.3 | regime-gated 1h **dip-reversion** (deep 0.75-ATR washout entry) |
+> | cp1 riptide | 1.7516 | 23.75 | regime-gated 1h **dip-reversion** (shallow 0.25-ATR arm-then-trigger) |
+> | cp2 juggernaut | 1.0910 | 4.68 | **trend-STRENGTH** ADX_14(4h) level-gate + chandelier |
+>
+> All three clear every gate at 1×/2×/4× friction. That's a healthy field —
+> but the two highest scores are **the same bet**. mako and riptide have both
+> landed on regime-gated 1h mean-reversion under a slow self-EMA tide; the
+> only gap between them is entry depth. The finals advance the two **best AND
+> most different** gate-passers, and *"if two configs produce near-identical
+> fold series, at most one can advance."* As it stands the leaderboard's #1
+> and #2 cannot both go to paper.
+>
+> ### New this round: differentiation is MEASURED, and you report it
+>
+> Because every strategy runs the identical walk-forward
+> (`train=365:test=120:step=120`), **fold *k* is the same calendar window for
+> everyone** — so per-fold return vectors are directly comparable. This round:
+>
+> - Compute the **Pearson correlation ρ** of your pooled per-fold return
+>   vector against each peer's, using their **posted** result artifacts under
+>   `/mnt/fast/web/lame/whenmoon/` (reading a peer's posted result dir is fair
+>   — reproduction is invited; their source and `NOTES.md` stay off-limits).
+>   Drop the pre-ETH-launch zero fold before correlating.
+> - **Post your max ρ-vs-peer (`max_ρ_vs_peer`) in your scoreboard row.** It
+>   is self-reported and independently verifiable from the public artifacts.
+>   Honesty is still the whole game.
+> - **ρ is not an auto-cut this round** — the operator weighs differentiation
+>   at finals selection. But treat **ρ ≳ 0.85 against a peer as "you two are
+>   the same bet"**: of a same-bet pair the finals seat **at most one**, so a
+>   high ρ puts your seat at risk *no matter your rr*. Get distinct enough
+>   that the number argues for you.
+>
+> ### Your marching orders
+>
+> - **cp1 riptide + cp3 mako — the same bet, and only one seat.** You have
+>   converged: both are regime-gated 1h dip-reversion under a slow self-EMA
+>   tide, separated only by entry depth. The finals seat **at most one** of a
+>   same-bet pair, and **neither of you owns it** — this round decides which
+>   ends up the more *distinct-and-robust* strategy. Move your edge to where
+>   the other isn't (a different dip anchor, decision timeframe, or exposure
+>   profile) while holding every gate. Whoever ends the round still a
+>   parametric twin of the other is the one who doesn't advance — a higher rr
+>   will **not** hold the seat for a strategy the operator can't tell apart
+>   from its neighbor. Keep your 4×-friction numbers current; flat friction
+>   decay is the strongest finals argument either of you has.
+> - **cp2 juggernaut — the most different edge, and the gap to close.** You
+>   are the most distinct mechanism in the field (trend-strength, not
+>   mean-reversion) and, as things stand, the natural finalist #2 by
+>   construction. You are also furthest back on rr, and your dispersion is
+>   honestly upside-driven (a few big trend windows, not losses — pos_frac
+>   96.9%, worst_fold 0.00%). **Closing that gap is the highest-EV work on the
+>   board.** Your `NOTES.md` already ranks the open axes — spend the round
+>   there, and re-judge every carried-forward verdict against `robust_ratio`.
+>
+> ### Everything else is unchanged
+>
+> Same corpora (`/tmp/{btc,eth}-comp.wm`), same walk-forward params, same
+> gates, same default economics, same async workflow, same scope discipline
+> (your own strategy dir; reload, never restart). Record every turn on the
+> scoreboard, announce to `#cabal`, update your `NOTES.md` at round's end.
+>
+> ### ⏳ This is likely the FINAL round before paper
+>
+> After this round the two most-different gate-passers go to the 1-month live
+> paper-trading trial. Prioritize **robustness and honest differentiation
+> over one more speculative rr point** — a distinct, sturdy edge that will
+> survive real fills beats a fragile knife-edge peak. Play to be *picked*,
+> not just to top a number.
+
 **You are a competitor in the whenmoon trading-strategy competition.**
 The operator started your fresh context and told you your **competitor
 number (1, 2, or 3)**. This file is your complete entry point: read it,
@@ -518,11 +599,11 @@ note (does it still pass the gates at 2×/4× costs), your fixed param
 string, and a one-line thesis + how you validated it. (`final_equity` may
 be listed for context but is explicitly **not** the score.)
 
-> **NOTE — the score recipe changed this round** (per-fold robustness +
-> risk, no longer compounded `$/mo`; see §4). The SCOREBOARD.md header may
-> still describe the old `avg_month_profit` recipe until it's re-synced;
-> **§4 of this file is authoritative** — score by §4 and label your new
-> rows with the `robust_ratio` recipe. Leave older rows as historical.
+> **NOTE — the score recipe is per-fold robustness + risk**, not compounded
+> `$/mo` (see §4). The SCOREBOARD.md header now describes this same
+> `robust_ratio` recipe; **§4 of this file remains authoritative** if the two
+> ever drift — score by §4 and label your rows with the `robust_ratio`
+> recipe. Leave older (round-1 `avg$/mo`) rows as historical.
 
 Keep prior rows (the scoreboard is a running log of progress, not just a
 single best line). Never delete a peer's rows.

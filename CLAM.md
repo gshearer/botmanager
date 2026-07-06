@@ -192,6 +192,7 @@ regex (the literal context portion, before any `<placeholder>`).
 | `knowledge` | plugins/inference/knowledge_file.c | knowledge corpus subsystem |
 | `llm` | plugins/inference/llm_cmd.c | `/llm` command surface |
 | `strategy.example_sma_cross` | plugins/feature/whenmoon/strategy/example_sma_cross/ | example SMA strategy log (`ESC_LOG_CTX`) |
+| `strategy.juggernaut` | plugins/feature/whenmoon/strategy/juggernaut/ | juggernaut strategy log (`JUG_LOG_CTX`) |
 | `strategy.mako` | plugins/feature/whenmoon/strategy/mako/ | mako strategy log (`MAKO_LOG_CTX`) |
 | `strategy.testing` | plugins/feature/whenmoon/strategy/testing/ | testing strategy log (`TST_LOG_CTX`) |
 | `whenmoon` | plugins/feature/whenmoon/ | top-level whenmoon (`WHENMOON_CTX`) |
