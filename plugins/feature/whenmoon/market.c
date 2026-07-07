@@ -175,6 +175,13 @@ wm_market_resub_ws(whenmoon_state_t *st)
 
   m = st->markets;
 
+  // WM-RESUB-COALESCE-1: during a bulk restore, per-add resubs are
+  // suppressed; wm_market_restore issues ONE resub after its add-loop.
+  // Rebuilding the whole subscription N times storms coinbase into
+  // starving the feed (see finding_ws_resub_storm_starves_feed).
+  if(m->defer_resub)
+    return;
+
   // WM-MKT-ARR-UAF-1: rdlock across the whole rebuild — the arr walks below
   // must see a stable pointer block, and the pid pointers gathered into
   // pid_ptrs alias session-owned (pointer-stable) memory. This is always
@@ -1532,6 +1539,14 @@ wm_market_restore(whenmoon_state_t *st)
     goto out;
   }
 
+  // WM-RESUB-COALESCE-1: suppress the per-add WS resubs across the whole
+  // restore. Each wm_market_add below would otherwise rebuild the entire
+  // per-exchange subscription, so N instances = N full unsub/resub cycles
+  // that storm coinbase into starving the live feed. We issue ONE resub
+  // after the loop instead. The query-fail `goto out` above is BEFORE this
+  // flag is set, so no cleanup is needed on that path.
+  st->markets->defer_resub = true;
+
   for(i = 0; i < res->rows; i++)
   {
     const char *exch  = db_result_get(res, i, 0);
@@ -1562,6 +1577,12 @@ wm_market_restore(whenmoon_state_t *st)
 
     n_restored++;
   }
+
+  // WM-RESUB-COALESCE-1: clear the gate and issue ONE resub for the whole
+  // restored set (one subscribe per exchange + the user-channel sub),
+  // instead of the N cycles the per-add path would have fired.
+  st->markets->defer_resub = false;
+  wm_market_resub_ws(st);
 
   clam(CLAM_INFO, WHENMOON_CTX,
       "%u running market(s) restored", n_restored);

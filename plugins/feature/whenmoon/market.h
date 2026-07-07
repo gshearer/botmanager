@@ -389,6 +389,16 @@ struct whenmoon_markets
   // resub retries.
   wm_market_ws_binding_t   ws_bindings[WM_MARKET_MAX_WS_BINDINGS];
   uint32_t                 n_ws_bindings;
+
+  // WM-RESUB-COALESCE-1: when true, wm_market_resub_ws returns
+  // immediately without touching the WS bindings. Set by
+  // wm_market_restore around its per-instance add-loop so the N adds
+  // don't each rebuild the whole per-exchange subscription (N full
+  // unsub/resub cycles storm coinbase into starving the live feed);
+  // the restore issues ONE resub after clearing it. Zeroed to false by
+  // wm_market_init's memset, so every non-restore caller resubs as
+  // before. See finding_ws_resub_storm_starves_feed.
+  bool                     defer_resub;
 };
 
 // Forward decl to keep this header independent of whenmoon.h.
