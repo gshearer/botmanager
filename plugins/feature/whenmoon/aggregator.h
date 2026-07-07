@@ -144,6 +144,16 @@ void wm_aggregator_load_history(struct whenmoon_state *st,
 
 void wm_aggregator_load_history_task(struct task *t);
 
+// WM-WARMUP-HERD-1 concurrency gate around the full-ring DB replay.
+// try_acquire increments the plugin-global active-warmup counter iff it
+// is below WM_WARMUP_MAX_CONCURRENT and returns true; otherwise it makes
+// no change and returns false (the caller re-defers). release decrements
+// (call once per successful acquire, on every exit path). active_count
+// is a live gauge for logging.
+bool     wm_warmup_try_acquire(void);
+void     wm_warmup_release(void);
+uint32_t wm_warmup_active_count(void);
+
 #endif // WHENMOON_INTERNAL
 
 #endif // BM_WHENMOON_AGGREGATOR_H

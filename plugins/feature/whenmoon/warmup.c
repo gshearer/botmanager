@@ -275,13 +275,36 @@ wm_market_warmup_recheck_task(task_t *t)
     converged = true;
   }
 
+  // WM-WARMUP-HERD-1 STEP 1: converged, but the full-ring replay herd is
+  // at the cap — poll again shortly WITHOUT advancing iters or re-walking
+  // gaps (we're already contiguous, just waiting for a replay slot). Keeps
+  // the bulk-restore remote-DB fetches staggered instead of simultaneous.
+  if(converged && !wm_warmup_try_acquire())
+  {
+    clam(CLAM_INFO, WHENMOON_CTX,
+        "warmup %s: converged, %u warmups active (cap %u) — deferring replay",
+        mk->market_id_str, wm_warmup_active_count(),
+        WM_WARMUP_MAX_CONCURRENT);
+
+    if(task_add_deferred("wm_warm_recheck", TASK_ANY, 200,
+           WM_WARM_RECHECK_INTERVAL_MS, wm_market_warmup_recheck_task, ctx)
+           == TASK_HANDLE_NONE)
+      mem_free(ctx);
+
+    pthread_rwlock_unlock(&ctx->st->markets->arr_lock);
+    t->state = TASK_ENDED;
+    return;
+  }
+
   if(converged)
   {
+    // We hold a warmup slot from the try_acquire above.
     uint32_t limit = (eff > 0) ? (uint32_t)(eff / 60000) : 0;
 
     // Replay the recent window from the (now-filled) DB → cascade warms
     // every grain. load_history takes mk->lock internally.
     wm_aggregator_load_history(ctx->st, mk->market_id_str, limit);
+    wm_warmup_release();
     wm_warm_set_state(mk, WM_WARM_READY);
 
     clam(CLAM_INFO, WHENMOON_CTX,

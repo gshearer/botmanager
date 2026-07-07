@@ -15,16 +15,19 @@
 
 #define WHENMOON_INTERNAL
 #include "aggregator.h"
+#include "dl_jobtable.h"
 #include "dl_schema.h"
 #include "indicators.h"
 #include "market.h"
 #include "strategy.h"
+#include "warmup.h"
 #include "whenmoon.h"
 
 #include "db.h"
 #include "task.h"
 
 #include <inttypes.h>
+#include <stdatomic.h>
 #include <stddef.h>
 #include <stdlib.h>
 #include <string.h>
@@ -518,6 +521,40 @@ wm_aggregator_warmup_grain(whenmoon_market_t *mk, wm_gran_t gran,
 // Warm-up loader                                                     //
 // ------------------------------------------------------------------ //
 
+// WM-WARMUP-HERD-1: plugin-global count of in-flight full-ring DB
+// replays. Bounds the remote-Postgres fetch + replay-lock herd on a bulk
+// restore so the control plane keeps a worker + DB slot free.
+static atomic_uint_fast32_t g_wm_warmup_active = 0;
+
+// Reserve a warmup slot if we're under the cap. Soft cap: momentarily
+// oversubscribes by one under contention (fetch_add then back off), which
+// is harmless — a single extra replay never reconstitutes the herd.
+bool
+wm_warmup_try_acquire(void)
+{
+  uint32_t prev = (uint32_t)atomic_fetch_add(&g_wm_warmup_active, 1);
+
+  if(prev >= WM_WARMUP_MAX_CONCURRENT)
+  {
+    atomic_fetch_sub(&g_wm_warmup_active, 1);
+    return(false);
+  }
+
+  return(true);
+}
+
+void
+wm_warmup_release(void)
+{
+  atomic_fetch_sub(&g_wm_warmup_active, 1);
+}
+
+uint32_t
+wm_warmup_active_count(void)
+{
+  return((uint32_t)atomic_load(&g_wm_warmup_active));
+}
+
 // Synchronous DB 1m replay. `limit_override` caps the replay at the
 // newest N 1m bars (0 = the full 1m ring capacity). Cascades 1m→…→1d via
 // wm_aggregator_replay_bar so every grain warms from one source. MUST be
@@ -540,6 +577,9 @@ wm_aggregator_load_history(whenmoon_state_t *st, const char *market_id_str,
   uint32_t           g;
   int                n;
   bool               saved_dispatch;
+  int64_t            t0;             // WM-WARMUP-HERD-1 STEP 0: timing
+  int64_t            fetch_ms = 0;
+  int64_t            replay_ms = 0;
 
   if(st == NULL || st->markets == NULL || market_id_str == NULL)
     return;
@@ -618,6 +658,10 @@ wm_aggregator_load_history(whenmoon_state_t *st, const char *market_id_str,
     return;
   }
 
+  // STEP 0: bracket the (remote) fetch. wm_dl_now_ms() is monotonic
+  // (memory wm_dl_now_ms_is_monotonic) — never wm_now_ms() here.
+  t0 = wm_dl_now_ms();
+
   if(db_query(sql, res) != SUCCESS || !res->ok)
   {
     clam(CLAM_INFO, WHENMOON_CTX,
@@ -628,6 +672,8 @@ wm_aggregator_load_history(whenmoon_state_t *st, const char *market_id_str,
     pthread_rwlock_unlock(&st->markets->arr_lock);
     return;
   }
+
+  fetch_ms = wm_dl_now_ms() - t0;
 
   if(res->rows == 0)
   {
@@ -663,6 +709,8 @@ wm_aggregator_load_history(whenmoon_state_t *st, const char *market_id_str,
     mk->aggregator->last_close_ms[g] = 0;
   }
 
+  t0 = wm_dl_now_ms();   // STEP 0: bracket the in-memory replay loop
+
   for(i = 0; i < res->rows; i++)
   {
     const char       *s_ts     = db_result_get(res, i, 0);
@@ -694,11 +742,19 @@ wm_aggregator_load_history(whenmoon_state_t *st, const char *market_id_str,
 
   mk->aggregator->dispatch_strategies = saved_dispatch;
 
+  replay_ms = wm_dl_now_ms() - t0;
+
   pthread_mutex_unlock(&mk->lock);
 
+  // STEP 0 (WM-WARMUP-HERD-1): one line per run splitting remote-fetch vs
+  // replay wall-time + the live concurrent-warmup gauge, so a restart is a
+  // measurement (which of fetch/replay dominates, and that the cap holds).
   clam(CLAM_INFO, WHENMOON_CTX,
-      "warmup %s: replayed %u 1m bars from %s (limit=%u)",
-      mk->market_id_str, replayed, table, limit);
+      "warmup %s: replayed %u 1m bars from %s (limit=%u) "
+      "fetch=%lldms replay=%lldms rows=%u active=%u",
+      mk->market_id_str, replayed, table, limit,
+      (long long)fetch_ms, (long long)replay_ms, res->rows,
+      wm_warmup_active_count());
 
   db_result_free(res);
   pthread_rwlock_unlock(&st->markets->arr_lock);
@@ -723,8 +779,23 @@ wm_aggregator_load_history_task(task_t *t)
     return;
   }
 
+  // STEP 1 (WM-WARMUP-HERD-1): bound concurrent full-ring replays. Over
+  // the cap, re-defer this same task (ctx stays heap-owned) rather than
+  // landing another remote-DB fetch on the herd.
+  if(!wm_warmup_try_acquire())
+  {
+    if(task_add_deferred("wm_warmup", TASK_ANY, 200, WM_WARMUP_DEFER_MS,
+           wm_aggregator_load_history_task, wctx) == TASK_HANDLE_NONE)
+      mem_free(wctx);   // couldn't reschedule — drop rather than leak
+
+    t->state = TASK_ENDED;
+    return;
+  }
+
   wm_aggregator_load_history(wctx->st, wctx->market_id_str,
       wctx->limit_override);
+
+  wm_warmup_release();
 
   mem_free(wctx);
   t->state = TASK_ENDED;

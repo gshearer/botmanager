@@ -43,6 +43,16 @@ struct whenmoon_market;
 // to READY with whatever history exists.
 #define WM_WARM_MAX_RECHECKS          240u
 
+// WM-WARMUP-HERD-1: bound how many full-ring DB replays run at once. A
+// bulk restore of N instances would otherwise land N concurrent remote-
+// Postgres fetches (~288k rows each) + N replay-loop lock holds, making
+// botmanctl/IRC sluggish for ~1-2 min. Cap = one slot per distinct
+// product in the trial set. Callers over the cap re-defer.
+#define WM_WARMUP_MAX_CONCURRENT      3u
+
+// Re-defer interval for a warmup that hit the concurrency cap.
+#define WM_WARMUP_DEFER_MS            250u
+
 // Begin (or restart) the warmup lifecycle for a market. Reads the
 // attached strategy roster to size the required history, enqueues DB
 // gap-fills for the recent window, and schedules the convergence
