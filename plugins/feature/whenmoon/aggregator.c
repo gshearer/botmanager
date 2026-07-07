@@ -518,31 +518,6 @@ wm_aggregator_warmup_grain(whenmoon_market_t *mk, wm_gran_t gran,
 // Warm-up loader                                                     //
 // ------------------------------------------------------------------ //
 
-// Look up a market by market_id under its containing whenmoon state.
-// Returns NULL if the bot has been torn down or the market removed
-// since the warmup task was scheduled.
-// WM-MKT-ARR-UAF-1: LOCK-FREE. The caller MUST hold `st->markets->arr_lock`
-// (read or write) across this call AND all use of the returned pointer.
-static whenmoon_market_t *
-wm_warmup_find_market(whenmoon_state_t *st, int32_t market_id)
-{
-  whenmoon_markets_t *m;
-  uint32_t            i;
-
-  if(st == NULL || st->markets == NULL || market_id < 0)
-    return(NULL);
-
-  m = st->markets;
-
-  for(i = 0; i < m->n_markets; i++)
-  {
-    if(m->arr[i]->market_id == market_id)
-      return(m->arr[i]);
-  }
-
-  return(NULL);
-}
-
 // Synchronous DB 1m replay. `limit_override` caps the replay at the
 // newest N 1m bars (0 = the full 1m ring capacity). Cascades 1m→…→1d via
 // wm_aggregator_replay_bar so every grain warms from one source. MUST be
@@ -550,10 +525,11 @@ wm_warmup_find_market(whenmoon_state_t *st, int32_t market_id)
 // replay under mk->lock); WM-WARMUP-2 calls it from the warmup task and
 // from the convergence re-check (both task threads).
 void
-wm_aggregator_load_history(whenmoon_state_t *st, int32_t market_id,
+wm_aggregator_load_history(whenmoon_state_t *st, const char *market_id_str,
     uint32_t limit_override)
 {
   whenmoon_market_t *mk;
+  int32_t            market_id;
   db_result_t       *res = NULL;
   char               table[WM_DL_TABLE_SZ];
   char               sql[512];
@@ -565,7 +541,7 @@ wm_aggregator_load_history(whenmoon_state_t *st, int32_t market_id,
   int                n;
   bool               saved_dispatch;
 
-  if(st == NULL || st->markets == NULL)
+  if(st == NULL || st->markets == NULL || market_id_str == NULL)
     return;
 
   // WM-MKT-ARR-UAF-1: hold rdlock across the whole load — mk is dereferenced
@@ -574,16 +550,21 @@ wm_aggregator_load_history(whenmoon_state_t *st, int32_t market_id,
   // warmups are readers and still run concurrently.
   pthread_rwlock_rdlock(&st->markets->arr_lock);
 
-  mk = wm_warmup_find_market(st, market_id);
+  // WM-MI-1: resolve the INSTANCE (by its unique market_id_str), not the
+  // shared int32 market_id — otherwise every instance of a product warms the
+  // first instance's ring and the rest stay at their REST-backfill depth.
+  mk = wm_market_lookup_by_id(st, market_id_str);
 
   if(mk == NULL || mk->aggregator == NULL)
   {
     pthread_rwlock_unlock(&st->markets->arr_lock);
     clam(CLAM_INFO, WHENMOON_CTX,
-        "warmup market_id=%" PRId32 ": market gone before run, skipping",
-        market_id);
+        "warmup %s: market gone before run, skipping", market_id_str);
     return;
   }
+
+  // Candle history is shared per product, keyed by the int32 registry id.
+  market_id = mk->market_id;
 
   // The 1m ring sets the ceiling on what's useful to load — anything
   // older would just shift off the front on push. A caller-supplied
@@ -742,7 +723,7 @@ wm_aggregator_load_history_task(task_t *t)
     return;
   }
 
-  wm_aggregator_load_history(wctx->st, wctx->market_id,
+  wm_aggregator_load_history(wctx->st, wctx->market_id_str,
       wctx->limit_override);
 
   mem_free(wctx);

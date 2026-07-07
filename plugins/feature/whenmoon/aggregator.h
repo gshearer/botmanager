@@ -117,25 +117,30 @@ void wm_aggregator_warmup_grain(struct whenmoon_market *mk,
     wm_gran_t gran, const wm_candle_full_t *bars, uint32_t n);
 
 // Warm-up loader. Heap-owned context; the task frees it when done.
-// Re-resolves the market by market_id under the markets container so
-// that a removed market between scheduling and run bails cleanly. Reads
-// `wm_candles_<market_id>` chronologically and replays through
-// wm_aggregator_replay_bar so the cascade backfills 5m..1d before any
-// live trade arrives.
+// WM-MI-1: re-resolves the market by its instance-unique `market_id_str`
+// (NOT the shared int32 market_id, which collapses all instances of a
+// product onto the first one — the warmup would then pour every instance's
+// DB replay into a single ring). A removed market between scheduling and
+// run bails cleanly. Reads the shared `wm_candles_<market_id>` table
+// chronologically and replays through wm_aggregator_replay_bar into THIS
+// instance's rings so the cascade backfills 5m..1d before any live trade.
 struct whenmoon_state;
 struct task;
 
 typedef struct
 {
   struct whenmoon_state *st;
-  int32_t                market_id;
+  // Instance-unique canonical id ("<exch>-<base>-<quote>[@<instance>]").
+  // 64 mirrors WM_MARKET_ID_STR_SZ (market.h — cannot #include here: it
+  // includes aggregator.h, so the dependency is one-way only).
+  char                   market_id_str[64];
   uint32_t               limit_override;   // 0 = full 1m ring capacity
 } wm_warmup_ctx_t;
 
 // Synchronous DB 1m replay (newest `limit_override` bars, or the full 1m
 // ring when 0). Cascades 1m→…→1d. Must run off the cmd thread.
 void wm_aggregator_load_history(struct whenmoon_state *st,
-    int32_t market_id, uint32_t limit_override);
+    const char *market_id_str, uint32_t limit_override);
 
 void wm_aggregator_load_history_task(struct task *t);
 

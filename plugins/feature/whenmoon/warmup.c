@@ -281,7 +281,7 @@ wm_market_warmup_recheck_task(task_t *t)
 
     // Replay the recent window from the (now-filled) DB → cascade warms
     // every grain. load_history takes mk->lock internally.
-    wm_aggregator_load_history(ctx->st, mk->market_id, limit);
+    wm_aggregator_load_history(ctx->st, mk->market_id_str, limit);
     wm_warm_set_state(mk, WM_WARM_READY);
 
     clam(CLAM_INFO, WHENMOON_CTX,
@@ -410,7 +410,8 @@ wm_market_warmup_begin(whenmoon_state_t *st, whenmoon_market_t *mk)
     if(lc != NULL)
     {
       lc->st             = st;
-      lc->market_id      = mk->market_id;
+      snprintf(lc->market_id_str, sizeof(lc->market_id_str), "%s",
+          mk->market_id_str);
       lc->limit_override = 0;
 
       if(task_add_deferred("wm_warmup", TASK_ANY, 200, 50,
