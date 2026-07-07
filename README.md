@@ -324,9 +324,9 @@ is explicitly out of scope.
 - [`DESIGN.md`](DESIGN.md) — full design specification
 - [`PLUGIN.md`](PLUGIN.md) — plugin layer rules and the grep audits
   that enforce them
-- [`CHATBOT.md`](CHATBOT.md) — chat method internals
-- [`KNOWLEDGE.md`](KNOWLEDGE.md), [`ACQUIRE.md`](ACQUIRE.md),
-  [`LLM.md`](LLM.md) — inference plugin subsystems
+- [`plugins/method/chat/CHATBOT.md`](plugins/method/chat/CHATBOT.md) — chat method internals
+- [`KNOWLEDGE.md`](plugins/inference/KNOWLEDGE.md), [`ACQUIRE.md`](plugins/inference/ACQUIRE.md),
+  [`LLM.md`](plugins/inference/LLM.md) — inference plugin subsystems
 
 ---
 

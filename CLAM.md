@@ -8,10 +8,10 @@ against `"<context> <body>"`; matching subscribers receive the
 event via their callback. FATAL messages bypass the filter.
 
 This file is the authoritative registry of every context string
-emitted in the codebase. **Discipline:** any commit that
-introduces a new CLAM context must update this file in the same
-commit. The discipline note also lives in `AGENTS.md §Coding
-Conventions`.
+emitted in the codebase — a map of where to point a subscriber
+regex to watch a given subsystem. **Convention:** whenever a commit
+introduces a new CLAM context, it updates this file in the same
+commit, so the registry never drifts from the source.
 
 ## Subscriber API
 
