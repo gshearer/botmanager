@@ -198,15 +198,21 @@ wm_count_active_markets(const char *exchange)
   if(st == NULL || st->markets == NULL)
     return(0);
 
+  // WM-MKT-ARR-UAF-1: rdlock across the walk (self-contained — returns only
+  // a count, no escaping pointer).
+  pthread_rwlock_rdlock(&st->markets->arr_lock);
+
   for(i = 0; i < st->markets->n_markets; i++)
   {
-    const whenmoon_market_t *mk = &st->markets->arr[i];
+    const whenmoon_market_t *mk = st->markets->arr[i];
     size_t                   prefix_len = strnlen(exchange, EXCHANGE_NAME_SZ);
 
     if(strncmp(mk->market_id_str, exchange, prefix_len) == 0
         && mk->market_id_str[prefix_len] == '-')
       n++;
   }
+
+  pthread_rwlock_unlock(&st->markets->arr_lock);
 
   return(n);
 }

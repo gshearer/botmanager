@@ -67,6 +67,10 @@ static const exchange_ws_channel_t wm_ws_channels[] = {
 // (e.g. "BTC-USD") on more than one exchange, and multiple instances can
 // share one (exchange, product); the triple is the unique key. A NULL
 // `instance` is treated as "" (the sole/legacy instance).
+//
+// WM-MKT-ARR-UAF-1: LOCK-FREE. The caller MUST hold `m->arr_lock` (read or
+// write) across this call AND all use of the returned pointer — the rwlock
+// keeps `arr` stable and the returned session alive for that span.
 static whenmoon_market_t *
 wm_market_find_instance(whenmoon_markets_t *m,
     const char *exchange_name, const char *product_id,
@@ -82,29 +86,31 @@ wm_market_find_instance(whenmoon_markets_t *m,
 
   for(i = 0; i < m->n_markets; i++)
   {
-    if(strncmp(m->arr[i].exchange_name, exchange_name,
+    if(strncmp(m->arr[i]->exchange_name, exchange_name,
            EXCHANGE_NAME_SZ) == 0
-        && strncmp(m->arr[i].product_id, product_id,
+        && strncmp(m->arr[i]->product_id, product_id,
            WM_PRODUCT_ID_SZ) == 0
-        && strncmp(m->arr[i].instance, instance,
+        && strncmp(m->arr[i]->instance, instance,
            WM_INSTANCE_LABEL_SZ) == 0)
-      return(&m->arr[i]);
+      return(m->arr[i]);
   }
 
   return(NULL);
 }
 
-// Grow `arr` to hold at least `needed` slots. Existing rows are
-// copied by mem_realloc; freshly-added tail bytes are zeroed so their
-// pthread_mutex_t fields are in a defined "not yet initialised" state
-// until wm_market_add fills them. Returns SUCCESS or FAIL.
+// Grow the `arr` POINTER block to hold at least `needed` slots. Existing
+// pointers are copied by mem_realloc (the sessions they reference never
+// move — see whenmoon_markets_t); freshly-added tail slots are zeroed to
+// NULL. WM-MKT-ARR-UAF-1: caller MUST hold `m->arr_lock` for writing (this
+// is only ever reached from wm_market_add's publish section). Returns
+// SUCCESS or FAIL.
 static bool
 wm_market_grow(whenmoon_markets_t *m, uint32_t needed)
 {
-  whenmoon_market_t *next;
-  uint32_t           new_cap;
-  size_t             new_sz;
-  size_t             old_sz;
+  whenmoon_market_t **next;
+  uint32_t            new_cap;
+  size_t              new_sz;
+  size_t              old_sz;
 
   if(m == NULL)
     return(FAIL);
@@ -169,6 +175,16 @@ wm_market_resub_ws(whenmoon_state_t *st)
 
   m = st->markets;
 
+  // WM-MKT-ARR-UAF-1: rdlock across the whole rebuild — the arr walks below
+  // must see a stable pointer block, and the pid pointers gathered into
+  // pid_ptrs alias session-owned (pointer-stable) memory. This is always
+  // reached OUTSIDE the writer's wrlock (add/remove call resub_ws after
+  // releasing it). Deadlock-safe: everything nested here (wm_live_ws_resub_all,
+  // any tick callback) only ever takes rdlock, and recursive read-locking is
+  // permitted under the default reader-preferring attributes. (ws_bindings
+  // writer-vs-writer serialization is a separate, pre-existing concern.)
+  pthread_rwlock_rdlock(&m->arr_lock);
+
   for(i = 0; i < m->n_ws_bindings; i++)
   {
     if(m->ws_bindings[i].ws_sub != NULL)
@@ -183,6 +199,7 @@ wm_market_resub_ws(whenmoon_state_t *st)
   if(m->n_markets == 0)
   {
     wm_live_ws_resub_all(st);
+    pthread_rwlock_unlock(&m->arr_lock);
     return;
   }
 
@@ -194,6 +211,7 @@ wm_market_resub_ws(whenmoon_state_t *st)
     clam(CLAM_INFO, WHENMOON_CTX,
         "ws resub alloc failed (no live stream)");
     wm_live_ws_resub_all(st);
+    pthread_rwlock_unlock(&m->arr_lock);
     return;
   }
 
@@ -203,7 +221,7 @@ wm_market_resub_ws(whenmoon_state_t *st)
   // O(N²) over the running set is fine at these scales.
   for(i = 0; i < m->n_markets; i++)
   {
-    const char             *exch = m->arr[i].exchange_name;
+    const char             *exch = m->arr[i]->exchange_name;
     wm_market_ws_binding_t *b;
     uint32_t                n_pids;
     bool                    seen;
@@ -239,13 +257,13 @@ wm_market_resub_ws(whenmoon_state_t *st)
       uint32_t k;
       bool     dup;
 
-      if(strncmp(m->arr[j].exchange_name, exch, EXCHANGE_NAME_SZ) != 0)
+      if(strncmp(m->arr[j]->exchange_name, exch, EXCHANGE_NAME_SZ) != 0)
         continue;
 
       dup = false;
       for(k = 0; k < n_pids; k++)
       {
-        if(strncmp(pid_ptrs[k], m->arr[j].product_id,
+        if(strncmp(pid_ptrs[k], m->arr[j]->product_id,
               WM_PRODUCT_ID_SZ) == 0)
         {
           dup = true;
@@ -254,7 +272,7 @@ wm_market_resub_ws(whenmoon_state_t *st)
       }
 
       if(!dup)
-        pid_ptrs[n_pids++] = m->arr[j].product_id;
+        pid_ptrs[n_pids++] = m->arr[j]->product_id;
     }
 
     b = &m->ws_bindings[m->n_ws_bindings];
@@ -286,6 +304,7 @@ wm_market_resub_ws(whenmoon_state_t *st)
   mem_free(pid_ptrs);
 
   wm_live_ws_resub_all(st);
+  pthread_rwlock_unlock(&m->arr_lock);
 }
 
 // Fire a one-shot candle backfill into the per-market live ring.
@@ -400,6 +419,9 @@ wm_market_session_init(wm_market_session_t *s)
   s->pending_cap    = WM_MARKET_DEFAULT_PENDING_CAP;
 }
 
+// WM-MKT-ARR-UAF-1: LOCK-FREE. The caller MUST hold
+// `st->markets->arr_lock` (read or write) across this call AND all use of
+// the returned pointer.
 whenmoon_market_t *
 wm_market_lookup_by_id(whenmoon_state_t *st, const char *market_id_str)
 {
@@ -413,9 +435,9 @@ wm_market_lookup_by_id(whenmoon_state_t *st, const char *market_id_str)
 
   for(i = 0; i < m->n_markets; i++)
   {
-    if(strncmp(m->arr[i].market_id_str, market_id_str,
+    if(strncmp(m->arr[i]->market_id_str, market_id_str,
            WM_MARKET_ID_STR_SZ) == 0)
-      return(&m->arr[i]);
+      return(m->arr[i]);
   }
 
   return(NULL);
@@ -433,15 +455,24 @@ wm_market_exchange_has_real_mode(whenmoon_state_t *st,
 
   m = st->markets;
 
+  // WM-MKT-ARR-UAF-1: self-contained reader — takes rdlock over its own
+  // walk. Returns only a bool (no escaping pointer), so releasing the lock
+  // here is safe.
+  pthread_rwlock_rdlock(&m->arr_lock);
+
   for(i = 0; i < m->n_markets; i++)
   {
-    if(m->arr[i].session.mode != WM_MARKET_MODE_REAL)
+    if(m->arr[i]->session.mode != WM_MARKET_MODE_REAL)
       continue;
 
-    if(strcmp(m->arr[i].exchange_name, exchange_name) == 0)
+    if(strcmp(m->arr[i]->exchange_name, exchange_name) == 0)
+    {
+      pthread_rwlock_unlock(&m->arr_lock);
       return(true);
+    }
   }
 
+  pthread_rwlock_unlock(&m->arr_lock);
   return(false);
 }
 
@@ -869,11 +900,18 @@ wm_market_on_candles(const exchange_candles_result_t *res, void *user)
     return;
   }
 
+  // WM-MKT-ARR-UAF-1: hold rdlock across find→lock→replay. This keeps the
+  // resolved session alive for the (potentially long) replay; it only ever
+  // blocks a concurrent remove of a market — ticks (other readers) run in
+  // parallel.
+  pthread_rwlock_rdlock(&ctx->st->markets->arr_lock);
+
   mk = wm_market_find_instance(ctx->st->markets, ctx->exchange_name,
       ctx->product_id, ctx->instance);
 
   if(mk == NULL)
   {
+    pthread_rwlock_unlock(&ctx->st->markets->arr_lock);
     mem_free(ctx);
     return;
   }
@@ -903,6 +941,7 @@ wm_market_on_candles(const exchange_candles_result_t *res, void *user)
   }
 
   pthread_mutex_unlock(&mk->lock);
+  pthread_rwlock_unlock(&ctx->st->markets->arr_lock);
 
   clam(CLAM_INFO, WHENMOON_CTX,
       "market %s: %u candles backfilled",
@@ -939,9 +978,12 @@ wm_market_on_event(const exchange_ws_event_t *ev, void *user)
       // (exchange, product_id) — each holds its own session/position, so
       // one wire tick must advance all of them. One lock acquire per
       // matching market, released before the next: no nested locking.
+      // WM-MKT-ARR-UAF-1: rdlock over the whole fan-out — arr stays stable
+      // and no session is freed by a concurrent remove while we hold it.
+      pthread_rwlock_rdlock(&st->markets->arr_lock);
       for(i = 0; i < st->markets->n_markets; i++)
       {
-        mk = &st->markets->arr[i];
+        mk = st->markets->arr[i];
 
         if(strncmp(mk->exchange_name, exch, EXCHANGE_NAME_SZ) != 0 ||
            strncmp(mk->product_id, t->product_id, WM_PRODUCT_ID_SZ) != 0)
@@ -952,6 +994,7 @@ wm_market_on_event(const exchange_ws_event_t *ev, void *user)
         mk->last_tick_ms = t->time_ms;
         pthread_mutex_unlock(&mk->lock);
       }
+      pthread_rwlock_unlock(&st->markets->arr_lock);
 
       clam(CLAM_DEBUG2, WHENMOON_CTX,
           "tick %s/%s px=%.8g",
@@ -968,9 +1011,11 @@ wm_market_on_event(const exchange_ws_event_t *ev, void *user)
       // (exchange, product_id). Each instance owns its aggregator, so it
       // must see the same trade to advance its own grain cascade +
       // position. One lock per matching market; no nested locking.
+      // WM-MKT-ARR-UAF-1: rdlock over the whole fan-out (see TICKER).
+      pthread_rwlock_rdlock(&st->markets->arr_lock);
       for(i = 0; i < st->markets->n_markets; i++)
       {
-        mk = &st->markets->arr[i];
+        mk = st->markets->arr[i];
 
         if(strncmp(mk->exchange_name, exch, EXCHANGE_NAME_SZ) != 0 ||
            strncmp(mk->product_id, m->product_id, WM_PRODUCT_ID_SZ) != 0)
@@ -988,6 +1033,7 @@ wm_market_on_event(const exchange_ws_event_t *ev, void *user)
 
         pthread_mutex_unlock(&mk->lock);
       }
+      pthread_rwlock_unlock(&st->markets->arr_lock);
 
       clam(CLAM_DEBUG2, WHENMOON_CTX,
           "match %s/%s %s px=%.8g sz=%.8g",
@@ -1018,6 +1064,17 @@ wm_market_init(whenmoon_state_t *st)
     return(FAIL);
 
   memset(m, 0, sizeof(*m));
+
+  // WM-MKT-ARR-UAF-1: default (reader-preferring) attributes — see the
+  // arr_lock field comment. Init cannot fail on a zeroed attr, but honor
+  // the return so a hostile pthread config surfaces rather than silently
+  // leaving an unusable lock.
+  if(pthread_rwlock_init(&m->arr_lock, NULL) != 0)
+  {
+    mem_free(m);
+    return(FAIL);
+  }
+
   st->markets = m;
 
   return(SUCCESS);
@@ -1048,16 +1105,24 @@ wm_market_destroy(whenmoon_state_t *st)
   {
     for(i = 0; i < m->n_markets; i++)
     {
-      whenmoon_market_t *mk = &m->arr[i];
+      whenmoon_market_t *mk = m->arr[i];
+
+      if(mk == NULL)
+        continue;
 
       if(mk->aggregator != NULL)
         wm_aggregator_destroy(mk);
 
       pthread_mutex_destroy(&mk->lock);
+
+      // WM-MKT-ARR-UAF-1: each session is individually heap-owned.
+      mem_free(mk);
     }
 
-    mem_free(m->arr);
+    mem_free(m->arr);   // the pointer block itself
   }
+
+  pthread_rwlock_destroy(&m->arr_lock);
 
   // Block new callbacks from finding the state via ->markets before we
   // free. In-flight backfill callbacks will see st->markets == NULL and
@@ -1105,10 +1170,18 @@ wm_market_add(whenmoon_state_t *st,
 
   m = st->markets;
 
-  // WM-MI-1: dedup on the (exchange, product, instance) triple — a new
-  // instance on an existing product is a distinct session, not a no-op.
+  // WM-MI-1 / WM-MKT-ARR-UAF-1: fast-path dedup on the
+  // (exchange, product, instance) triple. The authoritative re-check runs
+  // under the write lock below (closing the add/add TOCTOU); this cheap
+  // read-locked probe just avoids building a whole session for the common
+  // "already present" no-op.
+  pthread_rwlock_rdlock(&m->arr_lock);
   if(wm_market_find_instance(m, exchange, product_id, instance) != NULL)
+  {
+    pthread_rwlock_unlock(&m->arr_lock);
     return(SUCCESS);   // already present; benign no-op
+  }
+  pthread_rwlock_unlock(&m->arr_lock);
 
   market_id = wm_market_lookup_or_create(exchange, base, quote, product_id);
 
@@ -1118,13 +1191,18 @@ wm_market_add(whenmoon_state_t *st,
     return(FAIL);
   }
 
-  if(wm_market_grow(m, m->n_markets + 1) != SUCCESS)
+  // WM-MKT-ARR-UAF-1: build + fully initialise the session PRIVATELY. It is
+  // not yet linked into arr, so no reader can observe it. Only once it is
+  // complete do we take the write lock and publish it. A failure on this
+  // path is a simple free — no arr touch, no rollback of a live slot.
+  mk = mem_alloc("whenmoon", "market", sizeof(*mk));
+
+  if(mk == NULL)
   {
     if(err != NULL) snprintf(err, err_cap, "alloc failed");
     return(FAIL);
   }
 
-  mk = &m->arr[m->n_markets];
   memset(mk, 0, sizeof(*mk));
   snprintf(mk->exchange_name, sizeof(mk->exchange_name), "%s", exchange);
   snprintf(mk->product_id,    sizeof(mk->product_id),    "%s", product_id);
@@ -1136,7 +1214,7 @@ wm_market_add(whenmoon_state_t *st,
          mk->market_id_str, sizeof(mk->market_id_str)) != SUCCESS)
   {
     if(err != NULL) snprintf(err, err_cap, "market id too long");
-    memset(mk, 0, sizeof(*mk));
+    mem_free(mk);
     return(FAIL);
   }
 
@@ -1144,37 +1222,17 @@ wm_market_add(whenmoon_state_t *st,
   pthread_mutex_init(&mk->lock, NULL);
 
   // WM-MK-2: install the per-market position model with default-init
-  // values. Lazy KV refresh (Phase C) replaces cached params on first
-  // engine call. Persistence restore (Phase D) overwrites the session
-  // when a wm_market_state row exists for this market_id.
+  // values. Lazy KV refresh replaces cached params on first engine call;
+  // persistence restore overwrites the session when a wm_market_state row
+  // exists for this market_id.
   wm_market_session_init(&mk->session);
 
-  m->n_markets++;
-
-  if(persist)
-  {
-    if(wm_market_set_enabled(market_id, true) != SUCCESS)
-    {
-      // DB failure -- roll back the in-memory slot so the running set
-      // matches the persisted state.
-      pthread_mutex_destroy(&mk->lock);
-      memset(mk, 0, sizeof(*mk));
-      m->n_markets--;
-      if(err != NULL) snprintf(err, err_cap, "DB enable failed");
-      return(FAIL);
-    }
-  }
-
-  // Aggregator must be in place before resub_ws so the first WS event
-  // can already feed it.
+  // Aggregator must be in place before the market is published so the very
+  // first WS event fan-out can already feed it.
   if(wm_aggregator_init(mk, WM_AGG_DEFAULT_HISTORY_1D) != SUCCESS)
   {
-    if(persist)
-      (void)wm_market_set_enabled(market_id, false);
-
     pthread_mutex_destroy(&mk->lock);
-    memset(mk, 0, sizeof(*mk));
-    m->n_markets--;
+    mem_free(mk);
     if(err != NULL) snprintf(err, err_cap, "aggregator init failed");
     return(FAIL);
   }
@@ -1182,10 +1240,54 @@ wm_market_add(whenmoon_state_t *st,
   // WM-MK-2: lazy-register + cache per-market KV defaults so operator
   // /set kv values land in the session immediately. Idempotent across
   // restarts (kv_register short-circuits on existing keys; KV values
-  // hydrated by kv_load survive); the cached values are also
-  // overwritten by wm_market_persist_restore_all when a state row
-  // exists for this market.
+  // hydrated by kv_load survive); the cached values are also overwritten
+  // by wm_market_persist_restore_all when a state row exists.
   wm_market_session_refresh_kv(mk);
+
+  if(persist && wm_market_set_enabled(market_id, true) != SUCCESS)
+  {
+    wm_aggregator_destroy(mk);
+    pthread_mutex_destroy(&mk->lock);
+    mem_free(mk);
+    if(err != NULL) snprintf(err, err_cap, "DB enable failed");
+    return(FAIL);
+  }
+
+  // WM-MKT-ARR-UAF-1: PUBLISH under the write lock — the commit point.
+  pthread_rwlock_wrlock(&m->arr_lock);
+
+  // Re-check the dedup key: another worker may have published the same
+  // triple while we were building ours.
+  if(wm_market_find_instance(m, exchange, product_id, instance) != NULL)
+  {
+    pthread_rwlock_unlock(&m->arr_lock);
+    // Lost the race. Discard our private session. The product-level enabled
+    // flag we may have set is already true for the winner — nothing to undo.
+    wm_aggregator_destroy(mk);
+    pthread_mutex_destroy(&mk->lock);
+    mem_free(mk);
+    return(SUCCESS);
+  }
+
+  if(wm_market_grow(m, m->n_markets + 1) != SUCCESS)
+  {
+    pthread_rwlock_unlock(&m->arr_lock);
+    if(persist)
+      (void)wm_market_set_enabled(market_id, false);
+    wm_aggregator_destroy(mk);
+    pthread_mutex_destroy(&mk->lock);
+    mem_free(mk);
+    if(err != NULL) snprintf(err, err_cap, "alloc failed");
+    return(FAIL);
+  }
+
+  m->arr[m->n_markets] = mk;
+  m->n_markets++;
+
+  pthread_rwlock_unlock(&m->arr_lock);
+
+  // ---- Post-publish. mk is pointer-stable; these callees take arr_lock
+  //      themselves, so they MUST run outside the write section. ----
 
   // WM-MI-2: write the initial per-instance state row (enabled=TRUE) the
   // moment the instance joins the running set, so a restart before the
@@ -1270,6 +1372,7 @@ wm_market_remove(whenmoon_state_t *st,
   char                inst_str[WM_INSTANCE_LABEL_SZ];
   uint32_t            idx;
   int32_t             market_id;
+  bool                product_still_live = false;
 
   if(was_present != NULL)
     *was_present = false;
@@ -1288,69 +1391,88 @@ wm_market_remove(whenmoon_state_t *st,
   }
 
   m  = st->markets;
+
+  // WM-MKT-ARR-UAF-1: take the write lock for the whole structural edit.
+  // Under wrlock no reader holds any interior mk and none can find one, so
+  // once the session is unlinked it is private — safe to tear down and free
+  // after the lock with no barrier.
+  pthread_rwlock_wrlock(&m->arr_lock);
+
   // WM-MI-1: disambiguate which instance's session to drop.
   mk = wm_market_find_instance(m, exchange, product_id, instance);
 
   if(mk == NULL)
+  {
+    pthread_rwlock_unlock(&m->arr_lock);
     return(SUCCESS);  // benign no-op; was_present stays false
+  }
 
   if(was_present != NULL)
     *was_present = true;
 
-  idx       = (uint32_t)(mk - m->arr);
+  // Locate the pointer slot holding this session.
+  for(idx = 0; idx < m->n_markets; idx++)
+    if(m->arr[idx] == mk)
+      break;
+
   market_id = mk->market_id;
   snprintf(id_str,   sizeof(id_str),   "%s", mk->market_id_str);
   snprintf(inst_str, sizeof(inst_str), "%s", mk->instance);
 
-  // Auto-detach any strategy attachments bound to this market. Done
-  // before tearing down market state so finalize_fn callbacks fire
-  // while the (about-to-be-freed) ctx still has a valid id_str. The
-  // ctx->mkt pointer is invalidated regardless.
-  wm_strategy_detach_market(st, id_str);
-
-  // Aggregator locks the slot's mutex internally, so destroy it
-  // before pthread_mutex_destroy(&mk->lock).
-  if(mk->aggregator != NULL)
-    wm_aggregator_destroy(mk);
-
-  pthread_mutex_destroy(&mk->lock);
-
-  // Compact the tail over the removed slot. Memmove is safe across
-  // overlapping regions. The vacated tail slot is zeroed so a future
-  // grow doesn't inherit a bogus mutex.
+  // Unlink: compact the POINTER tail over the removed slot (sessions never
+  // move — only pointers shift). Overlapping memmove is safe; clear the
+  // vacated tail pointer.
   if(idx + 1 < m->n_markets)
     memmove(&m->arr[idx], &m->arr[idx + 1],
         sizeof(*m->arr) * (m->n_markets - idx - 1));
 
-  memset(&m->arr[m->n_markets - 1], 0, sizeof(*m->arr));
+  m->arr[m->n_markets - 1] = NULL;
   m->n_markets--;
 
-  if(persist && market_id >= 0)
+  // WM-MI-2: does any OTHER instance of this product still run? The slot is
+  // already compacted out, so a remaining match means the product must stay
+  // enabled (downloads/candles) even though this instance is leaving.
   {
-    // WM-MI-2: does any OTHER instance of this product still run? The
-    // slot has already been compacted out, so a remaining match in arr
-    // means the product must stay enabled (downloads/candles) even
-    // though this instance is leaving the running set.
-    bool     product_still_live = false;
     uint32_t k;
 
     for(k = 0; k < m->n_markets; k++)
     {
-      if(m->arr[k].market_id == market_id)
+      if(m->arr[k]->market_id == market_id)
       {
         product_still_live = true;
         break;
       }
     }
+  }
 
+  pthread_rwlock_unlock(&m->arr_lock);
+
+  // ---- mk is now unlinked + unreferenced. Tear it down OUTSIDE the lock
+  //      (these callees may take arr_lock themselves). ----
+
+  // Auto-detach any strategy attachments bound to this market. Done before
+  // freeing so finalize_fn callbacks fire while id_str is still valid; the
+  // ctx->mkt pointer is invalidated regardless.
+  wm_strategy_detach_market(st, id_str);
+
+  // Aggregator locks the session mutex internally, so destroy it before
+  // pthread_mutex_destroy(&mk->lock).
+  if(mk->aggregator != NULL)
+    wm_aggregator_destroy(mk);
+
+  pthread_mutex_destroy(&mk->lock);
+  mem_free(mk);   // WM-MKT-ARR-UAF-1: the session is individually heap-owned
+
+  if(persist && market_id >= 0)
+  {
     // Product-level enabled flag (downloads/candles) only flips off when
     // the LAST instance of the product stops.
     if(!product_still_live &&
         wm_market_set_enabled(market_id, false) != SUCCESS)
     {
       // In-memory removal already committed; leaving enabled=true would
-      // cause the product to resurrect on next restart. Log and keep
-      // going; the operator can `/whenmoon market stop` again.
+      // cause the product to resurrect on next restart. Log and keep going;
+      // the operator can `/whenmoon market stop` again.
       if(err != NULL)
         snprintf(err, err_cap,
             "DB disable failed (live set already updated)");

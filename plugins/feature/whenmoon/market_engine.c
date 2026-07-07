@@ -645,10 +645,21 @@ wm_market_set_mode(const char *market_id_str, wm_market_mode_t mode,
   }
 
   st = whenmoon_get_state();
+
+  if(st == NULL || st->markets == NULL)
+  {
+    if(errbuf != NULL) snprintf(errbuf, errbuf_sz, "no market state");
+    return(FAIL);
+  }
+
+  // WM-MKT-ARR-UAF-1: hold rdlock across lookup + the mk->lock edit and the
+  // trailing clam (which still dereferences mk->market_id_str).
+  pthread_rwlock_rdlock(&st->markets->arr_lock);
   mk = wm_market_lookup_by_id(st, market_id_str);
 
   if(mk == NULL)
   {
+    pthread_rwlock_unlock(&st->markets->arr_lock);
     if(errbuf != NULL)
       snprintf(errbuf, errbuf_sz, "market %s not running", market_id_str);
     return(FAIL);
@@ -659,6 +670,7 @@ wm_market_set_mode(const char *market_id_str, wm_market_mode_t mode,
   if(mk->session.position.side != WM_MARKET_POS_FLAT)
   {
     pthread_mutex_unlock(&mk->lock);
+    pthread_rwlock_unlock(&st->markets->arr_lock);
 
     if(errbuf != NULL)
       snprintf(errbuf, errbuf_sz,
@@ -678,6 +690,7 @@ wm_market_set_mode(const char *market_id_str, wm_market_mode_t mode,
       mk->market_id_str, wm_market_mode_name(prev),
       wm_market_mode_name(mode));
 
+  pthread_rwlock_unlock(&st->markets->arr_lock);
   return(SUCCESS);
 }
 
@@ -699,9 +712,13 @@ wm_market_halt_all(uint32_t *out_visited, uint32_t *out_with_position)
 
   m = st->markets;
 
+  // WM-MKT-ARR-UAF-1: rdlock across the walk — arr stays stable and no
+  // session is freed by a concurrent remove while we visit it.
+  pthread_rwlock_rdlock(&m->arr_lock);
+
   for(i = 0; i < m->n_markets; i++)
   {
-    whenmoon_market_t *mk = &m->arr[i];
+    whenmoon_market_t *mk = m->arr[i];
     wm_market_mode_t   prev;
     bool               was_long;
 
@@ -729,6 +746,8 @@ wm_market_halt_all(uint32_t *out_visited, uint32_t *out_with_position)
           was_long ? "; position open" : "");
   }
 
+  pthread_rwlock_unlock(&m->arr_lock);
+
   clam(CLAM_WARN, WHENMOON_CTX,
       "operator halt: %u market%s -> manual (%u with open positions)",
       visited, visited == 1 ? "" : "s", with_position);
@@ -752,10 +771,20 @@ wm_market_reset(const char *market_id_str, wm_market_mode_t mode_to_reset)
     return;
 
   st = whenmoon_get_state();
+
+  if(st == NULL || st->markets == NULL)
+    return;
+
+  // WM-MKT-ARR-UAF-1: hold rdlock across lookup + the mk->lock edit and the
+  // trailing clam (which dereferences mk->market_id_str).
+  pthread_rwlock_rdlock(&st->markets->arr_lock);
   mk = wm_market_lookup_by_id(st, market_id_str);
 
   if(mk == NULL)
+  {
+    pthread_rwlock_unlock(&st->markets->arr_lock);
     return;
+  }
 
   pthread_mutex_lock(&mk->lock);
 
@@ -794,6 +823,8 @@ wm_market_reset(const char *market_id_str, wm_market_mode_t mode_to_reset)
       "market %s [%s] reset (cash=%.4f)",
       mk->market_id_str, wm_market_mode_name(mode_to_reset),
       target->starting_cash);
+
+  pthread_rwlock_unlock(&st->markets->arr_lock);
 }
 
 // ------------------------------------------------------------------ //
@@ -842,12 +873,23 @@ wm_market_engine_on_signal(const char *market_id_str, double mark_px,
     return;
 
   st = whenmoon_get_state();
+
+  if(st == NULL || st->markets == NULL)
+    return;
+
+  // WM-MKT-ARR-UAF-1: hold rdlock across lookup + the engine pass (which
+  // works on mk under mk->lock). Recursive rdlock inside is deadlock-safe.
+  pthread_rwlock_rdlock(&st->markets->arr_lock);
   mk = wm_market_lookup_by_id(st, market_id_str);
 
   if(mk == NULL)
+  {
+    pthread_rwlock_unlock(&st->markets->arr_lock);
     return;
+  }
 
   wm_market_engine_on_signal_with_mk(mk, mark_px, mark_ms, sig);
+  pthread_rwlock_unlock(&st->markets->arr_lock);
 }
 
 void
@@ -1016,10 +1058,17 @@ wm_market_engine_record_external_fill(const char *market_id_str,
     return;
 
   st = whenmoon_get_state();
+
+  if(st == NULL || st->markets == NULL)
+    return;
+
+  // WM-MKT-ARR-UAF-1: hold rdlock across lookup + the mk->lock apply.
+  pthread_rwlock_rdlock(&st->markets->arr_lock);
   mk = wm_market_lookup_by_id(st, market_id_str);
 
   if(mk == NULL)
   {
+    pthread_rwlock_unlock(&st->markets->arr_lock);
     clam(CLAM_WARN, WHENMOON_CTX,
         "external fill dropped: market %s not running",
         market_id_str);
@@ -1044,6 +1093,7 @@ wm_market_engine_record_external_fill(const char *market_id_str,
         clam(CLAM_DEBUG2, WHENMOON_CTX,
             "market %s: external fill trade_id=%" PRId64 " dedup hit",
             mk->market_id_str, trade_id);
+        pthread_rwlock_unlock(&st->markets->arr_lock);
         return;
       }
     }
@@ -1060,6 +1110,7 @@ wm_market_engine_record_external_fill(const char *market_id_str,
   snprintf(exch, sizeof(exch), "%s", mk->exchange_name);
 
   pthread_mutex_unlock(&mk->lock);
+  pthread_rwlock_unlock(&st->markets->arr_lock);
 
   // Outside the lock: never hold mk->lock across the async submit (it
   // can re-enter clam/registry paths — see the clam-reentry deadlock

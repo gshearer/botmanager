@@ -360,7 +360,23 @@ typedef struct whenmoon_market
 
 struct whenmoon_markets
 {
-  whenmoon_market_t       *arr;       // n_markets live, `cap` allocated
+  // WM-MKT-ARR-UAF-1: sessions are stored as a block of individually
+  // heap-allocated POINTERS, never by value. Each whenmoon_market_t (and
+  // its embedded pthread_mutex_t) is pointer-stable for its whole
+  // lifetime: grow reallocs only this pointer block, remove memmoves only
+  // pointers — so an interior `mk` held by the WS fan-out or a curl
+  // backfill callback across an async/lock boundary never dangles.
+  whenmoon_market_t      **arr;       // n_markets live, `cap` allocated
+
+  // WM-MKT-ARR-UAF-1: guards `arr`, `n_markets`, `cap`, and session
+  // lifetime. OUTER lock — always acquired before any per-market
+  // `mk->lock`, never while one is held. Readers (every arr traversal)
+  // hold rdlock across the whole find→lock→use span; writers (add publish,
+  // remove unlink+free) hold wrlock around the structural edit. Default
+  // (reader-preferring) attributes: recursive read-lock is deadlock-safe
+  // and add/remove are rare enough that writer starvation is a non-issue.
+  pthread_rwlock_t         arr_lock;
+
   uint32_t                 n_markets;
   uint32_t                 cap;
 

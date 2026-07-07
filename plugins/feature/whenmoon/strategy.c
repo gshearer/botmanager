@@ -749,11 +749,11 @@ wm_strategy_find_loaded(whenmoon_state_t *st, const char *strategy_name)
   return(NULL);
 }
 
-// Find a market by canonical id under the markets container. Caller
-// must NOT hold mk->lock; the markets container has no lock of its
-// own — wm_market_add / _remove serialize through the cmd worker
-// thread, which is the only mutator. Safe to read the array length +
-// pointers from the dispatch path.
+// Find a market by canonical id under the markets container.
+// WM-MKT-ARR-UAF-1: LOCK-FREE. The caller MUST hold
+// `st->markets->arr_lock` (read or write) across this call AND all use of
+// the returned pointer — the rwlock keeps arr stable and the returned
+// session alive for that span.
 static whenmoon_market_t *
 wm_strategy_find_market(whenmoon_state_t *st, const char *market_id_str)
 {
@@ -766,9 +766,9 @@ wm_strategy_find_market(whenmoon_state_t *st, const char *market_id_str)
   m = st->markets;
 
   for(i = 0; i < m->n_markets; i++)
-    if(strncmp(m->arr[i].market_id_str, market_id_str,
+    if(strncmp(m->arr[i]->market_id_str, market_id_str,
            WM_MARKET_ID_STR_SZ) == 0)
-      return(&m->arr[i]);
+      return(m->arr[i]);
 
   return(NULL);
 }
@@ -897,10 +897,20 @@ wm_strategy_attach(whenmoon_state_t *st,
 
   reg = st->strategies;
 
+  if(st->markets == NULL)
+    return(WM_ATTACH_NO_MARKET);
+
+  // WM-MKT-ARR-UAF-1: hold rdlock across find AND all subsequent use of mk
+  // (it is stored into att->ctx.mkt and dereferenced by the strategy init +
+  // the WM-SR-1 cursor hydration at the tail). Every exit below releases it.
+  // Ordering: arr_lock is taken BEFORE reg->lock; release in reverse.
+  pthread_rwlock_rdlock(&st->markets->arr_lock);
+
   mk = wm_strategy_find_market(st, market_id_str);
 
   if(mk == NULL)
   {
+    pthread_rwlock_unlock(&st->markets->arr_lock);
     if(err != NULL)
       snprintf(err, err_cap, "market %s not running",
           market_id_str != NULL ? market_id_str : "(null)");
@@ -914,6 +924,7 @@ wm_strategy_attach(whenmoon_state_t *st,
   if(ls == NULL)
   {
     pthread_mutex_unlock(&reg->lock);
+    pthread_rwlock_unlock(&st->markets->arr_lock);
 
     if(err != NULL)
       snprintf(err, err_cap, "strategy %s not loaded",
@@ -928,6 +939,7 @@ wm_strategy_attach(whenmoon_state_t *st,
            sizeof(cur->ctx.market_id_str)) == 0)
     {
       pthread_mutex_unlock(&reg->lock);
+      pthread_rwlock_unlock(&st->markets->arr_lock);
 
       if(err != NULL)
         snprintf(err, err_cap, "already attached");
@@ -944,6 +956,7 @@ wm_strategy_attach(whenmoon_state_t *st,
            explicit_priority))
     {
       pthread_mutex_unlock(&reg->lock);
+      pthread_rwlock_unlock(&st->markets->arr_lock);
 
       if(err != NULL)
         snprintf(err, err_cap,
@@ -967,6 +980,7 @@ wm_strategy_attach(whenmoon_state_t *st,
     else if(max_prio > UINT32_MAX - WM_MK3_PRIORITY_DEFAULT_STEP)
     {
       pthread_mutex_unlock(&reg->lock);
+      pthread_rwlock_unlock(&st->markets->arr_lock);
 
       if(err != NULL)
         snprintf(err, err_cap, "priority space exhausted");
@@ -982,6 +996,7 @@ wm_strategy_attach(whenmoon_state_t *st,
   if(att == NULL)
   {
     pthread_mutex_unlock(&reg->lock);
+    pthread_rwlock_unlock(&st->markets->arr_lock);
 
     if(err != NULL)
       snprintf(err, err_cap, "out of memory");
@@ -1018,6 +1033,7 @@ wm_strategy_attach(whenmoon_state_t *st,
   if(ls->init_fn(&att->ctx) != 0)
   {
     pthread_mutex_unlock(&reg->lock);
+    pthread_rwlock_unlock(&st->markets->arr_lock);
     mem_free(att);
 
     if(err != NULL)
@@ -1064,6 +1080,7 @@ wm_strategy_attach(whenmoon_state_t *st,
       "strategy attach: %s -> %s (priority=%u)",
       strategy_name, market_id_str, chosen_priority);
 
+  pthread_rwlock_unlock(&st->markets->arr_lock);
   return(WM_ATTACH_OK);
 }
 

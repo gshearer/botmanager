@@ -208,10 +208,18 @@ wm_strategy_cmd_attach(const cmd_ctx_t *ctx)
       // market warms to this strategy's (possibly deeper) min_history.
       wm_roster_add(id_tok, name_tok);
 
-      mk = wm_market_lookup_by_id(st, id_tok);
+      // WM-MKT-ARR-UAF-1: hold rdlock across lookup + all use of `mk`
+      // (wm_market_warmup_begin) so a concurrent remove cannot free it.
+      if(st->markets != NULL)
+      {
+        pthread_rwlock_rdlock(&st->markets->arr_lock);
+        mk = wm_market_lookup_by_id(st, id_tok);
 
-      if(mk != NULL)
-        wm_market_warmup_begin(st, mk);
+        if(mk != NULL)
+          wm_market_warmup_begin(st, mk);
+
+        pthread_rwlock_unlock(&st->markets->arr_lock);
+      }
 
       snprintf(reply, sizeof(reply), "attached %s -> %s (priority=%u)",
           name_tok, id_tok, chosen_priority);

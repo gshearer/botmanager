@@ -102,9 +102,12 @@ whenmoon_show_markets_cmd(const cmd_ctx_t *ctx)
 
   cmd_reply(ctx, CLR_BOLD "whenmoon markets" CLR_RESET);
 
+  // WM-MKT-ARR-UAF-1: rdlock across the render walk.
+  pthread_rwlock_rdlock(&m->arr_lock);
+
   for(i = 0; i < m->n_markets; i++)
   {
-    whenmoon_market_t *mk = &m->arr[i];
+    whenmoon_market_t *mk = m->arr[i];
     double   px;
     int64_t  tick_ms;
     uint32_t g1m, g5m, g15m, g1h, g4h, g1d;
@@ -129,6 +132,8 @@ whenmoon_show_markets_cmd(const cmd_ctx_t *ctx)
         tick_ms);
     cmd_reply(ctx, line);
   }
+
+  pthread_rwlock_unlock(&m->arr_lock);
 }
 
 // ------------------------------------------------------------------ //

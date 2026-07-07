@@ -149,6 +149,10 @@ wm_warmup_enqueue_gaps(whenmoon_state_t *st, whenmoon_market_t *mk,
 // Re-resolve the market and verify the timer still belongs to the live
 // warmup generation. Returns NULL (caller frees ctx + ends) when the
 // market was stopped or a newer warmup_begin superseded this timer.
+//
+// WM-MKT-ARR-UAF-1: LOCK-FREE — caller MUST hold
+// ctx->st->markets->arr_lock (read) across this call and all use of the
+// returned pointer.
 static whenmoon_market_t *
 wm_warm_timer_live(wm_warm_timer_ctx_t *ctx)
 {
@@ -220,10 +224,22 @@ wm_market_warmup_recheck_task(task_t *t)
     return;
   }
 
+  // WM-MKT-ARR-UAF-1: wm_warm_timer_live returns a bare mk; hold rdlock
+  // across the call and ALL use of mk below (until this task ends), so a
+  // concurrent market remove cannot free the session under us.
+  if(ctx->st == NULL || ctx->st->markets == NULL)
+  {
+    mem_free(ctx);
+    t->state = TASK_ENDED;
+    return;
+  }
+
+  pthread_rwlock_rdlock(&ctx->st->markets->arr_lock);
   mk = wm_warm_timer_live(ctx);
 
   if(mk == NULL)
   {
+    pthread_rwlock_unlock(&ctx->st->markets->arr_lock);
     mem_free(ctx);
     t->state = TASK_ENDED;
     return;
@@ -274,6 +290,7 @@ wm_market_warmup_recheck_task(task_t *t)
 
     wm_warmup_start_tailfill(ctx->st, mk->market_id_str, ctx->gen);
 
+    pthread_rwlock_unlock(&ctx->st->markets->arr_lock);
     mem_free(ctx);
     t->state = TASK_ENDED;
     return;
@@ -299,6 +316,9 @@ wm_market_warmup_recheck_task(task_t *t)
     mem_free(ctx);
   }
 
+  // WM-MKT-ARR-UAF-1: last use of mk done — release the container rdlock.
+  pthread_rwlock_unlock(&ctx->st->markets->arr_lock);
+
   t->state = TASK_ENDED;
 }
 
@@ -320,10 +340,21 @@ wm_market_warmup_tailfill_task(task_t *t)
     return;
   }
 
+  // WM-MKT-ARR-UAF-1: wm_warm_timer_live returns a bare mk; hold rdlock
+  // across the call and ALL use of mk below (until this task ends).
+  if(ctx->st == NULL || ctx->st->markets == NULL)
+  {
+    mem_free(ctx);
+    t->state = TASK_ENDED;
+    return;
+  }
+
+  pthread_rwlock_rdlock(&ctx->st->markets->arr_lock);
   mk = wm_warm_timer_live(ctx);
 
   if(mk == NULL)
   {
+    pthread_rwlock_unlock(&ctx->st->markets->arr_lock);
     mem_free(ctx);
     t->state = TASK_ENDED;
     return;
@@ -336,6 +367,9 @@ wm_market_warmup_tailfill_task(task_t *t)
          WM_WARM_TAILFILL_INTERVAL_MS, wm_market_warmup_tailfill_task, ctx)
          == TASK_HANDLE_NONE)
     mem_free(ctx);
+
+  // WM-MKT-ARR-UAF-1: last use of mk done — release the container rdlock.
+  pthread_rwlock_unlock(&ctx->st->markets->arr_lock);
 
   t->state = TASK_ENDED;
 }

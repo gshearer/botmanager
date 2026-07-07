@@ -259,12 +259,16 @@ wm_live_market_order_done(const exchange_order_result_t *res, void *user)
     return;
   }
 
+  // WM-MKT-ARR-UAF-1: hold rdlock across lookup + the mk->lock reap below
+  // so a concurrent market remove cannot free the session under us.
+  pthread_rwlock_rdlock(&st->markets->arr_lock);
   mk = wm_market_lookup_by_id(st, ctx->market_id_str);
 
   if(mk == NULL)
   {
     // Market torn down between submit and ack. The pending row went
     // with the market state; nothing to reap.
+    pthread_rwlock_unlock(&st->markets->arr_lock);
     mem_free(ctx);
     return;
   }
@@ -309,6 +313,7 @@ wm_live_market_order_done(const exchange_order_result_t *res, void *user)
   }
 
   pthread_mutex_unlock(&mk->lock);
+  pthread_rwlock_unlock(&st->markets->arr_lock);
   mem_free(ctx);
 }
 
@@ -502,9 +507,12 @@ wm_market_engine_real_submit_locked(whenmoon_market_t *mk,
 // lock held.
 //
 // Locking discipline: this helper does NOT hold `g_live.mu` during
-// the per-market scan. Each market's lock is taken in turn. The
-// `st->markets->arr` snapshot pointer is stable for the duration of a
-// single dispatch (per `wm_market_lookup_by_id` contract).
+// the per-market scan. Each market's lock is taken in turn.
+//
+// WM-MKT-ARR-UAF-1: the CALLER MUST hold `st->markets->arr_lock` (read)
+// across this call AND until it releases the `mk->lock` returned held on
+// success — arr traversal and the returned session pointer are only valid
+// under that rdlock.
 static bool
 wm_live_find_pending_by_coid_market_locked(const char *coid,
     whenmoon_market_t **out_mk, uint32_t *out_idx)
@@ -529,7 +537,7 @@ wm_live_find_pending_by_coid_market_locked(const char *coid,
 
   for(i = 0; i < mkts->n_markets; i++)
   {
-    whenmoon_market_t *mk = &mkts->arr[i];
+    whenmoon_market_t *mk = mkts->arr[i];
 
     pthread_mutex_lock(&mk->lock);
 
@@ -558,6 +566,7 @@ wm_live_find_pending_by_coid_market_locked(const char *coid,
 static void
 wm_live_handle_ws_fill(const exchange_ws_user_fill_t *f)
 {
+  whenmoon_state_t    *st;
   whenmoon_market_t   *mk = NULL;
   uint32_t             pidx = 0;
   wm_market_pending_t *p;
@@ -569,12 +578,23 @@ wm_live_handle_ws_fill(const exchange_ws_user_fill_t *f)
   if(f == NULL || f->trade_id == 0 || f->size <= 0.0 || f->price <= 0.0)
     return;
 
+  st = whenmoon_get_state();
+
+  if(st == NULL || st->markets == NULL)
+    return;
+
+  // WM-MKT-ARR-UAF-1: the finder returns with the owning market's
+  // mk->lock held; hold the container rdlock from before the finder until
+  // AFTER we release that mk->lock, so no concurrent remove frees it.
+  pthread_rwlock_rdlock(&st->markets->arr_lock);
+
   if(!wm_live_find_pending_by_coid_market_locked(f->client_order_id,
          &mk, &pidx))
   {
     // Orphan: WS may have raced ahead of submit, or this fill belongs
     // to an unrelated principal (the user channel emits per-account,
     // not per-product). REST /fills poll handles late-bound dedup.
+    pthread_rwlock_unlock(&st->markets->arr_lock);
     clam(CLAM_DEBUG, WM_LIVE_CTX,
         "ws fill orphan coid=%s order_id=%s tid=%lld"
         " (REST poll safety-net handles dedup)",
@@ -590,6 +610,7 @@ wm_live_handle_ws_fill(const exchange_ws_user_fill_t *f)
     if(p->recorded_trade_ids[k] == f->trade_id)
     {
       pthread_mutex_unlock(&mk->lock);
+      pthread_rwlock_unlock(&st->markets->arr_lock);
       clam(CLAM_DEBUG2, WM_LIVE_CTX,
           "ws fill: dup trade_id=%lld coid=%s",
           (long long)f->trade_id, f->client_order_id);
@@ -618,6 +639,9 @@ wm_live_handle_ws_fill(const exchange_ws_user_fill_t *f)
   }
 
   pthread_mutex_unlock(&mk->lock);
+  // WM-MKT-ARR-UAF-1: mk no longer touched below (record_external_fill
+  // re-resolves via market_id_copy under its own rdlock) — release here.
+  pthread_rwlock_unlock(&st->markets->arr_lock);
 
   // Advance the global REST cursor under g_live.mu so a concurrent
   // poll-tick reads a consistent view.
@@ -640,6 +664,7 @@ wm_live_handle_ws_fill(const exchange_ws_user_fill_t *f)
 static void
 wm_live_handle_ws_order(const exchange_ws_user_order_t *o)
 {
+  whenmoon_state_t    *st;
   whenmoon_market_t   *mk = NULL;
   uint32_t             pidx = 0;
   wm_market_pending_t *p;
@@ -660,9 +685,21 @@ wm_live_handle_ws_order(const exchange_ws_user_order_t *o)
   else if(strcmp(status, "FAILED") == 0)
     reap = failed = true;
 
+  st = whenmoon_get_state();
+
+  if(st == NULL || st->markets == NULL)
+    return;
+
+  // WM-MKT-ARR-UAF-1: hold the container rdlock from before the finder
+  // (which returns with mk->lock held) until after we release mk->lock.
+  pthread_rwlock_rdlock(&st->markets->arr_lock);
+
   if(!wm_live_find_pending_by_coid_market_locked(o->client_order_id,
          &mk, &pidx))
+  {
+    pthread_rwlock_unlock(&st->markets->arr_lock);
     return;
+  }
 
   // mk->lock held here.
   p = &mk->session.pending[pidx];
@@ -686,6 +723,7 @@ wm_live_handle_ws_order(const exchange_ws_user_order_t *o)
     mk->session.pending_n--;
 
     pthread_mutex_unlock(&mk->lock);
+    pthread_rwlock_unlock(&st->markets->arr_lock);
 
     clam(failed ? CLAM_WARN : CLAM_INFO, WM_LIVE_CTX,
         "ws order %s coid=%s order_id=%s status=%s -> reaped",
@@ -694,6 +732,7 @@ wm_live_handle_ws_order(const exchange_ws_user_order_t *o)
   }
 
   pthread_mutex_unlock(&mk->lock);
+  pthread_rwlock_unlock(&st->markets->arr_lock);
 }
 
 static void
@@ -746,11 +785,19 @@ wm_live_ws_resub_all(whenmoon_state_t *st)
 
   m = st->markets;
 
+  // WM-MKT-ARR-UAF-1: rdlock across the whole gather+subscribe — pid_ptrs
+  // alias the sessions' product_id buffers and are consumed by
+  // exchange_ws_subscribe below, so no concurrent remove may free a
+  // session until we are done. Recursive rdlock is safe: this is
+  // sometimes reached from wm_market_resub_ws which already holds rdlock.
+  pthread_rwlock_rdlock(&m->arr_lock);
+
   pid_ptrs = mem_alloc("whenmoon.live", "ws_pids",
       sizeof(*pid_ptrs) * m->n_markets);
 
   if(pid_ptrs == NULL)
   {
+    pthread_rwlock_unlock(&m->arr_lock);
     clam(CLAM_WARN, WM_LIVE_CTX, "user-channel resub alloc failed");
     return;
   }
@@ -761,7 +808,7 @@ wm_live_ws_resub_all(whenmoon_state_t *st)
   // market-side resub loop.
   for(i = 0; i < m->n_markets; i++)
   {
-    const char             *exch = m->arr[i].exchange_name;
+    const char             *exch = m->arr[i]->exchange_name;
     exchange_capabilities_t caps;
     wm_live_ws_binding_t   *b;
     uint32_t                n_pids;
@@ -800,11 +847,34 @@ wm_live_ws_resub_all(whenmoon_state_t *st)
       continue;
     }
 
+    // WM-MI-1: dedup product_ids across instances — N instances of one
+    // product must yield ONE user-channel subscription, not N. Without
+    // this the duplicate ids scale with instance count and overflow the
+    // exchange driver's fixed per-sub product array (coinbase caps at
+    // CB_WS_CH_MAX_PRODUCTS_PER_SUB). Mirrors the market-side resub loop
+    // in market.c:wm_market_resub_ws.
     n_pids = 0;
     for(j = i; j < m->n_markets; j++)
     {
-      if(strncmp(m->arr[j].exchange_name, exch, EXCHANGE_NAME_SZ) == 0)
-        pid_ptrs[n_pids++] = m->arr[j].product_id;
+      uint32_t k;
+      bool     dup;
+
+      if(strncmp(m->arr[j]->exchange_name, exch, EXCHANGE_NAME_SZ) != 0)
+        continue;
+
+      dup = false;
+      for(k = 0; k < n_pids; k++)
+      {
+        if(strncmp(pid_ptrs[k], m->arr[j]->product_id,
+              WM_PRODUCT_ID_SZ) == 0)
+        {
+          dup = true;
+          break;
+        }
+      }
+
+      if(!dup)
+        pid_ptrs[n_pids++] = m->arr[j]->product_id;
     }
 
     b = &g_live.ws_bindings[g_live.n_ws_bindings];
@@ -833,6 +903,7 @@ wm_live_ws_resub_all(whenmoon_state_t *st)
   }
 
   mem_free(pid_ptrs);
+  pthread_rwlock_unlock(&m->arr_lock);
 }
 
 // ----------------------------------------------------------------------- //
@@ -870,9 +941,13 @@ wm_live_trade_id_seen_any_market(int64_t trade_id)
 
   mkts = st->markets;
 
+  // WM-MKT-ARR-UAF-1: rdlock across the whole read-only walk so no
+  // concurrent remove frees a session while we take its mk->lock.
+  pthread_rwlock_rdlock(&mkts->arr_lock);
+
   for(i = 0; i < mkts->n_markets; i++)
   {
-    whenmoon_market_t *mk = &mkts->arr[i];
+    whenmoon_market_t *mk = mkts->arr[i];
     bool               hit = false;
 
     pthread_mutex_lock(&mk->lock);
@@ -894,9 +969,13 @@ wm_live_trade_id_seen_any_market(int64_t trade_id)
     pthread_mutex_unlock(&mk->lock);
 
     if(hit)
+    {
+      pthread_rwlock_unlock(&mkts->arr_lock);
       return(true);
+    }
   }
 
+  pthread_rwlock_unlock(&mkts->arr_lock);
   return(false);
 }
 
@@ -904,8 +983,13 @@ static void
 wm_live_on_fills(const exchange_fills_result_t *res, void *user)
 {
   wm_live_fills_ctx_t *ctx = user;
+  whenmoon_state_t    *st;
 
   if(ctx == NULL || res == NULL) goto done;
+
+  st = whenmoon_get_state();
+
+  if(st == NULL || st->markets == NULL) goto done;
 
   if(res->err[0] != '\0')
   {
@@ -929,17 +1013,23 @@ wm_live_on_fills(const exchange_fills_result_t *res, void *user)
     if(f->trade_id == 0 || f->size <= 0.0 || f->price <= 0.0)
       continue;
 
+    // WM-MKT-ARR-UAF-1: hold the container rdlock across the finder (which
+    // returns mk->lock held on match) and until we release that mk->lock.
+    pthread_rwlock_rdlock(&st->markets->arr_lock);
+
     if(!wm_live_find_pending_by_coid_market_locked(f->client_oid,
            &mk, &pidx))
     {
       // Orphan: WS likely already reaped this pending row. Confirm
       // dedup against every running market's recorded_trade_ids[]
       // before logging — that distinguishes "WS got there first" from
-      // "fill landed for an unknown order".
+      // "fill landed for an unknown order". (seen_any_market takes its own
+      // rdlock; recursive read-lock is safe.)
       if(!wm_live_trade_id_seen_any_market(f->trade_id))
         clam(CLAM_DEBUG, WM_LIVE_CTX,
             "fills poll: orphan tid=%lld coid=%s product=%s",
             (long long)f->trade_id, f->client_oid, f->product_id);
+      pthread_rwlock_unlock(&st->markets->arr_lock);
       continue;
     }
 
@@ -958,6 +1048,7 @@ wm_live_on_fills(const exchange_fills_result_t *res, void *user)
     if(dedup_hit)
     {
       pthread_mutex_unlock(&mk->lock);
+      pthread_rwlock_unlock(&st->markets->arr_lock);
       continue;
     }
 
@@ -981,6 +1072,8 @@ wm_live_on_fills(const exchange_fills_result_t *res, void *user)
     }
 
     pthread_mutex_unlock(&mk->lock);
+    // WM-MKT-ARR-UAF-1: mk no longer touched below — release rdlock.
+    pthread_rwlock_unlock(&st->markets->arr_lock);
 
     // Advance the global REST cursor.
     pthread_mutex_lock(&g_live.mu);
@@ -1032,23 +1125,28 @@ wm_live_fills_poll_tick(task_t *t)
 
   mkts = st->markets;
 
+  // WM-MKT-ARR-UAF-1: rdlock across the whole walk — sessions read here
+  // must not be freed by a concurrent remove. (on_fills, fired below,
+  // takes its own rdlock; recursive read-lock is safe.)
+  pthread_rwlock_rdlock(&mkts->arr_lock);
+
   for(uint32_t i = 0; i < mkts->n_markets; i++)
   {
     wm_live_fills_ctx_t    *ctx;
     exchange_capabilities_t caps;
 
-    if(mkts->arr[i].exchange_name[0] == '\0')
+    if(mkts->arr[i]->exchange_name[0] == '\0')
       continue;
 
     // Only real-mode markets have live fills to reconcile. Paper /
     // manual markets must never touch the authenticated account —
     // doing so spams the exchange with reads against an account that
     // isn't trading, which reads as anomalous to their fraud tooling.
-    if(mkts->arr[i].session.mode != WM_MARKET_MODE_REAL)
+    if(mkts->arr[i]->session.mode != WM_MARKET_MODE_REAL)
       continue;
 
     // Skip when creds are not configured for this exchange.
-    if(exchange_get_capabilities(mkts->arr[i].exchange_name,
+    if(exchange_get_capabilities(mkts->arr[i]->exchange_name,
            &caps) != SUCCESS || !caps.has_credentials)
       continue;
 
@@ -1056,11 +1154,11 @@ wm_live_fills_poll_tick(task_t *t)
     if(ctx == NULL) continue;
 
     snprintf(ctx->market_id_str, sizeof(ctx->market_id_str), "%s",
-        mkts->arr[i].market_id_str);
+        mkts->arr[i]->market_id_str);
     snprintf(ctx->exchange_name, sizeof(ctx->exchange_name), "%s",
-        mkts->arr[i].exchange_name);
+        mkts->arr[i]->exchange_name);
     snprintf(ctx->product_id, sizeof(ctx->product_id), "%s",
-        mkts->arr[i].product_id);
+        mkts->arr[i]->product_id);
 
     if(exchange_list_fills_async(ctx->exchange_name, NULL,
            ctx->product_id, cursor_ms,
@@ -1070,6 +1168,8 @@ wm_live_fills_poll_tick(task_t *t)
       // set on FAIL; ctx already freed.
     }
   }
+
+  pthread_rwlock_unlock(&mkts->arr_lock);
 }
 
 // ----------------------------------------------------------------------- //
@@ -1460,9 +1560,13 @@ wm_live_reconcile_from_accounts(const char *exchange,
 
   mkts = st->markets;
 
+  // WM-MKT-ARR-UAF-1: rdlock across the whole walk so no concurrent remove
+  // frees a session while we take its mk->lock and reconcile it.
+  pthread_rwlock_rdlock(&mkts->arr_lock);
+
   for(i = 0; i < mkts->n_markets; i++)
   {
-    whenmoon_market_t *mk = &mkts->arr[i];
+    whenmoon_market_t *mk = mkts->arr[i];
     double             avail = 0.0;
 
     if(strncmp(mk->exchange_name, exchange, EXCHANGE_NAME_SZ) != 0)
@@ -1491,4 +1595,6 @@ wm_live_reconcile_from_accounts(const char *exchange,
 
     pthread_mutex_unlock(&mk->lock);
   }
+
+  pthread_rwlock_unlock(&mkts->arr_lock);
 }

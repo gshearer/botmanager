@@ -1069,7 +1069,7 @@ wm_market_persist_restore_all(whenmoon_state_t *st)
   uint32_t            n_skipped  = 0;
   uint32_t            i;
 
-  if(st == NULL)
+  if(st == NULL || st->markets == NULL)
     return(FAIL);
 
   res = db_result_alloc();
@@ -1123,6 +1123,13 @@ wm_market_persist_restore_all(whenmoon_state_t *st)
     // WM-MI-2: match on the (market_id, instance) pair — a bare
     // market_id match would hydrate the wrong instance's session onto a
     // peer sharing the same wm_market row.
+    //
+    // WM-MKT-ARR-UAF-1: hold rdlock across the match walk AND the mk->lock
+    // hydrate below — the resolved `mk` must not be freed/moved by a
+    // concurrent remove while we hydrate it. Released at every exit of this
+    // row iteration once acquired.
+    pthread_rwlock_rdlock(&st->markets->arr_lock);
+
     {
       const char *inst = db_result_get(res, i, 26);
 
@@ -1132,10 +1139,10 @@ wm_market_persist_restore_all(whenmoon_state_t *st)
       // Look up the running instance by (id, label) (linear walk; small N).
       for(j = 0; j < st->markets->n_markets; j++)
       {
-        if(st->markets->arr[j].market_id == market_id &&
-           strcmp(st->markets->arr[j].instance, inst) == 0)
+        if(st->markets->arr[j]->market_id == market_id &&
+           strcmp(st->markets->arr[j]->instance, inst) == 0)
         {
-          mk = &st->markets->arr[j];
+          mk = st->markets->arr[j];
           break;
         }
       }
@@ -1143,6 +1150,7 @@ wm_market_persist_restore_all(whenmoon_state_t *st)
 
     if(mk == NULL)
     {
+      pthread_rwlock_unlock(&st->markets->arr_lock);
       n_skipped++;
       continue;
     }
@@ -1230,6 +1238,9 @@ wm_market_persist_restore_all(whenmoon_state_t *st)
     if(cell != NULL) mk->session.pending_n = (uint32_t)strtoul(cell, NULL, 10);
 
     pthread_mutex_unlock(&mk->lock);
+
+    // WM-MKT-ARR-UAF-1: last use of `mk` done — release the container rdlock.
+    pthread_rwlock_unlock(&st->markets->arr_lock);
 
     if(jstats_paper != NULL) json_object_put(jstats_paper);
     if(jstats_real  != NULL) json_object_put(jstats_real);

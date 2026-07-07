@@ -521,6 +521,8 @@ wm_aggregator_warmup_grain(whenmoon_market_t *mk, wm_gran_t gran,
 // Look up a market by market_id under its containing whenmoon state.
 // Returns NULL if the bot has been torn down or the market removed
 // since the warmup task was scheduled.
+// WM-MKT-ARR-UAF-1: LOCK-FREE. The caller MUST hold `st->markets->arr_lock`
+// (read or write) across this call AND all use of the returned pointer.
 static whenmoon_market_t *
 wm_warmup_find_market(whenmoon_state_t *st, int32_t market_id)
 {
@@ -534,8 +536,8 @@ wm_warmup_find_market(whenmoon_state_t *st, int32_t market_id)
 
   for(i = 0; i < m->n_markets; i++)
   {
-    if(m->arr[i].market_id == market_id)
-      return(&m->arr[i]);
+    if(m->arr[i]->market_id == market_id)
+      return(m->arr[i]);
   }
 
   return(NULL);
@@ -563,10 +565,20 @@ wm_aggregator_load_history(whenmoon_state_t *st, int32_t market_id,
   int                n;
   bool               saved_dispatch;
 
+  if(st == NULL || st->markets == NULL)
+    return;
+
+  // WM-MKT-ARR-UAF-1: hold rdlock across the whole load — mk is dereferenced
+  // throughout the DB query + replay. A concurrent remove of THIS market
+  // waits out the replay (rare; warmup runs right after add). Multiple
+  // warmups are readers and still run concurrently.
+  pthread_rwlock_rdlock(&st->markets->arr_lock);
+
   mk = wm_warmup_find_market(st, market_id);
 
   if(mk == NULL || mk->aggregator == NULL)
   {
+    pthread_rwlock_unlock(&st->markets->arr_lock);
     clam(CLAM_INFO, WHENMOON_CTX,
         "warmup market_id=%" PRId32 ": market gone before run, skipping",
         market_id);
@@ -584,7 +596,10 @@ wm_aggregator_load_history(whenmoon_state_t *st, int32_t market_id,
     limit = limit_override;
 
   if(wm_candle_table_name(market_id, table, sizeof(table)) != SUCCESS)
+  {
+    pthread_rwlock_unlock(&st->markets->arr_lock);
     return;
+  }
 
   // CREATE IF NOT EXISTS so a market that has never been downloaded
   // queries an empty table cleanly rather than erroring on a missing
@@ -609,12 +624,18 @@ wm_aggregator_load_history(whenmoon_state_t *st, int32_t market_id,
       table, limit);
 
   if(n < 0 || (size_t)n >= sizeof(sql))
+  {
+    pthread_rwlock_unlock(&st->markets->arr_lock);
     return;
+  }
 
   res = db_result_alloc();
 
   if(res == NULL)
+  {
+    pthread_rwlock_unlock(&st->markets->arr_lock);
     return;
+  }
 
   if(db_query(sql, res) != SUCCESS || !res->ok)
   {
@@ -623,6 +644,7 @@ wm_aggregator_load_history(whenmoon_state_t *st, int32_t market_id,
         mk->market_id_str,
         res->error[0] != '\0' ? res->error : "(no driver error)");
     db_result_free(res);
+    pthread_rwlock_unlock(&st->markets->arr_lock);
     return;
   }
 
@@ -632,6 +654,7 @@ wm_aggregator_load_history(whenmoon_state_t *st, int32_t market_id,
         "warmup %s: no rows in %s — bot starts cold",
         mk->market_id_str, table);
     db_result_free(res);
+    pthread_rwlock_unlock(&st->markets->arr_lock);
     return;
   }
 
@@ -697,6 +720,7 @@ wm_aggregator_load_history(whenmoon_state_t *st, int32_t market_id,
       mk->market_id_str, replayed, table, limit);
 
   db_result_free(res);
+  pthread_rwlock_unlock(&st->markets->arr_lock);
 }
 
 // Thin task wrapper: replays then frees its heap ctx. Used for the

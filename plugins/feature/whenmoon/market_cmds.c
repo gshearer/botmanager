@@ -269,10 +269,13 @@ wm_market_cmd_indicators(const cmd_ctx_t *ctx)
   // Optional `latest` keyword for forward-compat.
   (void)wm_dl_next_token(&p, tail_tok, sizeof(tail_tok));
 
+  // WM-MKT-ARR-UAF-1: hold rdlock across lookup + the mk->lock read below.
+  pthread_rwlock_rdlock(&st->markets->arr_lock);
   mk = wm_market_lookup_by_id(st, id_str);
 
   if(mk == NULL)
   {
+    pthread_rwlock_unlock(&st->markets->arr_lock);
     snprintf(line, sizeof(line), "market %s not running", id_str);
     cmd_reply(ctx, line);
     return;
@@ -284,6 +287,7 @@ wm_market_cmd_indicators(const cmd_ctx_t *ctx)
   if(n == 0 || mk->grain_arr[gran] == NULL)
   {
     pthread_mutex_unlock(&mk->lock);
+    pthread_rwlock_unlock(&st->markets->arr_lock);
     snprintf(line, sizeof(line),
         "%s %s: no bars yet", id_str, gran_tok);
     cmd_reply(ctx, line);
@@ -292,6 +296,7 @@ wm_market_cmd_indicators(const cmd_ctx_t *ctx)
 
   bar = mk->grain_arr[gran][n - 1];
   pthread_mutex_unlock(&mk->lock);
+  pthread_rwlock_unlock(&st->markets->arr_lock);
 
   snprintf(line, sizeof(line),
       CLR_BOLD "%s %s bar @ ms=%" PRId64 " (closed; bars=%u)" CLR_RESET,
@@ -464,9 +469,14 @@ wm_market_cmd_mode(const cmd_ctx_t *ctx)
   // and the market card shows "UNSYNCED" until a later sync succeeds.
   if(mode == WM_MARKET_MODE_REAL)
   {
-    whenmoon_market_t *mk = wm_market_lookup_by_id(st, id_str);
+    whenmoon_market_t *mk;
     double             cash = 0.0;
     char               rerr[160] = {0};
+
+    // WM-MKT-ARR-UAF-1: hold rdlock across lookup + the reconcile (which
+    // reads/writes the session under mk->lock).
+    pthread_rwlock_rdlock(&st->markets->arr_lock);
+    mk = wm_market_lookup_by_id(st, id_str);
 
     if(mk != NULL &&
        wm_market_reconcile_real_cash(mk, &cash, rerr, sizeof(rerr))
@@ -481,6 +491,7 @@ wm_market_cmd_mode(const cmd_ctx_t *ctx)
           " run /whenmoon market sync %s",
           rerr[0] != '\0' ? rerr : "reconcile failed", id_str);
 
+    pthread_rwlock_unlock(&st->markets->arr_lock);
     cmd_reply(ctx, reply);
   }
 }
@@ -530,10 +541,13 @@ wm_market_cmd_sync(const cmd_ctx_t *ctx)
 
   wm_market_format_id(exch, base, quote, id_str, sizeof(id_str));
 
+  // WM-MKT-ARR-UAF-1: hold rdlock across lookup + the reconcile (mk->lock).
+  pthread_rwlock_rdlock(&st->markets->arr_lock);
   mk = wm_market_lookup_by_id(st, id_str);
 
   if(mk == NULL)
   {
+    pthread_rwlock_unlock(&st->markets->arr_lock);
     snprintf(reply, sizeof(reply), "market %s not running", id_str);
     cmd_reply(ctx, reply);
     return;
@@ -541,12 +555,15 @@ wm_market_cmd_sync(const cmd_ctx_t *ctx)
 
   if(wm_market_reconcile_real_cash(mk, &cash, err, sizeof(err)) != SUCCESS)
   {
+    pthread_rwlock_unlock(&st->markets->arr_lock);
     snprintf(reply, sizeof(reply),
         "market %s real cash sync FAIL: %s", id_str,
         err[0] != '\0' ? err : "(no detail)");
     cmd_reply(ctx, reply);
     return;
   }
+
+  pthread_rwlock_unlock(&st->markets->arr_lock);
 
   snprintf(reply, sizeof(reply),
       "market %s real cash reconciled to %.2f", id_str, cash);
@@ -630,10 +647,13 @@ wm_market_cmd_force(const cmd_ctx_t *ctx)
     return;
   }
 
+  // WM-MKT-ARR-UAF-1: hold rdlock across lookup + the mk->lock force-trade.
+  pthread_rwlock_rdlock(&st->markets->arr_lock);
   mk = wm_market_lookup_by_id(st, id_str);
 
   if(mk == NULL)
   {
+    pthread_rwlock_unlock(&st->markets->arr_lock);
     snprintf(reply, sizeof(reply),
         "error: market %s not running", id_str);
     cmd_reply(ctx, reply);
@@ -649,6 +669,7 @@ wm_market_cmd_force(const cmd_ctx_t *ctx)
       ts_ms, "force-operator", errbuf, sizeof(errbuf));
 
   pthread_mutex_unlock(&mk->lock);
+  pthread_rwlock_unlock(&st->markets->arr_lock);
 
   if(ok != SUCCESS)
   {
@@ -1076,11 +1097,18 @@ wm_show_market_cmd(const cmd_ctx_t *ctx)
   // Detail-arg form.
   if(wm_dl_next_token(&p, id_tok, sizeof(id_tok)))
   {
-    whenmoon_market_t *mk = wm_market_lookup_by_id(st, id_tok);
+    whenmoon_market_t *mk;
     char err[128];
+
+    // WM-MKT-ARR-UAF-1: hold rdlock across lookup + snapshot (which reads
+    // the session under mk->lock). The render below works off the local
+    // `snap` copy + id_tok, so the lock is released first.
+    pthread_rwlock_rdlock(&m->arr_lock);
+    mk = wm_market_lookup_by_id(st, id_tok);
 
     if(mk == NULL)
     {
+      pthread_rwlock_unlock(&m->arr_lock);
       snprintf(err, sizeof(err),
           "error: market %s not running", id_tok);
       cmd_reply(ctx, err);
@@ -1088,6 +1116,8 @@ wm_show_market_cmd(const cmd_ctx_t *ctx)
     }
 
     wm_market_session_snapshot(mk, &snap);
+    pthread_rwlock_unlock(&m->arr_lock);
+
     wm_obs_render_card(ctx, &snap);
     wm_obs_render_strategies(ctx, st, id_tok);
     return;
@@ -1102,11 +1132,16 @@ wm_show_market_cmd(const cmd_ctx_t *ctx)
 
   cmd_reply(ctx, CLR_BOLD "whenmoon market sessions" CLR_RESET);
 
+  // WM-MKT-ARR-UAF-1: rdlock across the list walk.
+  pthread_rwlock_rdlock(&m->arr_lock);
+
   for(i = 0; i < m->n_markets; i++)
   {
-    wm_market_session_snapshot(&m->arr[i], &snap);
+    wm_market_session_snapshot(m->arr[i], &snap);
     wm_obs_render_row(ctx, &snap);
   }
+
+  pthread_rwlock_unlock(&m->arr_lock);
 }
 
 bool
