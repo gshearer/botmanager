@@ -12,7 +12,12 @@
 
 // Custom validators
 
-// KV key format: alphanumeric, dots, underscores, hyphens.
+// KV key format: alphanumeric, dots, underscores, hyphens, and '@'.
+// '@' is the multi-instance market-ID separator ("<exch>-<base>-<quote>@
+// <instance>", WM-MI) and appears in per-market KV paths such as
+// plugin.whenmoon.market.coinbase-btc-usd@mako.strategy.mako.alpha. The
+// KV store and DB accept it; without it here per-instance config is
+// unsettable via `set kv`.
 static bool
 validate_kv_key(const char *str)
 {
@@ -25,7 +30,7 @@ validate_kv_key(const char *str)
 
     if(!((ch >= 'a' && ch <= 'z') || (ch >= 'A' && ch <= 'Z')
         || (ch >= '0' && ch <= '9') || ch == '.' || ch == '_'
-        || ch == '-'))
+        || ch == '-' || ch == '@'))
       return false;
   }
 
