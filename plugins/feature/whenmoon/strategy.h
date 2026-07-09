@@ -237,6 +237,19 @@ bool wm_strategy_reload(struct whenmoon_state *st,
 uint32_t wm_strategy_detach_market(struct whenmoon_state *st,
     const char *market_id_str);
 
+// WM-SR-2: re-seed the WM-SR-1 replay cursor on every attachment of `mk`
+// from `mk->session`. Needed because wm_market_restore (which attaches the
+// configured strategies) runs BEFORE wm_market_persist_restore_all (which
+// hydrates the session), so the seed taken at attach time is always empty
+// on the daemon-restart path. Call once per market at the tail of the
+// hydration, before warmup replay can feed a bar.
+//
+// Takes mk->lock and reg->lock, never simultaneously. Returns the number
+// of attachments seeded. A market whose session has no last-acted signal
+// leaves its attachments' cursors zeroed.
+uint32_t wm_strategy_seed_replay_cursors(struct whenmoon_state *st,
+    struct whenmoon_market *mk);
+
 // -----------------------------------------------------------------------
 // Bar-close fan-out (called from aggregator.c)
 // -----------------------------------------------------------------------

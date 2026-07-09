@@ -773,6 +773,32 @@ wm_strategy_find_market(whenmoon_state_t *st, const char *market_id_str)
   return(NULL);
 }
 
+// WM-SR-1/WM-SR-2: seed one attachment's replay cursor from the market's
+// restored session. Sole definition of the cursor's meaning — both the
+// attach path and the post-hydration re-seed call it so the two cannot
+// drift.
+//
+// The `false` branch is not merely a formality: a market whose persisted
+// row carries has_last_signal=f must be left with a zeroed cursor rather
+// than inheriting whatever the attachment happened to hold.
+//
+// Caller holds mk->lock (or otherwise guarantees `sess` is stable).
+static void
+wm_strategy_seed_cursor_from_session(wm_strategy_ctx_t *ctx,
+    const wm_market_session_t *sess)
+{
+  if(sess->has_last_acted_signal)
+  {
+    ctx->last_signal     = sess->last_acted_signal;
+    ctx->has_last_signal = true;
+  }
+  else
+  {
+    memset(&ctx->last_signal, 0, sizeof(ctx->last_signal));
+    ctx->has_last_signal = false;
+  }
+}
+
 // ----------------------------------------------------------------------- //
 // Attach / detach                                                         //
 // ----------------------------------------------------------------------- //
@@ -1056,16 +1082,16 @@ wm_strategy_attach(whenmoon_state_t *st,
   // Without this seed the REST candles backfill (300 bars per market
   // start) and the wm_aggregator_load_history_task re-fire every
   // prior signal as the warmup replays through dispatch.
+  //
+  // WM-SR-2: on the daemon-restart path the session is still zeroed here
+  // (wm_market_restore runs before wm_market_persist_restore_all), so this
+  // seed is a no-op and wm_strategy_seed_replay_cursors re-runs it once the
+  // session has been hydrated. On a runtime attach the session is already
+  // live and this is the only seed that happens.
   if(mk != NULL)
   {
     pthread_mutex_lock(&mk->lock);
-
-    if(mk->session.has_last_acted_signal)
-    {
-      att->ctx.last_signal     = mk->session.last_acted_signal;
-      att->ctx.has_last_signal = true;
-    }
-
+    wm_strategy_seed_cursor_from_session(&att->ctx, &mk->session);
     pthread_mutex_unlock(&mk->lock);
   }
 
@@ -1192,6 +1218,59 @@ wm_strategy_detach_market(whenmoon_state_t *st,
         n_detached, market_id_str);
 
   return(n_detached);
+}
+
+// ----------------------------------------------------------------------- //
+// Replay-cursor re-seed (called from wm_market_persist_restore_all)       //
+// ----------------------------------------------------------------------- //
+
+uint32_t
+wm_strategy_seed_replay_cursors(whenmoon_state_t *st,
+    whenmoon_market_t *mk)
+{
+  wm_strategy_registry_t   *reg;
+  loaded_strategy_t        *ls;
+  wm_strategy_attachment_t *att;
+  wm_market_session_t       snap;
+  uint32_t                  n_seeded = 0;
+
+  if(st == NULL || st->strategies == NULL || mk == NULL)
+    return(0);
+
+  reg = st->strategies;
+
+  // Snapshot the session under mk->lock and release it BEFORE taking
+  // reg->lock. Holding both would invert the dispatch path's ordering
+  // (reg->lock held across a mkt->lock re-acquire — see the locking
+  // discipline note at the head of this file), so the two locks are
+  // deliberately never held together here.
+  pthread_mutex_lock(&mk->lock);
+  snap = mk->session;
+  pthread_mutex_unlock(&mk->lock);
+
+  pthread_mutex_lock(&reg->lock);
+
+  for(ls = reg->head; ls != NULL; ls = ls->next)
+  {
+    for(att = ls->attachments; att != NULL; att = att->next)
+    {
+      if(strncmp(att->ctx.market_id_str, mk->market_id_str,
+             sizeof(att->ctx.market_id_str)) != 0)
+        continue;
+
+      wm_strategy_seed_cursor_from_session(&att->ctx, &snap);
+      n_seeded++;
+    }
+  }
+
+  pthread_mutex_unlock(&reg->lock);
+
+  if(n_seeded > 0 && snap.has_last_acted_signal)
+    clam(CLAM_INFO, WHENMOON_CTX,
+        "replay cursor seeded on %u attachment(s) of %s (ts=%" PRId64 ")",
+        n_seeded, mk->market_id_str, snap.last_acted_signal.ts_ms);
+
+  return(n_seeded);
 }
 
 // ----------------------------------------------------------------------- //

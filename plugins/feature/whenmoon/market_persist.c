@@ -16,6 +16,7 @@
 #define WHENMOON_INTERNAL
 #include "market_persist.h"
 #include "market.h"
+#include "strategy.h"   // WM-SR-2: wm_strategy_seed_replay_cursors
 #include "whenmoon.h"
 
 #include "alloc.h"
@@ -1238,6 +1239,14 @@ wm_market_persist_restore_all(whenmoon_state_t *st)
     if(cell != NULL) mk->session.pending_n = (uint32_t)strtoul(cell, NULL, 10);
 
     pthread_mutex_unlock(&mk->lock);
+
+    // WM-SR-2: the session is now hydrated, so re-seed the replay cursor on
+    // every attachment wm_market_restore created. Must happen here — after
+    // the hydrate, before warmup replay feeds a bar — because the seed taken
+    // at attach time ran against a zeroed session. Called with mk->lock
+    // released (it takes mk->lock itself) but still under arr_lock, which is
+    // what keeps `mk` alive.
+    wm_strategy_seed_replay_cursors(st, mk);
 
     // WM-MKT-ARR-UAF-1: last use of `mk` done — release the container rdlock.
     pthread_rwlock_unlock(&st->markets->arr_lock);
