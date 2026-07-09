@@ -384,7 +384,8 @@ whenmoon_root_cb(const cmd_ctx_t *ctx)
 {
   cmd_reply(ctx,
       "usage: /whenmoon <market|download|strategy|order|backtest|manual>"
-      " ... (market start|stop|mode|force, download <market>|cancel,"
+      " ... (market start|stop|mode|force,"
+      " download <market> [--gaps]|cancel,"
       " strategy attach|detach|reload, order buy|sell|cancel,"
       " backtest run; manual halts every market into MANUAL mode)");
 }

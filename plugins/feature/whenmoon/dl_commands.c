@@ -187,20 +187,29 @@ wm_dl_cmd_download_enqueue_gaps(const cmd_ctx_t *ctx,
   cmd_reply(ctx, reply);
 }
 
-// /whenmoon download <market> [<date> [<date>]]  (date: MM/dd/yyyy or ISO)
+// /whenmoon download <market> [--gaps] [<date> [<date>]]
+//                                       (date: MM/dd/yyyy or ISO)
 //
-// Idempotent: scans `wm_candles_<market_id>` for row-level gaps in
-// the requested window (default = epoch to now, since dl_candles'
-// empty-page termination keeps a too-old start from causing extra
-// work) and fires one DL_JOB_CANDLES per gap. Run as many times as
-// you like — each invocation just refetches whatever's still
-// missing. Anything that persists across runs is genuinely absent
-// from the exchange.
+// Two intents, discriminated by what the operator supplied:
+//
+//   * bare, warm table  — *freshen*: one DL_JOB_CANDLES over the
+//     forward gap [MAX(ts), now]. The exchange pages backward from
+//     now and terminates on the first page overlapping stored data,
+//     so this is bounded and idempotent.
+//   * bare, cold table  — full scan (first-time backfill): there is
+//     no tail to freshen, so deep-fetch the whole history.
+//   * `--gaps`, or a dated range — *full scan*: walk
+//     `wm_candles_<market_id>` for row-level gaps in the window and
+//     fire one job per gap. This is the deliberate deep-backfill /
+//     interior-hole repair path; markets carry permanent exchange
+//     outage holes, so it re-derives the same windows every run and
+//     must not be the default.
 static void
 wm_dl_cmd_download_market(const cmd_ctx_t *ctx, whenmoon_state_t *st,
     const char *market_tok, const char *rest)
 {
   const char    *p;
+  char           tok[32];
   char           old_tok[32]    = {0};
   char           new_tok[32]    = {0};
   char           exch[32]       = {0};
@@ -215,6 +224,9 @@ wm_dl_cmd_download_market(const cmd_ctx_t *ctx, whenmoon_state_t *st,
   int32_t        market_id;
   wm_coverage_t *gaps           = NULL;
   uint32_t       n_gaps;
+  bool           force_gaps     = false;
+  bool           do_scan;
+  int64_t        newest_ms;
   time_t         now;
   struct tm      tm;
 
@@ -226,9 +238,19 @@ wm_dl_cmd_download_market(const cmd_ctx_t *ctx, whenmoon_state_t *st,
     return;
   }
 
+  // Tail parse: `--gaps` is position-independent; the first two
+  // non-flag tokens are the oldest and newest dates.
   p = rest != NULL ? rest : "";
-  (void)wm_dl_next_token(&p, old_tok, sizeof(old_tok));
-  (void)wm_dl_next_token(&p, new_tok, sizeof(new_tok));
+
+  while(wm_dl_next_token(&p, tok, sizeof(tok)))
+  {
+    if(strcmp(tok, "--gaps") == 0)
+      force_gaps = true;
+    else if(old_tok[0] == '\0')
+      snprintf(old_tok, sizeof(old_tok), "%s", tok);
+    else if(new_tok[0] == '\0')
+      snprintf(new_tok, sizeof(new_tok), "%s", tok);
+  }
 
   if(old_tok[0] != '\0' &&
      wm_dl_parse_date(old_tok, oldest_ts, sizeof(oldest_ts)) != SUCCESS)
@@ -281,6 +303,47 @@ wm_dl_cmd_download_market(const cmd_ctx_t *ctx, whenmoon_state_t *st,
         "%04d-%02d-%02d %02d:%02d:%02d+00",
         tm.tm_year + 1900, tm.tm_mon + 1, tm.tm_mday,
         tm.tm_hour, tm.tm_min, tm.tm_sec);
+  }
+
+  // A dated window or an explicit --gaps means the operator asked for
+  // the full row-gap scan. Everything else freshens the tail — unless
+  // the table is cold, in which case there is no tail and we fall
+  // through to the scan as a first-time backfill.
+  do_scan = force_gaps ||
+      oldest_ts[0] != '\0' || newest_ts[0] != '\0';
+
+  if(!do_scan)
+  {
+    newest_ms = wm_candle_newest_ms(market_id);
+
+    if(newest_ms == 0)
+    {
+      do_scan = true;
+    }
+    else if(wm_now_ms() - newest_ms < 60000)
+    {
+      snprintf(reply, sizeof(reply),
+          "%s: already current, nothing to freshen", symbol);
+      cmd_reply(ctx, reply);
+      return;
+    }
+    else
+    {
+      wm_coverage_t one;
+
+      one.market_id = market_id;
+      wm_pg_ts_from_ms(newest_ms, one.first_ts, sizeof(one.first_ts));
+      snprintf(one.last_ts, sizeof(one.last_ts), "%s", range_end);
+
+      snprintf(reply, sizeof(reply),
+          "%s: freshening [%s, now]; enqueueing 1 fetch job",
+          symbol, one.first_ts);
+      cmd_reply(ctx, reply);
+
+      wm_dl_cmd_download_enqueue_gaps(ctx, st, exch, symbol, market_id,
+          &one, 1);
+      return;
+    }
   }
 
   gaps = mem_alloc(WM_DL_CTX, "gaps",
@@ -382,9 +445,10 @@ wm_dl_cmd_download(const cmd_ctx_t *ctx)
   {
     cmd_reply(ctx,
         "usage: /whenmoon download <exch>-<base>-<quote>"
-        " [<date> [<date>]]"
+        " [--gaps] [<date> [<date>]]"
         " | /whenmoon download cancel <job_id>"
-        "  (date = MM/dd/yyyy or YYYY-MM-DD)");
+        "  (no dates = freshen the tail; --gaps = full gap scan;"
+        " date = MM/dd/yyyy or YYYY-MM-DD)");
     return;
   }
 
@@ -609,16 +673,17 @@ wm_dl_parent_show_download(const cmd_ctx_t *ctx)
 bool
 wm_dl_register_verbs(void)
 {
-  // /whenmoon download <market> [start] [end]    — gap-fill enqueue
-  // /whenmoon download cancel <job_id>           — cancel job
+  // /whenmoon download <market> [--gaps] [start] [end]  — freshen/scan
+  // /whenmoon download cancel <job_id>                  — cancel job
   if(cmd_register("whenmoon", "download",
         "whenmoon download <exch>-<base>-<quote>"
-        " [<date> [<date>]] | cancel <job_id>"
+        " [--gaps] [<date> [<date>]] | cancel <job_id>"
         "  (date = MM/dd/yyyy or YYYY-MM-DD)",
-        "Idempotent candle backfill: scans wm_candles_<id> for"
-        " row-level gaps in the requested window (default = epoch to"
-        " now) and fires one fetch job per gap. Re-run as needed;"
-        " each invocation only refetches what's still missing.",
+        "Idempotent candle backfill. With no dates it freshens the"
+        " tail: one fetch job over [newest stored bar, now] (a market"
+        " with no candles yet deep-backfills instead). --gaps forces a"
+        " full row-gap scan of wm_candles_<id>, one job per hole — use"
+        " it to repair interior gaps. A dated range scans that window.",
         NULL,
         USERNS_GROUP_ADMIN, 100, CMD_SCOPE_ANY, METHOD_T_ANY,
         wm_dl_cmd_download, NULL, "whenmoon", NULL,
