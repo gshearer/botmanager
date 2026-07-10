@@ -9,6 +9,7 @@
 #include "market_engine.h"
 #include "strategy.h"
 #include "dl_commands.h"
+#include "wm_exch_query.h"
 
 #include "cmd.h"
 #include "colors.h"
@@ -20,6 +21,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <strings.h>
 
 // Stack-array cap for the attached-strategy advisor stack rendered in
 // /show whenmoon market <id>. Far above any realistic per-market roster.
@@ -830,43 +832,366 @@ wm_market_register_verbs(void)
 }
 
 // ====================================================================== //
-// WM-MK-OBS-1: /show whenmoon market [<id>] per-market session view       //
+// WM-MK-OBS-1: /show whenmoon market[s] [sessions|<id>] observability     //
 // ====================================================================== //
 
-// Render the no-arg list-row for one market.
+// ------------------------------------------------------------------ //
+// Shared table chrome — bold heading + a gray dash rule beneath       //
+// ------------------------------------------------------------------ //
+//
+// One column descriptor drives both the heading and the rule so the two
+// can never drift. Cells concatenate with no explicit separator — each
+// column's width carries its own breathing room — so the rule lays
+// (width-1) dashes per column, justified like the column, leaving the
+// one-space seam that mirrors where the data padding falls.
+
+typedef struct
+{
+  const char *label;
+  int         width;
+  bool        rjust;
+} wm_tcol_t;
+
+static void
+wm_table_head(const cmd_ctx_t *ctx, const wm_tcol_t *cols, uint32_t n)
+{
+  char     line[512];
+  char     cell[64];
+  size_t   off;
+  uint32_t i;
+
+  off = (size_t)snprintf(line, sizeof(line), CLR_BOLD "  ");
+
+  for(i = 0; i < n; i++)
+  {
+    snprintf(cell, sizeof(cell), "%s", cols[i].label);
+    wm_col_pad(cell, sizeof(cell), cols[i].width, cols[i].rjust);
+    off += (size_t)snprintf(line + off, sizeof(line) - off, "%s", cell);
+  }
+
+  snprintf(line + off, sizeof(line) - off, CLR_RESET);
+  cmd_reply(ctx, line);
+
+  off = (size_t)snprintf(line, sizeof(line), CLR_GRAY "  ");
+
+  for(i = 0; i < n; i++)
+  {
+    int d = cols[i].width - 1;
+    int j;
+
+    if(d < 1)                       d = 1;
+    if(d > (int)sizeof(cell) - 1)   d = (int)sizeof(cell) - 1;
+
+    for(j = 0; j < d; j++)
+      cell[j] = '-';
+    cell[d] = '\0';
+
+    wm_col_pad(cell, sizeof(cell), cols[i].width, cols[i].rjust);
+    off += (size_t)snprintf(line + off, sizeof(line) - off, "%s", cell);
+  }
+
+  snprintf(line + off, sizeof(line) - off, CLR_RESET);
+  cmd_reply(ctx, line);
+}
+
+// ------------------------------------------------------------------ //
+// Market subscriptions table — `show whenmoon markets`                //
+// ------------------------------------------------------------------ //
+//
+// One row per distinct (exchange, product) subscription — the N
+// per-strategy sessions collapse onto their shared product. Each grain
+// column is the % move from that grain's latest COMPLETED candle close
+// to the live last-trade price.
+
+#define WM_MKT_COL_MARKET   20   // "coinbase-btc-usd" = 16, room to spare
+#define WM_MKT_COL_PRICE    13
+#define WM_MKT_COL_GRAIN     9
+
+static const wm_tcol_t wm_mkt_cols[] = {
+  { "Market", WM_MKT_COL_MARKET, false },
+  { "Price",  WM_MKT_COL_PRICE,  true  },
+  { "1m",     WM_MKT_COL_GRAIN,  true  },
+  { "5m",     WM_MKT_COL_GRAIN,  true  },
+  { "15m",    WM_MKT_COL_GRAIN,  true  },
+  { "1h",     WM_MKT_COL_GRAIN,  true  },
+  { "4h",     WM_MKT_COL_GRAIN,  true  },
+  { "1d",     WM_MKT_COL_GRAIN,  true  },
+};
+
+#define WM_SUB_MAX  32
+
+// One accumulated subscription row while the session walk dedups onto
+// products. `ref[g]` is the close of the latest completed candle for
+// grain g, chosen by the max `ref_ts[g]` across the product's sessions
+// (their rings differ only in warmup depth; the newest bar is shared).
+typedef struct
+{
+  char    base_id[WM_MARKET_ID_STR_SZ];   // "<exch>-<base>-<quote>", no @inst
+  double  last_px;
+  int64_t last_tick_ms;
+  double  ref[WM_GRAN_MAX];
+  int64_t ref_ts[WM_GRAN_MAX];
+} wm_sub_row_t;
+
+static void
+wm_obs_render_subscriptions(const cmd_ctx_t *ctx, whenmoon_state_t *st)
+{
+  whenmoon_markets_t *m = st->markets;
+  wm_sub_row_t        rows[WM_SUB_MAX];
+  uint32_t            n_rows = 0;
+  uint32_t            i, g;
+
+  if(m->n_markets == 0)
+  {
+    cmd_reply(ctx,
+        "whenmoon: no markets configured"
+        " (use /whenmoon market start <exch>-<base>-<quote>)");
+    return;
+  }
+
+  // WM-MKT-ARR-UAF-1: rdlock across the dedup walk.
+  pthread_rwlock_rdlock(&m->arr_lock);
+
+  for(i = 0; i < m->n_markets; i++)
+  {
+    whenmoon_market_t *mk = m->arr[i];
+    char     base[WM_MARKET_ID_STR_SZ];
+    double   px;
+    int64_t  tick_ms;
+    double   cref[WM_GRAN_MAX];
+    int64_t  cref_ts[WM_GRAN_MAX];
+    uint32_t r;
+    size_t   blen;
+
+    // Product base id = market_id_str truncated at the '@instance' tail.
+    blen = strcspn(mk->market_id_str, "@");
+    if(blen >= sizeof(base))
+      blen = sizeof(base) - 1;
+    memcpy(base, mk->market_id_str, blen);
+    base[blen] = '\0';
+
+    pthread_mutex_lock(&mk->lock);
+    px      = mk->last_px;
+    tick_ms = mk->last_tick_ms;
+
+    for(g = 0; g < WM_GRAN_MAX; g++)
+    {
+      uint32_t cn = mk->grain_n[g];
+
+      if(cn > 0)
+      {
+        cref[g]    = mk->grain_arr[g][cn - 1].close;
+        cref_ts[g] = mk->grain_arr[g][cn - 1].ts_close_ms;
+      }
+      else
+      {
+        cref[g]    = 0.0;
+        cref_ts[g] = INT64_MIN;
+      }
+    }
+    pthread_mutex_unlock(&mk->lock);
+
+    // Find (or start) this product's row.
+    for(r = 0; r < n_rows; r++)
+      if(strcmp(rows[r].base_id, base) == 0)
+        break;
+
+    if(r == n_rows)
+    {
+      if(n_rows >= WM_SUB_MAX)
+        continue;   // unreachable at trial scale; a silent cap is fine here
+
+      snprintf(rows[r].base_id, sizeof(rows[r].base_id), "%s", base);
+      rows[r].last_px      = 0.0;
+      rows[r].last_tick_ms = INT64_MIN;
+
+      for(g = 0; g < WM_GRAN_MAX; g++)
+      {
+        rows[r].ref[g]    = 0.0;
+        rows[r].ref_ts[g] = INT64_MIN;
+      }
+
+      n_rows++;
+    }
+
+    // Freshest tick wins the price; latest completed bar wins each grain.
+    if(tick_ms >= rows[r].last_tick_ms)
+    {
+      rows[r].last_px      = px;
+      rows[r].last_tick_ms = tick_ms;
+    }
+
+    for(g = 0; g < WM_GRAN_MAX; g++)
+      if(cref_ts[g] > rows[r].ref_ts[g])
+      {
+        rows[r].ref[g]    = cref[g];
+        rows[r].ref_ts[g] = cref_ts[g];
+      }
+  }
+
+  pthread_rwlock_unlock(&m->arr_lock);
+
+  wm_table_head(ctx, wm_mkt_cols,
+      (uint32_t)(sizeof(wm_mkt_cols) / sizeof(wm_mkt_cols[0])));
+
+  for(i = 0; i < n_rows; i++)
+  {
+    const wm_sub_row_t *rw = &rows[i];
+    char   line[512];
+    char   cell[48];
+    char   price[32];
+    size_t off;
+
+    snprintf(cell, sizeof(cell), "%-*.*s", WM_MKT_COL_MARKET,
+        WM_MKT_COL_MARKET, rw->base_id);
+    off = (size_t)snprintf(line, sizeof(line),
+        "  " CLR_CYAN "%s" CLR_RESET, cell);
+
+    if(rw->last_px > 0.0)
+      snprintf(price, sizeof(price),
+          CLR_BOLD CLR_WHITE "%.4f" CLR_RESET, rw->last_px);
+    else
+      snprintf(price, sizeof(price), CLR_GRAY "—" CLR_RESET);
+
+    wm_col_pad(price, sizeof(price), WM_MKT_COL_PRICE, true);
+    off += (size_t)snprintf(line + off, sizeof(line) - off, "%s", price);
+
+    for(g = 0; g < WM_GRAN_MAX; g++)
+    {
+      if(rw->last_px > 0.0 && rw->ref[g] > 0.0)
+        wm_fmt_pct((rw->last_px - rw->ref[g]) / rw->ref[g] * 100.0, 2,
+            cell, sizeof(cell));
+      else
+        snprintf(cell, sizeof(cell), CLR_GRAY "—" CLR_RESET);
+
+      wm_col_pad(cell, sizeof(cell), WM_MKT_COL_GRAIN, true);
+      off += (size_t)snprintf(line + off, sizeof(line) - off, "%s", cell);
+    }
+
+    cmd_reply(ctx, line);
+  }
+}
+
+// ------------------------------------------------------------------ //
+// Session list table — column geometry                                //
+// ------------------------------------------------------------------ //
+//
+// SESSION is left-justified (it carries the "<exch>-<base>-<quote>@inst"
+// identity); every metric column is right-justified so the figures align
+// under their heading. Widths are picked so the flagship 9-instance trial
+// (e.g. "coinbase-btc-usd@juggernaut") fits without truncation.
+#define WM_SES_COL_SESSION  28
+#define WM_SES_COL_SIDE      6
+#define WM_SES_COL_TRADES    7
+#define WM_SES_COL_START    11
+#define WM_SES_COL_CURRENT  12
+#define WM_SES_COL_PL        9
+#define WM_SES_COL_ENTRY    11
+#define WM_SES_COL_VSENTRY   9
+
+// Append one right-justified cell to `line` at `*off`, padding to width.
+static void
+wm_ses_append(char *line, size_t line_sz, size_t *off,
+    char *cell, size_t cell_sz, int width)
+{
+  wm_col_pad(cell, cell_sz, width, true);
+  *off += (size_t)snprintf(line + *off, line_sz - *off, "%s", cell);
+}
+
+// The mark price the open position is valued against: the freshest of the
+// live ticker and the last strategy mark, falling back to entry so a
+// just-restored session with no tick yet reads flat rather than -100%.
+static double
+wm_ses_mark_px(const wm_market_session_snapshot_t *snap)
+{
+  if(snap->last_ticker_px > 0.0)
+    return(snap->last_ticker_px);
+  if(snap->last_mark_px > 0.0)
+    return(snap->last_mark_px);
+
+  return(snap->position.avg_entry_px);
+}
+
+static const wm_tcol_t wm_ses_cols[] = {
+  { "Session", WM_SES_COL_SESSION, false },
+  { "Side",    WM_SES_COL_SIDE,    true  },
+  { "Trades",  WM_SES_COL_TRADES,  true  },
+  { "Start",   WM_SES_COL_START,   true  },
+  { "Current", WM_SES_COL_CURRENT, true  },
+  { "P/L",     WM_SES_COL_PL,      true  },
+  { "Entry",   WM_SES_COL_ENTRY,   true  },
+  { "vsEntry", WM_SES_COL_VSENTRY, true  },
+};
+
+// Render the no-arg list-row for one market session. Metrics are drawn
+// from the market's ACTIVE mode ledger (paper vs real); "Current" marks
+// any open long to market so a session mid-position shows its true worth
+// rather than its depleted cash.
 static void
 wm_obs_render_row(const cmd_ctx_t *ctx,
     const wm_market_session_snapshot_t *snap)
 {
-  const wm_market_stats_t *paper = &snap->stats[WM_MARKET_MODE_PAPER];
-  const wm_market_stats_t *real  = &snap->stats[WM_MARKET_MODE_REAL];
-  char line[320];
+  const wm_market_stats_t *st  = &snap->stats[snap->mode];
+  bool     is_long = (snap->position.side == WM_MARKET_POS_LONG);
+  double   mark    = wm_ses_mark_px(snap);
+  double   equity;
+  double   pl_pct;
+  char     line[512];
+  char     cell[48];
+  size_t   off;
 
-  if(snap->position.side == WM_MARKET_POS_LONG)
-    snprintf(line, sizeof(line),
-        "  %-24s  mode=%-6s side=long   qty=%-12.8g avg=%-10.4f"
-        " paper:cash=%-9.2f realized=%-+9.2f"
-        " real:cash=%-9.2f realized=%-+9.2f"
-        " pending=%u/%u",
-        snap->market_id_str,
-        wm_market_mode_name(snap->mode),
-        snap->position.qty,
-        snap->position.avg_entry_px,
-        paper->cash, paper->realized_pnl_lifetime,
-        real->cash,  real->realized_pnl_lifetime,
-        snap->pending_n, snap->pending_cap);
+  equity = st->cash;
+  if(is_long)
+    equity += snap->position.qty * mark;
+
+  pl_pct = (st->starting_cash > 0.0)
+      ? (equity - st->starting_cash) / st->starting_cash * 100.0 : 0.0;
+
+  // Session id (cyan) — left-justified, hard-truncated to the column.
+  snprintf(cell, sizeof(cell), "%-*.*s", WM_SES_COL_SESSION,
+      WM_SES_COL_SESSION, snap->market_id_str);
+  off = (size_t)snprintf(line, sizeof(line),
+      "  " CLR_CYAN "%s" CLR_RESET, cell);
+
+  // Side — long tints green, flat stays muted.
+  if(is_long)
+    snprintf(cell, sizeof(cell), CLR_GREEN "long" CLR_RESET);
   else
-    snprintf(line, sizeof(line),
-        "  %-24s  mode=%-6s side=flat"
-        "                                    "
-        " paper:cash=%-9.2f realized=%-+9.2f"
-        " real:cash=%-9.2f realized=%-+9.2f"
-        " pending=%u/%u",
-        snap->market_id_str,
-        wm_market_mode_name(snap->mode),
-        paper->cash, paper->realized_pnl_lifetime,
-        real->cash,  real->realized_pnl_lifetime,
-        snap->pending_n, snap->pending_cap);
+    snprintf(cell, sizeof(cell), CLR_GRAY "flat" CLR_RESET);
+  wm_ses_append(line, sizeof(line), &off, cell, sizeof(cell), WM_SES_COL_SIDE);
+
+  snprintf(cell, sizeof(cell), "%u", st->n_trades);
+  wm_ses_append(line, sizeof(line), &off, cell, sizeof(cell), WM_SES_COL_TRADES);
+
+  snprintf(cell, sizeof(cell), "%.2f", st->starting_cash);
+  wm_ses_append(line, sizeof(line), &off, cell, sizeof(cell), WM_SES_COL_START);
+
+  snprintf(cell, sizeof(cell), CLR_BOLD CLR_WHITE "%.2f" CLR_RESET, equity);
+  wm_ses_append(line, sizeof(line), &off, cell, sizeof(cell), WM_SES_COL_CURRENT);
+
+  wm_fmt_pct(pl_pct, 2, cell, sizeof(cell));
+  wm_ses_append(line, sizeof(line), &off, cell, sizeof(cell), WM_SES_COL_PL);
+
+  // Entry + move-since-entry only carry meaning for an open long.
+  if(is_long)
+  {
+    double vs_entry = (snap->position.avg_entry_px > 0.0)
+        ? (mark - snap->position.avg_entry_px)
+              / snap->position.avg_entry_px * 100.0 : 0.0;
+
+    snprintf(cell, sizeof(cell), "%.4f", snap->position.avg_entry_px);
+    wm_ses_append(line, sizeof(line), &off, cell, sizeof(cell), WM_SES_COL_ENTRY);
+
+    wm_fmt_pct(vs_entry, 2, cell, sizeof(cell));
+    wm_ses_append(line, sizeof(line), &off, cell, sizeof(cell), WM_SES_COL_VSENTRY);
+  }
+  else
+  {
+    snprintf(cell, sizeof(cell), CLR_GRAY "—" CLR_RESET);
+    wm_ses_append(line, sizeof(line), &off, cell, sizeof(cell), WM_SES_COL_ENTRY);
+    snprintf(cell, sizeof(cell), CLR_GRAY "—" CLR_RESET);
+    wm_ses_append(line, sizeof(line), &off, cell, sizeof(cell), WM_SES_COL_VSENTRY);
+  }
 
   cmd_reply(ctx, line);
 }
@@ -1073,64 +1398,21 @@ wm_obs_render_strategies(const cmd_ctx_t *ctx, whenmoon_state_t *st,
       CLR_RESET);
 }
 
+// Render the full trading-session table (every instance, one row each).
 static void
-wm_show_market_cmd(const cmd_ctx_t *ctx)
+wm_obs_render_sessions(const cmd_ctx_t *ctx, whenmoon_markets_t *m)
 {
-  const char                  *p;
-  char                         id_tok[WM_MARKET_ID_STR_SZ] = {0};
-  whenmoon_state_t            *st;
-  whenmoon_markets_t          *m;
   wm_market_session_snapshot_t snap;
   uint32_t                     i;
 
-  st = whenmoon_get_state();
-
-  if(st == NULL || st->markets == NULL)
-  {
-    cmd_reply(ctx, "whenmoon: no market state");
-    return;
-  }
-
-  m = st->markets;
-  p = ctx->args != NULL ? ctx->args : "";
-
-  // Detail-arg form.
-  if(wm_dl_next_token(&p, id_tok, sizeof(id_tok)))
-  {
-    whenmoon_market_t *mk;
-    char err[128];
-
-    // WM-MKT-ARR-UAF-1: hold rdlock across lookup + snapshot (which reads
-    // the session under mk->lock). The render below works off the local
-    // `snap` copy + id_tok, so the lock is released first.
-    pthread_rwlock_rdlock(&m->arr_lock);
-    mk = wm_market_lookup_by_id(st, id_tok);
-
-    if(mk == NULL)
-    {
-      pthread_rwlock_unlock(&m->arr_lock);
-      snprintf(err, sizeof(err),
-          "error: market %s not running", id_tok);
-      cmd_reply(ctx, err);
-      return;
-    }
-
-    wm_market_session_snapshot(mk, &snap);
-    pthread_rwlock_unlock(&m->arr_lock);
-
-    wm_obs_render_card(ctx, &snap);
-    wm_obs_render_strategies(ctx, st, id_tok);
-    return;
-  }
-
-  // No-arg list view.
   if(m->n_markets == 0)
   {
-    cmd_reply(ctx, "whenmoon: (no markets running)");
+    cmd_reply(ctx, "whenmoon: (no sessions running)");
     return;
   }
 
-  cmd_reply(ctx, CLR_BOLD "whenmoon market sessions" CLR_RESET);
+  wm_table_head(ctx, wm_ses_cols,
+      (uint32_t)(sizeof(wm_ses_cols) / sizeof(wm_ses_cols[0])));
 
   // WM-MKT-ARR-UAF-1: rdlock across the list walk.
   pthread_rwlock_rdlock(&m->arr_lock);
@@ -1144,16 +1426,97 @@ wm_show_market_cmd(const cmd_ctx_t *ctx)
   pthread_rwlock_unlock(&m->arr_lock);
 }
 
+// One handler behind both `markets` and `market`. The first argument
+// selects the view:
+//   (none)         → market subscriptions table (dedup onto products)
+//   sessions | ses → the trading-session table
+//   <id>           → a per-session detail card
+static void
+wm_show_market_cmd(const cmd_ctx_t *ctx)
+{
+  const char                  *p;
+  char                         tok[WM_MARKET_ID_STR_SZ] = {0};
+  whenmoon_state_t            *st;
+  whenmoon_markets_t          *m;
+
+  st = whenmoon_get_state();
+
+  if(st == NULL || st->markets == NULL)
+  {
+    cmd_reply(ctx, "whenmoon: no market state");
+    return;
+  }
+
+  m = st->markets;
+  p = ctx->args != NULL ? ctx->args : "";
+
+  // No argument → the subscriptions overview.
+  if(!wm_dl_next_token(&p, tok, sizeof(tok)))
+  {
+    wm_obs_render_subscriptions(ctx, st);
+    return;
+  }
+
+  // `sessions` / `ses` → the trading-session table.
+  if(strcasecmp(tok, "sessions") == 0 || strcasecmp(tok, "ses") == 0)
+  {
+    wm_obs_render_sessions(ctx, m);
+    return;
+  }
+
+  // Otherwise treat the token as a session id → detail card.
+  {
+    wm_market_session_snapshot_t snap;
+    whenmoon_market_t           *mk;
+    char                         err[128];
+
+    // WM-MKT-ARR-UAF-1: hold rdlock across lookup + snapshot (which reads
+    // the session under mk->lock). The render below works off the local
+    // `snap` copy + tok, so the lock is released first.
+    pthread_rwlock_rdlock(&m->arr_lock);
+    mk = wm_market_lookup_by_id(st, tok);
+
+    if(mk == NULL)
+    {
+      pthread_rwlock_unlock(&m->arr_lock);
+      snprintf(err, sizeof(err), "error: market %s not running", tok);
+      cmd_reply(ctx, err);
+      return;
+    }
+
+    wm_market_session_snapshot(mk, &snap);
+    pthread_rwlock_unlock(&m->arr_lock);
+
+    wm_obs_render_card(ctx, &snap);
+    wm_obs_render_strategies(ctx, st, tok);
+  }
+}
+
 bool
 wm_show_market_register_verbs(void)
 {
-  // /show whenmoon market [<id>]  — alias /show whenmoon mk
+  // Subscriptions overview: `show whenmoon markets` (abbr `mar`).
+  if(cmd_register("whenmoon", "markets",
+        "show whenmoon markets",
+        "Market subscriptions: one row per distinct (exchange, product)"
+        " with the live last-trade price and, per candle grain (1m…1d),"
+        " the % move from that grain's latest completed candle close.",
+        NULL,
+        USERNS_GROUP_ADMIN, 100, CMD_SCOPE_ANY, METHOD_T_ANY,
+        wm_show_market_cmd, NULL, "show/whenmoon", "mar",
+        NULL, 0, NULL, NULL) != SUCCESS)
+    return(FAIL);
+
+  // Session table + detail card: `show whenmoon market [sessions|<id>]`
+  // (abbr `mk`; `sessions` abbr `ses`). Shares the one handler above, so
+  // `market` with no arg mirrors `markets`.
   if(cmd_register("whenmoon", "market",
-        "show whenmoon market [<id>]",
-        "Per-market session: mode, position, paper+real stats,"
-        " pending count. With <id>: a detail card mirroring the legacy"
-        " `/show whenmoon trade` layout, plus recent fills tails for"
-        " both paper and real ledgers.",
+        "show whenmoon market [sessions|<id>]",
+        "No arg: the subscriptions table (as `markets`)."
+        " `sessions` (abbr `ses`): every trading session with side,"
+        " trade count, starting vs current equity, total P/L, and the"
+        " entry price + move-from-entry for open longs."
+        " `<id>`: a per-session detail card plus recent fills tails.",
         NULL,
         USERNS_GROUP_ADMIN, 100, CMD_SCOPE_ANY, METHOD_T_ANY,
         wm_show_market_cmd, NULL, "show/whenmoon", "mk",

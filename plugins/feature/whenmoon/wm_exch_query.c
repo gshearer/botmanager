@@ -4,6 +4,7 @@
 
 #include "wm_exch_query.h"
 #include "alloc.h"
+#include "colors.h"
 
 #include <errno.h>
 #include <pthread.h>
@@ -166,4 +167,82 @@ wm_fmt_age(int64_t age_ms, char *buf, size_t cap)
         (long long)(s / 86400), (long long)((s % 86400) / 3600));
 
   return(buf);
+}
+
+const char *
+wm_fmt_pct(double pct, int prec, char *buf, size_t cap)
+{
+  // Tint by the value AS DISPLAYED: a move that rounds to 0.00% at this
+  // precision reads as neutral (plain "0.00%", no sign), not a red
+  // "-0.00%". `half` is the rounding boundary 0.5 * 10^-prec.
+  double half = 0.5;
+  double mag  = pct < 0.0 ? -pct : pct;
+  int    i;
+
+  for(i = 0; i < prec; i++)
+    half /= 10.0;
+
+  if(mag < half)
+    snprintf(buf, cap, "%.*f%%", prec, 0.0);
+  else if(pct > 0.0)
+    snprintf(buf, cap, CLR_GREEN "%+.*f%%" CLR_RESET, prec, pct);
+  else
+    snprintf(buf, cap, CLR_RED "%+.*f%%" CLR_RESET, prec, pct);
+
+  return(buf);
+}
+
+size_t
+wm_vis_len(const char *s)
+{
+  size_t n = 0;
+
+  while(*s != '\0')
+  {
+    // colors.h escapes are a two-byte pair: the \x01 marker + one code
+    // letter. Skip both so only visible glyphs count toward the width.
+    if(*s == '\x01' && s[1] != '\0')
+    {
+      s += 2;
+      continue;
+    }
+
+    // UTF-8 continuation bytes (10xxxxxx) belong to the glyph opened by
+    // their lead byte — count the glyph once (e.g. "—" is 3 bytes, 1
+    // column) so a multibyte cell still aligns.
+    if(((unsigned char)*s & 0xC0) != 0x80)
+      n++;
+
+    s++;
+  }
+
+  return(n);
+}
+
+void
+wm_col_pad(char *buf, size_t cap, int width, bool rjust)
+{
+  size_t vis = wm_vis_len(buf);
+  size_t raw = strlen(buf);
+  int    pad = width - (int)vis;
+
+  if(pad <= 0 || raw + (size_t)pad + 1 > cap)
+    return;
+
+  if(rjust)
+  {
+    // Shift the payload right and blank the leading gap.
+    memmove(buf + pad, buf, raw + 1);
+
+    for(int i = 0; i < pad; i++)
+      buf[i] = ' ';
+  }
+  else
+  {
+    // Append trailing spaces after the existing NUL-terminated payload.
+    for(int i = 0; i < pad; i++)
+      buf[raw + (size_t)i] = ' ';
+
+    buf[raw + (size_t)pad] = '\0';
+  }
 }

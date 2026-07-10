@@ -71,72 +71,6 @@ static const plugin_kv_entry_t whenmoon_plugin_schema[] = {
 };
 
 // ------------------------------------------------------------------ //
-// /show whenmoon markets                                              //
-// ------------------------------------------------------------------ //
-
-static void
-whenmoon_show_markets_cmd(const cmd_ctx_t *ctx)
-{
-  whenmoon_state_t   *st;
-  whenmoon_markets_t *m;
-  char                line[256];
-  uint32_t            i;
-
-  st = whenmoon_get_state();
-
-  if(st == NULL || st->markets == NULL)
-  {
-    cmd_reply(ctx, "whenmoon: no market state");
-    return;
-  }
-
-  m = st->markets;
-
-  if(m->n_markets == 0)
-  {
-    cmd_reply(ctx,
-        "whenmoon: no markets configured"
-        " (use /whenmoon market start <exch>-<base>-<quote>)");
-    return;
-  }
-
-  cmd_reply(ctx, CLR_BOLD "whenmoon markets" CLR_RESET);
-
-  // WM-MKT-ARR-UAF-1: rdlock across the render walk.
-  pthread_rwlock_rdlock(&m->arr_lock);
-
-  for(i = 0; i < m->n_markets; i++)
-  {
-    whenmoon_market_t *mk = m->arr[i];
-    double   px;
-    int64_t  tick_ms;
-    uint32_t g1m, g5m, g15m, g1h, g4h, g1d;
-    uint32_t cap1m;
-
-    pthread_mutex_lock(&mk->lock);
-    px       = mk->last_px;
-    tick_ms  = mk->last_tick_ms;
-    g1m      = mk->grain_n[WM_GRAN_1M];
-    g5m      = mk->grain_n[WM_GRAN_5M];
-    g15m     = mk->grain_n[WM_GRAN_15M];
-    g1h      = mk->grain_n[WM_GRAN_1H];
-    g4h      = mk->grain_n[WM_GRAN_4H];
-    g1d      = mk->grain_n[WM_GRAN_1D];
-    cap1m    = mk->grain_cap[WM_GRAN_1M];
-    pthread_mutex_unlock(&mk->lock);
-
-    snprintf(line, sizeof(line),
-        "  %-24s  last_px=%-14.8g  bars 1m=%u/%u 5m=%u 15m=%u"
-        " 1h=%u 4h=%u 1d=%u  last_tick_ms=%" PRId64,
-        mk->market_id_str, px, g1m, cap1m, g5m, g15m, g1h, g4h, g1d,
-        tick_ms);
-    cmd_reply(ctx, line);
-  }
-
-  pthread_rwlock_unlock(&m->arr_lock);
-}
-
-// ------------------------------------------------------------------ //
 // /show whenmoon balances [exchange] [fresh]                          //
 // ------------------------------------------------------------------ //
 //
@@ -476,15 +410,10 @@ whenmoon_register_root_verbs(void)
 static bool
 whenmoon_register_show_verbs(void)
 {
-  if(cmd_register("whenmoon", "markets",
-        "show whenmoon markets",
-        "Per-market state: id, last ticker px, candle count, last tick ts",
-        NULL,
-        USERNS_GROUP_ADMIN, 100, CMD_SCOPE_ANY, METHOD_T_ANY,
-        whenmoon_show_markets_cmd, NULL, "show/whenmoon", NULL,
-        NULL, 0, NULL, NULL) != SUCCESS)
-    return(FAIL);
-
+  // `show whenmoon markets` (subscriptions) and `show whenmoon market
+  // [sessions|<id>]` are both registered by wm_show_market_register_verbs
+  // in market_cmds.c — they share one handler that owns the session
+  // snapshot + detail-card machinery.
   if(cmd_register("whenmoon", "balances",
         "show whenmoon balances [exchange] [fresh]",
         "Account-balance snapshot. Cache-first: reads the per-exchange"
