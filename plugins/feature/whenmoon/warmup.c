@@ -21,10 +21,14 @@
 #include <string.h>
 
 // Heap context carried (and re-owned) across the self-rescheduling
-// re-check / tail-fill deferred tasks. The single in-flight task owns it
+// convergence re-check deferred task. The single in-flight task owns it
 // and frees it when it stops. The market is identified by canonical id
 // (re-resolved each tick) plus the warmup generation it belongs to, so a
 // stopped market or a superseding warmup_begin retires the timer.
+//
+// The tail-fill does NOT use this — it is one global periodic sweep keyed
+// on the candle table, with no per-session context to carry
+// (WM-TAILFILL-COALESCE-1; see warmup.h).
 typedef struct
 {
   whenmoon_state_t *st;
@@ -34,7 +38,6 @@ typedef struct
 } wm_warm_timer_ctx_t;
 
 static void wm_market_warmup_recheck_task(task_t *t);
-static void wm_market_warmup_tailfill_task(task_t *t);
 
 const char *
 wm_warmup_state_name(wm_warmup_state_t s)
@@ -114,8 +117,15 @@ wm_market_required_lookback_ms(whenmoon_state_t *st, whenmoon_market_t *mk)
 // Enqueue an authoritative DB gap-fill for every missing 1m window in
 // [from_ms, to_ms]. Reuses the downloader's row-level gap walker + job
 // queue — the candle table stays exchange-authoritative.
-static void
-wm_warmup_enqueue_gaps(whenmoon_state_t *st, whenmoon_market_t *mk,
+//
+// Takes the candle table's identity BY VALUE, not a live
+// whenmoon_market_t*: the tail-fill sweep calls this off a snapshot with
+// the markets container lock released (the gap walk is a remote-Postgres
+// round trip and must not be held under it), and several market sessions
+// share one `market_id`. Returns the number of jobs enqueued.
+static uint32_t
+wm_warmup_enqueue_gaps(whenmoon_state_t *st, int32_t market_id,
+    const char *exchange, const char *product_id,
     int64_t from_ms, int64_t to_ms)
 {
   char          s0[WM_COV_TS_SZ];
@@ -123,14 +133,15 @@ wm_warmup_enqueue_gaps(whenmoon_state_t *st, whenmoon_market_t *mk,
   wm_coverage_t gaps[WM_WARM_MAX_GAPS];
   uint32_t      n;
   uint32_t      i;
+  uint32_t      queued = 0;
 
   if(to_ms <= from_ms)
-    return;
+    return(0);
 
   wm_pg_ts_from_ms(from_ms, s0, sizeof(s0));
   wm_pg_ts_from_ms(to_ms,   s1, sizeof(s1));
 
-  n = wm_gap_find_row_gaps(mk->market_id, s0, s1, gaps, WM_WARM_MAX_GAPS);
+  n = wm_gap_find_row_gaps(market_id, s0, s1, gaps, WM_WARM_MAX_GAPS);
 
   for(i = 0; i < n; i++)
   {
@@ -139,11 +150,14 @@ wm_warmup_enqueue_gaps(whenmoon_state_t *st, whenmoon_market_t *mk,
 
     derr[0] = '\0';
 
-    (void)wm_dl_job_enqueue(st, DL_JOB_CANDLES, mk->market_id,
-        EXCHANGE_PRIO_USER_DOWNLOAD, mk->exchange_name, mk->product_id,
-        gaps[i].first_ts, gaps[i].last_ts, "warmup", &job_id,
-        derr, sizeof(derr));
+    if(wm_dl_job_enqueue(st, DL_JOB_CANDLES, market_id,
+           EXCHANGE_PRIO_USER_DOWNLOAD, exchange, product_id,
+           gaps[i].first_ts, gaps[i].last_ts, "warmup", &job_id,
+           derr, sizeof(derr)) == SUCCESS)
+      queued++;
   }
+
+  return(queued);
 }
 
 // Re-resolve the market and verify the timer still belongs to the live
@@ -172,30 +186,6 @@ wm_warm_set_state(whenmoon_market_t *mk, wm_warmup_state_t s)
   pthread_mutex_lock(&mk->lock);
   mk->warmup_state = s;
   pthread_mutex_unlock(&mk->lock);
-}
-
-// Schedule the first authoritative tail-fill for a now-READY market.
-static void
-wm_warmup_start_tailfill(whenmoon_state_t *st, const char *market_id_str,
-    uint32_t gen)
-{
-  wm_warm_timer_ctx_t *tc;
-
-  tc = mem_alloc("whenmoon", "warm_tailfill", sizeof(*tc));
-
-  if(tc == NULL)
-    return;
-
-  tc->st    = st;
-  tc->gen   = gen;
-  tc->iters = 0;
-  snprintf(tc->market_id_str, sizeof(tc->market_id_str), "%s",
-      market_id_str);
-
-  if(task_add_deferred("wm_warm_tailfill", TASK_ANY, 220,
-         WM_WARM_TAILFILL_INTERVAL_MS, wm_market_warmup_tailfill_task, tc)
-         == TASK_HANDLE_NONE)
-    mem_free(tc);
 }
 
 // --------------------------------------------------------------------
@@ -311,7 +301,9 @@ wm_market_warmup_recheck_task(task_t *t)
         "warmup %s: ready (replayed up to %u 1m bars)",
         mk->market_id_str, limit);
 
-    wm_warmup_start_tailfill(ctx->st, mk->market_id_str, ctx->gen);
+    // WM-TAILFILL-COALESCE-1: nothing to schedule here. The tail-fill is
+    // one global sweep keyed on the candle table, and it picks this market
+    // up on its next tick now that the state is READY.
 
     pthread_rwlock_unlock(&ctx->st->markets->arr_lock);
     mem_free(ctx);
@@ -325,7 +317,8 @@ wm_market_warmup_recheck_task(task_t *t)
   // while pages are still in flight). Re-issue occasionally (~every 60 s)
   // only as a backstop against permanently dropped jobs.
   if(ctx->iters > 0 && (ctx->iters % 12) == 0)
-    wm_warmup_enqueue_gaps(ctx->st, mk, now - eff, now);
+    (void)wm_warmup_enqueue_gaps(ctx->st, mk->market_id, mk->exchange_name,
+        mk->product_id, now - eff, now);
 
   ctx->iters++;
 
@@ -345,56 +338,163 @@ wm_market_warmup_recheck_task(task_t *t)
   t->state = TASK_ENDED;
 }
 
-static void
-wm_market_warmup_tailfill_task(task_t *t)
+// --------------------------------------------------------------------
+// WM-TAILFILL-COALESCE-1: global tail-fill sweep
+//
+// ONE periodic task for the plugin. Each tick: snapshot the DISTINCT
+// candle tables behind the READY markets, drop the container lock, then
+// tail-fill each table exactly once.
+//
+// Keyed on `market_id` (the table), NOT `market_id_str` (the session).
+// Those differ in cardinality — N strategy instances of one product are N
+// sessions sharing ONE table — and the gap walk + download enqueue are
+// per-table work. See warmup.h.
+// --------------------------------------------------------------------
+
+// One distinct candle table, copied out from under the container lock.
+typedef struct
 {
-  wm_warm_timer_ctx_t *ctx;
-  whenmoon_market_t   *mk;
-  int64_t              now;
+  int32_t market_id;
+  char    exchange[EXCHANGE_NAME_SZ];
+  char    product_id[WM_PRODUCT_ID_SZ];
+} wm_warm_table_t;
+
+static task_handle_t wm_warm_g_tailfill_task = TASK_HANDLE_NONE;
+
+// Phase A: reduce the READY markets to their distinct candle tables.
+// Caller must hold st->markets->arr_lock (read). Returns the count.
+static uint32_t
+wm_warm_collect_tables(whenmoon_state_t *st, wm_warm_table_t *out,
+    uint32_t cap)
+{
+  uint32_t n = 0;
+  uint32_t i;
+
+  for(i = 0; i < st->markets->n_markets; i++)
+  {
+    whenmoon_market_t *mk = st->markets->arr[i];
+    wm_warmup_state_t  ws;
+    uint32_t           j;
+    bool               dup = false;
+
+    if(mk == NULL)
+      continue;
+
+    // Lock order is arr_lock -> mk->lock, never the reverse (market.h:371).
+    pthread_mutex_lock(&mk->lock);
+    ws = mk->warmup_state;
+    pthread_mutex_unlock(&mk->lock);
+
+    // Only READY markets: a WARMING one is already being gap-filled by
+    // its own convergence re-check — don't race it.
+    if(ws != WM_WARM_READY)
+      continue;
+
+    for(j = 0; j < n; j++)
+    {
+      if(out[j].market_id == mk->market_id)
+      {
+        dup = true;
+        break;
+      }
+    }
+
+    // The whole point: N sessions of one product collapse to one table.
+    if(dup)
+      continue;
+
+    if(n >= cap)
+    {
+      clam(CLAM_WARN, WHENMOON_CTX,
+          "tailfill: more than %u distinct candle tables — skipping"
+          " market_id=%d this sweep", cap, mk->market_id);
+      break;
+    }
+
+    out[n].market_id = mk->market_id;
+    snprintf(out[n].exchange, sizeof(out[n].exchange), "%s",
+        mk->exchange_name);
+    snprintf(out[n].product_id, sizeof(out[n].product_id), "%s",
+        mk->product_id);
+    n++;
+  }
+
+  return(n);
+}
+
+static void
+wm_warm_tailfill_task(task_t *t)
+{
+  whenmoon_state_t *st;
+  wm_warm_table_t   tabs[WM_WARM_TAILFILL_MAX_TABLES];
+  uint32_t          n;
+  uint32_t          i;
+  uint32_t          queued = 0;
+  int64_t           now;
 
   if(t == NULL)
     return;
 
-  ctx = t->data;
+  st = t->data;
 
-  if(ctx == NULL)
+  if(st == NULL || st->markets == NULL)
   {
     t->state = TASK_ENDED;
     return;
   }
 
-  // WM-MKT-ARR-UAF-1: wm_warm_timer_live returns a bare mk; hold rdlock
-  // across the call and ALL use of mk below (until this task ends).
-  if(ctx->st == NULL || ctx->st->markets == NULL)
-  {
-    mem_free(ctx);
-    t->state = TASK_ENDED;
-    return;
-  }
+  pthread_rwlock_rdlock(&st->markets->arr_lock);
+  n = wm_warm_collect_tables(st, tabs, WM_WARM_TAILFILL_MAX_TABLES);
+  pthread_rwlock_unlock(&st->markets->arr_lock);
 
-  pthread_rwlock_rdlock(&ctx->st->markets->arr_lock);
-  mk = wm_warm_timer_live(ctx);
-
-  if(mk == NULL)
-  {
-    pthread_rwlock_unlock(&ctx->st->markets->arr_lock);
-    mem_free(ctx);
-    t->state = TASK_ENDED;
-    return;
-  }
-
+  // Lock released: the gap walk below is a remote-Postgres round trip and
+  // must not run under the container rdlock. `tabs` is a by-value snapshot,
+  // so a concurrent market remove cannot dangle us (WM-MKT-ARR-UAF-1).
   now = wm_now_ms();
-  wm_warmup_enqueue_gaps(ctx->st, mk, now - WM_WARM_TAILFILL_WINDOW_MS, now);
 
-  if(task_add_deferred("wm_warm_tailfill", TASK_ANY, 220,
-         WM_WARM_TAILFILL_INTERVAL_MS, wm_market_warmup_tailfill_task, ctx)
-         == TASK_HANDLE_NONE)
-    mem_free(ctx);
+  for(i = 0; i < n; i++)
+    queued += wm_warmup_enqueue_gaps(st, tabs[i].market_id,
+        tabs[i].exchange, tabs[i].product_id,
+        now - WM_WARM_TAILFILL_WINDOW_MS, now);
 
-  // WM-MKT-ARR-UAF-1: last use of mk done — release the container rdlock.
-  pthread_rwlock_unlock(&ctx->st->markets->arr_lock);
+  // Quiet on the common no-op tick; only speak when we actually repaired.
+  if(queued > 0)
+    clam(CLAM_INFO, WHENMOON_CTX,
+        "tailfill: %u gap job(s) enqueued across %u candle table(s)",
+        queued, n);
 
   t->state = TASK_ENDED;
+}
+
+bool
+wm_warm_tailfill_global_init(whenmoon_state_t *st)
+{
+  if(wm_warm_g_tailfill_task != TASK_HANDLE_NONE)
+    return(SUCCESS);
+
+  if(st == NULL)
+    return(FAIL);
+
+  wm_warm_g_tailfill_task = task_add_periodic("wm_warm_tailfill", TASK_ANY,
+      220, WM_WARM_TAILFILL_INTERVAL_MS, wm_warm_tailfill_task, st);
+
+  if(wm_warm_g_tailfill_task == TASK_HANDLE_NONE)
+  {
+    clam(CLAM_WARN, WHENMOON_CTX, "tailfill sweep task submit failed");
+    return(FAIL);
+  }
+
+  return(SUCCESS);
+}
+
+void
+wm_warm_tailfill_global_destroy(void)
+{
+  if(wm_warm_g_tailfill_task != TASK_HANDLE_NONE)
+  {
+    task_cancel(wm_warm_g_tailfill_task);
+    wm_warm_g_tailfill_task = TASK_HANDLE_NONE;
+  }
 }
 
 // --------------------------------------------------------------------
@@ -456,7 +556,8 @@ wm_market_warmup_begin(whenmoon_state_t *st, whenmoon_market_t *mk)
   eff     = (lookback < ring_ms) ? lookback : ring_ms;
   now     = wm_now_ms();
 
-  wm_warmup_enqueue_gaps(st, mk, now - eff, now);
+  (void)wm_warmup_enqueue_gaps(st, mk->market_id, mk->exchange_name,
+      mk->product_id, now - eff, now);
 
   clam(CLAM_INFO, WHENMOON_CTX,
       "warmup %s: warming (lookback=%lld ms, eff=%lld ms)",

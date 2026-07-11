@@ -17,6 +17,7 @@
 #include "mw.h"
 #include "strategy.h"
 #include "sweep.h"
+#include "warmup.h"
 #include "wm_exch_query.h"
 
 #include "cmd.h"
@@ -689,10 +690,21 @@ whenmoon_init(void)
   // touching those keys yet.
   wm_bt_sweep_cleanup_stale_kv();
 
+  // WM-TAILFILL-COALESCE-1: one global tail-fill sweep for the plugin
+  // (NOT one timer per market session). Needs `st` — hence here, after it
+  // exists. Harmless before restore: it skips every non-READY market.
+  if(wm_warm_tailfill_global_init(st) != SUCCESS)
+  {
+    clam(CLAM_INFO, WHENMOON_CTX, "tailfill sweep init failed");
+    goto fail;
+  }
+
   clam(CLAM_INFO, WHENMOON_CTX, "whenmoon plugin initialized");
   return(SUCCESS);
 
 fail:
+  // Cancel the sweep BEFORE `st` is freed — the task reads through it.
+  wm_warm_tailfill_global_destroy();
   whenmoon_subsystems_destroy(st);
   whenmoon_state = NULL;
   mem_free(st);
@@ -751,6 +763,9 @@ static void
 whenmoon_deinit(void)
 {
   whenmoon_state_t *st = whenmoon_state;
+
+  // Cancel the sweep BEFORE `st` is freed — the task reads through it.
+  wm_warm_tailfill_global_destroy();
 
   if(st != NULL)
   {

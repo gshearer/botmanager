@@ -6,11 +6,27 @@
 // attached strategy roster, gap-fill the recent 1m window from the
 // exchange into the authoritative candle DB, replay it (cascading
 // 1m→…→1d), then promote to READY. The trade engine acts on strategy
-// advice only in WM_WARM_READY. A periodic authoritative tail-fill keeps
-// the DB current thereafter so restart gaps stay small.
+// advice only in WM_WARM_READY.
 //
-// Timers are self-rescheduling DEFERRED tasks guarded by
-// whenmoon_market.warmup_gen — see market.h. No task_cancel is used.
+// Two timers, at DIFFERENT granularities — don't conflate them:
+//
+//   * Convergence re-check — PER MARKET SESSION (`market_id_str`, which
+//     carries the `@<strategy>` instance suffix). A self-rescheduling
+//     DEFERRED task guarded by whenmoon_market.warmup_gen (see market.h),
+//     so a stopped market or a superseding warmup_begin retires it. It
+//     ends for good once the market is promoted to READY. No task_cancel.
+//
+//   * Authoritative tail-fill — WM-TAILFILL-COALESCE-1: ONE GLOBAL
+//     periodic task for the whole plugin, NOT one per session. The work
+//     it does (gap-walk + download-enqueue) targets the candle table
+//     `wm_candles_<market_id>`, and `market_id` is SHARED by every
+//     instance of the same product (all of coinbase-btc-usd@{mako,
+//     riptide,juggernaut} are market_id 1). Scheduling it per session
+//     therefore ran the identical gap walk N× per table and — since
+//     wm_dl_job_enqueue does not dedupe — enqueued N duplicate download
+//     jobs whenever the timers landed in the same tick. The sweeper
+//     instead reduces the READY markets to their DISTINCT market_ids and
+//     tail-fills each table exactly once. Cancelled at plugin deinit.
 
 #ifndef BM_WHENMOON_WARMUP_H
 #define BM_WHENMOON_WARMUP_H
@@ -24,8 +40,13 @@ struct whenmoon_market;
 // window is contiguous to ~now.
 #define WM_WARM_RECHECK_INTERVAL_MS   5000u
 
-// Authoritative tail-fill cadence on a READY market.
+// Authoritative tail-fill cadence (global sweep; see the header note).
 #define WM_WARM_TAILFILL_INTERVAL_MS  180000u
+
+// Distinct candle tables one tail-fill sweep can cover. Sized well above
+// the live set (= number of distinct products, 3 today); a sweep that
+// would exceed it warns rather than silently dropping a table.
+#define WM_WARM_TAILFILL_MAX_TABLES   32u
 
 // A residual forward gap shorter than this is left for the live feed to
 // close; warmup promotes to READY rather than chasing the last bars.
@@ -62,6 +83,12 @@ struct whenmoon_market;
 // prior timer retires). Called off mk->lock.
 void wm_market_warmup_begin(struct whenmoon_state *st,
     struct whenmoon_market *mk);
+
+// WM-TAILFILL-COALESCE-1: start/stop the single global tail-fill sweep.
+// Init after `st` exists (the task reads the market array through it);
+// destroy BEFORE `st` is freed. Both idempotent.
+bool wm_warm_tailfill_global_init(struct whenmoon_state *st);
+void wm_warm_tailfill_global_destroy(void);
 
 #endif // WHENMOON_INTERNAL
 #endif // BM_WHENMOON_WARMUP_H
