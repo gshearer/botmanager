@@ -457,9 +457,12 @@ wm_warm_tailfill_task(task_t *t)
         tabs[i].exchange, tabs[i].product_id,
         now - WM_WARM_TAILFILL_WINDOW_MS, now);
 
-  // Quiet on the common no-op tick; only speak when we actually repaired.
+  // DEBUG, not INFO: the live aggregator never persists closed bars, so
+  // the tail is always a few minutes behind and this fires on virtually
+  // every 3-minute tick — at INFO it's a heartbeat that drowns real events
+  // (and leaks into CLAM subscribers like the #cabal fills announcer).
   if(queued > 0)
-    clam(CLAM_INFO, WHENMOON_CTX,
+    clam(CLAM_DEBUG, WHENMOON_CTX,
         "tailfill: %u gap job(s) enqueued across %u candle table(s)",
         queued, n);
 
