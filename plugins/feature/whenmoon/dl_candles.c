@@ -230,9 +230,15 @@ wm_dl_candles_insert_page(int32_t market_id,
     }
 
     // exchange_candle_t carries bucket open in ms; the on-disk schema
-    // stores TIMESTAMPTZ, so we narrow to seconds for to_timestamp().
+    // stores TIMESTAMPTZ, so we narrow to seconds for to_timestamp(),
+    // which yields a timestamptz at the correct instant. Do NOT append
+    // `AT TIME ZONE 'UTC'` here: that strips the zone to a naive
+    // timestamp whose wall-clock digits are UTC, and inserting a naive
+    // value into the TIMESTAMPTZ column re-anchors it in the session
+    // TimeZone (e.g. America/New_York), shifting every row +4h/+5h into
+    // the future. to_timestamp() alone stores the instant faithfully.
     n = snprintf(sql + len, cap - len,
-        "%s(to_timestamp(%" PRId64 ") AT TIME ZONE 'UTC',"
+        "%s(to_timestamp(%" PRId64 "),"
         " %.17g, %.17g, %.17g, %.17g, %.17g)",
         i > 0 ? "," : "",
         c->ts_open_ms / 1000,
