@@ -707,7 +707,7 @@ weather_init(void)
   if(cmd_register(WEATHER_CTX, "weather",
       "weather <zipcode | city>",
       "Show current weather for a US zipcode or city name",
-      "Queries the OpenWeather OneCall 3.0 API for current\n"
+      "Queries the OpenWeather One Call 4.0 API for current\n"
       "conditions at the given location. Accepts either a US\n"
       "zipcode or a city name (geocoded via OpenWeather's\n"
       "direct-geocoding endpoint). Displays temperature, humidity,\n"
@@ -726,7 +726,7 @@ weather_init(void)
   if(cmd_register(WEATHER_CTX, "forecast",
       "forecast [-h] <zipcode>",
       "Show forecast for a US zipcode (daily or hourly with -h)",
-      "Queries the OpenWeather OneCall 3.0 API for the forecast\n"
+      "Queries the OpenWeather One Call 4.0 API for the forecast\n"
       "at the given zipcode.\n"
       "\n"
       "  !forecast <zipcode>      7-day daily forecast\n"

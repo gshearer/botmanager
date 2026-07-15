@@ -1261,6 +1261,76 @@ plugin_find_so_by_name(const char *dir, const char *name,
   return(found);
 }
 
+// A KV key is display-sensitive if it lives in the `creds` tier or its
+// trailing segment names a credential — such values are never printed
+// verbatim in /show, only as a set/unset indicator.
+static bool
+plugin_kv_key_sensitive(const char *key)
+{
+  const char *dot;
+  const char *tail;
+
+  if(kv_is_secret_key(key))
+    return(true);
+
+  dot  = strrchr(key, '.');
+  tail = (dot != NULL) ? dot + 1 : key;
+
+  return(strstr(tail, "apikey")   != NULL
+      || strstr(tail, "api_key")  != NULL
+      || strstr(tail, "secret")   != NULL
+      || strstr(tail, "token")    != NULL
+      || strstr(tail, "password") != NULL
+      || strstr(tail, "passwd")   != NULL);
+}
+
+// Render a schema key's *live* value for /show plugin (the schema only
+// carries the compile-time default, which is misleading once an operator
+// has configured the key). Sensitive keys collapse to a set/unset badge
+// so a live credential never reaches the reply.
+static void
+plugin_kv_value_display(const plugin_kv_entry_t *e, char *out, size_t sz)
+{
+  if(plugin_kv_key_sensitive(e->key))
+  {
+    const char *v   = kv_get_str(e->key);
+    bool        set = v != NULL && v[0] != '\0'
+        && v != KV_REDACTED_VALUE && strcmp(v, KV_REDACTED_VALUE) != 0;
+
+    snprintf(out, sz, "%s", set ? CLR_GREEN "(set)" CLR_RESET
+                                : CLR_GRAY  "(unset)" CLR_RESET);
+    return;
+  }
+
+  switch(e->type)
+  {
+    case KV_STR:
+    {
+      const char *v = kv_get_str(e->key);
+
+      if(v == NULL || v[0] == '\0')
+        snprintf(out, sz, CLR_GRAY "(empty)" CLR_RESET);
+      else
+        snprintf(out, sz, "%s", v);
+      break;
+    }
+
+    case KV_BOOL:
+      snprintf(out, sz, "%s", kv_get_int(e->key) != 0 ? "true" : "false");
+      break;
+
+    case KV_FLOAT:
+    case KV_DOUBLE:
+    case KV_LDOUBLE:
+      snprintf(out, sz, "%g", kv_get_double(e->key));
+      break;
+
+    default:  // the integer tiers
+      snprintf(out, sz, "%lld", (long long)kv_get_int(e->key));
+      break;
+  }
+}
+
 // Emit the detail view for a plugin descriptor. When loaded is true,
 // the plugin is active in the system; when false, it was temporarily
 // opened from disk and runtime fields (memory, state) are unavailable.
@@ -1386,12 +1456,13 @@ plugin_show_detail_emit(const cmd_ctx_t *ctx,
     for(uint32_t i = 0; i < pd->kv_schema_count; i++)
     {
       const plugin_kv_entry_t *e = &pd->kv_schema[i];
+      char val[KV_STR_SZ + 32];
+
+      plugin_kv_value_display(e, val, sizeof(val));
 
       snprintf(line, sizeof(line),
           "    %-24s " CLR_CYAN "%s" CLR_RESET " = %s",
-          e->key, kv_type_name(e->type),
-          (e->default_val && e->default_val[0])
-              ? e->default_val : CLR_GRAY "(empty)" CLR_RESET);
+          e->key, kv_type_name(e->type), val);
       cmd_reply(ctx, line);
     }
   }
@@ -1407,12 +1478,13 @@ plugin_show_detail_emit(const cmd_ctx_t *ctx,
     for(uint32_t i = 0; i < pd->kv_inst_schema_count; i++)
     {
       const plugin_kv_entry_t *e = &pd->kv_inst_schema[i];
+      char val[KV_STR_SZ + 32];
+
+      plugin_kv_value_display(e, val, sizeof(val));
 
       snprintf(line, sizeof(line),
           "    %-24s " CLR_CYAN "%s" CLR_RESET " = %s",
-          e->key, kv_type_name(e->type),
-          (e->default_val && e->default_val[0])
-              ? e->default_val : CLR_GRAY "(empty)" CLR_RESET);
+          e->key, kv_type_name(e->type), val);
       cmd_reply(ctx, line);
     }
   }

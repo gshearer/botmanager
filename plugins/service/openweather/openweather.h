@@ -22,10 +22,17 @@
 #define OW_CTX          "openweather"
 
 // API base URLs.
-#define OW_GEO_URL          "https://api.openweathermap.org/geo/1.0/zip"
-#define OW_GEO_DIRECT_URL   "https://api.openweathermap.org/geo/1.0/direct"
-#define OW_GEO_REVERSE_URL  "https://api.openweathermap.org/geo/1.0/reverse"
-#define OW_ONECALL_URL      "https://api.openweathermap.org/data/3.0/onecall"
+#define OW_GEO_URL              "https://api.openweathermap.org/geo/1.0/zip"
+#define OW_GEO_DIRECT_URL       "https://api.openweathermap.org/geo/1.0/direct"
+#define OW_GEO_REVERSE_URL      "https://api.openweathermap.org/geo/1.0/reverse"
+
+// One Call API 4.0 replaces the single 3.0 OneCall call with per-datatype
+// endpoints: current conditions on their own path, the hourly/daily
+// forecasts as "timeline" resources (…/timeline/1h, …/timeline/1day),
+// and alert bodies fetched per id from …/alert/{id}.
+#define OW_ONECALL_CURRENT_URL  "https://api.openweathermap.org/data/4.0/onecall/current"
+#define OW_ONECALL_TIMELINE_URL "https://api.openweathermap.org/data/4.0/onecall/timeline"
+#define OW_ONECALL_ALERT_URL    "https://api.openweathermap.org/data/4.0/onecall/alert"
 
 // Size limits.
 #define OW_ZIPCODE_SZ   OPENWEATHER_ZIPCODE_SZ
@@ -34,6 +41,17 @@
 #define OW_URL_SZ       512
 #define OW_NAME_SZ      OPENWEATHER_NAME_SZ
 #define OW_CITY_SZ      96
+
+// OpenWeather alert ids are long URN strings (urn:oid:… ≈ 90 chars).
+#define OW_ALERT_ID_SZ  192
+
+// The /alert/{id} URL embeds a percent-escaped id (up to 3× expansion),
+// so its buffer must clear the id worst case plus the base and appid.
+#define OW_ALERT_URL_SZ (OW_ALERT_ID_SZ * 3 + 128)
+
+// Timeline page sizes requested by the forecast commands.
+#define OW_FCAST_DAILY_CNT   7
+#define OW_FCAST_HOURLY_CNT  24
 
 // Timeout budget for the sync city→zip geocode path (seconds). The
 // /weather command body runs on a task-worker thread; bounding the
@@ -72,6 +90,22 @@ typedef struct ow_request
     openweather_done_forecast_cb_t  forecast;
   }                   cb;
   void               *user;
+
+  // Result accumulator. One Call 4.0 answers a single command with a
+  // short chain of GETs (primary datatype, then hi/lo and per-alert
+  // enrichment), so the partial result must outlive each individual
+  // callback. Only the arm matching r->type is populated.
+  union
+  {
+    openweather_current_result_t   current;
+    openweather_forecast_result_t  forecast;
+  }                   acc;
+
+  // Alert-enrichment worklist: URN ids lifted from the primary response,
+  // resolved to human labels one GET at a time.
+  char                alert_ids[OPENWEATHER_ALERT_MAX][OW_ALERT_ID_SZ];
+  uint8_t             alert_id_count;
+  uint8_t             alert_idx;
 
   // Freelist linkage.
   struct ow_request  *next;
@@ -129,28 +163,32 @@ static void             ow_geo_insert(const char *zipcode, double lat,
                             double lon, const char *name);
 static ow_request_t    *ow_req_alloc(void);
 static void             ow_req_release(ow_request_t *r);
-static void             ow_submit_onecall(ow_request_t *r);
-static void             ow_onecall_done(const curl_response_t *resp);
 static void             ow_geocode_done(const curl_response_t *resp);
 static void             ow_deliver_current_err(ow_request_t *r,
                             const char *msg);
 static void             ow_deliver_forecast_err(ow_request_t *r,
                             const char *msg);
 
-static void             ow_parse_alerts(struct json_object *root,
-                            openweather_alert_set_t *out);
-static void             ow_parse_current(ow_request_t *r,
-                            struct json_object *root,
-                            openweather_current_result_t *out);
-static void             ow_parse_forecast_daily(ow_request_t *r,
-                            struct json_object *root,
-                            openweather_forecast_result_t *out);
-static void             ow_parse_forecast_hourly(ow_request_t *r,
-                            struct json_object *root,
-                            openweather_forecast_result_t *out);
+// One Call 4.0 request chain.
+static void             ow_submit_primary(ow_request_t *r);
+static void             ow_submit_current(ow_request_t *r);
+static void             ow_current_done(const curl_response_t *resp);
+static void             ow_submit_daily(ow_request_t *r);
+static void             ow_daily_done(const curl_response_t *resp);
+static void             ow_submit_hourly(ow_request_t *r);
+static void             ow_hourly_done(const curl_response_t *resp);
+static void             ow_start_alert_enrich(ow_request_t *r);
+static void             ow_submit_next_alert(ow_request_t *r);
+static void             ow_alert_done(const curl_response_t *resp);
+static void             ow_deliver_final(ow_request_t *r);
 
 static void             ow_canon_query(const char *in, char *out,
                             size_t out_sz);
+
+// Defined lower in the file; the request-chain helpers above use them.
+static char            *ow_str_trim(char *s);
+static size_t           ow_url_escape(const char *in, char *out,
+                            size_t cap);
 
 static bool             ow_init(void);
 static void             ow_deinit(void);

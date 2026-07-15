@@ -1,11 +1,10 @@
 // botmanager — MIT
-// OpenWeather service plugin: OneCall 3.0 fetch + geocode cache.
+// OpenWeather service plugin: One Call 4.0 fetch + geocode cache.
 #define OW_INTERNAL
 #include "openweather.h"
 #include "util.h"
 
 #include <ctype.h>
-#include <errno.h>
 #include <pthread.h>
 #include <string.h>
 
@@ -233,39 +232,205 @@ ow_get_hilo(struct json_object *jtemp_obj, double *hi, double *lo)
       && json_get_double(jtemp_obj, "min", lo));
 }
 
+// Copy the alert-id URN strings from an "alerts" JSON array — One Call
+// 4.0 returns bare ids here, not fleshed-out objects — into the
+// request's enrichment worklist for later per-id resolution.
 static void
-ow_parse_alerts(struct json_object *root, openweather_alert_set_t *out)
+ow_collect_alert_ids(struct json_object *jalerts, ow_request_t *r)
 {
   int n;
   int i;
-  struct json_object *jalerts = json_get_array(root, "alerts");
 
-  out->count = 0;
+  r->alert_id_count = 0;
+  r->alert_idx      = 0;
 
-  if(jalerts == NULL)
+  if(jalerts == NULL || !json_object_is_type(jalerts, json_type_array))
     return;
 
   n = (int)json_object_array_length(jalerts);
 
-  for(i = 0; i < n && out->count < OPENWEATHER_ALERT_MAX; i++)
+  for(i = 0; i < n && r->alert_id_count < OPENWEATHER_ALERT_MAX; i++)
   {
-    struct json_object *alert = json_object_array_get_idx(jalerts, i);
-    openweather_alert_t *slot = &out->alerts[out->count];
+    struct json_object *e = json_object_array_get_idx(jalerts, i);
+    const char *s;
 
-    if(alert == NULL)
+    if(e == NULL)
       continue;
 
-    slot->event[0] = '\0';
+    s = json_object_get_string(e);
 
-    if(json_get_str(alert, "event", slot->event, sizeof(slot->event)))
-      out->count++;
+    if(s == NULL || s[0] == '\0')
+      continue;
+
+    snprintf(r->alert_ids[r->alert_id_count], OW_ALERT_ID_SZ, "%s", s);
+    r->alert_id_count++;
   }
 }
 
+// Distil one /alert/{id} document into a single human-facing label.
+// 4.0's `event` field is frequently empty (seen on air-quality and some
+// NWS advisories), so fall back to the first line of the English
+// description, then to the issuer name.
 static void
-ow_parse_current(ow_request_t *r, struct json_object *root,
-    openweather_current_result_t *out)
+ow_alert_label(struct json_object *root, char *out, size_t out_sz)
 {
+  char event[128];
+  char sender[96];
+  struct json_object *descs;
+
+  out[0]    = '\0';
+  event[0]  = '\0';
+  sender[0] = '\0';
+
+  json_get_str(root, "event",       event,  sizeof(event));
+  json_get_str(root, "sender_name", sender, sizeof(sender));
+
+  if(event[0] != '\0')
+  {
+    snprintf(out, out_sz, "%s", event);
+    return;
+  }
+
+  descs = json_get_array(root, "description");
+
+  if(descs != NULL && json_object_array_length(descs) > 0)
+  {
+    struct json_object *d0 = json_object_array_get_idx(descs, 0);
+    char text[OPENWEATHER_ALERT_SZ];
+    char *nl;
+
+    text[0] = '\0';
+    json_get_str(d0, "description", text, sizeof(text));
+
+    // Keep only the opening line — advisory bodies run many paragraphs.
+    nl = strpbrk(text, "\r\n");
+
+    if(nl != NULL)
+      *nl = '\0';
+
+    ow_str_trim(text);
+
+    if(text[0] != '\0')
+    {
+      snprintf(out, out_sz, "%s", text);
+      return;
+    }
+  }
+
+  if(sender[0] != '\0')
+    snprintf(out, out_sz, "%s advisory", sender);
+}
+
+// Synthesize an OpenWeather condition code + description from the
+// coverage fields the daily timeline *does* carry. 4.0's daily rows omit
+// the `weather` array entirely, so without this every day renders as
+// "unknown"; mapping cloud cover (and any precipitation) onto the
+// canonical id keeps the command-side icon/color tables working untouched.
+static void
+ow_synth_condition(int clouds, bool has_rain, bool has_snow,
+    int32_t *id_out, char *desc, size_t desc_sz)
+{
+  int32_t id;
+  const char *text;
+
+  if(has_snow)          { id = 601; text = "snow";             }
+  else if(has_rain)     { id = 501; text = "rain";             }
+  else if(clouds >= 85) { id = 804; text = "overcast clouds";  }
+  else if(clouds >= 51) { id = 803; text = "broken clouds";    }
+  else if(clouds >= 25) { id = 802; text = "scattered clouds"; }
+  else if(clouds >= 11) { id = 801; text = "few clouds";       }
+  else                  { id = 800; text = "clear sky";        }
+
+  *id_out = id;
+  snprintf(desc, desc_sz, "%s", text);
+}
+
+// Pull the OpenWeather "message" field out of an error body so the user
+// sees the API's own explanation (e.g. the One Call subscription notice)
+// instead of a guessed-at generic string. `fallback` may be NULL.
+static void
+ow_api_message(const curl_response_t *resp, char *out, size_t out_sz,
+    const char *fallback)
+{
+  struct json_object *root;
+  char msg[192];
+
+  if(fallback != NULL)
+    snprintf(out, out_sz, "%s", fallback);
+  else
+    out[0] = '\0';
+
+  if(resp->body == NULL || resp->body_len == 0)
+    return;
+
+  root = json_parse_buf(resp->body, resp->body_len, OW_CTX);
+
+  if(root == NULL)
+    return;
+
+  msg[0] = '\0';
+
+  if(json_get_str(root, "message", msg, sizeof(msg)) && msg[0] != '\0')
+    snprintf(out, out_sz, "Error: %s", msg);
+
+  json_object_put(root);
+}
+
+// Classify a completed transfer. Returns true when the body is a usable
+// 2xx payload; otherwise fills errbuf with a forward-ready message.
+static bool
+ow_http_ok(const curl_response_t *resp, char *errbuf, size_t sz)
+{
+  if(resp->curl_code != 0)
+  {
+    snprintf(errbuf, sz, "Weather API error: %s",
+        resp->error != NULL ? resp->error : "transport failure");
+    return(false);
+  }
+
+  if(resp->status == 401)
+  {
+    ow_api_message(resp, errbuf, sz,
+        "Error: OpenWeather rejected the request (HTTP 401) — check the "
+        "API key and that the One Call subscription is active");
+    return(false);
+  }
+
+  if(resp->status == 429)
+  {
+    snprintf(errbuf, sz, "Error: API rate limit exceeded, try again later");
+    return(false);
+  }
+
+  if(resp->status != 200)
+  {
+    ow_api_message(resp, errbuf, sz, NULL);
+
+    if(errbuf[0] == '\0')
+      snprintf(errbuf, sz, "Weather API returned HTTP %ld", resp->status);
+
+    return(false);
+  }
+
+  if(resp->body == NULL)
+  {
+    snprintf(errbuf, sz, "Error: empty response from weather API");
+    return(false);
+  }
+
+  return(true);
+}
+
+// Parse the One Call 4.0 /current document (the payload lives in
+// data[0]) into the request accumulator. Alert ids are lifted for later
+// enrichment; hi/lo is filled by a follow-up daily call. Returns false
+// when the response carries no usable current-conditions object.
+static bool
+ow_parse_current(ow_request_t *r, struct json_object *root)
+{
+  openweather_current_result_t *out = &r->acc.current;
+  struct json_object *data = json_get_array(root, "data");
+  struct json_object *d0;
   int64_t sunrise_ts = 0;
   int64_t sunset_ts = 0;
   double temp = 0.0;
@@ -273,44 +438,24 @@ ow_parse_current(ow_request_t *r, struct json_object *root,
   double wind = 0.0;
   double wind_d = 0.0;
   int32_t humidity = 0;
-  int32_t tz_offset;
-  double hi = 0.0;
-  double lo = 0.0;
-  bool have_hilo = false;
-  struct json_object *current = json_get_obj(root, "current");
-  struct json_object *jweather;
-  struct json_object *daily;
 
   memset(out, 0, sizeof(*out));
 
-  if(current == NULL)
-  {
-    snprintf(out->err, sizeof(out->err),
-        "Error: no current weather data in response");
-    return;
-  }
+  if(data == NULL || json_object_array_length(data) == 0)
+    return(false);
 
-  json_get_double(current, "temp",       &temp);
-  json_get_double(current, "feels_like", &feels);
-  json_get_int   (current, "humidity",   &humidity);
-  json_get_double(current, "wind_speed", &wind);
-  json_get_double(current, "wind_deg",   &wind_d);
-  json_get_int64 (current, "sunrise",    &sunrise_ts);
-  json_get_int64 (current, "sunset",     &sunset_ts);
+  d0 = json_object_array_get_idx(data, 0);
 
-  jweather = json_get_array(current, "weather");
-  tz_offset = ow_get_tz_offset(root);
+  if(d0 == NULL)
+    return(false);
 
-  // Try to extract today's hi/lo from daily[0].
-  daily = json_get_array(root, "daily");
-
-  if(daily != NULL && json_object_array_length(daily) > 0)
-  {
-    struct json_object *today = json_object_array_get_idx(daily, 0);
-    struct json_object *jtemp_obj = json_get_obj(today, "temp");
-
-    have_hilo = ow_get_hilo(jtemp_obj, &hi, &lo);
-  }
+  json_get_double(d0, "temp",       &temp);
+  json_get_double(d0, "feels_like", &feels);
+  json_get_int   (d0, "humidity",   &humidity);
+  json_get_double(d0, "wind_speed", &wind);
+  json_get_double(d0, "wind_deg",   &wind_d);
+  json_get_int64 (d0, "sunrise",    &sunrise_ts);
+  json_get_int64 (d0, "sunset",     &sunset_ts);
 
   out->current.temp       = temp;
   out->current.feels_like = feels;
@@ -319,12 +464,10 @@ ow_parse_current(ow_request_t *r, struct json_object *root,
   out->current.humidity   = humidity;
   out->current.sunrise    = (time_t)sunrise_ts;
   out->current.sunset     = (time_t)sunset_ts;
-  out->current.tz_offset  = tz_offset;
-  out->current.have_hilo  = have_hilo;
-  out->current.temp_hi    = hi;
-  out->current.temp_lo    = lo;
+  out->current.tz_offset  = ow_get_tz_offset(root);
+  out->current.have_hilo  = false;   // filled by ow_daily_hilo_done
 
-  ow_fill_desc(jweather, out->current.condition_desc,
+  ow_fill_desc(json_get_array(d0, "weather"), out->current.condition_desc,
       sizeof(out->current.condition_desc), &out->current.condition_id);
 
   snprintf(out->current.place_name, sizeof(out->current.place_name),
@@ -334,31 +477,31 @@ ow_parse_current(ow_request_t *r, struct json_object *root,
   snprintf(out->current.units, sizeof(out->current.units),
       "%s", r->units);
 
-  ow_parse_alerts(root, &out->alerts);
+  ow_collect_alert_ids(json_get_array(d0, "alerts"), r);
+
+  return(true);
 }
 
-static void
-ow_parse_forecast_daily(ow_request_t *r, struct json_object *root,
-    openweather_forecast_result_t *out)
+// Parse a One Call 4.0 daily timeline (…/timeline/1day) into the
+// accumulator. The rows carry temp.max/min but no `weather` array and no
+// `pop`, so the condition is synthesized from cloud cover + rain/snow
+// and precipitation probability is left unset. Returns false if no day
+// rows were produced.
+static bool
+ow_parse_daily(ow_request_t *r, struct json_object *root)
 {
+  openweather_forecast_result_t *out = &r->acc.forecast;
+  struct json_object *data = json_get_array(root, "data");
+  struct json_object *d0;
   int n;
   int i;
-  int32_t tz_offset;
-  struct json_object *daily = json_get_array(root, "daily");
 
   memset(out, 0, sizeof(*out));
 
-  if(daily == NULL)
-  {
-    snprintf(out->err, sizeof(out->err),
-        "Error: no daily forecast data in response");
-    return;
-  }
+  if(data == NULL)
+    return(false);
 
-  tz_offset = ow_get_tz_offset(root);
-  n = (int)json_object_array_length(daily);
-
-  out->forecast.tz_offset = tz_offset;
+  out->forecast.tz_offset = ow_get_tz_offset(root);
   snprintf(out->forecast.place_name, sizeof(out->forecast.place_name),
       "%s", r->location_name);
   snprintf(out->forecast.zipcode, sizeof(out->forecast.zipcode),
@@ -366,31 +509,38 @@ ow_parse_forecast_daily(ow_request_t *r, struct json_object *root,
   snprintf(out->forecast.units, sizeof(out->forecast.units),
       "%s", r->units);
 
+  n = (int)json_object_array_length(data);
+
   for(i = 0; i < n && out->forecast.day_count < OPENWEATHER_FCAST_DAYS; i++)
   {
     int64_t dt_ts = 0;
     double wind = 0.0;
     double wdir = 0.0;
-    double pop = 0.0;
+    double rain = 0.0;
+    double snow = 0.0;
     int32_t humid = 0;
+    int32_t clouds = 0;
     double hi = 0.0;
     double lo = 0.0;
+    bool has_rain;
+    bool has_snow;
     openweather_forecast_day_t *slot;
-    struct json_object *day = json_object_array_get_idx(daily, i);
+    struct json_object *day = json_object_array_get_idx(data, i);
     struct json_object *jtemp_obj;
-    struct json_object *jweather;
 
     if(day == NULL)
       continue;
 
     json_get_int64 (day, "dt",         &dt_ts);
     json_get_int   (day, "humidity",   &humid);
+    json_get_int   (day, "clouds",     &clouds);
     json_get_double(day, "wind_speed", &wind);
     json_get_double(day, "wind_deg",   &wdir);
-    json_get_double(day, "pop",        &pop);
 
-    jtemp_obj = json_get_obj  (day, "temp");
-    jweather  = json_get_array(day, "weather");
+    has_rain = json_get_double(day, "rain", &rain) && rain > 0.0;
+    has_snow = json_get_double(day, "snow", &snow) && snow > 0.0;
+
+    jtemp_obj = json_get_obj(day, "temp");
 
     if(!ow_get_hilo(jtemp_obj, &hi, &lo))
     {
@@ -405,46 +555,48 @@ ow_parse_forecast_daily(ow_request_t *r, struct json_object *root,
     slot->temp_lo    = lo;
     slot->wind_speed = wind;
     slot->wind_deg   = wdir;
-    slot->pop        = pop;
+    slot->pop        = 0.0;   // 4.0 daily carries rain (mm), not pop
     slot->humidity   = humid;
 
-    ow_fill_desc(jweather, slot->condition_desc,
-        sizeof(slot->condition_desc), &slot->condition_id);
+    ow_synth_condition((int)clouds, has_rain, has_snow,
+        &slot->condition_id, slot->condition_desc,
+        sizeof(slot->condition_desc));
 
     out->forecast.day_count++;
   }
 
-  ow_parse_alerts(root, &out->alerts);
+  d0 = (n > 0) ? json_object_array_get_idx(data, 0) : NULL;
+  ow_collect_alert_ids(d0 != NULL ? json_get_array(d0, "alerts") : NULL, r);
+
+  return(out->forecast.day_count > 0);
 }
 
-static void
-ow_parse_forecast_hourly(ow_request_t *r, struct json_object *root,
-    openweather_forecast_result_t *out)
+// Parse a One Call 4.0 hourly timeline (…/timeline/1h) into the
+// accumulator. Hourly rows keep the full `weather` array and `pop`, so
+// they map straight across. Returns false if no hour rows were produced.
+static bool
+ow_parse_hourly(ow_request_t *r, struct json_object *root)
 {
+  openweather_forecast_result_t *out = &r->acc.forecast;
+  struct json_object *data = json_get_array(root, "data");
+  struct json_object *d0;
   int n;
   int i;
-  int32_t tz_offset;
-  struct json_object *hourly = json_get_array(root, "hourly");
 
   memset(out, 0, sizeof(*out));
 
-  if(hourly == NULL)
-  {
-    snprintf(out->err, sizeof(out->err),
-        "Error: no hourly forecast data in response");
-    return;
-  }
+  if(data == NULL)
+    return(false);
 
-  tz_offset = ow_get_tz_offset(root);
-  n = (int)json_object_array_length(hourly);
-
-  out->forecast.tz_offset = tz_offset;
+  out->forecast.tz_offset = ow_get_tz_offset(root);
   snprintf(out->forecast.place_name, sizeof(out->forecast.place_name),
       "%s", r->location_name);
   snprintf(out->forecast.zipcode, sizeof(out->forecast.zipcode),
       "%s", r->zipcode);
   snprintf(out->forecast.units, sizeof(out->forecast.units),
       "%s", r->units);
+
+  n = (int)json_object_array_length(data);
 
   for(i = 0; i < n && out->forecast.hour_count < OPENWEATHER_FCAST_HOURS; i++)
   {
@@ -455,8 +607,7 @@ ow_parse_forecast_hourly(ow_request_t *r, struct json_object *root,
     double pop = 0.0;
     int32_t humid = 0;
     openweather_forecast_hour_t *slot;
-    struct json_object *hour = json_object_array_get_idx(hourly, i);
-    struct json_object *jweather;
+    struct json_object *hour = json_object_array_get_idx(data, i);
 
     if(hour == NULL)
       continue;
@@ -468,8 +619,6 @@ ow_parse_forecast_hourly(ow_request_t *r, struct json_object *root,
     json_get_double(hour, "wind_deg",   &wdir);
     json_get_double(hour, "pop",        &pop);
 
-    jweather = json_get_array(hour, "weather");
-
     slot = &out->forecast.hours[out->forecast.hour_count];
 
     slot->dt         = (time_t)dt_ts;
@@ -479,101 +628,66 @@ ow_parse_forecast_hourly(ow_request_t *r, struct json_object *root,
     slot->pop        = pop;
     slot->humidity   = humid;
 
-    ow_fill_desc(jweather, slot->condition_desc,
+    ow_fill_desc(json_get_array(hour, "weather"), slot->condition_desc,
         sizeof(slot->condition_desc), &slot->condition_id);
 
     out->forecast.hour_count++;
   }
 
-  ow_parse_alerts(root, &out->alerts);
+  d0 = (n > 0) ? json_object_array_get_idx(data, 0) : NULL;
+  ow_collect_alert_ids(d0 != NULL ? json_get_array(d0, "alerts") : NULL, r);
+
+  return(out->forecast.hour_count > 0);
 }
 
-// OneCall submit + completion
+// One Call 4.0 request chain
+//
+// A command fans out into a short, strictly-sequential chain of GETs:
+// the primary datatype first, then one call per active alert to resolve
+// its label, and finally delivery. Exactly one transfer is ever
+// outstanding per request, so the accumulator in ow_request_t needs no
+// locking — each callback either schedules the next leg or delivers.
 
 static void
-ow_submit_onecall(ow_request_t *r)
+ow_submit_primary(ow_request_t *r)
 {
-  char url[OW_URL_SZ];
-  const char *exclude = "minutely,hourly";
-
   switch(r->type)
   {
-    case OW_REQ_WEATHER:          exclude = "minutely,hourly";         break;
-    case OW_REQ_FORECAST_DAILY:   exclude = "minutely,hourly,current"; break;
-    case OW_REQ_FORECAST_HOURLY:  exclude = "minutely,daily,current";  break;
+    case OW_REQ_WEATHER:          ow_submit_current(r); break;
+    case OW_REQ_FORECAST_DAILY:   ow_submit_daily(r);   break;
+    case OW_REQ_FORECAST_HOURLY:  ow_submit_hourly(r);  break;
   }
+}
+
+// Leg 1a: current conditions.
+
+static void
+ow_submit_current(ow_request_t *r)
+{
+  char url[OW_URL_SZ];
 
   snprintf(url, sizeof(url),
-      "%s?lat=%.6f&lon=%.6f&exclude=%s&units=%s&appid=%s",
-      OW_ONECALL_URL, r->lat, r->lon, exclude,
-      r->units, r->apikey);
+      "%s?lat=%.6f&lon=%.6f&units=%s&appid=%s",
+      OW_ONECALL_CURRENT_URL, r->lat, r->lon, r->units, r->apikey);
 
-  if(curl_get(url, ow_onecall_done, r) != SUCCESS)
+  if(curl_get(url, ow_current_done, r) != SUCCESS)
   {
-    if(r->type == OW_REQ_WEATHER)
-      ow_deliver_current_err(r, "Error: failed to submit weather request");
-    else
-      ow_deliver_forecast_err(r, "Error: failed to submit weather request");
-
+    ow_deliver_current_err(r, "Error: failed to submit weather request");
     ow_req_release(r);
   }
 }
 
 static void
-ow_onecall_done(const curl_response_t *resp)
+ow_current_done(const curl_response_t *resp)
 {
-  struct json_object *root;
-  char errbuf[128];
   ow_request_t *r = (ow_request_t *)resp->user_data;
-  bool is_current = (r->type == OW_REQ_WEATHER);
+  struct json_object *root;
+  char errbuf[192];
+  bool ok;
 
-  if(resp->curl_code != 0)
+  if(!ow_http_ok(resp, errbuf, sizeof(errbuf)))
   {
-    snprintf(errbuf, sizeof(errbuf), "Weather API error: %s", resp->error);
-
-    if(is_current)
-      ow_deliver_current_err(r, errbuf);
-    else
-      ow_deliver_forecast_err(r, errbuf);
-
-    ow_req_release(r);
-    return;
-  }
-
-  if(resp->status == 401)
-  {
-    if(is_current)
-      ow_deliver_current_err(r, "Error: invalid API key");
-    else
-      ow_deliver_forecast_err(r, "Error: invalid API key");
-
-    ow_req_release(r);
-    return;
-  }
-
-  if(resp->status == 429)
-  {
-    if(is_current)
-      ow_deliver_current_err(r,
-          "Error: API rate limit exceeded, try again later");
-    else
-      ow_deliver_forecast_err(r,
-          "Error: API rate limit exceeded, try again later");
-
-    ow_req_release(r);
-    return;
-  }
-
-  if(resp->status != 200)
-  {
-    snprintf(errbuf, sizeof(errbuf),
-        "Weather API returned HTTP %ld", resp->status);
-
-    if(is_current)
-      ow_deliver_current_err(r, errbuf);
-    else
-      ow_deliver_forecast_err(r, errbuf);
-
+    ow_deliver_current_err(r, errbuf);
     ow_req_release(r);
     return;
   }
@@ -582,52 +696,233 @@ ow_onecall_done(const curl_response_t *resp)
 
   if(root == NULL)
   {
-    if(is_current)
-      ow_deliver_current_err(r, "Error: malformed JSON from weather API");
-    else
-      ow_deliver_forecast_err(r, "Error: malformed JSON from weather API");
-
+    ow_deliver_current_err(r, "Error: malformed JSON from weather API");
     ow_req_release(r);
     return;
   }
 
-  switch(r->type)
+  ok = ow_parse_current(r, root);
+  json_object_put(root);
+
+  if(!ok)
   {
-    case OW_REQ_WEATHER:
+    ow_deliver_current_err(r, "Error: no current weather data in response");
+    ow_req_release(r);
+    return;
+  }
+
+  // Enrich: resolve any active alerts, then deliver. The current view
+  // deliberately does not chain a daily call for hi/lo — 4.0's daily
+  // timeline is cursor-paginated and returns inconsistent (often empty)
+  // results for the current day, which would make hi/lo flicker between
+  // identical queries and add unpredictable latency to /weather. Hi/lo
+  // stays available through /forecast, which needs the daily feed anyway.
+  ow_start_alert_enrich(r);
+}
+
+// Leg 1 (forecast): daily timeline.
+
+static void
+ow_submit_daily(ow_request_t *r)
+{
+  char url[OW_URL_SZ];
+
+  snprintf(url, sizeof(url),
+      "%s/1day?lat=%.6f&lon=%.6f&cnt=%d&units=%s&appid=%s",
+      OW_ONECALL_TIMELINE_URL, r->lat, r->lon,
+      OW_FCAST_DAILY_CNT, r->units, r->apikey);
+
+  if(curl_get(url, ow_daily_done, r) != SUCCESS)
+  {
+    ow_deliver_forecast_err(r, "Error: failed to submit forecast request");
+    ow_req_release(r);
+  }
+}
+
+static void
+ow_daily_done(const curl_response_t *resp)
+{
+  ow_request_t *r = (ow_request_t *)resp->user_data;
+  struct json_object *root;
+  char errbuf[192];
+  bool ok;
+
+  if(!ow_http_ok(resp, errbuf, sizeof(errbuf)))
+  {
+    ow_deliver_forecast_err(r, errbuf);
+    ow_req_release(r);
+    return;
+  }
+
+  root = json_parse_buf(resp->body, resp->body_len, OW_CTX);
+
+  if(root == NULL)
+  {
+    ow_deliver_forecast_err(r, "Error: malformed JSON from weather API");
+    ow_req_release(r);
+    return;
+  }
+
+  ok = ow_parse_daily(r, root);
+  json_object_put(root);
+
+  if(!ok)
+  {
+    // 4.0's daily timeline periodically answers 200 with an empty data
+    // array (its aggregation lags the current/hourly feeds). Steer the
+    // user to the hourly view rather than surfacing a bare error.
+    ow_deliver_forecast_err(r,
+        "Daily forecast is momentarily unavailable upstream. "
+        "Try the hourly view: forecast -h <zipcode>");
+    ow_req_release(r);
+    return;
+  }
+
+  ow_start_alert_enrich(r);
+}
+
+// Leg 1 (forecast): hourly timeline.
+
+static void
+ow_submit_hourly(ow_request_t *r)
+{
+  char url[OW_URL_SZ];
+
+  snprintf(url, sizeof(url),
+      "%s/1h?lat=%.6f&lon=%.6f&cnt=%d&units=%s&appid=%s",
+      OW_ONECALL_TIMELINE_URL, r->lat, r->lon,
+      OW_FCAST_HOURLY_CNT, r->units, r->apikey);
+
+  if(curl_get(url, ow_hourly_done, r) != SUCCESS)
+  {
+    ow_deliver_forecast_err(r, "Error: failed to submit forecast request");
+    ow_req_release(r);
+  }
+}
+
+static void
+ow_hourly_done(const curl_response_t *resp)
+{
+  ow_request_t *r = (ow_request_t *)resp->user_data;
+  struct json_object *root;
+  char errbuf[192];
+  bool ok;
+
+  if(!ow_http_ok(resp, errbuf, sizeof(errbuf)))
+  {
+    ow_deliver_forecast_err(r, errbuf);
+    ow_req_release(r);
+    return;
+  }
+
+  root = json_parse_buf(resp->body, resp->body_len, OW_CTX);
+
+  if(root == NULL)
+  {
+    ow_deliver_forecast_err(r, "Error: malformed JSON from weather API");
+    ow_req_release(r);
+    return;
+  }
+
+  ok = ow_parse_hourly(r, root);
+  json_object_put(root);
+
+  if(!ok)
+  {
+    ow_deliver_forecast_err(r, "Error: no hourly forecast data in response");
+    ow_req_release(r);
+    return;
+  }
+
+  ow_start_alert_enrich(r);
+}
+
+// Leg 2: resolve each active alert id to a human label, one GET at a
+// time. Also best-effort: a failed lookup is skipped, never fatal.
+
+static void
+ow_start_alert_enrich(ow_request_t *r)
+{
+  r->alert_idx = 0;
+  ow_submit_next_alert(r);
+}
+
+static void
+ow_submit_next_alert(ow_request_t *r)
+{
+  char url[OW_ALERT_URL_SZ];
+  char enc[OW_ALERT_ID_SZ * 3 + 1];
+
+  if(r->alert_idx >= r->alert_id_count)
+  {
+    ow_deliver_final(r);
+    return;
+  }
+
+  ow_url_escape(r->alert_ids[r->alert_idx], enc, sizeof(enc));
+
+  snprintf(url, sizeof(url), "%s/%s?appid=%s",
+      OW_ONECALL_ALERT_URL, enc, r->apikey);
+
+  if(curl_get(url, ow_alert_done, r) != SUCCESS)
+  {
+    // Skip this id and continue; recursion depth is bounded by
+    // OPENWEATHER_ALERT_MAX.
+    r->alert_idx++;
+    ow_submit_next_alert(r);
+  }
+}
+
+static void
+ow_alert_done(const curl_response_t *resp)
+{
+  ow_request_t *r = (ow_request_t *)resp->user_data;
+  openweather_alert_set_t *set = (r->type == OW_REQ_WEATHER)
+      ? &r->acc.current.alerts
+      : &r->acc.forecast.alerts;
+
+  if(resp->curl_code == 0 && resp->status == 200 && resp->body != NULL)
+  {
+    struct json_object *root = json_parse_buf(resp->body, resp->body_len,
+        OW_CTX);
+
+    if(root != NULL)
     {
-      openweather_current_result_t res;
+      char label[OPENWEATHER_ALERT_SZ];
 
-      ow_parse_current(r, root, &res);
+      ow_alert_label(root, label, sizeof(label));
 
-      if(r->cb.current != NULL)
-        r->cb.current(&res, r->user);
-      break;
-    }
+      if(label[0] != '\0' && set->count < OPENWEATHER_ALERT_MAX)
+      {
+        snprintf(set->alerts[set->count].event,
+            sizeof(set->alerts[set->count].event), "%s", label);
+        set->count++;
+      }
 
-    case OW_REQ_FORECAST_DAILY:
-    {
-      openweather_forecast_result_t res;
-
-      ow_parse_forecast_daily(r, root, &res);
-
-      if(r->cb.forecast != NULL)
-        r->cb.forecast(&res, r->user);
-      break;
-    }
-
-    case OW_REQ_FORECAST_HOURLY:
-    {
-      openweather_forecast_result_t res;
-
-      ow_parse_forecast_hourly(r, root, &res);
-
-      if(r->cb.forecast != NULL)
-        r->cb.forecast(&res, r->user);
-      break;
+      json_object_put(root);
     }
   }
 
-  json_object_put(root);
+  r->alert_idx++;
+  ow_submit_next_alert(r);
+}
+
+// Leg 3: hand the fully-assembled accumulator to the caller's callback.
+
+static void
+ow_deliver_final(ow_request_t *r)
+{
+  if(r->type == OW_REQ_WEATHER)
+  {
+    if(r->cb.current != NULL)
+      r->cb.current(&r->acc.current, r->user);
+  }
+  else
+  {
+    if(r->cb.forecast != NULL)
+      r->cb.forecast(&r->acc.forecast, r->user);
+  }
+
   ow_req_release(r);
 }
 
@@ -735,7 +1030,7 @@ ow_geocode_done(const curl_response_t *resp)
   clam(CLAM_DEBUG2, OW_CTX, "geocode %s -> %s (%.4f, %.4f) [cached]",
       r->zipcode, r->location_name, r->lat, r->lon);
 
-  ow_submit_onecall(r);
+  ow_submit_primary(r);
 }
 
 // Populate a freshly-allocated request with api key / units / cached
@@ -859,7 +1154,7 @@ openweather_fetch_current(const char *zipcode,
 
   if(pr == OW_PREP_CACHE_HIT)
   {
-    ow_submit_onecall(r);
+    ow_submit_primary(r);
     return(SUCCESS);
   }
 
@@ -900,7 +1195,7 @@ ow_fetch_forecast_common(ow_req_type_t type, const char *zipcode,
 
   if(pr == OW_PREP_CACHE_HIT)
   {
-    ow_submit_onecall(r);
+    ow_submit_primary(r);
     return(SUCCESS);
   }
 
@@ -1780,7 +2075,7 @@ ow_deinit(void)
 const plugin_desc_t bm_plugin_desc = {
   .api_version     = PLUGIN_API_VERSION,
   .name            = "openweather",
-  .version         = "2.0",
+  .version         = "4.0",
   .type            = PLUGIN_SERVICE,
   .kind            = "openweather",
   .provides        = { { .name = "service_openweather" } },

@@ -95,7 +95,9 @@ typedef struct
 
 typedef struct
 {
-  char  event[OPENWEATHER_NAME_SZ];
+  // One Call 4.0 alert bodies fill this from `event` when present, else
+  // from the first line of the advisory text — hence the wider buffer.
+  char  event[OPENWEATHER_ALERT_SZ];
 } openweather_alert_t;
 
 typedef struct
