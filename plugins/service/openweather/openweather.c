@@ -773,7 +773,7 @@ ow_daily_done(const curl_response_t *resp)
     // user to the hourly view rather than surfacing a bare error.
     ow_deliver_forecast_err(r,
         "Daily forecast is momentarily unavailable upstream. "
-        "Try the hourly view: forecast -h <zipcode>");
+        "Try the hourly view: weather -h <zipcode>");
     ow_req_release(r);
     return;
   }

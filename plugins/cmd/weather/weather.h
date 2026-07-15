@@ -19,6 +19,11 @@
 #define WEATHER_CTX       "weather"
 #define WEATHER_REPLY_SZ  640
 
+// One rendered hourly cell (colour codes + one emoji + fixed-width raw
+// fields). Two of these are joined into a single ≤100-column reply line
+// by the double-column hourly formatter.
+#define WEATHER_CELL_SZ   256
+
 typedef enum
 {
   WEATHER_REQ_CURRENT,
@@ -47,7 +52,6 @@ static const cmd_arg_desc_t weather_ad_weather[] = {
 };
 
 static void             weather_cmd_weather(const cmd_ctx_t *ctx);
-static void             weather_cmd_forecast(const cmd_ctx_t *ctx);
 
 static bool             weather_init(void);
 static void             weather_deinit(void);

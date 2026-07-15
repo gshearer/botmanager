@@ -3,7 +3,6 @@
 #define WEATHER_INTERNAL
 #include "weather.h"
 
-#include <ctype.h>
 #include <pthread.h>
 #include <stdio.h>
 #include <string.h>
@@ -118,6 +117,23 @@ weather_fmt_temp(char *buf, size_t sz, double temp, const char *units)
         clr, temp, CLR_RESET));
 
   return(snprintf(buf, sz, "%.0f", temp));
+}
+
+// As weather_fmt_temp, but right-justifies the numeric part to a fixed
+// visible width so temperatures line up as a column. The padding lands
+// *inside* the colour run (leading spaces, never a digit), which also
+// sidesteps the \003NN digit-eating hazard the bold toggle guards.
+static int
+weather_fmt_temp_w(char *buf, size_t sz, double temp, const char *units,
+    int width)
+{
+  const char *clr = weather_temp_color(weather_to_fahrenheit(temp, units));
+
+  if(*clr != '\0')
+    return(snprintf(buf, sz, "%s" CLR_BOLD CLR_BOLD "%*.0f%s",
+        clr, width, temp, CLR_RESET));
+
+  return(snprintf(buf, sz, "%*.0f", width, temp));
 }
 
 // Map a weather condition ID to a Unicode weather emoji (UTF-8). Must
@@ -417,77 +433,92 @@ weather_reply_forecast_daily(const cmd_ctx_t *ctx,
   weather_reply_alerts(ctx, alerts);
 }
 
+// Render one hour into a fixed-visible-width cell for the two-column
+// hourly view. Every field is padded on its *raw* text (colour codes
+// wrap already-padded content), so a cell's on-screen width is constant
+// and the second column lands at a predictable position. The layout is
+//
+//   {icon} {Day} {time}  {temp}°{u}  {condition:16}  {pop}%
+//
+// which measures ~42 display columns; two cells plus a two-space gutter
+// stay under the 100-column budget with room to spare.
+static void
+weather_hour_cell(char *buf, size_t sz, const openweather_forecast_hour_t *h,
+    const char *units, const char *tu, int tz_offset)
+{
+  const char *icon = weather_condition_icon(h->condition_id);
+  const char *dclr = weather_condition_color(h->condition_id);
+  const char *day_name = "???";
+  char temp[40];
+  char desc_pad[24];
+  char time_str[8];
+  int pop = (int)(h->pop * 100);
+
+  time_str[0] = time_str[1] = '?';
+  time_str[2] = '\0';
+
+  if(h->dt > 0)
+  {
+    int hour12;
+    time_t dt = h->dt + tz_offset;
+    struct tm tm;
+
+    gmtime_r(&dt, &tm);
+    day_name = weather_day_names_abbr[tm.tm_wday];
+
+    hour12 = tm.tm_hour % 12;
+
+    if(hour12 == 0)
+      hour12 = 12;
+
+    snprintf(time_str, sizeof(time_str), "%d%s",
+        hour12, tm.tm_hour < 12 ? "am" : "pm");
+  }
+
+  weather_fmt_temp_w(temp, sizeof(temp), h->temp, units, 3);
+  weather_fmt_desc_pad(desc_pad, sizeof(desc_pad), h->condition_desc, 16);
+
+  snprintf(buf, sz,
+      "%s %-3s %4s  %s\xc2\xb0%s  %s%s" CLR_RESET "  %3d%%",
+      icon, day_name, time_str, temp, tu, dclr, desc_pad, pop);
+}
+
+// Double-column hourly forecast: 24 hours collapse into 12 reply lines,
+// two cells each, so IRC clients aren't flooded. Hourly deliberately
+// drops wind/humidity (kept in the daily view) to stay within a sane
+// line width; the essentials — time, temperature, sky, precip odds —
+// remain.
 static void
 weather_reply_forecast_hourly(const cmd_ctx_t *ctx,
     const openweather_forecast_t *f,
     const openweather_alert_set_t *alerts)
 {
   const char *tu = weather_temp_unit(f->units);
-  const char *su = weather_speed_unit(f->units);
+  char cells[24][WEATHER_CELL_SZ];
+  uint8_t n;
   uint8_t i;
-  int prev_wday = -1;
 
   weather_reply_header(ctx, f->place_name, f->zipcode, "24-hour forecast");
 
-  for(i = 0; i < f->hour_count && i < 24; i++)
+  n = (f->hour_count < 24) ? f->hour_count : 24;
+
+  for(i = 0; i < n; i++)
+    weather_hour_cell(cells[i], sizeof(cells[i]), &f->hours[i],
+        f->units, tu, f->tz_offset);
+
+  for(i = 0; i < n; i += 2)
   {
-    const openweather_forecast_hour_t *h = &f->hours[i];
-    const char *day_name = "???";
-    const char *icon;
-    const char *dclr;
-    char ct[32];
-    char desc_pad[24];
-    char precip[24];
-    char time_str[8];
     char buf[WEATHER_REPLY_SZ];
-    int pop = (int)(h->pop * 100);
 
-    time_str[0] = time_str[1] = '?';
-    time_str[2] = '\0';
-
-    if(h->dt > 0)
-    {
-      int hour12;
-      time_t dt = h->dt + f->tz_offset;
-      struct tm tm;
-
-      gmtime_r(&dt, &tm);
-      day_name = weather_day_names_abbr[tm.tm_wday];
-
-      hour12 = tm.tm_hour % 12;
-
-      if(hour12 == 0)
-        hour12 = 12;
-
-      snprintf(time_str, sizeof(time_str), "%2d%s",
-          hour12, tm.tm_hour < 12 ? "am" : "pm");
-
-      // Insert a blank line at day boundary.
-      if(prev_wday >= 0 && tm.tm_wday != prev_wday)
-        cmd_reply(ctx, " ");
-
-      prev_wday = tm.tm_wday;
-    }
-
-    icon = weather_condition_icon(h->condition_id);
-    dclr = weather_condition_color(h->condition_id);
-
-    weather_fmt_temp(ct, sizeof(ct), h->temp, f->units);
-    weather_fmt_desc_pad(desc_pad, sizeof(desc_pad),
-        h->condition_desc, 20);
-    weather_fmt_precip(precip, sizeof(precip), pop);
-
-    snprintf(buf, sizeof(buf),
-        "%s %s %s  %s\xc2\xb0%s"
-        "  %s%s" CLR_RESET
-        "  %2d%%"
-        "  %2.0f%s %-3s"
-        "%s",
-        icon, day_name, time_str, ct, tu,
-        dclr, desc_pad,
-        h->humidity,
-        h->wind_speed, su, weather_wind_dir(h->wind_deg),
-        precip);
+    // Precision bounds each cell to its buffer so the compiler can see
+    // the join stays well within WEATHER_REPLY_SZ (the runtime-indexed
+    // cells[i] otherwise reads as reaching the end of the 2-D array).
+    if((uint8_t)(i + 1) < n)
+      snprintf(buf, sizeof(buf), "%.*s  %.*s",
+          WEATHER_CELL_SZ - 1, cells[i],
+          WEATHER_CELL_SZ - 1, cells[i + 1]);
+    else
+      snprintf(buf, sizeof(buf), "%.*s", WEATHER_CELL_SZ - 1, cells[i]);
 
     cmd_reply(ctx, buf);
   }
@@ -561,15 +592,22 @@ weather_req_new(const cmd_ctx_t *ctx, weather_req_kind_t kind)
 
 // Command callbacks
 
-// /weather — accepts either a US-style zipcode or a city name. A
-// city-name path synchronously geocodes city → zip and then reuses
-// the zipcode path. Runs on a task-worker thread.
+// /weather [-h | -d] <zipcode | city> — the single entry point for
+// every weather view:
+//   (no flag)  current conditions
+//   -h         24-hour forecast (two-column)
+//   -d         7-day forecast
+// A city-name location is synchronously geocoded to a zipcode and then
+// reuses the zipcode path, so all three views accept either form. Runs
+// on a task-worker thread.
 static void
 weather_cmd_weather(const cmd_ctx_t *ctx)
 {
   const char *input;
   char zip[OPENWEATHER_ZIPCODE_SZ];
+  weather_req_kind_t kind = WEATHER_REQ_CURRENT;
   bool has_digit;
+  bool submitted;
   weather_req_t *r;
   size_t i;
 
@@ -578,9 +616,26 @@ weather_cmd_weather(const cmd_ctx_t *ctx)
   else
     input = ctx->args;
 
+  // Optional leading mode flag: -h hourly, -d daily. Anything else is
+  // taken verbatim as the location.
+  if(input != NULL && input[0] == '-'
+      && (input[1] == 'h' || input[1] == 'd')
+      && (input[2] == ' ' || input[2] == '\0'))
+  {
+    kind = (input[1] == 'h') ? WEATHER_REQ_FORECAST_HOURLY
+                             : WEATHER_REQ_FORECAST_DAILY;
+    input += 2;
+
+    while(*input == ' ')
+      input++;
+
+    if(*input == '\0')
+      input = NULL;
+  }
+
   if(input == NULL || input[0] == '\0')
   {
-    cmd_reply(ctx, "Usage: weather <zipcode | city>");
+    cmd_reply(ctx, "Usage: weather [-h | -d] <zipcode | city>");
     return;
   }
 
@@ -611,62 +666,32 @@ weather_cmd_weather(const cmd_ctx_t *ctx)
     return;
   }
 
-  r = weather_req_new(ctx, WEATHER_REQ_CURRENT);
-
-  if(openweather_fetch_current(zip, weather_done_current, r) != SUCCESS)
-  {
-    cmd_reply(ctx,
-        "Error: failed to submit weather request. "
-        "Check plugin.openweather.apikey.");
-    mem_free(r);
-  }
-}
-
-// /forecast [-h] <zipcode>
-static void
-weather_cmd_forecast(const cmd_ctx_t *ctx)
-{
-  weather_req_t *r;
-  weather_req_kind_t kind = WEATHER_REQ_FORECAST_DAILY;
-  const char *args = ctx->args;
-  const char *zipcode;
-  bool submitted;
-
-  if(args != NULL && strncmp(args, "-h", 2) == 0
-      && (args[2] == ' ' || args[2] == '\0'))
-  {
-    kind = WEATHER_REQ_FORECAST_HOURLY;
-    args = args + 2;
-
-    while(*args == ' ')
-      args++;
-
-    if(*args == '\0')
-      args = NULL;
-  }
-
-  if(args == NULL || args[0] == '\0')
-  {
-    cmd_reply(ctx, "Usage: forecast [-h] <zipcode>");
-    return;
-  }
-
-  zipcode = args;
-
   r = weather_req_new(ctx, kind);
 
-  if(kind == WEATHER_REQ_FORECAST_HOURLY)
-    submitted = (openweather_fetch_forecast_hourly(zipcode,
-        weather_done_forecast, r) == SUCCESS);
-  else
-    submitted = (openweather_fetch_forecast_daily(zipcode,
-        weather_done_forecast, r) == SUCCESS);
+  switch(kind)
+  {
+    case WEATHER_REQ_FORECAST_HOURLY:
+      submitted = (openweather_fetch_forecast_hourly(zip,
+          weather_done_forecast, r) == SUCCESS);
+      break;
+
+    case WEATHER_REQ_FORECAST_DAILY:
+      submitted = (openweather_fetch_forecast_daily(zip,
+          weather_done_forecast, r) == SUCCESS);
+      break;
+
+    case WEATHER_REQ_CURRENT:
+    default:
+      submitted = (openweather_fetch_current(zip,
+          weather_done_current, r) == SUCCESS);
+      break;
+  }
 
   if(!submitted)
   {
     cmd_reply(ctx,
-        "Error: failed to submit forecast request. "
-        "Check the zipcode and plugin.openweather.apikey.");
+        "Error: failed to submit weather request. "
+        "Check plugin.openweather.apikey.");
     mem_free(r);
   }
 }
@@ -684,13 +709,15 @@ static const cmd_nl_example_t weather_weather_examples[] = {
     .invocation = "/weather" },
   { .utterance  = "tell me the weather in 45069",
     .invocation = "/weather 45069" },
-  { .utterance  = "will it rain in Cincinnati tomorrow?",
-    .invocation = "/weather Cincinnati" },
+  { .utterance  = "hourly forecast for Cincinnati",
+    .invocation = "/weather -h Cincinnati" },
+  { .utterance  = "what's the 7-day forecast for 90210?",
+    .invocation = "/weather -d 90210" },
 };
 
 static const cmd_nl_t weather_weather_nl = {
   .when          = "User asks about current or forecast weather.",
-  .syntax        = "/weather <zipcode | city>",
+  .syntax        = "/weather [-h | -d] <zipcode | city>",
   .slots         = weather_weather_slots,
   .slot_count    = (uint8_t)(sizeof(weather_weather_slots)
                              / sizeof(weather_weather_slots[0])),
@@ -705,45 +732,29 @@ static bool
 weather_init(void)
 {
   if(cmd_register(WEATHER_CTX, "weather",
-      "weather <zipcode | city>",
-      "Show current weather for a US zipcode or city name",
-      "Queries the OpenWeather One Call 4.0 API for current\n"
-      "conditions at the given location. Accepts either a US\n"
+      "weather [-h | -d] <zipcode | city>",
+      "Show weather for a US zipcode or city (current / hourly / daily)",
+      "Queries the OpenWeather One Call 4.0 API. Accepts either a US\n"
       "zipcode or a city name (geocoded via OpenWeather's\n"
-      "direct-geocoding endpoint). Displays temperature, humidity,\n"
-      "wind, sunrise/sunset, and any active alerts.\n"
+      "direct-geocoding endpoint).\n"
+      "\n"
+      "  !weather <location>       current conditions\n"
+      "  !weather -h <location>    24-hour forecast (two-column)\n"
+      "  !weather -d <location>    7-day forecast\n"
+      "\n"
+      "Current conditions show temperature, humidity, wind,\n"
+      "sunrise/sunset, and any active alerts.\n"
       "\n"
       "Requires plugin.openweather.apikey to be set.\n"
       "Units controlled by plugin.openweather.units (imperial/metric).\n"
       "\n"
       "Example: !weather 90210\n"
-      "         !weather Cincinnati",
+      "         !weather -h Cincinnati\n"
+      "         !weather -d 10001",
       "everyone", 0, CMD_SCOPE_ANY, METHOD_T_ANY,
       weather_cmd_weather, NULL, NULL, "w",
       weather_ad_weather, 1, NULL, &weather_weather_nl) != SUCCESS)
     return(FAIL);
-
-  if(cmd_register(WEATHER_CTX, "forecast",
-      "forecast [-h] <zipcode>",
-      "Show forecast for a US zipcode (daily or hourly with -h)",
-      "Queries the OpenWeather One Call 4.0 API for the forecast\n"
-      "at the given zipcode.\n"
-      "\n"
-      "  !forecast <zipcode>      7-day daily forecast\n"
-      "  !forecast -h <zipcode>   24-hour hourly forecast\n"
-      "\n"
-      "Requires plugin.openweather.apikey to be set.\n"
-      "Units controlled by plugin.openweather.units (imperial/metric).\n"
-      "\n"
-      "Example: !forecast 10001\n"
-      "         !forecast -h 90210",
-      "everyone", 0, CMD_SCOPE_ANY, METHOD_T_ANY,
-      weather_cmd_forecast, NULL, NULL, "f",
-      NULL, 0, NULL, NULL) != SUCCESS)
-  {
-    cmd_unregister("weather");
-    return(FAIL);
-  }
 
   clam(CLAM_INFO, WEATHER_CTX, "weather command plugin initialized");
 
@@ -753,7 +764,6 @@ weather_init(void)
 static void
 weather_deinit(void)
 {
-  cmd_unregister("forecast");
   cmd_unregister("weather");
 
   clam(CLAM_INFO, WEATHER_CTX, "weather command plugin deinitialized");
