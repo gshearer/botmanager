@@ -424,9 +424,9 @@ main(int argc, char *argv[])
 
   bot_restore();
 
-  // Claim any remaining DB entries not picked up by schema registration
-  // (e.g., per-channel IRC config, dynamically added keys).
-  kv_claim_pending();
+  // Materialize DB rows with no schema registration (per-channel IRC
+  // config, dynamically added keys) into live, queryable entries.
+  kv_claim_orphans();
 
   // Botmanctl method registration — Unix domain socket for programmatic
   // operator control. Must be after method_init and cmd_init.

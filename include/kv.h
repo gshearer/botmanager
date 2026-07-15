@@ -154,11 +154,10 @@ void kv_iterate_nl(kv_nl_iter_cb_t cb, void *data);
 
 bool kv_load(void);
 
-// Register all remaining pending DB entries that were not claimed by
-// explicit kv_register() calls. Call after bot restore to pick up
-// dynamic keys (e.g., per-channel IRC configuration). Returns the
-// number of entries claimed.
-uint32_t kv_claim_pending(void);
+// Materialize persisted DB rows that no live entry claims — dynamic keys
+// with no static schema (e.g. per-channel IRC configuration). Call after
+// bot restore. Returns the number of entries materialized.
+uint32_t kv_claim_orphans(void);
 
 bool kv_flush(void);
 
@@ -214,19 +213,7 @@ static kv_entry_t      *kv_table[KV_BUCKETS];
 static pthread_mutex_t   kv_mutex;
 static uint32_t          kv_count = 0;
 static bool              kv_ready = false;
-
-// Rows loaded by kv_load() before their key was registered. Consumed
-// by kv_register() when a matching key appears.
-typedef struct kv_pending
-{
-  char               key[KV_KEY_SZ];
-  int                type;
-  char               val_str[KV_STR_SZ];
-  struct kv_pending  *next;
-} kv_pending_t;
-
-static kv_pending_t *kv_pending_list  = NULL;
-static uint32_t      kv_pending_count = 0;
+static bool              kv_loaded = false;  // true once kv_load() completes
 
 #endif // KV_INTERNAL
 

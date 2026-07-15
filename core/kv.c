@@ -321,6 +321,47 @@ kv_type_name(kv_type_t type)
   }
 }
 
+// Fetch one persisted row by exact key. Caller must NOT hold kv_mutex
+// (this does DB I/O). On a hit, writes the raw type id to *out_type and
+// copies the value string into out_val[out_sz]. Returns true iff a row
+// exists and both columns are non-NULL.
+static bool
+kv_db_lookup_one(const char *key, int *out_type, char *out_val, size_t out_sz)
+{
+  char        *esc;
+  char         sql[256 + KV_KEY_SZ];
+  db_result_t *r;
+  bool         hit = false;
+
+  esc = db_escape(key);
+
+  if(esc == NULL)
+    return(false);
+
+  snprintf(sql, sizeof(sql),
+      "SELECT type, value FROM kv WHERE key = '%s'", esc);
+  mem_free(esc);
+
+  r = db_result_alloc();
+
+  if(db_query(sql, r) == SUCCESS && r->rows > 0)
+  {
+    const char *db_type = db_result_get(r, 0, 0);
+    const char *db_val  = db_result_get(r, 0, 1);
+
+    if(db_type != NULL && db_val != NULL)
+    {
+      *out_type = atoi(db_type);
+      strncpy(out_val, db_val, out_sz - 1);
+      out_val[out_sz - 1] = '\0';
+      hit = true;
+    }
+  }
+
+  db_result_free(r);
+  return(hit);
+}
+
 bool
 kv_register(const char *key, kv_type_t type, const char *default_val,
     kv_cb_t cb, void *cb_data, const char *help)
@@ -328,7 +369,6 @@ kv_register(const char *key, kv_type_t type, const char *default_val,
   kv_val_t       val;
   kv_entry_t    *e;
   uint32_t       bucket;
-  kv_pending_t **pp;
 
   if(key == NULL || default_val == NULL)
     return(FAIL);
@@ -374,47 +414,56 @@ kv_register(const char *key, kv_type_t type, const char *default_val,
   kv_table[bucket] = e;
   kv_count++;
 
-  // Check pending list for a DB value loaded before this key existed.
-  pp = &kv_pending_list;
-
-  while(*pp != NULL)
+  // The entry is inserted at its schema default. Before kv_load() has run
+  // (cold-start registration) the kv table may not exist yet and the bulk
+  // load pass will apply any persisted value momentarily — keep the
+  // default. After kv_load(), the DB is authoritative: a re-register after
+  // a plugin hot-reload, or a dynamic key registered post-restore, must
+  // take the persisted value. Read it with the lock released.
+  if(kv_loaded)
   {
-    kv_pending_t *p = *pp;
+    int  db_type;
+    char db_str[KV_STR_SZ];
 
-    if(strcmp(p->key, key) == 0)
+    pthread_mutex_unlock(&kv_mutex);
+
+    if(kv_db_lookup_one(key, &db_type, db_str, sizeof(db_str)))
     {
-      if(p->type == (int)type)
+      kv_val_t db_val;
+
+      memset(&db_val, 0, sizeof(db_val));
+
+      pthread_mutex_lock(&kv_mutex);
+
+      // Re-find: a concurrent kv_unregister may have dropped the entry.
+      e = find_locked(key);
+
+      // Type-mismatched rows are ignored (keep the default), mirroring the
+      // old pending-restore guard.
+      if(e != NULL && db_type == (int)type &&
+          str_to_val(type, db_str, &db_val) == SUCCESS)
       {
-        kv_val_t db_val;
+        e->val   = db_val;
+        e->dirty = false;
+        pthread_mutex_unlock(&kv_mutex);
 
-        memset(&db_val, 0, sizeof(db_val));
-
-        if(str_to_val(type, p->val_str, &db_val) == SUCCESS)
-        {
-          e->val   = db_val;
-          e->dirty = false;
-
-          clam(CLAM_DEBUG, "kv_register",
-              "'%s' (%s) = %s [restored from db]",
-              key, kv_type_name(type), p->val_str);
-        }
+        clam(CLAM_DEBUG, "kv_register",
+            "'%s' (%s) = %s [rehydrated from db]",
+            key, kv_type_name(type), db_str);
+        return(SUCCESS);
       }
 
-      // Remove from pending list.
-      *pp = p->next;
-      mem_free(p);
-      kv_pending_count--;
-      goto done;
+      pthread_mutex_unlock(&kv_mutex);
     }
 
-    pp = &(*pp)->next;
+    clam(CLAM_DEBUG, "kv_register", "'%s' (%s) = %s",
+        key, kv_type_name(type), default_val);
+    return(SUCCESS);
   }
 
+  pthread_mutex_unlock(&kv_mutex);
   clam(CLAM_DEBUG, "kv_register", "'%s' (%s) = %s",
       key, kv_type_name(type), default_val);
-
-done:
-  pthread_mutex_unlock(&kv_mutex);
   return(SUCCESS);
 }
 
@@ -1304,23 +1353,6 @@ load_ensure_table(void)
   return(SUCCESS);
 }
 
-// Cache a DB row into the pending list for later kv_register() pickup.
-// Must be called without kv_mutex held.
-static void
-load_cache_pending(const char *db_key, const char *db_type, const char *db_val)
-{
-  kv_pending_t *p = mem_alloc("kv", "pending", sizeof(kv_pending_t));
-
-  strncpy(p->key, db_key, KV_KEY_SZ - 1);
-  p->key[KV_KEY_SZ - 1] = '\0';
-  p->type = atoi(db_type);
-  strncpy(p->val_str, db_val, KV_STR_SZ - 1);
-  p->val_str[KV_STR_SZ - 1] = '\0';
-  p->next = kv_pending_list;
-  kv_pending_list = p;
-  kv_pending_count++;
-}
-
 // Apply a loaded DB row to an existing registered entry.
 // Must be called with kv_mutex held. Always unlocks before returning.
 // e: registered entry (must not be NULL)
@@ -1418,8 +1450,10 @@ kv_load(void)
 
     if(e == NULL)
     {
+      // No live entry yet — leave the row in the DB. A later
+      // kv_register() rehydrates it on demand, and kv_claim_orphans()
+      // materializes whatever stays schema-less after bot restore.
       pthread_mutex_unlock(&kv_mutex);
-      load_cache_pending(db_key, db_type, db_val);
       skipped++;
       continue;
     }
@@ -1434,6 +1468,7 @@ kv_load(void)
   db_result_free(r);
 
   clam(CLAM_INFO, "kv_load", "loaded %u entries (%u skipped)", loaded, skipped);
+  kv_loaded = true;
   return(SUCCESS);
 }
 
@@ -1479,39 +1514,60 @@ kv_flush(void)
   return((failed == 0) ? SUCCESS : FAIL);
 }
 
-// Register all remaining pending DB entries into the KV hash table.
-// Called after bot restore to claim dynamic keys (e.g., channel config)
-// that have no static schema registration.
+// Materialize persisted DB rows that no live entry claims — dynamic keys
+// with no static schema (per-channel IRC config, etc.). Runs after bot
+// restore; schema keys and any key a plugin already re-registered are
+// live and skipped. Returns the count materialized.
 uint32_t
-kv_claim_pending(void)
+kv_claim_orphans(void)
 {
-  uint32_t claimed = 0;
+  db_result_t *r;
+  uint32_t     claimed = 0;
 
-  // Walk the pending list, registering each entry.
-  // kv_register will consume matching entries from the list.
-  while(kv_pending_list != NULL)
+  r = db_result_alloc();
+
+  if(db_query("SELECT key, type, value FROM kv", r) != SUCCESS)
   {
-    kv_pending_t *p = kv_pending_list;
-
-    if(p->type >= 0 && p->type <= KV_BOOL)
-    {
-      kv_register(p->key, (kv_type_t)p->type, p->val_str, NULL, NULL,
-          NULL);
-      claimed++;
-    }
-
-    else
-    {
-      // kv_register didn't consume it (unknown type); remove manually.
-      kv_pending_list = p->next;
-      mem_free(p);
-      kv_pending_count--;
-    }
+    clam(CLAM_WARN, "kv_claim_orphans", "db scan failed: %s", r->error);
+    db_result_free(r);
+    return(0);
   }
 
+  for(uint32_t i = 0; i < r->rows; i++)
+  {
+    const char *db_key  = db_result_get(r, i, 0);
+    const char *db_type = db_result_get(r, i, 1);
+    const char *db_val  = db_result_get(r, i, 2);
+    int         type_id;
+    bool        live;
+
+    if(db_key == NULL || db_type == NULL || db_val == NULL)
+      continue;
+
+    type_id = atoi(db_type);
+
+    if(type_id < 0 || type_id > KV_BOOL)
+      continue;  // unknown type id — leave the row untouched in the DB
+
+    pthread_mutex_lock(&kv_mutex);
+    live = (find_locked(db_key) != NULL);
+    pthread_mutex_unlock(&kv_mutex);
+
+    if(live)
+      continue;
+
+    // Register at the persisted value; kv_register re-confirms it from the
+    // DB (kv_loaded is true here) and clears the dirty flag.
+    if(kv_register(db_key, (kv_type_t)type_id, db_val, NULL, NULL, NULL)
+        == SUCCESS)
+      claimed++;
+  }
+
+  db_result_free(r);
+
   if(claimed > 0)
-    clam(CLAM_DEBUG, "kv_claim_pending",
-        "claimed %u pending entries", claimed);
+    clam(CLAM_DEBUG, "kv_claim_orphans", "claimed %u orphan entries",
+        claimed);
 
   return(claimed);
 }
@@ -1563,22 +1619,6 @@ kv_exit(void)
   }
 
   kv_count = 0;
-
-  // Free any remaining pending entries (all should be claimed by now).
-  if(kv_pending_count > 0)
-    clam(CLAM_DEBUG, "kv_exit",
-        "%u unclaimed pending entries", kv_pending_count);
-
-  // Free unclaimed pending entries.
-  while(kv_pending_list != NULL)
-  {
-    kv_pending_t *p = kv_pending_list;
-
-    kv_pending_list = p->next;
-    mem_free(p);
-  }
-
-  kv_pending_count = 0;
 
   pthread_mutex_unlock(&kv_mutex);
   pthread_mutex_destroy(&kv_mutex);

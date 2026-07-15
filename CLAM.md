@@ -85,7 +85,7 @@ regex (the literal context portion, before any `<placeholder>`).
 | `db_query` | core/db.c | synchronous DB query path |
 | `db_query_async` | core/db.c | asynchronous DB query path |
 | `db_query_stream` | core/db.c | streaming (row-callback) DB read path |
-| `kv_claim_pending` | core/kv.c | claim of pending DB-loaded KV rows |
+| `kv_claim_orphans` | core/kv.c | materialize schema-less DB KV rows |
 | `kv_delete_prefix` | core/kv.c | bulk KV delete |
 | `kv_exit` | core/kv.c | KV subsystem teardown |
 | `kv_flush` | core/kv.c | KV flush to DB |
