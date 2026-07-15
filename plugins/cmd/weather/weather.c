@@ -438,10 +438,16 @@ weather_reply_forecast_daily(const cmd_ctx_t *ctx,
 // wrap already-padded content), so a cell's on-screen width is constant
 // and the second column lands at a predictable position. The layout is
 //
-//   {icon} {Day} {time}  {temp}°{u}  {condition:16}  {pop}%
+//   {icon} {Day} {time}  {temp}°{u}  {condition:16}  {pop}
 //
 // which measures ~42 display columns; two cells plus a two-space gutter
 // stay under the 100-column budget with room to spare.
+//
+// The trailing precipitation-probability field is shown only when there
+// *is* a chance (mirroring the daily view): a dry hour leaves the
+// 4-column slot blank so the eye locks onto the hours that carry rain
+// odds instead of a wall of "0%". The slot keeps its fixed width either
+// way, preserving column alignment.
 static void
 weather_hour_cell(char *buf, size_t sz, const openweather_forecast_hour_t *h,
     const char *units, const char *tu, int tz_offset)
@@ -452,6 +458,7 @@ weather_hour_cell(char *buf, size_t sz, const openweather_forecast_hour_t *h,
   char temp[40];
   char desc_pad[24];
   char time_str[8];
+  char pop_str[24];
   int pop = (int)(h->pop * 100);
 
   time_str[0] = time_str[1] = '?';
@@ -478,16 +485,28 @@ weather_hour_cell(char *buf, size_t sz, const openweather_forecast_hour_t *h,
   weather_fmt_temp_w(temp, sizeof(temp), h->temp, units, 3);
   weather_fmt_desc_pad(desc_pad, sizeof(desc_pad), h->condition_desc, 16);
 
+  // Fixed 4-column precip slot: coloured "NN%" when there's a chance,
+  // blank otherwise.
+  if(pop > 0)
+    snprintf(pop_str, sizeof(pop_str), CLR_CYAN "%3d%%" CLR_RESET, pop);
+  else
+    snprintf(pop_str, sizeof(pop_str), "    ");
+
   snprintf(buf, sz,
-      "%s %-3s %4s  %s\xc2\xb0%s  %s%s" CLR_RESET "  %3d%%",
-      icon, day_name, time_str, temp, tu, dclr, desc_pad, pop);
+      "%s %-3s %4s  %s\xc2\xb0%s  %s%s" CLR_RESET "  %s",
+      icon, day_name, time_str, temp, tu, dclr, desc_pad, pop_str);
 }
 
-// Double-column hourly forecast: 24 hours collapse into 12 reply lines,
-// two cells each, so IRC clients aren't flooded. Hourly deliberately
-// drops wind/humidity (kept in the daily view) to stay within a sane
-// line width; the essentials — time, temperature, sky, precip odds —
-// remain.
+// Double-column hourly forecast: 24 hours collapse into ~12 reply
+// lines, two cells each, so IRC clients aren't flooded. Hourly
+// deliberately drops wind/humidity (kept in the daily view) to stay
+// within a sane line width; the essentials — time, temperature, sky,
+// precip odds — remain.
+//
+// Cells are laid out COLUMN-MAJOR: the left column holds the earlier
+// half of the hours top-to-bottom, the right column the later half, so
+// a human reads each column straight down rather than zig-zagging
+// left↔right across every row.
 static void
 weather_reply_forecast_hourly(const cmd_ctx_t *ctx,
     const openweather_forecast_t *f,
@@ -496,6 +515,8 @@ weather_reply_forecast_hourly(const cmd_ctx_t *ctx,
   const char *tu = weather_temp_unit(f->units);
   char cells[24][WEATHER_CELL_SZ];
   uint8_t n;
+  uint8_t rows;
+  uint8_t r;
   uint8_t i;
 
   weather_reply_header(ctx, f->place_name, f->zipcode, "24-hour forecast");
@@ -506,19 +527,24 @@ weather_reply_forecast_hourly(const cmd_ctx_t *ctx,
     weather_hour_cell(cells[i], sizeof(cells[i]), &f->hours[i],
         f->units, tu, f->tz_offset);
 
-  for(i = 0; i < n; i += 2)
+  // Split point: the left column takes the first ceil(n/2) hours, so an
+  // odd count leaves the lone trailing cell alone on the last row.
+  rows = (uint8_t)((n + 1) / 2);
+
+  for(r = 0; r < rows; r++)
   {
     char buf[WEATHER_REPLY_SZ];
+    uint8_t right = (uint8_t)(rows + r);
 
     // Precision bounds each cell to its buffer so the compiler can see
     // the join stays well within WEATHER_REPLY_SZ (the runtime-indexed
-    // cells[i] otherwise reads as reaching the end of the 2-D array).
-    if((uint8_t)(i + 1) < n)
+    // cells[r] otherwise reads as reaching the end of the 2-D array).
+    if(right < n)
       snprintf(buf, sizeof(buf), "%.*s  %.*s",
-          WEATHER_CELL_SZ - 1, cells[i],
-          WEATHER_CELL_SZ - 1, cells[i + 1]);
+          WEATHER_CELL_SZ - 1, cells[r],
+          WEATHER_CELL_SZ - 1, cells[right]);
     else
-      snprintf(buf, sizeof(buf), "%.*s", WEATHER_CELL_SZ - 1, cells[i]);
+      snprintf(buf, sizeof(buf), "%.*s", WEATHER_CELL_SZ - 1, cells[r]);
 
     cmd_reply(ctx, buf);
   }
