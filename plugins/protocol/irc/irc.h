@@ -96,6 +96,18 @@ typedef struct
   uint16_t          port;                     // resolved from network
   uint8_t           tls;                      // resolved from network
   uint8_t           tls_verify;               // resolved from network
+
+  // Per-server operator credentials (irc.net.<net>.<srv>.operator_*).
+  // When both are set the bot sends OPER at registration to become an
+  // IRC operator on the connecting server.
+  char              operator_name[KV_STR_SZ];
+  char              operator_pass[KV_STR_SZ];
+
+  // Per-server flag: skip internal output queueing when the server
+  // relaxes flood limits for the bot
+  // (irc.net.<net>.<srv>.no_output_queueing).
+  bool              no_output_queueing;
+
   char              nick[IRC_NICK_SZ];        // preferred nick
   char              nick2[IRC_NICK_SZ];       // first fallback
   char              nick3[IRC_NICK_SZ];       // second fallback
@@ -244,6 +256,16 @@ static const plugin_kv_entry_t irc_srv_kv_schema[] = {
   { "priority",   KV_UINT16, "100",  "Server selection priority (lower = preferred)" },
   { "tls",        KV_BOOL,   "false", "Enable TLS encryption (true/false)" },
   { "tls_verify", KV_BOOL,   "true",  "Verify TLS certificate (true/false)" },
+
+  // IRC-operator credentials. When both are set the bot sends OPER at
+  // registration to gain operator privileges on this server.
+  { "operator_name",     KV_STR, "", "IRC operator name (OPER) for this server" },
+  { "operator_password", KV_STR, "", "IRC operator password (OPER) for this server" },
+
+  // On servers that relax or remove flood limits for the bot (e.g. once
+  // it holds operator status), internal output pacing is unnecessary.
+  { "no_output_queueing", KV_BOOL, "false",
+      "Skip internal output queueing on this server (bot has relaxed flood limits)" },
 };
 
 #define IRC_SRV_KV_COUNT \

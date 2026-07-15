@@ -79,6 +79,23 @@ irc_resolve_server(irc_state_t *st)
       st->network, srv);
   st->tls_verify = (uint8_t)kv_get_uint(key);
 
+  // Read per-server operator credentials. Both must be present for the
+  // bot to attempt OPER at registration (see irc_handle_welcome).
+  snprintf(key, sizeof(key), IRC_NET_PREFIX "%s.%s.operator_name",
+      st->network, srv);
+  v = kv_get_str(key);
+  snprintf(st->operator_name, sizeof(st->operator_name), "%s", v ? v : "");
+
+  snprintf(key, sizeof(key), IRC_NET_PREFIX "%s.%s.operator_password",
+      st->network, srv);
+  v = kv_get_str(key);
+  snprintf(st->operator_pass, sizeof(st->operator_pass), "%s", v ? v : "");
+
+  // Read per-server output-queueing flag.
+  snprintf(key, sizeof(key), IRC_NET_PREFIX "%s.%s.no_output_queueing",
+      st->network, srv);
+  st->no_output_queueing = (kv_get_uint(key) != 0);
+
   return(SUCCESS);
 }
 
@@ -571,6 +588,18 @@ irc_handle_welcome(irc_state_t *st, const irc_parsed_msg_t *pp)
   st->registered = true;
   clam(CLAM_INFO, "irc", "registered as %s on %s", st->cur_nick, st->host);
   method_set_state(st->inst, METHOD_AVAILABLE);
+
+  // Request IRC-operator status before joining, so any relaxed flood
+  // limits the server grants opers already apply to the autojoin burst.
+  // Both credentials must be configured for this server. The password
+  // is never logged.
+  if(st->operator_name[0] != '\0' && st->operator_pass[0] != '\0')
+  {
+    clam(CLAM_INFO, "irc", "requesting operator status as '%s'",
+        st->operator_name);
+    irc_send_raw(st, "OPER %s %s", st->operator_name, st->operator_pass);
+  }
+
   irc_join_channels(st);
 }
 
