@@ -156,6 +156,13 @@ typedef struct
   double    final_equity;   // wm_bt_compute_equity of the fold snapshot
   uint32_t  n_trades;       // round-trips = n_wins + n_losses
   bool      ok;             // false if this fold's iteration failed
+
+  // WM-RIGOR-2: buy-and-hold return of the same asset over the same
+  // window (close/close - 1 from the snapshot's 1m bars), so the scorer
+  // can compute active (benchmark-relative) fold returns. Valid only
+  // when bench_ok; bench_ok false means the window held < 2 1m bars.
+  double    bench_return;
+  bool      bench_ok;
 } wm_bt_fold_metric_t;
 
 // ----------------------------------------------------------------------- //

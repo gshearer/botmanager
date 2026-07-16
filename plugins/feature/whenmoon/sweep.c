@@ -1874,6 +1874,12 @@ wm_bt_perfold_one_row(whenmoon_state_t *st, wm_backtest_snapshot_t *snap,
     folds[w].end_ts_ms   = win->end_ts_ms;
     folds[w].ok          = false;
 
+    // WM-RIGOR-2: the fold's buy-and-hold benchmark is independent of
+    // the iteration outcome — compute it up front so even a failed
+    // fold run carries the reference return.
+    folds[w].bench_ok = wm_bt_bench_return(snap, win,
+        &folds[w].bench_return) == SUCCESS;
+
     wm_backtest_alloc_synthetic_id(synth_id, sizeof(synth_id));
 
     iter_err[0] = '\0';

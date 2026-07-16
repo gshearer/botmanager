@@ -231,6 +231,16 @@ wm_backtest_snapshot_t *wm_backtest_snapshot_build(int32_t market_id_db,
 
 void wm_backtest_snapshot_free(wm_backtest_snapshot_t *snap);
 
+// WM-RIGOR-2: buy-and-hold benchmark return over one window — the close
+// of the last 1m bar inside `win` over the close of the first, minus 1.
+// Window semantics match wm_bt_window_t (bars with ts_close_ms in
+// [start, end) belong to the window). Pass win == NULL to span the whole
+// snapshot. Returns SUCCESS with *out populated; FAIL when the window
+// holds fewer than two 1m bars or a boundary close is not a positive
+// price (*out untouched).
+bool wm_bt_bench_return(const wm_backtest_snapshot_t *snap,
+    const wm_bt_window_t *win, double *out);
+
 // ----------------------------------------------------------------------- //
 // Iteration                                                               //
 // ----------------------------------------------------------------------- //

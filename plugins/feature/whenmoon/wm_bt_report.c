@@ -492,6 +492,11 @@ wm_bt_build_metrics_obj(const wm_bt_sweep_result_t *result)
   wm_bt_obj_add_double(obj, "gross_loss",    st->gross_loss);
   wm_bt_obj_add_double(obj, "equity_peak",   st->equity_peak);
 
+  // WM-RIGOR-2: the size_frac the engine actually sized with (KV
+  // resolver + CLI override), so the scorer can deployment-match the
+  // buy-and-hold benchmark without re-deriving the resolution chain.
+  wm_bt_obj_add_double(obj, "size_frac",     snap->size_frac);
+
   return(obj);
 }
 
@@ -557,6 +562,11 @@ wm_bt_build_windows_arr(const wm_bt_sweep_result_t *result)
     wm_bt_obj_add_double(obj, "realized_pnl", f->realized_pnl);
     wm_bt_obj_add_double(obj, "return",       f->return_frac);
     wm_bt_obj_add_double(obj, "final_equity", f->final_equity);
+
+    // WM-RIGOR-2: same-asset buy-and-hold over the same window; JSON
+    // null when the window held too few bars to price it (NaN path).
+    wm_bt_obj_add_double(obj, "bench_return",
+        f->bench_ok ? f->bench_return : (double)NAN);
 
     json_object_array_add(arr, obj);
   }
@@ -2151,21 +2161,30 @@ wm_bt_emit_card(FILE *fp, const char *label, const char *def_key,
         label, sep, vcls, value_html);
 }
 
-// WM-BT-RPT-6: plain-English verdict banner at the very top of both index
-// surfaces. `best` is the rank-1 config's PAPER stats; `final_equity` is its
-// end-of-run equity (wm_bt_compute_equity), `start_cash` the opening
-// balance, `sharpe` the rank-1 Sharpe. Emits a PROFITABLE / UNPROFITABLE
-// pill + a two-line takeaway derived from the stats (active voice, second
-// person, numerals — per the Web Interface Guidelines content rules).
-// No-op on NULL fp / stats.
+// WM-RIGOR-2: benchmark-relative verdict banner at the very top of both
+// index surfaces (supersedes the WM-BT-RPT-6 absolute-profit test).
+// `best` is the rank-1 config's PAPER stats; `final_equity` its
+// end-of-run equity (wm_bt_compute_equity); `bench_return` the
+// buy-and-hold return of the same asset over the full run range. The
+// pill compares the strategy's net return against a size_frac-scaled
+// hold — the deployment-matched benchmark: a strategy that deploys only
+// size_frac of the book is measured against parking that same fraction
+// in the asset. The full-exposure hold is quoted in the takeaway as the
+// hard bound. When have_bench is false (a snapshot too thin to price)
+// the pill degrades to the absolute profit test. Wording per the Web
+// Interface Guidelines content rules (active voice, numerals). No-op on
+// NULL fp / stats.
 static void
 wm_bt_emit_verdict(FILE *fp, const wm_market_stats_t *best,
-    double start_cash, double sharpe, double final_equity)
+    double start_cash, double sharpe, double final_equity,
+    bool have_bench, double bench_return, double size_frac)
 {
   uint32_t rt;
   double   wr;
   double   pf;
   double   ret;
+  double   hold;
+  double   hold_full;
   bool     win;
   char     pf_str[32];
   char     wr_str[32];
@@ -2175,12 +2194,16 @@ wm_bt_emit_verdict(FILE *fp, const wm_market_stats_t *best,
   if(fp == NULL || best == NULL)
     return;
 
-  rt  = best->n_wins + best->n_losses;
-  wr  = rt > 0 ? (double)best->n_wins / (double)rt * 100.0 : 0.0;
-  pf  = wm_market_stats_profit_factor(best);
-  ret = (isfinite(final_equity) && start_cash > 0.0)
+  rt        = best->n_wins + best->n_losses;
+  wr        = rt > 0 ? (double)best->n_wins / (double)rt * 100.0 : 0.0;
+  pf        = wm_market_stats_profit_factor(best);
+  ret       = (isfinite(final_equity) && start_cash > 0.0)
       ? (final_equity - start_cash) / start_cash * 100.0 : 0.0;
-  win = isfinite(final_equity) && final_equity > start_cash;
+  hold      = size_frac * bench_return * 100.0;
+  hold_full = bench_return * 100.0;
+  win       = have_bench
+      ? ret > hold
+      : isfinite(final_equity) && final_equity > start_cash;
 
   if(rt == 0)
   {
@@ -2198,18 +2221,35 @@ wm_bt_emit_verdict(FILE *fp, const wm_market_stats_t *best,
   wm_bt_fmt_num(pf, 2, pf_str, sizeof(pf_str));
   wm_bt_fmt_num(isfinite(sharpe) ? sharpe : 0.0, 2, sh_str, sizeof(sh_str));
 
-  fprintf(fp,
-      "<div class=\"verdict %s\"><span class=\"pill\">%s</span>"
-      "<div class=\"takeaway\"><b>This configuration %s %s%.1f%% net.</b>"
-      "<span class=\"sub2\">Profit factor %s &middot; %s win rate &middot;"
-      " %s maximum drawdown &middot; Sharpe %s over %u round trips."
-      "</span></div></div>\n",
-      win ? "win" : "loss",
-      win ? "Profitable" : "Unprofitable",
-      win ? "returned" : "lost",
-      win ? "+" : "",
-      win ? ret : -ret,
-      pf_str, wr_str, dd_str, sh_str, rt);
+  if(have_bench)
+    fprintf(fp,
+        "<div class=\"verdict %s\"><span class=\"pill\">%s hold</span>"
+        "<div class=\"takeaway\"><b>This configuration returned %+.1f%%"
+        " net vs %+.1f%% for holding the asset at the same %.0f%%"
+        " sizing.</b>"
+        "<span class=\"sub2\">Full-exposure hold returned %+.1f%%."
+        " Profit factor %s &middot; %s win rate &middot;"
+        " %s maximum drawdown &middot; Sharpe %s over %u round trips."
+        "</span></div></div>\n",
+        win ? "win" : "loss",
+        win ? "Beats" : "Trails",
+        ret, hold, size_frac * 100.0, hold_full,
+        pf_str, wr_str, dd_str, sh_str, rt);
+
+  else
+    fprintf(fp,
+        "<div class=\"verdict %s\"><span class=\"pill\">%s</span>"
+        "<div class=\"takeaway\"><b>This configuration %s %s%.1f%% net."
+        "</b><span class=\"sub2\">No buy-and-hold benchmark &mdash; the"
+        " snapshot is too thin to price. Profit factor %s &middot;"
+        " %s win rate &middot; %s maximum drawdown &middot; Sharpe %s"
+        " over %u round trips.</span></div></div>\n",
+        win ? "win" : "loss",
+        win ? "Profitable" : "Unprofitable",
+        win ? "returned" : "lost",
+        win ? "+" : "",
+        win ? ret : -ret,
+        pf_str, wr_str, dd_str, sh_str, rt);
 }
 
 // Emit the stat-card row + P/L distribution for one config's closed
@@ -2580,6 +2620,8 @@ wm_bt_render_index_html(const char *sweep_dir,
         ? fixed_params->starting_cash : WM_MARKET_DEFAULT_STARTING_CASH;
     const char *ec = eq >= WM_MARKET_DEFAULT_STARTING_CASH ? "pos" : "neg";
     const char *rc = rpnl >= 0.0 ? "pos" : "neg";
+    double   bench_ret  = 0.0;
+    bool     have_bench;
     char     eq_str[48];
     char     rpnl_str[48];
     char     wr_str[32];
@@ -2587,7 +2629,10 @@ wm_bt_render_index_html(const char *sweep_dir,
     char     pf_str[32];
     char     rt_str[32];
 
-    wm_bt_emit_verdict(fp, st, start_cash, best->trade.sharpe, eq);
+    have_bench = wm_bt_bench_return(snap, NULL, &bench_ret) == SUCCESS;
+
+    wm_bt_emit_verdict(fp, st, start_cash, best->trade.sharpe, eq,
+        have_bench, bench_ret, best->trade.size_frac);
 
     wm_bt_fmt_usd(eq,   eq_str,   sizeof(eq_str));
     wm_bt_fmt_usd(rpnl, rpnl_str, sizeof(rpnl_str));
@@ -3555,6 +3600,8 @@ wm_bt_render_sweep_html(const char *sweep_dir,
         ? fixed_params->starting_cash : WM_MARKET_DEFAULT_STARTING_CASH;
     const char *ec   = eq >= WM_MARKET_DEFAULT_STARTING_CASH ? "pos" : "neg";
     const char *rc   = rpnl >= 0.0 ? "pos" : "neg";
+    double      bench_ret  = 0.0;
+    bool        have_bench;
     char        eq_str[48];
     char        rpnl_str[48];
     char        wr_str[32];
@@ -3563,7 +3610,10 @@ wm_bt_render_sweep_html(const char *sweep_dir,
     char        rt_str[32];
     char        params[256];
 
-    wm_bt_emit_verdict(fp, st, start_cash, best->trade.sharpe, eq);
+    have_bench = wm_bt_bench_return(snap, NULL, &bench_ret) == SUCCESS;
+
+    wm_bt_emit_verdict(fp, st, start_cash, best->trade.sharpe, eq,
+        have_bench, bench_ret, best->trade.size_frac);
 
     wm_bt_idx_params_str(plan, best->indices, params, sizeof(params));
     wm_bt_html_escape(params, esc, sizeof(esc));

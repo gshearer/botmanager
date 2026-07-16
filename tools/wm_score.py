@@ -9,11 +9,21 @@ market, and reports BOTH scoring conventions side by side:
          historical COMPSTART §4 recipe, kept as the comparable baseline)
   net    fold returns = (windows[].final_equity - start_cash) / start_cash
          (fold-end mark-to-market equity, net of fees — WM-RIGOR-1)
+  active fold returns = net - size_frac * windows[].bench_return
+         (WM-RIGOR-2: net minus the deployment-matched buy-and-hold of
+         the same asset over the same fold — a strategy deploying only
+         size_frac of the book is measured against parking that same
+         fraction in the asset; precise time-weighted exposure arrives
+         with WM-RIGOR-4)
+  act_fx fold returns = net - windows[].bench_return
+         (full-exposure active return — the hard bound; reported, not
+         gated)
 
 Per market and pooled across markets: mean_fold, std_fold (population),
 worst_fold, pos_frac, robust_ratio = mean/std, plus trades/mo and the
 engine max_drawdown, then the COMPSTART §4 eligibility gates evaluated on
-both conventions.
+gross, net, AND active (active gates need windows[].bench_return, i.e. a
+run from a WM-RIGOR-2 binary; older runs score gross/net only).
 
 Usage:
     python3 tools/wm_score.py <sweep_dir> [<sweep_dir> ...] [--json]
@@ -36,6 +46,7 @@ TEST_WINDOW_DAYS = 120          # official walk-forward test window
 DEFAULT_START_CASH = 10000.0    # WM_MARKET_DEFAULT_STARTING_CASH
 DEFAULT_FEE_BPS = 5.0
 DEFAULT_SLIP_BPS = 5.0
+DEFAULT_SIZE_FRAC = 0.25        # WM_MARKET_DEFAULT_SIZE_FRAC
 
 # COMPSTART §4 eligibility gates (fail any => cannot be a finalist)
 GATE_POS_FRAC = 0.75            # pooled: >= 3 of 4 windows net-positive
@@ -83,6 +94,14 @@ def load_run(d):
                  % (d, w.get("fold")))
 
     fixed = manifest.get("fixed_params") or {}
+    metrics = row.get("metrics") or {}
+
+    # WM-RIGOR-2: the engine emits the RESOLVED size_frac it sized with
+    # (metrics.size_frac); fixed_params only echoes a CLI override, and
+    # the engine default is the last resort for pre-RIGOR-2 runs.
+    size_frac = metrics.get("size_frac",
+                            fixed.get("size_frac", DEFAULT_SIZE_FRAC))
+
     return {
         "dir": d,
         "strategy": manifest.get("strategy"),
@@ -91,8 +110,9 @@ def load_run(d):
         "fee_bps": fixed.get("fee_bps", DEFAULT_FEE_BPS),
         "slip_bps": fixed.get("slip_bps", DEFAULT_SLIP_BPS),
         "start_cash": fixed.get("starting_cash", DEFAULT_START_CASH),
+        "size_frac": size_frac,
         "windows": windows,
-        "metrics": row.get("metrics") or {},
+        "metrics": metrics,
         "n_windows": row.get("n_windows", len(windows)),
     }
 
@@ -112,13 +132,14 @@ def fold_stats(folds):
 
 
 def score_market(run):
-    """Both conventions' fold vectors + stats for one market's run."""
+    """Every convention's fold vectors + stats for one market's run."""
     cash = run["start_cash"]
+    sf = run["size_frac"]
     gross = [w["return"] for w in run["windows"]]
     net = [(w["final_equity"] - cash) / cash for w in run["windows"]]
     months = run["n_windows"] * TEST_WINDOW_DAYS / DAYS_PER_MONTH
     trades = run["metrics"].get("trades", 0)
-    return {
+    out = {
         "market": run["market"],
         "dir": run["dir"],
         "folds_gross": gross,
@@ -130,6 +151,25 @@ def score_market(run):
         "trades_pm": trades / months if months else 0.0,
         "n_folds": len(gross),
     }
+
+    # WM-RIGOR-2: active (benchmark-relative) folds, only when every
+    # window carries a priced bench_return (a WM-RIGOR-2 binary run).
+    bench = [w.get("bench_return") for w in run["windows"]]
+    if all(b is not None for b in bench):
+        active = [n - sf * b for n, b in zip(net, bench)]
+        act_fx = [n - b for n, b in zip(net, bench)]
+        out.update({
+            "folds_active": active,
+            "folds_act_fx": act_fx,
+            "folds_bench": bench,
+            "active": fold_stats(active),
+            "act_fx": fold_stats(act_fx),
+            "bench": fold_stats(bench),
+        })
+    else:
+        warn("%s: windows[] missing bench_return (pre-WM-RIGOR-2 run) "
+             "— active scoring skipped" % run["dir"])
+    return out
 
 
 def eval_gates(markets, pooled_stats):
@@ -168,7 +208,7 @@ def render_table(result):
     rows = [(m["market"], m, m["n_folds"]) for m in result["markets"]]
     rows.append(("POOLED", result["pooled"], result["pooled"]["n_folds"]))
     for name, blk, nf in rows:
-        for kind in ("gross", "net"):
+        for kind in result["kinds"]:
             s = blk[kind]
             out.append("%-18s %-6s %6d %9s %8s %9s %6.1f%% %8.4f"
                        % (name, kind, nf, pct(s["mean_fold"]),
@@ -177,18 +217,24 @@ def render_table(result):
                           s["pos_frac"] * 100.0, s["robust_ratio"]))
     out.append("")
     for m in result["markets"]:
-        out.append("%-18s maxDD=%s  trades=%d  trades/mo=%.2f"
+        bench = ("  hold/fold=%s" % pct(m["bench"]["mean_fold"])
+                 if "bench" in m else "")
+        out.append("%-18s maxDD=%s  trades=%d  trades/mo=%.2f%s"
                    % (m["market"], pct(m["max_drawdown"], signed=False),
-                      m["trades"], m["trades_pm"]))
+                      m["trades"], m["trades_pm"], bench))
     out.append("%-18s trades/mo=%.2f (secondary)"
                % ("POOLED", result["pooled"]["trades_pm"]))
     out.append("")
-    for kind in ("gross", "net"):
+    for kind in result["kinds"]:
+        if kind not in result["gates"]:
+            out.append("gates[%-6s] (reported hard bound — not gated)"
+                       % kind)
+            continue
         g = result["gates"][kind]
         flags = "  ".join("%s=%s" % (k, "PASS" if v else "FAIL")
                           for k, v in g.items()
                           if k not in ("all_pass", "friction_repass"))
-        out.append("gates[%-5s] %s => %s" % (kind, flags,
+        out.append("gates[%-6s] %s => %s" % (kind, flags,
                    "ELIGIBLE" if g["all_pass"] else "NOT ELIGIBLE"))
     return "\n".join(out)
 
@@ -210,23 +256,34 @@ def main():
     if len(strategies) != 1:
         die("dirs mix strategies %s — score one strategy at a time"
             % strategies)
-    econ = sorted({(r["fee_bps"], r["slip_bps"], r["start_cash"])
-                   for r in runs})
+    econ = sorted({(r["fee_bps"], r["slip_bps"], r["start_cash"],
+                    r["size_frac"]) for r in runs})
     if len(econ) != 1:
-        die("dirs mix economics (fee/slip/cash) %s — pool runs from one "
-            "friction level only" % econ)
-    fee_bps, slip_bps, start_cash = econ[0]
+        die("dirs mix economics (fee/slip/cash/size_frac) %s — pool runs "
+            "from one friction level only" % econ)
+    fee_bps, slip_bps, start_cash, size_frac = econ[0]
 
     markets = [score_market(r) for r in runs]
 
+    # Active conventions pool only when EVERY market priced its bench;
+    # a mixed pool would compare active folds against net-only folds.
+    have_active = all("active" in m for m in markets)
+    kinds = ["gross", "net"] + (["active", "act_fx"] if have_active
+                                else [])
+
     pooled = {"n_folds": sum(m["n_folds"] for m in markets),
               "trades_pm": sum(m["trades_pm"] for m in markets)}
-    for kind in ("gross", "net"):
+    for kind in kinds:
         allf = [x for m in markets for x in m["folds_" + kind]]
         pooled[kind] = fold_stats(allf)
+    if have_active:
+        pooled["bench"] = fold_stats(
+            [b for m in markets for b in m["folds_bench"]])
 
     gates = {}
-    for kind in ("gross", "net"):
+    for kind in kinds:
+        if kind == "act_fx":
+            continue                 # reported hard bound — not gated
         ps = dict(pooled[kind])
         ps["kind"] = kind
         gates[kind] = eval_gates(markets, ps)
@@ -236,7 +293,9 @@ def main():
         "fee_bps": fee_bps,
         "slip_bps": slip_bps,
         "start_cash": start_cash,
+        "size_frac": size_frac,
         "params": runs[0]["params"],
+        "kinds": kinds,
         "markets": markets,
         "pooled": pooled,
         "gates": gates,
@@ -245,12 +304,14 @@ def main():
     if args.json:
         # raw fold vectors are working state, not score — keep JSON lean
         for m in result["markets"]:
-            m.pop("folds_gross", None)
-            m.pop("folds_net", None)
+            for kind in kinds + ["bench"]:
+                m.pop("folds_" + kind, None)
         print(json.dumps(result, indent=2))
     else:
-        print("strategy: %s   fee/slip: %g/%g bps   start_cash: $%g"
-              % (result["strategy"], fee_bps, slip_bps, start_cash))
+        print("strategy: %s   fee/slip: %g/%g bps   start_cash: $%g   "
+              "size_frac: %g"
+              % (result["strategy"], fee_bps, slip_bps, start_cash,
+                 size_frac))
         print("params:   %s" % " ".join(
             "%s=%g" % (k, v) for k, v in result["params"].items()))
         print()

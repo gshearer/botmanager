@@ -1192,3 +1192,72 @@ wm_bt_oos_split_range(const wm_bt_oos_spec_t *spec,
 
   return(SUCCESS);
 }
+
+// ----------------------------------------------------------------------- //
+// WM-RIGOR-2 — buy-and-hold benchmark return                              //
+// ----------------------------------------------------------------------- //
+
+// Index of the first 1m bar in [begin, n) whose ts_close_ms >= ts, or n
+// when every bar closes earlier. Bars are ascending by ts_close_ms.
+static uint32_t
+wm_bt_bars_lower_bound(const wm_candle_full_t *bars, uint32_t begin,
+    uint32_t n, int64_t ts)
+{
+  uint32_t lo = begin;
+  uint32_t hi = n;
+
+  while(lo < hi)
+  {
+    uint32_t mid = lo + (hi - lo) / 2u;
+
+    if(bars[mid].ts_close_ms < ts)
+      lo = mid + 1;
+
+    else
+      hi = mid;
+  }
+
+  return(lo);
+}
+
+bool
+wm_bt_bench_return(const wm_backtest_snapshot_t *snap,
+    const wm_bt_window_t *win, double *out)
+{
+  const wm_candle_full_t *bars;
+  uint32_t                n;
+  uint32_t                lo;
+  uint32_t                hi;
+  double                  entry_close;
+  double                  exit_close;
+
+  if(snap == NULL || out == NULL)
+    return(FAIL);
+
+  bars = snap->mkt.grain_arr[WM_GRAN_1M];
+  n    = snap->mkt.grain_n[WM_GRAN_1M];
+
+  if(bars == NULL || n < 2)
+    return(FAIL);
+
+  lo = 0;
+  hi = n;
+
+  if(win != NULL)
+  {
+    lo = wm_bt_bars_lower_bound(bars, 0,  n, win->start_ts_ms);
+    hi = wm_bt_bars_lower_bound(bars, lo, n, win->end_ts_ms);
+  }
+
+  if(hi - lo < 2)
+    return(FAIL);
+
+  entry_close = bars[lo].close;
+  exit_close  = bars[hi - 1].close;
+
+  if(entry_close <= 0.0 || exit_close <= 0.0)
+    return(FAIL);
+
+  *out = exit_close / entry_close - 1.0;
+  return(SUCCESS);
+}
