@@ -658,6 +658,23 @@ whenmoon_init(void)
     goto fail;
   }
 
+  // WM-RIGOR-6: audit trail for backtest runs that touch holdout data
+  // (corpus range past the frozen 2025-03-31 research cutoff). Empty
+  // resolves beside the other backtest artifacts at run time.
+  if(kv_register("plugin.whenmoon.backtest.holdout_log",
+         KV_STR, "", NULL, NULL,
+         "File the --holdout audit trail appends to: one line at run"
+         " submit + one at completion for every backtest run whose"
+         " corpus extends past the 2025-03-31 research cutoff"
+         " (WM-RIGOR-6 holdout discipline). Empty resolves to"
+         " HOLDOUT_LOG.md under the resolved backtest report root."
+         ) != SUCCESS)
+  {
+    clam(CLAM_INFO, WHENMOON_CTX,
+        "kv_register plugin.whenmoon.backtest.holdout_log failed");
+    goto fail;
+  }
+
   // WM-BT-6: chart generation toggle (consumed by WM-BT-8). Registered
   // alongside the other backtest knobs so a single freshstart picks up
   // the entire backtest KV surface.

@@ -5,6 +5,7 @@
 //                              [name=value ...] [--flag value ...]
 //   /whenmoon backtest reload  <strategy>
 //   /whenmoon backtest compile <market_id> <path.wm> [<days>]
+//                              [--until <date>]
 //   /whenmoon backtest inspect <path.wm>
 //
 // `run` mmap's a compiled .wm snapshot and dispatches the parameter
@@ -51,6 +52,7 @@
 
 #include <ctype.h>
 #include <errno.h>
+#include <fcntl.h>
 #include <inttypes.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -58,6 +60,7 @@
 #include <sys/stat.h>
 #include <sys/types.h>
 #include <time.h>
+#include <unistd.h>
 
 #include <json-c/json.h>
 
@@ -74,6 +77,131 @@
 // returns (WM-BT-RUN-ASYNC-1: a synchronous sweep on that thread wedged
 // every other botmanctl client for the backtest's full duration).
 #define WM_BT_RUN_TASK_PRIORITY 254u
+
+// ----------------------------------------------------------------------- //
+// WM-RIGOR-6 holdout discipline                                           //
+// ----------------------------------------------------------------------- //
+//
+// Research corpora are frozen at 2025-03-31T00:00:00Z; everything since
+// is a locked final exam, spent once per strategy family. Any run whose
+// corpus range extends past the cutoff demands the explicit --holdout
+// flag, and every such access is appended to an audit log — one line at
+// submit, one at completion. See COMPSTART.md §Holdout discipline.
+
+#define WM_BT_HOLDOUT_CUTOFF_MS 1743379200000LL  // 2025-03-31T00:00:00Z
+
+#define WM_BT_KV_HOLDOUT_LOG "plugin.whenmoon.backtest.holdout_log"
+
+#define WM_BT_HOLDOUT_REFUSAL \
+  "corpus range extends past the 2025-03-31 research cutoff (holdout" \
+  " data): use a research corpus, or add --holdout to spend a holdout" \
+  " shot (audit-logged; see COMPSTART.md §Holdout discipline)"
+
+// Resolve the audit log path: the KV when set, else HOLDOUT_LOG.md
+// beside the other backtest artifacts under the resolved report root.
+static bool
+wm_bt_holdout_log_path(char *out, size_t cap)
+{
+  const char *kv = kv_get_str(WM_BT_KV_HOLDOUT_LOG);
+  char        root[1024];
+  char        err[160];
+  int         n;
+
+  if(kv != NULL && kv[0] != '\0')
+  {
+    n = snprintf(out, cap, "%s", kv);
+  }
+  else
+  {
+    err[0] = '\0';
+
+    if(wm_bt_report_path_resolve(root, sizeof(root),
+           err, sizeof(err)) != SUCCESS)
+    {
+      clam(CLAM_WARN, WM_BT_CMD_CTX,
+          "holdout log: report root unresolvable: %s",
+          err[0] != '\0' ? err : "(no detail)");
+      return(FAIL);
+    }
+
+    n = snprintf(out, cap, "%s/HOLDOUT_LOG.md", root);
+  }
+
+  if(n < 0 || (size_t)n >= cap)
+    return(FAIL);
+
+  return(SUCCESS);
+}
+
+// Append one `<utc-ts> | <who> | <strategy> | <corpus> | <detail>` row.
+// Failures warn and drop the row — the audit trail must never block a
+// legitimately flagged run. Two threads write here (command handler at
+// submit, run task at completion): O_APPEND keeps each row's write
+// atomic, and the banner is written only by whichever caller actually
+// creates the file (O_CREAT|O_EXCL), so no check-then-act race.
+static void
+wm_bt_holdout_log_append(const char *who, const char *strategy,
+    const char *corpus, const char *detail)
+{
+  char       path[1024];
+  char       ts[40];
+  time_t     now;
+  struct tm  tm;
+  bool       fresh;
+  int        fd;
+  FILE      *f;
+
+  if(wm_bt_holdout_log_path(path, sizeof(path)) != SUCCESS)
+    return;
+
+  now = time(NULL);
+
+  if(gmtime_r(&now, &tm) == NULL)
+    memset(&tm, 0, sizeof(tm));
+
+  snprintf(ts, sizeof(ts), "%04d-%02d-%02dT%02d:%02d:%02dZ",
+      tm.tm_year + 1900, tm.tm_mon + 1, tm.tm_mday,
+      tm.tm_hour, tm.tm_min, tm.tm_sec);
+
+  fd    = open(path, O_WRONLY | O_APPEND | O_CREAT | O_EXCL, 0644);
+  fresh = fd >= 0;
+
+  if(fd < 0 && errno == EEXIST)
+    fd = open(path, O_WRONLY | O_APPEND);
+
+  if(fd < 0)
+  {
+    clam(CLAM_WARN, WM_BT_CMD_CTX,
+        "holdout log: open('%s') failed: %s", path, strerror(errno));
+    return;
+  }
+
+  f = fdopen(fd, "a");
+
+  if(f == NULL)
+  {
+    clam(CLAM_WARN, WM_BT_CMD_CTX,
+        "holdout log: fdopen('%s') failed: %s", path, strerror(errno));
+    close(fd);
+    return;
+  }
+
+  if(fresh)
+    fputs("# Holdout access log (WM-RIGOR-6) — one shot per strategy"
+          " family\n\n", f);
+
+  fprintf(f, "%s | %s | %s | %s | %s\n", ts,
+      who != NULL && who[0] != '\0' ? who : "(anon)",
+      strategy, corpus,
+      detail != NULL && detail[0] != '\0' ? detail : "(none)");
+
+  fclose(f);
+
+  clam(CLAM_INFO, WM_BT_CMD_CTX,
+      "holdout access logged (%s | %s | %s) -> %s",
+      who != NULL && who[0] != '\0' ? who : "(anon)",
+      strategy, corpus, path);
+}
 
 // ----------------------------------------------------------------------- //
 // /whenmoon backtest run                                                  //
@@ -544,8 +672,10 @@ wm_bt_cmd_run_linked(const cmd_ctx_t *ctx, whenmoon_state_t *st,
   char                    tok[256];
   char                    val[256];
   const char             *q;
-  bool                    have_oos = false;
-  uint32_t                oos_pct  = 0;
+  bool                    have_oos     = false;
+  bool                    holdout_flag = false;
+  bool                    holdout_run  = false;
+  uint32_t                oos_pct      = 0;
   uint32_t                i;
 
   // Split "a+b[+c...]" into names, tolerating empty segments ("a+", "a++b").
@@ -620,6 +750,14 @@ wm_bt_cmd_run_linked(const cmd_ctx_t *ctx, whenmoon_state_t *st,
     if(tok[0] != '-' || tok[1] != '-')
       continue;
 
+    // Value-less flags — recognise before the value fetch so they
+    // don't swallow the next flag token.
+    if(strcmp(tok, "--holdout") == 0)
+    {
+      holdout_flag = true;
+      continue;
+    }
+
     if(!wm_dl_next_token(&q, val, sizeof(val)))
     {
       snprintf(reply, sizeof(reply), "flag %s needs a value", tok);
@@ -662,11 +800,28 @@ wm_bt_cmd_run_linked(const cmd_ctx_t *ctx, whenmoon_state_t *st,
     {
       snprintf(reply, sizeof(reply),
           "linked run: unsupported flag '%s' (use --fee-bps/--slip-bps/"
-          "--size-frac/--cash/--oos-tail)", tok);
+          "--size-frac/--cash/--oos-tail/--holdout)", tok);
       cmd_reply(ctx, reply);
       wm_backtest_snapshot_free(snap);
       return;
     }
+  }
+
+  // WM-RIGOR-6: linked runs are research too — the same holdout guard
+  // as the sweep path, logged at submit (the run itself is synchronous
+  // so the result line follows below).
+  if(snap->range_end_ms > WM_BT_HOLDOUT_CUTOFF_MS)
+  {
+    if(!holdout_flag)
+    {
+      cmd_reply(ctx, WM_BT_HOLDOUT_REFUSAL);
+      wm_backtest_snapshot_free(snap);
+      return;
+    }
+
+    holdout_run = true;
+    wm_bt_holdout_log_append(ctx->username, name_tok, path_tok,
+        p != NULL && p[0] != '\0' ? p : "(no flags)");
   }
 
   // Full-range run.
@@ -736,6 +891,11 @@ wm_bt_cmd_run_linked(const cmd_ctx_t *ctx, whenmoon_state_t *st,
     }
   }
 
+  if(holdout_run)
+    wm_bt_holdout_log_append("result", name_tok, path_tok,
+        "linked run complete (metrics in session reply; no artifact"
+        " dir)");
+
   wm_backtest_snapshot_free(snap);
 }
 
@@ -774,6 +934,8 @@ typedef struct
   wm_bt_sweep_mode_t      mode;
   wm_backtest_params_t    params;
   bool                    charts_force;
+  bool                    holdout_logged; // WM-RIGOR-6: close the audit
+                                          // trail at completion
   char                    name[WM_STRATEGY_NAME_SZ];
   char                    path[256];
   char                    sweep_id[160];
@@ -1046,6 +1208,17 @@ wm_bt_run_task_cb(task_t *t)
       job->plan.total_iters, job->sweep_dir);
 
 done:
+  // WM-RIGOR-6: close the audit trail opened at submit. Runs on every
+  // exit path — an aborted holdout run still spent the access.
+  if(job->holdout_logged)
+  {
+    char detail[1100];
+
+    snprintf(detail, sizeof(detail), "ok=%u fail=%u -> %s",
+        n_ok, n_fail, job->sweep_dir);
+    wm_bt_holdout_log_append("result", job->name, job->path, detail);
+  }
+
   if(writer_open)
     wm_bt_iter_close(&writer);
 
@@ -1087,6 +1260,8 @@ wm_bt_cmd_run(const cmd_ctx_t *ctx)
   bool                       have_walk     = false;
   bool                       have_oos      = false;
   bool                       charts_force  = false;  // --charts seen
+  bool                       holdout_flag  = false;  // --holdout seen
+  bool                       holdout_run   = false;  // range past cutoff
 
   st = whenmoon_get_state();
 
@@ -1113,7 +1288,7 @@ wm_bt_cmd_run(const cmd_ctx_t *ctx)
         " [--walk-forward train=Td:test=Md:step=Sd]"
         " [--oos-tail PCT]"
         " [--fill close|next-open]"
-        " [--charts]");
+        " [--holdout] [--charts]");
     return;
   }
 
@@ -1169,6 +1344,11 @@ wm_bt_cmd_run(const cmd_ctx_t *ctx)
       if(f1[0] != '-' || f1[1] != '-')
         continue;
 
+      // Value-less flags take no value token — skip them here so they
+      // don't swallow a following `--config` as their "value".
+      if(strcmp(f1, "--charts") == 0 || strcmp(f1, "--holdout") == 0)
+        continue;
+
       if(!wm_dl_next_token(&p_pre, v1, sizeof(v1)))
         break;
 
@@ -1201,6 +1381,12 @@ wm_bt_cmd_run(const cmd_ctx_t *ctx)
       if(strcmp(tok, "--charts") == 0)
       {
         charts_force = true;
+        continue;
+      }
+
+      if(strcmp(tok, "--holdout") == 0)
+      {
+        holdout_flag = true;
         continue;
       }
 
@@ -1374,7 +1560,7 @@ wm_bt_cmd_run(const cmd_ctx_t *ctx)
             "unknown flag '%s' (expected --fee-bps/--slip-bps/"
             "--size-frac/--cash/--config/--threads/--rank-by/"
             "--top-n/--perfold-top/--walk-forward/--oos-tail/"
-            "--fill/--charts)",
+            "--fill/--holdout/--charts)",
             tok);
         cmd_reply(ctx, reply);
         wm_backtest_snapshot_free(snap);
@@ -1406,6 +1592,22 @@ wm_bt_cmd_run(const cmd_ctx_t *ctx)
       wm_backtest_snapshot_free(snap);
       return;
     }
+  }
+
+  // WM-RIGOR-6: a corpus whose range extends past the frozen research
+  // cutoff carries holdout data (the locked final exam). Refuse without
+  // the explicit flag; with it, the access is audit-logged at submit
+  // (below, once the task is accepted) and again at completion.
+  if(snap->range_end_ms > WM_BT_HOLDOUT_CUTOFF_MS)
+  {
+    if(!holdout_flag)
+    {
+      cmd_reply(ctx, WM_BT_HOLDOUT_REFUSAL);
+      wm_backtest_snapshot_free(snap);
+      return;
+    }
+
+    holdout_run = true;
   }
 
   if(have_walk && have_oos)
@@ -1525,11 +1727,12 @@ wm_bt_cmd_run(const cmd_ctx_t *ctx)
     }
 
     memset(job, 0, sizeof(*job));
-    job->snap         = snap;      // ownership transfers to the task
-    job->plan         = sweep_plan;
-    job->mode         = sweep_mode;
-    job->params       = params;
-    job->charts_force = charts_force;
+    job->snap           = snap;    // ownership transfers to the task
+    job->plan           = sweep_plan;
+    job->mode           = sweep_mode;
+    job->params         = params;
+    job->charts_force   = charts_force;
+    job->holdout_logged = holdout_run;
 
     // WM-RIGOR-4: single-config runs capture the daily MTM equity
     // series so the task can write equity.jsonl; a sweep would retain
@@ -1572,6 +1775,13 @@ wm_bt_cmd_run(const cmd_ctx_t *ctx)
     }
 
     cmd_reply(ctx, reply);
+
+    // WM-RIGOR-6: submit line, written only once the task is accepted
+    // (a rejected submission spends nothing). Handler-local strings
+    // only — the worker owns `snap` now.
+    if(holdout_run)
+      wm_bt_holdout_log_append(ctx->username, name_tok, path_tok,
+          ctx->args != NULL ? ctx->args : "(none)");
   }
 }
 
@@ -1674,6 +1884,58 @@ wm_bt_compile_ms_to_pg(int64_t ms, char *out, size_t cap)
       tm.tm_hour, tm.tm_min, tm.tm_sec);
 }
 
+// Parse "MM/dd/yyyy" or ISO "YYYY-MM-DD" to epoch ms at 00:00:00Z.
+// Validation shape mirrors wm_dl_parse_date (dl_commands.c) so the
+// compile verb accepts exactly the dates the download verb does.
+static bool
+wm_bt_parse_date_ms(const char *in, int64_t *out_ms)
+{
+  unsigned  mm       = 0;
+  unsigned  dd       = 0;
+  unsigned  yyyy     = 0;
+  int       consumed = 0;
+  struct tm tm;
+  time_t    t;
+
+  if(in == NULL || out_ms == NULL)
+    return(FAIL);
+
+  if(sscanf(in, "%u/%u/%u%n", &mm, &dd, &yyyy, &consumed) == 3 &&
+     in[consumed] == '\0')
+  {
+    // MM/dd/yyyy — fields land directly in mm, dd, yyyy.
+  }
+  else if(sscanf(in, "%u-%u-%u%n", &yyyy, &mm, &dd, &consumed) == 3 &&
+          in[consumed] == '\0')
+  {
+    // ISO YYYY-MM-DD.
+  }
+  else
+  {
+    return(FAIL);
+  }
+
+  if(mm < 1 || mm > 12 || dd < 1 || dd > 31 ||
+     yyyy < 1970 || yyyy > 9999)
+    return(FAIL);
+
+  memset(&tm, 0, sizeof(tm));
+  tm.tm_year = (int)yyyy - 1900;
+  tm.tm_mon  = (int)mm - 1;
+  tm.tm_mday = (int)dd;
+
+  // timegm, not mktime: cutoff dates are defined in UTC and must not
+  // shift with the host timezone.
+  t = timegm(&tm);
+
+  if(t == (time_t)-1)
+    return(FAIL);
+
+  *out_ms = (int64_t)t * 1000LL;
+
+  return(SUCCESS);
+}
+
 // Async payload for a backtest-compile task. The command handler
 // validates cheaply, copies the request here, and hands it to a
 // lowest-priority worker so the (multi-second, multi-million-row)
@@ -1683,6 +1945,7 @@ typedef struct
 {
   int32_t  market_id;
   uint32_t days;
+  int64_t  until_ms;       // cap on the newest edge; 0 = none (RIGOR-6)
   char     market[64];     // canonical <exch>-<base>-<quote> as given
   char     path[256];      // output .wm path
 } wm_bt_compile_task_t;
@@ -1716,6 +1979,11 @@ wm_bt_compile_task_cb(task_t *t)
 
   end_ms = latest_ms;
 
+  // WM-RIGOR-6: --until caps the newest edge so a research corpus
+  // freezes at the holdout cutoff no matter when it is compiled.
+  if(job->until_ms > 0 && job->until_ms < end_ms)
+    end_ms = job->until_ms;
+
   if(job->days == 0)
   {
     if(wm_bt_earliest_1m_bar_ms(job->market_id, &start_ms) != SUCCESS)
@@ -1732,7 +2000,10 @@ wm_bt_compile_task_cb(task_t *t)
   }
   else
   {
-    start_ms = latest_ms - ((int64_t)job->days * 86400LL * 1000LL);
+    // The lookback anchors at the (possibly --until-capped) newest
+    // edge, so `<days> --until <date>` composes as "days back from
+    // date" rather than "days back from now".
+    start_ms = end_ms - ((int64_t)job->days * 86400LL * 1000LL);
   }
 
   if(start_ms >= end_ms)
@@ -1809,14 +2080,17 @@ wm_bt_cmd_compile(const cmd_ctx_t *ctx)
   const char           *p;
   char                  pair_tok[64]   = {0};
   char                  path_tok[256]  = {0};
-  char                  days_tok[32]   = {0};
+  char                  arg_tok[64]    = {0};
+  char                  until_tok[32]  = {0};
   char                  exch[32]       = {0};
   char                  base[16]       = {0};
   char                  quote[16]      = {0};
   char                  symbol[32]     = {0};
   char                  reply[512];
   char                  task_name[TASK_NAME_SZ];
-  uint32_t              days = WM_BT_COMPILE_DEFAULT_DAYS;
+  uint32_t              days      = WM_BT_COMPILE_DEFAULT_DAYS;
+  int64_t               until_ms  = 0;
+  bool                  have_days = false;
   int32_t               market_id;
   wm_bt_compile_task_t *job;
   task_t               *t;
@@ -1836,26 +2110,57 @@ wm_bt_cmd_compile(const cmd_ctx_t *ctx)
      !wm_dl_next_token(&p, path_tok, sizeof(path_tok)))
   {
     cmd_reply(ctx,
-        "usage: /whenmoon backtest compile <market> <path.wm> [<days>]");
+        "usage: /whenmoon backtest compile <market> <path.wm>"
+        " [<days>] [--until <date>]");
     return;
   }
 
-  // Optional days arg. Absence or "0" means "full available history".
-  if(wm_dl_next_token(&p, days_tok, sizeof(days_tok)))
+  // Optional tail, order-free: [<days>] [--until <date>]. Absent days
+  // or "0" means "full available history". --until caps the range's
+  // newest edge at <date> 00:00:00Z (WM-RIGOR-6 research corpora); a
+  // <days> lookback then anchors at the cap, so the two compose.
+  while(wm_dl_next_token(&p, arg_tok, sizeof(arg_tok)))
   {
-    char  *end_p = NULL;
-    long   v;
-
-    errno = 0;
-    v = strtol(days_tok, &end_p, 10);
-
-    if(end_p == days_tok || errno != 0 || v < 0)
+    if(strcmp(arg_tok, "--until") == 0)
     {
-      cmd_reply(ctx, "bad <days> (expected non-negative integer)");
+      if(!wm_dl_next_token(&p, until_tok, sizeof(until_tok)))
+      {
+        cmd_reply(ctx, "missing value for --until");
+        return;
+      }
+
+      if(wm_bt_parse_date_ms(until_tok, &until_ms) != SUCCESS)
+      {
+        cmd_reply(ctx,
+            "bad --until date (expected MM/dd/yyyy or YYYY-MM-DD)");
+        return;
+      }
+    }
+    else if(!have_days)
+    {
+      char  *end_p = NULL;
+      long   v;
+
+      errno = 0;
+      v = strtol(arg_tok, &end_p, 10);
+
+      if(end_p == arg_tok || *end_p != '\0' || errno != 0 || v < 0)
+      {
+        cmd_reply(ctx, "bad <days> (expected non-negative integer)");
+        return;
+      }
+
+      days      = (uint32_t)v;
+      have_days = true;
+    }
+    else
+    {
+      snprintf(reply, sizeof(reply),
+          "unrecognised token '%s' (expected <days> or --until <date>)",
+          arg_tok);
+      cmd_reply(ctx, reply);
       return;
     }
-
-    days = (uint32_t)v;
   }
 
   if(wm_market_parse_id(pair_tok, exch, sizeof(exch),
@@ -1902,6 +2207,7 @@ wm_bt_cmd_compile(const cmd_ctx_t *ctx)
   memset(job, 0, sizeof(*job));
   job->market_id = market_id;
   job->days      = days;
+  job->until_ms  = until_ms;
   snprintf(job->market, sizeof(job->market), "%s", pair_tok);
   snprintf(job->path,   sizeof(job->path),   "%s", path_tok);
 
@@ -1918,10 +2224,13 @@ wm_bt_cmd_compile(const cmd_ctx_t *ctx)
   }
 
   snprintf(reply, sizeof(reply),
-      "task created: '%s' (pri %u) — compiling %s%s -> %s;"
+      "task created: '%s' (pri %u) — compiling %s%s%s%s -> %s;"
       " watch /show tasks, result lands in the log",
       task_name, WM_BT_COMPILE_TASK_PRIORITY, pair_tok,
-      days == 0 ? " (full history)" : "", path_tok);
+      days == 0 ? " (full history)" : "",
+      until_ms > 0 ? " until " : "",
+      until_ms > 0 ? until_tok : "",
+      path_tok);
   cmd_reply(ctx, reply);
 }
 
@@ -2203,7 +2512,7 @@ wm_backtest_register_verbs(void)
         "whenmoon backtest <verb> ...",
         "Backtest runner + sweep planner.",
         "Subcommands: run <path.wm> <strat> [name=value ...],"
-        " compile <market_id> <path.wm> [<days>],"
+        " compile <market_id> <path.wm> [<days>] [--until <date>],"
         " inspect <path.wm>,"
         " list,"
         " show <sweep_id>,"
@@ -2223,7 +2532,7 @@ wm_backtest_register_verbs(void)
         " [--walk-forward train=Td:test=Md:step=Sd]"
         " [--oos-tail PCT]"
         " [--fill close|next-open]"
-        " [--charts]",
+        " [--holdout] [--charts]",
         "Run a backtest against a compiled .wm snapshot — single"
         " iteration, parameter sweep, walk-forward, or OOS-tail"
         " validation.",
@@ -2278,15 +2587,17 @@ wm_backtest_register_verbs(void)
         " is dropped and counted in the log). Backtest-only; live"
         " trading is unaffected. Compare both modes on a fixed config:"
         " <10%% rr decay = healthy; >30%% = the edge was fill fiction.\n"
+        "--holdout is required when the corpus extends past the"
+        " 2025-03-31 research cutoff; the access is audit-logged"
+        " (COMPSTART.md §Holdout discipline).\n"
         "Each invocation writes a sweep directory under"
         " plugin.whenmoon.backtest.report_path (defaulting to"
         " $HOME/.local/share/botmanager/backtests/) containing"
         " manifest.json, iterations.jsonl, top-N.txt, report.md, and"
         " a charts/ subdir. Single-config runs also write equity.jsonl"
-        " (one daily mark-to-market equity sample per line); every run's"
-        " metrics carry mtm_max_dd + daily_sharpe_ann computed from the"
-        " same daily marks (per-fill max_drawdown only observes fill"
-        " days).\n"
+        " (daily mark-to-market samples); every run's metrics carry"
+        " mtm_max_dd + daily_sharpe_ann from the same daily marks"
+        " (per-fill max_drawdown only observes fill days).\n"
         "--charts forces Lightweight Charts HTML emission for this"
         " run (default-off unless"
         " plugin.whenmoon.backtest.charts_enabled=true). SINGLE-CONFIG"
@@ -2320,7 +2631,8 @@ wm_backtest_register_verbs(void)
     return(FAIL);
 
   if(cmd_register("whenmoon", "compile",
-        "whenmoon backtest compile <market_id> <path.wm> [<days>]",
+        "whenmoon backtest compile <market_id> <path.wm> [<days>]"
+        " [--until <date>]",
         "Compile a .wm snapshot file from persisted 1m candles (async).",
         "Validates the request, then returns immediately with a"
         " 'task created' acknowledgement: the build runs on a worker"
@@ -2331,8 +2643,14 @@ wm_backtest_register_verbs(void)
         " wm_candles_<id> table over the most recent <days> of 1m"
         " history (default 0 = all available history), then serialises"
         " the snapshot to <path.wm> via mmap-friendly host-endian"
-        " binary form (host-portable across daemon restarts; WM-BT-2"
-        " format magic 0x4D4E4257, version 1).\n"
+        " binary form.\n"
+        "--until <date> (MM/dd/yyyy or YYYY-MM-DD, UTC midnight) caps"
+        " the range's newest edge so research corpora freeze at the"
+        " WM-RIGOR-6 holdout cutoff no matter when they are compiled;"
+        " a <days> lookback then anchors at the cap (days back from"
+        " <date>, not from now), so the two compose.\n"
+        "The binary form is host-portable across daemon restarts"
+        " (WM-BT-2 format magic 0x4D4E4257, version 1).\n"
         "The pre-flight tolerates gaps of any size (illiquid early"
         " history is legitimately sparse) and only refuses an entirely"
         " empty range. Output is atomic via tmp+fsync+rename. Re-runs"
