@@ -497,6 +497,14 @@ wm_bt_build_metrics_obj(const wm_bt_sweep_result_t *result)
   // buy-and-hold benchmark without re-deriving the resolution chain.
   wm_bt_obj_add_double(obj, "size_frac",     snap->size_frac);
 
+  // WM-RIGOR-4: daily mark-to-market stats. `max_drawdown` above only
+  // observes the book on fill days; `mtm_max_dd` marks every 1d close
+  // and is the honest drawdown (wm_score.py prefers it when present).
+  wm_bt_obj_add_double(obj, "mtm_max_dd",       result->mtm_max_dd);
+  wm_bt_obj_add_double(obj, "daily_sharpe_ann", result->daily_sharpe_ann);
+  json_object_object_add(obj, "mtm_days",
+      json_object_new_int64((int64_t)result->mtm_days));
+
   return(obj);
 }
 
@@ -567,6 +575,11 @@ wm_bt_build_windows_arr(const wm_bt_sweep_result_t *result)
     // null when the window held too few bars to price it (NaN path).
     wm_bt_obj_add_double(obj, "bench_return",
         f->bench_ok ? f->bench_return : (double)NAN);
+
+    // WM-RIGOR-4: the fold's true MTM drawdown + annualized daily
+    // Sharpe over its in-window 1d closes.
+    wm_bt_obj_add_double(obj, "mtm_max_dd",       f->mtm_max_dd);
+    wm_bt_obj_add_double(obj, "daily_sharpe_ann", f->daily_sharpe_ann);
 
     json_object_array_add(arr, obj);
   }
@@ -661,6 +674,54 @@ wm_bt_iter_close(wm_bt_iterations_writer_t *w)
   }
 
   pthread_mutex_destroy(&w->lock);
+}
+
+bool
+wm_bt_equity_write(const char *sweep_dir,
+    const wm_bt_equity_pt_t *pts, uint32_t n_pts,
+    char *err, size_t err_cap)
+{
+  char      path[1024];
+  FILE     *fp;
+  int       n;
+  uint32_t  i;
+
+  if(err != NULL && err_cap > 0)
+    err[0] = '\0';
+
+  if(sweep_dir == NULL || pts == NULL || n_pts == 0)
+  {
+    if(err != NULL)
+      snprintf(err, err_cap, "equity_write: no series");
+    return(FAIL);
+  }
+
+  n = snprintf(path, sizeof(path), "%s/equity.jsonl", sweep_dir);
+
+  if(n < 0 || (size_t)n >= sizeof(path))
+  {
+    if(err != NULL)
+      snprintf(err, err_cap, "equity path overflow");
+    return(FAIL);
+  }
+
+  fp = fopen(path, "w");
+
+  if(fp == NULL)
+  {
+    if(err != NULL)
+      snprintf(err, err_cap,
+          "fopen('%s') failed: %s", path, strerror(errno));
+    return(FAIL);
+  }
+
+  for(i = 0; i < n_pts; i++)
+    fprintf(fp, "{\"ts_ms\":%" PRId64 ",\"equity\":%.10g}\n",
+        pts[i].ts_ms, pts[i].equity);
+
+  fflush(fp);
+  fclose(fp);
+  return(SUCCESS);
 }
 
 // ----------------------------------------------------------------------- //

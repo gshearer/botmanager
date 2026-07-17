@@ -39,6 +39,7 @@
 #include "db.h"
 
 #include <inttypes.h>
+#include <math.h>
 #include <pthread.h>
 #include <stdatomic.h>
 #include <stdio.h>
@@ -588,6 +589,127 @@ wm_bt_in_any_window(const wm_bt_window_t *w, uint32_t n, int64_t ts_ms)
   return(false);
 }
 
+// ----------------------------------------------------------------------- //
+// WM-RIGOR-4: daily mark-to-market tracker                                //
+// ----------------------------------------------------------------------- //
+//
+// The per-fill drawdown in market_engine.c only observes the book when a
+// fill lands, so a wide-exit config that rides a 40% dip to a profitable
+// close never shows the dip. This tracker marks the book at every 1d bar
+// close instead: peak/trough over the marks gives the true MTM max
+// drawdown, and a Welford pass over the daily simple returns gives an
+// annualized daily Sharpe (mean/std x sqrt(365), rf = 0, population
+// variance — the same convention as wm_market_stats_sharpe). The series
+// itself is captured only when the caller asks (equity.jsonl emission on
+// single-config runs); the scalars are always accumulated.
+
+typedef struct
+{
+  double              prev_eq;    // last mark; seeds from starting cash
+  double              peak;       // running equity peak
+  double              max_dd;     // worst (peak - eq) / peak seen
+  uint64_t            n_ret;      // Welford sample count (daily returns)
+  double              mean;       // Welford running mean
+  double              m2;         // Welford running sum of squared devs
+  uint32_t            n_marks;    // 1d closes marked
+  wm_bt_equity_pt_t  *series;     // lazily allocated when capturing
+  uint32_t            s_n;
+  uint32_t            s_cap;
+  bool                capture;
+} wm_bt_mtm_t;
+
+static void
+wm_bt_mtm_init(wm_bt_mtm_t *m, double start_cash, bool capture)
+{
+  memset(m, 0, sizeof(*m));
+
+  m->capture = capture;
+
+  // Seed peak + baseline from starting cash so a first-day loss
+  // registers in both drawdown and the first daily return. A
+  // non-positive start (defensive) seeds lazily from the first mark.
+  if(start_cash > 0.0)
+  {
+    m->prev_eq = start_cash;
+    m->peak    = start_cash;
+  }
+}
+
+static void
+wm_bt_mtm_mark(wm_bt_mtm_t *m, int64_t ts_ms, double eq)
+{
+  if(m->prev_eq > 0.0)
+  {
+    double r     = eq / m->prev_eq - 1.0;
+    double delta = r - m->mean;
+
+    m->n_ret++;
+    m->mean += delta / (double)m->n_ret;
+    m->m2   += delta * (r - m->mean);
+  }
+
+  m->prev_eq = eq;
+  m->n_marks++;
+
+  if(eq > m->peak)
+    m->peak = eq;
+
+  if(m->peak > 0.0)
+  {
+    double dd = (m->peak - eq) / m->peak;
+
+    if(dd > m->max_dd)
+      m->max_dd = dd;
+  }
+
+  if(m->capture)
+  {
+    if(m->s_n == m->s_cap)
+    {
+      uint32_t newcap = m->s_cap ? m->s_cap * 2u : 512u;
+
+      m->series = (m->s_cap == 0)
+          ? mem_alloc(WM_BT_CTX, "mtm_equity",
+                sizeof(*m->series) * (size_t)newcap)
+          : mem_realloc(m->series, sizeof(*m->series) * (size_t)newcap);
+      m->s_cap  = newcap;
+    }
+
+    m->series[m->s_n].ts_ms  = ts_ms;
+    m->series[m->s_n].equity = eq;
+    m->s_n++;
+  }
+}
+
+// Publish the accumulated stats into the result and hand over the
+// captured series (ownership transfers with it; NULL when capture was
+// off or no 1d bar marked).
+static void
+wm_bt_mtm_finish(wm_bt_mtm_t *m, wm_backtest_result_t *out)
+{
+  out->mtm_max_dd = m->max_dd;
+  out->mtm_days   = m->n_marks;
+
+  if(m->n_ret >= 2)
+  {
+    double variance = m->m2 / (double)m->n_ret;
+
+    if(variance > 0.0)
+    {
+      double stddev = sqrt(variance);
+
+      if(isfinite(stddev) && stddev > 0.0)
+        out->daily_sharpe_ann = m->mean / stddev * sqrt(365.0);
+    }
+  }
+
+  out->equity   = m->series;
+  out->n_equity = m->s_n;
+  m->series     = NULL;
+  m->s_n        = 0;
+  m->s_cap      = 0;
+}
+
 bool
 wm_backtest_run_iteration_multi(whenmoon_state_t *st,
     wm_backtest_snapshot_t *snap,
@@ -631,6 +753,7 @@ wm_backtest_run_iteration_multi(whenmoon_state_t *st,
   uint64_t                        prev_fn;
   const wm_market_stats_t        *ps;
   double                          win_rate;
+  wm_bt_mtm_t                     mtm;
 
   if(err != NULL && err_cap > 0)
     err[0] = '\0';
@@ -725,6 +848,12 @@ wm_backtest_run_iteration_multi(whenmoon_state_t *st,
   }
 
   wm_market_session_apply_iter_overrides(&synth_mk->session, params);
+
+  // WM-RIGOR-4: the tracker seeds from the post-override starting cash;
+  // the series buffer is captured only on request (single-config runs).
+  wm_bt_mtm_init(&mtm,
+      synth_mk->session.stats[WM_MARKET_MODE_PAPER].starting_cash,
+      params != NULL && params->want_equity_series);
 
   // Build + init each strategy ctx. All point mkt at the shared synth
   // market so every emit lands on the one book. A failed init unwinds the
@@ -889,6 +1018,27 @@ wm_backtest_run_iteration_multi(whenmoon_state_t *st,
       }
     }
 
+    // WM-RIGOR-4: mark the book at every 1d close. The 1d bar's
+    // ts_close_ms ties with the day's final lower-grain bars, and ties
+    // resolve lower-grain-first, so every fill of the day has already
+    // settled cash/position by the time the 1d bar lands here. The hook
+    // sits outside the `subscribed` gate — unsubscribed grains still
+    // walk through this loop, so the marks fire even when no strategy
+    // trades on 1d. Windowed runs mark only in-window days, keeping
+    // fold stats undiluted by the flat train/warmup stretches where
+    // the strategy never fires.
+    if(g == WM_GRAN_1D &&
+       (n_windows == 0 ||
+        wm_bt_in_any_window(windows, n_windows, bar->ts_close_ms)))
+    {
+      double eq = sess->stats[WM_MARKET_MODE_PAPER].cash;
+
+      if(sess->position.side == WM_MARKET_POS_LONG)
+        eq += sess->position.qty * bar->close;
+
+      wm_bt_mtm_mark(&mtm, bar->ts_close_ms, eq);
+    }
+
     cursors[g].idx++;
   }
 
@@ -905,6 +1055,9 @@ wm_backtest_run_iteration_multi(whenmoon_state_t *st,
     if(acc_fills != NULL)
       mem_free(acc_fills);
 
+    if(mtm.series != NULL)
+      mem_free(mtm.series);
+
     wm_market_destroy_synthetic(synth_mk);
 
     if(err != NULL)
@@ -917,6 +1070,10 @@ wm_backtest_run_iteration_multi(whenmoon_state_t *st,
   // iteration traded nothing; the caller's free path guards NULL.
   out->fills   = acc_fills;
   out->n_fills = acc_n;
+
+  // WM-RIGOR-4: publish the MTM stats + transfer the captured equity
+  // series (NULL unless params->want_equity_series).
+  wm_bt_mtm_finish(&mtm, out);
 
   fills_paper    =
       out->trade.stats[WM_MARKET_MODE_PAPER].lifetime_fills_count;

@@ -1155,6 +1155,15 @@ wm_bt_sweep_run_one(wm_bt_pool_t *pool, uint32_t iter,
   result->fills         = bt_result.fills;
   result->n_fills       = bt_result.n_fills;
 
+  // WM-RIGOR-4: MTM scalars ride every row; the equity series (non-NULL
+  // only when the planner requested capture — single-config runs) moves
+  // to the row with the same ownership story as `fills`.
+  result->mtm_max_dd       = bt_result.mtm_max_dd;
+  result->daily_sharpe_ann = bt_result.daily_sharpe_ann;
+  result->mtm_days         = bt_result.mtm_days;
+  result->equity           = bt_result.equity;
+  result->n_equity         = bt_result.n_equity;
+
   wm_bt_sweep_drop_iter_kv(synth_id);
 }
 
@@ -1657,13 +1666,14 @@ wm_bt_sweep_run_oos_validation(whenmoon_state_t *st,
     wm_bt_sweep_result_t *results,
     char *err, size_t err_cap)
 {
-  uint32_t  *top_idx = NULL;
-  double    *top_score = NULL;
-  uint32_t   top_k;
-  uint32_t   i;
-  uint32_t   j;
-  uint32_t   n;
-  uint32_t   n_validated = 0;
+  uint32_t             *top_idx = NULL;
+  double               *top_score = NULL;
+  uint32_t              top_k;
+  uint32_t              i;
+  uint32_t              j;
+  uint32_t              n;
+  uint32_t              n_validated = 0;
+  wm_backtest_params_t  oos_params;
 
   (void)market_id_db;
 
@@ -1677,6 +1687,16 @@ wm_bt_sweep_run_oos_validation(whenmoon_state_t *st,
       snprintf(err, err_cap, "bad oos validation inputs");
     return(FAIL);
   }
+
+  // WM-RIGOR-4: validation iterations run purely for scoring — never
+  // capture the equity series a single-config run may have requested.
+  // NULL base params stay legal (= no overrides), as everywhere else.
+  memset(&oos_params, 0, sizeof(oos_params));
+
+  if(base_params != NULL)
+    oos_params = *base_params;
+
+  oos_params.want_equity_series = false;
 
   if(oos_tail->end_ts_ms <= oos_tail->start_ts_ms)
   {
@@ -1779,7 +1799,7 @@ wm_bt_sweep_run_oos_validation(whenmoon_state_t *st,
 
     iter_err[0] = '\0';
     iter_ok = wm_backtest_run_iteration_with_id(st, snap,
-        strategy_name, synth_id, base_params,
+        strategy_name, synth_id, &oos_params,
         oos_tail, 1, &bt_result, iter_err, sizeof(iter_err))
         == SUCCESS;
 
@@ -1854,9 +1874,18 @@ wm_bt_perfold_one_row(whenmoon_state_t *st, wm_backtest_snapshot_t *snap,
     const wm_backtest_params_t *base_params, uint32_t src_iter,
     wm_bt_sweep_result_t *row)
 {
-  wm_bt_fold_metric_t *folds;
-  uint32_t             indices[WM_BT_SWEEP_MAX_PARAMS] = {0};
-  uint32_t             w;
+  wm_bt_fold_metric_t  *folds;
+  uint32_t              indices[WM_BT_SWEEP_MAX_PARAMS] = {0};
+  uint32_t              w;
+  wm_backtest_params_t  fold_params = {0};
+
+  // WM-RIGOR-4: fold iterations need only the MTM scalars — never the
+  // equity series a single-config run's base params may have requested.
+  // NULL base params stay legal (= no overrides), as everywhere else.
+  if(base_params != NULL)
+    fold_params = *base_params;
+
+  fold_params.want_equity_series = false;
 
   folds = mem_alloc("whenmoon.sweep", "wf_folds",
       sizeof(*folds) * (size_t)walk->n);
@@ -1904,7 +1933,7 @@ wm_bt_perfold_one_row(whenmoon_state_t *st, wm_backtest_snapshot_t *snap,
     // still walks the whole snapshot so indicators are warmed by the
     // pre-window history (see wm_backtest_run_iteration_with_id doc).
     iter_ok = wm_backtest_run_iteration_with_id(st, snap,
-        strategy_name, synth_id, base_params,
+        strategy_name, synth_id, &fold_params,
         win, 1, &bt_result, iter_err, sizeof(iter_err)) == SUCCESS;
 
     wm_bt_sweep_drop_iter_kv(synth_id);
@@ -1921,6 +1950,12 @@ wm_bt_perfold_one_row(whenmoon_state_t *st, wm_backtest_snapshot_t *snap,
       folds[w].final_equity = wm_bt_compute_equity(&bt_result.trade);
       folds[w].n_trades     = sp->n_wins + sp->n_losses;
       folds[w].ok           = true;
+
+      // WM-RIGOR-4: the fold's true MTM drawdown + daily Sharpe over
+      // its in-window 1d closes (the single-window run marks only
+      // inside `win`, so these are per-fold readings by construction).
+      folds[w].mtm_max_dd       = bt_result.mtm_max_dd;
+      folds[w].daily_sharpe_ann = bt_result.daily_sharpe_ann;
     }
 
     // Per-fold charts are not needed; free the captured fills buffer.

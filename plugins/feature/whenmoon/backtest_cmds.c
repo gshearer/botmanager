@@ -107,6 +107,15 @@ wm_bt_results_free_fills(wm_bt_sweep_result_t *results, uint32_t n)
       results[i].folds   = NULL;
       results[i].n_folds = 0;
     }
+
+    // WM-RIGOR-4: the captured daily equity series rides the same
+    // ownership story (non-NULL only on single-config runs).
+    if(results[i].equity != NULL)
+    {
+      mem_free(results[i].equity);
+      results[i].equity   = NULL;
+      results[i].n_equity = 0;
+    }
   }
 }
 
@@ -923,6 +932,25 @@ wm_bt_run_task_cb(task_t *t)
   wm_bt_iter_close(&writer);
   writer_open = false;
 
+  // WM-RIGOR-4: single-config runs carry a captured daily MTM equity
+  // series — write it beside iterations.jsonl. Warn-and-continue on
+  // failure (the metrics artifacts still ship).
+  if(job->plan.total_iters == 1 && sweep_results[0].ok &&
+     sweep_results[0].equity != NULL)
+  {
+    err[0] = '\0';
+
+    if(wm_bt_equity_write(job->sweep_dir, sweep_results[0].equity,
+           sweep_results[0].n_equity, err, sizeof(err)) != SUCCESS)
+      clam(CLAM_WARN, WM_BT_CMD_CTX,
+          "run %s: equity.jsonl write failed: %s",
+          job->name, err[0] != '\0' ? err : "(unknown)");
+    else
+      clam(CLAM_INFO, WM_BT_CMD_CTX,
+          "run %s: %u daily equity marks -> %s/equity.jsonl",
+          job->name, sweep_results[0].n_equity, job->sweep_dir);
+  }
+
   // Post-run manifest rewrite with final stats. Atomic via tmp+rename.
   err[0] = '\0';
 
@@ -1482,6 +1510,13 @@ wm_bt_cmd_run(const cmd_ctx_t *ctx)
     job->mode         = sweep_mode;
     job->params       = params;
     job->charts_force = charts_force;
+
+    // WM-RIGOR-4: single-config runs capture the daily MTM equity
+    // series so the task can write equity.jsonl; a sweep would retain
+    // one series per row for the whole run, so only total_iters == 1
+    // asks for it. (The per-fold and OOS post-passes clear the flag on
+    // their own iteration params.)
+    job->params.want_equity_series = (sweep_plan.total_iters == 1);
     snprintf(job->name,      sizeof(job->name),      "%s", name_tok);
     snprintf(job->path,      sizeof(job->path),      "%s", path_tok);
     snprintf(job->sweep_id,  sizeof(job->sweep_id),  "%s", sweep_id);
@@ -2217,7 +2252,11 @@ wm_backtest_register_verbs(void)
         " plugin.whenmoon.backtest.report_path (defaulting to"
         " $HOME/.local/share/botmanager/backtests/) containing"
         " manifest.json, iterations.jsonl, top-N.txt, report.md, and"
-        " a charts/ subdir.\n"
+        " a charts/ subdir. Single-config runs also write equity.jsonl"
+        " (one daily mark-to-market equity sample per line); every run's"
+        " metrics carry mtm_max_dd + daily_sharpe_ann computed from the"
+        " same daily marks (per-fill max_drawdown only observes fill"
+        " days).\n"
         "--charts forces Lightweight Charts HTML emission for this"
         " run (default-off unless"
         " plugin.whenmoon.backtest.charts_enabled=true). SINGLE-CONFIG"

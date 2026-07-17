@@ -13,17 +13,20 @@ market, and reports BOTH scoring conventions side by side:
          (WM-RIGOR-2: net minus the deployment-matched buy-and-hold of
          the same asset over the same fold — a strategy deploying only
          size_frac of the book is measured against parking that same
-         fraction in the asset; precise time-weighted exposure arrives
-         with WM-RIGOR-4)
+         fraction in the asset; WM-RIGOR-4's equity.jsonl provides the
+         daily series a future time-weighted-exposure refinement needs)
   act_fx fold returns = net - windows[].bench_return
          (full-exposure active return — the hard bound; reported, not
          gated)
 
 Per market and pooled across markets: mean_fold, std_fold (population),
 worst_fold, pos_frac, robust_ratio = mean/std, plus trades/mo and the
-engine max_drawdown, then the COMPSTART §4 eligibility gates evaluated on
+drawdown, then the COMPSTART §4 eligibility gates evaluated on
 gross, net, AND active (active gates need windows[].bench_return, i.e. a
-run from a WM-RIGOR-2 binary; older runs score gross/net only).
+run from a WM-RIGOR-2 binary; older runs score gross/net only). The DD
+gate prefers metrics.mtm_max_dd (WM-RIGOR-4 daily mark-to-market) over
+the per-fill engine max_drawdown, which only observes fill days; the
+table prints both so the flattery gap is visible.
 
 Usage:
     python3 tools/wm_score.py <sweep_dir> [<sweep_dir> ...] [--json]
@@ -168,7 +171,18 @@ def score_market(run):
         "folds_net": net,
         "gross": fold_stats(gross),
         "net": fold_stats(net),
-        "max_drawdown": run["metrics"].get("max_drawdown"),
+        # WM-RIGOR-4: the DD gate prefers the daily mark-to-market
+        # drawdown when the run carries it — per-fill max_drawdown only
+        # observes the book on fill days, flattering wide-exit configs.
+        # Older (pre-RIGOR-4) runs fall back to the per-fill number.
+        "max_drawdown": (run["metrics"]["mtm_max_dd"]
+                         if run["metrics"].get("mtm_max_dd") is not None
+                         else run["metrics"].get("max_drawdown")),
+        "dd_source": ("mtm"
+                      if run["metrics"].get("mtm_max_dd") is not None
+                      else "per_fill"),
+        "per_fill_max_drawdown": run["metrics"].get("max_drawdown"),
+        "daily_sharpe_ann": run["metrics"].get("daily_sharpe_ann"),
         "trades": trades,
         "trades_pm": trades / months if months else 0.0,
         "n_folds": len(gross),
@@ -476,8 +490,16 @@ def render_table(result):
     for m in result["markets"]:
         bench = ("  hold/fold=%s" % pct(m["bench"]["mean_fold"])
                  if "bench" in m else "")
-        out.append("%-18s maxDD=%s  trades=%d  trades/mo=%.2f%s"
-                   % (m["market"], pct(m["max_drawdown"], signed=False),
+        # WM-RIGOR-4: gate DD is MTM when available; show the per-fill
+        # number beside it so the flattery gap is visible at a glance.
+        if m["dd_source"] == "mtm" and m["per_fill_max_drawdown"] is not None:
+            dd = ("mtmDD=%s fillDD=%s"
+                  % (pct(m["max_drawdown"], signed=False),
+                     pct(m["per_fill_max_drawdown"], signed=False)))
+        else:
+            dd = "maxDD=%s(per-fill)" % pct(m["max_drawdown"], signed=False)
+        out.append("%-18s %s  trades=%d  trades/mo=%.2f%s"
+                   % (m["market"], dd,
                       m["trades"], m["trades_pm"], bench))
     out.append("%-18s trades/mo=%.2f (secondary)"
                % ("POOLED", result["pooled"]["trades_pm"]))

@@ -165,6 +165,12 @@ typedef struct
   // when bench_ok; bench_ok false means the window held < 2 1m bars.
   double    bench_return;
   bool      bench_ok;
+
+  // WM-RIGOR-4: daily mark-to-market stats over this fold's in-window
+  // 1d closes (see wm_backtest_result_t for conventions). The honest
+  // fold drawdown — per-fill max_drawdown only observes fill days.
+  double    mtm_max_dd;
+  double    daily_sharpe_ann;
 } wm_bt_fold_metric_t;
 
 // ----------------------------------------------------------------------- //
@@ -209,6 +215,17 @@ typedef struct
   // walk-forward rows outside the top-K.
   wm_bt_fold_metric_t  *folds;
   uint32_t              n_folds;
+
+  // WM-RIGOR-4: daily mark-to-market stats for the iteration (see
+  // wm_backtest_result_t for conventions) + the equity series behind
+  // them. The series is non-NULL only on single-config runs (the run
+  // planner requests capture when total_iters == 1 so equity.jsonl can
+  // be written); heap-owned, freed by wm_bt_results_free_fills.
+  double                mtm_max_dd;
+  double                daily_sharpe_ann;
+  uint32_t              mtm_days;
+  wm_bt_equity_pt_t    *equity;
+  uint32_t              n_equity;
 } wm_bt_sweep_result_t;
 
 // Score extraction from a synth-market snapshot. NaN/inf collapse to

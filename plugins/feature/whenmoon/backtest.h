@@ -169,11 +169,27 @@ typedef struct wm_backtest_params
   bool    have_slip_bps;      double  slip_bps;
   bool    have_size_frac;     double  size_frac;
   bool    have_starting_cash; double  starting_cash;
+
+  // WM-RIGOR-4: capture the daily mark-to-market equity series into
+  // wm_backtest_result_t.equity. The scalar MTM stats (mtm_max_dd /
+  // daily_sharpe_ann) are always computed; the series buffer is only
+  // worth its memory on single-config runs (the run planner sets this
+  // when total_iters == 1 so equity.jsonl can be written — a sweep
+  // would retain one series per row for the whole run).
+  bool    want_equity_series;
 } wm_backtest_params_t;
 
 // ----------------------------------------------------------------------- //
 // Iteration result                                                        //
 // ----------------------------------------------------------------------- //
+
+// WM-RIGOR-4: one daily mark-to-market equity sample — the book marked
+// at a 1d bar's close (equity = PAPER cash + open-long qty x close).
+typedef struct
+{
+  int64_t  ts_ms;     // the 1d bar's ts_close_ms
+  double   equity;
+} wm_bt_equity_pt_t;
 
 typedef struct wm_backtest_result
 {
@@ -193,6 +209,25 @@ typedef struct wm_backtest_result
   // produced no fills.
   wm_market_fill_t             *fills;
   uint32_t                      n_fills;
+
+  // WM-RIGOR-4: daily mark-to-market time-series stats — the honest
+  // counterpart of the per-fill numbers, which only observe the book on
+  // fill days and so flatter wide-exit configs. Marked on every 1d bar
+  // close inside the run's windows (all 1d closes on full-range runs).
+  // mtm_max_dd is the peak-to-trough fraction over those marks (seeded
+  // from starting cash, so a day-one loss registers); daily_sharpe_ann
+  // is mean/std of daily simple returns x sqrt(365), rf = 0, population
+  // std — 0.0 when fewer than two returns exist. mtm_days counts marks.
+  double                        mtm_max_dd;
+  double                        daily_sharpe_ann;
+  uint32_t                      mtm_days;
+
+  // WM-RIGOR-4: the daily equity series behind the stats above.
+  // Captured only when params->want_equity_series; heap-owned via
+  // mem_alloc, ownership transfers to the caller alongside `fills`.
+  // NULL/0 otherwise.
+  wm_bt_equity_pt_t            *equity;
+  uint32_t                      n_equity;
 } wm_backtest_result_t;
 
 // ----------------------------------------------------------------------- //

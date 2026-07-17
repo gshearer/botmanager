@@ -130,6 +130,17 @@ bool wm_bt_iter_append(wm_bt_iterations_writer_t *w,
 
 void wm_bt_iter_close(wm_bt_iterations_writer_t *w);
 
+// WM-RIGOR-4: write `<sweep_dir>/equity.jsonl` — one line per daily
+// mark-to-market sample, oldest-to-newest:
+//   {"ts_ms":<1d bar close>,"equity":<PAPER cash + open-long qty x close>}
+// Called by the run task for single-config runs (the only runs whose
+// result rows carry a captured series); feeds the WM-EDGE-3 portfolio
+// layer's daily-equity stage. Returns FAIL with `err` populated on an
+// empty series or an fopen/path failure.
+bool wm_bt_equity_write(const char *sweep_dir,
+    const wm_bt_equity_pt_t *pts, uint32_t n_pts,
+    char *err, size_t err_cap);
+
 // Atomic write of `<sweep_dir>/manifest.json` via tmp + rename.
 // Captures sweep_id, source wm_file, snapshot range, strategy, sweep
 // axes, fixed params, run mode, ranking metric, top-N cap, thread
