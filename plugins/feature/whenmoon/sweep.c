@@ -228,11 +228,12 @@ wm_bt_sweep_plan_init(wm_bt_sweep_plan_t *plan)
 
   memset(plan, 0, sizeof(*plan));
 
-  plan->n_axes      = 0;
-  plan->total_iters = 1;
-  plan->score       = WM_BT_SCORE_REALIZED;
-  plan->top_k       = 1;
-  plan->workers     = wm_bt_default_thread_count();
+  plan->n_axes        = 0;
+  plan->total_iters   = 1;
+  plan->score         = WM_BT_SCORE_REALIZED;
+  plan->top_k         = 1;
+  plan->perfold_top_k = 0;
+  plan->workers       = wm_bt_default_thread_count();
 }
 
 static const wm_strategy_param_t *
@@ -656,6 +657,11 @@ wm_bt_sweep_plan_finalize(wm_bt_sweep_plan_t *plan,
   // Clamp top_k to total. Reduce noise on tiny sweeps.
   if(plan->top_k == 0 || plan->top_k > plan->total_iters)
     plan->top_k = plan->total_iters;
+
+  // perfold_top_k: 0 stays 0 ("follow top_k"); an explicit request is
+  // clamped to total like top_k above.
+  if(plan->perfold_top_k > plan->total_iters)
+    plan->perfold_top_k = plan->total_iters;
 
   if(plan->workers < WM_BT_WORKERS_MIN)
     plan->workers = WM_BT_WORKERS_MIN;
@@ -1976,7 +1982,10 @@ wm_bt_sweep_run_walk_perfold(whenmoon_state_t *st,
 
   // Reuse the shared top-K selector (score desc). For the single-config
   // competition run total_iters == 1 ⇒ top_k == 1 ⇒ the lone row.
-  top_k = wm_bt_topk_compute(results, plan->total_iters, plan->top_k,
+  // --perfold-top widens (or narrows) the fold breakdown independently
+  // of the display/OOS top-K; 0 = follow top_k (WM-RIGOR-3).
+  top_k = wm_bt_topk_compute(results, plan->total_iters,
+      plan->perfold_top_k > 0 ? plan->perfold_top_k : plan->top_k,
       top_idx);
 
   for(i = 0; i < top_k; i++)

@@ -914,6 +914,9 @@ wm_bt_manifest_write(const char *sweep_dir,
       json_object_new_string(wm_bt_sweep_score_name(plan->score)));
   json_object_object_add(root, "top_n",
       json_object_new_int64((int64_t)plan->top_k));
+  json_object_object_add(root, "perfold_top",
+      json_object_new_int64((int64_t)(plan->perfold_top_k > 0 ?
+          plan->perfold_top_k : plan->top_k)));
   json_object_object_add(root, "threads",
       json_object_new_int64((int64_t)plan->workers));
   json_object_object_add(root, "total_iters",

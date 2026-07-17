@@ -27,17 +27,39 @@ run from a WM-RIGOR-2 binary; older runs score gross/net only).
 
 Usage:
     python3 tools/wm_score.py <sweep_dir> [<sweep_dir> ...] [--json]
+    python3 tools/wm_score.py --overfit <sweep_dir> [...] [--json]
+                              [--report-root DIR]
 
 Each <sweep_dir> is a `whenmoon backtest run` result directory (holding
 manifest.json + iterations.jsonl) from a fixed-param --walk-forward run.
 Pass one dir per market of the SAME strategy at the SAME economics; the
 pooled row concatenates every market's folds (~64 for BTC+ETH).
 
+--overfit (WM-RIGOR-3) is a SEPARATE path from official scoring: it
+reads ALL iteration rows of a --walk-forward SWEEP (the per-fold top set
+is every row carrying windows[]; widen it with the C flag
+--perfold-top N), builds the config x fold net-return matrix, and
+reports three overfitting statistics:
+
+  rank-stability  200 seeded half-splits of the fold axis; Spearman rho
+                  between the config rankings (by mean net) on the two
+                  halves. Real ridge: median rho > 0.5.
+  PBO-lite (CSCV) same 200 splits; fraction where the in-sample winner
+                  ranks in the bottom half out-of-sample. < 0.5 = some
+                  skill, << 0.5 = robust.
+  trials census   walks <report-root>/*/manifest.json, sums total_iters
+                  per strategy -> T, with the expected-max reference
+                  E[max] ~ sqrt(2 ln T) (haircut context, NOT a gate).
+
 stdlib only — this is a tool, not a build target.
 """
 
 import argparse
+import glob
 import json
+import math
+import os
+import random
 import statistics
 import sys
 
@@ -193,6 +215,241 @@ def eval_gates(markets, pooled_stats):
     }
 
 
+# --------------------------------------------------------------------- #
+# WM-RIGOR-3 — overfitting statistics (--overfit; separate path from    #
+# official scoring: multi-row loader, never used for eligibility)       #
+# --------------------------------------------------------------------- #
+
+OVERFIT_N_SPLITS = 200
+OVERFIT_SEED = 42
+RHO_RIDGE_MEDIAN = 0.5          # median rho above this = real ridge
+PBO_SKILL = 0.5                 # PBO below this = some skill
+
+
+def load_overfit_matrix(d):
+    """Read one SWEEP result dir -> config x fold net-return matrix.
+
+    Keeps every iteration row with a non-empty windows[] (that is the
+    per-fold top set — all rows on --perfold-top runs, top_k otherwise).
+    Rows whose fold count disagrees with the majority are dropped with a
+    warning rather than corrupting the matrix."""
+    try:
+        manifest = json.load(open(d + "/manifest.json"))
+    except (OSError, ValueError) as e:
+        die("%s: cannot read manifest.json (%s)" % (d, e))
+
+    try:
+        rows = [json.loads(l) for l in open(d + "/iterations.jsonl")
+                if l.strip()]
+    except (OSError, ValueError) as e:
+        die("%s: cannot read iterations.jsonl (%s)" % (d, e))
+
+    if manifest.get("mode") != "walk":
+        die("%s: mode is %r — overfit stats need a --walk-forward sweep"
+            % (d, manifest.get("mode")))
+
+    fixed = manifest.get("fixed_params") or {}
+    cash = fixed.get("starting_cash", DEFAULT_START_CASH)
+
+    folded = [r for r in rows if r.get("windows")]
+    if not folded:
+        die("%s: no rows carry windows[] — re-run the sweep with "
+            "--perfold-top N" % d)
+
+    n_folds = statistics.mode(len(r["windows"]) for r in folded)
+    matrix, configs = [], []
+    for r in folded:
+        if len(r["windows"]) != n_folds:
+            warn("%s: iter %s has %d folds (expected %d) — dropped"
+                 % (d, r.get("iter"), len(r["windows"]), n_folds))
+            continue
+        matrix.append([(w["final_equity"] - cash) / cash
+                       for w in r["windows"]])
+        configs.append(r.get("params") or {})
+
+    return {
+        "dir": d,
+        "strategy": manifest.get("strategy"),
+        "market": manifest.get("source_market_id"),
+        "total_iters": manifest.get("total_iters"),
+        "perfold_top": manifest.get("perfold_top"),
+        "start_cash": cash,
+        "n_configs": len(matrix),
+        "n_folds": n_folds,
+        "matrix": matrix,
+        "configs": configs,
+    }
+
+
+def avg_ranks(values):
+    """1-based average ranks, descending (best value = rank 1); tied
+    values share the mean of the positions they span."""
+    order = sorted(range(len(values)), key=lambda i: -values[i])
+    ranks = [0.0] * len(values)
+    i = 0
+    while i < len(order):
+        j = i
+        while (j + 1 < len(order)
+               and values[order[j + 1]] == values[order[i]]):
+            j += 1
+        for k in range(i, j + 1):
+            ranks[order[k]] = (i + j) / 2.0 + 1.0
+        i = j + 1
+    return ranks
+
+
+def pearson(x, y):
+    n = len(x)
+    mx, my = sum(x) / n, sum(y) / n
+    sxy = sum((a - mx) * (b - my) for a, b in zip(x, y))
+    sxx = sum((a - mx) ** 2 for a in x)
+    syy = sum((b - my) ** 2 for b in y)
+    if sxx == 0.0 or syy == 0.0:
+        return 0.0              # a constant ranking carries no signal
+    return sxy / math.sqrt(sxx * syy)
+
+
+def spearman(x, y):
+    return pearson(avg_ranks(x), avg_ranks(y))
+
+
+def overfit_stats(mat):
+    """Rank-stability + PBO-lite over one config x fold matrix, sharing
+    the same seeded half-splits of the fold axis (CSCV shape)."""
+    n_cfg, n_folds = mat["n_configs"], mat["n_folds"]
+    if n_cfg < 2:
+        return {"skipped": "need >= 2 configs with windows[] (got %d) "
+                           "— run the sweep with --perfold-top N"
+                           % n_cfg}
+    if n_folds < 4:
+        return {"skipped": "need >= 4 folds for half-splits (got %d)"
+                           % n_folds}
+
+    rng = random.Random(OVERFIT_SEED)
+    idx = list(range(n_folds))
+    half = n_folds // 2
+    rhos, pbo_hits = [], 0
+    for _ in range(OVERFIT_N_SPLITS):
+        rng.shuffle(idx)
+        a, b = idx[:half], idx[half:]
+        mean_a = [sum(row[f] for f in a) / len(a) for row in mat["matrix"]]
+        mean_b = [sum(row[f] for f in b) / len(b) for row in mat["matrix"]]
+        rhos.append(spearman(mean_a, mean_b))
+
+        # PBO-lite: does half-A's winner rank in half-B's bottom half?
+        winner = max(range(n_cfg), key=lambda c: mean_a[c])
+        oos_rank = sum(1 for c in range(n_cfg)
+                       if mean_b[c] > mean_b[winner])
+        if oos_rank >= n_cfg / 2.0:
+            pbo_hits += 1
+
+    q1, med, q3 = statistics.quantiles(rhos, n=4)
+    pbo = pbo_hits / OVERFIT_N_SPLITS
+    return {
+        "n_splits": OVERFIT_N_SPLITS,
+        "seed": OVERFIT_SEED,
+        "rho_median": med,
+        "rho_q1": q1,
+        "rho_q3": q3,
+        "rho_iqr": q3 - q1,
+        "ridge": med > RHO_RIDGE_MEDIAN,
+        "pbo": pbo,
+        "pbo_skill": pbo < PBO_SKILL,
+    }
+
+
+def trials_census(roots):
+    """Sum total_iters per strategy across every result dir under the
+    given report roots — every config ever tried counts as a trial."""
+    by_strat = {}
+    for root in roots:
+        for mf in sorted(glob.glob(os.path.join(root, "*",
+                                                "manifest.json"))):
+            try:
+                m = json.load(open(mf))
+            except (OSError, ValueError) as e:
+                warn("%s: unreadable manifest (%s) — skipped" % (mf, e))
+                continue
+            s = m.get("strategy") or "?"
+            ent = by_strat.setdefault(s, {"runs": 0, "trials": 0})
+            ent["runs"] += 1
+            ent["trials"] += int(m.get("total_iters") or 0)
+
+    for ent in by_strat.values():
+        t = ent["trials"]
+        ent["e_max"] = math.sqrt(2.0 * math.log(t)) if t > 1 else 0.0
+    return by_strat
+
+
+def render_overfit(blocks, census, roots):
+    out = []
+    for blk in blocks:
+        mat, st = blk["run"], blk["stats"]
+        out.append("== overfit: %s ==" % mat["dir"])
+        out.append("strategy: %s   market: %s   configs(with folds): "
+                   "%d/%s   folds: %d"
+                   % (mat["strategy"], mat["market"], mat["n_configs"],
+                      mat["total_iters"], mat["n_folds"]))
+        if "skipped" in st:
+            out.append("  skipped: %s" % st["skipped"])
+            out.append("")
+            continue
+        out.append("  rank-stability (%d half-splits, seed %d): "
+                   "median rho=%.3f  IQR=[%.3f, %.3f]"
+                   % (st["n_splits"], st["seed"], st["rho_median"],
+                      st["rho_q1"], st["rho_q3"]))
+        out.append("    verdict: %s (median %s %.1f)"
+                   % ("REAL RIDGE" if st["ridge"] else "UNSTABLE",
+                      ">" if st["ridge"] else "<=", RHO_RIDGE_MEDIAN))
+        out.append("  PBO-lite (CSCV): %.3f"
+                   % st["pbo"])
+        out.append("    verdict: %s (< %.1f = some skill, << %.1f = "
+                   "robust)"
+                   % ("SKILL" if st["pbo_skill"] else "OVERFIT",
+                      PBO_SKILL, PBO_SKILL))
+        out.append("")
+
+    out.append("== trials census: %s ==" % ", ".join(roots))
+    hdr = ("%-14s %6s %14s %18s"
+           % ("strategy", "runs", "T(trials)", "E[max]~sqrt(2lnT)"))
+    out.append(hdr)
+    out.append("-" * len(hdr))
+    for s in sorted(census):
+        ent = census[s]
+        out.append("%-14s %6d %14d %18.2f"
+                   % (s, ent["runs"], ent["trials"], ent["e_max"]))
+    out.append("")
+    out.append("E[max] is the expected best Sharpe-like score of T "
+               "independent zero-skill trials (in std units) — a "
+               "haircut reference beside rr, not a gate.")
+    return "\n".join(out)
+
+
+def overfit_main(args):
+    runs = [load_overfit_matrix(d) for d in args.dirs]
+    blocks = [{"run": r, "stats": overfit_stats(r)} for r in runs]
+
+    if args.report_root:
+        roots = [args.report_root]
+    else:
+        roots = sorted({os.path.dirname(os.path.abspath(d))
+                        for d in args.dirs})
+    census = trials_census(roots)
+
+    if args.json:
+        payload = {
+            "overfit": [dict(stats=b["stats"],
+                             **{k: v for k, v in b["run"].items()
+                                if k not in ("matrix", "configs")})
+                        for b in blocks],
+            "census": census,
+            "census_roots": roots,
+        }
+        print(json.dumps(payload, indent=2))
+    else:
+        print(render_overfit(blocks, census, roots))
+
+
 def pct(x, signed=True):
     return ("%+.2f%%" if signed else "%.2f%%") % (x * 100.0)
 
@@ -248,7 +505,18 @@ def main():
                          "same strategy + economics)")
     ap.add_argument("--json", action="store_true",
                     help="emit machine-readable JSON instead of the table")
+    ap.add_argument("--overfit", action="store_true",
+                    help="WM-RIGOR-3: rank-stability + PBO + trials "
+                         "census over a --walk-forward SWEEP dir "
+                         "(reads all rows; not official scoring)")
+    ap.add_argument("--report-root", metavar="DIR",
+                    help="result-dir root for the trials census "
+                         "(default: parent dir(s) of the sweep dirs)")
     args = ap.parse_args()
+
+    if args.overfit:
+        overfit_main(args)
+        return
 
     runs = [load_run(d) for d in args.dirs]
 

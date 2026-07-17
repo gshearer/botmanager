@@ -83,11 +83,13 @@ typedef struct
   uint32_t             total_iters;          // populated by finalize
   wm_bt_sweep_score_t  score;
   uint32_t             top_k;
+  uint32_t             perfold_top_k;        // 0 = follow top_k
   uint32_t             workers;
 } wm_bt_sweep_plan_t;
 
 // Initialise plan to a single-iteration default. score = REALIZED,
-// top_k = 1, workers = 1, n_axes = 0, total_iters = 1.
+// top_k = 1, perfold_top_k = 0 (follow top_k), workers = 1,
+// n_axes = 0, total_iters = 1.
 void wm_bt_sweep_plan_init(wm_bt_sweep_plan_t *plan);
 
 // Parse + add one axis to the plan, validating against `ls`'s param

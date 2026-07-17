@@ -1081,7 +1081,7 @@ wm_bt_cmd_run(const cmd_ctx_t *ctx)
         " [--fee-bps N] [--slip-bps N] [--size-frac F] [--cash N]"
         " [--config <path.json>] [--threads N]"
         " [--rank-by realized|sharpe|sortino|equity|pf]"
-        " [--top-n K]"
+        " [--top-n K] [--perfold-top N]"
         " [--walk-forward train=Td:test=Md:step=Sd]"
         " [--oos-tail PCT]"
         " [--charts]");
@@ -1273,6 +1273,23 @@ wm_bt_cmd_run(const cmd_ctx_t *ctx)
 
         sweep_plan.top_k = (uint32_t)k;
       }
+      else if(strcmp(tok, "--perfold-top") == 0)
+      {
+        char *end = NULL;
+        long  k;
+
+        errno = 0;
+        k     = strtol(val_tok, &end, 10);
+
+        if(end == val_tok || errno != 0 || *end != '\0' || k < 1)
+        {
+          cmd_reply(ctx, "bad --perfold-top (expected integer >= 1)");
+          wm_backtest_snapshot_free(snap);
+          return;
+        }
+
+        sweep_plan.perfold_top_k = (uint32_t)k;
+      }
       else if(strcmp(tok, "--walk-forward") == 0)
       {
         if(wm_bt_parse_walk_spec(val_tok, &walk_spec) != SUCCESS)
@@ -1309,7 +1326,7 @@ wm_bt_cmd_run(const cmd_ctx_t *ctx)
         snprintf(reply, sizeof(reply),
             "unknown flag '%s' (expected --fee-bps/--slip-bps/"
             "--size-frac/--cash/--config/--threads/--rank-by/"
-            "--top-n/--walk-forward/--oos-tail/--charts)",
+            "--top-n/--perfold-top/--walk-forward/--oos-tail/--charts)",
             tok);
         cmd_reply(ctx, reply);
         wm_backtest_snapshot_free(snap);
@@ -2146,7 +2163,7 @@ wm_backtest_register_verbs(void)
         " [--fee-bps N] [--slip-bps N] [--size-frac F] [--cash N]"
         " [--config <path.json>] [--threads N]"
         " [--rank-by realized|sharpe|sortino|equity|pf]"
-        " [--top-n K]"
+        " [--top-n K] [--perfold-top N]"
         " [--walk-forward train=Td:test=Md:step=Sd]"
         " [--oos-tail PCT]"
         " [--charts]",
@@ -2177,6 +2194,12 @@ wm_backtest_register_verbs(void)
         "--top-n caps the number of top rows shown after the run"
         " (default 20 when sweeping, 1 otherwise) and the number of"
         " rows the OOS post-pass validates.\n"
+        "--perfold-top N widens the walk-forward per-fold breakdown to"
+        " the top N configs independently of --top-n (default: follow"
+        " --top-n). Feeds wm_score.py --overfit (rank-stability/PBO"
+        " need a config×fold matrix). Each fold re-walks the full"
+        " snapshot for warmup, so N=100 on a big sweep is an overnight"
+        " run.\n"
         "--walk-forward expands each param vector into N test windows"
         " (train days warm the strategy state but only test windows"
         " accumulate fills); the recorded score is the cumulative"
