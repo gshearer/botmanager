@@ -213,6 +213,16 @@ typedef struct
 #define WM_MARKET_DEFAULT_MAX_NOTIONAL         0.0
 #define WM_MARKET_DEFAULT_PENDING_CAP            8u
 
+// WM-BREAKER-1: paper-mode drawdown circuit breaker. When a paper
+// session's post-fill equity drops below starting_cash × (1 − frac)
+// the engine flips the market to MANUAL (position kept — same
+// semantics as `/whenmoon manual`) and emits a CLAM_WARN alert.
+// Resolution: per-market `paper_loss_halt_frac` override (negative =
+// inherit) → global `plugin.whenmoon.market.paper_loss_halt_frac` →
+// this default. 0 at either tier disables. Read fresh at each paper
+// fill so an operator `/set kv` arms the breaker immediately.
+#define WM_MARKET_DEFAULT_PAPER_LOSS_HALT_FRAC 0.10
+
 // WM-QUOTE-ALLOC-1: per-market quote-balance allocation cap. When N flat
 // real markets share one quote currency, each would otherwise reconcile
 // its real cash to the FULL quote `available` and collectively over-

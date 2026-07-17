@@ -43,6 +43,12 @@
 
 #define WM_MK_KV_BUF_SZ   (KV_KEY_SZ + 64)
 
+// WM-BREAKER-1: global tier of the paper loss-halt knob. Per-market
+// keys carry a segment between `market.` and the suffix, so this path
+// can never collide with an override.
+#define WM_MK_PAPER_HALT_GLOBAL_KEY \
+    "plugin.whenmoon.market.paper_loss_halt_frac"
+
 // Public (declared in market_engine.h): also used by the real-cash
 // reconcile path in live.c to read the quote-allocation knobs fresh.
 double
@@ -61,6 +67,35 @@ wm_mk_kv_get_double(const char *market_id_str, const char *suffix,
   }
 
   return(kv_get_double(path));
+}
+
+// WM-BREAKER-1: resolve the paper-mode loss-halt fraction — per-market
+// override (negative = inherit) → global → compiled default. Values
+// are read FRESH here, not from the refresh_kv session cache, so an
+// operator `/set kv` arms the breaker on the very next fill. Reading
+// KV under mk->lock is safe for the same reason as the quote-alloc
+// knobs in live.c: whenmoon registers per-market KVs with NULL
+// change-callbacks, so kv ops never re-enter market code, and only
+// live paper fills reach this (synthetics skip the breaker entirely).
+static double
+wm_mk_paper_loss_halt_frac(const whenmoon_market_t *mk)
+{
+  char   path[WM_MK_KV_BUF_SZ];
+  double frac = -1.0;
+
+  snprintf(path, sizeof(path),
+      "plugin.whenmoon.market.%s.paper_loss_halt_frac",
+      mk->market_id_str);
+
+  if(kv_exists(path))
+    frac = kv_get_double(path);
+
+  if(frac < 0.0)
+    frac = kv_exists(WM_MK_PAPER_HALT_GLOBAL_KEY)
+        ? kv_get_double(WM_MK_PAPER_HALT_GLOBAL_KEY)
+        : WM_MARKET_DEFAULT_PAPER_LOSS_HALT_FRAC;
+
+  return(frac);
 }
 
 static uint64_t
@@ -140,6 +175,33 @@ wm_market_session_refresh_kv(whenmoon_market_t *mk)
 
   if(pending_cap > WM_MARKET_PENDING_CAP)
     pending_cap = WM_MARKET_PENDING_CAP;
+
+  // WM-BREAKER-1: register the breaker knobs so `/set kv` finds them
+  // before the first paper fill. Deliberately NOT cached in the
+  // session — wm_mk_paper_loss_halt_frac() reads them fresh at fill
+  // time. The per-market default of −1 means "inherit the global", so
+  // a lone global set reaches every session (unlike the cached caps
+  // above, whose per-market registrations shadow any global).
+  (void)wm_mk_kv_get_double(mk->market_id_str, "paper_loss_halt_frac",
+      "-1.0", -1.0,
+      "Paper-mode drawdown circuit breaker override for this market:"
+      " halt fraction of starting cash (0.10 = flip to manual at -10%"
+      " post-fill equity; position kept). 0 disables; negative"
+      " inherits the global plugin.whenmoon.market.paper_loss_halt_frac.");
+
+  if(!kv_exists(WM_MK_PAPER_HALT_GLOBAL_KEY) &&
+     kv_register(WM_MK_PAPER_HALT_GLOBAL_KEY, KV_DOUBLE, "0.10",
+         NULL, NULL,
+         "Paper-mode drawdown circuit breaker, all markets: halt"
+         " fraction of starting cash (0.10 = flip to manual at -10%"
+         " post-fill equity; position kept). 0 or negative disables."
+         " Per-market …market.<id>.paper_loss_halt_frac overrides when"
+         " non-negative.") != SUCCESS)
+    clam(CLAM_WARN, WHENMOON_CTX,
+        "market %s: kv_register failed: %s (breaker falls back to"
+        " compiled default %.2f)",
+        mk->market_id_str, WM_MK_PAPER_HALT_GLOBAL_KEY,
+        WM_MARKET_DEFAULT_PAPER_LOSS_HALT_FRAC);
 
   // Apply atomically under mk->lock so a concurrent fill engine call
   // sees a consistent cached-param set. cash-seeding is gated on
@@ -598,6 +660,37 @@ wm_market_apply_fill_locked(whenmoon_market_t *mk, wm_market_mode_t mode,
     s->equity_samples[s->equity_head].equity = equity;
     s->equity_head = (s->equity_head + 1u) % WM_MARKET_EQUITY_RING_CAP;
     s->equity_n++;
+
+    // WM-BREAKER-1: paper-mode drawdown circuit breaker. A bleeding
+    // paper strategy otherwise runs until a human notices — the only
+    // automated brake before this was real-mode daily_loss_bps. Flip
+    // to MANUAL (position kept — same semantics as `/whenmoon
+    // manual`; flatten or resume is the operator's call) and alert.
+    // Synthetic backtest markets are exempt: research runs must ride
+    // their drawdowns to measure them. Both mode tests matter —
+    // `mode` scopes the ledger this fill debited, `s->mode` keeps an
+    // already-halted market from re-alerting on manual force-fills.
+    // The flip is persisted by the caller's post-fill upsert.
+    if(mk->market_id != -1
+        && mode == WM_MARKET_MODE_PAPER
+        && s->mode == WM_MARKET_MODE_PAPER)
+    {
+      double halt_frac = wm_mk_paper_loss_halt_frac(mk);
+
+      if(halt_frac > 0.0 &&
+         equity < st->starting_cash * (1.0 - halt_frac))
+      {
+        s->mode = WM_MARKET_MODE_MANUAL;
+
+        clam(CLAM_WARN, WHENMOON_CTX,
+            "market %s BREAKER: paper equity %.2f breached halt floor"
+            " %.2f (start %.2f, paper_loss_halt_frac %.4g) — mode ->"
+            " manual, position kept; resume by hand",
+            mk->market_id_str, equity,
+            st->starting_cash * (1.0 - halt_frac),
+            st->starting_cash, halt_frac);
+      }
+    }
   }
 
   // WM-BT-FILLLOG-1: synthetic backtest markets (market_id == -1, set in
