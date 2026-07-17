@@ -791,6 +791,12 @@ wm_bt_build_fixed_params_obj(const wm_backtest_params_t *p)
   if(p->have_starting_cash)
     wm_bt_obj_add_double(obj, "starting_cash", p->starting_cash);
 
+  // WM-RIGOR-5: always record the execution model so a result dir is
+  // self-describing — the close/next-open delta table depends on
+  // knowing which model produced each run.
+  json_object_object_add(obj, "fill_mode",
+      json_object_new_string(p->fill_next_open ? "next-open" : "close"));
+
   return(obj);
 }
 

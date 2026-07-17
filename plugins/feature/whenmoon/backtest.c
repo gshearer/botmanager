@@ -29,6 +29,7 @@
 #include "dl_coverage.h"
 #include "dl_schema.h"
 #include "market.h"
+#include "market_engine.h"
 #include "strategy.h"
 #include "whenmoon.h"
 #include "wm_bt_file.h"
@@ -681,6 +682,39 @@ wm_bt_mtm_mark(wm_bt_mtm_t *m, int64_t ts_ms, double eq)
   }
 }
 
+// Drain every fill the engine appended since the last call into the
+// lossless accumulator, before the 256-slot session ring can wrap
+// (see the WM-BT-8 rationale at the call sites). Grow-by-doubling;
+// the strict allocator aborts on OOM.
+static void
+wm_bt_fills_drain(wm_market_session_t *sess, wm_market_fill_t **acc,
+    uint32_t *acc_n, uint32_t *acc_cap, uint64_t *prev_fn)
+{
+  uint64_t now_fn = sess->fills_n[WM_MARKET_MODE_PAPER];
+
+  while(*prev_fn < now_fn)
+  {
+    uint32_t back = (uint32_t)(now_fn - *prev_fn);
+    uint32_t ridx = (sess->fills_head[WM_MARKET_MODE_PAPER]
+                     + WM_MARKET_FILL_RING_CAP - back)
+                    % WM_MARKET_FILL_RING_CAP;
+
+    if(*acc_n == *acc_cap)
+    {
+      uint32_t newcap = *acc_cap ? *acc_cap * 2u : 256u;
+
+      *acc = (*acc_cap == 0)
+          ? mem_alloc(WM_BT_CTX, "iter_fills",
+                sizeof(**acc) * (size_t)newcap)
+          : mem_realloc(*acc, sizeof(**acc) * (size_t)newcap);
+      *acc_cap = newcap;
+    }
+
+    (*acc)[(*acc_n)++] = sess->fills[WM_MARKET_MODE_PAPER][ridx];
+    (*prev_fn)++;
+  }
+}
+
 // Publish the accumulated stats into the result and hand over the
 // captured series (ownership transfers with it; NULL when capture was
 // off or no 1d bar marked).
@@ -754,6 +788,11 @@ wm_backtest_run_iteration_multi(whenmoon_state_t *st,
   const wm_market_stats_t        *ps;
   double                          win_rate;
   wm_bt_mtm_t                     mtm;
+  bool                            defer;
+  wm_strategy_signal_t            pend[WM_BT_MAX_LINKED * 2u];
+  uint32_t                        pend_n        = 0;
+  uint32_t                        pend_executed = 0;
+  uint32_t                        pend_dropped  = 0;
 
   if(err != NULL && err_cap > 0)
     err[0] = '\0';
@@ -855,6 +894,14 @@ wm_backtest_run_iteration_multi(whenmoon_state_t *st,
       synth_mk->session.stats[WM_MARKET_MODE_PAPER].starting_cash,
       params != NULL && params->want_equity_series);
 
+  // WM-RIGOR-5: --fill next-open defers signal execution to the next
+  // 1m bar's open. The mechanism is pure replay-layer: ctx->mkt stays
+  // NULL below, so wm_strategy_emit_signal_impl records the signal on
+  // the ctx (signals_emitted / last_signal — the acted-detection this
+  // loop already uses) but never reaches the engine; the loop queues
+  // the advice and executes it on the next 1m bar instead.
+  defer = params != NULL && params->fill_next_open;
+
   // Build + init each strategy ctx. All point mkt at the shared synth
   // market so every emit lands on the one book. A failed init unwinds the
   // already-inited contexts before tearing the market down.
@@ -867,7 +914,7 @@ wm_backtest_run_iteration_multi(whenmoon_state_t *st,
     // length bound, so cap explicitly to keep -Wformat-truncation quiet.
     snprintf(ctx[si].strategy_name, sizeof(ctx[si].strategy_name), "%.*s",
         (int)sizeof(ctx[si].strategy_name) - 1, sname[si]);
-    ctx[si].mkt = synth_mk;
+    ctx[si].mkt = defer ? NULL : synth_mk;
 
     if(init_fn[si](&ctx[si]) != 0)
     {
@@ -934,6 +981,38 @@ wm_backtest_run_iteration_multi(whenmoon_state_t *st,
 
     bar = &rings[g][cursors[g].idx];
 
+    // WM-RIGOR-5 (--fill next-open): execute advice deferred from the
+    // bar that emitted it at THIS 1m bar's open ± slip, stamped at the
+    // bar's open instant. Runs before the bar's own dispatch (an open
+    // fill precedes close-time decisions) and regardless of window
+    // membership — the signal already committed inside its window;
+    // this is merely its execution moment. FIFO order matches the
+    // back-to-back execution immediate mode would have produced for a
+    // same-ts signal cluster; the engine's own idempotency (buy while
+    // long / sell while flat = no-op) applies at execution, exactly as
+    // it would have at emit.
+    if(defer && pend_n > 0 && g == WM_GRAN_1M)
+    {
+      int64_t  open_ts = bar->ts_close_ms
+                       - (int64_t)wm_gran_seconds[WM_GRAN_1M] * 1000;
+      uint32_t pi;
+
+      for(pi = 0; pi < pend_n; pi++)
+      {
+        pend[pi].ts_ms = open_ts;
+        wm_market_engine_on_signal_with_mk(synth_mk, bar->open,
+            open_ts, &pend[pi]);
+      }
+
+      pend_executed += pend_n;
+      pend_n = 0;
+
+      // Deferred fills can land outside the in-window drain below
+      // (train gaps, unsubscribed 1m) — drain here so the lossless
+      // accumulator never misses them.
+      wm_bt_fills_drain(sess, &acc_fills, &acc_n, &acc_cap, &prev_fn);
+    }
+
     // Match wm_strategy_dispatch_bar: ctx fields update only for
     // grains the strategy subscribes to (un-subscribed grains keep
     // the cursor moving but never touch the strategy's mark cache).
@@ -980,41 +1059,32 @@ wm_backtest_run_iteration_multi(whenmoon_state_t *st,
 
           if(ctx[si].signals_emitted > pre_emitted &&
              ctx[si].last_signal.score != 0.0)
+          {
             acted = true;
+
+            // WM-RIGOR-5: the emit shim recorded the signal on the ctx
+            // but never reached the engine (ctx->mkt == NULL) — queue
+            // it for execution at the next 1m bar's open. The cap
+            // (2 x max linked) covers the worst same-ts bar cluster
+            // (one winning signal per bar, <= 6 bars share a close
+            // ts); overflow is counted and reported, never silent.
+            if(defer)
+            {
+              if(pend_n < (uint32_t)(sizeof(pend) / sizeof(pend[0])))
+                pend[pend_n++] = ctx[si].last_signal;
+              else
+                pend_dropped++;
+            }
+          }
         }
 
         bars_replayed++;
 
         // Drain the (<= 1) fill this bar produced into the lossless
         // accumulator before the 256-slot ring can overwrite it. Only
-        // the single winning advisor acts, so the engine adds at most one
-        // fill per bar; the while loop is defensive.
-        {
-          uint64_t now_fn = sess->fills_n[WM_MARKET_MODE_PAPER];
-
-          while(prev_fn < now_fn)
-          {
-            uint32_t back = (uint32_t)(now_fn - prev_fn);
-            uint32_t ridx = (sess->fills_head[WM_MARKET_MODE_PAPER]
-                             + WM_MARKET_FILL_RING_CAP - back)
-                            % WM_MARKET_FILL_RING_CAP;
-
-            if(acc_n == acc_cap)
-            {
-              uint32_t newcap = acc_cap ? acc_cap * 2u : 256u;
-
-              acc_fills = (acc_cap == 0)
-                  ? mem_alloc("whenmoon.backtest", "iter_fills",
-                        sizeof(*acc_fills) * (size_t)newcap)
-                  : mem_realloc(acc_fills,
-                        sizeof(*acc_fills) * (size_t)newcap);
-              acc_cap = newcap;
-            }
-
-            acc_fills[acc_n++] = sess->fills[WM_MARKET_MODE_PAPER][ridx];
-            prev_fn++;
-          }
-        }
+        // the single winning advisor acts, so the engine adds at most
+        // one fill per bar; the drain loop is defensive.
+        wm_bt_fills_drain(sess, &acc_fills, &acc_n, &acc_cap, &prev_fn);
       }
     }
 
@@ -1043,6 +1113,16 @@ wm_backtest_run_iteration_multi(whenmoon_state_t *st,
   }
 
   clock_gettime(CLOCK_MONOTONIC, &t1);
+
+  // WM-RIGOR-5: advice emitted on the corpus's final bars has no next
+  // 1m bar to fill on — it is dropped, and reported below. Immediate
+  // mode would have filled it at the terminal close; the delta is part
+  // of what the next-open model measures.
+  if(defer && pend_n > 0)
+  {
+    pend_dropped += pend_n;
+    pend_n = 0;
+  }
 
   // Finalize every linked strategy attachment.
   for(si = 0; si < n_strats; si++)
@@ -1106,6 +1186,15 @@ wm_backtest_run_iteration_multi(whenmoon_state_t *st,
       ps->starting_cash, ps->starting_cash + realized_paper,
       realized_paper, (double)snap->bars_loaded_1m / 1440.0,
       bars_replayed, fills_paper, out->wallclock_ms);
+
+  // WM-RIGOR-5: one accounting line per next-open run. `dropped` > 0
+  // means terminal-bar advice with no next 1m bar (or the same-ts
+  // cluster overflowed the queue — cap 2 x max linked, unheard of).
+  if(defer)
+    clam(CLAM_INFO, WM_BT_CTX,
+        "backtest %s/%s: fill=next-open deferred=%u dropped=%u",
+        snap->source_market_id, strat_label,
+        pend_executed, pend_dropped);
 
   return(SUCCESS);
 }

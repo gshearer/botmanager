@@ -177,6 +177,15 @@ typedef struct wm_backtest_params
   // when total_iters == 1 so equity.jsonl can be written — a sweep
   // would retain one series per row for the whole run).
   bool    want_equity_series;
+
+  // WM-RIGOR-5 (--fill next-open): defer each emitted signal to the
+  // NEXT 1m bar and fill at that bar's open ± slip, instead of the
+  // default same-bar-close fill (which grants a free look at the close
+  // that generated the signal). Backtest-replay-layer only — the live
+  // engine is untouched; divergence between the two modes is an
+  // overfit / microstructure kill signal. Default false = bit-identical
+  // to the historical close-fill behavior.
+  bool    fill_next_open;
 } wm_backtest_params_t;
 
 // ----------------------------------------------------------------------- //

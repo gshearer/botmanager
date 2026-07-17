@@ -1112,6 +1112,7 @@ wm_bt_cmd_run(const cmd_ctx_t *ctx)
         " [--top-n K] [--perfold-top N]"
         " [--walk-forward train=Td:test=Md:step=Sd]"
         " [--oos-tail PCT]"
+        " [--fill close|next-open]"
         " [--charts]");
     return;
   }
@@ -1349,12 +1350,31 @@ wm_bt_cmd_run(const cmd_ctx_t *ctx)
         oos_spec.pct = (uint32_t)pct;
         have_oos     = true;
       }
+      else if(strcmp(tok, "--fill") == 0)
+      {
+        // WM-RIGOR-5: execution model. `close` is the historical
+        // default (same-bar-close fill); `next-open` defers each
+        // signal to the next 1m bar's open.
+        if(strcmp(val_tok, "close") == 0)
+          params.fill_next_open = false;
+
+        else if(strcmp(val_tok, "next-open") == 0)
+          params.fill_next_open = true;
+
+        else
+        {
+          cmd_reply(ctx, "bad --fill (expected close|next-open)");
+          wm_backtest_snapshot_free(snap);
+          return;
+        }
+      }
       else
       {
         snprintf(reply, sizeof(reply),
             "unknown flag '%s' (expected --fee-bps/--slip-bps/"
             "--size-frac/--cash/--config/--threads/--rank-by/"
-            "--top-n/--perfold-top/--walk-forward/--oos-tail/--charts)",
+            "--top-n/--perfold-top/--walk-forward/--oos-tail/"
+            "--fill/--charts)",
             tok);
         cmd_reply(ctx, reply);
         wm_backtest_snapshot_free(snap);
@@ -1528,13 +1548,14 @@ wm_bt_cmd_run(const cmd_ctx_t *ctx)
     // `snap` and may free it, so `snap->*` must not be read afterward.
     snprintf(reply, sizeof(reply),
         "run queued: '%s' (pri %u) — %u 1m bars from %s [%s..%s]"
-        " mode=%s N=%u threads=%u rank_by=%s top_n=%u;"
+        " mode=%s%s N=%u threads=%u rank_by=%s top_n=%u;"
         " poll /show tasks, results -> %s/iterations.jsonl",
         task_name, WM_BT_RUN_TASK_PRIORITY,
         snap->bars_loaded_1m, snap->source_market_id,
         snap->range_start, snap->range_end,
         sweep_mode.mode == WM_BT_MODE_WALK_FORWARD ? "walk" :
         sweep_mode.mode == WM_BT_MODE_OOS          ? "oos"  : "full",
+        params.fill_next_open ? " fill=next-open" : "",
         sweep_plan.total_iters, sweep_plan.workers,
         wm_bt_sweep_score_name(sweep_plan.score), sweep_plan.top_k,
         sweep_dir);
@@ -2201,6 +2222,7 @@ wm_backtest_register_verbs(void)
         " [--top-n K] [--perfold-top N]"
         " [--walk-forward train=Td:test=Md:step=Sd]"
         " [--oos-tail PCT]"
+        " [--fill close|next-open]"
         " [--charts]",
         "Run a backtest against a compiled .wm snapshot — single"
         " iteration, parameter sweep, walk-forward, or OOS-tail"
@@ -2248,6 +2270,14 @@ wm_backtest_register_verbs(void)
         " runs the top-N on the tail and stamps the OOS columns on"
         " each row. PCT clamped to [1, 50].\n"
         "--walk-forward and --oos-tail are mutually exclusive.\n"
+        "--fill selects the execution model (WM-RIGOR-5). `close`"
+        " (default) fills each signal at its own bar's close ± slip —"
+        " a free look at the close that generated the signal."
+        " `next-open` defers execution to the NEXT 1m bar and fills at"
+        " that bar's open ± slip (terminal-bar advice with no next bar"
+        " is dropped and counted in the log). Backtest-only; live"
+        " trading is unaffected. Compare both modes on a fixed config:"
+        " <10%% rr decay = healthy; >30%% = the edge was fill fiction.\n"
         "Each invocation writes a sweep directory under"
         " plugin.whenmoon.backtest.report_path (defaulting to"
         " $HOME/.local/share/botmanager/backtests/) containing"
