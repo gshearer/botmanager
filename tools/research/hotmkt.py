@@ -390,15 +390,23 @@ def describe(events, episodes_all):
 
 
 def freelook_delta(events):
-    """Diagnostic: mean free-look minus lag-1 gross, per horizon (bps)."""
+    """Diagnostic: free-look minus lag-1 gross, per horizon (bps).
+
+    Mean AND median (post-results descriptive amendment, disclosed: the
+    mean is dominated by a tail of extreme flag->entry gap moves —
+    horizon-invariant, i.e. junk/extreme minute bars at the flag base —
+    so the median is the honest typical-event read; gates never touch
+    either number).
+    """
     filled = events[events["filled"]]
     out = {}
     for label in HORIZONS:
         both = filled[filled[f"fwd_{label}"].notna()
                       & filled[f"look_{label}"].notna()]
         if len(both):
-            delta = (both[f"look_{label}"] - both[f"fwd_{label}"]).mean()
-            out[label] = float(delta * 1e4)
+            delta = both[f"look_{label}"] - both[f"fwd_{label}"]
+            out[label] = {"mean": float(delta.mean() * 1e4),
+                          "median": float(delta.median() * 1e4)}
     return out
 
 
@@ -516,6 +524,8 @@ def main():
         "verdict": verdict,
     }
     os.makedirs(args.out, exist_ok=True)
+    events_path = os.path.join(args.out, "hotmkt_events.parquet")
+    events.to_parquet(events_path, index=False)
     out_path = os.path.join(args.out, "hotmkt_results.json")
     with open(out_path, "w", encoding="utf-8") as fh:
         json.dump(result, fh, indent=2, default=str)
