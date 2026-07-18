@@ -35,10 +35,20 @@ FAMILY (a) "mirror" — pure artifact analysis, no new backtests.
   days); mirror daily return = −r_t − borrow_daily on held days, 0
   otherwise; mirror equity rebuilt by compounding. Folds: a daily
   calendar from windows[0].start to windows[-1].end, tiled by
-  rig.fold_windows(train_days=0) — ASSERT fold count AND first/last
-  boundaries match the C windows[] before trusting anything. Null per
-  fold = −bench_return − borrow_daily × fold_days (an always-on short
-  of the benchmark pays borrow every day). Margin per fold =
+  rig.fold_windows(train_days=0) — ASSERT parity with the C windows[]
+  before trusting anything. AMENDMENT (2026-07-18, pre-results — the
+  parity assert fired on first contact with the artifacts, before any
+  fold return was computed): the C walk clamps its LAST window to the
+  corpus end (a ragged 115d tail), which rig.fold_windows by design
+  refuses to tile. Scoring folds are therefore the C windows[]
+  VERBATIM, cross-checked by asserting rig's full-fold tiling matches
+  the windows[] prefix boundary-exact and that the single extra C
+  window is the terminal truncated tail. Dropping that tail instead
+  would discard the most recent — and for a short study most
+  informative (bench-negative) — 115 days. Null per fold =
+  −bench_return − borrow_daily × fold_days, fold_days taken from the
+  actual window span (an always-on short of the benchmark pays borrow
+  every day it exists). Margin per fold =
   mirror_fold − null_fold. Borrow grid {5, 10, 15} bps/day on the short
   notional; 10 is the primary reporting cell. Report per run and pooled
   btc+eth per finalist: rig.fold_metrics over the margin, its median,
@@ -175,17 +185,32 @@ def _load_run(dir_id):
 
 
 def _fold_parity(windows):
-    """C-aligned folds via rig.fold_windows, with the parity ASSERTs."""
+    """Scoring folds = the C windows[] verbatim, parity-checked.
+
+    rig.fold_windows must reproduce every FULL window boundary-exact;
+    the C walk is allowed exactly one extra window — a terminal tail
+    clamped to the corpus end, shorter than a full test window (see the
+    docstring amendment). Anything else is drift: do not trust the run.
+    """
     w0 = pd.Timestamp(windows[0]["start_ts_ms"], unit="ms")
     w_end = pd.Timestamp(windows[-1]["end_ts_ms"], unit="ms")
     calendar = pd.date_range(w0, w_end, freq="D")
-    folds = rig.fold_windows(calendar, train_days=0)
-    assert len(folds) == len(windows), (
-        f"fold parity broken: rig tiled {len(folds)} folds, "
+    tiled = rig.fold_windows(calendar, train_days=0)
+    assert len(tiled) in (len(windows), len(windows) - 1), (
+        f"fold parity broken: rig tiled {len(tiled)} folds, "
         f"C run has {len(windows)} windows")
-    assert folds[0][0] == w0 and folds[-1][1] == w_end, (
-        "fold boundary drift vs the C windows[] — do not trust this run")
-    return folds
+    for (start, end), win in zip(tiled, windows):
+        assert (start == pd.Timestamp(win["start_ts_ms"], unit="ms")
+                and end == pd.Timestamp(win["end_ts_ms"], unit="ms")), (
+            f"fold boundary drift at fold {win['fold']} — do not trust")
+    if len(tiled) == len(windows) - 1:
+        tail = windows[-1]
+        tail_days = (tail["end_ts_ms"] - tail["start_ts_ms"]) / 86400000.0
+        assert (tail["start_ts_ms"] == windows[-2]["end_ts_ms"]
+                and 0 < tail_days < rig.TEST_DAYS), (
+            "extra C window is not a terminal truncated tail — do not trust")
+    return [(pd.Timestamp(w["start_ts_ms"], unit="ms"),
+             pd.Timestamp(w["end_ts_ms"], unit="ms")) for w in windows]
 
 
 def _equity_at(equity, when):
