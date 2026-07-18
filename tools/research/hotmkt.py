@@ -173,8 +173,9 @@ def load_pair_1m(conf, market_id):
     ))
     frame = pd.read_csv(io.StringIO(csv), parse_dates=["ts"])
     frame = frame.set_index("ts")
-    assert frame.index.max() < rig.RESEARCH_CUTOFF, \
-        f"market {market_id}: post-cutoff bar leaked through the SQL guard"
+    if len(frame):
+        assert frame.index.max() < rig.RESEARCH_CUTOFF, \
+            f"market {market_id}: post-cutoff bar leaked past the SQL guard"
     return frame
 
 
