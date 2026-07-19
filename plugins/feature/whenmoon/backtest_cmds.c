@@ -1801,7 +1801,8 @@ wm_bt_cmd_reload(const cmd_ctx_t *ctx)
   char              name_tok[WM_STRATEGY_NAME_SZ] = {0};
   char              err[192];
   char              reply[256];
-  uint32_t          n_detached = 0;
+  uint32_t          n_detached   = 0;
+  uint32_t          n_reattached = 0;
 
   st = whenmoon_get_state();
 
@@ -1823,7 +1824,7 @@ wm_bt_cmd_reload(const cmd_ctx_t *ctx)
   err[0] = '\0';
 
   if(wm_bt_sweep_reload_strategy(st, name_tok, &n_detached,
-         err, sizeof(err)) != SUCCESS)
+         &n_reattached, err, sizeof(err)) != SUCCESS)
   {
     snprintf(reply, sizeof(reply), "reload failed: %s",
         err[0] != '\0' ? err : "unknown");
@@ -1832,11 +1833,13 @@ wm_bt_cmd_reload(const cmd_ctx_t *ctx)
   }
 
   snprintf(reply, sizeof(reply),
-      "reloaded %s (n_detached=%u, dlclose+dlopen ok)",
-      name_tok, n_detached);
+      "reloaded %s (detached %u, reattached %u, dlclose+dlopen ok)",
+      name_tok, n_detached, n_reattached);
   cmd_reply(ctx, reply);
-  cmd_reply(ctx,
-      "  re-attach: /whenmoon strategy attach <market_id> <name>");
+
+  if(n_reattached < n_detached)
+    cmd_reply(ctx,
+        "  re-attach missing: /whenmoon strategy attach <market_id> <name>");
 }
 
 // ----------------------------------------------------------------------- //
@@ -2620,11 +2623,12 @@ wm_backtest_register_verbs(void)
         "whenmoon backtest reload <strategy_name>",
         "Reload a strategy plugin under the sweep gate.",
         "Detaches all attachments, dlclose+dlopen+resolve+init the"
-        " strategy plugin, then re-scans the registry. Acquires the"
-        " global reload lock first and waits for in-flight sweep runs"
-        " to drain (CLAM_INFO every 5s while waiting) — this prevents"
-        " a dlclose from invalidating function pointers cached for an"
-        " active worker iteration. Re-attach manually after reload.",
+        " strategy plugin, re-scans the registry, then re-attaches"
+        " the captured attachments automatically (WM-RELOAD-1)."
+        " Acquires the global reload lock first and waits for"
+        " in-flight sweep runs to drain (CLAM_INFO every 5s while"
+        " waiting) — this prevents a dlclose from invalidating"
+        " function pointers cached for an active worker iteration.",
         USERNS_GROUP_ADMIN, 100, CMD_SCOPE_ANY, METHOD_T_ANY,
         wm_bt_cmd_reload, NULL, "whenmoon/backtest", NULL,
         NULL, 0, NULL, NULL) != SUCCESS)

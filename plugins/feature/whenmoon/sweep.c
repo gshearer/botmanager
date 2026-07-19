@@ -2073,7 +2073,7 @@ wm_bt_sweep_active_count(void)
 bool
 wm_bt_sweep_reload_strategy(whenmoon_state_t *st,
     const char *strategy_name, uint32_t *out_n_detached,
-    char *err, size_t err_cap)
+    uint32_t *out_n_reattached, char *err, size_t err_cap)
 {
   bool ok;
   time_t   t_last_log;
@@ -2081,6 +2081,9 @@ wm_bt_sweep_reload_strategy(whenmoon_state_t *st,
 
   if(out_n_detached != NULL)
     *out_n_detached = 0;
+
+  if(out_n_reattached != NULL)
+    *out_n_reattached = 0;
 
   if(err != NULL && err_cap > 0)
     err[0] = '\0';
@@ -2124,7 +2127,7 @@ wm_bt_sweep_reload_strategy(whenmoon_state_t *st,
   }
 
   ok = wm_strategy_reload(st, strategy_name, out_n_detached,
-      err, err_cap) == SUCCESS;
+      out_n_reattached, err, err_cap) == SUCCESS;
 
   pthread_mutex_unlock(&g_bt_reload_lock);
 

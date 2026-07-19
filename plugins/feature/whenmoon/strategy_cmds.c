@@ -305,9 +305,10 @@ wm_strategy_cmd_detach(const cmd_ctx_t *ctx)
 // /whenmoon strategy reload <strategy_name>                               //
 // ----------------------------------------------------------------------- //
 //
-// Detach all attachments, dlclose, dlopen, run init/start. The user
-// re-attaches afterward; auto-reattach is out of scope for WM-LT-3 to
-// keep the dev-iteration loop predictable.
+// Detach all attachments, dlclose, dlopen, run init/start, then
+// replay the attachments captured before the detach (WM-RELOAD-1 —
+// full contract on wm_strategy_reload in strategy.h). The reply
+// carries both counts; a re-attach shortfall prints the manual hint.
 
 static void
 wm_strategy_cmd_reload(const cmd_ctx_t *ctx)
@@ -317,7 +318,8 @@ wm_strategy_cmd_reload(const cmd_ctx_t *ctx)
   char              name_tok[WM_STRATEGY_NAME_SZ] = {0};
   char              err[192];
   char              reply[256];
-  uint32_t          n_detached = 0;
+  uint32_t          n_detached   = 0;
+  uint32_t          n_reattached = 0;
 
   st = whenmoon_get_state();
 
@@ -338,8 +340,8 @@ wm_strategy_cmd_reload(const cmd_ctx_t *ctx)
 
   err[0] = '\0';
 
-  if(wm_strategy_reload(st, name_tok, &n_detached, err, sizeof(err))
-         != SUCCESS)
+  if(wm_strategy_reload(st, name_tok, &n_detached, &n_reattached,
+         err, sizeof(err)) != SUCCESS)
   {
     snprintf(reply, sizeof(reply), "reload failed: %s",
         err[0] != '\0' ? err : "unknown");
@@ -348,11 +350,13 @@ wm_strategy_cmd_reload(const cmd_ctx_t *ctx)
   }
 
   snprintf(reply, sizeof(reply),
-      "reloaded %s (detached %u, dlclose+dlopen ok)",
-      name_tok, n_detached);
+      "reloaded %s (detached %u, reattached %u, dlclose+dlopen ok)",
+      name_tok, n_detached, n_reattached);
   cmd_reply(ctx, reply);
-  cmd_reply(ctx,
-      "  re-attach: /whenmoon strategy attach <market_id> <name>");
+
+  if(n_reattached < n_detached)
+    cmd_reply(ctx,
+        "  re-attach missing: /whenmoon strategy attach <market_id> <name>");
 }
 
 // ----------------------------------------------------------------------- //
@@ -743,8 +747,10 @@ wm_strategy_register_verbs(void)
   if(cmd_register("whenmoon", "reload",
         "whenmoon strategy reload <strategy_name>",
         "Detach all attachments, dlclose the strategy plugin,"
-        " dlopen it (picks up a fresh build), and re-init."
-        " Re-attach manually after reload.",
+        " dlopen it (picks up a fresh build), re-init, and re-attach"
+        " the captured attachments automatically (WM-RELOAD-1); the"
+        " reply carries detached/reattached counts and misses are"
+        " logged.",
         NULL,
         USERNS_GROUP_ADMIN, 100, CMD_SCOPE_ANY, METHOD_T_ANY,
         wm_strategy_cmd_reload, NULL, "whenmoon/strategy", NULL,

@@ -1279,19 +1279,29 @@ wm_strategy_seed_replay_cursors(whenmoon_state_t *st,
 
 bool
 wm_strategy_reload(whenmoon_state_t *st, const char *strategy_name,
-    uint32_t *out_n_detached, char *err, size_t err_cap)
+    uint32_t *out_n_detached, uint32_t *out_n_reattached,
+    char *err, size_t err_cap)
 {
-  wm_strategy_registry_t  *reg;
-  loaded_strategy_t       *ls;
-  loaded_strategy_t       *cur;
-  loaded_strategy_t      **pp;
-  char                     plugin_name[PLUGIN_NAME_SZ];
-  char                     path[512];
-  uint32_t                 n_detached = 0;
-  bool                     have_path  = false;
+  wm_strategy_registry_t   *reg;
+  loaded_strategy_t        *ls;
+  loaded_strategy_t        *cur;
+  loaded_strategy_t       **pp;
+  wm_strategy_attachment_t *walk;
+  wm_reattach_snap_t        snap[WM_MK3_DISPATCH_MAX_ATTACH];
+  char                      plugin_name[PLUGIN_NAME_SZ];
+  char                      path[512];
+  uint32_t                  n_detached    = 0;
+  uint32_t                  n_snap        = 0;
+  uint32_t                  n_trunc       = 0;
+  uint32_t                  n_reattached  = 0;
+  uint32_t                  i;
+  bool                      have_path     = false;
 
   if(out_n_detached != NULL)
     *out_n_detached = 0;
+
+  if(out_n_reattached != NULL)
+    *out_n_reattached = 0;
 
   if(err != NULL && err_cap > 0)
     err[0] = '\0';
@@ -1329,6 +1339,25 @@ wm_strategy_reload(whenmoon_state_t *st, const char *strategy_name,
   {
     snprintf(path, sizeof(path), "%s", ls->plugin_path);
     have_path = true;
+  }
+
+  // WM-RELOAD-1: capture (market, priority) for every attachment so
+  // the reload can replay them once the fresh .so is registered. Cap
+  // matches the dispatch scratch cap; overflow is counted and warned
+  // after the lock drops.
+  for(walk = ls->attachments; walk != NULL; walk = walk->next)
+  {
+    if(n_snap >= WM_MK3_DISPATCH_MAX_ATTACH)
+    {
+      n_trunc++;
+      continue;
+    }
+
+    snprintf(snap[n_snap].market_id_str,
+        sizeof(snap[n_snap].market_id_str), "%s",
+        walk->ctx.market_id_str);
+    snap[n_snap].priority = walk->priority;
+    n_snap++;
   }
 
   // Detach every attachment. Each finalize fires under the lock —
@@ -1427,6 +1456,43 @@ wm_strategy_reload(whenmoon_state_t *st, const char *strategy_name,
 
   // Re-scan the registry to pick up the freshly-loaded strategy.
   wm_strategy_registry_scan(st);
+
+  if(n_trunc > 0)
+    clam(CLAM_WARN, WHENMOON_CTX,
+        "reload %s: %u attachment(s) beyond the %u snapshot cap were"
+        " dropped — re-attach them manually", strategy_name, n_trunc,
+        (uint32_t)WM_MK3_DISPATCH_MAX_ATTACH);
+
+  // WM-RELOAD-1: replay the snapshot. wm_strategy_attach takes the
+  // registry lock itself, so this must run unlocked. A single-market
+  // miss (removed mid-reload) is logged and skipped — the reload
+  // itself stands; callers compare the two counts.
+  for(i = 0; i < n_snap; i++)
+  {
+    char aerr[128];
+
+    aerr[0] = '\0';
+
+    if(wm_strategy_attach(st, snap[i].market_id_str, strategy_name,
+           snap[i].priority, NULL, aerr, sizeof(aerr)) == WM_ATTACH_OK)
+    {
+      n_reattached++;
+      continue;
+    }
+
+    clam(CLAM_WARN, WHENMOON_CTX,
+        "reload %s: re-attach %s (priority %u) failed: %s",
+        strategy_name, snap[i].market_id_str, snap[i].priority,
+        aerr[0] != '\0' ? aerr : "unknown");
+  }
+
+  if(n_reattached > 0)
+    clam(CLAM_INFO, WHENMOON_CTX,
+        "reload %s: re-attached %u/%u live attachment(s)",
+        strategy_name, n_reattached, n_detached);
+
+  if(out_n_reattached != NULL)
+    *out_n_reattached = n_reattached;
 
   return(SUCCESS);
 }

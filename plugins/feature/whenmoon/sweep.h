@@ -383,11 +383,13 @@ uint32_t wm_bt_sweep_active_count(void);
 // Reload a strategy under the global reload lock. Waits for active
 // sweeps to drain (CLAM_INFO every 5s while waiting), then performs
 // the dlclose + dlopen + resolve + init + start sequence + registry
-// rescan. Returns SUCCESS on a clean reload; FAIL with err populated
-// otherwise.
+// rescan + attachment replay (WM-RELOAD-1 — detached / re-attached
+// counts land in the two out params; full contract on
+// wm_strategy_reload in strategy.h). Returns SUCCESS on a clean
+// reload; FAIL with err populated otherwise.
 bool wm_bt_sweep_reload_strategy(struct whenmoon_state *st,
     const char *strategy_name, uint32_t *out_n_detached,
-    char *err, size_t err_cap);
+    uint32_t *out_n_reattached, char *err, size_t err_cap);
 
 #endif // WHENMOON_INTERNAL
 

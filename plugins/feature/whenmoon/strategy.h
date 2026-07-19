@@ -217,18 +217,33 @@ typedef enum
 wm_detach_result_t wm_strategy_detach(struct whenmoon_state *st,
     const char *market_id_str, const char *strategy_name);
 
-// Reload: detach all attachments for the named strategy, drop the
-// registry entry, then plugin_unload + plugin_load + plugin_resolve +
-// plugin_init_all. The user re-attaches afterward; auto-reattach is
-// out of scope for WM-LT-3 and would require persisting attachments
-// (deferred).
+// WM-RELOAD-1: one (market, priority) pair captured across a reload so
+// the live attachments can be replayed after the dlclose+dlopen cycle.
+// Sized to match wm_strategy_ctx.market_id_str.
+typedef struct
+{
+  char      market_id_str[64];
+  uint32_t  priority;
+} wm_reattach_snap_t;
+
+// Reload: snapshot every attachment's (market, priority), detach them
+// all, drop the registry entry, plugin_unload + plugin_load +
+// plugin_resolve + plugin_init_all + plugin_start_all, re-scan the
+// registry, then replay the snapshot through wm_strategy_attach
+// (WM-RELOAD-1). Attach-time WM-SR-1/2 cursor seeding keeps the
+// replayed attachments from double-acting on bars the live session
+// already saw.
 //
-// Returns SUCCESS + writes the number of detached attachments to
-// `out_n_detached`; FAIL on lookup miss or a load error (with err
-// populated).
+// Returns SUCCESS + writes the detached / re-attached counts to
+// `out_n_detached` / `out_n_reattached` (either may be NULL); FAIL on
+// lookup miss or a load error (with err populated — the attachments
+// are already gone in that case and there is nothing to re-attach
+// into). A re-attach miss on a single market (removed mid-reload) is
+// CLAM_WARNed and skipped, never a reload failure: compare the two
+// counts.
 bool wm_strategy_reload(struct whenmoon_state *st,
     const char *strategy_name, uint32_t *out_n_detached,
-    char *err, size_t err_cap);
+    uint32_t *out_n_reattached, char *err, size_t err_cap);
 
 // Detach every attachment whose market_id_str matches. Called from
 // wm_market_remove so an in-flight stop does not leave attachments
