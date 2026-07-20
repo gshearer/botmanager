@@ -120,6 +120,41 @@ ow_geo_insert(const char *zipcode, double lat, double lon, const char *name)
   ow_geo_cache[idx] = e;
 }
 
+// Compose a human-facing place label from geocoder fields into `out`:
+//   "<name>, <state>, <country>"
+// The state is appended when present and not a duplicate of the name
+// (so "Singapore, Singapore" collapses to "Singapore"); the country is
+// appended only when it is not the US — a US state already
+// disambiguates, and the bare city reads cleaner for the common case.
+// `out` must be a distinct buffer from `name`.
+static void
+ow_compose_place(const char *name, const char *state, const char *country,
+    char *out, size_t out_sz)
+{
+  size_t len;
+
+  if(out_sz == 0)
+    return;
+
+  snprintf(out, out_sz, "%s", (name != NULL) ? name : "");
+
+  if(state != NULL && state[0] != '\0' && strcasecmp(state, out) != 0)
+  {
+    len = strlen(out);
+
+    if(len < out_sz)
+      snprintf(out + len, out_sz - len, ", %s", state);
+  }
+
+  if(country != NULL && country[0] != '\0' && strcasecmp(country, "US") != 0)
+  {
+    len = strlen(out);
+
+    if(len < out_sz)
+      snprintf(out + len, out_sz - len, ", %s", country);
+  }
+}
+
 // Request freelist helpers
 
 static ow_request_t *
@@ -1019,7 +1054,20 @@ ow_geocode_done(const curl_response_t *resp)
     return;
   }
 
-  json_get_str(root, "name", r->location_name, sizeof(r->location_name));
+  {
+    char zname[OW_NAME_SZ];
+    char zcountry[OW_NAME_SZ];
+
+    zname[0] = '\0';
+    zcountry[0] = '\0';
+    json_get_str(root, "name", zname, sizeof(zname));
+    json_get_str(root, "country", zcountry, sizeof(zcountry));
+
+    // The zip geocoder carries no state field, so only the country
+    // (when non-US) can enrich the label here.
+    ow_compose_place(zname, NULL, zcountry,
+        r->location_name, sizeof(r->location_name));
+  }
 
   json_object_put(root);
 
@@ -1707,6 +1755,8 @@ ow_http_get_sync(const char *url, uint32_t timeout_secs,
 static bool
 ow_parse_direct_geo(const char *body, size_t body_len,
     char *name_out, size_t name_sz,
+    char *state_out, size_t state_sz,
+    char *country_out, size_t country_sz,
     char *zip_out, size_t zip_sz,
     double *lat, double *lon)
 {
@@ -1745,6 +1795,18 @@ ow_parse_direct_geo(const char *body, size_t body_len,
   name_out[0] = '\0';
   json_get_str(e0, "name", name_out, name_sz);
 
+  if(state_out != NULL && state_sz > 0)
+  {
+    state_out[0] = '\0';
+    json_get_str(e0, "state", state_out, state_sz);
+  }
+
+  if(country_out != NULL && country_sz > 0)
+  {
+    country_out[0] = '\0';
+    json_get_str(e0, "country", country_out, country_sz);
+  }
+
   zip_out[0] = '\0';
 
   if(!json_get_str(e0, "zip", zip_out, zip_sz))
@@ -1769,6 +1831,9 @@ openweather_geocode_city_sync(const char *city, char *zip_out, size_t zip_sz)
   double lat;
   char zip[OW_ZIPCODE_SZ];
   char name[OW_NAME_SZ];
+  char state[OW_NAME_SZ];
+  char country[OW_NAME_SZ];
+  char place[OW_NAME_SZ];
   long http_stat;
   const ow_citycache_t *hit;
   const char *apikey;
@@ -1829,9 +1894,12 @@ openweather_geocode_city_sync(const char *city, char *zip_out, size_t zip_sz)
 
   lat = 0.0;
   lon = 0.0;
+  state[0] = '\0';
+  country[0] = '\0';
 
   parsed = ow_parse_direct_geo(body, body_len,
-      name, sizeof(name), zip, sizeof(zip), &lat, &lon);
+      name, sizeof(name), state, sizeof(state),
+      country, sizeof(country), zip, sizeof(zip), &lat, &lon);
 
   mem_free(body);
 
@@ -1850,6 +1918,8 @@ openweather_geocode_city_sync(const char *city, char *zip_out, size_t zip_sz)
     char *rb;
     double rev_lat;
     char rev_name[OW_NAME_SZ];
+    char rev_state[OW_NAME_SZ];
+    char rev_country[OW_NAME_SZ];
     long rb_stat;
     size_t rb_len;
     char rev_url[OW_URL_SZ];
@@ -1873,12 +1943,28 @@ openweather_geocode_city_sync(const char *city, char *zip_out, size_t zip_sz)
 
     rev_lat = 0.0;
     rev_lon = 0.0;
+    rev_state[0] = '\0';
+    rev_country[0] = '\0';
 
     rparsed = ow_parse_direct_geo(rb, rb_len,
-        rev_name, sizeof(rev_name), zip, sizeof(zip),
+        rev_name, sizeof(rev_name),
+        rev_state, sizeof(rev_state),
+        rev_country, sizeof(rev_country), zip, sizeof(zip),
         &rev_lat, &rev_lon);
 
     mem_free(rb);
+
+    // The reverse point backfills state/country when the direct hit
+    // omitted them (and its name if the direct name was blank).
+    if(rparsed == SUCCESS)
+    {
+      if(name[0] == '\0' && rev_name[0] != '\0')
+        snprintf(name, sizeof(name), "%s", rev_name);
+      if(state[0] == '\0' && rev_state[0] != '\0')
+        snprintf(state, sizeof(state), "%s", rev_state);
+      if(country[0] == '\0' && rev_country[0] != '\0')
+        snprintf(country, sizeof(country), "%s", rev_country);
+    }
 
     // Neither endpoint returned a postcode — synthesize a stable
     // 9-char key so the zip→lat/lon cache short-circuits the next
@@ -1899,9 +1985,12 @@ openweather_geocode_city_sync(const char *city, char *zip_out, size_t zip_sz)
     }
   }
 
+  ow_compose_place(name[0] != '\0' ? name : city, state, country,
+      place, sizeof(place));
+
   pthread_mutex_lock(&ow_geo_cache_mu);
   ow_city_insert_locked(city_lc, zip);
-  ow_geo_insert(zip, lat, lon, name[0] != '\0' ? name : city);
+  ow_geo_insert(zip, lat, lon, place);
   pthread_mutex_unlock(&ow_geo_cache_mu);
 
   snprintf(zip_out, zip_sz, "%s", zip);
@@ -1987,7 +2076,20 @@ openweather_geocode_zip_sync(const char *zipcode,
     return(FAIL);
   }
 
-  json_get_str(root, "name", name, sizeof(name));
+  {
+    char zname[OW_NAME_SZ];
+    char zcountry[OW_NAME_SZ];
+
+    zname[0] = '\0';
+    zcountry[0] = '\0';
+    json_get_str(root, "name", zname, sizeof(zname));
+    json_get_str(root, "country", zcountry, sizeof(zcountry));
+
+    // The zip geocoder carries no state field; enrich with the country
+    // only (when non-US).
+    ow_compose_place(zname, NULL, zcountry, name, sizeof(name));
+  }
+
   json_object_put(root);
 
   pthread_mutex_lock(&ow_geo_cache_mu);

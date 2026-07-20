@@ -158,6 +158,8 @@ static const plugin_kv_entry_t ow_kv_schema[] = {
     "Geocoding cache time-to-live in seconds" },
 };
 
+static void             ow_compose_place(const char *name, const char *state,
+                            const char *country, char *out, size_t out_sz);
 static ow_geocache_t   *ow_geo_lookup(const char *zipcode);
 static void             ow_geo_insert(const char *zipcode, double lat,
                             double lon, const char *name);
