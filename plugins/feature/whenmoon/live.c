@@ -41,6 +41,7 @@
 #include "alloc.h"
 #include "clam.h"
 #include "common.h"
+#include "kv.h"
 #include "task.h"
 
 #include "exchange_api.h"
@@ -100,6 +101,7 @@ static struct
 static void wm_live_ws_user_event_cb(const exchange_ws_event_t *ev,
     void *user);
 static void wm_live_fills_poll_tick(task_t *t);
+static void wm_live_disc_register_kvs(void);
 
 #define WM_LIVE_FILLS_POLL_SEC         30
 #define WM_LIVE_FILLS_POLL_OVERLAP_MS  (60 * 1000)
@@ -1243,6 +1245,10 @@ wm_live_engine_start(void)
   st = whenmoon_get_state();
   if(st == NULL) return;
 
+  // WM-DISC-1: surface the discretionary-treasury knobs to /set kv
+  // before any fill can consult them.
+  wm_live_disc_register_kvs();
+
   if(exchange_name_list(names, WM_LIVE_MAX_EXCHANGES, &n_names) != SUCCESS)
     n_names = 0;
 
@@ -1373,35 +1379,26 @@ wm_live_quote_available(const char *market_id,
   return(false);
 }
 
-// Bind the real-mode cash ledger to the deployable portion of `avail`,
-// returning the value actually applied (after the WM-QUOTE-ALLOC-1 cap).
-// Caller holds mk->lock. `reset_baseline` (true for a deliberate operator
-// reconcile) also re-anchors starting_cash, the daily-loss-cap denominator;
-// the periodic auto-reconcile passes false so it only tracks deployable
-// `cash` and leaves an established risk baseline alone — but the very first
-// sync always anchors it (off real funds, not the $10k placeholder).
-//
-// WM-QUOTE-ALLOC-1: bound `avail` by the per-market quote-allocation knobs
-// so N flat real markets sharing one quote currency don't each reconcile
-// to the full balance and collectively over-deploy. quote_alloc_frac
-// (default 1.0 = whole balance) and quote_alloc_max (default 0.0 =
-// uncapped) compose — most-restrictive wins. The capped value feeds BOTH
-// cash and starting_cash, so the daily-loss cap is relative to *allocated*
-// capital. Knobs are read FRESH here (not the session-cached params, which
-// only refresh at market start) so an operator `/set kv …quote_alloc_frac`
-// takes effect on the very next reconcile. Reading KV under mk->lock is
-// safe: whenmoon registers every per-market KV with NULL change-callbacks,
-// so kv ops never re-enter market code (mk->lock is a per-market leaf
+// WM-QUOTE-ALLOC-1: bound `avail` quote units by the per-market
+// allocation knobs so N real markets sharing one quote currency don't
+// each claim the full balance and collectively over-deploy.
+// quote_alloc_frac (default 1.0 = whole balance) and quote_alloc_max
+// (default 0.0 = uncapped) compose — most-restrictive wins. Knobs are
+// read FRESH here (not the session-cached params, which only refresh at
+// market start) so an operator `/set kv …quote_alloc_frac` takes effect
+// on the very next reconcile. Reading KV under mk->lock is safe:
+// whenmoon registers every per-market KV with NULL change-callbacks, so
+// kv ops never re-enter market code (mk->lock is a per-market leaf
 // lock; there is no kv->mk lock-ordering path), and reconcile is
-// infrequent.
+// infrequent. Split from wm_live_apply_real_cash_locked so the
+// WM-DISC-1 over-subscription audit can price a market's claim without
+// applying it. Caller holds mk->lock.
 static double
-wm_live_apply_real_cash_locked(whenmoon_market_t *mk, double avail,
-    bool reset_baseline)
+wm_live_quote_alloc_bound_locked(whenmoon_market_t *mk, double avail)
 {
-  wm_market_stats_t *rs = &mk->session.stats[WM_MARKET_MODE_REAL];
-  double             frac;
-  double             max;
-  double             capped = avail;
+  double frac;
+  double max;
+  double capped = avail;
 
   frac = wm_mk_kv_get_double(mk->market_id_str, "quote_alloc_frac",
       "1.0", WM_MARKET_DEFAULT_QUOTE_ALLOC_FRAC,
@@ -1422,6 +1419,25 @@ wm_live_apply_real_cash_locked(whenmoon_market_t *mk, double avail,
 
   if(max > 0.0 && max < capped)
     capped = max;
+
+  return(capped);
+}
+
+// Bind the real-mode cash ledger to the deployable portion of `avail`,
+// returning the value actually applied (after the WM-QUOTE-ALLOC-1 cap).
+// Caller holds mk->lock. `reset_baseline` (true for a deliberate operator
+// reconcile) also re-anchors starting_cash, the daily-loss-cap denominator;
+// the periodic auto-reconcile passes false so it only tracks deployable
+// `cash` and leaves an established risk baseline alone — but the very first
+// sync always anchors it (off real funds, not the $10k placeholder). The
+// capped value feeds BOTH cash and starting_cash, so the daily-loss cap is
+// relative to *allocated* capital.
+static double
+wm_live_apply_real_cash_locked(whenmoon_market_t *mk, double avail,
+    bool reset_baseline)
+{
+  wm_market_stats_t *rs     = &mk->session.stats[WM_MARKET_MODE_REAL];
+  double             capped = wm_live_quote_alloc_bound_locked(mk, avail);
 
   rs->cash = capped;
 
@@ -1542,13 +1558,87 @@ wm_market_reconcile_real_cash(whenmoon_market_t *mk, double *out_cash,
   return(SUCCESS);
 }
 
+// WM-DISC-1 A1: per-quote-currency accumulator for the reconcile
+// walk's over-subscription audit — one slot per distinct quote currency
+// seen among the exchange's real-mode markets.
+#define WM_LIVE_AUDIT_QUOTES 8
+
+typedef struct
+{
+  char     quote[16];
+  double   avail;
+  double   sum;
+  uint32_t n;
+  char     detail[512];
+  size_t   detail_len;
+} wm_live_alloc_audit_t;
+
+// Caller holds mk->lock (the bound helper reads KVs under it). Slots
+// past the compile cap are dropped silently — 8 distinct quote
+// currencies on one exchange exceeds anything we deploy.
+static void
+wm_live_alloc_audit_add(wm_live_alloc_audit_t *audit, uint32_t *n_audit,
+    whenmoon_market_t *mk, double avail)
+{
+  wm_live_alloc_audit_t *slot = NULL;
+  char                   exch[EXCHANGE_NAME_SZ];
+  char                   base[16];
+  char                   quote[16];
+  double                 bound;
+  uint32_t               i;
+
+  if(wm_market_parse_id(mk->market_id_str, exch, sizeof(exch),
+         base, sizeof(base), quote, sizeof(quote)) != SUCCESS)
+    return;
+
+  for(i = 0; i < *n_audit; i++)
+  {
+    if(strncmp(audit[i].quote, quote, sizeof(quote)) == 0)
+    {
+      slot = &audit[i];
+      break;
+    }
+  }
+
+  if(slot == NULL)
+  {
+    if(*n_audit >= WM_LIVE_AUDIT_QUOTES)
+      return;
+
+    slot = &audit[(*n_audit)++];
+    memset(slot, 0, sizeof(*slot));
+    snprintf(slot->quote, sizeof(slot->quote), "%s", quote);
+    slot->avail = avail;
+  }
+
+  bound = wm_live_quote_alloc_bound_locked(mk, avail);
+
+  slot->sum += bound;
+  slot->n++;
+
+  if(slot->detail_len < sizeof(slot->detail))
+  {
+    int len = snprintf(slot->detail + slot->detail_len,
+        sizeof(slot->detail) - slot->detail_len,
+        " %s=%.2f", mk->market_id_str, bound);
+
+    if(len > 0)
+      slot->detail_len += (size_t)len;
+
+    if(slot->detail_len > sizeof(slot->detail))
+      slot->detail_len = sizeof(slot->detail);
+  }
+}
+
 void
 wm_live_reconcile_from_accounts(const char *exchange,
     const exchange_account_t *rows, uint32_t n)
 {
-  whenmoon_state_t   *st;
-  whenmoon_markets_t *mkts;
-  uint32_t            i;
+  whenmoon_state_t      *st;
+  whenmoon_markets_t    *mkts;
+  wm_live_alloc_audit_t  audit[WM_LIVE_AUDIT_QUOTES];
+  uint32_t               n_audit = 0;
+  uint32_t               i;
 
   if(exchange == NULL || exchange[0] == '\0' || rows == NULL)
     return;
@@ -1577,6 +1667,13 @@ wm_live_reconcile_from_accounts(const char *exchange,
 
     pthread_mutex_lock(&mk->lock);
 
+    // WM-DISC-1 A1: tally this real-mode market's allocation claim so
+    // the post-walk audit below can flag quote-currency
+    // over-subscription. Position state is irrelevant here — the claim
+    // is configuration, not deployment.
+    if(mk->session.mode == WM_MARKET_MODE_REAL)
+      wm_live_alloc_audit_add(audit, &n_audit, mk, avail);
+
     // Reconcile only when flat. An open long means part of the capital
     // sits in the base asset, so the quote `available` understates the
     // market's deployable cash; the market's own fill ledger is the
@@ -1597,4 +1694,218 @@ wm_live_reconcile_from_accounts(const char *exchange,
   }
 
   pthread_rwlock_unlock(&mkts->arr_lock);
+
+  // WM-DISC-1 A1: warn — never refuse; refusing mid-reconcile could
+  // strand live positions — when the real-mode markets sharing a quote
+  // currency are collectively promised more than the balance holds.
+  // A single market's bound can never exceed `avail` by construction,
+  // so only multi-market sums can over-subscribe. The operator fixes
+  // the quote_alloc KVs.
+  for(i = 0; i < n_audit; i++)
+  {
+    wm_live_alloc_audit_t *a = &audit[i];
+
+    if(a->n >= 2 && a->sum > a->avail)
+      clam(CLAM_WARN, WM_LIVE_CTX,
+          "quote over-subscription on %s %s: allocation bounds sum %.2f"
+          " > available %.2f across %u real market(s):%s",
+          exchange, a->quote, a->sum, a->avail, a->n, a->detail);
+  }
+}
+
+// ----------------------------------------------------------------------- //
+// WM-DISC-1: discretionary-treasury freeze tripwire (CFO.md sec. 3)       //
+// ----------------------------------------------------------------------- //
+
+// All three knobs default inert; the tripwire arms only when every one
+// is set. Registered at engine start so /set kv finds them before the
+// first fill; read FRESH at each real fill, breaker-style.
+#define WM_DISC_KV_DEPOSIT   "plugin.whenmoon.disc.deposit_usd"
+#define WM_DISC_KV_FRAC      "plugin.whenmoon.disc.freeze_frac"
+#define WM_DISC_KV_MARKETS   "plugin.whenmoon.disc.markets"
+
+// Compile cap on designated markets + list-KV working buffer.
+#define WM_DISC_MAX_MARKETS  16
+#define WM_DISC_LIST_BUF_SZ  (WM_DISC_MAX_MARKETS * WM_MARKET_ID_STR_SZ)
+
+static void
+wm_live_disc_register_kvs(void)
+{
+  if(!kv_exists(WM_DISC_KV_DEPOSIT) &&
+     kv_register(WM_DISC_KV_DEPOSIT, KV_DOUBLE, "0.0", NULL, NULL,
+         "Discretionary treasury (whenmoon CFO.md sec. 3): operator"
+         " deposit in quote currency. 0 = fund unconfigured. The"
+         " DISC-FREEZE tripwire arms only when deposit_usd,"
+         " freeze_frac, and markets are all set.") != SUCCESS)
+    clam(CLAM_WARN, WM_LIVE_CTX, "kv_register failed: %s",
+        WM_DISC_KV_DEPOSIT);
+
+  if(!kv_exists(WM_DISC_KV_FRAC) &&
+     kv_register(WM_DISC_KV_FRAC, KV_DOUBLE, "0.0", NULL, NULL,
+         "Discretionary treasury freeze fraction: fund equity <"
+         " deposit_usd * (1 - freeze_frac) after a real fill on a"
+         " designated market flips every designated market to MANUAL"
+         " (positions kept) and emits one DISC-FREEZE warn."
+         " 0 disables.") != SUCCESS)
+    clam(CLAM_WARN, WM_LIVE_CTX, "kv_register failed: %s",
+        WM_DISC_KV_FRAC);
+
+  if(!kv_exists(WM_DISC_KV_MARKETS) &&
+     kv_register(WM_DISC_KV_MARKETS, KV_STR, "", NULL, NULL,
+         "Discretionary treasury designated markets: comma-separated"
+         " market_id_str list, exact match, no whitespace. The fund"
+         " trades ONLY through these; the freeze tripwire sums their"
+         " real cash + marked positions.") != SUCCESS)
+    clam(CLAM_WARN, WM_LIVE_CTX, "kv_register failed: %s",
+        WM_DISC_KV_MARKETS);
+}
+
+// Exact-match membership test against the comma-separated designated-
+// market list. No whitespace tolerance — the KV help states the format.
+static bool
+wm_disc_market_listed(const char *list, const char *market_id_str)
+{
+  const char *p    = list;
+  size_t      want = strlen(market_id_str);
+
+  while(*p != '\0')
+  {
+    const char *comma = strchr(p, ',');
+    size_t      len   = (comma != NULL) ? (size_t)(comma - p) : strlen(p);
+
+    if(len == want && strncmp(p, market_id_str, want) == 0)
+      return(true);
+
+    if(comma == NULL)
+      break;
+
+    p = comma + 1;
+  }
+
+  return(false);
+}
+
+// WM-DISC-1 A3: called from wm_market_engine_record_external_fill AFTER
+// the fill's locks are released. Mirrors the WM-BREAKER-1 shape at fund
+// scope: sum designated markets' real equity, breach -> every
+// designated market flips MANUAL.
+//
+// Locking: the walk takes one mk->lock at a time under the arr rdlock,
+// never two — two designated markets filling concurrently must not
+// ABBA-deadlock. The summed equity is therefore a near-instant
+// composite, not an atomic snapshot: breaker-grade arithmetic, not
+// accounting. Each market's position is marked at its own freshest
+// mark; for the just-filled market that IS the fill px
+// (apply_fill_locked updates last_mark_px before we run). A designated
+// market that is not running contributes zero — conservative by
+// construction (invisible capital leans the tripwire toward freezing).
+void
+wm_live_disc_freeze_check(const char *filled_market_id_str)
+{
+  whenmoon_state_t  *st;
+  whenmoon_market_t *fund[WM_DISC_MAX_MARKETS];
+  char               list[WM_DISC_LIST_BUF_SZ];
+  char              *tok;
+  char              *save = NULL;
+  const char        *val;
+  double             deposit;
+  double             frac;
+  double             floor_eq;
+  double             equity  = 0.0;
+  uint32_t           n_fund  = 0;
+  uint32_t           flipped = 0;
+  uint32_t           i;
+
+  if(filled_market_id_str == NULL)
+    return;
+
+  deposit = kv_get_double(WM_DISC_KV_DEPOSIT);
+  frac    = kv_get_double(WM_DISC_KV_FRAC);
+
+  if(deposit <= 0.0 || frac <= 0.0)
+    return;
+
+  // kv_get_str points at internal storage valid only until the value
+  // changes — copy before parsing.
+  val = kv_get_str(WM_DISC_KV_MARKETS);
+
+  if(val == NULL || val[0] == '\0')
+    return;
+
+  snprintf(list, sizeof(list), "%s", val);
+
+  if(!wm_disc_market_listed(list, filled_market_id_str))
+    return;
+
+  st = whenmoon_get_state();
+
+  if(st == NULL || st->markets == NULL)
+    return;
+
+  floor_eq = deposit * (1.0 - frac);
+
+  pthread_rwlock_rdlock(&st->markets->arr_lock);
+
+  for(tok = strtok_r(list, ",", &save);
+      tok != NULL && n_fund < WM_DISC_MAX_MARKETS;
+      tok = strtok_r(NULL, ",", &save))
+  {
+    whenmoon_market_t *mk = wm_market_lookup_by_id(st, tok);
+
+    if(mk == NULL)
+      continue;
+
+    pthread_mutex_lock(&mk->lock);
+
+    {
+      const wm_market_stats_t *rs =
+          &mk->session.stats[WM_MARKET_MODE_REAL];
+      double pos = (mk->session.position.side == WM_MARKET_POS_LONG)
+          ? mk->session.position.qty : 0.0;
+
+      equity += rs->cash + pos * mk->session.last_mark_px;
+    }
+
+    pthread_mutex_unlock(&mk->lock);
+    fund[n_fund++] = mk;
+  }
+
+  if(equity >= floor_eq)
+  {
+    pthread_rwlock_unlock(&st->markets->arr_lock);
+    return;
+  }
+
+  // Trip: flip every designated market to MANUAL, position kept — the
+  // WM-BREAKER-1 semantics. MANUAL blocks strategy auto-trades but not
+  // manual orders; enforcing "closes only, no opens" during a freeze is
+  // CFO discipline pending operator review (CFO.md sec. 3). Alert once
+  // per trip: if nothing flipped, an earlier fill already announced
+  // this freeze (in-flight orders can still fill after the flip).
+  for(i = 0; i < n_fund; i++)
+  {
+    whenmoon_market_t *mk = fund[i];
+
+    pthread_mutex_lock(&mk->lock);
+
+    if(mk->session.mode != WM_MARKET_MODE_MANUAL)
+    {
+      mk->session.mode = WM_MARKET_MODE_MANUAL;
+      (void)wm_market_persist_locked(mk);
+      flipped++;
+    }
+
+    pthread_mutex_unlock(&mk->lock);
+  }
+
+  pthread_rwlock_unlock(&st->markets->arr_lock);
+
+  if(flipped > 0)
+    clam(CLAM_WARN, WM_LIVE_CTX,
+        "DISC-FREEZE: fund equity %.2f breached floor %.2f"
+        " (deposit %.2f, freeze_frac %.4g) — %u designated market(s)"
+        " -> manual, positions kept, pending operator review"
+        " (tripping fill: %s)",
+        equity, floor_eq, deposit, frac, flipped,
+        filled_market_id_str);
 }

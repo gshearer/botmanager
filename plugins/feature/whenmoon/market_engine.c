@@ -1205,6 +1205,11 @@ wm_market_engine_record_external_fill(const char *market_id_str,
   pthread_mutex_unlock(&mk->lock);
   pthread_rwlock_unlock(&st->markets->arr_lock);
 
+  // WM-DISC-1 A3: evaluate the discretionary-fund tripwire now that
+  // this fill's locks are down — the checker re-walks the designated
+  // markets one lock at a time.
+  wm_live_disc_freeze_check(market_id_str);
+
   // Outside the lock: never hold mk->lock across the async submit (it
   // can re-enter clam/registry paths — see the clam-reentry deadlock
   // class). wm_account_fast_forward re-checks the real-mode + creds gate.
