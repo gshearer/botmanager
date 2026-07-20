@@ -397,10 +397,16 @@ weather_reply_forecast_daily(const cmd_ctx_t *ctx,
 
     if(d->dt > 0)
     {
-      time_t dt = d->dt + f->tz_offset;
       struct tm tm;
 
-      gmtime_r(&dt, &tm);
+      // A daily row's `dt` is a calendar-day marker, not an instant: One
+      // Call pins it to exactly 00:00:00 UTC of the day it represents,
+      // identical across every timezone. It is therefore read in UTC as-is
+      // — adding tz_offset would push negative-offset locales (the Americas)
+      // back across the UTC midnight boundary and mislabel the weekday
+      // (Monday shown as Sunday). Only true instants (hours, sunrise/sunset)
+      // get the offset applied.
+      gmtime_r(&d->dt, &tm);
       day_name = weather_day_names_full[tm.tm_wday];
     }
 
