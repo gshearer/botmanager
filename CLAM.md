@@ -119,6 +119,7 @@ regex (the literal context portion, before any `<placeholder>`).
 | `task_finish` | core/task.c | task completion path |
 | `task_init` | core/task.c | task scheduler init |
 | `task_submit` | core/task.c | task submit surface |
+| `urlgrabber` | plugins/feature/urlgrabber/*.c | URL-title watcher (detect, fetch, announce) |
 | `userns` | core/userns_util.c | userns helpers |
 | `userns_auth` | core/userns.c | userns auth events |
 | `userns_delete` | core/userns.c | userns delete |
