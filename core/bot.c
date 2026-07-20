@@ -148,6 +148,102 @@ bot_payload_ignored(const char *pattern, const char *text)
   return(rc == 0);
 }
 
+// Record a public (channel) line as the bot's latest witnessed line for
+// its (method, channel). DMs, empty lines, and command invocations are
+// skipped — the last of these so a `!quote add` never quotes itself.
+static void
+bot_witness_record(bot_inst_t *bot, const method_msg_t *msg)
+{
+  const char    *method;
+  const char    *prefix;
+  bot_witness_t *w = NULL;
+
+  if(msg->channel[0] == '\0' || msg->text[0] == '\0' || msg->inst == NULL)
+    return;
+
+  prefix = cmd_get_prefix(bot);
+
+  if(prefix != NULL && prefix[0] != '\0' &&
+     strncmp(msg->text, prefix, strlen(prefix)) == 0)
+    return;
+
+  method = method_inst_name(msg->inst);
+
+  if(method == NULL)
+    return;
+
+  pthread_mutex_lock(&bot_witness_lock);
+
+  // Reuse the slot for this (method, channel) if present.
+  for(uint32_t i = 0; i < BOT_WITNESS_MAX; i++)
+  {
+    bot_witness_t *e = &bot->witness[i];
+
+    if(e->valid && strcmp(e->method, method) == 0 &&
+       strcmp(e->channel, msg->channel) == 0)
+    {
+      w = e;
+      break;
+    }
+  }
+
+  if(w == NULL)
+  {
+    w = &bot->witness[bot->witness_next];
+    bot->witness_next = (bot->witness_next + 1) % BOT_WITNESS_MAX;
+    memset(w, 0, sizeof(*w));
+    snprintf(w->method,  sizeof(w->method),  "%s", method);
+    snprintf(w->channel, sizeof(w->channel), "%s", msg->channel);
+  }
+
+  snprintf(w->nickname, sizeof(w->nickname), "%.*s",
+      (int)(sizeof(w->nickname) - 1),
+      (msg->nickname[0] != '\0') ? msg->nickname : msg->sender);
+  snprintf(w->sender, sizeof(w->sender), "%s", msg->sender);
+  snprintf(w->text,   sizeof(w->text),   "%s", msg->text);
+  w->is_action = msg->is_action;
+  w->valid     = true;
+
+  pthread_mutex_unlock(&bot_witness_lock);
+}
+
+bool
+bot_last_public_line(const bot_inst_t *inst, const method_inst_t *method,
+    const char *channel, bot_public_line_t *out)
+{
+  const char *mname;
+  bool        hit = false;
+
+  if(inst == NULL || method == NULL || channel == NULL || out == NULL)
+    return(false);
+
+  mname = method_inst_name(method);
+
+  if(mname == NULL)
+    return(false);
+
+  pthread_mutex_lock(&bot_witness_lock);
+
+  for(uint32_t i = 0; i < BOT_WITNESS_MAX; i++)
+  {
+    const bot_witness_t *e = &inst->witness[i];
+
+    if(e->valid && strcmp(e->method, mname) == 0 &&
+       strcmp(e->channel, channel) == 0)
+    {
+      snprintf(out->nickname, sizeof(out->nickname), "%s", e->nickname);
+      snprintf(out->sender,   sizeof(out->sender),   "%s", e->sender);
+      snprintf(out->text,     sizeof(out->text),     "%s", e->text);
+      out->is_action = e->is_action;
+      hit = true;
+      break;
+    }
+  }
+
+  pthread_mutex_unlock(&bot_witness_lock);
+  return(hit);
+}
+
 static void
 bot_msg_handler(const method_msg_t *msg, void *data)
 {
@@ -189,6 +285,7 @@ bot_msg_handler(const method_msg_t *msg, void *data)
 
   bot->msg_count++;
   bot->last_activity = time(NULL);
+  bot_witness_record(bot, msg);
   bot->driver->on_message(bot->handle, msg);
 }
 

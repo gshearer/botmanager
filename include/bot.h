@@ -198,6 +198,26 @@ void bot_inc_cmd_count(bot_inst_t *inst);
 uint64_t bot_cmd_count(const bot_inst_t *inst);
 time_t bot_last_activity(const bot_inst_t *inst);
 
+// The most recent public (channel) line a bot witnessed, per
+// (method-instance, channel). Command invocations (lines beginning with
+// the bot's command prefix) are excluded, so consumers see the last
+// *conversational* line — e.g. the `quote` feature immortalising whoever
+// just spoke. Every bot maintains this automatically; no driver opt-in.
+typedef struct
+{
+  char nickname[METHOD_NICKNAME_SZ];  // speaker's display nick
+  char sender  [METHOD_SENDER_SZ];    // speaker's session key
+  char text    [METHOD_TEXT_SZ];      // the line itself
+  bool is_action;                     // true for emote/action lines
+} bot_public_line_t;
+
+// Fill `out` with the last public line witnessed by `inst` on the given
+// method instance and channel. Returns false (leaving `out` untouched)
+// when nothing has been seen there yet or on NULL inputs. Thread-safe.
+bool bot_last_public_line(const bot_inst_t *inst,
+    const method_inst_t *method, const char *channel,
+    bot_public_line_t *out);
+
 // Opaque handle from driver create(), or NULL. Used by show verb
 // handlers that need to pull stats from the driver's private state
 // (e.g. llm's in-flight counter).
@@ -280,6 +300,22 @@ typedef struct bot_session
   struct bot_session *next;
 } bot_session_t;
 
+// Per-bot ring of last-witnessed public lines, keyed by (method, channel).
+// Bounded and round-robin — a bot spanning more channels than slots keeps
+// the most-recently-active ones. Read/written under bot_witness_lock.
+#define BOT_WITNESS_MAX  16
+
+typedef struct
+{
+  bool  valid;
+  char  method [METHOD_NAME_SZ];
+  char  channel[METHOD_CHANNEL_SZ];
+  char  nickname[METHOD_NICKNAME_SZ];
+  char  sender  [METHOD_SENDER_SZ];
+  char  text    [METHOD_TEXT_SZ];
+  bool  is_action;
+} bot_witness_t;
+
 struct bot_inst
 {
   char                   name[BOT_NAME_SZ];
@@ -294,6 +330,8 @@ struct bot_inst
   uint64_t               msg_count;    // total messages received
   uint64_t               cmd_count;    // total commands dispatched
   time_t                 last_activity; // last message received
+  bot_witness_t          witness[BOT_WITNESS_MAX]; // last public lines
+  uint32_t               witness_next;  // round-robin insert cursor
   struct bot_inst       *next;
 };
 
@@ -310,6 +348,10 @@ static bot_cfg_t bot_cfg = {
 
 static bot_inst_t      *bot_list  = NULL;
 static pthread_mutex_t  bot_mutex;
+
+// Guards the per-bot witness rings (written on the delivery thread, read
+// from command worker threads). Static-initialised — no bot_init hook.
+static pthread_mutex_t  bot_witness_lock = PTHREAD_MUTEX_INITIALIZER;
 static uint32_t         bot_count = 0;
 static bool             bot_ready = false;
 
