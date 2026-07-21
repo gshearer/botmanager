@@ -120,7 +120,11 @@ ask_model_ok(const char *model, const char *def_model, const char *allow_csv)
   if(!llm_model_exists(model))
     return(false);
 
-  if(!llm_model_kind(model, &kind) || kind != LLM_KIND_CHAT)
+  // llm_model_kind uses the SUCCESS(=false)/FAIL(=true) convention, unlike
+  // llm_model_exists which returns a natural bool — compare against SUCCESS
+  // explicitly. A plain `!llm_model_kind(...)` inverts and rejects every
+  // real model (found → SUCCESS → !false → true → "unavailable").
+  if(llm_model_kind(model, &kind) != SUCCESS || kind != LLM_KIND_CHAT)
     return(false);
 
   if(def_model != NULL && strcasecmp(model, def_model) == 0)
@@ -339,7 +343,13 @@ ask_cmd_handler(const cmd_ctx_t *ctx)
 
   // model/msgs/query are caller-owned only until submit returns
   // (the callee copies internally) — all live here for the call.
-  if(!llm_chat_submit(model, &p, msgs, n, ask_done, NULL, r))
+  //
+  // llm_chat_submit uses SUCCESS(=false)/FAIL(=true): on a successful
+  // enqueue the async request OWNS r and frees it via ask_done. A plain
+  // `!llm_chat_submit(...)` inverts that — it took the failure branch on
+  // SUCCESS, freeing r out from under the in-flight request (use-after-
+  // free + double-free in ask_done). Compare against SUCCESS explicitly.
+  if(llm_chat_submit(model, &p, msgs, n, ask_done, NULL, r) != SUCCESS)
   {
     cmd_reply(ctx, "ask: failed to submit query (model unavailable?)");
     mem_free(r);
