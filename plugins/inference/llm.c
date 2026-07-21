@@ -32,6 +32,8 @@ static pthread_mutex_t  llm_active_mutex;
 // Model cache.
 llm_model_t            *llm_models_head = NULL;
 pthread_rwlock_t        llm_models_lock;
+llm_service_t          *llm_services_head = NULL;
+pthread_rwlock_t        llm_services_lock;
 
 #ifdef LLM_TEST_HOOKS
 // Test-only: slot holding the next canned chat-completion content. When
@@ -444,6 +446,167 @@ llm_models_snapshot(const char *name, llm_model_t *out)
   return(ok);
 }
 
+// Service cache
+//
+// Mirror of llm_services: name → base_url. Reloaded from DB alongside the
+// model cache (and always before it, so model rows can resolve their
+// base_url via the join). Each service's provider-token KV slot,
+// llm.service.<name>.apikey, is registered here.
+
+// Caller must not hold the lock.
+static void
+llm_services_clear(void)
+{
+  llm_service_t *s;
+  pthread_rwlock_wrlock(&llm_services_lock);
+
+  s = llm_services_head;
+  llm_services_head = NULL;
+
+  pthread_rwlock_unlock(&llm_services_lock);
+
+  while(s != NULL)
+  {
+    llm_service_t *next = s->next;
+    mem_free(s);
+    s = next;
+  }
+}
+
+// Insert or replace (by name). Takes write lock.
+static void
+llm_services_upsert(const llm_service_t *src)
+{
+  llm_service_t  *entry = mem_alloc("llm", "service", sizeof(*entry));
+  llm_service_t **pp;
+  memcpy(entry, src, sizeof(*entry));
+
+  pthread_rwlock_wrlock(&llm_services_lock);
+
+  pp = &llm_services_head;
+
+  while(*pp != NULL)
+  {
+    if(strcmp((*pp)->name, src->name) == 0)
+    {
+      llm_service_t *old = *pp;
+      entry->next = old->next;
+      *pp = entry;
+      pthread_rwlock_unlock(&llm_services_lock);
+      mem_free(old);
+      return;
+    }
+
+    pp = &(*pp)->next;
+  }
+
+  entry->next = NULL;
+  *pp = entry;
+
+  pthread_rwlock_unlock(&llm_services_lock);
+}
+
+bool
+llm_service_base_url(const char *name, char *out, size_t out_sz)
+{
+  bool ok = FAIL;
+  if(name == NULL || out == NULL || out_sz == 0)
+    return(FAIL);
+
+  pthread_rwlock_rdlock(&llm_services_lock);
+
+  for(llm_service_t *s = llm_services_head; s != NULL; s = s->next)
+  {
+    if(strcmp(s->name, name) == 0)
+    {
+      snprintf(out, out_sz, "%s", s->base_url);
+      ok = SUCCESS;
+      break;
+    }
+  }
+
+  pthread_rwlock_unlock(&llm_services_lock);
+  return(ok);
+}
+
+bool
+llm_build_url(const char *base, const char *op, char *out, size_t out_sz)
+{
+  size_t base_len;
+  int    n;
+  if(base == NULL || op == NULL || out == NULL || out_sz == 0
+      || base[0] == '\0' || op[0] == '\0')
+    return(FAIL);
+
+  base_len = strlen(base);
+
+  // Trim exactly one trailing '/' so "base/" + "op" never doubles it.
+  if(base[base_len - 1] == '/')
+    base_len--;
+
+  n = snprintf(out, out_sz, "%.*s/%s", (int)base_len, base, op);
+
+  if(n < 0 || (size_t)n >= out_sz)
+    return(FAIL);
+
+  return(SUCCESS);
+}
+
+// Reload the service cache from DB and (re)register each service's
+// API-token KV slot. Must run before llm_models_reload().
+void
+llm_services_reload(void)
+{
+  db_result_t *res;
+  llm_services_clear();
+
+  res = db_result_alloc();
+
+  if(db_query("SELECT name, base_url FROM llm_services", res) != SUCCESS
+      || !res->ok)
+  {
+    if(res->error[0] != '\0')
+      clam(CLAM_WARN, "llm", "service cache reload: %s", res->error);
+
+    db_result_free(res);
+    return;
+  }
+
+  for(uint32_t r = 0; r < res->rows; r++)
+  {
+    llm_service_t s;
+    const char   *name;
+    const char   *base;
+    char          key[LLM_KV_KEY_SZ];
+    memset(&s, 0, sizeof(s));
+
+    name = db_result_get(res, r, 0);
+    base = db_result_get(res, r, 1);
+
+    if(name == NULL || name[0] == '\0')
+      continue;
+
+    snprintf(s.name, sizeof(s.name), "%s", name);
+    snprintf(s.base_url, sizeof(s.base_url), "%s", base ? base : "");
+
+    // Register the provider-token KV slot named after the service so an
+    // operator can `set kv llm.service.<name>.apikey <token>` (kv_set
+    // rejects unregistered keys). kv_claim_orphans() (core init) has
+    // already rehydrated any persisted token; the kv_exists guard means
+    // we only ever create an empty slot, never clobber a live value.
+    snprintf(key, sizeof(key), "llm.service.%s.apikey", s.name);
+
+    if(!kv_exists(key))
+      kv_register(key, KV_STR, "", NULL, NULL,
+          "LLM provider API token sent as 'Authorization: Bearer'."
+          " Keyed by service name (llm.service.<name>.apikey).");
+
+    llm_services_upsert(&s);
+  }
+
+  db_result_free(res);
+}
+
 // Reload the cache from DB. Clears and rebuilds. Safe to call repeatedly.
 void
 llm_models_reload(void)
@@ -454,9 +617,10 @@ llm_models_reload(void)
   res = db_result_alloc();
 
   if(db_query(
-      "SELECT name, kind, endpoint_url, model_id, api_key_kv, embed_dim, "
-      "max_context, default_temp, enabled FROM llm_models", res) != SUCCESS
-      || !res->ok)
+      "SELECT m.name, m.kind, m.service_name, s.base_url, m.model_id, "
+      "m.embed_dim, m.max_context, m.default_temp, m.enabled "
+      "FROM llm_models m JOIN llm_services s ON s.name = m.service_name",
+      res) != SUCCESS || !res->ok)
   {
     if(res->error[0] != '\0')
       clam(CLAM_WARN, "llm", "model cache reload: %s", res->error);
@@ -470,9 +634,9 @@ llm_models_reload(void)
     llm_model_t m;
     const char *name;
     const char *kind;
-    const char *url;
+    const char *svc;
+    const char *base;
     const char *mid;
-    const char *keykv;
     const char *dim;
     const char *maxctx;
     const char *temp;
@@ -481,9 +645,9 @@ llm_models_reload(void)
 
     name = db_result_get(res, r, 0);
     kind = db_result_get(res, r, 1);
-    url = db_result_get(res, r, 2);
-    mid = db_result_get(res, r, 3);
-    keykv = db_result_get(res, r, 4);
+    svc = db_result_get(res, r, 2);
+    base = db_result_get(res, r, 3);
+    mid = db_result_get(res, r, 4);
     dim = db_result_get(res, r, 5);
     maxctx = db_result_get(res, r, 6);
     temp = db_result_get(res, r, 7);
@@ -493,9 +657,9 @@ llm_models_reload(void)
       continue;
 
     snprintf(m.name, sizeof(m.name), "%s", name);
-    snprintf(m.endpoint_url, sizeof(m.endpoint_url), "%s", url ? url : "");
+    snprintf(m.service_name, sizeof(m.service_name), "%s", svc ? svc : "");
+    snprintf(m.base_url, sizeof(m.base_url), "%s", base ? base : "");
     snprintf(m.model_id, sizeof(m.model_id), "%s", mid ? mid : "");
-    snprintf(m.api_key_kv, sizeof(m.api_key_kv), "%s", keykv ? keykv : "");
 
     if(llm_kind_from_str(kind, &m.kind) != SUCCESS)
       continue;
@@ -517,33 +681,55 @@ llm_models_reload(void)
   db_result_free(res);
 }
 
-// Ensure the llm_models table exists (idempotent, mirrors schema.sql).
+// Ensure the LLM registry tables exist (idempotent). Two-tier model:
+// a service is one OpenAI-compatible provider (one base URL, one key);
+// a model references a service by name and adds the real model_id;
+// llm_service_models caches each service's discovered /models list.
 static void
 llm_ensure_tables(void)
 {
-  const char *sql =
+  static const char *const ddl[] = {
+      "CREATE TABLE IF NOT EXISTS llm_services ("
+      " name       VARCHAR(64)  PRIMARY KEY,"
+      " base_url   TEXT         NOT NULL,"
+      " created    TIMESTAMPTZ  NOT NULL DEFAULT NOW(),"
+      " refreshed  TIMESTAMPTZ"
+      ")",
+
+      "CREATE TABLE IF NOT EXISTS llm_service_models ("
+      " service_name  VARCHAR(64)  NOT NULL"
+      "               REFERENCES llm_services(name) ON DELETE CASCADE,"
+      " model_id      VARCHAR(128) NOT NULL,"
+      " max_model_len INTEGER,"
+      " fetched       TIMESTAMPTZ  NOT NULL DEFAULT NOW(),"
+      " PRIMARY KEY (service_name, model_id)"
+      ")",
+
       "CREATE TABLE IF NOT EXISTS llm_models ("
       " name          VARCHAR(64)  PRIMARY KEY,"
       " kind          VARCHAR(16)  NOT NULL,"
-      " endpoint_url  TEXT         NOT NULL,"
+      " service_name  VARCHAR(64)  NOT NULL REFERENCES llm_services(name),"
       " model_id      VARCHAR(128) NOT NULL,"
-      " api_key_kv    VARCHAR(128) NOT NULL DEFAULT '',"
       " embed_dim     INTEGER      NOT NULL DEFAULT 0,"
       " max_context   INTEGER      NOT NULL DEFAULT 8192,"
       " default_temp  REAL         NOT NULL DEFAULT 0.7,"
       " enabled       BOOLEAN      NOT NULL DEFAULT TRUE,"
       " created       TIMESTAMPTZ  NOT NULL DEFAULT NOW()"
-      ")";
+      ")"
+  };
 
-  db_result_t *res = db_result_alloc();
-
-  if(db_query(sql, res) != SUCCESS || !res->ok)
+  for(size_t i = 0; i < sizeof(ddl) / sizeof(ddl[0]); i++)
   {
-    if(res->error[0] != '\0')
-      clam(CLAM_WARN, "llm", "ensure_tables: %s", res->error);
-  }
+    db_result_t *res = db_result_alloc();
 
-  db_result_free(res);
+    if(db_query(ddl[i], res) != SUCCESS || !res->ok)
+    {
+      if(res->error[0] != '\0')
+        clam(CLAM_WARN, "llm", "ensure_tables: %s", res->error);
+    }
+
+    db_result_free(res);
+  }
 }
 
 // Model registry public API
@@ -630,7 +816,7 @@ llm_model_iterate(llm_model_iter_cb_t cb, void *user)
   pthread_rwlock_rdlock(&llm_models_lock);
 
   for(llm_model_t *m = llm_models_head; m != NULL; m = m->next)
-    cb(m->name, m->kind, m->endpoint_url, m->model_id, m->embed_dim,
+    cb(m->name, m->kind, m->service_name, m->model_id, m->embed_dim,
        m->max_context, m->default_temp, m->enabled, user);
 
   pthread_rwlock_unlock(&llm_models_lock);
@@ -653,8 +839,11 @@ llm_test_register_model(const char *name, llm_kind_t kind,
   llm_model_t m;
   memset(&m, 0, sizeof(m));
 
+  // Test models bypass the service registry: the endpoint is treated as
+  // a base URL and pinned to a synthetic "test" service name.
   snprintf(m.name, sizeof(m.name), "%s", name);
-  snprintf(m.endpoint_url, sizeof(m.endpoint_url), "%s", endpoint_url);
+  snprintf(m.service_name, sizeof(m.service_name), "%s", "test");
+  snprintf(m.base_url, sizeof(m.base_url), "%s", endpoint_url);
   snprintf(m.model_id, sizeof(m.model_id), "%s", model_id);
 
   m.kind         = kind;
@@ -1616,10 +1805,20 @@ llm_chat_submit(const char *model_name,
   req = llm_req_alloc();
 
   req->type = LLM_REQ_CHAT;
-  snprintf(req->model_name,   sizeof(req->model_name),   "%s", m.name);
-  snprintf(req->endpoint_url, sizeof(req->endpoint_url), "%s", m.endpoint_url);
-  snprintf(req->model_id,     sizeof(req->model_id),     "%s", m.model_id);
-  snprintf(req->api_key_kv,   sizeof(req->api_key_kv),   "%s", m.api_key_kv);
+  snprintf(req->model_name, sizeof(req->model_name), "%s", m.name);
+  snprintf(req->model_id,   sizeof(req->model_id),   "%s", m.model_id);
+
+  if(llm_build_url(m.base_url, "chat/completions",
+      req->endpoint_url, sizeof(req->endpoint_url)) != SUCCESS)
+  {
+    clam(CLAM_WARN, "llm", "cannot build chat URL for %s (service %s)",
+        m.name, m.service_name);
+    llm_req_release(req);
+    return(FAIL);
+  }
+
+  snprintf(req->api_key_kv, sizeof(req->api_key_kv),
+      "llm.service.%s.apikey", m.service_name);
   req->kind         = m.kind;
   req->params       = *params;
   req->chat_done_cb = done_cb;
@@ -1676,10 +1875,20 @@ llm_embed_submit_impl(const char *model_name,
   req = llm_req_alloc();
 
   req->type = LLM_REQ_EMBED;
-  snprintf(req->model_name,   sizeof(req->model_name),   "%s", m.name);
-  snprintf(req->endpoint_url, sizeof(req->endpoint_url), "%s", m.endpoint_url);
-  snprintf(req->model_id,     sizeof(req->model_id),     "%s", m.model_id);
-  snprintf(req->api_key_kv,   sizeof(req->api_key_kv),   "%s", m.api_key_kv);
+  snprintf(req->model_name, sizeof(req->model_name), "%s", m.name);
+  snprintf(req->model_id,   sizeof(req->model_id),   "%s", m.model_id);
+
+  if(llm_build_url(m.base_url, "embeddings",
+      req->endpoint_url, sizeof(req->endpoint_url)) != SUCCESS)
+  {
+    clam(CLAM_WARN, "llm", "cannot build embed URL for %s (service %s)",
+        m.name, m.service_name);
+    llm_req_release(req);
+    return(FAIL);
+  }
+
+  snprintf(req->api_key_kv, sizeof(req->api_key_kv),
+      "llm.service.%s.apikey", m.service_name);
   req->kind            = m.kind;
   req->embed_dim       = m.embed_dim;
   req->embed_done_cb   = done_cb;
@@ -1824,6 +2033,7 @@ llm_init(void)
   pthread_mutex_init(&llm_active_mutex, NULL);
   pthread_mutex_init(&llm_stat_mutex, NULL);
   pthread_rwlock_init(&llm_models_lock, NULL);
+  pthread_rwlock_init(&llm_services_lock, NULL);
 
   llm_cfg.max_retries        = LLM_DEF_MAX_RETRIES;
   llm_cfg.retry_backoff_ms   = LLM_DEF_RETRY_BACKOFF_MS;
@@ -1842,7 +2052,13 @@ llm_register_config(void)
   llm_register_kv();
   llm_load_config();
   llm_ensure_tables();
+  llm_services_reload();
   llm_models_reload();
+
+  // Warm each service's /models cache (best-effort, async). Safe here:
+  // curl started with the plugin, and a failure just leaves the cache
+  // empty until the first manual `llm service <name> refresh`.
+  llm_services_refresh_all();
 }
 
 void
@@ -1888,11 +2104,13 @@ llm_exit(void)
   pthread_mutex_unlock(&llm_req_mutex);
 
   llm_models_clear();
+  llm_services_clear();
 
   pthread_mutex_destroy(&llm_req_mutex);
   pthread_mutex_destroy(&llm_active_mutex);
   pthread_mutex_destroy(&llm_stat_mutex);
   pthread_rwlock_destroy(&llm_models_lock);
+  pthread_rwlock_destroy(&llm_services_lock);
 
   clam(CLAM_INFO, "llm", "llm subsystem shut down");
 }

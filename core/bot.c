@@ -423,6 +423,16 @@ bot_create(const bot_driver_t *drv, const char *name)
     kv_register(key, KV_STR, "", NULL, NULL,
         "POSIX ERE matched against message payload; matching messages"
         " are dropped before dispatching to the driver");
+
+    snprintf(key, sizeof(key), "bot.%s.ask.allow", name);
+    kv_register(key, KV_STR, "", NULL, NULL,
+        "Per-bot !ask allowlist override (CSV of chat-model names, * = all;"
+        " empty inherits plugin.ask.allow).");
+
+    snprintf(key, sizeof(key), "bot.%s.ask.default", name);
+    kv_register(key, KV_STR, "", NULL, NULL,
+        "Per-bot !ask default model override (empty inherits"
+        " plugin.ask.model).");
   }
 
   clam(CLAM_INFO, "bot_create",

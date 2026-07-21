@@ -46,10 +46,16 @@ bool     llm_model_exists(const char *name);
 bool     llm_model_kind(const char *name, llm_kind_t *out);
 uint32_t llm_model_embed_dim(const char *name);
 
+// Also declared (identically) in the public inference.h so external
+// consumers can call llm_model_iterate through its dlsym shim; guarded
+// so this internal copy and the public one never clash.
+#ifndef BM_LLM_MODEL_ITER_CB_T_DEFINED
+#define BM_LLM_MODEL_ITER_CB_T_DEFINED
 typedef void (*llm_model_iter_cb_t)(const char *name, llm_kind_t kind,
-    const char *endpoint_url, const char *model_id,
+    const char *service_name, const char *model_id,
     uint32_t embed_dim, uint32_t max_context, float default_temp,
     bool enabled, void *user);
+#endif
 
 void llm_model_iterate(llm_model_iter_cb_t cb, void *user);
 
@@ -103,14 +109,28 @@ typedef struct
   uint32_t streaming_idle_ms;
 } llm_cfg_t;
 
-// In-memory mirror of an llm_models row.
+// In-memory mirror of an llm_services row: one OpenAI-compatible provider,
+// keyed by name, carrying the base URL that the engine appends
+// /chat/completions, /models, /embeddings to. The API token lives in the
+// KV slot llm.service.<name>.apikey, derived from the name (no stored
+// pointer column).
+typedef struct llm_service
+{
+  char        name[LLM_MODEL_NAME_SZ];
+  char        base_url[LLM_ENDPOINT_SZ];
+  struct llm_service *next;
+} llm_service_t;
+
+// In-memory mirror of an llm_models row. References a service by name; the
+// base_url is resolved from that service at reload time and cached here so
+// the submit path needs no second lookup.
 typedef struct llm_model
 {
   char        name[LLM_MODEL_NAME_SZ];
   llm_kind_t  kind;
-  char        endpoint_url[LLM_ENDPOINT_SZ];
+  char        service_name[LLM_MODEL_NAME_SZ];
+  char        base_url[LLM_ENDPOINT_SZ];
   char        model_id[LLM_MODEL_ID_SZ];
-  char        api_key_kv[LLM_KV_KEY_SZ];
   uint32_t    embed_dim;
   uint32_t    max_context;
   float       default_temp;
@@ -202,11 +222,31 @@ struct llm_request
 // Shared state between llm.c and llm_cmd.c. Defined in llm.c.
 extern llm_model_t     *llm_models_head;
 extern pthread_rwlock_t llm_models_lock;
+extern llm_service_t   *llm_services_head;
+extern pthread_rwlock_t llm_services_lock;
 extern llm_cfg_t        llm_cfg;
 
 // Shared helpers between llm.c and llm_cmd.c.
 bool        llm_kind_from_str(const char *s, llm_kind_t *out);
 const char *llm_kind_to_str(llm_kind_t k);
 void        llm_models_reload(void);
+void        llm_services_reload(void);
+
+// Resolve a service's base URL by name into out (rdlocks the service
+// list). Returns SUCCESS if the service exists, FAIL otherwise.
+bool        llm_service_base_url(const char *name, char *out, size_t out_sz);
+
+// Compose a request URL: one trailing '/' trimmed off base, then "/<op>"
+// appended (op ∈ "chat/completions", "models", "embeddings"). Returns
+// SUCCESS, or FAIL on a NULL/empty argument or truncation.
+bool        llm_build_url(const char *base, const char *op,
+                char *out, size_t out_sz);
+
+// Fire an async GET <base_url>/models for one service and cache the
+// result in llm_service_models. Defined in llm_cmd.c. Returns SUCCESS if
+// the request was submitted. llm_services_refresh_all() seeds every known
+// service once (startup).
+bool        llm_service_refresh(const char *name);
+void        llm_services_refresh_all(void);
 
 #endif // BM_LLM_PRIV_H

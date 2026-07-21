@@ -138,6 +138,19 @@ typedef struct
 
 typedef void (*llm_embed_done_cb_t)(const llm_embed_response_t *resp);
 
+// Per-model visitor for llm_model_iterate(). Called once per registered
+// model with its full descriptor. Guarded because the same typedef also
+// appears in the plugin-internal llm_priv.h, which includes this header
+// first — both definitions are identical, but the guard makes the
+// include order irrelevant.
+#ifndef BM_LLM_MODEL_ITER_CB_T_DEFINED
+#define BM_LLM_MODEL_ITER_CB_T_DEFINED
+typedef void (*llm_model_iter_cb_t)(const char *name, llm_kind_t kind,
+    const char *service_name, const char *model_id,
+    uint32_t embed_dim, uint32_t max_context, float default_temp,
+    bool enabled, void *user);
+#endif
+
 // -----------------------------------------------------------------------
 // Knowledge types
 // -----------------------------------------------------------------------
@@ -352,6 +365,75 @@ llm_embed_submit(const char *model_name,
     __atomic_store_n(&cached, fn, __ATOMIC_RELEASE);
   }
   return(fn(model_name, inputs, n_inputs, done_cb, user_data));
+}
+
+static inline bool
+llm_model_exists(const char *name)
+{
+  typedef bool (*fn_t)(const char *);
+  static fn_t cached = NULL;
+  fn_t        fn     = __atomic_load_n(&cached, __ATOMIC_ACQUIRE);
+
+  if(fn == NULL)
+  {
+    union { void *obj; fn_t fn; } u;
+
+    u.obj = plugin_dlsym_cached("inference", "llm_model_exists", (void **)&cached);
+    if(u.obj == NULL)
+    {
+      clam(CLAM_FATAL, "inference", "dlsym failed: llm_model_exists");
+      abort();
+    }
+    fn = u.fn;
+    __atomic_store_n(&cached, fn, __ATOMIC_RELEASE);
+  }
+  return(fn(name));
+}
+
+static inline bool
+llm_model_kind(const char *name, llm_kind_t *out)
+{
+  typedef bool (*fn_t)(const char *, llm_kind_t *);
+  static fn_t cached = NULL;
+  fn_t        fn     = __atomic_load_n(&cached, __ATOMIC_ACQUIRE);
+
+  if(fn == NULL)
+  {
+    union { void *obj; fn_t fn; } u;
+
+    u.obj = plugin_dlsym_cached("inference", "llm_model_kind", (void **)&cached);
+    if(u.obj == NULL)
+    {
+      clam(CLAM_FATAL, "inference", "dlsym failed: llm_model_kind");
+      abort();
+    }
+    fn = u.fn;
+    __atomic_store_n(&cached, fn, __ATOMIC_RELEASE);
+  }
+  return(fn(name, out));
+}
+
+static inline void
+llm_model_iterate(llm_model_iter_cb_t cb, void *user)
+{
+  typedef void (*fn_t)(llm_model_iter_cb_t, void *);
+  static fn_t cached = NULL;
+  fn_t        fn     = __atomic_load_n(&cached, __ATOMIC_ACQUIRE);
+
+  if(fn == NULL)
+  {
+    union { void *obj; fn_t fn; } u;
+
+    u.obj = plugin_dlsym_cached("inference", "llm_model_iterate", (void **)&cached);
+    if(u.obj == NULL)
+    {
+      clam(CLAM_FATAL, "inference", "dlsym failed: llm_model_iterate");
+      abort();
+    }
+    fn = u.fn;
+    __atomic_store_n(&cached, fn, __ATOMIC_RELEASE);
+  }
+  fn(cb, user);
 }
 
 // -------- Knowledge --------
