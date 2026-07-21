@@ -249,4 +249,10 @@ bool        llm_build_url(const char *base, const char *op,
 bool        llm_service_refresh(const char *name);
 void        llm_services_refresh_all(void);
 
+// KV change hook for llm.service.<name>.apikey (kv_cb_t). When the key is
+// set to a non-empty value, re-fires llm_service_refresh() for that service
+// so providers that gate /models behind auth get their model list on the
+// next probe. Defined in llm_cmd.c. Invoked outside the KV lock.
+void        llm_apikey_kv_cb(const char *key, void *data);
+
 #endif // BM_LLM_PRIV_H

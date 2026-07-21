@@ -174,17 +174,51 @@ llm_service_models_store(const char *service, struct json_object *root)
   return(stored);
 }
 
+// Stamp llm_services.probe_http with the most recent /models probe status
+// (0 on transport error) so `show llm service` can surface auth failures
+// without the value ever being printed as a secret.
+static void
+llm_service_set_probe_http(const char *name, long status)
+{
+  char        *e_name;
+  db_result_t *res;
+  char         sql[256];
+
+  e_name = db_escape(name);
+  snprintf(sql, sizeof(sql),
+      "UPDATE llm_services SET probe_http=%ld WHERE name='%s'",
+      status, e_name);
+  mem_free(e_name);
+
+  res = db_result_alloc();
+  db_query(sql, res);
+  db_result_free(res);
+}
+
 static void
 llm_service_refresh_done_cb(const curl_response_t *resp)
 {
   llm_refresh_ctx_t  *rctx = resp->user_data;
   struct json_object *root;
   int                 stored;
+
+  // Record the probe outcome regardless of success so the show surface can
+  // report "needs API key" (401/403) or a failed probe (non-200 / 0).
+  llm_service_set_probe_http(rctx->name, resp->status);
+
   if(resp->status != 200 || resp->body == NULL)
   {
     clam(CLAM_WARN, "llm", "refresh %s: http=%ld curl=%d %s",
         rctx->name, resp->status, resp->curl_code,
         resp->error ? resp->error : "");
+
+    // Auth-gated /models: nudge the operator toward the key. Setting it
+    // fires llm_apikey_kv_cb, which re-probes automatically.
+    if(resp->status == 401 || resp->status == 403)
+      clam(CLAM_INFO, "llm",
+          "service %s requires an API key: "
+          "set kv llm.service.%s.apikey <key>", rctx->name, rctx->name);
+
     mem_free(rctx);
     return;
   }
@@ -207,14 +241,20 @@ llm_service_refresh_done_cb(const curl_response_t *resp)
   mem_free(rctx);
 }
 
-// Fire an async GET <base_url>/models for one service. Returns SUCCESS if
-// the request was submitted (curl worker owns the heap ctx thereafter).
+// Fire an async GET <base_url>/models for one service. The probe runs
+// keyless by default (local providers don't gate /models); an Authorization
+// header is attached only when llm.service.<name>.apikey holds a value, so a
+// key-gated /models succeeds once the operator sets the key. Returns SUCCESS
+// if the request was submitted (curl worker owns the heap ctx thereafter).
 bool
 llm_service_refresh(const char *name)
 {
   llm_refresh_ctx_t *rctx;
+  curl_request_t    *cr;
   char base[LLM_ENDPOINT_SZ];
   char url[LLM_ENDPOINT_SZ + 16];
+  char kvkey[LLM_KV_KEY_SZ];
+  const char *apikey;
   if(name == NULL || name[0] == '\0')
     return(FAIL);
 
@@ -227,10 +267,31 @@ llm_service_refresh(const char *name)
   rctx = mem_alloc("llm", "refresh_ctx", sizeof(*rctx));
   snprintf(rctx->name, sizeof(rctx->name), "%s", name);
 
-  // curl_get uses the project's SUCCESS=false / FAIL=true convention — a
-  // "if(!curl_get(...))" would invert it, free rctx while the request is
-  // in flight, and leave the callback to use-after-free plus double-free.
-  if(curl_get(url, llm_service_refresh_done_cb, rctx) != SUCCESS)
+  cr = curl_request_create(CURL_METHOD_GET, url,
+      llm_service_refresh_done_cb, rctx);
+  if(cr == NULL)
+  {
+    clam(CLAM_WARN, "llm", "refresh %s: request create failed", name);
+    mem_free(rctx);
+    return(FAIL);
+  }
+
+  // Bearer token only when configured — keyless providers probe fine
+  // without it, and an empty "Bearer " would break some gateways.
+  snprintf(kvkey, sizeof(kvkey), "llm.service.%s.apikey", name);
+  apikey = kv_get_str(kvkey);
+
+  if(apikey != NULL && apikey[0] != '\0')
+  {
+    char hdr[LLM_KV_KEY_SZ + 512];
+    snprintf(hdr, sizeof(hdr), "Authorization: Bearer %s", apikey);
+    curl_request_add_header(cr, hdr);
+  }
+
+  // curl_request_submit uses SUCCESS=false / FAIL=true and releases cr
+  // internally on failure — but never frees user_data, so rctx is ours to
+  // free here. On success the done callback frees it.
+  if(curl_request_submit(cr) != SUCCESS)
   {
     clam(CLAM_WARN, "llm", "refresh %s: curl submit failed for %s", name, url);
     mem_free(rctx);
@@ -238,6 +299,48 @@ llm_service_refresh(const char *name)
   }
 
   return(SUCCESS);
+}
+
+// KV change hook on llm.service.<name>.apikey. Parses the service name out
+// of the key and re-probes /models when the value becomes non-empty. Fired
+// outside the KV lock (core/kv.c), so reading kv_get_str and submitting
+// curl from here is deadlock-safe.
+void
+llm_apikey_kv_cb(const char *key, void *data)
+{
+  static const char pfx[] = "llm.service.";
+  const char *tail;
+  const char *dot;
+  const char *val;
+  char        name[LLM_MODEL_NAME_SZ];
+  size_t      n;
+  (void)data;
+  if(key == NULL || strncmp(key, pfx, sizeof(pfx) - 1) != 0)
+    return;
+
+  tail = key + (sizeof(pfx) - 1);
+  dot  = strstr(tail, ".apikey");
+
+  if(dot == NULL || dot == tail)
+    return;
+
+  n = (size_t)(dot - tail);
+
+  if(n >= sizeof(name))
+    return;
+
+  memcpy(name, tail, n);
+  name[n] = '\0';
+
+  // Empty value = key cleared; nothing to re-probe.
+  val = kv_get_str(key);
+
+  if(val == NULL || val[0] == '\0')
+    return;
+
+  clam(CLAM_INFO, "llm",
+      "api key set for service %s — re-probing /models", name);
+  llm_service_refresh(name);
 }
 
 // Startup seed: fire one refresh per known service so the /models cache is
@@ -542,13 +645,15 @@ cmd_llm_add_service(const cmd_ctx_t *ctx)
   db_result_free(res);
 
   // Reload registers the llm.service.<name>.apikey KV slot; the refresh
-  // seeds the /models cache asynchronously.
+  // seeds the /models cache asynchronously and runs keyless. If the
+  // provider gates /models behind auth, the probe records 401/403 and
+  // `show llm service` will flag "needs API key" — set it then and the
+  // KV hook re-probes automatically.
   llm_services_reload();
   llm_service_refresh(name);
 
   snprintf(msg, sizeof(msg),
-      "ok (fetching model list) — set the API key with: "
-      "set kv llm.service.%s.apikey <key>", name);
+      "ok — probing /models; check `show llm service %s`", name);
   cmd_reply(ctx, msg);
 }
 
@@ -1031,12 +1136,15 @@ cmd_show_llm(const cmd_ctx_t *ctx)
 // presence only — its value is NEVER printed.
 static void
 llm_service_line(const cmd_ctx_t *ctx, const char *name, const char *base,
-    const char *refreshed, const char *cached, const char *defined)
+    const char *refreshed, const char *cached, const char *defined,
+    const char *probe_http)
 {
   char        key[LLM_KV_KEY_SZ];
   const char *token;
   bool        key_set;
-  char        line[640];
+  long        probe;
+  char        note[96];
+  char        line[768];
   if(name == NULL)
     return;
 
@@ -1044,17 +1152,31 @@ llm_service_line(const cmd_ctx_t *ctx, const char *name, const char *base,
   token   = kv_get_str(key);
   key_set = token != NULL && token[0] != '\0';
 
+  // Translate the last /models probe status into an at-a-glance note.
+  // -1 = never probed; 0 = transport failure; 401/403 = auth wall.
+  probe   = (probe_http && probe_http[0]) ? strtol(probe_http, NULL, 10) : -1;
+  note[0] = '\0';
+
+  if(probe == 401 || probe == 403)
+    snprintf(note, sizeof(note), "  " CLR_RED "needs API key" CLR_RESET);
+  else if(probe == 0)
+    snprintf(note, sizeof(note), "  " CLR_RED "probe failed" CLR_RESET);
+  else if(probe > 0 && probe != 200)
+    snprintf(note, sizeof(note),
+        "  " CLR_RED "probe http=%ld" CLR_RESET, probe);
+
   snprintf(line, sizeof(line),
       CLR_BOLD "%s" CLR_RESET "  " CLR_GRAY "%s" CLR_RESET
       "  " CLR_CYAN "models=%s" CLR_RESET "  defined=%s  key=%s%s" CLR_RESET
-      "  " CLR_GRAY "refreshed=%s" CLR_RESET,
+      "  " CLR_GRAY "refreshed=%s" CLR_RESET "%s",
       name,
       base ? base : "",
       cached ? cached : "0",
       defined ? defined : "0",
       key_set ? CLR_GREEN : CLR_RED,
       key_set ? "set" : "unset",
-      (refreshed && refreshed[0]) ? refreshed : "never");
+      (refreshed && refreshed[0]) ? refreshed : "never",
+      note);
 
   cmd_reply(ctx, line);
 }
@@ -1129,7 +1251,8 @@ cmd_show_llm_service_summary(const cmd_ctx_t *ctx, const char *where_name)
       "SELECT s.name, s.base_url, s.refreshed, "
       "(SELECT count(*) FROM llm_service_models c "
       "WHERE c.service_name=s.name), "
-      "(SELECT count(*) FROM llm_models m WHERE m.service_name=s.name) "
+      "(SELECT count(*) FROM llm_models m WHERE m.service_name=s.name), "
+      "s.probe_http "
       "FROM llm_services s%s ORDER BY s.name", where);
 
   res = db_result_alloc();
@@ -1141,7 +1264,7 @@ cmd_show_llm_service_summary(const cmd_ctx_t *ctx, const char *where_name)
       llm_service_line(ctx,
           db_result_get(res, r, 0), db_result_get(res, r, 1),
           db_result_get(res, r, 2), db_result_get(res, r, 3),
-          db_result_get(res, r, 4));
+          db_result_get(res, r, 4), db_result_get(res, r, 5));
       st.count++;
     }
   }

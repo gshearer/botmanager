@@ -596,10 +596,15 @@ llm_services_reload(void)
     // we only ever create an empty slot, never clobber a live value.
     snprintf(key, sizeof(key), "llm.service.%s.apikey", s.name);
 
+    // Attach the change hook whether we create the slot here or it was
+    // rehydrated by kv_claim_orphans (core init) before this reload — so
+    // setting the key later always re-probes /models (llm_apikey_kv_cb).
     if(!kv_exists(key))
-      kv_register(key, KV_STR, "", NULL, NULL,
+      kv_register(key, KV_STR, "", llm_apikey_kv_cb, NULL,
           "LLM provider API token sent as 'Authorization: Bearer'."
           " Keyed by service name (llm.service.<name>.apikey).");
+    else
+      kv_set_cb(key, llm_apikey_kv_cb, NULL);
 
     llm_services_upsert(&s);
   }
@@ -693,7 +698,8 @@ llm_ensure_tables(void)
       " name       VARCHAR(64)  PRIMARY KEY,"
       " base_url   TEXT         NOT NULL,"
       " created    TIMESTAMPTZ  NOT NULL DEFAULT NOW(),"
-      " refreshed  TIMESTAMPTZ"
+      " refreshed  TIMESTAMPTZ,"
+      " probe_http INTEGER"          // last /models probe HTTP status; NULL=never
       ")",
 
       "CREATE TABLE IF NOT EXISTS llm_service_models ("
