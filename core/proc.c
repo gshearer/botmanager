@@ -50,6 +50,19 @@ struct proc_handle
   proc_exit_cb_t    on_exit;
   void             *user;
   unsigned          timeout_sec;
+
+  // Watchdog task lifetime. The timeout task and its follow-up SIGKILL
+  // task each capture `h`. If the child exits before they fire they must
+  // be cancelled in proc_free — otherwise a stale task dereferences the
+  // freed handle and locking the destroyed mutex hangs shutdown forever.
+  // task_cancel frees a still-queued task synchronously (the common case:
+  // child exited before the timeout). wd_active + wd_idle barrier
+  // proc_free against a watchdog callback that is mid-flight because the
+  // child was reaped exactly as the watchdog fired. All guarded by lock.
+  task_handle_t     timeout_task;
+  task_handle_t     kill_task;
+  unsigned          wd_active;     // watchdog callbacks currently touching h
+  pthread_cond_t    wd_idle;       // signalled when wd_active reaches 0
 };
 
 // Forward declarations (statics)
@@ -208,25 +221,46 @@ proc_timeout_cb(task_t *t)
   proc_handle_t *h = t->data;
   bool           alive;
   pid_t          pid;
+  unsigned       tmo;
 
   pthread_mutex_lock(&h->lock);
+
+  // We are running, so this handle can no longer be cancelled-while-queued
+  // by proc_free; clear it and register on the watchdog barrier so a
+  // proc_free racing us (child reaped as we fire) waits for us to stop
+  // touching h before it destroys the mutex.
+  h->timeout_task = TASK_HANDLE_NONE;
+  h->wd_active++;
   alive = !h->exited;
   pid   = h->pid;
+  tmo   = h->timeout_sec;
+
+  // Arm the SIGKILL escalation under the same lock so its handle is
+  // published before we drop the barrier (proc_free can then cancel it).
+  if(alive)
+    h->kill_task = task_add_deferred("proc_kill", TASK_ANY, 200,
+        (uint32_t)PROC_TIMEOUT_KILL_DELAY_SEC * 1000, proc_kill_cb, h);
+
   pthread_mutex_unlock(&h->lock);
 
   if(alive)
   {
     clam(CLAM_WARN, PROC_CTX,
-        "timeout: SIGTERM pid=%d after %us", (int)pid, h->timeout_sec);
+        "timeout: SIGTERM pid=%d after %us", (int)pid, tmo);
 
     if(kill(pid, SIGTERM) != 0)
       clam(CLAM_WARN, PROC_CTX,
           "SIGTERM failed pid=%d errno=%d (%s)",
           (int)pid, errno, strerror(errno));
-
-    task_add_deferred("proc_kill", TASK_ANY, 200,
-        (uint32_t)PROC_TIMEOUT_KILL_DELAY_SEC * 1000, proc_kill_cb, h);
   }
+
+  pthread_mutex_lock(&h->lock);
+  h->wd_active--;
+
+  if(h->wd_active == 0)
+    pthread_cond_signal(&h->wd_idle);
+
+  pthread_mutex_unlock(&h->lock);
 
   t->state = TASK_ENDED;
 }
@@ -239,6 +273,8 @@ proc_kill_cb(task_t *t)
   pid_t          pid;
 
   pthread_mutex_lock(&h->lock);
+  h->kill_task = TASK_HANDLE_NONE;
+  h->wd_active++;
   alive = !h->exited;
   pid   = h->pid;
   pthread_mutex_unlock(&h->lock);
@@ -253,6 +289,14 @@ proc_kill_cb(task_t *t)
           "SIGKILL failed pid=%d errno=%d (%s)",
           (int)pid, errno, strerror(errno));
   }
+
+  pthread_mutex_lock(&h->lock);
+  h->wd_active--;
+
+  if(h->wd_active == 0)
+    pthread_cond_signal(&h->wd_idle);
+
+  pthread_mutex_unlock(&h->lock);
 
   t->state = TASK_ENDED;
 }
@@ -314,6 +358,20 @@ proc_spawn(const proc_spec_t *spec)
     return(NULL);
   }
 
+  if(pthread_cond_init(&h->wd_idle, NULL) != 0)
+  {
+    saved_errno = errno;
+    clam(CLAM_WARN, PROC_CTX, "cond_init failed errno=%d (%s)",
+        saved_errno, strerror(saved_errno));
+    pthread_mutex_destroy(&h->lock);
+    mem_free(h->buf);
+    mem_free(h);
+    close(pfd[0]);
+    close(pfd[1]);
+    errno = saved_errno;
+    return(NULL);
+  }
+
   pid = fork();
 
   if(pid == -1)
@@ -321,6 +379,7 @@ proc_spawn(const proc_spec_t *spec)
     saved_errno = errno;
     clam(CLAM_WARN, PROC_CTX, "fork failed errno=%d (%s)",
         saved_errno, strerror(saved_errno));
+    pthread_cond_destroy(&h->wd_idle);
     pthread_mutex_destroy(&h->lock);
     mem_free(h->buf);
     mem_free(h);
@@ -373,6 +432,7 @@ proc_spawn(const proc_spec_t *spec)
     kill(pid, SIGKILL);
     waitpid(pid, NULL, 0);
     close(pfd[0]);
+    pthread_cond_destroy(&h->wd_idle);
     pthread_mutex_destroy(&h->lock);
     mem_free(h->buf);
     mem_free(h);
@@ -390,6 +450,7 @@ proc_spawn(const proc_spec_t *spec)
     kill(pid, SIGKILL);
     pthread_join(h->reader_tid, NULL);
     waitpid(pid, NULL, 0);
+    pthread_cond_destroy(&h->wd_idle);
     pthread_mutex_destroy(&h->lock);
     mem_free(h->buf);
     mem_free(h);
@@ -400,8 +461,10 @@ proc_spawn(const proc_spec_t *spec)
   clam(CLAM_INFO, PROC_CTX, "spawned pid=%d argv0=%s cap=%zu timeout=%us",
       (int)pid, spec->argv[0], h->buf_cap, spec->timeout_sec);
 
+  // Track the handle so proc_free can cancel the watchdog if the child
+  // exits first (h->timeout_task stays TASK_HANDLE_NONE when no watchdog).
   if(spec->timeout_sec > 0)
-    task_add_deferred("proc_timeout", TASK_ANY, 200,
+    h->timeout_task = task_add_deferred("proc_timeout", TASK_ANY, 200,
         (uint32_t)spec->timeout_sec * 1000, proc_timeout_cb, h);
 
   return(h);
@@ -460,10 +523,24 @@ proc_free(proc_handle_t *h)
   else
     pthread_join(waiter_tid, NULL);
 
-  // stdout_fd is normally closed by the reader before it returns; this
-  // covers the error paths in which the reader bailed before EOF.
   pthread_mutex_lock(&h->lock);
 
+  // Cancel any watchdog task that has not fired so it can't dereference
+  // this handle after we free it. task_cancel unlinks+frees a still-queued
+  // task synchronously (the common case: the child exited before the
+  // timeout, so the tasks never ran); a task already mid-callback is only
+  // flagged, so the wd_active barrier below waits for it to stop touching
+  // h before we destroy the mutex.
+  task_cancel(h->timeout_task);
+  h->timeout_task = TASK_HANDLE_NONE;
+  task_cancel(h->kill_task);
+  h->kill_task = TASK_HANDLE_NONE;
+
+  while(h->wd_active > 0)
+    pthread_cond_wait(&h->wd_idle, &h->lock);
+
+  // stdout_fd is normally closed by the reader before it returns; this
+  // covers the error paths in which the reader bailed before EOF.
   if(h->stdout_fd >= 0)
   {
     close(h->stdout_fd);
@@ -472,6 +549,7 @@ proc_free(proc_handle_t *h)
 
   pthread_mutex_unlock(&h->lock);
 
+  pthread_cond_destroy(&h->wd_idle);
   pthread_mutex_destroy(&h->lock);
   mem_free(h->buf);
   mem_free(h);
