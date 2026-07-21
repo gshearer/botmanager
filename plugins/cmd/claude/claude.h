@@ -92,8 +92,12 @@ static const plugin_kv_entry_t claude_kv_schema[] = {
     " Relative paths resolve against plugin.claude.cwd. Empty value"
     " disables the preamble entirely.",
     NULL },
-  { "plugin.claude.model", KV_STR, "claude-opus-4-7",
+  { "plugin.claude.model", KV_STR, "claude-opus-4-8",
     "Model name passed as --model to the claude CLI", NULL },
+  { "plugin.claude.effort", KV_STR, "medium",
+    "Reasoning effort passed as --effort to the claude CLI"
+    " (low, medium, high, xhigh, max). Empty value omits the flag.",
+    NULL },
   { "plugin.claude.yolo", KV_INT32, "1",
     "When nonzero, pass --dangerously-skip-permissions to the CLI."
     " Zero will stall on the CLI's permission prompt.",

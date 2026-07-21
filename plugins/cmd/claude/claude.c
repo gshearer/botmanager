@@ -546,6 +546,7 @@ claude_pending_deliver(task_t *t)
 typedef struct {
   char    cli_path[256];
   char    model[128];
+  char    effort[32];
   char    cwd[512];
   char    preamble_path[256];
   char    bctl_rel[256];
@@ -560,7 +561,8 @@ claude_load_session(claude_session_t *s)
   const char *v;
 
   snprintf(s->cli_path,      sizeof(s->cli_path),      "%s", "claude");
-  snprintf(s->model,         sizeof(s->model),         "%s", "claude-opus-4-7");
+  snprintf(s->model,         sizeof(s->model),         "%s", "claude-opus-4-8");
+  snprintf(s->effort,        sizeof(s->effort),        "%s", "medium");
   s->cwd[0] = '\0';
   snprintf(s->preamble_path, sizeof(s->preamble_path), "%s", "prompt.txt");
   snprintf(s->bctl_rel,      sizeof(s->bctl_rel),      "%s",
@@ -573,6 +575,10 @@ claude_load_session(claude_session_t *s)
   v = kv_get_str("plugin.claude.model");
   if(v != NULL && v[0] != '\0')
     snprintf(s->model, sizeof(s->model), "%s", v);
+
+  v = kv_get_str("plugin.claude.effort");
+  if(v != NULL)
+    snprintf(s->effort, sizeof(s->effort), "%s", v);
 
   v = kv_get_str("plugin.claude.cwd");
   if(v != NULL)
@@ -722,7 +728,7 @@ claude_assemble_prompt(const claude_session_t *s, const char *user_prompt,
   *out_preamble_len = preamble_len;
 }
 
-// Build argv for the claude CLI. argv[] must have at least 8 slots.
+// Build argv for the claude CLI. argv[] must have at least 10 slots.
 static void
 claude_build_argv(const claude_session_t *s, const char *prompt,
     const char **argv)
@@ -738,6 +744,13 @@ claude_build_argv(const claude_session_t *s, const char *prompt,
 
   argv[a++] = "--model";
   argv[a++] = s->model;
+
+  if(s->effort[0] != '\0')
+  {
+    argv[a++] = "--effort";
+    argv[a++] = s->effort;
+  }
+
   argv[a]   = NULL;
 }
 
@@ -758,7 +771,7 @@ claude_cmd(const cmd_ctx_t *ctx)
   const char *network;
   const char *target;
   char **envp;
-  bool spawn_ok;
+  bool spawn_rc;
   time_t session_t0;
   const char *user_prompt = ctx->args != NULL ? ctx->args : "";
 
@@ -814,14 +827,16 @@ claude_cmd(const cmd_ctx_t *ctx)
       target != NULL ? target : "<unknown>",
       network != NULL ? network : "<unknown>");
 
-  spawn_ok = claude_run_and_wait(argv, s.cwd[0] != '\0' ? s.cwd : NULL,
+  spawn_rc = claude_run_and_wait(argv, s.cwd[0] != '\0' ? s.cwd : NULL,
       (const char *const *)envp,
       (unsigned)s.timeout, (size_t)s.cap,
       &status, &signalled, &buf, &buflen);
 
   mem_free(envp);
 
-  if(!spawn_ok)
+  // claude_run_and_wait returns SUCCESS/FAIL, not a truthy "ok" flag —
+  // and SUCCESS is false, so compare against FAIL explicitly.
+  if(spawn_rc == FAIL)
   {
     clam(CLAM_WARN, CLAUDE_CTX, "proc_spawn failed");
     cmd_reply(ctx, "claude: spawn failed");
