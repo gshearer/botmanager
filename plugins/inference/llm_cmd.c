@@ -1249,7 +1249,7 @@ llm_register_commands(void)
       "llm",
       "LLM model registry",
       NULL,
-      USERNS_GROUP_ADMIN, 100, CMD_SCOPE_PRIVATE, METHOD_T_ANY,
+      USERNS_GROUP_ADMIN, 100, CMD_SCOPE_ANY, METHOD_T_ANY,
       cmd_llm_root, NULL, NULL, NULL, NULL, 0, NULL, NULL);
 
   // add → { service, model }
@@ -1257,14 +1257,14 @@ llm_register_commands(void)
       "llm add <service|model> ...",
       "Create an LLM service or model",
       NULL,
-      USERNS_GROUP_ADMIN, 100, CMD_SCOPE_PRIVATE, METHOD_T_ANY,
+      USERNS_GROUP_ADMIN, 100, CMD_SCOPE_ANY, METHOD_T_ANY,
       cmd_llm_add_usage, NULL, "llm", "a", NULL, 0, NULL, NULL);
 
   cmd_register("llm", "service",
       "llm add service <name> <base_url>",
       "Register an OpenAI-compatible provider (base URL)",
       NULL,
-      USERNS_GROUP_ADMIN, 100, CMD_SCOPE_PRIVATE, METHOD_T_ANY,
+      USERNS_GROUP_ADMIN, 100, CMD_SCOPE_ANY, METHOD_T_ANY,
       cmd_llm_add_service, NULL, "llm/add", "s", ad_add_service,
       (uint8_t)(sizeof(ad_add_service) / sizeof(ad_add_service[0])),
       NULL, NULL);
@@ -1273,7 +1273,7 @@ llm_register_commands(void)
       "llm add model <chat|embed> <name> <service> <model_id>",
       "Register a model against a service",
       NULL,
-      USERNS_GROUP_ADMIN, 100, CMD_SCOPE_PRIVATE, METHOD_T_ANY,
+      USERNS_GROUP_ADMIN, 100, CMD_SCOPE_ANY, METHOD_T_ANY,
       cmd_llm_add_model, NULL, "llm/add", "m", ad_add_model,
       (uint8_t)(sizeof(ad_add_model) / sizeof(ad_add_model[0])), NULL, NULL);
 
@@ -1282,21 +1282,21 @@ llm_register_commands(void)
       "llm del <service|model> <name>",
       "Delete an LLM service or model",
       NULL,
-      USERNS_GROUP_ADMIN, 100, CMD_SCOPE_PRIVATE, METHOD_T_ANY,
+      USERNS_GROUP_ADMIN, 100, CMD_SCOPE_ANY, METHOD_T_ANY,
       cmd_llm_del_usage, NULL, "llm", "d", NULL, 0, NULL, NULL);
 
   cmd_register("llm", "service",
       "llm del service <name>",
       "Delete a service (blocked while models reference it)",
       NULL,
-      USERNS_GROUP_ADMIN, 100, CMD_SCOPE_PRIVATE, METHOD_T_ANY,
+      USERNS_GROUP_ADMIN, 100, CMD_SCOPE_ANY, METHOD_T_ANY,
       cmd_llm_del_service, NULL, "llm/del", "s", ad_del_one, 1, NULL, NULL);
 
   cmd_register("llm", "model",
       "llm del model <name>",
       "Delete a defined model",
       NULL,
-      USERNS_GROUP_ADMIN, 100, CMD_SCOPE_PRIVATE, METHOD_T_ANY,
+      USERNS_GROUP_ADMIN, 100, CMD_SCOPE_ANY, METHOD_T_ANY,
       cmd_llm_del_model, NULL, "llm/del", "m", ad_del_one, 1, NULL, NULL);
 
   // service <name> <action> (refresh)
@@ -1304,7 +1304,7 @@ llm_register_commands(void)
       "llm service <name> refresh",
       "Refresh a service's cached /models list",
       NULL,
-      USERNS_GROUP_ADMIN, 100, CMD_SCOPE_PRIVATE, METHOD_T_ANY,
+      USERNS_GROUP_ADMIN, 100, CMD_SCOPE_ANY, METHOD_T_ANY,
       cmd_llm_service, NULL, "llm", "sv", ad_llm_service,
       (uint8_t)(sizeof(ad_llm_service) / sizeof(ad_llm_service[0])),
       NULL, NULL);
@@ -1315,7 +1315,7 @@ llm_register_commands(void)
       "llm probe <name>",
       "Re-probe an embed model's output dimension",
       NULL,
-      USERNS_GROUP_ADMIN, 100, CMD_SCOPE_PRIVATE, METHOD_T_ANY,
+      USERNS_GROUP_ADMIN, 100, CMD_SCOPE_ANY, METHOD_T_ANY,
       cmd_llm_probe, NULL, "llm", "pb", ad_llm_probe,
       (uint8_t)(sizeof(ad_llm_probe) / sizeof(ad_llm_probe[0])), NULL, NULL);
 
@@ -1323,7 +1323,7 @@ llm_register_commands(void)
       "llm test <name> [prompt]",
       "Probe an LLM model synchronously",
       NULL,
-      USERNS_GROUP_ADMIN, 100, CMD_SCOPE_PRIVATE, METHOD_T_ANY,
+      USERNS_GROUP_ADMIN, 100, CMD_SCOPE_ANY, METHOD_T_ANY,
       cmd_llm_test, NULL, "llm", "t", ad_llm_test,
       (uint8_t)(sizeof(ad_llm_test) / sizeof(ad_llm_test[0])), NULL, NULL);
 
