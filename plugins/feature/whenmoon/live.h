@@ -59,11 +59,15 @@ bool wm_market_engine_real_submit_locked(whenmoon_market_t *mk,
     char *errbuf, size_t errbuf_sz);
 
 // WM-DISC-1: discretionary-treasury freeze tripwire (CFO.md sec. 3).
-// Called after a real fill is recorded and the fill path's locks are
-// released. Reads plugin.whenmoon.disc.* fresh; no-op until the fund is
-// configured (deposit_usd, freeze_frac, markets all set) and the filled
-// market is designated. On breach flips every designated market to
-// MANUAL (positions kept) and emits one DISC-FREEZE CLAM_WARN.
+// Called after a fill is recorded and the fill path's locks are
+// released: real exchange fills (record_external_fill) and synth-mode
+// operator force trades (the market force verb). Reads
+// plugin.whenmoon.disc.* fresh; no-op until the fund is configured
+// (deposit_usd, freeze_frac, markets all set) and the filled market is
+// designated. Equity reads each designated market's book by its mode
+// (PAPER -> paper book, REAL/MANUAL -> real book). On breach flips
+// every designated market to MANUAL (positions kept) and emits one
+// DISC-FREEZE CLAM_WARN.
 void wm_live_disc_freeze_check(const char *filled_market_id_str);
 
 #endif // WHENMOON_INTERNAL

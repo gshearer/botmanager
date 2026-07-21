@@ -1743,7 +1743,7 @@ wm_live_disc_register_kvs(void)
   if(!kv_exists(WM_DISC_KV_FRAC) &&
      kv_register(WM_DISC_KV_FRAC, KV_DOUBLE, "0.0", NULL, NULL,
          "Discretionary treasury freeze fraction: fund equity <"
-         " deposit_usd * (1 - freeze_frac) after a real fill on a"
+         " deposit_usd * (1 - freeze_frac) after a fill on a"
          " designated market flips every designated market to MANUAL"
          " (positions kept) and emits one DISC-FREEZE warn."
          " 0 disables.") != SUCCESS)
@@ -1754,8 +1754,9 @@ wm_live_disc_register_kvs(void)
      kv_register(WM_DISC_KV_MARKETS, KV_STR, "", NULL, NULL,
          "Discretionary treasury designated markets: comma-separated"
          " market_id_str list, exact match, no whitespace. The fund"
-         " trades ONLY through these; the freeze tripwire sums their"
-         " real cash + marked positions.") != SUCCESS)
+         " trades ONLY through these; the freeze tripwire sums each"
+         " market's book cash + marked position (paper-mode markets"
+         " read their paper book, all others the real book).") != SUCCESS)
     clam(CLAM_WARN, WM_LIVE_CTX, "kv_register failed: %s",
         WM_DISC_KV_MARKETS);
 }
@@ -1785,10 +1786,16 @@ wm_disc_market_listed(const char *list, const char *market_id_str)
   return(false);
 }
 
-// WM-DISC-1 A3: called from wm_market_engine_record_external_fill AFTER
-// the fill's locks are released. Mirrors the WM-BREAKER-1 shape at fund
-// scope: sum designated markets' real equity, breach -> every
-// designated market flips MANUAL.
+// WM-DISC-1 A3: evaluated after the fund's only two order paths —
+// real exchange fills (wm_market_engine_record_external_fill) and
+// operator force trades in synth modes (the /whenmoon market force
+// verb) — always AFTER the fill's locks are released. Strategy-driven
+// paper fills are deliberately not hooked: strategies never trade the
+// fund. Mirrors the WM-BREAKER-1 shape at fund scope: sum designated
+// markets' book equity (paper-mode markets read their paper book so
+// the Part B rehearsal can drill the tripwire; REAL and frozen MANUAL
+// markets read the real book), breach -> every designated market
+// flips MANUAL.
 //
 // Locking: the walk takes one mk->lock at a time under the arr rdlock,
 // never two — two designated markets filling concurrently must not
@@ -1813,6 +1820,8 @@ wm_live_disc_freeze_check(const char *filled_market_id_str)
   double             floor_eq;
   double             equity  = 0.0;
   uint32_t           n_fund  = 0;
+  uint32_t           n_paper = 0;
+  uint32_t           n_real  = 0;
   uint32_t           flipped = 0;
   uint32_t           i;
 
@@ -1858,17 +1867,35 @@ wm_live_disc_freeze_check(const char *filled_market_id_str)
     pthread_mutex_lock(&mk->lock);
 
     {
-      const wm_market_stats_t *rs =
-          &mk->session.stats[WM_MARKET_MODE_REAL];
+      // Book selection: a PAPER-mode designated market contributes its
+      // paper book (the Part B rehearsal fund is all-paper); everything
+      // else — REAL, and MANUAL after a freeze — contributes the real
+      // book. A fund must never mix books: paper cash in a real fund
+      // masks a real breach, hence the warn below.
+      wm_market_mode_t book =
+          (mk->session.mode == WM_MARKET_MODE_PAPER)
+              ? WM_MARKET_MODE_PAPER : WM_MARKET_MODE_REAL;
+      const wm_market_stats_t *bs = &mk->session.stats[book];
       double pos = (mk->session.position.side == WM_MARKET_POS_LONG)
           ? mk->session.position.qty : 0.0;
 
-      equity += rs->cash + pos * mk->session.last_mark_px;
+      equity += bs->cash + pos * mk->session.last_mark_px;
+
+      if(book == WM_MARKET_MODE_PAPER)
+        n_paper++;
+      else
+        n_real++;
     }
 
     pthread_mutex_unlock(&mk->lock);
     fund[n_fund++] = mk;
   }
+
+  if(n_paper > 0 && n_real > 0)
+    clam(CLAM_WARN, WM_LIVE_CTX,
+        "disc fund mixes books: %u paper-mode + %u real/manual"
+        " designated market(s) — paper cash inflates fund equity;"
+        " fix %s", n_paper, n_real, WM_DISC_KV_MARKETS);
 
   if(equity >= floor_eq)
   {

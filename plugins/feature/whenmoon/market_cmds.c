@@ -7,6 +7,7 @@
 #include "market.h"
 #include "market_cmds.h"
 #include "market_engine.h"
+#include "live.h"
 #include "strategy.h"
 #include "dl_commands.h"
 #include "wm_exch_query.h"
@@ -672,6 +673,13 @@ wm_market_cmd_force(const cmd_ctx_t *ctx)
 
   pthread_mutex_unlock(&mk->lock);
   pthread_rwlock_unlock(&st->markets->arr_lock);
+
+  // WM-DISC-1 A3: synth-mode force fills evaluate the discretionary
+  // tripwire here. Real force trades are checked when the exchange
+  // fill lands in wm_market_engine_record_external_fill — submissions
+  // don't move equity, fills do.
+  if(ok == SUCCESS && mode != WM_MARKET_MODE_REAL)
+    wm_live_disc_freeze_check(id_str);
 
   if(ok != SUCCESS)
   {
