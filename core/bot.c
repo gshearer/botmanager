@@ -340,6 +340,128 @@ bot_userns_kv_cb(const char *key, void *data)
     bot_set_userns(inst, ns_val);
 }
 
+// ---------------------------------------------------------------------------
+// Per-bot / per-(bot,protocol) KV contributors
+// ---------------------------------------------------------------------------
+//
+// A tiny fixed registry of plugins that want to decorate every bot with
+// their own KV keys (see bot.h). The array is guarded by its own mutex,
+// never nested under bot_mutex during fan-out: we snapshot under the
+// contributor lock, release it, then invoke the callbacks. Back-fill of a
+// newly registered contributor (below) walks the bot list under bot_mutex
+// and calls only that one contributor, so no re-registration storms.
+
+#define BOT_KV_CONTRIB_MAX  8
+
+typedef struct
+{
+  bot_kv_bot_cb_t    bot_cb;
+  bot_kv_method_cb_t method_cb;
+  void              *user;
+} bot_kv_contrib_t;
+
+static bot_kv_contrib_t bot_kv_contribs[BOT_KV_CONTRIB_MAX];
+static uint32_t         bot_kv_contrib_count = 0;
+static pthread_mutex_t  bot_kv_contrib_mutex = PTHREAD_MUTEX_INITIALIZER;
+
+// Snapshot the contributor table under its lock, so callbacks run unlocked.
+static uint32_t
+bot_kv_snapshot(bot_kv_contrib_t out[BOT_KV_CONTRIB_MAX])
+{
+  uint32_t n;
+
+  pthread_mutex_lock(&bot_kv_contrib_mutex);
+  n = bot_kv_contrib_count;
+  memcpy(out, bot_kv_contribs, n * sizeof(out[0]));
+  pthread_mutex_unlock(&bot_kv_contrib_mutex);
+
+  return(n);
+}
+
+// Fan a fresh bot out to every contributor's bot_cb.
+static void
+bot_kv_fanout_bot(const char *name)
+{
+  bot_kv_contrib_t snap[BOT_KV_CONTRIB_MAX];
+  uint32_t         n = bot_kv_snapshot(snap);
+
+  for(uint32_t i = 0; i < n; i++)
+    if(snap[i].bot_cb != NULL)
+      snap[i].bot_cb(name, snap[i].user);
+}
+
+// Fan a freshly-bound (bot, protocol) pair out to every method_cb.
+static void
+bot_kv_fanout_method(const char *name, const char *protocol)
+{
+  bot_kv_contrib_t snap[BOT_KV_CONTRIB_MAX];
+  uint32_t         n = bot_kv_snapshot(snap);
+
+  for(uint32_t i = 0; i < n; i++)
+    if(snap[i].method_cb != NULL)
+      snap[i].method_cb(name, protocol, snap[i].user);
+}
+
+void
+bot_kv_contributor_register(bot_kv_bot_cb_t bot_cb,
+    bot_kv_method_cb_t method_cb, void *user)
+{
+  pthread_mutex_lock(&bot_kv_contrib_mutex);
+
+  if(bot_kv_contrib_count >= BOT_KV_CONTRIB_MAX)
+  {
+    pthread_mutex_unlock(&bot_kv_contrib_mutex);
+    clam(CLAM_WARN, "bot",
+        "KV contributor table full (%d); dropping registration",
+        BOT_KV_CONTRIB_MAX);
+    return;
+  }
+
+  bot_kv_contribs[bot_kv_contrib_count].bot_cb    = bot_cb;
+  bot_kv_contribs[bot_kv_contrib_count].method_cb = method_cb;
+  bot_kv_contribs[bot_kv_contrib_count].user      = user;
+  bot_kv_contrib_count++;
+
+  pthread_mutex_unlock(&bot_kv_contrib_mutex);
+
+  // Back-fill: apply only this contributor to every existing bot and its
+  // already-bound protocols, so a late/hot-reloaded plugin catches up.
+  // kv_register is idempotent-quiet only for new keys, so we invoke the
+  // single new contributor rather than the full fan-out.
+  pthread_mutex_lock(&bot_mutex);
+
+  for(bot_inst_t *b = bot_list; b != NULL; b = b->next)
+  {
+    if(bot_cb != NULL)
+      bot_cb(b->name, user);
+
+    if(method_cb != NULL)
+      for(bot_method_t *m = b->methods; m != NULL; m = m->next)
+        method_cb(b->name, m->method_kind, user);
+  }
+
+  pthread_mutex_unlock(&bot_mutex);
+}
+
+void
+bot_kv_contributor_unregister(void *user)
+{
+  pthread_mutex_lock(&bot_kv_contrib_mutex);
+
+  for(uint32_t i = 0; i < bot_kv_contrib_count; i++)
+    if(bot_kv_contribs[i].user == user)
+    {
+      // Compact the tail down over the removed slot.
+      for(uint32_t j = i + 1; j < bot_kv_contrib_count; j++)
+        bot_kv_contribs[j - 1] = bot_kv_contribs[j];
+
+      bot_kv_contrib_count--;
+      break;
+    }
+
+  pthread_mutex_unlock(&bot_kv_contrib_mutex);
+}
+
 // Create a new bot instance.
 // drv: bot driver interface (must not be NULL)
 bot_inst_t *
@@ -423,17 +545,12 @@ bot_create(const bot_driver_t *drv, const char *name)
     kv_register(key, KV_STR, "", NULL, NULL,
         "POSIX ERE matched against message payload; matching messages"
         " are dropped before dispatching to the driver");
-
-    snprintf(key, sizeof(key), "bot.%s.ask.allow", name);
-    kv_register(key, KV_STR, "", NULL, NULL,
-        "Per-bot !ask allowlist override (CSV of chat-model names, * = all;"
-        " empty inherits plugin.ask.allow).");
-
-    snprintf(key, sizeof(key), "bot.%s.ask.default", name);
-    kv_register(key, KV_STR, "", NULL, NULL,
-        "Per-bot !ask default model override (empty inherits"
-        " plugin.ask.model).");
   }
+
+  // Invite registered plugins (e.g. `ask`) to layer their own
+  // bot.<name>.* keys onto the fresh instance. Runs unlocked — bot_mutex
+  // was released above and contributor callbacks only touch KV.
+  bot_kv_fanout_bot(name);
 
   clam(CLAM_INFO, "bot_create",
       "created '%s' (driver: %s)", name, drv->name);
@@ -1901,6 +2018,11 @@ bot_register_method_kv(const char *botname, const char *method_kind)
   if(botname == NULL || botname[0] == '\0' ||
      method_kind == NULL || method_kind[0] == '\0')
     return(0);
+
+  // Invite contributors (e.g. `ask`) to layer their own
+  // bot.<botname>.<protocol>.* keys onto this binding. Done first so it
+  // fires even when the protocol plugin itself exposes no instance schema.
+  bot_kv_fanout_method(botname, method_kind);
 
   // Find the protocol plugin by kind.
   pd = plugin_find_type(PLUGIN_PROTOCOL, method_kind);

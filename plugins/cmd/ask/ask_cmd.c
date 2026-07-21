@@ -25,71 +25,189 @@
 // KV schema — registered once under plugin.ask.*
 // -----------------------------------------------------------------------
 
+// The plugin tier is the ROOT of a three-level resolution
+// (plugin -> bot -> bot.protocol). allow is an absolute list the lower
+// tiers may only narrow (intersection); max_tokens / max_lines are hard
+// ceilings the lower tiers may only lower (min); default model and
+// prompt_prepend_file cascade most-specific-non-empty-wins. The per-bot
+// and per-(bot,protocol) keys are contributed dynamically at bot-create /
+// method-bind time — see ask_kv_bot_cb / ask_kv_proto_cb.
 static const plugin_kv_entry_t ask_kv_schema[] = {
-  { "plugin.ask.model",      KV_STR,    "gemini-flash3",
-    "Model used by !ask when no -m is given" },
+  { "plugin.ask.default",    KV_STR,    "gemini-flash3",
+    "Default chat model for !ask when no -m is given" },
   { "plugin.ask.allow",      KV_STR,    "*",
-    "CSV allowlist of exposable chat-model names ('*' = all enabled)" },
+    "Absolute allowlist of exposable chat-model names ('*' = all enabled);"
+    " bot / protocol tiers may only narrow this" },
   { "plugin.ask.max_tokens", KV_UINT32, "512",
-    "max_tokens sent with each !ask request" },
+    "Hard ceiling on max_tokens per !ask; bot / protocol tiers may only"
+    " lower it" },
   { "plugin.ask.max_lines",  KV_UINT32, "6",
-    "Reply-line cap per answer (flood guard)" },
-  { "plugin.ask.system",     KV_STR,
-    "Answer concisely and factually. This is for an IRC channel; keep it short.",
-    "One-shot system prompt prepended to every !ask query" },
+    "Hard ceiling on reply lines per answer (flood guard); bot / protocol"
+    " tiers may only lower it" },
+  { "plugin.ask.prompt_prepend_file", KV_STR, "prompts/ask_default.txt",
+    "Path to a .txt file whose contents are prepended (as a system prompt)"
+    " to every !ask query; bot / protocol tiers may override" },
 };
+
+// -----------------------------------------------------------------------
+// Per-bot / per-(bot,protocol) KV contributors
+// -----------------------------------------------------------------------
+//
+// Registered with core (bot_kv_contributor_register) so every bot instance
+// and every bound protocol grows its own ask.* override keys. Core invokes
+// these at bot-create / method-bind time and back-fills existing bots when
+// the plugin (re)loads. Keys default to "inherit" values: allow="*" (no
+// narrowing), max_*="0" (no lowering), prompt_prepend_file="" (fall through
+// to the parent tier). The default model is materialised from the parent
+// tier at instantiation so `show kv` reveals the effective choice.
+
+// Stable per-plugin address used as the KV-contributor registration
+// cookie (register / unregister match on it).
+static const char ask_kv_cookie;
+
+static void
+ask_kv_bot_cb(const char *botname, void *user)
+{
+  char        key[KV_KEY_SZ];
+  const char *inherit;
+  char        def[KV_STR_SZ];
+
+  (void)user;
+
+  // Snapshot the plugin default so the per-bot key advertises the model it
+  // inherited at creation (task: "inherited by bot-specific keys when
+  // instantiated"). Operators can override; clearing it falls back to the
+  // plugin default at resolution time.
+  inherit = kv_get_str("plugin.ask.default");
+  snprintf(def, sizeof(def), "%s", inherit != NULL ? inherit : "");
+
+  snprintf(key, sizeof(key), "bot.%s.ask.default", botname);
+  kv_register(key, KV_STR, def, NULL, NULL,
+      "Per-bot !ask default model (empty inherits plugin.ask.default)");
+
+  snprintf(key, sizeof(key), "bot.%s.ask.allow", botname);
+  kv_register(key, KV_STR, "*", NULL, NULL,
+      "Per-bot !ask allowlist ('*' = inherit; else narrows plugin.ask.allow)");
+
+  snprintf(key, sizeof(key), "bot.%s.ask.max_tokens", botname);
+  kv_register(key, KV_UINT32, "0", NULL, NULL,
+      "Per-bot max_tokens cap for !ask (0 = inherit plugin ceiling)");
+
+  snprintf(key, sizeof(key), "bot.%s.ask.max_lines", botname);
+  kv_register(key, KV_UINT32, "0", NULL, NULL,
+      "Per-bot reply-line cap for !ask (0 = inherit plugin ceiling)");
+
+  snprintf(key, sizeof(key), "bot.%s.ask.prompt_prepend_file", botname);
+  kv_register(key, KV_STR, "", NULL, NULL,
+      "Per-bot prepend-file path for !ask (empty inherits plugin default)");
+}
+
+static void
+ask_kv_proto_cb(const char *botname, const char *protocol, void *user)
+{
+  char        key[KV_KEY_SZ];
+  const char *inherit;
+  char        def[KV_STR_SZ];
+
+  (void)user;
+
+  // Materialise the protocol default from the bot tier it was created under.
+  snprintf(key, sizeof(key), "bot.%s.ask.default", botname);
+  inherit = kv_get_str(key);
+  snprintf(def, sizeof(def), "%s", inherit != NULL ? inherit : "");
+
+  snprintf(key, sizeof(key), "bot.%s.%s.ask.default", botname, protocol);
+  kv_register(key, KV_STR, def, NULL, NULL,
+      "Per-protocol !ask default model (empty inherits the bot tier)");
+
+  snprintf(key, sizeof(key), "bot.%s.%s.ask.allow", botname, protocol);
+  kv_register(key, KV_STR, "*", NULL, NULL,
+      "Per-protocol !ask allowlist ('*' = inherit; else narrows the bot tier)");
+
+  snprintf(key, sizeof(key), "bot.%s.%s.ask.max_tokens", botname, protocol);
+  kv_register(key, KV_UINT32, "0", NULL, NULL,
+      "Per-protocol max_tokens cap for !ask (0 = inherit)");
+
+  snprintf(key, sizeof(key), "bot.%s.%s.ask.max_lines", botname, protocol);
+  kv_register(key, KV_UINT32, "0", NULL, NULL,
+      "Per-protocol reply-line cap for !ask (0 = inherit)");
+
+  snprintf(key, sizeof(key), "bot.%s.%s.ask.prompt_prepend_file",
+      botname, protocol);
+  kv_register(key, KV_STR, "", NULL, NULL,
+      "Per-protocol prepend-file path for !ask (empty inherits)");
+}
 
 // -----------------------------------------------------------------------
 // Resolution helpers
 // -----------------------------------------------------------------------
 
-// Effective allowlist CSV for bot `bot_name`: the per-bot override if
-// set, else the global default, else the literal "*" (all). Returns a
-// pointer into KV storage or a string literal — never NULL.
+// The protocol (method kind, e.g. "irc") a command arrived on, or NULL
+// when it can't be determined — the third resolution tier keys off this.
 static const char *
-ask_allow_csv(const char *bot_name)
+ask_proto(const cmd_ctx_t *ctx)
 {
-  char        key[128];
-  const char *v = NULL;
+  if(ctx->msg != NULL && ctx->msg->inst != NULL)
+    return(method_inst_kind(ctx->msg->inst));
 
-  if(bot_name != NULL)
-  {
-    snprintf(key, sizeof(key), "bot.%s.ask.allow", bot_name);
-    v = kv_get_str(key);
-  }
-
-  if(v == NULL || v[0] == '\0')
-    v = kv_get_str("plugin.ask.allow");
-
-  if(v == NULL || v[0] == '\0')
-    v = "*";
-
-  return(v);
+  return(NULL);
 }
 
-// Effective default model for bot `bot_name`: per-bot override if set,
-// else the global default. May be NULL/empty in a misconfigured
-// deployment — callers treat that as "no default".
+// Read bot.<bot>.ask.<suffix>, or NULL if bot_name is absent.
 static const char *
-ask_def_model(const char *bot_name)
+ask_kv_bot(const char *bot_name, const char *suffix)
 {
-  char        key[128];
-  const char *v = NULL;
+  char key[KV_KEY_SZ];
 
-  if(bot_name != NULL)
-  {
-    snprintf(key, sizeof(key), "bot.%s.ask.default", bot_name);
-    v = kv_get_str(key);
-  }
+  if(bot_name == NULL)
+    return(NULL);
 
-  if(v == NULL || v[0] == '\0')
-    v = kv_get_str("plugin.ask.model");
-
-  return(v);
+  snprintf(key, sizeof(key), "bot.%s.ask.%s", bot_name, suffix);
+  return(kv_get_str(key));
 }
 
-// True iff `model` appears as a whole comma/space-separated token in the
-// allowlist CSV, matched case-insensitively. `csv` is left unmodified.
+// Read bot.<bot>.<proto>.ask.<suffix>, or NULL if either scope is absent.
+static const char *
+ask_kv_proto(const char *bot_name, const char *proto, const char *suffix)
+{
+  char key[KV_KEY_SZ];
+
+  if(bot_name == NULL || proto == NULL)
+    return(NULL);
+
+  snprintf(key, sizeof(key), "bot.%s.%s.ask.%s", bot_name, proto, suffix);
+  return(kv_get_str(key));
+}
+
+// First non-empty of the most-specific-first candidates, or NULL.
+static const char *
+ask_first_nonempty(const char *a, const char *b, const char *c)
+{
+  if(a != NULL && a[0] != '\0')
+    return(a);
+  if(b != NULL && b[0] != '\0')
+    return(b);
+  if(c != NULL && c[0] != '\0')
+    return(c);
+
+  return(NULL);
+}
+
+// Resolved per-request scope: the effective default model, the three
+// allowlist tiers (each a membership filter), and the reply ceilings.
+// Built once per command and threaded through the gate + reply loop.
+typedef struct
+{
+  const char *def_model;     // most-specific non-empty, or NULL
+  const char *allow_plugin;  // absolute list
+  const char *allow_bot;     // narrows plugin (NULL/empty/"*" = no-op)
+  const char *allow_proto;   // narrows bot    (NULL/empty/"*" = no-op)
+  uint32_t    max_lines;     // min across present tiers
+  uint32_t    max_tokens;    // min across present tiers
+} ask_scope_t;
+
+// True iff `model` is a whole comma/space-separated token of `csv`
+// (case-insensitive). `csv` is left unmodified.
 static bool
 ask_csv_contains(const char *csv, const char *model)
 {
@@ -106,11 +224,119 @@ ask_csv_contains(const char *csv, const char *model)
   return(false);
 }
 
-// Gate a model for !ask: it must exist, be a chat model (embed models
-// stay unreachable even under "*"), and be either the resolved default
-// (always self-allowed) or present in the allowlist.
+// A single allowlist tier admits `model` when it imposes no restriction
+// (unset / empty / "*") or explicitly lists it.
 static bool
-ask_model_ok(const char *model, const char *def_model, const char *allow_csv)
+ask_tier_admits(const char *csv, const char *model)
+{
+  if(csv == NULL || csv[0] == '\0' || strcmp(csv, "*") == 0)
+    return(true);
+
+  return(ask_csv_contains(csv, model));
+}
+
+// One ceiling resolved as the minimum of the plugin value and any lower
+// tier that opts in (a tier value of 0 means "inherit, don't lower").
+// Never returns below `floor`.
+static uint32_t
+ask_ceiling(const char *bot_name, const char *proto, const char *suffix,
+    uint32_t floor)
+{
+  char     key[KV_KEY_SZ];
+  uint32_t eff;
+  uint32_t tier;
+
+  snprintf(key, sizeof(key), "plugin.ask.%s", suffix);
+  eff = (uint32_t)kv_get_uint(key);
+
+  if(bot_name != NULL)
+  {
+    snprintf(key, sizeof(key), "bot.%s.ask.%s", bot_name, suffix);
+    tier = (uint32_t)kv_get_uint(key);
+    if(tier > 0 && (eff == 0 || tier < eff))
+      eff = tier;
+  }
+
+  if(bot_name != NULL && proto != NULL)
+  {
+    snprintf(key, sizeof(key), "bot.%s.%s.ask.%s", bot_name, proto, suffix);
+    tier = (uint32_t)kv_get_uint(key);
+    if(tier > 0 && (eff == 0 || tier < eff))
+      eff = tier;
+  }
+
+  return(eff < floor ? floor : eff);
+}
+
+// Populate `s` for a request on (bot_name, proto). Any tier may be absent.
+static void
+ask_scope_resolve(const char *bot_name, const char *proto, ask_scope_t *s)
+{
+  memset(s, 0, sizeof(*s));
+
+  s->def_model = ask_first_nonempty(
+      ask_kv_proto(bot_name, proto, "default"),
+      ask_kv_bot(bot_name, "default"),
+      kv_get_str("plugin.ask.default"));
+
+  s->allow_plugin = kv_get_str("plugin.ask.allow");
+  s->allow_bot    = ask_kv_bot(bot_name, "allow");
+  s->allow_proto  = ask_kv_proto(bot_name, proto, "allow");
+
+  s->max_lines  = ask_ceiling(bot_name, proto, "max_lines",  1);
+  s->max_tokens = ask_ceiling(bot_name, proto, "max_tokens", 1);
+}
+
+// Resolve the effective prepend-file path (most-specific non-empty) and
+// slurp it into `buf` (NUL-terminated, truncated to `cap`, trailing
+// newlines trimmed). Returns SUCCESS with buf populated, else FAIL with
+// buf[0] == '\0'. Read fresh each call so file edits take effect live.
+static bool
+ask_read_prepend(const char *bot_name, const char *proto,
+    char *buf, size_t cap)
+{
+  const char *path;
+  FILE       *fp;
+  size_t      n;
+
+  if(cap == 0)
+    return(FAIL);
+
+  buf[0] = '\0';
+
+  path = ask_first_nonempty(
+      ask_kv_proto(bot_name, proto, "prompt_prepend_file"),
+      ask_kv_bot(bot_name, "prompt_prepend_file"),
+      kv_get_str("plugin.ask.prompt_prepend_file"));
+
+  if(path == NULL)
+    return(FAIL);
+
+  fp = fopen(path, "r");
+
+  if(fp == NULL)
+  {
+    // Debug, not warn: this is on the per-request path and a missing file
+    // simply means "no system prompt" — logging every !ask would flood.
+    clam(CLAM_DEBUG, ASK_CMD_CTX, "prepend file unreadable: '%s'", path);
+    return(FAIL);
+  }
+
+  n = fread(buf, 1, cap - 1, fp);
+  fclose(fp);
+  buf[n] = '\0';
+
+  while(n > 0 && (buf[n - 1] == '\n' || buf[n - 1] == '\r'))
+    buf[--n] = '\0';
+
+  return(n > 0 ? SUCCESS : FAIL);
+}
+
+// Gate a model for !ask: it must exist, be a chat model (embed models stay
+// unreachable even under "*"), and either be the resolved default (always
+// self-allowed) or survive the intersection of all present allow tiers.
+static bool
+ask_model_ok(const char *model, const ask_scope_t *s)
 {
   llm_kind_t kind;
 
@@ -127,13 +353,15 @@ ask_model_ok(const char *model, const char *def_model, const char *allow_csv)
   if(llm_model_kind(model, &kind) != SUCCESS || kind != LLM_KIND_CHAT)
     return(false);
 
-  if(def_model != NULL && strcasecmp(model, def_model) == 0)
+  // The resolved default is always reachable, even if the allowlists omit
+  // it — a bot can always run its own configured default.
+  if(s->def_model != NULL && strcasecmp(model, s->def_model) == 0)
     return(true);
 
-  if(strcmp(allow_csv, "*") == 0)
-    return(true);
-
-  return(ask_csv_contains(allow_csv, model));
+  // Intersection: every present tier must admit the model.
+  return(ask_tier_admits(s->allow_plugin, model) &&
+         ask_tier_admits(s->allow_bot,    model) &&
+         ask_tier_admits(s->allow_proto,  model));
 }
 
 
@@ -222,7 +450,7 @@ ask_done(const llm_chat_response_t *resp)
     return;
   }
 
-  max_lines = (uint32_t)kv_get_uint("plugin.ask.max_lines");
+  max_lines = r->max_lines;
   if(max_lines == 0)
     max_lines = 1;
 
@@ -266,16 +494,16 @@ ask_cmd_handler(const cmd_ctx_t *ctx)
 {
   ask_req_t         *r;
   const char        *bot_name;
-  const char        *def_model;
-  const char        *allow_csv;
+  const char        *proto;
   const char        *model;
+  ask_scope_t        scope;
   char               picked[128];
   char               query[METHOD_TEXT_SZ];
   char               reply[ASK_CMD_REPLY_SZ];
+  char               prepend[ASK_PREPEND_SZ];
   bool               have_model;
   llm_message_t      msgs[2];
   size_t             n;
-  const char        *sys;
   llm_chat_params_t  p;
 
   static const char usage[] =
@@ -296,12 +524,12 @@ ask_cmd_handler(const cmd_ctx_t *ctx)
     return;
   }
 
-  bot_name  = (ctx->bot != NULL) ? bot_inst_name(ctx->bot) : NULL;
-  def_model = ask_def_model(bot_name);
-  allow_csv = ask_allow_csv(bot_name);
-  model     = have_model ? picked : def_model;
+  bot_name = (ctx->bot != NULL) ? bot_inst_name(ctx->bot) : NULL;
+  proto    = ask_proto(ctx);
+  ask_scope_resolve(bot_name, proto, &scope);
+  model    = have_model ? picked : scope.def_model;
 
-  if(!ask_model_ok(model, def_model, allow_csv))
+  if(!ask_model_ok(model, &scope))
   {
     snprintf(reply, sizeof(reply),
         "unknown or unavailable model '%s' — try !show ask",
@@ -312,7 +540,8 @@ ask_cmd_handler(const cmd_ctx_t *ctx)
 
   r = mem_alloc(ASK_CMD_CTX, "req", sizeof(*r));
   memset(r, 0, sizeof(*r));
-  r->ctx = *ctx;
+  r->ctx       = *ctx;
+  r->max_lines = scope.max_lines;
 
   if(ctx->msg != NULL)
     r->msg = *ctx->msg;
@@ -324,13 +553,16 @@ ask_cmd_handler(const cmd_ctx_t *ctx)
   r->ctx.data     = NULL;
 
   memset(msgs, 0, sizeof(msgs));   // header: blocks ptr must be zeroed
-  n   = 0;
-  sys = kv_get_str("plugin.ask.system");
+  n = 0;
 
-  if(sys != NULL && sys[0] != '\0')
+  // Prepend-file contents become the one-shot system prompt. Resolved
+  // most-specific-first (protocol -> bot -> plugin) and read fresh so
+  // edits to the file take effect without a reload. prepend outlives the
+  // submit call (llm_chat_submit copies internally).
+  if(ask_read_prepend(bot_name, proto, prepend, sizeof(prepend)) == SUCCESS)
   {
     msgs[n].role    = LLM_ROLE_SYSTEM;
-    msgs[n].content = sys;
+    msgs[n].content = prepend;
     n++;
   }
 
@@ -339,7 +571,7 @@ ask_cmd_handler(const cmd_ctx_t *ctx)
   n++;
 
   p            = (llm_chat_params_t){ 0 };
-  p.max_tokens = (uint32_t)kv_get_uint("plugin.ask.max_tokens");
+  p.max_tokens = scope.max_tokens;
 
   // model/msgs/query are caller-owned only until submit returns
   // (the callee copies internally) — all live here for the call.
@@ -360,9 +592,8 @@ ask_cmd_handler(const cmd_ctx_t *ctx)
 // model the calling bot may reach, starring the default.
 typedef struct
 {
-  const cmd_ctx_t *ctx;
-  const char      *def_model;
-  const char      *allow_csv;
+  const cmd_ctx_t   *ctx;
+  const ask_scope_t *scope;
 } ask_show_state_t;
 
 static void
@@ -383,10 +614,11 @@ ask_show_model_cb(const char *name, llm_kind_t kind,
   if(kind != LLM_KIND_CHAT || !enabled)
     return;
 
-  if(!ask_model_ok(name, s->def_model, s->allow_csv))
+  if(!ask_model_ok(name, s->scope))
     return;
 
-  is_def = (s->def_model != NULL && strcasecmp(name, s->def_model) == 0);
+  is_def = (s->scope->def_model != NULL &&
+            strcasecmp(name, s->scope->def_model) == 0);
 
   snprintf(line, sizeof(line), "  %s %s  " CLR_GRAY "%s" CLR_RESET "%s",
       is_def ? CLR_YELLOW "★" CLR_RESET : "  ",
@@ -399,12 +631,16 @@ static void
 show_ask_handler(const cmd_ctx_t *ctx)
 {
   ask_show_state_t s;
+  ask_scope_t      scope;
   const char      *bot_name;
+  const char      *proto;
 
-  bot_name    = (ctx->bot != NULL) ? bot_inst_name(ctx->bot) : NULL;
-  s.ctx       = ctx;
-  s.def_model = ask_def_model(bot_name);
-  s.allow_csv = ask_allow_csv(bot_name);
+  bot_name = (ctx->bot != NULL) ? bot_inst_name(ctx->bot) : NULL;
+  proto    = ask_proto(ctx);
+  ask_scope_resolve(bot_name, proto, &scope);
+
+  s.ctx   = ctx;
+  s.scope = &scope;
 
   cmd_reply(ctx, CLR_BOLD "ask" CLR_RESET "  ·  models available here");
   llm_model_iterate(ask_show_model_cb, &s);
@@ -449,6 +685,12 @@ ask_cmd_init(void)
     return(FAIL);
   }
 
+  // Grow every bot / bound protocol its own ask.* override tiers. Core
+  // back-fills existing bots immediately, so a hot-reload re-attaches the
+  // keys. The plugin_desc pointer is the unregister cookie.
+  bot_kv_contributor_register(ask_kv_bot_cb, ask_kv_proto_cb,
+      (void *)&ask_kv_cookie);
+
   clam(CLAM_INFO, ASK_CMD_CTX, "ask command plugin initialized");
   return(SUCCESS);
 }
@@ -456,6 +698,8 @@ ask_cmd_init(void)
 static void
 ask_cmd_deinit(void)
 {
+  bot_kv_contributor_unregister((void *)&ask_kv_cookie);
+
   // Two nodes share the name "ask" (root command + show child). Each
   // cmd_unregister removes the first match in the global list, so two
   // calls clear both.

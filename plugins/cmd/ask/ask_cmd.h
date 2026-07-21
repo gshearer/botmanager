@@ -23,14 +23,19 @@
 
 #define ASK_CMD_CTX        "ask"
 #define ASK_CMD_REPLY_SZ   640
+#define ASK_PREPEND_SZ     4096   // cap on prepend-file system-prompt bytes
 
 // Per-call closure carrying the saved command context through the async
 // llm_chat_submit callback. The context's msg pointer is rebound to the
 // embedded copy so it survives past the originating dispatch frame.
+// max_lines is the reply-line cap resolved at request time (plugin ceiling
+// narrowed by the bot / protocol tiers) — snapshotted here so the async
+// completion doesn't re-resolve on a worker thread.
 typedef struct
 {
   cmd_ctx_t    ctx;
   method_msg_t msg;
+  uint32_t     max_lines;
 } ask_req_t;
 
 static bool ask_cmd_init(void);

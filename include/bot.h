@@ -235,6 +235,38 @@ uint32_t bot_register_method_kv(const char *botname, const char *method_kind);
 // keys) under "bot.<botname>." after a bot is created.
 uint32_t bot_register_driver_kv(const char *botname, const char *bot_kind);
 
+// ---------------------------------------------------------------------------
+// Per-bot / per-(bot,protocol) KV contributors
+// ---------------------------------------------------------------------------
+//
+// Lets a command/feature plugin layer its OWN KV keys onto every bot
+// without core hardcoding plugin-specific keys (e.g. the `ask` plugin's
+// `bot.<botname>.ask.*` and `bot.<botname>.<protocol>.ask.*` tiers). This
+// keeps the layering clean: core owns the bot registry and merely invites
+// registered contributors to decorate each bot / bound protocol.
+//
+//   bot_cb    — fires once per bot instance. Register `bot.<botname>.*`.
+//   method_cb — fires once per (bot, bound protocol) pair. Register
+//               `bot.<botname>.<protocol>.*`. `protocol` is the method
+//               kind string (e.g. "irc").
+//
+// Either callback may be NULL. On registration the contributor is
+// immediately back-filled against every existing bot and its already-bound
+// protocols, so a hot-reloaded plugin re-attaches its keys. Thereafter each
+// new bot and each freshly-bound protocol invokes every registered
+// contributor. Unregister (by the same `user` cookie) before the plugin
+// unloads, or the stored callback pointer dangles.
+//
+// Contributor callbacks MUST be self-contained (kv_register and friends);
+// they must not re-enter bot APIs that take the bot lock.
+typedef void (*bot_kv_bot_cb_t)(const char *botname, void *user);
+typedef void (*bot_kv_method_cb_t)(const char *botname, const char *protocol,
+    void *user);
+
+void bot_kv_contributor_register(bot_kv_bot_cb_t bot_cb,
+    bot_kv_method_cb_t method_cb, void *user);
+void bot_kv_contributor_unregister(void *user);
+
 // Must be called after db_init().
 bool bot_ensure_tables(void);
 
