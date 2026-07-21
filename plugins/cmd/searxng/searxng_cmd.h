@@ -21,13 +21,15 @@
 #define SEARXNG_CMD_CTX        "searxng"
 #define SEARXNG_CMD_REPLY_SZ   640
 
-// Per-call closure carrying the saved command context and the search
-// category through the async sxng_search callback.
+// Per-call closure carrying the saved command context, the search
+// category, and the verbose-display flag through the async sxng_search
+// callback.
 typedef struct
 {
   cmd_ctx_t       ctx;
   method_msg_t    msg;
   sxng_category_t category;
+  bool            verbose;   // -v: full metadata; default: URLs only
 } searxng_cmd_req_t;
 
 static bool searxng_cmd_init(void);

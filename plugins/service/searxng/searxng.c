@@ -33,10 +33,12 @@ static const plugin_kv_entry_t sxng_kv_schema[] = {
     "SearXNG search URL (full path incl. /search)" },
   { "plugin.searxng.format",       KV_STR,    "json",
     "SearXNG response format (only 'json' is parsed)" },
-  { "plugin.searxng.timeout_secs", KV_UINT32, "15",
+  { "plugin.searxng.timeout_secs", KV_UINT32, "10",
     "Per-request timeout in seconds" },
   { "plugin.searxng.max_results",  KV_UINT32, "10",
     "Default result cap per query (hard max 32)" },
+  { "plugin.searxng.min_results",  KV_UINT32, "1",
+    "Floor on results returned per query (clamped to max_results)" },
   { "plugin.searxng.safesearch",   KV_UINT32, "1",
     "SafeSearch level: 0=off, 1=moderate, 2=strict" },
 };
@@ -339,6 +341,7 @@ sxng_search(const char *query, sxng_category_t category, size_t n_wanted,
   curl_request_t *cr;
   const char *endpoint;
   uint32_t kv_max;
+  uint32_t kv_min;
   sxng_req_t *r;
   if(cb == NULL)
     return(FAIL);
@@ -359,6 +362,7 @@ sxng_search(const char *query, sxng_category_t category, size_t n_wanted,
   }
 
   kv_max = (uint32_t)kv_get_uint("plugin.searxng.max_results");
+  kv_min = (uint32_t)kv_get_uint("plugin.searxng.min_results");
   safe = (uint32_t)kv_get_uint("plugin.searxng.safesearch");
   to_sec = (uint32_t)kv_get_uint("plugin.searxng.timeout_secs");
 
@@ -367,8 +371,19 @@ sxng_search(const char *query, sxng_category_t category, size_t n_wanted,
   if(kv_max > SXNG_HARDMAX_RESULTS)
     kv_max = SXNG_HARDMAX_RESULTS;
 
+  // Result floor. Default 1; can never exceed the per-query cap. A
+  // caller passing 0 still means "use the default cap" (preserves the
+  // inference layer's contract), so the floor only ever raises an
+  // explicit-but-too-small request up to kv_min.
+  if(kv_min == 0)
+    kv_min = 1;
+  if(kv_min > kv_max)
+    kv_min = kv_max;
+
   if(n_wanted == 0 || n_wanted > kv_max)
     n_wanted = kv_max;
+  if(n_wanted < kv_min)
+    n_wanted = kv_min;
 
   if(safe > 2)
     safe = 2;

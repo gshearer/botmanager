@@ -1,17 +1,29 @@
 // botmanager — MIT
-// /searxng command-surface plugin: admin-only diagnostic that submits
-// queries to the configured SearXNG endpoint via the searxng service
-// plugin's public API. Exposes one subcommand per SearXNG category so
-// the command bot can drive all of general / images / news / videos /
-// music from a single command tree.
+// searxng command-surface plugin: a public search interface over the
+// searxng service plugin. Exposes one top-level command per SearXNG
+// category, each usable by anyone in channels or private messages:
+//
+//   !searxng / !search / !s   general web search
+//   !news    / !n             news / current events
+//   !image   / !i             image search
+//   !video   / !v             video search
+//   !music                    music / audio search
+//
+// Every command accepts an optional "-n <count>" prefix to request a
+// specific number of results (clamped to plugin.searxng.max_results);
+// with no -n the count defaults to plugin.searxng.min_results. Results
+// are formatted with category-appropriate metadata (image dimensions,
+// video length, news publication date).
 #define SEARXNG_CMD_INTERNAL
 #include "searxng_cmd.h"
 
+#include "kv.h"
+
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 
 // Forward declarations for cmd_register binding.
-static void searxng_cmd_root  (const cmd_ctx_t *ctx);
 static void searxng_cmd_general(const cmd_ctx_t *ctx);
 static void searxng_cmd_images (const cmd_ctx_t *ctx);
 static void searxng_cmd_news   (const cmd_ctx_t *ctx);
@@ -137,15 +149,19 @@ searxng_cmd_done(const sxng_response_t *resp)
     return;
   }
 
-  snprintf(line, sizeof(line), "searxng %s: %zu result%s",
-      sxng_category_name(resp->category),
-      resp->n_results, resp->n_results == 1 ? "" : "s");
-  cmd_reply(&ctx, line);
-
   for(size_t i = 0; i < resp->n_results; i++)
   {
     const sxng_result_t *rr = &resp->results[i];
 
+    // Default (concise) mode: just the URL, one per line.
+    if(!r->verbose)
+    {
+      snprintf(line, sizeof(line), "%.*s", SXNG_CMD_LINE_BODY, rr->url);
+      cmd_reply(&ctx, line);
+      continue;
+    }
+
+    // Verbose mode: numbered title, URL, snippet, category extras.
     snprintf(line, sizeof(line), "%zu. %s", i + 1,
         rr->title[0] != '\0' ? rr->title : "(untitled)");
     cmd_reply(&ctx, line);
@@ -167,28 +183,131 @@ searxng_cmd_done(const sxng_response_t *resp)
   mem_free(r);
 }
 
-// Submit one search at the given category. Owns the per-call closure
-// allocation; on submit failure the closure is freed in-line and an
-// error reply is emitted. The async path always frees on its own.
+// Append one whitespace-separated token to the query buffer, inserting a
+// single space before every token but the first. Silently drops tokens
+// that would overflow the buffer — a truncated query is preferable to a
+// clobbered stack.
+static void
+searxng_cmd_query_append(char *query, size_t cap, size_t *len,
+    const char *tok)
+{
+  int wrote;
+
+  if(*len >= cap)
+    return;
+
+  wrote = snprintf(query + *len, cap - *len, "%s%s",
+      *len > 0 ? " " : "", tok);
+
+  if(wrote > 0)
+    *len += (size_t)wrote < cap - *len ? (size_t)wrote : cap - *len - 1;
+}
+
+// Parse the optional leading flags out of a raw argument string, writing
+// the residual query (flags removed) into `query`. Two flags are
+// recognised, each consumed on its first occurrence anywhere in the token
+// stream:
+//   -n <count>  request a specific result count -> *count, *have_count
+//   -v          verbose display                 -> *verbose
+// A "-n" whose successor is not a base-10 number is treated as two
+// ordinary query words, so a literal search for "-n foo" still works.
+static void
+searxng_cmd_parse_flags(const char *args, char *query, size_t cap,
+    uint32_t *count, bool *have_count, bool *verbose)
+{
+  char   scratch[METHOD_TEXT_SZ];
+  char  *save;
+  size_t qlen;
+
+  snprintf(scratch, sizeof(scratch), "%s", args);
+  query[0]    = '\0';
+  qlen        = 0;
+  *have_count = false;
+  *verbose    = false;
+
+  for(char *tok = strtok_r(scratch, " \t", &save); tok != NULL;
+      tok = strtok_r(NULL, " \t", &save))
+  {
+    if(!*verbose && strcmp(tok, "-v") == 0)
+    {
+      *verbose = true;
+      continue;
+    }
+
+    if(!*have_count && strcmp(tok, "-n") == 0)
+    {
+      char *num = strtok_r(NULL, " \t", &save);
+      char *end;
+      unsigned long v;
+
+      if(num == NULL)
+        continue;                   // trailing "-n" with no value: drop
+
+      v = strtoul(num, &end, 10);
+
+      if(end != num && *end == '\0')
+      {
+        *count      = (uint32_t)v;
+        *have_count = true;
+        continue;
+      }
+
+      // Not a number — keep both tokens as literal query words.
+      searxng_cmd_query_append(query, cap, &qlen, tok);
+      searxng_cmd_query_append(query, cap, &qlen, num);
+      continue;
+    }
+
+    searxng_cmd_query_append(query, cap, &qlen, tok);
+  }
+}
+
+// Submit one search at the given category. Parses the optional -n flag,
+// resolves the requested result count against plugin.searxng.min_results,
+// and owns the per-call closure allocation; on submit failure the closure
+// is freed in-line and an error reply is emitted. The async path always
+// frees on its own.
 static void
 searxng_cmd_dispatch(const cmd_ctx_t *ctx, sxng_category_t category)
 {
   searxng_cmd_req_t *r;
+  char               query[METHOD_TEXT_SZ];
+  uint32_t           n_wanted;
+  bool               have_n;
+  bool               verbose;
 
   if(ctx->args == NULL || ctx->args[0] == '\0')
   {
-    char line[SEARXNG_CMD_REPLY_SZ];
-
-    snprintf(line, sizeof(line), "Usage: searxng %s <query>",
-        sxng_category_name(category));
-    cmd_reply(ctx, line);
+    cmd_reply(ctx, "Usage: [-v] [-n <count>] <query>");
     return;
+  }
+
+  n_wanted = 0;
+  searxng_cmd_parse_flags(ctx->args, query, sizeof(query),
+      &n_wanted, &have_n, &verbose);
+
+  if(query[0] == '\0')
+  {
+    cmd_reply(ctx, "Usage: [-v] [-n <count>] <query>");
+    return;
+  }
+
+  // No -n (or "-n 0") falls back to the configured floor. The service
+  // clamps the final count to [min_results, max_results], so an
+  // over-large -n is honoured only up to max_results.
+  if(!have_n || n_wanted == 0)
+  {
+    n_wanted = (uint32_t)kv_get_uint("plugin.searxng.min_results");
+
+    if(n_wanted == 0)
+      n_wanted = 1;
   }
 
   r = mem_alloc(SEARXNG_CMD_CTX, "req", sizeof(*r));
   memset(r, 0, sizeof(*r));
   r->ctx      = *ctx;
   r->category = category;
+  r->verbose  = verbose;
 
   if(ctx->msg != NULL)
     r->msg = *ctx->msg;
@@ -199,7 +318,7 @@ searxng_cmd_dispatch(const cmd_ctx_t *ctx, sxng_category_t category)
   r->ctx.parsed   = NULL;
   r->ctx.data     = NULL;
 
-  if(sxng_search(ctx->args, category, 0, searxng_cmd_done, r) != SUCCESS)
+  if(sxng_search(query, category, n_wanted, searxng_cmd_done, r) != SUCCESS)
   {
     cmd_reply(ctx, "searxng: failed to submit query "
         "(check plugin.searxng.endpoint)");
@@ -207,18 +326,9 @@ searxng_cmd_dispatch(const cmd_ctx_t *ctx, sxng_category_t category)
   }
 }
 
-// Command callbacks
-
-static void
-searxng_cmd_root(const cmd_ctx_t *ctx)
-{
-  cmd_reply(ctx, "usage: /searxng <subcommand>");
-  cmd_reply(ctx, "  general <query> — web search (default)");
-  cmd_reply(ctx, "  images  <query> — image search");
-  cmd_reply(ctx, "  news    <query> — news / current events");
-  cmd_reply(ctx, "  videos  <query> — video search");
-  cmd_reply(ctx, "  music   <query> — music / audio search");
-}
+// Command callbacks. Each top-level command binds to one category; the
+// namesake "searxng" and its "search"/"s" aliases all perform a general
+// web search.
 
 static void searxng_cmd_general(const cmd_ctx_t *ctx)
 { searxng_cmd_dispatch(ctx, SXNG_CAT_GENERAL); }
@@ -237,59 +347,83 @@ static void searxng_cmd_music(const cmd_ctx_t *ctx)
 
 // Plugin lifecycle
 
-static bool
-searxng_cmd_register_sub(const char *name, const char *usage,
-    const char *desc, cmd_cb_t cb)
+// One public, top-level search command. `abbrev` may be NULL for the
+// namesake and the aliasless "music" command. All entries share the same
+// permission profile: the "everyone" group at level 0, usable in both
+// channels and private messages (CMD_SCOPE_ANY).
+typedef struct
 {
-  return(cmd_register(SEARXNG_CMD_CTX, name, usage, desc, NULL,
-      USERNS_GROUP_ADMIN, 100, CMD_SCOPE_PRIVATE, METHOD_T_ANY,
-      cb, NULL, SEARXNG_CMD_CTX, NULL,
-      NULL, 0, NULL, NULL));
+  const char *name;
+  const char *abbrev;
+  const char *usage;
+  const char *desc;
+  cmd_cb_t    cb;
+} searxng_cmd_entry_t;
+
+static const searxng_cmd_entry_t searxng_cmd_table[] = {
+  { SEARXNG_CMD_CTX, NULL, "searxng [-v] [-n <count>] <query>",
+    "Web search via SearXNG", searxng_cmd_general },
+  { "search", "s", "search [-v] [-n <count>] <query>",
+    "Web search via SearXNG", searxng_cmd_general },
+  { "news", "n", "news [-v] [-n <count>] <query>",
+    "News / current-events search via SearXNG", searxng_cmd_news },
+  { "image", "i", "image [-v] [-n <count>] <query>",
+    "Image search via SearXNG", searxng_cmd_images },
+  { "video", "v", "video [-v] [-n <count>] <query>",
+    "Video search via SearXNG", searxng_cmd_videos },
+  { "music", NULL, "music [-v] [-n <count>] <query>",
+    "Music / audio search via SearXNG", searxng_cmd_music },
+};
+
+#define SEARXNG_CMD_TABLE_N \
+    (sizeof(searxng_cmd_table) / sizeof(searxng_cmd_table[0]))
+
+static const char searxng_cmd_help[] =
+    "Search the web via the configured SearXNG endpoint.\n"
+    "\n"
+    "Commands (all public, usable in channels or private messages):\n"
+    "  searxng / search / s   web search\n"
+    "  news / n               news / current events\n"
+    "  image / i              image search\n"
+    "  video / v              video search\n"
+    "  music                  music / audio search\n"
+    "\n"
+    "By default only result URLs are returned. Add \"-v\" for\n"
+    "verbose output (title, URL, snippet, and category metadata).\n"
+    "\n"
+    "Add \"-n <count>\" to request a specific number of results\n"
+    "(capped at plugin.searxng.max_results). With no -n the count\n"
+    "defaults to plugin.searxng.min_results.\n"
+    "\n"
+    "Examples:\n"
+    "  !s dua lipa\n"
+    "  !n -n 5 ai legislation\n"
+    "  !i -v aurora borealis\n"
+    "  !v arch linux install\n"
+    "  !music aphex twin selected ambient";
+
+static void
+searxng_cmd_unregister_all(void)
+{
+  for(size_t i = 0; i < SEARXNG_CMD_TABLE_N; i++)
+    cmd_unregister(searxng_cmd_table[i].name);
 }
 
 static bool
 searxng_cmd_init(void)
 {
-  if(cmd_register(SEARXNG_CMD_CTX, SEARXNG_CMD_CTX,
-      "searxng <category> <query>",
-      "Submit a query to the configured SearXNG endpoint",
-      "Administrative helper for the SearXNG service plugin.\n"
-      "Exercises the endpoint configured at\n"
-      "plugin.searxng.endpoint and prints the parsed results,\n"
-      "with category-appropriate metadata (image dimensions,\n"
-      "video length, news publication date).\n"
-      "\n"
-      "Categories: general, images, news, videos, music.\n"
-      "\n"
-      "Examples:\n"
-      "  /searxng general dua lipa\n"
-      "  /searxng news ai legislation\n"
-      "  /searxng images aurora borealis\n"
-      "  /searxng videos arch linux install\n"
-      "  /searxng music aphex twin selected ambient",
-      USERNS_GROUP_ADMIN, 100, CMD_SCOPE_PRIVATE, METHOD_T_ANY,
-      searxng_cmd_root, NULL, NULL, NULL,
-      NULL, 0, NULL, NULL) != SUCCESS)
-    return(FAIL);
-
-  if(searxng_cmd_register_sub("general", "general <query>",
-        "Web search via SearXNG", searxng_cmd_general) != SUCCESS
-      || searxng_cmd_register_sub("images", "images <query>",
-        "Image search via SearXNG", searxng_cmd_images) != SUCCESS
-      || searxng_cmd_register_sub("news", "news <query>",
-        "News search via SearXNG", searxng_cmd_news) != SUCCESS
-      || searxng_cmd_register_sub("videos", "videos <query>",
-        "Video search via SearXNG", searxng_cmd_videos) != SUCCESS
-      || searxng_cmd_register_sub("music", "music <query>",
-        "Music search via SearXNG", searxng_cmd_music) != SUCCESS)
+  for(size_t i = 0; i < SEARXNG_CMD_TABLE_N; i++)
   {
-    cmd_unregister("general");
-    cmd_unregister("images");
-    cmd_unregister("news");
-    cmd_unregister("videos");
-    cmd_unregister("music");
-    cmd_unregister(SEARXNG_CMD_CTX);
-    return(FAIL);
+    const searxng_cmd_entry_t *e = &searxng_cmd_table[i];
+
+    if(cmd_register(SEARXNG_CMD_CTX, e->name, e->usage, e->desc,
+        searxng_cmd_help, USERNS_GROUP_EVERYONE, 0,
+        CMD_SCOPE_ANY, METHOD_T_ANY, e->cb, NULL,
+        NULL, e->abbrev, NULL, 0, NULL, NULL) != SUCCESS)
+    {
+      searxng_cmd_unregister_all();
+      return(FAIL);
+    }
   }
 
   clam(CLAM_INFO, SEARXNG_CMD_CTX,
@@ -300,12 +434,7 @@ searxng_cmd_init(void)
 static void
 searxng_cmd_deinit(void)
 {
-  cmd_unregister("general");
-  cmd_unregister("images");
-  cmd_unregister("news");
-  cmd_unregister("videos");
-  cmd_unregister("music");
-  cmd_unregister(SEARXNG_CMD_CTX);
+  searxng_cmd_unregister_all();
   clam(CLAM_INFO, SEARXNG_CMD_CTX,
       "searxng command plugin deinitialized");
 }
