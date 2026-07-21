@@ -91,6 +91,11 @@ void llm_iterate_active(llm_iter_cb_t cb, void *data);
 #define LLM_FINISH_SZ      32
 #define LLM_ERR_SZ         256
 
+// Per-model request-dialect negotiation (LLM-DIALECT-1).
+#define LLM_DIR_FIELD_SZ    64   // canonical builder field / wire name
+#define LLM_MAX_DIRECTIVES  8    // learned directives per model (room to grow)
+#define LLM_NEGOTIATION_CAP 4    // runaway backstop; each retry makes progress
+
 // Defaults (applied before KV load).
 #define LLM_DEF_MAX_RETRIES       3
 #define LLM_DEF_RETRY_BACKOFF_MS  500
@@ -145,6 +150,27 @@ typedef enum
   LLM_REQ_EMBED
 } llm_req_type_t;
 
+// One learned request-dialect directive for a canonical field the chat-body
+// builder emits (e.g. "max_tokens", "temperature"): keep it as-is, rename it
+// to a different wire name, or drop it entirely. Learned by parsing a
+// provider's 400 parameter error, then persisted per (service, model_id) in
+// llm_model_params so later calls build the right body on the first try.
+typedef enum
+{
+  LLM_DIR_KEEP,     // emit the canonical field unchanged (default; never stored)
+  LLM_DIR_RENAME,   // emit `replacement` as the wire field name
+  LLM_DIR_DROP      // omit the field so the provider default applies
+} llm_dir_action_t;
+
+typedef struct
+{
+  char             field[LLM_DIR_FIELD_SZ];       // canonical builder field
+  llm_dir_action_t action;
+  char             replacement[LLM_DIR_FIELD_SZ]; // wire name when RENAME
+  bool             staged;   // request-scoped: learned this request, flush on
+                             // success. Always false in the shared cache.
+} llm_directive_t;
+
 // Freelist-backed.
 struct llm_request
 {
@@ -152,11 +178,20 @@ struct llm_request
 
   // Model snapshot (copied at submit time so cache can mutate freely).
   char                  model_name[LLM_MODEL_NAME_SZ];
+  char                  service_name[LLM_MODEL_NAME_SZ];  // keys the params table
   char                  endpoint_url[LLM_ENDPOINT_SZ];
   char                  model_id[LLM_MODEL_ID_SZ];
   char                  api_key_kv[LLM_KV_KEY_SZ];
   llm_kind_t            kind;
   uint32_t              embed_dim;
+
+  // Request-dialect directives applied when building the chat-params tail.
+  // Seeded from the shared cache at submit; augmented in place when a
+  // provider 400 teaches us a new one. Staged entries flush to DB on the
+  // eventual success. See LLM-DIALECT-1.
+  llm_directive_t       directives[LLM_MAX_DIRECTIVES];
+  uint32_t              n_directives;
+  uint32_t              negotiation_attempts;  // independent of `attempt`
 
   // Chat-specific fields.
   llm_chat_params_t     params;
@@ -165,7 +200,12 @@ struct llm_request
   llm_embed_done_cb_t   embed_done_cb;
   void                 *user_data;
 
-  // Request body (JSON), built once and reused across retries.
+  // Request body (JSON). For chat, req_body = body_prefix + params-tail;
+  // the immutable prefix ({"model":...,"messages":[...]}) is retained so a
+  // negotiation retry rebuilds only the tail without re-encoding messages.
+  // body_prefix is NULL for embed requests (req_body built once).
+  char                 *body_prefix;
+  size_t                body_prefix_len;
   char                 *req_body;
   size_t                req_body_len;
 

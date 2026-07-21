@@ -35,6 +35,20 @@ pthread_rwlock_t        llm_models_lock;
 llm_service_t          *llm_services_head = NULL;
 pthread_rwlock_t        llm_services_lock;
 
+// Learned per-model request-dialect directives (LLM-DIALECT-1). Keyed by
+// (service_name, model_id); a tiny linked list mirroring llm_model_params.
+typedef struct llm_model_params
+{
+  char             service_name[LLM_MODEL_NAME_SZ];
+  char             model_id[LLM_MODEL_ID_SZ];
+  llm_directive_t  directives[LLM_MAX_DIRECTIVES];
+  uint32_t         n_directives;
+  struct llm_model_params *next;
+} llm_model_params_t;
+
+static llm_model_params_t *llm_model_params_head = NULL;
+static pthread_rwlock_t    llm_model_params_lock;
+
 #ifdef LLM_TEST_HOOKS
 // Test-only: slot holding the next canned chat-completion content. When
 // non-NULL, llm_chat_submit fires done_cb synchronously with this text
@@ -286,12 +300,14 @@ llm_req_alloc(void)
 static void
 llm_req_release(llm_request_t *req)
 {
+  if(req->body_prefix != NULL)  { mem_free(req->body_prefix); req->body_prefix = NULL; }
   if(req->req_body != NULL)     { mem_free(req->req_body); req->req_body = NULL; }
   if(req->assembled != NULL)    { mem_free(req->assembled); req->assembled = NULL; }
   if(req->vec_block != NULL)    { mem_free(req->vec_block); req->vec_block = NULL; }
   if(req->vectors != NULL)      { mem_free((void *)req->vectors); req->vectors = NULL; }
   if(req->sse_parser != NULL)   { sse_parser_free(req->sse_parser); req->sse_parser = NULL; }
 
+  req->body_prefix_len = 0;
   req->req_body_len = 0;
   req->assembled_len = 0;
   req->assembled_cap = 0;
@@ -606,6 +622,10 @@ llm_services_reload(void)
     else
       kv_set_cb(key, llm_apikey_kv_cb, NULL);
 
+    // Per-model request-dialect quirks (max_tokens rename, temperature drop)
+    // are no longer per-service KVs: they are learned per (service, model_id)
+    // and stored in llm_model_params. See LLM-DIALECT-1.
+
     llm_services_upsert(&s);
   }
 
@@ -721,6 +741,19 @@ llm_ensure_tables(void)
       " default_temp  REAL         NOT NULL DEFAULT 0.7,"
       " enabled       BOOLEAN      NOT NULL DEFAULT TRUE,"
       " created       TIMESTAMPTZ  NOT NULL DEFAULT NOW()"
+      ")",
+
+      // Learned request-dialect directives, keyed by (service, model_id) so
+      // it works whether or not /models was ever probed. See LLM-DIALECT-1.
+      "CREATE TABLE IF NOT EXISTS llm_model_params ("
+      " service_name  VARCHAR(64)  NOT NULL"
+      "               REFERENCES llm_services(name) ON DELETE CASCADE,"
+      " model_id      VARCHAR(128) NOT NULL,"
+      " field         VARCHAR(64)  NOT NULL,"   // canonical builder field
+      " action        VARCHAR(16)  NOT NULL,"   // 'rename' | 'drop'
+      " replacement   VARCHAR(64),"             // wire name for 'rename', else NULL
+      " learned       TIMESTAMPTZ  NOT NULL DEFAULT NOW(),"
+      " PRIMARY KEY (service_name, model_id, field)"
       ")"
   };
 
@@ -1047,11 +1080,415 @@ llm_clam_prompt_embed(const char *model_name,
     llm_clam_prompt_content("embed", i + 1, n_inputs, "input", inputs[i]);
 }
 
+// Request-dialect negotiation (LLM-DIALECT-1)
+//
+// One OpenAI-compatible service can host models with incompatible request
+// bodies (gpt-4o wants "max_tokens" + a temperature; gpt-5.x wants
+// "max_completion_tokens" and rejects any explicit temperature). OpenAI's
+// parameter 400s name their own fix, so we send the optimistic (classic)
+// body, parse a recognizable failure, learn the correction per model, retry,
+// and persist it — no model names in C.
+
+// Locate the first single-quoted '<token>' that begins immediately after
+// `anchor` (which must itself end at the opening quote) within [body, +len).
+// Copies the token into out. Returns SUCCESS if a non-empty token fits.
+static bool
+llm_extract_squoted(const char *body, size_t len, const char *anchor,
+    char *out, size_t out_sz)
+{
+  const char *a = util_memstr(body, len, anchor);
+  const char *end = body + len;
+  const char *p;
+  const char *q;
+  size_t n;
+
+  if(a == NULL)
+    return(FAIL);
+
+  p = a + strlen(anchor);
+  q = p;
+
+  while(q < end && *q != '\'')
+    q++;
+
+  if(q >= end)
+    return(FAIL);
+
+  n = (size_t)(q - p);
+
+  if(n == 0 || n >= out_sz)
+    return(FAIL);
+
+  memcpy(out, p, n);
+  out[n] = '\0';
+  return(SUCCESS);
+}
+
+// Parse an OpenAI-style invalid_request_error body into one candidate
+// directive. Returns SUCCESS if the grammar matched. The offending field is
+// taken verbatim from the message; the caller gates it against the set of
+// fields the builder actually emits.
+static bool
+llm_negotiate_parse(const char *body, size_t len, llm_directive_t *out)
+{
+  char field[LLM_DIR_FIELD_SZ];
+  char repl[LLM_DIR_FIELD_SZ];
+
+  memset(out, 0, sizeof(*out));
+
+  // "Unsupported parameter: '<P>' is not supported ... [Use '<Q>' instead]"
+  if(llm_extract_squoted(body, len, "Unsupported parameter: '",
+      field, sizeof(field)) == SUCCESS)
+  {
+    snprintf(out->field, sizeof(out->field), "%s", field);
+
+    if(llm_extract_squoted(body, len, "Use '", repl, sizeof(repl)) == SUCCESS)
+    {
+      out->action = LLM_DIR_RENAME;
+      snprintf(out->replacement, sizeof(out->replacement), "%s", repl);
+    }
+
+    else
+      out->action = LLM_DIR_DROP;
+
+    return(SUCCESS);
+  }
+
+  // "Unsupported value: '<P>' does not support <v> ... Only the default ..."
+  if(llm_extract_squoted(body, len, "Unsupported value: '",
+      field, sizeof(field)) == SUCCESS)
+  {
+    snprintf(out->field, sizeof(out->field), "%s", field);
+    out->action = LLM_DIR_DROP;
+    return(SUCCESS);
+  }
+
+  return(FAIL);
+}
+
+// True for the canonical fields llm_append_chat_params emits and can
+// negotiate. A parsed field outside this set (e.g. the renamed wire name on a
+// second failure) bails the negotiation — this bounds the retry loop.
+static bool
+llm_is_builder_field(const char *field)
+{
+  return(strcmp(field, "temperature") == 0
+      || strcmp(field, "max_tokens") == 0);
+}
+
+// The request's currently-applied directive for a canonical field, or NULL.
+static const llm_directive_t *
+llm_req_directive(const llm_request_t *req, const char *field)
+{
+  for(uint32_t i = 0; i < req->n_directives; i++)
+    if(strcmp(req->directives[i].field, field) == 0)
+      return(&req->directives[i]);
+
+  return(NULL);
+}
+
+// Resolve the wire field name to emit for a canonical builder field: the
+// field itself (KEEP / no directive), the replacement (RENAME), or NULL
+// (DROP — emit nothing).
+static const char *
+llm_wire_field(const llm_request_t *req, const char *field)
+{
+  const llm_directive_t *d = llm_req_directive(req, field);
+
+  if(d == NULL || d->action == LLM_DIR_KEEP)
+    return(field);
+
+  if(d->action == LLM_DIR_RENAME)
+    return(d->replacement);
+
+  return(NULL);
+}
+
+// True if `d` differs from what the request already applies for d->field
+// (unseen field, or a different action/replacement). A directive we already
+// applied that still 400s is not new — the caller gives up on it.
+static bool
+llm_directive_is_new(const llm_request_t *req, const llm_directive_t *d)
+{
+  const llm_directive_t *cur = llm_req_directive(req, d->field);
+
+  if(cur == NULL || cur->action != d->action)
+    return(true);
+
+  if(d->action == LLM_DIR_RENAME
+      && strcmp(cur->replacement, d->replacement) != 0)
+    return(true);
+
+  return(false);
+}
+
+// Add or replace the directive for d->field in the request's applied set.
+static void
+llm_req_directive_add(llm_request_t *req, const llm_directive_t *d)
+{
+  for(uint32_t i = 0; i < req->n_directives; i++)
+    if(strcmp(req->directives[i].field, d->field) == 0)
+    {
+      req->directives[i] = *d;
+      return;
+    }
+
+  if(req->n_directives < LLM_MAX_DIRECTIVES)
+    req->directives[req->n_directives++] = *d;
+}
+
+// Learned-directive cache (mirror of llm_model_params)
+
+static void
+llm_model_params_clear(void)
+{
+  llm_model_params_t *node;
+
+  pthread_rwlock_wrlock(&llm_model_params_lock);
+  node = llm_model_params_head;
+  llm_model_params_head = NULL;
+  pthread_rwlock_unlock(&llm_model_params_lock);
+
+  while(node != NULL)
+  {
+    llm_model_params_t *next = node->next;
+    mem_free(node);
+    node = next;
+  }
+}
+
+// Insert or replace the directive for (service, model_id, d->field). Takes
+// the write lock. The stored copy is never staged.
+static void
+llm_model_params_cache_put(const char *service, const char *model_id,
+    const llm_directive_t *d)
+{
+  llm_model_params_t *node;
+
+  pthread_rwlock_wrlock(&llm_model_params_lock);
+
+  for(node = llm_model_params_head; node != NULL; node = node->next)
+    if(strcmp(node->service_name, service) == 0
+        && strcmp(node->model_id, model_id) == 0)
+      break;
+
+  if(node == NULL)
+  {
+    node = mem_alloc("llm", "model_params", sizeof(*node));
+    memset(node, 0, sizeof(*node));
+    snprintf(node->service_name, sizeof(node->service_name), "%s", service);
+    snprintf(node->model_id, sizeof(node->model_id), "%s", model_id);
+    node->next = llm_model_params_head;
+    llm_model_params_head = node;
+  }
+
+  for(uint32_t i = 0; i < node->n_directives; i++)
+    if(strcmp(node->directives[i].field, d->field) == 0)
+    {
+      node->directives[i] = *d;
+      node->directives[i].staged = false;
+      pthread_rwlock_unlock(&llm_model_params_lock);
+      return;
+    }
+
+  if(node->n_directives < LLM_MAX_DIRECTIVES)
+  {
+    node->directives[node->n_directives] = *d;
+    node->directives[node->n_directives].staged = false;
+    node->n_directives++;
+  }
+
+  pthread_rwlock_unlock(&llm_model_params_lock);
+}
+
+// Copy the cached directive set for (service, model_id) into out[] (up to
+// max). Returns the count copied. Takes the read lock.
+static uint32_t
+llm_model_params_lookup(const char *service, const char *model_id,
+    llm_directive_t *out, uint32_t max)
+{
+  uint32_t n = 0;
+
+  pthread_rwlock_rdlock(&llm_model_params_lock);
+
+  for(llm_model_params_t *node = llm_model_params_head; node != NULL;
+      node = node->next)
+  {
+    if(strcmp(node->service_name, service) == 0
+        && strcmp(node->model_id, model_id) == 0)
+    {
+      for(uint32_t i = 0; i < node->n_directives && n < max; i++)
+        out[n++] = node->directives[i];
+
+      break;
+    }
+  }
+
+  pthread_rwlock_unlock(&llm_model_params_lock);
+  return(n);
+}
+
+// Rebuild the directive cache from llm_model_params. Called at startup after
+// the services/models reload.
+static void
+llm_model_params_reload(void)
+{
+  db_result_t *res = db_result_alloc();
+
+  llm_model_params_clear();
+
+  if(db_query(
+      "SELECT service_name, model_id, field, action, replacement"
+      " FROM llm_model_params", res) != SUCCESS || !res->ok)
+  {
+    if(res->error[0] != '\0')
+      clam(CLAM_WARN, "llm", "model-params reload: %s", res->error);
+
+    db_result_free(res);
+    return;
+  }
+
+  for(uint32_t r = 0; r < res->rows; r++)
+  {
+    llm_directive_t d;
+    const char     *svc   = db_result_get(res, r, 0);
+    const char     *mid   = db_result_get(res, r, 1);
+    const char     *field = db_result_get(res, r, 2);
+    const char     *act   = db_result_get(res, r, 3);
+    const char     *repl  = db_result_get(res, r, 4);
+
+    memset(&d, 0, sizeof(d));
+
+    if(svc == NULL || mid == NULL || field == NULL || act == NULL)
+      continue;
+
+    snprintf(d.field, sizeof(d.field), "%s", field);
+
+    if(strcmp(act, "rename") == 0)
+    {
+      d.action = LLM_DIR_RENAME;
+      snprintf(d.replacement, sizeof(d.replacement), "%s", repl ? repl : "");
+    }
+
+    else if(strcmp(act, "drop") == 0)
+      d.action = LLM_DIR_DROP;
+
+    else
+      continue;
+
+    llm_model_params_cache_put(svc, mid, &d);
+  }
+
+  db_result_free(res);
+}
+
+// Persist one learned directive so it survives restart. INSERT ... ON
+// CONFLICT DO UPDATE, keyed by (service, model_id, field).
+static void
+llm_model_params_persist(const char *service, const char *model_id,
+    const llm_directive_t *d)
+{
+  char        *e_svc   = db_escape(service);
+  char        *e_mid   = db_escape(model_id);
+  char        *e_field = db_escape(d->field);
+  char        *e_repl  = NULL;
+  char         sql[1024];
+  db_result_t *res;
+
+  if(e_svc == NULL || e_mid == NULL || e_field == NULL)
+    goto done;
+
+  if(d->action == LLM_DIR_RENAME)
+  {
+    e_repl = db_escape(d->replacement);
+
+    if(e_repl == NULL)
+      goto done;
+
+    snprintf(sql, sizeof(sql),
+        "INSERT INTO llm_model_params"
+        " (service_name, model_id, field, action, replacement)"
+        " VALUES ('%s','%s','%s','rename','%s')"
+        " ON CONFLICT (service_name, model_id, field) DO UPDATE SET"
+        " action='rename', replacement=EXCLUDED.replacement, learned=NOW()",
+        e_svc, e_mid, e_field, e_repl);
+  }
+
+  else
+    snprintf(sql, sizeof(sql),
+        "INSERT INTO llm_model_params"
+        " (service_name, model_id, field, action, replacement)"
+        " VALUES ('%s','%s','%s','drop',NULL)"
+        " ON CONFLICT (service_name, model_id, field) DO UPDATE SET"
+        " action='drop', replacement=NULL, learned=NOW()",
+        e_svc, e_mid, e_field);
+
+  res = db_result_alloc();
+
+  if((db_query(sql, res) != SUCCESS || !res->ok) && res->error[0] != '\0')
+    clam(CLAM_WARN, "llm", "persist directive: %s", res->error);
+
+  db_result_free(res);
+
+done:
+  if(e_svc   != NULL) mem_free(e_svc);
+  if(e_mid   != NULL) mem_free(e_mid);
+  if(e_field != NULL) mem_free(e_field);
+  if(e_repl  != NULL) mem_free(e_repl);
+}
+
+// Flush every directive the request learned this run to the DB, clearing the
+// staged flag so a later delivery (should one ever recur) does not re-write.
+static void
+llm_model_params_flush_staged(llm_request_t *req)
+{
+  for(uint32_t i = 0; i < req->n_directives; i++)
+    if(req->directives[i].staged)
+    {
+      llm_model_params_persist(req->service_name, req->model_id,
+          &req->directives[i]);
+      req->directives[i].staged = false;
+    }
+}
+
 // Request body assembly
 
-// Build OpenAI-compatible chat completions body into out. Caller owns out.
+// Emit the mutable chat-params tail (temperature / max_tokens / stream) and
+// the closing brace, applying the request's learned dialect directives: a
+// DROP omits the field, a RENAME emits it under a different wire name. Keep
+// `stream` non-negotiable — providers never reject it.
+static void
+llm_append_chat_params(llm_buf_t *b, const llm_request_t *req)
+{
+  const char *wf;
+
+  if(req->params.temperature > 0.0f)
+  {
+    wf = llm_wire_field(req, "temperature");
+
+    if(wf != NULL)
+      llm_buf_printf(b, ",\"%s\":%.3f", wf, (double)req->params.temperature);
+  }
+
+  if(req->params.max_tokens > 0)
+  {
+    wf = llm_wire_field(req, "max_tokens");
+
+    if(wf != NULL)
+      llm_buf_printf(b, ",\"%s\":%u", wf, req->params.max_tokens);
+  }
+
+  if(req->params.stream)
+    llm_buf_puts(b, ",\"stream\":true");
+
+  llm_buf_putc(b, '}');
+}
+
+// Build the immutable body prefix {"model":...,"messages":[...]} into
+// req->body_prefix (through the messages-array close bracket, no params, no
+// closing brace). Retained so a negotiation retry rebuilds only the tail.
 static bool
-llm_build_chat_body(llm_request_t *req, const llm_message_t *msgs,
+llm_build_chat_prefix(llm_request_t *req, const llm_message_t *msgs,
     size_t n_msgs)
 {
   llm_buf_t b;
@@ -1121,16 +1558,31 @@ llm_build_chat_body(llm_request_t *req, const llm_message_t *msgs,
 
   llm_buf_putc(&b, ']');
 
-  if(req->params.temperature > 0.0f)
-    llm_buf_printf(&b, ",\"temperature\":%.3f", (double)req->params.temperature);
+  if(req->body_prefix != NULL)
+    mem_free(req->body_prefix);
 
-  if(req->params.max_tokens > 0)
-    llm_buf_printf(&b, ",\"max_tokens\":%u", req->params.max_tokens);
+  req->body_prefix     = b.buf;
+  req->body_prefix_len = b.len;
+  return(SUCCESS);
+}
 
-  if(req->params.stream)
-    llm_buf_puts(&b, ",\"stream\":true");
+// Compose req->req_body = body_prefix + params-tail. Called on first submit
+// and on every retry (including negotiation retries, where the directives —
+// hence the tail — may have changed). The prefix is never re-encoded.
+static bool
+llm_compose_chat_body(llm_request_t *req)
+{
+  llm_buf_t b;
 
-  llm_buf_putc(&b, '}');
+  if(req->body_prefix == NULL)
+    return(FAIL);
+
+  llm_buf_init(&b, req->body_prefix_len + 64);
+  llm_buf_append(&b, req->body_prefix, req->body_prefix_len);
+  llm_append_chat_params(&b, req);
+
+  if(req->req_body != NULL)
+    mem_free(req->req_body);
 
   req->req_body     = b.buf;
   req->req_body_len = b.len;
@@ -1475,6 +1927,12 @@ llm_deliver_chat(llm_request_t *req, bool ok, long http_status,
 {
   llm_chat_response_t resp;
 
+  // The retried request finally succeeded — persist whatever dialect
+  // directives it learned so later calls skip the negotiation round-trip.
+  // (No-op when nothing was staged, i.e. every normal request.)
+  if(ok)
+    llm_model_params_flush_staged(req);
+
   memset(&resp, 0, sizeof(resp));
   resp.request           = req;
   resp.ok                = ok;
@@ -1533,7 +1991,7 @@ llm_retry_task(task_t *t)
   llm_stat_retries++;
   pthread_mutex_unlock(&llm_stat_mutex);
 
-  // Reset per-attempt state. Keep req_body (reusable).
+  // Reset per-attempt state.
   req->http_status     = 0;
   req->errbuf[0]       = '\0';
   req->assembled_len   = 0;
@@ -1548,6 +2006,13 @@ llm_retry_task(task_t *t)
 
   if(req->sse_parser != NULL)
     sse_parser_reset(req->sse_parser);
+
+  // Rebuild the chat body tail so any directive a negotiation retry just
+  // learned applies; the messages prefix is immutable. (For a plain
+  // 429/5xx retry the directives are unchanged, so this is a cheap no-op
+  // that reproduces the same body.)
+  if(req->type == LLM_REQ_CHAT && req->body_prefix != NULL)
+    llm_compose_chat_body(req);
 
   if(llm_issue_request(req) != SUCCESS)
   {
@@ -1642,6 +2107,56 @@ llm_curl_done_cb(const curl_response_t *resp)
     else
       snprintf(req->errbuf, sizeof(req->errbuf),
           "http %ld", resp->status);
+  }
+
+  // Dialect negotiation (LLM-DIALECT-1): an OpenAI-style 400 parameter error
+  // names its own fix. Parse it off the raw body (not the truncated errbuf),
+  // learn the directive, and schedule a corrective retry with a rebuilt body.
+  // Gated to chat requests that haven't streamed any bytes.
+  if(!ok
+      && req->type == LLM_REQ_CHAT
+      && resp->status == 400
+      && resp->curl_code == 0
+      && (!req->streaming || req->bytes_seen == 0)
+      && resp->body != NULL && resp->body_len > 0
+      && util_memstr(resp->body, resp->body_len,
+             "invalid_request_error") != NULL)
+  {
+    llm_directive_t d;
+
+    if(llm_negotiate_parse(resp->body, resp->body_len, &d) == SUCCESS
+        && llm_is_builder_field(d.field)
+        && llm_directive_is_new(req, &d)
+        && req->negotiation_attempts < LLM_NEGOTIATION_CAP)
+    {
+      task_handle_t nt;
+
+      req->negotiation_attempts++;
+      d.staged = true;                 // flush to DB only if the retry succeeds
+
+      llm_req_directive_add(req, &d);  // this request's applied set
+      llm_model_params_cache_put(req->service_name, req->model_id, &d);
+
+      clam(CLAM_DEBUG, "llm",
+          "negotiate %s: %s '%s'%s%s (attempt %u/%u)",
+          req->model_name,
+          d.action == LLM_DIR_RENAME ? "rename" : "drop", d.field,
+          d.action == LLM_DIR_RENAME ? " -> " : "",
+          d.action == LLM_DIR_RENAME ? d.replacement : "",
+          req->negotiation_attempts, LLM_NEGOTIATION_CAP);
+
+      // Delay 0: this is corrective, not backoff. Get off the curl callback
+      // thread like the 429 path does.
+      nt = task_add_deferred("llm_negotiate", TASK_ANY, 50, 0,
+          llm_retry_task, req);
+
+      if(nt != TASK_HANDLE_NONE)
+        return;
+
+      // Scheduling failed — fall through to deliver the failure.
+      snprintf(req->errbuf, sizeof(req->errbuf),
+          "negotiation retry scheduling failed");
+    }
   }
 
   // Retry logic: only for failures, non-streaming (or streaming with no
@@ -1825,6 +2340,13 @@ llm_chat_submit(const char *model_name,
 
   snprintf(req->api_key_kv, sizeof(req->api_key_kv),
       "llm.service.%s.apikey", m.service_name);
+  snprintf(req->service_name, sizeof(req->service_name), "%s", m.service_name);
+
+  // Seed any learned request-dialect directives so the very first body for a
+  // known-quirky model is already correct (no negotiation round-trip).
+  req->n_directives = llm_model_params_lookup(m.service_name, m.model_id,
+      req->directives, LLM_MAX_DIRECTIVES);
+
   req->kind         = m.kind;
   req->params       = *params;
   req->chat_done_cb = done_cb;
@@ -1837,7 +2359,8 @@ llm_chat_submit(const char *model_name,
 
   llm_clam_prompt_chat(model_name, &req->params, messages, n_messages);
 
-  if(llm_build_chat_body(req, messages, n_messages) != SUCCESS)
+  if(llm_build_chat_prefix(req, messages, n_messages) != SUCCESS
+      || llm_compose_chat_body(req) != SUCCESS)
   {
     llm_req_release(req);
     return(FAIL);
@@ -2040,6 +2563,7 @@ llm_init(void)
   pthread_mutex_init(&llm_stat_mutex, NULL);
   pthread_rwlock_init(&llm_models_lock, NULL);
   pthread_rwlock_init(&llm_services_lock, NULL);
+  pthread_rwlock_init(&llm_model_params_lock, NULL);
 
   llm_cfg.max_retries        = LLM_DEF_MAX_RETRIES;
   llm_cfg.retry_backoff_ms   = LLM_DEF_RETRY_BACKOFF_MS;
@@ -2060,6 +2584,7 @@ llm_register_config(void)
   llm_ensure_tables();
   llm_services_reload();
   llm_models_reload();
+  llm_model_params_reload();
 
   // Warm each service's /models cache (best-effort, async). Safe here:
   // curl started with the plugin, and a failure just leaves the cache
@@ -2098,6 +2623,7 @@ llm_exit(void)
     llm_request_t *r = llm_req_free;
     llm_req_free = r->next_free;
 
+    if(r->body_prefix != NULL) mem_free(r->body_prefix);
     if(r->req_body   != NULL) mem_free(r->req_body);
     if(r->assembled  != NULL) mem_free(r->assembled);
     if(r->vec_block  != NULL) mem_free(r->vec_block);
@@ -2111,12 +2637,14 @@ llm_exit(void)
 
   llm_models_clear();
   llm_services_clear();
+  llm_model_params_clear();
 
   pthread_mutex_destroy(&llm_req_mutex);
   pthread_mutex_destroy(&llm_active_mutex);
   pthread_mutex_destroy(&llm_stat_mutex);
   pthread_rwlock_destroy(&llm_models_lock);
   pthread_rwlock_destroy(&llm_services_lock);
+  pthread_rwlock_destroy(&llm_model_params_lock);
 
   clam(CLAM_INFO, "llm", "llm subsystem shut down");
 }
