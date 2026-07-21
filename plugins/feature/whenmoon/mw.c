@@ -1581,6 +1581,49 @@ mw_init(void)
   return(SUCCESS);
 }
 
+// Per-exchange KV registration table, one row per key tail. Help
+// strings MUST be literals: kv_register stores the help pointer
+// without copying (kv.h "static / caller-owned"), so a transient
+// buffer dangles once the registering frame returns (WM-MW-HELP-1).
+// The exchange name is deliberately absent from the help text — the
+// key being described already carries it.
+typedef struct
+{
+  const char *tail;
+  kv_type_t   type;
+  const char *help;
+} mw_exch_kv_t;
+
+static const mw_exch_kv_t mw_exch_kvs[] =
+{
+  { "enabled",             KV_UINT32,
+    "Per-exchange marketwatch enable (0/1)." },
+  { "poll_sec",            KV_UINT32,
+    "Per-exchange marketwatch poll cadence (s)"
+    " (0 = MW_POLL_SEC_DEFAULT)." },
+  { "pct_24h_thresh_x100", KV_UINT32,
+    "MW: 24h-pct threshold, encoded % × 100"
+    " (0 = MW_PCT_24H_THRESH_DEFAULT)." },
+  { "vel_pct_thresh_x100", KV_UINT32,
+    "MW: velocity threshold, encoded % × 100"
+    " (0 = MW_VEL_PCT_THRESH_DEFAULT)." },
+  { "vol_z_thresh_x100",   KV_UINT32,
+    "MW: volume z-score threshold, sigma × 100 (300 = 3.00 sigma)."
+    " One-sided (positive z only). 0 = MW_VOL_Z_THRESH_DEFAULT." },
+  { "vel_window_min",      KV_UINT32,
+    "MW: velocity walk-back window (minutes)"
+    " (0 = MW_VEL_WINDOW_MIN_DEFAULT)." },
+  { "min_vol_usd",         KV_UINT64,
+    "MW: 24h quote-vol floor (USD) for HOT entry"
+    " (unset = MW_MIN_VOL_USD_DEFAULT; 0 disables the gate)." },
+  { "cooldown_sec",        KV_UINT32,
+    "MW: minimum HOT dwell + COOL latch (s)"
+    " (0 = MW_COOLDOWN_SEC_DEFAULT)." },
+  { "upd_throttle_sec",    KV_UINT32,
+    "MW: minimum interval (s) between UPD re-emits on still-HOT pairs"
+    " (0 = MW_UPD_THROTTLE_SEC_DEFAULT)." },
+};
+
 bool
 mw_start(void)
 {
@@ -1618,7 +1661,7 @@ mw_start(void)
   {
     mw_exch_t *ex = &mw_g.exch[mw_g.n_exch];
     char       key[MW_KV_KEY_SZ];
-    char       help[160];
+    size_t     k;
 
     memset(ex, 0, sizeof(*ex));
     snprintf(ex->name, sizeof(ex->name), "%s", names[i]);
@@ -1630,93 +1673,25 @@ mw_start(void)
       continue;
     }
 
-    // Per-exchange KV registration. Keys are stable strings owned by
-    // a single mw_kv_key fill; kv_register copies them internally.
-    // A non-SUCCESS return here means the key was already registered
-    // (e.g. on a re-entry); the persisted value still applies, so we
-    // just continue past with a DBG note.
-    mw_kv_key(key, sizeof(key), ex->name, "enabled");
-    snprintf(help, sizeof(help),
-        "Per-exchange marketwatch enable for %s (0/1).", ex->name);
+    // Per-exchange KV registration, table-driven. Keys are copied by
+    // kv_register; help pointers are NOT — the table's literals keep
+    // them alive for the process lifetime (WM-MW-HELP-1). MW-3
+    // detector thresholds share the `0 → default` convention except
+    // min_vol_usd, where 0 is a valid operator-set "no floor" (see
+    // mw_load_detector_thresholds). A non-SUCCESS return means the
+    // key was already registered (e.g. on a re-entry); the persisted
+    // value still applies, so continue past with a DBG note.
+    for(k = 0; k < sizeof(mw_exch_kvs) / sizeof(mw_exch_kvs[0]); k++)
+    {
+      const mw_exch_kv_t *reg = &mw_exch_kvs[k];
 
-    if(kv_register(key, KV_UINT32, "0", NULL, NULL, help) != SUCCESS)
-      clam(CLAM_DEBUG, MW_CTX,
-          "%s: kv_register .enabled already present", ex->name);
+      mw_kv_key(key, sizeof(key), ex->name, reg->tail);
 
-    mw_kv_key(key, sizeof(key), ex->name, "poll_sec");
-    snprintf(help, sizeof(help),
-        "Per-exchange marketwatch poll cadence (s) for %s"
-        " (0 = MW_POLL_SEC_DEFAULT).", ex->name);
-
-    if(kv_register(key, KV_UINT32, "0", NULL, NULL, help) != SUCCESS)
-      clam(CLAM_DEBUG, MW_CTX,
-          "%s: kv_register .poll_sec already present", ex->name);
-
-    // MW-3: per-exchange detector thresholds. Same `0 → default`
-    // convention as poll_sec, except min_vol_usd where 0 is a valid
-    // operator-set value meaning "no floor" (see
-    // mw_load_detector_thresholds for the distinction).
-    mw_kv_key(key, sizeof(key), ex->name, "pct_24h_thresh_x100");
-    snprintf(help, sizeof(help),
-        "MW: 24h-pct threshold for %s, encoded %% × 100"
-        " (0 = MW_PCT_24H_THRESH_DEFAULT).", ex->name);
-    if(kv_register(key, KV_UINT32, "0", NULL, NULL, help) != SUCCESS)
-      clam(CLAM_DEBUG, MW_CTX,
-          "%s: kv_register .pct_24h_thresh_x100 already present",
-          ex->name);
-
-    mw_kv_key(key, sizeof(key), ex->name, "vel_pct_thresh_x100");
-    snprintf(help, sizeof(help),
-        "MW: velocity threshold for %s, encoded %% × 100"
-        " (0 = MW_VEL_PCT_THRESH_DEFAULT).", ex->name);
-    if(kv_register(key, KV_UINT32, "0", NULL, NULL, help) != SUCCESS)
-      clam(CLAM_DEBUG, MW_CTX,
-          "%s: kv_register .vel_pct_thresh_x100 already present",
-          ex->name);
-
-    mw_kv_key(key, sizeof(key), ex->name, "vol_z_thresh_x100");
-    snprintf(help, sizeof(help),
-        "MW: volume z-score threshold for %s, sigma × 100"
-        " (300 = 3.00 sigma). One-sided (positive z only)."
-        " 0 = MW_VOL_Z_THRESH_DEFAULT.", ex->name);
-    if(kv_register(key, KV_UINT32, "0", NULL, NULL, help) != SUCCESS)
-      clam(CLAM_DEBUG, MW_CTX,
-          "%s: kv_register .vol_z_thresh_x100 already present",
-          ex->name);
-
-    mw_kv_key(key, sizeof(key), ex->name, "vel_window_min");
-    snprintf(help, sizeof(help),
-        "MW: velocity walk-back window (minutes) for %s"
-        " (0 = MW_VEL_WINDOW_MIN_DEFAULT).", ex->name);
-    if(kv_register(key, KV_UINT32, "0", NULL, NULL, help) != SUCCESS)
-      clam(CLAM_DEBUG, MW_CTX,
-          "%s: kv_register .vel_window_min already present", ex->name);
-
-    mw_kv_key(key, sizeof(key), ex->name, "min_vol_usd");
-    snprintf(help, sizeof(help),
-        "MW: 24h quote-vol floor (USD) for HOT entry on %s"
-        " (unset = MW_MIN_VOL_USD_DEFAULT; 0 disables the gate).",
-        ex->name);
-    if(kv_register(key, KV_UINT64, "0", NULL, NULL, help) != SUCCESS)
-      clam(CLAM_DEBUG, MW_CTX,
-          "%s: kv_register .min_vol_usd already present", ex->name);
-
-    mw_kv_key(key, sizeof(key), ex->name, "cooldown_sec");
-    snprintf(help, sizeof(help),
-        "MW: minimum HOT dwell + COOL latch (s) for %s"
-        " (0 = MW_COOLDOWN_SEC_DEFAULT).", ex->name);
-    if(kv_register(key, KV_UINT32, "0", NULL, NULL, help) != SUCCESS)
-      clam(CLAM_DEBUG, MW_CTX,
-          "%s: kv_register .cooldown_sec already present", ex->name);
-
-    mw_kv_key(key, sizeof(key), ex->name, "upd_throttle_sec");
-    snprintf(help, sizeof(help),
-        "MW: minimum interval (s) between UPD re-emits on still-HOT"
-        " pairs for %s (0 = MW_UPD_THROTTLE_SEC_DEFAULT).", ex->name);
-    if(kv_register(key, KV_UINT32, "0", NULL, NULL, help) != SUCCESS)
-      clam(CLAM_DEBUG, MW_CTX,
-          "%s: kv_register .upd_throttle_sec already present",
-          ex->name);
+      if(kv_register(key, reg->type, "0", NULL, NULL,
+            reg->help) != SUCCESS)
+        clam(CLAM_DEBUG, MW_CTX,
+            "%s: kv_register .%s already present", ex->name, reg->tail);
+    }
 
     // Read persisted values back.
     mw_kv_key(key, sizeof(key), ex->name, "enabled");
