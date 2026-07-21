@@ -24,6 +24,7 @@
 #define ASK_CMD_CTX        "ask"
 #define ASK_CMD_REPLY_SZ   640
 #define ASK_PREPEND_SZ     4096   // cap on prepend-file system-prompt bytes
+#define ASK_WRAP_COLS      100    // soft word-wrap width for IRC readability
 
 // Per-call closure carrying the saved command context through the async
 // llm_chat_submit callback. The context's msg pointer is rebound to the

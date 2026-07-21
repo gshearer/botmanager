@@ -626,6 +626,19 @@ llm_services_reload(void)
     // are no longer per-service KVs: they are learned per (service, model_id)
     // and stored in llm_model_params. See LLM-DIALECT-1.
 
+    // Optional per-service 'reasoning_effort' knob (RSN-1). Thinking-first
+    // providers (e.g. Gemini) bill hidden reasoning against max_tokens; set
+    // this to 'none' so a terse !ask budget funds the answer, not the
+    // reasoning. Empty = omit the field (byte-identical request as before).
+    snprintf(key, sizeof(key), "llm.service.%s.reasoning_effort", s.name);
+
+    if(!kv_exists(key))
+      kv_register(key, KV_STR, "", NULL, NULL,
+          "Optional OpenAI-compat 'reasoning_effort' sent on every chat"
+          " request to this service (none|low|medium|high). Empty = omit."
+          " Set 'none' for thinking models (e.g. Gemini) so the token"
+          " budget funds the answer, not hidden reasoning.");
+
     llm_services_upsert(&s);
   }
 
@@ -1478,6 +1491,21 @@ llm_append_chat_params(llm_buf_t *b, const llm_request_t *req)
       llm_buf_printf(b, ",\"%s\":%u", wf, req->params.max_tokens);
   }
 
+  // Optional per-service reasoning_effort (RSN-1). Read fresh per request so
+  // an operator can retune without a restart. Kept in the params tail so a
+  // DIALECT-1 negotiation retry (which rebuilds only the tail) preserves it.
+  {
+    char        rkey[LLM_KV_KEY_SZ];
+    const char *reff;
+
+    snprintf(rkey, sizeof(rkey), "llm.service.%s.reasoning_effort",
+        req->service_name);
+    reff = kv_get_str(rkey);
+
+    if(reff != NULL && reff[0] != '\0')
+      llm_buf_printf(b, ",\"reasoning_effort\":\"%s\"", reff);
+  }
+
   if(req->params.stream)
     llm_buf_puts(b, ",\"stream\":true");
 
@@ -2090,13 +2118,21 @@ llm_curl_done_cb(const curl_response_t *resp)
       snprintf(req->errbuf, sizeof(req->errbuf), "%s", resp->error);
     else if(resp->body != NULL && resp->body[0] != '\0')
     {
-      // Capture a prefix of the server's response body alongside the
-      // status — OpenAI-compat endpoints (vLLM, TEI, etc.) put the
-      // real reason for a 4xx inside the body, and `"http 400"` on
-      // its own tells us nothing. 180 bytes of the body fits under
-      // LLM_ERR_SZ (256) with the status prefix.
-      snprintf(req->errbuf, sizeof(req->errbuf),
-          "http %ld: %.180s", resp->status, resp->body);
+      char msg[LLM_ERR_SZ];
+
+      // Providers wrap the real reason in {"error":{"message":"..."}}
+      // (OpenAI-compat endpoints and Gemini, sometimes array-wrapped).
+      // Surface that human-readable message rather than dumping raw JSON
+      // downstream (it reaches users via e.g. the !ask reply). Fall back
+      // to a body prefix when the shape is unexpected. Parse off
+      // resp->body, not errbuf — DIALECT-1 below still needs the raw body.
+      if(llm_extract_str(resp->body, resp->body_len, "\"message\"",
+             msg, sizeof(msg)) > 0)
+        snprintf(req->errbuf, sizeof(req->errbuf), "http %ld: %.200s",
+            resp->status, msg);
+      else
+        snprintf(req->errbuf, sizeof(req->errbuf),
+            "http %ld: %.180s", resp->status, resp->body);
 
       // Collapse newlines / CRs so the error reads as a single log
       // line (vLLM pretty-prints JSON errors with \n).

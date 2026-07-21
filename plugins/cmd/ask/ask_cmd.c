@@ -38,13 +38,15 @@ static const plugin_kv_entry_t ask_kv_schema[] = {
   { "plugin.ask.allow",      KV_STR,    "*",
     "Absolute allowlist of exposable chat-model names ('*' = all enabled);"
     " bot / protocol tiers may only narrow this" },
-  { "plugin.ask.max_tokens", KV_UINT32, "512",
+  { "plugin.ask.max_tokens", KV_UINT32, "1024",
     "Hard ceiling on max_tokens per !ask; bot / protocol tiers may only"
     " lower it" },
-  { "plugin.ask.max_lines",  KV_UINT32, "6",
+  { "plugin.ask.max_lines",  KV_UINT32, "30",
     "Hard ceiling on reply lines per answer (flood guard); bot / protocol"
     " tiers may only lower it" },
-  { "plugin.ask.prompt_prepend_file", KV_STR, "prompts/ask_default.txt",
+  // Path is relative to the daemon CWD (build/), so reach up to the
+  // project-root prompts/ dir; bot / protocol tiers may override.
+  { "plugin.ask.prompt_prepend_file", KV_STR, "../prompts/ask_default.txt",
     "Path to a .txt file whose contents are prepended (as a system prompt)"
     " to every !ask query; bot / protocol tiers may override" },
 };
@@ -436,7 +438,8 @@ ask_done(const llm_chat_response_t *resp)
   char        line[ASK_CMD_REPLY_SZ];
   const char *p;
   uint32_t    max_lines;
-  uint32_t    emitted = 0;
+  uint32_t    emitted      = 0;
+  bool        flood_capped = false;
 
   ctx     = r->ctx;
   ctx.msg = &r->msg;
@@ -454,26 +457,56 @@ ask_done(const llm_chat_response_t *resp)
   if(max_lines == 0)
     max_lines = 1;
 
-  for(p = resp->content; p != NULL && *p != '\0'; )
+  for(p = resp->content; p != NULL && *p != '\0' && !flood_capped; )
   {
     const char *nl  = strchr(p, '\n');
     size_t      seg = (nl != NULL) ? (size_t)(nl - p) : strlen(p);
+    size_t      off;
 
     // Strip a trailing CR (provider CRLF).
     if(seg > 0 && p[seg - 1] == '\r')
       seg--;
 
-    if(seg > 0)
+    // Word-wrap the logical line to ASK_WRAP_COLS so a long model line
+    // becomes several readable IRC lines, each counting toward the flood
+    // cap. An empty line (seg == 0) is skipped by the loop condition.
+    for(off = 0; off < seg && !flood_capped; )
     {
+      size_t take = seg - off;
+
+      if(take > ASK_WRAP_COLS)
+      {
+        size_t brk = ASK_WRAP_COLS;
+
+        // Prefer the last space in the column window; hard-break a single
+        // over-long word when there is none.
+        while(brk > 0 && p[off + brk] != ' ')
+          brk--;
+
+        take = (brk > 0) ? brk : ASK_WRAP_COLS;
+      }
+
+      // Never split a UTF-8 multibyte sequence on a hard break: back off
+      // while the byte at the break point is a continuation byte.
+      while(take > 1 && ((unsigned char)p[off + take] & 0xC0) == 0x80)
+        take--;
+
       if(emitted >= max_lines)
       {
         cmd_reply(&ctx, "…(truncated)");
+        flood_capped = true;
         break;
       }
 
-      snprintf(line, sizeof(line), "%.*s", (int)seg, p);
+      snprintf(line, sizeof(line), "%.*s", (int)take, p + off);
       cmd_reply(&ctx, line);
       emitted++;
+
+      off += take;
+
+      // Skip whitespace we broke on so the next line has no leading space.
+      while(off < seg && p[off] == ' ')
+        off++;
     }
 
     if(nl == NULL)
@@ -481,6 +514,15 @@ ask_done(const llm_chat_response_t *resp)
 
     p = nl + 1;
   }
+
+  // The model stopped because it hit its token ceiling, not because the
+  // answer was complete: signal it so the user can tell a short answer from
+  // a guillotined one. Skip when we already cut the reply for IRC flood
+  // (that path prints its own "…(truncated)" — a different cause).
+  if(!flood_capped && resp->finish_reason != NULL
+      && strcasecmp(resp->finish_reason, "length") == 0)
+    cmd_reply(&ctx, "⋯ (answer cut off at the model's token limit — ask a"
+        " narrower question or raise plugin.ask.max_tokens)");
 
   mem_free(r);
 }
