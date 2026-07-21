@@ -588,13 +588,38 @@ ask_cmd_handler(const cmd_ctx_t *ctx)
   }
 }
 
-// Per-model visitor for !show ask. Renders one row per enabled chat
-// model the calling bot may reach, starring the default.
+// Per-model visitor for !show ask. Collects one row per enabled chat
+// model the calling bot may reach; show_ask_handler emits them as an
+// aligned, colorized table, starring the default.
+
+#define ASK_SHOW_MAX_ROWS 64
+#define ASK_SHOW_FIELD_SZ 96
+
+typedef struct
+{
+  char name[ASK_SHOW_FIELD_SZ];      // arbitrary model name
+  char service[ASK_SHOW_FIELD_SZ];   // arbitrary service name
+  char model_id[ASK_SHOW_FIELD_SZ];  // full underlying model id
+  bool is_def;
+} ask_show_row_t;
+
 typedef struct
 {
   const cmd_ctx_t   *ctx;
   const ask_scope_t *scope;
+  ask_show_row_t     rows[ASK_SHOW_MAX_ROWS];
+  size_t             n_rows;
 } ask_show_state_t;
+
+static void
+ask_field_copy(char *dst, size_t dst_sz, const char *src)
+{
+  if(src == NULL)
+    src = "";
+
+  strncpy(dst, src, dst_sz - 1);
+  dst[dst_sz - 1] = '\0';
+}
 
 static void
 ask_show_model_cb(const char *name, llm_kind_t kind,
@@ -603,10 +628,8 @@ ask_show_model_cb(const char *name, llm_kind_t kind,
     bool enabled, void *user)
 {
   ask_show_state_t *s = (ask_show_state_t *)user;
-  char              line[ASK_CMD_REPLY_SZ];
-  bool              is_def;
+  ask_show_row_t   *r;
 
-  (void)model_id;
   (void)embed_dim;
   (void)max_context;
   (void)default_temp;
@@ -617,14 +640,66 @@ ask_show_model_cb(const char *name, llm_kind_t kind,
   if(!ask_model_ok(name, s->scope))
     return;
 
-  is_def = (s->scope->def_model != NULL &&
-            strcasecmp(name, s->scope->def_model) == 0);
+  if(s->n_rows >= ASK_SHOW_MAX_ROWS)
+    return;
 
-  snprintf(line, sizeof(line), "  %s %s  " CLR_GRAY "%s" CLR_RESET "%s",
-      is_def ? CLR_YELLOW "★" CLR_RESET : "  ",
-      name, service_name,
-      is_def ? "  " CLR_GRAY "(default)" CLR_RESET : "");
-  cmd_reply(s->ctx, line);
+  r = &s->rows[s->n_rows++];
+
+  ask_field_copy(r->name, sizeof(r->name), name);
+  ask_field_copy(r->service, sizeof(r->service), service_name);
+  ask_field_copy(r->model_id, sizeof(r->model_id), model_id);
+
+  r->is_def = (s->scope->def_model != NULL &&
+               strcasecmp(name, s->scope->def_model) == 0);
+}
+
+static void
+show_ask_emit(const ask_show_state_t *s)
+{
+  const cmd_ctx_t *ctx    = s->ctx;
+  size_t           w_svc  = strlen("service");
+  size_t           w_name = strlen("model");
+  char             line[ASK_CMD_REPLY_SZ];
+
+  if(s->n_rows == 0)
+  {
+    cmd_reply(ctx, "  " CLR_GRAY "(no models available here)" CLR_RESET);
+    return;
+  }
+
+  // Widen columns to the longest cell (header labels included).
+  for(size_t i = 0; i < s->n_rows; i++)
+  {
+    size_t l;
+
+    l = strlen(s->rows[i].service);
+    if(l > w_svc)
+      w_svc = l;
+
+    l = strlen(s->rows[i].name);
+    if(l > w_name)
+      w_name = l;
+  }
+
+  // Header row (three leading spaces align past the star column).
+  snprintf(line, sizeof(line),
+      "   " CLR_BOLD "%-*s  %-*s  %s" CLR_RESET,
+      (int)w_svc, "service", (int)w_name, "model", "model id");
+  cmd_reply(ctx, line);
+
+  for(size_t i = 0; i < s->n_rows; i++)
+  {
+    const ask_show_row_t *r = &s->rows[i];
+
+    snprintf(line, sizeof(line),
+        " %s " CLR_CYAN "%-*s" CLR_RESET "  " CLR_WHITE "%-*s" CLR_RESET
+        "  " CLR_GRAY "%s" CLR_RESET,
+        r->is_def ? CLR_YELLOW "★" CLR_RESET : " ",
+        (int)w_svc, r->service,
+        (int)w_name, r->name,
+        r->model_id);
+    cmd_reply(ctx, line);
+  }
 }
 
 static void
@@ -639,12 +714,13 @@ show_ask_handler(const cmd_ctx_t *ctx)
   proto    = ask_proto(ctx);
   ask_scope_resolve(bot_name, proto, &scope);
 
-  s.ctx   = ctx;
-  s.scope = &scope;
+  s.ctx    = ctx;
+  s.scope  = &scope;
+  s.n_rows = 0;
 
   cmd_reply(ctx, CLR_BOLD "ask" CLR_RESET "  ·  models available here");
   llm_model_iterate(ask_show_model_cb, &s);
-  cmd_reply(ctx, "  -m <model> to pick · answers are one-shot, no memory");
+  show_ask_emit(&s);
 }
 
 // -----------------------------------------------------------------------
