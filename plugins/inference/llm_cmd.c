@@ -719,6 +719,15 @@ cmd_llm_del_service(const cmd_ctx_t *ctx)
     return;
   }
 
+  if(res->rows_affected == 0)
+  {
+    char emsg[128];
+    snprintf(emsg, sizeof(emsg), "no such service: %s", name);
+    cmd_reply(ctx, emsg);
+    db_result_free(res);
+    return;
+  }
+
   db_result_free(res);
   llm_services_reload();
   cmd_reply(ctx, "ok");
@@ -871,6 +880,7 @@ cmd_llm_add_model(const cmd_ctx_t *ctx)
 static void
 cmd_llm_del_model(const cmd_ctx_t *ctx)
 {
+  const char  *name;
   char        *e_name;
   db_result_t *res;
   char         sql[256];
@@ -880,7 +890,8 @@ cmd_llm_del_model(const cmd_ctx_t *ctx)
     return;
   }
 
-  e_name = db_escape(ctx->parsed->argv[0]);
+  name   = ctx->parsed->argv[0];
+  e_name = db_escape(name);
   snprintf(sql, sizeof(sql),
       "DELETE FROM llm_models WHERE name='%s'", e_name);
   mem_free(e_name);
@@ -891,6 +902,18 @@ cmd_llm_del_model(const cmd_ctx_t *ctx)
   {
     char emsg[512];
     snprintf(emsg, sizeof(emsg), "delete failed: %s", res->error);
+    cmd_reply(ctx, emsg);
+    db_result_free(res);
+    return;
+  }
+
+  // A DELETE that matched nothing still "succeeds" — report it instead of
+  // a misleading "ok" (e.g. `llm del model chat g4nv` deletes name='chat',
+  // not the model, because del takes just <name> unlike add's typed form).
+  if(res->rows_affected == 0)
+  {
+    char emsg[128];
+    snprintf(emsg, sizeof(emsg), "no such model: %s", name);
     cmd_reply(ctx, emsg);
     db_result_free(res);
     return;
