@@ -274,6 +274,7 @@ main(int argc, char *argv[])
   // Administrative commands (set, show, status, quit, user, bot).
   cmd_show_register();
   cmd_set_register();
+  cmd_db_register();
   cmd_misc_register();
   userns_register_commands();
   bot_register_commands();

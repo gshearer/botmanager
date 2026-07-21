@@ -1182,6 +1182,69 @@ kv_delete_prefix(const char *prefix)
   return(deleted);
 }
 
+// Delete exactly ONE key from the live registry and its persisted row.
+// Unlike kv_delete_prefix this matches the whole key, so a janitor can
+// drop a single orphan without nuking a namespace. The DB DELETE is issued
+// unconditionally (harmless 0-row when the key was never persisted), which
+// also lets a DB-only orphan be swept even if it isn't in memory. Returns
+// true iff a live in-memory entry was removed.
+bool
+kv_delete(const char *key)
+{
+  uint32_t    bucket;
+  kv_entry_t *e;
+  kv_entry_t *prev = NULL;
+  bool        found = false;
+
+  if(key == NULL || key[0] == '\0')
+    return(false);
+
+  pthread_mutex_lock(&kv_mutex);
+
+  bucket = hash_key(key);
+
+  for(e = kv_table[bucket]; e != NULL; prev = e, e = e->next)
+  {
+    if(strcmp(e->key, key) == 0)
+    {
+      if(prev != NULL)
+        prev->next = e->next;
+      else
+        kv_table[bucket] = e->next;
+
+      mem_free(e);
+      kv_count--;
+      found = true;
+      break;
+    }
+  }
+
+  pthread_mutex_unlock(&kv_mutex);
+
+  // Drop the persisted row (exact match), whether or not it was live.
+  {
+    char *esc = db_escape(key);
+
+    if(esc != NULL)
+    {
+      char         sql[KV_KEY_SZ + 64];
+      db_result_t *r;
+
+      snprintf(sql, sizeof(sql), "DELETE FROM kv WHERE key = '%s'", esc);
+      mem_free(esc);
+
+      r = db_result_alloc();
+      db_query(sql, r);
+      db_result_free(r);
+    }
+  }
+
+  if(found)
+    clam(CLAM_INFO, "kv_delete", "deleted key '%s'", key);
+
+  return(found);
+}
+
 // Drop the NL responder attached to `key`, if any. Internal helper —
 // callers must NOT hold kv_nl_mutex. Returns true if one was removed.
 static bool

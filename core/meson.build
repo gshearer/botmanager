@@ -1,6 +1,7 @@
 # Sources for the core static library (everything except main.c).
 libcore_sources = [
   'bot_cmd.c',
+  'cmd_db.c',
   'cmd_misc.c',
   'cmd_set.c',
   'cmd_show.c',

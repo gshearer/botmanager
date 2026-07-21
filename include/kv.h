@@ -102,6 +102,12 @@ uint32_t kv_iterate_prefix(const char *prefix, kv_iter_cb_t cb, void *data);
 // the number of entries deleted.
 uint32_t kv_delete_prefix(const char *prefix);
 
+// Delete exactly one key (whole-key match) from the live registry and its
+// persisted row. The DB row is dropped unconditionally, so a DB-only orphan
+// is swept even when it isn't in memory. Returns true iff a live in-memory
+// entry was removed. Intended for admin janitoring (see /db delete kv).
+bool kv_delete(const char *key);
+
 // In-memory removal of a registered KV entry — drops the kv_entry_t
 // (including its cached cb pointer, cb_data, and help pointer, all of
 // which may live in plugin .text/.rodata) and any attached NL

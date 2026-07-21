@@ -345,6 +345,9 @@ void cmd_show_register(void);
 // Must be called after cmd_init().
 void cmd_set_register(void);
 
+// Must be called after cmd_init(). Registers the /db admin janitoring tree.
+void cmd_db_register(void);
+
 // Unregisters all commands and frees all per-bot prefix sets.
 void cmd_exit(void);
 
