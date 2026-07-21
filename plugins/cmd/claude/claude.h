@@ -6,7 +6,8 @@
 // method (IRC channel, DM, or botmanctl socket).
 //
 // Each invocation prepends the contents of plugin.claude.preamble_path
-// (default: `prompt.txt` at the project root) to the user's prompt.
+// (default: `prompts/claude_builtin.txt` at the project root) to the
+// user's prompt.
 // The preamble explains the invocation context to Claude and
 // instructs it to call `scripts/botman-restart.sh` when a daemon
 // restart is required. The plugin itself no longer matches a
@@ -84,10 +85,10 @@ static const plugin_kv_entry_t claude_kv_schema[] = {
     NULL },
   { "plugin.claude.cwd", KV_STR, "",
     "Working directory for the claude subprocess (empty = inherit parent)."
-    " Must be the project root so the CLI can find prompt.txt, the"
-    " scripts/ helpers, and the build tree.",
+    " Must be the project root so the CLI can find the preamble under"
+    " prompts/, the scripts/ helpers, and the build tree.",
     NULL },
-  { "plugin.claude.preamble_path", KV_STR, "prompt.txt",
+  { "plugin.claude.preamble_path", KV_STR, "prompts/claude_builtin.txt",
     "Path to the preamble file prepended to every /claude prompt."
     " Relative paths resolve against plugin.claude.cwd. Empty value"
     " disables the preamble entirely.",

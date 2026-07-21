@@ -564,7 +564,8 @@ claude_load_session(claude_session_t *s)
   snprintf(s->model,         sizeof(s->model),         "%s", "claude-opus-4-8");
   snprintf(s->effort,        sizeof(s->effort),        "%s", "medium");
   s->cwd[0] = '\0';
-  snprintf(s->preamble_path, sizeof(s->preamble_path), "%s", "prompt.txt");
+  snprintf(s->preamble_path, sizeof(s->preamble_path), "%s",
+      "prompts/claude_builtin.txt");
   snprintf(s->bctl_rel,      sizeof(s->bctl_rel),      "%s",
       "build/tools/botmanctl");
 
@@ -872,7 +873,7 @@ claude_init(void)
       "Run the claude CLI with <prompt>, reply with its stdout",
       "Owner-only bridge to the claude CLI. The prompt is prefixed"
       " by the preamble at plugin.claude.preamble_path (default:"
-      " prompt.txt in the project root) and passed as"
+      " prompts/claude_builtin.txt in the project root) and passed as"
       " `claude -p <preamble+prompt>`. Captured stdout replies on"
       " the originating method (IRC channel, DM, or botmanctl).\n"
       "\n"
