@@ -24,7 +24,12 @@ subdir('service/openweather')
 subdir('service/coinmarketcap')
 subdir('service/searxng')
 subdir('cmd/ask')
-subdir('cmd/imagine')
+# imagine_cmd is dormant: it registers the same 'imagine' command as
+# imagine_zimage, so loading both aborts startup (duplicate command).
+# Kept in-tree; re-enable this line (and remove imagine_zimage) once an
+# OpenAI-compatible Linux/CUDA image backend lands. See project memory
+# IMAGE-GEN-1 / imagine_zimage pivot (2026-07-22).
+# subdir('cmd/imagine')
 subdir('cmd/imagine_zimage')
 subdir('cmd/claude')
 subdir('cmd/crypto')
