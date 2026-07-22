@@ -153,10 +153,18 @@ searxng_cmd_done(const sxng_response_t *resp)
   {
     const sxng_result_t *rr = &resp->results[i];
 
-    // Default (concise) mode: just the URL, one per line.
+    // Default (concise) mode: just the URL, one per line. For image
+    // results the SearXNG `url` field is the web page hosting the image,
+    // not the image itself — prefer the direct `img_src` link so !image
+    // returns something viewable. Fall back to the page URL if a result
+    // carries no img_src.
     if(!r->verbose)
     {
-      snprintf(line, sizeof(line), "%.*s", SXNG_CMD_LINE_BODY, rr->url);
+      const char *link =
+          (rr->category == SXNG_CAT_IMAGES && rr->extras.image.src[0] != '\0')
+              ? rr->extras.image.src : rr->url;
+
+      snprintf(line, sizeof(line), "%.*s", SXNG_CMD_LINE_BODY, link);
       cmd_reply(&ctx, line);
       continue;
     }
