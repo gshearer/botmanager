@@ -38,12 +38,13 @@ static const plugin_kv_entry_t iz_kv_schema[] = {
 // the queue via iz_pump — the same "callback pumps the next" shape the old
 // quotebot used, made thread-safe for this heavily-threaded daemon.
 
-static pthread_mutex_t iz_lock   = PTHREAD_MUTEX_INITIALIZER;
-static iz_req_t       *iz_head   = NULL;   // FIFO front (next to submit)
-static iz_req_t       *iz_tail   = NULL;
-static bool            iz_active = false;  // a request is in flight
-static uint32_t        iz_depth  = 0;      // queued, excluding the in-flight one
-static uint32_t        iz_id_seq = 0;      // monotonic request id
+static pthread_mutex_t iz_lock    = PTHREAD_MUTEX_INITIALIZER;
+static iz_req_t       *iz_head    = NULL;   // FIFO front (next to submit)
+static iz_req_t       *iz_tail    = NULL;
+static iz_req_t       *iz_current = NULL;   // the in-flight request, for !show
+static bool            iz_active  = false;  // a request is in flight
+static uint32_t        iz_depth   = 0;      // queued, excluding the in-flight one
+static uint32_t        iz_id_seq  = 0;      // monotonic request id
 
 static void iz_pump(void);
 static void iz_done(const curl_response_t *resp);
@@ -219,6 +220,15 @@ iz_done(const curl_response_t *resp)
   }
 
 done:
+  // r is leaving flight. Clear the display pointer before freeing so a
+  // concurrent !show never dereferences it; iz_pump installs the next one.
+  pthread_mutex_lock(&iz_lock);
+
+  if(iz_current == r)
+    iz_current = NULL;
+
+  pthread_mutex_unlock(&iz_lock);
+
   mem_free(r);
   iz_pump();
 }
@@ -240,7 +250,8 @@ iz_pump(void)
 
     if(r == NULL)
     {
-      iz_active = false;
+      iz_active  = false;
+      iz_current = NULL;
       pthread_mutex_unlock(&iz_lock);
       return;
     }
@@ -251,7 +262,8 @@ iz_pump(void)
       iz_tail = NULL;
 
     iz_depth--;
-    iz_active = true;
+    iz_active  = true;
+    iz_current = r;
     pthread_mutex_unlock(&iz_lock);
 
     if(iz_submit_one(r) == SUCCESS)
@@ -259,6 +271,13 @@ iz_pump(void)
 
     snprintf(line, sizeof(line), "imagine #%u failed to submit", r->id);
     iz_reply(r, line);
+
+    pthread_mutex_lock(&iz_lock);
+
+    if(iz_current == r)
+      iz_current = NULL;
+
+    pthread_mutex_unlock(&iz_lock);
     mem_free(r);
   }
 }
@@ -335,7 +354,10 @@ imagine_zimage_handler(const cmd_ctx_t *ctx)
   go_now = !iz_active;
 
   if(go_now)
-    iz_active = true;
+  {
+    iz_active  = true;
+    iz_current = r;
+  }
 
   else
   {
@@ -375,9 +397,51 @@ imagine_zimage_handler(const cmd_ctx_t *ctx)
   if(iz_submit_one(r) != SUCCESS)
   {
     cmd_reply(ctx, "imagine: failed to submit request");
+
+    pthread_mutex_lock(&iz_lock);
+
+    if(iz_current == r)
+      iz_current = NULL;
+
+    pthread_mutex_unlock(&iz_lock);
+
     mem_free(r);
     iz_pump();                         // release the slot / drain any racers
   }
+}
+
+// One queue entry captured for display: id plus a short prompt preview.
+// text is sized for IZ_PREVIEW_CHARS bytes + a 3-byte "…" + NUL.
+typedef struct
+{
+  uint32_t id;
+  char     text[IZ_PREVIEW_CHARS + 4];
+} iz_snap_t;
+
+// Copy the first IZ_PREVIEW_CHARS bytes of prompt into out, flattening
+// control characters to spaces (prompts are single-line here) and appending
+// an ellipsis when the prompt was longer than the window. ASCII-oriented: a
+// truncation may land mid-UTF-8, which at worst garbles one preview glyph —
+// acceptable for a status line.
+static void
+iz_prompt_preview(const char *prompt, char *out, size_t out_sz)
+{
+  size_t i;
+
+  for(i = 0; i < IZ_PREVIEW_CHARS && prompt[i] != '\0'; i++)
+  {
+    unsigned char c = (unsigned char)prompt[i];
+
+    out[i] = (c < 0x20) ? ' ' : (char)c;
+  }
+
+  if(prompt[i] != '\0' && i + 4 <= out_sz)
+  {
+    memcpy(out + i, "\xe2\x80\xa6", 3);   // U+2026 HORIZONTAL ELLIPSIS
+    i += 3;
+  }
+
+  out[i] = '\0';
 }
 
 static void
@@ -386,17 +450,41 @@ show_imagine_handler(const cmd_ctx_t *ctx)
   const char *service_url;
   const char *public_base;
   const char *auth_header;
+  iz_snap_t   queued[IZ_SHOW_MAX];
+  iz_snap_t   current;
+  uint32_t    n_queued = 0;
   uint32_t    depth;
   bool        active;
+  bool        have_current = false;
   char        line[IZ_REPLY_SZ];
 
   service_url = kv_get_str("plugin.imagine.service_url");
   public_base = kv_get_str("plugin.imagine.public_base");
   auth_header = kv_get_str("plugin.imagine.auth_header");
 
+  // Snapshot the in-flight request and the queued prompts under the lock, then
+  // release it before replying — cmd_reply may re-enter the delivery path, so
+  // the mutex is never held across an emit (snapshot-then-emit).
   pthread_mutex_lock(&iz_lock);
+
   active = iz_active;
   depth  = iz_depth;
+
+  if(iz_current != NULL)
+  {
+    current.id = iz_current->id;
+    iz_prompt_preview(iz_current->prompt, current.text, sizeof(current.text));
+    have_current = true;
+  }
+
+  for(iz_req_t *r = iz_head; r != NULL && n_queued < IZ_SHOW_MAX; r = r->next)
+  {
+    queued[n_queued].id = r->id;
+    iz_prompt_preview(r->prompt, queued[n_queued].text,
+        sizeof(queued[n_queued].text));
+    n_queued++;
+  }
+
   pthread_mutex_unlock(&iz_lock);
 
   cmd_reply(ctx, CLR_BOLD "imagine" CLR_RESET
@@ -419,6 +507,27 @@ show_imagine_handler(const cmd_ctx_t *ctx)
   snprintf(line, sizeof(line), "  queue   : %s, %u waiting",
       active ? CLR_YELLOW "busy" CLR_RESET : "idle", depth);
   cmd_reply(ctx, line);
+
+  if(have_current)
+  {
+    snprintf(line, sizeof(line), "  render  : " CLR_GREEN "#%u" CLR_RESET
+        " %s", current.id, current.text);
+    cmd_reply(ctx, line);
+  }
+
+  for(uint32_t i = 0; i < n_queued; i++)
+  {
+    snprintf(line, sizeof(line), "    %2u. " CLR_GRAY "#%u" CLR_RESET " %s",
+        i + 1, queued[i].id, queued[i].text);
+    cmd_reply(ctx, line);
+  }
+
+  if(depth > n_queued)
+  {
+    snprintf(line, sizeof(line), "    " CLR_GRAY "… +%u more" CLR_RESET,
+        depth - n_queued);
+    cmd_reply(ctx, line);
+  }
 }
 
 // -----------------------------------------------------------------------
@@ -488,10 +597,11 @@ imagine_zimage_deinit(void)
     r = next;
   }
 
-  iz_head   = NULL;
-  iz_tail   = NULL;
-  iz_depth  = 0;
-  iz_active = false;
+  iz_head    = NULL;
+  iz_tail    = NULL;
+  iz_depth   = 0;
+  iz_active  = false;
+  iz_current = NULL;
   pthread_mutex_unlock(&iz_lock);
 
   clam(CLAM_INFO, IZ_CTX,

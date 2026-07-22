@@ -35,6 +35,8 @@
 #define IZ_URL_SZ       512    // service_url / public_base (KV values are <=255)
 #define IZ_HDR_SZ       256    // auth header line "name: value"
 #define IZ_FILENAME_SZ  128    // filename returned by the service
+#define IZ_PREVIEW_CHARS 30    // prompt chars shown per item in `!show imagine`
+#define IZ_SHOW_MAX      24    // queued items listed before "+N more"
 
 // Per-request closure. The command context + message are copied in so the
 // reply survives past the originating dispatch frame, and every config value
