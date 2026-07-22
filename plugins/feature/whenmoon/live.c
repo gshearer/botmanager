@@ -561,6 +561,73 @@ wm_live_find_pending_by_coid_market_locked(const char *coid,
   return(false);
 }
 
+// Same contract as the coid finder above: on match returns with mk->lock
+// held. Fallback key for exchanges whose fills feed omits client_order_id
+// (Coinbase REST /fills) — the accept path and WS order events both stamp
+// pending[].order_id.
+static bool
+wm_live_find_pending_by_order_id_market_locked(const char *order_id,
+    whenmoon_market_t **out_mk, uint32_t *out_idx)
+{
+  whenmoon_state_t   *st;
+  whenmoon_markets_t *mkts;
+  uint32_t            i;
+  uint32_t            j;
+
+  if(out_mk != NULL)  *out_mk  = NULL;
+  if(out_idx != NULL) *out_idx = 0;
+
+  if(order_id == NULL || order_id[0] == '\0')
+    return(false);
+
+  st = whenmoon_get_state();
+
+  if(st == NULL || st->markets == NULL)
+    return(false);
+
+  mkts = st->markets;
+
+  for(i = 0; i < mkts->n_markets; i++)
+  {
+    whenmoon_market_t *mk = mkts->arr[i];
+
+    pthread_mutex_lock(&mk->lock);
+
+    for(j = 0; j < mk->session.pending_n; j++)
+    {
+      if(mk->session.pending[j].order_id[0] != '\0' &&
+         strncmp(mk->session.pending[j].order_id, order_id,
+             sizeof(mk->session.pending[j].order_id)) == 0)
+      {
+        if(out_mk  != NULL) *out_mk  = mk;
+        if(out_idx != NULL) *out_idx = j;
+        // Lock stays held — caller releases after dedup + reap.
+        return(true);
+      }
+    }
+
+    pthread_mutex_unlock(&mk->lock);
+  }
+
+  return(false);
+}
+
+// Stable nonzero synthetic trade id for aggregate fills booked off a WS
+// order snapshot (which carries no exchange trade id). FNV-1a 64.
+static int64_t
+wm_live_order_id_synth_tid(const char *s)
+{
+  uint64_t h = 1469598103934665603ULL;
+
+  while(*s != '\0')
+  {
+    h ^= (uint8_t)*s++;
+    h *= 1099511628211ULL;
+  }
+
+  return(h != 0 ? (int64_t)h : 1);
+}
+
 // ----------------------------------------------------------------------- //
 // User-channel event handlers                                             //
 // ----------------------------------------------------------------------- //
@@ -715,6 +782,41 @@ wm_live_handle_ws_order(const exchange_ws_user_order_t *o)
   if(reap)
   {
     uint32_t shift;
+    bool     book_agg  = false;
+    int64_t  synth_tid = 0;
+    char     side_ch   = 's';
+
+    // Coinbase's user channel never emits per-fill events — this order
+    // snapshot's aggregates are the only WS record of executed money.
+    // Book them before the row dies: once reaped, the REST poll has no
+    // row to match and the fill would be dropped as an orphan (the exact
+    // failure WM-DISC-1 Part D exposed live, 2026-07-22).
+    if(p->n_recorded_trades == 0 && o->cumulative_quantity > 0.0)
+    {
+      if(o->avg_price > 0.0)
+      {
+        book_agg  = true;
+        synth_tid = wm_live_order_id_synth_tid(o->order_id);
+        side_ch   = (o->side[0] == 'b' || o->side[0] == 'B') ? 'b' : 's';
+      }
+
+      else
+      {
+        // Degenerate: terminal with executed qty but no price. Keep the
+        // row — the REST poll books the real fill rows via the order_id
+        // fallback and reaps on filled_qty. (A partial CANCELLED that
+        // never completes can park the row; visible in the card's
+        // pending count.)
+        pthread_mutex_unlock(&mk->lock);
+        pthread_rwlock_unlock(&st->markets->arr_lock);
+
+        clam(CLAM_WARN, WM_LIVE_CTX,
+            "ws order %s status=%s cum_qty=%.10g without avg_price —"
+            " row kept for REST fill recovery",
+            o->order_id, status, o->cumulative_quantity);
+        return;
+      }
+    }
 
     snprintf(market_id_copy, sizeof(market_id_copy), "%s",
         mk->market_id_str);
@@ -727,9 +829,27 @@ wm_live_handle_ws_order(const exchange_ws_user_order_t *o)
     pthread_mutex_unlock(&mk->lock);
     pthread_rwlock_unlock(&st->markets->arr_lock);
 
+    if(book_agg)
+    {
+      // Advance the REST cursor so the poll doesn't chase rows this
+      // aggregate already covers (the overlap window still re-reads the
+      // tail; the resulting orphans dedup to a debug line).
+      pthread_mutex_lock(&g_live.mu);
+
+      if(o->time_ms > g_live.last_fills_cursor_ms)
+        g_live.last_fills_cursor_ms = o->time_ms;
+
+      pthread_mutex_unlock(&g_live.mu);
+
+      wm_market_engine_record_external_fill(market_id_copy, synth_tid,
+          side_ch, o->cumulative_quantity, o->avg_price, o->total_fees,
+          o->time_ms, "ws-order-agg");
+    }
+
     clam(failed ? CLAM_WARN : CLAM_INFO, WM_LIVE_CTX,
-        "ws order %s coid=%s order_id=%s status=%s -> reaped",
-        market_id_copy, o->client_order_id, o->order_id, status);
+        "ws order %s coid=%s order_id=%s status=%s -> %s",
+        market_id_copy, o->client_order_id, o->order_id, status,
+        book_agg ? "aggregate booked + reaped" : "reaped");
     return;
   }
 
@@ -1019,7 +1139,11 @@ wm_live_on_fills(const exchange_fills_result_t *res, void *user)
     // returns mk->lock held on match) and until we release that mk->lock.
     pthread_rwlock_rdlock(&st->markets->arr_lock);
 
+    // coid first (exchanges that echo it), then order_id — Coinbase's
+    // /fills rows omit client_order_id entirely.
     if(!wm_live_find_pending_by_coid_market_locked(f->client_oid,
+           &mk, &pidx) &&
+       !wm_live_find_pending_by_order_id_market_locked(f->order_id,
            &mk, &pidx))
     {
       // Orphan: WS likely already reaped this pending row. Confirm
@@ -1088,8 +1212,8 @@ wm_live_on_fills(const exchange_fills_result_t *res, void *user)
     side_ch = (f->side[0] == 'b' || f->side[0] == 'B') ? 'b' : 's';
 
     clam(CLAM_INFO, WM_LIVE_CTX,
-        "fills poll: applied tid=%lld coid=%s",
-        (long long)f->trade_id, f->client_oid);
+        "fills poll: applied tid=%lld coid=%s order_id=%s",
+        (long long)f->trade_id, f->client_oid, f->order_id);
 
     wm_market_engine_record_external_fill(market_id_copy, f->trade_id,
         side_ch, f->size, f->price, f->fee, f->time_ms,
