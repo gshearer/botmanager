@@ -39,7 +39,11 @@ static const plugin_kv_entry_t ug_kv_schema[] = {
   { UG_KV_MAX_BYTES,  KV_UINT32, "131072",
     "Bytes fetched per URL (Range-capped — the <title> lives in the head)" },
   { UG_KV_USER_AGENT, KV_STR,
-    "Mozilla/5.0 (compatible; botmanager-urlgrabber/1.0)",
+    // A browser-like string on purpose: declaring ourselves a bot draws a
+    // 403 challenge from Cloudflare and similar WAFs, which silently starves
+    // whole sites of titles. Every mainstream link-preview bot presents as a
+    // browser for exactly this reason.
+    "Mozilla/5.0 (X11; Linux x86_64; rv:128.0) Gecko/20100101 Firefox/128.0",
     "User-Agent sent when fetching a page title" },
 };
 

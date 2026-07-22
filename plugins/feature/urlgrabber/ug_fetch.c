@@ -505,16 +505,49 @@ ug_fetch_done(const curl_response_t *resp)
   if(fc == NULL)
     return;
 
-  if(resp->cancelled || resp->error != NULL ||
-      resp->status < 200 || resp->status >= 400 ||
-      resp->body == NULL || resp->body_len == 0)
+  // Every drop path below used to be silent, which is exactly what made a
+  // WAF 403 look like a random "some URLs get ignored". Name the reason:
+  // a real failure (transport error, HTTP >= 400) is worth INFO so it shows
+  // up in a normal log; a benign miss (shutdown, non-markup, no <title>) is
+  // DEBUG so it doesn't nag.
+  if(resp->cancelled)
+  {
+    clam(CLAM_DEBUG, UG_CTX, "%s: fetch cancelled (drain), skipped",
+        fc->host);
     goto out;
+  }
+
+  if(resp->error != NULL)
+  {
+    clam(CLAM_INFO, UG_CTX, "%s: fetch error, skipped (%s)",
+        fc->host, resp->error);
+    goto out;
+  }
+
+  if(resp->status < 200 || resp->status >= 400)
+  {
+    clam(CLAM_INFO, UG_CTX, "%s: HTTP %ld, skipped", fc->host, resp->status);
+    goto out;
+  }
+
+  if(resp->body == NULL || resp->body_len == 0)
+  {
+    clam(CLAM_INFO, UG_CTX, "%s: empty body, skipped", fc->host);
+    goto out;
+  }
 
   if(!ug_content_is_html(resp->content_type))
+  {
+    clam(CLAM_DEBUG, UG_CTX, "%s: non-markup content-type '%s', skipped",
+        fc->host, resp->content_type != NULL ? resp->content_type : "");
     goto out;
+  }
 
   if(!ug_extract_title(resp->body, resp->body_len, title, sizeof(title)))
+  {
+    clam(CLAM_DEBUG, UG_CTX, "%s: no <title> in body, skipped", fc->host);
     goto out;
+  }
 
   // Cosmetic length cap, with an ellipsis to signal the cut.
   maxlen = (uint32_t)kv_get_uint(UG_KV_MAX_TITLE);
