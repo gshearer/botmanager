@@ -53,8 +53,8 @@
 //   target_atr   reversion target above EMA_20(1h), in ATR_14(1h) (0 = at mean)
 //   stop_atr     protective stop below entry, in ATR_14(1h) at entry time
 //   rsi_max      optional oversold filter: require RSI_14 <= this (>=100 = off)
-//   trigger_confirm_bars  consecutive up-closes required to trigger while
-//                armed (1 = today's single-tick trigger, unchanged default)
+//   trigger_atr_min  minimum up-tick magnitude, in ATR_14(1h), to count
+//                toward the trigger streak (0 = off, any positive tick counts)
 //
 // LOOKAHEAD SAFETY. The backtest fires on_bar in a merged chronological walk
 // across grains; on a shared timestamp the FINER grain fires first (1h before
@@ -107,7 +107,7 @@
 #define RIPTIDE_DEFAULT_TARGET_ATR    0.50   // bank the reversion 0.5 ATR above the mean
 #define RIPTIDE_DEFAULT_STOP_ATR      3.00   // protective stop 3.0 ATR below entry
 #define RIPTIDE_DEFAULT_RSI_MAX     100.0    // oversold filter off by default
-#define RIPTIDE_DEFAULT_TRIGGER_CONFIRM_BARS  1  // 1 = today's single-tick trigger
+#define RIPTIDE_DEFAULT_TRIGGER_ATR_MIN  0.0  // 0 = off, any positive tick counts
 
 typedef struct
 {
@@ -118,7 +118,7 @@ typedef struct
   double     target_atr;     // reversion target above EMA_20 (ATR units)
   double     stop_atr;       // protective stop below entry (ATR units)
   double     rsi_max;        // oversold filter (>=100 = off)
-  int        trigger_confirm_bars;  // consecutive up-closes required to fire
+  double     trigger_atr_min;   // min up-tick magnitude, ATR units (0 = off)
 
   // Cached tide-grain context. *_have latches once that grain produces a bar.
   // reg_ema is the strategy-computed slow self-EMA of that grain's closes.
@@ -134,8 +134,6 @@ typedef struct
   // both deep-below-mean AND closing up is rare; the bounce comes a bar or
   // two later, once price has ticked off the low).
   bool       armed;
-  int        up_streak;      // consecutive armed up-close bars (reset on
-                              // disarm or any non-uptick bar)
 
   // Position state.
   bool       in_position;
@@ -262,16 +260,15 @@ static const wm_strategy_param_t riptide_params[] = {
                    " (>=100 disables it). Default 100 (off).",
   },
   {
-    .name        = "trigger_confirm_bars",
-    .type        = WM_PARAM_UINT,
-    .default_int = (int64_t)RIPTIDE_DEFAULT_TRIGGER_CONFIRM_BARS,
-    .min_int     = 1,
-    .max_int     = 3,
-    .step_dbl    = 1.0,
-    .help        = "Consecutive up-close 1h bars required while armed before"
-                   " the buy triggers. 1 = today's single-tick trigger"
-                   " (default, unchanged). Higher values wait for a confirmed"
-                   " bounce before firing.",
+    .name        = "trigger_atr_min",
+    .type        = WM_PARAM_DOUBLE,
+    .default_dbl = RIPTIDE_DEFAULT_TRIGGER_ATR_MIN,
+    .min_dbl     = 0.0,
+    .max_dbl     = 0.30,
+    .step_dbl    = 0.05,
+    .help        = "Minimum up-tick magnitude, in ATR_14(1h), for a bar to"
+                   " count toward the trigger streak (0 disables it, any"
+                   " positive tick counts). Default 0 (off).",
   },
 };
 
@@ -331,9 +328,8 @@ wm_strategy_init(wm_strategy_ctx_t *ctx)
       RIPTIDE_DEFAULT_STOP_ATR);
   s->rsi_max = wm_strategy_kv_get_dbl(mid, strat, "rsi_max",
       RIPTIDE_DEFAULT_RSI_MAX);
-  s->trigger_confirm_bars = (int)wm_strategy_kv_get_uint(mid, strat,
-      "trigger_confirm_bars",
-      (uint64_t)RIPTIDE_DEFAULT_TRIGGER_CONFIRM_BARS);
+  s->trigger_atr_min = wm_strategy_kv_get_dbl(mid, strat, "trigger_atr_min",
+      RIPTIDE_DEFAULT_TRIGGER_ATR_MIN);
 
   if(s->regime_grain < 0)         s->regime_grain = 0;
   if(s->regime_grain > 1)         s->regime_grain = 1;
@@ -342,15 +338,15 @@ wm_strategy_init(wm_strategy_ctx_t *ctx)
   if(s->entry_atr < 0.0)          s->entry_atr = 0.0;
   if(s->target_atr < 0.0)         s->target_atr = 0.0;
   if(s->stop_atr <= 0.0)          s->stop_atr = RIPTIDE_DEFAULT_STOP_ATR;
-  if(s->trigger_confirm_bars < 1) s->trigger_confirm_bars = 1;
+  if(s->trigger_atr_min < 0.0)    s->trigger_atr_min = 0.0;
 
   wm_strategy_ctx_set_user(ctx, s);
 
   clam(CLAM_INFO, RIPTIDE_LOG_CTX,
       "init: %s -> %s regime_grain=%d regime_alpha=%.4f entry_atr=%.2f"
-      " target_atr=%.2f stop_atr=%.2f rsi_max=%.1f trigger_confirm_bars=%d",
+      " target_atr=%.2f stop_atr=%.2f rsi_max=%.1f trigger_atr_min=%.2f",
       strat, mid, s->regime_grain, s->regime_alpha, s->entry_atr,
-      s->target_atr, s->stop_atr, s->rsi_max, s->trigger_confirm_bars);
+      s->target_atr, s->stop_atr, s->rsi_max, s->trigger_atr_min);
 
   return(0);
 }
@@ -428,7 +424,11 @@ wm_strategy_on_bar(wm_strategy_ctx_t *ctx,
     // nascent bounce, not a freefall) while still below the mean. Disarm if
     // price recovers to the mean untriggered or the tide flips down.
     double dip_level = (double)ema20 - s->entry_atr * (double)atr;
-    bool   uptick    = s->prev_have && close > s->prev_close;
+    double tick_diff = close - s->prev_close;
+    bool   uptick    = s->prev_have && tick_diff > 0.0 &&
+                       (s->trigger_atr_min <= 0.0 ||
+                        (have_core &&
+                         tick_diff >= s->trigger_atr_min * (double)atr));
     bool   rsi_ok    = (s->rsi_max >= 100.0) ||
                        (!isnanf(rsi) && (double)rsi <= s->rsi_max);
 
@@ -439,23 +439,13 @@ wm_strategy_on_bar(wm_strategy_ctx_t *ctx,
     else if(close >= (double)ema20)
       s->armed = false;   // recovered to the mean without a bounce trigger
 
-    // Consecutive-up-close confirmation: the streak only grows on an armed
-    // up-tick bar and resets the instant either condition breaks, so a
-    // disarm or a down-close always restarts the count from zero.
-    if(s->armed && uptick)
-      s->up_streak++;
-    else
-      s->up_streak = 0;
-
-    if(s->armed && regime_up && have_core && rsi_ok &&
-        s->up_streak >= s->trigger_confirm_bars)
+    if(s->armed && regime_up && have_core && rsi_ok && uptick)
     {
       sig.score      = 1.0;
       sig.confidence = 0.6;
       snprintf(sig.reason, sizeof(sig.reason), "dip %.2fatr", s->entry_atr);
 
       s->armed       = false;
-      s->up_streak   = 0;
       s->in_position = true;
       s->entry_price = close;
       s->stop_price  = close - s->stop_atr * (double)atr;
