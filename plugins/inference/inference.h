@@ -37,11 +37,13 @@ typedef enum
   LLM_ROLE_ASSISTANT
 } llm_role_t;
 
-// Model kinds. A model is registered as chat OR embed, never both.
+// Model kinds. A model is registered as exactly one of chat, embed, or
+// image (text-to-image) — never more than one.
 typedef enum
 {
   LLM_KIND_CHAT,
-  LLM_KIND_EMBED
+  LLM_KIND_EMBED,
+  LLM_KIND_IMAGE
 } llm_kind_t;
 
 // Opaque request handle.
@@ -137,6 +139,34 @@ typedef struct
 } llm_embed_response_t;
 
 typedef void (*llm_embed_done_cb_t)(const llm_embed_response_t *resp);
+
+// Request-level parameters for a text-to-image generation. All zero
+// fields mean "use model/config default".
+typedef struct
+{
+  const char *size;          // e.g. "1024x1024"; NULL/"" -> provider default
+  uint32_t    n;             // images to request; v1 fixes this at 1
+  uint32_t    timeout_secs;  // 0 = KV default (llm.timeout_secs)
+} llm_image_params_t;
+
+// Response delivered to the image generation callback. Valid for the
+// duration of the callback only -- the caller must copy any needed data
+// (the b64 payload in particular is released when the callback returns).
+typedef struct
+{
+  llm_request_t *request;
+  bool           ok;              // true on HTTP 2xx with a decodable payload
+  long           http_status;
+  const char    *model;           // registered name
+  const char    *b64;             // base64 image bytes (NUL-terminated)
+  size_t         b64_len;
+  const char    *mime;            // "image/png" unless the provider says otherwise
+  const char    *revised_prompt;  // provider-rewritten prompt, or "" if none
+  const char    *error;           // NULL on success
+  void          *user_data;
+} llm_image_response_t;
+
+typedef void (*llm_image_done_cb_t)(const llm_image_response_t *resp);
 
 // Per-model visitor for llm_model_iterate(). Called once per registered
 // model with its full descriptor. Guarded because the same typedef also
@@ -365,6 +395,32 @@ llm_embed_submit(const char *model_name,
     __atomic_store_n(&cached, fn, __ATOMIC_RELEASE);
   }
   return(fn(model_name, inputs, n_inputs, done_cb, user_data));
+}
+
+static inline bool
+llm_image_submit(const char *model_name,
+    const llm_image_params_t *params, const char *prompt,
+    llm_image_done_cb_t done_cb, void *user_data)
+{
+  typedef bool (*fn_t)(const char *, const llm_image_params_t *,
+      const char *, llm_image_done_cb_t, void *);
+  static fn_t cached = NULL;
+  fn_t        fn     = __atomic_load_n(&cached, __ATOMIC_ACQUIRE);
+
+  if(fn == NULL)
+  {
+    union { void *obj; fn_t fn; } u;
+
+    u.obj = plugin_dlsym_cached("inference", "llm_image_submit", (void **)&cached);
+    if(u.obj == NULL)
+    {
+      clam(CLAM_FATAL, "inference", "dlsym failed: llm_image_submit");
+      abort();
+    }
+    fn = u.fn;
+    __atomic_store_n(&cached, fn, __ATOMIC_RELEASE);
+  }
+  return(fn(model_name, params, prompt, done_cb, user_data));
 }
 
 static inline bool

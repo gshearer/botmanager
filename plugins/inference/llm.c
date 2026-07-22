@@ -76,13 +76,23 @@ llm_kind_from_str(const char *s, llm_kind_t *out)
 {
   if(strcmp(s, "chat") == 0)   { *out = LLM_KIND_CHAT;  return(SUCCESS); }
   if(strcmp(s, "embed") == 0)  { *out = LLM_KIND_EMBED; return(SUCCESS); }
+  if(strcmp(s, "image") == 0)  { *out = LLM_KIND_IMAGE; return(SUCCESS); }
   return(FAIL);
 }
 
+// Real switch, not a ternary: a fall-through default would silently
+// mislabel any new kind (the SUCCESS/FAIL-style silent-inversion hazard).
 const char *
 llm_kind_to_str(llm_kind_t k)
 {
-  return(k == LLM_KIND_EMBED ? "embed" : "chat");
+  switch(k)
+  {
+    case LLM_KIND_CHAT:  return("chat");
+    case LLM_KIND_EMBED: return("embed");
+    case LLM_KIND_IMAGE: return("image");
+  }
+
+  return("chat");
 }
 
 // JSON writer: minimal growable string builder for request bodies
@@ -1644,6 +1654,38 @@ llm_build_embed_body(llm_request_t *req, const char *const *inputs,
   return(SUCCESS);
 }
 
+// Build the text-to-image request body:
+//   {"model":...,"prompt":...,"n":1,"size":"...","response_format":"b64_json"}
+// The bot owns hosting, so we always ask for base64 bytes rather than a
+// provider-hosted URL (see the imagine command). `size` is omitted when
+// unset so the provider's own default applies.
+static bool
+llm_build_image_body(llm_request_t *req, const char *prompt)
+{
+  llm_buf_t b;
+  llm_buf_init(&b, 512);
+
+  llm_buf_puts(&b, "{\"model\":");
+  llm_json_str(&b, req->model_id);
+
+  llm_buf_puts(&b, ",\"prompt\":");
+  llm_json_str(&b, prompt != NULL ? prompt : "");
+
+  llm_buf_puts(&b, ",\"n\":1");
+
+  if(req->image_size[0] != '\0')
+  {
+    llm_buf_puts(&b, ",\"size\":");
+    llm_json_str(&b, req->image_size);
+  }
+
+  llm_buf_puts(&b, ",\"response_format\":\"b64_json\"}");
+
+  req->req_body     = b.buf;
+  req->req_body_len = b.len;
+  return(SUCCESS);
+}
+
 // Response parsers
 
 // Parse a non-streaming chat body into req->assembled + token counts.
@@ -1848,6 +1890,67 @@ llm_parse_embed_response(llm_request_t *req, const char *body, size_t len)
   return(SUCCESS);
 }
 
+// Parse a text-to-image response: {"data":[{"b64_json":"<base64>",
+// "revised_prompt":"..."}]}. The base64 payload can be megabytes, so we
+// locate its bounds and append the raw slice straight into req->assembled
+// (base64's RFC 4648 alphabet contains no JSON metacharacters, so no
+// unescape pass is needed) rather than routing it through a fixed buffer.
+// Returns SUCCESS if a payload was captured, FAIL otherwise.
+static bool
+llm_parse_image_response(llm_request_t *req, const char *body, size_t len)
+{
+  const char *end = body + len;
+  const char *key = util_memstr(body, len, "\"b64_json\"");
+
+  const char *val;
+  const char *start;
+  const char *p;
+  char        rev[LLM_IMAGE_REVISED_SZ];
+
+  if(key == NULL)
+  {
+    snprintf(req->errbuf, sizeof(req->errbuf), "no b64_json in response");
+    return(FAIL);
+  }
+
+  val = util_skip_to_value(key + strlen("\"b64_json\""), end);
+
+  if(val == NULL || *val != '"')
+  {
+    snprintf(req->errbuf, sizeof(req->errbuf), "malformed b64_json value");
+    return(FAIL);
+  }
+
+  start = val + 1;
+
+  for(p = start; p < end && *p != '"'; p++)
+    if(*p == '\\' && p + 1 < end)
+      p++;
+
+  if(p >= end)
+  {
+    snprintf(req->errbuf, sizeof(req->errbuf), "unterminated b64_json value");
+    return(FAIL);
+  }
+
+  if(p == start)
+  {
+    snprintf(req->errbuf, sizeof(req->errbuf), "empty b64_json value");
+    return(FAIL);
+  }
+
+  llm_assembled_append(req, start, (size_t)(p - start));
+
+  // Default MIME; providers do not currently return one for images.
+  snprintf(req->image_mime, sizeof(req->image_mime), "image/png");
+
+  // Optional provider-rewritten prompt.
+  if(llm_extract_str(body, len, "\"revised_prompt\"", rev, sizeof(rev)) > 0)
+    snprintf(req->image_revised, sizeof(req->image_revised), "%s", rev);
+
+  return(SUCCESS);
+}
+
 // Streaming chunk handler
 
 // Called by sse_parser_feed for each complete SSE event.
@@ -2009,6 +2112,47 @@ llm_deliver_embed(llm_request_t *req, bool ok, long http_status,
   llm_req_release(req);
 }
 
+static void
+llm_deliver_image(llm_request_t *req, bool ok, long http_status,
+    const char *err)
+{
+  llm_image_response_t resp;
+
+  memset(&resp, 0, sizeof(resp));
+  resp.request        = req;
+  resp.ok             = ok;
+  resp.http_status    = http_status;
+  resp.model          = req->model_name;
+  resp.b64            = req->assembled != NULL ? req->assembled : "";
+  resp.b64_len        = req->assembled_len;
+  resp.mime           = req->image_mime[0] != '\0' ? req->image_mime
+                          : "image/png";
+  resp.revised_prompt = req->image_revised;
+  resp.error          = ok ? NULL : (err != NULL ? err : req->errbuf);
+  resp.user_data      = req->user_data;
+
+  llm_active_remove(req);
+  llm_accumulate_stats(req, ok);
+
+  if(req->image_done_cb != NULL)
+    req->image_done_cb(&resp);
+
+  llm_req_release(req);
+}
+
+// Deliver the terminal callback for whichever request type this is, then
+// release the request. Single point of truth for the type→deliverer map.
+static void
+llm_deliver(llm_request_t *req, bool ok, long http_status, const char *err)
+{
+  switch(req->type)
+  {
+    case LLM_REQ_CHAT:  llm_deliver_chat(req, ok, http_status, err);  break;
+    case LLM_REQ_EMBED: llm_deliver_embed(req, ok, http_status, err); break;
+    case LLM_REQ_IMAGE: llm_deliver_image(req, ok, http_status, err); break;
+  }
+}
+
 // Deferred-task retry trampoline.
 static void
 llm_retry_task(task_t *t)
@@ -2046,11 +2190,7 @@ llm_retry_task(task_t *t)
   {
     // Could not reissue; deliver failure.
     snprintf(req->errbuf, sizeof(req->errbuf), "retry submit failed");
-
-    if(req->type == LLM_REQ_CHAT)
-      llm_deliver_chat(req, false, 0, req->errbuf);
-    else
-      llm_deliver_embed(req, false, 0, req->errbuf);
+    llm_deliver(req, false, 0, req->errbuf);
   }
 
   t->state = TASK_ENDED;
@@ -2090,12 +2230,21 @@ llm_curl_done_cb(const curl_response_t *resp)
   {
     if(!req->streaming && resp->body != NULL && resp->body_len > 0)
     {
-      if(req->type == LLM_REQ_CHAT)
-        ok = (llm_parse_chat_response(req, resp->body, resp->body_len)
-              == SUCCESS);
-      else
-        ok = (llm_parse_embed_response(req, resp->body, resp->body_len)
-              == SUCCESS);
+      switch(req->type)
+      {
+        case LLM_REQ_CHAT:
+          ok = (llm_parse_chat_response(req, resp->body, resp->body_len)
+                == SUCCESS);
+          break;
+        case LLM_REQ_EMBED:
+          ok = (llm_parse_embed_response(req, resp->body, resp->body_len)
+                == SUCCESS);
+          break;
+        case LLM_REQ_IMAGE:
+          ok = (llm_parse_image_response(req, resp->body, resp->body_len)
+                == SUCCESS);
+          break;
+      }
     }
 
     else if(req->streaming)
@@ -2225,10 +2374,7 @@ llm_curl_done_cb(const curl_response_t *resp)
     snprintf(req->errbuf, sizeof(req->errbuf), "retry scheduling failed");
   }
 
-  if(req->type == LLM_REQ_CHAT)
-    llm_deliver_chat(req, ok, resp->status, ok ? NULL : req->errbuf);
-  else
-    llm_deliver_embed(req, ok, resp->status, ok ? NULL : req->errbuf);
+  llm_deliver(req, ok, resp->status, ok ? NULL : req->errbuf);
 }
 
 // Build a curl_request_t from req state and submit it. Caller manages
@@ -2498,6 +2644,77 @@ llm_embed_submit_wait(const char *model_name,
 {
   return(llm_embed_submit_impl(model_name, inputs, n_inputs,
       done_cb, user_data, true)); // blocking
+}
+
+bool
+llm_image_submit(const char *model_name,
+    const llm_image_params_t *params, const char *prompt,
+    llm_image_done_cb_t done_cb, void *user_data)
+{
+  llm_model_t    m;
+  llm_request_t *req;
+
+  if(!llm_ready || model_name == NULL || prompt == NULL || prompt[0] == '\0'
+      || done_cb == NULL)
+    return(FAIL);
+
+  if(llm_models_snapshot(model_name, &m) != SUCCESS || !m.enabled
+      || m.kind != LLM_KIND_IMAGE)
+  {
+    clam(CLAM_WARN, "llm", "unknown/disabled image model: %s", model_name);
+    return(FAIL);
+  }
+
+  req = llm_req_alloc();
+
+  req->type = LLM_REQ_IMAGE;
+  snprintf(req->model_name, sizeof(req->model_name), "%s", m.name);
+  snprintf(req->model_id,   sizeof(req->model_id),   "%s", m.model_id);
+
+  if(llm_build_url(m.base_url, "images/generations",
+      req->endpoint_url, sizeof(req->endpoint_url)) != SUCCESS)
+  {
+    clam(CLAM_WARN, "llm", "cannot build image URL for %s (service %s)",
+        m.name, m.service_name);
+    llm_req_release(req);
+    return(FAIL);
+  }
+
+  snprintf(req->api_key_kv, sizeof(req->api_key_kv),
+      "llm.service.%s.apikey", m.service_name);
+  snprintf(req->service_name, sizeof(req->service_name), "%s", m.service_name);
+
+  req->kind          = m.kind;
+  req->image_done_cb = done_cb;
+  req->user_data     = user_data;
+  req->streaming     = false;
+  req->image_n       = 1;               // v1: always one image
+
+  if(params != NULL)
+  {
+    if(params->size != NULL && params->size[0] != '\0')
+      snprintf(req->image_size, sizeof(req->image_size), "%s", params->size);
+
+    req->params.timeout_secs = params->timeout_secs;
+  }
+
+  if(llm_build_image_body(req, prompt) != SUCCESS)
+  {
+    llm_req_release(req);
+    return(FAIL);
+  }
+
+  clock_gettime(CLOCK_MONOTONIC, &req->started);
+  llm_active_add(req);
+
+  if(llm_issue_request(req) != SUCCESS)
+  {
+    llm_active_remove(req);
+    llm_req_release(req);
+    return(FAIL);
+  }
+
+  return(SUCCESS);
 }
 
 // Stats + iteration

@@ -164,6 +164,7 @@ regex (the literal context portion, before any `<placeholder>`).
 | `ask` | plugins/cmd/ask/ask_cmd.c | `!ask` one-shot LLM command (`ASK_CMD_CTX`) |
 | `claude` | plugins/cmd/claude/claude.c | `/claude` bridge command (`CLAUDE_CTX`) |
 | `crypto` | plugins/cmd/crypto/crypto.c | `/crypto` price command (`CRYPTO_CTX`) |
+| `imagine` | plugins/cmd/imagine/imagine_cmd.c | `!imagine` text-to-image command (`IMG_CMD_CTX`) |
 | `searxng` | plugins/cmd/searxng/searxng_cmd.c | `/searxng` command (`SEARXNG_CMD_CTX`) |
 | `weather` | plugins/cmd/weather/weather.c | `/weather` command (`WEATHER_CTX`) |
 

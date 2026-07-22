@@ -77,6 +77,10 @@ bool llm_embed_submit_wait(const char *model_name,
     const char *const *inputs, size_t n_inputs,
     llm_embed_done_cb_t done_cb, void *user_data);
 
+bool llm_image_submit(const char *model_name,
+    const llm_image_params_t *params, const char *prompt,
+    llm_image_done_cb_t done_cb, void *user_data);
+
 void llm_get_stats(llm_stats_t *out);
 
 typedef void (*llm_iter_cb_t)(const char *model_name, llm_kind_t kind,
@@ -90,6 +94,11 @@ void llm_iterate_active(llm_iter_cb_t cb, void *data);
 #define LLM_KV_KEY_SZ      128
 #define LLM_FINISH_SZ      32
 #define LLM_ERR_SZ         256
+
+// Image (text-to-image) request/response sizing.
+#define LLM_IMAGE_SIZE_SZ     16    // "1024x1024" style dimension string
+#define LLM_IMAGE_MIME_SZ     32    // e.g. "image/png"
+#define LLM_IMAGE_REVISED_SZ  512   // provider-rewritten prompt (optional)
 
 // Per-model request-dialect negotiation (LLM-DIALECT-1).
 #define LLM_DIR_FIELD_SZ    64   // canonical builder field / wire name
@@ -147,7 +156,8 @@ typedef struct llm_model
 typedef enum
 {
   LLM_REQ_CHAT,
-  LLM_REQ_EMBED
+  LLM_REQ_EMBED,
+  LLM_REQ_IMAGE
 } llm_req_type_t;
 
 // One learned request-dialect directive for a canonical field the chat-body
@@ -198,7 +208,16 @@ struct llm_request
   llm_chat_done_cb_t    chat_done_cb;
   llm_chunk_cb_t        chunk_cb;
   llm_embed_done_cb_t   embed_done_cb;
+  llm_image_done_cb_t   image_done_cb;
   void                 *user_data;
+
+  // Image (text-to-image) request/response state. The decoded-ready b64
+  // payload reuses the `assembled` buffer below (see llm_parse_image_
+  // response); only the small side-channel fields live here.
+  char                  image_size[LLM_IMAGE_SIZE_SZ];        // requested dims
+  uint32_t              image_n;                              // v1 fixes at 1
+  char                  image_mime[LLM_IMAGE_MIME_SZ];        // response MIME
+  char                  image_revised[LLM_IMAGE_REVISED_SZ];  // revised_prompt
 
   // Request body (JSON). For chat, req_body = body_prefix + params-tail;
   // the immutable prefix ({"model":...,"messages":[...]}) is retained so a

@@ -59,6 +59,14 @@ size_t util_b64_encode(const void *in, size_t in_len,
 size_t util_b64url_encode(const void *in, size_t in_len,
     char *out, size_t out_cap);
 
+// Base64-decode in[0,in_len) into out. RFC 4648 standard alphabet;
+// ASCII whitespace is skipped and a '=' pad byte ends the stream.
+// Writes at most out_cap bytes and stores the decoded length in
+// *written (may be NULL). Returns SUCCESS, or FAIL on an invalid
+// character or when out_cap is too small to hold the payload.
+bool util_b64_decode(const char *in, size_t in_len, void *out,
+    size_t out_cap, size_t *written);
+
 // Scan text for the first image URL (case-insensitive match on
 // https?://[^\s<>"']+\.(jpe?g|png|gif|webp)(\?[^\s<>"']*)?). Copies
 // the URL into out (NUL-terminated). Returns true on hit.

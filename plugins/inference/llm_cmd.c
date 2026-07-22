@@ -784,7 +784,7 @@ cmd_llm_add_model(const cmd_ctx_t *ctx)
   if(ctx->parsed == NULL || ctx->parsed->argc < 4)
   {
     cmd_reply(ctx,
-        "usage: llm add model <chat|embed> <name> <service> <model_id>");
+        "usage: llm add model <chat|embed|image> <name> <service> <model_id>");
     return;
   }
 
@@ -795,7 +795,7 @@ cmd_llm_add_model(const cmd_ctx_t *ctx)
 
   if(llm_kind_from_str(kind_s, &k) != SUCCESS)
   {
-    cmd_reply(ctx, "error: type must be 'chat' or 'embed'");
+    cmd_reply(ctx, "error: type must be 'chat', 'embed', or 'image'");
     return;
   }
 
@@ -985,6 +985,28 @@ cmd_llm_test_embed_done(const llm_embed_response_t *resp)
 }
 
 static void
+cmd_llm_test_image_done(const llm_image_response_t *resp)
+{
+  llm_test_sync_t *s = resp->user_data;
+
+  pthread_mutex_lock(&s->mu);
+
+  s->ok     = resp->ok;
+  s->status = resp->http_status;
+
+  if(resp->ok)
+    snprintf(s->content, sizeof(s->content),
+        "%s b64_len=%zu", resp->mime, resp->b64_len);
+
+  if(resp->error != NULL)
+    snprintf(s->err, sizeof(s->err), "%s", resp->error);
+
+  s->done = true;
+  pthread_cond_broadcast(&s->cv);
+  pthread_mutex_unlock(&s->mu);
+}
+
+static void
 cmd_llm_test(const cmd_ctx_t *ctx)
 {
   const char *name;
@@ -1033,6 +1055,15 @@ cmd_llm_test(const cmd_ctx_t *ctx)
 
     submitted = (llm_chat_submit(name, &params, msgs, 1,
         cmd_llm_test_done, NULL, &s) == SUCCESS);
+  }
+
+  else if(k == LLM_KIND_IMAGE)
+  {
+    llm_image_params_t params = { 0 };
+    params.n = 1;
+
+    submitted = (llm_image_submit(name, &params, prompt,
+        cmd_llm_test_image_done, &s) == SUCCESS);
   }
 
   else
@@ -1379,7 +1410,7 @@ static void
 cmd_llm_add_usage(const cmd_ctx_t *ctx)
 {
   cmd_reply(ctx, "usage: llm add service <name> <base_url>");
-  cmd_reply(ctx, "       llm add model <chat|embed> <name> <service> <model_id>");
+  cmd_reply(ctx, "       llm add model <chat|embed|image> <name> <service> <model_id>");
 }
 
 static void
@@ -1416,7 +1447,7 @@ llm_register_commands(void)
       NULL, NULL);
 
   cmd_register("llm", "model",
-      "llm add model <chat|embed> <name> <service> <model_id>",
+      "llm add model <chat|embed|image> <name> <service> <model_id>",
       "Register a model against a service",
       NULL,
       USERNS_GROUP_ADMIN, 100, CMD_SCOPE_ANY, METHOD_T_ANY,

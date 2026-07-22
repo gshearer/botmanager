@@ -12,6 +12,7 @@
 #include <unistd.h>
 
 #include "clam.h"
+#include "common.h"
 
 // Initialization
 
@@ -222,6 +223,68 @@ util_b64url_encode(const void *in, size_t in_len, char *out, size_t out_cap)
     out[--n] = '\0';
 
   return(n);
+}
+
+// Decode one RFC 4648 standard-alphabet character to its 6-bit value,
+// or -1 if the character is not part of the alphabet.
+static int
+util_b64_val(unsigned char c)
+{
+  if(c >= 'A' && c <= 'Z') return(c - 'A');
+  if(c >= 'a' && c <= 'z') return(c - 'a' + 26);
+  if(c >= '0' && c <= '9') return(c - '0' + 52);
+  if(c == '+') return(62);
+  if(c == '/') return(63);
+  return(-1);
+}
+
+bool
+util_b64_decode(const char *in, size_t in_len, void *out, size_t out_cap,
+    size_t *written)
+{
+  const unsigned char *p = (const unsigned char *)in;
+  unsigned char       *o = (unsigned char *)out;
+  uint32_t             acc = 0;
+  int                  nbits = 0;
+  size_t               w = 0;
+
+  if(in == NULL || out == NULL)
+    return(FAIL);
+
+  for(size_t i = 0; i < in_len; i++)
+  {
+    unsigned char c = p[i];
+    int           v;
+
+    if(c == '=')                 // padding — data ends here
+      break;
+
+    if(c == ' ' || c == '\t' || c == '\n' || c == '\r')
+      continue;
+
+    v = util_b64_val(c);
+
+    if(v < 0)
+      return(FAIL);
+
+    acc = (acc << 6) | (uint32_t)v;
+    nbits += 6;
+
+    if(nbits >= 8)
+    {
+      nbits -= 8;
+
+      if(w >= out_cap)
+        return(FAIL);
+
+      o[w++] = (unsigned char)((acc >> nbits) & 0xff);
+    }
+  }
+
+  if(written != NULL)
+    *written = w;
+
+  return(SUCCESS);
 }
 
 // URL helpers

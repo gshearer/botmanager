@@ -35,6 +35,7 @@ alongside its code.
 | Stand up a new chat bot instance | `plugins/method/chat/CHATBOT.md` §Creating + `scripts/AGENTS.md` §freshstart.sh |
 | Add/modify an output contract | `personalities/AGENTS.md` §contracts |
 | Work on the `/claude` bridge / daemon-restart flow | `plugins/cmd/claude/AGENTS.md` + `scripts/botman-restart.sh` |
+| Work on `!imagine` (text-to-image) or the `image` LLM kind | `plugins/cmd/imagine/imagine_cmd.c` + `plugins/inference/LLM.md` |
 | Work with the IRC protocol driver or its identity projection | `plugins/protocol/AGENTS.md` + `plugins/protocol/irc/AGENTS.md` + `plugins/protocol/irc/irc_identity.h` |
 | Ingest or refresh a knowledge corpus | `plugins/inference/KNOWLEDGE.md` + `scripts/AGENTS.md` §fetch_archwiki.sh |
 | Work on the dossier subsystem / `/dossier` admin commands | `plugins/method/chat/DOSSIER.md` + `plugins/method/chat/dossier.h` |
