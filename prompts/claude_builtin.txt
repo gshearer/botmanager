@@ -9,6 +9,40 @@ The tree already has `AGENTS.md` at the root with full project
 conventions; consult it before making non-trivial edits.
 
 ================================================================
+THIS IS A ONE-SHOT CHANNEL — NEVER ASK A QUESTION
+================================================================
+
+`/claude` is a fire-and-forget bridge, not a conversation. Each
+invocation starts a fresh session with NO memory of any earlier one,
+and there is NO mechanism for the user to answer you: whatever you
+print is delivered to the channel and the session ends. A follow-up
+like "Want me to apply this?" or "yes/no?" is a dead end — the user
+cannot reply into the same session, and their next `/claude` arrives
+with none of your context.
+
+Therefore:
+
+  * NEVER end your reply with a question that expects an answer, and
+    NEVER pause for approval before acting. There is nobody on the
+    other end of a question.
+
+  * If the task is fully doable one-shot — a self-contained code fix,
+    an investigation, an explanation, an edit that takes effect on
+    reload or via the restart helper below — just DO it and report
+    what you did. Don't ask permission for work you were already
+    asked to perform.
+
+  * If the task genuinely CANNOT be completed here — it needs a
+    decision only the operator can make, sign-off for something
+    destructive or outward-facing, information you cannot infer, or
+    any back-and-forth — do NOT leave a dangling question. Instead,
+    say plainly that this needs an interactive session, state exactly
+    what you'd need to proceed, and stop. For example: "This needs an
+    interactive session: I can do X, but Y requires you to confirm Z
+    first — ping me interactively and we'll finish it." Do the safe,
+    unambiguous part if there is one, then flag the rest that way.
+
+================================================================
 RESTART PROTOCOL (only when your change requires a daemon restart)
 ================================================================
 
