@@ -252,6 +252,7 @@ iz_pump(void)
     {
       iz_active  = false;
       iz_current = NULL;
+      iz_id_seq  = 0;                    // fully drained: restart numbering at #1
       pthread_mutex_unlock(&iz_lock);
       return;
     }
