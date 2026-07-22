@@ -1543,6 +1543,22 @@ kv_flush(void)
 
   pthread_mutex_lock(&kv_mutex);
 
+  // Refuse to persist before kv_load() has run. Until restore, the table
+  // holds only un-rehydrated schema defaults (plus bootstrap values that
+  // reload from botman.conf regardless), so flushing would overwrite the
+  // authoritative DB rows with those defaults. This is exactly the clobber
+  // a failed startup inflicts: when plugin_init_all() aborts before
+  // kv_load() (e.g. a plugin init error), the shutdown path still reaches
+  // kv_exit() -> kv_flush(). Nothing here is safe to save; skip it.
+  if(!kv_loaded)
+  {
+    pthread_mutex_unlock(&kv_mutex);
+
+    clam(CLAM_INFO, "kv_flush",
+        "skipped: kv not loaded (no persist before restore)");
+    return(SUCCESS);
+  }
+
   for(uint32_t b = 0; b < KV_BUCKETS; b++)
   {
     for(kv_entry_t *e = kv_table[b]; e != NULL; e = e->next)
