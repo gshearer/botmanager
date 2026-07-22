@@ -23,6 +23,7 @@ subdir('feature/whenmoon/strategy/riptide')
 subdir('service/openweather')
 subdir('service/coinmarketcap')
 subdir('service/searxng')
+subdir('service/yahoofinance')
 subdir('cmd/ask')
 # imagine_cmd is dormant: it registers the same 'imagine' command as
 # imagine_zimage, so loading both aborts startup (duplicate command).

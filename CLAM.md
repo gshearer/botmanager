@@ -143,6 +143,12 @@ regex (the literal context portion, before any `<placeholder>`).
 | `userns_user_set_password` | core/userns.c | password set |
 | `util` | core/util.c | shared utility helpers |
 
+## Cross-plugin contracts (`include/`)
+
+| Context | Source | Description |
+|---|---|---|
+| `stockquote` | include/stockquote.h | provider-neutral stock-quote contract; capability-resolution shims (no provider loaded / missing symbol) |
+
 ## Service plugins (`plugins/service/`)
 
 | Context | Source | Description |
@@ -156,6 +162,7 @@ regex (the literal context portion, before any `<placeholder>`).
 | `kraken` | plugins/service/kraken/kraken_sign.c | top-level kraken plugin (`KR_CTX`) |
 | `openweather` | plugins/service/openweather/openweather.c | OpenWeather API (`OW_CTX`) |
 | `searxng` | plugins/service/searxng/searxng.c | SearXNG service client (`SXNG_CTX`) |
+| `yahoofinance` | plugins/service/yahoofinance/yahoofinance.c | Yahoo Finance stock-quote provider (`YF_CTX`) |
 
 ## Command-surface plugins (`plugins/cmd/`)
 
