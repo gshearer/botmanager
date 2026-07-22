@@ -418,6 +418,26 @@ cmd_show_curl(const cmd_ctx_t *ctx)
       (unsigned long)cs.bytes_in, (unsigned long)cs.bytes_out);
   cmd_reply(ctx, buf);
 
+  // High-water marks vs configured ceilings — the numbers that tell you
+  // whether to raise core.curl.max_active / max_queued. A peak that has
+  // reached its ceiling (or any rejected submit) means requests were being
+  // throttled or dropped and the limit is worth revisiting.
+  snprintf(buf, sizeof(buf),
+      "  peak active: %u/%u%s   peak queued: %u/%u%s",
+      cs.active_peak, cs.max_active,
+      cs.active_peak >= cs.max_active ? CLR_YELLOW " (hit ceiling)" CLR_RESET : "",
+      cs.queued_peak, cs.max_queued,
+      cs.queued_peak >= cs.max_queued ? CLR_YELLOW " (hit ceiling)" CLR_RESET : "");
+  cmd_reply(ctx, buf);
+
+  if(cs.submit_rejected > 0)
+  {
+    snprintf(buf, sizeof(buf),
+        "  " CLR_RED "submits rejected (queue full): %lu" CLR_RESET,
+        (unsigned long)cs.submit_rejected);
+    cmd_reply(ctx, buf);
+  }
+
   if(cs.total_requests > 0)
   {
     double err_pct = (double)cs.total_errors /

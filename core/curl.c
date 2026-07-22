@@ -480,6 +480,7 @@ curl_request_submit(curl_request_t *req)
 
   if(curl_submit_total >= curl_cfg.max_queued)
   {
+    curl_submit_rejected++;
     pthread_mutex_unlock(&curl_submit_mutex);
     clam(CLAM_WARN, "curl", "submit rejected: queue full (%u)",
         curl_cfg.max_queued);
@@ -501,6 +502,9 @@ curl_request_submit(curl_request_t *req)
     q->tail = req;
     q->count++;
     curl_submit_total++;
+
+    if(curl_submit_total > curl_queued_peak)
+      curl_queued_peak = curl_submit_total;
   }
 
   pthread_mutex_unlock(&curl_submit_mutex);
@@ -561,6 +565,9 @@ curl_request_submit_wait(curl_request_t *req)
     q->tail = req;
     q->count++;
     curl_submit_total++;
+
+    if(curl_submit_total > curl_queued_peak)
+      curl_queued_peak = curl_submit_total;
   }
 
   pthread_mutex_unlock(&curl_submit_mutex);
@@ -907,6 +914,10 @@ curl_drain_queue(void)
       uint32_t total = 0;
       for(uint32_t i = 0; i < CURL_PRIO__COUNT; i++)
         total += curl_active_qs[i];
+
+      if(total > curl_active_peak)
+        curl_active_peak = total;
+
       clam(CLAM_DEBUG2, "curl", "%s %s (active: %u)",
           curl_method_name(req->method), req->url, total);
     }
@@ -1299,6 +1310,9 @@ curl_get_stats(curl_stats_t *out)
       total += curl_active_qs[i];
     out->active = total;
   }
+  out->active_peak      = curl_active_peak;
+  out->max_active       = curl_cfg.max_active;
+  out->max_queued       = curl_cfg.max_queued;
   out->total_requests   = curl_stat_total;
   out->total_errors     = curl_stat_errors;
   out->bytes_in         = curl_stat_in;
@@ -1306,7 +1320,9 @@ curl_get_stats(curl_stats_t *out)
   out->total_response_ms = curl_stat_time_ms;
 
   pthread_mutex_lock(&curl_submit_mutex);
-  out->queued = curl_submit_total;
+  out->queued           = curl_submit_total;
+  out->queued_peak      = curl_queued_peak;
+  out->submit_rejected  = curl_submit_rejected;
   pthread_mutex_unlock(&curl_submit_mutex);
 }
 

@@ -128,8 +128,13 @@ bool curl_post(const char *url, const char *content_type,
 
 typedef struct
 {
-  uint32_t active;          // in-flight requests
-  uint32_t queued;          // requests waiting in submit queue
+  uint32_t active;          // in-flight requests (instantaneous)
+  uint32_t queued;          // requests waiting in submit queue (instantaneous)
+  uint32_t active_peak;     // high-water mark of concurrent in-flight
+  uint32_t queued_peak;     // high-water mark of submit-queue depth
+  uint32_t max_active;      // configured concurrency ceiling
+  uint32_t max_queued;      // configured submit-queue ceiling
+  uint64_t submit_rejected; // submits refused because the queue was full
   uint64_t total_requests;  // lifetime total
   uint64_t total_errors;    // lifetime transport errors
   uint64_t bytes_in;        // total response bytes received
@@ -330,6 +335,15 @@ static uint64_t           curl_stat_errors  = 0;
 static uint64_t           curl_stat_in      = 0;
 static uint64_t           curl_stat_out     = 0;
 static uint64_t           curl_stat_time_ms = 0;
+
+// High-water marks + saturation telemetry (lifetime, since subsystem
+// start). Peaks answer "did we ever approach the configured ceilings?";
+// curl_submit_rejected counts submits dropped because the queue was
+// already at max_queued. curl_active_peak is updated on the multi-loop
+// thread; curl_queued_peak / curl_submit_rejected under curl_submit_mutex.
+static uint32_t           curl_active_peak     = 0;
+static uint32_t           curl_queued_peak     = 0;
+static uint64_t           curl_submit_rejected = 0;
 
 static curl_request_t    *curl_req_free     = NULL;
 static pthread_mutex_t    curl_req_mutex;
