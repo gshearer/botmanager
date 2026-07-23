@@ -95,10 +95,10 @@ static const plugin_kv_entry_t yf_kv_schema[] = {
     "Per-symbol quote cache TTL (seconds)" },
   { "plugin.yahoofinance.timeout_secs",  KV_UINT32, "10",
     "Per-request HTTP timeout (seconds)" },
-  { "plugin.yahoofinance.user_agent",    KV_STR,
-    "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) "
-    "Chrome/126.0.0.0 Safari/537.36",
-    "Browser User-Agent (bot UAs get blocked)" },
+  { "plugin.yahoofinance.user_agent",    KV_STR, "botmanager/1.0",
+    "HTTP User-Agent. Yahoo's finance API 429s browser-like *and* empty "
+    "UAs; a plain client token is served — do NOT set a Mozilla/Chrome "
+    "string here (verified 2026-07-22)" },
   { "plugin.yahoofinance.spark_range",   KV_STR, "1d",
     "Chart range for the inline sparkline" },
   { "plugin.yahoofinance.spark_interval", KV_STR, "5m",
