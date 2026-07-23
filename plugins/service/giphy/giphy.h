@@ -30,7 +30,7 @@
 #define GIPHY_ENC_SZ       512   // URL-encoded query
 #define GIPHY_KEY_SZ       KV_STR_SZ
 
-#define GIPHY_KV_API_KEY   "plugin.giphy.creds.api_key"
+#define GIPHY_KV_API_KEY   "plugin.giphy.creds.apikey"
 #define GIPHY_KV_RATING    "plugin.giphy.rating"
 #define GIPHY_KV_LANG      "plugin.giphy.lang"
 #define GIPHY_KV_MAX       "plugin.giphy.max_results"

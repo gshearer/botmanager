@@ -101,7 +101,7 @@ static pthread_mutex_t   tmdb_cache_mu;
 // KV schema
 
 static const plugin_kv_entry_t tmdb_kv_schema[] = {
-  { "plugin.tmdb.token",         KV_STR, "",
+  { "plugin.tmdb.creds.apikey",         KV_STR, "",
     "TMDB v4 Read Access Token (sent as 'Authorization: Bearer'). Get one "
     "free at themoviedb.org → Settings → API.", NULL, NULL },
   { "plugin.tmdb.language",      KV_STR, "en-US",

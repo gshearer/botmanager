@@ -1119,13 +1119,13 @@ ow_prepare_request(ow_request_t *r, const char *zipcode,
     return(OW_PREP_ERR);
   }
 
-  apikey = kv_get_str("plugin.openweather.apikey");
+  apikey = kv_get_creds("plugin.openweather.creds.apikey");
 
   if(apikey == NULL || apikey[0] == '\0')
   {
     snprintf(errbuf, errsz,
         "Error: OpenWeather API key not configured. "
-        "Set plugin.openweather.apikey via /set");
+        "Set plugin.openweather.creds.apikey via /set");
     return(OW_PREP_ERR);
   }
 
@@ -1864,7 +1864,7 @@ openweather_geocode_city_sync(const char *city, char *zip_out, size_t zip_sz)
 
   pthread_mutex_unlock(&ow_geo_cache_mu);
 
-  apikey = kv_get_str("plugin.openweather.apikey");
+  apikey = kv_get_creds("plugin.openweather.creds.apikey");
 
   if(apikey == NULL || apikey[0] == '\0')
   {
@@ -2045,7 +2045,7 @@ openweather_geocode_zip_sync(const char *zipcode,
 
   pthread_mutex_unlock(&ow_geo_cache_mu);
 
-  apikey = kv_get_str("plugin.openweather.apikey");
+  apikey = kv_get_creds("plugin.openweather.creds.apikey");
 
   if(apikey == NULL || apikey[0] == '\0')
     return(FAIL);

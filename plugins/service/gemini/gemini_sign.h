@@ -4,7 +4,7 @@
 // (HTTP body is intentionally empty — every parameter rides in the
 // base64-encoded payload):
 //
-//   X-GEMINI-APIKEY:    <plugin.gemini.creds.api_key verbatim>
+//   X-GEMINI-APIKEY:    <plugin.gemini.creds.apikey verbatim>
 //   X-GEMINI-PAYLOAD:   base64(payload_json)
 //   X-GEMINI-SIGNATURE: hex_lower(HMAC-SHA384(
 //                           plugin.gemini.creds.private_key,
@@ -38,7 +38,7 @@
 void    gem_sign_init(void);
 void    gem_sign_deinit(void);
 
-// True iff both plugin.gemini.creds.api_key and
+// True iff both plugin.gemini.creds.apikey and
 // plugin.gemini.creds.private_key are non-empty AND the private_key
 // base64-decoded cleanly. Safe to call at any time — refreshes the
 // cached snapshot transparently when the KVs change.

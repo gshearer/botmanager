@@ -229,7 +229,7 @@ typedef void (*kraken_done_assetpairs_cb_t)(
 
 #ifdef KR_INTERNAL
 
-// Returns true iff both plugin.kraken.creds.api_key and
+// Returns true iff both plugin.kraken.creds.apikey and
 // plugin.kraken.creds.private_key are set (non-empty) AND
 // creds.private_key base64-decodes cleanly.
 bool kraken_apikey_configured(void);

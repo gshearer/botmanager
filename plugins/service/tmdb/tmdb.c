@@ -911,7 +911,7 @@ emit:
 bool
 tmdb_configured(void)
 {
-  const char *tok = kv_get_str("plugin.tmdb.token");
+  const char *tok = kv_get_creds("plugin.tmdb.creds.apikey");
 
   return(tok != NULL && tok[0] != '\0');
 }
@@ -932,7 +932,7 @@ tmdb_search_async(tmdb_media_t kind, const char *query,
   if(cb == NULL || query == NULL || query[0] == '\0')
     return(FAIL);
 
-  tok = kv_get_str("plugin.tmdb.token");
+  tok = kv_get_creds("plugin.tmdb.creds.apikey");
 
   if(tok == NULL || tok[0] == '\0')
     return(FAIL);
@@ -1004,7 +1004,7 @@ tmdb_title_async(tmdb_media_t kind, int32_t id, tmdb_title_cb_t cb, void *user)
   if(kind != TMDB_MEDIA_MOVIE && kind != TMDB_MEDIA_TV)
     return(FAIL);
 
-  tok = kv_get_str("plugin.tmdb.token");
+  tok = kv_get_creds("plugin.tmdb.creds.apikey");
 
   if(tok == NULL || tok[0] == '\0')
     return(FAIL);
@@ -1080,7 +1080,7 @@ tmdb_person_async(int32_t id, tmdb_person_cb_t cb, void *user)
   if(cb == NULL || id <= 0)
     return(FAIL);
 
-  tok = kv_get_str("plugin.tmdb.token");
+  tok = kv_get_creds("plugin.tmdb.creds.apikey");
 
   if(tok == NULL || tok[0] == '\0')
     return(FAIL);
@@ -1159,7 +1159,7 @@ tmdb_trending_async(tmdb_media_t kind, bool weekly, tmdb_search_cb_t cb,
   if(cb == NULL)
     return(FAIL);
 
-  tok = kv_get_str("plugin.tmdb.token");
+  tok = kv_get_creds("plugin.tmdb.creds.apikey");
 
   if(tok == NULL || tok[0] == '\0')
     return(FAIL);

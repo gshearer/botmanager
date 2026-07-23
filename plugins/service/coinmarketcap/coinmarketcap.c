@@ -671,7 +671,7 @@ cmc_poll_tick(task_t *t)
     return;
   }
 
-  apikey = kv_get_str("plugin.coinmarketcap.apikey");
+  apikey = kv_get_creds("plugin.coinmarketcap.creds.apikey");
 
   if(apikey == NULL || apikey[0] == '\0')
   {
@@ -844,7 +844,7 @@ bool
 coinmarketcap_fetch_listings_async(
     coinmarketcap_done_listings_cb_t done_cb, void *user)
 {
-  const char *apikey = kv_get_str("plugin.coinmarketcap.apikey");
+  const char *apikey = kv_get_creds("plugin.coinmarketcap.creds.apikey");
   cmc_request_t *r;
 
   if(apikey == NULL || apikey[0] == '\0')
@@ -863,7 +863,7 @@ bool
 coinmarketcap_fetch_detail_async(const char *symbol, int32_t rank,
     coinmarketcap_done_detail_cb_t done_cb, void *user)
 {
-  const char *apikey = kv_get_str("plugin.coinmarketcap.apikey");
+  const char *apikey = kv_get_creds("plugin.coinmarketcap.creds.apikey");
   cmc_request_t *r;
 
   if(apikey == NULL || apikey[0] == '\0')
@@ -891,7 +891,7 @@ bool
 coinmarketcap_fetch_global_async(
     coinmarketcap_done_global_cb_t done_cb, void *user)
 {
-  const char *apikey = kv_get_str("plugin.coinmarketcap.apikey");
+  const char *apikey = kv_get_creds("plugin.coinmarketcap.creds.apikey");
   cmc_request_t *r;
 
   if(apikey == NULL || apikey[0] == '\0')
@@ -917,7 +917,7 @@ coinmarketcap_default_limit_kv_value(void)
 bool
 coinmarketcap_apikey_configured(void)
 {
-  const char *apikey = kv_get_str("plugin.coinmarketcap.apikey");
+  const char *apikey = kv_get_creds("plugin.coinmarketcap.creds.apikey");
 
   return(apikey != NULL && apikey[0] != '\0');
 }

@@ -69,7 +69,7 @@ giphy_mode_from_name(const char *s)
 typedef enum
 {
   GIPHY_OK = 0,
-  GIPHY_NO_KEY,        // plugin.giphy.creds.api_key unset
+  GIPHY_NO_KEY,        // plugin.giphy.creds.apikey unset
   GIPHY_AUTH,          // HTTP 401/403 — key rejected
   GIPHY_RATE_LIMITED,  // HTTP 429
   GIPHY_NOT_FOUND,     // HTTP 404, or an empty data payload
@@ -146,7 +146,7 @@ typedef void (*giphy_done_cb_t)(const giphy_response_t *resp);
 // consumers go through the static-inline dlsym shims below.
 #ifdef GIPHY_INTERNAL
 
-// True when plugin.giphy.creds.api_key holds a non-empty value.
+// True when plugin.giphy.creds.apikey holds a non-empty value.
 bool giphy_configured(void);
 
 // Submit a Giphy request. `query` is the search phrase (SEARCH /

@@ -217,7 +217,7 @@ llm_service_refresh_done_cb(const curl_response_t *resp)
     if(resp->status == 401 || resp->status == 403)
       clam(CLAM_INFO, "llm",
           "service %s requires an API key: "
-          "set kv llm.service.%s.apikey <key>", rctx->name, rctx->name);
+          "set kv llm.service.%s.creds.apikey <key>", rctx->name, rctx->name);
 
     mem_free(rctx);
     return;
@@ -243,7 +243,7 @@ llm_service_refresh_done_cb(const curl_response_t *resp)
 
 // Fire an async GET <base_url>/models for one service. The probe runs
 // keyless by default (local providers don't gate /models); an Authorization
-// header is attached only when llm.service.<name>.apikey holds a value, so a
+// header is attached only when llm.service.<name>.creds.apikey holds a value, so a
 // key-gated /models succeeds once the operator sets the key. Returns SUCCESS
 // if the request was submitted (curl worker owns the heap ctx thereafter).
 bool
@@ -278,7 +278,7 @@ llm_service_refresh(const char *name)
 
   // Bearer token only when configured — keyless providers probe fine
   // without it, and an empty "Bearer " would break some gateways.
-  snprintf(kvkey, sizeof(kvkey), "llm.service.%s.apikey", name);
+  snprintf(kvkey, sizeof(kvkey), "llm.service.%s.creds.apikey", name);
   apikey = kv_get_str(kvkey);
 
   if(apikey != NULL && apikey[0] != '\0')
@@ -301,10 +301,10 @@ llm_service_refresh(const char *name)
   return(SUCCESS);
 }
 
-// KV change hook on llm.service.<name>.apikey. Parses the service name out
-// of the key and re-probes /models when the value becomes non-empty. Fired
-// outside the KV lock (core/kv.c), so reading kv_get_str and submitting
-// curl from here is deadlock-safe.
+// KV change hook on llm.service.<name>.creds.apikey. Parses the service
+// name out of the key and re-probes /models when the value becomes
+// non-empty. Fired outside the KV lock (core/kv.c), so reading kv_get_str
+// and submitting curl from here is deadlock-safe.
 void
 llm_apikey_kv_cb(const char *key, void *data)
 {
@@ -319,7 +319,7 @@ llm_apikey_kv_cb(const char *key, void *data)
     return;
 
   tail = key + (sizeof(pfx) - 1);
-  dot  = strstr(tail, ".apikey");
+  dot  = strstr(tail, ".creds.apikey");
 
   if(dot == NULL || dot == tail)
     return;
@@ -644,7 +644,7 @@ cmd_llm_add_service(const cmd_ctx_t *ctx)
 
   db_result_free(res);
 
-  // Reload registers the llm.service.<name>.apikey KV slot; the refresh
+  // Reload registers the llm.service.<name>.creds.apikey KV slot; the refresh
   // seeds the /models cache asynchronously and runs keyless. If the
   // provider gates /models behind auth, the probe records 401/403 and
   // `show llm service` will flag "needs API key" — set it then and the
@@ -1202,7 +1202,7 @@ llm_service_line(const cmd_ctx_t *ctx, const char *name, const char *base,
   if(name == NULL)
     return;
 
-  snprintf(key, sizeof(key), "llm.service.%s.apikey", name);
+  snprintf(key, sizeof(key), "llm.service.%s.creds.apikey", name);
   token   = kv_get_str(key);
   key_set = token != NULL && token[0] != '\0';
 

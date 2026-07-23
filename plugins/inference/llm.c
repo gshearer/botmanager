@@ -477,7 +477,7 @@ llm_models_snapshot(const char *name, llm_model_t *out)
 // Mirror of llm_services: name → base_url. Reloaded from DB alongside the
 // model cache (and always before it, so model rows can resolve their
 // base_url via the join). Each service's provider-token KV slot,
-// llm.service.<name>.apikey, is registered here.
+// llm.service.<name>.creds.apikey, is registered here.
 
 // Caller must not hold the lock.
 static void
@@ -616,11 +616,11 @@ llm_services_reload(void)
     snprintf(s.base_url, sizeof(s.base_url), "%s", base ? base : "");
 
     // Register the provider-token KV slot named after the service so an
-    // operator can `set kv llm.service.<name>.apikey <token>` (kv_set
+    // operator can `set kv llm.service.<name>.creds.apikey <token>` (kv_set
     // rejects unregistered keys). kv_claim_orphans() (core init) has
     // already rehydrated any persisted token; the kv_exists guard means
     // we only ever create an empty slot, never clobber a live value.
-    snprintf(key, sizeof(key), "llm.service.%s.apikey", s.name);
+    snprintf(key, sizeof(key), "llm.service.%s.creds.apikey", s.name);
 
     // Attach the change hook whether we create the slot here or it was
     // rehydrated by kv_claim_orphans (core init) before this reload — so
@@ -628,7 +628,7 @@ llm_services_reload(void)
     if(!kv_exists(key))
       kv_register(key, KV_STR, "", llm_apikey_kv_cb, NULL,
           "LLM provider API token sent as 'Authorization: Bearer'."
-          " Keyed by service name (llm.service.<name>.apikey).");
+          " Keyed by service name (llm.service.<name>.creds.apikey).");
     else
       kv_set_cb(key, llm_apikey_kv_cb, NULL);
 
@@ -2521,7 +2521,7 @@ llm_chat_submit(const char *model_name,
   }
 
   snprintf(req->api_key_kv, sizeof(req->api_key_kv),
-      "llm.service.%s.apikey", m.service_name);
+      "llm.service.%s.creds.apikey", m.service_name);
   snprintf(req->service_name, sizeof(req->service_name), "%s", m.service_name);
 
   // Seed any learned request-dialect directives so the very first body for a
@@ -2599,7 +2599,7 @@ llm_embed_submit_impl(const char *model_name,
   }
 
   snprintf(req->api_key_kv, sizeof(req->api_key_kv),
-      "llm.service.%s.apikey", m.service_name);
+      "llm.service.%s.creds.apikey", m.service_name);
   req->kind            = m.kind;
   req->embed_dim       = m.embed_dim;
   req->embed_done_cb   = done_cb;
@@ -2681,7 +2681,7 @@ llm_image_submit(const char *model_name,
   }
 
   snprintf(req->api_key_kv, sizeof(req->api_key_kv),
-      "llm.service.%s.apikey", m.service_name);
+      "llm.service.%s.creds.apikey", m.service_name);
   snprintf(req->service_name, sizeof(req->service_name), "%s", m.service_name);
 
   req->kind          = m.kind;

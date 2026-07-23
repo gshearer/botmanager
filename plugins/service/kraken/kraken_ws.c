@@ -190,7 +190,7 @@ kr_ws_init(void)
 
   // Token cache invalidation when creds change. The channel multiplexer
   // re-fetches lazily on the next private subscribe.
-  kv_set_cb("plugin.kraken.creds.api_key",     kr_ws_kv_cb, &kr_ws);
+  kv_set_cb("plugin.kraken.creds.apikey",     kr_ws_kv_cb, &kr_ws);
   kv_set_cb("plugin.kraken.creds.private_key", kr_ws_kv_cb, &kr_ws);
 }
 

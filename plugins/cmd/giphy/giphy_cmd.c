@@ -295,7 +295,7 @@ giphy_cmd(const cmd_ctx_t *ctx)
   if(!giphy_configured())
   {
     cmd_reply(ctx, "giphy: no API key configured "
-        "(operator: set plugin.giphy.creds.api_key)");
+        "(operator: set plugin.giphy.creds.apikey)");
     return;
   }
 

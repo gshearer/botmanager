@@ -424,7 +424,7 @@ gem_submit_private(void *user_data, uint8_t prio, const char *path,
   }
 
   kv_admin_context_set(true);
-  api_key = kv_get_str("plugin.gemini.creds.api_key");
+  api_key = kv_get_str("plugin.gemini.creds.apikey");
   kv_admin_context_set(false);
 
   if(api_key == NULL || api_key[0] == '\0')

@@ -232,7 +232,7 @@ tmdb_err_note(tmdb_status_t st)
   {
     case TMDB_NOT_FOUND:    return("no results");
     case TMDB_RATE_LIMITED: return("TMDB is rate-limiting us — try again shortly");
-    case TMDB_AUTH:         return("TMDB rejected our token (check plugin.tmdb.token)");
+    case TMDB_AUTH:         return("TMDB rejected our token (check plugin.tmdb.creds.apikey)");
     case TMDB_UNAVAILABLE:  return("TMDB isn't configured");
     case TMDB_OK:           return("");
     case TMDB_TRANSPORT:    return("TMDB is unreachable right now");
@@ -885,7 +885,7 @@ tmdb_cmd(const cmd_ctx_t *ctx)
   if(!tmdb_configured())
   {
     cmd_reply(ctx, "TMDB isn't set up yet — the operator needs to set "
-        "plugin.tmdb.token.");
+        "plugin.tmdb.creds.apikey.");
     return;
   }
 

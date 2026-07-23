@@ -19,7 +19,7 @@
 // KV schema
 //
 // All keys live under the `plugin.gemini.*` namespace per core
-// convention. The `creds` segment auto-tiers `creds.api_key` and
+// convention. The `creds` segment auto-tiers `creds.apikey` and
 // `creds.private_key` as secret (kv_is_secret_key matches any non-
 // tail `creds` segment) so they redact for non-admin reads.
 //
@@ -40,7 +40,7 @@ static const plugin_kv_entry_t gem_kv_schema[] =
 
   // creds segment auto-tiers both keys as secret
   // (kv_is_secret_key matches any non-tail `creds` segment).
-  { "plugin.gemini.creds.api_key",       KV_STR, "", NULL, NULL, NULL },
+  { "plugin.gemini.creds.apikey",       KV_STR, "", NULL, NULL, NULL },
   { "plugin.gemini.creds.private_key",   KV_STR, "", NULL, NULL, NULL },
 
   // Subsystem toggles.

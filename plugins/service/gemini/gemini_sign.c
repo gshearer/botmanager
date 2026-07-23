@@ -330,7 +330,7 @@ gem_refresh_secret_locked(void)
   uint8_t     decoded[GEM_SECRET_BIN_CAP];
 
   kv_admin_context_set(true);
-  api_key  = kv_get_str("plugin.gemini.creds.api_key");
+  api_key  = kv_get_str("plugin.gemini.creds.apikey");
   priv_key = kv_get_str("plugin.gemini.creds.private_key");
   kv_admin_context_set(false);
 

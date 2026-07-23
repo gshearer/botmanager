@@ -11,11 +11,16 @@
 #define KV_STR_SZ  256
 
 // Substituted for any secret KV value when read without an active admin
-// context. Pointer-stable string literal — callers must not free.
+// context ("[CENSORED]"). Pointer-stable string literal — callers must
+// not free.
 extern const char *KV_REDACTED_VALUE;
 
 // True iff any non-tail dot-separated segment of key equals "creds".
-// "plugin.foo.creds.api_secret" is secret; "plugin.foo.creds" is not.
+// This is the single credential convention: every stored credential
+// lives under a `.creds.` segment — the API key itself is always
+// `.creds.apikey`, and any related material (tokens, key names, private
+// keys, passphrases) sits beside it under the same `.creds.` prefix.
+// "plugin.foo.creds.apikey" is secret; "plugin.foo.creds" is not.
 bool kv_is_secret_key(const char *key);
 
 bool kv_set_secret(const char *key, const char *val);
@@ -24,9 +29,20 @@ bool kv_set_secret(const char *key, const char *val);
 // KV_REDACTED_VALUE. Always non-NULL on a registered KV_STR key.
 const char *kv_get_secret(const char *key);
 
-// Thread-local admin-context flag. cmd dispatch sets this around the
-// command callback so secret-tier KV reads return real values; all other
-// readers see KV_REDACTED_VALUE.
+// Read a credential (`.creds.*`) value bypassing redaction — for a plugin
+// fetching its OWN stored credential to authenticate an outbound request.
+// This is a strictly internal-use accessor: NEVER route its result into a
+// user-facing reply, only the botmanctl display path may show credentials.
+// Returns NULL if unset. Non-secret keys read exactly as kv_get_str.
+const char *kv_get_creds(const char *key);
+
+// Thread-local admin-context flag. Command dispatch sets this around the
+// callback ONLY for admin commands arriving over the botmanctl control
+// socket (see cmd_creds_visible), so credential values de-redact solely
+// for the operator's local Unix-socket channel; every other method — IRC,
+// chat, ... — sees KV_REDACTED_VALUE even for an admin. Plugins that need
+// to read their own credential to sign a request arm this flag directly
+// for the duration of that read.
 void kv_admin_context_set(bool active);
 bool kv_admin_context_active(void);
 

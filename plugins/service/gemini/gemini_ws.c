@@ -243,7 +243,7 @@ gem_ws_init(void)
 
   // Cred-key changes invalidate the OE handshake so the next reconnect
   // re-signs against the refreshed key.
-  kv_set_cb("plugin.gemini.creds.api_key",       gem_ws_kv_cb, NULL);
+  kv_set_cb("plugin.gemini.creds.apikey",       gem_ws_kv_cb, NULL);
   kv_set_cb("plugin.gemini.creds.private_key",   gem_ws_kv_cb, NULL);
 
   clam(CLAM_DEBUG, GEM_CTX, "ws: subsystem initialized");
@@ -589,7 +589,7 @@ gem_ws_open_oe_locked(gem_ws_session_t *s)
   }
 
   kv_admin_context_set(true);
-  api_key = kv_get_str("plugin.gemini.creds.api_key");
+  api_key = kv_get_str("plugin.gemini.creds.apikey");
   kv_admin_context_set(false);
 
   if(api_key == NULL || api_key[0] == '\0')

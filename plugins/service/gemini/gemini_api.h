@@ -227,7 +227,7 @@ typedef void (*gemini_done_symbols_cb_t)(
 
 #ifdef GEM_INTERNAL
 
-// Returns true iff both plugin.gemini.creds.api_key and
+// Returns true iff both plugin.gemini.creds.apikey and
 // plugin.gemini.creds.private_key are set (non-empty) AND
 // creds.private_key base64-decodes cleanly.
 bool gemini_apikey_configured(void);

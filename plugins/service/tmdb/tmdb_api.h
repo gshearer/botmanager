@@ -183,7 +183,7 @@ typedef void (*tmdb_person_cb_t)(const tmdb_person_res_t *, void *user);
 
 #ifdef TMDB_INTERNAL
 
-// True when plugin.tmdb.token is configured.
+// True when plugin.tmdb.creds.apikey is configured.
 bool tmdb_configured(void);
 
 // Search. `kind` selects the endpoint: TMDB_MEDIA_UNKNOWN → /search/multi

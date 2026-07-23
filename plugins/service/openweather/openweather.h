@@ -150,7 +150,7 @@ static ow_citycache_t  *ow_city_cache[OW_CITY_CACHE_BUCKETS];
 static bool             ow_validate_zipcode(const char *s);
 
 static const plugin_kv_entry_t ow_kv_schema[] = {
-  { "plugin.openweather.apikey",         KV_STR,    "",
+  { "plugin.openweather.creds.apikey",         KV_STR,    "",
     "OpenWeatherMap API key" },
   { "plugin.openweather.units",          KV_STR,    "imperial",
     "Temperature units: imperial, metric, or standard" },

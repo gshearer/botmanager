@@ -20,7 +20,7 @@ typedef struct kv_nl_reg
 static kv_nl_reg_t     *kv_nl_head  = NULL;
 static pthread_mutex_t  kv_nl_mutex = PTHREAD_MUTEX_INITIALIZER;
 
-const char *KV_REDACTED_VALUE = "***";
+const char *KV_REDACTED_VALUE = "[CENSORED]";
 
 static __thread bool kv_admin_active = false;
 
@@ -611,6 +611,23 @@ kv_get_secret(const char *key)
   const char *s = kv_get_str(key);
 
   return(s != NULL ? s : KV_REDACTED_VALUE);
+}
+
+// Arms the thread-local admin context for the duration of one read so a
+// plugin can retrieve its own credential regardless of the caller's
+// transport. Restores the prior state — safe to nest inside an already
+// de-redacted context.
+const char *
+kv_get_creds(const char *key)
+{
+  const char *result;
+  bool        prev = kv_admin_active;
+
+  kv_admin_active = true;
+  result          = kv_get_str(key);
+  kv_admin_active = prev;
+
+  return(result);
 }
 
 bool

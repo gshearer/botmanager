@@ -12,7 +12,7 @@ Auth is **HMAC-SHA512** — Kraken's wire scheme is unchanged since the
 v1 REST API:
 
 ```
-API-Key:  <plugin.kraken.creds.api_key verbatim>
+API-Key:  <plugin.kraken.creds.apikey verbatim>
 API-Sign: base64(HMAC-SHA512(
               base64-decode(plugin.kraken.creds.private_key),
               uripath || SHA256(nonce_str || postdata)))
@@ -75,7 +75,7 @@ Hard layering rules apply (`plugins/service/AGENTS.md`):
 | `plugin.kraken.rest_url` | STR | `https://api.kraken.com` | REST base URL. |
 | `plugin.kraken.ws_url_public` | STR | `wss://ws.kraken.com/v2` | Public WebSocket URL (ticker, trade, ohlc). |
 | `plugin.kraken.ws_url_private` | STR | `wss://ws-auth.kraken.com/v2` | Private WebSocket URL (executions, balances). |
-| `plugin.kraken.creds.api_key` | STR (secret) | `` | API key string. Sent verbatim in `API-Key`. |
+| `plugin.kraken.creds.apikey` | STR (secret) | `` | API key string. Sent verbatim in `API-Key`. |
 | `plugin.kraken.creds.private_key` | STR (secret) | `` | Base64-encoded HMAC secret. Decoded once and cached. |
 | `plugin.kraken.rest_enabled` | BOOL | `true` | Enable REST dispatcher. |
 | `plugin.kraken.ws_enabled` | BOOL | `false` | Enable WebSocket reader. |
@@ -95,7 +95,7 @@ Key". Kraken exposes two strings: the **API Key** and the **Private
 Key** (a base64-encoded HMAC secret). Both go straight into KV:
 
 ```
-set kv plugin.kraken.creds.api_key <api-key-string>
+set kv plugin.kraken.creds.apikey <api-key-string>
 set kv plugin.kraken.creds.private_key <base64-secret>
 ```
 

@@ -5,7 +5,7 @@
 // The wire shape is documented at
 // docs.kraken.com/api/docs/rest-api/get-server-time §Authentication.
 // Result base64 lands in the `API-Sign` request header alongside
-// `API-Key: <plugin.kraken.creds.api_key>`.
+// `API-Key: <plugin.kraken.creds.apikey>`.
 //
 // Nonces are a monotonic 64-bit counter. The latest value is persisted
 // best-effort to `plugin.kraken.last_nonce` after every mint so a
@@ -249,7 +249,7 @@ kr_refresh_secret_locked(void)
   uint8_t     decoded[KR_SECRET_BIN_CAP];
 
   kv_admin_context_set(true);
-  api_key  = kv_get_str("plugin.kraken.creds.api_key");
+  api_key  = kv_get_str("plugin.kraken.creds.apikey");
   priv_key = kv_get_str("plugin.kraken.creds.private_key");
   kv_admin_context_set(false);
 

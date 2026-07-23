@@ -105,7 +105,7 @@ static task_handle_t    cmc_poll_task = TASK_HANDLE_NONE;
 // KV schema
 
 static const plugin_kv_entry_t cmc_kv_schema[] = {
-  { "plugin.coinmarketcap.apikey",        KV_STR,    "",
+  { "plugin.coinmarketcap.creds.apikey",        KV_STR,    "",
     "CoinMarketCap API key" },
   { "plugin.coinmarketcap.poll",          KV_BOOL,   "false",
     "Enable background price polling (true/false)" },

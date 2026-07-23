@@ -126,7 +126,7 @@ typedef struct
 // In-memory mirror of an llm_services row: one OpenAI-compatible provider,
 // keyed by name, carrying the base URL that the engine appends
 // /chat/completions, /models, /embeddings to. The API token lives in the
-// KV slot llm.service.<name>.apikey, derived from the name (no stored
+// KV slot llm.service.<name>.creds.apikey, derived from the name (no stored
 // pointer column).
 typedef struct llm_service
 {
@@ -308,7 +308,7 @@ bool        llm_build_url(const char *base, const char *op,
 bool        llm_service_refresh(const char *name);
 void        llm_services_refresh_all(void);
 
-// KV change hook for llm.service.<name>.apikey (kv_cb_t). When the key is
+// KV change hook for llm.service.<name>.creds.apikey (kv_cb_t). When the key is
 // set to a non-empty value, re-fires llm_service_refresh() for that service
 // so providers that gate /models behind auth get their model list on the
 // next probe. Defined in llm_cmd.c. Invoked outside the KV lock.

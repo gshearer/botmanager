@@ -18,7 +18,7 @@
 // KV schema
 //
 // All keys live under the `plugin.kraken.*` namespace per core
-// convention. The `creds` segment auto-tiers `creds.api_key` and
+// convention. The `creds` segment auto-tiers `creds.apikey` and
 // `creds.private_key` as secret (kv_is_secret_key matches any non-
 // tail `creds` segment) so they redact for non-admin reads.
 //
@@ -41,7 +41,7 @@ static const plugin_kv_entry_t kr_kv_schema[] =
   // decoded once and cached by the signer; the `api_key` is sent
   // verbatim in the `API-Key` header. The `creds` segment auto-tiers
   // both as secret.
-  { "plugin.kraken.creds.api_key",     KV_STR, "", NULL, NULL, NULL },
+  { "plugin.kraken.creds.apikey",     KV_STR, "", NULL, NULL, NULL },
   { "plugin.kraken.creds.private_key", KV_STR, "", NULL, NULL, NULL },
 
   // Subsystem toggles.

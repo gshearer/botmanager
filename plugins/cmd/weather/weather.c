@@ -723,7 +723,7 @@ weather_cmd_weather(const cmd_ctx_t *ctx)
   {
     cmd_reply(ctx,
         "Error: failed to submit weather request. "
-        "Check plugin.openweather.apikey.");
+        "Check plugin.openweather.creds.apikey.");
     mem_free(r);
   }
 }
@@ -777,7 +777,7 @@ weather_init(void)
       "Current conditions show temperature, humidity, wind,\n"
       "sunrise/sunset, and any active alerts.\n"
       "\n"
-      "Requires plugin.openweather.apikey to be set.\n"
+      "Requires plugin.openweather.creds.apikey to be set.\n"
       "Units controlled by plugin.openweather.units (imperial/metric).\n"
       "\n"
       "Example: !weather 90210\n"

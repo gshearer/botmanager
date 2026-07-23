@@ -1007,6 +1007,20 @@ cmd_caller_is_admin(bot_inst_t *bot, const char *username)
   return(userns_member_check(ns, username, USERNS_GROUP_ADMIN));
 }
 
+// True iff secret-tier (`.creds.*`) KV values may be de-redacted for the
+// duration of this command. The gate is deliberately narrow: the caller
+// must be an admin AND the command must have arrived over the botmanctl
+// control socket. Every other method (IRC, chat, ...) — even for an
+// admin — sees `[CENSORED]` in place of credential values. botmanctl is
+// the operator's local Unix-socket channel and the sole path to view
+// stored credentials.
+static bool
+cmd_creds_visible(const method_inst_t *inst, bool admin)
+{
+  return(admin && inst != NULL
+      && method_inst_type(inst) == METHOD_T_BOTMANCTL);
+}
+
 // Task callback for async command execution. Parses args if the command
 // has an arg spec, then invokes the command callback.
 static void
@@ -1015,6 +1029,7 @@ cmd_task_cb(task_t *t)
   cmd_task_data_t *d = (cmd_task_data_t *)t->data;
   const char      *uname;
   bool             admin;
+  bool             creds;
 
   cmd_ctx_t ctx = {
     .bot      = d->bot,
@@ -1043,13 +1058,14 @@ cmd_task_cb(task_t *t)
 
   uname = (d->username[0] != '\0') ? d->username : NULL;
   admin = cmd_caller_is_admin(d->bot, uname);
+  creds = cmd_creds_visible(d->msg.inst, admin);
 
-  if(admin)
+  if(creds)
     kv_admin_context_set(true);
 
   d->cb(&ctx);
 
-  if(admin)
+  if(creds)
     kv_admin_context_set(false);
 
   mem_free(d);
@@ -2136,13 +2152,14 @@ cmd_dispatch_as(const char *cmd_name, const char *args,
   {
     bool admin = (ns != NULL && username != NULL && username[0] != '\0' &&
         userns_member_check(ns, username, USERNS_GROUP_ADMIN));
+    bool creds = cmd_creds_visible(inst, admin);
 
-    if(admin)
+    if(creds)
       kv_admin_context_set(true);
 
     cb(&ctx);
 
-    if(admin)
+    if(creds)
       kv_admin_context_set(false);
   }
 

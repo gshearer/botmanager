@@ -762,7 +762,7 @@ crypto_cmd_crypto(const cmd_ctx_t *ctx)
   {
     cmd_reply(ctx,
         "Error: CoinMarketCap API key not configured. "
-        "Set plugin.coinmarketcap.apikey via /set");
+        "Set plugin.coinmarketcap.creds.apikey via /set");
     return;
   }
 
@@ -796,7 +796,7 @@ crypto_cmd_crypto(const cmd_ctx_t *ctx)
     {
       cmd_reply(ctx,
           "Error: failed to submit global request. "
-          "Check plugin.coinmarketcap.apikey.");
+          "Check plugin.coinmarketcap.creds.apikey.");
       mem_free(r);
     }
 
@@ -855,7 +855,7 @@ crypto_cmd_crypto(const cmd_ctx_t *ctx)
   {
     cmd_reply(ctx,
         "Error: failed to submit listings request. "
-        "Check plugin.coinmarketcap.apikey.");
+        "Check plugin.coinmarketcap.creds.apikey.");
     mem_free(r);
   }
 }

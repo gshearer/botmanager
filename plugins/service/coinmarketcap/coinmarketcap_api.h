@@ -179,7 +179,7 @@ bool coinmarketcap_fetch_global_async(
 // Returns the current value of plugin.coinmarketcap.default_limit.
 uint32_t coinmarketcap_default_limit_kv_value(void);
 
-// Returns true when plugin.coinmarketcap.apikey is configured.
+// Returns true when plugin.coinmarketcap.creds.apikey is configured.
 bool coinmarketcap_apikey_configured(void);
 
 #endif // CMC_INTERNAL

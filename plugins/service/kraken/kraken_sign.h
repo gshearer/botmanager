@@ -2,7 +2,7 @@
 //
 // Kraken's REST private endpoints authenticate with two HTTP headers:
 //
-//   API-Key:  <plugin.kraken.creds.api_key verbatim>
+//   API-Key:  <plugin.kraken.creds.apikey verbatim>
 //   API-Sign: base64(HMAC-SHA512(
 //                base64-decode(plugin.kraken.creds.private_key),
 //                uripath || SHA256(nonce_str || postdata)))
@@ -30,7 +30,7 @@
 void    kr_sign_init(void);
 void    kr_sign_deinit(void);
 
-// True iff both plugin.kraken.creds.api_key and
+// True iff both plugin.kraken.creds.apikey and
 // plugin.kraken.creds.private_key are non-empty AND the private_key
 // base64-decoded cleanly. Safe to call at any time — refreshes the
 // cached snapshot transparently when the KVs change.

@@ -14,7 +14,7 @@ Auth is **HMAC-SHA384** over a base64-encoded JSON payload — Gemini's
 wire scheme is unchanged since the v1 REST API:
 
 ```
-X-GEMINI-APIKEY:    <plugin.gemini.creds.api_key verbatim>
+X-GEMINI-APIKEY:    <plugin.gemini.creds.apikey verbatim>
 X-GEMINI-PAYLOAD:   base64(json_payload)            ; payload contains
                                                     ; request path + nonce
 X-GEMINI-SIGNATURE: lowercase_hex(HMAC-SHA384(
@@ -108,7 +108,7 @@ Hard layering rules apply (`plugins/service/AGENTS.md`):
 | `plugin.gemini.rest_url` | STR | `https://api.gemini.com` | REST base URL. |
 | `plugin.gemini.ws_url_marketdata` | STR | `wss://api.gemini.com/v2/marketdata` | Public WebSocket URL (l2, trade, candles_1m_updates). |
 | `plugin.gemini.ws_url_order_events` | STR | `wss://api.gemini.com/v1/order/events` | Private WebSocket URL. `?heartbeat=true` is appended at connect time only when the operator-set value does not already carry a query string. |
-| `plugin.gemini.creds.api_key` | STR (secret) | `` | Master/primary/scoped API key id. Sent verbatim in `X-GEMINI-APIKEY`. |
+| `plugin.gemini.creds.apikey` | STR (secret) | `` | Master/primary/scoped API key id. Sent verbatim in `X-GEMINI-APIKEY`. |
 | `plugin.gemini.creds.private_key` | STR (secret) | `` | Base64-encoded HMAC-SHA384 secret. Decoded once and cached. |
 | `plugin.gemini.rest_enabled` | BOOL | `true` | Enable REST dispatcher. |
 | `plugin.gemini.ws_enabled` | BOOL | `false` | Enable both WebSocket readers (Market Data v2 + Order Events). Order Events stays disconnected when creds are not configured even with this set. |
@@ -128,7 +128,7 @@ two strings: the **API Key** and the **API Secret** (a base64-encoded
 HMAC-SHA384 secret). Both go straight into KV:
 
 ```
-set kv plugin.gemini.creds.api_key <api-key-string>
+set kv plugin.gemini.creds.apikey <api-key-string>
 set kv plugin.gemini.creds.private_key <base64-secret>
 ```
 
