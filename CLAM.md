@@ -207,6 +207,7 @@ regex (the literal context portion, before any `<placeholder>`).
 | `strategy.juggernaut` | plugins/feature/whenmoon/strategy/juggernaut/ | juggernaut strategy log (`JUG_LOG_CTX`) |
 | `strategy.mako` | plugins/feature/whenmoon/strategy/mako/ | mako strategy log (`MAKO_LOG_CTX`) |
 | `strategy.squall` | plugins/feature/whenmoon/strategy/squall/ | squall strategy log (`SQUALL_LOG_CTX`) |
+| `strategy.keel` | plugins/feature/whenmoon/strategy/keel/ | keel strategy log (`KEEL_LOG_CTX`) |
 | `strategy.testing` | plugins/feature/whenmoon/strategy/testing/ | testing strategy log (`TST_LOG_CTX`) |
 | `userquote` | plugins/feature/userquote/ | quote book: schema, add/recall/del, migration (`UQ_CTX`) |
 | `whenmoon` | plugins/feature/whenmoon/ | top-level whenmoon (`WHENMOON_CTX`) |
