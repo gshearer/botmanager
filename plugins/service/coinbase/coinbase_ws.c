@@ -777,6 +777,27 @@ cb_ws_reader(task_t *t)
 
       pthread_mutex_unlock(&w->lock);
 
+      // Subscribe-ack watchdog. Pongs keep last_frame_ms fresh, so a
+      // gateway that silently ignores subscribes never trips the idle
+      // watchdog (INCIDENTS.md 2026-07-23: 75 min dark, pongs green).
+      // Probed with w->lock released — the channel layer's mu is the
+      // outer lock in the established order.
+      if(cb_ws_channels_sub_ack_overdue())
+      {
+        clam(CLAM_WARN, CB_CTX,
+            "ws subscribe unacked for %u ms — forcing reconnect",
+            CB_WS_SUB_ACK_TIMEOUT_MS);
+
+        pthread_mutex_lock(&w->lock);
+
+        if(w->state == CB_WS_OPEN)
+          cb_ws_schedule_reconnect_locked(w, "subscribe ack timeout");
+
+        pthread_mutex_unlock(&w->lock);
+
+        continue;
+      }
+
       {
         struct pollfd pfd = { .fd = sock, .events = POLLIN, .revents = 0 };
         int           pr;

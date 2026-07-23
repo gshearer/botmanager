@@ -50,6 +50,7 @@
 #define CB_WS_IDLE_TIMEOUT_MS   45000
 #define CB_WS_PING_INTERVAL_MS  20000
 #define CB_WS_POLL_MS           250
+#define CB_WS_SUB_ACK_TIMEOUT_MS 15000
 #define CB_WS_STOP_WAIT_MS      5000
 #define CB_WS_MAX_CONSEC_FAIL   10
 
@@ -255,6 +256,15 @@ void    cb_ws_channels_on_open(void);
 // matching local subscriber. Takes ownership of nothing; the buffer
 // pointer is only valid for the duration of the call.
 void    cb_ws_channels_dispatch(const char *buf, size_t len);
+
+// Subscribe-ack watchdog probe for the transport's reader loop. True
+// when the most recent subscribe batch has waited longer than
+// CB_WS_SUB_ACK_TIMEOUT_MS with no "subscriptions" ack from the
+// gateway — a state where the socket stays ping-pong-alive while every
+// subscribe is silently ignored (INCIDENTS.md 2026-07-23), which the
+// idle watchdog can never see. Thread-safe; the caller owns the
+// response (schedule a reconnect) — this only reports.
+bool    cb_ws_channels_sub_ack_overdue(void);
 
 #endif // CB_INTERNAL
 

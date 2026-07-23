@@ -590,6 +590,7 @@ wm_market_cmd_force(const cmd_ctx_t *ctx)
   char               exch[32];
   char               base[16];
   char               quote[16];
+  char               instance[WM_INSTANCE_LABEL_SZ] = {0};
   char               id_str[WM_MARKET_ID_STR_SZ];
   char               errbuf[192]  = {0};
   char               reply[256];
@@ -615,7 +616,7 @@ wm_market_cmd_force(const cmd_ctx_t *ctx)
      !wm_dl_next_token(&p, qty_tok,  sizeof(qty_tok)))
   {
     cmd_reply(ctx,
-        "usage: /whenmoon market force <exch>-<base>-<quote>"
+        "usage: /whenmoon market force <exch>-<base>-<quote>[@<instance>]"
         " <buy|sell> <qty> [<px>]");
     return;
   }
@@ -623,14 +624,20 @@ wm_market_cmd_force(const cmd_ctx_t *ctx)
   if(wm_dl_next_token(&p, px_tok, sizeof(px_tok)))
     px_override = strtod(px_tok, NULL);
 
-  if(wm_market_parse_id(id_tok, exch, sizeof(exch), base, sizeof(base),
-         quote, sizeof(quote)) != SUCCESS)
+  // WM-FORCE-INST-1: instance-aware like every other market verb, so
+  // the discretionary fund's manual order surface (and the A3 tripwire
+  // hook below) can address `@instance` markets.
+  if(wm_market_parse_instance_id(id_tok, exch, sizeof(exch), base,
+         sizeof(base), quote, sizeof(quote), instance,
+         sizeof(instance)) != SUCCESS)
   {
-    cmd_reply(ctx, "bad market id (expected <exch>-<base>-<quote>)");
+    cmd_reply(ctx,
+        "bad market id (expected <exch>-<base>-<quote>[@<instance>])");
     return;
   }
 
-  wm_market_format_id(exch, base, quote, id_str, sizeof(id_str));
+  wm_market_format_instance_id(exch, base, quote, instance,
+      id_str, sizeof(id_str));
 
   if(strcmp(side_tok, "buy") == 0)
     side_ch = 'b';
@@ -788,7 +795,7 @@ wm_market_register_verbs(void)
   // modes, real_submit_locked (with the four real-mode gates) for real
   // mode.
   if(cmd_register("whenmoon", "force",
-        "whenmoon market force <exch>-<base>-<quote>"
+        "whenmoon market force <exch>-<base>-<quote>[@<instance>]"
         " <buy|sell> <qty> [<px>]",
         "Operator-issued forced trade. Bypasses strategy advisors and"
         " the market's mode gate. Manual + paper modes: synthetic fill"

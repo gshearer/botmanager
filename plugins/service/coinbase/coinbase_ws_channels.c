@@ -87,6 +87,15 @@ static struct
   cb_ws_slot_t            slots[CB_WS_CH_MAX_SLOTS];
   uint32_t                n_slots;
 
+  // Subscribe-ack watchdog stamps (mu-guarded, CLOCK_MONOTONIC). The
+  // gateway can keep a socket ping-pong-alive while silently ignoring
+  // subscribes (INCIDENTS.md 2026-07-23) — the transport's idle
+  // watchdog never fires in that state, so it compares these instead:
+  // a subscribe send that outwaits CB_WS_SUB_ACK_TIMEOUT_MS with no
+  // "subscriptions" ack forces a reconnect.
+  uint64_t                last_sub_sent_ms;
+  uint64_t                last_ack_ms;
+
   bool                    initialized;
 } cb_ws_ch;
 
@@ -115,6 +124,23 @@ cb_ws_channel_name(coinbase_ws_channel_t ch)
     case COINBASE_CH__COUNT:       break;
   }
   return(NULL);
+}
+
+// The user channel is the only one Coinbase requires a JWT for.
+static bool
+cb_ws_channel_requires_auth(coinbase_ws_channel_t ch)
+{
+  return(ch == COINBASE_CH_USER);
+}
+
+static uint64_t
+cb_ws_ch_now_ms(void)
+{
+  struct timespec ts;
+
+  clock_gettime(CLOCK_MONOTONIC, &ts);
+
+  return(((uint64_t)ts.tv_sec * 1000u) + ((uint64_t)ts.tv_nsec / 1000000u));
 }
 
 static bool
@@ -243,10 +269,13 @@ cb_ws_slots_compact_locked(void)
 
 // Render one Advanced Trade subscribe / unsubscribe frame for a single
 // channel, listing every product whose slot passes `include_slot`.
-// `jwt` is embedded verbatim and must already be minted. Returns bytes
-// written, or 0 when no slot qualifies for `channel` under `pred`
-// (caller skips the frame). Channel name, product ids, and jwt are
-// JSON-safe by construction (allowlisted enums, base64url, hex).
+// `jwt` may be NULL — public channels are valid unsigned and the jwt
+// field is then omitted entirely (never sent empty: Coinbase rejects
+// malformed auth). When non-NULL it is embedded verbatim and must
+// already be minted. Returns bytes written, or 0 when no slot
+// qualifies for `channel` under `pred` (caller skips the frame).
+// Channel name, product ids, and jwt are JSON-safe by construction
+// (allowlisted enums, base64url, hex).
 typedef bool (*cb_ws_slot_pred_t)(const cb_ws_slot_t *);
 
 static size_t
@@ -261,7 +290,7 @@ cb_ws_render_frame_locked(char *out, size_t cap, const char *type,
   bool        any       = false;
   int         n;
 
-  if(out == NULL || cap == 0 || jwt == NULL)
+  if(out == NULL || cap == 0)
     return(0);
 
   cname = cb_ws_channel_name(channel);
@@ -316,8 +345,12 @@ cb_ws_render_frame_locked(char *out, size_t cap, const char *type,
     if(!any) return(0);
   }
 
-  n = snprintf(out + pos, cap - pos,
-      ",\"channel\":\"%s\",\"jwt\":\"%s\"}", cname, jwt);
+  if(jwt != NULL)
+    n = snprintf(out + pos, cap - pos,
+        ",\"channel\":\"%s\",\"jwt\":\"%s\"}", cname, jwt);
+  else
+    n = snprintf(out + pos, cap - pos, ",\"channel\":\"%s\"}", cname);
+
   if(n < 0 || (size_t)n >= cap - pos) return(0);
   pos += (size_t)n;
 
@@ -342,32 +375,72 @@ static bool cb_ws_pred_needs_unsub(const cb_ws_slot_t *s)
 // Reconcile — emit subscribe / unsubscribe frames for pending deltas
 // ----------------------------------------------------------------------
 
+// True when any slot on `ch` has a pending delta under `pred`.
+static bool
+cb_ws_delta_pending_locked(coinbase_ws_channel_t ch, cb_ws_slot_pred_t pred)
+{
+  for(uint32_t i = 0; i < cb_ws_ch.n_slots; i++)
+  {
+    const cb_ws_slot_t *s = &cb_ws_ch.slots[i];
+
+    if(s->channel == ch && pred(s))
+      return(true);
+  }
+
+  return(false);
+}
+
 // One frame per channel. Mints a single JWT covering the whole batch
 // (Advanced Trade accepts the same JWT on every subscribe within its
 // 120 s lifetime; minting once amortises ECDSA signing overhead in the
-// resubscribe-on-reconnect case).
+// resubscribe-on-reconnect case). A failed mint no longer aborts the
+// batch: public channels go out unsigned (Coinbase requires auth only
+// on the user channel) and auth channels are held — their slots keep
+// needs_sub and retry on the next delta / reconnect once creds exist.
+// A creds loss therefore degrades to "paper feed alive, auth channels
+// held" instead of darkening everything (CB-WS-PUB-1).
 static void
 cb_ws_send_delta_locked(const char *op, cb_ws_slot_pred_t pred,
     bool new_sent_state)
 {
-  char    frame[CB_WS_CH_TX_BUF_SZ];
-  char    jwt[CB_JWT_SZ];
-  size_t  len;
-  bool    ok;
+  char        frame[CB_WS_CH_TX_BUF_SZ];
+  char        jwt[CB_JWT_SZ];
+  char        held[128]  = {0};
+  size_t      held_len   = 0;
+  const char *jwt_p      = jwt;
+  bool        subscribing;
+  size_t      len;
+  bool        ok;
+
+  subscribing = (strcmp(op, "subscribe") == 0);
 
   if(cb_sign_jwt_ws(jwt, sizeof(jwt)) != SUCCESS)
-  {
-    clam(CLAM_WARN, CB_CTX, "ws %s: jwt mint failed (creds missing?)",
-        op);
-    return;
-  }
+    jwt_p = NULL;
 
   for(int ch = 0; ch < COINBASE_CH__COUNT; ch++)
   {
     coinbase_ws_channel_t cch = (coinbase_ws_channel_t)ch;
 
+    if(jwt_p == NULL && cb_ws_channel_requires_auth(cch))
+    {
+      const char *cname = cb_ws_channel_name(cch);
+      int         n;
+
+      if(cname == NULL)                          continue;
+      if(!cb_ws_delta_pending_locked(cch, pred)) continue;
+
+      // Held: slot untouched, stays pending, retries once creds exist.
+      n = snprintf(held + held_len, sizeof(held) - held_len, "%s%s",
+          held_len > 0 ? "," : "", cname);
+
+      if(n > 0 && (size_t)n < sizeof(held) - held_len)
+        held_len += (size_t)n;
+
+      continue;
+    }
+
     len = cb_ws_render_frame_locked(frame, sizeof(frame), op, cch, pred,
-        jwt);
+        jwt_p);
     if(len == 0) continue;
 
     ok = (cb_ws_send_json(frame, len) == SUCCESS);
@@ -383,6 +456,10 @@ cb_ws_send_delta_locked(const char *op, cb_ws_slot_pred_t pred,
 
         s->sent_upstream = new_sent_state;
       }
+
+      if(subscribing)
+        cb_ws_ch.last_sub_sent_ms = cb_ws_ch_now_ms();
+
       clam(CLAM_INFO, CB_CTX, "ws %s ch=%s (%zu bytes)", op,
           cb_ws_channel_name(cch), len);
     }
@@ -393,6 +470,15 @@ cb_ws_send_delta_locked(const char *op, cb_ws_slot_pred_t pred,
           op, cb_ws_channel_name(cch));
     }
   }
+
+  if(held_len > 0)
+    clam(CLAM_WARN, CB_CTX,
+        "ws %s: jwt mint failed (creds missing?) — public channels sent"
+        " unsigned, auth channel(s) held: %s", op, held);
+
+  else if(jwt_p == NULL)
+    clam(CLAM_DEBUG, CB_CTX,
+        "ws %s: jwt mint failed; all-public batch sent unsigned", op);
 }
 
 // ----------------------------------------------------------------------
@@ -903,6 +989,25 @@ cb_ws_channels_on_open(void)
   pthread_mutex_unlock(&cb_ws_ch.mu);
 }
 
+bool
+cb_ws_channels_sub_ack_overdue(void)
+{
+  uint64_t sent;
+  uint64_t acked;
+
+  if(!cb_ws_ch.initialized) return(false);
+
+  pthread_mutex_lock(&cb_ws_ch.mu);
+  sent  = cb_ws_ch.last_sub_sent_ms;
+  acked = cb_ws_ch.last_ack_ms;
+  pthread_mutex_unlock(&cb_ws_ch.mu);
+
+  if(sent == 0 || acked >= sent)
+    return(false);
+
+  return(cb_ws_ch_now_ms() - sent > CB_WS_SUB_ACK_TIMEOUT_MS);
+}
+
 void
 cb_ws_channels_dispatch(const char *buf, size_t len)
 {
@@ -958,6 +1063,10 @@ cb_ws_channels_dispatch(const char *buf, size_t len)
     // Surface the channel list inside the ack so we can correlate
     // subscribes-out with acks-in and spot the missing channel.
     const char *raw_json;
+
+    pthread_mutex_lock(&cb_ws_ch.mu);
+    cb_ws_ch.last_ack_ms = cb_ws_ch_now_ms();
+    pthread_mutex_unlock(&cb_ws_ch.mu);
 
     raw_json = json_object_to_json_string_ext(root,
         JSON_C_TO_STRING_PLAIN | JSON_C_TO_STRING_NOSLASHESCAPE);
