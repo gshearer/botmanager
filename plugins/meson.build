@@ -24,6 +24,7 @@ subdir('service/openweather')
 subdir('service/coinmarketcap')
 subdir('service/searxng')
 subdir('service/yahoofinance')
+subdir('service/tmdb')
 subdir('cmd/ask')
 # imagine_cmd is dormant: it registers the same 'imagine' command as
 # imagine_zimage, so loading both aborts startup (duplicate command).
@@ -38,4 +39,5 @@ subdir('cmd/math')
 subdir('cmd/searxng')
 subdir('cmd/smallgames')
 subdir('cmd/stock')
+subdir('cmd/tmdb')
 subdir('cmd/weather')
