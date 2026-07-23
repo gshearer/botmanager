@@ -36,6 +36,7 @@ alongside its code.
 | Add/modify an output contract | `personalities/AGENTS.md` §contracts |
 | Work on the `/claude` bridge / daemon-restart flow | `plugins/cmd/claude/AGENTS.md` + `scripts/botman-restart.sh` |
 | Work on `!imagine` (text-to-image) or the `image` LLM kind | `plugins/cmd/imagine/imagine_cmd.c` + `plugins/inference/LLM.md` |
+| Work on GIF search (`!giphy`) | `plugins/service/giphy/giphy_api.h` (contract) + `plugins/service/giphy/` (provider) + `plugins/cmd/giphy/` (command) |
 | Work on stock/equity/fund/commodity quotes (`!stock`) | `TODO.md` §STOCK-1..5 + `include/stockquote.h` (contract) + `plugins/service/yahoofinance/` (provider) + `plugins/cmd/stock/` (command) |
 | Work with the IRC protocol driver or its identity projection | `plugins/protocol/AGENTS.md` + `plugins/protocol/irc/AGENTS.md` + `plugins/protocol/irc/irc_identity.h` |
 | Ingest or refresh a knowledge corpus | `plugins/inference/KNOWLEDGE.md` + `scripts/AGENTS.md` §fetch_archwiki.sh |

@@ -159,9 +159,11 @@ regex (the literal context portion, before any `<placeholder>`).
 | `gemini.ws` | plugins/service/gemini/gemini_ws_channels.c | gemini WS transport (generic) |
 | `gemini.ws.md` | plugins/service/gemini/gemini_ws_channels.c | gemini WS Market Data v2 |
 | `gemini.ws.oe` | plugins/service/gemini/gemini_ws_channels.c | gemini WS Order Events |
+| `giphy` | plugins/service/giphy/giphy.c | Giphy GIF API client (`GIPHY_CTX`) |
 | `kraken` | plugins/service/kraken/kraken_sign.c | top-level kraken plugin (`KR_CTX`) |
 | `openweather` | plugins/service/openweather/openweather.c | OpenWeather API (`OW_CTX`) |
 | `searxng` | plugins/service/searxng/searxng.c | SearXNG service client (`SXNG_CTX`) |
+| `tmdb` | plugins/service/tmdb/tmdb.c | The Movie Database API (`TMDB_CTX`) |
 | `yahoofinance` | plugins/service/yahoofinance/yahoofinance.c | Yahoo Finance stock-quote provider (`YF_CTX`) |
 
 ## Command-surface plugins (`plugins/cmd/`)
@@ -171,9 +173,11 @@ regex (the literal context portion, before any `<placeholder>`).
 | `ask` | plugins/cmd/ask/ask_cmd.c | `!ask` one-shot LLM command (`ASK_CMD_CTX`) |
 | `claude` | plugins/cmd/claude/claude.c | `/claude` bridge command (`CLAUDE_CTX`) |
 | `crypto` | plugins/cmd/crypto/crypto.c | `/crypto` price command (`CRYPTO_CTX`) |
+| `giphy_cmd` | plugins/cmd/giphy/giphy_cmd.c | `!giphy` GIF search command (`GIPHY_CMD_CTX`) |
 | `imagine` | plugins/cmd/imagine/imagine_cmd.c | `!imagine` text-to-image command (`IMG_CMD_CTX`) |
 | `searxng` | plugins/cmd/searxng/searxng_cmd.c | `/searxng` command (`SEARXNG_CMD_CTX`) |
 | `stock` | plugins/cmd/stock/stock.c | `!stock` quote command (`STOCK_CTX`) |
+| `tmdb_cmd` | plugins/cmd/tmdb/tmdb_cmd.c | `!tmdb` movie/TV/actor command (`TMDBCMD_CTX`) |
 | `weather` | plugins/cmd/weather/weather.c | `/weather` command (`WEATHER_CTX`) |
 
 ## Method plugins (`plugins/method/`)
