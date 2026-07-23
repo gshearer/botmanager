@@ -55,6 +55,11 @@
 //   rsi_max      optional oversold filter: require RSI_14 <= this (>=100 = off)
 //   trigger_atr_min  minimum up-tick magnitude, in ATR_14(1h), to count
 //                toward the trigger streak (0 = off, any positive tick counts)
+//   decision_grain  0 = decide on 1h closes (flagship), 1 = decide on 4h
+//                closes instead. When lifted to 4h, the macro tide is forced
+//                to the 1d grain regardless of regime_grain (the only grain
+//                strictly coarser than a 4h decision) so the tide never
+//                degenerates into reading the decision grain's own state.
 //
 // LOOKAHEAD SAFETY. The backtest fires on_bar in a merged chronological walk
 // across grains; on a shared timestamp the FINER grain fires first (1h before
@@ -108,6 +113,7 @@
 #define RIPTIDE_DEFAULT_STOP_ATR      3.00   // protective stop 3.0 ATR below entry
 #define RIPTIDE_DEFAULT_RSI_MAX     100.0    // oversold filter off by default
 #define RIPTIDE_DEFAULT_TRIGGER_ATR_MIN  0.0  // 0 = off, any positive tick counts
+#define RIPTIDE_DEFAULT_DECISION_GRAIN  0.0   // 0 = 1h decision (flagship), 1 = 4h
 
 typedef struct
 {
@@ -119,6 +125,7 @@ typedef struct
   double     stop_atr;       // protective stop below entry (ATR units)
   double     rsi_max;        // oversold filter (>=100 = off)
   double     trigger_atr_min;   // min up-tick magnitude, ATR units (0 = off)
+  int        decision_grain; // 0 = decide on 1h closes, 1 = decide on 4h closes
 
   // Cached tide-grain context. *_have latches once that grain produces a bar.
   // reg_ema is the strategy-computed slow self-EMA of that grain's closes.
@@ -180,11 +187,16 @@ riptide_cache_context(riptide_state_t *s, wm_gran_t grain,
 }
 
 // Macro tide up? close of the selected tide grain above its slow self-EMA.
-// Fails closed until that grain has produced a bar.
+// Fails closed until that grain has produced a bar. When the decision itself
+// runs on 4h (decision_grain=1), the tide is forced onto 1d — the only grain
+// strictly coarser than a 4h decision — so it never degenerates into reading
+// the decision grain's own cached state.
 static bool
 riptide_regime_up(const riptide_state_t *s)
 {
-  if(s->regime_grain == 0)
+  int grain = (s->decision_grain == 1) ? 0 : s->regime_grain;
+
+  if(grain == 0)
     return(s->d1_have && !isnan(s->d1_ema) && s->d1_close > s->d1_ema);
 
   return(s->h4_have && !isnan(s->h4_ema) && s->h4_close > s->h4_ema);
@@ -270,6 +282,17 @@ static const wm_strategy_param_t riptide_params[] = {
                    " count toward the trigger streak (0 disables it, any"
                    " positive tick counts). Default 0 (off).",
   },
+  {
+    .name        = "decision_grain",
+    .type        = WM_PARAM_UINT,
+    .default_int = (int64_t)RIPTIDE_DEFAULT_DECISION_GRAIN,
+    .min_int     = 0,
+    .max_int     = 1,
+    .step_dbl    = 1.0,
+    .help        = "Grain the arm/trigger/exit decision runs on: 0=1h"
+                   " (flagship), 1=4h. Lifting to 4h forces the macro tide"
+                   " onto the 1d grain regardless of regime_grain. Default 0.",
+  },
 };
 
 void
@@ -330,6 +353,8 @@ wm_strategy_init(wm_strategy_ctx_t *ctx)
       RIPTIDE_DEFAULT_RSI_MAX);
   s->trigger_atr_min = wm_strategy_kv_get_dbl(mid, strat, "trigger_atr_min",
       RIPTIDE_DEFAULT_TRIGGER_ATR_MIN);
+  s->decision_grain = (int)wm_strategy_kv_get_uint(mid, strat, "decision_grain",
+      (uint64_t)RIPTIDE_DEFAULT_DECISION_GRAIN);
 
   if(s->regime_grain < 0)         s->regime_grain = 0;
   if(s->regime_grain > 1)         s->regime_grain = 1;
@@ -339,14 +364,18 @@ wm_strategy_init(wm_strategy_ctx_t *ctx)
   if(s->target_atr < 0.0)         s->target_atr = 0.0;
   if(s->stop_atr <= 0.0)          s->stop_atr = RIPTIDE_DEFAULT_STOP_ATR;
   if(s->trigger_atr_min < 0.0)    s->trigger_atr_min = 0.0;
+  if(s->decision_grain < 0)       s->decision_grain = 0;
+  if(s->decision_grain > 1)       s->decision_grain = 1;
 
   wm_strategy_ctx_set_user(ctx, s);
 
   clam(CLAM_INFO, RIPTIDE_LOG_CTX,
       "init: %s -> %s regime_grain=%d regime_alpha=%.4f entry_atr=%.2f"
-      " target_atr=%.2f stop_atr=%.2f rsi_max=%.1f trigger_atr_min=%.2f",
+      " target_atr=%.2f stop_atr=%.2f rsi_max=%.1f trigger_atr_min=%.2f"
+      " decision_grain=%d",
       strat, mid, s->regime_grain, s->regime_alpha, s->entry_atr,
-      s->target_atr, s->stop_atr, s->rsi_max, s->trigger_atr_min);
+      s->target_atr, s->stop_atr, s->rsi_max, s->trigger_atr_min,
+      s->decision_grain);
 
   return(0);
 }
@@ -382,6 +411,7 @@ wm_strategy_on_bar(wm_strategy_ctx_t *ctx,
   double                close;
   bool                  regime_up;
   bool                  have_core;
+  bool                  is_decision_bar;
   bool                  fire = false;
 
   (void)mkt;   // riptide reads only ind[] slots + its own cached context.
@@ -394,18 +424,35 @@ wm_strategy_on_bar(wm_strategy_ctx_t *ctx,
   if(s == NULL)
     return;
 
-  // Tide grains only refresh cached context.
-  if(grain == WM_GRAN_4H || grain == WM_GRAN_1D)
+  // 1d is always tide-only. 4h is tide-only UNLESS decision_grain=1, in
+  // which case it doubles as the decision grain (mirrors cp2/surf's
+  // cached-higher-grain pattern, just one notch coarser: tide=1d,
+  // decision=4h instead of tide=4h, decision=1h). 1h is the decision grain
+  // UNLESS decision_grain=1, in which case its bars are ignored entirely.
+  if(grain == WM_GRAN_1D)
   {
     riptide_cache_context(s, grain, bar);
     return;
   }
 
-  // Only the 1h grain runs the decision.
-  if(grain != WM_GRAN_1H)
+  if(grain == WM_GRAN_4H)
+  {
+    riptide_cache_context(s, grain, bar);
+    is_decision_bar = (s->decision_grain == 1);
+  }
+
+  else if(grain == WM_GRAN_1H)
+  {
+    is_decision_bar = (s->decision_grain == 0);
+  }
+
+  else
     return;
 
-  // ---- 1h decision grain ----
+  if(!is_decision_bar)
+    return;
+
+  // ---- decision grain (1h flagship, or 4h when decision_grain=1) ----
   close     = bar->close;
   ema20     = bar->ind[WM_IND_EMA_20];
   atr       = bar->ind[WM_IND_ATR_14];
