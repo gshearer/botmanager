@@ -1,0 +1,1018 @@
+// botmanager — MIT
+// !stock command-surface plugin: parses flags, fetches quotes through the
+// provider-neutral "stock_quotes" capability, and renders colorized
+// tables, verbose cards (gauge + sparkline), and symbol searches.
+#define STOCK_INTERNAL
+#include "stock.h"
+
+#include "colors.h"
+
+#include <ctype.h>
+#include <math.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+
+// ----------------------------------------------------------------------
+// Column / string helpers (color-marker + UTF-8 aware)
+// ----------------------------------------------------------------------
+
+// Visible column count: abstract color markers ("\x01" + id) are 2 bytes
+// of zero width; a UTF-8 code point is one column (every glyph we emit —
+// block, arrow, en-dash — is a single-column BMP character), so we count
+// lead bytes only.
+static size_t
+stock_visible_len(const char *s)
+{
+  size_t n = 0;
+
+  while(*s != '\0')
+  {
+    unsigned char c = (unsigned char)*s;
+
+    if(c == '\x01' && s[1] != '\0')
+    {
+      s += 2;
+      continue;
+    }
+
+    if((c & 0xc0) != 0x80)
+      n++;
+
+    s++;
+  }
+
+  return(n);
+}
+
+// Right-align: shift content and prepend spaces until it fills `width`
+// visible columns. No-op if it already meets or exceeds the width.
+static void
+stock_pad(char *buf, size_t sz, int width)
+{
+  size_t vis = stock_visible_len(buf);
+  size_t raw = strlen(buf);
+  int    pad = width - (int)vis;
+
+  if(pad <= 0 || raw + (size_t)pad + 1 > sz)
+    return;
+
+  memmove(buf + pad, buf, raw + 1);
+
+  for(int i = 0; i < pad; i++)
+    buf[i] = ' ';
+}
+
+// Left-align: append spaces until content fills `width` visible columns.
+static void
+stock_padr(char *buf, size_t sz, int width)
+{
+  size_t vis = stock_visible_len(buf);
+  size_t raw = strlen(buf);
+  int    pad = width - (int)vis;
+
+  if(pad <= 0)
+    return;
+
+  if(raw + (size_t)pad + 1 > sz)
+    pad = (int)(sz - raw - 1);
+
+  for(int i = 0; i < pad; i++)
+    buf[raw + (size_t)i] = ' ';
+
+  buf[raw + (size_t)pad] = '\0';
+}
+
+// Copy at most `cols` display columns of `src` into `dst`, never splitting
+// a UTF-8 sequence, always NUL-terminating. `src` is raw provider text
+// (no color markers).
+static void
+stock_fit(const char *src, int cols, char *dst, size_t sz)
+{
+  size_t n = 0;
+  int    w = 0;
+
+  while(*src != '\0' && w < cols)
+  {
+    unsigned char c   = (unsigned char)*src;
+    size_t        len = 1;
+
+    if((c & 0xe0) == 0xc0)      len = 2;
+    else if((c & 0xf0) == 0xe0) len = 3;
+    else if((c & 0xf8) == 0xf0) len = 4;
+
+    // A NUL inside the sequence (provider-side byte truncation mid-glyph)
+    // bounds len to the bytes actually present, so src never advances past
+    // the terminator.
+    for(size_t k = 0; k < len; k++)
+      if(src[k] == '\0')
+      {
+        len = k;
+        break;
+      }
+
+    if(len == 0 || n + len + 1 > sz)
+      break;
+
+    for(size_t k = 0; k < len; k++)
+      dst[n++] = src[k];
+
+    src += len;
+    w++;
+  }
+
+  dst[n] = '\0';
+}
+
+// Bounded string append that tolerates a full buffer without underflow.
+static size_t
+stock_append(char *dst, size_t sz, size_t pos, const char *s)
+{
+  int w;
+
+  if(pos + 1 >= sz)
+    return(pos);
+
+  w = snprintf(dst + pos, sz - pos, "%s", s);
+
+  if(w < 0)
+    return(pos);
+
+  pos += (size_t)w;
+  return(pos > sz - 1 ? sz - 1 : pos);
+}
+
+// ----------------------------------------------------------------------
+// Value formatters
+// ----------------------------------------------------------------------
+
+// Price honoring the provider's decimal hint, else scaling precision to
+// magnitude. Caller guarantees `p` is finite.
+static void
+stock_fmt_price(double p, uint8_t dec, char *buf, size_t sz)
+{
+  double a = p < 0.0 ? -p : p;
+
+  if(dec > 0 && dec <= 8)
+    snprintf(buf, sz, "%.*f", (int)dec, p);
+  else if(a >= 1.0)
+    snprintf(buf, sz, "%.2f", p);
+  else if(a >= 0.01)
+    snprintf(buf, sz, "%.4f", p);
+  else if(a > 0.0)
+    snprintf(buf, sz, "%.6f", p);
+  else
+    snprintf(buf, sz, "%.2f", p);
+}
+
+// Share volume with a K/M/B/T suffix (unit-agnostic; no currency).
+static void
+stock_fmt_vol(double v, char *buf, size_t sz)
+{
+  double a = v < 0.0 ? -v : v;
+
+  if(a >= 1e12)     snprintf(buf, sz, "%.2fT", v / 1e12);
+  else if(a >= 1e9) snprintf(buf, sz, "%.2fB", v / 1e9);
+  else if(a >= 1e6) snprintf(buf, sz, "%.2fM", v / 1e6);
+  else if(a >= 1e3) snprintf(buf, sz, "%.1fK", v / 1e3);
+  else              snprintf(buf, sz, "%.0f",  v);
+}
+
+// Colored, arrowed percentage change for the table's Change column.
+static void
+stock_fmt_pct(double pct, char *buf, size_t sz)
+{
+  if(isnan(pct))
+    snprintf(buf, sz, CLR_GRAY "—" CLR_RESET);
+  else if(pct > 0.0)
+    snprintf(buf, sz, CLR_GREEN "▲%.2f%%" CLR_RESET, pct);
+  else if(pct < 0.0)
+    snprintf(buf, sz, CLR_RED "▼%.2f%%" CLR_RESET, -pct);
+  else
+    snprintf(buf, sz, "0.00%%");
+}
+
+// Colored, arrowed absolute-and-percent delta for the verbose card,
+// e.g. "▲+1.23 (+0.45%)". Used for both regular and extended sessions.
+static void
+stock_fmt_delta(double abs_chg, double pct, char *buf, size_t sz)
+{
+  const char *clr;
+  const char *arrow;
+  char        cbuf[24];
+  char        pbuf[24];
+  bool        up;
+  bool        down;
+
+  if(isnan(abs_chg) && isnan(pct))
+  {
+    snprintf(buf, sz, CLR_GRAY "—" CLR_RESET);
+    return;
+  }
+
+  up   = (!isnan(abs_chg) && abs_chg > 0.0) || (!isnan(pct) && pct > 0.0);
+  down = (!isnan(abs_chg) && abs_chg < 0.0) || (!isnan(pct) && pct < 0.0);
+
+  if(up)        { clr = CLR_GREEN; arrow = "▲"; }
+  else if(down) { clr = CLR_RED;   arrow = "▼"; }
+  else          { clr = CLR_WHITE; arrow = "";  }
+
+  if(!isnan(abs_chg)) snprintf(cbuf, sizeof(cbuf), "%+.2f", abs_chg);
+  else                cbuf[0] = '\0';
+
+  if(!isnan(pct)) snprintf(pbuf, sizeof(pbuf), "%+.2f%%", pct);
+  else            pbuf[0] = '\0';
+
+  if(cbuf[0] != '\0' && pbuf[0] != '\0')
+    snprintf(buf, sz, "%s%s%s (%s)" CLR_RESET, clr, arrow, cbuf, pbuf);
+  else
+    snprintf(buf, sz, "%s%s%s%s" CLR_RESET, clr, arrow, cbuf, pbuf);
+}
+
+// "lo–hi" price range (en-dash), or a dim marker when either bound is
+// absent.
+static void
+stock_fmt_range(double lo, double hi, uint8_t dec, char *buf, size_t sz)
+{
+  char lbuf[24];
+  char hbuf[24];
+
+  if(isnan(lo) || isnan(hi))
+  {
+    snprintf(buf, sz, CLR_GRAY "—" CLR_RESET);
+    return;
+  }
+
+  stock_fmt_price(lo, dec, lbuf, sizeof(lbuf));
+  stock_fmt_price(hi, dec, hbuf, sizeof(hbuf));
+  snprintf(buf, sz, "%s–%s", lbuf, hbuf);
+}
+
+static void
+stock_klass_str(quote_class_t k, char *buf, size_t sz)
+{
+  const char *s;
+
+  switch(k)
+  {
+    case QUOTE_CLASS_EQUITY: s = "stock";  break;
+    case QUOTE_CLASS_ETF:    s = "ETF";    break;
+    case QUOTE_CLASS_FUND:   s = "fund";   break;
+    case QUOTE_CLASS_INDEX:  s = "index";  break;
+    case QUOTE_CLASS_FX:     s = "FX";     break;
+    case QUOTE_CLASS_CRYPTO: s = "crypto"; break;
+    case QUOTE_CLASS_FUTURE: s = "future"; break;
+    default:                 s = "";       break;
+  }
+
+  snprintf(buf, sz, "%s", s);
+}
+
+// Human note for a per-symbol non-OK status (auth failures read as a
+// generic outage rather than leaking the enrichment tier's mechanics).
+static const char *
+stock_status_note(quote_status_t st)
+{
+  switch(st)
+  {
+    case QUOTE_NOT_FOUND:    return("no data");
+    case QUOTE_RATE_LIMITED: return("rate-limited");
+    case QUOTE_OK:           return("");
+    case QUOTE_AUTH:
+    case QUOTE_TRANSPORT:
+    case QUOTE_UNAVAILABLE:  return("unavailable");
+  }
+
+  return("unavailable");
+}
+
+// ----------------------------------------------------------------------
+// Request factory — deep-copies the command context so it survives the
+// async round-trip (copied from crypto_req_new).
+// ----------------------------------------------------------------------
+
+static stock_req_t *
+stock_req_new(const cmd_ctx_t *ctx)
+{
+  stock_req_t *r = mem_alloc(STOCK_CTX, "req", sizeof(*r));
+
+  memset(r, 0, sizeof(*r));
+  r->ctx = *ctx;
+
+  if(ctx->msg != NULL)
+    r->msg = *ctx->msg;
+
+  r->ctx.msg      = &r->msg;
+  r->ctx.args     = NULL;
+  r->ctx.username = NULL;
+  r->ctx.parsed   = NULL;
+
+  return(r);
+}
+
+// ----------------------------------------------------------------------
+// Table renderer
+// ----------------------------------------------------------------------
+
+static void
+stock_row(const cmd_ctx_t *ctx, const quote_t *q)
+{
+  char line[STOCK_REPLY_SZ];
+  char sym[32];
+  char name[96];
+  char price[48];
+  char chg[64];
+  char dayr[80];
+  char yearr[88];
+  char vol[40];
+
+  if(q->status != QUOTE_OK)
+  {
+    snprintf(line, sizeof(line),
+        " " CLR_YELLOW "%-8s" CLR_RESET " " CLR_GRAY "— %s" CLR_RESET,
+        q->symbol, stock_status_note(q->status));
+    cmd_reply(ctx, line);
+    return;
+  }
+
+  snprintf(sym, sizeof(sym), CLR_YELLOW "%s" CLR_RESET, q->symbol);
+  stock_padr(sym, sizeof(sym), 8);
+
+  stock_fit(q->name[0] != '\0' ? q->name : q->symbol, 18, name, sizeof(name));
+  stock_padr(name, sizeof(name), 18);
+
+  if(isnan(q->price))
+    snprintf(price, sizeof(price), CLR_GRAY "—" CLR_RESET);
+  else
+  {
+    char tmp[24];
+
+    stock_fmt_price(q->price, q->price_decimals, tmp, sizeof(tmp));
+    snprintf(price, sizeof(price), CLR_BOLD CLR_WHITE "%s" CLR_RESET, tmp);
+  }
+  stock_pad(price, sizeof(price), 10);
+
+  stock_fmt_pct(q->change_pct, chg, sizeof(chg));
+  stock_pad(chg, sizeof(chg), 11);
+
+  stock_fmt_range(q->day_low, q->day_high, q->price_decimals,
+      dayr, sizeof(dayr));
+  stock_pad(dayr, sizeof(dayr), 19);
+
+  stock_fmt_range(q->year_low, q->year_high, q->price_decimals,
+      yearr, sizeof(yearr));
+  stock_pad(yearr, sizeof(yearr), 21);
+
+  if(isnan(q->volume))
+    snprintf(vol, sizeof(vol), CLR_GRAY "—" CLR_RESET);
+  else
+    stock_fmt_vol(q->volume, vol, sizeof(vol));
+  stock_pad(vol, sizeof(vol), 9);
+
+  snprintf(line, sizeof(line), " %s %s %s %s %s %s %s",
+      sym, name, price, chg, dayr, yearr, vol);
+  cmd_reply(ctx, line);
+}
+
+static void
+stock_reply_table(const cmd_ctx_t *ctx, const quote_batch_t *batch)
+{
+  static const char dashes[] = "----------------------------------------";
+  char line[STOCK_REPLY_SZ];
+
+  snprintf(line, sizeof(line),
+      CLR_GRAY " %-8s %-18s %10s %11s %19s %21s %9s" CLR_RESET,
+      "Symbol", "Name", "Price", "Change",
+      "Day Range", "52-Week Range", "Volume");
+  cmd_reply(ctx, line);
+
+  snprintf(line, sizeof(line),
+      CLR_GRAY " %-8.8s %-18.18s %10.10s %11.11s %19.19s %21.21s %9.9s"
+      CLR_RESET,
+      dashes, dashes, dashes, dashes, dashes, dashes, dashes);
+  cmd_reply(ctx, line);
+
+  for(uint8_t i = 0; i < batch->n; i++)
+    stock_row(ctx, &batch->quotes[i]);
+}
+
+// ----------------------------------------------------------------------
+// Verbose card: identity, price, 52-week gauge, sparkline, day/volume,
+// then caps-gated fundamentals + extended hours (dark until STOCK-4).
+// ----------------------------------------------------------------------
+
+// 52-week position gauge: a 20-cell bar filled to (price-low)/(high-low),
+// green in the upper third / red in the lower / yellow between, with a
+// cyan marker at the fill edge and the range printed on either side.
+static void
+stock_gauge(const cmd_ctx_t *ctx, const quote_t *q)
+{
+  char        bar[256];
+  char        line[STOCK_REPLY_SZ];
+  char        lo[24];
+  char        hi[24];
+  const char *barclr;
+  double      frac;
+  size_t      pos = 0;
+  int         filled;
+
+  if(isnan(q->year_low) || isnan(q->year_high) || isnan(q->price)
+      || q->year_high <= q->year_low)
+    return;
+
+  frac = (q->price - q->year_low) / (q->year_high - q->year_low);
+  frac = frac < 0.0 ? 0.0 : (frac > 1.0 ? 1.0 : frac);
+
+  filled = (int)(frac * STOCK_GAUGE_CELLS + 0.5);
+
+  barclr = frac >= (2.0 / 3.0) ? CLR_GREEN
+         : frac <= (1.0 / 3.0) ? CLR_RED
+         : CLR_YELLOW;
+
+  pos = stock_append(bar, sizeof(bar), pos, barclr);
+
+  for(int i = 0; i < STOCK_GAUGE_CELLS; i++)
+  {
+    if(i + 1 == filled)
+      pos = stock_append(bar, sizeof(bar), pos, CLR_CYAN);
+    else if(i == filled)
+      pos = stock_append(bar, sizeof(bar), pos, CLR_GRAY);
+
+    pos = stock_append(bar, sizeof(bar), pos, i < filled ? "█" : "░");
+  }
+
+  stock_fmt_price(q->year_low,  q->price_decimals, lo, sizeof(lo));
+  stock_fmt_price(q->year_high, q->price_decimals, hi, sizeof(hi));
+
+  snprintf(line, sizeof(line),
+      CLR_GRAY "%s" CLR_RESET " [%s" CLR_RESET "] " CLR_GRAY "%s  52w"
+      CLR_RESET,
+      lo, bar, hi);
+  cmd_reply(ctx, line);
+}
+
+// Intraday sparkline: spark[] mapped to eight block levels over its own
+// min..max, tinted by the session's direction.
+static void
+stock_sparkline(const cmd_ctx_t *ctx, const quote_t *q)
+{
+  static const char *const glyph[8] = {
+    "▁", "▂", "▃", "▄", "▅", "▆", "▇", "█"
+  };
+  char        spark[8 * 32 + 8];
+  char        line[STOCK_REPLY_SZ];
+  const char *clr;
+  float       lo;
+  float       hi;
+  size_t      pos = 0;
+  uint16_t    n;
+
+  if(q->spark_n == 0)
+    return;
+
+  // Clamp the provider-supplied count to the inline array's capacity — a
+  // misbehaving provider must never index past spark[].
+  n = q->spark_n;
+  if(n > (uint16_t)(sizeof(q->spark) / sizeof(q->spark[0])))
+    n = (uint16_t)(sizeof(q->spark) / sizeof(q->spark[0]));
+
+  lo = hi = q->spark[0];
+
+  for(uint16_t i = 1; i < n; i++)
+  {
+    if(q->spark[i] < lo) lo = q->spark[i];
+    if(q->spark[i] > hi) hi = q->spark[i];
+  }
+
+  for(uint16_t i = 0; i < n; i++)
+  {
+    int lvl = 0;
+
+    if(hi > lo)
+      lvl = (int)(((q->spark[i] - lo) / (hi - lo)) * 7.0f + 0.5f);
+
+    if(lvl < 0) lvl = 0;
+    if(lvl > 7) lvl = 7;
+
+    pos = stock_append(spark, sizeof(spark), pos, glyph[lvl]);
+  }
+
+  clr = ((!isnan(q->change) && q->change < 0.0)
+      || (!isnan(q->change_pct) && q->change_pct < 0.0))
+      ? CLR_RED : CLR_GREEN;
+
+  snprintf(line, sizeof(line), "%s%s" CLR_RESET, clr, spark);
+  cmd_reply(ctx, line);
+}
+
+static void
+stock_card_fundamentals(const cmd_ctx_t *ctx, const quote_t *q, uint32_t caps)
+{
+  char line[STOCK_REPLY_SZ];
+  char cap[24];
+  char eps[24];
+  char pe[48];
+  char div[24];
+
+  if(!isnan(q->market_cap)) stock_fmt_vol(q->market_cap, cap, sizeof(cap));
+  else                      snprintf(cap, sizeof(cap), "—");
+
+  if(!isnan(q->eps_ttm)) snprintf(eps, sizeof(eps), "%.2f", q->eps_ttm);
+  else                   snprintf(eps, sizeof(eps), "—");
+
+  {
+    char t[16];
+    char f[16];
+
+    if(!isnan(q->pe_trailing)) snprintf(t, sizeof(t), "%.1f", q->pe_trailing);
+    else                       snprintf(t, sizeof(t), "—");
+
+    if(!isnan(q->pe_forward)) snprintf(f, sizeof(f), "%.1f", q->pe_forward);
+    else                      snprintf(f, sizeof(f), "—");
+
+    snprintf(pe, sizeof(pe), "%s/%s", t, f);
+  }
+
+  if(!isnan(q->dividend_yield))
+    snprintf(div, sizeof(div), "%.2f%%", q->dividend_yield);
+  else
+    snprintf(div, sizeof(div), "—");
+
+  snprintf(line, sizeof(line),
+      CLR_GRAY "Mkt Cap" CLR_RESET " %s   " CLR_GRAY "P/E" CLR_RESET " %s   "
+      CLR_GRAY "EPS" CLR_RESET " %s   " CLR_GRAY "Div" CLR_RESET " %s",
+      cap, pe, eps, div);
+  cmd_reply(ctx, line);
+
+  if((caps & QUOTE_CAP_DEPTH) && (!isnan(q->bid) || !isnan(q->ask)))
+  {
+    char bid[24];
+    char ask[24];
+
+    if(!isnan(q->bid)) stock_fmt_price(q->bid, q->price_decimals, bid, sizeof(bid));
+    else               snprintf(bid, sizeof(bid), "—");
+
+    if(!isnan(q->ask)) stock_fmt_price(q->ask, q->price_decimals, ask, sizeof(ask));
+    else               snprintf(ask, sizeof(ask), "—");
+
+    snprintf(line, sizeof(line),
+        CLR_GRAY "Bid" CLR_RESET " %s   " CLR_GRAY "Ask" CLR_RESET " %s",
+        bid, ask);
+    cmd_reply(ctx, line);
+  }
+}
+
+static void
+stock_card_exthours(const cmd_ctx_t *ctx, const quote_t *q)
+{
+  char        line[STOCK_REPLY_SZ];
+  char        pbuf[24];
+  char        cbuf[48];
+  const char *label;
+
+  if(q->market_state != MARKET_STATE_PRE && q->market_state != MARKET_STATE_POST)
+    return;
+
+  if(isnan(q->session_price))
+    return;
+
+  label = q->market_state == MARKET_STATE_PRE ? "Pre-market" : "After-hours";
+
+  stock_fmt_price(q->session_price, q->price_decimals, pbuf, sizeof(pbuf));
+  stock_fmt_delta(q->session_change, q->session_change_pct, cbuf, sizeof(cbuf));
+
+  snprintf(line, sizeof(line),
+      CLR_GRAY "%s" CLR_RESET " " CLR_BOLD CLR_WHITE "%s" CLR_RESET " %s",
+      label, pbuf, cbuf);
+  cmd_reply(ctx, line);
+}
+
+static void
+stock_reply_card(const cmd_ctx_t *ctx, const quote_t *q)
+{
+  char     line[STOCK_REPLY_SZ];
+  char     klass[16];
+  uint32_t caps;
+
+  if(q->status != QUOTE_OK)
+  {
+    snprintf(line, sizeof(line), "%s — %s",
+        q->symbol, stock_status_note(q->status));
+    cmd_reply(ctx, line);
+    return;
+  }
+
+  caps = stockquote_provider_caps();
+  stock_klass_str(q->klass, klass, sizeof(klass));
+
+  // line 1 — identity
+  {
+    char meta[80];
+
+    if(q->exchange[0] != '\0' && klass[0] != '\0')
+      snprintf(meta, sizeof(meta), " %s · %s", q->exchange, klass);
+    else if(q->exchange[0] != '\0')
+      snprintf(meta, sizeof(meta), " %s", q->exchange);
+    else if(klass[0] != '\0')
+      snprintf(meta, sizeof(meta), " %s", klass);
+    else
+      meta[0] = '\0';
+
+    snprintf(line, sizeof(line),
+        CLR_BOLD "%s" CLR_RESET " (" CLR_YELLOW "%s" CLR_RESET ")"
+        CLR_GRAY "%s" CLR_RESET,
+        q->name[0] != '\0' ? q->name : q->symbol, q->symbol, meta);
+    cmd_reply(ctx, line);
+  }
+
+  // line 2 — price + change
+  {
+    char pbuf[24];
+    char cbuf[48];
+
+    if(isnan(q->price))
+      snprintf(pbuf, sizeof(pbuf), "—");
+    else
+      stock_fmt_price(q->price, q->price_decimals, pbuf, sizeof(pbuf));
+
+    stock_fmt_delta(q->change, q->change_pct, cbuf, sizeof(cbuf));
+
+    snprintf(line, sizeof(line),
+        "Price: " CLR_BOLD CLR_WHITE "%s" CLR_RESET "%s%s  %s",
+        pbuf, q->currency[0] != '\0' ? " " : "", q->currency, cbuf);
+    cmd_reply(ctx, line);
+  }
+
+  stock_gauge(ctx, q);
+  stock_sparkline(ctx, q);
+
+  // day range + volume
+  {
+    char dayr[64];
+    char vol[24];
+
+    stock_fmt_range(q->day_low, q->day_high, q->price_decimals,
+        dayr, sizeof(dayr));
+
+    if(isnan(q->volume))
+      snprintf(vol, sizeof(vol), "—");
+    else
+      stock_fmt_vol(q->volume, vol, sizeof(vol));
+
+    snprintf(line, sizeof(line),
+        CLR_GRAY "Day" CLR_RESET " %s   " CLR_GRAY "Vol" CLR_RESET " %s",
+        dayr, vol);
+    cmd_reply(ctx, line);
+  }
+
+  if(caps & QUOTE_CAP_FUNDAMENTALS)
+    stock_card_fundamentals(ctx, q, caps);
+
+  if(caps & QUOTE_CAP_EXTHOURS)
+    stock_card_exthours(ctx, q);
+}
+
+// ----------------------------------------------------------------------
+// Search renderer
+// ----------------------------------------------------------------------
+
+static void
+stock_reply_search(const cmd_ctx_t *ctx, const quote_search_res_t *res,
+    const char *query)
+{
+  char line[STOCK_REPLY_SZ];
+
+  if(res->status == QUOTE_RATE_LIMITED)
+  {
+    cmd_reply(ctx, CLR_ORANGE
+        "Quotes are rate-limited right now — try again shortly." CLR_RESET);
+    return;
+  }
+
+  if(res->status != QUOTE_OK)
+  {
+    cmd_reply(ctx, "Symbol search is unavailable right now — sorry.");
+    return;
+  }
+
+  if(res->n == 0)
+  {
+    snprintf(line, sizeof(line), "No matches for '%s'.", query);
+    cmd_reply(ctx, line);
+    return;
+  }
+
+  snprintf(line, sizeof(line), CLR_BOLD "Matches for '%s':" CLR_RESET, query);
+  cmd_reply(ctx, line);
+
+  for(uint8_t i = 0; i < res->n; i++)
+  {
+    const quote_hit_t *h = &res->hits[i];
+    char               sym[32];
+    char               name[96];
+    char               klass[16];
+    char               meta[96];
+
+    snprintf(sym, sizeof(sym), CLR_YELLOW "%s" CLR_RESET, h->symbol);
+    stock_padr(sym, sizeof(sym), 8);
+
+    stock_fit(h->name[0] != '\0' ? h->name : "—", 28, name, sizeof(name));
+    stock_padr(name, sizeof(name), 28);
+
+    stock_klass_str(h->klass, klass, sizeof(klass));
+
+    if(klass[0] != '\0' && h->exchange[0] != '\0')
+      snprintf(meta, sizeof(meta), "%s · %s", klass, h->exchange);
+    else if(klass[0] != '\0')
+      snprintf(meta, sizeof(meta), "%s", klass);
+    else if(h->exchange[0] != '\0')
+      snprintf(meta, sizeof(meta), "%s", h->exchange);
+    else
+      meta[0] = '\0';
+
+    if(meta[0] != '\0')
+      snprintf(line, sizeof(line),
+          "  %s %s " CLR_GRAY "(%s)" CLR_RESET, sym, name, meta);
+    else
+      snprintf(line, sizeof(line), "  %s %s", sym, name);
+
+    cmd_reply(ctx, line);
+  }
+}
+
+// ----------------------------------------------------------------------
+// Async completion callbacks (fire on the curl worker thread)
+// ----------------------------------------------------------------------
+
+static void
+stock_batch_done(const quote_batch_t *batch, void *user)
+{
+  stock_req_t *r   = (stock_req_t *)user;
+  cmd_ctx_t    ctx = r->ctx;
+
+  ctx.msg = &r->msg;
+
+  // batch->status is dispatch-level; a well-behaved provider reports real
+  // outcomes per-symbol. These branches defend against a provider that
+  // signals a whole-batch failure up front.
+  if(batch->status == QUOTE_RATE_LIMITED)
+    cmd_reply(&ctx, CLR_ORANGE
+        "Quotes are rate-limited right now — try again shortly." CLR_RESET);
+  else if(batch->status != QUOTE_OK)
+    cmd_reply(&ctx, "The quote service is unavailable right now — sorry.");
+  else if(r->verbose && batch->n == 1)
+    stock_reply_card(&ctx, &batch->quotes[0]);
+  else
+    stock_reply_table(&ctx, batch);
+
+  mem_free(r);
+}
+
+static void
+stock_search_done(const quote_search_res_t *res, void *user)
+{
+  stock_req_t *r   = (stock_req_t *)user;
+  cmd_ctx_t    ctx = r->ctx;
+
+  ctx.msg = &r->msg;
+
+  stock_reply_search(&ctx, res, r->query);
+  mem_free(r);
+}
+
+// ----------------------------------------------------------------------
+// Argument parsing
+// ----------------------------------------------------------------------
+
+static bool
+stock_parse(const cmd_ctx_t *ctx, const char *args, stock_args_t *out)
+{
+  char  buf[STOCK_REPLY_SZ];
+  char *save = NULL;
+  char *tok;
+
+  memset(out, 0, sizeof(*out));
+
+  if(args == NULL || args[0] == '\0')
+    return(true);
+
+  snprintf(buf, sizeof(buf), "%s", args);
+
+  tok = strtok_r(buf, " \t", &save);
+
+  while(tok != NULL)
+  {
+    char *sp2;
+    char *piece;
+
+    if(strcmp(tok, "-v") == 0 || strcmp(tok, "--verbose") == 0)
+    {
+      out->verbose = true;
+      tok = strtok_r(NULL, " \t", &save);
+      continue;
+    }
+
+    if(strcmp(tok, "-s") == 0 || strcmp(tok, "--search") == 0)
+    {
+      const char *rest = save;   // everything after -s is the free-text query
+
+      out->search = true;
+
+      while(rest != NULL && (*rest == ' ' || *rest == '\t'))
+        rest++;
+
+      if(rest != NULL)
+        snprintf(out->query, sizeof(out->query), "%s", rest);
+
+      break;
+    }
+
+    // bare token: one or more comma-separated symbols
+    sp2   = NULL;
+    piece = strtok_r(tok, ",", &sp2);
+
+    while(piece != NULL)
+    {
+      if(out->nsyms >= STOCK_MAX_SYMS)
+      {
+        cmd_reply(ctx, "Too many symbols (max 24).");
+        return(false);
+      }
+
+      if(piece[0] != '\0')
+      {
+        char  *dst = out->syms[out->nsyms];
+        size_t j   = 0;
+
+        for(; piece[j] != '\0' && j + 1 < STOCK_SYM_SZ; j++)
+          dst[j] = (char)toupper((unsigned char)piece[j]);
+
+        dst[j] = '\0';
+        out->nsyms++;
+      }
+
+      piece = strtok_r(NULL, ",", &sp2);
+    }
+
+    tok = strtok_r(NULL, " \t", &save);
+  }
+
+  return(true);
+}
+
+// ----------------------------------------------------------------------
+// Command callback
+// ----------------------------------------------------------------------
+
+static void
+stock_cmd(const cmd_ctx_t *ctx)
+{
+  stock_args_t  a;
+  const char   *symv[STOCK_MAX_SYMS];
+  stock_req_t  *r;
+  uint32_t      caps;
+
+  if(!stock_parse(ctx, ctx->args, &a))
+    return;
+
+  caps = stockquote_provider_caps();
+
+  // Free-text symbol search.
+  if(a.search)
+  {
+    if(a.query[0] == '\0')
+    {
+      cmd_reply(ctx, "Search for what? Example: !stock -s tesla");
+      return;
+    }
+
+    if(!(caps & QUOTE_CAP_SEARCH))
+    {
+      cmd_reply(ctx, "Symbol search isn't available right now.");
+      return;
+    }
+
+    r = stock_req_new(ctx);
+    snprintf(r->query, sizeof(r->query), "%s", a.query);
+
+    if(stockquote_search_async(a.query, stock_search_done, r) != SUCCESS)
+    {
+      cmd_reply(ctx,
+          "Couldn't reach the quote service — try again shortly.");
+      mem_free(r);
+    }
+
+    return;
+  }
+
+  if(a.nsyms == 0)
+  {
+    cmd_reply(ctx,
+        "Usage: !stock [-v] <symbols…>  |  !stock -s <search words>");
+    return;
+  }
+
+  if(caps == 0)
+  {
+    cmd_reply(ctx, "No quote provider is loaded right now.");
+    return;
+  }
+
+  if(a.verbose && a.nsyms != 1)
+  {
+    cmd_reply(ctx, "Verbose mode shows one symbol. Example: !stock -v NVDA");
+    return;
+  }
+
+  for(uint8_t i = 0; i < a.nsyms; i++)
+    symv[i] = a.syms[i];
+
+  r = stock_req_new(ctx);
+  r->verbose = a.verbose;
+
+  if(stockquote_fetch_async(symv, a.nsyms, stock_batch_done, r) != SUCCESS)
+  {
+    cmd_reply(ctx, "Couldn't reach the quote service — try again shortly.");
+    mem_free(r);
+  }
+}
+
+// ----------------------------------------------------------------------
+// NL hints
+// ----------------------------------------------------------------------
+
+static const cmd_nl_slot_t stock_nl_slots[] = {
+  { .name  = "symbol",
+    .type  = CMD_NL_ARG_FREE,
+    .flags = CMD_NL_SLOT_REQUIRED },
+};
+
+static const cmd_nl_example_t stock_nl_examples[] = {
+  { .utterance  = "how's apple stock",
+    .invocation = "/stock AAPL" },
+  { .utterance  = "s&p 500 right now",
+    .invocation = "/stock ^GSPC" },
+  { .utterance  = "quote tsla and nvda",
+    .invocation = "/stock TSLA NVDA" },
+};
+
+static const cmd_nl_t stock_nl = {
+  .when          = "User asks for a stock / ETF / index / fund / FX / "
+                   "commodity price or ticker quote.",
+  .syntax        = "/stock <symbols…>",
+  .slots         = stock_nl_slots,
+  .slot_count    = (uint8_t)(sizeof(stock_nl_slots)
+                             / sizeof(stock_nl_slots[0])),
+  .examples      = stock_nl_examples,
+  .example_count = (uint8_t)(sizeof(stock_nl_examples)
+                             / sizeof(stock_nl_examples[0])),
+};
+
+// ----------------------------------------------------------------------
+// Plugin lifecycle
+// ----------------------------------------------------------------------
+
+static bool
+stock_init(void)
+{
+  if(cmd_register(STOCK_CTX, "stock",
+      "stock [-v] <symbols…> | stock -s <search words>",
+      "Stock, ETF, fund, index, FX and commodity quotes",
+      NULL,
+      "everyone", 0, CMD_SCOPE_ANY, METHOD_T_ANY,
+      stock_cmd, NULL, NULL, "$",
+      NULL, 0, NULL, &stock_nl) != SUCCESS)
+    return(FAIL);
+
+  clam(CLAM_INFO, STOCK_CTX, "stock command plugin initialized");
+
+  return(SUCCESS);
+}
+
+static void
+stock_deinit(void)
+{
+  cmd_unregister("stock");
+
+  clam(CLAM_INFO, STOCK_CTX, "stock command plugin deinitialized");
+}
+
+const plugin_desc_t bm_plugin_desc = {
+  .api_version     = PLUGIN_API_VERSION,
+  .name            = "stock",
+  .version         = "1.0",
+  .type            = PLUGIN_MISC,
+  .kind            = "stock",
+  .provides        = { { .name = "cmd_stock" } },
+  .provides_count  = 1,
+  .requires        = { { .name = "method_command" },
+                       { .name = "stock_quotes" } },
+  .requires_count  = 2,
+  .kv_schema       = NULL,
+  .kv_schema_count = 0,
+  .init            = stock_init,
+  .start           = NULL,
+  .stop            = NULL,
+  .deinit          = stock_deinit,
+  .ext             = NULL,
+};

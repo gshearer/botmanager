@@ -173,6 +173,7 @@ regex (the literal context portion, before any `<placeholder>`).
 | `crypto` | plugins/cmd/crypto/crypto.c | `/crypto` price command (`CRYPTO_CTX`) |
 | `imagine` | plugins/cmd/imagine/imagine_cmd.c | `!imagine` text-to-image command (`IMG_CMD_CTX`) |
 | `searxng` | plugins/cmd/searxng/searxng_cmd.c | `/searxng` command (`SEARXNG_CMD_CTX`) |
+| `stock` | plugins/cmd/stock/stock.c | `!stock` quote command (`STOCK_CTX`) |
 | `weather` | plugins/cmd/weather/weather.c | `/weather` command (`WEATHER_CTX`) |
 
 ## Method plugins (`plugins/method/`)
