@@ -413,8 +413,12 @@ weather_reply_forecast_daily(const cmd_ctx_t *ctx,
     icon = weather_condition_icon(d->condition_id);
     dclr = weather_condition_color(d->condition_id);
 
-    weather_fmt_temp(chi, sizeof(chi), d->temp_hi, f->units);
-    weather_fmt_temp(clo, sizeof(clo), d->temp_lo, f->units);
+    // Width-pad the numeric part to 3 visible chars (matches the hourly
+    // view) so the hi/lo column stays fixed-width: a 3-digit temperature
+    // (100+°F) would otherwise be 1-2 chars wider than a 2-digit one and
+    // shove every column to its right out of alignment.
+    weather_fmt_temp_w(chi, sizeof(chi), d->temp_hi, f->units, 3);
+    weather_fmt_temp_w(clo, sizeof(clo), d->temp_lo, f->units, 3);
 
     weather_fmt_desc_pad(desc_pad, sizeof(desc_pad),
         d->condition_desc, 22);
