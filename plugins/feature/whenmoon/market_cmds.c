@@ -919,11 +919,13 @@ wm_table_head(const cmd_ctx_t *ctx, const wm_tcol_t *cols, uint32_t n)
 // to the live last-trade price.
 
 #define WM_MKT_COL_MARKET   20   // "coinbase-btc-usd" = 16, room to spare
+#define WM_MKT_COL_SESS      6    // attached-session count for this product
 #define WM_MKT_COL_PRICE    13
 #define WM_MKT_COL_GRAIN     9
 
 static const wm_tcol_t wm_mkt_cols[] = {
   { "Market", WM_MKT_COL_MARKET, false },
+  { "Sess",   WM_MKT_COL_SESS,   true  },
   { "Price",  WM_MKT_COL_PRICE,  true  },
   { "1m",     WM_MKT_COL_GRAIN,  true  },
   { "5m",     WM_MKT_COL_GRAIN,  true  },
@@ -941,11 +943,12 @@ static const wm_tcol_t wm_mkt_cols[] = {
 // (their rings differ only in warmup depth; the newest bar is shared).
 typedef struct
 {
-  char    base_id[WM_MARKET_ID_STR_SZ];   // "<exch>-<base>-<quote>", no @inst
-  double  last_px;
-  int64_t last_tick_ms;
-  double  ref[WM_GRAN_MAX];
-  int64_t ref_ts[WM_GRAN_MAX];
+  char     base_id[WM_MARKET_ID_STR_SZ];  // "<exch>-<base>-<quote>", no @inst
+  uint32_t n_sessions;                    // sessions collapsed onto this product
+  double   last_px;
+  int64_t  last_tick_ms;
+  double   ref[WM_GRAN_MAX];
+  int64_t  ref_ts[WM_GRAN_MAX];
 } wm_sub_row_t;
 
 static void
@@ -1017,6 +1020,7 @@ wm_obs_render_subscriptions(const cmd_ctx_t *ctx, whenmoon_state_t *st)
         continue;   // unreachable at trial scale; a silent cap is fine here
 
       snprintf(rows[r].base_id, sizeof(rows[r].base_id), "%s", base);
+      rows[r].n_sessions   = 0;
       rows[r].last_px      = 0.0;
       rows[r].last_tick_ms = INT64_MIN;
 
@@ -1028,6 +1032,8 @@ wm_obs_render_subscriptions(const cmd_ctx_t *ctx, whenmoon_state_t *st)
 
       n_rows++;
     }
+
+    rows[r].n_sessions++;
 
     // Freshest tick wins the price; latest completed bar wins each grain.
     if(tick_ms >= rows[r].last_tick_ms)
@@ -1061,6 +1067,10 @@ wm_obs_render_subscriptions(const cmd_ctx_t *ctx, whenmoon_state_t *st)
         WM_MKT_COL_MARKET, rw->base_id);
     off = (size_t)snprintf(line, sizeof(line),
         "  " CLR_CYAN "%s" CLR_RESET, cell);
+
+    snprintf(cell, sizeof(cell), "%u", rw->n_sessions);
+    wm_col_pad(cell, sizeof(cell), WM_MKT_COL_SESS, true);
+    off += (size_t)snprintf(line + off, sizeof(line) - off, "%s", cell);
 
     if(rw->last_px > 0.0)
       snprintf(price, sizeof(price),
@@ -1096,6 +1106,7 @@ wm_obs_render_subscriptions(const cmd_ctx_t *ctx, whenmoon_state_t *st)
 // under their heading. Widths are picked so the flagship 9-instance trial
 // (e.g. "coinbase-btc-usd@juggernaut") fits without truncation.
 #define WM_SES_COL_SESSION  28
+#define WM_SES_COL_MODE      8   // "manual" = 6, "paper"/"real" shorter
 #define WM_SES_COL_SIDE      6
 #define WM_SES_COL_TRADES    7
 #define WM_SES_COL_START    11
@@ -1129,6 +1140,7 @@ wm_ses_mark_px(const wm_market_session_snapshot_t *snap)
 
 static const wm_tcol_t wm_ses_cols[] = {
   { "Session", WM_SES_COL_SESSION, false },
+  { "Mode",    WM_SES_COL_MODE,    false },
   { "Side",    WM_SES_COL_SIDE,    true  },
   { "Trades",  WM_SES_COL_TRADES,  true  },
   { "Start",   WM_SES_COL_START,   true  },
@@ -1167,6 +1179,12 @@ wm_obs_render_row(const cmd_ctx_t *ctx,
       WM_SES_COL_SESSION, snap->market_id_str);
   off = (size_t)snprintf(line, sizeof(line),
       "  " CLR_CYAN "%s" CLR_RESET, cell);
+
+  // Mode — real money tints yellow to catch the eye; paper/manual muted.
+  snprintf(cell, sizeof(cell), "%-*.*s", WM_SES_COL_MODE, WM_SES_COL_MODE,
+      wm_market_mode_name(snap->mode));
+  off += (size_t)snprintf(line + off, sizeof(line) - off, "%s%s" CLR_RESET,
+      snap->mode == WM_MARKET_MODE_REAL ? CLR_YELLOW : CLR_GRAY, cell);
 
   // Side — long tints green, flat stays muted.
   if(is_long)
