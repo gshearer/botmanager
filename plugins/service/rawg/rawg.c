@@ -653,15 +653,23 @@ rawg_page_size(void)
   return(ps);
 }
 
-// Fill `dates` with "from,to" for the requested list. `year > 0` windows to
-// that whole calendar year; otherwise POPULAR/BEST span this year to date
-// and NEW spans the trailing 30 days.
+// Fill `dates` with the "from,to" window for the requested list, or leave it
+// empty ("") to request no date filter at all. `year > 0` windows to that
+// whole calendar year. With no year: POPULAR spans this year to date, NEW
+// spans the trailing 30 days, and BEST spans ALL TIME (empty) — a partial
+// current year carries almost no Metacritic scores, so a this-year default
+// would come back empty; "best reviewed" reads as all-time anyway.
 static void
 rawg_list_dates(rawg_list_kind_t kind, int32_t year, char *dates, size_t cap)
 {
   time_t    now = time(NULL);
   struct tm tmv;
   char      today[RAWG_DATE_SZ];
+
+  if(cap == 0)
+    return;
+
+  dates[0] = '\0';
 
   gmtime_r(&now, &tmv);
   strftime(today, sizeof(today), "%Y-%m-%d", &tmv);
@@ -671,6 +679,9 @@ rawg_list_dates(rawg_list_kind_t kind, int32_t year, char *dates, size_t cap)
     snprintf(dates, cap, "%04d-01-01,%04d-12-31", year, year);
     return;
   }
+
+  if(kind == RAWG_LIST_BEST)   // all-time best by Metacritic
+    return;
 
   if(kind == RAWG_LIST_NEW)
   {
@@ -828,6 +839,7 @@ rawg_list_async(rawg_list_kind_t kind, int32_t year, rawg_search_cb_t cb,
   const char     *extra;
   char            key[RAWG_LIST_KEY_SZ];
   char            dates[RAWG_DATES_SZ];
+  char            dates_clause[RAWG_DATES_SZ + 8];
   char            url[RAWG_REQ_URL_SZ];
   int             need;
   uint32_t        ttl;
@@ -886,9 +898,14 @@ rawg_list_async(rawg_list_kind_t kind, int32_t year, rawg_search_cb_t cb,
 
   rawg_list_dates(kind, year, dates, sizeof(dates));
 
+  if(dates[0] != '\0')
+    snprintf(dates_clause, sizeof(dates_clause), "&dates=%s", dates);
+  else
+    dates_clause[0] = '\0';
+
   need = snprintf(url, sizeof(url),
-      "%s/games?ordering=%s&dates=%s%s&page_size=%u&key=%s",
-      RAWG_API_BASE, ord, dates, extra, rawg_page_size(), tok);
+      "%s/games?ordering=%s%s%s&page_size=%u&key=%s",
+      RAWG_API_BASE, ord, dates_clause, extra, rawg_page_size(), tok);
 
   if(need < 0 || (size_t)need >= sizeof(url))
     return(FAIL);
