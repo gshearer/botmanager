@@ -14,7 +14,8 @@ alongside its code.
 | **Use a CLI tool (`botmanctl`, `ircspy`, `ircspyctl`)** | `tools/AGENTS.md` |
 | **Fresh-start the daemon** | `scripts/AGENTS.md` |
 | Add a user command (command-surface plugin) | `CMD.md` + `plugins/cmd/AGENTS.md` |
-| Add or modify a plugin layering rule | `TODO.md` §PL5 + `AGENTS.md` §Plugin Layers |
+| Add or modify a plugin layering rule | `PLUGIN.md` §Layer Rules + `AGENTS.md` §Plugin Layers |
+| **File a new plugin (which folder?)** | `PLUGIN.md` §Layer Rules (placement decision-tree) |
 | Add a service plugin (external API) | `PLUGIN.md` + `plugins/service/AGENTS.md` |
 | Add/modify a protocol driver (IRC, ...) | `PLUGIN.md` + `plugins/protocol/AGENTS.md` + `include/method.h` |
 | Add/modify a method driver (chat, command, ...) | `PLUGIN.md` + `plugins/method/AGENTS.md` + `include/bot.h` |
