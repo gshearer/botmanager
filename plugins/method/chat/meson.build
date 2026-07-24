@@ -9,8 +9,9 @@ chat_plugin = shared_library('chat',
    'volunteer.c', 'vision.c', 'extract.c', 'extract_prompt.c'],
   # '.' first so chat-plugin-local headers (memory.h, dossier.h) win
   # over any older include/ copy during transitional builds. The
-  # inference include dir exposes plugins/inference/inference.h (the
-  # dlsym-shim public surface for llm/knowledge/acquire).
+  # inference include dir exposes the engine's inference.h — the
+  # dlsym-shim public surface for llm/knowledge/acquire (defined by
+  # plugins/extension/inference/engine/meson.build).
   include_directories : [include_directories('.'), inc_include,
                          inference_include],
   override_options : ['b_lundef=false'],

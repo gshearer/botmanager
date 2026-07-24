@@ -3,7 +3,7 @@
 
 // Internal surface of the llm subsystem. Lives inside the inference
 // plugin; not part of the cross-plugin public API (which is
-// plugins/inference/inference.h's dlsym shims).
+// inference.h's dlsym shims).
 
 #define INFERENCE_INTERNAL
 #include "inference.h"

@@ -5,10 +5,10 @@
 // include this header and resolve the symbols at runtime via
 // plugin_dlsym_cached("openweather", …, (void **)&cached) — the plugin is loaded RTLD_LOCAL.
 //
-// Shim shape mirrors plugins/inference/inference.h: an atomic-guarded
-// static cache per symbol, union to launder void*↔function-pointer
-// conversion, FATAL + abort on lookup miss (which implies a broken
-// plugin-dependency graph).
+// Shim shape mirrors plugins/extension/inference/engine/inference.h:
+// an atomic-guarded static cache per symbol, union to launder
+// void*↔function-pointer conversion, FATAL + abort on lookup miss
+// (which implies a broken plugin-dependency graph).
 //
 // Inside the openweather plugin itself the static-inline shims below
 // would collide with the real definitions, so openweather.c defines
@@ -174,8 +174,8 @@ const char *openweather_units_kv_value(void);
 // dlsym shim helpers
 // ----------------------------------------------------------------------
 //
-// Reference: plugins/inference/inference.h. Each shim caches the
-// resolved function pointer in a static atomic-guarded slot so
+// Reference: plugins/extension/inference/engine/inference.h. Each shim
+// caches the resolved function pointer in a static atomic-guarded slot so
 // subsequent calls take one relaxed-acquire load. On a cold cache the
 // loader calls plugin_dlsym; a NULL return means the openweather
 // plugin was not loaded — a programming error, fatal.

@@ -38,7 +38,8 @@ multiple bot kinds consume it. The architectural test is concrete:
 without reading anything outside that directory?* If not, the
 boundary is in the wrong place. Inferencing — the LLM client, RAG
 store, and acquisition pipeline — used to live in core and was
-exiled to `plugins/inference/` when only the chat method consumed it.
+exiled to `plugins/extension/inference/` when only the chat method
+consumed it.
 
 **Asynchronous by construction.** No socket-handling thread ever
 performs work. It normalizes the wire bytes, submits a `task_t` to
@@ -77,11 +78,10 @@ runtime.
 | `plugins/protocol/` | Wire protocols | IRC, botmanctl |
 | `plugins/method/` | Bot interaction methods (the kinds) | command, chat |
 | `plugins/service/` | External API integrations | coinbase, openweather, coinmarketcap, searxng |
-| `plugins/inference/` | LLM client + knowledge store + acquisition | inference |
+| `plugins/extension/` | Self-contained subsystems with internal structure | inference (engine + `ask`/`claude`/`imagine`/`search`) |
 | `plugins/feature/` | Single focused capabilities atop the stack | whenmoon, exchange, weather, stock |
 | `plugins/feature/whenmoon/strategy/` | Loadable trading strategies | testing |
 | `plugins/misc/` | Toys / novelties — no external deps, no state | math, eightball |
-| `plugins/cmd/` | *Being dissolved* — command surfaces awaiting re-filing by domain | ask, claude, tmdb |
 
 Plugins are filed by **domain**, not by runtime `type`: a command
 surface lives with the capability it serves (`feature/`), with the
@@ -333,8 +333,8 @@ is explicitly out of scope.
 - [`PLUGIN.md`](PLUGIN.md) — plugin layer rules and the grep audits
   that enforce them
 - [`plugins/method/chat/CHATBOT.md`](plugins/method/chat/CHATBOT.md) — chat method internals
-- [`KNOWLEDGE.md`](plugins/inference/KNOWLEDGE.md), [`ACQUIRE.md`](plugins/inference/ACQUIRE.md),
-  [`LLM.md`](plugins/inference/LLM.md) — inference plugin subsystems
+- [`KNOWLEDGE.md`](plugins/extension/inference/KNOWLEDGE.md), [`ACQUIRE.md`](plugins/extension/inference/ACQUIRE.md),
+  [`LLM.md`](plugins/extension/inference/LLM.md) — inference plugin subsystems
 
 ---
 

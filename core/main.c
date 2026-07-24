@@ -235,9 +235,10 @@ main(int argc, char *argv[])
   curl_init();
 
   // LLM / knowledge / acquire subsystems now live in the inference
-  // plugin (plugins/inference/). Their init / register_commands /
-  // register_config / exit wiring is handled by the plugin's
-  // lifecycle callbacks; core no longer touches them directly.
+  // engine plugin (plugins/extension/inference/engine/). Their init /
+  // register_commands / register_config / exit wiring is handled by
+  // the plugin's lifecycle callbacks; core no longer touches them
+  // directly.
 
   // Memory subsystem lives in the chat plugin (R1) -- init / exit
   // wiring has moved into plugins/method/chat/chatbot.c. Core no longer
@@ -295,7 +296,7 @@ main(int argc, char *argv[])
   resolve_register_commands();
 
   // /llm, /knowledge, /acquire commands register from the inference
-  // plugin now (lift-and-shift to plugins/inference/).
+  // engine plugin now (plugins/extension/inference/engine/).
 
   // Memory subsystem commands register from the chat plugin now.
 

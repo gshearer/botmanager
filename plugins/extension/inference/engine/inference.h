@@ -6,7 +6,7 @@
 // helpers below resolve the real implementation through
 // `plugin_dlsym_cached("inference", …, (void **)&cached)` on first use and cache the pointer.
 //
-// Shim shape mirrors `plugins/inference/acquire_reactive.c`'s
+// Shim shape mirrors `acquire_reactive.c`'s
 // acq_sxng_resolve() pattern: atomic-guarded static cache, union to
 // launder void*↔function-pointer conversion, FATAL + abort on lookup
 // miss (which implies a broken plugin-dependency graph).
@@ -324,7 +324,7 @@ typedef void (*acquire_ingest_cb_t)(
 // dlsym shim helpers
 // -----------------------------------------------------------------------
 //
-// Reference: plugins/inference/acquire_reactive.c (acq_sxng_resolve).
+// Reference: acquire_reactive.c (acq_sxng_resolve).
 // Each shim caches the resolved function pointer in a static atomic-
 // guarded slot so subsequent calls take one relaxed-acquire load. On a
 // cold cache the loader uses plugin_dlsym; a NULL return means the

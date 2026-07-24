@@ -476,8 +476,8 @@ typedef struct
 // non-NULL; on_trade is optional. Logs a CLAM_WARN on miss.
 //
 // The union dance launders ISO-C-forbidden object-pointer-to-
-// function-pointer casts; matches the pattern in
-// plugins/inference/inference.h's dlsym shims.
+// function-pointer casts; matches the pattern in the inference
+// engine's dlsym shims (plugins/extension/inference/engine/inference.h).
 static bool
 wm_strategy_resolve_fns(const char *plugin_name, loaded_strategy_t *ls)
 {

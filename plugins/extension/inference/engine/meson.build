@@ -20,7 +20,7 @@ inference_plugin = shared_library('inference',
   include_directories : [
     inc_include,
     inference_include,
-    include_directories('../service/searxng'),
+    include_directories('../../../service/searxng'),
   ],
   dependencies : [curl_dep, json_c_dep, m_dep, xml2_dep],
   override_options : ['b_lundef=false'],

@@ -140,7 +140,8 @@ void *plugin_dlsym(const char *plugin_name, const char *symbol);
 
 // Like plugin_dlsym, but also registers the caller's `slot` (the
 // address of its `static fn_t cached`) for invalidation on plugin
-// unload. The dlsym-shim pattern (see plugins/inference/inference.h,
+// unload. The dlsym-shim pattern (see
+// plugins/extension/inference/engine/inference.h,
 // plugins/feature/whenmoon/whenmoon_strategy.h) caches the resolved
 // function pointer in a static slot inside the consumer; without
 // invalidation that pointer would dangle when the target plugin is

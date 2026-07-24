@@ -173,8 +173,9 @@ regex (the literal context portion, before any `<placeholder>`).
 ## Command-surface plugins
 
 Filed by domain, not by bucket — see `PLUGIN.md §Layer Rules`. The source
-column is authoritative; paths span `plugins/cmd/`, `plugins/feature/`, and
-`plugins/misc/` while the PTREE reorg dissolves the legacy `cmd/` bucket.
+column is authoritative; paths span `plugins/extension/`, `plugins/feature/`,
+and `plugins/misc/` now that the PTREE reorg has dissolved the legacy `cmd/`
+bucket.
 
 A **leaf service that carries its own command surface** is listed under
 Service plugins above, not here: its command TU emits a dotted sub-context
@@ -183,11 +184,11 @@ halves. Same shape as `gemini` / `gemini.ws`.
 
 | Context | Source | Description |
 |---|---|---|
-| `ask` | plugins/cmd/ask/ask_cmd.c | `!ask` one-shot LLM command (`ASK_CMD_CTX`) |
-| `claude` | plugins/cmd/claude/claude.c | `/claude` bridge command (`CLAUDE_CTX`) |
+| `ask` | plugins/extension/inference/ask/ask_cmd.c | `!ask` one-shot LLM command (`ASK_CMD_CTX`) |
+| `claude` | plugins/extension/inference/claude/claude.c | `/claude` bridge command (`CLAUDE_CTX`) |
 | `crypto` | plugins/feature/crypto/crypto.c | `/crypto` price command (`CRYPTO_CTX`) |
-| `imagine` | plugins/cmd/imagine/imagine_cmd.c | `!imagine` text-to-image command (`IMG_CMD_CTX`) |
-| `searxng` | plugins/cmd/searxng/searxng_cmd.c | `/searxng` command (`SEARXNG_CMD_CTX`) |
+| `imagine` | plugins/extension/inference/imagine/imagine_cmd.c (`IMG_CMD_CTX`) · plugins/extension/inference/imagine_zimage/imagine_zimage.c (`IZ_CTX`) | `!imagine` text-to-image command — one context, two mutually exclusive backends (load exactly one) |
+| `searxng` | plugins/extension/inference/search/searxng_cmd.c | `!search` / `!image` / `!news` / `!video` / `!music` command surface (`SEARXNG_CMD_CTX`) — shares the root context with the `searxng` service above |
 | `stock` | plugins/feature/stock/stock.c | `!stock` quote command (`STOCK_CTX`) |
 | `weather` | plugins/feature/weather/weather.c | `/weather` command (`WEATHER_CTX`) |
 
@@ -209,15 +210,23 @@ halves. Same shape as `gemini` / `gemini.ws`.
 | `register` | plugins/method/command/command.c | `/register` user creation |
 | `vision` | plugins/method/chat/vision.c | image-intent path |
 
+## Extension plugins (`plugins/extension/`)
+
+The command surfaces filed beside these engines (`ask`, `claude`,
+`imagine`, `searxng`) are listed under Command-surface plugins above.
+
+| Context | Source | Description |
+|---|---|---|
+| `acquire` | plugins/extension/inference/engine/acquire_digest.c | autonomous knowledge acquire (`ACQUIRE_CTX`) |
+| `inference` | plugins/extension/inference/engine/inference.c | inference engine top-level (`INFERENCE_CTX`) |
+| `knowledge` | plugins/extension/inference/engine/knowledge_file.c | knowledge corpus subsystem |
+| `llm` | plugins/extension/inference/engine/llm_cmd.c | `/llm` command surface |
+
 ## Feature plugins (`plugins/feature/`)
 
 | Context | Source | Description |
 |---|---|---|
-| `acquire` | plugins/inference/acquire_digest.c | autonomous knowledge acquire (`ACQUIRE_CTX`) |
 | `exchange` | plugins/feature/exchange/ | feature_exchange abstraction (`EXCHANGE_CTX`) |
-| `inference` | plugins/inference/inference.c | inference plugin top-level (`INFERENCE_CTX`) |
-| `knowledge` | plugins/inference/knowledge_file.c | knowledge corpus subsystem |
-| `llm` | plugins/inference/llm_cmd.c | `/llm` command surface |
 | `strategy.example_sma_cross` | plugins/feature/whenmoon/strategy/example_sma_cross/ | example SMA strategy log (`ESC_LOG_CTX`) |
 | `strategy.juggernaut` | plugins/feature/whenmoon/strategy/juggernaut/ | juggernaut strategy log (`JUG_LOG_CTX`) |
 | `strategy.mako` | plugins/feature/whenmoon/strategy/mako/ | mako strategy log (`MAKO_LOG_CTX`) |

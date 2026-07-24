@@ -8,10 +8,11 @@
 // helpers (signal emission, ctx user-slot, KV lookups) on first use
 // and cache the resolved function pointer.
 //
-// Shim shape mirrors plugins/inference/inference.h: atomic-guarded
-// static cache, union-laundered void* -> fn_t conversion, FATAL +
-// abort on lookup miss (which implies a broken plugin-dependency
-// graph: the strategy is loaded but feature_whenmoon is not).
+// Shim shape mirrors plugins/extension/inference/engine/inference.h:
+// atomic-guarded static cache, union-laundered void* -> fn_t
+// conversion, FATAL + abort on lookup miss (which implies a broken
+// plugin-dependency graph: the strategy is loaded but feature_whenmoon
+// is not).
 //
 // Inside the whenmoon plugin itself, the shims must NOT activate
 // (they would collide with the real definitions). Translation units

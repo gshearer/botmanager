@@ -884,7 +884,7 @@ claude_init(void)
       " channel automatically.\n"
       "\n"
       "Configuration lives under plugin.claude.*. See"
-      " plugins/cmd/claude/AGENTS.md.",
+      " plugins/extension/inference/claude/AGENTS.md.",
       USERNS_GROUP_OWNER, USERNS_OWNER_LEVEL,
       CMD_SCOPE_ANY, METHOD_T_ANY,
       claude_cmd, NULL,
