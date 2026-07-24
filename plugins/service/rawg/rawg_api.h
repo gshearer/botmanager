@@ -4,15 +4,16 @@
 // Public mechanism API for the rawg service plugin — keyed (?key= query
 // param) access to the RAWG video-games database (rawg.io, 350k+ games).
 // Consumers include this header and resolve the symbols at runtime via
-// plugin_dlsym_cached("rawg", …, (void **)&cached) — the plugin is loaded
+// plugin_dlsym_cached(RAWG_CTX, …, (void **)&cached) — the plugin is loaded
 // RTLD_LOCAL. Pure mechanism: this plugin fetches and normalizes; the rawg
 // command plugin owns every byte of user-facing presentation.
 //
 // Shim shape mirrors plugins/service/tmdb/tmdb_api.h: an atomic-guarded
 // static cache per symbol, a union to launder void*↔function-pointer,
 // FATAL + abort on a lookup miss. Inside the rawg plugin itself the
-// static-inline shims would collide with the real definitions, so rawg.c
-// defines RAWG_INTERNAL before including this header to skip them.
+// static-inline shims would collide with the real definitions, so its
+// own translation units (rawg.c, rawg_cmd.c) define RAWG_INTERNAL before
+// including this header to skip them and link directly instead.
 //
 // Normalization conventions (the service normalizes; the consumer only
 // presents): `rating` is RAWG's community average on a 0–5 scale and is 0
@@ -27,6 +28,10 @@
 #include <stdint.h>
 
 #include "common.h"  // SUCCESS/FAIL
+
+// The plugin's name, and so both its dlsym handle and the root of its
+// clam contexts. Public because the shims below resolve against it.
+#define RAWG_CTX "rawg"
 
 // ----------------------------------------------------------------------
 // Fixed sizes. Fixed-width strings let consumers stack-allocate results
@@ -188,10 +193,10 @@ rawg_configured(void)
   {
     union { void *obj; fn_t fn; } u;
 
-    u.obj = plugin_dlsym_cached("rawg", "rawg_configured", (void **)&cached);
+    u.obj = plugin_dlsym_cached(RAWG_CTX, "rawg_configured", (void **)&cached);
     if(u.obj == NULL)
     {
-      clam(CLAM_FATAL, "rawg", "dlsym failed: rawg_configured");
+      clam(CLAM_FATAL, RAWG_CTX, "dlsym failed: rawg_configured");
       abort();
     }
     fn = u.fn;
@@ -211,10 +216,11 @@ rawg_search_async(const char *query, rawg_search_cb_t cb, void *user)
   {
     union { void *obj; fn_t fn; } u;
 
-    u.obj = plugin_dlsym_cached("rawg", "rawg_search_async", (void **)&cached);
+    u.obj = plugin_dlsym_cached(RAWG_CTX, "rawg_search_async",
+        (void **)&cached);
     if(u.obj == NULL)
     {
-      clam(CLAM_FATAL, "rawg", "dlsym failed: rawg_search_async");
+      clam(CLAM_FATAL, RAWG_CTX, "dlsym failed: rawg_search_async");
       abort();
     }
     fn = u.fn;
@@ -234,10 +240,10 @@ rawg_game_async(int32_t id, rawg_game_cb_t cb, void *user)
   {
     union { void *obj; fn_t fn; } u;
 
-    u.obj = plugin_dlsym_cached("rawg", "rawg_game_async", (void **)&cached);
+    u.obj = plugin_dlsym_cached(RAWG_CTX, "rawg_game_async", (void **)&cached);
     if(u.obj == NULL)
     {
-      clam(CLAM_FATAL, "rawg", "dlsym failed: rawg_game_async");
+      clam(CLAM_FATAL, RAWG_CTX, "dlsym failed: rawg_game_async");
       abort();
     }
     fn = u.fn;
@@ -258,10 +264,10 @@ rawg_list_async(rawg_list_kind_t kind, int32_t year,
   {
     union { void *obj; fn_t fn; } u;
 
-    u.obj = plugin_dlsym_cached("rawg", "rawg_list_async", (void **)&cached);
+    u.obj = plugin_dlsym_cached(RAWG_CTX, "rawg_list_async", (void **)&cached);
     if(u.obj == NULL)
     {
-      clam(CLAM_FATAL, "rawg", "dlsym failed: rawg_list_async");
+      clam(CLAM_FATAL, RAWG_CTX, "dlsym failed: rawg_list_async");
       abort();
     }
     fn = u.fn;

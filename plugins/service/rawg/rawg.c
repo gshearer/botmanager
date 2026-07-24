@@ -2,14 +2,17 @@
 // RAWG service plugin: keyed (?key= query param) access to the RAWG
 // video-games database (rawg.io). Fetches and normalizes game detail,
 // free-text search, and ranked lists behind the rawg_api.h mechanism
-// contract. Pure connectivity — the rawg command plugin owns all
-// presentation. All RAWG nuance (endpoint shapes, the swagger's
-// under-documented nested arrays, date-window lists) is sealed here.
+// contract. Pure connectivity — the plugin's command surface half
+// (rawg_cmd.c) owns all presentation. All RAWG nuance (endpoint shapes,
+// the swagger's under-documented nested arrays, date-window lists) is
+// sealed here.
 //
 // The API key lands in the request URL (?key=…). Never clam() an assembled
 // request URL — it would leak the key to the logs.
 #define RAWG_INTERNAL
 #include "rawg.h"
+
+#include "rawg_cmd.h"
 
 // ----------------------------------------------------------------------
 // Small helpers
@@ -949,6 +952,14 @@ rawg_init(void)
   rawg_game_cursor = 0;
   rawg_list_cursor = 0;
 
+  // A plugin that cannot raise its own command surface is half-loaded,
+  // which is worse than absent — fail the init and let the loader skip it.
+  if(rawg_cmd_register() != SUCCESS)
+  {
+    pthread_mutex_destroy(&rawg_cache_mu);
+    return(FAIL);
+  }
+
   clam(CLAM_INFO, RAWG_CTX, "rawg plugin initialized");
   return(SUCCESS);
 }
@@ -956,10 +967,15 @@ rawg_init(void)
 static void
 rawg_deinit(void)
 {
+  rawg_cmd_unregister();
   pthread_mutex_destroy(&rawg_cache_mu);
   clam(CLAM_INFO, RAWG_CTX, "rawg plugin deinitialized");
 }
 
+// The command half's upward method_command dependency rides on this
+// descriptor. Sound only because rawg is a dependency-graph leaf —
+// nothing requires service_rawg, so nothing inherits it. See
+// `PLUGIN.md §Layer Rules` Rule 1, leaf exception.
 const plugin_desc_t bm_plugin_desc = {
   .api_version     = PLUGIN_API_VERSION,
   .name            = RAWG_CTX,
@@ -968,7 +984,8 @@ const plugin_desc_t bm_plugin_desc = {
   .kind            = RAWG_CTX,
   .provides        = { { .name = "service_rawg" } },
   .provides_count  = 1,
-  .requires_count  = 0,
+  .requires        = { { .name = "method_command" } },
+  .requires_count  = 1,
   .kv_schema       = rawg_kv_schema,
   .kv_schema_count = sizeof(rawg_kv_schema) / sizeof(rawg_kv_schema[0]),
   .init            = rawg_init,

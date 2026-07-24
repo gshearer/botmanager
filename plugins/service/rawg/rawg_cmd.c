@@ -1,7 +1,12 @@
 // botmanager — MIT
-// !rawg command-surface plugin: parses subcommands/flags, queries the rawg
-// service plugin via its public API, and renders colorized video-game
-// cards, searches, and trending/best/new lists.
+// rawg command surface: parses subcommands/flags, queries the service
+// half of its own plugin, and renders colorized video-game cards,
+// searches, and trending/best/new lists.
+//
+// RAWG_INTERNAL suppresses rawg_api.h's dlsym shims: this TU is linked
+// into the same .so as rawg.c, so it calls the service entry points
+// directly rather than resolving the plugin against itself.
+#define RAWG_INTERNAL
 #define RAWGCMD_INTERNAL
 #include "rawg_cmd.h"
 
@@ -733,13 +738,16 @@ static const cmd_nl_t rawg_nl = {
 };
 
 // ----------------------------------------------------------------------
-// Plugin lifecycle
+// Registration — driven by the service half's plugin lifecycle
 // ----------------------------------------------------------------------
 
-static bool
-rawgcmd_init(void)
+// The registry records RAWG_CTX as the providing module: after the merge
+// the rawg plugin itself owns this command, and `/show commands` should
+// say so.
+bool
+rawg_cmd_register(void)
 {
-  if(cmd_register(RAWGCMD_CTX, "rawg", rawg_usage,
+  if(cmd_register(RAWG_CTX, "rawg", rawg_usage,
       "Video-game info, search, and what's trending — from the RAWG "
       "database (rawg.io)",
       NULL,
@@ -748,33 +756,13 @@ rawgcmd_init(void)
       NULL, 0, NULL, &rawg_nl) != SUCCESS)
     return(FAIL);
 
-  clam(CLAM_INFO, RAWGCMD_CTX, "rawg command plugin initialized");
+  clam(CLAM_INFO, RAWGCMD_CTX, "!rawg registered");
   return(SUCCESS);
 }
 
-static void
-rawgcmd_deinit(void)
+void
+rawg_cmd_unregister(void)
 {
   cmd_unregister("rawg");
-  clam(CLAM_INFO, RAWGCMD_CTX, "rawg command plugin deinitialized");
+  clam(CLAM_INFO, RAWGCMD_CTX, "!rawg unregistered");
 }
-
-const plugin_desc_t bm_plugin_desc = {
-  .api_version     = PLUGIN_API_VERSION,
-  .name            = "rawg_cmd",
-  .version         = "1.0",
-  .type            = PLUGIN_MISC,
-  .kind            = "rawg_cmd",
-  .provides        = { { .name = "cmd_rawg" } },
-  .provides_count  = 1,
-  .requires        = { { .name = "method_command" },
-                       { .name = "service_rawg" } },
-  .requires_count  = 2,
-  .kv_schema       = NULL,
-  .kv_schema_count = 0,
-  .init            = rawgcmd_init,
-  .start           = NULL,
-  .stop            = NULL,
-  .deinit          = rawgcmd_deinit,
-  .ext             = NULL,
-};

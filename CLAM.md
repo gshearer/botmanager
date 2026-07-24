@@ -164,6 +164,7 @@ regex (the literal context portion, before any `<placeholder>`).
 | `kraken` | plugins/service/kraken/kraken_sign.c | top-level kraken plugin (`KR_CTX`) |
 | `openweather` | plugins/service/openweather/openweather.c | OpenWeather API (`OW_CTX`) |
 | `rawg` | plugins/service/rawg/rawg.c | RAWG video-games database API (`RAWG_CTX`) |
+| `rawg.cmd` | plugins/service/rawg/rawg_cmd.c | `!rawg` video-game info, the rawg plugin's own command surface (`RAWGCMD_CTX`) |
 | `searxng` | plugins/service/searxng/searxng.c | SearXNG service client (`SXNG_CTX`) |
 | `tmdb` | plugins/service/tmdb/tmdb.c | The Movie Database API (`TMDB_CTX`) |
 | `yahoofinance` | plugins/service/yahoofinance/yahoofinance.c | Yahoo Finance stock-quote provider (`YF_CTX`) |
@@ -185,7 +186,6 @@ halves. Same shape as `gemini` / `gemini.ws`.
 | `claude` | plugins/cmd/claude/claude.c | `/claude` bridge command (`CLAUDE_CTX`) |
 | `crypto` | plugins/feature/crypto/crypto.c | `/crypto` price command (`CRYPTO_CTX`) |
 | `imagine` | plugins/cmd/imagine/imagine_cmd.c | `!imagine` text-to-image command (`IMG_CMD_CTX`) |
-| `rawg_cmd` | plugins/cmd/rawg/rawg_cmd.c | `!rawg` video-game info command (`RAWGCMD_CTX`) |
 | `searxng` | plugins/cmd/searxng/searxng_cmd.c | `/searxng` command (`SEARXNG_CMD_CTX`) |
 | `stock` | plugins/feature/stock/stock.c | `!stock` quote command (`STOCK_CTX`) |
 | `tmdb_cmd` | plugins/cmd/tmdb/tmdb_cmd.c | `!tmdb` movie/TV/actor command (`TMDBCMD_CTX`) |

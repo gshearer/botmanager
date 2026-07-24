@@ -1,11 +1,23 @@
 #ifndef BM_RAWG_CMD_H
 #define BM_RAWG_CMD_H
 
-// Command-surface plugin for !rawg. Renders colorized video-game info
-// cards, searches, and trending/best/new lists against the rawg service
-// plugin's public mechanism API (rawg_api.h, resolved by name). Pure
-// presentation: every byte the user sees is shaped here; all fetching and
-// normalization lives in the service.
+// The rawg plugin's command surface: !rawg. Renders colorized video-game
+// info cards, searches, and trending/best/new lists over the rows rawg.c
+// normalizes — pure presentation, every byte the user sees is shaped
+// here, while all fetching and normalization stays in the service half
+// of the same .so.
+//
+// Both halves ship as one plugin because rawg is a dependency-graph leaf
+// (nothing requires service_rawg), so the command's upward method_command
+// dependency is inherited by nobody. See `PLUGIN.md §Layer Rules` Rule 1,
+// leaf exception.
+
+#include <stdbool.h>
+
+// Driven by rawg.c's lifecycle: the service half owns the plugin
+// descriptor, so it raises and lowers the command surface with it.
+bool rawg_cmd_register(void);
+void rawg_cmd_unregister(void);
 
 #ifdef RAWGCMD_INTERNAL
 
@@ -18,7 +30,7 @@
 
 #include "rawg_api.h"
 
-#define RAWGCMD_CTX      "rawg_cmd"
+#define RAWGCMD_CTX      RAWG_CTX ".cmd"
 #define RAWGCMD_REPLY_SZ 640
 #define RAWGCMD_QUERY_SZ 160
 #define RAWG_GAUGE_CELLS 10    // rating gauge width (over the 0–5 scale)
@@ -57,8 +69,6 @@ typedef struct
 } rawg_args_t;
 
 static void rawg_cmd(const cmd_ctx_t *);
-static bool rawgcmd_init(void);
-static void rawgcmd_deinit(void);
 
 #endif // RAWGCMD_INTERNAL
 

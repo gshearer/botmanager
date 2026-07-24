@@ -27,7 +27,7 @@
 
 // Constants
 
-#define RAWG_CTX        "rawg"
+// RAWG_CTX (the plugin name / clam-context root) lives in rawg_api.h.
 
 #define RAWG_API_BASE   "https://api.rawg.io/api"
 
