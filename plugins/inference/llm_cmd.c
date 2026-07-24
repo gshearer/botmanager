@@ -279,7 +279,7 @@ llm_service_refresh(const char *name)
   // Bearer token only when configured — keyless providers probe fine
   // without it, and an empty "Bearer " would break some gateways.
   snprintf(kvkey, sizeof(kvkey), "llm.service.%s.creds.apikey", name);
-  apikey = kv_get_str(kvkey);
+  apikey = kv_get_creds(kvkey);
 
   if(apikey != NULL && apikey[0] != '\0')
   {

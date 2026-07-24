@@ -2397,7 +2397,7 @@ llm_issue_request(llm_request_t *req)
   // Authorization header (if api key KV name configured).
   if(req->api_key_kv[0] != '\0')
   {
-    const char *key = kv_get_str(req->api_key_kv);
+    const char *key = kv_get_creds(req->api_key_kv);
 
     if(key != NULL && key[0] != '\0')
     {
