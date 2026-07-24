@@ -4,7 +4,7 @@
 // Public mechanism API for the tmdb service plugin — keyed (v4 Bearer
 // token) access to The Movie Database (themoviedb.org). Consumers include
 // this header and resolve the symbols at runtime via
-// plugin_dlsym_cached("tmdb", …, (void **)&cached) — the plugin is loaded
+// plugin_dlsym_cached(TMDB_CTX, …, (void **)&cached) — the plugin is loaded
 // RTLD_LOCAL. Pure mechanism: this plugin fetches and normalizes; the
 // tmdb command plugin owns every byte of user-facing presentation.
 //
@@ -12,8 +12,9 @@
 // atomic-guarded static cache per symbol, a union to launder
 // void*↔function-pointer, FATAL + abort on a lookup miss. Inside the tmdb
 // plugin itself the static-inline shims would collide with the real
-// definitions, so tmdb.c defines TMDB_INTERNAL before including this
-// header to skip them.
+// definitions, so its own translation units (tmdb.c, tmdb_cmd.c) define
+// TMDB_INTERNAL before including this header to skip them and link
+// directly instead.
 //
 // Normalization conventions (the service normalizes; the consumer only
 // presents): `rating` is TMDB's vote_average on a 0–10 scale and is 0
@@ -28,6 +29,10 @@
 #include <stdint.h>
 
 #include "common.h"  // SUCCESS/FAIL
+
+// The plugin's name, and so both its dlsym handle and the root of its
+// clam contexts. Public because the shims below resolve against it.
+#define TMDB_CTX "tmdb"
 
 // ----------------------------------------------------------------------
 // Fixed sizes. Fixed-width strings let consumers stack-allocate results
@@ -228,10 +233,10 @@ tmdb_configured(void)
   {
     union { void *obj; fn_t fn; } u;
 
-    u.obj = plugin_dlsym_cached("tmdb", "tmdb_configured", (void **)&cached);
+    u.obj = plugin_dlsym_cached(TMDB_CTX, "tmdb_configured", (void **)&cached);
     if(u.obj == NULL)
     {
-      clam(CLAM_FATAL, "tmdb", "dlsym failed: tmdb_configured");
+      clam(CLAM_FATAL, TMDB_CTX, "dlsym failed: tmdb_configured");
       abort();
     }
     fn = u.fn;
@@ -252,10 +257,11 @@ tmdb_search_async(tmdb_media_t kind, const char *query,
   {
     union { void *obj; fn_t fn; } u;
 
-    u.obj = plugin_dlsym_cached("tmdb", "tmdb_search_async", (void **)&cached);
+    u.obj = plugin_dlsym_cached(TMDB_CTX, "tmdb_search_async",
+        (void **)&cached);
     if(u.obj == NULL)
     {
-      clam(CLAM_FATAL, "tmdb", "dlsym failed: tmdb_search_async");
+      clam(CLAM_FATAL, TMDB_CTX, "dlsym failed: tmdb_search_async");
       abort();
     }
     fn = u.fn;
@@ -276,10 +282,11 @@ tmdb_title_async(tmdb_media_t kind, int32_t id,
   {
     union { void *obj; fn_t fn; } u;
 
-    u.obj = plugin_dlsym_cached("tmdb", "tmdb_title_async", (void **)&cached);
+    u.obj = plugin_dlsym_cached(TMDB_CTX, "tmdb_title_async",
+        (void **)&cached);
     if(u.obj == NULL)
     {
-      clam(CLAM_FATAL, "tmdb", "dlsym failed: tmdb_title_async");
+      clam(CLAM_FATAL, TMDB_CTX, "dlsym failed: tmdb_title_async");
       abort();
     }
     fn = u.fn;
@@ -299,10 +306,11 @@ tmdb_person_async(int32_t id, tmdb_person_cb_t cb, void *user)
   {
     union { void *obj; fn_t fn; } u;
 
-    u.obj = plugin_dlsym_cached("tmdb", "tmdb_person_async", (void **)&cached);
+    u.obj = plugin_dlsym_cached(TMDB_CTX, "tmdb_person_async",
+        (void **)&cached);
     if(u.obj == NULL)
     {
-      clam(CLAM_FATAL, "tmdb", "dlsym failed: tmdb_person_async");
+      clam(CLAM_FATAL, TMDB_CTX, "dlsym failed: tmdb_person_async");
       abort();
     }
     fn = u.fn;
@@ -323,11 +331,11 @@ tmdb_trending_async(tmdb_media_t kind, bool weekly,
   {
     union { void *obj; fn_t fn; } u;
 
-    u.obj = plugin_dlsym_cached("tmdb", "tmdb_trending_async",
+    u.obj = plugin_dlsym_cached(TMDB_CTX, "tmdb_trending_async",
         (void **)&cached);
     if(u.obj == NULL)
     {
-      clam(CLAM_FATAL, "tmdb", "dlsym failed: tmdb_trending_async");
+      clam(CLAM_FATAL, TMDB_CTX, "dlsym failed: tmdb_trending_async");
       abort();
     }
     fn = u.fn;

@@ -1,11 +1,23 @@
 #ifndef BM_TMDB_CMD_H
 #define BM_TMDB_CMD_H
 
-// Command-surface plugin for !tmdb. Renders colorized movie / TV / actor
-// info cards, searches, and trending lists against the tmdb service
-// plugin's public mechanism API (tmdb_api.h, resolved by name). Pure
-// presentation: every byte the user sees is shaped here; all fetching and
-// normalization lives in the service.
+// The tmdb plugin's command surface: !tmdb. Renders colorized movie / TV
+// / actor info cards, searches, and trending lists over the rows tmdb.c
+// normalizes — pure presentation, every byte the user sees is shaped
+// here, while all fetching and normalization stays in the service half
+// of the same .so.
+//
+// Both halves ship as one plugin because tmdb is a dependency-graph leaf
+// (nothing requires service_tmdb), so the command's upward method_command
+// dependency is inherited by nobody. See `PLUGIN.md §Layer Rules` Rule 1,
+// leaf exception.
+
+#include <stdbool.h>
+
+// Driven by tmdb.c's lifecycle: the service half owns the plugin
+// descriptor, so it raises and lowers the command surface with it.
+bool tmdb_cmd_register(void);
+void tmdb_cmd_unregister(void);
 
 #ifdef TMDBCMD_INTERNAL
 
@@ -18,7 +30,7 @@
 
 #include "tmdb_api.h"
 
-#define TMDBCMD_CTX      "tmdb_cmd"
+#define TMDBCMD_CTX      TMDB_CTX ".cmd"
 #define TMDBCMD_REPLY_SZ 640
 #define TMDBCMD_QUERY_SZ 160
 #define TMDB_GAUGE_CELLS 10    // rating gauge width
@@ -57,8 +69,6 @@ typedef struct
 } tmdb_args_t;
 
 static void tmdb_cmd(const cmd_ctx_t *);
-static bool tmdbcmd_init(void);
-static void tmdbcmd_deinit(void);
 
 #endif // TMDBCMD_INTERNAL
 

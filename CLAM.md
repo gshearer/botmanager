@@ -167,6 +167,7 @@ regex (the literal context portion, before any `<placeholder>`).
 | `rawg.cmd` | plugins/service/rawg/rawg_cmd.c | `!rawg` video-game info, the rawg plugin's own command surface (`RAWGCMD_CTX`) |
 | `searxng` | plugins/service/searxng/searxng.c | SearXNG service client (`SXNG_CTX`) |
 | `tmdb` | plugins/service/tmdb/tmdb.c | The Movie Database API (`TMDB_CTX`) |
+| `tmdb.cmd` | plugins/service/tmdb/tmdb_cmd.c | `!tmdb` movie/TV/actor info, the tmdb plugin's own command surface (`TMDBCMD_CTX`) |
 | `yahoofinance` | plugins/service/yahoofinance/yahoofinance.c | Yahoo Finance stock-quote provider (`YF_CTX`) |
 
 ## Command-surface plugins
@@ -188,7 +189,6 @@ halves. Same shape as `gemini` / `gemini.ws`.
 | `imagine` | plugins/cmd/imagine/imagine_cmd.c | `!imagine` text-to-image command (`IMG_CMD_CTX`) |
 | `searxng` | plugins/cmd/searxng/searxng_cmd.c | `/searxng` command (`SEARXNG_CMD_CTX`) |
 | `stock` | plugins/feature/stock/stock.c | `!stock` quote command (`STOCK_CTX`) |
-| `tmdb_cmd` | plugins/cmd/tmdb/tmdb_cmd.c | `!tmdb` movie/TV/actor command (`TMDBCMD_CTX`) |
 | `weather` | plugins/feature/weather/weather.c | `/weather` command (`WEATHER_CTX`) |
 
 ## Method plugins (`plugins/method/`)

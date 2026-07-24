@@ -2,11 +2,13 @@
 // TMDB service plugin: keyed (v4 Bearer) access to The Movie Database.
 // Fetches and normalizes movie/TV/person detail, multi-search, and
 // trending lists behind the tmdb_api.h mechanism contract. Pure
-// connectivity — the tmdb command plugin owns all presentation. All TMDB
-// nuance (endpoint shapes, append_to_response, image/id conventions) is
-// sealed here.
+// connectivity — the plugin's command surface half (tmdb_cmd.c) owns all
+// presentation. All TMDB nuance (endpoint shapes, append_to_response,
+// image/id conventions) is sealed here.
 #define TMDB_INTERNAL
 #include "tmdb.h"
+
+#include "tmdb_cmd.h"
 
 // ----------------------------------------------------------------------
 // Small helpers
@@ -1238,6 +1240,14 @@ tmdb_init(void)
   tmdb_person_cursor = 0;
   tmdb_trend_cursor  = 0;
 
+  // A plugin that cannot raise its own command surface is half-loaded,
+  // which is worse than absent — fail the init and let the loader skip it.
+  if(tmdb_cmd_register() != SUCCESS)
+  {
+    pthread_mutex_destroy(&tmdb_cache_mu);
+    return(FAIL);
+  }
+
   clam(CLAM_INFO, TMDB_CTX, "tmdb plugin initialized");
   return(SUCCESS);
 }
@@ -1245,10 +1255,15 @@ tmdb_init(void)
 static void
 tmdb_deinit(void)
 {
+  tmdb_cmd_unregister();
   pthread_mutex_destroy(&tmdb_cache_mu);
   clam(CLAM_INFO, TMDB_CTX, "tmdb plugin deinitialized");
 }
 
+// The command half's upward method_command dependency rides on this
+// descriptor. Sound only because tmdb is a dependency-graph leaf —
+// nothing requires service_tmdb, so nothing inherits it. See
+// `PLUGIN.md §Layer Rules` Rule 1, leaf exception.
 const plugin_desc_t bm_plugin_desc = {
   .api_version     = PLUGIN_API_VERSION,
   .name            = TMDB_CTX,
@@ -1257,7 +1272,8 @@ const plugin_desc_t bm_plugin_desc = {
   .kind            = TMDB_CTX,
   .provides        = { { .name = "service_tmdb" } },
   .provides_count  = 1,
-  .requires_count  = 0,
+  .requires        = { { .name = "method_command" } },
+  .requires_count  = 1,
   .kv_schema       = tmdb_kv_schema,
   .kv_schema_count = sizeof(tmdb_kv_schema) / sizeof(tmdb_kv_schema[0]),
   .init            = tmdb_init,

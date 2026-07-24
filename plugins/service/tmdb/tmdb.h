@@ -27,7 +27,7 @@
 
 // Constants
 
-#define TMDB_CTX          "tmdb"
+// TMDB_CTX (the plugin name / clam-context root) lives in tmdb_api.h.
 
 #define TMDB_API_BASE     "https://api.themoviedb.org/3"
 

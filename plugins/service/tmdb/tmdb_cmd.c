@@ -1,7 +1,12 @@
 // botmanager — MIT
-// !tmdb command-surface plugin: parses subcommands/flags, queries the tmdb
-// service plugin via its public API, and renders colorized movie / TV /
-// actor cards, searches, and trending lists.
+// tmdb command surface: parses subcommands/flags, queries the service
+// half of its own plugin, and renders colorized movie / TV / actor
+// cards, searches, and trending lists.
+//
+// TMDB_INTERNAL suppresses tmdb_api.h's dlsym shims: this TU is linked
+// into the same .so as tmdb.c, so it calls the service entry points
+// directly rather than resolving the plugin against itself.
+#define TMDB_INTERNAL
 #define TMDBCMD_INTERNAL
 #include "tmdb_cmd.h"
 
@@ -962,13 +967,16 @@ static const cmd_nl_t tmdb_nl = {
 };
 
 // ----------------------------------------------------------------------
-// Plugin lifecycle
+// Registration — driven by the service half's plugin lifecycle
 // ----------------------------------------------------------------------
 
-static bool
-tmdbcmd_init(void)
+// The registry records TMDB_CTX as the providing module: after the merge
+// the tmdb plugin itself owns this command, and `/show commands` should
+// say so.
+bool
+tmdb_cmd_register(void)
 {
-  if(cmd_register(TMDBCMD_CTX, "tmdb", tmdb_usage,
+  if(cmd_register(TMDB_CTX, "tmdb", tmdb_usage,
       "Movie, TV, and actor info from The Movie Database (themoviedb.org)",
       NULL,
       "everyone", 0, CMD_SCOPE_ANY, METHOD_T_ANY,
@@ -976,33 +984,13 @@ tmdbcmd_init(void)
       NULL, 0, NULL, &tmdb_nl) != SUCCESS)
     return(FAIL);
 
-  clam(CLAM_INFO, TMDBCMD_CTX, "tmdb command plugin initialized");
+  clam(CLAM_INFO, TMDBCMD_CTX, "!tmdb registered");
   return(SUCCESS);
 }
 
-static void
-tmdbcmd_deinit(void)
+void
+tmdb_cmd_unregister(void)
 {
   cmd_unregister("tmdb");
-  clam(CLAM_INFO, TMDBCMD_CTX, "tmdb command plugin deinitialized");
+  clam(CLAM_INFO, TMDBCMD_CTX, "!tmdb unregistered");
 }
-
-const plugin_desc_t bm_plugin_desc = {
-  .api_version     = PLUGIN_API_VERSION,
-  .name            = "tmdb_cmd",
-  .version         = "1.0",
-  .type            = PLUGIN_MISC,
-  .kind            = "tmdb_cmd",
-  .provides        = { { .name = "cmd_tmdb" } },
-  .provides_count  = 1,
-  .requires        = { { .name = "method_command" },
-                       { .name = "service_tmdb" } },
-  .requires_count  = 2,
-  .kv_schema       = NULL,
-  .kv_schema_count = 0,
-  .init            = tmdbcmd_init,
-  .start           = NULL,
-  .stop            = NULL,
-  .deinit          = tmdbcmd_deinit,
-  .ext             = NULL,
-};
