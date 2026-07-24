@@ -4,7 +4,7 @@ Service plugin (`PLUGIN_SERVICE`) for Coinbase Advanced Trade (the
 retail-facing successor to Coinbase Pro / GDAX, served at
 `api.coinbase.com/api/v3/brokerage/...`). Exposes a mechanism API
 over both REST and a WebSocket feed so consumers —
-`plugins/feature/whenmoon/`, a future `plugins/feature/coinbase/`
+`plugins/extension/whenmoon/`, a future `plugins/feature/coinbase/`
 command surface, other internal callers — can access products, candles,
 live trades, order books, accounts, and place orders without
 knowing how Coinbase authentication or streaming works.
@@ -59,7 +59,7 @@ prod CDP key if running against this plugin.
 Hard layering rules apply (`plugins/service/AGENTS.md`):
 
 1. **Zero user commands.** Coinbase-related `/` commands (if any
-   are added) belong either in `plugins/feature/whenmoon/` (when they
+   are added) belong either in `plugins/extension/whenmoon/` (when they
    mutate whenmoon state) or a `plugins/feature/coinbase/` command
    surface (for standalone users). The Rule 1 leaf exception (a
    graph-leaf service may carry its own command surface) does **not**
@@ -121,7 +121,7 @@ plugins and serve different purposes — neither is redundant:
   lives here.
 
 - **`plugin.whenmoon.exchange.coinbase.*`** — owned by the *whenmoon
-  feature plugin* (`plugins/feature/whenmoon/`). Configures
+  feature plugin* (`plugins/extension/whenmoon/`). Configures
   whenmoon's *consumer-side* policy when calling through coinbase:
   account-poll cadence (`account.refresh_sec`), per-exchange
   rate-limit (`rate_limit_rps`), and the WM-LT-8 live-trading

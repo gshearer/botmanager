@@ -50,7 +50,7 @@ whenmoon_plugin = shared_library('whenmoon',
     inc_include,
     whenmoon_include,
     include_directories('../../service/coinbase'),
-    include_directories('../exchange'),
+    include_directories('../../feature/exchange'),
   ],
   dependencies : [
     talib_dep,

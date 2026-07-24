@@ -227,20 +227,20 @@ The command surfaces filed beside these engines (`ask`, `claude`,
 | Context | Source | Description |
 |---|---|---|
 | `exchange` | plugins/feature/exchange/ | feature_exchange abstraction (`EXCHANGE_CTX`) |
-| `strategy.example_sma_cross` | plugins/feature/whenmoon/strategy/example_sma_cross/ | example SMA strategy log (`ESC_LOG_CTX`) |
-| `strategy.juggernaut` | plugins/feature/whenmoon/strategy/juggernaut/ | juggernaut strategy log (`JUG_LOG_CTX`) |
-| `strategy.mako` | plugins/feature/whenmoon/strategy/mako/ | mako strategy log (`MAKO_LOG_CTX`) |
-| `strategy.squall` | plugins/feature/whenmoon/strategy/squall/ | squall strategy log (`SQUALL_LOG_CTX`) |
-| `strategy.keel` | plugins/feature/whenmoon/strategy/keel/ | keel strategy log (`KEEL_LOG_CTX`) |
-| `strategy.testing` | plugins/feature/whenmoon/strategy/testing/ | testing strategy log (`TST_LOG_CTX`) |
+| `strategy.example_sma_cross` | plugins/extension/whenmoon/strategy/example_sma_cross/ | example SMA strategy log (`ESC_LOG_CTX`) |
+| `strategy.juggernaut` | plugins/extension/whenmoon/strategy/juggernaut/ | juggernaut strategy log (`JUG_LOG_CTX`) |
+| `strategy.mako` | plugins/extension/whenmoon/strategy/mako/ | mako strategy log (`MAKO_LOG_CTX`) |
+| `strategy.squall` | plugins/extension/whenmoon/strategy/squall/ | squall strategy log (`SQUALL_LOG_CTX`) |
+| `strategy.keel` | plugins/extension/whenmoon/strategy/keel/ | keel strategy log (`KEEL_LOG_CTX`) |
+| `strategy.testing` | plugins/extension/whenmoon/strategy/testing/ | testing strategy log (`TST_LOG_CTX`) |
 | `userquote` | plugins/feature/userquote/ | quote book: schema, add/recall/del, migration (`UQ_CTX`) |
-| `whenmoon` | plugins/feature/whenmoon/ | top-level whenmoon (`WHENMOON_CTX`) |
-| `whenmoon mw` | plugins/feature/whenmoon/mw.c | marketwatch subsystem op log (`MW_CTX`) |
-| `whenmoon.backtest` | plugins/feature/whenmoon/backtest.c | backtest engine (`WM_BT_CTX`) |
-| `whenmoon.bt.report` | plugins/feature/whenmoon/wm_bt_report.c | backtest report emit warnings (`WM_BT_REPORT_CTX`) |
-| `whenmoon.dl` | plugins/feature/whenmoon/dl_coverage.c | download / job-table events (`WM_DL_CTX`) |
-| `whenmoon.live` | plugins/feature/whenmoon/live.c | live-trading runtime (`WM_LIVE_CTX`) |
-| `whenmoon.sweep` | plugins/feature/whenmoon/sweep.c | strategy sweep runner (`WM_SWEEP_CTX`) |
+| `whenmoon` | plugins/extension/whenmoon/ | top-level whenmoon (`WHENMOON_CTX`) |
+| `whenmoon mw` | plugins/extension/whenmoon/mw.c | marketwatch subsystem op log (`MW_CTX`) |
+| `whenmoon.backtest` | plugins/extension/whenmoon/backtest.c | backtest engine (`WM_BT_CTX`) |
+| `whenmoon.bt.report` | plugins/extension/whenmoon/wm_bt_report.c | backtest report emit warnings (`WM_BT_REPORT_CTX`) |
+| `whenmoon.dl` | plugins/extension/whenmoon/dl_coverage.c | download / job-table events (`WM_DL_CTX`) |
+| `whenmoon.live` | plugins/extension/whenmoon/live.c | live-trading runtime (`WM_LIVE_CTX`) |
+| `whenmoon.sweep` | plugins/extension/whenmoon/sweep.c | strategy sweep runner (`WM_SWEEP_CTX`) |
 
 ## Marketwatch event topics — `mw.<exch>.<event>.<id>`
 

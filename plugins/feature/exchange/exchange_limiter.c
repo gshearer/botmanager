@@ -1,7 +1,7 @@
 // botmanager — MIT
 // Token-bucket + reserved-slot limiter for exchange dispatch.
 //
-// Bucket math is adapted from plugins/feature/whenmoon/dl_scheduler.c
+// Bucket math is adapted from plugins/extension/whenmoon/dl_scheduler.c
 // (the legacy per-bot limiter retired in EX-1). The reserved-slot
 // policy is new: each priority tier holds N tokens hostage so a flood
 // of low-priority backfill cannot starve a transactional buy/sell.

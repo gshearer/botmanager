@@ -80,7 +80,7 @@ runtime.
 | `plugins/service/` | External API integrations | coinbase, openweather, coinmarketcap, searxng |
 | `plugins/extension/` | Self-contained subsystems with internal structure | inference (engine + `ask`/`claude`/`imagine`/`search`) |
 | `plugins/feature/` | Single focused capabilities atop the stack | whenmoon, exchange, weather, stock |
-| `plugins/feature/whenmoon/strategy/` | Loadable trading strategies | testing |
+| `plugins/extension/whenmoon/strategy/` | Loadable trading strategies | testing |
 | `plugins/misc/` | Toys / novelties — no external deps, no state | math, eightball |
 
 Plugins are filed by **domain**, not by runtime `type`: a command
@@ -156,7 +156,7 @@ instance mediating.
 ## A worked example: Whenmoon
 
 Whenmoon is the canonical "feature plugin" — a capability layer,
-not a bot. It lives at `plugins/feature/whenmoon/` and is consumed
+not a bot. It lives at `plugins/extension/whenmoon/` and is consumed
 via `/whenmoon` (abbreviated `/wm`) verbs from any operator session.
 It owns:
 
@@ -187,7 +187,7 @@ It owns:
 ### Strategy ABI
 
 The supported view of a market is the per-grain bar ring published
-in `plugins/feature/whenmoon/market.h`:
+in `plugins/extension/whenmoon/market.h`:
 
 ```c
 mkt->grain_arr[g][i]   // i ∈ [0, grain_n[g])

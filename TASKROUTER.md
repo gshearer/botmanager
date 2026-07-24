@@ -20,10 +20,12 @@ alongside its code.
 | Add a service plugin (external API) | `PLUGIN.md` + `plugins/service/AGENTS.md` |
 | Add/modify a protocol driver (IRC, ...) | `PLUGIN.md` + `plugins/protocol/AGENTS.md` + `include/method.h` |
 | Add/modify a method driver (text, voice, ...) | `PLUGIN.md` + `plugins/method/AGENTS.md` + `include/bot.h` |
-| Add/modify a feature plugin (whenmoon, weather, crypto, stock, ...) | `PLUGIN.md` + `plugins/feature/AGENTS.md` + `include/bot.h` |
-| Add/modify an extension subsystem (inference) | `PLUGIN.md` + `plugins/extension/AGENTS.md` |
-| Write, iterate, or backtest a trading strategy (cp1, mako, riptide, ...) | `plugins/feature/whenmoon/strategy/AGENTS.md` |
-| Run or interpret a backtest / sweep (the iteration loop) | `plugins/feature/whenmoon/strategy/AGENTS.md` §iteration loop |
+| Add/modify a feature plugin (weather, crypto, stock, urlgrabber, userquote, ...) | `PLUGIN.md` + `plugins/feature/AGENTS.md` + `include/bot.h` |
+| Add/modify an extension subsystem (inference, whenmoon) | `PLUGIN.md` + `plugins/extension/AGENTS.md` |
+| Work on the whenmoon plugin C code (markets, candles, backtester, treasuries) | `plugins/extension/whenmoon/AGENTS.md` |
+| Act as CFO / touch a treasury or the live disc fund | `plugins/extension/whenmoon/CFO.md` (read FIRST — it is the office) |
+| Write, iterate, or backtest a trading strategy (cp1, mako, riptide, ...) | `plugins/extension/whenmoon/strategy/AGENTS.md` |
+| Run or interpret a backtest / sweep (the iteration loop) | `plugins/extension/whenmoon/strategy/AGENTS.md` §iteration loop |
 | Add/modify an exchange driver (coinbase, kraken, ...) | `PLUGIN.md` + `plugins/service/AGENTS.md` + `plugins/feature/exchange/AGENTS.md` |
 | Add/modify a DB driver | `PLUGIN.md` + `plugins/db/AGENTS.md` + `include/db.h` |
 | Work on a core subsystem | `core/AGENTS.md` + relevant `include/*.h` |

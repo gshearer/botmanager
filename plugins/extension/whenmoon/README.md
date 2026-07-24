@@ -87,7 +87,7 @@ the text method follows for `/dossier`, `/memory`, `/llm`.
 | Plugin kind | `whenmoon` |
 | Provides feature | `feature_whenmoon` |
 | Requires | `feature_exchange`, `exchange_coinbase` |
-| Home directory | `plugins/feature/whenmoon/` |
+| Home directory | `plugins/extension/whenmoon/` |
 | Shared library | `libwhenmoon.so` |
 
 Downward-only dependencies apply (core + service + inference). No

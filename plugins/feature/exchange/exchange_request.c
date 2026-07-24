@@ -1,7 +1,7 @@
 // botmanager — MIT
 // Public exchange_request(): enqueue + event-driven dispatch + retry.
 //
-// Shape mirrors the legacy plugins/feature/whenmoon/dl_scheduler.c
+// Shape mirrors the legacy plugins/extension/whenmoon/dl_scheduler.c
 // dispatch loop (proven in WM-S* live verification): no periodic tick;
 // dispatch is kicked by enqueue and by completion. Token-bucket math
 // lives in exchange_limiter.c, retry policy in exchange_retry.c.
