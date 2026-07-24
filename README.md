@@ -77,10 +77,18 @@ runtime.
 | `plugins/protocol/` | Wire protocols | IRC, botmanctl |
 | `plugins/method/` | Bot interaction methods (the kinds) | command, chat |
 | `plugins/service/` | External API integrations | coinbase, openweather, coinmarketcap, searxng |
-| `plugins/cmd/` | Pure command-surface wrappers (no I/O) | `misc_*` |
 | `plugins/inference/` | LLM client + knowledge store + acquisition | inference |
-| `plugins/feature/` | Cross-cutting capability layers | whenmoon, exchange |
+| `plugins/feature/` | Single focused capabilities atop the stack | whenmoon, exchange, weather, stock |
 | `plugins/feature/whenmoon/strategy/` | Loadable trading strategies | testing |
+| `plugins/misc/` | Toys / novelties — no external deps, no state | math, eightball |
+| `plugins/cmd/` | *Being dissolved* — command surfaces awaiting re-filing by domain | ask, claude, tmdb |
+
+Plugins are filed by **domain**, not by runtime `type`: a command
+surface lives with the capability it serves (`feature/`), with the
+toys (`misc/`), or beside the leaf service it wraps — never in a
+bucket that just means "it registers a command". `PLUGIN.md §Layer
+Rules` holds the authoritative layer table and the placement
+decision-tree for new plugins.
 
 **Inter-plugin contracts** live as headers in `plugins/contracts/` —
 consumer-agnostic types and function-pointer signatures, no
