@@ -405,7 +405,7 @@ vision_on_fetch_done(const curl_response_t *resp)
     goto done;
   }
 
-  // Synthesise a method_msg_t matching what chatbot_on_message would
+  // Synthesise a method_msg_t matching what chatbot_observe would
   // have built, so chatbot_reply_submit_vision can populate
   // chatbot_req_t from a single argument.
   memset(&synth, 0, sizeof(synth));

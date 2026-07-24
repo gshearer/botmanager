@@ -83,7 +83,7 @@ cmd_set_kv(const cmd_ctx_t *ctx)
 //
 // Disambiguation between the two forms uses the bot's driver name:
 // if the second token equals bot_driver_name(bot), it's parsed as the
-// kind. Kind strings ("llm", "command") don't collide with KV key
+// kind. Kind strings ("llm", "text") don't collide with KV key
 // segments, so this is unambiguous in practice.
 
 static const cmd_arg_desc_t ad_set_bot[] = {

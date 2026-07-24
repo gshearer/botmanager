@@ -456,7 +456,7 @@ const plugin_desc_t bm_plugin_desc = {
   .provides        = { { .name = "cmd_searxng" } },
   .provides_count  = 1,
   .requires        = {
-    { .name = "method_command" },
+    { .name = "method_text" },
     { .name = "service_searxng" },
   },
   .requires_count  = 2,

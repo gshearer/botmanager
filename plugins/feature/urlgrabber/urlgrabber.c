@@ -549,7 +549,7 @@ const plugin_desc_t bm_plugin_desc = {
   .kind                 = "urlgrabber",
   .provides             = { { .name = "feature_urlgrabber" } },
   .provides_count       = 1,
-  .requires             = { { .name = "method_command" } },
+  .requires             = { { .name = "method_text" } },
   .requires_count       = 1,
   .kv_schema            = ug_kv_schema,
   .kv_schema_count      = sizeof(ug_kv_schema) / sizeof(ug_kv_schema[0]),

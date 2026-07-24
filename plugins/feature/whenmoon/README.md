@@ -19,7 +19,7 @@ It runs as a feature of kind `whenmoon` — a `PLUGIN_FEATURE` capability
 layer composed atop a method/protocol bot. A bot instance bound to it
 owns exchange sessions, watched markets, per-market strategy state,
 and the order/position lifecycle; control and telemetry flow through
-the same method/command layer every other botmanager bot uses.
+the same method + command layer every other botmanager bot uses.
 
 It is not HFT. The smallest decision granularity is a 1-minute candle.
 If you need sub-second execution, look elsewhere (e.g. freqtrade).
@@ -43,7 +43,7 @@ lands in later chunks.
 ## Architectural Vision
 
 The plan, executed over future chunks, is a flat source layout
-mirroring `plugins/method/chat/`'s style: many `.c` files compiled
+mirroring `plugins/method/text/`'s style: many `.c` files compiled
 into a single `shared_library('whenmoon', …)` rather than nested
 subdirs.
 Expected subsystems, each growing as one or a few source files:

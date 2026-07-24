@@ -1,10 +1,11 @@
 // botmanager — MIT
-// /show bot <name> <verb> handlers for chat-kind bots (summary, personas, …).
+// /show bot <name> <verb> handlers for text-kind bots (summary, personas, …).
 
 #define CHATBOT_INTERNAL
 #include "chatbot.h"
 #include "colors.h"
 #include "db.h"
+#include "dispatch.h"
 #include "inference.h"
 
 #include <inttypes.h>
@@ -12,10 +13,16 @@
 #include <string.h>
 #include <time.h>
 
-// ---- /show bot <name> llm (kind summary) -------------------------------
+// ---- /show bot <name> (kind summary) -----------------------------------
+//
+// One summary for the whole bot. PTREE-6 fused the chat and command
+// drivers into a single `text` kind, so there is exactly one :default
+// sentinel for it — two would collide in the registry. The command-half
+// rows come from dispatch.c; the conversational rows are below, led by
+// the toggle that says whether they mean anything.
 
 static void
-verb_llm_summary(const cmd_ctx_t *ctx, bot_inst_t *bot, const char *rest)
+verb_text_summary(const cmd_ctx_t *ctx, bot_inst_t *bot, const char *rest)
 {
   const char *nl;
   const char *nl_state = "disabled";
@@ -24,6 +31,7 @@ verb_llm_summary(const cmd_ctx_t *ctx, bot_inst_t *bot, const char *rest)
   time_t now;
   uint32_t in_flight;
   const char *pname;
+  bool converses;
   char line[512];
   char key[128];
   const char *name;
@@ -32,7 +40,26 @@ verb_llm_summary(const cmd_ctx_t *ctx, bot_inst_t *bot, const char *rest)
 
   name = bot_inst_name(bot);
 
-  cmd_reply(ctx, CLR_BOLD "chat bot" CLR_RESET);
+  cmd_reply(ctx, CLR_BOLD "text bot" CLR_RESET);
+
+  // Command half: dispatch counters, activity, bound namespace.
+  text_dispatch_summary(ctx, bot);
+
+  // Bound methods count.
+  snprintf(line, sizeof(line), "  methods:     %u",
+      bot_method_count(bot));
+  cmd_reply(ctx, line);
+
+  // Conversational half. Everything below this row is inert when the
+  // toggle is off, so say so plainly rather than printing a persona and
+  // a model the bot will never use.
+  snprintf(key, sizeof(key), "bot.%s.behavior.chat.enabled", name);
+  converses = (kv_get_uint(key) != 0);
+
+  snprintf(line, sizeof(line), "  converse:    %s",
+      converses ? CLR_GREEN "enabled" CLR_RESET
+                : CLR_GRAY "disabled (command-only)" CLR_RESET);
+  cmd_reply(ctx, line);
 
   // Active persona.
   snprintf(key, sizeof(key), "bot.%s.behavior.personality", name);
@@ -60,11 +87,6 @@ verb_llm_summary(const cmd_ctx_t *ctx, bot_inst_t *bot, const char *rest)
 
   else
     cmd_reply(ctx, "  persona:     " CLR_GRAY "(none)" CLR_RESET);
-
-  // Bound methods count.
-  snprintf(line, sizeof(line), "  methods:     %u",
-      bot_method_count(bot));
-  cmd_reply(ctx, line);
 
   // In-flight replies.
   in_flight = chatbot_inflight_get((chatbot_state_t *)bot_get_handle(bot));
@@ -778,9 +800,9 @@ chatbot_show_extract_cmd(const cmd_ctx_t *ctx)
 // child callback, so the wrappers simply forward.
 
 static void
-verb_llm_summary_wrapper(const cmd_ctx_t *ctx)
+verb_text_summary_wrapper(const cmd_ctx_t *ctx)
 {
-  verb_llm_summary(ctx, ctx->bot, ctx->args);
+  verb_text_summary(ctx, ctx->bot, ctx->args);
 }
 
 static void
@@ -847,21 +869,23 @@ static const cmd_nl_t show_bot_model_nl = {
 
 // ---- registration ------------------------------------------------------
 
-// llm-kind filter, NUL-terminated. Storage must be static -- cmd_register
+// text-kind filter, NUL-terminated. Storage must be static -- cmd_register
 // keeps the pointer.
-static const char *const chat_kind_filter[] = { "chat", NULL };
+static const char *const text_kind_filter[] = { "text", NULL };
 
 // Called from chatbot plugin init (chatbot.c) once per plugin load.
 bool
 chatbot_show_verbs_register(void)
 {
-  if(cmd_register("llm", ":default",
+  // The sole :default sentinel for the text kind — it renders both
+  // halves (see verb_text_summary). A second one would collide.
+  if(cmd_register("text", ":default",
         "show bot <name>",
-        "LLM bot summary (persona, model, mute, verbosity)",
+        "Text bot summary (commands, converse toggle, persona, model)",
         NULL,
         USERNS_GROUP_ADMIN, 100, CMD_SCOPE_ANY, METHOD_T_ANY,
-        verb_llm_summary_wrapper, NULL, "show/bot", NULL,
-        NULL, 0, chat_kind_filter, NULL) != SUCCESS)
+        verb_text_summary_wrapper, NULL, "show/bot", NULL,
+        NULL, 0, text_kind_filter, NULL) != SUCCESS)
     return(FAIL);
 
   if(cmd_register("llm", "personas",
@@ -870,7 +894,7 @@ chatbot_show_verbs_register(void)
         NULL,
         USERNS_GROUP_ADMIN, 100, CMD_SCOPE_ANY, METHOD_T_ANY,
         verb_llm_personas_wrapper, NULL, "show/bot", NULL,
-        NULL, 0, chat_kind_filter, NULL) != SUCCESS)
+        NULL, 0, text_kind_filter, NULL) != SUCCESS)
     return(FAIL);
 
   if(cmd_register("llm", "memories",
@@ -879,7 +903,7 @@ chatbot_show_verbs_register(void)
         NULL,
         USERNS_GROUP_ADMIN, 100, CMD_SCOPE_ANY, METHOD_T_ANY,
         verb_llm_memories_wrapper, NULL, "show/bot", NULL,
-        NULL, 0, chat_kind_filter, NULL) != SUCCESS)
+        NULL, 0, text_kind_filter, NULL) != SUCCESS)
     return(FAIL);
 
   if(cmd_register("llm", "stats",
@@ -888,7 +912,7 @@ chatbot_show_verbs_register(void)
         NULL,
         USERNS_GROUP_ADMIN, 100, CMD_SCOPE_ANY, METHOD_T_ANY,
         verb_stats_wrapper, NULL, "show/bot", NULL,
-        NULL, 0, chat_kind_filter, NULL) != SUCCESS)
+        NULL, 0, text_kind_filter, NULL) != SUCCESS)
     return(FAIL);
 
   if(cmd_register("llm", "knowledge",
@@ -897,7 +921,7 @@ chatbot_show_verbs_register(void)
         NULL,
         USERNS_GROUP_ADMIN, 100, CMD_SCOPE_ANY, METHOD_T_ANY,
         verb_llm_knowledge_wrapper, NULL, "show/bot", NULL,
-        NULL, 0, chat_kind_filter, NULL) != SUCCESS)
+        NULL, 0, text_kind_filter, NULL) != SUCCESS)
     return(FAIL);
 
   if(cmd_register("llm", "interests",
@@ -906,7 +930,7 @@ chatbot_show_verbs_register(void)
         NULL,
         USERNS_GROUP_ADMIN, 100, CMD_SCOPE_ANY, METHOD_T_ANY,
         verb_llm_interests_wrapper, NULL, "show/bot", NULL,
-        NULL, 0, chat_kind_filter, NULL) != SUCCESS)
+        NULL, 0, text_kind_filter, NULL) != SUCCESS)
     return(FAIL);
 
   // Everyone-gated by design so the NL bridge can route "what LLM are
@@ -921,7 +945,7 @@ chatbot_show_verbs_register(void)
         "like \"what LLM are you?\" via the NL bridge.",
         USERNS_GROUP_EVERYONE, 0, CMD_SCOPE_ANY, METHOD_T_ANY,
         verb_model_wrapper, NULL, "show/bot", NULL,
-        NULL, 0, chat_kind_filter, &show_bot_model_nl) != SUCCESS)
+        NULL, 0, text_kind_filter, &show_bot_model_nl) != SUCCESS)
     return(FAIL);
 
   // /show extract {root,stats} — plain /show children, no kind filter.

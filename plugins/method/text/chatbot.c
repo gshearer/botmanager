@@ -1,8 +1,9 @@
 // botmanager — MIT
-// Mimick bot driver + plugin descriptor.
+// Text bot driver + plugin descriptor (conversational half).
 
 #define CHATBOT_INTERNAL
 #include "chatbot.h"
+#include "dispatch.h"
 #include "vision.h"
 
 #include "clam.h"
@@ -75,7 +76,18 @@ static const kv_nl_t behavior_mute_until_nl = {
 // each bound bot gets its own slot). All behavior-shaping knobs --
 // including the persona binding itself -- are grouped under
 // "bot.<name>.behavior.*"; model / knowledge bindings remain flat.
+//
+// Two namespaces live here and the distinction is deliberate (PTREE-6):
+// "text" is the METHOD -- the driver kind, the .so, the command prefix
+// every text bot dispatches on. "chat" is the CONVERSATIONAL SUBSYSTEM
+// inside it -- personalities, contracts, the NL/LLM reply pipeline. A
+// knob belongs under plugin.text.* / bot.text.* only if a command-only
+// bot (behavior.chat.enabled = false) still needs it.
 static const plugin_kv_entry_t chatbot_kv_schema[] = {
+  { "plugin.text.prefix", KV_STR, "!",
+    "Command prefix applied to a text bot instance at create time."
+    " Per-method overrides live at bot.<name>.<method-kind>.prefix.",
+    NULL, NULL },
   { "plugin.chat.default_personality", KV_STR, "",
     "Default personality name for new chat bot instances", NULL, NULL },
   { "plugin.chat.default_contract", KV_STR, "default",
@@ -115,6 +127,13 @@ static const plugin_kv_entry_t chatbot_inst_schema[] = {
     " TTL wins.", NULL },
 
   // --- behavior: runtime conduct (bot.<name>.behavior.*) ---------------
+  { "behavior.chat.enabled", KV_BOOL, "false",
+    "Master switch for the conversational half. Command interpretation"
+    " is unconditional on a text bot; this knob decides whether"
+    " non-command lines also reach the NL/LLM reply pipeline (and with"
+    " it conversation logging, dossiers, vision and volunteering)."
+    " Defaults false so a freshly bound text bot is a command bot until"
+    " the operator opts into LLM spend.", NULL },
   { "behavior.personality", KV_STR, "",
     "Active personality name for this bot instance. Resolves against"
     " bot.chat.personalitypath/<name>.txt. Empty falls back to"
@@ -333,7 +352,7 @@ chatbot_personality_kv_cb(const char *key, void *data)
 
   bot = bot_find(botname);
   if(bot == NULL) return;
-  if(strcmp(bot_driver_name(bot), "chat") != 0) return;
+  if(strcmp(bot_driver_name(bot), "text") != 0) return;
 
   st = bot_get_handle(bot);
   if(st == NULL) return;
@@ -1018,10 +1037,11 @@ chatbot_classify_with_engagement(chatbot_state_t *st,
 // ---------- driver callbacks ----------
 
 static void *
-chatbot_create(bot_inst_t *inst)
+textbot_create(bot_inst_t *inst)
 {
   chatbot_state_t *st = mem_alloc("chatbot", "state", sizeof(*st));
   const char *name;
+  const char *prefix;
   char key[KV_KEY_SZ];
 
   if(st == NULL) return(NULL);
@@ -1038,6 +1058,13 @@ chatbot_create(bot_inst_t *inst)
 
   chatbot_vision_state_init(st);
 
+  // Command dispatch is unconditional on a text bot, so the prefix is
+  // seeded here rather than behind the conversational toggle.
+  prefix = kv_get_str("plugin.text.prefix");
+
+  if(prefix != NULL && prefix[0] != '\0')
+    cmd_set_prefix(inst, prefix);
+
   // Seed active personality from per-instance KV (may be empty).
   snprintf(key, sizeof(key), "bot.%s.behavior.personality",
       bot_inst_name(inst));
@@ -1053,7 +1080,7 @@ chatbot_create(bot_inst_t *inst)
 }
 
 static void
-chatbot_destroy(void *handle)
+textbot_destroy(void *handle)
 {
   chatbot_state_t *st = handle;
   if(st == NULL) return;
@@ -1072,7 +1099,7 @@ chatbot_destroy(void *handle)
 static void chatbot_register_interests(chatbot_state_t *st);
 
 // Idempotent registration gate. Called from chatbot_start (eager),
-// chatbot_on_message (lazy retry), and commands.c's /bot <name>
+// chatbot_observe (lazy retry), and commands.c's /bot <name>
 // refresh_prompts path (explicit operator-driven re-sync). Compares
 // the currently active personality name against the one reflected in
 // the cached topic list; if they match, returns without work.
@@ -1217,7 +1244,7 @@ chatbot_register_interests(chatbot_state_t *st)
 }
 
 static bool
-chatbot_start(void *handle)
+textbot_start(void *handle)
 {
   chatbot_state_t *st = handle;
   uint32_t interval;
@@ -1249,7 +1276,7 @@ chatbot_start(void *handle)
 }
 
 static void
-chatbot_stop(void *handle)
+textbot_stop(void *handle)
 {
   chatbot_state_t *st = handle;
   if(st == NULL) return;
@@ -2058,12 +2085,13 @@ chatbot_scan_reactive_topics(chatbot_state_t *st, const method_msg_t *msg)
   pthread_rwlock_unlock(&st->lock);
 }
 
-// Incoming message: classify + log to memory + run speak policy (either
-// immediately, or after the paste-coalescing window closes).
+// Conversational half: classify + log to memory + run speak policy
+// (either immediately, or after the paste-coalescing window closes).
+// Reached only for non-command lines on a bot whose behavior.chat.enabled
+// toggle is on — see textbot_on_message below.
 static void
-chatbot_on_message(void *handle, const method_msg_t *msg)
+chatbot_observe(chatbot_state_t *st, const method_msg_t *msg)
 {
-  chatbot_state_t *st = handle;
   uint32_t coalesce_ms;
   chatbot_classify_reason_t reason;
   mem_msg_kind_t kind;
@@ -2073,16 +2101,6 @@ chatbot_on_message(void *handle, const method_msg_t *msg)
   const char *botname;
   char key[128];
   char self[METHOD_SENDER_SZ] = {0};
-
-  if(st == NULL || msg == NULL) return;
-
-  // Identity events are side-band: no chat log, no speak policy, just
-  // dossier bookkeeping.
-  if(msg->kind == METHOD_MSG_NICK_CHANGE)
-  {
-    chatbot_handle_nick_change(st, msg);
-    return;
-  }
 
   // Resolve our nick on this method for address detection.
   if(msg->inst != NULL)
@@ -2178,30 +2196,74 @@ chatbot_on_message(void *handle, const method_msg_t *msg)
   chatbot_consider_speaking(st, msg, kind, reason);
 }
 
+// The text method's single deliver path. Command interpretation is
+// unconditional; conversation is the toggled extra. The order is the
+// whole design in five steps:
+//
+//   1. nick changes are side-band — dossier bookkeeping, nothing else
+//   2. identity/auth bookkeeping, for every line either half will see
+//   3. command-shaped lines belong to the command half, period
+//   4. behavior.chat.enabled off => the bot is a command bot, done
+//   5. everything else is conversation
+//
+// Step 3 short-circuits deliberately: a "!weather chicago" is not chat
+// and must not be logged as chat, scored for interjection, or answered
+// by the model. The reverse direction (NL wanting to run a command) does
+// NOT come back through here — it goes out through the core cmd registry
+// from reply.c, which is what keeps the two halves from circling.
+static void
+textbot_on_message(void *handle, const method_msg_t *msg)
+{
+  chatbot_state_t *st = handle;
+  char key[KV_KEY_SZ];
+
+  if(st == NULL || msg == NULL) return;
+
+  if(msg->kind == METHOD_MSG_NICK_CHANGE)
+  {
+    chatbot_handle_nick_change(st, msg);
+    return;
+  }
+
+  text_identity_observe(st->inst, msg);
+
+  if(text_dispatch_message(st->inst, msg))
+    return;
+
+  snprintf(key, sizeof(key), "bot.%s.behavior.chat.enabled",
+      bot_inst_name(st->inst));
+
+  if(kv_get_uint(key) == 0)
+    return;
+
+  chatbot_observe(st, msg);
+}
+
 // ---------- driver + plugin descriptor ----------
 
-const bot_driver_t chatbot_driver = {
-  .name       = "chat",
-  .create     = chatbot_create,
-  .destroy    = chatbot_destroy,
-  .start      = chatbot_start,
-  .stop       = chatbot_stop,
-  .on_message = chatbot_on_message,
+const bot_driver_t textbot_driver = {
+  .name       = "text",
+  .create     = textbot_create,
+  .destroy    = textbot_destroy,
+  .start      = textbot_start,
+  .stop       = textbot_stop,
+  .on_message = textbot_on_message,
 };
 
 static bool
-chatbot_plugin_start(void)
+textbot_plugin_start(void)
 {
   memory_ensure_schema();
   dossier_register_config();
-  // Method plugins push their identity hooks (signer, scorer,
-  // token_scorer) into the chat_identity registry via plugin_dlsym
-  // at their own plugin_start time. Nothing to do from here.
+  // Identity scoring is plugin-local and protocol-agnostic: protocol
+  // plugins emit the four-field identity tuple on method_msg_t and
+  // identity.c scores it uniformly. No registry, no cross-plugin
+  // dlsym, nothing to wire from here.
   return(SUCCESS);
 }
 
 static bool
-chatbot_plugin_init(void)
+textbot_plugin_init(void)
 {
   // Kind-wide KV: directory of personality files. Registered directly
   // (not via kv_schema / kv_inst_schema) because the key sits under
@@ -2270,7 +2332,7 @@ chatbot_plugin_init(void)
   // Order at init time: bring up in-memory state and register commands
   // (cmd subsystem is already up). DDL must wait until userns_init has
   // run -- the dossier table FKs into userns -- so dossier_register_config
-  // is called from chatbot_plugin_start, which runs after userns_init.
+  // is called from textbot_plugin_start, which runs after userns_init.
   dossier_init();
   dossier_show_register_commands();
   dossier_register_commands();
@@ -2341,12 +2403,27 @@ chatbot_plugin_init(void)
     return(FAIL);
   }
 
+  // The command half's own surface (identify, deauth, register, id).
+  // Last in, first out: it owns no subsystem state, so a failure here
+  // unwinds the conversational half exactly as the steps above do.
+  if(text_dispatch_register() != SUCCESS)
+  {
+    chatbot_cmds_unregister();
+    chatbot_volunteer_deinit();
+    chatbot_reply_deinit();
+    dossier_exit();
+    extract_exit();
+    memory_exit();
+    return(FAIL);
+  }
+
   return(SUCCESS);
 }
 
 static void
-chatbot_plugin_deinit(void)
+textbot_plugin_deinit(void)
 {
+  text_dispatch_unregister();
   chatbot_cmds_unregister();
   chatbot_volunteer_deinit();
   chatbot_reply_deinit();
@@ -2361,11 +2438,11 @@ chatbot_plugin_deinit(void)
 
 const plugin_desc_t bm_plugin_desc = {
   .api_version          = PLUGIN_API_VERSION,
-  .name                 = "chat",
-  .version              = "0.1",
+  .name                 = "text",
+  .version              = "1.0",
   .type                 = PLUGIN_METHOD,
-  .kind                 = "chat",
-  .provides             = { { .name = "method_chat" } },
+  .kind                 = "text",
+  .provides             = { { .name = "method_text" } },
   .provides_count       = 1,
   .requires             = {
     { .name = "inference"   },
@@ -2380,9 +2457,9 @@ const plugin_desc_t bm_plugin_desc = {
   .kv_schema_count      = sizeof(chatbot_kv_schema) / sizeof(chatbot_kv_schema[0]),
   .kv_inst_schema       = chatbot_inst_schema,
   .kv_inst_schema_count = sizeof(chatbot_inst_schema) / sizeof(chatbot_inst_schema[0]),
-  .init                 = chatbot_plugin_init,
-  .start                = chatbot_plugin_start,
+  .init                 = textbot_plugin_init,
+  .start                = textbot_plugin_start,
   .stop                 = NULL,
-  .deinit               = chatbot_plugin_deinit,
-  .ext                  = &chatbot_driver,
+  .deinit               = textbot_plugin_deinit,
+  .ext                  = &textbot_driver,
 };

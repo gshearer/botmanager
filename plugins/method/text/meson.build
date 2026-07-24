@@ -1,5 +1,5 @@
-chat_plugin = shared_library('chat',
-  ['chatbot.c', 'personality.c', 'personality_show.c',
+text_plugin = shared_library('text',
+  ['chatbot.c', 'dispatch.c', 'personality.c', 'personality_show.c',
    'contract_show.c', 'commands.c',
    'dossier.c', 'dossier_cmd.c', 'dossier_show.c',
    'identity.c',
@@ -7,8 +7,8 @@ chat_plugin = shared_library('chat',
    'show_verbs.c', 'interests.c', 'memory.c', 'memory_rag.c',
    'memory_cmd.c', 'user_show.c',
    'volunteer.c', 'vision.c', 'extract.c', 'extract_prompt.c'],
-  # '.' first so chat-plugin-local headers (memory.h, dossier.h) win
-  # over any older include/ copy during transitional builds. The
+  # '.' first so plugin-local headers (memory.h, dossier.h, dispatch.h)
+  # win over any older include/ copy during transitional builds. The
   # inference include dir exposes the engine's inference.h — the
   # dlsym-shim public surface for llm/knowledge/acquire (defined by
   # plugins/extension/inference/engine/meson.build).

@@ -618,7 +618,7 @@ const plugin_desc_t bm_plugin_desc = {
   .provides        = { { .name = "cmd_imagine" } },
   .provides_count  = 1,
   .requires        = {
-    { .name = "method_command" },
+    { .name = "method_text" },
   },
   .requires_count  = 1,
   .kv_schema       = iz_kv_schema,

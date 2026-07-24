@@ -78,7 +78,7 @@ const plugin_desc_t bm_plugin_desc = {
   .kind                 = "userquote",
   .provides             = { { .name = "feature_userquote" } },
   .provides_count       = 1,
-  .requires             = { { .name = "method_command" } },
+  .requires             = { { .name = "method_text" } },
   .requires_count       = 1,
   .kv_schema            = uq_kv_schema,
   .kv_schema_count      = sizeof(uq_kv_schema) / sizeof(uq_kv_schema[0]),

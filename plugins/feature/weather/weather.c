@@ -814,7 +814,7 @@ const plugin_desc_t bm_plugin_desc = {
   .provides        = { { .name = "cmd_weather" } },
   .provides_count  = 1,
   .requires        = {
-    { .name = "method_command" },
+    { .name = "method_text" },
     { .name = "service_openweather" },
   },
   .requires_count  = 2,

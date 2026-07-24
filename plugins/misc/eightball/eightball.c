@@ -84,7 +84,7 @@ const plugin_desc_t bm_plugin_desc = {
   .kind            = "eightball",
   .provides        = { { .name = "misc_eightball" } },
   .provides_count  = 1,
-  .requires        = { { .name = "method_command" } },
+  .requires        = { { .name = "method_text" } },
   .requires_count  = 1,
   .kv_schema       = NULL,
   .kv_schema_count = 0,

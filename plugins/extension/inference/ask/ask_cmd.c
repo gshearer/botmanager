@@ -835,7 +835,7 @@ const plugin_desc_t bm_plugin_desc = {
   .provides        = { { .name = "cmd_ask" } },
   .provides_count  = 1,
   .requires        = {
-    { .name = "method_command" },
+    { .name = "method_text" },
     { .name = "inference" },
   },
   .requires_count  = 2,

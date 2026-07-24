@@ -1,10 +1,15 @@
-// chatbot.h — Chat bot plugin (kind: chat)
+// chatbot.h — conversational half of the text method plugin (kind: text)
 //
-// LLM-driven personality bot. Chunk E wires the plugin skeleton:
-// bot driver vtable, personality table loader, /llm personality
-// subcommands, and an on_message() that classifies incoming lines as
-// WITNESS or EXCHANGE_IN and forwards them to memory_log_message().
-// Speaking, RAG, and NL-command bridging land in Chunk F.
+// The LLM-driven personality half: bot driver vtable, personality table
+// loader, /llm personality subcommands, and the observe path that
+// classifies incoming lines as WITNESS or EXCHANGE_IN, forwards them to
+// memory_log_message(), and runs the speak policy / reply pipeline.
+//
+// It is one half of a two-half plugin. The other — always-on command
+// dispatch plus the identity/auth surface — is dispatch.h. The driver
+// vtable declared here (textbot_driver) fronts both; see the deliver
+// path comment above textbot_on_message in chatbot.c for the ordering
+// and for why the command half short-circuits this one.
 
 #ifndef BM_CHATBOT_H
 #define BM_CHATBOT_H
@@ -351,7 +356,7 @@ typedef struct
   char              active_name[CHATBOT_PERSONALITY_NAME_SZ];
 
   // Cached reactive-topic list. Populated in chatbot_register_interests;
-  // read by chatbot_on_message on every inbound line under the rdlock.
+  // read by chatbot_observe on every inbound line under the rdlock.
   // Empty when the active personality declares no interests.
   acquire_topic_t   topics[CHATBOT_TOPIC_CACHE_MAX];
   size_t            n_topics;
@@ -478,7 +483,7 @@ mem_msg_kind_t chatbot_classify_message(const method_msg_t *msg,
     const char *bot_nick);
 
 // Global driver vtable (defined in chatbot.c).
-extern const bot_driver_t chatbot_driver;
+extern const bot_driver_t textbot_driver;
 
 // Resolve the dossier for an inbound message. Runs the method driver's
 // dossier_signature callback, consults userns MFA patterns, and calls
@@ -503,7 +508,7 @@ bool chatbot_handle_nick_change(chatbot_state_t *st, const method_msg_t *msg);
 // reactive acquisition job via acquire_enqueue_reactive.
 //
 // Runs under st->lock rdlock; must not block. Called from
-// chatbot_on_message after conversation logging and before the speak
+// chatbot_observe after conversation logging and before the speak
 // policy decision.
 void chatbot_scan_reactive_topics(chatbot_state_t *st,
     const method_msg_t *msg);
@@ -593,7 +598,7 @@ void chatbot_nl_observe_location_slot(bot_inst_t *bot,
 
 // ---- reply.c ----
 
-// Entry point for the reply pipeline. Called from chatbot_on_message
+// Entry point for the reply pipeline. Called from chatbot_observe
 // when speak_policy returns REPLY or INTERJECT. Ownership of st/msg is
 // *not* transferred; the function copies what it needs.
 // is_direct_address is true only when the current line literally

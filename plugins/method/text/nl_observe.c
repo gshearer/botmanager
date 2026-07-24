@@ -1,8 +1,8 @@
 // botmanager — MIT
 // NL-bridge post-dispatch slot observers.
 //
-// PL5: generic observer for typed NL slots. Runs inside the chat plugin
-// so chat-specific side effects (dossier facts) stay out of service +
+// PL5: generic observer for typed NL slots. Runs inside the text plugin
+// so conversational side effects (dossier facts) stay out of service +
 // command-surface plugins. Today only CMD_NL_ARG_LOCATION is observed
 // — if it resolves to a real place via openweather's sync geocoder, we
 // attach a `city_of_interest:<canon>` fact to the sender's dossier.

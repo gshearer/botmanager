@@ -1,11 +1,10 @@
 subdir('db/postgresql')
 subdir('protocol/irc')
-subdir('method/command')
 
 # extension/inference — the engine .so plus its command siblings. The
 # engine defines inference_include (its own dir, where inference.h
 # lives), so it must precede every consumer: the siblings below and
-# method/chat.
+# method/text.
 subdir('extension/inference/engine')
 subdir('extension/inference/ask')
 # imagine_cmd is dormant: it registers the same 'imagine' command as
@@ -18,7 +17,7 @@ subdir('extension/inference/imagine_zimage')
 subdir('extension/inference/claude')
 subdir('extension/inference/search')
 
-subdir('method/chat')
+subdir('method/text')
 subdir('feature/exchange')
 subdir('service/coinbase')
 subdir('service/kraken')

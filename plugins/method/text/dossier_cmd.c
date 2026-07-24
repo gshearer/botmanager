@@ -45,9 +45,9 @@ llm_verb_dossiersweep(const cmd_ctx_t *ctx)
   cmd_reply(ctx, buf);
 }
 
-// Kind filter: restrict this verb to chat-kind bots. Storage static --
+// Kind filter: restrict this verb to text-kind bots. Storage static --
 // cmd_register keeps the pointer.
-static const char *const chat_kind_filter[] = { "chat", NULL };
+static const char *const text_kind_filter[] = { "text", NULL };
 
 bool
 chatbot_dossiersweep_cmd_register(void)
@@ -58,7 +58,7 @@ chatbot_dossiersweep_cmd_register(void)
         NULL,
         USERNS_GROUP_ADMIN, 100, CMD_SCOPE_ANY, METHOD_T_ANY,
         llm_verb_dossiersweep, NULL, "bot", "dsweep",
-        NULL, 0, chat_kind_filter, NULL) != SUCCESS)
+        NULL, 0, text_kind_filter, NULL) != SUCCESS)
     return(FAIL);
 
   return(SUCCESS);

@@ -1272,7 +1272,7 @@ const plugin_desc_t bm_plugin_desc = {
   .kind            = TMDB_CTX,
   .provides        = { { .name = "service_tmdb" } },
   .provides_count  = 1,
-  .requires        = { { .name = "method_command" } },
+  .requires        = { { .name = "method_text" } },
   .requires_count  = 1,
   .kv_schema       = tmdb_kv_schema,
   .kv_schema_count = sizeof(tmdb_kv_schema) / sizeof(tmdb_kv_schema[0]),

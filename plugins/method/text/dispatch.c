@@ -1,8 +1,13 @@
 // botmanager — MIT
-// Command bot plugin (kind: command).
+// Command-dispatch half of the text method: identity, auth, dispatch.
 
-#define COMMAND_INTERNAL
-#include "command.h"
+#define TEXT_DISPATCH_INTERNAL
+#include "dispatch.h"
+
+#include <stdio.h>
+#include <string.h>
+#include <strings.h>
+#include <time.h>
 
 // ------------------------------------------------------------------ //
 // Command callbacks                                                   //
@@ -550,182 +555,180 @@ cmd_id(const cmd_ctx_t *ctx)
 }
 
 // ------------------------------------------------------------------ //
-// /show bot <name> command — kind summary                            //
+// /show bot <name> — command-half rows                                //
 // ------------------------------------------------------------------ //
 
-#include "colors.h"
-#include <time.h>
-
-static void
-verb_command_summary(const cmd_ctx_t *ctx)
+// Column alignment matches the conversational rows emitted around this
+// block by show_verbs.c's unified :default verb; keep the two in step.
+void
+text_dispatch_summary(const cmd_ctx_t *ctx, bot_inst_t *bot)
 {
-  bot_inst_t *bot = ctx->bot;
-
   char line[256];
-  uint64_t cmds = bot_cmd_count(bot);
-  time_t last = bot_last_activity(bot);
-  userns_t *ns = bot_get_userns(bot);
+  uint64_t cmds;
+  time_t last;
+  userns_t *ns;
 
-  cmd_reply(ctx, CLR_BOLD "command bot" CLR_RESET);
+  if(ctx == NULL || bot == NULL)
+    return;
 
-  snprintf(line, sizeof(line), "  commands:   %lu", (unsigned long)cmds);
+  cmds = bot_cmd_count(bot);
+  last = bot_last_activity(bot);
+  ns = bot_get_userns(bot);
+
+  snprintf(line, sizeof(line), "  commands:    %lu", (unsigned long)cmds);
   cmd_reply(ctx, line);
 
   if(last == 0)
-    cmd_reply(ctx, "  last_seen:  " CLR_GRAY "(never)" CLR_RESET);
+    cmd_reply(ctx, "  last_seen:   " CLR_GRAY "(never)" CLR_RESET);
 
   else
   {
     long elapsed = (long)(time(NULL) - last);
-    snprintf(line, sizeof(line),
-        "  last_seen:  %lds ago", elapsed);
+
+    snprintf(line, sizeof(line), "  last_seen:   %lds ago", elapsed);
     cmd_reply(ctx, line);
   }
 
-  snprintf(line, sizeof(line),
-      "  methods:    %u", bot_method_count(bot));
-  cmd_reply(ctx, line);
-
-  snprintf(line, sizeof(line),
-      "  namespace:  %s",
+  snprintf(line, sizeof(line), "  namespace:   %s",
       (ns && ns->name[0]) ? ns->name : "-");
   cmd_reply(ctx, line);
 }
 
 // ------------------------------------------------------------------ //
-// Bot driver callbacks                                                //
+// Per-line identity bookkeeping                                       //
 // ------------------------------------------------------------------ //
 
-static void *
-cmdbot_create(bot_inst_t *inst)
+void
+text_identity_observe(bot_inst_t *inst, const method_msg_t *msg)
 {
-  const char *prefix;
-  cmdbot_state_t *st = mem_alloc("command", "state", sizeof(*st));
+  userns_t *ns;
+  const char *mfa_user;
+  const char *existing;
 
-  if(st == NULL)
-    return(NULL);
+  if(inst == NULL || msg == NULL || msg->metadata[0] == '\0')
+    return;
 
-  memset(st, 0, sizeof(*st));
-  st->inst = inst;
-
-  // Apply default prefix from plugin KV config.
-  prefix = kv_get_str("plugin.command.prefix");
-
-  if(prefix != NULL && prefix[0] != '\0')
-    cmd_set_prefix(inst, prefix);
-
-  return(st);
-}
-
-static void
-cmdbot_destroy(void *handle)
-{
-  if(handle != NULL)
-    mem_free(handle);
-}
-
-static bool
-cmdbot_start(void *handle)
-{
-  (void)handle;
-  return(SUCCESS);
-}
-
-static void
-cmdbot_stop(void *handle)
-{
-  (void)handle;
-}
-
-static void
-cmdbot_on_message(void *handle, const method_msg_t *msg)
-{
-  cmdbot_state_t *st = handle;
-
-  // Attempt user discovery from the method metadata (e.g., nick!user@host).
-  if(msg->metadata[0] != '\0')
-    bot_discover_user(st->inst, msg->metadata);
+  // Attempt user discovery from the method metadata (e.g. nick!user@host).
+  bot_discover_user(inst, msg->metadata);
 
   // MFA matching: refresh existing sessions and autoidentify new ones.
-  if(msg->metadata[0] != '\0')
-  {
-    userns_t *ns = bot_get_userns(st->inst);
+  ns = bot_get_userns(inst);
 
-    if(ns != NULL)
-    {
-      const char *mfa_user = userns_mfa_match(ns, msg->metadata);
+  if(ns == NULL)
+    return;
 
-      if(mfa_user != NULL)
-      {
-        const char *existing;
-        // Update persistent last-seen tracking in the user namespace.
-        userns_user_touch_lastseen(ns, mfa_user,
-            method_inst_kind(msg->inst), msg->metadata);
+  mfa_user = userns_mfa_match(ns, msg->metadata);
 
-        // Refresh identity timestamp if an existing session matches.
-        bot_session_refresh_mfa(st->inst, msg->inst, mfa_user);
+  if(mfa_user == NULL)
+    return;
 
-        // Autoidentify: if no active session exists for this sender
-        // and the matched user has autoidentify enabled, create one.
-        existing = bot_session_find(st->inst,
-            msg->inst, msg->sender);
+  // Update persistent last-seen tracking in the user namespace.
+  userns_user_touch_lastseen(ns, mfa_user,
+      method_inst_kind(msg->inst), msg->metadata);
 
-        if(existing == NULL &&
-           userns_user_get_autoidentify(ns, mfa_user))
-        {
-          if(bot_session_create(st->inst, msg->inst,
-              msg->sender, mfa_user) == SUCCESS)
-            clam(CLAM_INFO, "autoidentify",
-                "'%s' auto-identified from '%s'",
-                mfa_user, msg->metadata);
+  // Refresh identity timestamp if an existing session matches.
+  bot_session_refresh_mfa(inst, msg->inst, mfa_user);
 
-          else
-            clam(CLAM_WARN, "autoidentify",
-                "failed to create session for '%s' from '%s'",
-                mfa_user, msg->metadata);
-        }
-      }
-    }
-  }
+  // Autoidentify: if no active session exists for this sender and the
+  // matched user has autoidentify enabled, create one.
+  existing = bot_session_find(inst, msg->inst, msg->sender);
 
-  // Dispatch to the command system. Non-commands are silently ignored.
-  cmd_dispatch(st->inst, msg);
+  if(existing != NULL || !userns_user_get_autoidentify(ns, mfa_user))
+    return;
+
+  if(bot_session_create(inst, msg->inst, msg->sender, mfa_user) == SUCCESS)
+    clam(CLAM_INFO, "autoidentify",
+        "'%s' auto-identified from '%s'", mfa_user, msg->metadata);
+
+  else
+    clam(CLAM_WARN, "autoidentify",
+        "failed to create session for '%s' from '%s'",
+        mfa_user, msg->metadata);
 }
 
 // ------------------------------------------------------------------ //
-// Driver and descriptor                                               //
+// Command dispatch                                                    //
 // ------------------------------------------------------------------ //
 
-static const bot_driver_t cmdbot_driver = {
-  .name       = "command",
-  .create     = cmdbot_create,
-  .destroy    = cmdbot_destroy,
-  .start      = cmdbot_start,
-  .stop       = cmdbot_stop,
-  .on_message = cmdbot_on_message,
-};
-
-// ------------------------------------------------------------------ //
-// Plugin lifecycle                                                    //
-// ------------------------------------------------------------------ //
-
-// kind_filter for /show bot <name> :default handler; pinned here rather
-// than at function scope to keep cmdbot_init warning-clean under C90
-// decl-after-statement rules.
-static const char *const command_kind_filter[] = { "command", NULL };
-
-static bool
-cmdbot_init(void)
+// Mirror of cmd_dispatch's own prefix resolution: a per-method override
+// at bot.<bot>.<method-kind>.prefix wins over the bot-level prefix. Keep
+// this in step with core/cmd.c — the two must agree on what counts as
+// command-shaped, or the conversational half starts seeing command
+// traffic (or worse, swallows ordinary talk).
+static const char *
+text_prefix_for(bot_inst_t *inst, const method_msg_t *msg)
 {
-  if(cmd_register("command", "identify",
+  const char *kind;
+  const char *bname;
+  const char *pfx;
+  char key[KV_KEY_SZ];
+
+  if(msg->inst == NULL)
+    return(cmd_get_prefix(inst));
+
+  kind  = method_inst_kind(msg->inst);
+  bname = bot_inst_name(inst);
+
+  if(kind == NULL || bname == NULL)
+    return(cmd_get_prefix(inst));
+
+  snprintf(key, sizeof(key), "bot.%s.%s.prefix", bname, kind);
+  pfx = kv_get_str(key);
+
+  return((pfx != NULL && pfx[0] != '\0') ? pfx : cmd_get_prefix(inst));
+}
+
+bool
+text_dispatch_message(bot_inst_t *inst, const method_msg_t *msg)
+{
+  const char *prefix;
+  const char *rest;
+  size_t pfx_len;
+
+  if(inst == NULL || msg == NULL || msg->text[0] == '\0')
+    return(false);
+
+  prefix = text_prefix_for(inst, msg);
+
+  if(prefix == NULL || prefix[0] == '\0')
+    return(false);
+
+  pfx_len = strlen(prefix);
+
+  if(strncmp(msg->text, prefix, pfx_len) != 0)
+    return(false);
+
+  // A bare prefix, or one followed by whitespace, is not a command:
+  // cmd_dispatch rejects it and so must we, or "! that was funny" would
+  // never reach the conversational half.
+  rest = msg->text + pfx_len;
+
+  if(*rest == '\0' || *rest == ' ' || *rest == '\t')
+    return(false);
+
+  // The return value is deliberately discarded. An unknown verb or a
+  // denied command is still command traffic, and handing either to the
+  // LLM would be a surprise; the prefix alone decides ownership.
+  (void)cmd_dispatch(inst, msg);
+  return(true);
+}
+
+// ------------------------------------------------------------------ //
+// Command registration                                                //
+// ------------------------------------------------------------------ //
+
+bool
+text_dispatch_register(void)
+{
+  if(cmd_register("text", "identify",
         "identify <username> <password>",
         "Authenticate with the bot",
         NULL,
         USERNS_GROUP_EVERYONE, 0, CMD_SCOPE_PRIVATE, METHOD_T_ANY, cmd_identify, NULL,
-        NULL, NULL, cmdbot_ad_identify, 2, NULL, NULL) != SUCCESS)
+        NULL, NULL, text_ad_identify, 2, NULL, NULL) != SUCCESS)
     return(FAIL);
 
-  if(cmd_register("command", "deauth",
+  if(cmd_register("text", "deauth",
         "deauth",
         "End your authenticated session",
         NULL,
@@ -736,44 +739,25 @@ cmdbot_init(void)
     return(FAIL);
   }
 
-  if(cmd_register("command", "register",
+  if(cmd_register("text", "register",
         "register <password>",
         "Set password for a discovered account",
         NULL,
         USERNS_GROUP_EVERYONE, 0, CMD_SCOPE_PRIVATE, METHOD_T_ANY, cmd_register_user,
-        NULL, NULL, "reg", cmdbot_ad_register, 1, NULL, NULL) != SUCCESS)
+        NULL, NULL, "reg", text_ad_register, 1, NULL, NULL) != SUCCESS)
   {
     cmd_unregister("deauth");
     cmd_unregister("identify");
     return(FAIL);
   }
 
-  if(cmd_register("command", "id",
+  if(cmd_register("text", "id",
         "id [nickname]",
         "Show identity info for yourself, a nick, or the channel",
         NULL,
         USERNS_GROUP_EVERYONE, 0, CMD_SCOPE_ANY, METHOD_T_ANY, cmd_id,
-        NULL, NULL, NULL, cmdbot_ad_id, 1, NULL, NULL) != SUCCESS)
+        NULL, NULL, NULL, text_ad_id, 1, NULL, NULL) != SUCCESS)
   {
-    cmd_unregister("register");
-    cmd_unregister("deauth");
-    cmd_unregister("identify");
-    return(FAIL);
-  }
-
-  // Empty-verb summary handler for /show bot <name> when <name> is a
-  // command-kind bot. Registered as the ":default" sentinel child of
-  // show/bot; the dispatcher invokes it when no verb token is given
-  // and a matching kind-filtered sibling exists.
-  if(cmd_register("command", ":default",
-        "show bot <name>",
-        "Command bot summary (prefix, sessions, bindings)",
-        NULL,
-        USERNS_GROUP_ADMIN, 100, CMD_SCOPE_ANY, METHOD_T_ANY,
-        verb_command_summary, NULL, "show/bot", NULL,
-        NULL, 0, command_kind_filter, NULL) != SUCCESS)
-  {
-    cmd_unregister("id");
     cmd_unregister("register");
     cmd_unregister("deauth");
     cmd_unregister("identify");
@@ -783,34 +767,11 @@ cmdbot_init(void)
   return(SUCCESS);
 }
 
-static void
-cmdbot_deinit(void)
+void
+text_dispatch_unregister(void)
 {
-  cmd_unregister(":default");
   cmd_unregister("id");
   cmd_unregister("register");
   cmd_unregister("identify");
   cmd_unregister("deauth");
 }
-
-// ------------------------------------------------------------------ //
-// Plugin descriptor                                                   //
-// ------------------------------------------------------------------ //
-
-const plugin_desc_t bm_plugin_desc = {
-  .api_version     = PLUGIN_API_VERSION,
-  .name            = "command",
-  .version         = "1.0",
-  .type            = PLUGIN_METHOD,
-  .kind            = "command",
-  .provides        = { { .name = "method_command" } },
-  .provides_count  = 1,
-  .requires_count  = 0,
-  .kv_schema       = cmdbot_kv_schema,
-  .kv_schema_count = sizeof(cmdbot_kv_schema) / sizeof(cmdbot_kv_schema[0]),
-  .init            = cmdbot_init,
-  .start           = NULL,
-  .stop            = NULL,
-  .deinit          = cmdbot_deinit,
-  .ext             = &cmdbot_driver,
-};

@@ -125,14 +125,17 @@ A bot's *kind* names the method plugin it binds. Adding a method
 plugin (a future `xmpp` or `telegram`) automatically becomes a
 usable bot kind — there is no separate kind taxonomy.
 
-**`command`** — Structured slash-command bot. Hierarchical
-subcommands, declarative argument specs (`cmd_arg_desc_t[]`)
-that pre-tokenize and validate before the handler is invoked,
-per-method prefixes (`!` on IRC, `/` on botmanctl), abbreviations
-unique within scope. The default kind for operator-driven bots.
+**`text`** — Written conversation, in both senses. Every text bot
+interprets structured slash commands: hierarchical subcommands,
+declarative argument specs (`cmd_arg_desc_t[]`) that pre-tokenize and
+validate before the handler is invoked, per-method prefixes (`!` on
+IRC, `/` on botmanctl), abbreviations unique within scope. That half
+is unconditional, and a bot that stops there is an operator-driven
+command bot.
 
-**`chat`** — LLM-powered conversational bot with configurable
-persona. Classifies incoming lines as WITNESS or EXCHANGE_IN, logs
+Flip `bot.<name>.behavior.chat.enabled` and the same bot also
+converses: an LLM-powered persona that classifies incoming lines as
+WITNESS or EXCHANGE_IN, logs
 them through a memory subsystem (`conversation_log` +
 `user_facts`/`dossier_facts` + embedding tables), and decides
 whether to speak via a pure speak-policy function. When it replies,
@@ -332,7 +335,7 @@ is explicitly out of scope.
 - [`DESIGN.md`](DESIGN.md) — full design specification
 - [`PLUGIN.md`](PLUGIN.md) — plugin layer rules and the grep audits
   that enforce them
-- [`plugins/method/chat/CHATBOT.md`](plugins/method/chat/CHATBOT.md) — chat method internals
+- [`plugins/method/text/CHATBOT.md`](plugins/method/text/CHATBOT.md) — chat method internals
 - [`KNOWLEDGE.md`](plugins/extension/inference/KNOWLEDGE.md), [`ACQUIRE.md`](plugins/extension/inference/ACQUIRE.md),
   [`LLM.md`](plugins/extension/inference/LLM.md) — inference plugin subsystems
 

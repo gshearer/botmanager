@@ -196,19 +196,19 @@ halves. Same shape as `gemini` / `gemini.ws`.
 
 | Context | Source | Description |
 |---|---|---|
-| `autoidentify` | plugins/method/command/command.c | passive identify on session |
-| `chatbot` | plugins/method/chat/volunteer.c | chatbot volunteer-to-speak path |
-| `deauth` | plugins/method/command/command.c | session deauth |
-| `dossier` | plugins/method/chat/dossier.c | dossier subsystem |
-| `extract` | plugins/method/chat/extract.c | LLM-driven fact extraction |
-| `identify` | plugins/method/command/command.c | `/identify` session auth |
-| `interject` | plugins/method/chat/volunteer.c | chatbot interjection scoring |
+| `autoidentify` | plugins/method/text/dispatch.c | passive identify on session |
+| `chatbot` | plugins/method/text/chatbot.c · plugins/method/text/volunteer.c | conversational observe/classify trace + volunteer-to-speak path |
+| `deauth` | plugins/method/text/dispatch.c | session deauth |
+| `dossier` | plugins/method/text/dossier.c | dossier subsystem |
+| `extract` | plugins/method/text/extract.c | LLM-driven fact extraction |
+| `identify` | plugins/method/text/dispatch.c | `/identify` session auth |
+| `interject` | plugins/method/text/volunteer.c | chatbot interjection scoring |
 | `irc` | plugins/protocol/irc/irc_protocol.c | IRC protocol driver |
-| `memory` | plugins/method/chat/memory_rag.c | chat memory subsystem + RAG |
-| `nl_bridge` | plugins/method/chat/reply.c | natural-language bridge surface |
-| `nl_observe` | plugins/method/chat/nl_observe.c | post-dispatch chat observer (`OBS_CTX`) |
-| `register` | plugins/method/command/command.c | `/register` user creation |
-| `vision` | plugins/method/chat/vision.c | image-intent path |
+| `memory` | plugins/method/text/memory_rag.c | chat memory subsystem + RAG |
+| `nl_bridge` | plugins/method/text/reply.c | natural-language bridge surface |
+| `nl_observe` | plugins/method/text/nl_observe.c | post-dispatch chat observer (`OBS_CTX`) |
+| `register` | plugins/method/text/dispatch.c | `/register` user creation |
+| `vision` | plugins/method/text/vision.c | image-intent path |
 
 ## Extension plugins (`plugins/extension/`)
 

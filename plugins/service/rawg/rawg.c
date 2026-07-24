@@ -984,7 +984,7 @@ const plugin_desc_t bm_plugin_desc = {
   .kind            = RAWG_CTX,
   .provides        = { { .name = "service_rawg" } },
   .provides_count  = 1,
-  .requires        = { { .name = "method_command" } },
+  .requires        = { { .name = "method_text" } },
   .requires_count  = 1,
   .kv_schema       = rawg_kv_schema,
   .kv_schema_count = sizeof(rawg_kv_schema) / sizeof(rawg_kv_schema[0]),
