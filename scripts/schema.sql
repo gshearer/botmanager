@@ -96,8 +96,9 @@ CREATE TABLE IF NOT EXISTS bot_methods (
 );
 
 -- LLM models: admin-registered OpenAI-compatible chat and embedding
--- endpoints. Consumed by core/llm.c; api_key_kv names a KV key that
--- stores the bearer token (never stored directly in this table).
+-- endpoints. Consumed by plugins/extension/inference/engine/llm.c;
+-- api_key_kv names a KV key that stores the bearer token (never
+-- stored directly in this table).
 
 CREATE TABLE IF NOT EXISTS llm_models (
   name          VARCHAR(64)  PRIMARY KEY,
@@ -160,7 +161,8 @@ CREATE TABLE IF NOT EXISTS personalities (
 -- Knowledge store: corpus-scoped RAG chunks for per-persona external
 -- knowledge (Arch wiki, SEP, etc.). Parallel to user_facts /
 -- conversation_log; same float32 LE BYTEA + cosine retrieval machinery.
--- See KNOWLEDGE.md and include/knowledge.h.
+-- See KNOWLEDGE.md and engine/inference.h, both under
+-- plugins/extension/inference/.
 
 CREATE TABLE IF NOT EXISTS knowledge_corpora (
   name           VARCHAR(64)  PRIMARY KEY,
@@ -210,7 +212,8 @@ CREATE INDEX IF NOT EXISTS idx_knowledge_images_subject
 -- Acquisition engine: autonomous + reactive knowledge learning. The
 -- engine ticks per-bot, runs proactive SXNG queries for topics declared
 -- in each bot's config, digests + ingests results into a knowledge
--- corpus. See ACQUIRE.md and include/acquire.h.
+-- corpus. See ACQUIRE.md and engine/inference.h, both under
+-- plugins/extension/inference/.
 
 CREATE TABLE IF NOT EXISTS acquire_topic_stats (
   bot_name       VARCHAR(64)  NOT NULL,

@@ -65,7 +65,7 @@ typedef struct
 // A single dossier-keyed fact row. Mirrors mem_fact_t but is scoped to
 // the dossier subsystem (the llm bot's source of truth for memory).
 // dossier_id links to dossier.id rather than userns_user.id. See
-// include/dossier.h for the dossier identity model.
+// dossier.h for the dossier identity model.
 typedef struct
 {
   int64_t          id;                             // 0 on upsert = new

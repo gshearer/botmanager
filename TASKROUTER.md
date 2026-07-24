@@ -13,6 +13,7 @@ alongside its code.
 | **Get oriented in a fresh context (project briefing)** | `PRIMER.md` |
 | **Use a CLI tool (`botmanctl`, `ircspy`, `ircspyctl`)** | `tools/AGENTS.md` |
 | **Fresh-start the daemon** | `scripts/AGENTS.md` |
+| Work on the factory automation (steward, digest, research/family lanes, weekend charter) | `scripts/factory/<lane>.prompt.md` (the operative instructions) + its `scripts/factory/*.service`/`*.timer` pair — **units must be re-installed to `~/.config/systemd/user/` after any edit** |
 | Add a user command (command-surface plugin) | `CMD.md` + `PLUGIN.md` §Layer Rules (placement decision-tree) |
 | Add or work on a misc toy / novelty command (`!math`, `!8ball`) | `plugins/misc/AGENTS.md` |
 | Add or modify a plugin layering rule | `PLUGIN.md` §Layer Rules + `AGENTS.md` §Plugin Layers |
@@ -26,7 +27,7 @@ alongside its code.
 | Act as CFO / touch a treasury or the live disc fund | `plugins/extension/whenmoon/CFO.md` (read FIRST — it is the office) |
 | Write, iterate, or backtest a trading strategy (cp1, mako, riptide, ...) | `plugins/extension/whenmoon/strategy/AGENTS.md` |
 | Run or interpret a backtest / sweep (the iteration loop) | `plugins/extension/whenmoon/strategy/AGENTS.md` §iteration loop |
-| Add/modify an exchange driver (coinbase, kraken, ...) | `PLUGIN.md` + `plugins/service/AGENTS.md` + `plugins/feature/exchange/AGENTS.md` |
+| Add/modify an exchange driver (coinbase, gemini, kraken, ...) | `PLUGIN.md` + `plugins/service/AGENTS.md` + `plugins/feature/exchange/AGENTS.md` + that driver's own `plugins/service/<name>/README.md` (auth + protocol specifics) |
 | Add/modify a DB driver | `PLUGIN.md` + `plugins/db/AGENTS.md` + `include/db.h` |
 | Work on a core subsystem | `core/AGENTS.md` + relevant `include/*.h` |
 | Add a log/event context (`clam()`) or subscribe to one | `CLAM.md` |
