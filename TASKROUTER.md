@@ -13,7 +13,7 @@ alongside its code.
 | **Get oriented in a fresh context (project briefing)** | `PRIMER.md` |
 | **Use a CLI tool (`botmanctl`, `ircspy`, `ircspyctl`)** | `tools/AGENTS.md` |
 | **Fresh-start the daemon** | `scripts/AGENTS.md` |
-| Add a user command (command-surface plugin) | `CMD.md` + `plugins/cmd/AGENTS.md` |
+| Add a user command (command-surface plugin) | `CMD.md` + `PLUGIN.md` §Layer Rules (placement decision-tree) |
 | Add or work on a misc toy / novelty command (`!math`, `!8ball`) | `plugins/misc/AGENTS.md` |
 | Add or modify a plugin layering rule | `PLUGIN.md` §Layer Rules + `AGENTS.md` §Plugin Layers |
 | **File a new plugin (which folder?)** | `PLUGIN.md` §Layer Rules (placement decision-tree) |
@@ -21,7 +21,7 @@ alongside its code.
 | Add/modify a protocol driver (IRC, ...) | `PLUGIN.md` + `plugins/protocol/AGENTS.md` + `include/method.h` |
 | Add/modify a method driver (text, voice, ...) | `PLUGIN.md` + `plugins/method/AGENTS.md` + `include/bot.h` |
 | Add/modify a feature plugin (whenmoon, weather, crypto, stock, ...) | `PLUGIN.md` + `plugins/feature/AGENTS.md` + `include/bot.h` |
-| Add/modify an extension subsystem (inference, whenmoon) | `PLUGIN.md` + `plugins/extension/AGENTS.md` |
+| Add/modify an extension subsystem (inference) | `PLUGIN.md` + `plugins/extension/AGENTS.md` |
 | Write, iterate, or backtest a trading strategy (cp1, mako, riptide, ...) | `plugins/feature/whenmoon/strategy/AGENTS.md` |
 | Run or interpret a backtest / sweep (the iteration loop) | `plugins/feature/whenmoon/strategy/AGENTS.md` §iteration loop |
 | Add/modify an exchange driver (coinbase, kraken, ...) | `PLUGIN.md` + `plugins/service/AGENTS.md` + `plugins/feature/exchange/AGENTS.md` |

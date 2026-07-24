@@ -21,11 +21,11 @@ heartbeats.
         ┌─────────────────────────┼─────────────────────────────┐
         │                         │                             │
    protocol/                  method/                       feature/
-   IRC, botmanctl       command, chat                whenmoon, exchange
+   IRC, botmanctl                text                  whenmoon, exchange
         │                         │                             │
-        └─────────── service/ ────┴──── inference/ ──── strategy/ ──┘
-                 coinbase, searxng,         llm + knowledge      e.g. testing
-                 openweather, ...           + acquire
+        └─────────── service/ ────┴──── extension/ ──── strategy/ ──┘
+                 coinbase, searxng,     inference                e.g. testing
+                 openweather, ...       llm · knowledge · acquire
 ```
 
 ---
@@ -76,7 +76,7 @@ runtime.
 |---|---|---|
 | `plugins/db/` | Database engine drivers | postgresql |
 | `plugins/protocol/` | Wire protocols | IRC, botmanctl |
-| `plugins/method/` | Bot interaction methods (the kinds) | command, chat |
+| `plugins/method/` | Bot interaction methods (the kinds) | text (command dispatch + conversation) |
 | `plugins/service/` | External API integrations | coinbase, openweather, coinmarketcap, searxng |
 | `plugins/extension/` | Self-contained subsystems with internal structure | inference (engine + `ask`/`claude`/`imagine`/`search`) |
 | `plugins/feature/` | Single focused capabilities atop the stack | whenmoon, exchange, weather, stock |

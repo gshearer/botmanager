@@ -724,9 +724,9 @@ show_user_mfa_cb(const char *pattern, void *data)
 }
 
 // /show user <name> -- single-user detail. The memory-backed verbs
-// (/show user facts|log|rag <name>) were re-homed into the chat plugin
+// (/show user facts|log|rag <name>) were re-homed into the text method
 // when the memory subsystem moved out of core (R1); they now register
-// as children of /show/user from plugins/method/chat/user_show.c.
+// as children of /show/user from plugins/method/text/user_show.c.
 
 static void
 cmd_show_user(const cmd_ctx_t *ctx)

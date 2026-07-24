@@ -4,8 +4,8 @@ Service plugin (`PLUGIN_SERVICE`) for Coinbase Advanced Trade (the
 retail-facing successor to Coinbase Pro / GDAX, served at
 `api.coinbase.com/api/v3/brokerage/...`). Exposes a mechanism API
 over both REST and a WebSocket feed so consumers —
-`plugins/feature/whenmoon/`, future `plugins/cmd/coinbase/` command
-surfaces, other internal callers — can access products, candles,
+`plugins/feature/whenmoon/`, a future `plugins/feature/coinbase/`
+command surface, other internal callers — can access products, candles,
 live trades, order books, accounts, and place orders without
 knowing how Coinbase authentication or streaming works.
 
@@ -60,8 +60,11 @@ Hard layering rules apply (`plugins/service/AGENTS.md`):
 
 1. **Zero user commands.** Coinbase-related `/` commands (if any
    are added) belong either in `plugins/feature/whenmoon/` (when they
-   mutate whenmoon state) or `plugins/cmd/coinbase/` (for
-   standalone users).
+   mutate whenmoon state) or a `plugins/feature/coinbase/` command
+   surface (for standalone users). The Rule 1 leaf exception (a
+   graph-leaf service may carry its own command surface) does **not**
+   apply here: `coinbase` is a non-leaf service, so it stays
+   mechanism-only.
 2. **No upward includes or `plugin_dlsym`.** Service plugins stay
    pure mechanism.
 3. **KV schema is ours.** All operator-facing knobs sit under

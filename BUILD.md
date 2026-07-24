@@ -27,7 +27,7 @@ Re-running `meson setup build` is unnecessary after the first time —
 
 The build is expected to be **warning-free for files you touched**. A few
 pre-existing `-Wmissing-field-initializers` and `-Wformat-truncation`
-warnings exist in `plugins/service/coinmarketcap` and `plugins/method/irc`;
+warnings exist in `plugins/service/coinmarketcap` and `plugins/protocol/irc`;
 don't introduce new warnings.
 
 `scripts/gen_version_h.sh` runs every build and bumps the `BUILDNUM` file

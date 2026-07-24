@@ -240,11 +240,11 @@ main(int argc, char *argv[])
   // the plugin's lifecycle callbacks; core no longer touches them
   // directly.
 
-  // Memory subsystem lives in the chat plugin (R1) -- init / exit
-  // wiring has moved into plugins/method/chat/chatbot.c. Core no longer
+  // Memory subsystem lives in the text method (R1) -- init / exit
+  // wiring has moved into plugins/method/text/chatbot.c. Core no longer
   // touches it directly.
 
-  // Fact extraction lives in the chat plugin as of R2 — chat plugin
+  // Fact extraction lives in the text method as of R2 — the method's
   // init() wires extract_init / extract_register_config / extract_exit.
 
   // Bootstrap configuration.

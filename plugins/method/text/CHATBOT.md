@@ -353,7 +353,7 @@ unit of memory: facts are keyed by `dossier_id`, and
 `conversation_log.dossier_id` links each message to the person who sent
 it. Dossiers are resolved per-method using the driver's
 `dossier_signature` callback — for IRC that is `{nick, ident,
-host_tail}` (`plugins/method/irc/irc_dossier.c`).
+host_tail}` (`plugins/protocol/irc/irc_identity.c`).
 
 Dossier creation is gated by two rules, evaluated on every inbound
 line:

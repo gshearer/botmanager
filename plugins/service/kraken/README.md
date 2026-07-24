@@ -61,8 +61,11 @@ single production target.
 Hard layering rules apply (`plugins/service/AGENTS.md`):
 
 1. **Zero user commands.** Kraken-related `/` commands belong in the
-   whenmoon feature plugin (when they mutate whenmoon state) or in
-   `plugins/cmd/kraken/` (for standalone use).
+   whenmoon feature plugin (when they mutate whenmoon state) or in a
+   `plugins/feature/kraken/` command surface (for standalone use). The
+   Rule 1 leaf exception (a graph-leaf service may carry its own
+   command surface) does **not** apply here: `kraken` is a non-leaf
+   service, so it stays mechanism-only.
 2. **No upward includes or `plugin_dlsym`.** Service plugins stay
    pure mechanism.
 3. **KV schema is ours.** All operator-facing knobs sit under

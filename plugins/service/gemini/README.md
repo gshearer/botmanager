@@ -92,10 +92,13 @@ op kinds today; the gate exists for defence in depth.
 Hard layering rules apply (`plugins/service/AGENTS.md`):
 
 1. **Zero user commands.** Gemini-related `/` commands belong in the
-   whenmoon feature plugin (when they mutate whenmoon state) or in
-   `plugins/cmd/gemini/` (for standalone use). Today neither exists —
-   whenmoon talks to gemini through the `feature_exchange`
-   abstraction, never through `gemini_api.h` directly.
+   whenmoon feature plugin (when they mutate whenmoon state) or in a
+   `plugins/feature/gemini/` command surface (for standalone use).
+   Today neither exists — whenmoon talks to gemini through the
+   `feature_exchange` abstraction, never through `gemini_api.h`
+   directly. The Rule 1 leaf exception (a graph-leaf service may carry
+   its own command surface) does **not** apply here: `gemini` is a
+   non-leaf service, so it stays mechanism-only.
 2. **No upward includes or `plugin_dlsym`.** Service plugins stay
    pure mechanism.
 3. **KV schema is ours.** All operator-facing knobs sit under

@@ -75,9 +75,9 @@ whenmoon's consumer-side behaviour (account-poll cadence, rate
 limit, live kill-switch).
 
 User-facing commands registered into the unified command tree stay
-inside this plugin rather than a sibling `plugins/cmd/whenmoon/`,
+inside this plugin rather than in a sibling command-surface plugin,
 because the commands primarily mutate whenmoon state — the same rule
-the chat method follows for `/dossier`, `/memory`, `/llm`.
+the text method follows for `/dossier`, `/memory`, `/llm`.
 
 ## Layering
 
