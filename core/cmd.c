@@ -1292,6 +1292,7 @@ cmd_dispatch(bot_inst_t *inst, const method_msg_t *msg)
 
         help_cb(&help_ctx);
         __atomic_fetch_add(&cmd_stat_dispatches, 1, __ATOMIC_RELAXED);
+        bot_inc_cmd_count(inst);
         return(SUCCESS);
       }
       pthread_mutex_unlock(&cmd_mutex);
@@ -1427,6 +1428,12 @@ cmd_dispatch(bot_inst_t *inst, const method_msg_t *msg)
   }
 
   __atomic_add_fetch(&cmd_stat_dispatches, 1, __ATOMIC_RELAXED);
+
+  // Per-bot mirror of the process-wide counter above. Counted here, at
+  // the point of actual dispatch, so denials and unknown verbs stay out
+  // of it — core's deliver path can't make this call because only the
+  // cmd layer knows a line became a command.
+  bot_inc_cmd_count(inst);
 
   clam(CLAM_DEBUG, "cmd_dispatch",
       "'%s': dispatched '%s' from %s on %s",
@@ -2163,6 +2170,10 @@ cmd_dispatch_as(const char *cmd_name, const char *args,
       kv_admin_context_set(false);
   }
 
+  // No bot_inc_cmd_count here, and that is not an oversight: this path
+  // asserts a caller identity against a method instance with no bot
+  // instance behind it (botmanctl, NL bridges), so there is nothing to
+  // attribute the dispatch to. Process-wide counter only.
   __atomic_add_fetch(&cmd_stat_dispatches, 1, __ATOMIC_RELAXED);
   return(SUCCESS);
 }
@@ -2227,6 +2238,7 @@ cmd_dispatch_resolved(bot_inst_t *inst, const method_msg_t *msg,
   }
 
   __atomic_add_fetch(&cmd_stat_dispatches, 1, __ATOMIC_RELAXED);
+  bot_inc_cmd_count(inst);
 
   clam(CLAM_DEBUG, "cmd_dispatch_resolved",
       "'%s': dispatched leaf '%s' from %s on %s",

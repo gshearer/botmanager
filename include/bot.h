@@ -192,7 +192,11 @@ method_inst_t *bot_first_method(const bot_inst_t *inst);
 // kind.
 method_inst_t *bot_resolve_method(const bot_inst_t *inst, const char *key);
 
-// Called by cmd_dispatch() on successful command dispatch.
+// Called by the cmd layer on successful command dispatch: cmd_dispatch()
+// (including its help redirect) and cmd_dispatch_resolved(). Not from
+// core's deliver path — only the cmd layer knows a line became a command.
+// cmd_dispatch_as() is bot-less by design and bumps only the process-wide
+// counter.
 void bot_inc_cmd_count(bot_inst_t *inst);
 
 uint64_t bot_cmd_count(const bot_inst_t *inst);
