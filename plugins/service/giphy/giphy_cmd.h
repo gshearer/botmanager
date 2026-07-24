@@ -1,10 +1,22 @@
-#ifndef BM_CMD_GIPHY_H
-#define BM_CMD_GIPHY_H
+#ifndef BM_GIPHY_CMD_H
+#define BM_GIPHY_CMD_H
 
-// Command-surface plugin for !giphy. Renders GIF hits from the giphy
-// service plugin's public mechanism API (giphy_api.h, resolved by name).
-// Pure presentation: every byte the user sees is shaped here; all
-// fetching and normalization lives in the service.
+// The giphy plugin's command surface: !giphy. Renders GIF hits from the
+// rows giphy.c normalizes — pure presentation, every byte the user sees
+// is shaped here, while all fetching and normalization stays in the
+// service half of the same .so.
+//
+// Both halves ship as one plugin because giphy is a dependency-graph
+// leaf (nothing requires service_giphy), so the command's upward
+// method_command dependency is inherited by nobody. See
+// `PLUGIN.md §Layer Rules` Rule 1, leaf exception.
+
+#include <stdbool.h>
+
+// Driven by giphy.c's lifecycle: the service half owns the plugin
+// descriptor, so it raises and lowers the command surface with it.
+bool giphy_cmd_register(void);
+void giphy_cmd_unregister(void);
 
 #ifdef GIPHY_CMD_INTERNAL
 
@@ -19,7 +31,7 @@
 
 #include "giphy_api.h"
 
-#define GIPHY_CMD_CTX       "giphy_cmd"
+#define GIPHY_CMD_CTX       GIPHY_CTX ".cmd"
 #define GIPHY_CMD_REPLY_SZ  640
 #define GIPHY_CMD_QUERY_SZ  200
 
@@ -44,9 +56,7 @@ typedef struct
 } giphy_cmd_args_t;
 
 static void giphy_cmd(const cmd_ctx_t *);
-static bool giphy_cmd_init(void);
-static void giphy_cmd_deinit(void);
 
 #endif // GIPHY_CMD_INTERNAL
 
-#endif // BM_CMD_GIPHY_H
+#endif // BM_GIPHY_CMD_H

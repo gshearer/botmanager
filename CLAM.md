@@ -160,6 +160,7 @@ regex (the literal context portion, before any `<placeholder>`).
 | `gemini.ws.md` | plugins/service/gemini/gemini_ws_channels.c | gemini WS Market Data v2 |
 | `gemini.ws.oe` | plugins/service/gemini/gemini_ws_channels.c | gemini WS Order Events |
 | `giphy` | plugins/service/giphy/giphy.c | Giphy GIF API client (`GIPHY_CTX`) |
+| `giphy.cmd` | plugins/service/giphy/giphy_cmd.c | `!giphy` GIF search, the giphy plugin's own command surface (`GIPHY_CMD_CTX`) |
 | `kraken` | plugins/service/kraken/kraken_sign.c | top-level kraken plugin (`KR_CTX`) |
 | `openweather` | plugins/service/openweather/openweather.c | OpenWeather API (`OW_CTX`) |
 | `rawg` | plugins/service/rawg/rawg.c | RAWG video-games database API (`RAWG_CTX`) |
@@ -173,12 +174,16 @@ Filed by domain, not by bucket — see `PLUGIN.md §Layer Rules`. The source
 column is authoritative; paths span `plugins/cmd/`, `plugins/feature/`, and
 `plugins/misc/` while the PTREE reorg dissolves the legacy `cmd/` bucket.
 
+A **leaf service that carries its own command surface** is listed under
+Service plugins above, not here: its command TU emits a dotted sub-context
+beneath the plugin's root (`giphy.cmd`), so one `^giphy` subscriber sees both
+halves. Same shape as `gemini` / `gemini.ws`.
+
 | Context | Source | Description |
 |---|---|---|
 | `ask` | plugins/cmd/ask/ask_cmd.c | `!ask` one-shot LLM command (`ASK_CMD_CTX`) |
 | `claude` | plugins/cmd/claude/claude.c | `/claude` bridge command (`CLAUDE_CTX`) |
 | `crypto` | plugins/feature/crypto/crypto.c | `/crypto` price command (`CRYPTO_CTX`) |
-| `giphy_cmd` | plugins/cmd/giphy/giphy_cmd.c | `!giphy` GIF search command (`GIPHY_CMD_CTX`) |
 | `imagine` | plugins/cmd/imagine/imagine_cmd.c | `!imagine` text-to-image command (`IMG_CMD_CTX`) |
 | `rawg_cmd` | plugins/cmd/rawg/rawg_cmd.c | `!rawg` video-game info command (`RAWGCMD_CTX`) |
 | `searxng` | plugins/cmd/searxng/searxng_cmd.c | `/searxng` command (`SEARXNG_CMD_CTX`) |

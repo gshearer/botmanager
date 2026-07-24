@@ -4,10 +4,12 @@
 // endpoint's payload — list-shaped or single-object — into one flat
 // result row, and seals the Giphy-side conventions (image variants,
 // stringly-typed dimensions, the media permalink form) behind
-// giphy_api.h. Pure connectivity; the giphy command plugin owns all
-// presentation.
+// giphy_api.h. Pure connectivity; the plugin's command surface half
+// (giphy_cmd.c) owns all presentation.
 #define GIPHY_INTERNAL
 #include "giphy.h"
+
+#include "giphy_cmd.h"
 
 // ----------------------------------------------------------------------
 // KV schema
@@ -488,6 +490,11 @@ giphy_init(void)
     clam(CLAM_WARN, GIPHY_CTX,
         "no API key: set " GIPHY_KV_API_KEY " to enable lookups");
 
+  // A plugin that cannot raise its own command surface is half-loaded,
+  // which is worse than absent — fail the init and let the loader skip it.
+  if(giphy_cmd_register() != SUCCESS)
+    return(FAIL);
+
   clam(CLAM_INFO, GIPHY_CTX, "giphy plugin initialized");
   return(SUCCESS);
 }
@@ -495,9 +502,14 @@ giphy_init(void)
 static void
 giphy_deinit(void)
 {
+  giphy_cmd_unregister();
   clam(CLAM_INFO, GIPHY_CTX, "giphy plugin deinitialized");
 }
 
+// The command half's upward method_command dependency rides on this
+// descriptor. Sound only because giphy is a dependency-graph leaf —
+// nothing requires service_giphy, so nothing inherits it. See
+// `PLUGIN.md §Layer Rules` Rule 1, leaf exception.
 const plugin_desc_t bm_plugin_desc = {
   .api_version     = PLUGIN_API_VERSION,
   .name            = GIPHY_CTX,
@@ -506,7 +518,8 @@ const plugin_desc_t bm_plugin_desc = {
   .kind            = GIPHY_CTX,
   .provides        = { { .name = "service_giphy" } },
   .provides_count  = 1,
-  .requires_count  = 0,
+  .requires        = { { .name = "method_command" } },
+  .requires_count  = 1,
   .kv_schema       = giphy_kv_schema,
   .kv_schema_count = sizeof(giphy_kv_schema) / sizeof(giphy_kv_schema[0]),
   .init            = giphy_init,

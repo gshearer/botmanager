@@ -9,8 +9,9 @@
 //   - default: types + static-inline dlsym shims (abort on plugin miss).
 //     Use this in command-surface or behaviour plugins that consider a
 //     missing service plugin a startup misconfiguration.
-//   - GIPHY_INTERNAL: types + real prototypes, no shims. Used by
-//     giphy.c itself.
+//   - GIPHY_INTERNAL: types + real prototypes, no shims. Used by the
+//     plugin's own translation units (giphy.c, giphy_cmd.c), which link
+//     against the definitions directly rather than dlsym-ing themselves.
 //   - GIPHY_TYPES_ONLY: types only. For consumers that want to handle
 //     "plugin not loaded" gracefully through their own dlsym path.
 
@@ -20,6 +21,10 @@
 #include <strings.h>  // strcasecmp
 
 #include "common.h"  // SUCCESS/FAIL
+
+// The plugin's name, and so both its dlsym handle and the root of its
+// clam contexts. Public because the shims below resolve against it.
+#define GIPHY_CTX "giphy"
 
 // Which Giphy endpoint a request targets. SEARCH and TRANSLATE consume a
 // query; RANDOM treats it as an optional tag; TRENDING ignores it.
@@ -181,11 +186,12 @@ giphy_configured(void)
   {
     union { void *obj; fn_t fn; } u;
 
-    u.obj = plugin_dlsym_cached("giphy", "giphy_configured", (void **)&cached);
+    u.obj = plugin_dlsym_cached(GIPHY_CTX, "giphy_configured",
+        (void **)&cached);
 
     if(u.obj == NULL)
     {
-      clam(CLAM_FATAL, "giphy", "dlsym failed: giphy_configured");
+      clam(CLAM_FATAL, GIPHY_CTX, "dlsym failed: giphy_configured");
       abort();
     }
 
@@ -209,11 +215,11 @@ giphy_fetch(giphy_mode_t mode, const char *query, size_t n_wanted,
   {
     union { void *obj; fn_t fn; } u;
 
-    u.obj = plugin_dlsym_cached("giphy", "giphy_fetch", (void **)&cached);
+    u.obj = plugin_dlsym_cached(GIPHY_CTX, "giphy_fetch", (void **)&cached);
 
     if(u.obj == NULL)
     {
-      clam(CLAM_FATAL, "giphy", "dlsym failed: giphy_fetch");
+      clam(CLAM_FATAL, GIPHY_CTX, "dlsym failed: giphy_fetch");
       abort();
     }
 

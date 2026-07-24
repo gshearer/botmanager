@@ -21,7 +21,7 @@
 #include <stdlib.h>
 #include <string.h>
 
-#define GIPHY_CTX          "giphy"
+// GIPHY_CTX (the plugin name / clam-context root) lives in giphy_api.h.
 
 #define GIPHY_API_BASE     "https://api.giphy.com/v1/gifs"
 #define GIPHY_MEDIA_BASE   "https://media.giphy.com/media"

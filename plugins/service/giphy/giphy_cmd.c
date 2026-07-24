@@ -1,8 +1,13 @@
 // botmanager — MIT
-// giphy command-surface plugin: one public !giphy command over the giphy
-// service plugin. Searches by phrase, pulls a random GIF for a tag (-r),
-// or lists what is trending (-t), and renders the hits as colorized one-
-// liners — or, with -v, as a metadata card per GIF.
+// giphy command surface: the one public !giphy command. Searches by
+// phrase, pulls a random GIF for a tag (-r), or lists what is trending
+// (-t), and renders the hits as colorized one-liners — or, with -v, as a
+// metadata card per GIF.
+//
+// GIPHY_INTERNAL suppresses giphy_api.h's dlsym shims: this TU is linked
+// into the same .so as giphy.c, so it calls the service entry points
+// directly rather than resolving the plugin against itself.
+#define GIPHY_INTERNAL
 #define GIPHY_CMD_INTERNAL
 #include "giphy_cmd.h"
 
@@ -352,7 +357,7 @@ static const cmd_nl_t giphy_nl = {
 };
 
 // ----------------------------------------------------------------------
-// Plugin lifecycle
+// Registration — driven by the service half's plugin lifecycle
 // ----------------------------------------------------------------------
 
 static const char giphy_help[] =
@@ -378,10 +383,13 @@ static const char giphy_help[] =
     "  !giphy -r -v excited\n"
     "  !giphy -t -n 5";
 
-static bool
-giphy_cmd_init(void)
+// The registry records GIPHY_CTX as the providing module: after the
+// merge the giphy plugin itself owns this command, and `/show commands`
+// should say so.
+bool
+giphy_cmd_register(void)
 {
-  if(cmd_register(GIPHY_CMD_CTX, "giphy", GIPHY_CMD_USAGE,
+  if(cmd_register(GIPHY_CTX, "giphy", GIPHY_CMD_USAGE,
       "Animated GIF search via Giphy (giphy.com)",
       giphy_help,
       USERNS_GROUP_EVERYONE, 0, CMD_SCOPE_ANY, METHOD_T_ANY,
@@ -389,33 +397,13 @@ giphy_cmd_init(void)
       NULL, 0, NULL, &giphy_nl) != SUCCESS)
     return(FAIL);
 
-  clam(CLAM_INFO, GIPHY_CMD_CTX, "giphy command plugin initialized");
+  clam(CLAM_INFO, GIPHY_CMD_CTX, "!giphy registered");
   return(SUCCESS);
 }
 
-static void
-giphy_cmd_deinit(void)
+void
+giphy_cmd_unregister(void)
 {
   cmd_unregister("giphy");
-  clam(CLAM_INFO, GIPHY_CMD_CTX, "giphy command plugin deinitialized");
+  clam(CLAM_INFO, GIPHY_CMD_CTX, "!giphy unregistered");
 }
-
-const plugin_desc_t bm_plugin_desc = {
-  .api_version     = PLUGIN_API_VERSION,
-  .name            = GIPHY_CMD_CTX,
-  .version         = "1.0",
-  .type            = PLUGIN_MISC,
-  .kind            = GIPHY_CMD_CTX,
-  .provides        = { { .name = "cmd_giphy" } },
-  .provides_count  = 1,
-  .requires        = { { .name = "method_command" },
-                       { .name = "service_giphy" } },
-  .requires_count  = 2,
-  .kv_schema       = NULL,
-  .kv_schema_count = 0,
-  .init            = giphy_cmd_init,
-  .start           = NULL,
-  .stop            = NULL,
-  .deinit          = giphy_cmd_deinit,
-  .ext             = NULL,
-};
