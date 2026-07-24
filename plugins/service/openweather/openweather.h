@@ -70,7 +70,7 @@ typedef enum
 // Request context: carries fetch parameters and the caller-supplied
 // completion callback through the async geocode → onecall chain. No
 // command-surface state (no cmd_ctx_t, no method_msg_t) — consumers
-// in plugins/cmd/weather/ own their own per-request structs.
+// in plugins/feature/weather/ own their own per-request structs.
 typedef struct ow_request
 {
   ow_req_type_t       type;

@@ -167,20 +167,24 @@ regex (the literal context portion, before any `<placeholder>`).
 | `tmdb` | plugins/service/tmdb/tmdb.c | The Movie Database API (`TMDB_CTX`) |
 | `yahoofinance` | plugins/service/yahoofinance/yahoofinance.c | Yahoo Finance stock-quote provider (`YF_CTX`) |
 
-## Command-surface plugins (`plugins/cmd/`)
+## Command-surface plugins
+
+Filed by domain, not by bucket — see `PLUGIN.md §Layer Rules`. The source
+column is authoritative; paths span `plugins/cmd/`, `plugins/feature/`, and
+`plugins/misc/` while the PTREE reorg dissolves the legacy `cmd/` bucket.
 
 | Context | Source | Description |
 |---|---|---|
 | `ask` | plugins/cmd/ask/ask_cmd.c | `!ask` one-shot LLM command (`ASK_CMD_CTX`) |
 | `claude` | plugins/cmd/claude/claude.c | `/claude` bridge command (`CLAUDE_CTX`) |
-| `crypto` | plugins/cmd/crypto/crypto.c | `/crypto` price command (`CRYPTO_CTX`) |
+| `crypto` | plugins/feature/crypto/crypto.c | `/crypto` price command (`CRYPTO_CTX`) |
 | `giphy_cmd` | plugins/cmd/giphy/giphy_cmd.c | `!giphy` GIF search command (`GIPHY_CMD_CTX`) |
 | `imagine` | plugins/cmd/imagine/imagine_cmd.c | `!imagine` text-to-image command (`IMG_CMD_CTX`) |
 | `rawg_cmd` | plugins/cmd/rawg/rawg_cmd.c | `!rawg` video-game info command (`RAWGCMD_CTX`) |
 | `searxng` | plugins/cmd/searxng/searxng_cmd.c | `/searxng` command (`SEARXNG_CMD_CTX`) |
-| `stock` | plugins/cmd/stock/stock.c | `!stock` quote command (`STOCK_CTX`) |
+| `stock` | plugins/feature/stock/stock.c | `!stock` quote command (`STOCK_CTX`) |
 | `tmdb_cmd` | plugins/cmd/tmdb/tmdb_cmd.c | `!tmdb` movie/TV/actor command (`TMDBCMD_CTX`) |
-| `weather` | plugins/cmd/weather/weather.c | `/weather` command (`WEATHER_CTX`) |
+| `weather` | plugins/feature/weather/weather.c | `/weather` command (`WEATHER_CTX`) |
 
 ## Method plugins (`plugins/method/`)
 

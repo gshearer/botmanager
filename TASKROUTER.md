@@ -20,7 +20,7 @@ alongside its code.
 | Add a service plugin (external API) | `PLUGIN.md` + `plugins/service/AGENTS.md` |
 | Add/modify a protocol driver (IRC, ...) | `PLUGIN.md` + `plugins/protocol/AGENTS.md` + `include/method.h` |
 | Add/modify a method driver (chat, command, ...) | `PLUGIN.md` + `plugins/method/AGENTS.md` + `include/bot.h` |
-| Add/modify a feature plugin (whenmoon, ...) | `PLUGIN.md` + `plugins/feature/AGENTS.md` + `include/bot.h` |
+| Add/modify a feature plugin (whenmoon, weather, crypto, stock, ...) | `PLUGIN.md` + `plugins/feature/AGENTS.md` + `include/bot.h` |
 | Write, iterate, or backtest a trading strategy (cp1, mako, riptide, ...) | `plugins/feature/whenmoon/strategy/AGENTS.md` |
 | Run or interpret a backtest / sweep (the iteration loop) | `plugins/feature/whenmoon/strategy/AGENTS.md` §iteration loop |
 | Add/modify an exchange driver (coinbase, kraken, ...) | `PLUGIN.md` + `plugins/service/AGENTS.md` + `plugins/feature/exchange/AGENTS.md` |
@@ -39,7 +39,7 @@ alongside its code.
 | Work on the `/claude` bridge / daemon-restart flow | `plugins/cmd/claude/AGENTS.md` + `scripts/botman-restart.sh` |
 | Work on `!imagine` (text-to-image) or the `image` LLM kind | `plugins/cmd/imagine/imagine_cmd.c` + `plugins/inference/LLM.md` |
 | Work on GIF search (`!giphy`) | `plugins/service/giphy/giphy_api.h` (contract) + `plugins/service/giphy/` (provider) + `plugins/cmd/giphy/` (command) |
-| Work on stock/equity/fund/commodity quotes (`!stock`) | `TODO.md` §STOCK-1..5 + `include/stockquote.h` (contract) + `plugins/service/yahoofinance/` (provider) + `plugins/cmd/stock/` (command) |
+| Work on stock/equity/fund/commodity quotes (`!stock`) | `TODO.md` §STOCK-1..5 + `include/stockquote.h` (contract) + `plugins/service/yahoofinance/` (provider) + `plugins/feature/stock/` (command) |
 | Work on video-game info (`!rawg`) | `plugins/service/rawg/rawg_api.h` (contract) + `plugins/service/rawg/` (provider) + `plugins/cmd/rawg/` (command) |
 | Work with the IRC protocol driver or its identity projection | `plugins/protocol/AGENTS.md` + `plugins/protocol/irc/AGENTS.md` + `plugins/protocol/irc/irc_identity.h` |
 | Ingest or refresh a knowledge corpus | `plugins/inference/KNOWLEDGE.md` + `scripts/AGENTS.md` §fetch_archwiki.sh |
