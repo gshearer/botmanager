@@ -90,14 +90,18 @@ bucket that just means "it registers a command". `PLUGIN.md §Layer
 Rules` holds the authoritative layer table and the placement
 decision-tree for new plugins.
 
-**Inter-plugin contracts** live as headers in `plugins/contracts/` —
-consumer-agnostic types and function-pointer signatures, no
-dispatchers. Both implementer and consumer import the header;
-neither imports the other's plugin directory. (Example: protocol
-plugins publish optional dossier scorers through
-`method_driver_t.dossier_scorer`, void-typed in `method.h` so core
-stays free of chat-type dependencies; the chat plugin casts and
-binds them at start time.)
+**Inter-plugin contracts** are headers, and they come in two shapes.
+A provider its consumers name directly publishes a mechanism header
+beside its own source — `<name>_api.h` (`giphy_api.h`,
+`coinbase_api.h`, ...). The consumer picks it up through meson
+`include_directories` and calls in via `plugin_dlsym` shims, so the
+two share types without either linking the other. A provider that
+should be *swappable* instead implements a provider-neutral contract
+owned by no plugin, in `include/` — today `stockquote.h`. It declares
+a capability token in `.provides`, the consumer declares that same
+token in `.requires`, and the shims bind to whoever currently provides
+it via `plugin_find_feature()`. Changing the data source behind such a
+contract is a load/unload; the consumer is never recompiled.
 
 ---
 
