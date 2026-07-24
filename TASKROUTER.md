@@ -14,6 +14,7 @@ alongside its code.
 | **Use a CLI tool (`botmanctl`, `ircspy`, `ircspyctl`)** | `tools/AGENTS.md` |
 | **Fresh-start the daemon** | `scripts/AGENTS.md` |
 | Add a user command (command-surface plugin) | `CMD.md` + `plugins/cmd/AGENTS.md` |
+| Add or work on a misc toy / novelty command (`!math`, `!8ball`) | `plugins/misc/AGENTS.md` |
 | Add or modify a plugin layering rule | `PLUGIN.md` §Layer Rules + `AGENTS.md` §Plugin Layers |
 | **File a new plugin (which folder?)** | `PLUGIN.md` §Layer Rules (placement decision-tree) |
 | Add a service plugin (external API) | `PLUGIN.md` + `plugins/service/AGENTS.md` |

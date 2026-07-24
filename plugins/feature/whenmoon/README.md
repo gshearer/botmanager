@@ -108,7 +108,7 @@ None today. As subsystems land, expect to depend on:
 - *(possibly vendored)* `tulipindicators` — 150+ technical indicators,
   carried over from the original standalone if no equivalent is
   already present in the tree
-- *(possibly vendored)* `tinyexpr` — already used by `plugins/cmd/math`
+- *(possibly vendored)* `tinyexpr` — already used by `plugins/misc/math`
 
 ## Note on `old/whenmoon/`
 

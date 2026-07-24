@@ -1,7 +1,7 @@
 // botmanager — MIT
-// Small-games misc plugin: chat mini-games (8ball, dice, and friends).
-#define SMALLGAMES_INTERNAL
-#include "smallgames.h"
+// Eightball misc plugin: the Magic 8-Ball novelty command (!8ball).
+#define EIGHTBALL_INTERNAL
+#include "eightball.h"
 
 #include "colors.h"
 #include "util.h"
@@ -51,9 +51,9 @@ static const cmd_arg_desc_t eightball_args[] = {
 };
 
 static bool
-smallgames_init(void)
+eightball_init(void)
 {
-  if(cmd_register(SMALLGAMES_CTX, "8ball",
+  if(cmd_register(EIGHTBALL_CTX, "8ball",
       "8ball <question>",
       "Ask the Magic 8-Ball a question",
       "Shake the Magic 8-Ball and receive its wisdom.\n"
@@ -69,7 +69,7 @@ smallgames_init(void)
 }
 
 static void
-smallgames_deinit(void)
+eightball_deinit(void)
 {
   cmd_unregister("8ball");
 }
@@ -78,19 +78,19 @@ smallgames_deinit(void)
 
 const plugin_desc_t bm_plugin_desc = {
   .api_version     = PLUGIN_API_VERSION,
-  .name            = "misc_smallgames",
+  .name            = "eightball",
   .version         = "1.0",
   .type            = PLUGIN_MISC,
-  .kind            = "misc_smallgames",
-  .provides        = { { .name = "misc_misc_smallgames" } },
+  .kind            = "eightball",
+  .provides        = { { .name = "misc_eightball" } },
   .provides_count  = 1,
   .requires        = { { .name = "method_command" } },
   .requires_count  = 1,
   .kv_schema       = NULL,
   .kv_schema_count = 0,
-  .init            = smallgames_init,
+  .init            = eightball_init,
   .start           = NULL,
   .stop            = NULL,
-  .deinit          = smallgames_deinit,
+  .deinit          = eightball_deinit,
   .ext             = NULL,
 };
