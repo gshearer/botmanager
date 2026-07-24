@@ -130,11 +130,11 @@ math_deinit(void)
 
 const plugin_desc_t bm_plugin_desc = {
   .api_version     = PLUGIN_API_VERSION,
-  .name            = "misc_math",
+  .name            = "math",
   .version         = "1.0",
   .type            = PLUGIN_MISC,
-  .kind            = "misc_math",
-  .provides        = { { .name = "misc_misc_math" } },
+  .kind            = "math",
+  .provides        = { { .name = "misc_math" } },
   .provides_count  = 1,
   .requires        = { { .name = "method_text" } },
   .requires_count  = 1,

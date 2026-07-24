@@ -14,7 +14,7 @@
 
 #include "math_expr.h"
 
-#define MATH_CTX        "misc_math"
+#define MATH_CTX        "math"
 #define MATH_EXPR_SZ    256
 #define MATH_REPLY_SZ   512
 
