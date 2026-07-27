@@ -35,6 +35,14 @@ static const char *const melee_minor[] = {
   "%s trips %s face-first into a puddle of rothe filth for %s damage.",
   "%s jabs %s with the butt of a driftglobe pole for %s damage.",
   "%s slices a shallow line down %s's arm, just to watch it bleed — %s damage.",
+  "%s scuffs %s's cheekbone with a knuckle of House rings for %s damage.",
+  "%s clips %s's ear with the flat of a dagger, more insult than injury — %s damage.",
+  "%s treads on %s's cloak and tears the hem of the piwafwi for %s damage.",
+  "%s elbows %s in the shoulder on the way past, unhurried, for %s damage.",
+  "%s snaps a glove across %s's mouth the way a Matron scolds a servant — %s damage.",
+  "%s nicks %s's knuckles and watches them fumble the grip for %s damage.",
+  "%s raps %s across the shin with a still-sheathed blade for %s damage.",
+  "%s spits at %s's feet and opens their chin with a lazy backhand for %s damage.",
 };
 
 // A clean landed hit that hurts, and that a duellist keeps going through.
@@ -48,6 +56,13 @@ static const char *const melee_medium[] = {
   "%s shoulder-checks %s into a stalagmite for %s damage.",
   "%s knocks the wind from %s with a spider-carved buckler for %s damage.",
   "%s hooks %s's ankle and drops them hard onto the cavern floor for %s damage.",
+  "%s drives a fist into %s's kidney and lets them fold for %s damage.",
+  "%s opens a red line along %s's collarbone with black steel for %s damage.",
+  "%s beats %s's guard aside and puts a boot into their thigh for %s damage.",
+  "%s slashes %s across the shoulder blade as they turn away for %s damage.",
+  "%s catches %s in the mouth with a spiked bracer for %s damage.",
+  "%s slams %s's back against the cavern wall and holds them there for %s damage.",
+  "%s draws at arm's length and puts a hand-crossbow bolt in %s's thigh for %s damage.",
 };
 
 // Bone, blood and stagger. Badly hurt, visibly losing — never fatal.
@@ -64,6 +79,10 @@ static const char *const melee_major[] = {
   "%s bathes a blade in drow poison and paints %s with it for %s damage.",
   "%s smashes %s through a sava board and scatters pieces and teeth alike for %s damage.",
   "%s carves the sigil of Bregan D'aerthe into %s's back, stroke by unhurried stroke, for %s damage.",
+  "%s breaks %s's nose flat with a pommel and lets the blood come for %s damage.",
+  "%s runs a blade through %s's shoulder and leaves it there a moment — %s damage.",
+  "%s hammers %s's knee sideways until the joint gives with a crack for %s damage.",
+  "%s tears open %s's flank with a hooked dagger and steps back to watch — %s damage.",
 };
 
 // The heaviest thing that is still survivable — and it may say so.
@@ -79,6 +98,11 @@ static const char *const melee_critical[] = {
   "%s lets a yochlol's whisper guide the killing arc across %s's throat. %s CRITICAL damage!",
   "%s drives a hooked blade under %s's jaw and twists. %s CRITICAL damage!",
   "%s crushes %s beneath an adamantine boot until something deep gives way. %s CRITICAL damage!",
+  "%s nails %s's hand to the stone with a dagger and works on them at leisure. %s CRITICAL damage!",
+  "%s opens %s's belly with an adamantine edge; Lolth's spiders gather early. %s CRITICAL damage!",
+  "%s drives a spear of black steel through %s's thigh and out the other side. %s CRITICAL damage!",
+  "%s slams %s face-first through a driftglobe — the light dies with the scream. %s CRITICAL damage!",
+  "%s breaks %s's ribs against a stalagmite one at a time, in no hurry. %s CRITICAL damage!",
 };
 
 // FORMAT CONTRACT: every entry takes exactly two `const char *` —
