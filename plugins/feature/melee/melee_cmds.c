@@ -265,7 +265,7 @@ melee_cmd_attack(const cmd_ctx_t *ctx)
   // ---- 10. announce, still under the lock so two turns cannot ------- //
   //          interleave their narration                               //
 
-  melee_render_blow(line, sizeof(line), atk_nick, nick, dmg, crit,
+  melee_render_blow(line, sizeof(line), atk_nick, nick, dmg,
       new_hp, tgt.hp_max, &t, &refill_blow);
   cmd_reply(ctx, line);
 
@@ -308,7 +308,7 @@ melee_cmd_attack(const cmd_ctx_t *ctx)
   // inspectable rather than argued.
 
   if(refill_blow)
-    melee_llm_refill_kick(crit ? MELEE_FLAV_CRIT : MELEE_FLAV_HIT, &t);
+    melee_llm_refill_kick(melee_severity(&t, dmg), &t);
 
   if(refill_death)
     melee_llm_refill_kick(MELEE_FLAV_DEATH, &t);

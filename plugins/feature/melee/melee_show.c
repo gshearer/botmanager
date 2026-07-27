@@ -652,7 +652,7 @@ melee_show_scores(const cmd_ctx_t *ctx)
                          + MELEE_W_FREJ + 10)
 
 static const char *const melee_flav_label[MELEE_FLAV__COUNT] = {
-  "hits", "crits", "deaths"
+  "minor", "medium", "major", "critical", "deaths"
 };
 
 static void
@@ -732,6 +732,59 @@ melee_flav_row(const cmd_ctx_t *ctx, melee_flavour_t cat,
   cmd_reply(ctx, line);
 }
 
+// What the four damage tiers actually mean at the current tunables. The
+// boundaries are not computed from the KV percentages a second time —
+// they are read back out of melee_severity() itself, one damage value at
+// a time, so this line can never disagree with the renderer. The ceiling
+// is at most hit_max/crit_max's clamp, so the walk is free.
+static void
+melee_flav_bands(const cmd_ctx_t *ctx, const melee_tunables_t *t)
+{
+  int32_t         lo[MELEE_FLAV_DEATH] = { 0 };
+  int32_t         hi[MELEE_FLAV_DEATH] = { 0 };
+  int32_t         ceiling = melee_dmg_ceiling(t);
+  char            line[MELEE_LINE_SZ];
+  char            cell[64];
+  melee_flavour_t cat;
+  int32_t         dmg;
+
+  for(dmg = 1; dmg <= ceiling; dmg++)
+  {
+    melee_flavour_t sev = melee_severity(t, dmg);
+
+    if(lo[sev] == 0)
+      lo[sev] = dmg;
+
+    hi[sev] = dmg;
+  }
+
+  snprintf(line, sizeof(line), CLR_GRAY "  bands  ");
+
+  for(cat = MELEE_FLAV_MINOR; cat < MELEE_FLAV_DEATH; cat++)
+  {
+    // A small ceiling leaves no room for four tiers, and an unreachable
+    // band says "—" rather than the lie of "0-0".
+    if(lo[cat] == 0)
+      snprintf(cell, sizeof(cell), "%s%s —",
+          cat != MELEE_FLAV_MINOR ? " · " : "", melee_flav_label[cat]);
+
+    else if(lo[cat] == hi[cat])
+      snprintf(cell, sizeof(cell), "%s%s %d",
+          cat != MELEE_FLAV_MINOR ? " · " : "", melee_flav_label[cat],
+          lo[cat]);
+
+    else
+      snprintf(cell, sizeof(cell), "%s%s %d-%d",
+          cat != MELEE_FLAV_MINOR ? " · " : "", melee_flav_label[cat],
+          lo[cat], hi[cat]);
+
+    melee_cat(line, sizeof(line), cell);
+  }
+
+  melee_cat(line, sizeof(line), CLR_RESET);
+  cmd_reply(ctx, line);
+}
+
 static void
 melee_show_llm(const cmd_ctx_t *ctx)
 {
@@ -774,7 +827,7 @@ melee_show_llm(const cmd_ctx_t *ctx)
   cmd_reply(ctx, rule);
   melee_flav_header(ctx);
 
-  for(cat = MELEE_FLAV_HIT; cat < MELEE_FLAV__COUNT; cat++)
+  for(cat = MELEE_FLAV_MINOR; cat < MELEE_FLAV__COUNT; cat++)
   {
     melee_pool_stats(cat, &s);
     melee_flav_row(ctx, cat, &s);
@@ -784,6 +837,7 @@ melee_show_llm(const cmd_ctx_t *ctx)
   }
 
   cmd_reply(ctx, rule);
+  melee_flav_bands(ctx, &t);
 
   melee_fmt_num(num, sizeof(num), (int64_t)melee_pool_fallbacks(), 12);
   snprintf(line, sizeof(line),
@@ -793,7 +847,7 @@ melee_show_llm(const cmd_ctx_t *ctx)
   if(!errored)
     return;
 
-  for(cat = MELEE_FLAV_HIT; cat < MELEE_FLAV__COUNT; cat++)
+  for(cat = MELEE_FLAV_MINOR; cat < MELEE_FLAV__COUNT; cat++)
   {
     melee_pool_stats(cat, &s);
 

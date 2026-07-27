@@ -38,6 +38,11 @@ typedef struct
 // Lock ordering is melee_turn_lock -> melee_pool_lock, never the
 // reverse. melee_pool_lock is never held across file I/O, a task_add, or
 // an LLM submit.
+//
+// Static footprint, stated so nobody has to discover it: 5 categories x
+// MELEE_LLM_POOL_MAX (64) x MELEE_LLM_TMPL_SZ (256) = 80 KB of BSS. That
+// is deliberate — the pools are the whole reason no model runs on the
+// turn path.
 static melee_pool_t    melee_pools[MELEE_FLAV__COUNT];
 static pthread_mutex_t melee_pool_lock = PTHREAD_MUTEX_INITIALIZER;
 static uint64_t        melee_fallbacks;   // static-table renders
@@ -50,7 +55,7 @@ static uint64_t        melee_fallbacks;   // static-table renders
 #define MELEE_TOK_DAMAGE   "damage"
 
 static const char *const melee_flav_name[MELEE_FLAV__COUNT] = {
-  "hit", "crit", "death"
+  "minor", "medium", "major", "critical", "death"
 };
 
 static bool melee_llm_sanitize(melee_flavour_t, const char *, char *,
@@ -441,45 +446,58 @@ melee_tmpl_expand(char *out, size_t cap, const char *tmpl,
 // The refill                                                          //
 // ------------------------------------------------------------------ //
 
-// The machine-readable half of the prompt. It lives in C, not in
-// prompts/melee.txt, so an operator rewriting the persona can never
-// break parsing. %u is melee's own format string, interpolated into a
-// scratch buffer; the model's output never reaches a conversion.
-static const char *const melee_fmt_hit =
-  "Write exactly %u lines of combat flavour. One line per line of output.\n"
-  "\n"
-  "Every line MUST contain the three placeholder tokens {attacker}, {target}\n"
-  "and {damage}, spelled exactly like that in curly braces, each appearing\n"
-  "exactly once. A number is substituted for {damage}, so write it so it\n"
-  "reads naturally -- for example \"for {damage} damage\".\n"
-  "\n"
-  "Rules, all mandatory:\n"
-  "- Output ONLY the lines themselves. No numbering, no bullets, no blank\n"
-  "  lines, no preamble, no commentary, no quotation marks around lines.\n"
-  "- One sentence per line, at most 150 characters.\n"
-  "- Plain text only. No markdown, no emoji, no percent signs, and no curly\n"
-  "  braces other than the three tokens named above.\n"
+// The machine-readable half of the prompt. It lives in C, not in the
+// persona file, so an operator rewriting the persona can never break
+// parsing. %u is melee's own format string, interpolated into a scratch
+// buffer; the model's output never reaches a conversion.
+//
+// The four damage tiers share every rule but the last one, which is the
+// whole point of the tiering: the force described has to match the
+// number the roll produced. The shared half is a macro rather than four
+// copies so the rules cannot drift apart tier by tier.
+#define MELEE_FMT_BLOW_COMMON \
+  "Write exactly %u lines of combat flavour. One line per line of output.\n" \
+  "\n" \
+  "Every line MUST contain the three placeholder tokens {attacker}, {target}\n" \
+  "and {damage}, spelled exactly like that in curly braces, each appearing\n" \
+  "exactly once. A number is substituted for {damage}, so write it so it\n" \
+  "reads naturally -- for example \"for {damage} damage\".\n" \
+  "\n" \
+  "Rules, all mandatory:\n" \
+  "- Output ONLY the lines themselves. No numbering, no bullets, no blank\n" \
+  "  lines, no preamble, no commentary, no quotation marks around lines.\n" \
+  "- One sentence per line, at most 150 characters.\n" \
+  "- Plain text only. No markdown, no emoji, no percent signs, and no curly\n" \
+  "  braces other than the three tokens named above.\n" \
   "- Every line must differ from every other line.\n"
-  "- These are NON-fatal blows. The target is hurt, humiliated, staggered --\n"
-  "  never killed.\n";
 
-static const char *const melee_fmt_crit =
-  "Write exactly %u lines of combat flavour. One line per line of output.\n"
-  "\n"
-  "Every line MUST contain the three placeholder tokens {attacker}, {target}\n"
-  "and {damage}, spelled exactly like that in curly braces, each appearing\n"
-  "exactly once. A number is substituted for {damage}, so write it so it\n"
-  "reads naturally -- for example \"for {damage} damage\".\n"
-  "\n"
-  "Rules, all mandatory:\n"
-  "- Output ONLY the lines themselves. No numbering, no bullets, no blank\n"
-  "  lines, no preamble, no commentary, no quotation marks around lines.\n"
-  "- One sentence per line, at most 150 characters.\n"
-  "- Plain text only. No markdown, no emoji, no percent signs, and no curly\n"
-  "  braces other than the three tokens named above.\n"
-  "- Every line must differ from every other line.\n"
-  "- These are CRITICAL hits: unusually brutal, but still NON-fatal. The\n"
-  "  target survives. End each line with the damage clause so it lands hard.\n";
+static const char *const melee_fmt_minor =
+  MELEE_FMT_BLOW_COMMON
+  "- These are GLANCING blows: the weakest hits in the game. A graze, a\n"
+  "  scuff, a stinging insult of a strike. The target is barely\n"
+  "  inconvenienced and is never in danger.\n"
+  "- Match the words to the number: nothing here may sound like a wound\n"
+  "  that would end a fight.\n";
+
+static const char *const melee_fmt_medium =
+  MELEE_FMT_BLOW_COMMON
+  "- These are SOLID blows: a clean, ordinary hit that hurts and does real\n"
+  "  damage, but that a fighter shrugs off and keeps going through.\n"
+  "- Match the words to the number: no dismemberment, no bones through\n"
+  "  skin, no talk of dying.\n";
+
+static const char *const melee_fmt_major =
+  MELEE_FMT_BLOW_COMMON
+  "- These are HEAVY blows: bone, blood and stagger. The target is badly\n"
+  "  hurt and visibly losing, but SURVIVES the hit.\n"
+  "- Match the words to the number: this must sound worse than an ordinary\n"
+  "  hit and less than a killing one.\n";
+
+static const char *const melee_fmt_critical =
+  MELEE_FMT_BLOW_COMMON
+  "- These are DEVASTATING blows: the heaviest damage in the game,\n"
+  "  unusually brutal -- but still NON-fatal. The target survives.\n"
+  "- End each line with the damage clause so it lands hard.\n";
 
 static const char *const melee_fmt_death =
   "Write exactly %u lines of combat flavour. One line per line of output.\n"
@@ -504,10 +522,12 @@ melee_fmt_for(melee_flavour_t cat)
 {
   switch(cat)
   {
-    case MELEE_FLAV_HIT:   return(melee_fmt_hit);
-    case MELEE_FLAV_CRIT:  return(melee_fmt_crit);
-    case MELEE_FLAV_DEATH: return(melee_fmt_death);
-    default:               return(melee_fmt_hit);
+    case MELEE_FLAV_MINOR:    return(melee_fmt_minor);
+    case MELEE_FLAV_MEDIUM:   return(melee_fmt_medium);
+    case MELEE_FLAV_MAJOR:    return(melee_fmt_major);
+    case MELEE_FLAV_CRITICAL: return(melee_fmt_critical);
+    case MELEE_FLAV_DEATH:    return(melee_fmt_death);
+    default:                  return(melee_fmt_medium);
   }
 }
 
@@ -777,7 +797,10 @@ melee_llm_refill_kick(melee_flavour_t cat, const melee_tunables_t *t)
   }
 }
 
-// Fill all three pools before the first blow rather than after it.
+// Fill all five pools before the first blow rather than after it. That
+// is five concurrent chat requests against whatever service the operator
+// configured; they are deliberately not staggered, and a provider that
+// rate-limits us will show up as failed refills in `show melee llm`.
 void
 melee_llm_prime(const melee_tunables_t *t)
 {
@@ -789,6 +812,6 @@ melee_llm_prime(const melee_tunables_t *t)
   clam(CLAM_INFO, MELEE_CTX, "flavour: priming from model '%s'",
       t->llm_model);
 
-  for(cat = MELEE_FLAV_HIT; cat < MELEE_FLAV__COUNT; cat++)
+  for(cat = MELEE_FLAV_MINOR; cat < MELEE_FLAV__COUNT; cat++)
     melee_llm_refill_kick(cat, t);
 }

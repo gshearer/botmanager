@@ -33,6 +33,13 @@
 #define MELEE_KV_CRIT_PCT    "plugin.melee.crit_chance_pct"
 #define MELEE_KV_CRIT_MIN    "plugin.melee.crit_min"
 #define MELEE_KV_CRIT_MAX    "plugin.melee.crit_max"
+
+// Severity banding: the percentage of the heaviest possible blow at
+// which each tier BEGINS. Below the first is minor.
+#define MELEE_KV_SEV_MEDIUM  "plugin.melee.sev.medium_at"
+#define MELEE_KV_SEV_MAJOR   "plugin.melee.sev.major_at"
+#define MELEE_KV_SEV_CRIT    "plugin.melee.sev.critical_at"
+
 #define MELEE_KV_TIMEOUT     "plugin.melee.round_timeout"
 #define MELEE_KV_EJECT       "plugin.melee.eject_on_death"
 #define MELEE_KV_SCORE_ROWS  "plugin.melee.scoreboard_rows"
@@ -83,12 +90,19 @@
 // Longest model name the llm subsystem will hand back.
 #define MELEE_LLM_MODEL_SZ   64
 
-// The three independent flavour pools. The order is used as an array
-// index; keep the enum and every table keyed by it in step.
+// The five independent flavour pools: four damage tiers plus the killing
+// blow. The order is used as an array index AND as the severity ordering
+// itself (MINOR < MEDIUM < MAJOR < CRITICAL); keep the enum and every
+// table keyed by it in step. MELEE_FLAV_DEATH must stay last — the
+// sanitiser's one special case keys off it, and the four damage tiers
+// must be contiguous and ascending for melee_severity() to return them
+// as an ordering.
 typedef enum
 {
-  MELEE_FLAV_HIT = 0,
-  MELEE_FLAV_CRIT,
+  MELEE_FLAV_MINOR = 0,
+  MELEE_FLAV_MEDIUM,
+  MELEE_FLAV_MAJOR,
+  MELEE_FLAV_CRITICAL,
   MELEE_FLAV_DEATH,
   MELEE_FLAV__COUNT
 } melee_flavour_t;
@@ -108,6 +122,9 @@ typedef struct
   uint32_t crit_pct;         // percent chance a blow lands critical
   uint32_t crit_min;         // critical damage floor
   uint32_t crit_max;         // critical damage ceiling (>= crit_min)
+  uint32_t sev_medium_at;    // pct of the heaviest blow: medium begins
+  uint32_t sev_major_at;     // ... major begins    (> sev_medium_at)
+  uint32_t sev_crit_at;      // ... critical begins (> sev_major_at)
   uint32_t round_timeout;    // seconds of silence before a round is cold
   uint32_t scoreboard_rows;  // rows shown by `show melee scores`
   bool     eject_on_death;   // remove the fallen where the method allows
@@ -292,12 +309,27 @@ bool melee_db_deadliest(uint32_t ns_id, char *by, size_t by_cap,
 // Roll one blow. *crit_out reports whether it landed critical.
 int32_t melee_roll(const melee_tunables_t *t, bool *crit_out);
 
+// The heaviest damage the current tunables can roll — the reference the
+// severity band is a percentage OF. Never returns 0; the band divides
+// by it.
+int32_t melee_dmg_ceiling(const melee_tunables_t *t);
+
+// Which of the four damage tiers `dmg` belongs to, by percentage of
+// melee_dmg_ceiling(). Never returns MELEE_FLAV_DEATH — a fatal blow
+// still renders its own tier, and the death LINE is a separate pool.
+melee_flavour_t melee_severity(const melee_tunables_t *t, int32_t dmg);
+
 // Both renderers consult the flavour pool first and fall back to the
 // static tables. `need_refill` (may be NULL) reports that the pool they
 // drew from has reached its low-water mark; the CALLER kicks the refill,
 // after the turn lock is released.
+//
+// The blow takes no `crit` flag: the words, the colour and the emoji all
+// come from melee_severity(t, dmg). The crit roll still widens the
+// damage band and still feeds the scoreboard — it simply no longer
+// chooses the sentence.
 void melee_render_blow(char *out, size_t cap, const char *atk_nick,
-    const char *tgt_nick, int32_t dmg, bool crit, int32_t hp,
+    const char *tgt_nick, int32_t dmg, int32_t hp,
     int32_t hp_max, const melee_tunables_t *t, bool *need_refill);
 
 void melee_render_death(char *out, size_t cap, const char *slayer_nick,
@@ -335,7 +367,7 @@ void melee_pool_fallback(void);
 // inspectable rather than argued.
 void melee_llm_refill_kick(melee_flavour_t cat, const melee_tunables_t *t);
 
-// Fill all three pools at startup, so the pit is flavoured before the
+// Fill all five pools at startup, so the pit is flavoured before the
 // first blow rather than after it.
 void melee_llm_prime(const melee_tunables_t *t);
 

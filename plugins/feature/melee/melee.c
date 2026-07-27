@@ -33,6 +33,15 @@ static const plugin_kv_entry_t melee_kv_schema[] = {
     "Minimum critical-hit damage" },
   { MELEE_KV_CRIT_MAX,   KV_UINT32, "20",
     "Maximum critical-hit damage" },
+  { MELEE_KV_SEV_MEDIUM, KV_UINT32, "25",
+    "Percent of the heaviest possible blow at which a hit reads as "
+    "'medium' rather than 'minor'" },
+  { MELEE_KV_SEV_MAJOR,  KV_UINT32, "50",
+    "Percent of the heaviest possible blow at which a hit reads as "
+    "'major'" },
+  { MELEE_KV_SEV_CRIT,   KV_UINT32, "75",
+    "Percent of the heaviest possible blow at which a hit reads as "
+    "'critical'" },
   { MELEE_KV_TIMEOUT,    KV_UINT32, "1800",
     "Seconds of inactivity before a round is abandoned" },
   { MELEE_KV_EJECT,      KV_UINT8,  "1",
@@ -101,6 +110,19 @@ melee_tunables_load(melee_tunables_t *out)
 
   if(out->crit_max < out->crit_min)
     out->crit_max = out->crit_min;
+
+  out->sev_medium_at = melee_clamp(kv_get_uint(MELEE_KV_SEV_MEDIUM), 1, 98);
+  out->sev_major_at  = melee_clamp(kv_get_uint(MELEE_KV_SEV_MAJOR),  1, 99);
+  out->sev_crit_at   = melee_clamp(kv_get_uint(MELEE_KV_SEV_CRIT),   1, 100);
+
+  // Strictly ascending, or a tier would be unreachable and the pool
+  // behind it would fill with lines nothing ever speaks. The 98/99/100
+  // ceilings above are what make both corrections safe.
+  if(out->sev_major_at <= out->sev_medium_at)
+    out->sev_major_at = out->sev_medium_at + 1;
+
+  if(out->sev_crit_at <= out->sev_major_at)
+    out->sev_crit_at = out->sev_major_at + 1;
 
   // Flavour authorship. kv_get_str returns NULL for an unset key, which
   // is the shipped state of the model key and simply means "off".
