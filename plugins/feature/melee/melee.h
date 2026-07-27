@@ -56,6 +56,16 @@
 #define MELEE_KV_LLM_TIMEOUT "plugin.melee.llm.timeout_secs"
 #define MELEE_KV_LLM_RETRY   "plugin.melee.llm.retry_secs"
 
+// Damage over time: a wound that keeps working after the blow that made
+// it. `dot.chance_pct` at 0 turns the whole feature off.
+#define MELEE_KV_DOT_CHANCE  "plugin.melee.dot.chance_pct"
+#define MELEE_KV_DOT_MIN     "plugin.melee.dot.min_secs"
+#define MELEE_KV_DOT_MAX     "plugin.melee.dot.max_secs"
+#define MELEE_KV_DOT_TICK    "plugin.melee.dot.tick_secs"
+#define MELEE_KV_DOT_DMG     "plugin.melee.dot.tick_dmg_max"
+#define MELEE_KV_DOT_STACK   "plugin.melee.dot.stack_max"
+#define MELEE_KV_DOT_LINGER  "plugin.melee.dot.linger_secs"
+
 // Storage bounds. The table prefix is a SQL identifier, so it is
 // validated as strict alnum/underscore before it can reach a query.
 #define MELEE_PREFIX_SZ      32                 // table-name prefix
@@ -107,6 +117,25 @@ typedef enum
   MELEE_FLAV__COUNT
 } melee_flavour_t;
 
+// The afflictions a blow may leave behind. The kind is chosen at inflict
+// time and stored on the row, because it is what makes the words
+// specific: the flavour layer substitutes its name rather than keeping a
+// pool per affliction.
+typedef enum
+{
+  MELEE_DOT_BLEED = 0,
+  MELEE_DOT_VENOM,
+  MELEE_DOT_ACID,
+  MELEE_DOT_SPORES,
+  MELEE_DOT_CHILL,
+  MELEE_DOT__COUNT
+} melee_dot_kind_t;
+
+// Damage-over-time lifecycle, as stored in <prefix>_dots.state.
+#define MELEE_DOT_LIVE      0   // still ticking
+#define MELEE_DOT_SPENT     1   // ran its course, or landed the death blow
+#define MELEE_DOT_CANCELLED 2   // the round ended out from under it
+
 // Round lifecycle, as stored in <prefix>_rounds.state.
 #define MELEE_ROUND_ACTIVE    0
 #define MELEE_ROUND_ENDED     1
@@ -140,15 +169,26 @@ typedef struct
   uint32_t llm_max_tokens;   // ceiling per refill request
   uint32_t llm_timeout;      // seconds per refill request
   uint32_t llm_retry;        // seconds a failed category waits
+
+  // Damage over time. `dot_chance_pct` 0 is the off switch and is
+  // checked before anything else on the inflict path.
+  uint32_t dot_chance_pct;   // percent chance a non-fatal blow afflicts
+  uint32_t dot_min_secs;     // shortest an affliction lasts
+  uint32_t dot_max_secs;     // longest (>= dot_min_secs)
+  uint32_t dot_tick_secs;    // seconds between decay ticks (<= min_secs)
+  uint32_t dot_tick_dmg_max; // a tick rolls 1..N damage
+  uint32_t dot_stack_max;    // afflictions one victim may carry at once
+  uint32_t dot_linger_secs;  // decay task's idle life after the last DOT
 } melee_tunables_t;
 
-// The three table names for the configured prefix, resolved together so
+// The four table names for the configured prefix, resolved together so
 // the prefix is validated exactly once per operation.
 typedef struct
 {
   char rounds [MELEE_TABLE_SZ];
   char players[MELEE_TABLE_SZ];
   char scores [MELEE_TABLE_SZ];
+  char dots   [MELEE_TABLE_SZ];
 } melee_tables_t;
 
 // A brawl in progress, as the turn engine needs to see it.
@@ -334,6 +374,20 @@ void melee_render_blow(char *out, size_t cap, const char *atk_nick,
 
 void melee_render_death(char *out, size_t cap, const char *slayer_nick,
     const char *fallen_nick, const melee_tunables_t *t, bool *need_refill);
+
+// The trout: a critical blow that kills speaks one fixed sentence in
+// place of the tier line. A static easter egg — never model-authored,
+// never pooled, and so it takes no tunables and flags no refill.
+void melee_render_trout(char *out, size_t cap, const char *atk_nick,
+    const char *tgt_nick, int32_t dmg);
+
+// How an affliction presents itself: the bare noun substituted into a
+// line, the single-column glyph that marks a victim on the round card,
+// and the colour both are drawn in. Out-of-range kinds return the first
+// entry rather than reading past the tables.
+const char *melee_dot_name_of (melee_dot_kind_t kind);
+const char *melee_dot_emoji_of(melee_dot_kind_t kind);
+const char *melee_dot_color_of(melee_dot_kind_t kind);
 
 // ---- LLM-authored flavour (melee_llm.c) ---------------------------- //
 

@@ -71,6 +71,23 @@ static const plugin_kv_entry_t melee_kv_schema[] = {
     "Per-refill request timeout" },
   { MELEE_KV_LLM_RETRY,   KV_UINT32, "300",
     "Seconds to wait before retrying a category whose refill failed" },
+
+  { MELEE_KV_DOT_CHANCE,  KV_UINT32, "25",
+    "Percent chance a landing, non-fatal blow leaves an affliction that "
+    "keeps dealing damage; 0 disables the feature entirely" },
+  { MELEE_KV_DOT_MIN,     KV_UINT32, "5",
+    "Shortest an affliction lasts, in seconds" },
+  { MELEE_KV_DOT_MAX,     KV_UINT32, "60",
+    "Longest an affliction lasts, in seconds" },
+  { MELEE_KV_DOT_TICK,    KV_UINT32, "5",
+    "Seconds between the ticks of an affliction" },
+  { MELEE_KV_DOT_DMG,     KV_UINT32, "3",
+    "Maximum damage one tick of an affliction deals (rolls 1..N)" },
+  { MELEE_KV_DOT_STACK,   KV_UINT32, "1",
+    "Afflictions one combatant may carry at once within a round" },
+  { MELEE_KV_DOT_LINGER,  KV_UINT32, "3600",
+    "Seconds the decay task stays queued after the last affliction "
+    "clears, before it removes itself" },
 };
 
 // ------------------------------------------------------------------ //
@@ -148,6 +165,27 @@ melee_tunables_load(melee_tunables_t *out)
   // pool size would re-arm a refill the instant one completed, forever.
   out->llm_refill_at  = melee_clamp(kv_get_uint(MELEE_KV_LLM_REFILL), 1,
                                     out->llm_pool - 1);
+
+  // Damage over time. Zero chance is legal — it is the off switch — but
+  // every duration below it must be a usable number.
+  out->dot_chance_pct   = melee_clamp(kv_get_uint(MELEE_KV_DOT_CHANCE), 0, 100);
+  out->dot_min_secs     = melee_clamp(kv_get_uint(MELEE_KV_DOT_MIN),    1, 3600);
+  out->dot_max_secs     = melee_clamp(kv_get_uint(MELEE_KV_DOT_MAX),    1, 86400);
+  out->dot_tick_secs    = melee_clamp(kv_get_uint(MELEE_KV_DOT_TICK),   1, 300);
+  out->dot_tick_dmg_max = melee_clamp(kv_get_uint(MELEE_KV_DOT_DMG),    1, 1000);
+  out->dot_stack_max    = melee_clamp(kv_get_uint(MELEE_KV_DOT_STACK),  1, 4);
+  out->dot_linger_secs  = melee_clamp(kv_get_uint(MELEE_KV_DOT_LINGER),
+                                      60, 86400);
+
+  // The same correction crit_max gets, for the same reason: a random
+  // width of max - min + 1 must never be computed from an inverted band.
+  if(out->dot_max_secs < out->dot_min_secs)
+    out->dot_max_secs = out->dot_min_secs;
+
+  // A cadence slower than the shortest affliction would mint DOTs that
+  // expire before they ever speak. Silently lower it, as everywhere else.
+  if(out->dot_tick_secs > out->dot_min_secs)
+    out->dot_tick_secs = out->dot_min_secs;
 }
 
 // ------------------------------------------------------------------ //

@@ -158,6 +158,58 @@ static const char *const melee_tier_emoji[MELEE_FLAV_DEATH] = {
 };
 
 // ------------------------------------------------------------------ //
+// Afflictions                                                         //
+// ------------------------------------------------------------------ //
+
+// Three parallel tables keyed by melee_dot_kind_t, in the shape the tier
+// tables above already establish. The name is the bare noun a line
+// substitutes for {affliction}: lower case, no article, no colour — the
+// renderer colorizes it.
+static const char *const melee_dot_name[MELEE_DOT__COUNT] = {
+  "open wound", "spider venom", "ochre burn", "myconid spores",
+  "necrotic chill"
+};
+
+// Every glyph here must occupy exactly ONE display column, or
+// melee_vis_len() starts lying and the round card skews. All five are
+// plain U+27xx/U+26xx symbols: no variation selectors, no
+// emoji-presentation code points.
+static const char *const melee_dot_emoji[MELEE_DOT__COUNT] = {
+  "✚", "☣", "⚗", "✺", "❆"
+};
+
+static const char *const melee_dot_color[MELEE_DOT__COUNT] = {
+  CLR_RED, CLR_GREEN, CLR_ORANGE, CLR_YELLOW, CLR_CYAN
+};
+
+// A kind arrives from a database column, so it is input like any other:
+// an out-of-range value falls back to the first entry rather than
+// indexing past the table.
+static melee_dot_kind_t
+melee_dot_clamp(melee_dot_kind_t kind)
+{
+  return((kind >= 0 && kind < MELEE_DOT__COUNT) ? kind : MELEE_DOT_BLEED);
+}
+
+const char *
+melee_dot_name_of(melee_dot_kind_t kind)
+{
+  return(melee_dot_name[melee_dot_clamp(kind)]);
+}
+
+const char *
+melee_dot_emoji_of(melee_dot_kind_t kind)
+{
+  return(melee_dot_emoji[melee_dot_clamp(kind)]);
+}
+
+const char *
+melee_dot_color_of(melee_dot_kind_t kind)
+{
+  return(melee_dot_color[melee_dot_clamp(kind)]);
+}
+
+// ------------------------------------------------------------------ //
 // The roll                                                            //
 // ------------------------------------------------------------------ //
 
@@ -288,6 +340,26 @@ melee_render_blow(char *out, size_t cap, const char *atk_nick,
 
   else
     snprintf(out, cap, "%s%s", melee_tier_emoji[sev], body);
+}
+
+// The oldest joke on IRC, kept for the one blow that earns it: a
+// critical that kills. It stands where the tier line would have stood —
+// it is the line that carries the number — and the ordinary death line
+// still follows it, so the death-line-before-eject law is untouched. No
+// pool is consulted and none is owed a refill; no health tail, because a
+// fatal blow carries no tally.
+void
+melee_render_trout(char *out, size_t cap, const char *atk_nick,
+    const char *tgt_nick, int32_t dmg)
+{
+  if(out == NULL || cap == 0)
+    return;
+
+  snprintf(out, cap,
+      "%s" CLR_CYAN "%s" CLR_RESET " slaps " CLR_PURPLE "%s" CLR_RESET
+      " across the face with a large trout for %s%d" CLR_RESET " damage!",
+      melee_tier_emoji[MELEE_FLAV_CRITICAL], atk_nick, tgt_nick,
+      melee_tier_color[MELEE_FLAV_CRITICAL], dmg);
 }
 
 void

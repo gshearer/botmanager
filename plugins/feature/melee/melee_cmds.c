@@ -265,8 +265,15 @@ melee_cmd_attack(const cmd_ctx_t *ctx)
   // ---- 10. announce, still under the lock so two turns cannot ------- //
   //          interleave their narration                               //
 
-  melee_render_blow(line, sizeof(line), atk_nick, nick, dmg,
-      new_hp, tgt.hp_max, &t, &refill_blow);
+  // A critical that kills gets the trout instead of the tier line. It
+  // draws from no pool, so `refill_blow` correctly stays false.
+  if(crit && fatal)
+    melee_render_trout(line, sizeof(line), atk_nick, nick, dmg);
+
+  else
+    melee_render_blow(line, sizeof(line), atk_nick, nick, dmg,
+        new_hp, tgt.hp_max, &t, &refill_blow);
+
   cmd_reply(ctx, line);
 
   if(fatal)

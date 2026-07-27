@@ -66,6 +66,7 @@ melee_tables_resolve(melee_tables_t *out)
   snprintf(out->rounds,  sizeof(out->rounds),  "%s_rounds",  prefix);
   snprintf(out->players, sizeof(out->players), "%s_players", prefix);
   snprintf(out->scores,  sizeof(out->scores),  "%s_scores",  prefix);
+  snprintf(out->dots,    sizeof(out->dots),    "%s_dots",    prefix);
 
   return(SUCCESS);
 }
@@ -213,10 +214,56 @@ melee_schema_ensure(void)
   if(melee_run_ddl(sql) != SUCCESS)
     goto out;
 
+  // An affliction left by a blow, decaying on its own clock. `method`
+  // and `channel` are denormalised onto the row on purpose: the decay
+  // task holds no command context and no round, and must be able to
+  // address a room from a bare row.
+  snprintf(sql, sizeof(sql),
+      "CREATE TABLE IF NOT EXISTS %s ("
+      " id          BIGSERIAL    PRIMARY KEY,"
+      " round_id    BIGINT       NOT NULL REFERENCES %s(id) ON DELETE CASCADE,"
+      " ns_id       INTEGER      NOT NULL,"
+      " method      VARCHAR(64)  NOT NULL DEFAULT '',"
+      " channel     VARCHAR(128) NOT NULL DEFAULT '',"
+      " victim      VARCHAR(31)  NOT NULL,"
+      " victim_nick VARCHAR(64)  NOT NULL DEFAULT '',"
+      " source      VARCHAR(31)  NOT NULL,"
+      " source_nick VARCHAR(64)  NOT NULL DEFAULT '',"
+      " kind        SMALLINT     NOT NULL DEFAULT 0,"
+      " state       SMALLINT     NOT NULL DEFAULT 0,"
+      " ticks       INTEGER      NOT NULL DEFAULT 0,"
+      " dmg_total   INTEGER      NOT NULL DEFAULT 0,"
+      " next_tick   TIMESTAMPTZ  NOT NULL DEFAULT NOW(),"
+      " expires_at  TIMESTAMPTZ  NOT NULL DEFAULT NOW(),"
+      " created_at  TIMESTAMPTZ  NOT NULL DEFAULT NOW()"
+      ")", t.dots, t.rounds);
+
+  if(melee_run_ddl(sql) != SUCCESS)
+    goto out;
+
+  // The decay task's whole query plan: a range scan over live rows due
+  // now. Do not drop it.
+  snprintf(sql, sizeof(sql),
+      "CREATE INDEX IF NOT EXISTS idx_%s_due ON %s(next_tick) WHERE state = 0",
+      t.dots, t.dots);
+
+  if(melee_run_ddl(sql) != SUCCESS)
+    goto out;
+
+  // What the stack cap counts, and what the round card asks for.
+  snprintf(sql, sizeof(sql),
+      "CREATE INDEX IF NOT EXISTS idx_%s_victim"
+      " ON %s(round_id, victim) WHERE state = 0",
+      t.dots, t.dots);
+
+  if(melee_run_ddl(sql) != SUCCESS)
+    goto out;
+
   melee_schema_done = true;
   ok = SUCCESS;
-  clam(CLAM_INFO, MELEE_CTX, "melee schema ready (tables '%s', '%s', '%s')",
-      t.rounds, t.players, t.scores);
+  clam(CLAM_INFO, MELEE_CTX,
+      "melee schema ready (tables '%s', '%s', '%s', '%s')",
+      t.rounds, t.players, t.scores, t.dots);
 
 out:
   pthread_mutex_unlock(&melee_schema_lock);
