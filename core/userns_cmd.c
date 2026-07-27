@@ -130,7 +130,8 @@ static const cmd_arg_desc_t ad_user_delns[] = {
 
 // /set user subcommand argument descriptors.
 static const cmd_arg_desc_t ad_set_user_pass[] = {
-  { "password", CMD_ARG_NONE, CMD_ARG_REQUIRED | CMD_ARG_REST, 0, NULL },
+  { "oldpassword", CMD_ARG_NONE, CMD_ARG_REQUIRED,                0, NULL },
+  { "newpassword", CMD_ARG_NONE, CMD_ARG_REQUIRED | CMD_ARG_REST, 0, NULL },
 };
 
 static const cmd_arg_desc_t ad_set_user_groupdesc[] = {
@@ -970,18 +971,23 @@ static void
 cmd_set_user_parent(const cmd_ctx_t *ctx)
 {
   cmd_reply(ctx, "usage: /set user <subcommand>");
-  cmd_reply(ctx, "  pass <password>                 — change your password");
+  cmd_reply(ctx, "  pass <oldpassword> <newpassword> — change your password");
   cmd_reply(ctx, "  groupdesc <group> <description> — set group description");
 }
 
-// /set user pass <password> — change the authenticated user's password
+// /set user pass <oldpassword> <newpassword> — change the authenticated
+// user's own password. The current password must be supplied and verify:
+// an authenticated session alone is not sufficient authority to rotate a
+// credential. Administrative reset without the old password lives in
+// /user add and the register command, not here.
 
 static void
 cmd_set_user_pass(const cmd_ctx_t *ctx)
 {
   userns_t   *ns;
   const char *username;
-  const char *password;
+  const char *old_password;
+  const char *new_password;
 
   ns = userns_session_resolve(ctx);
 
@@ -996,13 +1002,23 @@ cmd_set_user_pass(const cmd_ctx_t *ctx)
     return;
   }
 
-  password = ctx->parsed->argv[0];
+  old_password = ctx->parsed->argv[0];
+  new_password = ctx->parsed->argv[1];
 
-  if(userns_user_reset_password(ns, username, password) == SUCCESS)
+  // Policy is checked here as well as inside the setter so a rejected
+  // new password is distinguishable from a wrong current password.
+  if(userns_password_check(new_password) != SUCCESS)
+  {
+    cmd_reply(ctx, "new password does not meet the password policy");
+    return;
+  }
+
+  if(userns_user_set_password(ns, username, old_password,
+        new_password) == SUCCESS)
     cmd_reply(ctx, "password changed");
 
   else
-    cmd_reply(ctx, "failed to change password (policy violation?)");
+    cmd_reply(ctx, "failed to change password — current password incorrect");
 }
 
 // /set user groupdesc <groupname> <description>
@@ -1204,12 +1220,13 @@ userns_register_commands(void)
       cmd_set_user_parent, NULL, "set", "u", NULL, 0, NULL, NULL);
 
   cmd_register("userns", "pass",
-      "set user pass <password>",
+      "set user pass <oldpassword> <newpassword>",
       "Change your password",
       "Changes the password for the currently authenticated user.\n"
-      "The new password must meet the password policy.",
+      "The current password must be supplied and verify, and the new\n"
+      "password must meet the password policy.",
       USERNS_GROUP_USER, 0, CMD_SCOPE_ANY, METHOD_T_ANY,
-      cmd_set_user_pass, NULL, "set/user", NULL, ad_set_user_pass, 1, NULL, NULL);
+      cmd_set_user_pass, NULL, "set/user", NULL, ad_set_user_pass, 2, NULL, NULL);
 
   cmd_register("userns", "groupdesc",
       "set user groupdesc <group> <description>",
