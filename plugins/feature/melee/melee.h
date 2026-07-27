@@ -21,6 +21,7 @@
 #include "plugin.h"
 #include "userns.h"
 
+#include <pthread.h>
 #include <stdint.h>
 
 // CLAM context (registered in CLAM.md).
@@ -73,6 +74,7 @@
 #define MELEE_USER_SZ        USERNS_USER_SZ     // 31
 #define MELEE_NICK_SZ        METHOD_NICKNAME_SZ // 64
 #define MELEE_CHAN_SZ        METHOD_CHANNEL_SZ  // 128
+#define MELEE_METHOD_SZ      64                 // method instance name
 #define MELEE_MAX_PLAYERS    32                 // per round, for the show card
 // The ceiling melee_tunables_load() clamps scoreboard_rows to. The
 // leaderboard's row array is sized from this, so the two must agree.
@@ -250,10 +252,12 @@ typedef struct
   char    fallen[MELEE_USER_SZ];
 } melee_card_t;
 
-// One combatant's row on the round card.
+// One combatant's row on the round card. `user` is the identity the
+// affliction markers are matched on — it is never rendered.
 typedef struct
 {
   char    name[MELEE_NICK_SZ];
+  char    user[MELEE_USER_SZ];
   int32_t hp;
   int32_t hp_max;
   int32_t dmg_given;
@@ -275,7 +279,84 @@ typedef struct
   int32_t best_crit;
 } melee_score_row_t;
 
+// The afflictions one combatant carries right now, for the round card.
+// `n` is bounded by the stack cap, which melee_tunables_load() clamps to
+// MELEE_DOT_STACK_CAP.
+#define MELEE_DOT_STACK_CAP 4
+
+typedef struct
+{
+  char             victim[MELEE_USER_SZ];
+  melee_dot_kind_t kinds[MELEE_DOT_STACK_CAP];
+  uint32_t         n;
+} melee_dot_mark_t;
+
+// How many afflictions one decay iteration may service — and so how
+// much it may say into a channel in one pass. Anything over the bound
+// waits for the next tick rather than flooding the room.
+#define MELEE_DOT_BATCH 32
+
+// Mid-range: the pit's decay is neither urgent nor background scavenging.
+#define MELEE_DOT_PRIO  128
+
+// One live affliction, due now, as the decay task sees it. `method` and
+// `channel` come off the row itself: the task holds no command context
+// and no round, and must address a room from a bare row.
+typedef struct
+{
+  int64_t          id;
+  int64_t          round_id;
+  uint32_t         ns_id;
+  char             method [MELEE_METHOD_SZ];
+  char             channel[MELEE_CHAN_SZ];
+  char             victim [MELEE_USER_SZ];
+  char             victim_nick[MELEE_NICK_SZ];
+  char             source [MELEE_USER_SZ];
+  char             source_nick[MELEE_NICK_SZ];
+  melee_dot_kind_t kind;
+  bool             expired;   // this is the last tick it will ever take
+} melee_dot_due_t;
+
+// One decay tick, resolved and ready to be written.
+typedef struct
+{
+  int64_t     dot_id;
+  int64_t     round_id;
+  uint32_t    ns_id;
+  const char *victim;
+  const char *source;
+  int32_t     dmg;
+  uint32_t    tick_secs;
+  bool        last;      // the affliction is spent after this tick
+  bool        fatal;     // this tick takes the victim to 0 hp
+} melee_dot_hit_t;
+
+// One affliction about to be inflicted. Like melee_blow_t, the `*_nick`
+// names are display-only and the usernames are the identity of record.
+typedef struct
+{
+  int64_t          round_id;
+  uint32_t         ns_id;
+  const char      *method;
+  const char      *channel;
+  const char      *victim;
+  const char      *victim_nick;
+  const char      *source;
+  const char      *source_nick;
+  melee_dot_kind_t kind;
+  uint32_t         secs;       // total lifetime
+  uint32_t         tick_secs;  // cadence, and so the first tick's delay
+  uint32_t         stack_max;  // enforced in SQL, not read-then-write
+} melee_dot_new_t;
+
 // ---- Plugin core (melee.c) ----------------------------------------- //
+
+// Serialises everything that mutates a round: the turn engine's steps
+// 5-10 and, on the other side of the plugin, every decay tick — a tick
+// decrements the same health a blow does. Defined in melee_cmds.c. The
+// lock ordering is melee_turn_lock -> melee_pool_lock, never the
+// reverse, and neither is ever held across a send.
+extern pthread_mutex_t melee_turn_lock;
 
 void melee_tunables_load(melee_tunables_t *out);
 
@@ -318,6 +399,42 @@ bool melee_db_pending(int64_t round_id, int32_t wave, char *out,
 // nothing; a daemon death mid-turn can never leave the attacker charged
 // for a blow the target never took.
 bool melee_db_blow_apply(const melee_blow_t *blow);
+
+// Leave an affliction on a combatant. The stack cap is enforced inside
+// the statement, so at the cap this lands no row and returns FAIL — the
+// intended silence, not an error. SUCCESS means a row landed and the
+// caller owes the room an inflict line.
+bool melee_db_dot_inflict(const melee_dot_new_t *dot);
+
+// Who in this round is currently afflicted, and with what. Returns the
+// number of victims written, at most `cap`.
+uint32_t melee_db_dot_marks(int64_t round_id, melee_dot_mark_t *out,
+    uint32_t cap);
+
+// Afflictions due a tick right now, oldest deadline first, at most
+// `cap`. Only rows whose round is still active are returned — an
+// affliction dies with its round.
+uint32_t melee_db_dot_due(melee_dot_due_t *out, uint32_t cap);
+
+// How many afflictions are still live in a still-active round. The
+// decay task asks only when nothing was due, so that a long affliction
+// waiting for its first tick cannot start the idle clock.
+uint32_t melee_db_dot_live(void);
+
+// Retire every live affliction whose round has ended or been abandoned.
+// Without this the idle counter could never reach zero.
+bool melee_db_dot_sweep(void);
+
+// Retire one affliction the decay task could not act on — an absent
+// method, a victim already dead.
+bool melee_db_dot_cancel(int64_t dot_id);
+
+// Write one decay tick as one transaction: the victim's health, both
+// damage tallies in both tables, the affliction's own counters and next
+// deadline, and — only when the tick is fatal — the round close and the
+// kill/death tally. A tick never touches last_wave, blows, crits or the
+// round's wave: decay is not a swing.
+bool melee_db_dot_tick(const melee_dot_hit_t *hit);
 
 // ---- DB reads for the views (melee_db.c) --------------------------- //
 
@@ -385,9 +502,39 @@ void melee_render_trout(char *out, size_t cap, const char *atk_nick,
 // line, the single-column glyph that marks a victim on the round card,
 // and the colour both are drawn in. Out-of-range kinds return the first
 // entry rather than reading past the tables.
+// The line that announces a fresh affliction, spoken right after the
+// blow that left it. It never names the duration: the pit does not tell
+// you how long you have.
+void melee_render_dot_inflict(char *out, size_t cap, const char *atk_nick,
+    const char *tgt_nick, melee_dot_kind_t kind);
+
+// One tick of an affliction doing its slow work, and the tick that
+// finishes what a blade started. The tick carries the survivor's health
+// tally, exactly as a blow line does, so decay reads as a peer of a
+// blow; the death line carries none.
+void melee_render_dot_tick(char *out, size_t cap, const char *src_nick,
+    const char *tgt_nick, int32_t dmg, int32_t hp, int32_t hp_max,
+    melee_dot_kind_t kind);
+
+void melee_render_dot_death(char *out, size_t cap, const char *src_nick,
+    const char *tgt_nick, melee_dot_kind_t kind);
+
 const char *melee_dot_name_of (melee_dot_kind_t kind);
 const char *melee_dot_emoji_of(melee_dot_kind_t kind);
 const char *melee_dot_color_of(melee_dot_kind_t kind);
+
+// ---- The decay task (melee_dot.c) ---------------------------------- //
+
+// Start the decay task if it is not already queued, and clear its idle
+// clock either way. Called after an affliction lands, OUTSIDE the turn
+// lock — the same discipline that keeps the flavour refill off the turn
+// path.
+void melee_dot_wake(void);
+
+// Cancel the decay task and forget its handle. melee_deinit() MUST call
+// this: a periodic callback pointing into an unloaded .so is a jump into
+// freed memory on the next tick.
+void melee_dot_stop(void);
 
 // ---- LLM-authored flavour (melee_llm.c) ---------------------------- //
 

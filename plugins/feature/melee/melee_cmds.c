@@ -13,6 +13,7 @@
 
 #include "bot.h"
 #include "colors.h"
+#include "util.h"
 
 #include <inttypes.h>
 #include <pthread.h>
@@ -23,8 +24,9 @@
 // Serialises steps 5-10 of a turn: load the round, enrol, gate the wave,
 // roll, write, announce. Target resolution and the presence probe run
 // *outside* it — they mutate nothing and would only widen the window
-// while holding a lock the method drivers know nothing about.
-static pthread_mutex_t melee_turn_lock = PTHREAD_MUTEX_INITIALIZER;
+// while holding a lock the method drivers know nothing about. The decay
+// task takes the same lock for the same reason (see melee.h).
+pthread_mutex_t melee_turn_lock = PTHREAD_MUTEX_INITIALIZER;
 
 // ------------------------------------------------------------------ //
 // Resolution helpers                                                  //
@@ -111,6 +113,7 @@ melee_cmd_attack(const cmd_ctx_t *ctx)
   bool              fatal = false;
   bool              refill_blow  = false;   // the blow's own category
   bool              refill_death = false;   // DEATH, on a fatal blow
+  bool              afflicted    = false;   // a DOT landed; wake the decay
 
   ns = userns_session_resolve(ctx);
 
@@ -282,6 +285,47 @@ melee_cmd_attack(const cmd_ctx_t *ctx)
     cmd_reply(ctx, line);
   }
 
+  // ---- the affliction ----------------------------------------------- //
+  // Still under the lock: it mutates round state, and the inflict line
+  // must not interleave with another turn's narration. Never on a fatal
+  // blow — the round ends in the same transaction as the kill, and a DOT
+  // on a corpse would have to be reaped one tick later, speaking into a
+  // round that is already over.
+
+  if(t.dot_chance_pct > 0 && !fatal &&
+     util_rand(100) < (int)t.dot_chance_pct)
+  {
+    melee_dot_new_t dot = {
+      .round_id    = round.id,
+      .ns_id       = ns->id,
+      .method      = method,
+      .channel     = channel,
+      .victim      = tgt_user,
+      .victim_nick = nick,
+      .source      = ctx->username,
+      .source_nick = atk_nick,
+      .kind        = (melee_dot_kind_t)util_rand(MELEE_DOT__COUNT),
+      .secs        = t.dot_min_secs +
+                     (uint32_t)util_rand((int)(t.dot_max_secs -
+                                               t.dot_min_secs) + 1),
+      .tick_secs   = t.dot_tick_secs,
+      .stack_max   = t.dot_stack_max,
+    };
+
+    // Fails soft, and silently at the stack cap: an affliction is
+    // cosmetic and may never cost a blow.
+    if(melee_db_dot_inflict(&dot) == SUCCESS)
+    {
+      melee_render_dot_inflict(line, sizeof(line), atk_nick, nick, dot.kind);
+      cmd_reply(ctx, line);
+      afflicted = true;
+    }
+
+    else
+      clam(CLAM_DEBUG, MELEE_CTX,
+          "round %" PRId64 ": no affliction landed on %s", round.id, tgt_user);
+  }
+
   pthread_mutex_unlock(&melee_turn_lock);
 
   // ---- the door ----------------------------------------------------- //
@@ -307,6 +351,13 @@ melee_cmd_attack(const cmd_ctx_t *ctx)
     clam(CLAM_INFO, MELEE_CTX, "round %" PRId64 ": %s slew %s (eject=%d)",
         round.id, ctx->username, tgt_user, (int)force);
   }
+
+  // ---- the decay -------------------------------------------------- //
+  // Outside the turn lock, like the refill below: the task system is
+  // deliberately kept off the turn path entirely.
+
+  if(afflicted)
+    melee_dot_wake();
 
   // ---- the flavour refill ------------------------------------------- //
   // Last, with no lock held and the turn already over. The renderers

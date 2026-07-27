@@ -182,6 +182,101 @@ static const char *const melee_dot_color[MELEE_DOT__COUNT] = {
   CLR_RED, CLR_GREEN, CLR_ORANGE, CLR_YELLOW, CLR_CYAN
 };
 
+// FORMAT CONTRACT: every entry in all five tables below takes exactly
+// two `const char *` — attacker, then target. The affliction names
+// itself in the words, so there is no {affliction} slot and no damage:
+// the tick lines carry the numbers, this one only says it has begun.
+// Short, deliberately — a blow line is already on screen above it.
+static const char *const melee_dot_bleed[] = {
+  "%s's cut will not close; %s is bleeding.",
+  "%s opens a vein and leaves it open — %s is losing blood.",
+  "%s carves a wound %s cannot press shut.",
+};
+
+static const char *const melee_dot_venom[] = {
+  "Lolth's patience runs in %s's blade — %s is envenomed.",
+  "%s's edge was drow-poisoned; %s begins to sweat.",
+  "%s lets spider venom find the wound. %s will feel it working.",
+};
+
+static const char *const melee_dot_acid[] = {
+  "%s smears ochre slime across %s; it begins to eat.",
+  "%s breaks a jelly-flask over %s. The burning starts slow.",
+  "%s paints %s with something that keeps chewing.",
+};
+
+static const char *const melee_dot_spores[] = {
+  "%s bursts a myconid cap over %s. The rot takes.",
+  "%s drives fungal spores into %s's wound; the bloom begins.",
+  "%s dusts %s with cavern rot and steps back to let it work.",
+};
+
+static const char *const melee_dot_chill[] = {
+  "%s leaves a Narbondel cold in %s that will not warm.",
+  "%s's blade drags a necrotic chill through %s.",
+  "%s marks %s with the cold that follows a death-blow.",
+};
+
+// FORMAT CONTRACT: every entry in the five tick tables takes exactly
+// three `const char *` — source, victim, damage — like a blow line, and
+// for the same reason: a tick is a peer of a blow and reads as one.
+static const char *const melee_dot_tick_bleed[] = {
+  "%s's cut keeps drinking from %s — %s damage.",
+  "The wound %s opened runs down %s's side for %s damage.",
+  "%s's blade is long gone; %s bleeds anyway, for %s damage.",
+};
+
+static const char *const melee_dot_tick_venom[] = {
+  "Lolth's patience works through %s's poison; %s shudders for %s damage.",
+  "The venom %s left climbs %s's arm for %s damage.",
+  "%s's poison finds another nerve in %s — %s damage.",
+};
+
+static const char *const melee_dot_tick_acid[] = {
+  "%s's slime eats deeper into %s for %s damage.",
+  "The ochre burn %s gave %s is still chewing — %s damage.",
+  "%s's acid finds bone in %s for %s damage.",
+};
+
+static const char *const melee_dot_tick_spores[] = {
+  "%s's spores bloom in %s's wound for %s damage.",
+  "The rot %s planted spreads under %s's skin — %s damage.",
+  "%s's fungus feeds on %s for %s damage.",
+};
+
+static const char *const melee_dot_tick_chill[] = {
+  "%s's cold creeps another inch through %s for %s damage.",
+  "The chill %s left greys %s's fingers — %s damage.",
+  "Narbondel's dark works in %s's wake; %s takes %s damage.",
+};
+
+// FORMAT CONTRACT: exactly two `const char *` — source, then victim. No
+// damage slot, matching melee_deaths[]: the round is already over.
+static const char *const melee_dot_death_bleed[] = {
+  "%s never struck again; %s simply ran out of blood.",
+  "The wound %s opened finishes the argument. %s does not get up.",
+};
+
+static const char *const melee_dot_death_venom[] = {
+  "%s's venom stops %s's heart between one breath and the next.",
+  "Lolth takes her time. %s waits; %s stops.",
+};
+
+static const char *const melee_dot_death_acid[] = {
+  "%s's slime finishes what it started — %s comes apart on the stone.",
+  "The burn %s gave eats through the last of %s.",
+};
+
+static const char *const melee_dot_death_spores[] = {
+  "%s's rot blooms one last time; %s is a garden now.",
+  "The spores %s planted come up through %s's ribs.",
+};
+
+static const char *const melee_dot_death_chill[] = {
+  "%s's cold reaches %s's heart and stays there.",
+  "The chill %s left finishes %s without being present for it.",
+};
+
 // A kind arrives from a database column, so it is input like any other:
 // an out-of-range value falls back to the first entry rather than
 // indexing past the table.
@@ -207,6 +302,64 @@ const char *
 melee_dot_color_of(melee_dot_kind_t kind)
 {
   return(melee_dot_color[melee_dot_clamp(kind)]);
+}
+
+// The five inflict tables as one indexable set, exactly as melee_tbl[]
+// gathers the damage tiers.
+static const char *const *const melee_dot_tbl[MELEE_DOT__COUNT] = {
+  melee_dot_bleed, melee_dot_venom, melee_dot_acid, melee_dot_spores,
+  melee_dot_chill
+};
+
+static const int melee_dot_tbl_n[MELEE_DOT__COUNT] = {
+  MELEE_N(melee_dot_bleed), MELEE_N(melee_dot_venom),
+  MELEE_N(melee_dot_acid),  MELEE_N(melee_dot_spores),
+  MELEE_N(melee_dot_chill)
+};
+
+static const char *const *const melee_dot_tick_tbl[MELEE_DOT__COUNT] = {
+  melee_dot_tick_bleed, melee_dot_tick_venom, melee_dot_tick_acid,
+  melee_dot_tick_spores, melee_dot_tick_chill
+};
+
+static const int melee_dot_tick_n[MELEE_DOT__COUNT] = {
+  MELEE_N(melee_dot_tick_bleed), MELEE_N(melee_dot_tick_venom),
+  MELEE_N(melee_dot_tick_acid),  MELEE_N(melee_dot_tick_spores),
+  MELEE_N(melee_dot_tick_chill)
+};
+
+static const char *const *const melee_dot_death_tbl[MELEE_DOT__COUNT] = {
+  melee_dot_death_bleed, melee_dot_death_venom, melee_dot_death_acid,
+  melee_dot_death_spores, melee_dot_death_chill
+};
+
+static const int melee_dot_death_n[MELEE_DOT__COUNT] = {
+  MELEE_N(melee_dot_death_bleed), MELEE_N(melee_dot_death_venom),
+  MELEE_N(melee_dot_death_acid),  MELEE_N(melee_dot_death_spores),
+  MELEE_N(melee_dot_death_chill)
+};
+
+void
+melee_render_dot_inflict(char *out, size_t cap, const char *atk_nick,
+    const char *tgt_nick, melee_dot_kind_t kind)
+{
+  char atk [MELEE_NICK_SZ + 8];
+  char tgt [MELEE_NICK_SZ + 8];
+  char body[MELEE_LINE_SZ];
+
+  if(out == NULL || cap == 0)
+    return;
+
+  kind = melee_dot_clamp(kind);
+
+  snprintf(atk, sizeof(atk), CLR_CYAN   "%s" CLR_RESET, atk_nick);
+  snprintf(tgt, sizeof(tgt), CLR_PURPLE "%s" CLR_RESET, tgt_nick);
+  snprintf(body, sizeof(body),
+      melee_dot_tbl[kind][util_rand(melee_dot_tbl_n[kind])], atk, tgt);
+
+  // The glyph that will mark the victim on the round card leads the
+  // line, so the two read as the same thing.
+  snprintf(out, cap, "%s %s", melee_dot_emoji_of(kind), body);
 }
 
 // ------------------------------------------------------------------ //
@@ -390,5 +543,64 @@ melee_render_death(char *out, size_t cap, const char *slayer_nick,
         melee_deaths[util_rand(MELEE_N(melee_deaths))], slayer, fallen);
   }
 
+  snprintf(out, cap, "☠ %s", body);
+}
+
+// A tick is dressed like a blow — glyph, colour, and the survivor's
+// remaining health — so decay reads as a peer of a swing rather than as
+// a system message. The affliction's own colour carries the number,
+// which is what tells a reader at a glance that no one swung.
+void
+melee_render_dot_tick(char *out, size_t cap, const char *src_nick,
+    const char *tgt_nick, int32_t dmg, int32_t hp, int32_t hp_max,
+    melee_dot_kind_t kind)
+{
+  char src [MELEE_NICK_SZ + 8];
+  char tgt [MELEE_NICK_SZ + 8];
+  char dmgs[32];
+  char body[MELEE_LINE_SZ];
+
+  if(out == NULL || cap == 0)
+    return;
+
+  kind = melee_dot_clamp(kind);
+
+  snprintf(src, sizeof(src), CLR_CYAN   "%s" CLR_RESET, src_nick);
+  snprintf(tgt, sizeof(tgt), CLR_PURPLE "%s" CLR_RESET, tgt_nick);
+  snprintf(dmgs, sizeof(dmgs), "%s%d" CLR_RESET, melee_dot_color_of(kind), dmg);
+
+  snprintf(body, sizeof(body),
+      melee_dot_tick_tbl[kind][util_rand(melee_dot_tick_n[kind])],
+      src, tgt, dmgs);
+
+  if(hp > 0)
+    snprintf(out, cap, "%s %s " CLR_GRAY "[%s — %d/%d hp]" CLR_RESET,
+        melee_dot_emoji_of(kind), body, tgt_nick, hp, hp_max);
+
+  else
+    snprintf(out, cap, "%s %s", melee_dot_emoji_of(kind), body);
+}
+
+void
+melee_render_dot_death(char *out, size_t cap, const char *src_nick,
+    const char *tgt_nick, melee_dot_kind_t kind)
+{
+  char src [MELEE_NICK_SZ + 8];
+  char tgt [MELEE_NICK_SZ + 8];
+  char body[MELEE_LINE_SZ];
+
+  if(out == NULL || cap == 0)
+    return;
+
+  kind = melee_dot_clamp(kind);
+
+  snprintf(src, sizeof(src), CLR_CYAN   "%s" CLR_RESET, src_nick);
+  snprintf(tgt, sizeof(tgt), CLR_PURPLE "%s" CLR_RESET, tgt_nick);
+
+  snprintf(body, sizeof(body),
+      melee_dot_death_tbl[kind][util_rand(melee_dot_death_n[kind])], src, tgt);
+
+  // The same headstone the turn engine's death line carries, so a death
+  // by decay is unmistakably the same event as a death by blade.
   snprintf(out, cap, "☠ %s", body);
 }

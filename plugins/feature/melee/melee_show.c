@@ -323,8 +323,42 @@ melee_card_header(const cmd_ctx_t *ctx)
   cmd_reply(ctx, line);
 }
 
+// The affliction markers a combatant carries, colorized, or an empty
+// string when they carry none. Each glyph is one display column, so the
+// card grows by exactly (1 + count) columns on the widest afflicted row.
 static void
-melee_card_row(const cmd_ctx_t *ctx, const melee_card_row_t *row)
+melee_card_marks(char *out, size_t cap, const melee_card_row_t *row,
+    const melee_dot_mark_t *marks, uint32_t n)
+{
+  uint32_t i;
+  uint32_t k;
+
+  out[0] = '\0';
+
+  for(i = 0; i < n; i++)
+  {
+    if(strcmp(marks[i].victim, row->user) != 0)
+      continue;
+
+    melee_cat(out, cap, " ");
+
+    for(k = 0; k < marks[i].n; k++)
+    {
+      char cell[32];
+
+      snprintf(cell, sizeof(cell), "%s%s" CLR_RESET,
+          melee_dot_color_of(marks[i].kinds[k]),
+          melee_dot_emoji_of(marks[i].kinds[k]));
+      melee_cat(out, cap, cell);
+    }
+
+    return;
+  }
+}
+
+static void
+melee_card_row(const cmd_ctx_t *ctx, const melee_card_row_t *row,
+    const melee_dot_mark_t *marks, uint32_t n_marks)
 {
   const bool alive = (row->hp > 0);
   char       name[MELEE_NAME_SZ];
@@ -377,6 +411,11 @@ melee_card_row(const cmd_ctx_t *ctx, const melee_card_row_t *row)
   melee_pad(cell, sizeof(cell), MELEE_W_CRIT);
   melee_cat(line, sizeof(line), cell);
 
+  // Outside the grid, after the last padded cell: the markers are a
+  // ragged tail, not a column, so no width promise is broken.
+  melee_card_marks(cell, sizeof(cell), row, marks, n_marks);
+  melee_cat(line, sizeof(line), cell);
+
   cmd_reply(ctx, line);
 }
 
@@ -384,7 +423,8 @@ static void
 melee_show_round(const cmd_ctx_t *ctx)
 {
   melee_card_t     card;
-  melee_card_row_t rows[MELEE_MAX_PLAYERS];
+  melee_card_row_t rows [MELEE_MAX_PLAYERS];
+  melee_dot_mark_t marks[MELEE_MAX_PLAYERS];
   userns_t        *ns;
   const char      *state;
   char             line  [MELEE_LINE_SZ];
@@ -392,6 +432,7 @@ melee_show_round(const cmd_ctx_t *ctx)
   char             roster[MELEE_ROSTER_SZ];
   char             dur   [32];
   uint32_t         shown;
+  uint32_t         n_marks;
   uint32_t         total = 0;
   uint32_t         i;
 
@@ -430,8 +471,12 @@ melee_show_round(const cmd_ctx_t *ctx)
 
   shown = melee_db_card_roster(card.id, rows, MELEE_MAX_PLAYERS, &total);
 
+  // Lock-free like everything else in this view, and optional: a failed
+  // marker query draws a card without markers rather than no card.
+  n_marks = melee_db_dot_marks(card.id, marks, MELEE_MAX_PLAYERS);
+
   for(i = 0; i < shown; i++)
-    melee_card_row(ctx, &rows[i]);
+    melee_card_row(ctx, &rows[i], marks, n_marks);
 
   cmd_reply(ctx, rule);
 

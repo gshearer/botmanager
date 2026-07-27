@@ -234,10 +234,11 @@ melee_start(void)
 static void
 melee_deinit(void)
 {
-  // Before anything else. The KV entries outlive this plugin, and a
-  // callback left pointing into an unloaded .so is a jump into freed
-  // memory on the next `set kv`.
+  // Before anything else, and for one reason twice over: a callback left
+  // pointing into an unloaded .so is a jump into freed memory — the KV
+  // entries outlive this plugin, and so does the task queue.
   melee_llm_watch(false);
+  melee_dot_stop();
 
   melee_commands_unregister();
   clam(CLAM_INFO, MELEE_CTX, "melee plugin deinitialized");

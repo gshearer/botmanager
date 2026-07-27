@@ -662,12 +662,15 @@ melee_db_card_roster(int64_t round_id, melee_card_row_t *out, uint32_t cap,
      melee_tables_resolve(&t) != SUCCESS)
     return(0);
 
+  // The table is aliased and the sort keys qualified because `username`
+  // is now both an output column and a table column: unqualified, that
+  // ORDER BY is ambiguous and Postgres refuses the whole query.
   snprintf(sql, sizeof(sql),
-      "SELECT CASE WHEN nickname <> '' THEN nickname ELSE username END,"
-      " hp, hp_max, dmg_given, dmg_taken, best_crit, last_wave,"
-      " COUNT(*) OVER ()"
-      " FROM %s WHERE round_id = %" PRId64
-      " ORDER BY hp DESC, dmg_given DESC, username LIMIT %" PRIu32,
+      "SELECT CASE WHEN p.nickname <> '' THEN p.nickname ELSE p.username END,"
+      " p.hp, p.hp_max, p.dmg_given, p.dmg_taken, p.best_crit, p.last_wave,"
+      " COUNT(*) OVER (), p.username"
+      " FROM %s p WHERE p.round_id = %" PRId64
+      " ORDER BY p.hp DESC, p.dmg_given DESC, p.username LIMIT %" PRIu32,
       t.players, round_id, cap);
 
   res = db_result_alloc();
@@ -677,6 +680,7 @@ melee_db_card_roster(int64_t round_id, melee_card_row_t *out, uint32_t cap,
     for(n = 0; n < res->rows && n < cap; n++)
     {
       melee_col_str(out[n].name, sizeof(out[n].name), res, n, 0);
+      melee_col_str(out[n].user, sizeof(out[n].user), res, n, 8);
       out[n].hp        = melee_col_i32(res, n, 1);
       out[n].hp_max    = melee_col_i32(res, n, 2);
       out[n].dmg_given = melee_col_i32(res, n, 3);
@@ -688,6 +692,13 @@ melee_db_card_roster(int64_t round_id, melee_card_row_t *out, uint32_t cap,
         *total = (uint32_t)melee_col_i64(res, n, 7);
     }
   }
+
+  // An empty card is indistinguishable from a broken one on screen, so
+  // the failure has to say so somewhere.
+  else
+    clam(CLAM_WARN, MELEE_CTX, "round card roster failed: %s",
+        (res != NULL && res->error[0] != '\0') ? res->error
+                                               : "(no driver error)");
 
   db_result_free(res);
   return(n);
@@ -913,6 +924,330 @@ out:
   if(e_tgt_u != NULL) mem_free(e_tgt_u);
   if(e_tgt_n != NULL) mem_free(e_tgt_n);
   if(sql     != NULL) mem_free(sql);
+
+  return(ok);
+}
+
+// ------------------------------------------------------------------ //
+// Afflictions                                                         //
+// ------------------------------------------------------------------ //
+
+// One statement, one round trip, and the stack cap enforced by the WHERE
+// clause rather than by a read-then-write another turn could race. At
+// the cap the INSERT ... SELECT simply affects no rows, which is why the
+// caller is told SUCCESS only when the row count says one landed.
+bool
+melee_db_dot_inflict(const melee_dot_new_t *d)
+{
+  melee_tables_t t;
+  char          *e_meth   = NULL;
+  char          *e_chan   = NULL;
+  char          *e_vic_u  = NULL;
+  char          *e_vic_n  = NULL;
+  char          *e_src_u  = NULL;
+  char          *e_src_n  = NULL;
+  char           sql[1536];
+  uint32_t       affected = 0;
+  bool           ok = FAIL;
+
+  if(d == NULL || d->round_id <= 0 || melee_tables_resolve(&t) != SUCCESS)
+    return(FAIL);
+
+  e_meth  = db_escape(d->method      != NULL ? d->method      : "");
+  e_chan  = db_escape(d->channel     != NULL ? d->channel     : "");
+  e_vic_u = db_escape(d->victim      != NULL ? d->victim      : "");
+  e_vic_n = db_escape(d->victim_nick != NULL ? d->victim_nick : "");
+  e_src_u = db_escape(d->source      != NULL ? d->source      : "");
+  e_src_n = db_escape(d->source_nick != NULL ? d->source_nick : "");
+
+  if(e_meth == NULL || e_chan == NULL || e_vic_u == NULL ||
+     e_vic_n == NULL || e_src_u == NULL || e_src_n == NULL)
+    goto out;
+
+  snprintf(sql, sizeof(sql),
+      "INSERT INTO %s (round_id, ns_id, method, channel, victim,"
+      " victim_nick, source, source_nick, kind, next_tick, expires_at)"
+      " SELECT %" PRId64 ", %" PRIu32 ", '%s', '%s', '%s', '%s', '%s',"
+      " '%s', %d, NOW() + INTERVAL '%" PRIu32 " seconds',"
+      " NOW() + INTERVAL '%" PRIu32 " seconds'"
+      " WHERE (SELECT COUNT(*) FROM %s WHERE round_id = %" PRId64
+      " AND victim = '%s' AND state = %d) < %" PRIu32,
+      t.dots, d->round_id, d->ns_id, e_meth, e_chan, e_vic_u, e_vic_n,
+      e_src_u, e_src_n, (int)d->kind, d->tick_secs, d->secs,
+      t.dots, d->round_id, e_vic_u, MELEE_DOT_LIVE, d->stack_max);
+
+  if(melee_exec(sql, "dot inflict", &affected) == SUCCESS && affected > 0)
+    ok = SUCCESS;
+
+out:
+  if(e_meth  != NULL) mem_free(e_meth);
+  if(e_chan  != NULL) mem_free(e_chan);
+  if(e_vic_u != NULL) mem_free(e_vic_u);
+  if(e_vic_n != NULL) mem_free(e_vic_n);
+  if(e_src_u != NULL) mem_free(e_src_u);
+  if(e_src_n != NULL) mem_free(e_src_n);
+
+  return(ok);
+}
+
+// Rows arrive ordered by victim, so the grouping is one pass with no
+// lookup: a new username opens a new mark, and anything past the stack
+// cap on one victim is dropped rather than overrunning the array.
+uint32_t
+melee_db_dot_marks(int64_t round_id, melee_dot_mark_t *out, uint32_t cap)
+{
+  melee_tables_t t;
+  db_result_t   *res = NULL;
+  char           sql[512];
+  char           victim[MELEE_USER_SZ];
+  uint32_t       row;
+  uint32_t       n = 0;
+
+  if(out == NULL || cap == 0 || round_id <= 0 ||
+     melee_tables_resolve(&t) != SUCCESS)
+    return(0);
+
+  snprintf(sql, sizeof(sql),
+      "SELECT victim, kind FROM %s WHERE round_id = %" PRId64
+      " AND state = %d ORDER BY victim, id",
+      t.dots, round_id, MELEE_DOT_LIVE);
+
+  res = db_result_alloc();
+
+  if(res == NULL || db_query(sql, res) != SUCCESS || !res->ok)
+    goto out;
+
+  for(row = 0; row < res->rows; row++)
+  {
+    melee_dot_mark_t *mark;
+
+    melee_col_str(victim, sizeof(victim), res, row, 0);
+
+    if(n == 0 || strcmp(out[n - 1].victim, victim) != 0)
+    {
+      if(n == cap)
+        break;
+
+      mark = &out[n++];
+      memset(mark, 0, sizeof(*mark));
+      snprintf(mark->victim, sizeof(mark->victim), "%s", victim);
+    }
+
+    else
+      mark = &out[n - 1];
+
+    if(mark->n < MELEE_DOT_STACK_CAP)
+      mark->kinds[mark->n++] = (melee_dot_kind_t)melee_col_i32(res, row, 1);
+  }
+
+out:
+  db_result_free(res);
+  return(n);
+}
+
+// The join against the rounds table is what implements "an affliction
+// dies with its round": a round that ended or was abandoned stops its
+// afflictions from ever ticking again, without a second lookup here.
+uint32_t
+melee_db_dot_due(melee_dot_due_t *out, uint32_t cap)
+{
+  melee_tables_t t;
+  db_result_t   *res = NULL;
+  char           sql[768];
+  uint32_t       n = 0;
+
+  if(out == NULL || cap == 0 || melee_tables_resolve(&t) != SUCCESS)
+    return(0);
+
+  snprintf(sql, sizeof(sql),
+      "SELECT d.id, d.round_id, d.ns_id, d.method, d.channel, d.victim,"
+      " d.victim_nick, d.source, d.source_nick, d.kind,"
+      " (d.expires_at <= NOW())"
+      " FROM %s d JOIN %s r ON r.id = d.round_id"
+      " WHERE d.state = %d AND r.state = %d AND d.next_tick <= NOW()"
+      " ORDER BY d.next_tick LIMIT %" PRIu32,
+      t.dots, t.rounds, MELEE_DOT_LIVE, MELEE_ROUND_ACTIVE, cap);
+
+  res = db_result_alloc();
+
+  if(res != NULL && db_query(sql, res) == SUCCESS && res->ok)
+  {
+    for(n = 0; n < res->rows && n < cap; n++)
+    {
+      const char *expired;
+
+      out[n].id       = melee_col_i64(res, n, 0);
+      out[n].round_id = melee_col_i64(res, n, 1);
+      out[n].ns_id    = (uint32_t)melee_col_i32(res, n, 2);
+
+      melee_col_str(out[n].method,      sizeof(out[n].method),      res, n, 3);
+      melee_col_str(out[n].channel,     sizeof(out[n].channel),     res, n, 4);
+      melee_col_str(out[n].victim,      sizeof(out[n].victim),      res, n, 5);
+      melee_col_str(out[n].victim_nick, sizeof(out[n].victim_nick), res, n, 6);
+      melee_col_str(out[n].source,      sizeof(out[n].source),      res, n, 7);
+      melee_col_str(out[n].source_nick, sizeof(out[n].source_nick), res, n, 8);
+
+      out[n].kind = (melee_dot_kind_t)melee_col_i32(res, n, 9);
+
+      // Postgres renders a boolean as 't' or 'f'.
+      expired = db_result_get(res, n, 10);
+      out[n].expired = (expired != NULL && expired[0] == 't');
+    }
+  }
+
+  db_result_free(res);
+  return(n);
+}
+
+uint32_t
+melee_db_dot_live(void)
+{
+  melee_tables_t t;
+  db_result_t   *res = NULL;
+  char           sql[512];
+  uint32_t       n = 0;
+
+  if(melee_tables_resolve(&t) != SUCCESS)
+    return(0);
+
+  snprintf(sql, sizeof(sql),
+      "SELECT COUNT(*) FROM %s d JOIN %s r ON r.id = d.round_id"
+      " WHERE d.state = %d AND r.state = %d",
+      t.dots, t.rounds, MELEE_DOT_LIVE, MELEE_ROUND_ACTIVE);
+
+  res = db_result_alloc();
+
+  if(res != NULL && db_query(sql, res) == SUCCESS && res->ok && res->rows == 1)
+    n = (uint32_t)melee_col_i64(res, 0, 0);
+
+  db_result_free(res);
+  return(n);
+}
+
+bool
+melee_db_dot_sweep(void)
+{
+  melee_tables_t t;
+  char           sql[512];
+
+  if(melee_tables_resolve(&t) != SUCCESS)
+    return(FAIL);
+
+  snprintf(sql, sizeof(sql),
+      "UPDATE %s SET state = %d WHERE state = %d AND round_id IN"
+      " (SELECT id FROM %s WHERE state <> %d)",
+      t.dots, MELEE_DOT_CANCELLED, MELEE_DOT_LIVE, t.rounds,
+      MELEE_ROUND_ACTIVE);
+
+  return(melee_exec(sql, "dot sweep", NULL));
+}
+
+bool
+melee_db_dot_cancel(int64_t dot_id)
+{
+  melee_tables_t t;
+  char           sql[256];
+
+  if(dot_id <= 0 || melee_tables_resolve(&t) != SUCCESS)
+    return(FAIL);
+
+  snprintf(sql, sizeof(sql), "UPDATE %s SET state = %d WHERE id = %" PRId64,
+      t.dots, MELEE_DOT_CANCELLED, dot_id);
+
+  return(melee_exec(sql, "dot cancel", NULL));
+}
+
+bool
+melee_db_dot_tick(const melee_dot_hit_t *h)
+{
+  melee_tables_t t;
+  char          *e_vic = NULL;
+  char          *e_src = NULL;
+  char          *sql   = NULL;
+  char           death[2048] = "";
+  size_t         need;
+  bool           ok = FAIL;
+
+  if(h == NULL || h->round_id <= 0 || melee_tables_resolve(&t) != SUCCESS)
+    return(FAIL);
+
+  e_vic = db_escape(h->victim != NULL ? h->victim : "");
+  e_src = db_escape(h->source != NULL ? h->source : "");
+
+  if(e_vic == NULL || e_src == NULL)
+    goto out;
+
+  // Only the tick that reaches zero closes anything — and that tick is
+  // by construction the affliction's last, marked spent below.
+  if(h->fatal)
+    snprintf(death, sizeof(death),
+        "UPDATE %s SET state = %d, ended_at = NOW(), slayer = '%s',"
+        " fallen = '%s' WHERE id = %" PRId64 ";"
+        "UPDATE %s SET kills = kills + 1, last_seen = NOW()"
+        " WHERE ns_id = %" PRIu32 " AND username = '%s';"
+        "UPDATE %s SET deaths = deaths + 1, last_seen = NOW()"
+        " WHERE ns_id = %" PRIu32 " AND username = '%s';",
+        t.rounds, MELEE_ROUND_ENDED, e_src, e_vic, h->round_id,
+        t.scores, h->ns_id, e_src,
+        t.scores, h->ns_id, e_vic);
+
+  need = 2048 + strlen(death)
+      + 6 * (strlen(e_vic) + strlen(e_src) + strlen(t.rounds)
+             + strlen(t.players) + strlen(t.scores) + strlen(t.dots));
+
+  sql = mem_alloc(MELEE_CTX, "dot_tick_sql", need);
+
+  if(sql == NULL)
+    goto out;
+
+  snprintf(sql, need,
+      "BEGIN;"
+
+      // The victim bleeds. hp floors at zero; died_at is stamped once.
+      // Nothing here touches last_wave: decay is not a swing.
+      "UPDATE %s SET hp = GREATEST(hp - %d, 0), dmg_taken = dmg_taken + %d,"
+      " died_at = CASE WHEN hp - %d <= 0 AND died_at IS NULL"
+      " THEN NOW() ELSE died_at END"
+      " WHERE round_id = %" PRId64 " AND username = '%s';"
+
+      // Whoever left the wound is still credited for what it does.
+      "UPDATE %s SET dmg_given = dmg_given + %d"
+      " WHERE round_id = %" PRId64 " AND username = '%s';"
+
+      // Both lifetime mirrors. Enrolment already created these rows.
+      "UPDATE %s SET dmg_taken = dmg_taken + %d, last_seen = NOW()"
+      " WHERE ns_id = %" PRIu32 " AND username = '%s';"
+      "UPDATE %s SET dmg_given = dmg_given + %d, last_seen = NOW()"
+      " WHERE ns_id = %" PRIu32 " AND username = '%s';"
+
+      // The affliction's own ledger and its next deadline. The deadline
+      // advances from the one it just met, not from now: the task wakes
+      // on its own cadence and can only ever service a tick LATE, so
+      // NOW() + interval would compound that lateness into a drift of
+      // roughly double the configured gap. GREATEST() keeps a backlog
+      // from firing a burst of catch-up ticks in consecutive seconds.
+      "UPDATE %s SET ticks = ticks + 1, dmg_total = dmg_total + %d,"
+      " next_tick = GREATEST(next_tick, NOW() - INTERVAL '%" PRIu32
+      " seconds') + INTERVAL '%" PRIu32 " seconds', state = %d"
+      " WHERE id = %" PRId64 ";"
+
+      "%s"
+      "COMMIT;",
+
+      t.players, h->dmg, h->dmg, h->dmg, h->round_id, e_vic,
+      t.players, h->dmg, h->round_id, e_src,
+      t.scores,  h->dmg, h->ns_id, e_vic,
+      t.scores,  h->dmg, h->ns_id, e_src,
+      t.dots,    h->dmg, h->tick_secs, h->tick_secs,
+      (h->last || h->fatal) ? MELEE_DOT_SPENT : MELEE_DOT_LIVE, h->dot_id,
+      death);
+
+  ok = melee_exec(sql, "dot tick", NULL);
+
+out:
+  if(e_vic != NULL) mem_free(e_vic);
+  if(e_src != NULL) mem_free(e_src);
+  if(sql   != NULL) mem_free(sql);
 
   return(ok);
 }
