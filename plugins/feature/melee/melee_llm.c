@@ -40,8 +40,8 @@ typedef struct
 // reverse. melee_pool_lock is never held across file I/O, a task_add, or
 // an LLM submit.
 //
-// Static footprint, stated so nobody has to discover it: 5 categories x
-// MELEE_LLM_POOL_MAX (64) x MELEE_LLM_TMPL_SZ (256) = 80 KB of BSS. That
+// Static footprint, stated so nobody has to discover it: 7 categories x
+// MELEE_LLM_POOL_MAX (64) x MELEE_LLM_TMPL_SZ (256) = 112 KB of BSS. That
 // is deliberate — the pools are the whole reason no model runs on the
 // turn path.
 static melee_pool_t    melee_pools[MELEE_FLAV__COUNT];
@@ -60,9 +60,33 @@ static uint32_t        melee_pool_gen;
 #define MELEE_TOK_ATTACKER "attacker"
 #define MELEE_TOK_TARGET   "target"
 #define MELEE_TOK_DAMAGE   "damage"
+#define MELEE_TOK_AFFLICT  "affliction"
 
 static const char *const melee_flav_name[MELEE_FLAV__COUNT] = {
-  "minor", "medium", "major", "critical", "death"
+  "minor", "medium", "major", "critical", "death", "dot_tick", "dot_death"
+};
+
+// How many times each token must appear in a line of each category —
+// exactly, no more and no less. This table IS the rule: one loop over it
+// replaced the death-line special case, and a further category is one
+// more row rather than another branch.
+//
+// A death line carries no tally, because the blow that killed already
+// said the number; an affliction line names its wound, and a blow line
+// must not.
+static const uint8_t melee_tok_req[MELEE_FLAV__COUNT][4] = {
+  //                    attacker target damage affliction
+  [MELEE_FLAV_MINOR]     = { 1, 1, 1, 0 },
+  [MELEE_FLAV_MEDIUM]    = { 1, 1, 1, 0 },
+  [MELEE_FLAV_MAJOR]     = { 1, 1, 1, 0 },
+  [MELEE_FLAV_CRITICAL]  = { 1, 1, 1, 0 },
+  [MELEE_FLAV_DEATH]     = { 1, 1, 0, 0 },
+  [MELEE_FLAV_DOT_TICK]  = { 1, 1, 1, 1 },
+  [MELEE_FLAV_DOT_DEATH] = { 1, 1, 0, 1 },
+};
+
+static const char *const melee_tok_name[4] = {
+  MELEE_TOK_ATTACKER, MELEE_TOK_TARGET, MELEE_TOK_DAMAGE, MELEE_TOK_AFFLICT
 };
 
 static bool melee_llm_sanitize(melee_flavour_t, const char *, char *,
@@ -143,15 +167,15 @@ static bool
 melee_llm_sanitize(melee_flavour_t cat, const char *in, char *out,
     size_t cap)
 {
-  const char *why  = NULL;
-  const char *end  = NULL;
-  const char *p    = NULL;
-  size_t      len  = 0;
-  uint32_t    n_atk = 0;
-  uint32_t    n_tgt = 0;
-  uint32_t    n_dmg = 0;
+  const char *why   = NULL;
+  const char *end   = NULL;
+  const char *p     = NULL;
+  size_t      len   = 0;
+  uint32_t    seen[4] = { 0 };
+  uint32_t    tok;
+  char        miscount[64];
 
-  if(in == NULL || out == NULL || cap == 0)
+  if(in == NULL || out == NULL || cap == 0 || cat >= MELEE_FLAV__COUNT)
     return(FAIL);
 
   // 1. Trim.
@@ -218,13 +242,13 @@ melee_llm_sanitize(melee_flavour_t cat, const char *in, char *out,
   if(why == NULL && memchr(in, '%', len) != NULL)
     why = "percent sign";
 
-  // 7. Every {…} must be one of the three known tokens, closed, and
-  //    opened. 8. …and the set required by `cat` must be complete, each
-  //    token appearing exactly once.
+  // 7. Every {…} must be one of the four known tokens, closed, and
+  //    opened.
   for(p = in; why == NULL && p < end; p++)
   {
     const char *close = NULL;
     size_t      tlen  = 0;
+    bool        known = false;
 
     if(*p == '}')
     {
@@ -244,16 +268,17 @@ melee_llm_sanitize(melee_flavour_t cat, const char *in, char *out,
 
     tlen = (size_t)(close - p - 1);
 
-    if(melee_tok_is(p + 1, tlen, MELEE_TOK_ATTACKER))
-      n_atk++;
+    for(tok = 0; tok < 4; tok++)
+    {
+      if(melee_tok_is(p + 1, tlen, melee_tok_name[tok]))
+      {
+        seen[tok]++;
+        known = true;
+        break;
+      }
+    }
 
-    else if(melee_tok_is(p + 1, tlen, MELEE_TOK_TARGET))
-      n_tgt++;
-
-    else if(melee_tok_is(p + 1, tlen, MELEE_TOK_DAMAGE))
-      n_dmg++;
-
-    else
+    if(!known)
     {
       why = "unknown token";
       break;
@@ -262,16 +287,20 @@ melee_llm_sanitize(melee_flavour_t cat, const char *in, char *out,
     p = close;
   }
 
-  if(why == NULL && (n_atk != 1 || n_tgt != 1))
-    why = "attacker/target not present exactly once";
-
-  // A death line carries no tally — the blow that killed already said
-  // the number, and the round is over.
-  else if(why == NULL && cat == MELEE_FLAV_DEATH && n_dmg != 0)
-    why = "damage token in a death line";
-
-  else if(why == NULL && cat != MELEE_FLAV_DEATH && n_dmg != 1)
-    why = "damage not present exactly once";
+  // 8. …and the observed count must equal what this category requires,
+  //    for every token. One loop, no special cases: a {damage} in a
+  //    death line and an {affliction} in a blow line are both simply
+  //    counts that do not match the table.
+  for(tok = 0; why == NULL && tok < 4; tok++)
+  {
+    if(seen[tok] != melee_tok_req[cat][tok])
+    {
+      snprintf(miscount, sizeof(miscount), "{%s} x%u, wanted x%u",
+          melee_tok_name[tok], seen[tok],
+          (unsigned)melee_tok_req[cat][tok]);
+      why = miscount;
+    }
+  }
 
   if(why != NULL)
   {
@@ -391,7 +420,8 @@ melee_pool_fallbacks(void)
 
 void
 melee_tmpl_expand(char *out, size_t cap, const char *tmpl,
-    const char *attacker, const char *target, const char *damage)
+    const char *attacker, const char *target, const char *damage,
+    const char *affliction)
 {
   size_t used = 0;
 
@@ -402,6 +432,14 @@ melee_tmpl_expand(char *out, size_t cap, const char *tmpl,
 
   if(tmpl == NULL)
     return;
+
+  // A NULL substitution is a token the sanitiser guaranteed absent from
+  // this category — reachable only through a bug, and then harmlessly:
+  // it expands to nothing rather than leaving a brace token on screen.
+  if(attacker   == NULL) attacker   = "";
+  if(target     == NULL) target     = "";
+  if(damage     == NULL) damage     = "";
+  if(affliction == NULL) affliction = "";
 
   // One forward scan over the TEMPLATE. The substituted values are
   // written straight out and are never re-examined, so a `{` inside a
@@ -426,6 +464,9 @@ melee_tmpl_expand(char *out, size_t cap, const char *tmpl,
 
       else if(melee_tok_is(tmpl + 1, tlen, MELEE_TOK_DAMAGE))
         sub = damage;
+
+      else if(melee_tok_is(tmpl + 1, tlen, MELEE_TOK_AFFLICT))
+        sub = affliction;
     }
 
     if(sub == NULL)
@@ -524,17 +565,69 @@ static const char *const melee_fmt_death =
   "  mention a damage number and do not use a {damage} token; the round is\n"
   "  already over.\n";
 
+// An affliction names itself through {affliction}, which the model does
+// not choose and must not gloss: the noun is substituted whole, so a
+// line that writes "the venom {affliction}" reads as nonsense the moment
+// the wound is spores.
+static const char *const melee_fmt_dot_tick =
+  "Write exactly %u lines of combat flavour. One line per line of output.\n"
+  "\n"
+  "Every line MUST contain the four placeholder tokens {attacker},\n"
+  "{target}, {damage} and {affliction}, spelled exactly like that in curly\n"
+  "braces, each appearing exactly once.\n"
+  "\n"
+  "Rules, all mandatory:\n"
+  "- Output ONLY the lines themselves. No numbering, no bullets, no blank\n"
+  "  lines, no preamble, no commentary, no quotation marks around lines.\n"
+  "- One sentence per line, at most 150 characters.\n"
+  "- Plain text only. No markdown, no emoji, no percent signs, and no curly\n"
+  "  braces other than the four tokens named above.\n"
+  "- Every line must differ from every other line.\n"
+  "- {affliction} is replaced by a NOUN PHRASE naming a lingering wound --\n"
+  "  for example \"open wound\", \"spider venom\", \"myconid spores\". You do\n"
+  "  not choose it and you must not describe it: write \"the {affliction}\n"
+  "  eats at {target}\", never \"the venom {affliction}\". It must read\n"
+  "  correctly for any such noun.\n"
+  "- Nobody is swinging. {attacker} left this wound EARLIER and may be\n"
+  "  across the room; the wound itself is doing the work now.\n"
+  "- {target} SURVIVES this line. It hurts and it is grim, but it does not\n"
+  "  kill.\n";
+
+static const char *const melee_fmt_dot_death =
+  "Write exactly %u lines of combat flavour. One line per line of output.\n"
+  "\n"
+  "Every line MUST contain the three placeholder tokens {attacker},\n"
+  "{target} and {affliction}, spelled exactly like that in curly braces,\n"
+  "each appearing exactly once.\n"
+  "\n"
+  "Rules, all mandatory:\n"
+  "- Output ONLY the lines themselves. No numbering, no bullets, no blank\n"
+  "  lines, no preamble, no commentary, no quotation marks around lines.\n"
+  "- One sentence per line, at most 150 characters.\n"
+  "- Plain text only. No markdown, no emoji, no percent signs, and no curly\n"
+  "  braces other than the three tokens named above.\n"
+  "- Every line must differ from every other line.\n"
+  "- {affliction} is replaced by a NOUN PHRASE naming a lingering wound --\n"
+  "  for example \"open wound\", \"spider venom\", \"myconid spores\". You do\n"
+  "  not choose it and you must not describe it. It must read correctly for\n"
+  "  any such noun.\n"
+  "- This is the moment {target} DIES, killed by the {affliction} that\n"
+  "  {attacker} left in them some time ago -- not by a blow. Do not mention\n"
+  "  a damage number and do not use a {damage} token; the round is over.\n";
+
 static const char *
 melee_fmt_for(melee_flavour_t cat)
 {
   switch(cat)
   {
-    case MELEE_FLAV_MINOR:    return(melee_fmt_minor);
-    case MELEE_FLAV_MEDIUM:   return(melee_fmt_medium);
-    case MELEE_FLAV_MAJOR:    return(melee_fmt_major);
-    case MELEE_FLAV_CRITICAL: return(melee_fmt_critical);
-    case MELEE_FLAV_DEATH:    return(melee_fmt_death);
-    default:                  return(melee_fmt_medium);
+    case MELEE_FLAV_MINOR:     return(melee_fmt_minor);
+    case MELEE_FLAV_MEDIUM:    return(melee_fmt_medium);
+    case MELEE_FLAV_MAJOR:     return(melee_fmt_major);
+    case MELEE_FLAV_CRITICAL:  return(melee_fmt_critical);
+    case MELEE_FLAV_DEATH:     return(melee_fmt_death);
+    case MELEE_FLAV_DOT_TICK:  return(melee_fmt_dot_tick);
+    case MELEE_FLAV_DOT_DEATH: return(melee_fmt_dot_death);
+    default:                   return(melee_fmt_medium);
   }
 }
 

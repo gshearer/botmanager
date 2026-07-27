@@ -92,23 +92,31 @@
 // MELEE_LINE_SZ is 512 and must hold the EXPANDED line. Expansion
 // replaces {attacker}/{target} (10 and 8 bytes) with a colorized nick
 // (MELEE_NICK_SZ 63 + ~10 bytes of colour = ~73 each) and {damage}
-// (8 bytes) with a colorized number (~20). Worst-case growth is about
-// +150 bytes, and melee_render_blow then adds the emoji prefix and the
-// " [nick — hp/hp hp]" tail, another ~90. 256 + 150 + 90 = 496 < 512.
-// Do not raise this without redoing that sum.
+// (8 bytes) with a colorized number (~20). {affliction} (12 bytes) is
+// replaced by the longest name in melee_dot_name[] ("myconid spores",
+// 14) plus ~10 of colour, another ~+14. Worst-case growth is about
+// +164 bytes, and melee_render_blow then adds the emoji prefix and the
+// " [nick — hp/hp hp]" tail, another ~90. 256 + 164 + 90 = 510 < 512.
+// It fits, but only just: lengthen an affliction name and this sum has
+// to be redone, or MELEE_LINE_SZ raised. Do not raise this without
+// redoing that sum either.
 #define MELEE_LLM_TMPL_SZ    256
 // Filesystem path to the persona prompt, relative to the daemon CWD.
 #define MELEE_LLM_PATH_SZ    256
 // Longest model name the llm subsystem will hand back.
 #define MELEE_LLM_MODEL_SZ   64
 
-// The five independent flavour pools: four damage tiers plus the killing
-// blow. The order is used as an array index AND as the severity ordering
-// itself (MINOR < MEDIUM < MAJOR < CRITICAL); keep the enum and every
-// table keyed by it in step. MELEE_FLAV_DEATH must stay last — the
-// sanitiser's one special case keys off it, and the four damage tiers
-// must be contiguous and ascending for melee_severity() to return them
-// as an ordering.
+// The seven independent flavour pools: four damage tiers, the killing
+// blow, and the two an affliction speaks. The order is used as an array
+// index AND as the severity ordering itself (MINOR < MEDIUM < MAJOR <
+// CRITICAL); keep the enum and every table keyed by it in step.
+//
+// The four damage tiers must stay contiguous and ascending — that is
+// what melee_severity() returns as an ordering, and the tables sized
+// MELEE_FLAV_DEATH cover exactly them. The tail beyond them is three
+// non-tier categories in no particular order: the sanitiser reads its
+// requirements from a table indexed by category, so nothing keys off any
+// one of them being last.
 typedef enum
 {
   MELEE_FLAV_MINOR = 0,
@@ -116,6 +124,8 @@ typedef enum
   MELEE_FLAV_MAJOR,
   MELEE_FLAV_CRITICAL,
   MELEE_FLAV_DEATH,
+  MELEE_FLAV_DOT_TICK,
+  MELEE_FLAV_DOT_DEATH,
   MELEE_FLAV__COUNT
 } melee_flavour_t;
 
@@ -514,10 +524,11 @@ void melee_render_dot_inflict(char *out, size_t cap, const char *atk_nick,
 // blow; the death line carries none.
 void melee_render_dot_tick(char *out, size_t cap, const char *src_nick,
     const char *tgt_nick, int32_t dmg, int32_t hp, int32_t hp_max,
-    melee_dot_kind_t kind);
+    melee_dot_kind_t kind, const melee_tunables_t *t, bool *need_refill);
 
 void melee_render_dot_death(char *out, size_t cap, const char *src_nick,
-    const char *tgt_nick, melee_dot_kind_t kind);
+    const char *tgt_nick, melee_dot_kind_t kind, const melee_tunables_t *t,
+    bool *need_refill);
 
 const char *melee_dot_name_of (melee_dot_kind_t kind);
 const char *melee_dot_emoji_of(melee_dot_kind_t kind);
@@ -601,13 +612,15 @@ void melee_pool_stats(melee_flavour_t cat, melee_pool_stat_t *out);
 // How often a pool came up dry and the static tables spoke instead.
 uint64_t melee_pool_fallbacks(void);
 
-// Substitute {attacker}/{target}/{damage} into a bounded buffer, copying
-// every other byte literally. Never hands `tmpl` to a printf conversion,
-// and never rescans what it substituted — a `{` inside a nickname is
-// data. The three values arrive already colorized, exactly as they do
-// for the static tables.
+// Substitute {attacker}/{target}/{damage}/{affliction} into a bounded
+// buffer, copying every other byte literally. Never hands `tmpl` to a
+// printf conversion, and never rescans what it substituted — a `{`
+// inside a nickname is data. The values arrive already colorized,
+// exactly as they do for the static tables; NULL is legal for a token
+// the category's line can never carry and expands to nothing.
 void melee_tmpl_expand(char *out, size_t cap, const char *tmpl,
-    const char *attacker, const char *target, const char *damage);
+    const char *attacker, const char *target, const char *damage,
+    const char *affliction);
 
 // ---- Command surface (melee_cmds.c) -------------------------------- //
 

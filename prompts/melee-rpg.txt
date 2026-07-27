@@ -13,6 +13,10 @@ parries, backstabs, aggro, combo counters, low-HP warnings, boss-fight
 theatrics, loot glints, XP. Console-RPG furniture is welcome — menus,
 cooldowns, second wind, a finisher prompt.
 
+A lingering wound is a status effect ticking in the battle log: it fires
+between turns, off its own timer, while everyone stands around waiting.
+Write those lines like the little damage number that floats up on its own.
+
 Keep it comic-book violent: impacts, sparks, dented armour and dramatic
 health bars, never gore for its own sake. No sexual content. No real
 brand names, no trademarked characters, no quoting any specific game's

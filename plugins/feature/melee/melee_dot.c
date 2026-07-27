@@ -95,6 +95,7 @@ melee_dot_service(const melee_dot_due_t *d, const melee_tunables_t *t)
   int32_t         dmg;
   int32_t         new_hp;
   bool            fatal;
+  bool            refill = false;
 
   pthread_mutex_lock(&melee_turn_lock);
 
@@ -134,15 +135,21 @@ melee_dot_service(const melee_dot_due_t *d, const melee_tunables_t *t)
 
   if(fatal)
     melee_render_dot_death(line, sizeof(line), d->source_nick,
-        d->victim_nick, d->kind);
+        d->victim_nick, d->kind, t, &refill);
 
   else
     melee_render_dot_tick(line, sizeof(line), d->source_nick, d->victim_nick,
-        dmg, new_hp, victim.hp_max, d->kind);
+        dmg, new_hp, victim.hp_max, d->kind, t, &refill);
 
   pthread_mutex_unlock(&melee_turn_lock);
 
   melee_dot_speak(d, t, line, fatal);
+
+  // Last, with no lock held and the door already closed behind the
+  // fallen — the same ordering the turn path uses, for the same reason.
+  if(refill)
+    melee_llm_refill_kick(fatal ? MELEE_FLAV_DOT_DEATH : MELEE_FLAV_DOT_TICK,
+        t);
 }
 
 // ------------------------------------------------------------------ //

@@ -475,7 +475,7 @@ melee_render_blow(char *out, size_t cap, const char *atk_nick,
 
   if(melee_pool_take(sev, tmpl, sizeof(tmpl),
         t != NULL ? t->llm_refill_at : 0, need_refill) == SUCCESS)
-    melee_tmpl_expand(body, sizeof(body), tmpl, atk, tgt, dmgs);
+    melee_tmpl_expand(body, sizeof(body), tmpl, atk, tgt, dmgs, NULL);
 
   else
   {
@@ -534,7 +534,7 @@ melee_render_death(char *out, size_t cap, const char *slayer_nick,
   // the sanitiser rejects any death template that asks for one.
   if(melee_pool_take(MELEE_FLAV_DEATH, tmpl, sizeof(tmpl),
         t != NULL ? t->llm_refill_at : 0, need_refill) == SUCCESS)
-    melee_tmpl_expand(body, sizeof(body), tmpl, slayer, fallen, "");
+    melee_tmpl_expand(body, sizeof(body), tmpl, slayer, fallen, "", NULL);
 
   else
   {
@@ -553,12 +553,14 @@ melee_render_death(char *out, size_t cap, const char *slayer_nick,
 void
 melee_render_dot_tick(char *out, size_t cap, const char *src_nick,
     const char *tgt_nick, int32_t dmg, int32_t hp, int32_t hp_max,
-    melee_dot_kind_t kind)
+    melee_dot_kind_t kind, const melee_tunables_t *t, bool *need_refill)
 {
   char src [MELEE_NICK_SZ + 8];
   char tgt [MELEE_NICK_SZ + 8];
   char dmgs[32];
+  char aff [64];
   char body[MELEE_LINE_SZ];
+  char tmpl[MELEE_LLM_TMPL_SZ];
 
   if(out == NULL || cap == 0)
     return;
@@ -568,10 +570,20 @@ melee_render_dot_tick(char *out, size_t cap, const char *src_nick,
   snprintf(src, sizeof(src), CLR_CYAN   "%s" CLR_RESET, src_nick);
   snprintf(tgt, sizeof(tgt), CLR_PURPLE "%s" CLR_RESET, tgt_nick);
   snprintf(dmgs, sizeof(dmgs), "%s%d" CLR_RESET, melee_dot_color_of(kind), dmg);
+  snprintf(aff, sizeof(aff), "%s%s" CLR_RESET, melee_dot_color_of(kind),
+      melee_dot_name_of(kind));
 
-  snprintf(body, sizeof(body),
-      melee_dot_tick_tbl[kind][util_rand(melee_dot_tick_n[kind])],
-      src, tgt, dmgs);
+  if(melee_pool_take(MELEE_FLAV_DOT_TICK, tmpl, sizeof(tmpl),
+        t != NULL ? t->llm_refill_at : 0, need_refill) == SUCCESS)
+    melee_tmpl_expand(body, sizeof(body), tmpl, src, tgt, dmgs, aff);
+
+  else
+  {
+    melee_pool_fallback();
+    snprintf(body, sizeof(body),
+        melee_dot_tick_tbl[kind][util_rand(melee_dot_tick_n[kind])],
+        src, tgt, dmgs);
+  }
 
   if(hp > 0)
     snprintf(out, cap, "%s %s " CLR_GRAY "[%s — %d/%d hp]" CLR_RESET,
@@ -583,11 +595,14 @@ melee_render_dot_tick(char *out, size_t cap, const char *src_nick,
 
 void
 melee_render_dot_death(char *out, size_t cap, const char *src_nick,
-    const char *tgt_nick, melee_dot_kind_t kind)
+    const char *tgt_nick, melee_dot_kind_t kind, const melee_tunables_t *t,
+    bool *need_refill)
 {
   char src [MELEE_NICK_SZ + 8];
   char tgt [MELEE_NICK_SZ + 8];
+  char aff [64];
   char body[MELEE_LINE_SZ];
+  char tmpl[MELEE_LLM_TMPL_SZ];
 
   if(out == NULL || cap == 0)
     return;
@@ -596,9 +611,23 @@ melee_render_dot_death(char *out, size_t cap, const char *src_nick,
 
   snprintf(src, sizeof(src), CLR_CYAN   "%s" CLR_RESET, src_nick);
   snprintf(tgt, sizeof(tgt), CLR_PURPLE "%s" CLR_RESET, tgt_nick);
+  snprintf(aff, sizeof(aff), "%s%s" CLR_RESET, melee_dot_color_of(kind),
+      melee_dot_name_of(kind));
 
-  snprintf(body, sizeof(body),
-      melee_dot_death_tbl[kind][util_rand(melee_dot_death_n[kind])], src, tgt);
+  // No tally, exactly as the blade's death line carries none: {damage}
+  // expands to nothing and the sanitiser rejects any template asking
+  // for one.
+  if(melee_pool_take(MELEE_FLAV_DOT_DEATH, tmpl, sizeof(tmpl),
+        t != NULL ? t->llm_refill_at : 0, need_refill) == SUCCESS)
+    melee_tmpl_expand(body, sizeof(body), tmpl, src, tgt, "", aff);
+
+  else
+  {
+    melee_pool_fallback();
+    snprintf(body, sizeof(body),
+        melee_dot_death_tbl[kind][util_rand(melee_dot_death_n[kind])],
+        src, tgt);
+  }
 
   // The same headstone the turn engine's death line carries, so a death
   // by decay is unmistakably the same event as a death by blade.

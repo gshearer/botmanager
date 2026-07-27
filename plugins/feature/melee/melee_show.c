@@ -698,7 +698,7 @@ melee_show_scores(const cmd_ctx_t *ctx)
                          + MELEE_W_FREJ + 10)
 
 static const char *const melee_flav_label[MELEE_FLAV__COUNT] = {
-  "minor", "medium", "major", "critical", "deaths"
+  "minor", "medium", "major", "critical", "deaths", "decay", "decay kill"
 };
 
 static void
