@@ -705,11 +705,13 @@ melee_llm_refill_task(task_t *t)
       persona[--n] = '\0';
   }
 
-  // A missing or empty persona file is not an error — it means the pit
-  // speaks in the model's own voice.
+  // A missing persona file is not fatal — the pit then speaks in the
+  // model's own voice — but it is almost always a typo, and two shipped
+  // personas mean twice the chance of one. CLAM_WARN, not CLAM_DEBUG:
+  // this fires once per refill, not once per line.
   else if(r->t.llm_prompt[0] != '\0')
-    clam(CLAM_DEBUG, MELEE_CTX, "persona file unreadable: '%s'",
-        r->t.llm_prompt);
+    clam(CLAM_WARN, MELEE_CTX, "persona file unreadable: '%s' (the model "
+        "will write in its own voice)", r->t.llm_prompt);
 
   snprintf(rules, sizeof(rules), melee_fmt_for(r->cat), r->t.llm_pool);
   snprintf(sys, sizeof(sys), "%s%s%s", persona,

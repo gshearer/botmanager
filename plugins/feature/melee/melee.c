@@ -52,9 +52,12 @@ static const plugin_kv_entry_t melee_kv_schema[] = {
   { MELEE_KV_LLM_MODEL,   KV_STR,    "",
     "Chat model (from the llm subsystem) that authors combat flavour; "
     "empty = use the built-in lines" },
-  { MELEE_KV_LLM_PROMPT,  KV_STR,    "../prompts/melee.txt",
+  { MELEE_KV_LLM_PROMPT,  KV_STR,    "../prompts/melee-drow.txt",
     "Path to the persona prompt prepended to every flavour request "
-    "(relative to the daemon CWD)" },
+    "(relative to the daemon CWD). Two ship: ../prompts/melee-drow.txt "
+    "(the Underdark duelling pit) and ../prompts/melee-rpg.txt (a "
+    "video-game battle log). An unreadable path means the model speaks "
+    "in its own voice" },
   { MELEE_KV_LLM_POOL,    KV_UINT32, "20",
     "Lines requested per category per refill" },
   { MELEE_KV_LLM_REFILL,  KV_UINT32, "6",

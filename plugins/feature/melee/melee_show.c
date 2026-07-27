@@ -18,6 +18,7 @@
 #include <inttypes.h>
 #include <stdio.h>
 #include <string.h>
+#include <unistd.h>
 
 // ------------------------------------------------------------------ //
 // Column geometry                                                     //
@@ -818,9 +819,26 @@ melee_show_llm(const cmd_ctx_t *ctx)
   }
 
   snprintf(line, sizeof(line),
-      "  source   " CLR_CYAN "%s" CLR_RESET CLR_GRAY " (chat) · persona "
-      CLR_RESET "%s", t.llm_model,
-      t.llm_prompt[0] != '\0' ? t.llm_prompt : "(none)");
+      "  source   " CLR_CYAN "%s" CLR_RESET CLR_GRAY " (chat)" CLR_RESET,
+      t.llm_model);
+  cmd_reply(ctx, line);
+
+  // Two personas ship, so the path is worth stating — and worth probing.
+  // An unreadable one is silently survivable (the model writes in its own
+  // voice), which is exactly why it must not be silent here. access() at
+  // view time is cheap; this is not a hot path.
+  if(t.llm_prompt[0] == '\0')
+    snprintf(line, sizeof(line),
+        "  persona  " CLR_GRAY "(none — the model writes in its own voice)"
+        CLR_RESET);
+
+  else
+    snprintf(line, sizeof(line), "  persona  %s %s", t.llm_prompt,
+        access(t.llm_prompt, R_OK) == 0
+          ? CLR_GREEN "✓ readable" CLR_RESET
+          : CLR_RED   "✗ unreadable — the model writes in its own voice"
+            CLR_RESET);
+
   cmd_reply(ctx, line);
 
   melee_rule(rule, sizeof(rule), MELEE_W_FLAV);
