@@ -46,7 +46,7 @@ alongside its code.
 | Work on `!imagine` (text-to-image) or the `image` LLM kind | `plugins/extension/inference/imagine_zimage/` (the loaded variant) + `plugins/extension/inference/imagine/imagine_cmd.c` (dormant, inference-backed) + `plugins/extension/inference/LLM.md` |
 | Work on GIF search (`!giphy`) | `plugins/service/giphy/` — one leaf-service plugin: `giphy.c` (provider) + `giphy_cmd.c` (command surface), contract in `giphy_api.h` |
 | Work on stock/equity/fund/commodity quotes (`!stock`) | `TODO.md` §STOCK-1..5 + `include/stockquote.h` (contract) + `plugins/service/yahoofinance/` (provider) + `plugins/feature/stock/` (command) |
-| Work on the melee duelling game (`!melee`, `show melee`; persona asset `prompts/melee.txt`) | `plugins/feature/melee/AGENTS.md` |
+| Work on the melee duelling game (`!melee`, `show melee`; persona assets `prompts/melee-drow.txt`, `prompts/melee-rpg.txt`) | `plugins/feature/melee/AGENTS.md` |
 | Work on video-game info (`!rawg`) | `plugins/service/rawg/` — one leaf-service plugin: `rawg.c` (provider) + `rawg_cmd.c` (command surface), contract in `rawg_api.h` |
 | Work on movie / TV / actor info (`!tmdb`) | `plugins/service/tmdb/` — one leaf-service plugin: `tmdb.c` (provider) + `tmdb_cmd.c` (command surface), contract in `tmdb_api.h` |
 | Work on the word of the day (`!wotd`) or dictionary lookup (`!dict`) | `plugins/service/wordnik/` — one leaf-service plugin: `wordnik.c` (provider) + `wordnik_cmd.c` (command surface, both commands), contract in `wordnik_api.h` |
