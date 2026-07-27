@@ -2,11 +2,11 @@
 // WHENMOON_INTERNAL-gated.
 //
 // On market start (and on a runtime strategy attach) the market enters a
-// warmup lifecycle: compute the deepest declared min_history across the
-// attached strategy roster, gap-fill the recent 1m window from the
-// exchange into the authoritative candle DB, replay it (cascading
-// 1m→…→1d), then promote to READY. The trade engine acts on strategy
-// advice only in WM_WARM_READY.
+// warmup lifecycle: compute the attached strategy's declared min_history
+// (a market holds at most one strategy — WM-MI-3), gap-fill the recent
+// 1m window from the exchange into the authoritative candle DB, replay
+// it (cascading 1m→…→1d), then promote to READY. The trade engine acts
+// on strategy advice only in WM_WARM_READY.
 //
 // Two timers, at DIFFERENT granularities — don't conflate them:
 //
@@ -75,9 +75,9 @@ struct whenmoon_market;
 #define WM_WARMUP_DEFER_MS            250u
 
 // Begin (or restart) the warmup lifecycle for a market. Reads the
-// attached strategy roster to size the required history, enqueues DB
+// attached strategy to size the required history, enqueues DB
 // gap-fills for the recent window, and schedules the convergence
-// re-check (which replays + promotes to READY). Zero strategies =
+// re-check (which replays + promotes to READY). No strategy =
 // feed-only: a shallow ring warm + immediate READY. Idempotent — safe to
 // call again when a strategy attaches at runtime (bumps warmup_gen so any
 // prior timer retires). Called off mk->lock.

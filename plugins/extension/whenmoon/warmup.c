@@ -1,5 +1,5 @@
 // botmanager — MIT
-// warmup.c — WM-WARMUP-2 market warmup lifecycle: roster-sized,
+// warmup.c — WM-WARMUP-2 market warmup lifecycle: strategy-sized,
 // DB-first gap-fill + convergence + authoritative tail-fill.
 
 #define WHENMOON_INTERNAL

@@ -23,10 +23,6 @@
 #include <stdlib.h>
 #include <string.h>
 #include <strings.h>
-
-// Stack-array cap for the attached-strategy advisor stack rendered in
-// /show whenmoon market <id>. Far above any realistic per-market roster.
-#define WM_MARKET_SHOW_MAX_STRAT  16
 #include <time.h>
 
 // Read one market-id token off ctx->args, parse it, and produce the
@@ -1345,65 +1341,54 @@ wm_obs_render_card(const cmd_ctx_t *ctx,
       "  recent real fills (oldest first):");
 }
 
-// Render the attached-strategy advisor stack for one market: each
-// attachment in poll order (ascending priority) with its live counters,
-// last signal, and resolved per-market param values. The market-centric
-// companion to /show whenmoon strategy <name> — answers "what is advising
-// THIS market and what is each knob actually set to here". Param values
-// carry a source tag: m=per-market override, g=global, d=schema default.
+// Render the attached strategy for one market (at most one, WM-MI-3)
+// with its live counters, last signal, and resolved per-market param
+// values. The market-centric companion to /show whenmoon strategy
+// <name> — answers "what is advising THIS market and what is each knob
+// actually set to here". Param values carry a source tag:
+// m=per-market override, g=global, d=schema default.
 static void
 wm_obs_render_strategies(const cmd_ctx_t *ctx, whenmoon_state_t *st,
     const char *market_id_str)
 {
-  wm_market_attach_snapshot_t snaps[WM_MARKET_SHOW_MAX_STRAT];
-  uint32_t                    n;
-  uint32_t                    i;
+  wm_market_attach_snapshot_t snap;
+  const wm_market_attach_snapshot_t *s = &snap;
+  char     line[320];
+  uint32_t off;
+  uint32_t j;
+  int      w;
 
-  n = wm_strategy_snapshot_market(st, market_id_str, snaps,
-      (uint32_t)(sizeof(snaps) / sizeof(snaps[0])));
-
-  if(n == 0)
+  if(wm_strategy_snapshot_market(st, market_id_str, &snap, 1) == 0)
   {
-    cmd_reply(ctx, "  strategies:  (none attached — feed-only)");
+    cmd_reply(ctx, "  strategy:  (none attached — feed-only)");
     return;
   }
 
-  cmd_reply(ctx, CLR_GRAY "  strategies (poll order):" CLR_RESET);
+  snprintf(line, sizeof(line),
+      "  strategy:  " CLR_BOLD "%.*s" CLR_RESET
+      "  bars_seen=%" PRIu64 " signals=%" PRIu64,
+      (int)(sizeof(s->strategy_name) - 1),
+      s->strategy_name, s->bars_seen, s->signals_emitted);
+  cmd_reply(ctx, line);
 
-  for(i = 0; i < n; i++)
+  if(s->has_last_signal)
   {
-    const wm_market_attach_snapshot_t *s = &snaps[i];
-    char     line[320];
-    uint32_t off;
-    uint32_t j;
-    int      w;
+    char    reason[WM_STRATEGY_REASON_SZ];
+    size_t  rlen;
+
+    rlen = strnlen(s->last_signal.reason, sizeof(reason) - 1);
+    memcpy(reason, s->last_signal.reason, rlen);
+    reason[rlen] = '\0';
 
     snprintf(line, sizeof(line),
-        "    [%u] " CLR_BOLD "%.*s" CLR_RESET
-        "  bars_seen=%" PRIu64 " signals=%" PRIu64,
-        s->priority, (int)(sizeof(s->strategy_name) - 1),
-        s->strategy_name, s->bars_seen, s->signals_emitted);
+        "        last_signal: score=%+.4f conf=%.4f reason=%s",
+        s->last_signal.score, s->last_signal.confidence,
+        reason[0] != '\0' ? reason : "(none)");
     cmd_reply(ctx, line);
+  }
 
-    if(s->has_last_signal)
-    {
-      char    reason[WM_STRATEGY_REASON_SZ];
-      size_t  rlen;
-
-      rlen = strnlen(s->last_signal.reason, sizeof(reason) - 1);
-      memcpy(reason, s->last_signal.reason, rlen);
-      reason[rlen] = '\0';
-
-      snprintf(line, sizeof(line),
-          "        last_signal: score=%+.4f conf=%.4f reason=%s",
-          s->last_signal.score, s->last_signal.confidence,
-          reason[0] != '\0' ? reason : "(none)");
-      cmd_reply(ctx, line);
-    }
-
-    if(s->n_params == 0)
-      continue;
-
+  if(s->n_params > 0)
+  {
     // Pack resolved params onto one wrapped line: name=value(source).
     off = (uint32_t)snprintf(line, sizeof(line), "        params:");
 

@@ -27,16 +27,6 @@ struct whenmoon_market;
 typedef struct loaded_strategy loaded_strategy_t;
 typedef struct wm_strategy_attachment wm_strategy_attachment_t;
 
-// WM-MK-3 advisor-walk dispatch constants.
-//   _DEFAULT_BASE: priority floor when no explicit value is supplied.
-//   _DEFAULT_STEP: gap between auto-assigned defaults; sparse layout
-//     leaves room for manual interleaving without renumbering.
-//   _DISPATCH_MAX_ATTACH: stack-array cap for per-bar attachment-sort
-//     scratch in wm_strategy_dispatch_bar / _dispatch_trade.
-#define WM_MK3_PRIORITY_DEFAULT_BASE  1000u
-#define WM_MK3_PRIORITY_DEFAULT_STEP  100u
-#define WM_MK3_DISPATCH_MAX_ATTACH    32
-
 // -----------------------------------------------------------------------
 // KV resolver (existing, retained from WM-G1 stub)
 // -----------------------------------------------------------------------
@@ -110,9 +100,6 @@ struct wm_strategy_attachment
 
   // Per-attachment context (passed to strategy callbacks).
   wm_strategy_ctx_t         ctx;
-
-  // WM-MK-3 advisor priority; lower = polled first; unique per market.
-  uint32_t                  priority;
 
   // Linkage in the per-strategy attachment list (owner->attachments).
   wm_strategy_attachment_t *next;
@@ -194,17 +181,14 @@ typedef enum
   WM_ATTACH_DUPLICATE,
   WM_ATTACH_INIT_FAILED,
   WM_ATTACH_OOM,
-  WM_ATTACH_PRIORITY_TAKEN,
+  WM_ATTACH_OCCUPIED,
 } wm_attach_result_t;
 
-// `explicit_priority` 0 means auto-pick the next free slot above the
-// current per-market max. Non-zero is honored verbatim and FAILs with
-// WM_ATTACH_PRIORITY_TAKEN if another attachment on the same market
-// already owns it. `out_priority` (may be NULL) receives the chosen
-// value on WM_ATTACH_OK.
+// WM-MI-3: a market instance holds exactly ONE strategy. Attaching to
+// a market that already has any attachment fails with
+// WM_ATTACH_OCCUPIED — detach first; there is no auto-detach.
 wm_attach_result_t wm_strategy_attach(struct whenmoon_state *st,
     const char *market_id_str, const char *strategy_name,
-    uint32_t explicit_priority, uint32_t *out_priority,
     char *err, size_t err_cap);
 
 typedef enum
@@ -217,22 +201,25 @@ typedef enum
 wm_detach_result_t wm_strategy_detach(struct whenmoon_state *st,
     const char *market_id_str, const char *strategy_name);
 
-// WM-RELOAD-1: one (market, priority) pair captured across a reload so
-// the live attachments can be replayed after the dlclose+dlopen cycle.
+// WM-RELOAD-1: cap on the number of MARKETS one strategy's attachments
+// can span in a reload snapshot (a strategy may be attached to many
+// markets; each market holds at most one attachment per WM-MI-3).
+#define WM_RELOAD_MAX_MARKETS  32
+
+// WM-RELOAD-1: one market id captured across a reload so the live
+// attachments can be replayed after the dlclose+dlopen cycle.
 // Sized to match wm_strategy_ctx.market_id_str.
 typedef struct
 {
-  char      market_id_str[64];
-  uint32_t  priority;
+  char  market_id_str[64];
 } wm_reattach_snap_t;
 
-// Reload: snapshot every attachment's (market, priority), detach them
-// all, drop the registry entry, plugin_unload + plugin_load +
-// plugin_resolve + plugin_init_all + plugin_start_all, re-scan the
-// registry, then replay the snapshot through wm_strategy_attach
-// (WM-RELOAD-1). Attach-time WM-SR-1/2 cursor seeding keeps the
-// replayed attachments from double-acting on bars the live session
-// already saw.
+// Reload: snapshot every attachment's market, detach them all, drop
+// the registry entry, plugin_unload + plugin_load + plugin_resolve +
+// plugin_init_all + plugin_start_all, re-scan the registry, then
+// replay the snapshot through wm_strategy_attach (WM-RELOAD-1).
+// Attach-time WM-SR-1/2 cursor seeding keeps the replayed attachments
+// from double-acting on bars the live session already saw.
 //
 // Returns SUCCESS + writes the detached / re-attached counts to
 // `out_n_detached` / `out_n_reattached` (either may be NULL); FAIL on
@@ -355,7 +342,6 @@ typedef struct
 typedef struct
 {
   char                     strategy_name[WM_STRATEGY_NAME_SZ];
-  uint32_t                 priority;
   uint64_t                 bars_seen;
   uint64_t                 signals_emitted;
   int64_t                  last_bar_ts_ms;
@@ -366,10 +352,10 @@ typedef struct
 } wm_market_attach_snapshot_t;
 
 // Copy up to `cap` attached-strategy snapshots for the named market
-// under the registry lock, sorted ascending by advisor priority (the
-// live poll order). Returns the number written; 0 if no strategy is
-// attached to the market. Each strategy's params are resolved against
-// the live KV at snapshot time via the two-tier resolver.
+// under the registry lock. A market holds at most one attachment
+// (WM-MI-3), so this returns 0 or 1; 0 if no strategy is attached.
+// Each strategy's params are resolved against the live KV at snapshot
+// time via the two-tier resolver.
 uint32_t wm_strategy_snapshot_market(struct whenmoon_state *st,
     const char *market_id_str,
     wm_market_attach_snapshot_t *out, uint32_t cap);

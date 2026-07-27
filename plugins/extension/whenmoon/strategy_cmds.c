@@ -15,7 +15,6 @@
 #include "kv.h"
 #include "userns.h"
 
-#include <errno.h>
 #include <inttypes.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -28,94 +27,36 @@
 #define WM_STRATEGY_SHOW_MAX_ATTACH  64
 
 // ----------------------------------------------------------------------- //
-// WM-WARMUP-2: per-market strategy roster KV sync                          //
+// WM-WARMUP-2 / WM-MI-3: per-market strategy binding KV sync              //
 //                                                                         //
-// The roster `plugin.whenmoon.market.<id>.strategies` (CSV) is the source //
-// of truth for which advisors a market auto-attaches + warms at start.    //
-// Runtime attach/detach keep it in sync so the set survives restart, and  //
-// a runtime attach re-runs the warmup lifecycle to the new depth.         //
+// The binding `plugin.whenmoon.market.<id>.strategy` (singular) names    //
+// the ONE strategy a market auto-attaches + warms at start; "" = feed-   //
+// only. Runtime attach/detach keep it in sync so it survives restart,    //
+// and a runtime attach re-runs the warmup lifecycle to the new depth.    //
 // ----------------------------------------------------------------------- //
 
 static void
-wm_roster_kv_key(const char *market_id_str, char *out, size_t cap)
+wm_binding_kv_key(const char *market_id_str, char *out, size_t cap)
 {
-  snprintf(out, cap, "plugin.whenmoon.market.%s.strategies", market_id_str);
-}
-
-static bool
-wm_roster_token_present(const char *csv, const char *name)
-{
-  char  src[512];
-  char *save = NULL;
-  char *tok;
-
-  snprintf(src, sizeof(src), "%s", csv);
-
-  for(tok = strtok_r(src, ", \t", &save); tok != NULL;
-      tok = strtok_r(NULL, ", \t", &save))
-    if(strcmp(tok, name) == 0)
-      return(true);
-
-  return(false);
+  snprintf(out, cap, "plugin.whenmoon.market.%s.strategy", market_id_str);
 }
 
 static void
-wm_roster_add(const char *market_id_str, const char *name)
+wm_binding_set(const char *market_id_str, const char *name)
 {
-  char        key[160];
-  const char *cur;
-  char        buf[512];
+  char key[160];
 
-  wm_roster_kv_key(market_id_str, key, sizeof(key));
-  cur = kv_get_str(key);
-
-  if(cur != NULL && wm_roster_token_present(cur, name))
-    return;
-
-  if(cur == NULL || cur[0] == '\0')
-    snprintf(buf, sizeof(buf), "%s", name);
-
-  else
-    snprintf(buf, sizeof(buf), "%s,%s", cur, name);
-
-  (void)kv_set_str(key, buf);
+  wm_binding_kv_key(market_id_str, key, sizeof(key));
+  (void)kv_set_str(key, name);
 }
 
 static void
-wm_roster_remove(const char *market_id_str, const char *name)
+wm_binding_clear(const char *market_id_str)
 {
-  char    key[160];
-  char    src[512];
-  char    out[512];
-  char   *save = NULL;
-  char   *tok;
-  size_t  off  = 0;
+  char key[160];
 
-  {
-    const char *cur;
-
-    wm_roster_kv_key(market_id_str, key, sizeof(key));
-    cur = kv_get_str(key);
-
-    if(cur == NULL || cur[0] == '\0')
-      return;
-
-    snprintf(src, sizeof(src), "%s", cur);
-  }
-
-  out[0] = '\0';
-
-  for(tok = strtok_r(src, ", \t", &save); tok != NULL;
-      tok = strtok_r(NULL, ", \t", &save))
-  {
-    if(strcmp(tok, name) == 0)
-      continue;
-
-    off += (size_t)snprintf(out + off, sizeof(out) - off, "%s%s",
-        off > 0 ? "," : "", tok);
-  }
-
-  (void)kv_set_str(key, out);
+  wm_binding_kv_key(market_id_str, key, sizeof(key));
+  (void)kv_set_str(key, "");
 }
 
 // ----------------------------------------------------------------------- //
@@ -129,13 +70,10 @@ wm_strategy_cmd_attach(const cmd_ctx_t *ctx)
   const char        *p;
   char               id_tok[64]   = {0};
   char               name_tok[WM_STRATEGY_NAME_SZ] = {0};
-  char               kw_tok[16]   = {0};
-  char               prio_tok[16] = {0};
+  char               extra_tok[16] = {0};
   char               err[160];
   char               reply[224];
   wm_attach_result_t r;
-  uint32_t           explicit_priority = 0;
-  uint32_t           chosen_priority   = 0;
 
   st = whenmoon_get_state();
 
@@ -148,55 +86,16 @@ wm_strategy_cmd_attach(const cmd_ctx_t *ctx)
   p = ctx->args != NULL ? ctx->args : "";
 
   if(!wm_dl_next_token(&p, id_tok, sizeof(id_tok)) ||
-     !wm_dl_next_token(&p, name_tok, sizeof(name_tok)))
+     !wm_dl_next_token(&p, name_tok, sizeof(name_tok)) ||
+     wm_dl_next_token(&p, extra_tok, sizeof(extra_tok)))
   {
     cmd_reply(ctx,
-        "usage: /whenmoon strategy attach <market_id> <strategy_name>"
-        " [priority <n>]");
+        "usage: /whenmoon strategy attach <market_id> <strategy_name>");
     return;
   }
 
-  // Optional trailing `priority <n>`.
-  if(wm_dl_next_token(&p, kw_tok, sizeof(kw_tok)))
-  {
-    if(strcmp(kw_tok, "priority") != 0)
-    {
-      cmd_reply(ctx,
-          "usage: /whenmoon strategy attach <market_id> <strategy_name>"
-          " [priority <n>]");
-      return;
-    }
-
-    if(!wm_dl_next_token(&p, prio_tok, sizeof(prio_tok)))
-    {
-      cmd_reply(ctx, "attach failed: priority requires a value");
-      return;
-    }
-
-    {
-      char     *endp;
-      unsigned long v;
-
-      errno = 0;
-      v = strtoul(prio_tok, &endp, 10);
-
-      if(errno != 0 || endp == prio_tok || *endp != '\0' ||
-         v == 0 || v > UINT32_MAX)
-      {
-        snprintf(reply, sizeof(reply),
-            "attach failed: invalid priority '%s'"
-            " (expect 1..%u)", prio_tok, UINT32_MAX);
-        cmd_reply(ctx, reply);
-        return;
-      }
-
-      explicit_priority = (uint32_t)v;
-    }
-  }
-
   err[0] = '\0';
-  r = wm_strategy_attach(st, id_tok, name_tok, explicit_priority,
-      &chosen_priority, err, sizeof(err));
+  r = wm_strategy_attach(st, id_tok, name_tok, err, sizeof(err));
 
   switch(r)
   {
@@ -204,9 +103,9 @@ wm_strategy_cmd_attach(const cmd_ctx_t *ctx)
     {
       whenmoon_market_t *mk;
 
-      // Persist into the roster + re-run the warmup lifecycle so the
+      // Persist the binding + re-run the warmup lifecycle so the
       // market warms to this strategy's (possibly deeper) min_history.
-      wm_roster_add(id_tok, name_tok);
+      wm_binding_set(id_tok, name_tok);
 
       // WM-MKT-ARR-UAF-1: hold rdlock across lookup + all use of `mk`
       // (wm_market_warmup_begin) so a concurrent remove cannot free it.
@@ -221,8 +120,8 @@ wm_strategy_cmd_attach(const cmd_ctx_t *ctx)
         pthread_rwlock_unlock(&st->markets->arr_lock);
       }
 
-      snprintf(reply, sizeof(reply), "attached %s -> %s (priority=%u)",
-          name_tok, id_tok, chosen_priority);
+      snprintf(reply, sizeof(reply), "attached %s -> %s",
+          name_tok, id_tok);
       cmd_reply(ctx, reply);
       break;
     }
@@ -232,7 +131,7 @@ wm_strategy_cmd_attach(const cmd_ctx_t *ctx)
     case WM_ATTACH_DUPLICATE:
     case WM_ATTACH_INIT_FAILED:
     case WM_ATTACH_OOM:
-    case WM_ATTACH_PRIORITY_TAKEN:
+    case WM_ATTACH_OCCUPIED:
       snprintf(reply, sizeof(reply), "attach failed: %s",
           err[0] != '\0' ? err : "unknown");
       cmd_reply(ctx, reply);
@@ -281,9 +180,9 @@ wm_strategy_cmd_detach(const cmd_ctx_t *ctx)
   switch(r)
   {
     case WM_DETACH_OK:
-      // Drop from the roster so it doesn't re-attach on restart. No
-      // re-warm needed — fewer advisors can only lower the demand.
-      wm_roster_remove(id_tok, name_tok);
+      // Clear the binding so it doesn't re-attach on restart. No
+      // re-warm needed — an empty market can only lower the demand.
+      wm_binding_clear(id_tok);
       snprintf(reply, sizeof(reply), "detached %s -> %s",
           name_tok, id_tok);
       cmd_reply(ctx, reply);
@@ -708,7 +607,7 @@ wm_strategy_register_verbs(void)
   if(cmd_register("whenmoon", "strategy",
         "whenmoon strategy <verb> ...",
         "Trading-strategy registry controls.",
-        "Subcommands: attach <market_id> <name> [priority <n>],"
+        "Subcommands: attach <market_id> <name>,"
         " detach <market_id> <name>,"
         " reload <name>.",
         USERNS_GROUP_ADMIN, 100, CMD_SCOPE_ANY, METHOD_T_ANY,
@@ -717,16 +616,14 @@ wm_strategy_register_verbs(void)
     return(FAIL);
 
   if(cmd_register("whenmoon", "attach",
-        "whenmoon strategy attach <market_id> <strategy_name>"
-        " [priority <n>]",
+        "whenmoon strategy attach <market_id> <strategy_name>",
         "Attach a strategy to a running market."
         " Registers per-attachment KV override slots at"
         " plugin.whenmoon.market.<id>.strategy.<name>.<param>"
         " and runs the strategy's init() callback. Strategy must"
         " already be loaded (visible via /show whenmoon strategy)."
-        " Optional trailing `priority <n>` overrides the auto-picked"
-        " advisor priority (lower = polled first, unique per market);"
-        " omit for the next free slot.",
+        " A market holds exactly one strategy (WM-MI-3) — attaching"
+        " to an occupied market fails; detach first.",
         NULL,
         USERNS_GROUP_ADMIN, 100, CMD_SCOPE_ANY, METHOD_T_ANY,
         wm_strategy_cmd_attach, NULL, "whenmoon/strategy", NULL,

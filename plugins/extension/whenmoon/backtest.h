@@ -289,12 +289,6 @@ bool wm_bt_bench_return(const wm_backtest_snapshot_t *snap,
 // Iteration                                                               //
 // ----------------------------------------------------------------------- //
 
-// WM-BT-LINK-1: maximum strategies linked on one backtest market. The
-// live advisor walk caps attachments at WM_MK3_DISPATCH_MAX_ATTACH (32);
-// a backtest comparison never needs that many, and a small cap keeps the
-// per-iteration stack arrays tiny on the sweep worker threads.
-#define WM_BT_MAX_LINKED  4u
-
 // Allocate a fresh synthetic market id for one backtest iteration.
 // Format: "bt:<N>" where N is a process-monotonic counter. The returned
 // id is unique for the daemon's lifetime; reuse across the sweep
@@ -341,33 +335,13 @@ bool wm_backtest_run_iteration(struct whenmoon_state *st,
 // state advances naturally), but the strategy callback fires only
 // for bars inside a window. Use NULL or n_windows == 0 for the
 // single full-range path.
+//
+// This is the engine body: the synthetic market owns the single
+// position and the strategy is its one advisor, matching the live
+// WM-MI-3 model (one strategy per market instance).
 bool wm_backtest_run_iteration_with_id(struct whenmoon_state *st,
     wm_backtest_snapshot_t *snap,
     const char *strategy_name,
-    const char *synth_id,
-    const wm_backtest_params_t *params,
-    const wm_bt_window_t *windows, uint32_t n_windows,
-    wm_backtest_result_t *out,
-    char *err, size_t err_cap);
-
-// WM-BT-LINK-1: run one iteration with N (1..WM_BT_MAX_LINKED) strategies
-// LINKED on a single backtest market — the faithful test of whenmoon's
-// market-owned-position / strategies-as-advisors model (whenmoon_market_
-// model.md). All strategies share the one synthetic market (the market
-// owns the single position); on each subscribed bar they are polled in
-// ARRAY order (strategy_names[0] first = highest priority / lowest
-// priority number) and the FIRST to emit a non-zero signal wins, the rest
-// are not polled for that bar — bit-identical to the live priority walk in
-// wm_strategy_dispatch_bar. Each strategy reads its own params from the KV
-// resolver under its own name, so a linked run pins per-strategy configs
-// via the global/market KV slots (no per-strategy CLI axes yet).
-//
-// wm_backtest_run_iteration_with_id is a thin n==1 wrapper around this, so
-// every existing single-strategy caller (sweep / OOS / walk-forward) runs
-// the identical engine path and stays comparable to a linked run.
-bool wm_backtest_run_iteration_multi(struct whenmoon_state *st,
-    wm_backtest_snapshot_t *snap,
-    const char *const *strategy_names, uint32_t n_strats,
     const char *synth_id,
     const wm_backtest_params_t *params,
     const wm_bt_window_t *windows, uint32_t n_windows,

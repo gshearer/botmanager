@@ -1312,50 +1312,42 @@ wm_market_add(whenmoon_state_t *st,
   wm_market_resub_ws(st);
   wm_market_kick_backfill(st, exchange, product_id, instance);
 
-  // WM-WARMUP-2: auto-attach the declared strategy roster, then begin
-  // the warmup lifecycle. The roster KV is the source of truth for which
-  // advisors participate; warmup depth derives from their declared
-  // min_history. Zero strategies = feed-only (manual hand-trade) and
+  // WM-WARMUP-2 / WM-MI-3: auto-attach the declared strategy binding,
+  // then begin the warmup lifecycle. The binding KV names the ONE
+  // strategy this market runs; warmup depth derives from its declared
+  // min_history. An empty binding = feed-only (manual hand-trade) and
   // wm_market_warmup_begin promotes straight to READY.
   {
-    char        roster_key[160];
-    const char *roster;
+    char        binding_key[160];
+    const char *binding;
 
-    snprintf(roster_key, sizeof(roster_key),
-        "plugin.whenmoon.market.%s.strategies", mk->market_id_str);
+    snprintf(binding_key, sizeof(binding_key),
+        "plugin.whenmoon.market.%s.strategy", mk->market_id_str);
 
-    // Register before reading: kv_set (used by the attach/detach roster
+    // Register before reading: kv_set (used by the attach/detach binding
     // sync) rejects unregistered keys, and kv_register adopts any
-    // DB-persisted value so a restored roster is visible here. Idempotent
+    // DB-persisted value so a restored binding is visible here. Idempotent
     // across restarts.
-    (void)kv_register(roster_key, KV_STR, "", NULL, NULL,
-        "CSV strategy roster auto-attached + warmed on market start");
+    (void)kv_register(binding_key, KV_STR, "", NULL, NULL,
+        "strategy auto-attached + warmed on market start (\"\" = feed-only)");
 
-    roster = kv_get_str(roster_key);
+    binding = kv_get_str(binding_key);
 
-    if(roster != NULL && roster[0] != '\0')
+    if(binding != NULL && binding[0] != '\0')
     {
-      char  buf[512];
-      char *save = NULL;
-      char *tok;
+      char name[WM_STRATEGY_NAME_SZ];
+      char rerr[128];
 
-      // Copy out of the KV-owned pointer before the attach loop, which
-      // issues its own KV writes that could invalidate `roster`.
-      snprintf(buf, sizeof(buf), "%s", roster);
+      // Copy out of the KV-owned pointer before the attach, which
+      // issues its own KV writes that could invalidate `binding`.
+      snprintf(name, sizeof(name), "%s", binding);
+      rerr[0] = '\0';
 
-      for(tok = strtok_r(buf, ", \t", &save); tok != NULL;
-          tok = strtok_r(NULL, ", \t", &save))
-      {
-        char rerr[128];
-
-        rerr[0] = '\0';
-
-        if(wm_strategy_attach(st, mk->market_id_str, tok, 0, NULL,
-               rerr, sizeof(rerr)) != WM_ATTACH_OK)
-          clam(CLAM_INFO, WHENMOON_CTX,
-              "market %s: roster attach '%s' failed: %s",
-              mk->market_id_str, tok, rerr[0] != '\0' ? rerr : "?");
-      }
+      if(wm_strategy_attach(st, mk->market_id_str, name,
+             rerr, sizeof(rerr)) != WM_ATTACH_OK)
+        clam(CLAM_INFO, WHENMOON_CTX,
+            "market %s: binding attach '%s' failed: %s",
+            mk->market_id_str, name, rerr[0] != '\0' ? rerr : "?");
     }
   }
 
