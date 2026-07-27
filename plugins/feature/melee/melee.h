@@ -37,6 +37,18 @@
 #define MELEE_KV_EJECT       "plugin.melee.eject_on_death"
 #define MELEE_KV_SCORE_ROWS  "plugin.melee.scoreboard_rows"
 
+// LLM-authored combat flavour. Every one of these is inert while
+// MELEE_KV_LLM_MODEL names nothing usable: the pit then speaks from the
+// static tables in melee_combat.c, exactly as it always has.
+#define MELEE_KV_LLM_MODEL   "plugin.melee.llm.model"
+#define MELEE_KV_LLM_PROMPT  "plugin.melee.llm.prompt_file"
+#define MELEE_KV_LLM_POOL    "plugin.melee.llm.pool_size"
+#define MELEE_KV_LLM_REFILL  "plugin.melee.llm.refill_at"
+#define MELEE_KV_LLM_TEMP    "plugin.melee.llm.temperature_pct"
+#define MELEE_KV_LLM_TOKENS  "plugin.melee.llm.max_tokens"
+#define MELEE_KV_LLM_TIMEOUT "plugin.melee.llm.timeout_secs"
+#define MELEE_KV_LLM_RETRY   "plugin.melee.llm.retry_secs"
+
 // Storage bounds. The table prefix is a SQL identifier, so it is
 // validated as strict alnum/underscore before it can reach a query.
 #define MELEE_PREFIX_SZ      32                 // table-name prefix
@@ -53,6 +65,33 @@
 // it always fits inside the sentence that carries it; a roster longer
 // than this would not survive an IRC line anyway.
 #define MELEE_ROSTER_SZ      320
+
+// Ceiling on model-authored lines held per flavour category; the
+// pool_size knob clamps to it.
+#define MELEE_LLM_POOL_MAX   64
+// One un-expanded template. The arithmetic that fixes this number:
+// MELEE_LINE_SZ is 512 and must hold the EXPANDED line. Expansion
+// replaces {attacker}/{target} (10 and 8 bytes) with a colorized nick
+// (MELEE_NICK_SZ 63 + ~10 bytes of colour = ~73 each) and {damage}
+// (8 bytes) with a colorized number (~20). Worst-case growth is about
+// +150 bytes, and melee_render_blow then adds the emoji prefix and the
+// " [nick — hp/hp hp]" tail, another ~90. 256 + 150 + 90 = 496 < 512.
+// Do not raise this without redoing that sum.
+#define MELEE_LLM_TMPL_SZ    256
+// Filesystem path to the persona prompt, relative to the daemon CWD.
+#define MELEE_LLM_PATH_SZ    256
+// Longest model name the llm subsystem will hand back.
+#define MELEE_LLM_MODEL_SZ   64
+
+// The three independent flavour pools. The order is used as an array
+// index; keep the enum and every table keyed by it in step.
+typedef enum
+{
+  MELEE_FLAV_HIT = 0,
+  MELEE_FLAV_CRIT,
+  MELEE_FLAV_DEATH,
+  MELEE_FLAV__COUNT
+} melee_flavour_t;
 
 // Round lifecycle, as stored in <prefix>_rounds.state.
 #define MELEE_ROUND_ACTIVE    0
@@ -72,6 +111,18 @@ typedef struct
   uint32_t round_timeout;    // seconds of silence before a round is cold
   uint32_t scoreboard_rows;  // rows shown by `show melee scores`
   bool     eject_on_death;   // remove the fallen where the method allows
+
+  // Flavour authorship. `llm_model` empty is the off switch, and is the
+  // shipped default: the pit speaks from its static tables until an
+  // operator names a chat model.
+  char     llm_model[MELEE_LLM_MODEL_SZ];  // empty = feature off
+  char     llm_prompt[MELEE_LLM_PATH_SZ];  // empty/unreadable = no persona
+  uint32_t llm_pool;         // lines held per category
+  uint32_t llm_refill_at;    // low-water mark; always < llm_pool
+  uint32_t llm_temp_pct;     // sampling temperature x100
+  uint32_t llm_max_tokens;   // ceiling per refill request
+  uint32_t llm_timeout;      // seconds per refill request
+  uint32_t llm_retry;        // seconds a failed category waits
 } melee_tunables_t;
 
 // The three table names for the configured prefix, resolved together so
@@ -241,12 +292,76 @@ bool melee_db_deadliest(uint32_t ns_id, char *by, size_t by_cap,
 // Roll one blow. *crit_out reports whether it landed critical.
 int32_t melee_roll(const melee_tunables_t *t, bool *crit_out);
 
+// Both renderers consult the flavour pool first and fall back to the
+// static tables. `need_refill` (may be NULL) reports that the pool they
+// drew from has reached its low-water mark; the CALLER kicks the refill,
+// after the turn lock is released.
 void melee_render_blow(char *out, size_t cap, const char *atk_nick,
     const char *tgt_nick, int32_t dmg, bool crit, int32_t hp,
-    int32_t hp_max);
+    int32_t hp_max, const melee_tunables_t *t, bool *need_refill);
 
 void melee_render_death(char *out, size_t cap, const char *slayer_nick,
-    const char *fallen_nick);
+    const char *fallen_nick, const melee_tunables_t *t, bool *need_refill);
+
+// ---- LLM-authored flavour (melee_llm.c) ---------------------------- //
+
+// True only when the inference plugin is loaded AND `t->llm_model` names
+// a usable chat model. The plugin_find() gate comes FIRST and is not
+// optional: the dlsym shims in inference.h abort() when inference is
+// absent, and melee must stay deployable on a daemon with no LLM.
+bool melee_llm_enabled(const melee_tunables_t *t);
+
+// Why flavour authorship is off, or NULL when it is on. Same four gates
+// as melee_llm_enabled(), in the same order, phrased for a reader.
+const char *melee_llm_offreason(const melee_tunables_t *t);
+
+// Pop a uniformly-chosen template out of `cat`'s pool, swap-removing it
+// so one pool generation never speaks the same line twice. SUCCESS with
+// `out` populated, or FAIL when the pool is empty — on FAIL the caller
+// renders from the static tables. *need_refill is set when the pool has
+// fallen to `refill_at`; the CALLER kicks the refill, and only after it
+// has released every lock it holds.
+bool melee_pool_take(melee_flavour_t cat, char *out, size_t cap,
+    uint32_t refill_at, bool *need_refill);
+
+// Record that a pool came up dry and the static tables spoke instead.
+void melee_pool_fallback(void);
+
+// Arm a background refill for one category. Idempotent and cheap: a
+// no-op when the feature is off, when a refill is already in flight, or
+// while the failure backoff is still running. Never call it while
+// holding melee_turn_lock — keeping the turn path free of the task
+// system entirely is what makes "no LLM on the critical path"
+// inspectable rather than argued.
+void melee_llm_refill_kick(melee_flavour_t cat, const melee_tunables_t *t);
+
+// Fill all three pools at startup, so the pit is flavoured before the
+// first blow rather than after it.
+void melee_llm_prime(const melee_tunables_t *t);
+
+// One category's pool as `show melee llm` sees it.
+typedef struct
+{
+  uint32_t depth;         // unspoken lines held
+  uint64_t served;        // templates handed to the renderer
+  uint64_t rejected;      // model lines the sanitiser threw away
+  int64_t  wait;          // seconds of failure backoff left, 0 = none
+  bool     inflight;      // a refill is outstanding
+  char     last_error[128];
+} melee_pool_stat_t;
+
+void melee_pool_stats(melee_flavour_t cat, melee_pool_stat_t *out);
+
+// How often a pool came up dry and the static tables spoke instead.
+uint64_t melee_pool_fallbacks(void);
+
+// Substitute {attacker}/{target}/{damage} into a bounded buffer, copying
+// every other byte literally. Never hands `tmpl` to a printf conversion,
+// and never rescans what it substituted — a `{` inside a nickname is
+// data. The three values arrive already colorized, exactly as they do
+// for the static tables.
+void melee_tmpl_expand(char *out, size_t cap, const char *tmpl,
+    const char *attacker, const char *target, const char *damage);
 
 // ---- Command surface (melee_cmds.c) -------------------------------- //
 

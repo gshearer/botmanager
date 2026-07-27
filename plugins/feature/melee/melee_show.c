@@ -1,11 +1,13 @@
 // botmanager — MIT
-// melee's two read-only views: `show melee` draws the round burning in
+// melee's three read-only views: `show melee` draws the round burning in
 // this room, `show melee scores` the lifetime standings of everyone who
-// has ever swung in this namespace.
+// has ever swung in this namespace, and `show melee llm` says where the
+// pit's words are coming from.
 //
-// Both are plain SELECTs and take no lock. melee_turn_lock serialises
-// *writers*; a blow lands as one transaction, so the worst a reader can
-// catch is the instant between two finished turns.
+// The first two are plain SELECTs and take no lock. melee_turn_lock
+// serialises *writers*; a blow lands as one transaction, so the worst a
+// reader can catch is the instant between two finished turns. The third
+// takes melee_pool_lock only, never the turn lock.
 
 #define MELEE_INTERNAL
 #include "melee.h"
@@ -639,6 +641,172 @@ melee_show_scores(const cmd_ctx_t *ctx)
 }
 
 // ------------------------------------------------------------------ //
+// Where the words come from                                           //
+// ------------------------------------------------------------------ //
+
+#define MELEE_W_FCAT    11   // category, left-aligned
+#define MELEE_W_FPOOL    6
+#define MELEE_W_FSERVED  9
+#define MELEE_W_FREJ    10
+#define MELEE_W_FLAV    (2 + MELEE_W_FCAT + MELEE_W_FPOOL + MELEE_W_FSERVED \
+                         + MELEE_W_FREJ + 10)
+
+static const char *const melee_flav_label[MELEE_FLAV__COUNT] = {
+  "hits", "crits", "deaths"
+};
+
+static void
+melee_flav_header(const cmd_ctx_t *ctx)
+{
+  char line[MELEE_LINE_SZ];
+  char cell[MELEE_CELL_SZ];
+
+  snprintf(line, sizeof(line), "%s  ", CLR_GRAY);
+
+  snprintf(cell, sizeof(cell), "category");
+  melee_padr(cell, sizeof(cell), MELEE_W_FCAT);
+  melee_cat(line, sizeof(line), cell);
+
+  snprintf(cell, sizeof(cell), "pool");
+  melee_pad(cell, sizeof(cell), MELEE_W_FPOOL);
+  melee_cat(line, sizeof(line), cell);
+
+  snprintf(cell, sizeof(cell), "served");
+  melee_pad(cell, sizeof(cell), MELEE_W_FSERVED);
+  melee_cat(line, sizeof(line), cell);
+
+  snprintf(cell, sizeof(cell), "rejected");
+  melee_pad(cell, sizeof(cell), MELEE_W_FREJ);
+  melee_cat(line, sizeof(line), cell);
+
+  melee_cat(line, sizeof(line), "  state");
+  melee_cat(line, sizeof(line), CLR_RESET);
+  cmd_reply(ctx, line);
+}
+
+static void
+melee_flav_row(const cmd_ctx_t *ctx, melee_flavour_t cat,
+    const melee_pool_stat_t *s)
+{
+  char line[MELEE_LINE_SZ];
+  char cell[MELEE_CELL_SZ];
+  char num [32];
+  char state[48];
+
+  snprintf(line, sizeof(line), "  ");
+
+  snprintf(cell, sizeof(cell), CLR_CYAN "%s" CLR_RESET,
+      melee_flav_label[cat]);
+  melee_padr(cell, sizeof(cell), MELEE_W_FCAT);
+  melee_cat(line, sizeof(line), cell);
+
+  melee_fmt_num(num, sizeof(num), (int64_t)s->depth, MELEE_W_FPOOL);
+  snprintf(cell, sizeof(cell), "%s%s" CLR_RESET,
+      s->depth > 0 ? CLR_WHITE : CLR_GRAY, num);
+  melee_pad(cell, sizeof(cell), MELEE_W_FPOOL);
+  melee_cat(line, sizeof(line), cell);
+
+  melee_fmt_num(num, sizeof(num), (int64_t)s->served, MELEE_W_FSERVED);
+  snprintf(cell, sizeof(cell), "%s", num);
+  melee_pad(cell, sizeof(cell), MELEE_W_FSERVED);
+  melee_cat(line, sizeof(line), cell);
+
+  melee_fmt_num(num, sizeof(num), (int64_t)s->rejected, MELEE_W_FREJ);
+  snprintf(cell, sizeof(cell), "%s%s" CLR_RESET,
+      s->rejected > 0 ? CLR_YELLOW : CLR_GRAY, num);
+  melee_pad(cell, sizeof(cell), MELEE_W_FREJ);
+  melee_cat(line, sizeof(line), cell);
+
+  if(s->inflight)
+    snprintf(state, sizeof(state), CLR_YELLOW "refilling" CLR_RESET);
+
+  else if(s->wait > 0)
+    snprintf(state, sizeof(state), CLR_RED "waiting %" PRId64 "s" CLR_RESET,
+        s->wait);
+
+  else
+    snprintf(state, sizeof(state), CLR_GREEN "ready" CLR_RESET);
+
+  melee_cat(line, sizeof(line), "  ");
+  melee_cat(line, sizeof(line), state);
+  cmd_reply(ctx, line);
+}
+
+static void
+melee_show_llm(const cmd_ctx_t *ctx)
+{
+  melee_tunables_t  t;
+  melee_pool_stat_t s;
+  const char       *why;
+  char              line[MELEE_LINE_SZ];
+  char              rule[MELEE_LINE_SZ];
+  char              num [32];
+  melee_flavour_t   cat;
+  bool              errored = false;
+
+  melee_tunables_load(&t);
+  why = melee_llm_offreason(&t);
+
+  snprintf(line, sizeof(line),
+      "⚔ " CLR_BOLD "MELEE — FLAVOUR" CLR_RESET);
+  cmd_reply(ctx, line);
+
+  if(why != NULL)
+  {
+    // Collapsed view: the built-in lines are speaking, and the reader is
+    // told which gate closed rather than left to guess.
+    snprintf(line, sizeof(line),
+        "  the pit speaks its own built-in lines " CLR_GRAY "(%s%s%s)"
+        CLR_RESET, why,
+        t.llm_model[0] != '\0' ? ": " : "",
+        t.llm_model[0] != '\0' ? t.llm_model : "");
+    cmd_reply(ctx, line);
+    return;
+  }
+
+  snprintf(line, sizeof(line),
+      "  source   " CLR_CYAN "%s" CLR_RESET CLR_GRAY " (chat) · persona "
+      CLR_RESET "%s", t.llm_model,
+      t.llm_prompt[0] != '\0' ? t.llm_prompt : "(none)");
+  cmd_reply(ctx, line);
+
+  melee_rule(rule, sizeof(rule), MELEE_W_FLAV);
+  cmd_reply(ctx, rule);
+  melee_flav_header(ctx);
+
+  for(cat = MELEE_FLAV_HIT; cat < MELEE_FLAV__COUNT; cat++)
+  {
+    melee_pool_stats(cat, &s);
+    melee_flav_row(ctx, cat, &s);
+
+    if(s.last_error[0] != '\0')
+      errored = true;
+  }
+
+  cmd_reply(ctx, rule);
+
+  melee_fmt_num(num, sizeof(num), (int64_t)melee_pool_fallbacks(), 12);
+  snprintf(line, sizeof(line),
+      CLR_GRAY "fallbacks to the built-in lines: %s" CLR_RESET, num);
+  cmd_reply(ctx, line);
+
+  if(!errored)
+    return;
+
+  for(cat = MELEE_FLAV_HIT; cat < MELEE_FLAV__COUNT; cat++)
+  {
+    melee_pool_stats(cat, &s);
+
+    if(s.last_error[0] == '\0')
+      continue;
+
+    snprintf(line, sizeof(line), CLR_GRAY "%s: %.80s" CLR_RESET,
+        melee_flav_label[cat], s.last_error);
+    cmd_reply(ctx, line);
+  }
+}
+
+// ------------------------------------------------------------------ //
 // Registration                                                        //
 // ------------------------------------------------------------------ //
 
@@ -671,6 +839,19 @@ melee_show_register(void)
         "The row count is `plugin.melee.scoreboard_rows`.",
         USERNS_GROUP_EVERYONE, 0, CMD_SCOPE_ANY, METHOD_T_ANY,
         melee_show_scores, NULL, "show/melee", NULL,
+        NULL, 0, NULL, NULL) != SUCCESS)
+    return(FAIL);
+
+  if(cmd_register("melee", "llm",
+        "show melee llm",
+        "Where the pit's words come from.",
+        "Reports whether a language model is authoring the combat "
+        "flavour, which model, and how deep each category's pool of "
+        "unspoken lines is. When no model is configured, or when a pool "
+        "runs dry, the pit falls back to its built-in lines and this "
+        "view says so.",
+        USERNS_GROUP_EVERYONE, 0, CMD_SCOPE_ANY, METHOD_T_ANY,
+        melee_show_llm, NULL, "show/melee", NULL,
         NULL, 0, NULL, NULL) != SUCCESS)
     return(FAIL);
 

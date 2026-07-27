@@ -124,14 +124,19 @@ melee_roll(const melee_tunables_t *t, bool *crit_out)
 // Rendering                                                           //
 // ------------------------------------------------------------------ //
 
+// The pool supplies the sentence and nothing else: the emoji prefix, the
+// colorization, and the health tail below are melee's own, whether the
+// words came from a model or from the tables above.
 void
 melee_render_blow(char *out, size_t cap, const char *atk_nick,
-    const char *tgt_nick, int32_t dmg, bool crit, int32_t hp, int32_t hp_max)
+    const char *tgt_nick, int32_t dmg, bool crit, int32_t hp, int32_t hp_max,
+    const melee_tunables_t *t, bool *need_refill)
 {
   char atk [MELEE_NICK_SZ + 8];
   char tgt [MELEE_NICK_SZ + 8];
   char dmgs[32];
   char body[MELEE_LINE_SZ];
+  char tmpl[MELEE_LLM_TMPL_SZ];
 
   if(out == NULL || cap == 0)
     return;
@@ -145,13 +150,23 @@ melee_render_blow(char *out, size_t cap, const char *atk_nick,
   else
     snprintf(dmgs, sizeof(dmgs), CLR_YELLOW "%d" CLR_RESET, dmg);
 
-  if(crit)
-    snprintf(body, sizeof(body), melee_crits[util_rand(MELEE_N(melee_crits))],
-        atk, tgt, dmgs);
+  if(melee_pool_take(crit ? MELEE_FLAV_CRIT : MELEE_FLAV_HIT, tmpl,
+        sizeof(tmpl), t != NULL ? t->llm_refill_at : 0,
+        need_refill) == SUCCESS)
+    melee_tmpl_expand(body, sizeof(body), tmpl, atk, tgt, dmgs);
 
   else
-    snprintf(body, sizeof(body), melee_hits[util_rand(MELEE_N(melee_hits))],
-        atk, tgt, dmgs);
+  {
+    melee_pool_fallback();
+
+    if(crit)
+      snprintf(body, sizeof(body), melee_crits[util_rand(MELEE_N(melee_crits))],
+          atk, tgt, dmgs);
+
+    else
+      snprintf(body, sizeof(body), melee_hits[util_rand(MELEE_N(melee_hits))],
+          atk, tgt, dmgs);
+  }
 
   // The survivor's remaining health rides on every non-fatal line; the
   // nick inside the gray block stays plain so the block reads as one.
@@ -166,11 +181,12 @@ melee_render_blow(char *out, size_t cap, const char *atk_nick,
 
 void
 melee_render_death(char *out, size_t cap, const char *slayer_nick,
-    const char *fallen_nick)
+    const char *fallen_nick, const melee_tunables_t *t, bool *need_refill)
 {
   char slayer[MELEE_NICK_SZ + 8];
   char fallen[MELEE_NICK_SZ + 8];
   char body  [MELEE_LINE_SZ];
+  char tmpl  [MELEE_LLM_TMPL_SZ];
 
   if(out == NULL || cap == 0)
     return;
@@ -178,8 +194,18 @@ melee_render_death(char *out, size_t cap, const char *slayer_nick,
   snprintf(slayer, sizeof(slayer), CLR_CYAN   "%s" CLR_RESET, slayer_nick);
   snprintf(fallen, sizeof(fallen), CLR_PURPLE "%s" CLR_RESET, fallen_nick);
 
-  snprintf(body, sizeof(body), melee_deaths[util_rand(MELEE_N(melee_deaths))],
-      slayer, fallen);
+  // The death line carries no tally, so {damage} expands to nothing —
+  // the sanitiser rejects any death template that asks for one.
+  if(melee_pool_take(MELEE_FLAV_DEATH, tmpl, sizeof(tmpl),
+        t != NULL ? t->llm_refill_at : 0, need_refill) == SUCCESS)
+    melee_tmpl_expand(body, sizeof(body), tmpl, slayer, fallen, "");
+
+  else
+  {
+    melee_pool_fallback();
+    snprintf(body, sizeof(body),
+        melee_deaths[util_rand(MELEE_N(melee_deaths))], slayer, fallen);
+  }
 
   snprintf(out, cap, "☠ %s", body);
 }

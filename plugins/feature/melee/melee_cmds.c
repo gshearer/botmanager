@@ -109,6 +109,8 @@ melee_cmd_attack(const cmd_ctx_t *ctx)
   int32_t           new_hp;
   bool              crit  = false;
   bool              fatal = false;
+  bool              refill_blow  = false;   // the blow's own category
+  bool              refill_death = false;   // DEATH, on a fatal blow
 
   ns = userns_session_resolve(ctx);
 
@@ -264,24 +266,22 @@ melee_cmd_attack(const cmd_ctx_t *ctx)
   //          interleave their narration                               //
 
   melee_render_blow(line, sizeof(line), atk_nick, nick, dmg, crit,
-      new_hp, tgt.hp_max);
+      new_hp, tgt.hp_max, &t, &refill_blow);
   cmd_reply(ctx, line);
 
   if(fatal)
   {
-    melee_render_death(line, sizeof(line), atk_nick, nick);
+    melee_render_death(line, sizeof(line), atk_nick, nick, &t, &refill_death);
     cmd_reply(ctx, line);
   }
 
   pthread_mutex_unlock(&melee_turn_lock);
 
-  if(!fatal)
-    return;
-
   // ---- the door ----------------------------------------------------- //
   // Strictly after the death line: on IRC the strongest ejection is a
   // KILL, and nothing sent afterwards would ever reach the fallen.
 
+  if(fatal)
   {
     method_eject_t force = METHOD_EJECT_NONE;
     char           reason[128];
@@ -300,6 +300,18 @@ melee_cmd_attack(const cmd_ctx_t *ctx)
     clam(CLAM_INFO, MELEE_CTX, "round %" PRId64 ": %s slew %s (eject=%d)",
         round.id, ctx->username, tgt_user, (int)force);
   }
+
+  // ---- the flavour refill ------------------------------------------- //
+  // Last, with no lock held and the turn already over. The renderers
+  // only flagged the need; the task system is deliberately kept off the
+  // turn path entirely, so that "no LLM on the critical path" is
+  // inspectable rather than argued.
+
+  if(refill_blow)
+    melee_llm_refill_kick(crit ? MELEE_FLAV_CRIT : MELEE_FLAV_HIT, &t);
+
+  if(refill_death)
+    melee_llm_refill_kick(MELEE_FLAV_DEATH, &t);
 }
 
 // ------------------------------------------------------------------ //
