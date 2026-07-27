@@ -105,7 +105,6 @@ melee_cmd_attack(const cmd_ctx_t *ctx)
   char              tgt_user[MELEE_USER_SZ];
   char              line[MELEE_LINE_SZ];
   char              roster[MELEE_ROSTER_SZ];
-  char              reason[128];
   int32_t           dmg;
   int32_t           new_hp;
   bool              crit  = false;
@@ -285,6 +284,7 @@ melee_cmd_attack(const cmd_ctx_t *ctx)
 
   {
     method_eject_t force = METHOD_EJECT_NONE;
+    char           reason[128];
 
     if(t.eject_on_death)
     {

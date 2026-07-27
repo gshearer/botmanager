@@ -200,7 +200,12 @@ melee_fmt_num(char *out, size_t cap, int64_t v, int width)
   if(u < 0)               // too wide, yet under a thousand: leave it be
     return;
 
-  if(scaled > -100.0 && scaled < 100.0)
+  // The bound is 99.95, not 100: `%.1f` *rounds*, so a combatant on
+  // 99997 of 100000 hp scales to 99.997 and prints as "100.0K" — six
+  // characters where the one-decimal branch promised five, shoving the
+  // rest of the row two columns sideways. Anything that would round up
+  // to three integer digits belongs in the no-decimal branch.
+  if(scaled > -99.95 && scaled < 99.95)
     snprintf(out, cap, "%.1f%c", scaled, unit[u]);
 
   else
