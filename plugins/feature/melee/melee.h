@@ -44,6 +44,11 @@
 #define MELEE_USER_SZ        USERNS_USER_SZ     // 31
 #define MELEE_NICK_SZ        METHOD_NICKNAME_SZ // 64
 #define MELEE_MAX_PLAYERS    32                 // per round, for the show card
+#define MELEE_LINE_SZ        512                // one rendered, colorized line
+// A comma-joined display list. Deliberately well under MELEE_LINE_SZ so
+// it always fits inside the sentence that carries it; a roster longer
+// than this would not survive an IRC line anyway.
+#define MELEE_ROSTER_SZ      320
 
 // Round lifecycle, as stored in <prefix>_rounds.state.
 #define MELEE_ROUND_ACTIVE    0
@@ -74,6 +79,43 @@ typedef struct
   char scores [MELEE_TABLE_SZ];
 } melee_tables_t;
 
+// A brawl in progress, as the turn engine needs to see it.
+typedef struct
+{
+  int64_t id;
+  int32_t wave;
+  int32_t blows;
+  int32_t top_crit;
+  int64_t idle;        // seconds since last_action
+} melee_round_t;
+
+// One combatant's standing within a round.
+typedef struct
+{
+  char    nickname[MELEE_NICK_SZ];
+  int32_t hp;
+  int32_t hp_max;
+  int32_t last_wave;
+} melee_player_t;
+
+// One resolved turn, ready to be written. The `*_user` names are
+// namespace-scoped usernames and are the identity of record; the
+// `*_nick` names are display-only and are refreshed on every blow.
+typedef struct
+{
+  int64_t     round_id;
+  uint32_t    ns_id;
+  const char *atk_user;
+  const char *atk_nick;
+  const char *tgt_user;
+  const char *tgt_nick;
+  int32_t     dmg;
+  int32_t     wave;      // the wave the attacker is spending
+  bool        crit;
+  bool        new_top;   // this crit is the round's heaviest so far
+  bool        fatal;     // the target reaches 0 hp
+} melee_blow_t;
+
 // ---- Plugin core (melee.c) ----------------------------------------- //
 
 void melee_tunables_load(melee_tunables_t *out);
@@ -86,6 +128,54 @@ bool melee_tables_resolve(melee_tables_t *out);
 
 // Ensure the three tables + their indexes exist. Idempotent; runs once.
 bool melee_schema_ensure(void);
+
+// The active round in this room, if there is one.
+bool melee_db_round_find(uint32_t ns_id, const char *method,
+    const char *channel, melee_round_t *out);
+
+// Retire a round nobody came back to.
+bool melee_db_round_abandon(int64_t round_id);
+
+// Open a round. Returns the new id (>0) or -1.
+int64_t melee_db_round_open(uint32_t ns_id, const char *method,
+    const char *channel, const char *opener);
+
+// Enrol a combatant at full health, bumping <p>_scores.rounds iff they
+// were not already in this round. Returns true when newly enrolled.
+bool melee_db_player_enrol(int64_t round_id, uint32_t ns_id,
+    const char *username, const char *nickname, int32_t hp);
+
+bool melee_db_player_get(int64_t round_id, const char *username,
+    melee_player_t *out);
+
+// Comma-joined display names of the living who have not swung in
+// `wave`. Writes an empty string when nobody is pending.
+bool melee_db_pending(int64_t round_id, int32_t wave, char *out,
+    size_t cap);
+
+// Write a whole turn as one transaction: both combatants, the round
+// counters, both lifetime score rows, the wave advance, and — when the
+// blow is fatal — the round close and the kill/death tally. All or
+// nothing; a daemon death mid-turn can never leave the attacker charged
+// for a blow the target never took.
+bool melee_db_blow_apply(const melee_blow_t *blow);
+
+// ---- Combat (melee_combat.c) --------------------------------------- //
+
+// Roll one blow. *crit_out reports whether it landed critical.
+int32_t melee_roll(const melee_tunables_t *t, bool *crit_out);
+
+void melee_render_blow(char *out, size_t cap, const char *atk_nick,
+    const char *tgt_nick, int32_t dmg, bool crit, int32_t hp,
+    int32_t hp_max);
+
+void melee_render_death(char *out, size_t cap, const char *slayer_nick,
+    const char *fallen_nick);
+
+// ---- Command surface (melee_cmds.c) -------------------------------- //
+
+bool melee_commands_register(void);
+void melee_commands_unregister(void);
 
 #endif // MELEE_INTERNAL
 

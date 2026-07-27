@@ -84,6 +84,12 @@ melee_tunables_load(melee_tunables_t *out)
 static bool
 melee_init(void)
 {
+  if(melee_commands_register() != SUCCESS)
+  {
+    clam(CLAM_WARN, MELEE_CTX, "command registration failed");
+    return(FAIL);
+  }
+
   clam(CLAM_INFO, MELEE_CTX, "melee plugin initialized");
   return(SUCCESS);
 }
@@ -103,6 +109,7 @@ melee_start(void)
 static void
 melee_deinit(void)
 {
+  melee_commands_unregister();
   clam(CLAM_INFO, MELEE_CTX, "melee plugin deinitialized");
 }
 
