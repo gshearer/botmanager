@@ -724,6 +724,107 @@ wm_bt_equity_write(const char *sweep_dir,
   return(SUCCESS);
 }
 
+bool
+wm_bt_fills_write(const char *sweep_dir,
+    const wm_market_fill_t *fills, uint32_t n_fills,
+    char *err, size_t err_cap)
+{
+  char      path[1024];
+  FILE     *fp;
+  int       n;
+  uint32_t  i;
+
+  if(err != NULL && err_cap > 0)
+    err[0] = '\0';
+
+  if(sweep_dir == NULL || fills == NULL || n_fills == 0)
+  {
+    if(err != NULL)
+      snprintf(err, err_cap, "fills_write: no fills");
+    return(FAIL);
+  }
+
+  n = snprintf(path, sizeof(path), "%s/fills.jsonl", sweep_dir);
+
+  if(n < 0 || (size_t)n >= sizeof(path))
+  {
+    if(err != NULL)
+      snprintf(err, err_cap, "fills path overflow");
+    return(FAIL);
+  }
+
+  fp = fopen(path, "w");
+
+  if(fp == NULL)
+  {
+    if(err != NULL)
+      snprintf(err, err_cap,
+          "fopen('%s') failed: %s", path, strerror(errno));
+    return(FAIL);
+  }
+
+  for(i = 0; i < n_fills; i++)
+  {
+    const wm_market_fill_t *f   = &fills[i];
+    struct json_object     *row = json_object_new_object();
+    const char             *js;
+
+    if(row == NULL)
+    {
+      if(err != NULL)
+        snprintf(err, err_cap, "fills row %u: json alloc failed", i);
+
+      fclose(fp);
+      return(FAIL);
+    }
+
+    // `reason` is strategy-authored free text — serialize through
+    // json-c so quoting can never corrupt the stream, and bound the
+    // read in case the engine ever hands over a full unterminated 64.
+    json_object_object_add(row, "ts_ms",
+        json_object_new_int64(f->ts_ms));
+    json_object_object_add(row, "side",
+        json_object_new_string(f->side == 'b' ? "buy" : "sell"));
+    json_object_object_add(row, "qty",
+        json_object_new_double(f->qty));
+    json_object_object_add(row, "price",
+        json_object_new_double(f->price));
+    json_object_object_add(row, "fee",
+        json_object_new_double(f->fee));
+    json_object_object_add(row, "slippage",
+        json_object_new_double(f->slippage));
+    json_object_object_add(row, "realized_pnl",
+        json_object_new_double(f->realized_pnl));
+    json_object_object_add(row, "cash_after",
+        json_object_new_double(f->cash_after));
+    json_object_object_add(row, "position_after",
+        json_object_new_double(f->position_after));
+    json_object_object_add(row, "reason",
+        json_object_new_string_len(f->reason,
+            (int)strnlen(f->reason, sizeof(f->reason))));
+
+    js = json_object_to_json_string_ext(row,
+        JSON_C_TO_STRING_PLAIN | JSON_C_TO_STRING_NOSLASHESCAPE);
+
+    if(js == NULL || fputs(js, fp) < 0 || fputc('\n', fp) == EOF)
+    {
+      json_object_put(row);
+
+      if(err != NULL)
+        snprintf(err, err_cap, "fills write failed at row %u", i);
+
+      fclose(fp);
+      return(FAIL);
+    }
+
+    json_object_put(row);
+  }
+
+  fflush(fp);
+  fclose(fp);
+  return(SUCCESS);
+}
+
 // ----------------------------------------------------------------------- //
 // Manifest                                                                //
 // ----------------------------------------------------------------------- //

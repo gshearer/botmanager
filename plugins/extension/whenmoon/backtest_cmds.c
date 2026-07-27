@@ -819,6 +819,25 @@ wm_bt_run_task_cb(task_t *t)
           job->name, sweep_results[0].n_equity, job->sweep_dir);
   }
 
+  // WM-BT-9: the same runs persist the lossless fill stream beside the
+  // equity series, so calendar-window scorers (monthly round-trip
+  // gates) never depend on the 256-slot chart ring.
+  if(job->plan.total_iters == 1 && sweep_results[0].ok &&
+     sweep_results[0].fills != NULL)
+  {
+    err[0] = '\0';
+
+    if(wm_bt_fills_write(job->sweep_dir, sweep_results[0].fills,
+           sweep_results[0].n_fills, err, sizeof(err)) != SUCCESS)
+      clam(CLAM_WARN, WM_BT_CMD_CTX,
+          "run %s: fills.jsonl write failed: %s",
+          job->name, err[0] != '\0' ? err : "(unknown)");
+    else
+      clam(CLAM_INFO, WM_BT_CMD_CTX,
+          "run %s: %u fills -> %s/fills.jsonl",
+          job->name, sweep_results[0].n_fills, job->sweep_dir);
+  }
+
   // Post-run manifest rewrite with final stats. Atomic via tmp+rename.
   err[0] = '\0';
 
@@ -2292,7 +2311,7 @@ wm_backtest_register_verbs(void)
         " $HOME/.local/share/botmanager/backtests/) containing"
         " manifest.json, iterations.jsonl, top-N.txt, report.md, and"
         " a charts/ subdir. Single-config runs also write equity.jsonl"
-        " (daily mark-to-market samples); every run's metrics carry"
+        " (daily MTM marks) + fills.jsonl; every run's metrics carry"
         " mtm_max_dd + daily_sharpe_ann from the same daily marks"
         " (per-fill max_drawdown only observes fill days).\n"
         "--charts forces Lightweight Charts HTML emission for this"

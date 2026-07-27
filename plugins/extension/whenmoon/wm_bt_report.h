@@ -141,6 +141,20 @@ bool wm_bt_equity_write(const char *sweep_dir,
     const wm_bt_equity_pt_t *pts, uint32_t n_pts,
     char *err, size_t err_cap);
 
+// WM-BT-9: write `<sweep_dir>/fills.jsonl` — one line per synthetic
+// fill, oldest-to-newest, from the run's lossless accumulator (NOT the
+// 256-slot chart ring, which drops the oldest fills on active configs):
+//   {"ts_ms":…,"side":"buy"|"sell","qty":…,"price":…,"fee":…,
+//    "slippage":…,"realized_pnl":…,"cash_after":…,"position_after":…,
+//    "reason":…}
+// Called by the run task for single-config runs, beside equity.jsonl;
+// calendar-window scorers (monthly round-trip gates) read this stream.
+// Returns FAIL with `err` populated on an empty stream or an
+// fopen/path/serialize failure.
+bool wm_bt_fills_write(const char *sweep_dir,
+    const wm_market_fill_t *fills, uint32_t n_fills,
+    char *err, size_t err_cap);
+
 // Atomic write of `<sweep_dir>/manifest.json` via tmp + rename.
 // Captures sweep_id, source wm_file, snapshot range, strategy, sweep
 // axes, fixed params, run mode, ranking metric, top-N cap, thread
