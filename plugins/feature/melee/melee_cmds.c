@@ -331,6 +331,11 @@ melee_commands_register(void)
         NULL, NULL) != SUCCESS)
     return(FAIL);
 
+  // The read-only views hang off the core `show` parent, not off this
+  // command; melee_show.c owns them.
+  if(melee_show_register() != SUCCESS)
+    return(FAIL);
+
   return(SUCCESS);
 }
 

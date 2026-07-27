@@ -526,6 +526,213 @@ melee_db_pending(int64_t round_id, int32_t wave, char *out, size_t cap)
 }
 
 // ------------------------------------------------------------------ //
+// Reads for the views                                                 //
+// ------------------------------------------------------------------ //
+
+// `(state = 0) DESC` puts the live round first (Postgres orders false
+// before true), and last_action breaks the tie among finished ones — so
+// one query answers both "what is happening" and "what just happened".
+bool
+melee_db_card_find(uint32_t ns_id, const char *method, const char *channel,
+    melee_card_t *out)
+{
+  melee_tables_t t;
+  db_result_t   *res    = NULL;
+  char          *e_meth = NULL;
+  char          *e_chan = NULL;
+  char           room[512] = "";
+  char           sql[1024];
+  bool           hit = false;
+
+  if(out == NULL || melee_tables_resolve(&t) != SUCCESS)
+    return(false);
+
+  memset(out, 0, sizeof(*out));
+
+  // A direct message names no room, so the search widens to every room
+  // in the namespace rather than matching the empty string.
+  if(channel != NULL && channel[0] != '\0')
+  {
+    e_meth = db_escape(method != NULL ? method : "");
+    e_chan = db_escape(channel);
+
+    if(e_meth == NULL || e_chan == NULL)
+      goto out;
+
+    snprintf(room, sizeof(room), " AND method = '%s' AND channel = '%s'",
+        e_meth, e_chan);
+  }
+
+  snprintf(sql, sizeof(sql),
+      "SELECT id, channel, state, wave, blows,"
+      " EXTRACT(EPOCH FROM (COALESCE(ended_at, NOW()) - started_at))::bigint,"
+      " top_crit, top_crit_by, top_crit_on, slayer, fallen"
+      " FROM %s WHERE ns_id = %" PRIu32 "%s"
+      " ORDER BY (state = %d) DESC, last_action DESC LIMIT 1",
+      t.rounds, ns_id, room, MELEE_ROUND_ACTIVE);
+
+  res = db_result_alloc();
+
+  if(res != NULL && db_query(sql, res) == SUCCESS && res->ok && res->rows == 1)
+  {
+    out->id     = melee_col_i64(res, 0, 0);
+    melee_col_str(out->channel, sizeof(out->channel), res, 0, 1);
+    out->state  = melee_col_i32(res, 0, 2);
+    out->wave   = melee_col_i32(res, 0, 3);
+    out->blows  = melee_col_i32(res, 0, 4);
+    out->length = melee_col_i64(res, 0, 5);
+    out->top_crit = melee_col_i32(res, 0, 6);
+    melee_col_str(out->top_by,  sizeof(out->top_by),  res, 0, 7);
+    melee_col_str(out->top_on,  sizeof(out->top_on),  res, 0, 8);
+    melee_col_str(out->slayer,  sizeof(out->slayer),  res, 0, 9);
+    melee_col_str(out->fallen,  sizeof(out->fallen),  res, 0, 10);
+    hit = true;
+  }
+
+out:
+  db_result_free(res);
+  if(e_meth != NULL) mem_free(e_meth);
+  if(e_chan != NULL) mem_free(e_chan);
+
+  return(hit);
+}
+
+// COUNT(*) OVER () rides along on every row, so the roster and its true
+// size arrive together and the card can be honest about what it cut.
+uint32_t
+melee_db_card_roster(int64_t round_id, melee_card_row_t *out, uint32_t cap,
+    uint32_t *total)
+{
+  melee_tables_t t;
+  db_result_t   *res = NULL;
+  char           sql[768];
+  uint32_t       n = 0;
+
+  if(total != NULL)
+    *total = 0;
+
+  if(out == NULL || cap == 0 || round_id <= 0 ||
+     melee_tables_resolve(&t) != SUCCESS)
+    return(0);
+
+  snprintf(sql, sizeof(sql),
+      "SELECT CASE WHEN nickname <> '' THEN nickname ELSE username END,"
+      " hp, hp_max, dmg_given, dmg_taken, best_crit, last_wave,"
+      " COUNT(*) OVER ()"
+      " FROM %s WHERE round_id = %" PRId64
+      " ORDER BY hp DESC, dmg_given DESC, username LIMIT %" PRIu32,
+      t.players, round_id, cap);
+
+  res = db_result_alloc();
+
+  if(res != NULL && db_query(sql, res) == SUCCESS && res->ok)
+  {
+    for(n = 0; n < res->rows && n < cap; n++)
+    {
+      melee_col_str(out[n].name, sizeof(out[n].name), res, n, 0);
+      out[n].hp        = melee_col_i32(res, n, 1);
+      out[n].hp_max    = melee_col_i32(res, n, 2);
+      out[n].dmg_given = melee_col_i32(res, n, 3);
+      out[n].dmg_taken = melee_col_i32(res, n, 4);
+      out[n].best_crit = melee_col_i32(res, n, 5);
+      out[n].last_wave = melee_col_i32(res, n, 6);
+
+      if(total != NULL)
+        *total = (uint32_t)melee_col_i64(res, n, 7);
+    }
+  }
+
+  db_result_free(res);
+  return(n);
+}
+
+uint32_t
+melee_db_scores(uint32_t ns_id, uint32_t limit, melee_score_row_t *out,
+    uint32_t cap)
+{
+  melee_tables_t t;
+  db_result_t   *res = NULL;
+  char           sql[640];
+  uint32_t       n = 0;
+
+  if(out == NULL || cap == 0 || melee_tables_resolve(&t) != SUCCESS)
+    return(0);
+
+  if(limit > cap)
+    limit = cap;
+
+  if(limit == 0)
+    return(0);
+
+  snprintf(sql, sizeof(sql),
+      "SELECT CASE WHEN nickname <> '' THEN nickname ELSE username END,"
+      " rounds, kills, deaths, dmg_given, dmg_taken, crits, best_crit"
+      " FROM %s WHERE ns_id = %" PRIu32
+      " ORDER BY dmg_given DESC, username LIMIT %" PRIu32,
+      t.scores, ns_id, limit);
+
+  res = db_result_alloc();
+
+  if(res != NULL && db_query(sql, res) == SUCCESS && res->ok)
+  {
+    for(n = 0; n < res->rows && n < limit; n++)
+    {
+      melee_col_str(out[n].name, sizeof(out[n].name), res, n, 0);
+      out[n].rounds    = melee_col_i32(res, n, 1);
+      out[n].kills     = melee_col_i32(res, n, 2);
+      out[n].deaths    = melee_col_i32(res, n, 3);
+      out[n].dmg_given = melee_col_i64(res, n, 4);
+      out[n].dmg_taken = melee_col_i64(res, n, 5);
+      out[n].crits     = melee_col_i32(res, n, 6);
+      out[n].best_crit = melee_col_i32(res, n, 7);
+    }
+  }
+
+  db_result_free(res);
+  return(n);
+}
+
+bool
+melee_db_deadliest(uint32_t ns_id, char *by, size_t by_cap, char *on,
+    size_t on_cap, int32_t *dmg)
+{
+  melee_tables_t t;
+  db_result_t   *res = NULL;
+  char           sql[512];
+  bool           hit = false;
+
+  if(by == NULL || on == NULL || dmg == NULL || by_cap == 0 || on_cap == 0)
+    return(false);
+
+  by[0] = '\0';
+  on[0] = '\0';
+  *dmg  = 0;
+
+  if(melee_tables_resolve(&t) != SUCCESS)
+    return(false);
+
+  snprintf(sql, sizeof(sql),
+      "SELECT CASE WHEN nickname <> '' THEN nickname ELSE username END,"
+      " best_crit_on, best_crit FROM %s"
+      " WHERE ns_id = %" PRIu32 " AND best_crit > 0"
+      " ORDER BY best_crit DESC LIMIT 1",
+      t.scores, ns_id);
+
+  res = db_result_alloc();
+
+  if(res != NULL && db_query(sql, res) == SUCCESS && res->ok && res->rows == 1)
+  {
+    melee_col_str(by, by_cap, res, 0, 0);
+    melee_col_str(on, on_cap, res, 0, 1);
+    *dmg = melee_col_i32(res, 0, 2);
+    hit  = true;
+  }
+
+  db_result_free(res);
+  return(hit);
+}
+
+// ------------------------------------------------------------------ //
 // The blow                                                            //
 // ------------------------------------------------------------------ //
 

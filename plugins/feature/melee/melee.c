@@ -70,7 +70,8 @@ melee_tunables_load(melee_tunables_t *out)
   out->crit_min        = melee_clamp(kv_get_uint(MELEE_KV_CRIT_MIN),   1, 100000);
   out->crit_max        = melee_clamp(kv_get_uint(MELEE_KV_CRIT_MAX),   1, 100000);
   out->round_timeout   = melee_clamp(kv_get_uint(MELEE_KV_TIMEOUT),   30, 604800);
-  out->scoreboard_rows = melee_clamp(kv_get_uint(MELEE_KV_SCORE_ROWS), 1, 50);
+  out->scoreboard_rows = melee_clamp(kv_get_uint(MELEE_KV_SCORE_ROWS), 1,
+                                     MELEE_MAX_SCORE_ROWS);
   out->eject_on_death  = (kv_get_uint(MELEE_KV_EJECT) != 0);
 
   if(out->crit_max < out->crit_min)

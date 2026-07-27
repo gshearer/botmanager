@@ -43,7 +43,11 @@
 #define MELEE_TABLE_SZ       64                 // prefix + "_players"
 #define MELEE_USER_SZ        USERNS_USER_SZ     // 31
 #define MELEE_NICK_SZ        METHOD_NICKNAME_SZ // 64
+#define MELEE_CHAN_SZ        METHOD_CHANNEL_SZ  // 128
 #define MELEE_MAX_PLAYERS    32                 // per round, for the show card
+// The ceiling melee_tunables_load() clamps scoreboard_rows to. The
+// leaderboard's row array is sized from this, so the two must agree.
+#define MELEE_MAX_SCORE_ROWS 50
 #define MELEE_LINE_SZ        512                // one rendered, colorized line
 // A comma-joined display list. Deliberately well under MELEE_LINE_SZ so
 // it always fits inside the sentence that carries it; a roster longer
@@ -116,6 +120,53 @@ typedef struct
   bool        fatal;     // the target reaches 0 hp
 } melee_blow_t;
 
+// ---- The read-only views (show melee, show melee scores) ------------ //
+//
+// These three carry display names, never identities: `name` is the last
+// nickname the pit saw, falling back to the username. Nothing here is
+// ever fed back into a query.
+
+// The header of one round, live or finished.
+typedef struct
+{
+  int64_t id;
+  char    channel[MELEE_CHAN_SZ];
+  int32_t state;                 // MELEE_ROUND_*
+  int32_t wave;
+  int32_t blows;
+  int64_t length;                // seconds start -> end, or -> now
+  int32_t top_crit;              // heaviest critical of the round, 0 = none
+  char    top_by[MELEE_USER_SZ];
+  char    top_on[MELEE_USER_SZ];
+  char    slayer[MELEE_USER_SZ]; // set once the round has been won
+  char    fallen[MELEE_USER_SZ];
+} melee_card_t;
+
+// One combatant's row on the round card.
+typedef struct
+{
+  char    name[MELEE_NICK_SZ];
+  int32_t hp;
+  int32_t hp_max;
+  int32_t dmg_given;
+  int32_t dmg_taken;
+  int32_t best_crit;
+  int32_t last_wave;
+} melee_card_row_t;
+
+// One combatant's row on the lifetime leaderboard.
+typedef struct
+{
+  char    name[MELEE_NICK_SZ];
+  int32_t rounds;
+  int32_t kills;
+  int32_t deaths;
+  int64_t dmg_given;
+  int64_t dmg_taken;
+  int32_t crits;
+  int32_t best_crit;
+} melee_score_row_t;
+
 // ---- Plugin core (melee.c) ----------------------------------------- //
 
 void melee_tunables_load(melee_tunables_t *out);
@@ -160,6 +211,31 @@ bool melee_db_pending(int64_t round_id, int32_t wave, char *out,
 // for a blow the target never took.
 bool melee_db_blow_apply(const melee_blow_t *blow);
 
+// ---- DB reads for the views (melee_db.c) --------------------------- //
+
+// The round `show melee` should describe: the room's active round when
+// there is one, else the room's most recent brawl. An empty `channel`
+// (a direct message has no room) widens the search to the whole
+// namespace. false when the namespace has never fought here.
+bool melee_db_card_find(uint32_t ns_id, const char *method,
+    const char *channel, melee_card_t *out);
+
+// Fill `out` with up to `cap` combatants, healthiest first. `total` (may
+// be NULL) reports how many the round actually holds, so the caller can
+// note what the cap left out. Returns the number written.
+uint32_t melee_db_card_roster(int64_t round_id, melee_card_row_t *out,
+    uint32_t cap, uint32_t *total);
+
+// Lifetime standings for a namespace, heaviest damage dealt first.
+// Returns the number written, at most min(cap, limit).
+uint32_t melee_db_scores(uint32_t ns_id, uint32_t limit,
+    melee_score_row_t *out, uint32_t cap);
+
+// The single heaviest critical anyone in the namespace has landed.
+// false when no crit has ever been struck.
+bool melee_db_deadliest(uint32_t ns_id, char *by, size_t by_cap,
+    char *on, size_t on_cap, int32_t *dmg);
+
 // ---- Combat (melee_combat.c) --------------------------------------- //
 
 // Roll one blow. *crit_out reports whether it landed critical.
@@ -176,6 +252,12 @@ void melee_render_death(char *out, size_t cap, const char *slayer_nick,
 
 bool melee_commands_register(void);
 void melee_commands_unregister(void);
+
+// ---- The read-only views (melee_show.c) ---------------------------- //
+
+// Attach `show melee` and `show melee scores` beneath the core `show`
+// parent. Called from melee_commands_register().
+bool melee_show_register(void);
 
 #endif // MELEE_INTERNAL
 
