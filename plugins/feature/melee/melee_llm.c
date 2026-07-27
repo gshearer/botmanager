@@ -648,8 +648,6 @@ typedef struct
   uint32_t         pool_size;
   uint32_t         retry_secs;
   uint32_t         gen;   // generation this request was submitted under
-  melee_tunables_t t;     // so the stale path can re-arm without reading
-                          // KV from a curl worker
 } melee_fill_ctx_t;
 
 static void
@@ -699,17 +697,27 @@ melee_llm_done(const llm_chat_response_t *resp)
 
   if(stale)
   {
-    const melee_flavour_t  cat = fc->cat;
-    const melee_tunables_t t   = fc->t;
+    const melee_flavour_t cat = fc->cat;
+    melee_tunables_t      t;
 
     clam(CLAM_INFO, MELEE_CTX,
         "flavour %s: refill discarded (preamble changed under it)",
         melee_flav_name[cat]);
 
-    // Copy before the free, kick after it. The kick is a queue insert and
-    // is safe here; it re-arms the category that melee_llm_invalidate()
-    // deliberately left alone, and it cannot storm — the generation only
-    // moves on an operator action.
+    // The tunables are read FRESH, not taken from fc->t. fc->t is what
+    // was in force when this request was submitted — the very preamble
+    // the answer was just discarded for — so re-kicking with it would
+    // regenerate the category under the persona the operator has just
+    // moved away from, and the pit would keep speaking in the old voice
+    // with the KV insisting otherwise. Cost is one kv read on a curl
+    // worker: a mutex, no I/O; the persona file is not touched until
+    // the refill task runs on its own thread.
+    melee_tunables_load(&t);
+
+    // Copy `cat` before the free, kick after it. The kick is a queue
+    // insert and is safe here; it re-arms the category that
+    // melee_llm_invalidate() deliberately left alone, and it cannot
+    // storm — the generation only moves on an operator action.
     mem_free(fc);
     melee_llm_refill_kick(cat, &t);
     return;
@@ -871,7 +879,6 @@ melee_llm_refill_task(task_t *t)
   fc->cat        = r->cat;
   fc->pool_size  = r->t.llm_pool;
   fc->retry_secs = r->t.llm_retry;
-  fc->t          = r->t;
 
   pthread_mutex_lock(&melee_pool_lock);
   fc->gen = melee_pool_gen;
