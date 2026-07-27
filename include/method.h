@@ -44,6 +44,7 @@ typedef uint32_t method_type_t;
 typedef uint32_t method_cap_t;
 
 #define METHOD_CAP_EMOTE   ((method_cap_t)1U << 0)  // third-person action (IRC CTCP ACTION, Discord italics, etc.)
+#define METHOD_CAP_EJECT   ((method_cap_t)1U << 1)  // can remove a participant from a room
 
 // Discriminator for the kind of event a method_msg_t carries. The
 // default (zero) is a normal chat/DM line. Other kinds describe
@@ -104,6 +105,15 @@ typedef void (*method_chan_member_cb_t)(const char *nick, void *data);
 
 typedef void (*method_joined_channel_cb_t)(const char *channel, void *data);
 
+// How forcefully a driver can remove a participant. Ordered: a numerically
+// greater value is a strictly harsher removal, so callers may compare.
+typedef enum
+{
+  METHOD_EJECT_NONE   = 0,  // no removal possible right now
+  METHOD_EJECT_ROOM   = 1,  // out of this room only (IRC KICK)
+  METHOD_EJECT_SERVER = 2,  // off the platform entirely (IRC KILL)
+} method_eject_t;
+
 // Functions a protocol plugin must implement. Stored in
 // plugin_desc_t.ext for PLUGIN_PROTOCOL plugins (IRC, Slack, etc.).
 typedef struct
@@ -147,6 +157,21 @@ typedef struct
 
   // Get the bot's own identity on this method (e.g., current IRC nick).
   bool (*get_self)(void *handle, char *buf, size_t buf_sz);
+
+  // Strongest removal this driver could apply to `target` in `channel`
+  // right now. A pure read-only probe: it emits no wire traffic and
+  // changes no state. METHOD_EJECT_NONE when the driver has no notion of
+  // removal, the bot lacks the privilege, or the target is not present.
+  // Optional — NULL means the driver can never eject.
+  method_eject_t (*eject_probe)(void *handle, const char *channel,
+      const char *target);
+
+  // Remove `target` from `channel`. `force` must not exceed what
+  // eject_probe just reported; the driver clamps if it does. `reason` is
+  // short, human-readable, and may be shown to other participants.
+  // Optional — NULL means the driver can never eject.
+  bool (*eject)(void *handle, const char *channel, const char *target,
+      method_eject_t force, const char *reason);
 } method_driver_t;
 
 typedef struct
@@ -189,6 +214,15 @@ void method_list_joined_channels(method_inst_t *inst,
     method_joined_channel_cb_t cb, void *data);
 
 bool method_get_self(method_inst_t *inst, char *buf, size_t buf_sz);
+
+// METHOD_EJECT_NONE if the driver does not implement ejection.
+method_eject_t method_eject_probe(method_inst_t *inst, const char *channel,
+    const char *target);
+
+// FAIL if the driver does not implement ejection or the removal was not
+// issued. Does not wait for the platform to confirm the removal.
+bool method_eject(method_inst_t *inst, const char *channel,
+    const char *target, method_eject_t force, const char *reason);
 
 method_state_t method_get_state(const method_inst_t *inst);
 

@@ -541,6 +541,7 @@ static void irc_handle_welcome (irc_state_t *, const irc_parsed_msg_t *);
 static void irc_handle_namreply(irc_state_t *, const irc_parsed_msg_t *);
 static void irc_handle_endnames(irc_state_t *, const irc_parsed_msg_t *);
 static void irc_handle_topic332(irc_state_t *, const irc_parsed_msg_t *);
+static void irc_handle_youreoper(irc_state_t *, const irc_parsed_msg_t *);
 static void irc_handle_join    (irc_state_t *, const irc_parsed_msg_t *);
 static void irc_handle_part    (irc_state_t *, const irc_parsed_msg_t *);
 static void irc_handle_quit    (irc_state_t *, const irc_parsed_msg_t *);
@@ -559,6 +560,7 @@ static const struct {
   { "001",     irc_handle_welcome  },
   { "353",     irc_handle_namreply },
   { "366",     irc_handle_endnames },
+  { "381",     irc_handle_youreoper},
   { "332",     irc_handle_topic332 },
   { "JOIN",    irc_handle_join     },
   { "PART",    irc_handle_part     },
@@ -601,6 +603,18 @@ irc_handle_welcome(irc_state_t *st, const irc_parsed_msg_t *pp)
   }
 
   irc_join_channels(st);
+}
+
+// RPL_YOUREOPER — the server granted the OPER request made at
+// registration. This is the only confirmation that the bot holds IRC
+// operator privileges, and it is what lets irc_eject reach for KILL.
+static void
+irc_handle_youreoper(irc_state_t *st, const irc_parsed_msg_t *pp)
+{
+  (void)pp;
+
+  __atomic_store_n(&st->is_oper, true, __ATOMIC_RELAXED);
+  clam(CLAM_INFO, "irc", "granted IRC operator status");
 }
 
 static void
@@ -1380,6 +1394,10 @@ irc_attempt_connect(irc_state_t *st)
   if(pool_shutting_down() || st->shutdown)
     return;
 
+  // Operator status is per-connection: the new session starts without it
+  // until this server answers OPER with a 381 of its own.
+  __atomic_store_n(&st->is_oper, false, __ATOMIC_RELAXED);
+
   // Reload config (may have changed since last attempt).
   if(irc_load_config(st) != SUCCESS)
   {
@@ -1520,6 +1538,7 @@ irc_disconnect(void *handle)
   irc_state_t *st = handle;
 
   st->shutdown = true;
+  __atomic_store_n(&st->is_oper, false, __ATOMIC_RELAXED);
 
   // Cancel any pending deferred reconnect so the scheduler drops it
   // before the delay expires. Without this, a stop/start cycle during
@@ -1654,6 +1673,100 @@ irc_get_self(void *handle, char *buf, size_t buf_sz)
   strncpy(buf, st->cur_nick, buf_sz - 1);
   buf[buf_sz - 1] = '\0';
   return(SUCCESS);
+}
+
+// Participant removal (KICK / KILL)
+
+// Fold `reason` into a form safe for a line-oriented protocol: CR and LF
+// are dropped outright, the result is truncated, and an empty reason
+// becomes a neutral placeholder so the trailing parameter is never bare.
+// Reasons originate in caller-side flavor text; none of it is trusted to
+// respect a wire boundary.
+static void
+irc_eject_reason(char *out, size_t out_sz, const char *reason)
+{
+  size_t n = 0;
+
+  if(reason == NULL)
+    reason = "";
+
+  for(const char *p = reason; *p != '\0' && n < out_sz - 1; p++)
+  {
+    if(*p == '\r' || *p == '\n')
+      continue;
+
+    out[n++] = *p;
+  }
+
+  out[n] = '\0';
+
+  if(n == 0)
+    snprintf(out, out_sz, "ejected");
+}
+
+// Report the harshest removal available against `target` right now,
+// without touching the wire. Operator status outranks channel ops: a
+// KILL removes the target from the network, a KICK only from the room.
+static method_eject_t
+irc_eject_probe(void *handle, const char *channel, const char *target)
+{
+  irc_state_t *st = handle;
+  irc_channel_t *ch;
+  bool present;
+  bool have_ops;
+
+  if(st == NULL || !st->connected || channel == NULL || target == NULL)
+    return(METHOD_EJECT_NONE);
+
+  pthread_mutex_lock(&st->chan_mutex);
+
+  ch       = irc_chan_find(st, channel);
+  present  = (ch != NULL && irc_member_find(ch, target) != NULL);
+  have_ops = (ch != NULL && ch->have_ops);
+
+  pthread_mutex_unlock(&st->chan_mutex);
+
+  if(!present)
+    return(METHOD_EJECT_NONE);
+
+  if(__atomic_load_n(&st->is_oper, __ATOMIC_RELAXED))
+    return(METHOD_EJECT_SERVER);
+
+  if(have_ops)
+    return(METHOD_EJECT_ROOM);
+
+  return(METHOD_EJECT_NONE);
+}
+
+// Remove `target` from `channel`. `force` is clamped to what the driver
+// can actually do at this instant, so a caller racing a deop or a PART
+// degrades to a weaker removal — or none — instead of emitting a command
+// the server would reject.
+static bool
+irc_eject(void *handle, const char *channel, const char *target,
+    method_eject_t force, const char *reason)
+{
+  irc_state_t *st = handle;
+  method_eject_t avail;
+  char why[IRC_EJECT_REASON_SZ];
+
+  if(st == NULL || channel == NULL || target == NULL)
+    return(FAIL);
+
+  avail = irc_eject_probe(handle, channel, target);
+
+  if(force > avail)
+    force = avail;
+
+  if(force == METHOD_EJECT_NONE)
+    return(FAIL);
+
+  irc_eject_reason(why, sizeof(why), reason);
+
+  if(force == METHOD_EJECT_SERVER)
+    return(irc_send_raw(st, "KILL %s :%s", target, why));
+
+  return(irc_send_raw(st, "KICK %s %s :%s", channel, target, why));
 }
 
 // IRC network/server configuration management

@@ -95,6 +95,7 @@ regex (the literal context portion, before any `<placeholder>`).
 | `kv_register` | core/kv.c | KV registration |
 | `kv_register_nl` | core/kv.c | NL responder attach |
 | `main` | core/main.c | daemon entry / startup banner |
+| `method_eject` | core/method.c | participant removal (KICK/KILL) issued |
 | `method_exit` | core/method.c | method subsystem teardown |
 | `method_init` | core/method.c | method subsystem init |
 | `method_register` | core/method.c | method driver registration |

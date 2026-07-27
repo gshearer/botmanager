@@ -14,6 +14,10 @@
 #define IRC_PREFIX_SZ   256
 #define IRC_CTX_CACHE   64
 
+// Sanitised KICK/KILL reason. Short enough that the command envelope
+// (verb, channel, target) always fits inside IRC_LINE_SZ.
+#define IRC_EJECT_REASON_SZ 200
+
 // IRC network/server configuration name limits.
 #define IRC_NET_NAME_SZ 32
 #define IRC_SRV_NAME_SZ IRC_HOST_SZ
@@ -85,6 +89,12 @@ typedef struct
   bool              registered;     // true after RPL_WELCOME (001)
   bool              connected;      // true while socket is open
   bool              shutdown;       // signal to stop reconnecting
+
+  // True once the server answers OPER with RPL_YOUREOPER (381). Written
+  // on the socket-reader thread, read from command worker threads —
+  // written at most once per connection, so relaxed atomics suffice and
+  // no mutex is warranted. Never survives a reconnect.
+  bool              is_oper;
 
   // Read buffer for partial line assembly.
   char              buf[IRC_BUF_SZ];
@@ -330,6 +340,10 @@ static void irc_list_channel(void *handle, const char *channel,
 static void irc_list_joined_channels(void *handle,
     method_joined_channel_cb_t cb, void *data);
 static bool irc_get_self(void *handle, char *buf, size_t buf_sz);
+static method_eject_t irc_eject_probe(void *handle, const char *channel,
+    const char *target);
+static bool irc_eject(void *handle, const char *channel, const char *target,
+    method_eject_t force, const char *reason);
 
 // Argument specs for IRC subcommands.
 static const cmd_arg_desc_t ad_irc_netname[] = {
@@ -387,7 +401,7 @@ static const color_table_t irc_colors = {
 // only the protocol essentials.
 static const method_driver_t irc_driver = {
   .name          = "irc",
-  .caps          = METHOD_CAP_EMOTE,
+  .caps          = METHOD_CAP_EMOTE | METHOD_CAP_EJECT,
   .colors        = &irc_colors,
   .create        = irc_create,
   .destroy       = irc_destroy,
@@ -399,6 +413,8 @@ static const method_driver_t irc_driver = {
   .list_channel  = irc_list_channel,
   .list_joined_channels = irc_list_joined_channels,
   .get_self      = irc_get_self,
+  .eject_probe   = irc_eject_probe,
+  .eject         = irc_eject,
 };
 
 #endif // IRC_INTERNAL

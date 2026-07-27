@@ -295,6 +295,52 @@ method_get_self(method_inst_t *inst, char *buf, size_t buf_sz)
   return(inst->driver->get_self(inst->handle, buf, buf_sz));
 }
 
+// Participant removal
+
+// Read-only probe: what the driver could do to `target` right now. No
+// wire traffic, no state change.
+method_eject_t
+method_eject_probe(method_inst_t *inst, const char *channel,
+    const char *target)
+{
+  if(inst == NULL || inst->driver == NULL || channel == NULL ||
+      target == NULL)
+    return(METHOD_EJECT_NONE);
+
+  if(inst->driver->eject_probe == NULL)
+    return(METHOD_EJECT_NONE);
+
+  return(inst->driver->eject_probe(inst->handle, channel, target));
+}
+
+// Issue the removal. Success means the request reached the platform, not
+// that the participant is gone — drivers do not wait for confirmation.
+bool
+method_eject(method_inst_t *inst, const char *channel, const char *target,
+    method_eject_t force, const char *reason)
+{
+  bool rc;
+
+  if(inst == NULL || inst->driver == NULL || channel == NULL ||
+      target == NULL)
+    return(FAIL);
+
+  if(inst->driver->eject == NULL)
+    return(FAIL);
+
+  rc = inst->driver->eject(inst->handle, channel, target, force,
+      reason != NULL ? reason : "");
+
+  // The driver may clamp `force` down to what it can actually do, and it
+  // does not report back which rung it used — so log the request, not an
+  // outcome core cannot observe.
+  if(rc == SUCCESS)
+    clam(CLAM_INFO, "method_eject", "'%s': ejected %s from %s (force %d requested)",
+        inst->name, target, channel, (int)force);
+
+  return(rc);
+}
+
 // State management
 
 method_state_t
