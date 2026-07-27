@@ -53,7 +53,18 @@ typedef struct
   char date[WORDNIK_DATE_SZ];            // empty = today's word
 } wordnik_cmd_args_t;
 
+// Same closure for the dictionary half, carrying the headword so the
+// not-found line can name what was looked up.
+typedef struct
+{
+  cmd_ctx_t    ctx;
+  method_msg_t msg;
+  bool         verbose;                  // -v: attribution and citations
+  char         word[WORDNIK_WORD_SZ];
+} wordnik_dict_req_t;
+
 static void wordnik_cmd(const cmd_ctx_t *);
+static void wordnik_dict_cmd(const cmd_ctx_t *);
 
 #endif // WORDNIK_CMD_INTERNAL
 

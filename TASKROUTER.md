@@ -48,7 +48,7 @@ alongside its code.
 | Work on stock/equity/fund/commodity quotes (`!stock`) | `TODO.md` §STOCK-1..5 + `include/stockquote.h` (contract) + `plugins/service/yahoofinance/` (provider) + `plugins/feature/stock/` (command) |
 | Work on video-game info (`!rawg`) | `plugins/service/rawg/` — one leaf-service plugin: `rawg.c` (provider) + `rawg_cmd.c` (command surface), contract in `rawg_api.h` |
 | Work on movie / TV / actor info (`!tmdb`) | `plugins/service/tmdb/` — one leaf-service plugin: `tmdb.c` (provider) + `tmdb_cmd.c` (command surface), contract in `tmdb_api.h` |
-| Work on the word of the day (`!wotd`) | `plugins/service/wordnik/` — one leaf-service plugin: `wordnik.c` (provider) + `wordnik_cmd.c` (command surface), contract in `wordnik_api.h` |
+| Work on the word of the day (`!wotd`) or dictionary lookup (`!dict`) | `plugins/service/wordnik/` — one leaf-service plugin: `wordnik.c` (provider) + `wordnik_cmd.c` (command surface, both commands), contract in `wordnik_api.h` |
 | Work on the one-shot LLM command (`!ask`) | `plugins/extension/inference/ask/` + `plugins/extension/inference/LLM.md` |
 | Work on the search commands (`!search`, `!image`, `!news`, `!video`, `!music`) | `plugins/extension/inference/search/searxng_cmd.c` (command surface) + `plugins/service/searxng/searxng_api.h` (mechanism) |
 | Merge a command surface into its leaf service | `plugins/service/AGENTS.md` §Leaf services with a command surface + `PLUGIN.md §Layer Rules` Rule 1 |

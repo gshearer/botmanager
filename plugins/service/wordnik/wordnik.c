@@ -1,11 +1,14 @@
 // botmanager — MIT
 // Wordnik service plugin: keyed access to the api.wordnik.com v4
-// word-of-the-day endpoint. Normalizes the payload into one flat word
-// record — senses and citations in fixed arrays, Wordnik's inline XML
-// markup stripped out — and seals the Wordnik-side conventions (the "pdd"
-// publication date, the nullable note, the per-sense dictionary id)
-// behind wordnik_api.h. Pure connectivity; the plugin's command surface
-// half (wordnik_cmd.c) owns all presentation.
+// word-of-the-day and dictionary endpoints. Normalizes each payload into
+// one flat record — senses, citations and related words in fixed arrays,
+// Wordnik's inline XML markup stripped out — and seals the Wordnik-side
+// conventions (the "pdd" publication date, the nullable note, the two
+// spellings of the per-sense dictionary id, the array-vs-object shape of
+// sibling endpoints) behind wordnik_api.h. A dictionary lookup fans out
+// into three parallel requests joined by a refcount, so the whole entry
+// arrives in one callback without a single blocking wait. Pure
+// connectivity; the command surface half owns all presentation.
 #define WORDNIK_INTERNAL
 #include "wordnik.h"
 
@@ -27,6 +30,8 @@ static const plugin_kv_entry_t wordnik_kv_schema[] = {
     "Definitions carried per word (hard max 8)" },
   { WORDNIK_KV_MAX_EX,   KV_UINT32, "2",
     "Usage citations carried per word (hard max 4)" },
+  { WORDNIK_KV_MAX_REL,  KV_UINT32, "6",
+    "Synonyms — and separately antonyms — carried per word (hard max 12)" },
   { WORDNIK_KV_TIMEOUT,  KV_UINT32, "10",
     "Per-request timeout in seconds" },
 };
@@ -46,6 +51,48 @@ wordnik_api_key(char *buf, size_t cap)
   snprintf(buf, cap, "%s", k != NULL ? k : "");
 
   return(buf[0] != '\0' ? SUCCESS : FAIL);
+}
+
+// Percent-encode `in` into `out`, keeping the RFC-3986 unreserved set
+// verbatim. Returns the length the full encoding needs, which may exceed
+// cap (snprintf semantics), so callers can detect truncation.
+static size_t
+wordnik_urlencode(const char *in, char *out, size_t cap)
+{
+  static const char hex[] = "0123456789ABCDEF";
+  size_t            n = 0;
+
+  if(cap == 0)
+    return(0);
+
+  for(const unsigned char *p = (const unsigned char *)in; *p != '\0'; p++)
+  {
+    unsigned char c = *p;
+    bool unreserved = (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z')
+                      || (c >= '0' && c <= '9')
+                      || c == '-' || c == '_' || c == '.' || c == '~';
+
+    if(unreserved)
+    {
+      if(n + 1 < cap)
+        out[n] = (char)c;
+
+      n++;
+      continue;
+    }
+
+    if(n + 3 < cap)
+    {
+      out[n]     = '%';
+      out[n + 1] = hex[c >> 4];
+      out[n + 2] = hex[c & 0x0f];
+    }
+
+    n += 3;
+  }
+
+  out[n < cap ? n : cap - 1] = '\0';
+  return(n);
 }
 
 static wordnik_status_t
@@ -93,6 +140,29 @@ wordnik_date_valid(const char *date)
   day   = (unsigned)((date[8] - '0') * 10 + (date[9] - '0'));
 
   return(month >= 1 && month <= 12 && day >= 1 && day <= 31);
+}
+
+// Create, configure and submit one GET. On FAIL nothing was queued and
+// the caller still owns `user_data`; on SUCCESS the completion callback
+// takes ownership of it.
+static bool
+wordnik_submit(const char *url, curl_done_cb_t done, void *user_data)
+{
+  curl_request_t *cr = curl_request_create(CURL_METHOD_GET, url, done,
+      user_data);
+  uint32_t        timeout;
+
+  if(cr == NULL)
+    return(FAIL);
+
+  timeout = (uint32_t)kv_get_uint(WORDNIK_KV_TIMEOUT);
+
+  if(timeout > 0)
+    curl_request_set_timeout(cr, timeout);
+
+  curl_request_add_header(cr, "Accept: application/json");
+
+  return(curl_request_submit(cr));
 }
 
 // Rewrite `s` in place, dropping Wordnik's inline XML markup (<xref>,
@@ -377,13 +447,11 @@ wordnik_configured(void)
 bool
 wordnik_fetch_wotd(const char *date, wordnik_done_cb_t cb, void *user_data)
 {
-  char            key[WORDNIK_KEY_SZ];
-  char            url[WORDNIK_URL_BUF_SZ];
-  bool            dated = (date != NULL && date[0] != '\0');
-  uint32_t        timeout;
-  curl_request_t *cr;
-  wordnik_req_t  *r;
-  int             need;
+  char           key[WORDNIK_KEY_SZ];
+  char           url[WORDNIK_URL_BUF_SZ];
+  bool           dated = (date != NULL && date[0] != '\0');
+  wordnik_req_t *r;
+  int            need;
 
   if(cb == NULL)
     return(FAIL);
@@ -420,22 +488,7 @@ wordnik_fetch_wotd(const char *date, wordnik_done_cb_t cb, void *user_data)
   if(dated)
     snprintf(r->date, sizeof(r->date), "%s", date);
 
-  cr = curl_request_create(CURL_METHOD_GET, url, wordnik_curl_done, r);
-
-  if(cr == NULL)
-  {
-    mem_free(r);
-    return(FAIL);
-  }
-
-  timeout = (uint32_t)kv_get_uint(WORDNIK_KV_TIMEOUT);
-
-  if(timeout > 0)
-    curl_request_set_timeout(cr, timeout);
-
-  curl_request_add_header(cr, "Accept: application/json");
-
-  if(curl_request_submit(cr) != SUCCESS)
+  if(wordnik_submit(url, wordnik_curl_done, r) != SUCCESS)
   {
     mem_free(r);
     return(FAIL);
@@ -444,6 +497,404 @@ wordnik_fetch_wotd(const char *date, wordnik_done_cb_t cb, void *user_data)
   clam(CLAM_DEBUG2, WORDNIK_CTX, "submitted wotd date=%s",
       dated ? date : "today");
 
+  return(SUCCESS);
+}
+
+// ----------------------------------------------------------------------
+// Dictionary lookup — a parallel fan-out joined by a refcount
+// ----------------------------------------------------------------------
+
+// The /definitions rows name their dictionary "sourceDictionary", where
+// the word-of-the-day rows call the same thing "source"; the callback
+// falls back to the shorter spelling when this one is absent.
+static const json_spec_t wordnik_word_def_spec[] = {
+  { JSON_STR, "text",             false, offsetof(wordnik_def_t, text),
+    .len = sizeof(((wordnik_def_t *)0)->text) },
+  { JSON_STR, "partOfSpeech",     false,
+    offsetof(wordnik_def_t, part_of_speech),
+    .len = sizeof(((wordnik_def_t *)0)->part_of_speech) },
+  { JSON_STR, "sourceDictionary", false, offsetof(wordnik_def_t, source),
+    .len = sizeof(((wordnik_def_t *)0)->source) },
+  { JSON_END }
+};
+
+// /examples answers with an object wrapping the array, unlike the two
+// sibling endpoints.
+static const json_spec_t wordnik_examples_root_spec[] = {
+  { JSON_OBJ_ARRAY, "examples", false, offsetof(wordnik_word_t, examples),
+    .sub       = wordnik_example_spec,
+    .stride    = sizeof(wordnik_example_t),
+    .max_count = WORDNIK_MAX_EXAMPLES,
+    .count_off = offsetof(wordnik_word_t, n_examples) },
+  { JSON_END }
+};
+
+static const char *
+wordnik_part_name(wordnik_part_t part)
+{
+  switch(part)
+  {
+    case WORDNIK_PART_DEFS:     return("definitions");
+    case WORDNIK_PART_RELATED:  return("relatedWords");
+    case WORDNIK_PART_EXAMPLES: return("examples");
+    case WORDNIK_PART_ALL:      break;
+  }
+
+  return("unknown");
+}
+
+// Drop one reference to the join. The last one out delivers the assembled
+// entry and frees it — so a caller must never touch `j` after releasing.
+static void
+wordnik_word_release(wordnik_word_ctx_t *j)
+{
+  wordnik_word_response_t resp;
+
+  if(__atomic_fetch_sub(&j->pending, 1, __ATOMIC_ACQ_REL) != 1)
+    return;
+
+  resp = (wordnik_word_response_t){
+    .status    = j->status,
+    .word      = j->status == WORDNIK_OK ? &j->result : NULL,
+    .user_data = j->user_data,
+  };
+
+  if(j->cb != NULL)
+    j->cb(&resp);
+
+  mem_free(j);
+}
+
+// Shared tail for every part's completion: log, drop the part's closure,
+// drop its reference.
+static void
+wordnik_part_finished(wordnik_part_req_t *p, wordnik_status_t status)
+{
+  wordnik_word_ctx_t *j = p->join;
+
+  if(status != WORDNIK_OK)
+    clam(CLAM_DEBUG2, WORDNIK_CTX, "'%s' %s part: %s", j->result.word,
+        wordnik_part_name(p->part), wordnik_status_str(status));
+
+  mem_free(p);
+  wordnik_word_release(j);
+}
+
+// /definitions: a bare array of sense objects. This is the part that
+// decides the lookup's reported status — no definitions, no entry.
+static void
+wordnik_defs_done(const curl_response_t *cresp)
+{
+  wordnik_part_req_t *p = (wordnik_part_req_t *)cresp->user_data;
+  wordnik_word_ctx_t *j = p->join;
+  struct json_object *root;
+  wordnik_status_t    status;
+  int32_t             max = wordnik_kv_limit(WORDNIK_KV_MAX_DEFS, 3,
+      WORDNIK_MAX_DEFS);
+  int32_t             kept = 0;
+  size_t              len;
+
+  status = wordnik_status_of_http(cresp->status, cresp->curl_code);
+
+  if(status != WORDNIK_OK)
+  {
+    j->status = status;
+    wordnik_part_finished(p, status);
+    return;
+  }
+
+  root = json_parse_buf(cresp->body, cresp->body_len, WORDNIK_CTX);
+
+  if(root == NULL || !json_object_is_type(root, json_type_array))
+  {
+    if(root != NULL)
+      json_object_put(root);
+
+    j->status = WORDNIK_MALFORMED;
+    wordnik_part_finished(p, WORDNIK_MALFORMED);
+    return;
+  }
+
+  len = (size_t)json_object_array_length(root);
+
+  for(size_t i = 0; i < len && kept < max; i++)
+  {
+    struct json_object *item = json_object_array_get_idx(root, (int)i);
+    wordnik_def_t      *d    = &j->result.defs[kept];
+
+    if(item == NULL || !json_object_is_type(item, json_type_object))
+      continue;
+
+    memset(d, 0, sizeof(*d));
+
+    if(!json_extract(item, d, wordnik_word_def_spec, WORDNIK_CTX ":def"))
+      continue;
+
+    if(d->source[0] == '\0')
+      json_get_str(item, "source", d->source, sizeof(d->source));
+
+    wordnik_strip_markup(d->text);
+
+    if(d->text[0] == '\0')
+      continue;
+
+    kept++;
+  }
+
+  memset(&j->result.defs[kept], 0,
+      (size_t)(WORDNIK_MAX_DEFS - kept) * sizeof(j->result.defs[0]));
+  j->result.n_defs = kept;
+  j->status        = kept > 0 ? WORDNIK_OK : WORDNIK_NOT_FOUND;
+
+  json_object_put(root);
+  wordnik_part_finished(p, j->status);
+}
+
+// /relatedWords: an array of { relationshipType, words[] } buckets. We
+// ask for synonyms and antonyms; anything else that shows up is ignored.
+static void
+wordnik_related_done(const curl_response_t *cresp)
+{
+  wordnik_part_req_t *p = (wordnik_part_req_t *)cresp->user_data;
+  wordnik_word_ctx_t *j = p->join;
+  struct json_object *root;
+  wordnik_status_t    status;
+  int32_t             max = wordnik_kv_limit(WORDNIK_KV_MAX_REL, 6,
+      WORDNIK_MAX_RELATED);
+  size_t              len;
+
+  status = wordnik_status_of_http(cresp->status, cresp->curl_code);
+
+  if(status != WORDNIK_OK)
+  {
+    wordnik_part_finished(p, status);
+    return;
+  }
+
+  root = json_parse_buf(cresp->body, cresp->body_len, WORDNIK_CTX);
+
+  if(root == NULL || !json_object_is_type(root, json_type_array))
+  {
+    if(root != NULL)
+      json_object_put(root);
+
+    wordnik_part_finished(p, WORDNIK_MALFORMED);
+    return;
+  }
+
+  len = (size_t)json_object_array_length(root);
+
+  for(size_t i = 0; i < len; i++)
+  {
+    struct json_object *bucket = json_object_array_get_idx(root, (int)i);
+    struct json_object *words;
+    char                type[32];
+    char              (*dest)[WORDNIK_WORD_SZ];
+    int32_t            *count;
+    size_t              n_words;
+
+    if(bucket == NULL || !json_get_str(bucket, "relationshipType", type,
+        sizeof(type)))
+      continue;
+
+    if(strcasecmp(type, "synonym") == 0)
+    {
+      dest  = j->result.synonyms;
+      count = &j->result.n_synonyms;
+    }
+
+    else if(strcasecmp(type, "antonym") == 0)
+    {
+      dest  = j->result.antonyms;
+      count = &j->result.n_antonyms;
+    }
+
+    else
+      continue;
+
+    words   = json_get_array(bucket, "words");
+    n_words = words != NULL ? (size_t)json_object_array_length(words) : 0;
+
+    for(size_t w = 0; w < n_words && *count < max; w++)
+    {
+      const char *s = json_object_get_string(
+          json_object_array_get_idx(words, (int)w));
+
+      if(s == NULL || s[0] == '\0')
+        continue;
+
+      snprintf(dest[*count], WORDNIK_WORD_SZ, "%s", s);
+      (*count)++;
+    }
+  }
+
+  json_object_put(root);
+  wordnik_part_finished(p, WORDNIK_OK);
+}
+
+// /examples: an object wrapping the citation array.
+static void
+wordnik_examples_done(const curl_response_t *cresp)
+{
+  wordnik_part_req_t *p = (wordnik_part_req_t *)cresp->user_data;
+  wordnik_word_ctx_t *j = p->join;
+  struct json_object *root;
+  wordnik_status_t    status;
+  int32_t             max = wordnik_kv_limit(WORDNIK_KV_MAX_EX, 2,
+      WORDNIK_MAX_EXAMPLES);
+
+  status = wordnik_status_of_http(cresp->status, cresp->curl_code);
+
+  if(status != WORDNIK_OK)
+  {
+    wordnik_part_finished(p, status);
+    return;
+  }
+
+  root = json_parse_buf(cresp->body, cresp->body_len, WORDNIK_CTX);
+
+  if(root == NULL)
+  {
+    wordnik_part_finished(p, WORDNIK_MALFORMED);
+    return;
+  }
+
+  json_extract(root, &j->result, wordnik_examples_root_spec,
+      WORDNIK_CTX ":examples");
+
+  j->result.n_examples = wordnik_compact_examples(j->result.examples,
+      j->result.n_examples);
+
+  if(j->result.n_examples > max)
+    j->result.n_examples = max;
+
+  json_object_put(root);
+  wordnik_part_finished(p, WORDNIK_OK);
+}
+
+// Queue one part. The join's reference count is raised before the submit
+// and lowered again if it fails — never through wordnik_word_release,
+// because the submitter's own reference guarantees the count cannot reach
+// zero here, and going through the release path would imply it might.
+static bool
+wordnik_submit_part(wordnik_word_ctx_t *j, wordnik_part_t part,
+    const char *url)
+{
+  wordnik_part_req_t *p = mem_alloc(WORDNIK_CTX, "part", sizeof(*p));
+  curl_done_cb_t      done;
+
+  p->join = j;
+  p->part = part;
+
+  switch(part)
+  {
+    case WORDNIK_PART_RELATED:  done = wordnik_related_done;  break;
+    case WORDNIK_PART_EXAMPLES: done = wordnik_examples_done; break;
+    case WORDNIK_PART_DEFS:
+    default:                    done = wordnik_defs_done;     break;
+  }
+
+  __atomic_fetch_add(&j->pending, 1, __ATOMIC_ACQ_REL);
+
+  if(wordnik_submit(url, done, p) != SUCCESS)
+  {
+    clam(CLAM_WARN, WORDNIK_CTX, "curl refused the %s request",
+        wordnik_part_name(part));
+    mem_free(p);
+    __atomic_fetch_sub(&j->pending, 1, __ATOMIC_ACQ_REL);
+    return(FAIL);
+  }
+
+  return(SUCCESS);
+}
+
+bool
+wordnik_fetch_word(const char *word, uint32_t parts, wordnik_word_cb_t cb,
+    void *user_data)
+{
+  char                key[WORDNIK_KEY_SZ];
+  char                enc[WORDNIK_ENC_SZ];
+  char                url[WORDNIK_URL_BUF_SZ];
+  wordnik_word_ctx_t *j;
+  int                 submitted = 0;
+
+  if(cb == NULL || word == NULL || word[0] == '\0')
+    return(FAIL);
+
+  parts &= WORDNIK_PART_ALL;
+
+  if(parts == 0)
+    return(FAIL);
+
+  if(wordnik_api_key(key, sizeof(key)) != SUCCESS)
+  {
+    clam(CLAM_WARN, WORDNIK_CTX, WORDNIK_KV_API_KEY " is unset");
+    return(FAIL);
+  }
+
+  if(wordnik_urlencode(word, enc, sizeof(enc)) >= sizeof(enc))
+  {
+    clam(CLAM_WARN, WORDNIK_CTX, "word too long after URL encoding");
+    return(FAIL);
+  }
+
+  j = mem_alloc(WORDNIK_CTX, "lookup", sizeof(*j));
+  memset(j, 0, sizeof(*j));
+  j->cb        = cb;
+  j->user_data = user_data;
+  snprintf(j->result.word, sizeof(j->result.word), "%s", word);
+
+  // Every part that fails leaves its rows empty, so only the definitions
+  // can turn a lookup into an error — and if they were asked for but
+  // never even reached the wire, that is a transport failure.
+  j->status  = (parts & WORDNIK_PART_DEFS) != 0 ? WORDNIK_TRANSPORT
+                                               : WORDNIK_OK;
+  j->pending = 1;  // the submitter's own reference, dropped below
+
+  if((parts & WORDNIK_PART_DEFS) != 0)
+  {
+    snprintf(url, sizeof(url), "%s/%s/definitions?limit=%d"
+        "&useCanonical=true&includeRelated=false&includeTags=false"
+        "&api_key=%s", WORDNIK_API_WORD, enc,
+        wordnik_kv_limit(WORDNIK_KV_MAX_DEFS, 3, WORDNIK_MAX_DEFS), key);
+
+    if(wordnik_submit_part(j, WORDNIK_PART_DEFS, url) == SUCCESS)
+      submitted++;
+  }
+
+  if((parts & WORDNIK_PART_RELATED) != 0)
+  {
+    snprintf(url, sizeof(url), "%s/%s/relatedWords?useCanonical=true"
+        "&relationshipTypes=synonym%%2Cantonym"
+        "&limitPerRelationshipType=%d&api_key=%s", WORDNIK_API_WORD, enc,
+        wordnik_kv_limit(WORDNIK_KV_MAX_REL, 6, WORDNIK_MAX_RELATED), key);
+
+    if(wordnik_submit_part(j, WORDNIK_PART_RELATED, url) == SUCCESS)
+      submitted++;
+  }
+
+  if((parts & WORDNIK_PART_EXAMPLES) != 0)
+  {
+    snprintf(url, sizeof(url), "%s/%s/examples?includeDuplicates=false"
+        "&useCanonical=true&limit=%d&api_key=%s", WORDNIK_API_WORD, enc,
+        wordnik_kv_limit(WORDNIK_KV_MAX_EX, 2, WORDNIK_MAX_EXAMPLES), key);
+
+    if(wordnik_submit_part(j, WORDNIK_PART_EXAMPLES, url) == SUCCESS)
+      submitted++;
+  }
+
+  // Nothing reached the wire, so nothing will ever deliver: tear the join
+  // down by hand rather than through the callback path.
+  if(submitted == 0)
+  {
+    mem_free(j);
+    return(FAIL);
+  }
+
+  clam(CLAM_DEBUG2, WORDNIK_CTX, "submitted lookup '%s' (%d parts)", word,
+      submitted);
+
+  wordnik_word_release(j);
   return(SUCCESS);
 }
 

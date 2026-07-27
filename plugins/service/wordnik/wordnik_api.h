@@ -71,6 +71,7 @@ wordnik_status_str(wordnik_status_t s)
 
 #define WORDNIK_MAX_DEFS     8     // hard ceiling regardless of KV
 #define WORDNIK_MAX_EXAMPLES 4     // hard ceiling regardless of KV
+#define WORDNIK_MAX_RELATED  12    // synonyms, and separately antonyms
 
 // One sense of the word. `source` is Wordnik's dictionary id and may be
 // empty; every field is an empty string when the API omitted it.
@@ -117,6 +118,51 @@ typedef struct
 // and non-blocking.
 typedef void (*wordnik_done_cb_t)(const wordnik_response_t *resp);
 
+// ----------------------------------------------------------------------
+// Dictionary lookup
+// ----------------------------------------------------------------------
+
+// Which of the word endpoints a lookup should gather. They are separate
+// HTTP requests issued in parallel, so ask only for what you will render.
+// A part that fails leaves its rows empty rather than failing the lookup:
+// only the definitions decide the reported status, since a word with no
+// definition is the one outcome a caller must handle.
+typedef enum
+{
+  WORDNIK_PART_DEFS     = 1u << 0,  // /definitions
+  WORDNIK_PART_RELATED  = 1u << 1,  // /relatedWords — synonyms + antonyms
+  WORDNIK_PART_EXAMPLES = 1u << 2,  // /examples
+  WORDNIK_PART_ALL      = 0x7u
+} wordnik_part_t;
+
+// A dictionary entry, assembled from however many parts were requested.
+// Markup-stripped and display-ready, same as wordnik_wotd_t.
+typedef struct
+{
+  char              word    [WORDNIK_WORD_SZ];   // as the caller spelled it
+  wordnik_def_t     defs    [WORDNIK_MAX_DEFS];
+  wordnik_example_t examples[WORDNIK_MAX_EXAMPLES];
+  char              synonyms[WORDNIK_MAX_RELATED][WORDNIK_WORD_SZ];
+  char              antonyms[WORDNIK_MAX_RELATED][WORDNIK_WORD_SZ];
+  int32_t           n_defs;
+  int32_t           n_examples;
+  int32_t           n_synonyms;
+  int32_t           n_antonyms;
+} wordnik_word_t;
+
+// Completion payload. `word` is valid for the duration of the callback
+// only, and is NULL for every status other than WORDNIK_OK.
+typedef struct
+{
+  wordnik_status_t      status;
+  const wordnik_word_t *word;
+  void                 *user_data;
+} wordnik_word_response_t;
+
+// Fired once, after every requested part has completed or failed —
+// on whichever curl worker thread finished last. Must be non-blocking.
+typedef void (*wordnik_word_cb_t)(const wordnik_word_response_t *resp);
+
 // Real declarations — visible only inside the wordnik plugin. External
 // consumers go through the static-inline dlsym shims below.
 #ifdef WORDNIK_INTERNAL
@@ -132,6 +178,16 @@ bool wordnik_configured(void);
 //          callback is NOT invoked.
 bool wordnik_fetch_wotd(const char *date, wordnik_done_cb_t cb,
     void *user_data);
+
+// Look `word` up in the dictionary, gathering the `parts` bitmask in
+// parallel. `word` may be a phrase; it is URL-encoded here.
+//
+// returns: SUCCESS once at least one request is queued, FAIL if the key
+//          is unset, the word is empty or too long, `parts` is empty, or
+//          curl refused every submit. On FAIL the callback is NOT
+//          invoked; otherwise it fires exactly once.
+bool wordnik_fetch_word(const char *word, uint32_t parts,
+    wordnik_word_cb_t cb, void *user_data);
 
 #endif // WORDNIK_INTERNAL
 
@@ -194,6 +250,34 @@ wordnik_fetch_wotd(const char *date, wordnik_done_cb_t cb, void *user_data)
   }
 
   return(fn(date, cb, user_data));
+}
+
+static inline bool
+wordnik_fetch_word(const char *word, uint32_t parts, wordnik_word_cb_t cb,
+    void *user_data)
+{
+  typedef bool (*fn_t)(const char *, uint32_t, wordnik_word_cb_t, void *);
+  static fn_t cached = NULL;
+  fn_t        fn     = __atomic_load_n(&cached, __ATOMIC_ACQUIRE);
+
+  if(fn == NULL)
+  {
+    union { void *obj; fn_t fn; } u;
+
+    u.obj = plugin_dlsym_cached(WORDNIK_CTX, "wordnik_fetch_word",
+        (void **)&cached);
+
+    if(u.obj == NULL)
+    {
+      clam(CLAM_FATAL, WORDNIK_CTX, "dlsym failed: wordnik_fetch_word");
+      abort();
+    }
+
+    fn = u.fn;
+    __atomic_store_n(&cached, fn, __ATOMIC_RELEASE);
+  }
+
+  return(fn(word, parts, cb, user_data));
 }
 
 #endif // !WORDNIK_INTERNAL && !WORDNIK_TYPES_ONLY
