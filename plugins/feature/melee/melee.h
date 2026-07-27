@@ -371,6 +371,19 @@ void melee_llm_refill_kick(melee_flavour_t cat, const melee_tunables_t *t);
 // first blow rather than after it.
 void melee_llm_prime(const melee_tunables_t *t);
 
+// Throw away every pooled line and start again. Called when the operator
+// changes what the model was told — the preamble file, or the model
+// itself. Safe from any thread; takes melee_pool_lock only, and never
+// holds it across the re-prime.
+void melee_llm_invalidate(const char *why);
+
+// Watch the two keys that decide what the model is told, so a change to
+// either empties the pools. Installed in start(), and CLEARED in
+// deinit(): the KV entries outlive the plugin, and a callback left
+// pointing into an unloaded .so is a jump into freed memory on the next
+// `set kv`.
+void melee_llm_watch(bool on);
+
 // One category's pool as `show melee llm` sees it.
 typedef struct
 {

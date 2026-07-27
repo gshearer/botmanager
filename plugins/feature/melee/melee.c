@@ -184,12 +184,23 @@ melee_start(void)
   melee_tunables_load(&t);
   melee_llm_prime(&t);
 
+  // Every pooled line was written by the preamble in force when it was
+  // requested, so a change to the persona file or the model throws the
+  // lot away and starts again. Installed after the prime: kv fires these
+  // only on an actual change, and only outside the KV lock.
+  melee_llm_watch(true);
+
   return(SUCCESS);
 }
 
 static void
 melee_deinit(void)
 {
+  // Before anything else. The KV entries outlive this plugin, and a
+  // callback left pointing into an unloaded .so is a jump into freed
+  // memory on the next `set kv`.
+  melee_llm_watch(false);
+
   melee_commands_unregister();
   clam(CLAM_INFO, MELEE_CTX, "melee plugin deinitialized");
 }

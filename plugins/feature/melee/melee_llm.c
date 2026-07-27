@@ -9,6 +9,7 @@
 #include "inference.h"
 
 #include "alloc.h"
+#include "kv.h"
 #include "task.h"
 #include "util.h"
 
@@ -46,6 +47,12 @@ typedef struct
 static melee_pool_t    melee_pools[MELEE_FLAV__COUNT];
 static pthread_mutex_t melee_pool_lock = PTHREAD_MUTEX_INITIALIZER;
 static uint64_t        melee_fallbacks;   // static-table renders
+
+// Bumped whenever the operator changes what the model was told. Every
+// in-flight refill carries the generation it was submitted under; a
+// response that comes back stale is discarded rather than installed,
+// because its lines were written by a preamble that no longer applies.
+static uint32_t        melee_pool_gen;
 
 // The only tokens a model-authored line may carry. Indexed nowhere —
 // the sanitiser and the expander each name them explicitly — but kept
@@ -544,9 +551,12 @@ typedef struct
 // answers.
 typedef struct
 {
-  melee_flavour_t cat;
-  uint32_t        pool_size;
-  uint32_t        retry_secs;
+  melee_flavour_t  cat;
+  uint32_t         pool_size;
+  uint32_t         retry_secs;
+  uint32_t         gen;   // generation this request was submitted under
+  melee_tunables_t t;     // so the stale path can re-arm without reading
+                          // KV from a curl worker
 } melee_fill_ctx_t;
 
 static void
@@ -570,12 +580,47 @@ melee_llm_done(const llm_chat_response_t *resp)
   uint32_t          accepted = 0;
   uint32_t          rejected = 0;
   uint16_t          depth    = 0;
+  bool              stale    = false;
 
   if(resp == NULL || resp->user_data == NULL)
     return;
 
   fc   = resp->user_data;
   pool = &melee_pools[fc->cat];
+
+  // These lines were written under a preamble that no longer applies, so
+  // nothing here may touch the pool's contents, its backoff, or its
+  // last_error — a reset pool must not inherit a discarded request's
+  // failure. Reading a plain uint32_t under the lock is the project's
+  // discipline, not a performance question.
+  pthread_mutex_lock(&melee_pool_lock);
+
+  if(fc->gen != melee_pool_gen)
+  {
+    pool->inflight = false;
+    pool->next_try = 0;
+    stale = true;
+  }
+
+  pthread_mutex_unlock(&melee_pool_lock);
+
+  if(stale)
+  {
+    const melee_flavour_t  cat = fc->cat;
+    const melee_tunables_t t   = fc->t;
+
+    clam(CLAM_INFO, MELEE_CTX,
+        "flavour %s: refill discarded (preamble changed under it)",
+        melee_flav_name[cat]);
+
+    // Copy before the free, kick after it. The kick is a queue insert and
+    // is safe here; it re-arms the category that melee_llm_invalidate()
+    // deliberately left alone, and it cannot storm — the generation only
+    // moves on an operator action.
+    mem_free(fc);
+    melee_llm_refill_kick(cat, &t);
+    return;
+  }
 
   if(!resp->ok || resp->content == NULL)
   {
@@ -733,6 +778,11 @@ melee_llm_refill_task(task_t *t)
   fc->cat        = r->cat;
   fc->pool_size  = r->t.llm_pool;
   fc->retry_secs = r->t.llm_retry;
+  fc->t          = r->t;
+
+  pthread_mutex_lock(&melee_pool_lock);
+  fc->gen = melee_pool_gen;
+  pthread_mutex_unlock(&melee_pool_lock);
 
   // msgs[] and both prompt buffers may be stack-local: llm_chat_submit
   // copies everything before it returns.
@@ -797,6 +847,66 @@ melee_llm_refill_kick(melee_flavour_t cat, const melee_tunables_t *t)
     clam(CLAM_WARN, MELEE_CTX, "flavour %s: could not queue refill",
         melee_flav_name[cat]);
   }
+}
+
+// ------------------------------------------------------------------ //
+// Invalidation                                                        //
+// ------------------------------------------------------------------ //
+
+// Between the clear and the first refill landing the pools are empty and
+// the pit speaks from the static tables. That is correct — it is what
+// the fallback is for — and `show melee llm` will tick its fallbacks
+// counter while it lasts.
+void
+melee_llm_invalidate(const char *why)
+{
+  melee_tunables_t t;
+  melee_flavour_t  cat;
+
+  pthread_mutex_lock(&melee_pool_lock);
+
+  for(cat = MELEE_FLAV_MINOR; cat < MELEE_FLAV__COUNT; cat++)
+  {
+    melee_pools[cat].count         = 0;
+    melee_pools[cat].next_try      = 0;
+    melee_pools[cat].last_error[0] = '\0';
+
+    // `inflight` is deliberately left alone: that request is already at
+    // the provider and its callback owns the flag. The generation bump
+    // below is what makes its answer harmless.
+  }
+
+  melee_pool_gen++;
+  pthread_mutex_unlock(&melee_pool_lock);
+
+  clam(CLAM_INFO, MELEE_CTX, "flavour: pools cleared (%s), regenerating",
+      why != NULL ? why : "reason unstated");
+
+  // Outside the lock. Categories with a request still in flight will not
+  // re-arm here; their discarded-response path re-arms them instead,
+  // which is the entire reason that path kicks.
+  melee_tunables_load(&t);
+  melee_llm_prime(&t);
+}
+
+// kv fires this outside the KV lock and only on an actual value change,
+// so it may read KV and queue tasks freely. Verified against core/kv.c:
+// apply_val() releases kv_mutex before firing and gates on val_changed();
+// kv_load() does the same, and these callbacks are installed in start(),
+// which runs after kv_load() — so boot never fires them.
+static void
+melee_llm_kv_changed(const char *key, void *data)
+{
+  (void)data;
+
+  melee_llm_invalidate(key != NULL ? key : "configuration changed");
+}
+
+void
+melee_llm_watch(bool on)
+{
+  kv_set_cb(MELEE_KV_LLM_PROMPT, on ? melee_llm_kv_changed : NULL, NULL);
+  kv_set_cb(MELEE_KV_LLM_MODEL,  on ? melee_llm_kv_changed : NULL, NULL);
 }
 
 // Fill all five pools before the first blow rather than after it. That
