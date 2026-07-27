@@ -53,6 +53,10 @@
 //   target_atr   reversion target above EMA_20(1h), in ATR_14(1h) (0 = at mean)
 //   stop_atr     protective stop below entry, in ATR_14(1h) at entry time
 //   rsi_max      optional oversold filter: require RSI_14 <= this (>=100 = off)
+//   adx_max      optional trend-strength filter: require ADX_14 <= this at
+//                trigger (>=100 = off). Sits out entries during strong-trend
+//                folds where a mean-reverting "dip" is often just a pullback
+//                in a stronger move, without touching choppy/ranging folds.
 //   trigger_atr_min  minimum up-tick magnitude, in ATR_14(1h), to count
 //                toward the trigger streak (0 = off, any positive tick counts)
 //   decision_grain  0 = decide on 1h closes (flagship), 1 = decide on 4h
@@ -112,6 +116,7 @@
 #define RIPTIDE_DEFAULT_TARGET_ATR    0.50   // bank the reversion 0.5 ATR above the mean
 #define RIPTIDE_DEFAULT_STOP_ATR      3.00   // protective stop 3.0 ATR below entry
 #define RIPTIDE_DEFAULT_RSI_MAX     100.0    // oversold filter off by default
+#define RIPTIDE_DEFAULT_ADX_MAX     100.0    // trend-strength filter off by default
 #define RIPTIDE_DEFAULT_TRIGGER_ATR_MIN  0.0  // 0 = off, any positive tick counts
 #define RIPTIDE_DEFAULT_DECISION_GRAIN  0.0   // 0 = 1h decision (flagship), 1 = 4h
 
@@ -124,6 +129,7 @@ typedef struct
   double     target_atr;     // reversion target above EMA_20 (ATR units)
   double     stop_atr;       // protective stop below entry (ATR units)
   double     rsi_max;        // oversold filter (>=100 = off)
+  double     adx_max;        // trend-strength filter (>=100 = off)
   double     trigger_atr_min;   // min up-tick magnitude, ATR units (0 = off)
   int        decision_grain; // 0 = decide on 1h closes, 1 = decide on 4h closes
 
@@ -272,6 +278,18 @@ static const wm_strategy_param_t riptide_params[] = {
                    " (>=100 disables it). Default 100 (off).",
   },
   {
+    .name        = "adx_max",
+    .type        = WM_PARAM_DOUBLE,
+    .default_dbl = RIPTIDE_DEFAULT_ADX_MAX,
+    .min_dbl     = 10.0,
+    .max_dbl     = 100.0,
+    .step_dbl    = 5.0,
+    .help        = "Optional trend-strength filter: require ADX_14 <= this at"
+                   " trigger, read on the decision grain (>=100 disables it)."
+                   " Sits out strong-trend folds without touching choppy ones."
+                   " Default 100 (off).",
+  },
+  {
     .name        = "trigger_atr_min",
     .type        = WM_PARAM_DOUBLE,
     .default_dbl = RIPTIDE_DEFAULT_TRIGGER_ATR_MIN,
@@ -351,6 +369,8 @@ wm_strategy_init(wm_strategy_ctx_t *ctx)
       RIPTIDE_DEFAULT_STOP_ATR);
   s->rsi_max = wm_strategy_kv_get_dbl(mid, strat, "rsi_max",
       RIPTIDE_DEFAULT_RSI_MAX);
+  s->adx_max = wm_strategy_kv_get_dbl(mid, strat, "adx_max",
+      RIPTIDE_DEFAULT_ADX_MAX);
   s->trigger_atr_min = wm_strategy_kv_get_dbl(mid, strat, "trigger_atr_min",
       RIPTIDE_DEFAULT_TRIGGER_ATR_MIN);
   s->decision_grain = (int)wm_strategy_kv_get_uint(mid, strat, "decision_grain",
@@ -371,11 +391,11 @@ wm_strategy_init(wm_strategy_ctx_t *ctx)
 
   clam(CLAM_INFO, RIPTIDE_LOG_CTX,
       "init: %s -> %s regime_grain=%d regime_alpha=%.4f entry_atr=%.2f"
-      " target_atr=%.2f stop_atr=%.2f rsi_max=%.1f trigger_atr_min=%.2f"
-      " decision_grain=%d",
+      " target_atr=%.2f stop_atr=%.2f rsi_max=%.1f adx_max=%.1f"
+      " trigger_atr_min=%.2f decision_grain=%d",
       strat, mid, s->regime_grain, s->regime_alpha, s->entry_atr,
-      s->target_atr, s->stop_atr, s->rsi_max, s->trigger_atr_min,
-      s->decision_grain);
+      s->target_atr, s->stop_atr, s->rsi_max, s->adx_max,
+      s->trigger_atr_min, s->decision_grain);
 
   return(0);
 }
@@ -408,6 +428,7 @@ wm_strategy_on_bar(wm_strategy_ctx_t *ctx,
   float                 ema20;
   float                 atr;
   float                 rsi;
+  float                 adx;
   double                close;
   bool                  regime_up;
   bool                  have_core;
@@ -457,6 +478,7 @@ wm_strategy_on_bar(wm_strategy_ctx_t *ctx,
   ema20     = bar->ind[WM_IND_EMA_20];
   atr       = bar->ind[WM_IND_ATR_14];
   rsi       = bar->ind[WM_IND_RSI_14];
+  adx       = bar->ind[WM_IND_ADX_14];
   regime_up = riptide_regime_up(s);
   have_core = !isnanf(ema20) && !isnanf(atr) && atr > 0.0f;
 
@@ -478,6 +500,8 @@ wm_strategy_on_bar(wm_strategy_ctx_t *ctx,
                          tick_diff >= s->trigger_atr_min * (double)atr));
     bool   rsi_ok    = (s->rsi_max >= 100.0) ||
                        (!isnanf(rsi) && (double)rsi <= s->rsi_max);
+    bool   adx_ok    = (s->adx_max >= 100.0) ||
+                       (!isnanf(adx) && (double)adx <= s->adx_max);
 
     if(!regime_up || !have_core)
       s->armed = false;
@@ -486,7 +510,7 @@ wm_strategy_on_bar(wm_strategy_ctx_t *ctx,
     else if(close >= (double)ema20)
       s->armed = false;   // recovered to the mean without a bounce trigger
 
-    if(s->armed && regime_up && have_core && rsi_ok && uptick)
+    if(s->armed && regime_up && have_core && rsi_ok && adx_ok && uptick)
     {
       sig.score      = 1.0;
       sig.confidence = 0.6;
