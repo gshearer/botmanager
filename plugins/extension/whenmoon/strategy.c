@@ -1287,7 +1287,7 @@ wm_strategy_reload(whenmoon_state_t *st, const char *strategy_name,
 
   // plugin_unload + plugin_load happen outside the registry lock so
   // we don't invert with any locks the loader takes internally.
-  if(plugin_unload(plugin_name) != SUCCESS)
+  if(plugin_unload(plugin_name, NULL) != SUCCESS)
   {
     if(err != NULL)
       snprintf(err, err_cap, "plugin_unload(%s) failed", plugin_name);
@@ -1317,7 +1317,7 @@ wm_strategy_reload(whenmoon_state_t *st, const char *strategy_name,
   {
     if(err != NULL)
       snprintf(err, err_cap, "plugin_resolve failed");
-    plugin_unload(plugin_name);
+    plugin_unload(plugin_name, NULL);
     return(FAIL);
   }
 
@@ -1325,7 +1325,7 @@ wm_strategy_reload(whenmoon_state_t *st, const char *strategy_name,
   {
     if(err != NULL)
       snprintf(err, err_cap, "plugin_init_all failed");
-    plugin_unload(plugin_name);
+    plugin_unload(plugin_name, NULL);
     return(FAIL);
   }
 
@@ -1333,7 +1333,7 @@ wm_strategy_reload(whenmoon_state_t *st, const char *strategy_name,
   {
     if(err != NULL)
       snprintf(err, err_cap, "plugin_start_all failed");
-    plugin_unload(plugin_name);
+    plugin_unload(plugin_name, NULL);
     return(FAIL);
   }
 

@@ -144,10 +144,13 @@ plugin_load(const char *path)
 }
 
 bool
-plugin_unload(const char *name)
+plugin_unload(const char *name, uint32_t *leaks_out)
 {
   plugin_rec_t  *target;
   plugin_rec_t **pp;
+
+  if(leaks_out != NULL)
+    *leaks_out = 0;
 
   if(name == NULL || !plugin_ready)
     return(FAIL);
@@ -258,6 +261,9 @@ plugin_unload(const char *name)
   // PLIFE-7 turns this into a refusal; until then, we only tell.
   {
     uint32_t leaks = plugin_audit(name, NULL, NULL);
+
+    if(leaks_out != NULL)
+      *leaks_out = leaks;
 
     if(leaks > 0)
       clam(CLAM_WARN, "plugin_audit",
@@ -2062,7 +2068,7 @@ plugin_cmd_load(const cmd_ctx_t *ctx)
         CLR_RESET " for " CLR_BOLD "%s" CLR_RESET
         "; unloading", name);
     cmd_reply(ctx, buf);
-    plugin_unload(name);
+    plugin_unload(name, NULL);
     return;
   }
 
@@ -2072,7 +2078,7 @@ plugin_cmd_load(const cmd_ctx_t *ctx)
     snprintf(buf, sizeof(buf), CLR_RED "initialization failed" CLR_RESET
         " for " CLR_BOLD "%s" CLR_RESET "; unloading", name);
     cmd_reply(ctx, buf);
-    plugin_unload(name);
+    plugin_unload(name, NULL);
     return;
   }
 
@@ -2082,7 +2088,7 @@ plugin_cmd_load(const cmd_ctx_t *ctx)
     snprintf(buf, sizeof(buf), CLR_RED "start failed" CLR_RESET
         " for " CLR_BOLD "%s" CLR_RESET "; unloading", name);
     cmd_reply(ctx, buf);
-    plugin_unload(name);
+    plugin_unload(name, NULL);
     return;
   }
 
@@ -2158,8 +2164,9 @@ plugin_cmd_audit(const cmd_ctx_t *ctx)
 static void
 plugin_cmd_unload(const cmd_ctx_t *ctx)
 {
-  const char *name = ctx->parsed->argv[0];
-  char buf[PLUGIN_NAME_SZ * 2 + 128];
+  const char *name  = ctx->parsed->argv[0];
+  uint32_t    leaks = 0;
+  char        buf[PLUGIN_NAME_SZ * 2 + 256];
 
   // Check if loaded.
   const plugin_desc_t *pd = plugin_find(name);
@@ -2226,8 +2233,8 @@ plugin_cmd_unload(const cmd_ctx_t *ctx)
     }
   }
 
-  // Unload (handles stop, deinit, dlclose).
-  if(plugin_unload(name) != SUCCESS)
+  // Unload (handles stop, deinit, dlclose, and the teardown audit).
+  if(plugin_unload(name, &leaks) != SUCCESS)
   {
     snprintf(buf, sizeof(buf), CLR_RED "failed to unload" CLR_RESET " "
         CLR_BOLD "%s" CLR_RESET, name);
@@ -2235,8 +2242,22 @@ plugin_cmd_unload(const cmd_ctx_t *ctx)
     return;
   }
 
+  // The audit runs on every unload, not on request. Saying "unloaded"
+  // and nothing else would be a lie when the plugin left N pointers in
+  // an address space that no longer exists.
+  if(leaks > 0)
+  {
+    snprintf(buf, sizeof(buf), CLR_GREEN "unloaded" CLR_RESET " "
+        CLR_BOLD "%s" CLR_RESET " — " CLR_YELLOW "%u live reference(s)"
+        CLR_RESET " remained after its deinit(); those pointers now "
+        "dangle. Reload it, then /plugin audit %s for the list.",
+        name, leaks, name);
+    cmd_reply(ctx, buf);
+    return;
+  }
+
   snprintf(buf, sizeof(buf), CLR_GREEN "unloaded" CLR_RESET " "
-      CLR_BOLD "%s" CLR_RESET, name);
+      CLR_BOLD "%s" CLR_RESET " (teardown clean)", name);
   cmd_reply(ctx, buf);
 }
 

@@ -120,7 +120,12 @@ typedef struct
 
 void plugin_get_stats(plugin_stats_t *out);
 bool plugin_load(const char *path);
-bool plugin_unload(const char *name);
+// `leaks_out` (optional) receives the teardown audit's verdict — the
+// number of references still pointing into the plugin's mapping after
+// its deinit() ran. Non-zero means the unload completed but the
+// plugin's teardown is incomplete; callers that face a human must say
+// so. PLIFE-7 turns that same count into a refusal.
+bool plugin_unload(const char *name, uint32_t *leaks_out);
 uint32_t plugin_discover(const char *dir);
 const plugin_desc_t *plugin_find(const char *name);
 const plugin_desc_t *plugin_find_feature(const char *feature);
