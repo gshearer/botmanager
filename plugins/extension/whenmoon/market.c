@@ -887,6 +887,7 @@ wm_market_on_candles(const exchange_candles_result_t *res, void *user)
   wm_market_backfill_ctx_t *ctx = user;
   whenmoon_market_t        *mk;
   uint32_t                  i;
+  uint32_t                  synthesized = 0;
 
   if(ctx == NULL)
     return;
@@ -944,15 +945,15 @@ wm_market_on_candles(const exchange_candles_result_t *res, void *user)
     bar.close       = src->close;
     bar.volume      = src->volume;
 
-    wm_aggregator_replay_bar(mk, WM_GRAN_1M, &bar);
+    synthesized += wm_aggregator_replay_bar(mk, WM_GRAN_1M, &bar);
   }
 
   pthread_mutex_unlock(&mk->lock);
   pthread_rwlock_unlock(&ctx->st->markets->arr_lock);
 
   clam(CLAM_INFO, WHENMOON_CTX,
-      "market %s: %u candles backfilled",
-      ctx->product_id, res->count);
+      "market %s: %u candles backfilled (synth=%u)",
+      ctx->product_id, res->count, synthesized);
 
   mem_free(ctx);
 }

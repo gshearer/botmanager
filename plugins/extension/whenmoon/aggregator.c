@@ -3,10 +3,12 @@
 //
 // One aggregator per running market. Drives the cascade
 //   trade -> 1m bar -> 5m -> 15m -> 1h -> 4h -> 1d
-// closing each grain on accumulator-input thresholds (1m feeds 5m on
-// every 5 closed 1m bars; 5m feeds 15m every 3; etc.). Every closed
-// bar gets pushed onto the corresponding grain ring and triggers a
-// TA-Lib indicator pass via wm_indicators_compute_bar.
+// rolling each grain's work bucket on TIME boundaries (WM-AGG-1a): a
+// bucket covers exactly [bar_start, bar_start + step) and closes the
+// instant a source bar lands on or crosses its end, so a bar's label
+// always bounds its content. Every closed bar gets pushed onto the
+// corresponding grain ring and triggers a TA-Lib indicator pass via
+// wm_indicators_compute_bar.
 //
 // The aggregator runs entirely under `whenmoon_market_t.lock`, so the
 // callers (the WS reader thread for live trades; the warm-up task for
@@ -42,26 +44,16 @@ const int32_t wm_gran_seconds[WM_GRAN_MAX] =
   86400, // 1d
 };
 
-// Inputs required to close one bar at the given target grain. 1m has
-// no upstream and is closed by trade boundaries, not by accumulator.
-static const uint32_t wm_inputs_per_grain[WM_GRAN_MAX] =
-{
-  [WM_GRAN_1M]  = 0,
-  [WM_GRAN_5M]  = 5,    // 5  * 1m   = 5m
-  [WM_GRAN_15M] = 3,    // 3  * 5m   = 15m
-  [WM_GRAN_1H]  = 4,    // 4  * 15m  = 1h
-  [WM_GRAN_4H]  = 4,    // 4  * 1h   = 4h
-  [WM_GRAN_1D]  = 6,    // 6  * 4h   = 1d
-};
-
 // Forward decls.
 static void wm_aggregator_close_1m(whenmoon_market_t *mk);
 static void wm_aggregator_emit_empty_1m(whenmoon_market_t *mk,
     int64_t bar_start_ms);
 static void wm_aggregator_push_bar(whenmoon_market_t *mk,
     wm_gran_t gran, const wm_candle_full_t *bar);
+static void wm_aggregator_bucket_emit(whenmoon_market_t *mk,
+    wm_gran_t target, wm_work_bucket_t *w);
 static void wm_aggregator_cascade_to(whenmoon_market_t *mk,
-    wm_gran_t target, const wm_candle_full_t *src);
+    wm_gran_t target, const wm_candle_full_t *src, wm_gran_t src_gran);
 
 // ------------------------------------------------------------------ //
 // Lifecycle                                                          //
@@ -114,10 +106,9 @@ wm_aggregator_init(whenmoon_market_t *mk, uint32_t history_1d_min)
     }
 
     memset(mk->grain_arr[g], 0, sz);
-    mk->grain_n[g]              = 0;
-    mk->grain_cap[g]            = bars;
-    a->bars_required[g]         = bars;
-    a->work[g].inputs_required  = wm_inputs_per_grain[g];
+    mk->grain_n[g]      = 0;
+    mk->grain_cap[g]    = bars;
+    a->bars_required[g] = bars;
   }
 
   mk->aggregator = a;
@@ -286,7 +277,7 @@ wm_aggregator_close_1m(whenmoon_market_t *mk)
 
     if(n > 0)
       wm_aggregator_cascade_to(mk, WM_GRAN_5M,
-          &mk->grain_arr[WM_GRAN_1M][n - 1]);
+          &mk->grain_arr[WM_GRAN_1M][n - 1], WM_GRAN_1M);
   }
 
   // pending_1m carries forward to the caller. The caller (live ingest
@@ -322,7 +313,8 @@ wm_aggregator_emit_empty_1m(whenmoon_market_t *mk, int64_t bar_start_ms)
 
   if(mk->grain_n[WM_GRAN_1M] > 0)
     wm_aggregator_cascade_to(mk, WM_GRAN_5M,
-        &mk->grain_arr[WM_GRAN_1M][mk->grain_n[WM_GRAN_1M] - 1]);
+        &mk->grain_arr[WM_GRAN_1M][mk->grain_n[WM_GRAN_1M] - 1],
+        WM_GRAN_1M);
 }
 
 // ------------------------------------------------------------------ //
@@ -386,13 +378,58 @@ wm_aggregator_push_bar(whenmoon_market_t *mk, wm_gran_t gran,
 // Cascade (1m -> 5m -> 15m -> 1h -> 4h -> 1d)                        //
 // ------------------------------------------------------------------ //
 
+// Close `target`'s work bucket: label it bucket-start + step (the
+// window it covers), push it, reset the bucket, and feed the closed
+// bar into the next grain up. Partial buckets (fewer source bars than
+// a full window) are legitimate bars — the label stays honest, the
+// content just stops early, exactly what live produces on a quiet
+// feed.
+static void
+wm_aggregator_bucket_emit(whenmoon_market_t *mk, wm_gran_t target,
+    wm_work_bucket_t *w)
+{
+  wm_candle_full_t bar;
+  int64_t          step_ms = (int64_t)wm_gran_seconds[target] * 1000;
+
+  memset(&bar, 0, sizeof(bar));
+  bar.ts_close_ms = w->bar_start_ms + step_ms;
+  bar.open        = w->open;
+  bar.high        = w->high;
+  bar.low         = w->low;
+  bar.close       = w->close;
+  bar.volume      = w->volume;
+
+  wm_aggregator_push_bar(mk, target, &bar);
+
+  memset(w, 0, sizeof(*w));
+
+  if(target + 1 < WM_GRAN_MAX)
+  {
+    uint32_t n = mk->grain_n[target];
+
+    if(n > 0)
+      wm_aggregator_cascade_to(mk, (wm_gran_t)(target + 1),
+          &mk->grain_arr[target][n - 1], target);
+  }
+}
+
+// WM-AGG-1a: buckets roll on TIME boundaries, never on input counts.
+// The old count-roll (N source bars close one target bar) floored a
+// fresh bucket one full target-step early and let every feed gap
+// ratchet bucket content past the bar's label — both legs handed
+// backtests future prices under the bar's stated close.
+//
+// `src_gran` is the grain `src` was aggregated at (the cascade always
+// feeds `target` from `target - 1`); its step locates the source bar's
+// window-open instant for the boundary-crossing test.
 static void
 wm_aggregator_cascade_to(whenmoon_market_t *mk, wm_gran_t target,
-    const wm_candle_full_t *src)
+    const wm_candle_full_t *src, wm_gran_t src_gran)
 {
   wm_aggregator_t  *a;
   wm_work_bucket_t *w;
   int64_t           step_ms;
+  int64_t           src_open_ms;
 
   if(target >= WM_GRAN_MAX || mk == NULL || src == NULL)
     return;
@@ -400,18 +437,28 @@ wm_aggregator_cascade_to(whenmoon_market_t *mk, wm_gran_t target,
   a = mk->aggregator;
   w = &a->work[target];
 
-  step_ms = (int64_t)wm_gran_seconds[target] * 1000;
+  step_ms     = (int64_t)wm_gran_seconds[target] * 1000;
+  src_open_ms = src->ts_close_ms
+              - (int64_t)wm_gran_seconds[src_gran] * 1000;
+
+  // A source bar that BEGINS at/after the current bucket's end belongs
+  // to a later window: close the bucket as a partial first (its label
+  // is already correct — the content just stops early). A bar whose
+  // close merely touches the end stays inside the closing bucket.
+  if(w->populated && src_open_ms >= w->bar_start_ms + step_ms)
+    wm_aggregator_bucket_emit(mk, target, w);
 
   if(!w->populated)
   {
-    w->bar_start_ms = (src->ts_close_ms - step_ms) / step_ms * step_ms;
+    // Bucket containing the bar's LAST instant — never the target-step
+    // subtraction (that was leg 1 of the lookahead bug).
+    w->bar_start_ms = ((src->ts_close_ms - 1) / step_ms) * step_ms;
     w->populated    = true;
     w->open         = src->open;
     w->high         = src->high;
     w->low          = src->low;
     w->close        = src->close;
     w->volume       = src->volume;
-    w->inputs_seen  = 1;
   }
 
   else
@@ -420,62 +467,62 @@ wm_aggregator_cascade_to(whenmoon_market_t *mk, wm_gran_t target,
     if(src->low  < w->low)  w->low  = src->low;
     w->close   = src->close;
     w->volume += src->volume;
-    w->inputs_seen++;
   }
 
-  if(w->inputs_seen >= w->inputs_required)
-  {
-    wm_candle_full_t  bar;
-
-    memset(&bar, 0, sizeof(bar));
-    bar.ts_close_ms = w->bar_start_ms + step_ms;
-    bar.open        = w->open;
-    bar.high        = w->high;
-    bar.low         = w->low;
-    bar.close       = w->close;
-    bar.volume      = w->volume;
-
-    wm_aggregator_push_bar(mk, target, &bar);
-
-    memset(w, 0, sizeof(*w));
-    w->inputs_required = wm_inputs_per_grain[target];
-
-    if(target + 1 < WM_GRAN_MAX)
-    {
-      uint32_t n = mk->grain_n[target];
-
-      if(n > 0)
-        wm_aggregator_cascade_to(mk, (wm_gran_t)(target + 1),
-            &mk->grain_arr[target][n - 1]);
-    }
-  }
+  // Complete exactly at the boundary: the 1h bar fires the moment its
+  // last source bar closes — the same instant the old count path fired
+  // on a gapless stream.
+  if(src->ts_close_ms >= w->bar_start_ms + step_ms)
+    wm_aggregator_bucket_emit(mk, target, w);
 }
 
 // ------------------------------------------------------------------ //
 // Single-bar replay (warm-up + REST live-ring backfill)              //
 // ------------------------------------------------------------------ //
 
-void
+uint32_t
 wm_aggregator_replay_bar(whenmoon_market_t *mk, wm_gran_t gran,
     const wm_candle_full_t *bar)
 {
+  uint32_t synthesized = 0;
+
   if(mk == NULL || mk->aggregator == NULL || bar == NULL)
-    return;
+    return(0);
 
   // Replay only at 1m for now. Higher grains are reconstructed via
   // cascade so they share computation with the live path. WM-LT-6
   // backtest replay uses the same entry point.
   if(gran != WM_GRAN_1M)
-    return;
+    return(0);
 
   // Idempotency: skip duplicates from overlapping warm-up + REST
   // live-ring backfill.
   if(bar->ts_close_ms <= mk->aggregator->last_close_ms[WM_GRAN_1M])
-    return;
+    return(0);
+
+  // WM-AGG-1b: synthesize the missing minutes between the ring's tail
+  // and this bar, mirroring live ingest's skip-bar loop — a replayed
+  // cascade must aggregate the same bars a live feed would have
+  // produced, or gaps ratchet higher-grain content past its labels.
+  // First bar of a stream (last_close == 0) starts cold, like live.
+  if(mk->aggregator->last_close_ms[WM_GRAN_1M] != 0)
+  {
+    int64_t expected = mk->aggregator->last_close_ms[WM_GRAN_1M];
+
+    while(expected < bar->ts_close_ms - 60000)
+    {
+      wm_aggregator_emit_empty_1m(mk, expected);
+      expected += 60000;
+      synthesized++;
+    }
+  }
 
   wm_aggregator_push_bar(mk, WM_GRAN_1M, bar);
   wm_aggregator_cascade_to(mk, WM_GRAN_5M,
-      &mk->grain_arr[WM_GRAN_1M][mk->grain_n[WM_GRAN_1M] - 1]);
+      &mk->grain_arr[WM_GRAN_1M][mk->grain_n[WM_GRAN_1M] - 1],
+      WM_GRAN_1M);
+
+  return(synthesized);
 }
 
 // Reset grain `gran`'s ring + cursor, then replay `n` bars (which MUST
@@ -503,8 +550,13 @@ wm_aggregator_warmup_grain(whenmoon_market_t *mk, wm_gran_t gran,
   a = mk->aggregator;
 
   // Reset ring length + cursor so the replay overwrites from index 0.
+  // WM-AGG-1: clear the grain's cascade bucket too — the direct fetch
+  // supersedes whatever was in flight, and a stale bucket would
+  // partial-emit old content into the warmed ring on the next source
+  // bar.
   mk->grain_n[gran]      = 0;
   a->last_close_ms[gran] = 0;
+  memset(&a->work[gran], 0, sizeof(a->work[gran]));
 
   // Suppress fan-out across the replay so historical bars do not fire
   // wm_strategy_dispatch_bar; restore the prior flag after.
@@ -573,6 +625,7 @@ wm_aggregator_load_history(whenmoon_state_t *st, const char *market_id_str,
   uint32_t           cap;
   uint32_t           limit;
   uint32_t           replayed = 0;
+  uint32_t           synthesized = 0;
   uint32_t           i;
   uint32_t           g;
   int                n;
@@ -703,10 +756,15 @@ wm_aggregator_load_history(whenmoon_state_t *st, const char *market_id_str,
   // DB's newest bar (replay_bar dedups on last_close_ms) — without this
   // reset the replay would be a no-op for an already-live market. Live
   // bars are re-established going forward once warmup hands back.
+  // WM-AGG-1: clear the cascade buckets too — a live market's in-flight
+  // buckets would otherwise partial-emit stale content into the freshly
+  // reset rings on the first replayed bar.
   for(g = 0; g < WM_GRAN_MAX; g++)
   {
     mk->grain_n[g]                   = 0;
     mk->aggregator->last_close_ms[g] = 0;
+    memset(&mk->aggregator->work[g], 0,
+        sizeof(mk->aggregator->work[g]));
   }
 
   t0 = wm_dl_now_ms();   // STEP 0: bracket the in-memory replay loop
@@ -736,7 +794,7 @@ wm_aggregator_load_history(whenmoon_state_t *st, const char *market_id_str,
     bar.close       = strtod(s_close, NULL);
     bar.volume      = strtod(s_volume, NULL);
 
-    wm_aggregator_replay_bar(mk, WM_GRAN_1M, &bar);
+    synthesized += wm_aggregator_replay_bar(mk, WM_GRAN_1M, &bar);
     replayed++;
   }
 
@@ -750,9 +808,9 @@ wm_aggregator_load_history(whenmoon_state_t *st, const char *market_id_str,
   // replay wall-time + the live concurrent-warmup gauge, so a restart is a
   // measurement (which of fetch/replay dominates, and that the cap holds).
   clam(CLAM_INFO, WHENMOON_CTX,
-      "warmup %s: replayed %u 1m bars from %s (limit=%u) "
+      "warmup %s: replayed %u 1m bars from %s (limit=%u) synth=%u "
       "fetch=%lldms replay=%lldms rows=%u active=%u",
-      mk->market_id_str, replayed, table, limit,
+      mk->market_id_str, replayed, table, limit, synthesized,
       (long long)fetch_ms, (long long)replay_ms, res->rows,
       wm_warmup_active_count());
 

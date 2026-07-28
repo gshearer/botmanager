@@ -37,8 +37,11 @@
 // Magic = "WBNM" in little-endian byte order ('W'=0x57, 'B'=0x42,
 // 'N'=0x4E, 'M'=0x4D → 0x4D4E4257). Files are host-endian; the magic
 // doubles as an endianness sniffer for diagnostic purposes only.
+//
+// v2: cascade boundary-roll fix (WM-AGG-1) — pre-fix corpora carry
+// future-skewed higher grains.
 #define WM_BT_FILE_MAGIC        0x4D4E4257u
-#define WM_BT_FILE_VERSION      1u
+#define WM_BT_FILE_VERSION      2u
 #define WM_BT_FILE_PAGE_ALIGN   4096u
 
 // One per-grain block descriptor. `bar_size` is sizeof(wm_candle_full_t)

@@ -47,8 +47,10 @@ typedef struct
   double   volume;
 } wm_pending_bucket_t;
 
-// Per-grain cascading work-bucket. 1m closes feed 5m's work bucket;
-// when 5 inputs accumulate, 5m closes and feeds 15m, and so on.
+// Per-grain cascading work-bucket. 1m closes feed 5m's work bucket,
+// 5m closes feed 15m's, and so on. WM-AGG-1a: a bucket covers exactly
+// [bar_start_ms, bar_start_ms + step) and closes when a source bar
+// lands on or crosses its end — time boundaries, never input counts.
 typedef struct
 {
   bool     populated;
@@ -58,8 +60,6 @@ typedef struct
   double   low;
   double   close;
   double   volume;
-  uint32_t inputs_seen;
-  uint32_t inputs_required;
 } wm_work_bucket_t;
 
 typedef struct wm_aggregator
@@ -99,11 +99,15 @@ void wm_aggregator_on_trade(struct whenmoon_market *mk,
     int64_t ts_ms, double price, double size);
 
 // Single-bar replay path. Used by the REST live-ring backfill (300 1m
-// rows on market add) and by the DB warm-up task. `gran` must be
-// WM_GRAN_1M for now — the cascade upgrades from 1m bars only.
-// Idempotent on duplicate ts_close_ms (skipped if <= last_close_ms).
-// Caller must hold `mk->lock`.
-void wm_aggregator_replay_bar(struct whenmoon_market *mk,
+// rows on market add), the DB warm-up task, and the backtest snapshot
+// build. `gran` must be WM_GRAN_1M for now — the cascade upgrades from
+// 1m bars only. Idempotent on duplicate ts_close_ms (skipped if
+// <= last_close_ms). WM-AGG-1b: gaps between the ring tail and `bar`
+// are filled with synthetic carry-forward 1m bars exactly as live
+// ingest fills them; returns how many were synthesized (callers fold
+// the count into their end-of-stream summary logs — per-bar logging
+// would flood on gappy history). Caller must hold `mk->lock`.
+uint32_t wm_aggregator_replay_bar(struct whenmoon_market *mk,
     wm_gran_t gran, const wm_candle_full_t *bar);
 
 // WM-WARMUP-1: reset grain `gran`'s ring + cursor and replay `bars`

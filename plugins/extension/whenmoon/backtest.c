@@ -250,6 +250,7 @@ typedef struct
 {
   whenmoon_market_t *mkt;
   uint32_t           replayed;
+  uint32_t           synthesized;   // WM-AGG-1b gap-fill 1m bars
 } wm_bt_stream_ctx_t;
 
 // Per-row sink for the streamed candle history (DB-STREAM-1). Cols
@@ -280,7 +281,7 @@ wm_bt_snapshot_row_cb(uint32_t row, uint32_t cols,
   bar.close       = strtod(values[4], NULL);
   bar.volume      = strtod(values[5], NULL);
 
-  wm_aggregator_replay_bar(ctx->mkt, WM_GRAN_1M, &bar);
+  ctx->synthesized += wm_aggregator_replay_bar(ctx->mkt, WM_GRAN_1M, &bar);
   ctx->replayed++;
   return(true);
 }
@@ -299,6 +300,7 @@ wm_backtest_snapshot_build(int32_t market_id_db,
   char                    sql[1024];
   uint32_t                history_days;
   uint32_t                replayed = 0;
+  uint32_t                synthesized = 0;
   int                     n;
 
   if(err != NULL && err_cap > 0)
@@ -434,7 +436,8 @@ wm_backtest_snapshot_build(int32_t market_id_db,
   // wedges the daemon). snap->mkt.lock is private to this unpublished
   // stub market, so holding it across the streamed read is uncontended.
   {
-    wm_bt_stream_ctx_t sctx = { .mkt = &snap->mkt, .replayed = 0 };
+    wm_bt_stream_ctx_t sctx = { .mkt = &snap->mkt, .replayed = 0,
+                                .synthesized = 0 };
     bool               ok;
 
     pthread_mutex_lock(&snap->mkt.lock);
@@ -454,16 +457,17 @@ wm_backtest_snapshot_build(int32_t market_id_db,
       goto fail;
     }
 
-    replayed = sctx.replayed;
+    replayed    = sctx.replayed;
+    synthesized = sctx.synthesized;
   }
 
   snap->bars_loaded_1m = replayed;
 
   clam(CLAM_INFO, WM_BT_CTX,
-      "snapshot built: %s [%s..%s] 1m_bars=%u history=%u days"
+      "snapshot built: %s [%s..%s] 1m_bars=%u synth=%u history=%u days"
       " (5m=%u 15m=%u 1h=%u 4h=%u 1d=%u)",
       source_market_id, range_start, range_end,
-      replayed, history_days,
+      replayed, synthesized, history_days,
       snap->mkt.grain_n[WM_GRAN_5M], snap->mkt.grain_n[WM_GRAN_15M],
       snap->mkt.grain_n[WM_GRAN_1H], snap->mkt.grain_n[WM_GRAN_4H],
       snap->mkt.grain_n[WM_GRAN_1D]);
