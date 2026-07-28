@@ -99,7 +99,16 @@ typedef struct
 
   bool (*init)(void);     // register state, set up internals
   bool (*start)(void);    // begin active operation
-  bool (*stop)(void);     // drain in-flight work
+
+  // Drain in-flight work — and *join* what runs in this mapping. A
+  // plugin that spawned a persist task must signal it and call
+  // task_persist_join(); signalling alone says nothing about whether
+  // the thread has left the plugin's .text. FAIL here refuses the
+  // unload with the plugin left running and intact — the one refusal
+  // that costs nothing. What stop() forgets, the teardown's quiescence
+  // barrier catches instead, at the price of a zombie.
+  bool (*stop)(void);
+
   void (*deinit)(void);   // final cleanup
 
   // Type-specific extension data (e.g., db_driver_t* for DB plugins).
@@ -121,6 +130,10 @@ typedef struct
 void plugin_get_stats(plugin_stats_t *out);
 bool plugin_load(const char *path);
 
+// Longest offender description the quiescence barrier prints — a kind,
+// a name, and the state it was caught in.
+#define PLUGIN_OFFENDER_SZ  160
+
 // What the teardown sweep between deinit() and dlclose found.
 //
 // `reclaimed` counts the Class-A registrations — commands, KV entries,
@@ -130,13 +143,21 @@ bool plugin_load(const char *path);
 //
 // `residual` counts what core will NOT drop for anyone: Class-B
 // references (running tasks, in-flight requests, a bound driver vtable)
-// still pointing into the mapping. Those genuinely dangle past dlclose.
-// PLIFE-6 turns a non-zero `residual` into a refusal; until then it is
-// reported and the unload proceeds.
+// still pointing into the mapping. Those genuinely dangle past dlclose,
+// so a non-zero `residual` after the quiescence budget expires refuses
+// the unload rather than risking the SIGSEGV.
+//
+// `zombie` is that refusal: the plugin was stopped and deinitialized
+// before the residual was found, so it stays mapped — nothing dangles,
+// nothing works — until the daemon restarts. `offender` names the first
+// task or request that held the mapping open, empty when the residual
+// is something that does not drain (a bound vtable, a driver).
 typedef struct
 {
   uint32_t reclaimed;
   uint32_t residual;
+  bool     zombie;
+  char     offender[PLUGIN_OFFENDER_SZ];
 } plugin_unload_report_t;
 
 // `report` is optional; callers that face a human should pass one and
@@ -277,6 +298,13 @@ void plugin_exit(void);
 // beyond the point where more lines help; the count stays exact.
 #define PLUGIN_AUDIT_LINE_SZ    200
 #define PLUGIN_AUDIT_MAX_LINES  256
+
+// How long the teardown waits for transient Class-B references to end,
+// and how often it looks. The budget is a KV knob; the poll interval is
+// not — it only trades a little idle CPU for how promptly a plugin that
+// went quiet gets unloaded.
+#define KV_UNLOAD_QUIESCE_MS     "core.plugin.unload_quiesce_ms"
+#define PLUGIN_QUIESCE_POLL_MS   50
 
 // The address range one loaded object occupies, plus the short name to
 // print for it. Resolved once per audit, so the per-pointer test is

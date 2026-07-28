@@ -13,6 +13,13 @@ static void dlsym_cache_on_plugin_unload(const plugin_rec_t *target);
 // mapping lookup. Called from plugin_unload between deinit and dlclose.
 static uint32_t plugin_reclaim(const plugin_rec_t *target);
 
+// Forward decls — both share plugin_audit's mapping lookup and
+// iterators, and both are called from plugin_unload after the Class-A
+// sweep, before dlclose.
+static bool plugin_quiesce(const plugin_rec_t *target, uint32_t timeout_ms,
+    char *offender, size_t offender_cap);
+static void audit_emit_clam(const char *line, void *data);
+
 static plugin_rec_t *
 find_by_name(const char *name)
 {
@@ -266,13 +273,8 @@ plugin_unload(const char *name, plugin_unload_report_t *report)
   // that is the worklist (`/plugin audit <name>`), this is the verdict.
   {
     uint32_t reclaimed = plugin_reclaim(target);
-    uint32_t residual  = plugin_audit(name, NULL, NULL);
-
-    if(report != NULL)
-    {
-      report->reclaimed = reclaimed;
-      report->residual  = residual;
-    }
+    char     offender[PLUGIN_OFFENDER_SZ];
+    uint32_t residual;
 
     if(reclaimed > 0)
       clam(CLAM_WARN, "plugin_audit",
@@ -284,11 +286,41 @@ plugin_unload(const char *name, plugin_unload_report_t *report)
 
     // Class B is nobody's default: a running task, an in-flight request
     // or a bound vtable cannot be cancelled centrally without inventing
-    // a policy. What is left here genuinely dangles.
+    // a policy. Waiting for one to end, however, is always correct — so
+    // give the transient half its budget before judging what is left.
+    plugin_quiesce(target, (uint32_t)kv_get_int(KV_UNLOAD_QUIESCE_MS),
+        offender, sizeof(offender));
+
+    residual = plugin_audit(name, NULL, NULL);
+
+    if(report != NULL)
+    {
+      report->reclaimed = reclaimed;
+      report->residual  = residual;
+      snprintf(report->offender, sizeof(report->offender), "%s", offender);
+    }
+
+    // Refusing here leaves the plugin stopped, deinitialized and still
+    // mapped — a zombie: nothing of it works, and nothing dangles. That
+    // is strictly better than the SIGSEGV dlclose would hand us, and it
+    // is loud enough that nobody mistakes it for a clean unload.
     if(residual > 0)
-      clam(CLAM_WARN, "plugin_audit",
-          "'%s': %u reference(s) core cannot reclaim (tasks, requests, "
-          "drivers) remain; this dlclose may dangle", name, residual);
+    {
+      clam(CLAM_FATAL, "plugin",
+          "refusing to dlclose '%s': %u reference(s) core cannot reclaim "
+          "still point into its mapping%s%s; the plugin is now "
+          "DEINITIALIZED but still mapped (zombie) — fix its stop() and "
+          "restart the daemon", name, residual,
+          offender[0] != '\0' ? " — " : "", offender);
+
+      plugin_audit(name, audit_emit_clam, NULL);
+
+      if(report != NULL)
+        report->zombie = true;
+
+      target->state = PLUGIN_LOADED;
+      return(FAIL);
+    }
   }
 
   // Remove from list.
@@ -1175,6 +1207,144 @@ plugin_audit(const char *plugin_name, plugin_audit_emit_t emit, void *data)
   leaks = ctx.leaks;
   mem_free(ctx.lines);
   return(leaks);
+}
+
+// Emitter that puts an audit line in the log rather than in a reply —
+// used on the refusal path, where the operator is not necessarily the
+// one who typed the command.
+static void
+audit_emit_clam(const char *line, void *data)
+{
+  (void)data;
+
+  clam(CLAM_WARN, "plugin_audit", "%s", line);
+}
+
+// The quiescence barrier.
+//
+// Class-B references are not core's to cancel — but most of them are
+// merely *transient*: a task between two runs of its own callback, a
+// request whose response is still on the wire. Nothing is wrong with
+// them except that dlclose is one instruction ahead. So core waits, and
+// refuses only what is still holding the mapping when the budget runs
+// out (root TODO.md §PLIFE-6).
+
+typedef struct
+{
+  plugin_map_t map;
+  uint32_t     holders;                    // this pass only; reset per poll
+  char         offender[PLUGIN_OFFENDER_SZ];
+} plugin_quiesce_ctx_t;
+
+static bool
+quiesce_in_map(const plugin_quiesce_ctx_t *ctx, const void *ptr)
+{
+  uintptr_t addr = (uintptr_t)ptr;
+
+  return(ptr != NULL && addr >= ctx->map.lo && addr < ctx->map.hi);
+}
+
+// The first holder of each pass is the one the refusal names; the rest
+// only raise the count. A bare "busy" would leave the operator with
+// nothing to fix.
+static void
+quiesce_hold(plugin_quiesce_ctx_t *ctx, const char *kind,
+    const char *subject, const char *state)
+{
+  ctx->holders++;
+
+  if(ctx->offender[0] != '\0')
+    return;
+
+  snprintf(ctx->offender, sizeof(ctx->offender), "%s '%s' (%s)", kind,
+      subject != NULL ? subject : "(unnamed)", state);
+}
+
+static void
+quiesce_task_cb(const task_iter_info_t *info, void *data)
+{
+  plugin_quiesce_ctx_t *ctx = data;
+
+  if(!quiesce_in_map(ctx, fn_addr(&info->cb))
+      && !quiesce_in_map(ctx, info->data))
+    return;
+
+  quiesce_hold(ctx, "task", info->name, task_state_name(info->state));
+}
+
+static void
+quiesce_curl_cb(const curl_iter_req_t *req, void *data)
+{
+  plugin_quiesce_ctx_t *ctx = data;
+
+  if(!quiesce_in_map(ctx, fn_addr(&req->cb))
+      && !quiesce_in_map(ctx, req->cb_data)
+      && !quiesce_in_map(ctx, fn_addr(&req->chunk_cb))
+      && !quiesce_in_map(ctx, req->chunk_user))
+    return;
+
+  quiesce_hold(ctx, "request", req->url,
+      req->in_flight ? "in-flight" : "queued");
+}
+
+// Blocks the unloading thread — an operator/command thread — for at
+// most `timeout_ms`. Never called from a worker: plugin_unload's own
+// callers are command handlers and the whenmoon strategy reload.
+// returns: SUCCESS when nothing in the queues names the mapping any
+// more, FAIL on timeout (caller refuses the unload).
+static bool
+plugin_quiesce(const plugin_rec_t *target, uint32_t timeout_ms,
+    char *offender, size_t offender_cap)
+{
+  static const struct timespec nap =
+      { 0, (long)PLUGIN_QUIESCE_POLL_MS * 1000L * 1000L };
+
+  plugin_quiesce_ctx_t ctx;
+  struct timespec      start;
+
+  if(offender != NULL && offender_cap > 0)
+    offender[0] = '\0';
+
+  // Synthetic core providers carry no mapping; nothing can be inside it.
+  if(target == NULL || target->handle == NULL)
+    return(SUCCESS);
+
+  memset(&ctx, 0, sizeof(ctx));
+
+  if(plugin_map_of(target, &ctx.map) != SUCCESS)
+  {
+    clam(CLAM_WARN, "plugin", "'%s': cannot resolve its mapping; "
+        "quiescence unverified", target->desc->name);
+    return(SUCCESS);
+  }
+
+  clock_gettime(CLOCK_MONOTONIC, &start);
+
+  for(;;)
+  {
+    ctx.holders     = 0;
+    ctx.offender[0] = '\0';
+
+    task_iterate(quiesce_task_cb, &ctx);
+    curl_iterate_active(quiesce_curl_cb, &ctx);
+
+    if(ctx.holders == 0)
+      return(SUCCESS);
+
+    if(util_ms_since(&start) >= (uint64_t)timeout_ms)
+      break;
+
+    nanosleep(&nap, NULL);
+  }
+
+  if(offender != NULL && offender_cap > 0)
+    snprintf(offender, offender_cap, "%s", ctx.offender);
+
+  clam(CLAM_WARN, "plugin", "'%s': %u Class-B reference(s) still name its "
+      "mapping after %u ms; first is %s", target->desc->name, ctx.holders,
+      timeout_ms, ctx.offender);
+
+  return(FAIL);
 }
 
 void
@@ -2219,7 +2389,7 @@ plugin_cmd_unload(const cmd_ctx_t *ctx)
 {
   const char            *name = ctx->parsed->argv[0];
   plugin_unload_report_t report;
-  char                   buf[PLUGIN_NAME_SZ * 2 + 256];
+  char                   buf[PLUGIN_NAME_SZ * 2 + PLUGIN_OFFENDER_SZ + 384];
 
   // Check if loaded.
   const plugin_desc_t *pd = plugin_find(name);
@@ -2290,23 +2460,23 @@ plugin_cmd_unload(const cmd_ctx_t *ctx)
   // audit, and dlclose).
   if(plugin_unload(name, &report) != SUCCESS)
   {
-    snprintf(buf, sizeof(buf), CLR_RED "failed to unload" CLR_RESET " "
-        CLR_BOLD "%s" CLR_RESET " — it is still running and intact; the "
-        "log names what it is still holding", name);
-    cmd_reply(ctx, buf);
-    return;
-  }
+    // Two different failures, and the difference is the whole story: a
+    // plugin that refused up front is untouched, one refused after its
+    // teardown is a zombie the operator must restart out of.
+    if(report.zombie)
+      snprintf(buf, sizeof(buf), CLR_RED "refused to unload" CLR_RESET " "
+          CLR_BOLD "%s" CLR_RESET " — " CLR_YELLOW "%u reference(s)"
+          CLR_RESET " core cannot reclaim still point into its mapping%s%s"
+          ". It is now stopped and deinitialized but still mapped "
+          "(nothing dangles, nothing works); restart the daemon. The log "
+          "lists every one.", name, report.residual,
+          report.offender[0] != '\0' ? ": " : "", report.offender);
 
-  // Both numbers run on every unload, not on request, and they say
-  // different things: what core tidied up, and what nobody could.
-  if(report.residual > 0)
-  {
-    snprintf(buf, sizeof(buf), CLR_GREEN "unloaded" CLR_RESET " "
-        CLR_BOLD "%s" CLR_RESET " — " CLR_YELLOW "%u reference(s)"
-        CLR_RESET " core cannot reclaim (tasks, requests, drivers) "
-        "remained after its deinit(); those pointers now dangle. "
-        "Reload it, then /plugin audit %s for the list.",
-        name, report.residual, name);
+    else
+      snprintf(buf, sizeof(buf), CLR_RED "failed to unload" CLR_RESET " "
+          CLR_BOLD "%s" CLR_RESET " — it is still running and intact; the "
+          "log names what it is still holding", name);
+
     cmd_reply(ctx, buf);
     return;
   }
@@ -2344,6 +2514,10 @@ plugin_register_config(void)
   kv_register("core.plugin.autoload", KV_STR, "",
       plugin_autoload_changed, NULL,
       "Comma-separated list of plugins to load automatically at startup");
+
+  kv_register(KV_UNLOAD_QUIESCE_MS, KV_UINT32, "5000", NULL, NULL,
+      "How long an unload waits for a plugin's tasks and requests to "
+      "finish before refusing to dlclose it (milliseconds)");
 }
 
 uint32_t
