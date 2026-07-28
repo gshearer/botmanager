@@ -171,10 +171,25 @@ void curl_begin_shutdown(void);
 // before calling this.
 void curl_exit(void);
 
-// Invoked once per in-flight request while the submit queue lock is
-// held — must be fast.
-typedef void (*curl_iter_cb_t)(const char *url, curl_method_t method,
-    uint32_t elapsed_secs, void *data);
+// One request, as seen by curl_iterate_active. The callback pointers
+// are what the request retains on the submitter's behalf: for a request
+// submitted by a plugin they point into that plugin's mapping, which is
+// what makes them the quiescence test (see plugin_owns_ptr).
+typedef struct
+{
+  const char     *url;
+  curl_method_t   method;
+  uint32_t        elapsed_secs;
+  bool            in_flight;    // false = still queued, not yet dispatched
+  curl_done_cb_t  cb;
+  void           *cb_data;
+  curl_chunk_cb_t chunk_cb;     // NULL unless streaming
+  void           *chunk_user;
+} curl_iter_req_t;
+
+// Invoked once per in-flight and once per queued request, while the
+// corresponding lock is held — must be fast and must not re-enter curl_*.
+typedef void (*curl_iter_cb_t)(const curl_iter_req_t *req, void *data);
 
 void curl_iterate_active(curl_iter_cb_t cb, void *data);
 
@@ -321,14 +336,20 @@ static volatile bool      curl_drain_initiated = false;
 static volatile bool      curl_drain_complete  = false;
 static pthread_cond_t     curl_drain_cond;
 
-// In-flight bookkeeping. Only touched by the multi loop thread, so no
-// extra mutex is required. curl_active_qs is per-priority so the
+// In-flight bookkeeping. curl_active_qs is per-priority so the
 // shutdown drain can wait on TRANSACTIONAL specifically;
 // curl_active_head is the singly-linked in-flight list (chained via
 // curl_request.next while the request is in CURL_REQ_ACTIVE) used by
 // the drain to enumerate non-TRANSACTIONAL handles for cancellation.
+//
+// The multi loop thread is the only *writer* of both, but external
+// readers exist (curl_iterate_active, and through it the plugin
+// teardown audit), so every list mutation takes curl_active_mutex.
+// The multi loop's own read-only traversals do not — it races nobody.
+// Never nested with curl_submit_mutex in either direction.
 static uint32_t           curl_active_qs[CURL_PRIO__COUNT] = {0};
 static curl_request_t    *curl_active_head = NULL;
+static pthread_mutex_t    curl_active_mutex = PTHREAD_MUTEX_INITIALIZER;
 
 static uint64_t           curl_stat_total   = 0;
 static uint64_t           curl_stat_errors  = 0;

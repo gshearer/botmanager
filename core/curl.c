@@ -696,8 +696,11 @@ curl_finish_request(curl_request_t *req, CURLcode result)
   // Unlink from the in-flight list. The drain enumerates this list to
   // cancel non-TRANSACTIONAL handles, so it must stay accurate for
   // every active request — natural completions included.
+  pthread_mutex_lock(&curl_active_mutex);
+
   if(curl_active_head == req)
     curl_active_head = req->next;
+
   else
   {
     for(curl_request_t *p = curl_active_head; p != NULL; p = p->next)
@@ -709,7 +712,9 @@ curl_finish_request(curl_request_t *req, CURLcode result)
       }
     }
   }
+
   req->next = NULL;
+  pthread_mutex_unlock(&curl_active_mutex);
 
   curl_request_release(req);
 }
@@ -907,8 +912,10 @@ curl_drain_queue(void)
     // Push onto the in-flight list. The shutdown drain walks this list
     // to cancel non-TRANSACTIONAL handles, and curl_finish_request
     // unlinks on completion.
+    pthread_mutex_lock(&curl_active_mutex);
     req->next = curl_active_head;
     curl_active_head = req;
+    pthread_mutex_unlock(&curl_active_mutex);
 
     {
       uint32_t total = 0;
@@ -1326,25 +1333,56 @@ curl_get_stats(curl_stats_t *out)
   pthread_mutex_unlock(&curl_submit_mutex);
 }
 
-// Iterate queued curl requests. Active requests are managed by the
-// multi handle and not directly enumerable from outside the multi
-// loop thread, so only queued requests are yielded individually.
-// Use curl_get_stats() for aggregate active/queued counts.
-// Walks every priority sub-queue in drain order (TRANSACTIONAL first,
-// BULK last) so the resulting list reflects what would dispatch next.
-// cb: iteration callback (must be fast — submit queue lock is held)
+// Copy one request into the caller-visible snapshot. Caller holds the
+// lock guarding whichever list `r` is on.
+static void
+curl_iter_fill(const curl_request_t *r, bool in_flight,
+    curl_iter_req_t *out)
+{
+  out->url          = r->url;
+  out->method       = r->method;
+  out->elapsed_secs = 0;
+  out->in_flight    = in_flight;
+  out->cb           = r->cb;
+  out->cb_data      = r->cb_data;
+  out->chunk_cb     = r->chunk_cb;
+  out->chunk_user   = r->chunk_user;
+}
+
+// Iterate every request the subsystem currently retains: first the
+// in-flight list (state CURL_REQ_ACTIVE, owned by the multi handle),
+// then the queued ones, walking every priority sub-queue in drain order
+// (TRANSACTIONAL first, BULK last) so the queued portion reflects what
+// would dispatch next. Use curl_get_stats() for aggregate counts.
+// cb: iteration callback (must be fast — a list lock is held)
 void
 curl_iterate_active(curl_iter_cb_t cb, void *data)
 {
+  curl_iter_req_t snap;
+
   if(cb == NULL)
     return;
 
+  pthread_mutex_lock(&curl_active_mutex);
+
+  for(curl_request_t *r = curl_active_head; r != NULL; r = r->next)
+  {
+    curl_iter_fill(r, true, &snap);
+    cb(&snap, data);
+  }
+
+  pthread_mutex_unlock(&curl_active_mutex);
+
+  // Separate lock, taken sequentially — the two are never nested.
   pthread_mutex_lock(&curl_submit_mutex);
 
   for(uint32_t i = 0; i < CURL_PRIO__COUNT; i++)
   {
     for(curl_request_t *r = curl_submit_qs[i].head; r != NULL; r = r->next)
-      cb(r->url, r->method, 0, data);
+    {
+      curl_iter_fill(r, false, &snap);
+      cb(&snap, data);
+    }
   }
 
   pthread_mutex_unlock(&curl_submit_mutex);

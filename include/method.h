@@ -279,6 +279,18 @@ typedef void (*method_inst_iter_cb_t)(const char *name, const char *kind,
 // Locks method_mutex for the duration of the iteration.
 void method_iterate_instances(method_inst_iter_cb_t cb, void *data);
 
+// Audit hook: yields each instance's retained driver vtable pointer.
+// method_iterate_drivers/_instances deliberately expose only names —
+// this one exposes the pointer, which is what a post-dlclose dangle
+// test needs.
+//
+// Invoked UNDER method_mutex: the callback must be fast and must not
+// re-enter any method_* API.
+typedef void (*method_audit_cb_t)(const char *subject, const char *field,
+    const void *ptr, void *data);
+
+void method_audit_iterate(method_audit_cb_t cb, void *data);
+
 void method_get_stats(method_stats_t *out);
 
 void method_init(void);

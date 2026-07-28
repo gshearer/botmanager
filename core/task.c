@@ -638,9 +638,29 @@ task_get_stats(task_stats_t *out)
   pthread_mutex_unlock(&task_lock);
 }
 
+// Fill an iteration snapshot from a live task. Caller holds task_lock.
+static void
+task_iter_fill(const task_t *t, task_iter_info_t *out)
+{
+  out->name        = t->name;
+  out->state       = t->state;
+  out->kind        = t->kind;
+  out->type        = t->type;
+  out->priority    = t->priority;
+  out->run_count   = t->run_count;
+  out->interval_ms = t->interval_ms;
+  out->created     = t->created;
+  out->last_run    = t->last_run;
+  out->sleep_until = t->sleep_until;
+  out->cb          = t->cb;
+  out->data        = t->data;
+}
+
 void
 task_iterate(task_iter_cb_t cb, void *data)
 {
+  task_iter_info_t info;
+
   if(cb == NULL)
     return;
 
@@ -648,21 +668,24 @@ task_iterate(task_iter_cb_t cb, void *data)
 
   // Running tasks (includes persist).
   for(task_t *t = running_head; t != NULL; t = t->next)
-    cb(t->name, t->state, t->kind, t->type, t->priority,
-        t->run_count, t->interval_ms, t->created,
-        t->last_run, t->sleep_until, data);
+  {
+    task_iter_fill(t, &info);
+    cb(&info, data);
+  }
 
   // Waiting tasks (ready queue).
   for(task_t *t = ready_head; t != NULL; t = t->next)
-    cb(t->name, t->state, t->kind, t->type, t->priority,
-        t->run_count, t->interval_ms, t->created,
-        t->last_run, t->sleep_until, data);
+  {
+    task_iter_fill(t, &info);
+    cb(&info, data);
+  }
 
   // Sleeping tasks (timer queue).
   for(task_t *t = timer_head; t != NULL; t = t->next)
-    cb(t->name, t->state, t->kind, t->type, t->priority,
-        t->run_count, t->interval_ms, t->created,
-        t->last_run, t->sleep_until, data);
+  {
+    task_iter_fill(t, &info);
+    cb(&info, data);
+  }
 
   pthread_mutex_unlock(&task_lock);
 }
@@ -698,10 +721,7 @@ task_kind_color(task_kind_t k)
 }
 
 static void
-task_show_cb(const char *name, task_state_t state, task_kind_t kind,
-    task_type_t type, uint8_t priority, uint32_t run_count,
-    uint32_t interval_ms, time_t created, time_t last_run,
-    time_t sleep_until, void *data)
+task_show_cb(const task_iter_info_t *info, void *data)
 {
   task_show_state_t *st = data;
   char               line[512];
@@ -709,30 +729,29 @@ task_show_cb(const char *name, task_state_t state, task_kind_t kind,
   char               age[16];
   char               extra[32] = "";
 
-  (void)last_run;
-
   // Age: time since creation.
-  util_fmt_duration(now - created, age, sizeof(age));
+  util_fmt_duration(now - info->created, age, sizeof(age));
 
   // Extra detail column: interval for periodic, sleep remaining for
   // sleeping, blank otherwise.
-  if(kind == TASK_PERIODIC && interval_ms > 0)
-    snprintf(extra, sizeof(extra), "every %us", interval_ms / 1000);
-  else if(state == TASK_SLEEPING && sleep_until > now)
+  if(info->kind == TASK_PERIODIC && info->interval_ms > 0)
+    snprintf(extra, sizeof(extra), "every %us", info->interval_ms / 1000);
+
+  else if(info->state == TASK_SLEEPING && info->sleep_until > now)
   {
     char rem[16];
 
-    util_fmt_duration(sleep_until - now, rem, sizeof(rem));
+    util_fmt_duration(info->sleep_until - now, rem, sizeof(rem));
     snprintf(extra, sizeof(extra), "in %s", rem);
   }
 
   snprintf(line, sizeof(line),
       "  %-24s %s%-8s" CLR_RESET "  %s%-8s" CLR_RESET
       "  %-6s  pri=%-3u  runs=%-6u  age=%-8s  %s",
-      name,
-      task_state_color(state), task_state_name(state),
-      task_kind_color(kind), task_kind_name(kind),
-      task_type_name(type), priority, run_count,
+      info->name,
+      task_state_color(info->state), task_state_name(info->state),
+      task_kind_color(info->kind),   task_kind_name(info->kind),
+      task_type_name(info->type), info->priority, info->run_count,
       age, extra);
 
   cmd_reply(st->ctx, line);

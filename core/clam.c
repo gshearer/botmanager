@@ -247,6 +247,20 @@ clam_unsubscribe(const char *name)
   return(FAIL);
 }
 
+void
+clam_audit_iterate(clam_audit_cb_t cb, void *data)
+{
+  if(cb == NULL)
+    return;
+
+  pthread_mutex_lock(&clam_mutex);
+
+  for(clam_sub_t *s = clam_subs; s != NULL; s = s->next)
+    cb(s->name, "cb", fn_addr(&s->cb), data);
+
+  pthread_mutex_unlock(&clam_mutex);
+}
+
 // Initialize CLAM subsystem.
 // Must be called before any other clam function.
 void

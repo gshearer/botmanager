@@ -332,6 +332,19 @@ void cmd_iterate_root(cmd_iter_cb_t cb, void *data);
 void cmd_iterate_children(const cmd_def_t *parent, cmd_iter_cb_t cb,
     void *data);
 
+// Audit hook: yields every pointer the command registry retains, one
+// invocation per (definition, field). `subject` is the definition's
+// slash-joined registration path — the same address space
+// cmd_unregister_path() takes, so a leak report names its own fix.
+// `ptr` may be NULL (the callback filters).
+//
+// Invoked UNDER cmd_mutex: the callback must be fast and must not
+// re-enter any cmd_* API.
+typedef void (*cmd_audit_cb_t)(const char *subject, const char *field,
+    const void *ptr, void *data);
+
+void cmd_audit_iterate(cmd_audit_cb_t cb, void *data);
+
 // Registers the built-in root commands (/help, /show, /set). Must be
 // called after bot_init().
 void cmd_init(void);
@@ -380,6 +393,11 @@ void cmd_exit(void);
 // remove in one call. A subtree larger than this is a registration bug,
 // not a legitimate case, so the unregister refuses rather than growing.
 #define CMD_UNREG_MAX_SUBTREE 64
+
+// Deepest registration path the audit walker will reconstruct. The
+// tree is three levels today (`show irc servers`); the cap only bounds
+// the walk against a corrupted parent chain.
+#define CMD_PATH_MAX_DEPTH 8
 
 struct cmd_def
 {

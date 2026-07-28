@@ -126,6 +126,11 @@ typedef void (*db_pool_iter_cb_t)(uint16_t slot, db_conn_state_t state,
 
 void db_iterate_pool(db_pool_iter_cb_t cb, void *data);
 
+// The driver vtable currently installed by db_init(), or NULL. It lives
+// in the DB plugin's mapping, so plugin teardown audits must be able to
+// see it.
+const db_driver_t *db_audit_driver(void);
+
 #ifdef DB_INTERNAL
 
 #include "common.h"

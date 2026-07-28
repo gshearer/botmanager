@@ -250,6 +250,27 @@ plugin_unload(const char *name)
   // entirely — their backing memory is about to go away.
   dlsym_cache_on_plugin_unload(target);
 
+  // Report-only teardown audit, and the one that counts: run AFTER
+  // deinit(), so anything it still finds pointing into the mapping we
+  // are about to unmap is a bug in this plugin's deinit(). The same
+  // sweep against a *running* plugin reports its live surface — that
+  // is the worklist (`/plugin audit <name>`), this is the verdict.
+  // PLIFE-7 turns this into a refusal; until then, we only tell.
+  {
+    uint32_t leaks = plugin_audit(name, NULL, NULL);
+
+    if(leaks > 0)
+      clam(CLAM_WARN, "plugin_audit",
+          "'%s': %u live reference(s) into its mapping after deinit(); "
+          "its teardown is incomplete and this dlclose may dangle",
+          name, leaks);
+
+    else
+      clam(CLAM_INFO, "plugin_audit",
+          "'%s': teardown clean, no live references into its mapping",
+          name);
+  }
+
   // Remove from list.
   pp = &plugins;
 
@@ -841,6 +862,262 @@ dlsym_cache_on_plugin_unload(const plugin_rec_t *target)
   }
 
   pthread_mutex_unlock(&dlsym_cache_mutex);
+}
+
+// Ownership attribution and the teardown audit
+//
+// A plugin's mapping is the ground truth for "does this pointer die at
+// dlclose". We resolve the extent once per audit with dl_iterate_phdr
+// (one loader-lock acquisition, taken before any registry lock is held)
+// and then range-test every retained pointer with plain arithmetic —
+// so the sweeps below never invert the lock order between the loader
+// and cmd/kv/clam/bot/method.
+
+typedef struct
+{
+  uintptr_t     probe;   // in: a pointer known to be inside the object
+  plugin_map_t *out;
+  bool          found;
+} plugin_map_probe_t;
+
+static int
+plugin_map_phdr_cb(struct dl_phdr_info *info, size_t size, void *data)
+{
+  plugin_map_probe_t *p  = data;
+  uintptr_t           lo = UINTPTR_MAX;
+  uintptr_t           hi = 0;
+  const char         *slash;
+
+  (void)size;
+
+  for(uint16_t i = 0; i < info->dlpi_phnum; i++)
+  {
+    const ElfW(Phdr) *ph = &info->dlpi_phdr[i];
+    uintptr_t         seg_lo;
+    uintptr_t         seg_hi;
+
+    if(ph->p_type != PT_LOAD)
+      continue;
+
+    seg_lo = (uintptr_t)info->dlpi_addr + (uintptr_t)ph->p_vaddr;
+    seg_hi = seg_lo + (uintptr_t)ph->p_memsz;
+
+    if(seg_lo < lo) lo = seg_lo;
+    if(seg_hi > hi) hi = seg_hi;
+  }
+
+  if(hi == 0 || p->probe < lo || p->probe >= hi)
+    return(0);  // not this object; keep walking
+
+  p->out->lo = lo;
+  p->out->hi = hi;
+
+  slash = strrchr(info->dlpi_name, '/');
+  snprintf(p->out->soname, sizeof(p->out->soname), "%s",
+      slash != NULL ? slash + 1 : info->dlpi_name);
+
+  p->found = true;
+  return(1);  // stop the walk
+}
+
+// Resolve the mapping that contains `rec`'s descriptor — the descriptor
+// is a const object in the .so, so it is always a valid probe.
+static bool
+plugin_map_of(const plugin_rec_t *rec, plugin_map_t *out)
+{
+  plugin_map_probe_t probe;
+
+  if(rec == NULL || rec->handle == NULL || rec->desc == NULL)
+    return(FAIL);
+
+  memset(out, 0, sizeof(*out));
+  probe.probe = (uintptr_t)rec->desc;
+  probe.out   = out;
+  probe.found = false;
+
+  dl_iterate_phdr(plugin_map_phdr_cb, &probe);
+
+  return(probe.found ? SUCCESS : FAIL);
+}
+
+bool
+plugin_owns_ptr(const char *plugin_name, const void *ptr)
+{
+  const plugin_rec_t *rec;
+  plugin_map_t        map;
+
+  if(plugin_name == NULL || ptr == NULL)
+    return(false);
+
+  rec = find_by_name(plugin_name);
+
+  if(rec == NULL || plugin_map_of(rec, &map) != SUCCESS)
+    return(false);
+
+  return((uintptr_t)ptr >= map.lo && (uintptr_t)ptr < map.hi);
+}
+
+typedef struct
+{
+  plugin_map_t map;
+  uint32_t     leaks;                            // exact, unbounded
+  uint32_t     n_lines;                          // recorded, capped
+  char       (*lines)[PLUGIN_AUDIT_LINE_SZ];
+} plugin_audit_ctx_t;
+
+// Range-test one retained pointer and record it if it dies at dlclose.
+static void
+audit_note(plugin_audit_ctx_t *ctx, const char *registry,
+    const char *subject, const char *field, const void *ptr)
+{
+  uintptr_t addr = (uintptr_t)ptr;
+
+  if(ptr == NULL || addr < ctx->map.lo || addr >= ctx->map.hi)
+    return;
+
+  ctx->leaks++;
+
+  if(ctx->n_lines >= PLUGIN_AUDIT_MAX_LINES)
+    return;
+
+  snprintf(ctx->lines[ctx->n_lines], PLUGIN_AUDIT_LINE_SZ,
+      "  %-6s %-34s %-12s -> %s", registry, subject, field,
+      ctx->map.soname);
+  ctx->n_lines++;
+}
+
+// One thin adapter per registry: the registry names the subject and the
+// field, the adapter names the registry.
+
+static void
+audit_cmd_cb(const char *subject, const char *field, const void *ptr,
+    void *data)
+{
+  audit_note(data, "cmd", subject, field, ptr);
+}
+
+static void
+audit_kv_cb(const char *subject, const char *field, const void *ptr,
+    void *data)
+{
+  audit_note(data, "kv", subject, field, ptr);
+}
+
+static void
+audit_clam_cb(const char *subject, const char *field, const void *ptr,
+    void *data)
+{
+  audit_note(data, "clam", subject, field, ptr);
+}
+
+static void
+audit_bot_cb(const char *subject, const char *field, const void *ptr,
+    void *data)
+{
+  audit_note(data, "bot", subject, field, ptr);
+}
+
+static void
+audit_method_cb(const char *subject, const char *field, const void *ptr,
+    void *data)
+{
+  audit_note(data, "method", subject, field, ptr);
+}
+
+static void
+audit_task_cb(const task_iter_info_t *info, void *data)
+{
+  audit_note(data, "task", info->name, "cb", fn_addr(&info->cb));
+  audit_note(data, "task", info->name, "data", info->data);
+}
+
+static void
+audit_curl_cb(const curl_iter_req_t *req, void *data)
+{
+  const char *state = req->in_flight ? "(in-flight)" : "(queued)";
+
+  audit_note(data, "curl", state, "cb",         fn_addr(&req->cb));
+  audit_note(data, "curl", state, "cb_data",    req->cb_data);
+  audit_note(data, "curl", state, "chunk_cb",   fn_addr(&req->chunk_cb));
+  audit_note(data, "curl", state, "chunk_user", req->chunk_user);
+}
+
+// NOT swept: the dlsym-shim cache. Its entries retain a consumer's
+// static slot and the target-name literal in that consumer's .rodata —
+// both inside the consumer's mapping, so they would show up here — but
+// dlsym_cache_on_plugin_unload() drops every one of them before
+// dlclose, unconditionally. Counting them would put a floor under the
+// audit that no plugin's deinit() could clear, and the whole point of
+// this number is that a plugin author can drive it to zero.
+
+uint32_t
+plugin_audit(const char *plugin_name, plugin_audit_emit_t emit, void *data)
+{
+  plugin_audit_ctx_t  ctx;
+  const plugin_rec_t *rec;
+  const db_driver_t  *db_drv;
+  uint32_t            leaks;
+
+  if(plugin_name == NULL)
+    return(0);
+
+  rec = find_by_name(plugin_name);
+
+  // Synthetic core providers carry no mapping — nothing can dangle.
+  if(rec == NULL || rec->handle == NULL)
+    return(0);
+
+  memset(&ctx, 0, sizeof(ctx));
+
+  if(plugin_map_of(rec, &ctx.map) != SUCCESS)
+  {
+    clam(CLAM_WARN, "plugin_audit",
+        "'%s': cannot resolve its mapping; audit skipped", plugin_name);
+    return(0);
+  }
+
+  ctx.lines = mem_alloc("plugin", "audit_lines",
+      PLUGIN_AUDIT_MAX_LINES * PLUGIN_AUDIT_LINE_SZ);
+
+  // Every sweep below runs under its own registry's lock and does
+  // nothing but arithmetic and snprintf — see each iterator's contract.
+  //
+  // Order is deliberate: the rare, high-signal registries go first so
+  // that a report truncated at PLUGIN_AUDIT_MAX_LINES still shows the
+  // live driver binding or the in-flight request, rather than 256 lines
+  // of a big plugin's command and KV surface. The count is unaffected.
+  db_drv = db_audit_driver();
+
+  if(db_drv != NULL)
+    audit_note(&ctx, "db", "driver", "vtable", db_drv);
+
+  bot_audit_iterate_bindings(audit_bot_cb, &ctx);
+  bot_audit_iterate_contributors(audit_bot_cb, &ctx);
+  method_audit_iterate(audit_method_cb, &ctx);
+  clam_audit_iterate(audit_clam_cb, &ctx);
+  task_iterate(audit_task_cb, &ctx);
+  curl_iterate_active(audit_curl_cb, &ctx);
+  cmd_audit_iterate(audit_cmd_cb, &ctx);
+  kv_audit_iterate(audit_kv_cb, &ctx);
+
+  if(emit != NULL)
+  {
+    for(uint32_t i = 0; i < ctx.n_lines; i++)
+      emit(ctx.lines[i], data);
+
+    if(ctx.leaks > ctx.n_lines)
+    {
+      char more[PLUGIN_AUDIT_LINE_SZ];
+
+      snprintf(more, sizeof(more), "  ... and %u more (report capped)",
+          ctx.leaks - ctx.n_lines);
+      emit(more, data);
+    }
+  }
+
+  leaks = ctx.leaks;
+  mem_free(ctx.lines);
+  return(leaks);
 }
 
 void
@@ -1814,6 +2091,69 @@ plugin_cmd_load(const cmd_ctx_t *ctx)
   cmd_reply(ctx, buf);
 }
 
+// /plugin audit — report registrations that would dangle after dlclose
+
+static void
+plugin_audit_reply(const char *line, void *data)
+{
+  cmd_reply((const cmd_ctx_t *)data, line);
+}
+
+static void
+plugin_audit_all_cb(const char *name, const char *version, const char *path,
+    plugin_type_t type, const char *kind, plugin_state_t state, void *data)
+{
+  const cmd_ctx_t *ctx = data;
+  uint32_t         leaks;
+  char             line[PLUGIN_NAME_SZ + 96];
+
+  (void)version; (void)path; (void)type; (void)kind; (void)state;
+
+  leaks = plugin_audit(name, NULL, NULL);
+
+  snprintf(line, sizeof(line), "  %-24s %s%u" CLR_RESET " leaked "
+      "reference(s)", name, leaks > 0 ? CLR_YELLOW : CLR_GREEN, leaks);
+  cmd_reply(ctx, line);
+}
+
+// /plugin audit <name> | all — report-only; never refuses anything.
+static void
+plugin_cmd_audit(const cmd_ctx_t *ctx)
+{
+  const char *name = ctx->parsed->argv[0];
+  uint32_t    leaks;
+  char        buf[PLUGIN_NAME_SZ + 96];
+
+  if(strcmp(name, "all") == 0)
+  {
+    cmd_reply(ctx, CLR_BOLD "plugin teardown audit:" CLR_RESET);
+    plugin_iterate(plugin_audit_all_cb, (void *)ctx);
+    return;
+  }
+
+  if(plugin_find(name) == NULL)
+  {
+    snprintf(buf, sizeof(buf), "plugin " CLR_BOLD "%s" CLR_RESET
+        " is not loaded", name);
+    cmd_reply(ctx, buf);
+    return;
+  }
+
+  leaks = plugin_audit(name, plugin_audit_reply, (void *)ctx);
+
+  if(leaks == 0)
+  {
+    snprintf(buf, sizeof(buf), "%s: " CLR_GREEN "clean" CLR_RESET
+        " — no live references into its mapping", name);
+    cmd_reply(ctx, buf);
+    return;
+  }
+
+  snprintf(buf, sizeof(buf), "%s: " CLR_YELLOW "%u" CLR_RESET
+      " leaked reference(s) — listed above", name, leaks);
+  cmd_reply(ctx, buf);
+}
+
 // /plugin unload <name> — stop, deinit, and unload a plugin.
 static void
 plugin_cmd_unload(const cmd_ctx_t *ctx)
@@ -2021,6 +2361,23 @@ plugin_register_commands(void)
       "on a feature this plugin provides.",
       USERNS_GROUP_OWNER, USERNS_OWNER_LEVEL, CMD_SCOPE_ANY, METHOD_T_ANY,
       plugin_cmd_unload, NULL, "plugin", NULL, ad_plugin_cmd_name, 1, NULL, NULL);
+
+  cmd_register("plugin", "audit",
+      "plugin audit <name> | all",
+      "Report registrations that would dangle after unload",
+      "Sweeps every registry that retains a pointer — commands, KV,\n"
+      "clam subscribers, bot KV contributors and driver bindings,\n"
+      "method drivers, tasks, in-flight curl requests, the dlsym\n"
+      "shim cache, and the DB driver — and reports each one that\n"
+      "points into the named plugin's mapping. Those are exactly the\n"
+      "references that would dangle once the plugin is dlclose'd, so\n"
+      "a non-zero count is a bug in that plugin's deinit().\n\n"
+      "Attribution is by the object's load address, not by any name\n"
+      "the plugin registers under.\n\n"
+      "Report-only: this command never unloads or refuses anything.\n"
+      "Use /plugin audit all for a one-line summary per plugin.",
+      USERNS_GROUP_OWNER, USERNS_OWNER_LEVEL, CMD_SCOPE_ANY, METHOD_T_ANY,
+      plugin_cmd_audit, NULL, "plugin", NULL, ad_plugin_cmd_name, 1, NULL, NULL);
 }
 
 // Synthetic core providers.

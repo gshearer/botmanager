@@ -153,6 +153,26 @@ void *plugin_dlsym(const char *plugin_name, const char *symbol);
 void *plugin_dlsym_cached(const char *plugin_name, const char *symbol,
     void **slot);
 
+// True when `ptr` lies inside the mapping of the named loaded plugin.
+// Attribution is by the object's own PT_LOAD extent, never by a label
+// the plugin chooses (cmd_def_t.module and friends are not plugin
+// identity — see root TODO.md §PLIFE-1 "Standing facts").
+//
+// LIMITATION: only code and static data are attributable. A heap
+// pointer belongs to no mapping, so this catches exactly the
+// references that SIGSEGV after dlclose, not heap leaks.
+bool plugin_owns_ptr(const char *plugin_name, const void *ptr);
+
+// Emitter for plugin_audit. `line` is valid only for the call.
+typedef void (*plugin_audit_emit_t)(const char *line, void *data);
+
+// Report every registration still pointing into the named plugin's
+// mapping — one emitted line per leaked reference. `emit` may be NULL
+// to count without reporting.
+// returns: number of leaked references (0 == clean).
+uint32_t plugin_audit(const char *plugin_name, plugin_audit_emit_t emit,
+    void *data);
+
 uint32_t plugin_count(void);
 
 typedef void (*plugin_iterate_cb_t)(const char *name, const char *version,
@@ -218,13 +238,34 @@ void plugin_exit(void);
 #include "alloc.h"
 #include "userns.h"
 
+#include "curl.h"
+#include "db.h"
+#include "method.h"
+#include "task.h"
+
 #include <dlfcn.h>
+#include <link.h>
 #include <stdarg.h>
 #include <dirent.h>
 #include <errno.h>
 #include <sys/stat.h>
 
 #define PLUGIN_PATH_SZ  512
+
+// Audit report bounds. A plugin with more leaks than this is broken
+// beyond the point where more lines help; the count stays exact.
+#define PLUGIN_AUDIT_LINE_SZ    200
+#define PLUGIN_AUDIT_MAX_LINES  256
+
+// The address range one loaded object occupies, plus the short name to
+// print for it. Resolved once per audit, so the per-pointer test is
+// arithmetic rather than a loader-lock round trip.
+typedef struct
+{
+  uintptr_t lo;
+  uintptr_t hi;
+  char      soname[PLUGIN_NAME_SZ];
+} plugin_map_t;
 
 // Registry of dlsym-shim cache slots. Each entry pairs a target
 // plugin name with the void** slot a consumer is caching its

@@ -2071,6 +2071,64 @@ cmd_iterate_children(const cmd_def_t *parent, cmd_iter_cb_t cb, void *data)
   pthread_mutex_unlock(&cmd_mutex);
 }
 
+// Reconstruct `d`'s slash-joined registration path (e.g.
+// "irc/network/list"). Caller must hold cmd_mutex.
+static void
+def_path_locked(const cmd_def_t *d, char *buf, size_t cap)
+{
+  const cmd_def_t *chain[CMD_PATH_MAX_DEPTH];
+  uint32_t         n   = 0;
+  size_t           len = 0;
+
+  buf[0] = '\0';
+
+  for(const cmd_def_t *p = d; p != NULL && n < CMD_PATH_MAX_DEPTH;
+      p = p->parent)
+    chain[n++] = p;
+
+  // chain[] runs leaf -> root; emit it back to front.
+  while(n > 0 && len + 1 < cap)
+  {
+    n--;
+    len += (size_t)snprintf(buf + len, cap - len, "%s%s",
+        len > 0 ? "/" : "", chain[n]->name);
+
+    if(len >= cap)
+    {
+      buf[cap - 1] = '\0';
+      return;
+    }
+  }
+}
+
+void
+cmd_audit_iterate(cmd_audit_cb_t cb, void *data)
+{
+  char path[CMD_USAGE_SZ];
+
+  if(cb == NULL)
+    return;
+
+  pthread_mutex_lock(&cmd_mutex);
+
+  for(cmd_def_t *d = cmd_list; d != NULL; d = d->next)
+  {
+    def_path_locked(d, path, sizeof(path));
+
+    cb(path, "cb",          fn_addr(&d->cb),       data);
+    cb(path, "help_ext",    fn_addr(&d->help_ext), data);
+    cb(path, "data",        d->data,               data);
+    cb(path, "usage",       d->usage,              data);
+    cb(path, "description", d->description,        data);
+    cb(path, "help_long",   d->help_long,          data);
+    cb(path, "arg_desc",    d->arg_desc,           data);
+    cb(path, "kind_filter", d->kind_filter,        data);
+    cb(path, "nl",          d->nl,                 data);
+  }
+
+  pthread_mutex_unlock(&cmd_mutex);
+}
+
 // Asserted-identity command dispatch
 
 // Evaluate the group+level check. Returns true if allowed.

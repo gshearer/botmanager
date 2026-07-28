@@ -106,6 +106,7 @@ regex (the literal context portion, before any `<placeholder>`).
 | `method_unregister` | core/method.c | method driver unregistration |
 | `method_unsubscribe` | core/method.c | method unsubscribe |
 | `plugin` | core/plugin.c | plugin discovery + load + lifecycle |
+| `plugin_audit` | core/plugin.c | teardown audit: references still pointing into a plugin's mapping |
 | `pool` | core/pool.c | worker pool runtime events |
 | `pool_exit` | core/pool.c | worker pool teardown |
 | `pool_init` | core/pool.c | worker pool init |

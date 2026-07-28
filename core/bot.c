@@ -462,6 +462,43 @@ bot_kv_contributor_unregister(void *user)
   pthread_mutex_unlock(&bot_kv_contrib_mutex);
 }
 
+void
+bot_audit_iterate_contributors(bot_audit_cb_t cb, void *data)
+{
+  char subject[32];
+
+  if(cb == NULL)
+    return;
+
+  pthread_mutex_lock(&bot_kv_contrib_mutex);
+
+  for(uint32_t i = 0; i < bot_kv_contrib_count; i++)
+  {
+    const bot_kv_contrib_t *c = &bot_kv_contribs[i];
+
+    snprintf(subject, sizeof(subject), "contributor[%u]", i);
+    cb(subject, "bot_cb",    fn_addr(&c->bot_cb),    data);
+    cb(subject, "method_cb", fn_addr(&c->method_cb), data);
+    cb(subject, "user",      c->user,                data);
+  }
+
+  pthread_mutex_unlock(&bot_kv_contrib_mutex);
+}
+
+void
+bot_audit_iterate_bindings(bot_audit_cb_t cb, void *data)
+{
+  if(cb == NULL)
+    return;
+
+  pthread_mutex_lock(&bot_mutex);
+
+  for(bot_inst_t *b = bot_list; b != NULL; b = b->next)
+    cb(b->name, "driver", b->driver, data);
+
+  pthread_mutex_unlock(&bot_mutex);
+}
+
 // Create a new bot instance.
 // drv: bot driver interface (must not be NULL)
 bot_inst_t *

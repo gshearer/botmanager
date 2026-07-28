@@ -768,6 +768,20 @@ method_iterate_drivers(method_driver_iter_cb_t cb, void *data)
 }
 
 void
+method_audit_iterate(method_audit_cb_t cb, void *data)
+{
+  if(cb == NULL)
+    return;
+
+  pthread_mutex_lock(&method_mutex);
+
+  for(method_inst_t *m = method_list; m != NULL; m = m->next)
+    cb(m->name, "driver", m->driver, data);
+
+  pthread_mutex_unlock(&method_mutex);
+}
+
+void
 method_get_stats(method_stats_t *out)
 {
   if(out == NULL)

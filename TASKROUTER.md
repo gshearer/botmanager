@@ -17,6 +17,7 @@ alongside its code.
 | Add a user command (command-surface plugin) | `CMD.md` + `PLUGIN.md` §Layer Rules (placement decision-tree) |
 | Add or work on a misc toy / novelty command (`!math`, `!8ball`) | `plugins/misc/AGENTS.md` |
 | Add or modify a plugin layering rule | `PLUGIN.md` §Layer Rules + `AGENTS.md` §Plugin Layers |
+| Work on plugin lifecycle / hot-reload (`PLIFE-*`), or make a plugin's `deinit()` mirror its `init()` | root `TODO.md` §PLIFE + `core/plugin.c` (`plugin_audit`) + `core/cmd.c` (`cmd_unregister_path`). Run `/plugin audit <name>` for the worklist; the verdict is the `plugin_audit` CLAM line emitted at unload |
 | **File a new plugin (which folder?)** | `PLUGIN.md` §Layer Rules (placement decision-tree) |
 | Add a service plugin (external API) | `PLUGIN.md` + `plugins/service/AGENTS.md` |
 | Add/modify a protocol driver (IRC, ...) | `PLUGIN.md` + `plugins/protocol/AGENTS.md` + `include/method.h` |

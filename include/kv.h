@@ -174,6 +174,17 @@ typedef void (*kv_nl_iter_cb_t)(const char *key, const kv_nl_t *nl,
 // type above for locking semantics.
 void kv_iterate_nl(kv_nl_iter_cb_t cb, void *data);
 
+// Audit hook: yields every pointer the KV registry retains, one
+// invocation per (entry, field), then one per attached NL responder.
+// `subject` is the key. `ptr` may be NULL (the callback filters).
+//
+// Invoked UNDER the registry locks: the callback must be fast and must
+// not re-enter any kv_* API.
+typedef void (*kv_audit_cb_t)(const char *subject, const char *field,
+    const void *ptr, void *data);
+
+void kv_audit_iterate(kv_audit_cb_t cb, void *data);
+
 bool kv_load(void);
 
 // Materialize persisted DB rows that no live entry claims — dynamic keys

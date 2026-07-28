@@ -557,6 +557,12 @@ db_get_pool_stats(db_pool_stats_t *out)
   out->errors  = __atomic_load_n(&db_stat_errors, __ATOMIC_RELAXED);
 }
 
+const db_driver_t *
+db_audit_driver(void)
+{
+  return(driver);
+}
+
 // Iterate database connection pool slots. For each slot that has an
 // active connection (handle != NULL), the callback receives the slot
 // index, state, per-slot query count, creation time, and last use time.

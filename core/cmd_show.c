@@ -379,15 +379,14 @@ cmd_show_sockets(const cmd_ctx_t *ctx)
 // /show curl
 
 static void
-show_curl_cb(const char *url, curl_method_t method,
-    uint32_t elapsed_secs, void *data)
+show_curl_cb(const curl_iter_req_t *req, void *data)
 {
   show_iter_state_t *st = data;
   char line[512];
 
-  (void)elapsed_secs;
-  snprintf(line, sizeof(line), "  queued  %-6s %s",
-      curl_method_name(method), url);
+  snprintf(line, sizeof(line), "  %-7s %-6s %s",
+      req->in_flight ? "active" : "queued",
+      curl_method_name(req->method), req->url);
   cmd_reply(st->ctx, line);
   st->count++;
 }
@@ -447,12 +446,12 @@ cmd_show_curl(const cmd_ctx_t *ctx)
     cmd_reply(ctx, buf);
   }
 
-  // Show queued requests if any.
-  if(cs.queued > 0)
+  // Show outstanding requests if any — in-flight first, then queued.
+  if(cs.active > 0 || cs.queued > 0)
   {
     show_iter_state_t st = { .ctx = ctx, .count = 0 };
 
-    cmd_reply(ctx, "queued requests:");
+    cmd_reply(ctx, "outstanding requests:");
     curl_iterate_active(show_curl_cb, &st);
   }
 }
@@ -647,27 +646,21 @@ typedef struct
 } pool_persist_state_t;
 
 static void
-pool_persist_cb(const char *name, task_state_t state, task_kind_t kind,
-    task_type_t type, uint8_t priority, uint32_t run_count,
-    uint32_t interval_ms, time_t created, time_t last_run,
-    time_t sleep_until, void *data)
+pool_persist_cb(const task_iter_info_t *info, void *data)
 {
   pool_persist_state_t *st;
   char age[16];
   char line[256];
 
-  (void)state; (void)type; (void)interval_ms;
-  (void)last_run; (void)sleep_until;
-
-  if(kind != TASK_PERSIST) return;
+  if(info->kind != TASK_PERSIST) return;
 
   st = data;
-  util_fmt_duration(time(NULL) - created, age, sizeof(age));
+  util_fmt_duration(time(NULL) - info->created, age, sizeof(age));
 
   snprintf(line, sizeof(line),
       "    " CLR_PURPLE "%-22s" CLR_RESET
       "  pri=%-3u  runs=%-6u  age=%s",
-      name, priority, run_count, age);
+      info->name, info->priority, info->run_count, age);
   cmd_reply(st->ctx, line);
   st->count++;
 }

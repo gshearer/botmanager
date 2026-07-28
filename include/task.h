@@ -151,12 +151,30 @@ const char *task_state_name(task_state_t s);
 const char *task_type_name(task_type_t t);
 const char *task_kind_name(task_kind_t k);
 
-typedef void (*task_iter_cb_t)(const char *name, task_state_t state,
-    task_kind_t kind, task_type_t type, uint8_t priority,
-    uint32_t run_count, uint32_t interval_ms, time_t created,
-    time_t last_run, time_t sleep_until, void *data);
+// Snapshot of one task, as seen by task_iterate. `cb` and `data` are
+// the pointers the queue retains on the submitter's behalf: for a task
+// submitted by a plugin they point into that plugin's mapping, which is
+// what makes them the quiescence test (see plugin_owns_ptr).
+typedef struct
+{
+  const char  *name;
+  task_state_t state;
+  task_kind_t  kind;
+  task_type_t  type;
+  uint8_t      priority;
+  uint32_t     run_count;
+  uint32_t     interval_ms;
+  time_t       created;
+  time_t       last_run;
+  time_t       sleep_until;
+  task_cb_t    cb;
+  void        *data;
+} task_iter_info_t;
 
-// Iterate all tasks (running, waiting, and sleeping).
+typedef void (*task_iter_cb_t)(const task_iter_info_t *info, void *data);
+
+// Iterate all tasks (running, waiting, and sleeping). The callback runs
+// under task_lock — it must be fast and must not re-enter task_*.
 void task_iterate(task_iter_cb_t cb, void *data);
 
 // Must be called after mem_init().

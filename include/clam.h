@@ -42,6 +42,17 @@ void clam_subscribe(const char *name, uint8_t sev, const char *regex,
 
 bool clam_unsubscribe(const char *name);
 
+// Audit hook: yields each subscriber's retained callback pointer.
+// `subject` is the subscriber name — the same handle
+// clam_unsubscribe() takes.
+//
+// Invoked UNDER clam_mutex: the callback must be fast and must not
+// call clam() or any other clam_* API.
+typedef void (*clam_audit_cb_t)(const char *subject, const char *field,
+    const void *ptr, void *data);
+
+void clam_audit_iterate(clam_audit_cb_t cb, void *data);
+
 // Must be called before any other clam function.
 void clam_init(void);
 

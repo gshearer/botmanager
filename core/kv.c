@@ -1088,6 +1088,34 @@ kv_iterate_nl(kv_nl_iter_cb_t cb, void *data)
   mem_free(nls);
 }
 
+void
+kv_audit_iterate(kv_audit_cb_t cb, void *data)
+{
+  if(cb == NULL)
+    return;
+
+  pthread_mutex_lock(&kv_mutex);
+
+  for(uint32_t b = 0; b < KV_BUCKETS; b++)
+    for(kv_entry_t *e = kv_table[b]; e != NULL; e = e->next)
+    {
+      cb(e->key, "cb",      fn_addr(&e->cb), data);
+      cb(e->key, "cb_data", e->cb_data,      data);
+      cb(e->key, "help",    e->help,         data);
+    }
+
+  pthread_mutex_unlock(&kv_mutex);
+
+  // NL responders live in their own registry; sweep it separately
+  // rather than nesting the two locks.
+  pthread_mutex_lock(&kv_nl_mutex);
+
+  for(kv_nl_reg_t *r = kv_nl_head; r != NULL; r = r->next)
+    cb(r->key, "nl", r->nl, data);
+
+  pthread_mutex_unlock(&kv_nl_mutex);
+}
+
 // Iterate all entries whose key starts with prefix. Calls cb for each.
 // Callback is invoked under the KV lock — must NOT call kv_* functions.
 uint32_t

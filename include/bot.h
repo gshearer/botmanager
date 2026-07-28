@@ -271,6 +271,18 @@ void bot_kv_contributor_register(bot_kv_bot_cb_t bot_cb,
     bot_kv_method_cb_t method_cb, void *user);
 void bot_kv_contributor_unregister(void *user);
 
+// Audit hooks: yield the pointers the bot registry retains on a
+// plugin's behalf — the contributor table's callbacks and cookies, and
+// each instance's bound driver vtable.
+//
+// Invoked UNDER the respective bot locks: the callback must be fast and
+// must not re-enter any bot_* API.
+typedef void (*bot_audit_cb_t)(const char *subject, const char *field,
+    const void *ptr, void *data);
+
+void bot_audit_iterate_contributors(bot_audit_cb_t cb, void *data);
+void bot_audit_iterate_bindings(bot_audit_cb_t cb, void *data);
+
 // Must be called after db_init().
 bool bot_ensure_tables(void);
 
