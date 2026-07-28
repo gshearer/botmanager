@@ -766,7 +766,7 @@ imagine_cmd_init(void)
       show_imagine_handler, NULL, "show", NULL, NULL, 0, NULL, NULL)
       != SUCCESS)
   {
-    cmd_unregister("imagine");
+    cmd_unregister_path("imagine");
     return(FAIL);
   }
 
@@ -782,10 +782,8 @@ imagine_cmd_deinit(void)
 {
   bot_kv_contributor_unregister((void *)&imagine_kv_cookie);
 
-  // Two nodes share the name "imagine" (root command + show child); two
-  // unregister calls clear both.
-  cmd_unregister("imagine");
-  cmd_unregister("imagine");
+  cmd_unregister_path("imagine");
+  cmd_unregister_path("show/imagine");
   clam(CLAM_INFO, IMG_CMD_CTX, "imagine command plugin deinitialized");
 }
 

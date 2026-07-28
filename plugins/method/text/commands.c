@@ -219,22 +219,21 @@ chatbot_cmds_register(void)
   return(SUCCESS);
 
 fail_refresh_prompts:
-  // show verbs / dossiersweep left registered; cmd_unregister only
-  // removes leaf defs and there's no per-child unregister helper here.
+  // show verbs / dossiersweep left registered: neither module exposes an
+  // unregister helper yet (PLIFE-5 gives them one).
 
 fail_show_verbs:
-  // dossiersweep left registered; cmd_unregister only removes leaf
-  // defs and there's no per-child unregister helper here.
+  // dossiersweep left registered; same reason.
 
 fail_dossiersweep:
-  cmd_unregister("hush");
+  cmd_unregister_path("bot/hush");
   return(FAIL);
 }
 
 void
 chatbot_cmds_unregister(void)
 {
-  // Names like "hush" may collide with other modules' commands at the
-  // global cmd_unregister level (parent scope is not considered), so
-  // we leave them registered -- matches core modules (memory, userns).
+  // Deliberately empty: the show verbs and the dossiersweep subtree have
+  // no unregister helper yet, so tearing down only "bot/hush" here would
+  // be a half-teardown. PLIFE-5 converts this plugin as a whole.
 }

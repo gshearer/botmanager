@@ -908,7 +908,7 @@ crypto_init(void)
 static void
 crypto_deinit(void)
 {
-  cmd_unregister("crypto");
+  cmd_unregister_path("crypto");
 
   clam(CLAM_INFO, CRYPTO_CTX, "crypto command plugin deinitialized");
 }

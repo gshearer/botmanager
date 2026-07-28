@@ -123,7 +123,7 @@ math_init(void)
 static void
 math_deinit(void)
 {
-  cmd_unregister("math");
+  cmd_unregister_path("math");
 }
 
 // Plugin descriptor

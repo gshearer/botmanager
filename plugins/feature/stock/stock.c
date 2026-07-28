@@ -992,7 +992,7 @@ stock_init(void)
 static void
 stock_deinit(void)
 {
-  cmd_unregister("stock");
+  cmd_unregister_path("stock");
 
   clam(CLAM_INFO, STOCK_CTX, "stock command plugin deinitialized");
 }

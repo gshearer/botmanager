@@ -799,7 +799,7 @@ ask_cmd_init(void)
       USERNS_GROUP_EVERYONE, 0, CMD_SCOPE_ANY, METHOD_T_ANY,
       show_ask_handler, NULL, "show", NULL, NULL, 0, NULL, NULL) != SUCCESS)
   {
-    cmd_unregister("ask");
+    cmd_unregister_path("ask");
     return(FAIL);
   }
 
@@ -818,11 +818,8 @@ ask_cmd_deinit(void)
 {
   bot_kv_contributor_unregister((void *)&ask_kv_cookie);
 
-  // Two nodes share the name "ask" (root command + show child). Each
-  // cmd_unregister removes the first match in the global list, so two
-  // calls clear both.
-  cmd_unregister("ask");
-  cmd_unregister("ask");
+  cmd_unregister_path("ask");
+  cmd_unregister_path("show/ask");
   clam(CLAM_INFO, ASK_CMD_CTX, "ask command plugin deinitialized");
 }
 

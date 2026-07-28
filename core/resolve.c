@@ -1083,7 +1083,7 @@ resolve_exit(void)
   pthread_mutex_unlock(&resolve_cmd_free_mu);
   pthread_mutex_destroy(&resolve_cmd_free_mu);
 
-  cmd_unregister("resolve");
+  cmd_unregister_path("resolve");
 
   clam(CLAM_INFO, "resolve", "resolver subsystem shut down");
 }

@@ -201,7 +201,16 @@ bool cmd_register(const char *module, const char *name,
     const char *const *kind_filter,
     const cmd_nl_t *nl);
 
-bool cmd_unregister(const char *name);
+// Unregister a command and its entire subtree, addressed with the same
+// slash-delimited grammar cmd_register() uses for parent_path:
+//   "melee"             the root command `melee`
+//   "show/melee"        the `melee` child of root `show`
+//   "irc/network/list"  a leaf three levels deep
+// Removal is depth-first: every descendant is freed before its parent,
+// so no definition is ever reparented. An unresolved path is silent --
+// teardown must be idempotent.
+// returns: number of definitions removed; 0 if the path does not resolve
+uint32_t cmd_unregister_path(const char *path);
 
 // When /help resolves to this command and there are remaining tokens
 // that don't match children, the extender is called instead of showing
@@ -366,6 +375,11 @@ void cmd_exit(void);
 // iteration. The array itself is NUL-terminated; this cap exists only
 // to bound help-listing loops against pathologically long filters.
 #define CMD_KIND_FILTER_MAX 8
+
+// Upper bound on the number of definitions cmd_unregister_path() will
+// remove in one call. A subtree larger than this is a registration bug,
+// not a legitimate case, so the unregister refuses rather than growing.
+#define CMD_UNREG_MAX_SUBTREE 64
 
 struct cmd_def
 {

@@ -950,7 +950,7 @@ claude_init(void)
 static void
 claude_deinit(void)
 {
-  cmd_unregister(CLAUDE_CTX);
+  cmd_unregister_path(CLAUDE_CTX);
   clam(CLAM_INFO, CLAUDE_CTX, "claude plugin deinitialized");
 }
 

@@ -991,6 +991,6 @@ tmdb_cmd_register(void)
 void
 tmdb_cmd_unregister(void)
 {
-  cmd_unregister("tmdb");
+  cmd_unregister_path("tmdb");
   clam(CLAM_INFO, TMDBCMD_CTX, "!tmdb unregistered");
 }

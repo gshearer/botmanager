@@ -763,6 +763,6 @@ rawg_cmd_register(void)
 void
 rawg_cmd_unregister(void)
 {
-  cmd_unregister("rawg");
+  cmd_unregister_path("rawg");
   clam(CLAM_INFO, RAWGCMD_CTX, "!rawg unregistered");
 }

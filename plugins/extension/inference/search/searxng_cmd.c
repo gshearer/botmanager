@@ -413,8 +413,10 @@ static const char searxng_cmd_help[] =
 static void
 searxng_cmd_unregister_all(void)
 {
+  // Every entry registers at root (parent_path NULL), so the entry name
+  // is also its unregister path.
   for(size_t i = 0; i < SEARXNG_CMD_TABLE_N; i++)
-    cmd_unregister(searxng_cmd_table[i].name);
+    cmd_unregister_path(searxng_cmd_table[i].name);
 }
 
 static bool

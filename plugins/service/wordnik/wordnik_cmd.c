@@ -555,7 +555,7 @@ wordnik_cmd_register(void)
       wordnik_dict_cmd, NULL, NULL, NULL,
       NULL, 0, NULL, &wordnik_dict_nl) != SUCCESS)
   {
-    cmd_unregister("wotd");
+    cmd_unregister_path("wotd");
     return(FAIL);
   }
 
@@ -566,7 +566,7 @@ wordnik_cmd_register(void)
 void
 wordnik_cmd_unregister(void)
 {
-  cmd_unregister("dict");
-  cmd_unregister("wotd");
+  cmd_unregister_path("dict");
+  cmd_unregister_path("wotd");
   clam(CLAM_INFO, WORDNIK_CMD_CTX, "!wotd and !dict unregistered");
 }

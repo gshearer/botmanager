@@ -737,7 +737,7 @@ text_dispatch_register(void)
         USERNS_GROUP_EVERYONE, 0, CMD_SCOPE_ANY, METHOD_T_ANY, cmd_deauth, NULL, NULL,
         NULL, NULL, 0, NULL, NULL) != SUCCESS)
   {
-    cmd_unregister("identify");
+    cmd_unregister_path("identify");
     return(FAIL);
   }
 
@@ -748,8 +748,8 @@ text_dispatch_register(void)
         USERNS_GROUP_EVERYONE, 0, CMD_SCOPE_PRIVATE, METHOD_T_ANY, cmd_register_user,
         NULL, NULL, "reg", text_ad_register, 1, NULL, NULL) != SUCCESS)
   {
-    cmd_unregister("deauth");
-    cmd_unregister("identify");
+    cmd_unregister_path("deauth");
+    cmd_unregister_path("identify");
     return(FAIL);
   }
 
@@ -760,9 +760,9 @@ text_dispatch_register(void)
         USERNS_GROUP_EVERYONE, 0, CMD_SCOPE_ANY, METHOD_T_ANY, cmd_id,
         NULL, NULL, NULL, text_ad_id, 1, NULL, NULL) != SUCCESS)
   {
-    cmd_unregister("register");
-    cmd_unregister("deauth");
-    cmd_unregister("identify");
+    cmd_unregister_path("register");
+    cmd_unregister_path("deauth");
+    cmd_unregister_path("identify");
     return(FAIL);
   }
 
@@ -772,8 +772,8 @@ text_dispatch_register(void)
 void
 text_dispatch_unregister(void)
 {
-  cmd_unregister("id");
-  cmd_unregister("register");
-  cmd_unregister("identify");
-  cmd_unregister("deauth");
+  cmd_unregister_path("id");
+  cmd_unregister_path("register");
+  cmd_unregister_path("identify");
+  cmd_unregister_path("deauth");
 }

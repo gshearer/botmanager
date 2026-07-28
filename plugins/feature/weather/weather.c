@@ -800,7 +800,7 @@ weather_init(void)
 static void
 weather_deinit(void)
 {
-  cmd_unregister("weather");
+  cmd_unregister_path("weather");
 
   clam(CLAM_INFO, WEATHER_CTX, "weather command plugin deinitialized");
 }

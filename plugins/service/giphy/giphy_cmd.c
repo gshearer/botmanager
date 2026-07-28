@@ -404,6 +404,6 @@ giphy_cmd_register(void)
 void
 giphy_cmd_unregister(void)
 {
-  cmd_unregister("giphy");
+  cmd_unregister_path("giphy");
   clam(CLAM_INFO, GIPHY_CMD_CTX, "!giphy unregistered");
 }

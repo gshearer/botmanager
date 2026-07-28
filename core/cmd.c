@@ -455,30 +455,75 @@ cmd_register(const char *module, const char *name,
   return(SUCCESS);
 }
 
-// Unregister a command. Removes it from all bot instance bindings.
-bool
-cmd_unregister(const char *name)
+// Collect `d` and every descendant into `out` in post-order, so a parent
+// never precedes one of its children. Caller must hold cmd_mutex.
+// returns: total collected (always >= 1), or 0 if the subtree exceeds cap
+static uint32_t
+def_collect_subtree_locked(cmd_def_t *d, cmd_def_t **out, uint32_t cap,
+    uint32_t n)
 {
-  cmd_def_t *d = NULL;
-  cmd_def_t *prev = NULL;
-  cmd_def_t *child;
+  for(cmd_def_t *c = d->children; c != NULL; c = c->sibling)
+  {
+    n = def_collect_subtree_locked(c, out, cap, n);
 
-  if(name == NULL || name[0] == '\0')
-    return(FAIL);
+    if(n == 0)
+      return(0);
+  }
+
+  if(n >= cap)
+    return(0);
+
+  out[n++] = d;
+  return(n);
+}
+
+static bool
+def_in_set(const cmd_def_t *d, cmd_def_t *const *set, uint32_t n)
+{
+  for(uint32_t i = 0; i < n; i++)
+    if(set[i] == d)
+      return(true);
+
+  return(false);
+}
+
+// Unregister a command subtree addressed by its registration path.
+uint32_t
+cmd_unregister_path(const char *path)
+{
+  cmd_def_t *victims[CMD_UNREG_MAX_SUBTREE];
+  cmd_def_t *d;
+  cmd_def_t *prev;
+  cmd_def_t *cur;
+  uint32_t   n;
+
+  if(path == NULL || path[0] == '\0')
+    return(0);
 
   pthread_mutex_lock(&cmd_mutex);
+  d = resolve_parent_path_locked(path);
 
-  for(d = cmd_list; d != NULL; prev = d, d = d->next)
-    if(strncasecmp(d->name, name, CMD_NAME_SZ) == 0)
-      break;
-
+  // An unresolved path is not a warning: teardown runs on partially
+  // registered plugins and must be idempotent.
   if(d == NULL)
   {
     pthread_mutex_unlock(&cmd_mutex);
-    return(FAIL);
+    return(0);
   }
 
-  // Unlink from parent's children list if this is a subcommand.
+  n = def_collect_subtree_locked(d, victims, CMD_UNREG_MAX_SUBTREE, 0);
+
+  if(n == 0)
+  {
+    pthread_mutex_unlock(&cmd_mutex);
+    clam(CLAM_WARN, "cmd_unregister",
+        "'%s': subtree exceeds %u definitions; refusing to unregister",
+        path, (unsigned)CMD_UNREG_MAX_SUBTREE);
+    return(0);
+  }
+
+  // Unlink the top node from its parent's sibling chain. Descendants
+  // need no such unlink -- their parents are freed alongside them.
   if(d->parent != NULL)
   {
     cmd_def_t **pp = &d->parent->children;
@@ -495,30 +540,38 @@ cmd_unregister(const char *name)
     }
   }
 
-  // Reparent any children (they become root-level commands).
-  child = d->children;
+  // A single pass over the global list drops every victim.
+  prev = NULL;
+  cur  = cmd_list;
 
-  while(child != NULL)
+  while(cur != NULL)
   {
-    cmd_def_t *next_sib = child->sibling;
-    child->parent = NULL;
-    child->sibling = NULL;
-    child = next_sib;
+    cmd_def_t *next = cur->next;
+
+    if(def_in_set(cur, victims, n))
+    {
+      if(prev != NULL)
+        prev->next = next;
+      else
+        cmd_list = next;
+
+      cmd_def_count--;
+    }
+
+    else
+      prev = cur;
+
+    cur = next;
   }
-
-  // Unlink from definition list.
-  if(prev != NULL)
-    prev->next = d->next;
-  else
-    cmd_list = d->next;
-
-  cmd_def_count--;
 
   pthread_mutex_unlock(&cmd_mutex);
 
-  clam(CLAM_DEBUG, "cmd_unregister", "unregistered '%s'", name);
-  mem_free(d);
-  return(SUCCESS);
+  for(uint32_t i = 0; i < n; i++)
+    mem_free(victims[i]);
+
+  clam(CLAM_DEBUG, "cmd_unregister",
+      "unregistered '%s' (%u definition(s))", path, (unsigned)n);
+  return(n);
 }
 
 bool

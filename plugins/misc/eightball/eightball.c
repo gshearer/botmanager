@@ -71,7 +71,7 @@ eightball_init(void)
 static void
 eightball_deinit(void)
 {
-  cmd_unregister("8ball");
+  cmd_unregister_path("8ball");
 }
 
 // Plugin descriptor

@@ -564,7 +564,7 @@ imagine_zimage_init(void)
       USERNS_GROUP_EVERYONE, 0, CMD_SCOPE_ANY, METHOD_T_ANY,
       show_imagine_handler, NULL, "show", NULL, NULL, 0, NULL, NULL) != SUCCESS)
   {
-    cmd_unregister("imagine");
+    cmd_unregister_path("imagine");
     return(FAIL);
   }
 
@@ -578,10 +578,8 @@ imagine_zimage_deinit(void)
 {
   iz_req_t *r;
 
-  // Two nodes share the name "imagine" (root command + show child); two
-  // unregister calls clear both.
-  cmd_unregister("imagine");
-  cmd_unregister("imagine");
+  cmd_unregister_path("imagine");
+  cmd_unregister_path("show/imagine");
 
   // Drop any queued (not-yet-submitted) closures we still own. An in-flight
   // request is owned by the curl subsystem; its callback frees itself (or

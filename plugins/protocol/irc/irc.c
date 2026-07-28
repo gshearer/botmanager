@@ -1991,42 +1991,22 @@ irc_stop(void)
   return(SUCCESS);
 }
 
-// Tear down the IRC plugin. Unregisters all operator commands
-// in leaf-first order to avoid dangling parent references.
+// Tear down the IRC plugin. Both command subtrees go in one call each --
+// cmd_unregister_path() frees depth-first, so no parent is ever left
+// holding a freed child.
 static void
 irc_deinit(void)
 {
   // Per-instance cleanup is handled by the driver destroy callback
   // when method_unregister() is called from bot_stop()/bot_destroy().
-  // Unregister leaf subcommands first, then parents.
 
-  // Leaves under /irc network.
-  cmd_unregister("list");   // network list
-  cmd_unregister("del");    // network del
+  // /irc and everything under it: network|server|channel and their
+  // add/del/list leaves, plus join, part and irc-schema.
+  cmd_unregister_path("irc");
 
-  // Leaves under /irc server.
-  cmd_unregister("add");    // server add
-  cmd_unregister("del");    // server del
-  cmd_unregister("list");   // server list
-
-  // Leaves under /irc channel.
-  cmd_unregister("add");    // channel add
-  cmd_unregister("del");    // channel del
-  cmd_unregister("list");   // channel list
-
-  // Parent subcommands under /irc.
-  cmd_unregister("network");
-  cmd_unregister("server");
-  cmd_unregister("channel");
-  cmd_unregister("irc-schema");
-
-  // /show irc subtree.
-  cmd_unregister("networks");
-  cmd_unregister("servers");
-  cmd_unregister("show-irc");
-
-  // Root.
-  cmd_unregister("irc");
+  // The /show irc subtree. Its root is registered under the internal
+  // name "show-irc" (abbrev "irc") to avoid colliding with root /irc.
+  cmd_unregister_path("show/show-irc");
 }
 
 // KV schema and plugin descriptor
