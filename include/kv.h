@@ -67,12 +67,13 @@ bool kv_register(const char *key, kv_type_t type, const char *default_val,
 
 // Same registration, with ownership stated rather than inferred. The
 // public form above attributes the entry to its call site, which is what
-// a plugin registering its own key wants; this form is for core code
-// registering a key *on a plugin's behalf* (the loader's kv_schema pass,
-// plugin_kv_group_register, the per-bot instance schemas), where the
-// call site is core's and the owner is the plugin whose declaration
-// supplied the cb/help pointers. `owner_pc` is any address inside that
-// plugin's mapping -- the schema entry itself is the natural one.
+// a plugin registering its own key wants; this form is for code
+// registering a key *on another module's behalf* (the loader's kv_schema
+// pass, plugin_kv_group_register, the per-bot instance schemas, whenmoon
+// registering a strategy's params), where the call site is not the owner
+// and the owner is whoever supplied the cb/help pointers. `owner_pc` is
+// any address inside that plugin's mapping -- the declaration the
+// registration was built from is the natural one.
 bool kv_register_owned(const char *key, kv_type_t type,
     const char *default_val, kv_cb_t cb, void *cb_data, const char *help,
     const void *owner_pc);

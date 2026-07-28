@@ -84,6 +84,38 @@ validate_desc(const plugin_desc_t *desc, const char *path)
   return(SUCCESS);
 }
 
+// True when a bot is currently bound to the bot_driver_t this plugin
+// exports. Bot bindings are runtime state, absent from the
+// .provides/.requires graph, so no dependency check sees them — and
+// after dlclose inst->driver would dangle into freed .text.
+static bool
+plugin_driver_bound(const plugin_desc_t *desc, char *bot_name, size_t sz,
+    bot_state_t *state)
+{
+  const bot_driver_t *drv;
+
+  if(desc->ext == NULL
+      || (desc->type != PLUGIN_METHOD && desc->type != PLUGIN_FEATURE))
+    return(false);
+
+  drv = (const bot_driver_t *)desc->ext;
+
+  if(drv->name == NULL)
+    return(false);
+
+  return(bot_find_bound_to_driver(drv->name, bot_name, sz, state));
+}
+
+static bool
+plugin_provides(const plugin_desc_t *desc, const char *feature)
+{
+  for(uint32_t i = 0; i < desc->provides_count; i++)
+    if(strcmp(desc->provides[i].name, feature) == 0)
+      return(true);
+
+  return(false);
+}
+
 // Public API
 
 bool
@@ -184,43 +216,28 @@ plugin_unload(const char *name, plugin_unload_report_t *report)
     {
       const char *need = q->desc->requires[r].name;
 
-      for(uint32_t k = 0; k < target->desc->provides_count; k++)
+      if(plugin_provides(target->desc, need))
       {
-        if(strcmp(need, target->desc->provides[k].name) == 0)
-        {
-          clam(CLAM_WARN, "plugin", "cannot unload '%s': '%s' depends "
-              "on feature '%s'", name, q->desc->name, need);
-          return(FAIL);
-        }
+        clam(CLAM_WARN, "plugin", "cannot unload '%s': '%s' depends "
+            "on feature '%s'", name, q->desc->name, need);
+        return(FAIL);
       }
     }
   }
 
-  // For PLUGIN_METHOD / PLUGIN_FEATURE plugins, also refuse if any bot
-  // is currently bound to the plugin's bot_driver_t vtable. bot bindings
-  // are runtime state (not in the .provides/.requires graph) so the
-  // dependency check above misses them. After dlclose, inst->driver
-  // would dangle into freed .text.
-  if(target->desc->ext != NULL
-      && (target->desc->type == PLUGIN_METHOD
-          || target->desc->type == PLUGIN_FEATURE))
+  // Refuse if a bot is bound to this plugin's driver vtable.
   {
-    const bot_driver_t *drv = (const bot_driver_t *)target->desc->ext;
+    char        bot_name[BOT_NAME_SZ];
+    bot_state_t bot_state;
 
-    if(drv->name != NULL)
+    if(plugin_driver_bound(target->desc, bot_name, sizeof(bot_name),
+        &bot_state))
     {
-      char        bot_name[BOT_NAME_SZ];
-      bot_state_t bot_state;
-
-      if(bot_find_bound_to_driver(drv->name, bot_name, sizeof(bot_name),
-          &bot_state))
-      {
-        clam(CLAM_WARN, "plugin",
-            "cannot unload '%s': bot '%s' is bound to kind '%s' "
-            "(state=%s); stop and destroy the bot first",
-            name, bot_name, drv->name, bot_state_name(bot_state));
-        return(FAIL);
-      }
+      clam(CLAM_WARN, "plugin",
+          "cannot unload '%s': bot '%s' is bound to its driver "
+          "(state=%s); stop and destroy the bot first",
+          name, bot_name, bot_state_name(bot_state));
+      return(FAIL);
     }
   }
 
@@ -345,6 +362,273 @@ plugin_unload(const char *name, plugin_unload_report_t *report)
   }
 
   return(FAIL);  // unreachable
+}
+
+// Every loaded plugin that transitively requires a feature `target`
+// provides, `target` itself included, in dependency order — which is
+// simply list order, since plugin_resolve() keeps `plugins` sorted
+// providers-first. Name and path are copied out because the records do
+// not survive the unloads this closure exists to drive.
+// returns: closure size, or 0 when it exceeds `cap` (a warning is logged).
+static uint32_t
+plugin_closure(const plugin_rec_t *target, plugin_snap_t *out, uint32_t cap)
+{
+  plugin_rec_t **arr;
+  bool          *in;
+  uint32_t       count = n_plugins;
+  uint32_t       idx   = 0;
+  uint32_t       n     = 0;
+  bool           progress = true;
+
+  arr = mem_alloc("plugin", "closure", count * sizeof(plugin_rec_t *));
+  in  = mem_alloc("plugin", "closure_in", count * sizeof(bool));
+
+  for(plugin_rec_t *p = plugins; p != NULL; p = p->next, idx++)
+  {
+    arr[idx] = p;
+    in[idx]  = (p == target);
+  }
+
+  // Fixpoint rather than a graph walk: a plugin joins as soon as it
+  // requires a feature any member provides, and membership only grows.
+  // At this size the passes are cheaper than the bookkeeping a worklist
+  // would need.
+  while(progress)
+  {
+    progress = false;
+
+    for(uint32_t i = 0; i < count; i++)
+    {
+      const plugin_desc_t *desc = arr[i]->desc;
+
+      if(in[i])
+        continue;
+
+      for(uint32_t r = 0; r < desc->requires_count && !in[i]; r++)
+      {
+        for(uint32_t j = 0; j < count; j++)
+        {
+          if(!in[j] || !plugin_provides(arr[j]->desc, desc->requires[r].name))
+            continue;
+
+          in[i]    = true;
+          progress = true;
+          break;
+        }
+      }
+    }
+  }
+
+  for(uint32_t i = 0; i < count; i++)
+  {
+    if(!in[i])
+      continue;
+
+    if(n < cap)
+    {
+      snprintf(out[n].name, sizeof(out[n].name), "%s", arr[i]->desc->name);
+      snprintf(out[n].path, sizeof(out[n].path), "%s", arr[i]->path);
+    }
+
+    n++;
+  }
+
+  mem_free(in);
+  mem_free(arr);
+
+  if(n > cap)
+  {
+    clam(CLAM_WARN, "plugin", "reload: '%s' would cycle %u plugins, over "
+        "the closure cap of %u", target->desc->name, n, cap);
+    return(0);
+  }
+
+  return(n);
+}
+
+// Bring a snapshot range back up: load each .so in forward order, then
+// run the single resolve/init/start pass the loader owes them. Shared
+// by the rollback and the reload proper — coming back is the same job
+// either way. `failed`, when given, keeps the first name that would not
+// load; it must arrive empty.
+// returns: how many of the range loaded.
+static uint32_t
+plugin_restore(const plugin_snap_t *snap, uint32_t from, uint32_t to,
+    char *failed, size_t failed_sz)
+{
+  uint32_t loaded = 0;
+
+  for(uint32_t i = from; i < to; i++)
+  {
+    if(plugin_load(snap[i].path) == SUCCESS)
+    {
+      loaded++;
+      continue;
+    }
+
+    clam(CLAM_WARN, "plugin", "reload: '%s' would not load back from %s",
+        snap[i].name, snap[i].path);
+
+    if(failed != NULL && failed[0] == '\0')
+      snprintf(failed, failed_sz, "%s", snap[i].name);
+  }
+
+  if(loaded == 0)
+    return(0);
+
+  if(plugin_resolve() != SUCCESS)
+  {
+    clam(CLAM_FATAL, "plugin", "reload: dependency resolution failed after "
+        "reloading %u plugin(s)", loaded);
+    return(loaded);
+  }
+
+  if(plugin_init_all() != SUCCESS || plugin_start_all() != SUCCESS)
+    clam(CLAM_FATAL, "plugin", "reload: %u plugin(s) reloaded but did not "
+        "come back up", loaded);
+
+  return(loaded);
+}
+
+bool
+plugin_reload(const char *name, plugin_reload_report_t *report)
+{
+  plugin_rec_t  *target;
+  plugin_snap_t *snap;
+  uint32_t       n;
+  uint32_t       cycled;
+  char           failed[PLUGIN_NAME_SZ] = "";
+
+  if(report != NULL)
+    memset(report, 0, sizeof(*report));
+
+  if(name == NULL || !plugin_ready)
+    return(FAIL);
+
+  target = find_by_name(name);
+
+  if(target == NULL)
+  {
+    clam(CLAM_WARN, "plugin", "reload: '%s' not found", name);
+    return(FAIL);
+  }
+
+  // Synthetic core providers are records without a .so behind them:
+  // there is nothing to dlclose and nothing to load back.
+  if(target->handle == NULL)
+  {
+    clam(CLAM_WARN, "plugin", "reload: '%s' is a core provider, not a "
+        "loadable plugin", name);
+    return(FAIL);
+  }
+
+  snap = mem_alloc("plugin", "reload",
+      PLUGIN_RELOAD_MAX_CLOSURE * sizeof(plugin_snap_t));
+
+  n = plugin_closure(target, snap, PLUGIN_RELOAD_MAX_CLOSURE);
+
+  if(n == 0)
+  {
+    mem_free(snap);
+    return(FAIL);
+  }
+
+  // Refuse before touching anything if the cascade cannot be completed:
+  // a bot bound to a driver in the closure is state this chunk has no
+  // way to carry across the cycle (that is PLIFE-8), and a plugin with
+  // no recorded path could not be loaded back.
+  for(uint32_t i = 0; i < n; i++)
+  {
+    const plugin_rec_t *rec = find_by_name(snap[i].name);
+    char                bot_name[BOT_NAME_SZ];
+    bot_state_t         bot_state;
+
+    if(snap[i].path[0] == '\0')
+    {
+      clam(CLAM_WARN, "plugin", "cannot reload '%s': '%s' has no recorded "
+          "path to load back from", name, snap[i].name);
+
+      if(report != NULL)
+        snprintf(report->failed, sizeof(report->failed), "%s", snap[i].name);
+
+      mem_free(snap);
+      return(FAIL);
+    }
+
+    if(plugin_driver_bound(rec->desc, bot_name, sizeof(bot_name),
+        &bot_state))
+    {
+      clam(CLAM_WARN, "plugin", "cannot reload '%s': bot '%s' is bound to "
+          "'%s' (state=%s); stop and destroy the bot first",
+          name, bot_name, snap[i].name, bot_state_name(bot_state));
+
+      if(report != NULL)
+      {
+        snprintf(report->failed, sizeof(report->failed), "%s", snap[i].name);
+        snprintf(report->detail, sizeof(report->detail),
+            "bot '%s' is bound to its driver", bot_name);
+      }
+
+      mem_free(snap);
+      return(FAIL);
+    }
+  }
+
+  clam(CLAM_INFO, "plugin", "reloading '%s' (%u dependent(s) to cycle)",
+      name, n - 1);
+
+  // Past this point a failure costs a teardown, so the report stops
+  // being able to say "nothing was touched".
+  if(report != NULL)
+    report->started = true;
+
+  // Down in reverse dependency order, so nothing is unmapped while
+  // something that links against it is still running.
+  for(uint32_t i = n; i > 0; i--)
+  {
+    plugin_unload_report_t urep;
+
+    if(plugin_unload(snap[i - 1].name, &urep) == SUCCESS)
+      continue;
+
+    // A refusal is no reason to leave the tree half down: put back
+    // everything already taken down and report the one that said no.
+    clam(CLAM_WARN, "plugin", "reload of '%s' aborted: '%s' refused to "
+        "unload; restoring %u plugin(s) already taken down",
+        name, snap[i - 1].name, n - i);
+
+    if(report != NULL)
+    {
+      report->rolled_back = true;
+      report->zombie      = urep.zombie;
+      report->dependents  = n - 1;
+      snprintf(report->failed, sizeof(report->failed), "%s",
+          snap[i - 1].name);
+      snprintf(report->detail, sizeof(report->detail), "%s", urep.offender);
+    }
+
+    plugin_restore(snap, i, n, NULL, 0);
+    mem_free(snap);
+    return(FAIL);
+  }
+
+  cycled = plugin_restore(snap, 0, n, failed, sizeof(failed));
+
+  if(report != NULL)
+  {
+    report->dependents = n - 1;
+    report->cycled     = cycled;
+    snprintf(report->failed, sizeof(report->failed), "%s", failed);
+  }
+
+  mem_free(snap);
+
+  if(cycled < n)
+    return(FAIL);
+
+  clam(CLAM_INFO, "plugin", "reloaded '%s' (%u dependent(s) cycled)",
+      name, n - 1);
+  return(SUCCESS);
 }
 
 uint32_t
@@ -2429,30 +2713,21 @@ plugin_cmd_unload(const cmd_ctx_t *ctx)
     }
   }
 
-  // Pre-check bot bindings. Same logic as plugin_unload — mirrored
-  // here for a friendly user-facing error before the loader fires.
-  if(pd->ext != NULL
-      && (pd->type == PLUGIN_METHOD || pd->type == PLUGIN_FEATURE))
+  // Pre-check bot bindings. Same test as plugin_unload — mirrored here
+  // for a friendly user-facing error before the loader fires.
   {
-    const bot_driver_t *drv = (const bot_driver_t *)pd->ext;
+    char        bot_name[BOT_NAME_SZ];
+    bot_state_t bot_state;
 
-    if(drv->name != NULL)
+    if(plugin_driver_bound(pd, bot_name, sizeof(bot_name), &bot_state))
     {
-      char        bot_name[BOT_NAME_SZ];
-      bot_state_t bot_state;
-
-      if(bot_find_bound_to_driver(drv->name, bot_name, sizeof(bot_name),
-          &bot_state))
-      {
-        snprintf(buf, sizeof(buf),
-            "cannot unload " CLR_BOLD "%s" CLR_RESET
-            ": bot " CLR_BOLD "%s" CLR_RESET
-            " is bound to kind " CLR_CYAN "%s" CLR_RESET
-            " (state=%s); stop and destroy it first",
-            name, bot_name, drv->name, bot_state_name(bot_state));
-        cmd_reply(ctx, buf);
-        return;
-      }
+      snprintf(buf, sizeof(buf),
+          "cannot unload " CLR_BOLD "%s" CLR_RESET
+          ": bot " CLR_BOLD "%s" CLR_RESET
+          " is bound to its driver (state=%s); stop and destroy it first",
+          name, bot_name, bot_state_name(bot_state));
+      cmd_reply(ctx, buf);
+      return;
     }
   }
 
@@ -2493,6 +2768,80 @@ plugin_cmd_unload(const cmd_ctx_t *ctx)
 
   snprintf(buf, sizeof(buf), CLR_GREEN "unloaded" CLR_RESET " "
       CLR_BOLD "%s" CLR_RESET " (teardown clean)", name);
+  cmd_reply(ctx, buf);
+}
+
+// /plugin reload <name> — cycle a plugin and everything that requires it.
+static void
+plugin_cmd_reload(const cmd_ctx_t *ctx)
+{
+  const char            *name = ctx->parsed->argv[0];
+  plugin_reload_report_t report;
+  char                   buf[PLUGIN_NAME_SZ * 2 + PLUGIN_OFFENDER_SZ + 384];
+
+  if(plugin_find(name) == NULL)
+  {
+    snprintf(buf, sizeof(buf), "plugin " CLR_BOLD "%s" CLR_RESET
+        " is not loaded", name);
+    cmd_reply(ctx, buf);
+    return;
+  }
+
+  if(plugin_reload(name, &report) == SUCCESS)
+  {
+    if(report.dependents == 0)
+      snprintf(buf, sizeof(buf), CLR_GREEN "reloaded" CLR_RESET " "
+          CLR_BOLD "%s" CLR_RESET, name);
+
+    else
+      snprintf(buf, sizeof(buf), CLR_GREEN "reloaded" CLR_RESET " "
+          CLR_BOLD "%s" CLR_RESET " (" CLR_CYAN "%u" CLR_RESET
+          " dependent%s cycled)", name, report.dependents,
+          report.dependents == 1 ? "" : "s");
+
+    cmd_reply(ctx, buf);
+    return;
+  }
+
+  // Three distinguishable failures, and the operator needs the
+  // difference: nothing happened, nothing happened but a plugin was
+  // taken down and put back, or the tree is down a plugin.
+  if(report.rolled_back && report.zombie)
+    snprintf(buf, sizeof(buf), CLR_RED "reload aborted" CLR_RESET " for "
+        CLR_BOLD "%s" CLR_RESET " — " CLR_BOLD "%s" CLR_RESET " could not "
+        "be unmapped%s%s and is now a " CLR_YELLOW "zombie" CLR_RESET
+        ": stopped, deinitialized, still mapped. Everything else was put "
+        "back, but that one needs a daemon restart. The log lists every "
+        "reference.", name, report.failed,
+        report.detail[0] != '\0' ? " — " : "", report.detail);
+
+  else if(report.rolled_back)
+    snprintf(buf, sizeof(buf), CLR_RED "reload aborted" CLR_RESET " for "
+        CLR_BOLD "%s" CLR_RESET " — " CLR_BOLD "%s" CLR_RESET " refused to "
+        "unload%s%s and is still running. Everything already taken down "
+        "was restored; the system is as it was.", name, report.failed,
+        report.detail[0] != '\0' ? ": " : "", report.detail);
+
+  else if(report.started)
+    snprintf(buf, sizeof(buf), CLR_RED "reload of" CLR_RESET " "
+        CLR_BOLD "%s" CLR_RESET " " CLR_RED "incomplete" CLR_RESET
+        " — %u of %u plugin(s) came back; " CLR_BOLD "%s" CLR_RESET
+        " did not%s%s. The log names what failed.",
+        name, report.cycled, report.dependents + 1, report.failed,
+        report.detail[0] != '\0' ? ": " : "", report.detail);
+
+  else if(report.failed[0] != '\0')
+    snprintf(buf, sizeof(buf), CLR_RED "cannot reload" CLR_RESET " "
+        CLR_BOLD "%s" CLR_RESET " — " CLR_BOLD "%s" CLR_RESET
+        " blocks the cascade%s%s. Nothing was touched.",
+        name, report.failed,
+        report.detail[0] != '\0' ? ": " : "", report.detail);
+
+  else
+    snprintf(buf, sizeof(buf), CLR_RED "cannot reload" CLR_RESET " "
+        CLR_BOLD "%s" CLR_RESET " — nothing was touched; the log says why",
+        name);
+
   cmd_reply(ctx, buf);
 }
 
@@ -2621,6 +2970,24 @@ plugin_register_commands(void)
       "on a feature this plugin provides.",
       USERNS_GROUP_OWNER, USERNS_OWNER_LEVEL, CMD_SCOPE_ANY, METHOD_T_ANY,
       plugin_cmd_unload, NULL, "plugin", NULL, ad_plugin_cmd_name, 1, NULL, NULL);
+
+  cmd_register("plugin", "reload",
+      "plugin reload <name>",
+      "Reload a plugin and everything that requires it",
+      "Unloads and loads a plugin back from the same .so, cycling\n"
+      "every loaded plugin that transitively requires a feature it\n"
+      "provides — a strategy cannot outlive the whenmoon it links\n"
+      "against, so unloading one alone is refused and always was.\n\n"
+      "Dependents come down in reverse dependency order and go back\n"
+      "up in forward order. If any of them refuses to unload, the\n"
+      "ones already taken down are loaded back and nothing is\n"
+      "reloaded: a partial cascade is worse than none.\n\n"
+      "Refused up front if a bot is bound to a driver in the closure\n"
+      "(destroy the bot first) or the plugin is a synthetic core\n"
+      "provider. KV rows survive the cycle — the persisted row is the\n"
+      "durable value and registration re-reads it.",
+      USERNS_GROUP_OWNER, USERNS_OWNER_LEVEL, CMD_SCOPE_ANY, METHOD_T_ANY,
+      plugin_cmd_reload, NULL, "plugin", NULL, ad_plugin_cmd_name, 1, NULL, NULL);
 
   cmd_register("plugin", "audit",
       "plugin audit <name> | all",

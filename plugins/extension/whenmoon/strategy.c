@@ -255,8 +255,12 @@ wm_strategy_register_global_param(const char *strategy_name,
   wm_strategy_format_default(p, def, sizeof(def));
   type = wm_strategy_param_kv_type(p->type);
 
-  if(kv_register(path, type, def, NULL, NULL,
-         p->help != NULL ? p->help : "") != SUCCESS)
+  // Owned by the strategy, not by us: `p` and its help string live in
+  // the strategy plugin's .rodata, so the entry has to name that
+  // mapping or it survives the strategy's unload with a dangling help
+  // pointer -- which is exactly what an unload audit reports.
+  if(kv_register_owned(path, type, def, NULL, NULL,
+         p->help != NULL ? p->help : "", p) != SUCCESS)
     clam(CLAM_WARN, WHENMOON_CTX,
         "strategy %s: kv_register failed: %s", strategy_name, path);
 }
@@ -288,8 +292,10 @@ wm_strategy_register_attach_param(const char *market_id_str,
   wm_strategy_format_default(p, def, sizeof(def));
   type = wm_strategy_param_kv_type(p->type);
 
-  if(kv_register(path, type, def, NULL, NULL,
-         p->help != NULL ? p->help : "") != SUCCESS)
+  // Same ownership rule as the global slot above: the strategy owns
+  // what its own .rodata supplied, however many markets clone it.
+  if(kv_register_owned(path, type, def, NULL, NULL,
+         p->help != NULL ? p->help : "", p) != SUCCESS)
     clam(CLAM_WARN, WHENMOON_CTX,
         "attach %s/%s: kv_register failed: %s",
         market_id_str, strategy_name, path);

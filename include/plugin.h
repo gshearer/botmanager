@@ -163,6 +163,40 @@ typedef struct
 // `report` is optional; callers that face a human should pass one and
 // say what it holds.
 bool plugin_unload(const char *name, plugin_unload_report_t *report);
+
+// A reload cycles the named plugin *and everything that transitively
+// requires it* — a strategy cannot outlive the whenmoon it links
+// against, so unloading one alone is refused and always was. The
+// cascade is the verb that does the obvious thing.
+//
+// `dependents` is the closure size excluding the named plugin;
+// `cycled` counts what actually came back up. `started` is false while
+// the cascade can still be refused for free — nothing has been unloaded
+// yet — and `rolled_back` says an unload refused after that, so the
+// plugins already taken down were restored and the system is where it
+// began; a partial cascade is worse than none. `failed` names the
+// plugin that blocked, refused, or would not come back, and `detail`
+// carries its reason when there was one to give.
+#define PLUGIN_RELOAD_MAX_CLOSURE  64
+
+// `zombie` qualifies `rolled_back`: the refusal landed after the
+// plugin's own teardown, so the one that said no is stopped,
+// deinitialized and still mapped. Its dependents came back, but it did
+// not — only a restart clears it.
+typedef struct
+{
+  uint32_t dependents;
+  uint32_t cycled;
+  bool     started;
+  bool     rolled_back;
+  bool     zombie;
+  char     failed[PLUGIN_NAME_SZ];
+  char     detail[PLUGIN_OFFENDER_SZ];
+} plugin_reload_report_t;
+
+// `report` is optional. FAIL leaves every plugin it could revive
+// running; what it could not is named in the report and the log.
+bool plugin_reload(const char *name, plugin_reload_report_t *report);
 uint32_t plugin_discover(const char *dir);
 const plugin_desc_t *plugin_find(const char *name);
 const plugin_desc_t *plugin_find_feature(const char *feature);
@@ -330,6 +364,17 @@ typedef struct dlsym_cache_rec
   const char              *consumer_so;    // owned copy (mem_alloc); dladdr() at registration
   struct dlsym_cache_rec  *next;
 } dlsym_cache_rec_t;
+
+// What a reload must remember about a plugin across its own teardown:
+// plugin_unload() frees the plugin_rec_t, so the path the .so came from
+// has to be copied out BEFORE the unload or there is nothing to load
+// back (wm_strategy_reload() learned this the hard way — see
+// strategy.c's "unloaded %s but no path captured").
+typedef struct
+{
+  char name[PLUGIN_NAME_SZ];
+  char path[PLUGIN_PATH_SZ];
+} plugin_snap_t;
 
 typedef struct plugin_rec
 {
