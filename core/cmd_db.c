@@ -10,6 +10,8 @@
 //   /db                      usage
 //   /db delete               usage
 //   /db delete kv <key>      drop one KV key from memory AND its DB row
+//   /db orphans              usage
+//   /db orphans kv           list persisted KV rows no live entry claims
 //
 // Everything here is destructive by intent and admin-gated accordingly.
 
@@ -66,13 +68,19 @@ static const cmd_arg_desc_t ad_db_delete_kv[] = {
 static void
 cmd_db(const cmd_ctx_t *ctx)
 {
-  cmd_reply(ctx, "usage: /db <subcommand> ...  (delete)");
+  cmd_reply(ctx, "usage: /db <subcommand> ...  (delete, orphans)");
 }
 
 static void
 cmd_db_delete(const cmd_ctx_t *ctx)
 {
   cmd_reply(ctx, "usage: /db delete <what> ...  (kv <key>)");
+}
+
+static void
+cmd_db_orphans(const cmd_ctx_t *ctx)
+{
+  cmd_reply(ctx, "usage: /db orphans <what>  (kv)");
 }
 
 // -----------------------------------------------------------------------
@@ -97,6 +105,77 @@ cmd_db_delete_kv(const cmd_ctx_t *ctx)
         "no live kv '%s' — dropped any persisted row (nothing in memory)",
         key);
 
+  cmd_reply(ctx, buf);
+}
+
+// -----------------------------------------------------------------------
+// /db orphans kv
+// -----------------------------------------------------------------------
+
+// Cap on listed rows, so a pathological table cannot flood a channel. The
+// count in the summary is the true total either way.
+#define DB_ORPHAN_LIST_MAX  200
+
+typedef struct
+{
+  const cmd_ctx_t *ctx;
+  uint32_t         listed;
+} db_orphan_state_t;
+
+static void
+db_orphan_cb(const char *key, kv_type_t type, const char *value, void *data)
+{
+  db_orphan_state_t *st = data;
+  const char        *shown = value;
+  char               line[KV_KEY_SZ + KV_STR_SZ + 32];
+
+  st->listed++;
+
+  if(st->listed > DB_ORPHAN_LIST_MAX)
+    return;
+
+  if(kv_is_secret_key(key) && !kv_admin_context_active())
+    shown = KV_REDACTED_VALUE;
+
+  snprintf(line, sizeof(line), "  %s = %s (%s)",
+      key, shown, kv_type_name(type));
+  cmd_reply(st->ctx, line);
+}
+
+// List the persisted KV rows that no live registry entry claims. Purely a
+// report: an unloaded plugin's keys are orphans for as long as it is out,
+// and they are exactly the rows that must survive so a reload costs no
+// reconfiguration. Deciding one is truly dead is the operator's call, and
+// /db delete kv is where that decision is executed.
+static void
+cmd_db_orphans_kv(const cmd_ctx_t *ctx)
+{
+  db_orphan_state_t st;
+  uint32_t          total;
+  char              buf[160];
+
+  memset(&st, 0, sizeof(st));
+  st.ctx = ctx;
+
+  cmd_reply(ctx, "orphaned kv rows (persisted, no live entry):");
+  total = kv_iterate_orphans(db_orphan_cb, &st);
+
+  if(total == 0)
+  {
+    cmd_reply(ctx, "  none — every persisted row is claimed");
+    return;
+  }
+
+  if(total > DB_ORPHAN_LIST_MAX)
+  {
+    snprintf(buf, sizeof(buf), "  ... %u more not shown",
+        total - DB_ORPHAN_LIST_MAX);
+    cmd_reply(ctx, buf);
+  }
+
+  snprintf(buf, sizeof(buf),
+      "%u orphan(s) — a row is kept until you drop it: /db delete kv <key>",
+      total);
   cmd_reply(ctx, buf);
 }
 
@@ -134,4 +213,25 @@ cmd_db_register(void)
       USERNS_GROUP_ADMIN, DB_CMD_LEVEL, CMD_SCOPE_ANY, METHOD_T_ANY,
       cmd_db_delete_kv, NULL, "db/delete", NULL,
       ad_db_delete_kv, 1, NULL, NULL);
+
+  cmd_register("cmd", "orphans",
+      "db orphans <what>",
+      "Report persisted state nothing claims (kv, ...)",
+      NULL,
+      USERNS_GROUP_ADMIN, DB_CMD_LEVEL, CMD_SCOPE_ANY, METHOD_T_ANY,
+      cmd_db_orphans, NULL, "db", NULL, NULL, 0, NULL, NULL);
+
+  cmd_register("cmd", "kv",
+      "db orphans kv",
+      "List persisted KV rows no live entry claims",
+      "Every configuration key a plugin registers is a live binding over a\n"
+      "durable database row. Unloading the plugin drops the binding and\n"
+      "keeps the row — that is what makes a reload cost no reconfiguration\n"
+      "— so its keys appear here until it loads again.\n"
+      "\n"
+      "A row also lands here when a schema change retires the key. Core\n"
+      "cannot tell the two apart and never prunes on its own; when you are\n"
+      "sure a key is retired, drop it with /db delete kv <key>.",
+      USERNS_GROUP_ADMIN, DB_CMD_LEVEL, CMD_SCOPE_ANY, METHOD_T_ANY,
+      cmd_db_orphans_kv, NULL, "db/orphans", NULL, NULL, 0, NULL, NULL);
 }

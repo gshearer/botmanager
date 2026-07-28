@@ -95,6 +95,7 @@ regex (the literal context portion, before any `<placeholder>`).
 | `kv_flush` | core/kv.c | KV flush to DB |
 | `kv_init` | core/kv.c | KV subsystem init |
 | `kv_load` | core/kv.c | KV load from DB |
+| `kv_orphans` | core/kv.c | orphaned-row report (admin `/db orphans kv`) |
 | `kv_reclaim` | core/kv.c | Class-A reclamation of a plugin's KV entries |
 | `kv_register` | core/kv.c | KV registration |
 | `kv_register_nl` | core/kv.c | NL responder attach |

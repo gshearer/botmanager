@@ -202,9 +202,25 @@ void kv_audit_iterate(kv_audit_cb_t cb, void *data);
 
 bool kv_load(void);
 
+// Invoked once per orphaned persisted row. Runs under NO lock and may
+// call other kv_* APIs; `value` is the raw stored text, redaction is the
+// caller's business (see kv_is_secret_key).
+typedef void (*kv_orphan_cb_t)(const char *key, kv_type_t type,
+    const char *value, void *data);
+
+// Visit every persisted row that no live registry entry claims — the
+// residue of an unloaded plugin, or of a key a schema change retired.
+// Strictly read-only: it never registers, modifies or deletes a row, so it
+// is the reporting counterpart of kv_claim_orphans() below and safe to run
+// while a plugin is unloaded. Returns the number of orphans visited.
+uint32_t kv_iterate_orphans(kv_orphan_cb_t cb, void *data);
+
 // Materialize persisted DB rows that no live entry claims — dynamic keys
 // with no static schema (e.g. per-channel IRC configuration). Call after
 // bot restore. Returns the number of entries materialized.
+// ⚠ Boot-time only: after an unload an orphan is a *dropped binding*, and
+// materializing it would resurrect the key as live-but-unowned. Reporting
+// after an unload is kv_iterate_orphans()'s job.
 uint32_t kv_claim_orphans(void);
 
 bool kv_flush(void);

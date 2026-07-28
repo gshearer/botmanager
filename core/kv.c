@@ -442,17 +442,19 @@ kv_register_owned(const char *key, kv_type_t type, const char *default_val,
     if(kv_db_lookup_one(key, &db_type, db_str, sizeof(db_str)))
     {
       kv_val_t db_val;
+      bool     live;
 
       memset(&db_val, 0, sizeof(db_val));
 
       pthread_mutex_lock(&kv_mutex);
 
       // Re-find: a concurrent kv_unregister may have dropped the entry.
-      e = find_locked(key);
+      e    = find_locked(key);
+      live = (e != NULL);
 
       // Type-mismatched rows are ignored (keep the default), mirroring the
       // old pending-restore guard.
-      if(e != NULL && db_type == (int)type &&
+      if(live && db_type == (int)type &&
           str_to_val(type, db_str, &db_val) == SUCCESS)
       {
         e->val   = db_val;
@@ -465,7 +467,26 @@ kv_register_owned(const char *key, kv_type_t type, const char *default_val,
         return(SUCCESS);
       }
 
+      // A row exists that this registration cannot take: the declaration
+      // changed type, or the stored text no longer parses as one. Keeping
+      // the default is the correct outcome — but the entry was born dirty,
+      // and a dirty default is exactly what kv_flush() would write over the
+      // operator's tuned row at shutdown (the kv_flush_failed_boot_clobber
+      // class). Mark it clean: nothing persists until someone deliberately
+      // sets the key, so reverting the declaration restores the value.
+      if(live)
+        e->dirty = false;
+
       pthread_mutex_unlock(&kv_mutex);
+
+      // Doing this at DEBUG silently resets whatever was tuned — say it out
+      // loud (root TODO.md §PLIFE-4, the type-changed case).
+      if(live)
+        clam(CLAM_WARN, "kv_register",
+            "'%s': persisted row is %s '%s' but the schema declares %s — "
+            "using default '%s'; the row is untouched",
+            key, kv_type_name((kv_type_t)db_type), db_str,
+            kv_type_name(type), default_val);
     }
 
     clam(CLAM_DEBUG, "kv_register", "'%s' (%s) = %s",
@@ -1484,10 +1505,18 @@ load_apply_row(kv_entry_t *e, const char *db_key,
 
   if(type_id != (int)e->type)
   {
+    // Keep the default, but clean — see the matching reasoning in
+    // kv_register(): a dirty default would flush over this very row.
+    e->dirty = false;
     pthread_mutex_unlock(&kv_mutex);
+    // Same case as the kv_register rehydrate path, seen at boot instead of
+    // at re-registration: name the row we are declining so the reset is
+    // never silent. The row stays put.
     clam(CLAM_WARN, "kv_load",
-        "type mismatch for '%s': registered %s, db %d",
-        db_key, kv_type_name(e->type), type_id);
+        "'%s': persisted row is %s '%s' but the schema declares %s — "
+        "using default; the row is untouched",
+        db_key, kv_type_name((kv_type_t)type_id), db_val,
+        kv_type_name(e->type));
     return(false);
   }
 
@@ -1495,9 +1524,11 @@ load_apply_row(kv_entry_t *e, const char *db_key,
 
   if(str_to_val(e->type, db_val, &new_val) != SUCCESS)
   {
+    e->dirty = false;
     pthread_mutex_unlock(&kv_mutex);
     clam(CLAM_WARN, "kv_load",
-        "invalid value for '%s': '%s'", db_key, db_val);
+        "invalid value for '%s': '%s' — using default; the row is untouched",
+        db_key, db_val);
     return(false);
   }
 
@@ -1644,6 +1675,58 @@ kv_flush(void)
         flushed, failed);
 
   return((failed == 0) ? SUCCESS : FAIL);
+}
+
+// Report the persisted rows that no live entry claims, without touching
+// one of them. This is the operator's view of "keys a plugin used to
+// have": after an unload, core's Class-A sweep drops the binding and
+// deliberately leaves the row, because an unloaded plugin and a retired
+// key look identical from here (root TODO.md §PLIFE-4). Pruning therefore
+// stays a deliberate act — /db delete kv <key>.
+uint32_t
+kv_iterate_orphans(kv_orphan_cb_t cb, void *data)
+{
+  db_result_t *r;
+  uint32_t     found = 0;
+
+  if(cb == NULL)
+    return(0);
+
+  r = db_result_alloc();
+
+  if(db_query("SELECT key, type, value FROM kv ORDER BY key", r) != SUCCESS)
+  {
+    clam(CLAM_WARN, "kv_orphans", "db scan failed: %s", r->error);
+    db_result_free(r);
+    return(0);
+  }
+
+  for(uint32_t i = 0; i < r->rows; i++)
+  {
+    const char *db_key  = db_result_get(r, i, 0);
+    const char *db_type = db_result_get(r, i, 1);
+    const char *db_val  = db_result_get(r, i, 2);
+    bool        live;
+
+    if(db_key == NULL || db_type == NULL || db_val == NULL)
+      continue;
+
+    pthread_mutex_lock(&kv_mutex);
+    live = (find_locked(db_key) != NULL);
+    pthread_mutex_unlock(&kv_mutex);
+
+    if(live)
+      continue;
+
+    // An unparseable type id reaches the callback as KV_UNKNOWN's name
+    // rather than being hidden — a row nothing can ever claim is the most
+    // orphaned row there is.
+    cb(db_key, (kv_type_t)atoi(db_type), db_val, data);
+    found++;
+  }
+
+  db_result_free(r);
+  return(found);
 }
 
 // Materialize persisted DB rows that no live entry claims — dynamic keys
