@@ -238,6 +238,7 @@ The command surfaces filed beside these engines (`ask`, `claude`,
 | `strategy.keel` | plugins/extension/whenmoon/strategy/keel/ | keel strategy log (`KEEL_LOG_CTX`) |
 | `strategy.capstan` | plugins/extension/whenmoon/strategy/capstan/ | capstan strategy log (`CAPSTAN_LOG_CTX`) |
 | `strategy.fathom` | plugins/extension/whenmoon/strategy/fathom/ | fathom strategy log (`FATHOM_LOG_CTX`) |
+| `strategy.sextant` | plugins/extension/whenmoon/strategy/sextant/ | sextant census-probe strategy log (`SXT_LOG_CTX`) |
 | `strategy.testing` | plugins/extension/whenmoon/strategy/testing/ | testing strategy log (`TST_LOG_CTX`) |
 | `userquote` | plugins/feature/userquote/ | quote book: schema, add/recall/del, migration (`UQ_CTX`) |
 | `whenmoon` | plugins/extension/whenmoon/ | top-level whenmoon (`WHENMOON_CTX`) |
