@@ -236,6 +236,7 @@ The command surfaces filed beside these engines (`ask`, `claude`,
 | `strategy.mako` | plugins/extension/whenmoon/strategy/mako/ | mako strategy log (`MAKO_LOG_CTX`) |
 | `strategy.squall` | plugins/extension/whenmoon/strategy/squall/ | squall strategy log (`SQUALL_LOG_CTX`) |
 | `strategy.keel` | plugins/extension/whenmoon/strategy/keel/ | keel strategy log (`KEEL_LOG_CTX`) |
+| `strategy.capstan` | plugins/extension/whenmoon/strategy/capstan/ | capstan strategy log (`CAPSTAN_LOG_CTX`) |
 | `strategy.testing` | plugins/extension/whenmoon/strategy/testing/ | testing strategy log (`TST_LOG_CTX`) |
 | `userquote` | plugins/feature/userquote/ | quote book: schema, add/recall/del, migration (`UQ_CTX`) |
 | `whenmoon` | plugins/extension/whenmoon/ | top-level whenmoon (`WHENMOON_CTX`) |
