@@ -517,6 +517,38 @@ wm_aggregator_replay_bar(whenmoon_market_t *mk, wm_gran_t gran,
     }
   }
 
+  // WM-AGG-2: poison-print guard. A bar whose open AND close BOTH sit
+  // more than 5x from the last accepted close is a bad exchange print
+  // (the 2017-04-15 btc $0.06 flash row bought one backtest 443k BTC),
+  // not a market move — drop it and synthesize a carry-forward minute
+  // in its place. Intrabar wicks pass untouched: high/low never price
+  // a fill, so real flash-crash wicks survive. Synthetic bars carry
+  // the last real close forward, so the ring tail is always the last
+  // ACCEPTED real close and the recovery bar after a dropped print is
+  // judged against sane prices.
+  {
+    uint32_t n = mk->grain_n[WM_GRAN_1M];
+
+    if(n > 0)
+    {
+      double prev = mk->grain_arr[WM_GRAN_1M][n - 1].close;
+
+      if(prev > 0.0 &&
+         (bar->open  > prev * 5.0 || bar->open  < prev * 0.2) &&
+         (bar->close > prev * 5.0 || bar->close < prev * 0.2))
+      {
+        clam(CLAM_WARN, WHENMOON_CTX,
+            "market %s: poison 1m bar at %lld dropped"
+            " (o=%.8f c=%.8f prev=%.8f)",
+            mk->product_id, (long long)bar->ts_close_ms,
+            bar->open, bar->close, prev);
+
+        wm_aggregator_emit_empty_1m(mk, bar->ts_close_ms - 60000);
+        return(synthesized + 1);
+      }
+    }
+  }
+
   wm_aggregator_push_bar(mk, WM_GRAN_1M, bar);
   wm_aggregator_cascade_to(mk, WM_GRAN_5M,
       &mk->grain_arr[WM_GRAN_1M][mk->grain_n[WM_GRAN_1M] - 1],
