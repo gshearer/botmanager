@@ -120,12 +120,28 @@ typedef struct
 
 void plugin_get_stats(plugin_stats_t *out);
 bool plugin_load(const char *path);
-// `leaks_out` (optional) receives the teardown audit's verdict — the
-// number of references still pointing into the plugin's mapping after
-// its deinit() ran. Non-zero means the unload completed but the
-// plugin's teardown is incomplete; callers that face a human must say
-// so. PLIFE-7 turns that same count into a refusal.
-bool plugin_unload(const char *name, uint32_t *leaks_out);
+
+// What the teardown sweep between deinit() and dlclose found.
+//
+// `reclaimed` counts the Class-A registrations — commands, KV entries,
+// clam subscribers, bot KV contributors — that the plugin's deinit()
+// left behind and core dropped on its behalf. Nothing dangles either
+// way; the number is the plugin's tidiness, not the daemon's safety.
+//
+// `residual` counts what core will NOT drop for anyone: Class-B
+// references (running tasks, in-flight requests, a bound driver vtable)
+// still pointing into the mapping. Those genuinely dangle past dlclose.
+// PLIFE-6 turns a non-zero `residual` into a refusal; until then it is
+// reported and the unload proceeds.
+typedef struct
+{
+  uint32_t reclaimed;
+  uint32_t residual;
+} plugin_unload_report_t;
+
+// `report` is optional; callers that face a human should pass one and
+// say what it holds.
+bool plugin_unload(const char *name, plugin_unload_report_t *report);
 uint32_t plugin_discover(const char *dir);
 const plugin_desc_t *plugin_find(const char *name);
 const plugin_desc_t *plugin_find_feature(const char *feature);

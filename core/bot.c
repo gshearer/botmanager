@@ -358,6 +358,7 @@ typedef struct
   bot_kv_bot_cb_t    bot_cb;
   bot_kv_method_cb_t method_cb;
   void              *user;
+  const void        *owner_pc;  // register call site; identifies the owning object
 } bot_kv_contrib_t;
 
 static bot_kv_contrib_t bot_kv_contribs[BOT_KV_CONTRIB_MAX];
@@ -406,6 +407,8 @@ void
 bot_kv_contributor_register(bot_kv_bot_cb_t bot_cb,
     bot_kv_method_cb_t method_cb, void *user)
 {
+  const void *owner_pc = __builtin_return_address(0);
+
   pthread_mutex_lock(&bot_kv_contrib_mutex);
 
   if(bot_kv_contrib_count >= BOT_KV_CONTRIB_MAX)
@@ -420,6 +423,7 @@ bot_kv_contributor_register(bot_kv_bot_cb_t bot_cb,
   bot_kv_contribs[bot_kv_contrib_count].bot_cb    = bot_cb;
   bot_kv_contribs[bot_kv_contrib_count].method_cb = method_cb;
   bot_kv_contribs[bot_kv_contrib_count].user      = user;
+  bot_kv_contribs[bot_kv_contrib_count].owner_pc  = owner_pc;
   bot_kv_contrib_count++;
 
   pthread_mutex_unlock(&bot_kv_contrib_mutex);
@@ -460,6 +464,45 @@ bot_kv_contributor_unregister(void *user)
     }
 
   pthread_mutex_unlock(&bot_kv_contrib_mutex);
+}
+
+uint32_t
+bot_reclaim_contributors_owned(uintptr_t lo, uintptr_t hi)
+{
+  uint32_t removed = 0;
+  uint32_t i       = 0;
+
+  if(lo >= hi)
+    return(0);
+
+  pthread_mutex_lock(&bot_kv_contrib_mutex);
+
+  while(i < bot_kv_contrib_count)
+  {
+    uintptr_t pc = (uintptr_t)bot_kv_contribs[i].owner_pc;
+
+    if(pc >= lo && pc < hi)
+    {
+      // Compact the tail down over the removed slot; `i` stays put so
+      // the entry shifted into it is tested on the next iteration.
+      for(uint32_t j = i + 1; j < bot_kv_contrib_count; j++)
+        bot_kv_contribs[j - 1] = bot_kv_contribs[j];
+
+      bot_kv_contrib_count--;
+      removed++;
+    }
+
+    else
+      i++;
+  }
+
+  pthread_mutex_unlock(&bot_kv_contrib_mutex);
+
+  if(removed > 0)
+    clam(CLAM_DEBUG, "bot_reclaim",
+        "reclaimed %u KV contributor(s)", removed);
+
+  return(removed);
 }
 
 void
@@ -2084,8 +2127,10 @@ bot_register_method_kv(const char *botname, const char *method_kind)
     // Build the per-bot key: "bot.<botname>.<kind>.<suffix>"
     snprintf(new_key, sizeof(new_key), "%s%s", bot_prefix, e->key);
 
-    if(kv_register(new_key, e->type, e->default_val, e->cb, NULL,
-        e->help) == SUCCESS)
+    // The instance schema belongs to the plugin that declared it, not to
+    // this loop; attribute the key there so its unload reclaims it.
+    if(kv_register_owned(new_key, e->type, e->default_val, e->cb, NULL,
+        e->help, e) == SUCCESS)
     {
       registered++;
 
@@ -2131,8 +2176,10 @@ bot_register_driver_kv(const char *botname, const char *bot_kind)
 
     snprintf(new_key, sizeof(new_key), "%s%s", bot_prefix, e->key);
 
-    if(kv_register(new_key, e->type, e->default_val, e->cb, NULL,
-        e->help) == SUCCESS)
+    // The instance schema belongs to the plugin that declared it, not to
+    // this loop; attribute the key there so its unload reclaims it.
+    if(kv_register_owned(new_key, e->type, e->default_val, e->cb, NULL,
+        e->help, e) == SUCCESS)
     {
       registered++;
 

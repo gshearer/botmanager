@@ -53,6 +53,14 @@ typedef void (*clam_audit_cb_t)(const char *subject, const char *field,
 
 void clam_audit_iterate(clam_audit_cb_t cb, void *data);
 
+// Drop every subscriber registered by code inside the address range
+// [lo,hi) — one loaded object's mapping. Subscribers are Class A (see
+// root TODO.md §PLIFE-3): the retained cb is dispatched from any thread
+// that logs, so leaving one behind past dlclose crashes the next
+// clam() call, and dropping it only costs the plugin its own log feed.
+// Returns the number of subscribers removed.
+uint32_t clam_reclaim_owned(uintptr_t lo, uintptr_t hi);
+
 // Must be called before any other clam function.
 void clam_init(void);
 
@@ -84,6 +92,7 @@ typedef struct clam_sub
   uint64_t         count;
   time_t           last;
   clam_cb_t        cb;
+  const void      *owner_pc;  // clam_subscribe() call site; identifies the owning object
   struct clam_sub *next;
 } clam_sub_t;
 

@@ -366,6 +366,17 @@ bool
 kv_register(const char *key, kv_type_t type, const char *default_val,
     kv_cb_t cb, void *cb_data, const char *help)
 {
+  // Core is link_whole'd into botman with export_dynamic, so a plugin
+  // reaches this symbol through the PLT and the return address lands in
+  // the plugin's own mapping.
+  return(kv_register_owned(key, type, default_val, cb, cb_data, help,
+      __builtin_return_address(0)));
+}
+
+bool
+kv_register_owned(const char *key, kv_type_t type, const char *default_val,
+    kv_cb_t cb, void *cb_data, const char *help, const void *owner_pc)
+{
   kv_val_t       val;
   kv_entry_t    *e;
   uint32_t       bucket;
@@ -399,13 +410,14 @@ kv_register(const char *key, kv_type_t type, const char *default_val,
 
   strncpy(e->key, key, KV_KEY_SZ - 1);
   e->key[KV_KEY_SZ - 1] = '\0';
-  e->type    = type;
-  e->val     = val;
-  e->cb      = cb;
-  e->cb_data = cb_data;
-  e->help    = help;
-  e->dirty   = true;   // new entries need DB persistence
-  e->secret  = kv_is_secret_key(key);
+  e->type     = type;
+  e->val      = val;
+  e->cb       = cb;
+  e->cb_data  = cb_data;
+  e->help     = help;
+  e->owner_pc = owner_pc;
+  e->dirty    = true;   // new entries need DB persistence
+  e->secret   = kv_is_secret_key(key);
 
   // Insert into hash table.
   bucket = hash_key(key);
@@ -1367,28 +1379,27 @@ kv_unregister(const char *key)
 }
 
 uint32_t
-kv_unregister_prefix(const char *prefix)
+kv_reclaim_owned(uintptr_t lo, uintptr_t hi)
 {
-  size_t   plen;
-  uint32_t removed = 0;
+  kv_nl_reg_t **rp;
+  uint32_t      removed = 0;
 
-  if(prefix == NULL || prefix[0] == '\0')
+  if(lo >= hi)
     return(0);
-
-  plen = strlen(prefix);
 
   pthread_mutex_lock(&kv_mutex);
 
   for(uint32_t b = 0; b < KV_BUCKETS; b++)
   {
-    kv_entry_t *e = kv_table[b];
+    kv_entry_t *e    = kv_table[b];
     kv_entry_t *prev = NULL;
 
     while(e != NULL)
     {
       kv_entry_t *next = e->next;
+      uintptr_t   pc   = (uintptr_t)e->owner_pc;
 
-      if(strncmp(e->key, prefix, plen) == 0)
+      if(pc >= lo && pc < hi)
       {
         if(prev != NULL)
           prev->next = next;
@@ -1409,35 +1420,32 @@ kv_unregister_prefix(const char *prefix)
 
   pthread_mutex_unlock(&kv_mutex);
 
-  // Walk the NL adapter list separately, dropping any whose key
-  // matches the prefix. Done outside kv_mutex per lock ordering.
-  if(removed > 0)
+  // NL responders are keyed by hint pointer rather than by owner: the
+  // hint is the only thing the registry retains, and it is exactly what
+  // dies at dlclose. Walked outside kv_mutex, per lock ordering.
+  pthread_mutex_lock(&kv_nl_mutex);
+
+  rp = &kv_nl_head;
+
+  while(*rp != NULL)
   {
-    kv_nl_reg_t **pp;
+    kv_nl_reg_t *r  = *rp;
+    uintptr_t    nl = (uintptr_t)r->nl;
 
-    pthread_mutex_lock(&kv_nl_mutex);
-
-    pp = &kv_nl_head;
-
-    while(*pp != NULL)
+    if(nl >= lo && nl < hi)
     {
-      kv_nl_reg_t *r = *pp;
-
-      if(strncmp(r->key, prefix, plen) == 0)
-      {
-        *pp = r->next;
-        mem_free(r);
-      }
-
-      else
-        pp = &r->next;
+      *rp = r->next;
+      mem_free(r);
     }
 
-    pthread_mutex_unlock(&kv_nl_mutex);
-
-    clam(CLAM_DEBUG, "kv_unregister_prefix",
-        "removed %u entries with prefix '%s'", removed, prefix);
+    else
+      rp = &r->next;
   }
+
+  pthread_mutex_unlock(&kv_nl_mutex);
+
+  if(removed > 0)
+    clam(CLAM_DEBUG, "kv_reclaim", "reclaimed %u entry(s)", removed);
 
   return(removed);
 }

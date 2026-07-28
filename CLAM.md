@@ -50,6 +50,7 @@ regex (the literal context portion, before any `<placeholder>`).
 | `bot_exit` | core/bot.c | bot subsystem teardown |
 | `bot_init` | core/bot.c | bot subsystem init |
 | `bot_msg` | core/bot.c | inbound message routed to a bot |
+| `bot_reclaim` | core/bot.c | Class-A reclamation of a plugin's KV contributors |
 | `bot_register_driver_kv` | core/bot.c | per-driver KV registration |
 | `bot_register_method_kv` | core/bot.c | per-method KV registration |
 | `bot_restore` | core/bot.c | bot restore from persistent store |
@@ -67,6 +68,7 @@ regex (the literal context portion, before any `<placeholder>`).
 | `botmanctl` | core/botmanctl.c | botmanctl protocol driver |
 | `clam_exit` | core/clam.c | clam subsystem teardown |
 | `clam_init` | core/clam.c | clam subsystem init |
+| `clam_reclaim` | core/clam.c | Class-A reclamation of a plugin's log subscribers |
 | `clam_subscribe` | core/clam.c | clam subscribe surface |
 | `clam_unsubscribe` | core/clam.c | clam unsubscribe surface |
 | `cmd_bot_cleanup` | core/cmd.c | per-bot command-tree cleanup |
@@ -75,6 +77,7 @@ regex (the literal context portion, before any `<placeholder>`).
 | `cmd_dispatch_resolved` | core/cmd.c | dispatch from pre-resolved node (NB1) |
 | `cmd_exit` | core/cmd.c | command subsystem teardown |
 | `cmd_init` | core/cmd.c | command subsystem init |
+| `cmd_reclaim` | core/cmd.c | Class-A reclamation of a plugin's command subtrees |
 | `cmd_register` | core/cmd.c | command-tree registration |
 | `cmd_set_prefix` | core/cmd.c | command prefix change |
 | `cmd_unregister` | core/cmd.c | command-tree unregistration |
@@ -92,6 +95,7 @@ regex (the literal context portion, before any `<placeholder>`).
 | `kv_flush` | core/kv.c | KV flush to DB |
 | `kv_init` | core/kv.c | KV subsystem init |
 | `kv_load` | core/kv.c | KV load from DB |
+| `kv_reclaim` | core/kv.c | Class-A reclamation of a plugin's KV entries |
 | `kv_register` | core/kv.c | KV registration |
 | `kv_register_nl` | core/kv.c | NL responder attach |
 | `main` | core/main.c | daemon entry / startup banner |
@@ -107,6 +111,7 @@ regex (the literal context portion, before any `<placeholder>`).
 | `method_unsubscribe` | core/method.c | method unsubscribe |
 | `plugin` | core/plugin.c | plugin discovery + load + lifecycle |
 | `plugin_audit` | core/plugin.c | teardown audit: references still pointing into a plugin's mapping |
+| `plugin_reclaim` | core/plugin.c | teardown sweep: mapping lookup for the Class-A reclamation |
 | `pool` | core/pool.c | worker pool runtime events |
 | `pool_exit` | core/pool.c | worker pool teardown |
 | `pool_init` | core/pool.c | worker pool init |

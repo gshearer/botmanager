@@ -368,6 +368,11 @@ cmd_register(const char *module, const char *name,
     const char *const *kind_filter,
     const cmd_nl_t *nl)
 {
+  // The owning object is whoever called us. Core is link_whole'd into
+  // botman with export_dynamic, so a plugin reaches this symbol through
+  // the PLT and the return address lands in the plugin's own mapping.
+  const void *owner_pc = __builtin_return_address(0);
+
   if(name == NULL || name[0] == '\0' || cb == NULL)
   {
     clam(CLAM_WARN, "cmd_register", "invalid arguments");
@@ -443,6 +448,8 @@ cmd_register(const char *module, const char *name,
         help_long, group, level, scope, methods, cb, data, abbrev,
         arg_desc, arg_count, kind_filter, nl, parent);
 
+    d->owner_pc = owner_pc;
+
     pthread_mutex_unlock(&cmd_mutex);
 
     clam(CLAM_DEBUG, "cmd_register",
@@ -477,6 +484,36 @@ def_collect_subtree_locked(cmd_def_t *d, cmd_def_t **out, uint32_t cap,
   return(n);
 }
 
+// Reconstruct `d`'s slash-joined registration path (e.g.
+// "irc/network/list"). Caller must hold cmd_mutex.
+static void
+def_path_locked(const cmd_def_t *d, char *buf, size_t cap)
+{
+  const cmd_def_t *chain[CMD_PATH_MAX_DEPTH];
+  uint32_t         n   = 0;
+  size_t           len = 0;
+
+  buf[0] = '\0';
+
+  for(const cmd_def_t *p = d; p != NULL && n < CMD_PATH_MAX_DEPTH;
+      p = p->parent)
+    chain[n++] = p;
+
+  // chain[] runs leaf -> root; emit it back to front.
+  while(n > 0 && len + 1 < cap)
+  {
+    n--;
+    len += (size_t)snprintf(buf + len, cap - len, "%s%s",
+        len > 0 ? "/" : "", chain[n]->name);
+
+    if(len >= cap)
+    {
+      buf[cap - 1] = '\0';
+      return;
+    }
+  }
+}
+
 static bool
 def_in_set(const cmd_def_t *d, cmd_def_t *const *set, uint32_t n)
 {
@@ -487,40 +524,23 @@ def_in_set(const cmd_def_t *d, cmd_def_t *const *set, uint32_t n)
   return(false);
 }
 
-// Unregister a command subtree addressed by its registration path.
-uint32_t
-cmd_unregister_path(const char *path)
+// Collect `d`'s subtree into `out` and unlink every member from both the
+// command tree and the global list. The definitions themselves are left
+// for the caller to free once cmd_mutex is dropped -- mem_free() logs,
+// and logging under this lock is how the clam re-entry guard earns its
+// keep. Caller must hold cmd_mutex.
+// returns: number detached, or 0 if the subtree exceeds cap
+static uint32_t
+def_detach_subtree_locked(cmd_def_t *d, cmd_def_t **out, uint32_t cap)
 {
-  cmd_def_t *victims[CMD_UNREG_MAX_SUBTREE];
-  cmd_def_t *d;
   cmd_def_t *prev;
   cmd_def_t *cur;
   uint32_t   n;
 
-  if(path == NULL || path[0] == '\0')
-    return(0);
-
-  pthread_mutex_lock(&cmd_mutex);
-  d = resolve_parent_path_locked(path);
-
-  // An unresolved path is not a warning: teardown runs on partially
-  // registered plugins and must be idempotent.
-  if(d == NULL)
-  {
-    pthread_mutex_unlock(&cmd_mutex);
-    return(0);
-  }
-
-  n = def_collect_subtree_locked(d, victims, CMD_UNREG_MAX_SUBTREE, 0);
+  n = def_collect_subtree_locked(d, out, cap, 0);
 
   if(n == 0)
-  {
-    pthread_mutex_unlock(&cmd_mutex);
-    clam(CLAM_WARN, "cmd_unregister",
-        "'%s': subtree exceeds %u definitions; refusing to unregister",
-        path, (unsigned)CMD_UNREG_MAX_SUBTREE);
     return(0);
-  }
 
   // Unlink the top node from its parent's sibling chain. Descendants
   // need no such unlink -- their parents are freed alongside them.
@@ -548,7 +568,7 @@ cmd_unregister_path(const char *path)
   {
     cmd_def_t *next = cur->next;
 
-    if(def_in_set(cur, victims, n))
+    if(def_in_set(cur, out, n))
     {
       if(prev != NULL)
         prev->next = next;
@@ -564,7 +584,41 @@ cmd_unregister_path(const char *path)
     cur = next;
   }
 
+  return(n);
+}
+
+// Unregister a command subtree addressed by its registration path.
+uint32_t
+cmd_unregister_path(const char *path)
+{
+  cmd_def_t *victims[CMD_UNREG_MAX_SUBTREE];
+  cmd_def_t *d;
+  uint32_t   n;
+
+  if(path == NULL || path[0] == '\0')
+    return(0);
+
+  pthread_mutex_lock(&cmd_mutex);
+  d = resolve_parent_path_locked(path);
+
+  // An unresolved path is not a warning: teardown runs on partially
+  // registered plugins and must be idempotent.
+  if(d == NULL)
+  {
+    pthread_mutex_unlock(&cmd_mutex);
+    return(0);
+  }
+
+  n = def_detach_subtree_locked(d, victims, CMD_UNREG_MAX_SUBTREE);
   pthread_mutex_unlock(&cmd_mutex);
+
+  if(n == 0)
+  {
+    clam(CLAM_WARN, "cmd_unregister",
+        "'%s': subtree exceeds %u definitions; refusing to unregister",
+        path, (unsigned)CMD_UNREG_MAX_SUBTREE);
+    return(0);
+  }
 
   for(uint32_t i = 0; i < n; i++)
     mem_free(victims[i]);
@@ -572,6 +626,94 @@ cmd_unregister_path(const char *path)
   clam(CLAM_DEBUG, "cmd_unregister",
       "unregistered '%s' (%u definition(s))", path, (unsigned)n);
   return(n);
+}
+
+static bool
+def_owned_by(const cmd_def_t *d, uintptr_t lo, uintptr_t hi)
+{
+  uintptr_t pc = (uintptr_t)d->owner_pc;
+
+  return(pc >= lo && pc < hi);
+}
+
+// Find the shallowest definition owned by [lo,hi) -- one whose parent is
+// owned by somebody else, so that taking it takes a whole subtree rather
+// than orphaning the nodes above it. Caller must hold cmd_mutex.
+static cmd_def_t *
+def_next_owned_root_locked(uintptr_t lo, uintptr_t hi)
+{
+  for(cmd_def_t *d = cmd_list; d != NULL; d = d->next)
+    if(def_owned_by(d, lo, hi)
+        && (d->parent == NULL || !def_owned_by(d->parent, lo, hi)))
+      return(d);
+
+  return(NULL);
+}
+
+// Reclaim every definition registered from inside one loaded object.
+uint32_t
+cmd_reclaim_owned(uintptr_t lo, uintptr_t hi)
+{
+  cmd_def_t *victims[CMD_UNREG_MAX_SUBTREE];
+  char       path[CMD_USAGE_SZ];
+  uint32_t   total = 0;
+
+  if(lo >= hi)
+    return(0);
+
+  // One subtree per pass: the list is rewritten each time, so the scan
+  // restarts rather than carrying stale pointers across the mutation.
+  for(;;)
+  {
+    cmd_def_t *root;
+    uint32_t   foreign = 0;
+    uint32_t   n;
+
+    pthread_mutex_lock(&cmd_mutex);
+    root = def_next_owned_root_locked(lo, hi);
+
+    if(root == NULL)
+    {
+      pthread_mutex_unlock(&cmd_mutex);
+      break;
+    }
+
+    def_path_locked(root, path, sizeof(path));
+    n = def_detach_subtree_locked(root, victims, CMD_UNREG_MAX_SUBTREE);
+
+    for(uint32_t i = 0; i < n; i++)
+      if(!def_owned_by(victims[i], lo, hi))
+        foreign++;
+
+    pthread_mutex_unlock(&cmd_mutex);
+
+    if(n == 0)
+    {
+      clam(CLAM_WARN, "cmd_reclaim",
+          "'%s': subtree exceeds %u definitions; leaving it registered",
+          path, (unsigned)CMD_UNREG_MAX_SUBTREE);
+      break;
+    }
+
+    for(uint32_t i = 0; i < n; i++)
+      mem_free(victims[i]);
+
+    // A foreign child under a reclaimed parent means some other object
+    // hung its command off this one's node. It goes with the parent --
+    // it has nowhere else to live -- but it is a layering bug and the
+    // owner deserves to hear about it.
+    if(foreign > 0)
+      clam(CLAM_WARN, "cmd_reclaim",
+          "'%s': %u definition(s) in this subtree belong to another "
+          "object; reclaimed with the parent", path, foreign);
+
+    total += n;
+  }
+
+  if(total > 0)
+    clam(CLAM_DEBUG, "cmd_reclaim", "reclaimed %u definition(s)", total);
+
+  return(total);
 }
 
 bool
@@ -2069,36 +2211,6 @@ cmd_iterate_children(const cmd_def_t *parent, cmd_iter_cb_t cb, void *data)
   }
 
   pthread_mutex_unlock(&cmd_mutex);
-}
-
-// Reconstruct `d`'s slash-joined registration path (e.g.
-// "irc/network/list"). Caller must hold cmd_mutex.
-static void
-def_path_locked(const cmd_def_t *d, char *buf, size_t cap)
-{
-  const cmd_def_t *chain[CMD_PATH_MAX_DEPTH];
-  uint32_t         n   = 0;
-  size_t           len = 0;
-
-  buf[0] = '\0';
-
-  for(const cmd_def_t *p = d; p != NULL && n < CMD_PATH_MAX_DEPTH;
-      p = p->parent)
-    chain[n++] = p;
-
-  // chain[] runs leaf -> root; emit it back to front.
-  while(n > 0 && len + 1 < cap)
-  {
-    n--;
-    len += (size_t)snprintf(buf + len, cap - len, "%s%s",
-        len > 0 ? "/" : "", chain[n]->name);
-
-    if(len >= cap)
-    {
-      buf[cap - 1] = '\0';
-      return;
-    }
-  }
 }
 
 void

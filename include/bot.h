@@ -271,6 +271,14 @@ void bot_kv_contributor_register(bot_kv_bot_cb_t bot_cb,
     bot_kv_method_cb_t method_cb, void *user);
 void bot_kv_contributor_unregister(void *user);
 
+// Drop every contributor registered by code inside the address range
+// [lo,hi) — one loaded object's mapping. Contributors are Class A (see
+// root TODO.md §PLIFE-3): the table retains two function pointers and a
+// cookie, all of which die at dlclose, and the keys a contributor
+// layered on already stand on their own.
+// Returns the number of contributors removed.
+uint32_t bot_reclaim_contributors_owned(uintptr_t lo, uintptr_t hi);
+
 // Audit hooks: yield the pointers the bot registry retains on a
 // plugin's behalf — the contributor table's callbacks and cookies, and
 // each instance's bound driver vtable.

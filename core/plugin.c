@@ -9,6 +9,10 @@
 // plugin_unload to invalidate dangling shim pointers before dlclose.
 static void dlsym_cache_on_plugin_unload(const plugin_rec_t *target);
 
+// Forward decl — defined alongside plugin_audit, which shares its
+// mapping lookup. Called from plugin_unload between deinit and dlclose.
+static uint32_t plugin_reclaim(const plugin_rec_t *target);
+
 static plugin_rec_t *
 find_by_name(const char *name)
 {
@@ -144,13 +148,13 @@ plugin_load(const char *path)
 }
 
 bool
-plugin_unload(const char *name, uint32_t *leaks_out)
+plugin_unload(const char *name, plugin_unload_report_t *report)
 {
   plugin_rec_t  *target;
   plugin_rec_t **pp;
 
-  if(leaks_out != NULL)
-    *leaks_out = 0;
+  if(report != NULL)
+    memset(report, 0, sizeof(*report));
 
   if(name == NULL || !plugin_ready)
     return(FAIL);
@@ -234,17 +238,6 @@ plugin_unload(const char *name, uint32_t *leaks_out)
     target->state = PLUGIN_LOADED;
   }
 
-  // Drop any KV entries the loader registered from the plugin's
-  // declared schema. kv_entry_t's cb / cb_data / help all point into
-  // plugin .text/.rodata; leaving them behind after dlclose would
-  // dangle on the next kv write or `/show kv`. Idempotent — a plugin
-  // that already unregistered its keys in deinit gets no-ops here.
-  if(target->desc->kv_schema != NULL && target->desc->kv_schema_count > 0)
-  {
-    for(uint32_t i = 0; i < target->desc->kv_schema_count; i++)
-      kv_unregister(target->desc->kv_schema[i].key);
-  }
-
   // Invalidate cross-plugin dlsym shim caches. Consumers (chat,
   // strategies, …) cache resolved function pointers in static fn_t
   // slots; without invalidation, dlclose'ing this plugin would dangle
@@ -253,28 +246,37 @@ plugin_unload(const char *name, uint32_t *leaks_out)
   // entirely — their backing memory is about to go away.
   dlsym_cache_on_plugin_unload(target);
 
-  // Report-only teardown audit, and the one that counts: run AFTER
-  // deinit(), so anything it still finds pointing into the mapping we
-  // are about to unmap is a bug in this plugin's deinit(). The same
-  // sweep against a *running* plugin reports its live surface — that
-  // is the worklist (`/plugin audit <name>`), this is the verdict.
-  // PLIFE-7 turns this into a refusal; until then, we only tell.
+  // The plugin has had its opportunity (stop, then deinit). Core now
+  // reclaims what it can define centrally — every Class-A registration
+  // still naming this mapping — and audits what is left. Both run AFTER
+  // deinit() and BEFORE dlclose, and both are about this mapping alone.
+  // The same audit against a *running* plugin reports its live surface:
+  // that is the worklist (`/plugin audit <name>`), this is the verdict.
   {
-    uint32_t leaks = plugin_audit(name, NULL, NULL);
+    uint32_t reclaimed = plugin_reclaim(target);
+    uint32_t residual  = plugin_audit(name, NULL, NULL);
 
-    if(leaks_out != NULL)
-      *leaks_out = leaks;
+    if(report != NULL)
+    {
+      report->reclaimed = reclaimed;
+      report->residual  = residual;
+    }
 
-    if(leaks > 0)
+    if(reclaimed > 0)
       clam(CLAM_WARN, "plugin_audit",
-          "'%s': %u live reference(s) into its mapping after deinit(); "
-          "its teardown is incomplete and this dlclose may dangle",
-          name, leaks);
+          "'%s': deinit() left %u registration(s); core reclaimed them",
+          name, reclaimed);
 
     else
-      clam(CLAM_INFO, "plugin_audit",
-          "'%s': teardown clean, no live references into its mapping",
-          name);
+      clam(CLAM_INFO, "plugin_audit", "'%s': deinit() complete", name);
+
+    // Class B is nobody's default: a running task, an in-flight request
+    // or a bound vtable cannot be cancelled centrally without inventing
+    // a policy. What is left here genuinely dangles.
+    if(residual > 0)
+      clam(CLAM_WARN, "plugin_audit",
+          "'%s': %u reference(s) core cannot reclaim (tasks, requests, "
+          "drivers) remain; this dlclose may dangle", name, residual);
   }
 
   // Remove from list.
@@ -547,8 +549,11 @@ plugin_init_all(void)
       {
         const plugin_kv_entry_t *e = &p->desc->kv_schema[i];
 
-        if(kv_register(e->key, e->type, e->default_val, e->cb, NULL,
-            e->help) == SUCCESS && e->nl != NULL)
+        // The schema entry lives in the plugin's .rodata, so it is both
+        // the declaration that owns the key and a valid address inside
+        // the mapping core must reclaim it from.
+        if(kv_register_owned(e->key, e->type, e->default_val, e->cb, NULL,
+            e->help, e) == SUCCESS && e->nl != NULL)
           kv_register_nl(e->key, e->nl);
       }
 
@@ -963,6 +968,40 @@ plugin_owns_ptr(const char *plugin_name, const void *ptr)
   return((uintptr_t)ptr >= map.lo && (uintptr_t)ptr < map.hi);
 }
 
+// Drop every Class-A registration still owned by `target` — the ones
+// core can define a correct default for, because dropping a pure
+// registry entry is order-independent and cannot be more wrong than
+// leaving it pointing at an unmapped object (root TODO.md §PLIFE-3).
+// Runs after deinit(), so what it finds is what the plugin did not
+// clean up itself.
+// returns: number of registrations reclaimed (0 == the plugin tore
+// itself down)
+static uint32_t
+plugin_reclaim(const plugin_rec_t *target)
+{
+  plugin_map_t map;
+  uint32_t     n = 0;
+
+  // Synthetic core providers carry no mapping; nothing to reclaim.
+  if(target == NULL || target->handle == NULL)
+    return(0);
+
+  if(plugin_map_of(target, &map) != SUCCESS)
+  {
+    clam(CLAM_WARN, "plugin_reclaim",
+        "'%s': cannot resolve its mapping; nothing reclaimed",
+        target->desc->name);
+    return(0);
+  }
+
+  n += cmd_reclaim_owned(map.lo, map.hi);
+  n += kv_reclaim_owned(map.lo, map.hi);
+  n += clam_reclaim_owned(map.lo, map.hi);
+  n += bot_reclaim_contributors_owned(map.lo, map.hi);
+
+  return(n);
+}
+
 typedef struct
 {
   plugin_map_t map;
@@ -1218,8 +1257,10 @@ plugin_kv_group_register(const plugin_kv_group_t *group, ...)
 
     snprintf(key, sizeof(key), "%s%s", prefix, e->key);
 
-    if(kv_register(key, e->type, e->default_val, e->cb, NULL,
-        e->help) == SUCCESS)
+    // Owned by the group declaration, not by this loop — see
+    // kv_register_owned().
+    if(kv_register_owned(key, e->type, e->default_val, e->cb, NULL,
+        e->help, e) == SUCCESS)
       registered++;
   }
 
@@ -2164,9 +2205,9 @@ plugin_cmd_audit(const cmd_ctx_t *ctx)
 static void
 plugin_cmd_unload(const cmd_ctx_t *ctx)
 {
-  const char *name  = ctx->parsed->argv[0];
-  uint32_t    leaks = 0;
-  char        buf[PLUGIN_NAME_SZ * 2 + 256];
+  const char            *name = ctx->parsed->argv[0];
+  plugin_unload_report_t report;
+  char                   buf[PLUGIN_NAME_SZ * 2 + 256];
 
   // Check if loaded.
   const plugin_desc_t *pd = plugin_find(name);
@@ -2233,8 +2274,9 @@ plugin_cmd_unload(const cmd_ctx_t *ctx)
     }
   }
 
-  // Unload (handles stop, deinit, dlclose, and the teardown audit).
-  if(plugin_unload(name, &leaks) != SUCCESS)
+  // Unload (handles stop, deinit, the Class-A reclamation, the residual
+  // audit, and dlclose).
+  if(plugin_unload(name, &report) != SUCCESS)
   {
     snprintf(buf, sizeof(buf), CLR_RED "failed to unload" CLR_RESET " "
         CLR_BOLD "%s" CLR_RESET, name);
@@ -2242,16 +2284,26 @@ plugin_cmd_unload(const cmd_ctx_t *ctx)
     return;
   }
 
-  // The audit runs on every unload, not on request. Saying "unloaded"
-  // and nothing else would be a lie when the plugin left N pointers in
-  // an address space that no longer exists.
-  if(leaks > 0)
+  // Both numbers run on every unload, not on request, and they say
+  // different things: what core tidied up, and what nobody could.
+  if(report.residual > 0)
   {
     snprintf(buf, sizeof(buf), CLR_GREEN "unloaded" CLR_RESET " "
-        CLR_BOLD "%s" CLR_RESET " — " CLR_YELLOW "%u live reference(s)"
-        CLR_RESET " remained after its deinit(); those pointers now "
-        "dangle. Reload it, then /plugin audit %s for the list.",
-        name, leaks, name);
+        CLR_BOLD "%s" CLR_RESET " — " CLR_YELLOW "%u reference(s)"
+        CLR_RESET " core cannot reclaim (tasks, requests, drivers) "
+        "remained after its deinit(); those pointers now dangle. "
+        "Reload it, then /plugin audit %s for the list.",
+        name, report.residual, name);
+    cmd_reply(ctx, buf);
+    return;
+  }
+
+  if(report.reclaimed > 0)
+  {
+    snprintf(buf, sizeof(buf), CLR_GREEN "unloaded" CLR_RESET " "
+        CLR_BOLD "%s" CLR_RESET " — its deinit() left " CLR_YELLOW "%u"
+        CLR_RESET " registration(s), reclaimed by core",
+        name, report.reclaimed);
     cmd_reply(ctx, buf);
     return;
   }

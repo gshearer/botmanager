@@ -65,6 +65,18 @@ typedef void (*kv_cb_t)(const char *key, void *data);
 bool kv_register(const char *key, kv_type_t type, const char *default_val,
     kv_cb_t cb, void *cb_data, const char *help);
 
+// Same registration, with ownership stated rather than inferred. The
+// public form above attributes the entry to its call site, which is what
+// a plugin registering its own key wants; this form is for core code
+// registering a key *on a plugin's behalf* (the loader's kv_schema pass,
+// plugin_kv_group_register, the per-bot instance schemas), where the
+// call site is core's and the owner is the plugin whose declaration
+// supplied the cb/help pointers. `owner_pc` is any address inside that
+// plugin's mapping -- the schema entry itself is the natural one.
+bool kv_register_owned(const char *key, kv_type_t type,
+    const char *default_val, kv_cb_t cb, void *cb_data, const char *help,
+    const void *owner_pc);
+
 // Returns 0 for missing or type-mismatched keys.
 int64_t kv_get_int(const char *key);
 
@@ -132,11 +144,14 @@ bool kv_delete(const char *key);
 // up. Returns SUCCESS if the entry existed, FAIL otherwise.
 bool kv_unregister(const char *key);
 
-// Bulk version of kv_unregister — drops every entry whose key starts
-// with `prefix` (and any NL responders attached to those keys). Used
-// by plugin_unload to remove all plugin-owned cb/help pointers before
-// dlclose. Returns the number of entries removed.
-uint32_t kv_unregister_prefix(const char *prefix);
+// Drop every entry registered by code inside the address range [lo,hi) --
+// one loaded object's mapping -- along with any NL responder whose hint
+// lives in that same range. KV entries are Class A (see root TODO.md
+// §PLIFE-3): core reclaims whatever a plugin's deinit() left, because a
+// retained cb / help pointer into an unmapped .so is a crash, and the
+// persisted row survives to rehydrate the key on reload.
+// Returns the number of entries removed.
+uint32_t kv_reclaim_owned(uintptr_t lo, uintptr_t hi);
 
 const char *kv_type_name(kv_type_t type);
 
@@ -237,6 +252,7 @@ typedef struct kv_entry
   kv_cb_t          cb;
   void            *cb_data;
   const char      *help;     // human-readable help (static, may be NULL)
+  const void      *owner_pc; // registration call site; identifies the owning object
   bool             dirty;
   bool             secret;   // value redacted from non-admin readers
   struct kv_entry *next;     // hash chain

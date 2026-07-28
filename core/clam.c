@@ -183,12 +183,14 @@ clam_subscribe(const char *name, uint8_t sev, const char *regex,
     clam_cb_t cb)
 {
   clam_sub_t *s;
+  const void *owner_pc = __builtin_return_address(0);
 
   pthread_mutex_lock(&clam_mutex);
 
   s = sub_get();
   s->sev = sev;
   s->cb = cb;
+  s->owner_pc = owner_pc;
   strncpy(s->name, name, CLAM_SUB_NAME_SZ - 1);
 
   if(regex != NULL && regex[0] != '\0')
@@ -259,6 +261,45 @@ clam_audit_iterate(clam_audit_cb_t cb, void *data)
     cb(s->name, "cb", fn_addr(&s->cb), data);
 
   pthread_mutex_unlock(&clam_mutex);
+}
+
+uint32_t
+clam_reclaim_owned(uintptr_t lo, uintptr_t hi)
+{
+  clam_sub_t **pp;
+  uint32_t     removed = 0;
+
+  if(lo >= hi)
+    return(0);
+
+  pthread_mutex_lock(&clam_mutex);
+
+  pp = &clam_subs;
+
+  while(*pp != NULL)
+  {
+    clam_sub_t *s  = *pp;
+    uintptr_t   pc = (uintptr_t)s->owner_pc;
+
+    if(pc >= lo && pc < hi)
+    {
+      *pp = s->next;
+      clam_sub_count--;
+      sub_put(s);
+      removed++;
+    }
+
+    else
+      pp = &s->next;
+  }
+
+  pthread_mutex_unlock(&clam_mutex);
+
+  // Logged after the unlock: clam() takes this same non-recursive mutex.
+  if(removed > 0)
+    clam(CLAM_DEBUG, "clam_reclaim", "reclaimed %u subscriber(s)", removed);
+
+  return(removed);
 }
 
 // Initialize CLAM subsystem.

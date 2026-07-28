@@ -212,6 +212,20 @@ bool cmd_register(const char *module, const char *name,
 // returns: number of definitions removed; 0 if the path does not resolve
 uint32_t cmd_unregister_path(const char *path);
 
+// Drop every definition registered by code inside the address range
+// [lo,hi) — one loaded object's mapping. Commands are Class A (see root
+// TODO.md §PLIFE-3): dropping them is always correct and
+// order-independent, so core reclaims whatever a plugin's deinit() left
+// behind rather than letting it dangle past dlclose.
+//
+// Ownership is the return address captured at cmd_register(), not
+// cmd_def_t.module — a module label is chosen by the registrant and
+// several plugins register under names that are not their own.
+// A subtree is reclaimed whole; a child owned by a *different* object
+// is a layering bug and is reported, not silently kept.
+// returns: number of definitions removed.
+uint32_t cmd_reclaim_owned(uintptr_t lo, uintptr_t hi);
+
 // When /help resolves to this command and there are remaining tokens
 // that don't match children, the extender is called instead of showing
 // "unknown command". child NULL means root-level.
@@ -418,6 +432,7 @@ struct cmd_def
   uint8_t     arg_count;                // number of entries in arg_desc
   const char *const *kind_filter;       // NULL-terminated kind array; NULL = kind-agnostic
   const cmd_nl_t *nl;                   // NL hint (static, caller-owned) or NULL
+  const void *owner_pc;                 // cmd_register() call site; identifies the owning object
   cmd_def_t  *parent;                   // parent command (NULL for root)
   cmd_def_t  *children;                 // first child (subcommand)
   cmd_def_t  *sibling;                  // next sibling in parent's child list
