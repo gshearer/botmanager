@@ -346,6 +346,7 @@ uint32_t userns_get_user_id(const userns_t *ns, const char *username);
 
 #include "common.h"
 #include "bot.h"
+#include "clam.h"
 #include "cmd.h"
 #include "colors.h"
 #include "db.h"
@@ -356,6 +357,7 @@ uint32_t userns_get_user_id(const userns_t *ns, const char *username);
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <strings.h>
 
 typedef struct
 {

@@ -20,6 +20,15 @@ admin_validate_level(const char *str)
   return v <= 65535;
 }
 
+// The literal verb in `/set user <username> pass <password>`. It sits
+// between two variable arguments, so it cannot be a tree child — the
+// resolver only matches a child in the first token after the parent.
+static bool
+set_user_verb_check(const char *str)
+{
+  return strcasecmp(str, "pass") == 0;
+}
+
 // Namespace resolution
 
 userns_t *
@@ -128,10 +137,19 @@ static const cmd_arg_desc_t ad_user_delns[] = {
   { "namespace", CMD_ARG_ALNUM, CMD_ARG_REQUIRED, USERNS_NAME_SZ, NULL },
 };
 
-// /set user subcommand argument descriptors.
-static const cmd_arg_desc_t ad_set_user_pass[] = {
+// Self-service password change, on the /user side of the tree.
+static const cmd_arg_desc_t ad_user_password[] = {
   { "oldpassword", CMD_ARG_NONE, CMD_ARG_REQUIRED,                0, NULL },
   { "newpassword", CMD_ARG_NONE, CMD_ARG_REQUIRED | CMD_ARG_REST, 0, NULL },
+};
+
+// /set user <username> pass <password> — administrative reset. The
+// middle "pass" token is an argument, not a subcommand; see
+// set_user_verb_check.
+static const cmd_arg_desc_t ad_set_user[] = {
+  { "username", CMD_ARG_ALNUM,  CMD_ARG_REQUIRED,                USERNS_USER_SZ, NULL },
+  { "pass",     CMD_ARG_CUSTOM, CMD_ARG_REQUIRED,                8,              set_user_verb_check },
+  { "password", CMD_ARG_NONE,   CMD_ARG_REQUIRED | CMD_ARG_REST, 0,              NULL },
 };
 
 static const cmd_arg_desc_t ad_set_user_groupdesc[] = {
@@ -965,24 +983,65 @@ cmd_show_group(const cmd_ctx_t *ctx)
   }
 }
 
-// /set user — parent for self-service user settings
+// /set user <username> pass <password> — administrative reset. The
+// caller's admin rights are the authority, so no old password is
+// required; this is the lockout-recovery path for an account whose
+// holder cannot log in. The self-service twin is `user password`.
 
 static void
-cmd_set_user_parent(const cmd_ctx_t *ctx)
+cmd_set_user(const cmd_ctx_t *ctx)
 {
-  cmd_reply(ctx, "usage: /set user <subcommand>");
-  cmd_reply(ctx, "  pass <oldpassword> <newpassword> — change your password");
-  cmd_reply(ctx, "  groupdesc <group> <description> — set group description");
+  char        buf[USERNS_USER_SZ + 32];
+  userns_t   *ns;
+  const char *username;
+  const char *password;
+
+  ns = userns_session_resolve(ctx);
+
+  if(ns == NULL)
+    return;
+
+  username = ctx->parsed->argv[0];
+  password = ctx->parsed->argv[2];
+
+  if(!userns_user_exists(ns, username))
+  {
+    snprintf(buf, sizeof(buf), "user not found: %s", username);
+    cmd_reply(ctx, buf);
+    return;
+  }
+
+  if(userns_password_check(password) != SUCCESS)
+  {
+    cmd_reply(ctx, "password does not meet the password policy");
+    return;
+  }
+
+  if(userns_user_reset_password(ns, username, password) != SUCCESS)
+  {
+    cmd_reply(ctx, "failed to reset password");
+    return;
+  }
+
+  // userns_user_reset_password logs the subject; the actor is only
+  // knowable here, and an admin resetting someone else's credential is
+  // exactly the event an audit reader wants attributed.
+  clam(CLAM_INFO, "set user pass",
+      "'%s' reset the password for '%s' in '%s'",
+      ctx->username != NULL ? ctx->username : "(unknown)",
+      username, ns->name);
+
+  snprintf(buf, sizeof(buf), "password reset for %s", username);
+  cmd_reply(ctx, buf);
 }
 
-// /set user pass <oldpassword> <newpassword> — change the authenticated
-// user's own password. The current password must be supplied and verify:
-// an authenticated session alone is not sufficient authority to rotate a
-// credential. Administrative reset without the old password lives in
-// /user add and the register command, not here.
+// user password <oldpassword> <newpassword> — change your own password.
+// The current password must be supplied and verify: an authenticated
+// session alone is not sufficient authority to rotate a credential.
+// Private-scoped, because both passwords travel in the command line.
 
 static void
-cmd_set_user_pass(const cmd_ctx_t *ctx)
+cmd_user_password(const cmd_ctx_t *ctx)
 {
   userns_t   *ns;
   const char *username;
@@ -1067,7 +1126,7 @@ userns_register_commands(void)
       "User and group management",
       "Manages namespaces, users, groups, MFA patterns, and permissions.\n"
       "Set the working namespace with /user cd <namespace>.\n"
-      "Subcommands: cd addns delns add del addmfa delmfa\n"
+      "Subcommands: cd addns delns add del password addmfa delmfa\n"
       "autoidentify addgroup delgroup grant revoke",
       USERNS_GROUP_ADMIN, 100, CMD_SCOPE_ANY, METHOD_T_ANY,
       cmd_user_parent, NULL, NULL, "u", NULL, 0, NULL, NULL);
@@ -1115,6 +1174,19 @@ userns_register_commands(void)
       "cannot be undone.",
       USERNS_GROUP_ADMIN, 100, CMD_SCOPE_ANY, METHOD_T_ANY,
       cmd_user_del, NULL, "user", NULL, ad_user_del, 1, NULL, NULL);
+
+  // Self-service. Every other /user child is admin-gated; permission is
+  // checked on the resolved leaf, not the parent chain, so an ordinary
+  // user reaches this one and nothing else under /user.
+  cmd_register("userns", "password",
+      "user password <oldpassword> <newpassword>",
+      "Change your own password",
+      "Changes the password of the currently authenticated user. The\n"
+      "current password must be supplied and verify, and the new one\n"
+      "must meet the password policy. Private messages only, since\n"
+      "both passwords appear in the command line.",
+      USERNS_GROUP_USER, 0, CMD_SCOPE_PRIVATE, METHOD_T_ANY,
+      cmd_user_password, NULL, "user", NULL, ad_user_password, 2, NULL, NULL);
 
   cmd_register("userns", "addmfa",
       "user addmfa <username> <pattern>",
@@ -1210,23 +1282,21 @@ userns_register_commands(void)
       USERNS_GROUP_ADMIN, 100, CMD_SCOPE_ANY, METHOD_T_ANY,
       cmd_show_group, NULL, "show", "gr", ad_show_group, 1, NULL, NULL);
 
-  // /set user — parent for self-service user settings.
+  // /set user — administrative user settings. Unlike the rest of the
+  // tree this command carries its own arguments as well as a child:
+  // `set user <username> pass <password>` puts a variable in the slot
+  // where the resolver looks for a subcommand, so anything that is not
+  // the literal "groupdesc" falls through to the argument parser.
   cmd_register("userns", "user",
-      "set user <subcommand> ...",
-      "User self-service settings",
-      "Change your own password or update group descriptions.\n"
-      "Subcommands: pass, groupdesc",
-      USERNS_GROUP_USER, 0, CMD_SCOPE_ANY, METHOD_T_ANY,
-      cmd_set_user_parent, NULL, "set", "u", NULL, 0, NULL, NULL);
-
-  cmd_register("userns", "pass",
-      "set user pass <oldpassword> <newpassword>",
-      "Change your password",
-      "Changes the password for the currently authenticated user.\n"
-      "The current password must be supplied and verify, and the new\n"
-      "password must meet the password policy.",
-      USERNS_GROUP_USER, 0, CMD_SCOPE_ANY, METHOD_T_ANY,
-      cmd_set_user_pass, NULL, "set/user", NULL, ad_set_user_pass, 2, NULL, NULL);
+      "set user <username> pass <password>",
+      "Set a user's password",
+      "Resets another user's password without their old password, on\n"
+      "the authority of your admin rights. Use this to recover an\n"
+      "account whose holder is locked out; users change their own\n"
+      "password with /user password.\n"
+      "Subcommand: groupdesc",
+      USERNS_GROUP_ADMIN, 100, CMD_SCOPE_ANY, METHOD_T_ANY,
+      cmd_set_user, NULL, "set", "u", ad_set_user, 3, NULL, NULL);
 
   cmd_register("userns", "groupdesc",
       "set user groupdesc <group> <description>",

@@ -144,7 +144,7 @@ cmd_register_user(const cmd_ctx_t *ctx)
   if(ctx->username != NULL)
   {
     cmd_reply(ctx, "Already authenticated. Use "
-        "set user pass <oldpassword> <newpassword> "
+        "user password <oldpassword> <newpassword> "
         "to change your password.");
     return;
   }
