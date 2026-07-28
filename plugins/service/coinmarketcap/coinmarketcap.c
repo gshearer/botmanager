@@ -2,6 +2,7 @@
 // CoinMarketCap service plugin: JSON lookups against the CMC REST API.
 // Pure mechanism — no command surface. Consumers call the public API
 // in coinmarketcap_api.h via plugin_dlsym.
+#define _GNU_SOURCE
 #define CMC_INTERNAL
 #include "coinmarketcap.h"
 
@@ -167,18 +168,25 @@ cmc_cache_populate(struct json_object *data_arr)
 
 // Sort comparator
 
-// Per-thread sort parameters (set before qsort, read by comparator).
-static __thread uint8_t cmc_sort_col_tl;
-static __thread bool    cmc_sort_rev_tl;
+// PLIFE-5: these were two `__thread` scalars — the only thread-local
+// storage anywhere in the tree, and the one thing that could have made
+// this mapping unsafe to drop. qsort_r carries the same two values on
+// the stack, so the plugin now holds nothing that outlives a call.
+typedef struct
+{
+  uint8_t col;
+  bool    rev;
+} cmc_sort_ctx_t;
 
 static int
-cmc_coin_cmp(const void *a, const void *b)
+cmc_coin_cmp(const void *a, const void *b, void *arg)
 {
-  const cmc_coin_t *ca = (const cmc_coin_t *)a;
-  const cmc_coin_t *cb = (const cmc_coin_t *)b;
+  const cmc_coin_t     *ca  = (const cmc_coin_t *)a;
+  const cmc_coin_t     *cb  = (const cmc_coin_t *)b;
+  const cmc_sort_ctx_t *ctx = arg;
   int result = 0;
 
-  switch(cmc_sort_col_tl)
+  switch(ctx->col)
   {
     case COINMARKETCAP_SORT_RANK:
       result = (ca->cmc_rank > cb->cmc_rank) - (ca->cmc_rank < cb->cmc_rank);
@@ -219,7 +227,7 @@ cmc_coin_cmp(const void *a, const void *b)
       break;
   }
 
-  return(cmc_sort_rev_tl ? -result : result);
+  return(ctx->rev ? -result : result);
 }
 
 // Global JSON specs (unchanged shape).
@@ -786,9 +794,11 @@ coinmarketcap_get_listings(uint32_t limit, uint8_t sort_col, bool reverse,
 
   pthread_rwlock_unlock(&cmc_cache_rwl);
 
-  cmc_sort_col_tl = sort_col;
-  cmc_sort_rev_tl = reverse;
-  qsort(out_arr, n, sizeof(cmc_coin_t), cmc_coin_cmp);
+  {
+    cmc_sort_ctx_t ctx = { .col = sort_col, .rev = reverse };
+
+    qsort_r(out_arr, n, sizeof(cmc_coin_t), cmc_coin_cmp, &ctx);
+  }
 
   *out_count = n;
 

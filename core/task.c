@@ -231,12 +231,16 @@ task_add(const char *name, task_type_t type, uint8_t priority,
   return(t);
 }
 
-// Create and spawn a persistent task on a dedicated thread.
-task_t *
+// Create and spawn a persistent task on a dedicated thread. The handle
+// outlives the task_t, which persist_entry frees the moment the
+// callback returns — so a caller that wants to join must hold this,
+// never the pointer.
+task_handle_t
 task_add_persist(const char *name, uint8_t priority,
     task_cb_t cb, void *data)
 {
-  task_t *t = task_create(name, TASK_THREAD, priority, cb, data);
+  task_t       *t  = task_create(name, TASK_THREAD, priority, cb, data);
+  task_handle_t id = t->id;
 
   t->kind = TASK_PERSIST;
 
@@ -276,13 +280,20 @@ task_add_persist(const char *name, uint8_t priority,
     pthread_mutex_unlock(&task_lock);
 
     mem_free(t);
-    return(NULL);
+    return(TASK_HANDLE_NONE);
   }
 
   clam(CLAM_DEBUG, "task_add_persist", "'%s' spawned on dedicated thread",
       name);
 
-  return(t);
+  return(id);
+}
+
+// Wait for a persist task's thread to leave its callback and exit.
+bool
+task_persist_join(task_handle_t h, uint32_t timeout_ms)
+{
+  return(pool_join_persist(h, timeout_ms));
 }
 
 task_handle_t

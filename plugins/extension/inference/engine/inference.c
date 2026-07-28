@@ -48,14 +48,22 @@ inference_start(void)
 static bool
 inference_stop(void)
 {
-  // No active drain today; present for symmetry.
+  // PLIFE-5: stop the engine topping itself up. acquire's periodic
+  // ticks and llm's retry/negotiate re-arms both schedule callbacks
+  // that live in this plugin's .text, so until they are latched off
+  // the in-flight set has no reason to ever reach zero. Waiting for
+  // what is already in flight is core's quiescence barrier, not ours.
+  acquire_stop();
+  llm_stop();
+
   return(SUCCESS);
 }
 
 static void
 inference_deinit(void)
 {
-  // Reverse init order.
+  // Reverse init order. stop() has already run, so no subsystem is
+  // scheduling anything new by the time its state is freed.
   acquire_exit();
   knowledge_exit();
   llm_exit();

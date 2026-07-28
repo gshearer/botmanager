@@ -69,7 +69,12 @@ typedef enum
 
 void    kr_ws_init  (void);
 void    kr_ws_start (void);
-void    kr_ws_stop  (void);
+
+// kr_ws_stop signals the reader and *joins* it, up to KR_WS_STOP_WAIT_MS.
+// FAIL means the thread is still inside this plugin's mapping, which
+// makes the unload unsafe — it is propagated out of the plugin's stop()
+// rather than logged and swallowed.
+bool    kr_ws_stop  (void);
 void    kr_ws_deinit(void);
 
 // Human-readable name for a session state (logging).

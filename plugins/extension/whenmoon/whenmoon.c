@@ -776,6 +776,28 @@ whenmoon_start(void)
   return(SUCCESS);
 }
 
+// PLIFE-5: whenmoon's Class-B holding that core cannot reason about. A
+// running sweep has worker threads inside this plugin's .text and has
+// cached strategy function pointers for the length of an iteration —
+// no default teardown makes unmapping that safe, so the refusal is
+// ours to make. Everything else whenmoon owns (periodic tasks, the
+// supervisor tick, marketwatch pairs) is cancelled and drained on the
+// deinit path below.
+static bool
+whenmoon_stop(void)
+{
+  uint32_t sweeps = wm_bt_sweep_active_count();
+
+  if(sweeps > 0)
+  {
+    clam(CLAM_WARN, WHENMOON_CTX,
+        "stop refused: %u backtest sweep(s) still running", sweeps);
+    return(FAIL);
+  }
+
+  return(SUCCESS);
+}
+
 static void
 whenmoon_deinit(void)
 {
@@ -820,7 +842,7 @@ const plugin_desc_t bm_plugin_desc = {
   .kv_inst_schema_count = 0,
   .init                 = whenmoon_init,
   .start                = whenmoon_start,
-  .stop                 = NULL,
+  .stop                 = whenmoon_stop,
   .deinit               = whenmoon_deinit,
   .ext                  = NULL,
 };

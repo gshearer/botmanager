@@ -166,9 +166,10 @@ gem_stop(void)
     gem_symbols_task = TASK_HANDLE_NONE;
   }
 
-  gem_ws_stop();
-
-  return(SUCCESS);
+  // The reader threads are the plugin's only Class-B holding. If one
+  // will not come home, say so — an unload past this point unmaps the
+  // code it is standing in.
+  return(gem_ws_stop());
 }
 
 static void

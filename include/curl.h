@@ -302,7 +302,7 @@ typedef struct
 } curl_cfg_t;
 
 static CURLM             *curl_multi_handle = NULL;
-static task_t            *curl_task         = NULL;
+static task_handle_t      curl_task         = TASK_HANDLE_NONE;
 static int                curl_wake_fd      = -1;
 static bool               curl_ready        = false;
 static curl_cfg_t         curl_cfg;

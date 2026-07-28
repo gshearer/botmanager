@@ -25,7 +25,7 @@
 
 // Module state
 
-bool                         acquire_ready = false;
+bool                         acquire_ready    = false;
 acquire_cfg_t                acquire_cfg;
 pthread_mutex_t              acquire_cfg_mutex;
 
@@ -68,6 +68,7 @@ static uint32_t              acquire_dedup_next = 0;    // LRU write cursor
 // acquire_ready in the callback covers any in-flight tick that
 // started before cancel.
 static task_handle_t         acquire_sweep_task = TASK_HANDLE_NONE;
+static bool                  acquire_stopping   = false;
 
 // Forward declarations
 
@@ -648,7 +649,7 @@ acquire_register_topics(const char *bot_name,
   // Spawn the periodic task outside the rwlock — task_add_periodic
   // may allocate and lock task_lock internally, and we want the
   // smallest possible critical section.
-  if(task_ref == TASK_HANDLE_NONE)
+  if(task_ref == TASK_HANDLE_NONE && !acquire_stopping)
   {
     char tname[TASK_NAME_SZ];
 
@@ -904,10 +905,40 @@ acquire_register_config(void)
   if(sweep_interval < ACQUIRE_MIN_SWEEP_INTERVAL_SECS)
     sweep_interval = ACQUIRE_MIN_SWEEP_INTERVAL_SECS;
 
-  if(acquire_sweep_task == TASK_HANDLE_NONE)
+  if(acquire_sweep_task == TASK_HANDLE_NONE && !acquire_stopping)
     acquire_sweep_task = task_add_periodic("acquire.sweep",
         TASK_ANY, 200, sweep_interval * 1000,
         acquire_sweep_tick, NULL);
+}
+
+void
+acquire_stop(void)
+{
+  acquire_bot_entry_t *e;
+
+  if(!acquire_ready)
+    return;
+
+  acquire_stopping = true;
+
+  if(acquire_sweep_task != TASK_HANDLE_NONE)
+  {
+    task_cancel(acquire_sweep_task);
+    acquire_sweep_task = TASK_HANDLE_NONE;
+  }
+
+  pthread_rwlock_wrlock(&acquire_entries_lock);
+
+  for(e = acquire_entries; e != NULL; e = e->next)
+  {
+    if(e->task != TASK_HANDLE_NONE)
+    {
+      task_cancel(e->task);
+      e->task = TASK_HANDLE_NONE;
+    }
+  }
+
+  pthread_rwlock_unlock(&acquire_entries_lock);
 }
 
 void
@@ -917,10 +948,13 @@ acquire_exit(void)
   if(!acquire_ready)
     return;
 
-  acquire_ready = false;
+  acquire_ready    = false;
+  acquire_stopping = false;
 
-  // Workers are already joined by pool_exit; safe to free entries
-  // without worrying about racing task callbacks.
+  // acquire_stop() has already cancelled every tick. task_cancel does
+  // not block on a callback that is mid-flight, so the entries below
+  // are freed under the same rwlock the tick takes — and the residual
+  // wait belongs to core's quiescence barrier, not here.
   pthread_rwlock_wrlock(&acquire_entries_lock);
 
   e = acquire_entries;

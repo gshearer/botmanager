@@ -1462,7 +1462,7 @@ sock_init(void)
     sock_workers[i].task = task_add_persist(name, 50,
         sock_epoll_task, &sock_workers[i]);
 
-    if(sock_workers[i].task == NULL)
+    if(sock_workers[i].task == TASK_HANDLE_NONE)
     {
       clam(CLAM_FATAL, "sock", "failed to spawn epoll worker %u", i);
       return;
@@ -1541,7 +1541,7 @@ sock_register_config(void)
     sock_workers[i].task = task_add_persist(name, 50,
         sock_epoll_task, &sock_workers[i]);
 
-    if(sock_workers[i].task == NULL)
+    if(sock_workers[i].task == TASK_HANDLE_NONE)
     {
       clam(CLAM_WARN, "sock", "failed to spawn epoll worker %u", i);
       break;

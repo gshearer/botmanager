@@ -109,8 +109,18 @@ task_t *task_add(const char *name, task_type_t type, uint8_t priority,
 
 // Create and spawn a persistent task on a dedicated thread.
 // The callback must contain its own loop and poll pool_shutting_down().
-task_t *task_add_persist(const char *name, uint8_t priority,
+// Returns a handle, or TASK_HANDLE_NONE on spawn failure. The task_t is
+// freed the instant the callback returns, so the handle — not a
+// pointer — is what a caller keeps.
+task_handle_t task_add_persist(const char *name, uint8_t priority,
     task_cb_t cb, void *data);
+
+// Block until the thread running persist task `h` has left the callback
+// and exited, or until timeout_ms elapses; true if it is gone. A
+// plugin's stop() must call this before its own code can be unmapped:
+// the callback body lives in the plugin's mapping and signalling it to
+// finish says nothing about whether it has actually returned.
+bool task_persist_join(task_handle_t h, uint32_t timeout_ms);
 
 // Create and submit a periodic task that runs on an interval.
 // Callback sets TASK_ENDED to mean "iteration done, reschedule".

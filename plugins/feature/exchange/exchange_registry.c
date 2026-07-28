@@ -89,12 +89,40 @@ exchange_registry_add(const char *name,
   if(nlen == 0 || nlen >= sizeof(((exchange_t *)0)->name))
     return(FAIL);
 
-  // Reject duplicates.
-  if(exchange_find(name) != NULL)
+  // A live duplicate is an error; a tombstone is not. exchange_-
+  // unregister leaves the entry in place deliberately (see there), so a
+  // plugin that unloads and loads again must be able to take its own
+  // name back — otherwise the second `/plugin load coinbase` starts
+  // with no dispatch and the daemon needs a restart after all.
+  e = exchange_find(name);
+
+  if(e != NULL)
   {
-    clam(CLAM_WARN, EXCHANGE_CTX,
-        "register '%s' rejected: already registered", name);
-    return(FAIL);
+    if(!e->dead)
+    {
+      clam(CLAM_WARN, EXCHANGE_CTX,
+          "register '%s' rejected: already registered", name);
+      return(FAIL);
+    }
+
+    pthread_mutex_lock(&e->lock);
+
+    e->vt                       = vt;
+    e->dead                     = false;
+    e->breaker_consec_fails     = 0;
+    e->breaker_tripped_until_ms = 0;
+
+    exchange_limiter_init(&e->limiter, vt->advertised_rps,
+        vt->advertised_burst);
+
+    pthread_mutex_unlock(&e->lock);
+
+    clam(CLAM_INFO, EXCHANGE_CTX,
+        "re-registered '%s' rps=%u burst=%u",
+        e->name, (unsigned)vt->advertised_rps,
+        (unsigned)vt->advertised_burst);
+
+    return(SUCCESS);
   }
 
   e = mem_alloc("exchange.reg", "exch", sizeof(*e));
@@ -158,6 +186,13 @@ exchange_register(const char *name, const exchange_protocol_vtable_t *vt)
 // Mark dead + drain the queue: every pending request is surfaced as
 // failure. Caller is the protocol plugin's `deinit`, which by contract
 // runs after all consumers have stopped — no new requests should arrive.
+//
+// The entry itself outlives the caller on purpose: a straggler holding
+// an `exchange_t *` keeps a valid pointer, and the name comes back to
+// the same plugin on reload (exchange_registry_add revives it). What
+// must NOT outlive the caller is `vt` — every function pointer in it
+// lands in a mapping that is about to be unmapped — so it is dropped
+// here, and every dispatch path already refuses a NULL vtable.
 void
 exchange_unregister(const char *name)
 {
@@ -174,9 +209,10 @@ exchange_unregister(const char *name)
 
   pthread_mutex_lock(&e->lock);
 
-  e->dead   = true;
-  q_head    = e->q_head;
-  e->q_head = NULL;
+  e->dead    = true;
+  e->vt      = NULL;
+  q_head     = e->q_head;
+  e->q_head  = NULL;
   e->q_count = 0;
 
   {

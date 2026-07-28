@@ -1983,11 +1983,41 @@ irc_start(void)
   return(SUCCESS);
 }
 
+// PLIFE-5 Class-B audit: count method instances still holding our
+// vtable. Runs under method_mutex — count and nothing else.
+static void
+irc_count_bound_cb(const char *subject, const char *field, const void *ptr,
+    void *data)
+{
+  uint32_t *n = data;
+
+  (void)subject;
+
+  if(strcmp(field, "driver") == 0 && ptr == (const void *)&irc_driver)
+    (*n)++;
+}
+
 static bool
 irc_stop(void)
 {
+  uint32_t bound = 0;
+
   // Per-instance disconnect is handled by the driver disconnect
-  // callback when bot_stop() or bot_destroy() is called.
+  // callback when bot_stop() or bot_destroy() is called — and that is
+  // also what cancels a pending reconnect task. So a surviving instance
+  // means both a vtable pointer into our .text and, possibly, a
+  // deferred task still armed. Core's bot-binding guard does not cover
+  // us: irc_driver is a method_driver_t, not a bot_driver_t.
+  method_audit_iterate(irc_count_bound_cb, &bound);
+
+  if(bound > 0)
+  {
+    clam(CLAM_WARN, "irc",
+        "stop refused: %u method instance(s) still bound to the irc "
+        "driver; stop and destroy the bot first", bound);
+    return(FAIL);
+  }
+
   return(SUCCESS);
 }
 

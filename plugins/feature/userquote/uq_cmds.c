@@ -368,15 +368,11 @@ uq_commands_register(void)
   return(SUCCESS);
 }
 
-// Teardown note: the command system has no parent-aware unregister, and
-// unregistering the `add` / `del` leaves by bare name would be ambiguous
-// (many plugins register commands of those names). Like the whenmoon
-// feature, we therefore leave the tree in place; it is freed wholesale by
-// cmd_exit() at daemon shutdown. Hot-unload is not supported — reload via
-// restart. Kept as a named hook so the lifecycle reads symmetrically.
+// One path takes the whole book: `quote` and its `add` / `del` leaves,
+// freed depth-first. The bare names that used to make this ambiguous are
+// no longer what we address the tree by.
 void
 uq_commands_unregister(void)
 {
-  clam(CLAM_DEBUG, UQ_CTX,
-      "quote command tree left registered (freed at shutdown)");
+  cmd_unregister_path("quote");
 }

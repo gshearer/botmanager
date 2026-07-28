@@ -821,7 +821,7 @@ void
 botmanctl_register_method(void)
 {
   method_inst_t *inst;
-  task_t *t;
+  task_handle_t t;
 
   inst = method_register(&bctl_driver, "botmanctl");
   if(inst == NULL)
@@ -844,7 +844,7 @@ botmanctl_register_method(void)
 
   // Start the persist task.
   t = task_add_persist("botmanctl", 0, bctl_task_cb, NULL);
-  if(t == NULL)
+  if(t == TASK_HANDLE_NONE)
   {
     clam(CLAM_WARN, "botmanctl", "failed to start listener task");
     method_unregister("botmanctl");

@@ -81,9 +81,10 @@ cb_start(void)
 static bool
 cb_stop(void)
 {
-  cb_ws_stop();
-
-  return(SUCCESS);
+  // The reader thread is the plugin's only Class-B holding. If it will
+  // not come home, say so — an unload past this point unmaps the code
+  // it is standing in.
+  return(cb_ws_stop());
 }
 
 static void

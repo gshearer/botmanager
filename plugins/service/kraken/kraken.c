@@ -177,9 +177,10 @@ kr_stop(void)
     kr_assetpairs_task = TASK_HANDLE_NONE;
   }
 
-  kr_ws_stop();
-
-  return(SUCCESS);
+  // The reader thread is the plugin's only Class-B holding. If it will
+  // not come home, say so — an unload past this point unmaps the code
+  // it is standing in.
+  return(kr_ws_stop());
 }
 
 static void

@@ -210,12 +210,16 @@ bool    cb_exchange_register_vtable(void);
 // Lifecycle. cb_ws_init prepares the session struct and subscribes to
 // the config knobs that force a reconnect; it does NOT spawn the reader
 // thread. cb_ws_start spawns the reader (latching the current value of
-// plugin.coinbase.ws_enabled), cb_ws_stop signals it to exit and blocks
-// up to CB_WS_STOP_WAIT_MS for a clean shutdown, and cb_ws_deinit frees
-// reassembly buffers + destroys the lock.
+// plugin.coinbase.ws_enabled), and cb_ws_deinit frees reassembly
+// buffers + destroys the lock.
+//
+// cb_ws_stop signals the reader and *joins* it, up to
+// CB_WS_STOP_WAIT_MS. FAIL means the thread is still inside this
+// plugin's mapping, which makes the unload unsafe — it is propagated
+// out of the plugin's stop() rather than logged and swallowed.
 void    cb_ws_init(void);
 void    cb_ws_start(void);
-void    cb_ws_stop(void);
+bool    cb_ws_stop(void);
 void    cb_ws_deinit(void);
 
 // Send a UTF-8 text frame on the WebSocket. Thread-safe. Returns FAIL

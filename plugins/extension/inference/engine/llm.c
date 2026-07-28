@@ -19,6 +19,7 @@
 // Module state
 
 static bool             llm_ready = false;
+static bool             llm_stopping = false;
 llm_cfg_t               llm_cfg;
 
 // Freelist.
@@ -2312,7 +2313,8 @@ llm_curl_done_cb(const curl_response_t *resp)
     if(llm_negotiate_parse(resp->body, resp->body_len, &d) == SUCCESS
         && llm_is_builder_field(d.field)
         && llm_directive_is_new(req, &d)
-        && req->negotiation_attempts < LLM_NEGOTIATION_CAP)
+        && req->negotiation_attempts < LLM_NEGOTIATION_CAP
+        && !llm_stopping)
     {
       task_handle_t nt;
 
@@ -2349,7 +2351,8 @@ llm_curl_done_cb(const curl_response_t *resp)
   if(!ok
       && req->attempt + 1 < llm_cfg.max_retries
       && llm_is_retryable(resp->status, resp->curl_code)
-      && (!req->streaming || req->bytes_seen == 0))
+      && (!req->streaming || req->bytes_seen == 0)
+      && !llm_stopping)
   {
     uint32_t backoff;
     task_handle_t t;
@@ -2846,16 +2849,27 @@ llm_register_config(void)
 }
 
 void
+llm_stop(void)
+{
+  if(!llm_ready)
+    return;
+
+  llm_stopping = true;
+}
+
+void
 llm_exit(void)
 {
   uint32_t leaked;
   if(!llm_ready)
     return;
 
-  llm_ready = false;
+  llm_ready    = false;
+  llm_stopping = false;
 
-  // Drain in-flight list (the curl worker is already joined; any
-  // requests left here are leaked callbacks we cannot deliver).
+  // Drain the in-flight list. Anything still here has a done-callback
+  // in this plugin's .text that we can no longer deliver — which is
+  // why llm_stop() ran first and why the count is worth naming.
   pthread_mutex_lock(&llm_active_mutex);
 
   leaked = llm_active_count;

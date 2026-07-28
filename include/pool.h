@@ -4,8 +4,7 @@
 #include <stdbool.h>
 #include <stdint.h>
 
-// Defined in task.h.
-typedef struct task task_t;
+#include "task.h"
 
 typedef struct
 {
@@ -42,6 +41,17 @@ bool pool_shutting_down(void);
 // immediately on its own thread, outside the elastic worker pool.
 bool pool_spawn_persist(task_t *t);
 
+// Block until the thread running persist task `id` has left the
+// callback and exited, or until `timeout_ms` elapses. Returns true once
+// the thread is joined — or immediately, if no live slot holds `id`.
+// Returns false on timeout, leaving the thread and its slot alone.
+//
+// Signalling a persist task is not enough for a plugin: the callback
+// body lives in the plugin's mapping, so `dlclose` before the thread
+// has actually returned unmaps the code under it. This is the join
+// that closes that window.
+bool pool_join_persist(task_handle_t id, uint32_t timeout_ms);
+
 // Joins all worker threads (elastic and persist) and frees resources.
 void pool_exit(void);
 
@@ -62,7 +72,8 @@ typedef enum
 {
   WORKER_UNUSED,              // slot available
   WORKER_RUNNING,             // thread is alive
-  WORKER_RETIRING             // thread exited, needs join
+  WORKER_RETIRING,            // thread exited, needs join
+  WORKER_JOINING              // a joiner owns this slot's thread
 } worker_state_t;
 
 typedef struct
@@ -74,6 +85,7 @@ typedef struct
   time_t         last_active;
   worker_state_t wstate;
   bool           idle;        // true while in task_wait
+  task_handle_t  task_id;     // persist slots only; what pool_join_persist matches
 } worker_t;
 
 typedef struct
@@ -108,6 +120,8 @@ static uint16_t  persist_count = 0;
 static bool  spawn_worker_locked(void);
 static void *worker_entry(void *arg);
 static void *persist_entry(void *arg);
+static void  persist_retire_self(void);
+static void  reap_persist_locked(void);
 
 #endif // POOL_INTERNAL
 

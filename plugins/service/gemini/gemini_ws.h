@@ -73,7 +73,12 @@ typedef enum
 
 void    gem_ws_init  (void);
 void    gem_ws_start (void);
-void    gem_ws_stop  (void);
+
+// gem_ws_stop signals both readers and *joins* them, up to
+// GEM_WS_STOP_WAIT_MS each. FAIL means a thread is still inside this
+// plugin's mapping, which makes the unload unsafe — it is propagated
+// out of the plugin's stop() rather than logged and swallowed.
+bool    gem_ws_stop  (void);
 void    gem_ws_deinit(void);
 
 // Human-readable name for a session state (logging).

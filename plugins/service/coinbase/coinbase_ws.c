@@ -34,12 +34,10 @@ typedef struct
   curl_socket_t   sockfd;
   cb_ws_state_t   state;
 
-  pthread_mutex_t lock;             // guards easy, state, rx_buf, thread_alive
+  pthread_mutex_t lock;             // guards easy, state, rx_buf
 
-  task_t         *reader;
+  task_handle_t   reader;           // joined by cb_ws_stop; never a task_t *
   bool            exit_requested;
-  bool            thread_alive;
-  pthread_cond_t  lifecycle_cond;   // signalled when thread_alive clears
 
   bool            enabled;          // latched copy of plugin.coinbase.ws_enabled
 
@@ -157,10 +155,10 @@ cb_ws_init(void)
   memset(&cb_ws, 0, sizeof(cb_ws));
 
   pthread_mutex_init(&cb_ws.lock, NULL);
-  pthread_cond_init(&cb_ws.lifecycle_cond, NULL);
 
   cb_ws.state  = CB_WS_DISCONNECTED;
   cb_ws.sockfd = CURL_SOCKET_BAD;
+  cb_ws.reader = TASK_HANDLE_NONE;
 
   atomic_store(&cb_ws_reconfig_req, false);
 
@@ -185,18 +183,16 @@ cb_ws_start(void)
 {
   cb_ws.enabled = (kv_get_uint("plugin.coinbase.ws_enabled") != 0);
 
-  if(cb_ws.reader != NULL)
+  if(cb_ws.reader != TASK_HANDLE_NONE)
     return;
 
   cb_ws.exit_requested = false;
-  cb_ws.thread_alive   = true;
 
   cb_ws.reader = task_add_persist("coinbase_ws", 50, cb_ws_reader, &cb_ws);
 
-  if(cb_ws.reader == NULL)
+  if(cb_ws.reader == TASK_HANDLE_NONE)
   {
     clam(CLAM_WARN, CB_CTX, "ws: failed to spawn reader task");
-    cb_ws.thread_alive = false;
     return;
   }
 
@@ -204,51 +200,41 @@ cb_ws_start(void)
       cb_ws.enabled ? "true" : "false");
 }
 
-void
+bool
 cb_ws_stop(void)
 {
-  struct timespec deadline;
-
-  if(cb_ws.reader == NULL)
-    return;
+  if(cb_ws.reader == TASK_HANDLE_NONE)
+    return(SUCCESS);
 
   pthread_mutex_lock(&cb_ws.lock);
   cb_ws.exit_requested = true;
   pthread_mutex_unlock(&cb_ws.lock);
 
-  // Deadline for a graceful shutdown. Past this, log and press on — we
-  // cannot block daemon shutdown indefinitely on a single plugin.
-  clock_gettime(CLOCK_REALTIME, &deadline);
-  deadline.tv_sec += (CB_WS_STOP_WAIT_MS / 1000);
-
-  pthread_mutex_lock(&cb_ws.lock);
-
-  while(cb_ws.thread_alive)
+  // Waiting for the reader to *say* it is done is not enough: the loop
+  // body is our .text, so the unload cannot proceed until the thread has
+  // actually left it. Join, and report the timeout upward rather than
+  // pressing on into dlclose.
+  if(!task_persist_join(cb_ws.reader, CB_WS_STOP_WAIT_MS))
   {
-    int rc = pthread_cond_timedwait(&cb_ws.lifecycle_cond, &cb_ws.lock,
-        &deadline);
-
-    if(rc == ETIMEDOUT)
-    {
-      clam(CLAM_WARN, CB_CTX,
-          "ws stop: reader did not exit within %d ms",
-          CB_WS_STOP_WAIT_MS);
-      break;
-    }
+    clam(CLAM_WARN, CB_CTX,
+        "ws stop: reader did not exit within %d ms — unload is unsafe",
+        CB_WS_STOP_WAIT_MS);
+    return(FAIL);
   }
 
-  pthread_mutex_unlock(&cb_ws.lock);
-
-  cb_ws.reader = NULL;
+  cb_ws.reader = TASK_HANDLE_NONE;
 
   clam(CLAM_INFO, CB_CTX, "ws subsystem stopped");
+  return(SUCCESS);
 }
 
 void
 cb_ws_deinit(void)
 {
-  if(cb_ws.reader != NULL)
-    cb_ws_stop();
+  // A reader we could not join still owns the session and the lock;
+  // tearing either down under it is the crash we are here to prevent.
+  if(cb_ws_stop() != SUCCESS)
+    return;
 
   pthread_mutex_lock(&cb_ws.lock);
 
@@ -264,7 +250,6 @@ cb_ws_deinit(void)
 
   pthread_mutex_unlock(&cb_ws.lock);
 
-  pthread_cond_destroy(&cb_ws.lifecycle_cond);
   pthread_mutex_destroy(&cb_ws.lock);
 }
 
@@ -856,13 +841,11 @@ cb_ws_reader(task_t *t)
     }
   }
 
-  // Thread exit. Drop the session and announce liveness=false so the
-  // cb_ws_stop cond_timedwait can release.
+  // Thread exit. Drop the session; cb_ws_stop is waiting on the join,
+  // which releases only once this frame is really gone.
   pthread_mutex_lock(&w->lock);
   cb_ws_close_locked(w);
   cb_ws_set_state_locked(w, CB_WS_DISCONNECTED);
-  w->thread_alive = false;
-  pthread_cond_broadcast(&w->lifecycle_cond);
   pthread_mutex_unlock(&w->lock);
 
   clam(CLAM_DEBUG, CB_CTX, "ws reader thread exited");

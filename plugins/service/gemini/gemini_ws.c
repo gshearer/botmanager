@@ -57,12 +57,10 @@ typedef struct
   curl_socket_t        sockfd;
   gem_ws_state_t       state;
 
-  pthread_mutex_t      lock;         // guards easy, state, rx_buf, thread_alive
+  pthread_mutex_t      lock;         // guards easy, state, rx_buf
 
-  task_t              *reader;
+  task_handle_t        reader;       // joined by gem_ws_stop_one
   bool                 exit_requested;
-  bool                 thread_alive;
-  pthread_cond_t       lifecycle_cond;
 
   bool                 enabled;      // latched copy of plugin.gemini.ws_enabled
 
@@ -98,6 +96,7 @@ static _Atomic uint32_t gem_ws_reconfig_gen;
 // Internal helpers — all *_locked require sess->lock held by caller.
 
 static void     gem_ws_reader              (task_t *t);
+static bool     gem_ws_stop_one            (gem_ws_session_t *s);
 static bool     gem_ws_open_locked         (gem_ws_session_t *s);
 static bool     gem_ws_open_md_locked      (gem_ws_session_t *s);
 static bool     gem_ws_open_oe_locked      (gem_ws_session_t *s);
@@ -214,8 +213,9 @@ gem_ws_session_zero(gem_ws_session_t *s, gem_ws_session_id_t sid,
   s->state      = GEM_WS_DISCONNECTED;
   s->sockfd     = CURL_SOCKET_BAD;
 
+  s->reader = TASK_HANDLE_NONE;
+
   pthread_mutex_init(&s->lock, NULL);
-  pthread_cond_init(&s->lifecycle_cond, NULL);
 }
 
 void
@@ -254,18 +254,16 @@ gem_ws_start_one(gem_ws_session_t *s)
 {
   s->enabled = (kv_get_uint("plugin.gemini.ws_enabled") != 0);
 
-  if(s->reader != NULL)
+  if(s->reader != TASK_HANDLE_NONE)
     return;
 
   s->exit_requested = false;
-  s->thread_alive   = true;
 
   s->reader = task_add_persist(s->task_name, 50, gem_ws_reader, s);
 
-  if(s->reader == NULL)
+  if(s->reader == TASK_HANDLE_NONE)
   {
     clam(CLAM_WARN, s->log_ctx, "failed to spawn reader task");
-    s->thread_alive = false;
     return;
   }
 
@@ -280,56 +278,52 @@ gem_ws_start(void)
   gem_ws_start_one(&gem_ws_oe);
 }
 
-static void
+static bool
 gem_ws_stop_one(gem_ws_session_t *s)
 {
-  struct timespec deadline;
-
-  if(s->reader == NULL)
-    return;
+  if(s->reader == TASK_HANDLE_NONE)
+    return(SUCCESS);
 
   pthread_mutex_lock(&s->lock);
   s->exit_requested = true;
   pthread_mutex_unlock(&s->lock);
 
-  clock_gettime(CLOCK_REALTIME, &deadline);
-  deadline.tv_sec += (GEM_WS_STOP_WAIT_MS / 1000);
-
-  pthread_mutex_lock(&s->lock);
-
-  while(s->thread_alive)
+  // Waiting for the reader to *say* it is done is not enough: the loop
+  // body is our .text, so the unload cannot proceed until the thread has
+  // actually left it. Join, and report the timeout upward rather than
+  // pressing on into dlclose.
+  if(!task_persist_join(s->reader, GEM_WS_STOP_WAIT_MS))
   {
-    int rc = pthread_cond_timedwait(&s->lifecycle_cond, &s->lock,
-        &deadline);
-
-    if(rc == ETIMEDOUT)
-    {
-      clam(CLAM_WARN, s->log_ctx,
-          "stop: reader did not exit within %d ms",
-          GEM_WS_STOP_WAIT_MS);
-      break;
-    }
+    clam(CLAM_WARN, s->log_ctx,
+        "stop: reader did not exit within %d ms — unload is unsafe",
+        GEM_WS_STOP_WAIT_MS);
+    return(FAIL);
   }
 
-  pthread_mutex_unlock(&s->lock);
-
-  s->reader = NULL;
+  s->reader = TASK_HANDLE_NONE;
 
   clam(CLAM_INFO, s->log_ctx, "reader stopped");
+  return(SUCCESS);
 }
 
-void
+// Both readers are always asked to stop; the verdict is the worse of
+// the two, so one stuck session cannot be masked by the other.
+bool
 gem_ws_stop(void)
 {
-  gem_ws_stop_one(&gem_ws_md);
-  gem_ws_stop_one(&gem_ws_oe);
+  bool md = gem_ws_stop_one(&gem_ws_md);
+  bool oe = gem_ws_stop_one(&gem_ws_oe);
+
+  return((md == SUCCESS && oe == SUCCESS) ? SUCCESS : FAIL);
 }
 
 static void
 gem_ws_deinit_one(gem_ws_session_t *s)
 {
-  if(s->reader != NULL)
-    gem_ws_stop_one(s);
+  // A reader we could not join still owns the session and the lock;
+  // tearing either down under it is the crash we are here to prevent.
+  if(gem_ws_stop_one(s) != SUCCESS)
+    return;
 
   pthread_mutex_lock(&s->lock);
 
@@ -345,7 +339,6 @@ gem_ws_deinit_one(gem_ws_session_t *s)
 
   pthread_mutex_unlock(&s->lock);
 
-  pthread_cond_destroy(&s->lifecycle_cond);
   pthread_mutex_destroy(&s->lock);
 }
 
@@ -1194,13 +1187,11 @@ gem_ws_reader(task_t *t)
     }
   }
 
-  // Thread exit. Drop the session and announce liveness=false so the
-  // gem_ws_stop cond_timedwait can release.
+  // Thread exit. Drop the session; gem_ws_stop_one is waiting on the
+  // join, which releases only once this frame is really gone.
   pthread_mutex_lock(&s->lock);
   gem_ws_close_locked(s);
   gem_ws_set_state_locked(s, GEM_WS_DISCONNECTED);
-  s->thread_alive = false;
-  pthread_cond_broadcast(&s->lifecycle_cond);
   pthread_mutex_unlock(&s->lock);
 
   clam(CLAM_DEBUG, s->log_ctx, "reader thread exited");

@@ -216,7 +216,7 @@ typedef struct
   uint8_t   id;
   int       epoll_fd;
   int       wake_fd;          // eventfd to wake epoll_wait
-  task_t   *task;             // persist task handle
+  task_handle_t task;         // persist task handle
 } sock_worker_t;
 
 typedef struct

@@ -47,6 +47,14 @@ typedef struct
 void acquire_init(void);
 void acquire_register_config(void);
 void acquire_register_commands(void);
+
+// PLIFE-5: cancel every periodic tick — the engine-global sweep and one
+// per registered bot — and latch the engine closed so a re-register
+// cannot re-arm them. The callbacks live in this plugin's .text; a
+// deinit that leaves them scheduled is a timer pointed at an unmapped
+// page.
+void acquire_stop(void);
+
 void acquire_exit(void);
 
 // Registry (extern — also exposed via inference.h shims outside the

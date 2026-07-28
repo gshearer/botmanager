@@ -39,6 +39,14 @@ typedef struct
 void llm_init(void);
 void llm_register_config(void);
 void llm_register_commands(void);
+
+// PLIFE-5: stop scheduling new work. Retries and dialect negotiations
+// re-arm themselves off the curl callback thread, so a plugin unload
+// needs the engine to stop topping up the in-flight set before anything
+// can wait for it to drain. In-flight requests are delivered normally —
+// a failure, if that is what they are.
+void llm_stop(void);
+
 void llm_exit(void);
 
 // Model introspection.

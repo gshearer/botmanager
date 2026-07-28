@@ -409,15 +409,14 @@ melee_commands_register(void)
   return(SUCCESS);
 }
 
-// Teardown note: `melee` is a root command with no children yet, but the
-// `show melee` tree that MELEE-4 attaches cannot be unregistered — the
-// command system has no parent-aware unregister. Keep the whole surface
-// in place for symmetry and let cmd_exit() free it at shutdown; reload
-// via daemon restart, not hot-unload, exactly as userquote and whenmoon
-// do.
+// Two roots, two paths: `!melee` and the `show melee` card with its own
+// children. Both unregister depth-first, so no parent is left holding a
+// freed child. Core would reclaim these anyway — saying so ourselves is
+// what keeps the unload audit reading `deinit() complete` instead of
+// naming us as the plugin that had to be tidied up after.
 void
 melee_commands_unregister(void)
 {
-  clam(CLAM_DEBUG, MELEE_CTX,
-      "melee command tree left registered (freed at shutdown)");
+  cmd_unregister_path("melee");
+  cmd_unregister_path("show/melee");
 }

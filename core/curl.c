@@ -1435,7 +1435,7 @@ curl_init(void)
   // Spawn the multi-loop persist task.
   curl_task = task_add_persist("curl_multi", 50, curl_multi_loop, NULL);
 
-  if(curl_task == NULL)
+  if(curl_task == TASK_HANDLE_NONE)
   {
     clam(CLAM_FATAL, "curl", "failed to spawn curl multi task");
     return;

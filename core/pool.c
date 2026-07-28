@@ -1,5 +1,6 @@
 // botmanager — MIT
-// Fixed-size object-pool allocator for hot-path reuse.
+// Elastic worker pool plus dedicated threads for persistent tasks.
+#define _GNU_SOURCE
 #define POOL_INTERNAL
 #include "pool.h"
 
@@ -179,6 +180,49 @@ worker_entry(void *arg)
   return(NULL);
 }
 
+// Hand this thread's persist slot back as joinable. Called as the very
+// last act of persist_entry so no lock is wanted after it.
+static void
+persist_retire_self(void)
+{
+  pthread_mutex_lock(&pool_mutex);
+
+  for(uint16_t i = 0; i < POOL_MAX_PERSIST; i++)
+  {
+    if(persist_workers[i].wstate == WORKER_RUNNING
+        && pthread_equal(persist_workers[i].thread, pthread_self()))
+    {
+      persist_workers[i].wstate = WORKER_RETIRING;
+      break;
+    }
+  }
+
+  pthread_mutex_unlock(&pool_mutex);
+}
+
+// Join and free every slot whose thread has already exited. Mirrors
+// reap_retired_locked() for the elastic pool: without it a plugin that
+// unloads and reloads burns a persist slot per cycle.
+// Must be called with pool_mutex held; releases it around each join.
+static void
+reap_persist_locked(void)
+{
+  for(uint16_t i = 0; i < POOL_MAX_PERSIST; i++)
+  {
+    if(persist_workers[i].wstate == WORKER_RETIRING)
+    {
+      persist_workers[i].wstate = WORKER_JOINING;
+
+      pthread_mutex_unlock(&pool_mutex);
+      pthread_join(persist_workers[i].thread, NULL);
+      pthread_mutex_lock(&pool_mutex);
+
+      persist_workers[i].wstate  = WORKER_UNUSED;
+      persist_workers[i].task_id = TASK_HANDLE_NONE;
+    }
+  }
+}
+
 static void *
 persist_entry(void *arg)
 {
@@ -209,6 +253,10 @@ persist_entry(void *arg)
 
   if(result == TASK_FATAL)
     pool_shutdown();
+
+  // Retiring is this thread's last act, so a joiner holding pool_mutex
+  // can never be waiting on a thread that still wants the lock.
+  persist_retire_self();
 
   return(NULL);
 }
@@ -352,6 +400,10 @@ pool_spawn_persist(task_t *t)
 {
   pthread_mutex_lock(&pool_mutex);
 
+  // Slots of readers that exited on their own — nobody joined them, so
+  // collect them here rather than leaking one per reload cycle.
+  reap_persist_locked();
+
   // Find an unused persist slot.
   for(uint16_t i = 0; i < POOL_MAX_PERSIST; i++)
   {
@@ -363,11 +415,13 @@ pool_spawn_persist(task_t *t)
       persist_workers[i].last_active = persist_workers[i].created;
       persist_workers[i].wstate      = WORKER_RUNNING;
       persist_workers[i].idle        = false;
+      persist_workers[i].task_id     = t->id;
 
       if(pthread_create(&persist_workers[i].thread, NULL,
               persist_entry, t) != 0)
       {
-        persist_workers[i].wstate = WORKER_UNUSED;
+        persist_workers[i].wstate  = WORKER_UNUSED;
+        persist_workers[i].task_id = TASK_HANDLE_NONE;
         pthread_mutex_unlock(&pool_mutex);
         return(false);
       }
@@ -385,6 +439,90 @@ pool_spawn_persist(task_t *t)
   clam(CLAM_WARN, "pool", "no persist slots available (max: %u)",
       POOL_MAX_PERSIST);
   return(false);
+}
+
+// The join a plugin needs before its .so is unmapped. `id` that no slot
+// holds is already gone, which is success. The slot is parked in
+// WORKER_JOINING for the duration so pool_exit and the spawn-time reap
+// leave the thread to us.
+bool
+pool_join_persist(task_handle_t id, uint32_t timeout_ms)
+{
+  struct timespec deadline;
+  pthread_t       thread;
+  worker_state_t  prev;
+  uint16_t        slot = POOL_MAX_PERSIST;
+  int             rc;
+
+  if(id == TASK_HANDLE_NONE)
+    return(true);
+
+  pthread_mutex_lock(&pool_mutex);
+
+  for(uint16_t i = 0; i < POOL_MAX_PERSIST; i++)
+  {
+    if(persist_workers[i].task_id == id
+        && (persist_workers[i].wstate == WORKER_RUNNING
+            || persist_workers[i].wstate == WORKER_RETIRING))
+    {
+      slot = i;
+      break;
+    }
+  }
+
+  if(slot == POOL_MAX_PERSIST)
+  {
+    pthread_mutex_unlock(&pool_mutex);
+    return(true);
+  }
+
+  thread = persist_workers[slot].thread;
+  prev   = persist_workers[slot].wstate;
+
+  persist_workers[slot].wstate = WORKER_JOINING;
+
+  pthread_mutex_unlock(&pool_mutex);
+
+  clock_gettime(CLOCK_REALTIME, &deadline);
+
+  deadline.tv_sec  += (time_t)(timeout_ms / 1000U);
+  deadline.tv_nsec += (long)(timeout_ms % 1000U) * 1000L * 1000L;
+
+  if(deadline.tv_nsec >= 1000L * 1000L * 1000L)
+  {
+    deadline.tv_nsec -= 1000L * 1000L * 1000L;
+    deadline.tv_sec  += 1;
+  }
+
+  rc = pthread_timedjoin_np(thread, NULL, &deadline);
+
+  pthread_mutex_lock(&pool_mutex);
+
+  // A thread that exits in the instant the deadline lapses is joined,
+  // not reported stuck — and this is also what keeps the slot from
+  // being restored to RUNNING after its thread is already gone.
+  if(rc != 0 && pthread_tryjoin_np(thread, NULL) == 0)
+    rc = 0;
+
+  if(rc != 0)
+  {
+    // Still running. Hand the slot back exactly as we found it — the
+    // caller decides whether a stuck reader is fatal to the unload.
+    persist_workers[slot].wstate = prev;
+    pthread_mutex_unlock(&pool_mutex);
+
+    clam(CLAM_WARN, "pool", "persist join timed out after %u ms (slot %u)",
+        timeout_ms, slot);
+    return(false);
+  }
+
+  persist_workers[slot].wstate  = WORKER_UNUSED;
+  persist_workers[slot].task_id = TASK_HANDLE_NONE;
+
+  pthread_mutex_unlock(&pool_mutex);
+
+  clam(CLAM_DEBUG, "pool", "persist thread joined (slot %u)", slot);
+  return(true);
 }
 
 // Shut down and clean up the thread pool. Joins all elastic and

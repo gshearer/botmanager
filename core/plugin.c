@@ -222,8 +222,20 @@ plugin_unload(const char *name, plugin_unload_report_t *report)
   {
     clam(CLAM_DEBUG, "plugin", "stopping '%s' before unload", name);
 
-    if(target->desc->stop != NULL)
-      target->desc->stop();
+    // stop() is where a plugin names the Class-B holding core cannot
+    // define away: a reader thread that would not join, a sweep still
+    // running, a driver vtable someone is still bound to. FAIL there
+    // means "unmapping me now is a crash", and it is the plugin's to
+    // say — so the unload ends here, with the plugin left running and
+    // intact. The residual audit further down catches what a plugin
+    // forgot to refuse; this catches what it knew.
+    if(target->desc->stop != NULL && target->desc->stop() != SUCCESS)
+    {
+      clam(CLAM_WARN, "plugin",
+          "cannot unload '%s': its stop() refused — see the plugin's own "
+          "warning for what is still live", name);
+      return(FAIL);
+    }
 
     target->state = PLUGIN_STOPPING;
   }
@@ -2279,7 +2291,8 @@ plugin_cmd_unload(const cmd_ctx_t *ctx)
   if(plugin_unload(name, &report) != SUCCESS)
   {
     snprintf(buf, sizeof(buf), CLR_RED "failed to unload" CLR_RESET " "
-        CLR_BOLD "%s" CLR_RESET, name);
+        CLR_BOLD "%s" CLR_RESET " — it is still running and intact; the "
+        "log names what it is still holding", name);
     cmd_reply(ctx, buf);
     return;
   }

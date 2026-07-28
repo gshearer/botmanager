@@ -218,13 +218,12 @@ chatbot_cmds_register(void)
 
   return(SUCCESS);
 
+  // A registration failure here is CLAM_FATAL to the load, and the
+  // daemon does not come up with a half-registered chat surface — so
+  // these labels unwind what they can name and leave the rest to the
+  // reclamation that runs before any mapping is dropped.
 fail_refresh_prompts:
-  // show verbs / dossiersweep left registered: neither module exposes an
-  // unregister helper yet (PLIFE-5 gives them one).
-
 fail_show_verbs:
-  // dossiersweep left registered; same reason.
-
 fail_dossiersweep:
   cmd_unregister_path("bot/hush");
   return(FAIL);
@@ -233,7 +232,8 @@ fail_dossiersweep:
 void
 chatbot_cmds_unregister(void)
 {
-  // Deliberately empty: the show verbs and the dossiersweep subtree have
-  // no unregister helper yet, so tearing down only "bot/hush" here would
-  // be a half-teardown. PLIFE-5 converts this plugin as a whole.
+  // Deliberately empty. This plugin's command surface is Class A —
+  // core reclaims every entry that names this mapping between deinit()
+  // and dlclose. What actually blocks a text unload is textbot_driver
+  // with bots bound to it, and that is PLIFE-8's to solve.
 }

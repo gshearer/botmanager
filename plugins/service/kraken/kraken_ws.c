@@ -49,12 +49,10 @@ typedef struct
   curl_socket_t   sockfd;
   kr_ws_state_t   state;
 
-  pthread_mutex_t lock;             // guards easy, state, rx_buf, thread_alive
+  pthread_mutex_t lock;             // guards easy, state, rx_buf
 
-  task_t         *reader;
+  task_handle_t   reader;           // joined by kr_ws_stop; never a task_t *
   bool            exit_requested;
-  bool            thread_alive;
-  pthread_cond_t  lifecycle_cond;   // signalled when thread_alive clears
 
   bool            enabled;          // latched copy of plugin.kraken.ws_enabled
 
@@ -172,10 +170,10 @@ kr_ws_init(void)
   memset(&kr_ws, 0, sizeof(kr_ws));
 
   pthread_mutex_init(&kr_ws.lock, NULL);
-  pthread_cond_init(&kr_ws.lifecycle_cond, NULL);
 
   kr_ws.state  = KR_WS_DISCONNECTED;
   kr_ws.sockfd = CURL_SOCKET_BAD;
+  kr_ws.reader = TASK_HANDLE_NONE;
 
   atomic_store(&kr_ws_reconfig_req, false);
 
@@ -199,18 +197,16 @@ kr_ws_start(void)
 {
   kr_ws.enabled = (kv_get_uint("plugin.kraken.ws_enabled") != 0);
 
-  if(kr_ws.reader != NULL)
+  if(kr_ws.reader != TASK_HANDLE_NONE)
     return;
 
   kr_ws.exit_requested = false;
-  kr_ws.thread_alive   = true;
 
   kr_ws.reader = task_add_persist("kraken_ws", 50, kr_ws_reader, &kr_ws);
 
-  if(kr_ws.reader == NULL)
+  if(kr_ws.reader == TASK_HANDLE_NONE)
   {
     clam(CLAM_WARN, KR_CTX, "ws: failed to spawn reader task");
-    kr_ws.thread_alive = false;
     return;
   }
 
@@ -218,51 +214,41 @@ kr_ws_start(void)
       kr_ws.enabled ? "true" : "false");
 }
 
-void
+bool
 kr_ws_stop(void)
 {
-  struct timespec deadline;
-
-  if(kr_ws.reader == NULL)
-    return;
+  if(kr_ws.reader == TASK_HANDLE_NONE)
+    return(SUCCESS);
 
   pthread_mutex_lock(&kr_ws.lock);
   kr_ws.exit_requested = true;
   pthread_mutex_unlock(&kr_ws.lock);
 
-  // Deadline for a graceful shutdown. Past this, log and press on — we
-  // cannot block daemon shutdown indefinitely on a single plugin.
-  clock_gettime(CLOCK_REALTIME, &deadline);
-  deadline.tv_sec += (KR_WS_STOP_WAIT_MS / 1000);
-
-  pthread_mutex_lock(&kr_ws.lock);
-
-  while(kr_ws.thread_alive)
+  // Waiting for the reader to *say* it is done is not enough: the loop
+  // body is our .text, so the unload cannot proceed until the thread has
+  // actually left it. Join, and report the timeout upward rather than
+  // pressing on into dlclose.
+  if(!task_persist_join(kr_ws.reader, KR_WS_STOP_WAIT_MS))
   {
-    int rc = pthread_cond_timedwait(&kr_ws.lifecycle_cond, &kr_ws.lock,
-        &deadline);
-
-    if(rc == ETIMEDOUT)
-    {
-      clam(CLAM_WARN, KR_CTX,
-          "ws stop: reader did not exit within %d ms",
-          KR_WS_STOP_WAIT_MS);
-      break;
-    }
+    clam(CLAM_WARN, KR_CTX,
+        "ws stop: reader did not exit within %d ms — unload is unsafe",
+        KR_WS_STOP_WAIT_MS);
+    return(FAIL);
   }
 
-  pthread_mutex_unlock(&kr_ws.lock);
-
-  kr_ws.reader = NULL;
+  kr_ws.reader = TASK_HANDLE_NONE;
 
   clam(CLAM_INFO, KR_CTX, "ws subsystem stopped");
+  return(SUCCESS);
 }
 
 void
 kr_ws_deinit(void)
 {
-  if(kr_ws.reader != NULL)
-    kr_ws_stop();
+  // A reader we could not join still owns the session and the lock;
+  // tearing either down under it is the crash we are here to prevent.
+  if(kr_ws_stop() != SUCCESS)
+    return;
 
   pthread_mutex_lock(&kr_ws.lock);
 
@@ -278,7 +264,6 @@ kr_ws_deinit(void)
 
   pthread_mutex_unlock(&kr_ws.lock);
 
-  pthread_cond_destroy(&kr_ws.lifecycle_cond);
   pthread_mutex_destroy(&kr_ws.lock);
 }
 
@@ -880,13 +865,11 @@ kr_ws_reader(task_t *t)
     }
   }
 
-  // Thread exit. Drop the session and announce liveness=false so the
-  // kr_ws_stop cond_timedwait can release.
+  // Thread exit. Drop the session; kr_ws_stop is waiting on the join,
+  // which releases only once this frame is really gone.
   pthread_mutex_lock(&w->lock);
   kr_ws_close_locked(w);
   kr_ws_set_state_locked(w, KR_WS_DISCONNECTED);
-  w->thread_alive = false;
-  pthread_cond_broadcast(&w->lifecycle_cond);
   pthread_mutex_unlock(&w->lock);
 
   clam(CLAM_DEBUG, KR_CTX, "ws reader thread exited");
