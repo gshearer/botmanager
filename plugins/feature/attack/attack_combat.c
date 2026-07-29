@@ -262,6 +262,48 @@ atk_render_blow(char *out, size_t cap, const char *src_nick,
     snprintf(out, cap, "%s%s%s", atk_tier_emoji[tier], body, badge);
 }
 
+// A heal wears the same shape as a blow — glyph, colorized names, the
+// number, and the health tail — because it costs exactly what a blow
+// costs: one turn. What differs is the palette. The target is GREEN
+// rather than purple: purple marks whoever is having something done *to*
+// them, and nothing is being done to the mended.
+//
+// The number is the movement of the bar, not the roll behind it. The
+// clamp lives at the call site, and by the time a line reaches here there
+// is only one number left to speak.
+void
+atk_render_heal(char *out, size_t cap, const char *src_nick,
+    const char *tgt_nick, const atk_move_t *move, int32_t amt,
+    uint32_t bonus_pct, int32_t hp, int32_t hp_max)
+{
+  char src  [ATK_NICK_SZ + 8];
+  char tgt  [ATK_NICK_SZ + 8];
+  char amts [32];
+  char badge[32] = "";
+  char body [ATK_LINE_SZ];
+
+  if(out == NULL || cap == 0)
+    return;
+
+  snprintf(src, sizeof(src), CLR_CYAN  "%s" CLR_RESET, src_nick);
+  snprintf(tgt, sizeof(tgt), CLR_GREEN "%s" CLR_RESET, tgt_nick);
+  snprintf(amts, sizeof(amts), CLR_BOLD CLR_GREEN "%d" CLR_RESET, amt);
+
+  // {heal}, never {damage}: the loader keeps the two tokens apart section
+  // by section, and atk_body() hands whichever one this line owns to the
+  // neutral template's third slot.
+  atk_body(body, sizeof(body), move, atk_fallback_heal(),
+      src, tgt, NULL, amts, NULL);
+
+  if(bonus_pct > 0)
+    snprintf(badge, sizeof(badge),
+        " " CLR_BOLD CLR_YELLOW "⚡+%" PRIu32 "%%" CLR_RESET, bonus_pct);
+
+  // A heal always leaves somebody standing, so the tally always rides.
+  snprintf(out, cap, "✚ %s%s " CLR_GRAY "[%s — %d/%d hp]" CLR_RESET,
+      body, badge, tgt_nick, hp, hp_max);
+}
+
 // The oldest joke on IRC, kept for the one blow that earns it: a
 // critical that kills. It stands where the tier line would have stood —
 // it is the line that carries the number — and the ordinary death line

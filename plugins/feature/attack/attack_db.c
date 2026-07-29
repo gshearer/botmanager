@@ -695,7 +695,7 @@ atk_db_card_roster(int64_t round_id, atk_card_row_t *out, uint32_t cap,
   snprintf(sql, sizeof(sql),
       "SELECT CASE WHEN p.nickname <> '' THEN p.nickname ELSE p.username END,"
       " p.hp, p.hp_max, p.dmg_given, p.dmg_taken, p.best_crit, p.last_wave,"
-      " COUNT(*) OVER (), p.username, p.class"
+      " COUNT(*) OVER (), p.username, p.class, p.heal_given"
       " FROM %s p WHERE p.round_id = %" PRId64
       " ORDER BY p.hp DESC, p.dmg_given DESC, p.username LIMIT %" PRIu32,
       t.players, round_id, cap);
@@ -709,12 +709,13 @@ atk_db_card_roster(int64_t round_id, atk_card_row_t *out, uint32_t cap,
       atk_col_str(out[n].name,  sizeof(out[n].name),  res, n, 0);
       atk_col_str(out[n].user,  sizeof(out[n].user),  res, n, 8);
       atk_col_str(out[n].class, sizeof(out[n].class), res, n, 9);
-      out[n].hp        = atk_col_i32(res, n, 1);
-      out[n].hp_max    = atk_col_i32(res, n, 2);
-      out[n].dmg_given = atk_col_i32(res, n, 3);
-      out[n].dmg_taken = atk_col_i32(res, n, 4);
-      out[n].best_crit = atk_col_i32(res, n, 5);
-      out[n].last_wave = atk_col_i32(res, n, 6);
+      out[n].hp         = atk_col_i32(res, n, 1);
+      out[n].hp_max     = atk_col_i32(res, n, 2);
+      out[n].dmg_given  = atk_col_i32(res, n, 3);
+      out[n].dmg_taken  = atk_col_i32(res, n, 4);
+      out[n].best_crit  = atk_col_i32(res, n, 5);
+      out[n].last_wave  = atk_col_i32(res, n, 6);
+      out[n].heal_given = atk_col_i32(res, n, 10);
 
       if(total != NULL)
         *total = (uint32_t)atk_col_i64(res, n, 7);
@@ -752,7 +753,8 @@ atk_db_scores(uint32_t ns_id, uint32_t limit, atk_score_row_t *out,
 
   snprintf(sql, sizeof(sql),
       "SELECT CASE WHEN nickname <> '' THEN nickname ELSE username END,"
-      " rounds, kills, deaths, dmg_given, dmg_taken, crits, best_crit"
+      " rounds, kills, deaths, dmg_given, dmg_taken, crits, best_crit,"
+      " heal_given"
       " FROM %s WHERE ns_id = %" PRIu32
       " ORDER BY dmg_given DESC, username LIMIT %" PRIu32,
       t.scores, ns_id, limit);
@@ -764,13 +766,14 @@ atk_db_scores(uint32_t ns_id, uint32_t limit, atk_score_row_t *out,
     for(n = 0; n < res->rows && n < limit; n++)
     {
       atk_col_str(out[n].name, sizeof(out[n].name), res, n, 0);
-      out[n].rounds    = atk_col_i32(res, n, 1);
-      out[n].kills     = atk_col_i32(res, n, 2);
-      out[n].deaths    = atk_col_i32(res, n, 3);
-      out[n].dmg_given = atk_col_i64(res, n, 4);
-      out[n].dmg_taken = atk_col_i64(res, n, 5);
-      out[n].crits     = atk_col_i32(res, n, 6);
-      out[n].best_crit = atk_col_i32(res, n, 7);
+      out[n].rounds     = atk_col_i32(res, n, 1);
+      out[n].kills      = atk_col_i32(res, n, 2);
+      out[n].deaths     = atk_col_i32(res, n, 3);
+      out[n].dmg_given  = atk_col_i64(res, n, 4);
+      out[n].dmg_taken  = atk_col_i64(res, n, 5);
+      out[n].crits      = atk_col_i32(res, n, 6);
+      out[n].best_crit  = atk_col_i32(res, n, 7);
+      out[n].heal_given = atk_col_i64(res, n, 8);
     }
   }
 
@@ -945,6 +948,127 @@ atk_db_blow_apply(const atk_blow_t *b)
       death);
 
   ok = atk_exec(sql, "blow apply", NULL);
+
+out:
+  if(e_src_u != NULL) mem_free(e_src_u);
+  if(e_src_n != NULL) mem_free(e_src_n);
+  if(e_tgt_u != NULL) mem_free(e_tgt_u);
+  if(e_tgt_n != NULL) mem_free(e_tgt_n);
+  if(sql     != NULL) mem_free(sql);
+
+  return(ok);
+}
+
+// ------------------------------------------------------------------ //
+// The heal                                                            //
+// ------------------------------------------------------------------ //
+
+// The same all-or-nothing shape as a blow, and for the same reason: a
+// daemon death between two statements could otherwise credit a healer for
+// hit points nobody received.
+//
+// Two numbers travel together here and they are not interchangeable. The
+// health column takes `amt` and lets SQL clamp it — LEAST(hp + amt,
+// hp_max) — so the ceiling is enforced where the value lives. Every
+// TALLY, and the line the room is told, take `delta`: what the bar
+// actually moved. Crediting `amt` would inflate a healer's standing by
+// every point of overheal they ever poured into a full combatant.
+//
+// A self-heal writes the same player row twice. That is safe and
+// deliberate: the two UPDATEs touch disjoint columns and run in order
+// inside one transaction, so the second reads the first's result.
+bool
+atk_db_heal_apply(const atk_heal_t *h)
+{
+  atk_tables_t t;
+  char        *e_src_u = NULL;
+  char        *e_src_n = NULL;
+  char        *e_tgt_u = NULL;
+  char        *e_tgt_n = NULL;
+  char        *sql     = NULL;
+  size_t       need;
+  bool         ok = FAIL;
+
+  if(h == NULL || h->round_id <= 0 || atk_tables_resolve(&t) != SUCCESS)
+    return(FAIL);
+
+  e_src_u = db_escape(h->src_user);
+  e_src_n = db_escape(h->src_nick);
+  e_tgt_u = db_escape(h->tgt_user);
+  e_tgt_n = db_escape(h->tgt_nick);
+
+  if(e_src_u == NULL || e_src_n == NULL || e_tgt_u == NULL || e_tgt_n == NULL)
+    goto out;
+
+  need = 2048
+      + 6 * (strlen(e_src_u) + strlen(e_src_n) + strlen(e_tgt_u)
+             + strlen(e_tgt_n) + strlen(t.rounds) + strlen(t.players)
+             + strlen(t.scores));
+
+  sql = mem_alloc(ATK_CTX, "heal_sql", need);
+
+  if(sql == NULL)
+    goto out;
+
+  snprintf(sql, need,
+      "BEGIN;"
+
+      // The mended. The ceiling is the row's own hp_max, so a pit retuned
+      // mid-round still cannot be healed past what it was opened at.
+      "UPDATE %s SET nickname = '%s', hp = LEAST(hp + %d, hp_max),"
+      " heal_taken = heal_taken + %d"
+      " WHERE round_id = %" PRId64 " AND username = '%s';"
+
+      // The healer spends the wave exactly as a blow does, and any
+      // deferral bonus is consumed in the SAME transaction that spends it
+      // — never in a second statement, or a daemon death between the two
+      // would hand somebody a permanent bonus.
+      "UPDATE %s SET nickname = '%s', heal_given = heal_given + %d,"
+      " heals = heals + 1, last_wave = %d, bonus_pct = 0"
+      " WHERE round_id = %" PRId64 " AND username = '%s';"
+
+      // `blows` is untouched: mending is a turn, but it is not a blow,
+      // and the ledger should never suggest otherwise.
+      "UPDATE %s SET last_action = NOW() WHERE id = %" PRId64 ";"
+
+      // Lifetime mirror for the healer.
+      "INSERT INTO %s (ns_id, username, nickname, heal_given, heals)"
+      " VALUES (%" PRIu32 ", '%s', '%s', %d, 1)"
+      " ON CONFLICT (ns_id, username) DO UPDATE SET"
+      " nickname = EXCLUDED.nickname,"
+      " heal_given = %s.heal_given + EXCLUDED.heal_given,"
+      " heals = %s.heals + EXCLUDED.heals,"
+      " last_seen = NOW();"
+
+      // Lifetime mirror for the mended.
+      "INSERT INTO %s (ns_id, username, nickname, heal_taken)"
+      " VALUES (%" PRIu32 ", '%s', '%s', %d)"
+      " ON CONFLICT (ns_id, username) DO UPDATE SET"
+      " nickname = EXCLUDED.nickname,"
+      " heal_taken = %s.heal_taken + EXCLUDED.heal_taken,"
+      " last_seen = NOW();"
+
+      // The same clause both other turn types carry: a heal that could
+      // not turn the wave would stall a pit full of healers forever.
+      "UPDATE %s r SET wave = r.wave + 1 WHERE r.id = %" PRId64
+      " AND NOT EXISTS (SELECT 1 FROM %s p WHERE p.round_id = r.id"
+      " AND p.hp > 0 AND p.last_wave < r.wave);"
+
+      "COMMIT;",
+
+      t.players, e_tgt_n, h->amt, h->delta, h->round_id, e_tgt_u,
+
+      t.players, e_src_n, h->delta, h->wave, h->round_id, e_src_u,
+
+      t.rounds, h->round_id,
+
+      t.scores, h->ns_id, e_src_u, e_src_n, h->delta, t.scores, t.scores,
+
+      t.scores, h->ns_id, e_tgt_u, e_tgt_n, h->delta, t.scores,
+
+      t.rounds, h->round_id, t.players);
+
+  ok = atk_exec(sql, "heal apply", NULL);
 
 out:
   if(e_src_u != NULL) mem_free(e_src_u);

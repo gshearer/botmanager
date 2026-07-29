@@ -153,6 +153,7 @@ static const char *const atk_kind_name[ATK_DOT__COUNT] = {
 //
 //   atk_blows[]          exactly three `const char *` — attacker, target,
 //                        damage
+//   atk_heals[]          exactly three — healer, target, hit points
 //   atk_deaths[]         exactly two `const char *` — slayer, fallen
 //   atk_inflict_*[]      exactly two — attacker, target
 //   atk_decay_*[]        exactly three — source, victim, damage
@@ -172,6 +173,21 @@ static const char *const atk_blows[] = {
   "%s strikes %s for %s damage.",
   "%s catches %s square for %s damage.",
   "%s puts one into %s for %s damage.",
+};
+
+// The floor under a heal, and reached about as rarely as the one above:
+// the loader takes `[heal]` as all-or-nothing, so a class that can heal
+// at all can speak both bands. It stands here for the same reason — a
+// stem can go stale between the roll and the sentence.
+//
+// Every line has to read as well of somebody working on themselves as of
+// somebody working on a neighbour: healing yourself is the default, and
+// the pit says so in the same words either way.
+static const char *const atk_heals[] = {
+  "%s closes %s's wounds — %s hit points.",
+  "%s gets %s breathing evenly again, worth %s hit points.",
+  "%s works on %s until it stops being urgent — %s hit points.",
+  "%s spends the turn patching %s up for %s hit points.",
 };
 
 static const char *const atk_deaths[] = {
@@ -378,6 +394,12 @@ const char *
 atk_fallback_blow(void)
 {
   return(atk_blows[util_rand(ATK_N(atk_blows))]);
+}
+
+const char *
+atk_fallback_heal(void)
+{
+  return(atk_heals[util_rand(ATK_N(atk_heals))]);
 }
 
 const char *

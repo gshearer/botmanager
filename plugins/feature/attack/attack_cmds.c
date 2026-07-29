@@ -15,6 +15,7 @@
 #include "colors.h"
 #include "util.h"
 
+#include <ctype.h>
 #include <inttypes.h>
 #include <pthread.h>
 #include <stdio.h>
@@ -512,6 +513,249 @@ atk_cmd_attack(const cmd_ctx_t *ctx)
 }
 
 // ------------------------------------------------------------------ //
+// heal [nick]                                                         //
+// ------------------------------------------------------------------ //
+
+// "a warrior" / "an oracle". A class stem is validated alnum by the
+// loader, so the first byte is all this needs to look at.
+static const char *
+atk_article(const char *word)
+{
+  const char c = (word != NULL) ? (char)tolower((unsigned char)word[0]) : '\0';
+
+  return((c == 'a' || c == 'e' || c == 'i' || c == 'o' || c == 'u')
+      ? "An" : "A");
+}
+
+// Mending instead of striking. It is the one place classes are more than
+// cosmetic, and that is the operator's own brief: a cleric may spend a
+// turn restoring hit points and a wizard may not. It costs a whole turn,
+// which is what keeps it a trade rather than a gift — see the fairness
+// charter in TODO.md §2, which names this as the ONLY such asymmetry.
+static void
+atk_cmd_heal(const cmd_ctx_t *ctx)
+{
+  atk_tunables_t t;
+  atk_round_t    round;
+  atk_player_t   src;
+  atk_player_t   tgt;
+  atk_heal_t     heal;
+  atk_move_t     move;
+  userns_t      *ns;
+  const char    *nick;
+  const char    *src_nick;
+  char           tgt_user[ATK_USER_SZ];
+  char           src_class[ATK_CLASS_NAME_SZ];
+  char           line[ATK_LINE_SZ];
+  char           roster[ATK_ROSTER_SZ];
+  int32_t        amt;
+  int32_t        delta;
+  bool           major;
+  bool           spoken;
+
+  ns = userns_session_resolve(ctx);
+
+  if(ns == NULL)          // the resolver already replied
+    return;
+
+  if(ctx->username == NULL || ctx->username[0] == '\0')
+  {
+    clam(CLAM_WARN, ATK_CTX, "heal reached the pit unauthenticated");
+    return;
+  }
+
+  atk_tunables_load(&t);
+
+  src_nick = (ctx->msg->nickname[0] != '\0')
+      ? ctx->msg->nickname : ctx->username;
+
+  // ---- resolution, outside the lock: it mutates nothing, and the ----- //
+  //      presence probe must not run under a lock the method drivers    //
+  //      know nothing about                                             //
+
+  nick = (ctx->parsed != NULL && ctx->parsed->argc > 0)
+      ? ctx->parsed->argv[0] : NULL;
+
+  // Healing yourself is allowed, and it is the default. There is no
+  // self-refusal here; that rule belongs to the blade.
+  if(nick == NULL || nick[0] == '\0')
+  {
+    nick = src_nick;
+    snprintf(tgt_user, sizeof(tgt_user), "%s", ctx->username);
+  }
+
+  else
+  {
+    if(!atk_resolve_target(ctx, ns, nick, tgt_user, sizeof(tgt_user)))
+    {
+      snprintf(line, sizeof(line),
+          "✚ " CLR_GREEN "%s" CLR_RESET
+          " is no one the pit has ever heard of.", nick);
+      cmd_reply(ctx, line);
+      return;
+    }
+
+    if(!atk_target_present(ctx, nick))
+    {
+      snprintf(line, sizeof(line),
+          "✚ " CLR_GREEN "%s" CLR_RESET
+          " is not in this room. You cannot mend what is not here.", nick);
+      cmd_reply(ctx, line);
+      return;
+    }
+  }
+
+  pthread_mutex_lock(&atk_turn_lock);
+
+  // ---- the round -- and `!heal` never opens or closes one ------------ //
+  //
+  // Only `!attack` starts a game and only `!attack` (or `attack --end`)
+  // finishes one. A stale round is left exactly as it was found: mending
+  // is not an event that should retire anything.
+
+  if(!atk_db_round_find(ns->id, method_inst_name(ctx->msg->inst),
+        ctx->msg->channel, &round))
+  {
+    pthread_mutex_unlock(&atk_turn_lock);
+    cmd_reply(ctx, "✚ Nothing is happening here. Start something with "
+                   "!attack <nick>.");
+    return;
+  }
+
+  // Both must already be in the fight. `!heal` must never be a free,
+  // damage-less way into one.
+  if(!atk_db_player_get(round.id, ctx->username, &src))
+  {
+    pthread_mutex_unlock(&atk_turn_lock);
+    cmd_reply(ctx, "✚ You are not in this fight. Join it the usual way.");
+    return;
+  }
+
+  if(!atk_db_player_get(round.id, tgt_user, &tgt))
+  {
+    pthread_mutex_unlock(&atk_turn_lock);
+    snprintf(line, sizeof(line),
+        "✚ " CLR_GREEN "%s" CLR_RESET " is not in this fight.", nick);
+    cmd_reply(ctx, line);
+    return;
+  }
+
+  // The stem stored at enrolment, unless the sheet has left the registry
+  // since — the same courtesy the blade extends.
+  atk_class_for(src.class, src_class, sizeof(src_class));
+
+  if(!atk_class_has(src_class, ATK_SEC_HEAL))
+  {
+    pthread_mutex_unlock(&atk_turn_lock);
+    snprintf(line, sizeof(line),
+        "✚ %s %s knows nothing of mending. Pick up a blade.",
+        atk_article(src_class), src_class);
+    cmd_reply(ctx, line);
+    return;
+  }
+
+  // The wave gate, identical to a blow's: mending costs a turn, and a
+  // turn is a turn.
+  if(src.last_wave >= round.wave)
+  {
+    if(atk_db_pending(round.id, round.wave, roster, sizeof(roster)) ==
+           SUCCESS && roster[0] != '\0')
+      snprintf(line, sizeof(line),
+          "✚ You have spent your turn this wave. Still standing idle: "
+          CLR_CYAN "%s" CLR_RESET ".", roster);
+
+    else
+      snprintf(line, sizeof(line), "✚ You have spent your turn this wave.");
+
+    pthread_mutex_unlock(&atk_turn_lock);
+    cmd_reply(ctx, line);
+    return;
+  }
+
+  // Neither of these spends the wave: a turn thrown away on a full
+  // combatant, or on a corpse, is a misfire and not a move.
+  if(tgt.hp <= 0)
+  {
+    pthread_mutex_unlock(&atk_turn_lock);
+    cmd_reply(ctx, "☠ That one is past mending. The pit does not give "
+                   "anyone back.");
+    return;
+  }
+
+  if(tgt.hp >= tgt.hp_max)
+  {
+    pthread_mutex_unlock(&atk_turn_lock);
+    snprintf(line, sizeof(line),
+        "✚ " CLR_GREEN "%s" CLR_RESET " is whole. Save it.", nick);
+    cmd_reply(ctx, line);
+    return;
+  }
+
+  // ---- the roll: engine first, class second, exactly as a blow ------- //
+  //
+  // Which band a heal lands in is the ENGINE's roll and not the healer's,
+  // so a sheet with thirty major lines mends no harder than one with a
+  // single line — it merely repeats itself less. atk_tunables_load() has
+  // already lifted each ceiling to at least its floor, so the width can
+  // never be computed from an inverted band.
+
+  major = (util_rand(100) < (int)t.heal_major_pct);
+  amt   = (int32_t)(major ? t.heal_major_min : t.heal_minor_min)
+      + (int32_t)util_rand((int)((major ? t.heal_major_max - t.heal_major_min
+                                        : t.heal_minor_max - t.heal_minor_min)
+                                 + 1));
+
+  // What the health bar will actually move. The roll is what SQL adds
+  // before its own clamp; THIS is what the tallies take and what the room
+  // is told, because a line saying 18 over a bar that moved 4 is a lie
+  // the round card contradicts on the very next `show attack`.
+  delta = (amt < tgt.hp_max - tgt.hp) ? amt : tgt.hp_max - tgt.hp;
+
+  spoken = (atk_class_move(src_class, ATK_SEC_HEAL,
+        major ? ATK_FLAV_MAJOR : ATK_FLAV_MINOR, 0, &move) == SUCCESS);
+
+  if(!spoken)
+  {
+    // Unreachable by the loader's all-or-nothing `[heal]` gate, and
+    // handled anyway: a neutral sentence beats a silent turn.
+    memset(&move, 0, sizeof(move));
+    clam(CLAM_WARN, ATK_CTX, "class '%s' had no %s heal move", src_class,
+        major ? "major" : "minor");
+  }
+
+  heal = (atk_heal_t){
+    .round_id = round.id,
+    .ns_id    = ns->id,
+    .src_user = ctx->username,
+    .src_nick = src_nick,
+    .tgt_user = tgt_user,
+    .tgt_nick = nick,
+    .amt      = amt,
+    .delta    = delta,
+    .wave     = round.wave,
+  };
+
+  if(atk_db_heal_apply(&heal) != SUCCESS)
+  {
+    pthread_mutex_unlock(&atk_turn_lock);
+    cmd_reply(ctx, "☠ The mending held nowhere — the pit's ledger "
+                   "refused it.");
+    return;
+  }
+
+  // Announced under the lock, so two turns cannot interleave their
+  // narration.
+  atk_render_heal(line, sizeof(line), src_nick, nick,
+      spoken ? &move : NULL, delta, 0, tgt.hp + delta, tgt.hp_max);
+  cmd_reply(ctx, line);
+
+  pthread_mutex_unlock(&atk_turn_lock);
+
+  clam(CLAM_INFO, ATK_CTX, "round %" PRId64 ": %s mended %s for %d",
+      round.id, ctx->username, tgt_user, delta);
+}
+
+// ------------------------------------------------------------------ //
 // Registration                                                        //
 // ------------------------------------------------------------------ //
 
@@ -548,6 +792,12 @@ atk_cmd_reload(const cmd_ctx_t *ctx)
 // [ ] \ ` _ ^ { | } and '-'.
 static const cmd_arg_desc_t atk_attack_args[] = {
   { "nick", CMD_ARG_NONE, CMD_ARG_REQUIRED, ATK_NICK_SZ - 1, NULL },
+};
+
+// Optional, and CMD_ARG_NONE for the same reason as the blade's: with no
+// argument at all you mend yourself, which is the common case.
+static const cmd_arg_desc_t atk_heal_args[] = {
+  { "nick", CMD_ARG_NONE, CMD_ARG_OPTIONAL, ATK_NICK_SZ - 1, NULL },
 };
 
 bool
@@ -594,6 +844,32 @@ atk_commands_register(void)
         NULL, 0, NULL, NULL) != SUCCESS)
     return(FAIL);
 
+  // A ROOT, not a child of `attack` — the opposite trade to `reload`
+  // above, and for the opposite reason. Children resolve before the
+  // root's argument, so `attack heal` as a child would make a combatant
+  // nicknamed `heal` unattackable; the verb is frequent and
+  // player-facing, so it earns a name of its own instead.
+  if(cmd_register("attack", "heal",
+        "heal [nick]",
+        "Mend a combatant instead of striking one.",
+        "Only a combatant whose character class knows healing may heal — "
+        "`show attack classes` says which do. Healing spends your turn "
+        "for the wave exactly as an attack does, so it is a trade and "
+        "never a free action, and it is the one thing a class can do that "
+        "another cannot. With no argument you mend yourself, which is "
+        "allowed and is the common case. How much is restored is rolled "
+        "by the pit, not by your class: a minor mend restores "
+        "`plugin.attack.heal.minor_min`..`minor_max` hit points and a "
+        "major one `major_min`..`major_max`. Nobody can be healed past "
+        "the health they started with, and the number announced is always "
+        "the number the health bar moved.",
+        USERNS_GROUP_USER, 0, CMD_SCOPE_PUBLIC, METHOD_T_ANY,
+        atk_cmd_heal, NULL, NULL, NULL,
+        atk_heal_args,
+        (uint8_t)(sizeof(atk_heal_args) / sizeof(atk_heal_args[0])),
+        NULL, NULL) != SUCCESS)
+    return(FAIL);
+
   // The read-only views hang off the core `show` parent, not off this
   // command; attack_show.c owns them.
   if(atk_show_register() != SUCCESS)
@@ -602,14 +878,19 @@ atk_commands_register(void)
   return(SUCCESS);
 }
 
-// Two roots, two paths: `!attack` and the `show attack` card with its own
-// children. Both unregister depth-first, so no parent is left holding a
-// freed child. Core would reclaim these anyway — saying so ourselves is
-// what keeps the unload audit reading `deinit() complete` instead of
-// naming us as the plugin that had to be tidied up after.
+// Three paths cover every definition this plugin owns: the `attack` root
+// with its `reload` child, the `heal` root, and the `show attack` card
+// with its two children. Each unregisters depth-first, so no parent is
+// left holding a freed child. Core would reclaim these anyway — saying so
+// ourselves is what keeps the unload audit reading `deinit() complete`
+// instead of naming us as the plugin that had to be tidied up after.
+//
+// A definition added anywhere in this plugin must fall under one of these
+// paths or earn a call of its own here.
 void
 atk_commands_unregister(void)
 {
   cmd_unregister_path("attack");
+  cmd_unregister_path("heal");
   cmd_unregister_path("show/attack");
 }

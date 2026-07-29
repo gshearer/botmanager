@@ -32,9 +32,13 @@
 #define ATK_W_BAR     15   // the health bar, one cell per glyph
 #define ATK_W_HP       9   // "74/100"
 #define ATK_W_NUM      7   // dealt, taken
+// Hit points restored. Shared by both views, exactly as ATK_W_CLASS is,
+// so the card and the leaderboard can never disagree about the column.
+#define ATK_W_HEALED   7
 #define ATK_W_CRIT     6
 #define ATK_W_CARD    (2 + ATK_W_NAME + ATK_W_CLASS + ATK_W_BAR + 1 \
-                         + ATK_W_HP + 2 * ATK_W_NUM + ATK_W_CRIT)
+                         + ATK_W_HP + 2 * ATK_W_NUM + ATK_W_HEALED \
+                         + ATK_W_CRIT)
 
 #define ATK_W_RANK     3
 #define ATK_W_ROUNDS   7
@@ -46,7 +50,8 @@
 #define ATK_W_BEST     6
 #define ATK_W_BOARD   (2 + ATK_W_RANK + 1 + ATK_W_NAME + ATK_W_ROUNDS \
                          + ATK_W_KILLS + ATK_W_DEATHS + ATK_W_DEALT \
-                         + ATK_W_TAKEN + ATK_W_CRITS + ATK_W_BEST)
+                         + ATK_W_TAKEN + ATK_W_HEALED + ATK_W_CRITS \
+                         + ATK_W_BEST)
 
 // One column's worth of text plus its color markers.
 #define ATK_CELL_SZ  128
@@ -216,6 +221,25 @@ atk_fmt_num(char *out, size_t cap, int64_t v, int width)
     snprintf(out, cap, "%.0f%c", scaled, unit[u]);
 }
 
+// Hit points restored, in both views. Nought is drawn as the same gray
+// `×` an unstruck critical gets rather than as a `0`: most combatants
+// cannot heal at all, and a column of zeroes would read as a class
+// failing at something rather than as one that never tries.
+static void
+atk_healed_cell(char *out, size_t cap, int64_t healed)
+{
+  char num[32];
+
+  if(healed <= 0)
+  {
+    snprintf(out, cap, CLR_GRAY "×" CLR_RESET);
+    return;
+  }
+
+  atk_fmt_num(num, sizeof(num), healed, ATK_W_HEALED);
+  snprintf(out, cap, CLR_GREEN "%s" CLR_RESET, num);
+}
+
 // A horizontal rule `cols` columns wide, in the dim color the tables
 // frame themselves with.
 static void
@@ -320,6 +344,10 @@ atk_card_header(const cmd_ctx_t *ctx)
   atk_pad(cell, sizeof(cell), ATK_W_NUM);
   atk_cat(line, sizeof(line), cell);
 
+  snprintf(cell, sizeof(cell), "healed");
+  atk_pad(cell, sizeof(cell), ATK_W_HEALED);
+  atk_cat(line, sizeof(line), cell);
+
   snprintf(cell, sizeof(cell), "crit");
   atk_pad(cell, sizeof(cell), ATK_W_CRIT);
   atk_cat(line, sizeof(line), cell);
@@ -412,6 +440,10 @@ atk_card_row(const cmd_ctx_t *ctx, const atk_card_row_t *row,
 
   atk_fmt_num(cell, sizeof(cell), row->dmg_taken, ATK_W_NUM);
   atk_pad(cell, sizeof(cell), ATK_W_NUM);
+  atk_cat(line, sizeof(line), cell);
+
+  atk_healed_cell(cell, sizeof(cell), row->heal_given);
+  atk_pad(cell, sizeof(cell), ATK_W_HEALED);
   atk_cat(line, sizeof(line), cell);
 
   if(row->best_crit > 0)
@@ -571,6 +603,10 @@ atk_board_header(const cmd_ctx_t *ctx)
   atk_pad(cell, sizeof(cell), ATK_W_TAKEN);
   atk_cat(line, sizeof(line), cell);
 
+  snprintf(cell, sizeof(cell), "healed");
+  atk_pad(cell, sizeof(cell), ATK_W_HEALED);
+  atk_cat(line, sizeof(line), cell);
+
   snprintf(cell, sizeof(cell), "crits");
   atk_pad(cell, sizeof(cell), ATK_W_CRITS);
   atk_cat(line, sizeof(line), cell);
@@ -631,6 +667,10 @@ atk_board_row(const cmd_ctx_t *ctx, uint32_t rank,
 
   atk_fmt_num(cell, sizeof(cell), row->dmg_taken, ATK_W_TAKEN);
   atk_pad(cell, sizeof(cell), ATK_W_TAKEN);
+  atk_cat(line, sizeof(line), cell);
+
+  atk_healed_cell(cell, sizeof(cell), row->heal_given);
+  atk_pad(cell, sizeof(cell), ATK_W_HEALED);
   atk_cat(line, sizeof(line), cell);
 
   atk_fmt_num(cell, sizeof(cell), row->crits, ATK_W_CRITS);

@@ -275,6 +275,24 @@ typedef struct
   bool        fatal;     // the target reaches 0 hp
 } atk_blow_t;
 
+// One resolved heal, ready to be written. `amt` is what the engine
+// rolled; `delta` is what the health bar will actually move once the
+// overheal is clamped, and it is the only number the room is ever told —
+// a line announcing 18 while the bar moved 4 is a lie the round card
+// would contradict on the very next `show attack`.
+typedef struct
+{
+  int64_t     round_id;
+  uint32_t    ns_id;
+  const char *src_user;
+  const char *src_nick;
+  const char *tgt_user;
+  const char *tgt_nick;
+  int32_t     amt;
+  int32_t     delta;
+  int32_t     wave;      // the wave the healer is spending
+} atk_heal_t;
+
 // ---- The read-only views (show attack, show attack scores) ---------- //
 //
 // These three carry display names, never identities: `name` is the last
@@ -308,6 +326,7 @@ typedef struct
   int32_t hp_max;
   int32_t dmg_given;
   int32_t dmg_taken;
+  int32_t heal_given;
   int32_t best_crit;
   int32_t last_wave;
 } atk_card_row_t;
@@ -321,6 +340,7 @@ typedef struct
   int32_t deaths;
   int64_t dmg_given;
   int64_t dmg_taken;
+  int64_t heal_given;
   int32_t crits;
   int32_t best_crit;
 } atk_score_row_t;
@@ -541,6 +561,7 @@ void atk_macro_expand(char *out, size_t cap, const char *tmpl,
 // templates — the FORMAT CONTRACT is in attack_class.c beside them and a
 // miscounted slot is a crash, not a typo. Never NULL.
 const char *atk_fallback_blow(void);
+const char *atk_fallback_heal(void);
 const char *atk_fallback_death(void);
 const char *atk_fallback_dot_inflict(atk_dot_kind_t kind);
 const char *atk_fallback_decay(atk_dot_kind_t kind);
@@ -603,6 +624,16 @@ bool atk_db_pending(int64_t round_id, int32_t wave, char *out,
 // nothing; a daemon death mid-turn can never leave the attacker charged
 // for a blow the target never took.
 bool atk_db_blow_apply(const atk_blow_t *blow);
+
+// Write a whole heal as one transaction: the target's health and both
+// heal tallies, the healer's spent wave, the round's clock, and both
+// lifetime score rows. The wave turns behind it exactly as it does behind
+// a blow — a pit of healers would otherwise deadlock.
+//
+// The overheal is clamped in SQL (`LEAST(hp + amt, hp_max)`) and the
+// tallies are credited `delta`, which the caller computed under the turn
+// lock from the same row it is about to write. Announce `delta`.
+bool atk_db_heal_apply(const atk_heal_t *heal);
 
 // Spend a turn that deals no instant damage — a damage-over-time turn.
 // The attacker still burns their swing and still bumps `blows`, and the
@@ -707,6 +738,19 @@ atk_flavour_t atk_severity(const atk_tunables_t *t, int32_t dmg);
 void atk_render_blow(char *out, size_t cap, const char *src_nick,
     const char *tgt_nick, atk_flavour_t tier, const atk_move_t *move,
     int32_t dmg, uint32_t bonus_pct, int32_t hp, int32_t hp_max);
+
+// One finished heal line, dressed as the peer of a blow so that mending
+// reads as one turn among turns rather than as a system notice. The split
+// is the charter's, exactly as it is for a blow: the ENGINE rolled the
+// band and the number, and `move` supplies only the sentence — NULL means
+// the healer's class had nothing to say and the neutral line stands in.
+//
+// `amt` is the CLAMPED delta, never the roll: the number spoken and the
+// movement of the health bar are the same thing or the card contradicts
+// the line. `bonus_pct` renders the deferral badge; 0 draws none.
+void atk_render_heal(char *out, size_t cap, const char *src_nick,
+    const char *tgt_nick, const atk_move_t *move, int32_t amt,
+    uint32_t bonus_pct, int32_t hp, int32_t hp_max);
 
 // The killing blow, in the slayer's own voice where their sheet has one.
 // `move` NULL falls back to the engine's neutral death line.
