@@ -3,10 +3,12 @@
 
 #define CLAUDE_INTERNAL
 #include "claude.h"
+#include "colors.h"
 
 #include <fcntl.h>
 #include <stdio.h>
 #include <string.h>
+#include <strings.h>   // strcasecmp
 #include <time.h>
 #include <unistd.h>
 
@@ -17,6 +19,7 @@ extern char **environ;
 // ------------------------------------------------------------------ //
 
 static void  claude_cmd(const cmd_ctx_t *ctx);
+static void  claude_show_cmd(const cmd_ctx_t *ctx);
 static bool  claude_init(void);
 static void  claude_deinit(void);
 
@@ -33,6 +36,13 @@ static bool  claude_load_preamble(const char *cwd, const char *rel_path,
                  char *buf, size_t bufsz, size_t *out_len);
 static void  claude_pending_clear(void);
 static void  claude_pending_deliver(task_t *t);
+
+static void  claude_prompt_append(char *prompt, size_t cap, size_t *len,
+                 const char *tok);
+static void  claude_parse_flags(const char *args,
+                 char *model, size_t model_cap, bool *have_model,
+                 char *effort, size_t effort_cap, bool *have_effort,
+                 char *prompt, size_t prompt_cap);
 
 // ------------------------------------------------------------------ //
 // File-static state                                                   //
@@ -538,6 +548,27 @@ claude_pending_deliver(task_t *t)
 }
 
 // ------------------------------------------------------------------ //
+// --model / --effort reference lists (for /show claude)               //
+// ------------------------------------------------------------------ //
+
+// Non-exhaustive reference for operators picking --model; the claude
+// CLI itself is authoritative on what a given install actually accepts.
+static const char *const claude_known_models[] = {
+  "claude-opus-5",
+  "claude-sonnet-5",
+  "claude-haiku-4-5",
+  "claude-fable-5",
+  "claude-opus-4-8",
+  "claude-sonnet-4-6",
+  NULL,
+};
+
+// Valid --effort values, per the claude CLI (see plugin.claude.effort).
+static const char *const claude_known_efforts[] = {
+  "low", "medium", "high", "xhigh", "max", NULL,
+};
+
+// ------------------------------------------------------------------ //
 // /claude command                                                     //
 // ------------------------------------------------------------------ //
 
@@ -755,12 +786,128 @@ claude_build_argv(const claude_session_t *s, const char *prompt,
   argv[a]   = NULL;
 }
 
+// Append tok to prompt (space-separated, rebuilding the residual free
+// text as flags are stripped out of it). Truncates silently if cap is
+// exhausted -- mirrors ask_cmd.c's ask_query_append.
+static void
+claude_prompt_append(char *prompt, size_t cap, size_t *len, const char *tok)
+{
+  int wrote;
+
+  if(*len >= cap)
+    return;
+
+  wrote = snprintf(prompt + *len, cap - *len, "%s%s",
+      *len > 0 ? " " : "", tok);
+
+  if(wrote > 0)
+    *len += (size_t)wrote < cap - *len ? (size_t)wrote : cap - *len - 1;
+}
+
+// Split a /claude invocation into optional "--model <name>" / "--effort
+// <level>" overrides (each consumed on first occurrence, in either
+// order, anywhere in the line) and the residual prompt text. A trailing
+// flag with no following token is dropped, same as ask_cmd.c's "-m".
+// Values are passed straight through to the claude CLI -- unrecognized
+// strings surface as the CLI's own error rather than being rejected
+// here, since new models/efforts land before this plugin's reference
+// list is updated.
+static void
+claude_parse_flags(const char *args,
+    char *model, size_t model_cap, bool *have_model,
+    char *effort, size_t effort_cap, bool *have_effort,
+    char *prompt, size_t prompt_cap)
+{
+  char    scratch[METHOD_TEXT_SZ];
+  char   *save;
+  size_t  plen = 0;
+
+  snprintf(scratch, sizeof(scratch), "%s", args);
+  model[0]     = '\0';
+  effort[0]    = '\0';
+  prompt[0]    = '\0';
+  *have_model  = false;
+  *have_effort = false;
+
+  for(char *tok = strtok_r(scratch, " \t", &save); tok != NULL;
+      tok = strtok_r(NULL, " \t", &save))
+  {
+    if(!*have_model && strcmp(tok, "--model") == 0)
+    {
+      char *v = strtok_r(NULL, " \t", &save);
+
+      if(v == NULL)
+        continue;                    // trailing "--model", no value: drop
+
+      snprintf(model, model_cap, "%s", v);
+      *have_model = true;
+      continue;
+    }
+
+    if(!*have_effort && strcmp(tok, "--effort") == 0)
+    {
+      char *v = strtok_r(NULL, " \t", &save);
+
+      if(v == NULL)
+        continue;
+
+      snprintf(effort, effort_cap, "%s", v);
+      *have_effort = true;
+      continue;
+    }
+
+    claude_prompt_append(prompt, prompt_cap, &plen, tok);
+  }
+}
+
+static void
+claude_show_cmd(const cmd_ctx_t *ctx)
+{
+  claude_session_t s;
+  char             line[192];
+  size_t           i;
+
+  claude_load_session(&s);
+
+  cmd_reply(ctx, CLR_BOLD "claude" CLR_RESET
+      "  ·  --model / --effort reference (not exhaustive -- the claude"
+      " CLI is authoritative). " CLR_YELLOW "★" CLR_RESET
+      " marks the current plugin.claude.* default.");
+
+  cmd_reply(ctx, CLR_BOLD "models:" CLR_RESET);
+
+  for(i = 0; claude_known_models[i] != NULL; i++)
+  {
+    bool is_def = strcasecmp(claude_known_models[i], s.model) == 0;
+
+    snprintf(line, sizeof(line), " %s " CLR_CYAN "%s" CLR_RESET,
+        is_def ? CLR_YELLOW "★" CLR_RESET : " ",
+        claude_known_models[i]);
+    cmd_reply(ctx, line);
+  }
+
+  cmd_reply(ctx, CLR_BOLD "effort levels:" CLR_RESET);
+
+  for(i = 0; claude_known_efforts[i] != NULL; i++)
+  {
+    bool is_def = strcasecmp(claude_known_efforts[i], s.effort) == 0;
+
+    snprintf(line, sizeof(line), " %s " CLR_WHITE "%s" CLR_RESET,
+        is_def ? CLR_YELLOW "★" CLR_RESET : " ",
+        claude_known_efforts[i]);
+    cmd_reply(ctx, line);
+  }
+}
+
 static void
 claude_cmd(const cmd_ctx_t *ctx)
 {
   claude_session_t s;
   size_t preamble_len = 0;
   char prompt[CLAUDE_PROMPT_SZ];
+  char body[CLAUDE_PROMPT_SZ];
+  char model_ovr[128];
+  char effort_ovr[32];
   char env_bctl[1024];
   char env_target[METHOD_CHANNEL_SZ + 32];
   char env_method[METHOD_SENDER_SZ  + 32];
@@ -773,15 +920,28 @@ claude_cmd(const cmd_ctx_t *ctx)
   const char *target;
   char **envp;
   bool spawn_rc;
+  bool have_model_ovr;
+  bool have_effort_ovr;
   time_t session_t0;
-  const char *user_prompt = ctx->args != NULL ? ctx->args : "";
+  const char *raw_args = ctx->args != NULL ? ctx->args : "";
 
-  while(*user_prompt == ' ' || *user_prompt == '\t')
-    user_prompt++;
+  while(*raw_args == ' ' || *raw_args == '\t')
+    raw_args++;
 
-  if(*user_prompt == '\0')
+  if(*raw_args == '\0')
   {
     cmd_reply(ctx, "claude: empty prompt");
+    return;
+  }
+
+  claude_parse_flags(raw_args,
+      model_ovr, sizeof(model_ovr), &have_model_ovr,
+      effort_ovr, sizeof(effort_ovr), &have_effort_ovr,
+      body, sizeof(body));
+
+  if(body[0] == '\0')
+  {
+    cmd_reply(ctx, "claude: empty prompt (only --model/--effort given)");
     return;
   }
 
@@ -800,7 +960,16 @@ claude_cmd(const cmd_ctx_t *ctx)
   claude_session_started = session_t0;
 
   claude_load_session(&s);
-  claude_assemble_prompt(&s, user_prompt, prompt, sizeof(prompt),
+
+  // Per-invocation overrides win over the plugin.claude.* KV defaults,
+  // but only for this call -- the KV values are left untouched.
+  if(have_model_ovr)
+    snprintf(s.model, sizeof(s.model), "%s", model_ovr);
+
+  if(have_effort_ovr)
+    snprintf(s.effort, sizeof(s.effort), "%s", effort_ovr);
+
+  claude_assemble_prompt(&s, body, prompt, sizeof(prompt),
       &preamble_len);
 
   network = method_inst_name(ctx->msg->inst);
@@ -822,8 +991,10 @@ claude_cmd(const cmd_ctx_t *ctx)
 
   clam(CLAM_INFO, CLAUDE_CTX,
       "spawn: %s -p <prompt=%zu bytes, preamble=%zu bytes>"
-      " --model %s%s for %s@%s",
+      " --model %s%s%s%s for %s@%s",
       s.cli_path, strlen(prompt), preamble_len, s.model,
+      s.effort[0] != '\0' ? " --effort " : "",
+      s.effort[0] != '\0' ? s.effort : "",
       s.yolo != 0 ? " --dangerously-skip-permissions" : "",
       target != NULL ? target : "<unknown>",
       network != NULL ? network : "<unknown>");
@@ -869,13 +1040,21 @@ claude_init(void)
 {
   int64_t ts;
   if(cmd_register(CLAUDE_CTX, CLAUDE_CTX,
-      "claude <prompt>",
+      "claude [--model <name>] [--effort <level>] <prompt>",
       "Run the claude CLI with <prompt>, reply with its stdout",
       "Owner-only bridge to the claude CLI. The prompt is prefixed"
       " by the preamble at plugin.claude.preamble_path (default:"
       " prompts/claude_builtin.txt in the project root) and passed as"
       " `claude -p <preamble+prompt>`. Captured stdout replies on"
       " the originating method (IRC channel, DM, or botmanctl).\n"
+      "\n"
+      "--model and --effort override the plugin.claude.model /"
+      " plugin.claude.effort KV defaults for this invocation only;"
+      " either or both may be given, in either order, before the"
+      " prompt text. `!show claude` lists a reference set of known"
+      " model names and effort levels -- values are passed straight"
+      " through to the claude CLI, which is authoritative on what it"
+      " actually accepts.\n"
       "\n"
       "If the preamble instructs the CLI to restart the daemon, it"
       " invokes scripts/botman-restart.sh, which runs ninja, stashes"
@@ -893,6 +1072,17 @@ claude_init(void)
       sizeof(claude_cmd_args) / sizeof(claude_cmd_args[0]),
       NULL, NULL) != SUCCESS)
     return(FAIL);
+
+  if(cmd_register(CLAUDE_CTX, CLAUDE_CTX, "show claude",
+      "List known --model names and --effort levels for /claude", NULL,
+      USERNS_GROUP_OWNER, USERNS_OWNER_LEVEL,
+      CMD_SCOPE_ANY, METHOD_T_ANY,
+      claude_show_cmd, NULL,
+      "show", NULL, NULL, 0, NULL, NULL) != SUCCESS)
+  {
+    cmd_unregister_path(CLAUDE_CTX);
+    return(FAIL);
+  }
 
   ts = kv_get_int("plugin.claude.pending.ts");
 
