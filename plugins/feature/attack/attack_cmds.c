@@ -80,11 +80,8 @@ atk_resolve_target(const cmd_ctx_t *ctx, const userns_t *ns,
     return(true);
   }
 
-  if(userns_user_exists(ns, nick))
-  {
-    snprintf(out, cap, "%s", nick);
+  if(userns_user_lookup_ci(ns, nick, out, cap))
     return(true);
-  }
 
   return(false);
 }

@@ -943,6 +943,49 @@ userns_user_exists(const userns_t *ns, const char *username)
 }
 
 bool
+userns_user_lookup_ci(const userns_t *ns, const char *username,
+    char *out, size_t cap)
+{
+  char        *esc_user;
+  char         sql[256];
+  db_result_t *r;
+  bool         found;
+
+  if(!userns_ready || ns == NULL || username == NULL ||
+     out == NULL || cap == 0)
+    return(false);
+
+  esc_user = db_escape(username);
+
+  if(esc_user == NULL)
+    return(false);
+
+  snprintf(sql, sizeof(sql),
+      "SELECT username FROM userns_user WHERE ns_id = %u"
+      " AND username ILIKE '%s' LIMIT 1",
+      ns->id, esc_user);
+
+  mem_free(esc_user);
+
+  r = db_result_alloc();
+
+  if(db_query(sql, r) != SUCCESS)
+  {
+    db_result_free(r);
+    return(false);
+  }
+
+  found = (r->rows > 0 && r->cols > 0);
+
+  if(found)
+    snprintf(out, cap, "%s", r->data[0]);
+
+  db_result_free(r);
+
+  return(found);
+}
+
+bool
 userns_user_set_password(const userns_t *ns, const char *username,
     const char *old_password, const char *new_password)
 {

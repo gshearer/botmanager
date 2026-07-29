@@ -111,6 +111,12 @@ bool userns_user_delete(const userns_t *ns, const char *username);
 
 bool userns_user_exists(const userns_t *ns, const char *username);
 
+// Case-insensitive match against a namespace's usernames. On a hit,
+// copies the canonically-stored username (not the caller's token) into
+// `out` and returns true.
+bool userns_user_lookup_ci(const userns_t *ns, const char *username,
+    char *out, size_t cap);
+
 // Old password must verify first. New password is validated against
 // policy and re-hashed.
 bool userns_user_set_password(const userns_t *ns, const char *username,
