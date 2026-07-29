@@ -32,8 +32,8 @@
 // `@name` be plain argument expansion into the existing fetch path.
 #define STOCK_LIST_TABLE    "stock_lists"
 #define STOCK_LIST_NAME_SZ  33    // 32-char list name + NUL
-#define STOCK_LIST_MAX      12    // symbols per list; see stock_lists.c
-#define STOCK_LIST_CSV_SZ   256   // STOCK_LIST_MAX * (STOCK_SYM_SZ + 1), rounded
+#define STOCK_LIST_MAX      40    // symbols per list; see stock_lists.c
+#define STOCK_LIST_CSV_SZ   768   // STOCK_LIST_MAX * (STOCK_SYM_SZ + 1), rounded
 
 typedef enum
 {

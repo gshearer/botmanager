@@ -25,8 +25,8 @@
 // and what makes a bare ETH in a list unambiguous.
 #define CRYPTO_LIST_TABLE    "crypto_lists"
 #define CRYPTO_LIST_NAME_SZ  33   // 32-char list name + NUL
-#define CRYPTO_LIST_MAX      12   // symbols per list; see crypto_lists.c
-#define CRYPTO_LIST_CSV_SZ   256  // CRYPTO_LIST_MAX * (SYMBOL_SZ + 1), rounded
+#define CRYPTO_LIST_MAX      40   // symbols per list; see crypto_lists.c
+#define CRYPTO_LIST_CSV_SZ   768  // CRYPTO_LIST_MAX * (SYMBOL_SZ + 1), rounded
 
 typedef enum
 {
