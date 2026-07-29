@@ -126,10 +126,17 @@ curl_request_release(curl_request_t *req)
   pthread_mutex_unlock(&curl_req_mutex);
 }
 
-// Header callback for libcurl. Captures only ETag and Last-Modified.
-// libcurl delivers each header line including the trailing CRLF; the
-// match is case-insensitive, the value is copied into the fixed request
-// buffer (bounded, NUL-terminated, CRLF-trimmed).
+// Header callback for libcurl. Captures only ETag, Last-Modified and
+// Set-Cookie. libcurl delivers each header line including the trailing
+// CRLF; the match is case-insensitive, the value is copied into the
+// fixed request buffer (bounded, NUL-terminated, CRLF-trimmed).
+//
+// Set-Cookie is handled differently from the other two: it may appear
+// many times in one response, so each line contributes its cookie-pair
+// (everything before the first ';' -- attributes are never sent back)
+// to a "a=1; b=2" accumulation that a caller can hand straight to
+// curl_request_add_header as a Cookie: header. Once the buffer is full
+// further pairs are dropped rather than truncated mid-pair.
 static size_t
 curl_header_cb(char *buf, size_t size, size_t nitems, void *userdata)
 {
@@ -152,6 +159,7 @@ curl_header_cb(char *buf, size_t size, size_t nitems, void *userdata)
     size_t i;
     size_t vstart;
     size_t vend;
+    bool   cookie = false;
 
     if(strncasecmp(buf, "ETag:", 5) == 0)
     {
@@ -165,6 +173,14 @@ curl_header_cb(char *buf, size_t size, size_t nitems, void *userdata)
       name_len = 14;
       dst      = req->resp_last_modified;
       dst_cap  = sizeof(req->resp_last_modified);
+    }
+
+    else if(strncasecmp(buf, "Set-Cookie:", 11) == 0)
+    {
+      name_len = 11;
+      dst      = req->resp_set_cookie;
+      dst_cap  = sizeof(req->resp_set_cookie);
+      cookie   = true;
     }
 
     else
@@ -184,10 +200,44 @@ curl_header_cb(char *buf, size_t size, size_t nitems, void *userdata)
             || buf[vend - 1] == ' ' || buf[vend - 1] == '\t'))
       vend--;
 
+    // Keep the cookie-pair only: everything from the first ';' on is
+    // attributes we would never echo back.
+    if(cookie)
+    {
+      size_t semi = vstart;
+
+      while(semi < vend && buf[semi] != ';')
+        semi++;
+
+      vend = semi;
+
+      while(vend > vstart && (buf[vend - 1] == ' ' || buf[vend - 1] == '\t'))
+        vend--;
+    }
+
     if(vend <= vstart)
       return(total);
 
     i = vend - vstart;
+
+    // Repeating header: append "; pair", or drop it whole if it no
+    // longer fits. Never a partial pair.
+    if(cookie)
+    {
+      size_t have = strnlen(dst, dst_cap);
+      size_t sep  = have > 0 ? 2 : 0;
+
+      if(have + sep + i >= dst_cap)
+        return(total);
+
+      if(sep > 0)
+        memcpy(dst + have, "; ", sep);
+
+      memcpy(dst + have + sep, buf + vstart, i);
+      dst[have + sep + i] = '\0';
+
+      return(total);
+    }
 
     if(i >= dst_cap)
       i = dst_cap - 1;
@@ -650,6 +700,8 @@ curl_finish_request(curl_request_t *req, CURLcode result)
         ? req->resp_etag : NULL;
     resp.last_modified = req->resp_last_modified[0]
         ? req->resp_last_modified : NULL;
+    resp.set_cookie = req->resp_set_cookie[0]
+        ? req->resp_set_cookie : NULL;
 
     // Byte counters.
     curl_easy_getinfo(req->easy, CURLINFO_SIZE_DOWNLOAD_T, &dl);
@@ -875,8 +927,9 @@ curl_drain_queue(void)
     curl_easy_setopt(easy, CURLOPT_WRITEFUNCTION, curl_write_cb);
     curl_easy_setopt(easy, CURLOPT_WRITEDATA, req);
 
-    // Header callback — captures ETag + Last-Modified into req's fixed
-    // buffers for conditional-GET support on the next fetch.
+    // Header callback — captures ETag + Last-Modified (conditional-GET
+    // support on the next fetch) and Set-Cookie (session bootstrap)
+    // into req's fixed buffers.
     curl_easy_setopt(easy, CURLOPT_HEADERFUNCTION, curl_header_cb);
     curl_easy_setopt(easy, CURLOPT_HEADERDATA, req);
 

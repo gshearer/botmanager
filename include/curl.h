@@ -40,6 +40,11 @@ typedef struct
   const char     *content_type; // Content-Type header value (or NULL)
   const char     *etag;         // ETag header value (or NULL)
   const char     *last_modified;// Last-Modified header value (or NULL)
+  const char     *set_cookie;   // every Set-Cookie cookie-pair seen on
+                                // the transfer, joined as "a=1; b=2" and
+                                // ready to hand back as a Cookie: request
+                                // header -- attributes (Path, Expires,
+                                // HttpOnly, ...) are dropped (or NULL)
   int             curl_code;    // CURLcode (0 = CURLE_OK)
   const char     *error;        // human-readable error (NULL on success)
   void           *user_data;    // caller's opaque pointer
@@ -230,6 +235,7 @@ void curl_iterate_active(curl_iter_cb_t cb, void *data);
 #define CURL_URL_SZ           2048
 #define CURL_CT_SZ            128
 #define CURL_UA_SZ            128
+#define CURL_COOKIE_SZ        1024
 
 typedef enum
 {
@@ -269,9 +275,13 @@ struct curl_request
 
   // Captured response headers of interest. Populated by the header
   // callback during transfer; surfaced on the delivered curl_response_t
-  // as `etag` / `last_modified`. Empty string means "not present".
+  // as `etag` / `last_modified` / `set_cookie`. Empty string means "not
+  // present". Set-Cookie is the one header that legitimately repeats, so
+  // its pairs accumulate (across redirect hops too) until the buffer is
+  // full; the others are last-write-wins.
   char                resp_etag          [128];
   char                resp_last_modified [64];
+  char                resp_set_cookie    [CURL_COOKIE_SZ];
 
   curl_done_cb_t      cb;
   void               *cb_data;
