@@ -445,6 +445,244 @@ ask_parse_flags(const char *args, char *model, size_t model_cap,
 }
 
 // -----------------------------------------------------------------------
+// Model markup -> abstract colour markers
+// -----------------------------------------------------------------------
+//
+// The model cannot emit raw control bytes. Asked for "\033[1m" or "\x02"
+// it reproduces the *notation* as literal text, which is what lands in the
+// channel. So !ask advertises markup the model can actually type — the
+// Markdown bold it already produces unprompted, plus <colour> tags — and
+// rewrites it here into the method-agnostic markers from colors.h.
+// method_send() then translates those to the driver's native codes, so one
+// answer renders correctly on IRC and on the botmanctl console alike.
+
+static const struct
+{
+  const char *name;
+  char        id;
+} ask_markup_colors[] = {
+  { "red",    'R' },
+  { "green",  'G' },
+  { "yellow", 'Y' },
+  { "blue",   'B' },
+  { "purple", 'P' },
+  { "cyan",   'C' },
+  { "white",  'W' },
+  { "orange", 'O' },
+  { "gray",   'A' },
+  { "grey",   'A' },
+};
+
+// Recognise a markup token at `p`. On a match `*id` receives the abstract
+// marker identifier ('b' bold toggle, 'X' close, else a colour) and `*len`
+// the token's byte length.
+static bool
+ask_markup_token(const char *p, char *id, size_t *len)
+{
+  const size_t n = sizeof(ask_markup_colors) / sizeof(ask_markup_colors[0]);
+
+  if(p[0] == '*' && p[1] == '*')
+  {
+    *id  = 'b';
+    *len = 2;
+    return(true);
+  }
+
+  if(p[0] != '<')
+    return(false);
+
+  // A closing tag resets everything; which colour it names doesn't matter,
+  // only that it names one (so real text like "<stdio.h>" passes through).
+  if(p[1] == '/')
+  {
+    for(size_t i = 0; i < n; i++)
+    {
+      size_t nl = strlen(ask_markup_colors[i].name);
+
+      if(strncasecmp(p + 2, ask_markup_colors[i].name, nl) == 0
+          && p[2 + nl] == '>')
+      {
+        *id  = 'X';
+        *len = nl + 3;
+        return(true);
+      }
+    }
+
+    return(false);
+  }
+
+  for(size_t i = 0; i < n; i++)
+  {
+    size_t nl = strlen(ask_markup_colors[i].name);
+
+    if(strncasecmp(p + 1, ask_markup_colors[i].name, nl) == 0
+        && p[1 + nl] == '>')
+    {
+      *id  = ask_markup_colors[i].id;
+      *len = nl + 2;
+      return(true);
+    }
+  }
+
+  return(false);
+}
+
+// Rewrite markup in `src` into abstract markers. Output is never longer
+// than input — every token is at least two bytes and becomes exactly two —
+// so a dst of strlen(src) + 1 always suffices.
+static void
+ask_markup_translate(char *dst, size_t dst_sz, const char *src)
+{
+  size_t di = 0;
+  size_t cap;
+
+  if(dst == NULL || dst_sz == 0)
+    return;
+
+  cap = dst_sz - 1;
+
+  for(size_t si = 0; src[si] != '\0'; )
+  {
+    char   id;
+    size_t len;
+
+    if(ask_markup_token(src + si, &id, &len))
+    {
+      if(di + 2 > cap)
+        break;
+
+      dst[di++] = '\x01';
+      dst[di++] = id;
+      si += len;
+      continue;
+    }
+
+    // A bare \x01 in the model's own output would be read as a marker
+    // downstream and swallow the byte after it. Drop it: the answer must
+    // not be able to forge formatting or eat its own text.
+    if(src[si] == '\x01')
+    {
+      si++;
+      continue;
+    }
+
+    if(di >= cap)
+      break;
+
+    dst[di++] = src[si++];
+  }
+
+  dst[di] = '\0';
+}
+
+// -----------------------------------------------------------------------
+// Wrapped emission
+// -----------------------------------------------------------------------
+
+// Formatting carried across wrapped lines. Every method drops formatting
+// at a message boundary, so a continuation line must re-open whatever was
+// still active when its predecessor broke.
+typedef struct
+{
+  bool bold;
+  char color;   // abstract marker id, or 0 for none
+} ask_fmt_t;
+
+static void
+ask_fmt_apply(ask_fmt_t *fmt, char id)
+{
+  if(id == 'b')
+    fmt->bold = !fmt->bold;
+
+  else if(id == 'X')
+  {
+    fmt->bold  = false;
+    fmt->color = 0;
+  }
+
+  else
+    fmt->color = id;
+}
+
+// Append to a line under construction. Markers are cosmetic, so a full
+// buffer drops them silently rather than truncating the answer.
+static void
+ask_line_put(char *line, size_t line_sz, size_t *li, const char *s)
+{
+  size_t n = strlen(s);
+
+  if(*li + n >= line_sz)
+    return;
+
+  memcpy(line + *li, s, n);
+  *li += n;
+}
+
+// Write `fmt` as a canonical marker sequence. Drivers have no "clear one
+// attribute" code, so a state change resets and re-states everything.
+static void
+ask_fmt_emit(char *line, size_t line_sz, size_t *li, const ask_fmt_t *fmt)
+{
+  char m[3];
+
+  ask_line_put(line, line_sz, li, "\x01X");
+
+  if(fmt->color != 0)
+  {
+    m[0] = '\x01';
+    m[1] = fmt->color;
+    m[2] = '\0';
+    ask_line_put(line, line_sz, li, m);
+  }
+
+  if(fmt->bold)
+    ask_line_put(line, line_sz, li, "\x01" "b");
+}
+
+// Byte length of the next line: at most `cols` *visible* characters.
+// Markers cost no columns, a multi-byte UTF-8 sequence counts as one, and
+// the break prefers the last space in the window.
+static size_t
+ask_wrap_take(const char *s, size_t len, size_t cols)
+{
+  size_t i        = 0;
+  size_t vis      = 0;
+  size_t brk      = 0;
+  bool   have_brk = false;
+
+  while(i < len)
+  {
+    if(s[i] == '\x01' && i + 1 < len)
+    {
+      i += 2;
+      continue;
+    }
+
+    if(vis == cols)
+      break;
+
+    if(s[i] == ' ')
+    {
+      brk      = i;
+      have_brk = true;
+    }
+
+    i++;
+
+    while(i < len && ((unsigned char)s[i] & 0xC0) == 0x80)
+      i++;
+
+    vis++;
+  }
+
+  if(i >= len)
+    return(len);
+
+  // brk == 0 would make no progress: hard-break the over-long word instead.
+  return((have_brk && brk > 0) ? brk : i);
+}
+
+// -----------------------------------------------------------------------
 // Async completion
 // -----------------------------------------------------------------------
 
@@ -455,10 +693,13 @@ ask_done(const llm_chat_response_t *resp)
 {
   ask_req_t  *r = (ask_req_t *)resp->user_data;
   cmd_ctx_t   ctx;
-  char        line[ASK_CMD_REPLY_SZ];
+  char        line[ASK_LINE_SZ];
+  char       *text;
+  size_t      text_sz;
   const char *p;
   uint32_t    max_lines;
   size_t      max_cols;
+  ask_fmt_t   fmt          = { false, 0 };
   uint32_t    emitted      = 0;
   bool        flood_capped = false;
 
@@ -485,7 +726,14 @@ ask_done(const llm_chat_response_t *resp)
   else if(max_cols > ASK_WRAP_COLS_MAX)
     max_cols = ASK_WRAP_COLS_MAX;
 
-  for(p = resp->content; p != NULL && *p != '\0' && !flood_capped; )
+  // Rewrite the model's markup into abstract markers up front, so the wrap
+  // below measures the answer as the channel will see it rather than
+  // counting tag bytes nobody renders.
+  text_sz = strlen(resp->content) + 1;
+  text    = mem_alloc(ASK_CMD_CTX, "markup", text_sz);
+  ask_markup_translate(text, text_sz, resp->content);
+
+  for(p = text; *p != '\0' && !flood_capped; )
   {
     const char *nl  = strchr(p, '\n');
     size_t      seg = (nl != NULL) ? (size_t)(nl - p) : strlen(p);
@@ -500,24 +748,8 @@ ask_done(const llm_chat_response_t *resp)
     // empty line (seg == 0) is skipped by the loop condition.
     for(off = 0; off < seg && !flood_capped; )
     {
-      size_t take = seg - off;
-
-      if(take > max_cols)
-      {
-        size_t brk = max_cols;
-
-        // Prefer the last space in the column window; hard-break a single
-        // over-long word when there is none.
-        while(brk > 0 && p[off + brk] != ' ')
-          brk--;
-
-        take = (brk > 0) ? brk : max_cols;
-      }
-
-      // Never split a UTF-8 multibyte sequence on a hard break: back off
-      // while the byte at the break point is a continuation byte.
-      while(take > 1 && ((unsigned char)p[off + take] & 0xC0) == 0x80)
-        take--;
+      size_t take = ask_wrap_take(p + off, seg - off, max_cols);
+      size_t li   = 0;
 
       if(emitted >= max_lines)
       {
@@ -526,7 +758,32 @@ ask_done(const llm_chat_response_t *resp)
         break;
       }
 
-      snprintf(line, sizeof(line), "%.*s", (int)take, p + off);
+      // Re-open formatting the previous line broke in the middle of.
+      if(fmt.bold || fmt.color != 0)
+        ask_fmt_emit(line, sizeof(line), &li, &fmt);
+
+      for(size_t i = 0; i < take; )
+      {
+        if(p[off + i] == '\x01' && i + 1 < take)
+        {
+          ask_fmt_apply(&fmt, p[off + i + 1]);
+          ask_fmt_emit(line, sizeof(line), &li, &fmt);
+          i += 2;
+          continue;
+        }
+
+        if(li + 1 < sizeof(line))
+          line[li++] = p[off + i];
+
+        i++;
+      }
+
+      // Close the line explicitly: a client that carried formatting past a
+      // message boundary would tint everything the bot says afterwards.
+      if(fmt.bold || fmt.color != 0)
+        ask_line_put(line, sizeof(line), &li, "\x01X");
+
+      line[li] = '\0';
       cmd_reply(&ctx, line);
       emitted++;
 
@@ -552,6 +809,7 @@ ask_done(const llm_chat_response_t *resp)
     cmd_reply(&ctx, "⋯ (answer cut off at the model's token limit — ask a"
         " narrower question or raise plugin.ask.max_tokens)");
 
+  mem_free(text);
   mem_free(r);
 }
 

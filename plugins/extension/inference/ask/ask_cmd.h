@@ -38,6 +38,13 @@
 #define ASK_WRAP_COLS_MIN  20
 #define ASK_WRAP_COLS_MAX  (ASK_CMD_REPLY_SZ - 1)
 
+// A wrapped line carries max_cols visible characters plus the colour
+// markers threaded through it, which occupy bytes but no columns. The
+// headroom is for those markers: appends are bounds-checked and drop
+// markers rather than text, so an answer dense with formatting loses
+// colour before it ever loses a character.
+#define ASK_LINE_SZ        (ASK_CMD_REPLY_SZ + 64)
+
 // Per-call closure carrying the saved command context through the async
 // llm_chat_submit callback. The context's msg pointer is rebound to the
 // embedded copy so it survives past the originating dispatch frame.
