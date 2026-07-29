@@ -259,6 +259,12 @@ The command surfaces filed beside these engines (`ask`, `claude`,
 | `whenmoon.live` | plugins/extension/whenmoon/live.c | live-trading runtime (`WM_LIVE_CTX`) |
 | `whenmoon.sweep` | plugins/extension/whenmoon/sweep.c | strategy sweep runner (`WM_SWEEP_CTX`) |
 
+## Misc plugins (`plugins/misc/`)
+
+| Context | Source | Description |
+|---|---|---|
+| `roulette` | plugins/misc/roulette/roulette.c | `!roulette` toy; logs only the IRC-operator KILL branch (`ROULETTE_CTX`) |
+
 ## Marketwatch event topics — `mw.<exch>.<event>.<id>`
 
 These are emitted at `CLAM_INFO` with a single-line JSON body in
