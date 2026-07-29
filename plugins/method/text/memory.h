@@ -146,7 +146,7 @@ void memory_register_config(void);
 // userns_init() (the tables FK into userns / userns_user).
 void memory_ensure_schema(void);
 
-// Register /memory * and /show memory commands. Must be called after
+// Register /user fact *, /user forget and /show memstore. Must be called after
 // cmd_init().
 void memory_register_commands(void);
 

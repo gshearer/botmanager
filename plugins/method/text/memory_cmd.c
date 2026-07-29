@@ -1,6 +1,6 @@
 // botmanager — MIT
 // Chat bot memory store: admin commands (/memory fact …, /memory forget …,
-// /show user {facts,log,rag}, /show memory).
+// /show user {facts,log,rag}, /show memstore).
 
 #define MEMORY_INTERNAL
 #include "memory.h"
@@ -432,9 +432,9 @@ memory_show_user_rag(const cmd_ctx_t *ctx, userns_t *ns,
   cmd_reply(ctx, line);
 }
 
-// /show memory
+// /show memstore
 static void
-cmd_show_memory(const cmd_ctx_t *ctx)
+cmd_show_memstore(const cmd_ctx_t *ctx)
 {
   memory_stats_t s;
   char buf[512];
@@ -492,7 +492,13 @@ cmd_show_memory(const cmd_ctx_t *ctx)
 // User-scoped read commands (facts, log, rag) live under /show user as
 // verb dispatch (see core/userns_cmd.c). User-scoped mutators (fact set,
 // fact del, forget) live under /user. Only the subsystem state view
-// (/show memory) is registered here.
+// (/show memstore) is registered here.
+//
+// That view is deliberately NOT /show memory: core's tracked allocator
+// owns that name (core/alloc.c mem_register_commands) and registers
+// first, so the bot-memory view was rejected as a duplicate for as long
+// as it claimed it. The two "memory" concepts are distinct — AGENTS.md
+// §Two Different "Memory" Concepts.
 
 static const cmd_arg_desc_t ad_user_fact_del[] = {
   { "id", CMD_ARG_DIGITS, CMD_ARG_REQUIRED, 20, NULL },
@@ -510,16 +516,26 @@ static const cmd_arg_desc_t ad_user_forget[] = {
   { "user", CMD_ARG_ALNUM, CMD_ARG_REQUIRED, USERNS_USER_SZ, NULL },
 };
 
+// Container stub — invoked when /user fact is typed with no verb.
+// cmd_register() rejects a definition with no callback, and a rejected
+// container takes both its children down with it (they can no longer
+// resolve the parent path), so this is load-bearing, not decoration.
+static void
+cmd_user_fact(const cmd_ctx_t *ctx)
+{
+  cmd_reply(ctx, "usage: /user fact <verb> ...  (set, del)");
+}
+
 void
 memory_register_cmds_internal(void)
 {
   // /user fact (container for set + del).
   cmd_register("memory", "fact",
-      "user fact",
+      "user fact <verb> ...",
       "Fact manipulation (set, del)",
       NULL,
       USERNS_GROUP_ADMIN, 100, CMD_SCOPE_ANY, METHOD_T_ANY,
-      NULL, NULL, "user", NULL, NULL, 0, NULL, NULL);
+      cmd_user_fact, NULL, "user", NULL, NULL, 0, NULL, NULL);
 
   cmd_register("memory", "set",
       "user fact set <user> <kind> <key> <value> [conf]",
@@ -547,11 +563,11 @@ memory_register_cmds_internal(void)
       ad_user_forget,
       (uint8_t)(sizeof(ad_user_forget) / sizeof(ad_user_forget[0])), NULL, NULL);
 
-  // /show memory — subsystem state (decay, totals).
-  cmd_register("memory", "memory",
-      "show memory",
-      "Show memory subsystem state",
+  // /show memstore — bot memory subsystem state (decay, totals).
+  cmd_register("memory", "memstore",
+      "show memstore",
+      "Show bot memory store state (facts, log, decay)",
       NULL,
       USERNS_GROUP_ADMIN, 100, CMD_SCOPE_ANY, METHOD_T_ANY,
-      cmd_show_memory, NULL, "show", "mem", NULL, 0, NULL, NULL);
+      cmd_show_memstore, NULL, "show", "ms", NULL, 0, NULL, NULL);
 }
