@@ -95,7 +95,6 @@ atk_dot_service(const atk_dot_due_t *d, const atk_tunables_t *t)
   int32_t       dmg;
   int32_t       new_hp;
   bool          fatal;
-  bool          refill = false;
 
   pthread_mutex_lock(&atk_turn_lock);
 
@@ -135,21 +134,15 @@ atk_dot_service(const atk_dot_due_t *d, const atk_tunables_t *t)
 
   if(fatal)
     atk_render_dot_death(line, sizeof(line), d->source_nick,
-        d->victim_nick, d->kind, t, &refill);
+        d->victim_nick, d->kind);
 
   else
     atk_render_dot_tick(line, sizeof(line), d->source_nick, d->victim_nick,
-        dmg, new_hp, victim.hp_max, d->kind, t, &refill);
+        dmg, new_hp, victim.hp_max, d->kind);
 
   pthread_mutex_unlock(&atk_turn_lock);
 
   atk_dot_speak(d, t, line, fatal);
-
-  // Last, with no lock held and the door already closed behind the
-  // fallen — the same ordering the turn path uses, for the same reason.
-  if(refill)
-    atk_llm_refill_kick(fatal ? ATK_FLAV_DOT_DEATH : ATK_FLAV_DOT_TICK,
-        t);
 }
 
 // ------------------------------------------------------------------ //
@@ -250,10 +243,9 @@ atk_dot_wake(void)
   pthread_mutex_unlock(&atk_dot_lock);
 }
 
-// task_cancel() does not wait for a callback already running, which is
-// the same exposure atk_llm_watch(false) carries: this is the best the
-// task API offers, and it closes the window that matters — a periodic
-// callback rescheduled into an unloaded .so.
+// task_cancel() does not wait for a callback already running. That is the
+// best the task API offers, and it closes the window that matters — a
+// periodic callback rescheduled into an unloaded .so.
 void
 atk_dot_stop(void)
 {

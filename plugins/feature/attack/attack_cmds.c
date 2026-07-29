@@ -109,11 +109,9 @@ atk_cmd_attack(const cmd_ctx_t *ctx)
   char            roster[ATK_ROSTER_SZ];
   int32_t         dmg;
   int32_t         new_hp;
-  bool            crit  = false;
-  bool            fatal = false;
-  bool            refill_blow  = false;   // the blow's own category
-  bool            refill_death = false;   // DEATH, on a fatal blow
-  bool            afflicted    = false;   // a DOT landed; wake the decay
+  bool            crit      = false;
+  bool            fatal     = false;
+  bool            afflicted = false;   // a DOT landed; wake the decay
 
   ns = userns_session_resolve(ctx);
 
@@ -148,15 +146,14 @@ atk_cmd_attack(const cmd_ctx_t *ctx)
   {
     snprintf(line, sizeof(line),
         "⚔ " CLR_PURPLE "%s" CLR_RESET
-        " is no one — the Underdark keeps no ledger for ghosts.", nick);
+        " is no one the pit has ever heard of.", nick);
     cmd_reply(ctx, line);
     return;
   }
 
   if(strcasecmp(tgt_user, ctx->username) == 0)
   {
-    cmd_reply(ctx, "⚔ Turning a blade on yourself is Vhaeraun's business, "
-        "not ours.");
+    cmd_reply(ctx, "⚔ You cannot attack yourself. Find someone else.");
     return;
   }
 
@@ -164,7 +161,7 @@ atk_cmd_attack(const cmd_ctx_t *ctx)
   {
     snprintf(line, sizeof(line),
         "⚔ " CLR_PURPLE "%s" CLR_RESET
-        " is not in this chamber. The pit takes only the present.", nick);
+        " is not in this room. The pit takes only the present.", nick);
     cmd_reply(ctx, line);
     return;
   }
@@ -268,20 +265,19 @@ atk_cmd_attack(const cmd_ctx_t *ctx)
   // ---- 10. announce, still under the lock so two turns cannot ------- //
   //          interleave their narration                               //
 
-  // A critical that kills gets the trout instead of the tier line. It
-  // draws from no pool, so `refill_blow` correctly stays false.
+  // A critical that kills gets the trout instead of the tier line.
   if(crit && fatal)
     atk_render_trout(line, sizeof(line), src_nick, nick, dmg);
 
   else
     atk_render_blow(line, sizeof(line), src_nick, nick, dmg,
-        new_hp, tgt.hp_max, &t, &refill_blow);
+        new_hp, tgt.hp_max, &t);
 
   cmd_reply(ctx, line);
 
   if(fatal)
   {
-    atk_render_death(line, sizeof(line), src_nick, nick, &t, &refill_death);
+    atk_render_death(line, sizeof(line), src_nick, nick);
     cmd_reply(ctx, line);
   }
 
@@ -353,23 +349,11 @@ atk_cmd_attack(const cmd_ctx_t *ctx)
   }
 
   // ---- the decay -------------------------------------------------- //
-  // Outside the turn lock, like the refill below: the task system is
+  // Last, with no lock held and the turn already over: the task system is
   // deliberately kept off the turn path entirely.
 
   if(afflicted)
     atk_dot_wake();
-
-  // ---- the flavour refill ------------------------------------------- //
-  // Last, with no lock held and the turn already over. The renderers
-  // only flagged the need; the task system is deliberately kept off the
-  // turn path entirely, so that "no LLM on the critical path" is
-  // inspectable rather than argued.
-
-  if(refill_blow)
-    atk_llm_refill_kick(atk_severity(&t, dmg), &t);
-
-  if(refill_death)
-    atk_llm_refill_kick(ATK_FLAV_DEATH, &t);
 }
 
 // ------------------------------------------------------------------ //

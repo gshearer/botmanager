@@ -2,7 +2,7 @@
 #define BM_ATTACK_H
 
 // botmanager — MIT
-// attack: the Drow duelling pit. `!attack <nick>` rolls damage against
+// attack: the duelling pit. `!attack <nick>` rolls damage against
 // another registered user; hit points, waves, and per-round + lifetime
 // scores persist in the caller's user namespace. The first death ends
 // the round, and where the protocol allows it the fallen are removed
@@ -45,18 +45,6 @@
 #define ATK_KV_EJECT       "plugin.attack.eject_on_death"
 #define ATK_KV_SCORE_ROWS  "plugin.attack.scoreboard_rows"
 
-// LLM-authored combat flavour. Every one of these is inert while
-// ATK_KV_LLM_MODEL names nothing usable: the pit then speaks from the
-// static tables in attack_combat.c, exactly as it always has.
-#define ATK_KV_LLM_MODEL   "plugin.attack.llm.model"
-#define ATK_KV_LLM_PROMPT  "plugin.attack.llm.prompt_file"
-#define ATK_KV_LLM_POOL    "plugin.attack.llm.pool_size"
-#define ATK_KV_LLM_REFILL  "plugin.attack.llm.refill_at"
-#define ATK_KV_LLM_TEMP    "plugin.attack.llm.temperature_pct"
-#define ATK_KV_LLM_TOKENS  "plugin.attack.llm.max_tokens"
-#define ATK_KV_LLM_TIMEOUT "plugin.attack.llm.timeout_secs"
-#define ATK_KV_LLM_RETRY   "plugin.attack.llm.retry_secs"
-
 // Damage over time: a wound that keeps working after the blow that made
 // it. `dot.chance_pct` at 0 turns the whole feature off.
 #define ATK_KV_DOT_CHANCE  "plugin.attack.dot.chance_pct"
@@ -79,44 +67,38 @@
 // The ceiling atk_tunables_load() clamps scoreboard_rows to. The
 // leaderboard's row array is sized from this, so the two must agree.
 #define ATK_MAX_SCORE_ROWS 50
-#define ATK_LINE_SZ        512                // one rendered, colorized line
+#define ATK_LINE_SZ        640                // one rendered, colorized line
 // A comma-joined display list. Deliberately well under ATK_LINE_SZ so
 // it always fits inside the sentence that carries it; a roster longer
 // than this would not survive an IRC line anyway.
 #define ATK_ROSTER_SZ      320
 
-// Ceiling on model-authored lines held per flavour category; the
-// pool_size knob clamps to it.
-#define ATK_LLM_POOL_MAX   64
-// One un-expanded template. The arithmetic that fixes this number:
-// ATK_LINE_SZ is 512 and must hold the EXPANDED line. Expansion
-// replaces {attacker}/{target} (10 and 8 bytes) with a colorized nick
-// (ATK_NICK_SZ 63 + ~10 bytes of colour = ~73 each) and {damage}
-// (8 bytes) with a colorized number (~20). {affliction} (12 bytes) is
-// replaced by the longest name in atk_dot_name[] ("myconid spores",
-// 14) plus ~10 of colour, another ~+14. Worst-case growth is about
-// +164 bytes, and atk_render_blow then adds the emoji prefix and the
-// " [nick — hp/hp hp]" tail, another ~90. 256 + 164 + 90 = 510 < 512.
-// It fits, but only just: lengthen an affliction name and this sum has
-// to be redone, or ATK_LINE_SZ raised. Do not raise this without
-// redoing that sum either.
-#define ATK_LLM_TMPL_SZ    256
-// Filesystem path to the persona prompt, relative to the daemon CWD.
-#define ATK_LLM_PATH_SZ    256
-// Longest model name the llm subsystem will hand back.
-#define ATK_LLM_MODEL_SZ   64
+// One un-expanded move, as a character sheet writes it. The arithmetic
+// that fixes this number, and that ATK_LINE_SZ above is sized from:
+//
+//   ATK_LINE_SZ must hold the EXPANDED line. Expansion replaces
+//   {attacker}/{target} (10 and 8 bytes) with a colorized nickname
+//   (ATK_NICK_SZ 63 + ~10 of colour ~= 73 each), {damage} or {heal}
+//   (8 or 6 bytes) with a colorized number (~20), and {affliction}
+//   (12 bytes) with a SHEET-SUPPLIED noun of up to 24 bytes plus ~10 of
+//   colour. Worst-case growth ~= +175 bytes. atk_render_blow() then adds
+//   the emoji prefix, the deferral badge (<= 10) and the
+//   " [nick — hp/hp hp]" tail, ~= +100.  256 + 175 + 100 = 531 of 640.
+//
+// Do not shrink either constant, and do not lengthen the noun bound,
+// without redoing that sum.
+#define ATK_MOVE_SZ        256
 
-// The seven independent flavour pools: four damage tiers, the killing
-// blow, and the two an affliction speaks. The order is used as an array
-// index AND as the severity ordering itself (MINOR < MEDIUM < MAJOR <
-// CRITICAL); keep the enum and every table keyed by it in step.
+// The seven line categories: four damage tiers, the killing blow, and
+// the two an affliction speaks. The order is used as an array index AND
+// as the severity ordering itself (MINOR < MEDIUM < MAJOR < CRITICAL);
+// keep the enum and every table keyed by it in step.
 //
 // The four damage tiers must stay contiguous and ascending — that is
 // what atk_severity() returns as an ordering, and the tables sized
 // ATK_FLAV_DEATH cover exactly them. The tail beyond them is three
-// non-tier categories in no particular order: the sanitiser reads its
-// requirements from a table indexed by category, so nothing keys off any
-// one of them being last.
+// non-tier categories in no particular order; nothing keys off any one
+// of them being last.
 typedef enum
 {
   ATK_FLAV_MINOR = 0,
@@ -131,8 +113,8 @@ typedef enum
 
 // The afflictions a blow may leave behind. The kind is chosen at inflict
 // time and stored on the row, because it is what makes the words
-// specific: the flavour layer substitutes its name rather than keeping a
-// pool per affliction.
+// specific: the renderer substitutes its name rather than keeping a
+// separate table per affliction.
 typedef enum
 {
   ATK_DOT_BLEED = 0,
@@ -169,18 +151,6 @@ typedef struct
   uint32_t round_timeout;    // seconds of silence before a round is cold
   uint32_t scoreboard_rows;  // rows shown by `show attack scores`
   bool     eject_on_death;   // remove the fallen where the method allows
-
-  // Flavour authorship. `llm_model` empty is the off switch, and is the
-  // shipped default: the pit speaks from its static tables until an
-  // operator names a chat model.
-  char     llm_model[ATK_LLM_MODEL_SZ];  // empty = feature off
-  char     llm_prompt[ATK_LLM_PATH_SZ];  // empty/unreadable = no persona
-  uint32_t llm_pool;         // lines held per category
-  uint32_t llm_refill_at;    // low-water mark; always < llm_pool
-  uint32_t llm_temp_pct;     // sampling temperature x100
-  uint32_t llm_max_tokens;   // ceiling per refill request
-  uint32_t llm_timeout;      // seconds per refill request
-  uint32_t llm_retry;        // seconds a failed category waits
 
   // Damage over time. `dot_chance_pct` 0 is the off switch and is
   // checked before anything else on the inflict path.
@@ -363,9 +333,8 @@ typedef struct
 
 // Serialises everything that mutates a round: the turn engine's steps
 // 5-10 and, on the other side of the plugin, every decay tick — a tick
-// decrements the same health a blow does. Defined in attack_cmds.c. The
-// lock ordering is atk_turn_lock -> atk_pool_lock, never the
-// reverse, and neither is ever held across a send.
+// decrements the same health a blow does. Defined in attack_cmds.c, and
+// never held across a send.
 extern pthread_mutex_t atk_turn_lock;
 
 void atk_tunables_load(atk_tunables_t *out);
@@ -483,28 +452,23 @@ int32_t atk_dmg_ceiling(const atk_tunables_t *t);
 
 // Which of the four damage tiers `dmg` belongs to, by percentage of
 // atk_dmg_ceiling(). Never returns ATK_FLAV_DEATH — a fatal blow
-// still renders its own tier, and the death LINE is a separate pool.
+// still renders its own tier, and the death LINE is a separate table.
 atk_flavour_t atk_severity(const atk_tunables_t *t, int32_t dmg);
 
-// Both renderers consult the flavour pool first and fall back to the
-// static tables. `need_refill` (may be NULL) reports that the pool they
-// drew from has reached its low-water mark; the CALLER kicks the refill,
-// after the turn lock is released.
-//
 // The blow takes no `crit` flag: the words, the colour and the emoji all
 // come from atk_severity(t, dmg). The crit roll still widens the
 // damage band and still feeds the scoreboard — it simply no longer
 // chooses the sentence.
 void atk_render_blow(char *out, size_t cap, const char *src_nick,
     const char *tgt_nick, int32_t dmg, int32_t hp,
-    int32_t hp_max, const atk_tunables_t *t, bool *need_refill);
+    int32_t hp_max, const atk_tunables_t *t);
 
 void atk_render_death(char *out, size_t cap, const char *slayer_nick,
-    const char *fallen_nick, const atk_tunables_t *t, bool *need_refill);
+    const char *fallen_nick);
 
 // The trout: a critical blow that kills speaks one fixed sentence in
-// place of the tier line. A static easter egg — never model-authored,
-// never pooled, and so it takes no tunables and flags no refill.
+// place of the tier line. A static easter egg, and the one piece of
+// flavour that is neither themed nor overridable.
 void atk_render_trout(char *out, size_t cap, const char *src_nick,
     const char *tgt_nick, int32_t dmg);
 
@@ -524,11 +488,10 @@ void atk_render_dot_inflict(char *out, size_t cap, const char *src_nick,
 // blow; the death line carries none.
 void atk_render_dot_tick(char *out, size_t cap, const char *src_nick,
     const char *tgt_nick, int32_t dmg, int32_t hp, int32_t hp_max,
-    atk_dot_kind_t kind, const atk_tunables_t *t, bool *need_refill);
+    atk_dot_kind_t kind);
 
 void atk_render_dot_death(char *out, size_t cap, const char *src_nick,
-    const char *tgt_nick, atk_dot_kind_t kind, const atk_tunables_t *t,
-    bool *need_refill);
+    const char *tgt_nick, atk_dot_kind_t kind);
 
 const char *atk_dot_name_of (atk_dot_kind_t kind);
 const char *atk_dot_emoji_of(atk_dot_kind_t kind);
@@ -538,8 +501,7 @@ const char *atk_dot_color_of(atk_dot_kind_t kind);
 
 // Start the decay task if it is not already queued, and clear its idle
 // clock either way. Called after an affliction lands, OUTSIDE the turn
-// lock — the same discipline that keeps the flavour refill off the turn
-// path.
+// lock — the turn path never touches the task system while it holds it.
 void atk_dot_wake(void);
 
 // Cancel the decay task and forget its handle. atk_deinit() MUST call
@@ -547,87 +509,20 @@ void atk_dot_wake(void);
 // freed memory on the next tick.
 void atk_dot_stop(void);
 
-// ---- LLM-authored flavour (attack_llm.c) --------------------------- //
-
-// True only when the inference plugin is loaded AND `t->llm_model` names
-// a usable chat model. The plugin_find() gate comes FIRST and is not
-// optional: the dlsym shims in inference.h abort() when inference is
-// absent, and attack must stay deployable on a daemon with no LLM.
-bool atk_llm_enabled(const atk_tunables_t *t);
-
-// Why flavour authorship is off, or NULL when it is on. Same four gates
-// as atk_llm_enabled(), in the same order, phrased for a reader.
-const char *atk_llm_offreason(const atk_tunables_t *t);
-
-// Pop a uniformly-chosen template out of `cat`'s pool, swap-removing it
-// so one pool generation never speaks the same line twice. SUCCESS with
-// `out` populated, or FAIL when the pool is empty — on FAIL the caller
-// renders from the static tables. *need_refill is set when the pool has
-// fallen to `refill_at`; the CALLER kicks the refill, and only after it
-// has released every lock it holds.
-bool atk_pool_take(atk_flavour_t cat, char *out, size_t cap,
-    uint32_t refill_at, bool *need_refill);
-
-// Record that a pool came up dry and the static tables spoke instead.
-void atk_pool_fallback(void);
-
-// Arm a background refill for one category. Idempotent and cheap: a
-// no-op when the feature is off, when a refill is already in flight, or
-// while the failure backoff is still running. Never call it while
-// holding atk_turn_lock — keeping the turn path free of the task
-// system entirely is what makes "no LLM on the critical path"
-// inspectable rather than argued.
-void atk_llm_refill_kick(atk_flavour_t cat, const atk_tunables_t *t);
-
-// Fill all five pools at startup, so the pit is flavoured before the
-// first blow rather than after it.
-void atk_llm_prime(const atk_tunables_t *t);
-
-// Throw away every pooled line and start again. Called when the operator
-// changes what the model was told — the preamble file, or the model
-// itself. Safe from any thread; takes atk_pool_lock only, and never
-// holds it across the re-prime.
-void atk_llm_invalidate(const char *why);
-
-// Watch the two keys that decide what the model is told, so a change to
-// either empties the pools. Installed in start(), and CLEARED in
-// deinit(): the KV entries outlive the plugin, and a callback left
-// pointing into an unloaded .so is a jump into freed memory on the next
-// `set kv`.
-void atk_llm_watch(bool on);
-
-// One category's pool as `show attack llm` sees it.
-typedef struct
-{
-  uint32_t depth;         // unspoken lines held
-  uint64_t served;        // templates handed to the renderer
-  uint64_t rejected;      // model lines the sanitiser threw away
-  int64_t  wait;          // seconds of failure backoff left, 0 = none
-  bool     inflight;      // a refill is outstanding
-  char     last_error[128];
-} atk_pool_stat_t;
-
-void atk_pool_stats(atk_flavour_t cat, atk_pool_stat_t *out);
-
-// How often a pool came up dry and the static tables spoke instead.
-uint64_t atk_pool_fallbacks(void);
-
-// Substitute {attacker}/{target}/{damage}/{affliction} into a bounded
-// buffer, copying every other byte literally. Never hands `tmpl` to a
-// printf conversion, and never rescans what it substituted — a `{`
-// inside a nickname is data. The values arrive already colorized,
-// exactly as they do for the static tables; NULL is legal for a token
-// the category's line can never carry and expands to nothing.
-void atk_tmpl_expand(char *out, size_t cap, const char *tmpl,
-    const char *attacker, const char *target, const char *damage,
-    const char *affliction);
-
 // ---- Command surface (attack_cmds.c) ------------------------------- //
 
 bool atk_commands_register(void);
 void atk_commands_unregister(void);
 
 // ---- The read-only views (attack_show.c) --------------------------- //
+
+// What the four damage tiers actually pay at the current tunables, read
+// back out of atk_severity() itself one damage value at a time rather
+// than re-derived from the KV percentages — so the line can never
+// disagree with the renderer. Not static: ATK-4 gives it its home under
+// `show attack classes`, where a reader asking what a class's `critical`
+// moves are worth can find it.
+void atk_flav_bands(const cmd_ctx_t *ctx, const atk_tunables_t *t);
 
 // Attach `show attack` and `show attack scores` beneath the core `show`
 // parent. Called from atk_commands_register().

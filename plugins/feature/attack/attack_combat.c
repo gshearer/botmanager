@@ -1,7 +1,13 @@
 // botmanager — MIT
-// attack combat: the damage roll and the Drow flavor that dresses it.
+// attack combat: the damage roll and the tables that dress it.
 // Nothing here touches the database or the command context — it turns
 // (tunables, two nicknames, a number) into one finished line of text.
+//
+// The tables below are still the old Drow ones. ATK-3 left them alone on
+// purpose: ATK-5 deletes the damage and inflict tables outright and
+// rewrites the death and decay tables plain, as the neutral fallbacks a
+// character sheet may override. Nothing ELSE in the plugin names a
+// setting any more.
 
 #define ATTACK_INTERNAL
 #include "attack.h"
@@ -446,43 +452,32 @@ atk_severity(const atk_tunables_t *t, int32_t dmg)
 // Rendering                                                           //
 // ------------------------------------------------------------------ //
 
-// The pool supplies the sentence and nothing else: the emoji prefix, the
-// colorization, and the health tail below are attack's own, whether the
-// words came from a model or from the tables above.
+// The table supplies the sentence and nothing else: the emoji prefix, the
+// colorization, and the health tail below are the engine's own.
 void
 atk_render_blow(char *out, size_t cap, const char *src_nick,
     const char *tgt_nick, int32_t dmg, int32_t hp, int32_t hp_max,
-    const atk_tunables_t *t, bool *need_refill)
+    const atk_tunables_t *t)
 {
   atk_flavour_t sev;
   char          src [ATK_NICK_SZ + 8];
   char          tgt [ATK_NICK_SZ + 8];
   char          dmgs[32];
   char          body[ATK_LINE_SZ];
-  char          tmpl[ATK_LLM_TMPL_SZ];
 
   if(out == NULL || cap == 0)
     return;
 
-  // Everything below — the pool, the table, the colour, the emoji — is
-  // driven by this one value, which is why the words can never again
-  // disagree with the number.
+  // Everything below — the table, the colour, the emoji — is driven by
+  // this one value, which is why the words can never again disagree with
+  // the number.
   sev = atk_severity(t, dmg);
 
   snprintf(src, sizeof(src), CLR_CYAN   "%s" CLR_RESET, src_nick);
   snprintf(tgt, sizeof(tgt), CLR_PURPLE "%s" CLR_RESET, tgt_nick);
   snprintf(dmgs, sizeof(dmgs), "%s%d" CLR_RESET, atk_tier_color[sev], dmg);
-
-  if(atk_pool_take(sev, tmpl, sizeof(tmpl),
-        t != NULL ? t->llm_refill_at : 0, need_refill) == SUCCESS)
-    atk_tmpl_expand(body, sizeof(body), tmpl, src, tgt, dmgs, NULL);
-
-  else
-  {
-    atk_pool_fallback();
-    snprintf(body, sizeof(body),
-        atk_tbl[sev][util_rand(atk_tbl_n[sev])], src, tgt, dmgs);
-  }
+  snprintf(body, sizeof(body),
+      atk_tbl[sev][util_rand(atk_tbl_n[sev])], src, tgt, dmgs);
 
   // The survivor's remaining health rides on every non-fatal line; the
   // nick inside the gray block stays plain so the block reads as one.
@@ -499,8 +494,7 @@ atk_render_blow(char *out, size_t cap, const char *src_nick,
 // critical that kills. It stands where the tier line would have stood —
 // it is the line that carries the number — and the ordinary death line
 // still follows it, so the death-line-before-eject law is untouched. No
-// pool is consulted and none is owed a refill; no health tail, because a
-// fatal blow carries no tally.
+// health tail, because a fatal blow carries no tally.
 void
 atk_render_trout(char *out, size_t cap, const char *src_nick,
     const char *tgt_nick, int32_t dmg)
@@ -515,33 +509,23 @@ atk_render_trout(char *out, size_t cap, const char *src_nick,
       atk_tier_color[ATK_FLAV_CRITICAL], dmg);
 }
 
+// The death line carries no tally: the blow that killed already said the
+// number.
 void
 atk_render_death(char *out, size_t cap, const char *slayer_nick,
-    const char *fallen_nick, const atk_tunables_t *t, bool *need_refill)
+    const char *fallen_nick)
 {
   char slayer[ATK_NICK_SZ + 8];
   char fallen[ATK_NICK_SZ + 8];
   char body  [ATK_LINE_SZ];
-  char tmpl  [ATK_LLM_TMPL_SZ];
 
   if(out == NULL || cap == 0)
     return;
 
   snprintf(slayer, sizeof(slayer), CLR_CYAN   "%s" CLR_RESET, slayer_nick);
   snprintf(fallen, sizeof(fallen), CLR_PURPLE "%s" CLR_RESET, fallen_nick);
-
-  // The death line carries no tally, so {damage} expands to nothing —
-  // the sanitiser rejects any death template that asks for one.
-  if(atk_pool_take(ATK_FLAV_DEATH, tmpl, sizeof(tmpl),
-        t != NULL ? t->llm_refill_at : 0, need_refill) == SUCCESS)
-    atk_tmpl_expand(body, sizeof(body), tmpl, slayer, fallen, "", NULL);
-
-  else
-  {
-    atk_pool_fallback();
-    snprintf(body, sizeof(body),
-        atk_deaths[util_rand(ATK_N(atk_deaths))], slayer, fallen);
-  }
+  snprintf(body, sizeof(body),
+      atk_deaths[util_rand(ATK_N(atk_deaths))], slayer, fallen);
 
   snprintf(out, cap, "☠ %s", body);
 }
@@ -553,14 +537,12 @@ atk_render_death(char *out, size_t cap, const char *slayer_nick,
 void
 atk_render_dot_tick(char *out, size_t cap, const char *src_nick,
     const char *tgt_nick, int32_t dmg, int32_t hp, int32_t hp_max,
-    atk_dot_kind_t kind, const atk_tunables_t *t, bool *need_refill)
+    atk_dot_kind_t kind)
 {
   char src [ATK_NICK_SZ + 8];
   char tgt [ATK_NICK_SZ + 8];
   char dmgs[32];
-  char aff [64];
   char body[ATK_LINE_SZ];
-  char tmpl[ATK_LLM_TMPL_SZ];
 
   if(out == NULL || cap == 0)
     return;
@@ -570,20 +552,9 @@ atk_render_dot_tick(char *out, size_t cap, const char *src_nick,
   snprintf(src, sizeof(src), CLR_CYAN   "%s" CLR_RESET, src_nick);
   snprintf(tgt, sizeof(tgt), CLR_PURPLE "%s" CLR_RESET, tgt_nick);
   snprintf(dmgs, sizeof(dmgs), "%s%d" CLR_RESET, atk_dot_color_of(kind), dmg);
-  snprintf(aff, sizeof(aff), "%s%s" CLR_RESET, atk_dot_color_of(kind),
-      atk_dot_name_of(kind));
-
-  if(atk_pool_take(ATK_FLAV_DOT_TICK, tmpl, sizeof(tmpl),
-        t != NULL ? t->llm_refill_at : 0, need_refill) == SUCCESS)
-    atk_tmpl_expand(body, sizeof(body), tmpl, src, tgt, dmgs, aff);
-
-  else
-  {
-    atk_pool_fallback();
-    snprintf(body, sizeof(body),
-        atk_dot_tick_tbl[kind][util_rand(atk_dot_tick_n[kind])],
-        src, tgt, dmgs);
-  }
+  snprintf(body, sizeof(body),
+      atk_dot_tick_tbl[kind][util_rand(atk_dot_tick_n[kind])],
+      src, tgt, dmgs);
 
   if(hp > 0)
     snprintf(out, cap, "%s %s " CLR_GRAY "[%s — %d/%d hp]" CLR_RESET,
@@ -595,14 +566,11 @@ atk_render_dot_tick(char *out, size_t cap, const char *src_nick,
 
 void
 atk_render_dot_death(char *out, size_t cap, const char *src_nick,
-    const char *tgt_nick, atk_dot_kind_t kind, const atk_tunables_t *t,
-    bool *need_refill)
+    const char *tgt_nick, atk_dot_kind_t kind)
 {
   char src [ATK_NICK_SZ + 8];
   char tgt [ATK_NICK_SZ + 8];
-  char aff [64];
   char body[ATK_LINE_SZ];
-  char tmpl[ATK_LLM_TMPL_SZ];
 
   if(out == NULL || cap == 0)
     return;
@@ -611,23 +579,11 @@ atk_render_dot_death(char *out, size_t cap, const char *src_nick,
 
   snprintf(src, sizeof(src), CLR_CYAN   "%s" CLR_RESET, src_nick);
   snprintf(tgt, sizeof(tgt), CLR_PURPLE "%s" CLR_RESET, tgt_nick);
-  snprintf(aff, sizeof(aff), "%s%s" CLR_RESET, atk_dot_color_of(kind),
-      atk_dot_name_of(kind));
 
-  // No tally, exactly as the blade's death line carries none: {damage}
-  // expands to nothing and the sanitiser rejects any template asking
-  // for one.
-  if(atk_pool_take(ATK_FLAV_DOT_DEATH, tmpl, sizeof(tmpl),
-        t != NULL ? t->llm_refill_at : 0, need_refill) == SUCCESS)
-    atk_tmpl_expand(body, sizeof(body), tmpl, src, tgt, "", aff);
-
-  else
-  {
-    atk_pool_fallback();
-    snprintf(body, sizeof(body),
-        atk_dot_death_tbl[kind][util_rand(atk_dot_death_n[kind])],
-        src, tgt);
-  }
+  // No tally, exactly as the blade's death line carries none.
+  snprintf(body, sizeof(body),
+      atk_dot_death_tbl[kind][util_rand(atk_dot_death_n[kind])],
+      src, tgt);
 
   // The same headstone the turn engine's death line carries, so a death
   // by decay is unmistakably the same event as a death by blade.

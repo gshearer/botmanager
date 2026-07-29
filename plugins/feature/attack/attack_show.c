@@ -1,13 +1,11 @@
 // botmanager — MIT
-// attack's three read-only views: `show attack` draws the round burning in
-// this room, `show attack scores` the lifetime standings of everyone who
-// has ever swung in this namespace, and `show attack llm` says where the
-// pit's words are coming from.
+// attack's read-only views: `show attack` draws the round burning in this
+// room, and `show attack scores` the lifetime standings of everyone who
+// has ever swung in this namespace.
 //
-// The first two are plain SELECTs and take no lock. atk_turn_lock
-// serialises *writers*; a blow lands as one transaction, so the worst a
-// reader can catch is the instant between two finished turns. The third
-// takes atk_pool_lock only, never the turn lock.
+// Both are plain SELECTs and take no lock. atk_turn_lock serialises
+// *writers*; a blow lands as one transaction, so the worst a reader can
+// catch is the instant between two finished turns.
 
 #define ATTACK_INTERNAL
 #include "attack.h"
@@ -18,7 +16,6 @@
 #include <inttypes.h>
 #include <stdio.h>
 #include <string.h>
-#include <unistd.h>
 
 // ------------------------------------------------------------------ //
 // Column geometry                                                     //
@@ -687,103 +684,19 @@ atk_show_scores(const cmd_ctx_t *ctx)
 }
 
 // ------------------------------------------------------------------ //
-// Where the words come from                                           //
+// The damage bands                                                    //
 // ------------------------------------------------------------------ //
-
-#define ATK_W_FCAT    11   // category, left-aligned
-#define ATK_W_FPOOL    6
-#define ATK_W_FSERVED  9
-#define ATK_W_FREJ    10
-#define ATK_W_FLAV    (2 + ATK_W_FCAT + ATK_W_FPOOL + ATK_W_FSERVED \
-                         + ATK_W_FREJ + 10)
 
 static const char *const atk_flav_label[ATK_FLAV__COUNT] = {
   "minor", "medium", "major", "critical", "deaths", "decay", "decay kill"
 };
 
-static void
-atk_flav_header(const cmd_ctx_t *ctx)
-{
-  char line[ATK_LINE_SZ];
-  char cell[ATK_CELL_SZ];
-
-  snprintf(line, sizeof(line), "%s  ", CLR_GRAY);
-
-  snprintf(cell, sizeof(cell), "category");
-  atk_padr(cell, sizeof(cell), ATK_W_FCAT);
-  atk_cat(line, sizeof(line), cell);
-
-  snprintf(cell, sizeof(cell), "pool");
-  atk_pad(cell, sizeof(cell), ATK_W_FPOOL);
-  atk_cat(line, sizeof(line), cell);
-
-  snprintf(cell, sizeof(cell), "served");
-  atk_pad(cell, sizeof(cell), ATK_W_FSERVED);
-  atk_cat(line, sizeof(line), cell);
-
-  snprintf(cell, sizeof(cell), "rejected");
-  atk_pad(cell, sizeof(cell), ATK_W_FREJ);
-  atk_cat(line, sizeof(line), cell);
-
-  atk_cat(line, sizeof(line), "  state");
-  atk_cat(line, sizeof(line), CLR_RESET);
-  cmd_reply(ctx, line);
-}
-
-static void
-atk_flav_row(const cmd_ctx_t *ctx, atk_flavour_t cat,
-    const atk_pool_stat_t *s)
-{
-  char line[ATK_LINE_SZ];
-  char cell[ATK_CELL_SZ];
-  char num [32];
-  char state[48];
-
-  snprintf(line, sizeof(line), "  ");
-
-  snprintf(cell, sizeof(cell), CLR_CYAN "%s" CLR_RESET,
-      atk_flav_label[cat]);
-  atk_padr(cell, sizeof(cell), ATK_W_FCAT);
-  atk_cat(line, sizeof(line), cell);
-
-  atk_fmt_num(num, sizeof(num), (int64_t)s->depth, ATK_W_FPOOL);
-  snprintf(cell, sizeof(cell), "%s%s" CLR_RESET,
-      s->depth > 0 ? CLR_WHITE : CLR_GRAY, num);
-  atk_pad(cell, sizeof(cell), ATK_W_FPOOL);
-  atk_cat(line, sizeof(line), cell);
-
-  atk_fmt_num(num, sizeof(num), (int64_t)s->served, ATK_W_FSERVED);
-  snprintf(cell, sizeof(cell), "%s", num);
-  atk_pad(cell, sizeof(cell), ATK_W_FSERVED);
-  atk_cat(line, sizeof(line), cell);
-
-  atk_fmt_num(num, sizeof(num), (int64_t)s->rejected, ATK_W_FREJ);
-  snprintf(cell, sizeof(cell), "%s%s" CLR_RESET,
-      s->rejected > 0 ? CLR_YELLOW : CLR_GRAY, num);
-  atk_pad(cell, sizeof(cell), ATK_W_FREJ);
-  atk_cat(line, sizeof(line), cell);
-
-  if(s->inflight)
-    snprintf(state, sizeof(state), CLR_YELLOW "refilling" CLR_RESET);
-
-  else if(s->wait > 0)
-    snprintf(state, sizeof(state), CLR_RED "waiting %" PRId64 "s" CLR_RESET,
-        s->wait);
-
-  else
-    snprintf(state, sizeof(state), CLR_GREEN "ready" CLR_RESET);
-
-  atk_cat(line, sizeof(line), "  ");
-  atk_cat(line, sizeof(line), state);
-  cmd_reply(ctx, line);
-}
-
 // What the four damage tiers actually mean at the current tunables. The
 // boundaries are not computed from the KV percentages a second time —
 // they are read back out of atk_severity() itself, one damage value at
 // a time, so this line can never disagree with the renderer. The ceiling
-// is at most hit_max/crit_max's clamp, so the walk is free.
-static void
+// is clamped, so the walk is free.
+void
 atk_flav_bands(const cmd_ctx_t *ctx, const atk_tunables_t *t)
 {
   int32_t       lo[ATK_FLAV_DEATH] = { 0 };
@@ -831,98 +744,6 @@ atk_flav_bands(const cmd_ctx_t *ctx, const atk_tunables_t *t)
   cmd_reply(ctx, line);
 }
 
-static void
-atk_show_llm(const cmd_ctx_t *ctx)
-{
-  atk_tunables_t  t;
-  atk_pool_stat_t s;
-  const char     *why;
-  char            line[ATK_LINE_SZ];
-  char            rule[ATK_LINE_SZ];
-  char            num [32];
-  atk_flavour_t   cat;
-  bool            errored = false;
-
-  atk_tunables_load(&t);
-  why = atk_llm_offreason(&t);
-
-  snprintf(line, sizeof(line),
-      "⚔ " CLR_BOLD "ATTACK — FLAVOUR" CLR_RESET);
-  cmd_reply(ctx, line);
-
-  if(why != NULL)
-  {
-    // Collapsed view: the built-in lines are speaking, and the reader is
-    // told which gate closed rather than left to guess.
-    snprintf(line, sizeof(line),
-        "  the pit speaks its own built-in lines " CLR_GRAY "(%s%s%s)"
-        CLR_RESET, why,
-        t.llm_model[0] != '\0' ? ": " : "",
-        t.llm_model[0] != '\0' ? t.llm_model : "");
-    cmd_reply(ctx, line);
-    return;
-  }
-
-  snprintf(line, sizeof(line),
-      "  source   " CLR_CYAN "%s" CLR_RESET CLR_GRAY " (chat)" CLR_RESET,
-      t.llm_model);
-  cmd_reply(ctx, line);
-
-  // Two personas ship, so the path is worth stating — and worth probing.
-  // An unreadable one is silently survivable (the model writes in its own
-  // voice), which is exactly why it must not be silent here. access() at
-  // view time is cheap; this is not a hot path.
-  if(t.llm_prompt[0] == '\0')
-    snprintf(line, sizeof(line),
-        "  persona  " CLR_GRAY "(none — the model writes in its own voice)"
-        CLR_RESET);
-
-  else
-    snprintf(line, sizeof(line), "  persona  %s %s", t.llm_prompt,
-        access(t.llm_prompt, R_OK) == 0
-          ? CLR_GREEN "✓ readable" CLR_RESET
-          : CLR_RED   "✗ unreadable — the model writes in its own voice"
-            CLR_RESET);
-
-  cmd_reply(ctx, line);
-
-  atk_rule(rule, sizeof(rule), ATK_W_FLAV);
-  cmd_reply(ctx, rule);
-  atk_flav_header(ctx);
-
-  for(cat = ATK_FLAV_MINOR; cat < ATK_FLAV__COUNT; cat++)
-  {
-    atk_pool_stats(cat, &s);
-    atk_flav_row(ctx, cat, &s);
-
-    if(s.last_error[0] != '\0')
-      errored = true;
-  }
-
-  cmd_reply(ctx, rule);
-  atk_flav_bands(ctx, &t);
-
-  atk_fmt_num(num, sizeof(num), (int64_t)atk_pool_fallbacks(), 12);
-  snprintf(line, sizeof(line),
-      CLR_GRAY "fallbacks to the built-in lines: %s" CLR_RESET, num);
-  cmd_reply(ctx, line);
-
-  if(!errored)
-    return;
-
-  for(cat = ATK_FLAV_MINOR; cat < ATK_FLAV__COUNT; cat++)
-  {
-    atk_pool_stats(cat, &s);
-
-    if(s.last_error[0] == '\0')
-      continue;
-
-    snprintf(line, sizeof(line), CLR_GRAY "%s: %.80s" CLR_RESET,
-        atk_flav_label[cat], s.last_error);
-    cmd_reply(ctx, line);
-  }
-}
-
 // ------------------------------------------------------------------ //
 // Registration                                                        //
 // ------------------------------------------------------------------ //
@@ -956,19 +777,6 @@ atk_show_register(void)
         "The row count is `plugin.attack.scoreboard_rows`.",
         USERNS_GROUP_EVERYONE, 0, CMD_SCOPE_ANY, METHOD_T_ANY,
         atk_show_scores, NULL, "show/attack", NULL,
-        NULL, 0, NULL, NULL) != SUCCESS)
-    return(FAIL);
-
-  if(cmd_register("attack", "llm",
-        "show attack llm",
-        "Where the pit's words come from.",
-        "Reports whether a language model is authoring the combat "
-        "flavour, which model, and how deep each category's pool of "
-        "unspoken lines is. When no model is configured, or when a pool "
-        "runs dry, the pit falls back to its built-in lines and this "
-        "view says so.",
-        USERNS_GROUP_EVERYONE, 0, CMD_SCOPE_ANY, METHOD_T_ANY,
-        atk_show_llm, NULL, "show/attack", NULL,
         NULL, 0, NULL, NULL) != SUCCESS)
     return(FAIL);
 

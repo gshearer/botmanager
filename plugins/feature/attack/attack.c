@@ -1,7 +1,8 @@
 // botmanager — MIT
 // attack feature plugin (PLUGIN_FEATURE, kind: attack).
 //
-// A channel brawl themed on the Drow: Lolth, Menzoberranzan, Narbondel.
+// A channel brawl. The engine owns the numbers and speaks no setting of
+// its own; the words belong to the combatants' character sheets.
 // `!attack <nick>` opens a round in the current room and rolls damage at
 // another registered user; the round, its combatants, and the lifetime
 // standings all live in Postgres, scoped to the caller's namespace.
@@ -49,29 +50,6 @@ static const plugin_kv_entry_t atk_kv_schema[] = {
   { ATK_KV_SCORE_ROWS, KV_UINT32, "15",
     "Rows shown by `show attack scores`" },
 
-  { ATK_KV_LLM_MODEL,   KV_STR,    "",
-    "Chat model (from the llm subsystem) that authors combat flavour; "
-    "empty = use the built-in lines" },
-  { ATK_KV_LLM_PROMPT,  KV_STR,    "../prompts/melee-drow.txt",
-    "Path to the persona prompt prepended to every flavour request "
-    "(relative to the daemon CWD). Two ship: ../prompts/melee-drow.txt "
-    "(the Underdark duelling pit) and ../prompts/melee-rpg.txt (a "
-    "video-game battle log). An unreadable path means the model speaks "
-    "in its own voice" },
-  { ATK_KV_LLM_POOL,    KV_UINT32, "20",
-    "Lines requested per category per refill" },
-  { ATK_KV_LLM_REFILL,  KV_UINT32, "6",
-    "Refill a category when its pool falls to this many lines" },
-  { ATK_KV_LLM_TEMP,    KV_UINT32, "110",
-    "Sampling temperature x100 (110 = 1.10); flavour wants more variety "
-    "than prose" },
-  { ATK_KV_LLM_TOKENS,  KV_UINT32, "1500",
-    "Token ceiling per refill request" },
-  { ATK_KV_LLM_TIMEOUT, KV_UINT32, "90",
-    "Per-refill request timeout" },
-  { ATK_KV_LLM_RETRY,   KV_UINT32, "300",
-    "Seconds to wait before retrying a category whose refill failed" },
-
   { ATK_KV_DOT_CHANCE,  KV_UINT32, "25",
     "Percent chance a landing, non-fatal blow leaves an affliction that "
     "keeps dealing damage; 0 disables the feature entirely" },
@@ -112,9 +90,6 @@ atk_clamp(uint64_t val, uint32_t lo, uint32_t hi)
 void
 atk_tunables_load(atk_tunables_t *out)
 {
-  const char *model  = NULL;
-  const char *prompt = NULL;
-
   if(out == NULL)
     return;
 
@@ -143,28 +118,6 @@ atk_tunables_load(atk_tunables_t *out)
 
   if(out->sev_crit_at <= out->sev_major_at)
     out->sev_crit_at = out->sev_major_at + 1;
-
-  // Flavour authorship. kv_get_str returns NULL for an unset key, which
-  // is the shipped state of the model key and simply means "off".
-  model  = kv_get_str(ATK_KV_LLM_MODEL);
-  prompt = kv_get_str(ATK_KV_LLM_PROMPT);
-
-  snprintf(out->llm_model,  sizeof(out->llm_model),  "%s",
-           model  != NULL ? model  : "");
-  snprintf(out->llm_prompt, sizeof(out->llm_prompt), "%s",
-           prompt != NULL ? prompt : "");
-
-  out->llm_pool       = atk_clamp(kv_get_uint(ATK_KV_LLM_POOL),    4,
-                                    ATK_LLM_POOL_MAX);
-  out->llm_temp_pct   = atk_clamp(kv_get_uint(ATK_KV_LLM_TEMP),    0, 200);
-  out->llm_max_tokens = atk_clamp(kv_get_uint(ATK_KV_LLM_TOKENS), 256, 8192);
-  out->llm_timeout    = atk_clamp(kv_get_uint(ATK_KV_LLM_TIMEOUT), 10, 300);
-  out->llm_retry      = atk_clamp(kv_get_uint(ATK_KV_LLM_RETRY),   30, 86400);
-
-  // After llm_pool, and strictly below it: a refill_at at or above the
-  // pool size would re-arm a refill the instant one completed, forever.
-  out->llm_refill_at  = atk_clamp(kv_get_uint(ATK_KV_LLM_REFILL), 1,
-                                    out->llm_pool - 1);
 
   // Damage over time. Zero chance is legal — it is the off switch — but
   // every duration below it must be a usable number.
@@ -210,23 +163,9 @@ atk_init(void)
 static bool
 atk_start(void)
 {
-  atk_tunables_t t;
-
   if(atk_schema_ensure() != SUCCESS)
     clam(CLAM_WARN, ATK_CTX,
         "attack schema init failed (the pit will error until fixed)");
-
-  // Flavour authorship is opt-in and inert by default: atk_llm_prime()
-  // returns immediately unless an operator has named a usable chat model
-  // and the inference plugin is loaded.
-  atk_tunables_load(&t);
-  atk_llm_prime(&t);
-
-  // Every pooled line was written by the preamble in force when it was
-  // requested, so a change to the persona file or the model throws the
-  // lot away and starts again. Installed after the prime: kv fires these
-  // only on an actual change, and only outside the KV lock.
-  atk_llm_watch(true);
 
   return(SUCCESS);
 }
@@ -234,10 +173,9 @@ atk_start(void)
 static void
 atk_deinit(void)
 {
-  // Before anything else, and for one reason twice over: a callback left
-  // pointing into an unloaded .so is a jump into freed memory — the KV
-  // entries outlive this plugin, and so does the task queue.
-  atk_llm_watch(false);
+  // Before anything else: a periodic callback left pointing into an
+  // unloaded .so is a jump into freed memory, and the task queue outlives
+  // this plugin.
   atk_dot_stop();
 
   atk_commands_unregister();
