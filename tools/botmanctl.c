@@ -704,6 +704,19 @@ main_parse_args(int argc, char *argv[], botmanctl_opts_t *out)
     }
   }
 
+  // -r is a subscription filter, not a command to run. Without -S there is
+  // nothing to filter, and getopt has already eaten the operand — so a
+  // `botmanctl -r "plugin reload text"` leaves no command arguments at all
+  // and falls through to the interactive attach, where it idles until the
+  // caller gives up. Refuse the combination the usage text already calls
+  // invalid rather than hanging on it.
+  if(out->subscribe_regex != NULL && out->subscribe_sev < 0)
+  {
+    fprintf(stderr, "-r requires -S <sev>\n");
+    print_usage(argv[0]);
+    return(1);
+  }
+
   out->first_cmd_arg = optind;
   return(0);
 }
