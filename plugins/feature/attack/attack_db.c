@@ -15,6 +15,7 @@
 #include <ctype.h>
 #include <inttypes.h>
 #include <pthread.h>
+#include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -960,6 +961,274 @@ out:
   if(e_src_n != NULL) mem_free(e_src_n);
   if(e_tgt_u != NULL) mem_free(e_tgt_u);
   if(e_tgt_n != NULL) mem_free(e_tgt_n);
+  if(sql     != NULL) mem_free(sql);
+
+  return(ok);
+}
+
+// ------------------------------------------------------------------ //
+// The sweep                                                           //
+// ------------------------------------------------------------------ //
+
+// By username, and that ordering is load-bearing twice over: it is what
+// makes the recorded fallen deterministic when a sweep takes more than
+// one combatant, and what makes the roster on screen the same list the
+// ledger wrote.
+uint32_t
+atk_db_living(int64_t round_id, const char *except, atk_victim_t *out,
+    uint32_t cap)
+{
+  atk_tables_t t;
+  db_result_t *res    = NULL;
+  char        *e_user = NULL;
+  char         sql[640];
+  uint32_t     n = 0;
+
+  if(out == NULL || cap == 0 || round_id <= 0 ||
+     atk_tables_resolve(&t) != SUCCESS)
+    return(0);
+
+  e_user = db_escape(except != NULL ? except : "");
+
+  if(e_user == NULL)
+    return(0);
+
+  snprintf(sql, sizeof(sql),
+      "SELECT username,"
+      " CASE WHEN nickname <> '' THEN nickname ELSE username END,"
+      " hp, hp_max FROM %s"
+      " WHERE round_id = %" PRId64 " AND hp > 0 AND username <> '%s'"
+      " ORDER BY username LIMIT %" PRIu32,
+      t.players, round_id, e_user, cap);
+
+  res = db_result_alloc();
+
+  if(res != NULL && db_query(sql, res) == SUCCESS && res->ok)
+  {
+    for(n = 0; n < res->rows && n < cap; n++)
+    {
+      atk_col_str(out[n].user, sizeof(out[n].user), res, n, 0);
+      atk_col_str(out[n].nick, sizeof(out[n].nick), res, n, 1);
+      out[n].hp      = atk_col_i32(res, n, 2);
+      out[n].hp_max  = atk_col_i32(res, n, 3);
+      out[n].hp_left = out[n].hp;
+      out[n].fell    = false;
+    }
+  }
+
+  else
+    clam(CLAM_WARN, ATK_CTX, "living roster failed: %s",
+        (res != NULL && res->error[0] != '\0') ? res->error
+                                               : "(no driver error)");
+
+  db_result_free(res);
+  mem_free(e_user);
+
+  return(n);
+}
+
+// Append one statement to a batch under construction. FAIL the moment the
+// buffer would truncate, so a half-written transaction can never reach
+// the driver — a `BEGIN;` with its `COMMIT;` cut off is the one shape of
+// malformed SQL that would leave a connection wedged rather than erroring.
+static bool
+atk_sql_cat(char *buf, size_t cap, size_t *off, const char *fmt, ...)
+    __attribute__((format(printf, 4, 5)));
+
+static bool
+atk_sql_cat(char *buf, size_t cap, size_t *off, const char *fmt, ...)
+{
+  va_list ap;
+  int     n;
+
+  if(*off >= cap)
+    return(FAIL);
+
+  va_start(ap, fmt);
+  n = vsnprintf(buf + *off, cap - *off, fmt, ap);
+  va_end(ap);
+
+  if(n < 0 || (size_t)n >= cap - *off)
+  {
+    clam(CLAM_WARN, ATK_CTX, "sql batch outgrew its buffer at %zu/%zu bytes",
+        *off, cap);
+    return(FAIL);
+  }
+
+  *off += (size_t)n;
+  return(SUCCESS);
+}
+
+// One blow, many victims, and exactly one damage number for all of them.
+// The batch is built rather than written as one format string because the
+// victim list is variable: everything else about it is the blow path's
+// shape, statement for statement, so the two ledgers agree column by
+// column.
+bool
+atk_db_sweep_apply(const atk_sweep_t *s)
+{
+  atk_tables_t t;
+  char        *e_src_u = NULL;
+  char        *e_src_n = NULL;
+  char        *e_tgt_u = NULL;
+  char        *e_fall  = NULL;
+  char        *e_vic_u[ATK_MAX_PLAYERS] = { NULL };
+  char        *e_vic_n[ATK_MAX_PLAYERS] = { NULL };
+  char        *sql     = NULL;
+  char         top[320] = "";
+  size_t       need;
+  size_t       off = 0;
+  uint32_t     i;
+  uint32_t     n;
+  bool         ok = FAIL;
+
+  if(s == NULL || s->round_id <= 0 || s->victim == NULL ||
+     s->n_victim == 0 || atk_tables_resolve(&t) != SUCCESS)
+    return(FAIL);
+
+  n = (s->n_victim < ATK_MAX_PLAYERS) ? s->n_victim : ATK_MAX_PLAYERS;
+
+  e_src_u = db_escape(s->src_user);
+  e_src_n = db_escape(s->src_nick);
+  e_tgt_u = db_escape(s->tgt_user);
+  e_fall  = db_escape((s->fallen != NULL) ? s->fallen : "");
+
+  if(e_src_u == NULL || e_src_n == NULL || e_tgt_u == NULL || e_fall == NULL)
+    goto out;
+
+  need = 4096 + 16 * (strlen(t.rounds) + strlen(t.players) + strlen(t.scores)
+                      + strlen(e_src_u) + strlen(e_src_n) + strlen(e_tgt_u)
+                      + strlen(e_fall));
+
+  for(i = 0; i < n; i++)
+  {
+    e_vic_u[i] = db_escape(s->victim[i].user);
+    e_vic_n[i] = db_escape(s->victim[i].nick);
+
+    if(e_vic_u[i] == NULL || e_vic_n[i] == NULL)
+      goto out;
+
+    need += 1024 + 8 * (strlen(e_vic_u[i]) + strlen(e_vic_n[i])
+                        + strlen(t.players) + strlen(t.scores));
+  }
+
+  if(s->new_top)
+    snprintf(top, sizeof(top),
+        ", top_crit = %d, top_crit_by = '%s', top_crit_on = '%s'",
+        s->dmg, e_src_u, e_tgt_u);
+
+  sql = mem_alloc(ATK_CTX, "sweep_sql", need);
+
+  if(sql == NULL)
+    goto out;
+
+  sql[0] = '\0';
+
+  // The attacker: one blow, one wave spent, one bonus consumed — and the
+  // damage of every victim credited at once, because it was one swing.
+  if(atk_sql_cat(sql, need, &off,
+        "BEGIN;"
+        "UPDATE %s SET nickname = '%s', dmg_given = dmg_given + %d,"
+        " blows = blows + 1, crits = crits + %d,"
+        " best_crit = GREATEST(best_crit, %d), last_wave = %d, bonus_pct = 0"
+        " WHERE round_id = %" PRId64 " AND username = '%s';",
+        t.players, e_src_n, s->dmg * (int32_t)n, s->crit ? 1 : 0,
+        s->crit ? s->dmg : 0, s->wave, s->round_id, e_src_u) != SUCCESS)
+    goto out;
+
+  // Every victim takes the same number. The nickname is refreshed on the
+  // way past exactly as a single blow refreshes its target's.
+  for(i = 0; i < n; i++)
+    if(atk_sql_cat(sql, need, &off,
+          "UPDATE %s SET nickname = '%s', hp = GREATEST(hp - %d, 0),"
+          " dmg_taken = dmg_taken + %d,"
+          " died_at = CASE WHEN hp - %d <= 0 AND died_at IS NULL"
+          " THEN NOW() ELSE died_at END"
+          " WHERE round_id = %" PRId64 " AND username = '%s';"
+
+          "INSERT INTO %s (ns_id, username, nickname, dmg_taken)"
+          " VALUES (%" PRIu32 ", '%s', '%s', %d)"
+          " ON CONFLICT (ns_id, username) DO UPDATE SET"
+          " nickname = EXCLUDED.nickname,"
+          " dmg_taken = %s.dmg_taken + EXCLUDED.dmg_taken,"
+          " last_seen = NOW();",
+          t.players, e_vic_n[i], s->dmg, s->dmg, s->dmg, s->round_id,
+          e_vic_u[i],
+          t.scores, s->ns_id, e_vic_u[i], e_vic_n[i], s->dmg,
+          t.scores) != SUCCESS)
+      goto out;
+
+  // The round counts ONE blow, not one per victim: the pit swung once.
+  if(atk_sql_cat(sql, need, &off,
+        "UPDATE %s SET blows = blows + 1, last_action = NOW()%s"
+        " WHERE id = %" PRId64 ";"
+
+        "INSERT INTO %s (ns_id, username, nickname, dmg_given, blows,"
+        " crits, best_crit, best_crit_on)"
+        " VALUES (%" PRIu32 ", '%s', '%s', %d, 1, %d, %d, '%s')"
+        " ON CONFLICT (ns_id, username) DO UPDATE SET"
+        " nickname = EXCLUDED.nickname,"
+        " dmg_given = %s.dmg_given + EXCLUDED.dmg_given,"
+        " blows = %s.blows + EXCLUDED.blows,"
+        " crits = %s.crits + EXCLUDED.crits,"
+        " best_crit = GREATEST(%s.best_crit, EXCLUDED.best_crit),"
+        " best_crit_on = CASE WHEN EXCLUDED.best_crit > %s.best_crit"
+        " THEN EXCLUDED.best_crit_on ELSE %s.best_crit_on END,"
+        " last_seen = NOW();",
+        t.rounds, top, s->round_id,
+        t.scores, s->ns_id, e_src_u, e_src_n, s->dmg * (int32_t)n,
+        s->crit ? 1 : 0, s->crit ? s->dmg : 0, s->crit ? e_tgt_u : "",
+        t.scores, t.scores, t.scores, t.scores, t.scores,
+        t.scores) != SUCCESS)
+    goto out;
+
+  // A sweep that killed ends the round in the same transaction that landed
+  // it, exactly as a single fatal blow does. One kill to the attacker
+  // however many fell — they swung once — and one death to each of them.
+  if(s->n_fallen > 0)
+  {
+    if(atk_sql_cat(sql, need, &off,
+          "UPDATE %s SET state = %d, ended_at = NOW(), slayer = '%s',"
+          " fallen = '%s' WHERE id = %" PRId64 ";"
+          "UPDATE %s SET kills = kills + 1, last_seen = NOW()"
+          " WHERE ns_id = %" PRIu32 " AND username = '%s';",
+          t.rounds, ATK_ROUND_ENDED, e_src_u, e_fall, s->round_id,
+          t.scores, s->ns_id, e_src_u) != SUCCESS)
+      goto out;
+
+    for(i = 0; i < n; i++)
+      if(s->victim[i].fell &&
+         atk_sql_cat(sql, need, &off,
+           "UPDATE %s SET deaths = deaths + 1, last_seen = NOW()"
+           " WHERE ns_id = %" PRIu32 " AND username = '%s';",
+           t.scores, s->ns_id, e_vic_u[i]) != SUCCESS)
+        goto out;
+  }
+
+  // Last, so it reads the health this batch has already written: the
+  // fallen are no longer pending, and a sweep that emptied the pit turns
+  // the wave on its way out.
+  if(atk_sql_cat(sql, need, &off,
+        "UPDATE %s r SET wave = r.wave + 1 WHERE r.id = %" PRId64
+        " AND NOT EXISTS (SELECT 1 FROM %s p WHERE p.round_id = r.id"
+        " AND p.hp > 0 AND p.last_wave < r.wave);"
+        "COMMIT;",
+        t.rounds, s->round_id, t.players) != SUCCESS)
+    goto out;
+
+  ok = atk_exec(sql, "sweep apply", NULL);
+
+out:
+  for(i = 0; i < ATK_MAX_PLAYERS; i++)
+  {
+    if(e_vic_u[i] != NULL) mem_free(e_vic_u[i]);
+    if(e_vic_n[i] != NULL) mem_free(e_vic_n[i]);
+  }
+
+  if(e_src_u != NULL) mem_free(e_src_u);
+  if(e_src_n != NULL) mem_free(e_src_n);
+  if(e_tgt_u != NULL) mem_free(e_tgt_u);
+  if(e_fall  != NULL) mem_free(e_fall);
   if(sql     != NULL) mem_free(sql);
 
   return(ok);

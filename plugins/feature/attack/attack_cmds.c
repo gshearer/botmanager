@@ -142,6 +142,170 @@ atk_cmd_end(const cmd_ctx_t *ctx, const userns_t *ns)
 }
 
 // ------------------------------------------------------------------ //
+// The door                                                            //
+// ------------------------------------------------------------------ //
+
+// Always the LAST thing a turn does: the caller has released the turn
+// lock and every death line has already gone out. On IRC the strongest
+// removal is a KILL, and nothing written afterwards ever reaches the
+// fallen — which is why this takes no lock, sends nothing, and is never
+// called from inside the announcement. Returns the force used, for the
+// caller's log line.
+static method_eject_t
+atk_eject(const cmd_ctx_t *ctx, const atk_tunables_t *t,
+    const char *src_nick, const char *nick)
+{
+  method_eject_t force;
+  char           reason[128];
+
+  if(!t->eject_on_death)
+    return(METHOD_EJECT_NONE);
+
+  force = method_eject_probe(ctx->msg->inst, ctx->msg->channel, nick);
+
+  if(force != METHOD_EJECT_NONE)
+  {
+    snprintf(reason, sizeof(reason), "slain by %s in the pit", src_nick);
+    method_eject(ctx->msg->inst, ctx->msg->channel, nick, force, reason);
+  }
+
+  return(force);
+}
+
+// ------------------------------------------------------------------ //
+// The sweep                                                           //
+// ------------------------------------------------------------------ //
+
+// A blow that went wide, from the roster to the last line spoken. It is
+// called with the turn lock HELD and returns with it still held: the
+// ejects belong to the caller, which releases the lock first and only
+// then opens the door on everyone this took.
+//
+// FAIL means the blow did not go wide after all and the caller should
+// land it as an ordinary one — the ledger has not been touched, because
+// the whole write is one transaction that either committed or did not.
+//
+// Two things this deliberately does NOT do. It rolls nothing: the number,
+// the tier and the bonus were all settled before it was called, and one
+// roll landing identically on everybody is what makes the line read as a
+// single blow rather than as a flurry of them. And it never speaks the
+// trout — that joke belongs to a blow aimed at somebody, and a blow that
+// went wide killed nobody in particular.
+static bool
+atk_sweep_turn(const cmd_ctx_t *ctx, const atk_round_t *round,
+    uint32_t ns_id, const char *src_nick, const char *src_class,
+    const char *tgt_user, const char *tgt_nick, atk_flavour_t tier,
+    const atk_move_t *move, int32_t dmg, uint32_t bonus,
+    atk_victim_t *victim, uint32_t *n_victim)
+{
+  atk_sweep_t sweep;
+  char        line[ATK_LINE_SZ];
+  const char *fallen_user = "";
+  uint32_t    n;
+  uint32_t    fell  = 0;
+  uint32_t    aimed = 0;        // where in the roster the named target sits
+  uint32_t    i;
+  bool        found = false;
+
+  *n_victim = 0;
+
+  n = atk_db_living(round->id, ctx->username, victim, ATK_MAX_PLAYERS);
+
+  // With a single other combatant standing, a sweep is indistinguishable
+  // from an ordinary blow and the second line is pure noise — so it
+  // degrades silently rather than announcing a flourish nobody can see.
+  if(n < 2)
+    return(FAIL);
+
+  for(i = 0; i < n; i++)
+  {
+    victim[i].hp_left = (victim[i].hp > dmg) ? victim[i].hp - dmg : 0;
+    victim[i].fell    = (victim[i].hp_left == 0);
+
+    if(strcasecmp(victim[i].user, tgt_user) == 0)
+    {
+      aimed = i;
+      found = true;
+    }
+
+    if(victim[i].fell)
+    {
+      // The roster is ordered by username, so the first of the fallen is
+      // the one the round records: every one of them is at zero, and the
+      // tie has to break somewhere a later reader can predict.
+      if(fell == 0)
+        fallen_user = victim[i].user;
+
+      fell++;
+    }
+  }
+
+  // Reachable only past ATK_MAX_PLAYERS, where the roster was cut before
+  // it reached whoever was actually named. A blow that skipped its own
+  // target is not a blow that went wide, so it lands as an ordinary one.
+  if(!found)
+  {
+    clam(CLAM_WARN, ATK_CTX, "round %" PRId64 ": sweep declined — %s is "
+        "past the %d-combatant roster", round->id, tgt_user,
+        ATK_MAX_PLAYERS);
+    return(FAIL);
+  }
+
+  sweep = (atk_sweep_t){
+    .round_id = round->id,
+    .ns_id    = ns_id,
+    .src_user = ctx->username,
+    .src_nick = src_nick,
+    .tgt_user = tgt_user,
+    .dmg      = dmg,
+    .wave     = round->wave,
+    .crit     = (tier == ATK_FLAV_CRITICAL),
+    .new_top  = (tier == ATK_FLAV_CRITICAL && dmg > round->top_crit),
+    .victim   = victim,
+    .n_victim = n,
+    .fallen   = fallen_user,
+    .n_fallen = fell,
+  };
+
+  if(atk_db_sweep_apply(&sweep) != SUCCESS)
+    return(FAIL);
+
+  // The class move still speaks, and it speaks against whoever was named:
+  // the words are the attacker's own and going wide does not take them
+  // away. The health tail is the named target's, exactly as it would be
+  // on an ordinary blow.
+  atk_render_blow(line, sizeof(line), src_nick, tgt_nick, tier, move, dmg,
+      bonus, victim[aimed].hp_left, victim[aimed].hp_max);
+  cmd_reply(ctx, line);
+
+  atk_render_sweep(line, sizeof(line), tier, dmg, victim, n);
+  cmd_reply(ctx, line);
+
+  // EVERY death line goes out here, before the caller ejects anybody —
+  // all of them, never interleaved with the door. A sweep is the easiest
+  // place in this plugin to break that law, because it is the only turn
+  // that can kill more than one combatant at once.
+  for(i = 0; i < n; i++)
+    if(victim[i].fell)
+    {
+      atk_move_t last;
+      const bool own = (atk_class_move(src_class, ATK_SEC_DEATH, 0, 0, &last)
+          == SUCCESS);
+
+      atk_render_death(line, sizeof(line), src_nick, victim[i].nick,
+          own ? &last : NULL);
+      cmd_reply(ctx, line);
+    }
+
+  clam(CLAM_INFO, ATK_CTX, "round %" PRId64 ": %s swept the pit for %d "
+      "(%" PRIu32 " hit, %" PRIu32 " fell)", round->id, ctx->username, dmg,
+      n, fell);
+
+  *n_victim = n;
+  return(SUCCESS);
+}
+
+// ------------------------------------------------------------------ //
 // attack <nick>                                                       //
 // ------------------------------------------------------------------ //
 
@@ -155,6 +319,11 @@ atk_cmd_attack(const cmd_ctx_t *ctx)
   atk_blow_t      blow;
   atk_move_t      move;
   atk_flavour_t   tier;
+  // Everyone a sweep would land on, and how many of them there were. The
+  // array is the turn's own so the fallen survive the unlock — the ejects
+  // run after the lock is released and after every death line has gone.
+  atk_victim_t    victim[ATK_MAX_PLAYERS];
+  uint32_t        n_victim = 0;
   userns_t       *ns;
   const char     *nick;
   const char     *method;
@@ -449,7 +618,44 @@ atk_cmd_attack(const cmd_ctx_t *ctx)
     return;
   }
 
-  // ---- 9. the instant blow ------------------------------------------ //
+  // ---- 9. the sweep, or the single blow ----------------------------- //
+  //
+  // Whether a blow goes wide is the ENGINE's roll, class-blind like every
+  // other number in this file: `aoe_chance_pct` is one KV, no sheet may
+  // carry a probability, and the chance is the same for a warrior and a
+  // necromancer. It fires only on the instant-damage branch — an
+  // affliction turn has already returned above — and atk_sweep_turn()
+  // answers FAIL when it declines, in which case the ordinary blow lands
+  // below with nothing spent in between.
+
+  if(t.aoe_pct > 0 && util_rand(100) < (int)t.aoe_pct &&
+     atk_sweep_turn(ctx, &round, ns->id, src_nick, src_class, tgt_user,
+         nick, tier, spoken ? &move : NULL, dmg, bonus, victim,
+         &n_victim) == SUCCESS)
+  {
+    uint32_t ejected = 0;
+    uint32_t fell    = 0;
+    uint32_t i;
+
+    pthread_mutex_unlock(&atk_turn_lock);
+
+    // The door, for everyone it took, and strictly after every death line
+    // has already gone out.
+    for(i = 0; i < n_victim; i++)
+      if(victim[i].fell)
+      {
+        fell++;
+
+        if(atk_eject(ctx, &t, src_nick, victim[i].nick) != METHOD_EJECT_NONE)
+          ejected++;
+      }
+
+    if(fell > 0)
+      clam(CLAM_INFO, ATK_CTX, "round %" PRId64 ": %" PRIu32 " of %" PRIu32
+          " fallen ejected after the sweep", round.id, ejected, fell);
+
+    return;
+  }
 
   new_hp = (tgt.hp > dmg) ? tgt.hp - dmg : 0;
   fatal  = (new_hp == 0);
@@ -512,19 +718,7 @@ atk_cmd_attack(const cmd_ctx_t *ctx)
 
   if(fatal)
   {
-    method_eject_t force = METHOD_EJECT_NONE;
-    char           reason[128];
-
-    if(t.eject_on_death)
-    {
-      force = method_eject_probe(ctx->msg->inst, channel, nick);
-
-      if(force != METHOD_EJECT_NONE)
-      {
-        snprintf(reason, sizeof(reason), "slain by %s in the pit", src_nick);
-        method_eject(ctx->msg->inst, channel, nick, force, reason);
-      }
-    }
+    const method_eject_t force = atk_eject(ctx, &t, src_nick, nick);
 
     clam(CLAM_INFO, ATK_CTX, "round %" PRId64 ": %s slew %s (eject=%d)",
         round.id, ctx->username, tgt_user, (int)force);
@@ -987,6 +1181,10 @@ atk_commands_register(void)
         "first. You may strike once per wave — once every living "
         "combatant has swung, the wave turns and anyone may go again. "
         "Targets must be registered users who are present in the room. "
+        "A blow occasionally goes wide and lands on every combatant but "
+        "the one who swung, for the same damage each — "
+        "`plugin.attack.aoe_chance_pct` is how often, and it needs at "
+        "least two others standing. "
         "A fight also has a life of its own and expires on its own "
         "clock; `attack --end` stops one early, and anyone who can "
         "attack can end it.",

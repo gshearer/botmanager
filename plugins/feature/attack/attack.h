@@ -282,6 +282,48 @@ typedef struct
   bool        fatal;     // the target reaches 0 hp
 } atk_blow_t;
 
+// One combatant a sweep landed on: everybody left standing except
+// whoever swung. `hp` is what they had when the blow went wide and
+// `hp_left` what it left them with — two fields rather than one that
+// changes meaning, because the announcement reads both.
+typedef struct
+{
+  char    user[ATK_USER_SZ];
+  char    nick[ATK_NICK_SZ];
+  int32_t hp;        // before the blow
+  int32_t hp_left;   // after it, floored at zero
+  int32_t hp_max;
+  bool    fell;      // this blow was the one that took them
+} atk_victim_t;
+
+// One blow that went wide. The damage is rolled ONCE and lands on
+// everybody identically — a roll per victim would read as several blows
+// rather than as one that missed its aim — and the bonus that scaled it
+// was already spent before it arrived here.
+//
+// `tgt_user` is the combatant who was actually named: they take the same
+// damage as everyone else and are the one the lifetime `best_crit_on`
+// records, because they are who the attacker was swinging at.
+typedef struct
+{
+  int64_t             round_id;
+  uint32_t            ns_id;
+  const char         *src_user;
+  const char         *src_nick;
+  const char         *tgt_user;
+  int32_t             dmg;
+  int32_t             wave;
+  bool                crit;
+  bool                new_top;   // this crit is the round's heaviest so far
+  const atk_victim_t *victim;    // everyone it landed on, by username
+  uint32_t            n_victim;
+  // The fallen the round records, which is one name however many died:
+  // the lowest resulting health, ties broken by username so the value is
+  // deterministic. Empty when the sweep killed nobody.
+  const char         *fallen;
+  uint32_t            n_fallen;
+} atk_sweep_t;
+
 // One resolved heal, ready to be written. `amt` is what the engine
 // rolled; `delta` is what the health bar will actually move once the
 // overheal is clamped, and it is the only number the room is ever told —
@@ -633,6 +675,23 @@ bool atk_db_pending(int64_t round_id, int32_t wave, char *out,
 // for a blow the target never took.
 bool atk_db_blow_apply(const atk_blow_t *blow);
 
+// Everyone still standing in this round except `except`, by username so
+// the order is deterministic and the caller can pick the recorded fallen
+// off the front of it. Returns the number written, at most `cap`.
+uint32_t atk_db_living(int64_t round_id, const char *except,
+    atk_victim_t *out, uint32_t cap);
+
+// Write a blow that went wide as one transaction: every victim's health
+// and damage taken, the attacker's whole tally at once, the round
+// counters, every lifetime mirror, the wave advance, and — when anybody
+// reached zero — the round close, one kill for the attacker and one death
+// for each of the fallen. All or nothing, exactly as a single blow is.
+//
+// The caller has already resolved who fell and what it left them with:
+// the arithmetic runs under the turn lock off the roster it read there,
+// so the announcement and the ledger can never describe different blows.
+bool atk_db_sweep_apply(const atk_sweep_t *sweep);
+
 // Write a whole heal as one transaction: the target's health and both
 // heal tallies, the healer's spent wave, the round's clock, and both
 // lifetime score rows. The wave turns behind it exactly as it does behind
@@ -769,6 +828,15 @@ void atk_render_blow(char *out, size_t cap, const char *src_nick,
 void atk_render_heal(char *out, size_t cap, const char *src_nick,
     const char *tgt_nick, const atk_move_t *move, int32_t amt,
     uint32_t bonus_pct, int32_t hp, int32_t hp_max);
+
+// The line a sweep speaks after the class move has had its say: one
+// number for everybody, then the roster it landed on with each
+// combatant's remaining health. Class-agnostic by design, exactly as the
+// deferral line is — going wide is a rule of the pit and not a move, so
+// no sheet supplies words for it and none may. A roster too long for the
+// line is cut with `… and N more` rather than truncated mid-nickname.
+void atk_render_sweep(char *out, size_t cap, atk_flavour_t tier,
+    int32_t dmg, const atk_victim_t *v, uint32_t n);
 
 // The killing blow, in the slayer's own voice where their sheet has one.
 // `move` NULL falls back to the engine's neutral death line.

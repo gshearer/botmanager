@@ -25,6 +25,7 @@
 
 #include <inttypes.h>
 #include <stdio.h>
+#include <string.h>
 
 // ------------------------------------------------------------------ //
 // The engine's dressing                                               //
@@ -305,6 +306,64 @@ atk_render_heal(char *out, size_t cap, const char *src_nick,
   // A heal always leaves somebody standing, so the tally always rides.
   snprintf(out, cap, "✚ %s%s " CLR_GRAY "[%s — %d/%d hp]" CLR_RESET,
       body, badge, tgt_nick, hp, hp_max);
+}
+
+// The line a blow that went wide speaks after the class move has had its
+// say. It is the ENGINE's own and deliberately not a sheet's: going wide
+// is a rule rather than an action, no class caused it and none may claim
+// it, so the words are as plain and as setting-free as the mechanic —
+// exactly the trade the deferral line makes.
+//
+// ONE number for everybody, spoken once and then the roster it landed on.
+// A number per victim would read as several blows instead of as one that
+// missed its aim, and the ledger rolled only one.
+void
+atk_render_sweep(char *out, size_t cap, atk_flavour_t tier, int32_t dmg,
+    const atk_victim_t *v, uint32_t n)
+{
+  char     roster[ATK_ROSTER_SZ];
+  size_t   off   = 0;
+  uint32_t shown = 0;
+  uint32_t i;
+
+  if(out == NULL || cap == 0 || v == NULL)
+    return;
+
+  tier      = atk_tier_clamp(tier);
+  roster[0] = '\0';
+
+  for(i = 0; i < n; i++)
+  {
+    char   cell[ATK_NICK_SZ + 96];
+    size_t len;
+
+    // The fallen go gray where the standing stay purple, so the reader
+    // does not have to parse four numbers to see who is still up.
+    snprintf(cell, sizeof(cell), "%s%s%s" CLR_RESET " %d/%d",
+        (off > 0) ? " · " : "",
+        v[i].fell ? CLR_GRAY : CLR_PURPLE, v[i].nick,
+        v[i].hp_left, v[i].hp_max);
+
+    len = strlen(cell);
+
+    // Reserve room for the tail: a roster that ran out of line has to be
+    // able to say so, and a truncated nickname could name the wrong
+    // combatant entirely.
+    if(off + len + 24 >= sizeof(roster))
+      break;
+
+    memcpy(roster + off, cell, len + 1);
+    off += len;
+    shown++;
+  }
+
+  if(shown < n)
+    snprintf(roster + off, sizeof(roster) - off, " … and %" PRIu32 " more",
+        n - shown);
+
+  snprintf(out, cap,
+      "🌀 The blow goes wide — everyone takes %s%d" CLR_RESET ": %s",
+      atk_tier_color[tier], dmg, roster);
 }
 
 // A surrendered turn. Four variants so a pit full of hesitation does not
