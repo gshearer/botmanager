@@ -515,16 +515,27 @@ stock_card_fundamentals(const cmd_ctx_t *ctx, const quote_t *q, uint32_t caps)
   char eps[24];
   char pe[48];
   char div[24];
+  bool any;
 
-  if(!isnan(q->market_cap)) stock_fmt_vol(q->market_cap, cap, sizeof(cap));
-  else                      snprintf(cap, sizeof(cap), "—");
+  // The provider advertises this block whenever its enrichment tier is
+  // switched on, which is not the same as having reached it — a session
+  // it could not mint leaves every field absent. Drawing "Mkt Cap —
+  // P/E —/— EPS — Div —" says nothing, so draw nothing; the depth line
+  // below already guards itself the same way.
+  any = !isnan(q->market_cap) || !isnan(q->pe_trailing)
+      || !isnan(q->pe_forward) || !isnan(q->eps_ttm)
+      || !isnan(q->dividend_yield);
 
-  if(!isnan(q->eps_ttm)) snprintf(eps, sizeof(eps), "%.2f", q->eps_ttm);
-  else                   snprintf(eps, sizeof(eps), "—");
-
+  if(any)
   {
     char t[16];
     char f[16];
+
+    if(!isnan(q->market_cap)) stock_fmt_vol(q->market_cap, cap, sizeof(cap));
+    else                      snprintf(cap, sizeof(cap), "—");
+
+    if(!isnan(q->eps_ttm)) snprintf(eps, sizeof(eps), "%.2f", q->eps_ttm);
+    else                   snprintf(eps, sizeof(eps), "—");
 
     if(!isnan(q->pe_trailing)) snprintf(t, sizeof(t), "%.1f", q->pe_trailing);
     else                       snprintf(t, sizeof(t), "—");
@@ -533,18 +544,18 @@ stock_card_fundamentals(const cmd_ctx_t *ctx, const quote_t *q, uint32_t caps)
     else                      snprintf(f, sizeof(f), "—");
 
     snprintf(pe, sizeof(pe), "%s/%s", t, f);
+
+    if(!isnan(q->dividend_yield))
+      snprintf(div, sizeof(div), "%.2f%%", q->dividend_yield);
+    else
+      snprintf(div, sizeof(div), "—");
+
+    snprintf(line, sizeof(line),
+        CLR_GRAY "Mkt Cap" CLR_RESET " %s   " CLR_GRAY "P/E" CLR_RESET " %s   "
+        CLR_GRAY "EPS" CLR_RESET " %s   " CLR_GRAY "Div" CLR_RESET " %s",
+        cap, pe, eps, div);
+    cmd_reply(ctx, line);
   }
-
-  if(!isnan(q->dividend_yield))
-    snprintf(div, sizeof(div), "%.2f%%", q->dividend_yield);
-  else
-    snprintf(div, sizeof(div), "—");
-
-  snprintf(line, sizeof(line),
-      CLR_GRAY "Mkt Cap" CLR_RESET " %s   " CLR_GRAY "P/E" CLR_RESET " %s   "
-      CLR_GRAY "EPS" CLR_RESET " %s   " CLR_GRAY "Div" CLR_RESET " %s",
-      cap, pe, eps, div);
-  cmd_reply(ctx, line);
 
   if((caps & QUOTE_CAP_DEPTH) && (!isnan(q->bid) || !isnan(q->ask)))
   {

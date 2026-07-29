@@ -27,6 +27,10 @@ typedef enum
   CURL_PRIO__COUNT        = 3
 } curl_prio_t;
 
+// Bound on curl_response_t.set_cookie — public because a caller that
+// keeps the value past the callback needs to size its own buffer.
+#define CURL_COOKIE_SZ        1024
+
 typedef struct curl_request curl_request_t;
 
 // Delivered to completion callback. Valid for the duration of the
@@ -235,7 +239,6 @@ void curl_iterate_active(curl_iter_cb_t cb, void *data);
 #define CURL_URL_SZ           2048
 #define CURL_CT_SZ            128
 #define CURL_UA_SZ            128
-#define CURL_COOKIE_SZ        1024
 
 typedef enum
 {
