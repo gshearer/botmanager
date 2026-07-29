@@ -569,6 +569,11 @@ volunteer_cascade(chatbot_state_t *st, volunteer_job_t *job,
     if(slot != NULL) last_volunteered = slot->last_volunteered;
     pthread_mutex_unlock(&st->volunteer.mutex);
 
+    // TEXT-COOLDOWN-1 — an absent slot (fresh handle after a reload)
+    // reads as "never volunteered here"; floor it to the handle's
+    // creation time so the channel gets one cooldown window of quiet.
+    if(last_volunteered < st->created_at) last_volunteered = st->created_at;
+
     if(last_volunteered > 0
         && now - last_volunteered < (time_t)chan_cooldown)
     {

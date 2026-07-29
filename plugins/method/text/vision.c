@@ -35,7 +35,7 @@ typedef struct
 } chatbot_vision_ctx_t;
 
 static bool vision_cooldown_hot(chatbot_vision_cd_t *ring,
-    const char *key, uint32_t cooldown_secs, time_t now);
+    const char *key, uint32_t cooldown_secs, time_t now, time_t floor_at);
 static void vision_cooldown_stamp(chatbot_vision_cd_t *ring,
     const char *key, time_t now);
 static void vision_url_cd_key(const char *target, const char *url,
@@ -128,7 +128,8 @@ chatbot_vision_maybe_submit(chatbot_state_t *st, const method_msg_t *msg)
   cooldown = (uint32_t)kv_get_uint(key);
   if(cooldown == 0) cooldown = 60;
 
-  if(vision_cooldown_hot(&st->vision_cd, target, cooldown, now))
+  if(vision_cooldown_hot(&st->vision_cd, target, cooldown, now,
+      st->created_at))
   {
     clam(CLAM_DEBUG, "vision", "channel cooldown hot target='%s'", target);
     return(true);
@@ -142,7 +143,13 @@ chatbot_vision_maybe_submit(chatbot_state_t *st, const method_msg_t *msg)
 
   vision_url_cd_key(target, image_url, url_cd_key, sizeof(url_cd_key));
 
-  if(vision_cooldown_hot(&st->vision_url_cd, url_cd_key, url_cd, now))
+  // No creation-time floor here, deliberately. This ring is a per-URL
+  // dedup, not a rate throttle: flooring it would make a reloaded bot
+  // ignore EVERY image for url_cooldown_secs (600s by default) to avoid
+  // the far rarer case of re-describing one URL relinked across the
+  // reload. The channel ring above already supplies the post-reload
+  // quiet window.
+  if(vision_cooldown_hot(&st->vision_url_cd, url_cd_key, url_cd, now, 0))
   {
     char safe[sizeof(image_url)];
 
@@ -232,11 +239,16 @@ chatbot_vision_maybe_submit(chatbot_state_t *st, const method_msg_t *msg)
 // Cooldown rings (mirror of chatbot_inflight_record_reply)
 // ----------------------------------------------------------------------
 
+// TEXT-COOLDOWN-1 — `floor_at` raises an unstamped (or stale) slot to a
+// caller-chosen instant, normally the bot handle's creation time, so a
+// ring emptied by a plugin reload does not read as "never replied here".
+// Pass 0 to disable the floor (see the per-URL dedup ring's call site).
 static bool
 vision_cooldown_hot(chatbot_vision_cd_t *ring, const char *key,
-    uint32_t cooldown_secs, time_t now)
+    uint32_t cooldown_secs, time_t now, time_t floor_at)
 {
   bool hot = false;
+  time_t last = 0;
 
   pthread_mutex_lock(&ring->mutex);
 
@@ -244,12 +256,16 @@ vision_cooldown_hot(chatbot_vision_cd_t *ring, const char *key,
   {
     if(strcmp(ring->slots[i].key, key) == 0)
     {
-      hot = (now - ring->slots[i].last_reply) < (time_t)cooldown_secs;
+      last = ring->slots[i].last_reply;
       break;
     }
   }
 
   pthread_mutex_unlock(&ring->mutex);
+
+  if(last < floor_at) last = floor_at;
+  if(last > 0) hot = (now - last) < (time_t)cooldown_secs;
+
   return(hot);
 }
 

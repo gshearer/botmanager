@@ -1048,6 +1048,7 @@ textbot_create(bot_inst_t *inst)
 
   memset(st, 0, sizeof(*st));
   st->inst = inst;
+  st->created_at = time(NULL);
   pthread_rwlock_init(&st->lock, NULL);
   pthread_mutex_init(&st->flight_mutex, NULL);
   pthread_mutex_init(&st->coalesce_mutex, NULL);

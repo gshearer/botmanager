@@ -355,6 +355,13 @@ typedef struct
   pthread_rwlock_t  lock;             // guards active_name + cooldowns + topic cache
   char              active_name[CHATBOT_PERSONALITY_NAME_SZ];
 
+  // TEXT-COOLDOWN-1 — wall-clock stamp taken in textbot_create().
+  // Every speak gate floors its "last spoke" timestamp to this value,
+  // so a handle created by a /plugin reload starts one cooldown window
+  // quiet instead of reading as "never spoke" (which the gates take as
+  // free to speak). Write-once at create; read without a lock.
+  time_t            created_at;
+
   // Cached reactive-topic list. Populated in chatbot_register_interests;
   // read by chatbot_observe on every inbound line under the rdlock.
   // Empty when the active personality declares no interests.
@@ -530,7 +537,10 @@ typedef enum
 // in_flight:                current in-flight LLM requests for this bot.
 // max_inflight:             hard cap from KV.
 // now_secs:                 caller-supplied wall-clock (for cooldown math).
-// last_reply_secs:          last time this bot replied on this target (0 = never).
+// last_reply_secs:          last time this bot replied on this target
+//                           (0 = never; but see TEXT-COOLDOWN-1 — the
+//                           caller floors this to the bot handle's
+//                           creation time, so it is 0 only in tests).
 // cooldown_secs:            cooldown between spoken replies on a target.
 // last_witness_interject:   last time this bot WITNESS-interjected on this
 //                           target (0 = never). VF-3 cooldown key.
@@ -640,13 +650,17 @@ void chatbot_volunteer_deinit(void);
 uint32_t chatbot_inflight_get(chatbot_state_t *st);
 void chatbot_inflight_record_reply(chatbot_state_t *st,
     const char *channel_or_sender, time_t now);
+
+// TEXT-COOLDOWN-1: the getter never returns less than st->created_at,
+// so an unstamped target reads as "spoke when this handle was created"
+// rather than "never spoke". Returns 0 only for a NULL argument.
 time_t chatbot_inflight_last_reply(chatbot_state_t *st,
     const char *channel_or_sender);
 
 // VF-3 — witness-interject cooldown helpers. Keyed by `target`
 // (channel for channel traffic, sender for DMs). Pure LRU under the
-// dedicated witness_cd.mutex; 0 from the getter means "never
-// interjected here".
+// dedicated witness_cd.mutex. TEXT-COOLDOWN-1: the getter floors its
+// result to st->created_at, so it returns 0 only for an empty target.
 time_t chatbot_last_witness_interject(chatbot_state_t *st,
     const char *target);
 void chatbot_stamp_witness_interject(chatbot_state_t *st,

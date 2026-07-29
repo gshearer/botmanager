@@ -100,6 +100,12 @@ chatbot_inflight_last_reply(chatbot_state_t *st, const char *key)
   }
 
   pthread_rwlock_unlock(&st->lock);
+
+  // TEXT-COOLDOWN-1 — an unstamped slot yields 0, which every caller's
+  // `> 0` gate reads as "free to speak". Floor to the handle's creation
+  // time so a reloaded bot serves out one cooldown window first.
+  if(t < st->created_at) t = st->created_at;
+
   return(t);
 }
 
@@ -128,6 +134,9 @@ chatbot_last_witness_interject(chatbot_state_t *st, const char *target)
     }
   }
   pthread_mutex_unlock(&st->witness_cd.mutex);
+
+  // TEXT-COOLDOWN-1 — see chatbot_inflight_last_reply().
+  if(t < st->created_at) t = st->created_at;
 
   return(t);
 }
