@@ -351,6 +351,18 @@ rawg_render_game(const cmd_ctx_t *ctx, const rawg_game_t *g, bool verbose)
     if(line[0] != '\0')
       cmd_reply(ctx, line);
   }
+
+  // line 8 — key artwork (verbose). RAWG_URL_SZ is 256 and the links
+  // line above can already carry three URLs into a 640-byte reply, so
+  // this gets its own line rather than a fourth append that would
+  // routinely truncate. RAWG serves this on the detail payload — no
+  // extra request.
+  if(verbose && g->background_image[0] != '\0')
+  {
+    snprintf(line, sizeof(line), CLR_GRAY "Artwork: " CLR_RESET
+        CLR_CYAN "%s" CLR_RESET, g->background_image);
+    cmd_reply(ctx, line);
+  }
 }
 
 static void
