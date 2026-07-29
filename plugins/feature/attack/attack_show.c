@@ -745,6 +745,133 @@ atk_flav_bands(const cmd_ctx_t *ctx, const atk_tunables_t *t)
 }
 
 // ------------------------------------------------------------------ //
+// show attack classes — the roster of sheets                          //
+// ------------------------------------------------------------------ //
+
+#define ATK_W_CLASS   12
+#define ATK_W_MOVES    8
+#define ATK_W_DECAY    7
+#define ATK_W_HEAL     6
+#define ATK_W_CLASSES (2 + ATK_W_CLASS + ATK_W_MOVES + ATK_W_DECAY \
+                         + ATK_W_HEAL + 1 + 40)
+
+static void
+atk_classes_header(const cmd_ctx_t *ctx)
+{
+  char cell[ATK_CELL_SZ];
+  char line[ATK_LINE_SZ];
+
+  snprintf(line, sizeof(line), "%s  ", CLR_GRAY);
+
+  snprintf(cell, sizeof(cell), "class");
+  atk_padr(cell, sizeof(cell), ATK_W_CLASS);
+  atk_cat(line, sizeof(line), cell);
+
+  snprintf(cell, sizeof(cell), "damage");
+  atk_pad(cell, sizeof(cell), ATK_W_MOVES);
+  atk_cat(line, sizeof(line), cell);
+
+  snprintf(cell, sizeof(cell), "decay");
+  atk_pad(cell, sizeof(cell), ATK_W_DECAY);
+  atk_cat(line, sizeof(line), cell);
+
+  snprintf(cell, sizeof(cell), "heal");
+  atk_pad(cell, sizeof(cell), ATK_W_HEAL);
+  atk_cat(line, sizeof(line), cell);
+
+  atk_cat(line, sizeof(line), " description");
+  atk_cat(line, sizeof(line), CLR_RESET);
+  cmd_reply(ctx, line);
+}
+
+// `decay` counts the afflictions a class can INFLICT, not the lines it
+// has for their ticks: what a reader wants to know is whether this class
+// leaves anything behind at all.
+static void
+atk_classes_row(const cmd_ctx_t *ctx, const atk_class_info_t *info)
+{
+  char name[ATK_CLASS_NAME_SZ];
+  char desc[ATK_CLASS_DESC_SZ];
+  char cell[ATK_CELL_SZ];
+  char line[ATK_LINE_SZ];
+
+  line[0] = '\0';
+  atk_cat(line, sizeof(line), "  ");
+
+  // Fitted rather than printed straight: a stem is bounded by the
+  // grammar, but the cell is what has to hold it, and one column of
+  // breathing room keeps a long class name off the count beside it.
+  atk_fit(info->type, ATK_W_CLASS - 1, name, sizeof(name));
+  atk_fit(info->desc, ATK_CLASS_DESC_SZ - 1, desc, sizeof(desc));
+
+  snprintf(cell, sizeof(cell), CLR_CYAN "%s" CLR_RESET, name);
+  atk_padr(cell, sizeof(cell), ATK_W_CLASS);
+  atk_cat(line, sizeof(line), cell);
+
+  atk_fmt_num(cell, sizeof(cell), info->n[ATK_SEC_DAMAGE], ATK_W_MOVES);
+  atk_pad(cell, sizeof(cell), ATK_W_MOVES);
+  atk_cat(line, sizeof(line), cell);
+
+  atk_fmt_num(cell, sizeof(cell), info->n[ATK_SEC_DOT], ATK_W_DECAY);
+  atk_pad(cell, sizeof(cell), ATK_W_DECAY);
+  atk_cat(line, sizeof(line), cell);
+
+  atk_fmt_num(cell, sizeof(cell), info->n[ATK_SEC_HEAL], ATK_W_HEAL);
+  atk_pad(cell, sizeof(cell), ATK_W_HEAL);
+  atk_cat(line, sizeof(line), cell);
+
+  // The description is the last cell on the row, so it is the one thing
+  // that never needs padding — and the fallback says what it is.
+  snprintf(cell, sizeof(cell), " %s%s", desc,
+      info->builtin ? CLR_GRAY " (built-in fallback)" CLR_RESET : "");
+  atk_cat(line, sizeof(line), cell);
+
+  cmd_reply(ctx, line);
+}
+
+static void
+atk_show_classes(const cmd_ctx_t *ctx)
+{
+  atk_tunables_t   t;
+  atk_class_info_t info[ATK_CLASSES_MAX];
+  char             line[ATK_LINE_SZ];
+  char             rule[ATK_LINE_SZ];
+  uint32_t         n;
+  uint32_t         i;
+
+  atk_tunables_load(&t);
+  n = atk_class_list(info, ATK_CLASSES_MAX);
+
+  if(n == 0)
+  {
+    cmd_reply(ctx, "☠ No character classes are loaded.");
+    return;
+  }
+
+  snprintf(line, sizeof(line),
+      "🎭 " CLR_BOLD "ATTACK — CHARACTER CLASSES" CLR_RESET
+      CLR_GRAY " (%s)" CLR_RESET, t.classes_path);
+  cmd_reply(ctx, line);
+
+  atk_rule(rule, sizeof(rule), ATK_W_CLASSES);
+  cmd_reply(ctx, rule);
+  atk_classes_header(ctx);
+
+  for(i = 0; i < n; i++)
+    atk_classes_row(ctx, &info[i]);
+
+  cmd_reply(ctx, rule);
+
+  // The charter, in one line, right under the evidence for it. A reader
+  // asking what a class's `critical` moves are worth gets the bands from
+  // the renderer itself — never re-derived from the percentages.
+  atk_flav_bands(ctx, &t);
+  cmd_reply(ctx, CLR_GRAY
+      "  every class rolls the same numbers; a sheet supplies only the "
+      "words." CLR_RESET);
+}
+
+// ------------------------------------------------------------------ //
 // Registration                                                        //
 // ------------------------------------------------------------------ //
 
@@ -777,6 +904,23 @@ atk_show_register(void)
         "The row count is `plugin.attack.scoreboard_rows`.",
         USERNS_GROUP_EVERYONE, 0, CMD_SCOPE_ANY, METHOD_T_ANY,
         atk_show_scores, NULL, "show/attack", NULL,
+        NULL, 0, NULL, NULL) != SUCCESS)
+    return(FAIL);
+
+  if(cmd_register("attack", "classes",
+        "show attack classes",
+        "The character classes a combatant may be dealt.",
+        "One row per loaded character sheet: how many damage moves it "
+        "carries, how many afflictions it can inflict, how many heals it "
+        "knows, and what it is. Below the table, what the four damage "
+        "tiers actually pay at the current tunables. A class changes "
+        "only the WORDS the pit speaks — the engine rolls the same "
+        "numbers for everybody, and a sheet with forty critical lines "
+        "hits exactly as hard as one with a single line. Sheets live in "
+        "`plugin.attack.classes_path` and are re-read by `attack "
+        "reload`.",
+        USERNS_GROUP_EVERYONE, 0, CMD_SCOPE_ANY, METHOD_T_ANY,
+        atk_show_classes, NULL, "show/attack", NULL,
         NULL, 0, NULL, NULL) != SUCCESS)
     return(FAIL);
 

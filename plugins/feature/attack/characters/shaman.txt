@@ -1,0 +1,58 @@
+# shaman — drums, rattles, dances and a heavy staff. Most of what it does
+# arrives late; some of it puts people back on their feet.
+
+type: shaman
+desc: Drums, rattles and a heavy staff. Slow harm, some mending.
+
+[damage]
+minor    | {attacker} raps {target} across the shins with the staff for {damage} damage.
+minor    | {attacker} shakes the rattle once and {target}'s ears start ringing — {damage} damage.
+minor    | {attacker} scatters ash across {target}'s eyes for {damage} damage.
+
+medium   | {attacker} swings the staff into {target}'s ribs for {damage} damage.
+medium   | {attacker} stamps twice and the floor throws {target} down for {damage} damage.
+medium   | {attacker} beats the drum until {target} bleeds from the nose — {damage} damage.
+
+major    | {attacker} brings the staff down on {target}'s shoulder and hears it crack for {damage} damage.
+major    | {attacker} calls the wind in and it takes {target} off their feet for {damage} damage.
+major    | {attacker} dances a circle around {target} and something inside them tears — {damage} damage.
+
+critical | {attacker} beats the drum until {target}'s heart tries to keep the rhythm. {damage} CRITICAL damage!
+critical | {attacker} brings the staff down across {target}'s spine. {damage} CRITICAL damage!
+critical | {attacker} calls every voice at once and {target} comes apart under them. {damage} CRITICAL damage!
+
+[dot]
+curse | binding word | {attacker} names {target} aloud and the {affliction} settles over them.
+curse | black mark   | {attacker} paints a {affliction} on {target} that will not wipe off.
+curse | old debt     | {attacker} calls in something older than {target}, and the {affliction} stays.
+rot   | creeping rot | {attacker} presses wet earth into {target}'s wound and the {affliction} takes.
+rot   | grave mould  | {attacker} breathes {affliction} across {target} and lets it settle.
+rot   | root blight  | {attacker} pushes something living into {target}. The {affliction} spreads on its own.
+chill | deep chill   | {attacker} lets the cold off the drumskin into {target} — a {affliction} that will not lift.
+chill | winter breath | {attacker} breathes over {target} and leaves a {affliction} in the lungs.
+chill | grey frost   | {attacker} marks {target} with a {affliction} that climbs from the fingers inward.
+curse | hollow name  | {attacker} takes {target}'s name away and leaves the {affliction} in its place.
+
+[heal]
+minor | {attacker} packs {target}'s wound with bitter leaf and ties it shut — {heal} hit points.
+minor | {attacker} beats a slow rhythm over {target} until the breathing follows it. {heal} hit points.
+major | {attacker} dances the whole circle over {target} and hauls them back up — {heal} hit points.
+major | {attacker} calls something old to look at {target}, and it decides to mend them. {heal} hit points.
+
+[death]
+{attacker} stops drumming. {target} stops with it.
+{attacker} steps over {target} and scatters ash across the face.
+{attacker} lets the circle close on {target} and does not open it again.
+
+[decay]
+curse | The {affliction} {attacker} laid on {target} comes due for {damage} damage.
+curse | {target} hears their own name again in {attacker}'s voice — the {affliction} takes {damage} damage.
+rot   | The {affliction} {attacker} planted spreads under {target}'s skin for {damage} damage.
+rot   | {attacker} is nowhere near; the {affliction} opens {target} further for {damage} damage.
+chill | The {affliction} {attacker} left greys {target}'s fingers for {damage} damage.
+chill | {target} cannot get warm — the {affliction} from {attacker} takes {damage} damage.
+
+[decay-kill]
+curse | The {affliction} {attacker} spoke over {target} takes the rest of it.
+rot   | The {affliction} {attacker} planted finally uses {target} up.
+chill | The {affliction} {attacker} left reaches {target}'s heart and stays there.

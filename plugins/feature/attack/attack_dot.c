@@ -78,7 +78,7 @@ atk_dot_speak(const atk_dot_due_t *d, const atk_tunables_t *t,
 
   clam(CLAM_INFO, ATK_CTX,
       "round %" PRId64 ": %s slew %s by %s (eject=%d)", d->round_id,
-      d->source, d->victim, atk_dot_name_of(d->kind), (int)force);
+      d->source, d->victim, atk_fallback_noun(d->kind), (int)force);
 }
 
 // The lock is the turn lock, not a lock of this file's own: a tick

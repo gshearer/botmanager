@@ -1,0 +1,54 @@
+# warrior — brawn, edged steel and blunt weight. No spells, no healing.
+# One class sheet for the botmanager `attack` pit. See
+# ../new-class-prompt.txt for the grammar and the fairness rules.
+
+type: warrior
+desc: Brawn and edged steel. Swords, axes, hammers, no mercy.
+
+[damage]
+minor    | {attacker} clips {target} with the flat of an axe for {damage} damage.
+minor    | {attacker} raps {target} across the shin with a sheathed blade for {damage} damage.
+minor    | {attacker} shoves {target} off balance with a shield rim for {damage} damage.
+minor    | {attacker} catches {target}'s ear with a gauntlet on the backswing — {damage} damage.
+minor    | {attacker} stamps on {target}'s instep and leans on it for {damage} damage.
+minor    | {attacker} nicks {target}'s knuckles and watches the grip go loose — {damage} damage.
+
+medium   | {attacker} shoulder-checks {target} into the wall for {damage} damage.
+medium   | {attacker} opens a red line along {target}'s collarbone for {damage} damage.
+medium   | {attacker} drives a knee into {target}'s gut and leaves them wheezing — {damage} damage.
+medium   | {attacker} beats {target}'s guard aside and puts a boot into the thigh for {damage} damage.
+medium   | {attacker} catches {target} in the mouth with a spiked bracer for {damage} damage.
+medium   | {attacker} hooks {target}'s ankle with a haft and drops them hard for {damage} damage.
+
+major    | {attacker} hammers {target}'s knee sideways until the joint gives — {damage} damage.
+major    | {attacker} folds {target}'s ribs inward with a mace head for {damage} damage.
+major    | {attacker} runs a blade through {target}'s shoulder and leaves it a moment — {damage} damage.
+major    | {attacker} catches {target}'s wrist and turns the arm the wrong way round for {damage} damage.
+major    | {attacker} splits {target}'s helm and most of what it was protecting — {damage} damage.
+major    | {attacker} drags {target} face-first down a wall of rough stone for {damage} damage.
+
+critical | {attacker} drives the blade to the hilt through {target}. {damage} CRITICAL damage!
+critical | {attacker} takes {target}'s arm off above the elbow. {damage} CRITICAL damage!
+critical | {attacker} caves {target}'s chest in with one overhead swing. {damage} CRITICAL damage!
+critical | {attacker} lifts {target} off the floor on the spear and holds them there. {damage} CRITICAL damage!
+critical | {attacker} opens {target} from collarbone to hip in one stroke. {damage} CRITICAL damage!
+critical | {attacker} breaks {target}'s ribs against a pillar, one at a time. {damage} CRITICAL damage!
+
+[dot]
+bleed | open wound | {attacker} opens a vein in {target} and steps back — the {affliction} does the rest.
+bleed | deep cut   | {attacker} leaves {target} a {affliction} too wide to press shut.
+bleed | torn artery | {attacker} carves through something in {target} that pumps. The {affliction} is the whole of it now.
+
+[death]
+{attacker} takes {target}'s head in one clean stroke.
+{attacker} puts the axe through {target}'s neck and pulls it free.
+{attacker} stands over {target} and waits until the twitching stops.
+
+[decay]
+bleed | The {affliction} {attacker} left runs down {target}'s side for {damage} damage.
+bleed | {attacker} is not even looking; {target} loses another {damage} damage to the {affliction}.
+bleed | {target} presses a hand to the {affliction} {attacker} opened and takes {damage} damage anyway.
+
+[decay-kill]
+bleed | {attacker} never struck again; the {affliction} simply ran {target} dry.
+bleed | The {affliction} {attacker} opened finishes the argument. {target} does not get up.

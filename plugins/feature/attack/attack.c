@@ -206,9 +206,18 @@ atk_init(void)
 static bool
 atk_start(void)
 {
+  atk_load_report_t rep;
+
   if(atk_schema_ensure() != SUCCESS)
     clam(CLAM_WARN, ATK_CTX,
         "attack schema init failed (the pit will error until fixed)");
+
+  // After the schema, and never before kv_load(): classes_path is a
+  // persisted knob like every other. A directory that yields nothing
+  // still leaves one class standing — see attack_class.c's D7 fallback.
+  atk_class_load(&rep);
+  clam(CLAM_INFO, ATK_CTX, "%u character class(es) loaded, %u rejected",
+      rep.accepted, rep.rejected);
 
   return(SUCCESS);
 }
@@ -221,6 +230,7 @@ atk_deinit(void)
   // this plugin.
   atk_dot_stop();
 
+  atk_class_free();
   atk_commands_unregister();
   clam(CLAM_INFO, ATK_CTX, "attack plugin deinitialized");
 }

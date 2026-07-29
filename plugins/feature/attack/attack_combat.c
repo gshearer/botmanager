@@ -3,11 +3,12 @@
 // Nothing here touches the database or the command context — it turns
 // (tunables, two nicknames, a number) into one finished line of text.
 //
-// The tables below are still the old Drow ones. ATK-3 left them alone on
-// purpose: ATK-5 deletes the damage and inflict tables outright and
-// rewrites the death and decay tables plain, as the neutral fallbacks a
-// character sheet may override. Nothing ELSE in the plugin names a
-// setting any more.
+// The four damage-tier tables below are the last themed words in the
+// tree, and the last words of any kind that this file owns: ATK-4 moved
+// every affliction and death line out to attack_class.c as the neutral
+// fallbacks a character sheet may override, and ATK-5 deletes these four
+// when the sheets take over the blow line. Nothing ELSE in the plugin
+// names a setting any more.
 
 #define ATTACK_INTERNAL
 #include "attack.h"
@@ -111,31 +112,6 @@ static const char *const atk_critical[] = {
   "%s breaks %s's ribs against a stalagmite one at a time, in no hurry. %s CRITICAL damage!",
 };
 
-// FORMAT CONTRACT: every entry takes exactly two `const char *` —
-// slayer, then fallen. No damage slot; the round is already over.
-static const char *const atk_deaths[] = {
-  "%s takes %s's head in one clean stroke — the Spider Queen is pleased.",
-  "%s feeds %s to Lolth's webs; the corpse is drawn down into the dark.",
-  "%s stands over %s's body and wipes the blade clean on a piwafwi.",
-  "%s hurls %s screaming into the Demonweb Pits.",
-  "%s claims the kill; the last of %s's blood cools on Underdark stone.",
-  "%s snuffs %s out — a House sigil cracks and goes dark, unmourned.",
-  "%s offers %s's heart at the altar of the Spider Queen. Accepted.",
-  "%s kills %s the way the drow prefer: quickly, and before witnesses.",
-  "%s severs the thread. %s does not rise again.",
-  "%s stands alone as Narbondel dims — %s has spent their last breath.",
-  "%s feeds %s to the driders, and the chamber falls silent.",
-  "%s strikes %s from the roster of the living without breaking stride.",
-  "%s spins %s's soul into the web; the Matron Mothers take note.",
-  "%s ends it — %s falls to one knee, then to none.",
-  "%s graduates; %s is dead. The Academy would call that a passing grade.",
-  "%s leaves %s where they lie. The rothe will handle the rest.",
-  "%s writes over %s's name in the House ledger, in blood.",
-  "%s closes the account; %s dies staring into a dark that stares back.",
-  "%s pins %s to the cavern wall and leaves the blade in as a marker.",
-  "%s takes the spoils while eight legs skitter over %s's cooling body.",
-};
-
 #define ATK_N(t) ((int)(sizeof(t) / sizeof((t)[0])))
 
 // The four damage tiers as one indexable set, so the renderer picks a
@@ -167,135 +143,34 @@ static const char *const atk_tier_emoji[ATK_FLAV_DEATH] = {
 // Afflictions                                                         //
 // ------------------------------------------------------------------ //
 
-// Three parallel tables keyed by atk_dot_kind_t, in the shape the tier
-// tables above already establish. The name is the bare noun a line
-// substitutes for {affliction}: lower case, no article, no colour — the
-// renderer colorizes it.
-static const char *const atk_dot_name[ATK_DOT__COUNT] = {
-  "open wound", "spider venom", "ochre burn", "myconid spores",
-  "necrotic chill"
-};
+// Two parallel tables keyed by atk_dot_kind_t, and deliberately only
+// two: the engine owns a kind's GLYPH and its COLOUR and nothing else.
+// The noun — whether a `rot` is a creeping rot, a gnawing skeleton or a
+// nanite bloom — belongs to the character sheet that inflicted it, and
+// the neutral fallbacks for every word a sheet may omit live together in
+// attack_class.c.
 
 // Every glyph here must occupy exactly ONE display column, or
-// atk_vis_len() starts lying and the round card skews. All five are
-// plain U+27xx/U+26xx symbols: no variation selectors, no
+// atk_vis_len() starts lying and the round card skews. All eight are
+// plain U+26xx/U+27xx symbols: no variation selectors, no
 // emoji-presentation code points.
 static const char *const atk_dot_emoji[ATK_DOT__COUNT] = {
-  "✚", "☣", "⚗", "✺", "❆"
+  "✚", "☣", "⚗", "✺", "❆",
+  "✧", "❖", "✞"
 };
 
 static const char *const atk_dot_color[ATK_DOT__COUNT] = {
-  CLR_RED, CLR_GREEN, CLR_ORANGE, CLR_YELLOW, CLR_CYAN
-};
-
-// FORMAT CONTRACT: every entry in all five tables below takes exactly
-// two `const char *` — attacker, then target. The affliction names
-// itself in the words, so there is no {affliction} slot and no damage:
-// the tick lines carry the numbers, this one only says it has begun.
-// Short, deliberately — a blow line is already on screen above it.
-static const char *const atk_dot_bleed[] = {
-  "%s's cut will not close; %s is bleeding.",
-  "%s opens a vein and leaves it open — %s is losing blood.",
-  "%s carves a wound %s cannot press shut.",
-};
-
-static const char *const atk_dot_venom[] = {
-  "Lolth's patience runs in %s's blade — %s is envenomed.",
-  "%s's edge was drow-poisoned; %s begins to sweat.",
-  "%s lets spider venom find the wound. %s will feel it working.",
-};
-
-static const char *const atk_dot_acid[] = {
-  "%s smears ochre slime across %s; it begins to eat.",
-  "%s breaks a jelly-flask over %s. The burning starts slow.",
-  "%s paints %s with something that keeps chewing.",
-};
-
-static const char *const atk_dot_spores[] = {
-  "%s bursts a myconid cap over %s. The rot takes.",
-  "%s drives fungal spores into %s's wound; the bloom begins.",
-  "%s dusts %s with cavern rot and steps back to let it work.",
-};
-
-static const char *const atk_dot_chill[] = {
-  "%s leaves a Narbondel cold in %s that will not warm.",
-  "%s's blade drags a necrotic chill through %s.",
-  "%s marks %s with the cold that follows a death-blow.",
-};
-
-// FORMAT CONTRACT: every entry in the five tick tables takes exactly
-// three `const char *` — source, victim, damage — like a blow line, and
-// for the same reason: a tick is a peer of a blow and reads as one.
-static const char *const atk_dot_tick_bleed[] = {
-  "%s's cut keeps drinking from %s — %s damage.",
-  "The wound %s opened runs down %s's side for %s damage.",
-  "%s's blade is long gone; %s bleeds anyway, for %s damage.",
-};
-
-static const char *const atk_dot_tick_venom[] = {
-  "Lolth's patience works through %s's poison; %s shudders for %s damage.",
-  "The venom %s left climbs %s's arm for %s damage.",
-  "%s's poison finds another nerve in %s — %s damage.",
-};
-
-static const char *const atk_dot_tick_acid[] = {
-  "%s's slime eats deeper into %s for %s damage.",
-  "The ochre burn %s gave %s is still chewing — %s damage.",
-  "%s's acid finds bone in %s for %s damage.",
-};
-
-static const char *const atk_dot_tick_spores[] = {
-  "%s's spores bloom in %s's wound for %s damage.",
-  "The rot %s planted spreads under %s's skin — %s damage.",
-  "%s's fungus feeds on %s for %s damage.",
-};
-
-static const char *const atk_dot_tick_chill[] = {
-  "%s's cold creeps another inch through %s for %s damage.",
-  "The chill %s left greys %s's fingers — %s damage.",
-  "Narbondel's dark works in %s's wake; %s takes %s damage.",
-};
-
-// FORMAT CONTRACT: exactly two `const char *` — source, then victim. No
-// damage slot, matching atk_deaths[]: the round is already over.
-static const char *const atk_dot_death_bleed[] = {
-  "%s never struck again; %s simply ran out of blood.",
-  "The wound %s opened finishes the argument. %s does not get up.",
-};
-
-static const char *const atk_dot_death_venom[] = {
-  "%s's venom stops %s's heart between one breath and the next.",
-  "Lolth takes her time. %s waits; %s stops.",
-};
-
-static const char *const atk_dot_death_acid[] = {
-  "%s's slime finishes what it started — %s comes apart on the stone.",
-  "The burn %s gave eats through the last of %s.",
-};
-
-static const char *const atk_dot_death_spores[] = {
-  "%s's rot blooms one last time; %s is a garden now.",
-  "The spores %s planted come up through %s's ribs.",
-};
-
-static const char *const atk_dot_death_chill[] = {
-  "%s's cold reaches %s's heart and stays there.",
-  "The chill %s left finishes %s without being present for it.",
+  CLR_RED, CLR_GREEN, CLR_ORANGE, CLR_YELLOW, CLR_CYAN, CLR_PURPLE,
+  CLR_BOLD CLR_RED, CLR_GRAY
 };
 
 // A kind arrives from a database column, so it is input like any other:
 // an out-of-range value falls back to the first entry rather than
-// indexing past the table.
+// indexing past the tables.
 static atk_dot_kind_t
 atk_dot_clamp(atk_dot_kind_t kind)
 {
   return((kind >= 0 && kind < ATK_DOT__COUNT) ? kind : ATK_DOT_BLEED);
-}
-
-const char *
-atk_dot_name_of(atk_dot_kind_t kind)
-{
-  return(atk_dot_name[atk_dot_clamp(kind)]);
 }
 
 const char *
@@ -309,41 +184,6 @@ atk_dot_color_of(atk_dot_kind_t kind)
 {
   return(atk_dot_color[atk_dot_clamp(kind)]);
 }
-
-// The five inflict tables as one indexable set, exactly as atk_tbl[]
-// gathers the damage tiers.
-static const char *const *const atk_dot_tbl[ATK_DOT__COUNT] = {
-  atk_dot_bleed, atk_dot_venom, atk_dot_acid, atk_dot_spores,
-  atk_dot_chill
-};
-
-static const int atk_dot_tbl_n[ATK_DOT__COUNT] = {
-  ATK_N(atk_dot_bleed), ATK_N(atk_dot_venom),
-  ATK_N(atk_dot_acid),  ATK_N(atk_dot_spores),
-  ATK_N(atk_dot_chill)
-};
-
-static const char *const *const atk_dot_tick_tbl[ATK_DOT__COUNT] = {
-  atk_dot_tick_bleed, atk_dot_tick_venom, atk_dot_tick_acid,
-  atk_dot_tick_spores, atk_dot_tick_chill
-};
-
-static const int atk_dot_tick_n[ATK_DOT__COUNT] = {
-  ATK_N(atk_dot_tick_bleed), ATK_N(atk_dot_tick_venom),
-  ATK_N(atk_dot_tick_acid),  ATK_N(atk_dot_tick_spores),
-  ATK_N(atk_dot_tick_chill)
-};
-
-static const char *const *const atk_dot_death_tbl[ATK_DOT__COUNT] = {
-  atk_dot_death_bleed, atk_dot_death_venom, atk_dot_death_acid,
-  atk_dot_death_spores, atk_dot_death_chill
-};
-
-static const int atk_dot_death_n[ATK_DOT__COUNT] = {
-  ATK_N(atk_dot_death_bleed), ATK_N(atk_dot_death_venom),
-  ATK_N(atk_dot_death_acid),  ATK_N(atk_dot_death_spores),
-  ATK_N(atk_dot_death_chill)
-};
 
 void
 atk_render_dot_inflict(char *out, size_t cap, const char *src_nick,
@@ -361,7 +201,7 @@ atk_render_dot_inflict(char *out, size_t cap, const char *src_nick,
   snprintf(src, sizeof(src), CLR_CYAN   "%s" CLR_RESET, src_nick);
   snprintf(tgt, sizeof(tgt), CLR_PURPLE "%s" CLR_RESET, tgt_nick);
   snprintf(body, sizeof(body),
-      atk_dot_tbl[kind][util_rand(atk_dot_tbl_n[kind])], src, tgt);
+      atk_fallback_dot_inflict(kind), src, tgt);
 
   // The glyph that will mark the victim on the round card leads the
   // line, so the two read as the same thing.
@@ -514,7 +354,7 @@ atk_render_death(char *out, size_t cap, const char *slayer_nick,
   snprintf(slayer, sizeof(slayer), CLR_CYAN   "%s" CLR_RESET, slayer_nick);
   snprintf(fallen, sizeof(fallen), CLR_PURPLE "%s" CLR_RESET, fallen_nick);
   snprintf(body, sizeof(body),
-      atk_deaths[util_rand(ATK_N(atk_deaths))], slayer, fallen);
+      atk_fallback_death(), slayer, fallen);
 
   snprintf(out, cap, "☠ %s", body);
 }
@@ -542,8 +382,7 @@ atk_render_dot_tick(char *out, size_t cap, const char *src_nick,
   snprintf(tgt, sizeof(tgt), CLR_PURPLE "%s" CLR_RESET, tgt_nick);
   snprintf(dmgs, sizeof(dmgs), "%s%d" CLR_RESET, atk_dot_color_of(kind), dmg);
   snprintf(body, sizeof(body),
-      atk_dot_tick_tbl[kind][util_rand(atk_dot_tick_n[kind])],
-      src, tgt, dmgs);
+      atk_fallback_decay(kind), src, tgt, dmgs);
 
   if(hp > 0)
     snprintf(out, cap, "%s %s " CLR_GRAY "[%s — %d/%d hp]" CLR_RESET,
@@ -571,8 +410,7 @@ atk_render_dot_death(char *out, size_t cap, const char *src_nick,
 
   // No tally, exactly as the blade's death line carries none.
   snprintf(body, sizeof(body),
-      atk_dot_death_tbl[kind][util_rand(atk_dot_death_n[kind])],
-      src, tgt);
+      atk_fallback_decay_kill(kind), src, tgt);
 
   // The same headstone the turn engine's death line carries, so a death
   // by decay is unmistakably the same event as a death by blade.

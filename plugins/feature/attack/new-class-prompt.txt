@@ -1,0 +1,171 @@
+## Task
+
+Write one character class sheet for the botmanager `attack` duelling
+game. Output the file body and nothing else: no preamble, no commentary,
+no markdown fences, no explanation of what you have written.
+
+The result is saved as `characters/<type>.txt` and is loaded by
+`attack reload`. If it does not parse, it does not exist.
+
+
+## Setting
+
+There isn't one.
+
+The game engine is theme-free by design and names no world. The *class*
+carries the setting, and it brings its own with it: a sword-and-sorcery
+warrior, a cyberpunk street samurai, a plague doctor, a thing that fires
+lasers, a bored god — all equally valid, and all able to stand in the
+same pit together. Nothing in the engine will ever contradict your world,
+because the engine has none.
+
+The one-line brief you were given naming this class is the only setting
+that applies. Commit to it completely.
+
+
+## Craft
+
+- Concrete physical detail over adjectives: what the blow did, what
+  broke, what hit the floor. "Folds the ribs inward" beats "strikes
+  mightily".
+- No narrator commentary, no moralising, no sympathy for either party.
+  Nobody in the pit is shocked by any of this.
+- Violence is ordinary here. Bloody, but not pornographic; no lingering
+  on suffering for its own sake.
+- No sexual content.
+- Every line short enough to read at a glance in a chat window.
+- Every line different from every other line, in verb as well as in noun.
+
+
+## Format
+
+The file is plain text. A line whose FIRST byte is `#` is a comment;
+blank lines are ignored. Everything before the first `[section]` is a
+`key: value` header. Fields inside a section are separated by `|`, every
+field is trimmed, and any further `|` belongs to the text.
+
+Header, both keys required:
+
+    type: warrior          # must be exactly the file stem, alphanumeric
+    desc: <= 60 bytes, one line, what this class is
+
+The six sections, and the exact shape of a line in each:
+
+    [damage]      tier | text            REQUIRED, and all four tiers
+    [dot]         kind | noun | text     optional
+    [heal]        tier | text            optional, but then both tiers
+    [death]       text                   optional
+    [decay]       kind | text            optional
+    [decay-kill]  kind | text            optional
+
+`tier` is one of `minor medium major critical` in `[damage]`, and one of
+`minor major` in `[heal]`. `[dot]` lines carry NO tier: the engine has
+already rolled the number and the line that inflicts an affliction names
+no number at all.
+
+`kind` is one of exactly these eight:
+
+    bleed  poison  burn  rot  chill  curse  drain  shock
+
+They are deliberately plain so that a sword, a spell and a plasma coil
+can all use them. The kind chooses only a glyph and a colour on the
+scoreboard.
+
+`noun` is YOUR class's word for that affliction — `open wound`,
+`gnawing skeleton`, `nanite bloom`, `binding word`. At most 24 bytes,
+lower case, no article, no punctuation. It is what `{affliction}`
+expands to, and it is stored with the affliction, so your wording
+survives every tick it speaks.
+
+The macros, and how many times each MUST appear — exactly, no more and
+no less:
+
+    section       {attacker} {target} {damage} {heal} {affliction}
+    [damage]           1        1        1       0        0
+    [dot]              1        1        0       0        1
+    [heal]             1        1        0       1        0
+    [death]            1        1        0       0        0
+    [decay]            1        1        1       0        1
+    [decay-kill]       1        1        0       0        1
+
+`[decay]` is one tick of an affliction still working; `[decay-kill]` is
+the tick that finishes someone. Both are looked up by KIND, and any kind
+you do not cover falls back to a plain engine line — so you need not
+write one for every kind you inflict.
+
+
+## Hard rules
+
+- One sentence per move, 150 characters or fewer.
+- Plain text only. No markdown, no emoji, no numbering, no bullets, no
+  quotation marks wrapped around a line.
+- **No `%` anywhere.** Not one.
+- No curly braces other than the named macros above.
+- No colour codes, no control characters.
+- Every line different from every other line.
+- 20 to 100 moves in total, weighted heavily toward `[damage]`.
+- At least one move in each of the four damage tiers, and — if you use
+  `[heal]` at all — at least one `minor` and one `major`.
+- Match the words to the tier. Nothing in `minor` may sound like a wound
+  that ends a fight, and only `critical` keeps the `CRITICAL damage!`
+  register.
+
+
+## Fairness — read this before writing a single line
+
+The tier tag does not make your class stronger.
+
+The engine rolls the damage FIRST — one uniform draw, identical for
+every class in the game — then works out which tier that number fell in,
+and only then asks your sheet for a sentence of that size. Your class
+never touches the number.
+
+So a sheet with forty `critical` lines and a sheet with one hit exactly
+as hard as each other. More moves buys variety, never power.
+
+Tag honestly. A `minor` line describing a decapitation will be spoken
+over a 3-damage graze and will read as a lie.
+
+And never invent a field. If your class "should" resist fire, strike
+twice, or ignore poison — it cannot. The grammar has no number, no
+weight, no probability, no cooldown, and it never will. Say it in `desc`
+and let it be flavour.
+
+The same applies to afflictions and heals: how OFTEN a turn becomes an
+affliction is an engine-owned roll identical for everyone, and how much a
+heal restores is engine-owned too. A class with ten affliction lines
+inflicts no more of them than a class with two — it simply repeats itself
+less.
+
+
+## Existing classes — do not duplicate
+
+Anyone adding or removing a sheet in `characters/` updates this table in
+the SAME COMMIT. It is the only thing stopping the seventh class from
+being the fourth sword user.
+
+| type | desc | weapons and flavour of harm |
+|---|---|---|
+| `warrior` | Brawn and edged steel. Swords, axes, hammers, no mercy. | Swords, axes, hammers, shields, spears. Instant force. A few `bleed` afflictions and nothing else lingering. No heals. |
+| `rogue` | Quiet, quick and piercing. Daggers, bows, spears, poison. | Daggers, bows, darts, spears, and angles nobody was watching. Roughly a quarter of what it says is a `bleed` or `poison` affliction. Backstabs. No heals. |
+| `cleric` | Borrowed authority. Smites, hammers and mends the fallen. | Mace and called-down light. Roughly a quarter of what it says is a heal, in both bands. Leaves nothing behind that keeps working — no afflictions. |
+| `wizard` | Raw energy, delivered directly. Fire, force and frost. | Fire, force, frost, lightning. No weapons, no afflictions, no heals: everything it does, it does at once. |
+| `shaman` | Drums, rattles and a heavy staff. Slow harm, some mending. | Drums, rattles, dances and a staff. Mostly `curse`, `rot` and `chill` afflictions; a few blunt staff strikes; a few heals in both bands. |
+| `necromancer` | Takes what is owed, and sets the dead to collect the rest. | Grave-cold, raised corpses and direct vitality theft. `drain` afflictions voiced as a hold that keeps taking, `rot` afflictions voiced as summoned servants. No heals. |
+
+
+## Invocation
+
+Recorded so the next author does not have to re-derive it.
+
+The model configured for this plugin is **`g4nv`**
+(`nvidia/Gemma-4-31B-IT-NVFP4`, service `hiigara-chat`, 98304 context) —
+local, no per-token cost, and comfortably large enough to write a
+100-move sheet in one response.
+
+Feed it this whole file plus a one-line brief naming the class and its
+flavour of violence.
+
+The gate is `attack reload` reporting zero rejections, not the provenance
+of the text. A rejection is logged with the file, the line number and the
+reason; fix the line and reload again.

@@ -379,7 +379,7 @@ atk_cmd_attack(const cmd_ctx_t *ctx)
       .victim_nick = nick,
       .source      = ctx->username,
       .source_nick = src_nick,
-      .noun        = atk_dot_name_of(kind),
+      .noun        = atk_fallback_noun(kind),
       .kind        = kind,
       .dmg_plan    = dmg,
       .max_ticks   = ticks,
@@ -439,6 +439,35 @@ atk_cmd_attack(const cmd_ctx_t *ctx)
 // Registration                                                        //
 // ------------------------------------------------------------------ //
 
+// Re-read every character sheet without a restart. A rejected sheet is
+// named rather than counted: a sheet that failed to load is a class
+// nobody can be dealt, and the author deserves to hear which one.
+static void
+atk_cmd_reload(const cmd_ctx_t *ctx)
+{
+  atk_tunables_t    t;
+  atk_load_report_t rep;
+  char              line[ATK_LINE_SZ];
+  uint32_t          i;
+
+  atk_tunables_load(&t);
+  atk_class_load(&rep);
+
+  snprintf(line, sizeof(line),
+      "🎭 %" PRIu32 " class%s loaded, %" PRIu32 " rejected (%s)",
+      rep.accepted, (rep.accepted == 1) ? "" : "es", rep.rejected,
+      t.classes_path);
+  cmd_reply(ctx, line);
+
+  for(i = 0; i < rep.n_bad; i++)
+  {
+    snprintf(line, sizeof(line),
+        "  rejected: %s — see the log for the line and the reason",
+        rep.bad[i]);
+    cmd_reply(ctx, line);
+  }
+}
+
 // CMD_ARG_NONE, not CMD_ARG_ALNUM: an IRC nickname legally contains
 // [ ] \ ` _ ^ { | } and '-'.
 static const cmd_arg_desc_t atk_attack_args[] = {
@@ -466,6 +495,27 @@ atk_commands_register(void)
         atk_attack_args,
         (uint8_t)(sizeof(atk_attack_args) / sizeof(atk_attack_args[0])),
         NULL, NULL) != SUCCESS)
+    return(FAIL);
+
+  // A child, not an argument — and the trade is deliberate. Children
+  // resolve before the root's argument (core/cmd.c resolve_subcmd_locked),
+  // so a user nicknamed `reload` cannot be attacked. Accepted: `reload`
+  // is admin-only and rare, while `!heal` and `!defer` are frequent and
+  // player-facing and therefore earn roots of their own. `--end` has no
+  // such problem: an IRC nickname can never begin with '-'.
+  if(cmd_register("attack", "reload",
+        "attack reload",
+        "Re-read the character sheets from disk.",
+        "Re-scans `plugin.attack.classes_path`, re-parses every sheet in "
+        "it, and swaps the whole registry at once — a sheet that fails "
+        "validation leaves the previously loaded set untouched for every "
+        "other class. Replies with the tally and names each rejected "
+        "file; the log carries the line number and the reason. Note that "
+        "a combatant nicknamed `reload` cannot be attacked, because this "
+        "child resolves before the root command's argument.",
+        USERNS_GROUP_ADMIN, 0, CMD_SCOPE_ANY, METHOD_T_ANY,
+        atk_cmd_reload, NULL, "attack", NULL,
+        NULL, 0, NULL, NULL) != SUCCESS)
     return(FAIL);
 
   // The read-only views hang off the core `show` parent, not off this

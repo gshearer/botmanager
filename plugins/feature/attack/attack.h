@@ -140,13 +140,22 @@ typedef enum
 // time and stored on the row, because it is what makes the words
 // specific: the renderer substitutes its name rather than keeping a
 // separate table per affliction.
+//
+// The engine owns the KIND — a glyph and a colour, and nothing else. The
+// NOUN belongs to the character sheet, so the same `rot` may be a
+// gnawing skeleton to one class and a nanite bloom to another. All eight
+// are deliberately plain: a sword, a spell and a plasma coil must all be
+// able to use them.
 typedef enum
 {
   ATK_DOT_BLEED = 0,
-  ATK_DOT_VENOM,
-  ATK_DOT_ACID,
-  ATK_DOT_SPORES,
+  ATK_DOT_POISON,
+  ATK_DOT_BURN,
+  ATK_DOT_ROT,
   ATK_DOT_CHILL,
+  ATK_DOT_CURSE,
+  ATK_DOT_DRAIN,
+  ATK_DOT_SHOCK,
   ATK_DOT__COUNT
 } atk_dot_kind_t;
 
@@ -387,6 +396,138 @@ typedef struct
   uint32_t       stack_max;  // enforced in SQL, not read-then-write
 } atk_dot_new_t;
 
+// ---- Character sheets (attack_class.c) ----------------------------- //
+//
+// THE LAW, in one sentence: the engine owns every number, and a sheet
+// owns only words plus one bucket-label per word saying which number
+// that sentence is allowed to describe. Everything below exists to keep
+// that true — see attack_class.c's preamble for the whole argument.
+
+#define ATK_CLASS_NAME_SZ  32          // sheet stem, and the `class` column
+#define ATK_CLASS_DESC_SZ  64          // 60 by the grammar, + NUL + slack
+#define ATK_CLASSES_MAX    32          // registry slots
+#define ATK_MOVES_MAX     128          // per section, the hard array bound
+#define ATK_MOVE_GROW      32          // moves one mem_realloc adds
+#define ATK_SHEET_SZ    (128 * 1024)   // one sheet, read whole
+#define ATK_STEM_MIN         5         // "x.txt": the shortest legal name
+// A sheet's FILE name, not its stem: the longest legal stem plus ".txt".
+// Sized from the stem so the two can never drift apart — a report that
+// truncated the extension off a rejected file would be naming a file
+// that is not there.
+#define ATK_SHEET_FILE_SZ  (ATK_CLASS_NAME_SZ + 4)
+
+// The six sections of a sheet, in the order the grammar lists them.
+// Used as an array index; keep atk_sec_meta[] in attack_class.c in step.
+typedef enum
+{
+  ATK_SEC_DAMAGE = 0,
+  ATK_SEC_DOT,
+  ATK_SEC_HEAL,
+  ATK_SEC_DEATH,
+  ATK_SEC_DECAY,
+  ATK_SEC_DECAY_KILL,
+  ATK_SEC__COUNT
+} atk_section_t;
+
+// One move, exactly as a sheet wrote it: a sentence, the label saying
+// which roll it may describe, and — for an affliction — the class's own
+// word for the thing it left behind. There is deliberately nowhere here
+// for a number, a weight or a cooldown to live.
+typedef struct
+{
+  char           text[ATK_MOVE_SZ];
+  char           noun[ATK_NOUN_SZ];  // ATK_SEC_DOT only
+  atk_flavour_t  tier;               // DAMAGE + HEAL only
+  atk_dot_kind_t kind;               // DOT / DECAY / DECAY_KILL only
+} atk_move_t;
+
+// One loaded class. The move arrays are heap, grown in blocks of
+// ATK_MOVE_GROW; the whole struct is owned by the registry and is
+// replaced wholesale on a reload, never edited in place.
+typedef struct
+{
+  char        type[ATK_CLASS_NAME_SZ];
+  char        desc[ATK_CLASS_DESC_SZ];
+  atk_move_t *move[ATK_SEC__COUNT];
+  uint16_t    n   [ATK_SEC__COUNT];
+  uint16_t    cap [ATK_SEC__COUNT];
+  bool        builtin;               // the compiled-in fallback brawler
+} atk_class_t;
+
+// One row of `show attack classes`. A copy, taken under the registry
+// lock, so the view never renders from a registry a reload may swap.
+typedef struct
+{
+  char     type[ATK_CLASS_NAME_SZ];
+  char     desc[ATK_CLASS_DESC_SZ];
+  uint16_t n[ATK_SEC__COUNT];
+  bool     builtin;
+} atk_class_info_t;
+
+// What one atk_class_load() did, for the reload verb to report. Every
+// rejected sheet is named: a sheet that silently failed to load is a
+// class nobody can be dealt, and the author deserves to hear about it.
+typedef struct
+{
+  uint32_t accepted;
+  uint32_t rejected;
+  uint32_t n_bad;                                    // names actually kept
+  char     bad[ATK_CLASSES_MAX][ATK_SHEET_FILE_SZ];
+} atk_load_report_t;
+
+// Re-scan the sheet directory and swap in a whole new registry. The scan
+// and the parse happen OUTSIDE the registry lock; only the pointer swap
+// is under it. `rep` may be NULL. Returns the number accepted — 1 with
+// `builtin` set when the directory yielded nothing at all, because the
+// pit must still speak on a daemon where the sheets were never deployed.
+uint32_t atk_class_load(atk_load_report_t *rep);
+
+// Drop the registry. atk_deinit() calls this before unregistering the
+// commands.
+void atk_class_free(void);
+
+// A random class stem, uniformly drawn. SUCCESS when one was written.
+bool atk_class_pick(char *out, size_t cap);
+
+// Draw a random move of `sec` from `type`, filtered by `tier` for DAMAGE
+// and HEAL, by `kind` for DECAY and DECAY_KILL, and by neither for DOT
+// and DEATH; pass 0 for the unused selector.
+//
+// FAIL means the matching subset is empty, and the caller must then use
+// the engine's neutral fallback — NEVER another tier. Substituting a
+// tier would bend the damage distribution, which is the one thing the
+// loader's coverage gate exists to prevent.
+bool atk_class_move(const char *type, atk_section_t sec,
+    atk_flavour_t tier, atk_dot_kind_t kind, atk_move_t *out);
+
+// Does this class own any move of this section at all? A natural
+// predicate, not SUCCESS/FAIL: true means yes.
+bool atk_class_has(const char *type, atk_section_t sec);
+
+// Copy the registry into `out`, alphabetical. Returns rows written.
+uint32_t atk_class_list(atk_class_info_t *out, uint32_t cap);
+
+// Expand {attacker} {target} {damage} {heal} {affliction} in `tmpl`.
+// A NULL substitution is a token the loader guaranteed absent from this
+// section — reachable only through a bug, and then harmlessly: it
+// expands to nothing rather than leaving a brace token on screen.
+void atk_macro_expand(char *out, size_t cap, const char *tmpl,
+    const char *attacker, const char *target, const char *damage,
+    const char *heal, const char *affliction);
+
+// The neutral fallbacks: one plain, setting-free line for each thing a
+// sheet may leave unsaid. These are printf templates, not macro
+// templates — the FORMAT CONTRACT is in attack_class.c beside them and a
+// miscounted slot is a crash, not a typo. Never NULL.
+const char *atk_fallback_death(void);
+const char *atk_fallback_dot_inflict(atk_dot_kind_t kind);
+const char *atk_fallback_decay(atk_dot_kind_t kind);
+const char *atk_fallback_decay_kill(atk_dot_kind_t kind);
+
+// The bare noun an affliction of this kind carries when the sheet that
+// inflicted it supplied none.
+const char *atk_fallback_noun(atk_dot_kind_t kind);
+
 // ---- Plugin core (attack.c) ---------------------------------------- //
 
 // Serialises everything that mutates a round: the turn engine's steps
@@ -535,10 +676,6 @@ void atk_render_death(char *out, size_t cap, const char *slayer_nick,
 void atk_render_trout(char *out, size_t cap, const char *src_nick,
     const char *tgt_nick, int32_t dmg);
 
-// How an affliction presents itself: the bare noun substituted into a
-// line, the single-column glyph that marks a victim on the round card,
-// and the colour both are drawn in. Out-of-range kinds return the first
-// entry rather than reading past the tables.
 // The line that announces a fresh affliction, spoken right after the
 // blow that left it. It never names the duration: the pit does not tell
 // you how long you have.
@@ -556,7 +693,12 @@ void atk_render_dot_tick(char *out, size_t cap, const char *src_nick,
 void atk_render_dot_death(char *out, size_t cap, const char *src_nick,
     const char *tgt_nick, atk_dot_kind_t kind);
 
-const char *atk_dot_name_of (atk_dot_kind_t kind);
+// How an affliction presents itself on screen: the single-column glyph
+// that marks a victim on the round card, and the colour it and its
+// damage are drawn in. The engine owns exactly these two; the NOUN
+// belongs to the sheet, and atk_fallback_noun() covers a row that
+// carries none. Out-of-range kinds return the first entry rather than
+// reading past the tables.
 const char *atk_dot_emoji_of(atk_dot_kind_t kind);
 const char *atk_dot_color_of(atk_dot_kind_t kind);
 
