@@ -1990,7 +1990,13 @@ plugin_iterate(plugin_iterate_cb_t cb, void *data)
 
 // /show plugin command
 
-#define PLUGIN_SHOW_MAX 64
+// Upper bound on rows the /show plugin table can hold. Must stay
+// comfortably above the number of plugins the daemon loads — when the
+// live count exceeds this, plugin_show_iter_cb silently drops the
+// overflow (and the "N loaded" header undercounts to match), which is
+// how a running-but-invisible plugin happens. Bumped past 64 once the
+// tree crossed 65 plugins; keep headroom as the tree grows.
+#define PLUGIN_SHOW_MAX 128
 
 // Row for the plugin table.
 typedef struct
