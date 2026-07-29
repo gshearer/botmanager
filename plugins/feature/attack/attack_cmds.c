@@ -607,14 +607,18 @@ atk_cmd_heal(const cmd_ctx_t *ctx)
 
   pthread_mutex_lock(&atk_turn_lock);
 
-  // ---- the round -- and `!heal` never opens or closes one ------------ //
+  // ---- the round: heal CONTINUES one, and may never BEGIN one -------- //
   //
-  // Only `!attack` starts a game and only `!attack` (or `attack --end`)
-  // finishes one. A stale round is left exactly as it was found: mending
-  // is not an event that should retire anything.
+  // Both verbs read the same clock. A brawl lasts round_max_secs and then
+  // the game is over, so a round past it reads to mending exactly as no
+  // round at all: you cannot continue something that has finished. The
+  // blade answers that case by abandoning and reopening in one step —
+  // which is precisely the power `!heal` does not have, so it refuses and
+  // touches nothing. The stale row is left for the next `!attack`.
 
   if(!atk_db_round_find(ns->id, method_inst_name(ctx->msg->inst),
-        ctx->msg->channel, &round))
+        ctx->msg->channel, &round) ||
+     round.age > (int64_t)t.round_max_secs)
   {
     pthread_mutex_unlock(&atk_turn_lock);
     cmd_reply(ctx, "✚ Nothing is happening here. Start something with "
