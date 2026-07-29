@@ -198,10 +198,10 @@ halves. Same shape as `gemini` / `gemini.ws`.
 |---|---|---|
 | `ask` | plugins/extension/inference/ask/ask_cmd.c | `!ask` one-shot LLM command (`ASK_CMD_CTX`) |
 | `claude` | plugins/extension/inference/claude/claude.c | `/claude` bridge command (`CLAUDE_CTX`) |
-| `crypto` | plugins/feature/crypto/crypto.c | `/crypto` price command (`CRYPTO_CTX`) |
+| `crypto` | plugins/feature/crypto/crypto.c · plugins/feature/crypto/crypto_lists.c | `/crypto` price command and its per-userns symbol lists (`CRYPTO_CTX`) |
 | `imagine` | plugins/extension/inference/imagine/imagine_cmd.c (`IMG_CMD_CTX`) · plugins/extension/inference/imagine_zimage/imagine_zimage.c (`IZ_CTX`) | `!imagine` text-to-image command — one context, two mutually exclusive backends (load exactly one) |
 | `searxng` | plugins/extension/inference/search/searxng_cmd.c | `!search` / `!image` / `!news` / `!video` / `!music` command surface (`SEARXNG_CMD_CTX`) — shares the root context with the `searxng` service above |
-| `stock` | plugins/feature/stock/stock.c | `!stock` quote command (`STOCK_CTX`) |
+| `stock` | plugins/feature/stock/stock.c · plugins/feature/stock/stock_lists.c | `!stock` quote command and its per-userns symbol lists (`STOCK_CTX`) |
 | `weather` | plugins/feature/weather/weather.c | `/weather` command (`WEATHER_CTX`) |
 
 ## Method plugins (`plugins/method/`)

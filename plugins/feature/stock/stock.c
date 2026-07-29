@@ -3,9 +3,11 @@
 // provider-neutral "stock_quotes" capability, and renders colorized
 // tables, verbose cards (gauge + sparkline), and symbol searches.
 #define STOCK_INTERNAL
+#define STOCK_CMD_UNIT
 #include "stock.h"
 
 #include "colors.h"
+#include "userns.h"
 
 #include <ctype.h>
 #include <math.h>
@@ -827,13 +829,49 @@ stock_parse(const cmd_ctx_t *ctx, const char *args, stock_args_t *out)
       break;
     }
 
-    // bare token: one or more comma-separated symbols
+    if(strcmp(tok, "-l") == 0 || strcmp(tok, "--list") == 0)
+    {
+      out->op = STOCK_OP_SHOW;
+      tok = strtok_r(NULL, " \t", &save);
+      continue;
+    }
+
+    if(strcmp(tok, "-a") == 0 || strcmp(tok, "--add") == 0 ||
+       strcmp(tok, "-d") == 0 || strcmp(tok, "--del") == 0)
+    {
+      const bool add = (strcmp(tok, "-a") == 0 || strcmp(tok, "--add") == 0);
+      char      *name;
+
+      out->op = add ? STOCK_OP_ADD : STOCK_OP_DEL;
+      name    = strtok_r(NULL, " \t", &save);
+
+      if(name == NULL)
+      {
+        cmd_reply(ctx, add
+            ? "Usage: !stock --add <list> <symbols…>"
+            : "Usage: !stock --del <list> <symbols…>");
+        return(false);
+      }
+
+      // A leading '@' is how lists are referenced elsewhere; accept it
+      // here too rather than making the user remember where it belongs.
+      if(name[0] == '@')
+        name++;
+
+      for(size_t j = 0; name[j] != '\0' && j + 1 < sizeof(out->list); j++)
+        out->list[j] = (char)tolower((unsigned char)name[j]);
+
+      tok = strtok_r(NULL, " \t", &save);
+      continue;
+    }
+
+    // bare token: one or more comma-separated symbols or '@list' refs
     sp2   = NULL;
     piece = strtok_r(tok, ",", &sp2);
 
     while(piece != NULL)
     {
-      if(out->nsyms >= STOCK_MAX_SYMS)
+      if(out->nitems >= STOCK_MAX_SYMS)
       {
         cmd_reply(ctx, "Too many symbols (max 24).");
         return(false);
@@ -841,14 +879,25 @@ stock_parse(const cmd_ctx_t *ctx, const char *args, stock_args_t *out)
 
       if(piece[0] != '\0')
       {
-        char  *dst = out->syms[out->nsyms];
-        size_t j   = 0;
+        stock_item_t *it = &out->items[out->nitems];
+        size_t        j  = 0;
 
-        for(; piece[j] != '\0' && j + 1 < STOCK_SYM_SZ; j++)
-          dst[j] = (char)toupper((unsigned char)piece[j]);
+        it->is_list = (piece[0] == '@');
 
-        dst[j] = '\0';
-        out->nsyms++;
+        if(it->is_list)
+          piece++;
+
+        // List names fold down, symbols fold up; both are bounded by the
+        // destination, which is the wider of the two.
+        for(; piece[j] != '\0' && j + 1 < sizeof(it->text); j++)
+          it->text[j] = it->is_list
+              ? (char)tolower((unsigned char)piece[j])
+              : (char)toupper((unsigned char)piece[j]);
+
+        it->text[j] = '\0';
+
+        if(it->text[0] != '\0')
+          out->nitems++;
       }
 
       piece = strtok_r(NULL, ",", &sp2);
@@ -858,6 +907,223 @@ stock_parse(const cmd_ctx_t *ctx, const char *args, stock_args_t *out)
   }
 
   return(true);
+}
+
+// ----------------------------------------------------------------------
+// Symbol lists
+// ----------------------------------------------------------------------
+
+// Resolves items into out->syms, expanding '@name' in place so the
+// rendered order follows the order the user typed. Replies and returns
+// false on anything the caller should not proceed past.
+static bool
+stock_expand(const cmd_ctx_t *ctx, stock_args_t *a)
+{
+  userns_t *ns = NULL;
+  char      line[STOCK_REPLY_SZ];
+  uint8_t   i;
+
+  for(i = 0; i < a->nitems; i++)
+  {
+    const stock_item_t *it = &a->items[i];
+    stock_symset_t      set;
+    stock_list_rc_t     rc;
+    uint8_t             j;
+
+    if(!it->is_list)
+    {
+      if(a->nsyms >= STOCK_MAX_SYMS)
+      {
+        cmd_reply(ctx, "Too many symbols (max 24).");
+        return(false);
+      }
+
+      snprintf(a->syms[a->nsyms], STOCK_SYM_SZ, "%s", it->text);
+      a->nsyms++;
+      continue;
+    }
+
+    // A list reference and a single-symbol card are different intents;
+    // pick the first symbol for the user and we would be guessing.
+    if(a->verbose)
+    {
+      cmd_reply(ctx, "Verbose mode shows one symbol, not a list. "
+          "Example: !stock -v NVDA");
+      return(false);
+    }
+
+    if(ns == NULL && (ns = userns_session_resolve(ctx)) == NULL)
+      return(false);   // the resolver already replied
+
+    rc = stock_lists_get(ns->id, it->text, &set);
+
+    if(rc == STOCK_LIST_NOSUCH)
+    {
+      snprintf(line, sizeof(line),
+          "No list called '%s'. Try !stock --list", it->text);
+      cmd_reply(ctx, line);
+      return(false);
+    }
+
+    if(rc != STOCK_LIST_OK)
+    {
+      cmd_reply(ctx, "Couldn't read your lists right now — sorry.");
+      return(false);
+    }
+
+    for(j = 0; j < set.n; j++)
+    {
+      if(a->nsyms >= STOCK_MAX_SYMS)
+      {
+        cmd_reply(ctx, "Too many symbols (max 24).");
+        return(false);
+      }
+
+      snprintf(a->syms[a->nsyms], STOCK_SYM_SZ, "%s", set.sym[j]);
+      a->nsyms++;
+    }
+  }
+
+  return(true);
+}
+
+// --list / --add / --del. Lists are userns-scoped, so every operation
+// needs a namespace; mutating one additionally needs a known user.
+static void
+stock_list_cmd(const cmd_ctx_t *ctx, const stock_args_t *a)
+{
+  userns_t *ns = userns_session_resolve(ctx);
+  char      line[STOCK_REPLY_SZ];
+  char      names[STOCK_REPLY_SZ - 64];   // leaves room for the heading
+  uint32_t  count   = 0;
+  uint8_t   changed = 0;
+  uint8_t   total   = 0;
+  bool      dropped = false;
+  stock_list_rc_t rc;
+
+  if(ns == NULL)   // the resolver already replied
+    return;
+
+  if(a->op == STOCK_OP_SHOW)
+  {
+    if(stock_lists_names(ns->id, names, sizeof(names), &count)
+        != STOCK_LIST_OK)
+    {
+      cmd_reply(ctx, "Couldn't read your lists right now — sorry.");
+      return;
+    }
+
+    if(count == 0)
+    {
+      cmd_reply(ctx, "No stock lists yet. "
+          "Make one: !stock --add tech AAPL MSFT NVDA");
+      return;
+    }
+
+    snprintf(line, sizeof(line), CLR_BOLD "Your stock lists:" CLR_RESET
+        " %s", names);
+    cmd_reply(ctx, line);
+    return;
+  }
+
+  if(ctx->username == NULL || ctx->username[0] == '\0')
+  {
+    cmd_reply(ctx, "Lists belong to a user — identify first, "
+        "then you can change one.");
+    return;
+  }
+
+  if(a->list[0] == '\0' || !stock_list_name_ok(a->list))
+  {
+    cmd_reply(ctx, "List names are up to 32 letters, digits, '-' or '_'.");
+    return;
+  }
+
+  if(a->nitems == 0)
+  {
+    cmd_reply(ctx, (a->op == STOCK_OP_ADD)
+        ? "Add what? Example: !stock --add tech AAPL MSFT"
+        : "Remove what? Example: !stock --del tech MSFT");
+    return;
+  }
+
+  for(uint8_t i = 0; i < a->nitems; i++)
+  {
+    if(!a->items[i].is_list)
+      continue;
+
+    cmd_reply(ctx, "Lists hold symbols, not other lists.");
+    return;
+  }
+
+  if(a->op == STOCK_OP_ADD)
+  {
+    rc = stock_lists_add(ns->id, a->list, a->items, a->nitems,
+        &changed, &total);
+
+    if(rc == STOCK_LIST_FULL)
+    {
+      snprintf(line, sizeof(line),
+          "@%s holds %u of %d symbols — that batch won't fit, so "
+          "nothing was added. Free some: !stock --del %s <symbol>",
+          a->list, (unsigned)total, STOCK_LIST_MAX, a->list);
+      cmd_reply(ctx, line);
+      return;
+    }
+
+    if(rc == STOCK_LIST_BADSYM)
+    {
+      cmd_reply(ctx, "That doesn't look like a ticker. "
+          "Letters, digits and ^ - . = only.");
+      return;
+    }
+
+    if(rc != STOCK_LIST_OK)
+    {
+      cmd_reply(ctx, "Couldn't save that list right now — sorry.");
+      return;
+    }
+
+    snprintf(line, sizeof(line),
+        CLR_GREEN "%s" CLR_RESET " @%s — %u symbol%s (view: !stock @%s)",
+        (changed > 0) ? "Saved" : "No change", a->list, (unsigned)total,
+        (total == 1) ? "" : "s", a->list);
+    cmd_reply(ctx, line);
+    return;
+  }
+
+  rc = stock_lists_del(ns->id, a->list, a->items, a->nitems,
+      &changed, &dropped);
+
+  if(rc == STOCK_LIST_NOSUCH)
+  {
+    snprintf(line, sizeof(line),
+        "No list called '%s'. Try !stock --list", a->list);
+    cmd_reply(ctx, line);
+    return;
+  }
+
+  if(rc != STOCK_LIST_OK)
+  {
+    cmd_reply(ctx, "Couldn't update that list right now — sorry.");
+    return;
+  }
+
+  if(changed == 0)
+  {
+    snprintf(line, sizeof(line), "Nothing in @%s matched.", a->list);
+    cmd_reply(ctx, line);
+    return;
+  }
+
+  if(dropped)
+    snprintf(line, sizeof(line), CLR_GREEN "Removed" CLR_RESET
+        " the last symbol — @%s is gone.", a->list);
+  else
+    snprintf(line, sizeof(line), CLR_GREEN "Removed" CLR_RESET
+        " %u from @%s.", (unsigned)changed, a->list);
+
+  cmd_reply(ctx, line);
 }
 
 // ----------------------------------------------------------------------
@@ -874,6 +1140,13 @@ stock_cmd(const cmd_ctx_t *ctx)
 
   if(!stock_parse(ctx, ctx->args, &a))
     return;
+
+  // List management never touches the quote provider.
+  if(a.op != STOCK_OP_NONE)
+  {
+    stock_list_cmd(ctx, &a);
+    return;
+  }
 
   caps = stockquote_provider_caps();
 
@@ -905,10 +1178,14 @@ stock_cmd(const cmd_ctx_t *ctx)
     return;
   }
 
+  if(!stock_expand(ctx, &a))
+    return;
+
   if(a.nsyms == 0)
   {
     cmd_reply(ctx,
-        "Usage: !stock [-v] <symbols…>  |  !stock -s <search words>");
+        "Usage: !stock [-v] <@list|symbol…>  |  !stock -s <search words>"
+        "  |  !stock --list");
     return;
   }
 
@@ -976,15 +1253,33 @@ static bool
 stock_init(void)
 {
   if(cmd_register(STOCK_CTX, "stock",
-      "stock [-v] <symbols…> | stock -s <search words>",
+      "stock [-v] <@list|symbol…> | stock -s <words> | stock --list"
+      " | stock --add|--del <list> <symbols…>",
       "Stock, ETF, fund, index, FX and commodity quotes",
-      NULL,
+      "Quote one or more symbols, or a saved list with @name. "
+      "--list shows your lists; --add creates or appends to one and "
+      "--del removes symbols (a list disappears when its last symbol "
+      "does). Lists are private to your namespace and holding or "
+      "changing one requires a known user.",
       "everyone", 0, CMD_SCOPE_ANY, METHOD_T_ANY,
       stock_cmd, NULL, NULL, "$",
       NULL, 0, NULL, &stock_nl) != SUCCESS)
     return(FAIL);
 
   clam(CLAM_INFO, STOCK_CTX, "stock command plugin initialized");
+
+  return(SUCCESS);
+}
+
+// Schema bootstrap runs in start(), after the DB plugin is up. Every list
+// entry point re-ensures it anyway, so a database that arrives later
+// still yields working lists without a reload.
+static bool
+stock_start(void)
+{
+  if(stock_lists_schema_ensure() != SUCCESS)
+    clam(CLAM_WARN, STOCK_CTX,
+        "list schema init failed (lists will error until the DB is up)");
 
   return(SUCCESS);
 }
@@ -1011,7 +1306,7 @@ const plugin_desc_t bm_plugin_desc = {
   .kv_schema       = NULL,
   .kv_schema_count = 0,
   .init            = stock_init,
-  .start           = NULL,
+  .start           = stock_start,
   .stop            = NULL,
   .deinit          = stock_deinit,
   .ext             = NULL,

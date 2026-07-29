@@ -3,9 +3,11 @@
 // coinmarketcap service plugin via its public API, and formats
 // user-facing replies (table / verbose / global).
 #define CRYPTO_INTERNAL
+#define CRYPTO_CMD_UNIT
 #include "crypto.h"
 
 #include "colors.h"
+#include "userns.h"
 
 #include <ctype.h>
 #include <stdio.h>
@@ -188,7 +190,7 @@ crypto_parse_piece(const char *piece, crypto_selector_t *sel)
 }
 
 static bool
-crypto_parse_args(const char *args, crypto_req_t *req,
+crypto_parse_args(const char *args, crypto_req_t *req, crypto_largs_t *la,
     const cmd_ctx_t *ctx)
 {
   char  buf[CRYPTO_REPLY_SZ];
@@ -199,6 +201,8 @@ crypto_parse_args(const char *args, crypto_req_t *req,
   req->sort_col       = COINMARKETCAP_SORT_RANK;
   req->sort_reverse   = false;
   req->selector_count = 0;
+
+  memset(la, 0, sizeof(*la));
 
   if(args == NULL || args[0] == '\0')
     return(true);
@@ -285,28 +289,76 @@ crypto_parse_args(const char *args, crypto_req_t *req,
       continue;
     }
 
+    if(strcmp(tok, "-l") == 0 || strcmp(tok, "--list") == 0)
+    {
+      la->op = CRYPTO_OP_SHOW;
+      tok = strtok_r(NULL, " \t", &saveptr);
+      continue;
+    }
+
+    if(strcmp(tok, "-a") == 0 || strcmp(tok, "--add") == 0 ||
+       strcmp(tok, "-d") == 0 || strcmp(tok, "--del") == 0)
+    {
+      const bool add = (strcmp(tok, "-a") == 0 || strcmp(tok, "--add") == 0);
+      char      *name;
+
+      la->op = add ? CRYPTO_OP_ADD : CRYPTO_OP_DEL;
+      name   = strtok_r(NULL, " \t", &saveptr);
+
+      if(name == NULL)
+      {
+        cmd_reply(ctx, add
+            ? "Usage: !crypto --add <list> <symbols…>"
+            : "Usage: !crypto --del <list> <symbols…>");
+        return(false);
+      }
+
+      // A leading '@' is how lists are referenced elsewhere; accept it
+      // here too rather than making the user remember where it belongs.
+      if(name[0] == '@')
+        name++;
+
+      for(size_t j = 0; name[j] != '\0' && j + 1 < sizeof(la->list); j++)
+        la->list[j] = (char)tolower((unsigned char)name[j]);
+
+      tok = strtok_r(NULL, " \t", &saveptr);
+      continue;
+    }
+
+    // Bare tokens are held verbatim and turned into selectors only after
+    // parsing, once any '@list' among them has been expanded.
     sp2 = NULL;
     piece = strtok_r(tok, ",", &sp2);
 
     while(piece != NULL)
     {
-      if(req->selector_count >= COINMARKETCAP_MAX_SELECT)
+      if(la->nitems >= COINMARKETCAP_MAX_SELECT)
       {
         cmd_reply(ctx, "Error: too many selectors (max 32)");
         return(false);
       }
 
-      if(!crypto_parse_piece(piece,
-          &req->selectors[req->selector_count]))
+      if(piece[0] != '\0')
       {
-        char err[CRYPTO_REPLY_SZ];
+        crypto_item_t *it = &la->items[la->nitems];
+        size_t         j  = 0;
 
-        snprintf(err, sizeof(err), "Invalid selector: '%s'", piece);
-        cmd_reply(ctx, err);
-        return(false);
+        it->is_list = (piece[0] == '@');
+
+        if(it->is_list)
+          piece++;
+
+        for(; piece[j] != '\0' && j + 1 < sizeof(it->text); j++)
+          it->text[j] = it->is_list
+              ? (char)tolower((unsigned char)piece[j])
+              : piece[j];
+
+        it->text[j] = '\0';
+
+        if(it->text[0] != '\0')
+          la->nitems++;
       }
 
-      req->selector_count++;
       piece = strtok_r(NULL, ",", &sp2);
     }
 
@@ -321,7 +373,7 @@ crypto_parse_args(const char *args, crypto_req_t *req,
       return(false);
     }
 
-    if(req->selector_count > 0)
+    if(la->nitems > 0)
     {
       cmd_reply(ctx,
           "Error: -g shows global market data and takes no selectors.");
@@ -329,6 +381,98 @@ crypto_parse_args(const char *args, crypto_req_t *req,
     }
 
     return(true);
+  }
+
+  // Selector-shaped validation (verbose arity, ranges) has to wait for
+  // crypto_expand — until a '@list' is resolved we do not know how many
+  // selectors the line actually means.
+  return(true);
+}
+
+// ----------------------------------------------------------------------
+// Symbol lists
+// ----------------------------------------------------------------------
+
+// Turns parsed items into selectors, expanding '@name' along the way, and
+// applies the validation that needs the final selector count. Replies and
+// returns false on anything the caller should not proceed past.
+static bool
+crypto_expand(const cmd_ctx_t *ctx, crypto_req_t *req,
+    const crypto_largs_t *la)
+{
+  userns_t *ns = NULL;
+  char      err[CRYPTO_REPLY_SZ];
+  uint8_t   i;
+
+  for(i = 0; i < la->nitems; i++)
+  {
+    const crypto_item_t *it = &la->items[i];
+    crypto_symset_t      set;
+    crypto_list_rc_t     rc;
+    uint8_t              j;
+
+    if(!it->is_list)
+    {
+      if(req->selector_count >= COINMARKETCAP_MAX_SELECT)
+      {
+        cmd_reply(ctx, "Error: too many selectors (max 32)");
+        return(false);
+      }
+
+      if(!crypto_parse_piece(it->text,
+          &req->selectors[req->selector_count]))
+      {
+        snprintf(err, sizeof(err), "Invalid selector: '%s'", it->text);
+        cmd_reply(ctx, err);
+        return(false);
+      }
+
+      req->selector_count++;
+      continue;
+    }
+
+    // A list reference and a single-coin card are different intents;
+    // pick the first symbol for the user and we would be guessing.
+    if(req->verbose)
+    {
+      cmd_reply(ctx, "Verbose mode shows one cryptocurrency, not a list. "
+          "Example: !crypto -v btc");
+      return(false);
+    }
+
+    if(ns == NULL && (ns = userns_session_resolve(ctx)) == NULL)
+      return(false);   // the resolver already replied
+
+    rc = crypto_lists_get(ns->id, it->text, &set);
+
+    if(rc == CRYPTO_LIST_NOSUCH)
+    {
+      snprintf(err, sizeof(err),
+          "No list called '%s'. Try !crypto --list", it->text);
+      cmd_reply(ctx, err);
+      return(false);
+    }
+
+    if(rc != CRYPTO_LIST_OK)
+    {
+      cmd_reply(ctx, "Couldn't read your lists right now — sorry.");
+      return(false);
+    }
+
+    for(j = 0; j < set.n; j++)
+    {
+      if(req->selector_count >= COINMARKETCAP_MAX_SELECT)
+      {
+        cmd_reply(ctx, "Error: too many selectors (max 32)");
+        return(false);
+      }
+
+      if(!crypto_parse_piece(set.sym[j],
+          &req->selectors[req->selector_count]))
+        continue;   // a stored symbol we can no longer parse: skip it
+
+      req->selector_count++;
+    }
   }
 
   if(req->verbose && req->selector_count != 1)
@@ -339,8 +483,7 @@ crypto_parse_args(const char *args, crypto_req_t *req,
     return(false);
   }
 
-  if(req->verbose && req->selector_count == 1
-      && req->selectors[0].kind == CRYPTO_SEL_RANGE)
+  if(req->verbose && req->selectors[0].kind == CRYPTO_SEL_RANGE)
   {
     cmd_reply(ctx,
         "Verbose mode requires a single symbol or rank, not a range.");
@@ -348,6 +491,145 @@ crypto_parse_args(const char *args, crypto_req_t *req,
   }
 
   return(true);
+}
+
+// --list / --add / --del. Lists are userns-scoped, so every operation
+// needs a namespace; mutating one additionally needs a known user.
+static void
+crypto_list_cmd(const cmd_ctx_t *ctx, const crypto_largs_t *la)
+{
+  userns_t *ns = userns_session_resolve(ctx);
+  char      line[CRYPTO_REPLY_SZ];
+  char      names[CRYPTO_REPLY_SZ - 64];   // leaves room for the heading
+  uint32_t  count   = 0;
+  uint8_t   changed = 0;
+  uint8_t   total   = 0;
+  bool      dropped = false;
+  crypto_list_rc_t rc;
+
+  if(ns == NULL)   // the resolver already replied
+    return;
+
+  if(la->op == CRYPTO_OP_SHOW)
+  {
+    if(crypto_lists_names(ns->id, names, sizeof(names), &count)
+        != CRYPTO_LIST_OK)
+    {
+      cmd_reply(ctx, "Couldn't read your lists right now — sorry.");
+      return;
+    }
+
+    if(count == 0)
+    {
+      cmd_reply(ctx, "No crypto lists yet. "
+          "Make one: !crypto --add bags BTC ETH SOL");
+      return;
+    }
+
+    snprintf(line, sizeof(line), CLR_BOLD "Your crypto lists:" CLR_RESET
+        " %s", names);
+    cmd_reply(ctx, line);
+    return;
+  }
+
+  if(ctx->username == NULL || ctx->username[0] == '\0')
+  {
+    cmd_reply(ctx, "Lists belong to a user — identify first, "
+        "then you can change one.");
+    return;
+  }
+
+  if(la->list[0] == '\0' || !crypto_list_name_ok(la->list))
+  {
+    cmd_reply(ctx, "List names are up to 32 letters, digits, '-' or '_'.");
+    return;
+  }
+
+  if(la->nitems == 0)
+  {
+    cmd_reply(ctx, (la->op == CRYPTO_OP_ADD)
+        ? "Add what? Example: !crypto --add bags BTC ETH"
+        : "Remove what? Example: !crypto --del bags ETH");
+    return;
+  }
+
+  for(uint8_t i = 0; i < la->nitems; i++)
+  {
+    if(!la->items[i].is_list)
+      continue;
+
+    cmd_reply(ctx, "Lists hold symbols, not other lists.");
+    return;
+  }
+
+  if(la->op == CRYPTO_OP_ADD)
+  {
+    rc = crypto_lists_add(ns->id, la->list, la->items, la->nitems,
+        &changed, &total);
+
+    if(rc == CRYPTO_LIST_FULL)
+    {
+      snprintf(line, sizeof(line),
+          "@%s holds %u of %d symbols — that batch won't fit, so "
+          "nothing was added. Free some: !crypto --del %s <symbol>",
+          la->list, (unsigned)total, CRYPTO_LIST_MAX, la->list);
+      cmd_reply(ctx, line);
+      return;
+    }
+
+    if(rc == CRYPTO_LIST_BADSYM)
+    {
+      cmd_reply(ctx, "Lists hold coin symbols, not ranks or ranges. "
+          "Example: !crypto --add bags BTC ETH");
+      return;
+    }
+
+    if(rc != CRYPTO_LIST_OK)
+    {
+      cmd_reply(ctx, "Couldn't save that list right now — sorry.");
+      return;
+    }
+
+    snprintf(line, sizeof(line),
+        CLR_GREEN "%s" CLR_RESET " @%s — %u symbol%s (view: !crypto @%s)",
+        (changed > 0) ? "Saved" : "No change", la->list, (unsigned)total,
+        (total == 1) ? "" : "s", la->list);
+    cmd_reply(ctx, line);
+    return;
+  }
+
+  rc = crypto_lists_del(ns->id, la->list, la->items, la->nitems,
+      &changed, &dropped);
+
+  if(rc == CRYPTO_LIST_NOSUCH)
+  {
+    snprintf(line, sizeof(line),
+        "No list called '%s'. Try !crypto --list", la->list);
+    cmd_reply(ctx, line);
+    return;
+  }
+
+  if(rc != CRYPTO_LIST_OK)
+  {
+    cmd_reply(ctx, "Couldn't update that list right now — sorry.");
+    return;
+  }
+
+  if(changed == 0)
+  {
+    snprintf(line, sizeof(line), "Nothing in @%s matched.", la->list);
+    cmd_reply(ctx, line);
+    return;
+  }
+
+  if(dropped)
+    snprintf(line, sizeof(line), CLR_GREEN "Removed" CLR_RESET
+        " the last symbol — @%s is gone.", la->list);
+  else
+    snprintf(line, sizeof(line), CLR_GREEN "Removed" CLR_RESET
+        " %u from @%s.", (unsigned)changed, la->list);
+
+  cmd_reply(ctx, line);
 }
 
 // Selector matching against a cached coin
@@ -755,8 +1037,24 @@ crypto_done_global(const coinmarketcap_global_result_t *res, void *user)
 static void
 crypto_cmd_crypto(const cmd_ctx_t *ctx)
 {
-  crypto_req_t  stack_req;
-  crypto_req_t *r;
+  crypto_req_t   stack_req;
+  crypto_largs_t la;
+  crypto_req_t  *r;
+
+  // Parse args on-stack first so validation failures don't allocate.
+  memset(&stack_req, 0, sizeof(stack_req));
+  stack_req.kind = CRYPTO_REQ_TABLE;
+
+  if(!crypto_parse_args(ctx->args, &stack_req, &la, ctx))
+    return;
+
+  // List management is pure storage — it needs no API key and no market
+  // data, so it is answered before the provider is ever consulted.
+  if(la.op != CRYPTO_OP_NONE)
+  {
+    crypto_list_cmd(ctx, &la);
+    return;
+  }
 
   if(!coinmarketcap_apikey_configured())
   {
@@ -766,11 +1064,7 @@ crypto_cmd_crypto(const cmd_ctx_t *ctx)
     return;
   }
 
-  // Parse args on-stack first so validation failures don't allocate.
-  memset(&stack_req, 0, sizeof(stack_req));
-  stack_req.kind = CRYPTO_REQ_TABLE;
-
-  if(!crypto_parse_args(ctx->args, &stack_req, ctx))
+  if(!crypto_expand(ctx, &stack_req, &la))
     return;
 
   stack_req.limit = coinmarketcap_default_limit_kv_value();
@@ -892,15 +1186,33 @@ static bool
 crypto_init(void)
 {
   if(cmd_register(CRYPTO_CTX, "crypto",
-      "crypto [options] [symbols|ranks|ranges]",
+      "crypto [options] [@list|symbol|rank|range…] | crypto --list"
+      " | crypto --add|--del <list> <symbols…>",
       "Show cryptocurrency market data from CoinMarketCap",
-      NULL,
+      "Quote coins by symbol, rank or range, or a saved list with @name. "
+      "--list shows your lists; --add creates or appends to one and "
+      "--del removes symbols (a list disappears when its last symbol "
+      "does). Lists are private to your namespace and holding or "
+      "changing one requires a known user.",
       "everyone", 0, CMD_SCOPE_ANY, METHOD_T_ANY,
       crypto_cmd_crypto, NULL, NULL, "c",
       NULL, 0, NULL, &crypto_nl) != SUCCESS)
     return(FAIL);
 
   clam(CLAM_INFO, CRYPTO_CTX, "crypto command plugin initialized");
+
+  return(SUCCESS);
+}
+
+// Schema bootstrap runs in start(), after the DB plugin is up. Every list
+// entry point re-ensures it anyway, so a database that arrives later
+// still yields working lists without a reload.
+static bool
+crypto_start(void)
+{
+  if(crypto_lists_schema_ensure() != SUCCESS)
+    clam(CLAM_WARN, CRYPTO_CTX,
+        "list schema init failed (lists will error until the DB is up)");
 
   return(SUCCESS);
 }
@@ -929,7 +1241,7 @@ const plugin_desc_t bm_plugin_desc = {
   .kv_schema       = NULL,
   .kv_schema_count = 0,
   .init            = crypto_init,
-  .start           = NULL,
+  .start           = crypto_start,
   .stop            = NULL,
   .deinit          = crypto_deinit,
   .ext             = NULL,

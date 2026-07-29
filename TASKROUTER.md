@@ -46,7 +46,8 @@ alongside its code.
 | Work on the `/claude` bridge / daemon-restart flow | `plugins/extension/inference/claude/AGENTS.md` + `scripts/botman-restart.sh` |
 | Work on `!imagine` (text-to-image) or the `image` LLM kind | `plugins/extension/inference/imagine_zimage/` (the loaded variant) + `plugins/extension/inference/imagine/imagine_cmd.c` (dormant, inference-backed) + `plugins/extension/inference/LLM.md` |
 | Work on GIF search (`!giphy`) | `plugins/service/giphy/` — one leaf-service plugin: `giphy.c` (provider) + `giphy_cmd.c` (command surface), contract in `giphy_api.h` |
-| Work on stock/equity/fund/commodity quotes (`!stock`) | `TODO.md` §STOCK-1..5 + `include/stockquote.h` (contract) + `plugins/service/yahoofinance/` (provider) + `plugins/feature/stock/` (command) |
+| Work on stock/equity/fund/commodity quotes (`!stock`) | `TODO.md` §STOCK-1..4 + `include/stockquote.h` (contract) + `plugins/service/yahoofinance/` (provider) + `plugins/feature/stock/` (command) |
+| Work on per-userns symbol lists (`!stock`/`!crypto` `--list`/`--add`/`--del`, `@name`) | `TODO.md` §LIST-1/LIST-2 + `plugins/feature/stock/stock_lists.c` + `plugins/feature/crypto/crypto_lists.c` — a list is typed (one table per class, no `class` column); do not build a shared lists service |
 | Work on the attack duelling game (`!attack`, `!heal`, `!defer`, `show attack`; character sheets in `plugins/feature/attack/characters/`) | `plugins/feature/attack/AGENTS.md` |
 | Work on video-game info (`!rawg`) | `plugins/service/rawg/` — one leaf-service plugin: `rawg.c` (provider) + `rawg_cmd.c` (command surface), contract in `rawg_api.h` |
 | Work on movie / TV / actor info (`!tmdb`) | `plugins/service/tmdb/` — one leaf-service plugin: `tmdb.c` (provider) + `tmdb_cmd.c` (command surface), contract in `tmdb_api.h` |
