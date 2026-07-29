@@ -9,7 +9,6 @@
 #include "attack.h"
 
 #include "task.h"
-#include "util.h"
 
 #include <inttypes.h>
 #include <stdio.h>
@@ -92,6 +91,8 @@ atk_dot_service(const atk_dot_due_t *d, const atk_tunables_t *t)
   atk_player_t  victim;
   atk_dot_hit_t hit;
   char          line[ATK_LINE_SZ];
+  int32_t       left;
+  int32_t       ticks;
   int32_t       dmg;
   int32_t       new_hp;
   bool          fatal;
@@ -107,7 +108,18 @@ atk_dot_service(const atk_dot_due_t *d, const atk_tunables_t *t)
     return;
   }
 
-  dmg    = 1 + (int32_t)util_rand((int)t->dot_tick_dmg_max);
+  // A tick has no damage budget of its own. The affliction was minted
+  // with the whole of an ordinary roll and spends it evenly across its
+  // ticks, so the sum over its life is EXACTLY dmg_plan — an affliction
+  // and an instant blow of the same roll cost the victim the same, and
+  // owning DOT moves is a difference in rhythm, never in strength.
+  left  = d->dmg_plan - d->dmg_done;
+  ticks = (int32_t)d->max_ticks - (int32_t)d->ticks;
+  dmg   = (ticks > 0) ? (left + ticks - 1) / ticks : left;   // ceil
+
+  if(dmg < 1)
+    dmg = 1;
+
   new_hp = (victim.hp > dmg) ? victim.hp - dmg : 0;
   fatal  = (new_hp == 0);
 

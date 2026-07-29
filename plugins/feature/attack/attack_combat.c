@@ -372,52 +372,41 @@ atk_render_dot_inflict(char *out, size_t cap, const char *src_nick,
 // The roll                                                            //
 // ------------------------------------------------------------------ //
 
-// atk_tunables_load() has already guaranteed hit_max >= 1 and
-// crit_max >= crit_min, so neither util_rand argument can reach zero.
+// One uniform draw over 1..dmg_max, and nothing else. It is deliberately
+// the whole of the pit's damage model: whatever class the attacker was
+// dealt, this line runs first and runs the same, and only afterwards is
+// the sheet asked for a sentence of the size that came up. Reordering
+// those two steps is the one change that would make class assignment
+// matter.
+//
+// atk_tunables_load() has already guaranteed dmg_max >= 1, so the
+// util_rand argument can never reach zero.
 int32_t
-atk_roll(const atk_tunables_t *t, bool *crit_out)
+atk_roll(const atk_tunables_t *t)
 {
-  bool crit;
-
   if(t == NULL)
     return(0);
 
-  crit = (t->crit_pct > 0 && util_rand(100) < (int)t->crit_pct);
-
-  if(crit_out != NULL)
-    *crit_out = crit;
-
-  if(crit)
-    return((int32_t)t->crit_min +
-        (int32_t)util_rand((int)(t->crit_max - t->crit_min) + 1));
-
-  return(1 + (int32_t)util_rand((int)t->hit_max));
+  return(1 + (int32_t)util_rand((int)t->dmg_max));
 }
 
 // ------------------------------------------------------------------ //
 // Severity                                                            //
 // ------------------------------------------------------------------ //
 
-// The heaviest blow the current tunables can produce. Crits only widen
-// the ceiling when they can actually fire AND actually exceed an
-// ordinary blow — with crit_chance_pct 0 the crit band is dead weight
-// and must not stretch the scale, or every real hit would read minor.
+// The heaviest blow the current tunables can produce — which, now that
+// the crit band is gone, is simply the top of the one roll. There is no
+// second damage source left to widen it: that was the whole point of
+// deleting the independent crit roll.
 int32_t
 atk_dmg_ceiling(const atk_tunables_t *t)
 {
-  int32_t ceiling;
-
   if(t == NULL)
     return(1);
 
-  ceiling = (int32_t)t->hit_max;
-
-  if(t->crit_pct > 0 && (int32_t)t->crit_max > ceiling)
-    ceiling = (int32_t)t->crit_max;
-
   // atk_tunables_load() already guarantees this; belt and braces,
   // because atk_severity() divides by it.
-  return(ceiling > 0 ? ceiling : 1);
+  return((t->dmg_max > 0) ? (int32_t)t->dmg_max : 1);
 }
 
 atk_flavour_t

@@ -27,13 +27,17 @@
 // CLAM context (registered in CLAM.md).
 #define ATK_CTX            "attack"
 
-// KV keys (registered under the plugin schema).
+// KV keys (registered under the plugin schema). Twenty-five, and the
+// count is load-bearing: every number the pit uses is here, because a
+// character sheet may not carry one.
 #define ATK_KV_PREFIX      "plugin.attack.table_prefix"
+#define ATK_KV_CLASSES     "plugin.attack.classes_path"
 #define ATK_KV_START_HP    "plugin.attack.start_hp"
-#define ATK_KV_HIT_MAX     "plugin.attack.hit_max"
-#define ATK_KV_CRIT_PCT    "plugin.attack.crit_chance_pct"
-#define ATK_KV_CRIT_MIN    "plugin.attack.crit_min"
-#define ATK_KV_CRIT_MAX    "plugin.attack.crit_max"
+
+// Every damage roll is 1..dmg_max, uniform and class-blind. The tier is
+// derived from the number AFTER it is rolled, which is what keeps class
+// assignment cosmetic.
+#define ATK_KV_DMG_MAX     "plugin.attack.dmg_max"
 
 // Severity banding: the percentage of the heaviest possible blow at
 // which each tier BEGINS. Below the first is minor.
@@ -41,19 +45,34 @@
 #define ATK_KV_SEV_MAJOR   "plugin.attack.sev.major_at"
 #define ATK_KV_SEV_CRIT    "plugin.attack.sev.critical_at"
 
-#define ATK_KV_TIMEOUT     "plugin.attack.round_timeout"
+#define ATK_KV_ROUND_MAX   "plugin.attack.round_max_secs"
 #define ATK_KV_EJECT       "plugin.attack.eject_on_death"
 #define ATK_KV_SCORE_ROWS  "plugin.attack.scoreboard_rows"
+#define ATK_KV_AOE_PCT     "plugin.attack.aoe_chance_pct"
 
-// Damage over time: a wound that keeps working after the blow that made
-// it. `dot.chance_pct` at 0 turns the whole feature off.
+// Damage over time: a turn that spends its whole rolled damage over
+// several ticks instead of landing it at once. `dot.chance_pct` at 0
+// turns the whole feature off; `dot.max_ticks` is the chattiness cap.
 #define ATK_KV_DOT_CHANCE  "plugin.attack.dot.chance_pct"
-#define ATK_KV_DOT_MIN     "plugin.attack.dot.min_secs"
-#define ATK_KV_DOT_MAX     "plugin.attack.dot.max_secs"
+#define ATK_KV_DOT_TICKS   "plugin.attack.dot.max_ticks"
 #define ATK_KV_DOT_TICK    "plugin.attack.dot.tick_secs"
-#define ATK_KV_DOT_DMG     "plugin.attack.dot.tick_dmg_max"
 #define ATK_KV_DOT_STACK   "plugin.attack.dot.stack_max"
 #define ATK_KV_DOT_LINGER  "plugin.attack.dot.linger_secs"
+
+// Healing. The engine rolls whether a heal is minor or major and then
+// how much; the sheet only supplies the sentence.
+#define ATK_KV_HEAL_PCT    "plugin.attack.heal.major_pct"
+#define ATK_KV_HEAL_MIN_LO "plugin.attack.heal.minor_min"
+#define ATK_KV_HEAL_MIN_HI "plugin.attack.heal.minor_max"
+#define ATK_KV_HEAL_MAJ_LO "plugin.attack.heal.major_min"
+#define ATK_KV_HEAL_MAJ_HI "plugin.attack.heal.major_max"
+
+// Deferral. Bonuses are ADDITIVE and capped: three deferrals buy at most
+// double damage, never more, whatever defer.max is raised to.
+#define ATK_KV_DEFER_MAX   "plugin.attack.defer.max"
+#define ATK_KV_DEFER_LO    "plugin.attack.defer.step_min_pct"
+#define ATK_KV_DEFER_HI    "plugin.attack.defer.step_max_pct"
+#define ATK_KV_DEFER_CAP   "plugin.attack.defer.bonus_cap_pct"
 
 // Storage bounds. The table prefix is a SQL identifier, so it is
 // validated as strict alnum/underscore before it can reach a query.
@@ -67,6 +86,12 @@
 // The ceiling atk_tunables_load() clamps scoreboard_rows to. The
 // leaderboard's row array is sized from this, so the two must agree.
 #define ATK_MAX_SCORE_ROWS 50
+// The character-sheet directory, as configured. Relative paths resolve
+// against the daemon's CWD (build/), which is why the default is one.
+#define ATK_PATH_SZ        256
+// The bare noun a line substitutes for {affliction}. 24 by the grammar,
+// plus slack; the column that stores it is VARCHAR(32).
+#define ATK_NOUN_SZ        32
 #define ATK_LINE_SZ        640                // one rendered, colorized line
 // A comma-joined display list. Deliberately well under ATK_LINE_SZ so
 // it always fits inside the sentence that carries it; a roster longer
@@ -137,30 +162,49 @@ typedef enum
 
 // Every knob an operator can turn, already sanitised. Read once per
 // command with atk_tunables_load(); never read the raw KV at a use
-// site — an operator can set hit_max to 0 or invert the crit band.
+// site — an operator can set dmg_max to 0 or invert a band.
+//
+// This struct is the WHOLE of the pit's arithmetic. A character sheet
+// supplies words and one bucket label per word; it may never supply a
+// number, a weight or a bonus, and there is deliberately nowhere here
+// for a per-class value to live.
 typedef struct
 {
+  char     classes_path[ATK_PATH_SZ]; // where the character sheets live
   uint32_t start_hp;         // hit points each combatant enters with
-  uint32_t hit_max;          // ordinary blow rolls 1..hit_max
-  uint32_t crit_pct;         // percent chance a blow lands critical
-  uint32_t crit_min;         // critical damage floor
-  uint32_t crit_max;         // critical damage ceiling (>= crit_min)
+  uint32_t dmg_max;          // every damage roll is 1..dmg_max
   uint32_t sev_medium_at;    // pct of the heaviest blow: medium begins
   uint32_t sev_major_at;     // ... major begins    (> sev_medium_at)
   uint32_t sev_crit_at;      // ... critical begins (> sev_major_at)
-  uint32_t round_timeout;    // seconds of silence before a round is cold
+  uint32_t round_max_secs;   // a brawl's whole life; then the game is over
   uint32_t scoreboard_rows;  // rows shown by `show attack scores`
+  uint32_t aoe_pct;          // chance a damage turn sweeps the pit
   bool     eject_on_death;   // remove the fallen where the method allows
 
   // Damage over time. `dot_chance_pct` 0 is the off switch and is
-  // checked before anything else on the inflict path.
-  uint32_t dot_chance_pct;   // percent chance a non-fatal blow afflicts
-  uint32_t dot_min_secs;     // shortest an affliction lasts
-  uint32_t dot_max_secs;     // longest (>= dot_min_secs)
-  uint32_t dot_tick_secs;    // seconds between decay ticks (<= min_secs)
-  uint32_t dot_tick_dmg_max; // a tick rolls 1..N damage
+  // checked before anything else on the inflict path. A DOT carries no
+  // damage budget of its own: it spreads the ordinary roll across its
+  // ticks, so afflictions are a difference in rhythm, never in strength.
+  uint32_t dot_chance_pct;   // percent chance a turn is a DOT
+  uint32_t dot_max_ticks;    // the chattiness cap: most ticks one may speak
+  uint32_t dot_tick_secs;    // seconds between decay ticks
   uint32_t dot_stack_max;    // afflictions one victim may carry at once
   uint32_t dot_linger_secs;  // decay task's idle life after the last DOT
+
+  // Healing. Which band a heal lands in is the engine's roll, not the
+  // healer's; the sheet supplies words for whichever came up.
+  uint32_t heal_major_pct;   // chance a heal is major rather than minor
+  uint32_t heal_minor_min;   // minor heal floor
+  uint32_t heal_minor_max;   // minor heal ceiling (>= heal_minor_min)
+  uint32_t heal_major_min;   // major heal floor
+  uint32_t heal_major_max;   // major heal ceiling (>= heal_major_min)
+
+  // Deferral. Additive and capped — multiplicative stacking would be
+  // abused, and the cap is what forbids a one-shot.
+  uint32_t defer_max;        // deferrals one combatant may spend per round
+  uint32_t defer_step_lo;    // smallest bonus one deferral adds
+  uint32_t defer_step_hi;    // largest (>= defer_step_lo)
+  uint32_t defer_cap_pct;    // hard ceiling on accumulated bonus
 } atk_tunables_t;
 
 // The four table names for the configured prefix, resolved together so
@@ -180,7 +224,11 @@ typedef struct
   int32_t wave;
   int32_t blows;
   int32_t top_crit;
-  int64_t idle;        // seconds since last_action
+  // Seconds since started_at. There is exactly one clock: a brawl lasts
+  // round_max_secs and then the game is over. Nothing measures silence —
+  // `attack --end` is what retires a pit that has gone stale, and it is
+  // a better instrument because the people standing in it can see it.
+  int64_t age;
 } atk_round_t;
 
 // One combatant's standing within a round.
@@ -293,7 +341,12 @@ typedef struct
   char           victim_nick[ATK_NICK_SZ];
   char           source [ATK_USER_SZ];
   char           source_nick[ATK_NICK_SZ];
+  char           noun[ATK_NOUN_SZ];  // what {affliction} expands to
   atk_dot_kind_t kind;
+  int32_t        dmg_plan;  // the whole damage this affliction will deal
+  int32_t        dmg_done;  // how much of it has already landed
+  uint32_t       max_ticks; // ticks it was minted with
+  uint32_t       ticks;     // ticks already taken
   bool           expired;   // this is the last tick it will ever take
 } atk_dot_due_t;
 
@@ -323,8 +376,13 @@ typedef struct
   const char    *victim_nick;
   const char    *source;
   const char    *source_nick;
+  const char    *noun;       // the sheet's own word for this affliction
   atk_dot_kind_t kind;
-  uint32_t       secs;       // total lifetime
+  // The whole rolled damage, spread across `max_ticks` instead of
+  // landing at once. A DOT has no budget of its own, which is what makes
+  // "some classes have DOTs" a difference in rhythm and not in strength.
+  int32_t        dmg_plan;
+  uint32_t       max_ticks;  // min(dot.max_ticks, dmg_plan)
   uint32_t       tick_secs;  // cadence, and so the first tick's delay
   uint32_t       stack_max;  // enforced in SQL, not read-then-write
 } atk_dot_new_t;
@@ -442,8 +500,13 @@ bool atk_db_deadliest(uint32_t ns_id, char *by, size_t by_cap,
 
 // ---- Combat (attack_combat.c) -------------------------------------- //
 
-// Roll one blow. *crit_out reports whether it landed critical.
-int32_t atk_roll(const atk_tunables_t *t, bool *crit_out);
+// Roll one blow: 1..dmg_max, uniform, and identical for everybody. This
+// happens BEFORE the attacker's class is consulted — the number decides
+// which sentence the sheet is asked for, never the other way round. It
+// takes no crit flag because there is no longer a crit roll: a blow is
+// critical iff its tier is, which is what stops the round card from ever
+// contradicting the words.
+int32_t atk_roll(const atk_tunables_t *t);
 
 // The heaviest damage the current tunables can roll — the reference the
 // severity band is a percentage OF. Never returns 0; the band divides

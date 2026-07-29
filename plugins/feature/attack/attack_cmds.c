@@ -20,6 +20,7 @@
 #include <stdio.h>
 #include <string.h>
 #include <strings.h>
+#include <time.h>
 
 // Serialises steps 5-10 of a turn: load the round, enrol, gate the wave,
 // roll, write, announce. Target resolution and the presence probe run
@@ -88,6 +89,58 @@ atk_resolve_target(const cmd_ctx_t *ctx, const userns_t *ns,
 }
 
 // ------------------------------------------------------------------ //
+// attack --end                                                        //
+// ------------------------------------------------------------------ //
+
+// Ending a game is not winning one: the round is retired with no slayer,
+// no fallen, and not one kill, death or point of damage recorded. Live
+// afflictions need no attention here — a round that is no longer active
+// stops its own afflictions from ever ticking again, and the decay task
+// sweeps their rows on its next pass.
+//
+// This needs no command definition and no permission gate of its own: it
+// is the `attack` leaf's own argument, so "anyone who can attack can end
+// it" is satisfied by construction. And an IRC nickname can never begin
+// with '-' (RFC 2812), so the comparison cannot shadow a real target.
+static void
+atk_cmd_end(const cmd_ctx_t *ctx, const userns_t *ns)
+{
+  atk_round_t round;
+  char        age [64];
+  char        line[ATK_LINE_SZ];
+  const char *who;
+  bool        found;
+
+  who = (ctx->msg->nickname[0] != '\0') ? ctx->msg->nickname : ctx->username;
+
+  pthread_mutex_lock(&atk_turn_lock);
+
+  found = atk_db_round_find(ns->id, method_inst_name(ctx->msg->inst),
+      ctx->msg->channel, &round);
+
+  if(found)
+    atk_db_round_abandon(round.id);
+
+  pthread_mutex_unlock(&atk_turn_lock);
+
+  if(!found)
+  {
+    cmd_reply(ctx, "⚔ Nothing is happening here.");
+    return;
+  }
+
+  util_fmt_duration((time_t)round.age, age, sizeof(age));
+
+  snprintf(line, sizeof(line),
+      "⚔ " CLR_CYAN "%s" CLR_RESET " calls the fight. It ran %s and "
+      "nobody won it. The next blow starts a new one.", who, age);
+  cmd_reply(ctx, line);
+
+  clam(CLAM_INFO, ATK_CTX, "round %" PRId64 " ended by %s after %" PRId64 "s",
+      round.id, ctx->username, round.age);
+}
+
+// ------------------------------------------------------------------ //
 // attack <nick>                                                       //
 // ------------------------------------------------------------------ //
 
@@ -131,7 +184,15 @@ atk_cmd_attack(const cmd_ctx_t *ctx)
 
   if(nick == NULL || nick[0] == '\0')
   {
-    cmd_reply(ctx, "usage: attack <nick>");
+    cmd_reply(ctx, "usage: attack <nick>|--end");
+    return;
+  }
+
+  // Before target resolution, and never after: --end is an argument, not
+  // a child command, precisely so that it cannot shadow a nickname.
+  if(strcmp(nick, "--end") == 0)
+  {
+    atk_cmd_end(ctx, ns);
     return;
   }
 
@@ -170,11 +231,15 @@ atk_cmd_attack(const cmd_ctx_t *ctx)
 
   // ---- 5. the round ------------------------------------------------ //
 
+  // One clock, and it measures the brawl's whole life rather than its
+  // silence: a round runs for round_max_secs and then the game is over.
+  // A pit that has merely gone quiet is ended by `attack --end`, which
+  // is the better instrument because everyone standing in it can see it.
   if(atk_db_round_find(ns->id, method, channel, &round) &&
-     round.idle > (int64_t)t.round_timeout)
+     round.age > (int64_t)t.round_max_secs)
   {
     atk_db_round_abandon(round.id);
-    cmd_reply(ctx, "⚔ The old brawl has gone cold; a new one begins.");
+    cmd_reply(ctx, "⚔ The old fight is over. A new one begins.");
 
     // Clear the whole snapshot, not just the id: the dead round's
     // top_crit would otherwise set the bar for the fresh one.
@@ -237,7 +302,12 @@ atk_cmd_attack(const cmd_ctx_t *ctx)
 
   // ---- 8-9. roll and write ----------------------------------------- //
 
-  dmg    = atk_roll(&t, &crit);
+  // The number first, the tier from the number, and only then the words.
+  // A critical hit is no longer an independent roll — it is simply a blow
+  // that landed in the top band — so the standings and the sentence can
+  // never again describe different events.
+  dmg    = atk_roll(&t);
+  crit   = (atk_severity(&t, dmg) == ATK_FLAV_CRITICAL);
   new_hp = (tgt.hp > dmg) ? tgt.hp - dmg : 0;
   fatal  = (new_hp == 0);
 
@@ -291,6 +361,15 @@ atk_cmd_attack(const cmd_ctx_t *ctx)
   if(t.dot_chance_pct > 0 && !fatal &&
      util_rand(100) < (int)t.dot_chance_pct)
   {
+    // Still the old blow-leaves-a-wound path; ATK-5 replaces it with a
+    // DOT *turn* that deals no instant damage. What is already final is
+    // the schedule: the affliction is minted with a whole damage plan
+    // and a tick count, and it can never speak more than dot.max_ticks
+    // times — a 1-damage affliction speaks exactly once.
+    const atk_dot_kind_t kind = (atk_dot_kind_t)util_rand(ATK_DOT__COUNT);
+    const uint32_t       ticks =
+        ((uint32_t)dmg < t.dot_max_ticks) ? (uint32_t)dmg : t.dot_max_ticks;
+
     atk_dot_new_t dot = {
       .round_id    = round.id,
       .ns_id       = ns->id,
@@ -300,10 +379,10 @@ atk_cmd_attack(const cmd_ctx_t *ctx)
       .victim_nick = nick,
       .source      = ctx->username,
       .source_nick = src_nick,
-      .kind        = (atk_dot_kind_t)util_rand(ATK_DOT__COUNT),
-      .secs        = t.dot_min_secs +
-                     (uint32_t)util_rand((int)(t.dot_max_secs -
-                                               t.dot_min_secs) + 1),
+      .noun        = atk_dot_name_of(kind),
+      .kind        = kind,
+      .dmg_plan    = dmg,
+      .max_ticks   = ticks,
       .tick_secs   = t.dot_tick_secs,
       .stack_max   = t.dot_stack_max,
     };
@@ -370,14 +449,18 @@ bool
 atk_commands_register(void)
 {
   if(cmd_register("attack", "attack",
-        "attack <nick>",
+        "attack <nick>|--end",
         "Attack another combatant in the pit.",
-        "Every combatant enters with full health. A blow may land "
-        "ordinary or critical; the first to reach 0 hit points ends the "
-        "round and, where the protocol allows it, leaves the channel "
-        "feet first. You may strike once per wave — once every living "
+        "Every combatant enters with full health. Damage is rolled the "
+        "same way for everyone, and a blow in the top band counts as a "
+        "critical hit; the first to reach 0 hit points ends the round "
+        "and, where the protocol allows it, leaves the channel feet "
+        "first. You may strike once per wave — once every living "
         "combatant has swung, the wave turns and anyone may go again. "
-        "Targets must be registered users who are present in the room.",
+        "Targets must be registered users who are present in the room. "
+        "A fight also has a life of its own and expires on its own "
+        "clock; `attack --end` stops one early, and anyone who can "
+        "attack can end it.",
         USERNS_GROUP_USER, 0, CMD_SCOPE_PUBLIC, METHOD_T_ANY,
         atk_cmd_attack, NULL, NULL, NULL,
         atk_attack_args,

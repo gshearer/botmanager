@@ -174,6 +174,12 @@ atk_schema_ensure(void)
       " crits     INTEGER     NOT NULL DEFAULT 0,"
       " best_crit INTEGER     NOT NULL DEFAULT 0,"
       " last_wave INTEGER     NOT NULL DEFAULT 0,"
+      " class      VARCHAR(32) NOT NULL DEFAULT '',"
+      " heal_given INTEGER     NOT NULL DEFAULT 0,"
+      " heal_taken INTEGER     NOT NULL DEFAULT 0,"
+      " heals      INTEGER     NOT NULL DEFAULT 0,"
+      " defers     SMALLINT    NOT NULL DEFAULT 0,"
+      " bonus_pct  INTEGER     NOT NULL DEFAULT 0,"
       " joined_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),"
       " died_at   TIMESTAMPTZ,"
       " PRIMARY KEY (round_id, username)"
@@ -198,6 +204,9 @@ atk_schema_ensure(void)
       " crits        INTEGER     NOT NULL DEFAULT 0,"
       " best_crit    INTEGER     NOT NULL DEFAULT 0,"
       " best_crit_on VARCHAR(31) NOT NULL DEFAULT '',"
+      " heal_given   BIGINT      NOT NULL DEFAULT 0,"
+      " heal_taken   BIGINT      NOT NULL DEFAULT 0,"
+      " heals        INTEGER     NOT NULL DEFAULT 0,"
       " first_seen   TIMESTAMPTZ NOT NULL DEFAULT NOW(),"
       " last_seen    TIMESTAMPTZ NOT NULL DEFAULT NOW(),"
       " PRIMARY KEY (ns_id, username)"
@@ -230,8 +239,15 @@ atk_schema_ensure(void)
       " source      VARCHAR(31)  NOT NULL,"
       " source_nick VARCHAR(64)  NOT NULL DEFAULT '',"
       " kind        SMALLINT     NOT NULL DEFAULT 0,"
+      // The sheet's own word for this affliction, carried on the row so
+      // a class's wording survives every tick it ever speaks.
+      " noun        VARCHAR(32)  NOT NULL DEFAULT '',"
       " state       SMALLINT     NOT NULL DEFAULT 0,"
       " ticks       INTEGER      NOT NULL DEFAULT 0,"
+      " max_ticks   SMALLINT     NOT NULL DEFAULT 3,"
+      // The whole rolled damage this affliction will ever deal, fixed at
+      // inflict time and spread across max_ticks.
+      " dmg_plan    INTEGER      NOT NULL DEFAULT 0,"
       " dmg_total   INTEGER      NOT NULL DEFAULT 0,"
       " next_tick   TIMESTAMPTZ  NOT NULL DEFAULT NOW(),"
       " expires_at  TIMESTAMPTZ  NOT NULL DEFAULT NOW(),"
@@ -354,7 +370,9 @@ atk_db_round_find(uint32_t ns_id, const char *method, const char *channel,
 
   snprintf(sql, sizeof(sql),
       "SELECT id, wave, blows, top_crit,"
-      " EXTRACT(EPOCH FROM (NOW() - last_action))::bigint"
+      // The brawl's whole age, not its silence: there is one clock now,
+      // and it starts when the round does.
+      " EXTRACT(EPOCH FROM (NOW() - started_at))::bigint"
       " FROM %s WHERE ns_id = %" PRIu32 " AND method = '%s'"
       " AND channel = '%s' AND state = %d",
       t.rounds, ns_id, e_meth, e_chan, ATK_ROUND_ACTIVE);
@@ -367,7 +385,7 @@ atk_db_round_find(uint32_t ns_id, const char *method, const char *channel,
     out->wave     = atk_col_i32(res, 0, 1);
     out->blows    = atk_col_i32(res, 0, 2);
     out->top_crit = atk_col_i32(res, 0, 3);
-    out->idle     = atk_col_i64(res, 0, 4);
+    out->age      = atk_col_i64(res, 0, 4);
     hit = true;
   }
 
@@ -946,7 +964,8 @@ atk_db_dot_inflict(const atk_dot_new_t *d)
   char        *e_vic_n  = NULL;
   char        *e_src_u  = NULL;
   char        *e_src_n  = NULL;
-  char         sql[1536];
+  char        *e_noun   = NULL;
+  char         sql[1792];
   uint32_t     affected = 0;
   bool         ok = FAIL;
 
@@ -959,21 +978,29 @@ atk_db_dot_inflict(const atk_dot_new_t *d)
   e_vic_n = db_escape(d->victim_nick != NULL ? d->victim_nick : "");
   e_src_u = db_escape(d->source      != NULL ? d->source      : "");
   e_src_n = db_escape(d->source_nick != NULL ? d->source_nick : "");
+  e_noun  = db_escape(d->noun        != NULL ? d->noun        : "");
 
   if(e_meth == NULL || e_chan == NULL || e_vic_u == NULL ||
-     e_vic_n == NULL || e_src_u == NULL || e_src_n == NULL)
+     e_vic_n == NULL || e_src_u == NULL || e_src_n == NULL ||
+     e_noun == NULL)
     goto out;
 
+  // expires_at is a BACKSTOP, not the thing that ends the affliction: a
+  // row the decay task never serviced is swept one cadence after its
+  // last scheduled tick. What actually retires it is the tick count.
   snprintf(sql, sizeof(sql),
       "INSERT INTO %s (round_id, ns_id, method, channel, victim,"
-      " victim_nick, source, source_nick, kind, next_tick, expires_at)"
+      " victim_nick, source, source_nick, kind, noun, max_ticks,"
+      " dmg_plan, next_tick, expires_at)"
       " SELECT %" PRId64 ", %" PRIu32 ", '%s', '%s', '%s', '%s', '%s',"
-      " '%s', %d, NOW() + INTERVAL '%" PRIu32 " seconds',"
+      " '%s', %d, '%s', %" PRIu32 ", %d,"
+      " NOW() + INTERVAL '%" PRIu32 " seconds',"
       " NOW() + INTERVAL '%" PRIu32 " seconds'"
       " WHERE (SELECT COUNT(*) FROM %s WHERE round_id = %" PRId64
       " AND victim = '%s' AND state = %d) < %" PRIu32,
       t.dots, d->round_id, d->ns_id, e_meth, e_chan, e_vic_u, e_vic_n,
-      e_src_u, e_src_n, (int)d->kind, d->tick_secs, d->secs,
+      e_src_u, e_src_n, (int)d->kind, e_noun, d->max_ticks, d->dmg_plan,
+      d->tick_secs, (d->max_ticks + 1) * d->tick_secs,
       t.dots, d->round_id, e_vic_u, ATK_DOT_LIVE, d->stack_max);
 
   if(atk_exec(sql, "dot inflict", &affected) == SUCCESS && affected > 0)
@@ -986,6 +1013,7 @@ out:
   if(e_vic_n != NULL) mem_free(e_vic_n);
   if(e_src_u != NULL) mem_free(e_src_u);
   if(e_src_n != NULL) mem_free(e_src_n);
+  if(e_noun  != NULL) mem_free(e_noun);
 
   return(ok);
 }
@@ -1062,7 +1090,11 @@ atk_db_dot_due(atk_dot_due_t *out, uint32_t cap)
   snprintf(sql, sizeof(sql),
       "SELECT d.id, d.round_id, d.ns_id, d.method, d.channel, d.victim,"
       " d.victim_nick, d.source, d.source_nick, d.kind,"
-      " (d.expires_at <= NOW())"
+      // An affliction ends by tick COUNT, not by the wall clock. This is
+      // what makes "at most max_ticks messages" exact rather than
+      // approximate, and it is why a 1-damage DOT speaks once.
+      " (d.ticks + 1 >= d.max_ticks),"
+      " d.noun, d.max_ticks, d.dmg_plan, d.dmg_total, d.ticks"
       " FROM %s d JOIN %s r ON r.id = d.round_id"
       " WHERE d.state = %d AND r.state = %d AND d.next_tick <= NOW()"
       " ORDER BY d.next_tick LIMIT %" PRIu32,
@@ -1092,6 +1124,13 @@ atk_db_dot_due(atk_dot_due_t *out, uint32_t cap)
       // Postgres renders a boolean as 't' or 'f'.
       expired = db_result_get(res, n, 10);
       out[n].expired = (expired != NULL && expired[0] == 't');
+
+      atk_col_str(out[n].noun, sizeof(out[n].noun), res, n, 11);
+
+      out[n].max_ticks = (uint32_t)atk_col_i32(res, n, 12);
+      out[n].dmg_plan  = atk_col_i32(res, n, 13);
+      out[n].dmg_done  = atk_col_i32(res, n, 14);
+      out[n].ticks     = (uint32_t)atk_col_i32(res, n, 15);
     }
   }
 

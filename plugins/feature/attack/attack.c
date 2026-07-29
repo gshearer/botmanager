@@ -23,49 +23,77 @@
 
 static const plugin_kv_entry_t atk_kv_schema[] = {
   { ATK_KV_PREFIX,     KV_STR,    "attack",
-    "Table-name prefix for the pit's three tables (bare SQL identifier)" },
+    "Table-name prefix for the pit's four tables (bare SQL identifier)" },
+  { ATK_KV_CLASSES,    KV_STR,    "../plugins/feature/attack/characters",
+    "Directory the character sheets are read from; relative paths "
+    "resolve against the daemon's working directory" },
   { ATK_KV_START_HP,   KV_UINT32, "100",
     "Hit points each combatant enters a round with" },
-  { ATK_KV_HIT_MAX,    KV_UINT32, "10",
-    "Maximum damage of an ordinary blow (rolls 1..N)" },
-  { ATK_KV_CRIT_PCT,   KV_UINT32, "12",
-    "Percent chance a blow lands as a critical hit" },
-  { ATK_KV_CRIT_MIN,   KV_UINT32, "10",
-    "Minimum critical-hit damage" },
-  { ATK_KV_CRIT_MAX,   KV_UINT32, "20",
-    "Maximum critical-hit damage" },
+  { ATK_KV_DMG_MAX,    KV_UINT32, "20",
+    "Maximum damage of any blow; every damage turn rolls 1..N, uniform "
+    "and identical for every class" },
+
+  // 25 / 55 / 85, not 25 / 50 / 75. The top band is now BOTH the word
+  // and the crit statistic, so it has to be the rarest: over dmg_max 20
+  // this pays minor 1-4 (20%), medium 5-10 (30%), major 11-16 (30%),
+  // critical 17-20 (20%). At the old 75 a third of every blow struck
+  // would have been recorded as a critical hit.
   { ATK_KV_SEV_MEDIUM, KV_UINT32, "25",
     "Percent of the heaviest possible blow at which a hit reads as "
     "'medium' rather than 'minor'" },
-  { ATK_KV_SEV_MAJOR,  KV_UINT32, "50",
+  { ATK_KV_SEV_MAJOR,  KV_UINT32, "55",
     "Percent of the heaviest possible blow at which a hit reads as "
     "'major'" },
-  { ATK_KV_SEV_CRIT,   KV_UINT32, "75",
+  { ATK_KV_SEV_CRIT,   KV_UINT32, "85",
     "Percent of the heaviest possible blow at which a hit reads as "
-    "'critical'" },
-  { ATK_KV_TIMEOUT,    KV_UINT32, "1800",
-    "Seconds of inactivity before a round is abandoned" },
+    "'critical' — and counts as a critical hit in the standings" },
+
+  { ATK_KV_ROUND_MAX,  KV_UINT32, "14400",
+    "Seconds a brawl may last before the game is over; only a fresh "
+    "attack opens a new one" },
   { ATK_KV_EJECT,      KV_UINT8,  "1",
     "Remove the fallen from the room (KILL/KICK) where the method allows" },
   { ATK_KV_SCORE_ROWS, KV_UINT32, "15",
     "Rows shown by `show attack scores`" },
+  { ATK_KV_AOE_PCT,    KV_UINT32, "3",
+    "Percent chance a damage turn strikes everyone in the pit but the "
+    "attacker; 0 disables it" },
 
   { ATK_KV_DOT_CHANCE,  KV_UINT32, "25",
-    "Percent chance a landing, non-fatal blow leaves an affliction that "
-    "keeps dealing damage; 0 disables the feature entirely" },
-  { ATK_KV_DOT_MIN,     KV_UINT32, "5",
-    "Shortest an affliction lasts, in seconds" },
-  { ATK_KV_DOT_MAX,     KV_UINT32, "60",
-    "Longest an affliction lasts, in seconds" },
-  { ATK_KV_DOT_TICK,    KV_UINT32, "5",
+    "Percent chance a turn deals its damage over time instead of at "
+    "once, where the attacker's class has the moves for it; 0 disables "
+    "the feature entirely" },
+  { ATK_KV_DOT_TICKS,   KV_UINT32, "3",
+    "Most messages one affliction may ever speak; its damage is spread "
+    "across exactly this many ticks" },
+  { ATK_KV_DOT_TICK,    KV_UINT32, "20",
     "Seconds between the ticks of an affliction" },
-  { ATK_KV_DOT_DMG,     KV_UINT32, "3",
-    "Maximum damage one tick of an affliction deals (rolls 1..N)" },
   { ATK_KV_DOT_STACK,   KV_UINT32, "1",
     "Afflictions one combatant may carry at once within a round" },
   { ATK_KV_DOT_LINGER,  KV_UINT32, "3600",
     "Seconds the decay task stays queued after the last affliction "
     "clears, before it removes itself" },
+
+  { ATK_KV_HEAL_PCT,    KV_UINT32, "25",
+    "Percent chance a heal is major rather than minor" },
+  { ATK_KV_HEAL_MIN_LO, KV_UINT32, "1",
+    "Fewest hit points a minor heal restores" },
+  { ATK_KV_HEAL_MIN_HI, KV_UINT32, "10",
+    "Most hit points a minor heal restores" },
+  { ATK_KV_HEAL_MAJ_LO, KV_UINT32, "10",
+    "Fewest hit points a major heal restores" },
+  { ATK_KV_HEAL_MAJ_HI, KV_UINT32, "20",
+    "Most hit points a major heal restores" },
+
+  { ATK_KV_DEFER_MAX,   KV_UINT32, "3",
+    "Turns one combatant may defer per round; 0 disables deferral" },
+  { ATK_KV_DEFER_LO,    KV_UINT32, "15",
+    "Smallest percentage bonus one deferral adds to the next turn" },
+  { ATK_KV_DEFER_HI,    KV_UINT32, "35",
+    "Largest percentage bonus one deferral adds to the next turn" },
+  { ATK_KV_DEFER_CAP,   KV_UINT32, "100",
+    "Hard ceiling on the bonus deferrals may accumulate; 100 means a "
+    "deferred turn can at most double its damage" },
 };
 
 // ------------------------------------------------------------------ //
@@ -84,35 +112,39 @@ atk_clamp(uint64_t val, uint32_t lo, uint32_t hi)
   return((uint32_t)val);
 }
 
-// Nothing downstream re-reads the raw KV: a zero hit_max would make
-// util_rand(0) meaningless and an inverted crit band would roll a
-// negative width, so both are corrected here, once, at the boundary.
+// Nothing downstream re-reads the raw KV: a zero dmg_max would make
+// util_rand(0) meaningless and an inverted band would roll a negative
+// width, so both are corrected here, once, at the boundary.
 void
 atk_tunables_load(atk_tunables_t *out)
 {
+  const char *path;
+
   if(out == NULL)
     return;
 
+  path = kv_get_str(ATK_KV_CLASSES);
+
+  snprintf(out->classes_path, sizeof(out->classes_path), "%s",
+      (path != NULL && path[0] != '\0')
+          ? path : "../plugins/feature/attack/characters");
+
   out->start_hp        = atk_clamp(kv_get_uint(ATK_KV_START_HP),   1, 100000);
-  out->hit_max         = atk_clamp(kv_get_uint(ATK_KV_HIT_MAX),    1, 1000);
-  out->crit_pct        = atk_clamp(kv_get_uint(ATK_KV_CRIT_PCT),   0, 100);
-  out->crit_min        = atk_clamp(kv_get_uint(ATK_KV_CRIT_MIN),   1, 100000);
-  out->crit_max        = atk_clamp(kv_get_uint(ATK_KV_CRIT_MAX),   1, 100000);
-  out->round_timeout   = atk_clamp(kv_get_uint(ATK_KV_TIMEOUT),   30, 604800);
+  out->dmg_max         = atk_clamp(kv_get_uint(ATK_KV_DMG_MAX),    1, 1000);
+  out->round_max_secs  = atk_clamp(kv_get_uint(ATK_KV_ROUND_MAX), 60, 604800);
   out->scoreboard_rows = atk_clamp(kv_get_uint(ATK_KV_SCORE_ROWS), 1,
                                      ATK_MAX_SCORE_ROWS);
+  out->aoe_pct         = atk_clamp(kv_get_uint(ATK_KV_AOE_PCT),     0, 100);
   out->eject_on_death  = (kv_get_uint(ATK_KV_EJECT) != 0);
-
-  if(out->crit_max < out->crit_min)
-    out->crit_max = out->crit_min;
 
   out->sev_medium_at = atk_clamp(kv_get_uint(ATK_KV_SEV_MEDIUM), 1, 98);
   out->sev_major_at  = atk_clamp(kv_get_uint(ATK_KV_SEV_MAJOR),  1, 99);
   out->sev_crit_at   = atk_clamp(kv_get_uint(ATK_KV_SEV_CRIT),   1, 100);
 
-  // Strictly ascending, or a tier would be unreachable and the pool
-  // behind it would fill with lines nothing ever speaks. The 98/99/100
-  // ceilings above are what make both corrections safe.
+  // Strictly ascending, or a tier would be unreachable — and a tier the
+  // engine can roll but no class can speak is a fairness bug now, not
+  // merely a dead pool of lines. The 98/99/100 ceilings above are what
+  // make both corrections safe.
   if(out->sev_major_at <= out->sev_medium_at)
     out->sev_major_at = out->sev_medium_at + 1;
 
@@ -120,25 +152,36 @@ atk_tunables_load(atk_tunables_t *out)
     out->sev_crit_at = out->sev_major_at + 1;
 
   // Damage over time. Zero chance is legal — it is the off switch — but
-  // every duration below it must be a usable number.
-  out->dot_chance_pct   = atk_clamp(kv_get_uint(ATK_KV_DOT_CHANCE), 0, 100);
-  out->dot_min_secs     = atk_clamp(kv_get_uint(ATK_KV_DOT_MIN),    1, 3600);
-  out->dot_max_secs     = atk_clamp(kv_get_uint(ATK_KV_DOT_MAX),    1, 86400);
-  out->dot_tick_secs    = atk_clamp(kv_get_uint(ATK_KV_DOT_TICK),   1, 300);
-  out->dot_tick_dmg_max = atk_clamp(kv_get_uint(ATK_KV_DOT_DMG),    1, 1000);
-  out->dot_stack_max    = atk_clamp(kv_get_uint(ATK_KV_DOT_STACK),  1, 4);
-  out->dot_linger_secs  = atk_clamp(kv_get_uint(ATK_KV_DOT_LINGER),
-                                      60, 86400);
+  // every number below it must be usable. There is no tick damage knob:
+  // a DOT spends the ordinary roll across its ticks and nothing else.
+  out->dot_chance_pct  = atk_clamp(kv_get_uint(ATK_KV_DOT_CHANCE), 0, 100);
+  out->dot_max_ticks   = atk_clamp(kv_get_uint(ATK_KV_DOT_TICKS),  1, 50);
+  out->dot_tick_secs   = atk_clamp(kv_get_uint(ATK_KV_DOT_TICK),   1, 3600);
+  out->dot_stack_max   = atk_clamp(kv_get_uint(ATK_KV_DOT_STACK),  1,
+                                     ATK_DOT_STACK_CAP);
+  out->dot_linger_secs = atk_clamp(kv_get_uint(ATK_KV_DOT_LINGER), 60, 86400);
 
-  // The same correction crit_max gets, for the same reason: a random
-  // width of max - min + 1 must never be computed from an inverted band.
-  if(out->dot_max_secs < out->dot_min_secs)
-    out->dot_max_secs = out->dot_min_secs;
+  out->heal_major_pct = atk_clamp(kv_get_uint(ATK_KV_HEAL_PCT),    0, 100);
+  out->heal_minor_min = atk_clamp(kv_get_uint(ATK_KV_HEAL_MIN_LO), 1, 100000);
+  out->heal_minor_max = atk_clamp(kv_get_uint(ATK_KV_HEAL_MIN_HI), 1, 100000);
+  out->heal_major_min = atk_clamp(kv_get_uint(ATK_KV_HEAL_MAJ_LO), 1, 100000);
+  out->heal_major_max = atk_clamp(kv_get_uint(ATK_KV_HEAL_MAJ_HI), 1, 100000);
 
-  // A cadence slower than the shortest affliction would mint DOTs that
-  // expire before they ever speak. Silently lower it, as everywhere else.
-  if(out->dot_tick_secs > out->dot_min_secs)
-    out->dot_tick_secs = out->dot_min_secs;
+  out->defer_max     = atk_clamp(kv_get_uint(ATK_KV_DEFER_MAX),  0, 10);
+  out->defer_step_lo = atk_clamp(kv_get_uint(ATK_KV_DEFER_LO),   0, 200);
+  out->defer_step_hi = atk_clamp(kv_get_uint(ATK_KV_DEFER_HI),   0, 200);
+  out->defer_cap_pct = atk_clamp(kv_get_uint(ATK_KV_DEFER_CAP),  0, 1000);
+
+  // Three bands, one correction, one reason: a random width of
+  // max - min + 1 must never be computed from an inverted band.
+  if(out->heal_minor_max < out->heal_minor_min)
+    out->heal_minor_max = out->heal_minor_min;
+
+  if(out->heal_major_max < out->heal_major_min)
+    out->heal_major_max = out->heal_major_min;
+
+  if(out->defer_step_hi < out->defer_step_lo)
+    out->defer_step_hi = out->defer_step_lo;
 }
 
 // ------------------------------------------------------------------ //
