@@ -540,8 +540,8 @@ atk_db_player_get(int64_t round_id, const char *username,
     return(false);
 
   snprintf(sql, sizeof(sql),
-      "SELECT nickname, hp, hp_max, last_wave, class FROM %s"
-      " WHERE round_id = %" PRId64 " AND username = '%s'",
+      "SELECT nickname, hp, hp_max, last_wave, class, defers, bonus_pct"
+      " FROM %s WHERE round_id = %" PRId64 " AND username = '%s'",
       t.players, round_id, e_user);
 
   res = db_result_alloc();
@@ -553,6 +553,8 @@ atk_db_player_get(int64_t round_id, const char *username,
     out->hp_max    = atk_col_i32(res, 0, 2);
     out->last_wave = atk_col_i32(res, 0, 3);
     atk_col_str(out->class, sizeof(out->class), res, 0, 4);
+    out->defers    = atk_col_i32(res, 0, 5);
+    out->bonus_pct = atk_col_i32(res, 0, 6);
     hit = true;
   }
 
@@ -695,7 +697,7 @@ atk_db_card_roster(int64_t round_id, atk_card_row_t *out, uint32_t cap,
   snprintf(sql, sizeof(sql),
       "SELECT CASE WHEN p.nickname <> '' THEN p.nickname ELSE p.username END,"
       " p.hp, p.hp_max, p.dmg_given, p.dmg_taken, p.best_crit, p.last_wave,"
-      " COUNT(*) OVER (), p.username, p.class, p.heal_given"
+      " COUNT(*) OVER (), p.username, p.class, p.heal_given, p.bonus_pct"
       " FROM %s p WHERE p.round_id = %" PRId64
       " ORDER BY p.hp DESC, p.dmg_given DESC, p.username LIMIT %" PRIu32,
       t.players, round_id, cap);
@@ -716,6 +718,7 @@ atk_db_card_roster(int64_t round_id, atk_card_row_t *out, uint32_t cap,
       out[n].best_crit  = atk_col_i32(res, n, 5);
       out[n].last_wave  = atk_col_i32(res, n, 6);
       out[n].heal_given = atk_col_i32(res, n, 10);
+      out[n].bonus_pct  = atk_col_i32(res, n, 11);
 
       if(total != NULL)
         *total = (uint32_t)atk_col_i64(res, n, 7);
@@ -882,10 +885,13 @@ atk_db_blow_apply(const atk_blow_t *b)
   snprintf(sql, need,
       "BEGIN;"
 
-      // The attacker spends the wave, whatever the blow was worth.
+      // The attacker spends the wave, whatever the blow was worth — and
+      // with it any deferral bonus, in the SAME transaction that applied
+      // it. Never in a second statement: a daemon death between the two
+      // would hand somebody a permanent bonus.
       "UPDATE %s SET nickname = '%s', dmg_given = dmg_given + %d,"
       " blows = blows + 1, crits = crits + %d,"
-      " best_crit = GREATEST(best_crit, %d), last_wave = %d"
+      " best_crit = GREATEST(best_crit, %d), last_wave = %d, bonus_pct = 0"
       " WHERE round_id = %" PRId64 " AND username = '%s';"
 
       // The target takes it. hp floors at zero; died_at is stamped once.
@@ -1107,7 +1113,11 @@ atk_db_turn_spend(int64_t round_id, uint32_t ns_id, const char *username,
   snprintf(sql, sizeof(sql),
       "BEGIN;"
 
-      "UPDATE %s SET nickname = '%s', blows = blows + 1, last_wave = %d"
+      // bonus_pct is consumed here too, and it must be: an affliction
+      // spends the same bonused roll a blow would have, one tick at a
+      // time, so leaving the bonus standing would let it be spent twice.
+      "UPDATE %s SET nickname = '%s', blows = blows + 1, last_wave = %d,"
+      " bonus_pct = 0"
       " WHERE round_id = %" PRId64 " AND username = '%s';"
 
       "UPDATE %s SET blows = blows + 1, last_action = NOW()"
@@ -1135,6 +1145,69 @@ atk_db_turn_spend(int64_t round_id, uint32_t ns_id, const char *username,
       t.rounds, round_id, t.players);
 
   ok = atk_exec(sql, "turn spend", NULL);
+
+out:
+  if(e_user != NULL) mem_free(e_user);
+  if(e_nick != NULL) mem_free(e_nick);
+
+  return(ok);
+}
+
+// ------------------------------------------------------------------ //
+// The deferral                                                        //
+// ------------------------------------------------------------------ //
+
+// A surrendered turn. Nothing here touches health, damage or `blows` —
+// stepping back is emphatically not a swing, and the ledger must not read
+// as though it were. What it does touch is the WAVE: a deferral spends
+// it, so a pit cannot be held hostage by somebody who never swings.
+//
+// The bonus arrives already accumulated and already capped. The cap is
+// applied by the caller under the turn lock rather than in SQL because it
+// is a tunable the caller has loaded anyway, and one authority for the
+// ceiling is worth more than the round trip it would save.
+bool
+atk_db_defer_apply(int64_t round_id, const char *username,
+    const char *nickname, int32_t wave, uint32_t bonus_pct)
+{
+  atk_tables_t t;
+  char        *e_user = NULL;
+  char        *e_nick = NULL;
+  char         sql[1280];
+  bool         ok = FAIL;
+
+  if(round_id <= 0 || username == NULL || atk_tables_resolve(&t) != SUCCESS)
+    return(FAIL);
+
+  e_user = db_escape(username);
+  e_nick = db_escape(nickname != NULL ? nickname : "");
+
+  if(e_user == NULL || e_nick == NULL)
+    goto out;
+
+  snprintf(sql, sizeof(sql),
+      "BEGIN;"
+
+      "UPDATE %s SET nickname = '%s', defers = defers + 1,"
+      " bonus_pct = %" PRIu32 ", last_wave = %d"
+      " WHERE round_id = %" PRId64 " AND username = '%s';"
+
+      // The round's clock moves — a pit whose combatants are all
+      // hesitating is still a pit in progress — but `blows` does not.
+      "UPDATE %s SET last_action = NOW() WHERE id = %" PRId64 ";"
+
+      // The same clause every other turn type carries.
+      "UPDATE %s r SET wave = r.wave + 1 WHERE r.id = %" PRId64
+      " AND NOT EXISTS (SELECT 1 FROM %s p WHERE p.round_id = r.id"
+      " AND p.hp > 0 AND p.last_wave < r.wave);"
+
+      "COMMIT;",
+
+      t.players, e_nick, bonus_pct, wave, round_id, e_user,
+      t.rounds, round_id,
+      t.rounds, round_id, t.players);
+
+  ok = atk_exec(sql, "defer apply", NULL);
 
 out:
   if(e_user != NULL) mem_free(e_user);

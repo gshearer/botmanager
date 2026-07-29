@@ -167,6 +167,7 @@ atk_cmd_attack(const cmd_ctx_t *ctx)
   char            roster[ATK_ROSTER_SZ];
   int32_t         dmg;
   int32_t         new_hp;
+  uint32_t        bonus;              // deferral bonus this turn spends
   bool            spoken;             // the sheet answered; else neutral
   bool            dot   = false;      // this turn is an affliction
   bool            crit  = false;
@@ -333,6 +334,22 @@ atk_cmd_attack(const cmd_ctx_t *ctx)
   tier = atk_severity(&t, dmg);
   crit = (tier == ATK_FLAV_CRITICAL);
 
+  // A deferral bonus is spent HERE — after the tier, never before it. It
+  // scales the NUMBER and never the sentence: bonusing the roll first
+  // would push a deferred combatant into `critical` words more often than
+  // everybody else, which is exactly the fairness leak the charter exists
+  // to close. The badge on the line is what explains the gap between the
+  // words and the number.
+  bonus = (uint32_t)((src.bonus_pct > 0) ? src.bonus_pct : 0);
+
+  if(bonus > 0)
+  {
+    dmg = (int32_t)(((int64_t)dmg * (100 + bonus)) / 100);
+
+    if(dmg < 1)
+      dmg = 1;
+  }
+
   // The stem stored at enrolment, unless the sheet has left the registry
   // since — a reload between one turn and the next must never cost
   // somebody their swing.
@@ -463,13 +480,15 @@ atk_cmd_attack(const cmd_ctx_t *ctx)
 
   // A critical that kills gets the trout instead of the tier line — it is
   // the line that carries the number, and the sheet's own words stand
-  // aside for the one joke no class may override.
+  // aside for the one joke no class may override. It carries no deferral
+  // badge for the same reason it carries no health tally: the fight is
+  // over, and nothing about the blow needs explaining any more.
   if(crit && fatal)
     atk_render_trout(line, sizeof(line), src_nick, nick, dmg);
 
   else
     atk_render_blow(line, sizeof(line), src_nick, nick, tier,
-        spoken ? &move : NULL, dmg, 0, new_hp, tgt.hp_max);
+        spoken ? &move : NULL, dmg, bonus, new_hp, tgt.hp_max);
 
   cmd_reply(ctx, line);
 
@@ -550,6 +569,7 @@ atk_cmd_heal(const cmd_ctx_t *ctx)
   char           roster[ATK_ROSTER_SZ];
   int32_t        amt;
   int32_t        delta;
+  uint32_t       bonus;
   bool           major;
   bool           spoken;
 
@@ -709,6 +729,20 @@ atk_cmd_heal(const cmd_ctx_t *ctx)
                                         : t.heal_minor_max - t.heal_minor_min)
                                  + 1));
 
+  // A deferral pays a healer exactly as it pays a striker, and for the
+  // same reason it lands after the band and not before it: the band chose
+  // the words, and a bonus may never reach them. It is applied to the
+  // ROLL, so the overheal clamp below still has the last word.
+  bonus = (uint32_t)((src.bonus_pct > 0) ? src.bonus_pct : 0);
+
+  if(bonus > 0)
+  {
+    amt = (int32_t)(((int64_t)amt * (100 + bonus)) / 100);
+
+    if(amt < 1)
+      amt = 1;
+  }
+
   // What the health bar will actually move. The roll is what SQL adds
   // before its own clamp; THIS is what the tallies take and what the room
   // is told, because a line saying 18 over a bar that moved 4 is a lie
@@ -750,13 +784,149 @@ atk_cmd_heal(const cmd_ctx_t *ctx)
   // Announced under the lock, so two turns cannot interleave their
   // narration.
   atk_render_heal(line, sizeof(line), src_nick, nick,
-      spoken ? &move : NULL, delta, 0, tgt.hp + delta, tgt.hp_max);
+      spoken ? &move : NULL, delta, bonus, tgt.hp + delta, tgt.hp_max);
   cmd_reply(ctx, line);
 
   pthread_mutex_unlock(&atk_turn_lock);
 
   clam(CLAM_INFO, ATK_CTX, "round %" PRId64 ": %s mended %s for %d",
       round.id, ctx->username, tgt_user, delta);
+}
+
+// ------------------------------------------------------------------ //
+// defer                                                               //
+// ------------------------------------------------------------------ //
+
+// Trading a turn for a heavier one. It costs the wave exactly as a blow
+// and a mend do, which is what keeps it a gamble rather than a gift: the
+// pit may end while the bonus is still waiting on a swing that never
+// comes, and a deferred combatant has dealt nothing at all in the
+// meantime.
+//
+// The bonus is ADDITIVE and hard-capped. It was multiplicative once, and
+// the operator ruled that out as abusable: three multiplied steps reach a
+// one-shot, three added ones reach at most double damage.
+static void
+atk_cmd_defer(const cmd_ctx_t *ctx)
+{
+  atk_tunables_t t;
+  atk_round_t    round;
+  atk_player_t   src;
+  userns_t      *ns;
+  const char    *src_nick;
+  char           line  [ATK_LINE_SZ];
+  char           roster[ATK_ROSTER_SZ];
+  uint32_t       step;
+  uint32_t       next;
+
+  ns = userns_session_resolve(ctx);
+
+  if(ns == NULL)          // the resolver already replied
+    return;
+
+  if(ctx->username == NULL || ctx->username[0] == '\0')
+  {
+    clam(CLAM_WARN, ATK_CTX, "defer reached the pit unauthenticated");
+    return;
+  }
+
+  atk_tunables_load(&t);
+
+  src_nick = (ctx->msg->nickname[0] != '\0')
+      ? ctx->msg->nickname : ctx->username;
+
+  pthread_mutex_lock(&atk_turn_lock);
+
+  // A deferral CONTINUES a fight and may never begin one, exactly as
+  // mending may not: there is no turn to surrender before there is a
+  // round to surrender it in, and a round past its one clock reads as no
+  // round at all. The stale row is left for the next `!attack`, which is
+  // the only verb allowed to retire and reopen in one step.
+  if(!atk_db_round_find(ns->id, method_inst_name(ctx->msg->inst),
+        ctx->msg->channel, &round) ||
+     round.age > (int64_t)t.round_max_secs)
+  {
+    pthread_mutex_unlock(&atk_turn_lock);
+    cmd_reply(ctx, "⏳ Nothing is happening here. Start something with "
+                   "!attack <nick>.");
+    return;
+  }
+
+  if(!atk_db_player_get(round.id, ctx->username, &src))
+  {
+    pthread_mutex_unlock(&atk_turn_lock);
+    cmd_reply(ctx, "⏳ You are not in this fight. Join it the usual way.");
+    return;
+  }
+
+  if(src.hp <= 0)
+  {
+    pthread_mutex_unlock(&atk_turn_lock);
+    cmd_reply(ctx, "☠ You are past hesitating. You are past everything.");
+    return;
+  }
+
+  // The wave gate, identical to a blow's and a mend's: a deferral is a
+  // turn, and a turn is a turn.
+  if(src.last_wave >= round.wave)
+  {
+    if(atk_db_pending(round.id, round.wave, roster, sizeof(roster)) ==
+           SUCCESS && roster[0] != '\0')
+      snprintf(line, sizeof(line),
+          "⏳ You have spent your turn this wave. Still standing idle: "
+          CLR_CYAN "%s" CLR_RESET ".", roster);
+
+    else
+      snprintf(line, sizeof(line), "⏳ You have spent your turn this wave.");
+
+    pthread_mutex_unlock(&atk_turn_lock);
+    cmd_reply(ctx, line);
+    return;
+  }
+
+  // Nothing is spent by a refusal. `defer.max` at 0 is the off switch and
+  // says so in the same breath, because a silent refusal reads as a bug.
+  if(t.defer_max == 0)
+  {
+    pthread_mutex_unlock(&atk_turn_lock);
+    cmd_reply(ctx, "⏳ There is no hesitating in this pit. Swing.");
+    return;
+  }
+
+  if((uint32_t)src.defers >= t.defer_max)
+  {
+    pthread_mutex_unlock(&atk_turn_lock);
+    cmd_reply(ctx, "⏳ You have hesitated enough. Swing.");
+    return;
+  }
+
+  // atk_tunables_load() has already lifted the ceiling to at least the
+  // floor, so the width can never be computed from an inverted band.
+  step = t.defer_step_lo +
+      (uint32_t)util_rand((int)(t.defer_step_hi - t.defer_step_lo) + 1);
+
+  next = (uint32_t)src.bonus_pct + step;
+
+  if(next > t.defer_cap_pct)
+    next = t.defer_cap_pct;
+
+  if(atk_db_defer_apply(round.id, ctx->username, src_nick, round.wave,
+        next) != SUCCESS)
+  {
+    pthread_mutex_unlock(&atk_turn_lock);
+    cmd_reply(ctx, "☠ The turn went nowhere — the pit's ledger refused it.");
+    return;
+  }
+
+  // Announced under the lock, so two turns cannot interleave their
+  // narration.
+  atk_render_defer(line, sizeof(line), src_nick, next);
+  cmd_reply(ctx, line);
+
+  pthread_mutex_unlock(&atk_turn_lock);
+
+  clam(CLAM_INFO, ATK_CTX, "round %" PRId64 ": %s deferred (%" PRIu32
+      "%% pending)", round.id, ctx->username, next);
 }
 
 // ------------------------------------------------------------------ //
@@ -874,6 +1044,27 @@ atk_commands_register(void)
         NULL, NULL) != SUCCESS)
     return(FAIL);
 
+  // A ROOT for the same reason `heal` is one: frequent, player-facing,
+  // and it must never make a combatant nicknamed `defer` unattackable.
+  if(cmd_register("attack", "defer",
+        "defer",
+        "Give up your turn for a heavier next one.",
+        "Surrendering a turn buys a bonus on your next attack or heal. "
+        "The bonus is rolled by the pit — `plugin.attack.defer.step_min_pct` "
+        "to `step_max_pct` — and deferrals ADD, so hesitating twice is "
+        "worth roughly twice as much; `plugin.attack.defer.bonus_cap_pct` "
+        "is the hard ceiling and defaults to at most double damage. You "
+        "may defer `plugin.attack.defer.max` times per round. It costs "
+        "your turn for the wave exactly as swinging does, and the bonus "
+        "scales the number only: the words you speak still come from the "
+        "band your roll landed in, and the ⚡ badge on the line is what "
+        "explains the difference. A bonus dies with its round if you never "
+        "get to spend it.",
+        USERNS_GROUP_USER, 0, CMD_SCOPE_PUBLIC, METHOD_T_ANY,
+        atk_cmd_defer, NULL, NULL, NULL,
+        NULL, 0, NULL, NULL) != SUCCESS)
+    return(FAIL);
+
   // The read-only views hang off the core `show` parent, not off this
   // command; attack_show.c owns them.
   if(atk_show_register() != SUCCESS)
@@ -882,9 +1073,10 @@ atk_commands_register(void)
   return(SUCCESS);
 }
 
-// Three paths cover every definition this plugin owns: the `attack` root
-// with its `reload` child, the `heal` root, and the `show attack` card
-// with its two children. Each unregisters depth-first, so no parent is
+// Four paths cover every definition this plugin owns: the `attack` root
+// with its `reload` child, the `heal` and `defer` roots, and the
+// `show attack` card with its two children. Each unregisters
+// depth-first, so no parent is
 // left holding a freed child. Core would reclaim these anyway — saying so
 // ourselves is what keeps the unload audit reading `deinit() complete`
 // instead of naming us as the plugin that had to be tidied up after.
@@ -896,5 +1088,6 @@ atk_commands_unregister(void)
 {
   cmd_unregister_path("attack");
   cmd_unregister_path("heal");
+  cmd_unregister_path("defer");
   cmd_unregister_path("show/attack");
 }

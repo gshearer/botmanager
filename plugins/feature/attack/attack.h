@@ -248,6 +248,11 @@ typedef struct
 // One combatant's standing within a round. `class` is the sheet stem
 // they were dealt at enrolment and keep for the whole brawl; it decides
 // which words they speak and nothing whatsoever about the numbers.
+// `bonus_pct` is the ONLY number a combatant carries between turns, and
+// it is spent — reset to zero — inside the same transaction as the turn
+// that uses it. It scales the number a turn deals and never the tier the
+// words come from, so a deferred combatant hits harder without ever
+// speaking above their roll.
 typedef struct
 {
   char    nickname[ATK_NICK_SZ];
@@ -255,6 +260,8 @@ typedef struct
   int32_t hp;
   int32_t hp_max;
   int32_t last_wave;
+  int32_t defers;      // deferrals spent this round
+  int32_t bonus_pct;   // additive bonus pending for the next turn
 } atk_player_t;
 
 // One resolved turn, ready to be written. The `*_user` names are
@@ -329,6 +336,7 @@ typedef struct
   int32_t heal_given;
   int32_t best_crit;
   int32_t last_wave;
+  int32_t bonus_pct;   // pending deferral bonus; drawn in the ragged tail
 } atk_card_row_t;
 
 // One combatant's row on the lifetime leaderboard.
@@ -637,11 +645,21 @@ bool atk_db_heal_apply(const atk_heal_t *heal);
 
 // Spend a turn that deals no instant damage — a damage-over-time turn.
 // The attacker still burns their swing and still bumps `blows`, and the
-// wave still turns behind them; nobody's health moves. Deliberately not
+// wave still turns behind them, and any deferral bonus is consumed here
+// too — the affliction spends the bonused roll one tick at a time, so
+// leaving it standing would let one deferral pay twice. Deliberately not
 // atk_db_blow_apply() with dmg = 0: a zero-damage blow reads ambiguously
 // in the ledger and in the code, and this is not the place to be clever.
 bool atk_db_turn_spend(int64_t round_id, uint32_t ns_id,
     const char *username, const char *nickname, int32_t wave);
+
+// Surrender a turn for a bonus on the next one. One transaction: the
+// deferral is counted, the accumulated bonus is written, and the wave is
+// SPENT — a deferral that could not turn the wave would stall the whole
+// pit behind one hesitant combatant. `bonus_pct` is the already-capped
+// total the caller computed under the turn lock, never the step.
+bool atk_db_defer_apply(int64_t round_id, const char *username,
+    const char *nickname, int32_t wave, uint32_t bonus_pct);
 
 // Leave an affliction on a combatant. The stack cap is enforced inside
 // the statement, so at the cap this lands no row and returns FAIL — the
@@ -756,6 +774,12 @@ void atk_render_heal(char *out, size_t cap, const char *src_nick,
 // `move` NULL falls back to the engine's neutral death line.
 void atk_render_death(char *out, size_t cap, const char *slayer_nick,
     const char *fallen_nick, const atk_move_t *move);
+
+// The deferral. Class-agnostic by design: stepping back is the engine's
+// own mechanic, not a move, so no sheet supplies words for it and none
+// may — the line names the bonus the surrender bought and nothing else.
+void atk_render_defer(char *out, size_t cap, const char *nick,
+    uint32_t bonus_pct);
 
 // The trout: a critical blow that kills speaks one fixed sentence in
 // place of the tier line. A static easter egg, and the one piece of

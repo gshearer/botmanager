@@ -463,6 +463,16 @@ atk_card_row(const cmd_ctx_t *ctx, const atk_card_row_t *row,
   atk_card_marks(cell, sizeof(cell), row, marks, n_marks);
   atk_cat(line, sizeof(line), cell);
 
+  // The pending deferral bonus rides in the same ragged tail, and for the
+  // same reason: it is true of a minority of rows and a column of blanks
+  // would cost every reader six characters of width to say nothing.
+  if(row->bonus_pct > 0)
+  {
+    snprintf(cell, sizeof(cell),
+        " " CLR_BOLD CLR_YELLOW "⚡+%d%%" CLR_RESET, row->bonus_pct);
+    atk_cat(line, sizeof(line), cell);
+  }
+
   cmd_reply(ctx, line);
 }
 

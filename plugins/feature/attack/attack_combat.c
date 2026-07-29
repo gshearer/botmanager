@@ -11,8 +11,11 @@
 // that used to live here went out with ATK-5, and the engine now names
 // no setting anywhere at all.
 //
-// The one exception, and it is deliberate: the trout. It is IRC culture
-// rather than a setting, and it predates every theme this plugin has had.
+// Two exceptions, and both are deliberate. The trout: IRC culture rather
+// than a setting, and it predates every theme this plugin has had. And
+// the deferral line: stepping back is a mechanic of the engine and not a
+// move, so no sheet has a section for it — the words are as plain and as
+// setting-free as the rule they describe.
 
 #define ATTACK_INTERNAL
 #include "attack.h"
@@ -302,6 +305,41 @@ atk_render_heal(char *out, size_t cap, const char *src_nick,
   // A heal always leaves somebody standing, so the tally always rides.
   snprintf(out, cap, "✚ %s%s " CLR_GRAY "[%s — %d/%d hp]" CLR_RESET,
       body, badge, tgt_nick, hp, hp_max);
+}
+
+// A surrendered turn. Four variants so a pit full of hesitation does not
+// read like a stuck record, each naming the bonus the surrender bought —
+// the number is the whole point of the move, and a line that withheld it
+// would leave a reader wondering what they had just paid a turn for.
+//
+// Deliberately class-agnostic: every other line in the pit is a sheet's,
+// and this one cannot be, because a deferral is a rule rather than an
+// action. The accumulated total is spoken, never the step, because the
+// total is what the next blow will actually be multiplied by.
+static const char *const atk_defer_line[] = {
+  "%s steps back and lets the wave pass. %s waits on their next move.",
+  "%s holds their turn, watching for the opening. %s is coiled behind it.",
+  "%s gives up the swing and takes the patience instead — %s.",
+  "%s waits. Whatever lands next lands harder: %s."
+};
+
+void
+atk_render_defer(char *out, size_t cap, const char *nick, uint32_t bonus_pct)
+{
+  const int n = (int)(sizeof(atk_defer_line) / sizeof(atk_defer_line[0]));
+  char      who  [ATK_NICK_SZ + 8];
+  char      badge[32];
+  char      body [ATK_LINE_SZ];
+
+  if(out == NULL || cap == 0)
+    return;
+
+  snprintf(who, sizeof(who), CLR_CYAN "%s" CLR_RESET, nick);
+  snprintf(badge, sizeof(badge),
+      CLR_BOLD CLR_YELLOW "⚡+%" PRIu32 "%%" CLR_RESET, bonus_pct);
+  snprintf(body, sizeof(body), atk_defer_line[util_rand(n)], who, badge);
+
+  snprintf(out, cap, "⏳ %s", body);
 }
 
 // The oldest joke on IRC, kept for the one blow that earns it: a
