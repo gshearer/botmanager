@@ -76,9 +76,13 @@ atk_dot_speak(const atk_dot_due_t *d, const atk_tunables_t *t,
     }
   }
 
+  // The log names the affliction as the sheet that inflicted it named it,
+  // falling back to the engine's plain word for a row that carries none.
   clam(CLAM_INFO, ATK_CTX,
       "round %" PRId64 ": %s slew %s by %s (eject=%d)", d->round_id,
-      d->source, d->victim, atk_fallback_noun(d->kind), (int)force);
+      d->source, d->victim,
+      (d->noun[0] != '\0') ? d->noun : atk_fallback_noun(d->kind),
+      (int)force);
 }
 
 // The lock is the turn lock, not a lock of this file's own: a tick
@@ -90,6 +94,8 @@ atk_dot_service(const atk_dot_due_t *d, const atk_tunables_t *t)
 {
   atk_player_t  victim;
   atk_dot_hit_t hit;
+  atk_move_t    move;
+  bool          spoken;
   char          line[ATK_LINE_SZ];
   int32_t       left;
   int32_t       ticks;
@@ -144,13 +150,23 @@ atk_dot_service(const atk_dot_due_t *d, const atk_tunables_t *t)
     return;
   }
 
+  // An affliction ticks in the voice of whoever left it: the source's
+  // sheet first, keyed by the wound's own kind, and the engine's neutral
+  // line only when that class covers this kind or exists no longer. Never
+  // another tier and never another kind — the words must describe the
+  // wound the victim is actually carrying.
+  spoken = (atk_class_move(d->class,
+      fatal ? ATK_SEC_DECAY_KILL : ATK_SEC_DECAY, 0, d->kind, &move)
+          == SUCCESS);
+
   if(fatal)
     atk_render_dot_death(line, sizeof(line), d->source_nick,
-        d->victim_nick, d->kind);
+        d->victim_nick, d->kind, d->noun, spoken ? &move : NULL);
 
   else
     atk_render_dot_tick(line, sizeof(line), d->source_nick, d->victim_nick,
-        dmg, new_hp, victim.hp_max, d->kind);
+        dmg, new_hp, victim.hp_max, d->kind, d->noun,
+        spoken ? &move : NULL);
 
   pthread_mutex_unlock(&atk_turn_lock);
 

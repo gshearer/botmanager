@@ -25,12 +25,16 @@
 // header included, so a width only ever has to change in one place.
 
 #define ATK_W_NAME    13   // combatant, left-aligned
+// The character sheet a combatant was dealt. Shared with the class
+// roster below so the two views can never disagree about how wide a
+// class name is.
+#define ATK_W_CLASS   12
 #define ATK_W_BAR     15   // the health bar, one cell per glyph
 #define ATK_W_HP       9   // "74/100"
 #define ATK_W_NUM      7   // dealt, taken
 #define ATK_W_CRIT     6
-#define ATK_W_CARD    (2 + ATK_W_NAME + ATK_W_BAR + 1 + ATK_W_HP \
-                         + 2 * ATK_W_NUM + ATK_W_CRIT)
+#define ATK_W_CARD    (2 + ATK_W_NAME + ATK_W_CLASS + ATK_W_BAR + 1 \
+                         + ATK_W_HP + 2 * ATK_W_NUM + ATK_W_CRIT)
 
 #define ATK_W_RANK     3
 #define ATK_W_ROUNDS   7
@@ -296,6 +300,10 @@ atk_card_header(const cmd_ctx_t *ctx)
   atk_padr(cell, sizeof(cell), ATK_W_NAME);
   atk_cat(line, sizeof(line), cell);
 
+  snprintf(cell, sizeof(cell), "class");
+  atk_padr(cell, sizeof(cell), ATK_W_CLASS);
+  atk_cat(line, sizeof(line), cell);
+
   snprintf(cell, sizeof(cell), "health");
   atk_padr(cell, sizeof(cell), ATK_W_BAR + 1);
   atk_cat(line, sizeof(line), cell);
@@ -359,6 +367,7 @@ atk_card_row(const cmd_ctx_t *ctx, const atk_card_row_t *row,
 {
   const bool alive = (row->hp > 0);
   char       name[ATK_NAME_SZ];
+  char       type[ATK_CLASS_NAME_SZ];
   char       num [32];
   char       max [32];
   char       cell[ATK_CELL_SZ];
@@ -373,6 +382,15 @@ atk_card_row(const cmd_ctx_t *ctx, const atk_card_row_t *row,
   snprintf(cell, sizeof(cell), "%s%s" CLR_RESET,
       alive ? CLR_CYAN : CLR_GRAY, name);
   atk_padr(cell, sizeof(cell), ATK_W_NAME);
+  atk_cat(line, sizeof(line), cell);
+
+  // The sheet they were dealt — a label, and never a number. A row
+  // written before classes existed simply has none to show.
+  atk_fit(row->class, ATK_W_CLASS - 1, type, sizeof(type));
+  snprintf(cell, sizeof(cell), "%s%s" CLR_RESET,
+      alive ? CLR_PURPLE : CLR_GRAY,
+      (type[0] != '\0') ? type : "—");
+  atk_padr(cell, sizeof(cell), ATK_W_CLASS);
   atk_cat(line, sizeof(line), cell);
 
   atk_hp_bar(cell, sizeof(cell), row->hp, row->hp_max);
@@ -748,7 +766,6 @@ atk_flav_bands(const cmd_ctx_t *ctx, const atk_tunables_t *t)
 // show attack classes — the roster of sheets                          //
 // ------------------------------------------------------------------ //
 
-#define ATK_W_CLASS   12
 #define ATK_W_MOVES    8
 #define ATK_W_DECAY    7
 #define ATK_W_HEAL     6

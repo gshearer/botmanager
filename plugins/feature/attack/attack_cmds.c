@@ -152,19 +152,24 @@ atk_cmd_attack(const cmd_ctx_t *ctx)
   atk_player_t    src;
   atk_player_t    tgt;
   atk_blow_t      blow;
+  atk_move_t      move;
+  atk_flavour_t   tier;
   userns_t       *ns;
   const char     *nick;
   const char     *method;
   const char     *channel;
   const char     *src_nick;
   char            tgt_user[ATK_USER_SZ];
+  char            src_class[ATK_CLASS_NAME_SZ];
+  char            tgt_class[ATK_CLASS_NAME_SZ];
   char            line[ATK_LINE_SZ];
   char            roster[ATK_ROSTER_SZ];
   int32_t         dmg;
   int32_t         new_hp;
-  bool            crit      = false;
-  bool            fatal     = false;
-  bool            afflicted = false;   // a DOT landed; wake the decay
+  bool            spoken;             // the sheet answered; else neutral
+  bool            dot   = false;      // this turn is an affliction
+  bool            crit  = false;
+  bool            fatal = false;
 
   ns = userns_session_resolve(ctx);
 
@@ -260,11 +265,20 @@ atk_cmd_attack(const cmd_ctx_t *ctx)
   }
 
   // ---- 6. enrolment ------------------------------------------------ //
+  //
+  // Each combatant is dealt a class here and keeps it for the whole
+  // brawl. The two draws are INDEPENDENT and duplicates are allowed: the
+  // brief says random, and under the charter a duplicate costs nobody
+  // anything, because two sheets of the same name roll exactly the same
+  // numbers as two of different ones.
+
+  atk_class_pick(src_class, sizeof(src_class));
+  atk_class_pick(tgt_class, sizeof(tgt_class));
 
   atk_db_player_enrol(round.id, ns->id, ctx->username, src_nick,
-      (int32_t)t.start_hp);
+      src_class, (int32_t)t.start_hp);
   atk_db_player_enrol(round.id, ns->id, tgt_user, nick,
-      (int32_t)t.start_hp);
+      tgt_class, (int32_t)t.start_hp);
 
   if(!atk_db_player_get(round.id, ctx->username, &src) ||
      !atk_db_player_get(round.id, tgt_user, &tgt))
@@ -300,14 +314,125 @@ atk_cmd_attack(const cmd_ctx_t *ctx)
     return;
   }
 
-  // ---- 8-9. roll and write ----------------------------------------- //
+  // ---- 8. the roll, and only then the words ------------------------- //
+  //
+  // THE LAW, in the order it must run (attack_class.c's charter):
+  //
+  //   1. the ENGINE rolls the number — uniform over 1..dmg_max, and
+  //      identical for everybody standing in the pit;
+  //   2. the ENGINE derives the tier from that number;
+  //   3. only THEN does the class matter, and only to choose which of
+  //      its sentences of that size gets spoken.
+  //
+  // Reordering these reintroduces exactly the unfairness the charter
+  // exists to prevent: a class would then decide how hard it hits rather
+  // than only how it sounds. A sheet with forty critical lines and a
+  // sheet with one hit precisely as hard as each other.
+  dmg  = atk_roll(&t);
+  tier = atk_severity(&t, dmg);
+  crit = (tier == ATK_FLAV_CRITICAL);
 
-  // The number first, the tier from the number, and only then the words.
-  // A critical hit is no longer an independent roll — it is simply a blow
-  // that landed in the top band — so the standings and the sentence can
-  // never again describe different events.
-  dmg    = atk_roll(&t);
-  crit   = (atk_severity(&t, dmg) == ATK_FLAV_CRITICAL);
+  // The stem stored at enrolment, unless the sheet has left the registry
+  // since — a reload between one turn and the next must never cost
+  // somebody their swing.
+  atk_class_for(src.class, src_class, sizeof(src_class));
+
+  // Whether the turn is an affliction is the ENGINE's roll too. A class
+  // with forty affliction moves inflicts no more often than one with
+  // three; it merely repeats itself less. No health check is needed here
+  // and none belongs here: a DOT turn lands no instant damage, so it can
+  // never be the blow that closes the round, and the kill it may
+  // eventually land arrives through the decay task with the round still
+  // open around it.
+  dot = (t.dot_chance_pct > 0 &&
+         atk_class_has(src_class, ATK_SEC_DOT) &&
+         util_rand(100) < (int)t.dot_chance_pct);
+
+  spoken = (atk_class_move(src_class, dot ? ATK_SEC_DOT : ATK_SEC_DAMAGE,
+        tier, 0, &move) == SUCCESS);
+
+  if(!spoken)
+  {
+    // Unreachable by the loader's coverage gate, and handled anyway: the
+    // engine's neutral line stands in rather than the pit falling silent
+    // mid-turn.
+    memset(&move, 0, sizeof(move));
+    clam(CLAM_WARN, ATK_CTX, "class '%s' had no move for tier %d",
+        src_class, (int)tier);
+  }
+
+  // ---- 8a. the affliction turn -------------------------------------- //
+  //
+  // A DOT turn deals no instant damage. It spends the SAME roll, paid out
+  // one tick at a time, so an affliction and an instant blow of the same
+  // number cost the victim exactly the same in the end — which is what
+  // makes owning affliction moves a difference in rhythm and never in
+  // strength.
+
+  if(dot)
+  {
+    const uint32_t ticks =
+        ((uint32_t)dmg < t.dot_max_ticks) ? (uint32_t)dmg : t.dot_max_ticks;
+
+    atk_dot_new_t wound = {
+      .round_id    = round.id,
+      .ns_id       = ns->id,
+      .method      = method,
+      .channel     = channel,
+      .victim      = tgt_user,
+      .victim_nick = nick,
+      .source      = ctx->username,
+      .source_nick = src_nick,
+      .noun        = (move.noun[0] != '\0')
+                         ? move.noun : atk_fallback_noun(move.kind),
+      .kind        = move.kind,
+      .dmg_plan    = dmg,
+      .max_ticks   = ticks,
+      .tick_secs   = t.dot_tick_secs,
+      .stack_max   = t.dot_stack_max,
+    };
+
+    bool landed;
+
+    if(atk_db_turn_spend(round.id, ns->id, ctx->username, src_nick,
+          round.wave) != SUCCESS)
+    {
+      pthread_mutex_unlock(&atk_turn_lock);
+      cmd_reply(ctx, "☠ The turn landed nowhere — the pit's ledger "
+                     "refused it.");
+      return;
+    }
+
+    // At the stack cap the insert lands no row and says so by returning
+    // FAIL. The turn is still spent: a wasted affliction against an
+    // already-afflicted victim costs the same as any other wasted turn,
+    // and refunding it would hand affliction classes a free retry.
+    landed = (atk_db_dot_inflict(&wound) == SUCCESS);
+
+    if(landed)
+    {
+      atk_render_dot_inflict(line, sizeof(line), src_nick, nick,
+          wound.kind, wound.noun, spoken ? &move : NULL);
+      cmd_reply(ctx, line);
+    }
+
+    else
+      clam(CLAM_DEBUG, ATK_CTX,
+          "round %" PRId64 ": no affliction landed on %s", round.id,
+          tgt_user);
+
+    pthread_mutex_unlock(&atk_turn_lock);
+
+    // Last, and with no lock held: the task system is deliberately kept
+    // off the turn path entirely.
+    if(landed)
+      atk_dot_wake();
+
+    return;
+  }
+
+  // ---- 9. the instant blow ------------------------------------------ //
+
   new_hp = (tgt.hp > dmg) ? tgt.hp - dmg : 0;
   fatal  = (new_hp == 0);
 
@@ -335,70 +460,28 @@ atk_cmd_attack(const cmd_ctx_t *ctx)
   // ---- 10. announce, still under the lock so two turns cannot ------- //
   //          interleave their narration                               //
 
-  // A critical that kills gets the trout instead of the tier line.
+  // A critical that kills gets the trout instead of the tier line — it is
+  // the line that carries the number, and the sheet's own words stand
+  // aside for the one joke no class may override.
   if(crit && fatal)
     atk_render_trout(line, sizeof(line), src_nick, nick, dmg);
 
   else
-    atk_render_blow(line, sizeof(line), src_nick, nick, dmg,
-        new_hp, tgt.hp_max, &t);
+    atk_render_blow(line, sizeof(line), src_nick, nick, tier,
+        spoken ? &move : NULL, dmg, 0, new_hp, tgt.hp_max);
 
   cmd_reply(ctx, line);
 
+  // The killing blow speaks in the slayer's own voice where their sheet
+  // has one, and in the engine's plain words where it does not.
   if(fatal)
   {
-    atk_render_death(line, sizeof(line), src_nick, nick);
+    atk_move_t last;
+    const bool own = (atk_class_move(src_class, ATK_SEC_DEATH, 0, 0, &last)
+        == SUCCESS);
+
+    atk_render_death(line, sizeof(line), src_nick, nick, own ? &last : NULL);
     cmd_reply(ctx, line);
-  }
-
-  // ---- the affliction ----------------------------------------------- //
-  // Still under the lock: it mutates round state, and the inflict line
-  // must not interleave with another turn's narration. Never on a fatal
-  // blow — the round ends in the same transaction as the kill, and a DOT
-  // on a corpse would have to be reaped one tick later, speaking into a
-  // round that is already over.
-
-  if(t.dot_chance_pct > 0 && !fatal &&
-     util_rand(100) < (int)t.dot_chance_pct)
-  {
-    // Still the old blow-leaves-a-wound path; ATK-5 replaces it with a
-    // DOT *turn* that deals no instant damage. What is already final is
-    // the schedule: the affliction is minted with a whole damage plan
-    // and a tick count, and it can never speak more than dot.max_ticks
-    // times — a 1-damage affliction speaks exactly once.
-    const atk_dot_kind_t kind = (atk_dot_kind_t)util_rand(ATK_DOT__COUNT);
-    const uint32_t       ticks =
-        ((uint32_t)dmg < t.dot_max_ticks) ? (uint32_t)dmg : t.dot_max_ticks;
-
-    atk_dot_new_t dot = {
-      .round_id    = round.id,
-      .ns_id       = ns->id,
-      .method      = method,
-      .channel     = channel,
-      .victim      = tgt_user,
-      .victim_nick = nick,
-      .source      = ctx->username,
-      .source_nick = src_nick,
-      .noun        = atk_fallback_noun(kind),
-      .kind        = kind,
-      .dmg_plan    = dmg,
-      .max_ticks   = ticks,
-      .tick_secs   = t.dot_tick_secs,
-      .stack_max   = t.dot_stack_max,
-    };
-
-    // Fails soft, and silently at the stack cap: an affliction is
-    // cosmetic and may never cost a blow.
-    if(atk_db_dot_inflict(&dot) == SUCCESS)
-    {
-      atk_render_dot_inflict(line, sizeof(line), src_nick, nick, dot.kind);
-      cmd_reply(ctx, line);
-      afflicted = true;
-    }
-
-    else
-      clam(CLAM_DEBUG, ATK_CTX,
-          "round %" PRId64 ": no affliction landed on %s", round.id, tgt_user);
   }
 
   pthread_mutex_unlock(&atk_turn_lock);
@@ -426,13 +509,6 @@ atk_cmd_attack(const cmd_ctx_t *ctx)
     clam(CLAM_INFO, ATK_CTX, "round %" PRId64 ": %s slew %s (eject=%d)",
         round.id, ctx->username, tgt_user, (int)force);
   }
-
-  // ---- the decay -------------------------------------------------- //
-  // Last, with no lock held and the turn already over: the task system is
-  // deliberately kept off the turn path entirely.
-
-  if(afflicted)
-    atk_dot_wake();
 }
 
 // ------------------------------------------------------------------ //

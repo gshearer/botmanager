@@ -83,6 +83,11 @@
 #define ATK_CHAN_SZ        METHOD_CHANNEL_SZ  // 128
 #define ATK_METHOD_SZ      64                 // method instance name
 #define ATK_MAX_PLAYERS    32                 // per round, for the show card
+// A character sheet's stem, and the `class` column that stores it. It
+// lives up here with the other storage bounds rather than down in the
+// character-sheet block because a combatant's class is part of their
+// round row, and atk_player_t needs the size.
+#define ATK_CLASS_NAME_SZ  32
 // The ceiling atk_tunables_load() clamps scoreboard_rows to. The
 // leaderboard's row array is sized from this, so the two must agree.
 #define ATK_MAX_SCORE_ROWS 50
@@ -240,10 +245,13 @@ typedef struct
   int64_t age;
 } atk_round_t;
 
-// One combatant's standing within a round.
+// One combatant's standing within a round. `class` is the sheet stem
+// they were dealt at enrolment and keep for the whole brawl; it decides
+// which words they speak and nothing whatsoever about the numbers.
 typedef struct
 {
   char    nickname[ATK_NICK_SZ];
+  char    class[ATK_CLASS_NAME_SZ];
   int32_t hp;
   int32_t hp_max;
   int32_t last_wave;
@@ -295,6 +303,7 @@ typedef struct
 {
   char    name[ATK_NICK_SZ];
   char    user[ATK_USER_SZ];
+  char    class[ATK_CLASS_NAME_SZ];
   int32_t hp;
   int32_t hp_max;
   int32_t dmg_given;
@@ -350,6 +359,10 @@ typedef struct
   char           victim_nick[ATK_NICK_SZ];
   char           source [ATK_USER_SZ];
   char           source_nick[ATK_NICK_SZ];
+  // The class the source was dealt, joined off their round row: an
+  // affliction ticks in the voice of whoever left it. Empty when that
+  // combatant's row is gone, and the neutral lines answer instead.
+  char           class[ATK_CLASS_NAME_SZ];
   char           noun[ATK_NOUN_SZ];  // what {affliction} expands to
   atk_dot_kind_t kind;
   int32_t        dmg_plan;  // the whole damage this affliction will deal
@@ -403,7 +416,8 @@ typedef struct
 // that sentence is allowed to describe. Everything below exists to keep
 // that true — see attack_class.c's preamble for the whole argument.
 
-#define ATK_CLASS_NAME_SZ  32          // sheet stem, and the `class` column
+// ATK_CLASS_NAME_SZ is up with the storage bounds: a combatant's class is
+// part of their round row, so atk_player_t needs it long before here.
 #define ATK_CLASS_DESC_SZ  64          // 60 by the grammar, + NUL + slack
 #define ATK_CLASSES_MAX    32          // registry slots
 #define ATK_MOVES_MAX     128          // per section, the hard array bound
@@ -489,6 +503,13 @@ void atk_class_free(void);
 // A random class stem, uniformly drawn. SUCCESS when one was written.
 bool atk_class_pick(char *out, size_t cap);
 
+// The class a combatant should speak with right now: their own when the
+// registry still carries it, a freshly picked one when it does not — a
+// sheet can be deleted between the enrolment that stored the stem and the
+// turn that reads it back, and a bookkeeping gap must never cost somebody
+// their swing. Writes an empty string only when nothing is loaded at all.
+void atk_class_for(const char *want, char *out, size_t cap);
+
 // Draw a random move of `sec` from `type`, filtered by `tier` for DAMAGE
 // and HEAL, by `kind` for DECAY and DECAY_KILL, and by neither for DOT
 // and DEATH; pass 0 for the unused selector.
@@ -519,6 +540,7 @@ void atk_macro_expand(char *out, size_t cap, const char *tmpl,
 // sheet may leave unsaid. These are printf templates, not macro
 // templates — the FORMAT CONTRACT is in attack_class.c beside them and a
 // miscounted slot is a crash, not a typo. Never NULL.
+const char *atk_fallback_blow(void);
 const char *atk_fallback_death(void);
 const char *atk_fallback_dot_inflict(atk_dot_kind_t kind);
 const char *atk_fallback_decay(atk_dot_kind_t kind);
@@ -560,8 +582,12 @@ int64_t atk_db_round_open(uint32_t ns_id, const char *method,
 
 // Enrol a combatant at full health, bumping <p>_scores.rounds iff they
 // were not already in this round. Returns true when newly enrolled.
+//
+// `class` is written on the INSERT only, so a combatant is dealt their
+// sheet exactly once and can never re-roll it by being struck again.
 bool atk_db_player_enrol(int64_t round_id, uint32_t ns_id,
-    const char *username, const char *nickname, int32_t hp);
+    const char *username, const char *nickname, const char *class,
+    int32_t hp);
 
 bool atk_db_player_get(int64_t round_id, const char *username,
     atk_player_t *out);
@@ -577,6 +603,14 @@ bool atk_db_pending(int64_t round_id, int32_t wave, char *out,
 // nothing; a daemon death mid-turn can never leave the attacker charged
 // for a blow the target never took.
 bool atk_db_blow_apply(const atk_blow_t *blow);
+
+// Spend a turn that deals no instant damage — a damage-over-time turn.
+// The attacker still burns their swing and still bumps `blows`, and the
+// wave still turns behind them; nobody's health moves. Deliberately not
+// atk_db_blow_apply() with dmg = 0: a zero-damage blow reads ambiguously
+// in the ledger and in the code, and this is not the place to be clever.
+bool atk_db_turn_spend(int64_t round_id, uint32_t ns_id,
+    const char *username, const char *nickname, int32_t wave);
 
 // Leave an affliction on a combatant. The stack cap is enforced inside
 // the statement, so at the cap this lands no row and returns FAIL — the
@@ -659,16 +693,25 @@ int32_t atk_dmg_ceiling(const atk_tunables_t *t);
 // still renders its own tier, and the death LINE is a separate table.
 atk_flavour_t atk_severity(const atk_tunables_t *t, int32_t dmg);
 
-// The blow takes no `crit` flag: the words, the colour and the emoji all
-// come from atk_severity(t, dmg). The crit roll still widens the
-// damage band and still feeds the scoreboard — it simply no longer
-// chooses the sentence.
+// One finished blow line. The split of responsibilities is the charter's:
+//
+//   `tier`  is the ENGINE's, derived from the roll before any sheet was
+//           consulted, and it — not the move — chooses the colour and the
+//           emoji. Passing it separately is what keeps the dressing
+//           honest even when `move` is NULL.
+//   `move`  is the SHEET's, and supplies only the sentence. NULL means
+//           the attacker's class had nothing to say, and the engine's own
+//           neutral line stands in.
+//
+// `bonus_pct` renders the deferral badge; 0 draws none.
 void atk_render_blow(char *out, size_t cap, const char *src_nick,
-    const char *tgt_nick, int32_t dmg, int32_t hp,
-    int32_t hp_max, const atk_tunables_t *t);
+    const char *tgt_nick, atk_flavour_t tier, const atk_move_t *move,
+    int32_t dmg, uint32_t bonus_pct, int32_t hp, int32_t hp_max);
 
+// The killing blow, in the slayer's own voice where their sheet has one.
+// `move` NULL falls back to the engine's neutral death line.
 void atk_render_death(char *out, size_t cap, const char *slayer_nick,
-    const char *fallen_nick);
+    const char *fallen_nick, const atk_move_t *move);
 
 // The trout: a critical blow that kills speaks one fixed sentence in
 // place of the tier line. A static easter egg, and the one piece of
@@ -676,22 +719,27 @@ void atk_render_death(char *out, size_t cap, const char *slayer_nick,
 void atk_render_trout(char *out, size_t cap, const char *src_nick,
     const char *tgt_nick, int32_t dmg);
 
-// The line that announces a fresh affliction, spoken right after the
-// blow that left it. It never names the duration: the pit does not tell
-// you how long you have.
+// The three lines an affliction speaks: the turn that inflicts it, one
+// tick of it doing its slow work, and the tick that finishes what the
+// wound started. The inflict and tick lines never name a duration — the
+// pit does not tell you how long you have — and only the tick carries the
+// survivor's health tally, exactly as a blow line does.
+//
+// Each takes the affliction's `kind` for its glyph and colour, the
+// `noun` the sheet that inflicted it chose (empty falls back to the
+// engine's plain word for that kind), and the class `move` supplying the
+// sentence (NULL falls back to the engine's neutral line).
 void atk_render_dot_inflict(char *out, size_t cap, const char *src_nick,
-    const char *tgt_nick, atk_dot_kind_t kind);
+    const char *tgt_nick, atk_dot_kind_t kind, const char *noun,
+    const atk_move_t *move);
 
-// One tick of an affliction doing its slow work, and the tick that
-// finishes what a blade started. The tick carries the survivor's health
-// tally, exactly as a blow line does, so decay reads as a peer of a
-// blow; the death line carries none.
 void atk_render_dot_tick(char *out, size_t cap, const char *src_nick,
     const char *tgt_nick, int32_t dmg, int32_t hp, int32_t hp_max,
-    atk_dot_kind_t kind);
+    atk_dot_kind_t kind, const char *noun, const atk_move_t *move);
 
 void atk_render_dot_death(char *out, size_t cap, const char *src_nick,
-    const char *tgt_nick, atk_dot_kind_t kind);
+    const char *tgt_nick, atk_dot_kind_t kind, const char *noun,
+    const atk_move_t *move);
 
 // How an affliction presents itself on screen: the single-column glyph
 // that marks a victim on the round card, and the colour it and its

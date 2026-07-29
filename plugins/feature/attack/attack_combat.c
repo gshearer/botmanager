@@ -1,14 +1,18 @@
 // botmanager — MIT
-// attack combat: the damage roll and the tables that dress it.
+// attack combat: the damage roll and the dressing around a finished line.
 // Nothing here touches the database or the command context — it turns
-// (tunables, two nicknames, a number) into one finished line of text.
+// (a tier, a move, two nicknames and a number) into one line of text.
 //
-// The four damage-tier tables below are the last themed words in the
-// tree, and the last words of any kind that this file owns: ATK-4 moved
-// every affliction and death line out to attack_class.c as the neutral
-// fallbacks a character sheet may override, and ATK-5 deletes these four
-// when the sheets take over the blow line. Nothing ELSE in the plugin
-// names a setting any more.
+// THIS FILE OWNS NO WORDS. Every sentence the pit speaks comes from a
+// character sheet (attack_class.c's registry) or, where a sheet said
+// nothing, from that file's neutral fallbacks. What survives here is the
+// engine's own dressing: the tier colour, the tier emoji, and the glyph
+// and colour of each affliction kind. The four themed damage-tier tables
+// that used to live here went out with ATK-5, and the engine now names
+// no setting anywhere at all.
+//
+// The one exception, and it is deliberate: the trout. It is IRC culture
+// rather than a setting, and it predates every theme this plugin has had.
 
 #define ATTACK_INTERNAL
 #include "attack.h"
@@ -16,121 +20,16 @@
 #include "colors.h"
 #include "util.h"
 
+#include <inttypes.h>
 #include <stdio.h>
 
 // ------------------------------------------------------------------ //
-// Flavor                                                              //
+// The engine's dressing                                               //
 // ------------------------------------------------------------------ //
 
-// The four damage tiers, one table each, keyed by atk_flavour_t. The
-// words come from the DAMAGE, never from the crit roll: a critical of 10
-// and an ordinary blow of 10 hurt the same, so they must read the same.
-//
-// FORMAT CONTRACT: every entry in all four tables takes exactly three
-// `const char *` — attacker, target, damage — in that order. The damage
-// arrives already rendered and colorized, so all three slots are %s and
-// there is no %d anywhere. Breaking this crashes the plugin, not the
-// line.
-
-// A graze, a scuff, a stinging insult of a strike.
-static const char *const atk_minor[] = {
-  "%s rakes %s with House-signet talons for %s damage.",
-  "%s scores %s's cheek with a poisoned nail for %s damage.",
-  "%s stamps on %s's instep with a spider-silk boot for %s damage.",
-  "%s hurls a fistful of Underdark grit into %s's eyes for %s damage.",
-  "%s clips %s with the pommel of a Melee-Magthere training blade for %s damage.",
-  "%s trips %s face-first into a puddle of rothe filth for %s damage.",
-  "%s jabs %s with the butt of a driftglobe pole for %s damage.",
-  "%s slices a shallow line down %s's arm, just to watch it bleed — %s damage.",
-  "%s scuffs %s's cheekbone with a knuckle of House rings for %s damage.",
-  "%s clips %s's ear with the flat of a dagger, more insult than injury — %s damage.",
-  "%s treads on %s's cloak and tears the hem of the piwafwi for %s damage.",
-  "%s elbows %s in the shoulder on the way past, unhurried, for %s damage.",
-  "%s snaps a glove across %s's mouth the way a Matron scolds a servant — %s damage.",
-  "%s nicks %s's knuckles and watches them fumble the grip for %s damage.",
-  "%s raps %s across the shin with a still-sheathed blade for %s damage.",
-  "%s spits at %s's feet and opens their chin with a lazy backhand for %s damage.",
-};
-
-// A clean landed hit that hurts, and that a duellist keeps going through.
-static const char *const atk_medium[] = {
-  "%s lashes %s across the brow with a piwafwi-wrapped fist for %s damage.",
-  "%s cracks %s with the flat of an adamantine blade for %s damage.",
-  "%s drives a knee into %s's gut and leaves them wheezing — %s damage.",
-  "%s parries, ripostes, and opens %s's forearm for %s damage.",
-  "%s snaps a whip-cord across %s's shoulders for %s damage.",
-  "%s catches %s with a backhand heavy with House rings for %s damage.",
-  "%s shoulder-checks %s into a stalagmite for %s damage.",
-  "%s knocks the wind from %s with a spider-carved buckler for %s damage.",
-  "%s hooks %s's ankle and drops them hard onto the cavern floor for %s damage.",
-  "%s drives a fist into %s's kidney and lets them fold for %s damage.",
-  "%s opens a red line along %s's collarbone with black steel for %s damage.",
-  "%s beats %s's guard aside and puts a boot into their thigh for %s damage.",
-  "%s slashes %s across the shoulder blade as they turn away for %s damage.",
-  "%s catches %s in the mouth with a spiked bracer for %s damage.",
-  "%s slams %s's back against the cavern wall and holds them there for %s damage.",
-  "%s draws at arm's length and puts a hand-crossbow bolt in %s's thigh for %s damage.",
-};
-
-// Bone, blood and stagger. Badly hurt, visibly losing — never fatal.
-static const char *const atk_major[] = {
-  "%s slips a hand-crossbow bolt between %s's ribs for %s damage.",
-  "%s slams %s against the Narbondel-lit stone for %s damage.",
-  "%s flicks faerie fire over %s and stabs the outline for %s damage.",
-  "%s lands a bone-splintering elbow that folds %s's ribs inward with a wet crunch — %s damage.",
-  "%s whispers to the Spider Queen and buries a dagger in %s to the guard for %s damage.",
-  "%s drags %s face-first down a rasp of raw obsidian for %s damage.",
-  "%s calls a globe of darkness and works %s over inside it, unseen and unhurried — %s damage.",
-  "%s brands %s with a red-hot House insignia and holds it there for %s damage.",
-  "%s catches %s's wrist, reverses the arm, and snaps it the wrong way round — %s damage.",
-  "%s bathes a blade in drow poison and paints %s with it for %s damage.",
-  "%s smashes %s through a sava board and scatters pieces and teeth alike for %s damage.",
-  "%s carves the sigil of Bregan D'aerthe into %s's back, stroke by unhurried stroke, for %s damage.",
-  "%s breaks %s's nose flat with a pommel and lets the blood come for %s damage.",
-  "%s runs a blade through %s's shoulder and leaves it there a moment — %s damage.",
-  "%s hammers %s's knee sideways until the joint gives with a crack for %s damage.",
-  "%s tears open %s's flank with a hooked dagger and steps back to watch — %s damage.",
-};
-
-// The heaviest thing that is still survivable — and it may say so.
-static const char *const atk_critical[] = {
-  "%s drives a black-steel blade to the hilt through %s — Lolth leans closer. %s CRITICAL damage!",
-  "%s opens %s from collarbone to hip; the wound steams in the cold. %s CRITICAL damage!",
-  "%s empties a quiver of drow-poisoned bolts into %s at point-blank. %s CRITICAL damage!",
-  "%s severs the tendons behind %s's knee; the scream carries to Menzoberranzan. %s CRITICAL damage!",
-  "%s drives %s's skull into the stone until the stone gives first. %s CRITICAL damage!",
-  "%s runs %s through and lifts them clean off the floor on the blade. %s CRITICAL damage!",
-  "%s answers with a whip of fangs — five heads find %s at once. %s CRITICAL damage!",
-  "%s throws %s down a chasm and hauls them back up by the hair to finish. %s CRITICAL damage!",
-  "%s lets a yochlol's whisper guide the killing arc across %s's throat. %s CRITICAL damage!",
-  "%s drives a hooked blade under %s's jaw and twists. %s CRITICAL damage!",
-  "%s crushes %s beneath an adamantine boot until something deep gives way. %s CRITICAL damage!",
-  "%s nails %s's hand to the stone with a dagger and works on them at leisure. %s CRITICAL damage!",
-  "%s opens %s's belly with an adamantine edge; Lolth's spiders gather early. %s CRITICAL damage!",
-  "%s drives a spear of black steel through %s's thigh and out the other side. %s CRITICAL damage!",
-  "%s slams %s face-first through a driftglobe — the light dies with the scream. %s CRITICAL damage!",
-  "%s breaks %s's ribs against a stalagmite one at a time, in no hurry. %s CRITICAL damage!",
-};
-
-#define ATK_N(t) ((int)(sizeof(t) / sizeof((t)[0])))
-
-// The four damage tiers as one indexable set, so the renderer picks a
-// table by severity rather than by a chain of conditionals — a fifth
-// tier would be one line here and nothing anywhere else. Indexed by
-// atk_flavour_t; ATK_FLAV_DEATH is not a damage tier and has no
-// entry.
-static const char *const *const atk_tbl[ATK_FLAV_DEATH] = {
-  atk_minor, atk_medium, atk_major, atk_critical
-};
-
-static const int atk_tbl_n[ATK_FLAV_DEATH] = {
-  ATK_N(atk_minor), ATK_N(atk_medium),
-  ATK_N(atk_major), ATK_N(atk_critical)
-};
-
-// The dressing attack adds around the sentence, also by tier: heavier
-// blows read louder. Every prefix is a single-column code point, so
-// atk_vis_len() stays honest.
+// What the engine adds around a sentence it did not write, by tier:
+// heavier blows read louder. Every prefix is a single-column code point,
+// so atk_vis_len() stays honest.
 static const char *const atk_tier_color[ATK_FLAV_DEATH] = {
   CLR_WHITE, CLR_YELLOW, CLR_BOLD CLR_ORANGE, CLR_BOLD CLR_RED
 };
@@ -183,29 +82,6 @@ const char *
 atk_dot_color_of(atk_dot_kind_t kind)
 {
   return(atk_dot_color[atk_dot_clamp(kind)]);
-}
-
-void
-atk_render_dot_inflict(char *out, size_t cap, const char *src_nick,
-    const char *tgt_nick, atk_dot_kind_t kind)
-{
-  char src [ATK_NICK_SZ + 8];
-  char tgt [ATK_NICK_SZ + 8];
-  char body[ATK_LINE_SZ];
-
-  if(out == NULL || cap == 0)
-    return;
-
-  kind = atk_dot_clamp(kind);
-
-  snprintf(src, sizeof(src), CLR_CYAN   "%s" CLR_RESET, src_nick);
-  snprintf(tgt, sizeof(tgt), CLR_PURPLE "%s" CLR_RESET, tgt_nick);
-  snprintf(body, sizeof(body),
-      atk_fallback_dot_inflict(kind), src, tgt);
-
-  // The glyph that will mark the victim on the round card leads the
-  // line, so the two read as the same thing.
-  snprintf(out, cap, "%s %s", atk_dot_emoji_of(kind), body);
 }
 
 // ------------------------------------------------------------------ //
@@ -281,42 +157,109 @@ atk_severity(const atk_tunables_t *t, int32_t dmg)
 // Rendering                                                           //
 // ------------------------------------------------------------------ //
 
-// The table supplies the sentence and nothing else: the emoji prefix, the
-// colorization, and the health tail below are the engine's own.
+// Every sentence the pit speaks arrives by exactly one of two roads, and
+// they must never be confused:
+//
+//   a MOVE is a character sheet's {macro} template, expanded with data
+//   through atk_macro_expand() — it is never a format string, and the
+//   loader refuses any '%' in one;
+//
+//   a FALLBACK is one of attack_class.c's neutral lines, a printf
+//   template with a fixed slot count stated beside it there.
+//
+// The two are resolved here, once, so that no renderer below has to know
+// which road its words came down.
+static void
+atk_body(char *out, size_t cap, const atk_move_t *move, const char *fb,
+    const char *attacker, const char *target, const char *damage,
+    const char *heal, const char *affliction)
+{
+  if(move != NULL && move->text[0] != '\0')
+  {
+    atk_macro_expand(out, cap, move->text, attacker, target, damage,
+        heal, affliction);
+    return;
+  }
+
+  // Every neutral template takes (attacker, target, <the number this
+  // line carries>) and stops where its own contract says — a line that
+  // names no number never reads the third slot, and none of them has a
+  // slot for the affliction, which they name in words instead. The
+  // surplus argument is what the varargs contract permits, and it is what
+  // keeps one call site here rather than five.
+  if(damage == NULL)
+    damage = (heal != NULL) ? heal : "";
+
+  snprintf(out, cap, fb, attacker, target, damage);
+}
+
+// A tier arrives from a roll and a database column alike, so it is input
+// like any other: anything outside the four damage bands is drawn as the
+// lightest rather than indexing past the dressing tables.
+static atk_flavour_t
+atk_tier_clamp(atk_flavour_t tier)
+{
+  return((tier >= ATK_FLAV_MINOR && tier < ATK_FLAV_DEATH)
+      ? tier : ATK_FLAV_MINOR);
+}
+
+// The affliction's own word, in the affliction's own colour. The sheet
+// that inflicted it chose the noun and the row carries it, so a class's
+// wording survives every tick; an empty one falls back to the engine's
+// plain word for that kind.
+static void
+atk_noun_render(char *out, size_t cap, atk_dot_kind_t kind,
+    const char *noun)
+{
+  if(noun == NULL || noun[0] == '\0')
+    noun = atk_fallback_noun(kind);
+
+  snprintf(out, cap, "%s%s" CLR_RESET, atk_dot_color_of(kind), noun);
+}
+
+// The sheet supplies the sentence and nothing else: the emoji prefix, the
+// colorization, the deferral badge and the health tail are the engine's
+// own. The TIER is the engine's too, and is passed in rather than read
+// off the move — it is the roll's dressing, and it must be right even in
+// the case where the attacker's class had nothing to say.
 void
 atk_render_blow(char *out, size_t cap, const char *src_nick,
-    const char *tgt_nick, int32_t dmg, int32_t hp, int32_t hp_max,
-    const atk_tunables_t *t)
+    const char *tgt_nick, atk_flavour_t tier, const atk_move_t *move,
+    int32_t dmg, uint32_t bonus_pct, int32_t hp, int32_t hp_max)
 {
-  atk_flavour_t sev;
-  char          src [ATK_NICK_SZ + 8];
-  char          tgt [ATK_NICK_SZ + 8];
-  char          dmgs[32];
-  char          body[ATK_LINE_SZ];
+  char src  [ATK_NICK_SZ + 8];
+  char tgt  [ATK_NICK_SZ + 8];
+  char dmgs [32];
+  char badge[32] = "";
+  char body [ATK_LINE_SZ];
 
   if(out == NULL || cap == 0)
     return;
 
-  // Everything below — the table, the colour, the emoji — is driven by
-  // this one value, which is why the words can never again disagree with
-  // the number.
-  sev = atk_severity(t, dmg);
+  tier = atk_tier_clamp(tier);
 
   snprintf(src, sizeof(src), CLR_CYAN   "%s" CLR_RESET, src_nick);
   snprintf(tgt, sizeof(tgt), CLR_PURPLE "%s" CLR_RESET, tgt_nick);
-  snprintf(dmgs, sizeof(dmgs), "%s%d" CLR_RESET, atk_tier_color[sev], dmg);
-  snprintf(body, sizeof(body),
-      atk_tbl[sev][util_rand(atk_tbl_n[sev])], src, tgt, dmgs);
+  snprintf(dmgs, sizeof(dmgs), "%s%d" CLR_RESET, atk_tier_color[tier], dmg);
+
+  atk_body(body, sizeof(body), move, atk_fallback_blow(),
+      src, tgt, dmgs, NULL, NULL);
+
+  // A bonused blow says why it is heavy. Without the badge a deferred
+  // turn simply looks like a suspiciously lucky roll.
+  if(bonus_pct > 0)
+    snprintf(badge, sizeof(badge),
+        " " CLR_BOLD CLR_YELLOW "⚡+%" PRIu32 "%%" CLR_RESET, bonus_pct);
 
   // The survivor's remaining health rides on every non-fatal line; the
   // nick inside the gray block stays plain so the block reads as one.
   // A fatal blow carries no tally — the death line that follows says it.
   if(hp > 0)
-    snprintf(out, cap, "%s%s " CLR_GRAY "[%s — %d/%d hp]" CLR_RESET,
-        atk_tier_emoji[sev], body, tgt_nick, hp, hp_max);
+    snprintf(out, cap, "%s%s%s " CLR_GRAY "[%s — %d/%d hp]" CLR_RESET,
+        atk_tier_emoji[tier], body, badge, tgt_nick, hp, hp_max);
 
   else
-    snprintf(out, cap, "%s%s", atk_tier_emoji[sev], body);
+    snprintf(out, cap, "%s%s%s", atk_tier_emoji[tier], body, badge);
 }
 
 // The oldest joke on IRC, kept for the one blow that earns it: a
@@ -324,6 +267,9 @@ atk_render_blow(char *out, size_t cap, const char *src_nick,
 // it is the line that carries the number — and the ordinary death line
 // still follows it, so the death-line-before-eject law is untouched. No
 // health tail, because a fatal blow carries no tally.
+//
+// The one piece of flavour no character sheet can override, and the one
+// place this file still owns a sentence.
 void
 atk_render_trout(char *out, size_t cap, const char *src_nick,
     const char *tgt_nick, int32_t dmg)
@@ -342,7 +288,7 @@ atk_render_trout(char *out, size_t cap, const char *src_nick,
 // number.
 void
 atk_render_death(char *out, size_t cap, const char *slayer_nick,
-    const char *fallen_nick)
+    const char *fallen_nick, const atk_move_t *move)
 {
   char slayer[ATK_NICK_SZ + 8];
   char fallen[ATK_NICK_SZ + 8];
@@ -353,10 +299,42 @@ atk_render_death(char *out, size_t cap, const char *slayer_nick,
 
   snprintf(slayer, sizeof(slayer), CLR_CYAN   "%s" CLR_RESET, slayer_nick);
   snprintf(fallen, sizeof(fallen), CLR_PURPLE "%s" CLR_RESET, fallen_nick);
-  snprintf(body, sizeof(body),
-      atk_fallback_death(), slayer, fallen);
+
+  atk_body(body, sizeof(body), move, atk_fallback_death(),
+      slayer, fallen, NULL, NULL, NULL);
 
   snprintf(out, cap, "☠ %s", body);
+}
+
+void
+atk_render_dot_inflict(char *out, size_t cap, const char *src_nick,
+    const char *tgt_nick, atk_dot_kind_t kind, const char *noun,
+    const atk_move_t *move)
+{
+  char src [ATK_NICK_SZ + 8];
+  char tgt [ATK_NICK_SZ + 8];
+  char aff [ATK_NOUN_SZ + 16];
+  char body[ATK_LINE_SZ];
+
+  if(out == NULL || cap == 0)
+    return;
+
+  kind = atk_dot_clamp(kind);
+
+  snprintf(src, sizeof(src), CLR_CYAN   "%s" CLR_RESET, src_nick);
+  snprintf(tgt, sizeof(tgt), CLR_PURPLE "%s" CLR_RESET, tgt_nick);
+  atk_noun_render(aff, sizeof(aff), kind, noun);
+
+  // The inflict line names no number. The engine has already rolled the
+  // whole of this affliction's damage and will pay it out one tick at a
+  // time; saying it here would tell the victim exactly how long they
+  // have, which the pit never does.
+  atk_body(body, sizeof(body), move, atk_fallback_dot_inflict(kind),
+      src, tgt, NULL, NULL, aff);
+
+  // The glyph that will mark the victim on the round card leads the
+  // line, so the two read as the same thing.
+  snprintf(out, cap, "%s %s", atk_dot_emoji_of(kind), body);
 }
 
 // A tick is dressed like a blow — glyph, colour, and the survivor's
@@ -366,10 +344,11 @@ atk_render_death(char *out, size_t cap, const char *slayer_nick,
 void
 atk_render_dot_tick(char *out, size_t cap, const char *src_nick,
     const char *tgt_nick, int32_t dmg, int32_t hp, int32_t hp_max,
-    atk_dot_kind_t kind)
+    atk_dot_kind_t kind, const char *noun, const atk_move_t *move)
 {
   char src [ATK_NICK_SZ + 8];
   char tgt [ATK_NICK_SZ + 8];
+  char aff [ATK_NOUN_SZ + 16];
   char dmgs[32];
   char body[ATK_LINE_SZ];
 
@@ -381,8 +360,10 @@ atk_render_dot_tick(char *out, size_t cap, const char *src_nick,
   snprintf(src, sizeof(src), CLR_CYAN   "%s" CLR_RESET, src_nick);
   snprintf(tgt, sizeof(tgt), CLR_PURPLE "%s" CLR_RESET, tgt_nick);
   snprintf(dmgs, sizeof(dmgs), "%s%d" CLR_RESET, atk_dot_color_of(kind), dmg);
-  snprintf(body, sizeof(body),
-      atk_fallback_decay(kind), src, tgt, dmgs);
+  atk_noun_render(aff, sizeof(aff), kind, noun);
+
+  atk_body(body, sizeof(body), move, atk_fallback_decay(kind),
+      src, tgt, dmgs, NULL, aff);
 
   if(hp > 0)
     snprintf(out, cap, "%s %s " CLR_GRAY "[%s — %d/%d hp]" CLR_RESET,
@@ -394,10 +375,12 @@ atk_render_dot_tick(char *out, size_t cap, const char *src_nick,
 
 void
 atk_render_dot_death(char *out, size_t cap, const char *src_nick,
-    const char *tgt_nick, atk_dot_kind_t kind)
+    const char *tgt_nick, atk_dot_kind_t kind, const char *noun,
+    const atk_move_t *move)
 {
   char src [ATK_NICK_SZ + 8];
   char tgt [ATK_NICK_SZ + 8];
+  char aff [ATK_NOUN_SZ + 16];
   char body[ATK_LINE_SZ];
 
   if(out == NULL || cap == 0)
@@ -407,10 +390,11 @@ atk_render_dot_death(char *out, size_t cap, const char *src_nick,
 
   snprintf(src, sizeof(src), CLR_CYAN   "%s" CLR_RESET, src_nick);
   snprintf(tgt, sizeof(tgt), CLR_PURPLE "%s" CLR_RESET, tgt_nick);
+  atk_noun_render(aff, sizeof(aff), kind, noun);
 
   // No tally, exactly as the blade's death line carries none.
-  snprintf(body, sizeof(body),
-      atk_fallback_decay_kill(kind), src, tgt);
+  atk_body(body, sizeof(body), move, atk_fallback_decay_kill(kind),
+      src, tgt, NULL, NULL, aff);
 
   // The same headstone the turn engine's death line carries, so a death
   // by decay is unmistakably the same event as a death by blade.

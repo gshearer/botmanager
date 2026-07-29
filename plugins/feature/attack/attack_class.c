@@ -151,6 +151,8 @@ static const char *const atk_kind_name[ATK_DOT__COUNT] = {
 //
 // FORMAT CONTRACT, and a miscounted slot is a crash rather than a typo:
 //
+//   atk_blows[]          exactly three `const char *` — attacker, target,
+//                        damage
 //   atk_deaths[]         exactly two `const char *` — slayer, fallen
 //   atk_inflict_*[]      exactly two — attacker, target
 //   atk_decay_*[]        exactly three — source, victim, damage
@@ -158,6 +160,19 @@ static const char *const atk_kind_name[ATK_DOT__COUNT] = {
 //
 // The damage arrives pre-rendered and pre-colorized, so every slot is
 // `%s` and there is no `%d` anywhere.
+
+// The floor under a blow, and the one entry here that should never be
+// reached: the loader's coverage gate guarantees every loaded class can
+// speak every tier the engine can roll, and D7 guarantees a class is
+// always loaded. It exists because "should never" is not "cannot" — a
+// sheet can leave the registry between the enrolment that dealt it and
+// the turn that reads the stem back — and because a pit that falls silent
+// mid-blow is a worse failure than a plain sentence.
+static const char *const atk_blows[] = {
+  "%s strikes %s for %s damage.",
+  "%s catches %s square for %s damage.",
+  "%s puts one into %s for %s damage.",
+};
 
 static const char *const atk_deaths[] = {
   "%s puts %s down, and %s does not get up.",
@@ -357,6 +372,12 @@ static atk_dot_kind_t
 atk_kind_clamp(atk_dot_kind_t kind)
 {
   return((kind >= 0 && kind < ATK_DOT__COUNT) ? kind : ATK_DOT_BLEED);
+}
+
+const char *
+atk_fallback_blow(void)
+{
+  return(atk_blows[util_rand(ATK_N(atk_blows))]);
 }
 
 const char *
@@ -1461,6 +1482,32 @@ atk_class_pick(char *out, size_t cap)
   pthread_mutex_unlock(&atk_class_lock);
 
   return(ok);
+}
+
+// Deliberately not a lookup failure: the caller has a turn to resolve and
+// a stem that may have gone stale under it, and re-picking is the honest
+// answer — under the charter, one class is worth exactly as much as
+// another, so being handed a different sheet costs nobody anything.
+void
+atk_class_for(const char *want, char *out, size_t cap)
+{
+  if(out == NULL || cap == 0)
+    return;
+
+  out[0] = '\0';
+
+  if(want != NULL && want[0] != '\0')
+  {
+    pthread_mutex_lock(&atk_class_lock);
+
+    if(atk_class_find_locked(want) != NULL)
+      snprintf(out, cap, "%s", want);
+
+    pthread_mutex_unlock(&atk_class_lock);
+  }
+
+  if(out[0] == '\0')
+    atk_class_pick(out, cap);
 }
 
 bool

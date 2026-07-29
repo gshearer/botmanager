@@ -466,13 +466,18 @@ out:
 // The CTE is what keeps the lifetime `rounds` tally honest: the score
 // row is bumped only for the enrolment that actually inserted, so a
 // combatant struck ten times in one brawl still counts one round.
+//
+// The same DO NOTHING is what deals a class exactly once: `class` rides
+// the INSERT and is never in an UPDATE, so a combatant cannot re-roll
+// their sheet by being struck again.
 bool
 atk_db_player_enrol(int64_t round_id, uint32_t ns_id, const char *username,
-    const char *nickname, int32_t hp)
+    const char *nickname, const char *class, int32_t hp)
 {
   atk_tables_t t;
-  char        *e_user = NULL;
-  char        *e_nick = NULL;
+  char        *e_user  = NULL;
+  char        *e_nick  = NULL;
+  char        *e_class = NULL;
   char         sql[1536];
   uint32_t     affected = 0;
   bool         fresh    = false;
@@ -480,16 +485,18 @@ atk_db_player_enrol(int64_t round_id, uint32_t ns_id, const char *username,
   if(round_id <= 0 || username == NULL || atk_tables_resolve(&t) != SUCCESS)
     return(false);
 
-  e_user = db_escape(username);
-  e_nick = db_escape(nickname != NULL ? nickname : "");
+  e_user  = db_escape(username);
+  e_nick  = db_escape(nickname != NULL ? nickname : "");
+  e_class = db_escape(class    != NULL ? class    : "");
 
-  if(e_user == NULL || e_nick == NULL)
+  if(e_user == NULL || e_nick == NULL || e_class == NULL)
     goto out;
 
   snprintf(sql, sizeof(sql),
       "WITH enrolled AS ("
-      " INSERT INTO %s (round_id, ns_id, username, nickname, hp, hp_max)"
-      " VALUES (%" PRId64 ", %" PRIu32 ", '%s', '%s', %d, %d)"
+      " INSERT INTO %s (round_id, ns_id, username, nickname, class,"
+      " hp, hp_max)"
+      " VALUES (%" PRId64 ", %" PRIu32 ", '%s', '%s', '%s', %d, %d)"
       " ON CONFLICT (round_id, username) DO NOTHING"
       " RETURNING 1"
       ")"
@@ -498,15 +505,16 @@ atk_db_player_enrol(int64_t round_id, uint32_t ns_id, const char *username,
       " ON CONFLICT (ns_id, username) DO UPDATE SET"
       " rounds = %s.rounds + 1, nickname = EXCLUDED.nickname,"
       " last_seen = NOW()",
-      t.players, round_id, ns_id, e_user, e_nick, hp, hp,
+      t.players, round_id, ns_id, e_user, e_nick, e_class, hp, hp,
       t.scores, ns_id, e_user, e_nick, t.scores);
 
   if(atk_exec(sql, "player enrol", &affected) == SUCCESS)
     fresh = (affected > 0);
 
 out:
-  if(e_user != NULL) mem_free(e_user);
-  if(e_nick != NULL) mem_free(e_nick);
+  if(e_user  != NULL) mem_free(e_user);
+  if(e_nick  != NULL) mem_free(e_nick);
+  if(e_class != NULL) mem_free(e_class);
 
   return(fresh);
 }
@@ -532,7 +540,7 @@ atk_db_player_get(int64_t round_id, const char *username,
     return(false);
 
   snprintf(sql, sizeof(sql),
-      "SELECT nickname, hp, hp_max, last_wave FROM %s"
+      "SELECT nickname, hp, hp_max, last_wave, class FROM %s"
       " WHERE round_id = %" PRId64 " AND username = '%s'",
       t.players, round_id, e_user);
 
@@ -544,6 +552,7 @@ atk_db_player_get(int64_t round_id, const char *username,
     out->hp        = atk_col_i32(res, 0, 1);
     out->hp_max    = atk_col_i32(res, 0, 2);
     out->last_wave = atk_col_i32(res, 0, 3);
+    atk_col_str(out->class, sizeof(out->class), res, 0, 4);
     hit = true;
   }
 
@@ -686,7 +695,7 @@ atk_db_card_roster(int64_t round_id, atk_card_row_t *out, uint32_t cap,
   snprintf(sql, sizeof(sql),
       "SELECT CASE WHEN p.nickname <> '' THEN p.nickname ELSE p.username END,"
       " p.hp, p.hp_max, p.dmg_given, p.dmg_taken, p.best_crit, p.last_wave,"
-      " COUNT(*) OVER (), p.username"
+      " COUNT(*) OVER (), p.username, p.class"
       " FROM %s p WHERE p.round_id = %" PRId64
       " ORDER BY p.hp DESC, p.dmg_given DESC, p.username LIMIT %" PRIu32,
       t.players, round_id, cap);
@@ -697,8 +706,9 @@ atk_db_card_roster(int64_t round_id, atk_card_row_t *out, uint32_t cap,
   {
     for(n = 0; n < res->rows && n < cap; n++)
     {
-      atk_col_str(out[n].name, sizeof(out[n].name), res, n, 0);
-      atk_col_str(out[n].user, sizeof(out[n].user), res, n, 8);
+      atk_col_str(out[n].name,  sizeof(out[n].name),  res, n, 0);
+      atk_col_str(out[n].user,  sizeof(out[n].user),  res, n, 8);
+      atk_col_str(out[n].class, sizeof(out[n].class), res, n, 9);
       out[n].hp        = atk_col_i32(res, n, 1);
       out[n].hp_max    = atk_col_i32(res, n, 2);
       out[n].dmg_given = atk_col_i32(res, n, 3);
@@ -946,6 +956,69 @@ out:
   return(ok);
 }
 
+// A turn that deals no instant damage: the attacker spends their swing,
+// the counters that describe a swing move, and nobody's health does. It
+// is deliberately its own statement rather than atk_db_blow_apply() with
+// dmg = 0 — the ledger should never carry a blow that hit for nothing,
+// and neither should the code that reads it back.
+bool
+atk_db_turn_spend(int64_t round_id, uint32_t ns_id, const char *username,
+    const char *nickname, int32_t wave)
+{
+  atk_tables_t t;
+  char        *e_user = NULL;
+  char        *e_nick = NULL;
+  char         sql[1536];
+  bool         ok = FAIL;
+
+  if(round_id <= 0 || username == NULL || atk_tables_resolve(&t) != SUCCESS)
+    return(FAIL);
+
+  e_user = db_escape(username);
+  e_nick = db_escape(nickname != NULL ? nickname : "");
+
+  if(e_user == NULL || e_nick == NULL)
+    goto out;
+
+  snprintf(sql, sizeof(sql),
+      "BEGIN;"
+
+      "UPDATE %s SET nickname = '%s', blows = blows + 1, last_wave = %d"
+      " WHERE round_id = %" PRId64 " AND username = '%s';"
+
+      "UPDATE %s SET blows = blows + 1, last_action = NOW()"
+      " WHERE id = %" PRId64 ";"
+
+      "INSERT INTO %s (ns_id, username, nickname, blows)"
+      " VALUES (%" PRIu32 ", '%s', '%s', 1)"
+      " ON CONFLICT (ns_id, username) DO UPDATE SET"
+      " nickname = EXCLUDED.nickname,"
+      " blows = %s.blows + EXCLUDED.blows,"
+      " last_seen = NOW();"
+
+      // The same clause the blow path uses, and for the same reason: a
+      // turn that could not turn the wave would stall the pit behind
+      // whoever happened to draw an affliction.
+      "UPDATE %s r SET wave = r.wave + 1 WHERE r.id = %" PRId64
+      " AND NOT EXISTS (SELECT 1 FROM %s p WHERE p.round_id = r.id"
+      " AND p.hp > 0 AND p.last_wave < r.wave);"
+
+      "COMMIT;",
+
+      t.players, e_nick, wave, round_id, e_user,
+      t.rounds, round_id,
+      t.scores, ns_id, e_user, e_nick, t.scores,
+      t.rounds, round_id, t.players);
+
+  ok = atk_exec(sql, "turn spend", NULL);
+
+out:
+  if(e_user != NULL) mem_free(e_user);
+  if(e_nick != NULL) mem_free(e_nick);
+
+  return(ok);
+}
+
 // ------------------------------------------------------------------ //
 // Afflictions                                                         //
 // ------------------------------------------------------------------ //
@@ -1081,7 +1154,7 @@ atk_db_dot_due(atk_dot_due_t *out, uint32_t cap)
 {
   atk_tables_t t;
   db_result_t *res = NULL;
-  char         sql[768];
+  char         sql[1024];
   uint32_t     n = 0;
 
   if(out == NULL || cap == 0 || atk_tables_resolve(&t) != SUCCESS)
@@ -1094,11 +1167,17 @@ atk_db_dot_due(atk_dot_due_t *out, uint32_t cap)
       // what makes "at most max_ticks messages" exact rather than
       // approximate, and it is why a 1-damage DOT speaks once.
       " (d.ticks + 1 >= d.max_ticks),"
-      " d.noun, d.max_ticks, d.dmg_plan, d.dmg_total, d.ticks"
+      " d.noun, d.max_ticks, d.dmg_plan, d.dmg_total, d.ticks,"
+      // An affliction ticks in the voice of whoever left it, so its
+      // source's class is joined in rather than stored a second time on
+      // the row. LEFT, because the wound outlives the bookkeeping: a
+      // source whose row is gone simply speaks the neutral lines.
+      " COALESCE(p.class, '')"
       " FROM %s d JOIN %s r ON r.id = d.round_id"
+      " LEFT JOIN %s p ON p.round_id = d.round_id AND p.username = d.source"
       " WHERE d.state = %d AND r.state = %d AND d.next_tick <= NOW()"
       " ORDER BY d.next_tick LIMIT %" PRIu32,
-      t.dots, t.rounds, ATK_DOT_LIVE, ATK_ROUND_ACTIVE, cap);
+      t.dots, t.rounds, t.players, ATK_DOT_LIVE, ATK_ROUND_ACTIVE, cap);
 
   res = db_result_alloc();
 
@@ -1131,6 +1210,8 @@ atk_db_dot_due(atk_dot_due_t *out, uint32_t cap)
       out[n].dmg_plan  = atk_col_i32(res, n, 13);
       out[n].dmg_done  = atk_col_i32(res, n, 14);
       out[n].ticks     = (uint32_t)atk_col_i32(res, n, 15);
+
+      atk_col_str(out[n].class, sizeof(out[n].class), res, n, 16);
     }
   }
 
