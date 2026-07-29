@@ -1,54 +1,68 @@
-# rogue — piercing weapons, angles nobody was watching, and a great deal
-# of patience. Roughly a quarter of what it says is an affliction.
+# rogue — piercing weapons from angles nobody was watching, and the
+# patience to let a small cut do a big cut's work. See
+# ../new-class-prompt.txt for the grammar and the fairness rules.
 
 type: rogue
 desc: Quiet, quick and piercing. Daggers, bows, spears, poison.
 
 [damage]
-minor    | {attacker} slips a blade past {target}'s guard and takes a finger's worth for {damage} damage.
-minor    | {attacker} puts a dart in {target}'s shoulder from somewhere behind — {damage} damage.
-minor    | {attacker} scores {target}'s cheek in passing for {damage} damage.
-minor    | {attacker} cuts {target}'s belt and the knife hand with it for {damage} damage.
-minor    | {attacker} flicks grit into {target}'s eyes and opens the chin — {damage} damage.
+minor    | {attacker} opens a thin line across {target}'s cheek in passing — {damage} damage.
+minor    | {attacker} puts a dart in {target}'s shoulder from somewhere above — {damage} damage.
+minor    | {attacker} nicks the back of {target}'s knife hand and the grip goes slick — {damage} damage.
+minor    | {attacker} slits {target}'s sleeve and takes the skin under it for {damage} damage.
+minor    | {attacker} flicks grit into {target}'s eyes and opens their chin on the flinch — {damage} damage.
+minor    | {attacker} pricks {target} behind the knee, just where the leg listens — {damage} damage.
+minor    | {attacker} passes behind {target} and leaves a shallow cut as a receipt — {damage} damage.
 
 medium   | {attacker} puts an arrow through {target}'s thigh for {damage} damage.
 medium   | {attacker} opens {target}'s forearm to the bone on the parry for {damage} damage.
-medium   | {attacker} drives a spear butt into {target}'s kidney for {damage} damage.
-medium   | {attacker} steps inside {target}'s reach and works the ribs twice — {damage} damage.
-medium   | {attacker} cuts the tendon behind {target}'s heel for {damage} damage.
+medium   | {attacker} drives the spear butt into {target}'s kidney for {damage} damage.
+medium   | {attacker} steps inside {target}'s reach and works the ribs, twice — {damage} damage.
+medium   | {attacker} cuts the tendon behind {target}'s heel and the stance goes with it — {damage} damage.
+medium   | {attacker} drops on {target} from above, knives first — {damage} damage.
+medium   | {attacker} threads a knife through the gap {target}'s elbow keeps leaving — {damage} damage.
 
-major    | {attacker} buries a dagger in {target}'s side to the guard for {damage} damage.
-major    | {attacker} puts two arrows in {target} before the first one lands — {damage} damage.
+major    | {attacker} buries a dagger to the guard in {target}'s side for {damage} damage.
+major    | {attacker} puts two arrows in {target} before the first is understood — {damage} damage.
 major    | {attacker} drives a spear through {target}'s shoulder and leans on it for {damage} damage.
-major    | {attacker} opens {target}'s flank with a hooked blade and steps back to watch — {damage} damage.
 major    | {attacker} nails {target}'s hand to the wall with a throwing knife for {damage} damage.
+major    | {attacker} opens {target}'s flank with a hooked blade and lets it gape — {damage} damage.
+major    | {attacker} appears at {target}'s back with the knife already home — {damage} damage.
+major    | {attacker} feeds {target}'s lunge past and writes a long line across the ribs — {damage} damage.
 
 critical | {attacker} backstabs {target} to the hilt, twice, before anyone sees the knife. {damage} CRITICAL damage!
 critical | {attacker} puts a bolt through {target}'s throat from the dark. {damage} CRITICAL damage!
-critical | {attacker} drives a hooked blade under {target}'s jaw and twists. {damage} CRITICAL damage!
-critical | {attacker} opens {target}'s belly and lets them look at it. {damage} CRITICAL damage!
-critical | {attacker} takes {target} from behind, blade under the ribs and upward. {damage} CRITICAL damage!
+critical | {attacker} drives a hooked blade up under {target}'s jaw and twists. {damage} CRITICAL damage!
+critical | {attacker} opens {target} low and is walking away before it registers. {damage} CRITICAL damage!
+critical | {attacker} takes {target} from behind, blade under the ribs and rising. {damage} CRITICAL damage!
+critical | {attacker} was never on {target}'s left. The knife was. {damage} CRITICAL damage!
+critical | {attacker} waits out {target}'s swing and answers under it, once, upward. {damage} CRITICAL damage!
 
 [dot]
-bleed  | opened vein | {attacker} finds the vein under {target}'s arm and leaves the {affliction} open.
-bleed  | cut throat  | {attacker} draws a line across {target}'s throat that will not stop — a {affliction}.
-poison | blade venom | {attacker}'s edge was treated; the {affliction} is already in {target}.
-poison | numbing draught | {attacker} nicks {target} with something slow. The {affliction} does the work now.
-poison | black tar   | {attacker} works {affliction} into the cut and lets {target} carry it.
-poison | wasp toxin  | {attacker} puts a treated dart in {target}; the {affliction} climbs from there.
-bleed  | slit wrist  | {attacker} opens {target}'s wrist on the way past and leaves the {affliction} to it.
+bleed  | opened vein     | {attacker} finds the vein inside {target}'s elbow and unstoppers it — the {affliction} runs on its own from here.
+bleed  | long red line   | {attacker} draws a {affliction} down {target}'s back, too shallow to feel and too long to close.
+bleed  | seeping gash    | {attacker} leaves a {affliction} under {target}'s ribs on the way past.
+bleed  | nicked artery   | {attacker} clips something load-bearing in {target}; the {affliction} pays out in instalments.
+poison | blade venom     | {attacker}'s edge was wet with something, and the {affliction} is already inside {target}.
+poison | numbing draught | {attacker} scratches {target} with a coated pin and lets the {affliction} climb.
+poison | spider venom    | {attacker} leaves one small puncture in {target}; the {affliction} handles the rest.
+poison | wasp toxin      | {attacker} plants a treated dart in {target} and the {affliction} gets to work.
 
 [death]
-{attacker} cuts {target}'s throat from behind and steps over the body.
+{attacker} cuts {target}'s throat from behind and steps over them on the way out.
 {attacker} finds the gap in {target}'s ribs on the third try. It is enough.
 {attacker} lowers {target} to the floor quietly, blade still in.
 
 [decay]
-bleed  | The {affliction} {attacker} opened has not closed; {target} loses {damage} damage to it.
-bleed  | {target} slips on their own blood — the {affliction} from {attacker} takes {damage} damage.
-poison | The {affliction} {attacker} left climbs {target}'s arm for {damage} damage.
-poison | {attacker} is long gone; {target} sweats through {damage} damage of {affliction}.
+bleed  | The {affliction} {attacker} left has not closed; {target} loses {damage} damage to it.
+bleed  | {target} leaves a boot-print in their own blood — {attacker}'s {affliction} costs {damage} damage more.
+bleed  | Nobody has touched {target} in a while, and {attacker}'s {affliction} takes {damage} damage anyway.
+poison | The {affliction} {attacker} left climbs another joint up {target}'s arm — {damage} damage.
+poison | {attacker} is long gone; the {affliction} keeps working {target} for {damage} damage.
+poison | {target}'s hands have started shaking — {attacker}'s {affliction} goes {damage} damage deeper.
 
 [decay-kill]
 bleed  | {attacker} was never in front of {target}. The {affliction} finishes it.
+bleed  | The {affliction} {attacker} opened runs {target} out of blood mid-step.
 poison | The {affliction} {attacker} left stops {target}'s heart between one breath and the next.
+poison | {target} turns to look for {attacker} and the {affliction} closes the matter first.

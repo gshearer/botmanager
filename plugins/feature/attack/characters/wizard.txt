@@ -1,5 +1,6 @@
 # wizard — raw energy, delivered directly. No weapons, no afflictions,
-# no healing: everything it does, it does at once.
+# no mending: everything it does, it does at once. See
+# ../new-class-prompt.txt for the grammar and the fairness rules.
 
 type: wizard
 desc: Raw energy, delivered directly. Fire, force and frost.
@@ -7,37 +8,42 @@ desc: Raw energy, delivered directly. Fire, force and frost.
 [damage]
 minor    | {attacker} snaps a spark off a fingertip into {target}'s collar for {damage} damage.
 minor    | {attacker} tugs the floor out from under {target} for {damage} damage.
-minor    | {attacker} throws a fistful of cold air into {target}'s face for {damage} damage.
-minor    | {attacker} makes the air around {target} shudder hard enough to bruise — {damage} damage.
-minor    | {attacker} lights {target}'s sleeve and lets them beat it out for {damage} damage.
-minor    | {attacker} flicks a stone off the wall into {target}'s temple for {damage} damage.
-minor    | {attacker} pulls the breath out of {target} for a moment — {damage} damage.
+minor    | {attacker} claps once and {target}'s ears pay for it — {damage} damage.
+minor    | {attacker} lights {target}'s sleeve and watches them beat it out — {damage} damage.
+minor    | {attacker} pulls the warmth out of {target}'s hands until the fingers quit — {damage} damage.
+minor    | {attacker} flicks a pebble off the far wall into the back of {target}'s head — {damage} damage.
+minor    | {attacker} thickens the air in {target}'s throat for one long moment — {damage} damage.
+minor    | {attacker} lets static crawl up {target}'s spine and bite at the top — {damage} damage.
 
-medium   | {attacker} puts a bolt of force through {target}'s shoulder for {damage} damage.
-medium   | {attacker} opens a sheet of flame across {target}'s chest for {damage} damage.
-medium   | {attacker} freezes the water in {target}'s eyes shut for {damage} damage.
+medium   | {attacker} puts a bolt of force through {target}'s guard and the shoulder behind it — {damage} damage.
+medium   | {attacker} rolls a sheet of flame across {target}'s chest for {damage} damage.
 medium   | {attacker} throws {target} into the ceiling and lets go for {damage} damage.
-medium   | {attacker} draws an arc of lightning down {target}'s spine for {damage} damage.
-medium   | {attacker} folds the air into an edge and drags it across {target} — {damage} damage.
-medium   | {attacker} sets the stone under {target} glowing, then standing on it hurts — {damage} damage.
+medium   | {attacker} walks lightning down {target}'s spine one vertebra at a time — {damage} damage.
+medium   | {attacker} folds the air into an edge and draws it across {target} for {damage} damage.
+medium   | {attacker} freezes {target}'s boots to the floor and lets momentum do the arithmetic — {damage} damage.
+medium   | {attacker} collapses the air beside {target}'s ear hard enough to draw blood — {damage} damage.
+medium   | {attacker} leaves a line of fire where {target} was about to step — {damage} damage.
 
 major    | {attacker} lands a lance of fire in {target}'s chest and holds it there for {damage} damage.
 major    | {attacker} hammers {target} flat with a wall of force for {damage} damage.
-major    | {attacker} calls lightning down through {target} and out the floor for {damage} damage.
-major    | {attacker} freezes {target}'s arm solid and then breaks it for {damage} damage.
+major    | {attacker} calls lightning down through {target} and out through the floor for {damage} damage.
+major    | {attacker} freezes {target}'s arm to the shoulder and raps it, once — {damage} damage.
+major    | {attacker} picks {target} up with a thought and files them under the flagstones — {damage} damage.
+major    | {attacker} sets the air in {target}'s lungs alight for {damage} damage.
 major    | {attacker} drags {target} the length of the room across bare stone for {damage} damage.
-major    | {attacker} sets the air burning in {target}'s lungs for {damage} damage.
-major    | {attacker} turns the ground beneath {target} to glass and lets them fall through — {damage} damage.
+major    | {attacker} tightens the air around {target} until something creaks and gives — {damage} damage.
 
 critical | {attacker} lets go of everything at once and {target} disappears inside it. {damage} CRITICAL damage!
-critical | {attacker} puts a column of fire through {target} and out the roof. {damage} CRITICAL damage!
 critical | {attacker} closes a fist and {target} closes with it. {damage} CRITICAL damage!
-critical | {attacker} calls the storm down onto {target} until nothing is standing. {damage} CRITICAL damage!
+critical | {attacker} unmakes the air where {target} is standing. {damage} CRITICAL damage!
+critical | {attacker} puts a column of fire through {target} and out through the roof. {damage} CRITICAL damage!
 critical | {attacker} throws {target} through three walls without touching them. {damage} CRITICAL damage!
 critical | {attacker} freezes {target} through and shatters what is left. {damage} CRITICAL damage!
-critical | {attacker} unmakes the air where {target} is standing. {damage} CRITICAL damage!
+critical | {attacker} calls the storm down onto {target} until nothing is standing. {damage} CRITICAL damage!
+critical | {attacker} sends {target} somewhere else and declines to bring all of them back. {damage} CRITICAL damage!
 
 [death]
 {attacker} lowers a hand and {target} stops being a problem.
-{attacker} burns {target} down to the floor and steps around the mark.
+{attacker} burns {target} down to a mark on the floor and steps around it.
 {attacker} lets the light go out. {target} goes with it.
+{attacker} turns away before {target} has finished falling.

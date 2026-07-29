@@ -1,57 +1,65 @@
-# necromancer — takes what is owed and sets the dead to collecting the
-# rest. Drains directly; the rot arrives with teeth.
+# necromancer — takes what is owed and sets the dead to collect the
+# rest. Drains directly; the rot arrives with hands and teeth. See
+# ../new-class-prompt.txt for the grammar and the fairness rules.
 
 type: necromancer
 desc: Takes what is owed, and sets the dead to collect the rest.
 
 [damage]
-minor    | {attacker} lays two fingers on {target} and takes the warmth out of them for {damage} damage.
-minor    | {attacker} lets something cold walk over {target} for {damage} damage.
-minor    | {attacker} snaps a finger bone and {target} feels it in the jaw — {damage} damage.
-minor    | {attacker} pulls the strength out of {target}'s grip for {damage} damage.
-minor    | {attacker} sends a dead hand up out of the floor to open {target}'s calf — {damage} damage.
+minor    | {attacker} lays two fingers on {target} and takes the warmth off them for {damage} damage.
+minor    | {attacker} lets something cold walk through {target} on its way past — {damage} damage.
+minor    | {attacker} snaps a spare finger bone and {target} feels it in their own jaw — {damage} damage.
+minor    | {attacker} borrows the strength out of {target}'s grip, indefinitely — {damage} damage.
+minor    | {attacker} sends one dead hand up through the floor to open {target}'s calf — {damage} damage.
+minor    | {attacker} reads {target} both of their dates, quietly — {damage} damage.
 
 medium   | {attacker} closes a fist and something in {target}'s chest tightens with it for {damage} damage.
 medium   | {attacker} calls a corpse up under {target} and lets it pull for {damage} damage.
-medium   | {attacker} draws a year out of {target} in one breath — {damage} damage.
-medium   | {attacker} sets grave-cold into {target}'s wound for {damage} damage.
-medium   | {attacker} lets the dead take {target} by both ankles for {damage} damage.
+medium   | {attacker} draws a year out of {target} in one slow breath — {damage} damage.
+medium   | {attacker} sets grave-cold into {target}'s wound and lets it spread for {damage} damage.
+medium   | {attacker} has the dead take {target} by both ankles for {damage} damage.
+medium   | {attacker} points, and three buried hands agree about {target} — {damage} damage.
 
-major    | {attacker} takes a long pull from {target} and stands up straighter for {damage} damage.
-major    | {attacker} raises three of them and they get to {target} at once — {damage} damage.
-major    | {attacker} withers {target}'s arm to the bone for {damage} damage.
+major    | {attacker} takes a long pull from {target} and stands a little straighter for {damage} damage.
+major    | {attacker} raises three of the patient dead and they reach {target} together — {damage} damage.
+major    | {attacker} withers {target}'s sword arm to the bone for {damage} damage.
 major    | {attacker} opens {target} and reaches in for what is still working — {damage} damage.
-major    | {attacker} lets the floor come apart and the dead take {target} down into it for {damage} damage.
+major    | {attacker} lets the floor give way and the dead walk {target} down into it for {damage} damage.
+major    | {attacker} tells {target}'s blood it is owed elsewhere, and it starts leaving — {damage} damage.
 
 critical | {attacker} takes everything {target} had left and does not give it back. {damage} CRITICAL damage!
 critical | {attacker} calls the whole yard up and they bury {target} standing. {damage} CRITICAL damage!
 critical | {attacker} ages {target} sixty years between one word and the next. {damage} CRITICAL damage!
-critical | {attacker} pulls {target}'s bones out through the skin and lets them fall. {damage} CRITICAL damage!
 critical | {attacker} makes {target} watch their own hands go grey. {damage} CRITICAL damage!
+critical | {attacker} stops paying {target}'s heart and waits out the notice period. {damage} CRITICAL damage!
+critical | {attacker} forecloses on {target}, effective immediately. {damage} CRITICAL damage!
 
 [dot]
-drain | withering grip | {attacker} takes hold of {target} and does not let go — the {affliction} keeps taking.
-drain | hollowing      | {attacker} opens a {affliction} in {target} that runs one way, outward.
-drain | grave thirst   | {attacker} leaves a {affliction} in {target} that drinks on its own schedule.
+drain | withering grip   | {attacker} takes hold of {target} and does not let go — the {affliction} keeps taking.
+drain | hollowing        | {attacker} opens a {affliction} in {target} that runs one way only, outward.
+drain | grave thirst     | {attacker} leaves a {affliction} in {target} that drinks on its own schedule.
+drain | standing debt    | {attacker} writes {target} into the ledger and the {affliction} begins collecting.
 rot   | gnawing skeleton | {attacker} sets a {affliction} on {target} and walks away.
-rot   | grave rot      | {attacker} works {affliction} into the wound and lets {target} carry it home.
-rot   | crawling hand  | {attacker} leaves a {affliction} clamped to {target}'s back.
+rot   | crawling hand    | {attacker} leaves a {affliction} clamped between {target}'s shoulders.
+rot   | tomb worm        | {attacker} drops a {affliction} into the wound and stops thinking about {target}.
+rot   | grave hound      | {attacker} whistles once and a {affliction} takes {target} by the hamstring.
 
 [death]
 {attacker} takes the last of it. {target} is an empty coat on the floor.
-{attacker} lets the dead finish {target} and then calls them off.
-{attacker} closes a hand. {target} does not need to be told it is over.
+{attacker} lets the dead finish {target}, then calls them off like dogs.
+{attacker} closes a hand and {target} gets the message all at once.
+{attacker} makes a small note somewhere, and {target}'s account is closed.
 
 [decay]
-drain | The {affliction} {attacker} left takes another {damage} damage out of {target}.
-drain | {target} is still paying {attacker}: the {affliction} costs {damage} damage.
+drain | The {affliction} {attacker} left takes another {damage} damage off {target}.
+drain | {target} is still paying {attacker} — the {affliction} collects {damage} damage.
+drain | {target} goes grey at the edges as {attacker}'s {affliction} draws off {damage} damage more.
 rot   | The {affliction} {attacker} set on {target} works another {damage} damage loose.
-rot   | {attacker} is not watching; the {affliction} opens {target} for {damage} damage regardless.
-drain | {target} goes grey at the edges — {attacker}'s {affliction} takes {damage} damage.
-rot   | The {affliction} {attacker} planted chews through {damage} damage of {target}.
+rot   | {attacker} is not even watching; the {affliction} eats {damage} damage further into {target}.
+rot   | The {affliction} {attacker} left takes {damage} damage more of {target}, without hurrying.
 
 [decay-kill]
-drain | There is nothing left in {target} for {attacker}'s {affliction} to take.
+drain | There is nothing left in {target} for {attacker}'s {affliction} to take, so it stops.
 drain | The {affliction} {attacker} opened finishes {target} quietly, from the inside.
-rot   | The {affliction} {attacker} set on {target} finally gets through the last of it.
+rot   | The {affliction} {attacker} set loose gets through the last of {target}.
 rot   | {attacker} is a room away when the {affliction} finishes {target}.

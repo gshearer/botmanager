@@ -158,14 +158,20 @@ being the fourth sword user.
 
 Recorded so the next author does not have to re-derive it.
 
-The model configured for this plugin is **`g4nv`**
-(`nvidia/Gemma-4-31B-IT-NVFP4`, service `hiigara-chat`, 98304 context) —
-local, no per-token cost, and comfortably large enough to write a
-100-move sheet in one response.
-
-Feed it this whole file plus a one-line brief naming the class and its
-flavour of violence.
+Operator ruling 2026-07-29: sheets are authored directly by the coding
+agent working this repository. Read this whole file, take the one-line
+brief, and write the sheet by hand — sheets are static data, so there is
+no model in the loop and no reason for one. Give each class ONE voice
+and make every line answer to it; the craft rules above are the floor,
+not the target. (A local-model route was recorded here previously; it
+was never load-bearing, and the 2026-07-29 rewrite replaced all six
+sheets by hand.)
 
 The gate is `attack reload` reporting zero rejections, not the provenance
 of the text. A rejection is logged with the file, the line number and the
-reason; fix the line and reload again.
+reason; fix the line and reload again. Where possible, prove it before
+the daemon is involved: the loader compiles standalone — stub `clam`,
+`mem_*`, `util_rand`, `validate_alnum` and `atk_tunables_load`,
+`#include` the real `attack_class.c`, and run the directory through
+`atk_class_load()` under sanitizers. ACHIEVED.md ("The sheets
+re-authored") records a worked example.

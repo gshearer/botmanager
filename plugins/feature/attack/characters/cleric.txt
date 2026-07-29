@@ -1,44 +1,54 @@
-# cleric — borrowed authority, applied bluntly. Smites and mends; leaves
-# nothing behind that keeps working on its own.
+# cleric — borrowed authority, applied bluntly. Smites with mace and
+# called-down light, mends what it chooses to, leaves nothing lingering.
+# See ../new-class-prompt.txt for the grammar and the fairness rules.
 
 type: cleric
 desc: Borrowed authority. Smites, hammers and mends the fallen.
 
 [damage]
-minor    | {attacker} raps {target} across the knuckles with a censer for {damage} damage.
+minor    | {attacker} raps {target} across the knuckles with the censer for {damage} damage.
 minor    | {attacker} says a short word and {target}'s nose starts bleeding — {damage} damage.
-minor    | {attacker} shoves {target} back with a wall of cold air for {damage} damage.
 minor    | {attacker} flicks holy water into {target}'s eyes for {damage} damage.
 minor    | {attacker} brings the mace haft down on {target}'s wrist for {damage} damage.
+minor    | {attacker} swings the censer through a low arc and catches {target} under the chin — {damage} damage.
+minor    | {attacker} rings the small bell beside {target}'s ear and the note refuses to leave — {damage} damage.
+minor    | {attacker} presses a thumb of ash to {target}'s brow and it burns where it sits — {damage} damage.
 
-medium   | {attacker} calls down a wash of light that scours {target} for {damage} damage.
+medium   | {attacker} calls down a wash of light that scours {target} raw for {damage} damage.
 medium   | {attacker} swings the mace into {target}'s hip and hears it go — {damage} damage.
 medium   | {attacker} lays a hand on {target} and takes something out of them for {damage} damage.
-medium   | {attacker} slams a shield of hard air into {target}'s chest for {damage} damage.
-medium   | {attacker} speaks over {target} until the air itself pushes back — {damage} damage.
+medium   | {attacker} reads {target}'s sins aloud, and the list has weight — {damage} damage.
+medium   | {attacker} snaps the mace up under {target}'s chin without breaking the benediction — {damage} damage.
+medium   | {attacker} anoints the mace head with burning oil and lays it across {target}'s ribs — {damage} damage.
+medium   | {attacker} turns the reliquary toward {target} and the light leans on them — {damage} damage.
 
 major    | {attacker} brings a pillar of white fire down on {target} for {damage} damage.
 major    | {attacker} caves in {target}'s shoulder with the mace and keeps praying — {damage} damage.
-major    | {attacker} calls judgement and {target} is thrown across the floor for {damage} damage.
+major    | {attacker} pronounces judgement and {target} is thrown bodily across the floor for {damage} damage.
 major    | {attacker} presses a burning sigil into {target}'s chest for {damage} damage.
 major    | {attacker} breaks {target}'s guard, then the arm behind it, for {damage} damage.
+major    | {attacker} drops {target} to their knees mid-plea and finishes the sentence with the mace — {damage} damage.
+major    | {attacker} swings the censer full-circle into {target}'s temple and the coals scatter — {damage} damage.
 
 critical | {attacker} calls the whole weight of it down and {target} folds under the light. {damage} CRITICAL damage!
 critical | {attacker} smites {target} until there is very little left to smite. {damage} CRITICAL damage!
 critical | {attacker} drives the mace through {target}'s helm and everything under it. {damage} CRITICAL damage!
 critical | {attacker} speaks one word over {target} and something inside gives out. {damage} CRITICAL damage!
-critical | {attacker} brings the pillar down a second time on {target}. {damage} CRITICAL damage!
+critical | {attacker} closes the book on {target}. {damage} CRITICAL damage!
+critical | {attacker} delivers the verdict and the floor around {target} scorches in a perfect circle. {damage} CRITICAL damage!
 
 [heal]
-minor | {attacker} presses a hand to {target}'s wound and the bleeding stops — {heal} hit points.
-minor | {attacker} says a few words over {target} and the shaking eases. {heal} hit points.
+minor | {attacker} presses a palm to {target}'s wound and the bleeding stops — {heal} hit points.
+minor | {attacker} murmurs a psalm over {target} and the shaking eases. {heal} hit points.
 minor | {attacker} binds {target}'s arm and pours something bitter down their throat — {heal} hit points.
-minor | {attacker} sets a warm hand on {target}'s back until the breathing steadies. {heal} hit points.
-major | {attacker} sets {target}'s bones straight and hauls them upright — {heal} hit points.
+minor | {attacker} traces oil across {target}'s brow and some of the colour comes back. {heal} hit points.
+minor | {attacker} sets a warm hand between {target}'s shoulders until the breathing steadies. {heal} hit points.
+major | {attacker} sets {target}'s bones straight in one motion and hauls them upright — {heal} hit points.
 major | {attacker} closes {target}'s wound entirely; only the blood on the floor says it happened. {heal} hit points.
 major | {attacker} calls the light down over {target} and it puts them back together. {heal} hit points.
+major | {attacker} recites the long litany and {target}'s wounds close in the order they were earned. {heal} hit points.
 
 [death]
 {attacker} finishes {target} and says the words over the body anyway.
-{attacker} brings the mace down once more. {target} is done.
 {attacker} closes {target}'s eyes without much ceremony.
+{attacker} lowers the mace and grants {target} the only mercy still on offer.
