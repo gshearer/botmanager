@@ -203,8 +203,8 @@ bool cmd_register(const char *module, const char *name,
 
 // Unregister a command and its entire subtree, addressed with the same
 // slash-delimited grammar cmd_register() uses for parent_path:
-//   "melee"             the root command `melee`
-//   "show/melee"        the `melee` child of root `show`
+//   "attack"            the root command `attack`
+//   "show/attack"       the `attack` child of root `show`
 //   "irc/network/list"  a leaf three levels deep
 // Removal is depth-first: every descendant is freed before its parent,
 // so no definition is ever reparented. An unresolved path is silent --

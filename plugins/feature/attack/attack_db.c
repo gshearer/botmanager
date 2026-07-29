@@ -1,11 +1,11 @@
 // botmanager — MIT
-// melee persistence: table naming and the schema bootstrap for the pit's
+// attack persistence: table naming and the schema bootstrap for the pit's
 // three tables. The configured prefix is the only identifier ever pasted
 // into SQL verbatim, so it is validated as a bare identifier first; every
 // user-originated value goes through db_escape at its own call site.
 
-#define MELEE_INTERNAL
-#include "melee.h"
+#define ATTACK_INTERNAL
+#include "attack.h"
 
 #include "alloc.h"
 #include "db.h"
@@ -27,23 +27,23 @@
 // refuse: the prefix is pasted into DDL and queries verbatim, so it must
 // be letters, digits and underscores, and must not open with a digit.
 static bool
-melee_table_prefix(char *out, size_t cap)
+atk_table_prefix(char *out, size_t cap)
 {
-  const char *name = kv_get_str(MELEE_KV_PREFIX);
+  const char *name = kv_get_str(ATK_KV_PREFIX);
   size_t      len;
 
   if(out == NULL || cap == 0)
     return(FAIL);
 
   if(name == NULL || name[0] == '\0')
-    name = "melee";
+    name = "attack";
 
   len = strlen(name);
 
   if(len >= cap || !validate_alnum(name, cap - 1) ||
      isdigit((unsigned char)name[0]))
   {
-    clam(CLAM_WARN, MELEE_CTX,
+    clam(CLAM_WARN, ATK_CTX,
         "configured table prefix '%s' is not a safe identifier", name);
     return(FAIL);
   }
@@ -53,14 +53,14 @@ melee_table_prefix(char *out, size_t cap)
 }
 
 bool
-melee_tables_resolve(melee_tables_t *out)
+atk_tables_resolve(atk_tables_t *out)
 {
-  char prefix[MELEE_PREFIX_SZ];
+  char prefix[ATK_PREFIX_SZ];
 
   if(out == NULL)
     return(FAIL);
 
-  if(melee_table_prefix(prefix, sizeof(prefix)) != SUCCESS)
+  if(atk_table_prefix(prefix, sizeof(prefix)) != SUCCESS)
     return(FAIL);
 
   snprintf(out->rounds,  sizeof(out->rounds),  "%s_rounds",  prefix);
@@ -77,11 +77,11 @@ melee_tables_resolve(melee_tables_t *out)
 
 // CREATE TABLE IF NOT EXISTS is idempotent, but a mutex keeps concurrent
 // bot starts from racing the batch and doubling the log noise.
-static bool            melee_schema_done = false;
-static pthread_mutex_t melee_schema_lock = PTHREAD_MUTEX_INITIALIZER;
+static bool            atk_schema_done = false;
+static pthread_mutex_t atk_schema_lock = PTHREAD_MUTEX_INITIALIZER;
 
 static bool
-melee_run_ddl(const char *sql)
+atk_run_ddl(const char *sql)
 {
   db_result_t *res = db_result_alloc();
   bool         ok  = SUCCESS;
@@ -91,7 +91,7 @@ melee_run_ddl(const char *sql)
 
   if(db_query(sql, res) != SUCCESS || !res->ok)
   {
-    clam(CLAM_WARN, MELEE_CTX, "ddl failed: %s",
+    clam(CLAM_WARN, ATK_CTX, "ddl failed: %s",
         res->error[0] != '\0' ? res->error : "(no driver error)");
     ok = FAIL;
   }
@@ -101,23 +101,23 @@ melee_run_ddl(const char *sql)
 }
 
 bool
-melee_schema_ensure(void)
+atk_schema_ensure(void)
 {
-  melee_tables_t t;
-  char           sql[1280];
-  bool           ok = FAIL;
+  atk_tables_t t;
+  char         sql[1280];
+  bool         ok = FAIL;
 
-  pthread_mutex_lock(&melee_schema_lock);
+  pthread_mutex_lock(&atk_schema_lock);
 
-  if(melee_schema_done)
+  if(atk_schema_done)
   {
-    pthread_mutex_unlock(&melee_schema_lock);
+    pthread_mutex_unlock(&atk_schema_lock);
     return(SUCCESS);
   }
 
-  if(melee_tables_resolve(&t) != SUCCESS)
+  if(atk_tables_resolve(&t) != SUCCESS)
   {
-    pthread_mutex_unlock(&melee_schema_lock);
+    pthread_mutex_unlock(&atk_schema_lock);
     return(FAIL);
   }
 
@@ -144,7 +144,7 @@ melee_schema_ensure(void)
       " ended_at    TIMESTAMPTZ"
       ")", t.rounds);
 
-  if(melee_run_ddl(sql) != SUCCESS)
+  if(atk_run_ddl(sql) != SUCCESS)
     goto out;
 
   // One active round per (namespace, method, channel). This partial
@@ -155,7 +155,7 @@ melee_schema_ensure(void)
       " ON %s(ns_id, method, channel) WHERE state = 0",
       t.rounds, t.rounds);
 
-  if(melee_run_ddl(sql) != SUCCESS)
+  if(atk_run_ddl(sql) != SUCCESS)
     goto out;
 
   // A combatant's standing within one round. last_wave is the wave in
@@ -179,7 +179,7 @@ melee_schema_ensure(void)
       " PRIMARY KEY (round_id, username)"
       ")", t.players, t.rounds);
 
-  if(melee_run_ddl(sql) != SUCCESS)
+  if(atk_run_ddl(sql) != SUCCESS)
     goto out;
 
   // Lifetime standings, keyed on the namespace-scoped username so a nick
@@ -203,7 +203,7 @@ melee_schema_ensure(void)
       " PRIMARY KEY (ns_id, username)"
       ")", t.scores);
 
-  if(melee_run_ddl(sql) != SUCCESS)
+  if(atk_run_ddl(sql) != SUCCESS)
     goto out;
 
   // The leaderboard's one ordering.
@@ -211,7 +211,7 @@ melee_schema_ensure(void)
       "CREATE INDEX IF NOT EXISTS idx_%s_dmg ON %s(ns_id, dmg_given DESC)",
       t.scores, t.scores);
 
-  if(melee_run_ddl(sql) != SUCCESS)
+  if(atk_run_ddl(sql) != SUCCESS)
     goto out;
 
   // An affliction left by a blow, decaying on its own clock. `method`
@@ -238,7 +238,7 @@ melee_schema_ensure(void)
       " created_at  TIMESTAMPTZ  NOT NULL DEFAULT NOW()"
       ")", t.dots, t.rounds);
 
-  if(melee_run_ddl(sql) != SUCCESS)
+  if(atk_run_ddl(sql) != SUCCESS)
     goto out;
 
   // The decay task's whole query plan: a range scan over live rows due
@@ -247,7 +247,7 @@ melee_schema_ensure(void)
       "CREATE INDEX IF NOT EXISTS idx_%s_due ON %s(next_tick) WHERE state = 0",
       t.dots, t.dots);
 
-  if(melee_run_ddl(sql) != SUCCESS)
+  if(atk_run_ddl(sql) != SUCCESS)
     goto out;
 
   // What the stack cap counts, and what the round card asks for.
@@ -256,17 +256,17 @@ melee_schema_ensure(void)
       " ON %s(round_id, victim) WHERE state = 0",
       t.dots, t.dots);
 
-  if(melee_run_ddl(sql) != SUCCESS)
+  if(atk_run_ddl(sql) != SUCCESS)
     goto out;
 
-  melee_schema_done = true;
+  atk_schema_done = true;
   ok = SUCCESS;
-  clam(CLAM_INFO, MELEE_CTX,
-      "melee schema ready (tables '%s', '%s', '%s', '%s')",
+  clam(CLAM_INFO, ATK_CTX,
+      "attack schema ready (tables '%s', '%s', '%s', '%s')",
       t.rounds, t.players, t.scores, t.dots);
 
 out:
-  pthread_mutex_unlock(&melee_schema_lock);
+  pthread_mutex_unlock(&atk_schema_lock);
   return(ok);
 }
 
@@ -275,7 +275,7 @@ out:
 // ------------------------------------------------------------------ //
 
 static int32_t
-melee_col_i32(const db_result_t *res, uint32_t row, uint32_t col)
+atk_col_i32(const db_result_t *res, uint32_t row, uint32_t col)
 {
   const char *s = db_result_get(res, row, col);
 
@@ -283,7 +283,7 @@ melee_col_i32(const db_result_t *res, uint32_t row, uint32_t col)
 }
 
 static int64_t
-melee_col_i64(const db_result_t *res, uint32_t row, uint32_t col)
+atk_col_i64(const db_result_t *res, uint32_t row, uint32_t col)
 {
   const char *s = db_result_get(res, row, col);
 
@@ -291,7 +291,7 @@ melee_col_i64(const db_result_t *res, uint32_t row, uint32_t col)
 }
 
 static void
-melee_col_str(char *dst, size_t cap, const db_result_t *res, uint32_t row,
+atk_col_str(char *dst, size_t cap, const db_result_t *res, uint32_t row,
     uint32_t col)
 {
   const char *s = db_result_get(res, row, col);
@@ -302,7 +302,7 @@ melee_col_str(char *dst, size_t cap, const db_result_t *res, uint32_t row,
 // Run a statement that returns no rows we care about. `what` names the
 // operation for the failure log.
 static bool
-melee_exec(const char *sql, const char *what, uint32_t *affected)
+atk_exec(const char *sql, const char *what, uint32_t *affected)
 {
   db_result_t *res = db_result_alloc();
   bool         ok  = FAIL;
@@ -319,7 +319,7 @@ melee_exec(const char *sql, const char *what, uint32_t *affected)
   }
 
   else
-    clam(CLAM_WARN, MELEE_CTX, "%s failed: %s", what,
+    clam(CLAM_WARN, ATK_CTX, "%s failed: %s", what,
         (res->error[0] != '\0') ? res->error : "(no driver error)");
 
   db_result_free(res);
@@ -331,17 +331,17 @@ melee_exec(const char *sql, const char *what, uint32_t *affected)
 // ------------------------------------------------------------------ //
 
 bool
-melee_db_round_find(uint32_t ns_id, const char *method, const char *channel,
-    melee_round_t *out)
+atk_db_round_find(uint32_t ns_id, const char *method, const char *channel,
+    atk_round_t *out)
 {
-  melee_tables_t t;
-  db_result_t   *res     = NULL;
-  char          *e_meth  = NULL;
-  char          *e_chan  = NULL;
-  char           sql[768];
-  bool           hit = false;
+  atk_tables_t t;
+  db_result_t *res     = NULL;
+  char        *e_meth  = NULL;
+  char        *e_chan  = NULL;
+  char         sql[768];
+  bool         hit = false;
 
-  if(out == NULL || melee_tables_resolve(&t) != SUCCESS)
+  if(out == NULL || atk_tables_resolve(&t) != SUCCESS)
     return(false);
 
   memset(out, 0, sizeof(*out));
@@ -357,17 +357,17 @@ melee_db_round_find(uint32_t ns_id, const char *method, const char *channel,
       " EXTRACT(EPOCH FROM (NOW() - last_action))::bigint"
       " FROM %s WHERE ns_id = %" PRIu32 " AND method = '%s'"
       " AND channel = '%s' AND state = %d",
-      t.rounds, ns_id, e_meth, e_chan, MELEE_ROUND_ACTIVE);
+      t.rounds, ns_id, e_meth, e_chan, ATK_ROUND_ACTIVE);
 
   res = db_result_alloc();
 
   if(res != NULL && db_query(sql, res) == SUCCESS && res->ok && res->rows == 1)
   {
-    out->id       = melee_col_i64(res, 0, 0);
-    out->wave     = melee_col_i32(res, 0, 1);
-    out->blows    = melee_col_i32(res, 0, 2);
-    out->top_crit = melee_col_i32(res, 0, 3);
-    out->idle     = melee_col_i64(res, 0, 4);
+    out->id       = atk_col_i64(res, 0, 0);
+    out->wave     = atk_col_i32(res, 0, 1);
+    out->blows    = atk_col_i32(res, 0, 2);
+    out->top_crit = atk_col_i32(res, 0, 3);
+    out->idle     = atk_col_i64(res, 0, 4);
     hit = true;
   }
 
@@ -380,34 +380,34 @@ out:
 }
 
 bool
-melee_db_round_abandon(int64_t round_id)
+atk_db_round_abandon(int64_t round_id)
 {
-  melee_tables_t t;
-  char           sql[256];
+  atk_tables_t t;
+  char         sql[256];
 
-  if(round_id <= 0 || melee_tables_resolve(&t) != SUCCESS)
+  if(round_id <= 0 || atk_tables_resolve(&t) != SUCCESS)
     return(FAIL);
 
   snprintf(sql, sizeof(sql),
       "UPDATE %s SET state = %d, ended_at = NOW() WHERE id = %" PRId64,
-      t.rounds, MELEE_ROUND_ABANDONED, round_id);
+      t.rounds, ATK_ROUND_ABANDONED, round_id);
 
-  return(melee_exec(sql, "round abandon", NULL));
+  return(atk_exec(sql, "round abandon", NULL));
 }
 
 int64_t
-melee_db_round_open(uint32_t ns_id, const char *method, const char *channel,
+atk_db_round_open(uint32_t ns_id, const char *method, const char *channel,
     const char *opener)
 {
-  melee_tables_t t;
-  db_result_t   *res      = NULL;
-  char          *e_meth   = NULL;
-  char          *e_chan   = NULL;
-  char          *e_opener = NULL;
-  char           sql[1024];
-  int64_t        id = -1;
+  atk_tables_t t;
+  db_result_t *res      = NULL;
+  char        *e_meth   = NULL;
+  char        *e_chan   = NULL;
+  char        *e_opener = NULL;
+  char         sql[1024];
+  int64_t      id = -1;
 
-  if(melee_tables_resolve(&t) != SUCCESS)
+  if(atk_tables_resolve(&t) != SUCCESS)
     return(-1);
 
   e_meth   = db_escape(method  != NULL ? method  : "");
@@ -425,10 +425,10 @@ melee_db_round_open(uint32_t ns_id, const char *method, const char *channel,
   res = db_result_alloc();
 
   if(res != NULL && db_query(sql, res) == SUCCESS && res->ok && res->rows == 1)
-    id = melee_col_i64(res, 0, 0);
+    id = atk_col_i64(res, 0, 0);
 
   else
-    clam(CLAM_WARN, MELEE_CTX, "round open failed: %s",
+    clam(CLAM_WARN, ATK_CTX, "round open failed: %s",
         (res != NULL && res->error[0] != '\0')
             ? res->error : "(no driver error)");
 
@@ -449,17 +449,17 @@ out:
 // row is bumped only for the enrolment that actually inserted, so a
 // combatant struck ten times in one brawl still counts one round.
 bool
-melee_db_player_enrol(int64_t round_id, uint32_t ns_id, const char *username,
+atk_db_player_enrol(int64_t round_id, uint32_t ns_id, const char *username,
     const char *nickname, int32_t hp)
 {
-  melee_tables_t t;
-  char          *e_user = NULL;
-  char          *e_nick = NULL;
-  char           sql[1536];
-  uint32_t       affected = 0;
-  bool           fresh    = false;
+  atk_tables_t t;
+  char        *e_user = NULL;
+  char        *e_nick = NULL;
+  char         sql[1536];
+  uint32_t     affected = 0;
+  bool         fresh    = false;
 
-  if(round_id <= 0 || username == NULL || melee_tables_resolve(&t) != SUCCESS)
+  if(round_id <= 0 || username == NULL || atk_tables_resolve(&t) != SUCCESS)
     return(false);
 
   e_user = db_escape(username);
@@ -483,7 +483,7 @@ melee_db_player_enrol(int64_t round_id, uint32_t ns_id, const char *username,
       t.players, round_id, ns_id, e_user, e_nick, hp, hp,
       t.scores, ns_id, e_user, e_nick, t.scores);
 
-  if(melee_exec(sql, "player enrol", &affected) == SUCCESS)
+  if(atk_exec(sql, "player enrol", &affected) == SUCCESS)
     fresh = (affected > 0);
 
 out:
@@ -494,16 +494,16 @@ out:
 }
 
 bool
-melee_db_player_get(int64_t round_id, const char *username,
-    melee_player_t *out)
+atk_db_player_get(int64_t round_id, const char *username,
+    atk_player_t *out)
 {
-  melee_tables_t t;
-  db_result_t   *res    = NULL;
-  char          *e_user = NULL;
-  char           sql[512];
-  bool           hit = false;
+  atk_tables_t t;
+  db_result_t *res    = NULL;
+  char        *e_user = NULL;
+  char         sql[512];
+  bool         hit = false;
 
-  if(out == NULL || username == NULL || melee_tables_resolve(&t) != SUCCESS)
+  if(out == NULL || username == NULL || atk_tables_resolve(&t) != SUCCESS)
     return(false);
 
   memset(out, 0, sizeof(*out));
@@ -522,10 +522,10 @@ melee_db_player_get(int64_t round_id, const char *username,
 
   if(res != NULL && db_query(sql, res) == SUCCESS && res->ok && res->rows == 1)
   {
-    melee_col_str(out->nickname, sizeof(out->nickname), res, 0, 0);
-    out->hp        = melee_col_i32(res, 0, 1);
-    out->hp_max    = melee_col_i32(res, 0, 2);
-    out->last_wave = melee_col_i32(res, 0, 3);
+    atk_col_str(out->nickname, sizeof(out->nickname), res, 0, 0);
+    out->hp        = atk_col_i32(res, 0, 1);
+    out->hp_max    = atk_col_i32(res, 0, 2);
+    out->last_wave = atk_col_i32(res, 0, 3);
     hit = true;
   }
 
@@ -536,19 +536,19 @@ melee_db_player_get(int64_t round_id, const char *username,
 }
 
 bool
-melee_db_pending(int64_t round_id, int32_t wave, char *out, size_t cap)
+atk_db_pending(int64_t round_id, int32_t wave, char *out, size_t cap)
 {
-  melee_tables_t t;
-  db_result_t   *res = NULL;
-  char           sql[512];
-  bool           ok = FAIL;
+  atk_tables_t t;
+  db_result_t *res = NULL;
+  char         sql[512];
+  bool         ok = FAIL;
 
   if(out == NULL || cap == 0)
     return(FAIL);
 
   out[0] = '\0';
 
-  if(melee_tables_resolve(&t) != SUCCESS)
+  if(atk_tables_resolve(&t) != SUCCESS)
     return(FAIL);
 
   // Display name falls back to the username for a combatant enrolled by
@@ -564,7 +564,7 @@ melee_db_pending(int64_t round_id, int32_t wave, char *out, size_t cap)
 
   if(res != NULL && db_query(sql, res) == SUCCESS && res->ok && res->rows == 1)
   {
-    melee_col_str(out, cap, res, 0, 0);
+    atk_col_str(out, cap, res, 0, 0);
     ok = SUCCESS;
   }
 
@@ -580,18 +580,18 @@ melee_db_pending(int64_t round_id, int32_t wave, char *out, size_t cap)
 // before true), and last_action breaks the tie among finished ones — so
 // one query answers both "what is happening" and "what just happened".
 bool
-melee_db_card_find(uint32_t ns_id, const char *method, const char *channel,
-    melee_card_t *out)
+atk_db_card_find(uint32_t ns_id, const char *method, const char *channel,
+    atk_card_t *out)
 {
-  melee_tables_t t;
-  db_result_t   *res    = NULL;
-  char          *e_meth = NULL;
-  char          *e_chan = NULL;
-  char           room[512] = "";
-  char           sql[1024];
-  bool           hit = false;
+  atk_tables_t t;
+  db_result_t *res    = NULL;
+  char        *e_meth = NULL;
+  char        *e_chan = NULL;
+  char         room[512] = "";
+  char         sql[1024];
+  bool         hit = false;
 
-  if(out == NULL || melee_tables_resolve(&t) != SUCCESS)
+  if(out == NULL || atk_tables_resolve(&t) != SUCCESS)
     return(false);
 
   memset(out, 0, sizeof(*out));
@@ -616,23 +616,23 @@ melee_db_card_find(uint32_t ns_id, const char *method, const char *channel,
       " top_crit, top_crit_by, top_crit_on, slayer, fallen"
       " FROM %s WHERE ns_id = %" PRIu32 "%s"
       " ORDER BY (state = %d) DESC, last_action DESC LIMIT 1",
-      t.rounds, ns_id, room, MELEE_ROUND_ACTIVE);
+      t.rounds, ns_id, room, ATK_ROUND_ACTIVE);
 
   res = db_result_alloc();
 
   if(res != NULL && db_query(sql, res) == SUCCESS && res->ok && res->rows == 1)
   {
-    out->id     = melee_col_i64(res, 0, 0);
-    melee_col_str(out->channel, sizeof(out->channel), res, 0, 1);
-    out->state  = melee_col_i32(res, 0, 2);
-    out->wave   = melee_col_i32(res, 0, 3);
-    out->blows  = melee_col_i32(res, 0, 4);
-    out->length = melee_col_i64(res, 0, 5);
-    out->top_crit = melee_col_i32(res, 0, 6);
-    melee_col_str(out->top_by,  sizeof(out->top_by),  res, 0, 7);
-    melee_col_str(out->top_on,  sizeof(out->top_on),  res, 0, 8);
-    melee_col_str(out->slayer,  sizeof(out->slayer),  res, 0, 9);
-    melee_col_str(out->fallen,  sizeof(out->fallen),  res, 0, 10);
+    out->id     = atk_col_i64(res, 0, 0);
+    atk_col_str(out->channel, sizeof(out->channel), res, 0, 1);
+    out->state  = atk_col_i32(res, 0, 2);
+    out->wave   = atk_col_i32(res, 0, 3);
+    out->blows  = atk_col_i32(res, 0, 4);
+    out->length = atk_col_i64(res, 0, 5);
+    out->top_crit = atk_col_i32(res, 0, 6);
+    atk_col_str(out->top_by,  sizeof(out->top_by),  res, 0, 7);
+    atk_col_str(out->top_on,  sizeof(out->top_on),  res, 0, 8);
+    atk_col_str(out->slayer,  sizeof(out->slayer),  res, 0, 9);
+    atk_col_str(out->fallen,  sizeof(out->fallen),  res, 0, 10);
     hit = true;
   }
 
@@ -647,19 +647,19 @@ out:
 // COUNT(*) OVER () rides along on every row, so the roster and its true
 // size arrive together and the card can be honest about what it cut.
 uint32_t
-melee_db_card_roster(int64_t round_id, melee_card_row_t *out, uint32_t cap,
+atk_db_card_roster(int64_t round_id, atk_card_row_t *out, uint32_t cap,
     uint32_t *total)
 {
-  melee_tables_t t;
-  db_result_t   *res = NULL;
-  char           sql[768];
-  uint32_t       n = 0;
+  atk_tables_t t;
+  db_result_t *res = NULL;
+  char         sql[768];
+  uint32_t     n = 0;
 
   if(total != NULL)
     *total = 0;
 
   if(out == NULL || cap == 0 || round_id <= 0 ||
-     melee_tables_resolve(&t) != SUCCESS)
+     atk_tables_resolve(&t) != SUCCESS)
     return(0);
 
   // The table is aliased and the sort keys qualified because `username`
@@ -679,24 +679,24 @@ melee_db_card_roster(int64_t round_id, melee_card_row_t *out, uint32_t cap,
   {
     for(n = 0; n < res->rows && n < cap; n++)
     {
-      melee_col_str(out[n].name, sizeof(out[n].name), res, n, 0);
-      melee_col_str(out[n].user, sizeof(out[n].user), res, n, 8);
-      out[n].hp        = melee_col_i32(res, n, 1);
-      out[n].hp_max    = melee_col_i32(res, n, 2);
-      out[n].dmg_given = melee_col_i32(res, n, 3);
-      out[n].dmg_taken = melee_col_i32(res, n, 4);
-      out[n].best_crit = melee_col_i32(res, n, 5);
-      out[n].last_wave = melee_col_i32(res, n, 6);
+      atk_col_str(out[n].name, sizeof(out[n].name), res, n, 0);
+      atk_col_str(out[n].user, sizeof(out[n].user), res, n, 8);
+      out[n].hp        = atk_col_i32(res, n, 1);
+      out[n].hp_max    = atk_col_i32(res, n, 2);
+      out[n].dmg_given = atk_col_i32(res, n, 3);
+      out[n].dmg_taken = atk_col_i32(res, n, 4);
+      out[n].best_crit = atk_col_i32(res, n, 5);
+      out[n].last_wave = atk_col_i32(res, n, 6);
 
       if(total != NULL)
-        *total = (uint32_t)melee_col_i64(res, n, 7);
+        *total = (uint32_t)atk_col_i64(res, n, 7);
     }
   }
 
   // An empty card is indistinguishable from a broken one on screen, so
   // the failure has to say so somewhere.
   else
-    clam(CLAM_WARN, MELEE_CTX, "round card roster failed: %s",
+    clam(CLAM_WARN, ATK_CTX, "round card roster failed: %s",
         (res != NULL && res->error[0] != '\0') ? res->error
                                                : "(no driver error)");
 
@@ -705,15 +705,15 @@ melee_db_card_roster(int64_t round_id, melee_card_row_t *out, uint32_t cap,
 }
 
 uint32_t
-melee_db_scores(uint32_t ns_id, uint32_t limit, melee_score_row_t *out,
+atk_db_scores(uint32_t ns_id, uint32_t limit, atk_score_row_t *out,
     uint32_t cap)
 {
-  melee_tables_t t;
-  db_result_t   *res = NULL;
-  char           sql[640];
-  uint32_t       n = 0;
+  atk_tables_t t;
+  db_result_t *res = NULL;
+  char         sql[640];
+  uint32_t     n = 0;
 
-  if(out == NULL || cap == 0 || melee_tables_resolve(&t) != SUCCESS)
+  if(out == NULL || cap == 0 || atk_tables_resolve(&t) != SUCCESS)
     return(0);
 
   if(limit > cap)
@@ -735,14 +735,14 @@ melee_db_scores(uint32_t ns_id, uint32_t limit, melee_score_row_t *out,
   {
     for(n = 0; n < res->rows && n < limit; n++)
     {
-      melee_col_str(out[n].name, sizeof(out[n].name), res, n, 0);
-      out[n].rounds    = melee_col_i32(res, n, 1);
-      out[n].kills     = melee_col_i32(res, n, 2);
-      out[n].deaths    = melee_col_i32(res, n, 3);
-      out[n].dmg_given = melee_col_i64(res, n, 4);
-      out[n].dmg_taken = melee_col_i64(res, n, 5);
-      out[n].crits     = melee_col_i32(res, n, 6);
-      out[n].best_crit = melee_col_i32(res, n, 7);
+      atk_col_str(out[n].name, sizeof(out[n].name), res, n, 0);
+      out[n].rounds    = atk_col_i32(res, n, 1);
+      out[n].kills     = atk_col_i32(res, n, 2);
+      out[n].deaths    = atk_col_i32(res, n, 3);
+      out[n].dmg_given = atk_col_i64(res, n, 4);
+      out[n].dmg_taken = atk_col_i64(res, n, 5);
+      out[n].crits     = atk_col_i32(res, n, 6);
+      out[n].best_crit = atk_col_i32(res, n, 7);
     }
   }
 
@@ -751,13 +751,13 @@ melee_db_scores(uint32_t ns_id, uint32_t limit, melee_score_row_t *out,
 }
 
 bool
-melee_db_deadliest(uint32_t ns_id, char *by, size_t by_cap, char *on,
+atk_db_deadliest(uint32_t ns_id, char *by, size_t by_cap, char *on,
     size_t on_cap, int32_t *dmg)
 {
-  melee_tables_t t;
-  db_result_t   *res = NULL;
-  char           sql[512];
-  bool           hit = false;
+  atk_tables_t t;
+  db_result_t *res = NULL;
+  char         sql[512];
+  bool         hit = false;
 
   if(by == NULL || on == NULL || dmg == NULL || by_cap == 0 || on_cap == 0)
     return(false);
@@ -766,7 +766,7 @@ melee_db_deadliest(uint32_t ns_id, char *by, size_t by_cap, char *on,
   on[0] = '\0';
   *dmg  = 0;
 
-  if(melee_tables_resolve(&t) != SUCCESS)
+  if(atk_tables_resolve(&t) != SUCCESS)
     return(false);
 
   snprintf(sql, sizeof(sql),
@@ -780,9 +780,9 @@ melee_db_deadliest(uint32_t ns_id, char *by, size_t by_cap, char *on,
 
   if(res != NULL && db_query(sql, res) == SUCCESS && res->ok && res->rows == 1)
   {
-    melee_col_str(by, by_cap, res, 0, 0);
-    melee_col_str(on, on_cap, res, 0, 1);
-    *dmg = melee_col_i32(res, 0, 2);
+    atk_col_str(by, by_cap, res, 0, 0);
+    atk_col_str(on, on_cap, res, 0, 1);
+    *dmg = atk_col_i32(res, 0, 2);
     hit  = true;
   }
 
@@ -795,34 +795,34 @@ melee_db_deadliest(uint32_t ns_id, char *by, size_t by_cap, char *on,
 // ------------------------------------------------------------------ //
 
 bool
-melee_db_blow_apply(const melee_blow_t *b)
+atk_db_blow_apply(const atk_blow_t *b)
 {
-  melee_tables_t t;
-  char          *e_atk_u = NULL;
-  char          *e_atk_n = NULL;
-  char          *e_tgt_u = NULL;
-  char          *e_tgt_n = NULL;
-  char          *sql     = NULL;
-  char           top  [320]  = "";
-  char           death[2048] = "";
-  size_t         need;
-  bool           ok = FAIL;
+  atk_tables_t t;
+  char        *e_src_u = NULL;
+  char        *e_src_n = NULL;
+  char        *e_tgt_u = NULL;
+  char        *e_tgt_n = NULL;
+  char        *sql     = NULL;
+  char         top  [320]  = "";
+  char         death[2048] = "";
+  size_t       need;
+  bool         ok = FAIL;
 
-  if(b == NULL || melee_tables_resolve(&t) != SUCCESS)
+  if(b == NULL || atk_tables_resolve(&t) != SUCCESS)
     return(FAIL);
 
-  e_atk_u = db_escape(b->atk_user);
-  e_atk_n = db_escape(b->atk_nick);
+  e_src_u = db_escape(b->src_user);
+  e_src_n = db_escape(b->src_nick);
   e_tgt_u = db_escape(b->tgt_user);
   e_tgt_n = db_escape(b->tgt_nick);
 
-  if(e_atk_u == NULL || e_atk_n == NULL || e_tgt_u == NULL || e_tgt_n == NULL)
+  if(e_src_u == NULL || e_src_n == NULL || e_tgt_u == NULL || e_tgt_n == NULL)
     goto out;
 
   if(b->new_top)
     snprintf(top, sizeof(top),
         ", top_crit = %d, top_crit_by = '%s', top_crit_on = '%s'",
-        b->dmg, e_atk_u, e_tgt_u);
+        b->dmg, e_src_u, e_tgt_u);
 
   // A fatal blow ends the brawl in the same transaction that lands it,
   // so the round can never be left open with a corpse still in it.
@@ -834,16 +834,16 @@ melee_db_blow_apply(const melee_blow_t *b)
         " WHERE ns_id = %" PRIu32 " AND username = '%s';"
         "UPDATE %s SET deaths = deaths + 1, last_seen = NOW()"
         " WHERE ns_id = %" PRIu32 " AND username = '%s';",
-        t.rounds, MELEE_ROUND_ENDED, e_atk_u, e_tgt_u, b->round_id,
-        t.scores, b->ns_id, e_atk_u,
+        t.rounds, ATK_ROUND_ENDED, e_src_u, e_tgt_u, b->round_id,
+        t.scores, b->ns_id, e_src_u,
         t.scores, b->ns_id, e_tgt_u);
 
   need = 4096 + strlen(top) + strlen(death)
-      + 8 * (strlen(e_atk_u) + strlen(e_atk_n) + strlen(e_tgt_u)
+      + 8 * (strlen(e_src_u) + strlen(e_src_n) + strlen(e_tgt_u)
              + strlen(e_tgt_n) + strlen(t.rounds) + strlen(t.players)
              + strlen(t.scores));
 
-  sql = mem_alloc(MELEE_CTX, "blow_sql", need);
+  sql = mem_alloc(ATK_CTX, "blow_sql", need);
 
   if(sql == NULL)
     goto out;
@@ -898,14 +898,14 @@ melee_db_blow_apply(const melee_blow_t *b)
       "%s"
       "COMMIT;",
 
-      t.players, e_atk_n, b->dmg, b->crit ? 1 : 0,
-      b->crit ? b->dmg : 0, b->wave, b->round_id, e_atk_u,
+      t.players, e_src_n, b->dmg, b->crit ? 1 : 0,
+      b->crit ? b->dmg : 0, b->wave, b->round_id, e_src_u,
 
       t.players, e_tgt_n, b->dmg, b->dmg, b->dmg, b->round_id, e_tgt_u,
 
       t.rounds, top, b->round_id,
 
-      t.scores, b->ns_id, e_atk_u, e_atk_n, b->dmg, b->crit ? 1 : 0,
+      t.scores, b->ns_id, e_src_u, e_src_n, b->dmg, b->crit ? 1 : 0,
       b->crit ? b->dmg : 0, b->crit ? e_tgt_u : "",
       t.scores, t.scores, t.scores, t.scores, t.scores, t.scores,
 
@@ -916,11 +916,11 @@ melee_db_blow_apply(const melee_blow_t *b)
 
       death);
 
-  ok = melee_exec(sql, "blow apply", NULL);
+  ok = atk_exec(sql, "blow apply", NULL);
 
 out:
-  if(e_atk_u != NULL) mem_free(e_atk_u);
-  if(e_atk_n != NULL) mem_free(e_atk_n);
+  if(e_src_u != NULL) mem_free(e_src_u);
+  if(e_src_n != NULL) mem_free(e_src_n);
   if(e_tgt_u != NULL) mem_free(e_tgt_u);
   if(e_tgt_n != NULL) mem_free(e_tgt_n);
   if(sql     != NULL) mem_free(sql);
@@ -937,20 +937,20 @@ out:
 // the cap the INSERT ... SELECT simply affects no rows, which is why the
 // caller is told SUCCESS only when the row count says one landed.
 bool
-melee_db_dot_inflict(const melee_dot_new_t *d)
+atk_db_dot_inflict(const atk_dot_new_t *d)
 {
-  melee_tables_t t;
-  char          *e_meth   = NULL;
-  char          *e_chan   = NULL;
-  char          *e_vic_u  = NULL;
-  char          *e_vic_n  = NULL;
-  char          *e_src_u  = NULL;
-  char          *e_src_n  = NULL;
-  char           sql[1536];
-  uint32_t       affected = 0;
-  bool           ok = FAIL;
+  atk_tables_t t;
+  char        *e_meth   = NULL;
+  char        *e_chan   = NULL;
+  char        *e_vic_u  = NULL;
+  char        *e_vic_n  = NULL;
+  char        *e_src_u  = NULL;
+  char        *e_src_n  = NULL;
+  char         sql[1536];
+  uint32_t     affected = 0;
+  bool         ok = FAIL;
 
-  if(d == NULL || d->round_id <= 0 || melee_tables_resolve(&t) != SUCCESS)
+  if(d == NULL || d->round_id <= 0 || atk_tables_resolve(&t) != SUCCESS)
     return(FAIL);
 
   e_meth  = db_escape(d->method      != NULL ? d->method      : "");
@@ -974,9 +974,9 @@ melee_db_dot_inflict(const melee_dot_new_t *d)
       " AND victim = '%s' AND state = %d) < %" PRIu32,
       t.dots, d->round_id, d->ns_id, e_meth, e_chan, e_vic_u, e_vic_n,
       e_src_u, e_src_n, (int)d->kind, d->tick_secs, d->secs,
-      t.dots, d->round_id, e_vic_u, MELEE_DOT_LIVE, d->stack_max);
+      t.dots, d->round_id, e_vic_u, ATK_DOT_LIVE, d->stack_max);
 
-  if(melee_exec(sql, "dot inflict", &affected) == SUCCESS && affected > 0)
+  if(atk_exec(sql, "dot inflict", &affected) == SUCCESS && affected > 0)
     ok = SUCCESS;
 
 out:
@@ -994,23 +994,23 @@ out:
 // lookup: a new username opens a new mark, and anything past the stack
 // cap on one victim is dropped rather than overrunning the array.
 uint32_t
-melee_db_dot_marks(int64_t round_id, melee_dot_mark_t *out, uint32_t cap)
+atk_db_dot_marks(int64_t round_id, atk_dot_mark_t *out, uint32_t cap)
 {
-  melee_tables_t t;
-  db_result_t   *res = NULL;
-  char           sql[512];
-  char           victim[MELEE_USER_SZ];
-  uint32_t       row;
-  uint32_t       n = 0;
+  atk_tables_t t;
+  db_result_t *res = NULL;
+  char         sql[512];
+  char         victim[ATK_USER_SZ];
+  uint32_t     row;
+  uint32_t     n = 0;
 
   if(out == NULL || cap == 0 || round_id <= 0 ||
-     melee_tables_resolve(&t) != SUCCESS)
+     atk_tables_resolve(&t) != SUCCESS)
     return(0);
 
   snprintf(sql, sizeof(sql),
       "SELECT victim, kind FROM %s WHERE round_id = %" PRId64
       " AND state = %d ORDER BY victim, id",
-      t.dots, round_id, MELEE_DOT_LIVE);
+      t.dots, round_id, ATK_DOT_LIVE);
 
   res = db_result_alloc();
 
@@ -1019,9 +1019,9 @@ melee_db_dot_marks(int64_t round_id, melee_dot_mark_t *out, uint32_t cap)
 
   for(row = 0; row < res->rows; row++)
   {
-    melee_dot_mark_t *mark;
+    atk_dot_mark_t *mark;
 
-    melee_col_str(victim, sizeof(victim), res, row, 0);
+    atk_col_str(victim, sizeof(victim), res, row, 0);
 
     if(n == 0 || strcmp(out[n - 1].victim, victim) != 0)
     {
@@ -1036,8 +1036,8 @@ melee_db_dot_marks(int64_t round_id, melee_dot_mark_t *out, uint32_t cap)
     else
       mark = &out[n - 1];
 
-    if(mark->n < MELEE_DOT_STACK_CAP)
-      mark->kinds[mark->n++] = (melee_dot_kind_t)melee_col_i32(res, row, 1);
+    if(mark->n < ATK_DOT_STACK_CAP)
+      mark->kinds[mark->n++] = (atk_dot_kind_t)atk_col_i32(res, row, 1);
   }
 
 out:
@@ -1049,14 +1049,14 @@ out:
 // dies with its round": a round that ended or was abandoned stops its
 // afflictions from ever ticking again, without a second lookup here.
 uint32_t
-melee_db_dot_due(melee_dot_due_t *out, uint32_t cap)
+atk_db_dot_due(atk_dot_due_t *out, uint32_t cap)
 {
-  melee_tables_t t;
-  db_result_t   *res = NULL;
-  char           sql[768];
-  uint32_t       n = 0;
+  atk_tables_t t;
+  db_result_t *res = NULL;
+  char         sql[768];
+  uint32_t     n = 0;
 
-  if(out == NULL || cap == 0 || melee_tables_resolve(&t) != SUCCESS)
+  if(out == NULL || cap == 0 || atk_tables_resolve(&t) != SUCCESS)
     return(0);
 
   snprintf(sql, sizeof(sql),
@@ -1066,7 +1066,7 @@ melee_db_dot_due(melee_dot_due_t *out, uint32_t cap)
       " FROM %s d JOIN %s r ON r.id = d.round_id"
       " WHERE d.state = %d AND r.state = %d AND d.next_tick <= NOW()"
       " ORDER BY d.next_tick LIMIT %" PRIu32,
-      t.dots, t.rounds, MELEE_DOT_LIVE, MELEE_ROUND_ACTIVE, cap);
+      t.dots, t.rounds, ATK_DOT_LIVE, ATK_ROUND_ACTIVE, cap);
 
   res = db_result_alloc();
 
@@ -1076,18 +1076,18 @@ melee_db_dot_due(melee_dot_due_t *out, uint32_t cap)
     {
       const char *expired;
 
-      out[n].id       = melee_col_i64(res, n, 0);
-      out[n].round_id = melee_col_i64(res, n, 1);
-      out[n].ns_id    = (uint32_t)melee_col_i32(res, n, 2);
+      out[n].id       = atk_col_i64(res, n, 0);
+      out[n].round_id = atk_col_i64(res, n, 1);
+      out[n].ns_id    = (uint32_t)atk_col_i32(res, n, 2);
 
-      melee_col_str(out[n].method,      sizeof(out[n].method),      res, n, 3);
-      melee_col_str(out[n].channel,     sizeof(out[n].channel),     res, n, 4);
-      melee_col_str(out[n].victim,      sizeof(out[n].victim),      res, n, 5);
-      melee_col_str(out[n].victim_nick, sizeof(out[n].victim_nick), res, n, 6);
-      melee_col_str(out[n].source,      sizeof(out[n].source),      res, n, 7);
-      melee_col_str(out[n].source_nick, sizeof(out[n].source_nick), res, n, 8);
+      atk_col_str(out[n].method,      sizeof(out[n].method),      res, n, 3);
+      atk_col_str(out[n].channel,     sizeof(out[n].channel),     res, n, 4);
+      atk_col_str(out[n].victim,      sizeof(out[n].victim),      res, n, 5);
+      atk_col_str(out[n].victim_nick, sizeof(out[n].victim_nick), res, n, 6);
+      atk_col_str(out[n].source,      sizeof(out[n].source),      res, n, 7);
+      atk_col_str(out[n].source_nick, sizeof(out[n].source_nick), res, n, 8);
 
-      out[n].kind = (melee_dot_kind_t)melee_col_i32(res, n, 9);
+      out[n].kind = (atk_dot_kind_t)atk_col_i32(res, n, 9);
 
       // Postgres renders a boolean as 't' or 'f'.
       expired = db_result_get(res, n, 10);
@@ -1100,75 +1100,75 @@ melee_db_dot_due(melee_dot_due_t *out, uint32_t cap)
 }
 
 uint32_t
-melee_db_dot_live(void)
+atk_db_dot_live(void)
 {
-  melee_tables_t t;
-  db_result_t   *res = NULL;
-  char           sql[512];
-  uint32_t       n = 0;
+  atk_tables_t t;
+  db_result_t *res = NULL;
+  char         sql[512];
+  uint32_t     n = 0;
 
-  if(melee_tables_resolve(&t) != SUCCESS)
+  if(atk_tables_resolve(&t) != SUCCESS)
     return(0);
 
   snprintf(sql, sizeof(sql),
       "SELECT COUNT(*) FROM %s d JOIN %s r ON r.id = d.round_id"
       " WHERE d.state = %d AND r.state = %d",
-      t.dots, t.rounds, MELEE_DOT_LIVE, MELEE_ROUND_ACTIVE);
+      t.dots, t.rounds, ATK_DOT_LIVE, ATK_ROUND_ACTIVE);
 
   res = db_result_alloc();
 
   if(res != NULL && db_query(sql, res) == SUCCESS && res->ok && res->rows == 1)
-    n = (uint32_t)melee_col_i64(res, 0, 0);
+    n = (uint32_t)atk_col_i64(res, 0, 0);
 
   db_result_free(res);
   return(n);
 }
 
 bool
-melee_db_dot_sweep(void)
+atk_db_dot_sweep(void)
 {
-  melee_tables_t t;
-  char           sql[512];
+  atk_tables_t t;
+  char         sql[512];
 
-  if(melee_tables_resolve(&t) != SUCCESS)
+  if(atk_tables_resolve(&t) != SUCCESS)
     return(FAIL);
 
   snprintf(sql, sizeof(sql),
       "UPDATE %s SET state = %d WHERE state = %d AND round_id IN"
       " (SELECT id FROM %s WHERE state <> %d)",
-      t.dots, MELEE_DOT_CANCELLED, MELEE_DOT_LIVE, t.rounds,
-      MELEE_ROUND_ACTIVE);
+      t.dots, ATK_DOT_CANCELLED, ATK_DOT_LIVE, t.rounds,
+      ATK_ROUND_ACTIVE);
 
-  return(melee_exec(sql, "dot sweep", NULL));
+  return(atk_exec(sql, "dot sweep", NULL));
 }
 
 bool
-melee_db_dot_cancel(int64_t dot_id)
+atk_db_dot_cancel(int64_t dot_id)
 {
-  melee_tables_t t;
-  char           sql[256];
+  atk_tables_t t;
+  char         sql[256];
 
-  if(dot_id <= 0 || melee_tables_resolve(&t) != SUCCESS)
+  if(dot_id <= 0 || atk_tables_resolve(&t) != SUCCESS)
     return(FAIL);
 
   snprintf(sql, sizeof(sql), "UPDATE %s SET state = %d WHERE id = %" PRId64,
-      t.dots, MELEE_DOT_CANCELLED, dot_id);
+      t.dots, ATK_DOT_CANCELLED, dot_id);
 
-  return(melee_exec(sql, "dot cancel", NULL));
+  return(atk_exec(sql, "dot cancel", NULL));
 }
 
 bool
-melee_db_dot_tick(const melee_dot_hit_t *h)
+atk_db_dot_tick(const atk_dot_hit_t *h)
 {
-  melee_tables_t t;
-  char          *e_vic = NULL;
-  char          *e_src = NULL;
-  char          *sql   = NULL;
-  char           death[2048] = "";
-  size_t         need;
-  bool           ok = FAIL;
+  atk_tables_t t;
+  char        *e_vic = NULL;
+  char        *e_src = NULL;
+  char        *sql   = NULL;
+  char         death[2048] = "";
+  size_t       need;
+  bool         ok = FAIL;
 
-  if(h == NULL || h->round_id <= 0 || melee_tables_resolve(&t) != SUCCESS)
+  if(h == NULL || h->round_id <= 0 || atk_tables_resolve(&t) != SUCCESS)
     return(FAIL);
 
   e_vic = db_escape(h->victim != NULL ? h->victim : "");
@@ -1187,7 +1187,7 @@ melee_db_dot_tick(const melee_dot_hit_t *h)
         " WHERE ns_id = %" PRIu32 " AND username = '%s';"
         "UPDATE %s SET deaths = deaths + 1, last_seen = NOW()"
         " WHERE ns_id = %" PRIu32 " AND username = '%s';",
-        t.rounds, MELEE_ROUND_ENDED, e_src, e_vic, h->round_id,
+        t.rounds, ATK_ROUND_ENDED, e_src, e_vic, h->round_id,
         t.scores, h->ns_id, e_src,
         t.scores, h->ns_id, e_vic);
 
@@ -1195,7 +1195,7 @@ melee_db_dot_tick(const melee_dot_hit_t *h)
       + 6 * (strlen(e_vic) + strlen(e_src) + strlen(t.rounds)
              + strlen(t.players) + strlen(t.scores) + strlen(t.dots));
 
-  sql = mem_alloc(MELEE_CTX, "dot_tick_sql", need);
+  sql = mem_alloc(ATK_CTX, "dot_tick_sql", need);
 
   if(sql == NULL)
     goto out;
@@ -1239,10 +1239,10 @@ melee_db_dot_tick(const melee_dot_hit_t *h)
       t.scores,  h->dmg, h->ns_id, e_vic,
       t.scores,  h->dmg, h->ns_id, e_src,
       t.dots,    h->dmg, h->tick_secs, h->tick_secs,
-      (h->last || h->fatal) ? MELEE_DOT_SPENT : MELEE_DOT_LIVE, h->dot_id,
+      (h->last || h->fatal) ? ATK_DOT_SPENT : ATK_DOT_LIVE, h->dot_id,
       death);
 
-  ok = melee_exec(sql, "dot tick", NULL);
+  ok = atk_exec(sql, "dot tick", NULL);
 
 out:
   if(e_vic != NULL) mem_free(e_vic);

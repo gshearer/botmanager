@@ -1,16 +1,16 @@
 // botmanager — MIT
-// melee's three read-only views: `show melee` draws the round burning in
-// this room, `show melee scores` the lifetime standings of everyone who
-// has ever swung in this namespace, and `show melee llm` says where the
+// attack's three read-only views: `show attack` draws the round burning in
+// this room, `show attack scores` the lifetime standings of everyone who
+// has ever swung in this namespace, and `show attack llm` says where the
 // pit's words are coming from.
 //
-// The first two are plain SELECTs and take no lock. melee_turn_lock
+// The first two are plain SELECTs and take no lock. atk_turn_lock
 // serialises *writers*; a blow lands as one transaction, so the worst a
 // reader can catch is the instant between two finished turns. The third
-// takes melee_pool_lock only, never the turn lock.
+// takes atk_pool_lock only, never the turn lock.
 
-#define MELEE_INTERNAL
-#include "melee.h"
+#define ATTACK_INTERNAL
+#include "attack.h"
 
 #include "colors.h"
 #include "util.h"
@@ -27,33 +27,33 @@
 // Both tables are built cell by cell through the padding helpers below,
 // header included, so a width only ever has to change in one place.
 
-#define MELEE_W_NAME    13   // combatant, left-aligned
-#define MELEE_W_BAR     15   // the health bar, one cell per glyph
-#define MELEE_W_HP       9   // "74/100"
-#define MELEE_W_NUM      7   // dealt, taken
-#define MELEE_W_CRIT     6
-#define MELEE_W_CARD    (2 + MELEE_W_NAME + MELEE_W_BAR + 1 + MELEE_W_HP \
-                         + 2 * MELEE_W_NUM + MELEE_W_CRIT)
+#define ATK_W_NAME    13   // combatant, left-aligned
+#define ATK_W_BAR     15   // the health bar, one cell per glyph
+#define ATK_W_HP       9   // "74/100"
+#define ATK_W_NUM      7   // dealt, taken
+#define ATK_W_CRIT     6
+#define ATK_W_CARD    (2 + ATK_W_NAME + ATK_W_BAR + 1 + ATK_W_HP \
+                         + 2 * ATK_W_NUM + ATK_W_CRIT)
 
-#define MELEE_W_RANK     3
-#define MELEE_W_ROUNDS   7
-#define MELEE_W_KILLS    6
-#define MELEE_W_DEATHS   7
-#define MELEE_W_DEALT    8
-#define MELEE_W_TAKEN    7
-#define MELEE_W_CRITS    6
-#define MELEE_W_BEST     6
-#define MELEE_W_BOARD   (2 + MELEE_W_RANK + 1 + MELEE_W_NAME + MELEE_W_ROUNDS \
-                         + MELEE_W_KILLS + MELEE_W_DEATHS + MELEE_W_DEALT \
-                         + MELEE_W_TAKEN + MELEE_W_CRITS + MELEE_W_BEST)
+#define ATK_W_RANK     3
+#define ATK_W_ROUNDS   7
+#define ATK_W_KILLS    6
+#define ATK_W_DEATHS   7
+#define ATK_W_DEALT    8
+#define ATK_W_TAKEN    7
+#define ATK_W_CRITS    6
+#define ATK_W_BEST     6
+#define ATK_W_BOARD   (2 + ATK_W_RANK + 1 + ATK_W_NAME + ATK_W_ROUNDS \
+                         + ATK_W_KILLS + ATK_W_DEATHS + ATK_W_DEALT \
+                         + ATK_W_TAKEN + ATK_W_CRITS + ATK_W_BEST)
 
 // One column's worth of text plus its color markers.
-#define MELEE_CELL_SZ  128
+#define ATK_CELL_SZ  128
 
-// A name already fitted to the combatant column: at most MELEE_W_NAME-1
+// A name already fitted to the combatant column: at most ATK_W_NAME-1
 // display columns, and a display column is at most four UTF-8 bytes.
 // Sized from the geometry so the cell buffer provably swallows it.
-#define MELEE_NAME_SZ  ((MELEE_W_NAME - 1) * 4 + 1)
+#define ATK_NAME_SZ  ((ATK_W_NAME - 1) * 4 + 1)
 
 // ------------------------------------------------------------------ //
 // Alignment                                                           //
@@ -64,7 +64,7 @@
 // arrow, en-dash — is a single-column code point, so counting UTF-8 lead
 // bytes is the column count. Same shape as stock.c's renderer.
 static size_t
-melee_vis_len(const char *s)
+atk_vis_len(const char *s)
 {
   size_t n = 0;
 
@@ -89,9 +89,9 @@ melee_vis_len(const char *s)
 
 // Right-align: shift the content up and fill the gap with spaces.
 static void
-melee_pad(char *buf, size_t sz, int width)
+atk_pad(char *buf, size_t sz, int width)
 {
-  size_t vis = melee_vis_len(buf);
+  size_t vis = atk_vis_len(buf);
   size_t raw = strlen(buf);
   int    pad = width - (int)vis;
   int    i;
@@ -107,9 +107,9 @@ melee_pad(char *buf, size_t sz, int width)
 
 // Left-align: trail spaces until the cell fills its width.
 static void
-melee_padr(char *buf, size_t sz, int width)
+atk_padr(char *buf, size_t sz, int width)
 {
-  size_t vis = melee_vis_len(buf);
+  size_t vis = atk_vis_len(buf);
   size_t raw = strlen(buf);
   int    pad = width - (int)vis;
   int    i;
@@ -130,7 +130,7 @@ melee_padr(char *buf, size_t sz, int width)
 // `src` is a nickname straight from the database: no color markers, but
 // no guarantee of ASCII either.
 static void
-melee_fit(const char *src, int cols, char *dst, size_t sz)
+atk_fit(const char *src, int cols, char *dst, size_t sz)
 {
   size_t n = 0;
   int    w = 0;
@@ -169,7 +169,7 @@ melee_fit(const char *src, int cols, char *dst, size_t sz)
 
 // Append one finished cell to a line, stopping cleanly at capacity.
 static void
-melee_cat(char *line, size_t cap, const char *cell)
+atk_cat(char *line, size_t cap, const char *cell)
 {
   size_t n = strlen(line);
 
@@ -183,7 +183,7 @@ melee_cat(char *line, size_t cap, const char *cell)
 // abbreviated K/M/B/T, and the grid survives a namespace that has been
 // spilling blood for years.
 static void
-melee_fmt_num(char *out, size_t cap, int64_t v, int width)
+atk_fmt_num(char *out, size_t cap, int64_t v, int width)
 {
   static const char unit[] = { 'K', 'M', 'B', 'T' };
   double            scaled = (double)v;
@@ -218,7 +218,7 @@ melee_fmt_num(char *out, size_t cap, int64_t v, int width)
 // A horizontal rule `cols` columns wide, in the dim color the tables
 // frame themselves with.
 static void
-melee_rule(char *out, size_t cap, int cols)
+atk_rule(char *out, size_t cap, int cols)
 {
   size_t n;
   int    i;
@@ -242,7 +242,7 @@ melee_rule(char *out, size_t cap, int cols)
 // Green while it is a fight, yellow while it is a worry, red while it is
 // nearly over. The fallen keep their column so the grid holds its shape.
 static void
-melee_hp_bar(char *out, size_t cap, int32_t hp, int32_t hp_max)
+atk_hp_bar(char *out, size_t cap, int32_t hp, int32_t hp_max)
 {
   const char *color;
   int32_t     pct;
@@ -253,7 +253,7 @@ melee_hp_bar(char *out, size_t cap, int32_t hp, int32_t hp_max)
   if(hp <= 0)
   {
     snprintf(out, cap, CLR_RED "☠" CLR_RESET);
-    melee_padr(out, cap, MELEE_W_BAR);
+    atk_padr(out, cap, ATK_W_BAR);
     return;
   }
 
@@ -261,20 +261,20 @@ melee_hp_bar(char *out, size_t cap, int32_t hp, int32_t hp_max)
     hp_max = hp;
 
   pct    = (int32_t)(((int64_t)hp * 100) / hp_max);
-  filled = (int)(((int64_t)hp * MELEE_W_BAR) / hp_max);
+  filled = (int)(((int64_t)hp * ATK_W_BAR) / hp_max);
 
   if(filled < 1)      // a survivor always shows at least one cell
     filled = 1;
 
-  if(filled > MELEE_W_BAR)
-    filled = MELEE_W_BAR;
+  if(filled > ATK_W_BAR)
+    filled = ATK_W_BAR;
 
   color = (pct > 60) ? CLR_GREEN : (pct >= 25) ? CLR_YELLOW : CLR_RED;
 
   snprintf(out, cap, "%s", color);
   n = strlen(out);
 
-  for(i = 0; i < MELEE_W_BAR && n + 4 < cap; i++)
+  for(i = 0; i < ATK_W_BAR && n + 4 < cap; i++)
   {
     memcpy(out + n, (i < filled) ? "█" : "░", 3);
     n += 3;
@@ -284,42 +284,42 @@ melee_hp_bar(char *out, size_t cap, int32_t hp, int32_t hp_max)
 }
 
 // ------------------------------------------------------------------ //
-// show melee — the round card                                         //
+// show attack — the round card                                        //
 // ------------------------------------------------------------------ //
 
 static void
-melee_card_header(const cmd_ctx_t *ctx)
+atk_card_header(const cmd_ctx_t *ctx)
 {
-  char cell[MELEE_CELL_SZ];
-  char line[MELEE_LINE_SZ];
+  char cell[ATK_CELL_SZ];
+  char line[ATK_LINE_SZ];
 
   snprintf(line, sizeof(line), "%s  ", CLR_GRAY);
 
   snprintf(cell, sizeof(cell), "combatant");
-  melee_padr(cell, sizeof(cell), MELEE_W_NAME);
-  melee_cat(line, sizeof(line), cell);
+  atk_padr(cell, sizeof(cell), ATK_W_NAME);
+  atk_cat(line, sizeof(line), cell);
 
   snprintf(cell, sizeof(cell), "health");
-  melee_padr(cell, sizeof(cell), MELEE_W_BAR + 1);
-  melee_cat(line, sizeof(line), cell);
+  atk_padr(cell, sizeof(cell), ATK_W_BAR + 1);
+  atk_cat(line, sizeof(line), cell);
 
   snprintf(cell, sizeof(cell), "hp");
-  melee_pad(cell, sizeof(cell), MELEE_W_HP);
-  melee_cat(line, sizeof(line), cell);
+  atk_pad(cell, sizeof(cell), ATK_W_HP);
+  atk_cat(line, sizeof(line), cell);
 
   snprintf(cell, sizeof(cell), "dealt");
-  melee_pad(cell, sizeof(cell), MELEE_W_NUM);
-  melee_cat(line, sizeof(line), cell);
+  atk_pad(cell, sizeof(cell), ATK_W_NUM);
+  atk_cat(line, sizeof(line), cell);
 
   snprintf(cell, sizeof(cell), "taken");
-  melee_pad(cell, sizeof(cell), MELEE_W_NUM);
-  melee_cat(line, sizeof(line), cell);
+  atk_pad(cell, sizeof(cell), ATK_W_NUM);
+  atk_cat(line, sizeof(line), cell);
 
   snprintf(cell, sizeof(cell), "crit");
-  melee_pad(cell, sizeof(cell), MELEE_W_CRIT);
-  melee_cat(line, sizeof(line), cell);
+  atk_pad(cell, sizeof(cell), ATK_W_CRIT);
+  atk_cat(line, sizeof(line), cell);
 
-  melee_cat(line, sizeof(line), CLR_RESET);
+  atk_cat(line, sizeof(line), CLR_RESET);
   cmd_reply(ctx, line);
 }
 
@@ -327,8 +327,8 @@ melee_card_header(const cmd_ctx_t *ctx)
 // string when they carry none. Each glyph is one display column, so the
 // card grows by exactly (1 + count) columns on the widest afflicted row.
 static void
-melee_card_marks(char *out, size_t cap, const melee_card_row_t *row,
-    const melee_dot_mark_t *marks, uint32_t n)
+atk_card_marks(char *out, size_t cap, const atk_card_row_t *row,
+    const atk_dot_mark_t *marks, uint32_t n)
 {
   uint32_t i;
   uint32_t k;
@@ -340,16 +340,16 @@ melee_card_marks(char *out, size_t cap, const melee_card_row_t *row,
     if(strcmp(marks[i].victim, row->user) != 0)
       continue;
 
-    melee_cat(out, cap, " ");
+    atk_cat(out, cap, " ");
 
     for(k = 0; k < marks[i].n; k++)
     {
       char cell[32];
 
       snprintf(cell, sizeof(cell), "%s%s" CLR_RESET,
-          melee_dot_color_of(marks[i].kinds[k]),
-          melee_dot_emoji_of(marks[i].kinds[k]));
-      melee_cat(out, cap, cell);
+          atk_dot_color_of(marks[i].kinds[k]),
+          atk_dot_emoji_of(marks[i].kinds[k]));
+      atk_cat(out, cap, cell);
     }
 
     return;
@@ -357,84 +357,84 @@ melee_card_marks(char *out, size_t cap, const melee_card_row_t *row,
 }
 
 static void
-melee_card_row(const cmd_ctx_t *ctx, const melee_card_row_t *row,
-    const melee_dot_mark_t *marks, uint32_t n_marks)
+atk_card_row(const cmd_ctx_t *ctx, const atk_card_row_t *row,
+    const atk_dot_mark_t *marks, uint32_t n_marks)
 {
   const bool alive = (row->hp > 0);
-  char       name[MELEE_NAME_SZ];
+  char       name[ATK_NAME_SZ];
   char       num [32];
   char       max [32];
-  char       cell[MELEE_CELL_SZ];
-  char       line[MELEE_LINE_SZ];
+  char       cell[ATK_CELL_SZ];
+  char       line[ATK_LINE_SZ];
 
   line[0] = '\0';
-  melee_cat(line, sizeof(line), "  ");
+  atk_cat(line, sizeof(line), "  ");
 
   // One column of breathing room is reserved so a long name never runs
   // into the bar.
-  melee_fit(row->name, MELEE_W_NAME - 1, name, sizeof(name));
+  atk_fit(row->name, ATK_W_NAME - 1, name, sizeof(name));
   snprintf(cell, sizeof(cell), "%s%s" CLR_RESET,
       alive ? CLR_CYAN : CLR_GRAY, name);
-  melee_padr(cell, sizeof(cell), MELEE_W_NAME);
-  melee_cat(line, sizeof(line), cell);
+  atk_padr(cell, sizeof(cell), ATK_W_NAME);
+  atk_cat(line, sizeof(line), cell);
 
-  melee_hp_bar(cell, sizeof(cell), row->hp, row->hp_max);
-  melee_cat(line, sizeof(line), cell);
-  melee_cat(line, sizeof(line), " ");
+  atk_hp_bar(cell, sizeof(cell), row->hp, row->hp_max);
+  atk_cat(line, sizeof(line), cell);
+  atk_cat(line, sizeof(line), " ");
 
   // Each half of "74/100" gets half the column, so even a pit tuned to
   // the six-figure ceiling still reads as "100K/100K".
-  melee_fmt_num(num, sizeof(num), row->hp,     MELEE_W_HP / 2);
-  melee_fmt_num(max, sizeof(max), row->hp_max, MELEE_W_HP / 2);
+  atk_fmt_num(num, sizeof(num), row->hp,     ATK_W_HP / 2);
+  atk_fmt_num(max, sizeof(max), row->hp_max, ATK_W_HP / 2);
   snprintf(cell, sizeof(cell), "%s%s" CLR_RESET "/%s",
       alive ? CLR_WHITE : CLR_GRAY, num, max);
-  melee_pad(cell, sizeof(cell), MELEE_W_HP);
-  melee_cat(line, sizeof(line), cell);
+  atk_pad(cell, sizeof(cell), ATK_W_HP);
+  atk_cat(line, sizeof(line), cell);
 
-  melee_fmt_num(cell, sizeof(cell), row->dmg_given, MELEE_W_NUM);
-  melee_pad(cell, sizeof(cell), MELEE_W_NUM);
-  melee_cat(line, sizeof(line), cell);
+  atk_fmt_num(cell, sizeof(cell), row->dmg_given, ATK_W_NUM);
+  atk_pad(cell, sizeof(cell), ATK_W_NUM);
+  atk_cat(line, sizeof(line), cell);
 
-  melee_fmt_num(cell, sizeof(cell), row->dmg_taken, MELEE_W_NUM);
-  melee_pad(cell, sizeof(cell), MELEE_W_NUM);
-  melee_cat(line, sizeof(line), cell);
+  atk_fmt_num(cell, sizeof(cell), row->dmg_taken, ATK_W_NUM);
+  atk_pad(cell, sizeof(cell), ATK_W_NUM);
+  atk_cat(line, sizeof(line), cell);
 
   if(row->best_crit > 0)
   {
-    melee_fmt_num(num, sizeof(num), row->best_crit, MELEE_W_CRIT);
+    atk_fmt_num(num, sizeof(num), row->best_crit, ATK_W_CRIT);
     snprintf(cell, sizeof(cell), CLR_RED "%s" CLR_RESET, num);
   }
 
   else
     snprintf(cell, sizeof(cell), CLR_GRAY "×" CLR_RESET);
 
-  melee_pad(cell, sizeof(cell), MELEE_W_CRIT);
-  melee_cat(line, sizeof(line), cell);
+  atk_pad(cell, sizeof(cell), ATK_W_CRIT);
+  atk_cat(line, sizeof(line), cell);
 
   // Outside the grid, after the last padded cell: the markers are a
   // ragged tail, not a column, so no width promise is broken.
-  melee_card_marks(cell, sizeof(cell), row, marks, n_marks);
-  melee_cat(line, sizeof(line), cell);
+  atk_card_marks(cell, sizeof(cell), row, marks, n_marks);
+  atk_cat(line, sizeof(line), cell);
 
   cmd_reply(ctx, line);
 }
 
 static void
-melee_show_round(const cmd_ctx_t *ctx)
+atk_show_round(const cmd_ctx_t *ctx)
 {
-  melee_card_t     card;
-  melee_card_row_t rows [MELEE_MAX_PLAYERS];
-  melee_dot_mark_t marks[MELEE_MAX_PLAYERS];
-  userns_t        *ns;
-  const char      *state;
-  char             line  [MELEE_LINE_SZ];
-  char             rule  [MELEE_LINE_SZ];
-  char             roster[MELEE_ROSTER_SZ];
-  char             dur   [32];
-  uint32_t         shown;
-  uint32_t         n_marks;
-  uint32_t         total = 0;
-  uint32_t         i;
+  atk_card_t     card;
+  atk_card_row_t rows [ATK_MAX_PLAYERS];
+  atk_dot_mark_t marks[ATK_MAX_PLAYERS];
+  userns_t      *ns;
+  const char    *state;
+  char           line  [ATK_LINE_SZ];
+  char           rule  [ATK_LINE_SZ];
+  char           roster[ATK_ROSTER_SZ];
+  char           dur   [32];
+  uint32_t       shown;
+  uint32_t       n_marks;
+  uint32_t       total = 0;
+  uint32_t       i;
 
   ns = userns_session_resolve(ctx);
 
@@ -443,22 +443,22 @@ melee_show_round(const cmd_ctx_t *ctx)
 
   // An empty channel is a direct message, which names no room: the
   // lookup widens to the namespace and reports whatever fought last.
-  if(!melee_db_card_find(ns->id, method_inst_name(ctx->msg->inst),
+  if(!atk_db_card_find(ns->id, method_inst_name(ctx->msg->inst),
         ctx->msg->channel, &card))
   {
-    cmd_reply(ctx, "☠ The pit is quiet. Open one with !melee <nick>.");
+    cmd_reply(ctx, "☠ The pit is quiet. Open one with !attack <nick>.");
     return;
   }
 
-  state = (card.state == MELEE_ROUND_ACTIVE)  ? ""
-        : (card.state == MELEE_ROUND_ENDED)   ? " · ended"
+  state = (card.state == ATK_ROUND_ACTIVE)  ? ""
+        : (card.state == ATK_ROUND_ENDED)   ? " · ended"
         :                                       " · abandoned";
 
   util_fmt_duration((time_t)card.length, dur, sizeof(dur));
-  melee_rule(rule, sizeof(rule), MELEE_W_CARD);
+  atk_rule(rule, sizeof(rule), ATK_W_CARD);
 
   snprintf(line, sizeof(line),
-      "⚔ " CLR_BOLD "MELEE" CLR_RESET CLR_GRAY " — " CLR_RESET
+      "⚔ " CLR_BOLD "ATTACK" CLR_RESET CLR_GRAY " — " CLR_RESET
       CLR_CYAN "%s" CLR_RESET
       CLR_GRAY " · wave %d · %d %s · %s%s" CLR_RESET,
       (card.channel[0] != '\0') ? card.channel : "the pit",
@@ -467,16 +467,16 @@ melee_show_round(const cmd_ctx_t *ctx)
   cmd_reply(ctx, line);
 
   cmd_reply(ctx, rule);
-  melee_card_header(ctx);
+  atk_card_header(ctx);
 
-  shown = melee_db_card_roster(card.id, rows, MELEE_MAX_PLAYERS, &total);
+  shown = atk_db_card_roster(card.id, rows, ATK_MAX_PLAYERS, &total);
 
   // Lock-free like everything else in this view, and optional: a failed
   // marker query draws a card without markers rather than no card.
-  n_marks = melee_db_dot_marks(card.id, marks, MELEE_MAX_PLAYERS);
+  n_marks = atk_db_dot_marks(card.id, marks, ATK_MAX_PLAYERS);
 
   for(i = 0; i < shown; i++)
-    melee_card_row(ctx, &rows[i], marks, n_marks);
+    atk_card_row(ctx, &rows[i], marks, n_marks);
 
   cmd_reply(ctx, rule);
 
@@ -488,7 +488,7 @@ melee_show_round(const cmd_ctx_t *ctx)
     cmd_reply(ctx, line);
   }
 
-  if(card.state == MELEE_ROUND_ENDED && card.slayer[0] != '\0')
+  if(card.state == ATK_ROUND_ENDED && card.slayer[0] != '\0')
   {
     snprintf(line, sizeof(line),
         "☠ " CLR_CYAN "%s" CLR_RESET " left " CLR_PURPLE "%s" CLR_RESET
@@ -505,8 +505,8 @@ melee_show_round(const cmd_ctx_t *ctx)
     cmd_reply(ctx, line);
   }
 
-  if(card.state == MELEE_ROUND_ACTIVE &&
-     melee_db_pending(card.id, card.wave, roster, sizeof(roster)) == SUCCESS &&
+  if(card.state == ATK_ROUND_ACTIVE &&
+     atk_db_pending(card.id, card.wave, roster, sizeof(roster)) == SUCCESS &&
      roster[0] != '\0')
   {
     snprintf(line, sizeof(line),
@@ -516,145 +516,145 @@ melee_show_round(const cmd_ctx_t *ctx)
 }
 
 // ------------------------------------------------------------------ //
-// show melee scores — the leaderboard                                 //
+// show attack scores — the leaderboard                                //
 // ------------------------------------------------------------------ //
 
 static void
-melee_board_header(const cmd_ctx_t *ctx)
+atk_board_header(const cmd_ctx_t *ctx)
 {
-  char cell[MELEE_CELL_SZ];
-  char line[MELEE_LINE_SZ];
+  char cell[ATK_CELL_SZ];
+  char line[ATK_LINE_SZ];
 
   snprintf(line, sizeof(line), "%s  ", CLR_GRAY);
 
   snprintf(cell, sizeof(cell), "#");
-  melee_pad(cell, sizeof(cell), MELEE_W_RANK);
-  melee_cat(line, sizeof(line), cell);
-  melee_cat(line, sizeof(line), " ");
+  atk_pad(cell, sizeof(cell), ATK_W_RANK);
+  atk_cat(line, sizeof(line), cell);
+  atk_cat(line, sizeof(line), " ");
 
   snprintf(cell, sizeof(cell), "combatant");
-  melee_padr(cell, sizeof(cell), MELEE_W_NAME);
-  melee_cat(line, sizeof(line), cell);
+  atk_padr(cell, sizeof(cell), ATK_W_NAME);
+  atk_cat(line, sizeof(line), cell);
 
   snprintf(cell, sizeof(cell), "rounds");
-  melee_pad(cell, sizeof(cell), MELEE_W_ROUNDS);
-  melee_cat(line, sizeof(line), cell);
+  atk_pad(cell, sizeof(cell), ATK_W_ROUNDS);
+  atk_cat(line, sizeof(line), cell);
 
   snprintf(cell, sizeof(cell), "kills");
-  melee_pad(cell, sizeof(cell), MELEE_W_KILLS);
-  melee_cat(line, sizeof(line), cell);
+  atk_pad(cell, sizeof(cell), ATK_W_KILLS);
+  atk_cat(line, sizeof(line), cell);
 
   snprintf(cell, sizeof(cell), "deaths");
-  melee_pad(cell, sizeof(cell), MELEE_W_DEATHS);
-  melee_cat(line, sizeof(line), cell);
+  atk_pad(cell, sizeof(cell), ATK_W_DEATHS);
+  atk_cat(line, sizeof(line), cell);
 
   snprintf(cell, sizeof(cell), "dealt");
-  melee_pad(cell, sizeof(cell), MELEE_W_DEALT);
-  melee_cat(line, sizeof(line), cell);
+  atk_pad(cell, sizeof(cell), ATK_W_DEALT);
+  atk_cat(line, sizeof(line), cell);
 
   snprintf(cell, sizeof(cell), "taken");
-  melee_pad(cell, sizeof(cell), MELEE_W_TAKEN);
-  melee_cat(line, sizeof(line), cell);
+  atk_pad(cell, sizeof(cell), ATK_W_TAKEN);
+  atk_cat(line, sizeof(line), cell);
 
   snprintf(cell, sizeof(cell), "crits");
-  melee_pad(cell, sizeof(cell), MELEE_W_CRITS);
-  melee_cat(line, sizeof(line), cell);
+  atk_pad(cell, sizeof(cell), ATK_W_CRITS);
+  atk_cat(line, sizeof(line), cell);
 
   snprintf(cell, sizeof(cell), "best");
-  melee_pad(cell, sizeof(cell), MELEE_W_BEST);
-  melee_cat(line, sizeof(line), cell);
+  atk_pad(cell, sizeof(cell), ATK_W_BEST);
+  atk_cat(line, sizeof(line), cell);
 
-  melee_cat(line, sizeof(line), CLR_RESET);
+  atk_cat(line, sizeof(line), CLR_RESET);
   cmd_reply(ctx, line);
 }
 
 // The podium is tinted; everyone below it shares one color. Rank is
 // 1-based and arrives already ordered by damage dealt.
 static void
-melee_board_row(const cmd_ctx_t *ctx, uint32_t rank,
-    const melee_score_row_t *row)
+atk_board_row(const cmd_ctx_t *ctx, uint32_t rank,
+    const atk_score_row_t *row)
 {
   const char *tint = (rank == 1) ? CLR_YELLOW
                    : (rank == 2) ? CLR_WHITE
                    : (rank == 3) ? CLR_ORANGE
                    :               CLR_CYAN;
-  char        name[MELEE_NAME_SZ];
+  char        name[ATK_NAME_SZ];
   char        num [32];
-  char        cell[MELEE_CELL_SZ];
-  char        line[MELEE_LINE_SZ];
+  char        cell[ATK_CELL_SZ];
+  char        line[ATK_LINE_SZ];
 
   line[0] = '\0';
-  melee_cat(line, sizeof(line), "  ");
+  atk_cat(line, sizeof(line), "  ");
 
   snprintf(cell, sizeof(cell), "%s%" PRIu32 CLR_RESET, tint, rank);
-  melee_pad(cell, sizeof(cell), MELEE_W_RANK);
-  melee_cat(line, sizeof(line), cell);
-  melee_cat(line, sizeof(line), " ");
+  atk_pad(cell, sizeof(cell), ATK_W_RANK);
+  atk_cat(line, sizeof(line), cell);
+  atk_cat(line, sizeof(line), " ");
 
-  melee_fit(row->name, MELEE_W_NAME - 1, name, sizeof(name));
+  atk_fit(row->name, ATK_W_NAME - 1, name, sizeof(name));
   snprintf(cell, sizeof(cell), "%s%s" CLR_RESET, tint, name);
-  melee_padr(cell, sizeof(cell), MELEE_W_NAME);
-  melee_cat(line, sizeof(line), cell);
+  atk_padr(cell, sizeof(cell), ATK_W_NAME);
+  atk_cat(line, sizeof(line), cell);
 
-  melee_fmt_num(cell, sizeof(cell), row->rounds, MELEE_W_ROUNDS);
-  melee_pad(cell, sizeof(cell), MELEE_W_ROUNDS);
-  melee_cat(line, sizeof(line), cell);
+  atk_fmt_num(cell, sizeof(cell), row->rounds, ATK_W_ROUNDS);
+  atk_pad(cell, sizeof(cell), ATK_W_ROUNDS);
+  atk_cat(line, sizeof(line), cell);
 
-  melee_fmt_num(num, sizeof(num), row->kills, MELEE_W_KILLS);
+  atk_fmt_num(num, sizeof(num), row->kills, ATK_W_KILLS);
   snprintf(cell, sizeof(cell), CLR_GREEN "%s" CLR_RESET, num);
-  melee_pad(cell, sizeof(cell), MELEE_W_KILLS);
-  melee_cat(line, sizeof(line), cell);
+  atk_pad(cell, sizeof(cell), ATK_W_KILLS);
+  atk_cat(line, sizeof(line), cell);
 
-  melee_fmt_num(num, sizeof(num), row->deaths, MELEE_W_DEATHS);
+  atk_fmt_num(num, sizeof(num), row->deaths, ATK_W_DEATHS);
   snprintf(cell, sizeof(cell), CLR_RED "%s" CLR_RESET, num);
-  melee_pad(cell, sizeof(cell), MELEE_W_DEATHS);
-  melee_cat(line, sizeof(line), cell);
+  atk_pad(cell, sizeof(cell), ATK_W_DEATHS);
+  atk_cat(line, sizeof(line), cell);
 
-  melee_fmt_num(cell, sizeof(cell), row->dmg_given, MELEE_W_DEALT);
-  melee_pad(cell, sizeof(cell), MELEE_W_DEALT);
-  melee_cat(line, sizeof(line), cell);
+  atk_fmt_num(cell, sizeof(cell), row->dmg_given, ATK_W_DEALT);
+  atk_pad(cell, sizeof(cell), ATK_W_DEALT);
+  atk_cat(line, sizeof(line), cell);
 
-  melee_fmt_num(cell, sizeof(cell), row->dmg_taken, MELEE_W_TAKEN);
-  melee_pad(cell, sizeof(cell), MELEE_W_TAKEN);
-  melee_cat(line, sizeof(line), cell);
+  atk_fmt_num(cell, sizeof(cell), row->dmg_taken, ATK_W_TAKEN);
+  atk_pad(cell, sizeof(cell), ATK_W_TAKEN);
+  atk_cat(line, sizeof(line), cell);
 
-  melee_fmt_num(cell, sizeof(cell), row->crits, MELEE_W_CRITS);
-  melee_pad(cell, sizeof(cell), MELEE_W_CRITS);
-  melee_cat(line, sizeof(line), cell);
+  atk_fmt_num(cell, sizeof(cell), row->crits, ATK_W_CRITS);
+  atk_pad(cell, sizeof(cell), ATK_W_CRITS);
+  atk_cat(line, sizeof(line), cell);
 
   if(row->best_crit > 0)
-    melee_fmt_num(cell, sizeof(cell), row->best_crit, MELEE_W_BEST);
+    atk_fmt_num(cell, sizeof(cell), row->best_crit, ATK_W_BEST);
 
   else
     snprintf(cell, sizeof(cell), CLR_GRAY "×" CLR_RESET);
 
-  melee_pad(cell, sizeof(cell), MELEE_W_BEST);
-  melee_cat(line, sizeof(line), cell);
+  atk_pad(cell, sizeof(cell), ATK_W_BEST);
+  atk_cat(line, sizeof(line), cell);
 
   cmd_reply(ctx, line);
 }
 
 static void
-melee_show_scores(const cmd_ctx_t *ctx)
+atk_show_scores(const cmd_ctx_t *ctx)
 {
-  melee_tunables_t  t;
-  melee_score_row_t rows[MELEE_MAX_SCORE_ROWS];
-  userns_t         *ns;
-  char              line[MELEE_LINE_SZ];
-  char              rule[MELEE_LINE_SZ];
-  char              by  [MELEE_USER_SZ];
-  char              on  [MELEE_USER_SZ];
-  int32_t           worst = 0;
-  uint32_t          n;
-  uint32_t          i;
+  atk_tunables_t  t;
+  atk_score_row_t rows[ATK_MAX_SCORE_ROWS];
+  userns_t       *ns;
+  char            line[ATK_LINE_SZ];
+  char            rule[ATK_LINE_SZ];
+  char            by  [ATK_USER_SZ];
+  char            on  [ATK_USER_SZ];
+  int32_t         worst = 0;
+  uint32_t        n;
+  uint32_t        i;
 
   ns = userns_session_resolve(ctx);
 
   if(ns == NULL)          // the resolver already replied
     return;
 
-  melee_tunables_load(&t);
-  n = melee_db_scores(ns->id, t.scoreboard_rows, rows, MELEE_MAX_SCORE_ROWS);
+  atk_tunables_load(&t);
+  n = atk_db_scores(ns->id, t.scoreboard_rows, rows, ATK_MAX_SCORE_ROWS);
 
   if(n == 0)
   {
@@ -663,20 +663,20 @@ melee_show_scores(const cmd_ctx_t *ctx)
   }
 
   snprintf(line, sizeof(line),
-      "☠ " CLR_BOLD "MELEE — HALL OF THE FALLEN" CLR_RESET
+      "☠ " CLR_BOLD "ATTACK — HALL OF THE FALLEN" CLR_RESET
       CLR_GRAY " (namespace: %s)" CLR_RESET, ns->name);
   cmd_reply(ctx, line);
 
-  melee_rule(rule, sizeof(rule), MELEE_W_BOARD);
+  atk_rule(rule, sizeof(rule), ATK_W_BOARD);
   cmd_reply(ctx, rule);
-  melee_board_header(ctx);
+  atk_board_header(ctx);
 
   for(i = 0; i < n; i++)
-    melee_board_row(ctx, i + 1, &rows[i]);
+    atk_board_row(ctx, i + 1, &rows[i]);
 
   cmd_reply(ctx, rule);
 
-  if(melee_db_deadliest(ns->id, by, sizeof(by), on, sizeof(on), &worst))
+  if(atk_db_deadliest(ns->id, by, sizeof(by), on, sizeof(on), &worst))
   {
     snprintf(line, sizeof(line),
         "💥 deadliest single blow: " CLR_CYAN "%s" CLR_RESET " → "
@@ -690,78 +690,78 @@ melee_show_scores(const cmd_ctx_t *ctx)
 // Where the words come from                                           //
 // ------------------------------------------------------------------ //
 
-#define MELEE_W_FCAT    11   // category, left-aligned
-#define MELEE_W_FPOOL    6
-#define MELEE_W_FSERVED  9
-#define MELEE_W_FREJ    10
-#define MELEE_W_FLAV    (2 + MELEE_W_FCAT + MELEE_W_FPOOL + MELEE_W_FSERVED \
-                         + MELEE_W_FREJ + 10)
+#define ATK_W_FCAT    11   // category, left-aligned
+#define ATK_W_FPOOL    6
+#define ATK_W_FSERVED  9
+#define ATK_W_FREJ    10
+#define ATK_W_FLAV    (2 + ATK_W_FCAT + ATK_W_FPOOL + ATK_W_FSERVED \
+                         + ATK_W_FREJ + 10)
 
-static const char *const melee_flav_label[MELEE_FLAV__COUNT] = {
+static const char *const atk_flav_label[ATK_FLAV__COUNT] = {
   "minor", "medium", "major", "critical", "deaths", "decay", "decay kill"
 };
 
 static void
-melee_flav_header(const cmd_ctx_t *ctx)
+atk_flav_header(const cmd_ctx_t *ctx)
 {
-  char line[MELEE_LINE_SZ];
-  char cell[MELEE_CELL_SZ];
+  char line[ATK_LINE_SZ];
+  char cell[ATK_CELL_SZ];
 
   snprintf(line, sizeof(line), "%s  ", CLR_GRAY);
 
   snprintf(cell, sizeof(cell), "category");
-  melee_padr(cell, sizeof(cell), MELEE_W_FCAT);
-  melee_cat(line, sizeof(line), cell);
+  atk_padr(cell, sizeof(cell), ATK_W_FCAT);
+  atk_cat(line, sizeof(line), cell);
 
   snprintf(cell, sizeof(cell), "pool");
-  melee_pad(cell, sizeof(cell), MELEE_W_FPOOL);
-  melee_cat(line, sizeof(line), cell);
+  atk_pad(cell, sizeof(cell), ATK_W_FPOOL);
+  atk_cat(line, sizeof(line), cell);
 
   snprintf(cell, sizeof(cell), "served");
-  melee_pad(cell, sizeof(cell), MELEE_W_FSERVED);
-  melee_cat(line, sizeof(line), cell);
+  atk_pad(cell, sizeof(cell), ATK_W_FSERVED);
+  atk_cat(line, sizeof(line), cell);
 
   snprintf(cell, sizeof(cell), "rejected");
-  melee_pad(cell, sizeof(cell), MELEE_W_FREJ);
-  melee_cat(line, sizeof(line), cell);
+  atk_pad(cell, sizeof(cell), ATK_W_FREJ);
+  atk_cat(line, sizeof(line), cell);
 
-  melee_cat(line, sizeof(line), "  state");
-  melee_cat(line, sizeof(line), CLR_RESET);
+  atk_cat(line, sizeof(line), "  state");
+  atk_cat(line, sizeof(line), CLR_RESET);
   cmd_reply(ctx, line);
 }
 
 static void
-melee_flav_row(const cmd_ctx_t *ctx, melee_flavour_t cat,
-    const melee_pool_stat_t *s)
+atk_flav_row(const cmd_ctx_t *ctx, atk_flavour_t cat,
+    const atk_pool_stat_t *s)
 {
-  char line[MELEE_LINE_SZ];
-  char cell[MELEE_CELL_SZ];
+  char line[ATK_LINE_SZ];
+  char cell[ATK_CELL_SZ];
   char num [32];
   char state[48];
 
   snprintf(line, sizeof(line), "  ");
 
   snprintf(cell, sizeof(cell), CLR_CYAN "%s" CLR_RESET,
-      melee_flav_label[cat]);
-  melee_padr(cell, sizeof(cell), MELEE_W_FCAT);
-  melee_cat(line, sizeof(line), cell);
+      atk_flav_label[cat]);
+  atk_padr(cell, sizeof(cell), ATK_W_FCAT);
+  atk_cat(line, sizeof(line), cell);
 
-  melee_fmt_num(num, sizeof(num), (int64_t)s->depth, MELEE_W_FPOOL);
+  atk_fmt_num(num, sizeof(num), (int64_t)s->depth, ATK_W_FPOOL);
   snprintf(cell, sizeof(cell), "%s%s" CLR_RESET,
       s->depth > 0 ? CLR_WHITE : CLR_GRAY, num);
-  melee_pad(cell, sizeof(cell), MELEE_W_FPOOL);
-  melee_cat(line, sizeof(line), cell);
+  atk_pad(cell, sizeof(cell), ATK_W_FPOOL);
+  atk_cat(line, sizeof(line), cell);
 
-  melee_fmt_num(num, sizeof(num), (int64_t)s->served, MELEE_W_FSERVED);
+  atk_fmt_num(num, sizeof(num), (int64_t)s->served, ATK_W_FSERVED);
   snprintf(cell, sizeof(cell), "%s", num);
-  melee_pad(cell, sizeof(cell), MELEE_W_FSERVED);
-  melee_cat(line, sizeof(line), cell);
+  atk_pad(cell, sizeof(cell), ATK_W_FSERVED);
+  atk_cat(line, sizeof(line), cell);
 
-  melee_fmt_num(num, sizeof(num), (int64_t)s->rejected, MELEE_W_FREJ);
+  atk_fmt_num(num, sizeof(num), (int64_t)s->rejected, ATK_W_FREJ);
   snprintf(cell, sizeof(cell), "%s%s" CLR_RESET,
       s->rejected > 0 ? CLR_YELLOW : CLR_GRAY, num);
-  melee_pad(cell, sizeof(cell), MELEE_W_FREJ);
-  melee_cat(line, sizeof(line), cell);
+  atk_pad(cell, sizeof(cell), ATK_W_FREJ);
+  atk_cat(line, sizeof(line), cell);
 
   if(s->inflight)
     snprintf(state, sizeof(state), CLR_YELLOW "refilling" CLR_RESET);
@@ -773,30 +773,30 @@ melee_flav_row(const cmd_ctx_t *ctx, melee_flavour_t cat,
   else
     snprintf(state, sizeof(state), CLR_GREEN "ready" CLR_RESET);
 
-  melee_cat(line, sizeof(line), "  ");
-  melee_cat(line, sizeof(line), state);
+  atk_cat(line, sizeof(line), "  ");
+  atk_cat(line, sizeof(line), state);
   cmd_reply(ctx, line);
 }
 
 // What the four damage tiers actually mean at the current tunables. The
 // boundaries are not computed from the KV percentages a second time —
-// they are read back out of melee_severity() itself, one damage value at
+// they are read back out of atk_severity() itself, one damage value at
 // a time, so this line can never disagree with the renderer. The ceiling
 // is at most hit_max/crit_max's clamp, so the walk is free.
 static void
-melee_flav_bands(const cmd_ctx_t *ctx, const melee_tunables_t *t)
+atk_flav_bands(const cmd_ctx_t *ctx, const atk_tunables_t *t)
 {
-  int32_t         lo[MELEE_FLAV_DEATH] = { 0 };
-  int32_t         hi[MELEE_FLAV_DEATH] = { 0 };
-  int32_t         ceiling = melee_dmg_ceiling(t);
-  char            line[MELEE_LINE_SZ];
-  char            cell[64];
-  melee_flavour_t cat;
-  int32_t         dmg;
+  int32_t       lo[ATK_FLAV_DEATH] = { 0 };
+  int32_t       hi[ATK_FLAV_DEATH] = { 0 };
+  int32_t       ceiling = atk_dmg_ceiling(t);
+  char          line[ATK_LINE_SZ];
+  char          cell[64];
+  atk_flavour_t cat;
+  int32_t       dmg;
 
   for(dmg = 1; dmg <= ceiling; dmg++)
   {
-    melee_flavour_t sev = melee_severity(t, dmg);
+    atk_flavour_t sev = atk_severity(t, dmg);
 
     if(lo[sev] == 0)
       lo[sev] = dmg;
@@ -806,48 +806,48 @@ melee_flav_bands(const cmd_ctx_t *ctx, const melee_tunables_t *t)
 
   snprintf(line, sizeof(line), CLR_GRAY "  bands  ");
 
-  for(cat = MELEE_FLAV_MINOR; cat < MELEE_FLAV_DEATH; cat++)
+  for(cat = ATK_FLAV_MINOR; cat < ATK_FLAV_DEATH; cat++)
   {
     // A small ceiling leaves no room for four tiers, and an unreachable
     // band says "—" rather than the lie of "0-0".
     if(lo[cat] == 0)
       snprintf(cell, sizeof(cell), "%s%s —",
-          cat != MELEE_FLAV_MINOR ? " · " : "", melee_flav_label[cat]);
+          cat != ATK_FLAV_MINOR ? " · " : "", atk_flav_label[cat]);
 
     else if(lo[cat] == hi[cat])
       snprintf(cell, sizeof(cell), "%s%s %d",
-          cat != MELEE_FLAV_MINOR ? " · " : "", melee_flav_label[cat],
+          cat != ATK_FLAV_MINOR ? " · " : "", atk_flav_label[cat],
           lo[cat]);
 
     else
       snprintf(cell, sizeof(cell), "%s%s %d-%d",
-          cat != MELEE_FLAV_MINOR ? " · " : "", melee_flav_label[cat],
+          cat != ATK_FLAV_MINOR ? " · " : "", atk_flav_label[cat],
           lo[cat], hi[cat]);
 
-    melee_cat(line, sizeof(line), cell);
+    atk_cat(line, sizeof(line), cell);
   }
 
-  melee_cat(line, sizeof(line), CLR_RESET);
+  atk_cat(line, sizeof(line), CLR_RESET);
   cmd_reply(ctx, line);
 }
 
 static void
-melee_show_llm(const cmd_ctx_t *ctx)
+atk_show_llm(const cmd_ctx_t *ctx)
 {
-  melee_tunables_t  t;
-  melee_pool_stat_t s;
-  const char       *why;
-  char              line[MELEE_LINE_SZ];
-  char              rule[MELEE_LINE_SZ];
-  char              num [32];
-  melee_flavour_t   cat;
-  bool              errored = false;
+  atk_tunables_t  t;
+  atk_pool_stat_t s;
+  const char     *why;
+  char            line[ATK_LINE_SZ];
+  char            rule[ATK_LINE_SZ];
+  char            num [32];
+  atk_flavour_t   cat;
+  bool            errored = false;
 
-  melee_tunables_load(&t);
-  why = melee_llm_offreason(&t);
+  atk_tunables_load(&t);
+  why = atk_llm_offreason(&t);
 
   snprintf(line, sizeof(line),
-      "⚔ " CLR_BOLD "MELEE — FLAVOUR" CLR_RESET);
+      "⚔ " CLR_BOLD "ATTACK — FLAVOUR" CLR_RESET);
   cmd_reply(ctx, line);
 
   if(why != NULL)
@@ -886,23 +886,23 @@ melee_show_llm(const cmd_ctx_t *ctx)
 
   cmd_reply(ctx, line);
 
-  melee_rule(rule, sizeof(rule), MELEE_W_FLAV);
+  atk_rule(rule, sizeof(rule), ATK_W_FLAV);
   cmd_reply(ctx, rule);
-  melee_flav_header(ctx);
+  atk_flav_header(ctx);
 
-  for(cat = MELEE_FLAV_MINOR; cat < MELEE_FLAV__COUNT; cat++)
+  for(cat = ATK_FLAV_MINOR; cat < ATK_FLAV__COUNT; cat++)
   {
-    melee_pool_stats(cat, &s);
-    melee_flav_row(ctx, cat, &s);
+    atk_pool_stats(cat, &s);
+    atk_flav_row(ctx, cat, &s);
 
     if(s.last_error[0] != '\0')
       errored = true;
   }
 
   cmd_reply(ctx, rule);
-  melee_flav_bands(ctx, &t);
+  atk_flav_bands(ctx, &t);
 
-  melee_fmt_num(num, sizeof(num), (int64_t)melee_pool_fallbacks(), 12);
+  atk_fmt_num(num, sizeof(num), (int64_t)atk_pool_fallbacks(), 12);
   snprintf(line, sizeof(line),
       CLR_GRAY "fallbacks to the built-in lines: %s" CLR_RESET, num);
   cmd_reply(ctx, line);
@@ -910,15 +910,15 @@ melee_show_llm(const cmd_ctx_t *ctx)
   if(!errored)
     return;
 
-  for(cat = MELEE_FLAV_MINOR; cat < MELEE_FLAV__COUNT; cat++)
+  for(cat = ATK_FLAV_MINOR; cat < ATK_FLAV__COUNT; cat++)
   {
-    melee_pool_stats(cat, &s);
+    atk_pool_stats(cat, &s);
 
     if(s.last_error[0] == '\0')
       continue;
 
     snprintf(line, sizeof(line), CLR_GRAY "%s: %.80s" CLR_RESET,
-        melee_flav_label[cat], s.last_error);
+        atk_flav_label[cat], s.last_error);
     cmd_reply(ctx, line);
   }
 }
@@ -931,10 +931,10 @@ melee_show_llm(const cmd_ctx_t *ctx)
 // anyone watching the fight should be able to read the board. The `show`
 // parent is core-provided and already exists.
 bool
-melee_show_register(void)
+atk_show_register(void)
 {
-  if(cmd_register("melee", "melee",
-        "show melee",
+  if(cmd_register("attack", "attack",
+        "show attack",
         "The current round in this pit.",
         "Draws the round burning in this room: every combatant's health, "
         "what they have dealt and taken, the heaviest blow struck, and "
@@ -943,24 +943,24 @@ melee_show_register(void)
         "namespace was last touched. A finished round keeps its card "
         "until the next one opens.",
         USERNS_GROUP_EVERYONE, 0, CMD_SCOPE_ANY, METHOD_T_ANY,
-        melee_show_round, NULL, "show", NULL,
+        atk_show_round, NULL, "show", NULL,
         NULL, 0, NULL, NULL) != SUCCESS)
     return(FAIL);
 
-  if(cmd_register("melee", "scores",
-        "show melee scores",
+  if(cmd_register("attack", "scores",
+        "show attack scores",
         "Lifetime standings for every combatant.",
         "Everyone in this namespace who has ever fought, ordered by the "
         "damage they have dealt: rounds entered, kills, deaths, damage "
         "given and taken, critical hits, and their heaviest single blow. "
-        "The row count is `plugin.melee.scoreboard_rows`.",
+        "The row count is `plugin.attack.scoreboard_rows`.",
         USERNS_GROUP_EVERYONE, 0, CMD_SCOPE_ANY, METHOD_T_ANY,
-        melee_show_scores, NULL, "show/melee", NULL,
+        atk_show_scores, NULL, "show/attack", NULL,
         NULL, 0, NULL, NULL) != SUCCESS)
     return(FAIL);
 
-  if(cmd_register("melee", "llm",
-        "show melee llm",
+  if(cmd_register("attack", "llm",
+        "show attack llm",
         "Where the pit's words come from.",
         "Reports whether a language model is authoring the combat "
         "flavour, which model, and how deep each category's pool of "
@@ -968,7 +968,7 @@ melee_show_register(void)
         "runs dry, the pit falls back to its built-in lines and this "
         "view says so.",
         USERNS_GROUP_EVERYONE, 0, CMD_SCOPE_ANY, METHOD_T_ANY,
-        melee_show_llm, NULL, "show/melee", NULL,
+        atk_show_llm, NULL, "show/attack", NULL,
         NULL, 0, NULL, NULL) != SUCCESS)
     return(FAIL);
 

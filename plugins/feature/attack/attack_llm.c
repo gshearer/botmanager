@@ -1,10 +1,10 @@
 // botmanager — MIT
-// melee: LLM-authored combat flavour — availability gating, the pools,
+// attack: LLM-authored combat flavour — availability gating, the pools,
 // and the background refill. The model never runs on the turn path; a
 // blow pops a pre-generated line or falls back to the static tables.
 
-#define MELEE_INTERNAL
-#include "melee.h"
+#define ATTACK_INTERNAL
+#include "attack.h"
 
 #include "inference.h"
 
@@ -24,45 +24,45 @@
 
 // One category's stock of unspoken lines. `count` only ever falls on the
 // turn path and only ever rises on a refill, so the whole structure is
-// memcpy-scale work under melee_pool_lock.
+// memcpy-scale work under atk_pool_lock.
 typedef struct
 {
-  char     lines[MELEE_LLM_POOL_MAX][MELEE_LLM_TMPL_SZ];
+  char     lines[ATK_LLM_POOL_MAX][ATK_LLM_TMPL_SZ];
   uint16_t count;
   bool     inflight;              // a refill task/request is outstanding
   time_t   next_try;              // backoff floor after a failure; 0 = free
   uint64_t served;                // templates handed to the renderer
   uint64_t rejected;              // model lines the sanitiser threw away
   char     last_error[128];
-} melee_pool_t;
+} atk_pool_t;
 
-// Lock ordering is melee_turn_lock -> melee_pool_lock, never the
-// reverse. melee_pool_lock is never held across file I/O, a task_add, or
+// Lock ordering is atk_turn_lock -> atk_pool_lock, never the
+// reverse. atk_pool_lock is never held across file I/O, a task_add, or
 // an LLM submit.
 //
 // Static footprint, stated so nobody has to discover it: 7 categories x
-// MELEE_LLM_POOL_MAX (64) x MELEE_LLM_TMPL_SZ (256) = 112 KB of BSS. That
+// ATK_LLM_POOL_MAX (64) x ATK_LLM_TMPL_SZ (256) = 112 KB of BSS. That
 // is deliberate — the pools are the whole reason no model runs on the
 // turn path.
-static melee_pool_t    melee_pools[MELEE_FLAV__COUNT];
-static pthread_mutex_t melee_pool_lock = PTHREAD_MUTEX_INITIALIZER;
-static uint64_t        melee_fallbacks;   // static-table renders
+static atk_pool_t      atk_pools[ATK_FLAV__COUNT];
+static pthread_mutex_t atk_pool_lock = PTHREAD_MUTEX_INITIALIZER;
+static uint64_t        atk_fallbacks;   // static-table renders
 
 // Bumped whenever the operator changes what the model was told. Every
 // in-flight refill carries the generation it was submitted under; a
 // response that comes back stale is discarded rather than installed,
 // because its lines were written by a preamble that no longer applies.
-static uint32_t        melee_pool_gen;
+static uint32_t        atk_pool_gen;
 
 // The only tokens a model-authored line may carry. Indexed nowhere —
 // the sanitiser and the expander each name them explicitly — but kept
 // together so the two can never drift apart unnoticed.
-#define MELEE_TOK_ATTACKER "attacker"
-#define MELEE_TOK_TARGET   "target"
-#define MELEE_TOK_DAMAGE   "damage"
-#define MELEE_TOK_AFFLICT  "affliction"
+#define ATK_TOK_ATTACKER "attacker"
+#define ATK_TOK_TARGET   "target"
+#define ATK_TOK_DAMAGE   "damage"
+#define ATK_TOK_AFFLICT  "affliction"
 
-static const char *const melee_flav_name[MELEE_FLAV__COUNT] = {
+static const char *const atk_flav_name[ATK_FLAV__COUNT] = {
   "minor", "medium", "major", "critical", "death", "dot_tick", "dot_death"
 };
 
@@ -74,22 +74,22 @@ static const char *const melee_flav_name[MELEE_FLAV__COUNT] = {
 // A death line carries no tally, because the blow that killed already
 // said the number; an affliction line names its wound, and a blow line
 // must not.
-static const uint8_t melee_tok_req[MELEE_FLAV__COUNT][4] = {
+static const uint8_t atk_tok_req[ATK_FLAV__COUNT][4] = {
   //                    attacker target damage affliction
-  [MELEE_FLAV_MINOR]     = { 1, 1, 1, 0 },
-  [MELEE_FLAV_MEDIUM]    = { 1, 1, 1, 0 },
-  [MELEE_FLAV_MAJOR]     = { 1, 1, 1, 0 },
-  [MELEE_FLAV_CRITICAL]  = { 1, 1, 1, 0 },
-  [MELEE_FLAV_DEATH]     = { 1, 1, 0, 0 },
-  [MELEE_FLAV_DOT_TICK]  = { 1, 1, 1, 1 },
-  [MELEE_FLAV_DOT_DEATH] = { 1, 1, 0, 1 },
+  [ATK_FLAV_MINOR]     = { 1, 1, 1, 0 },
+  [ATK_FLAV_MEDIUM]    = { 1, 1, 1, 0 },
+  [ATK_FLAV_MAJOR]     = { 1, 1, 1, 0 },
+  [ATK_FLAV_CRITICAL]  = { 1, 1, 1, 0 },
+  [ATK_FLAV_DEATH]     = { 1, 1, 0, 0 },
+  [ATK_FLAV_DOT_TICK]  = { 1, 1, 1, 1 },
+  [ATK_FLAV_DOT_DEATH] = { 1, 1, 0, 1 },
 };
 
-static const char *const melee_tok_name[4] = {
-  MELEE_TOK_ATTACKER, MELEE_TOK_TARGET, MELEE_TOK_DAMAGE, MELEE_TOK_AFFLICT
+static const char *const atk_tok_name[4] = {
+  ATK_TOK_ATTACKER, ATK_TOK_TARGET, ATK_TOK_DAMAGE, ATK_TOK_AFFLICT
 };
 
-static bool melee_llm_sanitize(melee_flavour_t, const char *, char *,
+static bool atk_llm_sanitize(atk_flavour_t, const char *, char *,
     size_t);
 
 // ------------------------------------------------------------------ //
@@ -98,11 +98,11 @@ static bool melee_llm_sanitize(melee_flavour_t, const char *, char *,
 
 // The plugin_find() gate is load-bearing and must stay first: every
 // llm_* entry point in inference.h is a dlsym shim that logs CLAM_FATAL
-// and abort()s when the inference plugin is not loaded. Melee declares
+// and abort()s when the inference plugin is not loaded. Attack declares
 // only `requires = method_text` — flavour is cosmetic, and the pit has
 // to stay deployable on a daemon that has no LLM at all.
 bool
-melee_llm_enabled(const melee_tunables_t *t)
+atk_llm_enabled(const atk_tunables_t *t)
 {
   llm_kind_t kind = LLM_KIND_CHAT;
 
@@ -125,10 +125,10 @@ melee_llm_enabled(const melee_tunables_t *t)
 }
 
 // Why the pit is speaking from its static tables, or NULL when a model
-// is authoring. `show melee llm` says this out loud rather than leaving
+// is authoring. `show attack llm` says this out loud rather than leaving
 // an operator to guess which of the four gates above closed.
 const char *
-melee_llm_offreason(const melee_tunables_t *t)
+atk_llm_offreason(const atk_tunables_t *t)
 {
   llm_kind_t kind = LLM_KIND_CHAT;
 
@@ -155,7 +155,7 @@ melee_llm_offreason(const melee_tunables_t *t)
 // ------------------------------------------------------------------ //
 
 static bool
-melee_tok_is(const char *tok, size_t len, const char *name)
+atk_tok_is(const char *tok, size_t len, const char *name)
 {
   return(strlen(name) == len && strncmp(tok, name, len) == 0);
 }
@@ -164,7 +164,7 @@ melee_tok_is(const char *tok, size_t len, const char *name)
 // when every rule below holds; the hot path then performs no validation
 // of its own, because there is nothing left to validate.
 static bool
-melee_llm_sanitize(melee_flavour_t cat, const char *in, char *out,
+atk_llm_sanitize(atk_flavour_t cat, const char *in, char *out,
     size_t cap)
 {
   const char *why   = NULL;
@@ -175,7 +175,7 @@ melee_llm_sanitize(melee_flavour_t cat, const char *in, char *out,
   uint32_t    tok;
   char        miscount[64];
 
-  if(in == NULL || out == NULL || cap == 0 || cat >= MELEE_FLAV__COUNT)
+  if(in == NULL || out == NULL || cap == 0 || cat >= ATK_FLAV__COUNT)
     return(FAIL);
 
   // 1. Trim.
@@ -226,9 +226,9 @@ melee_llm_sanitize(melee_flavour_t cat, const char *in, char *out,
     why = "too long";
 
   // 5. Control bytes. This kills \r and \n — IRC protocol injection —
-  //    and also \x01, the abstract colour marker melee_vis_len() treats
+  //    and also \x01, the abstract colour marker atk_vis_len() treats
   //    as zero width: a model-supplied one would silently skew every
-  //    column of `show melee`.
+  //    column of `show attack`.
   for(p = in; why == NULL && p < end; p++)
   {
     if((unsigned char)*p < 0x20 || (unsigned char)*p == 0x7f)
@@ -270,7 +270,7 @@ melee_llm_sanitize(melee_flavour_t cat, const char *in, char *out,
 
     for(tok = 0; tok < 4; tok++)
     {
-      if(melee_tok_is(p + 1, tlen, melee_tok_name[tok]))
+      if(atk_tok_is(p + 1, tlen, atk_tok_name[tok]))
       {
         seen[tok]++;
         known = true;
@@ -293,11 +293,11 @@ melee_llm_sanitize(melee_flavour_t cat, const char *in, char *out,
   //    counts that do not match the table.
   for(tok = 0; why == NULL && tok < 4; tok++)
   {
-    if(seen[tok] != melee_tok_req[cat][tok])
+    if(seen[tok] != atk_tok_req[cat][tok])
     {
       snprintf(miscount, sizeof(miscount), "{%s} x%u, wanted x%u",
-          melee_tok_name[tok], seen[tok],
-          (unsigned)melee_tok_req[cat][tok]);
+          atk_tok_name[tok], seen[tok],
+          (unsigned)atk_tok_req[cat][tok]);
       why = miscount;
     }
   }
@@ -305,9 +305,9 @@ melee_llm_sanitize(melee_flavour_t cat, const char *in, char *out,
   if(why != NULL)
   {
     // CLAM_DEBUG, never CLAM_WARN: a chatty model would flood the log
-    // one line at a time. melee_llm_done() logs the tally instead.
-    clam(CLAM_DEBUG, MELEE_CTX, "flavour %s: rejected line (%s)",
-        melee_flav_name[cat], why);
+    // one line at a time. atk_llm_done() logs the tally instead.
+    clam(CLAM_DEBUG, ATK_CTX, "flavour %s: rejected line (%s)",
+        atk_flav_name[cat], why);
     return(FAIL);
   }
 
@@ -322,21 +322,21 @@ melee_llm_sanitize(melee_flavour_t cat, const char *in, char *out,
 // ------------------------------------------------------------------ //
 
 bool
-melee_pool_take(melee_flavour_t cat, char *out, size_t cap,
+atk_pool_take(atk_flavour_t cat, char *out, size_t cap,
     uint32_t refill_at, bool *need_refill)
 {
-  melee_pool_t *pool = NULL;
-  bool          got  = FAIL;
+  atk_pool_t *pool = NULL;
+  bool        got  = FAIL;
 
   if(need_refill != NULL)
     *need_refill = false;
 
-  if(cat >= MELEE_FLAV__COUNT || out == NULL || cap == 0)
+  if(cat >= ATK_FLAV__COUNT || out == NULL || cap == 0)
     return(FAIL);
 
-  pool = &melee_pools[cat];
+  pool = &atk_pools[cat];
 
-  pthread_mutex_lock(&melee_pool_lock);
+  pthread_mutex_lock(&atk_pool_lock);
 
   // Swap-remove: draining rather than sampling with replacement is the
   // point — within one pool generation the pit never repeats itself,
@@ -359,57 +359,57 @@ melee_pool_take(melee_flavour_t cat, char *out, size_t cap,
   if(need_refill != NULL && pool->count <= refill_at)
     *need_refill = true;
 
-  pthread_mutex_unlock(&melee_pool_lock);
+  pthread_mutex_unlock(&atk_pool_lock);
 
   return(got);
 }
 
 // Bumped by the renderer whenever the pool came up dry and the static
-// tables spoke instead; `show melee llm` reports the tally.
+// tables spoke instead; `show attack llm` reports the tally.
 void
-melee_pool_fallback(void)
+atk_pool_fallback(void)
 {
-  pthread_mutex_lock(&melee_pool_lock);
-  melee_fallbacks++;
-  pthread_mutex_unlock(&melee_pool_lock);
+  pthread_mutex_lock(&atk_pool_lock);
+  atk_fallbacks++;
+  pthread_mutex_unlock(&atk_pool_lock);
 }
 
-// A read-only snapshot for `show melee llm`. Takes melee_pool_lock and
-// nothing else — the views never touch melee_turn_lock.
+// A read-only snapshot for `show attack llm`. Takes atk_pool_lock and
+// nothing else — the views never touch atk_turn_lock.
 void
-melee_pool_stats(melee_flavour_t cat, melee_pool_stat_t *out)
+atk_pool_stats(atk_flavour_t cat, atk_pool_stat_t *out)
 {
-  const melee_pool_t *pool = NULL;
-  time_t              now  = time(NULL);
+  const atk_pool_t *pool = NULL;
+  time_t            now  = time(NULL);
 
   if(out == NULL)
     return;
 
   memset(out, 0, sizeof(*out));
 
-  if(cat >= MELEE_FLAV__COUNT)
+  if(cat >= ATK_FLAV__COUNT)
     return;
 
-  pool = &melee_pools[cat];
+  pool = &atk_pools[cat];
 
-  pthread_mutex_lock(&melee_pool_lock);
+  pthread_mutex_lock(&atk_pool_lock);
   out->depth    = pool->count;
   out->served   = pool->served;
   out->rejected = pool->rejected;
   out->inflight = pool->inflight;
   out->wait     = (pool->next_try > now) ? (int64_t)(pool->next_try - now) : 0;
   snprintf(out->last_error, sizeof(out->last_error), "%s", pool->last_error);
-  pthread_mutex_unlock(&melee_pool_lock);
+  pthread_mutex_unlock(&atk_pool_lock);
 }
 
 uint64_t
-melee_pool_fallbacks(void)
+atk_pool_fallbacks(void)
 {
   uint64_t n;
 
-  pthread_mutex_lock(&melee_pool_lock);
-  n = melee_fallbacks;
-  pthread_mutex_unlock(&melee_pool_lock);
+  pthread_mutex_lock(&atk_pool_lock);
+  n = atk_fallbacks;
+  pthread_mutex_unlock(&atk_pool_lock);
 
   return(n);
 }
@@ -419,7 +419,7 @@ melee_pool_fallbacks(void)
 // ------------------------------------------------------------------ //
 
 void
-melee_tmpl_expand(char *out, size_t cap, const char *tmpl,
+atk_tmpl_expand(char *out, size_t cap, const char *tmpl,
     const char *attacker, const char *target, const char *damage,
     const char *affliction)
 {
@@ -456,16 +456,16 @@ melee_tmpl_expand(char *out, size_t cap, const char *tmpl,
     {
       tlen = (size_t)(close - tmpl - 1);
 
-      if(melee_tok_is(tmpl + 1, tlen, MELEE_TOK_ATTACKER))
+      if(atk_tok_is(tmpl + 1, tlen, ATK_TOK_ATTACKER))
         sub = attacker;
 
-      else if(melee_tok_is(tmpl + 1, tlen, MELEE_TOK_TARGET))
+      else if(atk_tok_is(tmpl + 1, tlen, ATK_TOK_TARGET))
         sub = target;
 
-      else if(melee_tok_is(tmpl + 1, tlen, MELEE_TOK_DAMAGE))
+      else if(atk_tok_is(tmpl + 1, tlen, ATK_TOK_DAMAGE))
         sub = damage;
 
-      else if(melee_tok_is(tmpl + 1, tlen, MELEE_TOK_AFFLICT))
+      else if(atk_tok_is(tmpl + 1, tlen, ATK_TOK_AFFLICT))
         sub = affliction;
     }
 
@@ -496,14 +496,14 @@ melee_tmpl_expand(char *out, size_t cap, const char *tmpl,
 
 // The machine-readable half of the prompt. It lives in C, not in the
 // persona file, so an operator rewriting the persona can never break
-// parsing. %u is melee's own format string, interpolated into a scratch
+// parsing. %u is attack's own format string, interpolated into a scratch
 // buffer; the model's output never reaches a conversion.
 //
 // The four damage tiers share every rule but the last one, which is the
 // whole point of the tiering: the force described has to match the
 // number the roll produced. The shared half is a macro rather than four
 // copies so the rules cannot drift apart tier by tier.
-#define MELEE_FMT_BLOW_COMMON \
+#define ATK_FMT_BLOW_COMMON \
   "Write exactly %u lines of combat flavour. One line per line of output.\n" \
   "\n" \
   "Every line MUST contain the three placeholder tokens {attacker}, {target}\n" \
@@ -519,35 +519,35 @@ melee_tmpl_expand(char *out, size_t cap, const char *tmpl,
   "  braces other than the three tokens named above.\n" \
   "- Every line must differ from every other line.\n"
 
-static const char *const melee_fmt_minor =
-  MELEE_FMT_BLOW_COMMON
+static const char *const atk_fmt_minor =
+  ATK_FMT_BLOW_COMMON
   "- These are GLANCING blows: the weakest hits in the game. A graze, a\n"
   "  scuff, a stinging insult of a strike. The target is barely\n"
   "  inconvenienced and is never in danger.\n"
   "- Match the words to the number: nothing here may sound like a wound\n"
   "  that would end a fight.\n";
 
-static const char *const melee_fmt_medium =
-  MELEE_FMT_BLOW_COMMON
+static const char *const atk_fmt_medium =
+  ATK_FMT_BLOW_COMMON
   "- These are SOLID blows: a clean, ordinary hit that hurts and does real\n"
   "  damage, but that a fighter shrugs off and keeps going through.\n"
   "- Match the words to the number: no dismemberment, no bones through\n"
   "  skin, no talk of dying.\n";
 
-static const char *const melee_fmt_major =
-  MELEE_FMT_BLOW_COMMON
+static const char *const atk_fmt_major =
+  ATK_FMT_BLOW_COMMON
   "- These are HEAVY blows: bone, blood and stagger. The target is badly\n"
   "  hurt and visibly losing, but SURVIVES the hit.\n"
   "- Match the words to the number: this must sound worse than an ordinary\n"
   "  hit and less than a killing one.\n";
 
-static const char *const melee_fmt_critical =
-  MELEE_FMT_BLOW_COMMON
+static const char *const atk_fmt_critical =
+  ATK_FMT_BLOW_COMMON
   "- These are DEVASTATING blows: the heaviest damage in the game,\n"
   "  unusually brutal -- but still NON-fatal. The target survives.\n"
   "- End each line with the damage clause so it lands hard.\n";
 
-static const char *const melee_fmt_death =
+static const char *const atk_fmt_death =
   "Write exactly %u lines of combat flavour. One line per line of output.\n"
   "\n"
   "Every line MUST contain the two placeholder tokens {attacker} and\n"
@@ -569,7 +569,7 @@ static const char *const melee_fmt_death =
 // not choose and must not gloss: the noun is substituted whole, so a
 // line that writes "the venom {affliction}" reads as nonsense the moment
 // the wound is spores.
-static const char *const melee_fmt_dot_tick =
+static const char *const atk_fmt_dot_tick =
   "Write exactly %u lines of combat flavour. One line per line of output.\n"
   "\n"
   "Every line MUST contain the four placeholder tokens {attacker},\n"
@@ -593,7 +593,7 @@ static const char *const melee_fmt_dot_tick =
   "- {target} SURVIVES this line. It hurts and it is grim, but it does not\n"
   "  kill.\n";
 
-static const char *const melee_fmt_dot_death =
+static const char *const atk_fmt_dot_death =
   "Write exactly %u lines of combat flavour. One line per line of output.\n"
   "\n"
   "Every line MUST contain the three placeholder tokens {attacker},\n"
@@ -616,18 +616,18 @@ static const char *const melee_fmt_dot_death =
   "  a damage number and do not use a {damage} token; the round is over.\n";
 
 static const char *
-melee_fmt_for(melee_flavour_t cat)
+atk_fmt_for(atk_flavour_t cat)
 {
   switch(cat)
   {
-    case MELEE_FLAV_MINOR:     return(melee_fmt_minor);
-    case MELEE_FLAV_MEDIUM:    return(melee_fmt_medium);
-    case MELEE_FLAV_MAJOR:     return(melee_fmt_major);
-    case MELEE_FLAV_CRITICAL:  return(melee_fmt_critical);
-    case MELEE_FLAV_DEATH:     return(melee_fmt_death);
-    case MELEE_FLAV_DOT_TICK:  return(melee_fmt_dot_tick);
-    case MELEE_FLAV_DOT_DEATH: return(melee_fmt_dot_death);
-    default:                   return(melee_fmt_medium);
+    case ATK_FLAV_MINOR:     return(atk_fmt_minor);
+    case ATK_FLAV_MEDIUM:    return(atk_fmt_medium);
+    case ATK_FLAV_MAJOR:     return(atk_fmt_major);
+    case ATK_FLAV_CRITICAL:  return(atk_fmt_critical);
+    case ATK_FLAV_DEATH:     return(atk_fmt_death);
+    case ATK_FLAV_DOT_TICK:  return(atk_fmt_dot_tick);
+    case ATK_FLAV_DOT_DEATH: return(atk_fmt_dot_death);
+    default:                   return(atk_fmt_medium);
   }
 }
 
@@ -635,74 +635,74 @@ melee_fmt_for(melee_flavour_t cat)
 // it; the tunables travel by value so the task reads no KV of its own.
 typedef struct
 {
-  melee_flavour_t   cat;
-  melee_tunables_t  t;
-} melee_refill_t;
+  atk_flavour_t   cat;
+  atk_tunables_t  t;
+} atk_refill_t;
 
 // What the LLM round-trip needs. Separately allocated from the task's
 // own payload, because the task frees itself long before the model
 // answers.
 typedef struct
 {
-  melee_flavour_t  cat;
-  uint32_t         pool_size;
-  uint32_t         retry_secs;
-  uint32_t         gen;   // generation this request was submitted under
-} melee_fill_ctx_t;
+  atk_flavour_t  cat;
+  uint32_t       pool_size;
+  uint32_t       retry_secs;
+  uint32_t       gen;   // generation this request was submitted under
+} atk_fill_ctx_t;
 
 static void
-melee_pool_fail(melee_flavour_t cat, const char *why, uint32_t retry_secs)
+atk_pool_fail(atk_flavour_t cat, const char *why, uint32_t retry_secs)
 {
-  pthread_mutex_lock(&melee_pool_lock);
-  snprintf(melee_pools[cat].last_error, sizeof(melee_pools[cat].last_error),
+  pthread_mutex_lock(&atk_pool_lock);
+  snprintf(atk_pools[cat].last_error, sizeof(atk_pools[cat].last_error),
       "%s", why != NULL ? why : "unknown error");
-  melee_pools[cat].next_try = time(NULL) + (time_t)retry_secs;
-  melee_pools[cat].inflight = false;
-  pthread_mutex_unlock(&melee_pool_lock);
+  atk_pools[cat].next_try = time(NULL) + (time_t)retry_secs;
+  atk_pools[cat].inflight = false;
+  pthread_mutex_unlock(&atk_pool_lock);
 }
 
 // Runs on a curl worker. Light work only: split, sanitise, install.
 static void
-melee_llm_done(const llm_chat_response_t *resp)
+atk_llm_done(const llm_chat_response_t *resp)
 {
-  melee_fill_ctx_t *fc       = NULL;
-  melee_pool_t     *pool     = NULL;
-  const char       *p        = NULL;
-  uint32_t          accepted = 0;
-  uint32_t          rejected = 0;
-  uint16_t          depth    = 0;
-  bool              stale    = false;
+  atk_fill_ctx_t *fc       = NULL;
+  atk_pool_t     *pool     = NULL;
+  const char     *p        = NULL;
+  uint32_t        accepted = 0;
+  uint32_t        rejected = 0;
+  uint16_t        depth    = 0;
+  bool            stale    = false;
 
   if(resp == NULL || resp->user_data == NULL)
     return;
 
   fc   = resp->user_data;
-  pool = &melee_pools[fc->cat];
+  pool = &atk_pools[fc->cat];
 
   // These lines were written under a preamble that no longer applies, so
   // nothing here may touch the pool's contents, its backoff, or its
   // last_error — a reset pool must not inherit a discarded request's
   // failure. Reading a plain uint32_t under the lock is the project's
   // discipline, not a performance question.
-  pthread_mutex_lock(&melee_pool_lock);
+  pthread_mutex_lock(&atk_pool_lock);
 
-  if(fc->gen != melee_pool_gen)
+  if(fc->gen != atk_pool_gen)
   {
     pool->inflight = false;
     pool->next_try = 0;
     stale = true;
   }
 
-  pthread_mutex_unlock(&melee_pool_lock);
+  pthread_mutex_unlock(&atk_pool_lock);
 
   if(stale)
   {
-    const melee_flavour_t cat = fc->cat;
-    melee_tunables_t      t;
+    const atk_flavour_t cat = fc->cat;
+    atk_tunables_t      t;
 
-    clam(CLAM_INFO, MELEE_CTX,
+    clam(CLAM_INFO, ATK_CTX,
         "flavour %s: refill discarded (preamble changed under it)",
-        melee_flav_name[cat]);
+        atk_flav_name[cat]);
 
     // The tunables are read FRESH, not taken from fc->t. fc->t is what
     // was in force when this request was submitted — the very preamble
@@ -712,23 +712,23 @@ melee_llm_done(const llm_chat_response_t *resp)
     // with the KV insisting otherwise. Cost is one kv read on a curl
     // worker: a mutex, no I/O; the persona file is not touched until
     // the refill task runs on its own thread.
-    melee_tunables_load(&t);
+    atk_tunables_load(&t);
 
     // Copy `cat` before the free, kick after it. The kick is a queue
     // insert and is safe here; it re-arms the category that
-    // melee_llm_invalidate() deliberately left alone, and it cannot
+    // atk_llm_invalidate() deliberately left alone, and it cannot
     // storm — the generation only moves on an operator action.
     mem_free(fc);
-    melee_llm_refill_kick(cat, &t);
+    atk_llm_refill_kick(cat, &t);
     return;
   }
 
   if(!resp->ok || resp->content == NULL)
   {
-    clam(CLAM_WARN, MELEE_CTX, "flavour %s: refill failed (%s)",
-        melee_flav_name[fc->cat],
+    clam(CLAM_WARN, ATK_CTX, "flavour %s: refill failed (%s)",
+        atk_flav_name[fc->cat],
         resp->error != NULL ? resp->error : "no response");
-    melee_pool_fail(fc->cat, resp->error, fc->retry_secs);
+    atk_pool_fail(fc->cat, resp->error, fc->retry_secs);
     mem_free(fc);
     return;
   }
@@ -739,8 +739,8 @@ melee_llm_done(const llm_chat_response_t *resp)
   {
     const char *nl  = strchr(p, '\n');
     size_t      seg = (nl != NULL) ? (size_t)(nl - p) : strlen(p);
-    char        raw [MELEE_LLM_TMPL_SZ * 2];
-    char        tmpl[MELEE_LLM_TMPL_SZ];
+    char        raw [ATK_LLM_TMPL_SZ * 2];
+    char        tmpl[ATK_LLM_TMPL_SZ];
 
     if(seg > 0 && p[seg - 1] == '\r')   // provider CRLF
       seg--;
@@ -756,52 +756,52 @@ melee_llm_done(const llm_chat_response_t *resp)
     if(raw[0] == '\0')
       continue;
 
-    if(melee_llm_sanitize(fc->cat, raw, tmpl, sizeof(tmpl)) != SUCCESS)
+    if(atk_llm_sanitize(fc->cat, raw, tmpl, sizeof(tmpl)) != SUCCESS)
     {
       rejected++;
       continue;
     }
 
-    pthread_mutex_lock(&melee_pool_lock);
+    pthread_mutex_lock(&atk_pool_lock);
 
-    if(pool->count < fc->pool_size && pool->count < MELEE_LLM_POOL_MAX)
+    if(pool->count < fc->pool_size && pool->count < ATK_LLM_POOL_MAX)
     {
-      snprintf(pool->lines[pool->count], MELEE_LLM_TMPL_SZ, "%s", tmpl);
+      snprintf(pool->lines[pool->count], ATK_LLM_TMPL_SZ, "%s", tmpl);
       pool->count++;
       accepted++;
     }
 
-    pthread_mutex_unlock(&melee_pool_lock);
+    pthread_mutex_unlock(&atk_pool_lock);
   }
 
   // A model that ignores the format block must not be retried in a
   // tight loop, so an all-rejected answer counts as a failure.
   if(accepted == 0)
   {
-    clam(CLAM_WARN, MELEE_CTX,
+    clam(CLAM_WARN, ATK_CTX,
         "flavour %s: refill produced nothing usable (%u rejected, "
-        "finish_reason %s)", melee_flav_name[fc->cat], rejected,
+        "finish_reason %s)", atk_flav_name[fc->cat], rejected,
         resp->finish_reason != NULL ? resp->finish_reason : "?");
-    melee_pool_fail(fc->cat, "model returned no usable lines",
+    atk_pool_fail(fc->cat, "model returned no usable lines",
         fc->retry_secs);
     mem_free(fc);
     return;
   }
 
-  pthread_mutex_lock(&melee_pool_lock);
+  pthread_mutex_lock(&atk_pool_lock);
   pool->rejected += rejected;
   pool->inflight  = false;
   pool->next_try  = 0;
   pool->last_error[0] = '\0';
   depth = pool->count;
-  pthread_mutex_unlock(&melee_pool_lock);
+  pthread_mutex_unlock(&atk_pool_lock);
 
   // A finish_reason of "length" means max_tokens truncated the final
   // line, which then simply failed sanitisation — the first thing to
   // suspect when accepted counts run one short.
-  clam(CLAM_INFO, MELEE_CTX,
+  clam(CLAM_INFO, ATK_CTX,
       "flavour %s: refilled +%u (rejected %u, depth %u, finish %s)",
-      melee_flav_name[fc->cat], accepted, rejected, (unsigned)depth,
+      atk_flav_name[fc->cat], accepted, rejected, (unsigned)depth,
       resp->finish_reason != NULL ? resp->finish_reason : "?");
 
   mem_free(fc);
@@ -812,10 +812,10 @@ melee_llm_done(const llm_chat_response_t *resp)
 // building the request is blocking file I/O and must never happen on a
 // command worker, let alone under a lock.
 static void
-melee_llm_refill_task(task_t *t)
+atk_llm_refill_task(task_t *t)
 {
-  melee_refill_t   *r    = NULL;
-  melee_fill_ctx_t *fc   = NULL;
+  atk_refill_t     *r    = NULL;
+  atk_fill_ctx_t   *fc   = NULL;
   llm_message_t     msgs[2] = {0};   // MUST be zero-initialised: the
                                      // .blocks pointer would otherwise
                                      // read stack garbage.
@@ -856,10 +856,10 @@ melee_llm_refill_task(task_t *t)
   // personas mean twice the chance of one. CLAM_WARN, not CLAM_DEBUG:
   // this fires once per refill, not once per line.
   else if(r->t.llm_prompt[0] != '\0')
-    clam(CLAM_WARN, MELEE_CTX, "persona file unreadable: '%s' (the model "
+    clam(CLAM_WARN, ATK_CTX, "persona file unreadable: '%s' (the model "
         "will write in its own voice)", r->t.llm_prompt);
 
-  snprintf(rules, sizeof(rules), melee_fmt_for(r->cat), r->t.llm_pool);
+  snprintf(rules, sizeof(rules), atk_fmt_for(r->cat), r->t.llm_pool);
   snprintf(sys, sizeof(sys), "%s%s%s", persona,
       persona[0] != '\0' ? "\n\n" : "", rules);
   snprintf(usr, sizeof(usr), "Write %u lines now.", r->t.llm_pool);
@@ -875,23 +875,23 @@ melee_llm_refill_task(task_t *t)
   p.timeout_secs = r->t.llm_timeout;
   p.stream       = false;
 
-  fc = mem_alloc(MELEE_CTX, "melee_fill_ctx", sizeof(*fc));
+  fc = mem_alloc(ATK_CTX, "atk_fill_ctx", sizeof(*fc));
   fc->cat        = r->cat;
   fc->pool_size  = r->t.llm_pool;
   fc->retry_secs = r->t.llm_retry;
 
-  pthread_mutex_lock(&melee_pool_lock);
-  fc->gen = melee_pool_gen;
-  pthread_mutex_unlock(&melee_pool_lock);
+  pthread_mutex_lock(&atk_pool_lock);
+  fc->gen = atk_pool_gen;
+  pthread_mutex_unlock(&atk_pool_lock);
 
   // msgs[] and both prompt buffers may be stack-local: llm_chat_submit
   // copies everything before it returns.
-  if(llm_chat_submit(r->t.llm_model, &p, msgs, 2, melee_llm_done, NULL,
+  if(llm_chat_submit(r->t.llm_model, &p, msgs, 2, atk_llm_done, NULL,
         fc) != SUCCESS)
   {
-    clam(CLAM_WARN, MELEE_CTX, "flavour %s: submit refused",
-        melee_flav_name[r->cat]);
-    melee_pool_fail(r->cat, "submit refused", r->t.llm_retry);
+    clam(CLAM_WARN, ATK_CTX, "flavour %s: submit refused",
+        atk_flav_name[r->cat]);
+    atk_pool_fail(r->cat, "submit refused", r->t.llm_retry);
     mem_free(fc);
   }
 
@@ -903,49 +903,49 @@ melee_llm_refill_task(task_t *t)
 // is already in flight, or while the failure backoff is still running.
 // Safe to call from the turn path — task_add is a queue insert, never
 // I/O — but the turn path deliberately calls it only after it has
-// dropped melee_turn_lock.
+// dropped atk_turn_lock.
 void
-melee_llm_refill_kick(melee_flavour_t cat, const melee_tunables_t *t)
+atk_llm_refill_kick(atk_flavour_t cat, const atk_tunables_t *t)
 {
-  melee_refill_t *r    = NULL;
-  bool            arm  = false;
+  atk_refill_t *r    = NULL;
+  bool          arm  = false;
 
-  if(cat >= MELEE_FLAV__COUNT || !melee_llm_enabled(t))
+  if(cat >= ATK_FLAV__COUNT || !atk_llm_enabled(t))
     return;
 
-  pthread_mutex_lock(&melee_pool_lock);
+  pthread_mutex_lock(&atk_pool_lock);
 
-  if(!melee_pools[cat].inflight &&
-     melee_pools[cat].next_try <= time(NULL) &&
-     melee_pools[cat].count < t->llm_pool)
+  if(!atk_pools[cat].inflight &&
+     atk_pools[cat].next_try <= time(NULL) &&
+     atk_pools[cat].count < t->llm_pool)
   {
-    melee_pools[cat].inflight = true;
+    atk_pools[cat].inflight = true;
     arm = true;
   }
 
-  pthread_mutex_unlock(&melee_pool_lock);
+  pthread_mutex_unlock(&atk_pool_lock);
 
   if(!arm)
     return;
 
-  r      = mem_alloc(MELEE_CTX, "melee_refill", sizeof(*r));
+  r      = mem_alloc(ATK_CTX, "atk_refill", sizeof(*r));
   r->cat = cat;
   r->t   = *t;
 
   // Priority 200 matches the other opportunistic background work. The
   // failure path below is mandatory: miss it and this category never
   // refills again for the life of the daemon.
-  if(task_add("melee.llm.fill", TASK_THREAD, 200, melee_llm_refill_task,
+  if(task_add("attack.llm.fill", TASK_THREAD, 200, atk_llm_refill_task,
         r) == NULL)
   {
     mem_free(r);
 
-    pthread_mutex_lock(&melee_pool_lock);
-    melee_pools[cat].inflight = false;
-    pthread_mutex_unlock(&melee_pool_lock);
+    pthread_mutex_lock(&atk_pool_lock);
+    atk_pools[cat].inflight = false;
+    pthread_mutex_unlock(&atk_pool_lock);
 
-    clam(CLAM_WARN, MELEE_CTX, "flavour %s: could not queue refill",
-        melee_flav_name[cat]);
+    clam(CLAM_WARN, ATK_CTX, "flavour %s: could not queue refill",
+        atk_flav_name[cat]);
   }
 }
 
@@ -955,38 +955,38 @@ melee_llm_refill_kick(melee_flavour_t cat, const melee_tunables_t *t)
 
 // Between the clear and the first refill landing the pools are empty and
 // the pit speaks from the static tables. That is correct — it is what
-// the fallback is for — and `show melee llm` will tick its fallbacks
+// the fallback is for — and `show attack llm` will tick its fallbacks
 // counter while it lasts.
 void
-melee_llm_invalidate(const char *why)
+atk_llm_invalidate(const char *why)
 {
-  melee_tunables_t t;
-  melee_flavour_t  cat;
+  atk_tunables_t t;
+  atk_flavour_t  cat;
 
-  pthread_mutex_lock(&melee_pool_lock);
+  pthread_mutex_lock(&atk_pool_lock);
 
-  for(cat = MELEE_FLAV_MINOR; cat < MELEE_FLAV__COUNT; cat++)
+  for(cat = ATK_FLAV_MINOR; cat < ATK_FLAV__COUNT; cat++)
   {
-    melee_pools[cat].count         = 0;
-    melee_pools[cat].next_try      = 0;
-    melee_pools[cat].last_error[0] = '\0';
+    atk_pools[cat].count         = 0;
+    atk_pools[cat].next_try      = 0;
+    atk_pools[cat].last_error[0] = '\0';
 
     // `inflight` is deliberately left alone: that request is already at
     // the provider and its callback owns the flag. The generation bump
     // below is what makes its answer harmless.
   }
 
-  melee_pool_gen++;
-  pthread_mutex_unlock(&melee_pool_lock);
+  atk_pool_gen++;
+  pthread_mutex_unlock(&atk_pool_lock);
 
-  clam(CLAM_INFO, MELEE_CTX, "flavour: pools cleared (%s), regenerating",
+  clam(CLAM_INFO, ATK_CTX, "flavour: pools cleared (%s), regenerating",
       why != NULL ? why : "reason unstated");
 
   // Outside the lock. Categories with a request still in flight will not
   // re-arm here; their discarded-response path re-arms them instead,
   // which is the entire reason that path kicks.
-  melee_tunables_load(&t);
-  melee_llm_prime(&t);
+  atk_tunables_load(&t);
+  atk_llm_prime(&t);
 }
 
 // kv fires this outside the KV lock and only on an actual value change,
@@ -995,35 +995,35 @@ melee_llm_invalidate(const char *why)
 // kv_load() does the same, and these callbacks are installed in start(),
 // which runs after kv_load() — so boot never fires them.
 static void
-melee_llm_kv_changed(const char *key, void *data)
+atk_llm_kv_changed(const char *key, void *data)
 {
   (void)data;
 
-  melee_llm_invalidate(key != NULL ? key : "configuration changed");
+  atk_llm_invalidate(key != NULL ? key : "configuration changed");
 }
 
 void
-melee_llm_watch(bool on)
+atk_llm_watch(bool on)
 {
-  kv_set_cb(MELEE_KV_LLM_PROMPT, on ? melee_llm_kv_changed : NULL, NULL);
-  kv_set_cb(MELEE_KV_LLM_MODEL,  on ? melee_llm_kv_changed : NULL, NULL);
+  kv_set_cb(ATK_KV_LLM_PROMPT, on ? atk_llm_kv_changed : NULL, NULL);
+  kv_set_cb(ATK_KV_LLM_MODEL,  on ? atk_llm_kv_changed : NULL, NULL);
 }
 
 // Fill all five pools before the first blow rather than after it. That
 // is five concurrent chat requests against whatever service the operator
 // configured; they are deliberately not staggered, and a provider that
-// rate-limits us will show up as failed refills in `show melee llm`.
+// rate-limits us will show up as failed refills in `show attack llm`.
 void
-melee_llm_prime(const melee_tunables_t *t)
+atk_llm_prime(const atk_tunables_t *t)
 {
-  melee_flavour_t cat;
+  atk_flavour_t cat;
 
-  if(!melee_llm_enabled(t))
+  if(!atk_llm_enabled(t))
     return;
 
-  clam(CLAM_INFO, MELEE_CTX, "flavour: priming from model '%s'",
+  clam(CLAM_INFO, ATK_CTX, "flavour: priming from model '%s'",
       t->llm_model);
 
-  for(cat = MELEE_FLAV_MINOR; cat < MELEE_FLAV__COUNT; cat++)
-    melee_llm_refill_kick(cat, t);
+  for(cat = ATK_FLAV_MINOR; cat < ATK_FLAV__COUNT; cat++)
+    atk_llm_refill_kick(cat, t);
 }

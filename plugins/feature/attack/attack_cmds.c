@@ -1,5 +1,5 @@
 // botmanager — MIT
-// melee command surface: `!melee <nick>`, the turn engine that resolves
+// attack command surface: `!attack <nick>`, the turn engine that resolves
 // one blow. Registered users only, group chat only — both enforced by
 // the command system's per-leaf gate, never re-checked here.
 //
@@ -8,8 +8,8 @@
 // arriving on different worker threads cannot both decrement the same
 // combatant's health.
 
-#define MELEE_INTERNAL
-#include "melee.h"
+#define ATTACK_INTERNAL
+#include "attack.h"
 
 #include "bot.h"
 #include "colors.h"
@@ -25,8 +25,8 @@
 // roll, write, announce. Target resolution and the presence probe run
 // *outside* it — they mutate nothing and would only widen the window
 // while holding a lock the method drivers know nothing about. The decay
-// task takes the same lock for the same reason (see melee.h).
-pthread_mutex_t melee_turn_lock = PTHREAD_MUTEX_INITIALIZER;
+// task takes the same lock for the same reason (see attack.h).
+pthread_mutex_t atk_turn_lock = PTHREAD_MUTEX_INITIALIZER;
 
 // ------------------------------------------------------------------ //
 // Resolution helpers                                                  //
@@ -37,12 +37,12 @@ typedef struct
   const char *nick;
   uint32_t    seen;    // members enumerated at all
   bool        found;
-} melee_presence_t;
+} atk_presence_t;
 
 static void
-melee_presence_cb(const char *nick, void *data)
+atk_presence_cb(const char *nick, void *data)
 {
-  melee_presence_t *p = data;
+  atk_presence_t *p = data;
 
   p->seen++;
 
@@ -53,12 +53,12 @@ melee_presence_cb(const char *nick, void *data)
 // Is `nick` in this room? A driver with no member tracking enumerates
 // nobody, which must read as "cannot tell", never as "absent".
 static bool
-melee_target_present(const cmd_ctx_t *ctx, const char *nick)
+atk_target_present(const cmd_ctx_t *ctx, const char *nick)
 {
-  melee_presence_t p = { .nick = nick, .seen = 0, .found = false };
+  atk_presence_t p = { .nick = nick, .seen = 0, .found = false };
 
   method_list_channel(ctx->msg->inst, ctx->msg->channel,
-      melee_presence_cb, &p);
+      atk_presence_cb, &p);
 
   return(p.seen == 0 || p.found);
 }
@@ -67,7 +67,7 @@ melee_target_present(const cmd_ctx_t *ctx, const char *nick)
 // the bot's authenticated sessions, then by taking the token as a
 // username outright. Anything else is a ghost.
 static bool
-melee_resolve_target(const cmd_ctx_t *ctx, const userns_t *ns,
+atk_resolve_target(const cmd_ctx_t *ctx, const userns_t *ns,
     const char *nick, char *out, size_t cap)
 {
   const char *user = bot_session_find(ctx->bot, ctx->msg->inst, nick);
@@ -88,32 +88,32 @@ melee_resolve_target(const cmd_ctx_t *ctx, const userns_t *ns,
 }
 
 // ------------------------------------------------------------------ //
-// melee <nick>                                                        //
+// attack <nick>                                                       //
 // ------------------------------------------------------------------ //
 
 static void
-melee_cmd_attack(const cmd_ctx_t *ctx)
+atk_cmd_attack(const cmd_ctx_t *ctx)
 {
-  melee_tunables_t  t;
-  melee_round_t     round = { 0 };
-  melee_player_t    atk;
-  melee_player_t    tgt;
-  melee_blow_t      blow;
-  userns_t         *ns;
-  const char       *nick;
-  const char       *method;
-  const char       *channel;
-  const char       *atk_nick;
-  char              tgt_user[MELEE_USER_SZ];
-  char              line[MELEE_LINE_SZ];
-  char              roster[MELEE_ROSTER_SZ];
-  int32_t           dmg;
-  int32_t           new_hp;
-  bool              crit  = false;
-  bool              fatal = false;
-  bool              refill_blow  = false;   // the blow's own category
-  bool              refill_death = false;   // DEATH, on a fatal blow
-  bool              afflicted    = false;   // a DOT landed; wake the decay
+  atk_tunables_t  t;
+  atk_round_t     round = { 0 };
+  atk_player_t    src;
+  atk_player_t    tgt;
+  atk_blow_t      blow;
+  userns_t       *ns;
+  const char     *nick;
+  const char     *method;
+  const char     *channel;
+  const char     *src_nick;
+  char            tgt_user[ATK_USER_SZ];
+  char            line[ATK_LINE_SZ];
+  char            roster[ATK_ROSTER_SZ];
+  int32_t         dmg;
+  int32_t         new_hp;
+  bool            crit  = false;
+  bool            fatal = false;
+  bool            refill_blow  = false;   // the blow's own category
+  bool            refill_death = false;   // DEATH, on a fatal blow
+  bool            afflicted    = false;   // a DOT landed; wake the decay
 
   ns = userns_session_resolve(ctx);
 
@@ -124,7 +124,7 @@ melee_cmd_attack(const cmd_ctx_t *ctx)
   // callers; a NULL here would be a gate regression, not user input.
   if(ctx->username == NULL || ctx->username[0] == '\0')
   {
-    clam(CLAM_WARN, MELEE_CTX, "attack reached the pit unauthenticated");
+    clam(CLAM_WARN, ATK_CTX, "attack reached the pit unauthenticated");
     return;
   }
 
@@ -133,18 +133,18 @@ melee_cmd_attack(const cmd_ctx_t *ctx)
 
   if(nick == NULL || nick[0] == '\0')
   {
-    cmd_reply(ctx, "usage: melee <nick>");
+    cmd_reply(ctx, "usage: attack <nick>");
     return;
   }
 
-  melee_tunables_load(&t);
+  atk_tunables_load(&t);
 
   method   = method_inst_name(ctx->msg->inst);
   channel  = ctx->msg->channel;
-  atk_nick = (ctx->msg->nickname[0] != '\0')
+  src_nick = (ctx->msg->nickname[0] != '\0')
       ? ctx->msg->nickname : ctx->username;
 
-  if(!melee_resolve_target(ctx, ns, nick, tgt_user, sizeof(tgt_user)))
+  if(!atk_resolve_target(ctx, ns, nick, tgt_user, sizeof(tgt_user)))
   {
     snprintf(line, sizeof(line),
         "⚔ " CLR_PURPLE "%s" CLR_RESET
@@ -160,7 +160,7 @@ melee_cmd_attack(const cmd_ctx_t *ctx)
     return;
   }
 
-  if(!melee_target_present(ctx, nick))
+  if(!atk_target_present(ctx, nick))
   {
     snprintf(line, sizeof(line),
         "⚔ " CLR_PURPLE "%s" CLR_RESET
@@ -169,14 +169,14 @@ melee_cmd_attack(const cmd_ctx_t *ctx)
     return;
   }
 
-  pthread_mutex_lock(&melee_turn_lock);
+  pthread_mutex_lock(&atk_turn_lock);
 
   // ---- 5. the round ------------------------------------------------ //
 
-  if(melee_db_round_find(ns->id, method, channel, &round) &&
+  if(atk_db_round_find(ns->id, method, channel, &round) &&
      round.idle > (int64_t)t.round_timeout)
   {
-    melee_db_round_abandon(round.id);
+    atk_db_round_abandon(round.id);
     cmd_reply(ctx, "⚔ The old brawl has gone cold; a new one begins.");
 
     // Clear the whole snapshot, not just the id: the dead round's
@@ -186,12 +186,12 @@ melee_cmd_attack(const cmd_ctx_t *ctx)
 
   if(round.id <= 0)
   {
-    round.id   = melee_db_round_open(ns->id, method, channel, ctx->username);
+    round.id   = atk_db_round_open(ns->id, method, channel, ctx->username);
     round.wave = 1;
 
     if(round.id <= 0)
     {
-      pthread_mutex_unlock(&melee_turn_lock);
+      pthread_mutex_unlock(&atk_turn_lock);
       cmd_reply(ctx, "☠ The pit will not answer — no round could be opened.");
       return;
     }
@@ -199,24 +199,24 @@ melee_cmd_attack(const cmd_ctx_t *ctx)
 
   // ---- 6. enrolment ------------------------------------------------ //
 
-  melee_db_player_enrol(round.id, ns->id, ctx->username, atk_nick,
+  atk_db_player_enrol(round.id, ns->id, ctx->username, src_nick,
       (int32_t)t.start_hp);
-  melee_db_player_enrol(round.id, ns->id, tgt_user, nick,
+  atk_db_player_enrol(round.id, ns->id, tgt_user, nick,
       (int32_t)t.start_hp);
 
-  if(!melee_db_player_get(round.id, ctx->username, &atk) ||
-     !melee_db_player_get(round.id, tgt_user, &tgt))
+  if(!atk_db_player_get(round.id, ctx->username, &src) ||
+     !atk_db_player_get(round.id, tgt_user, &tgt))
   {
-    pthread_mutex_unlock(&melee_turn_lock);
+    pthread_mutex_unlock(&atk_turn_lock);
     cmd_reply(ctx, "☠ The pit will not answer — the roster is unreadable.");
     return;
   }
 
   // ---- 7. the wave gate -------------------------------------------- //
 
-  if(atk.last_wave >= round.wave)
+  if(src.last_wave >= round.wave)
   {
-    if(melee_db_pending(round.id, round.wave, roster, sizeof(roster)) ==
+    if(atk_db_pending(round.id, round.wave, roster, sizeof(roster)) ==
            SUCCESS && roster[0] != '\0')
       snprintf(line, sizeof(line),
           "⚔ You have spent your blow this wave. Still standing idle: "
@@ -226,29 +226,29 @@ melee_cmd_attack(const cmd_ctx_t *ctx)
       snprintf(line, sizeof(line),
           "⚔ You have spent your blow this wave.");
 
-    pthread_mutex_unlock(&melee_turn_lock);
+    pthread_mutex_unlock(&atk_turn_lock);
     cmd_reply(ctx, line);
     return;
   }
 
   if(tgt.hp <= 0)
   {
-    pthread_mutex_unlock(&melee_turn_lock);
+    pthread_mutex_unlock(&atk_turn_lock);
     cmd_reply(ctx, "☠ That one is already cooling. Find a living quarrel.");
     return;
   }
 
   // ---- 8-9. roll and write ----------------------------------------- //
 
-  dmg    = melee_roll(&t, &crit);
+  dmg    = atk_roll(&t, &crit);
   new_hp = (tgt.hp > dmg) ? tgt.hp - dmg : 0;
   fatal  = (new_hp == 0);
 
-  blow = (melee_blow_t){
+  blow = (atk_blow_t){
     .round_id = round.id,
     .ns_id    = ns->id,
-    .atk_user = ctx->username,
-    .atk_nick = atk_nick,
+    .src_user = ctx->username,
+    .src_nick = src_nick,
     .tgt_user = tgt_user,
     .tgt_nick = nick,
     .dmg      = dmg,
@@ -258,9 +258,9 @@ melee_cmd_attack(const cmd_ctx_t *ctx)
     .fatal    = fatal,
   };
 
-  if(melee_db_blow_apply(&blow) != SUCCESS)
+  if(atk_db_blow_apply(&blow) != SUCCESS)
   {
-    pthread_mutex_unlock(&melee_turn_lock);
+    pthread_mutex_unlock(&atk_turn_lock);
     cmd_reply(ctx, "☠ The blow landed nowhere — the pit's ledger refused it.");
     return;
   }
@@ -271,17 +271,17 @@ melee_cmd_attack(const cmd_ctx_t *ctx)
   // A critical that kills gets the trout instead of the tier line. It
   // draws from no pool, so `refill_blow` correctly stays false.
   if(crit && fatal)
-    melee_render_trout(line, sizeof(line), atk_nick, nick, dmg);
+    atk_render_trout(line, sizeof(line), src_nick, nick, dmg);
 
   else
-    melee_render_blow(line, sizeof(line), atk_nick, nick, dmg,
+    atk_render_blow(line, sizeof(line), src_nick, nick, dmg,
         new_hp, tgt.hp_max, &t, &refill_blow);
 
   cmd_reply(ctx, line);
 
   if(fatal)
   {
-    melee_render_death(line, sizeof(line), atk_nick, nick, &t, &refill_death);
+    atk_render_death(line, sizeof(line), src_nick, nick, &t, &refill_death);
     cmd_reply(ctx, line);
   }
 
@@ -295,7 +295,7 @@ melee_cmd_attack(const cmd_ctx_t *ctx)
   if(t.dot_chance_pct > 0 && !fatal &&
      util_rand(100) < (int)t.dot_chance_pct)
   {
-    melee_dot_new_t dot = {
+    atk_dot_new_t dot = {
       .round_id    = round.id,
       .ns_id       = ns->id,
       .method      = method,
@@ -303,8 +303,8 @@ melee_cmd_attack(const cmd_ctx_t *ctx)
       .victim      = tgt_user,
       .victim_nick = nick,
       .source      = ctx->username,
-      .source_nick = atk_nick,
-      .kind        = (melee_dot_kind_t)util_rand(MELEE_DOT__COUNT),
+      .source_nick = src_nick,
+      .kind        = (atk_dot_kind_t)util_rand(ATK_DOT__COUNT),
       .secs        = t.dot_min_secs +
                      (uint32_t)util_rand((int)(t.dot_max_secs -
                                                t.dot_min_secs) + 1),
@@ -314,19 +314,19 @@ melee_cmd_attack(const cmd_ctx_t *ctx)
 
     // Fails soft, and silently at the stack cap: an affliction is
     // cosmetic and may never cost a blow.
-    if(melee_db_dot_inflict(&dot) == SUCCESS)
+    if(atk_db_dot_inflict(&dot) == SUCCESS)
     {
-      melee_render_dot_inflict(line, sizeof(line), atk_nick, nick, dot.kind);
+      atk_render_dot_inflict(line, sizeof(line), src_nick, nick, dot.kind);
       cmd_reply(ctx, line);
       afflicted = true;
     }
 
     else
-      clam(CLAM_DEBUG, MELEE_CTX,
+      clam(CLAM_DEBUG, ATK_CTX,
           "round %" PRId64 ": no affliction landed on %s", round.id, tgt_user);
   }
 
-  pthread_mutex_unlock(&melee_turn_lock);
+  pthread_mutex_unlock(&atk_turn_lock);
 
   // ---- the door ----------------------------------------------------- //
   // Strictly after the death line: on IRC the strongest ejection is a
@@ -343,12 +343,12 @@ melee_cmd_attack(const cmd_ctx_t *ctx)
 
       if(force != METHOD_EJECT_NONE)
       {
-        snprintf(reason, sizeof(reason), "slain by %s in the pit", atk_nick);
+        snprintf(reason, sizeof(reason), "slain by %s in the pit", src_nick);
         method_eject(ctx->msg->inst, channel, nick, force, reason);
       }
     }
 
-    clam(CLAM_INFO, MELEE_CTX, "round %" PRId64 ": %s slew %s (eject=%d)",
+    clam(CLAM_INFO, ATK_CTX, "round %" PRId64 ": %s slew %s (eject=%d)",
         round.id, ctx->username, tgt_user, (int)force);
   }
 
@@ -357,7 +357,7 @@ melee_cmd_attack(const cmd_ctx_t *ctx)
   // deliberately kept off the turn path entirely.
 
   if(afflicted)
-    melee_dot_wake();
+    atk_dot_wake();
 
   // ---- the flavour refill ------------------------------------------- //
   // Last, with no lock held and the turn already over. The renderers
@@ -366,10 +366,10 @@ melee_cmd_attack(const cmd_ctx_t *ctx)
   // inspectable rather than argued.
 
   if(refill_blow)
-    melee_llm_refill_kick(melee_severity(&t, dmg), &t);
+    atk_llm_refill_kick(atk_severity(&t, dmg), &t);
 
   if(refill_death)
-    melee_llm_refill_kick(MELEE_FLAV_DEATH, &t);
+    atk_llm_refill_kick(ATK_FLAV_DEATH, &t);
 }
 
 // ------------------------------------------------------------------ //
@@ -378,15 +378,15 @@ melee_cmd_attack(const cmd_ctx_t *ctx)
 
 // CMD_ARG_NONE, not CMD_ARG_ALNUM: an IRC nickname legally contains
 // [ ] \ ` _ ^ { | } and '-'.
-static const cmd_arg_desc_t melee_attack_args[] = {
-  { "nick", CMD_ARG_NONE, CMD_ARG_REQUIRED, MELEE_NICK_SZ - 1, NULL },
+static const cmd_arg_desc_t atk_attack_args[] = {
+  { "nick", CMD_ARG_NONE, CMD_ARG_REQUIRED, ATK_NICK_SZ - 1, NULL },
 };
 
 bool
-melee_commands_register(void)
+atk_commands_register(void)
 {
-  if(cmd_register("melee", "melee",
-        "melee <nick>",
+  if(cmd_register("attack", "attack",
+        "attack <nick>",
         "Attack another combatant in the pit.",
         "Every combatant enters with full health. A blow may land "
         "ordinary or critical; the first to reach 0 hit points ends the "
@@ -395,28 +395,28 @@ melee_commands_register(void)
         "combatant has swung, the wave turns and anyone may go again. "
         "Targets must be registered users who are present in the room.",
         USERNS_GROUP_USER, 0, CMD_SCOPE_PUBLIC, METHOD_T_ANY,
-        melee_cmd_attack, NULL, NULL, NULL,
-        melee_attack_args,
-        (uint8_t)(sizeof(melee_attack_args) / sizeof(melee_attack_args[0])),
+        atk_cmd_attack, NULL, NULL, NULL,
+        atk_attack_args,
+        (uint8_t)(sizeof(atk_attack_args) / sizeof(atk_attack_args[0])),
         NULL, NULL) != SUCCESS)
     return(FAIL);
 
   // The read-only views hang off the core `show` parent, not off this
-  // command; melee_show.c owns them.
-  if(melee_show_register() != SUCCESS)
+  // command; attack_show.c owns them.
+  if(atk_show_register() != SUCCESS)
     return(FAIL);
 
   return(SUCCESS);
 }
 
-// Two roots, two paths: `!melee` and the `show melee` card with its own
+// Two roots, two paths: `!attack` and the `show attack` card with its own
 // children. Both unregister depth-first, so no parent is left holding a
 // freed child. Core would reclaim these anyway — saying so ourselves is
 // what keeps the unload audit reading `deinit() complete` instead of
 // naming us as the plugin that had to be tidied up after.
 void
-melee_commands_unregister(void)
+atk_commands_unregister(void)
 {
-  cmd_unregister_path("melee");
-  cmd_unregister_path("show/melee");
+  cmd_unregister_path("attack");
+  cmd_unregister_path("show/attack");
 }

@@ -238,8 +238,8 @@ The command surfaces filed beside these engines (`ask`, `claude`,
 
 | Context | Source | Description |
 |---|---|---|
+| `attack` | plugins/feature/attack/ | duelling pit: schema, turn engine, round/score SQL (`ATK_CTX`) |
 | `exchange` | plugins/feature/exchange/ | feature_exchange abstraction (`EXCHANGE_CTX`) |
-| `melee` | plugins/feature/melee/ | duelling pit: schema, turn engine, round/score SQL (`MELEE_CTX`) |
 | `strategy.example_sma_cross` | plugins/extension/whenmoon/strategy/example_sma_cross/ | example SMA strategy log (`ESC_LOG_CTX`) |
 | `strategy.juggernaut` | plugins/extension/whenmoon/strategy/juggernaut/ | juggernaut strategy log (`JUG_LOG_CTX`) |
 | `strategy.mako` | plugins/extension/whenmoon/strategy/mako/ | mako strategy log (`MAKO_LOG_CTX`) |

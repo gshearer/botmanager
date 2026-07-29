@@ -1,10 +1,10 @@
 // botmanager — MIT
-// melee combat: the damage roll and the Drow flavor that dresses it.
+// attack combat: the damage roll and the Drow flavor that dresses it.
 // Nothing here touches the database or the command context — it turns
 // (tunables, two nicknames, a number) into one finished line of text.
 
-#define MELEE_INTERNAL
-#include "melee.h"
+#define ATTACK_INTERNAL
+#include "attack.h"
 
 #include "colors.h"
 #include "util.h"
@@ -15,7 +15,7 @@
 // Flavor                                                              //
 // ------------------------------------------------------------------ //
 
-// The four damage tiers, one table each, keyed by melee_flavour_t. The
+// The four damage tiers, one table each, keyed by atk_flavour_t. The
 // words come from the DAMAGE, never from the crit roll: a critical of 10
 // and an ordinary blow of 10 hurt the same, so they must read the same.
 //
@@ -26,7 +26,7 @@
 // line.
 
 // A graze, a scuff, a stinging insult of a strike.
-static const char *const melee_minor[] = {
+static const char *const atk_minor[] = {
   "%s rakes %s with House-signet talons for %s damage.",
   "%s scores %s's cheek with a poisoned nail for %s damage.",
   "%s stamps on %s's instep with a spider-silk boot for %s damage.",
@@ -46,7 +46,7 @@ static const char *const melee_minor[] = {
 };
 
 // A clean landed hit that hurts, and that a duellist keeps going through.
-static const char *const melee_medium[] = {
+static const char *const atk_medium[] = {
   "%s lashes %s across the brow with a piwafwi-wrapped fist for %s damage.",
   "%s cracks %s with the flat of an adamantine blade for %s damage.",
   "%s drives a knee into %s's gut and leaves them wheezing — %s damage.",
@@ -66,7 +66,7 @@ static const char *const melee_medium[] = {
 };
 
 // Bone, blood and stagger. Badly hurt, visibly losing — never fatal.
-static const char *const melee_major[] = {
+static const char *const atk_major[] = {
   "%s slips a hand-crossbow bolt between %s's ribs for %s damage.",
   "%s slams %s against the Narbondel-lit stone for %s damage.",
   "%s flicks faerie fire over %s and stabs the outline for %s damage.",
@@ -86,7 +86,7 @@ static const char *const melee_major[] = {
 };
 
 // The heaviest thing that is still survivable — and it may say so.
-static const char *const melee_critical[] = {
+static const char *const atk_critical[] = {
   "%s drives a black-steel blade to the hilt through %s — Lolth leans closer. %s CRITICAL damage!",
   "%s opens %s from collarbone to hip; the wound steams in the cold. %s CRITICAL damage!",
   "%s empties a quiver of drow-poisoned bolts into %s at point-blank. %s CRITICAL damage!",
@@ -107,7 +107,7 @@ static const char *const melee_critical[] = {
 
 // FORMAT CONTRACT: every entry takes exactly two `const char *` —
 // slayer, then fallen. No damage slot; the round is already over.
-static const char *const melee_deaths[] = {
+static const char *const atk_deaths[] = {
   "%s takes %s's head in one clean stroke — the Spider Queen is pleased.",
   "%s feeds %s to Lolth's webs; the corpse is drawn down into the dark.",
   "%s stands over %s's body and wipes the blade clean on a piwafwi.",
@@ -130,30 +130,30 @@ static const char *const melee_deaths[] = {
   "%s takes the spoils while eight legs skitter over %s's cooling body.",
 };
 
-#define MELEE_N(t) ((int)(sizeof(t) / sizeof((t)[0])))
+#define ATK_N(t) ((int)(sizeof(t) / sizeof((t)[0])))
 
 // The four damage tiers as one indexable set, so the renderer picks a
 // table by severity rather than by a chain of conditionals — a fifth
 // tier would be one line here and nothing anywhere else. Indexed by
-// melee_flavour_t; MELEE_FLAV_DEATH is not a damage tier and has no
+// atk_flavour_t; ATK_FLAV_DEATH is not a damage tier and has no
 // entry.
-static const char *const *const melee_tbl[MELEE_FLAV_DEATH] = {
-  melee_minor, melee_medium, melee_major, melee_critical
+static const char *const *const atk_tbl[ATK_FLAV_DEATH] = {
+  atk_minor, atk_medium, atk_major, atk_critical
 };
 
-static const int melee_tbl_n[MELEE_FLAV_DEATH] = {
-  MELEE_N(melee_minor), MELEE_N(melee_medium),
-  MELEE_N(melee_major), MELEE_N(melee_critical)
+static const int atk_tbl_n[ATK_FLAV_DEATH] = {
+  ATK_N(atk_minor), ATK_N(atk_medium),
+  ATK_N(atk_major), ATK_N(atk_critical)
 };
 
-// The dressing melee adds around the sentence, also by tier: heavier
+// The dressing attack adds around the sentence, also by tier: heavier
 // blows read louder. Every prefix is a single-column code point, so
-// melee_vis_len() stays honest.
-static const char *const melee_tier_color[MELEE_FLAV_DEATH] = {
+// atk_vis_len() stays honest.
+static const char *const atk_tier_color[ATK_FLAV_DEATH] = {
   CLR_WHITE, CLR_YELLOW, CLR_BOLD CLR_ORANGE, CLR_BOLD CLR_RED
 };
 
-static const char *const melee_tier_emoji[MELEE_FLAV_DEATH] = {
+static const char *const atk_tier_emoji[ATK_FLAV_DEATH] = {
   "⚔ ", "⚔ ", "🗡 ", "💥 "
 };
 
@@ -161,24 +161,24 @@ static const char *const melee_tier_emoji[MELEE_FLAV_DEATH] = {
 // Afflictions                                                         //
 // ------------------------------------------------------------------ //
 
-// Three parallel tables keyed by melee_dot_kind_t, in the shape the tier
+// Three parallel tables keyed by atk_dot_kind_t, in the shape the tier
 // tables above already establish. The name is the bare noun a line
 // substitutes for {affliction}: lower case, no article, no colour — the
 // renderer colorizes it.
-static const char *const melee_dot_name[MELEE_DOT__COUNT] = {
+static const char *const atk_dot_name[ATK_DOT__COUNT] = {
   "open wound", "spider venom", "ochre burn", "myconid spores",
   "necrotic chill"
 };
 
 // Every glyph here must occupy exactly ONE display column, or
-// melee_vis_len() starts lying and the round card skews. All five are
+// atk_vis_len() starts lying and the round card skews. All five are
 // plain U+27xx/U+26xx symbols: no variation selectors, no
 // emoji-presentation code points.
-static const char *const melee_dot_emoji[MELEE_DOT__COUNT] = {
+static const char *const atk_dot_emoji[ATK_DOT__COUNT] = {
   "✚", "☣", "⚗", "✺", "❆"
 };
 
-static const char *const melee_dot_color[MELEE_DOT__COUNT] = {
+static const char *const atk_dot_color[ATK_DOT__COUNT] = {
   CLR_RED, CLR_GREEN, CLR_ORANGE, CLR_YELLOW, CLR_CYAN
 };
 
@@ -187,31 +187,31 @@ static const char *const melee_dot_color[MELEE_DOT__COUNT] = {
 // itself in the words, so there is no {affliction} slot and no damage:
 // the tick lines carry the numbers, this one only says it has begun.
 // Short, deliberately — a blow line is already on screen above it.
-static const char *const melee_dot_bleed[] = {
+static const char *const atk_dot_bleed[] = {
   "%s's cut will not close; %s is bleeding.",
   "%s opens a vein and leaves it open — %s is losing blood.",
   "%s carves a wound %s cannot press shut.",
 };
 
-static const char *const melee_dot_venom[] = {
+static const char *const atk_dot_venom[] = {
   "Lolth's patience runs in %s's blade — %s is envenomed.",
   "%s's edge was drow-poisoned; %s begins to sweat.",
   "%s lets spider venom find the wound. %s will feel it working.",
 };
 
-static const char *const melee_dot_acid[] = {
+static const char *const atk_dot_acid[] = {
   "%s smears ochre slime across %s; it begins to eat.",
   "%s breaks a jelly-flask over %s. The burning starts slow.",
   "%s paints %s with something that keeps chewing.",
 };
 
-static const char *const melee_dot_spores[] = {
+static const char *const atk_dot_spores[] = {
   "%s bursts a myconid cap over %s. The rot takes.",
   "%s drives fungal spores into %s's wound; the bloom begins.",
   "%s dusts %s with cavern rot and steps back to let it work.",
 };
 
-static const char *const melee_dot_chill[] = {
+static const char *const atk_dot_chill[] = {
   "%s leaves a Narbondel cold in %s that will not warm.",
   "%s's blade drags a necrotic chill through %s.",
   "%s marks %s with the cold that follows a death-blow.",
@@ -220,59 +220,59 @@ static const char *const melee_dot_chill[] = {
 // FORMAT CONTRACT: every entry in the five tick tables takes exactly
 // three `const char *` — source, victim, damage — like a blow line, and
 // for the same reason: a tick is a peer of a blow and reads as one.
-static const char *const melee_dot_tick_bleed[] = {
+static const char *const atk_dot_tick_bleed[] = {
   "%s's cut keeps drinking from %s — %s damage.",
   "The wound %s opened runs down %s's side for %s damage.",
   "%s's blade is long gone; %s bleeds anyway, for %s damage.",
 };
 
-static const char *const melee_dot_tick_venom[] = {
+static const char *const atk_dot_tick_venom[] = {
   "Lolth's patience works through %s's poison; %s shudders for %s damage.",
   "The venom %s left climbs %s's arm for %s damage.",
   "%s's poison finds another nerve in %s — %s damage.",
 };
 
-static const char *const melee_dot_tick_acid[] = {
+static const char *const atk_dot_tick_acid[] = {
   "%s's slime eats deeper into %s for %s damage.",
   "The ochre burn %s gave %s is still chewing — %s damage.",
   "%s's acid finds bone in %s for %s damage.",
 };
 
-static const char *const melee_dot_tick_spores[] = {
+static const char *const atk_dot_tick_spores[] = {
   "%s's spores bloom in %s's wound for %s damage.",
   "The rot %s planted spreads under %s's skin — %s damage.",
   "%s's fungus feeds on %s for %s damage.",
 };
 
-static const char *const melee_dot_tick_chill[] = {
+static const char *const atk_dot_tick_chill[] = {
   "%s's cold creeps another inch through %s for %s damage.",
   "The chill %s left greys %s's fingers — %s damage.",
   "Narbondel's dark works in %s's wake; %s takes %s damage.",
 };
 
 // FORMAT CONTRACT: exactly two `const char *` — source, then victim. No
-// damage slot, matching melee_deaths[]: the round is already over.
-static const char *const melee_dot_death_bleed[] = {
+// damage slot, matching atk_deaths[]: the round is already over.
+static const char *const atk_dot_death_bleed[] = {
   "%s never struck again; %s simply ran out of blood.",
   "The wound %s opened finishes the argument. %s does not get up.",
 };
 
-static const char *const melee_dot_death_venom[] = {
+static const char *const atk_dot_death_venom[] = {
   "%s's venom stops %s's heart between one breath and the next.",
   "Lolth takes her time. %s waits; %s stops.",
 };
 
-static const char *const melee_dot_death_acid[] = {
+static const char *const atk_dot_death_acid[] = {
   "%s's slime finishes what it started — %s comes apart on the stone.",
   "The burn %s gave eats through the last of %s.",
 };
 
-static const char *const melee_dot_death_spores[] = {
+static const char *const atk_dot_death_spores[] = {
   "%s's rot blooms one last time; %s is a garden now.",
   "The spores %s planted come up through %s's ribs.",
 };
 
-static const char *const melee_dot_death_chill[] = {
+static const char *const atk_dot_death_chill[] = {
   "%s's cold reaches %s's heart and stays there.",
   "The chill %s left finishes %s without being present for it.",
 };
@@ -280,96 +280,96 @@ static const char *const melee_dot_death_chill[] = {
 // A kind arrives from a database column, so it is input like any other:
 // an out-of-range value falls back to the first entry rather than
 // indexing past the table.
-static melee_dot_kind_t
-melee_dot_clamp(melee_dot_kind_t kind)
+static atk_dot_kind_t
+atk_dot_clamp(atk_dot_kind_t kind)
 {
-  return((kind >= 0 && kind < MELEE_DOT__COUNT) ? kind : MELEE_DOT_BLEED);
+  return((kind >= 0 && kind < ATK_DOT__COUNT) ? kind : ATK_DOT_BLEED);
 }
 
 const char *
-melee_dot_name_of(melee_dot_kind_t kind)
+atk_dot_name_of(atk_dot_kind_t kind)
 {
-  return(melee_dot_name[melee_dot_clamp(kind)]);
+  return(atk_dot_name[atk_dot_clamp(kind)]);
 }
 
 const char *
-melee_dot_emoji_of(melee_dot_kind_t kind)
+atk_dot_emoji_of(atk_dot_kind_t kind)
 {
-  return(melee_dot_emoji[melee_dot_clamp(kind)]);
+  return(atk_dot_emoji[atk_dot_clamp(kind)]);
 }
 
 const char *
-melee_dot_color_of(melee_dot_kind_t kind)
+atk_dot_color_of(atk_dot_kind_t kind)
 {
-  return(melee_dot_color[melee_dot_clamp(kind)]);
+  return(atk_dot_color[atk_dot_clamp(kind)]);
 }
 
-// The five inflict tables as one indexable set, exactly as melee_tbl[]
+// The five inflict tables as one indexable set, exactly as atk_tbl[]
 // gathers the damage tiers.
-static const char *const *const melee_dot_tbl[MELEE_DOT__COUNT] = {
-  melee_dot_bleed, melee_dot_venom, melee_dot_acid, melee_dot_spores,
-  melee_dot_chill
+static const char *const *const atk_dot_tbl[ATK_DOT__COUNT] = {
+  atk_dot_bleed, atk_dot_venom, atk_dot_acid, atk_dot_spores,
+  atk_dot_chill
 };
 
-static const int melee_dot_tbl_n[MELEE_DOT__COUNT] = {
-  MELEE_N(melee_dot_bleed), MELEE_N(melee_dot_venom),
-  MELEE_N(melee_dot_acid),  MELEE_N(melee_dot_spores),
-  MELEE_N(melee_dot_chill)
+static const int atk_dot_tbl_n[ATK_DOT__COUNT] = {
+  ATK_N(atk_dot_bleed), ATK_N(atk_dot_venom),
+  ATK_N(atk_dot_acid),  ATK_N(atk_dot_spores),
+  ATK_N(atk_dot_chill)
 };
 
-static const char *const *const melee_dot_tick_tbl[MELEE_DOT__COUNT] = {
-  melee_dot_tick_bleed, melee_dot_tick_venom, melee_dot_tick_acid,
-  melee_dot_tick_spores, melee_dot_tick_chill
+static const char *const *const atk_dot_tick_tbl[ATK_DOT__COUNT] = {
+  atk_dot_tick_bleed, atk_dot_tick_venom, atk_dot_tick_acid,
+  atk_dot_tick_spores, atk_dot_tick_chill
 };
 
-static const int melee_dot_tick_n[MELEE_DOT__COUNT] = {
-  MELEE_N(melee_dot_tick_bleed), MELEE_N(melee_dot_tick_venom),
-  MELEE_N(melee_dot_tick_acid),  MELEE_N(melee_dot_tick_spores),
-  MELEE_N(melee_dot_tick_chill)
+static const int atk_dot_tick_n[ATK_DOT__COUNT] = {
+  ATK_N(atk_dot_tick_bleed), ATK_N(atk_dot_tick_venom),
+  ATK_N(atk_dot_tick_acid),  ATK_N(atk_dot_tick_spores),
+  ATK_N(atk_dot_tick_chill)
 };
 
-static const char *const *const melee_dot_death_tbl[MELEE_DOT__COUNT] = {
-  melee_dot_death_bleed, melee_dot_death_venom, melee_dot_death_acid,
-  melee_dot_death_spores, melee_dot_death_chill
+static const char *const *const atk_dot_death_tbl[ATK_DOT__COUNT] = {
+  atk_dot_death_bleed, atk_dot_death_venom, atk_dot_death_acid,
+  atk_dot_death_spores, atk_dot_death_chill
 };
 
-static const int melee_dot_death_n[MELEE_DOT__COUNT] = {
-  MELEE_N(melee_dot_death_bleed), MELEE_N(melee_dot_death_venom),
-  MELEE_N(melee_dot_death_acid),  MELEE_N(melee_dot_death_spores),
-  MELEE_N(melee_dot_death_chill)
+static const int atk_dot_death_n[ATK_DOT__COUNT] = {
+  ATK_N(atk_dot_death_bleed), ATK_N(atk_dot_death_venom),
+  ATK_N(atk_dot_death_acid),  ATK_N(atk_dot_death_spores),
+  ATK_N(atk_dot_death_chill)
 };
 
 void
-melee_render_dot_inflict(char *out, size_t cap, const char *atk_nick,
-    const char *tgt_nick, melee_dot_kind_t kind)
+atk_render_dot_inflict(char *out, size_t cap, const char *src_nick,
+    const char *tgt_nick, atk_dot_kind_t kind)
 {
-  char atk [MELEE_NICK_SZ + 8];
-  char tgt [MELEE_NICK_SZ + 8];
-  char body[MELEE_LINE_SZ];
+  char src [ATK_NICK_SZ + 8];
+  char tgt [ATK_NICK_SZ + 8];
+  char body[ATK_LINE_SZ];
 
   if(out == NULL || cap == 0)
     return;
 
-  kind = melee_dot_clamp(kind);
+  kind = atk_dot_clamp(kind);
 
-  snprintf(atk, sizeof(atk), CLR_CYAN   "%s" CLR_RESET, atk_nick);
+  snprintf(src, sizeof(src), CLR_CYAN   "%s" CLR_RESET, src_nick);
   snprintf(tgt, sizeof(tgt), CLR_PURPLE "%s" CLR_RESET, tgt_nick);
   snprintf(body, sizeof(body),
-      melee_dot_tbl[kind][util_rand(melee_dot_tbl_n[kind])], atk, tgt);
+      atk_dot_tbl[kind][util_rand(atk_dot_tbl_n[kind])], src, tgt);
 
   // The glyph that will mark the victim on the round card leads the
   // line, so the two read as the same thing.
-  snprintf(out, cap, "%s %s", melee_dot_emoji_of(kind), body);
+  snprintf(out, cap, "%s %s", atk_dot_emoji_of(kind), body);
 }
 
 // ------------------------------------------------------------------ //
 // The roll                                                            //
 // ------------------------------------------------------------------ //
 
-// melee_tunables_load() has already guaranteed hit_max >= 1 and
+// atk_tunables_load() has already guaranteed hit_max >= 1 and
 // crit_max >= crit_min, so neither util_rand argument can reach zero.
 int32_t
-melee_roll(const melee_tunables_t *t, bool *crit_out)
+atk_roll(const atk_tunables_t *t, bool *crit_out)
 {
   bool crit;
 
@@ -397,7 +397,7 @@ melee_roll(const melee_tunables_t *t, bool *crit_out)
 // ordinary blow — with crit_chance_pct 0 the crit band is dead weight
 // and must not stretch the scale, or every real hit would read minor.
 int32_t
-melee_dmg_ceiling(const melee_tunables_t *t)
+atk_dmg_ceiling(const atk_tunables_t *t)
 {
   int32_t ceiling;
 
@@ -409,37 +409,37 @@ melee_dmg_ceiling(const melee_tunables_t *t)
   if(t->crit_pct > 0 && (int32_t)t->crit_max > ceiling)
     ceiling = (int32_t)t->crit_max;
 
-  // melee_tunables_load() already guarantees this; belt and braces,
-  // because melee_severity() divides by it.
+  // atk_tunables_load() already guarantees this; belt and braces,
+  // because atk_severity() divides by it.
   return(ceiling > 0 ? ceiling : 1);
 }
 
-melee_flavour_t
-melee_severity(const melee_tunables_t *t, int32_t dmg)
+atk_flavour_t
+atk_severity(const atk_tunables_t *t, int32_t dmg)
 {
   int32_t pct;
 
   if(t == NULL)
-    return(MELEE_FLAV_MINOR);
+    return(ATK_FLAV_MINOR);
 
   if(dmg < 0)
     dmg = 0;
 
-  pct = (int32_t)((int64_t)dmg * 100 / melee_dmg_ceiling(t));
+  pct = (int32_t)((int64_t)dmg * 100 / atk_dmg_ceiling(t));
 
   if(pct > 100)          // a tunable moved mid-round; clamp rather than
     pct = 100;           // fall off the end of the band
 
   if(pct >= (int32_t)t->sev_crit_at)
-    return(MELEE_FLAV_CRITICAL);
+    return(ATK_FLAV_CRITICAL);
 
   if(pct >= (int32_t)t->sev_major_at)
-    return(MELEE_FLAV_MAJOR);
+    return(ATK_FLAV_MAJOR);
 
   if(pct >= (int32_t)t->sev_medium_at)
-    return(MELEE_FLAV_MEDIUM);
+    return(ATK_FLAV_MEDIUM);
 
-  return(MELEE_FLAV_MINOR);
+  return(ATK_FLAV_MINOR);
 }
 
 // ------------------------------------------------------------------ //
@@ -447,19 +447,19 @@ melee_severity(const melee_tunables_t *t, int32_t dmg)
 // ------------------------------------------------------------------ //
 
 // The pool supplies the sentence and nothing else: the emoji prefix, the
-// colorization, and the health tail below are melee's own, whether the
+// colorization, and the health tail below are attack's own, whether the
 // words came from a model or from the tables above.
 void
-melee_render_blow(char *out, size_t cap, const char *atk_nick,
+atk_render_blow(char *out, size_t cap, const char *src_nick,
     const char *tgt_nick, int32_t dmg, int32_t hp, int32_t hp_max,
-    const melee_tunables_t *t, bool *need_refill)
+    const atk_tunables_t *t, bool *need_refill)
 {
-  melee_flavour_t sev;
-  char            atk [MELEE_NICK_SZ + 8];
-  char            tgt [MELEE_NICK_SZ + 8];
-  char            dmgs[32];
-  char            body[MELEE_LINE_SZ];
-  char            tmpl[MELEE_LLM_TMPL_SZ];
+  atk_flavour_t sev;
+  char          src [ATK_NICK_SZ + 8];
+  char          tgt [ATK_NICK_SZ + 8];
+  char          dmgs[32];
+  char          body[ATK_LINE_SZ];
+  char          tmpl[ATK_LLM_TMPL_SZ];
 
   if(out == NULL || cap == 0)
     return;
@@ -467,21 +467,21 @@ melee_render_blow(char *out, size_t cap, const char *atk_nick,
   // Everything below — the pool, the table, the colour, the emoji — is
   // driven by this one value, which is why the words can never again
   // disagree with the number.
-  sev = melee_severity(t, dmg);
+  sev = atk_severity(t, dmg);
 
-  snprintf(atk, sizeof(atk), CLR_CYAN   "%s" CLR_RESET, atk_nick);
+  snprintf(src, sizeof(src), CLR_CYAN   "%s" CLR_RESET, src_nick);
   snprintf(tgt, sizeof(tgt), CLR_PURPLE "%s" CLR_RESET, tgt_nick);
-  snprintf(dmgs, sizeof(dmgs), "%s%d" CLR_RESET, melee_tier_color[sev], dmg);
+  snprintf(dmgs, sizeof(dmgs), "%s%d" CLR_RESET, atk_tier_color[sev], dmg);
 
-  if(melee_pool_take(sev, tmpl, sizeof(tmpl),
+  if(atk_pool_take(sev, tmpl, sizeof(tmpl),
         t != NULL ? t->llm_refill_at : 0, need_refill) == SUCCESS)
-    melee_tmpl_expand(body, sizeof(body), tmpl, atk, tgt, dmgs, NULL);
+    atk_tmpl_expand(body, sizeof(body), tmpl, src, tgt, dmgs, NULL);
 
   else
   {
-    melee_pool_fallback();
+    atk_pool_fallback();
     snprintf(body, sizeof(body),
-        melee_tbl[sev][util_rand(melee_tbl_n[sev])], atk, tgt, dmgs);
+        atk_tbl[sev][util_rand(atk_tbl_n[sev])], src, tgt, dmgs);
   }
 
   // The survivor's remaining health rides on every non-fatal line; the
@@ -489,10 +489,10 @@ melee_render_blow(char *out, size_t cap, const char *atk_nick,
   // A fatal blow carries no tally — the death line that follows says it.
   if(hp > 0)
     snprintf(out, cap, "%s%s " CLR_GRAY "[%s — %d/%d hp]" CLR_RESET,
-        melee_tier_emoji[sev], body, tgt_nick, hp, hp_max);
+        atk_tier_emoji[sev], body, tgt_nick, hp, hp_max);
 
   else
-    snprintf(out, cap, "%s%s", melee_tier_emoji[sev], body);
+    snprintf(out, cap, "%s%s", atk_tier_emoji[sev], body);
 }
 
 // The oldest joke on IRC, kept for the one blow that earns it: a
@@ -502,7 +502,7 @@ melee_render_blow(char *out, size_t cap, const char *atk_nick,
 // pool is consulted and none is owed a refill; no health tail, because a
 // fatal blow carries no tally.
 void
-melee_render_trout(char *out, size_t cap, const char *atk_nick,
+atk_render_trout(char *out, size_t cap, const char *src_nick,
     const char *tgt_nick, int32_t dmg)
 {
   if(out == NULL || cap == 0)
@@ -511,18 +511,18 @@ melee_render_trout(char *out, size_t cap, const char *atk_nick,
   snprintf(out, cap,
       "%s" CLR_CYAN "%s" CLR_RESET " slaps " CLR_PURPLE "%s" CLR_RESET
       " across the face with a large trout for %s%d" CLR_RESET " damage!",
-      melee_tier_emoji[MELEE_FLAV_CRITICAL], atk_nick, tgt_nick,
-      melee_tier_color[MELEE_FLAV_CRITICAL], dmg);
+      atk_tier_emoji[ATK_FLAV_CRITICAL], src_nick, tgt_nick,
+      atk_tier_color[ATK_FLAV_CRITICAL], dmg);
 }
 
 void
-melee_render_death(char *out, size_t cap, const char *slayer_nick,
-    const char *fallen_nick, const melee_tunables_t *t, bool *need_refill)
+atk_render_death(char *out, size_t cap, const char *slayer_nick,
+    const char *fallen_nick, const atk_tunables_t *t, bool *need_refill)
 {
-  char slayer[MELEE_NICK_SZ + 8];
-  char fallen[MELEE_NICK_SZ + 8];
-  char body  [MELEE_LINE_SZ];
-  char tmpl  [MELEE_LLM_TMPL_SZ];
+  char slayer[ATK_NICK_SZ + 8];
+  char fallen[ATK_NICK_SZ + 8];
+  char body  [ATK_LINE_SZ];
+  char tmpl  [ATK_LLM_TMPL_SZ];
 
   if(out == NULL || cap == 0)
     return;
@@ -532,15 +532,15 @@ melee_render_death(char *out, size_t cap, const char *slayer_nick,
 
   // The death line carries no tally, so {damage} expands to nothing —
   // the sanitiser rejects any death template that asks for one.
-  if(melee_pool_take(MELEE_FLAV_DEATH, tmpl, sizeof(tmpl),
+  if(atk_pool_take(ATK_FLAV_DEATH, tmpl, sizeof(tmpl),
         t != NULL ? t->llm_refill_at : 0, need_refill) == SUCCESS)
-    melee_tmpl_expand(body, sizeof(body), tmpl, slayer, fallen, "", NULL);
+    atk_tmpl_expand(body, sizeof(body), tmpl, slayer, fallen, "", NULL);
 
   else
   {
-    melee_pool_fallback();
+    atk_pool_fallback();
     snprintf(body, sizeof(body),
-        melee_deaths[util_rand(MELEE_N(melee_deaths))], slayer, fallen);
+        atk_deaths[util_rand(ATK_N(atk_deaths))], slayer, fallen);
   }
 
   snprintf(out, cap, "☠ %s", body);
@@ -551,81 +551,81 @@ melee_render_death(char *out, size_t cap, const char *slayer_nick,
 // a system message. The affliction's own colour carries the number,
 // which is what tells a reader at a glance that no one swung.
 void
-melee_render_dot_tick(char *out, size_t cap, const char *src_nick,
+atk_render_dot_tick(char *out, size_t cap, const char *src_nick,
     const char *tgt_nick, int32_t dmg, int32_t hp, int32_t hp_max,
-    melee_dot_kind_t kind, const melee_tunables_t *t, bool *need_refill)
+    atk_dot_kind_t kind, const atk_tunables_t *t, bool *need_refill)
 {
-  char src [MELEE_NICK_SZ + 8];
-  char tgt [MELEE_NICK_SZ + 8];
+  char src [ATK_NICK_SZ + 8];
+  char tgt [ATK_NICK_SZ + 8];
   char dmgs[32];
   char aff [64];
-  char body[MELEE_LINE_SZ];
-  char tmpl[MELEE_LLM_TMPL_SZ];
+  char body[ATK_LINE_SZ];
+  char tmpl[ATK_LLM_TMPL_SZ];
 
   if(out == NULL || cap == 0)
     return;
 
-  kind = melee_dot_clamp(kind);
+  kind = atk_dot_clamp(kind);
 
   snprintf(src, sizeof(src), CLR_CYAN   "%s" CLR_RESET, src_nick);
   snprintf(tgt, sizeof(tgt), CLR_PURPLE "%s" CLR_RESET, tgt_nick);
-  snprintf(dmgs, sizeof(dmgs), "%s%d" CLR_RESET, melee_dot_color_of(kind), dmg);
-  snprintf(aff, sizeof(aff), "%s%s" CLR_RESET, melee_dot_color_of(kind),
-      melee_dot_name_of(kind));
+  snprintf(dmgs, sizeof(dmgs), "%s%d" CLR_RESET, atk_dot_color_of(kind), dmg);
+  snprintf(aff, sizeof(aff), "%s%s" CLR_RESET, atk_dot_color_of(kind),
+      atk_dot_name_of(kind));
 
-  if(melee_pool_take(MELEE_FLAV_DOT_TICK, tmpl, sizeof(tmpl),
+  if(atk_pool_take(ATK_FLAV_DOT_TICK, tmpl, sizeof(tmpl),
         t != NULL ? t->llm_refill_at : 0, need_refill) == SUCCESS)
-    melee_tmpl_expand(body, sizeof(body), tmpl, src, tgt, dmgs, aff);
+    atk_tmpl_expand(body, sizeof(body), tmpl, src, tgt, dmgs, aff);
 
   else
   {
-    melee_pool_fallback();
+    atk_pool_fallback();
     snprintf(body, sizeof(body),
-        melee_dot_tick_tbl[kind][util_rand(melee_dot_tick_n[kind])],
+        atk_dot_tick_tbl[kind][util_rand(atk_dot_tick_n[kind])],
         src, tgt, dmgs);
   }
 
   if(hp > 0)
     snprintf(out, cap, "%s %s " CLR_GRAY "[%s — %d/%d hp]" CLR_RESET,
-        melee_dot_emoji_of(kind), body, tgt_nick, hp, hp_max);
+        atk_dot_emoji_of(kind), body, tgt_nick, hp, hp_max);
 
   else
-    snprintf(out, cap, "%s %s", melee_dot_emoji_of(kind), body);
+    snprintf(out, cap, "%s %s", atk_dot_emoji_of(kind), body);
 }
 
 void
-melee_render_dot_death(char *out, size_t cap, const char *src_nick,
-    const char *tgt_nick, melee_dot_kind_t kind, const melee_tunables_t *t,
+atk_render_dot_death(char *out, size_t cap, const char *src_nick,
+    const char *tgt_nick, atk_dot_kind_t kind, const atk_tunables_t *t,
     bool *need_refill)
 {
-  char src [MELEE_NICK_SZ + 8];
-  char tgt [MELEE_NICK_SZ + 8];
+  char src [ATK_NICK_SZ + 8];
+  char tgt [ATK_NICK_SZ + 8];
   char aff [64];
-  char body[MELEE_LINE_SZ];
-  char tmpl[MELEE_LLM_TMPL_SZ];
+  char body[ATK_LINE_SZ];
+  char tmpl[ATK_LLM_TMPL_SZ];
 
   if(out == NULL || cap == 0)
     return;
 
-  kind = melee_dot_clamp(kind);
+  kind = atk_dot_clamp(kind);
 
   snprintf(src, sizeof(src), CLR_CYAN   "%s" CLR_RESET, src_nick);
   snprintf(tgt, sizeof(tgt), CLR_PURPLE "%s" CLR_RESET, tgt_nick);
-  snprintf(aff, sizeof(aff), "%s%s" CLR_RESET, melee_dot_color_of(kind),
-      melee_dot_name_of(kind));
+  snprintf(aff, sizeof(aff), "%s%s" CLR_RESET, atk_dot_color_of(kind),
+      atk_dot_name_of(kind));
 
   // No tally, exactly as the blade's death line carries none: {damage}
   // expands to nothing and the sanitiser rejects any template asking
   // for one.
-  if(melee_pool_take(MELEE_FLAV_DOT_DEATH, tmpl, sizeof(tmpl),
+  if(atk_pool_take(ATK_FLAV_DOT_DEATH, tmpl, sizeof(tmpl),
         t != NULL ? t->llm_refill_at : 0, need_refill) == SUCCESS)
-    melee_tmpl_expand(body, sizeof(body), tmpl, src, tgt, "", aff);
+    atk_tmpl_expand(body, sizeof(body), tmpl, src, tgt, "", aff);
 
   else
   {
-    melee_pool_fallback();
+    atk_pool_fallback();
     snprintf(body, sizeof(body),
-        melee_dot_death_tbl[kind][util_rand(melee_dot_death_n[kind])],
+        atk_dot_death_tbl[kind][util_rand(atk_dot_death_n[kind])],
         src, tgt);
   }
 
