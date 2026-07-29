@@ -756,7 +756,10 @@ atk_db_scores(uint32_t ns_id, uint32_t limit, atk_score_row_t *out,
     return(0);
 
   snprintf(sql, sizeof(sql),
-      "SELECT CASE WHEN nickname <> '' THEN nickname ELSE username END,"
+      // Aliased for the reason above, and here it also decides the sort:
+      // unaliased, `ORDER BY username` would bind to the CASE and break
+      // ties on the nickname rather than on the account.
+      "SELECT CASE WHEN nickname <> '' THEN nickname ELSE username END AS shown,"
       " rounds, kills, deaths, dmg_given, dmg_taken, crits, best_crit,"
       " heal_given"
       " FROM %s WHERE ns_id = %" PRIu32
@@ -805,7 +808,7 @@ atk_db_deadliest(uint32_t ns_id, char *by, size_t by_cap, char *on,
     return(false);
 
   snprintf(sql, sizeof(sql),
-      "SELECT CASE WHEN nickname <> '' THEN nickname ELSE username END,"
+      "SELECT CASE WHEN nickname <> '' THEN nickname ELSE username END AS shown,"
       " best_crit_on, best_crit FROM %s"
       " WHERE ns_id = %" PRIu32 " AND best_crit > 0"
       " ORDER BY best_crit DESC LIMIT 1",
@@ -994,8 +997,13 @@ atk_db_living(int64_t round_id, const char *except, atk_victim_t *out,
     return(0);
 
   snprintf(sql, sizeof(sql),
+      // The display-name CASE must be ALIASED: PostgreSQL names an
+      // unlabelled CASE after its ELSE column, so an unaliased one lands a
+      // second output column called `username` and `ORDER BY username`
+      // fails with "is ambiguous" — which the sweep reads as an empty
+      // roster and degrades silently to an ordinary blow.
       "SELECT username,"
-      " CASE WHEN nickname <> '' THEN nickname ELSE username END,"
+      " CASE WHEN nickname <> '' THEN nickname ELSE username END AS shown,"
       " hp, hp_max FROM %s"
       " WHERE round_id = %" PRId64 " AND hp > 0 AND username <> '%s'"
       " ORDER BY username LIMIT %" PRIu32,
