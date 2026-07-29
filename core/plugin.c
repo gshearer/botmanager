@@ -19,6 +19,7 @@ static uint32_t plugin_reclaim(const plugin_rec_t *target);
 static bool plugin_quiesce(const plugin_rec_t *target, uint32_t timeout_ms,
     char *offender, size_t offender_cap);
 static void audit_emit_clam(const char *line, void *data);
+static void plugin_unmap_broadcast(uintptr_t lo, uintptr_t hi);
 
 static plugin_rec_t *
 find_by_name(const char *name)
@@ -335,7 +336,10 @@ plugin_unload(const char *name, plugin_unload_report_t *report)
       if(report != NULL)
         report->zombie = true;
 
-      target->state = PLUGIN_LOADED;
+      // Not LOADED: a LOADED plugin is one init_all() would pick up,
+      // and this one has already run its deinit(). Reviving it would
+      // re-register a surface over state that is gone.
+      target->state = PLUGIN_ZOMBIE;
       return(FAIL);
     }
   }
@@ -490,6 +494,121 @@ plugin_restore(const plugin_snap_t *snap, uint32_t from, uint32_t to,
   return(loaded);
 }
 
+// A bot's two pointers into plugin mappings, and what a reload owes
+// each. A bot driver is detached and put back in place — the bot keeps
+// its name, its sessions and its protocol connections and merely goes
+// deaf for the length of the cycle. A protocol driver cannot be handled
+// that gently: its connection lives in the mapping, so the bot goes
+// down with it and comes back up on the far side.
+// returns: bots affected.
+static uint32_t
+plugin_detach_bots(const plugin_desc_t *desc)
+{
+  if(desc->ext == NULL)
+    return(0);
+
+  if(desc->type == PLUGIN_METHOD || desc->type == PLUGIN_FEATURE)
+  {
+    const bot_driver_t *drv = (const bot_driver_t *)desc->ext;
+
+    return(drv->name != NULL ? bot_suspend_driver(drv->name) : 0);
+  }
+
+  if(desc->type == PLUGIN_PROTOCOL)
+    return(bot_suspend_method(desc->kind));
+
+  return(0);
+}
+
+static uint32_t
+plugin_reattach_bots(const plugin_desc_t *desc)
+{
+  if(desc->ext == NULL)
+    return(0);
+
+  if(desc->type == PLUGIN_METHOD || desc->type == PLUGIN_FEATURE)
+    return(bot_resume_driver((const bot_driver_t *)desc->ext, desc->kind));
+
+  if(desc->type == PLUGIN_PROTOCOL)
+    return(bot_resume_method(desc->kind));
+
+  return(0);
+}
+
+// Put the closure back together, in dependency order: core hands each
+// plugin its bots back, then the plugin restores whatever it wrote down
+// in suspend(). `skip` names a plugin to leave alone — the one that
+// refused, on the rollback path. Plugins that did not come back are
+// silently skipped; there is nothing to resume them into.
+// returns: bots rebound.
+static uint32_t
+plugin_resume_range(const plugin_snap_t *snap, uint32_t from, uint32_t to,
+    const char *skip)
+{
+  uint32_t rebound = 0;
+
+  for(uint32_t i = from; i < to; i++)
+  {
+    const plugin_rec_t *rec;
+
+    if(skip != NULL && strcmp(snap[i].name, skip) == 0)
+      continue;
+
+    rec = find_by_name(snap[i].name);
+
+    if(rec == NULL)
+      continue;
+
+    rebound += plugin_reattach_bots(rec->desc);
+
+    if(rec->desc->resume != NULL && rec->desc->resume() != SUCCESS)
+      clam(CLAM_WARN, "plugin", "'%s' came back but its resume() refused — "
+          "it is running with state the reload did not restore",
+          snap[i].name);
+  }
+
+  return(rebound);
+}
+
+// The mirror image, deepest dependent first: each plugin lets go of what
+// it holds, then core takes away the bots it holds on the plugin's
+// behalf. Nothing has been unloaded yet, so a hook that refuses costs
+// only the suspends already done — which are put straight back.
+static bool
+plugin_suspend_range(const plugin_snap_t *snap, uint32_t n, const char *name,
+    plugin_reload_report_t *report)
+{
+  for(uint32_t i = n; i > 0; i--)
+  {
+    const plugin_rec_t *rec = find_by_name(snap[i - 1].name);
+
+    if(rec == NULL)
+      continue;
+
+    if(rec->desc->suspend != NULL && rec->desc->suspend() != SUCCESS)
+    {
+      clam(CLAM_WARN, "plugin", "cannot reload '%s': '%s' refused to "
+          "suspend — see its own warning for what it could not put down",
+          name, snap[i - 1].name);
+
+      if(report != NULL)
+      {
+        snprintf(report->failed, sizeof(report->failed), "%s",
+            snap[i - 1].name);
+        snprintf(report->detail, sizeof(report->detail), "%s",
+            "its suspend() refused");
+      }
+
+      plugin_resume_range(snap, i, n, NULL);
+      return(FAIL);
+    }
+
+    plugin_detach_bots(rec->desc);
+  }
+
+  return(SUCCESS);
+}
+
 bool
 plugin_reload(const char *name, plugin_reload_report_t *report)
 {
@@ -497,6 +616,7 @@ plugin_reload(const char *name, plugin_reload_report_t *report)
   plugin_snap_t *snap;
   uint32_t       n;
   uint32_t       cycled;
+  uint32_t       rebound;
   char           failed[PLUGIN_NAME_SZ] = "";
 
   if(report != NULL)
@@ -534,15 +654,11 @@ plugin_reload(const char *name, plugin_reload_report_t *report)
   }
 
   // Refuse before touching anything if the cascade cannot be completed:
-  // a bot bound to a driver in the closure is state this chunk has no
-  // way to carry across the cycle (that is PLIFE-8), and a plugin with
-  // no recorded path could not be loaded back.
+  // a plugin with no recorded path could not be loaded back. A bot bound
+  // to a driver in the closure used to refuse here too; it is rebound
+  // now, below.
   for(uint32_t i = 0; i < n; i++)
   {
-    const plugin_rec_t *rec = find_by_name(snap[i].name);
-    char                bot_name[BOT_NAME_SZ];
-    bot_state_t         bot_state;
-
     if(snap[i].path[0] == '\0')
     {
       clam(CLAM_WARN, "plugin", "cannot reload '%s': '%s' has no recorded "
@@ -554,24 +670,15 @@ plugin_reload(const char *name, plugin_reload_report_t *report)
       mem_free(snap);
       return(FAIL);
     }
+  }
 
-    if(plugin_driver_bound(rec->desc, bot_name, sizeof(bot_name),
-        &bot_state))
-    {
-      clam(CLAM_WARN, "plugin", "cannot reload '%s': bot '%s' is bound to "
-          "'%s' (state=%s); stop and destroy the bot first",
-          name, bot_name, snap[i].name, bot_state_name(bot_state));
-
-      if(report != NULL)
-      {
-        snprintf(report->failed, sizeof(report->failed), "%s", snap[i].name);
-        snprintf(report->detail, sizeof(report->detail),
-            "bot '%s' is bound to its driver", bot_name);
-      }
-
-      mem_free(snap);
-      return(FAIL);
-    }
+  // Everything the closure holds that will not survive the unload —
+  // plugin-side state via suspend(), bot bindings via core — comes off
+  // now, while a refusal still costs nothing.
+  if(plugin_suspend_range(snap, n, name, report) != SUCCESS)
+  {
+    mem_free(snap);
+    return(FAIL);
   }
 
   clam(CLAM_INFO, "plugin", "reloading '%s' (%u dependent(s) to cycle)",
@@ -608,16 +715,30 @@ plugin_reload(const char *name, plugin_reload_report_t *report)
     }
 
     plugin_restore(snap, i, n, NULL, 0);
+
+    // The whole closure was suspended up front, so the resume covers
+    // both what just came back and what never went down. The one that
+    // refused is skipped: a zombie has nothing to resume into, and a
+    // plugin left running and intact was never taken apart.
+    {
+      uint32_t rebound = plugin_resume_range(snap, 0, n, snap[i - 1].name);
+
+      if(report != NULL)
+        report->rebound = rebound;
+    }
+
     mem_free(snap);
     return(FAIL);
   }
 
-  cycled = plugin_restore(snap, 0, n, failed, sizeof(failed));
+  cycled  = plugin_restore(snap, 0, n, failed, sizeof(failed));
+  rebound = plugin_resume_range(snap, 0, n, NULL);
 
   if(report != NULL)
   {
     report->dependents = n - 1;
     report->cycled     = cycled;
+    report->rebound    = rebound;
     snprintf(report->failed, sizeof(report->failed), "%s", failed);
   }
 
@@ -626,8 +747,14 @@ plugin_reload(const char *name, plugin_reload_report_t *report)
   if(cycled < n)
     return(FAIL);
 
-  clam(CLAM_INFO, "plugin", "reloaded '%s' (%u dependent(s) cycled)",
-      name, n - 1);
+  if(rebound > 0)
+    clam(CLAM_INFO, "plugin", "reloaded '%s' (%u dependent(s) cycled, "
+        "%u bot(s) rebound)", name, n - 1, rebound);
+
+  else
+    clam(CLAM_INFO, "plugin", "reloaded '%s' (%u dependent(s) cycled)",
+        name, n - 1);
+
   return(SUCCESS);
 }
 
@@ -1296,6 +1423,99 @@ plugin_owns_ptr(const char *plugin_name, const void *ptr)
   return((uintptr_t)ptr >= map.lo && (uintptr_t)ptr < map.hi);
 }
 
+void
+plugin_unmap_notify_register(plugin_unmap_cb_t cb, void *data)
+{
+  if(cb == NULL)
+    return;
+
+  pthread_mutex_lock(&plugin_unmap_mutex);
+
+  for(uint32_t i = 0; i < n_unmap_listeners; i++)
+  {
+    if(plugin_unmap_listeners[i].cb != cb)
+      continue;
+
+    plugin_unmap_listeners[i].data = data;   // idempotent re-registration
+    pthread_mutex_unlock(&plugin_unmap_mutex);
+    return;
+  }
+
+  if(n_unmap_listeners >= PLUGIN_UNMAP_MAX_LISTENERS)
+  {
+    pthread_mutex_unlock(&plugin_unmap_mutex);
+    clam(CLAM_WARN, "plugin",
+        "unmap listener table full (%u); a holder of foreign pointers "
+        "will not be told when a mapping goes away",
+        (uint32_t)PLUGIN_UNMAP_MAX_LISTENERS);
+    return;
+  }
+
+  plugin_unmap_listeners[n_unmap_listeners].cb   = cb;
+  plugin_unmap_listeners[n_unmap_listeners].data = data;
+  n_unmap_listeners++;
+
+  pthread_mutex_unlock(&plugin_unmap_mutex);
+}
+
+void
+plugin_unmap_notify_unregister(plugin_unmap_cb_t cb)
+{
+  pthread_mutex_lock(&plugin_unmap_mutex);
+
+  for(uint32_t i = 0; i < n_unmap_listeners; i++)
+  {
+    if(plugin_unmap_listeners[i].cb != cb)
+      continue;
+
+    plugin_unmap_listeners[i] = plugin_unmap_listeners[--n_unmap_listeners];
+    break;
+  }
+
+  pthread_mutex_unlock(&plugin_unmap_mutex);
+}
+
+// Tell every listener that [lo,hi) is going away, then drop the
+// listeners that live in it — a plugin that registered one and forgot to
+// unregister would otherwise leave core holding a pointer into freed
+// .text, which is the very thing this exists to prevent.
+static void
+plugin_unmap_broadcast(uintptr_t lo, uintptr_t hi)
+{
+  plugin_unmap_rec_t snap[PLUGIN_UNMAP_MAX_LISTENERS];
+  uint32_t           n = 0;
+
+  pthread_mutex_lock(&plugin_unmap_mutex);
+
+  for(uint32_t i = 0; i < n_unmap_listeners; i++)
+    snap[n++] = plugin_unmap_listeners[i];
+
+  for(uint32_t i = n_unmap_listeners; i > 0; i--)
+  {
+    uintptr_t addr = (uintptr_t)fn_addr(&plugin_unmap_listeners[i - 1].cb);
+
+    if(addr < lo || addr >= hi)
+      continue;
+
+    plugin_unmap_listeners[i - 1] =
+        plugin_unmap_listeners[--n_unmap_listeners];
+  }
+
+  pthread_mutex_unlock(&plugin_unmap_mutex);
+
+  // Unlocked: a listener drops pointers under its own lock and must be
+  // free to do so without ours.
+  for(uint32_t i = 0; i < n; i++)
+  {
+    uintptr_t addr = (uintptr_t)fn_addr(&snap[i].cb);
+
+    if(addr >= lo && addr < hi)
+      continue;   // the listener itself is going away; do not call it
+
+    snap[i].cb(lo, hi, snap[i].data);
+  }
+}
+
 // Drop every Class-A registration still owned by `target` — the ones
 // core can define a correct default for, because dropping a pure
 // registry entry is order-independent and cannot be more wrong than
@@ -1326,6 +1546,11 @@ plugin_reclaim(const plugin_rec_t *target)
   n += kv_reclaim_owned(map.lo, map.hi);
   n += clam_reclaim_owned(map.lo, map.hi);
   n += bot_reclaim_contributors_owned(map.lo, map.hi);
+
+  // What core cannot reach, it can at least announce. Listeners drop
+  // their own pointers into this range; whatever they do not drop, the
+  // audit below still counts against the unload.
+  plugin_unmap_broadcast(map.lo, map.hi);
 
   return(n);
 }
@@ -1671,6 +1896,7 @@ plugin_state_name(plugin_state_t s)
     case PLUGIN_RUNNING:     return("running");
     case PLUGIN_STOPPING:    return("stopping");
     case PLUGIN_UNLOADED:    return("unloaded");
+    case PLUGIN_ZOMBIE:      return("zombie");
   }
 
   return("unknown");
@@ -2789,15 +3015,25 @@ plugin_cmd_reload(const cmd_ctx_t *ctx)
 
   if(plugin_reload(name, &report) == SUCCESS)
   {
+    char bots[96] = "";
+
+    if(report.rebound > 0)
+      snprintf(bots, sizeof(bots), ", " CLR_CYAN "%u" CLR_RESET
+          " bot%s rebound", report.rebound,
+          report.rebound == 1 ? "" : "s");
+
     if(report.dependents == 0)
       snprintf(buf, sizeof(buf), CLR_GREEN "reloaded" CLR_RESET " "
-          CLR_BOLD "%s" CLR_RESET, name);
+          CLR_BOLD "%s" CLR_RESET "%s%s%s", name,
+          bots[0] != '\0' ? " (" : "",
+          bots[0] != '\0' ? bots + 2 : "",
+          bots[0] != '\0' ? ")" : "");
 
     else
       snprintf(buf, sizeof(buf), CLR_GREEN "reloaded" CLR_RESET " "
           CLR_BOLD "%s" CLR_RESET " (" CLR_CYAN "%u" CLR_RESET
-          " dependent%s cycled)", name, report.dependents,
-          report.dependents == 1 ? "" : "s");
+          " dependent%s cycled%s)", name, report.dependents,
+          report.dependents == 1 ? "" : "s", bots);
 
     cmd_reply(ctx, buf);
     return;

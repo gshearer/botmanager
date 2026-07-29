@@ -2420,6 +2420,19 @@ textbot_plugin_init(void)
   return(SUCCESS);
 }
 
+// Class B: the two periodic sweeps this plugin arms are the only work
+// that outlives a command and lands back in this mapping. Both read
+// state deinit() is about to tear down, so they come off first — and
+// they come off here rather than in deinit() so the loader's quiescence
+// barrier still has a window to wait out a callback already running.
+static bool
+textbot_plugin_stop(void)
+{
+  extract_stop();
+  memory_stop();
+  return(SUCCESS);
+}
+
 static void
 textbot_plugin_deinit(void)
 {
@@ -2459,7 +2472,7 @@ const plugin_desc_t bm_plugin_desc = {
   .kv_inst_schema_count = sizeof(chatbot_inst_schema) / sizeof(chatbot_inst_schema[0]),
   .init                 = textbot_plugin_init,
   .start                = textbot_plugin_start,
-  .stop                 = NULL,
+  .stop                 = textbot_plugin_stop,
   .deinit               = textbot_plugin_deinit,
   .ext                  = &textbot_driver,
 };

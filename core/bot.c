@@ -669,7 +669,7 @@ bot_destroy(const char *name)
     // Clear all active sessions.
     sess_clear_locked(inst);
 
-    if(inst->driver->stop != NULL)
+    if(inst->driver != NULL && inst->driver->stop != NULL)
       inst->driver->stop(inst->handle);
 
     // Unsubscribe from all methods and destroy bot-created instances.
@@ -694,7 +694,8 @@ bot_destroy(const char *name)
   }
 
   // Call driver destroy().
-  if(inst->driver->destroy != NULL && inst->handle != NULL)
+  if(inst->driver != NULL && inst->driver->destroy != NULL
+      && inst->handle != NULL)
     inst->driver->destroy(inst->handle);
 
   // Free all method bindings.
@@ -1559,6 +1560,17 @@ bot_start(bot_inst_t *inst)
     return(FAIL);
   }
 
+  // A reload holding the driver is transient, and starting into a NULL
+  // vtable is not. Refuse for the few seconds it takes to come back.
+  if(inst->driver == NULL)
+  {
+    pthread_mutex_unlock(&bot_mutex);
+    clam(CLAM_WARN, "bot_start",
+        "'%s': its driver is detached by a plugin reload in progress",
+        inst->name);
+    return(FAIL);
+  }
+
   // Resolve and subscribe to all bound methods.
   for(bot_method_t *m = inst->methods; m != NULL; m = m->next)
   {
@@ -1654,8 +1666,9 @@ bot_stop(bot_inst_t *inst)
   // Clear all active sessions.
   sess_clear_locked(inst);
 
-  // Call driver stop().
-  if(inst->driver->stop != NULL)
+  // Call driver stop(). NULL while a reload holds the driver — the
+  // suspend already stopped it.
+  if(inst->driver != NULL && inst->driver->stop != NULL)
     inst->driver->stop(inst->handle);
 
   // Unsubscribe from all methods and destroy bot-created instances.
@@ -1837,6 +1850,280 @@ bot_find_bound_to_driver(const char *driver_name, char *out_name,
 
   pthread_mutex_unlock(&bot_mutex);
   return(found);
+}
+
+// Suspend / resume across a plugin reload
+
+// One bot's driver, lifted out of the instance and not yet torn down.
+// The lift happens under bot_mutex and the teardown after it: once the
+// vtable is out of the instance no delivery thread can reach the driver,
+// so its stop()/destroy() are free to call back into the bot API.
+typedef struct
+{
+  const bot_driver_t *drv;
+  void               *handle;
+  bool                running;
+} bot_detach_t;
+
+uint32_t
+bot_suspend_driver(const char *driver_name)
+{
+  bot_detach_t det[BOT_SUSPEND_MAX];
+  uint32_t     n = 0;
+
+  if(driver_name == NULL || driver_name[0] == '\0')
+    return(0);
+
+  pthread_mutex_lock(&bot_mutex);
+
+  for(bot_inst_t *b = bot_list; b != NULL && n < BOT_SUSPEND_MAX; b = b->next)
+  {
+    if(b->driver == NULL || b->driver->name == NULL)
+      continue;
+
+    if(strcmp(b->driver->name, driver_name) != 0)
+      continue;
+
+    det[n].drv     = b->driver;
+    det[n].handle  = b->handle;
+    det[n].running = (b->state == BOT_RUNNING);
+    n++;
+
+    memset(&b->susp, 0, sizeof(b->susp));
+    b->susp.driver      = true;
+    b->susp.was_running = (b->state == BOT_RUNNING);
+    snprintf(b->susp.driver_name, sizeof(b->susp.driver_name), "%s",
+        driver_name);
+
+    // The state is left alone deliberately. The bot is still subscribed
+    // to its methods and still the owner of its sessions; it has only
+    // lost the ability to answer, which bot_msg_handler already treats
+    // as "drop the message".
+    b->driver = NULL;
+    b->handle = NULL;
+  }
+
+  pthread_mutex_unlock(&bot_mutex);
+
+  for(uint32_t i = 0; i < n; i++)
+  {
+    if(det[i].running && det[i].drv->stop != NULL)
+      det[i].drv->stop(det[i].handle);
+
+    if(det[i].drv->destroy != NULL && det[i].handle != NULL)
+      det[i].drv->destroy(det[i].handle);
+  }
+
+  if(n > 0)
+    clam(CLAM_INFO, "bot_suspend",
+        "detached %u bot(s) from driver '%s'", n, driver_name);
+
+  return(n);
+}
+
+uint32_t
+bot_resume_driver(const bot_driver_t *drv, const char *kind)
+{
+  char     names[BOT_SUSPEND_MAX][BOT_NAME_SZ];
+  uint32_t n       = 0;
+  uint32_t resumed = 0;
+
+  if(drv == NULL || drv->name == NULL)
+    return(0);
+
+  pthread_mutex_lock(&bot_mutex);
+
+  for(bot_inst_t *b = bot_list; b != NULL && n < BOT_SUSPEND_MAX; b = b->next)
+  {
+    if(!b->susp.driver || strcmp(b->susp.driver_name, drv->name) != 0)
+      continue;
+
+    snprintf(names[n], BOT_NAME_SZ, "%s", b->name);
+    n++;
+  }
+
+  pthread_mutex_unlock(&bot_mutex);
+
+  for(uint32_t i = 0; i < n; i++)
+  {
+    bot_inst_t *b      = bot_find(names[i]);
+    void       *handle = NULL;
+    bool        start;
+
+    if(b == NULL)
+      continue;
+
+    // The rows outlived the reload; the bindings did not. Per-bot
+    // instance KV is registered by core on the plugin's behalf and
+    // attributed to it, so the Class-A sweep reclaimed it at unload and
+    // nothing re-registers it until a bot binds again — which is here.
+    if(kind != NULL && kind[0] != '\0')
+      bot_register_driver_kv(names[i], kind);
+
+    if(drv->create != NULL)
+    {
+      handle = drv->create(b);
+
+      if(handle == NULL)
+      {
+        clam(CLAM_WARN, "bot_resume",
+            "'%s': driver '%s' create() failed; the bot stays detached",
+            names[i], drv->name);
+        continue;
+      }
+    }
+
+    pthread_mutex_lock(&bot_mutex);
+    b->driver = drv;
+    b->handle = handle;
+    start     = b->susp.was_running;
+    memset(&b->susp, 0, sizeof(b->susp));
+    pthread_mutex_unlock(&bot_mutex);
+
+    if(start && drv->start != NULL && drv->start(handle) != SUCCESS)
+      clam(CLAM_WARN, "bot_resume",
+          "'%s': driver '%s' start() failed after the reload",
+          names[i], drv->name);
+
+    resumed++;
+  }
+
+  if(resumed > 0)
+    clam(CLAM_INFO, "bot_resume",
+        "re-attached %u bot(s) to driver '%s'", resumed, drv->name);
+
+  return(resumed);
+}
+
+uint32_t
+bot_suspend_method(const char *method_kind)
+{
+  char     names[BOT_SUSPEND_MAX][BOT_NAME_SZ];
+  uint32_t n       = 0;
+  uint32_t stopped = 0;
+
+  if(method_kind == NULL || method_kind[0] == '\0')
+    return(0);
+
+  pthread_mutex_lock(&bot_mutex);
+
+  for(bot_inst_t *b = bot_list; b != NULL && n < BOT_SUSPEND_MAX; b = b->next)
+  {
+    // Only a running bot holds a method instance — the binding is a name
+    // until bot_start() resolves it.
+    if(b->state != BOT_RUNNING)
+      continue;
+
+    for(bot_method_t *m = b->methods; m != NULL; m = m->next)
+    {
+      if(strncasecmp(m->method_kind, method_kind, PLUGIN_NAME_SZ) != 0)
+        continue;
+
+      memset(&b->susp, 0, sizeof(b->susp));
+      b->susp.method      = true;
+      b->susp.was_running = true;
+      snprintf(b->susp.method_kind, sizeof(b->susp.method_kind), "%s",
+          method_kind);
+
+      snprintf(names[n], BOT_NAME_SZ, "%s", b->name);
+      n++;
+      break;
+    }
+  }
+
+  pthread_mutex_unlock(&bot_mutex);
+
+  // A protocol's connection lives in the mapping about to go away, so
+  // there is nothing to preserve and no half-measure: stop the bot,
+  // which unsubscribes it and unregisters the method instance it owns.
+  // Sessions go with it — the users will have to identify again.
+  for(uint32_t i = 0; i < n; i++)
+  {
+    bot_inst_t *b = bot_find(names[i]);
+
+    if(b == NULL)
+      continue;
+
+    if(bot_stop(b) == SUCCESS)
+    {
+      stopped++;
+      continue;
+    }
+
+    clam(CLAM_WARN, "bot_suspend",
+        "'%s': would not stop for the '%s' reload", names[i], method_kind);
+
+    pthread_mutex_lock(&bot_mutex);
+    memset(&b->susp, 0, sizeof(b->susp));
+    pthread_mutex_unlock(&bot_mutex);
+  }
+
+  if(stopped > 0)
+    clam(CLAM_INFO, "bot_suspend",
+        "stopped %u bot(s) bound to protocol '%s'", stopped, method_kind);
+
+  return(stopped);
+}
+
+uint32_t
+bot_resume_method(const char *method_kind)
+{
+  char     names[BOT_SUSPEND_MAX][BOT_NAME_SZ];
+  uint32_t n       = 0;
+  uint32_t resumed = 0;
+
+  if(method_kind == NULL || method_kind[0] == '\0')
+    return(0);
+
+  pthread_mutex_lock(&bot_mutex);
+
+  for(bot_inst_t *b = bot_list; b != NULL && n < BOT_SUSPEND_MAX; b = b->next)
+  {
+    if(!b->susp.method
+        || strncasecmp(b->susp.method_kind, method_kind, PLUGIN_NAME_SZ) != 0)
+      continue;
+
+    snprintf(names[n], BOT_NAME_SZ, "%s", b->name);
+    n++;
+  }
+
+  pthread_mutex_unlock(&bot_mutex);
+
+  for(uint32_t i = 0; i < n; i++)
+  {
+    bot_inst_t *b = bot_find(names[i]);
+    bool        start;
+
+    if(b == NULL)
+      continue;
+
+    // Same rebind as a driver resume, one tier down: these are the
+    // bot.<bot>.<protocol>.* keys the protocol plugin declared.
+    bot_register_method_kv(names[i], method_kind);
+
+    pthread_mutex_lock(&bot_mutex);
+    start = b->susp.was_running;
+    memset(&b->susp, 0, sizeof(b->susp));
+    pthread_mutex_unlock(&bot_mutex);
+
+    // bot_start() re-resolves the protocol plugin by kind, so the
+    // instance it creates comes from the mapping that just arrived.
+    if(start && bot_start(b) != SUCCESS)
+    {
+      clam(CLAM_WARN, "bot_resume",
+          "'%s': would not start after the '%s' reload",
+          names[i], method_kind);
+      continue;
+    }
+
+    resumed++;
+  }
+
+  if(resumed > 0)
+    clam(CLAM_INFO, "bot_resume",
+        "restarted %u bot(s) on protocol '%s'", resumed, method_kind);
+
+  return(resumed);
 }
 
 const char *

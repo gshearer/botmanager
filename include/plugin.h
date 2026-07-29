@@ -7,7 +7,7 @@
 #include "kv.h"
 
 // Plugins built against a different version are rejected at load time.
-#define PLUGIN_API_VERSION   14
+#define PLUGIN_API_VERSION   15
 
 // Entry point symbol that every plugin must export.
 #define PLUGIN_ENTRY_SYMBOL  "bm_plugin_desc"
@@ -37,7 +37,13 @@ typedef enum
   PLUGIN_INITIALIZED,   // init callback called
   PLUGIN_RUNNING,       // start callback called
   PLUGIN_STOPPING,      // stop callback called
-  PLUGIN_UNLOADED       // dlclose'd
+  PLUGIN_UNLOADED,      // dlclose'd
+
+  // Stopped and deinitialized, but a Class-B reference kept it mapped
+  // and the dlclose was refused. Nothing of it works and nothing of it
+  // dangles; only a daemon restart clears it. Its own state is gone, so
+  // it is never initialized, started or torn down again.
+  PLUGIN_ZOMBIE
 } plugin_state_t;
 
 typedef struct
@@ -111,6 +117,27 @@ typedef struct
 
   void (*deinit)(void);   // final cleanup
 
+  // A reload takes the mapping away and gives an identical one back.
+  // Everything a plugin registers comes back with it — commands, KV,
+  // the descriptor itself — but nothing it *holds* does: resolved
+  // pointers into peer plugins, attachments, live handles. suspend()
+  // is where a plugin lets those go and writes down whatever it wants
+  // to find again; resume() is where it re-resolves and restores.
+  //
+  // Both are optional, and NULL is the honest answer for a plugin whose
+  // whole state is registrations (every leaf command plugin, every
+  // strategy). The snapshot must NOT live in the plugin's own mapping —
+  // it is unmapped between the two calls — so persist it (the DB is
+  // already proven for whenmoon's markets) or hand it to core.
+  //
+  // suspend() runs before stop(), in reverse dependency order across
+  // the whole closure, and FAIL there refuses the reload while it is
+  // still free: nothing has come down yet. resume() runs after start(),
+  // in dependency order; a FAIL there is reported and logged, but the
+  // plugin is already back and running.
+  bool (*suspend)(void);
+  bool (*resume)(void);
+
   // Type-specific extension data (e.g., db_driver_t* for DB plugins).
   const void *ext;
 
@@ -183,10 +210,17 @@ bool plugin_unload(const char *name, plugin_unload_report_t *report);
 // plugin's own teardown, so the one that said no is stopped,
 // deinitialized and still mapped. Its dependents came back, but it did
 // not — only a restart clears it.
+//
+// `rebound` counts the bots whose driver — or whose bound protocol —
+// the cascade took away and gave back. A bot bound to a plugin in the
+// closure used to refuse the reload outright; now it is detached before
+// the unload and re-attached after the load, keeping its name, its KV,
+// its sessions and, for a driver rebind, its protocol connections.
 typedef struct
 {
   uint32_t dependents;
   uint32_t cycled;
+  uint32_t rebound;
   bool     started;
   bool     rolled_back;
   bool     zombie;
@@ -238,6 +272,33 @@ void *plugin_dlsym_cached(const char *plugin_name, const char *symbol,
 // pointer belongs to no mapping, so this catches exactly the
 // references that SIGSEGV after dlclose, not heap leaks.
 bool plugin_owns_ptr(const char *plugin_name, const void *ptr);
+
+// ---------------------------------------------------------------------------
+// Unmap notification — for pointers core cannot see
+// ---------------------------------------------------------------------------
+//
+// Core reclaims Class A because it owns the registries. A plugin that
+// keeps pointers into ANOTHER plugin's mapping — a completion callback
+// handed to it with a request, a vtable it was given — owns a registry
+// core cannot walk, so neither the reclaim nor the audit can help: the
+// dangle only shows up later, when the callback fires into an address
+// that is no longer mapped (measured: an in-flight LLM request whose
+// requester was cycled by `/plugin reload`).
+//
+// A listener registered here is told, once per unload, the address range
+// about to disappear. It must drop every pointer it holds inside that
+// range before returning; nothing else will. `lo` is inclusive, `hi`
+// exclusive. Listeners fire after the plugin's deinit() and before the
+// residual audit, on the unloading thread, and must not call any
+// plugin_* API.
+//
+// Register from the holder's init(), unregister from its deinit() —
+// though a listener whose own callback lies in an unloading mapping is
+// dropped automatically, so a forgotten unregister cannot dangle.
+typedef void (*plugin_unmap_cb_t)(uintptr_t lo, uintptr_t hi, void *data);
+
+void plugin_unmap_notify_register(plugin_unmap_cb_t cb, void *data);
+void plugin_unmap_notify_unregister(plugin_unmap_cb_t cb);
 
 // Emitter for plugin_audit. `line` is valid only for the call.
 typedef void (*plugin_audit_emit_t)(const char *line, void *data);
@@ -376,6 +437,17 @@ typedef struct
   char path[PLUGIN_PATH_SZ];
 } plugin_snap_t;
 
+// Holders of foreign pointers, told when a mapping goes away. Small,
+// static-capacity: this is a handful of subsystems (inference's in-flight
+// LLM requests today), not a general event bus.
+#define PLUGIN_UNMAP_MAX_LISTENERS  16
+
+typedef struct
+{
+  plugin_unmap_cb_t cb;
+  void             *data;
+} plugin_unmap_rec_t;
+
 typedef struct plugin_rec
 {
   char                  path[PLUGIN_PATH_SZ];
@@ -390,6 +462,10 @@ static uint32_t           n_plugins           = 0;
 static bool               plugin_ready        = false;
 static dlsym_cache_rec_t *dlsym_cache_head    = NULL;
 static pthread_mutex_t    dlsym_cache_mutex   = PTHREAD_MUTEX_INITIALIZER;
+
+static plugin_unmap_rec_t plugin_unmap_listeners[PLUGIN_UNMAP_MAX_LISTENERS];
+static uint32_t           n_unmap_listeners = 0;
+static pthread_mutex_t    plugin_unmap_mutex = PTHREAD_MUTEX_INITIALIZER;
 
 static uint32_t      n_discovered  = 0;
 static uint32_t      n_rejected    = 0;

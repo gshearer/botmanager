@@ -54,6 +54,7 @@ regex (the literal context portion, before any `<placeholder>`).
 | `bot_register_driver_kv` | core/bot.c | per-driver KV registration |
 | `bot_register_method_kv` | core/bot.c | per-method KV registration |
 | `bot_restore` | core/bot.c | bot restore from persistent store |
+| `bot_resume` | core/bot.c | re-attaching a bot to a reloaded driver/protocol |
 | `bot_say` | core/bot_cmd.c | `/say` command (bot emits to a channel) |
 | `bot_session_auth` | core/bot.c | bot session auth events |
 | `bot_session_clear` | core/bot.c | clearing a bot session |
@@ -63,6 +64,7 @@ regex (the literal context portion, before any `<placeholder>`).
 | `bot_set_userns` | core/bot.c | binding a userns to a bot |
 | `bot_start` | core/bot.c | bot start lifecycle hook |
 | `bot_stop` | core/bot.c | bot stop lifecycle hook |
+| `bot_suspend` | core/bot.c | detaching a bot across a plugin reload |
 | `bot_unbind` | core/bot_cmd.c | `/bot unbind` command |
 | `bot_unbind_method` | core/bot.c | method-unbinding step on a bot |
 | `botmanctl` | core/botmanctl.c | botmanctl protocol driver |

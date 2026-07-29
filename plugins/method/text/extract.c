@@ -1197,6 +1197,31 @@ extract_register_config(void)
 }
 
 void
+extract_stop(void)
+{
+  uint32_t cancelled = 0;
+
+  pthread_mutex_lock(&extract_sched_mutex);
+
+  for(extract_sched_t *s = extract_sched_head; s != NULL; s = s->next)
+  {
+    s->active = false;
+
+    if(s->task == TASK_HANDLE_NONE)
+      continue;
+
+    task_cancel(s->task);
+    s->task = TASK_HANDLE_NONE;
+    cancelled++;
+  }
+
+  pthread_mutex_unlock(&extract_sched_mutex);
+
+  if(cancelled > 0)
+    clam(CLAM_DEBUG, "extract", "cancelled %u sweep task(s)", cancelled);
+}
+
+void
 extract_exit(void)
 {
   extract_sched_t *s;
@@ -1206,8 +1231,8 @@ extract_exit(void)
 
   extract_ready = false;
 
-  // Mark all scheduled sweeps inactive and free the list. The periodic
-  // tasks themselves are joined by the task system during shutdown.
+  // Free the sweep list. Each entry is a live task's `data`, so
+  // extract_stop() must already have cancelled them.
   pthread_mutex_lock(&extract_sched_mutex);
   s = extract_sched_head;
   while(s != NULL)

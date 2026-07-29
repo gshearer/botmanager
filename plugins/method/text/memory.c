@@ -1394,6 +1394,18 @@ memory_register_commands(void)
 }
 
 void
+memory_stop(void)
+{
+  if(memory_sweep_task == TASK_HANDLE_NONE)
+    return;
+
+  task_cancel(memory_sweep_task);
+  memory_sweep_task = TASK_HANDLE_NONE;
+
+  clam(CLAM_DEBUG, "memory", "decay sweep cancelled");
+}
+
+void
 memory_exit(void)
 {
   if(!memory_ready)
@@ -1401,8 +1413,8 @@ memory_exit(void)
 
   memory_ready = false;
 
-  // Periodic task is joined by the task system during shutdown; nothing
-  // to flush in this chunk (all DB writes are synchronous).
+  // Nothing to flush (all DB writes are synchronous). The sweep is
+  // memory_stop()'s business — by here it must already be cancelled.
   memory_sweep_task = TASK_HANDLE_NONE;
 
   pthread_mutex_destroy(&memory_cfg_mutex);

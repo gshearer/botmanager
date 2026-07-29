@@ -6,6 +6,7 @@
 #include "curl.h"
 #include "db.h"
 #include "json.h"
+#include "plugin.h"
 #include "task.h"
 #include "userns.h"
 #include "util.h"
@@ -2808,6 +2809,50 @@ llm_register_kv(void)
 
 // Lifecycle
 
+// A request's done-callback belongs to whoever asked for the completion,
+// and that requester can be unloaded while its answer is still in flight
+// — a `/plugin reload` of a chat plugin with an LLM call outstanding.
+// Nothing else can see these pointers: they live in this plugin's
+// request list, not in any registry core walks, so the loader tells us
+// the range and we drop them ourselves. The request itself is left to
+// finish and free normally; it simply delivers to nobody.
+static void
+llm_unmap_cb(uintptr_t lo, uintptr_t hi, void *data)
+{
+  uint32_t orphaned = 0;
+
+  (void)data;
+
+  pthread_mutex_lock(&llm_active_mutex);
+
+  for(llm_request_t *r = llm_active_head; r != NULL; r = r->next_active)
+  {
+    uintptr_t cb = 0;
+
+    switch(r->type)
+    {
+      case LLM_REQ_CHAT:  cb = (uintptr_t)fn_addr(&r->chat_done_cb);  break;
+      case LLM_REQ_EMBED: cb = (uintptr_t)fn_addr(&r->embed_done_cb); break;
+      case LLM_REQ_IMAGE: cb = (uintptr_t)fn_addr(&r->image_done_cb); break;
+    }
+
+    if(cb == 0 || cb < lo || cb >= hi)
+      continue;
+
+    r->chat_done_cb  = NULL;
+    r->embed_done_cb = NULL;
+    r->image_done_cb = NULL;
+    r->user_data     = NULL;
+    orphaned++;
+  }
+
+  pthread_mutex_unlock(&llm_active_mutex);
+
+  if(orphaned > 0)
+    clam(CLAM_WARN, "llm", "%u in-flight request(s) lost their requester "
+        "to an unload; they will complete and deliver nothing", orphaned);
+}
+
 void
 llm_init(void)
 {
@@ -2826,6 +2871,8 @@ llm_init(void)
   llm_cfg.timeout_secs       = LLM_DEF_TIMEOUT_SECS;
   llm_cfg.max_context_tokens = LLM_DEF_MAX_CONTEXT;
   llm_cfg.streaming_idle_ms  = LLM_DEF_STREAMING_IDLE_MS;
+
+  plugin_unmap_notify_register(llm_unmap_cb, NULL);
 
   llm_ready = true;
 
@@ -2866,6 +2913,8 @@ llm_exit(void)
 
   llm_ready    = false;
   llm_stopping = false;
+
+  plugin_unmap_notify_unregister(llm_unmap_cb);
 
   // Drain the in-flight list. Anything still here has a done-callback
   // in this plugin's .text that we can no longer deliver — which is

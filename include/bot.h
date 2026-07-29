@@ -177,6 +177,44 @@ uint32_t bot_method_count(const bot_inst_t *inst);
 bool bot_find_bound_to_driver(const char *driver_name,
     char *out_name, size_t out_cap, bot_state_t *out_state);
 
+// ---------------------------------------------------------------------------
+// Rebinding a bot across a plugin reload
+// ---------------------------------------------------------------------------
+//
+// A bot holds two pointers into plugin mappings: its bot_driver_t (the
+// method plugin that gives it behaviour, e.g. text) and, per bound
+// method, a method_inst_t whose vtable belongs to a protocol plugin
+// (e.g. irc). Neither is visible in the .provides/.requires graph, so a
+// reload of either plugin would unmap code the bot is still pointing at
+// — which is why both used to refuse the unload outright.
+//
+// These four give the loader a way to put the bot down and pick it back
+// up instead. They are the reload's business alone; nothing else should
+// call them.
+//
+//   bot_suspend_driver() — stop the driver, destroy its per-bot handle
+//     and drop the vtable. Method subscriptions are left alone, so the
+//     bot stays connected and merely goes deaf: bot_msg_handler drops
+//     messages while the driver is NULL. Sessions survive.
+//   bot_resume_driver() — re-register the driver's per-bot instance KV,
+//     re-create the handle from `drv`, and start it again if the bot was
+//     running. `kind` is the new plugin's kind, for the KV prefix.
+//
+//   bot_suspend_method() — a protocol's own state (the socket, the
+//     connection) cannot outlive its mapping, so every bot with a bound
+//     method of that kind is stopped outright, unregistering the method
+//     instance with it.
+//   bot_resume_method() — re-register the per-(bot, protocol) KV and
+//     start the bot again, which re-creates the method instance from the
+//     reloaded driver and reconnects it.
+//
+// Each returns the number of bots affected. Resuming a bot that was not
+// suspended is a no-op, so a rollback may call them unconditionally.
+uint32_t bot_suspend_driver(const char *driver_name);
+uint32_t bot_resume_driver(const bot_driver_t *drv, const char *kind);
+uint32_t bot_suspend_method(const char *method_kind);
+uint32_t bot_resume_method(const char *method_kind);
+
 // Returns the first bound method, or NULL. Useful for driver-side
 // helpers (e.g. chatbot volunteer speech) that need a valid
 // method_inst_t for an outbound channel send without reconstructing
@@ -361,6 +399,10 @@ typedef struct bot_session
 // the most-recently-active ones. Read/written under bot_witness_lock.
 #define BOT_WITNESS_MAX  16
 
+// How many bots one reload can put down at once. A cascade that touches
+// more than this on a dev instance is not a cascade, it is a restart.
+#define BOT_SUSPEND_MAX  64
+
 typedef struct
 {
   bool  valid;
@@ -371,6 +413,18 @@ typedef struct
   char  text    [METHOD_TEXT_SZ];
   bool  is_action;
 } bot_witness_t;
+
+// What a plugin reload took away from a bot, and what it owes back.
+// `driver` and `method` are never both set: a bot loses its behaviour
+// or its protocol, and the loader cycles one plugin at a time.
+typedef struct
+{
+  bool driver;                        // bot_driver_t detached, inst->driver NULL
+  bool method;                        // bot stopped for a protocol reload
+  bool was_running;                   // ...and it was RUNNING when it happened
+  char driver_name[BOT_NAME_SZ];      // driver to re-attach
+  char method_kind[PLUGIN_NAME_SZ];   // protocol to re-bind
+} bot_suspend_t;
 
 struct bot_inst
 {
@@ -388,6 +442,7 @@ struct bot_inst
   time_t                 last_activity; // last message received
   bot_witness_t          witness[BOT_WITNESS_MAX]; // last public lines
   uint32_t               witness_next;  // round-robin insert cursor
+  bot_suspend_t          susp;         // set only across a plugin reload
   struct bot_inst       *next;
 };
 

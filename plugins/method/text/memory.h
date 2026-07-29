@@ -150,7 +150,12 @@ void memory_ensure_schema(void);
 // cmd_init().
 void memory_register_commands(void);
 
-// Shut down the subsystem. Cancels the decay task; flushes no state.
+// Cancel the periodic decay sweep. Must run before memory_exit() on the
+// unload path: exit() tears down the state the sweep reads, and until
+// the plugin is unmapped the task is still armed to read it.
+void memory_stop(void);
+
+// Shut down the subsystem. Flushes no state.
 void memory_exit(void);
 
 // Conversation log

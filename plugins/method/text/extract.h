@@ -30,6 +30,11 @@
 // mutex; does not touch the DB.
 void extract_init(void);
 
+// Cancel every scheduled per-bot sweep. Must run before extract_exit()
+// on the unload path: exit() frees the sweep state each armed task
+// holds a pointer to.
+void extract_stop(void);
+
 // Shut down the extract subsystem. Safe to call from shutdown path
 // after task workers have been drained.
 void extract_exit(void);
