@@ -186,10 +186,14 @@ static const plugin_kv_entry_t yf_kv_schema[] = {
     "Chart range for the inline sparkline" },
   { "plugin.yahoofinance.spark_interval", KV_STR, "5m",
     "Chart interval for the inline sparkline" },
-  { "plugin.yahoofinance.enrich",        KV_BOOL, "true",
+  { "plugin.yahoofinance.enrich",        KV_BOOL, "false",
     "Use the cookie+crumb v7/quote tier: fundamentals, bid/ask and "
     "extended-hours data, and ONE request for a whole batch instead of "
-    "one per symbol. Still keyless. Off falls back to v8/chart only" },
+    "one per symbol. Still keyless. Off falls back to v8/chart only. "
+    "DEFAULT OFF since 2026-07-29: Yahoo's getcrumb endpoint blocks "
+    "this public IP (429 regardless of User-Agent or host), so the tier "
+    "cannot mint a session here and every quote takes the fallback "
+    "anyway — see TODO.md STOCK-4-RECHECK before turning it back on" },
   { "plugin.yahoofinance.session_ttl",   KV_UINT32, "3600",
     "Lifetime of a minted cookie+crumb session (seconds) before it is "
     "re-minted; an early crumb rejection re-mints regardless" },
