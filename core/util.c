@@ -428,6 +428,121 @@ util_host_is_ipv4_unsafe(const char *host)
   return(false);
 }
 
+// Query-parameter name fragments that mark a value as a credential. Matched
+// case-insensitively as substrings, so this stays short and still covers the
+// hyphenated and prefixed spellings services actually use.
+static const char *const util_secret_frags[] = {
+  "key", "token", "secret", "password", "passwd", "pass",
+  "auth", "signature", "sig", "crumb", "credential", "session", "cookie",
+};
+
+// Mirrors kv.h's KV_REDACTED_VALUE without depending on it — util is a leaf.
+static const char util_redaction[] = "[CENSORED]";
+
+static bool
+util_param_is_secret(const char *name, size_t len)
+{
+  char lower[64];
+  size_t i;
+
+  if(len == 0) return(false);
+
+  if(len >= sizeof(lower))
+    len = sizeof(lower) - 1;
+
+  for(i = 0; i < len; i++)
+    lower[i] = (char)tolower((unsigned char)name[i]);
+
+  lower[len] = '\0';
+
+  for(i = 0; i < sizeof(util_secret_frags) / sizeof(util_secret_frags[0]); i++)
+    if(strstr(lower, util_secret_frags[i]) != NULL)
+      return(true);
+
+  return(false);
+}
+
+// Append [src,src+len) to out at *pos, never exceeding cap-1. Returns false
+// once the buffer is full so the caller can stop early.
+static bool
+util_append(char *out, size_t cap, size_t *pos, const char *src, size_t len)
+{
+  if(*pos + len >= cap)
+  {
+    size_t fit = (*pos + 1 < cap) ? cap - *pos - 1 : 0;
+
+    memcpy(out + *pos, src, fit);
+    *pos += fit;
+    return(false);
+  }
+
+  memcpy(out + *pos, src, len);
+  *pos += len;
+  return(true);
+}
+
+const char *
+util_redact_url(const char *url, char *out, size_t out_cap)
+{
+  const char *q;
+  const char *p;
+  size_t pos = 0;
+
+  if(out == NULL || out_cap == 0) return("");
+
+  if(url == NULL)
+  {
+    out[0] = '\0';
+    return(out);
+  }
+
+  q = strchr(url, '?');
+
+  if(q == NULL)
+  {
+    snprintf(out, out_cap, "%s", url);
+    return(out);
+  }
+
+  // Scheme, host and path are never secret — copy through the '?'.
+  if(!util_append(out, out_cap, &pos, url, (size_t)(q - url) + 1))
+  {
+    out[pos] = '\0';
+    return(out);
+  }
+
+  p = q + 1;
+
+  while(*p != '\0')
+  {
+    const char *amp = strchr(p, '&');
+    const char *end = (amp != NULL) ? amp : p + strlen(p);
+    const char *eq  = memchr(p, '=', (size_t)(end - p));
+    bool ok;
+
+    if(eq != NULL && util_param_is_secret(p, (size_t)(eq - p)))
+    {
+      ok = util_append(out, out_cap, &pos, p, (size_t)(eq - p) + 1)
+        && util_append(out, out_cap, &pos, util_redaction,
+            sizeof(util_redaction) - 1);
+    }
+
+    else
+      ok = util_append(out, out_cap, &pos, p, (size_t)(end - p));
+
+    if(!ok) break;
+
+    if(amp == NULL) break;
+
+    if(!util_append(out, out_cap, &pos, "&", 1)) break;
+
+    p = amp + 1;
+  }
+
+  out[pos] = '\0';
+  return(out);
+}
+
 bool
 util_url_is_safe_https(const char *url)
 {

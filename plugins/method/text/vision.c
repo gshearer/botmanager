@@ -110,8 +110,12 @@ chatbot_vision_maybe_submit(chatbot_state_t *st, const method_msg_t *msg)
   // SSRF guard — must be safe HTTPS against a public host.
   if(!util_url_is_safe_https(image_url))
   {
+    char safe[sizeof(image_url)];
+
+    // Chat-sourced, so it can be a presigned link carrying
+    // X-Amz-Signature / X-Amz-Credential in the query.
     clam(CLAM_WARN, "vision", "rejected url='%s' reason=unsafe-or-http",
-         image_url);
+         util_redact_url(image_url, safe, sizeof(safe)));
     return(true);
   }
 
@@ -140,7 +144,10 @@ chatbot_vision_maybe_submit(chatbot_state_t *st, const method_msg_t *msg)
 
   if(vision_cooldown_hot(&st->vision_url_cd, url_cd_key, url_cd, now))
   {
-    clam(CLAM_DEBUG, "vision", "url cooldown hot url='%s'", image_url);
+    char safe[sizeof(image_url)];
+
+    clam(CLAM_DEBUG, "vision", "url cooldown hot url='%s'",
+        util_redact_url(image_url, safe, sizeof(safe)));
     return(true);
   }
 

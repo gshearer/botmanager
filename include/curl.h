@@ -201,6 +201,7 @@ void curl_iterate_active(curl_iter_cb_t cb, void *data);
 #include "alloc.h"
 #include "pool.h"
 #include "task.h"
+#include "util.h"     // util_redact_url — no request URL reaches a log raw
 
 #include <curl/curl.h>
 #include <errno.h>

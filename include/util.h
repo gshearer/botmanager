@@ -72,6 +72,27 @@ bool util_b64_decode(const char *in, size_t in_len, void *out,
 // the URL into out (NUL-terminated). Returns true on hit.
 bool util_find_image_url(const char *text, char *out, size_t out_cap);
 
+// Copy `url` into `out`, replacing the value of every credential-bearing
+// query parameter with "[CENSORED]". Anything a log line can reach must
+// pass through here first: several services authenticate with a plain
+// `?key=`/`?api_key=` query parameter, so logging a request URL verbatim
+// writes the secret to disk in plaintext.
+//
+// A parameter is credential-bearing when its name CONTAINS any of: key,
+// token, secret, password, passwd, pass, auth, signature, sig, crumb,
+// credential, session, cookie. Substring matching is deliberate — it
+// catches `x-api-key`, `client_secret` and `access_token` without an
+// exhaustive list — and so is the over-matching that comes with it: a
+// parameter innocently named "monkey" is redacted too. In a log line that
+// is the harmless direction to be wrong in.
+//
+// The scheme, host, path and every non-credential parameter survive intact,
+// so the result is still worth reading. Output is always NUL-terminated and
+// truncates rather than overflowing; because values are redacted as they are
+// written, a truncated result can never expose a secret it meant to hide.
+// Returns `out`, so it can be used inline as a clam() argument.
+const char *util_redact_url(const char *url, char *out, size_t out_cap);
+
 // Reject URLs that would SSRF onto private / link-local / loopback /
 // cloud-metadata IPs, or that use any non-https scheme. Hostname-only
 // (does not resolve DNS); operators needing rebind resistance should

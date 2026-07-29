@@ -311,7 +311,12 @@ curl_request_create(curl_method_t method, const char *url,
 
   snprintf(req->url, sizeof(req->url), "%s", url);
 
-  clam(CLAM_DEBUG5, "curl", "create: %s", url);
+  {
+    char safe[CURL_URL_SZ];
+
+    clam(CLAM_DEBUG5, "curl", "create: %s",
+        util_redact_url(url, safe, sizeof(safe)));
+  }
 
   return(req);
 }
@@ -659,12 +664,15 @@ curl_finish_request(curl_request_t *req, CURLcode result)
 
   else
   {
+    char safe[CURL_URL_SZ];
+
     resp.error = req->curl_errbuf[0] ? req->curl_errbuf
         : curl_easy_strerror(result);
     curl_stat_errors++;
 
     clam(CLAM_WARN, "curl", "%s %s: %s",
-        curl_method_name(req->method), req->url,
+        curl_method_name(req->method),
+        util_redact_url(req->url, safe, sizeof(safe)),
         resp.error);
   }
 
@@ -794,7 +802,10 @@ curl_drain_queue(void)
     easy = curl_easy_init();
     if(easy == NULL)
     {
-      clam(CLAM_WARN, "curl", "curl_easy_init failed for %s", req->url);
+      char safe[CURL_URL_SZ];
+
+      clam(CLAM_WARN, "curl", "curl_easy_init failed for %s",
+          util_redact_url(req->url, safe, sizeof(safe)));
       curl_request_release(req);
       pthread_mutex_lock(&curl_submit_mutex);
       continue;
@@ -919,6 +930,8 @@ curl_drain_queue(void)
 
     {
       uint32_t total = 0;
+      char safe[CURL_URL_SZ];
+
       for(uint32_t i = 0; i < CURL_PRIO__COUNT; i++)
         total += curl_active_qs[i];
 
@@ -926,7 +939,8 @@ curl_drain_queue(void)
         curl_active_peak = total;
 
       clam(CLAM_DEBUG2, "curl", "%s %s (active: %u)",
-          curl_method_name(req->method), req->url, total);
+          curl_method_name(req->method),
+          util_redact_url(req->url, safe, sizeof(safe)), total);
     }
 
     pthread_mutex_lock(&curl_submit_mutex);
