@@ -27,8 +27,8 @@
 
 // The plugin tier is the ROOT of a three-level resolution
 // (plugin -> bot -> bot.protocol). allow is an absolute list the lower
-// tiers may only narrow (intersection); max_tokens / max_lines are hard
-// ceilings the lower tiers may only lower (min); default model and
+// tiers may only narrow (intersection); max_tokens / max_lines / max_cols
+// are hard ceilings the lower tiers may only lower (min); default model and
 // prompt_prepend_file cascade most-specific-non-empty-wins. The per-bot
 // and per-(bot,protocol) keys are contributed dynamically at bot-create /
 // method-bind time — see ask_kv_bot_cb / ask_kv_proto_cb.
@@ -44,6 +44,10 @@ static const plugin_kv_entry_t ask_kv_schema[] = {
   { "plugin.ask.max_lines",  KV_UINT32, "30",
     "Hard ceiling on reply lines per answer (flood guard); bot / protocol"
     " tiers may only lower it" },
+  // Keep in step with ASK_WRAP_COLS, the emit-loop fallback.
+  { "plugin.ask.max_cols",   KV_UINT32, "100",
+    "Hard ceiling on reply columns before word-wrap; each wrapped fragment"
+    " counts against max_lines. Bot / protocol tiers may only lower it" },
   // Path is relative to the daemon CWD (build/), so reach up to the
   // project-root prompts/ dir; bot / protocol tiers may override.
   { "plugin.ask.prompt_prepend_file", KV_STR, "../prompts/ask_default.txt",
@@ -99,6 +103,10 @@ ask_kv_bot_cb(const char *botname, void *user)
   kv_register(key, KV_UINT32, "0", NULL, NULL,
       "Per-bot reply-line cap for !ask (0 = inherit plugin ceiling)");
 
+  snprintf(key, sizeof(key), "bot.%s.ask.max_cols", botname);
+  kv_register(key, KV_UINT32, "0", NULL, NULL,
+      "Per-bot wrap-column cap for !ask (0 = inherit plugin ceiling)");
+
   snprintf(key, sizeof(key), "bot.%s.ask.prompt_prepend_file", botname);
   kv_register(key, KV_STR, "", NULL, NULL,
       "Per-bot prepend-file path for !ask (empty inherits plugin default)");
@@ -133,6 +141,10 @@ ask_kv_proto_cb(const char *botname, const char *protocol, void *user)
   snprintf(key, sizeof(key), "bot.%s.%s.ask.max_lines", botname, protocol);
   kv_register(key, KV_UINT32, "0", NULL, NULL,
       "Per-protocol reply-line cap for !ask (0 = inherit)");
+
+  snprintf(key, sizeof(key), "bot.%s.%s.ask.max_cols", botname, protocol);
+  kv_register(key, KV_UINT32, "0", NULL, NULL,
+      "Per-protocol wrap-column cap for !ask (0 = inherit)");
 
   snprintf(key, sizeof(key), "bot.%s.%s.ask.prompt_prepend_file",
       botname, protocol);
@@ -206,6 +218,7 @@ typedef struct
   const char *allow_proto;   // narrows bot    (NULL/empty/"*" = no-op)
   uint32_t    max_lines;     // min across present tiers
   uint32_t    max_tokens;    // min across present tiers
+  uint32_t    max_cols;      // min across present tiers, buffer-clamped
 } ask_scope_t;
 
 // True iff `model` is a whole comma/space-separated token of `csv`
@@ -287,6 +300,13 @@ ask_scope_resolve(const char *bot_name, const char *proto, ask_scope_t *s)
 
   s->max_lines  = ask_ceiling(bot_name, proto, "max_lines",  1);
   s->max_tokens = ask_ceiling(bot_name, proto, "max_tokens", 1);
+  s->max_cols   = ask_ceiling(bot_name, proto, "max_cols",
+      ASK_WRAP_COLS_MIN);
+
+  // Clamp to what the emit buffer can carry: a wider setting would leave
+  // ask_done's snprintf truncating each line instead of wrapping it.
+  if(s->max_cols > ASK_WRAP_COLS_MAX)
+    s->max_cols = ASK_WRAP_COLS_MAX;
 }
 
 // Resolve the effective prepend-file path (most-specific non-empty) and
@@ -438,6 +458,7 @@ ask_done(const llm_chat_response_t *resp)
   char        line[ASK_CMD_REPLY_SZ];
   const char *p;
   uint32_t    max_lines;
+  size_t      max_cols;
   uint32_t    emitted      = 0;
   bool        flood_capped = false;
 
@@ -457,6 +478,13 @@ ask_done(const llm_chat_response_t *resp)
   if(max_lines == 0)
     max_lines = 1;
 
+  max_cols = r->max_cols;
+  if(max_cols == 0)
+    max_cols = ASK_WRAP_COLS;
+
+  else if(max_cols > ASK_WRAP_COLS_MAX)
+    max_cols = ASK_WRAP_COLS_MAX;
+
   for(p = resp->content; p != NULL && *p != '\0' && !flood_capped; )
   {
     const char *nl  = strchr(p, '\n');
@@ -467,23 +495,23 @@ ask_done(const llm_chat_response_t *resp)
     if(seg > 0 && p[seg - 1] == '\r')
       seg--;
 
-    // Word-wrap the logical line to ASK_WRAP_COLS so a long model line
-    // becomes several readable IRC lines, each counting toward the flood
-    // cap. An empty line (seg == 0) is skipped by the loop condition.
+    // Word-wrap the logical line to max_cols so a long model line becomes
+    // several readable IRC lines, each counting toward the flood cap. An
+    // empty line (seg == 0) is skipped by the loop condition.
     for(off = 0; off < seg && !flood_capped; )
     {
       size_t take = seg - off;
 
-      if(take > ASK_WRAP_COLS)
+      if(take > max_cols)
       {
-        size_t brk = ASK_WRAP_COLS;
+        size_t brk = max_cols;
 
         // Prefer the last space in the column window; hard-break a single
         // over-long word when there is none.
         while(brk > 0 && p[off + brk] != ' ')
           brk--;
 
-        take = (brk > 0) ? brk : ASK_WRAP_COLS;
+        take = (brk > 0) ? brk : max_cols;
       }
 
       // Never split a UTF-8 multibyte sequence on a hard break: back off
@@ -584,6 +612,7 @@ ask_cmd_handler(const cmd_ctx_t *ctx)
   memset(r, 0, sizeof(*r));
   r->ctx       = *ctx;
   r->max_lines = scope.max_lines;
+  r->max_cols  = scope.max_cols;
 
   if(ctx->msg != NULL)
     r->msg = *ctx->msg;

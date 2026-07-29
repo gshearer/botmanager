@@ -24,19 +24,32 @@
 #define ASK_CMD_CTX        "ask"
 #define ASK_CMD_REPLY_SZ   640
 #define ASK_PREPEND_SZ     4096   // cap on prepend-file system-prompt bytes
-#define ASK_WRAP_COLS      100    // soft word-wrap width for IRC readability
+
+// Soft word-wrap width for IRC readability. This is the fallback the emit
+// loop uses when resolution yields nothing; the live value is the
+// plugin.ask.max_cols ceiling, whose schema default must match.
+#define ASK_WRAP_COLS      100
+
+// A wrap width below this emits ragged one-word lines that burn the
+// max_lines flood cap for no readability gain, so it is the resolution
+// floor. The ceiling is bounded by the emit buffer: a wider column count
+// would be silently cut by the snprintf in ask_done, dropping the tail of
+// the line instead of wrapping it onto the next one.
+#define ASK_WRAP_COLS_MIN  20
+#define ASK_WRAP_COLS_MAX  (ASK_CMD_REPLY_SZ - 1)
 
 // Per-call closure carrying the saved command context through the async
 // llm_chat_submit callback. The context's msg pointer is rebound to the
 // embedded copy so it survives past the originating dispatch frame.
-// max_lines is the reply-line cap resolved at request time (plugin ceiling
-// narrowed by the bot / protocol tiers) — snapshotted here so the async
-// completion doesn't re-resolve on a worker thread.
+// max_lines / max_cols are the reply ceilings resolved at request time
+// (plugin ceiling narrowed by the bot / protocol tiers) — snapshotted here
+// so the async completion doesn't re-resolve on a worker thread.
 typedef struct
 {
   cmd_ctx_t    ctx;
   method_msg_t msg;
   uint32_t     max_lines;
+  uint32_t     max_cols;
 } ask_req_t;
 
 static bool ask_cmd_init(void);
