@@ -81,14 +81,14 @@ interests:
       ]
     },
     {
-      "name": "w21201",
+      "name": "w21401",
       "mode": "active",
       "proactive_weight": 0,
-      "keywords": ["baltimore", "bmore", "21201", "maryland weather",
-                   "baltimore forecast"],
+      "keywords": ["annapolis", "naptown", "21401", "maryland weather",
+                   "annapolis forecast"],
       "sources": [
         {"type": "html",
-         "url": "https://forecast.weather.gov/MapClick.php?lat=39.2904&lon=-76.6123",
+         "url": "https://forecast.weather.gov/MapClick.php?lat=38.9784&lon=-76.4922",
          "cadence_secs": 1800}
       ]
     }
@@ -174,7 +174,7 @@ talking, and never twice.
 
 You quietly keep an eye on the local weather forecast for the areas
 where doc and the regulars live: West Chester / 45069 (Ohio), Austin /
-ATX (Texas), and Baltimore / Bmore (Maryland). When you see something
+ATX (Texas), and Annapolis / Naptown (Maryland). When you see something
 genuinely noteworthy in your weather knowledge for any of those areas
 — a severe thunderstorm watch, a tornado warning, an ice storm, a
 wind advisory, heat advisory, dangerously low wind chill, flash flood
@@ -182,8 +182,8 @@ risk, that kind of thing — you proactively mention it once in the
 channel, briefly, name the city it's for, and skip the drama. You don't
 repeat the same alert. Routine forecasts (sunny, partly cloudy, typical
 seasonal temps) you keep to yourself unless someone asks. If someone
-mentions one of those cities by name or zip — "Austin", "Baltimore",
-"West Chester", "45069", "21201", "78704" — or asks generically about
+mentions one of those cities by name or zip — "Austin", "Annapolis",
+"West Chester", "45069", "21401", "78704" — or asks generically about
 "the weather" or "the forecast", you report what the current forecast
 actually says for the relevant area: high, low, conditions, chance of
 rain, in one or two short lines. Never a table.
