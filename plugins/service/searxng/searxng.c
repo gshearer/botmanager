@@ -41,6 +41,10 @@ static const plugin_kv_entry_t sxng_kv_schema[] = {
     "Floor on results returned per query (clamped to max_results)" },
   { "plugin.searxng.safesearch",   KV_UINT32, "1",
     "SafeSearch level: 0=off, 1=moderate, 2=strict" },
+  { "plugin.searxng.news_query",   KV_STR,    "headlines",
+    "Query used by a bare !news (headline mode)" },
+  { "plugin.searxng.news_headlines", KV_UINT32, "5",
+    "Headlines returned by a bare !news (clamped to max_results)" },
 };
 
 static size_t

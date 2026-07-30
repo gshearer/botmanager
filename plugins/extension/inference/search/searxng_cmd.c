@@ -14,6 +14,10 @@
 // with no -n the count defaults to plugin.searxng.min_results. Results
 // are formatted with category-appropriate metadata (image dimensions,
 // video length, news publication date).
+//
+// !news alone — with no query — is the one exception to "a search needs
+// words": it runs the standing plugin.searxng.news_query and prints
+// plugin.searxng.news_headlines stories as bare headlines.
 #define SEARXNG_CMD_INTERNAL
 #include "searxng_cmd.h"
 
@@ -35,6 +39,14 @@ static void searxng_cmd_music  (const cmd_ctx_t *ctx);
 // terminating NUL — safe for the bare "   " indent used by the URL
 // and snippet lines as well.
 #define SXNG_CMD_LINE_BODY      ((int)(SEARXNG_CMD_REPLY_SZ - 16))
+
+// Headline-mode line budget: the link gets half the reply buffer, the
+// headline the rest less the " — " joiner and the NUL, so the two
+// precisions provably fit together. Both halves are far wider than an
+// IRC line survives anyway.
+#define SXNG_CMD_HEADLINE_TAIL  ((int)(SEARXNG_CMD_REPLY_SZ / 2))
+#define SXNG_CMD_HEADLINE_HEAD  \
+    ((int)(SEARXNG_CMD_REPLY_SZ - SXNG_CMD_HEADLINE_TAIL - 4))
 
 // Append a single result row's category-specific extras as separate
 // reply lines. Skips empty fields silently.
@@ -152,6 +164,21 @@ searxng_cmd_done(const sxng_response_t *resp)
   for(size_t i = 0; i < resp->n_results; i++)
   {
     const sxng_result_t *rr = &resp->results[i];
+
+    // Headline mode (a bare !news): one line per story — the headline,
+    // then the article link last so a client renders it clickable. The
+    // two precisions are sized to fit one reply buffer between them, so
+    // a long headline can never crowd the link off the end. "-v" opts
+    // back into the full verbose rendering below.
+    if(r->headlines && !r->verbose)
+    {
+      snprintf(line, sizeof(line), "%.*s — %.*s",
+          SXNG_CMD_HEADLINE_HEAD,
+          rr->title[0] != '\0' ? rr->title : "(untitled)",
+          SXNG_CMD_HEADLINE_TAIL, rr->url);
+      cmd_reply(&ctx, line);
+      continue;
+    }
 
     // Default (concise) mode: just the URL, one per line. For image
     // results the SearXNG `url` field is the web page hosting the image,
@@ -283,21 +310,47 @@ searxng_cmd_dispatch(const cmd_ctx_t *ctx, sxng_category_t category)
   uint32_t           n_wanted;
   bool               have_n;
   bool               verbose;
+  bool               headlines;
 
-  if(ctx->args == NULL || ctx->args[0] == '\0')
-  {
-    cmd_reply(ctx, "Usage: [-v] [-n <count>] <query>");
-    return;
-  }
+  query[0]  = '\0';
+  n_wanted  = 0;
+  have_n    = false;
+  verbose   = false;
+  headlines = false;
 
-  n_wanted = 0;
-  searxng_cmd_parse_flags(ctx->args, query, sizeof(query),
-      &n_wanted, &have_n, &verbose);
+  if(ctx->args != NULL && ctx->args[0] != '\0')
+    searxng_cmd_parse_flags(ctx->args, query, sizeof(query),
+        &n_wanted, &have_n, &verbose);
 
+  // A word-less !news is not a usage error — it is headline mode, which
+  // stands in the configured standing query and a headline-sized count.
+  // Every other category still needs something to search for.
   if(query[0] == '\0')
   {
-    cmd_reply(ctx, "Usage: [-v] [-n <count>] <query>");
-    return;
+    const char *standing;
+
+    if(category != SXNG_CAT_NEWS)
+    {
+      cmd_reply(ctx, "Usage: [-v] [-n <count>] <query>");
+      return;
+    }
+
+    standing = kv_get_str("plugin.searxng.news_query");
+
+    if(standing == NULL || standing[0] == '\0')
+    {
+      cmd_reply(ctx, "news: plugin.searxng.news_query is not set");
+      return;
+    }
+
+    headlines = true;
+    snprintf(query, sizeof(query), "%s", standing);
+
+    if(!have_n || n_wanted == 0)
+    {
+      n_wanted = (uint32_t)kv_get_uint("plugin.searxng.news_headlines");
+      have_n   = n_wanted > 0;
+    }
   }
 
   // No -n (or "-n 0") falls back to the configured floor. The service
@@ -313,9 +366,10 @@ searxng_cmd_dispatch(const cmd_ctx_t *ctx, sxng_category_t category)
 
   r = mem_alloc(SEARXNG_CMD_CTX, "req", sizeof(*r));
   memset(r, 0, sizeof(*r));
-  r->ctx      = *ctx;
-  r->category = category;
-  r->verbose  = verbose;
+  r->ctx       = *ctx;
+  r->category  = category;
+  r->verbose   = verbose;
+  r->headlines = headlines;
 
   if(ctx->msg != NULL)
     r->msg = *ctx->msg;
@@ -373,8 +427,9 @@ static const searxng_cmd_entry_t searxng_cmd_table[] = {
     "Web search via SearXNG", searxng_cmd_general },
   { "search", "s", "search [-v] [-n <count>] <query>",
     "Web search via SearXNG", searxng_cmd_general },
-  { "news", "n", "news [-v] [-n <count>] <query>",
-    "News / current-events search via SearXNG", searxng_cmd_news },
+  { "news", "n", "news [-v] [-n <count>] [query]",
+    "News search via SearXNG; no query prints the headlines",
+    searxng_cmd_news },
   { "image", "i", "image [-v] [-n <count>] <query>",
     "Image search via SearXNG", searxng_cmd_images },
   { "video", "v", "video [-v] [-n <count>] <query>",
@@ -391,7 +446,7 @@ static const char searxng_cmd_help[] =
     "\n"
     "Commands (all public, usable in channels or private messages):\n"
     "  searxng / search / s   web search\n"
-    "  news / n               news / current events\n"
+    "  news / n               news / current events (bare: headlines)\n"
     "  image / i              image search\n"
     "  video / v              video search\n"
     "  music                  music / audio search\n"
@@ -403,8 +458,14 @@ static const char searxng_cmd_help[] =
     "(capped at plugin.searxng.max_results). With no -n the count\n"
     "defaults to plugin.searxng.min_results.\n"
     "\n"
+    "!news on its own takes no query: it prints the current headlines\n"
+    "(story and link, one per line) from the standing search in\n"
+    "plugin.searxng.news_query, plugin.searxng.news_headlines of them.\n"
+    "Both -n and -v still apply.\n"
+    "\n"
     "Examples:\n"
     "  !s dua lipa\n"
+    "  !n\n"
     "  !n -n 5 ai legislation\n"
     "  !i -v aurora borealis\n"
     "  !v arch linux install\n"
