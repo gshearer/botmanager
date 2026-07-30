@@ -74,4 +74,14 @@ typedef struct
 size_t color_translate(char *dst, size_t dst_sz,
     const char *src, const color_table_t *ct);
 
+// Rewrite the typeable markup an LLM can actually produce — `**bold**`
+// and `<red>…</red>` over the nine colours above — into the abstract
+// markers, ready for color_translate at send time. A bare \x01 in src
+// is dropped so generated text cannot forge a marker or swallow the
+// byte behind it. Output is never longer than input (every token is at
+// least two bytes and becomes exactly two), so dst_sz of
+// strlen(src) + 1 always suffices. Always NUL-terminates dst. Returns
+// bytes written (excluding NUL).
+size_t color_markup_translate(char *dst, size_t dst_sz, const char *src);
+
 #endif // BM_COLORS_H

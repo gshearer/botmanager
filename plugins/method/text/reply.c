@@ -1084,6 +1084,32 @@ anti_repeat_blocks_line(const chatbot_req_t *r, const char *line)
   return(false);
 }
 
+// Rewrite the typeable markup a model can actually produce (`**bold**`,
+// `<red>…</red>`) into the abstract colour markers method_send resolves
+// per driver, then hand the line over. Translating here rather than
+// earlier keeps every gate in send_reply_line matching against what the
+// model literally wrote: the SKIP sentinel, the anti-repeat trigrams,
+// and the slash-command probe would all read markers as content.
+//
+// The translation is unconditional and costs a contract nothing to
+// ignore. A persona whose contract never mentions markup still wins:
+// models emit Markdown bold unprompted, and a channel that used to see
+// literal asterisks now sees bold. Output is never longer than input,
+// so a METHOD_TEXT_SZ buffer covers any line that reached this far.
+static void
+send_line_marked(chatbot_req_t *r, const char *line, bool emote)
+{
+  char marked[METHOD_TEXT_SZ];
+
+  color_markup_translate(marked, sizeof(marked), line);
+
+  if(emote)
+    method_send_emote(r->method, r->reply_target, marked);
+
+  else
+    method_send(r->method, r->reply_target, marked);
+}
+
 // Route one completed reply line to the method. Lines beginning with
 // "/me " are sent as actions/emotes via method_send_emote (which falls
 // back to "*text*" on methods without native action support).
@@ -1137,7 +1163,7 @@ send_reply_line(chatbot_req_t *r, const char *line)
   if(strncmp(line, "/me ", 4) == 0 && line[4] != '\0')
   {
     r->nonskip_lines_sent++;
-    method_send_emote(r->method, r->reply_target, line + 4);
+    send_line_marked(r, line + 4, true);
     return;
   }
 
@@ -1150,8 +1176,7 @@ send_reply_line(chatbot_req_t *r, const char *line)
      line[CHATBOT_ACTION_PREFIX_LEN] != '\0')
   {
     r->nonskip_lines_sent++;
-    method_send_emote(r->method, r->reply_target,
-        line + CHATBOT_ACTION_PREFIX_LEN);
+    send_line_marked(r, line + CHATBOT_ACTION_PREFIX_LEN, true);
     return;
   }
 
@@ -1176,7 +1201,7 @@ send_reply_line(chatbot_req_t *r, const char *line)
   }
 
   r->nonskip_lines_sent++;
-  method_send(r->method, r->reply_target, line);
+  send_line_marked(r, line, false);
 }
 
 // Streaming delta handler: accumulates text and flushes whole lines
@@ -1212,9 +1237,12 @@ llm_chunk(llm_request_t *req, const char *delta, size_t delta_len,
 
     if(r->stream_pos + 1 >= sizeof(r->stream_buf))
     {
-      // Buffer full without newline — flush as-is.
+      // Buffer full without newline — flush as-is. The gates in
+      // send_reply_line are deliberately skipped (this is a fragment,
+      // not a line), but the markup still needs resolving or the
+      // channel sees raw asterisks and tags.
       r->stream_buf[r->stream_pos] = '\0';
-      method_send(r->method, r->reply_target, r->stream_buf);
+      send_line_marked(r, r->stream_buf, false);
       r->stream_flushed += r->stream_pos;
       r->stream_pos = 0;
     }

@@ -445,139 +445,17 @@ ask_parse_flags(const char *args, char *model, size_t model_cap,
 }
 
 // -----------------------------------------------------------------------
-// Model markup -> abstract colour markers
+// Wrapped emission
 // -----------------------------------------------------------------------
 //
 // The model cannot emit raw control bytes. Asked for "\033[1m" or "\x02"
 // it reproduces the *notation* as literal text, which is what lands in the
 // channel. So !ask advertises markup the model can actually type — the
 // Markdown bold it already produces unprompted, plus <colour> tags — and
-// rewrites it here into the method-agnostic markers from colors.h.
-// method_send() then translates those to the driver's native codes, so one
-// answer renders correctly on IRC and on the botmanctl console alike.
-
-static const struct
-{
-  const char *name;
-  char        id;
-} ask_markup_colors[] = {
-  { "red",    'R' },
-  { "green",  'G' },
-  { "yellow", 'Y' },
-  { "blue",   'B' },
-  { "purple", 'P' },
-  { "cyan",   'C' },
-  { "white",  'W' },
-  { "orange", 'O' },
-  { "gray",   'A' },
-  { "grey",   'A' },
-};
-
-// Recognise a markup token at `p`. On a match `*id` receives the abstract
-// marker identifier ('b' bold toggle, 'X' close, else a colour) and `*len`
-// the token's byte length.
-static bool
-ask_markup_token(const char *p, char *id, size_t *len)
-{
-  const size_t n = sizeof(ask_markup_colors) / sizeof(ask_markup_colors[0]);
-
-  if(p[0] == '*' && p[1] == '*')
-  {
-    *id  = 'b';
-    *len = 2;
-    return(true);
-  }
-
-  if(p[0] != '<')
-    return(false);
-
-  // A closing tag resets everything; which colour it names doesn't matter,
-  // only that it names one (so real text like "<stdio.h>" passes through).
-  if(p[1] == '/')
-  {
-    for(size_t i = 0; i < n; i++)
-    {
-      size_t nl = strlen(ask_markup_colors[i].name);
-
-      if(strncasecmp(p + 2, ask_markup_colors[i].name, nl) == 0
-          && p[2 + nl] == '>')
-      {
-        *id  = 'X';
-        *len = nl + 3;
-        return(true);
-      }
-    }
-
-    return(false);
-  }
-
-  for(size_t i = 0; i < n; i++)
-  {
-    size_t nl = strlen(ask_markup_colors[i].name);
-
-    if(strncasecmp(p + 1, ask_markup_colors[i].name, nl) == 0
-        && p[1 + nl] == '>')
-    {
-      *id  = ask_markup_colors[i].id;
-      *len = nl + 2;
-      return(true);
-    }
-  }
-
-  return(false);
-}
-
-// Rewrite markup in `src` into abstract markers. Output is never longer
-// than input — every token is at least two bytes and becomes exactly two —
-// so a dst of strlen(src) + 1 always suffices.
-static void
-ask_markup_translate(char *dst, size_t dst_sz, const char *src)
-{
-  size_t di = 0;
-  size_t cap;
-
-  if(dst == NULL || dst_sz == 0)
-    return;
-
-  cap = dst_sz - 1;
-
-  for(size_t si = 0; src[si] != '\0'; )
-  {
-    char   id;
-    size_t len;
-
-    if(ask_markup_token(src + si, &id, &len))
-    {
-      if(di + 2 > cap)
-        break;
-
-      dst[di++] = '\x01';
-      dst[di++] = id;
-      si += len;
-      continue;
-    }
-
-    // A bare \x01 in the model's own output would be read as a marker
-    // downstream and swallow the byte after it. Drop it: the answer must
-    // not be able to forge formatting or eat its own text.
-    if(src[si] == '\x01')
-    {
-      si++;
-      continue;
-    }
-
-    if(di >= cap)
-      break;
-
-    dst[di++] = src[si++];
-  }
-
-  dst[di] = '\0';
-}
-
-// -----------------------------------------------------------------------
-// Wrapped emission
-// -----------------------------------------------------------------------
+// color_markup_translate rewrites it into the method-agnostic markers from
+// colors.h before anything below measures or emits a line. method_send()
+// then translates those to the driver's native codes, so one answer
+// renders correctly on IRC and on the botmanctl console alike.
 
 // Formatting carried across wrapped lines. Every method drops formatting
 // at a message boundary, so a continuation line must re-open whatever was
@@ -731,7 +609,7 @@ ask_done(const llm_chat_response_t *resp)
   // counting tag bytes nobody renders.
   text_sz = strlen(resp->content) + 1;
   text    = mem_alloc(ASK_CMD_CTX, "markup", text_sz);
-  ask_markup_translate(text, text_sz, resp->content);
+  color_markup_translate(text, text_sz, resp->content);
 
   for(p = text; *p != '\0' && !flood_capped; )
   {
