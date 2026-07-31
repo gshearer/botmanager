@@ -885,6 +885,9 @@ userns_user_delete(const userns_t *ns, const char *username)
   if(esc_user == NULL)
     return(FAIL);
 
+  // Purge temporary identities first: the DB rows die via CASCADE,
+  // but the in-memory cache must not outlive the user.
+  userns_tmfa_del(ns, username, NULL);
 
   snprintf(sql, sizeof(sql),
       "DELETE FROM userns_user WHERE ns_id = %u AND username = '%s'",

@@ -392,7 +392,8 @@ userns_tmfa_resolve(userns_t *ns, const char *metadata,
 }
 
 uint32_t
-userns_tmfa_del(userns_t *ns, const char *username, const char *metadata)
+userns_tmfa_del(const userns_t *ns, const char *username,
+    const char *metadata)
 {
   tmfa_cache_t *c;
   tmfa_entry_t *e;

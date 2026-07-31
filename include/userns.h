@@ -271,7 +271,7 @@ tmfa_result_t userns_tmfa_resolve(userns_t *ns, const char *metadata,
 
 // metadata == NULL removes every entry the user holds.
 // returns: number of entries removed
-uint32_t userns_tmfa_del(userns_t *ns, const char *username,
+uint32_t userns_tmfa_del(const userns_t *ns, const char *username,
     const char *metadata);
 
 typedef void (*userns_tmfa_iter_cb_t)(const char *username,
