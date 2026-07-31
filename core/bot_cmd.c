@@ -519,7 +519,7 @@ cmd_show_bots(const cmd_ctx_t *ctx)
   bot_cmd_list_state_t st = { .ctx = ctx, .count = 0 };
 
   cmd_reply(ctx,
-      "  " CLR_BOLD "NAME             KIND       STATE    METHODS  SESSIONS   CMDS  NAMESPACE" CLR_RESET);
+      "  " CLR_BOLD "NAME             KIND       STATE    METHODS   CMDS  NAMESPACE" CLR_RESET);
 
   bot_iterate(show_bots_cb, &st);
 
