@@ -204,12 +204,11 @@ halves. Same shape as `gemini` / `gemini.ws`.
 
 | Context | Source | Description |
 |---|---|---|
-| `autoidentify` | plugins/method/text/dispatch.c | passive identify on session |
 | `chatbot` | plugins/method/text/chatbot.c · plugins/method/text/volunteer.c | conversational observe/classify trace + volunteer-to-speak path |
-| `deauth` | plugins/method/text/dispatch.c | session deauth |
+| `deauth` | plugins/method/text/dispatch.c | temp-MFA drop for the caller's hostmask |
 | `dossier` | plugins/method/text/dossier.c | dossier subsystem |
 | `extract` | plugins/method/text/extract.c | LLM-driven fact extraction |
-| `identify` | plugins/method/text/dispatch.c | `/identify` session auth |
+| `identify` | plugins/method/text/dispatch.c | `!identify` auth + temp-MFA mint |
 | `interject` | plugins/method/text/volunteer.c | chatbot interjection scoring |
 | `irc` | plugins/protocol/irc/irc_protocol.c | IRC protocol driver |
 | `memory` | plugins/method/text/memory_rag.c | chat memory subsystem + RAG |
