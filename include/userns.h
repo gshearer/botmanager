@@ -48,6 +48,7 @@ typedef struct userns
   char          name[USERNS_NAME_SZ]; // unique namespace name
   time_t        created;
   void         *mfa_cache;            // opaque MFA cache (userns_cache_t *)
+  void         *tmfa_cache;           // opaque temp-MFA cache (tmfa_cache_t *)
   struct userns *next;                // linked list chain
 } userns_t;
 
@@ -231,6 +232,45 @@ bool userns_user_get_autoidentify(const userns_t *ns,
 bool userns_user_set_autoidentify(const userns_t *ns,
     const char *username, bool value);
 
+// Temporary MFAs — exact-match identities minted by !identify.
+//
+// Unlike permanent user_mfa patterns (globs, stateless, no expiry),
+// a temporary MFA is the identifying sender's full metadata string
+// matched byte-for-byte, refreshed by any observed matching line and
+// expired LAZILY: the first resolve past `timeout` deletes the entry
+// and reports TMFA_EXPIRED exactly once so the caller can notify;
+// every later resolve is TMFA_NONE. Rows persist in user_mfa_temp
+// and reload with the namespace, so identities survive restarts.
+
+typedef enum
+{
+  TMFA_NONE,                  // no entry matches this metadata
+  TMFA_OK,                    // matched and refreshed; user_out filled
+  TMFA_EXPIRED                // matched, idled out, deleted; user_out filled
+} tmfa_result_t;
+
+// Upsert a temp MFA for the user (re-identify refreshes the stamp).
+// Capped at USERNS_TMFA_MAX entries per user; the stalest is evicted.
+bool userns_tmfa_add(userns_t *ns, const char *username,
+    const char *metadata);
+
+// The per-message hot path: exact metadata match against the cache
+// only — no DB query on hit. timeout == 0 means the entry never
+// expires. user_out receives the username for OK and EXPIRED.
+tmfa_result_t userns_tmfa_resolve(userns_t *ns, const char *metadata,
+    uint32_t timeout, char *user_out, size_t user_sz);
+
+// metadata == NULL removes every entry the user holds.
+// returns: number of entries removed
+uint32_t userns_tmfa_del(userns_t *ns, const char *username,
+    const char *metadata);
+
+typedef void (*userns_tmfa_iter_cb_t)(const char *username,
+    const char *metadata, time_t created, time_t last_seen, void *data);
+
+void userns_tmfa_iterate(const userns_t *ns, userns_tmfa_iter_cb_t cb,
+    void *data);
+
 // Unlike userns_mfa_match() which searches all users, this checks only
 // the patterns belonging to the specified user.
 bool userns_user_mfa_match(const userns_t *ns, const char *username,
@@ -342,6 +382,32 @@ void userns_cache_clear(userns_cache_t *c);
 void userns_cache_populate(userns_cache_t *c, uint32_t ns_id);
 void userns_cache_invalidate(const userns_t *ns);
 void userns_cache_ensure(userns_t *ns);
+
+// Temp-MFA cache (userns_tmfa.c). One flat list per namespace — entry
+// counts are tiny (USERNS_TMFA_MAX per user), exact-match scan only.
+#define USERNS_TMFA_MAX          8    // temp MFAs per user; stalest evicted
+#define USERNS_TMFA_PERSIST_SEC  60   // min seconds between last_seen writes
+
+typedef struct tmfa_entry
+{
+  uint32_t           user_id;
+  char               username[USERNS_USER_SZ];
+  char               metadata[USERNS_MFA_PATTERN_SZ];
+  time_t             created;
+  time_t             last_seen;
+  time_t             persisted_at;    // last_seen value last written to DB
+  struct tmfa_entry *next;
+} tmfa_entry_t;
+
+typedef struct
+{
+  tmfa_entry_t     *entries;
+  uint32_t          count;
+  pthread_rwlock_t  lock;
+} tmfa_cache_t;
+
+void userns_tmfa_ensure(userns_t *ns);    // create + populate from DB
+void userns_tmfa_destroy(userns_t *ns);   // flush dirty stamps, free
 
 // DB user id lookup (userns.c).
 uint32_t userns_get_user_id(const userns_t *ns, const char *username);

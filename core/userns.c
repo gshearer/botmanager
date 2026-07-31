@@ -106,6 +106,7 @@ list_remove(const char *name)
     {
       *prev = ns->next;
       userns_cache_destroy((userns_cache_t *)ns->mfa_cache);
+      userns_tmfa_destroy(ns);
       mem_free(ns);
       userns_total--;
       return(SUCCESS);
@@ -232,6 +233,14 @@ create_core_tables(void)
       "user_id INTEGER NOT NULL REFERENCES userns_user(id) ON DELETE CASCADE, "
       "pattern VARCHAR(200) NOT NULL, "
       "UNIQUE(user_id, pattern))",
+
+    "CREATE TABLE IF NOT EXISTS user_mfa_temp ("
+      "id SERIAL PRIMARY KEY, "
+      "user_id INTEGER NOT NULL REFERENCES userns_user(id) ON DELETE CASCADE, "
+      "metadata VARCHAR(200) NOT NULL, "
+      "created TIMESTAMPTZ NOT NULL DEFAULT NOW(), "
+      "last_seen TIMESTAMPTZ NOT NULL DEFAULT NOW(), "
+      "UNIQUE(user_id, metadata))",
 
     NULL
   };
@@ -449,6 +458,7 @@ userns_init(void)
     seed_builtin_groups(ns);
     seed_owner_user(ns);
     userns_cache_ensure(ns);
+    userns_tmfa_ensure(ns);
   }
 
   clam(CLAM_INFO, "userns_init", "user namespace subsystem initialized");
@@ -478,6 +488,7 @@ userns_exit(void)
 
     userns_cache_destroy((userns_cache_t *)ns->mfa_cache);
     ns->mfa_cache = NULL;
+    userns_tmfa_destroy(ns);
 
     mem_free(ns);
     freed++;
@@ -584,6 +595,7 @@ userns_get(const char *name)
   seed_builtin_groups(ns);
   seed_owner_user(ns);
   userns_cache_ensure(ns);
+  userns_tmfa_ensure(ns);
 
   return(ns);
 }

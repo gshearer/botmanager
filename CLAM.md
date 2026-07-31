@@ -144,6 +144,7 @@ regex (the literal context portion, before any `<placeholder>`).
 | `userns_member_add` | core/userns.c | group member add |
 | `userns_member_remove` | core/userns.c | group member remove |
 | `userns_member_set_level` | core/userns.c | group member level set |
+| `userns_tmfa` | core/userns_tmfa.c | temporary MFA mint/refresh/expiry/eviction |
 | `userns_user_add_mfa` | core/userns_mfa.c | per-user MFA enroll |
 | `userns_user_create` | core/userns.c | user create |
 | `userns_user_create_nopass` | core/userns.c | user create (no password) |

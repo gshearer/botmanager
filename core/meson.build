@@ -30,6 +30,7 @@ libcore_sources = [
   'userns.c',
   'userns_cache.c',
   'userns_mfa.c',
+  'userns_tmfa.c',
   'userns_util.c',
   'util.c',
   'validate.c',
