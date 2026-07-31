@@ -185,9 +185,14 @@ uq_cmd_add(const cmd_ctx_t *ctx)
     }
 
     // Resolve the speaker's nick to a username where possible.
-    user = bot_session_find(ctx->bot, ctx->msg->inst, ll.sender);
-    snprintf(sayer, sizeof(sayer), "%s",
-        (user != NULL && user[0] != '\0') ? user : ll.nickname);
+    {
+      char ubuf[USERNS_USER_SZ];
+
+      user = bot_identity_resolve(ctx->bot, ctx->msg->inst,
+          ll.sender, NULL, ubuf, sizeof(ubuf)) ? ubuf : NULL;
+      snprintf(sayer, sizeof(sayer), "%s",
+          (user != NULL && user[0] != '\0') ? user : ll.nickname);
+    }
 
     // Bound the witnessed text (up to METHOD_TEXT_SZ) so it always fits
     // alongside the "<nick> " prefix; a length cap is applied below too.

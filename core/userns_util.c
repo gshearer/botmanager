@@ -482,6 +482,101 @@ userns_user_set_autoidentify(const userns_t *ns, const char *username,
   return(updated ? SUCCESS : FAIL);
 }
 
+// Per-user /user cd override
+
+bool
+userns_user_get_cd(const userns_t *ns, const char *username,
+    char *out, size_t out_sz)
+{
+  char *esc_user;
+  char sql[256];
+  db_result_t *r;
+  const char *val;
+
+  if(out == NULL || out_sz == 0)
+    return(FAIL);
+
+  out[0] = '\0';
+
+  if(!userns_ready || ns == NULL || username == NULL)
+    return(FAIL);
+
+  esc_user = db_escape(username);
+  if(esc_user == NULL)
+    return(FAIL);
+
+  snprintf(sql, sizeof(sql),
+      "SELECT userns_cd FROM userns_user "
+      "WHERE ns_id = %u AND username = '%s'",
+      ns->id, esc_user);
+
+  mem_free(esc_user);
+
+  r = db_result_alloc();
+
+  if(db_query(sql, r) != SUCCESS || r->rows == 0)
+  {
+    db_result_free(r);
+    return(FAIL);
+  }
+
+  val = db_result_get(r, 0, 0);
+
+  if(val != NULL)
+    snprintf(out, out_sz, "%s", val);
+
+  db_result_free(r);
+  return(SUCCESS);
+}
+
+bool
+userns_user_set_cd(const userns_t *ns, const char *username,
+    const char *cd_name)
+{
+  char *esc_user;
+  char *esc_cd;
+  char sql[384];
+  db_result_t *r;
+  bool updated;
+
+  if(!userns_ready || ns == NULL || username == NULL)
+    return(FAIL);
+
+  esc_user = db_escape(username);
+  if(esc_user == NULL)
+    return(FAIL);
+
+  esc_cd = db_escape(cd_name != NULL ? cd_name : "");
+
+  if(esc_cd == NULL)
+  {
+    mem_free(esc_user);
+    return(FAIL);
+  }
+
+  snprintf(sql, sizeof(sql),
+      "UPDATE userns_user SET userns_cd = '%s' "
+      "WHERE ns_id = %u AND username = '%s'",
+      esc_cd, ns->id, esc_user);
+
+  mem_free(esc_user);
+  mem_free(esc_cd);
+
+  r = db_result_alloc();
+
+  if(db_query(sql, r) != SUCCESS)
+  {
+    clam(CLAM_WARN, "userns", "cannot set cd for '%s': %s",
+        username, r->error);
+    db_result_free(r);
+    return(FAIL);
+  }
+
+  updated = (r->rows_affected > 0);
+  db_result_free(r);
+  return(updated ? SUCCESS : FAIL);
+}
+
 // Owner identity
 
 void

@@ -34,31 +34,29 @@ set_user_verb_check(const char *str)
 userns_t *
 userns_session_resolve(const cmd_ctx_t *ctx)
 {
-  const char *cd_name = NULL;
-
   if(ctx->bot != NULL && ctx->msg != NULL && ctx->msg->inst != NULL)
   {
-    // Bot session — check session cd override.
-    cd_name = bot_session_get_userns_cd(ctx->bot,
-        ctx->msg->inst, ctx->msg->sender);
+    userns_t *bound = bot_get_userns(ctx->bot);
 
-    if(cd_name != NULL && cd_name[0] != '\0')
+    // Identified caller — check their persistent cd override.
+    if(bound != NULL && ctx->username != NULL)
     {
-      userns_t *ns = userns_find(cd_name);
+      char cd_name[USERNS_NAME_SZ];
 
-      if(ns != NULL)
-        return(ns);
+      if(userns_user_get_cd(bound, ctx->username,
+            cd_name, sizeof(cd_name)) == SUCCESS && cd_name[0] != '\0')
+      {
+        userns_t *ns = userns_find(cd_name);
 
-      // cd was set but namespace no longer exists — fall through.
+        if(ns != NULL)
+          return(ns);
+
+        // cd was set but namespace no longer exists — fall through.
+      }
     }
 
-    // Fall back to bot's bound userns.
-    {
-      userns_t *ns = bot_get_userns(ctx->bot);
-
-      if(ns != NULL)
-        return(ns);
-    }
+    if(bound != NULL)
+      return(bound);
   }
 
   else
@@ -175,19 +173,19 @@ static void
 cmd_user_parent(const cmd_ctx_t *ctx)
 {
   const char *cd_name = NULL;
+  char        cd_buf[USERNS_NAME_SZ] = {0};
 
   if(ctx->bot != NULL && ctx->msg != NULL && ctx->msg->inst != NULL)
   {
-    cd_name = bot_session_get_userns_cd(ctx->bot,
-        ctx->msg->inst, ctx->msg->sender);
+    userns_t *bound = bot_get_userns(ctx->bot);
 
-    if(cd_name == NULL || cd_name[0] == '\0')
-    {
-      userns_t *ns = bot_get_userns(ctx->bot);
+    if(bound != NULL && ctx->username != NULL &&
+       userns_user_get_cd(bound, ctx->username,
+          cd_buf, sizeof(cd_buf)) == SUCCESS && cd_buf[0] != '\0')
+      cd_name = cd_buf;
 
-      if(ns != NULL)
-        cd_name = ns->name;
-    }
+    else if(bound != NULL)
+      cd_name = bound->name;
   }
 
   else
@@ -232,8 +230,17 @@ cmd_user_cd(const cmd_ctx_t *ctx)
   }
 
   if(ctx->bot != NULL && ctx->msg != NULL && ctx->msg->inst != NULL)
-    bot_session_set_userns_cd(ctx->bot,
-        ctx->msg->inst, ctx->msg->sender, ns_name);
+  {
+    userns_t *bound = bot_get_userns(ctx->bot);
+
+    if(bound == NULL || ctx->username == NULL ||
+       userns_user_set_cd(bound, ctx->username, ns_name) != SUCCESS)
+    {
+      cmd_reply(ctx, "cannot set working namespace: "
+          "you must be identified");
+      return;
+    }
+  }
 
   else
     botmanctl_set_user_ns(ns_name);
@@ -569,8 +576,12 @@ cmd_user_addns(const cmd_ctx_t *ctx)
 
   // Auto-cd into the new namespace.
   if(ctx->bot != NULL && ctx->msg != NULL && ctx->msg->inst != NULL)
-    bot_session_set_userns_cd(ctx->bot,
-        ctx->msg->inst, ctx->msg->sender, ns_name);
+  {
+    userns_t *bound = bot_get_userns(ctx->bot);
+
+    if(bound != NULL && ctx->username != NULL)
+      userns_user_set_cd(bound, ctx->username, ns_name);
+  }
 
   else
     botmanctl_set_user_ns(ns_name);

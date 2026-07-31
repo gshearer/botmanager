@@ -449,8 +449,7 @@ irc_kick_unident_task(task_t *t)
   bool still_here = false;
   char botname[METHOD_NAME_SZ] = {0};
   bot_inst_t *bot;
-  char mfa[IRC_PREFIX_SZ];
-  const char *user;
+  char ubuf[USERNS_USER_SZ];
   const char *channame;
   char key[KV_KEY_SZ];
   const char *msg;
@@ -505,13 +504,10 @@ irc_kick_unident_task(task_t *t)
     return;
   }
 
-  // Build MFA context string (nick!user@host format).
-  snprintf(mfa, sizeof(mfa), "%s!*@%s", kc->nick,
-      kc->host[0] ? kc->host : "*");
-
-  user = bot_session_find_ex(bot, inst, kc->nick, mfa, NULL);
-
-  if(user != NULL)
+  // Resolve via the method context map (real nick!user@host — the
+  // stateless resolver needs exact metadata, not a glob).
+  if(bot_identity_resolve(bot, inst, kc->nick, NULL,
+      ubuf, sizeof(ubuf)))
   {
     // User identified in time.
     mem_free(kc);
@@ -808,7 +804,7 @@ irc_handle_join(irc_state_t *st, const irc_parsed_msg_t *pp)
   char botname[METHOD_NAME_SZ] = {0};
   bot_inst_t *bot;
   char mfa[IRC_PREFIX_SZ];
-  const char *user;
+  char ubuf[USERNS_USER_SZ];
   uint32_t delay;
   irc_kick_check_t *kc;
 
@@ -853,10 +849,10 @@ irc_handle_join(irc_state_t *st, const irc_parsed_msg_t *pp)
   irc_botname_from_inst(st->inst_name, botname, sizeof(botname));
   bot = bot_find(botname);
   snprintf(mfa, sizeof(mfa), "%s!%s@%s", p.nick, p.user, p.host);
-  user = (bot != NULL) ?
-      bot_session_find_ex(bot, st->inst, p.nick, mfa, NULL) : NULL;
 
-  if(user != NULL)
+  if(bot != NULL &&
+     bot_identity_resolve(bot, st->inst, p.nick, mfa,
+        ubuf, sizeof(ubuf)))
     return;
 
   snprintf(key, sizeof(key), "%schan.%s.admin.kick_unident_delay",

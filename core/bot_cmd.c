@@ -484,7 +484,7 @@ admin_cmd_bot(const cmd_ctx_t *ctx)
 
 static void
 show_bots_cb(const char *name, const char *driver_name,
-    bot_state_t state, uint32_t method_count, uint32_t session_count,
+    bot_state_t state, uint32_t method_count,
     const char *userns_name, uint64_t cmd_count, time_t last_activity,
     void *data)
 {
@@ -502,10 +502,10 @@ show_bots_cb(const char *name, const char *driver_name,
   }
 
   snprintf(line, sizeof(line),
-      "  %-16s %-10s %s%-8s" CLR_RESET " %3u methods  %3u sessions  %5lu cmds  ns=%s",
+      "  %-16s %-10s %s%-8s" CLR_RESET " %3u methods  %5lu cmds  ns=%s",
       name, driver_name,
       state_color, bot_state_name(state),
-      method_count, session_count,
+      method_count,
       (unsigned long)cmd_count,
       userns_name ? userns_name : CLR_GRAY "\xe2\x80\x94" CLR_RESET);
 
@@ -965,40 +965,6 @@ cmd_show_bot(const cmd_ctx_t *ctx)
     cmd_reply(ctx, line);
   }
 
-  // Sessions.
-  snprintf(line, sizeof(line),
-      "  " CLR_CYAN "Sessions:" CLR_RESET "   %u", inst->session_count);
-  cmd_reply(ctx, line);
-
-  if(inst->session_count > 0)
-  {
-    for(bot_session_t *s = inst->sessions; s != NULL; s = s->next)
-    {
-      char age[32] = "n/a";
-
-      if(s->last_seen > 0)
-      {
-        time_t elapsed;
-
-        elapsed = time(NULL) - s->last_seen;
-        if(elapsed < 60)
-          snprintf(age, sizeof(age), "%lds ago", (long)elapsed);
-        else if(elapsed < 3600)
-          snprintf(age, sizeof(age), "%ldm ago", (long)(elapsed / 60));
-        else
-          snprintf(age, sizeof(age), "%ldh ago", (long)(elapsed / 3600));
-      }
-
-      {
-      const char *mname = s->method ? method_inst_name(s->method) : "?";
-
-      snprintf(line, sizeof(line),
-          "    %-20s on %-16s  last seen: %s",
-          s->username, mname, age);
-      cmd_reply(ctx, line);
-      }
-    }
-  }
 }
 
 // Ignore filters are bot-level and configured via KV directly:
@@ -1094,7 +1060,7 @@ bot_register_commands(void)
       "bot stop <name>",
       "Stop a bot",
       "Stops the named bot. Disconnects method instances,\n"
-      "clears sessions, and drains in-flight work.",
+      "and drains in-flight work.",
       USERNS_GROUP_ADMIN, 100, CMD_SCOPE_ANY, METHOD_T_ANY, admin_cmd_bot_stop, NULL, "bot", NULL,
       ad_bot_name, 1, NULL, NULL);
 
@@ -1121,7 +1087,7 @@ bot_register_commands(void)
       "show bots",
       "List all bot instances",
       "Shows a colorized table of all bot instances with state,\n"
-      "method count, session count, commands, and namespace.",
+      "method count, commands, and namespace.",
       USERNS_GROUP_ADMIN, 100, CMD_SCOPE_ANY, METHOD_T_ANY, cmd_show_bots, NULL, "show", NULL,
       NULL, 0, NULL, NULL);
 
@@ -1132,7 +1098,7 @@ bot_register_commands(void)
       "show bot <name> [<verb> [args...]]",
       "Show bot details or a kind-specific verb",
       "With just <name>, renders identity: state, autostart, methods,\n"
-      "sessions. With a trailing verb, dispatches to the first child of\n"
+      "identities. With a trailing verb, dispatches to the first child of\n"
       "show/bot whose name matches and whose kind_filter admits the\n"
       "bot's driver kind (llm: personas, memories, stats, candidates,\n"
       "knowledge, interests).",

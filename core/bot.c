@@ -42,52 +42,6 @@ bm_put(bot_method_t *m)
   bot_method_free_count++;
 }
 
-// Session freelist management.
-
-static bot_session_t *
-sess_get(void)
-{
-  bot_session_t *s;
-
-  if(bot_session_freelist != NULL)
-  {
-    s = bot_session_freelist;
-    bot_session_freelist = s->next;
-    bot_session_free_count--;
-    memset(s, 0, sizeof(*s));
-    return(s);
-  }
-
-  s = mem_alloc("bot", "session", sizeof(*s));
-  memset(s, 0, sizeof(*s));
-  return(s);
-}
-
-static void
-sess_put(bot_session_t *s)
-{
-  s->next = bot_session_freelist;
-  bot_session_freelist = s;
-  bot_session_free_count++;
-}
-
-// Clear all sessions from a bot instance. Caller must hold bot_mutex.
-static void
-sess_clear_locked(bot_inst_t *inst)
-{
-  bot_session_t *s = inst->sessions;
-
-  while(s != NULL)
-  {
-    bot_session_t *next = s->next;
-    sess_put(s);
-    s = next;
-  }
-
-  inst->sessions = NULL;
-  inst->session_count = 0;
-}
-
 // Internal message forwarding callback.
 // This is the method_msg_cb_t registered with method_subscribe().
 // data points to the bot_inst_t.
@@ -606,7 +560,8 @@ bot_create(const bot_driver_t *drv, const char *name)
 
     snprintf(key, sizeof(key), "bot.%s.maxidleauth", name);
     kv_register(key, KV_UINT32, "3600", NULL, NULL,
-        "Seconds before idle authenticated sessions expire (0=never)");
+        "Seconds a temporary identity survives idle before it "
+        "lazily expires (0=never)");
 
     snprintf(key, sizeof(key), "bot.%s.userdiscovery", name);
     kv_register(key, KV_BOOL, "false", NULL, NULL,
@@ -666,8 +621,6 @@ bot_destroy(const char *name)
     // Inline stop logic to avoid recursive lock.
     inst->state = BOT_STOPPING;
 
-    // Clear all active sessions.
-    sess_clear_locked(inst);
 
     if(inst->driver != NULL && inst->driver->stop != NULL)
       inst->driver->stop(inst->handle);
@@ -1002,337 +955,103 @@ bot_clear_userns(const char *ns_name)
   #undef MAX_CLEARED_BOTS
 }
 
-// Session tracking
+// Identity
 
-userns_auth_t
-bot_session_auth(bot_inst_t *inst, method_inst_t *method,
-    const char *sender, const char *username, const char *password)
-{
-  userns_t     *ns;
-  char          ctx[USERNS_MCTX_SZ] = {0};
-  userns_auth_t result;
-
-  if(inst == NULL || method == NULL || sender == NULL ||
-     sender[0] == '\0' || username == NULL || password == NULL)
-    return(USERNS_AUTH_ERR);
-
-  pthread_mutex_lock(&bot_mutex);
-
-  if(inst->state != BOT_RUNNING)
-  {
-    pthread_mutex_unlock(&bot_mutex);
-    clam(CLAM_WARN, "bot_session_auth",
-        "'%s': not running", inst->name);
-    return(USERNS_AUTH_ERR);
-  }
-
-  if(inst->userns == NULL)
-  {
-    pthread_mutex_unlock(&bot_mutex);
-    clam(CLAM_WARN, "bot_session_auth",
-        "'%s': no user namespace bound", inst->name);
-    return(USERNS_AUTH_ERR);
-  }
-
-  ns = inst->userns;
-  pthread_mutex_unlock(&bot_mutex);
-
-  // Get method context for logging (outside lock — method has own lock).
-  method_get_context(method, sender, ctx, sizeof(ctx));
-
-  // Authenticate against the user namespace.
-  result = userns_auth(ns, username, password,
-      ctx[0] != '\0' ? ctx : NULL);
-
-  if(result != USERNS_AUTH_OK)
-    return(result);
-
-  // Auth succeeded — create or update session.
-  pthread_mutex_lock(&bot_mutex);
-
-  // Check for existing session on this method+sender.
-  for(bot_session_t *s = inst->sessions; s != NULL; s = s->next)
-  {
-    if(s->method == method &&
-       strncasecmp(s->sender, sender, METHOD_SENDER_SZ) == 0)
-    {
-      // Replace existing session (re-auth or different user).
-      strncpy(s->username, username, USERNS_USER_SZ - 1);
-      s->username[USERNS_USER_SZ - 1] = '\0';
-      s->login_time = time(NULL);
-      s->auth_time  = s->login_time;
-      s->last_seen  = s->login_time;
-
-      pthread_mutex_unlock(&bot_mutex);
-      clam(CLAM_INFO, "bot_session_auth",
-          "'%s': session updated for '%s' on %s (%s)",
-          inst->name, username,
-          method_inst_name(method), sender);
-      return(USERNS_AUTH_OK);
-    }
-  }
-
-  // No existing session — check limit.
-  if(inst->session_count >= bot_cfg.max_sessions)
-  {
-    pthread_mutex_unlock(&bot_mutex);
-    clam(CLAM_WARN, "bot_session_auth",
-        "'%s': session limit reached (%u)", inst->name, bot_cfg.max_sessions);
-    return(USERNS_AUTH_ERR);
-  }
-
-  // Create new session.
-  {
-    bot_session_t *s = sess_get();
-    strncpy(s->username, username, USERNS_USER_SZ - 1);
-    s->username[USERNS_USER_SZ - 1] = '\0';
-    s->method = method;
-    strncpy(s->sender, sender, METHOD_SENDER_SZ - 1);
-    s->sender[METHOD_SENDER_SZ - 1] = '\0';
-    s->login_time = time(NULL);
-    s->auth_time  = s->login_time;
-    s->last_seen  = s->login_time;
-
-    // Prepend to list.
-    s->next = inst->sessions;
-    inst->sessions = s;
-    inst->session_count++;
-  }
-
-  pthread_mutex_unlock(&bot_mutex);
-
-  clam(CLAM_INFO, "bot_session_auth",
-      "'%s': session created for '%s' on %s (%s)",
-      inst->name, username,
-      method_inst_name(method), sender);
-  return(USERNS_AUTH_OK);
-}
-
+// Stateless per-message identity resolution. Two checks against the
+// message's own metadata, in order: an exact temporary-MFA match
+// (minted by !identify; lazy expiry — the first resolve past the idle
+// window deletes the entry, and the one-time "identity expired" notice
+// rides this call), then a permanent MFA pattern match gated on the
+// user's autoidentify flag. No cache of the result exists anywhere:
+// every message answers for itself.
+//
+// metadata may be NULL/empty; the method's context map is consulted
+// for the sender in that case (third-party lookups by nick).
 bool
-bot_session_create(bot_inst_t *inst, method_inst_t *method,
-    const char *sender, const char *username)
+bot_identity_resolve(bot_inst_t *inst, method_inst_t *method,
+    const char *sender, const char *metadata,
+    char *user_out, size_t user_sz)
 {
-  if(inst == NULL || method == NULL || sender == NULL ||
-     sender[0] == '\0' || username == NULL)
-    return(FAIL);
-
-  pthread_mutex_lock(&bot_mutex);
-
-  if(inst->state != BOT_RUNNING)
-  {
-    pthread_mutex_unlock(&bot_mutex);
-    return(FAIL);
-  }
-
-  // Check for existing session on this method+sender.
-  for(bot_session_t *s = inst->sessions; s != NULL; s = s->next)
-  {
-    if(s->method == method &&
-       strncasecmp(s->sender, sender, METHOD_SENDER_SZ) == 0)
-    {
-      strncpy(s->username, username, USERNS_USER_SZ - 1);
-      s->username[USERNS_USER_SZ - 1] = '\0';
-      s->login_time = time(NULL);
-      s->auth_time  = s->login_time;
-      s->last_seen  = s->login_time;
-
-      pthread_mutex_unlock(&bot_mutex);
-      clam(CLAM_INFO, "bot_session_create",
-          "'%s': autoidentify session updated for '%s' on %s (%s)",
-          inst->name, username,
-          method_inst_name(method), sender);
-      return(SUCCESS);
-    }
-  }
-
-  // No existing session — check limit.
-  if(inst->session_count >= bot_cfg.max_sessions)
-  {
-    pthread_mutex_unlock(&bot_mutex);
-    clam(CLAM_WARN, "bot_session_create",
-        "'%s': session limit reached (%u)", inst->name, bot_cfg.max_sessions);
-    return(FAIL);
-  }
-
-  // Create new session.
-  {
-    bot_session_t *s = sess_get();
-    strncpy(s->username, username, USERNS_USER_SZ - 1);
-    s->username[USERNS_USER_SZ - 1] = '\0';
-    s->method = method;
-    strncpy(s->sender, sender, METHOD_SENDER_SZ - 1);
-    s->sender[METHOD_SENDER_SZ - 1] = '\0';
-    s->login_time = time(NULL);
-    s->auth_time  = s->login_time;
-    s->last_seen  = s->login_time;
-
-    s->next = inst->sessions;
-    inst->sessions = s;
-    inst->session_count++;
-  }
-
-  pthread_mutex_unlock(&bot_mutex);
-
-  clam(CLAM_INFO, "bot_session_create",
-      "'%s': autoidentify session created for '%s' on %s (%s)",
-      inst->name, username,
-      method_inst_name(method), sender);
-  return(SUCCESS);
-}
-
-const char *
-bot_session_find(const bot_inst_t *inst,
-    const method_inst_t *method, const char *sender)
-{
-  if(inst == NULL || method == NULL || sender == NULL || sender[0] == '\0')
-    return(NULL);
-
-  pthread_mutex_lock(&bot_mutex);
-
-  for(bot_session_t *s = inst->sessions; s != NULL; s = s->next)
-  {
-    if(s->method == method &&
-       strncasecmp(s->sender, sender, METHOD_SENDER_SZ) == 0)
-    {
-      const char *name;
-
-      s->last_seen = time(NULL);
-      name = s->username;
-      pthread_mutex_unlock(&bot_mutex);
-      return(name);
-    }
-  }
-
-  pthread_mutex_unlock(&bot_mutex);
-  return(NULL);
-}
-
-const char *
-bot_session_get_userns_cd(const bot_inst_t *inst,
-    const method_inst_t *method, const char *sender)
-{
-  if(inst == NULL || method == NULL || sender == NULL || sender[0] == '\0')
-    return("");
-
-  pthread_mutex_lock(&bot_mutex);
-
-  for(bot_session_t *s = inst->sessions; s != NULL; s = s->next)
-  {
-    if(s->method == method &&
-       strncasecmp(s->sender, sender, METHOD_SENDER_SZ) == 0)
-    {
-      const char *cd = s->userns_cd;
-      pthread_mutex_unlock(&bot_mutex);
-      return(cd);
-    }
-  }
-
-  pthread_mutex_unlock(&bot_mutex);
-  return("");
-}
-
-bool
-bot_session_set_userns_cd(bot_inst_t *inst,
-    const method_inst_t *method, const char *sender,
-    const char *ns_name)
-{
-  if(inst == NULL || method == NULL || sender == NULL || sender[0] == '\0')
-    return(FAIL);
-
-  pthread_mutex_lock(&bot_mutex);
-
-  for(bot_session_t *s = inst->sessions; s != NULL; s = s->next)
-  {
-    if(s->method == method &&
-       strncasecmp(s->sender, sender, METHOD_SENDER_SZ) == 0)
-    {
-      if(ns_name == NULL || ns_name[0] == '\0')
-        s->userns_cd[0] = '\0';
-      else
-      {
-        strncpy(s->userns_cd, ns_name, USERNS_NAME_SZ - 1);
-        s->userns_cd[USERNS_NAME_SZ - 1] = '\0';
-      }
-
-      pthread_mutex_unlock(&bot_mutex);
-      return(SUCCESS);
-    }
-  }
-
-  pthread_mutex_unlock(&bot_mutex);
-  return(FAIL);
-}
-
-const char *
-bot_session_find_ex(const bot_inst_t *inst,
-    const method_inst_t *method, const char *sender,
-    const char *mfa_string, bool *is_authed)
-{
-  const char *user;
   userns_t   *ns;
+  char        meta[METHOD_META_SZ];
+  char        user[USERNS_USER_SZ];
   const char *matched;
+  uint32_t    timeout = 0;
 
-  // First try the normal authenticated session lookup.
-  user = bot_session_find(inst, method, sender);
+  if(user_out != NULL && user_sz > 0)
+    user_out[0] = '\0';
 
-  if(user != NULL)
-  {
-    if(is_authed != NULL)
-      *is_authed = true;
-    return(user);
-  }
-
-  // No authenticated session. Try MFA pattern matching if we have
-  // a namespace and an MFA string to match against.
-  if(mfa_string == NULL || mfa_string[0] == '\0' || inst == NULL)
-    return(NULL);
+  if(inst == NULL || user_out == NULL || user_sz == 0)
+    return(false);
 
   ns = bot_get_userns(inst);
 
   if(ns == NULL)
-    return(NULL);
+    return(false);
 
-  matched = userns_mfa_match(ns, mfa_string);
+  meta[0] = '\0';
 
-  if(matched != NULL)
+  if(metadata != NULL && metadata[0] != '\0')
+    snprintf(meta, sizeof(meta), "%s", metadata);
+
+  else if(method != NULL && sender != NULL && sender[0] != '\0')
   {
-    if(is_authed != NULL)
-      *is_authed = false;
-    return(matched);
+    char host[METHOD_META_SZ] = {0};
+
+    if(method_get_context(method, sender, host, sizeof(host)) == SUCCESS
+        && host[0] != '\0')
+      snprintf(meta, sizeof(meta), "%s!%s", sender, host);
   }
 
-  return(NULL);
-}
+  if(meta[0] == '\0')
+    return(false);
 
-bool
-bot_session_refresh_mfa(bot_inst_t *inst, method_inst_t *method,
-    const char *username)
-{
-  char user[USERNS_USER_SZ];
-
-  if(inst == NULL || method == NULL || username == NULL || username[0] == '\0')
-    return(FAIL);
-
-  // Copy username immediately — the caller may have passed a pointer
-  // from userns_mfa_match()'s static buffer which can be overwritten.
-  strncpy(user, username, USERNS_USER_SZ - 1);
-  user[USERNS_USER_SZ - 1] = '\0';
-
-  pthread_mutex_lock(&bot_mutex);
-
-  for(bot_session_t *s = inst->sessions; s != NULL; s = s->next)
+  // Effective idle window: per-method identtimeout wins, then the
+  // bot-level maxidleauth; 0 = temporary identities never expire.
   {
-    if(s->method == method &&
-       strncasecmp(s->username, user, USERNS_USER_SZ) == 0)
+    const char *kind = (method != NULL) ? method_inst_kind(method) : NULL;
+    char        key[KV_KEY_SZ];
+
+    if(kind != NULL)
     {
-      s->last_seen = time(NULL);
-      pthread_mutex_unlock(&bot_mutex);
-      return(SUCCESS);
+      snprintf(key, sizeof(key), "bot.%s.%s.identtimeout",
+          inst->name, kind);
+      timeout = (uint32_t)kv_get_uint(key);
+    }
+
+    if(timeout == 0)
+    {
+      snprintf(key, sizeof(key), "bot.%s.maxidleauth", inst->name);
+      timeout = (uint32_t)kv_get_uint(key);
     }
   }
 
-  pthread_mutex_unlock(&bot_mutex);
-  return(FAIL);
+  switch(userns_tmfa_resolve(ns, meta, timeout, user, sizeof(user)))
+  {
+    case TMFA_OK:
+      snprintf(user_out, user_sz, "%s", user);
+      return(true);
+
+    case TMFA_EXPIRED:
+      if(method != NULL && sender != NULL && sender[0] != '\0')
+        method_send(method, sender,
+            "Your identity has expired. "
+            "Use identify to re-authenticate.");
+      break;
+
+    case TMFA_NONE:
+      break;
+  }
+
+  matched = userns_mfa_match(ns, meta);
+
+  if(matched != NULL && userns_user_get_autoidentify(ns, matched))
+  {
+    snprintf(user_out, user_sz, "%s", matched);
+    return(true);
+  }
+
+  return(false);
 }
 
 const char *
@@ -1422,99 +1141,6 @@ bot_discover_user(bot_inst_t *inst, const char *mfa_string)
   strncpy(discovered, candidate, USERNS_USER_SZ - 1);
   discovered[USERNS_USER_SZ - 1] = '\0';
   return(discovered);
-}
-
-bool
-bot_session_remove(bot_inst_t *inst, const method_inst_t *method,
-    const char *sender)
-{
-  bot_session_t *s, *prev = NULL;
-
-  if(inst == NULL || method == NULL || sender == NULL || sender[0] == '\0')
-    return(FAIL);
-
-  pthread_mutex_lock(&bot_mutex);
-
-  for(s = inst->sessions; s != NULL; prev = s, s = s->next)
-  {
-    if(s->method == method &&
-       strncasecmp(s->sender, sender, METHOD_SENDER_SZ) == 0)
-    {
-      if(prev != NULL)
-        prev->next = s->next;
-      else
-        inst->sessions = s->next;
-
-      {
-        char uname[USERNS_USER_SZ];
-
-        inst->session_count--;
-        strncpy(uname, s->username, USERNS_USER_SZ);
-
-        sess_put(s);
-
-        pthread_mutex_unlock(&bot_mutex);
-
-        clam(CLAM_INFO, "bot_session_remove",
-            "'%s': removed session for '%s' on %s (%s)",
-            inst->name, uname,
-            method_inst_name(method), sender);
-        return(SUCCESS);
-      }
-    }
-  }
-
-  pthread_mutex_unlock(&bot_mutex);
-  return(FAIL);
-}
-
-void
-bot_session_clear(bot_inst_t *inst)
-{
-  uint32_t count;
-
-  if(inst == NULL)
-    return;
-
-  pthread_mutex_lock(&bot_mutex);
-
-  count = inst->session_count;
-  sess_clear_locked(inst);
-
-  pthread_mutex_unlock(&bot_mutex);
-
-  if(count > 0)
-    clam(CLAM_DEBUG, "bot_session_clear",
-        "'%s': cleared %u sessions", inst->name, count);
-}
-
-uint32_t
-bot_session_count(const bot_inst_t *inst)
-{
-  if(inst == NULL)
-    return(0);
-
-  return(inst->session_count);
-}
-
-void
-bot_session_iterate(const bot_inst_t *inst,
-    bot_session_iter_cb_t cb, void *data)
-{
-  if(inst == NULL || cb == NULL)
-    return;
-
-  pthread_mutex_lock(&bot_mutex);
-
-  for(bot_session_t *s = inst->sessions; s != NULL; s = s->next)
-  {
-    const char *mname = (s->method != NULL)
-        ? method_inst_name(s->method) : "(unknown)";
-
-    cb(s->username, mname, s->auth_time, s->last_seen, data);
-  }
-
-  pthread_mutex_unlock(&bot_mutex);
 }
 
 // Lifecycle
@@ -1663,9 +1289,6 @@ bot_stop(bot_inst_t *inst)
 
   inst->state = BOT_STOPPING;
 
-  // Clear all active sessions.
-  sess_clear_locked(inst);
-
   // Call driver stop(). NULL while a reload holds the driver — the
   // suspend already stopped it.
   if(inst->driver != NULL && inst->driver->stop != NULL)
@@ -1730,7 +1353,6 @@ bot_get_stats(bot_stats_t *out)
 
   out->instances        = bot_count;
   out->running          = 0;
-  out->sessions         = 0;
   out->methods          = 0;
   out->discovered_users = bot_stat_discoveries;
 
@@ -1738,7 +1360,6 @@ bot_get_stats(bot_stats_t *out)
   {
     if(b->state == BOT_RUNNING)
       out->running++;
-    out->sessions += b->session_count;
     out->methods  += b->method_count;
   }
 
@@ -1760,7 +1381,6 @@ typedef struct
   char        driver_name[BOT_NAME_SZ];
   bot_state_t state;
   uint32_t    method_count;
-  uint32_t    session_count;
   char        userns_name[USERNS_NAME_SZ];
   bool        has_userns;
   uint64_t    cmd_count;
@@ -1794,7 +1414,6 @@ bot_iterate(bot_iter_cb_t cb, void *data)
     snprintf(s->driver_name, sizeof(s->driver_name), "%s", drv_name);
     s->state         = b->state;
     s->method_count  = b->method_count;
-    s->session_count = b->session_count;
     s->has_userns    = (b->userns != NULL);
 
     if(s->has_userns)
@@ -1812,7 +1431,7 @@ bot_iterate(bot_iter_cb_t cb, void *data)
 
   for(i = 0; i < count; i++)
     cb(snap[i].name, snap[i].driver_name, snap[i].state,
-        snap[i].method_count, snap[i].session_count,
+        snap[i].method_count,
         snap[i].has_userns ? snap[i].userns_name : NULL,
         snap[i].cmd_count, snap[i].last_activity, data);
 
@@ -2209,16 +1828,14 @@ bot_init(void)
 // KV configuration
 
 // Load bot configuration values from KV into bot_cfg. Clamps
-// max_methods to [1, 64] and max_sessions to >= 1.
+// max_methods to [1, 64].
 static void
 bot_load_config(void)
 {
-  bot_cfg.max_methods  = (uint32_t)kv_get_uint("core.bot.max_methods");
-  bot_cfg.max_sessions = (uint32_t)kv_get_uint("core.bot.max_sessions");
+  bot_cfg.max_methods = (uint32_t)kv_get_uint("core.bot.max_methods");
 
   if(bot_cfg.max_methods < 1)   bot_cfg.max_methods = 1;
   if(bot_cfg.max_methods > 64)  bot_cfg.max_methods = 64;
-  if(bot_cfg.max_sessions < 1)  bot_cfg.max_sessions = 1;
 }
 
 static void
@@ -2229,156 +1846,16 @@ bot_kv_changed(const char *key, void *data)
   bot_load_config();
 }
 
-// Session idle expiry
 
-// One pending expiry notification, captured under bot_mutex and
-// emitted after the lock is released (clam() + method_send() both log
-// -> re-enter bot_mutex via clam_cmd_shared_cb -> bot_find).
-typedef struct
-{
-  char           bot_name[BOT_NAME_SZ];
-  char           username[USERNS_USER_SZ];
-  char           sender[METHOD_SENDER_SZ];
-  method_inst_t *method;
-  userns_t      *userns;
-  long           idle;
-  uint32_t       timeout;
-} reaper_notify_t;
-
-// Periodic task callback: scan all running bot instances and expire
-// sessions where (now - last_seen) exceeds the bot's maxidleauth.
-static void
-bot_session_reaper(task_t *t)
-{
-  #define MAX_REAP_PER_TICK 64
-
-  reaper_notify_t notify[MAX_REAP_PER_TICK];
-  uint32_t        nn = 0;
-  uint32_t        i;
-  time_t          now = time(NULL);
-
-  pthread_mutex_lock(&bot_mutex);
-
-  for(bot_inst_t *inst = bot_list;
-      inst != NULL && nn < MAX_REAP_PER_TICK; inst = inst->next)
-  {
-    char           key[KV_KEY_SZ];
-    uint32_t       maxidle;
-    bot_session_t *s;
-    bot_session_t *prev = NULL;
-
-    if(inst->state != BOT_RUNNING || inst->sessions == NULL)
-      continue;
-
-    // Read per-bot maxidleauth (0 = never expire).
-    snprintf(key, sizeof(key), "bot.%s.maxidleauth", inst->name);
-    maxidle = (uint32_t)kv_get_uint(key);
-
-    s = inst->sessions;
-
-    while(s != NULL && nn < MAX_REAP_PER_TICK)
-    {
-      bot_session_t *next = s->next;
-      uint32_t       timeout = 0;
-      const char    *kind = method_inst_kind(s->method);
-
-      // Determine effective timeout: per-method identtimeout takes
-      // precedence, falling back to per-bot maxidleauth.
-
-      if(kind != NULL)
-      {
-        char tkey[KV_KEY_SZ];
-        snprintf(tkey, sizeof(tkey), "bot.%s.%s.identtimeout",
-            inst->name, kind);
-        timeout = (uint32_t)kv_get_uint(tkey);
-      }
-
-      if(timeout == 0)
-        timeout = maxidle;
-
-      if(timeout == 0)
-      {
-        prev = s;
-        s = next;
-        continue;
-      }
-
-      if((now - s->last_seen) > (time_t)timeout)
-      {
-        // Capture the notification before sess_put recycles s; emit
-        // clam()/method_send() after unlock.
-        reaper_notify_t *rn = &notify[nn++];
-
-        snprintf(rn->bot_name, sizeof(rn->bot_name), "%s", inst->name);
-        snprintf(rn->username, sizeof(rn->username), "%s", s->username);
-        snprintf(rn->sender,   sizeof(rn->sender),   "%s", s->sender);
-        rn->method  = s->method;
-        rn->userns  = inst->userns;
-        rn->idle    = (long)(now - s->last_seen);
-        rn->timeout = timeout;
-
-        // Unlink.
-        if(prev != NULL)
-          prev->next = next;
-        else
-          inst->sessions = next;
-
-        inst->session_count--;
-
-        // Return to freelist (copies above already taken).
-        sess_put(s);
-      }
-
-      else
-        prev = s;
-
-      s = next;
-    }
-  }
-
-  pthread_mutex_unlock(&bot_mutex);
-
-  for(i = 0; i < nn; i++)
-  {
-    clam(CLAM_INFO, "bot_session_reaper",
-        "'%s': expired session for '%s' on %s (%s) "
-        "(idle %ld sec, limit %u sec)",
-        notify[i].bot_name, notify[i].username,
-        method_inst_name(notify[i].method), notify[i].sender,
-        notify[i].idle, notify[i].timeout);
-
-    // Notify the user that their identity expired — but skip it when
-    // autoidentify is enabled: their next line silently re-authenticates,
-    // so the message would only be noise. Checked here, after the lock is
-    // released, to keep the DB query off the bot_mutex hot path.
-    if(userns_user_get_autoidentify(notify[i].userns, notify[i].username))
-      continue;
-
-    method_send(notify[i].method, notify[i].sender,
-        "Your identity has expired. "
-        "Use identify to re-authenticate.");
-  }
-
-  t->state = TASK_ENDED;
-
-  #undef MAX_REAP_PER_TICK
-}
-
-// Register bot subsystem KV keys and load initial values. Also
-// starts the periodic session reaper task. Must be called after
-// kv_init() and kv_load().
+// Register bot subsystem KV keys and load initial values. Must be
+// called after kv_init() and kv_load().
 void
 bot_register_config(void)
 {
   kv_register("core.bot.max_methods",  KV_UINT32, "16",  bot_kv_changed, NULL,
       "Maximum number of method bindings per bot");
-  kv_register("core.bot.max_sessions", KV_UINT32, "256", bot_kv_changed, NULL,
-      "Maximum concurrent authenticated sessions across all bots");
   bot_load_config();
 
-  // Start periodic session reaper (every 60 seconds).
-  task_add_periodic("bot_session_reaper", TASK_ANY, 200,
-      60000, bot_session_reaper, NULL);
 }
 
 // Per-bot method KV registration
@@ -2711,8 +2188,7 @@ bot_restore(void)
 }
 
 // Shut down the bot subsystem. Stops and destroys all instances,
-// frees the method binding and session freelists, and destroys
-// the mutex.
+// frees the method binding freelist, and destroys the mutex.
 void
 bot_exit(void)
 {
@@ -2720,9 +2196,8 @@ bot_exit(void)
     return;
 
   clam(CLAM_INFO, "bot_exit",
-      "shutting down (%u instances, %u freelisted bindings, "
-      "%u freelisted sessions)",
-      bot_count, bot_method_free_count, bot_session_free_count);
+      "shutting down (%u instances, %u freelisted bindings)",
+      bot_count, bot_method_free_count);
 
   bot_ready = false;
 
@@ -2749,21 +2224,6 @@ bot_exit(void)
 
   bot_method_freelist = NULL;
   bot_method_free_count = 0;
-
-  // Free the session freelist.
-  {
-    bot_session_t *s = bot_session_freelist;
-
-    while(s != NULL)
-    {
-      bot_session_t *next = s->next;
-      mem_free(s);
-      s = next;
-    }
-  }
-
-  bot_session_freelist = NULL;
-  bot_session_free_count = 0;
 
   pthread_mutex_destroy(&bot_mutex);
 }

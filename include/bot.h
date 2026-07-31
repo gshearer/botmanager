@@ -45,7 +45,6 @@ typedef struct
 {
   uint32_t instances;         // total bot instances
   uint32_t running;           // instances in BOT_RUNNING state
-  uint32_t sessions;          // total active sessions across all instances
   uint32_t methods;           // total bound methods across all bots
   uint32_t discovered_users;  // lifetime discovered users
   uint64_t cmd_dispatches;    // lifetime successful command dispatches
@@ -79,41 +78,15 @@ userns_t *bot_get_userns(const bot_inst_t *inst);
 // Used when a namespace is deleted. Works regardless of bot state.
 void bot_clear_userns(const char *ns_name);
 
-// Authenticate a user and create an active session. Uses the bot's
-// bound user namespace for credential verification. If the sender
-// already has a session on this method, it is replaced.
-// Anonymous-by-default: no session exists until this succeeds.
-// Returns USERNS_AUTH_ERR if no namespace is bound or limits exceeded.
-userns_auth_t bot_session_auth(bot_inst_t *inst, method_inst_t *method,
-    const char *sender, const char *username, const char *password);
-
-// Create an authenticated session without password verification.
-// Used by the autoidentify system when a user's MFA pattern matches
-// and their autoidentify flag is enabled. Bot must be RUNNING.
-bool bot_session_create(bot_inst_t *inst, method_inst_t *method,
-    const char *sender, const char *username);
-
-// Primary lookup used by bots to check if a message sender is
-// authenticated. Returns authenticated username, or NULL if anonymous.
-const char *bot_session_find(const bot_inst_t *inst,
-    const method_inst_t *method, const char *sender);
-
-// Extended session lookup with MFA fallback. First checks for an
-// authenticated session (same as bot_session_find). If none is found
-// and the bot has a user namespace, attempts MFA pattern matching
-// against the sender's full method context (e.g., "nick!user@host").
-// is_authed (if non-NULL) is set to true for authenticated sessions,
-// false for MFA-matched-but-not-authenticated users.
-const char *bot_session_find_ex(const bot_inst_t *inst,
-    const method_inst_t *method, const char *sender,
-    const char *mfa_string, bool *is_authed);
-
-// Refresh the last_seen timestamp on a session matching a given
-// username and method. Called when the bot witnesses activity from
-// a user whose MFA string matches an active session, extending
-// their identity cache.
-bool bot_session_refresh_mfa(bot_inst_t *inst, method_inst_t *method,
-    const char *username);
+// Stateless per-message identity resolution: exact temporary-MFA
+// match first (lazy expiry — the one-time "identity expired" notice
+// rides this call), then permanent MFA pattern gated on the user's
+// autoidentify flag. metadata may be NULL/empty; the method context
+// map is consulted for the sender in that case. Fills user_out and
+// returns true when identified; false means anonymous.
+bool bot_identity_resolve(bot_inst_t *inst, method_inst_t *method,
+    const char *sender, const char *metadata,
+    char *user_out, size_t user_sz);
 
 // Attempt user discovery from an MFA string. If the bot has user
 // discovery enabled (bot.<name>.userdiscovery != 0), a user namespace
@@ -121,30 +94,6 @@ bool bot_session_refresh_mfa(bot_inst_t *inst, method_inst_t *method,
 // creates a user from the handle portion of the MFA string, adds the
 // MFA pattern, and returns the new username (static buffer).
 const char *bot_discover_user(bot_inst_t *inst, const char *mfa_string);
-
-// Logout — identified by method + sender.
-bool bot_session_remove(bot_inst_t *inst, const method_inst_t *method,
-    const char *sender);
-
-void bot_session_clear(bot_inst_t *inst);
-uint32_t bot_session_count(const bot_inst_t *inst);
-
-typedef void (*bot_session_iter_cb_t)(const char *username,
-    const char *method_name, time_t auth_time, time_t last_seen,
-    void *data);
-
-// Locks bot_mutex for the duration of the iteration.
-void bot_session_iterate(const bot_inst_t *inst,
-    bot_session_iter_cb_t cb, void *data);
-
-// Returns namespace name, or empty string if not set.
-const char *bot_session_get_userns_cd(const bot_inst_t *inst,
-    const method_inst_t *method, const char *sender);
-
-// ns_name NULL or empty clears.
-bool bot_session_set_userns_cd(bot_inst_t *inst,
-    const method_inst_t *method, const char *sender,
-    const char *ns_name);
 
 // Resolves and subscribes to all bound methods, calls driver start().
 // Transitions CREATED -> RUNNING.
@@ -160,7 +109,7 @@ const char *bot_state_name(bot_state_t s);
 void bot_get_stats(bot_stats_t *out);
 
 typedef void (*bot_iter_cb_t)(const char *name, const char *driver_name,
-    bot_state_t state, uint32_t method_count, uint32_t session_count,
+    bot_state_t state, uint32_t method_count,
     const char *userns_name, uint64_t cmd_count, time_t last_activity,
     void *data);
 
@@ -382,18 +331,6 @@ typedef struct bot_method
   struct bot_method *next;
 } bot_method_t;
 
-typedef struct bot_session
-{
-  char                username[USERNS_USER_SZ];    // authenticated username
-  method_inst_t      *method;                      // method authenticated on
-  char                sender[METHOD_SENDER_SZ];    // protocol-level sender
-  time_t              login_time;                   // session creation time
-  time_t              auth_time;                    // authentication timestamp
-  time_t              last_seen;                    // last activity timestamp
-  char                userns_cd[USERNS_NAME_SZ];   // /user cd override (empty = use bot default)
-  struct bot_session *next;
-} bot_session_t;
-
 // Per-bot ring of last-witnessed public lines, keyed by (method, channel).
 // Bounded and round-robin — a bot spanning more channels than slots keeps
 // the most-recently-active ones. Read/written under bot_witness_lock.
@@ -435,8 +372,6 @@ struct bot_inst
   bot_method_t          *methods;      // linked list of bound methods
   uint32_t               method_count;
   userns_t              *userns;       // optional user namespace
-  bot_session_t         *sessions;     // active authenticated sessions
-  uint32_t               session_count;
   uint64_t               msg_count;    // total messages received
   uint64_t               cmd_count;    // total commands dispatched
   time_t                 last_activity; // last message received
@@ -449,12 +384,10 @@ struct bot_inst
 typedef struct
 {
   uint32_t max_methods;
-  uint32_t max_sessions;
 } bot_cfg_t;
 
 static bot_cfg_t bot_cfg = {
-  .max_methods  = 16,
-  .max_sessions = 256,
+  .max_methods = 16,
 };
 
 static bot_inst_t      *bot_list  = NULL;
@@ -469,8 +402,6 @@ static bool             bot_ready = false;
 static bot_method_t    *bot_method_freelist    = NULL;
 static uint32_t         bot_method_free_count  = 0;
 
-static bot_session_t   *bot_session_freelist   = NULL;
-static uint32_t         bot_session_free_count = 0;
 
 static uint32_t         bot_stat_discoveries   = 0;
 

@@ -1293,6 +1293,7 @@ cmd_permits(bot_inst_t *inst, const method_msg_t *msg, const cmd_def_t *def)
 {
   method_type_t inst_type;
   const char *username;
+  char ubuf[USERNS_USER_SZ];
   userns_t   *ns;
 
   if(inst == NULL || msg == NULL || def == NULL)
@@ -1326,7 +1327,8 @@ cmd_permits(bot_inst_t *inst, const method_msg_t *msg, const cmd_def_t *def)
   // Permission gate: same formula as cmd_dispatch. Unauthenticated
   // callers are implicit members of "everyone" at level 0; authenticated
   // callers resolve through the bot's userns.
-  username = bot_session_find(inst, msg->inst, msg->sender);
+  username = bot_identity_resolve(inst, msg->inst, msg->sender,
+      msg->metadata, ubuf, sizeof(ubuf)) ? ubuf : NULL;
   ns       = (username != NULL) ? bot_get_userns(inst) : NULL;
 
   return(check_permission(ns, username, def->group, def->level));
@@ -1353,6 +1355,7 @@ cmd_dispatch(bot_inst_t *inst, const method_msg_t *msg)
   uint8_t arg_count;
   const char *usage;
   const char *username;
+  char ubuf[USERNS_USER_SZ];
   userns_t *ns_for_check;
   cmd_task_data_t *td;
   char task_name[TASK_NAME_SZ];
@@ -1518,7 +1521,8 @@ cmd_dispatch(bot_inst_t *inst, const method_msg_t *msg)
   pthread_mutex_unlock(&cmd_mutex);
 
   // Permission checking (done outside lock).
-  username = bot_session_find(inst, msg->inst, msg->sender);
+  username = bot_identity_resolve(inst, msg->inst, msg->sender,
+      msg->metadata, ubuf, sizeof(ubuf)) ? ubuf : NULL;
 
   // Scope enforcement: reject commands used in the wrong context.
   // Private-only commands must not be used in public channels, and
@@ -2424,11 +2428,13 @@ cmd_dispatch_resolved(bot_inst_t *inst, const method_msg_t *msg,
   task_t          *t;
   char             task_name[CMD_NAME_SZ + 8];
   const char      *username;
+  char             ubuf[USERNS_USER_SZ];
 
   if(inst == NULL || msg == NULL || def == NULL || def->cb == NULL)
     return(FAIL);
 
-  username = bot_session_find(inst, msg->inst, msg->sender);
+  username = bot_identity_resolve(inst, msg->inst, msg->sender,
+      msg->metadata, ubuf, sizeof(ubuf)) ? ubuf : NULL;
 
   td = mem_alloc("cmd", "task_data", sizeof(*td));
   memset(td, 0, sizeof(*td));

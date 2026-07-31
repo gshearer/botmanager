@@ -25,20 +25,24 @@ memory_resolve_ns(const cmd_ctx_t *ctx)
 {
   if(ctx->bot != NULL && ctx->msg != NULL && ctx->msg->inst != NULL)
   {
-    const char *cd_name = bot_session_get_userns_cd(ctx->bot,
-        ctx->msg->inst, ctx->msg->sender);
-    userns_t *ns;
+    userns_t *bound = bot_get_userns(ctx->bot);
 
-    if(cd_name != NULL && cd_name[0] != '\0')
+    if(bound != NULL && ctx->username != NULL)
     {
-      userns_t *ns = userns_find(cd_name);
-      if(ns != NULL)
-        return(ns);
+      char cd_name[USERNS_NAME_SZ];
+
+      if(userns_user_get_cd(bound, ctx->username,
+            cd_name, sizeof(cd_name)) == SUCCESS && cd_name[0] != '\0')
+      {
+        userns_t *ns = userns_find(cd_name);
+
+        if(ns != NULL)
+          return(ns);
+      }
     }
 
-    ns = bot_get_userns(ctx->bot);
-    if(ns != NULL)
-      return(ns);
+    if(bound != NULL)
+      return(bound);
   }
 
   else

@@ -21,15 +21,17 @@ cmd_identify(const cmd_ctx_t *ctx)
   const char *mfa_str;
   userns_auth_t result;
   const char *pass;
-  // Already authenticated?
+
+  // Already identified (temp MFA or permanent pattern)?
   if(ctx->username != NULL)
   {
-    cmd_reply(ctx, "Already authenticated. Use deauth first.");
+    cmd_reply(ctx, "Already identified. Use deauth first.");
     return;
   }
 
-  // No user namespace bound?
-  if(bot_get_userns(ctx->bot) == NULL)
+  ns = bot_get_userns(ctx->bot);
+
+  if(ns == NULL)
   {
     cmd_reply(ctx, "No user namespace configured for this bot.");
     return;
@@ -38,22 +40,8 @@ cmd_identify(const cmd_ctx_t *ctx)
   username = ctx->parsed->argv[0];
   pass = ctx->parsed->argv[1];
 
-  // Require at least one MFA pattern before allowing authentication.
-  ns = bot_get_userns(ctx->bot);
-
-  if(!userns_user_has_mfa(ns, username))
-  {
-    clam(CLAM_WARN, "identify",
-        "no MFA patterns for '%s' (sender: %s)",
-        username, ctx->msg->sender);
-    cmd_reply(ctx, "No MFA patterns defined for this user. "
-        "An admin must add at least one before you can authenticate.");
-    return;
-  }
-
-  // Verify the caller's method-facing address matches one of the
-  // target user's MFA patterns. This prevents a user from identifying
-  // as someone else from an unrecognized host.
+  // A temporary MFA is the sender's exact metadata; a method that
+  // carries none cannot mint one.
   mfa_str = ctx->msg->metadata;
 
   if(mfa_str == NULL || mfa_str[0] == '\0')
@@ -61,28 +49,33 @@ cmd_identify(const cmd_ctx_t *ctx)
     clam(CLAM_WARN, "identify",
         "no method metadata for '%s' (sender: %s)",
         username, ctx->msg->sender);
-    cmd_reply(ctx, "Cannot determine your identity from this method.");
+    cmd_reply(ctx, "This method carries no identity metadata; "
+        "identify is unavailable here.");
     return;
   }
 
-  if(!userns_user_mfa_match(ns, username, mfa_str))
-  {
-    clam(CLAM_WARN, "identify",
-        "MFA mismatch for '%s' from '%s'", username, mfa_str);
-    cmd_reply(ctx, "Authentication failed.");
-    return;
-  }
-
-  // Attempt authentication.
-  result = bot_session_auth(ctx->bot, ctx->msg->inst,
-      ctx->msg->sender, username, pass);
+  // The password is the whole proof — mint a temporary MFA from the
+  // caller's current metadata on success. No permanent-pattern gate:
+  // identify exists precisely for users whose pattern no longer
+  // matches the host they are on.
+  result = userns_auth(ns, username, pass, mfa_str);
 
   switch(result)
   {
     case USERNS_AUTH_OK:
+      if(userns_tmfa_add(ns, username, mfa_str) != SUCCESS)
+      {
+        clam(CLAM_WARN, "identify",
+            "auth ok but temp MFA mint failed for '%s' from '%s'",
+            username, mfa_str);
+        cmd_reply(ctx, "Authentication error.");
+        break;
+      }
+
       clam(CLAM_INFO, "identify",
           "'%s' authenticated from '%s'", username, mfa_str);
-      cmd_reply(ctx, "Authenticated.");
+      cmd_reply(ctx, "Identified. This hostmask is now you, "
+          "refreshed by anything you say, until it idles out.");
       break;
     case USERNS_AUTH_ERR:
       clam(CLAM_WARN, "identify",
@@ -102,28 +95,28 @@ cmd_identify(const cmd_ctx_t *ctx)
 static void
 cmd_deauth(const cmd_ctx_t *ctx)
 {
+  userns_t *ns;
+
   if(ctx->username == NULL)
   {
-    cmd_reply(ctx, "Not authenticated.");
+    cmd_reply(ctx, "Not identified.");
     return;
   }
 
-  if(bot_session_remove(ctx->bot, ctx->msg->inst,
-        ctx->msg->sender) == SUCCESS)
+  ns = bot_get_userns(ctx->bot);
+
+  if(ns != NULL && ctx->msg->metadata[0] != '\0' &&
+     userns_tmfa_del(ns, ctx->username, ctx->msg->metadata) > 0)
   {
     clam(CLAM_INFO, "deauth",
-        "'%s' deauthenticated (sender: %s)",
+        "'%s' dropped temporary MFA (sender: %s)",
         ctx->username, ctx->msg->sender);
-    cmd_reply(ctx, "Session ended.");
+    cmd_reply(ctx, "Identity dropped for this hostmask.");
   }
 
   else
-  {
-    clam(CLAM_WARN, "deauth",
-        "failed to end session for '%s' (sender: %s)",
-        ctx->username, ctx->msg->sender);
-    cmd_reply(ctx, "Failed to end session.");
-  }
+    cmd_reply(ctx, "No temporary identity to drop — your identity "
+        "comes from a permanent MFA pattern.");
 }
 
 //
@@ -218,15 +211,17 @@ cmd_register_user(const cmd_ctx_t *ctx)
     return;
   }
 
-  // Auto-authenticate.
-  result = bot_session_auth(ctx->bot, ctx->msg->inst,
-      ctx->msg->sender, matched, password);
+  // Auto-identify: mint a temp MFA from the caller's metadata. Their
+  // permanent pattern already matched (that is what found the account),
+  // so this matters only when autoidentify is off for the user.
+  result = userns_auth(ns, matched, password, mfa_str);
 
-  if(result == USERNS_AUTH_OK)
+  if(result == USERNS_AUTH_OK &&
+     userns_tmfa_add(ns, matched, mfa_str) == SUCCESS)
   {
     clam(CLAM_INFO, "register",
         "'%s' registered and authenticated from '%s'", matched, mfa_str);
-    cmd_reply(ctx, "Password set. You are now authenticated.");
+    cmd_reply(ctx, "Password set. You are now identified.");
   }
 
   else
@@ -313,10 +308,23 @@ id_format_nick(const cmd_ctx_t *ctx, userns_t *ns,
       snprintf(mfa_str, sizeof(mfa_str), "%s!%s", nick, host);
   }
 
-  // Try to resolve identity.
+  // Try to resolve identity: full resolution first, then a bare
+  // pattern match (recognized, but autoidentify is off and no temp
+  // MFA — visible yet not acting-as).
+  char ubuf[USERNS_USER_SZ];
+
   if(ns != NULL && ctx->msg->inst != NULL)
-    username = bot_session_find_ex(ctx->bot, ctx->msg->inst,
-        nick, mfa_str[0] != '\0' ? mfa_str : NULL, &is_authed);
+  {
+    if(bot_identity_resolve(ctx->bot, ctx->msg->inst, nick,
+        mfa_str[0] != '\0' ? mfa_str : NULL, ubuf, sizeof(ubuf)))
+    {
+      username = ubuf;
+      is_authed = true;
+    }
+
+    else if(mfa_str[0] != '\0')
+      username = userns_mfa_match(ns, mfa_str);
+  }
 
   // Pad nick (ASCII, safe for snprintf padding).
   id_pad_field(nick_pad, sizeof(nick_pad), nick, W_NICK);
@@ -429,9 +437,20 @@ id_format_self(const cmd_ctx_t *ctx, userns_t *ns, const char *nick,
   size_t pos = 0;
   char line[1024];
 
+  char ubuf[USERNS_USER_SZ];
+
   if(ns != NULL && ctx->msg->inst != NULL)
-    username = bot_session_find_ex(ctx->bot, ctx->msg->inst,
-        nick, mfa_str, &is_authed);
+  {
+    if(bot_identity_resolve(ctx->bot, ctx->msg->inst, nick,
+        mfa_str, ubuf, sizeof(ubuf)))
+    {
+      username = ubuf;
+      is_authed = true;
+    }
+
+    else if(mfa_str != NULL && mfa_str[0] != '\0')
+      username = userns_mfa_match(ns, mfa_str);
+  }
 
   if(username == NULL)
   {
@@ -605,7 +624,6 @@ text_identity_observe(bot_inst_t *inst, const method_msg_t *msg)
 {
   userns_t *ns;
   const char *mfa_user;
-  const char *existing;
 
   if(inst == NULL || msg == NULL || msg->metadata[0] == '\0')
     return;
@@ -621,31 +639,20 @@ text_identity_observe(bot_inst_t *inst, const method_msg_t *msg)
 
   mfa_user = userns_mfa_match(ns, msg->metadata);
 
-  if(mfa_user == NULL)
-    return;
-
   // Update persistent last-seen tracking in the user namespace.
-  userns_user_touch_lastseen(ns, mfa_user,
-      method_inst_kind(msg->inst), msg->metadata);
+  if(mfa_user != NULL)
+    userns_user_touch_lastseen(ns, mfa_user,
+        method_inst_kind(msg->inst), msg->metadata);
 
-  // Refresh identity timestamp if an existing session matches.
-  bot_session_refresh_mfa(inst, msg->inst, mfa_user);
+  // Called for its side effects, not its answer: any witnessed line
+  // whose metadata exactly matches a temporary MFA refreshes it, and
+  // the lazy expiry (with its one-time notice) fires here too.
+  {
+    char ubuf[USERNS_USER_SZ];
 
-  // Autoidentify: if no active session exists for this sender and the
-  // matched user has autoidentify enabled, create one.
-  existing = bot_session_find(inst, msg->inst, msg->sender);
-
-  if(existing != NULL || !userns_user_get_autoidentify(ns, mfa_user))
-    return;
-
-  if(bot_session_create(inst, msg->inst, msg->sender, mfa_user) == SUCCESS)
-    clam(CLAM_INFO, "autoidentify",
-        "'%s' auto-identified from '%s'", mfa_user, msg->metadata);
-
-  else
-    clam(CLAM_WARN, "autoidentify",
-        "failed to create session for '%s' from '%s'",
-        mfa_user, msg->metadata);
+    (void)bot_identity_resolve(inst, msg->inst, msg->sender,
+        msg->metadata, ubuf, sizeof(ubuf));
+  }
 }
 
 // ------------------------------------------------------------------ //

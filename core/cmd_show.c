@@ -60,7 +60,7 @@ static const cmd_arg_desc_t ad_show_schema[] = {
   { "group",  CMD_ARG_ALNUM, CMD_ARG_OPTIONAL, 0,              NULL },
 };
 
-static const cmd_arg_desc_t ad_show_sessions[] = {
+static const cmd_arg_desc_t ad_show_identities[] = {
   { "botname", CMD_ARG_ALNUM, CMD_ARG_REQUIRED, BOT_NAME_SZ, NULL },
 };
 
@@ -496,23 +496,25 @@ cmd_show_resolve(const cmd_ctx_t *ctx)
   }
 }
 
-// /show sessions <botname>
+// /show identities <botname> — the bot's namespace's temporary MFAs.
+// Permanent-pattern identities are stateless and per-message; only the
+// !identify-minted exact-match entries have anything to list.
 
 static void
-show_session_cb(const char *username, const char *method_name,
-    time_t auth_time, time_t last_seen, void *data)
+show_identity_cb(const char *username, const char *metadata,
+    time_t created, time_t last_seen, void *data)
 {
   show_iter_state_t *st = data;
-  char line[256];
-  char auth_dur[32];
+  char line[384];
+  char age_dur[32];
   char idle_dur[32];
   time_t now = time(NULL);
 
-  if(auth_time > 0)
-    fmt_duration(auth_dur, sizeof(auth_dur), now - auth_time);
+  if(created > 0)
+    fmt_duration(age_dur, sizeof(age_dur), now - created);
 
   else
-    snprintf(auth_dur, sizeof(auth_dur), "-");
+    snprintf(age_dur, sizeof(age_dur), "-");
 
   if(last_seen > 0)
     fmt_duration(idle_dur, sizeof(idle_dur), now - last_seen);
@@ -521,17 +523,18 @@ show_session_cb(const char *username, const char *method_name,
     snprintf(idle_dur, sizeof(idle_dur), "-");
 
   snprintf(line, sizeof(line),
-      "  %-20s method=%-16s authed=%s idle=%s",
-      username, method_name, auth_dur, idle_dur);
+      "  %-20s %-40s age=%s idle=%s",
+      username, metadata, age_dur, idle_dur);
   cmd_reply(st->ctx, line);
   st->count++;
 }
 
 static void
-cmd_show_sessions(const cmd_ctx_t *ctx)
+cmd_show_identities(const cmd_ctx_t *ctx)
 {
   const char *botname = ctx->parsed->argv[0];
   bot_inst_t *bot;
+  userns_t   *ns;
   char hdr[128];
   show_iter_state_t st = { .ctx = ctx, .count = 0 };
 
@@ -542,11 +545,18 @@ cmd_show_sessions(const cmd_ctx_t *ctx)
     return;
   }
 
-  snprintf(hdr, sizeof(hdr), "sessions for '%s' (%u active):",
-      botname, bot_session_count(bot));
+  ns = bot_get_userns(bot);
+
+  if(ns == NULL)
+  {
+    cmd_reply(ctx, "no user namespace bound");
+    return;
+  }
+
+  snprintf(hdr, sizeof(hdr), "temporary identities in '%s':", ns->name);
   cmd_reply(ctx, hdr);
 
-  bot_session_iterate(bot, show_session_cb, &st);
+  userns_tmfa_iterate(ns, show_identity_cb, &st);
 
   if(st.count == 0)
     cmd_reply(ctx, "  (none)");
@@ -947,10 +957,10 @@ cmd_show_status(const cmd_ctx_t *ctx)
       "  " CLR_CYAN "bots" CLR_RESET "      "
       CLR_BOLD "%u" CLR_RESET " instances  "
       CLR_GREEN "%u" CLR_RESET " running  "
-      "%u methods  %u sessions  "
+      "%u methods  "
       CLR_GRAY "cmds=%lu" CLR_RESET "  "
       "%s%lu denied" CLR_RESET,
-      bs.instances, bs.running, bs.methods, bs.sessions,
+      bs.instances, bs.running, bs.methods,
       (unsigned long)bs.cmd_dispatches,
       err_color(bs.cmd_denials), (unsigned long)bs.cmd_denials);
   cmd_reply(ctx, buf);
@@ -1078,13 +1088,13 @@ cmd_show_register(void)
       USERNS_GROUP_ADMIN, 100, CMD_SCOPE_ANY, METHOD_T_ANY,
       cmd_show_db, NULL, "show", "d", NULL, 0, NULL, NULL);
 
-  cmd_register("cmd", "sessions",
-      "show sessions <botname>",
-      "Show active sessions for a bot",
+  cmd_register("cmd", "identities",
+      "show identities <botname>",
+      "Show temporary identities in a bot's user namespace",
       NULL,
       USERNS_GROUP_ADMIN, 100, CMD_SCOPE_ANY, METHOD_T_ANY,
-      cmd_show_sessions, NULL, "show", "sess",
-      ad_show_sessions, 1, NULL, NULL);
+      cmd_show_identities, NULL, "show", "ident",
+      ad_show_identities, 1, NULL, NULL);
 
   // /show pool — thread pool dashboard.
   cmd_register("cmd", "pool",

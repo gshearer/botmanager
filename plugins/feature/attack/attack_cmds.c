@@ -65,20 +65,17 @@ atk_target_present(const cmd_ctx_t *ctx, const char *nick)
   return(p.seen == 0 || p.found);
 }
 
-// Map a typed nickname onto a namespace-scoped username: first through
-// the bot's authenticated sessions, then by taking the token as a
-// username outright. Anything else is a ghost.
+// Map a typed nickname onto a namespace-scoped username: first by
+// resolving the nick's identity (temp MFA or pattern, via the method
+// context map), then by taking the token as a username outright.
+// Anything else is a ghost.
 static bool
 atk_resolve_target(const cmd_ctx_t *ctx, const userns_t *ns,
     const char *nick, char *out, size_t cap)
 {
-  const char *user = bot_session_find(ctx->bot, ctx->msg->inst, nick);
-
-  if(user != NULL && user[0] != '\0')
-  {
-    snprintf(out, cap, "%s", user);
+  if(bot_identity_resolve(ctx->bot, ctx->msg->inst, nick, NULL,
+      out, cap) && out[0] != '\0')
     return(true);
-  }
 
   if(userns_user_lookup_ci(ns, nick, out, cap))
     return(true);

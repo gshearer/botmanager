@@ -208,6 +208,7 @@ create_core_tables(void)
       "description VARCHAR(101) NOT NULL DEFAULT '', "
       "passphrase VARCHAR(101) NOT NULL DEFAULT '', "
       "autoidentify BOOLEAN NOT NULL DEFAULT FALSE, "
+      "userns_cd VARCHAR(64) NOT NULL DEFAULT '', "
       "lastseen TIMESTAMPTZ, "
       "lastseen_method VARCHAR(64) NOT NULL DEFAULT '', "
       "lastseen_mfa VARCHAR(200) NOT NULL DEFAULT '', "
@@ -233,6 +234,9 @@ create_core_tables(void)
       "user_id INTEGER NOT NULL REFERENCES userns_user(id) ON DELETE CASCADE, "
       "pattern VARCHAR(200) NOT NULL, "
       "UNIQUE(user_id, pattern))",
+
+    "ALTER TABLE userns_user ADD COLUMN IF NOT EXISTS "
+      "userns_cd VARCHAR(64) NOT NULL DEFAULT ''",
 
     "CREATE TABLE IF NOT EXISTS user_mfa_temp ("
       "id SERIAL PRIMARY KEY, "

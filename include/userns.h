@@ -232,6 +232,15 @@ bool userns_user_get_autoidentify(const userns_t *ns,
 bool userns_user_set_autoidentify(const userns_t *ns,
     const char *username, bool value);
 
+// Per-user /user cd override — the namespace name a user's admin
+// commands operate on, persistent across identities and restarts.
+// Empty string means "use the bot's bound namespace".
+bool userns_user_get_cd(const userns_t *ns, const char *username,
+    char *out, size_t out_sz);
+
+bool userns_user_set_cd(const userns_t *ns, const char *username,
+    const char *cd_name);
+
 // Temporary MFAs — exact-match identities minted by !identify.
 //
 // Unlike permanent user_mfa patterns (globs, stateless, no expiry),

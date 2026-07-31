@@ -274,7 +274,7 @@ bool cmd_dispatch(bot_inst_t *inst, const method_msg_t *msg);
 // synthesize a command from LLM output, or the prompt assembler deciding
 // whether to advertise a command to the model) use this; the actual
 // denial replies remain cmd_dispatch's responsibility.
-// Returns true if the caller (resolved via bot_session_find on msg) is
+// Returns true if the caller (resolved via bot_identity_resolve) is
 // permitted to run `def` in the context described by `msg`; false on
 // any denial or on NULL inputs.
 bool cmd_permits(bot_inst_t *inst, const method_msg_t *msg,
