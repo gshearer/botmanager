@@ -2240,6 +2240,7 @@ typedef struct
   char           username[USERNS_USER_SZ];
   char           sender[METHOD_SENDER_SZ];
   method_inst_t *method;
+  userns_t      *userns;
   long           idle;
   uint32_t       timeout;
 } reaper_notify_t;
@@ -2312,6 +2313,7 @@ bot_session_reaper(task_t *t)
         snprintf(rn->username, sizeof(rn->username), "%s", s->username);
         snprintf(rn->sender,   sizeof(rn->sender),   "%s", s->sender);
         rn->method  = s->method;
+        rn->userns  = inst->userns;
         rn->idle    = (long)(now - s->last_seen);
         rn->timeout = timeout;
 
@@ -2345,7 +2347,13 @@ bot_session_reaper(task_t *t)
         method_inst_name(notify[i].method), notify[i].sender,
         notify[i].idle, notify[i].timeout);
 
-    // Notify the user that their identity expired.
+    // Notify the user that their identity expired — but skip it when
+    // autoidentify is enabled: their next line silently re-authenticates,
+    // so the message would only be noise. Checked here, after the lock is
+    // released, to keep the DB query off the bot_mutex hot path.
+    if(userns_user_get_autoidentify(notify[i].userns, notify[i].username))
+      continue;
+
     method_send(notify[i].method, notify[i].sender,
         "Your identity has expired. "
         "Use identify to re-authenticate.");
