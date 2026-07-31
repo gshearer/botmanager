@@ -203,6 +203,12 @@ irc_handle_self_join(irc_state_t *st, const char *channel)
   if(channel == NULL || channel[0] != '#')
     return;
 
+  // Warm the nick->user@host context cache for everyone already
+  // present: identity is stateless per-message now, so a member must
+  // be resolvable before their first line — the 352 replies land in
+  // irc_handle_whoreply.
+  irc_send_raw(st, "WHO %s", channel);
+
   // Strip '#' for KV key lookup.
   channame = channel + 1;
 
@@ -329,8 +335,15 @@ irc_handle_privmsg(irc_state_t *st, const irc_parsed_msg_t *p)
   char target[METHOD_CHANNEL_SZ];
   const char *body;
 
-  // Update context cache with sender's host.
-  irc_ctx_update(st, p->nick, p->host);
+  // Update context cache with the sender's user@host — consumers
+  // build "nick!<ctx>" and need the full MFA triple.
+  if(p->user[0] != '\0' && p->host[0] != '\0')
+  {
+    char uh[IRC_NICK_SZ + IRC_HOST_SZ + 2];
+
+    snprintf(uh, sizeof(uh), "%s@%s", p->user, p->host);
+    irc_ctx_update(st, p->nick, uh);
+  }
 
   // Build message context on stack.
   memset(&msg, 0, sizeof(msg));
@@ -538,6 +551,7 @@ static void irc_handle_namreply(irc_state_t *, const irc_parsed_msg_t *);
 static void irc_handle_endnames(irc_state_t *, const irc_parsed_msg_t *);
 static void irc_handle_topic332(irc_state_t *, const irc_parsed_msg_t *);
 static void irc_handle_youreoper(irc_state_t *, const irc_parsed_msg_t *);
+static void irc_handle_whoreply(irc_state_t *, const irc_parsed_msg_t *);
 static void irc_handle_join    (irc_state_t *, const irc_parsed_msg_t *);
 static void irc_handle_part    (irc_state_t *, const irc_parsed_msg_t *);
 static void irc_handle_quit    (irc_state_t *, const irc_parsed_msg_t *);
@@ -554,6 +568,7 @@ static const struct {
 } irc_cmd_table[] = {
   { "PING",    irc_handle_ping     },
   { "001",     irc_handle_welcome  },
+  { "352",     irc_handle_whoreply },
   { "353",     irc_handle_namreply },
   { "366",     irc_handle_endnames },
   { "381",     irc_handle_youreoper},
@@ -791,6 +806,57 @@ irc_handle_topic332(irc_state_t *st, const irc_parsed_msg_t *pp)
   pthread_mutex_unlock(&st->chan_mutex);
 }
 
+// RPL_WHOREPLY (352): "<me> <channel> <user> <host> <server> <nick> ..."
+// One reply per member; each seeds the nick -> user@host cache.
+static void
+irc_handle_whoreply(irc_state_t *st, const irc_parsed_msg_t *p)
+{
+  char user[IRC_NICK_SZ] = {0};
+  char host[IRC_HOST_SZ] = {0};
+  char nick[IRC_NICK_SZ] = {0};
+  char uh[IRC_NICK_SZ + IRC_HOST_SZ + 2];
+  const char *tok = p->params;
+  uint32_t field = 0;
+
+  // Walk space-separated params: field 2 = user, 3 = host, 5 = nick.
+  while(*tok != '\0')
+  {
+    const char *end = strchr(tok, ' ');
+    size_t len = (end != NULL) ? (size_t)(end - tok) : strlen(tok);
+
+    if(field == 2 && len < sizeof(user))
+    {
+      memcpy(user, tok, len);
+      user[len] = '\0';
+    }
+
+    else if(field == 3 && len < sizeof(host))
+    {
+      memcpy(host, tok, len);
+      host[len] = '\0';
+    }
+
+    else if(field == 5 && len < sizeof(nick))
+    {
+      memcpy(nick, tok, len);
+      nick[len] = '\0';
+      break;
+    }
+
+    if(end == NULL)
+      break;
+
+    tok = end + 1;
+    field++;
+  }
+
+  if(user[0] == '\0' || host[0] == '\0' || nick[0] == '\0')
+    return;
+
+  snprintf(uh, sizeof(uh), "%s@%s", user, host);
+  irc_ctx_update(st, nick, uh);
+}
+
 static void
 irc_handle_join(irc_state_t *st, const irc_parsed_msg_t *pp)
 {
@@ -812,6 +878,16 @@ irc_handle_join(irc_state_t *st, const irc_parsed_msg_t *pp)
     return;
 
   irc_chan_add_nick(st, channel, p.nick);
+
+  // Seed the context cache from the JOIN prefix so the joiner is
+  // resolvable before their first line.
+  if(p.user[0] != '\0' && p.host[0] != '\0')
+  {
+    char uh[IRC_NICK_SZ + IRC_HOST_SZ + 2];
+
+    snprintf(uh, sizeof(uh), "%s@%s", p.user, p.host);
+    irc_ctx_update(st, p.nick, uh);
+  }
 
   // Handle our own joins.
   if(strncasecmp(p.nick, st->cur_nick, IRC_NICK_SZ) == 0)
