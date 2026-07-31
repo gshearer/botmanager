@@ -56,11 +56,6 @@ regex (the literal context portion, before any `<placeholder>`).
 | `bot_restore` | core/bot.c | bot restore from persistent store |
 | `bot_resume` | core/bot.c | re-attaching a bot to a reloaded driver/protocol |
 | `bot_say` | core/bot_cmd.c | `/say` command (bot emits to a channel) |
-| `bot_session_auth` | core/bot.c | bot session auth events |
-| `bot_session_clear` | core/bot.c | clearing a bot session |
-| `bot_session_create` | core/bot.c | creating a bot session |
-| `bot_session_reaper` | core/bot.c | session reaper task |
-| `bot_session_remove` | core/bot.c | session remove path |
 | `bot_set_userns` | core/bot.c | binding a userns to a bot |
 | `bot_start` | core/bot.c | bot start lifecycle hook |
 | `bot_stop` | core/bot.c | bot stop lifecycle hook |
