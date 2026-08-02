@@ -1,7 +1,7 @@
 // botmanager — MIT
 // /crypto command-surface plugin: parses flags, queries the
 // coinmarketcap service plugin via its public API, and formats
-// user-facing replies (table / verbose / global).
+// user-facing replies (table / verbose card / whole-market card).
 #define CRYPTO_INTERNAL
 #define CRYPTO_CMD_UNIT
 #include "crypto.h"
@@ -10,10 +10,19 @@
 #include "userns.h"
 
 #include <ctype.h>
+#include <inttypes.h>
+#include <math.h>
+#include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <strings.h>
+#include <time.h>
+
+// Card layout: a fixed label column, then dot-separated facts. Shared by
+// the --mcap and --verbose cards so the two read as one family.
+#define CRYPTO_CARD_LABEL  CLR_BOLD CLR_CYAN "%-11s" CLR_RESET
+#define CRYPTO_CARD_DOT    "  " CLR_GRAY "·" CLR_RESET "  "
 
 // Formatting helpers
 
@@ -74,6 +83,185 @@ crypto_pad(char *buf, size_t sz, int width)
 
   for(int i = 0; i < pad; i++)
     buf[i] = ' ';
+}
+
+// Two-decimal money for the --mcap card, where the whole market moves
+// in trillions and one decimal place throws away the interesting digit.
+static int
+crypto_fmt_usd(double val, char *buf, size_t sz)
+{
+  double abs_val = val < 0 ? -val : val;
+
+  if(abs_val >= 1e12) return(snprintf(buf, sz, "$%.2fT", val / 1e12));
+  if(abs_val >= 1e9)  return(snprintf(buf, sz, "$%.2fB", val / 1e9));
+  if(abs_val >= 1e6)  return(snprintf(buf, sz, "$%.2fM", val / 1e6));
+  if(abs_val >= 1e3)  return(snprintf(buf, sz, "$%.1fK", val / 1e3));
+
+  return(snprintf(buf, sz, "$%.0f", val));
+}
+
+// Copies a run of decimal digits into buf with thousands separators:
+// "112304" -> "112,304".
+static int
+crypto_group_digits(const char *digits, char *buf, size_t sz)
+{
+  size_t len = strlen(digits);
+  size_t out = 0;
+
+  for(size_t i = 0; i < len; i++)
+  {
+    if(i > 0 && (len - i) % 3 == 0 && out + 1 < sz)
+      buf[out++] = ',';
+
+    if(out + 1 < sz)
+      buf[out++] = digits[i];
+  }
+
+  if(sz > 0)
+    buf[out] = '\0';
+
+  return((int)out);
+}
+
+static int
+crypto_fmt_count(int32_t n, char *buf, size_t sz)
+{
+  char digits[16];
+
+  if(n <= 0)
+    return(snprintf(buf, sz, CLR_GRAY "n/a" CLR_RESET));
+
+  snprintf(digits, sizeof(digits), "%" PRId32, n);
+
+  return(crypto_group_digits(digits, buf, sz));
+}
+
+// Full-precision price for the verbose card, grouped and with as many
+// decimals as the magnitude deserves: "$63,019.00", "$0.000042".
+static void
+crypto_fmt_price_wide(double price, char *buf, size_t sz)
+{
+  char        raw[24];
+  char        grouped[32];
+  char        out[64];
+  const char *frac = "";
+  char       *dot;
+  int         dec;
+
+  // NaN, infinity or a price no market has ever printed: hand it to the
+  // compact formatter rather than grouping nonsense.
+  if(!(price >= 0.0 && price < 1e15))
+  {
+    crypto_fmt_usd(price, buf, sz);
+    return;
+  }
+
+  dec = price >= 1.0 ? 2 : (price >= 0.01 ? 4 : 6);
+
+  snprintf(raw, sizeof(raw), "%.*f", dec, price);
+
+  dot = strchr(raw, '.');
+
+  if(dot != NULL)
+  {
+    *dot = '\0';
+    frac = dot + 1;
+  }
+
+  crypto_group_digits(raw, grouped, sizeof(grouped));
+  snprintf(out, sizeof(out), "$%s.%s", grouped, frac);
+  snprintf(buf, sz, "%s", out);
+}
+
+// Appends to a bounded buffer, keeping *used truthful when the write is
+// clipped so a later append can never walk past the end. Every card
+// line assembled piece by piece goes through this.
+static void crypto_append(char *buf, size_t cap, size_t *used,
+    const char *fmt, ...) __attribute__((format(printf, 4, 5)));
+
+static void
+crypto_append(char *buf, size_t cap, size_t *used, const char *fmt, ...)
+{
+  va_list ap;
+  int     n;
+
+  if(*used + 1 >= cap)
+    return;
+
+  va_start(ap, fmt);
+  n = vsnprintf(buf + *used, cap - *used, fmt, ap);
+  va_end(ap);
+
+  if(n < 0)
+    return;
+
+  *used = (size_t)n >= cap - *used ? cap - 1 : *used + (size_t)n;
+}
+
+// Coin-count magnitudes — supply, not money, so no dollar sign.
+static void
+crypto_fmt_supply(double n, char *buf, size_t sz)
+{
+  if(n <= 0.0)       snprintf(buf, sz, CLR_GRAY "n/a" CLR_RESET);
+  else if(n >= 1e12) snprintf(buf, sz, "%.2fT", n / 1e12);
+  else if(n >= 1e9)  snprintf(buf, sz, "%.2fB", n / 1e9);
+  else if(n >= 1e6)  snprintf(buf, sz, "%.2fM", n / 1e6);
+  else if(n >= 1e3)  snprintf(buf, sz, "%.1fK", n / 1e3);
+  else               snprintf(buf, sz, "%.0f",  n);
+}
+
+// Arrowed, coloured percentage move — the card's workhorse. NaN means
+// the provider did not give us enough to compute one.
+static int
+crypto_fmt_move(double pct, char *buf, size_t sz)
+{
+  if(isnan(pct))
+    return(snprintf(buf, sz, CLR_GRAY "n/a" CLR_RESET));
+  if(pct > 0.0)
+    return(snprintf(buf, sz, CLR_GREEN "▲%.2f%%" CLR_RESET, pct));
+  if(pct < 0.0)
+    return(snprintf(buf, sz, CLR_RED "▼%.2f%%" CLR_RESET, -pct));
+
+  return(snprintf(buf, sz, CLR_GRAY "flat" CLR_RESET));
+}
+
+// Same arrows, but for a move measured in percentage points (dominance),
+// where a trailing '%' would claim the wrong unit.
+static int
+crypto_fmt_points(double pts, char *buf, size_t sz)
+{
+  if(isnan(pts) || pts == 0.0)
+    return(snprintf(buf, sz, CLR_GRAY "flat" CLR_RESET));
+  if(pts > 0.0)
+    return(snprintf(buf, sz, CLR_GREEN "▲%.2f" CLR_RESET, pts));
+
+  return(snprintf(buf, sz, CLR_RED "▼%.2f" CLR_RESET, -pts));
+}
+
+// Age of a snapshot, in the coarsest unit that still reads honestly.
+static int
+crypto_fmt_age(int64_t secs, char *buf, size_t sz)
+{
+  if(secs < 0)     secs = 0;
+  if(secs < 90)    return(snprintf(buf, sz, "%llds", (long long)secs));
+  if(secs < 5400)  return(snprintf(buf, sz, "%lldm", (long long)(secs / 60)));
+
+  return(snprintf(buf, sz, "%lldh%lldm",
+      (long long)(secs / 3600), (long long)((secs % 3600) / 60)));
+}
+
+// Percentage change, preferring the value the provider computed and
+// falling back to yesterday's level. NaN when neither is available.
+static double
+crypto_pct_change(double now, double yesterday, double reported)
+{
+  if(reported != 0.0)
+    return(reported);
+
+  if(yesterday > 0.0)
+    return(((now - yesterday) / yesterday) * 100.0);
+
+  return(NAN);
 }
 
 static int
@@ -224,9 +412,12 @@ crypto_parse_args(const char *args, crypto_req_t *req, crypto_largs_t *la,
       continue;
     }
 
-    if(strcmp(tok, "-g") == 0 || strcmp(tok, "--global") == 0)
+    // --mcap is the whole-market card; "global" is kept as a synonym
+    // because that is what the provider calls the same endpoint.
+    if(strcmp(tok, "-m") == 0 || strcmp(tok, "--mcap") == 0 ||
+       strcmp(tok, "--global") == 0)
     {
-      req->kind = CRYPTO_REQ_GLOBAL;
+      req->kind = CRYPTO_REQ_MCAP;
       tok = strtok_r(NULL, " \t", &saveptr);
       continue;
     }
@@ -365,18 +556,18 @@ crypto_parse_args(const char *args, crypto_req_t *req, crypto_largs_t *la,
     tok = strtok_r(NULL, " \t", &saveptr);
   }
 
-  if(req->kind == CRYPTO_REQ_GLOBAL)
+  if(req->kind == CRYPTO_REQ_MCAP)
   {
     if(req->verbose)
     {
-      cmd_reply(ctx, "Error: -g and -v cannot be combined.");
+      cmd_reply(ctx, "Error: --mcap and --verbose cannot be combined.");
       return(false);
     }
 
     if(la->nitems > 0)
     {
       cmd_reply(ctx,
-          "Error: -g shows global market data and takes no selectors.");
+          "Error: --mcap shows the whole market and takes no symbols.");
       return(false);
     }
 
@@ -808,157 +999,342 @@ num:        cmp = (av > bv) - (av < bv);
 
 static void
 crypto_reply_verbose(const cmd_ctx_t *ctx,
-    const coinmarketcap_coin_detail_t *d)
+    const coinmarketcap_coin_detail_t *d,
+    const coinmarketcap_coin_info_t *info)
 {
-  char p1h[48], p24h[48], p7d[48], p30d[48], p60d[48], p90d[48];
-  char supply_t[32], supply_m[32];
-  char price[32], cap[32], fdcap[32], vol[64], supply_c[32];
-  char line[CRYPTO_REPLY_SZ];
-  char date_clean[COINMARKETCAP_DATE_SZ];
-  char *tpos;
-  double cs, ts, ms;
+  char   p1h[48], p24h[48], p7d[48], p30d[48], p60d[48], p90d[48];
+  char   vol_mv[48];
+  char   price[64], cap[32], fdcap[32], vol[32];
+  char   supply_c[32], supply_t[32], supply_m[32];
+  char   pairs[24];
+  char   line[CRYPTO_REPLY_SZ];
+  char   tail[CRYPTO_REPLY_SZ];
+  char   date_clean[COINMARKETCAP_DATE_SZ];
+  char  *tpos;
+  double turnover = 0.0;
 
   // Truncate date_added to date only.
   snprintf(date_clean, sizeof(date_clean), "%s", d->date_added);
   tpos = strchr(date_clean, 'T');
+
   if(tpos != NULL)
     *tpos = '\0';
 
-  crypto_fmt_price (d->base.price,              price, sizeof(price));
-  crypto_fmt_number(d->base.market_cap,         cap,   sizeof(cap));
-  crypto_fmt_number(d->fully_diluted_market_cap,fdcap, sizeof(fdcap));
-  crypto_fmt_vol   (d->base.volume_24h,         vol,   sizeof(vol));
-  crypto_fmt_pct   (d->base.pct_1h,             p1h,   sizeof(p1h));
-  crypto_fmt_pct   (d->base.pct_24h,            p24h,  sizeof(p24h));
-  crypto_fmt_pct   (d->base.pct_7d,             p7d,   sizeof(p7d));
-  crypto_fmt_pct   (d->pct_30d,                 p30d,  sizeof(p30d));
-  crypto_fmt_pct   (d->pct_60d,                 p60d,  sizeof(p60d));
-  crypto_fmt_pct   (d->pct_90d,                 p90d,  sizeof(p90d));
+  crypto_fmt_price_wide(d->base.price, price, sizeof(price));
+  crypto_fmt_usd(d->base.market_cap,          cap,   sizeof(cap));
+  crypto_fmt_usd(d->fully_diluted_market_cap, fdcap, sizeof(fdcap));
+  crypto_fmt_usd(d->base.volume_24h,          vol,   sizeof(vol));
 
-  cs = d->base.circulating_supply;
-  ts = d->base.total_supply;
-  ms = d->base.max_supply;
+  crypto_fmt_move(d->base.pct_1h,  p1h,  sizeof(p1h));
+  crypto_fmt_move(d->base.pct_24h, p24h, sizeof(p24h));
+  crypto_fmt_move(d->base.pct_7d,  p7d,  sizeof(p7d));
+  crypto_fmt_move(d->pct_30d,      p30d, sizeof(p30d));
+  crypto_fmt_move(d->pct_60d,      p60d, sizeof(p60d));
+  crypto_fmt_move(d->pct_90d,      p90d, sizeof(p90d));
+  crypto_fmt_move(d->volume_change_24h, vol_mv, sizeof(vol_mv));
 
-  if(cs >= 1e9)      snprintf(supply_c, sizeof(supply_c), "%.1fB", cs / 1e9);
-  else if(cs >= 1e6) snprintf(supply_c, sizeof(supply_c), "%.1fM", cs / 1e6);
-  else               snprintf(supply_c, sizeof(supply_c), "%.0f",  cs);
+  crypto_fmt_supply(d->base.circulating_supply, supply_c, sizeof(supply_c));
+  crypto_fmt_supply(d->base.total_supply,       supply_t, sizeof(supply_t));
+  crypto_fmt_supply(d->base.max_supply,         supply_m, sizeof(supply_m));
+  crypto_fmt_count (d->base.num_market_pairs,   pairs,    sizeof(pairs));
 
-  if(ts >= 1e9)      snprintf(supply_t, sizeof(supply_t), "%.1fB", ts / 1e9);
-  else if(ts >= 1e6) snprintf(supply_t, sizeof(supply_t), "%.1fM", ts / 1e6);
-  else               snprintf(supply_t, sizeof(supply_t), "%.0f",  ts);
+  if(d->base.market_cap > 0.0)
+    turnover = (d->base.volume_24h / d->base.market_cap) * 100.0;
 
-  if(ms > 0)
+  // Header: what it is, before what it costs. Category and tags come
+  // from the metadata leg and are simply absent when it did not land.
+  tail[0] = '\0';
+
+  if(info != NULL && info->valid)
   {
-    if(ms >= 1e9)      snprintf(supply_m, sizeof(supply_m), "%.1fB", ms / 1e9);
-    else if(ms >= 1e6) snprintf(supply_m, sizeof(supply_m), "%.1fM", ms / 1e6);
-    else               snprintf(supply_m, sizeof(supply_m), "%.0f",  ms);
+    size_t used = 0;
+
+    if(info->category[0] != '\0')
+      crypto_append(tail, sizeof(tail), &used,
+          CRYPTO_CARD_DOT "%s", info->category);
+
+    for(uint8_t i = 0; i < info->tag_count; i++)
+      crypto_append(tail, sizeof(tail), &used, "%s%s",
+          i == 0 ? CRYPTO_CARD_DOT : ", ", info->tags[i]);
   }
-  else
-    snprintf(supply_m, sizeof(supply_m), "N/A");
 
   snprintf(line, sizeof(line),
       CLR_BOLD CLR_WHITE "%s" CLR_RESET
       " (" CLR_YELLOW "%s" CLR_RESET ") "
-      CLR_GRAY "#%d" CLR_RESET,
-      d->base.name, d->base.symbol, d->base.cmc_rank);
+      CLR_GRAY "#%d" CLR_RESET "%s",
+      d->base.name, d->base.symbol, d->base.cmc_rank, tail);
   cmd_reply(ctx, line);
 
   snprintf(line, sizeof(line),
-      "Price: " CLR_BOLD CLR_WHITE "%s" CLR_RESET, price);
+      CRYPTO_CARD_LABEL CLR_BOLD CLR_WHITE "%s" CLR_RESET
+      CRYPTO_CARD_DOT "1h %s  24h %s  7d %s  30d %s  60d %s  90d %s",
+      "Price", price, p1h, p24h, p7d, p30d, p60d, p90d);
   cmd_reply(ctx, line);
 
   snprintf(line, sizeof(line),
-      "Market Cap: %s  Dominance: %.2f%%", cap, d->market_cap_dominance);
-  cmd_reply(ctx, line);
-
-  snprintf(line, sizeof(line), "Fully Diluted: %s", fdcap);
-  cmd_reply(ctx, line);
-
-  snprintf(line, sizeof(line),
-      "Volume (24h): %s  Market Pairs: %d", vol, d->base.num_market_pairs);
+      CRYPTO_CARD_LABEL "cap " CLR_WHITE "%s" CLR_RESET
+      " (%.2f%% of all crypto)"
+      CRYPTO_CARD_DOT "fully diluted " CLR_WHITE "%s" CLR_RESET,
+      "Market", cap, d->market_cap_dominance, fdcap);
   cmd_reply(ctx, line);
 
   snprintf(line, sizeof(line),
-      "Change:  1h: %s  24h: %s  7d: %s", p1h, p24h, p7d);
+      CRYPTO_CARD_LABEL CLR_WHITE "%s" CLR_RESET " in 24h %s"
+      CRYPTO_CARD_DOT CLR_WHITE "%s" CLR_RESET " market pairs"
+      CRYPTO_CARD_DOT "turnover " CLR_WHITE "%.1f%%" CLR_RESET,
+      "Volume", vol, vol_mv, pairs, turnover);
   cmd_reply(ctx, line);
+
+  // Supply reads as a sentence: how much exists, out of how much ever
+  // can. An uncapped token says so rather than showing a bare "n/a".
+  if(d->base.max_supply > 0.0)
+    snprintf(tail, sizeof(tail), " of " CLR_WHITE "%s" CLR_RESET
+        " max (%.1f%% issued)", supply_m,
+        (d->base.circulating_supply / d->base.max_supply) * 100.0);
+  else if(info != NULL && info->valid && info->infinite_supply)
+    snprintf(tail, sizeof(tail),
+        CRYPTO_CARD_DOT CLR_GRAY "no supply cap" CLR_RESET);
+  else
+    snprintf(tail, sizeof(tail),
+        CRYPTO_CARD_DOT CLR_GRAY "no published maximum" CLR_RESET);
 
   snprintf(line, sizeof(line),
-      "Change: 30d: %s  60d: %s  90d: %s", p30d, p60d, p90d);
+      CRYPTO_CARD_LABEL CLR_WHITE "%s" CLR_RESET " circulating%s"
+      CRYPTO_CARD_DOT CLR_WHITE "%s" CLR_RESET " minted in total",
+      "Supply", supply_c, tail, supply_t);
   cmd_reply(ctx, line);
 
-  snprintf(line, sizeof(line),
-      "Supply: Circ: %s  Total: %s  Max: %s", supply_c, supply_t, supply_m);
-  cmd_reply(ctx, line);
-
-  if(date_clean[0] != '\0')
+  if(info != NULL && info->valid && info->chain_count > 0)
   {
-    snprintf(line, sizeof(line), "Added: %s", date_clean);
+    size_t used = 0;
+
+    tail[0] = '\0';
+
+    for(uint8_t i = 0; i < info->chain_count; i++)
+      crypto_append(tail, sizeof(tail), &used, "%s" CLR_WHITE "%s" CLR_RESET,
+          i == 0 ? "" : CRYPTO_CARD_DOT, info->chains[i]);
+
+    if(info->chain_total > info->chain_count)
+      crypto_append(tail, sizeof(tail), &used,
+          CLR_GRAY "  (+%u more)" CLR_RESET,
+          (unsigned)(info->chain_total - info->chain_count));
+
+    snprintf(line, sizeof(line), CRYPTO_CARD_LABEL "%s", "Chains", tail);
     cmd_reply(ctx, line);
+  }
+
+  // Closing line: where to go next. Assembled piecewise because every
+  // part is optional — and skipped entirely when none of them landed.
+  {
+    const bool meta = (info != NULL && info->valid);
+    size_t     used = 0;
+
+    tail[0] = '\0';
+
+    if(meta && info->website[0] != '\0')
+      crypto_append(tail, sizeof(tail), &used,
+          CLR_WHITE "%s" CLR_RESET, info->website);
+
+    // Handles are expanded to full URLs rather than shown as "r/foo" or
+    // "@foo": a chat client linkifies what it can open, and nothing else.
+    if(meta && info->subreddit[0] != '\0')
+      crypto_append(tail, sizeof(tail), &used, "%shttps://reddit.com/r/%s",
+          used > 0 ? CRYPTO_CARD_DOT : "", info->subreddit);
+
+    if(meta && info->twitter[0] != '\0')
+      crypto_append(tail, sizeof(tail), &used, "%shttps://x.com/%s",
+          used > 0 ? CRYPTO_CARD_DOT : "", info->twitter);
+
+    if(date_clean[0] != '\0')
+      crypto_append(tail, sizeof(tail), &used, "%slisted %s",
+          used > 0 ? CRYPTO_CARD_DOT : "", date_clean);
+
+    if(tail[0] != '\0')
+    {
+      snprintf(line, sizeof(line), CRYPTO_CARD_LABEL "%s", "Links", tail);
+      cmd_reply(ctx, line);
+    }
   }
 }
 
+// --mcap card
+//
+// Six lines, each a fixed label column followed by dot-separated facts.
+// Everything here is read-only formatting of one global snapshot plus,
+// when it is already warm, the listings cache.
+
+
+// Advancers, decliners and the day's extremes among the top-ranked
+// coins. Leaves out->valid false when the listings cache is cold: the
+// card is a global-metrics view and must not spend a listings credit to
+// decorate itself.
 static void
-crypto_reply_global(const cmd_ctx_t *ctx, const coinmarketcap_global_t *g)
+crypto_breadth_survey(crypto_breadth_t *out)
 {
-  char line[CRYPTO_REPLY_SZ];
-  char cap[32], vol[64], defi_v[32], defi_c[32];
-  char stable_v[32], stable_c[32], deriv_v[32];
-  char cap_chg[48], vol_chg[48];
+  coinmarketcap_coin_t *rows;
+  uint32_t              n = 0;
 
-  crypto_fmt_number(g->total_cap,       cap,      sizeof(cap));
-  crypto_fmt_vol   (g->total_vol,       vol,      sizeof(vol));
-  crypto_fmt_number(g->defi_vol_24h,    defi_v,   sizeof(defi_v));
-  crypto_fmt_number(g->defi_cap,        defi_c,   sizeof(defi_c));
-  crypto_fmt_number(g->stablecoin_vol,  stable_v, sizeof(stable_v));
-  crypto_fmt_number(g->stablecoin_cap,  stable_c, sizeof(stable_c));
-  crypto_fmt_number(g->derivatives_vol, deriv_v,  sizeof(deriv_v));
+  memset(out, 0, sizeof(*out));
 
-  if(g->total_cap_yest > 0.0)
-    crypto_fmt_pct(
-        ((g->total_cap - g->total_cap_yest) / g->total_cap_yest) * 100.0,
-        cap_chg, sizeof(cap_chg));
-  else
-    snprintf(cap_chg, sizeof(cap_chg), "N/A");
+  if(!coinmarketcap_listings_cache_fresh())
+    return;
 
-  if(g->total_vol_yest > 0.0)
-    crypto_fmt_pct(
-        ((g->total_vol - g->total_vol_yest) / g->total_vol_yest) * 100.0,
-        vol_chg, sizeof(vol_chg));
-  else
-    snprintf(vol_chg, sizeof(vol_chg), "N/A");
+  rows = mem_alloc(CRYPTO_CTX, "breadth", sizeof(*rows) * CRYPTO_BREADTH_N);
+
+  if(coinmarketcap_get_listings(CRYPTO_BREADTH_N, COINMARKETCAP_SORT_RANK,
+      false, rows, CRYPTO_BREADTH_N, &n) != SUCCESS || n == 0)
+  {
+    mem_free(rows);
+    return;
+  }
+
+  out->best_pct  = rows[0].pct_24h;
+  out->worst_pct = rows[0].pct_24h;
+  snprintf(out->best,  sizeof(out->best),  "%s", rows[0].symbol);
+  snprintf(out->worst, sizeof(out->worst), "%s", rows[0].symbol);
+
+  for(uint32_t i = 0; i < n; i++)
+  {
+    const coinmarketcap_coin_t *c = &rows[i];
+
+    if(c->pct_24h > 0.0)      out->up++;
+    else if(c->pct_24h < 0.0) out->down++;
+
+    if(c->pct_24h > out->best_pct)
+    {
+      out->best_pct = c->pct_24h;
+      snprintf(out->best, sizeof(out->best), "%s", c->symbol);
+    }
+
+    if(c->pct_24h < out->worst_pct)
+    {
+      out->worst_pct = c->pct_24h;
+      snprintf(out->worst, sizeof(out->worst), "%s", c->symbol);
+    }
+  }
+
+  out->counted = (int32_t)n;
+  out->valid   = true;
+
+  mem_free(rows);
+}
+
+static void
+crypto_reply_mcap(const cmd_ctx_t *ctx, const coinmarketcap_global_t *g)
+{
+  crypto_breadth_t breadth;
+  char             line[CRYPTO_REPLY_SZ];
+  char             cap[32], vol[32], vol_rep[32], alt[32];
+  char             cap_mv[48], vol_mv[48];
+  char             btc_mv[48], eth_mv[48];
+  char             defi_c[32], defi_v[32], defi_mv[48];
+  char             stable_c[32], stable_v[32], stable_mv[48];
+  char             deriv_v[32], deriv_mv[48];
+  char             n_active[24], n_total[24], n_exch[24], n_pairs[24];
+  char             n_new[24];
+  char             age[24];
+  double           turnover  = 0.0;
+  double           alt_share = 0.0;
+
+  crypto_fmt_usd(g->total_cap,          cap,      sizeof(cap));
+  crypto_fmt_usd(g->total_vol,          vol,      sizeof(vol));
+  crypto_fmt_usd(g->total_vol_reported, vol_rep,  sizeof(vol_rep));
+  crypto_fmt_usd(g->altcoin_cap,        alt,      sizeof(alt));
+  crypto_fmt_usd(g->defi_cap,           defi_c,   sizeof(defi_c));
+  crypto_fmt_usd(g->defi_vol_24h,       defi_v,   sizeof(defi_v));
+  crypto_fmt_usd(g->stablecoin_cap,     stable_c, sizeof(stable_c));
+  crypto_fmt_usd(g->stablecoin_vol,     stable_v, sizeof(stable_v));
+  crypto_fmt_usd(g->derivatives_vol,    deriv_v,  sizeof(deriv_v));
+
+  crypto_fmt_move(crypto_pct_change(g->total_cap, g->total_cap_yest,
+      g->total_cap_chg_24h), cap_mv, sizeof(cap_mv));
+  crypto_fmt_move(crypto_pct_change(g->total_vol, g->total_vol_yest,
+      g->total_vol_chg_24h), vol_mv, sizeof(vol_mv));
+
+  crypto_fmt_points(g->btc_dom_chg_24h, btc_mv, sizeof(btc_mv));
+  crypto_fmt_points(g->eth_dom_chg_24h, eth_mv, sizeof(eth_mv));
+
+  crypto_fmt_move(g->defi_chg_24h,        defi_mv,   sizeof(defi_mv));
+  crypto_fmt_move(g->stablecoin_chg_24h,  stable_mv, sizeof(stable_mv));
+  crypto_fmt_move(g->derivatives_chg_24h, deriv_mv,  sizeof(deriv_mv));
+
+  crypto_fmt_count(g->active_cryptos,      n_active, sizeof(n_active));
+  crypto_fmt_count(g->total_cryptos,       n_total,  sizeof(n_total));
+  crypto_fmt_count(g->active_exchanges,    n_exch,   sizeof(n_exch));
+  crypto_fmt_count(g->active_market_pairs, n_pairs,  sizeof(n_pairs));
+  crypto_fmt_count(g->new_cryptos_24h,     n_new,    sizeof(n_new));
+
+  crypto_fmt_age(g->fetched_at > 0
+      ? (int64_t)time(NULL) - g->fetched_at : 0, age, sizeof(age));
+
+  // Turnover — the slice of total capitalisation that changed hands in
+  // the last day. The single best one-number read on market heat.
+  if(g->total_cap > 0.0)
+  {
+    turnover  = (g->total_vol / g->total_cap) * 100.0;
+    alt_share = (g->altcoin_cap / g->total_cap) * 100.0;
+  }
 
   snprintf(line, sizeof(line),
-      CLR_BOLD CLR_WHITE "Global Cryptocurrency Market" CLR_RESET);
-  cmd_reply(ctx, line);
-
-  snprintf(line, sizeof(line), "Market Cap: %s (%s)", cap, cap_chg);
-  cmd_reply(ctx, line);
-
-  snprintf(line, sizeof(line), "Volume (24h): %s (%s)", vol, vol_chg);
+      CLR_BOLD CLR_WHITE "Global Cryptocurrency Market" CLR_RESET
+      "  " CLR_GRAY "as of %s ago" CLR_RESET, age);
   cmd_reply(ctx, line);
 
   snprintf(line, sizeof(line),
-      "Dominance:  BTC: " CLR_YELLOW "%.1f%%" CLR_RESET
-      "  ETH: " CLR_CYAN "%.1f%%" CLR_RESET,
-      g->btc_dom, g->eth_dom);
+      CRYPTO_CARD_LABEL CLR_BOLD CLR_WHITE "%s" CLR_RESET " %s"
+      CRYPTO_CARD_DOT "24h volume " CLR_WHITE "%s" CLR_RESET " %s"
+      CLR_GRAY " (%s reported)" CLR_RESET
+      CRYPTO_CARD_DOT "turnover " CLR_WHITE "%.1f%%" CLR_RESET,
+      "Market", cap, cap_mv, vol, vol_mv, vol_rep, turnover);
   cmd_reply(ctx, line);
 
   snprintf(line, sizeof(line),
-      "Active:  Cryptocurrencies: %d  Exchanges: %d",
-      g->active_cryptos, g->active_exchanges);
+      CRYPTO_CARD_LABEL CLR_YELLOW "BTC" CLR_RESET " %.1f%% %s"
+      CRYPTO_CARD_DOT CLR_CYAN "ETH" CLR_RESET " %.1f%% %s"
+      CRYPTO_CARD_DOT "altcoins " CLR_WHITE "%s" CLR_RESET " (%.1f%%)",
+      "Dominance", g->btc_dom, btc_mv, g->eth_dom, eth_mv, alt, alt_share);
+  cmd_reply(ctx, line);
+
+  // Each sector's percentage belongs to its 24-hour volume, so the cap
+  // and the traded figure are stated side by side and the arrow sits
+  // against the one it actually describes.
+  snprintf(line, sizeof(line),
+      CRYPTO_CARD_LABEL "stablecoins " CLR_WHITE "%s" CLR_RESET " cap, "
+      CLR_WHITE "%s" CLR_RESET " traded %s"
+      CRYPTO_CARD_DOT "DeFi " CLR_WHITE "%s" CLR_RESET " cap, "
+      CLR_WHITE "%s" CLR_RESET " traded %s"
+      CRYPTO_CARD_DOT "derivatives " CLR_WHITE "%s" CLR_RESET " traded %s",
+      "Sectors", stable_c, stable_v, stable_mv, defi_c, defi_v, defi_mv,
+      deriv_v, deriv_mv);
   cmd_reply(ctx, line);
 
   snprintf(line, sizeof(line),
-      "DeFi:  Market Cap: %s  Volume (24h): %s", defi_c, defi_v);
+      CRYPTO_CARD_LABEL CLR_WHITE "%s" CLR_RESET " active of "
+      CLR_WHITE "%s" CLR_RESET " tracked"
+      CRYPTO_CARD_DOT CLR_WHITE "%s" CLR_RESET " exchanges"
+      CRYPTO_CARD_DOT CLR_WHITE "%s" CLR_RESET " market pairs"
+      CRYPTO_CARD_DOT CLR_WHITE "%s" CLR_RESET " new in 24h",
+      "Universe", n_active, n_total, n_exch, n_pairs, n_new);
   cmd_reply(ctx, line);
 
-  snprintf(line, sizeof(line),
-      "Stablecoins:  Market Cap: %s  Volume (24h): %s", stable_c, stable_v);
-  cmd_reply(ctx, line);
+  crypto_breadth_survey(&breadth);
 
-  snprintf(line, sizeof(line),
-      "Derivatives:  Volume (24h): %s", deriv_v);
-  cmd_reply(ctx, line);
+  if(breadth.valid)
+  {
+    char best[48], worst[48];
+
+    crypto_fmt_move(breadth.best_pct,  best,  sizeof(best));
+    crypto_fmt_move(breadth.worst_pct, worst, sizeof(worst));
+
+    snprintf(line, sizeof(line),
+        CRYPTO_CARD_LABEL "top %" PRId32 ": " CLR_GREEN "%" PRId32
+        " up" CLR_RESET " / " CLR_RED "%" PRId32 " down" CLR_RESET
+        CRYPTO_CARD_DOT "best " CLR_WHITE "%s" CLR_RESET " %s"
+        CRYPTO_CARD_DOT "worst " CLR_WHITE "%s" CLR_RESET " %s",
+        "Breadth", breadth.counted, breadth.up, breadth.down,
+        breadth.best, best, breadth.worst, worst);
+    cmd_reply(ctx, line);
+  }
 }
 
 // Request factory — deep-copies the command context so it survives
@@ -1011,13 +1387,13 @@ crypto_done_detail(const coinmarketcap_detail_result_t *res, void *user)
   if(res->err[0] != '\0')
     cmd_reply(&ctx, res->err);
   else
-    crypto_reply_verbose(&ctx, &res->detail);
+    crypto_reply_verbose(&ctx, &res->detail, &res->info);
 
   mem_free(r);
 }
 
 static void
-crypto_done_global(const coinmarketcap_global_result_t *res, void *user)
+crypto_done_mcap(const coinmarketcap_global_result_t *res, void *user)
 {
   crypto_req_t *r   = (crypto_req_t *)user;
   cmd_ctx_t     ctx = r->ctx;
@@ -1027,7 +1403,7 @@ crypto_done_global(const coinmarketcap_global_result_t *res, void *user)
   if(res->err[0] != '\0')
     cmd_reply(&ctx, res->err);
   else
-    crypto_reply_global(&ctx, &res->global);
+    crypto_reply_mcap(&ctx, &res->global);
 
   mem_free(r);
 }
@@ -1069,8 +1445,8 @@ crypto_cmd_crypto(const cmd_ctx_t *ctx)
 
   stack_req.limit = coinmarketcap_default_limit_kv_value();
 
-  // Global mode: serve from cache if fresh, otherwise fetch.
-  if(stack_req.kind == CRYPTO_REQ_GLOBAL)
+  // --mcap: serve from cache if fresh, otherwise fetch.
+  if(stack_req.kind == CRYPTO_REQ_MCAP)
   {
     if(coinmarketcap_global_cache_fresh())
     {
@@ -1078,18 +1454,18 @@ crypto_cmd_crypto(const cmd_ctx_t *ctx)
 
       if(coinmarketcap_get_global(&g) == SUCCESS)
       {
-        crypto_reply_global(ctx, &g);
+        crypto_reply_mcap(ctx, &g);
         return;
       }
     }
 
     r = crypto_req_new(ctx);
-    r->kind = CRYPTO_REQ_GLOBAL;
+    r->kind = CRYPTO_REQ_MCAP;
 
-    if(coinmarketcap_fetch_global_async(crypto_done_global, r) != SUCCESS)
+    if(coinmarketcap_fetch_global_async(crypto_done_mcap, r) != SUCCESS)
     {
       cmd_reply(ctx,
-          "Error: failed to submit global request. "
+          "Error: failed to submit market-wide request. "
           "Check plugin.coinmarketcap.creds.apikey.");
       mem_free(r);
     }
@@ -1156,10 +1532,13 @@ crypto_cmd_crypto(const cmd_ctx_t *ctx)
 
 // NL hints
 
+// The symbol is optional because the market-wide card takes none: a
+// question about "the market" must not be answered with an invented
+// ticker.
 static const cmd_nl_slot_t crypto_nl_slots[] = {
   { .name  = "symbol",
     .type  = CMD_NL_ARG_FREE,
-    .flags = CMD_NL_SLOT_REQUIRED },
+    .flags = CMD_NL_SLOT_OPTIONAL },
 };
 
 static const cmd_nl_example_t crypto_nl_examples[] = {
@@ -1167,11 +1546,16 @@ static const cmd_nl_example_t crypto_nl_examples[] = {
     .invocation = "/crypto BTC" },
   { .utterance  = "price of ETH",
     .invocation = "/crypto ETH" },
+  { .utterance  = "how's the crypto market doing?",
+    .invocation = "/crypto --mcap" },
+  { .utterance  = "what's the total market cap right now?",
+    .invocation = "/crypto --mcap" },
 };
 
 static const cmd_nl_t crypto_nl = {
-  .when          = "User asks for a cryptocurrency spot price.",
-  .syntax        = "/crypto <TICKER>",
+  .when          = "User asks for a cryptocurrency spot price, or for the "
+                   "state of the cryptocurrency market as a whole.",
+  .syntax        = "/crypto <TICKER> | /crypto --mcap",
   .slots         = crypto_nl_slots,
   .slot_count    = (uint8_t)(sizeof(crypto_nl_slots)
                              / sizeof(crypto_nl_slots[0])),
@@ -1186,10 +1570,15 @@ static bool
 crypto_init(void)
 {
   if(cmd_register(CRYPTO_CTX, "crypto",
-      "crypto [options] [@list|symbol|rank|range…] | crypto --list"
+      "crypto [options] [@list|symbol|rank|range…] | crypto --verbose <symbol>"
+      " | crypto --mcap | crypto --list"
       " | crypto --add|--del <list> <symbols…>",
       "Show cryptocurrency market data from CoinMarketCap",
       "Quote coins by symbol, rank or range, or a saved list with @name. "
+      "--verbose (-v) gives one coin the full card: price history, "
+      "supply, tags, the chains it is deployed on and its links. "
+      "--mcap reports the whole market: capitalisation, volume, "
+      "dominance, sectors and breadth. "
       "--list shows your lists; --add creates or appends to one and "
       "--del removes symbols (a list disappears when its last symbol "
       "does). Lists are private to your namespace and holding or "

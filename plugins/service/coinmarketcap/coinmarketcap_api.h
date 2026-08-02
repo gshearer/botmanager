@@ -28,6 +28,16 @@
 #define COINMARKETCAP_MAX_SELECT    32
 #define COINMARKETCAP_MAX_LISTINGS  500
 
+// Descriptive metadata (the Info endpoint). Bounded to what a chat line
+// can carry: three tags and a handful of chains, with the totals kept
+// alongside so a reply can honestly say "+9 more".
+#define COINMARKETCAP_TAG_SZ        40
+#define COINMARKETCAP_MAX_TAGS      3
+#define COINMARKETCAP_CHAIN_SZ      32
+#define COINMARKETCAP_MAX_CHAINS    4
+#define COINMARKETCAP_URL_SZ        96
+#define COINMARKETCAP_HANDLE_SZ     32
+
 // Sort column indices (bulk accessor).
 #define COINMARKETCAP_SORT_RANK     0
 #define COINMARKETCAP_SORT_SYMBOL   1
@@ -57,6 +67,30 @@ typedef struct
   int32_t   num_market_pairs;
 } coinmarketcap_coin_t;
 
+// Descriptive metadata for one coin (Info response). This is the slow-
+// moving half of a verbose card — what the thing *is*, rather than what
+// it costs — so the service caches it far longer than a quote and a
+// consumer must tolerate `valid == false` when the lookup failed or the
+// endpoint is outside the account's plan.
+typedef struct
+{
+  bool      valid;
+  char      category[16];               // "coin" or "token"
+  char      tags[COINMARKETCAP_MAX_TAGS][COINMARKETCAP_TAG_SZ];
+  uint8_t   tag_count;
+  char      website[COINMARKETCAP_URL_SZ];
+  char      subreddit[COINMARKETCAP_HANDLE_SZ];
+  char      twitter[COINMARKETCAP_HANDLE_SZ];
+
+  // Chains the token is deployed on, first N of chain_total. Empty for
+  // a coin with its own chain.
+  char      chains[COINMARKETCAP_MAX_CHAINS][COINMARKETCAP_CHAIN_SZ];
+  uint8_t   chain_count;
+  uint8_t   chain_total;
+
+  bool      infinite_supply;
+} coinmarketcap_coin_info_t;
+
 // Extended detail for verbose mode (Quotes Latest response).
 typedef struct
 {
@@ -70,22 +104,55 @@ typedef struct
   char                  date_added[COINMARKETCAP_DATE_SZ];
 } coinmarketcap_coin_detail_t;
 
-// Global market-metrics snapshot.
+// Global market-metrics snapshot. Every numeric member is optional in
+// the upstream payload — a field CoinMarketCap omits stays 0, so a
+// consumer that wants to distinguish "zero" from "absent" must lean on
+// a companion field (e.g. *_yest) rather than the value alone.
 typedef struct
 {
+  // Universe.
   int32_t   active_cryptos;
+  int32_t   total_cryptos;
   int32_t   active_exchanges;
+  int32_t   total_exchanges;
+  int32_t   active_market_pairs;
+
+  // Dominance, and its move over the last 24 hours in percentage points.
   double    btc_dom;
   double    eth_dom;
+  double    btc_dom_chg_24h;
+  double    eth_dom_chg_24h;
+
+  // New listings admitted in the last day — the token-issuance firehose.
+  int32_t   new_cryptos_24h;
+
+  // Sectors. Each *_chg_24h is the move in that sector's 24-hour volume,
+  // not in its capitalisation.
   double    defi_vol_24h;
   double    defi_cap;
+  double    defi_chg_24h;
   double    stablecoin_vol;
   double    stablecoin_cap;
+  double    stablecoin_chg_24h;
   double    derivatives_vol;
+  double    derivatives_chg_24h;
+
+  // Whole market. `altcoin_*` is everything except Bitcoin, and
+  // total_vol_reported is the unadjusted figure the exchanges claim —
+  // its gap to total_vol is the wash-trading CoinMarketCap discounts.
   double    total_cap;
   double    total_vol;
+  double    total_vol_reported;
   double    total_cap_yest;
   double    total_vol_yest;
+  double    total_cap_chg_24h;
+  double    total_vol_chg_24h;
+  double    altcoin_cap;
+  double    altcoin_vol_24h;
+
+  // Local wall-clock of the fetch that produced this snapshot — the
+  // vintage a consumer reports, not an upstream field.
+  int64_t   fetched_at;
 } coinmarketcap_global_t;
 
 // Async fetch result payloads. On success, err[0] == '\0' and the inner
@@ -96,6 +163,7 @@ typedef struct
 {
   char                        err[128];
   coinmarketcap_coin_detail_t detail;
+  coinmarketcap_coin_info_t   info;
 } coinmarketcap_detail_result_t;
 
 typedef struct

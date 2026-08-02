@@ -34,6 +34,11 @@
 #define CMC_LISTINGS_URL    CMC_BASE_URL "/v1/cryptocurrency/listings/latest"
 #define CMC_QUOTES_URL      CMC_BASE_URL "/v1/cryptocurrency/quotes/latest"
 #define CMC_GLOBAL_URL      CMC_BASE_URL "/v1/global-metrics/quotes/latest"
+#define CMC_INFO_URL        CMC_BASE_URL "/v2/cryptocurrency/info"
+
+// Descriptive metadata barely changes, so it is cached far longer than
+// a quote and by symbol rather than by request.
+#define CMC_INFO_CACHE_N    64
 
 // Size limits.
 #define CMC_APIKEY_SZ       128
@@ -45,6 +50,16 @@
 typedef coinmarketcap_coin_t         cmc_coin_t;
 typedef coinmarketcap_coin_detail_t  cmc_coin_detail_t;
 typedef coinmarketcap_global_t       cmc_global_t;
+typedef coinmarketcap_coin_info_t    cmc_info_t;
+
+// One metadata cache slot. `symbol` doubles as the occupancy flag: an
+// empty symbol means the slot has never been filled.
+typedef struct
+{
+  char       symbol[COINMARKETCAP_SYMBOL_SZ];
+  cmc_info_t info;
+  time_t     fetched;
+} cmc_info_slot_t;
 
 // Request type.
 typedef enum
@@ -95,6 +110,11 @@ static pthread_rwlock_t cmc_cache_rwl;
 static cmc_global_t     cmc_global_cache;
 static time_t           cmc_global_cache_time = 0;
 
+// Metadata cache. Its own mutex: lookups are per-command and rare, and
+// they must not queue behind a listings refresh holding cmc_cache_rwl.
+static cmc_info_slot_t  cmc_info_cache[CMC_INFO_CACHE_N];
+static pthread_mutex_t  cmc_info_mu;
+
 // Request freelist.
 static cmc_request_t   *cmc_free     = NULL;
 static pthread_mutex_t  cmc_free_mu;
@@ -111,6 +131,8 @@ static const plugin_kv_entry_t cmc_kv_schema[] = {
     "Enable background price polling (true/false)" },
   { "plugin.coinmarketcap.cache_ttl",     KV_UINT32, "60",
     "Cache time-to-live in seconds for price data" },
+  { "plugin.coinmarketcap.info_ttl",      KV_UINT32, "86400",
+    "Cache time-to-live in seconds for coin metadata (tags, links, chains)" },
   { "plugin.coinmarketcap.default_limit", KV_UINT32, "12",
     "Default number of results to display" },
 };
@@ -120,16 +142,29 @@ static const plugin_kv_entry_t cmc_kv_schema[] = {
 static cmc_request_t   *cmc_req_alloc(void);
 static void             cmc_req_release(cmc_request_t *r);
 
+static bool             cmc_info_lookup(const char *symbol, cmc_info_t *out);
+static void             cmc_info_store(const char *symbol,
+                            const cmc_info_t *info);
+static void             cmc_url_clean(const char *url, char *out, size_t cap);
+static void             cmc_info_parse(struct json_object *item,
+                            cmc_info_t *out);
+
 static bool             cmc_cache_valid(void);
 static void             cmc_cache_populate(struct json_object *data_arr);
 static bool             cmc_global_cache_valid(void);
 static void             cmc_global_cache_store(struct json_object *jdata);
 
 static void             cmc_listings_done(const curl_response_t *resp);
+static void             cmc_info_done(const curl_response_t *resp);
+static bool             cmc_submit_info(cmc_request_t *req);
 static void             cmc_quotes_done(const curl_response_t *resp);
 static void             cmc_global_done(const curl_response_t *resp);
 static bool             cmc_submit_listings(cmc_request_t *req);
-static bool             cmc_submit_quotes(cmc_request_t *req);
+static bool             cmc_abort_unsent(cmc_request_t *req, const char *err);
+static bool             cmc_detail_abort(cmc_request_t *req, bool deliver,
+                            const char *err);
+static bool             cmc_submit_quotes(cmc_request_t *req,
+                            bool deliver_on_fail);
 static bool             cmc_submit_global(cmc_request_t *req);
 
 static void             cmc_poll_tick(task_t *t);

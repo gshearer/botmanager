@@ -22,6 +22,7 @@ alongside its code.
 | Work on plugin lifecycle / hot-reload, or make a plugin's `deinit()` mirror its `init()` | **`PLUGIN.md §Lifecycle Contract` — authoritative, read it rather than any summary** + `core/plugin.c` (`plugin_audit`, `plugin_reclaim`, `plugin_quiesce`, `plugin_reload`) + `core/cmd.c` (`cmd_unregister_path`). Worklist: `/plugin audit <name>`; daemon-free gate: `scripts/plugin_audit.sh`. The one trap the contract cannot check for you: **a pointer another plugin handed you is invisible to every audit** — register a `plugin_unmap_notify_register()` listener or it kills the daemon later |
 | **File a new plugin (which folder?)** | `PLUGIN.md` §Layer Rules (placement decision-tree) |
 | Add a service plugin (external API) | `PLUGIN.md` + `plugins/service/AGENTS.md` |
+| Wire a consumer to a service's `*_async()` API, or write one | **`PLUGIN.md §Async failure semantics` first** — two opposite `FAIL` conventions live in this tree, and picking the wrong one double-frees the consumer's closure and kills the daemon with no FATAL line |
 | Add/modify a protocol driver (IRC, ...) | `PLUGIN.md` + `plugins/protocol/AGENTS.md` + `include/method.h` |
 | Add/modify a method driver (text, voice, ...) | `PLUGIN.md` + `plugins/method/AGENTS.md` + `include/bot.h` |
 | Add/modify a feature plugin (weather, crypto, stock, urlgrabber, userquote, ...) | `PLUGIN.md` + `plugins/feature/AGENTS.md` + `include/bot.h` |

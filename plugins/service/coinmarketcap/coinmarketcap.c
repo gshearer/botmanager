@@ -75,6 +75,200 @@ cmc_global_cache_valid(void)
   return((time(NULL) - cmc_global_cache_time) < (time_t)ttl);
 }
 
+// Metadata cache. Slots are matched case-insensitively by symbol; a
+// write reuses the matching slot, then the first empty one, and only
+// then evicts the least recently fetched.
+
+static bool
+cmc_info_lookup(const char *symbol, cmc_info_t *out)
+{
+  uint32_t ttl   = (uint32_t)kv_get_uint("plugin.coinmarketcap.info_ttl");
+  bool     found = false;
+
+  if(symbol == NULL || symbol[0] == '\0')
+    return(false);
+
+  if(ttl == 0)
+    ttl = 86400;
+
+  pthread_mutex_lock(&cmc_info_mu);
+
+  for(size_t i = 0; i < CMC_INFO_CACHE_N; i++)
+  {
+    const cmc_info_slot_t *s = &cmc_info_cache[i];
+
+    if(s->symbol[0] == '\0' || strcasecmp(s->symbol, symbol) != 0)
+      continue;
+
+    if((time(NULL) - s->fetched) < (time_t)ttl)
+    {
+      *out  = s->info;
+      found = true;
+    }
+
+    break;
+  }
+
+  pthread_mutex_unlock(&cmc_info_mu);
+
+  return(found);
+}
+
+static void
+cmc_info_store(const char *symbol, const cmc_info_t *info)
+{
+  size_t victim = 0;
+  time_t oldest;
+
+  if(symbol == NULL || symbol[0] == '\0')
+    return;
+
+  pthread_mutex_lock(&cmc_info_mu);
+
+  oldest = cmc_info_cache[0].fetched;
+
+  for(size_t i = 0; i < CMC_INFO_CACHE_N; i++)
+  {
+    if(cmc_info_cache[i].symbol[0] == '\0' ||
+       strcasecmp(cmc_info_cache[i].symbol, symbol) == 0)
+    {
+      victim = i;
+      break;
+    }
+
+    if(cmc_info_cache[i].fetched < oldest)
+    {
+      oldest = cmc_info_cache[i].fetched;
+      victim = i;
+    }
+  }
+
+  snprintf(cmc_info_cache[victim].symbol,
+      sizeof(cmc_info_cache[victim].symbol), "%s", symbol);
+  cmc_info_cache[victim].info    = *info;
+  cmc_info_cache[victim].fetched = time(NULL);
+
+  pthread_mutex_unlock(&cmc_info_mu);
+}
+
+// Tidies a URL for a chat line without breaking it: the scheme stays
+// (an IRC client only linkifies what it can open), a bare host gains
+// https://, and the trailing slash goes.
+// "https://bitcoin.org/" -> "https://bitcoin.org".
+static void
+cmc_url_clean(const char *url, char *out, size_t cap)
+{
+  const bool schemed = (url != NULL &&
+      (strncasecmp(url, "https://", 8) == 0 ||
+       strncasecmp(url, "http://",  7) == 0));
+  size_t     len;
+
+  if(url == NULL || url[0] == '\0' || cap == 0)
+    return;
+
+  snprintf(out, cap, "%s%s", schemed ? "" : "https://", url);
+
+  len = strlen(out);
+
+  // Never strip past the scheme's own "//".
+  while(len > 0 && out[len - 1] == '/' && out[len - 2] != '/')
+    out[--len] = '\0';
+}
+
+// Turns one element of the Info response into a cmc_info_t. The shape
+// mixes scalars, a string array (tag-names) and an array of nested
+// objects (contract_address), so it is walked by hand rather than
+// described as a json_spec_t.
+static void
+cmc_info_parse(struct json_object *item, cmc_info_t *out)
+{
+  struct json_object *tags;
+  struct json_object *urls;
+  struct json_object *contracts;
+
+  memset(out, 0, sizeof(*out));
+
+  json_get_str(item, "category", out->category, sizeof(out->category));
+  json_get_str(item, "subreddit", out->subreddit, sizeof(out->subreddit));
+  json_get_str(item, "twitter_username", out->twitter, sizeof(out->twitter));
+  json_get_bool(item, "infinite_supply", &out->infinite_supply);
+
+  tags = json_get_array(item, "tag-names");
+
+  if(tags != NULL)
+  {
+    size_t n = json_object_array_length(tags);
+
+    for(size_t i = 0; i < n && out->tag_count < COINMARKETCAP_MAX_TAGS; i++)
+    {
+      const char *t = json_object_get_string(
+          json_object_array_get_idx(tags, i));
+
+      if(t == NULL || t[0] == '\0')
+        continue;
+
+      snprintf(out->tags[out->tag_count], COINMARKETCAP_TAG_SZ, "%s", t);
+      out->tag_count++;
+    }
+  }
+
+  urls = json_get_obj(item, "urls");
+
+  if(urls != NULL)
+  {
+    struct json_object *web = json_get_array(urls, "website");
+
+    // The list is not ordered by usefulness — Uniswap leads with a blog
+    // post — and the shortest entry is reliably the project's root.
+    if(web != NULL)
+    {
+      size_t      n    = json_object_array_length(web);
+      const char *best = NULL;
+
+      for(size_t i = 0; i < n; i++)
+      {
+        const char *u = json_object_get_string(
+            json_object_array_get_idx(web, i));
+
+        if(u != NULL && u[0] != '\0' &&
+            (best == NULL || strlen(u) < strlen(best)))
+          best = u;
+      }
+
+      cmc_url_clean(best, out->website, sizeof(out->website));
+    }
+  }
+
+  // Every chain the token is deployed on. The count is kept whole even
+  // though only the first few names are stored, so a reply can say how
+  // many were left out.
+  contracts = json_get_array(item, "contract_address");
+
+  if(contracts != NULL)
+  {
+    size_t n = json_object_array_length(contracts);
+
+    out->chain_total = (uint8_t)(n > 255 ? 255 : n);
+
+    for(size_t i = 0; i < n && out->chain_count < COINMARKETCAP_MAX_CHAINS;
+        i++)
+    {
+      struct json_object *plat = json_get_obj(
+          json_object_array_get_idx(contracts, i), "platform");
+      char                name[COINMARKETCAP_CHAIN_SZ] = { 0 };
+
+      if(plat == NULL || !json_get_str(plat, "name", name, sizeof(name)))
+        continue;
+
+      snprintf(out->chains[out->chain_count], COINMARKETCAP_CHAIN_SZ,
+          "%s", name);
+      out->chain_count++;
+    }
+  }
+
+  out->valid = true;
+}
+
 // JSON specs: drive cmc_coin_t and cmc_coin_detail_t population from the
 // CoinMarketCap response shape. The USD sub-spec writes into the base
 // cmc_coin_t (offset 0 on JSON_OBJ) so one json_extract call fills the
@@ -237,10 +431,20 @@ static const json_spec_t cmc_global_usd_spec[] = {
       offsetof(cmc_global_t, total_cap) },
   { JSON_DOUBLE, "total_volume_24h",           false,
       offsetof(cmc_global_t, total_vol) },
+  { JSON_DOUBLE, "total_volume_24h_reported",  false,
+      offsetof(cmc_global_t, total_vol_reported) },
   { JSON_DOUBLE, "total_market_cap_yesterday", false,
       offsetof(cmc_global_t, total_cap_yest) },
   { JSON_DOUBLE, "total_volume_24h_yesterday", false,
       offsetof(cmc_global_t, total_vol_yest) },
+  { JSON_DOUBLE, "total_market_cap_yesterday_percentage_change", false,
+      offsetof(cmc_global_t, total_cap_chg_24h) },
+  { JSON_DOUBLE, "total_volume_24h_yesterday_percentage_change", false,
+      offsetof(cmc_global_t, total_vol_chg_24h) },
+  { JSON_DOUBLE, "altcoin_market_cap",         false,
+      offsetof(cmc_global_t, altcoin_cap) },
+  { JSON_DOUBLE, "altcoin_volume_24h",         false,
+      offsetof(cmc_global_t, altcoin_vol_24h) },
   { JSON_END }
 };
 
@@ -252,22 +456,40 @@ static const json_spec_t cmc_global_quote_spec[] = {
 static const json_spec_t cmc_global_spec[] = {
   { JSON_INT,    "active_cryptocurrencies",false,
       offsetof(cmc_global_t, active_cryptos) },
+  { JSON_INT,    "total_cryptocurrencies", false,
+      offsetof(cmc_global_t, total_cryptos) },
   { JSON_INT,    "active_exchanges",       false,
       offsetof(cmc_global_t, active_exchanges) },
+  { JSON_INT,    "total_exchanges",        false,
+      offsetof(cmc_global_t, total_exchanges) },
+  { JSON_INT,    "active_market_pairs",    false,
+      offsetof(cmc_global_t, active_market_pairs) },
+  { JSON_INT,    "past_24h_incremental_crypto_number", false,
+      offsetof(cmc_global_t, new_cryptos_24h) },
   { JSON_DOUBLE, "btc_dominance",          false,
       offsetof(cmc_global_t, btc_dom) },
   { JSON_DOUBLE, "eth_dominance",          false,
       offsetof(cmc_global_t, eth_dom) },
+  { JSON_DOUBLE, "btc_dominance_24h_percentage_change", false,
+      offsetof(cmc_global_t, btc_dom_chg_24h) },
+  { JSON_DOUBLE, "eth_dominance_24h_percentage_change", false,
+      offsetof(cmc_global_t, eth_dom_chg_24h) },
   { JSON_DOUBLE, "defi_volume_24h",        false,
       offsetof(cmc_global_t, defi_vol_24h) },
   { JSON_DOUBLE, "defi_market_cap",        false,
       offsetof(cmc_global_t, defi_cap) },
+  { JSON_DOUBLE, "defi_24h_percentage_change", false,
+      offsetof(cmc_global_t, defi_chg_24h) },
   { JSON_DOUBLE, "stablecoin_volume_24h",  false,
       offsetof(cmc_global_t, stablecoin_vol) },
   { JSON_DOUBLE, "stablecoin_market_cap",  false,
       offsetof(cmc_global_t, stablecoin_cap) },
+  { JSON_DOUBLE, "stablecoin_24h_percentage_change", false,
+      offsetof(cmc_global_t, stablecoin_chg_24h) },
   { JSON_DOUBLE, "derivatives_volume_24h", false,
       offsetof(cmc_global_t, derivatives_vol) },
+  { JSON_DOUBLE, "derivatives_24h_percentage_change", false,
+      offsetof(cmc_global_t, derivatives_chg_24h) },
   { JSON_OBJ,    "quote",                  false, 0,
       .sub = cmc_global_quote_spec },
   { JSON_END }
@@ -278,7 +500,8 @@ cmc_global_cache_store(struct json_object *jdata)
 {
   memset(&cmc_global_cache, 0, sizeof(cmc_global_cache));
   json_extract(jdata, &cmc_global_cache, cmc_global_spec, CMC_CTX ":global");
-  cmc_global_cache_time = time(NULL);
+  cmc_global_cache_time         = time(NULL);
+  cmc_global_cache.fetched_at   = (int64_t)cmc_global_cache_time;
 }
 
 // Callback-dispatch helpers. On failure these fire the typed callback
@@ -375,26 +598,137 @@ cmc_submit_listings(cmc_request_t *req)
       CURL_METHOD_GET, url, cmc_listings_done, req);
 
   if(cr == NULL)
-  {
-    cmc_deliver_listings_fail(req, "Error: failed to create API request");
-    return(FAIL);
-  }
+    return(cmc_abort_unsent(req,
+        "Error: failed to create API request"));
 
   snprintf(hdr, sizeof(hdr), "X-CMC_PRO_API_KEY: %s", req->apikey);
   curl_request_add_header(cr, hdr);
   curl_request_add_header(cr, "Accept: application/json");
 
   if(curl_request_submit(cr) != SUCCESS)
-  {
-    cmc_deliver_listings_fail(req, "Error: failed to submit API request");
-    return(FAIL);
-  }
+    return(cmc_abort_unsent(req,
+        "Error: failed to submit API request"));
 
   return(SUCCESS);
 }
 
+// Metadata leg of a detail request. Whatever happens here the request
+// continues on to the quote — a card without tags is still a card — so
+// every path ends in cmc_submit_quotes and none of them delivers a
+// failure to the consumer.
+static void
+cmc_info_done(const curl_response_t *resp)
+{
+  char                errbuf[CMC_ERR_SZ];
+  const char         *err;
+  struct json_object *root;
+  struct json_object *jdata = NULL;
+  struct json_object *item  = NULL;
+  cmc_request_t      *r     = (cmc_request_t *)resp->user_data;
+
+  err = cmc_classify_http(resp, errbuf, sizeof(errbuf));
+
+  if(err != NULL)
+  {
+    clam(CLAM_DEBUG, CMC_CTX, "info fetch failed for %s: %s", r->symbol, err);
+    cmc_submit_quotes(r, true);
+    return;
+  }
+
+  root = json_parse_buf(resp->body, resp->body_len, CMC_CTX);
+
+  if(root == NULL || !json_object_object_get_ex(root, "data", &jdata) ||
+      jdata == NULL)
+  {
+    clam(CLAM_DEBUG, CMC_CTX, "info response unusable for %s", r->symbol);
+
+    if(root != NULL)
+      json_object_put(root);
+
+    cmc_submit_quotes(r, true);
+    return;
+  }
+
+  // data is keyed by the requested symbol and holds an array of matches.
+  {
+    struct json_object_iterator it  = json_object_iter_begin(jdata);
+    struct json_object_iterator end = json_object_iter_end(jdata);
+
+    if(!json_object_iter_equal(&it, &end))
+      item = json_object_iter_peek_value(&it);
+  }
+
+  if(item != NULL && json_object_is_type(item, json_type_array))
+    item = json_object_array_length(item) > 0
+        ? json_object_array_get_idx(item, 0) : NULL;
+
+  if(item != NULL)
+  {
+    cmc_info_t info;
+
+    cmc_info_parse(item, &info);
+    cmc_info_store(r->symbol, &info);
+  }
+
+  json_object_put(root);
+  cmc_submit_quotes(r, true);
+}
+
 static bool
-cmc_submit_quotes(cmc_request_t *req)
+cmc_submit_info(cmc_request_t *req)
+{
+  curl_request_t *cr;
+  char            hdr[CMC_HDR_SZ];
+  char            url[CMC_URL_SZ];
+
+  snprintf(url, sizeof(url), CMC_INFO_URL "?symbol=%s", req->symbol);
+
+  cr = curl_request_create(CURL_METHOD_GET, url, cmc_info_done, req);
+
+  if(cr == NULL)
+    return(cmc_submit_quotes(req, false));
+
+  snprintf(hdr, sizeof(hdr), "X-CMC_PRO_API_KEY: %s", req->apikey);
+  curl_request_add_header(cr, hdr);
+  curl_request_add_header(cr, "Accept: application/json");
+
+  if(curl_request_submit(cr) != SUCCESS)
+    return(cmc_submit_quotes(req, false));
+
+  return(SUCCESS);
+}
+
+// A request that never reached the wire, dropped while its caller is
+// still on the stack. The header promises that on FAIL the callback is
+// NOT invoked — the caller owns the user-facing message — so firing it
+// here as well is what makes a consumer reply twice and free its
+// closure twice. The reason survives in the log instead.
+static bool
+cmc_abort_unsent(cmc_request_t *req, const char *err)
+{
+  clam(CLAM_WARN, CMC_CTX, "request dropped before submit: %s", err);
+  cmc_req_release(req);
+
+  return(FAIL);
+}
+
+// Detail requests have a second leg: once the metadata fetch has
+// returned, the caller is long gone and the consumer is reachable only
+// through its callback. `deliver` distinguishes the two cases.
+static bool
+cmc_detail_abort(cmc_request_t *req, bool deliver, const char *err)
+{
+  if(deliver)
+  {
+    cmc_deliver_detail_fail(req, err);
+    return(FAIL);
+  }
+
+  return(cmc_abort_unsent(req, err));
+}
+
+static bool
+cmc_submit_quotes(cmc_request_t *req, bool deliver_on_fail)
 {
   curl_request_t *cr;
   char hdr[CMC_HDR_SZ];
@@ -424,11 +758,8 @@ cmc_submit_quotes(cmc_request_t *req)
     pthread_rwlock_unlock(&cmc_cache_rwl);
 
     if(coin_id <= 0)
-    {
-      cmc_deliver_detail_fail(req,
-          "Error: rank lookup requires cached data.");
-      return(FAIL);
-    }
+      return(cmc_detail_abort(req, deliver_on_fail,
+          "Error: rank lookup requires cached data."));
 
     snprintf(url, sizeof(url),
         CMC_QUOTES_URL "?id=%d&convert=USD", coin_id);
@@ -438,10 +769,8 @@ cmc_submit_quotes(cmc_request_t *req)
       CURL_METHOD_GET, url, cmc_quotes_done, req);
 
   if(cr == NULL)
-  {
-    cmc_deliver_detail_fail(req, "Error: failed to create API request");
-    return(FAIL);
-  }
+    return(cmc_detail_abort(req, deliver_on_fail,
+        "Error: failed to create API request"));
 
   snprintf(hdr, sizeof(hdr), "X-CMC_PRO_API_KEY: %s", req->apikey);
   curl_request_add_header(cr, hdr);
@@ -466,20 +795,16 @@ cmc_submit_global(cmc_request_t *req)
       cmc_global_done, req);
 
   if(cr == NULL)
-  {
-    cmc_deliver_global_fail(req, "Error: failed to create API request");
-    return(FAIL);
-  }
+    return(cmc_abort_unsent(req,
+        "Error: failed to create API request"));
 
   snprintf(hdr, sizeof(hdr), "X-CMC_PRO_API_KEY: %s", req->apikey);
   curl_request_add_header(cr, hdr);
   curl_request_add_header(cr, "Accept: application/json");
 
   if(curl_request_submit(cr) != SUCCESS)
-  {
-    cmc_deliver_global_fail(req, "Error: failed to submit API request");
-    return(FAIL);
-  }
+    return(cmc_abort_unsent(req,
+        "Error: failed to submit API request"));
 
   return(SUCCESS);
 }
@@ -603,6 +928,11 @@ cmc_quotes_done(const curl_response_t *resp)
   json_extract(item, &res.detail.base, cmc_coin_spec, CMC_CTX ":coin");
   json_extract(item, &res.detail,
       cmc_coin_detail_extra_spec, CMC_CTX ":detail");
+
+  // Metadata is decoration: whatever is cached by now rides along, and
+  // a miss simply leaves res.info.valid false. A rank lookup only ever
+  // hits here if some earlier request warmed the same symbol.
+  cmc_info_lookup(res.detail.base.symbol, &res.info);
 
   if(!r->is_poll && r->cb.detail != NULL)
     r->cb.detail(&res, r->user);
@@ -894,7 +1224,17 @@ coinmarketcap_fetch_detail_async(const char *symbol, int32_t rank,
   else
     r->rank = rank;
 
-  return(cmc_submit_quotes(r));
+  // A symbol we have no metadata for takes the long way round: fetch
+  // the description first, then the quote. Metadata barely changes, so
+  // this second call is paid roughly once a day per coin.
+  {
+    cmc_info_t cached;
+
+    if(r->symbol[0] != '\0' && !cmc_info_lookup(r->symbol, &cached))
+      return(cmc_submit_info(r));
+  }
+
+  return(cmc_submit_quotes(r, false));
 }
 
 bool
@@ -938,8 +1278,10 @@ static bool
 cmc_init(void)
 {
   pthread_mutex_init(&cmc_free_mu, NULL);
+  pthread_mutex_init(&cmc_info_mu, NULL);
   pthread_rwlock_init(&cmc_cache_rwl, NULL);
   memset(cmc_cache, 0, sizeof(cmc_cache));
+  memset(cmc_info_cache, 0, sizeof(cmc_info_cache));
   memset(&cmc_global_cache, 0, sizeof(cmc_global_cache));
 
   clam(CLAM_INFO, CMC_CTX, "coinmarketcap plugin initialized");
@@ -1010,6 +1352,7 @@ cmc_deinit(void)
 
   pthread_mutex_unlock(&cmc_free_mu);
   pthread_mutex_destroy(&cmc_free_mu);
+  pthread_mutex_destroy(&cmc_info_mu);
 
   pthread_rwlock_destroy(&cmc_cache_rwl);
 

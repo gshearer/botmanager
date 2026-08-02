@@ -76,8 +76,25 @@ typedef enum
 {
   CRYPTO_REQ_TABLE,
   CRYPTO_REQ_VERBOSE,
-  CRYPTO_REQ_GLOBAL
+  CRYPTO_REQ_MCAP     // --mcap: the whole-market card
 } crypto_req_kind_t;
+
+// --mcap breadth: how many of the top-ranked coins are advancing, and
+// the day's extremes among them. Derived from the listings cache when it
+// happens to be warm — the card never spends an API credit to fill it.
+#define CRYPTO_BREADTH_N  100
+
+typedef struct
+{
+  bool    valid;
+  int32_t counted;
+  int32_t up;
+  int32_t down;
+  char    best[COINMARKETCAP_SYMBOL_SZ];
+  double  best_pct;
+  char    worst[COINMARKETCAP_SYMBOL_SZ];
+  double  worst_pct;
+} crypto_breadth_t;
 
 // Selector kinds for argument parsing.
 typedef enum
