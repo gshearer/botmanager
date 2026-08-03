@@ -448,9 +448,13 @@ resolve_task(task_t *t)
     resolve_via_res_query(req, &result);
 
   if(result.status != 0)
+  {
+    __atomic_fetch_add(&resolve_stat_failures, 1, __ATOMIC_RELAXED);
+
     clam(CLAM_DEBUG, "resolve", "%s %s: %s",
         resolve_type_name(req->qtype), req->name,
         result.error ? result.error : "unknown error");
+  }
 
   else
     clam(CLAM_DEBUG, "resolve", "%s %s: %u record(s)",
@@ -487,6 +491,12 @@ resolve_lookup(const char *name, resolve_type_t qtype,
   if(name[0] == '\0')
     return(FAIL);
 
+  // Bound the type before it indexes the per-type counters. Cast so a
+  // negative value wraps into the same rejection rather than tripping
+  // a signedness warning on an enum the compiler picked unsigned.
+  if((unsigned)qtype >= RESOLVE_TYPE_COUNT)
+    return(FAIL);
+
   // Capacity check.
   pthread_mutex_lock(&resolve_req_lock);
   at_cap = (resolve_pending >= resolve_cfg.max_pending);
@@ -506,6 +516,11 @@ resolve_lookup(const char *name, resolve_type_t qtype,
   req->cb        = cb;
   req->user_data = user_data;
   req->submitted = time(NULL);
+
+  // Counted at submission, so an in-flight lookup is already visible
+  // in /show resolve; resolve_task() books any failure on completion.
+  __atomic_fetch_add(&resolve_stat_queries, 1, __ATOMIC_RELAXED);
+  __atomic_fetch_add(&resolve_stat_by_type[qtype], 1, __ATOMIC_RELAXED);
 
   task_add("resolve", TASK_THREAD, 100, resolve_task, req);
   return(SUCCESS);
@@ -1024,13 +1039,21 @@ resolve_register_commands(void)
 
 // Statistics
 
+// Counters are read independently, so a concurrent submission can land
+// between two loads: totals are a coherent snapshot only at rest, which
+// is all a status view needs.
 void
 resolve_get_stats(resolve_stats_t *out)
 {
   if(out == NULL)
     return;
 
-  memset(out, 0, sizeof(*out));
+  out->queries  = __atomic_load_n(&resolve_stat_queries,  __ATOMIC_RELAXED);
+  out->failures = __atomic_load_n(&resolve_stat_failures, __ATOMIC_RELAXED);
+
+  for(uint32_t i = 0; i < RESOLVE_TYPE_COUNT; i++)
+    out->by_type[i] = __atomic_load_n(&resolve_stat_by_type[i],
+        __ATOMIC_RELAXED);
 }
 
 // Lifecycle
