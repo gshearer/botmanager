@@ -212,6 +212,20 @@ static resolve_cmd_request_t *resolve_cmd_free = NULL;
 static pthread_mutex_t        resolve_cmd_free_mu;
 
 static bool resolve_validate_target(const char *str);
+static bool resolve_validate_verbose(const char *str);
+
+// Argument descriptor for `resolve <target> [-v]`. Without this the
+// dispatcher leaves ctx->parsed NULL and the handler faults on its
+// first line, so the table is the command's contract, not a nicety.
+// The verbose slot takes the default length so that a near-miss flag
+// ("-vv") reaches the validator whole and is rejected rather than
+// silently truncated into a match.
+static const cmd_arg_desc_t ad_resolve[] = {
+  { "target",  CMD_ARG_CUSTOM, CMD_ARG_REQUIRED, RESOLVE_NAME_SZ - 1,
+      resolve_validate_target  },
+  { "verbose", CMD_ARG_CUSTOM, CMD_ARG_OPTIONAL, 0,
+      resolve_validate_verbose },
+};
 
 #endif // RESOLVE_INTERNAL
 

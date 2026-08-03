@@ -812,6 +812,39 @@ resolve_cmd_format(resolve_cmd_request_t *r)
   }
 }
 
+// Retire n outstanding queries.  The last one out owns the reply and
+// recycles the request, so no caller may touch r after this returns.
+static void
+resolve_cmd_complete(resolve_cmd_request_t *r, uint8_t n)
+{
+  bool done;
+
+  pthread_mutex_lock(&r->mu);
+  r->pending = (r->pending > n) ? (uint8_t)(r->pending - n) : 0;
+  done       = (r->pending == 0);
+  pthread_mutex_unlock(&r->mu);
+
+  if(!done)
+    return;
+
+  // Sole survivor: the counter reaching zero fences every other
+  // callback, so the accumulated records need no further locking.
+
+  if(r->count == 0 && r->errors > 0)
+  {
+    char line[RESOLVE_CMD_REPLY_SZ];
+
+    snprintf(line, sizeof(line),
+        CLR_RED "Lookup failed for %s" CLR_RESET, r->target);
+    cmd_reply(&r->ctx, line);
+  }
+
+  else
+    resolve_cmd_format(r);
+
+  resolve_cmd_req_release(r);
+}
+
 // Resolver callback for the !resolve command.  Accumulates records
 // across parallel queries.  When the last query completes, formats
 // and sends results to the user.
@@ -820,7 +853,6 @@ static void
 resolve_cmd_cb(const resolve_result_t *result)
 {
   resolve_cmd_request_t *r = result->user_data;
-  bool                   done;
 
   pthread_mutex_lock(&r->mu);
 
@@ -840,27 +872,9 @@ resolve_cmd_cb(const resolve_result_t *result)
   else if(result->status != 0)
     r->errors++;
 
-  r->pending--;
-  done = (r->pending == 0);
-
   pthread_mutex_unlock(&r->mu);
 
-  if(done)
-  {
-    if(r->count == 0 && r->errors > 0)
-    {
-      char line[RESOLVE_CMD_REPLY_SZ];
-
-      snprintf(line, sizeof(line),
-          CLR_RED "Lookup failed for %s" CLR_RESET, r->target);
-      cmd_reply(&r->ctx, line);
-    }
-
-    else
-      resolve_cmd_format(r);
-
-    resolve_cmd_req_release(r);
-  }
+  resolve_cmd_complete(r, 1);
 }
 
 static void
@@ -966,6 +980,8 @@ resolve_cmd_resolve(const cmd_ctx_t *ctx)
     if(resolve_lookup(target, qtypes[i], resolve_cmd_cb, req) == SUCCESS)
       submitted++;
 
+  // Nothing was submitted, so no callback can be in flight and the
+  // request is ours to recycle outright.
   if(submitted == 0)
   {
     cmd_reply(ctx, CLR_RED "Error: resolver busy" CLR_RESET);
@@ -973,13 +989,12 @@ resolve_cmd_resolve(const cmd_ctx_t *ctx)
     return;
   }
 
-  // Adjust pending if some submissions failed.
+  // pending was primed with the full query count before the loop, so
+  // the rejected submissions still have to be retired.  A callback may
+  // already have run by now -- adjust the counter, never assign to it,
+  // or their decrements are lost and the reply never fires.
   if(submitted < qcount)
-  {
-    pthread_mutex_lock(&req->mu);
-    req->pending = submitted;
-    pthread_mutex_unlock(&req->mu);
-  }
+    resolve_cmd_complete(req, (uint8_t)(qcount - submitted));
 }
 
 // Register the !resolve user command.
@@ -1003,7 +1018,8 @@ resolve_register_commands(void)
       "  !resolve 8.8.8.8\n"
       "  !resolve 2001:4860:4860::8888",
       USERNS_GROUP_EVERYONE, 0, CMD_SCOPE_ANY, METHOD_T_ANY, resolve_cmd_resolve, NULL, NULL, "res",
-      NULL, 0, NULL, NULL);
+      ad_resolve, (uint8_t)(sizeof(ad_resolve) / sizeof(ad_resolve[0])),
+      NULL, NULL);
 }
 
 // Statistics
