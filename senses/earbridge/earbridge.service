@@ -40,7 +40,19 @@ Wants=network-online.target
 Type=simple
 User=pollen
 WorkingDirectory=/home/pollen/earbridge
-ExecStart=/home/pollen/earbridge/earbridge --daemon-url http://127.0.0.1:8000 --take ch0
+# --floor-db is the knob you will actually tune, so it is spelled out here
+# rather than left to the compiled default. The XVF3800's speech flag fires on
+# the CM4's own cooling fan, and whisper turns that into confident English, so
+# earbridge measures the loudest 250 ms of each utterance and drops anything
+# below this. Measured 2026-08-04: fan worst window -42 dBFS, noisiest false
+# utterance -40.3, quietest real speech -13.7 — hence -35.
+#
+# Tuning it: watch `quiet_discards` against `utterances` in /health.
+#   real speech being dropped   -> LOWER it (more negative), e.g. -40
+#   fan still getting through   -> RAISE it, e.g. -32
+# The fan is not stationary (it drifted 22 dB in eight minutes), so expect to
+# revisit this. -90 or below disables the gate entirely.
+ExecStart=/home/pollen/earbridge/earbridge --daemon-url http://127.0.0.1:8000 --take ch0 --floor-db -35
 # The capture thread already recovers from ALSA errors and reopens the device
 # on its own; Restart is the backstop for something worse, not the strategy.
 Restart=always

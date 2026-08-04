@@ -43,6 +43,29 @@ int main(int, char **);
 #define EB_MAX_S_DEFAULT    25
 #define EB_POLL_HZ_DEFAULT  10
 
+// The energy gate. The XVF3800's speech flag is the only thing telling us an
+// utterance happened, and it is wrong far more often than it is right: over
+// ten minutes of a silent room it produced 23 utterances, all of them the
+// CM4's cooling fan, which whisper then transcribed into confident English
+// ("Thank you." being the favourite). Level alone is what separates the two,
+// so we measure it here rather than shipping the fan to a GPU.
+//
+// Measured on the robot 2026-08-04 (scripts/reachy_mic_probe.sh):
+//
+//   fan, worst 250 ms window          -42.0 dBFS
+//   noisiest false utterance          -40.3 dBFS   (loudest 250 ms)
+//   quietest real speech              -13.7 dBFS   (loudest 250 ms)
+//
+// -35 dBFS therefore clears the noisiest artefact by ~5 dB and sits ~21 dB
+// under real speech. It is a starting point, not a law — the fan is NOT
+// stationary (it drifted 22 dB inside eight minutes), so watch
+// quiet_discards against utterances in /health and move it.
+//
+// A floor at or below -90 dBFS passes everything: no 16-bit sample can be
+// quieter than one LSB, so that is how you turn the gate off.
+#define EB_FLOOR_DB_DEFAULT (-35.0f)
+#define EB_FLOOR_WIN_MS     250
+
 #define EB_WAIT_MS_MAX      30000
 #define EB_REQUEST_MAX      2048
 #define EB_BACKLOG          8
@@ -66,6 +89,7 @@ typedef struct
   uint32_t   min_ms;
   uint32_t   max_s;
   uint32_t   poll_hz;
+  float      floor_db;
   eb_take_t  take;
 } eb_cfg_t;
 
@@ -89,6 +113,7 @@ typedef struct
   atomic_ullong utterances;
   atomic_ullong dropped;          // ring overwrote one before a client read it
   atomic_ullong short_discards;   // shorter than --min-ms
+  atomic_ullong quiet_discards;   // never rose above --floor-db
   atomic_ullong clipped;
   atomic_ullong alsa_recovered;
   atomic_ullong alsa_reopened;
@@ -109,6 +134,11 @@ static void  eb_wav_header(uint8_t *, size_t);
 static snd_pcm_t *eb_pcm_open(void);
 static void *eb_capture_thread(void *);
 static void  eb_publish(const int16_t *, size_t, float, bool);
+
+// Threshold is mean-square per sample, not dB: the conversion happens once at
+// startup so the hot path never calls log10 on a CM4.
+static uint64_t eb_floor_thresh(float);
+static bool     eb_loud_enough(const int16_t *, size_t, uint64_t);
 
 static int   eb_vad_fetch(const eb_cfg_t *, float *, bool *);
 static void *eb_vad_thread(void *);

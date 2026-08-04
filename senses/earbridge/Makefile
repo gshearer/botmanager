@@ -13,7 +13,7 @@
 
 CC      ?= cc
 CFLAGS  ?= -O2 -Wall -Wextra -std=c11 -D_POSIX_C_SOURCE=200809L
-LDLIBS  := -lasound -lpthread
+LDLIBS  := -lasound -lpthread -lm
 
 earbridge: earbridge.c earbridge.h
 	$(CC) $(CFLAGS) -o $@ earbridge.c $(LDLIBS)

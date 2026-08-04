@@ -36,9 +36,22 @@ ExecStartPre=/usr/bin/test -r /mnt/fast/doc/projects/botmanager/senses/whisper/m
 # 08-03); that is the route RCH-4's `whispercpp` stt_dialect posts to, and
 # it is why the STT service URL carries no /v1. Left at the default
 # deliberately — pinning it here would silently diverge from the dialect.
+# --suppress-nst and -nth are the second line of defence against the
+# hallucination documented in plugins/protocol/reachy/TODO.md §HALLUCINATION:
+# whisper invents fluent English from a silent room. earbridge's --floor-db
+# gate stops most of it reaching us at all, but the two are complementary and
+# these cost nothing:
+#   --suppress-nst  suppress non-speech tokens — kills the "*shriek*",
+#                   "*sad music*", "*scoffs*" class outright
+#   -nth 0.8        raise the no-speech threshold from the 0.60 default, so
+#                   marginal segments come back empty instead of invented
+# An empty transcript is already dropped by the driver (reachy.c, the
+# resp->text[0] == '\0' test), so anything whisper declines costs nothing
+# downstream. If real speech starts coming back blank, lower -nth first.
 ExecStart=/usr/bin/whisper-server \
     -m /mnt/fast/doc/projects/botmanager/senses/whisper/models/ggml-large-v3-turbo.bin \
-    --host 127.0.0.1 --port 8004
+    --host 127.0.0.1 --port 8004 \
+    --suppress-nst -nth 0.8
 # The model load is ~1.6 GB off disk into VRAM; give it room before systemd
 # decides the unit is wedged.
 TimeoutStartSec=180

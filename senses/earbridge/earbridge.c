@@ -8,6 +8,7 @@
 
 #include <arpa/inet.h>
 #include <errno.h>
+#include <math.h>
 #include <netdb.h>
 #include <netinet/in.h>
 #include <signal.h>
@@ -51,12 +52,15 @@ eb_usage(const char *argv0)
     "  --min-ms N        discard utterances shorter   (default %d)\n"
     "  --max-s N         force-close after            (default %d)\n"
     "  --poll-hz N       VAD polls per second         (default %d)\n"
+    "  --floor-db N      discard utterances quieter,  (default %.0f)\n"
+    "                    measured as the loudest %d ms window in dBFS;\n"
+    "                    -90 or below passes everything\n"
     "\n"
     "Serves GET /utt?after=<seq>&wait=<ms> and GET /health.\n"
     "Captures via the shared dsnoop PCM: the robot daemon keeps the mic.\n",
     argv0, EB_DAEMON_DEFAULT, EB_PORT_DEFAULT, EB_PRE_MS_DEFAULT,
     EB_HANG_MS_DEFAULT, EB_MIN_MS_DEFAULT, EB_MAX_S_DEFAULT,
-    EB_POLL_HZ_DEFAULT);
+    EB_POLL_HZ_DEFAULT, (double)EB_FLOOR_DB_DEFAULT, EB_FLOOR_WIN_MS);
 }
 
 static bool
@@ -104,6 +108,7 @@ eb_parse_args(int argc, char **argv, eb_cfg_t *cfg)
   cfg->min_ms = EB_MIN_MS_DEFAULT;
   cfg->max_s = EB_MAX_S_DEFAULT;
   cfg->poll_hz = EB_POLL_HZ_DEFAULT;
+  cfg->floor_db = EB_FLOOR_DB_DEFAULT;
   cfg->take = EB_TAKE_CH0;
 
   if(!eb_parse_daemon_url(EB_DAEMON_DEFAULT, cfg))
@@ -135,6 +140,7 @@ eb_parse_args(int argc, char **argv, eb_cfg_t *cfg)
     else if(strcmp(arg, "--min-ms") == 0)   cfg->min_ms = (uint32_t)strtoul(val, NULL, 10);
     else if(strcmp(arg, "--max-s") == 0)    cfg->max_s = (uint32_t)strtoul(val, NULL, 10);
     else if(strcmp(arg, "--poll-hz") == 0)  cfg->poll_hz = (uint32_t)strtoul(val, NULL, 10);
+    else if(strcmp(arg, "--floor-db") == 0) cfg->floor_db = strtof(val, NULL);
 
     else if(strcmp(arg, "--take") == 0)
     {
@@ -168,6 +174,14 @@ eb_parse_args(int argc, char **argv, eb_cfg_t *cfg)
   if(cfg->pre_ms >= cfg->max_s * 1000)
   {
     fprintf(stderr, "earbridge: --pre-ms must be less than --max-s\n");
+    return(false);
+  }
+
+  // dBFS is measured against full scale, so a positive floor is unreachable
+  // by construction and would silently discard every utterance forever.
+  if(cfg->floor_db > 0.0f)
+  {
+    fprintf(stderr, "earbridge: --floor-db is dBFS and must be <= 0\n");
     return(false);
   }
 
@@ -335,10 +349,59 @@ eb_publish(const int16_t *pcm, size_t samples, float doa, bool clipped)
     slot->seq, slot->ms, (double)doa, clipped ? " CLIPPED" : "");
 }
 
+static uint64_t
+eb_floor_thresh(float floor_db)
+{
+  const double amp = pow(10.0, (double)floor_db / 20.0) * 32768.0;
+
+  return((uint64_t)(amp * amp));
+}
+
+// True if ANY window reaches the threshold — deliberately not the mean. The
+// artefacts run one to eight seconds and a mean is dominated by their silence,
+// but so is a real one-word answer: "stop" inside a five-second segment means
+// nothing to a mean and everything to a peak. Windows overlap by half so a
+// word straddling a boundary is not halved into silence.
+static bool
+eb_loud_enough(const int16_t *pcm, size_t samples, uint64_t thresh)
+{
+  const size_t win = ((size_t)EB_RATE * EB_FLOOR_WIN_MS) / 1000;
+  const size_t step = win / 2;
+  size_t start;
+
+  if(samples == 0)
+    return(false);
+
+  for(start = 0; ; start += step)
+  {
+    const size_t n = (samples - start < win) ? samples - start : win;
+    uint64_t sum = 0;
+    size_t i;
+
+    for(i = 0; i < n; i++)
+    {
+      const int64_t s = pcm[start + i];
+
+      sum += (uint64_t)(s * s);
+    }
+
+    if(n > 0 && (sum / n) >= thresh)
+      return(true);
+
+    // The tail is measured as a short window rather than dropped: a quiet
+    // utterance whose only real sound is its last 100 ms is still a sound.
+    if(start + win >= samples)
+      break;
+  }
+
+  return(false);
+}
+
 static void *
 eb_capture_thread(void *arg)
 {
   const eb_cfg_t *cfg = arg;
+  const uint64_t floor_thresh = eb_floor_thresh(cfg->floor_db);
   const size_t pre_cap = ((size_t)EB_RATE * cfg->pre_ms) / 1000;
   const size_t max_samples = (size_t)EB_RATE * cfg->max_s;
   const size_t min_samples = ((size_t)EB_RATE * cfg->min_ms) / 1000;
@@ -470,15 +533,20 @@ eb_capture_thread(void *arg)
 
     if(silence >= hang_samples || utt_len >= max_samples)
     {
+      // The trailing silence is hang-time, not speech; keep it out of both
+      // tests so --min-ms means "this much voice" and --floor-db is not
+      // dragged down by the hang.
       const bool clipped = (utt_len >= max_samples);
+      const size_t voiced = (utt_len > silence) ? utt_len - silence : 0;
 
-      // The trailing silence is hang-time, not speech; keep it out of the
-      // length test so --min-ms means "this much voice".
-      if(utt_len > silence && (utt_len - silence) >= min_samples)
-        eb_publish(utt, utt_len, open_angle, clipped);
+      if(voiced < min_samples)
+        atomic_fetch_add(&eb_stats.short_discards, 1);
+
+      else if(!eb_loud_enough(utt, voiced, floor_thresh))
+        atomic_fetch_add(&eb_stats.quiet_discards, 1);
 
       else
-        atomic_fetch_add(&eb_stats.short_discards, 1);
+        eb_publish(utt, utt_len, open_angle, clipped);
 
       open = false;
       utt_len = 0;
@@ -820,22 +888,26 @@ eb_handle_health(int fd, const eb_cfg_t *cfg)
   n = snprintf(body, sizeof(body),
     "{\"ok\":true,\"seq\":%u,\"speech\":%s,\"doa\":%.3f,"
     "\"utterances\":%llu,\"dropped\":%llu,\"short_discards\":%llu,"
+    "\"quiet_discards\":%llu,"
     "\"clipped\":%llu,\"alsa_recovered\":%llu,\"alsa_reopened\":%llu,"
     "\"vad_polls\":%llu,\"vad_failures\":%llu,"
-    "\"take\":\"%s\",\"pre_ms\":%u,\"hang_ms\":%u,\"min_ms\":%u,\"max_s\":%u}\n",
+    "\"take\":\"%s\",\"pre_ms\":%u,\"hang_ms\":%u,\"min_ms\":%u,\"max_s\":%u,"
+    "\"floor_db\":%.1f}\n",
     seq,
     atomic_load(&eb_vad_speech) ? "true" : "false",
     (double)atomic_load(&eb_vad_angle),
     (unsigned long long)atomic_load(&eb_stats.utterances),
     (unsigned long long)atomic_load(&eb_stats.dropped),
     (unsigned long long)atomic_load(&eb_stats.short_discards),
+    (unsigned long long)atomic_load(&eb_stats.quiet_discards),
     (unsigned long long)atomic_load(&eb_stats.clipped),
     (unsigned long long)atomic_load(&eb_stats.alsa_recovered),
     (unsigned long long)atomic_load(&eb_stats.alsa_reopened),
     (unsigned long long)atomic_load(&eb_stats.vad_polls),
     (unsigned long long)atomic_load(&eb_stats.vad_failures),
     (cfg->take == EB_TAKE_CH0) ? "ch0" : ((cfg->take == EB_TAKE_CH1) ? "ch1" : "mix"),
-    cfg->pre_ms, cfg->hang_ms, cfg->min_ms, cfg->max_s);
+    cfg->pre_ms, cfg->hang_ms, cfg->min_ms, cfg->max_s,
+    (double)cfg->floor_db);
 
   if(n < 0 || (size_t)n >= sizeof(body))
     return;
@@ -981,11 +1053,11 @@ main(int argc, char **argv)
   }
 
   fprintf(stderr, "earbridge: listening on 0.0.0.0:%u — take=%s, vad via %s:%u, "
-                  "pre=%ums hang=%ums min=%ums max=%us\n",
+                  "pre=%ums hang=%ums min=%ums max=%us floor=%.1fdBFS\n",
     cfg.port,
     (cfg.take == EB_TAKE_CH0) ? "ch0" : ((cfg.take == EB_TAKE_CH1) ? "ch1" : "mix"),
     cfg.daemon_host, cfg.daemon_port,
-    cfg.pre_ms, cfg.hang_ms, cfg.min_ms, cfg.max_s);
+    cfg.pre_ms, cfg.hang_ms, cfg.min_ms, cfg.max_s, (double)cfg.floor_db);
 
   while(eb_stop == 0)
   {
