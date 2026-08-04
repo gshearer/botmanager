@@ -162,6 +162,122 @@ reachy_mode_ok(const char *mode)
 }
 
 // ----------------------------------------------------------------------
+// The in-flight registry — every entry point borrows a foreign callback
+// ----------------------------------------------------------------------
+
+// Each call below stores its caller's completion in a heap context of
+// ours and hands core's curl layer reachy_curl_done instead. That is one
+// indirection more than core can see: plugin_quiesce and plugin_audit
+// both range-test curl_iter_req_t.cb, which for our transfers points at
+// THIS mapping, never at the caller's. Unload reachycmd — or the reachy
+// driver, whose mouth uploads a WAV per spoken reply — with a robot
+// request airborne and the stored pointer aims into freed .text.
+//
+// So every live request is filed here, and plugin_unmap_notify_register
+// tells us when a mapping is about to go away in time to null the
+// pointers that name it. A request whose caller left still completes
+// normally; it simply delivers to nobody. `llm.c` holds the identical
+// posture for the identical reason — the two are the tree's only
+// listeners, and the pattern is written up in PLUGIN.md.
+//
+// The caller's `user_data` is dropped with the callback and whatever it
+// points at is leaked. Nothing else is possible: only the caller knows
+// how to free its own context, and the caller is precisely what is no
+// longer there. A bounded leak on an operator action beats a SIGSEGV.
+static pthread_mutex_t reachy_active_mutex = PTHREAD_MUTEX_INITIALIZER;
+static reachy_req_t   *reachy_active_head  = NULL;
+static uint32_t        reachy_active_count = 0;
+
+static void
+reachy_req_track(reachy_req_t *r)
+{
+  pthread_mutex_lock(&reachy_active_mutex);
+
+  r->next_active     = reachy_active_head;
+  reachy_active_head = r;
+  reachy_active_count++;
+
+  pthread_mutex_unlock(&reachy_active_mutex);
+}
+
+// Unlink `r`, copy it to `out` and free it. The copy is taken under the
+// lock so a completion reads the caller's callback in the same critical
+// section the unmap sweep would null it in — read it afterwards and the
+// two interleave, which is the whole bug.
+static void
+reachy_req_retire(reachy_req_t *r, reachy_req_t *out)
+{
+  reachy_req_t **pp;
+
+  pthread_mutex_lock(&reachy_active_mutex);
+
+  for(pp = &reachy_active_head; *pp != NULL; pp = &(*pp)->next_active)
+  {
+    if(*pp != r)
+      continue;
+
+    *pp = r->next_active;
+    reachy_active_count--;
+    break;
+  }
+
+  *out = *r;
+
+  pthread_mutex_unlock(&reachy_active_mutex);
+
+  out->next_active = NULL;
+  mem_free(r);
+}
+
+// A mapping is going away (core is between the plugin's deinit() and its
+// residual audit, so nothing of it runs any more). Drop every callback
+// that lives inside it.
+//
+// Residual race, the same one the reachy driver documents: a completion
+// that has already retired its request holds the callback on its stack
+// and is a few instructions from calling it. The window is bounded above
+// by the quiescence poll plus the audit that follow this broadcast, and
+// below by two stores — against an operator-timescale unload. Closing it
+// would need core to wait on a lock a curl worker holds.
+static void
+reachyapi_unmap_cb(uintptr_t lo, uintptr_t hi, void *data)
+{
+  uint32_t orphaned = 0;
+
+  (void)data;
+
+  pthread_mutex_lock(&reachy_active_mutex);
+
+  for(reachy_req_t *r = reachy_active_head; r != NULL; r = r->next_active)
+  {
+    uintptr_t cb = 0;
+
+    switch(r->kind)
+    {
+      case REACHY_REQ_DOA:    cb = (uintptr_t)fn_addr(&r->cb.doa);    break;
+      case REACHY_REQ_STATUS: cb = (uintptr_t)fn_addr(&r->cb.status); break;
+      case REACHY_REQ_MOVES:  cb = (uintptr_t)fn_addr(&r->cb.moves);  break;
+      case REACHY_REQ_DONE:   cb = (uintptr_t)fn_addr(&r->cb.done);   break;
+    }
+
+    if(cb == 0 || cb < lo || cb >= hi)
+      continue;
+
+    // memset rather than one arm's NULL: the arms are a union, and
+    // all-bits-zero is the null test every delivery path makes.
+    memset(&r->cb, 0, sizeof(r->cb));
+    r->user_data = NULL;
+    orphaned++;
+  }
+
+  pthread_mutex_unlock(&reachy_active_mutex);
+
+  if(orphaned > 0)
+    clam(CLAM_WARN, REACHYAPI_CTX, "%u robot request(s) lost their caller "
+        "to an unload; they will complete and deliver nothing", orphaned);
+}
+
+// ----------------------------------------------------------------------
 // Completion delivery — one arm per reply shape
 // ----------------------------------------------------------------------
 
@@ -177,8 +293,12 @@ reachy_status_of_http(long http, int curl_code)
   return(REACHY_HTTP);
 }
 
+// Each arm takes a RETIRED request — a stack copy the completion owns,
+// already unlinked from the in-flight list, whose callback is either the
+// caller's or NULL because the caller was unloaded mid-flight.
+
 static void
-reachy_deliver_done(reachy_req_t *r, reachy_status_t st,
+reachy_deliver_done(const reachy_req_t *r, reachy_status_t st,
     const curl_response_t *cresp)
 {
   reachy_result_t out = {
@@ -189,12 +309,10 @@ reachy_deliver_done(reachy_req_t *r, reachy_status_t st,
 
   if(r->cb.done != NULL)
     r->cb.done(&out);
-
-  mem_free(r);
 }
 
 static void
-reachy_deliver_doa(reachy_req_t *r, reachy_status_t st,
+reachy_deliver_doa(const reachy_req_t *r, reachy_status_t st,
     const curl_response_t *cresp)
 {
   reachy_doa_t        out  = { .status = st, .user_data = r->user_data };
@@ -216,12 +334,10 @@ reachy_deliver_doa(reachy_req_t *r, reachy_status_t st,
 
   if(root != NULL)
     json_object_put(root);
-
-  mem_free(r);
 }
 
 static void
-reachy_deliver_status(reachy_req_t *r, reachy_status_t st,
+reachy_deliver_status(const reachy_req_t *r, reachy_status_t st,
     const curl_response_t *cresp)
 {
   reachy_robot_status_t out  = { .status = st, .user_data = r->user_data };
@@ -261,15 +377,13 @@ reachy_deliver_status(reachy_req_t *r, reachy_status_t st,
 
   if(root != NULL)
     json_object_put(root);
-
-  mem_free(r);
 }
 
 // The dataset listing is a bare JSON array of strings. Rows are copied
 // into one flat block so the caller sees a lifetime-free char[][] for
 // the duration of its callback.
 static void
-reachy_deliver_moves(reachy_req_t *r, reachy_status_t st,
+reachy_deliver_moves(const reachy_req_t *r, reachy_status_t st,
     const curl_response_t *cresp)
 {
   reachy_moves_t      out  = { .status = st, .user_data = r->user_data };
@@ -330,42 +444,42 @@ reachy_deliver_moves(reachy_req_t *r, reachy_status_t st,
 
   if(root != NULL)
     json_object_put(root);
-
-  mem_free(r);
 }
 
 static void
 reachy_curl_done(const curl_response_t *cresp)
 {
-  reachy_req_t   *r  = (reachy_req_t *)cresp->user_data;
+  reachy_req_t    r;
   reachy_status_t st = reachy_status_of_http(cresp->status,
       cresp->curl_code);
 
+  reachy_req_retire((reachy_req_t *)cresp->user_data, &r);
+
   if(st == REACHY_OK)
     clam(CLAM_DEBUG2, REACHYAPI_CTX, "kind %d ok (http %ld, %zu bytes)",
-        (int)r->kind, cresp->status, cresp->body_len);
+        (int)r.kind, cresp->status, cresp->body_len);
 
   else
     clam(CLAM_WARN, REACHYAPI_CTX, "request failed: %s (http %ld)",
         reachy_status_str(st), cresp->status);
 
-  switch(r->kind)
+  switch(r.kind)
   {
     case REACHY_REQ_DOA:
-      reachy_deliver_doa(r, st, cresp);
+      reachy_deliver_doa(&r, st, cresp);
       break;
 
     case REACHY_REQ_STATUS:
-      reachy_deliver_status(r, st, cresp);
+      reachy_deliver_status(&r, st, cresp);
       break;
 
     case REACHY_REQ_MOVES:
-      reachy_deliver_moves(r, st, cresp);
+      reachy_deliver_moves(&r, st, cresp);
       break;
 
     case REACHY_REQ_DONE:
     default:
-      reachy_deliver_done(r, st, cresp);
+      reachy_deliver_done(&r, st, cresp);
       break;
   }
 }
@@ -395,6 +509,7 @@ reachy_submit(curl_method_t method, const char *url,
     reachy_req_t *r)
 {
   curl_request_t *cr;
+  reachy_req_t    dead;
   uint32_t        timeout;
 
   cr = curl_request_create(method, url, reachy_curl_done, r);
@@ -415,9 +530,14 @@ reachy_submit(curl_method_t method, const char *url,
 
   curl_request_add_header(cr, "Accept: application/json");
 
+  // File it before submitting, never after: the completion can run on a
+  // curl worker before submit has even returned here, and it retires
+  // what it finds.
+  reachy_req_track(r);
+
   if(curl_request_submit(cr) != SUCCESS)
   {
-    mem_free(r);
+    reachy_req_retire(r, &dead);
     return(FAIL);
   }
 
@@ -715,11 +835,11 @@ reachy_wobbling(bool on, reachy_done_cb_t cb, void *user_data)
 // Plugin lifecycle
 // ----------------------------------------------------------------------
 
-// Registrations only — no commands, no tasks, no clam subscriptions, no
-// state that outlives a request. deinit() therefore has nothing to
-// mirror but the hello, and suspend/resume being absent is honest
-// rather than lazy: a request in flight owns its own heap and its
-// completion runs in core's mapping.
+// No commands, no tasks, no clam subscriptions. The one thing that does
+// outlive a call is the in-flight registry, and the unmap listener that
+// keeps it honest is the single registration deinit() has to mirror.
+// suspend/resume being absent stays honest: a request in flight owns its
+// own heap and its completion runs in this mapping.
 static bool
 reachyapi_init(void)
 {
@@ -729,6 +849,8 @@ reachyapi_init(void)
     clam(CLAM_WARN, REACHYAPI_CTX,
         "no robot configured: set " REACHYAPI_KV_BASE_URL);
 
+  plugin_unmap_notify_register(reachyapi_unmap_cb, NULL);
+
   clam(CLAM_INFO, REACHYAPI_CTX, "reachyapi plugin initialized");
   return(SUCCESS);
 }
@@ -736,6 +858,23 @@ reachyapi_init(void)
 static void
 reachyapi_deinit(void)
 {
+  uint32_t stranded;
+
+  plugin_unmap_notify_unregister(reachyapi_unmap_cb);
+
+  pthread_mutex_lock(&reachy_active_mutex);
+  stranded = reachy_active_count;
+  pthread_mutex_unlock(&reachy_active_mutex);
+
+  // Nothing to free: those requests belong to curl, and their
+  // completions live in the mapping now going away. Core's residual
+  // audit sees them — reachy_curl_done is curl_iter_req_t.cb for every
+  // one — so it is the audit that refuses the dlclose, not us. Naming
+  // the count here is what makes that refusal legible.
+  if(stranded > 0)
+    clam(CLAM_WARN, REACHYAPI_CTX,
+        "%u robot request(s) still in flight at deinit", stranded);
+
   clam(CLAM_INFO, REACHYAPI_CTX, "reachyapi plugin deinitialized");
 }
 

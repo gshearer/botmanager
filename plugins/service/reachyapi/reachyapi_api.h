@@ -28,6 +28,14 @@
 // path also takes, and offload real work via task_add(). A NULL `cb` is
 // legal and means fire-and-forget — the request is still submitted, and
 // SUCCESS still means it was queued.
+//
+// The one exception to "exactly once", and it is not one a caller can
+// act on: if the CALLING plugin is unloaded while its request is still
+// airborne, the callback is dropped rather than fired into a mapping
+// that no longer exists. Whatever was handed in as `user_data` is then
+// leaked — only the caller could have freed it, and the caller is what
+// went away. A plugin that wants its contexts accounted for on unload
+// must not have live requests at that point.
 
 #include <stdbool.h>
 #include <stddef.h>

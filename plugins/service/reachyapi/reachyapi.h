@@ -64,7 +64,12 @@ typedef enum
 } reachy_req_kind_t;
 
 // Per-call state bridging the curl completion back to the caller's cb.
-typedef struct
+//
+// `cb` is a pointer into the CALLER's mapping, held one indirection
+// deeper than anything core can range-test — which is why every live
+// request is filed in the in-flight list (`next_active`) and why this
+// plugin listens for unmaps. See the registry's comment in reachyapi.c.
+typedef struct reachy_req
 {
   reachy_req_kind_t kind;
   union
@@ -74,7 +79,8 @@ typedef struct
     reachy_status_cb_t status;
     reachy_moves_cb_t  moves;
   } cb;
-  void             *user_data;
+  void              *user_data;
+  struct reachy_req *next_active;   // guarded by reachy_active_mutex
 } reachy_req_t;
 
 // Declared rather than merely defined so the format archetype can be
