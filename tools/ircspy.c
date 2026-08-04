@@ -995,6 +995,8 @@ print_usage(void)
     "  -s <host>    Server (default: " DEFAULT_HOST ")\n"
     "  -p <port>    Port (default: %d)\n"
     "  -n <nick>    Nickname (default: " DEFAULT_NICK ")\n"
+    "  -u <user>    Username/ident, the '~user' of the mask "
+      "(default: " DEFAULT_USER ")\n"
     "  -c <channel> Channel (default: " DEFAULT_CHANNEL ")\n"
     "  -C <path>    Control socket path (default: " CTL_SOCK_PATH ")\n"
     "  -T           Disable TLS\n"
@@ -1022,13 +1024,14 @@ parse_args(int argc, char *argv[], struct irc_cfg *cfg)
   cfg->tls_verify = false;
   cfg->raw_mode   = false;
 
-  while((opt = getopt(argc, argv, "s:p:n:c:C:TVrh")) != -1)
+  while((opt = getopt(argc, argv, "s:p:n:u:c:C:TVrh")) != -1)
   {
     switch(opt)
     {
       case 's': cfg->host       = optarg;                 break;
       case 'p': cfg->port       = (uint16_t)atoi(optarg); break;
       case 'n': cfg->nick       = optarg;                 break;
+      case 'u': cfg->user       = optarg;                 break;
       case 'c': cfg->channel    = optarg;                 break;
       case 'C': cfg->ctl_path   = optarg;                 break;
       case 'T': cfg->use_tls    = false;                    break;
