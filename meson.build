@@ -74,3 +74,6 @@ talib_dep = dependency('ta-lib', required : true)
 subdir('core')
 subdir('plugins')
 subdir('tools')
+# Out-of-daemon speech hosts for the reachy robot. Not plugins and not linked
+# against core — kokorod is a standalone daemon. Self-guarding on sherpa-onnx.
+subdir('senses/kokorod')

@@ -1,0 +1,46 @@
+# kokorod.service — Kokoro text-to-speech for the reachy senses (RCH-3).
+#
+# Master copy. Install with:
+#   install -Dm644 senses/kokorod/kokorod.service \
+#       ~/.config/systemd/user/kokorod.service
+#   systemctl --user daemon-reload
+#   systemctl --user enable --now kokorod
+#
+# A systemd *user* unit, like its whisper sibling. Unlike whisper this is
+# pure CPU — Kokoro synthesizes at roughly RTF 0.13 on four threads, so the
+# 4090 stays entirely whisper's. Loopback only: the sole consumer is the
+# botman daemon on this host, which uploads the finished WAV to the robot.
+#
+# Port map for the initiative: robot daemon 8000, earbridge 8090 (on the
+# robot), kokorod 8003, whisper-server 8004. The DGX Spark holds 8001/8002.
+#
+# The binary is built by the main meson tree, guarded on the sherpa-onnx
+# package being installed. Model weights are gitignored and fetched per
+# TODO.md §RCH-2.
+
+[Unit]
+Description=kokorod — Kokoro TTS server (reachy senses)
+Documentation=https://github.com/k2-fsa/sherpa-onnx
+After=default.target
+
+[Service]
+Type=simple
+WorkingDirectory=/mnt/fast/doc/projects/botmanager/senses/kokorod
+# Fail immediately and legibly if the model is missing, rather than letting
+# sherpa-onnx report it from inside a restart loop.
+ExecStartPre=/usr/bin/test -r /mnt/fast/doc/projects/botmanager/senses/kokorod/models/kokoro-multi-lang-v1_0/model.onnx
+# ⚠ kokoro-multi-lang-v1_0, NOT v1_1 — v1.1 is the Mandarin model and has
+# none of af_heart / af_bella / am_michael. See TODO.md §SHERPA-TRUTH.
+ExecStart=/mnt/fast/doc/projects/botmanager/build/senses/kokorod/kokorod \
+    --model    /mnt/fast/doc/projects/botmanager/senses/kokorod/models/kokoro-multi-lang-v1_0/model.onnx \
+    --voices   /mnt/fast/doc/projects/botmanager/senses/kokorod/models/kokoro-multi-lang-v1_0/voices.bin \
+    --tokens   /mnt/fast/doc/projects/botmanager/senses/kokorod/models/kokoro-multi-lang-v1_0/tokens.txt \
+    --data-dir /mnt/fast/doc/projects/botmanager/senses/kokorod/models/kokoro-multi-lang-v1_0/espeak-ng-data \
+    --lexicon  /mnt/fast/doc/projects/botmanager/senses/kokorod/models/kokoro-multi-lang-v1_0/lexicon-us-en.txt \
+    --lang en --port 8003 --threads 4
+Restart=on-failure
+RestartSec=5
+SyslogIdentifier=kokorod
+
+[Install]
+WantedBy=default.target
