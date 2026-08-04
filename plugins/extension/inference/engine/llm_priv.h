@@ -89,6 +89,12 @@ bool llm_image_submit(const char *model_name,
     const llm_image_params_t *params, const char *prompt,
     llm_image_done_cb_t done_cb, void *user_data);
 
+bool llm_stt_submit(const char *model_name, const void *wav, size_t wav_len,
+    llm_stt_done_cb_t done_cb, void *user_data);
+
+bool llm_tts_submit(const char *model_name, const llm_tts_params_t *params,
+    const char *text, llm_tts_done_cb_t done_cb, void *user_data);
+
 void llm_get_stats(llm_stats_t *out);
 
 typedef void (*llm_iter_cb_t)(const char *model_name, llm_kind_t kind,
@@ -107,6 +113,22 @@ void llm_iterate_active(llm_iter_cb_t cb, void *data);
 #define LLM_IMAGE_SIZE_SZ     16    // "1024x1024" style dimension string
 #define LLM_IMAGE_MIME_SZ     32    // e.g. "image/png"
 #define LLM_IMAGE_REVISED_SZ  512   // provider-rewritten prompt (optional)
+
+// Request Content-Type, wide enough for a multipart boundary parameter.
+// Matches core/curl.c's CURL_CT_SZ, which is where the value ends up.
+#define LLM_CONTENT_TYPE_SZ   128
+
+// Speech request sizing. The multipart boundary is randomised per
+// request (util_rand) exactly as reachyapi's is: our payload is binary
+// audio, and a fixed delimiter is a delimiter an unlucky sample run can
+// forge.
+#define LLM_BOUNDARY_SZ       40
+#define LLM_TTS_VOICE_SZ      64
+
+// Refuse an oversize upload here rather than pay to put it on the wire
+// and have the server refuse it. Twenty-five minutes of 16 kHz mono
+// S16LE is far past any utterance the ear will ever hand us.
+#define LLM_STT_WAV_MAX       (48u * 1024u * 1024u)
 
 // Per-model request-dialect negotiation (LLM-DIALECT-1).
 #define LLM_DIR_FIELD_SZ    64   // canonical builder field / wire name
@@ -160,12 +182,15 @@ typedef struct llm_model
   struct llm_model *next;
 } llm_model_t;
 
-// Mirrors llm_kind_t; separate in case we add more.
+// Mirrors llm_kind_t; separate in case we add more. Grows in lockstep
+// with it, and append-only for the same reason.
 typedef enum
 {
   LLM_REQ_CHAT,
   LLM_REQ_EMBED,
-  LLM_REQ_IMAGE
+  LLM_REQ_IMAGE,
+  LLM_REQ_STT,
+  LLM_REQ_TTS
 } llm_req_type_t;
 
 // One learned request-dialect directive for a canonical field the chat-body
@@ -217,6 +242,8 @@ struct llm_request
   llm_chunk_cb_t        chunk_cb;
   llm_embed_done_cb_t   embed_done_cb;
   llm_image_done_cb_t   image_done_cb;
+  llm_stt_done_cb_t     stt_done_cb;
+  llm_tts_done_cb_t     tts_done_cb;
   void                 *user_data;
 
   // Image (text-to-image) request/response state. The decoded-ready b64
@@ -226,6 +253,14 @@ struct llm_request
   uint32_t              image_n;                              // v1 fixes at 1
   char                  image_mime[LLM_IMAGE_MIME_SZ];        // response MIME
   char                  image_revised[LLM_IMAGE_REVISED_SZ];  // revised_prompt
+
+  // Request Content-Type. Empty means "application/json", which is what
+  // every JSON-bodied kind wants; the speech-to-text path fills it with
+  // its multipart type and boundary. Response Content-Type is captured
+  // off the completion because the audio kinds are the only ones whose
+  // success depends on it.
+  char                  content_type[LLM_CONTENT_TYPE_SZ];
+  char                  resp_content_type[LLM_CONTENT_TYPE_SZ];
 
   // Request body (JSON). For chat, req_body = body_prefix + params-tail;
   // the immutable prefix ({"model":...,"messages":[...]}) is retained so a

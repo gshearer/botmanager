@@ -4,7 +4,7 @@
 # plugin's upward method_text dependency.
 reachycmd_plugin = shared_library('reachycmd',
   'reachycmd.c',
-  include_directories : [inc_include, reachyapi_include],
+  include_directories : [inc_include, reachyapi_include, inference_include],
   override_options : ['b_lundef=false'],
   install : true,
 )

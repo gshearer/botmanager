@@ -11,6 +11,28 @@
 #include <strings.h>  // strcasecmp / strncasecmp
 
 // ----------------------------------------------------------------------
+// Configuration
+// ----------------------------------------------------------------------
+
+// The voice `!reachy say` speaks in. Plugin-level rather than per-bot
+// because this is a command surface and a command has no bot: when the
+// protocol driver lands, a bound bot gets its own voice from instance KV
+// and these stay the fallback for anyone typing at the robot directly.
+//
+// The defaults name the rows RCH-4 registers (`llm add model tts kokoro1
+// senses-tts kokoro`) and the voice measured as sid 3 in the shipped
+// Kokoro v1_0 model.
+static const plugin_kv_entry_t reachycmd_kv_schema[] = {
+  { REACHYCMD_KV_TTS_MODEL, KV_STR, "kokoro1",
+    "Registered tts model `!reachy say` synthesizes through "
+    "(`llm add model tts ...`); empty disables the verb" },
+  { REACHYCMD_KV_TTS_VOICE, KV_STR, "af_heart",
+    "Kokoro voice id; empty lets the speech host pick its own default" },
+  { REACHYCMD_KV_TTS_SPEED, KV_STR, "1.0",
+    "Synthesis rate multiplier — 1.0 is natural, below is slower" },
+};
+
+// ----------------------------------------------------------------------
 // Holding a reply path across the async hop
 // ----------------------------------------------------------------------
 
@@ -284,6 +306,91 @@ reachycmd_show_status_done(const reachy_robot_status_t *st)
 }
 
 // ----------------------------------------------------------------------
+// !reachy say — synthesize, upload, play
+// ----------------------------------------------------------------------
+
+// Every failure arm ends here: one line, then the context dies. Each
+// hop names its own stage, because "it did not speak" has three quite
+// different causes and the operator fixes each somewhere else.
+static void
+reachycmd_say_fail(reachycmd_say_t *s, const char *what)
+{
+  char line[REACHYCMD_LINE_SZ];
+
+  snprintf(line, sizeof(line), CLR_RED "reachy" CLR_RESET ": %s", what);
+  cmd_reply(&s->hold.ctx, line);
+  mem_free(s);
+}
+
+static void
+reachycmd_say_played(const reachy_result_t *r)
+{
+  reachycmd_say_t *s = (reachycmd_say_t *)r->user_data;
+  char             line[REACHYCMD_LINE_SZ];
+
+  if(r->status != REACHY_OK)
+  {
+    char reason[REACHYCMD_REASON_SZ];
+
+    snprintf(reason, sizeof(reason), "the audio reached the robot but it "
+        "would not play it — %s", reachy_status_str(r->status));
+    reachycmd_say_fail(s, reason);
+    return;
+  }
+
+  snprintf(line, sizeof(line),
+      CLR_GREEN "reachy" CLR_RESET ": \"%s\"", s->text);
+  cmd_reply(&s->hold.ctx, line);
+  mem_free(s);
+}
+
+static void
+reachycmd_say_uploaded(const reachy_result_t *r)
+{
+  reachycmd_say_t *s = (reachycmd_say_t *)r->user_data;
+  char             reason[REACHYCMD_REASON_SZ];
+
+  if(r->status != REACHY_OK)
+  {
+    snprintf(reason, sizeof(reason),
+        "the robot would not take the audio — %s (http %ld)",
+        reachy_status_str(r->status), r->http);
+    reachycmd_say_fail(s, reason);
+    return;
+  }
+
+  if(reachy_play_sound(REACHYCMD_SAY_FILE, reachycmd_say_played, s)
+      != SUCCESS)
+    reachycmd_say_fail(s, "the audio is on the robot but playing it was "
+        "refused before it left");
+}
+
+// The engine hands the WAV over for the duration of this callback only,
+// and reachy_upload_sound copies it into the multipart body before it
+// returns — so the bytes are safe to pass straight through, and there is
+// no window where anyone owns a copy of them but us.
+static void
+reachycmd_say_synthesized(const llm_tts_response_t *r)
+{
+  reachycmd_say_t *s = (reachycmd_say_t *)r->user_data;
+  char             reason[REACHYCMD_REASON_SZ];
+
+  if(!r->ok || r->bytes_len == 0)
+  {
+    snprintf(reason, sizeof(reason), "could not find its voice — %.256s",
+        r->error != NULL && r->error[0] != '\0'
+            ? r->error : "the speech host answered with no audio");
+    reachycmd_say_fail(s, reason);
+    return;
+  }
+
+  if(reachy_upload_sound(REACHYCMD_SAY_FILE, r->bytes, r->bytes_len,
+      reachycmd_say_uploaded, s) != SUCCESS)
+    reachycmd_say_fail(s, "the speech was synthesized but sending it to "
+        "the robot was refused before it left");
+}
+
+// ----------------------------------------------------------------------
 // Argument helpers
 // ----------------------------------------------------------------------
 
@@ -330,8 +437,8 @@ reachycmd_root(const cmd_ctx_t *ctx)
 {
   cmd_reply(ctx, CLR_BOLD "reachy" CLR_RESET
       " — the robot's body. What it can be told to do:");
-  cmd_reply(ctx, "  list [filter] · do <move> · wake · sleep · "
-      "volume <0-100> · track <on|off> [weight] · wobble <on|off>");
+  cmd_reply(ctx, "  list [filter] · do <move> · say <text> · wake · "
+      "sleep · volume <0-100> · track <on|off> [weight] · wobble <on|off>");
   cmd_reply(ctx, CLR_GRAY
       "  `show reachy` reports what it is doing right now." CLR_RESET);
 }
@@ -369,6 +476,43 @@ reachycmd_do(const cmd_ctx_t *ctx)
 
   if(reachy_play_move(move, reachycmd_act_done, a) != SUCCESS)
     reachycmd_act_refused(a);
+}
+
+static void
+reachycmd_say(const cmd_ctx_t *ctx)
+{
+  const char      *model = kv_get_str(REACHYCMD_KV_TTS_MODEL);
+  const char      *voice = kv_get_str(REACHYCMD_KV_TTS_VOICE);
+  const char      *speed = kv_get_str(REACHYCMD_KV_TTS_SPEED);
+  llm_tts_params_t params;
+  reachycmd_say_t *s;
+
+  if(model == NULL || model[0] == '\0')
+  {
+    cmd_reply(ctx, "reachy: no voice is configured — set "
+        REACHYCMD_KV_TTS_MODEL " to a registered tts model.");
+    return;
+  }
+
+  memset(&params, 0, sizeof(params));
+  params.voice = voice;
+  params.speed = speed != NULL ? strtod(speed, NULL) : 0.0;
+
+  s = mem_alloc(REACHYCMD_CTX, "say", sizeof(*s));
+  memset(s, 0, sizeof(*s));
+  reachycmd_hold_save(&s->hold, ctx);
+  snprintf(s->text, sizeof(s->text), "%s", ctx->parsed->argv[0]);
+
+  if(llm_tts_submit(model, &params, s->text, reachycmd_say_synthesized, s)
+      != SUCCESS)
+  {
+    char line[REACHYCMD_LINE_SZ];
+
+    snprintf(line, sizeof(line), "reachy: the speech host would not take "
+        "the request — is '%s' a registered, enabled tts model?", model);
+    cmd_reply(ctx, line);
+    mem_free(s);
+  }
 }
 
 static void
@@ -501,6 +645,14 @@ static const cmd_arg_desc_t reachycmd_list_args[] = {
     NULL },
 };
 
+// CMD_ARG_REST: everything after the verb is the sentence, spaces and
+// punctuation included. It must be the last argument, and it is the only
+// one.
+static const cmd_arg_desc_t reachycmd_say_args[] = {
+  { "text", CMD_ARG_NONE, CMD_ARG_REQUIRED | CMD_ARG_REST,
+    REACHYCMD_SAY_SZ - 1, NULL },
+};
+
 static const cmd_arg_desc_t reachycmd_volume_args[] = {
   { "level", CMD_ARG_DIGITS, CMD_ARG_REQUIRED, 3, NULL },
 };
@@ -515,11 +667,12 @@ static const cmd_arg_desc_t reachycmd_wobble_args[] = {
 };
 
 static const char reachycmd_help[] =
-    "Move the Reachy Mini.\n"
+    "Move the Reachy Mini, and give it a voice.\n"
     "\n"
     "  !reachy list [filter]      the emotion library, optionally\n"
     "                             narrowed to names containing <filter>\n"
     "  !reachy do <move>          play one of them\n"
+    "  !reachy say <text>         speak a line aloud\n"
     "  !reachy wake               rise and centre\n"
     "  !reachy sleep              settle back down\n"
     "  !reachy volume <0-100>     speaker level\n"
@@ -527,9 +680,12 @@ static const char reachycmd_help[] =
     "  !reachy wobble <on|off>    let played audio drive head motion\n"
     "\n"
     "The moves are recordings that ship with the robot's daemon, played\n"
-    "on the robot itself — botman only names one. `show reachy` reports\n"
-    "the daemon state, whether a face is being tracked, and which way\n"
-    "the microphone array last heard a voice.";
+    "on the robot itself — botman only names one. Speech is the other\n"
+    "way round: the line is synthesized here, uploaded, and played, so\n"
+    "`!reachy wobble on` is what makes it look like speaking rather than\n"
+    "broadcasting. `show reachy` reports the daemon state, whether a\n"
+    "face is being tracked, and which way the microphone array last\n"
+    "heard a voice.";
 
 // Uniformly `user` at REACHYCMD_LEVEL — reading verbs as well as moving
 // ones. The robot is a physical object in a room and not a toy for a
@@ -542,7 +698,7 @@ static bool
 reachycmd_register(void)
 {
   if(cmd_register(REACHYCMD_CTX, "reachy",
-        "reachy <list|do|wake|sleep|volume|track|wobble>",
+        "reachy <list|do|say|wake|sleep|volume|track|wobble>",
         "Move the Reachy Mini robot.",
         reachycmd_help,
         USERNS_GROUP_USER, REACHYCMD_LEVEL, CMD_SCOPE_ANY, METHOD_T_ANY,
@@ -577,6 +733,23 @@ reachycmd_register(void)
         reachycmd_do, NULL, "reachy", NULL,
         reachycmd_do_args,
         (uint8_t)(sizeof(reachycmd_do_args) / sizeof(reachycmd_do_args[0])),
+        NULL, NULL) != SUCCESS)
+    return(FAIL);
+
+  if(cmd_register(REACHYCMD_CTX, "say",
+        "reachy say <text>",
+        "Make the robot speak a line aloud.",
+        "Three hops: the text is synthesized by the tts model named in "
+        "plugin.reachycmd.tts_model, the resulting WAV is uploaded to the "
+        "robot, and the robot plays it. Turn `reachy wobble on` first and "
+        "the head moves in time with the words. The voice and rate come "
+        "from plugin.reachycmd.tts_voice and .tts_speed; the model row "
+        "itself is registered with `llm add model tts ...`.",
+        USERNS_GROUP_USER, REACHYCMD_LEVEL, CMD_SCOPE_ANY, METHOD_T_ANY,
+        reachycmd_say, NULL, "reachy", NULL,
+        reachycmd_say_args,
+        (uint8_t)(sizeof(reachycmd_say_args)
+                  / sizeof(reachycmd_say_args[0])),
         NULL, NULL) != SUCCESS)
     return(FAIL);
 
@@ -698,10 +871,12 @@ const plugin_desc_t bm_plugin_desc = {
   .provides        = { { .name = "misc_reachycmd" } },
   .provides_count  = 1,
   .requires        = { { .name = "service_reachyapi" },
-                       { .name = "method_text" } },
-  .requires_count  = 2,
-  .kv_schema       = NULL,
-  .kv_schema_count = 0,
+                       { .name = "method_text" },
+                       { .name = "inference" } },
+  .requires_count  = 3,
+  .kv_schema       = reachycmd_kv_schema,
+  .kv_schema_count = sizeof(reachycmd_kv_schema)
+                     / sizeof(reachycmd_kv_schema[0]),
   .init            = reachycmd_init,
   .start           = NULL,
   .stop            = NULL,

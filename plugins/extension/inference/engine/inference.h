@@ -37,13 +37,21 @@ typedef enum
   LLM_ROLE_ASSISTANT
 } llm_role_t;
 
-// Model kinds. A model is registered as exactly one of chat, embed, or
-// image (text-to-image) — never more than one.
+// Model kinds. A model is registered as exactly one of these — never
+// more than one.
+//
+// APPEND ONLY. The ordinal is the public ABI and it is what a sibling
+// .so compiled against an older copy of this header still believes;
+// inserting a kind renumbers every one after it. New kinds go at the
+// end, and the mirror enum llm_req_type_t (llm_priv.h) grows in
+// lockstep.
 typedef enum
 {
   LLM_KIND_CHAT,
   LLM_KIND_EMBED,
-  LLM_KIND_IMAGE
+  LLM_KIND_IMAGE,
+  LLM_KIND_STT,     // speech in, transcript out
+  LLM_KIND_TTS      // text in, speech out
 } llm_kind_t;
 
 // Opaque request handle.
@@ -167,6 +175,51 @@ typedef struct
 } llm_image_response_t;
 
 typedef void (*llm_image_done_cb_t)(const llm_image_response_t *resp);
+
+// Speech-to-text. The audio is handed over as a complete WAV container
+// (whisper.cpp's native form is 16 kHz mono S16LE, which costs it no
+// conversion) and copied into the request body before llm_stt_submit()
+// returns, so the caller keeps ownership of its buffer throughout.
+typedef struct
+{
+  llm_request_t *request;
+  bool           ok;
+  long           http_status;
+  const char    *model;        // registered name
+  const char    *text;         // transcript, whitespace-collapsed, trimmed
+  size_t         text_len;
+  const char    *error;        // NULL on success
+  void          *user_data;
+} llm_stt_response_t;
+
+typedef void (*llm_stt_done_cb_t)(const llm_stt_response_t *resp);
+
+// Text-to-speech request parameters. Every zero/NULL field means "let
+// the provider decide".
+typedef struct
+{
+  const char *voice;         // provider voice id, e.g. "af_heart"
+  double      speed;         // synthesis rate multiplier; 0 = default
+  uint32_t    timeout_secs;  // 0 = KV default (llm.timeout_secs)
+} llm_tts_params_t;
+
+// Text-to-speech response. `bytes` is the audio container exactly as the
+// provider sent it — no transcoding, no resampling — and like every
+// other response here it is valid for the duration of the callback only.
+typedef struct
+{
+  llm_request_t *request;
+  bool           ok;
+  long           http_status;
+  const char    *model;         // registered name
+  const uint8_t *bytes;         // audio payload (WAV from kokorod)
+  size_t         bytes_len;
+  const char    *content_type;  // as reported by the provider, or ""
+  const char    *error;         // NULL on success
+  void          *user_data;
+} llm_tts_response_t;
+
+typedef void (*llm_tts_done_cb_t)(const llm_tts_response_t *resp);
 
 // Per-model visitor for llm_model_iterate(). Called once per registered
 // model with its full descriptor. Guarded because the same typedef also
@@ -421,6 +474,70 @@ llm_image_submit(const char *model_name,
     __atomic_store_n(&cached, fn, __ATOMIC_RELEASE);
   }
   return(fn(model_name, params, prompt, done_cb, user_data));
+}
+
+// Transcribe `wav` (wav_len bytes of a complete audio container) with the
+// registered `stt` model `model_name`.
+//
+// SUCCESS ⇒ the request is queued and done_cb fires exactly once, on the
+//           curl worker thread.
+// FAIL    ⇒ done_cb was NOT invoked and never will be; the caller still
+//           owns whatever it passed as user_data.
+// (Remember SUCCESS == false and FAIL == true — compare with == SUCCESS.)
+// The audio is copied into the request body before this returns, so the
+// caller may free its buffer immediately either way.
+static inline bool
+llm_stt_submit(const char *model_name, const void *wav, size_t wav_len,
+    llm_stt_done_cb_t done_cb, void *user_data)
+{
+  typedef bool (*fn_t)(const char *, const void *, size_t,
+      llm_stt_done_cb_t, void *);
+  static fn_t cached = NULL;
+  fn_t        fn     = __atomic_load_n(&cached, __ATOMIC_ACQUIRE);
+
+  if(fn == NULL)
+  {
+    union { void *obj; fn_t fn; } u;
+
+    u.obj = plugin_dlsym_cached("inference", "llm_stt_submit", (void **)&cached);
+    if(u.obj == NULL)
+    {
+      clam(CLAM_FATAL, "inference", "dlsym failed: llm_stt_submit");
+      abort();
+    }
+    fn = u.fn;
+    __atomic_store_n(&cached, fn, __ATOMIC_RELEASE);
+  }
+  return(fn(model_name, wav, wav_len, done_cb, user_data));
+}
+
+// Synthesize `text` with the registered `tts` model `model_name`.
+// `params` may be NULL for provider defaults throughout. Same async
+// failure contract as llm_stt_submit above; `text` is copied into the
+// request body before this returns.
+static inline bool
+llm_tts_submit(const char *model_name, const llm_tts_params_t *params,
+    const char *text, llm_tts_done_cb_t done_cb, void *user_data)
+{
+  typedef bool (*fn_t)(const char *, const llm_tts_params_t *, const char *,
+      llm_tts_done_cb_t, void *);
+  static fn_t cached = NULL;
+  fn_t        fn     = __atomic_load_n(&cached, __ATOMIC_ACQUIRE);
+
+  if(fn == NULL)
+  {
+    union { void *obj; fn_t fn; } u;
+
+    u.obj = plugin_dlsym_cached("inference", "llm_tts_submit", (void **)&cached);
+    if(u.obj == NULL)
+    {
+      clam(CLAM_FATAL, "inference", "dlsym failed: llm_tts_submit");
+      abort();
+    }
+    fn = u.fn;
+    __atomic_store_n(&cached, fn, __ATOMIC_RELEASE);
+  }
+  return(fn(model_name, params, text, done_cb, user_data));
 }
 
 static inline bool

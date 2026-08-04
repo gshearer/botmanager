@@ -79,6 +79,8 @@ llm_kind_from_str(const char *s, llm_kind_t *out)
   if(strcmp(s, "chat") == 0)   { *out = LLM_KIND_CHAT;  return(SUCCESS); }
   if(strcmp(s, "embed") == 0)  { *out = LLM_KIND_EMBED; return(SUCCESS); }
   if(strcmp(s, "image") == 0)  { *out = LLM_KIND_IMAGE; return(SUCCESS); }
+  if(strcmp(s, "stt") == 0)    { *out = LLM_KIND_STT;   return(SUCCESS); }
+  if(strcmp(s, "tts") == 0)    { *out = LLM_KIND_TTS;   return(SUCCESS); }
   return(FAIL);
 }
 
@@ -92,6 +94,8 @@ llm_kind_to_str(llm_kind_t k)
     case LLM_KIND_CHAT:  return("chat");
     case LLM_KIND_EMBED: return("embed");
     case LLM_KIND_IMAGE: return("image");
+    case LLM_KIND_STT:   return("stt");
+    case LLM_KIND_TTS:   return("tts");
   }
 
   return("chat");
@@ -711,8 +715,15 @@ llm_models_reload(void)
     snprintf(m.base_url, sizeof(m.base_url), "%s", base ? base : "");
     snprintf(m.model_id, sizeof(m.model_id), "%s", mid ? mid : "");
 
+    // A kind this binary does not know is a row written by a NEWER one
+    // (the DB outlives any single build). Dropping it silently would
+    // present as a model that simply stopped existing, so name it.
     if(llm_kind_from_str(kind, &m.kind) != SUCCESS)
+    {
+      clam(CLAM_WARN, "llm", "model %s: unknown kind '%s' — row ignored",
+          name, kind);
       continue;
+    }
 
     m.embed_dim    = dim    ? (uint32_t)strtoul(dim, NULL, 10) : 0;
     // Fall back to the KV default (llm.max_context_tokens) rather than
@@ -1688,6 +1699,98 @@ llm_build_image_body(llm_request_t *req, const char *prompt)
   return(SUCCESS);
 }
 
+// Build the speech-to-text request body. This is the one request the
+// engine sends that is not JSON: whisper.cpp's server takes an RFC-7578
+// multipart upload on /inference, and its OpenAI-compatible route does
+// not exist (measured against 1.9.1). Two parts — the audio, and the
+// response_format the parser downstream expects.
+//
+// The boundary is randomised per request rather than fixed: the payload
+// is binary audio, and a constant delimiter is one an unlucky run of
+// samples can forge.
+static bool
+llm_build_stt_body(llm_request_t *req, const void *wav, size_t wav_len)
+{
+  char   boundary[LLM_BOUNDARY_SZ];
+  char   head[LLM_BOUNDARY_SZ + 128];
+  char   tail[LLM_BOUNDARY_SZ * 2 + 128];
+  char  *body;
+  int    head_len;
+  int    tail_len;
+
+  snprintf(boundary, sizeof(boundary), "----botman%04x%04x%04x%04x",
+      (unsigned)util_rand(0x10000), (unsigned)util_rand(0x10000),
+      (unsigned)util_rand(0x10000), (unsigned)util_rand(0x10000));
+
+  head_len = snprintf(head, sizeof(head),
+      "--%s\r\n"
+      "Content-Disposition: form-data; name=\"file\";"
+      " filename=\"audio.wav\"\r\n"
+      "Content-Type: audio/wav\r\n"
+      "\r\n",
+      boundary);
+
+  tail_len = snprintf(tail, sizeof(tail),
+      "\r\n--%s\r\n"
+      "Content-Disposition: form-data; name=\"response_format\"\r\n"
+      "\r\n"
+      "json\r\n"
+      "--%s--\r\n",
+      boundary, boundary);
+
+  if(head_len < 0 || (size_t)head_len >= sizeof(head)
+      || tail_len < 0 || (size_t)tail_len >= sizeof(tail))
+    return(FAIL);
+
+  body = mem_alloc("llm", "stt_body",
+      (size_t)head_len + wav_len + (size_t)tail_len);
+
+  memcpy(body, head, (size_t)head_len);
+  memcpy(body + head_len, wav, wav_len);
+  memcpy(body + head_len + wav_len, tail, (size_t)tail_len);
+
+  req->req_body     = body;
+  req->req_body_len = (size_t)head_len + wav_len + (size_t)tail_len;
+
+  snprintf(req->content_type, sizeof(req->content_type),
+      "multipart/form-data; boundary=%s", boundary);
+
+  return(SUCCESS);
+}
+
+// Build the text-to-speech request body:
+//   {"model":...,"input":...,"voice":...,"speed":...,"response_format":"wav"}
+// Voice and speed are omitted when unset so the provider's own defaults
+// apply — kokorod answers a bare {"input":...} perfectly well.
+static bool
+llm_build_tts_body(llm_request_t *req, const char *text,
+    const char *voice, double speed)
+{
+  llm_buf_t b;
+  llm_buf_init(&b, 512);
+
+  llm_buf_puts(&b, "{\"model\":");
+  llm_json_str(&b, req->model_id);
+
+  llm_buf_puts(&b, ",\"input\":");
+  llm_json_str(&b, text);
+
+  if(voice != NULL && voice[0] != '\0')
+  {
+    llm_buf_puts(&b, ",\"voice\":");
+    llm_json_str(&b, voice);
+  }
+
+  if(speed > 0.0)
+    llm_buf_printf(&b, ",\"speed\":%.3f", speed);
+
+  llm_buf_puts(&b, ",\"response_format\":\"wav\"}");
+
+  req->req_body     = b.buf;
+  req->req_body_len = b.len;
+  return(SUCCESS);
+}
+
 // Response parsers
 
 // Parse a non-streaming chat body into req->assembled + token counts.
@@ -1953,6 +2056,78 @@ llm_parse_image_response(llm_request_t *req, const char *body, size_t len)
   return(SUCCESS);
 }
 
+// Collapse every run of whitespace to one space and trim both ends, in
+// place. Returns the new length. whisper punctuates its transcript with
+// the newlines it heard pauses at — " And so, my fellow Americans, ask
+// not what your country can\n do for you" — and a message carrying those
+// verbatim becomes several lines wherever it is delivered.
+static size_t
+llm_collapse_ws(char *s)
+{
+  char *w   = s;
+  bool  gap = false;
+
+  for(const char *r = s; *r != '\0'; r++)
+  {
+    if(*r == ' ' || *r == '\t' || *r == '\n' || *r == '\r')
+    {
+      gap = w != s;      // a gap before the first kept byte is not a gap
+      continue;
+    }
+
+    if(gap)
+      *w++ = ' ';
+
+    gap  = false;
+    *w++ = *r;
+  }
+
+  *w = '\0';
+  return((size_t)(w - s));
+}
+
+// Parse a transcription response: {"text":"…"}. An empty transcript is
+// a legitimate answer — the speaker said nothing intelligible — so it
+// succeeds with zero length rather than failing.
+static bool
+llm_parse_stt_response(llm_request_t *req, const char *body, size_t len)
+{
+  char   *out = mem_alloc("llm", "transcript", len + 1);
+  ssize_t n   = llm_extract_str(body, len, "\"text\"", out, len + 1);
+
+  if(n < 0)
+  {
+    mem_free(out);
+    snprintf(req->errbuf, sizeof(req->errbuf), "no text in response");
+    return(FAIL);
+  }
+
+  llm_assembled_append(req, out, llm_collapse_ws(out));
+  mem_free(out);
+
+  return(SUCCESS);
+}
+
+// "Parse" a synthesis response: the provider answers with the audio
+// container itself, so this is a Content-Type assertion plus a binary
+// copy. Without the assertion a JSON error body served with a 200 would
+// be handed downstream and uploaded to the robot as speech.
+static bool
+llm_parse_tts_response(llm_request_t *req, const char *body, size_t len)
+{
+  if(strncmp(req->resp_content_type, "audio/", 6) != 0)
+  {
+    snprintf(req->errbuf, sizeof(req->errbuf),
+        "expected audio, got '%.64s'",
+        req->resp_content_type[0] != '\0'
+            ? req->resp_content_type : "no content type");
+    return(FAIL);
+  }
+
+  llm_assembled_append(req, body, len);
+  return(SUCCESS);
+}
+
 // Streaming chunk handler
 
 // Called by sse_parser_feed for each complete SSE event.
@@ -2142,6 +2317,57 @@ llm_deliver_image(llm_request_t *req, bool ok, long http_status,
   llm_req_release(req);
 }
 
+static void
+llm_deliver_stt(llm_request_t *req, bool ok, long http_status,
+    const char *err)
+{
+  llm_stt_response_t resp;
+
+  memset(&resp, 0, sizeof(resp));
+  resp.request     = req;
+  resp.ok          = ok;
+  resp.http_status = http_status;
+  resp.model       = req->model_name;
+  resp.text        = req->assembled != NULL ? req->assembled : "";
+  resp.text_len    = req->assembled_len;
+  resp.error       = ok ? NULL : (err != NULL ? err : req->errbuf);
+  resp.user_data   = req->user_data;
+
+  llm_active_remove(req);
+  llm_accumulate_stats(req, ok);
+
+  if(req->stt_done_cb != NULL)
+    req->stt_done_cb(&resp);
+
+  llm_req_release(req);
+}
+
+static void
+llm_deliver_tts(llm_request_t *req, bool ok, long http_status,
+    const char *err)
+{
+  llm_tts_response_t resp;
+
+  memset(&resp, 0, sizeof(resp));
+  resp.request      = req;
+  resp.ok           = ok;
+  resp.http_status  = http_status;
+  resp.model        = req->model_name;
+  resp.bytes        = (const uint8_t *)req->assembled;
+  resp.bytes_len    = req->assembled_len;
+  resp.content_type = req->resp_content_type;
+  resp.error        = ok ? NULL : (err != NULL ? err : req->errbuf);
+  resp.user_data    = req->user_data;
+
+  llm_active_remove(req);
+  llm_accumulate_stats(req, ok);
+
+  if(req->tts_done_cb != NULL)
+    req->tts_done_cb(&resp);
+
+  llm_req_release(req);
+}
+
 // Deliver the terminal callback for whichever request type this is, then
 // release the request. Single point of truth for the type→deliverer map.
 static void
@@ -2152,6 +2378,8 @@ llm_deliver(llm_request_t *req, bool ok, long http_status, const char *err)
     case LLM_REQ_CHAT:  llm_deliver_chat(req, ok, http_status, err);  break;
     case LLM_REQ_EMBED: llm_deliver_embed(req, ok, http_status, err); break;
     case LLM_REQ_IMAGE: llm_deliver_image(req, ok, http_status, err); break;
+    case LLM_REQ_STT:   llm_deliver_stt(req, ok, http_status, err);   break;
+    case LLM_REQ_TTS:   llm_deliver_tts(req, ok, http_status, err);   break;
   }
 }
 
@@ -2226,6 +2454,12 @@ llm_curl_done_cb(const curl_response_t *resp)
   bool ok;
   req->http_status = resp->status;
 
+  // Captured for every kind, load-bearing for the audio ones: a 200
+  // carrying JSON instead of a WAV is a failure the body alone does not
+  // announce.
+  snprintf(req->resp_content_type, sizeof(req->resp_content_type), "%s",
+      resp->content_type != NULL ? resp->content_type : "");
+
   ok = false;
 
   if(resp->curl_code == 0 && resp->status >= 200 && resp->status < 300)
@@ -2244,6 +2478,14 @@ llm_curl_done_cb(const curl_response_t *resp)
           break;
         case LLM_REQ_IMAGE:
           ok = (llm_parse_image_response(req, resp->body, resp->body_len)
+                == SUCCESS);
+          break;
+        case LLM_REQ_STT:
+          ok = (llm_parse_stt_response(req, resp->body, resp->body_len)
+                == SUCCESS);
+          break;
+        case LLM_REQ_TTS:
+          ok = (llm_parse_tts_response(req, resp->body, resp->body_len)
                 == SUCCESS);
           break;
       }
@@ -2394,7 +2636,10 @@ llm_issue_request(llm_request_t *req)
   if(cr == NULL)
     return(FAIL);
 
-  if(curl_request_set_body(cr, "application/json",
+  // JSON unless the request said otherwise — only the speech-to-text
+  // path does, and only to carry its multipart boundary.
+  if(curl_request_set_body(cr,
+      req->content_type[0] != '\0' ? req->content_type : "application/json",
       req->req_body, req->req_body_len) != SUCCESS)
     goto fail;
 
@@ -2411,9 +2656,16 @@ llm_issue_request(llm_request_t *req)
     }
   }
 
-  // Accept SSE or JSON depending on streaming.
-  curl_request_add_header(cr, req->streaming
-      ? "Accept: text/event-stream" : "Accept: application/json");
+  // What we are willing to be answered with: an event stream while
+  // streaming, audio from a synthesis request, JSON everywhere else.
+  if(req->streaming)
+    curl_request_add_header(cr, "Accept: text/event-stream");
+
+  else if(req->type == LLM_REQ_TTS)
+    curl_request_add_header(cr, "Accept: audio/wav");
+
+  else
+    curl_request_add_header(cr, "Accept: application/json");
 
   // Timeout.
   to = req->params.timeout_secs;
@@ -2721,6 +2973,158 @@ llm_image_submit(const char *model_name,
   return(SUCCESS);
 }
 
+// The audio kinds carry no prompt worth reproducing — a WAV cannot be
+// logged and a synthesis input is one short line — so they get a single
+// DEBUG5 line each rather than llm_clam_prompt_*'s chunked treatment.
+
+bool
+llm_stt_submit(const char *model_name, const void *wav, size_t wav_len,
+    llm_stt_done_cb_t done_cb, void *user_data)
+{
+  llm_model_t    m;
+  llm_request_t *req;
+
+  if(!llm_ready || model_name == NULL || wav == NULL || wav_len == 0
+      || done_cb == NULL)
+    return(FAIL);
+
+  if(wav_len > LLM_STT_WAV_MAX)
+  {
+    clam(CLAM_WARN, "llm", "stt payload of %zu bytes exceeds the %u-byte cap",
+        wav_len, LLM_STT_WAV_MAX);
+    return(FAIL);
+  }
+
+  if(llm_models_snapshot(model_name, &m) != SUCCESS || !m.enabled
+      || m.kind != LLM_KIND_STT)
+  {
+    clam(CLAM_WARN, "llm", "unknown/disabled stt model: %s", model_name);
+    return(FAIL);
+  }
+
+  req = llm_req_alloc();
+
+  req->type = LLM_REQ_STT;
+  snprintf(req->model_name, sizeof(req->model_name), "%s", m.name);
+  snprintf(req->model_id,   sizeof(req->model_id),   "%s", m.model_id);
+
+  // whisper.cpp serves transcription at the server root, which is why
+  // an stt service's base URL carries no /v1.
+  if(llm_build_url(m.base_url, "inference",
+      req->endpoint_url, sizeof(req->endpoint_url)) != SUCCESS)
+  {
+    clam(CLAM_WARN, "llm", "cannot build stt URL for %s (service %s)",
+        m.name, m.service_name);
+    llm_req_release(req);
+    return(FAIL);
+  }
+
+  snprintf(req->api_key_kv, sizeof(req->api_key_kv),
+      "llm.service.%s.creds.apikey", m.service_name);
+  snprintf(req->service_name, sizeof(req->service_name), "%s", m.service_name);
+
+  req->kind        = m.kind;
+  req->stt_done_cb = done_cb;
+  req->user_data   = user_data;
+  req->streaming   = false;
+
+  clam(CLAM_DEBUG5, "llm", "prompt stt submit model=%s wav=%zu bytes",
+      model_name, wav_len);
+
+  if(llm_build_stt_body(req, wav, wav_len) != SUCCESS)
+  {
+    llm_req_release(req);
+    return(FAIL);
+  }
+
+  clock_gettime(CLOCK_MONOTONIC, &req->started);
+  llm_active_add(req);
+
+  if(llm_issue_request(req) != SUCCESS)
+  {
+    llm_active_remove(req);
+    llm_req_release(req);
+    return(FAIL);
+  }
+
+  return(SUCCESS);
+}
+
+bool
+llm_tts_submit(const char *model_name, const llm_tts_params_t *params,
+    const char *text, llm_tts_done_cb_t done_cb, void *user_data)
+{
+  llm_model_t    m;
+  llm_request_t *req;
+  const char    *voice = NULL;
+  double         speed = 0.0;
+
+  if(!llm_ready || model_name == NULL || text == NULL || text[0] == '\0'
+      || done_cb == NULL)
+    return(FAIL);
+
+  if(llm_models_snapshot(model_name, &m) != SUCCESS || !m.enabled
+      || m.kind != LLM_KIND_TTS)
+  {
+    clam(CLAM_WARN, "llm", "unknown/disabled tts model: %s", model_name);
+    return(FAIL);
+  }
+
+  req = llm_req_alloc();
+
+  req->type = LLM_REQ_TTS;
+  snprintf(req->model_name, sizeof(req->model_name), "%s", m.name);
+  snprintf(req->model_id,   sizeof(req->model_id),   "%s", m.model_id);
+
+  if(llm_build_url(m.base_url, "audio/speech",
+      req->endpoint_url, sizeof(req->endpoint_url)) != SUCCESS)
+  {
+    clam(CLAM_WARN, "llm", "cannot build tts URL for %s (service %s)",
+        m.name, m.service_name);
+    llm_req_release(req);
+    return(FAIL);
+  }
+
+  snprintf(req->api_key_kv, sizeof(req->api_key_kv),
+      "llm.service.%s.creds.apikey", m.service_name);
+  snprintf(req->service_name, sizeof(req->service_name), "%s", m.service_name);
+
+  req->kind        = m.kind;
+  req->tts_done_cb = done_cb;
+  req->user_data   = user_data;
+  req->streaming   = false;
+
+  if(params != NULL)
+  {
+    voice = params->voice;
+    speed = params->speed;
+    req->params.timeout_secs = params->timeout_secs;
+  }
+
+  clam(CLAM_DEBUG5, "llm",
+      "prompt tts submit model=%s voice=%s speed=%.3f chars=%zu: %s",
+      model_name, voice != NULL && voice[0] != '\0' ? voice : "(default)",
+      speed, strlen(text), text);
+
+  if(llm_build_tts_body(req, text, voice, speed) != SUCCESS)
+  {
+    llm_req_release(req);
+    return(FAIL);
+  }
+
+  clock_gettime(CLOCK_MONOTONIC, &req->started);
+  llm_active_add(req);
+
+  if(llm_issue_request(req) != SUCCESS)
+  {
+    llm_active_remove(req);
+    llm_req_release(req);
+    return(FAIL);
+  }
+
+  return(SUCCESS);
+}
+
 // Stats + iteration
 
 void
@@ -2834,6 +3238,8 @@ llm_unmap_cb(uintptr_t lo, uintptr_t hi, void *data)
       case LLM_REQ_CHAT:  cb = (uintptr_t)fn_addr(&r->chat_done_cb);  break;
       case LLM_REQ_EMBED: cb = (uintptr_t)fn_addr(&r->embed_done_cb); break;
       case LLM_REQ_IMAGE: cb = (uintptr_t)fn_addr(&r->image_done_cb); break;
+      case LLM_REQ_STT:   cb = (uintptr_t)fn_addr(&r->stt_done_cb);   break;
+      case LLM_REQ_TTS:   cb = (uintptr_t)fn_addr(&r->tts_done_cb);   break;
     }
 
     if(cb == 0 || cb < lo || cb >= hi)
@@ -2842,6 +3248,8 @@ llm_unmap_cb(uintptr_t lo, uintptr_t hi, void *data)
     r->chat_done_cb  = NULL;
     r->embed_done_cb = NULL;
     r->image_done_cb = NULL;
+    r->stt_done_cb   = NULL;
+    r->tts_done_cb   = NULL;
     r->user_data     = NULL;
     orphaned++;
   }

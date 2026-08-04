@@ -25,8 +25,10 @@
 
 // Included WITHOUT REACHYAPI_INTERNAL: this TU lives in a different
 // mapping from the service, so every call goes through the header's
-// dlsym shims.
+// dlsym shims. Same story for the inference engine's ABI.
 #include "reachyapi_api.h"
+#include "inference.h"
+#include "kv.h"
 
 #include <math.h>
 #include <stdio.h>
@@ -35,6 +37,28 @@
 #define REACHYCMD_CTX       "reachycmd"
 #define REACHYCMD_LINE_SZ   512
 #define REACHYCMD_FILTER_SZ 64
+
+// A failure reason, before the "reachy: " prefix that turns it into a
+// line. Kept comfortably under REACHYCMD_LINE_SZ so the two compose
+// without truncation — the longest reason carries an engine errbuf.
+#define REACHYCMD_REASON_SZ 384
+
+// `!reachy say` is bounded by the command parser: CMD_ARG_REST captures
+// the remainder of the line into one CMD_ARG_SZ token, so nothing longer
+// than that can arrive here in the first place.
+#define REACHYCMD_SAY_SZ    CMD_ARG_SZ
+
+// One fixed filename on the robot for every spoken line. Uploads
+// overwrite by name in /tmp/reachy_mini_sounds/, so a fixed name is what
+// keeps a talkative robot from filling its own tmpfs.
+#define REACHYCMD_SAY_FILE  "reachy_say.wav"
+
+// Which registered speech model the voice comes out of, and how. These
+// are plugin-level because `!reachy say` is a command surface, not a
+// bot: per-bot voice lives in the protocol driver's instance KV.
+#define REACHYCMD_KV_TTS_MODEL "plugin.reachycmd.tts_model"
+#define REACHYCMD_KV_TTS_VOICE "plugin.reachycmd.tts_voice"
+#define REACHYCMD_KV_TTS_SPEED "plugin.reachycmd.tts_speed"
 
 // The move list is rendered as a grid. Four to a line keeps the widest
 // name in the shipped library (`incomprehensible2`, 17 chars) inside its
@@ -84,6 +108,16 @@ typedef struct
   reachycmd_hold_t hold;
   char             filter[REACHYCMD_FILTER_SZ];
 } reachycmd_list_t;
+
+// `!reachy say` is three async hops on one heap context — synthesize,
+// upload, play — each hop's completion starting the next from the curl
+// worker thread. The text rides along only so the final line can quote
+// what was actually spoken.
+typedef struct
+{
+  reachycmd_hold_t hold;
+  char             text[REACHYCMD_SAY_SZ];
+} reachycmd_say_t;
 
 static bool reachycmd_register(void);
 static bool reachycmd_init(void);

@@ -784,7 +784,7 @@ cmd_llm_add_model(const cmd_ctx_t *ctx)
   if(ctx->parsed == NULL || ctx->parsed->argc < 4)
   {
     cmd_reply(ctx,
-        "usage: llm add model <chat|embed|image> <name> <service> <model_id>");
+        "usage: llm add model <chat|embed|image|stt|tts> <name> <service> <model_id>");
     return;
   }
 
@@ -795,7 +795,7 @@ cmd_llm_add_model(const cmd_ctx_t *ctx)
 
   if(llm_kind_from_str(kind_s, &k) != SUCCESS)
   {
-    cmd_reply(ctx, "error: type must be 'chat', 'embed', or 'image'");
+    cmd_reply(ctx, "error: type must be 'chat', 'embed', 'image', 'stt' or 'tts'");
     return;
   }
 
@@ -1066,11 +1066,23 @@ cmd_llm_test(const cmd_ctx_t *ctx)
         cmd_llm_test_image_done, &s) == SUCCESS);
   }
 
-  else
+  else if(k == LLM_KIND_EMBED)
   {
     const char *inputs[1] = { prompt };
     submitted = (llm_embed_submit(name, inputs, 1,
         cmd_llm_test_embed_done, &s) == SUCCESS);
+  }
+
+  // The speech kinds are deliberately not testable from here: one wants
+  // a WAV this command has no way to hold and the other answers with
+  // one. Say so plainly rather than fall through to the embed arm and
+  // fail against its kind guard with a baffling message.
+  else
+  {
+    cmd_reply(ctx, "error: `llm test` does not cover the speech kinds — "
+        "try `!reachy say <text>` for a tts model, and speak to the robot "
+        "for an stt one");
+    goto cleanup;
   }
 
   if(!submitted)
@@ -1410,7 +1422,7 @@ static void
 cmd_llm_add_usage(const cmd_ctx_t *ctx)
 {
   cmd_reply(ctx, "usage: llm add service <name> <base_url>");
-  cmd_reply(ctx, "       llm add model <chat|embed|image> <name> <service> <model_id>");
+  cmd_reply(ctx, "       llm add model <chat|embed|image|stt|tts> <name> <service> <model_id>");
 }
 
 static void
@@ -1447,7 +1459,7 @@ llm_register_commands(void)
       NULL, NULL);
 
   cmd_register("llm", "model",
-      "llm add model <chat|embed|image> <name> <service> <model_id>",
+      "llm add model <chat|embed|image|stt|tts> <name> <service> <model_id>",
       "Register a model against a service",
       NULL,
       USERNS_GROUP_ADMIN, 100, CMD_SCOPE_ANY, METHOD_T_ANY,
