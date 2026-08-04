@@ -149,10 +149,16 @@ curl -s $H/api/media/tracking/face                 # detected:true when you are 
 curl -s $H/api/state/doa                           # angle moves as you speak
 ```
 
-⚠ **Motors boot `disabled`.** A limp robot accepts every move command, returns
-a normal `{"uuid":…}`, completes, and does not move — with no error anywhere.
-If the robot "ignores" you, check `GET /api/motors/status` first. See
-`TODO.md §RCH-WAKE-1`.
+⚠ **Motors boot `disabled`, and the daemon is asymmetric about torque:**
+`goto_sleep` disables the motors itself at the end of its move, but `wake_up`
+never enables them. A limp robot accepts every move command, returns a normal
+`{"uuid":…}`, completes, and does not move — with no error anywhere. That is
+why the `set_mode/enabled` line above comes first and is not optional.
+
+If the robot "ignores" you, check `GET /api/motors/status` first — or ask the
+bot, since `show reachy` reports the motor mode in words. `!reachy wake` does
+both steps for you (shipped `4ef0cef`); this section is the by-hand path for a
+robot with no botman in front of it.
 
 ---
 
