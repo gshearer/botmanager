@@ -126,10 +126,12 @@ curl_request_release(curl_request_t *req)
   pthread_mutex_unlock(&curl_req_mutex);
 }
 
-// Header callback for libcurl. Captures only ETag, Last-Modified and
-// Set-Cookie. libcurl delivers each header line including the trailing
-// CRLF; the match is case-insensitive, the value is copied into the
-// fixed request buffer (bounded, NUL-terminated, CRLF-trimmed).
+// Header callback for libcurl. Captures ETag, Last-Modified and
+// Set-Cookie unconditionally, plus whatever names the submitter asked
+// for through curl_request_capture_header. libcurl delivers each
+// header line including the trailing CRLF; the match is
+// case-insensitive, the value is copied into the fixed request buffer
+// (bounded, NUL-terminated, CRLF-trimmed).
 //
 // Set-Cookie is handled differently from the other two: it may appear
 // many times in one response, so each line contributes its cookie-pair
@@ -156,10 +158,11 @@ curl_header_cb(char *buf, size_t size, size_t nitems, void *userdata)
     size_t name_len;
     char  *dst;
     size_t dst_cap;
-    size_t i;
-    size_t vstart;
-    size_t vend;
-    bool   cookie = false;
+    size_t  i;
+    size_t  vstart;
+    size_t  vend;
+    uint8_t slot;
+    bool    cookie = false;
 
     if(strncasecmp(buf, "ETag:", 5) == 0)
     {
@@ -183,8 +186,28 @@ curl_header_cb(char *buf, size_t size, size_t nitems, void *userdata)
       cookie   = true;
     }
 
+    // Not one of the three: fall through to the submitter's capture
+    // set. A name matches when the line opens with it and the very
+    // next byte is the colon — a prefix match would let "X-Utt-Seq"
+    // swallow "X-Utt-Seq-Whatever".
     else
-      return(total);
+    {
+      for(slot = 0; slot < req->capture_count; slot++)
+      {
+        size_t nlen = strnlen(req->captures[slot].name, CURL_CAPTURE_NAME_SZ);
+
+        if(total > nlen && buf[nlen] == ':'
+            && strncasecmp(buf, req->captures[slot].name, nlen) == 0)
+          break;
+      }
+
+      if(slot == req->capture_count)
+        return(total);
+
+      name_len = strnlen(req->captures[slot].name, CURL_CAPTURE_NAME_SZ) + 1;
+      dst      = req->captures[slot].value;
+      dst_cap  = CURL_CAPTURE_VALUE_SZ;
+    }
 
     // Skip leading whitespace after the colon.
     vstart = name_len;
@@ -411,6 +434,62 @@ curl_request_add_header(curl_request_t *req, const char *header)
   req->headers = hdr;
 
   return(SUCCESS);
+}
+
+// Ask the transfer to retain one more response header for the
+// completion callback. Registering the same name twice is idempotent
+// rather than an error — it costs no slot and lets a caller assemble
+// its capture list from several places without bookkeeping.
+// req: request handle (must be in CREATED state)
+bool
+curl_request_capture_header(curl_request_t *req, const char *name)
+{
+  size_t nlen;
+
+  if(req == NULL || name == NULL || req->state != CURL_REQ_CREATED)
+    return(FAIL);
+
+  nlen = strnlen(name, CURL_CAPTURE_NAME_SZ);
+
+  // A colon in the name would never match: curl_header_cb splices one
+  // in itself. Refuse rather than capture a header that cannot fire.
+  if(nlen == 0 || nlen >= CURL_CAPTURE_NAME_SZ
+      || memchr(name, ':', nlen) != NULL)
+    return(FAIL);
+
+  for(uint8_t i = 0; i < req->capture_count; i++)
+    if(strncasecmp(req->captures[i].name, name, CURL_CAPTURE_NAME_SZ) == 0)
+      return(SUCCESS);
+
+  if(req->capture_count >= CURL_CAPTURE_MAX)
+    return(FAIL);
+
+  // The request came off the freelist zeroed, so the value buffer is
+  // already the empty string that means "the server never sent it".
+  memcpy(req->captures[req->capture_count].name, name, nlen + 1);
+  req->capture_count++;
+
+  return(SUCCESS);
+}
+
+// Read back a header captured by curl_request_capture_header. Safe on
+// any response, including one whose request never asked for captures.
+const char *
+curl_response_header(const curl_response_t *resp, const char *name)
+{
+  const curl_request_t *req;
+
+  if(resp == NULL || resp->request == NULL || name == NULL)
+    return(NULL);
+
+  req = resp->request;
+
+  for(uint8_t i = 0; i < req->capture_count; i++)
+    if(strncasecmp(req->captures[i].name, name, CURL_CAPTURE_NAME_SZ) == 0)
+      return(req->captures[i].value[0] != '\0'
+          ? req->captures[i].value : NULL);
+
+  return(NULL);
 }
 
 // Set a per-request timeout, overriding the global KV default.

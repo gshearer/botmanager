@@ -15,6 +15,7 @@ typedef struct
 static const method_type_entry_t method_type_table[] = {
   { "botmanctl", METHOD_T_BOTMANCTL, "Unix socket interface for scripted control" },
   { "irc",       METHOD_T_IRC,       "Internet Relay Chat protocol" },
+  { "reachy",    METHOD_T_REACHY,    "Reachy Mini robot voice" },
 };
 
 #define METHOD_TYPE_COUNT \

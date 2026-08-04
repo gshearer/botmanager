@@ -36,6 +36,7 @@ typedef uint32_t method_type_t;
 
 #define METHOD_T_BOTMANCTL ((method_type_t)1U << 1)
 #define METHOD_T_IRC       ((method_type_t)1U << 2)
+#define METHOD_T_REACHY    ((method_type_t)1U << 3)
 #define METHOD_T_ANY       ((method_type_t)UINT32_MAX)
 
 // Method capability bitmask: declares optional features a driver supports,

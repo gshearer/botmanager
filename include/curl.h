@@ -31,6 +31,13 @@ typedef enum
 // keeps the value past the callback needs to size its own buffer.
 #define CURL_COOKIE_SZ        1024
 
+// Bounds on the per-request captured-header set. Public because a
+// caller that keeps a captured value past the callback needs to size
+// its own buffer. See curl_request_capture_header.
+#define CURL_CAPTURE_MAX      4
+#define CURL_CAPTURE_NAME_SZ  32
+#define CURL_CAPTURE_VALUE_SZ 128
+
 typedef struct curl_request curl_request_t;
 
 // Delivered to completion callback. Valid for the duration of the
@@ -79,6 +86,28 @@ bool curl_request_set_body(curl_request_t *req, const char *content_type,
 
 // May be called multiple times before submit.
 bool curl_request_add_header(curl_request_t *req, const char *header);
+
+// Retain the value of response header `name` so the completion
+// callback can read it back with curl_response_header(). The match is
+// case-insensitive and, for a header the server repeats, last-write-
+// wins; `name` is copied and must carry no colon. CREATED state only.
+//
+// FAIL when the request is past CREATED, the set is already
+// CURL_CAPTURE_MAX deep, or `name` does not fit
+// CURL_CAPTURE_NAME_SZ. Values longer than CURL_CAPTURE_VALUE_SZ are
+// truncated, not refused.
+//
+// ETag, Last-Modified and Set-Cookie are captured unconditionally and
+// surfaced as named fields on curl_response_t — never spend a slot on
+// those three.
+bool curl_request_capture_header(curl_request_t *req, const char *name);
+
+// The captured value of `name` on a completed transfer. NULL when the
+// header was never requested, or was requested and the server did not
+// send it — so a non-NULL return always carries a real value. Valid
+// for the duration of the completion callback only.
+const char *curl_response_header(const curl_response_t *resp,
+    const char *name);
 
 // timeout_secs of 0 uses the KV default.
 bool curl_request_set_timeout(curl_request_t *req, uint32_t timeout_secs);
@@ -285,6 +314,19 @@ struct curl_request
   char                resp_etag          [128];
   char                resp_last_modified [64];
   char                resp_set_cookie    [CURL_COOKIE_SZ];
+
+  // Response headers the submitter asked to keep beyond those three,
+  // via curl_request_capture_header. Names are matched case-
+  // insensitively and a repeated header is last-write-wins; an empty
+  // value means the server never sent it. Read back through
+  // curl_response_header, which is why the set is bounded and inline —
+  // a captured header is a handful of small values, not a dictionary.
+  struct
+  {
+    char name  [CURL_CAPTURE_NAME_SZ];
+    char value [CURL_CAPTURE_VALUE_SZ];
+  } captures[CURL_CAPTURE_MAX];
+  uint8_t             capture_count;
 
   curl_done_cb_t      cb;
   void               *cb_data;

@@ -23,6 +23,16 @@ static const plugin_kv_entry_t reachyapi_kv_schema[] = {
   { REACHYAPI_KV_BASE_URL, KV_STR,
     "http://reachy.iot.hiigara.shearer.tech:8000",
     "Base URL of the reachy-mini-daemon HTTP API (no trailing slash)" },
+
+  // Nothing in this plugin reads this one: the ear is polled by the
+  // reachy protocol driver, and a plugin that speaks to the robot has
+  // no business speaking to the bridge. It lives here because the two
+  // addresses are one robot and belong in one place.
+  { REACHYAPI_KV_BRIDGE_URL, KV_STR,
+    "http://reachy.iot.hiigara.shearer.tech:8090",
+    "Base URL of earbridge, the robot's microphone bridge (no trailing "
+    "slash)" },
+
   { REACHYAPI_KV_TIMEOUT,  KV_UINT32, "15",
     "Per-request timeout in seconds; the robot is on WiFi, so keep it "
     "generous" },

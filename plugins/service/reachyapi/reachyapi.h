@@ -26,8 +26,13 @@
 // REACHYAPI_CTX (the plugin name / clam-context root) lives in
 // reachyapi_api.h.
 
-#define REACHYAPI_KV_BASE_URL  "plugin.reachyapi.base_url"
-#define REACHYAPI_KV_TIMEOUT   "plugin.reachyapi.timeout"
+#define REACHYAPI_KV_BASE_URL   "plugin.reachyapi.base_url"
+#define REACHYAPI_KV_TIMEOUT    "plugin.reachyapi.timeout"
+
+// Declared here and read by the reachy protocol driver, which keeps its
+// own copy of the name — the row is registered where the robot's other
+// address is, not where its only reader lives.
+#define REACHYAPI_KV_BRIDGE_URL "plugin.reachyapi.bridge_url"
 
 // The daemon plays a named move out of a Hugging Face dataset; the
 // emotion library is the only one botman addresses, and its id carries a
