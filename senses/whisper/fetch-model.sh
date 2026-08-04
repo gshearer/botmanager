@@ -22,9 +22,15 @@
 #   senses/whisper/fetch-model.sh                 # large-v3-turbo, the pinned model
 #   senses/whisper/fetch-model.sh base.en         # any upstream model name
 #
+# The server itself is the distro package (`whisper.cpp-cuda`), which ships
+# no weights — so this script is the whole of the model story, and the models
+# live beside it under senses/whisper/models/ (gitignored). WHISPER_DIR is
+# kept for a source checkout, which upstream's own downloader can then serve.
+#
 # Environment overrides:
-#   DEST_DIR   where the .bin lands     (default: ~/src/whisper.cpp/models)
-#   WHISPER_DIR whisper.cpp checkout    (default: ~/src/whisper.cpp)
+#   DEST_DIR   where the .bin lands     (default: senses/whisper/models)
+#   WHISPER_DIR whisper.cpp checkout,   (default: ~/src/whisper.cpp)
+#              used only when present
 #   SHA256     expected digest; when    (default: unset — the sidecar written
 #              set it is enforced and             by the first good fetch is
 #              replaces the sidecar               the reference instead)
@@ -36,7 +42,7 @@ set -euo pipefail
 
 MODEL="${1:-large-v3-turbo}"
 WHISPER_DIR="${WHISPER_DIR:-$HOME/src/whisper.cpp}"
-DEST_DIR="${DEST_DIR:-$WHISPER_DIR/models}"
+DEST_DIR="${DEST_DIR:-$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/models}"
 HF_BASE="https://huggingface.co/ggerganov/whisper.cpp/resolve/main"
 
 BIN="$DEST_DIR/ggml-${MODEL}.bin"
@@ -62,12 +68,18 @@ die() { echo "fetch-model: $*" >&2 ; exit 1 ; }
 
 # --- the three checks -------------------------------------------------------
 
+# The two formats disagree about byte order, and the headers are actively
+# misleading about it. `ggml.h` has `#define GGML_FILE_MAGIC 0x67676d6c //
+# "ggml"` — but that is a uint32, so it lands on disk little-endian as the
+# bytes `6c 6d 67 67`, i.e. **"lmgg"**. `gguf.h` has `#define GGUF_MAGIC
+# "GGUF"`, a string literal, which is NOT reversed. Trust the file, not the
+# trailing comment: a real ggml-large-v3-turbo.bin starts "lmgg".
 check_magic() {
     local magic
     magic=$(head -c 4 "$BIN" | tr -d '\0')
     case "$magic" in
-        ggml|GGUF) return 0 ;;
-        *) echo "    magic is '$magic', expected 'ggml' or 'GGUF'" >&2 ; return 1 ;;
+        lmgg|GGUF) return 0 ;;
+        *) echo "    magic is '$magic', expected 'lmgg' (ggml) or 'GGUF'" >&2 ; return 1 ;;
     esac
 }
 

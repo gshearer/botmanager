@@ -12,9 +12,11 @@
 # botman daemon on this same host (the robot never talks to it directly; the
 # ear bridge ships WAVs to botman and botman does the transcribing).
 #
-# Upstream builds out-of-tree in ~/src/whisper.cpp (operator gate G1); the
-# model is fetched by senses/whisper/fetch-model.sh. Nothing in this repo is
-# built or installed by this unit.
+# The server is the distro package `whisper.cpp-cuda` (AUR), not a source
+# build — operator preference, 2026-08-03, and it is the better deal: pacman
+# owns the upgrade path and the CUDA linkage is real (`ldd` shows
+# libggml-cuda, libcudart, libcublas). Only the model weights are ours to
+# fetch, via senses/whisper/fetch-model.sh. Nothing here is built by meson.
 #
 # Port map for the initiative: robot daemon 8000, earbridge 8090 (on the
 # robot), kokorod 8003, whisper-server 8004. The DGX Spark holds 8001/8002.
@@ -26,12 +28,16 @@ After=default.target
 
 [Service]
 Type=simple
-WorkingDirectory=%h/src/whisper.cpp
+WorkingDirectory=/mnt/fast/doc/projects/botmanager/senses/whisper
 # Fail loudly and immediately on a missing model rather than crash-looping on
 # an error message buried in whisper's own startup output.
-ExecStartPre=/usr/bin/test -r %h/src/whisper.cpp/models/ggml-large-v3-turbo.bin
-ExecStart=%h/src/whisper.cpp/build/bin/whisper-server \
-    -m %h/src/whisper.cpp/models/ggml-large-v3-turbo.bin \
+ExecStartPre=/usr/bin/test -r /mnt/fast/doc/projects/botmanager/senses/whisper/models/ggml-large-v3-turbo.bin
+# --inference-path defaults to /inference on 1.9.1 (measured from --help,
+# 08-03); that is the route RCH-4's `whispercpp` stt_dialect posts to, and
+# it is why the STT service URL carries no /v1. Left at the default
+# deliberately — pinning it here would silently diverge from the dialect.
+ExecStart=/usr/bin/whisper-server \
+    -m /mnt/fast/doc/projects/botmanager/senses/whisper/models/ggml-large-v3-turbo.bin \
     --host 127.0.0.1 --port 8004
 # The model load is ~1.6 GB off disk into VRAM; give it room before systemd
 # decides the unit is wedged.
