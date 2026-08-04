@@ -1,0 +1,51 @@
+# earbridge.service — the robot's ear (RCH-5).
+#
+# ⚠ This is a SYSTEM unit that installs ON THE ROBOT, not on the botman host.
+# It is the only systemd unit in this project that does. Install it with the
+# commands deploy.sh prints (operator gate G4):
+#
+#   sudo cp ~/earbridge/earbridge.service /etc/systemd/system/
+#   sudo systemctl daemon-reload
+#   sudo systemctl enable --now earbridge
+#
+# It runs as `pollen`, the same unprivileged user as the Reachy daemon, which
+# is all the access it needs: capture goes through the shared dsnoop PCM in
+# ~pollen/.asoundrc. It never calls /api/media/release and never opens hw:0,0,
+# so the robot daemon keeps the microphone, and face tracking and DoA carry on
+# untouched while this records.
+#
+# NO AUTHENTICATION. It will hand a recording of the room to anyone who asks
+# on port 8090. That is acceptable only because the robot is on an isolated
+# VLAN with botman as its sole client — revisit this the moment either
+# changes.
+#
+# --take selects which channel of the 2-channel dsnoop stream becomes the mono
+# utterance. The bake-off was run on 2026-08-03 and settled objectively rather
+# than by ear: over a 6 s shared capture the two channels are BIT-IDENTICAL
+# (rms(ch0-ch1) == 0.0 exactly). The XVF3800 emits one AEC/beamformed mono
+# signal duplicated across both channels, so ch0, ch1 and mix produce
+# byte-for-byte the same audio and there is nothing to choose between them.
+#
+# ch0 is therefore the flag, and --take is currently a no-op kept as the
+# diagnostic for the day a firmware or .asoundrc change makes the channels
+# differ. If you are here because audio looks wrong, re-run that comparison
+# before assuming the channel is the problem.
+
+[Unit]
+Description=earbridge — microphone bridge for botman (reachy senses)
+After=network-online.target reachy-mini-daemon.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=pollen
+WorkingDirectory=/home/pollen/earbridge
+ExecStart=/home/pollen/earbridge/earbridge --daemon-url http://127.0.0.1:8000 --take ch0
+# The capture thread already recovers from ALSA errors and reopens the device
+# on its own; Restart is the backstop for something worse, not the strategy.
+Restart=always
+RestartSec=5
+SyslogIdentifier=earbridge
+
+[Install]
+WantedBy=multi-user.target
