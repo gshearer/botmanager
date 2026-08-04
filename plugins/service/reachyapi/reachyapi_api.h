@@ -96,15 +96,27 @@ typedef struct
 
 typedef void (*reachy_doa_cb_t)(const reachy_doa_t *r);
 
+// Motor control mode, long enough for "gravity_compensation".
+#define REACHY_MOTOR_MODE_SZ 24
+
 // GET /api/daemon/status, flattened. `face_x` / `face_y` are normalized
 // to [-1,1] and meaningful only while `face_detected` — the daemon sends
 // nulls when it has no target, and those land here as zeroes.
+//
+// `motors` is "enabled", "disabled" or "gravity_compensation", and is
+// empty only if the daemon stopped reporting it. It is lifted out of
+// `backend_status.motor_control_mode`, which was measured character-for
+// -character equal to what GET /api/motors/status serves across all
+// three modes on 2026-08-04 — so the mode rides along in a response the
+// caller was already making, and no caller needs a second round trip to
+// find out whether the robot has any torque in it.
 typedef struct
 {
   reachy_status_t status;
   char            state[24];
   bool            media_released;
   bool            no_media;
+  char            motors[REACHY_MOTOR_MODE_SZ];
   bool            face_detected;
   double          face_x;
   double          face_y;
@@ -145,10 +157,21 @@ bool reachy_list_moves(reachy_moves_cb_t cb, void *user_data);
 bool reachy_play_move(const char *move, reachy_done_cb_t cb,
     void *user_data);
 
+// ⚠ The daemon is ASYMMETRIC about torque, measured 2026-08-04:
+// `goto_sleep` disables the motors itself once the move finishes, but
+// `wake_up` never enables them. So waking is two calls — motors first,
+// the move second — while sleeping is one. A wake_up sent to a limp
+// robot is accepted, returns a uuid, "completes", and moves nothing;
+// there is no error on any surface. See `reachy/TODO.md §RCH-WAKE-1`.
+//
+// Both return as soon as the daemon has ACCEPTED the move (~13 ms). The
+// motion itself takes ~2.5 s and is visible in GET /api/move/running
+// until it ends — a completion here is not a robot that has arrived.
 bool reachy_wake(reachy_done_cb_t cb, void *user_data);
 bool reachy_sleep_move(reachy_done_cb_t cb, void *user_data);
 
-// mode: "enabled", "disabled" or "gravity_compensation".
+// mode: "enabled", "disabled" or "gravity_compensation". Read the
+// current one from reachy_get_status()'s `motors`.
 bool reachy_motors_mode(const char *mode, reachy_done_cb_t cb,
     void *user_data);
 

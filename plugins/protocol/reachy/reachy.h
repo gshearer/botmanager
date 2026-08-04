@@ -247,6 +247,20 @@ typedef struct
   char            text[METHOD_TEXT_SZ];
 } reachy_dispatch_t;
 
+// Standing the robot up at connect, across three completions on the
+// curl worker thread: ask what the motors are doing, raise torque if
+// they are down, then play the wake move.
+//
+// It carries a COPY of the name and nothing else — deliberately. The
+// chain outlives no state, holds no reference and touches no instance,
+// so a bot destroyed while the robot is still rising raises no lifetime
+// question at all; the worst case is three log lines about a creature
+// that has already gone.
+typedef struct
+{
+  char botname[BOT_NAME_SZ];
+} reachy_posture_t;
+
 static bool reachy_thread_track(task_handle_t);
 static void reachy_thread_forget(task_handle_t);
 
@@ -307,6 +321,11 @@ static bool reachy_pace(reachy_state_t *, uint32_t, bool);
 static void reachy_speak(reachy_state_t *, const char *);
 static void reachy_mouth(task_t *);
 
+static void reachy_posture_woke(const reachy_result_t *);
+static void reachy_posture_torque(const reachy_result_t *);
+static void reachy_posture_probe(const reachy_robot_status_t *);
+static void reachy_posture_wake(const reachy_state_t *);
+
 static void *reachy_create(const char *);
 static void reachy_destroy(void *);
 static bool reachy_connect(void *);
@@ -321,6 +340,8 @@ static bool reachy_start(void);
 static void reachy_count_bound_cb(const char *, const char *, const void *,
     void *);
 static bool reachy_stop(void);
+static bool reachy_suspend(void);
+static bool reachy_resume(void);
 
 #endif // REACHY_INTERNAL
 

@@ -50,7 +50,9 @@ static const plugin_kv_entry_t reachy_inst_kv_schema[] = {
     "Face-tracking strength in [0,1] applied at connect; 0 leaves "
     "tracking alone" },
   { "sleep_on_disconnect", KV_UINT8, "1",
-    "Play the goto_sleep move when the bot stops" },
+    "Settle the robot into its shell when the bot stops; the daemon "
+    "drops torque at the end of that move, so it ends up limp. A "
+    "plugin reload is exempt — that is a blip, not a goodbye" },
 
   { "prefix", KV_STR, "!",
     "Command prefix this bot answers to when spoken aloud" },
@@ -109,6 +111,23 @@ reachy_thread_forget(task_handle_t h)
 
   pthread_mutex_unlock(&reachy_threads_mutex);
 }
+
+// ----------------------------------------------------------------------
+// Telling a reload apart from a goodbye
+// ----------------------------------------------------------------------
+
+// disconnect() is called for both, by the same core path, and the two
+// want opposite things from the body: a bot being stopped should be put
+// to bed, while a bot whose code is being swapped underneath it should
+// not notice at all. suspend() is the one signal that separates them —
+// core calls it only on the reload path, immediately before it detaches
+// our bots, and detaching is what runs disconnect().
+//
+// Set on the way into a reload, cleared on the way out. Cleared in
+// resume() rather than in connect(), because a reload that is refused
+// downstream is put straight back without anything having disconnected
+// at all, and resume() is the only call both paths share.
+static bool reachy_reloading = false;  // atomic
 
 // ----------------------------------------------------------------------
 // State lifetime and bounded waiting
@@ -1531,6 +1550,108 @@ reachy_destroy(void *handle)
   reachy_state_unref(handle);
 }
 
+// ----------------------------------------------------------------------
+// Posture at connect — torque, then the move, and only if it is needed
+// ----------------------------------------------------------------------
+
+// The robot's daemon is asymmetric about torque, measured 2026-08-04:
+// goto_sleep drops the motors when its move ends, but wake_up never
+// raises them. A limp robot accepts wake_up, returns a uuid, "completes"
+// and stirs not at all, with no error on any surface — which is exactly
+// how a reload used to leave it lying in its shell.
+//
+// So the driver asks before it lifts. A robot already on its feet is
+// left standing exactly as the room last saw it: a reload is an event in
+// the daemon, not in the living room, and a creature that hauls itself
+// upright every time its code is rebuilt is a poltergeist.
+static void
+reachy_posture_woke(const reachy_result_t *r)
+{
+  reachy_posture_t *p = r->user_data;
+
+  if(r->status == REACHY_OK)
+    clam(CLAM_INFO, REACHY_CTX, "%s: robot woken — motors on, rising",
+        p->botname);
+
+  else
+    clam(CLAM_WARN, REACHY_CTX,
+        "%s: motors are on but the wake move failed — %s", p->botname,
+        reachy_status_str(r->status));
+
+  mem_free(p);
+}
+
+static void
+reachy_posture_torque(const reachy_result_t *r)
+{
+  reachy_posture_t *p = r->user_data;
+
+  if(r->status != REACHY_OK)
+  {
+    clam(CLAM_WARN, REACHY_CTX,
+        "%s: could not enable the robot's motors — %s; it will hear the "
+        "room but cannot move in it", p->botname,
+        reachy_status_str(r->status));
+    mem_free(p);
+    return;
+  }
+
+  if(reachy_wake(reachy_posture_woke, p) != SUCCESS)
+  {
+    clam(CLAM_WARN, REACHY_CTX,
+        "%s: the wake move was refused before it left", p->botname);
+    mem_free(p);
+  }
+}
+
+static void
+reachy_posture_probe(const reachy_robot_status_t *r)
+{
+  reachy_posture_t *p = r->user_data;
+
+  // An unreadable robot is left alone rather than heaved to its feet on
+  // a guess — the same posture the volume and tracking calls take.
+  if(r->status != REACHY_OK)
+  {
+    clam(CLAM_WARN, REACHY_CTX,
+        "%s: could not read the robot's motor state — %s; leaving its "
+        "posture alone", p->botname, reachy_status_str(r->status));
+    mem_free(p);
+    return;
+  }
+
+  if(strcmp(r->motors, "enabled") == 0)
+  {
+    clam(CLAM_INFO, REACHY_CTX,
+        "%s: robot is already up — leaving it as it stands", p->botname);
+    mem_free(p);
+    return;
+  }
+
+  if(reachy_motors_mode("enabled", reachy_posture_torque, p) != SUCCESS)
+  {
+    clam(CLAM_WARN, REACHY_CTX,
+        "%s: the motor enable was refused before it left", p->botname);
+    mem_free(p);
+  }
+}
+
+static void
+reachy_posture_wake(const reachy_state_t *st)
+{
+  reachy_posture_t *p = mem_alloc(REACHY_CTX, "posture", sizeof(*p));
+
+  snprintf(p->botname, sizeof(p->botname), "%s", st->botname);
+
+  if(reachy_get_status(reachy_posture_probe, p) != SUCCESS)
+  {
+    clam(CLAM_WARN, REACHY_CTX,
+        "%s: could not ask the robot whether it is awake — is "
+        "plugin.reachyapi.base_url set?", st->botname);
+    mem_free(p);
+  }
+}
+
 // Runs outside every core lock, which is what makes the instance
 // lookup and the thread spawn legal here and nowhere else.
 static bool
@@ -1567,8 +1688,10 @@ reachy_connect(void *handle)
   if(weight > 0.0)
     reachy_tracking(true, weight, NULL, NULL);
 
-  reachy_motors_mode("enabled", NULL, NULL);
-  reachy_wake(NULL, NULL);
+  // Standing up is the one thing that is NOT fire-and-forget: it needs
+  // torque before the move, and it needs to know whether the robot is
+  // already on its feet. See the chain above.
+  reachy_posture_wake(st);
 
   st->mouth_head    = 0;
   st->mouth_count   = 0;
@@ -1643,6 +1766,14 @@ reachy_disconnect(void *handle)
   // a robot that tucks itself away mid-sentence and keeps talking from
   // inside its shell is a haunting, not a goodbye.
   reachy_stop_sound(NULL, NULL);
+
+  // A reload is not a goodbye, and putting the robot to bed for one is
+  // worse than pointless: goto_sleep takes ~2.5 s and ends by dropping
+  // torque, so it lands AFTER the connect that is already racing it and
+  // leaves the robot limp in its shell with every call having returned
+  // 200. Observed twice on 2026-08-04. reachy_suspend() is how we know.
+  if(__atomic_load_n(&reachy_reloading, __ATOMIC_ACQUIRE))
+    return;
 
   if(reachy_kv_flag(st, "sleep_on_disconnect"))
     reachy_sleep_move(NULL, NULL);
@@ -1819,6 +1950,26 @@ reachy_stop(void)
   return(SUCCESS);
 }
 
+// Neither hook has any state to put down — the driver holds nothing
+// across an unload that core does not already restore. They exist for
+// one reason: to mark the window in which a disconnect means "back in a
+// moment" rather than "goodbye". See reachy_reloading.
+static bool
+reachy_suspend(void)
+{
+  __atomic_store_n(&reachy_reloading, true, __ATOMIC_RELEASE);
+
+  return(SUCCESS);
+}
+
+static bool
+reachy_resume(void)
+{
+  __atomic_store_n(&reachy_reloading, false, __ATOMIC_RELEASE);
+
+  return(SUCCESS);
+}
+
 const plugin_desc_t bm_plugin_desc = {
   .api_version     = PLUGIN_API_VERSION,
   .name            = "reachy",
@@ -1839,5 +1990,7 @@ const plugin_desc_t bm_plugin_desc = {
 
   .start           = reachy_start,
   .stop            = reachy_stop,
+  .suspend         = reachy_suspend,
+  .resume          = reachy_resume,
   .ext             = &reachy_driver,
 };

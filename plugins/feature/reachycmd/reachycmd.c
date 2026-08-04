@@ -246,6 +246,19 @@ reachycmd_show_render(reachycmd_show_t *s, const reachy_doa_t *doa)
                            : "held by the daemon (camera and mic live)");
   cmd_reply(&s->hold.ctx, line);
 
+  // The one line that explains a robot which "ignores" you: with the
+  // motors off it accepts every move, answers normally and does not
+  // stir. Worth stating in words rather than leaving as a mode name.
+  snprintf(line, sizeof(line), "  " CLR_GRAY "motors " CLR_RESET
+      "%s%s" CLR_RESET,
+      strcmp(rb->motors, "enabled") == 0 ? CLR_GREEN : CLR_YELLOW,
+      rb->motors[0] == '\0'                    ? "unknown"
+      : strcmp(rb->motors, "enabled")  == 0    ? "on — holding its pose"
+      : strcmp(rb->motors, "disabled") == 0    ? "off — limp; moves will "
+                                                 "play but not move it"
+                                               : rb->motors);
+  cmd_reply(&s->hold.ctx, line);
+
   if(rb->face_detected)
     snprintf(line, sizeof(line), "  " CLR_GRAY "face   " CLR_RESET
         CLR_GREEN "tracking" CLR_RESET " at x %+.2f  y %+.2f",
@@ -515,15 +528,41 @@ reachycmd_say(const cmd_ctx_t *ctx)
   }
 }
 
+// Torque landed, so the body can be asked to move. Anything else and
+// the shared renderer reports it against the same phrase — "waking the
+// robot failed" is true of a wake that never got its motors on.
 static void
-reachycmd_wake(const cmd_ctx_t *ctx)
+reachycmd_wake_torque_done(const reachy_result_t *r)
 {
-  reachycmd_act_t *a = reachycmd_act_new(ctx, "waking the robot");
+  reachycmd_act_t *a = (reachycmd_act_t *)r->user_data;
+
+  if(r->status != REACHY_OK)
+  {
+    reachycmd_act_done(r);
+    return;
+  }
 
   if(reachy_wake(reachycmd_act_done, a) != SUCCESS)
     reachycmd_act_refused(a);
 }
 
+// Two hops, because the daemon only raises torque when it is asked to:
+// wake_up alone plays the whole animation into a limp robot, reports
+// success and moves nothing. Motors first, then the move.
+static void
+reachycmd_wake(const cmd_ctx_t *ctx)
+{
+  reachycmd_act_t *a = reachycmd_act_new(ctx, "waking the robot");
+
+  if(reachy_motors_mode("enabled", reachycmd_wake_torque_done, a) != SUCCESS)
+    reachycmd_act_refused(a);
+}
+
+// One hop, and deliberately so: goto_sleep ends by dropping torque
+// itself (measured — mode goes `enabled` → `disabled` on its own about
+// 2.5 s after the POST, with nothing else touching it). Disabling the
+// motors from here would land while the head is still on its way down
+// and drop it the rest of the way.
 static void
 reachycmd_sleep(const cmd_ctx_t *ctx)
 {
@@ -673,8 +712,8 @@ static const char reachycmd_help[] =
     "                             narrowed to names containing <filter>\n"
     "  !reachy do <move>          play one of them\n"
     "  !reachy say <text>         speak a line aloud\n"
-    "  !reachy wake               rise and centre\n"
-    "  !reachy sleep              settle back down\n"
+    "  !reachy wake               torque on, then rise and centre\n"
+    "  !reachy sleep              settle back down, then go limp\n"
     "  !reachy volume <0-100>     speaker level\n"
     "  !reachy track <on|off> [w] follow faces, at weight w (0.0-1.0)\n"
     "  !reachy wobble <on|off>    let played audio drive head motion\n"
@@ -685,7 +724,9 @@ static const char reachycmd_help[] =
     "`!reachy wobble on` is what makes it look like speaking rather than\n"
     "broadcasting. `show reachy` reports the daemon state, whether a\n"
     "face is being tracked, and which way the microphone array last\n"
-    "heard a voice.";
+    "heard a voice — including whether its motors are on at all, which\n"
+    "is the difference between a robot that is ignoring you and one\n"
+    "that physically cannot answer.";
 
 // Uniformly `user` at REACHYCMD_LEVEL — reading verbs as well as moving
 // ones. The robot is a physical object in a room and not a toy for a
@@ -756,9 +797,11 @@ reachycmd_register(void)
   if(cmd_register(REACHYCMD_CTX, "wake",
         "reachy wake",
         "Bring the robot up out of rest.",
-        "Enables the motors gently and plays the daemon's wake_up move: "
-        "the head rises, the body re-centres, the antennas come down. "
-        "Safe to repeat.",
+        "Enables the motors, then plays the daemon's wake_up move: the "
+        "head rises, the body re-centres, the antennas come down. Both "
+        "steps are needed — the daemon never raises torque on its own, "
+        "and a limp robot plays the whole move without stirring. Safe to "
+        "repeat; the motion takes about two and a half seconds.",
         USERNS_GROUP_USER, REACHYCMD_LEVEL, CMD_SCOPE_ANY, METHOD_T_ANY,
         reachycmd_wake, NULL, "reachy", NULL,
         NULL, 0, NULL, NULL) != SUCCESS)
@@ -767,8 +810,11 @@ reachycmd_register(void)
   if(cmd_register(REACHYCMD_CTX, "sleep",
         "reachy sleep",
         "Settle the robot back into rest.",
-        "Plays the daemon's goto_sleep move. The motors stay enabled — "
-        "this is a posture, not a power state.",
+        "Plays the daemon's goto_sleep move: the robot lowers itself "
+        "into its shell over about two and a half seconds, and the "
+        "daemon drops torque once it arrives. It is then limp, and only "
+        "`reachy wake` will lift it again. `show reachy` reports which "
+        "of the two states it is in.",
         USERNS_GROUP_USER, REACHYCMD_LEVEL, CMD_SCOPE_ANY, METHOD_T_ANY,
         reachycmd_sleep, NULL, "reachy", NULL,
         NULL, 0, NULL, NULL) != SUCCESS)

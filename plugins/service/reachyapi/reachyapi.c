@@ -353,11 +353,22 @@ reachy_deliver_status(const reachy_req_t *r, reachy_status_t st,
 
     else
     {
+      struct json_object *backend;
       struct json_object *face;
 
       json_get_bool(root, "media_released", &out.media_released);
       json_get_bool(root, "no_media",       &out.no_media);
       json_get_str (root, "version", out.version, sizeof(out.version));
+
+      // Whether the robot has any torque in it. Left empty rather than
+      // guessed at if the daemon ever stops reporting it: "unknown" is
+      // a state a caller can render, and "disabled" is one it would act
+      // on by heaving the robot to its feet.
+      backend = json_get_obj(root, "backend_status");
+
+      if(backend != NULL)
+        json_get_str(backend, "motor_control_mode", out.motors,
+            sizeof(out.motors));
 
       // face_target is always present; its x/y are null until the
       // tracker has a target, and json_get_double leaves them at zero.
