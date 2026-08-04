@@ -274,9 +274,11 @@ static bool reachy_prime_seq(reachy_state_t *, const char *);
 static void reachy_bridge_up(reachy_state_t *);
 static void reachy_bridge_down(reachy_state_t *);
 
-static bool reachy_word_in(const char *, const char *);
+static char *reachy_word_in(char *, const char *);
 static char *reachy_trim(char *);
-static bool reachy_addressed(reachy_state_t *, const char *);
+static void reachy_alias_rewrite(reachy_state_t *, char *, size_t, char *,
+    size_t);
+static bool reachy_addressed(reachy_state_t *, char *, size_t);
 static void reachy_deliver(reachy_state_t *, const reachy_dispatch_t *);
 static void reachy_dispatch_task(task_t *);
 static void reachy_stt_done(const llm_stt_response_t *);

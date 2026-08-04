@@ -503,15 +503,17 @@ reachy_bridge_down(reachy_state_t *st)
 
 // Case-insensitive whole-word search, so a bot called "mini" is not
 // addressed by the word "minimum".
-static bool
-reachy_word_in(const char *hay, const char *needle)
+// returns: the match inside `hay`, or NULL. The position is what lets an
+// alias be rewritten in place; a bool would not be enough.
+static char *
+reachy_word_in(char *hay, const char *needle)
 {
   size_t nlen = strlen(needle);
 
   if(nlen == 0)
-    return(false);
+    return(NULL);
 
-  for(const char *p = hay; *p != '\0'; p++)
+  for(char *p = hay; *p != '\0'; p++)
   {
     if(strncasecmp(p, needle, nlen) != 0)
       continue;
@@ -522,10 +524,43 @@ reachy_word_in(const char *hay, const char *needle)
     if(p[nlen] != '\0' && (isalnum((unsigned char)p[nlen]) || p[nlen] == '_'))
       continue;
 
-    return(true);
+    return(p);
   }
 
-  return(false);
+  return(NULL);
+}
+
+// Put the bot's own name where the alias was heard.
+//
+// Without this, `attention.names` is only half a feature. It decides
+// what the DRIVER listens to, but the chat plugin runs its own address
+// classifier against `method_get_self()` — which knows one name — so an
+// utterance admitted by an alias arrives looking like somebody else's
+// conversation, is filed as WITNESS, and (at the default
+// `interject_prob` of 0) is answered with silence. Measured live
+// 2026-08-04: "Minnie, tell me a story…" passed this gate and the brain
+// ignored it.
+//
+// Rewriting is honest here in a way it would not be elsewhere: the alias
+// list exists precisely to say "these sounds are also my name", and
+// whisper's spelling of a spoken name is a guess, not testimony.
+static void
+reachy_alias_rewrite(reachy_state_t *st, char *text, size_t cap, char *at,
+    size_t alias_len)
+{
+  size_t name_len = strlen(st->botname);
+  size_t tail_len = strlen(at + alias_len);
+
+  // Refuse rather than truncate: an unanswered request beats a request
+  // answered with its last words missing.
+  if((size_t)(at - text) + name_len + tail_len + 1 > cap)
+    return;
+
+  clam(CLAM_DEBUG, REACHY_CTX, "%s: heard its name as \"%.*s\"",
+      st->botname, (int)alias_len, at);
+
+  memmove(at + name_len, at + alias_len, tail_len + 1);
+  memcpy(at, st->botname, name_len);
 }
 
 static char *
@@ -548,7 +583,7 @@ reachy_trim(char *s)
 // what carries the bot's name, and then keeps listening for a window
 // afterwards so a conversation does not need the name in every line.
 static bool
-reachy_addressed(reachy_state_t *st, const char *text)
+reachy_addressed(reachy_state_t *st, char *text, size_t cap)
 {
   char    mode [16];
   char    names[KV_STR_SZ];
@@ -561,7 +596,7 @@ reachy_addressed(reachy_state_t *st, const char *text)
   if(strcasecmp(mode, "name") != 0)
     return(true);
 
-  hit = reachy_word_in(text, st->botname);
+  hit = (reachy_word_in(text, st->botname) != NULL);
 
   if(!hit)
   {
@@ -569,7 +604,16 @@ reachy_addressed(reachy_state_t *st, const char *text)
 
     for(char *tok = strtok_r(names, ",", &save); tok != NULL && !hit;
         tok = strtok_r(NULL, ",", &save))
-      hit = reachy_word_in(text, reachy_trim(tok));
+    {
+      const char *alias = reachy_trim(tok);
+      char       *at    = reachy_word_in(text, alias);
+
+      if(at == NULL)
+        continue;
+
+      reachy_alias_rewrite(st, text, cap, at, strlen(alias));
+      hit = true;
+    }
   }
 
   pthread_mutex_lock(&st->attn_mutex);
@@ -634,7 +678,7 @@ reachy_dispatch_task(task_t *t)
 
   t->state = TASK_ENDED;
 
-  if(reachy_addressed(d->st, d->text))
+  if(reachy_addressed(d->st, d->text, sizeof(d->text)))
     reachy_deliver(d->st, d);
   else
     clam(CLAM_DEBUG, REACHY_CTX, "%s: unaddressed, dropped \"%.120s\"",
