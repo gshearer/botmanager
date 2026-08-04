@@ -531,11 +531,13 @@ static const char reachycmd_help[] =
     "the daemon state, whether a face is being tracked, and which way\n"
     "the microphone array last heard a voice.";
 
-// The robot is a physical object in a room, so every verb that MOVES it
-// is user-level; reading its state and its vocabulary is not. The
-// `reachy` parent stays at everyone/0 because the dispatcher walks it
-// before resolving a child, and an admin-gated parent would deny
-// `reachy list` on the way past.
+// Uniformly `user` at REACHYCMD_LEVEL — reading verbs as well as moving
+// ones. The robot is a physical object in a room and not a toy for a
+// channel to discover, so `show reachy` and `reachy list` are gated
+// exactly as hard as `reachy do`. That uniformity is also what keeps the
+// tree walkable: the dispatcher checks the `reachy` parent before
+// resolving a child, so a parent stricter than its children would deny
+// them on the way past.
 static bool
 reachycmd_register(void)
 {
@@ -543,7 +545,7 @@ reachycmd_register(void)
         "reachy <list|do|wake|sleep|volume|track|wobble>",
         "Move the Reachy Mini robot.",
         reachycmd_help,
-        USERNS_GROUP_EVERYONE, 0, CMD_SCOPE_ANY, METHOD_T_ANY,
+        USERNS_GROUP_USER, REACHYCMD_LEVEL, CMD_SCOPE_ANY, METHOD_T_ANY,
         reachycmd_root, NULL, NULL, NULL,
         NULL, 0, NULL, NULL) != SUCCESS)
     return(FAIL);
@@ -556,7 +558,7 @@ reachycmd_register(void)
         "filter narrows the list to names containing it, case "
         "insensitively, which is the fast way to find every dance or "
         "every way of saying no.",
-        USERNS_GROUP_EVERYONE, 0, CMD_SCOPE_ANY, METHOD_T_ANY,
+        USERNS_GROUP_USER, REACHYCMD_LEVEL, CMD_SCOPE_ANY, METHOD_T_ANY,
         reachycmd_list, NULL, "reachy", NULL,
         reachycmd_list_args,
         (uint8_t)(sizeof(reachycmd_list_args)
@@ -571,7 +573,7 @@ reachycmd_register(void)
         "botman only names it and is told whether it started. Names come "
         "from `reachy list`. A name the library does not hold comes back "
         "as an http 404 rather than silence.",
-        USERNS_GROUP_USER, 0, CMD_SCOPE_ANY, METHOD_T_ANY,
+        USERNS_GROUP_USER, REACHYCMD_LEVEL, CMD_SCOPE_ANY, METHOD_T_ANY,
         reachycmd_do, NULL, "reachy", NULL,
         reachycmd_do_args,
         (uint8_t)(sizeof(reachycmd_do_args) / sizeof(reachycmd_do_args[0])),
@@ -584,7 +586,7 @@ reachycmd_register(void)
         "Enables the motors gently and plays the daemon's wake_up move: "
         "the head rises, the body re-centres, the antennas come down. "
         "Safe to repeat.",
-        USERNS_GROUP_USER, 0, CMD_SCOPE_ANY, METHOD_T_ANY,
+        USERNS_GROUP_USER, REACHYCMD_LEVEL, CMD_SCOPE_ANY, METHOD_T_ANY,
         reachycmd_wake, NULL, "reachy", NULL,
         NULL, 0, NULL, NULL) != SUCCESS)
     return(FAIL);
@@ -594,7 +596,7 @@ reachycmd_register(void)
         "Settle the robot back into rest.",
         "Plays the daemon's goto_sleep move. The motors stay enabled — "
         "this is a posture, not a power state.",
-        USERNS_GROUP_USER, 0, CMD_SCOPE_ANY, METHOD_T_ANY,
+        USERNS_GROUP_USER, REACHYCMD_LEVEL, CMD_SCOPE_ANY, METHOD_T_ANY,
         reachycmd_sleep, NULL, "reachy", NULL,
         NULL, 0, NULL, NULL) != SUCCESS)
     return(FAIL);
@@ -604,7 +606,7 @@ reachycmd_register(void)
         "Set the robot's speaker level.",
         "Applies immediately and persists in the daemon until something "
         "else changes it.",
-        USERNS_GROUP_USER, 0, CMD_SCOPE_ANY, METHOD_T_ANY,
+        USERNS_GROUP_USER, REACHYCMD_LEVEL, CMD_SCOPE_ANY, METHOD_T_ANY,
         reachycmd_volume, NULL, "reachy", NULL,
         reachycmd_volume_args,
         (uint8_t)(sizeof(reachycmd_volume_args)
@@ -620,7 +622,7 @@ reachycmd_register(void)
         "strongly the head is pulled toward the face, from 0.0 to 1.0, "
         "and defaults to 0.6 — high enough to be obviously alive, low "
         "enough not to snap.",
-        USERNS_GROUP_USER, 0, CMD_SCOPE_ANY, METHOD_T_ANY,
+        USERNS_GROUP_USER, REACHYCMD_LEVEL, CMD_SCOPE_ANY, METHOD_T_ANY,
         reachycmd_track, NULL, "reachy", NULL,
         reachycmd_track_args,
         (uint8_t)(sizeof(reachycmd_track_args)
@@ -634,7 +636,7 @@ reachycmd_register(void)
         "With wobbling enabled, ANY sound the daemon plays moves the "
         "head in time with it. It costs nothing and it is what will make "
         "the robot look like it is speaking rather than broadcasting.",
-        USERNS_GROUP_USER, 0, CMD_SCOPE_ANY, METHOD_T_ANY,
+        USERNS_GROUP_USER, REACHYCMD_LEVEL, CMD_SCOPE_ANY, METHOD_T_ANY,
         reachycmd_wobble, NULL, "reachy", NULL,
         reachycmd_wobble_args,
         (uint8_t)(sizeof(reachycmd_wobble_args)
@@ -651,7 +653,7 @@ reachycmd_register(void)
         "the face it is currently tracking — and the microphone array's "
         "direction of arrival, which is the bearing it last heard a voice "
         "on and whether it is hearing one now.",
-        USERNS_GROUP_EVERYONE, 0, CMD_SCOPE_ANY, METHOD_T_ANY,
+        USERNS_GROUP_USER, REACHYCMD_LEVEL, CMD_SCOPE_ANY, METHOD_T_ANY,
         reachycmd_show, NULL, "show", NULL,
         NULL, 0, NULL, NULL) != SUCCESS)
     return(FAIL);

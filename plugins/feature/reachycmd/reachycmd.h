@@ -42,6 +42,12 @@
 #define REACHYCMD_LIST_COLS  4
 #define REACHYCMD_LIST_WIDTH 20
 
+// Minimum privilege level for every reachy verb, reading ones included
+// (operator direction, 2026-08-03). The robot is a physical object in a
+// room: a registered user of the namespace at this level or above may
+// address it, and nobody else — not even to read its state.
+#define REACHYCMD_LEVEL 100
+
 // Default face-tracking strength for `reachy track on`: the weight the
 // robot was measured following a walking human at, obviously alive
 // without snapping.
