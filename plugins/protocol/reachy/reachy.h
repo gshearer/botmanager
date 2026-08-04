@@ -9,8 +9,11 @@
 // and speak-policy all unchanged. The robot is the same mind as the
 // text bots, embodied.
 //
-// The inbound half only. `send()` is a stub here: giving the reply a
-// voice is RCH-7's mouth loop, which extends this same file.
+// Both halves. The reply pipeline's send() queues a line for the mouth
+// thread, which synthesizes it through the same inference engine, hands
+// the WAV to the robot and paces itself against the audio's own
+// duration — so a multi-line answer comes out as speech rather than on
+// top of itself.
 //
 // Layering (PLUGIN.md §Layer Rules): PLUGIN_PROTOCOL over the
 // reachyapi service, and nothing else. This plugin must never reach up
@@ -88,10 +91,53 @@
 // from the ear.
 #define REACHY_WAV_MAX (25u * 32000u + 4096u)
 
-// Live persist threads across every bound bot. RCH-6 spends one slot
-// per bot (ears); RCH-7's mouth makes it two, against a tree-wide
-// task_add_persist pool of 16 — so the array is generous, not tight.
+// Live persist threads across every bound bot. Two slots per bot — ears
+// and mouth — against a tree-wide task_add_persist pool of 16, so the
+// array is generous, not tight.
 #define REACHY_MAX_THREADS 32
+
+// The mouth's queue. A speaker lagging minutes behind the room is worse
+// than one that misses a line, so an overflow drops the OLDEST.
+#define REACHY_SPEECH_RING 16
+
+// "reachy_say_" + a BOT_NAME_SZ name + ".wav", which is what lands in
+// the robot's sound directory.
+#define REACHY_FILE_SZ 80
+
+// Bounds on the mouth's sync-waits. Synthesis is the long one, with the
+// engine's own timeout sitting just inside the waiter's patience so a
+// slow speech host is reported by the engine rather than abandoned here.
+// The robot's two REST hops are LAN round trips; the barge-in probe is
+// a poll the mouth must never stall on.
+#define REACHY_TTS_TIMEOUT   20
+#define REACHY_TTS_WAIT_MS   22000
+#define REACHY_ROBOT_WAIT_MS 15000
+#define REACHY_DOA_WAIT_MS   2000
+
+// Playback pacing. The window comes from the WAV's own header; these are
+// the fallback when it is not the canonical 44-byte RIFF kokorod emits
+// (24 kHz stereo S16LE — 96,000 bytes per second).
+#define REACHY_WAV_BYTE_RATE 96000u
+#define REACHY_WAV_HDR_SZ    44u
+
+// Ceiling on one line's playback window. A minute is already an
+// unreasonable single reply; past that the arithmetic is wrong rather
+// than the speech long, and waiting it out would wedge the queue.
+#define REACHY_PLAY_MAX_MS 60000
+
+// Grace past the computed window, so the tail of a phrase is not clipped
+// by the next line landing on top of it.
+#define REACHY_PLAY_GRACE_MS 250
+
+// The slice playback is slept in: the barge-in probe cadence, and how
+// promptly a teardown is felt mid-sentence.
+#define REACHY_PLAY_SLICE_MS 250
+
+// Consecutive positive direction-of-arrival probes before barge-in
+// believes a human has taken the floor. The flag it reads is noisy —
+// see the measurement above reachy_barged() — and this run length is a
+// guard against that noise, not a cure for it.
+#define REACHY_BARGE_RUN 5
 
 // How long stop() waits on one straggler before saying so. The worst
 // thread tail is a long poll plus its transport bound, so this is that
@@ -137,32 +183,51 @@ typedef struct
   // outside the ears thread.
   pthread_mutex_t attn_mutex;
   time_t          attn_until;
+
+  // The mouth's queue. send() is called from the curl worker (one call
+  // per streamed reply line) and from task workers, so every field here
+  // is written under the mutex; the mouth thread is the only reader.
+  // Sized once with the state rather than per line, because a speaking
+  // robot must not be allocating.
+  pthread_mutex_t mouth_mutex;
+  pthread_cond_t  mouth_cond;
+  char            mouth_line[REACHY_SPEECH_RING][METHOD_TEXT_SZ];
+  uint32_t        mouth_head;     // index of the next line to speak
+  uint32_t        mouth_count;
+  uint64_t        mouth_dropped;
 } reachy_state_t;
 
-// One bridge long-poll, shared between the ears thread and the curl
-// worker that completes it. Refcounted for the same reason the state
-// is: the waiter may walk away — on shutdown, or when a completion
-// overruns REACHY_WAIT_MS — while the transfer is still airborne.
+// One request in flight, shared between the thread waiting on it and the
+// curl worker that completes it. Refcounted for the same reason the
+// state is: the waiter may walk away — on shutdown, or when a completion
+// overruns its patience — while the transfer is still airborne.
 //
-// The completion callback lives in THIS mapping and is handed to core's
-// curl layer directly, which is what makes an unload safe: plugin_quiesce
-// reads curl_iter_req_t.cb, sees a pointer into us, and delays the
-// unmap until the transfer lands.
+// One context for four completions: the bridge long-poll and the
+// bridge's health probe (ears), and synthesis, upload, playback and the
+// direction-of-arrival probe (mouth). They fill different fields of it;
+// none of them fills all.
+//
+// Every completion callback lives in THIS mapping and is handed to core
+// directly, which is what makes an unload safe: plugin_quiesce reads
+// curl_iter_req_t.cb, sees a pointer into us, and delays the unmap until
+// the transfer lands.
 typedef struct
 {
   pthread_mutex_t mutex;
   pthread_cond_t  cond;
   uint32_t        refs;      // atomic: the waiter + the completion
   bool            done;
+  bool            ok;        // the completion's own verdict
 
   long            http;
   bool            transport;
   bool            have_seq;
   uint64_t        seq;
   double          doa;
+  bool            speech;
   void           *wav;       // mem_alloc'd; the waiter takes ownership
   size_t          wav_len;
-} reachy_poll_t;
+} reachy_wait_t;
 
 // A transcription in flight. Holds a reference on the state for the
 // whole trip, so nothing can free it under a worker that is mid-deliver.
@@ -192,9 +257,9 @@ static void reachy_deadline(struct timespec *, uint32_t);
 static bool reachy_expired(const struct timespec *);
 static bool reachy_nap(reachy_state_t *, uint32_t);
 
-static reachy_poll_t *reachy_poll_create(void);
-static void reachy_poll_unref(reachy_poll_t *);
-static bool reachy_poll_wait(reachy_state_t *, reachy_poll_t *);
+static reachy_wait_t *reachy_wait_create(void);
+static void reachy_wait_unref(reachy_wait_t *);
+static bool reachy_wait_for(reachy_state_t *, reachy_wait_t *, uint32_t);
 
 static void reachy_kv_copy(const reachy_state_t *, const char *, char *,
     size_t);
@@ -217,6 +282,28 @@ static void reachy_dispatch_task(task_t *);
 static void reachy_stt_done(const llm_stt_response_t *);
 static void reachy_transcribe(reachy_state_t *, void *, size_t, double);
 static void reachy_ears(task_t *);
+
+static void reachy_mouth_push(reachy_state_t *, const char *);
+static bool reachy_mouth_take(reachy_state_t *, char *, size_t);
+static void reachy_mouth_flush(reachy_state_t *);
+static void reachy_mouth_wake(reachy_state_t *);
+
+static void reachy_tts_done(const llm_tts_response_t *);
+static void reachy_robot_done(const reachy_result_t *);
+static void reachy_doa_done(const reachy_doa_t *);
+
+static void reachy_sound_file(const reachy_state_t *, char *, size_t);
+static bool reachy_synthesize(reachy_state_t *, const char *, void **,
+    size_t *);
+static bool reachy_upload(reachy_state_t *, const char *, const void *,
+    size_t);
+static bool reachy_play(reachy_state_t *, const char *);
+static uint32_t reachy_play_ms(const void *, size_t);
+static uint32_t reachy_lap(struct timespec *);
+static bool reachy_barged(reachy_state_t *);
+static bool reachy_pace(reachy_state_t *, uint32_t, bool);
+static void reachy_speak(reachy_state_t *, const char *);
+static void reachy_mouth(task_t *);
 
 static void *reachy_create(const char *);
 static void reachy_destroy(void *);

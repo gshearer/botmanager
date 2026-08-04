@@ -216,7 +216,7 @@ halves. Same shape as `gemini` / `gemini.ws`.
 | `memory` | plugins/method/text/memory_rag.c | chat memory subsystem + RAG |
 | `nl_bridge` | plugins/method/text/reply.c | natural-language bridge surface |
 | `nl_observe` | plugins/method/text/nl_observe.c | post-dispatch chat observer (`OBS_CTX`) |
-| `reachy` | plugins/protocol/reachy/reachy.c | Reachy Mini protocol driver — the ear: bridge long-poll, transcription, attention gate, delivery (`REACHY_CTX`) |
+| `reachy` | plugins/protocol/reachy/reachy.c | Reachy Mini protocol driver — the ear (bridge long-poll, transcription, attention gate, delivery) and the mouth (speech queue, synthesis, upload, playback pacing) (`REACHY_CTX`) |
 | `register` | plugins/method/text/dispatch.c | `/register` user creation |
 | `vision` | plugins/method/text/vision.c | image-intent path |
 

@@ -356,7 +356,13 @@ Two gates silently swallow everything during bring-up:
   daemon's CWD is the repo root).
 
 Attention policy is per-bot KV `bot.<name>.reachy.attention.*` (`open|name`,
-`window_s`, `barge_in`). `name` is the privacy mode.
+`window_s`). `name` is the privacy mode.
+
+⚠ `bot.<name>.reachy.barge_in` **defaults to 0 and should stay there** until
+the robot's cooling fan is quieter. The microphone array's `speech_detected`
+flag reads true in ~49% of a *silent* room, so barge-in interrupts the bot
+rather than for it — `ACHIEVED.md §BARGE-TRUTH` has the measurement and the
+re-test.
 
 ---
 
@@ -368,10 +374,18 @@ curl -s http://127.0.0.1:8004/inference -F file=@<a wav> -F response_format=json
 curl -s http://127.0.0.1:8003/health        # {"ok":true,"voices":53}
 build/tools/botmanctl "show reachy"         # live DoA bearing
 build/tools/botmanctl -u doc "reachy say the ear hears and the mouth answers"
+build/tools/botmanctl "say <bot> voice the mouth is wired to the brain"
 ```
 
+That last line is the **mouth-only rig**: it drives `method_send` without
+needing the ear, the brain or a human. ⚠ It reports **`send failed` even when
+the line is spoken perfectly** — that is the `SUCCESS == false` trap in the
+`say` command, not a robot fault. The truth is `/tmp/botman.log`: look for
+`reachy … says "…" (… tts N ms, upload N ms, play N ms)`.
+
 Then speak to the robot and confirm the transcript reaches the brain in the
-CLAM stream (`botmanctl -S 6 -r 'reachy|llm'`).
+CLAM stream (`botmanctl -S 6 -r 'reachy|llm'`) and that the answer comes back
+out of the speaker with the head wobbling.
 
 ---
 

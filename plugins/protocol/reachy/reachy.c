@@ -40,8 +40,10 @@ static const plugin_kv_entry_t reachy_inst_kv_schema[] = {
   { "attention.window_s", KV_UINT32, "90",
     "Seconds attention stays open after the bot is addressed by name" },
 
-  { "barge_in", KV_UINT8, "1",
-    "Stop speaking the moment a human starts (1) or talk over them (0)" },
+  { "barge_in", KV_UINT8, "0",
+    "Stop speaking when a human starts. DEFAULT OFF: the microphone "
+    "array reports speech in half of all samples of a silent room, so "
+    "this interrupts the bot rather than for it — see reachy_barged()" },
   { "wobble", KV_UINT8, "1",
     "Drive speech-synced head motion from played audio at connect" },
   { "tracking_weight", KV_STR, "0.6",
@@ -125,7 +127,9 @@ reachy_state_unref(reachy_state_t *st)
     return;
 
   pthread_cond_destroy(&st->wake_cond);
+  pthread_cond_destroy(&st->mouth_cond);
   pthread_mutex_destroy(&st->wake_mutex);
+  pthread_mutex_destroy(&st->mouth_mutex);
   pthread_mutex_destroy(&st->attn_mutex);
   mem_free(st);
 }
@@ -186,13 +190,14 @@ reachy_nap(reachy_state_t *st, uint32_t ms)
 }
 
 // ----------------------------------------------------------------------
-// The long-poll wait context
+// The bounded wait context — one shape for every request this driver
+// blocks on, whether it is the ear's long poll or the mouth's synthesis
 // ----------------------------------------------------------------------
 
-static reachy_poll_t *
-reachy_poll_create(void)
+static reachy_wait_t *
+reachy_wait_create(void)
 {
-  reachy_poll_t *p = mem_alloc(REACHY_CTX, "poll", sizeof(*p));
+  reachy_wait_t *p = mem_alloc(REACHY_CTX, "wait", sizeof(*p));
 
   memset(p, 0, sizeof(*p));
 
@@ -206,7 +211,7 @@ reachy_poll_create(void)
 }
 
 static void
-reachy_poll_unref(reachy_poll_t *p)
+reachy_wait_unref(reachy_wait_t *p)
 {
   if(__atomic_sub_fetch(&p->refs, 1, __ATOMIC_ACQ_REL) != 0)
     return;
@@ -221,16 +226,18 @@ reachy_poll_unref(reachy_poll_t *p)
   mem_free(p);
 }
 
-// Wait for the transfer to complete, in slices so a teardown is felt
-// without a second condvar to broadcast on.
+// Wait up to `ms` for the completion to run, in slices so a teardown is
+// felt without a second condvar to broadcast on. Each caller brings its
+// own patience: a bridge poll, a synthesis and a direction probe are
+// three quite different lengths of reasonable.
 // returns: true when the completion actually ran.
 static bool
-reachy_poll_wait(reachy_state_t *st, reachy_poll_t *p)
+reachy_wait_for(reachy_state_t *st, reachy_wait_t *p, uint32_t ms)
 {
   struct timespec deadline;
   bool            done;
 
-  reachy_deadline(&deadline, REACHY_WAIT_MS);
+  reachy_deadline(&deadline, ms);
 
   pthread_mutex_lock(&p->mutex);
 
@@ -330,7 +337,7 @@ reachy_bridge_url(char *out, size_t cap)
 static void
 reachy_utt_done(const curl_response_t *resp)
 {
-  reachy_poll_t      *p = resp->user_data;
+  reachy_wait_t      *p = resp->user_data;
   const char         *hdr;
   unsigned long long  seq;
 
@@ -371,7 +378,7 @@ reachy_utt_done(const curl_response_t *resp)
   pthread_cond_signal(&p->cond);
   pthread_mutex_unlock(&p->mutex);
 
-  reachy_poll_unref(p);
+  reachy_wait_unref(p);
 }
 
 // Curl worker thread. The bridge's counters, of which exactly one
@@ -379,7 +386,7 @@ reachy_utt_done(const curl_response_t *resp)
 static void
 reachy_health_done(const curl_response_t *resp)
 {
-  reachy_poll_t      *p = resp->user_data;
+  reachy_wait_t      *p = resp->user_data;
   const char         *seq;
   unsigned long long  v;
 
@@ -402,7 +409,7 @@ reachy_health_done(const curl_response_t *resp)
   pthread_cond_signal(&p->cond);
   pthread_mutex_unlock(&p->mutex);
 
-  reachy_poll_unref(p);
+  reachy_wait_unref(p);
 }
 
 // Find out where the ear currently is before listening to it.
@@ -415,26 +422,26 @@ reachy_health_done(const curl_response_t *resp)
 static bool
 reachy_prime_seq(reachy_state_t *st, const char *base)
 {
-  reachy_poll_t  *p;
+  reachy_wait_t  *p;
   curl_request_t *cr;
   char            url[REACHY_URL_SZ];
   bool            ok = false;
 
   snprintf(url, sizeof(url), "%s/health", base);
 
-  p  = reachy_poll_create();
+  p  = reachy_wait_create();
   cr = curl_request_create(CURL_METHOD_GET, url, reachy_health_done, p);
 
   curl_request_set_timeout(cr, REACHY_POLL_TIMEOUT);
 
   if(curl_request_submit(cr) != SUCCESS)
   {
-    reachy_poll_unref(p);
-    reachy_poll_unref(p);
+    reachy_wait_unref(p);
+    reachy_wait_unref(p);
     return(FAIL);
   }
 
-  if(reachy_poll_wait(st, p))
+  if(reachy_wait_for(st, p, REACHY_WAIT_MS))
   {
     pthread_mutex_lock(&p->mutex);
 
@@ -447,7 +454,7 @@ reachy_prime_seq(reachy_state_t *st, const char *base)
     pthread_mutex_unlock(&p->mutex);
   }
 
-  reachy_poll_unref(p);
+  reachy_wait_unref(p);
 
   if(ok)
     clam(CLAM_INFO, REACHY_CTX,
@@ -736,7 +743,7 @@ reachy_ears(task_t *t)
 
   while(!reachy_stopping(st))
   {
-    reachy_poll_t  *p;
+    reachy_wait_t  *p;
     curl_request_t *cr;
     char            url[REACHY_URL_SZ];
     void           *wav     = NULL;
@@ -773,7 +780,7 @@ reachy_ears(task_t *t)
     snprintf(url, sizeof(url), "%s/utt?after=%llu&wait=%u", base,
         (unsigned long long)st->seq, (unsigned)REACHY_POLL_WAIT_MS);
 
-    p  = reachy_poll_create();
+    p  = reachy_wait_create();
     cr = curl_request_create(CURL_METHOD_GET, url, reachy_utt_done, p);
 
     // The seq is the poll cursor and cannot be inferred: earbridge's
@@ -787,8 +794,8 @@ reachy_ears(task_t *t)
     {
       // A refused submit releases the request itself and the completion
       // will never fire, so both references are ours to drop.
-      reachy_poll_unref(p);
-      reachy_poll_unref(p);
+      reachy_wait_unref(p);
+      reachy_wait_unref(p);
       reachy_bridge_down(st);
 
       if(!reachy_nap(st, REACHY_BACKOFF_MS))
@@ -797,11 +804,11 @@ reachy_ears(task_t *t)
       continue;
     }
 
-    if(!reachy_poll_wait(st, p))
+    if(!reachy_wait_for(st, p, REACHY_WAIT_MS))
     {
       // Abandoned rather than answered: the transfer still holds our
       // completion, and the last reference goes with it.
-      reachy_poll_unref(p);
+      reachy_wait_unref(p);
 
       if(reachy_stopping(st))
         break;
@@ -829,7 +836,7 @@ reachy_ears(task_t *t)
     p->wav  = NULL;   // taken
 
     pthread_mutex_unlock(&p->mutex);
-    reachy_poll_unref(p);
+    reachy_wait_unref(p);
 
     // 204 is the quiet room, and it is by far the most common answer.
     if(http == 200 || http == 204)
@@ -858,6 +865,571 @@ reachy_ears(task_t *t)
   }
 
   clam(CLAM_INFO, REACHY_CTX, "%s: stopped listening", st->botname);
+
+  reachy_thread_forget(t->id);
+  reachy_state_unref(st);
+
+  t->state = TASK_ENDED;
+}
+
+// ----------------------------------------------------------------------
+// The mouth: a queued line → synthesis → the robot → paced by its own
+// duration
+// ----------------------------------------------------------------------
+
+// Called from the curl worker (one call per streamed reply line) and
+// from task workers, so it does nothing slow: a copy under the mutex and
+// a signal.
+//
+// Overflow drops the OLDEST rather than refusing the newest. A speaker
+// that is a minute behind the room is not participating in the
+// conversation, it is reciting at it.
+static void
+reachy_mouth_push(reachy_state_t *st, const char *text)
+{
+  uint64_t dropped = 0;
+  uint32_t slot;
+
+  pthread_mutex_lock(&st->mouth_mutex);
+
+  if(st->mouth_count == REACHY_SPEECH_RING)
+  {
+    st->mouth_head = (st->mouth_head + 1u) % REACHY_SPEECH_RING;
+    st->mouth_count--;
+    dropped = ++st->mouth_dropped;
+  }
+
+  slot = (st->mouth_head + st->mouth_count) % REACHY_SPEECH_RING;
+  snprintf(st->mouth_line[slot], METHOD_TEXT_SZ, "%s", text);
+  st->mouth_count++;
+
+  pthread_cond_signal(&st->mouth_cond);
+  pthread_mutex_unlock(&st->mouth_mutex);
+
+  if(dropped != 0)
+    clam(CLAM_WARN, REACHY_CTX,
+        "%s: the mouth is %u lines behind — dropped the oldest (%llu so "
+        "far)", st->botname, (uint32_t)REACHY_SPEECH_RING,
+        (unsigned long long)dropped);
+}
+
+// Block until there is a line to speak or the instance is torn down.
+// returns: true when `out` holds a line.
+static bool
+reachy_mouth_take(reachy_state_t *st, char *out, size_t cap)
+{
+  bool got = false;
+
+  pthread_mutex_lock(&st->mouth_mutex);
+
+  while(st->mouth_count == 0 && !reachy_stopping(st))
+  {
+    struct timespec slice;
+
+    reachy_deadline(&slice, REACHY_WAIT_SLICE_MS);
+    pthread_cond_timedwait(&st->mouth_cond, &st->mouth_mutex, &slice);
+  }
+
+  if(st->mouth_count > 0)
+  {
+    snprintf(out, cap, "%s", st->mouth_line[st->mouth_head]);
+    st->mouth_head = (st->mouth_head + 1u) % REACHY_SPEECH_RING;
+    st->mouth_count--;
+    got = true;
+  }
+
+  pthread_mutex_unlock(&st->mouth_mutex);
+
+  return(got);
+}
+
+// Everything still queued is abandoned. Only barge-in calls this: once a
+// human has the floor, the rest of an answer they interrupted is stale.
+static void
+reachy_mouth_flush(reachy_state_t *st)
+{
+  uint32_t n;
+
+  pthread_mutex_lock(&st->mouth_mutex);
+
+  n              = st->mouth_count;
+  st->mouth_count = 0;
+
+  pthread_mutex_unlock(&st->mouth_mutex);
+
+  if(n > 0)
+    clam(CLAM_INFO, REACHY_CTX,
+        "%s: interrupted — abandoned %u queued line(s)", st->botname, n);
+}
+
+static void
+reachy_mouth_wake(reachy_state_t *st)
+{
+  pthread_mutex_lock(&st->mouth_mutex);
+  pthread_cond_broadcast(&st->mouth_cond);
+  pthread_mutex_unlock(&st->mouth_mutex);
+}
+
+// Curl worker thread, through the inference engine. The audio is valid
+// for this callback only, so it is copied out before the waiter is told
+// anything landed.
+static void
+reachy_tts_done(const llm_tts_response_t *resp)
+{
+  reachy_wait_t *w = resp->user_data;
+
+  pthread_mutex_lock(&w->mutex);
+
+  w->http = resp->http_status;
+  w->ok   = (resp->ok && resp->bytes != NULL && resp->bytes_len > 0);
+
+  if(w->ok)
+  {
+    w->wav = mem_alloc(REACHY_CTX, "speech", resp->bytes_len);
+    memcpy(w->wav, resp->bytes, resp->bytes_len);
+    w->wav_len = resp->bytes_len;
+  }
+
+  w->done = true;
+  pthread_cond_signal(&w->cond);
+  pthread_mutex_unlock(&w->mutex);
+
+  reachy_wait_unref(w);
+}
+
+// Curl worker thread. The robot's fire-and-forget verbs all answer in
+// this one shape, so upload and playback share a completion.
+static void
+reachy_robot_done(const reachy_result_t *r)
+{
+  reachy_wait_t *w = r->user_data;
+
+  pthread_mutex_lock(&w->mutex);
+
+  w->http = r->http;
+  w->ok   = (r->status == REACHY_OK);
+  w->done = true;
+
+  pthread_cond_signal(&w->cond);
+  pthread_mutex_unlock(&w->mutex);
+
+  reachy_wait_unref(w);
+}
+
+// Curl worker thread.
+static void
+reachy_doa_done(const reachy_doa_t *r)
+{
+  reachy_wait_t *w = r->user_data;
+
+  pthread_mutex_lock(&w->mutex);
+
+  w->ok     = (r->status == REACHY_OK);
+  w->doa    = r->angle;
+  w->speech = r->speech;
+  w->done   = true;
+
+  pthread_cond_signal(&w->cond);
+  pthread_mutex_unlock(&w->mutex);
+
+  reachy_wait_unref(w);
+}
+
+// One fixed name per bot, overwritten every line. The robot's sound
+// directory is a tmpfs on a 4-core CM4 with a few gigabytes to its name;
+// a unique filename per utterance would fill it in an afternoon of
+// conversation and nothing would ever delete them.
+static void
+reachy_sound_file(const reachy_state_t *st, char *out, size_t cap)
+{
+  size_t n;
+
+  n = (size_t)snprintf(out, cap, "reachy_say_%s.wav", st->botname);
+
+  if(n >= cap)
+    n = cap - 1;
+
+  // The daemon's upload endpoint refuses anything outside this alphabet,
+  // and it refuses it as a flat FAIL with no clue which character did it.
+  for(size_t i = 0; i < n; i++)
+  {
+    char c = out[i];
+
+    if(!((c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z')
+        || (c >= '0' && c <= '9') || c == '-' || c == '_' || c == '.'))
+      out[i] = '_';
+  }
+}
+
+// returns: SUCCESS with `*wav` owned by the caller, FAIL with nothing
+// allocated.
+static bool
+reachy_synthesize(reachy_state_t *st, const char *text, void **wav,
+    size_t *wav_len)
+{
+  llm_tts_params_t  params;
+  reachy_wait_t    *w;
+  char              model[64];
+  char              voice[64];
+  bool              ok = false;
+
+  *wav     = NULL;
+  *wav_len = 0;
+
+  reachy_kv_copy(st, "tts_model", model, sizeof(model));
+  reachy_kv_copy(st, "tts_voice", voice, sizeof(voice));
+
+  if(model[0] == '\0')
+  {
+    clam(CLAM_WARN, REACHY_CTX, "%s: no tts_model configured", st->botname);
+    return(FAIL);
+  }
+
+  memset(&params, 0, sizeof(params));
+
+  params.voice        = voice[0] != '\0' ? voice : NULL;
+  params.speed        = reachy_kv_double(st, "tts_speed");
+  params.timeout_secs = REACHY_TTS_TIMEOUT;
+
+  w = reachy_wait_create();
+
+  if(llm_tts_submit(model, &params, text, reachy_tts_done, w) != SUCCESS)
+  {
+    // Refused before it left: the completion will never fire, so both
+    // references are ours to drop.
+    reachy_wait_unref(w);
+    reachy_wait_unref(w);
+    clam(CLAM_WARN, REACHY_CTX,
+        "%s: the speech host would not take the line", st->botname);
+    return(FAIL);
+  }
+
+  if(!reachy_wait_for(st, w, REACHY_TTS_WAIT_MS))
+  {
+    // Abandoned rather than answered: the transfer still holds our
+    // completion, and the last reference goes with it.
+    reachy_wait_unref(w);
+
+    if(!reachy_stopping(st))
+      clam(CLAM_WARN, REACHY_CTX, "%s: synthesis did not answer in %u ms",
+          st->botname, (unsigned)REACHY_TTS_WAIT_MS);
+
+    return(FAIL);
+  }
+
+  pthread_mutex_lock(&w->mutex);
+
+  if(w->ok)
+  {
+    *wav     = w->wav;
+    *wav_len = w->wav_len;
+    w->wav   = NULL;   // taken
+    ok       = true;
+  }
+
+  pthread_mutex_unlock(&w->mutex);
+  reachy_wait_unref(w);
+
+  if(!ok)
+    clam(CLAM_WARN, REACHY_CTX, "%s: the speech host found no voice",
+        st->botname);
+
+  return(ok ? SUCCESS : FAIL);
+}
+
+// The WAV is copied into the multipart body before the submit returns,
+// so the caller keeps ownership of `wav` throughout.
+static bool
+reachy_upload(reachy_state_t *st, const char *file, const void *wav,
+    size_t wav_len)
+{
+  reachy_wait_t *w = reachy_wait_create();
+  bool           ok;
+
+  if(reachy_upload_sound(file, wav, wav_len, reachy_robot_done, w)
+      != SUCCESS)
+  {
+    reachy_wait_unref(w);
+    reachy_wait_unref(w);
+    clam(CLAM_WARN, REACHY_CTX,
+        "%s: the robot was not even asked to take the audio", st->botname);
+    return(FAIL);
+  }
+
+  if(!reachy_wait_for(st, w, REACHY_ROBOT_WAIT_MS))
+  {
+    reachy_wait_unref(w);
+
+    if(!reachy_stopping(st))
+      clam(CLAM_WARN, REACHY_CTX, "%s: the robot did not take the audio "
+          "within %u ms", st->botname, (unsigned)REACHY_ROBOT_WAIT_MS);
+
+    return(FAIL);
+  }
+
+  pthread_mutex_lock(&w->mutex);
+  ok = w->ok;
+  pthread_mutex_unlock(&w->mutex);
+
+  reachy_wait_unref(w);
+
+  if(!ok)
+    clam(CLAM_WARN, REACHY_CTX, "%s: the robot refused the audio",
+        st->botname);
+
+  return(ok ? SUCCESS : FAIL);
+}
+
+static bool
+reachy_play(reachy_state_t *st, const char *file)
+{
+  reachy_wait_t *w = reachy_wait_create();
+  bool           ok;
+
+  if(reachy_play_sound(file, reachy_robot_done, w) != SUCCESS)
+  {
+    reachy_wait_unref(w);
+    reachy_wait_unref(w);
+    clam(CLAM_WARN, REACHY_CTX,
+        "%s: the audio is on the robot but playing it was refused before "
+        "it left", st->botname);
+    return(FAIL);
+  }
+
+  if(!reachy_wait_for(st, w, REACHY_ROBOT_WAIT_MS))
+  {
+    reachy_wait_unref(w);
+
+    if(!reachy_stopping(st))
+      clam(CLAM_WARN, REACHY_CTX,
+          "%s: the robot did not start playing within %u ms", st->botname,
+          (unsigned)REACHY_ROBOT_WAIT_MS);
+
+    return(FAIL);
+  }
+
+  pthread_mutex_lock(&w->mutex);
+  ok = w->ok;
+  pthread_mutex_unlock(&w->mutex);
+
+  reachy_wait_unref(w);
+
+  if(!ok)
+    clam(CLAM_WARN, REACHY_CTX, "%s: the robot would not play the audio",
+        st->botname);
+
+  return(ok ? SUCCESS : FAIL);
+}
+
+// How long this audio takes to play, in milliseconds.
+//
+// The daemon's play_sound returns the moment playback STARTS, so the
+// only thing that keeps two lines from landing on top of each other is
+// this arithmetic. It is read from the file's own header rather than
+// assumed: kokorod emits 24 kHz stereo S16LE today (96,000 bytes per
+// second), and a server that one day emits something else should slow
+// the robot down, not desynchronize it.
+static uint32_t
+reachy_play_ms(const void *wav, size_t wav_len)
+{
+  const uint8_t *b    = wav;
+  uint32_t       rate = 0;
+  uint64_t       ms;
+
+  if(wav_len <= REACHY_WAV_HDR_SZ)
+    return(0);
+
+  // Canonical 44-byte RIFF: byte rate is the little-endian word at 28.
+  if(memcmp(b, "RIFF", 4) == 0 && memcmp(b + 8, "WAVE", 4) == 0)
+    rate = (uint32_t)b[28] | ((uint32_t)b[29] << 8)
+         | ((uint32_t)b[30] << 16) | ((uint32_t)b[31] << 24);
+
+  if(rate == 0)
+    rate = REACHY_WAV_BYTE_RATE;
+
+  ms = ((uint64_t)(wav_len - REACHY_WAV_HDR_SZ) * 1000u) / rate;
+
+  return(ms > REACHY_PLAY_MAX_MS ? (uint32_t)REACHY_PLAY_MAX_MS
+                                 : (uint32_t)ms);
+}
+
+// Has a human taken the floor?
+//
+// ⚠ The flag this reads is not trustworthy on this hardware, which is
+// why `barge_in` ships OFF. Measured 2026-08-04 over 451 probes of a
+// SILENT room: `speech_detected` was true in 49% of them, in 93 separate
+// runs, 28 of which were 3 or more probes long and 11 of which were 5 or
+// more. The cause is the one §HALLUCINATION found — the CM4's cooling
+// fan sits above the XVF3800's speech threshold — and no run length
+// separates it from a person. The array's echo canceller is meanwhile
+// doing its job: during 19 s of the robot's OWN speech the flag was true
+// LESS often than in silence, so self-interruption was never the risk.
+//
+// REACHY_BARGE_RUN is therefore a guard for the day the fan is quieter,
+// not a fix for today. Leave the knob off until `reachy_mic_probe.sh`
+// says the floor has moved.
+static bool
+reachy_barged(reachy_state_t *st)
+{
+  reachy_wait_t *w = reachy_wait_create();
+  bool           speech = false;
+
+  if(reachy_get_doa(reachy_doa_done, w) != SUCCESS)
+  {
+    reachy_wait_unref(w);
+    reachy_wait_unref(w);
+    return(false);
+  }
+
+  if(!reachy_wait_for(st, w, REACHY_DOA_WAIT_MS))
+  {
+    reachy_wait_unref(w);
+    return(false);
+  }
+
+  pthread_mutex_lock(&w->mutex);
+  speech = (w->ok && w->speech);
+  pthread_mutex_unlock(&w->mutex);
+
+  reachy_wait_unref(w);
+
+  return(speech);
+}
+
+// Hold the mouth for the length of the audio, watching for an
+// interruption if the operator has asked for one.
+// returns: true when playback ran its course, false when it was cut
+// short by a human or a teardown.
+static bool
+reachy_pace(reachy_state_t *st, uint32_t ms, bool barge_in)
+{
+  struct timespec deadline;
+  uint32_t        run = 0;
+
+  reachy_deadline(&deadline, ms + REACHY_PLAY_GRACE_MS);
+
+  while(!reachy_expired(&deadline))
+  {
+    if(!reachy_nap(st, REACHY_PLAY_SLICE_MS))
+      return(false);
+
+    if(!barge_in)
+      continue;
+
+    if(!reachy_barged(st))
+    {
+      run = 0;
+      continue;
+    }
+
+    if(++run < REACHY_BARGE_RUN)
+      continue;
+
+    clam(CLAM_INFO, REACHY_CTX, "%s: a human has the floor — stopping",
+        st->botname);
+
+    reachy_stop_sound(NULL, NULL);
+    reachy_mouth_flush(st);
+
+    return(false);
+  }
+
+  return(true);
+}
+
+// Milliseconds since `since`, which is then advanced to now — so three
+// hops in a row are each measured without three pairs of timestamps.
+static uint32_t
+reachy_lap(struct timespec *since)
+{
+  struct timespec now;
+  int64_t         ms;
+
+  clock_gettime(CLOCK_MONOTONIC, &now);
+
+  // Signed throughout: the nanosecond term is negative whenever the lap
+  // crossed a second boundary, and the seconds term is what pays for it.
+  ms = (int64_t)(now.tv_sec - since->tv_sec) * 1000
+     + (int64_t)(now.tv_nsec - since->tv_nsec) / 1000000;
+
+  *since = now;
+
+  return(ms > 0 ? (uint32_t)ms : 0u);
+}
+
+// One line, end to end. Every failure arm drops this line and returns:
+// the mouth must never wedge on a phrase it cannot say.
+//
+// The three hop timings are logged together because that is how they are
+// read — "the robot was slow to answer" is a question about which of
+// synthesis, the WiFi upload or the daemon took the time, and one line
+// carrying all three answers it without a stopwatch.
+static void
+reachy_speak(reachy_state_t *st, const char *text)
+{
+  struct timespec lap;
+  char            file[REACHY_FILE_SZ];
+  void           *wav     = NULL;
+  size_t          wav_len = 0;
+  uint32_t        tts_ms;
+  uint32_t        up_ms;
+  uint32_t        play_ms;
+  uint32_t        ms;
+
+  clock_gettime(CLOCK_MONOTONIC, &lap);
+
+  if(reachy_synthesize(st, text, &wav, &wav_len) != SUCCESS)
+    return;
+
+  tts_ms = reachy_lap(&lap);
+
+  reachy_sound_file(st, file, sizeof(file));
+
+  ms = reachy_play_ms(wav, wav_len);
+
+  if(reachy_upload(st, file, wav, wav_len) != SUCCESS)
+  {
+    mem_free(wav);
+    return;
+  }
+
+  up_ms = reachy_lap(&lap);
+
+  // The robot has its own copy now, and the pacing length is already
+  // measured — nothing below needs these bytes.
+  mem_free(wav);
+
+  if(reachy_play(st, file) != SUCCESS)
+    return;
+
+  play_ms = reachy_lap(&lap);
+
+  clam(CLAM_INFO, REACHY_CTX,
+      "%s: says \"%.160s\" (%u.%03u s of audio; tts %u ms, upload %u ms, "
+      "play %u ms)", st->botname, text, ms / 1000u, ms % 1000u, tts_ms,
+      up_ms, play_ms);
+
+  reachy_pace(st, ms, reachy_kv_flag(st, "barge_in"));
+}
+
+// The mouth thread. Strictly one line at a time: the robot has one
+// speaker, and the whole point of pacing is that the next line waits for
+// this one to finish being heard.
+static void
+reachy_mouth(task_t *t)
+{
+  reachy_state_t *st = t->data;
+  char            line[METHOD_TEXT_SZ];
+
+  reachy_thread_track(t->id);
+
+  clam(CLAM_INFO, REACHY_CTX, "%s: the mouth is open", st->botname);
+
+  while(!reachy_stopping(st))
+    if(reachy_mouth_take(st, line, sizeof(line)))
+      reachy_speak(st, line);
+
+  clam(CLAM_INFO, REACHY_CTX, "%s: the mouth is closed", st->botname);
 
   reachy_thread_forget(t->id);
   reachy_state_unref(st);
@@ -902,7 +1474,9 @@ reachy_create(const char *inst_name)
 
   pthread_mutex_init(&st->wake_mutex, NULL);
   pthread_mutex_init(&st->attn_mutex, NULL);
+  pthread_mutex_init(&st->mouth_mutex, NULL);
   pthread_cond_init(&st->wake_cond, NULL);
+  pthread_cond_init(&st->mouth_cond, NULL);
 
   return(st);
 }
@@ -952,12 +1526,17 @@ reachy_connect(void *handle)
   reachy_motors_mode("enabled", NULL, NULL);
   reachy_wake(NULL, NULL);
 
-  // Taken BEFORE the spawn: a thread that starts instantly must never
-  // find a state that has already been freed underneath it.
+  st->mouth_head    = 0;
+  st->mouth_count   = 0;
+  st->mouth_dropped = 0;
+
+  // Each reference is taken BEFORE its spawn: a thread that starts
+  // instantly must never find a state that has already been freed
+  // underneath it.
   reachy_state_ref(st);
 
-  // TASK_NAME_SZ is 40 and a bot name may be 63, so the name is clipped
-  // here rather than by snprintf — the task name is a label in
+  // TASK_NAME_SZ is 40 and a bot name may be 63, so both names are
+  // clipped here rather than by snprintf — the task name is a label in
   // `show tasks`, and a deliberate clip reads better than a silent one.
   snprintf(task_name, sizeof(task_name), "reachy_ears_%.27s", st->botname);
   h = task_add_persist(task_name, 50, reachy_ears, st);
@@ -970,6 +1549,29 @@ reachy_connect(void *handle)
     return(FAIL);
   }
 
+  reachy_state_ref(st);
+
+  snprintf(task_name, sizeof(task_name), "reachy_mouth_%.26s", st->botname);
+  h = task_add_persist(task_name, 50, reachy_mouth, st);
+
+  if(h == TASK_HANDLE_NONE)
+  {
+    // The ear is already listening. A creature that hears the room and
+    // cannot answer it is worse than one that does neither, so the whole
+    // connect unwinds — the flag is how the ears thread is told.
+    clam(CLAM_WARN, REACHY_CTX, "%s: could not spawn the mouth thread",
+        st->botname);
+    reachy_state_unref(st);
+
+    __atomic_store_n(&st->shutdown, true, __ATOMIC_RELEASE);
+
+    pthread_mutex_lock(&st->wake_mutex);
+    pthread_cond_broadcast(&st->wake_cond);
+    pthread_mutex_unlock(&st->wake_mutex);
+
+    return(FAIL);
+  }
+
   // RUNNING, not AVAILABLE: the ear promotes us when the bridge answers.
   method_set_state(st->inst, METHOD_RUNNING);
 
@@ -978,7 +1580,8 @@ reachy_connect(void *handle)
 
 // Runs UNDER method_mutex, back to back with destroy(). No joins — the
 // ears thread may be blocked taking this very mutex inside
-// method_deliver — and no method_* calls.
+// method_deliver — and no method_* calls. Both threads are told the same
+// way, on the two condvars they sleep on.
 static void
 reachy_disconnect(void *handle)
 {
@@ -990,26 +1593,50 @@ reachy_disconnect(void *handle)
   pthread_cond_broadcast(&st->wake_cond);
   pthread_mutex_unlock(&st->wake_mutex);
 
-  // Plain curl submits, which is legal under the mutex.
+  reachy_mouth_wake(st);
+
+  // Plain curl submits, which is legal under the mutex. Silence first:
+  // a robot that tucks itself away mid-sentence and keeps talking from
+  // inside its shell is a haunting, not a goodbye.
   reachy_stop_sound(NULL, NULL);
 
   if(reachy_kv_flag(st, "sleep_on_disconnect"))
     reachy_sleep_move(NULL, NULL);
 }
 
-// RCH-7 replaces this whole body with the mouth loop. SUCCESS rather
-// than FAIL on purpose: the reply pipeline treats a send failure as
-// something to report and retry, and there is nothing here to retry.
+// Called from the curl worker thread — one call per streamed reply line
+// — and from task workers via cmd_reply, so it does the least it can:
+// one copy into the ring, one signal. Everything expensive belongs to
+// the mouth thread.
+//
+// `target` is ignored on purpose. It is the channel when there is one
+// and the sender otherwise, and here both name the same room, the same
+// microphone and the same speaker.
+//
+// SUCCESS even when the line is dropped: the reply pipeline treats a
+// send failure as something to report to a user and retry, and neither
+// makes sense for speech that has already been overtaken by the
+// conversation.
 static bool
 reachy_send(void *handle, const char *target, const char *text)
 {
   reachy_state_t *st = handle;
+  char            spoken[METHOD_TEXT_SZ];
 
   (void)target;
 
-  clam(CLAM_WARN, REACHY_CTX,
-      "%s: the mouth is not built yet — swallowed \"%.120s\"",
-      st->botname, text);
+  if(text == NULL || text[0] == '\0')
+    return(SUCCESS);
+
+  // An action ("/me waves") read out verbatim is a bot reading a stage
+  // direction. Spoken aloud it wants its subject back.
+  if(strncmp(text, "/me ", 4) == 0)
+    snprintf(spoken, sizeof(spoken), "%s %s", st->botname, text + 4);
+
+  else
+    snprintf(spoken, sizeof(spoken), "%s", text);
+
+  reachy_mouth_push(st, spoken);
 
   return(SUCCESS);
 }
@@ -1141,8 +1768,8 @@ reachy_stop(void)
   for(uint32_t i = 0; i < n; i++)
     if(!task_persist_join(pending[i], REACHY_JOIN_MS))
       clam(CLAM_WARN, REACHY_CTX,
-          "ears thread %llu did not exit within %u ms — unloading now "
-          "would unmap code it is still running",
+          "thread %llu did not exit within %u ms — unloading now would "
+          "unmap code it is still running",
           (unsigned long long)pending[i], (unsigned)REACHY_JOIN_MS);
 
   return(SUCCESS);
