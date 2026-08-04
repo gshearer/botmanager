@@ -1,0 +1,45 @@
+# whisper-server.service — speech-to-text for the reachy senses (RCH-2).
+#
+# Master copy. Install with:
+#   install -Dm644 senses/whisper/whisper-server.service \
+#       ~/.config/systemd/user/whisper-server.service
+#   systemctl --user daemon-reload
+#   systemctl --user enable --now whisper-server
+#
+# This is a systemd *user* unit: it runs as the operator, sees the operator's
+# CUDA environment, and needs no root. It serves the STT half of the voice
+# loop on 127.0.0.1:8004 — loopback only, because the only consumer is the
+# botman daemon on this same host (the robot never talks to it directly; the
+# ear bridge ships WAVs to botman and botman does the transcribing).
+#
+# Upstream builds out-of-tree in ~/src/whisper.cpp (operator gate G1); the
+# model is fetched by senses/whisper/fetch-model.sh. Nothing in this repo is
+# built or installed by this unit.
+#
+# Port map for the initiative: robot daemon 8000, earbridge 8090 (on the
+# robot), kokorod 8003, whisper-server 8004. The DGX Spark holds 8001/8002.
+
+[Unit]
+Description=whisper.cpp STT server (reachy senses)
+Documentation=https://github.com/ggml-org/whisper.cpp
+After=default.target
+
+[Service]
+Type=simple
+WorkingDirectory=%h/src/whisper.cpp
+# Fail loudly and immediately on a missing model rather than crash-looping on
+# an error message buried in whisper's own startup output.
+ExecStartPre=/usr/bin/test -r %h/src/whisper.cpp/models/ggml-large-v3-turbo.bin
+ExecStart=%h/src/whisper.cpp/build/bin/whisper-server \
+    -m %h/src/whisper.cpp/models/ggml-large-v3-turbo.bin \
+    --host 127.0.0.1 --port 8004
+# The model load is ~1.6 GB off disk into VRAM; give it room before systemd
+# decides the unit is wedged.
+TimeoutStartSec=180
+Restart=on-failure
+RestartSec=5
+SyslogIdentifier=whisper-server
+Nice=-5
+
+[Install]
+WantedBy=default.target
