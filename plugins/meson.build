@@ -51,6 +51,10 @@ subdir('service/tmdb')
 subdir('service/giphy')
 subdir('service/rawg')
 subdir('service/wordnik')
+# reachyapi defines reachyapi_include, so it must precede every consumer
+# (feature/reachycmd below, and the reachy protocol driver later).
+subdir('service/reachyapi')
+subdir('feature/reachycmd')
 subdir('feature/crypto')
 subdir('misc/math')
 subdir('misc/eightball')
