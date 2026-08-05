@@ -2454,7 +2454,7 @@ const plugin_desc_t bm_plugin_desc = {
   .api_version          = PLUGIN_API_VERSION,
   .name                 = "text",
   .version              = "1.0",
-  .type                 = PLUGIN_METHOD,
+  .type                 = PLUGIN_BOT,
   .kind                 = "text",
   .provides             = { { .name = "method_text" } },
   .provides_count       = 1,

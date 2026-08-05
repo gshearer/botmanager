@@ -96,7 +96,7 @@ plugin_driver_bound(const plugin_desc_t *desc, char *bot_name, size_t sz,
   const bot_driver_t *drv;
 
   if(desc->ext == NULL
-      || (desc->type != PLUGIN_METHOD && desc->type != PLUGIN_FEATURE))
+      || (desc->type != PLUGIN_BOT && desc->type != PLUGIN_FEATURE))
     return(false);
 
   drv = (const bot_driver_t *)desc->ext;
@@ -507,7 +507,7 @@ plugin_detach_bots(const plugin_desc_t *desc)
   if(desc->ext == NULL)
     return(0);
 
-  if(desc->type == PLUGIN_METHOD || desc->type == PLUGIN_FEATURE)
+  if(desc->type == PLUGIN_BOT || desc->type == PLUGIN_FEATURE)
   {
     const bot_driver_t *drv = (const bot_driver_t *)desc->ext;
 
@@ -526,7 +526,7 @@ plugin_reattach_bots(const plugin_desc_t *desc)
   if(desc->ext == NULL)
     return(0);
 
-  if(desc->type == PLUGIN_METHOD || desc->type == PLUGIN_FEATURE)
+  if(desc->type == PLUGIN_BOT || desc->type == PLUGIN_FEATURE)
     return(bot_resume_driver((const bot_driver_t *)desc->ext, desc->kind));
 
   if(desc->type == PLUGIN_PROTOCOL)
@@ -1874,7 +1874,7 @@ plugin_type_name(plugin_type_t t)
     case PLUGIN_CORE:        return("core");
     case PLUGIN_DB:          return("db");
     case PLUGIN_PROTOCOL:    return("protocol");
-    case PLUGIN_METHOD:      return("method");
+    case PLUGIN_BOT:         return("bot");
     case PLUGIN_SERVICE:     return("service");
     case PLUGIN_MISC:        return("misc");
     case PLUGIN_PERSONALITY: return("personality");

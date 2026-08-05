@@ -67,7 +67,7 @@ admin_cmd_bot_add(const cmd_ctx_t *ctx)
     return;
   }
 
-  pd = plugin_find_type(PLUGIN_METHOD, kind);
+  pd = plugin_find_type(PLUGIN_BOT, kind);
 
   if(pd == NULL || pd->ext == NULL)
   {

@@ -22,7 +22,7 @@ typedef enum
   PLUGIN_CORE,          // extends core functionality
   PLUGIN_DB,            // database engine driver
   PLUGIN_PROTOCOL,      // human interaction protocol (IRC, Slack, etc.)
-  PLUGIN_METHOD,        // bot interaction method (text, voice, etc.)
+  PLUGIN_BOT,           // the mind that drives a bot (chat, etc.)
   PLUGIN_SERVICE,       // external API integration (REST, WebSocket, etc.)
   PLUGIN_MISC,          // miscellaneous user command extension (registers commands)
   PLUGIN_PERSONALITY,   // language/messaging personality
