@@ -15,10 +15,18 @@
 // KV schema
 // ----------------------------------------------------------------------
 
-// One robot, addressed plugin-wide. Per-bot policy (voice, attention,
-// volume at connect) is instance KV owned by the method driver — a
-// second robot is what would move these two rows down there, and that
-// day is not today.
+// The rule, and it is the operator's: a plugin-level row may hold only
+// what is true of EVERY reachy under botmanager. `timeout` qualifies.
+// Per-bot policy — voice, attention, volume, gaze — does not, and lives
+// in the method driver's instance KV, where `/bot <name> volume 42`
+// writes it.
+//
+// The two addresses below fail that rule and stay anyway, because
+// moving them is not a KV change at all. This is a SERVICE: it sits
+// below the method layer and cannot ask which bot is calling. Per-robot
+// addressing means every `reachyapi_*` entry point grows a robot-address
+// parameter and every caller supplies one — that is `TODO.md §F`'s
+// multi-robot item, and this comment is where its price is recorded.
 static const plugin_kv_entry_t reachyapi_kv_schema[] = {
   { REACHYAPI_KV_BASE_URL, KV_STR,
     "http://reachy.iot.hiigara.shearer.tech:8000",

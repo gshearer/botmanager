@@ -1080,7 +1080,7 @@ cmd_llm_test(const cmd_ctx_t *ctx)
   else
   {
     cmd_reply(ctx, "error: `llm test` does not cover the speech kinds — "
-        "try `!reachy say <text>` for a tts model, and speak to the robot "
+        "try `/bot <name> say <text>` for a tts model, and speak to the robot "
         "for an stt one");
     goto cleanup;
   }

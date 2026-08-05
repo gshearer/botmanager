@@ -47,8 +47,8 @@ static const plugin_kv_entry_t reachy_inst_kv_schema[] = {
   { "wobble", KV_UINT8, "1",
     "Drive speech-synced head motion from played audio at connect" },
   { "tracking_weight", KV_STR, "0.6",
-    "Face-tracking strength in [0,1] applied at connect; 0 leaves "
-    "tracking alone" },
+    "Face-tracking strength in [0,1] applied at connect; 0 turns face "
+    "tracking off" },
   { "sleep_on_disconnect", KV_UINT8, "1",
     "Settle the robot into its shell when the bot stops; the daemon "
     "drops torque at the end of that move, so it ends up limp. A "
@@ -1683,10 +1683,11 @@ reachy_connect(void *handle)
   reachy_set_volume((uint8_t)reachy_kv_uint(st, "volume"), NULL, NULL);
   reachy_wobbling(reachy_kv_flag(st, "wobble"), NULL, NULL);
 
+  // Unconditional, both ways. A weight of 0 that merely *skipped* the
+  // call would leave the robot however it was last left, which is
+  // exactly how `track off` used to evaporate at the next connect.
   weight = reachy_kv_double(st, "tracking_weight");
-
-  if(weight > 0.0)
-    reachy_tracking(true, weight, NULL, NULL);
+  reachy_tracking(weight > 0.0, weight, NULL, NULL);
 
   // Standing up is the one thing that is NOT fire-and-forget: it needs
   // torque before the move, and it needs to know whether the robot is

@@ -156,9 +156,9 @@ never enables them. A limp robot accepts every move command, returns a normal
 why the `set_mode/enabled` line above comes first and is not optional.
 
 If the robot "ignores" you, check `GET /api/motors/status` first — or ask the
-bot, since `show reachy` reports the motor mode in words. `!reachy wake` does
-both steps for you (shipped `4ef0cef`); this section is the by-hand path for a
-robot with no botman in front of it.
+bot, since `show bot <name> robot` reports the motor mode in words.
+`/bot <name> wake` does both steps for you (shipped `4ef0cef`); this section is
+the by-hand path for a robot with no botman in front of it.
 
 ---
 
@@ -323,17 +323,23 @@ Three plugins, layered protocol/misc → service (`TODO.md §C4`):
 ```sh
 ninja -C build
 build/tools/botmanctl "plugin load reachyapi"    # PLUGIN_SERVICE, no commands
-build/tools/botmanctl "plugin load reachycmd"    # !reachy command surface
+build/tools/botmanctl "plugin load reachycmd"    # the bot-scoped robot verbs
 build/tools/botmanctl "plugin load reachy"       # the method driver (ears)
 build/tools/botmanctl "plugin audit reachyapi"
 ```
 
-⚠ Every `!reachy` verb **and** `show reachy` is `USERNS_GROUP_USER` at level
-**100**. An `ircspy` nick is anonymous and gets "Permission denied", so verify
-with `botmanctl -u <registered user>`, e.g.:
+⚠ Load order matters now: `reachycmd` requires **both** `service_reachyapi`
+and `method_reachy`, because its verbs write the instance KV the driver owns.
+
+⚠ Every robot verb lives under `/bot <name>` or `/show bot <name>` and is
+therefore **admin-gated by its parent** — `cmd_invoke()` checks nothing, so the
+child's own registration is decorative and matches the parent deliberately
+(operator decision, 2026-08-05, superseding RCH-1-PERMS for this surface). An
+`ircspy` nick is anonymous and gets "Permission denied", so verify with a
+registered identity:
 
 ```sh
-build/tools/botmanctl -u doc "reachy say hello there"
+build/tools/botmanctl -u doc "bot mini say hello there"
 ```
 
 ⚠ **Async replies never come back through botmanctl** (`bctl_reply_target` is
@@ -378,8 +384,8 @@ re-test.
 curl -s http://reachy…:8090/health          # ear alive, floor_db set
 curl -s http://127.0.0.1:8004/inference -F file=@<a wav> -F response_format=json
 curl -s http://127.0.0.1:8003/health        # {"ok":true,"voices":53}
-build/tools/botmanctl "show reachy"         # live DoA bearing
-build/tools/botmanctl -u doc "reachy say the ear hears and the mouth answers"
+build/tools/botmanctl "show bot mini robot"  # live DoA bearing
+build/tools/botmanctl -u doc "bot mini say the ear hears and the mouth answers"
 build/tools/botmanctl "say <bot> voice the mouth is wired to the brain"
 ```
 
