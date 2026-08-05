@@ -488,7 +488,7 @@ typedef struct
 
 // ATK_CLASS_NAME_SZ is up with the storage bounds: a combatant's class is
 // part of their round row, so atk_player_t needs it long before here.
-#define ATK_CLASS_DESC_SZ  64          // 60 by the grammar, + NUL + slack
+#define ATK_CLASS_DESC_SZ  74          // 70 by the grammar, + NUL + slack
 #define ATK_CLASSES_MAX    32          // registry slots
 #define ATK_MOVES_MAX     128          // per section, the hard array bound
 #define ATK_MOVE_GROW      32          // moves one mem_realloc adds

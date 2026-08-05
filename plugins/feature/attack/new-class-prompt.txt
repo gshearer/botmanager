@@ -47,7 +47,7 @@ field is trimmed, and any further `|` belongs to the text.
 Header, both keys required:
 
     type: warrior          # must be exactly the file stem, alphanumeric
-    desc: <= 60 bytes, one line, what this class is
+    desc: <= 70 bytes, one line, what this class is
 
 The six sections, and the exact shape of a line in each:
 

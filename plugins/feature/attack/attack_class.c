@@ -90,7 +90,7 @@
 #define ATK_NOUN_MAX     24
 
 // The longest a description may be, by the brief.
-#define ATK_DESC_MAX     60
+#define ATK_DESC_MAX     70
 
 static const char *const atk_tok_name[ATK_TOK__COUNT] = {
   ATK_TOK_ATTACKER, ATK_TOK_TARGET, ATK_TOK_DAMAGE, ATK_TOK_HEAL,
@@ -1104,7 +1104,7 @@ atk_sheet_parse(const char *path, const char *file, const char *stem)
       {
         if(strlen(text) > ATK_DESC_MAX)
         {
-          why = "desc is over 60 bytes";
+          why = "desc is over 70 bytes";
           break;
         }
 
