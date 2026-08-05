@@ -1,0 +1,69 @@
+# hacker — access taken quietly and used immediately. Mends nothing, and
+# leaves things running long after the session ends. See
+# ../new-class-prompt.txt for the grammar and the fairness rules.
+
+type: hacker
+desc: Zero-days and payloads. Corrupts systems, scrambles code.
+
+[damage]
+minor    | {attacker} revokes something small of {target}'s and waits — {damage} damage.
+minor    | {attacker} sends mail from {target} that was never written — {damage} damage.
+minor    | {attacker} changes {target}'s password to something unhelpful — {damage} damage.
+minor    | {attacker} reads {target}'s drafts aloud to nobody in particular — {damage} damage.
+minor    | {attacker} finds the one machine {target} forgot about for {damage} damage.
+minor    | {attacker} moves a decimal in something {target} relies on — {damage} damage.
+minor    | {attacker} signs {target} up for everything, alphabetically — {damage} damage.
+minor    | {attacker} leaves {target} logged in somewhere unwise for {damage} damage.
+
+medium   | {attacker} takes {target}'s keys and hands back the locks for {damage} damage.
+medium   | {attacker} rewrites what {target}'s own tools report for {damage} damage.
+medium   | {attacker} walks in through a door {target} propped open in March — {damage} damage.
+medium   | {attacker} makes {target} the author of things nobody read — {damage} damage.
+medium   | {attacker} corrupts {target}'s backups first, then the rest for {damage} damage.
+medium   | {attacker} turns {target}'s permissions inside out for {damage} damage.
+medium   | {attacker} routes {target}'s own alarms somewhere quiet for {damage} damage.
+medium   | {attacker} leaves {target} administering nothing at all for {damage} damage.
+
+major    | {attacker} takes {target}'s name off everything it was on — {damage} damage.
+major    | {attacker} publishes what {target} kept in the folder marked old — {damage} damage.
+major    | {attacker} makes every record of {target} disagree with the others — {damage} damage.
+major    | {attacker} owns {target}'s week before the morning is over — {damage} damage.
+major    | {attacker} scrambles {target} down to something that will not run — {damage} damage.
+major    | {attacker} locks {target} out of their own name and keeps the key — {damage} damage.
+major    | {attacker} has been inside {target} since Tuesday for {damage} damage.
+
+critical | {attacker} was already finished when {target} noticed. {damage} CRITICAL damage!
+critical | {attacker} revokes {target} entirely. There is no appeal path. {damage} CRITICAL damage!
+critical | {attacker} closes the session and takes {target} with it. {damage} CRITICAL damage!
+critical | {attacker} leaves {target} with nothing that will open. {damage} CRITICAL damage!
+critical | {attacker} makes {target} unrecoverable and clears the history. {damage} CRITICAL damage!
+critical | {attacker} owns {target} down to the last thing that worked. {damage} CRITICAL damage!
+critical | {attacker} never touched {target} directly, once. {damage} CRITICAL damage!
+
+[dot]
+rot   | quiet worm       | {attacker} leaves a {affliction} in {target} and logs off.
+rot   | sleeping payload | {attacker} plants a {affliction} in {target} for later.
+rot   | logic bomb       | {attacker} sets a {affliction} in {target} and names a date.
+curse | revoked key      | {attacker} leaves {target} holding a {affliction} and nothing else.
+curse | dead credential  | {attacker} turns {target}'s access into a {affliction}.
+curse | locked account   | {attacker} makes a {affliction} of {target} and keeps the key.
+
+[death]
+{attacker} closes the connection and leaves {target} where it dropped.
+{attacker} removes {target} from every list they were ever on.
+{attacker} clears the log, and {target} was in the log.
+{attacker} does not need {target} any more and says so by leaving.
+
+[decay]
+rot   | The {affliction} {attacker} left in {target} wakes up — {damage} damage.
+rot   | {attacker} is asleep; the {affliction} takes {damage} damage off {target}.
+rot   | The {affliction} {attacker} planted works {damage} damage into {target}.
+curse | The {affliction} {attacker} left keeps {target} out — {damage} damage.
+curse | {target} tries {attacker}'s {affliction} again and loses {damage} damage.
+curse | The {affliction} {attacker} set on {target} holds for {damage} damage more.
+
+[decay-kill]
+rot   | The {affliction} {attacker} left finishes {target} on a timer.
+rot   | {target} runs {attacker}'s {affliction} one last time.
+curse | {target} never gets back into anything {attacker}'s {affliction} holds.
+curse | The {affliction} {attacker} set outlasts {target} by a considerable margin.

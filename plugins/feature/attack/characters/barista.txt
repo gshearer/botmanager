@@ -1,0 +1,59 @@
+# barista — service at nine bars and a hundred and forty degrees. Mends
+# generously, and leaves very little behind. See
+# ../new-class-prompt.txt for the grammar and the fairness rules.
+
+type: barista
+desc: Caffeine and hot steam. Scalding splashes, fast boosts.
+
+[damage]
+minor    | {attacker} knocks the portafilter out against {target}'s knuckles — {damage} damage.
+minor    | {attacker} calls a name that is not {target}'s, four times — {damage} damage.
+minor    | {attacker} runs the grinder through whatever {target} was saying — {damage} damage.
+minor    | {attacker} apologises to {target} for the wait. The wait was the point — {damage} damage.
+minor    | {attacker} hands {target} a cup at the temperature it left the machine — {damage} damage.
+
+medium   | {attacker} steams {target}'s forearm and wipes the wand down after — {damage} damage.
+medium   | {attacker} does not look up from the milk. {target} is bleeding — {damage} damage.
+medium   | {attacker} serves {target} four ounces at a hundred and ninety — {damage} damage.
+medium   | {attacker} puts {target}'s hand under the wand and opens the valve — {damage} damage.
+medium   | {attacker} tamps, twists, locks, and takes {target} off their feet — {damage} damage.
+
+major    | {attacker} opens the group head into {target}'s face for {damage} damage.
+major    | {attacker} rides {target} down onto the hot plate and holds them — {damage} damage.
+major    | {attacker} puts {target} through the counter and starts the next ticket — {damage} damage.
+major    | {attacker} pulls a double into {target}'s eyes and does not stop timing it — {damage} damage.
+
+critical | {attacker} holds {target} down until the smell changes. {damage} CRITICAL damage!
+critical | {attacker} closes at nine. It is nine. {target} is still here. {damage} CRITICAL damage!
+critical | {attacker} steams {target} to temperature and pours them out. {damage} CRITICAL damage!
+critical | {attacker} calls the order. Nobody comes. {target} least of all. {damage} CRITICAL damage!
+
+[dot]
+burn | slow scald | {attacker} leaves a {affliction} across {target} and wipes the counter.
+burn | steam burn | {attacker} puts a {affliction} into {target} that goes on rising.
+
+[heal]
+minor | {attacker} puts something hot in {target}'s hands and waits — {heal} hit points.
+minor | {attacker} slides {target} a fourth shot without mentioning it. {heal} hit points.
+minor | {attacker} remembers {target}'s order correctly and it lands. {heal} hit points.
+minor | {attacker} gives {target} the seat by the window and the good cup. {heal} hit points.
+minor | {attacker} makes {target} sit down and drink the whole thing. {heal} hit points.
+major | {attacker} pulls {target} a triple and the shaking stops. {heal} hit points.
+major | {attacker} feeds {target} something from behind the counter, off menu. {heal} hit points.
+major | {attacker} gets {target} through the rush and out the other side. {heal} hit points.
+major | {attacker} hands {target} something scalding, and it works. {heal} hit points.
+major | {attacker} closes early for {target} and puts the chairs up slowly. {heal} hit points.
+
+[death]
+{attacker} wipes the wand, wipes the counter, and steps over {target}.
+{attacker} writes {target}'s name on a cup and does not make the drink.
+{attacker} turns the sign around while {target} is still on the floor.
+
+[decay]
+burn | The {affliction} {attacker} left on {target} keeps rising — {damage} damage.
+burn | {target} runs {attacker}'s {affliction} under cold water for {damage} damage.
+burn | The {affliction} {attacker} left has gone deeper into {target} — {damage} damage.
+
+[decay-kill]
+burn | The {affliction} {attacker} left finishes {target} quietly, by the door.
+burn | {target} does not get out from under {attacker}'s {affliction}.

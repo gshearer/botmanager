@@ -1,0 +1,59 @@
+# webmaster — layout as a weapon, held wrong. Mends generously between
+# outages, and leaves one thing flashing away in the corner. See
+# ../new-class-prompt.txt for the grammar and the fairness rules.
+
+type: webmaster
+desc: Blinking text and garish layouts. Patches broken links.
+
+[damage]
+minor    | {attacker} sets {target}'s name flashing and it does not stop — {damage} damage.
+minor    | {attacker} puts a tiled background behind {target} for {damage} damage.
+minor    | {attacker} adds a visitor counter to {target} for {damage} damage.
+minor    | {attacker} centres everything about {target}, permanently — {damage} damage.
+
+medium   | {attacker} marks {target} under construction and walks away — {damage} damage.
+medium   | {attacker} sets the whole thing to lime on purple around {target} — {damage} damage.
+medium   | {attacker} starts a marquee across {target} for {damage} damage.
+medium   | {attacker} nests {target} inside a table nine deep for {damage} damage.
+
+major    | {attacker} frames {target} in a way that has no way out — {damage} damage.
+major    | {attacker} autoplays something at {target} with no controls — {damage} damage.
+major    | {attacker} points every link on the page at {target} for {damage} damage.
+major    | {attacker} rebuilds {target} in a way that only works at one width — {damage} damage.
+
+critical | {attacker} sets it all blinking at once. {target} looks directly at it. {damage} CRITICAL damage!
+critical | {attacker} makes {target} the splash page and gives no way past. {damage} CRITICAL damage!
+critical | {attacker} publishes {target} exactly as they are, permanently. {damage} CRITICAL damage!
+critical | {attacker} takes the whole site down onto {target}. {damage} CRITICAL damage!
+
+[dot]
+curse | blinking tag | {attacker} leaves a {affliction} on {target} with no way to close it.
+curse | broken link  | {attacker} leaves a {affliction} in {target} pointing nowhere good.
+
+[heal]
+minor | {attacker} patches {target}'s broken link and the bleeding stops — {heal} hit points.
+minor | {attacker} turns the background music off for {target}. {heal} hit points.
+minor | {attacker} takes the under construction sign off {target}. {heal} hit points.
+minor | {attacker} finds {target} a mirror that is actually up. {heal} hit points.
+minor | {attacker} puts {target} back the way it was on Tuesday. {heal} hit points.
+minor | {attacker} adds {target} to the links page, which is an honour. {heal} hit points.
+major | {attacker} rebuilds {target} from the backup that turned out to exist. {heal} hit points.
+major | {attacker} restores every page of {target} and fixes the navigation. {heal} hit points.
+major | {attacker} sits up all night getting {target} working again. {heal} hit points.
+major | {attacker} gives {target} the good hosting and eats the cost. {heal} hit points.
+major | {attacker} makes {target} load in under a second on a slow line. {heal} hit points.
+major | {attacker} signs {target}'s guestbook and means every word. {heal} hit points.
+
+[death]
+{attacker} takes {target}'s page down and leaves the domain parked.
+{attacker} replaces {target} with a single line and a mail address.
+{attacker} marks {target} last updated and never touches it again.
+
+[decay]
+curse | The {affliction} {attacker} left on {target} is still going — {damage} damage.
+curse | {target} cannot close {attacker}'s {affliction}; it takes {damage} damage.
+curse | The {affliction} {attacker} left costs {target} another {damage} damage.
+
+[decay-kill]
+curse | The {affliction} {attacker} left is the last thing {target} sees.
+curse | {target} follows {attacker}'s {affliction} and does not come back.

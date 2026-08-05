@@ -1,0 +1,63 @@
+# paladin — shield and sworn word at close range. Mends a little, and
+# what it swears over a body stays sworn. See
+# ../new-class-prompt.txt for the grammar and the fairness rules.
+
+type: paladin
+desc: Shield and sworn oaths. Punishes some, protects others.
+
+[damage]
+minor    | {attacker} sets the shield rim on {target}'s instep and leans — {damage} damage.
+minor    | {attacker} reads the oath aloud and {target}'s ears start ringing — {damage} damage.
+minor    | {attacker} turns the shield face toward {target} and lets the glare work — {damage} damage.
+minor    | {attacker} raps {target}'s knuckles with the pommel on the way past — {damage} damage.
+minor    | {attacker} steps into {target}'s space and declines to leave for {damage} damage.
+minor    | {attacker} clips {target}'s ear with the shield boss for {damage} damage.
+minor    | {attacker} names one of {target}'s smaller sins and it stings — {damage} damage.
+
+medium   | {attacker} puts the shield into {target}'s chest and holds it there — {damage} damage.
+medium   | {attacker} catches {target}'s swing on the boss and returns it for {damage} damage.
+medium   | {attacker} walks {target} backwards into a wall and keeps walking — {damage} damage.
+medium   | {attacker} brings the flat of the blade across {target}'s shoulders — {damage} damage.
+medium   | {attacker} stands where {target} needed to be, and collects — {damage} damage.
+medium   | {attacker} shoulders {target} off their feet without breaking the vow — {damage} damage.
+medium   | {attacker} closes the gap and empties {target}'s lungs with the rim — {damage} damage.
+
+major    | {attacker} opens {target}'s cheek on the shield edge for {damage} damage.
+major    | {attacker} breaks {target}'s guard and the collarbone under it — {damage} damage.
+major    | {attacker} runs the blade along {target}'s ribs and keeps the verse going — {damage} damage.
+major    | {attacker} pins {target} to the wall on the boss and leans on the blade — {damage} damage.
+major    | {attacker} calls {target} out by name and something answers for {damage} damage.
+major    | {attacker} drives the shield edge onto {target}'s foot until it gives — {damage} damage.
+major    | {attacker} lays {target} open from hip to knee and finishes the verse — {damage} damage.
+
+critical | {attacker} finishes the oath. {target} does not finish anything. {damage} CRITICAL damage!
+critical | {attacker} puts the shield through {target} and the wall agrees. {damage} CRITICAL damage!
+critical | {attacker} breaks {target} across the boss and steps off. {damage} CRITICAL damage!
+critical | {attacker} was sworn to this exact outcome. {target} arrives at it. {damage} CRITICAL damage!
+critical | {attacker} drives the blade down through {target}'s guard and the rest. {damage} CRITICAL damage!
+critical | {attacker} holds the line. {target} is what the line was for. {damage} CRITICAL damage!
+critical | {attacker} closes the verdict on {target} without raising the voice. {damage} CRITICAL damage!
+
+[dot]
+curse | broken oath | {attacker} swears a {affliction} over {target} and leaves it standing.
+curse | marked name | {attacker} sets a {affliction} on {target} that will not wash off.
+
+[heal]
+minor | {attacker} sets a hand on {target}'s breastplate until the shaking stops — {heal} hit points.
+minor | {attacker} says the short vow over {target} and the bleeding slows. {heal} hit points.
+major | {attacker} puts {target} back on their feet and hands them the shield. {heal} hit points.
+major | {attacker} holds the oath over {target} until the wounds close under it. {heal} hit points.
+
+[death]
+{attacker} lowers the shield and lets {target} down onto it.
+{attacker} finishes {target} and keeps the promise anyway.
+{attacker} says the last of the oath over {target} and means it.
+
+[decay]
+curse | The {affliction} {attacker} swore over {target} comes due for {damage} damage.
+curse | {target} cannot put {attacker}'s {affliction} down; it takes {damage} damage.
+curse | {attacker} is elsewhere, and the {affliction} holds {target} to {damage} damage.
+
+[decay-kill]
+curse | The {affliction} {attacker} swore over {target} collects the rest.
+curse | {target} is held to {attacker}'s {affliction} until nothing is left to hold.

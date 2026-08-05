@@ -1,0 +1,75 @@
+# thefactor — carries the same arsenal as everyone else and points it
+# wherever the mood takes him, teammates included. See
+# ../new-class-prompt.txt for the grammar and the fairness rules.
+
+type: thefactor
+desc: Trigger-happy and unpredictable. Same guns, same team, no promises.
+
+[damage]
+minor    | {attacker} clips {target} with a stray SMG burst meant for a Common — {damage} damage.
+minor    | {attacker} "checks the corner" with a full Pistol mag and half of it finds {target} — {damage} damage.
+minor    | {attacker} pistol-whips {target} out of the doorway for {damage} damage.
+minor    | {attacker} racks the Pump Shotgun into {target}'s shoulder "by accident" for {damage} damage.
+minor    | {attacker} lets a Fire Axe swing follow through past the zombie and into {target} for {damage} damage.
+minor    | {attacker} shoves {target} into a shelf clearing their own sightline for {damage} damage.
+minor    | {attacker} clocks {target} with the Frying Pan just to hear the noise it makes — {damage} damage.
+
+medium   | {attacker} puts a burst from the AK-47 through {target}'s cover for {damage} damage.
+medium   | {attacker} puts a slug from the Chrome Shotgun into {target}'s back "for the horde behind them" — {damage} damage.
+medium   | {attacker} clubs {target} with the Cricket Bat mid-sentence for {damage} damage.
+medium   | {attacker} puts a burst from the SMG into {target} and blames them for standing in the crossfire for {damage} damage.
+medium   | {attacker} drives the Fire Axe into {target}'s shoulder and blames the dark for {damage} damage.
+medium   | {attacker} lines {target} up in the Hunting Rifle's scope and doesn't say why — {damage} damage.
+medium   | {attacker} empties the Auto Shotgun into {target} clearing a path that wasn't blocked for {damage} damage.
+
+major    | {attacker} puts a few Magnum rounds into {target}'s chest and reloads without a word — {damage} damage.
+major    | {attacker} catches {target} in the open with the Grenade Launcher for {damage} damage.
+major    | {attacker} drops a Pipe Bomb at {target}'s feet and walks the other way for {damage} damage.
+major    | {attacker} puts a few rounds from the M60 into {target}, clearing a lane through the safe room door for {damage} damage.
+major    | {attacker} catches {target} with one shell from the Auto Shotgun point-blank for {damage} damage.
+major    | {attacker} buries the Machete in {target}'s collarbone and says they walked into it for {damage} damage.
+major    | {attacker} lets the Chainsaw walk across {target} on the way to the Tank for {damage} damage.
+
+critical | {attacker} puts a Military Sniper round through {target} from clear across the map, nowhere near the fight. {damage} CRITICAL damage!
+critical | {attacker} empties the AK-47 into {target} and reloads before anyone can ask why. {damage} CRITICAL damage!
+critical | {attacker} drops {target} with the Grenade Launcher and calls it a Tank round they should've dodged. {damage} CRITICAL damage!
+critical | {attacker} puts {target} down with the Auto Shotgun and steps over them for the Pain Pills. {damage} CRITICAL damage!
+critical | {attacker} catches {target} full in the chest with the Magnum and doesn't reload. {damage} CRITICAL damage!
+critical | {attacker} lets the whole SMG mag go into {target} and shrugs at the muzzle flash. {damage} CRITICAL damage!
+critical | {attacker} buries the Chainsaw in {target} and finishes the cut. {damage} CRITICAL damage!
+
+[dot]
+burn  | molotov splash  | {attacker} drops the Molotov short of the horde and {target} is left standing in the {affliction}.
+burn  | gas can flare   | {attacker} puts a round through the Gas Can by {target} and calls the {affliction} a warning shot they should've heeded.
+burn  | propane flash   | {attacker} shoots the Propane Tank next to {target} and the {affliction} does the rest.
+bleed | buckshot furrow | {attacker} catches {target} at the ragged edge of the shotgun's spread and leaves a {affliction} in the muscle.
+bleed | stray round     | {attacker} puts a {affliction} through {target} while aiming at something else entirely.
+bleed | machete graze   | {attacker} swings the Machete wide, more habit than aim, and leaves a {affliction} down {target}'s arm.
+curse | bile coat       | {attacker} pops a Bile Bomb over {target}'s head; the {affliction} isn't washing off before the horde arrives.
+curse | car alarm       | {attacker} leans {target} against a parked car and leaves a {affliction} nobody can un-hear.
+curse | witch scream    | {attacker} startles the Witch awake facing {target} and leaves a {affliction} she hasn't forgotten.
+
+[heal]
+minor | {attacker} tosses a bottle of Pain Pills at {target}'s feet without breaking stride — {heal} hit points.
+minor | {attacker} kicks a First Aid Kit across the floor toward {target} because it was in the way — {heal} hit points.
+major | {attacker} hits {target} with the Defibrillator, mostly because a body slows everyone down — {heal} hit points.
+
+[death]
+{attacker} puts the last round into {target} and radios that it was "definitely" a zombie.
+{attacker} leaves {target} for the horde and takes point without looking back.
+{attacker} steps over {target} on the way to loot the ammo pile.
+{attacker} shrugs, reloads, and says {target} should have called it.
+
+[decay]
+burn  | The {affliction} {attacker} left keeps eating through {target}'s jacket for {damage} damage.
+burn  | {attacker} is already across the room; the {affliction} keeps burning {target} for {damage} damage.
+bleed | The {affliction} {attacker} opened hasn't closed; {target} loses {damage} damage to it.
+bleed | Nobody's pressing on it, and {attacker}'s {affliction} costs {target} {damage} damage more.
+curse | The horde {attacker}'s {affliction} called hasn't lost {target}'s scent — {damage} damage.
+curse | {attacker} is long gone; the {affliction} keeps drawing more of the horde onto {target} for {damage} damage.
+
+[decay-kill]
+burn  | The {affliction} {attacker} left burns {target} down to nothing.
+bleed | The {affliction} {attacker} opened runs {target} out of blood mid-step.
+curse | {attacker} is already reloading when the {affliction} finishes {target}.
+

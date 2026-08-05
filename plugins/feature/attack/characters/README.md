@@ -150,12 +150,13 @@ not; a heal line names hit points restored, never damage dealt.
 
 ---
 
-## Registry is full — read before adding a file
+## Registry has room — but count before adding a file
 
-There are currently **32 sheets and exactly 32 registry slots**
-(`ATK_CLASSES_MAX`). Adding a 33rd class means **removing one first**, or
-raising `ATK_CLASSES_MAX` in `attack.h` and rebuilding. A sheet beyond
-the cap is a load failure, not a silent no-op.
+There are currently **33 sheets against 40 registry slots**
+(`ATK_CLASSES_MAX`). Seven free slots is not many: once they are gone,
+another class means **removing one first**, or raising
+`ATK_CLASSES_MAX` in `attack.h` and rebuilding. A sheet beyond the cap
+is a load failure, not a silent no-op.
 
 ### Existing classes — do not duplicate a niche
 
@@ -164,37 +165,38 @@ roster (`desc` line of each sheet):
 
 | type | desc |
 |---|---|
-| alchemist | Vials, acids, and volatile tonics. Balanced brews to harm or cure. |
-| astrologer | Retrograde planets and star charts. Predicts moves, aligns chakras. |
-| barista | Caffeine injections and hot steam. Energy boosts and scalding splashes. |
-| berserker | Pure bloodlust and fury. Relentless strikes that bleed the user. |
-| bionic | Slow-motion running and synth SFX. Judo chops and styrofoam boulders. |
-| bureaucrat | Red tape and stamped denials. Stalls the enemy with admin misery. |
-| captain | Torn velour and dramatic pauses. Flying double-fists and monologues. |
+| alchemist | Vials, acids and volatile tonics. Brews to harm or cure. |
+| astrologer | Star charts and retrogrades. Predicts moves, aligns allies. |
+| barista | Caffeine and hot steam. Scalding splashes, fast boosts. |
+| berserker | Pure fury. Relentless strikes that bleed the user. |
+| bionic | Slow-motion and synthesizers. Judo chops, foam boulders. |
+| bureaucrat | Red tape and stamped denials. Administrative misery. |
+| captain | Torn velour and dramatic pauses. Fists and monologues. |
 | cleric | Borrowed authority. Smites, hammers and mends the fallen. |
-| conspiracy | Red string and wild theories. Confuses with collateral mental damage. |
-| dj | Dropping the bass, shifting the vibe. Sonic disruption, regenerative beat. |
-| dotcommer | Unlimited VC, zero plan. A burn rate that destroys the market and self. |
-| flamer | ALL CAPS USENET RANTS. Toxic rhetoric and lingering flame wars. |
-| florist | Thorns and blossoms. Toxic pollen and soothing aromas. |
-| hacker | Zero-days and payloads. Corrupts systems and scrambles target code. |
-| influencer | Viral clout. Heals the team through parasocial validation. |
-| lawyer | Cease and desist. Drains the will to live with billable hours. |
-| mechanic | Heavy wrenches and WD-40. Dismantles armor, patches teammates. |
-| monk | Inner balance and swift strikes. Fists, footwork, serene self-repair. |
-| necromancer | Takes what is owed, sets the dead to collect the rest. |
-| paladin | Shield and sacred oaths. Punishes the wicked, protects the faithful. |
-| phreaker | Blue boxes and 2600Hz. Routes devastating long-distance tolls. |
-| pylon | A humming crystal. Alters dimensional weather, restorative frequencies. |
+| conspiracy | Red string and wild theories. Confuses, damages minds. |
+| dj | Bass and vibe. Sonic disruption, a regenerative beat. |
+| dotcommer | Unlimited funding, no plan. Burns the market and itself. |
+| flamer | All caps Usenet rants. Lingering, inescapable flame wars. |
+| florist | Thorns and blossoms. Toxic pollen, soothing aromas. |
+| hacker | Zero-days and payloads. Corrupts systems, scrambles code. |
+| influencer | Viral clout. Heals through parasocial validation. |
+| lawyer | Cease and desist. Drains the will to live, billably. |
+| mechanic | Heavy wrenches and oil. Dismantles armour, patches allies. |
+| monk | Balance and swift strikes. Fists, footwork, self-repair. |
+| necromancer | Takes what is owed, and sets the dead to collect the rest. |
+| paladin | Shield and sworn oaths. Punishes some, protects others. |
+| phreaker | Blue boxes and whistles. Routes ruinous tolls to the enemy. |
+| pylon | A humming crystal. Alters weather, mends by frequency. |
 | pyromancer | Living kindling. Unstable flames, scorching heat, high risk. |
-| ranger | Wild instinct and long-range focus. Traps, tracking, unerring shots. |
-| redshirt | Expendable security detail. Fires recklessly before being vaporized. |
+| ranger | Wild instinct at range. Traps, tracking, unerring shots. |
+| redshirt | Expendable security detail. Fires first, lasts briefly. |
 | rogue | Quiet, quick and piercing. Daggers, bows, spears, poison. |
 | shaman | Drums, rattles and a heavy staff. Slow harm, some mending. |
-| sleestak | Hissing and slow in a rubber suit. Crossbows and lingering swamp fever. |
-| sysop | God of the BBS. Drops connections, bans users, grants download quotas. |
+| sleestak | Hissing and slow in rubber. Crossbows and swamp fever. |
+| sysop | God of the BBS. Drops carriers, grants quotas to allies. |
+| thefactor | Trigger-happy and unpredictable. Same guns, same team, no promises. |
 | warrior | Brawn and edged steel. Swords, axes, hammers, no mercy. |
-| webmaster | Blinking text and under-construction GIFs. Blinds foes, patches links. |
+| webmaster | Blinking text and garish layouts. Patches broken links. |
 | wizard | Raw energy, delivered directly. Fire, force and frost. |
 
 Anyone adding or removing a sheet updates this table in the **same

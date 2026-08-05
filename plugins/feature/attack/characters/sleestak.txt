@@ -1,0 +1,65 @@
+# sleestak — unhurried, and closer than it was. Mends nothing, and the
+# swamp does most of the work afterwards. See
+# ../new-class-prompt.txt for the grammar and the fairness rules.
+
+type: sleestak
+desc: Hissing and slow in rubber. Crossbows and swamp fever.
+
+[damage]
+minor    | {attacker} hisses once and takes a long step toward {target} — {damage} damage.
+minor    | {attacker} puts a crude bolt into {target}'s thigh for {damage} damage.
+minor    | {attacker} reaches {target} with three fingers and no hurry — {damage} damage.
+minor    | {attacker} blocks the way out while {target} works that out — {damage} damage.
+minor    | {attacker} drags {target} a short distance toward the water — {damage} damage.
+minor    | {attacker} makes the sound, and {target}'s nerve goes first — {damage} damage.
+
+medium   | {attacker} winds the crossbow while {target} watches for {damage} damage.
+medium   | {attacker} takes {target} by the shoulder and does not let go — {damage} damage.
+medium   | {attacker} puts a bolt through {target}'s calf at close range — {damage} damage.
+medium   | {attacker} walks {target} backwards into the shallows for {damage} damage.
+medium   | {attacker} is joined by two more, and {target} counts them — {damage} damage.
+medium   | {attacker} closes the distance {target} was relying on for {damage} damage.
+
+major    | {attacker} pins {target} against the rock face for {damage} damage.
+major    | {attacker} puts a bolt in {target} and leaves it there — {damage} damage.
+major    | {attacker} takes {target} down into the water for {damage} damage.
+major    | {attacker} gets both hands on {target} and does not rush it — {damage} damage.
+major    | {attacker} drags {target} toward the pylons for {damage} damage.
+
+critical | {attacker} arrives at {target}, eventually. {damage} CRITICAL damage!
+critical | {attacker} takes {target} into the dark and comes back alone. {damage} CRITICAL damage!
+critical | {attacker} was between {target} and the way out the whole time. {damage} CRITICAL damage!
+critical | {attacker} closes both hands on {target} and holds. {damage} CRITICAL damage!
+critical | {attacker} hisses, and the swamp takes {target} from there. {damage} CRITICAL damage!
+
+[dot]
+poison | swamp fever     | {attacker} leaves a {affliction} in {target} and wades off.
+poison | slow fever      | {attacker} puts a {affliction} into {target} that takes days.
+poison | green fever     | {attacker} leaves {target} carrying a {affliction} out of the water.
+poison | marsh chill     | {attacker} leaves a {affliction} in {target} that will not lift.
+rot    | clinging mire   | {attacker} works {affliction} into {target}'s wound and leaves it.
+rot    | black silt      | {attacker} packs {affliction} into {target} and lets it sit.
+rot    | wet rot         | {attacker} starts a {affliction} in {target} and wades away.
+rot    | bog stink       | {attacker} leaves {target} carrying a {affliction} nobody will approach.
+bleed  | crude bolt      | {attacker} leaves a {affliction} in {target}, unclean.
+bleed  | barbed bolt     | {attacker} puts a {affliction} into {target} that will not come out.
+bleed  | notched shaft   | {attacker} leaves a {affliction} working in {target}.
+bleed  | splintered head | {attacker} leaves a {affliction} somewhere inside {target}.
+
+[death]
+{attacker} takes {target} down into the water and does not surface.
+{attacker} stands over {target} for a long moment, then hisses.
+{attacker} drags {target} off toward the pylons without hurrying.
+
+[decay]
+poison | The {affliction} {attacker} left rises in {target} — {damage} damage.
+poison | {target} cannot sweat out {attacker}'s {affliction} — {damage} damage.
+rot    | The {affliction} {attacker} left in {target} has gone bad — {damage} damage.
+rot    | {target} carries {attacker}'s {affliction} another mile for {damage} damage.
+bleed  | The {affliction} {attacker} left works deeper into {target} — {damage} damage.
+bleed  | {target} tries to draw {attacker}'s {affliction} out — {damage} damage.
+
+[decay-kill]
+poison | The {affliction} {attacker} left burns through the last of {target}.
+rot    | {target} never gets clean of {attacker}'s {affliction}.
+bleed  | The {affliction} {attacker} left finishes {target} three days out.

@@ -1,0 +1,50 @@
+# sysop — one line, one modem, and absolute authority over both. Mends
+# generously from the console, and leaves nothing lingering. See
+# ../new-class-prompt.txt for the grammar and the fairness rules.
+
+type: sysop
+desc: God of the BBS. Drops carriers, grants quotas to allies.
+
+[damage]
+minor    | {attacker} drops {target}'s carrier mid-sentence for {damage} damage.
+minor    | {attacker} sets {target}'s time limit to four minutes for {damage} damage.
+minor    | {attacker} breaks into chat while {target} is typing for {damage} damage.
+minor    | {attacker} moves {target} down to the slowest node for {damage} damage.
+minor    | {attacker} makes {target} answer the new user questionnaire again — {damage} damage.
+minor    | {attacker} turns {target}'s ratio the wrong way round for {damage} damage.
+
+medium   | {attacker} hangs up on {target} at the end of a long upload — {damage} damage.
+medium   | {attacker} deletes {target}'s post and the two replies agreeing — {damage} damage.
+medium   | {attacker} takes {target}'s access down to level one for {damage} damage.
+medium   | {attacker} reads {target}'s private mail aloud in the general area — {damage} damage.
+medium   | {attacker} locks {target} out of the good file areas for {damage} damage.
+medium   | {attacker} makes {target} watch the ANSI intro at full speed — {damage} damage.
+
+major    | {attacker} zeroes {target}'s credits and the upload that earned them — {damage} damage.
+major    | {attacker} drops {target} at ninety-eight percent for {damage} damage.
+major    | {attacker} removes {target}'s handle from the top ten for {damage} damage.
+major    | {attacker} puts {target} in the twilight zone and leaves them there — {damage} damage.
+major    | {attacker} takes the door games away from {target} entirely — {damage} damage.
+major    | {attacker} turns the modem off with {target} still on it for {damage} damage.
+
+critical | {attacker} takes the line down. {target} gets NO CARRIER. {damage} CRITICAL damage!
+critical | {attacker} deletes {target}'s account and the backup of it. {damage} CRITICAL damage!
+critical | {attacker} pulls the phone cord out. {target} was mid-word. {damage} CRITICAL damage!
+critical | {attacker} decides {target} is a problem user, once, finally. {damage} CRITICAL damage!
+critical | {attacker} runs this board, and {target} does not. {damage} CRITICAL damage!
+critical | {attacker} unplugs the whole system rather than share it with {target}. {damage} CRITICAL damage!
+
+[heal]
+minor | {attacker} gives {target} an extra hour and does not mention it — {heal} hit points.
+minor | {attacker} fixes {target}'s ratio quietly from the console. {heal} hit points.
+minor | {attacker} lets {target} resume the download from where it broke. {heal} hit points.
+minor | {attacker} moves {target} up a level for no stated reason. {heal} hit points.
+major | {attacker} opens the private file area to {target} alone. {heal} hit points.
+major | {attacker} gives {target} unlimited credits and turns the logging off. {heal} hit points.
+major | {attacker} stays up until four talking {target} through it. {heal} hit points.
+major | {attacker} makes {target} co-sysop, which is the whole board. {heal} hit points.
+
+[death]
+{attacker} removes {target} from the user list and rebuilds the index.
+{attacker} logs {target}'s disconnect and does not read it back.
+{attacker} takes the board down for the night with {target} still on it.

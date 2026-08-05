@@ -1,0 +1,52 @@
+# captain — command presence, a torn tunic and both fists. Mends well by
+# talking, and leaves nothing lingering behind it. See
+# ../new-class-prompt.txt for the grammar and the fairness rules.
+
+type: captain
+desc: Torn velour and dramatic pauses. Fists and monologues.
+
+[damage]
+minor    | {attacker} pauses. Then hits {target} for {damage} damage.
+minor    | {attacker} tears the sleeve getting to {target} for {damage} damage.
+minor    | {attacker} shoulder-rolls across the console into {target} — {damage} damage.
+minor    | {attacker} takes {target} by the tunic and does the talking — {damage} damage.
+minor    | {attacker} throws a chair that was bolted down at {target} — {damage} damage.
+minor    | {attacker} points at {target} and holds it for a moment — {damage} damage.
+minor    | {attacker} kicks {target} with both boots and lands badly — {damage} damage.
+
+medium   | {attacker} brings both fists down on {target} together for {damage} damage.
+medium   | {attacker} leaps from something high onto {target} for {damage} damage.
+medium   | {attacker} explains to {target} what is about to happen — {damage} damage.
+medium   | {attacker} rolls {target} over the railing and follows them down — {damage} damage.
+medium   | {attacker} takes a swing from {target} and returns it doubled — {damage} damage.
+medium   | {attacker} puts {target} through the viewscreen for {damage} damage.
+medium   | {attacker} loses the tunic and takes the fight off {target} — {damage} damage.
+
+major    | {attacker} lands the double-fist on {target} from height — {damage} damage.
+major    | {attacker} throws {target} across the bridge into the rail — {damage} damage.
+major    | {attacker} finishes the sentence and then finishes {target} — {damage} damage.
+major    | {attacker} takes {target} apart in front of the whole crew — {damage} damage.
+major    | {attacker} refuses to accept the situation and hits {target} — {damage} damage.
+major    | {attacker} puts {target} down with one improbable manoeuvre — {damage} damage.
+
+critical | {attacker} pauses for a long moment. Then {target} is finished. {damage} CRITICAL damage!
+critical | {attacker} brings both fists down and {target} does not rise. {damage} CRITICAL damage!
+critical | {attacker} does not accept that {target} cannot be beaten. {damage} CRITICAL damage!
+critical | {attacker} throws {target} off the platform without watching. {damage} CRITICAL damage!
+critical | {attacker} gives the order, and is the order. {target} is over. {damage} CRITICAL damage!
+critical | {attacker} beats {target} in a way that will be hard to report. {damage} CRITICAL damage!
+
+[heal]
+minor | {attacker} tells {target} to get up, and it works — {heal} hit points.
+minor | {attacker} puts a hand on {target}'s shoulder and says the name. {heal} hit points.
+minor | {attacker} reminds {target} what they are all doing out here. {heal} hit points.
+minor | {attacker} refuses to leave {target} behind, at some cost. {heal} hit points.
+major | {attacker} talks {target} back from wherever they had gone. {heal} hit points.
+major | {attacker} makes a short speech and {target} decides to live. {heal} hit points.
+major | {attacker} tells {target} the odds and then dismisses them. {heal} hit points.
+major | {attacker} carries {target} out personally and says nothing after. {heal} hit points.
+
+[death]
+{attacker} closes {target}'s eyes and straightens the torn tunic.
+{attacker} looks at {target} for a moment longer than the situation allows.
+{attacker} logs {target}'s death in the record and does not elaborate.

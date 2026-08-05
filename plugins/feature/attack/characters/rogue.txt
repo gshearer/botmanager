@@ -42,7 +42,7 @@ critical | {attacker} waits out {target}'s swing and answers under it, once, upw
 bleed  | opened vein     | {attacker} finds the vein inside {target}'s elbow and unstoppers it — the {affliction} runs on its own from here.
 bleed  | long red line   | {attacker} draws a {affliction} down {target}'s back, too shallow to feel and too long to close.
 bleed  | seeping gash    | {attacker} leaves a {affliction} under {target}'s ribs on the way past.
-bleed  | nicked artery   | {attacker} clips something load-bearing in {target}; the {affliction} pays out in instalments.
+bleed  | nicked artery   | {attacker} clips something load-bearing in {target}; the {affliction} pays out in installments.
 poison | blade venom     | {attacker}'s edge was wet with something, and the {affliction} is already inside {target}.
 poison | numbing draught | {attacker} scratches {target} with a coated pin and lets the {affliction} climb.
 poison | spider venom    | {attacker} leaves one small puncture in {target}; the {affliction} handles the rest.

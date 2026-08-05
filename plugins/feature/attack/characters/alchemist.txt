@@ -1,0 +1,66 @@
+# alchemist — glass, measures and things that react. Mends about as
+# often as it harms, and some of it keeps reacting after. See
+# ../new-class-prompt.txt for the grammar and the fairness rules.
+
+type: alchemist
+desc: Vials, acids and volatile tonics. Brews to harm or cure.
+
+[damage]
+minor    | {attacker} tips a measure onto {target}'s glove and it goes thin — {damage} damage.
+minor    | {attacker} uncorks something near {target} and the eyes water — {damage} damage.
+minor    | {attacker} flicks two drops at {target} and counts them in — {damage} damage.
+minor    | {attacker} lets a vial go at {target}'s feet for {damage} damage.
+minor    | {attacker} hands {target} the wrong bottle and lets them find out — {damage} damage.
+
+medium   | {attacker} puts a working vial into {target}'s breastplate for {damage} damage.
+medium   | {attacker} splashes {target}'s forearm and watches the sleeve go — {damage} damage.
+medium   | {attacker} mixes two on the way across and gives {target} both — {damage} damage.
+medium   | {attacker} sets a reaction going against {target}'s greaves for {damage} damage.
+medium   | {attacker} gets a measure into {target}'s mouth and steps back — {damage} damage.
+
+major    | {attacker} empties the green one down {target}'s collar for {damage} damage.
+major    | {attacker} breaks a flask on {target} and the flask was the safe part — {damage} damage.
+major    | {attacker} etches {target}'s helm down to what it was hiding for {damage} damage.
+major    | {attacker} doses {target} at a measure written down as unwise — {damage} damage.
+major    | {attacker} puts the volatile one where {target} is standing for {damage} damage.
+
+critical | {attacker} corks the bottle. {target} is already reacting. {damage} CRITICAL damage!
+critical | {attacker} gets the ratio right for once, and {target} is it. {damage} CRITICAL damage!
+critical | {attacker} pours all of it into {target} and steps well back. {damage} CRITICAL damage!
+critical | {attacker} labels the vial afterwards, using {target} as the note. {damage} CRITICAL damage!
+critical | {attacker} lets the reaction finish {target} and writes it down. {damage} CRITICAL damage!
+
+[dot]
+burn   | green acid     | {attacker} leaves a {affliction} working on {target} and moves off.
+burn   | black vitriol  | {attacker} puts a {affliction} into {target} and lets it go down.
+burn   | eating draught | {attacker} gets the {affliction} into {target} and corks the bottle.
+poison | bad reaction   | {attacker} starts a {affliction} in {target} and notes the time.
+poison | curdled tonic  | {attacker} leaves a {affliction} in {target} to do the rest.
+poison | wrong dose     | {attacker} gives {target} a {affliction} and does not correct it.
+
+[heal]
+minor | {attacker} gets a measure of the blue one into {target} — {heal} hit points.
+minor | {attacker} pours something bitter into {target} and holds the jaw shut. {heal} hit points.
+minor | {attacker} paints {target}'s wound with a tincture and it closes over. {heal} hit points.
+major | {attacker} mixes the good one over {target} and gets the ratio right. {heal} hit points.
+major | {attacker} puts {target} back together out of three bottles and a cloth. {heal} hit points.
+major | {attacker} doses {target} properly for once and the colour comes back. {heal} hit points.
+
+[death]
+{attacker} stoppers what is left and steps around {target}.
+{attacker} writes the measure down beside {target}'s name.
+{attacker} lets {target} finish reacting before touching anything.
+
+[decay]
+burn   | The {affliction} {attacker} left is still eating into {target} — {damage} damage.
+burn   | {target} cannot wash {attacker}'s {affliction} off; it takes {damage} damage.
+burn   | The {affliction} {attacker} started works {damage} damage further into {target}.
+poison | The {affliction} {attacker} began turns over in {target} for {damage} damage.
+poison | {target} brings up some of {attacker}'s {affliction} and loses {damage} damage.
+poison | The {affliction} {attacker} left in {target} has not finished — {damage} damage.
+
+[decay-kill]
+burn   | The {affliction} {attacker} left gets all the way through {target}.
+burn   | There is not enough of {target} left for {attacker}'s {affliction} to work on.
+poison | The {affliction} {attacker} measured out finishes {target} on schedule.
+poison | {target} stops, and {attacker}'s {affliction} stops with them.

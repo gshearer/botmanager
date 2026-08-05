@@ -1,0 +1,44 @@
+# influencer — the audience does the work, in both directions. Mends
+# more than almost anything, and leaves nothing lingering. See
+# ../new-class-prompt.txt for the grammar and the fairness rules.
+
+type: influencer
+desc: Viral clout. Heals through parasocial validation.
+
+[damage]
+minor    | {attacker} holds the phone at the angle that does {target} no favours — {damage} damage.
+minor    | {attacker} films four seconds of {target} and moves on for {damage} damage.
+minor    | {attacker} tags {target} in it — {damage} damage.
+
+medium   | {attacker} zooms in on {target} and lets the audience finish it — {damage} damage.
+medium   | {attacker} pins {target}'s worst four seconds to the top for {damage} damage.
+medium   | {attacker} thanks {target} for their honesty, publicly, for {damage} damage.
+
+major    | {attacker} goes live from inside {target}'s guard for {damage} damage.
+major    | {attacker} puts the receipts up beside {target}'s reply for {damage} damage.
+major    | {attacker} makes {target} the whole story by evening for {damage} damage.
+
+critical | {attacker} explains what {target} did, at length, to nine hundred thousand. {damage} CRITICAL damage!
+critical | {attacker} crops {target} out of the frame and out of the afternoon. {damage} CRITICAL damage!
+critical | {attacker} says nothing about {target}, loudly, for a week. {damage} CRITICAL damage!
+
+[heal]
+minor | {attacker} tells {target} they were right, and means enough of it — {heal} hit points.
+minor | {attacker} puts {target} in the story as the one who was brave. {heal} hit points.
+minor | {attacker} replies to {target} first, before any of the others. {heal} hit points.
+minor | {attacker} says {target}'s name to the camera and the room warms. {heal} hit points.
+minor | {attacker} shares what {target} made and does not take the credit. {heal} hit points.
+minor | {attacker} tells {target} to sit down and drink some water. {heal} hit points.
+minor | {attacker} stays on the call with {target} until it is not needed. {heal} hit points.
+major | {attacker} puts {target} on the main feed and the colour comes back. {heal} hit points.
+major | {attacker} tells nine hundred thousand people that {target} is fine. {heal} hit points.
+major | {attacker} defends {target} at some personal cost. {heal} hit points.
+major | {attacker} sits with {target} with the camera off entirely. {heal} hit points.
+major | {attacker} makes the whole internet decide {target} is going to make it. {heal} hit points.
+major | {attacker} takes the post down because {target} asked. {heal} hit points.
+major | {attacker} tells {target} the truth for once, and it helps. {heal} hit points.
+
+[death]
+{attacker} archives {target}.
+{attacker} stops filming {target}. Nobody else was.
+{attacker} posts something else, and {target} is gone by morning.

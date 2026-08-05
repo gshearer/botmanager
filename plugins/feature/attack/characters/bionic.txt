@@ -1,0 +1,68 @@
+# bionic — rebuilt, expensive, and arriving slower than it looks. Mends
+# barely, and leaves a little something in the servos. See
+# ../new-class-prompt.txt for the grammar and the fairness rules.
+
+type: bionic
+desc: Slow-motion and synthesizers. Judo chops, foam boulders.
+
+[damage]
+minor    | {attacker} chops {target} across the collarbone, once — {damage} damage.
+minor    | {attacker} arrives at {target} slower than seems useful — {damage} damage.
+minor    | {attacker} lifts something enormous and light onto {target} — {damage} damage.
+minor    | {attacker} takes {target}'s wrist in the good hand for {damage} damage.
+minor    | {attacker} steps over a fence and lands beside {target} — {damage} damage.
+minor    | {attacker} throws {target} a distance that does not suit the effort — {damage} damage.
+minor    | {attacker} runs at {target} for some time before arriving — {damage} damage.
+minor    | {attacker} bends {target}'s weapon out of true for {damage} damage.
+minor    | {attacker} sets {target} down somewhere not of their choosing — {damage} damage.
+
+medium   | {attacker} throws a boulder that takes {target} off their feet — {damage} damage.
+medium   | {attacker} chops through {target}'s guard into the shoulder — {damage} damage.
+medium   | {attacker} picks {target} up one-handed and turns around — {damage} damage.
+medium   | {attacker} puts {target} through a wall of no great thickness — {damage} damage.
+medium   | {attacker} takes hold of {target}'s arm and closes the hand — {damage} damage.
+medium   | {attacker} lands on {target} from a height, deliberately — {damage} damage.
+medium   | {attacker} throws {target} over a car and into the next one — {damage} damage.
+medium   | {attacker} carries {target} at running speed into a fence — {damage} damage.
+medium   | {attacker} tears the door off and puts it into {target} — {damage} damage.
+
+major    | {attacker} judo chops {target}'s forearm and it goes the wrong way — {damage} damage.
+major    | {attacker} throws {target} the length of the lot for {damage} damage.
+major    | {attacker} brings the good arm down through {target}'s guard — {damage} damage.
+major    | {attacker} lifts the front of the truck onto {target} for {damage} damage.
+major    | {attacker} takes {target}'s knee out with a single motion — {damage} damage.
+major    | {attacker} throws {target} at something structural for {damage} damage.
+major    | {attacker} closes the hand until {target} stops using the arm — {damage} damage.
+major    | {attacker} runs {target} down at a pace nobody could evade — {damage} damage.
+
+critical | {attacker} chops once, slowly, and {target} folds. {damage} CRITICAL damage!
+critical | {attacker} throws {target} out of the shot entirely. {damage} CRITICAL damage!
+critical | {attacker} puts {target} through the boulder and the wall behind. {damage} CRITICAL damage!
+critical | {attacker} arrives, eventually, and {target} is what happens then. {damage} CRITICAL damage!
+critical | {attacker} lifts {target} overhead and does not lower them. {damage} CRITICAL damage!
+critical | {attacker} takes {target} apart at a very reasonable speed. {damage} CRITICAL damage!
+critical | {attacker} closes the good hand on {target} and keeps closing. {damage} CRITICAL damage!
+critical | {attacker} was rebuilt for exactly this. {target} was not. {damage} CRITICAL damage!
+
+[dot]
+shock | torn servo  | {attacker} leaves {target} a {affliction} where the arm used to answer.
+shock | slow strain | {attacker} puts a {affliction} into {target} that keeps pulling.
+
+[heal]
+minor | {attacker} resets {target}'s shoulder with more force than needed — {heal} hit points.
+major | {attacker} carries {target} out at a steady, unhurried run. {heal} hit points.
+
+[death]
+{attacker} sets {target} down and does not check for a pulse.
+{attacker} steps over {target} at the same speed as everything else.
+{attacker} lifts what is left of {target} and moves it aside.
+{attacker} walks away from {target} without appearing to accelerate.
+
+[decay]
+shock | The {affliction} {attacker} left in {target} pulls again — {damage} damage.
+shock | {target} tries the arm and {attacker}'s {affliction} takes {damage} damage.
+shock | The {affliction} {attacker} left costs {target} another {damage} damage.
+
+[decay-kill]
+shock | The {affliction} {attacker} left gives out, and {target} with it.
+shock | {target} does not come back from {attacker}'s {affliction}.

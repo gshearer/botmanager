@@ -1,0 +1,64 @@
+# phreaker — the network belongs to whoever whistles correctly. Mends
+# nothing, and the charges keep arriving long afterwards. See
+# ../new-class-prompt.txt for the grammar and the fairness rules.
+
+type: phreaker
+desc: Blue boxes and whistles. Routes ruinous tolls to the enemy.
+
+[damage]
+minor    | {attacker} whistles the tone and {target}'s line goes elsewhere — {damage} damage.
+minor    | {attacker} bills a short call to {target} and hangs up for {damage} damage.
+minor    | {attacker} rings {target} from their own number for {damage} damage.
+minor    | {attacker} puts {target} on hold with the network for {damage} damage.
+minor    | {attacker} routes {target}'s call through four countries for {damage} damage.
+minor    | {attacker} listens to {target}'s line for a while and says nothing — {damage} damage.
+minor    | {attacker} reverses the charges onto {target} for {damage} damage.
+
+medium   | {attacker} seizes the trunk out from under {target} for {damage} damage.
+medium   | {attacker} bridges {target} into a call they are not part of — {damage} damage.
+medium   | {attacker} runs a long distance call through {target} all night — {damage} damage.
+medium   | {attacker} takes {target}'s exchange and does not give it back — {damage} damage.
+medium   | {attacker} makes {target}'s phone ring at four every morning — {damage} damage.
+medium   | {attacker} bills the whole afternoon to {target}'s account for {damage} damage.
+medium   | {attacker} puts a tone down {target}'s line at volume for {damage} damage.
+
+major    | {attacker} routes an entire switch through {target} for {damage} damage.
+major    | {attacker} leaves {target} paying for a call to somewhere expensive — {damage} damage.
+major    | {attacker} takes {target}'s number off the network entirely for {damage} damage.
+major    | {attacker} bills a month of somebody else's calls to {target} — {damage} damage.
+major    | {attacker} opens {target}'s line to everyone at once for {damage} damage.
+major    | {attacker} makes the network believe {target} is somewhere else — {damage} damage.
+
+critical | {attacker} whistles once, at the right pitch. {target} is cut off. {damage} CRITICAL damage!
+critical | {attacker} routes the whole country through {target}'s account. {damage} CRITICAL damage!
+critical | {attacker} takes {target}'s line and does not put it back. {damage} CRITICAL damage!
+critical | {attacker} bills {target} for every call made this year. {damage} CRITICAL damage!
+critical | {attacker} owns the switch. {target} was only ever renting. {damage} CRITICAL damage!
+critical | {attacker} hangs up on {target} from the exchange itself. {damage} CRITICAL damage!
+
+[dot]
+drain | long distance   | {attacker} opens a {affliction} on {target}'s account and leaves.
+drain | reversed charge | {attacker} puts a {affliction} onto {target} and hangs up.
+drain | running toll    | {attacker} starts a {affliction} against {target} and lets it run.
+shock | crossed line    | {attacker} leaves {target} on a {affliction} nobody can clear.
+shock | held trunk      | {attacker} leaves a {affliction} open into {target} and walks off.
+shock | dead line       | {attacker} leaves {target} holding a {affliction}.
+
+[death]
+{attacker} hangs up on {target} and the line stays down.
+{attacker} takes {target}'s number out of the exchange for good.
+{attacker} lets the tone run on after {target} has stopped.
+
+[decay]
+drain | The {affliction} {attacker} opened on {target} is still running — {damage} damage.
+drain | {target} gets another month of {attacker}'s {affliction} — {damage} damage.
+drain | The {affliction} {attacker} started costs {target} {damage} damage more.
+shock | The {affliction} {attacker} left has not cleared for {target} — {damage} damage.
+shock | {target} picks up {attacker}'s {affliction} again for {damage} damage.
+shock | The {affliction} {attacker} left takes {damage} damage off {target} overnight.
+
+[decay-kill]
+drain | The {affliction} {attacker} opened outlasts {target} entirely.
+drain | {target} cannot pay off {attacker}'s {affliction}, and stops trying.
+shock | {target} is still on {attacker}'s {affliction} when it ends.
+shock | The {affliction} {attacker} left goes quiet, and so does {target}.

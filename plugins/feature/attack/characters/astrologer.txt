@@ -1,0 +1,61 @@
+# astrologer — timing, mostly, and the confidence to name it. Mends
+# about as much as it costs, and what it foretells arrives late. See
+# ../new-class-prompt.txt for the grammar and the fairness rules.
+
+type: astrologer
+desc: Star charts and retrogrades. Predicts moves, aligns allies.
+
+[damage]
+minor    | {attacker} tells {target} which way they were going to move — {damage} damage.
+minor    | {attacker} reads {target}'s chart and does not soften it — {damage} damage.
+minor    | {attacker} names the hour and {target} arrives in it for {damage} damage.
+minor    | {attacker} is already standing where {target} intended to be — {damage} damage.
+minor    | {attacker} mentions what {target} was born under for {damage} damage.
+minor    | {attacker} corrects {target}'s birth time by nine minutes — {damage} damage.
+
+medium   | {attacker} waits out {target}'s bad hour and takes it for {damage} damage.
+medium   | {attacker} answers {target}'s swing before it is committed to — {damage} damage.
+medium   | {attacker} tells {target} how this ends and starts it for {damage} damage.
+medium   | {attacker} moves at the exact wrong moment for {target} for {damage} damage.
+medium   | {attacker} charts {target} out to the third house and strikes there — {damage} damage.
+medium   | {attacker} has been expecting {target} since the spring for {damage} damage.
+
+major    | {attacker} puts {target} exactly where the chart said they would be — {damage} damage.
+major    | {attacker} reads the transit aloud and {target} lives through it — {damage} damage.
+major    | {attacker} knew about {target}'s guard a season ago for {damage} damage.
+major    | {attacker} takes {target} on the cusp and does not wait for {damage} damage.
+major    | {attacker} tells {target} the date, and it is not far off — {damage} damage.
+
+critical | {attacker} said this would happen. {target} is what happens. {damage} CRITICAL damage!
+critical | {attacker} closes the chart on {target} without checking it. {damage} CRITICAL damage!
+critical | {attacker} was never guessing about {target}. {damage} CRITICAL damage!
+critical | {attacker} names the hour for {target}, and the hour agrees. {damage} CRITICAL damage!
+critical | {attacker} lets the alignment finish and {target} with it. {damage} CRITICAL damage!
+
+[dot]
+curse | bad transit  | {attacker} tells {target} about a {affliction} that has already begun.
+curse | retrograde   | {attacker} leaves {target} inside a {affliction} with no exit date.
+curse | fixed omen   | {attacker} sets a {affliction} over {target} and does not lift it.
+curse | long shadow  | {attacker} casts a {affliction} across {target}'s next few weeks.
+curse | crossed star | {attacker} finds a {affliction} in {target}'s chart and points at it.
+
+[heal]
+minor | {attacker} tells {target} the worst of it is behind them — {heal} hit points.
+minor | {attacker} finds something good in {target}'s chart and reads it out. {heal} hit points.
+minor | {attacker} tells {target} to wait until Thursday, and Thursday helps. {heal} hit points.
+major | {attacker} realigns {target} to something that was always going to hold. {heal} hit points.
+major | {attacker} sits with {target}'s chart until it says something kinder. {heal} hit points.
+
+[death]
+{attacker} notes the hour and closes {target}'s chart.
+{attacker} is not surprised by {target}, and does not pretend to be.
+{attacker} draws the last line on {target}'s chart and puts the pen down.
+
+[decay]
+curse | The {affliction} {attacker} named over {target} arrives — {damage} damage.
+curse | {target} is still inside {attacker}'s {affliction} for {damage} damage.
+curse | The {affliction} {attacker} charted runs {damage} damage further into {target}.
+
+[decay-kill]
+curse | The {affliction} {attacker} named for {target} comes due exactly.
+curse | {target} reaches the end of {attacker}'s {affliction}, on time.

@@ -1,0 +1,65 @@
+# conspiracy — string, pins and a working theory. Mends nothing, and
+# what it puts in a head does not come back out. See
+# ../new-class-prompt.txt for the grammar and the fairness rules.
+
+type: conspiracy
+desc: Red string and wild theories. Confuses, damages minds.
+
+[damage]
+minor    | {attacker} asks {target} a question with no good answer for {damage} damage.
+minor    | {attacker} points at the ceiling and {target} looks up — {damage} damage.
+minor    | {attacker} says the date of {target}'s birthday back to them — {damage} damage.
+minor    | {attacker} mentions the birds to {target}, briefly — {damage} damage.
+minor    | {attacker} tells {target} what the road signs are numbered for — {damage} damage.
+minor    | {attacker} has a photograph of {target}'s house for {damage} damage.
+minor    | {attacker} counts something out loud near {target} for {damage} damage.
+
+medium   | {attacker} shows {target} the corkboard and gives them a minute — {damage} damage.
+medium   | {attacker} explains what {target}'s employer actually does for {damage} damage.
+medium   | {attacker} runs the string from {target} to something worse — {damage} damage.
+medium   | {attacker} tells {target} who else has been asking about them — {damage} damage.
+medium   | {attacker} makes {target} check their own attic later for {damage} damage.
+medium   | {attacker} was right about one thing, and {target} noticed — {damage} damage.
+
+major    | {attacker} pins {target}'s name at the centre of the board for {damage} damage.
+major    | {attacker} tells {target} what the humming has been for {damage} damage.
+major    | {attacker} shows {target} the part they were already worried about — {damage} damage.
+major    | {attacker} gives {target} a theory that fits everything for {damage} damage.
+major    | {attacker} explains {target} back to the room and it lands — {damage} damage.
+major    | {attacker} has been keeping notes on {target} since before this — {damage} damage.
+
+critical | {attacker} connects the last two pins. {target} sees it too. {damage} CRITICAL damage!
+critical | {attacker} tells {target} the one thing that cannot be unheard. {damage} CRITICAL damage!
+critical | {attacker} was right about all of it. {target} works that out. {damage} CRITICAL damage!
+critical | {attacker} hands {target} the folder with their own name on it. {damage} CRITICAL damage!
+critical | {attacker} asks {target} who they think they have been working for. {damage} CRITICAL damage!
+critical | {attacker} says nothing more, and {target} fills in the rest. {damage} CRITICAL damage!
+
+[dot]
+curse | small doubt    | {attacker} leaves a {affliction} in {target} and lets it sit.
+curse | creeping doubt | {attacker} starts a {affliction} in {target} and says no more.
+curse | bad feeling    | {attacker} gives {target} a {affliction} with nowhere to put it.
+drain | red thread     | {attacker} runs a {affliction} from {target} to something else.
+drain | loose thread   | {attacker} leaves {target} a {affliction} they will have to pull.
+drain | long thread    | {attacker} ties a {affliction} to {target} and lets out slack.
+shock | grey static    | {attacker} leaves {affliction} in the back of {target}'s hearing.
+shock | background hum | {attacker} puts a {affliction} under everything {target} does.
+shock | ringing ear    | {attacker} leaves {target} with a {affliction} and no source.
+
+[death]
+{attacker} takes {target}'s photograph down and files it under closed.
+{attacker} was right, and {target} is no longer available to confirm it.
+{attacker} cuts the string running to {target} and coils it up.
+
+[decay]
+curse | The {affliction} {attacker} left in {target} has spread — {damage} damage.
+curse | {target} checks again, and {attacker}'s {affliction} takes {damage} damage.
+drain | {target} pulls {attacker}'s {affliction} and it keeps coming — {damage} damage.
+drain | The {affliction} {attacker} ran from {target} goes taut — {damage} damage.
+shock | The {affliction} {attacker} left has not stopped in {target} — {damage} damage.
+shock | {target} cannot place {attacker}'s {affliction}; it takes {damage} damage.
+
+[decay-kill]
+curse | The {affliction} {attacker} left gets all the way through {target}.
+drain | {target} follows {attacker}'s {affliction} to the end of it.
+shock | {target} stops trying to hear past {attacker}'s {affliction}.

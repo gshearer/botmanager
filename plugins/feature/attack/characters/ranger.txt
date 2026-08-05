@@ -1,0 +1,60 @@
+# ranger — distance, patience and prepared ground. Mends barely at all,
+# and leaves things behind that keep working. See
+# ../new-class-prompt.txt for the grammar and the fairness rules.
+
+type: ranger
+desc: Wild instinct at range. Traps, tracking, unerring shots.
+
+[damage]
+minor    | {attacker} puts an arrow through the meat of {target}'s arm for {damage} damage.
+minor    | {attacker} clips {target}'s ear at ninety paces without standing up — {damage} damage.
+minor    | {attacker} nicks {target}'s bowstring hand and the draw goes wrong — {damage} damage.
+minor    | {attacker} lets {target} walk onto ground that was prepared yesterday — {damage} damage.
+minor    | {attacker} whistles once and {target} turns the wrong way for {damage} damage.
+minor    | {attacker} shoots the branch above {target} and lets it come down — {damage} damage.
+minor    | {attacker} reads {target}'s footing and takes the ankle out for {damage} damage.
+
+medium   | {attacker} puts a shaft through {target}'s thigh from cover for {damage} damage.
+medium   | {attacker} drives {target} back onto the wire and lets it close — {damage} damage.
+medium   | {attacker} shoots {target}'s shoulder out of the draw for {damage} damage.
+medium   | {attacker} has been tracking {target} since morning and stops now — {damage} damage.
+medium   | {attacker} puts two shafts a hand apart in {target}'s flank for {damage} damage.
+medium   | {attacker} takes {target}'s knee from a place nobody was watching — {damage} damage.
+medium   | {attacker} waits out {target}'s cover and collects on it for {damage} damage.
+
+major    | {attacker} puts an arrow through {target}'s shoulder to the fletching — {damage} damage.
+major    | {attacker} springs the jaws under {target} and lets them shut — {damage} damage.
+major    | {attacker} shoots {target} through the gap in the treeline for {damage} damage.
+major    | {attacker} pins {target}'s foot to the ground and takes the time — {damage} damage.
+major    | {attacker} opens {target}'s ribs with a broadhead at forty paces — {damage} damage.
+major    | {attacker} puts a shaft where {target} was going to be for {damage} damage.
+
+critical | {attacker} looses once. {target} is already finished. {damage} CRITICAL damage!
+critical | {attacker} puts the arrow through {target}'s throat from the ridge. {damage} CRITICAL damage!
+critical | {attacker} set this ground three days ago. {target} finds it. {damage} CRITICAL damage!
+critical | {attacker} takes {target} at a range nobody thought was a range. {damage} CRITICAL damage!
+critical | {attacker} does not hurry the shot, and {target} runs out of time. {damage} CRITICAL damage!
+critical | {attacker} lowers the bow before {target} is done falling. {damage} CRITICAL damage!
+
+[dot]
+bleed | wire snare  | {attacker} leaves a {affliction} closed on {target} and moves upwind.
+bleed | barbed trap | {attacker} sets a {affliction} in {target} that pulls the wrong way.
+bleed | sprung jaw  | {attacker} lets a {affliction} take {target} by the calf and stay.
+
+[heal]
+minor | {attacker} packs {target}'s wound with moss and binds it tight — {heal} hit points.
+major | {attacker} sets {target}'s leg against a shaft and walks them out. {heal} hit points.
+
+[death]
+{attacker} steps out of the treeline to confirm {target}, then back into it.
+{attacker} takes the arrow back out of {target} and cleans it.
+{attacker} waits until {target} stops, then goes to collect the rest.
+
+[decay]
+bleed | The {affliction} {attacker} left has not let go of {target} — {damage} damage.
+bleed | {target} works at {attacker}'s {affliction} and opens it for {damage} damage.
+bleed | {attacker} is a ridge away; the {affliction} takes {damage} damage off {target}.
+
+[decay-kill]
+bleed | The {affliction} {attacker} set finishes {target} on the trail out.
+bleed | {target} does not get clear of {attacker}'s {affliction} in time.

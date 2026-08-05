@@ -1,0 +1,52 @@
+# mechanic — leverage, penetrating oil and the right size spanner. Mends
+# what it likes, and leaves nothing running afterwards. See
+# ../new-class-prompt.txt for the grammar and the fairness rules.
+
+type: mechanic
+desc: Heavy wrenches and oil. Dismantles armour, patches allies.
+
+[damage]
+minor    | {attacker} takes one bolt out of {target}'s pauldron and pockets it — {damage} damage.
+minor    | {attacker} raps {target}'s gauntlet with the spanner and listens — {damage} damage.
+minor    | {attacker} oils {target}'s hinge until it will not hold shut — {damage} damage.
+minor    | {attacker} finds the loose plate on {target} and makes it looser — {damage} damage.
+minor    | {attacker} taps {target}'s helm twice and does not like the sound — {damage} damage.
+minor    | {attacker} wipes both hands on a rag and swings at {target} for {damage} damage.
+minor    | {attacker} shortens {target}'s strap by a hole and a half — {damage} damage.
+
+medium   | {attacker} works {target}'s breastplate loose one bolt at a time — {damage} damage.
+medium   | {attacker} puts the spanner through {target}'s guard into the ribs — {damage} damage.
+medium   | {attacker} levers {target}'s vambrace off and the arm goes with it — {damage} damage.
+medium   | {attacker} strips the thread on {target}'s shoulder joint for {damage} damage.
+medium   | {attacker} cracks {target}'s knee cop and keeps the piece — {damage} damage.
+medium   | {attacker} drops something heavy on {target}'s foot deliberately — {damage} damage.
+medium   | {attacker} takes {target}'s helm off with the head still in it — {damage} damage.
+
+major    | {attacker} dismantles {target}'s harness down to what it was over — {damage} damage.
+major    | {attacker} swings the wrench into {target}'s hip and hears it go — {damage} damage.
+major    | {attacker} braces a foot on {target} and pulls until something comes — {damage} damage.
+major    | {attacker} torques {target}'s arm past the figure on the plate — {damage} damage.
+major    | {attacker} opens {target} up like a seized housing for {damage} damage.
+major    | {attacker} finds the weld on {target} and puts the hammer to it — {damage} damage.
+major    | {attacker} removes the part of {target} that was doing the work — {damage} damage.
+
+critical | {attacker} takes the last bolt out. {target} comes apart. {damage} CRITICAL damage!
+critical | {attacker} brings the wrench down through {target}'s helm. {damage} CRITICAL damage!
+critical | {attacker} strips {target} to the frame and stops there. {damage} CRITICAL damage!
+critical | {attacker} works out what {target} was for and removes it. {damage} CRITICAL damage!
+critical | {attacker} wipes {target} off the spanner mid-swing. {damage} CRITICAL damage!
+critical | {attacker} does not repair {target}. {damage} CRITICAL damage!
+critical | {attacker} lays {target}'s parts out in the order they came off. {damage} CRITICAL damage!
+
+[heal]
+minor | {attacker} tightens everything on {target} that had gone slack — {heal} hit points.
+minor | {attacker} beats {target}'s breastplate back into roughly the old shape. {heal} hit points.
+minor | {attacker} oils {target}'s joints until they stop arguing. {heal} hit points.
+major | {attacker} strips {target} down, fixes the actual problem, and rebuilds. {heal} hit points.
+major | {attacker} welds {target}'s harness shut around the wound. {heal} hit points.
+major | {attacker} puts {target} back together properly and charges nothing. {heal} hit points.
+
+[death]
+{attacker} wipes {target} off the wrench and puts it back in the roll.
+{attacker} looks at what is left of {target} and writes it off.
+{attacker} does not think {target} is worth the parts.

@@ -1,0 +1,85 @@
+# dotcommer — other people's money, spent at speed. Mends nothing, and
+# the wreckage keeps compounding for quarters afterwards. See
+# ../new-class-prompt.txt for the grammar and the fairness rules.
+
+type: dotcommer
+desc: Unlimited funding, no plan. Burns the market and itself.
+
+[damage]
+minor    | {attacker} offers {target} equity, which is accepted — {damage} damage.
+minor    | {attacker} undercuts {target} below cost and holds it there — {damage} damage.
+minor    | {attacker} hires {target}'s second best person for {damage} damage.
+minor    | {attacker} announces something {target} has not built yet — {damage} damage.
+minor    | {attacker} gives it away free until {target} notices for {damage} damage.
+minor    | {attacker} explains the pivot to {target} at length for {damage} damage.
+minor    | {attacker} puts {target}'s market on a slide as addressable — {damage} damage.
+minor    | {attacker} spends a year of {target}'s revenue on a party — {damage} damage.
+minor    | {attacker} raises again, on nothing, in front of {target} — {damage} damage.
+
+medium   | {attacker} buys the market out from under {target} for {damage} damage.
+medium   | {attacker} burns eleven million and {target} stands in the heat — {damage} damage.
+medium   | {attacker} hires everyone {target} was about to for {damage} damage.
+medium   | {attacker} sets the price at zero and dares {target} to follow — {damage} damage.
+medium   | {attacker} takes {target}'s entire quarter with a press release — {damage} damage.
+medium   | {attacker} outlasts {target} by never needing to be profitable — {damage} damage.
+medium   | {attacker} outspends {target} into somewhere quieter for {damage} damage.
+medium   | {attacker} makes {target} explain themselves to a board for {damage} damage.
+medium   | {attacker} moves fast enough to break {target} for {damage} damage.
+
+major    | {attacker} acquires {target} and shuts them down within the hour — {damage} damage.
+major    | {attacker} takes {target}'s whole category down as collateral — {damage} damage.
+major    | {attacker} promises {target} equity that arrives, worthless and heavy — {damage} damage.
+major    | {attacker} burns eighteen months of runway across {target} for {damage} damage.
+major    | {attacker} leaves {target} nothing standing but the foosball table — {damage} damage.
+major    | {attacker} disrupts {target}, which is the same thing with a slide — {damage} damage.
+major    | {attacker} spends whatever it takes, and it takes {target} — {damage} damage.
+major    | {attacker} scales into {target} until there is nothing left — {damage} damage.
+major    | {attacker} raises a round specifically to end {target} for {damage} damage.
+
+critical | {attacker} burns the whole runway. {target} is standing in it. {damage} CRITICAL damage!
+critical | {attacker} takes the market down and {target} with it. {damage} CRITICAL damage!
+critical | {attacker} goes under, from this height, directly onto {target}. {damage} CRITICAL damage!
+critical | {attacker} has no business plan and no further need of {target}. {damage} CRITICAL damage!
+critical | {attacker} exits, and {target} does not. {damage} CRITICAL damage!
+critical | {attacker} spends everything, the founders included, on {target}. {damage} CRITICAL damage!
+critical | {attacker} was never going to work. {target} learns this first. {damage} CRITICAL damage!
+critical | {attacker} wins {target}'s category and dissolves it the same day. {damage} CRITICAL damage!
+
+[dot]
+burn  | burn rate      | {attacker} sets a {affliction} against {target} and lets it run.
+burn  | cash burn      | {attacker} opens a {affliction} on {target} with no floor.
+burn  | runway fire    | {attacker} leaves a {affliction} going under {target}.
+burn  | quarterly loss | {attacker} books a {affliction} against {target} and moves on.
+drain | customer churn | {attacker} starts a {affliction} inside {target} and waits.
+drain | silent churn   | {attacker} opens a {affliction} in {target} nobody is measuring.
+drain | user exodus    | {attacker} begins the {affliction} out of {target}.
+drain | attrition      | {attacker} leaves {affliction} working quietly through {target}.
+curse | technical debt | {attacker} leaves {target} holding a {affliction}.
+curse | bridge loan    | {attacker} arranges a {affliction} for {target} on bad terms.
+curse | cap table      | {attacker} writes {target} into a {affliction} they cannot exit.
+curse | down round     | {attacker} sets up a {affliction} that {target} must take.
+rot   | press cycle    | {attacker} starts a {affliction} that runs over {target}.
+rot   | hockey stick   | {attacker} draws a {affliction} that {target} has to answer for.
+rot   | growth story   | {attacker} tells a {affliction} with {target} in the wrong part.
+
+[death]
+{attacker} writes {target} off and mentions it on the next earnings call.
+{attacker} takes what was left of {target} for the talent and bins the rest.
+{attacker} does not attend the wind-down, and neither does {target}.
+{attacker} moves on to the next thing before {target} has stopped moving.
+
+[decay]
+burn  | The {affliction} {attacker} started is still running through {target} — {damage} damage.
+burn  | {target} cannot slow {attacker}'s {affliction}; it takes {damage} damage.
+drain | The {affliction} {attacker} began inside {target} widens — {damage} damage.
+drain | Nobody at {target} can name {attacker}'s {affliction} — {damage} damage.
+curse | The {affliction} {attacker} arranged comes back on {target} — {damage} damage.
+curse | {target} services {attacker}'s {affliction} for another {damage} damage.
+rot   | The {affliction} {attacker} started has stopped being about {target} — {damage} damage.
+rot   | The {affliction} {attacker} started reaches {target} from elsewhere — {damage} damage.
+
+[decay-kill]
+burn  | The {affliction} {attacker} lit gets to the end of {target}.
+drain | There is nobody left inside {target} for {attacker}'s {affliction} to take.
+curse | {target} cannot service {attacker}'s {affliction} any longer.
+rot   | The {affliction} outlives {attacker}, the market, and {target}.

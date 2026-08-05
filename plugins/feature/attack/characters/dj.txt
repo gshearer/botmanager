@@ -1,0 +1,68 @@
+# dj — the room is the instrument and everyone in it is downstream.
+# Mends a little on the beat, and leaves the room ringing. See
+# ../new-class-prompt.txt for the grammar and the fairness rules.
+
+type: dj
+desc: Bass and vibe. Sonic disruption, a regenerative beat.
+
+[damage]
+minor    | {attacker} nudges the low end up and {target}'s chest notices — {damage} damage.
+minor    | {attacker} cuts everything for one bar and leaves {target} in it — {damage} damage.
+minor    | {attacker} finds the frequency {target}'s fillings answer to — {damage} damage.
+minor    | {attacker} rides the filter across {target} and back for {damage} damage.
+minor    | {attacker} lets one thing feed back near {target} for {damage} damage.
+minor    | {attacker} changes the tempo under {target} mid-step for {damage} damage.
+
+medium   | {attacker} drops it, and {target} finds the floor for {damage} damage.
+medium   | {attacker} puts the sub under {target} and turns it up for {damage} damage.
+medium   | {attacker} runs the room somewhere {target} did not agree to go — {damage} damage.
+medium   | {attacker} loops the one bar {target} cannot stand for {damage} damage.
+medium   | {attacker} points the stack at {target} and opens it for {damage} damage.
+medium   | {attacker} holds a note under {target} until the knees go — {damage} damage.
+
+major    | {attacker} builds it for eight bars and spends all of it on {target} — {damage} damage.
+major    | {attacker} puts forty hertz through {target}'s ribs for {damage} damage.
+major    | {attacker} takes the room off {target} entirely for {damage} damage.
+major    | {attacker} plays the thing that empties {target} for {damage} damage.
+major    | {attacker} runs the low end up until {target} comes off the floor — {damage} damage.
+major    | {attacker} beat-matches {target}'s heart and then does not — {damage} damage.
+
+critical | {attacker} drops it. {target} does not come back up. {damage} CRITICAL damage!
+critical | {attacker} holds one note until {target} comes apart on it. {damage} CRITICAL damage!
+critical | {attacker} kills the sound. The silence takes {target}. {damage} CRITICAL damage!
+critical | {attacker} plays {target} out. {damage} CRITICAL damage!
+critical | {attacker} takes the whole room with it, and {target} was in it. {damage} CRITICAL damage!
+critical | {attacker} does not look up from the decks at {target}. {damage} CRITICAL damage!
+
+[dot]
+shock | low bass      | {attacker} leaves a {affliction} sitting in {target}'s chest.
+shock | sub rumble    | {attacker} puts a {affliction} into {target} that does not stop.
+shock | standing wave | {attacker} parks a {affliction} where {target} happens to be.
+drain | long echo     | {attacker} leaves a {affliction} going round inside {target}.
+drain | dead ring     | {attacker} leaves {target} a {affliction} and no way to clear it.
+drain | feedback loop | {attacker} starts a {affliction} in {target} and walks off.
+
+[heal]
+minor | {attacker} finds the tempo {target} needs and holds it there — {heal} hit points.
+minor | {attacker} plays the one {target} has not heard in years. {heal} hit points.
+major | {attacker} shifts the whole room and carries {target} up with it. {heal} hit points.
+major | {attacker} puts a beat under {target} until the pulse agrees with it. {heal} hit points.
+
+[death]
+{attacker} lets the track run out over {target}.
+{attacker} pulls the fader down and leaves {target} in the quiet.
+{attacker} cues the next one without looking at {target}.
+
+[decay]
+shock | The {affliction} {attacker} left in {target} has not stopped — {damage} damage.
+shock | {target} still has {attacker}'s {affliction} in the chest — {damage} damage.
+shock | The {affliction} {attacker} parked on {target} takes {damage} damage more.
+drain | The {affliction} {attacker} started goes round {target} again — {damage} damage.
+drain | {target} cannot clear {attacker}'s {affliction}; it takes {damage} damage.
+drain | The {affliction} {attacker} left in {target} comes back for {damage} damage.
+
+[decay-kill]
+shock | The {affliction} {attacker} left finishes {target} in the quiet after.
+shock | {target} never gets {attacker}'s {affliction} back out of the chest.
+drain | The {affliction} {attacker} started comes round once more for {target}.
+drain | {target} stops trying to hear over {attacker}'s {affliction}.

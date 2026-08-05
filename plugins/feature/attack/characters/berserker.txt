@@ -1,0 +1,87 @@
+# berserker — weight, edge and no brakes. Mends nothing, least of all
+# itself, and what it opens goes on opening. See
+# ../new-class-prompt.txt for the grammar and the fairness rules.
+
+type: berserker
+desc: Pure fury. Relentless strikes that bleed the user.
+
+[damage]
+minor    | {attacker} walks through {target}'s guard and takes the shoulder — {damage} damage.
+minor    | {attacker} headbutts {target} and does not check the result — {damage} damage.
+minor    | {attacker} catches {target} with the back of a fist on the return — {damage} damage.
+minor    | {attacker} shoves {target} into the nearest hard thing for {damage} damage.
+minor    | {attacker} swings wide, misses, and comes back through {target} — {damage} damage.
+minor    | {attacker} opens a knuckle on {target}'s teeth and does not slow down — {damage} damage.
+minor    | {attacker} takes {target}'s blade on the forearm and keeps coming — {damage} damage.
+minor    | {attacker} stamps on {target}'s foot hard enough to be heard — {damage} damage.
+minor    | {attacker} takes {target} by the hair and introduces the knee — {damage} damage.
+minor    | {attacker} throws an elbow into {target} on the way past for {damage} damage.
+
+medium   | {attacker} opens {target}'s arm to the bone and keeps swinging — {damage} damage.
+medium   | {attacker} buries the axe in {target}'s shoulder and wrenches it out — {damage} damage.
+medium   | {attacker} takes a cut in order to give {target} a worse one — {damage} damage.
+medium   | {attacker} splits {target}'s eyebrow and works in the blood — {damage} damage.
+medium   | {attacker} drags the edge across {target}'s belly on the backswing — {damage} damage.
+medium   | {attacker} bites {target}, because both hands are busy — {damage} damage.
+medium   | {attacker} runs {target} down and opens the back of the leg — {damage} damage.
+medium   | {attacker} swings until something in {target} opens for {damage} damage.
+medium   | {attacker} takes {target}'s guard apart with weight alone for {damage} damage.
+medium   | {attacker} puts {target} through a table and follows them down — {damage} damage.
+
+major    | {attacker} caves in {target}'s ribs with the flat of the axe — {damage} damage.
+major    | {attacker} breaks {target}'s arm across the shoulder and drops it — {damage} damage.
+major    | {attacker} hammers {target}'s knee until the joint quits — {damage} damage.
+major    | {attacker} throws {target} at the wall hard enough to mark both — {damage} damage.
+major    | {attacker} opens {target} from shoulder to hip and does not stop — {damage} damage.
+major    | {attacker} takes {target}'s jaw off its hinge for {damage} damage.
+major    | {attacker} lands three {target} cannot answer and starts a fourth — {damage} damage.
+major    | {attacker} bleeds freely and spends all of it on {target} for {damage} damage.
+major    | {attacker} breaks {target}'s guard, arm and footing in that order — {damage} damage.
+
+critical | {attacker} takes {target}'s arm off and keeps hold of it. {damage} CRITICAL damage!
+critical | {attacker} does not stop when {target} does. {damage} CRITICAL damage!
+critical | {attacker} opens {target} to the spine in one pass. {damage} CRITICAL damage!
+critical | {attacker} spends everything left, some of it their own, on {target}. {damage} CRITICAL damage!
+critical | {attacker} breaks {target} apart at the joints, without hurrying. {damage} CRITICAL damage!
+critical | {attacker} is still swinging. {target} is no longer the reason. {damage} CRITICAL damage!
+critical | {attacker} puts the axe through {target} and into the floor. {damage} CRITICAL damage!
+critical | {attacker} takes {target}'s head and most of a shoulder with it. {damage} CRITICAL damage!
+critical | {attacker} finishes {target} and looks around for the next one. {damage} CRITICAL damage!
+
+[dot]
+bleed | open gash      | {attacker} leaves the {affliction} in {target} and swings on.
+bleed | split flank    | {attacker} opens a {affliction} down {target} that will not close.
+bleed | wet wound      | {attacker} puts a {affliction} in {target} and forgets it immediately.
+bleed | deep furrow    | {attacker} ploughs a {affliction} across {target} and moves on.
+shock | crushed rib    | {attacker} leaves {target} a {affliction} to breathe around.
+shock | caved plate    | {attacker} beats a {affliction} into {target} and keeps going.
+shock | broken hinge   | {attacker} turns {target}'s joint into a {affliction} and drops it.
+shock | flattened hand | {attacker} leaves {target} a {affliction} that used to hold a sword.
+drain | torn shoulder  | {attacker} pulls {target} into a {affliction} and lets go.
+drain | parted muscle  | {attacker} opens a {affliction} in {target} and does not look.
+drain | wrenched joint | {attacker} turns {target}'s arm into a {affliction} on the way past.
+chill | cold shock     | {attacker} hits {target} hard enough to leave a {affliction} behind.
+chill | grey shock     | {attacker} takes so much out of {target} that a {affliction} sets in.
+chill | shaking fit    | {attacker} leaves {target} with a {affliction} and no idea why.
+
+[death]
+{attacker} stands over {target}, bleeding from places nobody has counted.
+{attacker} finishes {target} and does not appear to notice finishing.
+{attacker} drops what is left of {target} and looks for more.
+{attacker} wipes {target} off the axe with a forearm already red.
+
+[decay]
+bleed | The {affliction} {attacker} left in {target} runs on for {damage} damage.
+bleed | {target} cannot hold {attacker}'s {affliction} shut — {damage} damage.
+shock | The {affliction} {attacker} beat into {target} takes {damage} damage more.
+shock | {target} breathes wrong once and {attacker}'s {affliction} takes {damage} damage.
+drain | The {affliction} {attacker} opened in {target} pulls wider — {damage} damage.
+drain | {target} moves the arm and {attacker}'s {affliction} takes {damage} damage.
+chill | The {affliction} {attacker} left goes {damage} damage deeper into {target}.
+chill | {target} has gone grey around {attacker}'s {affliction} — {damage} damage.
+
+[decay-kill]
+bleed | The {affliction} {attacker} opened runs {target} out entirely.
+shock | {target} stops breathing around {attacker}'s {affliction} and stops.
+drain | The {affliction} {attacker} left finishes {target} without a witness.
+chill | {target} never comes back up out of {attacker}'s {affliction}.

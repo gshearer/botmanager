@@ -1,0 +1,35 @@
+# bureaucrat — process, applied at the speed of process. Nothing lingers
+# and almost nothing mends; the harm is entirely in the waiting. See
+# ../new-class-prompt.txt for the grammar and the fairness rules.
+
+type: bureaucrat
+desc: Red tape and stamped denials. Administrative misery.
+
+[damage]
+minor    | {attacker} stamps something of {target}'s denied and slides it back — {damage} damage.
+minor    | {attacker} sends {target} to a different window for {damage} damage.
+minor    | {attacker} closes the counter with {target} second in the queue — {damage} damage.
+minor    | {attacker} finds an error in how {target} spelled their own name — {damage} damage.
+
+medium   | {attacker} refuses {target}'s form over the wrong shade of ink — {damage} damage.
+medium   | {attacker} requires a document {target} would need this one to get — {damage} damage.
+medium   | {attacker} books {target} an appointment for a date already past — {damage} damage.
+medium   | {attacker} loses {target}'s file in a manner that took real effort — {damage} damage.
+
+major    | {attacker} refers {target} to the department that refers to this one — {damage} damage.
+major    | {attacker} reopens a matter {target} settled eleven years ago for {damage} damage.
+major    | {attacker} requires {target} to appear in person, twice, elsewhere — {damage} damage.
+
+critical | {attacker} finds {target} was never eligible to begin with. {damage} CRITICAL damage!
+critical | {attacker} misfiles {target} under a heading with no clerk. {damage} CRITICAL damage!
+critical | {attacker} closes the window at one minute to. {target} was next. {damage} CRITICAL damage!
+
+[heal]
+minor | {attacker} finds {target}'s paperwork was in order after all — {heal} hit points.
+major | {attacker} approves {target} without explanation and stamps it twice. {heal} hit points.
+
+[death]
+{attacker} marks {target}'s file closed and puts it in the correct drawer.
+{attacker} does not look up as {target} is removed from the register.
+{attacker} stamps the last of it and calls the next number after {target}.
+{attacker} files {target} under a heading that has no clerk.

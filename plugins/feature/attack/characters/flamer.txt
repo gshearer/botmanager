@@ -1,0 +1,68 @@
+# flamer — correspondence at volume, sustained past all reason. Mends
+# nothing, and the thread goes on without anybody tending it. See
+# ../new-class-prompt.txt for the grammar and the fairness rules.
+
+type: flamer
+desc: All caps Usenet rants. Lingering, inescapable flame wars.
+
+[damage]
+minor    | {attacker} corrects {target}'s spelling, sourcing and character — {damage} damage.
+minor    | {attacker} replies to {target} with the single word TYPICAL — {damage} damage.
+minor    | {attacker} quotes {target} back at themselves in full for {damage} damage.
+minor    | {attacker} crossposts {target} to four groups that hate them — {damage} damage.
+minor    | {attacker} answers a post {target} made in 1994 for {damage} damage.
+minor    | {attacker} adds {target} to a killfile and announces it — {damage} damage.
+minor    | {attacker} explains the charter to {target} at length for {damage} damage.
+
+medium   | {attacker} opens a thread titled WRONG AGAIN about {target} — {damage} damage.
+medium   | {attacker} writes {target} nine hundred words before breakfast — {damage} damage.
+medium   | {attacker} has been waiting since March for {target} to say that — {damage} damage.
+medium   | {attacker} follows up on {target}'s followup, twice, for {damage} damage.
+medium   | {attacker} finds every earlier thing {target} said and lists it — {damage} damage.
+medium   | {attacker} takes {target} apart on a technicality for {damage} damage.
+medium   | {attacker} posts about {target} in a group they do not read — {damage} damage.
+
+major    | {attacker} replies to every line {target} wrote, separately — {damage} damage.
+major    | {attacker} turns {target} into the subject line for {damage} damage.
+major    | {attacker} makes {target} the reason the group has rules now — {damage} damage.
+major    | {attacker} writes the post that ends {target}'s posting for {damage} damage.
+major    | {attacker} brings up what {target} did at the last one for {damage} damage.
+major    | {attacker} escalates it beyond anything {target} intended for {damage} damage.
+major    | {attacker} will not let it go, and {target} needs it let go — {damage} damage.
+
+critical | {attacker} tells {target} it is over. It is NOT OVER. {damage} CRITICAL damage!
+critical | {attacker} has more time than {target} will ever have. {damage} CRITICAL damage!
+critical | {attacker} takes the whole group down over {target}. {damage} CRITICAL damage!
+critical | {attacker} is still typing. {target} logged off in April. {damage} CRITICAL damage!
+critical | {attacker} wins the argument and loses {target} entirely. {damage} CRITICAL damage!
+critical | {attacker} archives the thread with {target} in the subject. {damage} CRITICAL damage!
+critical | {attacker} was never going to stop. {target} finds that out. {damage} CRITICAL damage!
+
+[dot]
+burn  | flame war      | {attacker} opens a {affliction} over {target} and feeds it.
+burn  | burning thread | {attacker} starts a {affliction} about {target} and steps back.
+burn  | hot take       | {attacker} posts a {affliction} concerning {target} and waits.
+burn  | long rant      | {attacker} leaves a {affliction} about {target} where it will be found.
+curse | dead thread    | {attacker} leaves {target} at the bottom of a {affliction}.
+curse | killfile entry | {attacker} makes {target} a {affliction} and tells everyone.
+curse | crossposting   | {attacker} takes {target} to four groups by {affliction}.
+curse | followup storm | {attacker} starts a {affliction} that lands entirely on {target}.
+
+[death]
+{attacker} gets the last post in, and {target} is not there for it.
+{attacker} marks the thread resolved and {target} stops replying.
+{attacker} never concedes, and {target} runs out of afternoon.
+
+[decay]
+burn  | The {affliction} {attacker} started has stopped being about {target} — {damage} damage.
+burn  | The {affliction} {attacker} lit is fed by strangers — {target} takes {damage} damage.
+burn  | The {affliction} {attacker} lit burns {damage} damage further into {target}.
+curse | The {affliction} {attacker} began is still open on {target} — {damage} damage.
+curse | {target} reads to the bottom of {attacker}'s {affliction} for {damage} damage.
+curse | The {affliction} {attacker} left costs {target} another {damage} damage.
+
+[decay-kill]
+burn  | The {affliction} {attacker} lit outlives the argument, the group, and {target}.
+burn  | Nobody remembers {attacker} starting the {affliction} that finishes {target}.
+curse | {target} reaches the end of {attacker}'s {affliction} and stops there.
+curse | The {affliction} {attacker} opened is still going. {target} is not.

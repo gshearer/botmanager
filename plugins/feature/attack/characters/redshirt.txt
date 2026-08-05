@@ -1,0 +1,109 @@
+# redshirt — security detail, issued equipment beyond its training.
+# Mends nothing, and leaves more behind than anything else. See
+# ../new-class-prompt.txt for the grammar and the fairness rules.
+
+type: redshirt
+desc: Expendable security detail. Fires first, lasts briefly.
+
+[damage]
+minor    | {attacker} fires before the order arrives and clips {target} — {damage} damage.
+minor    | {attacker} sets it one notch past the manual and hits {target} — {damage} damage.
+minor    | {attacker} discharges into the deck and {target} catches some — {damage} damage.
+minor    | {attacker} swings the rifle instead of firing it at {target} — {damage} damage.
+minor    | {attacker} calls it in wrong and shoots {target} anyway for {damage} damage.
+minor    | {attacker} backs into a console and it goes off at {target} — {damage} damage.
+minor    | {attacker} has not checked the setting, and {target} finds out — {damage} damage.
+minor    | {attacker} fires at a shadow and {target} is standing in it — {damage} damage.
+minor    | {attacker} drops the rifle. It fires. {target} is unlucky — {damage} damage.
+minor    | {attacker} does not wait to identify {target} for {damage} damage.
+
+medium   | {attacker} empties the charge in {target}'s direction for {damage} damage.
+medium   | {attacker} panics and holds the trigger down on {target} — {damage} damage.
+medium   | {attacker} shoots the bulkhead and it comes down on {target} — {damage} damage.
+medium   | {attacker} vents something at {target} that should have stayed shut — {damage} damage.
+medium   | {attacker} takes cover badly and fires through it at {target} — {damage} damage.
+medium   | {attacker} volunteers to go first and reaches {target} for {damage} damage.
+medium   | {attacker} fires on full and the recoil puts {target} down — {damage} damage.
+medium   | {attacker} reaches for the wrong control and {target} pays — {damage} damage.
+medium   | {attacker} shoots the coolant line above {target} for {damage} damage.
+medium   | {attacker} does everything by the book and it works on {target} — {damage} damage.
+
+major    | {attacker} sets it past the last marking and gives {target} all of it — {damage} damage.
+major    | {attacker} fires the whole pack into {target} without stopping — {damage} damage.
+major    | {attacker} breaches the deck and {target} goes down with it — {damage} damage.
+major    | {attacker} shoots the rock, and the rock answers past {target} — {damage} damage.
+major    | {attacker} holds the corridor alone and {target} runs into it — {damage} damage.
+major    | {attacker} overloads the rifle in {target}'s general direction — {damage} damage.
+major    | {attacker} trips, and the beam goes through {target} lengthwise — {damage} damage.
+major    | {attacker} fires on something behind {target} and gets both — {damage} damage.
+major    | {attacker} does not stop firing when {target} stops moving — {damage} damage.
+major    | {attacker} takes the whole compartment to take {target} — {damage} damage.
+
+critical | {attacker} had it on the wrong setting for {target} all along. {damage} CRITICAL damage!
+critical | {attacker} holds the trigger down. {target} is a shape on the wall. {damage} CRITICAL damage!
+critical | {attacker} overloads the pack and {target} is nearest to it. {damage} CRITICAL damage!
+critical | {attacker} vents the compartment with {target} still inside. {damage} CRITICAL damage!
+critical | {attacker} fires once, badly, and it is enough for {target}. {damage} CRITICAL damage!
+critical | {attacker} did not mean to do that to {target}. {damage} CRITICAL damage!
+critical | {attacker} breaches the hull. {target} goes out through it. {damage} CRITICAL damage!
+critical | {attacker} was told to hold position, and held it onto {target}. {damage} CRITICAL damage!
+critical | {attacker} sets it past the dial and puts all of it into {target}. {damage} CRITICAL damage!
+critical | {attacker} goes in first, as ordered, and {target} does not come out. {damage} CRITICAL damage!
+
+[dot]
+burn   | plasma burn    | {attacker} leaves a {affliction} on {target} and reloads.
+burn   | beam burn      | {attacker} puts a {affliction} through {target} and misses twice more.
+burn   | hull scorch    | {attacker} leaves a {affliction} across {target} and the bulkhead.
+burn   | arc flash      | {attacker} leaves the {affliction} burning across {target} and reloads.
+bleed  | hot shard      | {attacker} leaves a {affliction} in {target} from the wrong wall.
+bleed  | hull splinter  | {attacker} puts a {affliction} into {target} without meaning to.
+bleed  | bulkhead shard | {attacker} brings down a {affliction} onto {target}.
+bleed  | glass grit     | {attacker} fills {target}'s eyes with {affliction} and keeps firing.
+rot    | loose rad      | {attacker} leaves a {affliction} where {target} is standing.
+rot    | hot particle   | {attacker} puts a {affliction} into {target} and does not log it.
+rot    | leaked rad     | {attacker} breaches something and leaves {target} a {affliction}.
+rot    | core dust      | {attacker} coats {target} in {affliction} and moves up the corridor.
+shock  | arc shock      | {attacker} leaves the {affliction} running through {target}.
+shock  | system shock   | {attacker} puts {target} into a {affliction} and calls it in.
+shock  | dead limb      | {attacker} leaves {target} a {affliction} and no explanation.
+shock  | grey shock     | {attacker} leaves {target} in a {affliction} against the bulkhead.
+poison | vented gas     | {attacker} vents {affliction} over {target} and seals the door.
+poison | coolant leak   | {attacker} opens a {affliction} above {target} and moves on.
+poison | bad air        | {attacker} leaves {target} breathing {affliction} for a while.
+bleed  | open wound     | {attacker} leaves the {affliction} in {target} and does not treat it.
+bleed  | torn seam      | {attacker} opens a {affliction} in {target}'s suit.
+bleed  | deep gouge     | {attacker} leaves a {affliction} in {target} on the way past.
+shock  | panel fault    | {attacker} leaves a {affliction} arcing over {target}.
+shock  | live circuit   | {attacker} leaves {target} against a {affliction}.
+shock  | shorted deck   | {attacker} leaves {target} standing on a {affliction}.
+
+[death]
+{attacker} confirms {target} and reports it to nobody in particular.
+{attacker} finishes {target} and is not present for the debrief.
+{attacker} stands over {target} as the rock behind them begins to glow.
+{attacker} did not mean to, and {target} is not going to argue.
+
+[decay]
+burn   | The {affliction} {attacker} left works into {target} — {damage} damage.
+burn   | {target} cannot cool {attacker}'s {affliction} — {damage} damage.
+bleed  | The {affliction} {attacker} left shifts in {target} — {damage} damage.
+bleed  | {target} moves, and {attacker}'s {affliction} takes {damage} damage.
+rot    | The {affliction} {attacker} left is still on {target} — {damage} damage.
+rot    | {target} carries {attacker}'s {affliction} for {damage} damage.
+shock  | The {affliction} {attacker} left runs on in {target} — {damage} damage.
+shock  | {target} cannot feel the arm; {attacker}'s {affliction} takes {damage} damage.
+poison | The {affliction} {attacker} vented reaches {target} — {damage} damage.
+poison | {target} breathes {attacker}'s {affliction} for {damage} damage.
+bleed  | The {affliction} {attacker} left in {target} opens — {damage} damage.
+bleed  | {target} bleeds into {attacker}'s {affliction} for {damage} damage.
+shock  | The {affliction} {attacker} left arcs into {target} — {damage} damage.
+shock  | {target} leans on {attacker}'s {affliction} for {damage} damage.
+
+[decay-kill]
+burn   | The {affliction} {attacker} left finishes {target} in the corridor.
+bleed  | {target} does not get {attacker}'s {affliction} out in time.
+rot    | The {affliction} {attacker} left uses up the rest of {target}.
+shock  | {target} never comes out of {attacker}'s {affliction}.
+poison | The {affliction} {attacker} vented gets to {target} last of all.
+bleed  | {target} bleeds out into {attacker}'s {affliction}, unattended.
+shock  | The {affliction} {attacker} left takes {target} on the way past.

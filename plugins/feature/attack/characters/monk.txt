@@ -1,0 +1,60 @@
+# monk — hands, feet and breathing. Mends itself and others readily, and
+# leaves one thing behind that takes its time. See
+# ../new-class-prompt.txt for the grammar and the fairness rules.
+
+type: monk
+desc: Balance and swift strikes. Fists, footwork, self-repair.
+
+[damage]
+minor    | {attacker} taps {target} twice under the ribs and steps back — {damage} damage.
+minor    | {attacker} takes {target}'s wrist off the guard and returns it — {damage} damage.
+minor    | {attacker} puts a knuckle into {target}'s shoulder joint for {damage} damage.
+minor    | {attacker} sweeps {target}'s lead foot and lets them find the floor — {damage} damage.
+minor    | {attacker} breathes out and {target} arrives at the fist for {damage} damage.
+minor    | {attacker} redirects {target}'s own weight into the wall for {damage} damage.
+
+medium   | {attacker} works {target}'s ribs in threes and stops on the fourth — {damage} damage.
+medium   | {attacker} folds {target} over a knee and lets go for {damage} damage.
+medium   | {attacker} strikes {target}'s thigh dead and the leg stops answering — {damage} damage.
+medium   | {attacker} catches {target}'s elbow and turns it past comfortable — {damage} damage.
+medium   | {attacker} puts a heel through {target}'s guard into the sternum — {damage} damage.
+medium   | {attacker} steps inside and empties {target} in one short motion — {damage} damage.
+
+major    | {attacker} breaks {target}'s stance and then the knee holding it — {damage} damage.
+major    | {attacker} drives a palm up under {target}'s chin for {damage} damage.
+major    | {attacker} takes {target} off the ground and puts them down flat — {damage} damage.
+major    | {attacker} strikes {target} once behind the ear and waits — {damage} damage.
+major    | {attacker} closes {target}'s guard and works through it for {damage} damage.
+
+critical | {attacker} strikes once. {target} sits down and does not get up. {damage} CRITICAL damage!
+critical | {attacker} finds the place under {target}'s ribs and presses. {damage} CRITICAL damage!
+critical | {attacker} returns {target}'s own force in full. {damage} CRITICAL damage!
+critical | {attacker} breathes out. {target} does not manage the same. {damage} CRITICAL damage!
+critical | {attacker} puts {target} through the floor and steadies the stance. {damage} CRITICAL damage!
+
+[dot]
+drain | slow ache | {attacker} presses one point in {target} and lets the {affliction} unfold.
+
+[heal]
+minor | {attacker} sets {target}'s shoulder back in with a short turn — {heal} hit points.
+minor | {attacker} breathes with {target} until the breathing is worth having. {heal} hit points.
+minor | {attacker} presses two fingers under {target}'s jaw and the pain lets go. {heal} hit points.
+minor | {attacker} straightens {target} and the ribs stop arguing about it. {heal} hit points.
+major | {attacker} works {target} over from the feet up and stands them back on them. {heal} hit points.
+major | {attacker} sets every joint of {target} where it belongs, in order. {heal} hit points.
+major | {attacker} sits with {target} for a moment and the moment does the work. {heal} hit points.
+major | {attacker} takes {target}'s wounds seriously and they close in response. {heal} hit points.
+
+[death]
+{attacker} lowers the hands and lets {target} finish falling.
+{attacker} steps over {target} and resets the stance.
+{attacker} bows to {target}, which is more than was required.
+
+[decay]
+drain | The {affliction} {attacker} left in {target} opens out for {damage} damage.
+drain | {target} moves wrong once and {attacker}'s {affliction} takes {damage} damage.
+drain | The {affliction} {attacker} left unfolds further in {target} — {damage} damage.
+
+[decay-kill]
+drain | The {affliction} {attacker} started reaches the end of {target}.
+drain | {target} sits down to wait out the {affliction} {attacker} left, and stays.

@@ -1,0 +1,59 @@
+# florist — arrangement, mostly. Mends as readily as anything on the
+# roster, and what it plants goes on growing. See
+# ../new-class-prompt.txt for the grammar and the fairness rules.
+
+type: florist
+desc: Thorns and blossoms. Toxic pollen, soothing aromas.
+
+[damage]
+minor    | {attacker} tucks something behind {target}'s ear and it starts to itch — {damage} damage.
+minor    | {attacker} hands {target} the stem thorn-first for {damage} damage.
+minor    | {attacker} shakes the arrangement out over {target} for {damage} damage.
+minor    | {attacker} trims something at {target}'s eye level with the secateurs — {damage} damage.
+
+medium   | {attacker} puts the secateurs through {target}'s finger for {damage} damage.
+medium   | {attacker} fills the air around {target} with something in flower — {damage} damage.
+medium   | {attacker} wraps a stem around {target}'s wrist and pulls it tight — {damage} damage.
+medium   | {attacker} arranges {target} into a position that will not hold — {damage} damage.
+
+major    | {attacker} opens {target}'s forearm on a thorn nobody stripped — {damage} damage.
+major    | {attacker} seeds the ground under {target} and lets it come up — {damage} damage.
+major    | {attacker} takes {target} down to the base and cuts on the angle — {damage} damage.
+
+critical | {attacker} prunes {target} back hard. {damage} CRITICAL damage!
+critical | {attacker} decides {target} is finished, and finishes them. {damage} CRITICAL damage!
+critical | {attacker} plants something in {target} that will do well here. {damage} CRITICAL damage!
+
+[dot]
+poison | toxic pollen  | {attacker} leaves a {affliction} settling over {target}.
+poison | thorn scratch | {attacker} leaves a {affliction} in {target} with something on it.
+
+[heal]
+minor | {attacker} puts something green in {target}'s hands and waits — {heal} hit points.
+minor | {attacker} crushes a leaf under {target}'s nose and the head clears. {heal} hit points.
+minor | {attacker} packs {target}'s wound with something bitter and binds it. {heal} hit points.
+minor | {attacker} sets the arrangement where {target} can see it. {heal} hit points.
+minor | {attacker} sends {target} something without a note attached. {heal} hit points.
+minor | {attacker} cuts the dead growth off {target} and lets the rest go on. {heal} hit points.
+minor | {attacker} tells {target} it will come back next year, and it will. {heal} hit points.
+major | {attacker} works over {target} the way a border gets worked over. {heal} hit points.
+major | {attacker} fills the room around {target} with something that helps. {heal} hit points.
+major | {attacker} repots {target} entirely and gives them better light. {heal} hit points.
+major | {attacker} finds what was strangling {target} and takes it out. {heal} hit points.
+major | {attacker} waters {target}, which turns out to have been the whole problem. {heal} hit points.
+major | {attacker} stakes {target} upright and ties them in loosely. {heal} hit points.
+major | {attacker} leaves {target} somewhere warm and stops interfering. {heal} hit points.
+
+[death]
+{attacker} lays the last of it across {target} and steps back to look.
+{attacker} takes {target} out at the root and composts the rest.
+{attacker} arranges {target} neatly, because that is the habit.
+
+[decay]
+poison | The {affliction} {attacker} left is still on {target} — {damage} damage.
+poison | {target} breathes {attacker}'s {affliction} again for {damage} damage.
+poison | The {affliction} {attacker} seeded has taken in {target} — {damage} damage.
+
+[decay-kill]
+poison | The {affliction} {attacker} left comes up through {target} entirely.
+poison | {target} does not get clear of {attacker}'s {affliction} in the end.

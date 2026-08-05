@@ -1,0 +1,80 @@
+# pyromancer — fire held closer than is wise. Mends nothing, and what it
+# starts keeps burning after the hands are elsewhere. See
+# ../new-class-prompt.txt for the grammar and the fairness rules.
+
+type: pyromancer
+desc: Living kindling. Unstable flames, scorching heat, high risk.
+
+[damage]
+minor    | {attacker} lets a spark off the thumb into {target}'s collar — {damage} damage.
+minor    | {attacker} warms the air around {target} past what skin allows — {damage} damage.
+minor    | {attacker} lights {target}'s cuff and watches them deal with it — {damage} damage.
+minor    | {attacker} drops something small and hot down {target}'s back — {damage} damage.
+minor    | {attacker} touches {target}'s buckle and leaves the shape of it — {damage} damage.
+minor    | {attacker} breathes out warm and {target}'s eyebrows go with it — {damage} damage.
+minor    | {attacker} sets the floor alight where {target} was about to stand — {damage} damage.
+minor    | {attacker} holds a flame near {target} for slightly too long — {damage} damage.
+minor    | {attacker} lets the heat off both hands wash over {target} for {damage} damage.
+
+medium   | {attacker} lays a sheet of flame across {target}'s chest for {damage} damage.
+medium   | {attacker} puts a handprint through {target}'s sleeve and the arm — {damage} damage.
+medium   | {attacker} cooks {target}'s armour until it is unwearable — {damage} damage.
+medium   | {attacker} throws fire low and takes {target} off their feet — {damage} damage.
+medium   | {attacker} lights {target}'s hair and lets the panic finish it — {damage} damage.
+medium   | {attacker} opens a hand at {target} and the room gets brighter — {damage} damage.
+medium   | {attacker} burns {target}'s grip off the weapon for {damage} damage.
+medium   | {attacker} lets the fire run up {target}'s leg unattended — {damage} damage.
+medium   | {attacker} holds on to {target} longer than either can stand — {damage} damage.
+
+major    | {attacker} sets {target} alight properly and steps back for {damage} damage.
+major    | {attacker} puts a column of flame through {target}'s guard — {damage} damage.
+major    | {attacker} burns {target}'s arm down to something simpler — {damage} damage.
+major    | {attacker} lights the air in {target}'s lungs for {damage} damage.
+major    | {attacker} throws more than intended and it lands on {target} — {damage} damage.
+major    | {attacker} melts {target}'s helm onto what it was protecting — {damage} damage.
+major    | {attacker} burns through {target}'s shield and the arm behind it — {damage} damage.
+major    | {attacker} loses hold of it, and {target} is where it goes — {damage} damage.
+major    | {attacker} cooks {target} inside the armour and waits it out — {damage} damage.
+
+critical | {attacker} lets go of all of it. {target} is inside when it goes. {damage} CRITICAL damage!
+critical | {attacker} burns all of it, some of it their own, onto {target}. {damage} CRITICAL damage!
+critical | {attacker} puts a pillar of fire through {target} and the roof. {damage} CRITICAL damage!
+critical | {attacker} reduces {target} to a mark and stands in the heat. {damage} CRITICAL damage!
+critical | {attacker} does not manage to stop. {target} is the reason. {damage} CRITICAL damage!
+critical | {attacker} lights {target} from the inside and lets it finish. {damage} CRITICAL damage!
+critical | {attacker} takes the whole room to take {target}. {damage} CRITICAL damage!
+critical | {attacker} burns {target} down and keeps burning afterwards. {damage} CRITICAL damage!
+critical | {attacker} is still alight. {target} is not still anything. {damage} CRITICAL damage!
+
+[dot]
+burn   | deep burn     | {attacker} leaves a {affliction} in {target} and lets it work.
+burn   | clinging fire | {attacker} puts a {affliction} on {target} that will not beat out.
+burn   | seared lung   | {attacker} leaves {target} a {affliction} to breathe through.
+burn   | branded plate | {attacker} welds a {affliction} into {target} and walks off.
+burn   | live ember    | {attacker} leaves a {affliction} somewhere inside {target}.
+burn   | banked heat   | {attacker} puts {affliction} into {target} and lets it sit.
+burn   | slow kindling | {attacker} makes {affliction} of {target} and waits.
+burn   | hot ash       | {attacker} packs {affliction} into {target}'s wound.
+poison | black smoke   | {attacker} fills {target} with {affliction} and leaves it there.
+poison | scorched air  | {attacker} burns the air around {target} into {affliction}.
+poison | choking haze  | {attacker} leaves {target} standing in a {affliction}.
+poison | oily soot     | {attacker} coats {target}'s throat with {affliction}.
+
+[death]
+{attacker} lets {target} finish burning and does not look away.
+{attacker} steps back from {target} and shakes the heat off both hands.
+{attacker} leaves {target} as a shape on the flagstones.
+{attacker} is still smoking, and has no plan for what is left of {target}.
+
+[decay]
+burn   | The {affliction} {attacker} left in {target} works deeper — {damage} damage.
+burn   | {target} cannot get out of {attacker}'s {affliction} — {damage} damage.
+burn   | The {affliction} {attacker} left in {target} catches again — {damage} damage.
+burn   | {target} goes up again on {attacker}'s {affliction} — {damage} damage.
+poison | The {affliction} {attacker} made is still in {target} — {damage} damage.
+poison | {target} breathes {attacker}'s {affliction} for another {damage} damage.
+
+[decay-kill]
+burn   | The {affliction} {attacker} left goes all the way through {target}.
+burn   | {target} catches one last time on {attacker}'s {affliction}.
+poison | {target} never gets a clean breath past {attacker}'s {affliction}.

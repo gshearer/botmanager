@@ -1,0 +1,59 @@
+# pylon — a humming geometric object with no opinion about any of this.
+# Mends more than it harms, and alters the weather while it does. See
+# ../new-class-prompt.txt for the grammar and the fairness rules.
+
+type: pylon
+desc: A humming crystal. Alters weather, mends by frequency.
+
+[damage]
+minor    | {attacker} hums a half-tone lower and {target}'s inner ear gives — {damage} damage.
+minor    | {attacker} brightens for as long as {target} looks at it — {damage} damage.
+minor    | {attacker} thins the air in the space {target} occupies — {damage} damage.
+
+medium   | {attacker} shifts the local pressure and {target}'s nose runs red — {damage} damage.
+medium   | {attacker} pulls the warmth out of the room around {target} — {damage} damage.
+medium   | {attacker} strobes at a rate {target}'s heart tries to match — {damage} damage.
+
+major    | {attacker} turns the weather inside out above {target} for {damage} damage.
+major    | {attacker} holds one note and {target} comes apart along a seam — {damage} damage.
+
+critical | {attacker} shifts one degree. {target} was never rated for it. {damage} CRITICAL damage!
+critical | {attacker} stops humming. The silence takes {target}. {damage} CRITICAL damage!
+
+[dot]
+chill | low pressure  | {attacker} settles a {affliction} over {target} and holds it.
+chill | wrong weather | {attacker} leaves {affliction} sitting where {target} stands.
+chill | cold front    | {attacker} moves a {affliction} across {target} and stays there.
+chill | thin air      | {attacker} leaves {affliction} around {target} and does not lift it.
+chill | static charge | {attacker} leaves a {affliction} clinging to {target}.
+
+[heal]
+minor | {attacker} settles on a frequency {target}'s bones recognise — {heal} hit points.
+minor | {attacker} warms the air around {target} by a few degrees. {heal} hit points.
+minor | {attacker} hums at a pitch that agrees with {target}. {heal} hit points.
+minor | {attacker} brightens slowly over {target} until the shaking stops. {heal} hit points.
+minor | {attacker} steadies the weather where {target} is lying. {heal} hit points.
+minor | {attacker} holds one clear tone and {target} breathes with it. {heal} hit points.
+minor | {attacker} thickens the air around {target} into something usable. {heal} hit points.
+minor | {attacker} dims to the level {target} can rest under. {heal} hit points.
+major | {attacker} glows steadily over {target} until the wounds close. {heal} hit points.
+major | {attacker} emits a frequency {target}'s body agrees with entirely. {heal} hit points.
+major | {attacker} turns the weather kind directly above {target}. {heal} hit points.
+major | {attacker} holds the room at the temperature {target} needs. {heal} hit points.
+major | {attacker} hums {target} back up out of it over several minutes. {heal} hit points.
+major | {attacker} shifts the whole field and {target} comes back with it. {heal} hit points.
+major | {attacker} resonates until whatever was wrong with {target} is not. {heal} hit points.
+
+[death]
+{attacker} returns to the note it was holding before {target} arrived.
+{attacker} dims, briefly, over {target}.
+{attacker} does not stop humming, and {target} does not start again.
+
+[decay]
+chill | The {affliction} {attacker} settled over {target} holds — {damage} damage.
+chill | {target} is still under {attacker}'s {affliction} for {damage} damage.
+chill | The {affliction} {attacker} left has not lifted off {target} — {damage} damage.
+
+[decay-kill]
+chill | The {affliction} {attacker} settled over {target} does not lift.
+chill | {target} stays under {attacker}'s {affliction} until nothing is left.

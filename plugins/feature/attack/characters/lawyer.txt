@@ -1,0 +1,61 @@
+# lawyer — correspondence, mostly. Mends nothing, threatens nothing, and
+# what it opens stays open for years. See
+# ../new-class-prompt.txt for the grammar and the fairness rules.
+
+type: lawyer
+desc: Cease and desist. Drains the will to live, billably.
+
+[damage]
+minor    | {attacker} adds {target} to a thread for {damage} damage.
+minor    | {attacker} asks {target} one question and writes the answer down — {damage} damage.
+minor    | {attacker} copies in two more people {target} has not met — {damage} damage.
+minor    | {attacker} serves {target} in front of everyone, politely — {damage} damage.
+minor    | {attacker} sends {target} a letter that is technically an offer to help — {damage} damage.
+
+medium   | {attacker} requests everything {target} has written since March — {damage} damage.
+medium   | {attacker} enters {target}'s own words into the record for {damage} damage.
+medium   | {attacker} moves the date, and {target} rearranges a month around it — {damage} damage.
+medium   | {attacker} sends {target} eleven pages clarifying one sentence — {damage} damage.
+medium   | {attacker} bills the time spent explaining the bill to {target} — {damage} damage.
+
+major    | {attacker} files, and {target} discovers what disclosure means — {damage} damage.
+major    | {attacker} takes {target} through the same afternoon for a fourth time — {damage} damage.
+major    | {attacker} produces the thing {target} assumed had been deleted — {damage} damage.
+major    | {attacker} explains to {target} what the retainer has been funding — {damage} damage.
+
+critical | {attacker} moves to dismiss {target}. {damage} CRITICAL damage!
+critical | {attacker} wins on a point {target} conceded in the first week. {damage} CRITICAL damage!
+critical | {attacker} sends {target} the final invoice, itemised. {damage} CRITICAL damage!
+critical | {attacker} is in no hurry at all, and {target} cannot afford one. {damage} CRITICAL damage!
+
+[dot]
+curse | protracted suit | {attacker} files a {affliction} against {target} and settles in.
+curse | standing action | {attacker} opens a {affliction} on {target} with no end date.
+curse | counterclaim    | {attacker} attaches a {affliction} to {target} and waits.
+curse | open matter     | {attacker} leaves the {affliction} on {target} indefinitely.
+drain | billable hour   | {attacker} starts a {affliction} against {target} and forgets it.
+drain | running tab     | {attacker} opens a {affliction} on {target} that does not close.
+drain | hourly rate     | {attacker} applies a {affliction} to {target} and lets it run.
+drain | cost order      | {attacker} hangs a {affliction} on {target} and moves on.
+rot   | endless motion  | {attacker} lodges the {affliction} against {target} and waits.
+rot   | sealed exhibit  | {attacker} enters a {affliction} concerning {target}.
+rot   | long docket     | {attacker} puts {target} on a {affliction} and closes the folder.
+rot   | further filing  | {attacker} promises {target} a {affliction} and delivers it.
+
+[death]
+{attacker} closes the file and sends the last invoice to {target}'s estate.
+{attacker} wins, eventually, and {target} is not present for it.
+{attacker} marks the matter concluded and does not think about {target}.
+
+[decay]
+curse | The {affliction} {attacker} filed against {target} enters month four — {damage} damage.
+curse | {target} answers {attacker}'s {affliction} again for {damage} damage.
+drain | The {affliction} {attacker} started against {target} runs on — {damage} damage.
+drain | {target} opens {attacker}'s {affliction} and loses {damage} damage.
+rot   | The {affliction} {attacker} lodged concerning {target} costs {damage} damage.
+rot   | {target} reads {attacker}'s {affliction} to the end — {damage} damage.
+
+[decay-kill]
+curse | The {affliction} {attacker} filed outlives {target} and continues.
+drain | {target} settles. {attacker}'s {affliction} carries on without them.
+rot   | {target} does not reach the end of {attacker}'s {affliction}.
