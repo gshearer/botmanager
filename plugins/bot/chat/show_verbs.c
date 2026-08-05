@@ -40,15 +40,27 @@ verb_text_summary(const cmd_ctx_t *ctx, bot_inst_t *bot, const char *rest)
 
   name = bot_inst_name(bot);
 
-  cmd_reply(ctx, CLR_BOLD "chat bot" CLR_RESET);
+  // This verb is the `:default` under show/bot, so it is what `/show bot
+  // <name>` renders — it has to name the bot it is describing. The kind
+  // is parenthetical: every bot has this same mind.
+  snprintf(line, sizeof(line),
+      CLR_BOLD "%s" CLR_RESET " " CLR_GRAY "(chat bot)" CLR_RESET, name);
+  cmd_reply(ctx, line);
 
   // Command half: dispatch counters, activity, bound namespace.
   text_dispatch_summary(ctx, bot);
 
-  // Bound methods count.
-  snprintf(line, sizeof(line), "  methods:     %u",
-      bot_method_count(bot));
-  cmd_reply(ctx, line);
+  // Bound methods: the kinds, which is what the bot can actually do.
+  {
+    char kinds[BOT_METHOD_KINDS_SZ];
+
+    if(bot_method_kinds(bot, kinds, sizeof(kinds)) == 0)
+      snprintf(kinds, sizeof(kinds), CLR_GRAY "(none)" CLR_RESET);
+
+    snprintf(line, sizeof(line), "  methods:     %u  %s",
+        bot_method_count(bot), kinds);
+    cmd_reply(ctx, line);
+  }
 
   // Conversational half. Everything below this row is inert when the
   // toggle is off, so say so plainly rather than printing a persona and

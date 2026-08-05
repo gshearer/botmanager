@@ -483,13 +483,13 @@ typedef struct
 } ug_botlist_t;
 
 static void
-ug_bot_collect(const char *name, const char *driver_name, bot_state_t state,
+ug_bot_collect(const char *name, const char *method_kinds, bot_state_t state,
     uint32_t method_count, const char *userns_name,
     uint64_t cmd_count, time_t last_activity, void *data)
 {
   ug_botlist_t *bl = data;
 
-  (void)driver_name;
+  (void)method_kinds;
   (void)method_count;
   (void)userns_name;
   (void)cmd_count;

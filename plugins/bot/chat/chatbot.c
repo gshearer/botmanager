@@ -352,7 +352,14 @@ chatbot_personality_kv_cb(const char *key, void *data)
 
   bot = bot_find(botname);
   if(bot == NULL) return;
-  if(strcmp(bot_driver_name(bot), "chat") != 0) return;
+
+  // The handle below is this plugin's private state, and the cast is only
+  // sound for a bot whose mind we are. The NULL check underneath cannot
+  // stand in for this one: it catches a bot mid-reload, not a bot driven
+  // by some other PLUGIN_BOT plugin. There is only one today (TAXO-3
+  // keeps the possibility of a second), so compare against our own
+  // vtable's name rather than a literal.
+  if(strcmp(bot_driver_name(bot), chatbot_driver.name) != 0) return;
 
   st = bot_get_handle(bot);
   if(st == NULL) return;

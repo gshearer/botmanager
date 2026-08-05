@@ -5,6 +5,7 @@
 #include "bot.h"
 #include "cmd.h"
 #include "kv.h"
+#include "plugin.h"   // PLUGIN_NAME_SZ — the bound on a method kind
 #include "userns.h"
 
 #include <stdio.h>
@@ -74,17 +75,23 @@ cmd_set_kv(const cmd_ctx_t *ctx)
   }
 }
 
-// /set bot <bot> [<kind>] <key> <value>
+// /set bot <bot> [<method>] <key> <value>
 //
 // Sugar over /set kv that builds the namespaced key for an admin who
 // knows the bot but not the full KV path. With three args (bot key
-// value), writes bot.<bot>.<key>. With four args (bot kind key value),
-// the kind must match the bot's driver and writes bot.<bot>.<kind>.<key>.
+// value), writes bot.<bot>.<key>. With four args (bot method key value),
+// writes bot.<bot>.<method>.<key> — the per-method tier, where a method
+// plugin's KV schema is copied for each bot that binds it
+// (bot_register_method_kv).
 //
-// Disambiguation between the two forms uses the bot's driver name:
-// if the second token equals bot_driver_name(bot), it's parsed as the
-// kind. Kind strings ("llm", "text") don't collide with KV key
-// segments, so this is unambiguous in practice.
+// Disambiguation between the two forms is bot_has_method_kind(): the
+// second token is a method kind when the bot has that method bound. It
+// used to be compared against bot_driver_name() instead, which meant the
+// four-token form could only ever address the bot plugin's own tier —
+// and that tier has no <kind> segment, so it addressed nothing at all
+// while every real per-method knob had to be written through raw
+// `set kv bot.<n>.<method>.<key>`. Method kinds ("irc", "reachy") don't
+// collide with KV key segments, so this stays unambiguous in practice.
 
 static const cmd_arg_desc_t ad_set_bot[] = {
   { "bot",  CMD_ARG_ALNUM, CMD_ARG_REQUIRED,                BOT_NAME_SZ, NULL },
@@ -101,7 +108,7 @@ cmd_set_bot(const cmd_ctx_t *ctx)
   size_t      t1_len;
   const char *t2;
   size_t      t2_len;
-  const char *driver;
+  char        method[PLUGIN_NAME_SZ];
   bool        four_form;
   char        key[KV_KEY_SZ];
   const char *value;
@@ -132,30 +139,28 @@ cmd_set_bot(const cmd_ctx_t *ctx)
   t2_len = (size_t)(rest - t2);
   while(*rest == ' ' || *rest == '\t') rest++;
 
-  // If the first token matches the bot's driver kind, treat as
-  // 4-arg form (bot kind key value); else 3-arg form (bot key value).
-  driver = bot_driver_name(bot);
-  four_form = (driver != NULL
-      && strlen(driver) == t1_len
-      && strncmp(driver, t1, t1_len) == 0
+  // If the first token names a method this bot has bound, treat as
+  // 4-arg form (bot method key value); else 3-arg form (bot key value).
+  snprintf(method, sizeof(method), "%.*s", (int)t1_len, t1);
+  four_form = (bot_has_method_kind(bot, method)
       && t2_len > 0 && *rest != '\0');
 
-  // Reject a kind-looking-but-wrong second token to catch the common
-  // mistake "set bot <name> llm ..." against a non-llm bot.
+  // Reject a method-looking-but-wrong second token to catch the common
+  // mistake "set bot <name> irc ..." against a bot with no irc binding.
   if(!four_form && t2_len > 0 && *rest != '\0')
   {
     // Heuristic: a 3-form key normally contains a dot. A bare alpha
     // first token followed by another token + value almost certainly
-    // means the user typed the wrong kind. Fall through to 3-form
+    // means the user typed the wrong method. Fall through to 3-form
     // anyway, but if the bare token doesn't look like a key, error.
     bool looks_like_key = false;
     for(size_t i = 0; i < t1_len; i++)
       if(t1[i] == '.' || t1[i] == '_') { looks_like_key = true; break; }
     if(!looks_like_key)
     {
-      char buf[BOT_NAME_SZ + 64];
-      snprintf(buf, sizeof(buf), "bot is kind %s, not %.*s",
-          driver ? driver : "?", (int)t1_len, t1);
+      char buf[BOT_NAME_SZ + PLUGIN_NAME_SZ + 32];
+      snprintf(buf, sizeof(buf), "%s has no %.*s method",
+          botname, (int)t1_len, t1);
       cmd_reply(ctx, buf);
       return;
     }
@@ -227,12 +232,13 @@ cmd_set_register(void)
       cmd_set_kv, NULL, "set", NULL, ad_set_kv, 2, NULL, NULL);
 
   cmd_register("cmd", "bot",
-      "set bot <bot> [<kind>] <key> <value>",
+      "set bot <bot> [<method>] <key> <value>",
       "Set a per-bot configuration value (sugar over /set kv)",
       "Builds the namespaced KV path for a bot. Three-arg form writes\n"
-      "bot.<bot>.<key>; four-arg form writes bot.<bot>.<kind>.<key>\n"
-      "and requires <kind> to match the bot's driver. Refuses keys\n"
-      "that are not registered.",
+      "bot.<bot>.<key>; four-arg form writes bot.<bot>.<method>.<key>\n"
+      "and requires <method> to name a method the bot has bound.\n"
+      "Refuses keys that are not registered.\n"
+      "Example: /set bot mini reachy attention.mode name",
       USERNS_GROUP_ADMIN, 100, CMD_SCOPE_ANY, METHOD_T_ANY,
       cmd_set_bot, NULL, "set", NULL, ad_set_bot,
       (uint8_t)(sizeof(ad_set_bot) / sizeof(ad_set_bot[0])), NULL, NULL);

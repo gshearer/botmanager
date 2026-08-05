@@ -37,7 +37,7 @@ resolve_named_bot(const cmd_ctx_t *ctx, const char *name)
 
 static const cmd_arg_desc_t ad_bot_name_kind[] = {
   { "name", CMD_ARG_ALNUM, CMD_ARG_REQUIRED, BOT_NAME_SZ,    NULL },
-  { "kind", CMD_ARG_NONE,  CMD_ARG_REQUIRED, PLUGIN_NAME_SZ, NULL },
+  { "kind", CMD_ARG_NONE,  CMD_ARG_OPTIONAL, PLUGIN_NAME_SZ, NULL },
 };
 
 static const cmd_arg_desc_t ad_bot_name[] = {
@@ -49,12 +49,50 @@ static const cmd_arg_desc_t ad_bot_method[] = {
   { "method", CMD_ARG_ALNUM, CMD_ARG_REQUIRED, PLUGIN_NAME_SZ, NULL },
 };
 
-// /bot add <name> <kind>
+// What a scan of the loaded plugins found on the PLUGIN_BOT axis: the
+// first kind, and how many there were to choose from.
+typedef struct
+{
+  char     kind[PLUGIN_NAME_SZ];
+  uint32_t count;
+} bot_kind_scan_t;
+
+// plugin_iterate callback — records the first PLUGIN_BOT kind and counts
+// the rest. plugin_find_type(PLUGIN_BOT, NULL) already yields the first
+// one, but it cannot say whether the choice was ambiguous, and an
+// unannounced pick is exactly what makes a default confusing later.
+static void
+bot_kind_scan_cb(const char *name, const char *version, const char *path,
+    plugin_type_t type, const char *kind, plugin_state_t state, void *data)
+{
+  bot_kind_scan_t *scan = data;
+
+  (void)name;
+  (void)version;
+  (void)path;
+  (void)state;
+
+  if(type != PLUGIN_BOT || kind == NULL || kind[0] == '\0')
+    return;
+
+  if(scan->count == 0)
+    snprintf(scan->kind, sizeof(scan->kind), "%s", kind);
+
+  scan->count++;
+}
+
+// /bot add <name> [<kind>]
+//
+// The bot kind is optional because there is exactly one bot plugin (see
+// AGENTS.md §Terminology) — a bot is a name, a set of methods and its
+// config, so naming the mind is ceremony. It stays available for the day
+// a second one lands.
 static void
 admin_cmd_bot_add(const cmd_ctx_t *ctx)
 {
   const char *name = ctx->parsed->argv[0];
-  const char *kind = ctx->parsed->argv[1];
+  const char *kind = (ctx->parsed->argc >= 2) ? ctx->parsed->argv[1] : NULL;
+  bot_kind_scan_t scan = {0};
   const plugin_desc_t *pd;
   const bot_driver_t *drv;
   bot_inst_t *inst;
@@ -67,11 +105,29 @@ admin_cmd_bot_add(const cmd_ctx_t *ctx)
     return;
   }
 
+  if(kind == NULL || kind[0] == '\0')
+  {
+    plugin_iterate(bot_kind_scan_cb, &scan);
+
+    if(scan.count == 0)
+    {
+      cmd_reply(ctx, "no bot plugin is loaded — name a kind or load one");
+      return;
+    }
+
+    if(scan.count > 1)
+      clam(CLAM_WARN, "bot_add",
+          "%u bot plugins loaded; '%s' defaulted to kind '%s'",
+          scan.count, name, scan.kind);
+
+    kind = scan.kind;
+  }
+
   pd = plugin_find_type(PLUGIN_BOT, kind);
 
   if(pd == NULL || pd->ext == NULL)
   {
-    snprintf(buf, sizeof(buf), "unknown method: %s", kind);
+    snprintf(buf, sizeof(buf), "unknown bot kind: %s", kind);
     cmd_reply(ctx, buf);
     return;
   }
@@ -483,7 +539,7 @@ admin_cmd_bot(const cmd_ctx_t *ctx)
 // /show bots — colorized table of all bot instances
 
 static void
-show_bots_cb(const char *name, const char *driver_name,
+show_bots_cb(const char *name, const char *method_kinds,
     bot_state_t state, uint32_t method_count,
     const char *userns_name, uint64_t cmd_count, time_t last_activity,
     void *data)
@@ -492,6 +548,7 @@ show_bots_cb(const char *name, const char *driver_name,
   char line[512];
   const char *state_color;
 
+  (void)method_count;
   (void)last_activity;
 
   switch(state)
@@ -501,11 +558,14 @@ show_bots_cb(const char *name, const char *driver_name,
     default:           state_color = CLR_RED;    break;
   }
 
+  // The METHODS column is padded by byte count, so its placeholder is a
+  // plain hyphen — a coloured em dash like the namespace column's would
+  // pad the row short by the width of its escape sequence.
   snprintf(line, sizeof(line),
-      "  %-16s %-10s %s%-8s" CLR_RESET " %3u methods  %5lu cmds  ns=%s",
-      name, driver_name,
+      "  %-16s %-20s %s%-8s" CLR_RESET " %5lu  %s",
+      name,
+      (method_kinds != NULL && method_kinds[0] != '\0') ? method_kinds : "-",
       state_color, bot_state_name(state),
-      method_count,
       (unsigned long)cmd_count,
       userns_name ? userns_name : CLR_GRAY "\xe2\x80\x94" CLR_RESET);
 
@@ -519,7 +579,7 @@ cmd_show_bots(const cmd_ctx_t *ctx)
   bot_cmd_list_state_t st = { .ctx = ctx, .count = 0 };
 
   cmd_reply(ctx,
-      "  " CLR_BOLD "NAME             KIND       STATE    METHODS   CMDS  NAMESPACE" CLR_RESET);
+      "  " CLR_BOLD "NAME             METHODS              STATE     CMDS  NAMESPACE" CLR_RESET);
 
   bot_iterate(show_bots_cb, &st);
 
@@ -867,11 +927,21 @@ cmd_show_bot(const cmd_ctx_t *ctx)
     }
   }
 
-  // Header.
-  snprintf(line, sizeof(line),
-      CLR_BOLD "%s" CLR_RESET " " CLR_GRAY "(%s)" CLR_RESET,
-      inst->name, inst->driver->name);
-  cmd_reply(ctx, line);
+  // Header: the bot, then what it can do. The bot kind comes last and in
+  // parentheses because it is not this bot's identity — every bot has the
+  // same one. bot_driver_name() rather than inst->driver->name: a bot
+  // mid-reload has no driver at all.
+  {
+    char kinds[BOT_METHOD_KINDS_SZ];
+
+    if(bot_method_kinds(inst, kinds, sizeof(kinds)) == 0)
+      snprintf(kinds, sizeof(kinds), "no methods");
+
+    snprintf(line, sizeof(line),
+        CLR_BOLD "%s" CLR_RESET "  %s  " CLR_GRAY "(%s bot)" CLR_RESET,
+        inst->name, kinds, bot_driver_name(inst));
+    cmd_reply(ctx, line);
+  }
 
   // State.
   {
@@ -1031,11 +1101,14 @@ bot_register_commands(void)
       USERNS_GROUP_ADMIN, 100, CMD_SCOPE_ANY, METHOD_T_ANY, admin_cmd_bot, NULL, NULL, NULL, NULL, 0, NULL, NULL);
 
   cmd_register("bot", "add",
-      "bot add <name> <kind>",
+      "bot add <name> [<kind>]",
       "Create a bot instance",
-      "Creates a new bot instance with the given name and kind.\n"
-      "The kind must match a loaded bot plugin (e.g., command).\n"
-      "Example: /bot add mybot command",
+      "Creates a new bot instance. Give it methods with\n"
+      "/bot addmethod, then start it.\n"
+      "<kind> names the bot plugin that gives the bot a mind and\n"
+      "defaults to the only one loaded (chat); name it explicitly\n"
+      "only when more than one exists.\n"
+      "Example: /bot add mybot",
       USERNS_GROUP_ADMIN, 100, CMD_SCOPE_ANY, METHOD_T_ANY, admin_cmd_bot_add, NULL, "bot", NULL,
       ad_bot_name_kind, 2, NULL, NULL);
 
@@ -1086,8 +1159,8 @@ bot_register_commands(void)
   cmd_register("bot", "bots",
       "show bots",
       "List all bot instances",
-      "Shows a colorized table of all bot instances with state,\n"
-      "method count, commands, and namespace.",
+      "Shows a colorized table of all bot instances with their bound\n"
+      "method kinds, state, command count, and namespace.",
       USERNS_GROUP_ADMIN, 100, CMD_SCOPE_ANY, METHOD_T_ANY, cmd_show_bots, NULL, "show", NULL,
       NULL, 0, NULL, NULL);
 
@@ -1100,7 +1173,7 @@ bot_register_commands(void)
       "With just <name>, renders identity: state, autostart, methods,\n"
       "identities. With a trailing verb, dispatches to the first child of\n"
       "show/bot whose name matches and whose kind_filter admits the\n"
-      "bot's driver kind (llm: personas, memories, stats, candidates,\n"
+      "bot's driver kind (chat: personas, memories, stats, candidates,\n"
       "knowledge, interests).",
       USERNS_GROUP_ADMIN, 100, CMD_SCOPE_ANY, METHOD_T_ANY, cmd_show_bot, NULL, "show", NULL,
       ad_show_bot, (uint8_t)(sizeof(ad_show_bot)/sizeof(ad_show_bot[0])), NULL, &show_bot_nl);

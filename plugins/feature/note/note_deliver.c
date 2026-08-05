@@ -464,13 +464,13 @@ typedef struct
 } note_botlist_t;
 
 static void
-note_bot_collect(const char *name, const char *driver_name,
+note_bot_collect(const char *name, const char *method_kinds,
     bot_state_t state, uint32_t method_count, const char *userns_name,
     uint64_t cmd_count, time_t last_activity, void *data)
 {
   note_botlist_t *bl = data;
 
-  (void)driver_name;
+  (void)method_kinds;
   (void)method_count;
   (void)userns_name;
   (void)cmd_count;

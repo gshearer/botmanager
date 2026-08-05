@@ -9,6 +9,11 @@
 
 #define BOT_NAME_SZ       64
 
+// Room for every bound method kind of one bot, comma-joined. Sixteen
+// bindings is bot_cfg.max_methods and the kinds are short words, so this
+// is generous; bot_method_kinds() truncates rather than overflowing.
+#define BOT_METHOD_KINDS_SZ  128
+
 typedef enum
 {
   BOT_CREATED,    // instance exists, configured but not started
@@ -19,7 +24,7 @@ typedef enum
 typedef struct bot_inst bot_inst_t;
 
 // Functions a bot-behaviour plugin must implement. Stored in
-// plugin_desc_t.ext for PLUGIN_BOT plugins (text).
+// plugin_desc_t.ext for PLUGIN_BOT plugins (chat).
 typedef struct
 {
   const char *name;
@@ -108,7 +113,11 @@ const char *bot_state_name(bot_state_t s);
 
 void bot_get_stats(bot_stats_t *out);
 
-typedef void (*bot_iter_cb_t)(const char *name, const char *driver_name,
+// `method_kinds` is the bot's bound method kinds, comma-joined by
+// bot_method_kinds() — "" when nothing is bound. It names what the bot
+// can do, which is what a listing wants; the bot plugin behind it is
+// bot_driver_name() and there is only one of those.
+typedef void (*bot_iter_cb_t)(const char *name, const char *method_kinds,
     bot_state_t state, uint32_t method_count,
     const char *userns_name, uint64_t cmd_count, time_t last_activity,
     void *data);
@@ -117,6 +126,19 @@ void bot_iterate(bot_iter_cb_t cb, void *data);
 
 const char *bot_driver_name(const bot_inst_t *inst);
 uint32_t bot_method_count(const bot_inst_t *inst);
+
+// True when `kind` names a method bound to this bot, running or not.
+// Case-insensitive, matching bot_resolve_method()'s kind comparison.
+//
+// bot_resolve_method() cannot answer this question: it hands back the
+// method_inst_t, which is resolved at start time and therefore NULL for
+// a CREATED bot — so a bot with a bound method reads as not having it.
+bool bot_has_method_kind(const bot_inst_t *inst, const char *kind);
+
+// Comma-joined bound method kinds ("irc, botmanctl") into `out`, each
+// kind once however many instances of it are bound. Returns the byte
+// length written; 0 means nothing is bound and `out` is "".
+size_t bot_method_kinds(const bot_inst_t *inst, char *out, size_t out_sz);
 
 // Find the first bot whose driver->name matches `driver_name`. Returns
 // true on hit, with out_name (cap out_cap) and out_state populated.

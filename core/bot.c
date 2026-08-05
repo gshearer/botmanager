@@ -1378,7 +1378,7 @@ bot_get_stats(bot_stats_t *out)
 typedef struct
 {
   char        name[BOT_NAME_SZ];
-  char        driver_name[BOT_NAME_SZ];
+  char        method_kinds[BOT_METHOD_KINDS_SZ];
   bot_state_t state;
   uint32_t    method_count;
   char        userns_name[USERNS_NAME_SZ];
@@ -1407,11 +1407,9 @@ bot_iterate(bot_iter_cb_t cb, void *data)
       b = b->next)
   {
     bot_snap_t *s = &snap[count];
-    const char *drv_name = (b->driver && b->driver->name)
-        ? b->driver->name : "(unknown)";
 
     snprintf(s->name, sizeof(s->name), "%s", b->name);
-    snprintf(s->driver_name, sizeof(s->driver_name), "%s", drv_name);
+    bot_method_kinds(b, s->method_kinds, sizeof(s->method_kinds));
     s->state         = b->state;
     s->method_count  = b->method_count;
     s->has_userns    = (b->userns != NULL);
@@ -1430,7 +1428,7 @@ bot_iterate(bot_iter_cb_t cb, void *data)
   pthread_mutex_unlock(&bot_mutex);
 
   for(i = 0; i < count; i++)
-    cb(snap[i].name, snap[i].driver_name, snap[i].state,
+    cb(snap[i].name, snap[i].method_kinds, snap[i].state,
         snap[i].method_count,
         snap[i].has_userns ? snap[i].userns_name : NULL,
         snap[i].cmd_count, snap[i].last_activity, data);
@@ -1791,6 +1789,72 @@ bot_resolve_method(const bot_inst_t *inst, const char *key)
       return(m->inst);
 
   return(NULL);
+}
+
+// Both of the following walk inst->methods without taking bot_mutex, as
+// bot_resolve_method() above does: the list is built and torn down while
+// the bot is CREATED, and bot_iterate() calls bot_method_kinds() with the
+// lock already held.
+bool
+bot_has_method_kind(const bot_inst_t *inst, const char *kind)
+{
+  if(inst == NULL || kind == NULL || kind[0] == '\0')
+    return(false);
+
+  for(bot_method_t *m = inst->methods; m != NULL; m = m->next)
+    if(strncasecmp(m->method_kind, kind, PLUGIN_NAME_SZ) == 0)
+      return(true);
+
+  return(false);
+}
+
+size_t
+bot_method_kinds(const bot_inst_t *inst, char *out, size_t out_sz)
+{
+  size_t n = 0;
+
+  if(out == NULL || out_sz == 0)
+    return(0);
+
+  out[0] = '\0';
+
+  if(inst == NULL)
+    return(0);
+
+  for(bot_method_t *m = inst->methods; m != NULL; m = m->next)
+  {
+    bool dup = false;
+    int  w;
+
+    // Two IRC networks on one bot are two bindings of one kind; the
+    // reader wants "irc", not "irc, irc".
+    for(bot_method_t *e = inst->methods; e != m; e = e->next)
+      if(strncasecmp(e->method_kind, m->method_kind, PLUGIN_NAME_SZ) == 0)
+      {
+        dup = true;
+        break;
+      }
+
+    if(dup)
+      continue;
+
+    w = snprintf(out + n, out_sz - n, "%s%s",
+        n > 0 ? ", " : "", m->method_kind);
+
+    if(w < 0)
+      break;
+
+    // Truncated: keep the prefix that fits and stop.
+    if((size_t)w >= out_sz - n)
+    {
+      n = out_sz - 1;
+      break;
+    }
+
+    n += (size_t)w;
+  }
+
+  return(n);
 }
 
 void
