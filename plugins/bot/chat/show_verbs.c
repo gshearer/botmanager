@@ -1,5 +1,5 @@
 // botmanager — MIT
-// /show bot <name> <verb> handlers for text-kind bots (summary, personas, …).
+// /show bot <name> <verb> handlers for chat-kind bots (summary, personas, …).
 
 #define CHATBOT_INTERNAL
 #include "chatbot.h"
@@ -40,7 +40,7 @@ verb_text_summary(const cmd_ctx_t *ctx, bot_inst_t *bot, const char *rest)
 
   name = bot_inst_name(bot);
 
-  cmd_reply(ctx, CLR_BOLD "text bot" CLR_RESET);
+  cmd_reply(ctx, CLR_BOLD "chat bot" CLR_RESET);
 
   // Command half: dispatch counters, activity, bound namespace.
   text_dispatch_summary(ctx, bot);
@@ -869,23 +869,23 @@ static const cmd_nl_t show_bot_model_nl = {
 
 // ---- registration ------------------------------------------------------
 
-// text-kind filter, NUL-terminated. Storage must be static -- cmd_register
+// chat-kind filter, NUL-terminated. Storage must be static -- cmd_register
 // keeps the pointer.
-static const char *const text_kind_filter[] = { "text", NULL };
+static const char *const chat_kind_filter[] = { "chat", NULL };
 
 // Called from chatbot plugin init (chatbot.c) once per plugin load.
 bool
 chatbot_show_verbs_register(void)
 {
-  // The sole :default sentinel for the text kind — it renders both
+  // The sole :default sentinel for the chat kind — it renders both
   // halves (see verb_text_summary). A second one would collide.
-  if(cmd_register("text", ":default",
+  if(cmd_register("chat", ":default",
         "show bot <name>",
         "Text bot summary (commands, converse toggle, persona, model)",
         NULL,
         USERNS_GROUP_ADMIN, 100, CMD_SCOPE_ANY, METHOD_T_ANY,
         verb_text_summary_wrapper, NULL, "show/bot", NULL,
-        NULL, 0, text_kind_filter, NULL) != SUCCESS)
+        NULL, 0, chat_kind_filter, NULL) != SUCCESS)
     return(FAIL);
 
   if(cmd_register("llm", "personas",
@@ -894,7 +894,7 @@ chatbot_show_verbs_register(void)
         NULL,
         USERNS_GROUP_ADMIN, 100, CMD_SCOPE_ANY, METHOD_T_ANY,
         verb_llm_personas_wrapper, NULL, "show/bot", NULL,
-        NULL, 0, text_kind_filter, NULL) != SUCCESS)
+        NULL, 0, chat_kind_filter, NULL) != SUCCESS)
     return(FAIL);
 
   if(cmd_register("llm", "memories",
@@ -903,7 +903,7 @@ chatbot_show_verbs_register(void)
         NULL,
         USERNS_GROUP_ADMIN, 100, CMD_SCOPE_ANY, METHOD_T_ANY,
         verb_llm_memories_wrapper, NULL, "show/bot", NULL,
-        NULL, 0, text_kind_filter, NULL) != SUCCESS)
+        NULL, 0, chat_kind_filter, NULL) != SUCCESS)
     return(FAIL);
 
   if(cmd_register("llm", "stats",
@@ -912,7 +912,7 @@ chatbot_show_verbs_register(void)
         NULL,
         USERNS_GROUP_ADMIN, 100, CMD_SCOPE_ANY, METHOD_T_ANY,
         verb_stats_wrapper, NULL, "show/bot", NULL,
-        NULL, 0, text_kind_filter, NULL) != SUCCESS)
+        NULL, 0, chat_kind_filter, NULL) != SUCCESS)
     return(FAIL);
 
   if(cmd_register("llm", "knowledge",
@@ -921,7 +921,7 @@ chatbot_show_verbs_register(void)
         NULL,
         USERNS_GROUP_ADMIN, 100, CMD_SCOPE_ANY, METHOD_T_ANY,
         verb_llm_knowledge_wrapper, NULL, "show/bot", NULL,
-        NULL, 0, text_kind_filter, NULL) != SUCCESS)
+        NULL, 0, chat_kind_filter, NULL) != SUCCESS)
     return(FAIL);
 
   if(cmd_register("llm", "interests",
@@ -930,7 +930,7 @@ chatbot_show_verbs_register(void)
         NULL,
         USERNS_GROUP_ADMIN, 100, CMD_SCOPE_ANY, METHOD_T_ANY,
         verb_llm_interests_wrapper, NULL, "show/bot", NULL,
-        NULL, 0, text_kind_filter, NULL) != SUCCESS)
+        NULL, 0, chat_kind_filter, NULL) != SUCCESS)
     return(FAIL);
 
   // Everyone-gated by design so the NL bridge can route "what LLM are
@@ -945,7 +945,7 @@ chatbot_show_verbs_register(void)
         "like \"what LLM are you?\" via the NL bridge.",
         USERNS_GROUP_EVERYONE, 0, CMD_SCOPE_ANY, METHOD_T_ANY,
         verb_model_wrapper, NULL, "show/bot", NULL,
-        NULL, 0, text_kind_filter, &show_bot_model_nl) != SUCCESS)
+        NULL, 0, chat_kind_filter, &show_bot_model_nl) != SUCCESS)
     return(FAIL);
 
   // /show extract {root,stats} — plain /show children, no kind filter.

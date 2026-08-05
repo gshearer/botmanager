@@ -29,7 +29,7 @@
 #define REACHYAPI_KV_BASE_URL   "plugin.reachyapi.base_url"
 #define REACHYAPI_KV_TIMEOUT    "plugin.reachyapi.timeout"
 
-// Declared here and read by the reachy protocol driver, which keeps its
+// Declared here and read by the reachy method driver, which keeps its
 // own copy of the name — the row is registered where the robot's other
 // address is, not where its only reader lives.
 #define REACHYAPI_KV_BRIDGE_URL "plugin.reachyapi.bridge_url"

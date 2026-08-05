@@ -173,7 +173,7 @@ knowledge_register_kv(void)
 // BYTEA helpers — float32 LE packing + hex serialization for Postgres.
 //
 // Duplicated for K1 from the bot-memory subsystem, which the microkernel
-// reorg since moved to plugins/method/text/memory.c. Folding the two into
+// reorg since moved to plugins/bot/chat/memory.c. Folding the two into
 // one shared vector helper is an open cleanup, tracked in no TODO today.
 // The copies must stay in lock-step on the wire format:
 // "'\x<hex>'::bytea" text literal, raw float32 LE bytes.

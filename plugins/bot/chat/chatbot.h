@@ -1,4 +1,4 @@
-// chatbot.h — conversational half of the text method plugin (kind: text)
+// chatbot.h — conversational half of the chat bot plugin (kind: chat)
 //
 // The LLM-driven personality half: bot driver vtable, personality table
 // loader, /llm personality subcommands, and the observe path that
@@ -7,8 +7,8 @@
 //
 // It is one half of a two-half plugin. The other — always-on command
 // dispatch plus the identity/auth surface — is dispatch.h. The driver
-// vtable declared here (textbot_driver) fronts both; see the deliver
-// path comment above textbot_on_message in chatbot.c for the ordering
+// vtable declared here (chatbot_driver) fronts both; see the deliver
+// path comment above chatbot_on_message in chatbot.c for the ordering
 // and for why the command half short-circuits this one.
 
 #ifndef BM_CHATBOT_H
@@ -355,7 +355,7 @@ typedef struct
   pthread_rwlock_t  lock;             // guards active_name + cooldowns + topic cache
   char              active_name[CHATBOT_PERSONALITY_NAME_SZ];
 
-  // TEXT-COOLDOWN-1 — wall-clock stamp taken in textbot_create().
+  // TEXT-COOLDOWN-1 — wall-clock stamp taken in chatbot_create().
   // Every speak gate floors its "last spoke" timestamp to this value,
   // so a handle created by a /plugin reload starts one cooldown window
   // quiet instead of reading as "never spoke" (which the gates take as
@@ -490,7 +490,7 @@ mem_msg_kind_t chatbot_classify_message(const method_msg_t *msg,
     const char *bot_nick);
 
 // Global driver vtable (defined in chatbot.c).
-extern const bot_driver_t textbot_driver;
+extern const bot_driver_t chatbot_driver;
 
 // Resolve the dossier for an inbound message. Runs the method driver's
 // dossier_signature callback, consults userns MFA patterns, and calls

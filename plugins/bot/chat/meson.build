@@ -1,4 +1,4 @@
-text_plugin = shared_library('text',
+chat_plugin = shared_library('chat',
   ['chatbot.c', 'dispatch.c', 'personality.c', 'personality_show.c',
    'contract_show.c', 'commands.c',
    'dossier.c', 'dossier_cmd.c', 'dossier_show.c',

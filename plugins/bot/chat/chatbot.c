@@ -77,15 +77,15 @@ static const kv_nl_t behavior_mute_until_nl = {
 // including the persona binding itself -- are grouped under
 // "bot.<name>.behavior.*"; model / knowledge bindings remain flat.
 //
-// Two namespaces live here and the distinction is deliberate (PTREE-6):
-// "text" is the METHOD -- the driver kind, the .so, the command prefix
-// every text bot dispatches on. "chat" is the CONVERSATIONAL SUBSYSTEM
-// inside it -- personalities, contracts, the NL/LLM reply pipeline. A
-// knob belongs under plugin.text.* / bot.text.* only if a command-only
-// bot (behavior.chat.enabled = false) still needs it.
+// One namespace, "chat", covers the whole mind. It used to be two --
+// "text" for the driver kind and "chat" for the conversational
+// subsystem inside it (PTREE-6) -- but TAXO-2 renamed the bot plugin to
+// "chat", so the split named one thing twice. Every knob here is either
+// unconditional (the command prefix) or gated by behavior.chat.enabled;
+// nothing about that distinction needs a second namespace to record it.
 static const plugin_kv_entry_t chatbot_kv_schema[] = {
-  { "plugin.text.prefix", KV_STR, "!",
-    "Command prefix applied to a text bot instance at create time."
+  { "plugin.chat.prefix", KV_STR, "!",
+    "Command prefix applied to a chat bot instance at create time."
     " Per-method overrides live at bot.<name>.<method-kind>.prefix.",
     NULL, NULL },
   { "plugin.chat.default_personality", KV_STR, "",
@@ -129,10 +129,10 @@ static const plugin_kv_entry_t chatbot_inst_schema[] = {
   // --- behavior: runtime conduct (bot.<name>.behavior.*) ---------------
   { "behavior.chat.enabled", KV_BOOL, "false",
     "Master switch for the conversational half. Command interpretation"
-    " is unconditional on a text bot; this knob decides whether"
+    " is unconditional on a chat bot; this knob decides whether"
     " non-command lines also reach the NL/LLM reply pipeline (and with"
     " it conversation logging, dossiers, vision and volunteering)."
-    " Defaults false so a freshly bound text bot is a command bot until"
+    " Defaults false so a freshly bound chat bot is a command bot until"
     " the operator opts into LLM spend.", NULL },
   { "behavior.personality", KV_STR, "",
     "Active personality name for this bot instance. Resolves against"
@@ -352,7 +352,7 @@ chatbot_personality_kv_cb(const char *key, void *data)
 
   bot = bot_find(botname);
   if(bot == NULL) return;
-  if(strcmp(bot_driver_name(bot), "text") != 0) return;
+  if(strcmp(bot_driver_name(bot), "chat") != 0) return;
 
   st = bot_get_handle(bot);
   if(st == NULL) return;
@@ -1037,7 +1037,7 @@ chatbot_classify_with_engagement(chatbot_state_t *st,
 // ---------- driver callbacks ----------
 
 static void *
-textbot_create(bot_inst_t *inst)
+chatbot_create(bot_inst_t *inst)
 {
   chatbot_state_t *st = mem_alloc("chatbot", "state", sizeof(*st));
   const char *name;
@@ -1059,9 +1059,9 @@ textbot_create(bot_inst_t *inst)
 
   chatbot_vision_state_init(st);
 
-  // Command dispatch is unconditional on a text bot, so the prefix is
+  // Command dispatch is unconditional on a chat bot, so the prefix is
   // seeded here rather than behind the conversational toggle.
-  prefix = kv_get_str("plugin.text.prefix");
+  prefix = kv_get_str("plugin.chat.prefix");
 
   if(prefix != NULL && prefix[0] != '\0')
     cmd_set_prefix(inst, prefix);
@@ -1081,7 +1081,7 @@ textbot_create(bot_inst_t *inst)
 }
 
 static void
-textbot_destroy(void *handle)
+chatbot_destroy(void *handle)
 {
   chatbot_state_t *st = handle;
   if(st == NULL) return;
@@ -1245,7 +1245,7 @@ chatbot_register_interests(chatbot_state_t *st)
 }
 
 static bool
-textbot_start(void *handle)
+chatbot_start(void *handle)
 {
   chatbot_state_t *st = handle;
   uint32_t interval;
@@ -1277,7 +1277,7 @@ textbot_start(void *handle)
 }
 
 static void
-textbot_stop(void *handle)
+chatbot_stop(void *handle)
 {
   chatbot_state_t *st = handle;
   if(st == NULL) return;
@@ -1560,7 +1560,7 @@ chatbot_handle_nick_change(chatbot_state_t *st, const method_msg_t *msg)
   method_kind = method_inst_kind(msg->inst);
   if(method_kind == NULL || method_kind[0] == '\0') return(SUCCESS);
 
-  // The protocol plugin populated both halves of the rename on the
+  // The method plugin populated both halves of the rename on the
   // delivered msg: prev_* for the old identity, the regular fields for
   // the new identity. If the old identity carried no usable tuple we
   // can't look it up — skip the merge.
@@ -2089,7 +2089,7 @@ chatbot_scan_reactive_topics(chatbot_state_t *st, const method_msg_t *msg)
 // Conversational half: classify + log to memory + run speak policy
 // (either immediately, or after the paste-coalescing window closes).
 // Reached only for non-command lines on a bot whose behavior.chat.enabled
-// toggle is on — see textbot_on_message below.
+// toggle is on — see chatbot_on_message below.
 static void
 chatbot_observe(chatbot_state_t *st, const method_msg_t *msg)
 {
@@ -2197,7 +2197,7 @@ chatbot_observe(chatbot_state_t *st, const method_msg_t *msg)
   chatbot_consider_speaking(st, msg, kind, reason);
 }
 
-// The text method's single deliver path. Command interpretation is
+// The chat bot plugin's single deliver path. Command interpretation is
 // unconditional; conversation is the toggled extra. The order is the
 // whole design in five steps:
 //
@@ -2213,7 +2213,7 @@ chatbot_observe(chatbot_state_t *st, const method_msg_t *msg)
 // NOT come back through here — it goes out through the core cmd registry
 // from reply.c, which is what keeps the two halves from circling.
 static void
-textbot_on_message(void *handle, const method_msg_t *msg)
+chatbot_on_message(void *handle, const method_msg_t *msg)
 {
   chatbot_state_t *st = handle;
   char key[KV_KEY_SZ];
@@ -2242,17 +2242,17 @@ textbot_on_message(void *handle, const method_msg_t *msg)
 
 // ---------- driver + plugin descriptor ----------
 
-const bot_driver_t textbot_driver = {
-  .name       = "text",
-  .create     = textbot_create,
-  .destroy    = textbot_destroy,
-  .start      = textbot_start,
-  .stop       = textbot_stop,
-  .on_message = textbot_on_message,
+const bot_driver_t chatbot_driver = {
+  .name       = "chat",
+  .create     = chatbot_create,
+  .destroy    = chatbot_destroy,
+  .start      = chatbot_start,
+  .stop       = chatbot_stop,
+  .on_message = chatbot_on_message,
 };
 
 static bool
-textbot_plugin_start(void)
+chatbot_plugin_start(void)
 {
   memory_ensure_schema();
   dossier_register_config();
@@ -2264,7 +2264,7 @@ textbot_plugin_start(void)
 }
 
 static bool
-textbot_plugin_init(void)
+chatbot_plugin_init(void)
 {
   // Kind-wide KV: directory of personality files. Registered directly
   // (not via kv_schema / kv_inst_schema) because the key sits under
@@ -2333,7 +2333,7 @@ textbot_plugin_init(void)
   // Order at init time: bring up in-memory state and register commands
   // (cmd subsystem is already up). DDL must wait until userns_init has
   // run -- the dossier table FKs into userns -- so dossier_register_config
-  // is called from textbot_plugin_start, which runs after userns_init.
+  // is called from chatbot_plugin_start, which runs after userns_init.
   dossier_init();
   dossier_show_register_commands();
   dossier_register_commands();
@@ -2427,7 +2427,7 @@ textbot_plugin_init(void)
 // they come off here rather than in deinit() so the loader's quiescence
 // barrier still has a window to wait out a callback already running.
 static bool
-textbot_plugin_stop(void)
+chatbot_plugin_stop(void)
 {
   extract_stop();
   memory_stop();
@@ -2435,7 +2435,7 @@ textbot_plugin_stop(void)
 }
 
 static void
-textbot_plugin_deinit(void)
+chatbot_plugin_deinit(void)
 {
   text_dispatch_unregister();
   chatbot_cmds_unregister();
@@ -2452,11 +2452,11 @@ textbot_plugin_deinit(void)
 
 const plugin_desc_t bm_plugin_desc = {
   .api_version          = PLUGIN_API_VERSION,
-  .name                 = "text",
+  .name                 = "chat",
   .version              = "1.0",
   .type                 = PLUGIN_BOT,
-  .kind                 = "text",
-  .provides             = { { .name = "method_text" } },
+  .kind                 = "chat",
+  .provides             = { { .name = "bot_chat" } },
   .provides_count       = 1,
   .requires             = {
     { .name = "inference"   },
@@ -2471,9 +2471,9 @@ const plugin_desc_t bm_plugin_desc = {
   .kv_schema_count      = sizeof(chatbot_kv_schema) / sizeof(chatbot_kv_schema[0]),
   .kv_inst_schema       = chatbot_inst_schema,
   .kv_inst_schema_count = sizeof(chatbot_inst_schema) / sizeof(chatbot_inst_schema[0]),
-  .init                 = textbot_plugin_init,
-  .start                = textbot_plugin_start,
-  .stop                 = textbot_plugin_stop,
-  .deinit               = textbot_plugin_deinit,
-  .ext                  = &textbot_driver,
+  .init                 = chatbot_plugin_init,
+  .start                = chatbot_plugin_start,
+  .stop                 = chatbot_plugin_stop,
+  .deinit               = chatbot_plugin_deinit,
+  .ext                  = &chatbot_driver,
 };

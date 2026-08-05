@@ -43,7 +43,7 @@ lands in later chunks.
 ## Architectural Vision
 
 The plan, executed over future chunks, is a flat source layout
-mirroring `plugins/method/text/`'s style: many `.c` files compiled
+mirroring `plugins/bot/chat/`'s style: many `.c` files compiled
 into a single `shared_library('whenmoon', …)` rather than nested
 subdirs.
 Expected subsystems, each growing as one or a few source files:
@@ -93,7 +93,7 @@ the text method follows for `/dossier`, `/memory`, `/llm`.
 Downward-only dependencies apply (core + service + inference). No
 includes or `plugin_dlsym` into other `plugins/feature/*/` or
 `plugins/method/*/` plugins; no upward references from
-`plugins/service/*/` or `plugins/protocol/*/` into this directory.
+`plugins/service/*/` or `plugins/method/*/` into this directory.
 
 ## External Dependencies (planned, not yet wired)
 

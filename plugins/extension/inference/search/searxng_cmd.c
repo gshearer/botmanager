@@ -519,7 +519,7 @@ const plugin_desc_t bm_plugin_desc = {
   .provides        = { { .name = "cmd_searxng" } },
   .provides_count  = 1,
   .requires        = {
-    { .name = "method_text" },
+    { .name = "bot_chat" },
     { .name = "service_searxng" },
   },
   .requires_count  = 2,

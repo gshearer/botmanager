@@ -17,7 +17,7 @@
 //
 // Layering (PLUGIN.md §Layer Rules): PLUGIN_METHOD over the reachyapi
 // service, and nothing else. This plugin must never reach up into the
-// bot plugin (plugins/method/text/) — everything it knows about the
+// bot plugin (plugins/bot/chat/) — everything it knows about the
 // conversation it learns through include/method.h.
 
 #ifdef REACHY_INTERNAL

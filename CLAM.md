@@ -206,19 +206,19 @@ halves. Same shape as `gemini` / `gemini.ws`.
 
 | Context | Source | Description |
 |---|---|---|
-| `chatbot` | plugins/method/text/chatbot.c · plugins/method/text/volunteer.c | conversational observe/classify trace + volunteer-to-speak path |
-| `deauth` | plugins/method/text/dispatch.c | temp-MFA drop for the caller's hostmask |
-| `dossier` | plugins/method/text/dossier.c | dossier subsystem |
-| `extract` | plugins/method/text/extract.c | LLM-driven fact extraction |
-| `identify` | plugins/method/text/dispatch.c | `!identify` auth + temp-MFA mint |
-| `interject` | plugins/method/text/volunteer.c | chatbot interjection scoring |
-| `irc` | plugins/protocol/irc/irc_protocol.c | IRC method driver |
-| `memory` | plugins/method/text/memory_rag.c | chat memory subsystem + RAG |
-| `nl_bridge` | plugins/method/text/reply.c | natural-language bridge surface |
-| `nl_observe` | plugins/method/text/nl_observe.c | post-dispatch chat observer (`OBS_CTX`) |
-| `reachy` | plugins/protocol/reachy/reachy.c | Reachy Mini method driver — the ear (bridge long-poll, transcription, attention gate, delivery) and the mouth (speech queue, synthesis, upload, playback pacing) (`REACHY_CTX`) |
-| `register` | plugins/method/text/dispatch.c | `/register` user creation |
-| `vision` | plugins/method/text/vision.c | image-intent path |
+| `chatbot` | plugins/bot/chat/chatbot.c · plugins/bot/chat/volunteer.c | conversational observe/classify trace + volunteer-to-speak path |
+| `deauth` | plugins/bot/chat/dispatch.c | temp-MFA drop for the caller's hostmask |
+| `dossier` | plugins/bot/chat/dossier.c | dossier subsystem |
+| `extract` | plugins/bot/chat/extract.c | LLM-driven fact extraction |
+| `identify` | plugins/bot/chat/dispatch.c | `!identify` auth + temp-MFA mint |
+| `interject` | plugins/bot/chat/volunteer.c | chatbot interjection scoring |
+| `irc` | plugins/method/irc/irc_protocol.c | IRC method driver |
+| `memory` | plugins/bot/chat/memory_rag.c | chat memory subsystem + RAG |
+| `nl_bridge` | plugins/bot/chat/reply.c | natural-language bridge surface |
+| `nl_observe` | plugins/bot/chat/nl_observe.c | post-dispatch chat observer (`OBS_CTX`) |
+| `reachy` | plugins/method/reachy/reachy.c | Reachy Mini method driver — the ear (bridge long-poll, transcription, attention gate, delivery) and the mouth (speech queue, synthesis, upload, playback pacing) (`REACHY_CTX`) |
+| `register` | plugins/bot/chat/dispatch.c | `/register` user creation |
+| `vision` | plugins/bot/chat/vision.c | image-intent path |
 
 ## Extension plugins (`plugins/extension/`)
 

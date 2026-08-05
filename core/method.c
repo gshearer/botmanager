@@ -680,7 +680,7 @@ void
 method_iterate_instances(method_inst_iter_cb_t cb, void *data)
 {
   // Cap is generous — method instances are inherently few (one per
-  // protocol driver). Excess is dropped silently, matching
+  // method driver). Excess is dropped silently, matching
   // method_iterate_drivers' MAX_DRIVER_KINDS behaviour.
   #define MAX_ITER_INSTANCES 64
 

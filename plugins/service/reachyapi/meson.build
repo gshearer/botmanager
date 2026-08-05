@@ -1,7 +1,7 @@
 reachyapi_include = include_directories('.')
 
 # Mechanism only: no command surface lives here. reachyapi is a non-leaf
-# service (the reachycmd command plugin and the reachy protocol driver
+# service (the reachycmd command plugin and the reachy method driver
 # both consume it), so PLUGIN.md §Layer Rules Rule 1 forbids it holding
 # commands of its own.
 reachyapi_plugin = shared_library('reachyapi',

@@ -518,7 +518,7 @@ const plugin_desc_t bm_plugin_desc = {
   .kind            = GIPHY_CTX,
   .provides        = { { .name = "service_giphy" } },
   .provides_count  = 1,
-  .requires        = { { .name = "method_text" } },
+  .requires        = { { .name = "bot_chat" } },
   .requires_count  = 1,
   .kv_schema       = giphy_kv_schema,
   .kv_schema_count = sizeof(giphy_kv_schema) / sizeof(giphy_kv_schema[0]),

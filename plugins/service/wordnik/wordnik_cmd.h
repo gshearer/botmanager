@@ -8,7 +8,7 @@
 //
 // Both halves ship as one plugin because wordnik is a dependency-graph
 // leaf (nothing requires service_wordnik), so the command's upward
-// method_text dependency is inherited by nobody. See
+// bot_chat dependency is inherited by nobody. See
 // `PLUGIN.md §Layer Rules` Rule 1, leaf exception.
 
 #include <stdbool.h>

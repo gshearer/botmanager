@@ -247,7 +247,7 @@ const plugin_desc_t bm_plugin_desc = {
   .kind                 = "attack",
   .provides             = { { .name = "feature_attack" } },
   .provides_count       = 1,
-  .requires             = { { .name = "method_text" } },
+  .requires             = { { .name = "bot_chat" } },
   .requires_count       = 1,
   .kv_schema            = atk_kv_schema,
   .kv_schema_count      = sizeof(atk_kv_schema) / sizeof(atk_kv_schema[0]),

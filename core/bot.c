@@ -1990,6 +1990,15 @@ bot_ensure_tables(void)
       "method_kind VARCHAR(64) NOT NULL, "
       "PRIMARY KEY(bot_name, method_kind))",
 
+    // TAXO-2 (2026-08-05), one-time and DELETE ME. The bot plugin was
+    // renamed 'text' -> 'chat'; bot_restore_instances() resolves this
+    // column with plugin_find_type(), so a stored 'text' matches
+    // nothing and every bot is silently left unrestored with only a
+    // WARN. Idempotent, and a no-op on any tree that has been
+    // fresh-started since -- freshstart.sh drops both tables. Drop this
+    // line the first time that happens. See root TODO.md §TAXO-2.
+    "UPDATE bot_instances SET kind = 'chat' WHERE kind = 'text'",
+
     NULL
   };
 

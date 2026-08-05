@@ -2123,7 +2123,7 @@ const plugin_desc_t bm_plugin_desc = {
   .version         = "1.0",
   .type            = PLUGIN_METHOD,
   .kind            = "irc",
-  .provides        = { { .name = "protocol_irc" } },
+  .provides        = { { .name = "method_irc" } },
   .provides_count  = 1,
   .requires_count  = 0,
   .kv_schema            = NULL,

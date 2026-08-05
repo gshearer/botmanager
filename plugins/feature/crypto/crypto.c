@@ -1623,7 +1623,7 @@ const plugin_desc_t bm_plugin_desc = {
   .provides        = { { .name = "cmd_crypto" } },
   .provides_count  = 1,
   .requires        = {
-    { .name = "method_text" },
+    { .name = "bot_chat" },
     { .name = "service_coinmarketcap" },
   },
   .requires_count  = 2,

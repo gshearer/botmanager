@@ -16,7 +16,7 @@
 
 // The voice `!reachy say` speaks in. Plugin-level rather than per-bot
 // because this is a command surface and a command has no bot: when the
-// protocol driver lands, a bound bot gets its own voice from instance KV
+// method driver lands, a bound bot gets its own voice from instance KV
 // and these stay the fallback for anyone typing at the robot directly.
 //
 // The defaults name the rows RCH-4 registers (`llm add model tts kokoro1
@@ -917,7 +917,7 @@ const plugin_desc_t bm_plugin_desc = {
   .provides        = { { .name = "misc_reachycmd" } },
   .provides_count  = 1,
   .requires        = { { .name = "service_reachyapi" },
-                       { .name = "method_text" },
+                       { .name = "bot_chat" },
                        { .name = "inference" } },
   .requires_count  = 3,
   .kv_schema       = reachycmd_kv_schema,

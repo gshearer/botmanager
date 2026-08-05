@@ -1,4 +1,4 @@
-// dispatch.h — command-dispatch half of the text method plugin
+// dispatch.h — command-dispatch half of the chat bot plugin
 //
 // The `text` method fuses two halves into one bot driver: this one,
 // which always interprets inbound lines as potential commands, and the

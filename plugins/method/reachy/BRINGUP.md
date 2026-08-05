@@ -346,7 +346,7 @@ cleared when dispatch returns). Judge by the *action*: check
 # Phase 6 — give a bot ears
 
 ```sh
-build/tools/botmanctl "bot add <name> text"
+build/tools/botmanctl "bot add <name> chat"
 build/tools/botmanctl "bot addmethod <name> reachy"
 build/tools/botmanctl set kv bot.<name>.reachy.speaker <operator-handle>
 build/tools/botmanctl "bot start <name>"

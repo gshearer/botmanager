@@ -1,5 +1,5 @@
 // botmanager — MIT
-// Reachy Mini protocol driver: the robot's ear, wired into the brain.
+// Reachy Mini method driver: the robot's ear, wired into the brain.
 #define REACHY_INTERNAL
 #include "reachy.h"
 
@@ -1977,7 +1977,7 @@ const plugin_desc_t bm_plugin_desc = {
   .type            = PLUGIN_METHOD,
   .kind            = "reachy",
 
-  .provides        = { { .name = "protocol_reachy" } },
+  .provides        = { { .name = "method_reachy" } },
   .provides_count  = 1,
   .requires        = { { .name = "service_reachyapi" } },
   .requires_count  = 1,

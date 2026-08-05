@@ -37,7 +37,7 @@ ExecStartPre=/usr/bin/test -r /mnt/fast/doc/projects/botmanager/senses/whisper/m
 # it is why the STT service URL carries no /v1. Left at the default
 # deliberately — pinning it here would silently diverge from the dialect.
 # --suppress-nst and -nth are the second line of defence against the
-# hallucination documented in plugins/protocol/reachy/TODO.md §HALLUCINATION:
+# hallucination documented in plugins/method/reachy/TODO.md §HALLUCINATION:
 # whisper invents fluent English from a silent room. earbridge's --floor-db
 # gate stops most of it reaching us at all, but the two are complementary and
 # these cost nothing:

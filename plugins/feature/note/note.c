@@ -82,7 +82,7 @@ const plugin_desc_t bm_plugin_desc = {
   .kind                 = "note",
   .provides             = { { .name = "feature_note" } },
   .provides_count       = 1,
-  .requires             = { { .name = "method_text" } },
+  .requires             = { { .name = "bot_chat" } },
   .requires_count       = 1,
   .kv_schema            = note_kv_schema,
   .kv_schema_count      = sizeof(note_kv_schema) / sizeof(note_kv_schema[0]),

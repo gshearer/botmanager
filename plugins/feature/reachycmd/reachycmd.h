@@ -7,9 +7,9 @@
 // plugins/service/reachyapi/.
 //
 // A separate .so from the service it wraps, because reachyapi is NOT a
-// dependency-graph leaf: the reachy protocol driver consumes it too, and
+// dependency-graph leaf: the reachy method driver consumes it too, and
 // a command surface welded into the service would push that surface's
-// upward method_text dependency onto the driver. See
+// upward bot_chat dependency onto the driver. See
 // `PLUGIN.md §Layer Rules` Rule 1.
 
 #ifdef REACHYCMD_INTERNAL
@@ -55,7 +55,7 @@
 
 // Which registered speech model the voice comes out of, and how. These
 // are plugin-level because `!reachy say` is a command surface, not a
-// bot: per-bot voice lives in the protocol driver's instance KV.
+// bot: per-bot voice lives in the method driver's instance KV.
 #define REACHYCMD_KV_TTS_MODEL "plugin.reachycmd.tts_model"
 #define REACHYCMD_KV_TTS_VOICE "plugin.reachycmd.tts_voice"
 #define REACHYCMD_KV_TTS_SPEED "plugin.reachycmd.tts_speed"

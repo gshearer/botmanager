@@ -7,7 +7,7 @@
 // conventions (the percent-encoded dataset id, its stringly enums, its
 // nullable face target) behind reachyapi_api.h. Pure connectivity: no
 // commands, no state, no threads. Presentation belongs to reachycmd,
-// conversation to the reachy protocol driver.
+// conversation to the reachy method driver.
 #define REACHYAPI_INTERNAL
 #include "reachyapi.h"
 
@@ -16,7 +16,7 @@
 // ----------------------------------------------------------------------
 
 // One robot, addressed plugin-wide. Per-bot policy (voice, attention,
-// volume at connect) is instance KV owned by the protocol driver — a
+// volume at connect) is instance KV owned by the method driver — a
 // second robot is what would move these two rows down there, and that
 // day is not today.
 static const plugin_kv_entry_t reachyapi_kv_schema[] = {
@@ -25,7 +25,7 @@ static const plugin_kv_entry_t reachyapi_kv_schema[] = {
     "Base URL of the reachy-mini-daemon HTTP API (no trailing slash)" },
 
   // Nothing in this plugin reads this one: the ear is polled by the
-  // reachy protocol driver, and a plugin that speaks to the robot has
+  // reachy method driver, and a plugin that speaks to the robot has
   // no business speaking to the bridge. It lives here because the two
   // addresses are one robot and belong in one place.
   { REACHYAPI_KV_BRIDGE_URL, KV_STR,

@@ -144,17 +144,17 @@ CREATE TABLE IF NOT EXISTS personalities (
 
 -- The memory subsystem's tables (user_facts, user_fact_embeddings,
 -- conversation_log, conversation_embeddings) used to be declared here.
--- Chunk R1 re-homed the memory subsystem into plugins/method/text/ and
+-- Chunk R1 re-homed the memory subsystem into plugins/bot/chat/ and
 -- memory_register_config() already ensures these tables idempotently at
 -- plugin init time, so a fresh Postgres only grows them once the chat
--- plugin loads. See plugins/method/text/MEMSTORE.md.
+-- plugin loads. See plugins/bot/chat/MEMSTORE.md.
 
 -- Dossiers: the llm bot's single source of truth for participant
 -- memory. A dossier represents one real person observed across chat
 -- rooms, identified by a pluggable per-method signature (IRC nick +
 -- ident + host-tail; Discord stable user-id; etc.). user_id is an
 -- Dossier tables (dossier / dossier_signature / dossier_facts) live
--- in plugins/method/text/ as of R4. The chat plugin's dossier_init path
+-- in plugins/bot/chat/ as of R4. The chat plugin's dossier_init path
 -- creates them on first run via dossier_register_config(); they are
 -- not declared here.
 

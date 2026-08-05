@@ -11,10 +11,10 @@
 // The dossier subsystem is the chat bot's single source of truth for
 // participant memory. Each dossier represents one real person observed
 // in chat, identified by the generic four-field identity tuple every
-// protocol plugin emits per inbound message (nickname, username,
-// hostname, verified_id). The protocol owns how it projects its native
-// identity onto those fields — see plugins/protocol/<kind>/AGENTS.md
-// for the per-protocol contract — and the chat plugin owns scoring.
+// method plugin emits per inbound message (nickname, username,
+// hostname, verified_id). The method owns how it projects its native
+// identity onto those fields — see plugins/method/<kind>/AGENTS.md
+// for the per-method contract — and the chat plugin owns scoring.
 //
 // A dossier optionally links to a registered userns_user via user_id;
 // when set, the dossier is the canonical identity for that user. Until
@@ -46,7 +46,7 @@
 // threshold since token context is thinner.
 #define DOSSIER_MENTION_THRESHOLD  0.7f
 
-// Bounds. method_kind tracks the originating protocol plugin; the
+// Bounds. method_kind tracks the originating method plugin; the
 // quad-tuple field bounds match METHOD_*_SZ in include/method.h.
 #define DOSSIER_METHOD_KIND_SZ  64
 #define DOSSIER_LABEL_SZ        128
@@ -56,7 +56,7 @@
 // A dossier identifier. 0 indicates "no dossier" / "not resolved".
 typedef int64_t dossier_id_t;
 
-// A single protocol-level identity signature. Mirrors the four-field
+// A single method-level identity signature. Mirrors the four-field
 // tuple on method_msg_t (nickname, username, hostname, verified_id)
 // plus the originating method_kind. All char* fields are borrowed
 // references -- the dossier layer copies what it needs.

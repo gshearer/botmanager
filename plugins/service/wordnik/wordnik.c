@@ -925,7 +925,7 @@ wordnik_deinit(void)
   clam(CLAM_INFO, WORDNIK_CTX, "wordnik plugin deinitialized");
 }
 
-// The command half's upward method_text dependency rides on this
+// The command half's upward bot_chat dependency rides on this
 // descriptor. Sound only because wordnik is a dependency-graph leaf —
 // nothing requires service_wordnik, so nothing inherits it. See
 // `PLUGIN.md §Layer Rules` Rule 1, leaf exception.
@@ -937,7 +937,7 @@ const plugin_desc_t bm_plugin_desc = {
   .kind            = WORDNIK_CTX,
   .provides        = { { .name = "service_wordnik" } },
   .provides_count  = 1,
-  .requires        = { { .name = "method_text" } },
+  .requires        = { { .name = "bot_chat" } },
   .requires_count  = 1,
   .kv_schema       = wordnik_kv_schema,
   .kv_schema_count = sizeof(wordnik_kv_schema) / sizeof(wordnik_kv_schema[0]),

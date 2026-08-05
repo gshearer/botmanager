@@ -241,7 +241,7 @@ main(int argc, char *argv[])
   // directly.
 
   // Memory subsystem lives in the text method (R1) -- init / exit
-  // wiring has moved into plugins/method/text/chatbot.c. Core no longer
+  // wiring has moved into plugins/bot/chat/chatbot.c. Core no longer
   // touches it directly.
 
   // Fact extraction lives in the text method as of R2 — the method's

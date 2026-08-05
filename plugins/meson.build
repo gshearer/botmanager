@@ -1,10 +1,10 @@
 subdir('db/postgresql')
-subdir('protocol/irc')
+subdir('method/irc')
 
 # extension/inference — the engine .so plus its command siblings. The
 # engine defines inference_include (its own dir, where inference.h
 # lives), so it must precede every consumer: the siblings below and
-# method/text.
+# bot/chat.
 subdir('extension/inference/engine')
 subdir('extension/inference/ask')
 # imagine_cmd is dormant: it registers the same 'imagine' command as
@@ -17,7 +17,7 @@ subdir('extension/inference/imagine_zimage')
 subdir('extension/inference/claude')
 subdir('extension/inference/search')
 
-subdir('method/text')
+subdir('bot/chat')
 subdir('feature/exchange')
 subdir('service/coinbase')
 subdir('service/kraken')
@@ -52,10 +52,10 @@ subdir('service/giphy')
 subdir('service/rawg')
 subdir('service/wordnik')
 # reachyapi defines reachyapi_include, so it must precede both of its
-# consumers: the command surface and the protocol driver.
+# consumers: the command surface and the method driver.
 subdir('service/reachyapi')
 subdir('feature/reachycmd')
-subdir('protocol/reachy')
+subdir('method/reachy')
 subdir('feature/crypto')
 subdir('misc/math')
 subdir('misc/eightball')

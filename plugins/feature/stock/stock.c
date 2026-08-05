@@ -1311,7 +1311,7 @@ const plugin_desc_t bm_plugin_desc = {
   .kind            = "stock",
   .provides        = { { .name = "cmd_stock" } },
   .provides_count  = 1,
-  .requires        = { { .name = "method_text" },
+  .requires        = { { .name = "bot_chat" },
                        { .name = "stock_quotes" } },
   .requires_count  = 2,
   .kv_schema       = NULL,

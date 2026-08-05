@@ -20,8 +20,8 @@ heartbeats.
                                   │ stable plugin ABI
         ┌─────────────────────────┼─────────────────────────────┐
         │                         │                             │
-   protocol/                  method/                       feature/
-   IRC, botmanctl                text                  whenmoon, exchange
+    method/                    bot/                         feature/
+   IRC, reachy                   chat                  whenmoon, exchange
         │                         │                             │
         └─────────── service/ ────┴──── extension/ ──── strategy/ ──┘
                  coinbase, searxng,     inference                e.g. testing
@@ -34,11 +34,11 @@ heartbeats.
 
 **Microkernel discipline.** A subsystem belongs in core only if
 multiple bot kinds consume it. The architectural test is concrete:
-*could an agent launched in `plugins/method/<kind>/` be productive
+*could an agent launched in `plugins/bot/<kind>/` be productive
 without reading anything outside that directory?* If not, the
 boundary is in the wrong place. Inferencing — the LLM client, RAG
 store, and acquisition pipeline — used to live in core and was
-exiled to `plugins/extension/inference/` when only the chat method
+exiled to `plugins/extension/inference/` when only the chat plugin
 consumed it.
 
 **Asynchronous by construction.** No socket-handling thread ever
@@ -75,8 +75,8 @@ runtime.
 | Layer | Purpose | Examples |
 |---|---|---|
 | `plugins/db/` | Database engine drivers | postgresql |
-| `plugins/protocol/` | Wire protocols | IRC, botmanctl |
-| `plugins/method/` | Bot interaction methods (the kinds) | text (command dispatch + conversation) |
+| `plugins/method/` | How a bot meets humans — modality *and* wire | irc, reachy (voice) |
+| `plugins/bot/` | The mind that drives a bot | chat (command dispatch + conversation) |
 | `plugins/service/` | External API integrations | coinbase, openweather, coinmarketcap, searxng |
 | `plugins/extension/` | Self-contained subsystems with internal structure | inference (engine + `ask`/`claude`/`imagine`/`search`) |
 | `plugins/feature/` | Single focused capabilities atop the stack | whenmoon, exchange, weather, stock |
@@ -109,9 +109,9 @@ contract is a load/unload; the consumer is never recompiled.
 
 ```
   Socket I/O (core)
-    → Method plugin (protocol → normalized message)
+    → Method plugin (wire → normalized message)
       → Bot instance (subscribed to method via callback)
-        → Bot decides what to do based on its kind
+        → Bot plugin decides what to do with it
           → Submits a task to the work queue
             → Worker thread executes the task
               → Response sent back via the originating method
@@ -123,13 +123,14 @@ methods; the bot always replies on the originating method.
 
 ---
 
-## Bot kinds
+## The two kind axes
 
-A bot's *kind* names the method plugin it binds. Adding a method
-plugin (a future `xmpp` or `telegram`) automatically becomes a
-usable bot kind — there is no separate kind taxonomy.
+A bot is a **name + a set of methods + config**. Its *bot kind* names
+the mind driving it (`chat`, the only one); its *method kinds* name how
+it meets humans (`irc`, `reachy`). Adding a method plugin (a future
+`xmpp` or `telegram`) gives every bot a new way to be reached.
 
-**`text`** — Written conversation, in both senses. Every text bot
+**`chat`** — Written conversation, in both senses. Every chat bot
 interprets structured slash commands: hierarchical subcommands,
 declarative argument specs (`cmd_arg_desc_t[]`) that pre-tokenize and
 validate before the handler is invoked, per-method prefixes (`!` on
@@ -339,7 +340,7 @@ is explicitly out of scope.
 - [`DESIGN.md`](DESIGN.md) — full design specification
 - [`PLUGIN.md`](PLUGIN.md) — plugin layer rules and the grep audits
   that enforce them
-- [`plugins/method/text/CHATBOT.md`](plugins/method/text/CHATBOT.md) — chat method internals
+- [`plugins/bot/chat/CHATBOT.md`](plugins/bot/chat/CHATBOT.md) — chat method internals
 - [`KNOWLEDGE.md`](plugins/extension/inference/KNOWLEDGE.md), [`ACQUIRE.md`](plugins/extension/inference/ACQUIRE.md),
   [`LLM.md`](plugins/extension/inference/LLM.md) — inference plugin subsystems
 

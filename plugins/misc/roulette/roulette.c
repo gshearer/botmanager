@@ -150,7 +150,7 @@ const plugin_desc_t bm_plugin_desc = {
   .kind            = "roulette",
   .provides        = { { .name = "misc_roulette" } },
   .provides_count  = 1,
-  .requires        = { { .name = "method_text" } },
+  .requires        = { { .name = "bot_chat" } },
   .requires_count  = 1,
   .kv_schema       = NULL,
   .kv_schema_count = 0,

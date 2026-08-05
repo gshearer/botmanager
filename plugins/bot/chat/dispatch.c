@@ -1,5 +1,5 @@
 // botmanager — MIT
-// Command-dispatch half of the text method: identity, auth, dispatch.
+// Command-dispatch half of the chat bot plugin: identity, auth, dispatch.
 
 #define TEXT_DISPATCH_INTERNAL
 #include "dispatch.h"
@@ -729,7 +729,7 @@ text_dispatch_message(bot_inst_t *inst, const method_msg_t *msg)
 bool
 text_dispatch_register(void)
 {
-  if(cmd_register("text", "identify",
+  if(cmd_register("chat", "identify",
         "identify <username> <password>",
         "Authenticate with the bot",
         NULL,
@@ -737,7 +737,7 @@ text_dispatch_register(void)
         NULL, NULL, text_ad_identify, 2, NULL, NULL) != SUCCESS)
     return(FAIL);
 
-  if(cmd_register("text", "deauth",
+  if(cmd_register("chat", "deauth",
         "deauth",
         "End your authenticated session",
         NULL,
@@ -748,7 +748,7 @@ text_dispatch_register(void)
     return(FAIL);
   }
 
-  if(cmd_register("text", "register",
+  if(cmd_register("chat", "register",
         "register <password>",
         "Set password for a discovered account",
         NULL,
@@ -760,7 +760,7 @@ text_dispatch_register(void)
     return(FAIL);
   }
 
-  if(cmd_register("text", "id",
+  if(cmd_register("chat", "id",
         "id [nickname]",
         "Show identity info for yourself, a nick, or the channel",
         NULL,
