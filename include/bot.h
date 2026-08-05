@@ -172,12 +172,16 @@ bool bot_find_bound_to_driver(const char *driver_name,
 //     running. `kind` is the new plugin's kind, for the KV prefix.
 //
 //   bot_suspend_method() — a method's own state (the socket, the
-//     connection) cannot outlive its mapping, so every bot with a bound
-//     method of that kind is stopped outright, unregistering the method
-//     instance with it.
-//   bot_resume_method() — re-register the per-(bot, method) KV and
-//     start the bot again, which re-creates the method instance from the
-//     reloaded driver and reconnects it.
+//     connection) cannot outlive its mapping, so every RUNNING bot with
+//     a bound method of that kind is stopped outright, unregistering the
+//     method instance with it. A bot that is merely bound is recorded
+//     too and left alone: it holds no instance, but its
+//     bot.<bot>.<method>.* keys are reclaimed with the mapping just the
+//     same, and only the resume puts them back.
+//   bot_resume_method() — re-register the per-(bot, method) KV for every
+//     suspended bot, and start the ones that were running again, which
+//     re-creates the method instance from the reloaded driver and
+//     reconnects it.
 //
 // Each returns the number of bots affected. Resuming a bot that was not
 // suspended is a no-op, so a rollback may call them unconditionally.

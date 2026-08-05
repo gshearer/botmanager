@@ -1616,8 +1616,9 @@ uint32_t
 bot_suspend_method(const char *method_kind)
 {
   char     names[BOT_SUSPEND_MAX][BOT_NAME_SZ];
-  uint32_t n       = 0;
-  uint32_t stopped = 0;
+  uint32_t n         = 0;
+  uint32_t suspended = 0;
+  uint32_t stopped   = 0;
 
   if(method_kind == NULL || method_kind[0] == '\0')
     return(0);
@@ -1626,19 +1627,18 @@ bot_suspend_method(const char *method_kind)
 
   for(bot_inst_t *b = bot_list; b != NULL && n < BOT_SUSPEND_MAX; b = b->next)
   {
-    // Only a running bot holds a method instance — the binding is a name
-    // until bot_start() resolves it.
-    if(b->state != BOT_RUNNING)
-      continue;
-
     for(bot_method_t *m = b->methods; m != NULL; m = m->next)
     {
       if(strncasecmp(m->method_kind, method_kind, PLUGIN_NAME_SZ) != 0)
         continue;
 
+      // Every bound bot is recorded, running or not. Only a running one
+      // holds a method instance — but all of them hold
+      // bot.<name>.<kind>.* registrations that the unload reclaims, and
+      // the resume is the only thing that puts those back.
       memset(&b->susp, 0, sizeof(b->susp));
       b->susp.method      = true;
-      b->susp.was_running = true;
+      b->susp.was_running = (b->state == BOT_RUNNING);
       snprintf(b->susp.method_kind, sizeof(b->susp.method_kind), "%s",
           method_kind);
 
@@ -1657,12 +1657,26 @@ bot_suspend_method(const char *method_kind)
   for(uint32_t i = 0; i < n; i++)
   {
     bot_inst_t *b = bot_find(names[i]);
+    bool        was_running;
 
     if(b == NULL)
       continue;
 
+    pthread_mutex_lock(&bot_mutex);
+    was_running = b->susp.was_running;
+    pthread_mutex_unlock(&bot_mutex);
+
+    // A bot that never started has no instance to tear down; its binding
+    // is still just a name. Suspending it is bookkeeping alone.
+    if(!was_running)
+    {
+      suspended++;
+      continue;
+    }
+
     if(bot_stop(b) == SUCCESS)
     {
+      suspended++;
       stopped++;
       continue;
     }
@@ -1675,19 +1689,21 @@ bot_suspend_method(const char *method_kind)
     pthread_mutex_unlock(&bot_mutex);
   }
 
-  if(stopped > 0)
+  if(suspended > 0)
     clam(CLAM_INFO, "bot_suspend",
-        "stopped %u bot(s) bound to method '%s'", stopped, method_kind);
+        "suspended %u bot(s) bound to method '%s'; %u stopped",
+        suspended, method_kind, stopped);
 
-  return(stopped);
+  return(suspended);
 }
 
 uint32_t
 bot_resume_method(const char *method_kind)
 {
   char     names[BOT_SUSPEND_MAX][BOT_NAME_SZ];
-  uint32_t n       = 0;
-  uint32_t resumed = 0;
+  uint32_t n         = 0;
+  uint32_t resumed   = 0;
+  uint32_t restarted = 0;
 
   if(method_kind == NULL || method_kind[0] == '\0')
     return(0);
@@ -1715,7 +1731,9 @@ bot_resume_method(const char *method_kind)
       continue;
 
     // Same rebind as a driver resume, one tier down: these are the
-    // bot.<bot>.<method>.* keys the method plugin declared.
+    // bot.<bot>.<method>.* keys the method plugin declared. Every
+    // suspended bot gets them back, whether or not it was running —
+    // for a bot that never started this is the whole of the resume.
     bot_register_method_kv(names[i], method_kind);
 
     pthread_mutex_lock(&bot_mutex);
@@ -1725,12 +1743,17 @@ bot_resume_method(const char *method_kind)
 
     // bot_start() re-resolves the method plugin by kind, so the
     // instance it creates comes from the mapping that just arrived.
-    if(start && bot_start(b) != SUCCESS)
+    if(start)
     {
-      clam(CLAM_WARN, "bot_resume",
-          "'%s': would not start after the '%s' reload",
-          names[i], method_kind);
-      continue;
+      if(bot_start(b) != SUCCESS)
+      {
+        clam(CLAM_WARN, "bot_resume",
+            "'%s': would not start after the '%s' reload",
+            names[i], method_kind);
+        continue;
+      }
+
+      restarted++;
     }
 
     resumed++;
@@ -1738,7 +1761,8 @@ bot_resume_method(const char *method_kind)
 
   if(resumed > 0)
     clam(CLAM_INFO, "bot_resume",
-        "restarted %u bot(s) on method '%s'", resumed, method_kind);
+        "rebound %u bot(s) to method '%s'; %u restarted",
+        resumed, method_kind, restarted);
 
   return(resumed);
 }
