@@ -142,9 +142,6 @@ cmd_bot_refresh_prompts(const cmd_ctx_t *ctx)
   cmd_reply(ctx, buf);
 }
 
-// chat-kind filter: static storage, cmd_register keeps the pointer.
-static const char *const chat_kind_filter[] = { "chat", NULL };
-
 // NL hint for /hush. The chat plugin's NL bridge forwards the
 // LLM-emitted slash line directly; any future translation from bare
 // "hush <nick>" into the parent-scoped "/bot <name> hush <duration>"
@@ -191,7 +188,7 @@ chatbot_cmds_register(void)
         USERNS_GROUP_ADMIN, 100, CMD_SCOPE_ANY, METHOD_T_ANY,
         cmd_bot_hush, NULL, "bot", NULL,
         ad_bot_hush, (uint8_t)(sizeof(ad_bot_hush) / sizeof(ad_bot_hush[0])),
-        chat_kind_filter, &chat_hush_nl) != SUCCESS)
+        NULL, &chat_hush_nl) != SUCCESS)
     return(FAIL);
 
   if(chatbot_dossiersweep_cmd_register() != SUCCESS)
@@ -213,7 +210,7 @@ chatbot_cmds_register(void)
         "acquisition engine.",
         USERNS_GROUP_ADMIN, 100, CMD_SCOPE_ANY, METHOD_T_ANY,
         cmd_bot_refresh_prompts, NULL, "bot", NULL,
-        NULL, 0, chat_kind_filter, NULL) != SUCCESS)
+        NULL, 0, NULL, NULL) != SUCCESS)
     goto fail_refresh_prompts;
 
   return(SUCCESS);

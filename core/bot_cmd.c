@@ -451,6 +451,68 @@ admin_cmd_bot_unbind(const cmd_ctx_t *ctx)
   }
 }
 
+// ---- method-scoped verb resolution -------------------------------------
+
+// True when `inst` may reach `child`. A NULL kind_filter is offered to
+// every bot -- that is how the mind's own verbs, and the kind-agnostic
+// bot start/stop children, stay universally available. Otherwise the
+// filter names method kinds, and one bound method is enough.
+static bool
+bot_admits_child(const bot_inst_t *inst, const cmd_def_t *child)
+{
+  const char *const *filter = cmd_kind_filter_of(child);
+
+  if(filter == NULL)
+    return(true);
+
+  for(size_t i = 0; i < CMD_KIND_FILTER_MAX && filter[i] != NULL; i++)
+    if(bot_has_method_kind(inst, filter[i]))
+      return(true);
+
+  return(false);
+}
+
+// Per-child callback for cmd_find_child_for_bot.
+static void
+cmd_find_child_iter_cb(const cmd_def_t *c, void *data)
+{
+  bot_cmd_child_match_t *w = data;
+  const char *cname;
+  const char *abbr;
+
+  if(w->exact != NULL || !bot_admits_child(w->inst, c))
+    return;
+
+  cname = cmd_get_name(c);
+  if(cname != NULL && strncasecmp(cname, w->name, CMD_NAME_SZ) == 0)
+  {
+    w->exact = c;
+    return;
+  }
+
+  abbr = cmd_get_abbrev(c);
+  if(w->abbrev == NULL && abbr != NULL && abbr[0] != '\0'
+      && strncasecmp(abbr, w->name, CMD_NAME_SZ) == 0)
+    w->abbrev = c;
+}
+
+// Resolve a verb under `parent` against the methods `inst` has bound.
+// Name resolution mirrors cmd_find_child(): exact name beats abbrev,
+// and among equals the first registered child wins.
+static const cmd_def_t *
+cmd_find_child_for_bot(const cmd_def_t *parent, const char *name,
+    const bot_inst_t *inst)
+{
+  bot_cmd_child_match_t w = { name, inst, NULL, NULL };
+
+  if(parent == NULL || inst == NULL || name == NULL || name[0] == '\0')
+    return(NULL);
+
+  cmd_iterate_children(parent, cmd_find_child_iter_cb, &w);
+
+  return(w.exact != NULL ? w.exact : w.abbrev);
+}
+
 // /bot — dispatcher for subcommands
 // Parent handler: usage only. Every bot-scoped subcommand takes an
 // explicit <name> argument -- no session state.
@@ -459,12 +521,11 @@ admin_cmd_bot(const cmd_ctx_t *ctx)
 {
   // Subcommand resolution already consumed known children (add, del,
   // start, stop, addmethod, delmethod). Anything left in ctx->args is
-  // a name-first invocation: /bot <name> <kind> <verb> [args...].
+  // a name-first invocation: /bot <name> <verb> [args...].
   const char *p = ctx->args;
   char name[BOT_NAME_SZ] = {0};
   size_t n = 0;
   bot_inst_t *inst;
-  const char *kind;
   char verb[CMD_NAME_SZ] = {0};
   size_t vn = 0;
   const cmd_def_t *bot_root;
@@ -496,8 +557,6 @@ admin_cmd_bot(const cmd_ctx_t *ctx)
     return;
   }
 
-  kind = bot_driver_name(inst);
-
   // Pull the first whitespace-delimited token after <name> as the verb.
   while(*p != '\0' && *p != ' ' && *p != '\t' && vn + 1 < sizeof(verb))
     verb[vn++] = *p++;
@@ -517,14 +576,14 @@ admin_cmd_bot(const cmd_ctx_t *ctx)
   }
 
   bot_root = cmd_find("bot");
-  child    = cmd_find_child_for_kind(bot_root, verb, kind);
+  child    = cmd_find_child_for_bot(bot_root, verb, inst);
 
   if(child == NULL)
   {
-    char buf[CMD_NAME_SZ + PLUGIN_NAME_SZ + 64];
+    char buf[CMD_NAME_SZ + BOT_NAME_SZ + 64];
 
     snprintf(buf, sizeof(buf),
-        "unknown verb '%s' for bot kind '%s'", verb, kind);
+        "unknown verb '%s' for bot %s", verb, name);
     cmd_reply(ctx, buf);
     return;
   }
@@ -596,8 +655,8 @@ cmd_show_bots(const cmd_ctx_t *ctx)
 }
 
 // /show bot <name> [<verb> [args...]] — detailed bot status or a
-// kind-scoped verb registered under "show/bot" via cmd_register(, NULL) with
-// a kind_filter that names the bot driver kind.
+// method-scoped verb registered under "show/bot" via cmd_register(, NULL)
+// with a kind_filter that names a method the bot has bound.
 
 static const cmd_arg_desc_t ad_show_bot[] = {
   { "name", CMD_ARG_ALNUM, CMD_ARG_REQUIRED,            BOT_NAME_SZ, NULL },
@@ -619,24 +678,14 @@ help_ext_next_tok(const char *p, char *buf, size_t sz)
 
 // ---- unified-tree help extender helpers --------------------------------
 
-// State passed to the help-list iteration callback.
-typedef struct
-{
-  const cmd_ctx_t *ctx;
-  const char      *kind;      // bot kind to filter against (NULL = agnostic)
-  uint32_t         count;
-} help_list_ctx_t;
-
-// Per-child callback for help_list_children_for_kind.
-// Emits one line when the child's kind_filter admits ctx->kind and the
-// child name is user-addressable (non-empty, not a ":*" sentinel).
+// Per-child callback for help_list_children_for_bot.
+// Emits one line when the child is reachable and its name is
+// user-addressable (non-empty, not a ":*" sentinel).
 static void
 help_list_iter_cb(const cmd_def_t *c, void *data)
 {
   help_list_ctx_t *wp = data;
   const char *name = cmd_get_name(c);
-  const cmd_def_t *parent;
-  const cmd_def_t *match;
   const char *abbr;
   const char *desc;
   char line[256];
@@ -644,14 +693,12 @@ help_list_iter_cb(const cmd_def_t *c, void *data)
   if(name == NULL || name[0] == '\0' || name[0] == ':')
     return;
 
-  // Re-resolve through cmd_find_child_for_kind: accept this child only
-  // if the kind filter matches. A distinct child may share the same
-  // name under different kinds; the first-match rule in the resolver
-  // is acceptable for listing since we visit each child exactly once.
-  parent = cmd_get_parent(c);
-  match  = cmd_find_child_for_kind(parent, name, wp->kind);
-
-  if(match != c)
+  // With a bot in hand, list only what that bot's dispatcher would
+  // actually reach: two same-named siblings may coexist when their
+  // method filters are disjoint, and only one of them ever answers.
+  // Without one, the listing is the whole surface and shows both.
+  if(wp->inst != NULL
+      && cmd_find_child_for_bot(cmd_get_parent(c), name, wp->inst) != c)
     return;
 
   abbr = cmd_get_abbrev(c);
@@ -663,15 +710,16 @@ help_list_iter_cb(const cmd_def_t *c, void *data)
   wp->count++;
 }
 
-// List children of `parent` whose kind_filter admits `kind`. Emits one
-// line per child via cmd_reply. Children with empty or ":*" names are
-// skipped (the default handler is not a user-addressable verb).
-// Returns the number of verbs listed.
+// List the children of `parent` that `inst` can reach, one line each,
+// via cmd_reply. A NULL `inst` lists every child -- that is the
+// bot-less "/help bot" survey, not a bot with no methods. Children with
+// empty or ":*" names are skipped (the default handler is not a
+// user-addressable verb). Returns the number of verbs listed.
 static uint32_t
-help_list_children_for_kind(const cmd_ctx_t *ctx,
-    const cmd_def_t *parent, const char *kind)
+help_list_children_for_bot(const cmd_ctx_t *ctx,
+    const cmd_def_t *parent, const bot_inst_t *inst)
 {
-  help_list_ctx_t w = { ctx, kind, 0 };
+  help_list_ctx_t w = { ctx, inst, 0 };
 
   if(parent == NULL)
     return(0);
@@ -679,7 +727,7 @@ help_list_children_for_kind(const cmd_ctx_t *ctx,
   cmd_iterate_children(parent, help_list_iter_cb, &w);
 
   if(w.count == 0)
-    cmd_reply(ctx, "  (no verbs registered for this bot kind)");
+    cmd_reply(ctx, "  (no verbs registered for this bot)");
   else
   {
     char line[64];
@@ -694,14 +742,14 @@ help_list_children_for_kind(const cmd_ctx_t *ctx,
 // Emit long-form help for one verb child. Returns true on success.
 static bool
 help_one_verb(const cmd_ctx_t *ctx, const cmd_def_t *parent,
-    const char *verb, const char *kind)
+    const char *verb, const bot_inst_t *inst)
 {
   const cmd_def_t *child;
   const char *usage;
   const char *desc;
   const char *lng;
 
-  child = cmd_find_child_for_kind(parent, verb, kind);
+  child = cmd_find_child_for_bot(parent, verb, inst);
   if(child == NULL)
     return(false);
 
@@ -733,7 +781,6 @@ help_ext_bot(const cmd_ctx_t *ctx, const char *rest)
   char name[BOT_NAME_SZ] = {0};
   const cmd_def_t *bot_root;
   bot_inst_t *inst;
-  const char *kind;
   char verb[32] = {0};
 
   rest = help_ext_next_tok(rest, name, sizeof(name));
@@ -742,8 +789,8 @@ help_ext_bot(const cmd_ctx_t *ctx, const char *rest)
   if(name[0] == '\0')
   {
     cmd_reply(ctx, "");
-    cmd_reply(ctx, "available /bot <name> verbs (kind-agnostic + all kinds):");
-    help_list_children_for_kind(ctx, bot_root, NULL);
+    cmd_reply(ctx, "available /bot <name> verbs (every bot, every method):");
+    help_list_children_for_bot(ctx, bot_root, NULL);
     return;
   }
 
@@ -757,20 +804,19 @@ help_ext_bot(const cmd_ctx_t *ctx, const char *rest)
     return;
   }
 
-  kind = bot_driver_name(inst);
   help_ext_next_tok(rest, verb, sizeof(verb));
 
   if(verb[0] == '\0')
   {
-    char hdr[BOT_NAME_SZ + PLUGIN_NAME_SZ + 64];
+    char hdr[BOT_NAME_SZ + 32];
 
-    snprintf(hdr, sizeof(hdr), "verbs for /bot %s (%s):", name, kind);
+    snprintf(hdr, sizeof(hdr), "verbs for /bot %s:", name);
     cmd_reply(ctx, hdr);
-    help_list_children_for_kind(ctx, bot_root, kind);
+    help_list_children_for_bot(ctx, bot_root, inst);
     return;
   }
 
-  if(!help_one_verb(ctx, bot_root, verb, kind))
+  if(!help_one_verb(ctx, bot_root, verb, inst))
   {
     char buf[64];
 
@@ -787,7 +833,6 @@ help_ext_show_bot(const cmd_ctx_t *ctx, const char *rest)
   const cmd_def_t *show_root;
   const cmd_def_t *show_bot;
   bot_inst_t *inst;
-  const char *kind;
   char verb[32] = {0};
 
   rest = help_ext_next_tok(rest, name, sizeof(name));
@@ -798,8 +843,9 @@ help_ext_show_bot(const cmd_ctx_t *ctx, const char *rest)
   if(name[0] == '\0')
   {
     cmd_reply(ctx, "");
-    cmd_reply(ctx, "available /show bot <name> verbs (kind-agnostic + all kinds):");
-    help_list_children_for_kind(ctx, show_bot, NULL);
+    cmd_reply(ctx,
+        "available /show bot <name> verbs (every bot, every method):");
+    help_list_children_for_bot(ctx, show_bot, NULL);
     return;
   }
 
@@ -813,21 +859,19 @@ help_ext_show_bot(const cmd_ctx_t *ctx, const char *rest)
     return;
   }
 
-  kind = bot_driver_name(inst);
   help_ext_next_tok(rest, verb, sizeof(verb));
 
   if(verb[0] == '\0')
   {
-    char hdr[BOT_NAME_SZ + PLUGIN_NAME_SZ + 64];
+    char hdr[BOT_NAME_SZ + 32];
 
-    snprintf(hdr, sizeof(hdr),
-        "verbs for /show bot %s (%s):", name, kind);
+    snprintf(hdr, sizeof(hdr), "verbs for /show bot %s:", name);
     cmd_reply(ctx, hdr);
-    help_list_children_for_kind(ctx, show_bot, kind);
+    help_list_children_for_bot(ctx, show_bot, inst);
     return;
   }
 
-  if(!help_one_verb(ctx, show_bot, verb, kind))
+  if(!help_one_verb(ctx, show_bot, verb, inst))
   {
     char buf[64];
 
@@ -855,11 +899,11 @@ cmd_show_bot(const cmd_ctx_t *ctx)
   if(inst == NULL)
     return;
 
-  // Kind-scoped verb dispatch against the unified command tree:
+  // Method-scoped verb dispatch against the unified command tree:
   //   /show bot <name>                -> ":default" (if any) else identity
-  //   /show bot <name> <verb> [args]  -> kind-filtered child under show/bot
+  //   /show bot <name> <verb> [args]  -> a child under show/bot this bot
+  //                                      has the methods to reach
   {
-    const char *kind = bot_driver_name(inst);
     const cmd_def_t *show_root = cmd_find("show");
     const cmd_def_t *show_bot  =
         show_root != NULL ? cmd_find_child(show_root, "bot") : NULL;
@@ -884,10 +928,10 @@ cmd_show_bot(const cmd_ctx_t *ctx)
 
     if(verb[0] == '\0')
     {
-      // No verb given. Try the per-kind ":default" child first; fall
+      // No verb given. Try this bot's ":default" child first; fall
       // through to the identity render if none is registered.
       const cmd_def_t *dflt =
-          cmd_find_child_for_kind(show_bot, ":default", kind);
+          cmd_find_child_for_bot(show_bot, ":default", inst);
 
       if(dflt != NULL)
       {
@@ -907,13 +951,13 @@ cmd_show_bot(const cmd_ctx_t *ctx)
       const cmd_def_t *child;
       cmd_ctx_t sub;
 
-      child = cmd_find_child_for_kind(show_bot, verb, kind);
+      child = cmd_find_child_for_bot(show_bot, verb, inst);
       if(child == NULL)
       {
-        char buf[CMD_NAME_SZ + PLUGIN_NAME_SZ + 64];
+        char buf[CMD_NAME_SZ + BOT_NAME_SZ + 64];
 
         snprintf(buf, sizeof(buf),
-            "unknown verb '%s' for bot kind '%s'", verb, kind);
+            "unknown verb '%s' for bot %s", verb, name);
         cmd_reply(ctx, buf);
         return;
       }
@@ -1165,24 +1209,24 @@ bot_register_commands(void)
       NULL, 0, NULL, NULL);
 
   // /show bot <name> [<verb> ...] -- detailed bot status, or a
-  // kind-scoped verb registered as a child of "show/bot" via
+  // method-scoped verb registered as a child of "show/bot" via
   // cmd_register(, NULL) with a matching kind_filter.
   cmd_register("bot", "bot",
       "show bot <name> [<verb> [args...]]",
-      "Show bot details or a kind-specific verb",
+      "Show bot details or a verb the bot's methods offer",
       "With just <name>, renders identity: state, autostart, methods,\n"
       "identities. With a trailing verb, dispatches to the first child of\n"
-      "show/bot whose name matches and whose kind_filter admits the\n"
-      "bot's driver kind (chat: personas, memories, stats, candidates,\n"
-      "knowledge, interests).",
+      "show/bot whose name matches and whose kind_filter is either empty\n"
+      "or names a method this bot has bound (every bot: personas,\n"
+      "memories, stats, candidates, knowledge, interests, model).",
       USERNS_GROUP_ADMIN, 100, CMD_SCOPE_ANY, METHOD_T_ANY, cmd_show_bot, NULL, "show", NULL,
       ad_show_bot, (uint8_t)(sizeof(ad_show_bot)/sizeof(ad_show_bot[0])), NULL, &show_bot_nl);
 
-  // Context-sensitive help: /help show bot <name> lists kind-scoped
-  // verbs registered under "show/bot" with a matching kind_filter.
+  // Context-sensitive help: /help show bot <name> lists the verbs
+  // registered under "show/bot" that this bot's methods admit.
   cmd_set_help_extender("show", "bot", help_ext_show_bot);
 
-  // /help bot <name>: list kind-scoped verbs registered under "bot"
+  // /help bot <name>: list method-scoped verbs registered under "bot"
   // (e.g. llm personas). Extends /bot (a root command) when /help's
   // tokens don't match a static subcommand.
   cmd_set_help_extender("bot", NULL, help_ext_bot);

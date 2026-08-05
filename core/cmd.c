@@ -772,69 +772,16 @@ cmd_find_child(const cmd_def_t *parent, const char *name)
   return(c);
 }
 
-// True if the child's kind_filter accepts bot_kind. Callers in this
-// file may hold cmd_mutex; no locking needed -- kind_filter arrays are
-// caller-owned static storage, never mutated after registration.
-// NOTE: file-local; declared static.
-static bool
-kind_filter_matches(const char *const *kind_filter, const char *bot_kind)
+// The definition's own allowlist, verbatim. Deciding whether a bot may
+// reach a verb is core/bot_cmd.c's job -- what a method kind means is
+// knowledge this registry deliberately does not carry. No lock: the
+// array is caller-owned static storage, never mutated after
+// registration, and the pointer field is written once under cmd_mutex
+// before the definition is ever reachable.
+const char *const *
+cmd_kind_filter_of(const cmd_def_t *def)
 {
-  if(kind_filter == NULL)
-    return(true);           // kind-agnostic child matches anything
-
-  if(bot_kind == NULL)
-    return(false);          // kind-agnostic context, filtered child skipped
-
-  for(size_t i = 0;
-      i < CMD_KIND_FILTER_MAX && kind_filter[i] != NULL; i++)
-    if(strcasecmp(kind_filter[i], bot_kind) == 0)
-      return(true);
-
-  return(false);
-}
-
-// Find a kind-scoped child. Name resolution matches cmd_find_child
-// (exact-name then abbrev). On a name match, the child's kind_filter
-// is tested; if the filter rejects the bot_kind, iteration continues.
-const cmd_def_t *
-cmd_find_child_for_kind(const cmd_def_t *parent, const char *name,
-    const char *bot_kind)
-{
-  cmd_def_t *exact_match  = NULL;
-  cmd_def_t *abbrev_match = NULL;
-
-  if(parent == NULL || name == NULL || name[0] == '\0')
-    return(NULL);
-
-  pthread_mutex_lock(&cmd_mutex);
-
-  for(cmd_def_t *c = parent->children; c != NULL; c = c->sibling)
-  {
-    if(!kind_filter_matches(c->kind_filter, bot_kind))
-      continue;
-
-    if(exact_match == NULL
-        && strncasecmp(c->name, name, CMD_NAME_SZ) == 0)
-      exact_match = c;
-    else if(abbrev_match == NULL && c->abbrev[0] != '\0'
-        && strncasecmp(c->abbrev, name, CMD_NAME_SZ) == 0)
-      abbrev_match = c;
-  }
-
-  pthread_mutex_unlock(&cmd_mutex);
-  return(exact_match != NULL ? exact_match : abbrev_match);
-}
-
-// Walk upward through parents, returning the first kind_filter's
-// leading entry. NULL = kind-agnostic (no ancestor declares a filter).
-const char *
-cmd_kind_of(const cmd_def_t *def)
-{
-  for(const cmd_def_t *p = def; p != NULL; p = p->parent)
-    if(p->kind_filter != NULL && p->kind_filter[0] != NULL)
-      return(p->kind_filter[0]);
-
-  return(NULL);
+  return(def != NULL ? def->kind_filter : NULL);
 }
 
 // Get global command count.

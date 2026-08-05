@@ -317,12 +317,13 @@ void bot_exit(void);
 // Must be called after cmd_init().
 void bot_register_commands(void);
 
-// Kind-scoped bot verbs:
-// Bot-kind-specific verbs (e.g. llm's "personas" and "memories")
-// register as children of "show/bot" or "bot" via cmd_register() with
-// a non-NULL kind_filter. Dispatchers in core/bot_cmd.c resolve them
-// with cmd_find_child_for_kind() so only children whose filter admits
-// the bot's driver kind match.
+// Method-scoped bot verbs:
+// A verb registers as a child of "bot" or "show/bot" via cmd_register()
+// and is offered to a bot when its kind_filter is NULL or names a
+// method the bot has bound. Dispatchers in core/bot_cmd.c resolve them
+// with bot_has_method_kind(), so a verb is scoped by what the bot can
+// do, never by the plugin that gives it a mind -- every bot shares one
+// of those, which is why the mind's own verbs register kind-agnostic.
 
 // Forward decl: cmd_ctx_t lives in cmd.h (tagged struct) and is
 // passed through opaque where needed.
@@ -449,6 +450,25 @@ typedef struct
   const cmd_ctx_t *ctx;
   uint32_t         count;
 } bot_cmd_list_state_t;
+
+// Accumulator for cmd_find_child_for_bot()'s child iteration. Exact
+// name beats abbrev, so both are collected and the exact one wins.
+typedef struct
+{
+  const char         *name;     // verb the caller typed
+  const bot_inst_t   *inst;     // bot whose methods gate the match
+  const cmd_def_t    *exact;
+  const cmd_def_t    *abbrev;
+} bot_cmd_child_match_t;
+
+// State threaded through help_list_children_for_bot()'s iteration.
+// A NULL `inst` means "list every child", not "a bot with no methods".
+typedef struct
+{
+  const cmd_ctx_t  *ctx;
+  const bot_inst_t *inst;
+  uint32_t          count;
+} help_list_ctx_t;
 
 #endif // BOT_CMD_INTERNAL
 

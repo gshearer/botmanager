@@ -881,23 +881,24 @@ static const cmd_nl_t show_bot_model_nl = {
 
 // ---- registration ------------------------------------------------------
 
-// chat-kind filter, NUL-terminated. Storage must be static -- cmd_register
-// keeps the pointer.
-static const char *const chat_kind_filter[] = { "chat", NULL };
-
+// Every verb below registers kind-agnostic (kind_filter NULL). A
+// kind_filter names *method* kinds, and these verbs belong to the mind
+// that drives every bot -- there is no method to name.
+//
 // Called from chatbot plugin init (chatbot.c) once per plugin load.
 bool
 chatbot_show_verbs_register(void)
 {
-  // The sole :default sentinel for the chat kind — it renders both
-  // halves (see verb_text_summary). A second one would collide.
+  // The sole :default sentinel under show/bot — it renders both halves
+  // (see verb_text_summary). With no kind_filter to keep them apart, a
+  // second one collides outright.
   if(cmd_register("chat", ":default",
         "show bot <name>",
         "Text bot summary (commands, converse toggle, persona, model)",
         NULL,
         USERNS_GROUP_ADMIN, 100, CMD_SCOPE_ANY, METHOD_T_ANY,
         verb_text_summary_wrapper, NULL, "show/bot", NULL,
-        NULL, 0, chat_kind_filter, NULL) != SUCCESS)
+        NULL, 0, NULL, NULL) != SUCCESS)
     return(FAIL);
 
   if(cmd_register("llm", "personas",
@@ -906,7 +907,7 @@ chatbot_show_verbs_register(void)
         NULL,
         USERNS_GROUP_ADMIN, 100, CMD_SCOPE_ANY, METHOD_T_ANY,
         verb_llm_personas_wrapper, NULL, "show/bot", NULL,
-        NULL, 0, chat_kind_filter, NULL) != SUCCESS)
+        NULL, 0, NULL, NULL) != SUCCESS)
     return(FAIL);
 
   if(cmd_register("llm", "memories",
@@ -915,7 +916,7 @@ chatbot_show_verbs_register(void)
         NULL,
         USERNS_GROUP_ADMIN, 100, CMD_SCOPE_ANY, METHOD_T_ANY,
         verb_llm_memories_wrapper, NULL, "show/bot", NULL,
-        NULL, 0, chat_kind_filter, NULL) != SUCCESS)
+        NULL, 0, NULL, NULL) != SUCCESS)
     return(FAIL);
 
   if(cmd_register("llm", "stats",
@@ -924,7 +925,7 @@ chatbot_show_verbs_register(void)
         NULL,
         USERNS_GROUP_ADMIN, 100, CMD_SCOPE_ANY, METHOD_T_ANY,
         verb_stats_wrapper, NULL, "show/bot", NULL,
-        NULL, 0, chat_kind_filter, NULL) != SUCCESS)
+        NULL, 0, NULL, NULL) != SUCCESS)
     return(FAIL);
 
   if(cmd_register("llm", "knowledge",
@@ -933,7 +934,7 @@ chatbot_show_verbs_register(void)
         NULL,
         USERNS_GROUP_ADMIN, 100, CMD_SCOPE_ANY, METHOD_T_ANY,
         verb_llm_knowledge_wrapper, NULL, "show/bot", NULL,
-        NULL, 0, chat_kind_filter, NULL) != SUCCESS)
+        NULL, 0, NULL, NULL) != SUCCESS)
     return(FAIL);
 
   if(cmd_register("llm", "interests",
@@ -942,7 +943,7 @@ chatbot_show_verbs_register(void)
         NULL,
         USERNS_GROUP_ADMIN, 100, CMD_SCOPE_ANY, METHOD_T_ANY,
         verb_llm_interests_wrapper, NULL, "show/bot", NULL,
-        NULL, 0, chat_kind_filter, NULL) != SUCCESS)
+        NULL, 0, NULL, NULL) != SUCCESS)
     return(FAIL);
 
   // Everyone-gated by design so the NL bridge can route "what LLM are
@@ -957,7 +958,7 @@ chatbot_show_verbs_register(void)
         "like \"what LLM are you?\" via the NL bridge.",
         USERNS_GROUP_EVERYONE, 0, CMD_SCOPE_ANY, METHOD_T_ANY,
         verb_model_wrapper, NULL, "show/bot", NULL,
-        NULL, 0, chat_kind_filter, &show_bot_model_nl) != SUCCESS)
+        NULL, 0, NULL, &show_bot_model_nl) != SUCCESS)
     return(FAIL);
 
   // /show extract {root,stats} — plain /show children, no kind filter.

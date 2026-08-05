@@ -16,6 +16,11 @@
 #define CMD_MAX_ARGS     8
 #define CMD_ARG_SZ       256
 
+// Maximum entries scanned in a kind_filter array. The array itself is
+// NULL-terminated; this cap exists only to bound resolution and
+// help-listing loops against pathologically long filters.
+#define CMD_KIND_FILTER_MAX 8
+
 typedef struct cmd_def cmd_def_t;
 
 // Controls where a command may be used. Scope is enforced during
@@ -187,9 +192,11 @@ typedef void (*cmd_help_extender_t)(const cmd_ctx_t *ctx,
 // methods is a bitmask of method types this command is visible on
 // (METHOD_T_ANY for all, or e.g. METHOD_T_BOTMANCTL | METHOD_T_IRC).
 // abbrev must be unique among siblings.
-// kind_filter is a NULL-terminated array of bot-kind strings this
-// command applies to; NULL = kind-agnostic. Storage is caller-owned
-// and must be static -- the registry keeps the pointer.
+// kind_filter is a NULL-terminated array of *method* kind strings; a
+// verb registered under "bot" or "show/bot" is offered to a bot when
+// the filter is NULL (every bot) or names a method that bot has bound.
+// Storage is caller-owned and must be static -- the registry keeps the
+// pointer.
 // nl is an optional static caller-owned natural-language hint.
 bool cmd_register(const char *module, const char *name,
     const char *usage, const char *description,
@@ -237,18 +244,12 @@ const cmd_def_t *cmd_find(const char *name);
 
 const cmd_def_t *cmd_find_child(const cmd_def_t *parent, const char *name);
 
-// Find a child whose kind_filter matches the given bot kind. Name
-// resolution is identical to cmd_find_child (exact match before abbrev).
-// A child with kind_filter == NULL is kind-agnostic and matches any
-// bot kind. When bot_kind == NULL, only kind-agnostic children match.
-const cmd_def_t *cmd_find_child_for_kind(const cmd_def_t *parent,
-    const char *name, const char *bot_kind);
-
-// Return the bot-kind string that a command is filtered to, walking
-// upward through the parent chain. Returns NULL for kind-agnostic
-// commands. Used by help traversal to decide whether a child applies
-// to a particular bot.
-const char *cmd_kind_of(const cmd_def_t *def);
+// The definition's own kind_filter, or NULL when it is kind-agnostic.
+// The returned array is the caller-owned static storage handed to
+// cmd_register(); read it with CMD_KIND_FILTER_MAX as the bound.
+// core/bot_cmd.c is the interpreter -- it decides which bots a filter
+// admits (see include/bot.h §Method-scoped bot verbs).
+const char *const *cmd_kind_filter_of(const cmd_def_t *def);
 
 uint32_t cmd_count(void);
 
@@ -398,11 +399,6 @@ void cmd_exit(void);
 #include "validate.h"
 #include "version.h"
 
-// Maximum entries scanned in a kind_filter array during display
-// iteration. The array itself is NUL-terminated; this cap exists only
-// to bound help-listing loops against pathologically long filters.
-#define CMD_KIND_FILTER_MAX 8
-
 // Upper bound on the number of definitions cmd_unregister_path() will
 // remove in one call. A subtree larger than this is a registration bug,
 // not a legitimate case, so the unregister refuses rather than growing.
@@ -430,7 +426,7 @@ struct cmd_def
   method_type_t methods;                // bitmask of method types visible on
   const cmd_arg_desc_t *arg_desc;       // argument descriptors (NULL = none)
   uint8_t     arg_count;                // number of entries in arg_desc
-  const char *const *kind_filter;       // NULL-terminated kind array; NULL = kind-agnostic
+  const char *const *kind_filter;       // NULL-terminated method-kind array; NULL = every bot
   const cmd_nl_t *nl;                   // NL hint (static, caller-owned) or NULL
   const void *owner_pc;                 // cmd_register() call site; identifies the owning object
   cmd_def_t  *parent;                   // parent command (NULL for root)
