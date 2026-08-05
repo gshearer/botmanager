@@ -54,7 +54,7 @@ regex (the literal context portion, before any `<placeholder>`).
 | `bot_register_driver_kv` | core/bot.c | per-driver KV registration |
 | `bot_register_method_kv` | core/bot.c | per-method KV registration |
 | `bot_restore` | core/bot.c | bot restore from persistent store |
-| `bot_resume` | core/bot.c | re-attaching a bot to a reloaded driver/protocol |
+| `bot_resume` | core/bot.c | re-attaching a bot to a reloaded driver/method |
 | `bot_say` | core/bot_cmd.c | `/say` command (bot emits to a channel) |
 | `bot_set_userns` | core/bot.c | binding a userns to a bot |
 | `bot_start` | core/bot.c | bot start lifecycle hook |
@@ -62,7 +62,7 @@ regex (the literal context portion, before any `<placeholder>`).
 | `bot_suspend` | core/bot.c | detaching a bot across a plugin reload |
 | `bot_unbind` | core/bot_cmd.c | `/bot unbind` command |
 | `bot_unbind_method` | core/bot.c | method-unbinding step on a bot |
-| `botmanctl` | core/botmanctl.c | botmanctl protocol driver |
+| `botmanctl` | core/botmanctl.c | botmanctl method driver |
 | `clam_exit` | core/clam.c | clam subsystem teardown |
 | `clam_init` | core/clam.c | clam subsystem init |
 | `clam_reclaim` | core/clam.c | Class-A reclamation of a plugin's log subscribers |
@@ -212,11 +212,11 @@ halves. Same shape as `gemini` / `gemini.ws`.
 | `extract` | plugins/method/text/extract.c | LLM-driven fact extraction |
 | `identify` | plugins/method/text/dispatch.c | `!identify` auth + temp-MFA mint |
 | `interject` | plugins/method/text/volunteer.c | chatbot interjection scoring |
-| `irc` | plugins/protocol/irc/irc_protocol.c | IRC protocol driver |
+| `irc` | plugins/protocol/irc/irc_protocol.c | IRC method driver |
 | `memory` | plugins/method/text/memory_rag.c | chat memory subsystem + RAG |
 | `nl_bridge` | plugins/method/text/reply.c | natural-language bridge surface |
 | `nl_observe` | plugins/method/text/nl_observe.c | post-dispatch chat observer (`OBS_CTX`) |
-| `reachy` | plugins/protocol/reachy/reachy.c | Reachy Mini protocol driver — the ear (bridge long-poll, transcription, attention gate, delivery) and the mouth (speech queue, synthesis, upload, playback pacing) (`REACHY_CTX`) |
+| `reachy` | plugins/protocol/reachy/reachy.c | Reachy Mini method driver — the ear (bridge long-poll, transcription, attention gate, delivery) and the mouth (speech queue, synthesis, upload, playback pacing) (`REACHY_CTX`) |
 | `register` | plugins/method/text/dispatch.c | `/register` user creation |
 | `vision` | plugins/method/text/vision.c | image-intent path |
 

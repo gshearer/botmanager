@@ -21,7 +21,7 @@ typedef enum
 {
   PLUGIN_CORE,          // extends core functionality
   PLUGIN_DB,            // database engine driver
-  PLUGIN_PROTOCOL,      // human interaction protocol (IRC, Slack, etc.)
+  PLUGIN_METHOD,        // how a bot meets humans (IRC, voice, etc.)
   PLUGIN_BOT,           // the mind that drives a bot (chat, etc.)
   PLUGIN_SERVICE,       // external API integration (REST, WebSocket, etc.)
   PLUGIN_MISC,          // miscellaneous user command extension (registers commands)
@@ -211,11 +211,11 @@ bool plugin_unload(const char *name, plugin_unload_report_t *report);
 // deinitialized and still mapped. Its dependents came back, but it did
 // not — only a restart clears it.
 //
-// `rebound` counts the bots whose driver — or whose bound protocol —
+// `rebound` counts the bots whose driver — or whose bound method —
 // the cascade took away and gave back. A bot bound to a plugin in the
 // closure used to refuse the reload outright; now it is detached before
 // the unload and re-attached after the load, keeping its name, its KV,
-// its sessions and, for a driver rebind, its protocol connections.
+// its sessions and, for a driver rebind, its live connections.
 typedef struct
 {
   uint32_t dependents;

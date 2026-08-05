@@ -13,7 +13,7 @@
 #define METHOD_TEXT_SZ     2048
 #define METHOD_META_SZ     512
 
-// Quad-tuple identity field bounds. Each protocol fills whatever it
+// Quad-tuple identity field bounds. Each method driver fills whatever it
 // has, leaves the rest empty. The chat plugin's identity scorer treats
 // nickname/username/hostname as a similarity tuple and verified_id as
 // an authoritative short-circuit (server-attested, unforgeable handle:
@@ -49,7 +49,7 @@ typedef uint32_t method_cap_t;
 
 // Discriminator for the kind of event a method_msg_t carries. The
 // default (zero) is a normal chat/DM line. Other kinds describe
-// protocol-level identity events that bots may want to observe but do
+// method-level identity events that bots may want to observe but do
 // not inject into chat history (e.g., IRC NICK changes that collapse
 // into the same per-identity record at confidence 1.0).
 typedef enum
@@ -67,7 +67,7 @@ typedef struct method_inst method_inst_t;
 typedef struct
 {
   method_inst_t *inst;                    // originating method instance
-  char           sender[METHOD_SENDER_SZ];    // sender identity (protocol-level)
+  char           sender[METHOD_SENDER_SZ];    // sender identity (method-level)
   char           channel[METHOD_CHANNEL_SZ];  // channel/group (empty for DM)
   char           text[METHOD_TEXT_SZ];        // raw message text
   time_t         timestamp;                   // message timestamp
@@ -75,19 +75,19 @@ typedef struct
   bool           is_action;                   // true when the message is an emote/action (e.g., IRC CTCP ACTION)
   method_msg_kind_t kind;                     // default METHOD_MSG_MESSAGE
 
-  // Generic protocol-level identity for the sender. The protocol plugin
+  // Generic method-level identity for the sender. The method plugin
   // populates whatever it has; consumers (chat, audit, etc.) treat the
   // tuple uniformly. nickname is the user's current display label;
   // username is their client-claimed login; hostname is the origin /
   // homeserver / workspace identifier; verified_id is the server-
   // attested unforgeable handle (IRC SASL account, Slack user_id,
-  // Matrix MXID, ...) and is empty when the protocol cannot attest.
+  // Matrix MXID, ...) and is empty when the method cannot attest.
   char nickname    [METHOD_NICKNAME_SZ];
   char username    [METHOD_USERNAME_SZ];
   char hostname    [METHOD_HOSTNAME_SZ];
   char verified_id [METHOD_VERIFIED_ID_SZ];
 
-  // Previous protocol-level identity, set on METHOD_MSG_NICK_CHANGE.
+  // Previous method-level identity, set on METHOD_MSG_NICK_CHANGE.
   // The new identity lives in the fields above and metadata holds the
   // new raw prefix; sender is the old display label, text is the new
   // display label, channel is empty. Unused for other kinds.
@@ -115,8 +115,9 @@ typedef enum
   METHOD_EJECT_SERVER = 2,  // off the platform entirely (IRC KILL)
 } method_eject_t;
 
-// Functions a protocol plugin must implement. Stored in
-// plugin_desc_t.ext for PLUGIN_PROTOCOL plugins (IRC, Slack, etc.).
+// Functions a method plugin must implement — how a bot meets humans.
+// Stored in plugin_desc_t.ext for PLUGIN_METHOD plugins (IRC, voice,
+// Slack, etc.).
 typedef struct
 {
   const char *name;

@@ -15,10 +15,10 @@
 // duration — so a multi-line answer comes out as speech rather than on
 // top of itself.
 //
-// Layering (PLUGIN.md §Layer Rules): PLUGIN_PROTOCOL over the
-// reachyapi service, and nothing else. This plugin must never reach up
-// into plugins/method/ — everything it knows about the conversation it
-// learns through include/method.h.
+// Layering (PLUGIN.md §Layer Rules): PLUGIN_METHOD over the reachyapi
+// service, and nothing else. This plugin must never reach up into the
+// bot plugin (plugins/method/text/) — everything it knows about the
+// conversation it learns through include/method.h.
 
 #ifdef REACHY_INTERNAL
 

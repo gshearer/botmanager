@@ -131,9 +131,9 @@ bool bot_find_bound_to_driver(const char *driver_name,
 // ---------------------------------------------------------------------------
 //
 // A bot holds two pointers into plugin mappings: its bot_driver_t (the
-// method plugin that gives it behaviour, e.g. text) and, per bound
-// method, a method_inst_t whose vtable belongs to a protocol plugin
-// (e.g. irc). Neither is visible in the .provides/.requires graph, so a
+// bot plugin that gives it behaviour, e.g. chat) and, per bound method,
+// a method_inst_t whose vtable belongs to a method plugin (e.g. irc).
+// Neither is visible in the .provides/.requires graph, so a
 // reload of either plugin would unmap code the bot is still pointing at
 // — which is why both used to refuse the unload outright.
 //
@@ -149,11 +149,11 @@ bool bot_find_bound_to_driver(const char *driver_name,
 //     re-create the handle from `drv`, and start it again if the bot was
 //     running. `kind` is the new plugin's kind, for the KV prefix.
 //
-//   bot_suspend_method() — a protocol's own state (the socket, the
+//   bot_suspend_method() — a method's own state (the socket, the
 //     connection) cannot outlive its mapping, so every bot with a bound
 //     method of that kind is stopped outright, unregistering the method
 //     instance with it.
-//   bot_resume_method() — re-register the per-(bot, protocol) KV and
+//   bot_resume_method() — re-register the per-(bot, method) KV and
 //     start the bot again, which re-creates the method instance from the
 //     reloaded driver and reconnects it.
 //
@@ -227,32 +227,32 @@ uint32_t bot_register_method_kv(const char *botname, const char *method_kind);
 uint32_t bot_register_driver_kv(const char *botname, const char *bot_kind);
 
 // ---------------------------------------------------------------------------
-// Per-bot / per-(bot,protocol) KV contributors
+// Per-bot / per-(bot,method) KV contributors
 // ---------------------------------------------------------------------------
 //
 // Lets a command/feature plugin layer its OWN KV keys onto every bot
 // without core hardcoding plugin-specific keys (e.g. the `ask` plugin's
-// `bot.<botname>.ask.*` and `bot.<botname>.<protocol>.ask.*` tiers). This
+// `bot.<botname>.ask.*` and `bot.<botname>.<method>.ask.*` tiers). This
 // keeps the layering clean: core owns the bot registry and merely invites
-// registered contributors to decorate each bot / bound protocol.
+// registered contributors to decorate each bot / bound method.
 //
 //   bot_cb    — fires once per bot instance. Register `bot.<botname>.*`.
-//   method_cb — fires once per (bot, bound protocol) pair. Register
-//               `bot.<botname>.<protocol>.*`. `protocol` is the method
-//               kind string (e.g. "irc").
+//   method_cb — fires once per (bot, bound method) pair. Register
+//               `bot.<botname>.<method_kind>.*`, where `method_kind` is
+//               the method plugin's kind string (e.g. "irc").
 //
 // Either callback may be NULL. On registration the contributor is
 // immediately back-filled against every existing bot and its already-bound
-// protocols, so a hot-reloaded plugin re-attaches its keys. Thereafter each
-// new bot and each freshly-bound protocol invokes every registered
+// methods, so a hot-reloaded plugin re-attaches its keys. Thereafter each
+// new bot and each freshly-bound method invokes every registered
 // contributor. Unregister (by the same `user` cookie) before the plugin
 // unloads, or the stored callback pointer dangles.
 //
 // Contributor callbacks MUST be self-contained (kv_register and friends);
 // they must not re-enter bot APIs that take the bot lock.
 typedef void (*bot_kv_bot_cb_t)(const char *botname, void *user);
-typedef void (*bot_kv_method_cb_t)(const char *botname, const char *protocol,
-    void *user);
+typedef void (*bot_kv_method_cb_t)(const char *botname,
+    const char *method_kind, void *user);
 
 void bot_kv_contributor_register(bot_kv_bot_cb_t bot_cb,
     bot_kv_method_cb_t method_cb, void *user);
@@ -353,14 +353,14 @@ typedef struct
 
 // What a plugin reload took away from a bot, and what it owes back.
 // `driver` and `method` are never both set: a bot loses its behaviour
-// or its protocol, and the loader cycles one plugin at a time.
+// or one of its methods, and the loader cycles one plugin at a time.
 typedef struct
 {
   bool driver;                        // bot_driver_t detached, inst->driver NULL
-  bool method;                        // bot stopped for a protocol reload
+  bool method;                        // bot stopped for a method reload
   bool was_running;                   // ...and it was RUNNING when it happened
   char driver_name[BOT_NAME_SZ];      // driver to re-attach
-  char method_kind[PLUGIN_NAME_SZ];   // protocol to re-bind
+  char method_kind[PLUGIN_NAME_SZ];   // method to re-bind
 } bot_suspend_t;
 
 struct bot_inst

@@ -496,10 +496,10 @@ plugin_restore(const plugin_snap_t *snap, uint32_t from, uint32_t to,
 
 // A bot's two pointers into plugin mappings, and what a reload owes
 // each. A bot driver is detached and put back in place — the bot keeps
-// its name, its sessions and its protocol connections and merely goes
-// deaf for the length of the cycle. A protocol driver cannot be handled
-// that gently: its connection lives in the mapping, so the bot goes
-// down with it and comes back up on the far side.
+// its name, its sessions and its live connections and merely goes deaf
+// for the length of the cycle. A method driver cannot be handled that
+// gently: its connection lives in the mapping, so the bot goes down
+// with it and comes back up on the far side.
 // returns: bots affected.
 static uint32_t
 plugin_detach_bots(const plugin_desc_t *desc)
@@ -514,7 +514,7 @@ plugin_detach_bots(const plugin_desc_t *desc)
     return(drv->name != NULL ? bot_suspend_driver(drv->name) : 0);
   }
 
-  if(desc->type == PLUGIN_PROTOCOL)
+  if(desc->type == PLUGIN_METHOD)
     return(bot_suspend_method(desc->kind));
 
   return(0);
@@ -529,7 +529,7 @@ plugin_reattach_bots(const plugin_desc_t *desc)
   if(desc->type == PLUGIN_BOT || desc->type == PLUGIN_FEATURE)
     return(bot_resume_driver((const bot_driver_t *)desc->ext, desc->kind));
 
-  if(desc->type == PLUGIN_PROTOCOL)
+  if(desc->type == PLUGIN_METHOD)
     return(bot_resume_method(desc->kind));
 
   return(0);
@@ -1873,7 +1873,7 @@ plugin_type_name(plugin_type_t t)
   {
     case PLUGIN_CORE:        return("core");
     case PLUGIN_DB:          return("db");
-    case PLUGIN_PROTOCOL:    return("protocol");
+    case PLUGIN_METHOD:      return("method");
     case PLUGIN_BOT:         return("bot");
     case PLUGIN_SERVICE:     return("service");
     case PLUGIN_MISC:        return("misc");

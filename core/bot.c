@@ -295,7 +295,7 @@ bot_userns_kv_cb(const char *key, void *data)
 }
 
 // ---------------------------------------------------------------------------
-// Per-bot / per-(bot,protocol) KV contributors
+// Per-bot / per-(bot,method) KV contributors
 // ---------------------------------------------------------------------------
 //
 // A tiny fixed registry of plugins that want to decorate every bot with
@@ -345,16 +345,16 @@ bot_kv_fanout_bot(const char *name)
       snap[i].bot_cb(name, snap[i].user);
 }
 
-// Fan a freshly-bound (bot, protocol) pair out to every method_cb.
+// Fan a freshly-bound (bot, method) pair out to every method_cb.
 static void
-bot_kv_fanout_method(const char *name, const char *protocol)
+bot_kv_fanout_method(const char *name, const char *method_kind)
 {
   bot_kv_contrib_t snap[BOT_KV_CONTRIB_MAX];
   uint32_t         n = bot_kv_snapshot(snap);
 
   for(uint32_t i = 0; i < n; i++)
     if(snap[i].method_cb != NULL)
-      snap[i].method_cb(name, protocol, snap[i].user);
+      snap[i].method_cb(name, method_kind, snap[i].user);
 }
 
 void
@@ -383,7 +383,7 @@ bot_kv_contributor_register(bot_kv_bot_cb_t bot_cb,
   pthread_mutex_unlock(&bot_kv_contrib_mutex);
 
   // Back-fill: apply only this contributor to every existing bot and its
-  // already-bound protocols, so a late/hot-reloaded plugin catches up.
+  // already-bound methods, so a late/hot-reloaded plugin catches up.
   // kv_register is idempotent-quiet only for new keys, so we invoke the
   // single new contributor rather than the full fan-out.
   pthread_mutex_lock(&bot_mutex);
@@ -1206,7 +1206,7 @@ bot_start(bot_inst_t *inst)
     if(m->inst == NULL && m->method_kind[0] != '\0')
     {
       const plugin_desc_t *pd =
-          plugin_find_type(PLUGIN_PROTOCOL, m->method_kind);
+          plugin_find_type(PLUGIN_METHOD, m->method_kind);
 
       if(pd != NULL && pd->ext != NULL)
       {
@@ -1652,7 +1652,7 @@ bot_suspend_method(const char *method_kind)
 
   pthread_mutex_unlock(&bot_mutex);
 
-  // A protocol's connection lives in the mapping about to go away, so
+  // A method's connection lives in the mapping about to go away, so
   // there is nothing to preserve and no half-measure: stop the bot,
   // which unsubscribes it and unregisters the method instance it owns.
   // Sessions go with it — the users will have to identify again.
@@ -1679,7 +1679,7 @@ bot_suspend_method(const char *method_kind)
 
   if(stopped > 0)
     clam(CLAM_INFO, "bot_suspend",
-        "stopped %u bot(s) bound to protocol '%s'", stopped, method_kind);
+        "stopped %u bot(s) bound to method '%s'", stopped, method_kind);
 
   return(stopped);
 }
@@ -1717,7 +1717,7 @@ bot_resume_method(const char *method_kind)
       continue;
 
     // Same rebind as a driver resume, one tier down: these are the
-    // bot.<bot>.<protocol>.* keys the protocol plugin declared.
+    // bot.<bot>.<method>.* keys the method plugin declared.
     bot_register_method_kv(names[i], method_kind);
 
     pthread_mutex_lock(&bot_mutex);
@@ -1725,7 +1725,7 @@ bot_resume_method(const char *method_kind)
     memset(&b->susp, 0, sizeof(b->susp));
     pthread_mutex_unlock(&bot_mutex);
 
-    // bot_start() re-resolves the protocol plugin by kind, so the
+    // bot_start() re-resolves the method plugin by kind, so the
     // instance it creates comes from the mapping that just arrived.
     if(start && bot_start(b) != SUCCESS)
     {
@@ -1740,7 +1740,7 @@ bot_resume_method(const char *method_kind)
 
   if(resumed > 0)
     clam(CLAM_INFO, "bot_resume",
-        "restarted %u bot(s) on protocol '%s'", resumed, method_kind);
+        "restarted %u bot(s) on method '%s'", resumed, method_kind);
 
   return(resumed);
 }
@@ -1872,12 +1872,12 @@ bot_register_method_kv(const char *botname, const char *method_kind)
     return(0);
 
   // Invite contributors (e.g. `ask`) to layer their own
-  // bot.<botname>.<protocol>.* keys onto this binding. Done first so it
-  // fires even when the protocol plugin itself exposes no instance schema.
+  // bot.<botname>.<method>.* keys onto this binding. Done first so it
+  // fires even when the method plugin itself exposes no instance schema.
   bot_kv_fanout_method(botname, method_kind);
 
-  // Find the protocol plugin by kind.
-  pd = plugin_find_type(PLUGIN_PROTOCOL, method_kind);
+  // Find the method plugin by kind.
+  pd = plugin_find_type(PLUGIN_METHOD, method_kind);
 
   if(pd == NULL || pd->kv_inst_schema == NULL ||
      pd->kv_inst_schema_count == 0)

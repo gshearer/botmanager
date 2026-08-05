@@ -2121,7 +2121,7 @@ const plugin_desc_t bm_plugin_desc = {
   .api_version     = PLUGIN_API_VERSION,
   .name            = "irc",
   .version         = "1.0",
-  .type            = PLUGIN_PROTOCOL,
+  .type            = PLUGIN_METHOD,
   .kind            = "irc",
   .provides        = { { .name = "protocol_irc" } },
   .provides_count  = 1,

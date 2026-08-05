@@ -1974,7 +1974,7 @@ const plugin_desc_t bm_plugin_desc = {
   .api_version     = PLUGIN_API_VERSION,
   .name            = "reachy",
   .version         = "1.0",
-  .type            = PLUGIN_PROTOCOL,
+  .type            = PLUGIN_METHOD,
   .kind            = "reachy",
 
   .provides        = { { .name = "protocol_reachy" } },
