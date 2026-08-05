@@ -436,6 +436,24 @@ typedef struct exchange_ws_sub exchange_ws_sub_t;
 // Callback signatures. Same threading rules as
 // exchange_response_cb_t — fired on the curl-multi worker thread that
 // completed the underlying transport. Consumers must not block.
+//
+// Every driver (coinbase, gemini, kraken) files each live dispatch on an
+// in-flight registry and listens for mapping unloads
+// (plugin_unmap_notify_register). If your plugin is unloaded with a
+// request airborne, the request still completes but the callback below
+// is NOT invoked — and `user` is dropped, so whatever it points at
+// LEAKS. That is the accepted outcome: only you could free your own
+// context and you are exactly what is no longer there. These are the
+// longest requests in the daemon (seconds against an exchange), so the
+// window is real. Size per-request contexts accordingly and do not plan
+// a reload-time drain around a guaranteed final callback. See
+// PLUGIN.md §Lifecycle Contract.
+//
+// WS subscriptions are the exception, and the obligation runs the other
+// way: no driver files an exchange_ws_event_cb_t, because a subscription
+// outlives any request. Every consumer must call exchange_ws_unsubscribe
+// for every live binding on its own teardown path — whenmoon does, in
+// market.c:wm_market_destroy and live.c:wm_live_shutdown.
 typedef void (*exchange_done_order_cb_t)(
     const exchange_order_result_t *res, void *user);
 typedef void (*exchange_done_orders_cb_t)(

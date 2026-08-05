@@ -67,6 +67,15 @@ typedef enum
   OW_REQ_FORECAST_HOURLY
 } ow_req_type_t;
 
+// The caller-supplied completion, one arm per request type. Named
+// because both the request and the caller-half snapshot below hold one,
+// and an anonymous union in each would be two incompatible types.
+typedef union
+{
+  openweather_done_current_cb_t   current;
+  openweather_done_forecast_cb_t  forecast;
+} ow_cb_u;
+
 // Request context: carries fetch parameters and the caller-supplied
 // completion callback through the async geocode → onecall chain. No
 // command-surface state (no cmd_ctx_t, no method_msg_t) — consumers
@@ -84,11 +93,7 @@ typedef struct ow_request
   char                location_name[OW_NAME_SZ];
 
   // Caller callback (union on done-callback shape).
-  union
-  {
-    openweather_done_current_cb_t   current;
-    openweather_done_forecast_cb_t  forecast;
-  }                   cb;
+  ow_cb_u             cb;
   void               *user;
 
   // Result accumulator. One Call 4.0 answers a single command with a
@@ -109,7 +114,21 @@ typedef struct ow_request
 
   // Freelist linkage.
   struct ow_request  *next;
+
+  // In-flight registry linkage — distinct from `next` because the two
+  // lists are disjoint in time but the freelist is not the thing the
+  // unmap sweep walks. See the registry section in openweather.c.
+  struct ow_request  *next_active;
 } ow_request_t;
+
+// The caller's half of a request, lifted off it under the registry lock
+// so a delivery cannot interleave with an unmap sweep. Both arms are
+// NULL when the caller was unloaded mid-chain.
+typedef struct
+{
+  ow_cb_u   cb;
+  void     *user;
+} ow_caller_t;
 
 // Geocode cache
 
@@ -140,6 +159,12 @@ typedef struct ow_citycache
 static ow_request_t    *ow_free     = NULL;
 static pthread_mutex_t  ow_free_mu;
 
+// In-flight registry. Guards `next_active` linkage and every read or
+// write of a request's caller half.
+static ow_request_t    *ow_active_head  = NULL;
+static uint32_t         ow_active_count = 0;
+static pthread_mutex_t  ow_active_mutex = PTHREAD_MUTEX_INITIALIZER;
+
 static ow_geocache_t   *ow_geo_cache[OW_GEO_CACHE_BUCKETS];
 static pthread_mutex_t  ow_geo_cache_mu;
 
@@ -165,6 +190,11 @@ static void             ow_geo_insert(const char *zipcode, double lat,
                             double lon, const char *name);
 static ow_request_t    *ow_req_alloc(void);
 static void             ow_req_release(ow_request_t *r);
+static void             ow_req_track(ow_request_t *r);
+static void             ow_req_untrack_locked(ow_request_t *r);
+static void             ow_req_take_caller(ow_request_t *r,
+                            ow_caller_t *out);
+static void             ow_unmap_cb(uintptr_t lo, uintptr_t hi, void *data);
 static void             ow_geocode_done(const curl_response_t *resp);
 static void             ow_deliver_current_err(ow_request_t *r,
                             const char *msg);

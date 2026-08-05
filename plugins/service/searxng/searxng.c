@@ -14,6 +14,7 @@
 #include "kv.h"
 #include "plugin.h"
 
+#include <pthread.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -86,9 +87,124 @@ sxng_urlencode(const char *in, char *out, size_t cap)
   return(n);
 }
 
-// Deliver a failure response and free the request context.
+// ----------------------------------------------------------------------
+// The in-flight registry — every query borrows a foreign callback
+// ----------------------------------------------------------------------
+
+// sxng_search stores its caller's completion in a heap context of ours
+// and hands core's curl layer sxng_curl_done instead. That is one
+// indirection more than core can see: plugin_quiesce and plugin_audit
+// both range-test curl_iter_req_t.cb, which for our transfers names THIS
+// mapping, never the caller's. Both callers live elsewhere — the
+// `searxng_cmd` plugin behind !search/!image/!news/!video/!music, and
+// the inference engine's reactive acquisition — and a search is one of
+// the longest requests this daemon makes (a SearXNG instance fans out to
+// a dozen upstream engines and the timeout defaults to 10 s). Reload
+// either caller inside that window and the stored pointer aims into
+// freed .text.
+//
+// So every live query is filed here, and plugin_unmap_notify_register
+// tells us when a mapping is about to go away in time to null the
+// pointers that name it. A query whose caller left still completes
+// normally; it simply delivers to nobody. The mechanics are commented in
+// full in reachyapi.c and written up in PLUGIN.md.
+//
+// The caller's `user_data` is dropped with the callback and whatever it
+// points at is leaked. Nothing else is possible: only the caller knows
+// how to free its own context, and the caller is precisely what is no
+// longer there. A bounded leak on an operator action beats a SIGSEGV.
+static pthread_mutex_t sxng_active_mutex = PTHREAD_MUTEX_INITIALIZER;
+static sxng_req_t     *sxng_active_head  = NULL;
+static uint32_t        sxng_active_count = 0;
+
 static void
-sxng_deliver_fail(sxng_req_t *r, const char *msg)
+sxng_req_track(sxng_req_t *r)
+{
+  pthread_mutex_lock(&sxng_active_mutex);
+
+  r->next_active   = sxng_active_head;
+  sxng_active_head = r;
+  sxng_active_count++;
+
+  pthread_mutex_unlock(&sxng_active_mutex);
+}
+
+// Unlink `r`, copy it to `out` and free it. The copy is taken under the
+// lock so a completion reads the caller's callback in the same critical
+// section the unmap sweep would null it in — read it afterwards and the
+// two interleave, which is the whole bug.
+static void
+sxng_req_retire(sxng_req_t *r, sxng_req_t *out)
+{
+  sxng_req_t **pp;
+
+  pthread_mutex_lock(&sxng_active_mutex);
+
+  for(pp = &sxng_active_head; *pp != NULL; pp = &(*pp)->next_active)
+  {
+    if(*pp != r)
+      continue;
+
+    *pp = r->next_active;
+    sxng_active_count--;
+    break;
+  }
+
+  *out = *r;
+
+  pthread_mutex_unlock(&sxng_active_mutex);
+
+  out->next_active = NULL;
+  mem_free(r);
+}
+
+// A mapping is going away (core is between the plugin's deinit() and its
+// residual audit, so nothing of it runs any more). Drop every callback
+// that lives inside it.
+//
+// Residual race: a completion that has already retired its query holds
+// the callback on its stack and is a few instructions from calling it.
+// The window is bounded above by the quiescence poll plus the audit that
+// follow this broadcast, and below by two stores — against an
+// operator-timescale unload. Closing it would need core to wait on a
+// lock a curl worker holds.
+static void
+sxng_unmap_cb(uintptr_t lo, uintptr_t hi, void *data)
+{
+  uint32_t orphaned = 0;
+
+  (void)data;
+
+  pthread_mutex_lock(&sxng_active_mutex);
+
+  for(sxng_req_t *r = sxng_active_head; r != NULL; r = r->next_active)
+  {
+    uintptr_t cb = (uintptr_t)fn_addr(&r->cb);
+
+    if(cb == 0 || cb < lo || cb >= hi)
+      continue;
+
+    r->cb        = NULL;
+    r->user_data = NULL;
+    orphaned++;
+  }
+
+  pthread_mutex_unlock(&sxng_active_mutex);
+
+  if(orphaned > 0)
+    clam(CLAM_WARN, SXNG_CTX, "%u search(es) lost their caller to an "
+        "unload; they will complete and deliver nothing", orphaned);
+}
+
+// ----------------------------------------------------------------------
+// Delivery
+// ----------------------------------------------------------------------
+
+// Deliver a failure response from a RETIRED query — a stack copy the
+// completion owns, already unlinked, whose callback is either the
+// caller's or NULL because the caller was unloaded mid-flight.
+static void
+sxng_deliver_fail(const sxng_req_t *r, const char *msg)
 {
   sxng_response_t resp = {
     .ok        = false,
@@ -101,8 +217,6 @@ sxng_deliver_fail(sxng_req_t *r, const char *msg)
 
   if(r->cb != NULL)
     r->cb(&resp);
-
-  mem_free(r);
 }
 
 // Populate the per-category extras union on a freshly-extracted result
@@ -233,7 +347,9 @@ sxng_curl_done(const curl_response_t *cresp)
   struct json_object *jresults;
   size_t len;
   sxng_result_t *out;
-  sxng_req_t *r = (sxng_req_t *)cresp->user_data;
+  sxng_req_t r;
+
+  sxng_req_retire((sxng_req_t *)cresp->user_data, &r);
 
   if(cresp->curl_code != 0)
   {
@@ -242,7 +358,7 @@ sxng_curl_done(const curl_response_t *cresp)
     snprintf(buf, sizeof(buf), "transport: %s",
         cresp->error != NULL ? cresp->error : "unknown");
     clam(CLAM_WARN, SXNG_CTX, "%s", buf);
-    sxng_deliver_fail(r, "transport error");
+    sxng_deliver_fail(&r, "transport error");
     return;
   }
 
@@ -252,7 +368,7 @@ sxng_curl_done(const curl_response_t *cresp)
 
     snprintf(buf, sizeof(buf), "HTTP %ld", cresp->status);
     clam(CLAM_WARN, SXNG_CTX, "searxng endpoint returned %s", buf);
-    sxng_deliver_fail(r, "http error");
+    sxng_deliver_fail(&r, "http error");
     return;
   }
 
@@ -260,7 +376,7 @@ sxng_curl_done(const curl_response_t *cresp)
 
   if(root == NULL)
   {
-    sxng_deliver_fail(r, "malformed JSON response");
+    sxng_deliver_fail(&r, "malformed JSON response");
     return;
   }
 
@@ -269,12 +385,12 @@ sxng_curl_done(const curl_response_t *cresp)
   if(jresults == NULL)
   {
     json_object_put(root);
-    sxng_deliver_fail(r, "no 'results' array in response");
+    sxng_deliver_fail(&r, "no 'results' array in response");
     return;
   }
 
   len = (size_t)json_object_array_length(jresults);
-  want = r->n_wanted;
+  want = r.n_wanted;
 
   if(want > SXNG_HARDMAX_RESULTS)
     want = SXNG_HARDMAX_RESULTS;
@@ -303,8 +419,8 @@ sxng_curl_done(const curl_response_t *cresp)
           SXNG_CTX ":result"))
         continue;   // required field (url) missing; skip row
 
-      out[kept].category = r->category;
-      sxng_extract_extras(item, &out[kept], r->category);
+      out[kept].category = r.category;
+      sxng_extract_extras(item, &out[kept], r.category);
 
       kept++;
     }
@@ -315,20 +431,19 @@ sxng_curl_done(const curl_response_t *cresp)
   resp = (sxng_response_t){
     .ok        = true,
     .error     = NULL,
-    .category  = r->category,
+    .category  = r.category,
     .results   = out,
     .n_results = len,
-    .user_data = r->user_data,
+    .user_data = r.user_data,
   };
 
-  if(r->cb != NULL)
-    r->cb(&resp);
+  if(r.cb != NULL)
+    r.cb(&resp);
 
   if(out != NULL)
     mem_free(out);
 
   json_object_put(root);
-  mem_free(r);
 }
 
 // Public API
@@ -347,6 +462,8 @@ sxng_search(const char *query, sxng_category_t category, size_t n_wanted,
   uint32_t kv_max;
   uint32_t kv_min;
   sxng_req_t *r;
+  sxng_req_t dead;
+
   if(cb == NULL)
     return(FAIL);
 
@@ -411,6 +528,7 @@ sxng_search(const char *query, sxng_category_t category, size_t n_wanted,
   }
 
   r = mem_alloc(SXNG_CTX, "request", sizeof(*r));
+  memset(r, 0, sizeof(*r));
 
   r->cb        = cb;
   r->user_data = user_data;
@@ -431,9 +549,14 @@ sxng_search(const char *query, sxng_category_t category, size_t n_wanted,
 
   curl_request_add_header(cr, "Accept: application/json");
 
+  // File it before submitting, never after: the completion can run on a
+  // curl worker before submit has even returned here, and it retires
+  // what it finds.
+  sxng_req_track(r);
+
   if(curl_request_submit(cr) != SUCCESS)
   {
-    mem_free(r);
+    sxng_req_retire(r, &dead);
     return(FAIL);
   }
 
@@ -446,9 +569,14 @@ sxng_search(const char *query, sxng_category_t category, size_t n_wanted,
 
 // Plugin lifecycle
 
+// No commands, no tasks, no clam subscriptions. The one thing that does
+// outlive a call is the in-flight registry, and the unmap listener that
+// keeps it honest is the single registration deinit() has to mirror.
 static bool
 sxng_init(void)
 {
+  plugin_unmap_notify_register(sxng_unmap_cb, NULL);
+
   clam(CLAM_INFO, SXNG_CTX, "searxng plugin initialized");
   return(SUCCESS);
 }
@@ -456,6 +584,23 @@ sxng_init(void)
 static void
 sxng_deinit(void)
 {
+  uint32_t stranded;
+
+  plugin_unmap_notify_unregister(sxng_unmap_cb);
+
+  pthread_mutex_lock(&sxng_active_mutex);
+  stranded = sxng_active_count;
+  pthread_mutex_unlock(&sxng_active_mutex);
+
+  // Nothing to free: those queries belong to curl, and their completions
+  // live in the mapping now going away. Core's residual audit sees them
+  // — sxng_curl_done is curl_iter_req_t.cb for every one — so it is the
+  // audit that refuses the dlclose, not us. Naming the count here is
+  // what makes that refusal legible.
+  if(stranded > 0)
+    clam(CLAM_WARN, SXNG_CTX, "%u search(es) still in flight at deinit",
+        stranded);
+
   clam(CLAM_INFO, SXNG_CTX, "searxng plugin deinitialized");
 }
 

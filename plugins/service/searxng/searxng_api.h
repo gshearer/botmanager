@@ -150,6 +150,15 @@ typedef struct
 
 // Completion callback. Invoked on the curl worker thread; must be fast
 // and non-blocking.
+//
+// The plugin files every live query on an in-flight list and listens for
+// mapping unloads (plugin_unmap_notify_register). If your plugin is
+// unloaded with a search airborne, the query still completes but this
+// callback is NOT invoked — and `user_data` is dropped, so whatever it
+// points at LEAKS. That is the accepted outcome: only you could free
+// your own context and you are exactly what is no longer there. Size
+// per-request contexts accordingly, and do not plan a reload-time drain
+// around a guaranteed final callback. See PLUGIN.md §Lifecycle Contract.
 typedef void (*sxng_done_cb_t)(const sxng_response_t *resp);
 
 // Real function declaration — visible only inside the searxng plugin.

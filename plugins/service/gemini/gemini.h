@@ -66,6 +66,14 @@
 // abstraction. Called from gem_start.
 bool    gem_exchange_register_vtable(void);
 
+// In-flight registry for the consumer callbacks the vtable borrows.
+// gem_exch_init registers the unmap listener that keeps it honest;
+// gem_exch_deinit unregisters it and reports anything still airborne.
+// Both are idempotent. See the registry section in gemini_exchange.c
+// for why a service with an async API needs this at all.
+void    gem_exch_init(void);
+void    gem_exch_deinit(void);
+
 // Collapse Gemini's verbose order-type string ("exchange limit" /
 // "exchange market" / "exchange stop") to the abstraction's compact
 // form ("limit" / "market" / "stop"). EXCHANGE_TYPE_SZ is 16 bytes;

@@ -205,6 +205,14 @@ bool    cb_submit_public(void *user_data, uint8_t prio, const char *path,
 // abstraction. Called from cb_init.
 bool    cb_exchange_register_vtable(void);
 
+// In-flight registry for the consumer callbacks the vtable borrows.
+// cb_exch_init registers the unmap listener that keeps it honest;
+// cb_exch_deinit unregisters it and reports anything still airborne.
+// Both are idempotent. See the registry section in coinbase_exchange.c
+// for why a service with an async API needs this at all.
+void    cb_exch_init(void);
+void    cb_exch_deinit(void);
+
 // coinbase_ws.c
 
 // Lifecycle. cb_ws_init prepares the session struct and subscribes to

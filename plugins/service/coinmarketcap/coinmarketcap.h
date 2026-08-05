@@ -69,6 +69,16 @@ typedef enum
   CMC_REQ_GLOBAL
 } cmc_req_type_t;
 
+// The caller-supplied completion, one arm per request type. Named
+// because both the request and the caller-half snapshot below hold one,
+// and an anonymous union in each would be two incompatible types.
+typedef union
+{
+  coinmarketcap_done_listings_cb_t listings;
+  coinmarketcap_done_detail_cb_t   detail;
+  coinmarketcap_done_global_cb_t   global;
+} cmc_cb_u;
+
 // Request context (freelist-managed). Each request carries either a
 // listings / detail / global callback; the active callback is chosen
 // by r->type.
@@ -83,12 +93,7 @@ typedef struct cmc_request
 
   // Typed callback + opaque user pointer. Exactly one member of the
   // union is valid based on `type`.
-  union
-  {
-    coinmarketcap_done_listings_cb_t listings;
-    coinmarketcap_done_detail_cb_t   detail;
-    coinmarketcap_done_global_cb_t   global;
-  } cb;
+  cmc_cb_u             cb;
   void                *user;
 
   // Background poll: skip the callback dispatch entirely.
@@ -96,7 +101,22 @@ typedef struct cmc_request
 
   // Freelist linkage.
   struct cmc_request  *next;
+
+  // In-flight registry linkage — a poll request carries no foreign
+  // pointer and is never filed. See the registry section in
+  // coinmarketcap.c.
+  struct cmc_request  *next_active;
 } cmc_request_t;
+
+// The caller's half of a request, lifted off it under the registry lock
+// so a delivery cannot interleave with an unmap sweep. Every arm is NULL
+// when the caller was unloaded mid-chain (and on a poll request, which
+// never had one).
+typedef struct
+{
+  cmc_cb_u   cb;
+  void      *user;
+} cmc_caller_t;
 
 // Module state
 
@@ -118,6 +138,12 @@ static pthread_mutex_t  cmc_info_mu;
 // Request freelist.
 static cmc_request_t   *cmc_free     = NULL;
 static pthread_mutex_t  cmc_free_mu;
+
+// In-flight registry. Guards `next_active` linkage and every read or
+// write of a request's caller half.
+static cmc_request_t   *cmc_active_head  = NULL;
+static uint32_t         cmc_active_count = 0;
+static pthread_mutex_t  cmc_active_mutex = PTHREAD_MUTEX_INITIALIZER;
 
 // Polling task handle.
 static task_handle_t    cmc_poll_task = TASK_HANDLE_NONE;
@@ -141,6 +167,12 @@ static const plugin_kv_entry_t cmc_kv_schema[] = {
 
 static cmc_request_t   *cmc_req_alloc(void);
 static void             cmc_req_release(cmc_request_t *r);
+static void             cmc_req_track(cmc_request_t *r);
+static void             cmc_req_untrack_locked(cmc_request_t *r);
+static void             cmc_req_take_caller(cmc_request_t *r,
+                            cmc_caller_t *out);
+static void             cmc_unmap_cb(uintptr_t lo, uintptr_t hi,
+                            void *data);
 
 static bool             cmc_info_lookup(const char *symbol, cmc_info_t *out);
 static void             cmc_info_store(const char *symbol,

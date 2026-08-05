@@ -37,10 +37,146 @@ cmc_req_alloc(void)
 static void
 cmc_req_release(cmc_request_t *r)
 {
+  pthread_mutex_lock(&cmc_active_mutex);
+  cmc_req_untrack_locked(r);
+  pthread_mutex_unlock(&cmc_active_mutex);
+
   pthread_mutex_lock(&cmc_free_mu);
   r->next = cmc_free;
   cmc_free = r;
   pthread_mutex_unlock(&cmc_free_mu);
+}
+
+// ----------------------------------------------------------------------
+// The in-flight registry — every async fetch borrows a foreign callback
+// ----------------------------------------------------------------------
+
+// Each coinmarketcap_fetch_*_async stores its caller's completion in a
+// request of ours and hands core's curl layer one of our own cmc_*_done
+// functions instead. That is one indirection more than core can see:
+// plugin_quiesce and plugin_audit both range-test curl_iter_req_t.cb,
+// which for our transfers names THIS mapping, never the caller's. The
+// only caller is the `crypto` feature plugin, in a mapping of its own —
+// reload it with a fetch airborne and the stored pointer aims into
+// freed .text.
+//
+// The exposure is wider than one round trip on the detail path: a symbol
+// with no cached metadata fetches the description first and only then
+// the quote, carrying the caller's callback across both legs unread. So
+// the registry brackets the request's whole lifetime — filed by the
+// public entry points, dropped by cmc_req_release, which every terminal
+// path already goes through.
+//
+// Poll requests are never filed: they carry no callback at all
+// (`is_poll`), and untracking one is a harmless no-op.
+//
+// A request whose caller left still runs to the end; it simply delivers
+// to nobody. The mechanics are commented in full in reachyapi.c and
+// written up in PLUGIN.md.
+//
+// The caller's `user` is dropped with the callback and whatever it
+// points at is leaked. Nothing else is possible: only the caller knows
+// how to free its own context, and the caller is precisely what is no
+// longer there. A bounded leak on an operator action beats a SIGSEGV.
+
+static void
+cmc_req_track(cmc_request_t *r)
+{
+  pthread_mutex_lock(&cmc_active_mutex);
+
+  r->next_active  = cmc_active_head;
+  cmc_active_head = r;
+  cmc_active_count++;
+
+  pthread_mutex_unlock(&cmc_active_mutex);
+}
+
+// Caller holds cmc_active_mutex. A no-op for a request that is not on
+// the list, which is what makes both the poll path and
+// release-after-delivery safe.
+static void
+cmc_req_untrack_locked(cmc_request_t *r)
+{
+  cmc_request_t **pp;
+
+  for(pp = &cmc_active_head; *pp != NULL; pp = &(*pp)->next_active)
+  {
+    if(*pp != r)
+      continue;
+
+    *pp = r->next_active;
+    r->next_active = NULL;
+    cmc_active_count--;
+    return;
+  }
+}
+
+// Lift the caller's half off `r` and unlink it, both under the registry
+// lock. The read has to happen in the same critical section the sweep
+// would null it in — read it afterwards and the two interleave, which is
+// the whole bug. Clearing the arms as we go also makes a second delivery
+// on the same request structurally impossible.
+static void
+cmc_req_take_caller(cmc_request_t *r, cmc_caller_t *out)
+{
+  pthread_mutex_lock(&cmc_active_mutex);
+
+  cmc_req_untrack_locked(r);
+
+  out->cb   = r->cb;
+  out->user = r->user;
+
+  memset(&r->cb, 0, sizeof(r->cb));
+  r->user = NULL;
+
+  pthread_mutex_unlock(&cmc_active_mutex);
+}
+
+// A mapping is going away (core is between the plugin's deinit() and its
+// residual audit, so nothing of it runs any more). Drop every callback
+// that lives inside it.
+//
+// Residual race: a completion that has already taken its caller half
+// holds it on the stack and is a few instructions from calling it. The
+// window is bounded above by the quiescence poll plus the audit that
+// follow this broadcast, and below by two stores — against an
+// operator-timescale unload. Closing it would need core to wait on a
+// lock a curl worker holds.
+static void
+cmc_unmap_cb(uintptr_t lo, uintptr_t hi, void *data)
+{
+  uint32_t orphaned = 0;
+
+  (void)data;
+
+  pthread_mutex_lock(&cmc_active_mutex);
+
+  for(cmc_request_t *r = cmc_active_head; r != NULL; r = r->next_active)
+  {
+    uintptr_t cb = 0;
+
+    switch(r->type)
+    {
+      case CMC_REQ_LISTINGS: cb = (uintptr_t)fn_addr(&r->cb.listings); break;
+      case CMC_REQ_DETAIL:   cb = (uintptr_t)fn_addr(&r->cb.detail);   break;
+      case CMC_REQ_GLOBAL:   cb = (uintptr_t)fn_addr(&r->cb.global);   break;
+    }
+
+    if(cb == 0 || cb < lo || cb >= hi)
+      continue;
+
+    // memset rather than one arm's NULL: the arms are a union, and
+    // all-bits-zero is the null test every delivery path makes.
+    memset(&r->cb, 0, sizeof(r->cb));
+    r->user = NULL;
+    orphaned++;
+  }
+
+  pthread_mutex_unlock(&cmc_active_mutex);
+
+  if(orphaned > 0)
+    clam(CLAM_WARN, CMC_CTX, "%u market request(s) lost their caller to "
+        "an unload; they will complete and deliver nothing", orphaned);
 }
 
 // Cache helpers
@@ -505,17 +641,22 @@ cmc_global_cache_store(struct json_object *jdata)
 }
 
 // Callback-dispatch helpers. On failure these fire the typed callback
-// with err set; on poll requests no callback fires.
+// with err set; on poll requests no callback fires. Each takes the
+// caller's half off the request first, so what runs is a stack copy that
+// is either the caller's or NULL because the caller was unloaded
+// mid-flight.
 
 static void
 cmc_deliver_listings_fail(cmc_request_t *r, const char *err)
 {
   coinmarketcap_listings_result_t res = { 0 };
+  cmc_caller_t                    c;
 
+  cmc_req_take_caller(r, &c);
   snprintf(res.err, sizeof(res.err), "%s", err);
 
-  if(!r->is_poll && r->cb.listings != NULL)
-    r->cb.listings(&res, r->user);
+  if(c.cb.listings != NULL)
+    c.cb.listings(&res, c.user);
 
   cmc_req_release(r);
 }
@@ -524,11 +665,13 @@ static void
 cmc_deliver_detail_fail(cmc_request_t *r, const char *err)
 {
   coinmarketcap_detail_result_t res = { 0 };
+  cmc_caller_t                  c;
 
+  cmc_req_take_caller(r, &c);
   snprintf(res.err, sizeof(res.err), "%s", err);
 
-  if(!r->is_poll && r->cb.detail != NULL)
-    r->cb.detail(&res, r->user);
+  if(c.cb.detail != NULL)
+    c.cb.detail(&res, c.user);
 
   cmc_req_release(r);
 }
@@ -537,11 +680,13 @@ static void
 cmc_deliver_global_fail(cmc_request_t *r, const char *err)
 {
   coinmarketcap_global_result_t res = { 0 };
+  cmc_caller_t                  c;
 
+  cmc_req_take_caller(r, &c);
   snprintf(res.err, sizeof(res.err), "%s", err);
 
-  if(!r->is_poll && r->cb.global != NULL)
-    r->cb.global(&res, r->user);
+  if(c.cb.global != NULL)
+    c.cb.global(&res, c.user);
 
   cmc_req_release(r);
 }
@@ -820,6 +965,7 @@ cmc_listings_done(const curl_response_t *resp)
   struct json_object *jdata;
   coinmarketcap_listings_result_t res = { 0 };
   cmc_request_t *r = (cmc_request_t *)resp->user_data;
+  cmc_caller_t   c;
 
   err = cmc_classify_http(resp, errbuf, sizeof(errbuf));
 
@@ -853,8 +999,10 @@ cmc_listings_done(const curl_response_t *resp)
   cmc_cache_populate(jdata);
   pthread_rwlock_unlock(&cmc_cache_rwl);
 
-  if(!r->is_poll && r->cb.listings != NULL)
-    r->cb.listings(&res, r->user);
+  cmc_req_take_caller(r, &c);
+
+  if(c.cb.listings != NULL)
+    c.cb.listings(&res, c.user);
 
   json_object_put(root);
   cmc_req_release(r);
@@ -870,6 +1018,7 @@ cmc_quotes_done(const curl_response_t *resp)
   struct json_object *item = NULL;
   coinmarketcap_detail_result_t res = { 0 };
   cmc_request_t *r = (cmc_request_t *)resp->user_data;
+  cmc_caller_t   c;
 
   err = cmc_classify_http(resp, errbuf, sizeof(errbuf));
 
@@ -934,8 +1083,10 @@ cmc_quotes_done(const curl_response_t *resp)
   // hits here if some earlier request warmed the same symbol.
   cmc_info_lookup(res.detail.base.symbol, &res.info);
 
-  if(!r->is_poll && r->cb.detail != NULL)
-    r->cb.detail(&res, r->user);
+  cmc_req_take_caller(r, &c);
+
+  if(c.cb.detail != NULL)
+    c.cb.detail(&res, c.user);
 
   json_object_put(root);
   cmc_req_release(r);
@@ -950,6 +1101,7 @@ cmc_global_done(const curl_response_t *resp)
   struct json_object *jdata = NULL;
   coinmarketcap_global_result_t res = { 0 };
   cmc_request_t *r = (cmc_request_t *)resp->user_data;
+  cmc_caller_t   c;
 
   err = cmc_classify_http(resp, errbuf, sizeof(errbuf));
 
@@ -982,8 +1134,10 @@ cmc_global_done(const curl_response_t *resp)
   res.global = cmc_global_cache;
   pthread_rwlock_unlock(&cmc_cache_rwl);
 
-  if(!r->is_poll && r->cb.global != NULL)
-    r->cb.global(&res, r->user);
+  cmc_req_take_caller(r, &c);
+
+  if(c.cb.global != NULL)
+    c.cb.global(&res, c.user);
 
   json_object_put(root);
   cmc_req_release(r);
@@ -1196,6 +1350,10 @@ coinmarketcap_fetch_listings_async(
   r->user         = user;
   snprintf(r->apikey, sizeof(r->apikey), "%s", apikey);
 
+  // File it before anything can be submitted, never after: a completion
+  // can run on a curl worker before the submitting call has returned.
+  cmc_req_track(r);
+
   return(cmc_submit_listings(r));
 }
 
@@ -1218,6 +1376,8 @@ coinmarketcap_fetch_detail_async(const char *symbol, int32_t rank,
   r->cb.detail = done_cb;
   r->user      = user;
   snprintf(r->apikey, sizeof(r->apikey), "%s", apikey);
+
+  cmc_req_track(r);
 
   if(symbol != NULL && symbol[0] != '\0')
     snprintf(r->symbol, sizeof(r->symbol), "%s", symbol);
@@ -1253,6 +1413,8 @@ coinmarketcap_fetch_global_async(
   r->user      = user;
   snprintf(r->apikey, sizeof(r->apikey), "%s", apikey);
 
+  cmc_req_track(r);
+
   return(cmc_submit_global(r));
 }
 
@@ -1283,6 +1445,8 @@ cmc_init(void)
   memset(cmc_cache, 0, sizeof(cmc_cache));
   memset(cmc_info_cache, 0, sizeof(cmc_info_cache));
   memset(&cmc_global_cache, 0, sizeof(cmc_global_cache));
+
+  plugin_unmap_notify_register(cmc_unmap_cb, NULL);
 
   clam(CLAM_INFO, CMC_CTX, "coinmarketcap plugin initialized");
 
@@ -1338,7 +1502,24 @@ cmc_start(void)
 static void
 cmc_deinit(void)
 {
+  uint32_t stranded;
+
   kv_set_cb("plugin.coinmarketcap.poll", NULL, NULL);
+
+  plugin_unmap_notify_unregister(cmc_unmap_cb);
+
+  pthread_mutex_lock(&cmc_active_mutex);
+  stranded = cmc_active_count;
+  pthread_mutex_unlock(&cmc_active_mutex);
+
+  // Nothing to free here: a stranded request is still owned by a live
+  // curl transfer whose completion lives in the mapping now going away.
+  // Core's residual audit sees those — cmc_*_done is curl_iter_req_t.cb
+  // for every one — so it is the audit that refuses the dlclose, not us.
+  // Naming the count here is what makes that refusal legible.
+  if(stranded > 0)
+    clam(CLAM_WARN, CMC_CTX, "%u market request(s) still in flight at "
+        "deinit", stranded);
 
   pthread_mutex_lock(&cmc_free_mu);
 

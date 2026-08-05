@@ -10,13 +10,18 @@
 
 #include "searxng_api.h"
 
-// Per-call state bridging the curl callback to the caller's cb.
-typedef struct
+// Per-call state bridging the curl callback to the caller's cb. `cb`
+// and `user_data` belong to another mapping, so every live request is
+// filed on the in-flight list through `next_active` — see the registry
+// section in searxng.c.
+typedef struct sxng_req
 {
   sxng_done_cb_t   cb;
   void            *user_data;
   size_t           n_wanted;
   sxng_category_t  category;
+
+  struct sxng_req *next_active;
 } sxng_req_t;
 
 #endif // SEARXNG_INTERNAL

@@ -50,6 +50,7 @@ static bool
 cb_init(void)
 {
   cb_rest_init();
+  cb_exch_init();
   cb_ws_init();
   cb_ws_channels_init();
 
@@ -96,6 +97,7 @@ cb_deinit(void)
 
   cb_ws_deinit();            // stops reader, frees transport state
   cb_ws_channels_deinit();   // drops every sub handle + slot state
+  cb_exch_deinit();          // drops the unmap listener over the vtable
   cb_rest_deinit();
   cb_cdp_deinit();
 

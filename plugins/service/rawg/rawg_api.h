@@ -140,6 +140,17 @@ typedef struct
 
 // Callbacks run on the curl-multi worker thread owned by the rawg plugin
 // — they must be fast and non-blocking.
+//
+// This plugin registers NO plugin_unmap_notify listener, and is the one
+// shape of async service that legitimately needs none: it is a single
+// .so whose only caller is its own command surface (rawg_cmd.c), so a
+// stored completion always names THIS mapping. Core sees it — quiesce
+// and audit range-test curl_iter_req_t.cb, which for our transfers
+// points here too — and refuses the dlclose while a request is
+// airborne. ⚠ That holds only while nothing else calls in. The first
+// consumer in another plugin makes this the defect written up in
+// PLUGIN.md §Lifecycle Contract ("hand back pointers other plugins gave
+// you"); copy reachyapi.c's registry before adding one.
 typedef void (*rawg_search_cb_t)(const rawg_search_res_t *, void *user);
 typedef void (*rawg_game_cb_t)(const rawg_game_res_t *, void *user);
 

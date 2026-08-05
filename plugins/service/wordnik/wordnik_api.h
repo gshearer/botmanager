@@ -116,6 +116,17 @@ typedef struct
 
 // Completion callback. Invoked on the curl worker thread; must be fast
 // and non-blocking.
+//
+// This plugin registers NO plugin_unmap_notify listener, and is the one
+// shape of async service that legitimately needs none: it is a single
+// .so whose only caller is its own command surface (wordnik_cmd.c), so a
+// stored completion always names THIS mapping. Core sees it — quiesce
+// and audit range-test curl_iter_req_t.cb, which for our transfers
+// points here too — and refuses the dlclose while a request is
+// airborne. ⚠ That holds only while nothing else calls in. The first
+// consumer in another plugin makes this the defect written up in
+// PLUGIN.md §Lifecycle Contract ("hand back pointers other plugins gave
+// you"); copy reachyapi.c's registry before adding one.
 typedef void (*wordnik_done_cb_t)(const wordnik_response_t *resp);
 
 // ----------------------------------------------------------------------

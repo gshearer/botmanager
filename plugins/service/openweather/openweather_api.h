@@ -126,6 +126,17 @@ typedef struct
 // Callback signatures. Callbacks run on the curl-multi worker thread
 // owned by the openweather plugin — do not block; if substantial work
 // is needed, enqueue a task. cmd_reply is thread-safe.
+//
+// The plugin files every live fetch on an in-flight list and listens for
+// mapping unloads (plugin_unmap_notify_register). If your plugin is
+// unloaded with a fetch airborne, the request still runs its chain to
+// the end but this callback is NOT invoked — and `user` is dropped, so
+// whatever it points at LEAKS. That is the accepted outcome: only you
+// could free your own context and you are exactly what is no longer
+// there. The window is a whole request chain (geocode → datatype →
+// hi/lo → one GET per alert), not one round trip, so size per-request
+// contexts accordingly and do not plan a reload-time drain around a
+// guaranteed final callback. See PLUGIN.md §Lifecycle Contract.
 typedef void (*openweather_done_current_cb_t)(
     const openweather_current_result_t *res, void *user);
 

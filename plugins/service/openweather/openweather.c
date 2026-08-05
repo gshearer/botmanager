@@ -183,36 +183,175 @@ ow_req_alloc(void)
 static void
 ow_req_release(ow_request_t *r)
 {
+  pthread_mutex_lock(&ow_active_mutex);
+  ow_req_untrack_locked(r);
+  pthread_mutex_unlock(&ow_active_mutex);
+
   pthread_mutex_lock(&ow_free_mu);
   r->next = ow_free;
   ow_free = r;
   pthread_mutex_unlock(&ow_free_mu);
 }
 
+// ----------------------------------------------------------------------
+// The in-flight registry — every fetch borrows a foreign callback
+// ----------------------------------------------------------------------
+
+// Each openweather_fetch_* stores its caller's completion in a request
+// of ours and hands core's curl layer one of our own ow_*_done functions
+// instead. That is one indirection more than core can see: plugin_quiesce
+// and plugin_audit both range-test curl_iter_req_t.cb, which for our
+// transfers names THIS mapping, never the caller's. The only caller is
+// the `weather` feature plugin, in a mapping of its own — reload it with
+// a fetch airborne and the stored pointer aims into freed .text.
+//
+// The exposure here is wider than one HTTP round trip. A request is a
+// CHAIN — geocode, then the One Call datatype, then hi/lo, then one GET
+// per weather alert — and the caller's callback sits in it, unread, for
+// the whole sequence. So the registry brackets the request's entire
+// lifetime rather than a single transfer: filed the moment the caller's
+// callback is installed, dropped by ow_req_release, which every terminal
+// path already goes through.
+//
+// A request whose caller left still runs its chain to the end; it simply
+// delivers to nobody. The mechanics are commented in full in
+// reachyapi.c and written up in PLUGIN.md.
+//
+// The caller's `user` is dropped with the callback and whatever it
+// points at is leaked. Nothing else is possible: only the caller knows
+// how to free its own context, and the caller is precisely what is no
+// longer there. A bounded leak on an operator action beats a SIGSEGV.
+
+static void
+ow_req_track(ow_request_t *r)
+{
+  pthread_mutex_lock(&ow_active_mutex);
+
+  r->next_active = ow_active_head;
+  ow_active_head = r;
+  ow_active_count++;
+
+  pthread_mutex_unlock(&ow_active_mutex);
+}
+
+// Caller holds ow_active_mutex. A no-op for a request that is not on the
+// list, which is what makes release-after-delivery safe.
+static void
+ow_req_untrack_locked(ow_request_t *r)
+{
+  ow_request_t **pp;
+
+  for(pp = &ow_active_head; *pp != NULL; pp = &(*pp)->next_active)
+  {
+    if(*pp != r)
+      continue;
+
+    *pp = r->next_active;
+    r->next_active = NULL;
+    ow_active_count--;
+    return;
+  }
+}
+
+// Lift the caller's half off `r` and unlink it, both under the registry
+// lock. The read has to happen in the same critical section the sweep
+// would null it in — read it afterwards and the two interleave, which is
+// the whole bug. Clearing the arms as we go also makes a second delivery
+// on the same request structurally impossible.
+static void
+ow_req_take_caller(ow_request_t *r, ow_caller_t *out)
+{
+  pthread_mutex_lock(&ow_active_mutex);
+
+  ow_req_untrack_locked(r);
+
+  out->cb   = r->cb;
+  out->user = r->user;
+
+  memset(&r->cb, 0, sizeof(r->cb));
+  r->user = NULL;
+
+  pthread_mutex_unlock(&ow_active_mutex);
+}
+
+// A mapping is going away (core is between the plugin's deinit() and its
+// residual audit, so nothing of it runs any more). Drop every callback
+// that lives inside it.
+//
+// Residual race: a chain that has already taken its caller half holds it
+// on the stack and is a few instructions from calling it. The window is
+// bounded above by the quiescence poll plus the audit that follow this
+// broadcast, and below by two stores — against an operator-timescale
+// unload. Closing it would need core to wait on a lock a curl worker
+// holds.
+static void
+ow_unmap_cb(uintptr_t lo, uintptr_t hi, void *data)
+{
+  uint32_t orphaned = 0;
+
+  (void)data;
+
+  pthread_mutex_lock(&ow_active_mutex);
+
+  for(ow_request_t *r = ow_active_head; r != NULL; r = r->next_active)
+  {
+    uintptr_t cb = r->type == OW_REQ_WEATHER
+        ? (uintptr_t)fn_addr(&r->cb.current)
+        : (uintptr_t)fn_addr(&r->cb.forecast);
+
+    if(cb == 0 || cb < lo || cb >= hi)
+      continue;
+
+    // memset rather than one arm's NULL: the arms are a union, and
+    // all-bits-zero is the null test every delivery path makes.
+    memset(&r->cb, 0, sizeof(r->cb));
+    r->user = NULL;
+    orphaned++;
+  }
+
+  pthread_mutex_unlock(&ow_active_mutex);
+
+  if(orphaned > 0)
+    clam(CLAM_WARN, OW_CTX, "%u weather request(s) lost their caller to "
+        "an unload; they will complete and deliver nothing", orphaned);
+}
+
+// ----------------------------------------------------------------------
 // Callback delivery helpers
+// ----------------------------------------------------------------------
+
+// Each takes the caller's half off the request first, so what runs is a
+// stack copy that is either the caller's or NULL because the caller was
+// unloaded mid-chain.
 
 static void
 ow_deliver_current_err(ow_request_t *r, const char *msg)
 {
   openweather_current_result_t res;
+  ow_caller_t                  c;
+
+  ow_req_take_caller(r, &c);
 
   memset(&res, 0, sizeof(res));
   snprintf(res.err, sizeof(res.err), "%s", msg);
 
-  if(r->cb.current != NULL)
-    r->cb.current(&res, r->user);
+  if(c.cb.current != NULL)
+    c.cb.current(&res, c.user);
 }
 
 static void
 ow_deliver_forecast_err(ow_request_t *r, const char *msg)
 {
   openweather_forecast_result_t res;
+  ow_caller_t                   c;
+
+  ow_req_take_caller(r, &c);
 
   memset(&res, 0, sizeof(res));
   snprintf(res.err, sizeof(res.err), "%s", msg);
 
-  if(r->cb.forecast != NULL)
-    r->cb.forecast(&res, r->user);
+  if(c.cb.forecast != NULL)
+    c.cb.forecast(&res, c.user);
 }
 
 // JSON → typed payload parsers
@@ -947,15 +1086,20 @@ ow_alert_done(const curl_response_t *resp)
 static void
 ow_deliver_final(ow_request_t *r)
 {
+  ow_caller_t c;
+
+  ow_req_take_caller(r, &c);
+
   if(r->type == OW_REQ_WEATHER)
   {
-    if(r->cb.current != NULL)
-      r->cb.current(&r->acc.current, r->user);
+    if(c.cb.current != NULL)
+      c.cb.current(&r->acc.current, c.user);
   }
+
   else
   {
-    if(r->cb.forecast != NULL)
-      r->cb.forecast(&r->acc.forecast, r->user);
+    if(c.cb.forecast != NULL)
+      c.cb.forecast(&r->acc.forecast, c.user);
   }
 
   ow_req_release(r);
@@ -1190,6 +1334,10 @@ openweather_fetch_current(const char *zipcode,
   r->cb.current = done_cb;
   r->user       = user;
 
+  // File it before anything can be submitted, never after: a completion
+  // can run on a curl worker before the submitting call has returned.
+  ow_req_track(r);
+
   pr = ow_prepare_request(r, zipcode, errbuf, sizeof(errbuf));
 
   if(pr == OW_PREP_ERR)
@@ -1230,6 +1378,8 @@ ow_fetch_forecast_common(ow_req_type_t type, const char *zipcode,
   r->type        = type;
   r->cb.forecast = done_cb;
   r->user        = user;
+
+  ow_req_track(r);
 
   pr = ow_prepare_request(r, zipcode, errbuf, sizeof(errbuf));
 
@@ -2115,6 +2265,8 @@ ow_init(void)
   memset(ow_geo_cache,  0, sizeof(ow_geo_cache));
   memset(ow_city_cache, 0, sizeof(ow_city_cache));
 
+  plugin_unmap_notify_register(ow_unmap_cb, NULL);
+
   clam(CLAM_INFO, OW_CTX, "openweather plugin initialized");
 
   return(SUCCESS);
@@ -2123,6 +2275,23 @@ ow_init(void)
 static void
 ow_deinit(void)
 {
+  uint32_t stranded;
+
+  plugin_unmap_notify_unregister(ow_unmap_cb);
+
+  pthread_mutex_lock(&ow_active_mutex);
+  stranded = ow_active_count;
+  pthread_mutex_unlock(&ow_active_mutex);
+
+  // Nothing to free here: a stranded request is still owned by a live
+  // curl transfer whose completion lives in the mapping now going away.
+  // Core's residual audit sees those — ow_*_done is curl_iter_req_t.cb
+  // for every one — so it is the audit that refuses the dlclose, not us.
+  // Naming the count here is what makes that refusal legible.
+  if(stranded > 0)
+    clam(CLAM_WARN, OW_CTX, "%u weather request(s) still in flight at "
+        "deinit", stranded);
+
   // Free the request freelist.
   pthread_mutex_lock(&ow_free_mu);
 

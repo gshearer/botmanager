@@ -90,6 +90,7 @@ kr_init(void)
   kr_sign_init();
   kr_pairs_init();
   kr_rest_init();
+  kr_exch_init();
   kr_ws_init();
   kr_ws_channels_init();
 
@@ -192,6 +193,7 @@ kr_deinit(void)
 
   kr_ws_deinit();
   kr_ws_channels_deinit();
+  kr_exch_deinit();        // drops the unmap listener over the vtable
   kr_rest_deinit();
   kr_pairs_deinit();
   kr_sign_deinit();

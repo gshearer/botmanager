@@ -44,6 +44,14 @@
 // abstraction. Called from kr_start.
 bool    kr_exchange_register_vtable(void);
 
+// In-flight registry for the consumer callbacks the vtable borrows.
+// kr_exch_init registers the unmap listener that keeps it honest;
+// kr_exch_deinit unregisters it and reports anything still airborne.
+// Both are idempotent. See the registry section in kraken_exchange.c
+// for why a service with an async API needs this at all.
+void    kr_exch_init(void);
+void    kr_exch_deinit(void);
+
 #endif // KR_INTERNAL
 
 #endif // BM_KRAKEN_H

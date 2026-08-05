@@ -181,6 +181,17 @@ typedef struct
 
 // Callback signatures. Callbacks run on the curl-multi worker thread
 // owned by the coinmarketcap plugin — do not block.
+//
+// The plugin files every live fetch on an in-flight list and listens for
+// mapping unloads (plugin_unmap_notify_register). If your plugin is
+// unloaded with a fetch airborne, the request still completes but this
+// callback is NOT invoked — and `user` is dropped, so whatever it points
+// at LEAKS. That is the accepted outcome: only you could free your own
+// context and you are exactly what is no longer there. On the detail
+// path the window spans two legs (metadata, then quote), not one round
+// trip. Size per-request contexts accordingly, and do not plan a
+// reload-time drain around a guaranteed final callback. See
+// PLUGIN.md §Lifecycle Contract.
 typedef void (*coinmarketcap_done_detail_cb_t)(
     const coinmarketcap_detail_result_t *res, void *user);
 

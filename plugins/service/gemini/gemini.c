@@ -87,6 +87,7 @@ gem_init(void)
   gem_sign_init();
   gem_pairs_init();
   gem_rest_init();
+  gem_exch_init();
   gem_ws_init();           // stub in GEM-1; real body in GEM-3
   gem_ws_channels_init();  // stub in GEM-1; real body in GEM-3
 
@@ -181,6 +182,7 @@ gem_deinit(void)
 
   gem_ws_deinit();
   gem_ws_channels_deinit();
+  gem_exch_deinit();       // drops the unmap listener over the vtable
   gem_rest_deinit();
   gem_pairs_deinit();
   gem_sign_deinit();

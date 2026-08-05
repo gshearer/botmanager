@@ -266,38 +266,204 @@ cb_exch_is_authenticated(void)
   return(cb_apikey_configured());
 }
 
-// Per-call adapter contexts. Sized for trivial forwarding; allocated
-// per dispatch and freed by the adapter cb.
+// ------------------------------------------------------------------ //
+// Per-call adapter context, and the in-flight registry over it         //
+// ------------------------------------------------------------------ //
 
-typedef struct
+// One context per dispatch: it carries the consumer's typed callback
+// across the inner coinbase_*_async call and is freed by the adapter
+// that delivers it. Six shapes of callback, one struct — they differ
+// only in which arm of the union is live, and a single type is what
+// lets one registry walk them all.
+typedef enum
 {
-  exchange_done_order_cb_t cb;
-  void                    *user;
-} cb_exch_order_fwd_t;
+  CB_FWD_ORDER,
+  CB_FWD_ORDERS,
+  CB_FWD_ACCOUNTS,
+  CB_FWD_FILLS,
+  CB_FWD_CANDLES,
+  CB_FWD_TICKERS
+} cb_fwd_type_t;
 
-typedef struct
+typedef struct cb_exch_fwd
 {
-  exchange_done_orders_cb_t cb;
-  void                     *user;
-} cb_exch_orders_fwd_t;
+  cb_fwd_type_t type;
 
-typedef struct
-{
-  exchange_done_accounts_cb_t cb;
-  void                       *user;
-} cb_exch_accounts_fwd_t;
+  union
+  {
+    exchange_done_order_cb_t     order;
+    exchange_done_orders_cb_t    orders;
+    exchange_done_accounts_cb_t  accounts;
+    exchange_done_fills_cb_t     fills;
+    exchange_done_candles_cb_t   candles;
+    exchange_done_tickers_cb_t   tickers;
+  } cb;
+  void         *user;
 
-typedef struct
-{
-  exchange_done_fills_cb_t cb;
-  void                    *user;
-} cb_exch_fills_fwd_t;
+  struct cb_exch_fwd *next_active;
+} cb_exch_fwd_t;
 
-typedef struct
+// Every callback in that union belongs to another mapping — the vtable
+// is reached only from `whenmoon`, through feature_exchange. We hand
+// core's curl layer one of our own completions and keep the consumer's
+// one indirection deeper, where neither plugin_quiesce nor plugin_audit
+// can see it: both range-test curl_iter_req_t.cb, which for our
+// transfers names THIS mapping, never the consumer's. Reload whenmoon
+// with an order, a fills page or a candle range airborne and the stored
+// pointer aims into freed .text — and these are the longest requests in
+// the daemon, held open for seconds against an exchange.
+//
+// So every live dispatch is filed here, and plugin_unmap_notify_register
+// tells us when a mapping is about to go away in time to null the
+// pointers that name it. A dispatch whose consumer left still completes
+// normally; it simply delivers to nobody. The mechanics are commented in
+// full in reachyapi.c and written up in PLUGIN.md.
+//
+// The consumer's `user` is dropped with the callback and whatever it
+// points at is leaked. Nothing else is possible: only the consumer knows
+// how to free its own context, and the consumer is precisely what is no
+// longer there. A bounded leak on an operator action beats a SIGSEGV.
+//
+// ⭑ WS subscriptions are deliberately NOT filed. cb_exch_ws_sub_t holds
+// a consumer callback for the life of the subscription — a far wider
+// window — but whenmoon drains every binding through
+// exchange_ws_unsubscribe on both of its teardown paths
+// (market.c:wm_market_destroy, live.c:wm_live_shutdown), so the handle
+// is gone before the unload. That is a consumer-side guarantee, not a
+// property of this file; if a second consumer ever subscribes, it owes
+// the same discipline or this registry owes it an arm.
+static pthread_mutex_t cb_fwd_mutex = PTHREAD_MUTEX_INITIALIZER;
+static cb_exch_fwd_t  *cb_fwd_head  = NULL;
+static uint32_t        cb_fwd_count = 0;
+
+// Allocate a dispatch context with its consumer half installed and file
+// it before anything can be submitted, never after: a completion can run
+// on a curl worker before the submitting call has returned.
+static cb_exch_fwd_t *
+cb_fwd_new(cb_fwd_type_t type, void *user)
 {
-  exchange_done_candles_cb_t cb;
-  void                      *user;
-} cb_exch_candles_fwd_t;
+  cb_exch_fwd_t *fwd = mem_alloc(CB_CTX, "exch.fwd", sizeof(*fwd));
+
+  memset(fwd, 0, sizeof(*fwd));
+  fwd->type = type;
+  fwd->user = user;
+
+  pthread_mutex_lock(&cb_fwd_mutex);
+
+  fwd->next_active = cb_fwd_head;
+  cb_fwd_head      = fwd;
+  cb_fwd_count++;
+
+  pthread_mutex_unlock(&cb_fwd_mutex);
+
+  return(fwd);
+}
+
+// Unlink `fwd`, copy it to `out` and free it. The copy is taken under
+// the lock so an adapter reads the consumer's callback in the same
+// critical section the unmap sweep would null it in — read it afterwards
+// and the two interleave, which is the whole bug.
+static void
+cb_fwd_retire(cb_exch_fwd_t *fwd, cb_exch_fwd_t *out)
+{
+  cb_exch_fwd_t **pp;
+
+  pthread_mutex_lock(&cb_fwd_mutex);
+
+  for(pp = &cb_fwd_head; *pp != NULL; pp = &(*pp)->next_active)
+  {
+    if(*pp != fwd)
+      continue;
+
+    *pp = fwd->next_active;
+    cb_fwd_count--;
+    break;
+  }
+
+  *out = *fwd;
+
+  pthread_mutex_unlock(&cb_fwd_mutex);
+
+  out->next_active = NULL;
+  mem_free(fwd);
+}
+
+// A mapping is going away (core is between the plugin's deinit() and its
+// residual audit, so nothing of it runs any more). Drop every callback
+// that lives inside it.
+//
+// Residual race: an adapter that has already retired its context holds
+// the callback on its stack and is a few instructions from calling it.
+// The window is bounded above by the quiescence poll plus the audit that
+// follow this broadcast, and below by two stores — against an
+// operator-timescale unload. Closing it would need core to wait on a
+// lock a curl worker holds.
+static void
+cb_exch_unmap_cb(uintptr_t lo, uintptr_t hi, void *data)
+{
+  uint32_t orphaned = 0;
+
+  (void)data;
+
+  pthread_mutex_lock(&cb_fwd_mutex);
+
+  for(cb_exch_fwd_t *f = cb_fwd_head; f != NULL; f = f->next_active)
+  {
+    uintptr_t cb = 0;
+
+    switch(f->type)
+    {
+      case CB_FWD_ORDER:    cb = (uintptr_t)fn_addr(&f->cb.order);    break;
+      case CB_FWD_ORDERS:   cb = (uintptr_t)fn_addr(&f->cb.orders);   break;
+      case CB_FWD_ACCOUNTS: cb = (uintptr_t)fn_addr(&f->cb.accounts); break;
+      case CB_FWD_FILLS:    cb = (uintptr_t)fn_addr(&f->cb.fills);    break;
+      case CB_FWD_CANDLES:  cb = (uintptr_t)fn_addr(&f->cb.candles);  break;
+      case CB_FWD_TICKERS:  cb = (uintptr_t)fn_addr(&f->cb.tickers);  break;
+    }
+
+    if(cb == 0 || cb < lo || cb >= hi)
+      continue;
+
+    // memset rather than one arm's NULL: the arms are a union, and
+    // all-bits-zero is the null test every adapter makes.
+    memset(&f->cb, 0, sizeof(f->cb));
+    f->user = NULL;
+    orphaned++;
+  }
+
+  pthread_mutex_unlock(&cb_fwd_mutex);
+
+  if(orphaned > 0)
+    clam(CLAM_WARN, CB_CTX, "%u exchange request(s) lost their consumer "
+        "to an unload; they will complete and deliver nothing", orphaned);
+}
+
+void
+cb_exch_init(void)
+{
+  plugin_unmap_notify_register(cb_exch_unmap_cb, NULL);
+}
+
+void
+cb_exch_deinit(void)
+{
+  uint32_t stranded;
+
+  plugin_unmap_notify_unregister(cb_exch_unmap_cb);
+
+  pthread_mutex_lock(&cb_fwd_mutex);
+  stranded = cb_fwd_count;
+  pthread_mutex_unlock(&cb_fwd_mutex);
+
+  // Nothing to free: those contexts belong to requests curl still owns,
+  // and their adapters live in the mapping now going away. Core's
+  // residual audit sees them — cb_curl_done is curl_iter_req_t.cb for
+  // every one — so it is the audit that refuses the dlclose, not us.
+  // Naming the count here is what makes that refusal legible.
+  if(stranded > 0)
+    clam(CLAM_WARN, CB_CTX, "%u exchange request(s) still in flight at "
+        "deinit", stranded);
+}
 
 // KR-2: WS subscriber state. The protocol-side coinbase_ws_sub_t is
 // opaque to the exchange layer; we wrap it together with the user-
@@ -378,32 +544,34 @@ cb_to_exch_candle(const coinbase_candle_t *src, exchange_candle_t *dst)
 static void
 cb_exch_order_done_adapter(const coinbase_order_result_t *res, void *user)
 {
-  cb_exch_order_fwd_t      *fwd = user;
   exchange_order_result_t   out;
+  cb_exch_fwd_t             fwd;
 
-  if(fwd == NULL)
+  if(user == NULL)
     return;
+
+  cb_fwd_retire(user, &fwd);
 
   memset(&out, 0, sizeof(out));
   snprintf(out.err, sizeof(out.err), "%s", res->err);
   cb_to_exch_order(&res->order, &out.order);
 
-  if(fwd->cb != NULL)
-    fwd->cb(&out, fwd->user);
-
-  mem_free(fwd);
+  if(fwd.cb.order != NULL)
+    fwd.cb.order(&out, fwd.user);
 }
 
 static void
 cb_exch_orders_done_adapter(const coinbase_orders_result_t *res, void *user)
 {
-  cb_exch_orders_fwd_t     *fwd = user;
   exchange_orders_result_t  out;
+  cb_exch_fwd_t             fwd;
   uint32_t                  i;
   uint32_t                  n;
 
-  if(fwd == NULL)
+  if(user == NULL)
     return;
+
+  cb_fwd_retire(user, &fwd);
 
   memset(&out, 0, sizeof(out));
   snprintf(out.err, sizeof(out.err), "%s", res->err);
@@ -418,23 +586,23 @@ cb_exch_orders_done_adapter(const coinbase_orders_result_t *res, void *user)
 
   out.count = n;
 
-  if(fwd->cb != NULL)
-    fwd->cb(&out, fwd->user);
-
-  mem_free(fwd);
+  if(fwd.cb.orders != NULL)
+    fwd.cb.orders(&out, fwd.user);
 }
 
 static void
 cb_exch_accounts_done_adapter(const coinbase_accounts_result_t *res,
     void *user)
 {
-  cb_exch_accounts_fwd_t      *fwd = user;
   exchange_accounts_result_t   out;
+  cb_exch_fwd_t                fwd;
   uint32_t                     i;
   uint32_t                     n;
 
-  if(fwd == NULL)
+  if(user == NULL)
     return;
+
+  cb_fwd_retire(user, &fwd);
 
   memset(&out, 0, sizeof(out));
   snprintf(out.err, sizeof(out.err), "%s", res->err);
@@ -449,22 +617,22 @@ cb_exch_accounts_done_adapter(const coinbase_accounts_result_t *res,
 
   out.count = n;
 
-  if(fwd->cb != NULL)
-    fwd->cb(&out, fwd->user);
-
-  mem_free(fwd);
+  if(fwd.cb.accounts != NULL)
+    fwd.cb.accounts(&out, fwd.user);
 }
 
 static void
 cb_exch_fills_done_adapter(const coinbase_fills_result_t *res, void *user)
 {
-  cb_exch_fills_fwd_t       *fwd = user;
   exchange_fills_result_t    out;
+  cb_exch_fwd_t              fwd;
   uint32_t                   i;
   uint32_t                   n;
 
-  if(fwd == NULL)
+  if(user == NULL)
     return;
+
+  cb_fwd_retire(user, &fwd);
 
   memset(&out, 0, sizeof(out));
   snprintf(out.err, sizeof(out.err), "%s", res->err);
@@ -479,23 +647,23 @@ cb_exch_fills_done_adapter(const coinbase_fills_result_t *res, void *user)
 
   out.count = n;
 
-  if(fwd->cb != NULL)
-    fwd->cb(&out, fwd->user);
-
-  mem_free(fwd);
+  if(fwd.cb.fills != NULL)
+    fwd.cb.fills(&out, fwd.user);
 }
 
 static void
 cb_exch_candles_done_adapter(const coinbase_candles_result_t *res,
     void *user)
 {
-  cb_exch_candles_fwd_t      *fwd = user;
   exchange_candles_result_t   out;
+  cb_exch_fwd_t               fwd;
   uint32_t                    i;
   uint32_t                    n;
 
-  if(fwd == NULL)
+  if(user == NULL)
     return;
+
+  cb_fwd_retire(user, &fwd);
 
   memset(&out, 0, sizeof(out));
   snprintf(out.err, sizeof(out.err), "%s", res->err);
@@ -510,10 +678,8 @@ cb_exch_candles_done_adapter(const coinbase_candles_result_t *res,
 
   out.count = n;
 
-  if(fwd->cb != NULL)
-    fwd->cb(&out, fwd->user);
-
-  mem_free(fwd);
+  if(fwd.cb.candles != NULL)
+    fwd.cb.candles(&out, fwd.user);
 }
 
 // Trampolines. Each FAIL path that returns before the inner async
@@ -539,7 +705,7 @@ cb_exch_place_order_async(const exchange_place_order_req_t *req,
     exchange_done_order_cb_t cb, void *user)
 {
   coinbase_place_order_req_t  inner;
-  cb_exch_order_fwd_t        *fwd;
+  cb_exch_fwd_t              *fwd;
 
   if(req == NULL || cb == NULL)
   {
@@ -547,16 +713,8 @@ cb_exch_place_order_async(const exchange_place_order_req_t *req,
     return(FAIL);
   }
 
-  fwd = mem_alloc(CB_CTX, "exch.fwd", sizeof(*fwd));
-
-  if(fwd == NULL)
-  {
-    cb_exch_fail_order(cb, user, "out of memory");
-    return(FAIL);
-  }
-
-  fwd->cb   = cb;
-  fwd->user = user;
+  fwd           = cb_fwd_new(CB_FWD_ORDER, user);
+  fwd->cb.order = cb;
 
   // The neutral `req->*` buffers are sized at-or-above coinbase's
   // per-field caps; copy via memcpy after a bounded strnlen so we
@@ -601,7 +759,7 @@ static bool
 cb_exch_cancel_order_async(const char *order_id,
     exchange_done_order_cb_t cb, void *user)
 {
-  cb_exch_order_fwd_t *fwd;
+  cb_exch_fwd_t *fwd;
 
   if(cb == NULL)
     return(FAIL);
@@ -612,16 +770,8 @@ cb_exch_cancel_order_async(const char *order_id,
     return(FAIL);
   }
 
-  fwd = mem_alloc(CB_CTX, "exch.fwd", sizeof(*fwd));
-
-  if(fwd == NULL)
-  {
-    cb_exch_fail_order(cb, user, "out of memory");
-    return(FAIL);
-  }
-
-  fwd->cb   = cb;
-  fwd->user = user;
+  fwd           = cb_fwd_new(CB_FWD_ORDER, user);
+  fwd->cb.order = cb;
 
   return(coinbase_cancel_order_async(order_id,
         cb_exch_order_done_adapter, fwd));
@@ -631,7 +781,7 @@ static bool
 cb_exch_get_order_async(const char *order_id,
     exchange_done_order_cb_t cb, void *user)
 {
-  cb_exch_order_fwd_t *fwd;
+  cb_exch_fwd_t *fwd;
 
   if(cb == NULL)
     return(FAIL);
@@ -642,16 +792,8 @@ cb_exch_get_order_async(const char *order_id,
     return(FAIL);
   }
 
-  fwd = mem_alloc(CB_CTX, "exch.fwd", sizeof(*fwd));
-
-  if(fwd == NULL)
-  {
-    cb_exch_fail_order(cb, user, "out of memory");
-    return(FAIL);
-  }
-
-  fwd->cb   = cb;
-  fwd->user = user;
+  fwd           = cb_fwd_new(CB_FWD_ORDER, user);
+  fwd->cb.order = cb;
 
   return(coinbase_get_order_async(order_id,
         cb_exch_order_done_adapter, fwd));
@@ -661,25 +803,13 @@ static bool
 cb_exch_list_orders_async(const char *status, const char *product_id,
     exchange_done_orders_cb_t cb, void *user)
 {
-  cb_exch_orders_fwd_t *fwd;
+  cb_exch_fwd_t *fwd;
 
   if(cb == NULL)
     return(FAIL);
 
-  fwd = mem_alloc(CB_CTX, "exch.fwd", sizeof(*fwd));
-
-  if(fwd == NULL)
-  {
-    exchange_orders_result_t res;
-
-    memset(&res, 0, sizeof(res));
-    snprintf(res.err, sizeof(res.err), "%s", "out of memory");
-    cb(&res, user);
-    return(FAIL);
-  }
-
-  fwd->cb   = cb;
-  fwd->user = user;
+  fwd            = cb_fwd_new(CB_FWD_ORDERS, user);
+  fwd->cb.orders = cb;
 
   return(coinbase_list_orders_async(status, product_id,
         cb_exch_orders_done_adapter, fwd));
@@ -689,25 +819,13 @@ static bool
 cb_exch_list_fills_async(const char *order_id, const char *product_id,
     int64_t start_ms, exchange_done_fills_cb_t cb, void *user)
 {
-  cb_exch_fills_fwd_t *fwd;
+  cb_exch_fwd_t *fwd;
 
   if(cb == NULL)
     return(FAIL);
 
-  fwd = mem_alloc(CB_CTX, "exch.fwd", sizeof(*fwd));
-
-  if(fwd == NULL)
-  {
-    exchange_fills_result_t res;
-
-    memset(&res, 0, sizeof(res));
-    snprintf(res.err, sizeof(res.err), "%s", "out of memory");
-    cb(&res, user);
-    return(FAIL);
-  }
-
-  fwd->cb   = cb;
-  fwd->user = user;
+  fwd           = cb_fwd_new(CB_FWD_FILLS, user);
+  fwd->cb.fills = cb;
 
   return(coinbase_list_fills_async(order_id, product_id, start_ms,
         cb_exch_fills_done_adapter, fwd));
@@ -716,25 +834,13 @@ cb_exch_list_fills_async(const char *order_id, const char *product_id,
 static bool
 cb_exch_get_accounts_async(exchange_done_accounts_cb_t cb, void *user)
 {
-  cb_exch_accounts_fwd_t *fwd;
+  cb_exch_fwd_t *fwd;
 
   if(cb == NULL)
     return(FAIL);
 
-  fwd = mem_alloc(CB_CTX, "exch.fwd", sizeof(*fwd));
-
-  if(fwd == NULL)
-  {
-    exchange_accounts_result_t res;
-
-    memset(&res, 0, sizeof(res));
-    snprintf(res.err, sizeof(res.err), "%s", "out of memory");
-    cb(&res, user);
-    return(FAIL);
-  }
-
-  fwd->cb   = cb;
-  fwd->user = user;
+  fwd              = cb_fwd_new(CB_FWD_ACCOUNTS, user);
+  fwd->cb.accounts = cb;
 
   return(coinbase_get_accounts_async(cb_exch_accounts_done_adapter, fwd));
 }
@@ -788,10 +894,10 @@ cb_exch_fetch_candles_async(const char *product_id,
     exchange_granularity_t gran, int64_t since_ms, int64_t until_ms,
     exchange_done_candles_cb_t cb, void *user)
 {
-  cb_exch_candles_fwd_t *fwd;
-  int32_t                cb_gran = 0;
-  int64_t                start_s;
-  int64_t                end_s;
+  cb_exch_fwd_t *fwd;
+  int32_t        cb_gran = 0;
+  int64_t        start_s;
+  int64_t        end_s;
 
   if(cb == NULL)
     return(FAIL);
@@ -808,16 +914,8 @@ cb_exch_fetch_candles_async(const char *product_id,
     return(FAIL);
   }
 
-  fwd = mem_alloc(CB_CTX, "exch.fwd", sizeof(*fwd));
-
-  if(fwd == NULL)
-  {
-    cb_exch_fail_candles(cb, user, "out of memory");
-    return(FAIL);
-  }
-
-  fwd->cb   = cb;
-  fwd->user = user;
+  fwd             = cb_fwd_new(CB_FWD_CANDLES, user);
+  fwd->cb.candles = cb;
 
   // Coinbase REST takes seconds (and treats `end` as inclusive); narrow
   // the millisecond window to seconds for the underlying call. The
@@ -851,12 +949,6 @@ cb_exch_fetch_candles_async(const char *product_id,
 // honest zeros. FCM (futures) products are filtered out via            //
 // `product_type == "SPOT"` when the field is present.                  //
 // ------------------------------------------------------------------ //
-
-typedef struct
-{
-  exchange_done_tickers_cb_t  cb;
-  void                       *user;
-} cb_exch_tickers_fwd_t;
 
 static double
 cb_json_str_double_local(struct json_object *obj, const char *key)
@@ -898,15 +990,25 @@ cb_map_product_status(const char *s)
   return(EXCH_TICK_UNKNOWN);
 }
 
+// Deliver from a RETIRED context, whose callback is either the
+// consumer's or NULL because the consumer was unloaded mid-flight.
+static void
+cb_exch_deliver_tickers(const cb_exch_fwd_t *f, bool ok, const char *err,
+    const exchange_ticker_snapshot_t *rows, size_t n)
+{
+  if(f->cb.tickers != NULL)
+    f->cb.tickers(ok, err, rows, n, f->user);
+}
+
 static void
 cb_exch_tickers_resp(int http_status, const char *body, size_t body_len,
     const char *err, void *user)
 {
-  cb_exch_tickers_fwd_t       *fwd = user;
   struct json_object          *root;
   struct json_object          *products;
   struct json_object          *v;
   exchange_ticker_snapshot_t  *rows = NULL;
+  cb_exch_fwd_t                fwd;
   size_t                       row_cap;
   size_t                       kept = 0;
   int                          len;
@@ -914,13 +1016,16 @@ cb_exch_tickers_resp(int http_status, const char *body, size_t body_len,
 
   (void)http_status;
 
-  if(fwd == NULL)
+  if(user == NULL)
     return;
+
+  // Retired up front: every exit below delivers through the stack copy,
+  // so no path can miss the unlink.
+  cb_fwd_retire(user, &fwd);
 
   if(err != NULL)
   {
-    fwd->cb(false, err, NULL, 0, fwd->user);
-    mem_free(fwd);
+    cb_exch_deliver_tickers(&fwd, false, err, NULL, 0);
     return;
   }
 
@@ -928,9 +1033,8 @@ cb_exch_tickers_resp(int http_status, const char *body, size_t body_len,
 
   if(root == NULL)
   {
-    fwd->cb(false, "malformed JSON from Coinbase products", NULL, 0,
-        fwd->user);
-    mem_free(fwd);
+    cb_exch_deliver_tickers(&fwd, false,
+        "malformed JSON from Coinbase products", NULL, 0);
     return;
   }
 
@@ -939,9 +1043,8 @@ cb_exch_tickers_resp(int http_status, const char *body, size_t body_len,
      !json_object_is_type(products, json_type_array))
   {
     json_object_put(root);
-    fwd->cb(false, "unexpected Coinbase products response shape",
-        NULL, 0, fwd->user);
-    mem_free(fwd);
+    cb_exch_deliver_tickers(&fwd, false,
+        "unexpected Coinbase products response shape", NULL, 0);
     return;
   }
 
@@ -950,8 +1053,7 @@ cb_exch_tickers_resp(int http_status, const char *body, size_t body_len,
   if(len <= 0)
   {
     json_object_put(root);
-    fwd->cb(true, NULL, NULL, 0, fwd->user);
-    mem_free(fwd);
+    cb_exch_deliver_tickers(&fwd, true, NULL, NULL, 0);
     return;
   }
 
@@ -971,8 +1073,7 @@ cb_exch_tickers_resp(int http_status, const char *body, size_t body_len,
   if(rows == NULL)
   {
     json_object_put(root);
-    fwd->cb(false, "out of memory", NULL, 0, fwd->user);
-    mem_free(fwd);
+    cb_exch_deliver_tickers(&fwd, false, "out of memory", NULL, 0);
     return;
   }
 
@@ -1040,40 +1141,32 @@ cb_exch_tickers_resp(int http_status, const char *body, size_t body_len,
   clam(CLAM_DEBUG2, CB_CTX,
       "tickers: products=%d kept=%zu", len, kept);
 
-  fwd->cb(true, NULL, rows, kept, fwd->user);
+  cb_exch_deliver_tickers(&fwd, true, NULL, rows, kept);
 
   mem_free(rows);
   json_object_put(root);
-  mem_free(fwd);
 }
 
 static bool
 cb_exch_fetch_all_tickers_async(exchange_done_tickers_cb_t cb, void *user)
 {
-  cb_exch_tickers_fwd_t *fwd;
+  cb_exch_fwd_t *fwd;
+  cb_exch_fwd_t  dead;
 
   if(cb == NULL)
     return(FAIL);
 
-  fwd = mem_alloc(CB_CTX, "exch.tickers.fwd", sizeof(*fwd));
-
-  if(fwd == NULL)
-  {
-    cb(false, "out of memory", NULL, 0, user);
-    return(FAIL);
-  }
-
-  fwd->cb   = cb;
-  fwd->user = user;
+  fwd             = cb_fwd_new(CB_FWD_TICKERS, user);
+  fwd->cb.tickers = cb;
 
   if(exchange_request("coinbase", EXCHANGE_PRIO_MARKET_BACKFILL,
         EXCHANGE_OP_REST_GET,
         "/api/v3/brokerage/market/products", NULL,
         cb_exch_tickers_resp, fwd) != SUCCESS)
   {
+    cb_fwd_retire(fwd, &dead);
     cb(false, "failed to submit Coinbase products request",
         NULL, 0, user);
-    mem_free(fwd);
     return(FAIL);
   }
 
