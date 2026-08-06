@@ -154,6 +154,7 @@ regex (the literal context portion, before any `<placeholder>`).
 | Context | Source | Description |
 |---|---|---|
 | `stockquote` | include/stockquote.h | provider-neutral stock-quote contract; capability-resolution shims (no provider loaded / missing symbol) |
+| `url_offer` | emitted: any plugin · consumed: plugins/feature/urlgrabber | a plugin offers a URL **it just printed** for title-grabbing. Payload is exactly `<bot> <method> <channel> <url>`, all four fields space-free, at `CLAM_INFO`. It is an event rather than a call because `PLUGIN.md §Layer Rules` forbids an extension from depending on a feature (searxng, the first offerer, may not call urlgrabber). An offer is a **candidate, not an order**: the consumer still applies its own per-channel opt-in, media-extension and private-host filters, so offering costs nothing and guarantees nothing. Offerers must not exceed `CLAM_MSG_SZ` — clam truncates silently, and half a URL is worse than none |
 
 ## Service plugins (`plugins/service/`)
 

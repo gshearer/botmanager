@@ -8,6 +8,7 @@
 
 #ifdef SEARXNG_CMD_INTERNAL
 
+#include "bot.h"
 #include "clam.h"
 #include "cmd.h"
 #include "common.h"

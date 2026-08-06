@@ -47,6 +47,25 @@
 // CLAM context (registered in CLAM.md).
 #define UG_CTX               "urlgrabber"
 
+// The offer contract, both halves of which are documented in CLAM.md.
+//
+// urlgrabber sees a bot's *inbound* stream, so a URL the bot itself prints
+// is invisible to it. A plugin that emits one — searxng's search results
+// are the first — offers it for consideration by logging a single line:
+//
+//   clam(CLAM_INFO, "url_offer", "<bot> <method> <channel> <url>");
+//
+// clam is the bus rather than a function call because the layer rule
+// (PLUGIN.md §Layer Rules) forbids an extension from depending on a
+// feature: searxng may not call into urlgrabber, and a log line couples
+// neither side to the other. An offer is a *candidate*, not an order — it
+// passes exactly the gate a human-pasted URL passes, so a channel that
+// never opted in stays silent and a .jpg is still filtered out.
+//
+// Note the payload must fit CLAM_MSG_SZ, which clam truncates silently;
+// an offerer is responsible for not offering a URL that would be cut.
+#define UG_OFFER_CTX         "url_offer"
+
 // Plugin-level KV keys — global operational knobs.
 #define UG_KV_TIMEOUT        "plugin.urlgrabber.timeout_secs"
 #define UG_KV_MAX_TITLE      "plugin.urlgrabber.max_title_len"

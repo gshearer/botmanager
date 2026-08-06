@@ -182,18 +182,63 @@ typedef struct
   char bot[BOT_NAME_SZ];
 } ug_actx_t;
 
+// The gate every candidate passes, no matter who offered it: the channel
+// must be opted in, `text` must yield a URL that survives the media and
+// private-host filters, and the channel's hold-down must have expired.
+// `inst` is the method the announcement goes back out on — the caller
+// resolves it, because only the caller knows which of a multi-method bot's
+// instances the URL arrived on.
+static void
+ug_consider(const char *botname, method_inst_t *inst, const char *channel,
+    const char *text)
+{
+  const char *kind;
+  const char *method_name;
+  char        key[KV_KEY_SZ];
+  char        url[UG_URL_SZ];
+  uint32_t    holddown;
+
+  kind = method_inst_kind(inst);
+  if(kind == NULL)
+    return;
+
+  // Keep the channel's knobs present (covers channels joined after attach).
+  ug_chan_register(botname, kind, channel);
+
+  // Opted in? Absent/false ⇒ take no action — the safe, silent default.
+  ug_chan_key(key, sizeof(key), botname, kind, channel, UG_SUFFIX_ENABLED);
+  if(kv_get_uint(key) == 0)
+    return;
+
+  if(!ug_find_url(text, url, sizeof(url)))
+    return;
+
+  // Rate-limit per channel before committing to any outbound request.
+  ug_chan_key(key, sizeof(key), botname, kind, channel, UG_SUFFIX_HOLDDOWN);
+  holddown = kv_exists(key) ? (uint32_t)kv_get_uint(key) : UG_DEFAULT_HOLDDOWN;
+
+  if(!ug_holddown_ready(botname, channel, holddown))
+  {
+    clam(CLAM_DEBUG, UG_CTX, "%s/%s: held down, skipping %s",
+        botname, channel, url);
+    return;
+  }
+
+  method_name = method_inst_name(inst);
+  if(method_name == NULL)
+    return;
+
+  clam(CLAM_DEBUG, UG_CTX, "%s/%s: fetching %s", botname, channel, url);
+  ug_fetch(method_name, channel, url);
+}
+
 static void
 ug_observe(const method_msg_t *msg, void *data)
 {
   ug_actx_t  *ctx = data;
   bot_inst_t *bot;
-  const char *kind;
   const char *prefix;
   const char *p;
-  const char *method_name;
-  char        key[KV_KEY_SZ];
-  char        url[UG_URL_SZ];
-  uint32_t    holddown;
 
   if(ctx == NULL || msg == NULL)
     return;
@@ -204,18 +249,6 @@ ug_observe(const method_msg_t *msg, void *data)
 
   bot = bot_find(ctx->bot);
   if(bot == NULL)                       // bot torn down; detached at deinit
-    return;
-
-  kind = method_inst_kind(msg->inst);
-  if(kind == NULL)
-    return;
-
-  // Keep the channel's knobs present (covers channels joined after attach).
-  ug_chan_register(ctx->bot, kind, msg->channel);
-
-  // Opted in? Absent/false ⇒ take no action — the safe, silent default.
-  ug_chan_key(key, sizeof(key), ctx->bot, kind, msg->channel, UG_SUFFIX_ENABLED);
-  if(kv_get_uint(key) == 0)
     return;
 
   // Never chase a URL sitting in someone's command arguments.
@@ -229,27 +262,7 @@ ug_observe(const method_msg_t *msg, void *data)
       strncmp(p, prefix, strlen(prefix)) == 0)
     return;
 
-  if(!ug_find_url(msg->text, url, sizeof(url)))
-    return;
-
-  // Rate-limit per channel before committing to any outbound request.
-  ug_chan_key(key, sizeof(key), ctx->bot, kind, msg->channel, UG_SUFFIX_HOLDDOWN);
-  holddown = kv_exists(key) ? (uint32_t)kv_get_uint(key) : UG_DEFAULT_HOLDDOWN;
-
-  if(!ug_holddown_ready(ctx->bot, msg->channel, holddown))
-  {
-    clam(CLAM_DEBUG, UG_CTX, "%s/%s: held down, skipping %s",
-        ctx->bot, msg->channel, url);
-    return;
-  }
-
-  method_name = method_inst_name(msg->inst);
-  if(method_name == NULL)
-    return;
-
-  clam(CLAM_DEBUG, UG_CTX, "%s/%s: fetching %s",
-      ctx->bot, msg->channel, url);
-  ug_fetch(method_name, msg->channel, url);
+  ug_consider(ctx->bot, msg->inst, msg->channel, msg->text);
 }
 
 // ------------------------------------------------------------------ //
@@ -453,16 +466,13 @@ ug_attach_task(task_t *t)
   }
 }
 
-// clam subscriber for "bot_start" events. The message is "'<name>' started
-// (<n> methods)"; lift the name and defer the real work to a task.
+// The message is "'<name>' started (<n> methods)"; lift the name and defer
+// the real work to a task.
 static void
 ug_on_bot_start(const clam_msg_t *msg)
 {
   char  name[BOT_NAME_SZ];
   char *copy;
-
-  if(msg == NULL)
-    return;
 
   if(sscanf(msg->msg, "'%63[^']'", name) != 1 || name[0] == '\0')
     return;
@@ -473,6 +483,90 @@ ug_on_bot_start(const clam_msg_t *msg)
 
   if(task_add(UG_CTX, TASK_ANY, 200, ug_attach_task, copy) == NULL)
     mem_free(copy);
+}
+
+// ------------------------------------------------------------------ //
+// URL offer → deferred consideration                                  //
+// ------------------------------------------------------------------ //
+
+// One offered URL, lifted off the event and owned by the task that acts
+// on it. Every field is a name rather than a pointer: an offer crosses a
+// thread boundary, so both bot and method are re-resolved on the far side.
+typedef struct
+{
+  char bot    [BOT_NAME_SZ];
+  char method [METHOD_NAME_SZ];
+  char channel[METHOD_CHANNEL_SZ];
+  char url    [UG_URL_SZ];
+} ug_offer_t;
+
+// Worker-thread task body. Runs off the clam dispatch thread because
+// ug_consider touches the KV store (and so, on a first sighting, the DB).
+static void
+ug_offer_task(task_t *t)
+{
+  ug_offer_t    *off = t->data;
+  method_inst_t *inst;
+
+  if(off == NULL)
+    return;
+
+  // The offering plugin resolved these on its own thread and the bot may
+  // have stopped since; a name that no longer resolves simply drops.
+  inst = method_find(off->method);
+
+  if(inst != NULL && bot_find(off->bot) != NULL)
+    ug_consider(off->bot, inst, off->channel, off->url);
+
+  mem_free(off);
+}
+
+// clam subscriber for UG_OFFER_CTX events — see the contract in
+// urlgrabber.h. Payload: "<bot> <method> <channel> <url>", every field
+// space-free by construction.
+static void
+ug_on_url_offer(const clam_msg_t *msg)
+{
+  ug_offer_t *off;
+
+  // sscanf field widths cannot be composed from the size macros, so they
+  // are written out by hand — and pinned here, so a header that grows one
+  // of these buffers fails the build instead of silently truncating.
+  _Static_assert(BOT_NAME_SZ == 64 && METHOD_NAME_SZ == 64
+      && METHOD_CHANNEL_SZ == 128 && UG_URL_SZ == 2048,
+      "ug_on_url_offer's sscanf widths must track these sizes");
+
+  off = mem_alloc(UG_CTX, "offer", sizeof(*off));
+  if(off == NULL)
+    return;
+
+  if(sscanf(msg->msg, "%63s %63s %127s %2047s",
+      off->bot, off->method, off->channel, off->url) != 4)
+  {
+    clam(CLAM_DEBUG, UG_CTX, "malformed url offer, ignored: %s", msg->msg);
+    mem_free(off);
+    return;
+  }
+
+  if(task_add(UG_CTX, TASK_ANY, 200, ug_offer_task, off) == NULL)
+    mem_free(off);
+}
+
+// Both events arrive here because clam_unsubscribe() removes exactly one
+// subscription per call: a second subscribe under the same name would
+// outlive ug_deinit() and fire into an unloaded .so. One subscription, one
+// regex, and the context tells the two apart.
+static void
+ug_on_clam_event(const clam_msg_t *msg)
+{
+  if(msg == NULL)
+    return;
+
+  if(strcmp(msg->context, "bot_start") == 0)
+    ug_on_bot_start(msg);
+
+  else if(strcmp(msg->context, UG_OFFER_CTX) == 0)
+    ug_on_url_offer(msg);
 }
 
 // bot_iterate callback — runs under bot_mutex, so it only records names.
@@ -513,8 +607,10 @@ ug_start(void)
 {
   ug_botlist_t bl;
 
-  // Catch every bot that starts from now on (cold-boot restore + runtime).
-  clam_subscribe(UG_CTX, CLAM_INFO, "^bot_start ", ug_on_bot_start);
+  // Catch every bot that starts from now on (cold-boot restore + runtime),
+  // and every URL another plugin offers us.
+  clam_subscribe(UG_CTX, CLAM_INFO, "^(bot_start|" UG_OFFER_CTX ") ",
+      ug_on_clam_event);
 
   // Attach to bots already running (the hot-load path).
   memset(&bl, 0, sizeof(bl));

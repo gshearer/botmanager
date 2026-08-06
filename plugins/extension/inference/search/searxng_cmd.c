@@ -133,6 +133,52 @@ searxng_cmd_emit_extras(cmd_ctx_t *ctx, const sxng_result_t *rr)
   }
 }
 
+// The link this result is rendered as. Every mode prints the page URL but
+// one: a concise !image prints the direct image, because SearXNG's `url`
+// for an image result is the page hosting it rather than the picture.
+static const char *
+searxng_cmd_result_link(const searxng_cmd_req_t *r, const sxng_result_t *rr)
+{
+  if(!r->verbose && rr->category == SXNG_CAT_IMAGES
+      && rr->extras.image.src[0] != '\0')
+    return(rr->extras.image.src);
+
+  return(rr->url);
+}
+
+// Offer a URL we just printed to whoever grabs titles (today: urlgrabber),
+// as a single log line. The contract — context, payload shape, and why a
+// clam event rather than a call — is documented in CLAM.md and in
+// plugins/feature/urlgrabber/urlgrabber.h; the short version is that the
+// layer rule forbids an extension from depending on a feature, and an
+// offer is a candidate rather than an order: the far side still applies
+// its own opt-in, media and private-host filters.
+static void
+searxng_cmd_offer_url(const cmd_ctx_t *ctx, const char *url)
+{
+  const char *bot;
+  const char *method;
+  char        payload[CLAM_MSG_SZ];
+
+  // A search answered in private has no room to annotate.
+  if(ctx->bot == NULL || ctx->msg == NULL || ctx->msg->channel[0] == '\0')
+    return;
+
+  bot    = bot_inst_name(ctx->bot);
+  method = method_inst_name(ctx->msg->inst);
+
+  if(bot == NULL || method == NULL)
+    return;
+
+  // clam truncates at CLAM_MSG_SZ without saying so, and half a URL is
+  // worse than no URL — decline to offer one that would not survive.
+  if(snprintf(payload, sizeof(payload), "%s %s %s %s",
+      bot, method, ctx->msg->channel, url) >= (int)sizeof(payload))
+    return;
+
+  clam(CLAM_INFO, "url_offer", "%s", payload);
+}
+
 // Async completion: format and free the per-request closure.
 static void
 searxng_cmd_done(const sxng_response_t *resp)
@@ -187,11 +233,8 @@ searxng_cmd_done(const sxng_response_t *resp)
     // carries no img_src.
     if(!r->verbose)
     {
-      const char *link =
-          (rr->category == SXNG_CAT_IMAGES && rr->extras.image.src[0] != '\0')
-              ? rr->extras.image.src : rr->url;
-
-      snprintf(line, sizeof(line), "%.*s", SXNG_CMD_LINE_BODY, link);
+      snprintf(line, sizeof(line), "%.*s", SXNG_CMD_LINE_BODY,
+          searxng_cmd_result_link(r, rr));
       cmd_reply(&ctx, line);
       continue;
     }
@@ -214,6 +257,13 @@ searxng_cmd_done(const sxng_response_t *resp)
 
     searxng_cmd_emit_extras(&ctx, rr);
   }
+
+  // A lone result is the one case worth a fetched title: the room is
+  // looking at a single link and nothing else. Two or more and a title per
+  // line would bury the results it set out to annotate, so a multi-result
+  // search offers nothing at all.
+  if(resp->n_results == 1)
+    searxng_cmd_offer_url(&ctx, searxng_cmd_result_link(r, &resp->results[0]));
 
   mem_free(r);
 }
