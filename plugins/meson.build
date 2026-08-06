@@ -7,13 +7,7 @@ subdir('method/irc')
 # bot/chat.
 subdir('extension/inference/engine')
 subdir('extension/inference/ask')
-# imagine_cmd is dormant: it registers the same 'imagine' command as
-# imagine_zimage, so loading both aborts startup (duplicate command).
-# Kept in-tree; re-enable this line (and remove imagine_zimage) once an
-# OpenAI-compatible Linux/CUDA image backend lands. See project memory
-# IMAGE-GEN-1 / imagine_zimage pivot (2026-07-22).
-# subdir('extension/inference/imagine')
-subdir('extension/inference/imagine_zimage')
+subdir('extension/inference/imagine')
 subdir('extension/inference/claude')
 subdir('extension/inference/search')
 

@@ -196,7 +196,7 @@ halves. Same shape as `gemini` / `gemini.ws`.
 | `ask` | plugins/extension/inference/ask/ask_cmd.c | `!ask` one-shot LLM command (`ASK_CMD_CTX`) |
 | `claude` | plugins/extension/inference/claude/claude.c | `/claude` bridge command (`CLAUDE_CTX`) |
 | `crypto` | plugins/feature/crypto/crypto.c · plugins/feature/crypto/crypto_lists.c | `/crypto` price command and its per-userns symbol lists (`CRYPTO_CTX`) |
-| `imagine` | plugins/extension/inference/imagine/imagine_cmd.c (`IMG_CMD_CTX`) · plugins/extension/inference/imagine_zimage/imagine_zimage.c (`IZ_CTX`) | `!imagine` text-to-image command — one context, two mutually exclusive backends (load exactly one) |
+| `imagine` | plugins/extension/inference/imagine/imagine_cmd.c (`IMG_CMD_CTX`) | `!imagine` text-to-image command, over the inference engine's `image` kind |
 | `reachycmd` | plugins/feature/reachycmd/reachycmd.c | `/bot <name> …` and `/show bot <name> robot\|moves` — the Reachy Mini's bot-scoped verbs (`REACHYCMD_CTX`) |
 | `searxng` | plugins/extension/inference/search/searxng_cmd.c | `!search` / `!image` / `!news` / `!video` / `!music` command surface (`SEARXNG_CMD_CTX`) — shares the root context with the `searxng` service above |
 | `stock` | plugins/feature/stock/stock.c · plugins/feature/stock/stock_lists.c | `!stock` quote command and its per-userns symbol lists (`STOCK_CTX`) |
