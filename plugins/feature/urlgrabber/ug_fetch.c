@@ -499,7 +499,7 @@ ug_fetch_done(const curl_response_t *resp)
   ug_fetch_ctx_t *fc = resp->user_data;
   method_inst_t  *method;
   char            title[UG_TITLE_SZ];
-  char            line[UG_TITLE_SZ + UG_HOST_SZ + 64];
+  char            line[UG_TITLE_SZ + 64];
   uint32_t        maxlen;
 
   if(fc == NULL)
@@ -557,13 +557,12 @@ ug_fetch_done(const curl_response_t *resp)
   if((method = method_find(fc->method)) == NULL)
     goto out;                                      // bot/method torn down
 
-  if(fc->host[0] != '\0')
-    snprintf(line, sizeof(line),
-        CLR_CYAN "\xC2\xBB" CLR_RESET " %s " CLR_GRAY "(%s)" CLR_RESET,
-        title, fc->host);
-  else
-    snprintf(line, sizeof(line),
-        CLR_CYAN "\xC2\xBB" CLR_RESET " %s", title);
+  // The title, and nothing else. The host used to trail the line in grey,
+  // which told the room something it already knew — a URL cannot be grabbed
+  // without first being pasted in front of everyone. It survives in `fc`
+  // because every drop path above logs under it, and a diagnostic that
+  // names the site is the whole reason a silent WAF block is findable.
+  snprintf(line, sizeof(line), CLR_CYAN "\xC2\xBB" CLR_RESET " %s", title);
 
   method_send(method, fc->channel, line);
 
