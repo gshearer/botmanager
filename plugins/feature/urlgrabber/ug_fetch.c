@@ -574,6 +574,18 @@ out:
 void
 ug_fetch(const char *method_name, const char *channel, const char *url)
 {
+  // The headers a browser sends on a top-level navigation, in the order it
+  // sends them. See the note at the add loop for why they are not optional.
+  static const char *const nav_headers[] = {
+    "Accept: text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+    "Accept-Language: en-US,en;q=0.9",
+    "Upgrade-Insecure-Requests: 1",
+    "Sec-Fetch-Dest: document",
+    "Sec-Fetch-Mode: navigate",
+    "Sec-Fetch-Site: none",
+    "Sec-Fetch-User: ?1"
+  };
+
   ug_fetch_ctx_t *fc;
   curl_request_t *req;
   const char     *ua;
@@ -610,10 +622,6 @@ ug_fetch(const char *method_name, const char *channel, const char *url)
   curl_request_set_prio(req, CURL_PRIO_BULK);
   curl_request_set_follow_redirects(req, true);
 
-  curl_request_add_header(req,
-      "Accept: text/html,application/xhtml+xml,*/*;q=0.8");
-  curl_request_add_header(req, "Accept-Language: en-US,en;q=0.9");
-
   // Bound the download: the <title> lives in the head, so we ask for only
   // the first slice. Servers that ignore Range are still capped by the
   // curl core's global response ceiling.
@@ -625,6 +633,20 @@ ug_fetch(const char *method_name, const char *channel, const char *url)
     snprintf(range, sizeof(range), "Range: bytes=0-%u", maxbytes - 1);
     curl_request_add_header(req, range);
   }
+
+  // `user_agent` claims Firefox; a request that claims Firefox and then
+  // arrives without Fetch Metadata claims two contradictory things, and a
+  // fingerprinting WAF scores the contradiction rather than the UA. Akamai
+  // answers such a request with an HTTP/2 RST_STREAM *before* any status
+  // line, so the drop reaches us as a transport error and never looks like
+  // the 403 a block is expected to be. Measured 2026-08-06 against
+  // washingtonpost.com: refused 3/3 without these headers, served 3/3 with
+  // them (any single Sec-Fetch-* flips it), and no other site in a 17-URL
+  // sweep changed status. The curl core *prepends*, so walk the list
+  // backwards to land it on the wire in browser order — after which the
+  // Range above, added first, trails the set as the one non-browser tell.
+  for(size_t i = sizeof(nav_headers) / sizeof(nav_headers[0]); i > 0; i--)
+    curl_request_add_header(req, nav_headers[i - 1]);
 
   // On submit failure the curl core releases `req` itself; we still own —
   // and must free — the context, since the callback will never fire.
