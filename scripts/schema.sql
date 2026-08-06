@@ -95,23 +95,23 @@ CREATE TABLE IF NOT EXISTS bot_methods (
   PRIMARY KEY(bot_name, method_kind)
 );
 
--- LLM models: admin-registered OpenAI-compatible chat and embedding
--- endpoints. Consumed by plugins/extension/inference/engine/llm.c;
--- api_key_kv names a KV key that stores the bearer token (never
--- stored directly in this table).
-
-CREATE TABLE IF NOT EXISTS llm_models (
-  name          VARCHAR(64)  PRIMARY KEY,
-  kind          VARCHAR(16)  NOT NULL,
-  endpoint_url  TEXT         NOT NULL,
-  model_id      VARCHAR(128) NOT NULL,
-  api_key_kv    VARCHAR(128) NOT NULL DEFAULT '',
-  embed_dim     INTEGER      NOT NULL DEFAULT 0,
-  max_context   INTEGER      NOT NULL DEFAULT 8192,
-  default_temp  REAL         NOT NULL DEFAULT 0.7,
-  enabled       BOOLEAN      NOT NULL DEFAULT TRUE,
-  created       TIMESTAMPTZ  NOT NULL DEFAULT NOW()
-);
+-- LLM registry: deliberately NOT defined here.
+--
+-- The inference engine owns four tables — llm_services, llm_models,
+-- llm_service_models (the cached /models listing) and llm_model_params
+-- (learned request-dialect directives) — and creates them itself in
+-- llm_ensure_tables() (plugins/extension/inference/engine/llm.c).
+--
+-- A copy in this file is worse than no copy. Everything here runs
+-- BEFORE the daemon starts, so a stale CREATE TABLE IF NOT EXISTS wins
+-- the race and the engine's correct definition is silently skipped: the
+-- table exists, so nothing errors, and every later insert fails against
+-- columns that were renamed a refactor ago. That is exactly what this
+-- file did until 2026-08-05, when it still described the pre-service
+-- shape (endpoint_url / api_key_kv, no service_name).
+--
+-- The bearer token is not in any of these tables in any case; it lives
+-- in KV under llm.service.<name>.creds.apikey.
 
 -- Personalities: named LLM system-prompt + behavior bundles loaded by
 -- the llm bot driver. The loader/parser lands in Chunk E; the table
