@@ -152,8 +152,8 @@ not; a heal line names hit points restored, never damage dealt.
 
 ## Registry has room — but count before adding a file
 
-There are currently **33 sheets against 40 registry slots**
-(`ATK_CLASSES_MAX`). Seven free slots is not many: once they are gone,
+There are currently **34 sheets against 40 registry slots**
+(`ATK_CLASSES_MAX`). Six free slots is not many: once they are gone,
 another class means **removing one first**, or raising
 `ATK_CLASSES_MAX` in `attack.h` and rebuilding. A sheet beyond the cap
 is a load failure, not a silent no-op.
@@ -167,6 +167,7 @@ roster (`desc` line of each sheet):
 |---|---|
 | alchemist | Vials, acids and volatile tonics. Brews to harm or cure. |
 | astrologer | Star charts and retrogrades. Predicts moves, aligns allies. |
+| auditor | Line-item scrutiny, penalties and interest. The IRS always collects. |
 | barista | Caffeine and hot steam. Scalding splashes, fast boosts. |
 | berserker | Pure fury. Relentless strikes that bleed the user. |
 | bionic | Slow-motion and synthesizers. Judo chops, foam boulders. |

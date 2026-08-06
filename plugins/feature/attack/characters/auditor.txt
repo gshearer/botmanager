@@ -1,0 +1,72 @@
+# auditor — arithmetic, applied retroactively. Nothing is forgiven,
+# everything accrues, and the only mercy it issues is called a refund.
+# See ../new-class-prompt.txt for the grammar and the fairness rules.
+
+type: auditor
+desc: Line-item scrutiny, penalties and interest. The IRS always collects.
+
+[damage]
+minor    | {attacker} asks {target} for the original receipt, not this photocopy — {damage} damage.
+minor    | {attacker} circles one figure on {target}'s Schedule C in red pencil — {damage} damage.
+minor    | {attacker} strikes {target}'s second monitor from the ledger, neither ordinary nor necessary — {damage} damage.
+minor    | {attacker} corrects a rounding error {target} made in their own favor — {damage} damage.
+minor    | {attacker} reads {target} the definition of a business meal, slowly — {damage} damage.
+minor    | {attacker} has {target} initial here, and here, and here also — {damage} damage.
+minor    | {attacker} requests the odometer readings behind {target}'s mileage log — {damage} damage.
+
+medium   | {attacker} rules {target}'s entire livelihood a hobby for {damage} damage.
+medium   | {attacker} surfaces a 1099 {target} never mentioned — {damage} damage.
+medium   | {attacker} measures {target}'s home office and voids both square feet of it — {damage} damage.
+medium   | {attacker} matches {target}'s deposits against declared income and underlines the difference — {damage} damage.
+medium   | {attacker} revises {target}'s quarterly estimates upward, retroactively — {damage} damage.
+medium   | {attacker} extends the lookback window on {target} by three further years — {damage} damage.
+medium   | {attacker} reclassifies {target} as self-employed, both halves now due — {damage} damage.
+
+major    | {attacker} garnishes {target} directly at the source for {damage} damage.
+major    | {attacker} levies {target}'s account down to the statutory minimum — {damage} damage.
+major    | {attacker} recaptures every mile {target} ever deducted, at the correct rate — {damage} damage.
+major    | {attacker} summons {target} in person, with seven years of records — {damage} damage.
+major    | {attacker} denies {target}'s installment plan and accelerates the whole balance — {damage} damage.
+major    | {attacker} recites the examination findings to {target}, all four schedules of them — {damage} damage.
+
+critical | {attacker} finds fraud in {target}'s file, for which no limitation period exists. {damage} CRITICAL damage!
+critical | {attacker} refers {target} upstairs to Criminal Investigation. {damage} CRITICAL damage!
+critical | {attacker} disallows {target} entirely, as filed. {damage} CRITICAL damage!
+critical | {attacker} assesses {target} the balance, plus penalties, plus interest on the penalties. {damage} CRITICAL damage!
+critical | {attacker} audits {target}'s audit and it comes back worse. {damage} CRITICAL damage!
+
+[dot]
+drain | compounding interest | {attacker} sets {affliction} running on {target}'s balance, computed daily.
+drain | underpayment penalty | {attacker} applies an {affliction} to {target} and lets the arithmetic work.
+drain | accruing balance     | {attacker} posts an {affliction} against {target}, growing while they sleep.
+curse | field audit          | {attacker} schedules a {affliction} of {target} and asks when would be convenient.
+curse | federal tax lien     | {attacker} records a {affliction} against everything {target} is standing on.
+curse | full examination     | {attacker} upgrades {target} to a {affliction}, correspondence no longer sufficing.
+chill | certified letter     | {attacker} sends {target} a {affliction}, return receipt requested.
+chill | notice cp2000        | {attacker} issues {target} a {affliction} proposing changes to their year.
+chill | second notice        | {attacker} follows the silence from {target} with a {affliction}, less friendly now.
+
+[heal]
+minor | {attacker} finds an arithmetic error in {target}'s favor, of all things — {heal} hit points.
+minor | {attacker} allows one of {target}'s deductions to stand, provisionally — {heal} hit points.
+major | {attacker} accepts {target}'s amended return and pays the refund, with interest — {heal} hit points.
+major | {attacker} grants {target} a no change letter, the rarest document there is — {heal} hit points.
+
+[death]
+{attacker} stamps the final return of {target} accepted as filed.
+{attacker} notes that of the two certainties, {target} has now met both.
+{attacker} declares {target} fully depreciated and writes them off.
+{attacker} closes the case of {target}, retention schedule permanent.
+
+[decay]
+drain | The {affliction} {attacker} set running takes another {damage} damage out of {target}, per the daily rate.
+drain | {target} checks the balance and {attacker}'s {affliction} has added {damage} damage to it.
+curse | {attacker}'s {affliction} asks {target} for further documentation — {damage} damage.
+curse | The {affliction} {attacker} began now wants {target}'s bank statements too — {damage} damage.
+chill | The {affliction} from {attacker} sits unopened on {target}'s table, working — {damage} damage.
+chill | {target} rereads {attacker}'s {affliction} and finds a new deadline in it — {damage} damage.
+
+[decay-kill]
+drain | The {affliction} {attacker} applied compounds past everything {target} had.
+curse | {attacker}'s {affliction} concludes, and the finding does not favor {target}.
+chill | {target} finally opens {attacker}'s {affliction}, and it is exactly what they feared.
