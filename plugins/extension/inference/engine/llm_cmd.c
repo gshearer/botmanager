@@ -22,6 +22,35 @@
 
 // Commands: /llm *, /show llm
 
+// The canonical wire id for a model, given whatever an operator typed or a
+// provider listed.
+//
+// Google namespaces its /models listing — "models/gemini-3.5-flash" — but
+// the id itself is the bare tail. Both forms reach chat completions, so the
+// prefix looks harmless right up until someone registers an image model
+// with it: /images/generations accepts ONLY the bare form and answers the
+// other with a 404 that blames the model for not existing. Worse, the
+// listing is what the registration warning checks against, so the prefixed
+// id — the broken one — is the form that registers quietly.
+//
+// Canonicalising on the way in, into the cache and into a registration,
+// means every kind gets an id that works, `show llm models` reads
+// uniformly, and the cached listing is something an operator can paste
+// straight into `llm add model`.
+//
+// The test is the exact literal prefix, so a provider whose ids genuinely
+// contain a slash (vLLM's "nvidia/Gemma-4-31B-IT-NVFP4") is untouched.
+static const char *
+llm_model_id_canon(const char *model_id)
+{
+  static const char prefix[] = "models/";
+
+  if(model_id != NULL && strncmp(model_id, prefix, sizeof(prefix) - 1) == 0)
+    return(model_id + sizeof(prefix) - 1);
+
+  return(model_id);
+}
+
 typedef struct
 {
   const cmd_ctx_t *ctx;
@@ -138,7 +167,7 @@ llm_service_models_store(const char *service, struct json_object *root)
     if(model_id[0] == '\0')
       continue;
 
-    e_mid = db_escape(model_id);
+    e_mid = db_escape(llm_model_id_canon(model_id));
 
     if(json_get_int64(item, "max_model_len", &max_len) && max_len > 0)
       snprintf(sql, sizeof(sql),
@@ -791,7 +820,7 @@ cmd_llm_add_model(const cmd_ctx_t *ctx)
   kind_s   = ctx->parsed->argv[0];
   name     = ctx->parsed->argv[1];
   service  = ctx->parsed->argv[2];
-  model_id = ctx->parsed->argv[3];
+  model_id = llm_model_id_canon(ctx->parsed->argv[3]);
 
   if(llm_kind_from_str(kind_s, &k) != SUCCESS)
   {
@@ -838,9 +867,35 @@ cmd_llm_add_model(const cmd_ctx_t *ctx)
 
   db_result_free(res);
 
+  // A miss means one of two very different things, and saying "warning"
+  // for both taught operators to read a benign one as a rejection. A
+  // service's listing is fetched asynchronously when it is added, so
+  // registering a model in the first seconds of a new service's life
+  // always misses — there was nothing to check against. Only a miss
+  // against a listing we actually hold says anything about the id.
   if(!in_cache)
-    cmd_reply(ctx, "warning: model_id not in this service's cached /models "
-        "list — adding anyway (try `llm service <name> refresh`)");
+  {
+    bool have_listing = false;
+
+    snprintf(sql, sizeof(sql),
+        "SELECT 1 FROM llm_service_models WHERE service_name='%s' LIMIT 1",
+        e_svc);
+    res = db_result_alloc();
+
+    if(db_query(sql, res) == SUCCESS && res->ok && res->rows > 0)
+      have_listing = true;
+
+    db_result_free(res);
+
+    if(have_listing)
+      cmd_reply(ctx, "warning: this service's /models list does not advertise "
+          "that model_id — adding anyway (check the spelling against "
+          "`show llm service <name> models`)");
+    else
+      cmd_reply(ctx, "note: this service has no cached /models list yet, so "
+          "the model_id could not be verified — it is fetched in the "
+          "background when a service is added (`llm service <name> refresh`)");
+  }
 
   e_name = db_escape(name);
   snprintf(sql, sizeof(sql),
@@ -924,7 +979,33 @@ cmd_llm_del_model(const cmd_ctx_t *ctx)
   cmd_reply(ctx, "ok");
 }
 
-// /llm test: synchronous probe.
+// /llm test: a bounded synchronous probe.
+//
+// This is the documented exception to the daemon's non-blocking rule
+// (see DESIGN.md): an operator asked "does this model answer?" and wants
+// the answer in the same breath. The wait is therefore confined to the
+// command thread and bounded — but the request outlives the bound. A
+// model slower than its window keeps running, and its callback fires on
+// a curl worker after the command has already replied and returned.
+//
+// The waiter is consequently heap-owned and reference-counted, never a
+// stack local: one reference for the command, one for the in-flight
+// request, and whoever drops the last one frees it. Abandoning a stack
+// waiter would hand the curl worker a dead frame to write 512 bytes
+// into — silent corruption that surfaces as a crash somewhere else
+// entirely, minutes later.
+//
+// The windows below are deliberately code, not KV. The wait is served by
+// whatever thread dispatched the command, and over botmanctl that thread
+// is the control socket's own poll task — cmd_dispatch_as() invokes the
+// handler inline — so a generous operator-tunable knob here is an
+// invitation to take the control surface offline for minutes while
+// diagnosing a slow model. Image generation is inherently slower than a
+// chat ping and gets its own window; no other kind needs one, and a
+// model slower than its window is not a failure, it is a log entry.
+#define LLM_TEST_WAIT_SECS        15
+#define LLM_TEST_WAIT_IMAGE_SECS  30
+
 typedef struct
 {
   pthread_mutex_t mu;
@@ -934,7 +1015,84 @@ typedef struct
   long            status;
   char            content[512];
   char            err[256];
+
+  uint32_t        refs;        // guarded by mu; 0 = free it
+  bool            abandoned;   // command gave up: report to the log instead
+  char            model[LLM_MODEL_NAME_SZ];
+  struct timespec t0;          // probe start, for the late-result latency
 } llm_test_sync_t;
+
+// Two references: the command's own, and the one the request carries as
+// user_data. A failed submit means the second never materialises, so the
+// caller releases twice.
+static llm_test_sync_t *
+llm_test_sync_create(const char *model)
+{
+  llm_test_sync_t *s;
+
+  s = mem_alloc("llm", "test", sizeof(*s));
+  memset(s, 0, sizeof(*s));
+
+  pthread_mutex_init(&s->mu, NULL);
+  pthread_cond_init(&s->cv, NULL);
+
+  s->refs = 2;
+  snprintf(s->model, sizeof(s->model), "%s", model);
+  clock_gettime(CLOCK_MONOTONIC, &s->t0);
+
+  return(s);
+}
+
+static void
+llm_test_sync_release(llm_test_sync_t *s)
+{
+  uint32_t remaining;
+
+  pthread_mutex_lock(&s->mu);
+  remaining = --s->refs;
+  pthread_mutex_unlock(&s->mu);
+
+  if(remaining > 0)
+    return;
+
+  pthread_mutex_destroy(&s->mu);
+  pthread_cond_destroy(&s->cv);
+  mem_free(s);
+}
+
+// Every kind's callback ends here with the result fields already filled:
+// wake a waiting command, or — when the command timed out and left — put
+// the result the operator asked for in the log, where it is still worth
+// having. Consumes the request's reference, so `s` is unsafe to touch on
+// return.
+static void
+llm_test_sync_complete(llm_test_sync_t *s)
+{
+  char     line[832];
+  bool     abandoned;
+  uint64_t ms;
+
+  pthread_mutex_lock(&s->mu);
+
+  s->done   = true;
+  abandoned = s->abandoned;
+  ms        = util_ms_since(&s->t0);
+
+  // Format under the lock, emit outside it: clam() takes a lock of its
+  // own and nothing here needs to hold two at once.
+  if(abandoned)
+    snprintf(line, sizeof(line), "test %s: late result after %lums, http %ld: %s",
+        s->model, (unsigned long)ms, s->status,
+        s->ok ? s->content : s->err);
+
+  pthread_cond_broadcast(&s->cv);
+  pthread_mutex_unlock(&s->mu);
+
+  if(abandoned)
+    clam(CLAM_INFO, "llm", "%s", line);
+
+  llm_test_sync_release(s);
+}
 
 static void
 cmd_llm_test_done(const llm_chat_response_t *resp)
@@ -957,9 +1115,9 @@ cmd_llm_test_done(const llm_chat_response_t *resp)
   if(resp->error != NULL)
     snprintf(s->err, sizeof(s->err), "%s", resp->error);
 
-  s->done = true;
-  pthread_cond_broadcast(&s->cv);
   pthread_mutex_unlock(&s->mu);
+
+  llm_test_sync_complete(s);
 }
 
 static void
@@ -979,9 +1137,9 @@ cmd_llm_test_embed_done(const llm_embed_response_t *resp)
   if(resp->error != NULL)
     snprintf(s->err, sizeof(s->err), "%s", resp->error);
 
-  s->done = true;
-  pthread_cond_broadcast(&s->cv);
   pthread_mutex_unlock(&s->mu);
+
+  llm_test_sync_complete(s);
 }
 
 static void
@@ -1001,34 +1159,33 @@ cmd_llm_test_image_done(const llm_image_response_t *resp)
   if(resp->error != NULL)
     snprintf(s->err, sizeof(s->err), "%s", resp->error);
 
-  s->done = true;
-  pthread_cond_broadcast(&s->cv);
   pthread_mutex_unlock(&s->mu);
+
+  llm_test_sync_complete(s);
 }
 
 static void
 cmd_llm_test(const cmd_ctx_t *ctx)
 {
-  const char *name;
-  llm_test_sync_t s;
-  struct timespec t0;
-  bool submitted;
-  struct timespec until;
-  bool done;
-  struct timespec t1;
-  uint64_t ms;
-  const char *prompt;
-  char line[640];
-  llm_kind_t k;
+  llm_test_sync_t *s;
+  const char      *name;
+  const char      *prompt;
+  struct timespec  until;
+  char             line[832];
+  uint64_t         ms;
+  uint32_t         wait_secs;
+  llm_kind_t       k;
+  bool             submitted;
+  bool             done;
+
   if(ctx->parsed == NULL || ctx->parsed->argc < 1)
   {
     cmd_reply(ctx, "usage: llm test <name> [prompt...]");
     return;
   }
 
-  name = ctx->parsed->argv[0];
+  name   = ctx->parsed->argv[0];
   prompt = ctx->parsed->argc > 1 ? ctx->parsed->argv[1] : "ping";
-
 
   if(llm_model_kind(name, &k) != SUCCESS)
   {
@@ -1036,100 +1193,102 @@ cmd_llm_test(const cmd_ctx_t *ctx)
     return;
   }
 
-  memset(&s, 0, sizeof(s));
-  pthread_mutex_init(&s.mu, NULL);
-  pthread_cond_init(&s.cv, NULL);
+  // The speech kinds are deliberately not testable from here: one wants
+  // a WAV this command has no way to hold and the other answers with
+  // one. Say so plainly rather than fall through to the embed arm and
+  // fail against its kind guard with a baffling message.
+  if(k != LLM_KIND_CHAT && k != LLM_KIND_IMAGE && k != LLM_KIND_EMBED)
+  {
+    cmd_reply(ctx, "error: `llm test` does not cover the speech kinds — "
+        "try `/bot <name> say <text>` for a tts model, and speak to the robot "
+        "for an stt one");
+    return;
+  }
 
-  clock_gettime(CLOCK_MONOTONIC, &t0);
-
+  s = llm_test_sync_create(name);
 
   if(k == LLM_KIND_CHAT)
   {
     llm_chat_params_t params = { 0 };
-    llm_message_t msgs[1];
+    llm_message_t     msgs[1];
+
     memset(msgs, 0, sizeof(msgs));
-    params.max_tokens = 32;
+    // Wide enough that a thinking model can reason and still answer. At
+    // 32 the reasoning pass consumed the whole budget and the probe came
+    // back "no content in response" — a healthy model reported as broken,
+    // which is the opposite of what a diagnostic is for. The extra tokens
+    // cost nothing next to being lied to.
+    params.max_tokens = 512;
 
     msgs[0].role    = LLM_ROLE_USER;
     msgs[0].content = prompt;
 
     submitted = (llm_chat_submit(name, &params, msgs, 1,
-        cmd_llm_test_done, NULL, &s) == SUCCESS);
+        cmd_llm_test_done, NULL, s) == SUCCESS);
   }
 
   else if(k == LLM_KIND_IMAGE)
   {
     llm_image_params_t params = { 0 };
+
     params.n = 1;
 
     submitted = (llm_image_submit(name, &params, prompt,
-        cmd_llm_test_image_done, &s) == SUCCESS);
+        cmd_llm_test_image_done, s) == SUCCESS);
   }
 
-  else if(k == LLM_KIND_EMBED)
-  {
-    const char *inputs[1] = { prompt };
-    submitted = (llm_embed_submit(name, inputs, 1,
-        cmd_llm_test_embed_done, &s) == SUCCESS);
-  }
-
-  // The speech kinds are deliberately not testable from here: one wants
-  // a WAV this command has no way to hold and the other answers with
-  // one. Say so plainly rather than fall through to the embed arm and
-  // fail against its kind guard with a baffling message.
   else
   {
-    cmd_reply(ctx, "error: `llm test` does not cover the speech kinds — "
-        "try `/bot <name> say <text>` for a tts model, and speak to the robot "
-        "for an stt one");
-    goto cleanup;
+    const char *inputs[1] = { prompt };
+
+    submitted = (llm_embed_submit(name, inputs, 1,
+        cmd_llm_test_embed_done, s) == SUCCESS);
   }
 
   if(!submitted)
   {
     cmd_reply(ctx, "error: submit failed");
-    goto cleanup;
+
+    // No callback will ever fire, so the request's reference is ours to
+    // drop as well as our own.
+    llm_test_sync_release(s);
+    llm_test_sync_release(s);
+    return;
   }
 
-  // Wait up to 15 seconds.
+  wait_secs = (k == LLM_KIND_IMAGE)
+      ? LLM_TEST_WAIT_IMAGE_SECS : LLM_TEST_WAIT_SECS;
+
   clock_gettime(CLOCK_REALTIME, &until);
-  until.tv_sec += 15;
+  until.tv_sec += wait_secs;
 
-  pthread_mutex_lock(&s.mu);
+  pthread_mutex_lock(&s->mu);
 
-  while(!s.done)
-    if(pthread_cond_timedwait(&s.cv, &s.mu, &until) != 0)
+  while(!s->done)
+    if(pthread_cond_timedwait(&s->cv, &s->mu, &until) != 0)
       break;
 
-  done = s.done;
-  pthread_mutex_unlock(&s.mu);
+  done = s->done;
+  ms   = util_ms_since(&s->t0);
+
+  // Claim the result while still holding the lock the callback needs, so
+  // there is no window in which both sides believe they own the reply.
+  if(done)
+    snprintf(line, sizeof(line), "%s (%lums, http %ld): %s",
+        s->ok ? "ok" : "failed", (unsigned long)ms, s->status,
+        s->ok ? s->content : s->err);
+  else
+    s->abandoned = true;
+
+  pthread_mutex_unlock(&s->mu);
 
   if(!done)
-  {
-    cmd_reply(ctx, "timeout (15s)");
-    goto cleanup;
-  }
-
-  clock_gettime(CLOCK_MONOTONIC, &t1);
-
-  ms = util_ms_since(&t0);
-
-  if(s.ok)
     snprintf(line, sizeof(line),
-        "ok (%lums, http %ld): %s",
-        (unsigned long)ms, s.status, s.content);
-  else
-    snprintf(line, sizeof(line),
-        "failed (%lums, http %ld): %s",
-        (unsigned long)ms, s.status, s.err);
+        "still running after %us — this model is slower than the probe "
+        "window; the result will be logged when it lands", wait_secs);
 
   cmd_reply(ctx, line);
-
-  (void)t1;
-
-cleanup:
-  pthread_mutex_destroy(&s.mu);
-  pthread_cond_destroy(&s.cv);
+  llm_test_sync_release(s);
 }
 
 // -----------------------------------------------------------------------
