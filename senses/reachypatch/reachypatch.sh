@@ -17,8 +17,12 @@
 #   ./reachypatch.sh                          # default host, sway 0.75
 #   ./reachypatch.sh --host reachy2.local     # a second robot
 #   ./reachypatch.sh --sway-master 1.0        # dial it back up
+#   ./reachypatch.sh --sway-db-high -6        # unpin the loudness curve
 #   ./reachypatch.sh --revert                 # restore the vendor file
 #   ./reachypatch.sh --show                   # read, change nothing
+#
+# A knob left unnamed on the command line is left ALONE in the file, so
+# the two can be tuned independently and in either order.
 #
 # ⚠ Re-check this on every daemon upgrade. If Pollen ever exposes the
 # amplitude through the API, this script should be DELETED rather than
@@ -29,11 +33,12 @@ set -eu
 HOST="reachy.iot.hiigara.shearer.tech"
 USER="pollen"
 SWAY_MASTER="0.75"          # vendor default is 1.5; this is half the throw
+SWAY_DB_HIGH=""             # vendor default is -18.0; empty = leave it alone
 ACTION="patch"
 
 TAPPER="/venvs/mini_daemon/lib/python3.12/site-packages/reachy_mini/motion/speech_tapper.py"
 UNIT="reachy-mini-daemon"
-MARK="# botmanager: halved; vendor default 1.5 (senses/reachypatch)"
+MARK="# botmanager (senses/reachypatch) — vendor defaults 1.5 / -18.0"
 
 usage()
 {
@@ -46,6 +51,7 @@ while [ $# -gt 0 ]; do
     --host)        HOST="$2"; shift 2 ;;
     --user)        USER="$2"; shift 2 ;;
     --sway-master) SWAY_MASTER="$2"; shift 2 ;;
+    --sway-db-high) SWAY_DB_HIGH="$2"; shift 2 ;;
     --revert)      ACTION="revert"; shift ;;
     --show)        ACTION="show"; shift ;;
     -h|--help)     usage 0 ;;
@@ -62,7 +68,7 @@ say() { printf '%s\n' "$*"; }
 case "$ACTION" in
   show)
     say "== ${HOST}"
-    $RSH "grep -n '^SWAY_MASTER' '${TAPPER}'; \
+    $RSH "grep -nE '^(SWAY_MASTER|SWAY_DB_HIGH)' '${TAPPER}'; \
           ls -l '${TAPPER}.orig' 2>/dev/null || echo '(no .orig — never patched)'"
     ;;
 
@@ -76,15 +82,23 @@ case "$ACTION" in
     ;;
 
   patch)
+    # Only the knobs actually named are rewritten; the rest of the
+    # vendor file — including the other knob — is left untouched.
+    SED="-e 's|^SWAY_MASTER *=.*|SWAY_MASTER = ${SWAY_MASTER}  ${MARK}|'"
     say "== patching ${HOST} (SWAY_MASTER=${SWAY_MASTER})"
+
+    if [ -n "$SWAY_DB_HIGH" ]; then
+      SED="${SED} -e 's|^SWAY_DB_HIGH *=.*|SWAY_DB_HIGH = ${SWAY_DB_HIGH}  ${MARK}|'"
+      say "   and SWAY_DB_HIGH=${SWAY_DB_HIGH}"
+    fi
 
     # The .orig is written ONCE, from whatever the vendor shipped. Never
     # overwrite it: a second run would otherwise snapshot our own patch
     # and there would be nothing left to revert to.
     $RSH "set -eu; \
           test -f '${TAPPER}.orig' || sudo cp -p '${TAPPER}' '${TAPPER}.orig'; \
-          sudo sed -i 's|^SWAY_MASTER *=.*|SWAY_MASTER = ${SWAY_MASTER}  ${MARK}|' '${TAPPER}'; \
-          grep -n '^SWAY_MASTER' '${TAPPER}'; \
+          sudo sed -i ${SED} '${TAPPER}'; \
+          grep -nE '^(SWAY_MASTER|SWAY_DB_HIGH)' '${TAPPER}'; \
           sudo systemctl restart '${UNIT}'"
 
     # The daemon takes a few seconds to serve again; the caller almost
