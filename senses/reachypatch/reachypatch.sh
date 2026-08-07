@@ -108,6 +108,15 @@ case "$ACTION" in
     while [ "$i" -lt 30 ]; do
       if curl -sf -m 3 "http://${HOST}:8000/api/media/status" >/dev/null 2>&1; then
         say "daemon is up."
+        say ""
+        say "⚠ THE RESTART DISCARDED EVERY CONNECT-TIME SETTING on this robot."
+        say "  Wobbling, face tracking and volume are runtime-only state in the"
+        say "  daemon — nothing persists them, and no endpoint even reports them."
+        say "  A bound bot will speak with a MOTIONLESS HEAD until connect() runs"
+        say "  again. 'wake' is NOT enough; it only touches the motors:"
+        say ""
+        say "      botmanctl 'bot stop <name>' && botmanctl 'bot start <name>'"
+        say ""
         exit 0
       fi
       i=$((i + 1))

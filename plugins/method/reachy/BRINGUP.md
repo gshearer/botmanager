@@ -189,6 +189,24 @@ exposes nothing. So the tuning **does not survive a daemon reinstall and does
 not exist on a robot nobody has patched**, which is why it is a script in the
 tree rather than something done by hand. A second robot needs it too.
 
+⚠⚠ **A DAEMON RESTART DISCARDS EVERY CONNECT-TIME SETTING — and `wake` does
+not bring them back.** Wobbling, face tracking and speaker volume are
+runtime-only state inside the daemon (`enable_wobbling()` lives on
+`backend._media_server`; nothing persists it and **no endpoint reports it**).
+Our driver applies all three once, in `connect()`. So after *any* robot daemon
+restart — this script, a `systemctl restart`, a robot reboot — a bound bot
+will speak with a **completely motionless head**, and `/bot <name> wake` will
+not fix it because wake only touches the motors:
+
+```sh
+botmanctl 'bot stop <name>' ; botmanctl 'bot start <name>'   # re-runs connect()
+```
+
+Measured 2026-08-07, and it reads exactly like "the patch broke the wobble".
+It did not: check `grep wobbling/enable /tmp/botman.log` before suspecting the
+patch, and note that a genuinely broken `speech_tapper.py` shows a Python
+traceback in `journalctl -u reachy-mini-daemon` rather than a clean startup.
+
 ⭑ Worth knowing when judging the amount: `kokorod` peak-normalises to −3 dBFS
 (deliberately — see §C3, Kokoro is inaudible over the motors otherwise), which
 pins `_loudness_gain` at its maximum of 1.0 for essentially every syllable. So
