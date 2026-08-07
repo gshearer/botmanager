@@ -207,15 +207,25 @@ It did not: check `grep wobbling/enable /tmp/botman.log` before suspecting the
 patch, and note that a genuinely broken `speech_tapper.py` shows a Python
 traceback in `journalctl -u reachy-mini-daemon` rather than a clean startup.
 
-⭑ Worth knowing when judging the amount: `kokorod` peak-normalises to −3 dBFS
+⭑ **The head throws the same amount on every syllable, and that is settled as
+WON'T FIX — operator, 2026-08-07.** `kokorod` peak-normalises to −3 dBFS
 (deliberately — see §C3, Kokoro is inaudible over the motors otherwise), which
-pins `_loudness_gain` at its maximum of 1.0 for essentially every syllable. So
-the wobble currently has **no dynamic range at all**. The fix is queued as
-`TODO.md RCH-SWAY-1`, and it works on **our** side — lowering kokorod's
-normalisation target, not raising the daemon's `SWAY_DB_HIGH` — because the
-operator would rather not carry vendor patches. Whether that is reachable
-turns on one unmeasured thing: how many dB the robot's `volume` control
-actually buys between 90 and 100.
+holds `_loudness_gain` at its ceiling for **49–66% of voiced frames**, so the
+loud half of every utterance is flat. `RCH-SWAY-1` measured the whole
+mechanism and it *works*: the wobble is tapped off a GStreamer tee **upstream
+of the audiosink**, so attenuating in kokorod unpins the daemon's curve while
+the robot's `volume` control compensates the loudness, with Pollen's file
+untouched. **It was declined on price.** Unpinning needs ~9 dB of attenuation
+and `bot.karan.reachy.volume` is already **100 — 0.00 dB, the hardware
+ceiling** — so the 9 dB is paid entirely in loudness, and loudness is worth
+more than expression here. Full arithmetic: `TODO.md §SWAY-TRUTH`.
+
+⭑ **Reusable, measured 2026-08-07: the robot's volume control is exactly
+0.6 dB per unit, linear in dB, over a full 60 dB range.** `POST
+/api/volume/set` → `amixer -c 0 sset PCM,0 N%`, whose control is raw 0–60 on a
+`dBminmax −60.00 → 0.00 dB` scale. So volume 50 = −30 dB, 85 = −9 dB, 100 =
+0 dB, and there is **nothing above 100**. It is *not* the amplitude-linear
+percentage it looks like — worth knowing before budgeting any gain change.
 
 ---
 
