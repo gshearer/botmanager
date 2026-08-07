@@ -160,6 +160,41 @@ bot, since `show bot <name> robot` reports the motor mode in words.
 `/bot <name> wake` does both steps for you (shipped `4ef0cef`); this section is
 the by-hand path for a robot with no botman in front of it.
 
+## ⚠ Vendor tuning: the head wobble (`senses/reachypatch/reachypatch.sh`)
+
+**Run this once on every robot, and again after any daemon upgrade.**
+
+```sh
+senses/reachypatch/reachypatch.sh --host <robot>     # patch + restart daemon
+senses/reachypatch/reachypatch.sh --show             # read it back, change nothing
+senses/reachypatch/reachypatch.sh --revert           # restore the vendor file
+```
+
+The daemon's speech-synced head motion ships **too strong for a room** — at
+stock settings the head does the same full throw on every syllable. The
+amplitude is a single linear scalar, `SWAY_MASTER` in
+`reachy_mini/motion/speech_tapper.py`, applied to all six axes at once:
+
+```python
+loud = _loudness_gain(db) * SWAY_MASTER    # _loudness_gain is already clipped to [0,1]
+pitch = radians(SWAY_A_PITCH_DEG) * loud * env * sin(...)   # …and five more axes
+```
+
+Nothing clamps after it, so it is exact: **vendor `1.5` → our `0.75` is half
+the motion, everywhere.** Operator's call, 2026-08-07.
+
+⚠⚠ **This is vendor code inside the daemon's venv.** There is no env var, no
+config file and no parameter on `POST /api/media/wobbling/enable` — the API
+exposes nothing. So the tuning **does not survive a daemon reinstall and does
+not exist on a robot nobody has patched**, which is why it is a script in the
+tree rather than something done by hand. A second robot needs it too.
+
+⭑ Worth knowing when judging the amount: `kokorod` peak-normalises to −3 dBFS
+(deliberately — see §C3, Kokoro is inaudible over the motors otherwise), which
+pins `_loudness_gain` at its maximum of 1.0 for essentially every syllable. So
+the wobble currently has **no dynamic range at all**; raising `SWAY_DB_HIGH`
+would give it some, and is filed unqueued in `TODO.md §F`.
+
 ---
 
 # Phase 2 — earbridge, the ear (runs ON the robot)
