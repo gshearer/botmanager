@@ -58,6 +58,24 @@ typedef enum
   METHOD_MSG_NICK_CHANGE = 1,  // sender renamed; see method_msg_t notes
 } method_msg_kind_t;
 
+// Whether the METHOD knows this line was addressed to the bot.
+//
+// Addressing is not a property of text — that is only how IRC happens to
+// express it. A microphone knows by a spoken name, a wake phrase or a
+// button; a workspace method knows by a user id it was handed. The layer
+// that knows says so here, and the bot believes it rather than trying to
+// re-derive the answer from English.
+//
+// UNKNOWN is the honest default and the zero value, so a method that has
+// no such knowledge says nothing by saying nothing: the bot falls back to
+// its own text classifier, exactly as it always has.
+typedef enum
+{
+  METHOD_ADDR_UNKNOWN = 0,  // no opinion — the bot classifies the text itself
+  METHOD_ADDR_DIRECT  = 1,  // the method knows this was said TO the bot
+  METHOD_ADDR_AMBIENT = 2,  // the method knows it was not — overheard, not addressed
+} method_addressing_t;
+
 typedef struct method_inst method_inst_t;
 
 // Full message context delivered to subscribers. Created by method
@@ -74,14 +92,10 @@ typedef struct
   char           metadata[METHOD_META_SZ];    // method-specific data (diagnostic / auth context)
   bool           is_action;                   // true when the message is an emote/action (e.g., IRC CTCP ACTION)
 
-  // True when the method admitted this line for a reason other than the
-  // bot being addressed — an always-listening microphone hearing the
-  // room, an attention window still open from an earlier request. The
-  // bot is being told "you may hear this", never "this was said to
-  // you": a consumer must not treat an ambient line as a continuation
-  // of a conversation. Methods whose senders are real identities (IRC
-  // and friends) leave it false and lose nothing.
-  bool           is_ambient;
+  // What the method knows about who this line was aimed at. Left
+  // UNKNOWN by any method that cannot tell (see method_addressing_t);
+  // an AMBIENT line is one the bot may hear but was never said to.
+  method_addressing_t addressing;
 
   method_msg_kind_t kind;                     // default METHOD_MSG_MESSAGE
 

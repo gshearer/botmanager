@@ -989,16 +989,31 @@ chatbot_classify_with_engagement(chatbot_state_t *st,
   mem_msg_kind_t k;
   time_t now;
 
-  // A method that admits ambient lines has already told us this one was
-  // not addressed to the bot, and it knows better than any text rule:
-  // an always-listening microphone has no senders to tell apart, so the
-  // handoff gate below can never fire and the sticky ring holds one
-  // permanently warm slot shared by every voice in the room. Ambient
-  // lines are witnessed, never promoted, and never engage the ring.
-  if(msg != NULL && msg->is_ambient)
+  // When the method knows who the line was aimed at, it is the authority
+  // and we do not second-guess it with a text rule. Addressing is only a
+  // property of text on IRC; a microphone knows it by a spoken name, a
+  // workspace by a user id. A method that cannot tell says UNKNOWN and
+  // the stateless classifier below runs exactly as it always has.
+  //
+  // AMBIENT also skips the sticky path entirely, deliberately: a voice
+  // method collapses a whole room onto one sender, so the handoff gate
+  // can never fire and the engagement ring would hold a single
+  // permanently-warm slot shared by every speaker — and a television.
+  if(msg != NULL)
   {
-    if(out_reason) *out_reason = CHATBOT_CLASSIFY_AMBIENT;
-    return(MEM_MSG_WITNESS);
+    switch(msg->addressing)
+    {
+      case METHOD_ADDR_DIRECT:
+        if(out_reason) *out_reason = CHATBOT_CLASSIFY_DIRECT;
+        return(MEM_MSG_EXCHANGE_IN);
+
+      case METHOD_ADDR_AMBIENT:
+        if(out_reason) *out_reason = CHATBOT_CLASSIFY_AMBIENT;
+        return(MEM_MSG_WITNESS);
+
+      case METHOD_ADDR_UNKNOWN:
+        break;
+    }
   }
 
   k = chatbot_classify_message(msg, bot_nick);

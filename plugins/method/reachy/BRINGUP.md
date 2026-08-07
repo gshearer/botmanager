@@ -379,6 +379,12 @@ ignored, so `hey mini` matches whisper's "Hey, Mini, ...". A phrase only
 *adds* a trigger unless `attention.strict = 1`, which is what stops the bare
 bot name from waking it on its own.
 
+⭑ **A name in `attention.names` need not resemble the bot's name, and the
+transcript is never edited to make one fit.** The driver declares
+`method_msg_t.addressing = METHOD_ADDR_DIRECT` and the chat plugin takes its
+word, so the bot's id, its persona's name and the sound the human makes are
+three independent things. What you said is what gets logged.
+
 ⚠ `bot.<name>.reachy.barge_in` **defaults to 0 and should stay there** until
 the robot's cooling fan is quieter. The microphone array's `speech_detected`
 flag reads true in ~49% of a *silent* room, so barge-in interrupts the bot

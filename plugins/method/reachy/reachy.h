@@ -242,15 +242,16 @@ typedef struct
 // attention gate and method_deliver both happen here, on a task worker.
 typedef struct
 {
-  reachy_state_t *st;
-  double          doa;
-  bool            ambient;   // heard, but the bot's name was not in it
-  char            text[METHOD_TEXT_SZ];
+  reachy_state_t     *st;
+  double              doa;
+  method_addressing_t addressing;
+  char                text[METHOD_TEXT_SZ];
 } reachy_dispatch_t;
 
-// What the attention gate made of an utterance. The middle verdict is
-// the one worth having: a line the bot may hear without being the line
-// it was asked to answer.
+// What the attention gate made of an utterance. Distinct from
+// method_addressing_t because it carries a verdict that never reaches
+// the bot at all: DROP is the driver declining to deliver, which is not
+// something a delivered message can say about itself.
 typedef enum
 {
   REACHY_ATTN_DROP = 0,   // nobody was addressing us and we are not listening
@@ -300,11 +301,9 @@ static void reachy_bridge_up(reachy_state_t *);
 static void reachy_bridge_down(reachy_state_t *);
 
 static bool reachy_word_char(char);
-static char *reachy_phrase_in(char *, const char *, size_t *);
+static bool reachy_phrase_in(const char *, const char *);
 static char *reachy_trim(char *);
-static void reachy_alias_rewrite(reachy_state_t *, char *, size_t, char *,
-    size_t);
-static reachy_attn_t reachy_attention(reachy_state_t *, char *, size_t);
+static reachy_attn_t reachy_attention(reachy_state_t *, const char *);
 static void reachy_deliver(reachy_state_t *, const reachy_dispatch_t *);
 static void reachy_dispatch_task(task_t *);
 static void reachy_stt_done(const llm_stt_response_t *);

@@ -540,21 +540,16 @@ reachy_word_char(char c)
 // whatever separates two words in `hay` — which is what makes a wake
 // PHRASE possible at all: whisper punctuates a spoken vocative, and no
 // literal needle survives the comma it puts after the name.
-//
-// returns: the match inside `hay`, or NULL. `len`, when given, receives
-// the length of the matched SPAN — punctuation makes it longer than the
-// needle, and the caller rewriting an alias in place needs the span,
-// not the needle. A bool would be enough for neither.
-static char *
-reachy_phrase_in(char *hay, const char *needle, size_t *len)
+static bool
+reachy_phrase_in(const char *hay, const char *needle)
 {
   if(needle[0] == '\0')
-    return(NULL);
+    return(false);
 
-  for(char *p = hay; *p != '\0'; p++)
+  for(const char *p = hay; *p != '\0'; p++)
   {
     const char *n = needle;
-    char       *h = p;
+    const char *h = p;
 
     if(p != hay && reachy_word_char(p[-1]))
       continue;
@@ -584,49 +579,11 @@ reachy_phrase_in(char *hay, const char *needle, size_t *len)
       n++;
     }
 
-    if(*n != '\0' || reachy_word_char(*h))
-      continue;
-
-    if(len != NULL)
-      *len = (size_t)(h - p);
-
-    return(p);
+    if(*n == '\0' && !reachy_word_char(*h))
+      return(true);
   }
 
-  return(NULL);
-}
-
-// Put the bot's own name where the alias was heard.
-//
-// Without this, `attention.names` is only half a feature. It decides
-// what the DRIVER listens to, but the chat plugin runs its own address
-// classifier against `method_get_self()` — which knows one name — so an
-// utterance admitted by an alias arrives looking like somebody else's
-// conversation, is filed as WITNESS, and (at the default
-// `interject_prob` of 0) is answered with silence. Measured live
-// 2026-08-04: "Minnie, tell me a story…" passed this gate and the brain
-// ignored it.
-//
-// Rewriting is honest here in a way it would not be elsewhere: the alias
-// list exists precisely to say "these sounds are also my name", and
-// whisper's spelling of a spoken name is a guess, not testimony.
-static void
-reachy_alias_rewrite(reachy_state_t *st, char *text, size_t cap, char *at,
-    size_t span_len)
-{
-  size_t name_len = strlen(st->botname);
-  size_t tail_len = strlen(at + span_len);
-
-  // Refuse rather than truncate: an unanswered request beats a request
-  // answered with its last words missing.
-  if((size_t)(at - text) + name_len + tail_len + 1 > cap)
-    return;
-
-  clam(CLAM_DEBUG, REACHY_CTX, "%s: heard its name as \"%.*s\"",
-      st->botname, (int)span_len, at);
-
-  memmove(at + name_len, at + span_len, tail_len + 1);
-  memcpy(at, st->botname, name_len);
+  return(false);
 }
 
 static char *
@@ -656,11 +613,14 @@ reachy_trim(char *s)
 // television behind a wall, reaches the chat plugin as one speaker on
 // one channel, so its two IRC-shaped defences — the handoff window and
 // per-(channel, sender) sticky engagement — cannot tell them apart and
-// one answered request leaves a permanently warm slot. The ambient mark
-// is what splits the job correctly: the driver decides what the bot
-// HEARS, the chat plugin decides what it ANSWERS.
+// one answered request leaves a permanently warm slot. The verdict is
+// what splits the job correctly: the driver decides what the bot HEARS,
+// the chat plugin decides what it ANSWERS.
+//
+// `text` is read, never written. What the human said is testimony, and
+// this gate is the last place that should be tempted to edit it.
 static reachy_attn_t
-reachy_attention(reachy_state_t *st, char *text, size_t cap)
+reachy_attention(reachy_state_t *st, const char *text)
 {
   char    mode [16];
   char    names[KV_STR_SZ];
@@ -677,7 +637,7 @@ reachy_attention(reachy_state_t *st, char *text, size_t cap)
   // used to run unconditionally and first, so a phrase could only ever
   // ADD a trigger to a name that already fired on its own.
   if(!reachy_kv_flag(st, "attention.strict"))
-    named = (reachy_phrase_in(text, st->botname, NULL) != NULL);
+    named = reachy_phrase_in(text, st->botname);
 
   if(!named)
   {
@@ -687,14 +647,12 @@ reachy_attention(reachy_state_t *st, char *text, size_t cap)
         tok = strtok_r(NULL, ",", &save))
     {
       const char *alias = reachy_trim(tok);
-      size_t      span  = 0;
-      char       *at    = reachy_phrase_in(text, alias, &span);
 
-      if(at == NULL)
-        continue;
+      named = reachy_phrase_in(text, alias);
 
-      reachy_alias_rewrite(st, text, cap, at, span);
-      named = true;
+      if(named)
+        clam(CLAM_DEBUG, REACHY_CTX, "%s: answers to \"%s\"", st->botname,
+            alias);
     }
   }
 
@@ -749,10 +707,12 @@ reachy_deliver(reachy_state_t *st, const reachy_dispatch_t *d)
   snprintf(msg.text,     sizeof(msg.text),     "%s", d->text);
   snprintf(msg.metadata, sizeof(msg.metadata), "doa=%.2f", d->doa);
 
-  msg.is_ambient = d->ambient;
+  // The gate already worked out who this was aimed at. Say so, rather
+  // than editing the words until the chat plugin agrees.
+  msg.addressing = d->addressing;
 
   clam(CLAM_INFO, REACHY_CTX, "%s: heard \"%.200s\"%s", st->botname, d->text,
-      d->ambient ? " (ambient)" : "");
+      d->addressing == METHOD_ADDR_AMBIENT ? " (ambient)" : "");
 
   method_deliver(st->inst, &msg);
 }
@@ -768,7 +728,7 @@ reachy_dispatch_task(task_t *t)
 
   t->state = TASK_ENDED;
 
-  attn = reachy_attention(d->st, d->text, sizeof(d->text));
+  attn = reachy_attention(d->st, d->text);
 
   if(attn == REACHY_ATTN_DROP)
     clam(CLAM_DEBUG, REACHY_CTX, "%s: unaddressed, dropped \"%.120s\"",
@@ -776,7 +736,9 @@ reachy_dispatch_task(task_t *t)
 
   else
   {
-    d->ambient = (attn == REACHY_ATTN_AMBIENT);
+    d->addressing = (attn == REACHY_ATTN_NAMED)
+        ? METHOD_ADDR_DIRECT : METHOD_ADDR_AMBIENT;
+
     reachy_deliver(d->st, d);
   }
 
