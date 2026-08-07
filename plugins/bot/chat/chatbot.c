@@ -613,6 +613,7 @@ typedef enum
   CHATBOT_CLASSIFY_DIRECT,
   CHATBOT_CLASSIFY_STICKY,
   CHATBOT_CLASSIFY_HANDOFF,
+  CHATBOT_CLASSIFY_AMBIENT,
   CHATBOT_CLASSIFY_WITNESS
 } chatbot_classify_reason_t;
 
@@ -626,6 +627,7 @@ chatbot_classify_reason_tag(chatbot_classify_reason_t r)
     case CHATBOT_CLASSIFY_DIRECT:   return("direct");
     case CHATBOT_CLASSIFY_STICKY:   return("sticky");
     case CHATBOT_CLASSIFY_HANDOFF:  return("handoff");
+    case CHATBOT_CLASSIFY_AMBIENT:  return("ambient");
     case CHATBOT_CLASSIFY_WITNESS:  return("witness");
   }
   return("?");
@@ -984,8 +986,22 @@ chatbot_classify_with_engagement(chatbot_state_t *st,
     uint32_t window_secs, uint32_t handoff_window_secs,
     chatbot_classify_reason_t *out_reason)
 {
-  mem_msg_kind_t k = chatbot_classify_message(msg, bot_nick);
+  mem_msg_kind_t k;
   time_t now;
+
+  // A method that admits ambient lines has already told us this one was
+  // not addressed to the bot, and it knows better than any text rule:
+  // an always-listening microphone has no senders to tell apart, so the
+  // handoff gate below can never fire and the sticky ring holds one
+  // permanently warm slot shared by every voice in the room. Ambient
+  // lines are witnessed, never promoted, and never engage the ring.
+  if(msg != NULL && msg->is_ambient)
+  {
+    if(out_reason) *out_reason = CHATBOT_CLASSIFY_AMBIENT;
+    return(MEM_MSG_WITNESS);
+  }
+
+  k = chatbot_classify_message(msg, bot_nick);
 
   if(k == MEM_MSG_EXCHANGE_IN)
   {

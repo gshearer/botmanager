@@ -244,8 +244,19 @@ typedef struct
 {
   reachy_state_t *st;
   double          doa;
+  bool            ambient;   // heard, but the bot's name was not in it
   char            text[METHOD_TEXT_SZ];
 } reachy_dispatch_t;
+
+// What the attention gate made of an utterance. The middle verdict is
+// the one worth having: a line the bot may hear without being the line
+// it was asked to answer.
+typedef enum
+{
+  REACHY_ATTN_DROP = 0,   // nobody was addressing us and we are not listening
+  REACHY_ATTN_NAMED,      // it carried the bot's name (or one of its aliases)
+  REACHY_ATTN_AMBIENT     // admitted by policy or by an open window
+} reachy_attn_t;
 
 // Standing the robot up at connect, across three completions on the
 // curl worker thread: ask what the motors are doing, raise torque if
@@ -288,11 +299,12 @@ static bool reachy_prime_seq(reachy_state_t *, const char *);
 static void reachy_bridge_up(reachy_state_t *);
 static void reachy_bridge_down(reachy_state_t *);
 
-static char *reachy_word_in(char *, const char *);
+static bool reachy_word_char(char);
+static char *reachy_phrase_in(char *, const char *, size_t *);
 static char *reachy_trim(char *);
 static void reachy_alias_rewrite(reachy_state_t *, char *, size_t, char *,
     size_t);
-static bool reachy_addressed(reachy_state_t *, char *, size_t);
+static reachy_attn_t reachy_attention(reachy_state_t *, char *, size_t);
 static void reachy_deliver(reachy_state_t *, const reachy_dispatch_t *);
 static void reachy_dispatch_task(task_t *);
 static void reachy_stt_done(const llm_stt_response_t *);

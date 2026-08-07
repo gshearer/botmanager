@@ -73,6 +73,16 @@ typedef struct
   time_t         timestamp;                   // message timestamp
   char           metadata[METHOD_META_SZ];    // method-specific data (diagnostic / auth context)
   bool           is_action;                   // true when the message is an emote/action (e.g., IRC CTCP ACTION)
+
+  // True when the method admitted this line for a reason other than the
+  // bot being addressed — an always-listening microphone hearing the
+  // room, an attention window still open from an earlier request. The
+  // bot is being told "you may hear this", never "this was said to
+  // you": a consumer must not treat an ambient line as a continuation
+  // of a conversation. Methods whose senders are real identities (IRC
+  // and friends) leave it false and lose nothing.
+  bool           is_ambient;
+
   method_msg_kind_t kind;                     // default METHOD_MSG_MESSAGE
 
   // Generic method-level identity for the sender. The method plugin

@@ -32,13 +32,21 @@ static const plugin_kv_entry_t reachy_inst_kv_schema[] = {
     "Speaker volume applied to the robot at connect (0-100)" },
 
   { "attention.mode", KV_STR, "open",
-    "`open` hears everything in the room; `name` hears only what is "
-    "addressed to the bot" },
+    "`open` hears the whole room; `name` hears only lines carrying the "
+    "bot's name, plus whatever follows them inside attention.window_s" },
   { "attention.names", KV_STR, "",
-    "Extra comma-separated names the bot answers to in `name` mode; "
-    "empty means its own name only" },
-  { "attention.window_s", KV_UINT32, "90",
-    "Seconds attention stays open after the bot is addressed by name" },
+    "Extra comma-separated names — or phrases — the bot answers to. "
+    "Punctuation between the words of a phrase is ignored, so `hey "
+    "mini` matches \"Hey, Mini, ...\". Empty means its own name only" },
+  { "attention.strict", KV_UINT8, "0",
+    "Answer only to attention.names, never to the bare bot name. This "
+    "is what makes a wake phrase mandatory: without it `hey mini` only "
+    "adds a trigger and a passing \"mini\" still wakes the bot" },
+  { "attention.window_s", KV_UINT32, "30",
+    "Seconds the bot keeps listening after hearing its name, so a "
+    "conversation need not repeat it. Lines let in by the window alone "
+    "are marked ambient — heard and remembered, never mistaken for "
+    "something said to the bot" },
 
   { "barge_in", KV_UINT8, "0",
     "Stop speaking when a human starts. DEFAULT OFF: the microphone "
@@ -520,28 +528,67 @@ reachy_bridge_down(reachy_state_t *st)
       st->botname, st->fails);
 }
 
-// Case-insensitive whole-word search, so a bot called "mini" is not
-// addressed by the word "minimum".
-// returns: the match inside `hay`, or NULL. The position is what lets an
-// alias be rewritten in place; a bool would not be enough.
-static char *
-reachy_word_in(char *hay, const char *needle)
+static bool
+reachy_word_char(char c)
 {
-  size_t nlen = strlen(needle);
+  return(isalnum((unsigned char)c) || c == '_');
+}
 
-  if(nlen == 0)
+// Case-insensitive whole-word search that reads through punctuation, so
+// a bot called "mini" is not addressed by the word "minimum" and IS
+// addressed by "Hey, Mini,". Each space in `needle` matches a run of
+// whatever separates two words in `hay` — which is what makes a wake
+// PHRASE possible at all: whisper punctuates a spoken vocative, and no
+// literal needle survives the comma it puts after the name.
+//
+// returns: the match inside `hay`, or NULL. `len`, when given, receives
+// the length of the matched SPAN — punctuation makes it longer than the
+// needle, and the caller rewriting an alias in place needs the span,
+// not the needle. A bool would be enough for neither.
+static char *
+reachy_phrase_in(char *hay, const char *needle, size_t *len)
+{
+  if(needle[0] == '\0')
     return(NULL);
 
   for(char *p = hay; *p != '\0'; p++)
   {
-    if(strncasecmp(p, needle, nlen) != 0)
+    const char *n = needle;
+    char       *h = p;
+
+    if(p != hay && reachy_word_char(p[-1]))
       continue;
 
-    if(p != hay && (isalnum((unsigned char)p[-1]) || p[-1] == '_'))
+    while(*n != '\0')
+    {
+      // A gap in the needle: one or more separators in the hay. Demand
+      // at least one, or "heymini" would answer to "hey mini".
+      if(*n == ' ')
+      {
+        if(*h == '\0' || reachy_word_char(*h))
+          break;
+
+        while(*h != '\0' && !reachy_word_char(*h))
+          h++;
+
+        while(*n == ' ')
+          n++;
+
+        continue;
+      }
+
+      if(tolower((unsigned char)*h) != tolower((unsigned char)*n))
+        break;
+
+      h++;
+      n++;
+    }
+
+    if(*n != '\0' || reachy_word_char(*h))
       continue;
 
-    if(p[nlen] != '\0' && (isalnum((unsigned char)p[nlen]) || p[nlen] == '_'))
-      continue;
+    if(len != NULL)
+      *len = (size_t)(h - p);
 
     return(p);
   }
@@ -565,10 +612,10 @@ reachy_word_in(char *hay, const char *needle)
 // whisper's spelling of a spoken name is a guess, not testimony.
 static void
 reachy_alias_rewrite(reachy_state_t *st, char *text, size_t cap, char *at,
-    size_t alias_len)
+    size_t span_len)
 {
   size_t name_len = strlen(st->botname);
-  size_t tail_len = strlen(at + alias_len);
+  size_t tail_len = strlen(at + span_len);
 
   // Refuse rather than truncate: an unanswered request beats a request
   // answered with its last words missing.
@@ -576,9 +623,9 @@ reachy_alias_rewrite(reachy_state_t *st, char *text, size_t cap, char *at,
     return;
 
   clam(CLAM_DEBUG, REACHY_CTX, "%s: heard its name as \"%.*s\"",
-      st->botname, (int)alias_len, at);
+      st->botname, (int)span_len, at);
 
-  memmove(at + name_len, at + alias_len, tail_len + 1);
+  memmove(at + name_len, at + span_len, tail_len + 1);
   memcpy(at, st->botname, name_len);
 }
 
@@ -598,53 +645,73 @@ reachy_trim(char *s)
   return(s);
 }
 
-// The attention gate. `open` hears the whole room; `name` hears only
-// what carries the bot's name, and then keeps listening for a window
-// afterwards so a conversation does not need the name in every line.
-static bool
-reachy_addressed(reachy_state_t *st, char *text, size_t cap)
+// The attention gate. It answers two questions at once, because they
+// have never been the same question: may this utterance reach the bot,
+// and was it SAID to the bot? `open` hears the whole room, `name` hears
+// only what carries the bot's name plus a window of what follows — but
+// under either policy a line that arrived without the name is ambient,
+// and the brain is told so.
+//
+// A microphone has no senders. Every voice in the room, and every
+// television behind a wall, reaches the chat plugin as one speaker on
+// one channel, so its two IRC-shaped defences — the handoff window and
+// per-(channel, sender) sticky engagement — cannot tell them apart and
+// one answered request leaves a permanently warm slot. The ambient mark
+// is what splits the job correctly: the driver decides what the bot
+// HEARS, the chat plugin decides what it ANSWERS.
+static reachy_attn_t
+reachy_attention(reachy_state_t *st, char *text, size_t cap)
 {
   char    mode [16];
   char    names[KV_STR_SZ];
-  char   *save = NULL;
-  bool    hit  = false;
-  time_t  now  = time(NULL);
+  char   *save    = NULL;
+  bool    named   = false;
+  bool    listening;
+  time_t  now     = time(NULL);
 
   reachy_kv_copy(st, "attention.mode", mode, sizeof(mode));
+  listening = (strcasecmp(mode, "name") != 0);
 
-  if(strcasecmp(mode, "name") != 0)
-    return(true);
+  // Under `attention.strict` the bare name is not an address — only the
+  // wake phrases are. Skipping the match here is the whole feature: it
+  // used to run unconditionally and first, so a phrase could only ever
+  // ADD a trigger to a name that already fired on its own.
+  if(!reachy_kv_flag(st, "attention.strict"))
+    named = (reachy_phrase_in(text, st->botname, NULL) != NULL);
 
-  hit = (reachy_word_in(text, st->botname) != NULL);
-
-  if(!hit)
+  if(!named)
   {
     reachy_kv_copy(st, "attention.names", names, sizeof(names));
 
-    for(char *tok = strtok_r(names, ",", &save); tok != NULL && !hit;
+    for(char *tok = strtok_r(names, ",", &save); tok != NULL && !named;
         tok = strtok_r(NULL, ",", &save))
     {
       const char *alias = reachy_trim(tok);
-      char       *at    = reachy_word_in(text, alias);
+      size_t      span  = 0;
+      char       *at    = reachy_phrase_in(text, alias, &span);
 
       if(at == NULL)
         continue;
 
-      reachy_alias_rewrite(st, text, cap, at, strlen(alias));
-      hit = true;
+      reachy_alias_rewrite(st, text, cap, at, span);
+      named = true;
     }
   }
 
   pthread_mutex_lock(&st->attn_mutex);
 
-  if(hit)
+  if(named)
     st->attn_until = now + (time_t)reachy_kv_uint(st, "attention.window_s");
-  else
-    hit = (now < st->attn_until);
+
+  else if(!listening)
+    listening = (now < st->attn_until);
 
   pthread_mutex_unlock(&st->attn_mutex);
 
-  return(hit);
+  if(named)
+    return(REACHY_ATTN_NAMED);
+
+  return(listening ? REACHY_ATTN_AMBIENT : REACHY_ATTN_DROP);
 }
 
 static void
@@ -682,7 +749,10 @@ reachy_deliver(reachy_state_t *st, const reachy_dispatch_t *d)
   snprintf(msg.text,     sizeof(msg.text),     "%s", d->text);
   snprintf(msg.metadata, sizeof(msg.metadata), "doa=%.2f", d->doa);
 
-  clam(CLAM_INFO, REACHY_CTX, "%s: heard \"%.200s\"", st->botname, d->text);
+  msg.is_ambient = d->ambient;
+
+  clam(CLAM_INFO, REACHY_CTX, "%s: heard \"%.200s\"%s", st->botname, d->text,
+      d->ambient ? " (ambient)" : "");
 
   method_deliver(st->inst, &msg);
 }
@@ -694,14 +764,21 @@ static void
 reachy_dispatch_task(task_t *t)
 {
   reachy_dispatch_t *d = t->data;
+  reachy_attn_t      attn;
 
   t->state = TASK_ENDED;
 
-  if(reachy_addressed(d->st, d->text, sizeof(d->text)))
-    reachy_deliver(d->st, d);
-  else
+  attn = reachy_attention(d->st, d->text, sizeof(d->text));
+
+  if(attn == REACHY_ATTN_DROP)
     clam(CLAM_DEBUG, REACHY_CTX, "%s: unaddressed, dropped \"%.120s\"",
         d->st->botname, d->text);
+
+  else
+  {
+    d->ambient = (attn == REACHY_ATTN_AMBIENT);
+    reachy_deliver(d->st, d);
+  }
 
   reachy_state_unref(d->st);
   mem_free(d);

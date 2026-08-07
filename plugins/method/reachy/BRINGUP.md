@@ -368,7 +368,16 @@ Two gates silently swallow everything during bring-up:
   daemon's CWD is the repo root).
 
 Attention policy is per-bot KV `bot.<name>.reachy.attention.*` (`open|name`,
-`window_s`). `name` is the privacy mode.
+`names`, `strict`, `window_s`). `name` is the privacy mode, and since §A1 it
+means it: only a line carrying the bot's name is an address, and everything
+else the driver admits — the whole room in `open` mode, the tail of a
+conversation in `name` mode — is delivered **ambient**, which the chat plugin
+witnesses but never answers as conversation.
+
+`attention.names` entries may be phrases; punctuation between their words is
+ignored, so `hey mini` matches whisper's "Hey, Mini, ...". A phrase only
+*adds* a trigger unless `attention.strict = 1`, which is what stops the bare
+bot name from waking it on its own.
 
 ⚠ `bot.<name>.reachy.barge_in` **defaults to 0 and should stay there** until
 the robot's cooling fan is quieter. The microphone array's `speech_detected`
