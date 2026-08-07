@@ -165,11 +165,17 @@ typedef struct
   bool (*send_emote)(void *handle, const char *target, const char *text);
 
   // Method context for authentication (e.g., hostname/IP from IRC).
+  // Implementations must answer from live state, never from a cache
+  // with a lifetime of its own — see method_get_context() below for why
+  // a stale answer here authenticates the wrong person. Answering FAIL
+  // is always safe; guessing is not.
   bool (*get_context)(void *handle, const char *sender,
       char *ctx, size_t ctx_sz);
 
   // List members of a channel. If not implemented (NULL), the channel
-  // has no member tracking.
+  // has no member tracking. `cb` may call back into this driver — asking
+  // about a member is the usual reason to enumerate them — so snapshot
+  // the roster and invoke `cb` with no driver lock held.
   void (*list_channel)(void *handle, const char *channel,
       method_chan_member_cb_t cb, void *data);
 
@@ -285,6 +291,16 @@ method_cap_t method_inst_caps(const method_inst_t *inst);
 
 // Method context for a sender (e.g., hostname/IP). Used by the auth
 // system as a second factor.
+//
+// This is an authentication surface, not a diagnostic one.
+// bot_identity_resolve() falls back to it whenever a caller passes no
+// metadata, builds "<sender>!<ctx>" and matches that against the
+// namespace's MFA patterns — so whatever this returns is what the
+// caller is treated AS. A driver that answers from a stale cache grants
+// a departed session's privileges to whoever holds the name now, and
+// the divergence hides well: the message-carried path stays correct, so
+// only the metadata-less callers are wrong. Prefer FAIL over a guess;
+// callers read it as anonymous.
 bool method_get_context(method_inst_t *inst, const char *sender,
     char *ctx, size_t ctx_sz);
 
