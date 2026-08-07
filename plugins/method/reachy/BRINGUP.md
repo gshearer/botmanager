@@ -215,10 +215,17 @@ loud half of every utterance is flat. `RCH-SWAY-1` measured the whole
 mechanism and it *works*: the wobble is tapped off a GStreamer tee **upstream
 of the audiosink**, so attenuating in kokorod unpins the daemon's curve while
 the robot's `volume` control compensates the loudness, with Pollen's file
-untouched. **It was declined on price.** Unpinning needs ~9 dB of attenuation
-and `bot.karan.reachy.volume` is already **100 — 0.00 dB, the hardware
-ceiling** — so the 9 dB is paid entirely in loudness, and loudness is worth
-more than expression here. Full arithmetic: `TODO.md §SWAY-TRUTH`.
+untouched. **It was declined, and the primary reason is not the price.**
+
+⭑⭑ **The Reachy Mini began shipping about a month ago. We give the product
+and its community time to grow the API before we engineer around its gaps.**
+Operator, 2026-08-07. The price is the secondary argument and it is real —
+unpinning needs ~9 dB and `bot.karan.reachy.volume` is already **100, which
+is 0.00 dB, the hardware ceiling**, so it comes entirely out of loudness —
+but even a free fix would have waited. **Read that as standing posture for
+every reachy limitation, not a ruling about the wobble**: prefer waiting to
+working around, because a workaround for a gap upstream is about to close is
+a maintenance burden we chose. Full arithmetic: `TODO.md §SWAY-TRUTH`.
 
 ⭑ **Reusable, measured 2026-08-07: the robot's volume control is exactly
 0.6 dB per unit, linear in dB, over a full 60 dB range.** `POST
