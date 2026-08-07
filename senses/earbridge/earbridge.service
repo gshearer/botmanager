@@ -40,19 +40,42 @@ Wants=network-online.target
 Type=simple
 User=pollen
 WorkingDirectory=/home/pollen/earbridge
-# --floor-db is the knob you will actually tune, so it is spelled out here
-# rather than left to the compiled default. The XVF3800's speech flag fires on
-# the CM4's own cooling fan, and whisper turns that into confident English, so
-# earbridge measures the loudest 250 ms of each utterance and drops anything
-# below this. Measured 2026-08-04: fan worst window -42 dBFS, noisiest false
-# utterance -40.3, quietest real speech -13.7 — hence -35.
+# --floor-db and --hang-ms are the two knobs worth tuning, so both are spelled
+# out here rather than left to the compiled defaults. Both were settled against
+# measurements on 2026-08-06; the procedure that produced them is
+# `scripts/reachy_mic_probe.sh`, which prints a floor ladder telling you what
+# earbridge WOULD have published from a capture.
 #
-# Tuning it: watch `quiet_discards` against `utterances` in /health.
-#   real speech being dropped   -> LOWER it (more negative), e.g. -40
-#   fan still getting through   -> RAISE it, e.g. -32
-# The fan is not stationary (it drifted 22 dB in eight minutes), so expect to
-# revisit this. -90 or below disables the gate entirely.
-ExecStart=/home/pollen/earbridge/earbridge --daemon-url http://127.0.0.1:8000 --take ch0 --floor-db -35
+# --floor-db: earbridge measures the loudest 250 ms of each utterance and drops
+# anything below this. -35 SURVIVED a two-capture ladder and should stay.
+#   silence, 60 s, ceiling fan on : 10th pct -54.9 dBFS, ZERO events at every
+#                                   floor tested, down to -45.
+#   speech,  30 s, normal voice   : typical -20..-30, loudest 0.5 s -19.0,
+#                                   dies entirely between -20 and -15.
+# So the usable band is -45..-25 — but only for ONE speaker beside the robot.
+# The room is 30x20 ft, and a speaker at 3x the distance loses ~9.5 dB to
+# inverse-square, putting a normal voice near -33.5. RAISING THIS PAST -30
+# DELETES EVERYONE ACROSS THE ROOM, to reject noise the silence capture says
+# is not there. Do not "reduce sensitivity" here: every false positive ever
+# identified on this robot (a cough at -11.7, a laptop beep at -20.0, TV
+# dialogue at speech level) sits ABOVE any floor speech can survive. That is
+# an attention-gate problem, not a floor problem.
+#   real speech being dropped -> LOWER it (more negative), e.g. -40
+#   -90 or below disables the gate entirely.
+#
+# --hang-ms: silence that ends an utterance. 700 was SPLITTING NATURAL SPEECH.
+# Measured: 30 s of continuous talk holds 25 internal pauses, four of them
+# over 700 ms (940, 900, 740, 720). The split orphans the vocative — "Mini,
+# <pause> tell me a story" closed on the name, whisper got one context-free
+# word and wrote "Many", and a homophone was added to attention.names to patch
+# it. Proven live 2026-08-06/07 on the same voice and phrase, old binary vs
+# new: voiced content per utterance went from [1960,1700,560,560,1580,300,500,
+# 440] to [1840,1960,5160,1660,1520,1580,1940,1720,1820] — fragmentation
+# 5/8 -> 0/9. ⚠ The cost is real and was seen once: the 5160 ms outlier is
+# ~3 phrases merged, because the next was spoken within the hang. A longer
+# hang merges speakers who overlap; raising it further trades that against
+# +latency on every reply.
+ExecStart=/home/pollen/earbridge/earbridge --daemon-url http://127.0.0.1:8000 --take ch0 --hang-ms 1100 --floor-db -35
 # The capture thread already recovers from ALSA errors and reopens the device
 # on its own; Restart is the backstop for something worse, not the strategy.
 Restart=always
