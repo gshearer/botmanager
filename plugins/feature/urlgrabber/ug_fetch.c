@@ -473,12 +473,20 @@ ug_extract_title(const char *html, size_t len, char *out, size_t cap)
 // Async fetch + announce                                              //
 // ------------------------------------------------------------------ //
 
+// The URL is kept alongside the destination because a challenge shell earns
+// one retry, and the retry re-issues the same request under another name.
 typedef struct
 {
   char method [METHOD_NAME_SZ];
   char channel[METHOD_CHANNEL_SZ];
   char host   [UG_HOST_SZ];
+  char url    [UG_URL_SZ];
+  bool retried;                       // one challenge retry, and only one
 } ug_fetch_ctx_t;
+
+// Mutually recursive with ug_fetch_submit below: a completion that turns out
+// to be a challenge shell re-arms the very submit that produced it.
+static void ug_fetch_done(const curl_response_t *resp);
 
 // Only HTML-ish payloads carry a <title>. An absent Content-Type is given
 // the benefit of the doubt; anything else declared non-markup is skipped.
@@ -489,6 +497,138 @@ ug_content_is_html(const char *ct)
     return(true);
 
   return(ug_stristr(ct, "html") != NULL || ug_stristr(ct, "xml") != NULL);
+}
+
+// True when the body is a JavaScript challenge shell rather than the page —
+// a document whose only content is script that solves a puzzle and resubmits.
+// Such a page still carries a perfectly well-formed <title>, which is exactly
+// what makes it dangerous: reddit's says "Reddit", so the naive read succeeds
+// and the room is told the name of the site it was already looking at.
+//
+// The markers are attribute names emitted by the challenge machinery itself,
+// not prose, so a page that merely *discusses* one will not match. Only the
+// head of the body is scanned: a challenge shell is a stub by construction
+// (reddit's is 8 KiB entire), so a marker appearing deep inside a real
+// document is a false positive, not a late detection.
+static bool
+ug_is_challenge(const char *body, size_t len)
+{
+  static const char *const markers[] = {
+    "name=\"js_challenge\""        // reddit, measured 2026-08-06
+  };
+
+  size_t scan = len < UG_CHALLENGE_SCAN_SZ ? len : UG_CHALLENGE_SCAN_SZ;
+
+  for(size_t i = 0; i < sizeof(markers) / sizeof(markers[0]); i++)
+    if(ug_memcasefind(body, scan, markers[i]) != NULL)
+      return(true);
+
+  return(false);
+}
+
+// The identity worn for a challenge retry, or NULL when the operator has
+// declined it. `/set kv` cannot store a genuine empty string — a bare key
+// fails arg parsing and a quoted "" is stored literally — so the retry is
+// waved off by the same spellings giphy's rating knob accepts.
+static const char *
+ug_crawler_agent(void)
+{
+  const char *ua = kv_get_str(UG_KV_CRAWLER_AGENT);
+
+  if(ua == NULL || ua[0] == '\0'
+      || strcmp(ua, "\"\"") == 0
+      || strcasecmp(ua, "none") == 0
+      || strcasecmp(ua, "off") == 0)
+    return(NULL);
+
+  return(ua);
+}
+
+// Build and submit the GET described by `fc` under the identity `ua` — the
+// browser's on the first attempt, the link-preview crawler's on a challenge
+// retry. The identity is passed rather than looked up so that the caller
+// deciding to retry and the request carrying that decision out cannot read
+// two different values of the knob. Takes ownership of `fc` unconditionally:
+// it is freed here if the request never reaches the wire, and by
+// ug_fetch_done otherwise.
+static void
+ug_fetch_submit(ug_fetch_ctx_t *fc, const char *ua)
+{
+  // The headers a browser sends on a top-level navigation, in the order it
+  // sends them. The first UG_NAV_GENERIC suit any HTTP client; the tail is a
+  // browser-only claim. See the note at the add loop for why that split, and
+  // the order, are not incidental.
+  static const char *const nav_headers[] = {
+    "Accept: text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+    "Accept-Language: en-US,en;q=0.9",
+    "Upgrade-Insecure-Requests: 1",
+    "Sec-Fetch-Dest: document",
+    "Sec-Fetch-Mode: navigate",
+    "Sec-Fetch-Site: none",
+    "Sec-Fetch-User: ?1"
+  };
+
+  curl_request_t *req;
+  uint32_t        timeout;
+  uint32_t        maxbytes;
+  size_t          nhdrs;
+
+  if((req = curl_request_create(CURL_METHOD_GET, fc->url,
+          ug_fetch_done, fc)) == NULL)
+  {
+    mem_free(fc);
+    return;
+  }
+
+  timeout = (uint32_t)kv_get_uint(UG_KV_TIMEOUT);
+  if(timeout > 0)
+    curl_request_set_timeout(req, timeout);
+
+  if(ua != NULL && ua[0] != '\0')
+    curl_request_set_user_agent(req, ua);
+
+  // Idempotent, best-effort, and first to shed on shutdown drain.
+  curl_request_set_prio(req, CURL_PRIO_BULK);
+  curl_request_set_follow_redirects(req, true);
+
+  // Bound the download: the <title> lives in the head, so we ask for only
+  // the first slice. Servers that ignore Range are still capped by the
+  // curl core's global response ceiling.
+  maxbytes = (uint32_t)kv_get_uint(UG_KV_MAX_BYTES);
+  if(maxbytes > 0)
+  {
+    char range[64];
+
+    snprintf(range, sizeof(range), "Range: bytes=0-%u", maxbytes - 1);
+    curl_request_add_header(req, range);
+  }
+
+  // `user_agent` claims Firefox; a request that claims Firefox and then
+  // arrives without Fetch Metadata claims two contradictory things, and a
+  // fingerprinting WAF scores the contradiction rather than the UA. Akamai
+  // answers such a request with an HTTP/2 RST_STREAM *before* any status
+  // line, so the drop reaches us as a transport error and never looks like
+  // the 403 a block is expected to be. Measured 2026-08-06 against
+  // washingtonpost.com: refused 3/3 without these headers, served 3/3 with
+  // them (any single Sec-Fetch-* flips it), and no other site in a 17-URL
+  // sweep changed status. The curl core *prepends*, so walk the list
+  // backwards to land it on the wire in browser order — after which the
+  // Range above, added first, trails the set as the one non-browser tell.
+  //
+  // The same lesson runs the other way on the retry. Fetch Metadata is a
+  // browser's account of a click it did not make on our behalf, so a crawler
+  // that sends it contradicts itself precisely as the bare Firefox UA once
+  // did. The retry stops at the generic two and makes no claim it cannot own.
+  nhdrs = fc->retried ? UG_NAV_GENERIC
+                      : sizeof(nav_headers) / sizeof(nav_headers[0]);
+
+  for(size_t i = nhdrs; i > 0; i--)
+    curl_request_add_header(req, nav_headers[i - 1]);
+
+  // On submit failure the curl core releases `req` itself; we still own —
+  // and must free — the context, since the callback will never fire.
+  if(curl_request_submit(req) != SUCCESS)
+    mem_free(fc);
 }
 
 // Completion callback — runs on the curl worker thread, so it stays fast:
@@ -543,6 +683,31 @@ ug_fetch_done(const curl_response_t *resp)
     goto out;
   }
 
+  // A 200 carrying a challenge shell is a refusal wearing a success code,
+  // and its <title> names the site rather than the page. Some such sites
+  // keep the real markup for a named link-preview crawler — which is the one
+  // thing we honestly are — so spend exactly one more request saying so.
+  if(!fc->retried && ug_is_challenge(resp->body, resp->body_len))
+  {
+    const char *crawler = ug_crawler_agent();
+
+    if(crawler == NULL)
+    {
+      clam(CLAM_DEBUG, UG_CTX,
+          "%s: JavaScript challenge and crawler_agent declined, skipped",
+          fc->host);
+      goto out;
+    }
+
+    clam(CLAM_INFO, UG_CTX,
+        "%s: JavaScript challenge, retrying as a link-preview crawler",
+        fc->host);
+
+    fc->retried = true;
+    ug_fetch_submit(fc, crawler);  // takes ownership; must not fall through
+    return;
+  }
+
   if(!ug_extract_title(resp->body, resp->body_len, title, sizeof(title)))
   {
     clam(CLAM_DEBUG, UG_CTX, "%s: no <title> in body, skipped", fc->host);
@@ -573,23 +738,7 @@ out:
 void
 ug_fetch(const char *method_name, const char *channel, const char *url)
 {
-  // The headers a browser sends on a top-level navigation, in the order it
-  // sends them. See the note at the add loop for why they are not optional.
-  static const char *const nav_headers[] = {
-    "Accept: text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-    "Accept-Language: en-US,en;q=0.9",
-    "Upgrade-Insecure-Requests: 1",
-    "Sec-Fetch-Dest: document",
-    "Sec-Fetch-Mode: navigate",
-    "Sec-Fetch-Site: none",
-    "Sec-Fetch-User: ?1"
-  };
-
   ug_fetch_ctx_t *fc;
-  curl_request_t *req;
-  const char     *ua;
-  uint32_t        timeout;
-  uint32_t        maxbytes;
 
   if(method_name == NULL || channel == NULL || url == NULL)
     return;
@@ -600,55 +749,8 @@ ug_fetch(const char *method_name, const char *channel, const char *url)
   memset(fc, 0, sizeof(*fc));
   snprintf(fc->method,  sizeof(fc->method),  "%s", method_name);
   snprintf(fc->channel, sizeof(fc->channel), "%s", channel);
+  snprintf(fc->url,     sizeof(fc->url),     "%s", url);
   ug_host_of(url, fc->host, sizeof(fc->host));
 
-  if((req = curl_request_create(CURL_METHOD_GET, url,
-          ug_fetch_done, fc)) == NULL)
-  {
-    mem_free(fc);
-    return;
-  }
-
-  timeout = (uint32_t)kv_get_uint(UG_KV_TIMEOUT);
-  if(timeout > 0)
-    curl_request_set_timeout(req, timeout);
-
-  ua = kv_get_str(UG_KV_USER_AGENT);
-  if(ua != NULL && ua[0] != '\0')
-    curl_request_set_user_agent(req, ua);
-
-  // Idempotent, best-effort, and first to shed on shutdown drain.
-  curl_request_set_prio(req, CURL_PRIO_BULK);
-  curl_request_set_follow_redirects(req, true);
-
-  // Bound the download: the <title> lives in the head, so we ask for only
-  // the first slice. Servers that ignore Range are still capped by the
-  // curl core's global response ceiling.
-  maxbytes = (uint32_t)kv_get_uint(UG_KV_MAX_BYTES);
-  if(maxbytes > 0)
-  {
-    char range[64];
-
-    snprintf(range, sizeof(range), "Range: bytes=0-%u", maxbytes - 1);
-    curl_request_add_header(req, range);
-  }
-
-  // `user_agent` claims Firefox; a request that claims Firefox and then
-  // arrives without Fetch Metadata claims two contradictory things, and a
-  // fingerprinting WAF scores the contradiction rather than the UA. Akamai
-  // answers such a request with an HTTP/2 RST_STREAM *before* any status
-  // line, so the drop reaches us as a transport error and never looks like
-  // the 403 a block is expected to be. Measured 2026-08-06 against
-  // washingtonpost.com: refused 3/3 without these headers, served 3/3 with
-  // them (any single Sec-Fetch-* flips it), and no other site in a 17-URL
-  // sweep changed status. The curl core *prepends*, so walk the list
-  // backwards to land it on the wire in browser order — after which the
-  // Range above, added first, trails the set as the one non-browser tell.
-  for(size_t i = sizeof(nav_headers) / sizeof(nav_headers[0]); i > 0; i--)
-    curl_request_add_header(req, nav_headers[i - 1]);
-
-  // On submit failure the curl core releases `req` itself; we still own —
-  // and must free — the context, since the callback will never fire.
-  if(curl_request_submit(req) != SUCCESS)
-    mem_free(fc);
+  ug_fetch_submit(fc, kv_get_str(UG_KV_USER_AGENT));
 }

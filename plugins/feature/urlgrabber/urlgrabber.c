@@ -45,6 +45,20 @@ static const plugin_kv_entry_t ug_kv_schema[] = {
     // browser for exactly this reason.
     "Mozilla/5.0 (X11; Linux x86_64; rv:128.0) Gecko/20100101 Firefox/128.0",
     "User-Agent sent when fetching a page title" },
+  { UG_KV_CRAWLER_AGENT, KV_STR,
+    // Worn only for the one retry a JavaScript challenge earns. Reddit —
+    // and it will not be the last — hands a browser an 8 KiB challenge
+    // shell titled "Reddit", and keeps the server-rendered page for the
+    // handful of link-preview crawlers it knows by name. Announcing a link
+    // to a room is that job exactly, so the string leads with who we really
+    // are and claims compatibility rather than identity. Measured
+    // 2026-08-06: reddit matches the token anywhere in the field, and this
+    // value returned the true title 3/3 where the browser UA returned none.
+    // Set it to "none"/"off" to decline the retry — a challenge shell is
+    // then dropped, which still beats repeating the site's own name back.
+    "botmanager-urlgrabber/1.0 (link preview bot; compatible; Discordbot/2.0)",
+    "User-Agent for the single retry a JavaScript challenge earns "
+    "(\"none\"/\"off\" declines the retry)" },
 };
 
 // ------------------------------------------------------------------ //

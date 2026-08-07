@@ -72,6 +72,13 @@
 #define UG_KV_MAX_BYTES      "plugin.urlgrabber.max_fetch_bytes"
 #define UG_KV_USER_AGENT     "plugin.urlgrabber.user_agent"
 
+// The identity worn for the one retry a JavaScript challenge earns. Some
+// sites hand a browser a challenge shell instead of a page, and serve the
+// real markup only to a named link-preview crawler. Set it to "none"/"off"
+// to decline the retry — a challenge shell is then dropped rather than
+// announced, which is still better than repeating the site's own name.
+#define UG_KV_CRAWLER_AGENT  "plugin.urlgrabber.crawler_agent"
+
 // Per-channel knob suffixes. The keys hang off each bot's own channel
 // namespace (bot.<bot>.<kind>.chan.<channel>.urlgrabber.<suffix>) so they
 // sit beside the channel's other settings in `!show kv`.
@@ -81,6 +88,16 @@
 // Default hold-down, in seconds — the registered default for a channel's
 // holddown key, and the fallback used before that key exists.
 #define UG_DEFAULT_HOLDDOWN  5
+
+// Headers a browser sends that any HTTP client may also honestly send —
+// the leading slice of the navigation set. The rest is Fetch Metadata, an
+// account of a click, and so belongs only to the browser identity.
+#define UG_NAV_GENERIC       2
+
+// How far into a body the challenge-shell markers are looked for. A shell
+// is a stub by construction, so this bounds the scan and doubles as the
+// false-positive guard against a real document that merely quotes a marker.
+#define UG_CHALLENGE_SCAN_SZ 32768
 
 // Storage bounds.
 #define UG_URL_SZ            2048
