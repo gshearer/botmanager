@@ -233,33 +233,20 @@ verb_llm_personas(const cmd_ctx_t *ctx, bot_inst_t *bot, const char *rest)
       CLR_GRAY "(see /show personalities for the full catalog)" CLR_RESET);
 }
 
-// ---- helpers shared by remaining verbs --------------------------------
-
-static void
-render_fact_kind_short(char *buf, size_t sz, mem_fact_kind_t k)
-{
-  const char *s;
-  switch(k)
-  {
-    case MEM_FACT_PREFERENCE: s = "preference"; break;
-    case MEM_FACT_ATTRIBUTE:  s = "attribute";  break;
-    case MEM_FACT_RELATION:   s = "relation";   break;
-    case MEM_FACT_EVENT:      s = "event";      break;
-    case MEM_FACT_OPINION:    s = "opinion";    break;
-    case MEM_FACT_FREEFORM:   s = "freeform";   break;
-    default:                  s = "?";          break;
-  }
-  snprintf(buf, sz, "%s", s);
-}
-
 // ---- /show bot <name> llm memories [<query>] --------------------------
 
+// Heap-owned state that survives the verb's return. memory_retrieve_ns
+// submits the query embed to the llm worker pool and fires mem_rag_cb
+// from that thread long after the verb returned and `cmd_ctx_t` died.
+// We snapshot the reply target up front and send from the cb directly.
 typedef struct
 {
-  const cmd_ctx_t *ctx;
-  uint32_t         count;
+  method_inst_t *inst;
+  char           target[METHOD_SENDER_SZ];
 } mem_rag_state_t;
 
+// Owns `user`: frees it on every path. memory_retrieve_ns guarantees
+// exactly one delivery, including on its own failure returns.
 static void
 mem_rag_cb(const mem_fact_t *facts, size_t n_facts,
     const mem_msg_t *msgs, size_t n_msgs, void *user)
@@ -267,34 +254,44 @@ mem_rag_cb(const mem_fact_t *facts, size_t n_facts,
   mem_rag_state_t *st = user;
   char line[1400];
 
-  for(size_t i = 0; i < n_facts; i++)
-  {
-    char kind[32];
-    render_fact_kind_short(kind, sizeof(kind), facts[i].kind);
-    snprintf(line, sizeof(line),
-        "fact  %s/%s = %s  (conf=%.2f)",
-        kind, facts[i].fact_key, facts[i].fact_value,
-        (double)facts[i].confidence);
-    cmd_reply(st->ctx, line);
-    st->count++;
-  }
+  // Namespace-wide retrieval is message-only — facts are dossier-keyed
+  // and reached through /show dossier <name> facts.
+  (void)facts;
+  (void)n_facts;
 
+  // Best match first, with the cosine that earned it. Without the score
+  // a thin corpus looks identical to a good one: top-K is taken with no
+  // relevance floor, so a 0.05 hit prints exactly like a 0.9 hit.
   for(size_t i = 0; i < n_msgs; i++)
   {
+    char ts[32];
+    struct tm tm;
+    time_t when = msgs[i].ts;
+
+    if(when > 0 && localtime_r(&when, &tm) != NULL)
+      strftime(ts, sizeof(ts), "%Y-%m-%d %H:%M", &tm);
+    else
+      snprintf(ts, sizeof(ts), "%s", "(no ts)");
+
     snprintf(line, sizeof(line),
-        "msg   [%s] %s",
-        msgs[i].channel[0] ? msgs[i].channel : "(dm)",
+        "[%.3f] %s [%s] %s",
+        (double)msgs[i].score, ts,
+        msgs[i].channel[0] ? msgs[i].channel : "dm",
         msgs[i].text);
-    cmd_reply(st->ctx, line);
-    st->count++;
+    method_send(st->inst, st->target, line);
   }
+
+  if(n_msgs == 0)
+    method_send(st->inst, st->target, "(no hits)");
+
+  mem_free(st);
 }
 
 static void
 verb_llm_memories(const cmd_ctx_t *ctx, bot_inst_t *bot, const char *rest)
 {
   userns_t *ns = bot_get_userns(bot);
-  mem_rag_state_t st = { .ctx = ctx, .count = 0 };
+  mem_rag_state_t *st;
 
   if(ns == NULL) { cmd_reply(ctx, "bot has no userns bound"); return; }
 
@@ -346,14 +343,32 @@ verb_llm_memories(const cmd_ctx_t *ctx, bot_inst_t *bot, const char *rest)
     return;
   }
 
-  // Query path: RAG over facts + messages for this namespace.
-  if(memory_retrieve((int)ns->id, 0, rest, 10, mem_rag_cb, &st) != SUCCESS)
+  // Query path: semantic search over this namespace's conversation log.
+  // The callback fires on the llm worker thread after the query embed
+  // completes, so `ctx` is gone by then — snapshot the reply target into
+  // heap state the cb frees.
+  if(ctx->msg == NULL || ctx->msg->inst == NULL)
   {
-    cmd_reply(ctx, "retrieve failed");
+    cmd_reply(ctx, "internal error: no method context for async reply");
     return;
   }
-  if(st.count == 0)
-    cmd_reply(ctx, "(no hits)");
+
+  st = mem_alloc("chatbot", "mem_rag_state", sizeof(*st));
+
+  if(st == NULL)
+  {
+    cmd_reply(ctx, "memory_retrieve_ns alloc failed");
+    return;
+  }
+
+  st->inst = ctx->msg->inst;
+  snprintf(st->target, sizeof(st->target), "%s",
+      ctx->msg->channel[0] != '\0' ? ctx->msg->channel : ctx->msg->sender);
+
+  // No mem_free(st) on FAIL: memory_retrieve_ns delivers the callback on
+  // its failure paths too, and the callback already freed it.
+  if(memory_retrieve_ns((int)ns->id, rest, 10, mem_rag_cb, st) != SUCCESS)
+    clam(CLAM_WARN, "chatbot", "memories: retrieve failed for ns=%u", ns->id);
 }
 
 // ---- /show bot <name> stats --------------------------------------------

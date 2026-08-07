@@ -2581,7 +2581,7 @@ retrieve_cb(const mem_fact_t *facts, size_t n_facts,
 // Entry point.
 //   1. Captures a chatbot_req_t with everything needed to reply.
 //   2. Loads the active personality body.
-//   3. Calls memory_retrieve() to pull top-K facts + log snippets.
+//   3. Calls memory_retrieve_dossier() to pull top-K facts + log snippets.
 //   4. Builds system + user messages, submits a streaming chat request.
 //   5. On done_cb: forwards the final text via method_send(), logs
 //      EXCHANGE_OUT, and runs the NL-command bridge if enabled.

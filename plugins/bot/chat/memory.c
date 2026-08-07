@@ -340,7 +340,6 @@ memory_write_embedding(const char *table, const char *id_col, int64_t id,
 typedef struct
 {
   int64_t id;
-  bool    is_fact;
   char    model[MEM_EMBED_MODEL_SZ];
 } memory_embed_ctx_t;
 
@@ -348,8 +347,6 @@ static void
 memory_embed_done(const llm_embed_response_t *resp)
 {
   memory_embed_ctx_t *c = resp->user_data;
-  const char *table;
-  const char *id_col;
 
   if(!resp->ok || resp->n_vectors < 1 || resp->dim == 0)
   {
@@ -359,20 +356,20 @@ memory_embed_done(const llm_embed_response_t *resp)
     return;
   }
 
-  table = c->is_fact ? "user_fact_embeddings" : "conversation_embeddings";
-  id_col = c->is_fact ? "fact_id" : "msg_id";
-
-  memory_write_embedding(table, id_col, c->id, c->model,
-      resp->dim, resp->vectors[0]);
+  memory_write_embedding("conversation_embeddings", "msg_id",
+      c->id, c->model, resp->dim, resp->vectors[0]);
 
   mem_free(c);
 }
 
 // Submit an embed job if the embed model is configured. The caller has
 // already decided that this id/text is eligible for embedding.
+//
+// Only conversation_log rows are embedded. Facts are not: the dossier
+// store has no embedding table and its facts are retrieved by dossier
+// id, not by cosine.
 static void
-memory_submit_embed(int64_t id, bool is_fact,
-    const char *model, const char *text)
+memory_submit_embed(int64_t id, const char *model, const char *text)
 {
   const char *inputs[1] = { text };
   memory_embed_ctx_t *c;
@@ -385,8 +382,7 @@ memory_submit_embed(int64_t id, bool is_fact,
   if(c == NULL)
     return;
 
-  c->id      = id;
-  c->is_fact = is_fact;
+  c->id = id;
   snprintf(c->model, sizeof(c->model), "%s", model);
 
   if(llm_embed_submit(model, inputs, 1, memory_embed_done, c) != SUCCESS)
@@ -422,36 +418,6 @@ memory_run_ddl(const char *sql)
 static void
 memory_ensure_tables(void)
 {
-  memory_run_ddl(
-      "CREATE TABLE IF NOT EXISTS user_facts ("
-      " id           BIGSERIAL    PRIMARY KEY,"
-      " user_id      INTEGER      NOT NULL REFERENCES userns_user(id) ON DELETE CASCADE,"
-      " kind         SMALLINT     NOT NULL,"
-      " fact_key     VARCHAR(128) NOT NULL,"
-      " fact_value   TEXT         NOT NULL,"
-      " source       VARCHAR(32)  NOT NULL DEFAULT 'llm_extract',"
-      " channel      VARCHAR(128) NOT NULL DEFAULT '',"
-      " confidence   REAL         NOT NULL DEFAULT 0.6,"
-      " observed_at  TIMESTAMPTZ  NOT NULL DEFAULT NOW(),"
-      " last_seen    TIMESTAMPTZ  NOT NULL DEFAULT NOW(),"
-      " UNIQUE (user_id, kind, fact_key)"
-      ")");
-
-  memory_run_ddl(
-      "CREATE INDEX IF NOT EXISTS idx_user_facts_user"
-      " ON user_facts(user_id)");
-  memory_run_ddl(
-      "CREATE INDEX IF NOT EXISTS idx_user_facts_lastseen"
-      " ON user_facts(last_seen)");
-
-  memory_run_ddl(
-      "CREATE TABLE IF NOT EXISTS user_fact_embeddings ("
-      " fact_id  BIGINT      PRIMARY KEY REFERENCES user_facts(id) ON DELETE CASCADE,"
-      " model    VARCHAR(64) NOT NULL,"
-      " dim      INTEGER     NOT NULL,"
-      " vec      BYTEA       NOT NULL"
-      ")");
-
   memory_run_ddl(
       "CREATE TABLE IF NOT EXISTS conversation_log ("
       " id         BIGSERIAL    PRIMARY KEY,"
@@ -518,333 +484,14 @@ memory_ensure_tables(void)
       " END$$");
 }
 
-// Row parsers
-
-void
-memory_parse_fact_row(const db_result_t *r, uint32_t row, mem_fact_t *f)
-{
-  const char *v;
-
-  memset(f, 0, sizeof(*f));
-
-  v = db_result_get(r, row, 0);
-  if(v != NULL) f->id = (int64_t)strtoll(v, NULL, 10);
-
-  v = db_result_get(r, row, 1);
-  if(v != NULL) f->user_id = (int)strtol(v, NULL, 10);
-
-  v = db_result_get(r, row, 2);
-  if(v != NULL) f->kind = (mem_fact_kind_t)strtol(v, NULL, 10);
-
-  v = db_result_get(r, row, 3);
-  if(v != NULL) snprintf(f->fact_key, sizeof(f->fact_key), "%s", v);
-
-  v = db_result_get(r, row, 4);
-  if(v != NULL) snprintf(f->fact_value, sizeof(f->fact_value), "%s", v);
-
-  v = db_result_get(r, row, 5);
-  if(v != NULL) snprintf(f->source, sizeof(f->source), "%s", v);
-
-  v = db_result_get(r, row, 6);
-  if(v != NULL) snprintf(f->channel, sizeof(f->channel), "%s", v);
-
-  v = db_result_get(r, row, 7);
-  if(v != NULL) f->confidence = (float)strtod(v, NULL);
-
-  v = db_result_get(r, row, 8);
-  if(v != NULL) f->observed_at = (time_t)strtoll(v, NULL, 10);
-
-  v = db_result_get(r, row, 9);
-  if(v != NULL) f->last_seen = (time_t)strtoll(v, NULL, 10);
-}
-
-// Fact upsert
-
-bool
-memory_upsert_fact(const mem_fact_t *fact, mem_merge_t policy)
-{
-  db_result_t *res;
-  bool ok;
-  int64_t new_id;
-  char final_value[MEM_FACT_VALUE_SZ];
-  size_t used;
-  char *sql;
-  size_t cap;
-  char *e_key;
-  char *e_val;
-  char *e_src;
-  char *e_chan;
-
-  if(!memory_ready || fact == NULL)
-    return(FAIL);
-
-  e_key = db_escape(fact->fact_key);
-  e_val = db_escape(fact->fact_value);
-  e_src = db_escape(fact->source[0] ? fact->source : "llm_extract");
-  e_chan = db_escape(fact->channel);
-
-  if(e_key == NULL || e_val == NULL || e_src == NULL || e_chan == NULL)
-  {
-    if(e_key)  mem_free(e_key);
-    if(e_val)  mem_free(e_val);
-    if(e_src)  mem_free(e_src);
-    if(e_chan) mem_free(e_chan);
-    return(FAIL);
-  }
-
-  sql = mem_alloc("memory", "upsert_sql", MEM_SQL_SZ + MEM_FACT_VALUE_SZ * 2);
-  cap = MEM_SQL_SZ + MEM_FACT_VALUE_SZ * 2;
-
-  switch(policy)
-  {
-    case MEM_MERGE_REPLACE:
-      snprintf(sql, cap,
-          "INSERT INTO user_facts"
-          " (user_id, kind, fact_key, fact_value, source, channel, confidence)"
-          " VALUES (%d, %d, '%s', '%s', '%s', '%s', %f)"
-          " ON CONFLICT (user_id, kind, fact_key) DO UPDATE"
-          " SET fact_value = EXCLUDED.fact_value,"
-          "     source     = EXCLUDED.source,"
-          "     channel    = EXCLUDED.channel,"
-          "     confidence = EXCLUDED.confidence,"
-          "     last_seen  = NOW()",
-          fact->user_id, (int)fact->kind, e_key, e_val, e_src, e_chan,
-          (double)fact->confidence);
-      break;
-
-    case MEM_MERGE_HIGHER_CONF:
-      snprintf(sql, cap,
-          "INSERT INTO user_facts"
-          " (user_id, kind, fact_key, fact_value, source, channel, confidence)"
-          " VALUES (%d, %d, '%s', '%s', '%s', '%s', %f)"
-          " ON CONFLICT (user_id, kind, fact_key) DO UPDATE"
-          " SET fact_value = CASE WHEN EXCLUDED.confidence > user_facts.confidence"
-          "         THEN EXCLUDED.fact_value ELSE user_facts.fact_value END,"
-          "     source     = CASE WHEN EXCLUDED.confidence > user_facts.confidence"
-          "         THEN EXCLUDED.source     ELSE user_facts.source     END,"
-          "     channel    = CASE WHEN EXCLUDED.confidence > user_facts.confidence"
-          "         THEN EXCLUDED.channel    ELSE user_facts.channel    END,"
-          "     confidence = GREATEST(user_facts.confidence, EXCLUDED.confidence),"
-          "     last_seen  = NOW()",
-          fact->user_id, (int)fact->kind, e_key, e_val, e_src, e_chan,
-          (double)fact->confidence);
-      break;
-
-    case MEM_MERGE_APPEND_HISTORY:
-      snprintf(sql, cap,
-          "INSERT INTO user_facts"
-          " (user_id, kind, fact_key, fact_value, source, channel, confidence)"
-          " VALUES (%d, %d, '%s', '%s', '%s', '%s', %f)"
-          " ON CONFLICT (user_id, kind, fact_key) DO UPDATE"
-          " SET fact_value = user_facts.fact_value || E'\\n---\\n'"
-          "                  || EXCLUDED.fact_value,"
-          "     last_seen  = NOW(),"
-          "     confidence = GREATEST(user_facts.confidence, EXCLUDED.confidence)",
-          fact->user_id, (int)fact->kind, e_key, e_val, e_src, e_chan,
-          (double)fact->confidence);
-      break;
-
-    default:
-      mem_free(sql);
-      mem_free(e_key); mem_free(e_val); mem_free(e_src); mem_free(e_chan);
-      return(FAIL);
-  }
-
-  mem_free(e_key); mem_free(e_val); mem_free(e_src); mem_free(e_chan);
-
-  // Append RETURNING id, fact_value so we can embed the final value. In
-  // HIGHER_CONF no-op cases the row is unchanged but its id still returns.
-  used = strlen(sql);
-  snprintf(sql + used, cap - used, " RETURNING id, fact_value");
-
-  res = db_result_alloc();
-  ok = true;
-  new_id = 0;
-  final_value[0] = '\0';
-
-  if(db_query(sql, res) != SUCCESS || !res->ok)
-  {
-    clam(CLAM_WARN, "memory", "upsert_fact: %s",
-        res->error[0] ? res->error : "db_query failed");
-    ok = false;
-  }
-
-  else if(res->rows > 0)
-  {
-    const char *id_s = db_result_get(res, 0, 0);
-    const char *val  = db_result_get(res, 0, 1);
-    if(id_s != NULL) new_id = (int64_t)strtoll(id_s, NULL, 10);
-    if(val   != NULL) snprintf(final_value, sizeof(final_value), "%s", val);
-  }
-
-  db_result_free(res);
-  mem_free(sql);
-
-  if(ok)
-  {
-    mem_cfg_t cfg;
-
-    memory_stat_bump_facts();
-
-    memory_cfg_snapshot(&cfg);
-
-    if(new_id > 0 && cfg.enabled && cfg.embed_model[0] != '\0'
-       && final_value[0] != '\0')
-      memory_submit_embed(new_id, true, // is_fact
-          cfg.embed_model, final_value);
-  }
-
-  return(ok ? SUCCESS : FAIL);
-}
-
-// Fact read
-
-size_t
-memory_get_facts(int user_id, uint32_t kinds_mask,
-    mem_fact_t *out, size_t cap)
-{
-  db_result_t *res;
-  size_t n;
-  char sql[2048];
-  char kind_clause[256];
-
-  if(!memory_ready || out == NULL || cap == 0)
-    return(0);
-
-  // Build "kind IN (...)" clause, or accept all kinds if mask is ANY.
-  kind_clause[0] = '\0';
-
-  if(kinds_mask != MEM_FACT_KIND_ANY)
-  {
-    char buf[256];
-    size_t w = 0;
-    bool any = false;
-
-    w += (size_t)snprintf(buf + w, sizeof(buf) - w, " AND kind IN (");
-
-    for(uint32_t k = 0; k <= MEM_FACT_FREEFORM; k++)
-    {
-      if(kinds_mask & MEM_FACT_KIND_BIT(k))
-      {
-        w += (size_t)snprintf(buf + w, sizeof(buf) - w,
-            "%s%u", any ? "," : "", k);
-        any = true;
-      }
-    }
-
-    w += (size_t)snprintf(buf + w, sizeof(buf) - w, ")");
-
-    if(!any)
-      return(0);
-
-    snprintf(kind_clause, sizeof(kind_clause), "%s", buf);
-  }
-
-  snprintf(sql, sizeof(sql),
-      "SELECT " MEMORY_FACT_SELECT_COLS
-      " FROM user_facts WHERE user_id = %d%s"
-      " ORDER BY last_seen DESC LIMIT %zu",
-      user_id, kind_clause, cap);
-
-  res = db_result_alloc();
-  n = 0;
-
-  if(db_query(sql, res) == SUCCESS && res->ok)
-  {
-    for(uint32_t i = 0; i < res->rows && n < cap; i++)
-      memory_parse_fact_row(res, i, &out[n++]);
-  }
-
-  else if(res->error[0] != '\0')
-    clam(CLAM_WARN, "memory", "get_facts: %s", res->error);
-
-  db_result_free(res);
-  return(n);
-}
-
-// Forget
-
-bool
-memory_forget_fact(int64_t fact_id)
-{
-  db_result_t *res;
-  bool ok;
-  char sql[128];
-
-  if(!memory_ready)
-    return(FAIL);
-
-  snprintf(sql, sizeof(sql),
-      "DELETE FROM user_facts WHERE id = %" PRId64, fact_id);
-
-  res = db_result_alloc();
-  ok = (db_query(sql, res) == SUCCESS) && res->ok;
-
-  if(!ok && res->error[0] != '\0')
-    clam(CLAM_WARN, "memory", "forget_fact: %s", res->error);
-
-  db_result_free(res);
-
-  if(ok)
-    memory_stat_bump_forgets();
-
-  return(ok ? SUCCESS : FAIL);
-}
-
-bool
-memory_forget_user(int user_id)
-{
-  db_result_t *res;
-  char sql[256];
-  bool ok;
-
-  if(!memory_ready)
-    return(FAIL);
-
-  // FK ON DELETE CASCADE / SET NULL removes user_facts + conversation_log
-  // rows for this user (embeddings cascade from those). We explicitly
-  // DELETE from user_facts and conversation_log here so the rows go even
-  // if the user row still exists in userns_user.
-  ok = true;
-
-  snprintf(sql, sizeof(sql),
-      "DELETE FROM user_facts WHERE user_id = %d", user_id);
-
-  res = db_result_alloc();
-
-  if(db_query(sql, res) != SUCCESS || !res->ok)
-  {
-    clam(CLAM_WARN, "memory", "forget_user (facts): %s", res->error);
-    ok = false;
-  }
-
-  db_result_free(res);
-
-  snprintf(sql, sizeof(sql),
-      "DELETE FROM conversation_log WHERE user_id = %d", user_id);
-
-  res = db_result_alloc();
-
-  if(db_query(sql, res) != SUCCESS || !res->ok)
-  {
-    clam(CLAM_WARN, "memory", "forget_user (log): %s", res->error);
-    ok = false;
-  }
-
-  db_result_free(res);
-
-  if(ok)
-    memory_stat_bump_forgets();
-
-  return(ok ? SUCCESS : FAIL);
-}
-
 // Dossier-keyed facts
 //
-// Everything below mirrors the user_facts API one-to-one, with the FK
-// retargeted to dossier.id. Embedding eligibility for dossier facts is
-// intentionally deferred -- the llm bot's RAG plumbing in Chunk C
-// decides whether to wire dossier_facts through the embed pipeline.
+// The only fact store. Facts hang off dossier.id -- what the bot has
+// learned about a human -- never off userns_user.id, which identifies
+// an auth principal and says nothing about who was talking.
+//
+// Facts carry no embeddings: they are retrieved by dossier id, and only
+// conversation_log rows are cosine-scanned.
 
 // Parse a single dossier_facts row produced by MEMORY_DOSSIER_FACT_SELECT_COLS.
 void
@@ -1186,8 +833,7 @@ memory_log_message(const mem_msg_t *msg)
     }
 
     if(do_embed)
-      memory_submit_embed(new_id, false, // is_fact
-          cfg.embed_model, msg->text);
+      memory_submit_embed(new_id, cfg.embed_model, msg->text);
   }
 
 cleanup:
@@ -1284,7 +930,7 @@ memory_decay_sweep(void)
   //                          * ln(2) / half_life_days)
   // We fold the constant 86400 into the division (Postgres side).
   snprintf(sql, sizeof(sql),
-      "DELETE FROM user_facts"
+      "DELETE FROM dossier_facts"
       " WHERE source <> 'admin_seed'"
       "   AND confidence * exp("
       "         - (EXTRACT(EPOCH FROM NOW() - observed_at) / 86400.0)"
@@ -1451,30 +1097,14 @@ memory_test_reset_stats(void)
 // llm_embed_submit path into unit tests -- the retrieval logic (cosine
 // scan, top-K, join filters) is what we actually want to exercise.
 bool
-memory_test_inject_embedding(int64_t id, bool is_fact,
-    const char *model, uint32_t dim, const float *vec)
+memory_test_inject_embedding(int64_t id, const char *model,
+    uint32_t dim, const float *vec)
 {
   if(!memory_ready || model == NULL || vec == NULL || dim == 0)
     return(FAIL);
 
-  const char *table  = is_fact ? "user_fact_embeddings" : "conversation_embeddings";
-  const char *id_col = is_fact ? "fact_id" : "msg_id";
-
-  return(memory_write_embedding(table, id_col, id, model, dim, vec));
-}
-
-bool
-memory_test_retrieve_with_vec(int ns_id, int user_id_or_0,
-    const char *model, uint32_t dim, const float *query_vec,
-    uint32_t top_k, memory_retrieve_cb_t cb, void *user)
-{
-  if(cb == NULL || model == NULL || query_vec == NULL || dim == 0)
-    return(FAIL);
-
-  memory_retrieve_with_vec(ns_id, user_id_or_0, model, dim,
-      query_vec, top_k, cb, user);
-
-  return(SUCCESS);
+  return(memory_write_embedding("conversation_embeddings", "msg_id",
+      id, model, dim, vec));
 }
 
 #endif // MEMORY_TEST_HOOKS

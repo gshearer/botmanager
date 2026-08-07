@@ -142,7 +142,7 @@ Flip `bot.<name>.behavior.chat.enabled` and the same bot also
 converses: an LLM-powered persona that classifies incoming lines as
 WITNESS or EXCHANGE_IN, logs
 them through a memory subsystem (`conversation_log` +
-`user_facts`/`dossier_facts` + embedding tables), and decides
+`dossier_facts` + embedding tables), and decides
 whether to speak via a pure speak-policy function. When it replies,
 RAG-assembled context — facts, recent conversation, knowledge
 chunks — is fenced into the system prompt and a streaming chat

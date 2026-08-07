@@ -142,12 +142,15 @@ CREATE TABLE IF NOT EXISTS personalities (
 -- personality: set `bot.<name>.corpus` to a semicolon-separated
 -- list of corpus names to enable retrieval. See KNOWLEDGE.md.
 
--- The memory subsystem's tables (user_facts, user_fact_embeddings,
--- conversation_log, conversation_embeddings) used to be declared here.
--- Chunk R1 re-homed the memory subsystem into plugins/bot/chat/ and
+-- The memory subsystem's tables (conversation_log,
+-- conversation_embeddings) used to be declared here. Chunk R1 re-homed
+-- the memory subsystem into plugins/bot/chat/ and
 -- memory_register_config() already ensures these tables idempotently at
 -- plugin init time, so a fresh Postgres only grows them once the chat
 -- plugin loads. See plugins/bot/chat/MEMSTORE.md.
+--
+-- The user-keyed fact store (user_facts, user_fact_embeddings) was
+-- deleted 2026-08-07: facts hang off a dossier, not a userns_user.
 
 -- Dossiers: the llm bot's single source of truth for participant
 -- memory. A dossier represents one real person observed across chat
@@ -159,7 +162,7 @@ CREATE TABLE IF NOT EXISTS personalities (
 -- not declared here.
 
 -- Knowledge store: corpus-scoped RAG chunks for per-persona external
--- knowledge (Arch wiki, SEP, etc.). Parallel to user_facts /
+-- knowledge (Arch wiki, SEP, etc.). Parallel to dossier_facts /
 -- conversation_log; same float32 LE BYTEA + cosine retrieval machinery.
 -- See KNOWLEDGE.md and engine/inference.h, both under
 -- plugins/extension/inference/.

@@ -8,7 +8,7 @@
 
 // Public types
 
-// Fact kinds: stored as SMALLINT in user_facts.kind.
+// Fact kinds: stored as SMALLINT in dossier_facts.kind.
 typedef enum
 {
   MEM_FACT_PREFERENCE = 0,
@@ -19,7 +19,7 @@ typedef enum
   MEM_FACT_FREEFORM   = 5
 } mem_fact_kind_t;
 
-// Mask helper: matches every fact kind in memory_get_facts().
+// Mask helper: matches every fact kind in memory_get_dossier_facts().
 #define MEM_FACT_KIND_ANY  0xFFFFFFFFu
 
 // Convert kind enum to a bit in a kinds mask.
@@ -33,7 +33,7 @@ typedef enum
   MEM_MSG_EXCHANGE_OUT = 2    // bot's own reply
 } mem_msg_kind_t;
 
-// Merge policies for memory_upsert_fact().
+// Merge policies for memory_upsert_dossier_fact().
 typedef enum
 {
   MEM_MERGE_REPLACE,          // overwrite value unconditionally
@@ -41,8 +41,9 @@ typedef enum
   MEM_MERGE_APPEND_HISTORY    // keep old, append new value with a separator
 } mem_merge_t;
 
-// A single fact row. Strings are caller-owned for upsert; for reads the
-// storage is populated by the library and valid for the caller's buffer.
+// A single fact row as delivered to a retrieval callback. Facts are
+// stored dossier-keyed (mem_dossier_fact_t); this is the flattened
+// shape the prompt assembler consumes, so it carries no owning id.
 #define MEM_FACT_KEY_SZ    128
 #define MEM_FACT_VALUE_SZ  1024
 #define MEM_FACT_SOURCE_SZ 32
@@ -50,8 +51,7 @@ typedef enum
 
 typedef struct
 {
-  int64_t          id;                             // 0 on upsert = new
-  int              user_id;                        // userns_user.id
+  int64_t          id;
   mem_fact_kind_t  kind;
   char             fact_key[MEM_FACT_KEY_SZ];
   char             fact_value[MEM_FACT_VALUE_SZ];
@@ -105,6 +105,10 @@ typedef struct
   // n_referenced == 0 (preserves "not computed" vs "computed and empty").
   int64_t         referenced_dossiers[MEM_MSG_REFS_MAX];
   uint8_t         n_referenced;
+  // Cosine similarity to the query, set only when this row arrived via a
+  // semantic-retrieval path. 0.0 on every other path (log writes, name-
+  // mention fetches), where the field is meaningless.
+  float           score;
 } mem_msg_t;
 
 // Per-line truncation cap on each recent-own-replies excerpt spliced
@@ -178,25 +182,17 @@ size_t memory_recent_own_replies(const char *bot_name, const char *method,
 // msg: message to log (may not be NULL)
 void memory_log_message(const mem_msg_t *msg);
 
-// Facts
-
-// Upsert a fact, deduplicating by (user_id, kind, fact_key).
-// returns: SUCCESS or FAIL
-// fact: fact to upsert (may not be NULL)
-// policy: merge behavior on conflict
-bool memory_upsert_fact(const mem_fact_t *fact, mem_merge_t policy);
-
-size_t memory_get_facts(int user_id, uint32_t kinds_mask,
-    mem_fact_t *out, size_t cap);
-
-bool memory_forget_fact(int64_t fact_id);
-
 // Dossier-keyed facts (llm bot memory)
+//
+// Facts are keyed on dossier.id, never on userns_user.id: a dossier is
+// what the bot has learned about a human, while a userns user is an
+// auth principal. The user-keyed store these mirrored was deleted once
+// it was established that nothing had written to it since dossiers
+// landed.
 
 // Upsert a dossier-keyed fact, deduplicating by (dossier_id, kind,
-// fact_key). Mirrors memory_upsert_fact semantics exactly, including
-// merge policies. Dossier FK violations are reported and treated as
-// FAIL (no row inserted).
+// fact_key). Dossier FK violations are reported and treated as FAIL
+// (no row inserted).
 //
 // returns: SUCCESS or FAIL
 // fact: fact to upsert (may not be NULL)
@@ -211,22 +207,31 @@ size_t memory_get_dossier_facts(int64_t dossier_id, uint32_t kinds_mask,
 
 bool memory_forget_dossier_fact(int64_t fact_id);
 
-// Delete every fact, log entry, and embedding row for the given user
-// via FK ON DELETE CASCADE on userns_user.
-// returns: SUCCESS or FAIL
-bool memory_forget_user(int user_id);
+// Retrieval
 
-// Retrieval (Chunk D placeholder)
-
-// Retrieval callback: delivered once per memory_retrieve() call. Facts
+// Retrieval callback: delivered exactly once per retrieve call. Facts
 // and msgs arrays are valid for the duration of the callback only.
+//
+// THREADING: the callback normally fires from the llm worker thread
+// after the query embed completes, i.e. long after the submitting call
+// returned. `user` must therefore be heap-owned and must not be a stack
+// object belonging to the caller's frame. It fires synchronously, on
+// the caller's thread, only when memory is disabled or no embed model
+// is configured — so a caller may not assume either ordering.
 typedef void (*memory_retrieve_cb_t)(const mem_fact_t *facts, size_t n_facts,
     const mem_msg_t *msgs, size_t n_msgs, void *user);
 
-// In Chunk C this is a synchronous stub: cb fires immediately with
-// zero results, before the call returns.
+// Namespace-wide semantic search over conversation_log. Delivers
+// messages only — facts are dossier-keyed and reached through
+// memory_retrieve_dossier().
+//
+// OWNERSHIP: `cb` is delivered exactly once on EVERY path, including
+// each path that returns FAIL. A caller that heap-allocates `user` must
+// therefore let the callback free it and must NOT free it itself on a
+// FAIL return — that is a double free. FAIL means "the search did not
+// run", not "the callback did not fire".
 // returns: SUCCESS or FAIL
-bool memory_retrieve(int ns_id, int user_id_or_0, const char *query,
+bool memory_retrieve_ns(int ns_id, const char *query,
     uint32_t top_k, memory_retrieve_cb_t cb, void *user);
 
 bool memory_retrieve_dossier(int ns_id, int64_t dossier_id,
@@ -241,21 +246,6 @@ void memory_decay_sweep(void);
 
 void memory_get_stats(memory_stats_t *out);
 
-// /show user verb helpers — invoked by cmd_show_user (userns_cmd.c).
-// Caller resolves the namespace; helpers handle user lookup + render.
-
-struct cmd_ctx;
-struct userns;
-
-void memory_show_user_facts(const struct cmd_ctx *ctx,
-    struct userns *ns, const char *username);
-
-void memory_show_user_log(const struct cmd_ctx *ctx,
-    struct userns *ns, const char *username, uint32_t limit);
-
-void memory_show_user_rag(const struct cmd_ctx *ctx,
-    struct userns *ns, const char *username, const char *query);
-
 // Test hooks (MEMORY_TEST_HOOKS only)
 
 #ifdef MEMORY_TEST_HOOKS
@@ -267,15 +257,8 @@ bool memory_test_db_ok(void);
 // Test-only: reset in-memory stats counters to zero.
 void memory_test_reset_stats(void);
 
-bool memory_test_inject_embedding(int64_t id, bool is_fact,
-    const char *model, uint32_t dim, const float *vec);
-
-// Test-only: synchronous retrieve that skips the llm_embed_submit query
-// path and uses a caller-supplied query vector. Cosine-scans both
-// embedding tables, invokes the callback once, returns SUCCESS.
-bool memory_test_retrieve_with_vec(int ns_id, int user_id_or_0,
-    const char *model, uint32_t dim, const float *query_vec,
-    uint32_t top_k, memory_retrieve_cb_t cb, void *user);
+bool memory_test_inject_embedding(int64_t id, const char *model,
+    uint32_t dim, const float *vec);
 
 #endif // MEMORY_TEST_HOOKS
 

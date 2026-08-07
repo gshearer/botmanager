@@ -155,10 +155,8 @@ static const cmd_arg_desc_t ad_set_user_groupdesc[] = {
   { "description", CMD_ARG_NONE,  CMD_ARG_REQUIRED | CMD_ARG_REST, 0,               NULL },
 };
 
-// /show subcommand argument descriptors. The dispatched verbs (facts,
-// log, rag) now live as separate child commands under /show/user
-// registered by the chat plugin, so this parent only takes an optional
-// username.
+// /show subcommand argument descriptors. /show user takes a username
+// and nothing else — it has no verbs.
 static const cmd_arg_desc_t ad_show_user[] = {
   { "username", CMD_ARG_ALNUM, CMD_ARG_OPTIONAL, USERNS_USER_SZ, NULL },
 };
@@ -753,10 +751,9 @@ show_user_mfa_cb(const char *pattern, void *data)
   st->count++;
 }
 
-// /show user <name> -- single-user detail. The memory-backed verbs
-// (/show user facts|log|rag <name>) were re-homed into the text method
-// when the memory subsystem moved out of core (R1); they now register
-// as children of /show/user from plugins/bot/chat/user_show.c.
+// /show user <name> -- single-user detail. This is an auth view only:
+// what the bot has *learned* about a human hangs off a dossier, not a
+// userns user, and is read with /show dossier <name>.
 
 static void
 cmd_show_user(const cmd_ctx_t *ctx)
@@ -785,7 +782,7 @@ cmd_show_user(const cmd_ctx_t *ctx)
         "usage: /show user <username>");
     cmd_reply(ctx,
         CLR_GRAY "(use /show users to list all users;"
-        " /show user <v> <name> for facts|log|rag)" CLR_RESET);
+        " /show dossier <name> for what the bot has learned)" CLR_RESET);
     return;
   }
 
@@ -1266,14 +1263,14 @@ userns_register_commands(void)
       USERNS_GROUP_ADMIN, 100, CMD_SCOPE_ANY, METHOD_T_ANY,
       cmd_show_users, NULL, "show", "us", NULL, 0, NULL, NULL);
 
-  // /show user <name> [<verb>] — single-user detail or verb dispatch.
+  // /show user <name> — single-user detail.
   cmd_register("userns", "user",
       "show user <username>",
-      "Show user details or dispatch a verb",
+      "Show user details",
       "With <username>, displays UUID, description, group memberships,\n"
       "and MFA patterns. For the namespace-wide user list, use\n"
-      "/show users. The memory-backed verbs (facts, log, rag) are\n"
-      "registered by the chat plugin as /show user facts|log|rag.",
+      "/show users. This is the auth record only — for the facts and\n"
+      "conversation the bot has accumulated, use /show dossier <name>.",
       USERNS_GROUP_ADMIN, 100, CMD_SCOPE_ANY, METHOD_T_ANY,
       cmd_show_user, NULL, "show", "u", ad_show_user,
       (uint8_t)(sizeof(ad_show_user) / sizeof(ad_show_user[0])), NULL, NULL);

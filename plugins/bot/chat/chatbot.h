@@ -478,12 +478,6 @@ bool chatbot_dossiersweep_cmd_register(void);
 // Called from chatbot plugin init. Implemented in show_verbs.c.
 bool chatbot_show_verbs_register(void);
 
-// Register /show user {facts,log,rag} as chat-plugin-local children of
-// /show/user. Called from chatbot plugin init after cmd_init has set up
-// the tree. Implemented in user_show.c. The verbs moved out of core
-// when the memory subsystem re-homed into the chat plugin in R1.
-bool chatbot_user_show_verbs_register(void);
-
 // ---- chatbot.c ----
 
 mem_msg_kind_t chatbot_classify_message(const method_msg_t *msg,

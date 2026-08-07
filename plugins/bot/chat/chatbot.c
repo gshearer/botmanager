@@ -2431,17 +2431,6 @@ chatbot_plugin_init(void)
     return(FAIL);
   }
 
-  if(chatbot_user_show_verbs_register() != SUCCESS)
-  {
-    chatbot_cmds_unregister();
-    chatbot_volunteer_deinit();
-    chatbot_reply_deinit();
-    dossier_exit();
-    extract_exit();
-    memory_exit();
-    return(FAIL);
-  }
-
   // The command half's own surface (identify, deauth, register, id).
   // Last in, first out: it owns no subsystem state, so a failure here
   // unwinds the conversational half exactly as the steps above do.

@@ -154,42 +154,15 @@ memory_parse_msg_row(const db_result_t *r, uint32_t row, mem_msg_t *m)
   v = db_result_get(r, row, 9); if(v) m->ts = (time_t)strtoll(v, NULL, 10);
 }
 
+// Hydrate cosine hits into full conversation_log rows and deliver them.
+// Facts are never delivered here: they are dossier-keyed and have no
+// embedding table, so the only cosine-searchable corpus is the log.
 static void
-memory_deliver_hits(const memory_hit_t *fact_hits, size_t n_facts,
-    const memory_hit_t *msg_hits,  size_t n_msgs,
+memory_deliver_hits(const memory_hit_t *msg_hits, size_t n_msgs,
     memory_retrieve_cb_t cb, void *user)
 {
-  mem_fact_t *facts = NULL;
   mem_msg_t  *msgs  = NULL;
-  size_t      nf    = 0;
   size_t      nm    = 0;
-
-  if(n_facts > 0)
-  {
-    char in_list[32 * 64];
-    db_result_t *res;
-    char sql[2048];
-
-    memory_build_in_list(in_list, sizeof(in_list), fact_hits, n_facts);
-
-    snprintf(sql, sizeof(sql),
-        "SELECT " MEMORY_FACT_SELECT_COLS
-        " FROM user_facts WHERE id IN %s", in_list);
-
-    res = db_result_alloc();
-
-    if(db_query(sql, res) == SUCCESS && res->ok && res->rows > 0)
-    {
-      facts = mem_alloc("memory", "rag_facts",
-          sizeof(mem_fact_t) * res->rows);
-
-      if(facts != NULL)
-        for(uint32_t i = 0; i < res->rows; i++)
-          memory_parse_fact_row(res, i, &facts[nf++]);
-    }
-
-    db_result_free(res);
-  }
 
   if(n_msgs > 0)
   {
@@ -199,6 +172,10 @@ memory_deliver_hits(const memory_hit_t *fact_hits, size_t n_facts,
 
     memory_build_in_list(in_list, sizeof(in_list), msg_hits, n_msgs);
 
+    // `IN (...)` returns rows in whatever order Postgres likes, which is
+    // not the ranking msg_hits already holds. Hydrate into a scratch
+    // array, then emit in hit order so the caller sees best-match-first
+    // and carries the cosine that earned each row its place.
     snprintf(sql, sizeof(sql),
         "SELECT " MEMORY_MSG_SELECT_COLS
         " FROM conversation_log WHERE id IN %s", in_list);
@@ -207,72 +184,62 @@ memory_deliver_hits(const memory_hit_t *fact_hits, size_t n_facts,
 
     if(db_query(sql, res) == SUCCESS && res->ok && res->rows > 0)
     {
+      mem_msg_t *rows = mem_alloc("memory", "rag_rows",
+          sizeof(mem_msg_t) * res->rows);
+
       msgs = mem_alloc("memory", "rag_msgs",
           sizeof(mem_msg_t) * res->rows);
 
-      if(msgs != NULL)
+      if(rows != NULL && msgs != NULL)
+      {
         for(uint32_t i = 0; i < res->rows; i++)
-          memory_parse_msg_row(res, i, &msgs[nm++]);
+          memory_parse_msg_row(res, i, &rows[i]);
+
+        for(size_t h = 0; h < n_msgs && nm < res->rows; h++)
+          for(uint32_t i = 0; i < res->rows; i++)
+            if(rows[i].id == msg_hits[h].id)
+            {
+              msgs[nm] = rows[i];
+              msgs[nm].score = msg_hits[h].score;
+              nm++;
+              break;
+            }
+      }
+
+      if(rows != NULL) mem_free(rows);
     }
 
     db_result_free(res);
   }
 
-  cb(facts, nf, msgs, nm, user);
+  cb(NULL, 0, msgs, nm, user);
 
-  if(facts != NULL) mem_free(facts);
-  if(msgs  != NULL) mem_free(msgs);
+  if(msgs != NULL) mem_free(msgs);
 }
 
 // Run the cosine scan + delivery with a pre-computed query vector.
 static void
-memory_retrieve_with_vec(int ns_id, int user_id_or_0,
-    const char *model, uint32_t dim, const float *qvec, uint32_t top_k,
+memory_retrieve_ns_with_vec(int ns_id, const char *model, uint32_t dim,
+    const float *qvec, uint32_t top_k,
     memory_retrieve_cb_t cb, void *user)
 {
-  memory_hit_t fact_buf[64];
+  char         join[512];
   memory_hit_t msg_buf[64];
-  size_t       n_facts;
   size_t       n_msgs;
 
   if(top_k == 0 || top_k > 64)
     top_k = 8;
 
-  n_facts = 0;
   n_msgs = 0;
 
-  {
-    char join[512];
-    if(user_id_or_0 > 0)
-      snprintf(join, sizeof(join),
-          "FROM user_fact_embeddings e JOIN user_facts x"
-          " ON e.fact_id = x.id WHERE x.user_id = %d", user_id_or_0);
-    else
-      snprintf(join, sizeof(join),
-          "FROM user_fact_embeddings e JOIN user_facts x"
-          " ON e.fact_id = x.id WHERE TRUE");
+  snprintf(join, sizeof(join),
+      "FROM conversation_embeddings e JOIN conversation_log x"
+      " ON e.msg_id = x.id WHERE x.ns_id = %d", ns_id);
 
-    memory_scan_embeddings(join, "fact_id", model, dim, qvec,
-        fact_buf, top_k, &n_facts);
-  }
+  memory_scan_embeddings(join, "msg_id", model, dim, qvec,
+      msg_buf, top_k, &n_msgs);
 
-  {
-    char join[512];
-    if(user_id_or_0 > 0)
-      snprintf(join, sizeof(join),
-          "FROM conversation_embeddings e JOIN conversation_log x"
-          " ON e.msg_id = x.id WHERE x.ns_id = %d AND x.user_id = %d",
-          ns_id, user_id_or_0);
-    else
-      snprintf(join, sizeof(join),
-          "FROM conversation_embeddings e JOIN conversation_log x"
-          " ON e.msg_id = x.id WHERE x.ns_id = %d", ns_id);
-
-    memory_scan_embeddings(join, "msg_id", model, dim, qvec,
-        msg_buf, top_k, &n_msgs);
-  }
-
-  memory_deliver_hits(fact_buf, n_facts, msg_buf, n_msgs, cb, user);
+  memory_deliver_hits(msg_buf, n_msgs, cb, user);
 }
 
 // Hydrate conversation_log rows by id. Returns rows matching any id in
@@ -420,7 +387,6 @@ memory_recall_scan_convo(int ns_id, int64_t dossier_id,
 typedef struct
 {
   int                   ns_id;
-  int                   user_id_or_0;
   uint32_t              top_k;
   char                  model[MEM_EMBED_MODEL_SZ];
   memory_retrieve_cb_t  cb;
@@ -428,7 +394,7 @@ typedef struct
 } memory_retrieval_ctx_t;
 
 static void
-memory_retrieve_embed_done(const llm_embed_response_t *resp)
+memory_retrieve_ns_embed_done(const llm_embed_response_t *resp)
 {
   memory_retrieval_ctx_t *c = resp->user_data;
 
@@ -441,14 +407,14 @@ memory_retrieve_embed_done(const llm_embed_response_t *resp)
     return;
   }
 
-  memory_retrieve_with_vec(c->ns_id, c->user_id_or_0,
-      c->model, resp->dim, resp->vectors[0], c->top_k, c->cb, c->user);
+  memory_retrieve_ns_with_vec(c->ns_id, c->model, resp->dim,
+      resp->vectors[0], c->top_k, c->cb, c->user);
 
   mem_free(c);
 }
 
 bool
-memory_retrieve(int ns_id, int user_id_or_0, const char *query,
+memory_retrieve_ns(int ns_id, const char *query,
     uint32_t top_k, memory_retrieve_cb_t cb, void *user)
 {
   const char *inputs[1] = { query };
@@ -476,15 +442,14 @@ memory_retrieve(int ns_id, int user_id_or_0, const char *query,
     return(FAIL);
   }
 
-  c->ns_id        = ns_id;
-  c->user_id_or_0 = user_id_or_0;
-  c->top_k        = top_k ? top_k : cfg.rag_top_k;
-  c->cb           = cb;
-  c->user         = user;
+  c->ns_id = ns_id;
+  c->top_k = top_k ? top_k : cfg.rag_top_k;
+  c->cb    = cb;
+  c->user  = user;
   snprintf(c->model, sizeof(c->model), "%s", cfg.embed_model);
 
   if(llm_embed_submit(cfg.embed_model, inputs, 1,
-      memory_retrieve_embed_done, c) != SUCCESS)
+      memory_retrieve_ns_embed_done, c) != SUCCESS)
   {
     cb(NULL, 0, NULL, 0, user);
     mem_free(c);
@@ -500,7 +465,6 @@ memory_pf_to_fact(const mem_dossier_fact_t *pf, mem_fact_t *out)
 {
   memset(out, 0, sizeof(*out));
   out->id          = pf->id;
-  out->user_id     = 0;
   out->kind        = pf->kind;
   out->confidence  = pf->confidence;
   out->observed_at = pf->observed_at;
