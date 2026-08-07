@@ -210,8 +210,12 @@ traceback in `journalctl -u reachy-mini-daemon` rather than a clean startup.
 ⭑ Worth knowing when judging the amount: `kokorod` peak-normalises to −3 dBFS
 (deliberately — see §C3, Kokoro is inaudible over the motors otherwise), which
 pins `_loudness_gain` at its maximum of 1.0 for essentially every syllable. So
-the wobble currently has **no dynamic range at all**; raising `SWAY_DB_HIGH`
-would give it some, and is filed unqueued in `TODO.md §F`.
+the wobble currently has **no dynamic range at all**. The fix is queued as
+`TODO.md RCH-SWAY-1`, and it works on **our** side — lowering kokorod's
+normalisation target, not raising the daemon's `SWAY_DB_HIGH` — because the
+operator would rather not carry vendor patches. Whether that is reachable
+turns on one unmeasured thing: how many dB the robot's `volume` control
+actually buys between 90 and 100.
 
 ---
 
