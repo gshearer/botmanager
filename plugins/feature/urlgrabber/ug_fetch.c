@@ -631,6 +631,30 @@ ug_fetch_submit(ug_fetch_ctx_t *fc, const char *ua)
     mem_free(fc);
 }
 
+// Spend the single retry `fc` is allowed, wearing the link-preview crawler's
+// name; `reason` names the trigger for the log. Returns false when the retry
+// is unavailable — already spent, or declined by the operator — leaving the
+// caller to drop as it would have. On true, ownership of `fc` has passed to
+// the new request and the caller must not touch it again.
+static bool
+ug_retry_as_crawler(ug_fetch_ctx_t *fc, const char *reason)
+{
+  const char *crawler;
+
+  if(fc->retried)
+    return(false);
+
+  if((crawler = ug_crawler_agent()) == NULL)
+    return(false);
+
+  clam(CLAM_INFO, UG_CTX, "%s: %s, retrying as a link-preview crawler",
+      fc->host, reason);
+
+  fc->retried = true;
+  ug_fetch_submit(fc, crawler);
+  return(true);
+}
+
 // Completion callback — runs on the curl worker thread, so it stays fast:
 // parse, format, hand the line to the method layer, free the context.
 static void
@@ -687,29 +711,27 @@ ug_fetch_done(const curl_response_t *resp)
   // and its <title> names the site rather than the page. Some such sites
   // keep the real markup for a named link-preview crawler — which is the one
   // thing we honestly are — so spend exactly one more request saying so.
-  if(!fc->retried && ug_is_challenge(resp->body, resp->body_len))
+  if(ug_is_challenge(resp->body, resp->body_len))
   {
-    const char *crawler = ug_crawler_agent();
+    if(ug_retry_as_crawler(fc, "JavaScript challenge"))
+      return;                      // ownership passed; must not fall through
 
-    if(crawler == NULL)
-    {
-      clam(CLAM_DEBUG, UG_CTX,
-          "%s: JavaScript challenge and crawler_agent declined, skipped",
-          fc->host);
-      goto out;
-    }
-
-    clam(CLAM_INFO, UG_CTX,
-        "%s: JavaScript challenge, retrying as a link-preview crawler",
+    clam(CLAM_DEBUG, UG_CTX, "%s: JavaScript challenge, not retried, skipped",
         fc->host);
-
-    fc->retried = true;
-    ug_fetch_submit(fc, crawler);  // takes ownership; must not fall through
-    return;
+    goto out;
   }
 
+  // A page that yields no title at all is the one place a retry is free: we
+  // are about to say nothing, so the worst a second attempt can do is leave
+  // us exactly as silent. That costs no site its title — a page the browser
+  // identity reads fine never reaches this branch — and it picks up the
+  // sites that serve a title only to a crawler without ever announcing a
+  // challenge (cnn.com and imdb.com, measured 2026-08-06).
   if(!ug_extract_title(resp->body, resp->body_len, title, sizeof(title)))
   {
+    if(ug_retry_as_crawler(fc, "no <title> in body"))
+      return;                      // ownership passed; must not fall through
+
     clam(CLAM_DEBUG, UG_CTX, "%s: no <title> in body, skipped", fc->host);
     goto out;
   }
