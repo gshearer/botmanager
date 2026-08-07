@@ -335,14 +335,15 @@ irc_handle_privmsg(irc_state_t *st, const irc_parsed_msg_t *p)
   char target[METHOD_CHANNEL_SZ];
   const char *body;
 
-  // Update context cache with the sender's user@host — consumers
-  // build "nick!<ctx>" and need the full MFA triple.
+  // Refresh the sender's user@host — consumers build "nick!<ctx>" and
+  // need the full MFA triple. A line is the freshest evidence there is,
+  // so it overwrites whatever JOIN or WHO recorded earlier.
   if(p->user[0] != '\0' && p->host[0] != '\0')
   {
-    char uh[IRC_NICK_SZ + IRC_HOST_SZ + 2];
+    char uh[IRC_USERHOST_SZ];
 
     snprintf(uh, sizeof(uh), "%s@%s", p->user, p->host);
-    irc_ctx_update(st, p->nick, uh);
+    irc_user_seen(st, p->nick, uh);
   }
 
   // Build message context on stack.
@@ -807,14 +808,15 @@ irc_handle_topic332(irc_state_t *st, const irc_parsed_msg_t *pp)
 }
 
 // RPL_WHOREPLY (352): "<me> <channel> <user> <host> <server> <nick> ..."
-// One reply per member; each seeds the nick -> user@host cache.
+// One reply per member. The WHO fired on join is what fills in the
+// user@host that NAMES (nicks only) could not supply.
 static void
 irc_handle_whoreply(irc_state_t *st, const irc_parsed_msg_t *p)
 {
   char user[IRC_NICK_SZ] = {0};
   char host[IRC_HOST_SZ] = {0};
   char nick[IRC_NICK_SZ] = {0};
-  char uh[IRC_NICK_SZ + IRC_HOST_SZ + 2];
+  char uh[IRC_USERHOST_SZ];
   const char *tok = p->params;
   uint32_t field = 0;
 
@@ -854,7 +856,7 @@ irc_handle_whoreply(irc_state_t *st, const irc_parsed_msg_t *p)
     return;
 
   snprintf(uh, sizeof(uh), "%s@%s", user, host);
-  irc_ctx_update(st, nick, uh);
+  irc_user_seen(st, nick, uh);
 }
 
 static void
@@ -879,14 +881,15 @@ irc_handle_join(irc_state_t *st, const irc_parsed_msg_t *pp)
 
   irc_chan_add_nick(st, channel, p.nick);
 
-  // Seed the context cache from the JOIN prefix so the joiner is
-  // resolvable before their first line.
+  // Record the joiner's user@host from the JOIN prefix so they are
+  // resolvable before their first line. This runs after the member
+  // exists, which is what gives irc_user_seen() somewhere to write.
   if(p.user[0] != '\0' && p.host[0] != '\0')
   {
-    char uh[IRC_NICK_SZ + IRC_HOST_SZ + 2];
+    char uh[IRC_USERHOST_SZ];
 
     snprintf(uh, sizeof(uh), "%s@%s", p.user, p.host);
-    irc_ctx_update(st, p.nick, uh);
+    irc_user_seen(st, p.nick, uh);
   }
 
   // Handle our own joins.
@@ -1583,7 +1586,6 @@ irc_create(const char *inst_name)
 
   st->reconnect_delay = 30;
 
-  pthread_mutex_init(&st->ctx_mutex, NULL);
   pthread_mutex_init(&st->chan_mutex, NULL);
   return(st);
 }
@@ -1595,7 +1597,6 @@ irc_destroy(void *handle)
 
   irc_chan_clear_all(st);
   pthread_mutex_destroy(&st->chan_mutex);
-  pthread_mutex_destroy(&st->ctx_mutex);
   mem_free(st);
 }
 
@@ -1666,52 +1667,60 @@ irc_send_emote(void *handle, const char *target, const char *text)
   return(irc_send_privmsg(st, target, buf));
 }
 
+// Answer with the sender's live user@host. The identity layer builds
+// "<nick>!<ctx>" from this and matches it against MFA patterns, so a
+// stale answer here authenticates the wrong person — hence the member
+// lists, refreshed by JOIN/WHO/PRIVMSG and torn down by PART/QUIT/KICK,
+// rather than a cache with a life of its own.
 static bool
 irc_get_context(void *handle, const char *sender,
     char *ctx, size_t ctx_sz)
 {
   irc_state_t *st = handle;
 
-  pthread_mutex_lock(&st->ctx_mutex);
-
-  for(uint32_t i = 0; i < IRC_CTX_CACHE; i++)
-  {
-    if(st->ctx_cache[i].nick[0] != '\0' &&
-        strncasecmp(st->ctx_cache[i].nick, sender, IRC_NICK_SZ) == 0)
-    {
-      strncpy(ctx, st->ctx_cache[i].host, ctx_sz - 1);
-      ctx[ctx_sz - 1] = '\0';
-      pthread_mutex_unlock(&st->ctx_mutex);
-      return(SUCCESS);
-    }
-  }
-
-  pthread_mutex_unlock(&st->ctx_mutex);
-  return(FAIL);
+  return(irc_user_userhost(st, sender, ctx, ctx_sz));
 }
 
 // List members of an IRC channel, invoking cb for each nick.
+//
+// The nicks are snapshotted under chan_mutex and the callback runs
+// after it is dropped, because the natural thing to do with a member
+// is ask the driver about them — `!id` in a channel calls straight
+// back into get_context() for every nick it is handed. Holding the
+// lock across the callback would deadlock on the first one.
 static void
 irc_list_channel(void *handle, const char *channel,
     method_chan_member_cb_t cb, void *data)
 {
-  irc_state_t *st = handle;
+  irc_state_t   *st = handle;
   irc_channel_t *ch;
+  char         (*nicks)[IRC_NICK_SZ];
+  uint32_t       count = 0;
+  uint32_t       i;
 
   pthread_mutex_lock(&st->chan_mutex);
 
   ch = irc_chan_find(st, channel);
 
-  if(ch == NULL)
+  if(ch == NULL || ch->member_count == 0)
   {
     pthread_mutex_unlock(&st->chan_mutex);
     return;
   }
 
-  for(irc_member_t *m = ch->members; m != NULL; m = m->next)
-    cb(m->nick, data);
+  nicks = mem_alloc("irc", "member_snapshot",
+      (size_t)ch->member_count * sizeof(*nicks));
+
+  for(const irc_member_t *m = ch->members;
+      m != NULL && count < ch->member_count; m = m->next)
+    snprintf(nicks[count++], IRC_NICK_SZ, "%s", m->nick);
 
   pthread_mutex_unlock(&st->chan_mutex);
+
+  for(i = 0; i < count; i++)
+    cb(nicks[i], data);
+
+  mem_free(nicks);
 }
 
 // List channels the bot is currently joined to. Entries are added on

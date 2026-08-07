@@ -12,7 +12,10 @@
 #define IRC_NICK_SZ     32
 #define IRC_HOST_SZ     256
 #define IRC_PREFIX_SZ   256
-#define IRC_CTX_CACHE   64
+
+// "user@host" — the two halves of a prefix that survive a nick change,
+// and the only thing an MFA pattern is matched against beyond the nick.
+#define IRC_USERHOST_SZ (IRC_NICK_SZ + IRC_HOST_SZ + 2)
 
 // Sanitised KICK/KILL reason. Short enough that the command envelope
 // (verb, channel, target) always fits inside IRC_LINE_SZ.
@@ -57,9 +60,16 @@ typedef struct
 } irc_parsed_msg_t;
 
 // Per-channel member tracking.
+//
+// `userhost` is the member's live "user@host", refreshed in place by
+// every JOIN, WHO reply and line they speak, and carried across a NICK
+// because the rename edits this same node. It is empty only in the
+// window between a NAMES reply (nicks only) and the WHO that follows
+// it, where "we do not know yet" is the honest answer.
 typedef struct irc_member
 {
   char                nick[IRC_NICK_SZ];
+  char                userhost[IRC_USERHOST_SZ];
   uint8_t             mode_flags;     // IRC_MFLAG_* bitmask
   struct irc_member  *next;
 } irc_member_t;
@@ -135,18 +145,11 @@ typedef struct
   // method has been stopped.
   task_handle_t     reconnect_task;
 
-  // Channel member tracking.
+  // Channel member tracking. Also backs get_context(): a member's
+  // `userhost` is the authoritative nick -> user@host mapping, so
+  // there is no second cache to fall out of step with this one.
   irc_channel_t    *channels;
   pthread_mutex_t   chan_mutex;
-
-  // nick -> host cache for get_context() (ring buffer).
-  struct
-  {
-    char nick[IRC_NICK_SZ];
-    char host[IRC_HOST_SZ];
-  }                 ctx_cache[IRC_CTX_CACHE];
-  pthread_mutex_t   ctx_mutex;
-  uint32_t          ctx_idx;
 } irc_state_t;
 
 #ifdef IRC_INTERNAL
@@ -317,8 +320,15 @@ void irc_chan_rename_nick(irc_state_t *st, const char *old_nick, const char *new
 void irc_chan_remove(irc_state_t *st, const char *channel);
 void irc_chan_clear_all(irc_state_t *st);
 
-// Context cache + mode/admin helpers (defined in irc_channel.c).
-void    irc_ctx_update(irc_state_t *st, const char *nick, const char *host);
+// Nick -> user@host projection over the member lists (irc_channel.c).
+// `irc_user_seen` refreshes every channel that tracks the nick and is a
+// no-op for a stranger; `irc_user_userhost` answers FAIL when no shared
+// channel knows them, which the identity layer reads as "anonymous".
+void irc_user_seen(irc_state_t *st, const char *nick, const char *userhost);
+bool irc_user_userhost(irc_state_t *st, const char *nick,
+    char *out, size_t out_sz);
+
+// Mode/admin helpers (defined in irc_channel.c).
 uint8_t irc_mode_to_flag(char mode);
 void    irc_apply_chan_admin(irc_state_t *st, const char *channel);
 

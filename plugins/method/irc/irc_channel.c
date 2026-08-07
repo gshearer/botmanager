@@ -3,29 +3,6 @@
 #define IRC_INTERNAL
 #include "irc.h"
 
-// Context cache (nick -> host mapping for MFA)
-
-// Update the nick -> host ring buffer.
-void
-irc_ctx_update(irc_state_t *st, const char *nick, const char *host)
-{
-  uint32_t idx;
-
-  if(nick[0] == '\0' || host[0] == '\0')
-    return;
-
-  pthread_mutex_lock(&st->ctx_mutex);
-
-  idx = st->ctx_idx % IRC_CTX_CACHE;
-
-  snprintf(st->ctx_cache[idx].nick, IRC_NICK_SZ, "%s", nick);
-  snprintf(st->ctx_cache[idx].host, IRC_HOST_SZ, "%s", host);
-
-  st->ctx_idx++;
-
-  pthread_mutex_unlock(&st->ctx_mutex);
-}
-
 // Channel member tracking
 
 // Find a tracked channel by name (case-insensitive).
@@ -105,6 +82,7 @@ irc_chan_add_nick(irc_state_t *st, const char *channel, const char *nick)
   m = mem_alloc("irc", "member", sizeof(*m));
   strncpy(m->nick, nick, IRC_NICK_SZ - 1);
   m->nick[IRC_NICK_SZ - 1] = '\0';
+  m->userhost[0] = '\0';
   m->mode_flags = 0;
   m->next = ch->members;
   ch->members = m;
@@ -207,6 +185,61 @@ irc_chan_rename_nick(irc_state_t *st, const char *old_nick,
   }
 
   pthread_mutex_unlock(&st->chan_mutex);
+}
+
+// Nick -> user@host projection
+
+// Refresh a nick's user@host everywhere they are tracked. A prefix we
+// see for someone sharing no channel with us is simply dropped: there
+// is nowhere to put it, and nothing that could later ask for it.
+void
+irc_user_seen(irc_state_t *st, const char *nick, const char *userhost)
+{
+  if(nick == NULL || nick[0] == '\0'
+      || userhost == NULL || userhost[0] == '\0')
+    return;
+
+  pthread_mutex_lock(&st->chan_mutex);
+
+  for(irc_channel_t *ch = st->channels; ch != NULL; ch = ch->next)
+  {
+    irc_member_t *m = irc_member_find(ch, nick);
+
+    if(m != NULL)
+      snprintf(m->userhost, sizeof(m->userhost), "%s", userhost);
+  }
+
+  pthread_mutex_unlock(&st->chan_mutex);
+}
+
+// Answer with a nick's user@host, or FAIL when no shared channel has
+// one for them yet. Every channel holds the same value, so the first
+// populated hit is the answer.
+bool
+irc_user_userhost(irc_state_t *st, const char *nick,
+    char *out, size_t out_sz)
+{
+  if(nick == NULL || nick[0] == '\0' || out == NULL || out_sz == 0)
+    return(FAIL);
+
+  out[0] = '\0';
+
+  pthread_mutex_lock(&st->chan_mutex);
+
+  for(irc_channel_t *ch = st->channels; ch != NULL; ch = ch->next)
+  {
+    const irc_member_t *m = irc_member_find(ch, nick);
+
+    if(m != NULL && m->userhost[0] != '\0')
+    {
+      snprintf(out, out_sz, "%s", m->userhost);
+      pthread_mutex_unlock(&st->chan_mutex);
+      return(SUCCESS);
+    }
+  }
+
+  pthread_mutex_unlock(&st->chan_mutex);
+  return(FAIL);
 }
 
 // Remove a channel entirely (when the bot parts/is kicked).
