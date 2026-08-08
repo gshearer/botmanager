@@ -97,6 +97,7 @@ memory_load_config(void)
   c.recall_min_cosine_x100    = (uint32_t)kv_get_uint("memory.recall_min_cosine");
   c.rag_max_context_chars     = (uint32_t)kv_get_uint("memory.rag_max_context_chars");
   c.embed_min_chars           = (uint32_t)kv_get_uint("memory.embed_min_chars");
+  c.embed_batch_size          = (uint32_t)kv_get_uint("memory.embed_batch_size");
   c.embed_own_replies         = kv_get_uint("memory.embed_own_replies") != 0;
   c.decay_sweep_interval_secs = (uint32_t)kv_get_uint("memory.decay_sweep_interval_secs");
 
@@ -124,6 +125,12 @@ memory_load_config(void)
   if(c.decay_sweep_interval_secs == 0)
     c.decay_sweep_interval_secs = MEM_DEF_DECAY_SWEEP_INTERVAL_SEC;
 
+  if(c.embed_batch_size == 0)
+    c.embed_batch_size = MEM_DEF_EMBED_BATCH_SIZE;
+
+  if(c.embed_batch_size > MEM_EMBED_BATCH_MAX)
+    c.embed_batch_size = MEM_EMBED_BATCH_MAX;
+
   // embed_min_chars is deliberately NOT clamped up to its default the
   // way every knob above is: 0 is a meaningful value here, meaning
   // "disable the content filter", the same escape hatch
@@ -147,8 +154,14 @@ memory_register_kv(void)
 {
   kv_register("memory.enabled", KV_BOOL, "true",
       memory_kv_changed, NULL, "Enable memory subsystem");
-  kv_register("memory.witness_embeds", KV_BOOL, "false",
-      memory_kv_changed, NULL, "Embed WITNESS messages for RAG (Chunk D)");
+  kv_register("memory.witness_embeds", KV_BOOL, "true",
+      memory_kv_changed, NULL,
+      "Embed overheard (WITNESS) lines, not just lines addressed to the"
+      " bot. On by default: with it off the conversation corpus is only"
+      " the handful of directed lines, which is too small for semantic"
+      " recall to return anything but noise. ⚠ It widens what the bot"
+      " can recall about people who never spoke to it — a privacy"
+      " posture, not just a tuning knob.");
   kv_register("memory.log_retention_days", KV_UINT32, "30",
       memory_kv_changed, NULL, "Days to retain conversation_log rows");
   kv_register("memory.fact_decay_half_life_days", KV_UINT32, "30",
@@ -185,6 +198,13 @@ memory_register_kv(void)
       " query, so they outrank genuine matches and must be kept out of"
       " the corpus — a read-time cosine floor cannot substitute, since"
       " the hubs are what score high. 0 disables the filter.");
+  kv_register("memory.embed_batch_size", KV_UINT32, "32",
+      memory_kv_changed, NULL,
+      "Rows per embed request during a /bot <name> embedbackfill run."
+      " Higher means fewer round trips and better GPU utilisation on a"
+      " batching-aware endpoint; bounded at compile time by"
+      " MEM_EMBED_BATCH_MAX. Does not affect the live embed path, which"
+      " submits one line at a time as it is logged.");
 }
 
 // BYTEA helpers (float32 LE packing + hex serialization for Postgres).
@@ -301,7 +321,7 @@ memory_cosine(const float *a, const float *b, uint32_t dim)
 }
 
 // Persist an embedding row. Returns SUCCESS on success.
-static bool
+bool
 memory_write_embedding(const char *table, const char *id_col, int64_t id,
     const char *model, uint32_t dim, const float *vec)
 {
@@ -406,7 +426,7 @@ memory_embed_done(const llm_embed_response_t *resp)
 // and urlgrabber already owns links); and the IRC action prefix
 // "* <nick> " is NOT stripped here, unlike extract_prompt_build() —
 // an action is content and counts toward both gates.
-static bool
+bool
 memory_text_is_embeddable(const char *text, uint32_t min_chars)
 {
   const char *start;
@@ -1155,6 +1175,10 @@ memory_register_commands(void)
 void
 memory_stop(void)
 {
+  // A backfill outlives any one command, so stop it here rather than
+  // letting its pump re-arm into an unloading mapping.
+  memory_backfill_stop();
+
   if(memory_sweep_task == TASK_HANDLE_NONE)
     return;
 

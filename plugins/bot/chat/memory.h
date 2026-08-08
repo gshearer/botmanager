@@ -284,10 +284,15 @@ bool memory_test_inject_embedding(int64_t id, const char *model,
 #define MEM_DEF_RECALL_TOP_K             4
 #define MEM_DEF_RECALL_MIN_COSINE_X100   0   // 0 = no floor
 #define MEM_DEF_EMBED_MIN_CHARS          24  // 0 = filter disabled
+#define MEM_DEF_EMBED_BATCH_SIZE         32
 
 // Minimum content-bearing tokens a line needs to earn a vector.
 // Deliberately not a knob — see memory_text_is_embeddable().
 #define MEM_EMBED_MIN_TOKENS             2
+
+// Hard ceiling on texts per embed request. Bounds the backfill batch
+// struct, which carries its ids and text pointers inline.
+#define MEM_EMBED_BATCH_MAX              64
 
 // Buffer sizes used across helpers.
 #define MEM_SQL_SZ      4096
@@ -309,6 +314,7 @@ typedef struct
   uint32_t recall_top_k;
   uint32_t recall_min_cosine_x100;
   uint32_t embed_min_chars;
+  uint32_t embed_batch_size;
 } mem_cfg_t;
 
 // Module state shared across memory.c and its siblings (memory_rag.c,
@@ -325,6 +331,23 @@ extern time_t            memory_last_sweep;
 
 // Cross-file helpers defined in memory.c.
 void memory_cfg_snapshot(mem_cfg_t *out);
+
+// The content gate on the embed write path. Shared with memory_backfill.c
+// so the live path and the backfill cannot drift apart on what counts as
+// worth embedding. See MEMSTORE.md §Embed eligibility.
+bool memory_text_is_embeddable(const char *text, uint32_t min_chars);
+
+// Upsert one vector row. Returns SUCCESS on success.
+bool memory_write_embedding(const char *table, const char *id_col, int64_t id,
+    const char *model, uint32_t dim, const float *vec);
+
+// Embed backfill (memory_backfill.c). One run at a time, tree-wide.
+// memory_backfill_start() returns FAIL and fills `err` when a run is
+// already active or the subsystem cannot start one.
+bool memory_backfill_start(uint32_t ns_id, char *err, size_t err_sz);
+void memory_backfill_status(char *out, size_t out_sz);
+void memory_backfill_stop(void);
+bool memory_backfill_cmd_register(void);
 
 // Shared SELECT column lists + row parsers. The macros and parsers must
 // change in lock-step: the parser indexes into the ordinal positions the

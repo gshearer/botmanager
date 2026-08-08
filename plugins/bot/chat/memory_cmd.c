@@ -67,6 +67,14 @@ cmd_show_memstore(const cmd_ctx_t *ctx)
       cfg.decay_sweep_interval_secs);
   cmd_reply(ctx, buf);
 
+  snprintf(buf, sizeof(buf),
+      "  embed_min_chars=%u embed_batch_size=%u",
+      cfg.embed_min_chars, cfg.embed_batch_size);
+  cmd_reply(ctx, buf);
+
+  memory_backfill_status(buf, sizeof(buf));
+  cmd_reply(ctx, buf);
+
   if(memory_last_sweep != 0)
   {
     time_t now = time(NULL);
@@ -107,4 +115,8 @@ memory_register_cmds_internal(void)
       NULL,
       USERNS_GROUP_ADMIN, 100, CMD_SCOPE_ANY, METHOD_T_ANY,
       cmd_show_memstore, NULL, "show", "ms", NULL, 0, NULL, NULL);
+
+  // /bot <name> embedbackfill — the mutating half, so it hangs off /bot
+  // rather than /show (feedback_show_vs_bot_verbs).
+  memory_backfill_cmd_register();
 }
