@@ -12,6 +12,7 @@
 #include "task.h"
 #include "userns.h"
 
+#include <ctype.h>
 #include <inttypes.h>
 #include <math.h>
 #include <stdio.h>
@@ -95,6 +96,7 @@ memory_load_config(void)
   c.recall_top_k              = (uint32_t)kv_get_uint("memory.recall_top_k");
   c.recall_min_cosine_x100    = (uint32_t)kv_get_uint("memory.recall_min_cosine");
   c.rag_max_context_chars     = (uint32_t)kv_get_uint("memory.rag_max_context_chars");
+  c.embed_min_chars           = (uint32_t)kv_get_uint("memory.embed_min_chars");
   c.embed_own_replies         = kv_get_uint("memory.embed_own_replies") != 0;
   c.decay_sweep_interval_secs = (uint32_t)kv_get_uint("memory.decay_sweep_interval_secs");
 
@@ -121,6 +123,11 @@ memory_load_config(void)
 
   if(c.decay_sweep_interval_secs == 0)
     c.decay_sweep_interval_secs = MEM_DEF_DECAY_SWEEP_INTERVAL_SEC;
+
+  // embed_min_chars is deliberately NOT clamped up to its default the
+  // way every knob above is: 0 is a meaningful value here, meaning
+  // "disable the content filter", the same escape hatch
+  // memory.recall_min_cosine uses. Clamping would remove it.
 
   pthread_mutex_lock(&memory_cfg_mutex);
   memory_cfg = c;
@@ -170,6 +177,14 @@ memory_register_kv(void)
   kv_register("memory.embed_model", KV_STR, "",
       memory_kv_changed, NULL,
       "LLM embed model for memory RAG (empty = embeddings disabled)");
+  kv_register("memory.embed_min_chars", KV_UINT32, "24",
+      memory_kv_changed, NULL,
+      "Minimum trimmed length in bytes a conversation line needs before"
+      " it is embedded for semantic recall. Short strings ('!', 'heh',"
+      " '....') embed to hub vectors roughly equidistant from every"
+      " query, so they outrank genuine matches and must be kept out of"
+      " the corpus — a read-time cosine floor cannot substitute, since"
+      " the hubs are what score high. 0 disables the filter.");
 }
 
 // BYTEA helpers (float32 LE packing + hex serialization for Postgres).
@@ -362,19 +377,116 @@ memory_embed_done(const llm_embed_response_t *resp)
   mem_free(c);
 }
 
-// Submit an embed job if the embed model is configured. The caller has
-// already decided that this id/text is eligible for embedding.
+// True when a line carries enough substance to be worth a vector.
+//
+// Short degenerate strings embed to *hub* vectors that sit roughly
+// equidistant from everything, so they outrank real matches on every
+// query: measured, query "coffee" scores "!" at 0.976 and "I drink
+// black coffee every morning" at 0.509. Keeping them out of the corpus
+// is the only lever that works — a read-time cosine floor cannot
+// substitute, because the hubs are precisely what score high, so a
+// floor discards the genuine matches first.
+//
+// Two gates, both of which must pass, and only the first is tunable:
+//
+//   1. trimmed byte length >= min_chars (0 disables the whole filter)
+//   2. at least MEM_EMBED_MIN_TOKENS content-bearing tokens
+//
+// Rule 2 is not a knob on purpose. A single-token line is the hub case
+// itself and no threshold makes "heh" worth recalling, and it is also
+// what rejects "....", "!!!" and ":)" however long they run.
+//
+// A byte >= 0x80 counts as content, so non-ASCII scripts clear rule 2
+// (isalnum() would reject every UTF-8 continuation byte in the C
+// locale). Rule 1 counting bytes then works in their favour — a CJK
+// sentence reaches 24 bytes at roughly 8 characters.
+//
+// Two deliberate consequences: a bare URL is long but single-token and
+// so is rejected, which is intended (a link has no text to recall on,
+// and urlgrabber already owns links); and the IRC action prefix
+// "* <nick> " is NOT stripped here, unlike extract_prompt_build() —
+// an action is content and counts toward both gates.
+static bool
+memory_text_is_embeddable(const char *text, uint32_t min_chars)
+{
+  const char *start;
+  const char *end;
+  const char *p;
+  size_t      n_tokens;
+  bool        in_token;
+  bool        tok_content;
+
+  if(text == NULL)
+    return(false);
+
+  if(min_chars == 0)
+    return(true);
+
+  start = text;
+
+  while(*start != '\0' && isspace((unsigned char)*start))
+    start++;
+
+  end = start + strlen(start);
+
+  while(end > start && isspace((unsigned char)end[-1]))
+    end--;
+
+  if((size_t)(end - start) < (size_t)min_chars)
+    return(false);
+
+  n_tokens    = 0;
+  in_token    = false;
+  tok_content = false;
+
+  for(p = start; p < end; p++)
+  {
+    if(isspace((unsigned char)*p))
+    {
+      if(in_token && tok_content)
+      {
+        n_tokens++;
+
+        if(n_tokens >= MEM_EMBED_MIN_TOKENS)
+          return(true);
+      }
+
+      in_token    = false;
+      tok_content = false;
+      continue;
+    }
+
+    in_token = true;
+
+    if(isalnum((unsigned char)*p) || (unsigned char)*p >= 0x80)
+      tok_content = true;
+  }
+
+  if(in_token && tok_content)
+    n_tokens++;
+
+  return(n_tokens >= MEM_EMBED_MIN_TOKENS);
+}
+
+// Submit an embed job if the embed model is configured. The caller owns
+// the *kind* decision (WITNESS / EXCHANGE_IN / EXCHANGE_OUT); the
+// *content* gate is applied here so that every write path — this one
+// and any batch backfill — shares one rule and the two cannot drift.
 //
 // Only conversation_log rows are embedded. Facts are not: the dossier
 // store has no embedding table and its facts are retrieved by dossier
 // id, not by cosine.
 static void
-memory_submit_embed(int64_t id, const char *model, const char *text)
+memory_submit_embed(int64_t id, const char *model, const char *text,
+    uint32_t min_chars)
 {
   const char *inputs[1] = { text };
   memory_embed_ctx_t *c;
 
   if(model[0] == '\0' || text == NULL || text[0] == '\0')
+    return;
+
+  if(!memory_text_is_embeddable(text, min_chars))
     return;
 
   c = mem_alloc("memory", "embed_ctx", sizeof(*c));
@@ -833,7 +945,8 @@ memory_log_message(const mem_msg_t *msg)
     }
 
     if(do_embed)
-      memory_submit_embed(new_id, cfg.embed_model, msg->text);
+      memory_submit_embed(new_id, cfg.embed_model, msg->text,
+          cfg.embed_min_chars);
   }
 
 cleanup:

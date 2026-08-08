@@ -283,6 +283,11 @@ bool memory_test_inject_embedding(int64_t id, const char *model,
 #define MEM_EMBED_MODEL_SZ               64
 #define MEM_DEF_RECALL_TOP_K             4
 #define MEM_DEF_RECALL_MIN_COSINE_X100   0   // 0 = no floor
+#define MEM_DEF_EMBED_MIN_CHARS          24  // 0 = filter disabled
+
+// Minimum content-bearing tokens a line needs to earn a vector.
+// Deliberately not a knob — see memory_text_is_embeddable().
+#define MEM_EMBED_MIN_TOKENS             2
 
 // Buffer sizes used across helpers.
 #define MEM_SQL_SZ      4096
@@ -303,6 +308,7 @@ typedef struct
   char     embed_model[MEM_EMBED_MODEL_SZ];
   uint32_t recall_top_k;
   uint32_t recall_min_cosine_x100;
+  uint32_t embed_min_chars;
 } mem_cfg_t;
 
 // Module state shared across memory.c and its siblings (memory_rag.c,
