@@ -26,6 +26,7 @@ alongside its code.
 | Add/modify a **method** driver — how a bot meets humans, modality *and* wire (irc, reachy, ...) | `PLUGIN.md` + `plugins/method/AGENTS.md` + `include/method.h` |
 | Add/modify the **bot** plugin — the mind that drives a bot (`chat`; there is exactly one) | `PLUGIN.md` + `plugins/bot/AGENTS.md` + `include/bot.h` |
 | Add/modify a feature plugin (weather, crypto, stock, urlgrabber, userquote, ...) | `PLUGIN.md` + `plugins/feature/AGENTS.md` + `include/bot.h` |
+| Touch **weather** — the `!weather` surface or either provider behind it | The stack is **hybrid** and the routing lives in the feature: `plugins/feature/weather/weather.c` resolves a location (always through openweather's geocoders — weather.gov has none) and routes on the resulting coordinate; `weather_render.c` holds **all** presentation and never sees a provider type. Providers: `plugins/service/openweather/` (geocoding, every non-US location, alerts until WX-2) and `plugins/service/weathergov/` (US grid, and the CAP/forecast/observation work WX-2..4 hang off it). Plan + measured API facts: root `TODO.md §WEATHER-1-PLAN` (`§WX-DESIGN`, `§WX-NAMING`, `§WXG-TRUTH`) |
 | Add/modify an extension subsystem (inference, whenmoon) | `PLUGIN.md` + `plugins/extension/AGENTS.md` |
 | Work on the whenmoon plugin C code (markets, candles, backtester, treasuries) | `plugins/extension/whenmoon/AGENTS.md` |
 | Act as CFO / touch a treasury or the live disc fund | `plugins/extension/whenmoon/CFO.md` (read FIRST — it is the office) |

@@ -1,0 +1,541 @@
+// botmanager — MIT
+// Weather presentation: colour, icon and column layout for every view.
+#define WEATHER_INTERNAL
+#include "weather.h"
+
+#include <stdio.h>
+#include <string.h>
+#include <time.h>
+
+#include "colors.h"
+
+// Day-name tables, shared by forecast formatters.
+
+static const char *const weather_day_names_full[] = {
+  "Sunday", "Monday", "Tuesday", "Wednesday",
+  "Thursday", "Friday", "Saturday",
+};
+
+static const char *const weather_day_names_abbr[] = {
+  "Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat",
+};
+
+// Unit + display helpers
+
+const char *
+weather_temp_unit(const char *units)
+{
+  if(strcmp(units, "metric") == 0)
+    return("C");
+
+  if(strcmp(units, "standard") == 0)
+    return("K");
+
+  return("F");
+}
+
+const char *
+weather_speed_unit(const char *units)
+{
+  if(strcmp(units, "imperial") == 0)
+    return("mph");
+
+  return("m/s");
+}
+
+const char *
+weather_wind_dir(double deg)
+{
+  static const char *dirs[] = {
+    "N", "NNE", "NE", "ENE", "E", "ESE", "SE", "SSE",
+    "S", "SSW", "SW", "WSW", "W", "WNW", "NW", "NNW"
+  };
+  int idx = ((int)((deg + 11.25) / 22.5)) % 16;
+
+  return(dirs[idx]);
+}
+
+double
+weather_to_fahrenheit(double temp, const char *units)
+{
+  if(strcmp(units, "metric") == 0)
+    return(temp * 9.0 / 5.0 + 32.0);
+
+  if(strcmp(units, "standard") == 0)
+    return((temp - 273.15) * 9.0 / 5.0 + 32.0);
+
+  return(temp);
+}
+
+const char *
+weather_temp_color(double temp_f)
+{
+  if(temp_f >= 100.0) return(CLR_BOLD CLR_RED);
+  if(temp_f >=  90.0) return(CLR_RED);
+  if(temp_f >=  80.0) return(CLR_ORANGE);
+  if(temp_f >=  70.0) return(CLR_YELLOW);
+  if(temp_f <    0.0) return(CLR_BOLD CLR_PURPLE);
+  if(temp_f <   25.0) return(CLR_BOLD CLR_BLUE);
+  if(temp_f <   40.0) return(CLR_BLUE);
+  if(temp_f <   55.0) return(CLR_CYAN);
+
+  return("");
+}
+
+int
+weather_fmt_temp(char *buf, size_t sz, double temp, const char *units)
+{
+  const char *clr = weather_temp_color(weather_to_fahrenheit(temp, units));
+
+  // The bold toggle pair (CLR_BOLD CLR_BOLD) between the color code
+  // and the digit prevents IRC clients from consuming temperature
+  // digits as part of the \003NN color parameter sequence.
+  if(*clr != '\0')
+    return(snprintf(buf, sz, "%s" CLR_BOLD CLR_BOLD "%.0f%s",
+        clr, temp, CLR_RESET));
+
+  return(snprintf(buf, sz, "%.0f", temp));
+}
+
+// As weather_fmt_temp, but right-justifies the numeric part to a fixed
+// visible width so temperatures line up as a column. The padding lands
+// *inside* the colour run (leading spaces, never a digit), which also
+// sidesteps the \003NN digit-eating hazard the bold toggle guards.
+int
+weather_fmt_temp_w(char *buf, size_t sz, double temp, const char *units,
+    int width)
+{
+  const char *clr = weather_temp_color(weather_to_fahrenheit(temp, units));
+
+  if(*clr != '\0')
+    return(snprintf(buf, sz, "%s" CLR_BOLD CLR_BOLD "%*.0f%s",
+        clr, width, temp, CLR_RESET));
+
+  return(snprintf(buf, sz, "%*.0f", width, temp));
+}
+
+// Map a weather condition ID to a Unicode weather emoji (UTF-8). Must
+// be placed at the START of each line so variable emoji width does
+// not break column alignment.
+const char *
+weather_condition_icon(int id)
+{
+  if(id >= 200 && id < 300)
+    return("\xf0\x9f\x8c\xa9\xef\xb8\x8f");  // 🌩️ thunderstorm
+
+  if(id >= 300 && id < 400)
+    return("\xf0\x9f\x8c\xa7\xef\xb8\x8f");  // 🌧️ drizzle
+
+  if(id >= 500 && id < 600)
+    return("\xf0\x9f\x8c\xa7\xef\xb8\x8f");  // 🌧️ rain
+
+  if(id >= 600 && id < 700)
+    return("\xf0\x9f\x8c\xa8\xef\xb8\x8f");  // 🌨️ snow
+
+  if(id >= 700 && id < 800)
+    return("\xf0\x9f\x8c\xab\xef\xb8\x8f");  // 🌫️ fog/mist/haze
+
+  if(id == 800)
+    return("\xe2\x98\x80\xef\xb8\x8f");       // ☀️  clear
+
+  if(id == 801 || id == 802)
+    return("\xf0\x9f\x8c\xa5\xef\xb8\x8f");  // 🌥️ few/scattered
+
+  if(id >= 803)
+    return("\xf0\x9f\x8c\xa5\xef\xb8\x8f");  // 🌥️ overcast
+
+  return("\xf0\x9f\x8c\xa1\xef\xb8\x8f");    // 🌡️ fallback
+}
+
+const char *
+weather_condition_color(int id)
+{
+  if(id >= 200 && id < 300) return(CLR_RED);        // thunderstorm
+  if(id >= 300 && id < 400) return(CLR_CYAN);       // drizzle
+  if(id >= 500 && id < 600) return(CLR_CYAN);       // rain
+  if(id >= 600 && id < 700) return(CLR_BOLD);       // snow
+  if(id >= 700 && id < 800) return(CLR_PURPLE);     // fog/mist/haze
+  if(id == 800)             return(CLR_YELLOW);      // clear sky
+  if(id == 801)             return(CLR_YELLOW);      // few clouds
+  if(id == 802)             return(CLR_GRAY);        // scattered clouds
+  if(id >= 803)             return(CLR_GRAY);        // overcast
+
+  return("");
+}
+
+void
+weather_format_time_ampm(time_t ts, int tz_offset, char *buf, size_t sz)
+{
+  int h;
+  time_t local = ts + tz_offset;
+  struct tm tm;
+
+  gmtime_r(&local, &tm);
+
+  h = tm.tm_hour % 12;
+
+  if(h == 0)
+    h = 12;
+
+  snprintf(buf, sz, "%d:%02d%s", h, tm.tm_min,
+      tm.tm_hour < 12 ? "am" : "pm");
+}
+
+// Synthetic zipcodes take the shape G+8 hex digits; they arrive from
+// the city-name path's lat/lon fallback when OpenWeather has coords
+// but no postcode. They're purely internal cache keys and must not
+// leak into human-facing replies.
+bool
+weather_zip_is_synth(const char *zip)
+{
+  size_t i;
+
+  if(zip == NULL || zip[0] != 'G')
+    return(false);
+
+  for(i = 1; i < 9; i++)
+  {
+    if(!((zip[i] >= '0' && zip[i] <= '9')
+        || (zip[i] >= 'A' && zip[i] <= 'F')))
+      return(false);
+  }
+
+  return(zip[9] == '\0');
+}
+
+void
+weather_fmt_precip(char *buf, size_t sz, int pop)
+{
+  if(pop > 0)
+    snprintf(buf, sz, " " CLR_CYAN "%d%% precip" CLR_RESET, pop);
+  else
+    buf[0] = '\0';
+}
+
+void
+weather_fmt_desc_pad(char *buf, size_t sz, const char *desc, int width)
+{
+  snprintf(buf, sz, "%-*.*s", width, width, desc);
+}
+
+void
+weather_reply_header(const cmd_ctx_t *ctx, const char *place,
+    const char *zip, const char *subtitle)
+{
+  char buf[WEATHER_REPLY_SZ];
+
+  if(weather_zip_is_synth(zip))
+    snprintf(buf, sizeof(buf),
+        CLR_BOLD "%s" CLR_RESET " "
+        "\xe2\x80\x94 " CLR_BOLD "%s" CLR_RESET,
+        place, subtitle);
+  else
+    snprintf(buf, sizeof(buf),
+        CLR_BOLD "%s" CLR_RESET " (%s) "
+        "\xe2\x80\x94 " CLR_BOLD "%s" CLR_RESET,
+        place, zip, subtitle);
+
+  cmd_reply(ctx, buf);
+}
+
+void
+weather_reply_alerts(const cmd_ctx_t *ctx, const openweather_alert_set_t *a)
+{
+  char buf[WEATHER_REPLY_SZ];
+  uint8_t i;
+
+  for(i = 0; i < a->count && i < 3; i++)
+  {
+    if(a->alerts[i].event[0] == '\0')
+      continue;
+
+    snprintf(buf, sizeof(buf),
+        "  " CLR_BOLD CLR_RED "\xe2\x9a\xa0" CLR_RESET " "
+        CLR_BOLD CLR_YELLOW "ALERT:" CLR_RESET " %s",
+        a->alerts[i].event);
+
+    cmd_reply(ctx, buf);
+  }
+}
+
+// Reply formatters (consume typed payloads)
+
+void
+weather_reply_current(const cmd_ctx_t *ctx,
+    const openweather_current_t *cur,
+    const openweather_alert_set_t *alerts)
+{
+  char ct[32], cf[32];
+  char buf[WEATHER_REPLY_SZ];
+  char sunrise[12], sunset[12];
+  const char *tu = weather_temp_unit(cur->units);
+  const char *su = weather_speed_unit(cur->units);
+  const char *icon = weather_condition_icon(cur->condition_id);
+  const char *dclr = weather_condition_color(cur->condition_id);
+
+  sunrise[0] = sunset[0] = '?';
+  sunrise[1] = sunset[1] = '\0';
+
+  if(cur->sunrise > 0)
+    weather_format_time_ampm(cur->sunrise, cur->tz_offset,
+        sunrise, sizeof(sunrise));
+
+  if(cur->sunset > 0)
+    weather_format_time_ampm(cur->sunset, cur->tz_offset,
+        sunset, sizeof(sunset));
+
+  weather_fmt_temp(ct, sizeof(ct), cur->temp,       cur->units);
+  weather_fmt_temp(cf, sizeof(cf), cur->feels_like, cur->units);
+
+  // Line 1: icon + location + condition + temperature.
+  if(weather_zip_is_synth(cur->zipcode))
+    snprintf(buf, sizeof(buf),
+        "%s " CLR_BOLD "%s" CLR_RESET " "
+        "\xe2\x80\x94 %s%s" CLR_RESET
+        " " CLR_GRAY "\xc2\xb7" CLR_RESET " "
+        "%s\xc2\xb0%s (feels %s\xc2\xb0%s)",
+        icon, cur->place_name,
+        dclr, cur->condition_desc,
+        ct, tu, cf, tu);
+  else
+    snprintf(buf, sizeof(buf),
+        "%s " CLR_BOLD "%s" CLR_RESET " (%s) "
+        "\xe2\x80\x94 %s%s" CLR_RESET
+        " " CLR_GRAY "\xc2\xb7" CLR_RESET " "
+        "%s\xc2\xb0%s (feels %s\xc2\xb0%s)",
+        icon, cur->place_name, cur->zipcode,
+        dclr, cur->condition_desc,
+        ct, tu, cf, tu);
+
+  cmd_reply(ctx, buf);
+
+  // Line 2: hi/lo + humidity + wind + sunrise/sunset.
+  if(cur->have_hilo)
+  {
+    char chi[32], clo[32];
+
+    weather_fmt_temp(chi, sizeof(chi), cur->temp_hi, cur->units);
+    weather_fmt_temp(clo, sizeof(clo), cur->temp_lo, cur->units);
+
+    snprintf(buf, sizeof(buf),
+        "  Hi %s\xc2\xb0/Lo %s\xc2\xb0%s"
+        " " CLR_GRAY "\xc2\xb7" CLR_RESET " "
+        CLR_CYAN "Humidity" CLR_RESET " %d%%"
+        " " CLR_GRAY "\xc2\xb7" CLR_RESET " "
+        CLR_GREEN "Wind" CLR_RESET " %.0f%s %s"
+        " " CLR_GRAY "\xc2\xb7" CLR_RESET " "
+        CLR_YELLOW "Rise" CLR_RESET " %s "
+        CLR_PURPLE "Set" CLR_RESET " %s",
+        chi, clo, tu,
+        cur->humidity,
+        cur->wind_speed, su, weather_wind_dir(cur->wind_deg),
+        sunrise, sunset);
+  }
+
+  else
+    snprintf(buf, sizeof(buf),
+        "  "
+        CLR_CYAN "Humidity" CLR_RESET " %d%%"
+        " " CLR_GRAY "\xc2\xb7" CLR_RESET " "
+        CLR_GREEN "Wind" CLR_RESET " %.0f%s %s"
+        " " CLR_GRAY "\xc2\xb7" CLR_RESET " "
+        CLR_YELLOW "Rise" CLR_RESET " %s "
+        CLR_PURPLE "Set" CLR_RESET " %s",
+        cur->humidity,
+        cur->wind_speed, su, weather_wind_dir(cur->wind_deg),
+        sunrise, sunset);
+
+  cmd_reply(ctx, buf);
+
+  weather_reply_alerts(ctx, alerts);
+}
+
+void
+weather_reply_forecast_daily(const cmd_ctx_t *ctx,
+    const openweather_forecast_t *f,
+    const openweather_alert_set_t *alerts)
+{
+  const char *tu = weather_temp_unit(f->units);
+  const char *su = weather_speed_unit(f->units);
+  uint8_t i;
+
+  weather_reply_header(ctx, f->place_name, f->zipcode, "7-day forecast");
+
+  for(i = 0; i < f->day_count && i < 7; i++)
+  {
+    const openweather_forecast_day_t *d = &f->days[i];
+    const char *day_name = "???";
+    const char *icon;
+    const char *dclr;
+    char chi[32], clo[32];
+    char desc_pad[24];
+    char precip[24];
+    char buf[WEATHER_REPLY_SZ];
+    int pop = (int)(d->pop * 100);
+
+    if(d->dt > 0)
+    {
+      struct tm tm;
+
+      // A daily row's `dt` is a calendar-day marker, not an instant: One
+      // Call pins it to exactly 00:00:00 UTC of the day it represents,
+      // identical across every timezone. It is therefore read in UTC as-is
+      // — adding tz_offset would push negative-offset locales (the Americas)
+      // back across the UTC midnight boundary and mislabel the weekday
+      // (Monday shown as Sunday). Only true instants (hours, sunrise/sunset)
+      // get the offset applied.
+      gmtime_r(&d->dt, &tm);
+      day_name = weather_day_names_full[tm.tm_wday];
+    }
+
+    icon = weather_condition_icon(d->condition_id);
+    dclr = weather_condition_color(d->condition_id);
+
+    // Width-pad the numeric part to 3 visible chars (matches the hourly
+    // view) so the hi/lo column stays fixed-width: a 3-digit temperature
+    // (100+°F) would otherwise be 1-2 chars wider than a 2-digit one and
+    // shove every column to its right out of alignment.
+    weather_fmt_temp_w(chi, sizeof(chi), d->temp_hi, f->units, 3);
+    weather_fmt_temp_w(clo, sizeof(clo), d->temp_lo, f->units, 3);
+
+    weather_fmt_desc_pad(desc_pad, sizeof(desc_pad),
+        d->condition_desc, 22);
+
+    weather_fmt_precip(precip, sizeof(precip), pop);
+
+    snprintf(buf, sizeof(buf),
+        "%s %-9.9s  %s/%s\xc2\xb0%s"
+        "  %s%s" CLR_RESET
+        "  %2d%%"
+        "  %2.0f%s %-3s"
+        "%s",
+        icon, day_name, chi, clo, tu,
+        dclr, desc_pad,
+        d->humidity,
+        d->wind_speed, su, weather_wind_dir(d->wind_deg),
+        precip);
+
+    cmd_reply(ctx, buf);
+  }
+
+  weather_reply_alerts(ctx, alerts);
+}
+
+// Render one hour into a fixed-visible-width cell for the two-column
+// hourly view. Every field is padded on its *raw* text (colour codes
+// wrap already-padded content), so a cell's on-screen width is constant
+// and the second column lands at a predictable position. The layout is
+//
+//   {icon} {Day} {time}  {temp}°{u}  {condition:16}  {pop}
+//
+// which measures ~42 display columns; two cells plus a two-space gutter
+// stay under the 100-column budget with room to spare.
+//
+// The trailing precipitation-probability field is shown only when there
+// *is* a chance (mirroring the daily view): a dry hour leaves the
+// 4-column slot blank so the eye locks onto the hours that carry rain
+// odds instead of a wall of "0%". The slot keeps its fixed width either
+// way, preserving column alignment.
+void
+weather_hour_cell(char *buf, size_t sz, const openweather_forecast_hour_t *h,
+    const char *units, const char *tu, int tz_offset)
+{
+  const char *icon = weather_condition_icon(h->condition_id);
+  const char *dclr = weather_condition_color(h->condition_id);
+  const char *day_name = "???";
+  char temp[40];
+  char desc_pad[24];
+  char time_str[8];
+  char pop_str[24];
+  int pop = (int)(h->pop * 100);
+
+  time_str[0] = time_str[1] = '?';
+  time_str[2] = '\0';
+
+  if(h->dt > 0)
+  {
+    int hour12;
+    time_t dt = h->dt + tz_offset;
+    struct tm tm;
+
+    gmtime_r(&dt, &tm);
+    day_name = weather_day_names_abbr[tm.tm_wday];
+
+    hour12 = tm.tm_hour % 12;
+
+    if(hour12 == 0)
+      hour12 = 12;
+
+    snprintf(time_str, sizeof(time_str), "%d%s",
+        hour12, tm.tm_hour < 12 ? "am" : "pm");
+  }
+
+  weather_fmt_temp_w(temp, sizeof(temp), h->temp, units, 3);
+  weather_fmt_desc_pad(desc_pad, sizeof(desc_pad), h->condition_desc, 16);
+
+  // Fixed 4-column precip slot: coloured "NN%" when there's a chance,
+  // blank otherwise.
+  if(pop > 0)
+    snprintf(pop_str, sizeof(pop_str), CLR_CYAN "%3d%%" CLR_RESET, pop);
+  else
+    snprintf(pop_str, sizeof(pop_str), "    ");
+
+  snprintf(buf, sz,
+      "%s %-3s %4s  %s\xc2\xb0%s  %s%s" CLR_RESET "  %s",
+      icon, day_name, time_str, temp, tu, dclr, desc_pad, pop_str);
+}
+
+// Double-column hourly forecast: 24 hours collapse into ~12 reply
+// lines, two cells each, so IRC clients aren't flooded. Hourly
+// deliberately drops wind/humidity (kept in the daily view) to stay
+// within a sane line width; the essentials — time, temperature, sky,
+// precip odds — remain.
+//
+// Cells are laid out COLUMN-MAJOR: the left column holds the earlier
+// half of the hours top-to-bottom, the right column the later half, so
+// a human reads each column straight down rather than zig-zagging
+// left↔right across every row.
+void
+weather_reply_forecast_hourly(const cmd_ctx_t *ctx,
+    const openweather_forecast_t *f,
+    const openweather_alert_set_t *alerts)
+{
+  const char *tu = weather_temp_unit(f->units);
+  char cells[24][WEATHER_CELL_SZ];
+  uint8_t n;
+  uint8_t rows;
+  uint8_t r;
+  uint8_t i;
+
+  weather_reply_header(ctx, f->place_name, f->zipcode, "24-hour forecast");
+
+  n = (f->hour_count < 24) ? f->hour_count : 24;
+
+  for(i = 0; i < n; i++)
+    weather_hour_cell(cells[i], sizeof(cells[i]), &f->hours[i],
+        f->units, tu, f->tz_offset);
+
+  // Split point: the left column takes the first ceil(n/2) hours, so an
+  // odd count leaves the lone trailing cell alone on the last row.
+  rows = (uint8_t)((n + 1) / 2);
+
+  for(r = 0; r < rows; r++)
+  {
+    char buf[WEATHER_REPLY_SZ];
+    uint8_t right = (uint8_t)(rows + r);
+
+    // Precision bounds each cell to its buffer so the compiler can see
+    // the join stays well within WEATHER_REPLY_SZ (the runtime-indexed
+    // cells[r] otherwise reads as reaching the end of the 2-D array).
+    if(right < n)
+      snprintf(buf, sizeof(buf), "%.*s  %.*s",
+          WEATHER_CELL_SZ - 1, cells[r],
+          WEATHER_CELL_SZ - 1, cells[right]);
+    else
+      snprintf(buf, sizeof(buf), "%.*s", WEATHER_CELL_SZ - 1, cells[r]);
+
+    cmd_reply(ctx, buf);
+  }
+
+  weather_reply_alerts(ctx, alerts);
+}
