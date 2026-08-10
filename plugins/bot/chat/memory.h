@@ -285,6 +285,21 @@ bool memory_test_inject_embedding(int64_t id, const char *model,
 #define MEM_DEF_RECALL_MIN_COSINE_X100   0   // 0 = no floor
 #define MEM_DEF_EMBED_MIN_CHARS          24  // 0 = filter disabled
 #define MEM_DEF_EMBED_BATCH_SIZE         32
+#define MEM_DEF_EMBED_BURST_MAX          4   // 0 = burst gate disabled
+#define MEM_DEF_EMBED_BURST_SECS         5
+#define MEM_EXCLUDE_REGEX_SZ             256
+
+// Corpus hygiene: the shipped exclusion pattern, POSIX ERE. Every
+// alternative was measured against the live corpus — it drops 43 junk
+// vectors (attack class tables, code/diff/pipe pastes) and touches none
+// of 1,576 legitimate lines. ⛔ Never add a whitespace-run alternative
+// ("   ", "\t", "[ ]{2,}"): it looks like the best junk signal available
+// and it would silently eat 25 rows of one human's ordinary speech, who
+// double- and triple-spaces after a sentence. See TODO.md
+// §POLLUTION-TRUTH 4 — and 5, for why the diff alternative needs a space
+// on BOTH sides of the sign.
+#define MEM_DEF_EMBED_EXCLUDE_REGEX \
+    "^[0-9]+ +[+-] |^[[:space:]]*[{}]|\\||^[a-z_]+ +[0-9]+ +[0-9]+ +[0-9]+ |^class +[a-z]+ +[a-z]+ "
 
 // Minimum content-bearing tokens a line needs to earn a vector.
 // Deliberately not a knob — see memory_text_is_embeddable().
@@ -326,7 +341,10 @@ typedef struct
   uint32_t recall_min_cosine_x100;
   uint32_t embed_min_chars;
   uint32_t embed_batch_size;
+  uint32_t embed_burst_max;
+  uint32_t embed_burst_secs;
   char     recall_instruct[MEM_RECALL_INSTRUCT_SZ];
+  char     embed_exclude_regex[MEM_EXCLUDE_REGEX_SZ];
 } mem_cfg_t;
 
 // Module state shared across memory.c and its siblings (memory_rag.c,
@@ -348,6 +366,19 @@ void memory_cfg_snapshot(mem_cfg_t *out);
 // so the live path and the backfill cannot drift apart on what counts as
 // worth embedding. See MEMSTORE.md §Embed eligibility.
 bool memory_text_is_embeddable(const char *text, uint32_t min_chars);
+
+// The typeable "unset" convention for a KV_STR. `/set kv` cannot store a
+// true empty string — the REST argument is required and a quoted "" is
+// stored as two literal bytes — so a string knob that must be
+// disableable accepts `off` and `none` as well. Shared so every such
+// knob answers to the same words.
+bool memory_kv_str_disabled(const char *s);
+
+// True when memory.embed_exclude_regex is actually compiled and being
+// enforced. A configured-but-uncompilable pattern reads as false — the
+// state view must say the gate is off rather than echo a knob nothing
+// obeys.
+bool memory_exclude_regex_active(void);
 
 // Upsert one vector row. Returns SUCCESS on success.
 bool memory_write_embedding(const char *table, const char *id_col, int64_t id,

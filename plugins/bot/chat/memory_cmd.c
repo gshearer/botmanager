@@ -76,6 +76,32 @@ cmd_show_memstore(const cmd_ctx_t *ctx)
       cfg.recall_instruct[0] != '\0' ? cfg.recall_instruct : "(off)");
   cmd_reply(ctx, buf);
 
+  if(cfg.embed_burst_max == 0)
+    snprintf(buf, sizeof(buf), "  embed_burst=(off)");
+
+  else
+    snprintf(buf, sizeof(buf), "  embed_burst=%u msgs/%us",
+        cfg.embed_burst_max, cfg.embed_burst_secs);
+
+  cmd_reply(ctx, buf);
+
+  // Report what is enforced, not what is stored: a pattern that failed
+  // to compile leaves the gate off, and a state view that echoed the
+  // knob would be lying about it.
+  if(memory_kv_str_disabled(cfg.embed_exclude_regex))
+    snprintf(buf, sizeof(buf), "  embed_exclude_regex=(off)");
+
+  else if(!memory_exclude_regex_active())
+    snprintf(buf, sizeof(buf),
+        "  embed_exclude_regex=(off - '%s' does not compile)",
+        cfg.embed_exclude_regex);
+
+  else
+    snprintf(buf, sizeof(buf), "  embed_exclude_regex=%s",
+        cfg.embed_exclude_regex);
+
+  cmd_reply(ctx, buf);
+
   memory_backfill_status(buf, sizeof(buf));
   cmd_reply(ctx, buf);
 

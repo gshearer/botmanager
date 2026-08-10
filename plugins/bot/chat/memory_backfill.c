@@ -200,6 +200,11 @@ backfill_fetch(void)
 
       bf.scanned++;
 
+      // The content gate — including its exclusion regex, which the
+      // predicate reads from module state, so the backfill inherits it
+      // with no signature change. It does NOT inherit the burst gate,
+      // and that is intended, not an oversight: a backfill re-reads
+      // history where the burst is long over and now() means nothing.
       if(text_s == NULL || !memory_text_is_embeddable(text_s, min_chars))
       {
         bf.skipped++;

@@ -15,9 +15,11 @@
 #include <ctype.h>
 #include <inttypes.h>
 #include <math.h>
+#include <regex.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <strings.h>
 
 // Module state
 
@@ -35,6 +37,16 @@ uint64_t                 memory_stat_forgets = 0;
 // Decay sweep periodic task (if scheduled).
 static task_handle_t     memory_sweep_task  = TASK_HANDLE_NONE;
 time_t                   memory_last_sweep  = 0;
+
+// The compiled embed-exclusion pattern. Compiled once per change under
+// the write lock and read under the read lock by every logged line, so a
+// live /set kv can never be seen half-applied. The pattern string is
+// kept beside it purely so a recompile can be skipped when some other
+// memory.* key changes.
+static regex_t           memory_exclude_rx;
+static bool              memory_exclude_rx_valid = false;
+static char              memory_exclude_rx_pattern[MEM_EXCLUDE_REGEX_SZ] = "";
+static pthread_rwlock_t  memory_exclude_rx_lock;
 
 // Small utilities
 
@@ -81,12 +93,90 @@ memory_cfg_snapshot(mem_cfg_t *out)
 
 // KV configuration
 
+bool
+memory_kv_str_disabled(const char *s)
+{
+  return(s == NULL || s[0] == '\0'
+      || strcasecmp(s, "off")  == 0
+      || strcasecmp(s, "none") == 0
+      || strcmp(s, "\"\"")     == 0);
+}
+
+// Compile the exclusion pattern. Called for every memory.* change, so it
+// no-ops unless the pattern itself moved.
+//
+// ⚠ A pattern that fails to compile DISABLES the gate — it must never
+// reject everything. A typo in a KV would otherwise silently empty the
+// corpus, one unembedded line at a time, with nothing to see afterwards.
+static void
+memory_exclude_regex_compile(const char *pattern)
+{
+  char err[MEM_ERR_SZ];
+  int  rc;
+
+  pthread_rwlock_wrlock(&memory_exclude_rx_lock);
+
+  if(strcmp(pattern, memory_exclude_rx_pattern) == 0)
+  {
+    pthread_rwlock_unlock(&memory_exclude_rx_lock);
+    return;
+  }
+
+  if(memory_exclude_rx_valid)
+  {
+    regfree(&memory_exclude_rx);
+    memory_exclude_rx_valid = false;
+  }
+
+  snprintf(memory_exclude_rx_pattern, sizeof(memory_exclude_rx_pattern),
+      "%s", pattern);
+
+  if(memory_kv_str_disabled(pattern))
+  {
+    pthread_rwlock_unlock(&memory_exclude_rx_lock);
+    clam(CLAM_INFO, "memory", "embed exclude regex disabled");
+    return;
+  }
+
+  rc = regcomp(&memory_exclude_rx, pattern, REG_EXTENDED | REG_NOSUB);
+
+  if(rc != 0)
+  {
+    // Do not regfree() a preg regcomp() rejected — its contents are
+    // undefined. regerror() is the one call that stays valid.
+    regerror(rc, &memory_exclude_rx, err, sizeof(err));
+    pthread_rwlock_unlock(&memory_exclude_rx_lock);
+    clam(CLAM_WARN, "memory",
+        "embed exclude regex '%s' does not compile (%s); gate disabled",
+        pattern, err);
+    return;
+  }
+
+  memory_exclude_rx_valid = true;
+  pthread_rwlock_unlock(&memory_exclude_rx_lock);
+
+  clam(CLAM_DEBUG, "memory", "embed exclude regex compiled: %s", pattern);
+}
+
+bool
+memory_exclude_regex_active(void)
+{
+  bool on;
+
+  pthread_rwlock_rdlock(&memory_exclude_rx_lock);
+  on = memory_exclude_rx_valid;
+  pthread_rwlock_unlock(&memory_exclude_rx_lock);
+
+  return(on);
+}
+
 static void
 memory_load_config(void)
 {
   mem_cfg_t c;
   const char *em;
   const char *ri;
+  const char *xr;
 
   c.enabled                   = kv_get_uint("memory.enabled") != 0;
   c.witness_embeds            = kv_get_uint("memory.witness_embeds") != 0;
@@ -99,6 +189,8 @@ memory_load_config(void)
   c.rag_max_context_chars     = (uint32_t)kv_get_uint("memory.rag_max_context_chars");
   c.embed_min_chars           = (uint32_t)kv_get_uint("memory.embed_min_chars");
   c.embed_batch_size          = (uint32_t)kv_get_uint("memory.embed_batch_size");
+  c.embed_burst_max           = (uint32_t)kv_get_uint("memory.embed_burst_max");
+  c.embed_burst_secs          = (uint32_t)kv_get_uint("memory.embed_burst_secs");
   c.embed_own_replies         = kv_get_uint("memory.embed_own_replies") != 0;
   c.decay_sweep_interval_secs = (uint32_t)kv_get_uint("memory.decay_sweep_interval_secs");
 
@@ -107,6 +199,10 @@ memory_load_config(void)
 
   ri = kv_get_str("memory.recall_instruct");
   snprintf(c.recall_instruct, sizeof(c.recall_instruct), "%s", ri ? ri : "");
+
+  xr = kv_get_str("memory.embed_exclude_regex");
+  snprintf(c.embed_exclude_regex, sizeof(c.embed_exclude_regex), "%s",
+      xr ? xr : "");
 
   if(c.log_retention_days == 0)
     c.log_retention_days = MEM_DEF_LOG_RETENTION_DAYS;
@@ -135,6 +231,12 @@ memory_load_config(void)
   if(c.embed_batch_size > MEM_EMBED_BATCH_MAX)
     c.embed_batch_size = MEM_EMBED_BATCH_MAX;
 
+  // embed_burst_max is NOT clamped up either — 0 disables the burst
+  // gate. The window is, since a zero-second window would count only
+  // rows sharing the current instant and never trip.
+  if(c.embed_burst_max > 0 && c.embed_burst_secs == 0)
+    c.embed_burst_secs = MEM_DEF_EMBED_BURST_SECS;
+
   // embed_min_chars is deliberately NOT clamped up to its default the
   // way every knob above is: 0 is a meaningful value here, meaning
   // "disable the content filter", the same escape hatch
@@ -146,6 +248,11 @@ memory_load_config(void)
   pthread_mutex_lock(&memory_cfg_mutex);
   memory_cfg = c;
   pthread_mutex_unlock(&memory_cfg_mutex);
+
+  // Outside the cfg lock: the pattern lives in its own compiled form
+  // under its own rwlock, and holding two locks to publish one knob buys
+  // nothing.
+  memory_exclude_regex_compile(c.embed_exclude_regex);
 }
 
 static void
@@ -221,6 +328,30 @@ memory_register_kv(void)
       " a hub vector and returns the corpus's blandest line."
       " 'off' or 'none' disables it. Does NOT affect live bot replies"
       " or knowledge RAG.");
+  kv_register("memory.embed_burst_max", KV_UINT32, "4",
+      memory_kv_changed, NULL,
+      "Messages from one person within memory.embed_burst_secs before"
+      " the burst is treated as a paste and none of the window is"
+      " embedded — including the lines already embedded before the"
+      " threshold tripped, whose vectors are deleted. A human does not"
+      " post four lines in five seconds; a paste, or a bot dumping a"
+      " table, does. 0 disables the gate.");
+  kv_register("memory.embed_burst_secs", KV_UINT32, "5",
+      memory_kv_changed, NULL,
+      "Window in seconds for memory.embed_burst_max. Ignored when that"
+      " is 0.");
+  kv_register("memory.embed_exclude_regex", KV_STR,
+      MEM_DEF_EMBED_EXCLUDE_REGEX,
+      memory_kv_changed, NULL,
+      "POSIX extended regex; a conversation line matching it earns no"
+      " vector. Catches what a burst cannot — code, diffs and tables a"
+      " human pasted at ordinary typing speed — which reach live reply"
+      " prompts and displace real content. Matched against the line with"
+      " leading whitespace stripped, so anchor alternatives with ^."
+      " ⛔ Never add a whitespace-run alternative: it reads as column"
+      " output and eats the speech of anyone who double-spaces after a"
+      " sentence. 'off' or 'none' disables it; a pattern that does not"
+      " compile logs a WARN and disables it too.");
 }
 
 // BYTEA helpers (float32 LE packing + hex serialization for Postgres).
@@ -423,10 +554,15 @@ memory_embed_done(const llm_embed_response_t *resp)
 // substitute, because the hubs are precisely what score high, so a
 // floor discards the genuine matches first.
 //
-// Two gates, both of which must pass, and only the first is tunable:
+// Three gates, all of which must pass:
 //
-//   1. trimmed byte length >= min_chars (0 disables the whole filter)
+//   1. trimmed byte length >= min_chars (0 disables gates 1 and 2)
 //   2. at least MEM_EMBED_MIN_TOKENS content-bearing tokens
+//   3. no match against memory.embed_exclude_regex
+//
+// Gate 3 is independent and carries its own escape hatch, which is why
+// min_chars == 0 does not disable it: length says nothing about whether
+// a line is a pasted diff, and a pasted diff is long.
 //
 // Rule 2 is not a knob on purpose. A single-token line is the hub case
 // itself and no threshold makes "heh" worth recalling, and it is also
@@ -442,6 +578,24 @@ memory_embed_done(const llm_embed_response_t *resp)
 // and urlgrabber already owns links); and the IRC action prefix
 // "* <nick> " is NOT stripped here, unlike extract_prompt_build() —
 // an action is content and counts toward both gates.
+
+// Gate 3. `text` must already have had its leading whitespace stripped:
+// the shipped alternatives are ^-anchored, and " karen  20  12  0" would
+// slip past every one of them. Trailing whitespace is harmless, so the
+// caller passes a pointer into its own string rather than a trimmed copy.
+static bool
+memory_text_excluded(const char *text)
+{
+  bool hit;
+
+  pthread_rwlock_rdlock(&memory_exclude_rx_lock);
+  hit = memory_exclude_rx_valid
+      && regexec(&memory_exclude_rx, text, 0, NULL, 0) == 0;
+  pthread_rwlock_unlock(&memory_exclude_rx_lock);
+
+  return(hit);
+}
+
 bool
 memory_text_is_embeddable(const char *text, uint32_t min_chars)
 {
@@ -455,13 +609,16 @@ memory_text_is_embeddable(const char *text, uint32_t min_chars)
   if(text == NULL)
     return(false);
 
-  if(min_chars == 0)
-    return(true);
-
   start = text;
 
   while(*start != '\0' && isspace((unsigned char)*start))
     start++;
+
+  if(memory_text_excluded(start))
+    return(false);
+
+  if(min_chars == 0)
+    return(true);
 
   end = start + strlen(start);
 
@@ -877,6 +1034,81 @@ memory_forget_dossier_fact(int64_t fact_id)
 
 // Conversation log
 
+// Gate A. A human does not post four lines in five seconds; a paste, or
+// a bot dumping a table, does. Measured on the live corpus the shipped
+// threshold costs 0 of 1,546 normal rows and 0 of the 25 rows belonging
+// to the one human who triple-spaces after a sentence.
+//
+// ⭑ The retroactive delete is what makes this gate work at all. The
+// decision is per-message at log time, so when line 1 of a paste arrives
+// nothing yet indicates a burst and lines 1..max-1 are embedded before
+// the threshold trips. Deleting the whole window's vectors is therefore
+// part of the gate, not a tidy-up. It re-runs on every later message of
+// the same burst, which is what sweeps up a straggler whose async embed
+// landed after an earlier delete — self-healing by construction, so do
+// NOT add in-flight tracking to close that race. Re-running the delete
+// is cheaper than preventing it.
+//
+// ⚠ The look-back is a DB query and deliberately not an in-memory
+// per-sender ring: a ring is zeroed by /plugin reload chat, which
+// happens many times a day, and a zeroed timing guard reads as "not a
+// burst" (the failure class finding_reload_zeroed_timestamp_guards
+// records). idx_conv_dossier_ts makes this an index-only scan, measured
+// at 0.015 ms. The window is expressed with the server's now() because
+// mem_msg_t.ts is 0 for "NOW()" on the live path, and the row this call
+// is deciding about was inserted moments ago by the same caller.
+static bool
+memory_burst_suppressed(int64_t dossier_id, uint32_t max, uint32_t secs)
+{
+  db_result_t *res;
+  const char  *cell;
+  char         sql[MEM_SQL_SZ];
+  uint64_t     n;
+
+  // An unattributable speaker cannot be burst-detected: counting a
+  // channel's whole traffic as one sender's would suppress everyone.
+  if(max == 0 || dossier_id <= 0)
+    return(false);
+
+  snprintf(sql, sizeof(sql),
+      "SELECT count(*) FROM conversation_log"
+      " WHERE dossier_id = %" PRId64
+      " AND ts > now() - interval '%u seconds'", dossier_id, secs);
+
+  res  = db_result_alloc();
+  cell = NULL;
+  n    = 0;
+
+  if(db_query(sql, res) != SUCCESS || !res->ok)
+    clam(CLAM_WARN, "memory", "burst count: %s", res->error);
+
+  else if(res->rows > 0 && (cell = db_result_get(res, 0, 0)) != NULL)
+    n = strtoull(cell, NULL, 10);
+
+  db_result_free(res);
+
+  if(n < (uint64_t)max)
+    return(false);
+
+  snprintf(sql, sizeof(sql),
+      "DELETE FROM conversation_embeddings e USING conversation_log x"
+      " WHERE x.id = e.msg_id AND x.dossier_id = %" PRId64
+      " AND x.ts > now() - interval '%u seconds'", dossier_id, secs);
+
+  res = db_result_alloc();
+
+  if(db_query(sql, res) != SUCCESS || !res->ok)
+    clam(CLAM_WARN, "memory", "burst purge: %s", res->error);
+
+  db_result_free(res);
+
+  clam(CLAM_DEBUG, "memory",
+      "burst: dossier %" PRId64 " sent %" PRIu64 " lines in %us;"
+      " window not embedded", dossier_id, n, secs);
+
+  return(true);
+}
+
 void
 memory_log_message(const mem_msg_t *msg)
 {
@@ -979,6 +1211,16 @@ memory_log_message(const mem_msg_t *msg)
       case MEM_MSG_EXCHANGE_IN:  do_embed = true;                  break;
       case MEM_MSG_EXCHANGE_OUT: do_embed = cfg.embed_own_replies; break;
     }
+
+    // Gate A applies to EXCHANGE_IN as well: a human pasting *at* the
+    // bot is still pasting. It lives here rather than in
+    // memory_text_is_embeddable() because it needs the speaker and the
+    // clock, which a text predicate has no business knowing — and
+    // because the backfill must NOT inherit it. See the note at
+    // memory_backfill.c's filter call.
+    if(do_embed && memory_burst_suppressed(msg->dossier_id,
+        cfg.embed_burst_max, cfg.embed_burst_secs))
+      do_embed = false;
 
     if(do_embed)
       memory_submit_embed(new_id, cfg.embed_model, msg->text,
@@ -1144,6 +1386,7 @@ memory_init(void)
 
   pthread_mutex_init(&memory_cfg_mutex, NULL);
   pthread_mutex_init(&memory_stat_mutex, NULL);
+  pthread_rwlock_init(&memory_exclude_rx_lock, NULL);
 
   memset(&memory_cfg, 0, sizeof(memory_cfg));
   memory_cfg.enabled                    = true;
@@ -1216,8 +1459,17 @@ memory_exit(void)
   // memory_stop()'s business — by here it must already be cancelled.
   memory_sweep_task = TASK_HANDLE_NONE;
 
+  if(memory_exclude_rx_valid)
+  {
+    regfree(&memory_exclude_rx);
+    memory_exclude_rx_valid = false;
+  }
+
+  memory_exclude_rx_pattern[0] = '\0';
+
   pthread_mutex_destroy(&memory_cfg_mutex);
   pthread_mutex_destroy(&memory_stat_mutex);
+  pthread_rwlock_destroy(&memory_exclude_rx_lock);
 
   clam(CLAM_INFO, "memory", "memory subsystem shut down");
 }

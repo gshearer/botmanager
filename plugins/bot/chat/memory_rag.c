@@ -13,7 +13,6 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <strings.h>
 
 // Retrieval (Chunk D)
 
@@ -417,18 +416,12 @@ memory_retrieve_ns_embed_done(const llm_embed_response_t *resp)
 // Render what actually gets embedded for a recall query. Returns `out`
 // when an instruction is configured, or `query` itself when it is
 // disabled — so the caller submits the pointer this returns and never
-// assumes a copy was made. `/set kv` cannot store a true empty string
-// (finding: the REST arg is required and a quoted "" is stored as two
-// literal bytes), so all four of NULL, "", '""' and the typeable
-// sentinels off/none mean the same thing: submit the query raw.
+// assumes a copy was made.
 static const char *
 memory_recall_render_query(const char *query, const char *instruct,
     char *out, size_t out_sz)
 {
-  if(instruct == NULL || instruct[0] == '\0'
-      || strcasecmp(instruct, "off")  == 0
-      || strcasecmp(instruct, "none") == 0
-      || strcmp(instruct, "\"\"")     == 0)
+  if(memory_kv_str_disabled(instruct))
     return(query);
 
   snprintf(out, out_sz, "Instruct: %s\nQuery: %s", instruct, query);
