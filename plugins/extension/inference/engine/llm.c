@@ -1173,8 +1173,14 @@ llm_negotiate_parse(const char *body, size_t len, llm_directive_t *out)
   memset(out, 0, sizeof(*out));
 
   // "Unsupported parameter: '<P>' is not supported ... [Use '<Q>' instead]"
+  // "Unknown parameter: '<P>'." — the images endpoint's wording for a field
+  // the model does not take at all (the gpt-image family and
+  // `response_format`). It never names a replacement, so it always resolves
+  // to a DROP; the "Use '" probe below costs nothing and stays shared.
   if(llm_extract_squoted(body, len, "Unsupported parameter: '",
-      field, sizeof(field)) == SUCCESS)
+         field, sizeof(field)) == SUCCESS
+      || llm_extract_squoted(body, len, "Unknown parameter: '",
+         field, sizeof(field)) == SUCCESS)
   {
     snprintf(out->field, sizeof(out->field), "%s", field);
 
@@ -1202,14 +1208,26 @@ llm_negotiate_parse(const char *body, size_t len, llm_directive_t *out)
   return(FAIL);
 }
 
-// True for the canonical fields llm_append_chat_params emits and can
+// True for the canonical fields the params tail for `type` emits and can
 // negotiate. A parsed field outside this set (e.g. the renamed wire name on a
 // second failure) bails the negotiation — this bounds the retry loop.
+//
+// Every image field here is safe to drop, because each one's provider default
+// is what we would have asked for anyway. `response_format` reads like the
+// exception and is not: a provider that rejects the parameter outright has
+// exactly one output form, and for an images endpoint that form is the
+// inline base64 we wanted.
 static bool
-llm_is_builder_field(const char *field)
+llm_is_builder_field(llm_req_type_t type, const char *field)
 {
-  return(strcmp(field, "temperature") == 0
-      || strcmp(field, "max_tokens") == 0);
+  if(type == LLM_REQ_IMAGE)
+    return(strcmp(field, "response_format") == 0
+        || strcmp(field, "size") == 0
+        || strcmp(field, "n") == 0);
+
+  return(type == LLM_REQ_CHAT
+      && (strcmp(field, "temperature") == 0
+       || strcmp(field, "max_tokens") == 0));
 }
 
 // The request's currently-applied directive for a canonical field, or NULL.
@@ -1617,11 +1635,50 @@ llm_build_chat_prefix(llm_request_t *req, const llm_message_t *msgs,
   return(SUCCESS);
 }
 
-// Compose req->req_body = body_prefix + params-tail. Called on first submit
-// and on every retry (including negotiation retries, where the directives —
-// hence the tail — may have changed). The prefix is never re-encoded.
+// Emit the mutable image-params tail (n / size / response_format) and the
+// closing brace, applying the request's learned dialect directives exactly as
+// the chat tail does.
+//
+// We ask for base64 because the bot hosts the result itself and a
+// provider-hosted URL is of no use to it — but the ask is negotiable, since a
+// provider that returns base64 unconditionally rejects being told to (see
+// llm_is_builder_field). `size` is omitted when unset so the provider's own
+// default applies.
+static void
+llm_append_image_params(llm_buf_t *b, const llm_request_t *req)
+{
+  const char *wf;
+
+  wf = llm_wire_field(req, "n");
+
+  if(wf != NULL)
+    llm_buf_printf(b, ",\"%s\":%u", wf, req->image_n);
+
+  if(req->image_size[0] != '\0')
+  {
+    wf = llm_wire_field(req, "size");
+
+    if(wf != NULL)
+    {
+      llm_buf_printf(b, ",\"%s\":", wf);
+      llm_json_str(b, req->image_size);
+    }
+  }
+
+  wf = llm_wire_field(req, "response_format");
+
+  if(wf != NULL)
+    llm_buf_printf(b, ",\"%s\":\"b64_json\"", wf);
+
+  llm_buf_putc(b, '}');
+}
+
+// Compose req->req_body = body_prefix + the params tail its kind emits.
+// Called on first submit and on every retry (including negotiation retries,
+// where the directives — hence the tail — may have changed). The prefix, which
+// carries the messages or the prompt, is never re-encoded.
 static bool
-llm_compose_chat_body(llm_request_t *req)
+llm_compose_body(llm_request_t *req)
 {
   llm_buf_t b;
 
@@ -1630,7 +1687,17 @@ llm_compose_chat_body(llm_request_t *req)
 
   llm_buf_init(&b, req->body_prefix_len + 64);
   llm_buf_append(&b, req->body_prefix, req->body_prefix_len);
-  llm_append_chat_params(&b, req);
+
+  switch(req->type)
+  {
+    case LLM_REQ_CHAT:  llm_append_chat_params(&b, req);  break;
+    case LLM_REQ_IMAGE: llm_append_image_params(&b, req); break;
+
+    // No other kind builds a prefix, so no other kind reaches here.
+    default:
+      mem_free(b.buf);
+      return(FAIL);
+  }
 
   if(req->req_body != NULL)
     mem_free(req->req_body);
@@ -1667,13 +1734,11 @@ llm_build_embed_body(llm_request_t *req, const char *const *inputs,
   return(SUCCESS);
 }
 
-// Build the text-to-image request body:
-//   {"model":...,"prompt":...,"n":1,"size":"...","response_format":"b64_json"}
-// The bot owns hosting, so we always ask for base64 bytes rather than a
-// provider-hosted URL (see the imagine command). `size` is omitted when
-// unset so the provider's own default applies.
+// Build the immutable image-body prefix {"model":...,"prompt":...} into
+// req->body_prefix (no params, no closing brace). Retained for the same
+// reason the chat prefix is: a negotiation retry rebuilds only the tail.
 static bool
-llm_build_image_body(llm_request_t *req, const char *prompt)
+llm_build_image_prefix(llm_request_t *req, const char *prompt)
 {
   llm_buf_t b;
   llm_buf_init(&b, 512);
@@ -1684,18 +1749,11 @@ llm_build_image_body(llm_request_t *req, const char *prompt)
   llm_buf_puts(&b, ",\"prompt\":");
   llm_json_str(&b, prompt != NULL ? prompt : "");
 
-  llm_buf_puts(&b, ",\"n\":1");
+  if(req->body_prefix != NULL)
+    mem_free(req->body_prefix);
 
-  if(req->image_size[0] != '\0')
-  {
-    llm_buf_puts(&b, ",\"size\":");
-    llm_json_str(&b, req->image_size);
-  }
-
-  llm_buf_puts(&b, ",\"response_format\":\"b64_json\"}");
-
-  req->req_body     = b.buf;
-  req->req_body_len = b.len;
+  req->body_prefix     = b.buf;
+  req->body_prefix_len = b.len;
   return(SUCCESS);
 }
 
@@ -2295,6 +2353,13 @@ llm_deliver_image(llm_request_t *req, bool ok, long http_status,
 {
   llm_image_response_t resp;
 
+  // As on the chat path: the retry that finally succeeded may have learned a
+  // dialect directive (the gpt-image family's rejection of `response_format`
+  // is the one measured case). Persist it so later renders build the right
+  // body on the first try.
+  if(ok)
+    llm_model_params_flush_staged(req);
+
   memset(&resp, 0, sizeof(resp));
   resp.request        = req;
   resp.ok             = ok;
@@ -2409,12 +2474,17 @@ llm_retry_task(task_t *t)
   if(req->sse_parser != NULL)
     sse_parser_reset(req->sse_parser);
 
-  // Rebuild the chat body tail so any directive a negotiation retry just
-  // learned applies; the messages prefix is immutable. (For a plain
-  // 429/5xx retry the directives are unchanged, so this is a cheap no-op
-  // that reproduces the same body.)
-  if(req->type == LLM_REQ_CHAT && req->body_prefix != NULL)
-    llm_compose_chat_body(req);
+  // Rebuild the body tail so any directive a negotiation retry just learned
+  // applies; the prefix — the messages, or the image prompt — is immutable.
+  // (For a plain 429/5xx retry the directives are unchanged, so this is a
+  // cheap no-op that reproduces the same body.)
+  if(req->body_prefix != NULL && llm_compose_body(req) != SUCCESS)
+  {
+    snprintf(req->errbuf, sizeof(req->errbuf), "retry body rebuild failed");
+    llm_deliver(req, false, 0, req->errbuf);
+    t->state = TASK_ENDED;
+    return;
+  }
 
   if(llm_issue_request(req) != SUCCESS)
   {
@@ -2541,9 +2611,10 @@ llm_curl_done_cb(const curl_response_t *resp)
   // Dialect negotiation (LLM-DIALECT-1): an OpenAI-style 400 parameter error
   // names its own fix. Parse it off the raw body (not the truncated errbuf),
   // learn the directive, and schedule a corrective retry with a rebuilt body.
-  // Gated to chat requests that haven't streamed any bytes.
+  // Gated to the two kinds that keep a rebuildable prefix (chat, image), and
+  // for chat to requests that haven't streamed any bytes.
   if(!ok
-      && req->type == LLM_REQ_CHAT
+      && (req->type == LLM_REQ_CHAT || req->type == LLM_REQ_IMAGE)
       && resp->status == 400
       && resp->curl_code == 0
       && (!req->streaming || req->bytes_seen == 0)
@@ -2554,7 +2625,7 @@ llm_curl_done_cb(const curl_response_t *resp)
     llm_directive_t d;
 
     if(llm_negotiate_parse(resp->body, resp->body_len, &d) == SUCCESS
-        && llm_is_builder_field(d.field)
+        && llm_is_builder_field(req->type, d.field)
         && llm_directive_is_new(req, &d)
         && req->negotiation_attempts < LLM_NEGOTIATION_CAP
         && !llm_stopping)
@@ -2798,7 +2869,7 @@ llm_chat_submit(const char *model_name,
   llm_clam_prompt_chat(model_name, &req->params, messages, n_messages);
 
   if(llm_build_chat_prefix(req, messages, n_messages) != SUCCESS
-      || llm_compose_chat_body(req) != SUCCESS)
+      || llm_compose_body(req) != SUCCESS)
   {
     llm_req_release(req);
     return(FAIL);
@@ -2940,6 +3011,11 @@ llm_image_submit(const char *model_name,
       "llm.service.%s.creds.apikey", m.service_name);
   snprintf(req->service_name, sizeof(req->service_name), "%s", m.service_name);
 
+  // Seed any learned request-dialect directives so the very first body for a
+  // known-quirky model is already correct (no negotiation round-trip).
+  req->n_directives = llm_model_params_lookup(m.service_name, m.model_id,
+      req->directives, LLM_MAX_DIRECTIVES);
+
   req->kind          = m.kind;
   req->image_done_cb = done_cb;
   req->user_data     = user_data;
@@ -2954,7 +3030,8 @@ llm_image_submit(const char *model_name,
     req->params.timeout_secs = params->timeout_secs;
   }
 
-  if(llm_build_image_body(req, prompt) != SUCCESS)
+  if(llm_build_image_prefix(req, prompt) != SUCCESS
+      || llm_compose_body(req) != SUCCESS)
   {
     llm_req_release(req);
     return(FAIL);
