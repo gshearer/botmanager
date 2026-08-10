@@ -13,6 +13,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <strings.h>
 
 // Retrieval (Chunk D)
 
@@ -413,13 +414,36 @@ memory_retrieve_ns_embed_done(const llm_embed_response_t *resp)
   mem_free(c);
 }
 
+// Render what actually gets embedded for a recall query. Returns `out`
+// when an instruction is configured, or `query` itself when it is
+// disabled — so the caller submits the pointer this returns and never
+// assumes a copy was made. `/set kv` cannot store a true empty string
+// (finding: the REST arg is required and a quoted "" is stored as two
+// literal bytes), so all four of NULL, "", '""' and the typeable
+// sentinels off/none mean the same thing: submit the query raw.
+static const char *
+memory_recall_render_query(const char *query, const char *instruct,
+    char *out, size_t out_sz)
+{
+  if(instruct == NULL || instruct[0] == '\0'
+      || strcasecmp(instruct, "off")  == 0
+      || strcasecmp(instruct, "none") == 0
+      || strcmp(instruct, "\"\"")     == 0)
+    return(query);
+
+  snprintf(out, out_sz, "Instruct: %s\nQuery: %s", instruct, query);
+
+  return(out);
+}
+
 bool
 memory_retrieve_ns(int ns_id, const char *query,
     uint32_t top_k, memory_retrieve_cb_t cb, void *user)
 {
-  const char *inputs[1] = { query };
   memory_retrieval_ctx_t *c;
+  const char *inputs[1];
   mem_cfg_t cfg;
+  char qbuf[MEM_RECALL_QUERY_SZ];
 
   if(cb == NULL)
     return(FAIL);
@@ -433,6 +457,12 @@ memory_retrieve_ns(int ns_id, const char *query,
     cb(NULL, 0, NULL, 0, user);
     return(SUCCESS);
   }
+
+  // Only after that guard: an empty query must never be submitted as a
+  // bare instruction with nothing after it. qbuf need only outlive the
+  // submit below, which deep-copies its inputs.
+  inputs[0] = memory_recall_render_query(query, cfg.recall_instruct,
+      qbuf, sizeof(qbuf));
 
   c = mem_alloc("memory", "rag_ctx", sizeof(*c));
 

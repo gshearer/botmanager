@@ -86,6 +86,7 @@ memory_load_config(void)
 {
   mem_cfg_t c;
   const char *em;
+  const char *ri;
 
   c.enabled                   = kv_get_uint("memory.enabled") != 0;
   c.witness_embeds            = kv_get_uint("memory.witness_embeds") != 0;
@@ -103,6 +104,9 @@ memory_load_config(void)
 
   em = kv_get_str("memory.embed_model");
   snprintf(c.embed_model, sizeof(c.embed_model), "%s", em ? em : "");
+
+  ri = kv_get_str("memory.recall_instruct");
+  snprintf(c.recall_instruct, sizeof(c.recall_instruct), "%s", ri ? ri : "");
 
   if(c.log_retention_days == 0)
     c.log_retention_days = MEM_DEF_LOG_RETENTION_DAYS;
@@ -135,6 +139,9 @@ memory_load_config(void)
   // way every knob above is: 0 is a meaningful value here, meaning
   // "disable the content filter", the same escape hatch
   // memory.recall_min_cosine uses. Clamping would remove it.
+  // recall_instruct is left alone for the same reason: an empty or
+  // sentinel value means "submit the recall query raw", and it is
+  // memory_recall_render_query() that interprets it.
 
   pthread_mutex_lock(&memory_cfg_mutex);
   memory_cfg = c;
@@ -205,6 +212,15 @@ memory_register_kv(void)
       " batching-aware endpoint; bounded at compile time by"
       " MEM_EMBED_BATCH_MAX. Does not affect the live embed path, which"
       " submits one line at a time as it is logged.");
+  kv_register("memory.recall_instruct", KV_STR, MEM_DEF_RECALL_INSTRUCT,
+      memory_kv_changed, NULL,
+      "Task sentence prefixed to the semantic-recall query for"
+      " /show bot <name> memories. Qwen3 embedders are asymmetric —"
+      " the query is instructed, stored documents never are, so this"
+      " needs no re-embed. Without it a bare one-word query embeds to"
+      " a hub vector and returns the corpus's blandest line."
+      " 'off' or 'none' disables it. Does NOT affect live bot replies"
+      " or knowledge RAG.");
 }
 
 // BYTEA helpers (float32 LE packing + hex serialization for Postgres).

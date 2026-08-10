@@ -72,6 +72,10 @@ cmd_show_memstore(const cmd_ctx_t *ctx)
       cfg.embed_min_chars, cfg.embed_batch_size);
   cmd_reply(ctx, buf);
 
+  snprintf(buf, sizeof(buf), "  recall_instruct=%s",
+      cfg.recall_instruct[0] != '\0' ? cfg.recall_instruct : "(off)");
+  cmd_reply(ctx, buf);
+
   memory_backfill_status(buf, sizeof(buf));
   cmd_reply(ctx, buf);
 

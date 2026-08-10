@@ -294,6 +294,17 @@ bool memory_test_inject_embedding(int64_t id, const char *model,
 // struct, which carries its ids and text pointers inline.
 #define MEM_EMBED_BATCH_MAX              64
 
+// The recall query's task instruction, and the buffer the instructed
+// query is rendered into. Qwen3 embedders are asymmetric: the QUERY
+// carries a task instruction, the documents never do. Measured on the
+// live corpus, this exact wording puts 14/14 labelled queries at rank 1
+// where raw manages 11/14 and misses three short ones entirely.
+// Rewording it measurably loses ground — see TODO.md §EMBED-4.
+#define MEM_RECALL_INSTRUCT_SZ  256
+#define MEM_RECALL_QUERY_SZ     (MEM_MSG_TEXT_SZ + MEM_RECALL_INSTRUCT_SZ + 32)
+#define MEM_DEF_RECALL_INSTRUCT \
+    "Given a search query, retrieve relevant chat messages"
+
 // Buffer sizes used across helpers.
 #define MEM_SQL_SZ      4096
 #define MEM_ERR_SZ      256
@@ -315,6 +326,7 @@ typedef struct
   uint32_t recall_min_cosine_x100;
   uint32_t embed_min_chars;
   uint32_t embed_batch_size;
+  char     recall_instruct[MEM_RECALL_INSTRUCT_SZ];
 } mem_cfg_t;
 
 // Module state shared across memory.c and its siblings (memory_rag.c,
