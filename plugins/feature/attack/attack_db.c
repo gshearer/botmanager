@@ -371,9 +371,10 @@ atk_db_round_find(uint32_t ns_id, const char *method, const char *channel,
 
   snprintf(sql, sizeof(sql),
       "SELECT id, wave, blows, top_crit,"
-      // The brawl's whole age, not its silence: there is one clock now,
-      // and it starts when the round does.
-      " EXTRACT(EPOCH FROM (NOW() - started_at))::bigint"
+      // Two clocks: the whole age from started_at for the retirement line,
+      // and the silence from last_action, which is what ends the game.
+      " EXTRACT(EPOCH FROM (NOW() - started_at))::bigint,"
+      " EXTRACT(EPOCH FROM (NOW() - last_action))::bigint"
       " FROM %s WHERE ns_id = %" PRIu32 " AND method = '%s'"
       " AND channel = '%s' AND state = %d",
       t.rounds, ns_id, e_meth, e_chan, ATK_ROUND_ACTIVE);
@@ -387,6 +388,7 @@ atk_db_round_find(uint32_t ns_id, const char *method, const char *channel,
     out->blows    = atk_col_i32(res, 0, 2);
     out->top_crit = atk_col_i32(res, 0, 3);
     out->age      = atk_col_i64(res, 0, 4);
+    out->idle     = atk_col_i64(res, 0, 5);
     hit = true;
   }
 

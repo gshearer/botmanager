@@ -48,9 +48,9 @@ static const plugin_kv_entry_t atk_kv_schema[] = {
     "Percent of the heaviest possible blow at which a hit reads as "
     "'critical' — and counts as a critical hit in the standings" },
 
-  { ATK_KV_ROUND_MAX,  KV_UINT32, "14400",
-    "Seconds a brawl may last before the game is over; only a fresh "
-    "attack opens a new one" },
+  { ATK_KV_ROUND_IDLE, KV_UINT32, "14400",
+    "Seconds a brawl may go idle before the game is over; each !attack "
+    "or !heal resets the clock and a fresh attack opens a new one" },
   { ATK_KV_EJECT,      KV_UINT8,  "1",
     "Remove the fallen from the room (KILL/KICK) where the method allows" },
   { ATK_KV_SCORE_ROWS, KV_UINT32, "15",
@@ -131,7 +131,8 @@ atk_tunables_load(atk_tunables_t *out)
 
   out->start_hp        = atk_clamp(kv_get_uint(ATK_KV_START_HP),   1, 100000);
   out->dmg_max         = atk_clamp(kv_get_uint(ATK_KV_DMG_MAX),    1, 1000);
-  out->round_max_secs  = atk_clamp(kv_get_uint(ATK_KV_ROUND_MAX), 60, 604800);
+  out->round_max_idle_secs = atk_clamp(kv_get_uint(ATK_KV_ROUND_IDLE), 60,
+                                     604800);
   out->scoreboard_rows = atk_clamp(kv_get_uint(ATK_KV_SCORE_ROWS), 1,
                                      ATK_MAX_SCORE_ROWS);
   out->aoe_pct         = atk_clamp(kv_get_uint(ATK_KV_AOE_PCT),     0, 100);

@@ -435,12 +435,12 @@ atk_cmd_attack(const cmd_ctx_t *ctx)
 
   // ---- 5. the round ------------------------------------------------ //
 
-  // One clock, and it measures the brawl's whole life rather than its
-  // silence: a round runs for round_max_secs and then the game is over.
-  // A pit that has merely gone quiet is ended by `attack --end`, which
-  // is the better instrument because everyone standing in it can see it.
+  // The clock measures silence: a round that has gone idle for
+  // round_max_idle_secs is over, and this attack retires it and opens a
+  // fresh one in the same step. Every !attack or !heal resets last_action,
+  // so a pit that anyone is still fighting in never expires.
   if(atk_db_round_find(ns->id, method, channel, &round) &&
-     round.age > (int64_t)t.round_max_secs)
+     round.idle > (int64_t)t.round_max_idle_secs)
   {
     atk_db_round_abandon(round.id);
     cmd_reply(ctx, "⚔ The old fight is over. A new one begins.");
@@ -849,16 +849,17 @@ atk_cmd_heal(const cmd_ctx_t *ctx)
 
   // ---- the round: heal CONTINUES one, and may never BEGIN one -------- //
   //
-  // Both verbs read the same clock. A brawl lasts round_max_secs and then
-  // the game is over, so a round past it reads to mending exactly as no
-  // round at all: you cannot continue something that has finished. The
-  // blade answers that case by abandoning and reopening in one step —
-  // which is precisely the power `!heal` does not have, so it refuses and
-  // touches nothing. The stale row is left for the next `!attack`.
+  // Both verbs read the same clock. A brawl that has gone idle for
+  // round_max_idle_secs is over, so a round past it reads to mending
+  // exactly as no round at all: you cannot continue something that has
+  // finished. The blade answers that case by abandoning and reopening in
+  // one step — which is precisely the power `!heal` does not have, so it
+  // refuses and touches nothing. The stale row is left for the next
+  // `!attack`.
 
   if(!atk_db_round_find(ns->id, method_inst_name(ctx->msg->inst),
         ctx->msg->channel, &round) ||
-     round.age > (int64_t)t.round_max_secs)
+     round.idle > (int64_t)t.round_max_idle_secs)
   {
     pthread_mutex_unlock(&atk_turn_lock);
     cmd_reply(ctx, "✚ Nothing is happening here. Start something with "
@@ -1059,12 +1060,12 @@ atk_cmd_defer(const cmd_ctx_t *ctx)
 
   // A deferral CONTINUES a fight and may never begin one, exactly as
   // mending may not: there is no turn to surrender before there is a
-  // round to surrender it in, and a round past its one clock reads as no
-  // round at all. The stale row is left for the next `!attack`, which is
-  // the only verb allowed to retire and reopen in one step.
+  // round to surrender it in, and a round gone idle past round_max_idle_secs
+  // reads as no round at all. The stale row is left for the next `!attack`,
+  // which is the only verb allowed to retire and reopen in one step.
   if(!atk_db_round_find(ns->id, method_inst_name(ctx->msg->inst),
         ctx->msg->channel, &round) ||
-     round.age > (int64_t)t.round_max_secs)
+     round.idle > (int64_t)t.round_max_idle_secs)
   {
     pthread_mutex_unlock(&atk_turn_lock);
     cmd_reply(ctx, "⏳ Nothing is happening here. Start something with "

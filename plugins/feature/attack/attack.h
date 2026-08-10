@@ -45,7 +45,7 @@
 #define ATK_KV_SEV_MAJOR   "plugin.attack.sev.major_at"
 #define ATK_KV_SEV_CRIT    "plugin.attack.sev.critical_at"
 
-#define ATK_KV_ROUND_MAX   "plugin.attack.round_max_secs"
+#define ATK_KV_ROUND_IDLE  "plugin.attack.round_max_idle_secs"
 #define ATK_KV_EJECT       "plugin.attack.eject_on_death"
 #define ATK_KV_SCORE_ROWS  "plugin.attack.scoreboard_rows"
 #define ATK_KV_AOE_PCT     "plugin.attack.aoe_chance_pct"
@@ -190,7 +190,7 @@ typedef struct
   uint32_t sev_medium_at;    // pct of the heaviest blow: medium begins
   uint32_t sev_major_at;     // ... major begins    (> sev_medium_at)
   uint32_t sev_crit_at;      // ... critical begins (> sev_major_at)
-  uint32_t round_max_secs;   // a brawl's whole life; then the game is over
+  uint32_t round_max_idle_secs; // seconds of silence before the game is over
   uint32_t scoreboard_rows;  // rows shown by `show attack scores`
   uint32_t aoe_pct;          // chance a damage turn sweeps the pit
   bool     eject_on_death;   // remove the fallen where the method allows
@@ -238,11 +238,13 @@ typedef struct
   int32_t wave;
   int32_t blows;
   int32_t top_crit;
-  // Seconds since started_at. There is exactly one clock: a brawl lasts
-  // round_max_secs and then the game is over. Nothing measures silence —
-  // `attack --end` is what retires a pit that has gone stale, and it is
-  // a better instrument because the people standing in it can see it.
+  // Two clocks. `age` is seconds since started_at — the brawl's whole
+  // life, shown when a pit is retired. `idle` is seconds since the last
+  // !attack or !heal, and it is what ends a game: once it passes
+  // round_max_idle_secs the next blow opens a fresh round. Any turn that
+  // lands resets last_action, so a lively pit never goes stale.
   int64_t age;
+  int64_t idle;
 } atk_round_t;
 
 // One combatant's standing within a round. `class` is the sheet stem
