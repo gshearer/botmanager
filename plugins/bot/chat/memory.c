@@ -216,9 +216,6 @@ memory_load_config(void)
   if(c.rag_top_k == 0)
     c.rag_top_k = MEM_DEF_RAG_TOP_K;
 
-  if(c.recall_top_k == 0)
-    c.recall_top_k = MEM_DEF_RECALL_TOP_K;
-
   if(c.rag_max_context_chars == 0)
     c.rag_max_context_chars = MEM_DEF_RAG_MAX_CONTEXT_CHARS;
 
@@ -241,6 +238,12 @@ memory_load_config(void)
   // way every knob above is: 0 is a meaningful value here, meaning
   // "disable the content filter", the same escape hatch
   // memory.recall_min_cosine uses. Clamping would remove it.
+  // recall_top_k joined that family in EMBED-TRUTH-1: it used to clamp
+  // to MEM_DEF_RECALL_TOP_K, which made the `recall_k > 0` arm of
+  // memory_retrieve_dossier() unreachable and left no way to switch
+  // semantic recall off without also disabling the embed write path.
+  // 0 now means "retrieve no recall rows" — the lever the reply-quality
+  // question needs, and the only honest reading of a zero budget.
   // recall_instruct is left alone for the same reason: an empty or
   // sentinel value means "submit the recall query raw", and it is
   // memory_recall_render_query() that interprets it.
@@ -287,7 +290,11 @@ memory_register_kv(void)
   kv_register("memory.recall_top_k", KV_UINT32, "4",
       memory_kv_changed, NULL,
       "Top-K semantic-recall hits from conversation_embeddings"
-      " (dossier-scoped); 0 uses default");
+      " (dossier-scoped) blended into the RECENT CONVERSATION block."
+      " 0 disables semantic recall for replies, leaving the block to"
+      " the name-mention rows alone — facts, logging and the"
+      " /show bot <name> memories verb are unaffected. It is the A/B"
+      " lever for judging whether recall improves a reply at all.");
   kv_register("memory.recall_min_cosine", KV_UINT32, "0",
       memory_kv_changed, NULL,
       "Cosine floor for semantic recall, stored x100"

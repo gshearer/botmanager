@@ -7,6 +7,7 @@
 #include "clam.h"
 #include "inference.h"
 
+#include <inttypes.h>
 #include <regex.h>
 #include <strings.h>
 #include <stdio.h>
@@ -2083,25 +2084,84 @@ prompt_emit_nl_commands(char *buf, size_t pos, size_t cap,
   return pos + n;
 }
 
+// Emit the RECENT CONVERSATION block and trace what survived into it.
+//
+// The rows arrive already merged: name-mention rows fetched by plain SQL
+// and semantic-recall rows fetched by cosine are one undifferentiated
+// array by the time they get here, and the block renders them
+// identically on purpose — the model is told what was said, not how it
+// was found. `mem_msg_t.score` is the only thing that still tells the
+// two apart (non-zero == cosine), which is why the trace below is the
+// only place the distinction is observable at all. EMBED-TRUTH §8 —
+// whether any of this improves the reply — cannot be judged without it.
 static size_t
 prompt_emit_conversation(char *buf, size_t pos, size_t cap,
-    const mem_msg_t *msgs, size_t nm)
+    const chatbot_req_t *r, const mem_msg_t *msgs, size_t nm)
 {
+  size_t block_start;
+  size_t block_cap_bytes;
+  size_t n_emitted;
+  size_t n_recall;
   char safe_msg[2048];
 
+  // Trace the empty case too, and before the early return. "Retrieval
+  // contributed nothing to this reply" is a result, not an absence of
+  // one — it is how EMBED-TRUTH-1 Part B tells an invalid A/B pair
+  // (both arms identical by construction) from a working one. A silent
+  // early return would make that indistinguishable from a broken trace.
   if(nm == 0 || pos >= cap)
+  {
+    clam(CLAM_DEBUG, "rag",
+        "trace=block target=%s rows=0/%zu recall=0 mention=0 bytes=0 cap=%u",
+        r->reply_target, nm, r->memory_max_chars);
+
     return pos;
+  }
+
+  block_start = pos;
+
+  // 0 means unbounded: the block is then capped only by the prompt
+  // buffer, which is the behaviour every reply had before this budget
+  // was enforced.
+  block_cap_bytes = r->memory_max_chars > 0
+      ? (size_t)r->memory_max_chars
+      : (size_t)-1;
 
   pos += snprintf(buf + pos, cap - pos, "<<<RECENT CONVERSATION>>>\n");
 
+  n_emitted = 0;
+  n_recall  = 0;
+
   for(size_t i = 0; i < nm && pos < cap; i++)
   {
+    if(pos - block_start >= block_cap_bytes)
+      break;
+
     sanitize_copy(safe_msg, sizeof(safe_msg), msgs[i].text);
     pos += snprintf(buf + pos, cap - pos, "- %s\n", safe_msg);
+
+    n_emitted++;
+    if(msgs[i].score > 0.0f)
+      n_recall++;
+
+    // One line per row that actually reached the prompt. Rows the
+    // budget cut never appear, which is the point: this traces the
+    // prompt, not the retrieval.
+    clam(CLAM_DEBUG, "rag",
+        "trace=inject target=%s src=%s cos=%.3f id=%" PRId64 " text='%.120s'",
+        r->reply_target,
+        msgs[i].score > 0.0f ? "recall" : "mention",
+        (double)msgs[i].score, msgs[i].id, safe_msg);
   }
 
   if(pos < cap)
     pos += snprintf(buf + pos, cap - pos, "<<<END CONVERSATION>>>\n\n");
+
+  clam(CLAM_DEBUG, "rag",
+      "trace=block target=%s rows=%zu/%zu recall=%zu mention=%zu"
+      " bytes=%zu cap=%u",
+      r->reply_target, n_emitted, nm, n_recall, n_emitted - n_recall,
+      pos - block_start, r->memory_max_chars);
 
   return pos;
 }
@@ -2209,7 +2269,7 @@ assemble_prompt(chatbot_req_t *r, const mem_fact_t *facts, size_t nf,
   pos = prompt_emit_nl_commands(buf, pos, cap, r);
 
   // 4. Conversation snippets, sanitized.
-  pos = prompt_emit_conversation(buf, pos, cap, msgs, nm);
+  pos = prompt_emit_conversation(buf, pos, cap, r, msgs, nm);
 
   // 4b. Knowledge chunks — external corpus RAG.
   pos = prompt_emit_knowledge(buf, pos, cap, r, kchunks, n_kchunks);
@@ -2722,6 +2782,8 @@ chatbot_reply_submit(chatbot_state_t *st, const method_msg_t *msg,
   r->knowledge_top_k = 0;
   r->knowledge_max_chars = (uint32_t)kv_get_uint(
       "knowledge.rag_max_context_chars");
+  r->memory_max_chars = (uint32_t)kv_get_uint(
+      "memory.rag_max_context_chars");
 
   // Image splice (I2) — global subsystem knobs, not per-bot. Snapshot
   // here so KV edits mid-reply can't tear off. images_per_reply=0
@@ -3032,6 +3094,8 @@ chatbot_reply_submit_vision(chatbot_state_t *st, const method_msg_t *msg,
   r->knowledge_top_k = 0;
   r->knowledge_max_chars = (uint32_t)kv_get_uint(
       "knowledge.rag_max_context_chars");
+  r->memory_max_chars = (uint32_t)kv_get_uint(
+      "memory.rag_max_context_chars");
 
   // Image-splice knobs — unused on the vision path (the image is
   // already on the user message), but kept zeroed so assemble_prompt

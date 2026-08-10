@@ -169,6 +169,16 @@ typedef struct
   char            sender[METHOD_SENDER_SZ];
   char            metadata[METHOD_META_SZ];
   char            channel[METHOD_CHANNEL_SZ];
+  // The identity tuple, carried so the flush can rebuild a message
+  // chatbot_resolve_dossier() will actually resolve. It bails to 0 when
+  // all four are empty, so a synth message missing them silently
+  // disabled every RAG path on the reply — facts, mention rows and
+  // semantic recall alike — while the per-line logger, which never sees
+  // the synth message, kept resolving the same speaker correctly.
+  char            nickname[METHOD_NICKNAME_SZ];
+  char            username[METHOD_USERNAME_SZ];
+  char            hostname[METHOD_HOSTNAME_SZ];
+  char            verified_id[METHOD_VERIFIED_ID_SZ];
   char            text[CHATBOT_COALESCE_TEXT_SZ];
   size_t          text_len;
   bool            was_addressed;   // sticky: any line in the block classified as EXCHANGE_IN
@@ -757,6 +767,12 @@ typedef struct
   char            knowledge_corpus[CHATBOT_CORPUS_LIST_SZ];
   uint32_t        knowledge_top_k;
   uint32_t        knowledge_max_chars;
+
+  // Byte budget for the RECENT CONVERSATION block, snapshot from
+  // `memory.rag_max_context_chars` at submit time for the same reason
+  // the knowledge budget is. 0 means unbounded — the whole system
+  // prompt is still capped by CHATBOT_PROMPT_SZ.
+  uint32_t        memory_max_chars;
 
   // Image-splice knobs (I2). rag_images_per_reply doubles as the master
   // switch — 0 disables the IMAGES fence AND its system-prompt hint.

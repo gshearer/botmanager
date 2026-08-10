@@ -72,6 +72,15 @@ cmd_show_memstore(const cmd_ctx_t *ctx)
       cfg.embed_min_chars, cfg.embed_batch_size);
   cmd_reply(ctx, buf);
 
+  if(cfg.recall_top_k == 0)
+    snprintf(buf, sizeof(buf), "  recall=(off - recall_top_k 0)");
+
+  else
+    snprintf(buf, sizeof(buf), "  recall_top_k=%u recall_min_cosine=%.2f",
+        cfg.recall_top_k, (double)cfg.recall_min_cosine_x100 / 100.0);
+
+  cmd_reply(ctx, buf);
+
   snprintf(buf, sizeof(buf), "  recall_instruct=%s",
       cfg.recall_instruct[0] != '\0' ? cfg.recall_instruct : "(off)");
   cmd_reply(ctx, buf);

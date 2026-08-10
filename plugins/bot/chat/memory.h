@@ -281,7 +281,7 @@ bool memory_test_inject_embedding(int64_t id, const char *model,
 #define MEM_DEF_RAG_MAX_CONTEXT_CHARS    2048
 #define MEM_DEF_DECAY_SWEEP_INTERVAL_SEC 3600
 #define MEM_EMBED_MODEL_SZ               64
-#define MEM_DEF_RECALL_TOP_K             4
+#define MEM_DEF_RECALL_TOP_K             4   // 0 = recall disabled
 #define MEM_DEF_RECALL_MIN_COSINE_X100   0   // 0 = no floor
 #define MEM_DEF_EMBED_MIN_CHARS          24  // 0 = filter disabled
 #define MEM_DEF_EMBED_BATCH_SIZE         32

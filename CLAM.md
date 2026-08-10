@@ -216,6 +216,7 @@ halves. Same shape as `gemini` / `gemini.ws`.
 | `irc` | plugins/method/irc/irc_protocol.c | IRC method driver |
 | `memory` | plugins/bot/chat/memory_rag.c | chat memory subsystem + RAG |
 | `nl_bridge` | plugins/bot/chat/reply.c | natural-language bridge surface |
+| `rag` | plugins/bot/chat/reply.c | what retrieval actually put in the prompt — one `trace=inject` line per surviving RECENT CONVERSATION row (`src=recall` vs `src=mention`, with cosine) plus a `trace=block` summary |
 | `nl_observe` | plugins/bot/chat/nl_observe.c | post-dispatch chat observer (`OBS_CTX`) |
 | `reachy` | plugins/method/reachy/reachy.c | Reachy Mini method driver — the ear (bridge long-poll, transcription, attention gate, delivery) and the mouth (speech queue, synthesis, upload, playback pacing) (`REACHY_CTX`) |
 | `register` | plugins/bot/chat/dispatch.c | `/register` user creation |

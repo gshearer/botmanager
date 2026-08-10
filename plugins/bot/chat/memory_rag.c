@@ -242,9 +242,30 @@ memory_retrieve_ns_with_vec(int ns_id, const char *model, uint32_t dim,
   memory_deliver_hits(msg_buf, n_msgs, cb, user);
 }
 
+// Cosine of the hit that pulled `id` in, or 0.0 when `id` is not one of
+// them. Linear because `n` is the recall top-K (bounded at 64) and the
+// caller is already round-tripping the database for the same rows.
+static float
+memory_hit_score(const memory_hit_t *hits, size_t n, int64_t id)
+{
+  for(size_t i = 0; i < n; i++)
+  {
+    if(hits[i].id == id)
+      return(hits[i].score);
+  }
+
+  return(0.0f);
+}
+
 // Hydrate conversation_log rows by id. Returns rows matching any id in
 // `hits`, bounded by `cap`. ns_id gates the lookup to the correct
 // namespace (cheap guard against stale ids from a different install).
+//
+// The rows come back ts-ordered, not hit-ordered, so each one's cosine
+// is carried across by id. Without it mem_msg_t.score stays 0 and a
+// recall row is indistinguishable from a name-mention row downstream —
+// which is what it was until EMBED-TRUTH-1, despite the field
+// documenting the opposite.
 static size_t
 memory_msgs_from_ids(int ns_id, const memory_hit_t *hits, size_t n_hits,
     mem_msg_t *out, size_t cap)
@@ -289,6 +310,8 @@ memory_msgs_from_ids(int ns_id, const memory_hit_t *hits, size_t n_hits,
       v = db_result_get(res, i, 6); if(v) m->kind = (mem_msg_kind_t)strtol(v, NULL, 10);
       v = db_result_get(res, i, 7); if(v) snprintf(m->text,     sizeof(m->text),     "%s", v);
       v = db_result_get(res, i, 8); if(v) m->ts = (time_t)strtoll(v, NULL, 10);
+
+      m->score = memory_hit_score(hits, n_hits, m->id);
     }
   }
 
@@ -715,8 +738,20 @@ memory_retrieve_dossier(int ns_id, int64_t dossier_id, const char *query,
   if(cb == NULL)
     return(FAIL);
 
+  // The retrieval half of the `rag` trace. `trace=block` in reply.c says
+  // what reached the prompt; this says what retrieval was even asked
+  // for. Without it "recall found nothing" and "recall never ran" look
+  // identical downstream, and they call for opposite responses.
+  clam(CLAM_DEBUG, "rag",
+      "trace=retrieve ns=%d dossier=%" PRId64 " query_len=%zu",
+      ns_id, dossier_id, query != NULL ? strlen(query) : (size_t)0);
+
   if(!memory_ready || dossier_id <= 0)
   {
+    clam(CLAM_DEBUG, "rag",
+        "trace=skip reason=%s dossier=%" PRId64,
+        memory_ready ? "no_dossier" : "memory_not_ready", dossier_id);
+
     cb(NULL, 0, NULL, 0, user);
     return(SUCCESS);
   }
@@ -792,6 +827,13 @@ memory_retrieve_dossier(int ns_id, int64_t dossier_id, const char *query,
 
   if(!want_recall)
   {
+    clam(CLAM_DEBUG, "rag",
+        "trace=skip reason=%s recall_k=%u",
+        (query == NULL || query[0] == '\0') ? "empty_query"
+            : cfg.embed_model[0] == '\0'    ? "no_embed_model"
+            : "recall_k_zero",
+        recall_k);
+
     cb(facts, n_facts_total, msgs, n_msgs, user);
     if(facts != NULL) mem_free(facts);
     if(msgs  != NULL) mem_free(msgs);
