@@ -370,24 +370,51 @@ memory_merge_msgs(const mem_msg_t *a, size_t na,
 // Writes at most `top_k` hits to `out`; sets `*n_out` to the number
 // written. Rows whose cosine is below `min_cos_x100` / 100.0 are
 // dropped. When `min_cos_x100` is 0, no floor is applied.
+//
+// `exclude_esc` is a db_escape'd line of text to keep out of the scan,
+// or NULL for none. It exists for CHAT-RECALL-SELF-1: the inbound line
+// is written to conversation_log *and* embedded before the reply path
+// retrieves, so an unfiltered scan finds it and it matches itself at
+// cosine 1.000. That burned one of the `recall_top_k` slots on every
+// single reply to tell the model what it was already being asked.
+//
+// Excluding by text rather than by row id is deliberate, and it is the
+// stronger rule: with paste-coalescing on there is no single row id for
+// a synthesised query, and a byte-identical *earlier* line carries
+// nothing the query does not already say. Re-asking a question must not
+// evict its answer — which is exactly what was measured happening.
 static void
 memory_recall_scan_convo(int ns_id, int64_t dossier_id,
     const char *model, uint32_t dim, const float *qvec,
-    uint32_t top_k, uint32_t min_cos_x100,
+    uint32_t top_k, uint32_t min_cos_x100, const char *exclude_esc,
     memory_hit_t *out, size_t *n_out)
 {
-  char join[512];
+  char  *join;
+  size_t join_sz;
   size_t n;
 
-  snprintf(join, sizeof(join),
+  *n_out = 0;
+
+  join_sz = 256 + (exclude_esc != NULL ? strlen(exclude_esc) : 0);
+
+  join = mem_alloc("memory", "rag_recall_join", join_sz);
+  if(join == NULL)
+    return;
+
+  snprintf(join, join_sz,
       "FROM conversation_embeddings e JOIN conversation_log x"
       " ON e.msg_id = x.id"
-      " WHERE x.ns_id = %d AND x.dossier_id = %" PRId64,
-      ns_id, dossier_id);
+      " WHERE x.ns_id = %d AND x.dossier_id = %" PRId64 "%s%s%s",
+      ns_id, dossier_id,
+      exclude_esc != NULL ? " AND x.text <> '" : "",
+      exclude_esc != NULL ? exclude_esc      : "",
+      exclude_esc != NULL ? "'"              : "");
 
   n = 0;
   memory_scan_embeddings(join, "msg_id", model, dim, qvec,
       out, top_k, &n);
+
+  mem_free(join);
 
   // memory_scan_embeddings returns hits sorted score-desc, so truncating
   // on the first sub-floor entry drops every remaining (lower) hit too.
@@ -643,6 +670,12 @@ typedef struct
   memory_retrieve_cb_t  cb;
   void                 *user;
 
+  // db_escape'd copy of the query, kept only so the cosine scan can keep
+  // the inbound line out of its own results (CHAT-RECALL-SELF-1). NULL
+  // when db_escape failed, in which case the scan simply runs unfiltered
+  // — a wasted slot is a far better failure than a malformed WHERE.
+  char                 *query_esc;
+
   mem_fact_t           *facts;
   size_t                n_facts;
   mem_msg_t            *mention_msgs;
@@ -656,6 +689,7 @@ memory_retrieve_dossier_ctx_free(memory_retrieve_dossier_ctx_t *c)
     return;
   if(c->facts        != NULL) mem_free(c->facts);
   if(c->mention_msgs != NULL) mem_free(c->mention_msgs);
+  if(c->query_esc    != NULL) mem_free(c->query_esc);
   mem_free(c);
 }
 
@@ -684,7 +718,7 @@ memory_retrieve_dossier_embed_done(const llm_embed_response_t *resp)
   n_hits = 0;
   memory_recall_scan_convo(c->ns_id, c->dossier_id, c->model,
       resp->dim, resp->vectors[0], c->top_k, c->min_cos_x100,
-      hits, &n_hits);
+      c->query_esc, hits, &n_hits);
 
   n_recall = memory_msgs_from_ids(c->ns_id, hits, n_hits,
       recall_msgs, 64);
@@ -856,6 +890,7 @@ memory_retrieve_dossier(int ns_id, int64_t dossier_id, const char *query,
   rc->min_cos_x100   = cfg.recall_min_cosine_x100;
   rc->cb             = cb;
   rc->user           = user;
+  rc->query_esc      = db_escape(query);
   rc->facts          = facts;
   rc->n_facts        = n_facts_total;
   rc->mention_msgs   = msgs;
