@@ -441,58 +441,262 @@ ow_collect_alert_ids(struct json_object *jalerts, ow_request_t *r)
   }
 }
 
-// Distil one /alert/{id} document into a single human-facing label.
-// 4.0's `event` field is frequently empty (seen on air-quality and some
-// NWS advisories), so fall back to the first line of the English
-// description, then to the issuer name.
+// Pick the English body out of an alert's `description` array. Most
+// agencies publish one entry; the docs warn that some issue only a
+// local language, so an unmatched language still yields the first entry
+// rather than nothing.
+static struct json_object *
+ow_alert_desc_en(struct json_object *root)
+{
+  struct json_object *descs = json_get_array(root, "description");
+  int n;
+  int i;
+
+  if(descs == NULL)
+    return(NULL);
+
+  n = (int)json_object_array_length(descs);
+
+  for(i = 0; i < n; i++)
+  {
+    struct json_object *d = json_object_array_get_idx(descs, i);
+    char lang[16];
+
+    if(d == NULL)
+      continue;
+
+    lang[0] = '\0';
+    json_get_str(d, "language", lang, sizeof(lang));
+
+    if(strncasecmp(lang, "en", 2) == 0)
+      return(d);
+  }
+
+  return(n > 0 ? json_object_array_get_idx(descs, 0) : NULL);
+}
+
+// The nouns that end a weather product's name. A match is what anchors
+// the scan below; everything before it is the qualifier run.
+static bool
+ow_is_product_word(const char *w, size_t len)
+{
+  static const char *const products[] = {
+    "warning", "watch", "advisory", "statement", "emergency", NULL
+  };
+  int i;
+
+  for(i = 0; products[i] != NULL; i++)
+    if(strlen(products[i]) == len && strncasecmp(w, products[i], len) == 0)
+      return(true);
+
+  return(false);
+}
+
+// Normalize an ALL-CAPS product name to title case. Bulletins shout
+// their continuation headers ("SEVERE THUNDERSTORM WATCH 552 REMAINS
+// VALID…") while issuance lines are already mixed case, so a string
+// carrying any lowercase letter is left in the issuer's own casing.
+static void
+ow_title_case(char *s)
+{
+  bool at_word = true;
+  char *p;
+
+  for(p = s; *p != '\0'; p++)
+    if(islower((unsigned char)*p))
+      return;
+
+  for(p = s; *p != '\0'; p++)
+  {
+    if(isalpha((unsigned char)*p))
+    {
+      *p      = (char)(at_word ? toupper((unsigned char)*p)
+                               : tolower((unsigned char)*p));
+      at_word = false;
+    }
+
+    else
+      at_word = true;
+  }
+}
+
+// Mine the product name out of an advisory body: scan for a product
+// keyword and claim the run of capitalized words immediately before it,
+// bounded to one line. This lifts "Flash Flood Warning" out of
+//
+//   FFWPBZ
+//
+//   The National Weather Service in Pittsburgh has issued a
+//
+//   * Flash Flood Warning for...
+//
+// and "SEVERE THUNDERSTORM WATCH" out of a shouted continuation header,
+// where the old first-line heuristic yielded the WMO product code and a
+// truncated sentence respectively. Returns false when the body names no
+// product — common on the follow-up statements that carry only radar
+// narrative — which hands the label to the tag fallback.
+static bool
+ow_alert_product_name(const char *text, char *out, size_t out_sz)
+{
+  ow_word_t   ring[OW_ALERT_NAME_WORDS];
+  const char *p    = text;
+  uint8_t     held = 0;
+
+  out[0] = '\0';
+
+  while(*p != '\0')
+  {
+    const char *w;
+    size_t      len;
+    size_t      span;
+    uint8_t     first;
+
+    // A name never spans lines: forget the qualifier run at each break.
+    if(*p == '\n' || *p == '\r')
+    {
+      held = 0;
+      p++;
+      continue;
+    }
+
+    if(!isalpha((unsigned char)*p))
+    {
+      p++;
+      continue;
+    }
+
+    w = p;
+
+    while(isalpha((unsigned char)*p))
+      p++;
+
+    len = (size_t)(p - w);
+
+    if(!ow_is_product_word(w, len))
+    {
+      if(held == OW_ALERT_NAME_WORDS)
+      {
+        memmove(&ring[0], &ring[1], sizeof(ring) - sizeof(ring[0]));
+        held--;
+      }
+
+      ring[held].start    = w;
+      ring[held].namelike = isupper((unsigned char)w[0]) != 0;
+      held++;
+      continue;
+    }
+
+    first = held;
+
+    while(first > 0 && ring[first - 1].namelike)
+      first--;
+
+    // A bare "Warning" names nothing — keep scanning for a qualified one.
+    if(first == held)
+    {
+      held = 0;
+      continue;
+    }
+
+    // The name is contiguous in the source, so copy the span rather than
+    // rejoining words: the issuer's own spacing survives intact.
+    span = (size_t)((w + len) - ring[first].start);
+
+    if(span >= out_sz)
+      span = out_sz - 1;
+
+    memcpy(out, ring[first].start, span);
+    out[span] = '\0';
+    ow_title_case(out);
+
+    return(true);
+  }
+
+  return(false);
+}
+
+// Last resort before the issuer name: 4.0 ships an undocumented `tags`
+// array ("Thunderstorm", "Flood", "Other dangers") on bulletins whose
+// body is pure narrative. Coarse, but never garbage — and qualified with
+// the issuer it reads as a real advisory rather than a bare noun.
+static bool
+ow_alert_tag_label(struct json_object *root, const char *sender, char *out,
+    size_t out_sz)
+{
+  struct json_object *tags = json_get_array(root, "tags");
+  struct json_object *t0;
+  const char *s;
+
+  if(tags == NULL || json_object_array_length(tags) == 0)
+    return(false);
+
+  t0 = json_object_array_get_idx(tags, 0);
+  s  = (t0 != NULL) ? json_object_get_string(t0) : NULL;
+
+  if(s == NULL || s[0] == '\0')
+    return(false);
+
+  if(sender[0] != '\0')
+    snprintf(out, out_sz, "%s (%s)", s, sender);
+
+  else
+    snprintf(out, out_sz, "%s", s);
+
+  return(true);
+}
+
+// Distil one /alert/{id} document into a single human-facing label, best
+// source first. `event` is the issuer's own name for the product and is
+// what non-US agencies populate; across every US NWS bulletin sampled it
+// was empty, so the body and tags carry the real work.
 static void
 ow_alert_label(struct json_object *root, char *out, size_t out_sz)
 {
-  char event[128];
+  char text[OW_ALERT_SCAN_SZ];
   char sender[96];
-  struct json_object *descs;
+  struct json_object *desc;
 
   out[0]    = '\0';
-  event[0]  = '\0';
   sender[0] = '\0';
 
-  json_get_str(root, "event",       event,  sizeof(event));
   json_get_str(root, "sender_name", sender, sizeof(sender));
 
-  if(event[0] != '\0')
-  {
-    snprintf(out, out_sz, "%s", event);
+  if(json_get_str(root, "event", out, out_sz) && out[0] != '\0')
     return;
-  }
 
-  descs = json_get_array(root, "description");
+  out[0] = '\0';
+  desc   = ow_alert_desc_en(root);
 
-  if(descs != NULL && json_object_array_length(descs) > 0)
+  if(desc != NULL)
   {
-    struct json_object *d0 = json_object_array_get_idx(descs, 0);
-    char text[OPENWEATHER_ALERT_SZ];
-    char *nl;
-
     text[0] = '\0';
-    json_get_str(d0, "description", text, sizeof(text));
+    json_get_str(desc, "description", text, sizeof(text));
 
-    // Keep only the opening line — advisory bodies run many paragraphs.
-    nl = strpbrk(text, "\r\n");
-
-    if(nl != NULL)
-      *nl = '\0';
-
-    ow_str_trim(text);
-
-    if(text[0] != '\0')
-    {
-      snprintf(out, out_sz, "%s", text);
+    if(ow_alert_product_name(text, out, out_sz))
       return;
-    }
   }
+
+  if(ow_alert_tag_label(root, sender, out, out_sz))
+    return;
 
   if(sender[0] != '\0')
     snprintf(out, out_sz, "%s advisory", sender);
+}
+
+// One storm produces a burst of bulletins — an issuance plus a radar
+// update every ten minutes — that all distil to the same label. Without
+// this the user reads "Severe Thunderstorm Warning" four times and the
+// three-line display cap hides everything else that is happening.
+static bool
+ow_label_seen(const openweather_alert_set_t *set, const char *label)
+{
+  uint8_t i;
+
+  for(i = 0; i < set->count; i++)
+    if(strcasecmp(set->alerts[i].event, label) == 0)
+      return(true);
+
+  return(false);
 }
 
 // Synthesize an OpenWeather condition code + description from the
@@ -1066,7 +1270,8 @@ ow_alert_done(const curl_response_t *resp)
 
       ow_alert_label(root, label, sizeof(label));
 
-      if(label[0] != '\0' && set->count < OPENWEATHER_ALERT_MAX)
+      if(label[0] != '\0' && set->count < OPENWEATHER_ALERT_MAX
+          && !ow_label_seen(set, label))
       {
         snprintf(set->alerts[set->count].event,
             sizeof(set->alerts[set->count].event), "%s", label);

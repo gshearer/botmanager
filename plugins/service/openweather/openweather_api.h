@@ -95,8 +95,11 @@ typedef struct
 
 typedef struct
 {
-  // One Call 4.0 alert bodies fill this from `event` when present, else
-  // from the first line of the advisory text — hence the wider buffer.
+  // One Call 4.0 alert bodies fill this from `event` when the issuer
+  // populates it, else from the product name mined out of the advisory
+  // text ("Flash Flood Warning"), else from the `tags` array qualified
+  // by the issuer. Labels within a set are distinct — a storm's repeat
+  // bulletins collapse to one entry.
   char  event[OPENWEATHER_ALERT_SZ];
 } openweather_alert_t;
 

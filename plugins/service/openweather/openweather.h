@@ -49,6 +49,17 @@
 // so its buffer must clear the id worst case plus the base and appid.
 #define OW_ALERT_URL_SZ (OW_ALERT_ID_SZ * 3 + 128)
 
+// Bytes of advisory body scanned for the product name. NWS buries it a
+// few lines in ("…has issued a\n\n* Flash Flood Warning for…"); 1 KiB
+// clears that with room to spare without copying whole bulletins, which
+// run to several KiB of county lists.
+#define OW_ALERT_SCAN_SZ     1024
+
+// How many words before a product keyword may join its name. "Special
+// Weather Statement" needs two; four leaves headroom without letting a
+// mid-sentence match swallow half a line.
+#define OW_ALERT_NAME_WORDS  4
+
 // Timeline page sizes requested by the forecast commands.
 #define OW_FCAST_DAILY_CNT   7
 #define OW_FCAST_HOURLY_CNT  24
@@ -129,6 +140,17 @@ typedef struct
   ow_cb_u   cb;
   void     *user;
 } ow_caller_t;
+
+// One word of advisory text, as spotted by the product-name scanner.
+// `start` points into the caller's scan buffer and lives only as long as
+// it does — the scanner copies the winning name as one contiguous span,
+// so a word needs no length of its own. `namelike` marks a capitalized
+// word, the shape a product qualifier takes ("Severe", "Flash", "SEVERE").
+typedef struct
+{
+  const char *start;
+  bool        namelike;
+} ow_word_t;
 
 // Geocode cache
 
@@ -212,6 +234,18 @@ static void             ow_hourly_done(const curl_response_t *resp);
 static void             ow_start_alert_enrich(ow_request_t *r);
 static void             ow_submit_next_alert(ow_request_t *r);
 static void             ow_alert_done(const curl_response_t *resp);
+
+// Alert-label derivation. `event` is empty on every US NWS bulletin, so
+// the label is mined out of the advisory body instead.
+static struct json_object *ow_alert_desc_en(struct json_object *root);
+static bool             ow_is_product_word(const char *w, size_t len);
+static bool             ow_alert_product_name(const char *text, char *out,
+                            size_t out_sz);
+static bool             ow_alert_tag_label(struct json_object *root,
+                            const char *sender, char *out, size_t out_sz);
+static void             ow_title_case(char *s);
+static bool             ow_label_seen(const openweather_alert_set_t *set,
+                            const char *label);
 static void             ow_deliver_final(ow_request_t *r);
 
 static void             ow_canon_query(const char *in, char *out,
