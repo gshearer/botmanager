@@ -983,8 +983,10 @@ atk_show_register(void)
         "tiers actually pay at the current tunables. A class changes "
         "only the WORDS the pit speaks — the engine rolls the same "
         "numbers for everybody, and a sheet with forty critical lines "
-        "hits exactly as hard as one with a single line. Sheets live in "
-        "`plugin.attack.classes_path` and are re-read by `attack "
+        "hits exactly as hard as one with a single line. Everyone in a "
+        "round is dealt a different class, and a brawl with more "
+        "combatants than there are sheets starts repeating them. Sheets "
+        "live in `plugin.attack.classes_path` and are re-read by `attack "
         "reload`.",
         USERNS_GROUP_EVERYONE, 0, CMD_SCOPE_ANY, METHOD_T_ANY,
         atk_show_classes, NULL, "show/attack", NULL,

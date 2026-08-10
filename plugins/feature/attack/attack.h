@@ -571,13 +571,51 @@ uint32_t atk_class_load(atk_load_report_t *rep);
 void atk_class_free(void);
 
 // A random class stem, uniformly drawn. SUCCESS when one was written.
+// This is the UNCONSTRAINED draw and it has exactly one caller left —
+// atk_class_for(), which is substituting a voice rather than dealing a
+// class. Enrolment deals through atk_class_deal() instead.
 bool atk_class_pick(char *out, size_t cap);
+
+// The class stems already dealt in one round. Uniqueness is a property of
+// the ROUND, so this set is read off the roster once per turn and grown by
+// each deal within it — never cached between turns, where a reload or a
+// second room would make it a lie.
+//
+// It is bounded by the registry it filters rather than by the roster: a
+// round can hold any number of combatants, but never more distinct classes
+// than there are sheets to deal.
+typedef struct
+{
+  uint32_t n;
+  char     type[ATK_CLASSES_MAX][ATK_CLASS_NAME_SZ];
+} atk_dealt_t;
+
+// Record `type` as taken — idempotent, and a no-op once the set is full.
+// The overflow can only ever under-constrain the next deal, which costs a
+// duplicate and never a wrong class.
+void atk_dealt_add(atk_dealt_t *dealt, const char *type);
+
+// Deal a class no one in this round already holds, and record it in
+// `dealt` so the next deal of the same turn avoids it too. A NULL set
+// means "nothing is taken" and degrades to atk_class_pick().
+//
+// Uniqueness yields to the pit speaking at all: when every loaded sheet is
+// already in the round the draw falls back to the whole registry, logs a
+// CLAM_WARN and hands out a duplicate. A brawl on the built-in brawler has
+// one class for everybody, and refusing the second combatant a sheet would
+// end the game rather than constrain it.
+void atk_class_deal(atk_dealt_t *dealt, char *out, size_t cap);
 
 // The class a combatant should speak with right now: their own when the
 // registry still carries it, a freshly picked one when it does not — a
 // sheet can be deleted between the enrolment that stored the stem and the
 // turn that reads it back, and a bookkeeping gap must never cost somebody
 // their swing. Writes an empty string only when nothing is loaded at all.
+//
+// The substitute is drawn UNCONSTRAINED, and deliberately so: this is a
+// voice for one turn, not an assignment. The roster row keeps the stem it
+// was dealt, so the round's dealt classes stay unique on the card and in
+// the ledger even while a deleted sheet is being spoken around.
 void atk_class_for(const char *want, char *out, size_t cap);
 
 // Draw a random move of `sec` from `type`, filtered by `tier` for DAMAGE
@@ -656,12 +694,22 @@ int64_t atk_db_round_open(uint32_t ns_id, const char *method,
 //
 // `class` is written on the INSERT only, so a combatant is dealt their
 // sheet exactly once and can never re-roll it by being struck again.
+//
+// The caller must have drawn `class` through atk_class_deal() against a
+// set this round's roster answered for: no two combatants in one round
+// share a class, and the turn lock is the whole of what enforces it. The
+// column carries no unique index — see attack_db.c.
 bool atk_db_player_enrol(int64_t round_id, uint32_t ns_id,
     const char *username, const char *nickname, const char *class,
     int32_t hp);
 
 bool atk_db_player_get(int64_t round_id, const char *username,
     atk_player_t *out);
+
+// Every class already dealt in this round, into `out`. Returns the number
+// written. A round nobody has enrolled in yet answers zero, which is the
+// correct empty set and not an error.
+uint32_t atk_db_classes_dealt(int64_t round_id, atk_dealt_t *out);
 
 // Comma-joined display names of the living who have not swung in
 // `wave`. Writes an empty string when nobody is pending.

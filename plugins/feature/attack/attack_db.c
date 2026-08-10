@@ -565,6 +565,64 @@ atk_db_player_get(int64_t round_id, const char *username,
   return(hit);
 }
 
+// The classes this round has already handed out, so the next enrolment
+// can deal one nobody holds. DISTINCT because the answer is a SET and the
+// roster is not: a round can carry more combatants than there are sheets,
+// and past the fallback in atk_class_deal() it carries duplicates too.
+//
+// There is no unique index behind this, and there must not be. Uniqueness
+// yields when the registry runs dry — a two-handed brawl on the built-in
+// brawler has one sheet for both — and a constraint that made the INSERT
+// fail would end the game instead of relaxing. atk_turn_lock serialises
+// every writer, so the read-then-write across this and the enrol is safe
+// without one.
+uint32_t
+atk_db_classes_dealt(int64_t round_id, atk_dealt_t *out)
+{
+  atk_tables_t t;
+  db_result_t *res = NULL;
+  char         sql[512];
+  uint32_t     i;
+
+  if(out == NULL)
+    return(0);
+
+  memset(out, 0, sizeof(*out));
+
+  if(round_id <= 0 || atk_tables_resolve(&t) != SUCCESS)
+    return(0);
+
+  // The LIMIT is the set's own bound, not a page: a round holding more
+  // distinct stems than the registry can hold has outlived several sheet
+  // reloads, and the names beyond it are ones no deal could draw anyway.
+  snprintf(sql, sizeof(sql),
+      "SELECT DISTINCT class FROM %s"
+      " WHERE round_id = %" PRId64 " AND class <> '' LIMIT %d",
+      t.players, round_id, ATK_CLASSES_MAX);
+
+  res = db_result_alloc();
+
+  if(res != NULL && db_query(sql, res) == SUCCESS && res->ok)
+  {
+    for(i = 0; i < res->rows; i++)
+    {
+      char type[ATK_CLASS_NAME_SZ];
+
+      atk_col_str(type, sizeof(type), res, i, 0);
+      atk_dealt_add(out, type);
+    }
+  }
+
+  else
+    clam(CLAM_WARN, ATK_CTX, "dealt-class read failed: %s",
+        (res != NULL && res->error[0] != '\0') ? res->error
+                                               : "(no driver error)");
+
+  db_result_free(res);
+
+  return(out->n);
+}
+
 bool
 atk_db_pending(int64_t round_id, int32_t wave, char *out, size_t cap)
 {

@@ -300,6 +300,38 @@ atk_sweep_turn(const cmd_ctx_t *ctx, const atk_round_t *round,
 }
 
 // ------------------------------------------------------------------ //
+// Enrolment                                                           //
+// ------------------------------------------------------------------ //
+
+// Put one combatant on the roster and read back the row that governs
+// their turn. A class is dealt only to somebody who was not already
+// standing there: the stem rides the INSERT alone, so a second draw
+// would be discarded anyway — and discarding one would burn a name out
+// of the round's pool that a crowded pit may not have to spare.
+//
+// `dealt` carries the round's taken classes in and any newly dealt one
+// back out, so two enrolments in one turn cannot draw the same sheet.
+// The caller must hold atk_turn_lock: it is the only thing serialising
+// the read of the pool against the write that grows it.
+static bool
+atk_enrol(int64_t round_id, uint32_t ns_id, const char *username,
+    const char *nickname, int32_t hp, atk_dealt_t *dealt,
+    atk_player_t *out)
+{
+  char class[ATK_CLASS_NAME_SZ];
+
+  // Already fighting — and their stem is already in `dealt`, off the very
+  // roster the caller read the pool from.
+  if(atk_db_player_get(round_id, username, out))
+    return(true);
+
+  atk_class_deal(dealt, class, sizeof(class));
+  atk_db_player_enrol(round_id, ns_id, username, nickname, class, hp);
+
+  return(atk_db_player_get(round_id, username, out));
+}
+
+// ------------------------------------------------------------------ //
 // attack <nick>                                                       //
 // ------------------------------------------------------------------ //
 
@@ -318,6 +350,9 @@ atk_cmd_attack(const cmd_ctx_t *ctx)
   // run after the lock is released and after every death line has gone.
   atk_victim_t    victim[ATK_MAX_PLAYERS];
   uint32_t        n_victim = 0;
+  // The classes this round has already handed out. Loaded once at
+  // enrolment and grown by each deal, so no two combatants share a sheet.
+  atk_dealt_t     dealt;
   userns_t       *ns;
   const char     *nick;
   const char     *method;
@@ -325,7 +360,6 @@ atk_cmd_attack(const cmd_ctx_t *ctx)
   const char     *src_nick;
   char            tgt_user[ATK_USER_SZ];
   char            src_class[ATK_CLASS_NAME_SZ];
-  char            tgt_class[ATK_CLASS_NAME_SZ];
   char            line[ATK_LINE_SZ];
   char            roster[ATK_ROSTER_SZ];
   int32_t         dmg;
@@ -432,21 +466,19 @@ atk_cmd_attack(const cmd_ctx_t *ctx)
   // ---- 6. enrolment ------------------------------------------------ //
   //
   // Each combatant is dealt a class here and keeps it for the whole
-  // brawl. The two draws are INDEPENDENT and duplicates are allowed: the
-  // brief says random, and under the charter a duplicate costs nobody
-  // anything, because two sheets of the same name roll exactly the same
-  // numbers as two of different ones.
+  // brawl, and NO TWO COMBATANTS IN ONE ROUND SHARE ONE. The set of stems
+  // already handed out is read off the roster once and grown by each
+  // deal, so the second draw of this turn can see the first. The turn
+  // lock is the whole of what makes that read-then-write safe; the column
+  // carries no unique index, because uniqueness has to be able to yield
+  // when the registry runs dry (attack_class.c, atk_class_deal()).
 
-  atk_class_pick(src_class, sizeof(src_class));
-  atk_class_pick(tgt_class, sizeof(tgt_class));
+  atk_db_classes_dealt(round.id, &dealt);
 
-  atk_db_player_enrol(round.id, ns->id, ctx->username, src_nick,
-      src_class, (int32_t)t.start_hp);
-  atk_db_player_enrol(round.id, ns->id, tgt_user, nick,
-      tgt_class, (int32_t)t.start_hp);
-
-  if(!atk_db_player_get(round.id, ctx->username, &src) ||
-     !atk_db_player_get(round.id, tgt_user, &tgt))
+  if(!atk_enrol(round.id, ns->id, ctx->username, src_nick,
+         (int32_t)t.start_hp, &dealt, &src) ||
+     !atk_enrol(round.id, ns->id, tgt_user, nick,
+         (int32_t)t.start_hp, &dealt, &tgt))
   {
     pthread_mutex_unlock(&atk_turn_lock);
     cmd_reply(ctx, "☠ The pit will not answer — the roster is unreadable.");

@@ -1506,6 +1506,92 @@ atk_class_pick(char *out, size_t cap)
   return(ok);
 }
 
+// ------------------------------------------------------------------ //
+// Dealing: one class per combatant, never the same one twice          //
+// ------------------------------------------------------------------ //
+//
+// Uniqueness is a property of the ROUND, and it is cosmetic in exactly
+// the way class assignment itself is: under the charter above, two sheets
+// roll precisely the same numbers, so forbidding a duplicate takes
+// nothing from anybody. What it buys is a pit where every combatant reads
+// as a different character, which is the whole point of the sheets.
+//
+// The set is read off the roster at the top of every enrolment and grown
+// as the turn deals, so the only thing enforcing it is atk_turn_lock —
+// the single writer that serialises a turn. That is deliberate: a unique
+// index on (round_id, class) would make the enrolment FAIL on a
+// collision, and there is one collision the game must survive, which is
+// running out of sheets.
+
+static bool
+atk_dealt_holds(const atk_dealt_t *dealt, const char *type)
+{
+  uint32_t i;
+
+  if(dealt == NULL || type == NULL)
+    return(false);
+
+  for(i = 0; i < dealt->n; i++)
+    if(strcmp(dealt->type[i], type) == 0)
+      return(true);
+
+  return(false);
+}
+
+void
+atk_dealt_add(atk_dealt_t *dealt, const char *type)
+{
+  if(dealt == NULL || type == NULL || type[0] == '\0')
+    return;
+
+  if(dealt->n >= ATK_CLASSES_MAX || atk_dealt_holds(dealt, type))
+    return;
+
+  snprintf(dealt->type[dealt->n], sizeof(dealt->type[0]), "%s", type);
+  dealt->n++;
+}
+
+void
+atk_class_deal(atk_dealt_t *dealt, char *out, size_t cap)
+{
+  uint32_t free_ix[ATK_CLASSES_MAX];    // registry slots nobody holds yet
+  uint32_t n_free = 0;
+  uint32_t i;
+  bool     crowded = false;
+
+  if(out == NULL || cap == 0)
+    return;
+
+  out[0] = '\0';
+
+  pthread_mutex_lock(&atk_class_lock);
+
+  if(atk_class_n > 0)
+  {
+    for(i = 0; i < atk_class_n; i++)
+      if(!atk_dealt_holds(dealt, atk_classes[i]->type))
+        free_ix[n_free++] = i;
+
+    // Out of sheets: the pit speaking beats the pit being unique, so the
+    // draw widens back to the whole registry rather than refusing. It is
+    // the one path here that breaks the promise, and it says so.
+    crowded = (n_free == 0);
+
+    snprintf(out, cap, "%s", crowded
+        ? atk_classes[util_rand((int)atk_class_n)]->type
+        : atk_classes[free_ix[util_rand((int)n_free)]]->type);
+  }
+
+  pthread_mutex_unlock(&atk_class_lock);
+
+  if(crowded)
+    clam(CLAM_WARN, ATK_CTX,
+        "every loaded class is already in this round — dealing '%s' twice",
+        out);
+
+  atk_dealt_add(dealt, out);
+}
+
 // Deliberately not a lookup failure: the caller has a turn to resolve and
 // a stem that may have gone stale under it, and re-picking is the honest
 // answer — under the charter, one class is worth exactly as much as
