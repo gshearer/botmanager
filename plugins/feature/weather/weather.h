@@ -84,6 +84,13 @@ static bool             weather_resolve_location(const char *input,
 static void             weather_alerts_adopt(weather_req_t *r,
                             const openweather_alert_set_t *ow);
 static void             weather_dispatch_openweather(weather_req_t *r);
+static const char      *weather_units_wxg(const char *kv);
+static void             weather_forecast_done(
+                            const weathergov_forecast_result_t *res,
+                            void *user);
+static void             weather_point_done(
+                            const weathergov_point_result_t *res,
+                            void *user);
 static void             weather_alerts_done(
                             const weathergov_alert_result_t *res,
                             void *user);

@@ -21,6 +21,18 @@ static const char *const weather_day_names_abbr[] = {
   "Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat",
 };
 
+// The forecast adapter labels an OpenWeather daily row, which carries a
+// timestamp where weather.gov carries a name. Naming a weekday is
+// presentation, so the table stays here and the adapter asks for it.
+const char *
+weather_day_name_full(int wday)
+{
+  if(wday < 0 || wday > 6)
+    return("???");
+
+  return(weather_day_names_full[wday]);
+}
+
 // Unit + display helpers
 
 const char *
@@ -118,9 +130,30 @@ weather_fmt_temp_w(char *buf, size_t sz, double temp, const char *units,
 // Map a weather condition ID to a Unicode weather emoji (UTF-8). Must
 // be placed at the START of each line so variable emoji width does
 // not break column alignment.
+//
+// ⭑ Codes 900–905 are a PRIVATE range, and the one place this axis
+// extends past OpenWeather's numbering. weather.gov names five sky
+// states OpenWeather has no code for — tornado, hurricane, blizzard,
+// tropical storm — plus the two extremes it calls out as conditions in
+// their own right, hot and cold. They are tested FIRST because the
+// existing `id >= 803` arm would otherwise swallow every one of them.
 const char *
 weather_condition_icon(int id)
 {
+  if(id >= 900)
+  {
+    switch(id)
+    {
+      case 900: return("\xf0\x9f\x8c\xaa\xef\xb8\x8f");  // 🌪️ tornado
+      case 901: return("\xf0\x9f\x8c\x80");               // 🌀 hurricane
+      case 902: return("\xf0\x9f\x8c\xa8\xef\xb8\x8f");  // 🌨️ blizzard
+      case 903: return("\xf0\x9f\x8c\x80");               // 🌀 tropical storm
+      case 904: return("\xf0\x9f\xa5\xb5");               // 🥵 hot
+      case 905: return("\xf0\x9f\xa5\xb6");               // 🥶 cold
+      default:  break;
+    }
+  }
+
   if(id >= 200 && id < 300)
     return("\xf0\x9f\x8c\xa9\xef\xb8\x8f");  // 🌩️ thunderstorm
 
@@ -151,6 +184,14 @@ weather_condition_icon(int id)
 const char *
 weather_condition_color(int id)
 {
+  // The private range, ahead of the `id >= 803` arm for the same reason.
+  if(id == 900)             return(CLR_BOLD CLR_RED);  // tornado
+  if(id == 901)             return(CLR_BOLD CLR_RED);  // hurricane
+  if(id == 902)             return(CLR_BOLD);          // blizzard
+  if(id == 903)             return(CLR_RED);           // tropical storm
+  if(id == 904)             return(CLR_ORANGE);        // hot
+  if(id == 905)             return(CLR_BOLD CLR_BLUE); // cold
+
   if(id >= 200 && id < 300) return(CLR_RED);        // thunderstorm
   if(id >= 300 && id < 400) return(CLR_CYAN);       // drizzle
   if(id >= 500 && id < 600) return(CLR_CYAN);       // rain
@@ -204,13 +245,18 @@ weather_zip_is_synth(const char *zip)
   return(zip[9] == '\0');
 }
 
+// The precipitation slot, four columns wide either way: coloured "NN%"
+// when there is a chance, blank when there is not. A dry row leaves the
+// slot empty rather than printing "0%", so the eye lands on the rows
+// that carry odds — and the fixed width is what keeps every column to
+// its right aligned across a whole forecast.
 void
 weather_fmt_precip(char *buf, size_t sz, int pop)
 {
   if(pop > 0)
-    snprintf(buf, sz, " " CLR_CYAN "%d%% precip" CLR_RESET, pop);
+    snprintf(buf, sz, CLR_CYAN "%3d%%" CLR_RESET, pop);
   else
-    buf[0] = '\0';
+    snprintf(buf, sz, "    ");
 }
 
 void
@@ -552,70 +598,81 @@ weather_reply_current(const cmd_ctx_t *ctx,
   weather_reply_alerts(ctx, alerts);
 }
 
+// The 7-day view, one row per day:
+//
+//   {icon} {day:9}  {hi}/{lo}°{u}  {condition:22}  {rh:3}  {pop:4}  {wind}
+//
+// 73 display columns, comfortably inside WEATHER_LINE_COLS. Every field
+// is padded on its RAW text before colour markup wraps it — the reason
+// weather_fmt_temp_w exists — so the columns line up whatever the
+// temperature's digit count.
+//
+// Humidity and precipitation are two fixed slots rather than one field
+// because the two providers are optional in opposite places: a
+// weather.gov period carries a real precipitation probability and no
+// relative humidity, a One Call 4.0 daily row the exact reverse. Each
+// fills the slot the other cannot and both keep their width when empty,
+// so the layout is identical whichever provider answered.
 void
 weather_reply_forecast_daily(const cmd_ctx_t *ctx,
-    const openweather_forecast_t *f,
+    const weather_view_forecast_t *f,
     const weather_view_alert_set_t *alerts)
 {
   const char *tu = weather_temp_unit(f->units);
-  const char *su = weather_speed_unit(f->units);
   uint8_t i;
 
-  weather_reply_header(ctx, f->place_name, f->zipcode, "7-day forecast");
+  weather_reply_header(ctx, f->place, f->zip, "7-day forecast");
 
-  for(i = 0; i < f->day_count && i < 7; i++)
+  for(i = 0; i < f->count && i < WEATHER_FORECAST_DAYS; i++)
   {
-    const openweather_forecast_day_t *d = &f->days[i];
-    const char *day_name = "???";
-    const char *icon;
-    const char *dclr;
+    const weather_view_day_t *d = &f->days[i];
+    const char *icon = weather_condition_icon(d->condition_id);
+    const char *dclr = weather_condition_color(d->condition_id);
     char chi[32], clo[32];
     char desc_pad[24];
+    char humid[8];
     char precip[24];
     char buf[WEATHER_REPLY_SZ];
-    int pop = (int)(d->pop * 100);
 
-    if(d->dt > 0)
-    {
-      struct tm tm;
-
-      // A daily row's `dt` is a calendar-day marker, not an instant: One
-      // Call pins it to exactly 00:00:00 UTC of the day it represents,
-      // identical across every timezone. It is therefore read in UTC as-is
-      // — adding tz_offset would push negative-offset locales (the Americas)
-      // back across the UTC midnight boundary and mislabel the weekday
-      // (Monday shown as Sunday). Only true instants (hours, sunrise/sunset)
-      // get the offset applied.
-      gmtime_r(&d->dt, &tm);
-      day_name = weather_day_names_full[tm.tm_wday];
-    }
-
-    icon = weather_condition_icon(d->condition_id);
-    dclr = weather_condition_color(d->condition_id);
-
-    // Width-pad the numeric part to 3 visible chars (matches the hourly
+    // Width-pad the numeric part to 3 visible chars (matching the hourly
     // view) so the hi/lo column stays fixed-width: a 3-digit temperature
-    // (100+°F) would otherwise be 1-2 chars wider than a 2-digit one and
-    // shove every column to its right out of alignment.
-    weather_fmt_temp_w(chi, sizeof(chi), d->temp_hi, f->units, 3);
-    weather_fmt_temp_w(clo, sizeof(clo), d->temp_lo, f->units, 3);
+    // (100+°F) would otherwise be wider than a 2-digit one and shove
+    // every column to its right out of alignment. A half-row — the
+    // leading "Tonight" of a forecast issued after dark — has no daytime
+    // half at all, and says so rather than repeating its own low.
+    if(d->have_hi)
+      weather_fmt_temp_w(chi, sizeof(chi), d->temp_hi, f->units, 3);
+    else
+      snprintf(chi, sizeof(chi), " --");
 
-    weather_fmt_desc_pad(desc_pad, sizeof(desc_pad),
-        d->condition_desc, 22);
+    if(d->have_lo)
+      weather_fmt_temp_w(clo, sizeof(clo), d->temp_lo, f->units, 3);
+    else
+      snprintf(clo, sizeof(clo), " --");
 
-    weather_fmt_precip(precip, sizeof(precip), pop);
+    weather_fmt_desc_pad(desc_pad, sizeof(desc_pad), d->cond, 22);
 
+    if(d->have_humidity)
+      snprintf(humid, sizeof(humid), "%2d%%", d->humidity);
+    else
+      snprintf(humid, sizeof(humid), "   ");
+
+    weather_fmt_precip(precip, sizeof(precip), d->have_pop ? d->pop : 0);
+
+    // Wind closes the line and is the one field left unpadded: nothing
+    // sits to its right to fall out of alignment, and a padded "5mph"
+    // only opens a gap before the direction.
     snprintf(buf, sizeof(buf),
-        "%s %-9.9s  %s/%s\xc2\xb0%s"
+        "%s %-*.*s  %s/%s\xc2\xb0%s"
         "  %s%s" CLR_RESET
-        "  %2d%%"
-        "  %2.0f%s %-3s"
-        "%s",
-        icon, day_name, chi, clo, tu,
+        "  %s"
+        "  %s"
+        "  %s %s",
+        icon, WEATHER_DAY_COLS, WEATHER_DAY_COLS, d->day_name, chi, clo, tu,
         dclr, desc_pad,
-        d->humidity,
-        d->wind_speed, su, weather_wind_dir(d->wind_deg),
-        precip);
+        humid,
+        precip,
+        d->wind, d->wind_dir);
 
     cmd_reply(ctx, buf);
   }
@@ -675,12 +732,7 @@ weather_hour_cell(char *buf, size_t sz, const openweather_forecast_hour_t *h,
   weather_fmt_temp_w(temp, sizeof(temp), h->temp, units, 3);
   weather_fmt_desc_pad(desc_pad, sizeof(desc_pad), h->condition_desc, 16);
 
-  // Fixed 4-column precip slot: coloured "NN%" when there's a chance,
-  // blank otherwise.
-  if(pop > 0)
-    snprintf(pop_str, sizeof(pop_str), CLR_CYAN "%3d%%" CLR_RESET, pop);
-  else
-    snprintf(pop_str, sizeof(pop_str), "    ");
+  weather_fmt_precip(pop_str, sizeof(pop_str), pop);
 
   snprintf(buf, sz,
       "%s %-3s %4s  %s\xc2\xb0%s  %s%s" CLR_RESET "  %s",

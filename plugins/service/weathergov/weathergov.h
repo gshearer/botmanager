@@ -34,10 +34,19 @@
 // active set arrives or nothing does.
 #define WXG_ALERTS_URL  "https://api.weather.gov/alerts/active"
 
+// Everything keyed on a forecast grid hangs off here: the 14-period
+// forecast (WX-3), the 156-period hourly one and the raw 59-parameter
+// timeseries (neither of which we ask for — root TODO §WX-NOTPLANNED).
+#define WXG_GRID_URL    "https://api.weather.gov/gridpoints"
+
 // Rounded "%.4f,%.4f" — the coordinate as both the URL tail and the
 // point-cache key. Longer forms answer 301 with the rounded one, which
 // costs a round trip and a cache key that never matches.
 #define WXG_COORD_SZ    32
+
+// A forecast is addressed by grid rather than by coordinate, so
+// "ILN/39,49" is what its log lines and its cache key would name.
+#define WXG_GRID_LABEL_SZ  24
 
 #define WXG_URL_SZ      256
 #define WXG_UA_SZ       128
@@ -54,15 +63,16 @@
 #define WXG_ALERT_REF_MAX        32   // superseded ids remembered
 
 // Successive chunks add their own WEATHERGOV_* result sizes beside the
-// ones in weathergov_api.h: forecast periods (WX-3), observations
-// (WX-4). §WX-NAMING in the root TODO pins every name.
+// ones in weathergov_api.h: observations (WX-4). §WX-NAMING in the root
+// TODO pins every name.
 
 // Request types and structures
 
 typedef enum
 {
   WXG_REQ_POINT,
-  WXG_REQ_ALERTS
+  WXG_REQ_ALERTS,
+  WXG_REQ_FORECAST
 } wxg_req_type_t;
 
 // The caller-supplied completion, one arm per request type. Named
@@ -70,8 +80,9 @@ typedef enum
 // and an anonymous union in each would be two incompatible types.
 typedef union
 {
-  weathergov_point_cb_t   point;
-  weathergov_alerts_cb_t  alerts;
+  weathergov_point_cb_t    point;
+  weathergov_alerts_cb_t   alerts;
+  weathergov_forecast_cb_t forecast;
 } wxg_cb_u;
 
 // Request context: carries request parameters and the caller-supplied
@@ -84,6 +95,7 @@ typedef struct wxg_request
   double              lat;
   double              lon;
   char                coord[WXG_COORD_SZ];   // rounded, "%.4f,%.4f"
+  char                grid[WXG_GRID_LABEL_SZ]; // "ILN/39,49" — grid requests
   char                ua[WXG_UA_SZ];
 
   // Caller callback (union on done-callback shape).
@@ -95,8 +107,9 @@ typedef struct wxg_request
   // can fill it a leg at a time.
   union
   {
-    weathergov_point_result_t  point;
-    weathergov_alert_result_t  alerts;
+    weathergov_point_result_t     point;
+    weathergov_alert_result_t     alerts;
+    weathergov_forecast_result_t  forecast;
   }                   acc;
 
   // Freelist linkage.
@@ -218,6 +231,32 @@ static void  wxg_alerts_deliver(wxg_request_t *r);
 static void  wxg_alerts_done(const curl_response_t *resp);
 
 #endif // WXG_ALERTS_TU
+
+// ----------------------------------------------------------------------
+// Forecast — weathergov_forecast.c
+// ----------------------------------------------------------------------
+
+#ifdef WXG_FORECAST_TU
+
+// One NWS icon token and the OpenWeather condition code it means. The
+// vocabulary is closed at 34 tokens upstream (api.weather.gov/icons), so
+// the table is exhaustive by construction and anything outside it is a
+// protocol surprise rather than a gap.
+typedef struct
+{
+  const char *token;
+  int32_t     condition_id;
+} wxg_icon_map_t;
+
+static int32_t wxg_icon_condition_id(const char *icon_url);
+static void    wxg_wind_tidy(const char *raw, char *out, size_t sz);
+static void    wxg_period_parse_one(struct json_object *p,
+                   weathergov_period_t *out);
+
+static void    wxg_forecast_deliver(wxg_request_t *r);
+static void    wxg_forecast_done(const curl_response_t *resp);
+
+#endif // WXG_FORECAST_TU
 
 // ----------------------------------------------------------------------
 // Core translation unit — weathergov.c. Lifecycle, module state, the

@@ -48,6 +48,12 @@
 #define WEATHERGOV_STATE_SZ     4
 #define WEATHERGOV_ALERT_MAX    8    // matches OPENWEATHER_ALERT_MAX
 
+#define WEATHERGOV_PERIOD_NAME_SZ 24   // "Wednesday Night" = 15
+#define WEATHERGOV_COND_SZ      96   // shortForecast, verbatim; measured 77
+#define WEATHERGOV_WIND_SZ      24   // "7-12mph"
+#define WEATHERGOV_DETAIL_SZ    512  // detailedForecast
+#define WEATHERGOV_PERIOD_MAX   14   // measured exactly 14, day/night alternating
+
 // A point resolved to its NWS forecast grid. The grid triple is what
 // every forecast and gridpoint URL is built from; the rest is what the
 // same response hands over for free.
@@ -183,6 +189,67 @@ typedef struct
 typedef void (*weathergov_alerts_cb_t)(
     const weathergov_alert_result_t *res, void *user);
 
+// ----------------------------------------------------------------------
+// The forecast
+// ----------------------------------------------------------------------
+//
+// weather.gov forecasts in day/night PERIODS, not days: 14 of them,
+// alternating, each written by the local Weather Forecast Office. The
+// service hands them over exactly as issued — pairing a day with its
+// night is a presentation decision and belongs to the consumer.
+//
+// Two fields are deliberately carried and rendered nowhere, on the same
+// terms as an alert's `desc`: `start` is a period's identity, and
+// `detail` is the meteorologist's own prose — the quality argument for
+// this provider in the first place, and what the proactive alerter
+// (root TODO.md §WX-FORWARD) will read. Neither is dead weight.
+//
+// There is no timezone here on purpose. Every period arrives already
+// LABELLED by upstream ("Today", "Tonight", "Wednesday Night"), so no
+// consumer has to turn an instant back into a weekday, and a second
+// offset beside weathergov_point_t.tz_offset would only be a way for
+// the two to disagree.
+typedef struct
+{
+  char    name[WEATHERGOV_PERIOD_NAME_SZ];  // "Tonight", "Wednesday Night"
+  time_t  start;                            // NOT rendered
+  bool    is_daytime;                       // pairs a night onto its day
+  double  temp;                             // high on a day, low on a night
+  char    temp_unit[4];                     // "F" | "C", as requested
+  int32_t pop;                              // %, -1 when null upstream
+  char    wind [WEATHERGOV_WIND_SZ];        // tidied: "7-12mph", "19km/h"
+  char    wind_dir[8];                      // "SSW" — already a compass point
+  int32_t condition_id;                     // OpenWeather numbering; see below
+  char    cond [WEATHERGOV_COND_SZ];        // shortForecast, verbatim
+  char    detail[WEATHERGOV_DETAIL_SZ];     // NOT rendered
+} weathergov_period_t;
+
+// `condition_id` is OpenWeather's condition numbering, which the whole
+// tree's icon and colour tables already key off. The five sky states
+// NWS names and OpenWeather has no code for take a private range at
+// 900+: 900 tornado, 901 hurricane, 902 blizzard, 903 tropical storm,
+// 904 hot, 905 cold. 0 means the icon token was unrecognised.
+
+typedef struct
+{
+  uint8_t             count;
+  weathergov_period_t periods[WEATHERGOV_PERIOD_MAX];
+} weathergov_forecast_t;
+
+// `covered == false` with an empty `err` means the same thing it does
+// everywhere else in this API: outside NWS coverage, ask the other
+// provider. A grid that answers 200 with zero periods lands here as
+// `count == 0`, which a consumer must treat the same way.
+typedef struct
+{
+  char                   err[128];
+  bool                   covered;
+  weathergov_forecast_t  forecast;
+} weathergov_forecast_result_t;
+
+typedef void (*weathergov_forecast_cb_t)(
+    const weathergov_forecast_result_t *res, void *user);
+
 // Real function declarations — visible only inside the weathergov
 // plugin (where WEATHERGOV_INTERNAL is defined). External consumers go
 // through the static-inline dlsym shims defined further down.
@@ -210,6 +277,20 @@ bool weathergov_point_async(double lat, double lon,
 // entirely the caller's to reply on and free.
 bool weathergov_alerts_async(double lat, double lon,
     weathergov_alerts_cb_t cb, void *user);
+
+// The 14-period forecast for an already-resolved grid. `pt` is borrowed
+// for the duration of the call only — the grid triple is copied into the
+// URL before this returns. `units` is "us" (°F, mph) or "si" (°C, km/h);
+// NULL means "us". There is no Kelvin upstream, so a caller wanting it
+// asks for "si" and converts.
+//
+// Returns SUCCESS if the callback will fire. Returns FAIL when the
+// request could not be queued at all (callback or point NULL, the
+// service switched off via plugin.weathergov.enabled, or curl refusing
+// the submit); on FAIL the callback does NOT fire and `user` is still
+// entirely the caller's to reply on and free.
+bool weathergov_forecast_async(const weathergov_point_t *pt,
+    const char *units, weathergov_forecast_cb_t cb, void *user);
 
 // The plugin.weathergov.enabled master switch. A caller checks this to
 // skip the weather.gov leg outright rather than paying for a refused
@@ -282,6 +363,32 @@ weathergov_alerts_async(double lat, double lon,
     __atomic_store_n(&cached, fn, __ATOMIC_RELEASE);
   }
   return(fn(lat, lon, cb, user));
+}
+
+static inline bool
+weathergov_forecast_async(const weathergov_point_t *pt, const char *units,
+    weathergov_forecast_cb_t cb, void *user)
+{
+  typedef bool (*fn_t)(const weathergov_point_t *, const char *,
+      weathergov_forecast_cb_t, void *);
+  static fn_t cached = NULL;
+  fn_t        fn     = __atomic_load_n(&cached, __ATOMIC_ACQUIRE);
+
+  if(fn == NULL)
+  {
+    union { void *obj; fn_t fn; } u;
+
+    u.obj = plugin_dlsym_cached("weathergov", "weathergov_forecast_async", (void **)&cached);
+    if(u.obj == NULL)
+    {
+      clam(CLAM_FATAL, "weathergov",
+          "dlsym failed: weathergov_forecast_async");
+      abort();
+    }
+    fn = u.fn;
+    __atomic_store_n(&cached, fn, __ATOMIC_RELEASE);
+  }
+  return(fn(pt, units, cb, user));
 }
 
 static inline bool

@@ -82,8 +82,14 @@ weather_done_forecast(const openweather_forecast_result_t *res, void *user)
 
   if(r->kind == WEATHER_REQ_FORECAST_HOURLY)
     weather_reply_forecast_hourly(&ctx, &res->forecast, &r->alerts);
+
   else
-    weather_reply_forecast_daily(&ctx, &res->forecast, &r->alerts);
+  {
+    weather_view_forecast_t view;
+
+    weather_view_from_ow_forecast(&res->forecast, &view);
+    weather_reply_forecast_daily(&ctx, &view, &r->alerts);
+  }
 
   mem_free(r);
 }
@@ -189,6 +195,81 @@ weather_dispatch_openweather(weather_req_t *r)
   mem_free(r);
 }
 
+// weather.gov negotiates units server-side, in two flavours where our
+// own knob has three. There is no Kelvin upstream at all, so "standard"
+// asks for Celsius and the adapter adds the 273.15 — the one unit
+// conversion this feature owns (root TODO §WX-DESIGN §5).
+static const char *
+weather_units_wxg(const char *kv)
+{
+  return(strcmp(kv, "imperial") == 0 ? "us" : "si");
+}
+
+// Leg C, and the last of them: the forecast the local Weather Forecast
+// Office wrote. Anything short of real periods — uncovered, non-2xx,
+// unparseable, empty — falls back to openweather's daily view, which is
+// exactly what shipped before this leg existed.
+static void
+weather_forecast_done(const weathergov_forecast_result_t *res, void *user)
+{
+  weather_req_t *r = (weather_req_t *)user;
+  weather_view_forecast_t view;
+  cmd_ctx_t ctx = r->ctx;
+
+  if(res->err[0] != '\0' || !res->covered || res->forecast.count == 0)
+  {
+    clam(CLAM_DEBUG, WEATHER_CTX, "forecast %s: weathergov gave nothing (%s)",
+        r->loc.zip, res->err[0] != '\0' ? res->err : "no periods");
+
+    weather_dispatch_openweather(r);
+    return;
+  }
+
+  ctx.msg = &r->msg;
+
+  weather_view_from_wxg_forecast(&res->forecast, r->loc.place, r->loc.zip,
+      openweather_units_kv_value(), &view);
+
+  clam(CLAM_DEBUG, WEATHER_CTX, "forecast %s: %u period(s) -> %u day row(s)",
+      r->loc.zip, res->forecast.count, view.count);
+
+  weather_reply_forecast_daily(&ctx, &view, &r->alerts);
+
+  mem_free(r);
+}
+
+// Leg B, daily view only: the forecast grid this coordinate sits in.
+// Alerts took raw coordinates, but every gridpoint URL is built from the
+// office/x/y triple, so the forecast needs this one lookup first — from
+// the point cache in every case but the first (7 days, and a grid does
+// not move).
+static void
+weather_point_done(const weathergov_point_result_t *res, void *user)
+{
+  weather_req_t *r = (weather_req_t *)user;
+
+  if(res->err[0] != '\0' || !res->covered)
+  {
+    clam(CLAM_DEBUG, WEATHER_CTX, "forecast %s: no grid (%s)", r->loc.zip,
+        res->err[0] != '\0' ? res->err : "uncovered");
+
+    weather_dispatch_openweather(r);
+    return;
+  }
+
+  // A FAIL means the callback did NOT fire, so the request is still ours
+  // to hand on to openweather — never a reply and never a free.
+  if(weathergov_forecast_async(&res->point,
+      weather_units_wxg(openweather_units_kv_value()),
+      weather_forecast_done, r) == SUCCESS)
+    return;
+
+  clam(CLAM_DEBUG, WEATHER_CTX, "forecast %s: weathergov refused the "
+      "forecast leg", r->loc.zip);
+
+  weather_dispatch_openweather(r);
+}
+
 // Leg A of the chain: weather.gov's alerts, and with them its verdict
 // on whether this coordinate is American at all. Runs on the curl multi
 // worker, and hands straight on to leg B — openweather, for the
@@ -220,6 +301,21 @@ weather_alerts_done(const weathergov_alert_result_t *res, void *user)
 
     clam(CLAM_DEBUG, WEATHER_CTX, "route %s: us=yes alerts=%u (%u carried)",
         r->loc.zip, res->alerts.total, res->alerts.count);
+  }
+
+  // A covered coordinate is the only thing that earns the forecast legs:
+  // the daily view is the one weather.gov answers better than OpenWeather
+  // in every column that matters, and `have_alerts` is already the
+  // coverage verdict. Everything else — and every failure downstream of
+  // here — goes to openweather.
+  if(r->kind == WEATHER_REQ_FORECAST_DAILY && r->have_alerts)
+  {
+    if(weathergov_point_async(r->loc.lat, r->loc.lon,
+        weather_point_done, r) == SUCCESS)
+      return;
+
+    clam(CLAM_DEBUG, WEATHER_CTX, "forecast %s: weathergov refused the point "
+        "leg", r->loc.zip);
   }
 
   weather_dispatch_openweather(r);
