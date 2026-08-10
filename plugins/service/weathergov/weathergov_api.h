@@ -54,6 +54,8 @@
 #define WEATHERGOV_DETAIL_SZ    512  // detailedForecast
 #define WEATHERGOV_PERIOD_MAX   14   // measured exactly 14, day/night alternating
 
+#define WEATHERGOV_STATION_SZ   12   // "KHAO"; mesonet identifiers run longer
+
 // A point resolved to its NWS forecast grid. The grid triple is what
 // every forecast and gridpoint URL is built from; the rest is what the
 // same response hands over for free.
@@ -250,6 +252,61 @@ typedef struct
 typedef void (*weathergov_forecast_cb_t)(
     const weathergov_forecast_result_t *res, void *user);
 
+// ----------------------------------------------------------------------
+// Current conditions
+// ----------------------------------------------------------------------
+//
+// A forecast is a model's opinion of right now; an observation is what
+// an instrument at a named airport actually measured, minutes ago. This
+// is the one view where the two providers differ in kind rather than in
+// quality.
+//
+// ⚠ EVERY numeric an observation carries is nullable, and a station
+// that reports temperature may report nothing else — `windGust`,
+// `windChill`, `seaLevelPressure` were all null in the 08-10 probe of
+// KHAO. Each optional field therefore has its own presence flag and a
+// zero must never be read as a measurement.
+//
+// `have_temp` is the validity flag for the whole observation: false
+// means the nearest station is not reporting and the caller should use
+// its other provider rather than print a half-empty line.
+typedef struct
+{
+  char    station[WEATHERGOV_STATION_SZ];  // "KHAO"
+  char    text   [WEATHERGOV_COND_SZ];     // textDescription: "Partly Cloudy"
+  int32_t condition_id;                    // OpenWeather numbering; see above
+  time_t  observed;
+  bool    have_temp;
+  double  temp;
+  bool    have_feels;                      // heatIndex, else windChill
+  double  feels_like;
+  bool    have_humidity;
+  int32_t humidity;                        // %
+  bool    have_wind;
+  double  wind_speed;
+  double  wind_dir_deg;                    // degrees, as issued
+  bool    have_gust;
+  double  wind_gust;
+} weathergov_obs_t;
+
+// One caller needs both halves of "right now" — what was measured and
+// what the office says about the rest of the day — so they arrive
+// together rather than as two callbacks a consumer would have to join
+// (root TODO §WX-DESIGN §6: chains, never joins).
+//
+// The forecast half is enrichment and degrades on its own: `count == 0`
+// costs the caller its high/low and its prose line, nothing more.
+typedef struct
+{
+  char                   err[128];
+  bool                   covered;
+  weathergov_obs_t       obs;
+  weathergov_forecast_t  forecast;
+} weathergov_current_result_t;
+
+typedef void (*weathergov_current_cb_t)(
+    const weathergov_current_result_t *res, void *user);
+
 // Real function declarations — visible only inside the weathergov
 // plugin (where WEATHERGOV_INTERNAL is defined). External consumers go
 // through the static-inline dlsym shims defined further down.
@@ -291,6 +348,24 @@ bool weathergov_alerts_async(double lat, double lon,
 // entirely the caller's to reply on and free.
 bool weathergov_forecast_async(const weathergov_point_t *pt,
     const char *units, weathergov_forecast_cb_t cb, void *user);
+
+// Current conditions for an already-resolved grid: the latest
+// observation from the station nearest it, together with the forecast
+// periods that state today's high and low. `pt` is borrowed for the
+// duration of the call only. `units` is "us" (°F, mph) or "si" (°C,
+// m/s); NULL means "us".
+//
+// ⚠ The forecast half is enrichment: a result whose `obs.have_temp` is
+// true but whose `forecast.count` is 0 is a good answer with two fields
+// missing, not a failure.
+//
+// Returns SUCCESS if the callback will fire. Returns FAIL when the
+// request could not be queued at all (callback or point NULL, the
+// service switched off via plugin.weathergov.enabled, or curl refusing
+// the submit); on FAIL the callback does NOT fire and `user` is still
+// entirely the caller's to reply on and free.
+bool weathergov_current_async(const weathergov_point_t *pt,
+    const char *units, weathergov_current_cb_t cb, void *user);
 
 // The plugin.weathergov.enabled master switch. A caller checks this to
 // skip the weather.gov leg outright rather than paying for a refused
@@ -383,6 +458,32 @@ weathergov_forecast_async(const weathergov_point_t *pt, const char *units,
     {
       clam(CLAM_FATAL, "weathergov",
           "dlsym failed: weathergov_forecast_async");
+      abort();
+    }
+    fn = u.fn;
+    __atomic_store_n(&cached, fn, __ATOMIC_RELEASE);
+  }
+  return(fn(pt, units, cb, user));
+}
+
+static inline bool
+weathergov_current_async(const weathergov_point_t *pt, const char *units,
+    weathergov_current_cb_t cb, void *user)
+{
+  typedef bool (*fn_t)(const weathergov_point_t *, const char *,
+      weathergov_current_cb_t, void *);
+  static fn_t cached = NULL;
+  fn_t        fn     = __atomic_load_n(&cached, __ATOMIC_ACQUIRE);
+
+  if(fn == NULL)
+  {
+    union { void *obj; fn_t fn; } u;
+
+    u.obj = plugin_dlsym_cached("weathergov", "weathergov_current_async", (void **)&cached);
+    if(u.obj == NULL)
+    {
+      clam(CLAM_FATAL, "weathergov",
+          "dlsym failed: weathergov_current_async");
       abort();
     }
     fn = u.fn;

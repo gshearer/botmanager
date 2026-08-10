@@ -61,6 +61,11 @@ typedef struct
   // skip alert enrichment entirely, which is where the round trips go.
   weather_view_alert_set_t  alerts;
   bool                      have_alerts;
+
+  // The resolved forecast grid, kept from leg B onward. The current view
+  // prints the sunrise and sunset it carries, which arrived with the grid
+  // and cost nothing.
+  weathergov_point_t        point;
 } weather_req_t;
 
 // The command surface — weather.c only. Its argument descriptor is a
@@ -87,6 +92,9 @@ static void             weather_dispatch_openweather(weather_req_t *r);
 static const char      *weather_units_wxg(const char *kv);
 static void             weather_forecast_done(
                             const weathergov_forecast_result_t *res,
+                            void *user);
+static void             weather_current_done(
+                            const weathergov_current_result_t *res,
                             void *user);
 static void             weather_point_done(
                             const weathergov_point_result_t *res,

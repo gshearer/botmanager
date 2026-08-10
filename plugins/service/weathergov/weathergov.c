@@ -657,6 +657,10 @@ wxg_deinit(void)
 
   pthread_mutex_destroy(&wxg_point_cache_mu);
 
+  // Owned by the observation chain, freed here: one plugin, one place
+  // that gives its memory back.
+  wxg_station_cache_clear();
+
   clam(CLAM_INFO, WXG_CTX, "weathergov plugin deinitialized");
 }
 

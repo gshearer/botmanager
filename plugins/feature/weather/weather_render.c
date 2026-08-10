@@ -4,6 +4,7 @@
 #define WEATHER_RENDER_TU
 #include "weather.h"
 
+#include <stdarg.h>
 #include <stdio.h>
 #include <string.h>
 #include <time.h>
@@ -259,10 +260,94 @@ weather_fmt_precip(char *buf, size_t sz, int pop)
     snprintf(buf, sz, "    ");
 }
 
+// The forecast office's own prose, cut to one line.
+//
+// It runs to a paragraph upstream — "A slight chance of showers and
+// thunderstorms before 11am, then a chance of showers and thunderstorms
+// after 2pm. Partly sunny, with a high near 89…" — and one line of it is
+// worth more than none. The cut lands on a word boundary and says so
+// with an ellipsis; anything else reads as a bug.
+//
+// The whole line is plain: every other line in this view colours its
+// field LABELS, and this line is not fields, it is a sentence.
+void
+weather_fmt_detail(char *buf, size_t sz, const char *name, const char *detail)
+{
+  // Two leading spaces to sit under the header, and the ellipsis is the
+  // one multi-byte character this line can gain — the budget below is
+  // therefore counted in bytes, which for ASCII prose is columns.
+  size_t budget = (sz - 1 < WEATHER_LINE_COLS) ? sz - 1 : WEATHER_LINE_COLS;
+  size_t len    = (size_t)snprintf(buf, sz, "  %s: ", name);
+  size_t i;
+  size_t cut    = 0;
+
+  if(len >= budget)
+    return;
+
+  for(i = 0; detail[i] != '\0' && len + i < budget; i++)
+  {
+    buf[len + i] = detail[i];
+
+    if(detail[i] == ' ')
+      cut = i;
+  }
+
+  // The whole thing fitted: no cut, no ellipsis.
+  if(detail[i] == '\0')
+  {
+    buf[len + i] = '\0';
+    return;
+  }
+
+  // No space anywhere in the budget is one unbroken word; cutting mid-word
+  // is then the only honest option left.
+  if(cut == 0)
+    cut = i;
+
+  snprintf(buf + len + cut, sz - len - cut, "\xe2\x80\xa6");
+}
+
 void
 weather_fmt_desc_pad(char *buf, size_t sz, const char *desc, int width)
 {
   snprintf(buf, sz, "%-*.*s", width, width, desc);
+}
+
+// The interpunct that joins one segment of a line to the next. It is
+// grey because it is punctuation, and it belongs to the segment that
+// follows it — which is what lets an absent field vanish without leaving
+// a separator behind.
+#define WEATHER_SEG_DOT  " " CLR_GRAY "\xc2\xb7" CLR_RESET " "
+
+static void
+weather_line_add(weather_line_t *l, const char *fmt, ...)
+{
+  va_list ap;
+  int     n;
+
+  if(l->len + 1 >= l->sz)
+    return;
+
+  if(l->any)
+    l->len += (size_t)snprintf(l->buf + l->len, l->sz - l->len,
+        WEATHER_SEG_DOT);
+
+  if(l->len + 1 >= l->sz)
+    return;
+
+  va_start(ap, fmt);
+  n = vsnprintf(l->buf + l->len, l->sz - l->len, fmt, ap);
+  va_end(ap);
+
+  if(n > 0)
+    l->len += (size_t)n;
+
+  // snprintf reports what it WOULD have written; a truncated segment
+  // must still leave the length inside the buffer.
+  if(l->len >= l->sz)
+    l->len = l->sz - 1;
+
+  l->any = true;
 }
 
 void
@@ -508,18 +593,31 @@ weather_reply_alerts(const cmd_ctx_t *ctx, const weather_view_alert_set_t *a)
 
 // Reply formatters (consume typed payloads)
 
+// Current conditions, in two lines and sometimes three:
+//
+//   {icon} {Place} ({zip}) — {condition} · {temp}°{u} (feels {temp}°{u})
+//     Hi {hi}°/Lo {lo}°{u} · Humidity {rh}% · Wind {n}{u} {dir} (g{n}) · Rise … Set …
+//     {Today}: {the forecast office's own prose, cut to one line}
+//
+// Everything on line 2 is optional and every optional thing takes its own
+// separator with it, so the openweather path — no gust, no prose, and a
+// high/low only when One Call's daily timeline is steady enough to state
+// one — renders exactly the two lines it always did.
 void
 weather_reply_current(const cmd_ctx_t *ctx,
-    const openweather_current_t *cur,
+    const weather_view_current_t *cur,
     const weather_view_alert_set_t *alerts)
 {
   char ct[32], cf[32];
   char buf[WEATHER_REPLY_SZ];
   char sunrise[12], sunset[12];
+  char zipseg[OPENWEATHER_ZIPCODE_SZ + 4];
+  char feels[64];
   const char *tu = weather_temp_unit(cur->units);
   const char *su = weather_speed_unit(cur->units);
   const char *icon = weather_condition_icon(cur->condition_id);
   const char *dclr = weather_condition_color(cur->condition_id);
+  weather_line_t line = { .buf = buf, .sz = sizeof(buf) };
 
   sunrise[0] = sunset[0] = '?';
   sunrise[1] = sunset[1] = '\0';
@@ -532,32 +630,38 @@ weather_reply_current(const cmd_ctx_t *ctx,
     weather_format_time_ampm(cur->sunset, cur->tz_offset,
         sunset, sizeof(sunset));
 
-  weather_fmt_temp(ct, sizeof(ct), cur->temp,       cur->units);
-  weather_fmt_temp(cf, sizeof(cf), cur->feels_like, cur->units);
+  weather_fmt_temp(ct, sizeof(ct), cur->temp, cur->units);
+
+  // A synthetic zipcode is an internal cache key rather than anybody's
+  // postcode, so the parentheses leave with it.
+  if(weather_zip_is_synth(cur->zip))
+    zipseg[0] = '\0';
+  else
+    snprintf(zipseg, sizeof(zipseg), " (%s)", cur->zip);
+
+  feels[0] = '\0';
+
+  if(cur->have_feels)
+  {
+    weather_fmt_temp(cf, sizeof(cf), cur->feels_like, cur->units);
+    snprintf(feels, sizeof(feels), " (feels %s\xc2\xb0%s)", cf, tu);
+  }
 
   // Line 1: icon + location + condition + temperature.
-  if(weather_zip_is_synth(cur->zipcode))
-    snprintf(buf, sizeof(buf),
-        "%s " CLR_BOLD "%s" CLR_RESET " "
-        "\xe2\x80\x94 %s%s" CLR_RESET
-        " " CLR_GRAY "\xc2\xb7" CLR_RESET " "
-        "%s\xc2\xb0%s (feels %s\xc2\xb0%s)",
-        icon, cur->place_name,
-        dclr, cur->condition_desc,
-        ct, tu, cf, tu);
-  else
-    snprintf(buf, sizeof(buf),
-        "%s " CLR_BOLD "%s" CLR_RESET " (%s) "
-        "\xe2\x80\x94 %s%s" CLR_RESET
-        " " CLR_GRAY "\xc2\xb7" CLR_RESET " "
-        "%s\xc2\xb0%s (feels %s\xc2\xb0%s)",
-        icon, cur->place_name, cur->zipcode,
-        dclr, cur->condition_desc,
-        ct, tu, cf, tu);
+  snprintf(buf, sizeof(buf),
+      "%s " CLR_BOLD "%s" CLR_RESET "%s "
+      "\xe2\x80\x94 %s%s" CLR_RESET
+      " " CLR_GRAY "\xc2\xb7" CLR_RESET " "
+      "%s\xc2\xb0%s%s",
+      icon, cur->place, zipseg,
+      dclr, cur->cond,
+      ct, tu, feels);
 
   cmd_reply(ctx, buf);
 
-  // Line 2: hi/lo + humidity + wind + sunrise/sunset.
+  // Line 2: whatever of hi/lo, humidity, wind and the sun is known.
+  line.len = (size_t)snprintf(buf, sizeof(buf), "  ");
+
   if(cur->have_hilo)
   {
     char chi[32], clo[32];
@@ -565,35 +669,35 @@ weather_reply_current(const cmd_ctx_t *ctx,
     weather_fmt_temp(chi, sizeof(chi), cur->temp_hi, cur->units);
     weather_fmt_temp(clo, sizeof(clo), cur->temp_lo, cur->units);
 
-    snprintf(buf, sizeof(buf),
-        "  Hi %s\xc2\xb0/Lo %s\xc2\xb0%s"
-        " " CLR_GRAY "\xc2\xb7" CLR_RESET " "
-        CLR_CYAN "Humidity" CLR_RESET " %d%%"
-        " " CLR_GRAY "\xc2\xb7" CLR_RESET " "
-        CLR_GREEN "Wind" CLR_RESET " %.0f%s %s"
-        " " CLR_GRAY "\xc2\xb7" CLR_RESET " "
-        CLR_YELLOW "Rise" CLR_RESET " %s "
-        CLR_PURPLE "Set" CLR_RESET " %s",
-        chi, clo, tu,
-        cur->humidity,
-        cur->wind_speed, su, weather_wind_dir(cur->wind_deg),
-        sunrise, sunset);
+    weather_line_add(&line, "Hi %s\xc2\xb0/Lo %s\xc2\xb0%s", chi, clo, tu);
   }
 
-  else
-    snprintf(buf, sizeof(buf),
-        "  "
-        CLR_CYAN "Humidity" CLR_RESET " %d%%"
-        " " CLR_GRAY "\xc2\xb7" CLR_RESET " "
-        CLR_GREEN "Wind" CLR_RESET " %.0f%s %s"
-        " " CLR_GRAY "\xc2\xb7" CLR_RESET " "
-        CLR_YELLOW "Rise" CLR_RESET " %s "
-        CLR_PURPLE "Set" CLR_RESET " %s",
-        cur->humidity,
-        cur->wind_speed, su, weather_wind_dir(cur->wind_deg),
-        sunrise, sunset);
+  if(cur->have_humidity)
+    weather_line_add(&line, CLR_CYAN "Humidity" CLR_RESET " %d%%",
+        cur->humidity);
+
+  // A gust is reported only when there is one to report: a station
+  // measuring steady wind leaves windGust null rather than repeating the
+  // speed, and "(g0)" would be a reading nobody took.
+  if(cur->have_wind && cur->have_gust)
+    weather_line_add(&line, CLR_GREEN "Wind" CLR_RESET " %.0f%s %s (g%.0f)",
+        cur->wind_speed, su, weather_wind_dir(cur->wind_deg), cur->wind_gust);
+
+  else if(cur->have_wind)
+    weather_line_add(&line, CLR_GREEN "Wind" CLR_RESET " %.0f%s %s",
+        cur->wind_speed, su, weather_wind_dir(cur->wind_deg));
+
+  weather_line_add(&line, CLR_YELLOW "Rise" CLR_RESET " %s "
+      CLR_PURPLE "Set" CLR_RESET " %s", sunrise, sunset);
 
   cmd_reply(ctx, buf);
+
+  // Line 3: the forecast office, in its own words.
+  if(cur->have_detail)
+  {
+    weather_fmt_detail(buf, sizeof(buf), cur->detail_name, cur->detail);
+    cmd_reply(ctx, buf);
+  }
 
   weather_reply_alerts(ctx, alerts);
 }

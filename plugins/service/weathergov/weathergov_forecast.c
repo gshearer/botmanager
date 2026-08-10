@@ -68,7 +68,7 @@ static const wxg_icon_map_t wxg_icons[] = {
 //
 // Returns 0 for anything unrecognised, which every consumer's condition
 // table already renders as its own fallback.
-static int32_t
+int32_t
 wxg_icon_condition_id(const char *icon_url)
 {
   const char *p;
@@ -200,6 +200,65 @@ wxg_period_parse_one(struct json_object *p, weathergov_period_t *out)
 }
 
 // ----------------------------------------------------------------------
+// The response
+// ----------------------------------------------------------------------
+
+// Shared with the current-conditions chain, whose last leg ends on this
+// same endpoint: one gridpoint forecast, one reader of it.
+bool
+wxg_forecast_parse(const char *body, size_t len, weathergov_forecast_t *out)
+{
+  struct json_object *root;
+  struct json_object *props;
+  struct json_object *periods;
+  int                 n;
+  int                 i;
+
+  memset(out, 0, sizeof(*out));
+
+  root = json_parse_buf(body, len, WXG_CTX);
+
+  if(root == NULL)
+    return(FAIL);
+
+  props   = json_get_obj(root, "properties");
+  periods = (props != NULL) ? json_get_array(props, "periods") : NULL;
+
+  if(periods == NULL)
+  {
+    json_object_put(root);
+    return(FAIL);
+  }
+
+  n = (int)json_object_array_length(periods);
+
+  for(i = 0; i < n && out->count < WEATHERGOV_PERIOD_MAX; i++)
+  {
+    struct json_object  *p = json_object_array_get_idx(periods, i);
+    weathergov_period_t *period;
+
+    if(p == NULL)
+      continue;
+
+    period = &out->periods[out->count];
+
+    wxg_period_parse_one(p, period);
+
+    // A period with no label is a period no consumer can render. It has
+    // never been observed; dropping it keeps that true downstream.
+    if(period->name[0] != '\0')
+      out->count++;
+  }
+
+  json_object_put(root);
+
+  clam(CLAM_DEBUG2, WXG_CTX, "forecast: %d period(s) -> %u kept", n,
+      out->count);
+
+  return(SUCCESS);
+}
+
+// ----------------------------------------------------------------------
 // Transfer
 // ----------------------------------------------------------------------
 
@@ -221,11 +280,6 @@ wxg_forecast_done(const curl_response_t *resp)
 {
   wxg_request_t                *r   = (wxg_request_t *)resp->user_data;
   weathergov_forecast_result_t *res = &r->acc.forecast;
-  struct json_object           *root;
-  struct json_object           *props;
-  struct json_object           *periods;
-  int                           n;
-  int                           i;
 
   res->covered = true;
 
@@ -242,52 +296,9 @@ wxg_forecast_done(const curl_response_t *resp)
     return;
   }
 
-  root = json_parse_buf(resp->body, resp->body_len, WXG_CTX);
-
-  if(root == NULL)
-  {
+  if(wxg_forecast_parse(resp->body, resp->body_len, &res->forecast) != SUCCESS)
     snprintf(res->err, sizeof(res->err),
-        "weather.gov returned an unreadable response.");
-    wxg_forecast_deliver(r);
-    return;
-  }
-
-  props   = json_get_obj(root, "properties");
-  periods = (props != NULL) ? json_get_array(props, "periods") : NULL;
-
-  if(periods == NULL)
-  {
-    json_object_put(root);
-    snprintf(res->err, sizeof(res->err),
-        "weather.gov returned no forecast periods.");
-    wxg_forecast_deliver(r);
-    return;
-  }
-
-  n = (int)json_object_array_length(periods);
-
-  for(i = 0; i < n && res->forecast.count < WEATHERGOV_PERIOD_MAX; i++)
-  {
-    struct json_object  *p = json_object_array_get_idx(periods, i);
-    weathergov_period_t *out;
-
-    if(p == NULL)
-      continue;
-
-    out = &res->forecast.periods[res->forecast.count];
-
-    wxg_period_parse_one(p, out);
-
-    // A period with no label is a period no consumer can render. It has
-    // never been observed; dropping it keeps that true downstream.
-    if(out->name[0] != '\0')
-      res->forecast.count++;
-  }
-
-  json_object_put(root);
-
-  clam(CLAM_DEBUG2, WXG_CTX, "forecast %s: %d period(s) -> %u kept",
-      r->grid, n, res->forecast.count);
+        "weather.gov returned no readable forecast.");
 
   wxg_forecast_deliver(r);
 }

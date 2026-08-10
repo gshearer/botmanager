@@ -322,6 +322,111 @@ weather_view_from_wxg_forecast(const weathergov_forecast_t *src,
   }
 }
 
+// ----------------------------------------------------------------------
+// Current conditions
+// ----------------------------------------------------------------------
+
+void
+weather_view_from_wxg_current(const weathergov_obs_t *obs,
+    const weathergov_forecast_t *fc, const weathergov_point_t *pt,
+    const char *place, const char *zip, const char *units,
+    weather_view_current_t *out)
+{
+  double kelvin = (strcmp(units, "standard") == 0) ? 273.15 : 0.0;
+
+  memset(out, 0, sizeof(*out));
+
+  snprintf(out->place, sizeof(out->place), "%s", place);
+  snprintf(out->zip,   sizeof(out->zip),   "%s", zip);
+  snprintf(out->units, sizeof(out->units), "%s", units);
+
+  snprintf(out->cond, sizeof(out->cond), "%s", obs->text);
+  out->condition_id = obs->condition_id;
+
+  out->temp          = obs->temp + kelvin;
+  out->have_feels    = obs->have_feels;
+  out->feels_like    = obs->feels_like + kelvin;
+  out->have_humidity = obs->have_humidity;
+  out->humidity      = obs->humidity;
+  out->have_wind     = obs->have_wind;
+  out->wind_speed    = obs->wind_speed;
+  out->wind_deg      = obs->wind_dir_deg;
+  out->have_gust     = obs->have_gust;
+  out->wind_gust     = obs->wind_gust;
+
+  // Sunrise and sunset came with the grid lookup and cost nothing here —
+  // the same cached /points response the forecast URL was built from.
+  out->sunrise   = pt->sunrise;
+  out->sunset    = pt->sunset;
+  out->tz_offset = pt->tz_offset;
+
+  if(fc->count == 0)
+    return;
+
+  // ⚠ A reporting station may still say nothing about the sky: PHTO in
+  // Hilo sends a temperature with an empty textDescription and no icon
+  // at all. The forecast office's own word for the same hour is already
+  // in hand, so the sky falls back to it rather than to a blank line and
+  // the thermometer glyph.
+  if(out->cond[0] == '\0')
+  {
+    snprintf(out->cond, sizeof(out->cond), "%s", fc->periods[0].cond);
+    out->condition_id = fc->periods[0].condition_id;
+  }
+
+  // Today's extremes are the first two periods — a high issued for the
+  // daylight half and the low for the night that follows it. Issued after
+  // dark the sequence opens on the night instead, and today's high is
+  // simply over: printing tomorrow's in its place would read as a
+  // measurement of a day that has not happened.
+  if(fc->periods[0].is_daytime && fc->count >= 2)
+  {
+    out->have_hilo = true;
+    out->temp_hi   = fc->periods[0].temp + kelvin;
+    out->temp_lo   = fc->periods[1].temp + kelvin;
+  }
+
+  if(fc->periods[0].detail[0] == '\0')
+    return;
+
+  out->have_detail = true;
+  snprintf(out->detail_name, sizeof(out->detail_name), "%s",
+      fc->periods[0].name);
+  snprintf(out->detail, sizeof(out->detail), "%s", fc->periods[0].detail);
+}
+
+// One Call states a feels-like, a humidity and a wind for every location
+// on earth and never a gust, a station or a paragraph of prose — so
+// three presence flags stay false here and the line grammar renders
+// exactly the two lines this view has always had.
+void
+weather_view_from_ow_current(const openweather_current_t *src,
+    weather_view_current_t *out)
+{
+  memset(out, 0, sizeof(*out));
+
+  snprintf(out->place, sizeof(out->place), "%s", src->place_name);
+  snprintf(out->zip,   sizeof(out->zip),   "%s", src->zipcode);
+  snprintf(out->units, sizeof(out->units), "%s", src->units);
+  snprintf(out->cond,  sizeof(out->cond),  "%s", src->condition_desc);
+
+  out->condition_id  = src->condition_id;
+  out->temp          = src->temp;
+  out->have_feels    = true;
+  out->feels_like    = src->feels_like;
+  out->have_hilo     = src->have_hilo;
+  out->temp_hi       = src->temp_hi;
+  out->temp_lo       = src->temp_lo;
+  out->have_humidity = true;
+  out->humidity      = src->humidity;
+  out->have_wind     = true;
+  out->wind_speed    = src->wind_speed;
+  out->wind_deg      = src->wind_deg;
+  out->sunrise       = src->sunrise;
+  out->sunset        = src->sunset;
+  out->tz_offset     = src->tz_offset;
+}
+
 // One Call 4.0's daily rows are the mirror image of a weather.gov
 // period: a real relative humidity, and no precipitation probability at
 // all — 4.0 dropped `pop` from daily, which is why the column beside it

@@ -111,6 +111,55 @@ typedef struct
   weather_view_day_t days[WEATHER_FORECAST_DAYS];
 } weather_view_forecast_t;
 
+// Current conditions.
+//
+// The two providers differ in KIND here, not merely in quality: One Call
+// states a model's opinion of right now, weather.gov relays what an
+// instrument at a named airport measured minutes ago. What survives into
+// this struct is what both can be asked for, plus the three things only
+// an observation network has — a gust, the day's high and low from the
+// forecast office, and that office's own prose.
+//
+// Every optional field carries a presence flag because a station that
+// reports temperature may report nothing else, and because the openweather
+// path leaves the last three empty by construction. A zero is never a
+// measurement.
+typedef struct
+{
+  char    place[OPENWEATHER_NAME_SZ];
+  char    zip  [OPENWEATHER_ZIPCODE_SZ];
+  char    units[OPENWEATHER_UNITS_SZ];   // the openweather KV value
+
+  int32_t condition_id;
+  char    cond[OPENWEATHER_DESC_SZ];     // "Partly Cloudy", "broken clouds"
+
+  double  temp;
+  bool    have_feels;
+  double  feels_like;
+
+  bool    have_hilo;                     // today's extremes, when known
+  double  temp_hi;
+  double  temp_lo;
+
+  bool    have_humidity;
+  int32_t humidity;                      // %
+  bool    have_wind;
+  double  wind_speed;
+  double  wind_deg;
+  bool    have_gust;
+  double  wind_gust;
+
+  time_t  sunrise;                       // 0 = unknown
+  time_t  sunset;
+  int32_t tz_offset;
+
+  // The local Weather Forecast Office on the rest of today — the one
+  // thing in this whole feature no other API can produce.
+  bool    have_detail;
+  char    detail_name[WEATHERGOV_PERIOD_NAME_SZ];  // "Today", "Tonight"
+  char    detail     [WEATHERGOV_DETAIL_SZ];
+} weather_view_current_t;
+
 // Adapters — weather_adapt.c. One per (provider, view), never one per
 // field.
 void weather_view_from_wxg_alerts(const weathergov_alert_set_t *src,
@@ -128,6 +177,18 @@ void weather_view_from_wxg_forecast(const weathergov_forecast_t *src,
          weather_view_forecast_t *out);
 void weather_view_from_ow_forecast(const openweather_forecast_t *src,
          weather_view_forecast_t *out);
+
+// The observation names its station and nothing else: the place label,
+// the postcode and the sun times come from the caller and its cached
+// point, exactly as they do for the forecast view. `fc` may be empty —
+// it is what carries the high, the low and the prose, and its absence
+// costs those three and no more.
+void weather_view_from_wxg_current(const weathergov_obs_t *obs,
+         const weathergov_forecast_t *fc, const weathergov_point_t *pt,
+         const char *place, const char *zip, const char *units,
+         weather_view_current_t *out);
+void weather_view_from_ow_current(const openweather_current_t *src,
+         weather_view_current_t *out);
 
 // Presentation — weather_render.c. Everything below this line formats;
 // nothing below it fetches, routes or decides.
@@ -147,6 +208,8 @@ void        weather_format_time_ampm(time_t ts, int tz_offset, char *buf,
                 size_t sz);
 bool        weather_zip_is_synth(const char *zip);
 void        weather_fmt_precip(char *buf, size_t sz, int pop);
+void        weather_fmt_detail(char *buf, size_t sz, const char *name,
+                const char *detail);
 void        weather_fmt_desc_pad(char *buf, size_t sz, const char *desc,
                 int width);
 void        weather_reply_header(const cmd_ctx_t *ctx, const char *place,
@@ -154,7 +217,7 @@ void        weather_reply_header(const cmd_ctx_t *ctx, const char *place,
 void        weather_reply_alerts(const cmd_ctx_t *ctx,
                 const weather_view_alert_set_t *a);
 void        weather_reply_current(const cmd_ctx_t *ctx,
-                const openweather_current_t *cur,
+                const weather_view_current_t *cur,
                 const weather_view_alert_set_t *alerts);
 void        weather_reply_forecast_daily(const cmd_ctx_t *ctx,
                 const weather_view_forecast_t *f,
@@ -182,6 +245,20 @@ static void weather_day_from_wxg(const weathergov_period_t *day,
 
 // Renderer-private — weather_render.c alone defines WEATHER_RENDER_TU.
 #ifdef WEATHER_RENDER_TU
+
+// A line built out of optional segments. Each one brings its own
+// separator, so a field that is absent takes its punctuation with it and
+// there is never a dangling " · " to trim afterwards.
+typedef struct
+{
+  char   *buf;
+  size_t  sz;
+  size_t  len;
+  bool    any;
+} weather_line_t;
+
+static void weather_line_add(weather_line_t *l, const char *fmt, ...)
+                __attribute__((format(printf, 2, 3)));
 
 // Columns a line occupies on screen: colour markup is skipped, UTF-8
 // continuation bytes count nothing, and a glyph followed by the

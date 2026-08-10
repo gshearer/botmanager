@@ -39,6 +39,11 @@
 // timeseries (neither of which we ask for — root TODO §WX-NOTPLANNED).
 #define WXG_GRID_URL    "https://api.weather.gov/gridpoints"
 
+// An observation is addressed by station, and a station is found by
+// grid: ".../gridpoints/ILN/39,49/stations" then ".../stations/KHAO/
+// observations/latest". Only the second base is new here.
+#define WXG_STATIONS_URL "https://api.weather.gov/stations"
+
 // Rounded "%.4f,%.4f" — the coordinate as both the URL tail and the
 // point-cache key. Longer forms answer 301 with the rounded one, which
 // costs a round trip and a cache key that never matches.
@@ -62,9 +67,13 @@
 #define WXG_ALERT_LABEL_MAX      32   // event+area fingerprints remembered
 #define WXG_ALERT_REF_MAX        32   // superseded ids remembered
 
-// Successive chunks add their own WEATHERGOV_* result sizes beside the
-// ones in weathergov_api.h: observations (WX-4). §WX-NAMING in the root
-// TODO pins every name.
+// The station list for one grid is 75 KiB and 53 entries, of which we
+// want the first — so it is fetched once per grid and remembered for as
+// long as the grid itself is (plugin.weathergov.point_cache_ttl). A
+// linear list rather than a hash: a bot sees tens of distinct grids in a
+// lifetime, and the point cache next door is the one that sees a lookup
+// per command.
+#define WXG_STATION_CACHE_MAX  256
 
 // Request types and structures
 
@@ -72,7 +81,8 @@ typedef enum
 {
   WXG_REQ_POINT,
   WXG_REQ_ALERTS,
-  WXG_REQ_FORECAST
+  WXG_REQ_FORECAST,
+  WXG_REQ_CURRENT
 } wxg_req_type_t;
 
 // The caller-supplied completion, one arm per request type. Named
@@ -83,6 +93,7 @@ typedef union
   weathergov_point_cb_t    point;
   weathergov_alerts_cb_t   alerts;
   weathergov_forecast_cb_t forecast;
+  weathergov_current_cb_t  current;
 } wxg_cb_u;
 
 // Request context: carries request parameters and the caller-supplied
@@ -96,6 +107,8 @@ typedef struct wxg_request
   double              lon;
   char                coord[WXG_COORD_SZ];   // rounded, "%.4f,%.4f"
   char                grid[WXG_GRID_LABEL_SZ]; // "ILN/39,49" — grid requests
+  char                units[4];                // "us" | "si" — grid requests
+  char                station[WEATHERGOV_STATION_SZ];  // current chain, leg 2
   char                ua[WXG_UA_SZ];
 
   // Caller callback (union on done-callback shape).
@@ -110,6 +123,7 @@ typedef struct wxg_request
     weathergov_point_result_t     point;
     weathergov_alert_result_t     alerts;
     weathergov_forecast_result_t  forecast;
+    weathergov_current_result_t   current;
   }                   acc;
 
   // Freelist linkage.
@@ -236,6 +250,18 @@ static void  wxg_alerts_done(const curl_response_t *resp);
 // Forecast — weathergov_forecast.c
 // ----------------------------------------------------------------------
 
+// The period parse, shared with the current-conditions chain, which ends
+// on the same endpoint and must not grow a second reader of it. Returns
+// FAIL when the body is unreadable or names no periods; `out` is zeroed
+// either way.
+bool wxg_forecast_parse(const char *body, size_t len,
+         weathergov_forecast_t *out);
+
+// The whole condition vocabulary: an NWS icon URL to an OpenWeather
+// condition code. An observation names its sky the same way a period
+// does, so there is one table and one reader of it.
+int32_t wxg_icon_condition_id(const char *icon_url);
+
 #ifdef WXG_FORECAST_TU
 
 // One NWS icon token and the OpenWeather condition code it means. The
@@ -248,7 +274,6 @@ typedef struct
   int32_t     condition_id;
 } wxg_icon_map_t;
 
-static int32_t wxg_icon_condition_id(const char *icon_url);
 static void    wxg_wind_tidy(const char *raw, char *out, size_t sz);
 static void    wxg_period_parse_one(struct json_object *p,
                    weathergov_period_t *out);
@@ -257,6 +282,49 @@ static void    wxg_forecast_deliver(wxg_request_t *r);
 static void    wxg_forecast_done(const curl_response_t *resp);
 
 #endif // WXG_FORECAST_TU
+
+// ----------------------------------------------------------------------
+// Current conditions — weathergov_obs.c
+// ----------------------------------------------------------------------
+
+// The station cache is private to the observation chain but its memory
+// is not: the plugin frees everything it owns in one place.
+void wxg_station_cache_clear(void);
+
+#ifdef WXG_OBS_TU
+
+// One grid and the reporting station nearest it. Kept for as long as the
+// grid is — a station list changes about as often as a grid does, which
+// is to say never within a cache lifetime.
+typedef struct wxg_stationcache
+{
+  char                     grid   [WXG_GRID_LABEL_SZ];
+  char                     station[WEATHERGOV_STATION_SZ];
+  time_t                   cached_at;
+  struct wxg_stationcache *next;
+} wxg_stationcache_t;
+
+static bool wxg_station_lookup(const char *grid, char *out, size_t sz);
+static void wxg_station_insert(const char *grid, const char *station);
+
+// A measured quantity: `properties.<key>.value`, plus the WMO unit code
+// it arrived in. Returns false for an absent key OR a null value — the
+// two are the same thing to a renderer and neither may read as 0.
+static bool wxg_obs_value(struct json_object *props, const char *key,
+                double *out, char *unit, size_t unit_sz);
+static double wxg_to_fahrenheit(double c);
+static double wxg_speed_convert(double kmh, bool imperial);
+static double wxg_temp_value(double v, const char *unit, bool imperial);
+static void   wxg_obs_parse(struct json_object *props, bool imperial,
+                  weathergov_obs_t *out);
+
+static void wxg_current_deliver(wxg_request_t *r);
+static bool wxg_obs_submit(wxg_request_t *r);
+static void wxg_stations_done(const curl_response_t *resp);
+static void wxg_obs_done(const curl_response_t *resp);
+static void wxg_obs_forecast_done(const curl_response_t *resp);
+
+#endif // WXG_OBS_TU
 
 // ----------------------------------------------------------------------
 // Core translation unit — weathergov.c. Lifecycle, module state, the

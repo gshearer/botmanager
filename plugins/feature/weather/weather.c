@@ -56,8 +56,11 @@ weather_done_current(const openweather_current_result_t *res, void *user)
 
   else
   {
+    weather_view_current_t view;
+
     weather_alerts_adopt(r, &res->alerts);
-    weather_reply_current(&ctx, &res->current, &r->alerts);
+    weather_view_from_ow_current(&res->current, &view);
+    weather_reply_current(&ctx, &view, &r->alerts);
   }
 
   mem_free(r);
@@ -238,34 +241,80 @@ weather_forecast_done(const weathergov_forecast_result_t *res, void *user)
   mem_free(r);
 }
 
-// Leg B, daily view only: the forecast grid this coordinate sits in.
-// Alerts took raw coordinates, but every gridpoint URL is built from the
-// office/x/y triple, so the forecast needs this one lookup first — from
-// the point cache in every case but the first (7 days, and a grid does
-// not move).
+// Leg C for the current view: what the nearest station measured, plus the
+// two periods that state today's extremes and the office's prose. The
+// observation is the point of it — without one there is no line to
+// print that openweather does not print better, so anything short of it
+// falls back whole.
+static void
+weather_current_done(const weathergov_current_result_t *res, void *user)
+{
+  weather_req_t *r = (weather_req_t *)user;
+  weather_view_current_t view;
+  cmd_ctx_t ctx = r->ctx;
+
+  if(res->err[0] != '\0' || !res->covered || !res->obs.have_temp)
+  {
+    clam(CLAM_DEBUG, WEATHER_CTX, "current %s: weathergov gave nothing (%s)",
+        r->loc.zip, res->err[0] != '\0' ? res->err : "no observation");
+
+    weather_dispatch_openweather(r);
+    return;
+  }
+
+  ctx.msg = &r->msg;
+
+  weather_view_from_wxg_current(&res->obs, &res->forecast, &r->point,
+      r->loc.place, r->loc.zip, openweather_units_kv_value(), &view);
+
+  clam(CLAM_DEBUG, WEATHER_CTX, "current %s: station %s, %u period(s)",
+      r->loc.zip, res->obs.station, res->forecast.count);
+
+  weather_reply_current(&ctx, &view, &r->alerts);
+
+  mem_free(r);
+}
+
+// Leg B, and the fork: the forecast grid this coordinate sits in. Alerts
+// took raw coordinates, but every gridpoint URL is built from the
+// office/x/y triple, so both views need this one lookup first — from the
+// point cache in every case but the first (7 days, and a grid does not
+// move).
+//
+// The point is kept rather than consumed: it carries the sunrise and
+// sunset the current view prints, at no further cost.
 static void
 weather_point_done(const weathergov_point_result_t *res, void *user)
 {
   weather_req_t *r = (weather_req_t *)user;
+  const char *units = weather_units_wxg(openweather_units_kv_value());
+  bool submitted;
 
   if(res->err[0] != '\0' || !res->covered)
   {
-    clam(CLAM_DEBUG, WEATHER_CTX, "forecast %s: no grid (%s)", r->loc.zip,
+    clam(CLAM_DEBUG, WEATHER_CTX, "route %s: no grid (%s)", r->loc.zip,
         res->err[0] != '\0' ? res->err : "uncovered");
 
     weather_dispatch_openweather(r);
     return;
   }
 
+  r->point = res->point;
+
   // A FAIL means the callback did NOT fire, so the request is still ours
   // to hand on to openweather — never a reply and never a free.
-  if(weathergov_forecast_async(&res->point,
-      weather_units_wxg(openweather_units_kv_value()),
-      weather_forecast_done, r) == SUCCESS)
+  if(r->kind == WEATHER_REQ_CURRENT)
+    submitted = (weathergov_current_async(&res->point, units,
+        weather_current_done, r) == SUCCESS);
+  else
+    submitted = (weathergov_forecast_async(&res->point, units,
+        weather_forecast_done, r) == SUCCESS);
+
+  if(submitted)
     return;
 
-  clam(CLAM_DEBUG, WEATHER_CTX, "forecast %s: weathergov refused the "
-      "forecast leg", r->loc.zip);
+  clam(CLAM_DEBUG, WEATHER_CTX, "route %s: weathergov refused the "
+      "conditions leg", r->loc.zip);
 
   weather_dispatch_openweather(r);
 }
@@ -303,18 +352,20 @@ weather_alerts_done(const weathergov_alert_result_t *res, void *user)
         r->loc.zip, res->alerts.total, res->alerts.count);
   }
 
-  // A covered coordinate is the only thing that earns the forecast legs:
-  // the daily view is the one weather.gov answers better than OpenWeather
-  // in every column that matters, and `have_alerts` is already the
-  // coverage verdict. Everything else — and every failure downstream of
+  // A covered coordinate is the only thing that earns the legs below:
+  // the current and daily views are the two weather.gov answers better
+  // than OpenWeather in every column that matters, and `have_alerts` is
+  // already the coverage verdict — there is no second coverage test.
+  // Everything else — the hourly view, and every failure downstream of
   // here — goes to openweather.
-  if(r->kind == WEATHER_REQ_FORECAST_DAILY && r->have_alerts)
+  if(r->have_alerts && (r->kind == WEATHER_REQ_FORECAST_DAILY
+      || r->kind == WEATHER_REQ_CURRENT))
   {
     if(weathergov_point_async(r->loc.lat, r->loc.lon,
         weather_point_done, r) == SUCCESS)
       return;
 
-    clam(CLAM_DEBUG, WEATHER_CTX, "forecast %s: weathergov refused the point "
+    clam(CLAM_DEBUG, WEATHER_CTX, "route %s: weathergov refused the point "
         "leg", r->loc.zip);
   }
 
