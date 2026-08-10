@@ -26,10 +26,11 @@
 // detail from the right until it fits.
 #define WEATHER_LINE_COLS   100
 
-// At most three alerts are printed however many are active — the rest
-// become one overflow line. A channel that gets eleven lines of storm
-// products stops reading at two.
-#define WEATHER_ALERT_LINES 3
+// At most this many alerts are printed however many are active — the
+// rest become one overflow line. Matched to the providers' own set
+// size, so everything a fetch carried gets a line and the overflow
+// counts only what the provider dropped.
+#define WEATHER_ALERT_LINES 8
 
 // One active alert, already reduced to what a line needs.
 //
