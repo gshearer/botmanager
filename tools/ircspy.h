@@ -58,6 +58,16 @@ static SSL      *g_ssl = NULL;
 static char g_linebuf[BUF_SZ];
 static int  g_lineoff = 0;
 
+// Line buffer for partial stdin reads. stdin is drained with read(2) rather
+// than stdio: poll(2) reports readiness on the *descriptor*, so a buffered
+// fgets() strands every line but the first of a multi-line write inside
+// FILE *stdin, where poll can never see it again.
+static char g_stdinbuf[CMD_SZ];
+static int  g_stdinoff = 0;
+
+// True while the tail of an over-length stdin line is being swallowed.
+static bool g_stdin_overlong = false;
+
 // Current channel (for bare-text sends).
 static char g_channel[CMD_SZ];
 

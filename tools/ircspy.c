@@ -848,31 +848,101 @@ stdin_eof(void)
     g_stdin_open = false;
 }
 
+// Dispatch every complete line sitting in the stdin buffer. Guarantees on
+// return that the buffer has room for at least one more byte, so the reader
+// never has to test for a full buffer.
+static void
+stdin_drain_lines(void)
+{
+  for(;;)
+  {
+    const char *nl = memchr(g_stdinbuf, '\n', (size_t)g_stdinoff);
+    size_t consumed;
+    size_t len;
+
+    if(nl == NULL)
+      break;
+
+    consumed = (size_t)(nl - g_stdinbuf) + 1;
+    len      = consumed - 1;
+
+    // Tolerate a CRLF writer.
+    while(len > 0 && g_stdinbuf[len - 1] == '\r')
+      len--;
+
+    g_stdinbuf[len] = '\0';
+
+    // The tail of a discarded over-length line is debris, not a command.
+    if(g_stdin_overlong)
+      g_stdin_overlong = false;
+    else
+      handle_user_input(g_stdinbuf);
+
+    g_stdinoff -= (int)consumed;
+
+    if(g_stdinoff > 0)
+      memmove(g_stdinbuf, g_stdinbuf + consumed, (size_t)g_stdinoff);
+  }
+
+  // A full buffer holding no newline can never complete: drop it, and
+  // swallow the remainder of that line as it arrives.
+  if(g_stdinoff == (int)sizeof(g_stdinbuf))
+  {
+    fprintf(stderr, "ircspy: stdin line exceeds %d bytes, discarded\n",
+            (int)sizeof(g_stdinbuf) - 1);
+
+    g_stdinoff       = 0;
+    g_stdin_overlong = true;
+  }
+}
+
+// One read(2) into the stdin buffer, followed by a drain of whatever it
+// completed. Returns the byte count, 0 at end of input, and -1 when the read
+// was merely interrupted and nothing was consumed.
+static ssize_t
+stdin_read_once(void)
+{
+  ssize_t n = read(STDIN_FILENO, g_stdinbuf + g_stdinoff,
+                   sizeof(g_stdinbuf) - (size_t)g_stdinoff);
+
+  if(n < 0)
+    return((errno == EINTR || errno == EAGAIN) ? -1 : 0);
+
+  if(n == 0)
+    return(0);
+
+  g_stdinoff += (int)n;
+  stdin_drain_lines();
+
+  return(n);
+}
+
 // Read and process data from stdin.
 static void
 handle_stdin_data(struct pollfd *fds, const struct poll_idx *idx)
 {
-  if(idx->stdin_fd >= 0 && (fds[idx->stdin_fd].revents & POLLIN))
+  short revents;
+
+  if(idx->stdin_fd < 0)
+    return;
+
+  revents = fds[idx->stdin_fd].revents;
+
+  if((revents & POLLIN) && stdin_read_once() == 0)
   {
-    char input[CMD_SZ];
-
-    if(fgets(input, (int)sizeof(input), stdin) != NULL)
-    {
-      size_t len = strlen(input);
-
-      while(len > 0 && (input[len - 1] == '\n' || input[len - 1] == '\r'))
-        input[--len] = '\0';
-
-      handle_user_input(input);
-    }
-
-    else
-      stdin_eof();
+    stdin_eof();
+    return;
   }
 
-  if(idx->stdin_fd >= 0
-      && (fds[idx->stdin_fd].revents & (POLLERR | POLLHUP)))
+  // A hangup can arrive with bytes still queued. The writer is gone, so no
+  // further read can block — take the pipe down to the end before closing.
+  if(revents & (POLLERR | POLLHUP))
+  {
+    while(stdin_read_once() > 0)
+      ;
+
     stdin_eof();
+  }
 }
 
 // Accept a new control client and read commands from an existing one.
