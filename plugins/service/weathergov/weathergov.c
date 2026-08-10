@@ -1,6 +1,7 @@
 // botmanager — MIT
 // National Weather Service (weather.gov) client: point → forecast grid.
 #define WEATHERGOV_INTERNAL
+#define WXG_CORE_TU
 #include "weathergov.h"
 #include "util.h"
 
@@ -11,7 +12,7 @@
 // Request freelist
 // ----------------------------------------------------------------------
 
-static wxg_request_t *
+wxg_request_t *
 wxg_req_alloc(void)
 {
   wxg_request_t *r = NULL;
@@ -34,7 +35,7 @@ wxg_req_alloc(void)
   return(r);
 }
 
-static void
+void
 wxg_req_release(wxg_request_t *r)
 {
   pthread_mutex_lock(&wxg_active_mutex);
@@ -73,7 +74,7 @@ wxg_req_release(wxg_request_t *r)
 // what is no longer there. A bounded leak on an operator action beats a
 // SIGSEGV. See PLUGIN.md §Lifecycle Contract.
 
-static void
+void
 wxg_req_track(wxg_request_t *r)
 {
   pthread_mutex_lock(&wxg_active_mutex);
@@ -109,7 +110,7 @@ wxg_req_untrack_locked(wxg_request_t *r)
 // would null it in — read it afterwards and the two interleave, which is
 // the whole bug. Clearing the arms as we go also makes a second delivery
 // on the same request structurally impossible.
-static void
+void
 wxg_req_take_caller(wxg_request_t *r, wxg_caller_t *out)
 {
   pthread_mutex_lock(&wxg_active_mutex);
@@ -172,7 +173,7 @@ wxg_unmap_cb(uintptr_t lo, uintptr_t hi, void *data)
 // weather.gov authenticates on the User-Agent alone: an empty one is
 // answered 403. There is no key and no credential tier, which is why
 // this is a plain kv_get_str.
-static void
+void
 wxg_ua(char *out, size_t sz)
 {
   const char *ua = kv_get_str("plugin.weathergov.user_agent");
@@ -185,7 +186,7 @@ wxg_ua(char *out, size_t sz)
 
 // The one place a weather.gov transfer is built. curl_get() cannot set a
 // User-Agent, so it can never be used against this API.
-static bool
+bool
 wxg_http_get(const char *url, const char *ua, curl_done_cb_t cb, void *user)
 {
   curl_request_t *req = curl_request_create(CURL_METHOD_GET, url, cb, user);
@@ -212,7 +213,7 @@ wxg_http_get(const char *url, const char *ua, curl_done_cb_t cb, void *user)
 // is reported as 404 by /points and 400 by /alerts — two codes for one
 // condition — so coverage is decided by "not 2xx", never by switching on
 // a specific status.
-static bool
+bool
 wxg_http_status_ok(const curl_response_t *resp, char *err, size_t err_sz,
     bool *covered)
 {
@@ -240,7 +241,7 @@ wxg_http_status_ok(const curl_response_t *resp, char *err, size_t err_sz,
 //
 // Returns 0 on any malformed input — callers must treat 0 as "absent",
 // never as the epoch.
-static time_t
+time_t
 wxg_parse_iso8601(const char *s, int32_t *tz_off_out)
 {
   struct tm    tm = {0};

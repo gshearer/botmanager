@@ -118,7 +118,10 @@ typedef struct ow_request
   }                   acc;
 
   // Alert-enrichment worklist: URN ids lifted from the primary response,
-  // resolved to human labels one GET at a time.
+  // resolved to human labels one GET at a time. A caller that already
+  // holds a better alert set asks for OPENWEATHER_ALERTS_SKIP and the
+  // worklist is never collected, so the chain ends at the datatype leg.
+  openweather_alerts_t alerts_mode;
   char                alert_ids[OPENWEATHER_ALERT_MAX][OW_ALERT_ID_SZ];
   uint8_t             alert_id_count;
   uint8_t             alert_idx;

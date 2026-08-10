@@ -36,6 +36,18 @@
 #define WEATHERGOV_PLACE_SZ     64   // "Olde West Chester, OH"
 #define WEATHERGOV_TZ_SZ        48   // "America/New_York"
 
+#define WEATHERGOV_ID_SZ        200  // urn:oid:… measured 96
+#define WEATHERGOV_EVENT_SZ     64   // "Severe Thunderstorm Warning" = 27
+#define WEATHERGOV_AREA_SZ      256
+#define WEATHERGOV_HEADLINE_SZ  256
+#define WEATHERGOV_DESC_SZ      512  // excerpt; full bodies run ~900 B
+#define WEATHERGOV_INSTR_SZ     256
+#define WEATHERGOV_IMPACT_SZ    128
+#define WEATHERGOV_SENDER_SZ    64   // "NWS Wilmington OH"
+#define WEATHERGOV_RESPONSE_SZ  16   // "Shelter"
+#define WEATHERGOV_STATE_SZ     4
+#define WEATHERGOV_ALERT_MAX    8    // matches OPENWEATHER_ALERT_MAX
+
 // A point resolved to its NWS forecast grid. The grid triple is what
 // every forecast and gridpoint URL is built from; the rest is what the
 // same response hands over for free.
@@ -80,6 +92,97 @@ typedef struct
 typedef void (*weathergov_point_cb_t)(
     const weathergov_point_result_t *res, void *user);
 
+// ----------------------------------------------------------------------
+// Active alerts (Common Alerting Protocol)
+// ----------------------------------------------------------------------
+//
+// One GET answers every active alert for a coordinate, and every CAP
+// field a human cares about arrives with it — the product name is
+// stated rather than mined out of prose, and an update names the
+// bulletin it supersedes.
+//
+// The three graded enums are ordered ASCENDING so a comparison means
+// what it reads as: WEATHERGOV_SEV_SEVERE > WEATHERGOV_SEV_MINOR.
+
+typedef enum
+{
+  WEATHERGOV_SEV_UNKNOWN = 0, WEATHERGOV_SEV_MINOR,
+  WEATHERGOV_SEV_MODERATE, WEATHERGOV_SEV_SEVERE, WEATHERGOV_SEV_EXTREME
+} weathergov_severity_t;
+
+typedef enum
+{
+  WEATHERGOV_URG_UNKNOWN = 0, WEATHERGOV_URG_PAST,
+  WEATHERGOV_URG_FUTURE, WEATHERGOV_URG_EXPECTED, WEATHERGOV_URG_IMMEDIATE
+} weathergov_urgency_t;
+
+typedef enum
+{
+  WEATHERGOV_CRT_UNKNOWN = 0, WEATHERGOV_CRT_UNLIKELY,
+  WEATHERGOV_CRT_POSSIBLE, WEATHERGOV_CRT_LIKELY, WEATHERGOV_CRT_OBSERVED
+} weathergov_certainty_t;
+
+// One active alert.
+//
+// `impact` is assembled here rather than by the caller because it is a
+// distillation of the CAP `parameters` map — wind gust, hail size,
+// damage threat, else the protective-action phrase — and no renderer
+// should have to know that map exists.
+//
+// ⚠ `desc` and `instruction` are parsed and carried but rendered
+// NOWHERE. They run 250–900 bytes of prose and would flood a channel.
+// They exist for the proactive alerter (root TODO.md §WX-FORWARD); do
+// not delete them as dead weight.
+typedef struct
+{
+  char                    id      [WEATHERGOV_ID_SZ];
+  char                    event   [WEATHERGOV_EVENT_SZ];
+  char                    area    [WEATHERGOV_AREA_SZ];      // areaDesc verbatim
+  char                    state   [WEATHERGOV_STATE_SZ];     // "" unless all areas agree
+  char                    headline[WEATHERGOV_HEADLINE_SZ];
+  char                    desc    [WEATHERGOV_DESC_SZ];      // NOT rendered
+  char                    instruction[WEATHERGOV_INSTR_SZ];  // NOT rendered
+  char                    impact  [WEATHERGOV_IMPACT_SZ];    // pre-assembled
+  char                    sender  [WEATHERGOV_SENDER_SZ];
+  char                    response[WEATHERGOV_RESPONSE_SZ];
+  weathergov_severity_t   severity;
+  weathergov_urgency_t    urgency;
+  weathergov_certainty_t  certainty;
+  time_t                  onset;
+  time_t                  ends;      // 0 when null upstream — fall back to expires
+  time_t                  expires;
+  time_t                  sent;
+  int32_t                 tz_offset; // seconds east of UTC, off the ISO strings
+  uint8_t                 area_count;
+} weathergov_alert_t;
+
+// Sorted severity-descending, then soonest-expiring first, so the ones
+// that fit a reply are the ones that matter.
+//
+// `total` counts every distinct active alert after supersession and
+// label dedup; `count` is how many of them fit below. total - count is
+// exactly what an "…and N more" line reports.
+typedef struct
+{
+  uint8_t             count;
+  uint8_t             total;
+  weathergov_alert_t  alerts[WEATHERGOV_ALERT_MAX];
+} weathergov_alert_set_t;
+
+// `covered == false` with an empty `err` carries the same meaning as it
+// does for a point lookup: the coordinate is outside NWS coverage. The
+// alerts endpoint reports that as HTTP 400 where /points reports 404,
+// which is why neither is switched on.
+typedef struct
+{
+  char                    err[128];
+  bool                    covered;
+  weathergov_alert_set_t  alerts;
+} weathergov_alert_result_t;
+
+typedef void (*weathergov_alerts_cb_t)(
+    const weathergov_alert_result_t *res, void *user);
+
 // Real function declarations — visible only inside the weathergov
 // plugin (where WEATHERGOV_INTERNAL is defined). External consumers go
 // through the static-inline dlsym shims defined further down.
@@ -95,6 +198,18 @@ typedef void (*weathergov_point_cb_t)(
 // entirely the caller's to reply on and free.
 bool weathergov_point_async(double lat, double lon,
     weathergov_point_cb_t cb, void *user);
+
+// Every active alert for a coordinate, in one round trip. Needs no
+// point lookup, no grid and no prior call — the endpoint takes raw
+// coordinates and its own non-2xx is the coverage answer.
+//
+// Returns SUCCESS if the callback will fire. Returns FAIL when the
+// request could not be queued at all (callback NULL, the service
+// switched off via plugin.weathergov.enabled, or curl refusing the
+// submit); on FAIL the callback does NOT fire and `user` is still
+// entirely the caller's to reply on and free.
+bool weathergov_alerts_async(double lat, double lon,
+    weathergov_alerts_cb_t cb, void *user);
 
 // The plugin.weathergov.enabled master switch. A caller checks this to
 // skip the weather.gov leg outright rather than paying for a refused
@@ -136,6 +251,31 @@ weathergov_point_async(double lat, double lon,
     {
       clam(CLAM_FATAL, "weathergov",
           "dlsym failed: weathergov_point_async");
+      abort();
+    }
+    fn = u.fn;
+    __atomic_store_n(&cached, fn, __ATOMIC_RELEASE);
+  }
+  return(fn(lat, lon, cb, user));
+}
+
+static inline bool
+weathergov_alerts_async(double lat, double lon,
+    weathergov_alerts_cb_t cb, void *user)
+{
+  typedef bool (*fn_t)(double, double, weathergov_alerts_cb_t, void *);
+  static fn_t cached = NULL;
+  fn_t        fn     = __atomic_load_n(&cached, __ATOMIC_ACQUIRE);
+
+  if(fn == NULL)
+  {
+    union { void *obj; fn_t fn; } u;
+
+    u.obj = plugin_dlsym_cached("weathergov", "weathergov_alerts_async", (void **)&cached);
+    if(u.obj == NULL)
+    {
+      clam(CLAM_FATAL, "weathergov",
+          "dlsym failed: weathergov_alerts_async");
       abort();
     }
     fn = u.fn;

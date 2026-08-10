@@ -418,6 +418,12 @@ ow_collect_alert_ids(struct json_object *jalerts, ow_request_t *r)
   r->alert_id_count = 0;
   r->alert_idx      = 0;
 
+  // The caller holds a better alert set than anything we could build
+  // out of these ids. With none collected, ow_start_alert_enrich falls
+  // straight through to delivery — no enrichment GETs at all.
+  if(r->alerts_mode == OPENWEATHER_ALERTS_SKIP)
+    return;
+
   if(jalerts == NULL || !json_object_is_type(jalerts, json_type_array))
     return;
 
@@ -1525,6 +1531,7 @@ ow_kick_off(ow_request_t *r)
 
 bool
 openweather_fetch_current(const char *zipcode,
+    openweather_alerts_t alerts,
     openweather_done_current_cb_t done_cb, void *user)
 {
   char errbuf[128];
@@ -1535,9 +1542,10 @@ openweather_fetch_current(const char *zipcode,
     return(FAIL);
 
   r = ow_req_alloc();
-  r->type       = OW_REQ_WEATHER;
-  r->cb.current = done_cb;
-  r->user       = user;
+  r->type        = OW_REQ_WEATHER;
+  r->alerts_mode = alerts;
+  r->cb.current  = done_cb;
+  r->user        = user;
 
   // File it before anything can be submitted, never after: a completion
   // can run on a curl worker before the submitting call has returned.
@@ -1570,6 +1578,7 @@ openweather_fetch_current(const char *zipcode,
 
 static bool
 ow_fetch_forecast_common(ow_req_type_t type, const char *zipcode,
+    openweather_alerts_t alerts,
     openweather_done_forecast_cb_t done_cb, void *user)
 {
   char errbuf[128];
@@ -1581,6 +1590,7 @@ ow_fetch_forecast_common(ow_req_type_t type, const char *zipcode,
 
   r = ow_req_alloc();
   r->type        = type;
+  r->alerts_mode = alerts;
   r->cb.forecast = done_cb;
   r->user        = user;
 
@@ -1613,18 +1623,20 @@ ow_fetch_forecast_common(ow_req_type_t type, const char *zipcode,
 
 bool
 openweather_fetch_forecast_daily(const char *zipcode,
+    openweather_alerts_t alerts,
     openweather_done_forecast_cb_t done_cb, void *user)
 {
   return(ow_fetch_forecast_common(OW_REQ_FORECAST_DAILY,
-      zipcode, done_cb, user));
+      zipcode, alerts, done_cb, user));
 }
 
 bool
 openweather_fetch_forecast_hourly(const char *zipcode,
+    openweather_alerts_t alerts,
     openweather_done_forecast_cb_t done_cb, void *user)
 {
   return(ow_fetch_forecast_common(OW_REQ_FORECAST_HOURLY,
-      zipcode, done_cb, user));
+      zipcode, alerts, done_cb, user));
 }
 
 const char *

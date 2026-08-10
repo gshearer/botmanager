@@ -31,6 +31,18 @@ weather_valid_location(const char *s)
 // Async completion callbacks. Fire on the openweather curl-multi worker
 // thread; cmd_reply is thread-safe. Each frees the per-request closure.
 
+// The alert set to render. weather.gov's answer wins outright when we
+// have one — openweather was asked to skip enrichment in that case and
+// its own set is empty by construction.
+static void
+weather_alerts_adopt(weather_req_t *r, const openweather_alert_set_t *ow)
+{
+  if(r->have_alerts)
+    return;
+
+  weather_view_from_ow_alerts(ow, &r->alerts);
+}
+
 static void
 weather_done_current(const openweather_current_result_t *res, void *user)
 {
@@ -41,8 +53,12 @@ weather_done_current(const openweather_current_result_t *res, void *user)
 
   if(res->err[0] != '\0')
     cmd_reply(&ctx, res->err);
+
   else
-    weather_reply_current(&ctx, &res->current, &res->alerts);
+  {
+    weather_alerts_adopt(r, &res->alerts);
+    weather_reply_current(&ctx, &res->current, &r->alerts);
+  }
 
   mem_free(r);
 }
@@ -62,10 +78,12 @@ weather_done_forecast(const openweather_forecast_result_t *res, void *user)
     return;
   }
 
+  weather_alerts_adopt(r, &res->alerts);
+
   if(r->kind == WEATHER_REQ_FORECAST_HOURLY)
-    weather_reply_forecast_hourly(&ctx, &res->forecast, &res->alerts);
+    weather_reply_forecast_hourly(&ctx, &res->forecast, &r->alerts);
   else
-    weather_reply_forecast_daily(&ctx, &res->forecast, &res->alerts);
+    weather_reply_forecast_daily(&ctx, &res->forecast, &r->alerts);
 
   mem_free(r);
 }
@@ -137,23 +155,27 @@ weather_resolve_location(const char *input, weather_loc_t *out)
 static void
 weather_dispatch_openweather(weather_req_t *r)
 {
+  // Holding weather.gov's CAP set, we spend nothing on One Call's
+  // alert ids — which cost one serial GET each, up to eight of them.
+  openweather_alerts_t alerts = r->have_alerts ? OPENWEATHER_ALERTS_SKIP
+                                               : OPENWEATHER_ALERTS_FETCH;
   bool submitted;
 
   switch(r->kind)
   {
     case WEATHER_REQ_FORECAST_HOURLY:
-      submitted = (openweather_fetch_forecast_hourly(r->loc.zip,
+      submitted = (openweather_fetch_forecast_hourly(r->loc.zip, alerts,
           weather_done_forecast, r) == SUCCESS);
       break;
 
     case WEATHER_REQ_FORECAST_DAILY:
-      submitted = (openweather_fetch_forecast_daily(r->loc.zip,
+      submitted = (openweather_fetch_forecast_daily(r->loc.zip, alerts,
           weather_done_forecast, r) == SUCCESS);
       break;
 
     case WEATHER_REQ_CURRENT:
     default:
-      submitted = (openweather_fetch_current(r->loc.zip,
+      submitted = (openweather_fetch_current(r->loc.zip, alerts,
           weather_done_current, r) == SUCCESS);
       break;
   }
@@ -167,27 +189,38 @@ weather_dispatch_openweather(weather_req_t *r)
   mem_free(r);
 }
 
-// weather.gov's verdict on the location. Runs on the curl multi worker.
+// Leg A of the chain: weather.gov's alerts, and with them its verdict
+// on whether this coordinate is American at all. Runs on the curl multi
+// worker, and hands straight on to leg B — openweather, for the
+// conditions — without a join, because both completions land on that
+// same single thread and a concurrent fetch would only be theatre.
 //
-// Nothing user-visible hangs off it yet — WX-1 lands the routing and
-// says so in the log, and the reply is still openweather's alone. What
-// the verdict costs is one cached round trip; what it buys is the branch
-// WX-2 onward hang the CAP alerts, the forecast and the observation off.
+// EVERY failure here is soft. Timeout, non-2xx, unparseable, uncovered:
+// all of them leave `have_alerts` false and openweather's own alert
+// path switched on, which is exactly the behaviour that shipped before
+// weather.gov existed. An outage must degrade !weather, never break it.
 static void
-weather_point_probe_done(const weathergov_point_result_t *res, void *user)
+weather_alerts_done(const weathergov_alert_result_t *res, void *user)
 {
   weather_req_t *r = (weather_req_t *)user;
 
   if(res->err[0] != '\0')
     clam(CLAM_DEBUG, WEATHER_CTX, "route %s: weathergov unavailable (%s)",
         r->loc.zip, res->err);
+
+  else if(!res->covered)
+    clam(CLAM_DEBUG, WEATHER_CTX, "route %s: us=no", r->loc.zip);
+
   else
-    clam(CLAM_DEBUG, WEATHER_CTX,
-        "route %s: us=%s grid=%s/%d,%d place=%s",
-        r->loc.zip, res->covered ? "yes" : "no",
-        res->covered ? res->point.grid_id : "-",
-        res->point.grid_x, res->point.grid_y,
-        res->covered ? res->point.place : "-");
+  {
+    // Covered and quiet is an answer too: it is what lets a US location
+    // with no active alert skip openweather's enrichment entirely.
+    weather_view_from_wxg_alerts(&res->alerts, &r->alerts);
+    r->have_alerts = true;
+
+    clam(CLAM_DEBUG, WEATHER_CTX, "route %s: us=yes alerts=%u (%u carried)",
+        r->loc.zip, res->alerts.total, res->alerts.count);
+  }
 
   weather_dispatch_openweather(r);
 }
@@ -258,12 +291,12 @@ weather_cmd_weather(const cmd_ctx_t *ctx)
 
     // A FAIL here means the callback did NOT fire, so the request is
     // still ours to hand on — never a reply and never a free.
-    if(weathergov_point_async(loc.lat, loc.lon,
-        weather_point_probe_done, r) == SUCCESS)
+    if(weathergov_alerts_async(loc.lat, loc.lon,
+        weather_alerts_done, r) == SUCCESS)
       return;
 
-    clam(CLAM_DEBUG, WEATHER_CTX, "route %s: weathergov refused the probe",
-        loc.zip);
+    clam(CLAM_DEBUG, WEATHER_CTX, "route %s: weathergov refused the alerts "
+        "leg", loc.zip);
   }
 
   weather_dispatch_openweather(r);

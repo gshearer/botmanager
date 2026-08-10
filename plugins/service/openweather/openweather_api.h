@@ -146,6 +146,20 @@ typedef void (*openweather_done_current_cb_t)(
 typedef void (*openweather_done_forecast_cb_t)(
     const openweather_forecast_result_t *res, void *user);
 
+// Whether a fetch should enrich the alert ids One Call returns into
+// human labels. Enrichment costs one serial GET per alert (up to
+// OPENWEATHER_ALERT_MAX of them), so a caller holding a better alert
+// set — weather.gov's CAP feed, which answers in one call and names
+// the product outright — asks for SKIP and leaves `alerts` empty.
+//
+// An enum rather than a bool: openweather_fetch_current(zip, false, …)
+// tells the reader nothing at the call site.
+typedef enum
+{
+  OPENWEATHER_ALERTS_FETCH = 0,   // enrich as usual
+  OPENWEATHER_ALERTS_SKIP         // caller has better alerts
+} openweather_alerts_t;
+
 // Real function declarations — visible only inside the openweather
 // plugin (where OW_INTERNAL is defined). External consumers go through
 // the static-inline dlsym shims defined further down.
@@ -169,12 +183,15 @@ bool openweather_geocode_city_sync(const char *city,
 // Returns SUCCESS if the request was queued; FAIL if it could not be
 // queued (e.g. API key unconfigured). On FAIL, done_cb is NOT invoked.
 bool openweather_fetch_current(const char *zipcode,
+    openweather_alerts_t alerts,
     openweather_done_current_cb_t done_cb, void *user);
 
 bool openweather_fetch_forecast_daily(const char *zipcode,
+    openweather_alerts_t alerts,
     openweather_done_forecast_cb_t done_cb, void *user);
 
 bool openweather_fetch_forecast_hourly(const char *zipcode,
+    openweather_alerts_t alerts,
     openweather_done_forecast_cb_t done_cb, void *user);
 
 // Returns the current value of plugin.openweather.units. Pointer is
@@ -257,9 +274,10 @@ openweather_geocode_city_sync(const char *city, char *zip_out, size_t zip_sz)
 
 static inline bool
 openweather_fetch_current(const char *zipcode,
+    openweather_alerts_t alerts,
     openweather_done_current_cb_t done_cb, void *user)
 {
-  typedef bool (*fn_t)(const char *,
+  typedef bool (*fn_t)(const char *, openweather_alerts_t,
       openweather_done_current_cb_t, void *);
   static fn_t cached = NULL;
   fn_t        fn     = __atomic_load_n(&cached, __ATOMIC_ACQUIRE);
@@ -278,14 +296,15 @@ openweather_fetch_current(const char *zipcode,
     fn = u.fn;
     __atomic_store_n(&cached, fn, __ATOMIC_RELEASE);
   }
-  return(fn(zipcode, done_cb, user));
+  return(fn(zipcode, alerts, done_cb, user));
 }
 
 static inline bool
 openweather_fetch_forecast_daily(const char *zipcode,
+    openweather_alerts_t alerts,
     openweather_done_forecast_cb_t done_cb, void *user)
 {
-  typedef bool (*fn_t)(const char *,
+  typedef bool (*fn_t)(const char *, openweather_alerts_t,
       openweather_done_forecast_cb_t, void *);
   static fn_t cached = NULL;
   fn_t        fn     = __atomic_load_n(&cached, __ATOMIC_ACQUIRE);
@@ -304,14 +323,15 @@ openweather_fetch_forecast_daily(const char *zipcode,
     fn = u.fn;
     __atomic_store_n(&cached, fn, __ATOMIC_RELEASE);
   }
-  return(fn(zipcode, done_cb, user));
+  return(fn(zipcode, alerts, done_cb, user));
 }
 
 static inline bool
 openweather_fetch_forecast_hourly(const char *zipcode,
+    openweather_alerts_t alerts,
     openweather_done_forecast_cb_t done_cb, void *user)
 {
-  typedef bool (*fn_t)(const char *,
+  typedef bool (*fn_t)(const char *, openweather_alerts_t,
       openweather_done_forecast_cb_t, void *);
   static fn_t cached = NULL;
   fn_t        fn     = __atomic_load_n(&cached, __ATOMIC_ACQUIRE);
@@ -331,7 +351,7 @@ openweather_fetch_forecast_hourly(const char *zipcode,
     fn = u.fn;
     __atomic_store_n(&cached, fn, __ATOMIC_RELEASE);
   }
-  return(fn(zipcode, done_cb, user));
+  return(fn(zipcode, alerts, done_cb, user));
 }
 
 static inline const char *

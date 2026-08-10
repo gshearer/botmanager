@@ -1,6 +1,7 @@
 weather_plugin = shared_library('weather',
   'weather.c',
   'weather_render.c',
+  'weather_adapt.c',
   include_directories : [
     inc_include,
     include_directories('.'),

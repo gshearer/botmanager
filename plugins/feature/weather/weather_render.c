@@ -1,6 +1,7 @@
 // botmanager — MIT
 // Weather presentation: colour, icon and column layout for every view.
 #define WEATHER_INTERNAL
+#define WEATHER_RENDER_TU
 #include "weather.h"
 
 #include <stdio.h>
@@ -238,24 +239,225 @@ weather_reply_header(const cmd_ctx_t *ctx, const char *place,
   cmd_reply(ctx, buf);
 }
 
-void
-weather_reply_alerts(const cmd_ctx_t *ctx, const openweather_alert_set_t *a)
+// ----------------------------------------------------------------------
+// Alerts
+// ----------------------------------------------------------------------
+
+// What a line costs on screen. Colour markup is a two-byte marker (see
+// colors.h) that core rewrites per method and occupies no column;
+// UTF-8 continuation bytes are part of a glyph already counted; and a
+// glyph followed by the variation selector U+FE0F is drawn
+// double-width, which is what makes the weather emoji two columns and
+// the bare ⚠ one.
+static int
+weather_visible_cols(const char *s)
 {
-  char buf[WEATHER_REPLY_SZ];
+  int    cols = 0;
+  size_t i;
+
+  for(i = 0; s[i] != '\0'; i++)
+  {
+    unsigned char c = (unsigned char)s[i];
+
+    if(c == 0x01)
+    {
+      if(s[i + 1] != '\0')
+        i++;
+
+      continue;
+    }
+
+    if(c == 0xef && (unsigned char)s[i + 1] == 0xb8
+        && (unsigned char)s[i + 2] == 0x8f)
+    {
+      cols++;
+      i += 2;
+      continue;
+    }
+
+    if(c < 0x80 || c >= 0xc0)
+      cols++;
+  }
+
+  return(cols);
+}
+
+static const char *
+weather_alert_color(uint8_t severity)
+{
+  switch(severity)
+  {
+    case 4:  return(CLR_BOLD CLR_RED);   // Extreme
+    case 3:  return(CLR_RED);            // Severe
+    case 2:  return(CLR_ORANGE);         // Moderate
+    case 1:  return(CLR_YELLOW);         // Minor
+    default: return(CLR_GRAY);           // Unknown
+  }
+}
+
+// "12:45pm" when the alert lifts today, "Wed 8:00am" when it does not —
+// both read in the alert's own timezone, never the daemon's.
+static void
+weather_alert_until_str(const weather_view_alert_t *a, char *buf, size_t sz)
+{
+  struct tm nowtm;
+  struct tm endtm;
+  time_t    now_local;
+  time_t    end_local;
+  char      clock[12];
+
+  buf[0] = '\0';
+
+  if(a->until == 0)
+    return;
+
+  weather_format_time_ampm(a->until, a->tz_offset, clock, sizeof(clock));
+
+  now_local = time(NULL) + a->tz_offset;
+  end_local = a->until   + a->tz_offset;
+
+  gmtime_r(&now_local, &nowtm);
+  gmtime_r(&end_local, &endtm);
+
+  if(nowtm.tm_year == endtm.tm_year && nowtm.tm_yday == endtm.tm_yday)
+    snprintf(buf, sz, "%s", clock);
+  else
+    snprintf(buf, sz, "%s %s", weather_day_names_abbr[endtm.tm_wday], clock);
+}
+
+// Drop the rightmost ", "-joined item. Returns false once there is
+// nothing left to drop, which is how the width loop knows to move on to
+// the next thing it is allowed to shed.
+static bool
+weather_drop_last_item(char *csv)
+{
+  char *last = NULL;
+  char *p;
+
+  if(csv[0] == '\0')
+    return(false);
+
+  for(p = csv; *p != '\0'; p++)
+  {
+    if(p[0] == ',' && p[1] == ' ')
+      last = p;
+  }
+
+  if(last != NULL)
+    *last = '\0';
+  else
+    csv[0] = '\0';
+
+  return(true);
+}
+
+// Every segment is omitted whole — separator included — when its source
+// is absent. There is no such thing as a dangling " — " on this line.
+static void
+weather_alert_compose(char *buf, size_t sz, const weather_view_alert_t *a,
+    const char *until, const char *impact, bool short_area)
+{
+  const char *clr   = weather_alert_color(a->severity);
+  const char *glyph = (a->severity >= 3) ? "\xe2\x9a\xa0"   // ⚠
+                                         : "\xe2\x9a\x91";  // ⚑
+  char   area[96];
+  size_t len;
+
+  if(short_area && a->area_count > 0)
+    snprintf(area, sizeof(area), "%u counties%s%s", (unsigned)a->area_count,
+        a->state[0] != '\0' ? " " : "", a->state);
+  else
+    snprintf(area, sizeof(area), "%s", a->area);
+
+  len = (size_t)snprintf(buf, sz, "  %s%s" CLR_RESET " %s%s" CLR_RESET,
+      clr, glyph, clr, a->event);
+
+  if(len >= sz)
+    return;
+
+  if(area[0] != '\0')
+  {
+    len += (size_t)snprintf(buf + len, sz - len, " \xe2\x80\x94 %s", area);
+
+    if(len >= sz)
+      return;
+  }
+
+  if(until[0] != '\0')
+  {
+    len += (size_t)snprintf(buf + len, sz - len,
+        " " CLR_GRAY "\xc2\xb7" CLR_RESET " til %s", until);
+
+    if(len >= sz)
+      return;
+  }
+
+  if(impact[0] != '\0')
+    snprintf(buf + len, sz - len,
+        " " CLR_GRAY "\xc2\xb7" CLR_RESET " %s", impact);
+}
+
+// The line, inside its width budget.
+//
+// Compose, measure, and shed from the right until it fits: trailing
+// impact items one at a time, then the area detail down to a count. The
+// event, the time and the glyph are never dropped — a truncated alert
+// must still say what it is and when it lifts.
+static void
+weather_alert_line(char *buf, size_t sz, const weather_view_alert_t *a)
+{
+  char until [24];
+  char impact[128];
+  bool short_area = false;
+
+  weather_alert_until_str(a, until, sizeof(until));
+  snprintf(impact, sizeof(impact), "%s", a->impact);
+
+  for(;;)
+  {
+    weather_alert_compose(buf, sz, a, until, impact, short_area);
+
+    if(weather_visible_cols(buf) <= WEATHER_LINE_COLS)
+      return;
+
+    if(weather_drop_last_item(impact))
+      continue;
+
+    if(!short_area && a->area_count > 0)
+    {
+      short_area = true;
+      continue;
+    }
+
+    return;
+  }
+}
+
+void
+weather_reply_alerts(const cmd_ctx_t *ctx, const weather_view_alert_set_t *a)
+{
+  char    buf[WEATHER_REPLY_SZ];
+  uint8_t shown = 0;
   uint8_t i;
 
-  for(i = 0; i < a->count && i < 3; i++)
+  for(i = 0; i < a->count && shown < WEATHER_ALERT_LINES; i++)
   {
     if(a->alerts[i].event[0] == '\0')
       continue;
 
-    snprintf(buf, sizeof(buf),
-        "  " CLR_BOLD CLR_RED "\xe2\x9a\xa0" CLR_RESET " "
-        CLR_BOLD CLR_YELLOW "ALERT:" CLR_RESET " %s",
-        a->alerts[i].event);
-
+    weather_alert_line(buf, sizeof(buf), &a->alerts[i]);
     cmd_reply(ctx, buf);
+    shown++;
   }
+
+  if(shown == 0 || a->total <= shown)
+    return;
+
+  snprintf(buf, sizeof(buf),
+      "  " CLR_GRAY "\xe2\x80\xa6" "and %u more active alert%s" CLR_RESET,
+      (unsigned)(a->total - shown), (a->total - shown) == 1 ? "" : "s");
+
+  cmd_reply(ctx, buf);
 }
 
 // Reply formatters (consume typed payloads)
@@ -263,7 +465,7 @@ weather_reply_alerts(const cmd_ctx_t *ctx, const openweather_alert_set_t *a)
 void
 weather_reply_current(const cmd_ctx_t *ctx,
     const openweather_current_t *cur,
-    const openweather_alert_set_t *alerts)
+    const weather_view_alert_set_t *alerts)
 {
   char ct[32], cf[32];
   char buf[WEATHER_REPLY_SZ];
@@ -353,7 +555,7 @@ weather_reply_current(const cmd_ctx_t *ctx,
 void
 weather_reply_forecast_daily(const cmd_ctx_t *ctx,
     const openweather_forecast_t *f,
-    const openweather_alert_set_t *alerts)
+    const weather_view_alert_set_t *alerts)
 {
   const char *tu = weather_temp_unit(f->units);
   const char *su = weather_speed_unit(f->units);
@@ -498,7 +700,7 @@ weather_hour_cell(char *buf, size_t sz, const openweather_forecast_hour_t *h,
 void
 weather_reply_forecast_hourly(const cmd_ctx_t *ctx,
     const openweather_forecast_t *f,
-    const openweather_alert_set_t *alerts)
+    const weather_view_alert_set_t *alerts)
 {
   const char *tu = weather_temp_unit(f->units);
   char cells[24][WEATHER_CELL_SZ];
