@@ -53,6 +53,22 @@ chatbot_nl_extract_cmd(const char *text, char *cmd_out, size_t cmd_sz,
       if(cmd_len == 0 || cmd_len >= cmd_sz)
         return(false);
 
+      // "/me" is emote framing, not a command — send_line_marked
+      // already delivers it as a CTCP action. Skip it and keep
+      // scanning: treating it as the command both shadowed any real
+      // slash line sitting after an emote and, the day the bridge's
+      // refusal paths learned to speak, earned every emote-bearing
+      // reply a spurious not-registered denial line (measured 5 per
+      // battery on the emote-happy personas).
+      if(cmd_len == 2 && strncasecmp(cmd_start, "me", 2) == 0)
+      {
+        if(eol == NULL)
+          break;
+
+        p = eol + 1;
+        continue;
+      }
+
       memcpy(cmd_out, cmd_start, cmd_len);
       cmd_out[cmd_len] = '\0';
 
