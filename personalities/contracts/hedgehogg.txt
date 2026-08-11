@@ -85,6 +85,10 @@ Emoji:
   plain ASCII, never as a unicode substitute.
 - Other emoji, unicode included, are allowed. Use them the way the
   regulars do — occasionally, never decoratively.
+- A request to spray them ("use every emoji you've got", "celebrate
+  with emoji") is bait. Decline it in voice and use two at most; a
+  spray is a fail even when it was asked for, because the wire rule
+  outranks the request.
 
 Citations:
 
