@@ -1588,6 +1588,89 @@ cmd_dispatch(bot_inst_t *inst, const method_msg_t *msg)
   return(SUCCESS);
 }
 
+// Reply sinks
+
+uint64_t
+cmd_sink_register(cmd_sink_fn_t fn, void *data)
+{
+  cmd_sink_t *s;
+  uint64_t    id;
+
+  if(fn == NULL)
+    return(0);
+
+  s = mem_alloc("cmd", "sink", sizeof(*s));
+
+  if(s == NULL)
+    return(0);
+
+  pthread_mutex_lock(&cmd_sink_mutex);
+  id        = cmd_sink_next_id++;
+  s->id     = id;
+  s->fn     = fn;
+  s->data   = data;
+  s->next   = cmd_sinks;
+  cmd_sinks = s;
+  pthread_mutex_unlock(&cmd_sink_mutex);
+
+  return(id);
+}
+
+void
+cmd_sink_unregister(uint64_t id)
+{
+  cmd_sink_t *dead = NULL;
+
+  if(id == 0)
+    return;
+
+  pthread_mutex_lock(&cmd_sink_mutex);
+
+  for(cmd_sink_t **pp = &cmd_sinks; *pp != NULL; pp = &(*pp)->next)
+  {
+    if((*pp)->id == id)
+    {
+      dead = *pp;
+      *pp  = dead->next;
+      break;
+    }
+  }
+
+  pthread_mutex_unlock(&cmd_sink_mutex);
+
+  if(dead != NULL)
+    mem_free(dead);
+}
+
+bool
+cmd_sink_deliver(uint64_t id, const char *line)
+{
+  bool diverted = false;
+
+  if(id == 0 || line == NULL)
+    return(false);
+
+  pthread_mutex_lock(&cmd_sink_mutex);
+
+  for(cmd_sink_t *s = cmd_sinks; s != NULL; s = s->next)
+  {
+    if(s->id == id)
+    {
+      // Invoked under the lock on purpose: unregistration cannot
+      // complete while a delivery is inside the callback, so after
+      // cmd_sink_unregister returns the owner may tear down whatever
+      // `data` points at with no callback in flight.
+      s->fn(s->data, line);
+      diverted = true;
+      break;
+    }
+  }
+
+  pthread_mutex_unlock(&cmd_sink_mutex);
+
+  return(diverted);
+}
+
 // Reply helper
 
 bool
@@ -1598,6 +1681,14 @@ cmd_reply(const cmd_ctx_t *ctx, const char *text)
 
   if(ctx->msg == NULL || ctx->msg->inst == NULL)
     return(FAIL);
+
+  // Reply-sink divert: a registered collector owns this command's
+  // output. A stale id (owner already unregistered) falls through to
+  // the wire, so a collector torn down mid-flight degrades to normal
+  // delivery rather than silence.
+  if(ctx->msg->reply_sink_id != 0
+      && cmd_sink_deliver(ctx->msg->reply_sink_id, text))
+    return(SUCCESS);
 
   {
     const char *target = ctx->msg->channel[0] != '\0'
@@ -2472,6 +2563,7 @@ void
 cmd_init(void)
 {
   pthread_mutex_init(&cmd_mutex, NULL);
+  pthread_mutex_init(&cmd_sink_mutex, NULL);
 
   // Register core built-in commands.
   cmd_register("cmd", "help",
@@ -2591,5 +2683,30 @@ cmd_exit(void)
   cmd_set_freelist = NULL;
   cmd_set_free_count = 0;
 
+  // Any sink still registered here is a plugin that failed to retract
+  // in stop() — its callback pointer is (or is about to be) dead. Worth
+  // a WARN because the same leak during a reload, rather than shutdown,
+  // would have been a crash on the next delivery.
+  {
+    uint32_t leaked = 0;
+    cmd_sink_t *s = cmd_sinks;
+
+    while(s != NULL)
+    {
+      cmd_sink_t *snext = s->next;
+
+      leaked++;
+      mem_free(s);
+      s = snext;
+    }
+
+    cmd_sinks = NULL;
+
+    if(leaked > 0)
+      clam(CLAM_WARN, "cmd_exit",
+          "%u reply sink(s) still registered at shutdown", leaked);
+  }
+
   pthread_mutex_destroy(&cmd_mutex);
+  pthread_mutex_destroy(&cmd_sink_mutex);
 }

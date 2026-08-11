@@ -46,6 +46,7 @@ typedef uint32_t method_cap_t;
 
 #define METHOD_CAP_EMOTE   ((method_cap_t)1U << 0)  // third-person action (IRC CTCP ACTION, Discord italics, etc.)
 #define METHOD_CAP_EJECT   ((method_cap_t)1U << 1)  // can remove a participant from a room
+#define METHOD_CAP_SPOKEN  ((method_cap_t)1U << 2)  // replies are read aloud (TTS); fixed-width or columnar output is unusable, so data-bearing command output must be rephrased as prose
 
 // Discriminator for the kind of event a method_msg_t carries. The
 // default (zero) is a normal chat/DM line. Other kinds describe
@@ -98,6 +99,15 @@ typedef struct
   method_addressing_t addressing;
 
   method_msg_kind_t kind;                     // default METHOD_MSG_MESSAGE
+
+  // Reply-sink divert (see cmd.h §Reply sinks). Non-zero routes every
+  // cmd_reply() of a command dispatched from this message to the
+  // registered collector instead of the wire. Consumed by cmd_reply()
+  // only — method drivers neither read nor set it. An id rather than a
+  // pointer: async commands deep-copy the whole message by value, so
+  // the id survives every hop for free, and a stale id after the owner
+  // unregistered falls through to normal delivery.
+  uint64_t reply_sink_id;
 
   // Generic method-level identity for the sender. The method plugin
   // populates whatever it has; consumers (chat, audit, etc.) treat the

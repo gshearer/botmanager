@@ -310,8 +310,40 @@ bool cmd_dispatch_resolved(bot_inst_t *inst, const method_msg_t *msg,
 
 // Send a reply to the originator of a command. If the message came from
 // a channel, replies to the channel. If it was a DM (empty channel),
-// replies to the sender directly.
+// replies to the sender directly. A message carrying a live
+// reply_sink_id is diverted to that sink instead — see §Reply sinks.
 bool cmd_reply(const cmd_ctx_t *ctx, const char *text);
+
+// §Reply sinks — divert a dispatched command's cmd_reply() output to a
+// collector instead of the wire.
+//
+// A collector registers a callback and threads the returned id through
+// method_msg_t.reply_sink_id on the message it dispatches. Every
+// cmd_reply() whose ctx->msg carries that id delivers the line to the
+// callback instead of method_send. The id — never a pointer — is what
+// rides the message: async commands deep-copy the whole method_msg_t,
+// so the id survives every async hop for free, and once the owner
+// unregisters, a stale id falls through to normal wire delivery
+// instead of dangling into a dead mapping.
+//
+// `fn` runs on whatever thread called cmd_reply (task workers, curl
+// completions) and is invoked UNDER the registry lock: it must be
+// fast, must not block, and must not re-enter cmd_sink_*. After
+// cmd_sink_unregister() returns, fn is not running and will never run
+// again for that id — that guarantee is what lets a plugin retract its
+// sinks in stop() before its mapping goes away.
+typedef void (*cmd_sink_fn_t)(void *data, const char *line);
+
+// Returns the new sink id (non-zero), or 0 on NULL fn / alloc failure.
+uint64_t cmd_sink_register(cmd_sink_fn_t fn, void *data);
+
+// Unknown / already-removed ids are a no-op.
+void cmd_sink_unregister(uint64_t id);
+
+// Deliver one line to sink `id`. Returns false when the id is stale —
+// the caller falls through to normal delivery. cmd_reply is the
+// intended caller; collectors never call this themselves.
+bool cmd_sink_deliver(uint64_t id, const char *line);
 
 // Command definition accessors (cmd_def_t is opaque outside cmd.c).
 
@@ -457,11 +489,30 @@ typedef struct
   char           arg_bufs[CMD_MAX_ARGS][CMD_ARG_SZ]; // token storage
 } cmd_task_data_t;
 
+// Reply-sink registry node. Singly linked; the list stays short (one
+// live sink per in-flight captured command) so linear lookup is fine.
+typedef struct cmd_sink
+{
+  uint64_t         id;
+  cmd_sink_fn_t    fn;
+  void            *data;
+  struct cmd_sink *next;
+} cmd_sink_t;
+
 static cmd_def_t       *cmd_list         = NULL;
 static uint32_t         cmd_def_count    = 0;
 static cmd_set_t       *cmd_sets         = NULL;
 static pthread_mutex_t  cmd_mutex;
 static bool             cmd_ready        = false;
+
+// Sinks get their own mutex: delivery happens per output line on hot
+// reply paths and must not contend with registration traffic under
+// cmd_mutex. Guards the list and the id counter; sink callbacks are
+// invoked under it (see cmd_sink_register's contract in the public
+// section above).
+static cmd_sink_t      *cmd_sinks        = NULL;
+static uint64_t         cmd_sink_next_id = 1;
+static pthread_mutex_t  cmd_sink_mutex;
 
 static cmd_set_t       *cmd_set_freelist     = NULL;
 static uint32_t         cmd_set_free_count   = 0;

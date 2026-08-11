@@ -1905,10 +1905,14 @@ reachy_list_joined_channels(void *handle, method_joined_channel_cb_t cb,
 // Emote, member listing and ejection have no meaning in a room the
 // robot perceives as one microphone: all NULL, all NULL-safe in core.
 // .colors NULL makes core strip abstract markers for us — a spoken
-// reply has no use for colour codes.
+// reply has no use for colour codes. SPOKEN declares that every reply
+// is read aloud by the mouth ring: the chat plugin's NL bridge forces
+// interpreted (prose) delivery of command output on this method
+// regardless of persona configuration, because a fixed-width weather
+// block spoken character-by-column is noise.
 static const method_driver_t reachy_driver = {
   .name                 = "reachy",
-  .caps                 = 0,
+  .caps                 = METHOD_CAP_SPOKEN,
   .colors               = NULL,
   .create               = reachy_create,
   .destroy              = reachy_destroy,
