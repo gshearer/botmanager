@@ -44,6 +44,9 @@ alongside its code.
 | Work on the chat bot plugin (command dispatch + LLM conversation) | `plugins/bot/chat/AGENTS.md` + `plugins/bot/chat/CHATBOT.md` |
 | Work on command dispatch / the identity + auth surface (`identify`, `deauth`, `register`, `id`) | `plugins/bot/chat/dispatch.h` + `plugins/bot/chat/AGENTS.md` §The two halves |
 | Turn conversation on or off for a bot | `plugins/bot/chat/AGENTS.md` §The two halves (`bot.<name>.behavior.chat.enabled`) |
+| Work on interpreted command output (a persona retelling a tool's reading) | `plugins/bot/chat/CHATBOT.md` §Interpreted command output + `plugins/bot/chat/interpret.c` (capture/settle/cue) + `core/cmd.c` (`cmd_sink_*`, the reply-sink registry the capture rides on) |
+| Work on the soul (heartbeat, `!remind`, the weather watch, a new chore) | `plugins/bot/chat/CHATBOT.md` §The soul + `plugins/bot/chat/soul.c`. ⚠ Every chore knob must join chatbot.c's KV descriptor table — a free-form `bot.*` key refuses `set kv` |
+| Score a persona / run the SOUL battery rig | `scripts/soul/` (`spies.sh` holds the IRC presences in a long-lived shell; a round is `reset.sh <persona> && probe.sh <persona> <rN>`; dim-6 halves `remind_probe.sh` / `watch_probe.sh`, output round via `SOUL_ROUND`) + root `TODO.md §SOUL-PLAN` (rubric + scoreboard) |
 | Add/modify conversational admin commands (`/dossier`, `/bot … hush`, `/show bot …`) | `plugins/bot/chat/AGENTS.md` + `plugins/bot/chat/CHATBOT.md` §Admin commands |
 | Stand up a new chat bot instance | `plugins/bot/chat/CHATBOT.md` §Creating + `scripts/AGENTS.md` §freshstart.sh |
 | Add/modify an output contract | `personalities/AGENTS.md` §contracts |
