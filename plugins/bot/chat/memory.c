@@ -1013,6 +1013,59 @@ memory_get_dossier_facts(int64_t dossier_id, uint32_t kinds_mask,
 }
 
 bool
+memory_get_dossier_fact_by_key(int64_t dossier_id, const char *exact_key,
+    const char *key_prefix, mem_dossier_fact_t *out)
+{
+  db_result_t *res;
+  bool found;
+  char sql[2048];
+  char *e_key;
+  char *e_pfx;
+
+  if(!memory_ready || dossier_id <= 0 || exact_key == NULL
+      || key_prefix == NULL || out == NULL)
+    return(FAIL);
+
+  e_key = db_escape(exact_key);
+  e_pfx = db_escape(key_prefix);
+
+  if(e_key == NULL || e_pfx == NULL)
+  {
+    if(e_key) mem_free(e_key);
+    if(e_pfx) mem_free(e_pfx);
+    return(FAIL);
+  }
+
+  // Plain LIKE on the prefix, unescaped underscores and all — the
+  // tree's own idiom for this family (soul.c watch-list scan accepts
+  // the same benign `_` wildcard).
+  snprintf(sql, sizeof(sql),
+      "SELECT " MEMORY_DOSSIER_FACT_SELECT_COLS
+      " FROM dossier_facts WHERE dossier_id = %" PRId64
+      " AND (fact_key = '%s' OR fact_key LIKE '%s%%')"
+      " ORDER BY (fact_key = '%s') DESC, last_seen DESC LIMIT 1",
+      dossier_id, e_key, e_pfx, e_key);
+
+  mem_free(e_key);
+  mem_free(e_pfx);
+
+  res = db_result_alloc();
+  found = FAIL;
+
+  if(db_query(sql, res) == SUCCESS && res->ok && res->rows > 0)
+  {
+    memory_parse_dossier_fact_row(res, 0, out);
+    found = SUCCESS;
+  }
+
+  else if(res->error[0] != '\0')
+    clam(CLAM_WARN, "memory", "get_dossier_fact_by_key: %s", res->error);
+
+  db_result_free(res);
+  return(found);
+}
+
+bool
 memory_forget_dossier_fact(int64_t fact_id)
 {
   db_result_t *res;

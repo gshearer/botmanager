@@ -499,34 +499,33 @@ nl_bridge_list_permits(const char *list, const char *name)
 // enriching the declarative shape first (see NL-Decoupling design
 // principle in TODO.md).
 
-#define NL_DEFAULT_LOCATION_FACT_KEY "location"
+// A location default prefers an explicit `location` fact (extractor-
+// written) and falls back to the newest `city_of_interest:*` fact —
+// geocode-verified by the NL observer after a successful /weather
+// dispatch, so one explicit ask teaches the default and the soul's
+// weather watch in the same stroke.
+#define NL_DEFAULT_LOCATION_FACT_KEY     "location"
+#define NL_DEFAULT_LOCATION_FACT_PREFIX  "city_of_interest:"
 
 static bool
 nl_default_from_dossier_fact(chatbot_req_t *r, const char *fact_key,
-    char *out, size_t out_sz)
+    const char *fact_prefix, char *out, size_t out_sz)
 {
-  mem_dossier_fact_t  facts[8];
-  size_t              n;
+  mem_dossier_fact_t fact;
 
   if(r == NULL || r->dossier_id == 0 || fact_key == NULL
-      || out == NULL || out_sz == 0)
+      || fact_prefix == NULL || out == NULL || out_sz == 0)
     return(FAIL);
 
-  n = memory_get_dossier_facts(r->dossier_id,
-      MEM_FACT_KIND_BIT(MEM_FACT_ATTRIBUTE),
-      facts, sizeof(facts) / sizeof(facts[0]));
+  if(memory_get_dossier_fact_by_key(r->dossier_id, fact_key,
+      fact_prefix, &fact) != SUCCESS)
+    return(FAIL);
 
-  for(size_t i = 0; i < n; i++)
-  {
-    if(strcasecmp(facts[i].fact_key, fact_key) == 0
-        && facts[i].fact_value[0] != '\0')
-    {
-      snprintf(out, out_sz, "%s", facts[i].fact_value);
-      return(SUCCESS);
-    }
-  }
+  if(fact.fact_value[0] == '\0')
+    return(FAIL);
 
-  return(FAIL);
+  snprintf(out, out_sz, "%.*s", (int)(out_sz - 1), fact.fact_value);
+  return(SUCCESS);
 }
 
 static bool
@@ -537,7 +536,8 @@ nl_default_for_type(chatbot_req_t *r, cmd_nl_arg_type_t type,
   {
     case CMD_NL_ARG_LOCATION:
       return(nl_default_from_dossier_fact(r,
-          NL_DEFAULT_LOCATION_FACT_KEY, out, out_sz));
+          NL_DEFAULT_LOCATION_FACT_KEY,
+          NL_DEFAULT_LOCATION_FACT_PREFIX, out, out_sz));
 
     // No declarative user-profile default for the remaining types.
     // Add a case when a future command needs one; keep per-type

@@ -205,6 +205,16 @@ bool memory_kind_from_name(const char *s, mem_fact_kind_t *out);
 size_t memory_get_dossier_facts(int64_t dossier_id, uint32_t kinds_mask,
     mem_dossier_fact_t *out, size_t cap);
 
+// Fetch the single best fact matching `exact_key` or the `key_prefix`
+// family: an exact-key row beats any prefix row; newest last_seen
+// breaks ties. No kind filter — the key is the contract, and extractor
+// kind labels are model-chosen.
+//
+// returns: SUCCESS with *out filled iff a row matched
+bool memory_get_dossier_fact_by_key(int64_t dossier_id,
+    const char *exact_key, const char *key_prefix,
+    mem_dossier_fact_t *out);
+
 bool memory_forget_dossier_fact(int64_t fact_id);
 
 // Retrieval
