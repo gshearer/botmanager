@@ -496,6 +496,18 @@ bool chatbot_dossiersweep_cmd_register(void);
 // Called from chatbot plugin init. Implemented in show_verbs.c.
 bool chatbot_show_verbs_register(void);
 
+// Parse a short duration string: "30s", "5m", "2h", "1d", or a bare
+// number interpreted as seconds. Returns 0 on parse failure. Shared by
+// /bot <n> hush and /remind.
+uint64_t chatbot_parse_duration_secs(const char *s);
+
+// The one reading of "hushed" for every path that can speak — the
+// reply speak path, the volunteer cascade and the soul tick (D9).
+// True while bot.<name>.behavior.mute_until is in the future; a lapsed
+// deadline is cleared here (lazily, on next read) so an idle bot
+// re-opens without a scheduled task.
+bool chatbot_mute_active(const char *botname);
+
 // ---- chatbot.c ----
 
 mem_msg_kind_t chatbot_classify_message(const method_msg_t *msg,
@@ -563,8 +575,11 @@ typedef enum
 // harm_signal:              caller flagged the line as containing a
 //                           destructive shell pattern (chmod 777, rm -rf /,
 //                           curl|sh, …). When set, WITNESS bypasses the
-//                           probability roll — mute / in_flight / cooldown
-//                           still gate. EXCHANGE_IN ignores this flag.
+//                           probability roll — in_flight / cooldown still
+//                           gate, and mute gates upstream: the caller runs
+//                           chatbot_mute_active() before this function is
+//                           ever reached (D9). EXCHANGE_IN ignores this
+//                           flag.
 // relevance_boost_pct:      additive percent multiplier for interject_prob
 //                           when the line touches a persona interest topic
 //                           keyword. 0 = no boost. The effective prob is
@@ -920,6 +935,25 @@ uint64_t chatbot_interpret_begin(const chatbot_req_t *r,
 // cleared. Airborne command output falls through to the wire.
 void chatbot_interpret_stop(chatbot_state_t *st);
 void chatbot_interpret_stop_all(void);
+
+// ---- soul.c — the per-bot heartbeat (SOUL-2) ----
+
+// Idempotent chat_reminders DDL. Called from chatbot_plugin_start
+// after dossier_register_config (the dossier FK target must exist).
+void soul_ensure_schema(void);
+
+// Arm / latch a bot's heartbeat. The extract.c scheduler pattern:
+// schedule reuses a parked task when one exists, unschedule only flips
+// the latch, soul_stop cancels every task (plugin stop), soul_exit
+// frees the sched list (plugin deinit, after soul_stop).
+void soul_schedule(const char *bot_name, uint32_t ns_id,
+    uint32_t interval_secs);
+void soul_unschedule(const char *bot_name);
+void soul_stop(void);
+void soul_exit(void);
+
+// Register /remind. Called from chatbot_cmds_register.
+bool soul_remind_register(void);
 
 #endif // CHATBOT_INTERNAL
 

@@ -9,9 +9,10 @@
 #include <time.h>
 
 // Parse a short duration string: "30s", "5m", "2h", "1d", or a bare
-// number interpreted as seconds. Returns 0 on parse failure.
-static uint64_t
-parse_duration_secs(const char *s)
+// number interpreted as seconds. Returns 0 on parse failure. Shared
+// with /remind (soul.c), hence not static.
+uint64_t
+chatbot_parse_duration_secs(const char *s)
 {
   char              *endp;
   unsigned long long n;
@@ -33,6 +34,30 @@ parse_duration_secs(const char *s)
   return(0);
 }
 
+// D9 (CHAT-MUTE-1) — the shared mute gate. The writer (/hush below)
+// and this reader live in the same TU so the mute domain has one home.
+// The lazy clear keeps an idle bot from needing a scheduled task just
+// to re-open; /show bot renders the KV directly (observation only,
+// no clearing side effect on a /show).
+bool
+chatbot_mute_active(const char *botname)
+{
+  char     key[KV_KEY_SZ];
+  uint64_t until;
+
+  snprintf(key, sizeof(key), "bot.%s.behavior.mute_until", botname);
+  until = kv_get_uint(key);
+
+  if(until == 0)
+    return(false);
+
+  if((time_t)until > time(NULL))
+    return(true);
+
+  kv_set_uint(key, 0);
+  return(false);
+}
+
 // /bot <name> hush <duration>
 //
 // <name> is resolved by the core dispatcher; this handler sees
@@ -46,7 +71,7 @@ static const cmd_arg_desc_t ad_bot_hush[] = {
 static void
 cmd_bot_hush(const cmd_ctx_t *ctx)
 {
-  uint64_t secs = parse_duration_secs(ctx->parsed->argv[0]);
+  uint64_t secs = chatbot_parse_duration_secs(ctx->parsed->argv[0]);
   char buf[128];
   uint64_t until;
   const char *botname;
@@ -213,12 +238,16 @@ chatbot_cmds_register(void)
         NULL, 0, NULL, NULL) != SUCCESS)
     goto fail_refresh_prompts;
 
+  if(soul_remind_register() != SUCCESS)
+    goto fail_remind;
+
   return(SUCCESS);
 
   // A registration failure here is CLAM_FATAL to the load, and the
   // daemon does not come up with a half-registered chat surface — so
   // these labels unwind what they can name and leave the rest to the
   // reclamation that runs before any mapping is dropped.
+fail_remind:
 fail_refresh_prompts:
 fail_show_verbs:
 fail_dossiersweep:

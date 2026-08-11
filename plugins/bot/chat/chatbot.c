@@ -158,8 +158,14 @@ static const plugin_kv_entry_t chatbot_inst_schema[] = {
     "Concurrent LLM reply cap for this bot", NULL },
   { "behavior.mute_until", KV_UINT32, "0",
     "Epoch seconds until which this bot is muted (0 = not muted)."
-    " Set via /hush, cleared by /unmute or when the deadline passes.",
-    NULL, &behavior_mute_until_nl },
+    " Set via /hush, cleared by /unmute or when the deadline passes."
+    " Enforced by chatbot_mute_active on the reply, volunteer and soul"
+    " paths.", NULL, &behavior_mute_until_nl },
+  { "behavior.soul.interval_secs", KV_UINT32, "60",
+    "Soul heartbeat period in seconds (min 5). Each tick runs due"
+    " chores (reminder delivery today; more later) when the bot is"
+    " RUNNING, chat-enabled and not muted. Re-read every tick, so a"
+    " change takes effect on the next fire.", NULL },
   { "behavior.coalesce_ms", KV_UINT32, "1500",
     "Paste coalescing window in milliseconds. Consecutive lines from the"
     " same sender are buffered and treated as a single message once the"
@@ -1307,17 +1313,26 @@ chatbot_start(void *handle)
 
   botname = bot_inst_name(st->inst);
 
+  ns = bot_get_userns(st->inst);
+  ns_id = ns != NULL ? ns->id : 0;
+  if(ns_id == 0)
+    return(SUCCESS);
+
+  // Soul heartbeat — every chat-enabled bot gets one; its tick re-reads
+  // the gates (enabled, mute, interval) fresh each fire.
+  snprintf(key, sizeof(key), "bot.%s.behavior.chat.enabled", botname);
+  if(kv_get_uint(key) != 0)
+  {
+    snprintf(key, sizeof(key), "bot.%s.behavior.soul.interval_secs", botname);
+    soul_schedule(botname, ns_id, (uint32_t)kv_get_uint(key));
+  }
+
   snprintf(key, sizeof(key), "bot.%s.behavior.fact_extract.enabled", botname);
   if(kv_get_uint(key) == 0)
     return(SUCCESS);
 
   snprintf(key, sizeof(key), "bot.%s.behavior.fact_extract.interval_secs", botname);
   interval = (uint32_t)kv_get_uint(key);
-
-  ns = bot_get_userns(st->inst);
-  ns_id = ns != NULL ? ns->id : 0;
-  if(ns_id == 0)
-    return(SUCCESS);
 
   extract_schedule(botname, ns_id, interval);
   return(SUCCESS);
@@ -1333,6 +1348,7 @@ chatbot_stop(void *handle)
   // submit a cue against a handle that is going away, and any airborne
   // command output falls through to the wire.
   chatbot_interpret_stop(st);
+  soul_unschedule(bot_inst_name(st->inst));
   acquire_unregister_bot(bot_inst_name(st->inst));
   extract_unschedule(bot_inst_name(st->inst));
 }
@@ -1362,21 +1378,12 @@ chatbot_consider_speaking(chatbot_state_t *st, const method_msg_t *msg,
   uint32_t witness_base_prob;
   uint32_t interject_prob;
   uint32_t max_inflight;
-  uint64_t mute_until;
-  time_t now_mute;
 
-  // Mute gate: if mute_until is in the future, suppress all replies.
-  // Clears itself lazily once the deadline passes so idle bots don't
-  // need a scheduled task to re-enable.
-  snprintf(key, sizeof(key), "bot.%s.behavior.mute_until", botname);
-  mute_until = kv_get_uint(key);
-  now_mute = time(NULL);
-  if(mute_until > 0)
-  {
-    if((time_t)mute_until > now_mute)
-      return;
-    kv_set_uint(key, 0);
-  }
+  // D9 — the shared mute gate (also guards the volunteer and soul
+  // paths). Suppresses every reply, direct address included: that is
+  // what an operator typing /hush means.
+  if(chatbot_mute_active(botname))
+    return;
 
   // IV3 vision intercept. Runs after the mute gate so /hush still wins.
   // Bypasses speak-policy on purpose: when image_vision.enabled and an
@@ -2322,6 +2329,8 @@ chatbot_plugin_start(void)
 {
   memory_ensure_schema();
   dossier_register_config();
+  // After dossier DDL: chat_reminders FKs into dossier(id).
+  soul_ensure_schema();
   // Identity scoring is plugin-local and protocol-agnostic: protocol
   // plugins emit the four-field identity tuple on method_msg_t and
   // identity.c scores it uniformly. No registry, no cross-plugin
@@ -2476,11 +2485,12 @@ chatbot_plugin_init(void)
   return(SUCCESS);
 }
 
-// Class B: the two periodic sweeps this plugin arms are the only work
-// that outlives a command and lands back in this mapping. Both read
-// state deinit() is about to tear down, so they come off first — and
-// they come off here rather than in deinit() so the loader's quiescence
-// barrier still has a window to wait out a callback already running.
+// Class B: the periodic work this plugin arms (extract sweeps, soul
+// heartbeats, the memory decay sweep) is the only work that outlives a
+// command and lands back in this mapping. All of it reads state
+// deinit() is about to tear down, so it comes off first — and it comes
+// off here rather than in deinit() so the loader's quiescence barrier
+// still has a window to wait out a callback already running.
 static bool
 chatbot_plugin_stop(void)
 {
@@ -2489,6 +2499,7 @@ chatbot_plugin_stop(void)
   // that for us — the retract is what turns a reload-with-airborne-
   // capture from a later crash into a verbatim block on the wire.
   chatbot_interpret_stop_all();
+  soul_stop();
   extract_stop();
   memory_stop();
   return(SUCCESS);
@@ -2504,8 +2515,10 @@ chatbot_plugin_deinit(void)
   // Reverse order of init. dossier_exit only frees the stat mutex; no
   // DB writes. Extract teardown must run before memory_exit because
   // extract may hold sweep-state pointing at memory types; extract owns
-  // no DB state the memory teardown needs.
+  // no DB state the memory teardown needs. Soul frees its sched list
+  // here — soul_stop() already cancelled the tasks those entries feed.
   dossier_exit();
+  soul_exit();
   extract_exit();
   memory_exit();
 }

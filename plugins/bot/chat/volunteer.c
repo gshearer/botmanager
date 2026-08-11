@@ -656,6 +656,17 @@ volunteer_submit(chatbot_state_t *st, const volunteer_job_t *job,
     return;
   }
 
+  // D9 — a hush silences spontaneous speech too. Gated at submit, not
+  // in the cascade, so every volunteer entry point passes through it,
+  // and before the stamps below so a muted attempt doesn't burn the
+  // channel cooldown or the hourly cap.
+  if(chatbot_mute_active(job->bot_name))
+  {
+    clam(CLAM_DEBUG, "chatbot",
+        "volunteer skip bot=%s chan=%s reason=muted", job->bot_name, chan);
+    return;
+  }
+
   memset(&msg, 0, sizeof(msg));
   msg.inst      = method;
   msg.timestamp = time(NULL);

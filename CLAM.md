@@ -222,6 +222,7 @@ halves. Same shape as `gemini` / `gemini.ws`.
 | `nl_observe` | plugins/bot/chat/nl_observe.c | post-dispatch chat observer (`OBS_CTX`) |
 | `reachy` | plugins/method/reachy/reachy.c | Reachy Mini method driver — the ear (bridge long-poll, transcription, attention gate, delivery) and the mouth (speech queue, synthesis, upload, playback pacing) (`REACHY_CTX`) |
 | `register` | plugins/bot/chat/dispatch.c | `/register` user creation |
+| `soul` | plugins/bot/chat/soul.c | per-bot heartbeat — chore scheduling, reminder claim/delivery, mute skips (`SOUL_CTX`) |
 | `vision` | plugins/bot/chat/vision.c | image-intent path |
 
 ## Extension plugins (`plugins/extension/`)
