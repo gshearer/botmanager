@@ -214,6 +214,7 @@ halves. Same shape as `gemini` / `gemini.ws`.
 | `extract` | plugins/bot/chat/extract.c | LLM-driven fact extraction |
 | `identify` | plugins/bot/chat/dispatch.c | `!identify` auth + temp-MFA mint |
 | `interject` | plugins/bot/chat/volunteer.c | chatbot interjection scoring |
+| `interpret` | plugins/bot/chat/interpret.c | interpreted command output — reply-sink capture open/close + cue hand-off (`INTERPRET_CTX`) |
 | `irc` | plugins/method/irc/irc_protocol.c | IRC method driver |
 | `memory` | plugins/bot/chat/memory_rag.c | chat memory subsystem + RAG |
 | `nl_bridge` | plugins/bot/chat/reply.c | natural-language bridge surface |

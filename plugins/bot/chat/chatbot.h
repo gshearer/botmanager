@@ -120,6 +120,13 @@ void chatbot_personality_free(struct chatbot_personality_s *p);
 // corpus selection is a deployment decision, not a character trait).
 #define CHATBOT_CORPUS_LIST_SZ        256
 
+// Comma-separated list of command names whose output the persona
+// relays in voice instead of the channel receiving the renderer's
+// block verbatim (frontmatter `interpret:`; empty = today's verbatim
+// behaviour). Same token grammar as behavior.nl_bridge_cmds — a
+// character trait, so it lives in the personality file, not KV.
+#define CHATBOT_INTERPRET_LIST_SZ     256
+
 // Byte budget for the rendered NL COMMANDS block in the system prompt.
 // Caps the combined size of every per-command stanza so a bot with many
 // NL-capable commands cannot starve the FACTS / MENTIONS / KNOWLEDGE
@@ -136,6 +143,7 @@ typedef struct chatbot_personality_s
 {
   char    name[CHATBOT_PERSONALITY_NAME_SZ];
   char    description[CHATBOT_PERSONALITY_DESC_SZ];
+  char    interpret[CHATBOT_INTERPRET_LIST_SZ];  // frontmatter `interpret:`; "" = none
   char   *body;            // mem_alloc'd
   char   *interests_json;  // mem_alloc'd; "" when absent
   int     version;
@@ -604,10 +612,11 @@ bool chatbot_nl_extract_cmd(const char *text,
 // declarative slot table and, for typed slots we care about
 // (CMD_NL_ARG_LOCATION today), schedules an async task that records
 // the appropriate chat-specific side effect (dossier fact upsert).
-// No reply is emitted; pure side effect.
+// No reply is emitted; pure side effect. `msg` is the bridge's fully
+// identity-populated synth message — the observer's dossier resolve
+// needs the whole tuple (CHAT-NLOBSERVE-1).
 void chatbot_nl_observe_location_slot(bot_inst_t *bot,
-    method_inst_t *inst, uint32_t ns_id, const char *sender,
-    const char *channel, const char *metadata,
+    const method_msg_t *msg, uint32_t ns_id,
     const cmd_nl_t *nl, const char *args_post_subst);
 
 // ---- reply.c ----
@@ -618,8 +627,11 @@ void chatbot_nl_observe_location_slot(bot_inst_t *bot,
 // is_direct_address is true only when the current line literally
 // addressed the bot (nick match or DM); sticky-promoted WITNESS lines
 // must pass false so the CV-4 fallback does not fire on them.
+// nl_bridge_off is true only for the interpret cue's second submit —
+// it suppresses the COMMANDS prompt block and the bridge itself so an
+// interpreted exchange cannot chain another command.
 void chatbot_reply_submit(chatbot_state_t *st, const method_msg_t *msg,
-    bool was_addressed, bool is_direct_address);
+    bool was_addressed, bool is_direct_address, bool nl_bridge_off);
 
 // Image-vision sibling of chatbot_reply_submit. Seeds the vision
 // fields (image_b64 ownership transfers in from the caller; mime is
@@ -686,6 +698,13 @@ void chatbot_stamp_witness_interject(chatbot_state_t *st,
 // never LLM output — keeps attribution clean in logs and scoring.
 #define CHATBOT_DIRECT_FALLBACK_TEXT       "couldn't tell you."
 
+// Deterministic denial when the NL bridge extracts a slash command the
+// caller is not permitted to run. The slash line was already
+// suppressed from the wire, so without this the asker gets total
+// silence (CHAT-BRIDGE-SWALLOW-1 arm 3). Same attribution rule as the
+// CV-4 string: appears in no personality body.
+#define CHATBOT_NL_DENIED_TEXT             "that's not something I can do for you."
+
 // CV-7 Part B — cooldown between two CV-4 fallback emissions on the
 // same (method, target). The canned fallback bypasses the LLM and
 // therefore also bypasses CV-6's anti-repeat window; without this
@@ -738,6 +757,15 @@ typedef struct
   // synth, and downstream features (e.g. "note the weather-queried
   // city on the sender's dossier") silently fail.
   char            sender_metadata[METHOD_META_SZ];
+  // The four-field identity tuple, snapshotted for the same reason as
+  // sender_metadata: every message the bridge synthesizes downstream of
+  // this request (dispatch synth, nl_observe, interpret cue) must carry
+  // it or chat_user_dossier_id refuses to resolve and the sender loses
+  // facts and recall — the dcfc359 coalescer lesson, once per path.
+  char            nickname[METHOD_NICKNAME_SZ];
+  char            username[METHOD_USERNAME_SZ];
+  char            hostname[METHOD_HOSTNAME_SZ];
+  char            verified_id[METHOD_VERIFIED_ID_SZ];
   char            channel[METHOD_CHANNEL_SZ];
   char            reply_target[METHOD_CHANNEL_SZ];
   char            text[METHOD_TEXT_SZ];
@@ -823,6 +851,19 @@ typedef struct
   //   otherwise → comma-separated command names, case-insensitive.
   char            nl_bridge_cmds[256];
 
+  // Interpreted-delivery list from the persona's `interpret:`
+  // frontmatter (same token grammar as nl_bridge_cmds). A bridged
+  // command on this list — or any bridged command when the method
+  // declares METHOD_CAP_SPOKEN — has its output captured through a
+  // reply sink and relayed in voice instead of hitting the wire raw.
+  char            interpret_cmds[CHATBOT_INTERPRET_LIST_SZ];
+
+  // True on the second submit of an interpreted exchange (the internal
+  // cue carrying fenced command output). Leaves nl_bridge_cmds empty so
+  // the COMMANDS block is never rendered and reply_nl_bridge disarms:
+  // one ask → one command → one reply, no chaining, no loops.
+  bool            nl_bridge_off;
+
   // Streaming coalescer: accumulate deltas, flush per-line via
   // method_send. done_cb sends any residual tail.
   char            stream_buf[METHOD_TEXT_SZ];
@@ -854,6 +895,31 @@ typedef struct
   // 0 = guard disabled.
   uint32_t           anti_repeat_threshold_pct;
 } chatbot_req_t;
+
+// ---- interpret.c ----
+// (Below chatbot_req_t — the begin call reads the request record.)
+
+// Open an output capture for a bridged command about to be dispatched.
+// Claims a collector slot, registers a reply sink (cmd.h §Reply sinks)
+// and arms the hard deadline. The caller threads the returned id
+// through the dispatched message's reply_sink_id; every cmd_reply the
+// command makes then lands in the collector, and a settle window after
+// the last line closes the capture and re-submits the block as an
+// internal cue through the persona pipeline (nl_bridge_off).
+// `synth` is the identity-complete message being dispatched; `r`
+// supplies the question, sender and address flags the cue needs.
+// Returns 0 when no slot is free (caller dispatches uncaptured — the
+// channel gets the verbatim block, never silence).
+uint64_t chatbot_interpret_begin(const chatbot_req_t *r,
+    const method_msg_t *synth, const char *cmd, const char *args);
+
+// Retract every live capture owned by `st` (bot stop), or every
+// capture regardless of owner (plugin stop). Sinks are unregistered
+// first — after that no collector callback is running or will run —
+// then pending settle/deadline tasks are cancelled and the slots
+// cleared. Airborne command output falls through to the wire.
+void chatbot_interpret_stop(chatbot_state_t *st);
+void chatbot_interpret_stop_all(void);
 
 #endif // CHATBOT_INTERNAL
 

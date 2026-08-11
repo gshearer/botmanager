@@ -758,6 +758,12 @@ reply_nl_bridge(chatbot_req_t *r, const char *text)
   char cmd[64] = {0};
   char args[1024] = {0};
 
+  if(r->nl_bridge_off)
+  {
+    clam(CLAM_DEBUG, "nl_bridge", "disarmed (interpret cue reply)");
+    return;
+  }
+
   if(r->nl_bridge_cmds[0] == '\0')
   {
     clam(CLAM_DEBUG, "nl_bridge", "disabled (empty allowlist)");
@@ -822,12 +828,26 @@ reply_nl_bridge(chatbot_req_t *r, const char *text)
   // metadata broke dossier_signature + MFA match for every NL-bridged
   // command.
   snprintf(synth.metadata, sizeof(synth.metadata), "%s", r->sender_metadata);
+  // The identity tuple rides along for the same reason: everything
+  // synthesized downstream of this dispatch (nl_observe's dossier
+  // resolve, the interpret cue's second submit) refuses an all-empty
+  // tuple by design — the dcfc359 coalescer lesson.
+  snprintf(synth.nickname,    sizeof(synth.nickname),    "%s", r->nickname);
+  snprintf(synth.username,    sizeof(synth.username),    "%s", r->username);
+  snprintf(synth.hostname,    sizeof(synth.hostname),    "%s", r->hostname);
+  snprintf(synth.verified_id, sizeof(synth.verified_id), "%s", r->verified_id);
   synth.timestamp = time(NULL);
 
   if(!cmd_permits(r->st->inst, &synth, def))
   {
     clam(CLAM_DEBUG, "nl_bridge",
         "'/%s' denied by cmd_permits for sender '%s'", cmd, r->sender);
+
+    // CHAT-BRIDGE-SWALLOW-1 arm 3: the slash line never reached the
+    // wire (send_reply_line suppresses it), so a silent denial leaves
+    // the asker with nothing at all. Deterministic string — appears in
+    // no personality body, so transcript attribution stays clean.
+    method_send(r->method, r->reply_target, CHATBOT_NL_DENIED_TEXT);
     return;
   }
 
@@ -836,6 +856,17 @@ reply_nl_bridge(chatbot_req_t *r, const char *text)
   // Silent no-op when no default is known; the command body will
   // surface a usage reply as appropriate.
   nl_bridge_substitute_defaults(r, nl, args, sizeof(args));
+
+  // D4 — interpreted delivery. A command on the persona's interpret
+  // list — or ANY bridged command on a method that declares its
+  // replies are read aloud (METHOD_CAP_SPOKEN), where a fixed-width
+  // block is noise — has its output captured through a reply sink and
+  // handed back to the model as data; the persona relays the substance
+  // in voice. Collector exhaustion returns 0: the command dispatches
+  // uncaptured and the channel gets the verbatim block, never silence.
+  if(nl_bridge_list_permits(r->interpret_cmds, cmd)
+      || (method_inst_caps(r->method) & METHOD_CAP_SPOKEN) != 0)
+    synth.reply_sink_id = chatbot_interpret_begin(r, &synth, cmd, args);
 
   // Both dispatch paths below hand the callback off to the task pool,
   // so any bounded blocking (sync HTTP for a city→zip geocode, etc.)
@@ -887,8 +918,10 @@ reply_nl_bridge(chatbot_req_t *r, const char *text)
   // PL5 post-dispatch observer: record chat-specific side-effects for
   // typed slots (today: CMD_NL_ARG_LOCATION → city_of_interest fact).
   // Runs asynchronously via a task; the dispatch path does not block.
-  chatbot_nl_observe_location_slot(r->st->inst, r->method, r->ns_id,
-      r->sender, r->channel, r->sender_metadata, nl, args);
+  // Receives the synth whole — its dossier resolve needs the identity
+  // tuple, not just sender + metadata (CHAT-NLOBSERVE-1).
+  chatbot_nl_observe_location_slot(r->st->inst, &synth, r->ns_id,
+      nl, args);
 }
 
 // Drop ASCII whitespace from both ends of `s` in place, returning s.
@@ -1625,7 +1658,7 @@ chatbot_build_nl_commands_block(const chatbot_req_t *r,
   header = "<<<COMMANDS you may invoke. To run one, emit exactly\n"
       "/<name> <args> on a line by itself. Do not explain the command.\n"
       "Do not wrap it in backticks. Emit only the slash-line; the system\n"
-      "will speak the result. If the user's request does not match any\n"
+      "will handle the result. If the user's request does not match any\n"
       "command below, answer normally instead of guessing a command.>>>\n\n";
 
   header_len = strlen(header);
@@ -2647,7 +2680,7 @@ retrieve_cb(const mem_fact_t *facts, size_t n_facts,
 //      EXCHANGE_OUT, and runs the NL-command bridge if enabled.
 void
 chatbot_reply_submit(chatbot_state_t *st, const method_msg_t *msg,
-    bool was_addressed, bool is_direct_address)
+    bool was_addressed, bool is_direct_address, bool nl_bridge_off)
 {
   uint32_t top_k;
   uint32_t rr_cap;
@@ -2672,9 +2705,14 @@ chatbot_reply_submit(chatbot_state_t *st, const method_msg_t *msg,
   r->was_addressed     = was_addressed;
   r->is_direct_address = is_direct_address;
   r->is_action_at_bot  = msg->is_action && was_addressed;
+  r->nl_bridge_off     = nl_bridge_off;
 
   snprintf(r->sender,          sizeof(r->sender),          "%s", msg->sender);
   snprintf(r->sender_metadata, sizeof(r->sender_metadata), "%s", msg->metadata);
+  snprintf(r->nickname,        sizeof(r->nickname),        "%s", msg->nickname);
+  snprintf(r->username,        sizeof(r->username),        "%s", msg->username);
+  snprintf(r->hostname,        sizeof(r->hostname),        "%s", msg->hostname);
+  snprintf(r->verified_id,     sizeof(r->verified_id),     "%s", msg->verified_id);
   snprintf(r->channel,         sizeof(r->channel),         "%s", msg->channel);
 
   // Frame the incoming line as an emote when it is a /me action, unless
@@ -2731,6 +2769,7 @@ chatbot_reply_submit(chatbot_state_t *st, const method_msg_t *msg,
   }
 
   snprintf(r->personality_name, sizeof(r->personality_name), "%s", p.name);
+  snprintf(r->interpret_cmds, sizeof(r->interpret_cmds), "%s", p.interpret);
   r->personality_body = p.body;           // transfer ownership
   p.body = NULL;                           // neutralise to avoid double-free
   chatbot_personality_free(&p);            // releases interests_json
@@ -2821,10 +2860,17 @@ chatbot_reply_submit(chatbot_state_t *st, const method_msg_t *msg,
   snprintf(key, sizeof(key), "bot.%s.max_reply_tokens", botname);
   r->max_tokens = (uint32_t)kv_get_uint(key);
 
-  snprintf(key, sizeof(key), "bot.%s.behavior.nl_bridge_cmds", botname);
-  nlc = kv_get_str(key);
-  snprintf(r->nl_bridge_cmds, sizeof(r->nl_bridge_cmds),
-      "%s", nlc ? nlc : "");
+  // The interpret cue's second submit keeps the allowlist empty: no
+  // COMMANDS block is rendered into its prompt and reply_nl_bridge
+  // disarms itself, so an interpreted exchange cannot chain another
+  // command (D3: one ask → one command → one reply).
+  if(!nl_bridge_off)
+  {
+    snprintf(key, sizeof(key), "bot.%s.behavior.nl_bridge_cmds", botname);
+    nlc = kv_get_str(key);
+    snprintf(r->nl_bridge_cmds, sizeof(r->nl_bridge_cmds),
+        "%s", nlc ? nlc : "");
+  }
 
   // Mention-expansion budget knobs. Clamp top_k to the compile-time
   // cap so assemble_prompt's fixed-size facts array never overruns.
@@ -2992,6 +3038,10 @@ chatbot_reply_submit_vision(chatbot_state_t *st, const method_msg_t *msg,
 
   snprintf(r->sender,          sizeof(r->sender),          "%s", msg->sender);
   snprintf(r->sender_metadata, sizeof(r->sender_metadata), "%s", msg->metadata);
+  snprintf(r->nickname,        sizeof(r->nickname),        "%s", msg->nickname);
+  snprintf(r->username,        sizeof(r->username),        "%s", msg->username);
+  snprintf(r->hostname,        sizeof(r->hostname),        "%s", msg->hostname);
+  snprintf(r->verified_id,     sizeof(r->verified_id),     "%s", msg->verified_id);
   snprintf(r->channel,         sizeof(r->channel),         "%s", msg->channel);
 
   if(msg->is_action && strncmp(msg->text, "* ", 2) != 0)
@@ -3046,6 +3096,7 @@ chatbot_reply_submit_vision(chatbot_state_t *st, const method_msg_t *msg,
   }
 
   snprintf(r->personality_name, sizeof(r->personality_name), "%s", p.name);
+  snprintf(r->interpret_cmds, sizeof(r->interpret_cmds), "%s", p.interpret);
   r->personality_body = p.body;           // transfer ownership
   p.body = NULL;
   chatbot_personality_free(&p);

@@ -94,6 +94,15 @@ static const plugin_kv_entry_t chatbot_kv_schema[] = {
     "Default output contract stem for chat bot instances"
     " (overridden per-bot by bot.<name>.behavior.contract). Resolves"
     " against bot.chat.contractpath.", NULL, NULL },
+  { "plugin.chat.interpret.settle_ms", KV_UINT32, "1500",
+    "Interpreted command output: milliseconds of output silence that"
+    " closes a capture (async commands have no completion signal, so"
+    " quiet is the only end there is). Clamped to a 100 ms floor;"
+    " snapshotted per capture.", NULL, NULL },
+  { "plugin.chat.interpret.max_wait_secs", KV_UINT32, "20",
+    "Interpreted command output: hard deadline for a command that"
+    " never prints. On expiry the persona is cued to say, in character,"
+    " that it couldn't find out.", NULL, NULL },
 };
 
 static const plugin_kv_entry_t chatbot_inst_schema[] = {
@@ -1320,6 +1329,10 @@ chatbot_stop(void *handle)
   chatbot_state_t *st = handle;
   if(st == NULL) return;
 
+  // Sinks first: after this no interpret capture owned by this bot can
+  // submit a cue against a handle that is going away, and any airborne
+  // command output falls through to the wire.
+  chatbot_interpret_stop(st);
   acquire_unregister_bot(bot_inst_name(st->inst));
   extract_unschedule(bot_inst_name(st->inst));
 }
@@ -1483,7 +1496,7 @@ chatbot_consider_speaking(chatbot_state_t *st, const method_msg_t *msg,
   // synthesised at chatbot.c:1345-1346, so DIRECT propagates correctly
   // without an extra field on chatbot_coalesce_slot_t.
   chatbot_reply_submit(st, msg, decision == CHATBOT_SPEAK_REPLY,
-      reason == CHATBOT_CLASSIFY_DIRECT);
+      reason == CHATBOT_CLASSIFY_DIRECT, false);
 
   // VF-3: stamp the per-target witness-interject ring ONLY after a
   // successful interject submit. Direct-address replies (REPLY) do
@@ -2471,6 +2484,11 @@ chatbot_plugin_init(void)
 static bool
 chatbot_plugin_stop(void)
 {
+  // Interpret sinks before anything else: a registered sink callback
+  // points into this mapping, and core's sink registry cannot audit
+  // that for us — the retract is what turns a reload-with-airborne-
+  // capture from a later crash into a verbatim block on the wire.
+  chatbot_interpret_stop_all();
   extract_stop();
   memory_stop();
   return(SUCCESS);

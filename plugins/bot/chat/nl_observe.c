@@ -34,14 +34,26 @@ typedef struct
   char            sender[METHOD_SENDER_SZ];
   char            channel[METHOD_CHANNEL_SZ];
   char            metadata[METHOD_META_SZ];
+  // The identity tuple, carried whole: chat_user_dossier_id refuses an
+  // all-empty tuple by design, so a task data missing it resolved
+  // dossier 0 on every dispatch and this observer never wrote a fact
+  // in its life (CHAT-NLOBSERVE-1; the dcfc359 coalescer disease in a
+  // second location).
+  char            nickname[METHOD_NICKNAME_SZ];
+  char            username[METHOD_USERNAME_SZ];
+  char            hostname[METHOD_HOSTNAME_SZ];
+  char            verified_id[METHOD_VERIFIED_ID_SZ];
   char            user_label[128];
   method_inst_t  *inst;
   bot_inst_t     *bot;
 } nl_observe_task_data_t;
 
 typedef bool (*geocode_city_fn_t)(const char *, char *, size_t);
+typedef bool (*geocode_zip_fn_t)(const char *, double *, double *,
+    char *, size_t);
 
 static geocode_city_fn_t  fn_geocode_city_sync;
+static geocode_zip_fn_t   fn_geocode_zip_sync;
 static bool               geocode_resolved;
 
 static bool
@@ -49,16 +61,40 @@ resolve_openweather_geocode(void)
 {
   if(!geocode_resolved)
   {
-    union { void *obj; geocode_city_fn_t fn; } u;
+    union { void *obj; geocode_city_fn_t fn; } uc;
+    union { void *obj; geocode_zip_fn_t  fn; } uz;
 
-    u.obj = plugin_dlsym_cached("openweather",
+    uc.obj = plugin_dlsym_cached("openweather",
         "openweather_geocode_city_sync",
         (void **)&fn_geocode_city_sync);
-    fn_geocode_city_sync = u.fn;
+    fn_geocode_city_sync = uc.fn;
+
+    uz.obj = plugin_dlsym_cached("openweather",
+        "openweather_geocode_zip_sync",
+        (void **)&fn_geocode_zip_sync);
+    fn_geocode_zip_sync = uz.fn;
+
     geocode_resolved = true;
   }
 
-  return(fn_geocode_city_sync != NULL);
+  return(fn_geocode_city_sync != NULL && fn_geocode_zip_sync != NULL);
+}
+
+// A bare 5-digit token is a US zip: the model emits them readily and
+// the CITY geocoder FAILs every one, which silently killed the fact
+// for zip-shaped dispatches (CHAT-NLOBSERVE-1 mechanism 2).
+static bool
+label_is_zip(const char *label)
+{
+  size_t n = strlen(label);
+
+  if(n != 5) return(false);
+
+  for(size_t i = 0; i < 5; i++)
+    if(label[i] < '0' || label[i] > '9')
+      return(false);
+
+  return(true);
 }
 
 // Lowercase + underscore-collapse a user-supplied location so the fact
@@ -110,14 +146,34 @@ nl_observe_task(task_t *t)
     goto done;
   }
 
-  zip[0] = '\0';
-
-  if(fn_geocode_city_sync(d->user_label, zip, sizeof(zip)) != SUCCESS)
+  // The geocode is a reality gate, nothing more: a label that resolves
+  // to no place on earth (hallucinated, misspelled) must not become a
+  // fact. Zip-shaped labels go to the zip geocoder — the city geocoder
+  // FAILs every zip.
+  if(label_is_zip(d->user_label))
   {
-    clam(CLAM_DEBUG, OBS_CTX,
-        "geocode '%s' FAIL (hallucinated or misspelled)",
-        d->user_label);
-    goto done;
+    double lat;
+    double lon;
+
+    if(fn_geocode_zip_sync(d->user_label, &lat, &lon, NULL, 0) != SUCCESS)
+    {
+      clam(CLAM_DEBUG, OBS_CTX,
+          "geocode zip '%s' FAIL (no such zip)", d->user_label);
+      goto done;
+    }
+  }
+
+  else
+  {
+    zip[0] = '\0';
+
+    if(fn_geocode_city_sync(d->user_label, zip, sizeof(zip)) != SUCCESS)
+    {
+      clam(CLAM_DEBUG, OBS_CTX,
+          "geocode '%s' FAIL (hallucinated or misspelled)",
+          d->user_label);
+      goto done;
+    }
   }
 
   canonicalize_location(d->user_label, canon, sizeof(canon));
@@ -131,9 +187,13 @@ nl_observe_task(task_t *t)
 
   memset(&synth, 0, sizeof(synth));
   synth.inst = d->inst;
-  snprintf(synth.sender,   sizeof(synth.sender),   "%s", d->sender);
-  snprintf(synth.channel,  sizeof(synth.channel),  "%s", d->channel);
-  snprintf(synth.metadata, sizeof(synth.metadata), "%s", d->metadata);
+  snprintf(synth.sender,      sizeof(synth.sender),      "%s", d->sender);
+  snprintf(synth.channel,     sizeof(synth.channel),     "%s", d->channel);
+  snprintf(synth.metadata,    sizeof(synth.metadata),    "%s", d->metadata);
+  snprintf(synth.nickname,    sizeof(synth.nickname),    "%s", d->nickname);
+  snprintf(synth.username,    sizeof(synth.username),    "%s", d->username);
+  snprintf(synth.hostname,    sizeof(synth.hostname),    "%s", d->hostname);
+  snprintf(synth.verified_id, sizeof(synth.verified_id), "%s", d->verified_id);
 
   did = chat_user_dossier_id(&synth, d->ns_id, d->sender, true);
 
@@ -175,8 +235,7 @@ done:
 
 void
 chatbot_nl_observe_location_slot(bot_inst_t *bot,
-    method_inst_t *inst, uint32_t ns_id, const char *sender,
-    const char *channel, const char *metadata,
+    const method_msg_t *msg, uint32_t ns_id,
     const cmd_nl_t *nl, const char *args_post_subst)
 {
   // v1 observes only the single-slot CMD_NL_ARG_LOCATION case — the only
@@ -193,7 +252,7 @@ chatbot_nl_observe_location_slot(bot_inst_t *bot,
   if(nl->slots[0].type != CMD_NL_ARG_LOCATION)
     return;
 
-  if(sender == NULL || sender[0] == '\0' || args_post_subst == NULL)
+  if(msg == NULL || msg->sender[0] == '\0' || args_post_subst == NULL)
     return;
 
   value = args_post_subst;
@@ -207,14 +266,16 @@ chatbot_nl_observe_location_slot(bot_inst_t *bot,
 
   memset(d, 0, sizeof(*d));
   d->ns_id = ns_id;
-  d->inst  = inst;
+  d->inst  = msg->inst;
   d->bot   = bot;
-  snprintf(d->sender,     sizeof(d->sender),     "%s", sender);
-  snprintf(d->channel,    sizeof(d->channel),    "%s",
-      channel != NULL ? channel : "");
-  snprintf(d->metadata,   sizeof(d->metadata),   "%s",
-      metadata != NULL ? metadata : "");
-  snprintf(d->user_label, sizeof(d->user_label), "%s", value);
+  snprintf(d->sender,      sizeof(d->sender),      "%s", msg->sender);
+  snprintf(d->channel,     sizeof(d->channel),     "%s", msg->channel);
+  snprintf(d->metadata,    sizeof(d->metadata),    "%s", msg->metadata);
+  snprintf(d->nickname,    sizeof(d->nickname),    "%s", msg->nickname);
+  snprintf(d->username,    sizeof(d->username),    "%s", msg->username);
+  snprintf(d->hostname,    sizeof(d->hostname),    "%s", msg->hostname);
+  snprintf(d->verified_id, sizeof(d->verified_id), "%s", msg->verified_id);
+  snprintf(d->user_label,  sizeof(d->user_label),  "%s", value);
 
   t = task_add(OBS_CTX, TASK_ANY, 200, nl_observe_task, d);
 
@@ -222,6 +283,6 @@ chatbot_nl_observe_location_slot(bot_inst_t *bot,
   {
     mem_free(d);
     clam(CLAM_WARN, OBS_CTX,
-        "task spawn failed sender=%s value='%.40s'", sender, value);
+        "task spawn failed sender=%s value='%.40s'", msg->sender, value);
   }
 }

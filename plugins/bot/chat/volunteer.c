@@ -723,7 +723,10 @@ volunteer_submit(chatbot_state_t *st, const volunteer_job_t *job,
   // doesn't name anyone, and we don't want synthetic dossier hits.
   // is_direct_address=false: volunteer speech is spontaneous, never a
   // reply to a direct address, so the CV-4 SKIP fallback must not fire.
-  chatbot_reply_submit(st, &msg, false, false);
+  // nl_bridge_off=false: the volunteer cue never embeds tool output, so
+  // it keeps the bridge — a volunteered line may legitimately reach for
+  // a command.
+  chatbot_reply_submit(st, &msg, false, false, false);
 }
 
 // Task callback — consumes a volunteer_job_t that was queued from the
