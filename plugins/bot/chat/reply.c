@@ -1958,7 +1958,8 @@ chatbot_build_nl_commands_block(const chatbot_req_t *r,
 }
 
 // Prompt-section builders. Each appends to buf[pos..cap) and returns the
-// new pos. `public_reply` gates the DM-origin fact leak guard.
+// new pos. `public_reply` gates the facts block's DM-origin leak guard;
+// the mentions block guards unconditionally (see its loop).
 static size_t
 prompt_emit_facts(char *buf, size_t pos, size_t cap,
     const chatbot_req_t *r, const mem_fact_t *facts, size_t nf,
@@ -1998,8 +1999,7 @@ prompt_emit_facts(char *buf, size_t pos, size_t cap,
 static size_t
 prompt_emit_mentions(char *buf, size_t pos, size_t cap,
     const chatbot_req_t *r,
-    const chatbot_mention_t *mentions, size_t n_mentions,
-    bool public_reply)
+    const chatbot_mention_t *mentions, size_t n_mentions)
 {
   size_t block_start;
   size_t block_cap_bytes;
@@ -2036,7 +2036,12 @@ prompt_emit_mentions(char *buf, size_t pos, size_t cap,
       if(pos - block_start >= block_cap_bytes)
         break;
 
-      if(public_reply && mn->facts[i].channel[0] == '\0')
+      // A ''-channel fact was learned in a DM between the *mentioned*
+      // person and the bot, and the requester is never that person —
+      // chatbot_reply_submit drops self-mentions at scan time. So a
+      // private fact never renders here, DM or channel alike
+      // (CHAT-DM-MENTION-LEAK-1).
+      if(mn->facts[i].channel[0] == '\0')
         continue;
 
       sanitize_copy(safe_key, sizeof(safe_key), mn->facts[i].fact_key);
@@ -2429,8 +2434,7 @@ assemble_prompt(chatbot_req_t *r, const mem_fact_t *facts, size_t nf,
   pos = prompt_emit_facts(buf, pos, cap, r, facts, nf, public_reply);
 
   // 3b. Facts about people named in the user's message.
-  pos = prompt_emit_mentions(buf, pos, cap, r, mentions, n_mentions,
-      public_reply);
+  pos = prompt_emit_mentions(buf, pos, cap, r, mentions, n_mentions);
 
   // 3c. NL COMMANDS block — per-request catalog of permitted slash-commands.
   pos = prompt_emit_nl_commands(buf, pos, cap, r);
