@@ -748,6 +748,61 @@ nl_bridge_handle_kv(chatbot_req_t *r, const char *suffix)
   method_send(r->method, r->reply_target, reply);
 }
 
+// D-ASK — true iff the command's NL shape is "exactly one USER_DEFAULT
+// slot, and it is a location". Only that shape may skip a doomed
+// dispatch for an in-voice ask: the cue text below speaks about where
+// the user lives, so a future USER_DEFAULT of another semantic type
+// must add its own case rather than inherit the wording.
+static bool
+nl_single_location_default(const cmd_nl_t *nl)
+{
+  const cmd_nl_slot_t *ud;
+  uint8_t              n;
+
+  if(nl == NULL || nl->slots == NULL) return(false);
+
+  ud = NULL;
+  n  = 0;
+
+  for(uint8_t i = 0; i < nl->slot_count; i++)
+  {
+    if((nl->slots[i].flags & CMD_NL_SLOT_USER_DEFAULT) != 0)
+    {
+      ud = &nl->slots[i];
+      n++;
+    }
+  }
+
+  return(n == 1 && ud->type == CMD_NL_ARG_LOCATION);
+}
+
+typedef struct
+{
+  chatbot_state_t *st;
+  method_msg_t     msg;           // synth copy, text replaced by the cue
+  bool             was_addressed;
+  bool             is_direct;
+} nl_ask_task_data_t;
+
+// The cue's second submit runs a full retrieval pass (sync DB round
+// trips), so it hops to a task worker — the bridge runs on the
+// curl_multi thread, which must not block. Same lifecycle posture as
+// nl_observe's one-shot.
+static void
+nl_bridge_ask_task(task_t *t)
+{
+  nl_ask_task_data_t *d = t->data;
+
+  if(d != NULL)
+  {
+    chatbot_reply_submit(d->st, &d->msg, d->was_addressed,
+        d->is_direct, true);
+    mem_free(d);
+  }
+
+  t->state = TASK_ENDED;
+}
+
 static void
 reply_nl_bridge(chatbot_req_t *r, const char *text)
 {
@@ -861,9 +916,62 @@ reply_nl_bridge(chatbot_req_t *r, const char *text)
 
   // ND3 — fill any USER_DEFAULT slot the LLM left unfilled (e.g. a
   // /weather call without a location) from the asking user's profile.
-  // Silent no-op when no default is known; the command body will
-  // surface a usage reply as appropriate.
   nl_bridge_substitute_defaults(r, nl, args, sizeof(args));
+
+  // D-ASK — the default found nothing and the command cannot succeed
+  // without it. Dispatching anyway buys a usage error the persona then
+  // voices as a dead end (the 15:48 hedgehogg shape: an apology plus a
+  // promise the disarmed cue reply cannot keep). Skip the dispatch and
+  // cue the persona to ask for the location instead — the user's
+  // answer flows through the normal bridge next turn, which also
+  // teaches the fact stores.
+  if(args[0] == '\0' && nl_single_location_default(nl))
+  {
+    nl_ask_task_data_t *d;
+    const char         *nick;
+    char                excerpt[240];
+
+    nick = r->nickname[0] != '\0' ? r->nickname : r->sender;
+
+    if(strlen(r->text) >= sizeof(excerpt))
+      snprintf(excerpt, sizeof(excerpt), "%.*s…",
+          (int)(sizeof(excerpt) - 5), r->text);
+    else
+      snprintf(excerpt, sizeof(excerpt), "%s", r->text);
+
+    d = mem_alloc("chat", "nl_ask_cue", sizeof(*d));
+
+    if(d != NULL)
+    {
+      memset(d, 0, sizeof(*d));
+      d->st            = r->st;
+      d->msg           = synth;
+      d->was_addressed = r->was_addressed;
+      d->is_direct     = r->is_direct_address;
+      d->msg.reply_sink_id = 0;
+      d->msg.timestamp     = time(NULL);
+
+      snprintf(d->msg.text, sizeof(d->msg.text),
+          "[internal cue: %s asked \"%s\" but you don't know where "
+          "they live. Ask %s now, in one short line and in character, "
+          "for their city or zip code. Do not promise to look "
+          "anything up yet.]",
+          nick, excerpt, nick);
+
+      clam(CLAM_INFO, "nl_bridge",
+          "no location default for sender=%s — cueing ask instead of "
+          "dispatch", r->sender);
+
+      if(task_add("nl_bridge", TASK_ANY, 150, nl_bridge_ask_task, d)
+          == NULL)
+      {
+        mem_free(d);
+        method_send(r->method, r->reply_target, CHATBOT_NL_DENIED_TEXT);
+      }
+    }
+
+    return;
+  }
 
   // D4 — interpreted delivery. A command on the persona's interpret
   // list — or ANY bridged command on a method that declares its

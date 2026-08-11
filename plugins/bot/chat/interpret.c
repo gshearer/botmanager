@@ -240,7 +240,8 @@ interpret_build_cue(method_msg_t *msg, const char *sender,
     snprintf(msg->text, sizeof(msg->text),
         "[internal cue: %s asked \"%s\" and you ran /%s%s%s, but it "
         "produced no output at all. Tell %s, in one short line and in "
-        "character, that you couldn't find out.]",
+        "character, that you couldn't find out. Never promise to "
+        "retry, follow up, or fetch anything later — you cannot.]",
         sender, question, cmd, args[0] != '\0' ? " " : "", args, sender);
     return;
   }
@@ -251,7 +252,8 @@ interpret_build_cue(method_msg_t *msg, const char *sender,
       "lines, your voice — relay the substance, never the formatting; "
       "do not quote it verbatim; do not mention running a command. If "
       "the output reports an error, tell them what you couldn't find "
-      "out, in character.\n<<<COMMAND OUTPUT>>>\n",
+      "out, in character. Never promise to retry, follow up, or fetch "
+      "anything later — you cannot.\n<<<COMMAND OUTPUT>>>\n",
       sender, question, cmd, args[0] != '\0' ? " " : "", args, sender);
 
   hlen = strlen(head);
