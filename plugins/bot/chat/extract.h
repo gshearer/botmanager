@@ -99,6 +99,17 @@ typedef struct
   int64_t         dossier_id;
   char            display_label[EXTRACT_LABEL_SZ];
   extract_role_t  role;
+
+  // Channel provenance for facts about this participant, resolved per
+  // batch by extract_fetch_batch: the newest channel they spoke in, or
+  // the DM-guard sentinel "" when any of their rows arrived by DM
+  // (privacy-first — a fact that MIGHT derive from a DM is treated as
+  // if it did). A mentioned-only participant said nothing themselves,
+  // so their facts inherit the batch-wide resolution under the same
+  // rule. This is what CHAT-EXTRACT-DMCHAN-1 was about: stamping every
+  // fact with one batch-level channel let DM secrets masquerade as
+  // channel knowledge.
+  char            channel[MEM_FACT_CHANNEL_SZ];
 } extract_participant_t;
 
 typedef struct
@@ -116,9 +127,11 @@ size_t extract_prompt_build(const extract_participant_t *parts, size_t n_parts,
 // not free or mutate.
 const char *extract_prompt_system(void);
 
+// Each accepted fact is stamped with its subject participant's resolved
+// channel (see extract_participant_t.channel), never a batch-level one.
 size_t extract_parse_response(const char *content, size_t content_len,
     const extract_participant_t *parts, size_t n_parts,
-    float min_conf, const char *channel,
+    float min_conf,
     mem_dossier_fact_t *out, size_t out_cap);
 
 // Parse aliases from the same LLM response body. On a response that
@@ -141,8 +154,7 @@ size_t extract_parse_aliases(const char *content, size_t content_len,
 //
 // returns: number of facts written (0 on no-op, error, or all rejected)
 // model_name: registered chat model name (must be non-empty)
-// parts / n_parts, msgs / n_msgs: batch
-// channel: stamped on accepted facts
+// parts / n_parts, msgs / n_msgs: batch (parts carry channel provenance)
 // min_conf: validation threshold
 // timeout_secs: cap on the blocking wait; 0 -> 60s default
 // Pull the next batch of conversation_log rows past the given high-
@@ -162,7 +174,7 @@ size_t extract_dispatch(const char *bot_name, uint32_t ns_id,
     const char *model_name,
     const extract_participant_t *parts, size_t n_parts,
     const mem_msg_t *msgs, size_t n_msgs,
-    const char *channel, float min_conf, uint32_t timeout_secs);
+    float min_conf, uint32_t timeout_secs);
 
 #endif // EXTRACT_INTERNAL
 

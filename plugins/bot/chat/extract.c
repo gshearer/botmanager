@@ -107,14 +107,14 @@ kind_from_str(const char *s, mem_fact_kind_t *out)
   return(false);
 }
 
-static bool
-participants_contain(const extract_participant_t *parts, size_t n,
+static const extract_participant_t *
+participants_find(const extract_participant_t *parts, size_t n,
     int64_t pid)
 {
   for(size_t i = 0; i < n; i++)
     if(parts[i].dossier_id == pid)
-      return(true);
-  return(false);
+      return(&parts[i]);
+  return(NULL);
 }
 
 // Returns true if `key` is valid per the schema. When it starts with
@@ -142,7 +142,7 @@ fact_key_ok(const char *key, const extract_participant_t *parts, size_t n)
     if(digits[0] == '\0' || endp == NULL || *endp != '\0' || v <= 0)
       return(false);
 
-    if(!participants_contain(parts, n, (int64_t)v))
+    if(participants_find(parts, n, (int64_t)v) == NULL)
       return(false);
   }
 
@@ -154,7 +154,7 @@ fact_key_ok(const char *key, const extract_participant_t *parts, size_t n)
 size_t
 extract_parse_response(const char *content, size_t content_len,
     const extract_participant_t *parts, size_t n_parts,
-    float min_conf, const char *channel,
+    float min_conf,
     mem_dossier_fact_t *out, size_t out_cap)
 {
   size_t n_items;
@@ -213,6 +213,7 @@ extract_parse_response(const char *content, size_t content_len,
     char    key_buf [MEM_FACT_KEY_SZ]   = "";
     char    val_buf [MEM_FACT_VALUE_SZ] = "";
     double  conf = 0.0;
+    const extract_participant_t *subject;
     mem_dossier_fact_t *f;
     size_t vl;
     mem_fact_kind_t kind;
@@ -233,7 +234,9 @@ extract_parse_response(const char *content, size_t content_len,
       continue;
     }
 
-    if(!participants_contain(parts, n_parts, pid))
+    subject = participants_find(parts, n_parts, pid);
+
+    if(subject == NULL)
     {
       STAT_BUMP(facts_rejected_validation);
       continue;
@@ -267,7 +270,7 @@ extract_parse_response(const char *content, size_t content_len,
     snprintf(f->fact_key,   sizeof(f->fact_key),   "%s", key_buf);
     snprintf(f->fact_value, sizeof(f->fact_value), "%s", val_buf);
     snprintf(f->source,     sizeof(f->source),     "%s", "llm_extract");
-    snprintf(f->channel,    sizeof(f->channel),    "%s", channel ? channel : "");
+    snprintf(f->channel,    sizeof(f->channel),    "%s", subject->channel);
     f->confidence  = (float)conf;
     f->observed_at = now;
     f->last_seen   = now;
@@ -341,7 +344,7 @@ extract_parse_aliases(const char *content, size_t content_len,
         || !json_get_double(item, "confidence", &conf))
       continue;
 
-    if(!participants_contain(parts, n_parts, pid))
+    if(participants_find(parts, n_parts, pid) == NULL)
       continue;
 
     alen = strlen(alias_buf);
@@ -504,7 +507,7 @@ extract_dispatch(const char *bot_name, uint32_t ns_id,
     const char *model_name,
     const extract_participant_t *parts, size_t n_parts,
     const mem_msg_t *msgs, size_t n_msgs,
-    const char *channel, float min_conf, uint32_t timeout_secs)
+    float min_conf, uint32_t timeout_secs)
 {
   size_t n_written;
   mem_dossier_fact_t facts[EXTRACT_MAX_FACTS];
@@ -597,7 +600,7 @@ extract_dispatch(const char *bot_name, uint32_t ns_id,
   }
 
   n_parsed = extract_parse_response(w.content, w.content_len,
-      parts, n_parts, min_conf, channel,
+      parts, n_parts, min_conf,
       facts, EXTRACT_MAX_FACTS);
 
   // Parse aliases from the same response body before freeing it. Gating
@@ -898,14 +901,62 @@ extract_fetch_batch(const char *bot_name, uint32_t ns_id,
   if(n == 0)
     return(0);
 
-  // Resolve display labels for each participant.
-  for(size_t i = 0; i < np; i++)
+  // Resolve display labels and channel provenance for each participant.
+  // Provenance rule (CHAT-EXTRACT-DMCHAN-1): a participant's facts are
+  // stamped with the newest channel they spoke in this batch, or the
+  // DM-guard sentinel "" when ANY of their rows arrived by DM — at fact
+  // granularity we cannot know which line a fact came from, and a fact
+  // that might derive from a DM must be guarded as if it did. A
+  // mentioned-only participant said nothing, so their facts derive from
+  // other speakers' rows and inherit the batch-wide resolution under
+  // the same privacy-first rule.
   {
-    memset(&parts_out[i], 0, sizeof(parts_out[i]));
-    parts_out[i].dossier_id = pids[i];
-    parts_out[i].role       = roles[i];
-    dossier_label(pids[i], parts_out[i].display_label,
-        sizeof(parts_out[i].display_label));
+    const char *batch_chan = NULL;
+    bool        batch_dm   = false;
+
+    for(size_t r = 0; r < n; r++)
+    {
+      if(msgs_out[r].channel[0] == '\0')
+        batch_dm = true;
+      else
+        batch_chan = msgs_out[r].channel;
+    }
+
+    for(size_t i = 0; i < np; i++)
+    {
+      const char *chan  = NULL;
+      bool        dm    = false;
+      bool        spoke = false;
+
+      memset(&parts_out[i], 0, sizeof(parts_out[i]));
+      parts_out[i].dossier_id = pids[i];
+      parts_out[i].role       = roles[i];
+      dossier_label(pids[i], parts_out[i].display_label,
+          sizeof(parts_out[i].display_label));
+
+      for(size_t r = 0; r < n; r++)
+      {
+        if(msgs_out[r].dossier_id != pids[i])
+          continue;
+
+        spoke = true;
+
+        if(msgs_out[r].channel[0] == '\0')
+          dm = true;
+        else
+          chan = msgs_out[r].channel;
+      }
+
+      if(!spoke)
+      {
+        dm   = batch_dm;
+        chan = batch_chan;
+      }
+
+      if(!dm && chan != NULL)
+        snprintf(parts_out[i].channel, sizeof(parts_out[i].channel),
+            "%s", chan);
+    }
   }
 
   if(n_parts_out != NULL) *n_parts_out = np;
@@ -977,7 +1028,6 @@ rate_check_and_record(extract_sched_t *s, uint32_t max_per_hour)
 size_t
 extract_run_once(const char *bot_name, uint32_t ns_id)
 {
-  const char *channel;
   size_t written;
   const char *cm;
   mem_msg_t             msgs[EXTRACT_MAX_FACTS];
@@ -1052,11 +1102,9 @@ extract_run_once(const char *bot_name, uint32_t ns_id)
     return(0);
   }
 
-  channel = msgs[0].channel;
-
   written = extract_dispatch(bot_name, ns_id, cm,
       parts, n_parts, msgs, n_msgs,
-      channel, min_conf, 0);
+      min_conf, 0);
 
   // Advance the high-water mark on any successful dispatch so the same
   // rows aren't reprocessed every tick. On hard failure (written == 0
