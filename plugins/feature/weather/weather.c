@@ -462,6 +462,10 @@ static const cmd_nl_example_t weather_weather_examples[] = {
     .invocation = "/weather" },
   { .utterance  = "tell me the weather in 45069",
     .invocation = "/weather 45069" },
+  { .utterance  = "how's the weather in london?",
+    .invocation = "/weather London" },
+  { .utterance  = "what's it like in santa fe right now?",
+    .invocation = "/weather Santa Fe" },
   { .utterance  = "hourly forecast for Cincinnati",
     .invocation = "/weather -h Cincinnati" },
   { .utterance  = "what's the 7-day forecast for 90210?",
@@ -469,8 +473,11 @@ static const cmd_nl_example_t weather_weather_examples[] = {
 };
 
 static const cmd_nl_t weather_weather_nl = {
-  .when          = "User asks about current or forecast weather.",
-  .syntax        = "/weather [-h | -d] <zipcode | city>",
+  .when          = "User asks about current or forecast weather for any "
+                   "place in the world.",
+  .syntax        = "/weather [-h | -d] <zipcode | city name — bare "
+                   "(\"Santa Fe\", \"London\") or comma-qualified "
+                   "(\"Santa Fe, NM\"); never a bare state suffix>",
   .slots         = weather_weather_slots,
   .slot_count    = (uint8_t)(sizeof(weather_weather_slots)
                              / sizeof(weather_weather_slots[0])),
