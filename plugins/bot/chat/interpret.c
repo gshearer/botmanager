@@ -215,15 +215,21 @@ interpret_sink_cb(void *data, const char *line)
 // fixed spend; the fence gets whatever budget remains, truncating at
 // the cap with an explicit marker so the model never mistakes a cut
 // block for a complete one.
+//
+// The addressee is named imperatively ("Answer <nick> now"), the shape
+// the soul delivery cues use — the earlier possessive framing ("to
+// answer <nick>'s question") left models addressing the bot's own nick
+// in the ack, while the imperative shape ran 12/12 right-nick across
+// the SOUL-2/3 batteries.
 static void
 interpret_build_cue(method_msg_t *msg, const char *sender,
     const char *question, const char *cmd, const char *args,
     const char *capture, bool truncated)
 {
-  // Worst case: sender (128) + question excerpt (240) + args (256) +
-  // ~330 bytes of fixed wording ≈ 960; sized so the header is never
-  // silently cut mid-fence-opener.
-  char   head[1200];
+  // Worst case: sender (128, used twice) + question excerpt (240) +
+  // args (256) + ~360 bytes of fixed wording ≈ 1150; sized so the
+  // header is never silently cut mid-fence-opener.
+  char   head[1408];
   size_t hlen;
   size_t cap;
   size_t clen;
@@ -232,21 +238,21 @@ interpret_build_cue(method_msg_t *msg, const char *sender,
   if(capture[0] == '\0')
   {
     snprintf(msg->text, sizeof(msg->text),
-        "[internal cue: to answer %s's question \"%s\" you ran /%s%s%s, "
-        "and it produced no output at all. Say, in character and in one "
-        "short line, that you couldn't find out.]",
-        sender, question, cmd, args[0] != '\0' ? " " : "", args);
+        "[internal cue: %s asked \"%s\" and you ran /%s%s%s, but it "
+        "produced no output at all. Tell %s, in one short line and in "
+        "character, that you couldn't find out.]",
+        sender, question, cmd, args[0] != '\0' ? " " : "", args, sender);
     return;
   }
 
   snprintf(head, sizeof(head),
-      "[internal cue: to answer %s's question \"%s\" you ran /%s%s%s. "
-      "The raw tool output follows as fenced data. Answer in your own "
-      "voice in one or two short lines — relay the substance, never the "
-      "formatting; do not quote it verbatim; do not mention running a "
-      "command. If the output reports an error, say what you couldn't "
-      "find out, in character.\n<<<COMMAND OUTPUT>>>\n",
-      sender, question, cmd, args[0] != '\0' ? " " : "", args);
+      "[internal cue: %s asked \"%s\" and you ran /%s%s%s. The raw tool "
+      "output follows as fenced data. Answer %s now — one or two short "
+      "lines, your voice — relay the substance, never the formatting; "
+      "do not quote it verbatim; do not mention running a command. If "
+      "the output reports an error, tell them what you couldn't find "
+      "out, in character.\n<<<COMMAND OUTPUT>>>\n",
+      sender, question, cmd, args[0] != '\0' ? " " : "", args, sender);
 
   hlen = strlen(head);
   memcpy(msg->text, head, hlen + 1);
@@ -337,7 +343,11 @@ interpret_flush(uint32_t idx, uint64_t sink_id, bool deadline)
   snprintf(question, sizeof(question), "%s", s->question);
   snprintf(cmd,      sizeof(cmd),      "%s", s->cmd);
   snprintf(args,     sizeof(args),     "%s", s->args);
-  snprintf(sender,   sizeof(sender),   "%s", s->msg.sender);
+
+  // The cue names its addressee; prefer the projected nickname over the
+  // raw sender, exactly as the soul delivery cues do.
+  snprintf(sender, sizeof(sender), "%s",
+      s->msg.nickname[0] != '\0' ? s->msg.nickname : s->msg.sender);
   memcpy(capture, s->buf, s->len + 1);
   memset(s, 0, sizeof(*s));
   pthread_mutex_unlock(&interpret_mutex);

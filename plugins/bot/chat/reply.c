@@ -1658,8 +1658,11 @@ chatbot_build_nl_commands_block(const chatbot_req_t *r,
   header = "<<<COMMANDS you may invoke. To run one, emit exactly\n"
       "/<name> <args> on a line by itself. Do not explain the command.\n"
       "Do not wrap it in backticks. Emit only the slash-line; the system\n"
-      "will handle the result. If the user's request does not match any\n"
-      "command below, answer normally instead of guessing a command.>>>\n\n";
+      "will handle the result. When someone asks you to do one of these\n"
+      "things, emit the command — never claim you did it without emitting\n"
+      "it, never act out compliance, and never promise to run it later.\n"
+      "If the user's request does not match any command below, answer\n"
+      "normally instead of guessing a command.>>>\n\n";
 
   header_len = strlen(header);
 
