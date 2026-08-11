@@ -12,9 +12,12 @@ chat_plugin = shared_library('chat',
   # win over any older include/ copy during transitional builds. The
   # inference include dir exposes the engine's inference.h — the
   # dlsym-shim public surface for llm/knowledge/acquire (defined by
-  # plugins/extension/inference/engine/meson.build).
+  # plugins/extension/inference/engine/meson.build). The weathergov
+  # dir exposes the CAP alert types the soul's weather watch consumes
+  # (resolution is tolerant plugin_dlsym, never the abort-shims).
   include_directories : [include_directories('.'), inc_include,
-                         inference_include],
+                         inference_include,
+                         include_directories('../../service/weathergov')],
   override_options : ['b_lundef=false'],
   install : true,
 )

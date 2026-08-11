@@ -163,9 +163,28 @@ static const plugin_kv_entry_t chatbot_inst_schema[] = {
     " paths.", NULL, &behavior_mute_until_nl },
   { "behavior.soul.interval_secs", KV_UINT32, "60",
     "Soul heartbeat period in seconds (min 5). Each tick runs due"
-    " chores (reminder delivery today; more later) when the bot is"
+    " chores (reminder delivery, the weather watch) when the bot is"
     " RUNNING, chat-enabled and not muted. Re-read every tick, so a"
     " change takes effect on the next fire.", NULL },
+  { "behavior.soul.weather.enabled", KV_BOOL, "false",
+    "Proactive weather watch: each sweep scans the namespace's"
+    " city_of_interest facts (written by the NL bridge observer after"
+    " a successful /weather), fetches active NWS alerts per distinct"
+    " coordinate and announces fresh ones in persona — once per alert,"
+    " claimed in chat_soul_alerts_seen. Off by default: unprompted"
+    " speech is an operator decision.", NULL },
+  { "behavior.soul.weather.interval_secs", KV_UINT32, "600",
+    "Seconds between weather watch sweeps (min 5). The soul tick still"
+    " paces the floor: a sweep fires on the first tick after this"
+    " cadence elapses.", NULL },
+  { "behavior.soul.weather.min_severity", KV_STR, "severe",
+    "Announcement floor: minor, moderate, severe or extreme. Alerts"
+    " graded below it are never claimed or spoken; unrecognized values"
+    " read as severe.", NULL },
+  { "behavior.soul.weather.max_per_hour", KV_UINT32, "4",
+    "Alerts announced per hour per namespace. Fresh alerts beyond the"
+    " cap are claimed as seen but never spoken — a capped storm stays"
+    " silent when the cap lifts, deliberately. 0 = the default 4.", NULL },
   { "behavior.coalesce_ms", KV_UINT32, "1500",
     "Paste coalescing window in milliseconds. Consecutive lines from the"
     " same sender are buffered and treated as a single message once the"

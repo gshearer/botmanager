@@ -634,6 +634,12 @@ void chatbot_nl_observe_location_slot(bot_inst_t *bot,
     const method_msg_t *msg, uint32_t ns_id,
     const cmd_nl_t *nl, const char *args_post_subst);
 
+// True when a location label is a bare 5-digit US zip. Routing gate
+// shared by every geocode site in the plugin: the CITY geocoder FAILs
+// every zip (CHAT-NLOBSERVE-1 mechanism 2), so zip-shaped labels must
+// go to the zip geocoder.
+bool chatbot_label_is_zip(const char *label);
+
 // ---- reply.c ----
 
 // Entry point for the reply pipeline. Called from chatbot_observe

@@ -82,9 +82,10 @@ resolve_openweather_geocode(void)
 
 // A bare 5-digit token is a US zip: the model emits them readily and
 // the CITY geocoder FAILs every one, which silently killed the fact
-// for zip-shaped dispatches (CHAT-NLOBSERVE-1 mechanism 2).
-static bool
-label_is_zip(const char *label)
+// for zip-shaped dispatches (CHAT-NLOBSERVE-1 mechanism 2). Exported
+// plugin-wide — the soul's weather watch routes the same labels.
+bool
+chatbot_label_is_zip(const char *label)
 {
   size_t n = strlen(label);
 
@@ -150,7 +151,7 @@ nl_observe_task(task_t *t)
   // to no place on earth (hallucinated, misspelled) must not become a
   // fact. Zip-shaped labels go to the zip geocoder — the city geocoder
   // FAILs every zip.
-  if(label_is_zip(d->user_label))
+  if(chatbot_label_is_zip(d->user_label))
   {
     double lat;
     double lon;
