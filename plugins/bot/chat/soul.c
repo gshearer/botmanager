@@ -383,6 +383,24 @@ typedef struct
   uint8_t                  total;                  // incl. beyond the spell-out cap
 } soul_wx_target_t;
 
+// One distinct CAP alert per sweep, with every point that carries it.
+// The same alert covers every coordinate inside its polygon, so the
+// per-(alert, ns) claim MUST be taken once per sweep and fanned out to
+// all carrying points' watchers — claiming inside one point's walk
+// hands the alert to whichever point iterates first and silently
+// disinherits its siblings' watchers (measured 2026-08-11: two
+// Cleveland coordinates, one zip-seeded and one city-seeded, under one
+// Flood Watch — the DM watcher was never warned).
+#define SOUL_WX_UNIQ_MAX  64
+
+typedef struct
+{
+  const weathergov_alert_t *a;                     // first carrier's copy
+  soul_wx_point_t          *carrier_pt[SOUL_WX_POINTS_MAX];
+  uint8_t                   carrier_ai[SOUL_WX_POINTS_MAX];
+  uint8_t                   n_carriers;
+} soul_wx_uniq_t;
+
 // Tolerant resolution, the nl_observe pattern: a missing provider
 // idles the watch instead of aborting the daemon the way the
 // api-header shims would. Re-attempted while incomplete, so a
@@ -706,17 +724,26 @@ soul_wx_announce(chatbot_state_t *st, method_inst_t *method,
         " (%u more alert(s) are active for them too.)",
         (unsigned)(tgt->total - tgt->n_alerts));
 
+  // Two wording rules learned from R3 (dale): the reading is spelled
+  // out IN the cue, and a model never told so may answer by running
+  // /weather — with the bridge disarmed on cue replies, a reply that is
+  // only a suppressed slash line dies silently and the warning is never
+  // spoken. And the channel name must stay out of the addressing
+  // position ("Warn #botman ... by nick" produced "@botman veksel").
   if(tgt->dm_watcher != NULL)
     soul_wx_append(msg.text, sizeof(msg.text), &off,
         " Warn %s here in this DM now — one or two short lines, your"
-        " voice, lead with what matters. Do not mention this cue.]",
+        " voice, lead with what matters. The reading is already in this"
+        " cue: run no command, answer from what is here. Do not mention"
+        " this cue.]",
         lead->label);
 
   else
     soul_wx_append(msg.text, sizeof(msg.text), &off,
-        " Warn %s about this now — one or two short lines, your voice,"
-        " address the affected by nick, lead with what matters. Do not"
-        " mention this cue.]", tgt->channel);
+        " Warn the channel now — one or two short lines, your voice,"
+        " name the affected by nick, lead with what matters. The"
+        " reading is already in this cue: run no command, answer from"
+        " what is here. Do not mention this cue.]");
 
   clam(CLAM_INFO, SOUL_CTX,
       "bot=%s weather announce to %s: %u alert(s), %u spelled",
@@ -782,6 +809,12 @@ soul_wx_batch_task(task_t *t)
       budget = hour < cap ? cap - hour : 0;
     }
 
+    // Pass 1 — collect the sweep's DISTINCT alerts (by CAP id) across
+    // every covered point, remembering each carrying point. See
+    // soul_wx_uniq_t for why claiming inside this walk would be wrong.
+    soul_wx_uniq_t uniq[SOUL_WX_UNIQ_MAX];
+    uint8_t        n_uniq = 0;
+
     for(uint8_t p = 0; p < sweep->n_points; p++)
     {
       soul_wx_point_t *pt = &sweep->points[p];
@@ -802,29 +835,73 @@ soul_wx_batch_task(task_t *t)
       for(uint8_t ai = 0; ai < pt->result.alerts.count; ai++)
       {
         const weathergov_alert_t *a = &pt->result.alerts.alerts[ai];
-        soul_wx_target_t         *seen[SOUL_WX_WATCHERS_MAX];
-        uint8_t                   n_seen = 0;
+        soul_wx_uniq_t           *u = NULL;
 
         if(a->severity < floor)
           continue;
 
-        if(!soul_wx_claim(sweep->ns_id, a))
-          continue;
+        for(uint8_t k = 0; k < n_uniq; k++)
+          if(strcmp(uniq[k].a->id, a->id) == 0)
+          {
+            u = &uniq[k];
+            break;
+          }
 
-        if(budget == 0)
+        if(u == NULL)
         {
-          // Deliberate: the claim above already recorded this alert as
-          // seen, so a storm capped mid-outbreak does NOT re-announce
-          // when the cap lifts — silence now is silence for good.
-          capped++;
-          continue;
+          if(n_uniq >= SOUL_WX_UNIQ_MAX)
+          {
+            clam(CLAM_WARN, SOUL_CTX,
+                "bot=%s watch: distinct-alert table full (%u), '%s'"
+                " dropped this sweep (unclaimed — it re-offers next"
+                " sweep)", sweep->bot_name, (unsigned)n_uniq, a->event);
+            continue;
+          }
+
+          u = &uniq[n_uniq++];
+          memset(u, 0, sizeof(*u));
+          u->a = a;
         }
 
-        budget--;
+        if(u->n_carriers < SOUL_WX_POINTS_MAX)
+        {
+          u->carrier_pt[u->n_carriers] = pt;
+          u->carrier_ai[u->n_carriers] = ai;
+          u->n_carriers++;
+        }
+      }
+    }
 
-        // Route once per DISTINCT target of this point's watchers —
-        // two users in one channel share a cue line; a DM watcher gets
-        // an isolated cue of their own.
+    // Pass 2 — one claim per distinct alert, then fan the announcement
+    // out to EVERY carrying point's watchers.
+    for(uint8_t ui = 0; ui < n_uniq; ui++)
+    {
+      soul_wx_uniq_t   *u = &uniq[ui];
+      soul_wx_target_t *seen[SOUL_WX_ROWS_MAX];   // distinct targets, not one point's watchers
+      uint8_t           n_seen = 0;
+
+      if(!soul_wx_claim(sweep->ns_id, u->a))
+        continue;
+
+      if(budget == 0)
+      {
+        // Deliberate: the claim above already recorded this alert as
+        // seen, so a storm capped mid-outbreak does NOT re-announce
+        // when the cap lifts — silence now is silence for good.
+        capped++;
+        continue;
+      }
+
+      budget--;
+
+      // Route once per DISTINCT target across all carriers — two users
+      // in one channel share a cue line however many points they watch;
+      // a DM watcher gets an isolated cue of their own.
+      for(uint8_t ci = 0; ci < u->n_carriers; ci++)
+      {
+        soul_wx_point_t *pt = u->carrier_pt[ci];
+        uint8_t          ai = u->carrier_ai[ci];
+
         for(uint8_t wi = 0; wi < pt->n_watchers; wi++)
         {
           soul_wx_target_t *tg =
@@ -844,7 +921,7 @@ soul_wx_batch_task(task_t *t)
           if(dup)
             continue;
 
-          if(n_seen < SOUL_WX_WATCHERS_MAX)
+          if(n_seen < SOUL_WX_ROWS_MAX)
             seen[n_seen++] = tg;
 
           if(tg->n_alerts < SOUL_WX_CUE_ALERTS_MAX)

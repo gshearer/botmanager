@@ -792,11 +792,17 @@ reply_nl_bridge(chatbot_req_t *r, const char *text)
     return;
   }
 
+  // CHAT-BRIDGE-SWALLOW-2: every refusal below speaks. The slash line
+  // never reaches the wire (send_reply_line suppresses it), so when the
+  // model's whole reply was a guessed phantom command — '/flight' — a
+  // silent drop leaves a directly-addressed user with nothing at all.
+  // Same deterministic line as the denied path, same reason.
   def = cmd_find(cmd);
 
   if(def == NULL)
   {
     clam(CLAM_DEBUG, "nl_bridge", "'/%s' not registered", cmd);
+    method_send(r->method, r->reply_target, CHATBOT_NL_DENIED_TEXT);
     return;
   }
 
@@ -805,6 +811,7 @@ reply_nl_bridge(chatbot_req_t *r, const char *text)
   if(nl == NULL)
   {
     clam(CLAM_DEBUG, "nl_bridge", "'/%s' is not NL-capable", cmd);
+    method_send(r->method, r->reply_target, CHATBOT_NL_DENIED_TEXT);
     return;
   }
 
@@ -812,6 +819,7 @@ reply_nl_bridge(chatbot_req_t *r, const char *text)
   {
     clam(CLAM_DEBUG, "nl_bridge",
         "'/%s' not on allowlist ('%s')", cmd, r->nl_bridge_cmds);
+    method_send(r->method, r->reply_target, CHATBOT_NL_DENIED_TEXT);
     return;
   }
 
@@ -2271,6 +2279,21 @@ assemble_prompt(chatbot_req_t *r, const mem_fact_t *facts, size_t nf,
   // 1. Personality body verbatim.
   if(r->personality_body != NULL)
     pos += snprintf(buf + pos, cap - pos, "%s\n\n", r->personality_body);
+
+  // 1a. Live deployment identity. Personas are nick-agnostic by design
+  // (any bot may wear any persona), so the persona body cannot know the
+  // wire name — and a model that is never told reads its own nick in
+  // "<nick>: ..." address lines as a third party and starts addressing
+  // people by it (CHAT-PROMPT-SELF-NICK-1: x14 in one battery round).
+  {
+    const char *botnick = bot_inst_name(r->st->inst);
+
+    pos += snprintf(buf + pos, cap - pos,
+        "On this wire your nick is '%s': lines addressed to '%s' are"
+        " addressed to YOU. '%s' is never how you address anyone else —"
+        " the people you answer have their own names.\n\n",
+        botnick, botnick, botnick);
+  }
 
   // 1b. Method-capability block.
   caps = method_inst_caps(r->method);
