@@ -799,23 +799,16 @@ size_t
 extract_fetch_batch(const char *bot_name, uint32_t ns_id,
     int64_t hwm_in, uint32_t batch_cap,
     mem_msg_t *msgs_out, size_t msgs_cap,
-    extract_participant_t *parts_out, size_t parts_cap,
-    size_t *n_parts_out, int64_t *hwm_out)
+    int64_t *hwm_out)
 {
   db_result_t *res;
   size_t n;
   int64_t new_hwm;
-  int64_t         pids[EXTRACT_MAX_PARTS];
-  extract_role_t  roles[EXTRACT_MAX_PARTS];
-  size_t          np;
-  size_t          pcap;
   char sql[1024];
   uint32_t cap;
   char esc_bot[MEM_MSG_BOT_SZ * 2 + 4];
 
-  if(n_parts_out != NULL) *n_parts_out = 0;
-  if(bot_name == NULL || msgs_out == NULL || parts_out == NULL
-      || msgs_cap == 0 || parts_cap == 0 || batch_cap == 0)
+  if(bot_name == NULL || msgs_out == NULL || msgs_cap == 0 || batch_cap == 0)
     return(0);
 
   cap = batch_cap < (uint32_t)msgs_cap
@@ -838,11 +831,6 @@ extract_fetch_batch(const char *bot_name, uint32_t ns_id,
   res = db_result_alloc();
   n = 0;
   new_hwm = hwm_in;
-
-  // Collected unique participant pids, up to parts_cap.
-  np = 0;
-  pcap = parts_cap < EXTRACT_MAX_PARTS
-      ? parts_cap : EXTRACT_MAX_PARTS;
 
   if(db_query(sql, res) == SUCCESS && res->ok)
   {
@@ -872,27 +860,6 @@ extract_fetch_batch(const char *bot_name, uint32_t ns_id,
       if(m->id > new_hwm)
         new_hwm = m->id;
 
-      // Sender dossier.
-      if(m->dossier_id > 0 && !pid_in(pids, np, m->dossier_id)
-          && np < pcap)
-      {
-        pids [np] = m->dossier_id;
-        roles[np] = EXTRACT_ROLE_SENDER;
-        np++;
-      }
-
-      // Referenced dossiers.
-      for(uint8_t k = 0; k < m->n_referenced && np < pcap; k++)
-      {
-        int64_t rp = m->referenced_dossiers[k];
-        if(rp > 0 && !pid_in(pids, np, rp))
-        {
-          pids [np] = rp;
-          roles[np] = EXTRACT_ROLE_MENTIONED;
-          np++;
-        }
-      }
-
       n++;
     }
   }
@@ -901,25 +868,76 @@ extract_fetch_batch(const char *bot_name, uint32_t ns_id,
   if(n == 0)
     return(0);
 
+  if(hwm_out != NULL) *hwm_out = new_hwm;
+  return(n);
+}
+
+// Participants assembly
+
+size_t
+extract_parts_assemble(const mem_msg_t *msgs, size_t n_msgs,
+    extract_participant_t *parts_out, size_t parts_cap)
+{
+  int64_t         pids [EXTRACT_MAX_PARTS];
+  extract_role_t  roles[EXTRACT_MAX_PARTS];
+  size_t          np;
+  size_t          pcap;
+
+  if(msgs == NULL || parts_out == NULL || n_msgs == 0 || parts_cap == 0)
+    return(0);
+
+  // Collect unique participant pids in row order, up to parts_cap.
+  np   = 0;
+  pcap = parts_cap < EXTRACT_MAX_PARTS ? parts_cap : EXTRACT_MAX_PARTS;
+
+  for(size_t r = 0; r < n_msgs; r++)
+  {
+    const mem_msg_t *m = &msgs[r];
+
+    // Sender dossier.
+    if(m->dossier_id > 0 && !pid_in(pids, np, m->dossier_id) && np < pcap)
+    {
+      pids [np] = m->dossier_id;
+      roles[np] = EXTRACT_ROLE_SENDER;
+      np++;
+    }
+
+    // Referenced dossiers.
+    for(uint8_t k = 0; k < m->n_referenced && np < pcap; k++)
+    {
+      int64_t rp = m->referenced_dossiers[k];
+
+      if(rp > 0 && !pid_in(pids, np, rp))
+      {
+        pids [np] = rp;
+        roles[np] = EXTRACT_ROLE_MENTIONED;
+        np++;
+      }
+    }
+  }
+
   // Resolve display labels and channel provenance for each participant.
   // Provenance rule (CHAT-EXTRACT-DMCHAN-1): a participant's facts are
-  // stamped with the newest channel they spoke in this batch, or the
+  // stamped with the newest channel they spoke in these rows, or the
   // DM-guard sentinel "" when ANY of their rows arrived by DM — at fact
   // granularity we cannot know which line a fact came from, and a fact
   // that might derive from a DM must be guarded as if it did. A
   // mentioned-only participant said nothing, so their facts derive from
-  // other speakers' rows and inherit the batch-wide resolution under
-  // the same privacy-first rule.
+  // other speakers' rows and inherit the slice-wide resolution under
+  // the same privacy-first rule. run_once hands this function single-
+  // channel partitions (CHAT-EXTRACT-PARTITION-1), so the rule
+  // degenerates to "the partition's channel" and provenance is exact;
+  // over a mixed-channel slice it stays the conservative safety net.
   {
-    const char *batch_chan = NULL;
-    bool        batch_dm   = false;
+    const char *slice_chan = NULL;
+    bool        slice_dm   = false;
 
-    for(size_t r = 0; r < n; r++)
+    for(size_t r = 0; r < n_msgs; r++)
     {
-      if(msgs_out[r].channel[0] == '\0')
-        batch_dm = true;
+      if(msgs[r].channel[0] == '\0')
+        slice_dm = true;
       else
-        batch_chan = msgs_out[r].channel;
+        slice_chan = msgs[r].channel;
     }
 
     for(size_t i = 0; i < np; i++)
@@ -934,23 +952,23 @@ extract_fetch_batch(const char *bot_name, uint32_t ns_id,
       dossier_label(pids[i], parts_out[i].display_label,
           sizeof(parts_out[i].display_label));
 
-      for(size_t r = 0; r < n; r++)
+      for(size_t r = 0; r < n_msgs; r++)
       {
-        if(msgs_out[r].dossier_id != pids[i])
+        if(msgs[r].dossier_id != pids[i])
           continue;
 
         spoke = true;
 
-        if(msgs_out[r].channel[0] == '\0')
+        if(msgs[r].channel[0] == '\0')
           dm = true;
         else
-          chan = msgs_out[r].channel;
+          chan = msgs[r].channel;
       }
 
       if(!spoke)
       {
-        dm   = batch_dm;
-        chan = batch_chan;
+        dm   = slice_dm;
+        chan = slice_chan;
       }
 
       if(!dm && chan != NULL)
@@ -959,9 +977,7 @@ extract_fetch_batch(const char *bot_name, uint32_t ns_id,
     }
   }
 
-  if(n_parts_out != NULL) *n_parts_out = np;
-  if(hwm_out     != NULL) *hwm_out     = new_hwm;
-  return(n);
+  return(np);
 }
 
 // Schedule + real run_once (rate-limited)
@@ -1025,6 +1041,26 @@ rate_check_and_record(extract_sched_t *s, uint32_t max_per_hour)
   return(true);
 }
 
+// Order rows by channel, chronologically within each channel, so a
+// fetched batch becomes contiguous single-channel partitions (the DM
+// partition — channel "" — sorts first). Row ids are unique, so the
+// comparator is a total order and qsort's instability is moot.
+static int
+msg_channel_cmp(const void *a, const void *b)
+{
+  const mem_msg_t *ma = a;
+  const mem_msg_t *mb = b;
+  int              c  = strcmp(ma->channel, mb->channel);
+
+  if(c != 0)
+    return(c);
+
+  if(ma->id == mb->id)
+    return(0);
+
+  return(ma->id < mb->id ? -1 : 1);
+}
+
 size_t
 extract_run_once(const char *bot_name, uint32_t ns_id)
 {
@@ -1032,7 +1068,6 @@ extract_run_once(const char *bot_name, uint32_t ns_id)
   const char *cm;
   mem_msg_t             msgs[EXTRACT_MAX_FACTS];
   extract_participant_t parts[EXTRACT_MAX_PARTS];
-  size_t                n_parts;
   int64_t               new_hwm;
   size_t n_msgs;
   extract_sched_t *s;
@@ -1079,15 +1114,12 @@ extract_run_once(const char *bot_name, uint32_t ns_id)
   pthread_mutex_unlock(&extract_sched_mutex);
 
   // Fetch the batch.
-  n_parts = 0;
   new_hwm = hwm;
 
   n_msgs = extract_fetch_batch(bot_name, ns_id, hwm, batch_cap,
-      msgs, sizeof(msgs)/sizeof(msgs[0]),
-      parts, sizeof(parts)/sizeof(parts[0]),
-      &n_parts, &new_hwm);
+      msgs, sizeof(msgs)/sizeof(msgs[0]), &new_hwm);
 
-  if(n_msgs == 0 || n_parts == 0)
+  if(n_msgs == 0)
     return(0);
 
   // Chat model lookup.
@@ -1102,9 +1134,37 @@ extract_run_once(const char *bot_name, uint32_t ns_id)
     return(0);
   }
 
-  written = extract_dispatch(bot_name, ns_id, cm,
-      parts, n_parts, msgs, n_msgs,
-      min_conf, 0);
+  // Partition the batch by channel before dispatch
+  // (CHAT-EXTRACT-PARTITION-1): each channel's rows extract as their
+  // own LLM call, DM rows as another. The extractor sees a coherent
+  // single-channel transcript and fact provenance is exact — a subject
+  // who spoke in a channel AND by DM within one sweep no longer has
+  // their channel facts guarded down to the DM sentinel. Cost: one LLM
+  // call per distinct channel in the batch; a bot inhabits few
+  // channels and every DM shares one partition, so the fan-out is
+  // small and the batch cap bounds it absolutely.
+  qsort(msgs, n_msgs, sizeof(msgs[0]), msg_channel_cmp);
+
+  written = 0;
+
+  for(size_t lo = 0; lo < n_msgs; )
+  {
+    size_t hi      = lo + 1;
+    size_t n_parts;
+
+    while(hi < n_msgs && strcmp(msgs[hi].channel, msgs[lo].channel) == 0)
+      hi++;
+
+    n_parts = extract_parts_assemble(&msgs[lo], hi - lo,
+        parts, sizeof(parts)/sizeof(parts[0]));
+
+    if(n_parts > 0)
+      written += extract_dispatch(bot_name, ns_id, cm,
+          parts, n_parts, &msgs[lo], hi - lo,
+          min_conf, 0);
+
+    lo = hi;
+  }
 
   // Advance the high-water mark on any successful dispatch so the same
   // rows aren't reprocessed every tick. On hard failure (written == 0

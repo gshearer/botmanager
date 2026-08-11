@@ -100,15 +100,19 @@ typedef struct
   char            display_label[EXTRACT_LABEL_SZ];
   extract_role_t  role;
 
-  // Channel provenance for facts about this participant, resolved per
-  // batch by extract_fetch_batch: the newest channel they spoke in, or
-  // the DM-guard sentinel "" when any of their rows arrived by DM
-  // (privacy-first — a fact that MIGHT derive from a DM is treated as
-  // if it did). A mentioned-only participant said nothing themselves,
-  // so their facts inherit the batch-wide resolution under the same
-  // rule. This is what CHAT-EXTRACT-DMCHAN-1 was about: stamping every
-  // fact with one batch-level channel let DM secrets masquerade as
-  // channel knowledge.
+  // Channel provenance for facts about this participant, resolved by
+  // extract_parts_assemble over exactly the rows it was handed: the
+  // newest channel they spoke in, or the DM-guard sentinel "" when any
+  // of their rows arrived by DM (privacy-first — a fact that MIGHT
+  // derive from a DM is treated as if it did). A mentioned-only
+  // participant said nothing themselves, so their facts inherit the
+  // slice-wide resolution under the same rule. extract_run_once
+  // partitions each sweep batch by channel before assembly
+  // (CHAT-EXTRACT-PARTITION-1), so the rule degenerates to "the
+  // partition's channel" and provenance is exact; over a mixed-channel
+  // slice it stays the conservative safety net CHAT-EXTRACT-DMCHAN-1
+  // introduced — stamping every fact with one batch-level channel had
+  // let DM secrets masquerade as channel knowledge.
   char            channel[MEM_FACT_CHANNEL_SZ];
 } extract_participant_t;
 
@@ -147,29 +151,39 @@ size_t extract_parse_aliases(const char *content, size_t content_len,
     float min_conf,
     extract_alias_t *out, size_t out_cap);
 
-// Synchronous single-batch dispatch. Builds the prompt, calls
+// Pull the next batch of conversation_log rows past the given high-
+// water mark for a bot/namespace into the caller-owned msgs_out
+// [msgs_cap]. Sets *hwm_out to the largest row id observed (caller
+// uses this as the next hwm) or leaves it unchanged on empty batch.
+// Participants are deliberately NOT assembled here: extract_run_once
+// partitions the batch by channel first and assembles per partition.
+//
+// returns: number of messages written to msgs_out (0 on empty/error)
+size_t extract_fetch_batch(const char *bot_name, uint32_t ns_id,
+    int64_t hwm_in, uint32_t batch_cap,
+    mem_msg_t *msgs_out, size_t msgs_cap,
+    int64_t *hwm_out);
+
+// Assemble the participants list for exactly the rows given: unique
+// senders + every referenced dossier (tagged sender/mentioned, first
+// sighting wins the role), display labels, and per-subject channel
+// provenance (see extract_participant_t.channel for the rule).
+//
+// returns: number of participants written to parts_out (0..parts_cap)
+size_t extract_parts_assemble(const mem_msg_t *msgs, size_t n_msgs,
+    extract_participant_t *parts_out, size_t parts_cap);
+
+// Synchronous single-partition dispatch. Builds the prompt, calls
 // llm_chat_submit (blocking until done_cb fires), parses the response,
 // and upserts accepted facts via memory_upsert_dossier_fact with
 // MEM_MERGE_HIGHER_CONF. Bumps llm_calls / llm_errors / facts_written.
 //
 // returns: number of facts written (0 on no-op, error, or all rejected)
 // model_name: registered chat model name (must be non-empty)
-// parts / n_parts, msgs / n_msgs: batch (parts carry channel provenance)
+// parts / n_parts, msgs / n_msgs: one partition (parts carry channel
+//   provenance)
 // min_conf: validation threshold
 // timeout_secs: cap on the blocking wait; 0 -> 60s default
-// Pull the next batch of conversation_log rows past the given high-
-// water mark for a bot/namespace and assemble the participants list.
-// Caller-owned buffers: msgs_out[msgs_cap], parts_out[parts_cap].
-// Sets *hwm_out to the largest row id observed (caller uses this as
-// the next hwm) or leaves it unchanged on empty batch.
-//
-// returns: number of messages written to msgs_out (0 on empty/error)
-size_t extract_fetch_batch(const char *bot_name, uint32_t ns_id,
-    int64_t hwm_in, uint32_t batch_cap,
-    mem_msg_t *msgs_out, size_t msgs_cap,
-    extract_participant_t *parts_out, size_t parts_cap,
-    size_t *n_parts_out, int64_t *hwm_out);
-
 size_t extract_dispatch(const char *bot_name, uint32_t ns_id,
     const char *model_name,
     const extract_participant_t *parts, size_t n_parts,
