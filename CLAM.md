@@ -225,6 +225,7 @@ halves. Same shape as `gemini` / `gemini.ws`.
 | `register` | plugins/bot/chat/dispatch.c | `/register` user creation |
 | `soul` | plugins/bot/chat/soul.c | per-bot heartbeat — chore scheduling, the weather watch, mute skips (`SOUL_CTX`) |
 | `vision` | plugins/bot/chat/vision.c | image-intent path |
+| `voice` | plugins/bot/chat/voice.c | the voice governor — every unprompted cue a budget or a quiet window held back, and why (`VOICE_CTX`) |
 
 ## Extension plugins (`plugins/extension/`)
 

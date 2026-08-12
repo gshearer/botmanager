@@ -987,6 +987,43 @@ void chatbot_deferred_deliver_presence(const char *bot_name, uint32_t ns_id,
 // from chatbot_cmds_register.
 bool chatbot_deferred_register(void);
 
+// ---- voice.c — the voice governor (CARE-3) ----
+
+// How much say the governor gets over a cue. The classes are about who
+// chose the moment, not about what the cue says (CARE-3 §D8).
+typedef enum
+{
+  SOUL_CLASS_TIMED       = 0,   // the human picked it: /remind, /in
+  SOUL_CLASS_ASKED       = 1,   // they asked, the bot picked the moment
+  SOUL_CLASS_UNSOLICITED = 2,   // nobody asked for this one
+} soul_class_t;
+
+// Idempotent chat_soul_voice_log DDL. Called from chatbot_plugin_start
+// after dossier_register_config (the dossier FK target must exist).
+void soul_voice_ensure_schema(void);
+
+// May a cue of this class be spoken at this moment? Pure clock + KV,
+// no DB, no accounting — this is the question a chore asks BEFORE it
+// claims anything durable, because quiet hours mean later and a claim
+// taken inside the window would mean never. TIMED is always open.
+// `severe` passes the quiet window when quiet.override_severe is on.
+bool soul_voice_window_open(const char *bot_name, soul_class_t cls,
+    bool severe);
+
+// The gate every chore calls immediately before submitting a cue: the
+// quiet window plus, for UNSOLICITED, the hourly and per-person
+// budgets. A permitted cue is recorded in the same statement that
+// permits it, so racing chores cannot both spend the last slot.
+// `dossier_id` <= 0 means the cue names no one in particular and only
+// the hourly budget applies. TIMED and ASKED are never refused for
+// budget; TIMED is never refused at all, so its callers record rather
+// than branch. Blocking (sync db_query) — chore threads only.
+bool soul_voice_permits(const char *bot_name, uint32_t ns_id,
+    int64_t dossier_id, soul_class_t cls, bool severe);
+
+// Drop log rows past the retention window. Called once per soul tick.
+void soul_voice_purge(void);
+
 // ---- soul.c — the per-bot heartbeat (SOUL-2) ----
 
 // Idempotent DDL for the soul's own tables (the weather watch's alert

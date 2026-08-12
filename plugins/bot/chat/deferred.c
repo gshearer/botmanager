@@ -81,13 +81,13 @@ typedef enum
 // exactly this shape, which is what lets them share one deliver.
 enum
 {
-  DC_ID = 0, DC_SOURCE, DC_KIND, DC_SENDER, DC_NICKNAME, DC_USERNAME,
-  DC_HOSTNAME, DC_VERIFIED_ID, DC_METADATA, DC_METHOD_NAME, DC_CHANNEL,
-  DC_BODY, DC_CMD_NAME, DC_REPEAT, DC_CREATED, DC_EXPIRED,
+  DC_ID = 0, DC_DOSSIER, DC_SOURCE, DC_KIND, DC_SENDER, DC_NICKNAME,
+  DC_USERNAME, DC_HOSTNAME, DC_VERIFIED_ID, DC_METADATA, DC_METHOD_NAME,
+  DC_CHANNEL, DC_BODY, DC_CMD_NAME, DC_REPEAT, DC_CREATED, DC_EXPIRED,
 };
 
 #define DEFERRED_CLAIM_COLS \
-    "id, source, kind, sender, nickname, username, hostname," \
+    "id, dossier_id, source, kind, sender, nickname, username, hostname," \
     " verified_id, metadata, method_name, channel, body, cmd_name," \
     " repeat_secs, EXTRACT(EPOCH FROM created_at)::BIGINT AS created_epoch," \
     " (expires_at IS NOT NULL AND expires_at < NOW()) AS expired"
@@ -590,6 +590,13 @@ deferred_deliver_row(const char *bot_name, uint32_t ns_id,
       bot_name, kind == DEFERRED_KIND_RUN ? "run" : "say", id, source,
       msg.sender, msg.channel[0] != '\0' ? msg.channel : "DM", ago);
 
+  // Recorded, never gated. A deferred row is TIMED by definition — the
+  // human picked this moment — so the governor cannot refuse it and
+  // the verdict is deliberately not branched on: the call is what puts
+  // the cue in the voice log (CARE-3 §D8).
+  (void)soul_voice_permits(bot_name, ns_id,
+      deferred_col_i64(res, i, DC_DOSSIER, 0), SOUL_CLASS_TIMED, false);
+
   if(kind == DEFERRED_KIND_RUN)
     deferred_deliver_run(st, bot, ns_id, &msg, body, ago);
 
@@ -621,8 +628,10 @@ chatbot_deferred_run_due(const char *bot_name, uint32_t ns_id,
       " ORDER BY due_at ASC LIMIT %d)"
       " RETURNING " DEFERRED_CLAIM_COLS ","
       // Carried past the projection the deliver path reads so the
-      // recurrence INSERT below can copy the row whole.
-      " ns_id, dossier_id, deliver_on_presence, expires_at),"
+      // recurrence INSERT below can copy the row whole. dossier_id is
+      // not repeated here — the claim columns already carry it, and a
+      // duplicate name would make the SELECT below ambiguous.
+      " ns_id, deliver_on_presence, expires_at),"
       " renewed AS ("
       "INSERT INTO chat_deferred"
       " (ns_id, dossier_id, source, kind, sender, nickname, username,"

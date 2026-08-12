@@ -44,7 +44,6 @@
 // many users share them, and a cue spells out at most a few alerts —
 // a 20-county outbreak is one line and a count, not twenty lines.
 #define SOUL_WX_INTERVAL_DEFAULT_SECS 600
-#define SOUL_WX_MAX_PER_HOUR_DEFAULT  4
 #define SOUL_WX_ROWS_MAX              32
 #define SOUL_WX_POINTS_MAX            32
 #define SOUL_WX_WATCHERS_MAX          8
@@ -384,6 +383,7 @@ typedef struct soul_wx_sweep soul_wx_sweep_t;
 // every synthetic cue whole).
 typedef struct
 {
+  int64_t dossier_id;                  // who the per-person budget bills
   char  label[METHOD_NICKNAME_SZ];
   char  city[128];                     // fact_value, as the user typed it
   char  channel[METHOD_CHANNEL_SZ];    // where the fact was observed; "" = DM
@@ -436,6 +436,7 @@ typedef struct
   uint8_t                  alerts[SOUL_WX_CUE_ALERTS_MAX];
   uint8_t                  n_alerts;
   uint8_t                  total;                  // incl. beyond the spell-out cap
+  bool                     severe;                 // any alert severe or worse
 } soul_wx_target_t;
 
 // One distinct CAP alert per sweep, with every point that carries it.
@@ -646,31 +647,6 @@ soul_wx_claim(uint32_t ns_id, const weathergov_alert_t *a)
   return(fresh);
 }
 
-static uint32_t
-soul_wx_hour_count(uint32_t ns_id)
-{
-  db_result_t *res;
-  const char  *cell;
-  char         sql[192];
-  uint32_t     n = 0;
-
-  snprintf(sql, sizeof(sql),
-      "SELECT COUNT(*) FROM chat_soul_alerts_seen WHERE ns_id = %" PRIu32
-      " AND announced_at > NOW() - INTERVAL '1 hour'", ns_id);
-
-  res = db_result_alloc();
-
-  if(res == NULL)
-    return(0);
-
-  if(db_query(sql, res) == SUCCESS && res->ok && res->rows > 0
-      && (cell = db_result_get(res, 0, 0)) != NULL)
-    n = (uint32_t)strtoul(cell, NULL, 10);
-
-  db_result_free(res);
-  return(n);
-}
-
 static bool
 soul_wx_watcher_in_target(const soul_wx_watcher_t *w,
     const soul_wx_target_t *t)
@@ -810,7 +786,7 @@ soul_wx_announce(chatbot_state_t *st, method_inst_t *method,
 }
 
 // The sweep lands here on a task worker once every fetch has answered:
-// claims, the hourly budget, cue grouping and the purge — all the
+// claims, the voice gate, cue grouping and the purge — all the
 // blocking work the curl callback must not do.
 static void
 soul_wx_batch_task(task_t *t)
@@ -822,9 +798,8 @@ soul_wx_batch_task(task_t *t)
   chatbot_state_t       *st       = NULL;
   method_inst_t         *method   = NULL;
   weathergov_severity_t  floor;
-  uint32_t               budget   = 0;
-  uint32_t               cap;
-  uint32_t               capped   = 0;
+  uint32_t               held     = 0;
+  uint32_t               quiet    = 0;
   time_t                 now      = time(NULL);
   char                   key[KV_KEY_SZ];
 
@@ -850,19 +825,6 @@ soul_wx_batch_task(task_t *t)
   if(st != NULL && method != NULL)
   {
     floor = soul_wx_severity_floor(sweep->bot_name);
-
-    snprintf(key, sizeof(key), "bot.%s.behavior.soul.weather.max_per_hour",
-        sweep->bot_name);
-    cap = (uint32_t)kv_get_uint(key);
-
-    if(cap == 0)
-      cap = SOUL_WX_MAX_PER_HOUR_DEFAULT;
-
-    {
-      uint32_t hour = soul_wx_hour_count(sweep->ns_id);
-
-      budget = hour < cap ? cap - hour : 0;
-    }
 
     // Pass 1 — collect the sweep's DISTINCT alerts (by CAP id) across
     // every covered point, remembering each carrying point. See
@@ -931,23 +893,25 @@ soul_wx_batch_task(task_t *t)
     // out to EVERY carrying point's watchers.
     for(uint8_t ui = 0; ui < n_uniq; ui++)
     {
-      soul_wx_uniq_t   *u = &uniq[ui];
+      soul_wx_uniq_t   *u      = &uniq[ui];
+      bool              severe = u->a->severity >= WEATHERGOV_SEV_SEVERE;
       soul_wx_target_t *seen[SOUL_WX_ROWS_MAX];   // distinct targets, not one point's watchers
       uint8_t           n_seen = 0;
 
-      if(!soul_wx_claim(sweep->ns_id, u->a))
-        continue;
-
-      if(budget == 0)
+      // Quiet hours are asked about BEFORE the claim, and only quiet
+      // hours: a window that closes at 8am must find the alert still
+      // unclaimed and still active, so an overnight watch is late
+      // rather than lost. The budget below is the opposite case on
+      // purpose — see the announce loop.
+      if(!soul_voice_window_open(sweep->bot_name, SOUL_CLASS_UNSOLICITED,
+          severe))
       {
-        // Deliberate: the claim above already recorded this alert as
-        // seen, so a storm capped mid-outbreak does NOT re-announce
-        // when the cap lifts — silence now is silence for good.
-        capped++;
+        quiet++;
         continue;
       }
 
-      budget--;
+      if(!soul_wx_claim(sweep->ns_id, u->a))
+        continue;
 
       // Route once per DISTINCT target across all carriers — two users
       // in one channel share a cue line however many points they watch;
@@ -986,18 +950,43 @@ soul_wx_batch_task(task_t *t)
             tg->n_alerts++;
           }
 
+          tg->severe = tg->severe || severe;
           tg->total++;
         }
       }
     }
 
-    if(capped > 0)
+    if(quiet > 0)
       clam(CLAM_INFO, SOUL_CTX,
-          "bot=%s weather cap: %u fresh alert(s) claimed but unspoken"
-          " (max_per_hour)", sweep->bot_name, capped);
+          "bot=%s weather: %u alert(s) left unclaimed for quiet hours"
+          " — they re-offer when the window closes",
+          sweep->bot_name, quiet);
 
+    // The voice gate, once per cue rather than once per alert: a
+    // twenty-county outbreak is one thing said to one room, and the
+    // budget counts what the bot SAYS. A target refused here keeps its
+    // claims, so an outbreak that overruns the budget stays silent
+    // instead of arriving an hour late — the semantic the bespoke
+    // weather cap had, now shared with every other chore.
     for(uint8_t i = 0; i < n_targets; i++)
-      soul_wx_announce(st, method, &targets[i], now);
+    {
+      const soul_wx_target_t *tg = &targets[i];
+
+      if(!soul_voice_permits(sweep->bot_name, sweep->ns_id,
+          tg->dm_watcher != NULL ? tg->dm_watcher->dossier_id : 0,
+          SOUL_CLASS_UNSOLICITED, tg->severe))
+      {
+        held++;
+        continue;
+      }
+
+      soul_wx_announce(st, method, tg, now);
+    }
+
+    if(held > 0)
+      clam(CLAM_INFO, SOUL_CTX,
+          "bot=%s weather: %u cue(s) claimed but unspoken (voice budget)",
+          sweep->bot_name, held);
   }
 
   else
@@ -1092,7 +1081,7 @@ soul_chore_weather(soul_sched_t *s, uint32_t chore,
       "SELECT DISTINCT ON (df.dossier_id) df.fact_value, df.channel,"
       " d.display_label, COALESCE(sg.nickname,''),"
       " COALESCE(sg.username,''), COALESCE(sg.hostname,''),"
-      " COALESCE(sg.verified_id,'')"
+      " COALESCE(sg.verified_id,''), df.dossier_id"
       " FROM dossier_facts df"
       " JOIN dossier d ON d.id = df.dossier_id"
       " LEFT JOIN LATERAL (SELECT nickname, username, hostname,"
@@ -1143,6 +1132,7 @@ soul_chore_weather(soul_sched_t *s, uint32_t chore,
   {
     soul_wx_point_t   *pt = NULL;
     soul_wx_watcher_t *w;
+    const char        *did;
     double             lat;
     double             lon;
     char               city[128];
@@ -1200,6 +1190,12 @@ soul_chore_weather(soul_sched_t *s, uint32_t chore,
     w = &pt->watchers[pt->n_watchers++];
     snprintf(w->label, sizeof(w->label), "%s", label);
     snprintf(w->city,  sizeof(w->city),  "%s", city);
+
+    // Only a DM cue bills a person — see the announce loop — but the
+    // id rides every watcher so the two target kinds stay symmetric.
+    did           = db_result_get(res, i, 7);
+    w->dossier_id = did != NULL ? strtoll(did, NULL, 10) : 0;
+
     soul_copy_col(w->channel,     sizeof(w->channel),     res, i, 1);
     soul_copy_col(w->nickname,    sizeof(w->nickname),    res, i, 3);
     soul_copy_col(w->username,    sizeof(w->username),    res, i, 4);
@@ -1312,6 +1308,10 @@ soul_tick_cb(task_t *t)
   }
 
   now = time(NULL);
+
+  // The voice log is accounting, not memory: two days is longer than
+  // either budget window and long enough to answer for last night.
+  soul_voice_purge();
 
   for(uint32_t i = 0; i < SOUL_CHORE_COUNT; i++)
   {

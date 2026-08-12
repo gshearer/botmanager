@@ -192,10 +192,37 @@ static const plugin_kv_entry_t chatbot_inst_schema[] = {
     "Announcement floor: minor, moderate, severe or extreme. Alerts"
     " graded below it are never claimed or spoken; unrecognized values"
     " read as severe.", NULL },
-  { "behavior.soul.weather.max_per_hour", KV_UINT32, "4",
-    "Alerts announced per hour per namespace. Fresh alerts beyond the"
-    " cap are claimed as seen but never spoken — a capped storm stays"
-    " silent when the cap lifts, deliberately. 0 = the default 4.", NULL },
+  // --- behavior.soul.budget.* / .quiet.* — the voice governor (CARE-3)
+  // One gate for every chore: how often the bot may speak unprompted,
+  // and when it must not. Weather used to carry its own hourly cap and
+  // no longer does — chore-local throttles make a bot per-chore polite
+  // and aggregately rude.
+  { "behavior.soul.budget.unsolicited_per_hour", KV_UINT32, "4",
+    "Cues per rolling hour, namespace-wide, that nobody asked for —"
+    " weather warnings, occasions, follow-ups. Reminders and scheduled"
+    " commands are exempt (the human picked those moments). A cue"
+    " refused here is silent for good, not delayed: the chore has"
+    " already claimed its work. 0 silences every unprompted chore at"
+    " once.", NULL },
+  { "behavior.soul.budget.per_person_per_day", KV_UINT32, "2",
+    "Unsolicited cues per rolling day that name one person — the DM"
+    " half of the budget above. A cue addressed to a channel pays only"
+    " the hourly budget. 0 silences unprompted speech to individuals.",
+    NULL },
+  { "behavior.soul.quiet.start_hour", KV_UINT32, "23",
+    "Hour (0-23, server-local) the quiet window opens. Inside it the"
+    " bot still answers when spoken to and still delivers reminders and"
+    " scheduled commands on time; everything it would have raised by"
+    " itself waits for the window to close. Equal to end_hour, or"
+    " out of range, disables quiet hours.", NULL },
+  { "behavior.soul.quiet.end_hour", KV_UINT32, "8",
+    "Hour (0-23, server-local) the quiet window closes. A window that"
+    " wraps midnight (23 to 8) is the normal case and is read as such.",
+    NULL },
+  { "behavior.soul.quiet.override_severe", KV_BOOL, "true",
+    "Let severe and extreme weather through the quiet window. The one"
+    " thing worth waking someone for; turn it off and a tornado warning"
+    " waits until morning like everything else.", NULL },
   { "behavior.coalesce_ms", KV_UINT32, "1500",
     "Paste coalescing window in milliseconds. Consecutive lines from the"
     " same sender are buffered and treated as a single message once the"
@@ -2369,9 +2396,11 @@ chatbot_plugin_start(void)
 {
   memory_ensure_schema();
   dossier_register_config();
-  // After dossier DDL: chat_deferred FKs into dossier(id).
+  // After dossier DDL: chat_deferred and chat_soul_voice_log both FK
+  // into dossier(id).
   soul_ensure_schema();
   chatbot_deferred_ensure_schema();
+  soul_voice_ensure_schema();
   // Identity scoring is plugin-local and protocol-agnostic: protocol
   // plugins emit the four-field identity tuple on method_msg_t and
   // identity.c scores it uniformly. No registry, no cross-plugin
