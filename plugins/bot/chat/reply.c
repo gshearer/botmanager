@@ -1229,6 +1229,16 @@ anti_repeat_jaccard_pct(const char *a, const char *b)
 // or above r->anti_repeat_threshold_pct. Emits a single WARN clam on
 // the first matching slot so log readers can see why a line didn't
 // make it to the wire.
+//
+// CV13-DIRECT — a directly-addressed turn is exempt. A human asked the
+// same question twice repeats the answer; the guard was dropping the
+// only line a waiting user was owed and CV-4's fallback cannot catch
+// it (that gate needs a SKIP sentinel, which a suppressed repeat never
+// produces). The exemption lives here rather than at the call site so
+// the match still costs its trigram pass and reports the jaccard it
+// forgave — a forgiven repeat stays visible in a trace instead of
+// vanishing. Everything non-direct — witness, volunteer, chore cue —
+// is guarded exactly as before, which is where catchphrase spam lives.
 static bool
 anti_repeat_blocks_line(const chatbot_req_t *r, const char *line)
 {
@@ -1242,6 +1252,16 @@ anti_repeat_blocks_line(const chatbot_req_t *r, const char *line)
         r->recent_replies[i].text);
     if(pct >= r->anti_repeat_threshold_pct)
     {
+      if(r->is_direct_address)
+      {
+        clam(CLAM_DEBUG, "chatbot",
+            "bot=%s persona=%s: CV-13 allowed (direct address)"
+            " jaccard=%u%% threshold=%u%% slot=%zu line=\"%.80s\"",
+            bot_inst_name(r->st->inst), r->personality_name,
+            pct, r->anti_repeat_threshold_pct, i, line);
+        return(false);
+      }
+
       clam(CLAM_WARN, "chatbot",
           "bot=%s persona=%s: CV-13 near-repeat suppressed"
           " (jaccard=%u%% threshold=%u%% slot=%zu line=\"%.80s\")",
@@ -1294,7 +1314,8 @@ send_line_marked(chatbot_req_t *r, const char *line, bool emote)
 // the CV-6 recent-replies slice via trigram Jaccard; lines above the
 // configured percent are dropped silently (WARN-logged) so a model
 // that ignored the soft "do not repeat" instruction in the prompt
-// can't put a verbatim copy of a prior reply on the wire.
+// can't put a verbatim copy of a prior reply on the wire. A directly
+// addressed turn is exempt — see anti_repeat_blocks_line.
 static void
 send_reply_line(chatbot_req_t *r, const char *line)
 {
