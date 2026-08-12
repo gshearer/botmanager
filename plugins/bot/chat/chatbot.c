@@ -171,6 +171,12 @@ static const plugin_kv_entry_t chatbot_inst_schema[] = {
     " reminders and scheduled commands together. A further /remind or"
     " /in is refused until one fires or is cancelled. 0 = the default"
     " 10.", NULL },
+  { "behavior.soul.deferred.back_quiet_secs", KV_UINT32, "1800",
+    "How long 'back' waits before it starts watching for you. '/in back"
+    " <command>' and '/remind back <message>' hold their work until you"
+    " are next seen speaking, but you are speaking when you ask — so the"
+    " row stays disarmed for this long first, and the next thing you say"
+    " after that delivers it. 0 = the default 1800 (30 minutes).", NULL },
   { "behavior.soul.weather.enabled", KV_BOOL, "false",
     "Proactive weather watch: each sweep scans the namespace's"
     " city_of_interest facts (written by the NL bridge observer after"

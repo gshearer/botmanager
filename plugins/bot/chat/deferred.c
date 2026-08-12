@@ -55,6 +55,15 @@
 
 #define DEFERRED_MAX_PENDING_DEFAULT 10
 
+// The word that buys a presence row instead of a timed one, and how
+// long it stays disarmed first. You are, necessarily, present when you
+// ask for "when I'm back" — so the row waits out a floor before it
+// starts watching, and the next thing you say after that delivers it.
+// Long enough that it does not fire into the same conversation; short
+// enough that a coffee break counts as being away.
+#define DEFERRED_BACK_WORD           "back"
+#define DEFERRED_BACK_QUIET_DEFAULT  1800
+
 // Rendered rows per `in list` / `show deferred` page. A list longer
 // than this is a paging problem, not a listing problem.
 #define DEFERRED_LIST_MAX       20
@@ -260,7 +269,7 @@ deferred_pending_for(uint32_t ns_id, const char *owner_pred)
 static bool
 deferred_insert(uint32_t ns_id, int64_t dossier, const method_msg_t *msg,
     const char *method_name, const char *source, deferred_kind_t kind,
-    const char *body, const char *cmd_name, uint64_t secs)
+    const char *body, const char *cmd_name, uint64_t secs, bool on_presence)
 {
   // Escaped in one array so the all-or-nothing guard and the release
   // are each one loop; E_COUNT keeps the two from drifting apart.
@@ -299,17 +308,24 @@ deferred_insert(uint32_t ns_id, int64_t dossier, const method_msg_t *msg,
     else
       snprintf(dossier_cell, sizeof(dossier_cell), "NULL");
 
+    // A presence row gets the same 30-day horizon a timed one is capped
+    // at. Somebody who never comes back would otherwise hold a slot
+    // against their own pending cap forever; the tick's expiry sweep
+    // drops it unspoken, which is the honest end for work whose moment
+    // never arrived.
     snprintf(sql, sizeof(sql),
         "INSERT INTO chat_deferred"
         " (ns_id, dossier_id, source, kind, sender, nickname, username,"
         "  hostname, verified_id, metadata, method_name, channel, body,"
-        "  cmd_name, due_at)"
+        "  cmd_name, deliver_on_presence, due_at, expires_at)"
         " VALUES (%" PRIu32 ", %s, '%s', %d, '%s', '%s', '%s', '%s',"
-        " '%s', '%s', '%s', '%s', '%s', '%s',"
-        " NOW() + %llu * INTERVAL '1 second')",
+        " '%s', '%s', '%s', '%s', '%s', '%s', %s,"
+        " NOW() + %llu * INTERVAL '1 second', %s)",
         ns_id, dossier_cell, source, (int)kind, e[E_SENDER], e[E_NICK],
         e[E_USER], e[E_HOST], e[E_VID], e[E_META], e[E_METH], e[E_CHAN],
-        e[E_BODY], e[E_CMD], (unsigned long long)secs);
+        e[E_BODY], e[E_CMD], on_presence ? "TRUE" : "FALSE",
+        (unsigned long long)secs,
+        on_presence ? "NOW() + INTERVAL '30 days'" : "NULL");
 
     ok = deferred_exec(sql);
   }
@@ -764,6 +780,7 @@ typedef struct
   const char      *method_name;
   char             owner_pred[768];
   uint64_t         secs;
+  bool             on_presence;
 } deferred_ask_t;
 
 static bool
@@ -774,11 +791,31 @@ deferred_ask_open(const cmd_ctx_t *ctx, const char *duration,
   uint32_t cap;
 
   memset(a, 0, sizeof(*a));
-  a->secs = chatbot_parse_duration_secs(duration);
+
+  // "back" is a moment, not a length — the one place the two kinds of
+  // moment meet a user. It rides the duration slot rather than a flag
+  // or a child verb so that both verbs get it, and so `in list`, `in
+  // cancel` and the pending cap need to know nothing new. The floor it
+  // resolves to is when the row starts WATCHING, not when it speaks.
+  a->on_presence = (strcasecmp(duration, DEFERRED_BACK_WORD) == 0);
+
+  if(a->on_presence)
+  {
+    snprintf(key, sizeof(key), "bot.%s.behavior.soul.deferred.back_quiet_secs",
+        bot_inst_name(ctx->bot));
+    a->secs = (uint64_t)kv_get_uint(key);
+
+    if(a->secs == 0)
+      a->secs = DEFERRED_BACK_QUIET_DEFAULT;
+  }
+
+  else
+    a->secs = chatbot_parse_duration_secs(duration);
 
   if(a->secs == 0)
   {
-    cmd_reply(ctx, "bad duration (use e.g. 30s, 5m, 2h, 1d)");
+    cmd_reply(ctx, "bad duration (use e.g. 30s, 5m, 2h, 1d — or 'back'"
+        " to wait until you're next around)");
     return(FAIL);
   }
 
@@ -864,19 +901,25 @@ cmd_remind(const cmd_ctx_t *ctx)
 
   if(deferred_insert(a.ns->id, chatbot_resolve_dossier(a.st, ctx->msg),
       ctx->msg, a.method_name, "remind", DEFERRED_KIND_SAY,
-      ctx->parsed->argv[1], NULL, a.secs) != SUCCESS)
+      ctx->parsed->argv[1], NULL, a.secs, a.on_presence) != SUCCESS)
   {
     cmd_reply(ctx, "failed to store the reminder");
     return;
   }
 
   clam(CLAM_INFO, DEFERRED_CTX,
-      "bot=%s reminder set by %s for %s in '%s' (%llu s)",
+      "bot=%s reminder set by %s for %s in '%s' (%llu s%s)",
       bot_inst_name(ctx->bot), ctx->msg->sender, ctx->parsed->argv[0],
-      ctx->msg->channel, (unsigned long long)a.secs);
+      ctx->msg->channel, (unsigned long long)a.secs,
+      a.on_presence ? ", on presence" : "");
 
-  snprintf(ack, sizeof(ack), "noted — I'll remind you in %s.",
-      ctx->parsed->argv[0]);
+  if(a.on_presence)
+    snprintf(ack, sizeof(ack), "noted — I'll remind you when you're back.");
+
+  else
+    snprintf(ack, sizeof(ack), "noted — I'll remind you in %s.",
+        ctx->parsed->argv[0]);
+
   cmd_reply(ctx, ack);
 }
 
@@ -944,9 +987,15 @@ cmd_in(const cmd_ctx_t *ctx)
     return;
   }
 
-  if(strcasecmp(verb, "in") == 0)
+  // Deferring a deferral is always nonsense, and it is not only `/in
+  // in` — `/in back remind about the PR` parses, passes every other
+  // gate (remind exists and is NL-capable) and stores a row that can
+  // only ever refuse itself, because at fire time /remind reads "about"
+  // as its duration. Observed from the bridge 2026-08-12, not imagined.
+  if(strcasecmp(verb, "in") == 0 || strcasecmp(verb, "remind") == 0)
   {
-    cmd_reply(ctx, "I can't defer a deferral — name a real command");
+    cmd_reply(ctx, "I can't defer a deferral — ask me directly and I'll"
+        " hold it myself");
     return;
   }
 
@@ -997,20 +1046,26 @@ cmd_in(const cmd_ctx_t *ctx)
 
   if(deferred_insert(a.ns->id, chatbot_resolve_dossier(a.st, ctx->msg),
       ctx->msg, a.method_name, "in", DEFERRED_KIND_RUN, body, verb,
-      a.secs) != SUCCESS)
+      a.secs, a.on_presence) != SUCCESS)
   {
     cmd_reply(ctx, "failed to store it");
     return;
   }
 
   clam(CLAM_INFO, DEFERRED_CTX,
-      "bot=%s deferred '%s' set by %s for %s in '%s' (%llu s)",
+      "bot=%s deferred '%s' set by %s for %s in '%s' (%llu s%s)",
       bot_inst_name(ctx->bot), body, ctx->msg->sender,
       ctx->parsed->argv[0], ctx->msg->channel,
-      (unsigned long long)a.secs);
+      (unsigned long long)a.secs, a.on_presence ? ", on presence" : "");
 
-  snprintf(ack, sizeof(ack), "alright — I'll run %s in %s.",
-      body, ctx->parsed->argv[0]);
+  if(a.on_presence)
+    snprintf(ack, sizeof(ack), "alright — I'll run %s when you're back.",
+        body);
+
+  else
+    snprintf(ack, sizeof(ack), "alright — I'll run %s in %s.",
+        body, ctx->parsed->argv[0]);
+
   cmd_reply(ctx, ack);
 }
 
@@ -1031,9 +1086,28 @@ deferred_render(const cmd_ctx_t *ctx, const db_result_t *res, bool with_who)
     char        src  [24];
     char        venue[METHOD_CHANNEL_SZ];
     char        body [192];
+    const char *pres = db_result_get(res, i, 7);
     int64_t     secs = deferred_col_i64(res, i, 4, 0);
+    bool        back = (pres != NULL && (pres[0] == 't' || pres[0] == 'T'));
+
+    char        when [48];
 
     util_fmt_duration(secs > 0 ? (time_t)secs : 0, due, sizeof(due));
+
+    // A presence row has no due time to render — its moment is a
+    // person. While it counts out its quiet floor it is not even
+    // watching yet, and "in 20m" would promise a delivery that only a
+    // sighting can cause. Third person on purpose: the admin view
+    // renders the same string about somebody else.
+    if(back)
+      snprintf(when, sizeof(when), "when back%s", secs > 0 ? " (arming)" : "");
+
+    else if(secs > 0)
+      snprintf(when, sizeof(when), "in %s", due);
+
+    else
+      snprintf(when, sizeof(when), "now");
+
     deferred_copy_col(id,    sizeof(id),    res, i, 0);
     deferred_copy_col(src,   sizeof(src),   res, i, 1);
     deferred_copy_col(body,  sizeof(body),  res, i, 3);
@@ -1048,23 +1122,22 @@ deferred_render(const cmd_ctx_t *ctx, const db_result_t *res, bool with_who)
     }
 
     snprintf(line, sizeof(line),
-        "  " CLR_BOLD "%s" CLR_RESET "  %s%s/%s  in %s  %s: %s",
+        "  " CLR_BOLD "%s" CLR_RESET "  %s%s/%s  %s  %s: %s",
         id, who, src,
         deferred_col_i64(res, i, 2, DEFERRED_KIND_SAY) == DEFERRED_KIND_RUN
             ? "run" : "say",
-        secs > 0 ? due : "now",
-        venue[0] != '\0' ? venue : "DM", body);
+        when, venue[0] != '\0' ? venue : "DM", body);
 
     cmd_reply(ctx, line);
   }
 }
 
-// Columns 0..6 are what deferred_render reads; every listing query
+// Columns 0..7 are what deferred_render reads; every listing query
 // below produces exactly this shape.
 #define DEFERRED_LIST_COLS \
     "id, source, kind, body," \
     " GREATEST(0, EXTRACT(EPOCH FROM (due_at - NOW()))::BIGINT)," \
-    " channel, COALESCE(NULLIF(nickname,''), sender)"
+    " channel, COALESCE(NULLIF(nickname,''), sender), deliver_on_presence"
 
 static void
 cmd_in_list(const cmd_ctx_t *ctx)
@@ -1273,13 +1346,26 @@ static const cmd_nl_example_t in_examples[] = {
     .invocation = "/in 1h lights off outside" },
   { .utterance  = "check the weather in 45069 in 20 minutes",
     .invocation = "/in 20m weather 45069" },
+  { .utterance  = "run the weather for 45069 next time I show up",
+    .invocation = "/in back weather 45069" },
 };
 
 static const cmd_nl_t in_nl = {
+  // ⚠⚠ `.when` is the ROUTING field — it is what decides /in against
+  // /remind — and it is deliberately byte-identical to the pre-'back'
+  // wording. Measured 2026-08-12: adding one clause about the 'back'
+  // duration here pulled "remind me in 20 minutes to water the
+  // tomatoes" (a canonical /remind utterance, no 'back' in it at all)
+  // onto /in, which then refused because 'water' is not a verb. The
+  // same probe routed correctly on the binary one commit earlier. A
+  // form change belongs in .syntax and .examples; never buy it with a
+  // clause in the field that carries the choice.
   .when          = "Someone asks you to DO something later — run a"
                    " command, check something, or act at a future time"
                    " (not merely be reminded).",
-  .syntax        = "/in <duration> <command and its arguments>",
+  .syntax        = "/in <duration|back> <command and its arguments>"
+                   " — 'back' means when they are next seen speaking,"
+                   " instead of after a length of time",
   .slots         = in_slots,
   .slot_count    = (uint8_t)(sizeof(in_slots) / sizeof(in_slots[0])),
   .examples      = in_examples,
@@ -1301,12 +1387,18 @@ static const cmd_nl_example_t remind_examples[] = {
     .invocation = "/remind 20m flip the steaks" },
   { .utterance  = "poke me about the laundry in two hours",
     .invocation = "/remind 2h the laundry" },
+  { .utterance  = "remind me when I'm back to look at the pull request",
+    .invocation = "/remind back look at the pull request" },
 };
 
 static const cmd_nl_t remind_nl = {
+  // Left byte-identical for the same reason as /in's — see the note
+  // above the sibling field.
   .when          = "Someone asks to be reminded of something after a"
                    " delay, or asks you to poke them later.",
-  .syntax        = "/remind <duration> <message>",
+  .syntax        = "/remind <duration|back> <message>"
+                   " — 'back' means when they are next seen speaking,"
+                   " instead of after a length of time",
   .slots         = remind_slots,
   .slot_count    = (uint8_t)(sizeof(remind_slots) / sizeof(remind_slots[0])),
   .examples      = remind_examples,
@@ -1319,7 +1411,7 @@ bool
 chatbot_deferred_register(void)
 {
   if(cmd_register("chat", "remind",
-        "remind <duration> <message>",
+        "remind <duration|back> <message>",
         "Set a reminder the bot delivers when it comes due",
         "Stores a reminder and delivers it in the bot's own voice once\n"
         "due (checked every behavior.soul.interval_secs, default 60 s).\n"
@@ -1327,7 +1419,13 @@ chatbot_deferred_register(void)
         "channel it is delivered there; set in a DM it comes back as a\n"
         "DM. Sugar over the same deferred spine /in uses, so 'in list'\n"
         "and 'in cancel' see reminders too. Survives restarts and\n"
-        "reloads.",
+        "reloads.\n"
+        "\n"
+        "Say 'back' instead of a duration to be reminded when you are\n"
+        "next around rather than at a set time. Since you are here when\n"
+        "you ask, it waits out a quiet period first\n"
+        "(behavior.soul.deferred.back_quiet_secs, default 30 min) and\n"
+        "then delivers on the next thing you say.",
         USERNS_GROUP_EVERYONE, 0, CMD_SCOPE_ANY, METHOD_T_ANY,
         cmd_remind, NULL, NULL, NULL,
         ad_remind, (uint8_t)(sizeof(ad_remind) / sizeof(ad_remind[0])),
@@ -1335,7 +1433,7 @@ chatbot_deferred_register(void)
     return(FAIL);
 
   if(cmd_register("chat", "in",
-        "in <duration> <command> [args]",
+        "in <duration|back> <command> [args]",
         "Run a command later, as you, and report back in voice",
         "Schedules any conversational command to run after a delay, in\n"
         "your name: 'in 20m weather 45069'. When it fires the bot runs\n"
@@ -1347,7 +1445,13 @@ chatbot_deferred_register(void)
         "Only commands the bot can reach conversationally qualify, and\n"
         "only top-level ones. Durations read like 30s, 5m, 2h or 1d, up\n"
         "to 30 days. 'in list' shows what you have pending; 'in cancel\n"
-        "<id>' drops one.",
+        "<id>' drops one.\n"
+        "\n"
+        "Say 'back' instead of a duration — 'in back weather 45069' —\n"
+        "to have it run when you are next around rather than at a set\n"
+        "time. Since you are here when you ask, it waits out a quiet\n"
+        "period first (behavior.soul.deferred.back_quiet_secs, default\n"
+        "30 min) and then runs on the next thing you say.",
         USERNS_GROUP_EVERYONE, 0, CMD_SCOPE_ANY, METHOD_T_ANY,
         cmd_in, NULL, NULL, NULL,
         ad_in, (uint8_t)(sizeof(ad_in) / sizeof(ad_in[0])),
