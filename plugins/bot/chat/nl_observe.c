@@ -220,7 +220,7 @@ nl_observe_task(task_t *t)
   fact.observed_at = now;
   fact.last_seen   = now;
 
-  if(memory_upsert_dossier_fact(&fact, MEM_MERGE_HIGHER_CONF) != SUCCESS)
+  if(memory_upsert_dossier_fact(&fact, MEM_MERGE_OBSERVE) != SUCCESS)
     clam(CLAM_DEBUG, OBS_CTX,
         "upsert city_of_interest='%s' FAIL did=%lld",
         d->user_label, (long long)did);

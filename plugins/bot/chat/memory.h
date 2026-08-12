@@ -33,12 +33,39 @@ typedef enum
   MEM_MSG_EXCHANGE_OUT = 2    // bot's own reply
 } mem_msg_kind_t;
 
-// Merge policies for memory_upsert_dossier_fact().
+// Merge policies for memory_upsert_dossier_fact(). There are two, and
+// the second is the interesting one (FACT-1).
+//
+// MEM_MERGE_OBSERVE resolves one incoming observation of
+// (dossier, kind, key) against the stored row as exactly one of:
+//
+//   affirm   same value — refresh the evidence clock, never lower the
+//            confidence, and upgrade the attribution if the affirming
+//            source outranks the stored one. Evidence is evidence,
+//            whoever brings it.
+//   replace  different value from a source allowed to override — new
+//            value, new confidence AS GIVEN (no GREATEST floor: that is
+//            how rows pinned themselves at 1.0 and became immutable),
+//            new clock.
+//   reject   different value from a source that may not override — the
+//            row is left BYTE-IDENTICAL, last_seen included. Prompt
+//            injection orders facts by last_seen, so bumping it on a
+//            rejected correction would promote the stale value.
+//
+// The ladder deciding "allowed to override" is admin_seed(3) >
+// user_stated(2) > llm_extract / nl_observe / anything unknown (1).
+// Higher rank replaces at any confidence; equal rank replaces at >=
+// confidence, because facts describe mutable state and recency should
+// win a tie; lower rank never replaces a differing value but may affirm
+// an equal one. That single rule is also what keeps the hourly
+// extraction sweep in its place: it fills gaps, people correct.
+//
+// MEM_MERGE_REPLACE is the admin door (`/dossier fact set`) and means
+// exactly what it says.
 typedef enum
 {
   MEM_MERGE_REPLACE,          // overwrite value unconditionally
-  MEM_MERGE_HIGHER_CONF,      // overwrite only if new confidence is higher
-  MEM_MERGE_APPEND_HISTORY    // keep old, append new value with a separator
+  MEM_MERGE_OBSERVE           // affirm / replace / reject, per the ladder
 } mem_merge_t;
 
 // A single fact row as delivered to a retrieval callback. Facts are
@@ -333,6 +360,30 @@ bool memory_test_inject_embedding(int64_t id, const char *model,
 // Buffer sizes used across helpers.
 #define MEM_SQL_SZ      4096
 #define MEM_ERR_SZ      256
+
+// MEM_MERGE_OBSERVE's decision table, as SQL. Every fragment references
+// COLUMNS only — never an interpolated value — so these are literals the
+// upsert pastes into its ON CONFLICT clause, and the three places the
+// ladder appears cannot drift apart. Semantics: see mem_merge_t.
+#define MEM_SRC_RANK(col) \
+    "CASE " col " WHEN 'admin_seed' THEN 3" \
+    " WHEN 'user_stated' THEN 2 ELSE 1 END"
+
+#define MEM_FACT_AFFIRM \
+    "(EXCLUDED.fact_value = dossier_facts.fact_value)"
+
+#define MEM_FACT_REPLACES \
+    "(NOT " MEM_FACT_AFFIRM " AND (" \
+      MEM_SRC_RANK("EXCLUDED.source") " > " \
+      MEM_SRC_RANK("dossier_facts.source") \
+      " OR (" MEM_SRC_RANK("EXCLUDED.source") " = " \
+      MEM_SRC_RANK("dossier_facts.source") \
+      " AND EXCLUDED.confidence >= dossier_facts.confidence)))"
+
+#define MEM_FACT_UPGRADES \
+    "(" MEM_FACT_AFFIRM " AND " \
+      MEM_SRC_RANK("EXCLUDED.source") " > " \
+      MEM_SRC_RANK("dossier_facts.source") ")"
 
 // Cached configuration values (refreshed from KV on change).
 typedef struct

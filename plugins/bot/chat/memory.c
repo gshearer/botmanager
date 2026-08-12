@@ -852,6 +852,7 @@ memory_upsert_dossier_fact(const mem_dossier_fact_t *fact,
   db_result_t *res;
   bool ok;
   size_t cap;
+  int n;
   char *sql;
   char *e_key;
   char *e_val;
@@ -875,13 +876,19 @@ memory_upsert_dossier_fact(const mem_dossier_fact_t *fact,
     return(FAIL);
   }
 
-  cap = MEM_SQL_SZ + MEM_FACT_VALUE_SZ * 2;
+  // OBSERVE's decision table renders to roughly 4 KiB of SQL on its
+  // own, and db_escape can double every value it was handed, so the
+  // buffer is sized for the statement plus escaped worst cases rather
+  // than for the values alone. The length check below is the backstop:
+  // a truncated statement would be a syntactically valid-looking prefix.
+  cap = MEM_SQL_SZ * 2 + MEM_FACT_VALUE_SZ * 3;
   sql = mem_alloc("memory", "upsert_p_sql", cap);
+  n   = 0;
 
   switch(policy)
   {
     case MEM_MERGE_REPLACE:
-      snprintf(sql, cap,
+      n = snprintf(sql, cap,
           "INSERT INTO dossier_facts"
           " (dossier_id, kind, fact_key, fact_value, source, channel, confidence)"
           " VALUES (%" PRId64 ", %d, '%s', '%s', '%s', '%s', %f)"
@@ -895,34 +902,36 @@ memory_upsert_dossier_fact(const mem_dossier_fact_t *fact,
           (double)fact->confidence);
       break;
 
-    case MEM_MERGE_HIGHER_CONF:
-      snprintf(sql, cap,
+    // One statement, one round trip, and a WHERE that makes rejection
+    // mean *untouched* rather than "written back identically" — the
+    // difference matters, because a no-op UPDATE still bumps nothing
+    // but a written-back last_seen would reorder the prompt.
+    //
+    // observed_at is refreshed here too, and that single assignment is
+    // the whole of the decay fix: the clock measures how stale the
+    // EVIDENCE is, so an accepted observation restarts it. Nothing
+    // else refreshes it, which is exactly why the legacy drift-pile
+    // still ages out on the existing schedule.
+    case MEM_MERGE_OBSERVE:
+      n = snprintf(sql, cap,
           "INSERT INTO dossier_facts"
           " (dossier_id, kind, fact_key, fact_value, source, channel, confidence)"
           " VALUES (%" PRId64 ", %d, '%s', '%s', '%s', '%s', %f)"
           " ON CONFLICT (dossier_id, kind, fact_key) DO UPDATE"
-          " SET fact_value = CASE WHEN EXCLUDED.confidence > dossier_facts.confidence"
+          " SET fact_value  = CASE WHEN " MEM_FACT_REPLACES
           "         THEN EXCLUDED.fact_value ELSE dossier_facts.fact_value END,"
-          "     source     = CASE WHEN EXCLUDED.confidence > dossier_facts.confidence"
-          "         THEN EXCLUDED.source     ELSE dossier_facts.source     END,"
-          "     channel    = CASE WHEN EXCLUDED.confidence > dossier_facts.confidence"
-          "         THEN EXCLUDED.channel    ELSE dossier_facts.channel    END,"
-          "     confidence = GREATEST(dossier_facts.confidence, EXCLUDED.confidence),"
-          "     last_seen  = NOW()",
-          fact->dossier_id, (int)fact->kind, e_key, e_val, e_src, e_chan,
-          (double)fact->confidence);
-      break;
-
-    case MEM_MERGE_APPEND_HISTORY:
-      snprintf(sql, cap,
-          "INSERT INTO dossier_facts"
-          " (dossier_id, kind, fact_key, fact_value, source, channel, confidence)"
-          " VALUES (%" PRId64 ", %d, '%s', '%s', '%s', '%s', %f)"
-          " ON CONFLICT (dossier_id, kind, fact_key) DO UPDATE"
-          " SET fact_value = dossier_facts.fact_value || E'\\n---\\n'"
-          "                  || EXCLUDED.fact_value,"
-          "     last_seen  = NOW(),"
-          "     confidence = GREATEST(dossier_facts.confidence, EXCLUDED.confidence)",
+          "     source      = CASE WHEN " MEM_FACT_REPLACES
+          "         OR " MEM_FACT_UPGRADES
+          "         THEN EXCLUDED.source ELSE dossier_facts.source END,"
+          "     channel     = CASE WHEN " MEM_FACT_REPLACES
+          "         OR " MEM_FACT_UPGRADES
+          "         THEN EXCLUDED.channel ELSE dossier_facts.channel END,"
+          "     confidence  = CASE WHEN " MEM_FACT_REPLACES
+          "         THEN EXCLUDED.confidence"
+          "         ELSE GREATEST(dossier_facts.confidence, EXCLUDED.confidence) END,"
+          "     observed_at = NOW(),"
+          "     last_seen   = NOW()"
+          " WHERE " MEM_FACT_AFFIRM " OR " MEM_FACT_REPLACES,
           fact->dossier_id, (int)fact->kind, e_key, e_val, e_src, e_chan,
           (double)fact->confidence);
       break;
@@ -934,6 +943,15 @@ memory_upsert_dossier_fact(const mem_dossier_fact_t *fact,
   }
 
   mem_free(e_key); mem_free(e_val); mem_free(e_src); mem_free(e_chan);
+
+  if(n < 0 || (size_t)n >= cap)
+  {
+    clam(CLAM_WARN, "memory",
+        "upsert_dossier_fact: statement would need %d bytes of %zu — not sent",
+        n, cap);
+    mem_free(sql);
+    return(FAIL);
+  }
 
   res = db_result_alloc();
   ok = (db_query(sql, res) == SUCCESS) && res->ok;

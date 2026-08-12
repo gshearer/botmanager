@@ -88,6 +88,14 @@ void extract_get_stats(extract_stats_t *out);
 #define EXTRACT_ALIAS_MAX_LEN  32
 #define EXTRACT_MAX_ALIASES    8
 
+// Ceiling on the confidence a machine-read fact may claim, whatever the
+// model asserts (FACT-1/F2). It buys one guarantee the merge ladder
+// relies on: a stored 1.0 came from a human, so a person correcting
+// themselves through /remember or /dossier always outranks the sweep's
+// reading of what they said. Aliases are deliberately NOT clamped —
+// they carry no value to contradict.
+#define EXTRACT_MAX_FACT_CONF  0.95f
+
 typedef enum
 {
   EXTRACT_ROLE_SENDER    = 0,
@@ -176,7 +184,9 @@ size_t extract_parts_assemble(const mem_msg_t *msgs, size_t n_msgs,
 // Synchronous single-partition dispatch. Builds the prompt, calls
 // llm_chat_submit (blocking until done_cb fires), parses the response,
 // and upserts accepted facts via memory_upsert_dossier_fact with
-// MEM_MERGE_HIGHER_CONF. Bumps llm_calls / llm_errors / facts_written.
+// MEM_MERGE_OBSERVE — the sweep is a rank-1 source, so it fills gaps
+// and affirms, and can never overwrite what a person stated. Bumps
+// llm_calls / llm_errors / facts_written.
 //
 // returns: number of facts written (0 on no-op, error, or all rejected)
 // model_name: registered chat model name (must be non-empty)

@@ -271,7 +271,8 @@ extract_parse_response(const char *content, size_t content_len,
     snprintf(f->fact_value, sizeof(f->fact_value), "%s", val_buf);
     snprintf(f->source,     sizeof(f->source),     "%s", "llm_extract");
     snprintf(f->channel,    sizeof(f->channel),    "%s", subject->channel);
-    f->confidence  = (float)conf;
+    f->confidence  = (float)conf > EXTRACT_MAX_FACT_CONF
+                     ? EXTRACT_MAX_FACT_CONF : (float)conf;
     f->observed_at = now;
     f->last_seen   = now;
     n_written++;
@@ -648,7 +649,7 @@ extract_dispatch(const char *bot_name, uint32_t ns_id,
   n_written = 0;
 
   for(size_t i = 0; i < n_parsed; i++)
-    if(memory_upsert_dossier_fact(&facts[i], MEM_MERGE_HIGHER_CONF) == SUCCESS)
+    if(memory_upsert_dossier_fact(&facts[i], MEM_MERGE_OBSERVE) == SUCCESS)
       n_written++;
 
   if(n_written > 0)
