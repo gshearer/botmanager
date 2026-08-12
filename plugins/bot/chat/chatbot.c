@@ -106,6 +106,21 @@ static const plugin_kv_entry_t chatbot_kv_schema[] = {
 };
 
 static const plugin_kv_entry_t chatbot_inst_schema[] = {
+  // --- identity: the other names this bot answers to -------------------
+  { "aka", KV_STR, "",
+    "Short names this bot also answers to, comma-separated (e.g. 'hh,"
+    " hog'). A line addressed to one of them — 'hh: how are you?' — is"
+    " read exactly as if the bot's own nick had been used. The nick"
+    " itself never needs listing, and a name is matched case-insensitively"
+    " on every method the bot is bound to. ⚠ A short name is a summons,"
+    " not a word: it addresses the bot at the head of a line, and"
+    " elsewhere only when it carries an address mark ('@hh', or 'hey hh,"
+    " ...'). Pick something nobody types by accident — a name that is"
+    " also an English word will answer lines that were never aimed at it."
+    " Up to 8 are honoured; anything 32 bytes or longer is ignored. Set"
+    " it to '-' to answer to the nick alone again.",
+    NULL },
+
   // --- model / knowledge bindings (bot.<name>.*) -----------------------
   { "chat_model", KV_STR, "",
     "LLM chat model name (empty = use llm.default_chat_model)",
@@ -654,6 +669,15 @@ text_starts_with_nick(const char *text, const char *nick)
   return(0);
 }
 
+// Is `c` the edge of a name — the string's end, or any byte that cannot
+// be part of one? Shared by both body scanners below so "hedgehogg" and
+// "hh" are bounded by exactly the same rule.
+static inline bool
+text_name_boundary(char c)
+{
+  return(c == '\0' || (!isalnum((unsigned char)c) && c != '_'));
+}
+
 // Word-boundary nick scan: returns true if `nick` appears anywhere in
 // `text` flanked by non-identifier characters (or string boundaries).
 // Used so that mid-sentence mentions ("hey dale, what's up") and CTCP
@@ -669,32 +693,133 @@ text_contains_nick(const char *text, const char *nick)
   n = strlen(nick);
   for(const char *p = text; *p != '\0'; p++)
   {
-    char prev;
-    char next;
-    bool prev_boundary;
-    bool next_boundary;
-
     if(strncasecmp(p, nick, n) != 0) continue;
 
-    prev = (p == text) ? '\0' : p[-1];
-    next = p[n];
-
-    prev_boundary = (prev == '\0') ||
-        (!isalnum((unsigned char)prev) && prev != '_');
-    next_boundary = (next == '\0') ||
-        (!isalnum((unsigned char)next) && next != '_');
-
-    if(prev_boundary && next_boundary) return(true);
+    if(text_name_boundary((p == text) ? '\0' : p[-1])
+        && text_name_boundary(p[n]))
+      return(true);
   }
   return(false);
 }
 
+// Does `name` appear in `text` wearing an explicit mark of address —
+// "@name", or "name" followed by ':', ',' or ';'?
+//
+// Short names live under this stricter rule than the bot's own nick.
+// "hh" swept bare through prose the way `text_contains_nick` sweeps a
+// nick would answer lines nobody aimed at the bot; the mark is exactly
+// what a human types when they do mean it, and it costs them nothing —
+// "hey hh, you around?" is how the sentence gets written anyway.
+static bool
+text_summons_by(const char *text, const char *name)
+{
+  size_t n;
+
+  if(text == NULL || name == NULL || name[0] == '\0') return(false);
+
+  n = strlen(name);
+
+  for(const char *p = text; *p != '\0'; p++)
+  {
+    char prev;
+    char next;
+
+    if(strncasecmp(p, name, n) != 0) continue;
+
+    prev = (p == text) ? '\0' : p[-1];
+    next = p[n];
+
+    // Trailing mark. The name must still start a word, or "uhh," would
+    // summon a bot that answers to "hh".
+    if(text_name_boundary(prev)
+        && (next == ':' || next == ',' || next == ';'))
+      return(true);
+
+    // Leading mark. The '@' must itself start a word, or an address like
+    // "someone@hh" would read as a summons.
+    if(prev == '@' && text_name_boundary((p == text + 1) ? '\0' : p[-2])
+        && text_name_boundary(next))
+      return(true);
+  }
+
+  return(false);
+}
+
+// Trim ASCII whitespace off both ends, in place. Returns a pointer into
+// `s`, never NULL for non-NULL input.
+static char *
+text_trim(char *s)
+{
+  size_t n;
+
+  while(isspace((unsigned char)*s)) s++;
+
+  n = strlen(s);
+
+  while(n > 0 && isspace((unsigned char)s[n - 1]))
+    s[--n] = '\0';
+
+  return(s);
+}
+
+void
+chatbot_names_resolve(const char *botname, const method_msg_t *msg,
+    chatbot_names_t *out)
+{
+  const char *list;
+  char        copy[KV_STR_SZ];
+  char        key[128];
+  char       *save = NULL;
+
+  if(out == NULL) return;
+
+  memset(out, 0, sizeof(*out));
+
+  if(msg != NULL && msg->inst != NULL)
+    method_get_self(msg->inst, out->nick, sizeof(out->nick));
+
+  if(botname == NULL || botname[0] == '\0') return;
+
+  snprintf(key, sizeof(key), "bot.%s.aka", botname);
+
+  list = kv_get_str(key);
+
+  if(list == NULL || list[0] == '\0') return;
+
+  // Copied out whole before it is touched: kv_get_str hands back
+  // internal storage valid only until the value changes, and strtok_r
+  // writes into what it walks.
+  snprintf(copy, sizeof(copy), "%s", list);
+
+  for(char *tok = strtok_r(copy, ",", &save);
+      tok != NULL && out->n_aka < CHATBOT_AKA_MAX;
+      tok = strtok_r(NULL, ",", &save))
+  {
+    const char *aka = text_trim(tok);
+
+    // Empty entries ("hh,,hog") and names too long to be short ones are
+    // dropped in silence. The classifier answers a question about the
+    // line in front of it; it is not the place to refuse configuration.
+    //
+    // A lone "-" is how the list is emptied: `set kv` cannot store a
+    // true empty string, so without a sentinel a name once given could
+    // never be taken back.
+    if(aka[0] == '\0' || strcmp(aka, "-") == 0
+        || strlen(aka) >= CHATBOT_AKA_SZ)
+      continue;
+
+    snprintf(out->aka[out->n_aka], sizeof(out->aka[0]), "%s", aka);
+    out->n_aka++;
+  }
+}
+
 mem_msg_kind_t
-chatbot_classify_message(const method_msg_t *msg, const char *bot_nick)
+chatbot_classify_message(const method_msg_t *msg,
+    const chatbot_names_t *names)
 {
   const char *t;
 
-  if(msg == NULL) return(MEM_MSG_WITNESS);
+  if(msg == NULL || names == NULL) return(MEM_MSG_WITNESS);
 
   // DM (no channel) is always EXCHANGE_IN.
   if(msg->channel[0] == '\0')
@@ -704,16 +829,35 @@ chatbot_classify_message(const method_msg_t *msg, const char *bot_nick)
   t = msg->text;
   while(*t == ' ' || *t == '\t') t++;
 
-  if(*t == '@' && text_starts_with_nick(t + 1, bot_nick) > 0)
+  if(*t == '@' && text_starts_with_nick(t + 1, names->nick) > 0)
     return(MEM_MSG_EXCHANGE_IN);
 
-  if(text_starts_with_nick(t, bot_nick) > 0)
+  if(text_starts_with_nick(t, names->nick) > 0)
     return(MEM_MSG_EXCHANGE_IN);
 
   // Mid-sentence mention or CTCP ACTION ("/me looks at <nick>"): scan
   // the full body for a word-bounded occurrence of the bot's nick.
-  if(text_contains_nick(msg->text, bot_nick))
+  if(text_contains_nick(msg->text, names->nick))
     return(MEM_MSG_EXCHANGE_IN);
+
+  // The short names from bot.<name>.aka. The head of a line is an
+  // address position in its own right, so there they are read exactly as
+  // the nick is — "hh: ping", "hh ping". Anywhere else they must say so:
+  // "@hh" or "hey hh, ...". See chatbot_names_t for why the two are not
+  // one rule.
+  for(size_t i = 0; i < names->n_aka; i++)
+  {
+    const char *aka = names->aka[i];
+
+    if(*t == '@' && text_starts_with_nick(t + 1, aka) > 0)
+      return(MEM_MSG_EXCHANGE_IN);
+
+    if(text_starts_with_nick(t, aka) > 0)
+      return(MEM_MSG_EXCHANGE_IN);
+
+    if(text_summons_by(msg->text, aka))
+      return(MEM_MSG_EXCHANGE_IN);
+  }
 
   return(MEM_MSG_WITNESS);
 }
@@ -1098,7 +1242,7 @@ chatbot_text_starts_with_some_other_nick(const char *text)
 // that speaker and demoted to WITNESS. 0 disables the gate.
 static mem_msg_kind_t
 chatbot_classify_with_engagement(chatbot_state_t *st,
-    const method_msg_t *msg, const char *bot_nick,
+    const method_msg_t *msg, const chatbot_names_t *names,
     uint32_t window_secs, uint32_t handoff_window_secs,
     chatbot_classify_reason_t *out_reason)
 {
@@ -1132,7 +1276,7 @@ chatbot_classify_with_engagement(chatbot_state_t *st,
     }
   }
 
-  k = chatbot_classify_message(msg, bot_nick);
+  k = chatbot_classify_message(msg, names);
 
   if(k == MEM_MSG_EXCHANGE_IN)
   {
@@ -1173,7 +1317,7 @@ chatbot_classify_with_engagement(chatbot_state_t *st,
       clam(CLAM_DEBUG, "chatbot",
           "bot=%s sticky suppressed: prior=%s window=%us "
           "sender=%s text=%.120s",
-          bot_nick != NULL ? bot_nick : "?",
+          names->nick[0] != '\0' ? names->nick : "?",
           other, handoff_window_secs,
           msg->sender, msg->text);
       if(out_reason) *out_reason = CHATBOT_CLASSIFY_WITNESS;
@@ -2275,13 +2419,13 @@ chatbot_observe(chatbot_state_t *st, const method_msg_t *msg)
   uint32_t engagement_window;
   const char *botname;
   char key[128];
-  char self[METHOD_SENDER_SZ] = {0};
-
-  // Resolve our nick on this method for address detection.
-  if(msg->inst != NULL)
-    method_get_self(msg->inst, self, sizeof(self));
+  chatbot_names_t names;
 
   botname = bot_inst_name(st->inst);
+
+  // Every name we answer to on this method: the nick it gave us, plus
+  // the short forms in bot.<name>.aka.
+  chatbot_names_resolve(botname, msg, &names);
 
   // Sticky engagement knobs (per message, same cadence as the rest of
   // the per-line KV reads below). Two small integer reads — no point
@@ -2298,8 +2442,7 @@ chatbot_observe(chatbot_state_t *st, const method_msg_t *msg)
     handoff_window = CHATBOT_HANDOFF_WINDOW_DEFAULT_SECS;
 
   reason = CHATBOT_CLASSIFY_WITNESS;
-  kind = chatbot_classify_with_engagement(st, msg,
-      self[0] != '\0' ? self : NULL,
+  kind = chatbot_classify_with_engagement(st, msg, &names,
       engagement_window, handoff_window, &reason);
 
   // When the operator opts into require_reply=false, stamp on every
@@ -2343,7 +2486,8 @@ chatbot_observe(chatbot_state_t *st, const method_msg_t *msg)
   // Bot's own outbound lines don't flow through this path, but a
   // belt-and-braces self-compare is cheap insurance.
   if(msg->channel[0] != '\0' && msg->sender[0] != '\0'
-      && !(self[0] != '\0' && strcasecmp(msg->sender, self) == 0))
+      && !(names.nick[0] != '\0'
+          && strcasecmp(msg->sender, names.nick) == 0))
     chatbot_handoff_stamp(&st->handoff, msg->channel, msg->sender,
         time(NULL));
 

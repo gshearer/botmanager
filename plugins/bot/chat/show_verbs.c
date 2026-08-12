@@ -26,6 +26,7 @@ verb_text_summary(const cmd_ctx_t *ctx, bot_inst_t *bot, const char *rest)
 {
   const char *nl;
   const char *nl_state = "disabled";
+  const char *aka;
   const char *model;
   uint64_t mute_until;
   time_t now;
@@ -59,6 +60,17 @@ verb_text_summary(const cmd_ctx_t *ctx, bot_inst_t *bot, const char *rest)
 
     snprintf(line, sizeof(line), "  methods:     %u  %s",
         bot_method_count(bot), kinds);
+    cmd_reply(ctx, line);
+  }
+
+  // Other names it answers to. Only rendered when set — a bot that
+  // answers to its nick alone has nothing to say here.
+  snprintf(key, sizeof(key), "bot.%s.aka", name);
+  aka = kv_get_str(key);
+
+  if(aka != NULL && aka[0] != '\0')
+  {
+    snprintf(line, sizeof(line), "  aka:         %s", aka);
     cmd_reply(ctx, line);
   }
 

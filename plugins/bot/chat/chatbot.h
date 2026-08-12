@@ -233,6 +233,32 @@ typedef struct
 // topic cap keeps the per-bot footprint bounded at ~16 KiB.
 #define CHATBOT_TOPIC_CACHE_MAX 32
 
+// The names a bot answers to, resolved per inbound line: the nick the
+// method knows it by, plus the short forms an operator listed in
+// `bot.<name>.aka` ("hh" for hedgehogg). Per-line, like every other
+// per-bot knob — a nick change or a KV edit lands on the next message.
+//
+// The nick and the short names are held apart on purpose, because they
+// are not addressed the same way. A nick is a distinctive token and is
+// recognised bare, anywhere in a line; a short name is two letters and
+// counts only where it is unmistakably a summons — at the head of a
+// line, or wearing an address mark ("@hh", "hey hh, ..."). See
+// `chatbot_classify_message`.
+//
+// A short name longer than CHATBOT_AKA_SZ - 1 is dropped rather than
+// truncated: a truncated name would match every longer word that starts
+// with it, which is the one failure mode this whole type exists to
+// avoid.
+#define CHATBOT_AKA_MAX 8
+#define CHATBOT_AKA_SZ  32
+
+typedef struct
+{
+  char   nick[METHOD_SENDER_SZ];    // empty when the method has no name for us
+  char   aka[CHATBOT_AKA_MAX][CHATBOT_AKA_SZ];
+  size_t n_aka;
+} chatbot_names_t;
+
 // Sticky engagement ring: tracks the most recent (channel, user) pairs
 // the bot has exchanged with so follow-up messages from the same user
 // in the same channel can be promoted from WITNESS to EXCHANGE_IN
@@ -518,8 +544,15 @@ bool chatbot_mute_active(const char *botname);
 
 // ---- chatbot.c ----
 
+// Resolve every name `botname` answers to on the method `msg` arrived
+// on. Never fails: a bot the method has no name for, and with no aka
+// list, simply answers to no text and relies on the method's own
+// addressing verdict.
+void chatbot_names_resolve(const char *botname, const method_msg_t *msg,
+    chatbot_names_t *out);
+
 mem_msg_kind_t chatbot_classify_message(const method_msg_t *msg,
-    const char *bot_nick);
+    const chatbot_names_t *names);
 
 // Global driver vtable (defined in chatbot.c).
 extern const bot_driver_t chatbot_driver;
