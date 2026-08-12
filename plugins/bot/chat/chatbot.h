@@ -120,13 +120,6 @@ void chatbot_personality_free(struct chatbot_personality_s *p);
 // corpus selection is a deployment decision, not a character trait).
 #define CHATBOT_CORPUS_LIST_SZ        256
 
-// Comma-separated list of command names whose output the persona
-// relays in voice instead of the channel receiving the renderer's
-// block verbatim (frontmatter `interpret:`; empty = today's verbatim
-// behaviour). Same token grammar as behavior.nl_bridge_cmds — a
-// character trait, so it lives in the personality file, not KV.
-#define CHATBOT_INTERPRET_LIST_SZ     256
-
 // Byte budget for the rendered NL COMMANDS block in the system prompt.
 // Caps the combined size of every per-command stanza so a bot with many
 // NL-capable commands cannot starve the FACTS / MENTIONS / KNOWLEDGE
@@ -143,7 +136,6 @@ typedef struct chatbot_personality_s
 {
   char    name[CHATBOT_PERSONALITY_NAME_SZ];
   char    description[CHATBOT_PERSONALITY_DESC_SZ];
-  char    interpret[CHATBOT_INTERPRET_LIST_SZ];  // frontmatter `interpret:`; "" = none
   char   *body;            // mem_alloc'd
   char   *interests_json;  // mem_alloc'd; "" when absent
   int     version;
@@ -871,13 +863,6 @@ typedef struct
   //   "*" → every NL-capable command that also passes cmd_permits
   //   otherwise → comma-separated command names, case-insensitive.
   char            nl_bridge_cmds[256];
-
-  // Interpreted-delivery list from the persona's `interpret:`
-  // frontmatter (same token grammar as nl_bridge_cmds). A bridged
-  // command on this list — or any bridged command when the method
-  // declares METHOD_CAP_SPOKEN — has its output captured through a
-  // reply sink and relayed in voice instead of hitting the wire raw.
-  char            interpret_cmds[CHATBOT_INTERPRET_LIST_SZ];
 
   // True on the second submit of an interpreted exchange (the internal
   // cue carrying fenced command output). Leaves nl_bridge_cmds empty so

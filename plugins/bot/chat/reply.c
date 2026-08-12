@@ -973,15 +973,15 @@ reply_nl_bridge(chatbot_req_t *r, const char *text)
     return;
   }
 
-  // D4 — interpreted delivery. A command on the persona's interpret
-  // list — or ANY bridged command on a method that declares its
-  // replies are read aloud (METHOD_CAP_SPOKEN), where a fixed-width
-  // block is noise — has its output captured through a reply sink and
-  // handed back to the model as data; the persona relays the substance
-  // in voice. Collector exhaustion returns 0: the command dispatches
-  // uncaptured and the channel gets the verbatim block, never silence.
-  if(nl_bridge_list_permits(r->interpret_cmds, cmd)
-      || (method_inst_caps(r->method) & METHOD_CAP_SPOKEN) != 0)
+  // CARE-4 — the register of the ask decides the register of the
+  // answer, and this is the prose path: the human spoke to the persona,
+  // so the persona answers, whatever the command turned out to be. The
+  // output is captured through a reply sink and handed back to the
+  // model as data; the substance reaches the channel in voice. Anyone
+  // who wants the renderer's block addresses the tool instead — a
+  // banged `!weather 45069` never reaches this function. Collector
+  // exhaustion returns 0: the command dispatches uncaptured and the
+  // channel gets the verbatim block, never silence.
   {
     const char *nick = r->nickname[0] != '\0' ? r->nickname : r->sender;
     char        excerpt[240];
@@ -2926,7 +2926,6 @@ chatbot_reply_submit(chatbot_state_t *st, const method_msg_t *msg,
   }
 
   snprintf(r->personality_name, sizeof(r->personality_name), "%s", p.name);
-  snprintf(r->interpret_cmds, sizeof(r->interpret_cmds), "%s", p.interpret);
   r->personality_body = p.body;           // transfer ownership
   p.body = NULL;                           // neutralise to avoid double-free
   chatbot_personality_free(&p);            // releases interests_json
@@ -3253,7 +3252,6 @@ chatbot_reply_submit_vision(chatbot_state_t *st, const method_msg_t *msg,
   }
 
   snprintf(r->personality_name, sizeof(r->personality_name), "%s", p.name);
-  snprintf(r->interpret_cmds, sizeof(r->interpret_cmds), "%s", p.interpret);
   r->personality_body = p.body;           // transfer ownership
   p.body = NULL;
   chatbot_personality_free(&p);

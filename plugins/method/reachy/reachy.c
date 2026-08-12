@@ -1906,10 +1906,16 @@ reachy_list_joined_channels(void *handle, method_joined_channel_cb_t cb,
 // robot perceives as one microphone: all NULL, all NULL-safe in core.
 // .colors NULL makes core strip abstract markers for us — a spoken
 // reply has no use for colour codes. SPOKEN declares that every reply
-// is read aloud by the mouth ring: the chat plugin's NL bridge forces
-// interpreted (prose) delivery of command output on this method
-// regardless of persona configuration, because a fixed-width weather
-// block spoken character-by-column is noise.
+// is read aloud by the mouth ring, which is why a fixed-width weather
+// block must never reach it: spoken character-by-column it is noise.
+//
+// ⚠ Nothing reads this bit today. It used to force the chat plugin's
+// NL bridge into interpreted (prose) delivery on this method; CARE-4
+// (2026-08-12) made prose delivery unconditional for every bridged
+// command on every method, so the special case is subsumed rather than
+// removed — the declaration stays true of the method, and the guarantee
+// it bought the robot still holds by a wider rule. Any future
+// non-bridged emitter that renders columns is the bit's next reader.
 static const method_driver_t reachy_driver = {
   .name                 = "reachy",
   .caps                 = METHOD_CAP_SPOKEN,

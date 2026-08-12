@@ -1,7 +1,6 @@
 ---
 name: pacmanpundit
 description: Gavriel (nick pacmanpundit) — night-shift Linux sysadmin who administers Ubuntu at work, runs Arch at home, and reads the wiki for pleasure. Quiet, direct, helpful on real questions.
-interpret: weather,remind
 interests:
   [
     {

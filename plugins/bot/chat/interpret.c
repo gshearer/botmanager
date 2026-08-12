@@ -1,10 +1,11 @@
 // botmanager — MIT
 // Interpreted command output: reply-sink capture → in-persona relay.
 //
-// Two callers open captures: the NL bridge (a command whose name is on
-// the persona's `interpret:` list, or any command on a method
-// declaring METHOD_CAP_SPOKEN) and the deferred spine (a `run` row
-// coming due). The dispatched message carries a reply-sink id (cmd.h
+// Two callers open captures: the NL bridge (every bridged command,
+// unconditionally — the human spoke prose, so the answer comes back as
+// prose) and the deferred spine (a `run` row coming due). Both are the
+// same case: nobody addressed the tool, so nobody asked for its
+// renderer. The dispatched message carries a reply-sink id (cmd.h
 // §Reply sinks) and every cmd_reply line the command produces lands
 // here instead of the wire. No completion signal exists anywhere in
 // the tree for an async command, so a settle window after the last

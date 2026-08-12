@@ -143,8 +143,8 @@ mp_resolve_path(const char *name, char *out, size_t sz)
 
 // Parse the frontmatter of `raw` in place. On return `*body_out`
 // points at the first body byte inside raw (no further allocation).
-// Recognised keys: name, description, interests, interpret, version.
-// Unknown keys (e.g. a legacy "contract:" line) are silently skipped.
+// Recognised keys: name, description, interests, version. Unknown keys
+// (a legacy "contract:" or "interpret:" line) are silently skipped.
 //
 // When err / err_sz is non-NULL, a short explanation of the first
 // fatal parse problem is written there (used by the header-only
@@ -154,7 +154,6 @@ mp_parse_frontmatter(char *raw,
     char *name, size_t name_sz,
     char *desc, size_t desc_sz,
     char *interests, size_t interests_sz,
-    char *interpret, size_t interpret_sz,
     char *version, size_t version_sz,
     const char **body_out,
     char *err, size_t err_sz)
@@ -167,8 +166,6 @@ mp_parse_frontmatter(char *raw,
   if(desc_sz > 0)     desc[0]     = '\0';
   if(interests != NULL && interests_sz > 0)
     interests[0] = '\0';
-  if(interpret != NULL && interpret_sz > 0)
-    interpret[0] = '\0';
   if(version_sz > 0)  version[0]  = '\0';
   if(err_sz > 0)      err[0]      = '\0';
 
@@ -241,9 +238,6 @@ mp_parse_frontmatter(char *raw,
       snprintf(name, name_sz, "%s", val);
     else if(strcasecmp(key, "description") == 0)
       snprintf(desc, desc_sz, "%s", val);
-    else if(strcasecmp(key, "interpret") == 0 && interpret != NULL
-        && interpret_sz > 0)
-      snprintf(interpret, interpret_sz, "%s", val);
     else if(strcasecmp(key, "version") == 0 && version_sz > 0)
       snprintf(version, version_sz, "%s", val);
     else if(strcasecmp(key, "interests") == 0 && interests != NULL
@@ -393,7 +387,6 @@ chatbot_personality_read(const char *name, chatbot_personality_t *out)
       pname, sizeof(pname),
       pdesc, sizeof(pdesc),
       interests_buf, CHATBOT_INTERESTS_JSON_SZ,
-      out->interpret, sizeof(out->interpret),
       version_str, sizeof(version_str),
       &body_ptr, NULL, 0) != SUCCESS)
   {
@@ -547,7 +540,6 @@ chatbot_personality_read_header(const char *name, persona_header_t *hdr)
       hdr->name,        sizeof(hdr->name),
       hdr->description, sizeof(hdr->description),
       interests_buf,    sizeof(interests_buf),
-      NULL,             0,
       hdr->version,     sizeof(hdr->version),
       &body_ptr, hdr->err, sizeof(hdr->err));
 
@@ -677,7 +669,6 @@ chatbot_contract_read_header(const char *name, persona_header_t *hdr)
       hdr->name,        sizeof(hdr->name),
       hdr->description, sizeof(hdr->description),
       interests_buf,    sizeof(interests_buf),
-      NULL,             0,
       hdr->version,     sizeof(hdr->version),
       &body_ptr, hdr->err, sizeof(hdr->err));
 
