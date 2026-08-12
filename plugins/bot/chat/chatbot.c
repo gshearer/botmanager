@@ -166,6 +166,11 @@ static const plugin_kv_entry_t chatbot_inst_schema[] = {
     " chores (reminder delivery, the weather watch) when the bot is"
     " RUNNING, chat-enabled and not muted. Re-read every tick, so a"
     " change takes effect on the next fire.", NULL },
+  { "behavior.soul.deferred.max_pending", KV_UINT32, "10",
+    "How many undelivered items one person may have waiting at once —"
+    " reminders and scheduled commands together. A further /remind or"
+    " /in is refused until one fires or is cancelled. 0 = the default"
+    " 10.", NULL },
   { "behavior.soul.weather.enabled", KV_BOOL, "false",
     "Proactive weather watch: each sweep scans the namespace's"
     " city_of_interest facts (written by the NL bridge observer after"
@@ -2348,8 +2353,9 @@ chatbot_plugin_start(void)
 {
   memory_ensure_schema();
   dossier_register_config();
-  // After dossier DDL: chat_reminders FKs into dossier(id).
+  // After dossier DDL: chat_deferred FKs into dossier(id).
   soul_ensure_schema();
+  chatbot_deferred_ensure_schema();
   // Identity scoring is plugin-local and protocol-agnostic: protocol
   // plugins emit the four-field identity tuple on method_msg_t and
   // identity.c scores it uniformly. No registry, no cross-plugin

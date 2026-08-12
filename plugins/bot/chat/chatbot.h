@@ -927,12 +927,17 @@ typedef struct
 // command makes then lands in the collector, and a settle window after
 // the last line closes the capture and re-submits the block as an
 // internal cue through the persona pipeline (nl_bridge_off).
-// `synth` is the identity-complete message being dispatched; `r`
-// supplies the question, sender and address flags the cue needs.
+// `synth` is the identity-complete message being dispatched.
+// `premise` is the cue's opening sentence and belongs to the caller —
+// only it knows why the command ran ("X asked … and you ran /y", "X
+// asked you an hour ago to run /y when the time came"). It must read
+// as a complete sentence ending in a period; the fixed instruction and
+// the output fence follow it. Control bytes are flattened on copy.
 // Returns 0 when no slot is free (caller dispatches uncaptured — the
 // channel gets the verbatim block, never silence).
-uint64_t chatbot_interpret_begin(const chatbot_req_t *r,
-    const method_msg_t *synth, const char *cmd, const char *args);
+uint64_t chatbot_interpret_begin(chatbot_state_t *st,
+    const method_msg_t *synth, const char *cmd, const char *args,
+    const char *premise, bool was_addressed, bool is_direct);
 
 // Retract every live capture owned by `st` (bot stop), or every
 // capture regardless of owner (plugin stop). Sinks are unregistered
@@ -942,10 +947,28 @@ uint64_t chatbot_interpret_begin(const chatbot_req_t *r,
 void chatbot_interpret_stop(chatbot_state_t *st);
 void chatbot_interpret_stop_all(void);
 
+// ---- deferred.c — durable work the bot owes a human (CARE-1) ----
+
+// Idempotent chat_deferred DDL. Called from chatbot_plugin_start after
+// dossier_register_config (the dossier FK target must exist).
+void chatbot_deferred_ensure_schema(void);
+
+// Claim and deliver every row that has come due for this namespace,
+// say and run alike. Called from the soul tick's `deferred` chore, on
+// the tick's worker thread — it blocks on sync db_query and dispatches
+// commands, so it must never run on a callback thread.
+void chatbot_deferred_run_due(const char *bot_name, uint32_t ns_id,
+    chatbot_state_t *st, bot_inst_t *bot);
+
+// Register /remind, /in (+ list, cancel) and /show deferred. Called
+// from chatbot_cmds_register.
+bool chatbot_deferred_register(void);
+
 // ---- soul.c — the per-bot heartbeat (SOUL-2) ----
 
-// Idempotent chat_reminders DDL. Called from chatbot_plugin_start
-// after dossier_register_config (the dossier FK target must exist).
+// Idempotent DDL for the soul's own tables (the weather watch's alert
+// ledger). Called from chatbot_plugin_start after
+// dossier_register_config (the dossier FK target must exist).
 void soul_ensure_schema(void);
 
 // Arm / latch a bot's heartbeat. The extract.c scheduler pattern:
@@ -958,8 +981,6 @@ void soul_unschedule(const char *bot_name);
 void soul_stop(void);
 void soul_exit(void);
 
-// Register /remind. Called from chatbot_cmds_register.
-bool soul_remind_register(void);
 
 #endif // CHATBOT_INTERNAL
 

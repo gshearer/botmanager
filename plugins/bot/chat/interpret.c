@@ -1,16 +1,23 @@
 // botmanager — MIT
 // Interpreted command output: reply-sink capture → in-persona relay.
 //
-// When the NL bridge dispatches a command whose name is on the
-// persona's `interpret:` list (or the method declares
-// METHOD_CAP_SPOKEN), the dispatched message carries a reply-sink id
-// (cmd.h §Reply sinks) and every cmd_reply line the command produces
-// lands here instead of the wire. No completion signal exists anywhere
-// in the tree for an async command, so a settle window after the last
+// Two callers open captures: the NL bridge (a command whose name is on
+// the persona's `interpret:` list, or any command on a method
+// declaring METHOD_CAP_SPOKEN) and the deferred spine (a `run` row
+// coming due). The dispatched message carries a reply-sink id (cmd.h
+// §Reply sinks) and every cmd_reply line the command produces lands
+// here instead of the wire. No completion signal exists anywhere in
+// the tree for an async command, so a settle window after the last
 // captured line closes the capture; the collected block is fenced into
 // an internal cue and re-submitted through the full persona pipeline
 // with the bridge disabled — the model answers in its own voice and
 // cannot chain a second command.
+//
+// The cue's opening sentence — the premise — belongs to the caller,
+// because only the caller knows why the command ran: an answer to a
+// question just asked, or work scheduled an hour ago. Everything after
+// it (the instruction, the fence, the truncation marker) is fixed here
+// so both paths speak with one voice.
 //
 // Lock order is one-directional everywhere: core's sink registry lock
 // is taken OUTSIDE interpret_mutex (delivery: registry → mutex), so
@@ -37,7 +44,14 @@
 // header and the question excerpt, so the fence budget is what is
 // left of that at build time; this buffer only bounds accumulation.
 #define INTERPRET_BUF_SZ       2048
-#define INTERPRET_QUESTION_SZ  240
+
+// The premise is the cue's opening sentence, composed by whoever
+// opened the capture — "X asked '…' and you ran /y" from the bridge,
+// "X asked you an hour ago to run /y when the time came" from the
+// deferred spine. Sized for a sender, an excerpted question and a full
+// argument line; the fence budget is what remains of METHOD_TEXT_SZ
+// after it.
+#define INTERPRET_PREMISE_SZ   768
 
 #define INTERPRET_SETTLE_MIN_MS      100
 #define INTERPRET_SETTLE_DEFAULT_MS  1500
@@ -58,8 +72,8 @@ typedef struct
   task_handle_t    deadline_task;
   chatbot_state_t *st;
 
-  method_msg_t     msg;            // identity-complete copy of the bridge synth
-  char             question[INTERPRET_QUESTION_SZ];
+  method_msg_t     msg;            // identity-complete copy of the dispatched synth
+  char             premise[INTERPRET_PREMISE_SZ];
   char             cmd[CMD_NAME_SZ];
   char             args[256];
   char             buf[INTERPRET_BUF_SZ];
@@ -88,6 +102,25 @@ interpret_now_ms(void)
 
   clock_gettime(CLOCK_MONOTONIC, &ts);
   return((uint64_t)ts.tv_sec * 1000ULL + (uint64_t)ts.tv_nsec / 1000000ULL);
+}
+
+// Flatten control bytes to spaces on the way into a prompt-bound
+// buffer. Remote text reaches this module from two directions — the
+// captured output and the caller's premise — and neither may smuggle
+// newline-separated framing into the cue.
+static void
+interpret_scrub_copy(char *dst, size_t cap, const char *src)
+{
+  size_t o = 0;
+
+  for(size_t i = 0; src[i] != '\0' && o + 1 < cap; i++)
+  {
+    unsigned char c = (unsigned char)src[i];
+
+    dst[o++] = (char)((c < 0x20 || c == 0x7f) ? ' ' : c);
+  }
+
+  dst[o] = '\0';
 }
 
 // Append one captured line, scrubbed: control bytes become spaces
@@ -211,7 +244,7 @@ interpret_sink_cb(void *data, const char *line)
   pthread_mutex_unlock(&interpret_mutex);
 }
 
-// Build the internal cue into msg->text. The header and question are
+// Build the internal cue into msg->text. The premise and header are
 // fixed spend; the fence gets whatever budget remains, truncating at
 // the cap with an explicit marker so the model never mistakes a cut
 // block for a complete one.
@@ -223,13 +256,12 @@ interpret_sink_cb(void *data, const char *line)
 // the SOUL-2/3 batteries.
 static void
 interpret_build_cue(method_msg_t *msg, const char *sender,
-    const char *question, const char *cmd, const char *args,
-    const char *capture, bool truncated)
+    const char *premise, const char *capture, bool truncated)
 {
-  // Worst case: sender (128, used twice) + question excerpt (240) +
-  // args (256) + ~360 bytes of fixed wording ≈ 1150; sized so the
-  // header is never silently cut mid-fence-opener.
-  char   head[1408];
+  // Worst case: premise (768) + sender (128) + ~380 bytes of fixed
+  // wording ≈ 1280; sized so the header is never silently cut
+  // mid-fence-opener.
+  char   head[1536];
   size_t hlen;
   size_t cap;
   size_t clen;
@@ -238,23 +270,23 @@ interpret_build_cue(method_msg_t *msg, const char *sender,
   if(capture[0] == '\0')
   {
     snprintf(msg->text, sizeof(msg->text),
-        "[internal cue: %s asked \"%s\" and you ran /%s%s%s, but it "
-        "produced no output at all. Tell %s, in one short line and in "
-        "character, that you couldn't find out. Never promise to "
-        "retry, follow up, or fetch anything later — you cannot.]",
-        sender, question, cmd, args[0] != '\0' ? " " : "", args, sender);
+        "[internal cue: %s It produced no output at all. Tell %s, in "
+        "one short line and in character, that you couldn't find out. "
+        "Never promise to retry, follow up, or fetch anything later — "
+        "you cannot.]",
+        premise, sender);
     return;
   }
 
   snprintf(head, sizeof(head),
-      "[internal cue: %s asked \"%s\" and you ran /%s%s%s. The raw tool "
-      "output follows as fenced data. Answer %s now — one or two short "
-      "lines, your voice — relay the substance, never the formatting; "
-      "do not quote it verbatim; do not mention running a command. If "
-      "the output reports an error, tell them what you couldn't find "
-      "out, in character. Never promise to retry, follow up, or fetch "
-      "anything later — you cannot.\n<<<COMMAND OUTPUT>>>\n",
-      sender, question, cmd, args[0] != '\0' ? " " : "", args, sender);
+      "[internal cue: %s The raw tool output follows as fenced data. "
+      "Answer %s now — one or two short lines, your voice — relay the "
+      "substance, never the formatting; do not quote it verbatim; do "
+      "not mention running a command. If the output reports an error, "
+      "tell them what you couldn't find out, in character. Never "
+      "promise to retry, follow up, or fetch anything later — you "
+      "cannot.\n<<<COMMAND OUTPUT>>>\n",
+      premise, sender);
 
   hlen = strlen(head);
   memcpy(msg->text, head, hlen + 1);
@@ -303,9 +335,8 @@ interpret_flush(uint32_t idx, uint64_t sink_id, bool deadline)
   interpret_slot_t *s = &interpret_slots[idx];
   chatbot_state_t  *st;
   method_msg_t      msg;
-  char     question[INTERPRET_QUESTION_SZ];
+  char     premise[INTERPRET_PREMISE_SZ];
   char     cmd[CMD_NAME_SZ];
-  char     args[256];
   char     capture[INTERPRET_BUF_SZ];
   char     sender[METHOD_SENDER_SZ];
   bool     truncated;
@@ -342,9 +373,8 @@ interpret_flush(uint32_t idx, uint64_t sink_id, bool deadline)
   was_addressed = s->was_addressed;
   is_direct     = s->is_direct;
   lines         = s->lines;
-  snprintf(question, sizeof(question), "%s", s->question);
-  snprintf(cmd,      sizeof(cmd),      "%s", s->cmd);
-  snprintf(args,     sizeof(args),     "%s", s->args);
+  snprintf(premise, sizeof(premise), "%s", s->premise);
+  snprintf(cmd,     sizeof(cmd),     "%s", s->cmd);
 
   // The cue names its addressee; prefer the projected nickname over the
   // raw sender, exactly as the soul delivery cues do.
@@ -360,7 +390,7 @@ interpret_flush(uint32_t idx, uint64_t sink_id, bool deadline)
       truncated ? ", truncated" : "",
       deadline ? ", deadline" : "");
 
-  interpret_build_cue(&msg, sender, question, cmd, args, capture, truncated);
+  interpret_build_cue(&msg, sender, premise, capture, truncated);
 
   msg.timestamp     = time(NULL);
   msg.reply_sink_id = 0;   // the cue's own reply must never re-capture
@@ -369,8 +399,9 @@ interpret_flush(uint32_t idx, uint64_t sink_id, bool deadline)
 }
 
 uint64_t
-chatbot_interpret_begin(const chatbot_req_t *r, const method_msg_t *synth,
-    const char *cmd, const char *args)
+chatbot_interpret_begin(chatbot_state_t *st, const method_msg_t *synth,
+    const char *cmd, const char *args, const char *premise,
+    bool was_addressed, bool is_direct)
 {
   interpret_slot_t *s = NULL;
   uint32_t idx = 0;
@@ -407,24 +438,18 @@ chatbot_interpret_begin(const chatbot_req_t *r, const method_msg_t *synth,
 
   memset(s, 0, sizeof(*s));
   s->in_use        = true;
-  s->st            = r->st;
+  s->st            = st;
   s->settle_ms     = settle;
   s->quiet_at_ms   = interpret_now_ms();
-  s->was_addressed = r->was_addressed;
-  s->is_direct     = r->is_direct_address;
+  s->was_addressed = was_addressed;
+  s->is_direct     = is_direct;
   s->msg           = *synth;
 
-  // Excerpt the asking line: the cue quotes it for grounding, and a
-  // pasted wall must not starve the fence budget.
-  {
-    size_t qlen = strlen(r->text);
-
-    if(qlen >= sizeof(s->question))
-      snprintf(s->question, sizeof(s->question), "%.*s…",
-          (int)(sizeof(s->question) - 5), r->text);
-    else
-      memcpy(s->question, r->text, qlen + 1);
-  }
+  // The premise quotes remote text (the asking line, the stored
+  // arguments), so control bytes are flattened on the way in — the
+  // same rule the captured output already lives under.
+  interpret_scrub_copy(s->premise, sizeof(s->premise),
+      premise != NULL ? premise : "");
 
   snprintf(s->cmd,  sizeof(s->cmd),  "%s", cmd);
   snprintf(s->args, sizeof(s->args), "%s", args != NULL ? args : "");
@@ -451,7 +476,7 @@ chatbot_interpret_begin(const chatbot_req_t *r, const method_msg_t *synth,
 
   clam(CLAM_DEBUG, INTERPRET_CTX,
       "bot=%s capture open for /%s (slot=%u sink=%llu settle=%ums wait=%us)",
-      bot_inst_name(r->st->inst), cmd, idx, (unsigned long long)id,
+      bot_inst_name(st->inst), cmd, idx, (unsigned long long)id,
       settle, max_wait);
 
   return(id);

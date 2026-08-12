@@ -982,7 +982,26 @@ reply_nl_bridge(chatbot_req_t *r, const char *text)
   // uncaptured and the channel gets the verbatim block, never silence.
   if(nl_bridge_list_permits(r->interpret_cmds, cmd)
       || (method_inst_caps(r->method) & METHOD_CAP_SPOKEN) != 0)
-    synth.reply_sink_id = chatbot_interpret_begin(r, &synth, cmd, args);
+  {
+    const char *nick = r->nickname[0] != '\0' ? r->nickname : r->sender;
+    char        excerpt[240];
+    char        premise[512];
+
+    // The cue quotes the asking line for grounding; a pasted wall must
+    // not starve the fence budget the collector computes downstream.
+    if(strlen(r->text) >= sizeof(excerpt))
+      snprintf(excerpt, sizeof(excerpt), "%.*s…",
+          (int)(sizeof(excerpt) - 5), r->text);
+    else
+      snprintf(excerpt, sizeof(excerpt), "%s", r->text);
+
+    snprintf(premise, sizeof(premise),
+        "%s asked \"%s\" and you ran /%s%s%s.",
+        nick, excerpt, cmd, args[0] != '\0' ? " " : "", args);
+
+    synth.reply_sink_id = chatbot_interpret_begin(r->st, &synth, cmd,
+        args, premise, r->was_addressed, r->is_direct_address);
+  }
 
   // Both dispatch paths below hand the callback off to the task pool,
   // so any bounded blocking (sync HTTP for a city→zip geocode, etc.)

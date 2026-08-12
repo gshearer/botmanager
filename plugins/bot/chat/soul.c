@@ -1,15 +1,19 @@
 // botmanager — MIT
 // The soul: a per-bot heartbeat that lets a persona act on its own.
-// Each tick runs due chores (reminders today, the weather watch next)
+// Each tick runs due chores (the deferred spine, the weather watch)
 // and every chore speaks through the same cue → reply pipeline that
 // volunteer speech uses, so persona, contract and markup all inherit.
 //
-// Durable chore state lives in the DB, never in this mapping: a
-// reminder survives restart and reload because delivery is a claimed
-// UPDATE (the note plugin's exactly-once shape), not an in-memory
-// queue. The scheduler side mirrors extract.c: one periodic task per
-// bot, a mutex-guarded sched list whose entries outlive bot stops, and
-// a soft latch instead of task churn.
+// Durable chore state lives in the DB, never in this mapping: work
+// survives restart and reload because delivery is a claimed UPDATE
+// (the note plugin's exactly-once shape), not an in-memory queue. The
+// scheduler side mirrors extract.c: one periodic task per bot, a
+// mutex-guarded sched list whose entries outlive bot stops, and a soft
+// latch instead of task churn.
+//
+// This file owns the schedule and the weather watch. The deferred
+// spine — chat_deferred, /remind, /in — is deferred.c's; the chore
+// here is one call into it.
 
 #define CHATBOT_INTERNAL
 #include "chatbot.h"
@@ -17,7 +21,6 @@
 #include "clam.h"
 #include "db.h"
 #include "plugin.h"
-#include "util.h"
 #include "weathergov_api.h"
 
 #include <inttypes.h>
@@ -29,13 +32,6 @@
 
 #define SOUL_INTERVAL_DEFAULT_SECS 60
 #define SOUL_INTERVAL_MIN_SECS     5
-
-// One claim batch per tick per bot; a backlog drains at this rate.
-#define SOUL_REMIND_CLAIM_MAX      5
-
-// Reminder horizon. Beyond this the ack would be a promise nobody
-// remembers making.
-#define SOUL_REMIND_MAX_SECS       (30ULL * 86400ULL)
 
 // Weather watch (D8) bounds. A sweep is one tick's fan-out: the watch
 // list scan is capped, distinct coordinates are fetched once however
@@ -71,14 +67,14 @@ typedef struct
   soul_chore_fn_t  fn;
 } soul_chore_t;
 
-static bool soul_chore_reminders(soul_sched_t *, uint32_t,
+static bool soul_chore_deferred(soul_sched_t *, uint32_t,
     chatbot_state_t *, bot_inst_t *);
 static bool soul_chore_weather(soul_sched_t *, uint32_t,
     chatbot_state_t *, bot_inst_t *);
 
 static const soul_chore_t soul_chores[] = {
-  { "reminders", NULL,      0,                             soul_chore_reminders },
-  { "weather",   "weather", SOUL_WX_INTERVAL_DEFAULT_SECS, soul_chore_weather   },
+  { "deferred", NULL,      0,                             soul_chore_deferred },
+  { "weather",  "weather", SOUL_WX_INTERVAL_DEFAULT_SECS, soul_chore_weather  },
 };
 
 #define SOUL_CHORE_COUNT (sizeof(soul_chores) / sizeof(soul_chores[0]))
@@ -159,148 +155,19 @@ soul_copy_col(char *dst, size_t cap, const db_result_t *res,
   snprintf(dst, cap, "%s", s != NULL ? s : "");
 }
 
-// Copy stored user text into a prompt-bound buffer: control bytes
-// become spaces so a line typed months ago can't smuggle framing into
-// today's cue.
-static void
-soul_scrub_copy(char *dst, size_t cap, const char *src)
-{
-  size_t o = 0;
-
-  for(size_t i = 0; src[i] != '\0' && o + 1 < cap; i++)
-  {
-    unsigned char c = (unsigned char)src[i];
-
-    dst[o++] = (char)((c < 0x20 || c == 0x7f) ? ' ' : c);
-  }
-
-  dst[o] = '\0';
-}
-
-// ---------- chore: reminders (D6/D7) ----------
+// ---------- chore: the deferred spine (CARE-1) ----------
+//
+// Every tick, on the tick's own worker thread: the whole claim →
+// deliver → dispatch path lives in deferred.c, which owns the table
+// and both verbs. The chore is the schedule, not the work.
 
 static bool
-soul_chore_reminders(soul_sched_t *s, uint32_t chore,
+soul_chore_deferred(soul_sched_t *s, uint32_t chore,
     chatbot_state_t *st, bot_inst_t *bot)
 {
-  db_result_t *res;
-  char         sql[640];
-  uint32_t     rows;
-  time_t       now;
-
   (void)chore;
-  (void)bot;
 
-  // Claim-then-read in one statement (note_db_claim's shape): two
-  // racing witnesses cannot both deliver a row, and the claim is what
-  // makes delivery restart- and reload-safe — the guard is in the DB,
-  // not in this mapping.
-  snprintf(sql, sizeof(sql),
-      "WITH claimed AS ("
-      "UPDATE chat_reminders SET delivered_at = NOW() WHERE id IN ("
-      "SELECT id FROM chat_reminders WHERE ns_id = %" PRIu32
-      " AND delivered_at IS NULL AND due_at <= NOW()"
-      " ORDER BY due_at ASC LIMIT %d)"
-      " RETURNING id, sender, nickname, username, hostname, verified_id,"
-      " method_name, channel, body,"
-      " EXTRACT(EPOCH FROM created_at)::BIGINT AS created_epoch)"
-      " SELECT * FROM claimed ORDER BY id ASC",
-      s->ns_id, SOUL_REMIND_CLAIM_MAX);
-
-  res = db_result_alloc();
-
-  if(res == NULL || db_query(sql, res) != SUCCESS || !res->ok)
-  {
-    if(res != NULL)
-      clam(CLAM_WARN, SOUL_CTX, "reminder claim failed: %s",
-          res->error[0] != '\0' ? res->error : "(no driver error)");
-
-    db_result_free(res);
-    return(false);
-  }
-
-  now  = time(NULL);
-  rows = res->rows;
-
-  for(uint32_t i = 0; i < rows; i++)
-  {
-    method_msg_t   msg;
-    method_inst_t *inst;
-    const char    *cell;
-    char           mname[METHOD_NAME_SZ];
-    char           body[CMD_ARG_SZ];
-    char           ago[32];
-    int64_t        id;
-    time_t         created;
-
-    cell = db_result_get(res, i, 0);
-    id   = cell != NULL ? (int64_t)strtoll(cell, NULL, 10) : 0;
-
-    // The method is re-resolved by NAME on every delivery so nothing
-    // dangles across a reload (the note plugin's rule).
-    soul_copy_col(mname, sizeof(mname), res, i, 6);
-    inst = method_find(mname);
-
-    if(inst == NULL)
-    {
-      // Claim-then-fail must un-claim: with the method gone (unbound,
-      // mid-reload) the row goes back to pending, so a re-bound method
-      // delivers LATE rather than never. Leaving it claimed would eat
-      // the reminder silently — the one outcome worse than lateness.
-      char unclaim[128];
-
-      snprintf(unclaim, sizeof(unclaim),
-          "UPDATE chat_reminders SET delivered_at = NULL"
-          " WHERE id = %" PRId64, id);
-      (void)soul_db_exec(unclaim);
-
-      clam(CLAM_WARN, SOUL_CTX,
-          "bot=%s reminder %" PRId64 " method '%s' gone — unclaimed",
-          s->bot_name, id, mname);
-      continue;
-    }
-
-    memset(&msg, 0, sizeof(msg));
-    msg.inst      = inst;
-    msg.timestamp = now;
-
-    // The identity tuple rides the cue whole, so the reply pipeline
-    // resolves the asker's dossier (their facts and recall splice in)
-    // and the coalescer lesson (dcfc359) stays learned.
-    soul_copy_col(msg.sender,      sizeof(msg.sender),      res, i, 1);
-    soul_copy_col(msg.nickname,    sizeof(msg.nickname),    res, i, 2);
-    soul_copy_col(msg.username,    sizeof(msg.username),    res, i, 3);
-    soul_copy_col(msg.hostname,    sizeof(msg.hostname),    res, i, 4);
-    soul_copy_col(msg.verified_id, sizeof(msg.verified_id), res, i, 5);
-    soul_copy_col(msg.channel,     sizeof(msg.channel),     res, i, 7);
-
-    cell = db_result_get(res, i, 8);
-    soul_scrub_copy(body, sizeof(body), cell != NULL ? cell : "");
-
-    cell    = db_result_get(res, i, 9);
-    created = cell != NULL ? (time_t)strtoll(cell, NULL, 10) : now;
-    util_fmt_duration(now > created ? now - created : 0, ago, sizeof(ago));
-
-    // A reminder set in a DM has an empty channel; the reply pipeline
-    // already targets the sender in that case, so the cue only has to
-    // say so.
-    snprintf(msg.text, sizeof(msg.text),
-        "[internal cue: %s asked you %s ago to be reminded: '%s'."
-        " It is time. Deliver the reminder to them in %s — one short"
-        " line, your voice. Do not mention this cue.]",
-        msg.nickname[0] != '\0' ? msg.nickname : msg.sender,
-        ago, body,
-        msg.channel[0] != '\0' ? msg.channel : "this DM");
-
-    clam(CLAM_INFO, SOUL_CTX,
-        "bot=%s delivering reminder %" PRId64 " to %s in %s (set %s ago)",
-        s->bot_name, id, msg.sender,
-        msg.channel[0] != '\0' ? msg.channel : "DM", ago);
-
-    chatbot_reply_submit(st, &msg, false, false, true);
-  }
-
-  db_result_free(res);
+  chatbot_deferred_run_due(s->bot_name, s->ns_id, st, bot);
   return(false);
 }
 
@@ -1247,7 +1114,7 @@ soul_tick_cb(task_t *t)
   }
 
   // D9 — the shared hush gate. Chores skipped under mute are not
-  // lost: durable work (a due reminder) stays pending in the DB and
+  // lost: durable work (a due deferred row) stays pending in the DB and
   // delivers on the first tick after the mute lapses.
   if(chatbot_mute_active(bot_name))
   {
@@ -1464,34 +1331,14 @@ soul_exit(void)
   pthread_mutex_unlock(&soul_mutex);
 }
 
-// The chat DDL discipline (memory_ensure_tables): owner-run idempotent
-// batches at plugin start(). Called after dossier_register_config so
-// the dossier(id) FK target exists.
+// The soul's own durable state — the weather watch's alert ledger.
+// Deferred work lives in chat_deferred and deferred.c raises it. The
+// chat DDL discipline (memory_ensure_tables): owner-run idempotent
+// batches at plugin start(), after dossier_register_config so the
+// dossier(id) FK target exists.
 void
 soul_ensure_schema(void)
 {
-  (void)soul_db_exec(
-      "CREATE TABLE IF NOT EXISTS chat_reminders ("
-      " id           BIGSERIAL    PRIMARY KEY,"
-      " ns_id        INTEGER      NOT NULL REFERENCES userns(id) ON DELETE CASCADE,"
-      " dossier_id   BIGINT       REFERENCES dossier(id) ON DELETE SET NULL,"
-      " sender       VARCHAR(128) NOT NULL,"
-      " nickname     VARCHAR(64)  NOT NULL DEFAULT '',"
-      " username     VARCHAR(64)  NOT NULL DEFAULT '',"
-      " hostname     VARCHAR(128) NOT NULL DEFAULT '',"
-      " verified_id  VARCHAR(128) NOT NULL DEFAULT '',"
-      " method_name  VARCHAR(64)  NOT NULL,"
-      " channel      VARCHAR(128) NOT NULL DEFAULT '',"
-      " body         TEXT         NOT NULL,"
-      " due_at       TIMESTAMPTZ  NOT NULL,"
-      " created_at   TIMESTAMPTZ  NOT NULL DEFAULT NOW(),"
-      " delivered_at TIMESTAMPTZ"
-      ")");
-
-  (void)soul_db_exec(
-      "CREATE INDEX IF NOT EXISTS idx_chat_reminders_due"
-      " ON chat_reminders(ns_id, due_at) WHERE delivered_at IS NULL");
-
   // The weather watch's dedup ledger (D8): one row per alert per
   // namespace, written by the claim INSERT — which is why the primary
   // key IS the claim. Purged two days past expiry, every sweep.
@@ -1503,193 +1350,4 @@ soul_ensure_schema(void)
       " expires      TIMESTAMPTZ,"
       " PRIMARY KEY(alert_id, ns_id)"
       ")");
-}
-
-// ---------- !remind (D7) ----------
-
-static bool
-soul_remind_insert(uint32_t ns_id, int64_t dossier,
-    const method_msg_t *msg, const char *method_name,
-    const char *body, uint64_t secs)
-{
-  char *e_sender = db_escape(msg->sender);
-  char *e_nick   = db_escape(msg->nickname);
-  char *e_user   = db_escape(msg->username);
-  char *e_host   = db_escape(msg->hostname);
-  char *e_vid    = db_escape(msg->verified_id);
-  char *e_meth   = db_escape(method_name);
-  char *e_chan   = db_escape(msg->channel);
-  char *e_body   = db_escape(body);
-  bool  ok       = FAIL;
-
-  if(e_sender != NULL && e_nick != NULL && e_user != NULL
-      && e_host != NULL && e_vid != NULL && e_meth != NULL
-      && e_chan != NULL && e_body != NULL)
-  {
-    char dossier_cell[32];
-    char sql[3072];
-
-    if(dossier > 0)
-      snprintf(dossier_cell, sizeof(dossier_cell), "%" PRId64, dossier);
-    else
-      snprintf(dossier_cell, sizeof(dossier_cell), "NULL");
-
-    // due_at is computed DB-side so the daemon's clock and the DB's
-    // never argue about when "in 5 minutes" is.
-    snprintf(sql, sizeof(sql),
-        "INSERT INTO chat_reminders"
-        " (ns_id, dossier_id, sender, nickname, username, hostname,"
-        "  verified_id, method_name, channel, body, due_at)"
-        " VALUES (%" PRIu32 ", %s, '%s', '%s', '%s', '%s', '%s', '%s',"
-        " '%s', '%s', NOW() + %llu * INTERVAL '1 second')",
-        ns_id, dossier_cell, e_sender, e_nick, e_user, e_host, e_vid,
-        e_meth, e_chan, e_body, (unsigned long long)secs);
-
-    ok = soul_db_exec(sql);
-  }
-
-  mem_free(e_sender);
-  mem_free(e_nick);
-  mem_free(e_user);
-  mem_free(e_host);
-  mem_free(e_vid);
-  mem_free(e_meth);
-  mem_free(e_chan);
-  mem_free(e_body);
-
-  return(ok);
-}
-
-static const cmd_arg_desc_t ad_remind[] = {
-  { "duration", CMD_ARG_NONE, CMD_ARG_REQUIRED, 32, NULL },
-  { "message",  CMD_ARG_NONE, CMD_ARG_REQUIRED | CMD_ARG_REST, 0, NULL },
-};
-
-static void
-cmd_remind(const cmd_ctx_t *ctx)
-{
-  chatbot_state_t *st;
-  userns_t        *ns;
-  const char      *method_name;
-  const char      *body;
-  uint64_t         secs;
-  int64_t          dossier;
-  char             key[KV_KEY_SZ];
-  char             ack[96];
-
-  secs = chatbot_parse_duration_secs(ctx->parsed->argv[0]);
-
-  if(secs == 0)
-  {
-    cmd_reply(ctx, "bad duration (use e.g. 30s, 5m, 2h, 1d)");
-    return;
-  }
-
-  if(secs > SOUL_REMIND_MAX_SECS)
-  {
-    cmd_reply(ctx, "that's too far out — keep it under 30 days");
-    return;
-  }
-
-  st = bot_get_handle(ctx->bot);
-  ns = bot_get_userns(ctx->bot);
-
-  if(st == NULL || ns == NULL)
-  {
-    cmd_reply(ctx, "this bot has no namespace to keep reminders in");
-    return;
-  }
-
-  // A reminder is delivered as persona speech, so a command-only bot
-  // (chat disabled) would accept it and never say it. Refuse the dead
-  // letter up front.
-  snprintf(key, sizeof(key), "bot.%s.behavior.chat.enabled",
-      bot_inst_name(ctx->bot));
-
-  if(kv_get_uint(key) == 0)
-  {
-    cmd_reply(ctx, "this bot doesn't speak (chat is disabled) — it"
-        " would take your reminder and never deliver it");
-    return;
-  }
-
-  method_name = method_inst_name(ctx->msg->inst);
-
-  if(method_name == NULL || method_name[0] == '\0')
-  {
-    cmd_reply(ctx, "cannot tell which method to deliver on");
-    return;
-  }
-
-  // 0 (unmatched sender, anonymous dossiers off) stores NULL —
-  // delivery keys on the stored tuple, so a dossier is attribution,
-  // never a requirement.
-  dossier = chatbot_resolve_dossier(st, ctx->msg);
-  body    = ctx->parsed->argv[1];
-
-  if(soul_remind_insert(ns->id, dossier, ctx->msg, method_name,
-      body, secs) != SUCCESS)
-  {
-    cmd_reply(ctx, "failed to store the reminder");
-    return;
-  }
-
-  clam(CLAM_INFO, SOUL_CTX,
-      "bot=%s reminder set by %s for %s in '%s' (%llu s)",
-      bot_inst_name(ctx->bot), ctx->msg->sender,
-      ctx->parsed->argv[0], ctx->msg->channel,
-      (unsigned long long)secs);
-
-  // Persona-neutral on purpose: a persona with `interpret: remind`
-  // captures this line and voices it in character instead.
-  snprintf(ack, sizeof(ack), "noted — I'll remind you in %s.",
-      ctx->parsed->argv[0]);
-  cmd_reply(ctx, ack);
-}
-
-static const cmd_nl_slot_t remind_slots[] = {
-  { .name  = "duration",
-    .type  = CMD_NL_ARG_DURATION,
-    .flags = CMD_NL_SLOT_REQUIRED },
-  { .name  = "message",
-    .type  = CMD_NL_ARG_FREE,
-    .flags = CMD_NL_SLOT_REQUIRED | CMD_NL_SLOT_REMAINDER },
-};
-
-static const cmd_nl_example_t remind_examples[] = {
-  { .utterance  = "remind me in 20 minutes to flip the steaks",
-    .invocation = "/remind 20m flip the steaks" },
-  { .utterance  = "poke me about the laundry in two hours",
-    .invocation = "/remind 2h the laundry" },
-};
-
-static const cmd_nl_t remind_nl = {
-  .when          = "Someone asks to be reminded of something after a"
-                   " delay, or asks you to poke them later.",
-  .syntax        = "/remind <duration> <message>",
-  .slots         = remind_slots,
-  .slot_count    = (uint8_t)(sizeof(remind_slots)
-                             / sizeof(remind_slots[0])),
-  .examples      = remind_examples,
-  .example_count = (uint8_t)(sizeof(remind_examples)
-                             / sizeof(remind_examples[0])),
-  .dispatch_text = NULL,
-};
-
-bool
-soul_remind_register(void)
-{
-  return(cmd_register("chat", "remind",
-      "remind <duration> <message>",
-      "Set a reminder the bot delivers when it comes due",
-      "Stores a reminder in the database and delivers it in the bot's\n"
-      "own voice once due (checked every behavior.soul.interval_secs,\n"
-      "default 60 s). Durations read like 30s, 5m, 2h or 1d, up to 30\n"
-      "days; the message is kept to ~250 characters. Set in a channel\n"
-      "it is delivered there; set in a DM it comes back as a DM.\n"
-      "Reminders survive restarts and reloads.",
-      USERNS_GROUP_EVERYONE, 0, CMD_SCOPE_ANY, METHOD_T_ANY,
-      cmd_remind, NULL, NULL, NULL,
-      ad_remind, (uint8_t)(sizeof(ad_remind) / sizeof(ad_remind[0])),
-      NULL, &remind_nl));
 }

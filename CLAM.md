@@ -210,6 +210,7 @@ halves. Same shape as `gemini` / `gemini.ws`.
 |---|---|---|
 | `chatbot` | plugins/bot/chat/chatbot.c · plugins/bot/chat/volunteer.c | conversational observe/classify trace + volunteer-to-speak path |
 | `deauth` | plugins/bot/chat/dispatch.c | temp-MFA drop for the caller's hostmask |
+| `deferred` | plugins/bot/chat/deferred.c | the deferred spine — schedule, claim, delivery and fire-time permission refusals for `chat_deferred` (`DEFERRED_CTX`) |
 | `dossier` | plugins/bot/chat/dossier.c | dossier subsystem |
 | `extract` | plugins/bot/chat/extract.c | LLM-driven fact extraction |
 | `identify` | plugins/bot/chat/dispatch.c | `!identify` auth + temp-MFA mint |
@@ -222,7 +223,7 @@ halves. Same shape as `gemini` / `gemini.ws`.
 | `nl_observe` | plugins/bot/chat/nl_observe.c | post-dispatch chat observer (`OBS_CTX`) |
 | `reachy` | plugins/method/reachy/reachy.c | Reachy Mini method driver — the ear (bridge long-poll, transcription, attention gate, delivery) and the mouth (speech queue, synthesis, upload, playback pacing) (`REACHY_CTX`) |
 | `register` | plugins/bot/chat/dispatch.c | `/register` user creation |
-| `soul` | plugins/bot/chat/soul.c | per-bot heartbeat — chore scheduling, reminder claim/delivery, mute skips (`SOUL_CTX`) |
+| `soul` | plugins/bot/chat/soul.c | per-bot heartbeat — chore scheduling, the weather watch, mute skips (`SOUL_CTX`) |
 | `vision` | plugins/bot/chat/vision.c | image-intent path |
 
 ## Extension plugins (`plugins/extension/`)

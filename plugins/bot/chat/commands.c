@@ -238,8 +238,8 @@ chatbot_cmds_register(void)
         NULL, 0, NULL, NULL) != SUCCESS)
     goto fail_refresh_prompts;
 
-  if(soul_remind_register() != SUCCESS)
-    goto fail_remind;
+  if(chatbot_deferred_register() != SUCCESS)
+    goto fail_deferred;
 
   return(SUCCESS);
 
@@ -247,7 +247,7 @@ chatbot_cmds_register(void)
   // daemon does not come up with a half-registered chat surface — so
   // these labels unwind what they can name and leave the rest to the
   // reclamation that runs before any mapping is dropped.
-fail_remind:
+fail_deferred:
 fail_refresh_prompts:
 fail_show_verbs:
 fail_dossiersweep:
