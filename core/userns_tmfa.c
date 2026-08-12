@@ -234,7 +234,7 @@ userns_tmfa_add(userns_t *ns, const char *username, const char *metadata)
   for(e = c->entries; e != NULL; e = e->next)
   {
     if(e->user_id == user_id &&
-       strncmp(e->metadata, metadata, USERNS_MFA_PATTERN_SZ) == 0)
+       strncasecmp(e->metadata, metadata, USERNS_MFA_PATTERN_SZ) == 0)
     {
       e->last_seen = now;
       e->persisted_at = now;
@@ -333,7 +333,7 @@ userns_tmfa_resolve(userns_t *ns, const char *metadata,
 
   for(pp = &c->entries; (e = *pp) != NULL; pp = &e->next)
   {
-    if(strncmp(e->metadata, metadata, USERNS_MFA_PATTERN_SZ) != 0)
+    if(strncasecmp(e->metadata, metadata, USERNS_MFA_PATTERN_SZ) != 0)
       continue;
 
     if(user_out != NULL && user_sz > 0)
@@ -424,7 +424,7 @@ userns_tmfa_del(const userns_t *ns, const char *username,
   {
     if(e->user_id != user_id ||
        (metadata != NULL &&
-        strncmp(e->metadata, metadata, USERNS_MFA_PATTERN_SZ) != 0))
+        strncasecmp(e->metadata, metadata, USERNS_MFA_PATTERN_SZ) != 0))
     {
       pp = &e->next;
       continue;
