@@ -90,7 +90,12 @@ double kv_get_double(const char *key);
 // Returns 0.0 for missing or type-mismatched keys.
 long double kv_get_ldouble(const char *key);
 
-// Returns pointer to internal storage (valid until value changes), or NULL.
+// Returns pointer to internal storage (valid until value changes), or
+// NULL. ⚠ NULL also means "registered, but not KV_STR" — this reads
+// only string keys, so it is no use for asking whether a UINT32 or BOOL
+// key has a value. There is no such question to ask: a registered key
+// always answers with its default, so the typed getter above IS the
+// value, and 0 from it means the key says 0.
 const char *kv_get_str(const char *key);
 
 bool kv_set(const char *key, const char *val);
