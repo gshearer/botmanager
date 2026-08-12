@@ -960,6 +960,29 @@ void chatbot_deferred_ensure_schema(void);
 void chatbot_deferred_run_due(const char *bot_name, uint32_t ns_id,
     chatbot_state_t *st, bot_inst_t *bot);
 
+// One row of the soul's presence cache (CARE-2): the least a sighting
+// needs to recognise its subject, and nothing durable — the row itself
+// stays in the DB and the id is what gets claimed.
+typedef struct
+{
+  int64_t id;
+  char    nickname[METHOD_NICKNAME_SZ];
+  char    sender  [METHOD_SENDER_SZ];
+} chatbot_presence_row_t;
+
+// Drop presence rows whose window has closed, then fill `out` with up
+// to `max` rows still waiting for their subject to turn up. Returns how
+// many were written. Blocking (sync db_query) — tick thread only.
+uint32_t chatbot_deferred_presence_scan(const char *bot_name,
+    uint32_t ns_id, chatbot_presence_row_t *out, uint32_t max);
+
+// Claim one presence row by id and deliver it. A zero-row claim is the
+// normal outcome for the loser of a two-witness race, not an error.
+// Blocking — runs on the presence delivery task, never on the method
+// thread that saw the line.
+void chatbot_deferred_deliver_presence(const char *bot_name, uint32_t ns_id,
+    chatbot_state_t *st, bot_inst_t *bot, int64_t id);
+
 // Register /remind, /in (+ list, cancel) and /show deferred. Called
 // from chatbot_cmds_register.
 bool chatbot_deferred_register(void);
@@ -978,6 +1001,13 @@ void soul_ensure_schema(void);
 void soul_schedule(const char *bot_name, uint32_t ns_id,
     uint32_t interval_secs);
 void soul_unschedule(const char *bot_name);
+
+// Presence, the soul's second trigger kind (CARE-2). Called from
+// chatbot_observe for every line the conversational half sees, on the
+// method's delivery thread: it must stay cheap and must never block.
+// When no bot in this daemon owes presence-gated work it is one relaxed
+// atomic load and a return.
+void soul_on_seen(const char *bot_name, const method_msg_t *msg);
 void soul_stop(void);
 void soul_exit(void);
 

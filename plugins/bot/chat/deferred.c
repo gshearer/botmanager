@@ -15,9 +15,15 @@
 // UPDATE is the guard, so a reload or a crash mid-window delivers late
 // rather than twice or never. Everything durable a later chore needs
 // — a birthday wish waiting on a sighting, a follow-up question —
-// lands in this same table, which is why the row carries `source`,
-// `deliver_on_presence` and `expires_at` that nothing in this chunk
-// writes yet.
+// lands in this same table.
+//
+// A row's moment is either a clock or a person. `due_at` names the
+// first; `deliver_on_presence` names the second (CARE-2), and the two
+// claim paths are disjoint by construction — the due sweep claims only
+// `deliver_on_presence = FALSE`, a sighting claims one row by id. Both
+// project the same columns and share one deliver, so say/run, expiry
+// and the method-gone un-claim behave identically whichever moment
+// arrived. CARE-5/6 are the first writers of presence rows.
 
 #define CHATBOT_INTERNAL
 #include "chatbot.h"
@@ -59,15 +65,23 @@ typedef enum
   DEFERRED_KIND_RUN = 1,
 } deferred_kind_t;
 
-// Claim RETURNING order. The fire path reads by index and the SQL
-// below is the only place the order is written, so the two live
+// Claim RETURNING order. The fire path reads by index and the column
+// list below is the only place the order is written, so the two live
 // together and an inserted column breaks one build, not one delivery.
+// Both claim paths — the due sweep and a presence sighting — project
+// exactly this shape, which is what lets them share one deliver.
 enum
 {
   DC_ID = 0, DC_SOURCE, DC_KIND, DC_SENDER, DC_NICKNAME, DC_USERNAME,
   DC_HOSTNAME, DC_VERIFIED_ID, DC_METADATA, DC_METHOD_NAME, DC_CHANNEL,
   DC_BODY, DC_CMD_NAME, DC_REPEAT, DC_CREATED, DC_EXPIRED,
 };
+
+#define DEFERRED_CLAIM_COLS \
+    "id, source, kind, sender, nickname, username, hostname," \
+    " verified_id, metadata, method_name, channel, body, cmd_name," \
+    " repeat_secs, EXTRACT(EPOCH FROM created_at)::BIGINT AS created_epoch," \
+    " (expires_at IS NOT NULL AND expires_at < NOW()) AS expired"
 
 // ---------- schema ----------
 
@@ -484,6 +498,89 @@ deferred_deliver_run(chatbot_state_t *st, bot_inst_t *bot, uint32_t ns_id,
   chatbot_nl_observe_location_slot(bot, msg, ns_id, cmd_get_nl(def), args);
 }
 
+// Deliver one already-claimed row. Both claim paths land here, so the
+// expiry drop, the method-gone un-claim and the say/run split are
+// written once. `res` must project DEFERRED_CLAIM_COLS.
+static void
+deferred_deliver_row(const char *bot_name, uint32_t ns_id,
+    chatbot_state_t *st, bot_inst_t *bot, const db_result_t *res,
+    uint32_t i, time_t now)
+{
+  method_msg_t msg;
+  int64_t      id      = deferred_col_i64(res, i, DC_ID, 0);
+  int64_t      kind    = deferred_col_i64(res, i, DC_KIND, DEFERRED_KIND_SAY);
+  time_t       created = (time_t)deferred_col_i64(res, i, DC_CREATED, now);
+  const char  *expired = db_result_get(res, i, DC_EXPIRED);
+  char         source[24];
+  char         body[CMD_ARG_SZ];
+  char         ago[32];
+
+  deferred_copy_col(source, sizeof(source), res, i, DC_SOURCE);
+
+  // Expiry is claim-and-drop: a wish two days stale or a watch whose
+  // window closed is worse spoken late than never spoken at all.
+  if(expired != NULL && (expired[0] == 't' || expired[0] == 'T'))
+  {
+    clam(CLAM_DEBUG, DEFERRED_CTX,
+        "bot=%s deferred %" PRId64 " (%s) expired — dropped unspoken",
+        bot_name, id, source);
+    return;
+  }
+
+  if(deferred_row_to_msg(res, i, &msg, now) == NULL)
+  {
+    // Claim-then-fail must un-claim: with the method gone (unbound,
+    // mid-reload) the row goes back to pending, so a re-bound method
+    // delivers LATE rather than never. Leaving it claimed would eat
+    // the work silently — the one outcome worse than lateness.
+    //
+    // ⚠ Not for a REPEATING row. The claim statement already wrote
+    // its successor, so un-claiming would re-offer the same row on
+    // the very next tick and write another successor, and another —
+    // one child per tick for as long as the method stays gone
+    // (measured 2026-08-11: three ticks, three rows). A recurrence
+    // is by definition re-offered, so the honest outcome is to skip
+    // this occurrence and let the successor stand.
+    int64_t repeat = deferred_col_i64(res, i, DC_REPEAT, 0);
+
+    if(repeat < DEFERRED_REPEAT_MIN)
+    {
+      char unclaim[128];
+
+      snprintf(unclaim, sizeof(unclaim),
+          "UPDATE chat_deferred SET delivered_at = NULL"
+          " WHERE id = %" PRId64, id);
+      (void)deferred_exec(unclaim);
+    }
+
+    clam(CLAM_WARN, DEFERRED_CTX,
+        "bot=%s deferred %" PRId64 " method gone — %s",
+        bot_name, id,
+        repeat < DEFERRED_REPEAT_MIN
+            ? "unclaimed" : "occurrence skipped (successor stands)");
+    return;
+  }
+
+  {
+    const char *cell = db_result_get(res, i, DC_BODY);
+
+    deferred_scrub_copy(body, sizeof(body), cell != NULL ? cell : "");
+  }
+
+  util_fmt_duration(now > created ? now - created : 0, ago, sizeof(ago));
+
+  clam(CLAM_INFO, DEFERRED_CTX,
+      "bot=%s delivering %s %" PRId64 " (%s) to %s in %s (set %s ago)",
+      bot_name, kind == DEFERRED_KIND_RUN ? "run" : "say", id, source,
+      msg.sender, msg.channel[0] != '\0' ? msg.channel : "DM", ago);
+
+  if(kind == DEFERRED_KIND_RUN)
+    deferred_deliver_run(st, bot, ns_id, &msg, body, ago);
+
+  else
+    deferred_deliver_say(st, &msg, source, body, ago);
+}
+
 void
 chatbot_deferred_run_due(const char *bot_name, uint32_t ns_id,
     chatbot_state_t *st, bot_inst_t *bot)
@@ -506,10 +603,9 @@ chatbot_deferred_run_due(const char *bot_name, uint32_t ns_id,
       " AND delivered_at IS NULL AND deliver_on_presence = FALSE"
       " AND due_at <= NOW()"
       " ORDER BY due_at ASC LIMIT %d)"
-      " RETURNING id, source, kind, sender, nickname, username, hostname,"
-      " verified_id, metadata, method_name, channel, body, cmd_name,"
-      " repeat_secs, EXTRACT(EPOCH FROM created_at)::BIGINT AS created_epoch,"
-      " (expires_at IS NOT NULL AND expires_at < NOW()) AS expired,"
+      " RETURNING " DEFERRED_CLAIM_COLS ","
+      // Carried past the projection the deliver path reads so the
+      // recurrence INSERT below can copy the row whole.
       " ns_id, dossier_id, deliver_on_presence, expires_at),"
       " renewed AS ("
       "INSERT INTO chat_deferred"
@@ -540,81 +636,118 @@ chatbot_deferred_run_due(const char *bot_name, uint32_t ns_id,
   rows = res->rows;
 
   for(uint32_t i = 0; i < rows; i++)
-  {
-    method_msg_t msg;
-    int64_t      id      = deferred_col_i64(res, i, DC_ID, 0);
-    int64_t      kind    = deferred_col_i64(res, i, DC_KIND, DEFERRED_KIND_SAY);
-    time_t       created = (time_t)deferred_col_i64(res, i, DC_CREATED, now);
-    const char  *expired = db_result_get(res, i, DC_EXPIRED);
-    char         source[24];
-    char         body[CMD_ARG_SZ];
-    char         ago[32];
+    deferred_deliver_row(bot_name, ns_id, st, bot, res, i, now);
 
-    deferred_copy_col(source, sizeof(source), res, i, DC_SOURCE);
+  db_result_free(res);
+}
 
-    // Expiry is claim-and-drop: a wish two days stale or a watch whose
-    // window closed is worse spoken late than never spoken at all.
-    if(expired != NULL && (expired[0] == 't' || expired[0] == 'T'))
+// ---------- fire time: presence (CARE-2) ----------
+//
+// A presence row is work whose moment is a person, not a clock. The
+// tick never claims one — its claim carries `deliver_on_presence =
+// FALSE` — so these two entry points are the whole of its lifecycle:
+// the tick offers the waiting subjects to the soul's cache, and a
+// sighting comes back here to claim exactly one row by id.
+//
+// The venue is the row's, not the sighting's: being seen in #botman
+// only *unlocks* a wish told in a DM, it does not move it into the
+// channel. deferred_row_to_msg already reads the stored channel, so
+// provenance routes delivery for free.
+
+uint32_t
+chatbot_deferred_presence_scan(const char *bot_name, uint32_t ns_id,
+    chatbot_presence_row_t *out, uint32_t max)
+{
+  db_result_t *res;
+  char         sql[1024];
+  uint32_t     n = 0;
+
+  // Expiry belongs to the tick, never to the sighting: a window that
+  // closed while its subject was away must not sit in the cache waiting
+  // to be spoken days late. Claim-and-log, same as the due sweep.
+  snprintf(sql, sizeof(sql),
+      "UPDATE chat_deferred SET delivered_at = NOW()"
+      " WHERE ns_id = %" PRIu32 " AND delivered_at IS NULL"
+      " AND deliver_on_presence AND expires_at IS NOT NULL"
+      " AND expires_at < NOW() RETURNING id, source", ns_id);
+
+  res = db_result_alloc();
+
+  if(res != NULL && db_query(sql, res) == SUCCESS && res->ok)
+    for(uint32_t i = 0; i < res->rows; i++)
     {
+      const char *id  = db_result_get(res, i, 0);
+      const char *src = db_result_get(res, i, 1);
+
       clam(CLAM_DEBUG, DEFERRED_CTX,
-          "bot=%s deferred %" PRId64 " (%s) expired — dropped unspoken",
-          bot_name, id, source);
-      continue;
+          "bot=%s presence %s (%s) expired unseen — dropped unspoken",
+          bot_name, id != NULL ? id : "?", src != NULL ? src : "?");
     }
 
-    if(deferred_row_to_msg(res, i, &msg, now) == NULL)
-    {
-      // Claim-then-fail must un-claim: with the method gone (unbound,
-      // mid-reload) the row goes back to pending, so a re-bound method
-      // delivers LATE rather than never. Leaving it claimed would eat
-      // the work silently — the one outcome worse than lateness.
-      //
-      // ⚠ Not for a REPEATING row. The claim statement already wrote
-      // its successor, so un-claiming would re-offer the same row on
-      // the very next tick and write another successor, and another —
-      // one child per tick for as long as the method stays gone
-      // (measured 2026-08-11: three ticks, three rows). A recurrence
-      // is by definition re-offered, so the honest outcome is to skip
-      // this occurrence and let the successor stand.
-      int64_t repeat = deferred_col_i64(res, i, DC_REPEAT, 0);
+  db_result_free(res);
 
-      if(repeat < DEFERRED_REPEAT_MIN)
-      {
-        char unclaim[128];
+  if(out == NULL || max == 0)
+    return(0);
 
-        snprintf(unclaim, sizeof(unclaim),
-            "UPDATE chat_deferred SET delivered_at = NULL"
-            " WHERE id = %" PRId64, id);
-        (void)deferred_exec(unclaim);
-      }
+  snprintf(sql, sizeof(sql),
+      "SELECT id, nickname, sender FROM chat_deferred"
+      " WHERE ns_id = %" PRIu32 " AND delivered_at IS NULL"
+      " AND deliver_on_presence AND due_at <= NOW()"
+      " ORDER BY due_at ASC LIMIT %" PRIu32, ns_id, max);
 
-      clam(CLAM_WARN, DEFERRED_CTX,
-          "bot=%s deferred %" PRId64 " method gone — %s",
-          bot_name, id,
-          repeat < DEFERRED_REPEAT_MIN
-              ? "unclaimed" : "occurrence skipped (successor stands)");
-      continue;
-    }
+  res = db_result_alloc();
 
-    {
-      const char *cell = db_result_get(res, i, DC_BODY);
+  if(res == NULL || db_query(sql, res) != SUCCESS || !res->ok)
+  {
+    if(res != NULL)
+      clam(CLAM_WARN, DEFERRED_CTX, "presence scan failed: %s",
+          res->error[0] != '\0' ? res->error : "(no driver error)");
 
-      deferred_scrub_copy(body, sizeof(body), cell != NULL ? cell : "");
-    }
-
-    util_fmt_duration(now > created ? now - created : 0, ago, sizeof(ago));
-
-    clam(CLAM_INFO, DEFERRED_CTX,
-        "bot=%s delivering %s %" PRId64 " (%s) to %s in %s (set %s ago)",
-        bot_name, kind == DEFERRED_KIND_RUN ? "run" : "say", id, source,
-        msg.sender, msg.channel[0] != '\0' ? msg.channel : "DM", ago);
-
-    if(kind == DEFERRED_KIND_RUN)
-      deferred_deliver_run(st, bot, ns_id, &msg, body, ago);
-
-    else
-      deferred_deliver_say(st, &msg, source, body, ago);
+    db_result_free(res);
+    return(0);
   }
+
+  for(uint32_t i = 0; i < res->rows && n < max; i++, n++)
+  {
+    out[n].id = deferred_col_i64(res, i, 0, 0);
+    deferred_copy_col(out[n].nickname, sizeof(out[n].nickname), res, i, 1);
+    deferred_copy_col(out[n].sender,   sizeof(out[n].sender),   res, i, 2);
+  }
+
+  db_result_free(res);
+  return(n);
+}
+
+void
+chatbot_deferred_deliver_presence(const char *bot_name, uint32_t ns_id,
+    chatbot_state_t *st, bot_inst_t *bot, int64_t id)
+{
+  db_result_t *res;
+  char         sql[1024];
+
+  snprintf(sql, sizeof(sql),
+      "UPDATE chat_deferred SET delivered_at = NOW()"
+      " WHERE id = %" PRId64 " AND ns_id = %" PRIu32
+      " AND delivered_at IS NULL AND deliver_on_presence"
+      " RETURNING " DEFERRED_CLAIM_COLS, id, ns_id);
+
+  res = db_result_alloc();
+
+  if(res == NULL || db_query(sql, res) != SUCCESS || !res->ok)
+  {
+    if(res != NULL)
+      clam(CLAM_WARN, DEFERRED_CTX, "presence claim failed: %s",
+          res->error[0] != '\0' ? res->error : "(no driver error)");
+
+    db_result_free(res);
+    return;
+  }
+
+  // Zero rows is the ordinary losing side of a race — two bots in one
+  // namespace both saw the line and the other one is delivering it.
+  // Nothing to say about that.
+  if(res->rows > 0)
+    deferred_deliver_row(bot_name, ns_id, st, bot, res, 0, time(NULL));
 
   db_result_free(res);
 }

@@ -2238,6 +2238,16 @@ chatbot_observe(chatbot_state_t *st, const method_msg_t *msg)
     chatbot_engagement_stamp(&st->engagement, msg->channel, msg->sender,
         time(NULL));
 
+  // CARE-2: a sighting is the soul's second kind of moment. Work that
+  // was waiting for this person to turn up — a birthday wish, a
+  // follow-up question — is claimed and delivered from here.
+  //
+  // Deliberately ahead of the witness-log drop: being seen is not the
+  // same as being logged, and a bot running with witness_log off still
+  // has eyes. Costs one relaxed atomic load per line when nobody is
+  // being waited for, which is nearly always.
+  soul_on_seen(botname, msg);
+
   // Drop WITNESS lines if witness logging is disabled for this instance.
   if(kind == MEM_MSG_WITNESS)
   {

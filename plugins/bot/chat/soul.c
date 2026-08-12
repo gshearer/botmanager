@@ -11,9 +11,14 @@
 // mutex-guarded sched list whose entries outlive bot stops, and a soft
 // latch instead of task churn.
 //
-// This file owns the schedule and the weather watch. The deferred
-// spine — chat_deferred, /remind, /in — is deferred.c's; the chore
-// here is one call into it.
+// Two things can make a chore's moment arrive: a clock, and a person.
+// The tick is the clock. Presence is the person (CARE-2) — every line
+// the conversational half sees passes soul_on_seen(), and work that was
+// waiting for its subject to turn up is claimed and delivered then.
+//
+// This file owns the schedule, presence, and the weather watch. The
+// deferred spine — chat_deferred, /remind, /in — is deferred.c's; the
+// chores here are calls into it.
 
 #define CHATBOT_INTERNAL
 #include "chatbot.h"
@@ -27,6 +32,7 @@
 #include <stdarg.h>
 #include <stdio.h>
 #include <string.h>
+#include <strings.h>
 
 #define SOUL_CTX "soul"
 
@@ -43,6 +49,11 @@
 #define SOUL_WX_POINTS_MAX            32
 #define SOUL_WX_WATCHERS_MAX          8
 #define SOUL_WX_CUE_ALERTS_MAX        3
+
+// How many subjects a bot watches for at once. The cache is a hint, not
+// a queue: whatever does not fit is simply offered on the next tick, and
+// the claim in the DB is what decides who gets delivered.
+#define SOUL_PRESENCE_MAX             16
 
 typedef struct soul_sched soul_sched_t;
 
@@ -69,11 +80,14 @@ typedef struct
 
 static bool soul_chore_deferred(soul_sched_t *, uint32_t,
     chatbot_state_t *, bot_inst_t *);
+static bool soul_chore_presence(soul_sched_t *, uint32_t,
+    chatbot_state_t *, bot_inst_t *);
 static bool soul_chore_weather(soul_sched_t *, uint32_t,
     chatbot_state_t *, bot_inst_t *);
 
 static const soul_chore_t soul_chores[] = {
   { "deferred", NULL,      0,                             soul_chore_deferred },
+  { "presence", NULL,      0,                             soul_chore_presence },
   { "weather",  "weather", SOUL_WX_INTERVAL_DEFAULT_SECS, soul_chore_weather  },
 };
 
@@ -92,11 +106,22 @@ struct soul_sched
   task_handle_t  task;
   time_t         last_ran [SOUL_CHORE_COUNT];
   bool           in_flight[SOUL_CHORE_COUNT];
+
+  // Who this bot is watching for, rebuilt from the DB every tick.
+  // Guarded by soul_mutex; never a source of truth — see soul_on_seen.
+  chatbot_presence_row_t presence[SOUL_PRESENCE_MAX];
+  uint32_t               n_presence;
+
   soul_sched_t  *next;
 };
 
 static soul_sched_t   *soul_sched_head = NULL;
 static pthread_mutex_t soul_mutex      = PTHREAD_MUTEX_INITIALIZER;
+
+// True while any bot in this daemon has a subject to watch for. The one
+// thing an idle line pays: a relaxed load, no lock, no lookup. It is a
+// pure fast-path hint — every claim that follows is still the DB's.
+static bool            soul_presence_any = false;
 
 // Statics vanish with the mapping, so an initializer is the whole init
 // story; soul_exit() flips it for the teardown window.
@@ -169,6 +194,169 @@ soul_chore_deferred(soul_sched_t *s, uint32_t chore,
 
   chatbot_deferred_run_due(s->bot_name, s->ns_id, st, bot);
   return(false);
+}
+
+// ---------- chore + trigger: presence (CARE-2) ----------
+//
+// The second kind of moment. A `deliver_on_presence` row names a person
+// rather than an instant, so the tick cannot deliver it — all the tick
+// does is ask the DB who is being waited for and hand the answer to the
+// cache. The delivery happens when that person next says anything.
+//
+// The cache is deliberately not authoritative. It is rebuilt whole
+// every tick, so a reload, a restart or a hand-inserted row all heal on
+// the next fire, and a stale entry costs at most one claim that returns
+// zero rows.
+
+// Caller holds soul_mutex.
+static void
+soul_presence_refresh_locked(void)
+{
+  bool any = false;
+
+  for(soul_sched_t *s = soul_sched_head; s != NULL && !any; s = s->next)
+    any = (s->active && s->n_presence > 0);
+
+  __atomic_store_n(&soul_presence_any, any, __ATOMIC_RELAXED);
+}
+
+static bool
+soul_chore_presence(soul_sched_t *s, uint32_t chore, chatbot_state_t *st,
+    bot_inst_t *bot)
+{
+  chatbot_presence_row_t rows[SOUL_PRESENCE_MAX];
+  uint32_t               n;
+
+  (void)chore;
+  (void)st;
+  (void)bot;
+
+  // Scanned outside the mutex — it is two round-trips to a remote
+  // database and the cache it feeds is read on the delivery thread of
+  // every method this daemon speaks.
+  n = chatbot_deferred_presence_scan(s->bot_name, s->ns_id, rows,
+      SOUL_PRESENCE_MAX);
+
+  pthread_mutex_lock(&soul_mutex);
+
+  if(n > 0)
+    memcpy(s->presence, rows, n * sizeof(rows[0]));
+
+  s->n_presence = n;
+  soul_presence_refresh_locked();
+  pthread_mutex_unlock(&soul_mutex);
+
+  return(false);
+}
+
+// A sighting is a match on either name the row stored. Nick case is not
+// identity on IRC, and an empty stored field matches nobody — comparing
+// "" to "" would make every anonymous line a hit.
+static bool
+soul_presence_matches(const chatbot_presence_row_t *r,
+    const method_msg_t *msg)
+{
+  if(r->nickname[0] != '\0' && msg->nickname[0] != '\0'
+      && strcasecmp(r->nickname, msg->nickname) == 0)
+    return(true);
+
+  return(r->sender[0] != '\0' && msg->sender[0] != '\0'
+      && strcasecmp(r->sender, msg->sender) == 0);
+}
+
+typedef struct
+{
+  char     bot_name[BOT_NAME_SZ];
+  uint32_t ns_id;
+  int64_t  id;
+} soul_presence_job_t;
+
+// The claim is a database round-trip and the delivery submits a reply,
+// so neither may happen on the thread still walking this line through
+// its subscribers. Nothing is carried across but names and an id: the
+// bot is re-resolved here, because a sighting and its claim are on
+// different threads and the bot may have stopped in between.
+static void
+soul_presence_task(task_t *t)
+{
+  soul_presence_job_t *j = t->data;
+  bot_inst_t          *bot;
+  chatbot_state_t     *st;
+
+  if(j == NULL)
+    return;
+
+  bot = bot_find(j->bot_name);
+
+  // Skip before claiming, never after (the D9 mute precedent): a row
+  // this bot cannot speak right now stays pending, and the next tick
+  // puts it back in the cache. Deferred is late, never lost.
+  if(soul_ready && bot != NULL && bot_get_state(bot) == BOT_RUNNING
+      && (st = bot_get_handle(bot)) != NULL
+      && !chatbot_mute_active(j->bot_name))
+    chatbot_deferred_deliver_presence(j->bot_name, j->ns_id, st, bot, j->id);
+
+  mem_free(j);
+}
+
+void
+soul_on_seen(const char *bot_name, const method_msg_t *msg)
+{
+  soul_sched_t        *s;
+  soul_presence_job_t *j;
+  int64_t              id = 0;
+  uint32_t             ns_id = 0;
+
+  // The idle cost of this entire feature, paid once per line: one
+  // relaxed load of a flag that is false unless some bot in this daemon
+  // is actually waiting for somebody. No lock, no list walk, no alloc.
+  if(!__atomic_load_n(&soul_presence_any, __ATOMIC_RELAXED))
+    return;
+
+  if(!soul_ready || bot_name == NULL || msg == NULL)
+    return;
+
+  pthread_mutex_lock(&soul_mutex);
+  s = soul_sched_find_locked(bot_name);
+
+  if(s != NULL && s->active)
+    for(uint32_t i = 0; i < s->n_presence; i++)
+    {
+      if(!soul_presence_matches(&s->presence[i], msg))
+        continue;
+
+      id    = s->presence[i].id;
+      ns_id = s->ns_id;
+
+      // Drop it from the cache before releasing the mutex. The DB claim
+      // is what makes delivery exactly-once, but a chatty subject would
+      // otherwise spawn one task per line, all but one of them existing
+      // only to lose the race.
+      s->presence[i] = s->presence[--s->n_presence];
+      soul_presence_refresh_locked();
+      break;
+    }
+
+  pthread_mutex_unlock(&soul_mutex);
+
+  if(id == 0)
+    return;
+
+  j = mem_alloc("chat", "soul_presence_job", sizeof(*j));
+
+  if(j == NULL)
+    return;
+
+  memset(j, 0, sizeof(*j));
+  snprintf(j->bot_name, sizeof(j->bot_name), "%s", bot_name);
+  j->ns_id = ns_id;
+  j->id    = id;
+
+  clam(CLAM_DEBUG, SOUL_CTX, "bot=%s presence %" PRId64 " triggered by %s",
+      bot_name, id, msg->sender);
+
+  if(task_add("soul_presence", TASK_ANY, 200, soul_presence_task, j) == NULL)
+    mem_free(j);
 }
 
 // ---------- chore: weather (D8) ----------
@@ -1271,7 +1459,11 @@ soul_unschedule(const char *bot_name)
   s = soul_sched_find_locked(bot_name);
 
   if(s != NULL)
-    s->active = false;
+  {
+    s->active     = false;
+    s->n_presence = 0;
+    soul_presence_refresh_locked();
+  }
 
   pthread_mutex_unlock(&soul_mutex);
 
@@ -1288,7 +1480,8 @@ soul_stop(void)
 
   for(soul_sched_t *s = soul_sched_head; s != NULL; s = s->next)
   {
-    s->active = false;
+    s->active     = false;
+    s->n_presence = 0;
 
     if(s->task == TASK_HANDLE_NONE)
       continue;
@@ -1298,6 +1491,7 @@ soul_stop(void)
     cancelled++;
   }
 
+  soul_presence_refresh_locked();
   pthread_mutex_unlock(&soul_mutex);
 
   if(cancelled > 0)
@@ -1319,6 +1513,7 @@ soul_exit(void)
   pthread_mutex_lock(&soul_mutex);
   s               = soul_sched_head;
   soul_sched_head = NULL;
+  __atomic_store_n(&soul_presence_any, false, __ATOMIC_RELAXED);
 
   while(s != NULL)
   {
