@@ -213,6 +213,7 @@ halves. Same shape as `gemini` / `gemini.ws`.
 | `deferred` | plugins/bot/chat/deferred.c | the deferred spine — schedule, claim, delivery and fire-time permission refusals for `chat_deferred` (`DEFERRED_CTX`) |
 | `dossier` | plugins/bot/chat/dossier.c | dossier subsystem |
 | `extract` | plugins/bot/chat/extract.c | LLM-driven fact extraction |
+| `followups` | plugins/bot/chat/followups.c | the follow-ups chore — a plan whose date has passed claimed once, and the question held until its subject turns up (`FOLLOWUPS_CTX`) |
 | `identify` | plugins/bot/chat/dispatch.c | `!identify` auth + temp-MFA mint |
 | `interject` | plugins/bot/chat/volunteer.c | chatbot interjection scoring |
 | `interpret` | plugins/bot/chat/interpret.c | interpreted command output — reply-sink capture open/close + cue hand-off (`INTERPRET_CTX`) |

@@ -182,8 +182,9 @@ static const plugin_kv_entry_t chatbot_inst_schema[] = {
     " city_of_interest facts (written by the NL bridge observer after"
     " a successful /weather), fetches active NWS alerts per distinct"
     " coordinate and announces fresh ones in persona — once per alert,"
-    " claimed in chat_soul_alerts_seen. Off by default: unprompted"
-    " speech is an operator decision.", NULL },
+    " claimed as 'wxalert:<id>' in the soul's shared chat_soul_claims"
+    " ledger. Off by default: unprompted speech is an operator"
+    " decision.", NULL },
   { "behavior.soul.weather.interval_secs", KV_UINT32, "600",
     "Seconds between weather watch sweeps (min 5). The soul tick still"
     " paces the floor: a sweep fires on the first tick after this"
@@ -204,6 +205,19 @@ static const plugin_kv_entry_t chatbot_inst_schema[] = {
     "Seconds between occasion sweeps (min 5). A date changes once a"
     " day, so hourly is generous — it is what lets a bot started at noon"
     " still catch the day's birthdays.", NULL },
+  { "behavior.soul.followups.enabled", KV_BOOL, "false",
+    "Follow-ups: each sweep looks for a plan somebody told the bot about"
+    " themselves (an 'upcoming_event:<thing>' fact dated YYYY-MM-DD or"
+    " YYYY-MM) whose date passed in the last week, and holds a question"
+    " about how it went until they are next seen speaking — in the venue"
+    " they mentioned it in. Asked once per person per event, and dropped"
+    " unspoken a week after the event. Off by default: unprompted speech"
+    " is an operator decision.", NULL },
+  { "behavior.soul.followups.interval_secs", KV_UINT32, "3600",
+    "Seconds between follow-up sweeps (min 5). The window an event stays"
+    " askable is days wide, so this is not about precision — it is what"
+    " lets a plan whose date passed while the daemon was down still be"
+    " noticed within the hour.", NULL },
   // --- behavior.soul.budget.* / .quiet.* — the voice governor (CARE-3)
   // One gate for every chore: how often the bot may speak unprompted,
   // and when it must not. Weather used to carry its own hourly cap and

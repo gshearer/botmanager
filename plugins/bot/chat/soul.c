@@ -57,6 +57,12 @@
 // rather than waiting for midnight.
 #define SOUL_OCC_INTERVAL_DEFAULT_SECS 3600
 
+// Follow-ups run on the same clock and for a related reason: the window
+// an event is asked about is days wide, so the cadence is not about
+// precision at all — it is what lets a plan whose date passed while the
+// daemon was down still be noticed within the hour.
+#define SOUL_FUP_INTERVAL_DEFAULT_SECS 3600
+
 // How many subjects a bot watches for at once. The cache is a hint, not
 // a queue: whatever does not fit is simply offered on the next tick, and
 // the claim in the DB is what decides who gets delivered.
@@ -93,12 +99,15 @@ static bool soul_chore_weather(soul_sched_t *, uint32_t,
     chatbot_state_t *, bot_inst_t *);
 static bool soul_chore_occasions(soul_sched_t *, uint32_t,
     chatbot_state_t *, bot_inst_t *);
+static bool soul_chore_followups(soul_sched_t *, uint32_t,
+    chatbot_state_t *, bot_inst_t *);
 
 static const soul_chore_t soul_chores[] = {
   { "deferred",  NULL,        0,                              soul_chore_deferred  },
   { "presence",  NULL,        0,                              soul_chore_presence  },
   { "weather",   "weather",   SOUL_WX_INTERVAL_DEFAULT_SECS,  soul_chore_weather   },
   { "occasions", "occasions", SOUL_OCC_INTERVAL_DEFAULT_SECS, soul_chore_occasions },
+  { "followups", "followups", SOUL_FUP_INTERVAL_DEFAULT_SECS, soul_chore_followups },
 };
 
 #define SOUL_CHORE_COUNT (sizeof(soul_chores) / sizeof(soul_chores[0]))
@@ -1306,6 +1315,22 @@ soul_chore_occasions(soul_sched_t *s, uint32_t chore, chatbot_state_t *st,
   (void)st;
 
   chatbot_occasions_run(s->bot_name, s->ns_id, bot);
+  return(false);
+}
+
+// ---------- chore: follow-ups (CARE-6) ----------
+//
+// The same division again: the schedule is here, the scan, the claim
+// and the question it hands to the deferred spine are followups.c's.
+
+static bool
+soul_chore_followups(soul_sched_t *s, uint32_t chore, chatbot_state_t *st,
+    bot_inst_t *bot)
+{
+  (void)chore;
+  (void)st;
+
+  chatbot_followups_run(s->bot_name, s->ns_id, bot);
   return(false);
 }
 

@@ -1054,6 +1054,18 @@ bool chatbot_deferred_register(void);
 void chatbot_occasions_run(const char *bot_name, uint32_t ns_id,
     bot_inst_t *bot);
 
+// ---- followups.c — plans somebody told the bot about (CARE-6) ----
+
+// One sweep of the follow-ups chore: scan the namespace for
+// `upcoming_event:*` facts whose date has just passed, claim each at
+// most once per person per event, and hand a question to the deferred
+// spine to ask when its subject is next seen. Speaks nothing itself,
+// and owns nothing about the answer — the ordinary extract sweep reads
+// that like any other line. Blocking (sync db_query) — runs on the
+// tick's worker thread only.
+void chatbot_followups_run(const char *bot_name, uint32_t ns_id,
+    bot_inst_t *bot);
+
 // ---- soul.c — the per-bot heartbeat (SOUL-2) ----
 
 // Idempotent DDL for the soul's own tables (the generic claim ledger).
