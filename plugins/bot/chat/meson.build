@@ -10,7 +10,7 @@ chat_plugin = shared_library('chat',
    'show_verbs.c', 'interests.c', 'memory.c', 'memory_rag.c',
    'memory_cmd.c', 'memory_backfill.c',
    'volunteer.c', 'vision.c', 'extract.c', 'extract_prompt.c',
-   'fact_vocab.c'],
+   'fact_vocab.c', 'remember.c'],
   # '.' first so plugin-local headers (memory.h, dossier.h, dispatch.h)
   # win over any older include/ copy during transitional builds. The
   # inference include dir exposes the engine's inference.h — the

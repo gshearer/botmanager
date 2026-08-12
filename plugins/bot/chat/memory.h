@@ -244,6 +244,13 @@ bool memory_get_dossier_fact_by_key(int64_t dossier_id,
 
 bool memory_forget_dossier_fact(int64_t fact_id);
 
+// Delete every fact a dossier holds under one key, across ALL kinds —
+// the key is what a person names when they ask you to forget something,
+// and legacy rows drifted their kind as freely as their key. Writes the
+// number of rows removed to *n_removed (0 is not an error).
+bool memory_delete_dossier_fact_key(int64_t dossier_id, const char *key,
+    uint32_t *n_removed);
+
 // Retrieval
 
 // Retrieval callback: delivered exactly once per retrieve call. Facts

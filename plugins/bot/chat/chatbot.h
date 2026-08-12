@@ -1164,6 +1164,13 @@ bool chatbot_pricewatch_run(soul_sched_t *sched, uint32_t chore,
 // /show bot <name> watchlist. Called from chatbot_cmds_register.
 bool chatbot_pricewatch_register(void);
 
+// ---- remember.c — the conversation-speed fact write path (FACT-3) ----
+
+// Register /remember and /forget. Called from chatbot_cmds_register.
+// Both write ONLY the invoking speaker's dossier — there is no target
+// argument, which is the whole of their permission model.
+bool chatbot_remember_register(void);
+
 // ---- soul.c — the per-bot heartbeat (SOUL-2) ----
 
 // Release a chore's in-flight latch. Called exactly once by whichever

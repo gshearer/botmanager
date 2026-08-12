@@ -1110,6 +1110,52 @@ memory_forget_dossier_fact(int64_t fact_id)
   return(ok ? SUCCESS : FAIL);
 }
 
+bool
+memory_delete_dossier_fact_key(int64_t dossier_id, const char *key,
+    uint32_t *n_removed)
+{
+  db_result_t *res;
+  bool ok;
+  char sql[512];
+  char *e_key;
+
+  if(n_removed != NULL)
+    *n_removed = 0;
+
+  if(!memory_ready || dossier_id <= 0 || key == NULL || key[0] == '\0')
+    return(FAIL);
+
+  e_key = db_escape(key);
+
+  if(e_key == NULL)
+    return(FAIL);
+
+  // No kind predicate on purpose: the same key has landed under two
+  // kinds in this store's history, and somebody asking to be forgotten
+  // means all of it.
+  snprintf(sql, sizeof(sql),
+      "DELETE FROM dossier_facts WHERE dossier_id = %" PRId64
+      " AND fact_key = '%s'",
+      dossier_id, e_key);
+
+  mem_free(e_key);
+
+  res = db_result_alloc();
+  ok = (db_query(sql, res) == SUCCESS) && res->ok;
+
+  if(!ok && res->error[0] != '\0')
+    clam(CLAM_WARN, "memory", "delete_dossier_fact_key: %s", res->error);
+
+  if(ok && n_removed != NULL)
+    *n_removed = res->rows_affected;
+
+  if(ok && res->rows_affected > 0)
+    memory_stat_bump_forgets();
+
+  db_result_free(res);
+  return(ok ? SUCCESS : FAIL);
+}
+
 // Conversation log
 
 // Gate A. A human does not post four lines in five seconds; a paste, or
