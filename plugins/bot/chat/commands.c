@@ -241,12 +241,16 @@ chatbot_cmds_register(void)
   if(chatbot_deferred_register() != SUCCESS)
     goto fail_deferred;
 
+  if(chatbot_pricewatch_register() != SUCCESS)
+    goto fail_pricewatch;
+
   return(SUCCESS);
 
   // A registration failure here is CLAM_FATAL to the load, and the
   // daemon does not come up with a half-registered chat surface — so
   // these labels unwind what they can name and leave the rest to the
   // reclamation that runs before any mapping is dropped.
+fail_pricewatch:
 fail_deferred:
 fail_refresh_prompts:
 fail_show_verbs:

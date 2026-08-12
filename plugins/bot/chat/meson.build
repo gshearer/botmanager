@@ -5,6 +5,7 @@ chat_plugin = shared_library('chat',
    'identity.c',
    'speak_policy.c', 'nl_bridge.c', 'nl_observe.c', 'interpret.c',
    'soul.c', 'deferred.c', 'voice.c', 'occasions.c', 'followups.c',
+   'pricewatch.c',
    'reply.c',
    'show_verbs.c', 'interests.c', 'memory.c', 'memory_rag.c',
    'memory_cmd.c', 'memory_backfill.c',
@@ -14,11 +15,14 @@ chat_plugin = shared_library('chat',
   # inference include dir exposes the engine's inference.h — the
   # dlsym-shim public surface for llm/knowledge/acquire (defined by
   # plugins/extension/inference/engine/meson.build). The weathergov
-  # dir exposes the CAP alert types the soul's weather watch consumes
-  # (resolution is tolerant plugin_dlsym, never the abort-shims).
+  # dir exposes the CAP alert types the soul's weather watch consumes,
+  # and the exchange dir the bulk-ticker types the price watch consumes
+  # (resolution is tolerant plugin_dlsym in both cases, never the
+  # abort-shims those headers also carry).
   include_directories : [include_directories('.'), inc_include,
                          inference_include,
-                         include_directories('../../service/weathergov')],
+                         include_directories('../../service/weathergov'),
+                         include_directories('../../feature/exchange')],
   override_options : ['b_lundef=false'],
   install : true,
 )

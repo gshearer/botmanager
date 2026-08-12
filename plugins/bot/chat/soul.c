@@ -63,12 +63,17 @@
 // daemon was down still be noticed within the hour.
 #define SOUL_FUP_INTERVAL_DEFAULT_SECS 3600
 
+// A price moves continuously and a threshold is a step, so this cadence
+// is the resolution of the whole feature: five minutes is close enough
+// that the reported price still resembles the one that crossed, and far
+// enough that a bot is not a market-data client. One REST call per
+// sweep whatever the watchlist holds.
+#define SOUL_PW_INTERVAL_DEFAULT_SECS   300
+
 // How many subjects a bot watches for at once. The cache is a hint, not
 // a queue: whatever does not fit is simply offered on the next tick, and
 // the claim in the DB is what decides who gets delivered.
 #define SOUL_PRESENCE_MAX             16
-
-typedef struct soul_sched soul_sched_t;
 
 // A chore is one autonomous duty, run from the tick when its gates
 // pass. kv_suffix names a per-chore knob family under
@@ -101,13 +106,16 @@ static bool soul_chore_occasions(soul_sched_t *, uint32_t,
     chatbot_state_t *, bot_inst_t *);
 static bool soul_chore_followups(soul_sched_t *, uint32_t,
     chatbot_state_t *, bot_inst_t *);
+static bool soul_chore_pricewatch(soul_sched_t *, uint32_t,
+    chatbot_state_t *, bot_inst_t *);
 
 static const soul_chore_t soul_chores[] = {
-  { "deferred",  NULL,        0,                              soul_chore_deferred  },
-  { "presence",  NULL,        0,                              soul_chore_presence  },
-  { "weather",   "weather",   SOUL_WX_INTERVAL_DEFAULT_SECS,  soul_chore_weather   },
-  { "occasions", "occasions", SOUL_OCC_INTERVAL_DEFAULT_SECS, soul_chore_occasions },
-  { "followups", "followups", SOUL_FUP_INTERVAL_DEFAULT_SECS, soul_chore_followups },
+  { "deferred",   NULL,         0,                              soul_chore_deferred   },
+  { "presence",   NULL,         0,                              soul_chore_presence   },
+  { "weather",    "weather",    SOUL_WX_INTERVAL_DEFAULT_SECS,  soul_chore_weather    },
+  { "occasions",  "occasions",  SOUL_OCC_INTERVAL_DEFAULT_SECS, soul_chore_occasions  },
+  { "followups",  "followups",  SOUL_FUP_INTERVAL_DEFAULT_SECS, soul_chore_followups  },
+  { "pricewatch", "pricewatch", SOUL_PW_INTERVAL_DEFAULT_SECS,  soul_chore_pricewatch },
 };
 
 #define SOUL_CHORE_COUNT (sizeof(soul_chores) / sizeof(soul_chores[0]))
@@ -160,8 +168,9 @@ soul_sched_find_locked(const char *bot_name)
 // Drop a chore's in-flight flag from an async completion path. Safe
 // from any thread: sched entries are freed only at plugin deinit,
 // after core's quiesce has already drained every task that could be
-// holding one.
-static void
+// holding one. Not static since CARE-7: a chore whose completion path
+// lives in its own TU releases the latch from there.
+void
 soul_chore_done(soul_sched_t *s, uint32_t chore)
 {
   pthread_mutex_lock(&soul_mutex);
@@ -1332,6 +1341,24 @@ soul_chore_followups(soul_sched_t *s, uint32_t chore, chatbot_state_t *st,
 
   chatbot_followups_run(s->bot_name, s->ns_id, bot);
   return(false);
+}
+
+// ---------- chore: price watch (CARE-7) ----------
+//
+// The division holds, with one difference the others do not have: this
+// chore's work leaves the tick's thread. It asks an exchange for a
+// snapshot and returns true, and the latch it holds is released by
+// pricewatch.c's completion path — the weather watch's shape, in
+// another TU.
+
+static bool
+soul_chore_pricewatch(soul_sched_t *s, uint32_t chore, chatbot_state_t *st,
+    bot_inst_t *bot)
+{
+  (void)st;
+  (void)bot;
+
+  return(chatbot_pricewatch_run(s, chore, s->bot_name, s->ns_id));
 }
 
 // ---------- the tick ----------

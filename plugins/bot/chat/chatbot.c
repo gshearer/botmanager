@@ -218,6 +218,24 @@ static const plugin_kv_entry_t chatbot_inst_schema[] = {
     " askable is days wide, so this is not about precision — it is what"
     " lets a plan whose date passed while the daemon was down still be"
     " noticed within the hour.", NULL },
+  { "behavior.soul.pricewatch.enabled", KV_BOOL, "false",
+    "Price watch: each sweep takes one bulk-ticker snapshot from the"
+    " exchange below, prices this bot's watchlist ('bot <name> watchlist"
+    " add BTC-USD') and reports the first crossing of any threshold a"
+    " user set with /pricewatch — once per watch, in the venue they"
+    " asked from. Public market data only; the bot never trades. Off by"
+    " default, and while it is off /pricewatch refuses rather than"
+    " storing a promise nothing will keep.", NULL },
+  { "behavior.soul.pricewatch.interval_secs", KV_UINT32, "300",
+    "Seconds between price sweeps (min 5). This is the resolution of the"
+    " whole feature: the reported price is the one the snapshot saw, not"
+    " the one that crossed, so a longer cadence means a staler number.",
+    NULL },
+  { "behavior.soul.pricewatch.exchange", KV_STR, "coinbase",
+    "Which registered exchange the price sweep reads. Any exchange"
+    " driver offering the bulk-ticker snapshot will do; a name nothing"
+    " answers to idles the chore with a warning and costs nothing else.",
+    NULL },
   // --- behavior.soul.budget.* / .quiet.* — the voice governor (CARE-3)
   // One gate for every chore: how often the bot may speak unprompted,
   // and when it must not. Weather used to carry its own hourly cap and
@@ -2427,6 +2445,7 @@ chatbot_plugin_start(void)
   soul_ensure_schema();
   chatbot_deferred_ensure_schema();
   soul_voice_ensure_schema();
+  chatbot_pricewatch_ensure_schema();
   // Identity scoring is plugin-local and protocol-agnostic: protocol
   // plugins emit the four-field identity tuple on method_msg_t and
   // identity.c scores it uniformly. No registry, no cross-plugin

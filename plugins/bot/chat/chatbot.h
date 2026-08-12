@@ -125,7 +125,23 @@ void chatbot_personality_free(struct chatbot_personality_s *p);
 // NL-capable commands cannot starve the FACTS / MENTIONS / KNOWLEDGE
 // sections. On overflow the builder truncates at a whole-command
 // boundary and appends "… (more available)\n".
-#define CHATBOT_NL_COMMANDS_MAX_BYTES  4096
+//
+// ⚠⚠ Raised from 4096 by CARE-7, and the reason is the thing to
+// remember: the block is sorted by command name, so an overflow does
+// not degrade the vocabulary evenly — it deletes the alphabetical
+// tail. At 4096 the tree assembled 4025 bytes with room for nothing
+// more, and adding /pricewatch pushed /remind off the end, after which
+// "remind me in 20 minutes to flip the steaks" routed to /in and was
+// refused. The command still existed everywhere except in the only
+// place the model could see it. The builder now says so out loud when
+// it truncates (reply.c) — treat that WARN as a build-time error in a
+// dressing gown, and raise this number rather than reword a `.when`.
+//
+// Measured 2026-08-12 against a bot whose nl_bridge_cmds is `*`, the
+// worst case: the whole vocabulary renders between 8,192 and 12,288
+// bytes. 16 KiB is that plus room for the next few commands, and a bot
+// with a narrower allowlist never pays for what it does not offer.
+#define CHATBOT_NL_COMMANDS_MAX_BYTES  16384
 
 // Personality record (in-memory copy of a personalities table row).
 //
@@ -1044,6 +1060,20 @@ void chatbot_deferred_deliver_presence(const char *bot_name, uint32_t ns_id,
 // from chatbot_cmds_register.
 bool chatbot_deferred_register(void);
 
+// Build the SQL predicate "this row is the caller's": the stored sender
+// matches case-insensitively (nick case is not identity on IRC), or
+// both carry the same verified identity. Shared by every table that
+// stores the identity tuple under those column names — chat_deferred
+// and chat_pricewatch today. The inputs are the caller's own message
+// fields and never a name they typed, because ownership is not
+// something you can type. Returns FAIL when the escape fails.
+bool chatbot_row_owner_pred(const method_msg_t *msg, char *dst, size_t cap);
+
+// Owner or namespace admin. The owner test is the stored tuple; this
+// one is the caller's authenticated membership, so an unauthenticated
+// nick can never reach another person's row however it is spelled.
+bool chatbot_caller_is_admin(const cmd_ctx_t *ctx, const userns_t *ns);
+
 // ---- occasions.c — dates somebody told the bot about (CARE-5) ----
 
 // One sweep of the occasions chore: scan the namespace for birthday
@@ -1066,7 +1096,47 @@ void chatbot_occasions_run(const char *bot_name, uint32_t ns_id,
 void chatbot_followups_run(const char *bot_name, uint32_t ns_id,
     bot_inst_t *bot);
 
+// ---- pricewatch.c — a threshold on a market price (CARE-7) ----
+
+// One bot's slot in the soul's schedule (soul.c). Opaque everywhere
+// else: a chore whose work outlives its tick — CARE-7's snapshot is
+// the only one — carries the handle solely to hand it back to
+// soul_chore_done().
+typedef struct soul_sched soul_sched_t;
+
+// Idempotent DDL for chat_watchlist + chat_pricewatch. Called from
+// chatbot_plugin_start after dossier_register_config (the dossier FK
+// target must exist).
+void chatbot_pricewatch_ensure_schema(void);
+
+// Arm one threshold for one person. `dir` is the stored SMALLINT (0
+// below, 1 above) and `msg` supplies the identity tuple the report
+// will ride — whole, per the dcfc359 rule. The caller has already
+// checked the pair against the serving bot's watchlist; this only
+// writes.
+bool chatbot_pricewatch_insert(uint32_t ns_id, int64_t dossier,
+    const method_msg_t *msg, const char *bot_name, const char *method_name,
+    const char *pair, int dir, double threshold);
+
+// One sweep: read the bot's watchlist and its armed thresholds, ask the
+// exchange for one bulk-ticker snapshot, and claim every crossing into
+// a deferred report. Speaks nothing itself. Returns true when the
+// snapshot is airborne — the chore's in-flight latch then belongs to
+// the completion path, which releases it with soul_chore_done().
+// Blocking (sync db_query) — runs on the tick's worker thread only.
+bool chatbot_pricewatch_run(soul_sched_t *sched, uint32_t chore,
+    const char *bot_name, uint32_t ns_id);
+
+// Register /pricewatch (+ list, cancel), /bot <name> watchlist and
+// /show bot <name> watchlist. Called from chatbot_cmds_register.
+bool chatbot_pricewatch_register(void);
+
 // ---- soul.c — the per-bot heartbeat (SOUL-2) ----
+
+// Release a chore's in-flight latch. Called exactly once by whichever
+// completion path owns an airborne chore — never by a chore that
+// finished on the tick's own thread, which releases by returning false.
+void soul_chore_done(soul_sched_t *s, uint32_t chore);
 
 // Idempotent DDL for the soul's own tables (the generic claim ledger).
 // Called from chatbot_plugin_start after dossier_register_config (the

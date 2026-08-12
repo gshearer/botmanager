@@ -1712,6 +1712,7 @@ chatbot_build_nl_commands_block(const chatbot_req_t *r,
   bool truncated;
   size_t hard_cap;
   size_t pos;
+  size_t emitted;
   const char *header;
   size_t header_len;
   method_type_t want_type;
@@ -1805,7 +1806,8 @@ chatbot_build_nl_commands_block(const chatbot_req_t *r,
     return(0);
 
   memcpy(dst, header, header_len);
-  pos = header_len;
+  pos     = header_len;
+  emitted = 0;
 
   truncated = false;
 
@@ -1881,6 +1883,7 @@ chatbot_build_nl_commands_block(const chatbot_req_t *r,
 
     memcpy(dst + pos, stanza, sp);
     pos += sp;
+    emitted++;
   }
 
   // KV stanzas. Rendered inline beneath the command list under the same
@@ -1965,6 +1968,18 @@ chatbot_build_nl_commands_block(const chatbot_req_t *r,
       memcpy(dst + pos, sentinel, sentinel_n);
       pos += sentinel_n;
     }
+
+    // ⚠ Loud, because the failure it causes reads as a model problem
+    // and is not one. The block is sorted by name, so what overflows is
+    // the alphabetical tail: adding /pricewatch pushed /remind out and
+    // canonical "remind me in 20 minutes to flip the steaks" utterances
+    // started landing on /in, which then refused them (measured
+    // 2026-08-12, CARE-7). A command the model cannot see is a command
+    // that does not exist, and the sentinel only tells the MODEL that.
+    clam(CLAM_WARN, "chatbot",
+        "bot=%s NL command block truncated at %zu/%zu bytes — %zu of %zu"
+        " commands rendered, the rest are invisible to the model",
+        bot_inst_name(r->st->inst), pos, hard_cap, emitted, nkept);
   }
 
   if(pos < hard_cap)

@@ -205,10 +205,12 @@ deferred_free_escaped(char **v, size_t n)
 // The escaped inputs are the caller's own message fields, never a
 // user-supplied name — ownership is not something you can type.
 //
-// Three surfaces need this predicate, so the escape/free dance lives
-// here once rather than three times.
-static bool
-deferred_owner_pred(const method_msg_t *msg, char *dst, size_t cap)
+// Five surfaces need this predicate now, and since CARE-7 they are not
+// all in this file: chat_pricewatch stores the identity tuple under
+// the same column names and asks the same question of it. The contract
+// is chatbot.h's.
+bool
+chatbot_row_owner_pred(const method_msg_t *msg, char *dst, size_t cap)
 {
   char *e[2];
   bool  ok = FAIL;
@@ -399,15 +401,22 @@ deferred_unclaim(int64_t id, int64_t repeat_secs)
 
 // Who chose the moment is a property of the SOURCE, not of the row: a
 // human typed /remind and /in, so those are TIMED and the governor may
-// not refuse them however late the hour. Everything else in this table
-// was written by a chore that decided by itself that something was
-// worth saying — and an unrecognized source reads that way too,
-// because for a gate the safe direction is the quiet one.
+// not refuse them however late the hour. A price watch splits the
+// difference and is the only row that does — the human chose the
+// subject and the bot chose the moment, so it waits out quiet hours
+// (and is then delivered, because the row is still there) but pays no
+// budget for speech somebody explicitly asked for. Everything else in
+// this table was written by a chore that decided by itself that
+// something was worth saying — and an unrecognized source reads that
+// way too, because for a gate the safe direction is the quiet one.
 static soul_class_t
 deferred_source_class(const char *source)
 {
   if(strcmp(source, "remind") == 0 || strcmp(source, "in") == 0)
     return(SOUL_CLASS_TIMED);
+
+  if(strcmp(source, "pricewatch") == 0)
+    return(SOUL_CLASS_ASKED);
 
   return(SOUL_CLASS_UNSOLICITED);
 }
@@ -914,7 +923,7 @@ deferred_ask_open(const cmd_ctx_t *ctx, const char *duration,
     return(FAIL);
   }
 
-  if(deferred_owner_pred(ctx->msg, a->owner_pred,
+  if(chatbot_row_owner_pred(ctx->msg, a->owner_pred,
       sizeof(a->owner_pred)) != SUCCESS)
   {
     cmd_reply(ctx, "failed to prepare the request");
@@ -1212,7 +1221,7 @@ cmd_in_list(const cmd_ctx_t *ctx)
     return;
   }
 
-  if(deferred_owner_pred(ctx->msg, pred, sizeof(pred)) != SUCCESS)
+  if(chatbot_row_owner_pred(ctx->msg, pred, sizeof(pred)) != SUCCESS)
   {
     cmd_reply(ctx, "failed to prepare the query");
     return;
@@ -1247,8 +1256,10 @@ cmd_in_list(const cmd_ctx_t *ctx)
 // Owner or admin. The owner test is the stored tuple; the admin test
 // is the caller's authenticated membership, so an unauthenticated
 // nick can never reach another person's row however it is spelled.
-static bool
-deferred_caller_is_admin(const cmd_ctx_t *ctx, const userns_t *ns)
+// Shared with the price watch's cancel since CARE-7 — the same
+// question about a different table.
+bool
+chatbot_caller_is_admin(const cmd_ctx_t *ctx, const userns_t *ns)
 {
   if(ctx->username == NULL || ctx->username[0] == '\0')
     return(false);
@@ -1281,10 +1292,10 @@ cmd_in_cancel(const cmd_ctx_t *ctx)
 
   id = (int64_t)strtoll(ctx->parsed->argv[0], NULL, 10);
 
-  if(deferred_caller_is_admin(ctx, ns))
+  if(chatbot_caller_is_admin(ctx, ns))
     snprintf(pred, sizeof(pred), "TRUE");
 
-  else if(deferred_owner_pred(ctx->msg, pred, sizeof(pred)) != SUCCESS)
+  else if(chatbot_row_owner_pred(ctx->msg, pred, sizeof(pred)) != SUCCESS)
   {
     cmd_reply(ctx, "failed to prepare the query");
     return;

@@ -223,6 +223,7 @@ halves. Same shape as `gemini` / `gemini.ws`.
 | `rag` | plugins/bot/chat/reply.c | what retrieval actually put in the prompt — one `trace=inject` line per surviving RECENT CONVERSATION row (`src=recall` vs `src=mention`, with cosine) plus a `trace=block` summary |
 | `nl_observe` | plugins/bot/chat/nl_observe.c | post-dispatch chat observer (`OBS_CTX`) |
 | `occasions` | plugins/bot/chat/occasions.c | the occasions chore — a birthday claimed for the year and the wish held until its subject turns up (`OCCASIONS_CTX`) |
+| `pricewatch` | plugins/bot/chat/pricewatch.c | the price watch — watchlist curation, the ticker sweep, and each crossing claimed once into a deferred report (`PRICEWATCH_CTX`) |
 | `reachy` | plugins/method/reachy/reachy.c | Reachy Mini method driver — the ear (bridge long-poll, transcription, attention gate, delivery) and the mouth (speech queue, synthesis, upload, playback pacing) (`REACHY_CTX`) |
 | `register` | plugins/bot/chat/dispatch.c | `/register` user creation |
 | `soul` | plugins/bot/chat/soul.c | per-bot heartbeat — chore scheduling, the weather watch, the generic claim ledger, mute skips (`SOUL_CTX`) |
