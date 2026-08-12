@@ -82,6 +82,10 @@ void extract_get_stats(extract_stats_t *out);
 
 #define EXTRACT_LABEL_SZ       64
 #define EXTRACT_PROMPT_MAX_SZ  16384
+
+// The assembled system prompt (head + rendered vocabulary + tail).
+// ~5 KiB as shipped; the builder WARNs rather than truncating quietly.
+#define EXTRACT_SYSTEM_PROMPT_SZ 8192
 #define EXTRACT_MAX_FACTS      32
 #define EXTRACT_MAX_PARTS      16
 #define EXTRACT_ALIAS_MIN_LEN  3
@@ -135,8 +139,13 @@ size_t extract_prompt_build(const extract_participant_t *parts, size_t n_parts,
     const mem_msg_t *msgs, size_t n_msgs,
     char *out, size_t out_sz);
 
-// System prompt text (stable). Returned pointer is interned; caller must
-// not free or mutate.
+// Assemble the system prompt from the canonical fact vocabulary. Called
+// once by extract_init, before any sweep can run; not thread-safe, and
+// does not need to be.
+void extract_prompt_system_init(void);
+
+// System prompt text (stable after extract_prompt_system_init).
+// Returned pointer is interned; caller must not free or mutate.
 const char *extract_prompt_system(void);
 
 // Each accepted fact is stamped with its subject participant's resolved

@@ -1295,6 +1295,11 @@ extract_init(void)
   pthread_mutex_init(&extract_stat_mutex, NULL);
   memset(&extract_stats, 0, sizeof(extract_stats));
 
+  // Renders the canonical vocabulary into the system prompt. Here, and
+  // not lazily at first use, because sweeps run on task workers and
+  // this is the last single-threaded moment we get.
+  extract_prompt_system_init();
+
   extract_ready = true;
   clam(CLAM_INFO, "extract", "extract subsystem initialized");
 }

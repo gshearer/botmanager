@@ -499,11 +499,18 @@ nl_bridge_list_permits(const char *list, const char *name)
 // enriching the declarative shape first (see NL-Decoupling design
 // principle in TODO.md).
 
-// A location default prefers an explicit `location` fact (extractor-
-// written) and falls back to the newest `city_of_interest:*` fact —
-// geocode-verified by the NL observer after a successful /weather
-// dispatch, so one explicit ask teaches the default and the soul's
-// weather watch in the same stroke.
+// A location default tries the home postal code first, then an explicit
+// `location` fact (extractor-written), then the newest
+// `city_of_interest:*` fact — geocode-verified by the NL observer after
+// a successful /weather dispatch, so one explicit ask teaches the
+// default and the soul's weather watch in the same stroke.
+//
+// ⭑ Zip first, and it is not a preference: a postal code geocodes to
+// exactly one place, while a city string geocodes to the first row of a
+// name search. "Ohio" resolved to Ohio, Illinois for somebody who lives
+// in West Chester — the fact was RIGHT and the answer was still 300
+// miles wrong. A code we hold is worth more than a name we hold.
+#define NL_DEFAULT_POSTAL_FACT_KEY       "postal_code"
 #define NL_DEFAULT_LOCATION_FACT_KEY     "location"
 #define NL_DEFAULT_LOCATION_FACT_PREFIX  "city_of_interest:"
 
@@ -535,6 +542,13 @@ nl_default_for_type(chatbot_req_t *r, cmd_nl_arg_type_t type,
   switch(type)
   {
     case CMD_NL_ARG_LOCATION:
+      // The postal code has no prefix family of its own, so the exact
+      // key doubles as the prefix — it matches itself and, by the
+      // vocabulary, nothing else.
+      if(nl_default_from_dossier_fact(r, NL_DEFAULT_POSTAL_FACT_KEY,
+          NL_DEFAULT_POSTAL_FACT_KEY, out, out_sz) == SUCCESS)
+        return(SUCCESS);
+
       return(nl_default_from_dossier_fact(r,
           NL_DEFAULT_LOCATION_FACT_KEY,
           NL_DEFAULT_LOCATION_FACT_PREFIX, out, out_sz));

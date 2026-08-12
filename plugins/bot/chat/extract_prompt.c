@@ -3,14 +3,22 @@
 #define EXTRACT_INTERNAL
 #include "extract.h"
 
+#include "clam.h"
+#include "fact_vocab.h"
+
 #include <inttypes.h>
 #include <stdarg.h>
 #include <stdio.h>
 #include <string.h>
 #include <time.h>
 
-// System prompt: stable across sweeps. Keeps tone + schema contract.
-static const char *extract_system_prompt =
+// The system prompt is assembled once at extract_init from three
+// pieces: this head (schema + the rules that carry their own logic),
+// the canonical vocabulary rendered from fact_vocab.c, and the tail
+// below (aliases). Rendering rather than hardcoding is the point of
+// FACT-2 — the table is the single authority on key naming, so the
+// steering cannot drift from what /remember will accept.
+static const char *extract_prompt_head =
     "You extract durable facts about chat participants from a transcript "
     "you did not write. You are not a chatbot. Output ONLY compact JSON "
     "matching this schema:\n"
@@ -21,10 +29,6 @@ static const char *extract_system_prompt =
     "- dossier_id MUST appear in the participants list.\n"
     "- For facts about one dossier's attitude/behavior toward another, "
     "use kind=\"relation\" and fact_key=\"toward:<other_dossier_id>\".\n"
-    "- When a participant states where they permanently live, use "
-    "kind=\"attribute\" and fact_key=\"location\" with the place as "
-    "the value. A visit, trip, or temporary stay is NOT their "
-    "location.\n"
     "- When a participant states their OWN birthday, use "
     "kind=\"attribute\" and fact_key=\"birthday\", with the value as "
     "\"MM-DD\" zero-padded (e.g. \"03-07\"); ignore the year. Resolve a "
@@ -43,7 +47,10 @@ static const char *extract_system_prompt =
     "somebody else's plans are NOT this fact.\n"
     "- Prefer few high-confidence facts over many speculative ones.\n"
     "- If nothing is worth recording, output {\"facts\":[]}.\n"
-    "- No prose, no markdown fences, no commentary.\n"
+    "- No prose, no markdown fences, no commentary.\n";
+
+// Everything after the rendered vocabulary block.
+static const char *extract_prompt_tail =
     "\n"
     "The JSON object MAY also contain an \"aliases\" array describing "
     "informal nicknames observed in the transcript that refer to a "
@@ -60,12 +67,6 @@ static const char *extract_system_prompt =
     "- dossier_id MUST appear in the participants list above.\n"
     "- Prefer few high-confidence aliases. If unsure, omit.\n"
     "- If no aliases are clear, output \"aliases\":[].";
-
-const char *
-extract_prompt_system(void)
-{
-  return(extract_system_prompt);
-}
 
 // Append formatted text to buf; returns true on overflow (stops writing).
 static bool
@@ -93,6 +94,108 @@ bufprintf(char *buf, size_t cap, size_t *pos, const char *fmt, ...)
 
   *pos += (size_t)n;
   return(false);
+}
+
+// The schema tokens, which are not the display names reply.c renders
+// ("freeform", not "note"). Kept beside the schema string they have to
+// agree with.
+static const char *
+kind_token(mem_fact_kind_t k)
+{
+  switch(k)
+  {
+    case MEM_FACT_PREFERENCE: return("preference");
+    case MEM_FACT_ATTRIBUTE:  return("attribute");
+    case MEM_FACT_RELATION:   return("relation");
+    case MEM_FACT_EVENT:      return("event");
+    case MEM_FACT_OPINION:    return("opinion");
+    case MEM_FACT_FREEFORM:   return("freeform");
+  }
+  return("freeform");
+}
+
+// Built once, at extract_init, before any sweep can run. Single-threaded
+// by that ordering (extract.h §Concurrency), so no lock guards it.
+static char extract_system_prompt[EXTRACT_SYSTEM_PROMPT_SZ];
+
+void
+extract_prompt_system_init(void)
+{
+  size_t pos = 0;
+  bool   over;
+
+  extract_system_prompt[0] = '\0';
+
+  over = bufprintf(extract_system_prompt, sizeof(extract_system_prompt),
+      &pos, "%s", extract_prompt_head);
+
+  // The canonical block. "never a synonym" with a worked example is
+  // doing real work here: without it a model happily writes `car` for
+  // `vehicle`, and a key nobody can predict is a key no correction can
+  // ever find again.
+  if(!over)
+    over = bufprintf(extract_system_prompt, sizeof(extract_system_prompt),
+        &pos,
+        "\nCanonical fact keys. When a statement fits one of these, use "
+        "EXACTLY this fact_key with the kind shown — never a synonym (no "
+        "\"car\" when \"vehicle\" is listed):\n");
+
+  for(size_t i = 0; i < fact_vocab_count() && !over; i++)
+  {
+    const fact_vocab_t *v = fact_vocab_at(i);
+
+    over = bufprintf(extract_system_prompt, sizeof(extract_system_prompt),
+        &pos, "  %-9s %-14s %s\n", kind_token(v->kind), v->key, v->hint);
+  }
+
+  // Location gets its own clause because the value SHAPE is what makes
+  // it usable: "Ohio" geocodes to Ohio, Illinois, which is how a
+  // resident of West Chester was told about the weather 300 miles away.
+  // The trip-hardening sentence is load-bearing too — it was added
+  // against a live failure where a holiday became somebody's home.
+  if(!over)
+    over = bufprintf(extract_system_prompt, sizeof(extract_system_prompt),
+        &pos,
+        "\n- A location value must name the place precisely: \"City, ST\" "
+        "or \"City, Country\", never a bare state or country on its own. "
+        "A visit, trip, or temporary stay is NOT their location.\n"
+        "- A stated home zip or postal code is fact_key \"postal_code\", "
+        "value the code alone.\n");
+
+  // The negative rule. Moment-state was the store's other quiet
+  // poison: a fact saying somebody is "out of town this weekend" reads
+  // as current three weekends later, because a fact has no expiry and
+  // the prompt cannot tell it apart from where they live.
+  if(!over)
+    over = bufprintf(extract_system_prompt, sizeof(extract_system_prompt),
+        &pos,
+        "- Do NOT record transient state: what someone is doing right "
+        "now, errands, chores, meetings, appointments, or plans tied to a "
+        "particular day. A dated personal plan belongs ONLY under "
+        "upcoming_event:<slug>. If it will stop being true within weeks "
+        "by itself, it is not a fact.\n"
+        "- Any fact_key you invent must be 1-3 lowercase words joined by "
+        "underscores.\n");
+
+  if(!over)
+    over = bufprintf(extract_system_prompt, sizeof(extract_system_prompt),
+        &pos, "%s", extract_prompt_tail);
+
+  if(over)
+    clam(CLAM_WARN, "extract",
+        "system prompt truncated at %zu bytes — raise "
+        "EXTRACT_SYSTEM_PROMPT_SZ", sizeof(extract_system_prompt));
+
+  else
+    clam(CLAM_DEBUG, "extract",
+        "system prompt built: %zu bytes, %zu canonical key(s)",
+        pos, fact_vocab_count());
+}
+
+const char *
+extract_prompt_system(void)
+{
+  return(extract_system_prompt);
 }
 
 size_t
