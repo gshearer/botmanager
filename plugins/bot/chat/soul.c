@@ -49,6 +49,14 @@
 #define SOUL_WX_WATCHERS_MAX          8
 #define SOUL_WX_CUE_ALERTS_MAX        3
 
+// "wxalert:" + a CAP urn (WEATHERGOV_ID_SZ, measured 96 of 200).
+#define SOUL_WX_CLAIM_KEY_SZ          (WEATHERGOV_ID_SZ + 16)
+
+// A date changes once a day, so an hourly sweep is generous — it
+// exists so a bot started at noon still catches the day's birthdays
+// rather than waiting for midnight.
+#define SOUL_OCC_INTERVAL_DEFAULT_SECS 3600
+
 // How many subjects a bot watches for at once. The cache is a hint, not
 // a queue: whatever does not fit is simply offered on the next tick, and
 // the claim in the DB is what decides who gets delivered.
@@ -83,11 +91,14 @@ static bool soul_chore_presence(soul_sched_t *, uint32_t,
     chatbot_state_t *, bot_inst_t *);
 static bool soul_chore_weather(soul_sched_t *, uint32_t,
     chatbot_state_t *, bot_inst_t *);
+static bool soul_chore_occasions(soul_sched_t *, uint32_t,
+    chatbot_state_t *, bot_inst_t *);
 
 static const soul_chore_t soul_chores[] = {
-  { "deferred", NULL,      0,                             soul_chore_deferred },
-  { "presence", NULL,      0,                             soul_chore_presence },
-  { "weather",  "weather", SOUL_WX_INTERVAL_DEFAULT_SECS, soul_chore_weather  },
+  { "deferred",  NULL,        0,                              soul_chore_deferred  },
+  { "presence",  NULL,        0,                              soul_chore_presence  },
+  { "weather",   "weather",   SOUL_WX_INTERVAL_DEFAULT_SECS,  soul_chore_weather   },
+  { "occasions", "occasions", SOUL_OCC_INTERVAL_DEFAULT_SECS, soul_chore_occasions },
 };
 
 #define SOUL_CHORE_COUNT (sizeof(soul_chores) / sizeof(soul_chores[0]))
@@ -179,6 +190,75 @@ soul_copy_col(char *dst, size_t cap, const db_result_t *res,
   snprintf(dst, cap, "%s", s != NULL ? s : "");
 }
 
+// ---------- the generic claim (CARE-5) ----------
+//
+// One ledger behind every "at most once" the soul needs: an alert
+// announced once per namespace, a birthday wished once per year, a
+// follow-up asked once per event. The claim IS the guard — the same
+// idiom the deferred spine uses for work, applied to occasions — so a
+// reload mid-sweep cannot double-announce and two bots in different
+// namespaces each get their own turn.
+//
+// The key belongs to the chore. Prefixing it (`wxalert:`, `bday:`) is
+// what keeps two chores from ever arguing over one string, and putting
+// the varying part LAST keeps a long value (a CAP urn) from colliding
+// with anything after truncation.
+
+bool
+soul_claim_take(uint32_t ns_id, const char *key, time_t expires)
+{
+  db_result_t *res;
+  char        *e_key;
+  char         expires_cell[48];
+  char         sql[512];
+  bool         fresh = false;
+
+  e_key = db_escape(key);
+
+  if(e_key == NULL)
+    return(false);
+
+  if(expires > 0)
+    snprintf(expires_cell, sizeof(expires_cell), "to_timestamp(%lld)",
+        (long long)expires);
+
+  else
+    snprintf(expires_cell, sizeof(expires_cell), "NULL");
+
+  snprintf(sql, sizeof(sql),
+      "INSERT INTO chat_soul_claims (claim_key, ns_id, expires)"
+      " VALUES ('%s', %" PRIu32 ", %s)"
+      " ON CONFLICT DO NOTHING RETURNING claim_key",
+      e_key, ns_id, expires_cell);
+  mem_free(e_key);
+
+  res = db_result_alloc();
+
+  if(res == NULL)
+    return(false);
+
+  if(db_query(sql, res) != SUCCESS || !res->ok)
+    clam(CLAM_WARN, SOUL_CTX, "claim '%s' failed: %s", key,
+        res->error[0] != '\0' ? res->error : "(no driver error)");
+
+  else if(res->rows > 0)
+    fresh = true;
+
+  db_result_free(res);
+  return(fresh);
+}
+
+void
+soul_claim_purge(void)
+{
+  // A claim whose expiry passed two days ago can never dedup anything
+  // again: the alert is long gone, the birthday long over. The two
+  // days are slack, not policy — a row that costs nothing to keep is
+  // cheaper than a boundary argued over.
+  (void)soul_db_exec("DELETE FROM chat_soul_claims"
+      " WHERE expires IS NOT NULL AND expires < NOW() - INTERVAL '2 days'");
+}
+
 // ---------- chore: the deferred spine (CARE-1) ----------
 //
 // Every tick, on the tick's own worker thread: the whole claim →
@@ -265,9 +345,10 @@ soul_presence_matches(const chatbot_presence_row_t *r,
 
 typedef struct
 {
-  char     bot_name[BOT_NAME_SZ];
-  uint32_t ns_id;
-  int64_t  id;
+  char         bot_name[BOT_NAME_SZ];
+  uint32_t     ns_id;
+  int64_t      id;
+  soul_class_t cls;
 } soul_presence_job_t;
 
 // The claim is a database round-trip and the delivery submits a reply,
@@ -290,9 +371,16 @@ soul_presence_task(task_t *t)
   // Skip before claiming, never after (the D9 mute precedent): a row
   // this bot cannot speak right now stays pending, and the next tick
   // puts it back in the cache. Deferred is late, never lost.
+  //
+  // Quiet hours join that list for the same reason and at the same
+  // moment (CARE-5): they mean LATER, so a wish unlocked at 3am must
+  // find its row still unclaimed after breakfast. The class is the
+  // row's — a reminder somebody set for 3am is TIMED and the window is
+  // always open to it.
   if(soul_ready && bot != NULL && bot_get_state(bot) == BOT_RUNNING
       && (st = bot_get_handle(bot)) != NULL
-      && !chatbot_mute_active(j->bot_name))
+      && !chatbot_mute_active(j->bot_name)
+      && soul_voice_window_open(j->bot_name, j->cls, false))
     chatbot_deferred_deliver_presence(j->bot_name, j->ns_id, st, bot, j->id);
 
   mem_free(j);
@@ -303,7 +391,8 @@ soul_on_seen(const char *bot_name, const method_msg_t *msg)
 {
   soul_sched_t        *s;
   soul_presence_job_t *j;
-  int64_t              id = 0;
+  soul_class_t         cls   = SOUL_CLASS_TIMED;
+  int64_t              id    = 0;
   uint32_t             ns_id = 0;
 
   // The idle cost of this entire feature, paid once per line: one
@@ -325,6 +414,7 @@ soul_on_seen(const char *bot_name, const method_msg_t *msg)
         continue;
 
       id    = s->presence[i].id;
+      cls   = s->presence[i].cls;
       ns_id = s->ns_id;
 
       // Drop it from the cache before releasing the mutex. The DB claim
@@ -350,6 +440,7 @@ soul_on_seen(const char *bot_name, const method_msg_t *msg)
   snprintf(j->bot_name, sizeof(j->bot_name), "%s", bot_name);
   j->ns_id = ns_id;
   j->id    = id;
+  j->cls   = cls;
 
   clam(CLAM_DEBUG, SOUL_CTX, "bot=%s presence %" PRId64 " triggered by %s",
       bot_name, id, msg->sender);
@@ -607,46 +698,6 @@ soul_wx_append(char *buf, size_t cap, size_t *off, const char *fmt, ...)
   if(*off > cap)   *off  = cap;
 }
 
-// The exactly-once gate (fact 10): winning this INSERT is what
-// authorizes an announcement, and losing it is the normal "already
-// seen" answer — from a previous sweep, a racing peer, or the sweep a
-// reload interrupted.
-static bool
-soul_wx_claim(uint32_t ns_id, const weathergov_alert_t *a)
-{
-  db_result_t *res;
-  char        *e_id;
-  char         sql[512];
-  bool         fresh = false;
-
-  e_id = db_escape(a->id);
-
-  if(e_id == NULL)
-    return(false);
-
-  snprintf(sql, sizeof(sql),
-      "INSERT INTO chat_soul_alerts_seen (alert_id, ns_id, expires)"
-      " VALUES ('%s', %" PRIu32 ", to_timestamp(%lld))"
-      " ON CONFLICT DO NOTHING RETURNING alert_id",
-      e_id, ns_id, (long long)a->expires);
-  mem_free(e_id);
-
-  res = db_result_alloc();
-
-  if(res == NULL)
-    return(false);
-
-  if(db_query(sql, res) != SUCCESS || !res->ok)
-    clam(CLAM_WARN, SOUL_CTX, "alert claim failed: %s",
-        res->error[0] != '\0' ? res->error : "(no driver error)");
-
-  else if(res->rows > 0)
-    fresh = true;
-
-  db_result_free(res);
-  return(fresh);
-}
-
 static bool
 soul_wx_watcher_in_target(const soul_wx_watcher_t *w,
     const soul_wx_target_t *t)
@@ -897,6 +948,7 @@ soul_wx_batch_task(task_t *t)
       bool              severe = u->a->severity >= WEATHERGOV_SEV_SEVERE;
       soul_wx_target_t *seen[SOUL_WX_ROWS_MAX];   // distinct targets, not one point's watchers
       uint8_t           n_seen = 0;
+      char              ckey[SOUL_WX_CLAIM_KEY_SZ];
 
       // Quiet hours are asked about BEFORE the claim, and only quiet
       // hours: a window that closes at 8am must find the alert still
@@ -910,7 +962,14 @@ soul_wx_batch_task(task_t *t)
         continue;
       }
 
-      if(!soul_wx_claim(sweep->ns_id, u->a))
+      // The exactly-once gate (fact 10): winning the claim is what
+      // authorizes an announcement, and losing it is the normal
+      // "already seen" answer — a previous sweep, a racing peer, or
+      // the sweep a reload interrupted. The alert's own expiry is the
+      // claim's: past it the id can never match an active alert again.
+      snprintf(ckey, sizeof(ckey), "wxalert:%s", u->a->id);
+
+      if(!soul_claim_take(sweep->ns_id, ckey, u->a->expires))
         continue;
 
       // Route once per DISTINCT target across all carriers — two users
@@ -993,11 +1052,6 @@ soul_wx_batch_task(task_t *t)
     clam(CLAM_DEBUG, SOUL_CTX,
         "bot=%s weather sweep dropped (bot gone, chat off, or muted)",
         sweep->bot_name);
-
-  // Purge, every sweep: a row whose alert expired two days ago can
-  // never match an active id again, so it buys no dedup.
-  (void)soul_db_exec("DELETE FROM chat_soul_alerts_seen"
-      " WHERE expires < NOW() - INTERVAL '2 days'");
 
   soul_chore_done(sweep->sched, sweep->chore);
   mem_free(sweep);
@@ -1238,6 +1292,23 @@ soul_chore_weather(soul_sched_t *s, uint32_t chore,
   return(true);
 }
 
+// ---------- chore: occasions (CARE-5) ----------
+//
+// The schedule, not the work: the scan, the claim and the wish it
+// hands to the deferred spine are occasions.c's, the same division the
+// deferred chore keeps.
+
+static bool
+soul_chore_occasions(soul_sched_t *s, uint32_t chore, chatbot_state_t *st,
+    bot_inst_t *bot)
+{
+  (void)chore;
+  (void)st;
+
+  chatbot_occasions_run(s->bot_name, s->ns_id, bot);
+  return(false);
+}
+
 // ---------- the tick ----------
 
 static void
@@ -1310,8 +1381,12 @@ soul_tick_cb(task_t *t)
   now = time(NULL);
 
   // The voice log is accounting, not memory: two days is longer than
-  // either budget window and long enough to answer for last night.
+  // either budget window and long enough to answer for last night. The
+  // claim ledger keeps its own clock and is swept from here for the
+  // same reason — a chore should never have to remember to tidy up
+  // after the shared table it wrote into.
   soul_voice_purge();
+  soul_claim_purge();
 
   for(uint32_t i = 0; i < SOUL_CHORE_COUNT; i++)
   {
@@ -1526,23 +1601,24 @@ soul_exit(void)
   pthread_mutex_unlock(&soul_mutex);
 }
 
-// The soul's own durable state — the weather watch's alert ledger.
-// Deferred work lives in chat_deferred and deferred.c raises it. The
-// chat DDL discipline (memory_ensure_tables): owner-run idempotent
-// batches at plugin start(), after dossier_register_config so the
-// dossier(id) FK target exists.
+// The soul's own durable state — the claim ledger every chore dedups
+// against. Deferred work lives in chat_deferred and deferred.c raises
+// it. The chat DDL discipline (memory_ensure_tables): owner-run
+// idempotent batches at plugin start(), after dossier_register_config
+// so the dossier(id) FK target exists.
 void
 soul_ensure_schema(void)
 {
-  // The weather watch's dedup ledger (D8): one row per alert per
-  // namespace, written by the claim INSERT — which is why the primary
-  // key IS the claim. Purged two days past expiry, every sweep.
+  // One row per thing a chore has done and must not do again, keyed by
+  // a string the chore composes: the primary key IS the claim, which
+  // is why there is no separate "seen" bookkeeping anywhere. Two days
+  // past expiry it is swept (soul_claim_purge, every tick).
   (void)soul_db_exec(
-      "CREATE TABLE IF NOT EXISTS chat_soul_alerts_seen ("
-      " alert_id     VARCHAR(200) NOT NULL,"
-      " ns_id        INTEGER      NOT NULL REFERENCES userns(id) ON DELETE CASCADE,"
-      " announced_at TIMESTAMPTZ  NOT NULL DEFAULT NOW(),"
-      " expires      TIMESTAMPTZ,"
-      " PRIMARY KEY(alert_id, ns_id)"
+      "CREATE TABLE IF NOT EXISTS chat_soul_claims ("
+      " claim_key  VARCHAR(256) NOT NULL,"
+      " ns_id      INTEGER      NOT NULL REFERENCES userns(id) ON DELETE CASCADE,"
+      " claimed_at TIMESTAMPTZ  NOT NULL DEFAULT NOW(),"
+      " expires    TIMESTAMPTZ,"
+      " PRIMARY KEY(claim_key, ns_id)"
       ")");
 }

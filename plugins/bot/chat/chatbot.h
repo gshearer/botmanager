@@ -932,46 +932,6 @@ uint64_t chatbot_interpret_begin(chatbot_state_t *st,
 void chatbot_interpret_stop(chatbot_state_t *st);
 void chatbot_interpret_stop_all(void);
 
-// ---- deferred.c — durable work the bot owes a human (CARE-1) ----
-
-// Idempotent chat_deferred DDL. Called from chatbot_plugin_start after
-// dossier_register_config (the dossier FK target must exist).
-void chatbot_deferred_ensure_schema(void);
-
-// Claim and deliver every row that has come due for this namespace,
-// say and run alike. Called from the soul tick's `deferred` chore, on
-// the tick's worker thread — it blocks on sync db_query and dispatches
-// commands, so it must never run on a callback thread.
-void chatbot_deferred_run_due(const char *bot_name, uint32_t ns_id,
-    chatbot_state_t *st, bot_inst_t *bot);
-
-// One row of the soul's presence cache (CARE-2): the least a sighting
-// needs to recognise its subject, and nothing durable — the row itself
-// stays in the DB and the id is what gets claimed.
-typedef struct
-{
-  int64_t id;
-  char    nickname[METHOD_NICKNAME_SZ];
-  char    sender  [METHOD_SENDER_SZ];
-} chatbot_presence_row_t;
-
-// Drop presence rows whose window has closed, then fill `out` with up
-// to `max` rows still waiting for their subject to turn up. Returns how
-// many were written. Blocking (sync db_query) — tick thread only.
-uint32_t chatbot_deferred_presence_scan(const char *bot_name,
-    uint32_t ns_id, chatbot_presence_row_t *out, uint32_t max);
-
-// Claim one presence row by id and deliver it. A zero-row claim is the
-// normal outcome for the loser of a two-witness race, not an error.
-// Blocking — runs on the presence delivery task, never on the method
-// thread that saw the line.
-void chatbot_deferred_deliver_presence(const char *bot_name, uint32_t ns_id,
-    chatbot_state_t *st, bot_inst_t *bot, int64_t id);
-
-// Register /remind, /in (+ list, cancel) and /show deferred. Called
-// from chatbot_cmds_register.
-bool chatbot_deferred_register(void);
-
 // ---- voice.c — the voice governor (CARE-3) ----
 
 // How much say the governor gets over a cue. The classes are about who
@@ -1009,12 +969,111 @@ bool soul_voice_permits(const char *bot_name, uint32_t ns_id,
 // Drop log rows past the retention window. Called once per soul tick.
 void soul_voice_purge(void);
 
+// ---- deferred.c — durable work the bot owes a human (CARE-1) ----
+
+// What a row delivers when its moment comes. Public because chores
+// write rows too (CARE-5), and because these two are the whole
+// contract of the table: speech held until its moment, or an action
+// held until its moment and reported afterwards in voice.
+typedef enum
+{
+  DEFERRED_KIND_SAY = 0,
+  DEFERRED_KIND_RUN = 1,
+} deferred_kind_t;
+
+// Idempotent chat_deferred DDL. Called from chatbot_plugin_start after
+// dossier_register_config (the dossier FK target must exist).
+void chatbot_deferred_ensure_schema(void);
+
+// The one insert every writer goes through — both user verbs and every
+// chore. `secs` is a DELAY, not an instant: `due_at` is computed
+// DB-side so the daemon's clock and the DB's never argue. On a
+// presence row that delay is how long the row stays disarmed before it
+// starts watching, never when it speaks.
+//
+// `expires_secs` 0 takes the default policy — 30 days for a presence
+// row, so nobody who never comes back holds a pending slot forever,
+// and no expiry at all for a timed one. A chore whose work has a real
+// deadline (a birthday wish is worse two days late than never) passes
+// its own.
+//
+// ⚠ `msg` supplies the identity tuple the row stores, and it rides
+// whole: a chore composing one synthetically must fill it from a
+// dossier signature (the dcfc359 rule) or the delivered cue resolves
+// to no dossier and the reply loses the person's memory.
+bool chatbot_deferred_insert(uint32_t ns_id, int64_t dossier,
+    const method_msg_t *msg, const char *method_name, const char *source,
+    deferred_kind_t kind, const char *body, const char *cmd_name,
+    uint64_t secs, bool on_presence, uint64_t expires_secs);
+
+// Claim and deliver every row that has come due for this namespace,
+// say and run alike. Called from the soul tick's `deferred` chore, on
+// the tick's worker thread — it blocks on sync db_query and dispatches
+// commands, so it must never run on a callback thread.
+void chatbot_deferred_run_due(const char *bot_name, uint32_t ns_id,
+    chatbot_state_t *st, bot_inst_t *bot);
+
+// One row of the soul's presence cache (CARE-2): the least a sighting
+// needs to recognise its subject, and nothing durable — the row itself
+// stays in the DB and the id is what gets claimed. `cls` rides along
+// because quiet hours must be answered BEFORE the claim (CARE-5), and
+// by then the only thing the sighting knows about the row is what the
+// scan put here.
+typedef struct
+{
+  int64_t      id;
+  soul_class_t cls;
+  char         nickname[METHOD_NICKNAME_SZ];
+  char         sender  [METHOD_SENDER_SZ];
+} chatbot_presence_row_t;
+
+// Drop presence rows whose window has closed, then fill `out` with up
+// to `max` rows still waiting for their subject to turn up. Returns how
+// many were written. Blocking (sync db_query) — tick thread only.
+uint32_t chatbot_deferred_presence_scan(const char *bot_name,
+    uint32_t ns_id, chatbot_presence_row_t *out, uint32_t max);
+
+// Claim one presence row by id and deliver it. A zero-row claim is the
+// normal outcome for the loser of a two-witness race, not an error.
+// Blocking — runs on the presence delivery task, never on the method
+// thread that saw the line.
+void chatbot_deferred_deliver_presence(const char *bot_name, uint32_t ns_id,
+    chatbot_state_t *st, bot_inst_t *bot, int64_t id);
+
+// Register /remind, /in (+ list, cancel) and /show deferred. Called
+// from chatbot_cmds_register.
+bool chatbot_deferred_register(void);
+
+// ---- occasions.c — dates somebody told the bot about (CARE-5) ----
+
+// One sweep of the occasions chore: scan the namespace for birthday
+// facts falling today, claim each at most once per person per year,
+// and hand a wish to the deferred spine to deliver when its subject is
+// next seen. Speaks nothing itself. Blocking (sync db_query) — runs on
+// the tick's worker thread only.
+void chatbot_occasions_run(const char *bot_name, uint32_t ns_id,
+    bot_inst_t *bot);
+
 // ---- soul.c — the per-bot heartbeat (SOUL-2) ----
 
-// Idempotent DDL for the soul's own tables (the weather watch's alert
-// ledger). Called from chatbot_plugin_start after
-// dossier_register_config (the dossier FK target must exist).
+// Idempotent DDL for the soul's own tables (the generic claim ledger).
+// Called from chatbot_plugin_start after dossier_register_config (the
+// dossier FK target must exist).
 void soul_ensure_schema(void);
+
+// The soul's generic exactly-once guard (CARE-5): one row per thing a
+// chore may do only once — an alert announced once per namespace, a
+// birthday wished once per year. Returns true to the ONE caller that
+// wins the key; false is the ordinary answer for a later tick, a
+// racing peer, or a sweep a reload interrupted, and never an error.
+// `expires` is when the claim stops meaning anything (0 = never); the
+// purge keeps it two days past that. Keys are the chore's to compose,
+// and the prefix convention (`wxalert:`, `bday:`) is what keeps two
+// chores from ever arguing over one string.
+bool soul_claim_take(uint32_t ns_id, const char *key, time_t expires);
+
+// Drop claims whose meaning has expired. Called once per soul tick.
+void soul_claim_purge(void);
 
 // Arm / latch a bot's heartbeat. The extract.c scheduler pattern:
 // schedule reuses a parked task when one exists, unschedule only flips

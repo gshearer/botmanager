@@ -221,9 +221,10 @@ halves. Same shape as `gemini` / `gemini.ws`.
 | `nl_bridge` | plugins/bot/chat/reply.c | natural-language bridge surface |
 | `rag` | plugins/bot/chat/reply.c | what retrieval actually put in the prompt — one `trace=inject` line per surviving RECENT CONVERSATION row (`src=recall` vs `src=mention`, with cosine) plus a `trace=block` summary |
 | `nl_observe` | plugins/bot/chat/nl_observe.c | post-dispatch chat observer (`OBS_CTX`) |
+| `occasions` | plugins/bot/chat/occasions.c | the occasions chore — a birthday claimed for the year and the wish held until its subject turns up (`OCCASIONS_CTX`) |
 | `reachy` | plugins/method/reachy/reachy.c | Reachy Mini method driver — the ear (bridge long-poll, transcription, attention gate, delivery) and the mouth (speech queue, synthesis, upload, playback pacing) (`REACHY_CTX`) |
 | `register` | plugins/bot/chat/dispatch.c | `/register` user creation |
-| `soul` | plugins/bot/chat/soul.c | per-bot heartbeat — chore scheduling, the weather watch, mute skips (`SOUL_CTX`) |
+| `soul` | plugins/bot/chat/soul.c | per-bot heartbeat — chore scheduling, the weather watch, the generic claim ledger, mute skips (`SOUL_CTX`) |
 | `vision` | plugins/bot/chat/vision.c | image-intent path |
 | `voice` | plugins/bot/chat/voice.c | the voice governor — every unprompted cue a budget or a quiet window held back, and why (`VOICE_CTX`) |
 

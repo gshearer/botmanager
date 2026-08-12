@@ -192,6 +192,18 @@ static const plugin_kv_entry_t chatbot_inst_schema[] = {
     "Announcement floor: minor, moderate, severe or extreme. Alerts"
     " graded below it are never claimed or spoken; unrecognized values"
     " read as severe.", NULL },
+  { "behavior.soul.occasions.enabled", KV_BOOL, "false",
+    "Occasions watch: each sweep looks for a birthday somebody told the"
+    " bot themselves (an MM-DD 'birthday' fact) falling today, and holds"
+    " a wish until they are next seen speaking — in the venue they said"
+    " it in, so a date told in a DM is answered in that DM. Claimed once"
+    " per person per year; a wish more than two days late is dropped"
+    " unspoken. Off by default: unprompted speech is an operator"
+    " decision.", NULL },
+  { "behavior.soul.occasions.interval_secs", KV_UINT32, "3600",
+    "Seconds between occasion sweeps (min 5). A date changes once a"
+    " day, so hourly is generous — it is what lets a bot started at noon"
+    " still catch the day's birthdays.", NULL },
   // --- behavior.soul.budget.* / .quiet.* — the voice governor (CARE-3)
   // One gate for every chore: how often the bot may speak unprompted,
   // and when it must not. Weather used to carry its own hourly cap and

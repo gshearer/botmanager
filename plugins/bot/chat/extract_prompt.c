@@ -7,6 +7,7 @@
 #include <stdarg.h>
 #include <stdio.h>
 #include <string.h>
+#include <time.h>
 
 // System prompt: stable across sweeps. Keeps tone + schema contract.
 static const char *extract_system_prompt =
@@ -24,6 +25,12 @@ static const char *extract_system_prompt =
     "kind=\"attribute\" and fact_key=\"location\" with the place as "
     "the value. A visit, trip, or temporary stay is NOT their "
     "location.\n"
+    "- When a participant states their OWN birthday, use "
+    "kind=\"attribute\" and fact_key=\"birthday\", with the value as "
+    "\"MM-DD\" zero-padded (e.g. \"03-07\"); ignore the year. Resolve a "
+    "relative date against the date given above. Someone else's "
+    "birthday, talk about a birthday party, an age without a date, and "
+    "any date you cannot pin to one month and day are NOT this fact.\n"
     "- Prefer few high-confidence facts over many speculative ones.\n"
     "- If nothing is worth recording, output {\"facts\":[]}.\n"
     "- No prose, no markdown fences, no commentary.\n"
@@ -93,6 +100,24 @@ extract_prompt_build(const extract_participant_t *parts, size_t n_parts,
 
   pos = 0;
   out[0] = '\0';
+
+  // The transcript carries no dates, so a relative one ("my birthday is
+  // next Tuesday") has nothing to resolve against. A sweep runs minutes
+  // behind the conversation it reads, which makes the wall clock right
+  // in every ordinary case; a backfill over much older rows is the one
+  // case where it is a lie, and a date it mis-resolves decays like any
+  // other fact.
+  {
+    struct tm tm;
+    time_t    now = time(NULL);
+    char      today[16];
+
+    localtime_r(&now, &tm);
+    strftime(today, sizeof(today), "%Y-%m-%d", &tm);
+
+    if(bufprintf(out, out_sz, &pos, "Today is %s.\n\n", today))
+      return(pos);
+  }
 
   if(bufprintf(out, out_sz, &pos, "Participants:\n"))
     return(pos);

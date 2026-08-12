@@ -68,12 +68,6 @@
 // than this is a paging problem, not a listing problem.
 #define DEFERRED_LIST_MAX       20
 
-typedef enum
-{
-  DEFERRED_KIND_SAY = 0,
-  DEFERRED_KIND_RUN = 1,
-} deferred_kind_t;
-
 // Claim RETURNING order. The fire path reads by index and the column
 // list below is the only place the order is written, so the two live
 // together and an inserted column breaks one build, not one delivery.
@@ -263,13 +257,13 @@ deferred_pending_for(uint32_t ns_id, const char *owner_pred)
   return(n);
 }
 
-// The one insert both verbs (and every future chore) go through.
-// `secs` is a delay, not an instant: due_at is computed DB-side so the
-// daemon's clock and the DB's never argue about when "in 5 minutes" is.
-static bool
-deferred_insert(uint32_t ns_id, int64_t dossier, const method_msg_t *msg,
-    const char *method_name, const char *source, deferred_kind_t kind,
-    const char *body, const char *cmd_name, uint64_t secs, bool on_presence)
+// The one insert both verbs and every chore go through; the contract
+// is chatbot.h's.
+bool
+chatbot_deferred_insert(uint32_t ns_id, int64_t dossier,
+    const method_msg_t *msg, const char *method_name, const char *source,
+    deferred_kind_t kind, const char *body, const char *cmd_name,
+    uint64_t secs, bool on_presence, uint64_t expires_secs)
 {
   // Escaped in one array so the all-or-nothing guard and the release
   // are each one loop; E_COUNT keeps the two from drifting apart.
@@ -300,6 +294,7 @@ deferred_insert(uint32_t ns_id, int64_t dossier, const method_msg_t *msg,
   if(whole)
   {
     char dossier_cell[32];
+    char expires_cell[64];
     char sql[4096];
 
     if(dossier > 0)
@@ -308,11 +303,22 @@ deferred_insert(uint32_t ns_id, int64_t dossier, const method_msg_t *msg,
     else
       snprintf(dossier_cell, sizeof(dossier_cell), "NULL");
 
-    // A presence row gets the same 30-day horizon a timed one is capped
-    // at. Somebody who never comes back would otherwise hold a slot
-    // against their own pending cap forever; the tick's expiry sweep
-    // drops it unspoken, which is the honest end for work whose moment
-    // never arrived.
+    // A caller with a real deadline names it. Otherwise a presence row
+    // gets the same 30-day horizon a timed one is capped at: somebody
+    // who never comes back would otherwise hold a slot against their
+    // own pending cap forever, and the tick's expiry sweep dropping it
+    // unspoken is the honest end for work whose moment never arrived.
+    if(expires_secs > 0)
+      snprintf(expires_cell, sizeof(expires_cell),
+          "NOW() + %llu * INTERVAL '1 second'",
+          (unsigned long long)expires_secs);
+
+    else if(on_presence)
+      snprintf(expires_cell, sizeof(expires_cell), "NOW() + INTERVAL '30 days'");
+
+    else
+      snprintf(expires_cell, sizeof(expires_cell), "NULL");
+
     snprintf(sql, sizeof(sql),
         "INSERT INTO chat_deferred"
         " (ns_id, dossier_id, source, kind, sender, nickname, username,"
@@ -324,8 +330,7 @@ deferred_insert(uint32_t ns_id, int64_t dossier, const method_msg_t *msg,
         ns_id, dossier_cell, source, (int)kind, e[E_SENDER], e[E_NICK],
         e[E_USER], e[E_HOST], e[E_VID], e[E_META], e[E_METH], e[E_CHAN],
         e[E_BODY], e[E_CMD], on_presence ? "TRUE" : "FALSE",
-        (unsigned long long)secs,
-        on_presence ? "NOW() + INTERVAL '30 days'" : "NULL");
+        (unsigned long long)secs, expires_cell);
 
     ok = deferred_exec(sql);
   }
@@ -367,6 +372,44 @@ deferred_row_to_msg(const db_result_t *res, uint32_t i, method_msg_t *msg,
   deferred_copy_col(msg->channel,     sizeof(msg->channel),     res, i, DC_CHANNEL);
 
   return(inst);
+}
+
+// Put a claimed row back to pending so a later moment can deliver it.
+//
+// ⚠ Never call this for a REPEATING row. The claim statement already
+// wrote its successor, so un-claiming re-offers this occurrence on the
+// very next tick and writes another successor, and another — one child
+// per tick for as long as the condition lasts (measured 2026-08-11:
+// three ticks, three rows). A recurrence is by definition re-offered,
+// so for one the honest outcome is to skip the occurrence and let the
+// successor stand. Returns whether the row was actually returned.
+static bool
+deferred_unclaim(int64_t id, int64_t repeat_secs)
+{
+  char sql[128];
+
+  if(repeat_secs >= DEFERRED_REPEAT_MIN)
+    return(false);
+
+  snprintf(sql, sizeof(sql),
+      "UPDATE chat_deferred SET delivered_at = NULL WHERE id = %" PRId64, id);
+  (void)deferred_exec(sql);
+  return(true);
+}
+
+// Who chose the moment is a property of the SOURCE, not of the row: a
+// human typed /remind and /in, so those are TIMED and the governor may
+// not refuse them however late the hour. Everything else in this table
+// was written by a chore that decided by itself that something was
+// worth saying — and an unrecognized source reads that way too,
+// because for a gate the safe direction is the quiet one.
+static soul_class_t
+deferred_source_class(const char *source)
+{
+  if(strcmp(source, "remind") == 0 || strcmp(source, "in") == 0)
+    return(SOUL_CLASS_TIMED);
+
+  return(SOUL_CLASS_UNSOLICITED);
 }
 
 static const char *
@@ -549,31 +592,11 @@ deferred_deliver_row(const char *bot_name, uint32_t ns_id,
     // mid-reload) the row goes back to pending, so a re-bound method
     // delivers LATE rather than never. Leaving it claimed would eat
     // the work silently — the one outcome worse than lateness.
-    //
-    // ⚠ Not for a REPEATING row. The claim statement already wrote
-    // its successor, so un-claiming would re-offer the same row on
-    // the very next tick and write another successor, and another —
-    // one child per tick for as long as the method stays gone
-    // (measured 2026-08-11: three ticks, three rows). A recurrence
-    // is by definition re-offered, so the honest outcome is to skip
-    // this occurrence and let the successor stand.
-    int64_t repeat = deferred_col_i64(res, i, DC_REPEAT, 0);
-
-    if(repeat < DEFERRED_REPEAT_MIN)
-    {
-      char unclaim[128];
-
-      snprintf(unclaim, sizeof(unclaim),
-          "UPDATE chat_deferred SET delivered_at = NULL"
-          " WHERE id = %" PRId64, id);
-      (void)deferred_exec(unclaim);
-    }
+    bool back = deferred_unclaim(id, deferred_col_i64(res, i, DC_REPEAT, 0));
 
     clam(CLAM_WARN, DEFERRED_CTX,
-        "bot=%s deferred %" PRId64 " method gone — %s",
-        bot_name, id,
-        repeat < DEFERRED_REPEAT_MIN
-            ? "unclaimed" : "occurrence skipped (successor stands)");
+        "bot=%s deferred %" PRId64 " method gone — %s", bot_name, id,
+        back ? "unclaimed" : "occurrence skipped (successor stands)");
     return;
   }
 
@@ -590,12 +613,32 @@ deferred_deliver_row(const char *bot_name, uint32_t ns_id,
       bot_name, kind == DEFERRED_KIND_RUN ? "run" : "say", id, source,
       msg.sender, msg.channel[0] != '\0' ? msg.channel : "DM", ago);
 
-  // Recorded, never gated. A deferred row is TIMED by definition — the
-  // human picked this moment — so the governor cannot refuse it and
-  // the verdict is deliberately not branched on: the call is what puts
-  // the cue in the voice log (CARE-3 §D8).
-  (void)soul_voice_permits(bot_name, ns_id,
-      deferred_col_i64(res, i, DC_DOSSIER, 0), SOUL_CLASS_TIMED, false);
+  // The governor, once, at the moment of speech. A TIMED row is never
+  // refused — the human picked this moment — so for /remind and /in
+  // this call is purely what puts the cue in the voice log (CARE-3
+  // §D8). For a chore-written row it is a real gate, and by here the
+  // only thing it can still fail is the budget: quiet hours were
+  // answered before the claim.
+  //
+  // A refusal returns the row rather than eating it, which is where a
+  // deferred cue parts company with a weather cue. Weather has no row
+  // to go back to, so what its budget silences stays silent; a row can
+  // simply wait for the next moment, and its own expires_at is the
+  // statement of how late is too late. A birthday wish held by a busy
+  // hour is spoken on the next sighting, or not at all after two days
+  // — which is exactly the promise the chore made when it wrote it.
+  if(!soul_voice_permits(bot_name, ns_id,
+      deferred_col_i64(res, i, DC_DOSSIER, 0),
+      deferred_source_class(source), false))
+  {
+    bool back = deferred_unclaim(id, deferred_col_i64(res, i, DC_REPEAT, 0));
+
+    clam(CLAM_INFO, DEFERRED_CTX,
+        "bot=%s deferred %" PRId64 " (%s) held by the voice governor — %s",
+        bot_name, id, source,
+        back ? "returned to pending" : "occurrence skipped (successor stands)");
+    return;
+  }
 
   if(kind == DEFERRED_KIND_RUN)
     deferred_deliver_run(st, bot, ns_id, &msg, body, ago);
@@ -714,8 +757,11 @@ chatbot_deferred_presence_scan(const char *bot_name, uint32_t ns_id,
   if(out == NULL || max == 0)
     return(0);
 
+  // `source` is projected for its class alone: the sighting path has
+  // to know whether quiet hours apply to a row before it may claim it,
+  // and the cache is all it will have to go on.
   snprintf(sql, sizeof(sql),
-      "SELECT id, nickname, sender FROM chat_deferred"
+      "SELECT id, nickname, sender, source FROM chat_deferred"
       " WHERE ns_id = %" PRIu32 " AND delivered_at IS NULL"
       " AND deliver_on_presence AND due_at <= NOW()"
       " ORDER BY due_at ASC LIMIT %" PRIu32, ns_id, max);
@@ -734,9 +780,13 @@ chatbot_deferred_presence_scan(const char *bot_name, uint32_t ns_id,
 
   for(uint32_t i = 0; i < res->rows && n < max; i++, n++)
   {
+    char source[24];
+
     out[n].id = deferred_col_i64(res, i, 0, 0);
     deferred_copy_col(out[n].nickname, sizeof(out[n].nickname), res, i, 1);
     deferred_copy_col(out[n].sender,   sizeof(out[n].sender),   res, i, 2);
+    deferred_copy_col(source,          sizeof(source),          res, i, 3);
+    out[n].cls = deferred_source_class(source);
   }
 
   db_result_free(res);
@@ -908,9 +958,9 @@ cmd_remind(const cmd_ctx_t *ctx)
   if(deferred_ask_open(ctx, ctx->parsed->argv[0], &a) != SUCCESS)
     return;
 
-  if(deferred_insert(a.ns->id, chatbot_resolve_dossier(a.st, ctx->msg),
+  if(chatbot_deferred_insert(a.ns->id, chatbot_resolve_dossier(a.st, ctx->msg),
       ctx->msg, a.method_name, "remind", DEFERRED_KIND_SAY,
-      ctx->parsed->argv[1], NULL, a.secs, a.on_presence) != SUCCESS)
+      ctx->parsed->argv[1], NULL, a.secs, a.on_presence, 0) != SUCCESS)
   {
     cmd_reply(ctx, "failed to store the reminder");
     return;
@@ -1053,9 +1103,9 @@ cmd_in(const cmd_ctx_t *ctx)
   else
     snprintf(body, sizeof(body), "%s", verb);
 
-  if(deferred_insert(a.ns->id, chatbot_resolve_dossier(a.st, ctx->msg),
+  if(chatbot_deferred_insert(a.ns->id, chatbot_resolve_dossier(a.st, ctx->msg),
       ctx->msg, a.method_name, "in", DEFERRED_KIND_RUN, body, verb,
-      a.secs, a.on_presence) != SUCCESS)
+      a.secs, a.on_presence, 0) != SUCCESS)
   {
     cmd_reply(ctx, "failed to store it");
     return;
