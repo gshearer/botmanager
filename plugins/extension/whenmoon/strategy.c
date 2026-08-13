@@ -28,6 +28,10 @@
 //     dispatch path's mkt->lock re-acquire (after drop) does NOT
 //     deadlock because no other code path holds mkt->lock and then
 //     tries to take reg->lock.
+//   - WM-SU-1: the plugin-unmap listener takes reg->lock as well. It
+//     runs on the unloading thread between a strategy's deinit() and
+//     its dlclose, so that lock is precisely what serializes the
+//     dlclose against a dispatch already inside the strategy's .text.
 
 #define WHENMOON_INTERNAL
 #include "strategy.h"
@@ -364,6 +368,10 @@ wm_strategy_ctx_strategy_name_impl(wm_strategy_ctx_t *ctx)
 // Registry lifecycle                                                      //
 // ----------------------------------------------------------------------- //
 
+// WM-SU-1: told by core that a mapping is about to disappear. Defined
+// with the rest of the unload handling, below the free helpers it uses.
+static void wm_strategy_unmap_cb(uintptr_t lo, uintptr_t hi, void *data);
+
 bool
 wm_strategy_registry_init(whenmoon_state_t *st)
 {
@@ -386,6 +394,11 @@ wm_strategy_registry_init(whenmoon_state_t *st)
   }
 
   st->strategies = reg;
+
+  // WM-SU-1: from here on, every strategy .so that leaves takes its row
+  // in this registry with it. Registered from the holder's init and
+  // dropped in wm_strategy_registry_destroy, as include/plugin.h asks.
+  plugin_unmap_notify_register(wm_strategy_unmap_cb, st);
 
   clam(CLAM_INFO, WHENMOON_CTX, "strategy registry initialized");
   return(SUCCESS);
@@ -427,12 +440,137 @@ wm_strategy_free_loaded_locked(loaded_strategy_t *ls)
   mem_free(ls);
 }
 
+// ----------------------------------------------------------------------- //
+// A strategy .so leaving under us (WM-SU-1)                               //
+// ----------------------------------------------------------------------- //
+//
+// The registry caches five entry points per strategy, resolved once with
+// plugin_dlsym so the bar path pays no lookup. They are pointers into
+// another plugin's mapping and core cannot see them: plugin_audit
+// reasons about registrations, not about what a consumer stashed in its
+// own heap (PLUGIN.md §Lifecycle Contract — Class B). Nothing told this
+// registry when a strategy went away, so a cascade unload — `/plugin
+// reload coinbase` cycles seventeen dependents, every strategy .so
+// first and whenmoon last — left wm_strategy_registry_destroy calling
+// finalize_fn into unmapped .text. A SIGSEGV inside deinit, and with
+// the daemon's stderr on /dev/null it read as a silent death.
+//
+// plugin_unmap_notify fires after the departing plugin's deinit() and
+// before its dlclose, on the unloading thread. Taking reg->lock here
+// therefore does two jobs: it drops the stale row, and it cannot return
+// until any dispatch already inside that .text has left, since
+// dispatch_bar / dispatch_trade hold reg->lock across the callback.
+// That is what makes the mapping safe to close, not luck.
+//
+// The attachments go with the row, and we deliberately do NOT call the
+// strategy's finalize_fn on the way out: include/plugin.h forbids a
+// listener from calling plugin_* APIs, and every finalize in the tree
+// reaches wm_strategy_ctx_get_user(), which is a plugin_dlsym_cached
+// shim — re-entering the loader from inside its own teardown. The
+// plugin's deinit() has already run besides. Whatever per-attachment
+// state the strategy allocated is leaked, which the WARN says out loud:
+// a bounded, tracked leak on an unload path is the better half of that
+// trade.
+
+// True when any entry point cached for `ls` lies in the departing
+// mapping. One hit condemns the row — all five come from one .so.
+static bool
+wm_strategy_ls_in_range(const loaded_strategy_t *ls, uintptr_t lo,
+    uintptr_t hi)
+{
+  const void *const fns[] = {
+    fn_addr(&ls->describe_fn),
+    fn_addr(&ls->init_fn),
+    fn_addr(&ls->finalize_fn),
+    fn_addr(&ls->on_bar_fn),
+    fn_addr(&ls->on_trade_fn),
+  };
+  size_t i;
+
+  for(i = 0; i < sizeof(fns) / sizeof(fns[0]); i++)
+  {
+    const uintptr_t addr = (uintptr_t)fns[i];
+
+    if(addr >= lo && addr < hi)
+      return(true);
+  }
+
+  return(false);
+}
+
+static void
+wm_strategy_unmap_cb(uintptr_t lo, uintptr_t hi, void *data)
+{
+  whenmoon_state_t        *st = data;
+  wm_strategy_registry_t  *reg;
+  loaded_strategy_t      **pp;
+
+  if(st == NULL || st->strategies == NULL)
+    return;
+
+  reg = st->strategies;
+
+  pthread_mutex_lock(&reg->lock);
+
+  pp = &reg->head;
+
+  while(*pp != NULL)
+  {
+    loaded_strategy_t *ls    = *pp;
+    uint32_t           n_att = ls->n_attachments;
+
+    if(!wm_strategy_ls_in_range(ls, lo, hi))
+    {
+      pp = &ls->next;
+      continue;
+    }
+
+    *pp = ls->next;
+    reg->n_loaded--;
+
+    // Drop the cached entry points BEFORE the free walk: with
+    // finalize_fn NULL, wm_strategy_free_attachment_locked frees our
+    // own record and calls nothing into the departing mapping.
+    ls->describe_fn = NULL;
+    ls->init_fn     = NULL;
+    ls->finalize_fn = NULL;
+    ls->on_bar_fn   = NULL;
+    ls->on_trade_fn = NULL;
+
+    // Losing a row nothing was attached to is routine bookkeeping; the
+    // loud case is the one that leaks, so only that one is a WARN.
+    if(n_att > 0)
+      clam(CLAM_WARN, WHENMOON_CTX,
+          "strategy '%s' (%s) unloaded out from under the registry; "
+          "dropped its row and %u attachment(s) without finalize — any "
+          "per-attachment state it allocated is leaked",
+          ls->name, ls->plugin_name, n_att);
+
+    else
+      clam(CLAM_INFO, WHENMOON_CTX,
+          "strategy '%s' (%s) unloaded; row dropped from the registry",
+          ls->name, ls->plugin_name);
+
+    wm_strategy_free_loaded_locked(ls);
+  }
+
+  pthread_mutex_unlock(&reg->lock);
+}
+
 void
 wm_strategy_registry_destroy(whenmoon_state_t *st)
 {
   wm_strategy_registry_t *reg;
   loaded_strategy_t      *ls;
   loaded_strategy_t      *next;
+
+  // WM-SU-1: stop hearing about unloads before the registry the
+  // listener scrubs can go away — and before `st`, which it is handed
+  // as its data pointer, is freed by whenmoon_deinit. A no-op when
+  // registry_init never ran. Unloading is single-threaded (core's
+  // plugin list is unlocked), so no broadcast can be inside the
+  // callback while this runs.
+  plugin_unmap_notify_unregister(wm_strategy_unmap_cb);
 
   if(st == NULL || st->strategies == NULL)
     return;
