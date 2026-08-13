@@ -407,17 +407,13 @@ gem_symbols_silent_cb(const gemini_symbols_result_t *res, void *user)
         "symbols refresh: %s (count=%u)", res->err, res->count);
 }
 
-bool
+async_rc_t
 gemini_symbols_refresh_async(gemini_done_symbols_cb_t cb, void *user)
 {
   gem_symbols_batch_t *b;
   gem_request_t       *r;
 
   b = gem_batch_alloc((cb != NULL) ? cb : gem_symbols_silent_cb, user);
-
-  if(b == NULL)
-    return(FAIL);
-
   r = gem_req_alloc();
 
   r->type  = GEM_REQ_SYMBOLS;
@@ -432,11 +428,13 @@ gemini_symbols_refresh_async(gemini_done_symbols_cb_t cb, void *user)
     snprintf(b->errbuf, sizeof(b->errbuf),
         "Error: failed to submit Gemini /v1/symbols request");
 
+    // gem_batch_finalise fires the batch's cb — the caller's, or the
+    // silent stand-in substituted above when it passed none.
     gem_batch_finalise(b);
-    return(FAIL);
+    return(ASYNC_FAILED_DELIVERED);
   }
 
-  return(SUCCESS);
+  return(ASYNC_AIRBORNE);
 }
 
 // ==================================================================
@@ -937,7 +935,7 @@ gem_candles_done(const curl_response_t *resp)
   gem_req_release(r);
 }
 
-bool
+async_rc_t
 gemini_fetch_candles_async(const char *pair, exchange_granularity_t gran,
     int64_t since_ms, int64_t until_ms, uint8_t prio,
     gemini_done_candles_cb_t cb, void *user)
@@ -949,7 +947,7 @@ gemini_fetch_candles_async(const char *pair, exchange_granularity_t gran,
   int            n;
 
   if(pair == NULL || pair[0] == '\0' || cb == NULL)
-    return(FAIL);
+    return(ASYNC_FAILED_UNDELIVERED);
 
   r = gem_req_alloc();
 
@@ -965,7 +963,7 @@ gemini_fetch_candles_async(const char *pair, exchange_granularity_t gran,
   if(tf == NULL)
   {
     gem_deliver_candles_fail(r, "Error: gemini: granularity unsupported");
-    return(FAIL);
+    return(ASYNC_FAILED_DELIVERED);
   }
 
   snprintf(r->granularity, sizeof(r->granularity), "%s", tf);
@@ -973,7 +971,7 @@ gemini_fetch_candles_async(const char *pair, exchange_granularity_t gran,
   if(gem_translate_native(pair, native, sizeof(native)) != SUCCESS)
   {
     gem_deliver_candles_fail(r, "Error: gemini: unknown product_id");
-    return(FAIL);
+    return(ASYNC_FAILED_DELIVERED);
   }
 
   n = snprintf(path, sizeof(path), GEM_PATH_CANDLES "%s/%s", native, tf);
@@ -981,17 +979,17 @@ gemini_fetch_candles_async(const char *pair, exchange_granularity_t gran,
   if(n < 0 || (size_t)n >= sizeof(path))
   {
     gem_deliver_candles_fail(r, "Error: gemini candles path overflow");
-    return(FAIL);
+    return(ASYNC_FAILED_DELIVERED);
   }
 
   if(gem_submit_public(r, prio, path, gem_candles_done) != SUCCESS)
   {
     gem_deliver_candles_fail(r,
         "Error: failed to submit Gemini /v2/candles request");
-    return(FAIL);
+    return(ASYNC_FAILED_DELIVERED);
   }
 
-  return(SUCCESS);
+  return(ASYNC_AIRBORNE);
 }
 
 // ==================================================================
@@ -1082,7 +1080,7 @@ gem_balances_done(const curl_response_t *resp)
   gem_req_release(r);
 }
 
-bool
+async_rc_t
 gemini_get_balance_async(gemini_done_balances_cb_t cb, void *user)
 {
   gem_request_t *r;
@@ -1091,7 +1089,7 @@ gemini_get_balance_async(gemini_done_balances_cb_t cb, void *user)
   int            n;
 
   if(cb == NULL)
-    return(FAIL);
+    return(ASYNC_FAILED_UNDELIVERED);
 
   r = gem_req_alloc();
 
@@ -1102,13 +1100,13 @@ gemini_get_balance_async(gemini_done_balances_cb_t cb, void *user)
   if(!gem_apikey_configured())
   {
     gem_deliver_balances_fail(r, GEM_ERR_NO_CREDS);
-    return(FAIL);
+    return(ASYNC_FAILED_DELIVERED);
   }
 
   if(gem_next_nonce(&nonce) != SUCCESS)
   {
     gem_deliver_balances_fail(r, "Error: gemini nonce mint failed");
-    return(FAIL);
+    return(ASYNC_FAILED_DELIVERED);
   }
 
   n = snprintf(body, sizeof(body),
@@ -1118,7 +1116,7 @@ gemini_get_balance_async(gemini_done_balances_cb_t cb, void *user)
   if(n < 0 || (size_t)n >= sizeof(body))
   {
     gem_deliver_balances_fail(r, "Error: gemini balances body overflow");
-    return(FAIL);
+    return(ASYNC_FAILED_DELIVERED);
   }
 
   if(gem_submit_private(r, EXCHANGE_PRIO_TRANSACTIONAL, GEM_PATH_BALANCES,
@@ -1126,10 +1124,10 @@ gemini_get_balance_async(gemini_done_balances_cb_t cb, void *user)
   {
     gem_deliver_balances_fail(r,
         "Error: failed to submit Gemini /v1/balances request");
-    return(FAIL);
+    return(ASYNC_FAILED_DELIVERED);
   }
 
-  return(SUCCESS);
+  return(ASYNC_AIRBORNE);
 }
 
 // ==================================================================
@@ -1207,7 +1205,7 @@ gem_order_new_done(const curl_response_t *resp)
   gem_req_release(r);
 }
 
-bool
+async_rc_t
 gemini_add_order_async(const gemini_place_order_req_t *req,
     gemini_done_order_cb_t cb, void *user)
 {
@@ -1225,7 +1223,7 @@ gemini_add_order_async(const gemini_place_order_req_t *req,
   int            n;
 
   if(req == NULL || cb == NULL)
-    return(FAIL);
+    return(ASYNC_FAILED_UNDELIVERED);
 
   r = gem_req_alloc();
 
@@ -1240,7 +1238,7 @@ gemini_add_order_async(const gemini_place_order_req_t *req,
   if(!gem_apikey_configured())
   {
     gem_deliver_order_fail(r, GEM_ERR_NO_CREDS);
-    return(FAIL);
+    return(ASYNC_FAILED_DELIVERED);
   }
 
   // Gemini's documented type strings start with the literal "exchange ".
@@ -1262,7 +1260,7 @@ gemini_add_order_async(const gemini_place_order_req_t *req,
   {
     gem_deliver_order_fail(r,
         "Error: Gemini supports order types 'limit' and 'market'");
-    return(FAIL);
+    return(ASYNC_FAILED_DELIVERED);
   }
 
   is_buy  = (strcmp(req->side, "buy")  == 0);
@@ -1272,33 +1270,33 @@ gemini_add_order_async(const gemini_place_order_req_t *req,
   {
     gem_deliver_order_fail(r,
         "Error: Gemini side must be 'buy' or 'sell'");
-    return(FAIL);
+    return(ASYNC_FAILED_DELIVERED);
   }
 
   if(req->size <= 0.0)
   {
     gem_deliver_order_fail(r, "Error: positive size required");
-    return(FAIL);
+    return(ASYNC_FAILED_DELIVERED);
   }
 
   if(!is_market && req->price <= 0.0)
   {
     gem_deliver_order_fail(r,
         "Error: positive price required for a limit order");
-    return(FAIL);
+    return(ASYNC_FAILED_DELIVERED);
   }
 
   if(is_market && req->post_only)
   {
     gem_deliver_order_fail(r,
         "Error: post_only is invalid on market orders");
-    return(FAIL);
+    return(ASYNC_FAILED_DELIVERED);
   }
 
   if(gem_translate_native(req->product_id, native, sizeof(native)) != SUCCESS)
   {
     gem_deliver_order_fail(r, "Error: gemini: unknown product_id");
-    return(FAIL);
+    return(ASYNC_FAILED_DELIVERED);
   }
 
   if(req->client_oid[0] != '\0')
@@ -1309,7 +1307,7 @@ gemini_add_order_async(const gemini_place_order_req_t *req,
   if(gem_next_nonce(&nonce) != SUCCESS)
   {
     gem_deliver_order_fail(r, "Error: gemini nonce mint failed");
-    return(FAIL);
+    return(ASYNC_FAILED_DELIVERED);
   }
 
   gem_fmt_decimal(amount_str, sizeof(amount_str), req->size);
@@ -1377,7 +1375,7 @@ gemini_add_order_async(const gemini_place_order_req_t *req,
   if(n < 0 || (size_t)n >= sizeof(body))
   {
     gem_deliver_order_fail(r, "Error: gemini order/new body overflow");
-    return(FAIL);
+    return(ASYNC_FAILED_DELIVERED);
   }
 
   if(gem_submit_private(r, EXCHANGE_PRIO_TRANSACTIONAL, GEM_PATH_ORDER_NEW,
@@ -1385,10 +1383,10 @@ gemini_add_order_async(const gemini_place_order_req_t *req,
   {
     gem_deliver_order_fail(r,
         "Error: failed to submit Gemini /v1/order/new request");
-    return(FAIL);
+    return(ASYNC_FAILED_DELIVERED);
   }
 
-  return(SUCCESS);
+  return(ASYNC_AIRBORNE);
 }
 
 // ==================================================================
@@ -1410,7 +1408,7 @@ gem_order_cancel_done(const curl_response_t *resp)
   gem_order_new_done(resp);
 }
 
-bool
+async_rc_t
 gemini_cancel_order_async(const char *order_id,
     gemini_done_order_cb_t cb, void *user)
 {
@@ -1422,7 +1420,7 @@ gemini_cancel_order_async(const char *order_id,
   int            n;
 
   if(order_id == NULL || order_id[0] == '\0' || cb == NULL)
-    return(FAIL);
+    return(ASYNC_FAILED_UNDELIVERED);
 
   r = gem_req_alloc();
 
@@ -1434,7 +1432,7 @@ gemini_cancel_order_async(const char *order_id,
   if(!gem_apikey_configured())
   {
     gem_deliver_order_fail(r, GEM_ERR_NO_CREDS);
-    return(FAIL);
+    return(ASYNC_FAILED_DELIVERED);
   }
 
   oid_num = strtoll(order_id, &end, 10);
@@ -1443,13 +1441,13 @@ gemini_cancel_order_async(const char *order_id,
   {
     gem_deliver_order_fail(r,
         "Error: gemini cancel: order_id must be a positive integer");
-    return(FAIL);
+    return(ASYNC_FAILED_DELIVERED);
   }
 
   if(gem_next_nonce(&nonce) != SUCCESS)
   {
     gem_deliver_order_fail(r, "Error: gemini nonce mint failed");
-    return(FAIL);
+    return(ASYNC_FAILED_DELIVERED);
   }
 
   n = snprintf(body, sizeof(body),
@@ -1463,7 +1461,7 @@ gemini_cancel_order_async(const char *order_id,
   if(n < 0 || (size_t)n >= sizeof(body))
   {
     gem_deliver_order_fail(r, "Error: gemini cancel body overflow");
-    return(FAIL);
+    return(ASYNC_FAILED_DELIVERED);
   }
 
   if(gem_submit_private(r, EXCHANGE_PRIO_TRANSACTIONAL, GEM_PATH_ORDER_CANCEL,
@@ -1471,10 +1469,10 @@ gemini_cancel_order_async(const char *order_id,
   {
     gem_deliver_order_fail(r,
         "Error: failed to submit Gemini /v1/order/cancel request");
-    return(FAIL);
+    return(ASYNC_FAILED_DELIVERED);
   }
 
-  return(SUCCESS);
+  return(ASYNC_AIRBORNE);
 }
 
 // ==================================================================
@@ -1492,7 +1490,7 @@ gem_order_status_done(const curl_response_t *resp)
   gem_order_new_done(resp);
 }
 
-bool
+async_rc_t
 gemini_query_order_async(const char *order_id,
     gemini_done_order_cb_t cb, void *user)
 {
@@ -1504,7 +1502,7 @@ gemini_query_order_async(const char *order_id,
   int            n;
 
   if(order_id == NULL || order_id[0] == '\0' || cb == NULL)
-    return(FAIL);
+    return(ASYNC_FAILED_UNDELIVERED);
 
   r = gem_req_alloc();
 
@@ -1516,7 +1514,7 @@ gemini_query_order_async(const char *order_id,
   if(!gem_apikey_configured())
   {
     gem_deliver_order_fail(r, GEM_ERR_NO_CREDS);
-    return(FAIL);
+    return(ASYNC_FAILED_DELIVERED);
   }
 
   oid_num = strtoll(order_id, &end, 10);
@@ -1525,13 +1523,13 @@ gemini_query_order_async(const char *order_id,
   {
     gem_deliver_order_fail(r,
         "Error: gemini status: order_id must be a positive integer");
-    return(FAIL);
+    return(ASYNC_FAILED_DELIVERED);
   }
 
   if(gem_next_nonce(&nonce) != SUCCESS)
   {
     gem_deliver_order_fail(r, "Error: gemini nonce mint failed");
-    return(FAIL);
+    return(ASYNC_FAILED_DELIVERED);
   }
 
   n = snprintf(body, sizeof(body),
@@ -1545,7 +1543,7 @@ gemini_query_order_async(const char *order_id,
   if(n < 0 || (size_t)n >= sizeof(body))
   {
     gem_deliver_order_fail(r, "Error: gemini status body overflow");
-    return(FAIL);
+    return(ASYNC_FAILED_DELIVERED);
   }
 
   if(gem_submit_private(r, EXCHANGE_PRIO_TRANSACTIONAL, GEM_PATH_ORDER_STATUS,
@@ -1553,10 +1551,10 @@ gemini_query_order_async(const char *order_id,
   {
     gem_deliver_order_fail(r,
         "Error: failed to submit Gemini /v1/order/status request");
-    return(FAIL);
+    return(ASYNC_FAILED_DELIVERED);
   }
 
-  return(SUCCESS);
+  return(ASYNC_AIRBORNE);
 }
 
 // ==================================================================
@@ -1627,7 +1625,7 @@ gem_active_orders_done(const curl_response_t *resp)
   gem_req_release(r);
 }
 
-bool
+async_rc_t
 gemini_active_orders_async(gemini_done_orders_cb_t cb, void *user)
 {
   gem_request_t *r;
@@ -1636,7 +1634,7 @@ gemini_active_orders_async(gemini_done_orders_cb_t cb, void *user)
   int            n;
 
   if(cb == NULL)
-    return(FAIL);
+    return(ASYNC_FAILED_UNDELIVERED);
 
   r = gem_req_alloc();
 
@@ -1647,13 +1645,13 @@ gemini_active_orders_async(gemini_done_orders_cb_t cb, void *user)
   if(!gem_apikey_configured())
   {
     gem_deliver_orders_fail(r, GEM_ERR_NO_CREDS);
-    return(FAIL);
+    return(ASYNC_FAILED_DELIVERED);
   }
 
   if(gem_next_nonce(&nonce) != SUCCESS)
   {
     gem_deliver_orders_fail(r, "Error: gemini nonce mint failed");
-    return(FAIL);
+    return(ASYNC_FAILED_DELIVERED);
   }
 
   n = snprintf(body, sizeof(body),
@@ -1663,7 +1661,7 @@ gemini_active_orders_async(gemini_done_orders_cb_t cb, void *user)
   if(n < 0 || (size_t)n >= sizeof(body))
   {
     gem_deliver_orders_fail(r, "Error: gemini orders body overflow");
-    return(FAIL);
+    return(ASYNC_FAILED_DELIVERED);
   }
 
   if(gem_submit_private(r, EXCHANGE_PRIO_TRANSACTIONAL, GEM_PATH_ORDERS,
@@ -1671,10 +1669,10 @@ gemini_active_orders_async(gemini_done_orders_cb_t cb, void *user)
   {
     gem_deliver_orders_fail(r,
         "Error: failed to submit Gemini /v1/orders request");
-    return(FAIL);
+    return(ASYNC_FAILED_DELIVERED);
   }
 
-  return(SUCCESS);
+  return(ASYNC_AIRBORNE);
 }
 
 // ==================================================================
@@ -1795,7 +1793,7 @@ gem_mytrades_done(const curl_response_t *resp)
   gem_req_release(r);
 }
 
-bool
+async_rc_t
 gemini_mytrades_async(const char *product_id, int64_t since_ms,
     gemini_done_fills_cb_t cb, void *user)
 {
@@ -1806,7 +1804,7 @@ gemini_mytrades_async(const char *product_id, int64_t since_ms,
   int            n;
 
   if(cb == NULL)
-    return(FAIL);
+    return(ASYNC_FAILED_UNDELIVERED);
 
   r = gem_req_alloc();
 
@@ -1820,7 +1818,7 @@ gemini_mytrades_async(const char *product_id, int64_t since_ms,
   if(!gem_apikey_configured())
   {
     gem_deliver_fills_fail(r, GEM_ERR_NO_CREDS);
-    return(FAIL);
+    return(ASYNC_FAILED_DELIVERED);
   }
 
   // Gemini requires `symbol` on /v1/mytrades; reject NULL/empty rather
@@ -1830,19 +1828,19 @@ gemini_mytrades_async(const char *product_id, int64_t since_ms,
   {
     gem_deliver_fills_fail(r,
         "Error: gemini mytrades requires a product_id");
-    return(FAIL);
+    return(ASYNC_FAILED_DELIVERED);
   }
 
   if(gem_translate_native(product_id, native, sizeof(native)) != SUCCESS)
   {
     gem_deliver_fills_fail(r, "Error: gemini: unknown product_id");
-    return(FAIL);
+    return(ASYNC_FAILED_DELIVERED);
   }
 
   if(gem_next_nonce(&nonce) != SUCCESS)
   {
     gem_deliver_fills_fail(r, "Error: gemini nonce mint failed");
-    return(FAIL);
+    return(ASYNC_FAILED_DELIVERED);
   }
 
   if(since_ms > 0)
@@ -1870,7 +1868,7 @@ gemini_mytrades_async(const char *product_id, int64_t since_ms,
   if(n < 0 || (size_t)n >= sizeof(body))
   {
     gem_deliver_fills_fail(r, "Error: gemini mytrades body overflow");
-    return(FAIL);
+    return(ASYNC_FAILED_DELIVERED);
   }
 
   if(gem_submit_private(r, EXCHANGE_PRIO_TRANSACTIONAL, GEM_PATH_MYTRADES,
@@ -1878,8 +1876,8 @@ gemini_mytrades_async(const char *product_id, int64_t since_ms,
   {
     gem_deliver_fills_fail(r,
         "Error: failed to submit Gemini /v1/mytrades request");
-    return(FAIL);
+    return(ASYNC_FAILED_DELIVERED);
   }
 
-  return(SUCCESS);
+  return(ASYNC_AIRBORNE);
 }

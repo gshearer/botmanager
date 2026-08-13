@@ -442,7 +442,7 @@ cb_candles_exchange_resp(int http_status, const char *body, size_t body_len,
 
 // Public API
 
-bool
+async_rc_t
 coinbase_fetch_candles_async(const char *product_id, int32_t granularity,
     int64_t start_ts, int64_t end_ts, uint8_t prio,
     coinbase_done_candles_cb_t cb, void *user)
@@ -453,7 +453,7 @@ coinbase_fetch_candles_async(const char *product_id, int32_t granularity,
   int           n;
 
   if(product_id == NULL || product_id[0] == '\0' || granularity <= 0)
-    return(FAIL);
+    return(ASYNC_FAILED_UNDELIVERED);
 
   if(cb_gran_seconds_to_at_name(granularity, gran_name,
         sizeof(gran_name)) != SUCCESS)
@@ -464,7 +464,7 @@ coinbase_fetch_candles_async(const char *product_id, int32_t granularity,
     r->user       = user;
     cb_deliver_candles_fail(r,
         "Error: unsupported granularity for Coinbase Advanced Trade");
-    return(FAIL);
+    return(ASYNC_FAILED_DELIVERED);
   }
 
   // Bucket budget: Coinbase Advanced Trade caps at 350 candles per
@@ -484,7 +484,7 @@ coinbase_fetch_candles_async(const char *product_id, int32_t granularity,
       r->user       = user;
       cb_deliver_candles_fail(r,
           "Error: requested candle range exceeds 300-bucket limit");
-      return(FAIL);
+      return(ASYNC_FAILED_DELIVERED);
     }
   }
 
@@ -498,7 +498,7 @@ coinbase_fetch_candles_async(const char *product_id, int32_t granularity,
         product_id, gran_name);
 
   if(n < 0 || (size_t)n >= sizeof(path))
-    return(FAIL);
+    return(ASYNC_FAILED_UNDELIVERED);
 
   r = cb_req_alloc();
   r->type        = CB_REQ_CANDLES;
@@ -518,10 +518,10 @@ coinbase_fetch_candles_async(const char *product_id, int32_t granularity,
   {
     cb_deliver_candles_fail(r,
         "Error: failed to submit Coinbase candles request");
-    return(FAIL);
+    return(ASYNC_FAILED_DELIVERED);
   }
 
-  return(SUCCESS);
+  return(ASYNC_AIRBORNE);
 }
 
 // Lifecycle

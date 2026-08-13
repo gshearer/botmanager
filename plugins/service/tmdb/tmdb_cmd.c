@@ -731,7 +731,8 @@ tmdb_on_pick(const tmdb_search_res_t *res, void *user)
 
   if(best->media == TMDB_MEDIA_PERSON)
   {
-    if(tmdb_person_async(best->id, tmdb_on_person, r) != SUCCESS)
+    if(tmdb_person_async(best->id, tmdb_on_person, r)
+        == ASYNC_FAILED_UNDELIVERED)
     {
       cmd_reply(&ctx, "Couldn't load details — try again shortly.");
       mem_free(r);
@@ -740,7 +741,8 @@ tmdb_on_pick(const tmdb_search_res_t *res, void *user)
 
   else
   {
-    if(tmdb_title_async(best->media, best->id, tmdb_on_title, r) != SUCCESS)
+    if(tmdb_title_async(best->media, best->id, tmdb_on_title, r)
+        == ASYNC_FAILED_UNDELIVERED)
     {
       cmd_reply(&ctx, "Couldn't load details — try again shortly.");
       mem_free(r);
@@ -902,7 +904,8 @@ tmdb_cmd(const cmd_ctx_t *ctx)
     r->weekly  = a.weekly;
     r->verbose = a.verbose;
 
-    if(tmdb_trending_async(a.forced, a.weekly, tmdb_on_list, r) != SUCCESS)
+    if(tmdb_trending_async(a.forced, a.weekly, tmdb_on_list, r)
+        == ASYNC_FAILED_UNDELIVERED)
     {
       cmd_reply(ctx, "Couldn't reach TMDB — try again shortly.");
       mem_free(r);
@@ -924,9 +927,11 @@ tmdb_cmd(const cmd_ctx_t *ctx)
   snprintf(r->query, sizeof(r->query), "%s", a.query);
 
   if(a.mode == TMDB_MODE_LIST)
-    ok = tmdb_search_async(a.forced, a.query, tmdb_on_list, r) == SUCCESS;
+    ok = tmdb_search_async(a.forced, a.query, tmdb_on_list, r)
+        != ASYNC_FAILED_UNDELIVERED;
   else
-    ok = tmdb_search_async(a.forced, a.query, tmdb_on_pick, r) == SUCCESS;
+    ok = tmdb_search_async(a.forced, a.query, tmdb_on_pick, r)
+        != ASYNC_FAILED_UNDELIVERED;
 
   if(!ok)
   {

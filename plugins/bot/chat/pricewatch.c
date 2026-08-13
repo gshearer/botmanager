@@ -133,7 +133,7 @@ typedef struct
   pricewatch_row_t    rows  [PRICEWATCH_ROWS_MAX];
 } pricewatch_sweep_t;
 
-typedef bool (*pricewatch_tickers_fn_t)(const char *,
+typedef async_rc_t (*pricewatch_tickers_fn_t)(const char *,
     exchange_done_tickers_cb_t, void *);
 
 static pricewatch_tickers_fn_t pricewatch_tickers_fn;
@@ -1476,21 +1476,18 @@ chatbot_pricewatch_run(soul_sched_t *sched, uint32_t chore,
   // watchlist's prices — and the answer to "does that pair exist?" —
   // honest between watches.
   //
-  // ⚠⚠ The exchange is the "FAIL means the callback ALREADY fired"
-  // convention (`PLUGIN.md §Async failure semantics`, and
-  // exchange_caps.c is the table's own citation), so from here the
-  // sweep belongs to pricewatch_tickers_cb whatever comes back: it has
-  // logged the error, released the latch and freed the sweep before
-  // this returns. Freeing here as well was a real double-free and it
-  // killed the daemon on the first unregistered exchange name — the
-  // trap that finding is about, walked into, measured, and fixed.
+  // Anything but ASYNC_AIRBORNE means the sweep is no longer ours —
+  // pricewatch_tickers_cb has logged the error, released the latch and
+  // freed it before this returns. Freeing here as well was a real
+  // double-free that killed the daemon on the first unregistered
+  // exchange name; the return type is what says so now.
   //
-  // false, not true: the callback has already released the latch, and
+  // false, not true: the callback has already released the latch, so
   // asking the tick to release it again is a harmless repeated store,
   // where claiming to be airborne after a synchronous failure would
-  // wedge the chore for good if the convention ever changed.
-  if(pricewatch_tickers_fn(sweep->exchange, pricewatch_tickers_cb,
-      sweep) != SUCCESS)
+  // wedge the chore for good.
+  if(pricewatch_tickers_fn(sweep->exchange, pricewatch_tickers_cb, sweep)
+      != ASYNC_AIRBORNE)
     return(false);
 
   // Airborne: the in-flight flag now belongs to the completion path.

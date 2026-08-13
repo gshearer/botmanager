@@ -918,7 +918,7 @@ tmdb_configured(void)
   return(tok != NULL && tok[0] != '\0');
 }
 
-bool
+async_rc_t
 tmdb_search_async(tmdb_media_t kind, const char *query,
     tmdb_search_cb_t cb, void *user)
 {
@@ -932,15 +932,15 @@ tmdb_search_async(tmdb_media_t kind, const char *query,
   tmdb_req_t     *req;
 
   if(cb == NULL || query == NULL || query[0] == '\0')
-    return(FAIL);
+    return(ASYNC_FAILED_UNDELIVERED);
 
   tok = kv_get_creds("plugin.tmdb.creds.apikey");
 
   if(tok == NULL || tok[0] == '\0')
-    return(FAIL);
+    return(ASYNC_FAILED_UNDELIVERED);
 
   if(tmdb_urlencode(query, enc, sizeof(enc)) >= sizeof(enc))
-    return(FAIL);
+    return(ASYNC_FAILED_UNDELIVERED);
 
   lang = kv_get_str("plugin.tmdb.language");
 
@@ -958,7 +958,7 @@ tmdb_search_async(tmdb_media_t kind, const char *query,
       kv_get_uint("plugin.tmdb.include_adult") ? "true" : "false", lang);
 
   if(need < 0 || (size_t)need >= sizeof(url))
-    return(FAIL);
+    return(ASYNC_FAILED_UNDELIVERED);
 
   req = mem_alloc(TMDB_CTX, "req", sizeof(*req));
   memset(req, 0, sizeof(*req));
@@ -972,7 +972,7 @@ tmdb_search_async(tmdb_media_t kind, const char *query,
   if(cr == NULL)
   {
     mem_free(req);
-    return(FAIL);
+    return(ASYNC_FAILED_UNDELIVERED);
   }
 
   tmdb_apply_auth(cr, tok);
@@ -980,13 +980,13 @@ tmdb_search_async(tmdb_media_t kind, const char *query,
   if(curl_request_submit(cr) != SUCCESS)
   {
     mem_free(req);
-    return(FAIL);
+    return(ASYNC_FAILED_UNDELIVERED);
   }
 
-  return(SUCCESS);
+  return(ASYNC_AIRBORNE);
 }
 
-bool
+async_rc_t
 tmdb_title_async(tmdb_media_t kind, int32_t id, tmdb_title_cb_t cb, void *user)
 {
   const char     *tok;
@@ -1001,15 +1001,15 @@ tmdb_title_async(tmdb_media_t kind, int32_t id, tmdb_title_cb_t cb, void *user)
   tmdb_req_t     *req;
 
   if(cb == NULL || id <= 0)
-    return(FAIL);
+    return(ASYNC_FAILED_UNDELIVERED);
 
   if(kind != TMDB_MEDIA_MOVIE && kind != TMDB_MEDIA_TV)
-    return(FAIL);
+    return(ASYNC_FAILED_UNDELIVERED);
 
   tok = kv_get_creds("plugin.tmdb.creds.apikey");
 
   if(tok == NULL || tok[0] == '\0')
-    return(FAIL);
+    return(ASYNC_FAILED_UNDELIVERED);
 
   ttl = (uint32_t)kv_get_uint("plugin.tmdb.cache_ttl");
   now = time(NULL);
@@ -1022,7 +1022,7 @@ tmdb_title_async(tmdb_media_t kind, int32_t id, tmdb_title_cb_t cb, void *user)
     res.status = TMDB_OK;
     res.title  = cached_v;
     cb(&res, user);
-    return(SUCCESS);
+    return(ASYNC_AIRBORNE);
   }
 
   lang = kv_get_str("plugin.tmdb.language");
@@ -1037,7 +1037,7 @@ tmdb_title_async(tmdb_media_t kind, int32_t id, tmdb_title_cb_t cb, void *user)
       TMDB_API_BASE, path, id, lang);
 
   if(need < 0 || (size_t)need >= sizeof(url))
-    return(FAIL);
+    return(ASYNC_FAILED_UNDELIVERED);
 
   req = mem_alloc(TMDB_CTX, "req", sizeof(*req));
   memset(req, 0, sizeof(*req));
@@ -1052,7 +1052,7 @@ tmdb_title_async(tmdb_media_t kind, int32_t id, tmdb_title_cb_t cb, void *user)
   if(cr == NULL)
   {
     mem_free(req);
-    return(FAIL);
+    return(ASYNC_FAILED_UNDELIVERED);
   }
 
   tmdb_apply_auth(cr, tok);
@@ -1060,13 +1060,13 @@ tmdb_title_async(tmdb_media_t kind, int32_t id, tmdb_title_cb_t cb, void *user)
   if(curl_request_submit(cr) != SUCCESS)
   {
     mem_free(req);
-    return(FAIL);
+    return(ASYNC_FAILED_UNDELIVERED);
   }
 
-  return(SUCCESS);
+  return(ASYNC_AIRBORNE);
 }
 
-bool
+async_rc_t
 tmdb_person_async(int32_t id, tmdb_person_cb_t cb, void *user)
 {
   const char     *tok;
@@ -1080,12 +1080,12 @@ tmdb_person_async(int32_t id, tmdb_person_cb_t cb, void *user)
   tmdb_req_t     *req;
 
   if(cb == NULL || id <= 0)
-    return(FAIL);
+    return(ASYNC_FAILED_UNDELIVERED);
 
   tok = kv_get_creds("plugin.tmdb.creds.apikey");
 
   if(tok == NULL || tok[0] == '\0')
-    return(FAIL);
+    return(ASYNC_FAILED_UNDELIVERED);
 
   ttl = (uint32_t)kv_get_uint("plugin.tmdb.cache_ttl");
   now = time(NULL);
@@ -1098,7 +1098,7 @@ tmdb_person_async(int32_t id, tmdb_person_cb_t cb, void *user)
     res.status = TMDB_OK;
     res.person = cached_v;
     cb(&res, user);
-    return(SUCCESS);
+    return(ASYNC_AIRBORNE);
   }
 
   lang = kv_get_str("plugin.tmdb.language");
@@ -1112,7 +1112,7 @@ tmdb_person_async(int32_t id, tmdb_person_cb_t cb, void *user)
       TMDB_API_BASE, id, lang);
 
   if(need < 0 || (size_t)need >= sizeof(url))
-    return(FAIL);
+    return(ASYNC_FAILED_UNDELIVERED);
 
   req = mem_alloc(TMDB_CTX, "req", sizeof(*req));
   memset(req, 0, sizeof(*req));
@@ -1126,7 +1126,7 @@ tmdb_person_async(int32_t id, tmdb_person_cb_t cb, void *user)
   if(cr == NULL)
   {
     mem_free(req);
-    return(FAIL);
+    return(ASYNC_FAILED_UNDELIVERED);
   }
 
   tmdb_apply_auth(cr, tok);
@@ -1134,13 +1134,13 @@ tmdb_person_async(int32_t id, tmdb_person_cb_t cb, void *user)
   if(curl_request_submit(cr) != SUCCESS)
   {
     mem_free(req);
-    return(FAIL);
+    return(ASYNC_FAILED_UNDELIVERED);
   }
 
-  return(SUCCESS);
+  return(ASYNC_AIRBORNE);
 }
 
-bool
+async_rc_t
 tmdb_trending_async(tmdb_media_t kind, bool weekly, tmdb_search_cb_t cb,
     void *user)
 {
@@ -1159,12 +1159,12 @@ tmdb_trending_async(tmdb_media_t kind, bool weekly, tmdb_search_cb_t cb,
   tmdb_req_t     *req;
 
   if(cb == NULL)
-    return(FAIL);
+    return(ASYNC_FAILED_UNDELIVERED);
 
   tok = kv_get_creds("plugin.tmdb.creds.apikey");
 
   if(tok == NULL || tok[0] == '\0')
-    return(FAIL);
+    return(ASYNC_FAILED_UNDELIVERED);
 
   path = kind == TMDB_MEDIA_MOVIE ? "movie"
        : kind == TMDB_MEDIA_TV    ? "tv"
@@ -1184,7 +1184,7 @@ tmdb_trending_async(tmdb_media_t kind, bool weekly, tmdb_search_cb_t cb,
     res.hits   = n > 0 ? hits : NULL;
     res.n      = n;
     cb(&res, user);
-    return(SUCCESS);
+    return(ASYNC_AIRBORNE);
   }
 
   lang = kv_get_str("plugin.tmdb.language");
@@ -1196,7 +1196,7 @@ tmdb_trending_async(tmdb_media_t kind, bool weekly, tmdb_search_cb_t cb,
       TMDB_API_BASE, path, win, lang);
 
   if(need < 0 || (size_t)need >= sizeof(url))
-    return(FAIL);
+    return(ASYNC_FAILED_UNDELIVERED);
 
   req = mem_alloc(TMDB_CTX, "req", sizeof(*req));
   memset(req, 0, sizeof(*req));
@@ -1211,7 +1211,7 @@ tmdb_trending_async(tmdb_media_t kind, bool weekly, tmdb_search_cb_t cb,
   if(cr == NULL)
   {
     mem_free(req);
-    return(FAIL);
+    return(ASYNC_FAILED_UNDELIVERED);
   }
 
   tmdb_apply_auth(cr, tok);
@@ -1219,10 +1219,10 @@ tmdb_trending_async(tmdb_media_t kind, bool weekly, tmdb_search_cb_t cb,
   if(curl_request_submit(cr) != SUCCESS)
   {
     mem_free(req);
-    return(FAIL);
+    return(ASYNC_FAILED_UNDELIVERED);
   }
 
-  return(SUCCESS);
+  return(ASYNC_AIRBORNE);
 }
 
 // ----------------------------------------------------------------------

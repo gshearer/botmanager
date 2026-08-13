@@ -955,7 +955,7 @@ cb_accounts_done(const curl_response_t *resp)
 // Public API
 // ----------------------------------------------------------------------
 
-bool
+async_rc_t
 coinbase_place_order_async(const coinbase_place_order_req_t *req,
     coinbase_done_order_cb_t cb, void *user)
 {
@@ -965,7 +965,7 @@ coinbase_place_order_async(const coinbase_place_order_req_t *req,
   char          errbuf[CB_ERR_SZ];
 
   if(req == NULL)
-    return(FAIL);
+    return(ASYNC_FAILED_UNDELIVERED);
 
   r = cb_req_alloc();
   r->type     = CB_REQ_PLACE_ORDER;
@@ -975,7 +975,7 @@ coinbase_place_order_async(const coinbase_place_order_req_t *req,
   if(!cb_apikey_configured())
   {
     cb_deliver_order_fail(r, CB_ERR_NO_CREDS);
-    return(FAIL);
+    return(ASYNC_FAILED_DELIVERED);
   }
 
   body = cb_render_order_body(req, &body_len, errbuf, sizeof(errbuf));
@@ -983,7 +983,7 @@ coinbase_place_order_async(const coinbase_place_order_req_t *req,
   if(body == NULL)
   {
     cb_deliver_order_fail(r, errbuf);
-    return(FAIL);
+    return(ASYNC_FAILED_DELIVERED);
   }
 
   // Transfer body ownership to the request — cb_req_release frees it.
@@ -995,13 +995,13 @@ coinbase_place_order_async(const coinbase_place_order_req_t *req,
   {
     cb_deliver_order_fail(r,
         "Error: failed to submit Coinbase place-order request");
-    return(FAIL);
+    return(ASYNC_FAILED_DELIVERED);
   }
 
-  return(SUCCESS);
+  return(ASYNC_AIRBORNE);
 }
 
-bool
+async_rc_t
 coinbase_cancel_order_async(const char *order_id,
     coinbase_done_order_cb_t cb, void *user)
 {
@@ -1010,7 +1010,7 @@ coinbase_cancel_order_async(const char *order_id,
   size_t        body_len = 0;
 
   if(order_id == NULL || order_id[0] == '\0')
-    return(FAIL);
+    return(ASYNC_FAILED_UNDELIVERED);
 
   r = cb_req_alloc();
   r->type     = CB_REQ_CANCEL_ORDER;
@@ -1021,7 +1021,7 @@ coinbase_cancel_order_async(const char *order_id,
   if(!cb_apikey_configured())
   {
     cb_deliver_order_fail(r, CB_ERR_NO_CREDS);
-    return(FAIL);
+    return(ASYNC_FAILED_DELIVERED);
   }
 
   body = cb_render_cancel_body(order_id, &body_len);
@@ -1029,7 +1029,7 @@ coinbase_cancel_order_async(const char *order_id,
   if(body == NULL)
   {
     cb_deliver_order_fail(r, "Error: failed to render cancel body");
-    return(FAIL);
+    return(ASYNC_FAILED_DELIVERED);
   }
 
   r->body     = body;
@@ -1040,13 +1040,13 @@ coinbase_cancel_order_async(const char *order_id,
   {
     cb_deliver_order_fail(r,
         "Error: failed to submit Coinbase cancel-order request");
-    return(FAIL);
+    return(ASYNC_FAILED_DELIVERED);
   }
 
-  return(SUCCESS);
+  return(ASYNC_AIRBORNE);
 }
 
-bool
+async_rc_t
 coinbase_get_order_async(const char *order_id,
     coinbase_done_order_cb_t cb, void *user)
 {
@@ -1055,7 +1055,7 @@ coinbase_get_order_async(const char *order_id,
   int           n;
 
   if(order_id == NULL || order_id[0] == '\0')
-    return(FAIL);
+    return(ASYNC_FAILED_UNDELIVERED);
 
   r = cb_req_alloc();
   r->type     = CB_REQ_GET_ORDER;
@@ -1066,7 +1066,7 @@ coinbase_get_order_async(const char *order_id,
   if(!cb_apikey_configured())
   {
     cb_deliver_order_fail(r, CB_ERR_NO_CREDS);
-    return(FAIL);
+    return(ASYNC_FAILED_DELIVERED);
   }
 
   n = snprintf(path, sizeof(path), "%s%s", CB_PATH_ORDER_GET, order_id);
@@ -1074,7 +1074,7 @@ coinbase_get_order_async(const char *order_id,
   if(n < 0 || (size_t)n >= sizeof(path))
   {
     cb_deliver_order_fail(r, "Error: order_id too long");
-    return(FAIL);
+    return(ASYNC_FAILED_DELIVERED);
   }
 
   if(cb_submit_private(r, CURL_PRIO_NORMAL, CURL_METHOD_GET, path,
@@ -1082,13 +1082,13 @@ coinbase_get_order_async(const char *order_id,
   {
     cb_deliver_order_fail(r,
         "Error: failed to submit Coinbase get-order request");
-    return(FAIL);
+    return(ASYNC_FAILED_DELIVERED);
   }
 
-  return(SUCCESS);
+  return(ASYNC_AIRBORNE);
 }
 
-bool
+async_rc_t
 coinbase_list_orders_async(const char *status, const char *product_id,
     coinbase_done_orders_cb_t cb, void *user)
 {
@@ -1110,7 +1110,7 @@ coinbase_list_orders_async(const char *status, const char *product_id,
   if(!cb_apikey_configured())
   {
     cb_deliver_orders_fail(r, CB_ERR_NO_CREDS);
-    return(FAIL);
+    return(ASYNC_FAILED_DELIVERED);
   }
 
   n = snprintf(path, sizeof(path), "%s", CB_PATH_ORDERS_LIST);
@@ -1131,7 +1131,7 @@ coinbase_list_orders_async(const char *status, const char *product_id,
     if(m < 0 || (size_t)m >= sizeof(path) - (size_t)n)
     {
       cb_deliver_orders_fail(r, "Error: orders query too long");
-      return(FAIL);
+      return(ASYNC_FAILED_DELIVERED);
     }
     n += m;
     sep = "&";
@@ -1144,7 +1144,7 @@ coinbase_list_orders_async(const char *status, const char *product_id,
     if(m < 0 || (size_t)m >= sizeof(path) - (size_t)n)
     {
       cb_deliver_orders_fail(r, "Error: orders query too long");
-      return(FAIL);
+      return(ASYNC_FAILED_DELIVERED);
     }
     n += m;
     sep = "&";
@@ -1156,7 +1156,7 @@ coinbase_list_orders_async(const char *status, const char *product_id,
     if(m < 0 || (size_t)m >= sizeof(path) - (size_t)n)
     {
       cb_deliver_orders_fail(r, "Error: orders query too long");
-      return(FAIL);
+      return(ASYNC_FAILED_DELIVERED);
     }
   }
 
@@ -1165,13 +1165,13 @@ coinbase_list_orders_async(const char *status, const char *product_id,
   {
     cb_deliver_orders_fail(r,
         "Error: failed to submit Coinbase list-orders request");
-    return(FAIL);
+    return(ASYNC_FAILED_DELIVERED);
   }
 
-  return(SUCCESS);
+  return(ASYNC_AIRBORNE);
 }
 
-bool
+async_rc_t
 coinbase_get_accounts_async(coinbase_done_accounts_cb_t cb, void *user)
 {
   cb_request_t *r;
@@ -1184,7 +1184,7 @@ coinbase_get_accounts_async(coinbase_done_accounts_cb_t cb, void *user)
   if(!cb_apikey_configured())
   {
     cb_deliver_accounts_fail(r, CB_ERR_NO_CREDS);
-    return(FAIL);
+    return(ASYNC_FAILED_DELIVERED);
   }
 
   if(cb_submit_private(r, CURL_PRIO_NORMAL, CURL_METHOD_GET,
@@ -1192,10 +1192,10 @@ coinbase_get_accounts_async(coinbase_done_accounts_cb_t cb, void *user)
   {
     cb_deliver_accounts_fail(r,
         "Error: failed to submit Coinbase accounts request");
-    return(FAIL);
+    return(ASYNC_FAILED_DELIVERED);
   }
 
-  return(SUCCESS);
+  return(ASYNC_AIRBORNE);
 }
 
 // ----------------------------------------------------------------------
@@ -1353,7 +1353,7 @@ cb_format_iso8601_z(int64_t epoch_ms, char *out, size_t cap)
   return(SUCCESS);
 }
 
-bool
+async_rc_t
 coinbase_list_fills_async(const char *order_id, const char *product_id,
     int64_t start_ms, coinbase_done_fills_cb_t cb, void *user)
 {
@@ -1375,7 +1375,7 @@ coinbase_list_fills_async(const char *order_id, const char *product_id,
   if(!cb_apikey_configured())
   {
     cb_deliver_fills_fail(r, CB_ERR_NO_CREDS);
-    return(FAIL);
+    return(ASYNC_FAILED_DELIVERED);
   }
 
   n = snprintf(path, sizeof(path), "%s", CB_PATH_FILLS);
@@ -1387,7 +1387,7 @@ coinbase_list_fills_async(const char *order_id, const char *product_id,
     if(m < 0 || (size_t)m >= sizeof(path) - (size_t)n)
     {
       cb_deliver_fills_fail(r, "Error: fills query too long");
-      return(FAIL);
+      return(ASYNC_FAILED_DELIVERED);
     }
     n += m;
     sep = "&";
@@ -1400,7 +1400,7 @@ coinbase_list_fills_async(const char *order_id, const char *product_id,
     if(m < 0 || (size_t)m >= sizeof(path) - (size_t)n)
     {
       cb_deliver_fills_fail(r, "Error: fills query too long");
-      return(FAIL);
+      return(ASYNC_FAILED_DELIVERED);
     }
     n += m;
     sep = "&";
@@ -1414,7 +1414,7 @@ coinbase_list_fills_async(const char *order_id, const char *product_id,
     if(cb_format_iso8601_z(start_ms, ts, sizeof(ts)) != SUCCESS)
     {
       cb_deliver_fills_fail(r, "Error: fills start_ms format failed");
-      return(FAIL);
+      return(ASYNC_FAILED_DELIVERED);
     }
 
     m = snprintf(path + n, sizeof(path) - (size_t)n,
@@ -1422,7 +1422,7 @@ coinbase_list_fills_async(const char *order_id, const char *product_id,
     if(m < 0 || (size_t)m >= sizeof(path) - (size_t)n)
     {
       cb_deliver_fills_fail(r, "Error: fills query too long");
-      return(FAIL);
+      return(ASYNC_FAILED_DELIVERED);
     }
     n += m;
     sep = "&";
@@ -1434,7 +1434,7 @@ coinbase_list_fills_async(const char *order_id, const char *product_id,
     if(m < 0 || (size_t)m >= sizeof(path) - (size_t)n)
     {
       cb_deliver_fills_fail(r, "Error: fills query too long");
-      return(FAIL);
+      return(ASYNC_FAILED_DELIVERED);
     }
   }
 
@@ -1443,8 +1443,8 @@ coinbase_list_fills_async(const char *order_id, const char *product_id,
   {
     cb_deliver_fills_fail(r,
         "Error: failed to submit Coinbase list-fills request");
-    return(FAIL);
+    return(ASYNC_FAILED_DELIVERED);
   }
 
-  return(SUCCESS);
+  return(ASYNC_AIRBORNE);
 }

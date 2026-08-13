@@ -26,6 +26,7 @@
 #include <stdint.h>
 #include <time.h>
 
+#include "async.h"
 #include "common.h"  // SUCCESS/FAIL
 
 // Size limits used by the result structs. Fixed sizes let callers
@@ -312,27 +313,24 @@ typedef void (*weathergov_current_cb_t)(
 // through the static-inline dlsym shims defined further down.
 #ifdef WEATHERGOV_INTERNAL
 
+// All four *_async below return only ASYNC_AIRBORNE or
+// ASYNC_FAILED_UNDELIVERED, never ASYNC_FAILED_DELIVERED. Undelivered
+// means the request could not be queued at all — a NULL callback or
+// point, the service switched off via plugin.weathergov.enabled, or
+// curl refusing the submit — and `user` is still entirely the caller's
+// to reply on and free. Each notes below only what is particular to it.
+
 // Resolve a coordinate to its NWS forecast grid, from cache when warm.
 //
-// Returns SUCCESS if the callback will fire — including the warm-cache
-// case, where it has already fired by the time this returns. Returns
-// FAIL when the request could not be queued at all (callback NULL, the
-// service switched off via plugin.weathergov.enabled, or curl refusing
-// the submit); on FAIL the callback does NOT fire and `user` is still
-// entirely the caller's to reply on and free.
-bool weathergov_point_async(double lat, double lon,
+// ⚠ On a warm cache the callback has already fired by the time this
+// returns, so a caller holding a lock can re-enter itself.
+async_rc_t weathergov_point_async(double lat, double lon,
     weathergov_point_cb_t cb, void *user);
 
 // Every active alert for a coordinate, in one round trip. Needs no
 // point lookup, no grid and no prior call — the endpoint takes raw
 // coordinates and its own non-2xx is the coverage answer.
-//
-// Returns SUCCESS if the callback will fire. Returns FAIL when the
-// request could not be queued at all (callback NULL, the service
-// switched off via plugin.weathergov.enabled, or curl refusing the
-// submit); on FAIL the callback does NOT fire and `user` is still
-// entirely the caller's to reply on and free.
-bool weathergov_alerts_async(double lat, double lon,
+async_rc_t weathergov_alerts_async(double lat, double lon,
     weathergov_alerts_cb_t cb, void *user);
 
 // The 14-period forecast for an already-resolved grid. `pt` is borrowed
@@ -340,13 +338,7 @@ bool weathergov_alerts_async(double lat, double lon,
 // URL before this returns. `units` is "us" (°F, mph) or "si" (°C, km/h);
 // NULL means "us". There is no Kelvin upstream, so a caller wanting it
 // asks for "si" and converts.
-//
-// Returns SUCCESS if the callback will fire. Returns FAIL when the
-// request could not be queued at all (callback or point NULL, the
-// service switched off via plugin.weathergov.enabled, or curl refusing
-// the submit); on FAIL the callback does NOT fire and `user` is still
-// entirely the caller's to reply on and free.
-bool weathergov_forecast_async(const weathergov_point_t *pt,
+async_rc_t weathergov_forecast_async(const weathergov_point_t *pt,
     const char *units, weathergov_forecast_cb_t cb, void *user);
 
 // Current conditions for an already-resolved grid: the latest
@@ -358,13 +350,7 @@ bool weathergov_forecast_async(const weathergov_point_t *pt,
 // ⚠ The forecast half is enrichment: a result whose `obs.have_temp` is
 // true but whose `forecast.count` is 0 is a good answer with two fields
 // missing, not a failure.
-//
-// Returns SUCCESS if the callback will fire. Returns FAIL when the
-// request could not be queued at all (callback or point NULL, the
-// service switched off via plugin.weathergov.enabled, or curl refusing
-// the submit); on FAIL the callback does NOT fire and `user` is still
-// entirely the caller's to reply on and free.
-bool weathergov_current_async(const weathergov_point_t *pt,
+async_rc_t weathergov_current_async(const weathergov_point_t *pt,
     const char *units, weathergov_current_cb_t cb, void *user);
 
 // The plugin.weathergov.enabled master switch. A caller checks this to
@@ -390,11 +376,11 @@ bool weathergov_enabled(void);
 
 #include <stdlib.h>  // abort
 
-static inline bool
+static inline async_rc_t
 weathergov_point_async(double lat, double lon,
     weathergov_point_cb_t cb, void *user)
 {
-  typedef bool (*fn_t)(double, double, weathergov_point_cb_t, void *);
+  typedef async_rc_t (*fn_t)(double, double, weathergov_point_cb_t, void *);
   static fn_t cached = NULL;
   fn_t        fn     = __atomic_load_n(&cached, __ATOMIC_ACQUIRE);
 
@@ -415,11 +401,11 @@ weathergov_point_async(double lat, double lon,
   return(fn(lat, lon, cb, user));
 }
 
-static inline bool
+static inline async_rc_t
 weathergov_alerts_async(double lat, double lon,
     weathergov_alerts_cb_t cb, void *user)
 {
-  typedef bool (*fn_t)(double, double, weathergov_alerts_cb_t, void *);
+  typedef async_rc_t (*fn_t)(double, double, weathergov_alerts_cb_t, void *);
   static fn_t cached = NULL;
   fn_t        fn     = __atomic_load_n(&cached, __ATOMIC_ACQUIRE);
 
@@ -440,11 +426,11 @@ weathergov_alerts_async(double lat, double lon,
   return(fn(lat, lon, cb, user));
 }
 
-static inline bool
+static inline async_rc_t
 weathergov_forecast_async(const weathergov_point_t *pt, const char *units,
     weathergov_forecast_cb_t cb, void *user)
 {
-  typedef bool (*fn_t)(const weathergov_point_t *, const char *,
+  typedef async_rc_t (*fn_t)(const weathergov_point_t *, const char *,
       weathergov_forecast_cb_t, void *);
   static fn_t cached = NULL;
   fn_t        fn     = __atomic_load_n(&cached, __ATOMIC_ACQUIRE);
@@ -466,11 +452,11 @@ weathergov_forecast_async(const weathergov_point_t *pt, const char *units,
   return(fn(pt, units, cb, user));
 }
 
-static inline bool
+static inline async_rc_t
 weathergov_current_async(const weathergov_point_t *pt, const char *units,
     weathergov_current_cb_t cb, void *user)
 {
-  typedef bool (*fn_t)(const weathergov_point_t *, const char *,
+  typedef async_rc_t (*fn_t)(const weathergov_point_t *, const char *,
       weathergov_current_cb_t, void *);
   static fn_t cached = NULL;
   fn_t        fn     = __atomic_load_n(&cached, __ATOMIC_ACQUIRE);

@@ -698,7 +698,7 @@ gem_exch_fail_candles(exchange_done_candles_cb_t cb, void *user,
 
 // ---- trampolines ----
 
-static bool
+static async_rc_t
 gem_exch_place_order_async(const exchange_place_order_req_t *req,
     exchange_done_order_cb_t cb, void *user)
 {
@@ -707,7 +707,7 @@ gem_exch_place_order_async(const exchange_place_order_req_t *req,
   const char               *type_str;
 
   if(cb == NULL)
-    return(FAIL);
+    return(ASYNC_FAILED_UNDELIVERED);
 
   if(req == NULL
       || req->product_id[0] == '\0'
@@ -715,13 +715,13 @@ gem_exch_place_order_async(const exchange_place_order_req_t *req,
       || req->type[0]       == '\0')
   {
     gem_exch_fail_order(cb, user, "invalid place_order arguments");
-    return(FAIL);
+    return(ASYNC_FAILED_DELIVERED);
   }
 
   if(!gem_apikey_configured())
   {
     gem_exch_fail_order(cb, user, "gemini: api keys not configured");
-    return(FAIL);
+    return(ASYNC_FAILED_DELIVERED);
   }
 
   // Map the generic "limit" / "market" tokens to Gemini's "exchange
@@ -734,7 +734,7 @@ gem_exch_place_order_async(const exchange_place_order_req_t *req,
   {
     gem_exch_fail_order(cb, user,
         "gemini: supported order types are 'limit' and 'market'");
-    return(FAIL);
+    return(ASYNC_FAILED_DELIVERED);
   }
 
   fwd           = gem_fwd_new(GEM_FWD_ORDER, user);
@@ -755,25 +755,25 @@ gem_exch_place_order_async(const exchange_place_order_req_t *req,
   return(gemini_add_order_async(&inner, gem_exch_order_done_adapter, fwd));
 }
 
-static bool
+static async_rc_t
 gem_exch_cancel_order_async(const char *order_id,
     exchange_done_order_cb_t cb, void *user)
 {
   gem_exch_fwd_t       *fwd;
 
   if(cb == NULL)
-    return(FAIL);
+    return(ASYNC_FAILED_UNDELIVERED);
 
   if(order_id == NULL || order_id[0] == '\0')
   {
     gem_exch_fail_order(cb, user, "order_id required");
-    return(FAIL);
+    return(ASYNC_FAILED_DELIVERED);
   }
 
   if(!gem_apikey_configured())
   {
     gem_exch_fail_order(cb, user, "gemini: api keys not configured");
-    return(FAIL);
+    return(ASYNC_FAILED_DELIVERED);
   }
 
   fwd           = gem_fwd_new(GEM_FWD_ORDER, user);
@@ -782,25 +782,25 @@ gem_exch_cancel_order_async(const char *order_id,
   return(gemini_cancel_order_async(order_id, gem_exch_order_done_adapter, fwd));
 }
 
-static bool
+static async_rc_t
 gem_exch_get_order_async(const char *order_id,
     exchange_done_order_cb_t cb, void *user)
 {
   gem_exch_fwd_t       *fwd;
 
   if(cb == NULL)
-    return(FAIL);
+    return(ASYNC_FAILED_UNDELIVERED);
 
   if(order_id == NULL || order_id[0] == '\0')
   {
     gem_exch_fail_order(cb, user, "order_id required");
-    return(FAIL);
+    return(ASYNC_FAILED_DELIVERED);
   }
 
   if(!gem_apikey_configured())
   {
     gem_exch_fail_order(cb, user, "gemini: api keys not configured");
-    return(FAIL);
+    return(ASYNC_FAILED_DELIVERED);
   }
 
   fwd           = gem_fwd_new(GEM_FWD_ORDER, user);
@@ -814,7 +814,7 @@ gem_exch_get_order_async(const char *order_id,
 // goes through to gemini_active_orders_async; anything else FAILs
 // cleanly so the consumer knows to look elsewhere for closed orders
 // (Gemini exposes those only via /v1/mytrades).
-static bool
+static async_rc_t
 gem_exch_list_orders_async(const char *status, const char *product_id,
     exchange_done_orders_cb_t cb, void *user)
 {
@@ -823,19 +823,19 @@ gem_exch_list_orders_async(const char *status, const char *product_id,
   (void)product_id;
 
   if(cb == NULL)
-    return(FAIL);
+    return(ASYNC_FAILED_UNDELIVERED);
 
   if(status != NULL && status[0] != '\0' && strcmp(status, "open") != 0)
   {
     gem_exch_fail_orders(cb, user,
         "gemini: closed orders not supported (server returns open only)");
-    return(FAIL);
+    return(ASYNC_FAILED_DELIVERED);
   }
 
   if(!gem_apikey_configured())
   {
     gem_exch_fail_orders(cb, user, "gemini: api keys not configured");
-    return(FAIL);
+    return(ASYNC_FAILED_DELIVERED);
   }
 
   fwd            = gem_fwd_new(GEM_FWD_ORDERS, user);
@@ -844,7 +844,7 @@ gem_exch_list_orders_async(const char *status, const char *product_id,
   return(gemini_active_orders_async(gem_exch_orders_done_adapter, fwd));
 }
 
-static bool
+static async_rc_t
 gem_exch_list_fills_async(const char *order_id, const char *product_id,
     int64_t start_ms, exchange_done_fills_cb_t cb, void *user)
 {
@@ -853,19 +853,19 @@ gem_exch_list_fills_async(const char *order_id, const char *product_id,
   (void)order_id;     // Gemini's mytrades scopes by symbol only.
 
   if(cb == NULL)
-    return(FAIL);
+    return(ASYNC_FAILED_UNDELIVERED);
 
   if(product_id == NULL || product_id[0] == '\0')
   {
     gem_exch_fail_fills(cb, user,
         "gemini: list_fills requires product_id");
-    return(FAIL);
+    return(ASYNC_FAILED_DELIVERED);
   }
 
   if(!gem_apikey_configured())
   {
     gem_exch_fail_fills(cb, user, "gemini: api keys not configured");
-    return(FAIL);
+    return(ASYNC_FAILED_DELIVERED);
   }
 
   fwd           = gem_fwd_new(GEM_FWD_FILLS, user);
@@ -875,18 +875,18 @@ gem_exch_list_fills_async(const char *order_id, const char *product_id,
         gem_exch_fills_done_adapter, fwd));
 }
 
-static bool
+static async_rc_t
 gem_exch_get_accounts_async(exchange_done_accounts_cb_t cb, void *user)
 {
   gem_exch_fwd_t          *fwd;
 
   if(cb == NULL)
-    return(FAIL);
+    return(ASYNC_FAILED_UNDELIVERED);
 
   if(!gem_apikey_configured())
   {
     gem_exch_fail_accounts(cb, user, "gemini: api keys not configured");
-    return(FAIL);
+    return(ASYNC_FAILED_DELIVERED);
   }
 
   fwd              = gem_fwd_new(GEM_FWD_ACCOUNTS, user);
@@ -897,7 +897,7 @@ gem_exch_get_accounts_async(exchange_done_accounts_cb_t cb, void *user)
 
 // Public market data — no auth gate. The typed wrapper owns the
 // granularity translation + client-side window filtering.
-static bool
+static async_rc_t
 gem_exch_fetch_candles_async(const char *product_id,
     exchange_granularity_t gran, int64_t since_ms, int64_t until_ms,
     exchange_done_candles_cb_t cb, void *user)
@@ -905,27 +905,23 @@ gem_exch_fetch_candles_async(const char *product_id,
   gem_exch_fwd_t         *fwd;
 
   if(cb == NULL)
-    return(FAIL);
+    return(ASYNC_FAILED_UNDELIVERED);
 
   if(product_id == NULL || product_id[0] == '\0')
   {
     gem_exch_fail_candles(cb, user, "product_id required");
-    return(FAIL);
+    return(ASYNC_FAILED_DELIVERED);
   }
 
   fwd             = gem_fwd_new(GEM_FWD_CANDLES, user);
   fwd->cb.candles = cb;
 
-  if(gemini_fetch_candles_async(product_id, gran, since_ms, until_ms,
+  // `fwd` belongs to the typed wrapper from here, so its verdict on
+  // delivery is this adapter's verdict too — pass it through rather
+  // than restating it.
+  return(gemini_fetch_candles_async(product_id, gran, since_ms, until_ms,
         EXCHANGE_PRIO_MARKET_BACKFILL,
-        gem_exch_candles_done_adapter, fwd) != SUCCESS)
-  {
-    // The typed wrapper has already delivered the fail callback +
-    // freed fwd. Nothing left to do here.
-    return(FAIL);
-  }
-
-  return(SUCCESS);
+        gem_exch_candles_done_adapter, fwd));
 }
 
 // ------------------------------------------------------------------ //
@@ -1092,14 +1088,14 @@ gem_exch_tickers_resp(int http_status, const char *body, size_t body_len,
   json_object_put(root);
 }
 
-static bool
+static async_rc_t
 gem_exch_fetch_all_tickers_async(exchange_done_tickers_cb_t cb, void *user)
 {
   gem_exch_fwd_t *fwd;
   gem_exch_fwd_t  dead;
 
   if(cb == NULL)
-    return(FAIL);
+    return(ASYNC_FAILED_UNDELIVERED);
 
   fwd             = gem_fwd_new(GEM_FWD_TICKERS, user);
   fwd->cb.tickers = cb;
@@ -1111,10 +1107,10 @@ gem_exch_fetch_all_tickers_async(exchange_done_tickers_cb_t cb, void *user)
     gem_fwd_retire(fwd, &dead);
     cb(false, "failed to submit Gemini pricefeed request",
         NULL, 0, user);
-    return(FAIL);
+    return(ASYNC_FAILED_DELIVERED);
   }
 
-  return(SUCCESS);
+  return(ASYNC_AIRBORNE);
 }
 
 // ------------------------------------------------------------------ //

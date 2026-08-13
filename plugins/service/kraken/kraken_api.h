@@ -24,6 +24,8 @@
 #include <stddef.h>
 #include <stdint.h>
 
+#include "async.h"
+
 // Fixed size limits for public result structs.
 // Kraken's altname surface is short (`BTCUSD`); canonical/legacy
 // surface is also short (`XXBTZUSD`); the wsname is `BTC/USD`. 24 B
@@ -234,6 +236,18 @@ typedef void (*kraken_done_assetpairs_cb_t)(
 // creds.private_key base64-decodes cleanly.
 bool kraken_apikey_configured(void);
 
+// ------------------------------------------------------------------
+// Async failure contract — the whole file. Values and what each
+// obliges you to do: include/async.h. Kraken's row in the tree-wide
+// table: PLUGIN.md §Async failure semantics.
+//
+// Every `*_async` below returns ASYNC_FAILED_DELIVERED on any failure
+// after its argument check, and ASYNC_FAILED_UNDELIVERED only from that
+// check itself — a NULL callback or a missing/empty required parameter,
+// refused before anything was allocated or fired, so the closure is
+// still yours.
+// ------------------------------------------------------------------
+
 // Public REST. `pair` accepts any of altname/canonical/wsname; the
 // assetpairs cache translates to the form the OHLC endpoint expects.
 // `interval_minutes` must be one of the KRAKEN_GRAN_* constants. The
@@ -243,9 +257,8 @@ bool kraken_apikey_configured(void);
 // `prio` is one of EXCHANGE_PRIO_* (the abstraction's byte values
 // match curl_prio_t on purpose — pass-through through the vtable).
 //
-// On synchronous FAIL the callback fires with `res->err` populated;
-// on SUCCESS the callback fires later from the curl-multi thread.
-bool kraken_fetch_candles_async(const char *pair,
+// Follows the file's contract above.
+async_rc_t kraken_fetch_candles_async(const char *pair,
     uint32_t interval_minutes, int64_t since_sec, uint8_t prio,
     kraken_done_candles_cb_t cb, void *user);
 
@@ -256,27 +269,27 @@ bool kraken_fetch_candles_async(const char *pair,
 // (`error: ["EAPI:Rate limit exceeded"]`) with HTTP 200 — those land
 // as hard errors in `res->err`.
 
-bool kraken_get_balance_async(kraken_done_balances_cb_t cb, void *user);
+async_rc_t kraken_get_balance_async(kraken_done_balances_cb_t cb, void *user);
 
-bool kraken_add_order_async(const kraken_place_order_req_t *req,
+async_rc_t kraken_add_order_async(const kraken_place_order_req_t *req,
     kraken_done_order_cb_t cb, void *user);
 
-bool kraken_cancel_order_async(const char *order_id,
+async_rc_t kraken_cancel_order_async(const char *order_id,
     kraken_done_order_cb_t cb, void *user);
 
-bool kraken_query_order_async(const char *order_id,
+async_rc_t kraken_query_order_async(const char *order_id,
     kraken_done_order_cb_t cb, void *user);
 
-bool kraken_open_orders_async(kraken_done_orders_cb_t cb, void *user);
+async_rc_t kraken_open_orders_async(kraken_done_orders_cb_t cb, void *user);
 
-bool kraken_closed_orders_async(int64_t start_sec,
+async_rc_t kraken_closed_orders_async(int64_t start_sec,
     kraken_done_orders_cb_t cb, void *user);
 
 // `order_id` and `product_id` are optional client-side filters
 // (Kraken's TradesHistory endpoint does not support them server-
 // side). When both are NULL/empty every fill since `start_sec` is
 // surfaced.
-bool kraken_trades_history_async(const char *order_id,
+async_rc_t kraken_trades_history_async(const char *order_id,
     const char *product_id, int64_t start_sec,
     kraken_done_fills_cb_t cb, void *user);
 
@@ -284,7 +297,7 @@ bool kraken_trades_history_async(const char *order_id,
 // call with cb=NULL for the fire-and-forget pattern. The cache is
 // populated by side-effect via kraken_pairs.c regardless of whether
 // `cb` is supplied.
-bool kraken_assetpairs_refresh_async(kraken_done_assetpairs_cb_t cb,
+async_rc_t kraken_assetpairs_refresh_async(kraken_done_assetpairs_cb_t cb,
     void *user);
 
 #endif // KR_INTERNAL

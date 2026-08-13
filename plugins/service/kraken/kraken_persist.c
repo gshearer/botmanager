@@ -274,7 +274,7 @@ kr_assetpairs_load_or_refresh_async(void)
         "SELECT altname, canonical, wsname,"
         " EXTRACT(EPOCH FROM (NOW() - fetched_at))::bigint AS age_sec"
         " FROM kraken_assetpairs",
-        kr_assetpairs_load_cb, NULL) != SUCCESS)
+        kr_assetpairs_load_cb, NULL) == ASYNC_FAILED_UNDELIVERED)
   {
     // DB unreachable / submit failed → never leave the cache empty;
     // fall through to a direct network refresh.

@@ -39,6 +39,7 @@
 #include <stddef.h>
 #include <stdint.h>
 
+#include "async.h"
 #include "common.h"  // SUCCESS/FAIL
 
 // ----------------------------------------------------------------------
@@ -196,21 +197,25 @@ typedef void (*stockquote_series_cb_t)(const quote_series_res_t *, void *user);
 
 // ----------------------------------------------------------------------
 // Provider API. A provider MUST export all four symbols; ones it does not
-// implement return FAIL and are omitted from the caps bitmask. These
-// prototypes are visible only inside the provider (which defines
-// STOCKQUOTE_PROVIDER_INTERNAL before including this header). Everyone else
-// gets the capability-resolved shims below instead.
+// implement return ASYNC_FAILED_UNDELIVERED and are omitted from the caps
+// bitmask. These prototypes are visible only inside the provider (which
+// defines STOCKQUOTE_PROVIDER_INTERNAL before including this header).
+// Everyone else gets the capability-resolved shims below instead.
+//
+// A provider's *_async returns only ASYNC_AIRBORNE or
+// ASYNC_FAILED_UNDELIVERED, never ASYNC_FAILED_DELIVERED: a refusal
+// leaves `user` the caller's to reply on and free.
 // ----------------------------------------------------------------------
 
 #ifdef STOCKQUOTE_PROVIDER_INTERNAL
 
-uint32_t stockquote_provider_caps(void);
-bool     stockquote_fetch_async(const char *const *syms, uint8_t n,
-             stockquote_batch_cb_t cb, void *user);
-bool     stockquote_search_async(const char *query,
-             stockquote_search_cb_t cb, void *user);
-bool     stockquote_series_async(const char *sym, quote_range_t range,
-             stockquote_series_cb_t cb, void *user);
+uint32_t   stockquote_provider_caps(void);
+async_rc_t stockquote_fetch_async(const char *const *syms, uint8_t n,
+               stockquote_batch_cb_t cb, void *user);
+async_rc_t stockquote_search_async(const char *query,
+               stockquote_search_cb_t cb, void *user);
+async_rc_t stockquote_series_async(const char *sym, quote_range_t range,
+               stockquote_series_cb_t cb, void *user);
 
 #endif // STOCKQUOTE_PROVIDER_INTERNAL
 
@@ -259,11 +264,11 @@ stockquote_provider_caps(void)
   return(fn());
 }
 
-static inline bool
+static inline async_rc_t
 stockquote_fetch_async(const char *const *syms, uint8_t n,
     stockquote_batch_cb_t cb, void *user)
 {
-  typedef bool (*fn_t)(const char *const *, uint8_t,
+  typedef async_rc_t (*fn_t)(const char *const *, uint8_t,
       stockquote_batch_cb_t, void *);
   static fn_t cached = NULL;
   fn_t        fn     = __atomic_load_n(&cached, __ATOMIC_ACQUIRE);
@@ -292,11 +297,11 @@ stockquote_fetch_async(const char *const *syms, uint8_t n,
   return(fn(syms, n, cb, user));
 }
 
-static inline bool
+static inline async_rc_t
 stockquote_search_async(const char *query,
     stockquote_search_cb_t cb, void *user)
 {
-  typedef bool (*fn_t)(const char *, stockquote_search_cb_t, void *);
+  typedef async_rc_t (*fn_t)(const char *, stockquote_search_cb_t, void *);
   static fn_t cached = NULL;
   fn_t        fn     = __atomic_load_n(&cached, __ATOMIC_ACQUIRE);
 
@@ -324,11 +329,11 @@ stockquote_search_async(const char *query,
   return(fn(query, cb, user));
 }
 
-static inline bool
+static inline async_rc_t
 stockquote_series_async(const char *sym, quote_range_t range,
     stockquote_series_cb_t cb, void *user)
 {
-  typedef bool (*fn_t)(const char *, quote_range_t,
+  typedef async_rc_t (*fn_t)(const char *, quote_range_t,
       stockquote_series_cb_t, void *);
   static fn_t cached = NULL;
   fn_t        fn     = __atomic_load_n(&cached, __ATOMIC_ACQUIRE);

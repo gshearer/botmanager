@@ -24,6 +24,7 @@
 // candles wrapper signature consumes — this keeps the dlsym shim self-
 // contained for any external consumer that does want the typed path.
 
+#include "async.h"
 #include "exchange_api.h"
 
 #include <stdbool.h>
@@ -233,35 +234,21 @@ typedef void (*gemini_done_symbols_cb_t)(
 bool gemini_apikey_configured(void);
 
 // ------------------------------------------------------------------
-// Async failure contract — the whole file (PLUGIN.md §Async failure
-// semantics, which MUSTs this be stated and MUSTs you not guess it).
+// Async failure contract — the whole file. Values and what each
+// obliges you to do: include/async.h. Gemini's row in the tree-wide
+// table: PLUGIN.md §Async failure semantics.
 //
-// Gemini is in the "FAIL ⇒ the callback has ALREADY fired" row, with
-// `coinbase` and `kraken`. So for every `*_async` below:
-//
-//   SUCCESS — the callback fires later, from the curl-multi thread.
-//   FAIL    — the callback has already fired synchronously, inside the
-//             call, with `res->err` populated. **Free nothing and say
-//             nothing**: your closure was consumed by that callback,
-//             and the tracked allocator aborts the daemon with no FATAL
-//             line if you free it twice.
-//
-// The one exception is the argument check an entry point makes before
-// it allocates anything: a NULL callback or a missing/empty required
-// parameter returns FAIL immediately, and there is no callback to fire
-// (you did not supply one, or the call was malformed) and nothing was
-// taken from you. It is the *only* exception: every failure after that
-// point delivers through gem_deliver_*_fail(), with no branch in
-// between, because the request allocation cannot fail — gem_req_alloc()
-// pops a freelist or falls through to the aborting allocator. Which
-// entry points have such a check is noted on each below —
-// `gemini_symbols_refresh_async` deliberately has none, because a NULL
-// callback is legal there.
-//
-// This convention has killed the daemon twice tree-wide, most recently
-// 2026-08-12, so it is written down here rather than inferred from a
-// neighbour: the neighbouring plugin's behaviour is not evidence of
-// this one's.
+// Every `*_async` below returns ASYNC_FAILED_DELIVERED on any failure
+// after its argument check, and ASYNC_FAILED_UNDELIVERED only from
+// that check itself — a NULL callback or a missing/empty required
+// parameter, refused before anything was allocated or fired. Nothing
+// lies between: every later failure delivers through
+// gem_deliver_*_fail(), with no branch in the way, because the request
+// allocation cannot fail (gem_req_alloc() pops a freelist or falls
+// through to the aborting allocator). Which entry points have such a
+// check is noted on each below — `gemini_symbols_refresh_async`
+// deliberately has none, because a NULL callback is legal there, so it
+// is the one entry point that can only ever answer DELIVERED.
 // ------------------------------------------------------------------
 
 // Refresh the symbols cache via GET /v1/symbols followed by per-symbol
@@ -275,10 +262,10 @@ bool gemini_apikey_configured(void);
 // asynchronously. The callback fires once after the last detail
 // response lands; partial-failure rows are skipped silently.
 //
-// FAIL: the callback has already fired — no argument check precedes it,
-// because cb=NULL is legal here and a silent stand-in is substituted, so
-// every reachable failure runs the batch's finaliser on the way out.
-bool gemini_symbols_refresh_async(gemini_done_symbols_cb_t cb, void *user);
+// Never ASYNC_FAILED_UNDELIVERED: no argument check precedes this one,
+// because cb=NULL is legal here and a silent stand-in is substituted,
+// so every failure runs the batch's finaliser on the way out.
+async_rc_t gemini_symbols_refresh_async(gemini_done_symbols_cb_t cb, void *user);
 
 // ------------------------------------------------------------------
 // GEM-2 typed REST wrappers (forwarded to by gemini_exchange.c via the
@@ -287,42 +274,41 @@ bool gemini_symbols_refresh_async(gemini_done_symbols_cb_t cb, void *user);
 // private} call, parses the response, and fires the typed callback on
 // the curl worker thread.
 //
-// All seven follow the file's contract above: FAIL means the typed
-// callback has already fired with `res->err` set, so free nothing —
-// **except** for the argument check each makes first (NULL callback, or
-// the required parameter named in its own comment), which returns FAIL
-// having allocated nothing and fired nothing.
+// All seven follow the file's contract above: ASYNC_FAILED_DELIVERED
+// everywhere except the argument check each makes first (NULL callback,
+// or the required parameter named in its own comment), which answers
+// ASYNC_FAILED_UNDELIVERED having allocated nothing and fired nothing.
 // ------------------------------------------------------------------
 
 // Public GET /v2/candles/<native>/<time_frame>. since_ms / until_ms are
 // client-side window bounds applied after parse (Gemini's endpoint has
 // no `since` parameter). `prio` is forwarded to the curl scheduler.
-bool gemini_fetch_candles_async(const char *pair,
+async_rc_t gemini_fetch_candles_async(const char *pair,
     exchange_granularity_t gran, int64_t since_ms, int64_t until_ms,
     uint8_t prio, gemini_done_candles_cb_t cb, void *user);
 
 // Private POST /v1/balances.
-bool gemini_get_balance_async(gemini_done_balances_cb_t cb, void *user);
+async_rc_t gemini_get_balance_async(gemini_done_balances_cb_t cb, void *user);
 
 // Private POST /v1/order/new.
-bool gemini_add_order_async(const gemini_place_order_req_t *req,
+async_rc_t gemini_add_order_async(const gemini_place_order_req_t *req,
     gemini_done_order_cb_t cb, void *user);
 
 // Private POST /v1/order/cancel. `order_id` must be a positive decimal
 // integer in string form (Gemini's wire type is numeric).
-bool gemini_cancel_order_async(const char *order_id,
+async_rc_t gemini_cancel_order_async(const char *order_id,
     gemini_done_order_cb_t cb, void *user);
 
 // Private POST /v1/order/status.
-bool gemini_query_order_async(const char *order_id,
+async_rc_t gemini_query_order_async(const char *order_id,
     gemini_done_order_cb_t cb, void *user);
 
 // Private POST /v1/orders — Gemini only surfaces OPEN orders here.
-bool gemini_active_orders_async(gemini_done_orders_cb_t cb, void *user);
+async_rc_t gemini_active_orders_async(gemini_done_orders_cb_t cb, void *user);
 
 // Private POST /v1/mytrades. `product_id` is required (Gemini scopes
 // the endpoint per symbol); since_ms is an optional lower bound.
-bool gemini_mytrades_async(const char *product_id, int64_t since_ms,
+async_rc_t gemini_mytrades_async(const char *product_id, int64_t since_ms,
     gemini_done_fills_cb_t cb, void *user);
 
 #endif // GEM_INTERNAL
@@ -362,10 +348,10 @@ gemini_apikey_configured(void)
   return(fn());
 }
 
-static inline bool
+static inline async_rc_t
 gemini_symbols_refresh_async(gemini_done_symbols_cb_t cb, void *user)
 {
-  typedef bool (*fn_t)(gemini_done_symbols_cb_t, void *);
+  typedef async_rc_t (*fn_t)(gemini_done_symbols_cb_t, void *);
   static fn_t cached = NULL;
   fn_t        fn     = __atomic_load_n(&cached, __ATOMIC_ACQUIRE);
 
@@ -386,12 +372,12 @@ gemini_symbols_refresh_async(gemini_done_symbols_cb_t cb, void *user)
   return(fn(cb, user));
 }
 
-static inline bool
+static inline async_rc_t
 gemini_fetch_candles_async(const char *pair, exchange_granularity_t gran,
     int64_t since_ms, int64_t until_ms, uint8_t prio,
     gemini_done_candles_cb_t cb, void *user)
 {
-  typedef bool (*fn_t)(const char *, exchange_granularity_t,
+  typedef async_rc_t (*fn_t)(const char *, exchange_granularity_t,
       int64_t, int64_t, uint8_t,
       gemini_done_candles_cb_t, void *);
   static fn_t cached = NULL;
@@ -414,10 +400,10 @@ gemini_fetch_candles_async(const char *pair, exchange_granularity_t gran,
   return(fn(pair, gran, since_ms, until_ms, prio, cb, user));
 }
 
-static inline bool
+static inline async_rc_t
 gemini_get_balance_async(gemini_done_balances_cb_t cb, void *user)
 {
-  typedef bool (*fn_t)(gemini_done_balances_cb_t, void *);
+  typedef async_rc_t (*fn_t)(gemini_done_balances_cb_t, void *);
   static fn_t cached = NULL;
   fn_t        fn     = __atomic_load_n(&cached, __ATOMIC_ACQUIRE);
 
@@ -438,11 +424,11 @@ gemini_get_balance_async(gemini_done_balances_cb_t cb, void *user)
   return(fn(cb, user));
 }
 
-static inline bool
+static inline async_rc_t
 gemini_add_order_async(const gemini_place_order_req_t *req,
     gemini_done_order_cb_t cb, void *user)
 {
-  typedef bool (*fn_t)(const gemini_place_order_req_t *,
+  typedef async_rc_t (*fn_t)(const gemini_place_order_req_t *,
       gemini_done_order_cb_t, void *);
   static fn_t cached = NULL;
   fn_t        fn     = __atomic_load_n(&cached, __ATOMIC_ACQUIRE);
@@ -464,11 +450,11 @@ gemini_add_order_async(const gemini_place_order_req_t *req,
   return(fn(req, cb, user));
 }
 
-static inline bool
+static inline async_rc_t
 gemini_cancel_order_async(const char *order_id,
     gemini_done_order_cb_t cb, void *user)
 {
-  typedef bool (*fn_t)(const char *, gemini_done_order_cb_t, void *);
+  typedef async_rc_t (*fn_t)(const char *, gemini_done_order_cb_t, void *);
   static fn_t cached = NULL;
   fn_t        fn     = __atomic_load_n(&cached, __ATOMIC_ACQUIRE);
 
@@ -489,11 +475,11 @@ gemini_cancel_order_async(const char *order_id,
   return(fn(order_id, cb, user));
 }
 
-static inline bool
+static inline async_rc_t
 gemini_query_order_async(const char *order_id,
     gemini_done_order_cb_t cb, void *user)
 {
-  typedef bool (*fn_t)(const char *, gemini_done_order_cb_t, void *);
+  typedef async_rc_t (*fn_t)(const char *, gemini_done_order_cb_t, void *);
   static fn_t cached = NULL;
   fn_t        fn     = __atomic_load_n(&cached, __ATOMIC_ACQUIRE);
 
@@ -514,10 +500,10 @@ gemini_query_order_async(const char *order_id,
   return(fn(order_id, cb, user));
 }
 
-static inline bool
+static inline async_rc_t
 gemini_active_orders_async(gemini_done_orders_cb_t cb, void *user)
 {
-  typedef bool (*fn_t)(gemini_done_orders_cb_t, void *);
+  typedef async_rc_t (*fn_t)(gemini_done_orders_cb_t, void *);
   static fn_t cached = NULL;
   fn_t        fn     = __atomic_load_n(&cached, __ATOMIC_ACQUIRE);
 
@@ -538,11 +524,11 @@ gemini_active_orders_async(gemini_done_orders_cb_t cb, void *user)
   return(fn(cb, user));
 }
 
-static inline bool
+static inline async_rc_t
 gemini_mytrades_async(const char *product_id, int64_t since_ms,
     gemini_done_fills_cb_t cb, void *user)
 {
-  typedef bool (*fn_t)(const char *, int64_t,
+  typedef async_rc_t (*fn_t)(const char *, int64_t,
       gemini_done_fills_cb_t, void *);
   static fn_t cached = NULL;
   fn_t        fn     = __atomic_load_n(&cached, __ATOMIC_ACQUIRE);

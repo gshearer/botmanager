@@ -25,11 +25,16 @@
 #include <stddef.h>
 #include <stdint.h>
 
-// Real symbols (added by CB2–CB6) return SUCCESS / FAIL from common.h;
-// consumers of this header therefore include common.h transitively via
-// the shim block once symbols land. Scaffold stays free of the include
-// to keep "no unused include" diagnostics quiet until there is a shim
-// to consume it.
+#include "async.h"
+
+// Async failure contract — the whole file. Values and what each
+// obliges you to do: include/async.h. Coinbase's row in the tree-wide
+// table: PLUGIN.md §Async failure semantics.
+//
+// Every `*_async` below returns ASYNC_FAILED_DELIVERED on any failure
+// after its argument check, and ASYNC_FAILED_UNDELIVERED only from that
+// check itself — refused before anything was allocated or fired, so the
+// closure is still yours.
 
 // Fixed size limits for public result structs.
 
@@ -379,15 +384,16 @@ bool coinbase_apikey_configured(void);
 // Fetch historical candles. `granularity` seconds; `start_ts`/`end_ts`
 // in seconds since epoch (0/0 = server default range ending now). The
 // 300-bucket cap is enforced client-side — violating ranges fail before
-// a request is submitted. Returns FAIL if product_id is invalid, the
-// request could not be queued, or the bucket budget is exceeded; on FAIL
-// the callback is invoked with a descriptive res->err.
+// a request is submitted. An empty/NULL product_id, a non-positive
+// granularity or a URL overflow answers ASYNC_FAILED_UNDELIVERED; an
+// unsupported granularity, a breached bucket budget or a refused submit
+// answers ASYNC_FAILED_DELIVERED with a descriptive res->err.
 //
 // EX-1: routes through feature_exchange. `prio` is one of the
 // EXCHANGE_PRIO_* constants in exchange_api.h (typically
 // EXCHANGE_PRIO_MARKET_BACKFILL for catchup, EXCHANGE_PRIO_USER_DOWNLOAD
 // for user-initiated jobs).
-bool coinbase_fetch_candles_async(const char *product_id,
+async_rc_t coinbase_fetch_candles_async(const char *product_id,
     int32_t granularity, int64_t start_ts, int64_t end_ts,
     uint8_t prio,
     coinbase_done_candles_cb_t cb, void *user);
@@ -399,35 +405,35 @@ bool coinbase_fetch_candles_async(const char *product_id,
 // POST /orders. `req` is copied into the signed body; caller may free
 // after the call returns. On success `res->order` is populated with the
 // server-assigned order_id + echoed fields.
-bool coinbase_place_order_async(const coinbase_place_order_req_t *req,
+async_rc_t coinbase_place_order_async(const coinbase_place_order_req_t *req,
     coinbase_done_order_cb_t cb, void *user);
 
 // DELETE /orders/{id}. On success `res->order.order_id` echoes the id
 // that Coinbase acknowledged; no other fields are populated (the cancel
 // ack is a bare string, not an order object).
-bool coinbase_cancel_order_async(const char *order_id,
+async_rc_t coinbase_cancel_order_async(const char *order_id,
     coinbase_done_order_cb_t cb, void *user);
 
 // GET /orders/{id}. On success `res->order` carries the full server-
 // side view (status, filled_size, executed_value, etc.).
-bool coinbase_get_order_async(const char *order_id,
+async_rc_t coinbase_get_order_async(const char *order_id,
     coinbase_done_order_cb_t cb, void *user);
 
 // GET /orders?status=…&product_id=…&limit=100. Either filter may be
 // NULL / empty to omit. Returns up to COINBASE_MAX_ORDERS_LIST rows.
-bool coinbase_list_orders_async(const char *status, const char *product_id,
+async_rc_t coinbase_list_orders_async(const char *status, const char *product_id,
     coinbase_done_orders_cb_t cb, void *user);
 
 // GET /accounts. Populates `res->rows` with the caller's per-currency
 // balance / hold / available.
-bool coinbase_get_accounts_async(coinbase_done_accounts_cb_t cb,
+async_rc_t coinbase_get_accounts_async(coinbase_done_accounts_cb_t cb,
     void *user);
 
 // GET /api/v3/brokerage/orders/historical/fills. Lists executed fills,
 // optionally filtered server-side by product_id and bounded by
 // `start_ms` (start_sequence_timestamp). 0 = unbounded. Newest-first.
 // Up to COINBASE_MAX_FILLS_LIST rows. order_id may be NULL/empty.
-bool coinbase_list_fills_async(const char *order_id,
+async_rc_t coinbase_list_fills_async(const char *order_id,
     const char *product_id, int64_t start_ms,
     coinbase_done_fills_cb_t cb, void *user);
 
@@ -499,12 +505,12 @@ coinbase_apikey_configured(void)
   return(fn());
 }
 
-static inline bool
+static inline async_rc_t
 coinbase_fetch_candles_async(const char *product_id, int32_t granularity,
     int64_t start_ts, int64_t end_ts, uint8_t prio,
     coinbase_done_candles_cb_t cb, void *user)
 {
-  typedef bool (*fn_t)(const char *, int32_t, int64_t, int64_t,
+  typedef async_rc_t (*fn_t)(const char *, int32_t, int64_t, int64_t,
       uint8_t, coinbase_done_candles_cb_t, void *);
   static fn_t cached = NULL;
   fn_t        fn     = __atomic_load_n(&cached, __ATOMIC_ACQUIRE);
@@ -526,11 +532,11 @@ coinbase_fetch_candles_async(const char *product_id, int32_t granularity,
   return(fn(product_id, granularity, start_ts, end_ts, prio, cb, user));
 }
 
-static inline bool
+static inline async_rc_t
 coinbase_place_order_async(const coinbase_place_order_req_t *req,
     coinbase_done_order_cb_t cb, void *user)
 {
-  typedef bool (*fn_t)(const coinbase_place_order_req_t *,
+  typedef async_rc_t (*fn_t)(const coinbase_place_order_req_t *,
       coinbase_done_order_cb_t, void *);
   static fn_t cached = NULL;
   fn_t        fn     = __atomic_load_n(&cached, __ATOMIC_ACQUIRE);
@@ -552,11 +558,11 @@ coinbase_place_order_async(const coinbase_place_order_req_t *req,
   return(fn(req, cb, user));
 }
 
-static inline bool
+static inline async_rc_t
 coinbase_cancel_order_async(const char *order_id,
     coinbase_done_order_cb_t cb, void *user)
 {
-  typedef bool (*fn_t)(const char *, coinbase_done_order_cb_t, void *);
+  typedef async_rc_t (*fn_t)(const char *, coinbase_done_order_cb_t, void *);
   static fn_t cached = NULL;
   fn_t        fn     = __atomic_load_n(&cached, __ATOMIC_ACQUIRE);
 
@@ -577,11 +583,11 @@ coinbase_cancel_order_async(const char *order_id,
   return(fn(order_id, cb, user));
 }
 
-static inline bool
+static inline async_rc_t
 coinbase_get_order_async(const char *order_id,
     coinbase_done_order_cb_t cb, void *user)
 {
-  typedef bool (*fn_t)(const char *, coinbase_done_order_cb_t, void *);
+  typedef async_rc_t (*fn_t)(const char *, coinbase_done_order_cb_t, void *);
   static fn_t cached = NULL;
   fn_t        fn     = __atomic_load_n(&cached, __ATOMIC_ACQUIRE);
 
@@ -602,11 +608,11 @@ coinbase_get_order_async(const char *order_id,
   return(fn(order_id, cb, user));
 }
 
-static inline bool
+static inline async_rc_t
 coinbase_list_orders_async(const char *status, const char *product_id,
     coinbase_done_orders_cb_t cb, void *user)
 {
-  typedef bool (*fn_t)(const char *, const char *,
+  typedef async_rc_t (*fn_t)(const char *, const char *,
       coinbase_done_orders_cb_t, void *);
   static fn_t cached = NULL;
   fn_t        fn     = __atomic_load_n(&cached, __ATOMIC_ACQUIRE);
@@ -628,10 +634,10 @@ coinbase_list_orders_async(const char *status, const char *product_id,
   return(fn(status, product_id, cb, user));
 }
 
-static inline bool
+static inline async_rc_t
 coinbase_get_accounts_async(coinbase_done_accounts_cb_t cb, void *user)
 {
-  typedef bool (*fn_t)(coinbase_done_accounts_cb_t, void *);
+  typedef async_rc_t (*fn_t)(coinbase_done_accounts_cb_t, void *);
   static fn_t cached = NULL;
   fn_t        fn     = __atomic_load_n(&cached, __ATOMIC_ACQUIRE);
 
@@ -652,11 +658,11 @@ coinbase_get_accounts_async(coinbase_done_accounts_cb_t cb, void *user)
   return(fn(cb, user));
 }
 
-static inline bool
+static inline async_rc_t
 coinbase_list_fills_async(const char *order_id, const char *product_id,
     int64_t start_ms, coinbase_done_fills_cb_t cb, void *user)
 {
-  typedef bool (*fn_t)(const char *, const char *, int64_t,
+  typedef async_rc_t (*fn_t)(const char *, const char *, int64_t,
       coinbase_done_fills_cb_t, void *);
   static fn_t cached = NULL;
   fn_t        fn     = __atomic_load_n(&cached, __ATOMIC_ACQUIRE);

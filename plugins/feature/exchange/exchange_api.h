@@ -34,6 +34,8 @@
 #include <stddef.h>
 #include <stdint.h>
 
+#include "async.h"
+
 // Priority tiers carried on every request. Lower numeric value = higher
 // priority. The token bucket reserves slots for P0 traffic so a flood of
 // P254 backfill cannot starve a transactional buy/sell. Reservation
@@ -521,31 +523,33 @@ typedef struct
   bool   (*is_authenticated)(void);
 
   // Async — mirror the protocol's typed wrappers. Fill error reasons
-  // into the result's `err` field; never block the caller.
-  bool   (*place_order_async)(const exchange_place_order_req_t *req,
-                              exchange_done_order_cb_t cb, void *u);
-  bool   (*cancel_order_async)(const char *order_id,
-                               exchange_done_order_cb_t cb, void *u);
-  bool   (*get_order_async)(const char *order_id,
-                            exchange_done_order_cb_t cb, void *u);
-  bool   (*list_orders_async)(const char *status,
-                              const char *product_id,
-                              exchange_done_orders_cb_t cb, void *u);
-  bool   (*list_fills_async)(const char *order_id,
-                             const char *product_id,
-                             int64_t start_ms,
-                             exchange_done_fills_cb_t cb, void *u);
-  bool   (*get_accounts_async)(exchange_done_accounts_cb_t cb,
-                               void *u);
+  // into the result's `err` field; never block the caller. A hook's
+  // async_rc_t is returned to the abstraction's caller verbatim, so it
+  // must be honest about whether it fired `cb`.
+  async_rc_t (*place_order_async)(const exchange_place_order_req_t *req,
+                                  exchange_done_order_cb_t cb, void *u);
+  async_rc_t (*cancel_order_async)(const char *order_id,
+                                   exchange_done_order_cb_t cb, void *u);
+  async_rc_t (*get_order_async)(const char *order_id,
+                                exchange_done_order_cb_t cb, void *u);
+  async_rc_t (*list_orders_async)(const char *status,
+                                  const char *product_id,
+                                  exchange_done_orders_cb_t cb, void *u);
+  async_rc_t (*list_fills_async)(const char *order_id,
+                                 const char *product_id,
+                                 int64_t start_ms,
+                                 exchange_done_fills_cb_t cb, void *u);
+  async_rc_t (*get_accounts_async)(exchange_done_accounts_cb_t cb,
+                                   void *u);
 
   // KR-2 capability hooks. Candles are public market data; WS subscribe
   // is gated per-channel by the protocol plugin (e.g. user channel
   // requires credentials). Both slots may be NULL — the public shim
   // FAILs with a stable error in that case.
-  bool   (*fetch_candles_async)(const char *product_id,
-                                exchange_granularity_t gran,
-                                int64_t since_ms, int64_t until_ms,
-                                exchange_done_candles_cb_t cb, void *u);
+  async_rc_t (*fetch_candles_async)(const char *product_id,
+                                    exchange_granularity_t gran,
+                                    int64_t since_ms, int64_t until_ms,
+                                    exchange_done_candles_cb_t cb, void *u);
   bool   (*ws_subscribe)(const exchange_ws_channel_t *channels,
                          uint32_t n_channels,
                          const char *const *product_ids,
@@ -557,7 +561,7 @@ typedef struct
   // MW-1 capability hook. Bulk-ticker fetch — single REST call returning
   // a snapshot row per pair. Public market data; no auth gate. NULL =
   // unsupported by this exchange (public shim FAILs with a stable error).
-  bool   (*fetch_all_tickers)(exchange_done_tickers_cb_t cb, void *u);
+  async_rc_t (*fetch_all_tickers)(exchange_done_tickers_cb_t cb, void *u);
 } exchange_protocol_vtable_t;
 
 // ------------------------------------------------------------------
@@ -598,14 +602,20 @@ void exchange_unregister(const char *name);
 // Capability surface (WM-OR-1).                                        //
 //                                                                      //
 // All `exchange_*_async` capability shims dispatch to the protocol     //
-// vtable's matching hook. FAIL when:                                   //
-//   * `name` is NULL/empty/unknown,                                    //
-//   * the matching vtable hook is NULL,                                //
-//   * the auth hook is non-NULL and reports false, AND the verb is    //
-//     auth-gated (every order verb + accounts + fills).               //
-// On FAIL the typed callback is invoked synchronously with a          //
-// populated `err` string; the function then returns FAIL. SUCCESS     //
-// means the request was queued and the typed callback fires later.    //
+// vtable's matching hook. Values: include/async.h; the tree-wide       //
+// table: PLUGIN.md §Async failure semantics.                           //
+//                                                                      //
+// ASYNC_FAILED_DELIVERED — the abstraction refused and answered the    //
+//   typed callback itself with a populated `err`: `name` is            //
+//   NULL/empty/unknown, the matching vtable hook is NULL, or the auth  //
+//   hook reports false on an auth-gated verb (every order verb +       //
+//   accounts + fills).                                                 //
+// ASYNC_FAILED_UNDELIVERED — a required argument was NULL/empty, so    //
+//   there was nothing to answer with. The closure is still yours.      //
+//                                                                      //
+// Past the shim's own checks the driver's verdict IS the return value  //
+// — it is passed through, not flattened, so a driver that refuses      //
+// without delivering cannot be mistaken here for one that delivered.   //
 // ------------------------------------------------------------------ //
 
 // Snapshot of capabilities for one named exchange. FAIL when name is
@@ -621,46 +631,40 @@ bool exchange_get_capabilities(const char *name,
 bool exchange_name_list(char (*out_arr)[EXCHANGE_NAME_SZ],
     uint32_t out_cap, uint32_t *out_count);
 
-bool exchange_place_order_async(const char *name,
+async_rc_t exchange_place_order_async(const char *name,
     const exchange_place_order_req_t *req,
     exchange_done_order_cb_t cb, void *user);
 
-bool exchange_cancel_order_async(const char *name,
+async_rc_t exchange_cancel_order_async(const char *name,
     const char *order_id,
     exchange_done_order_cb_t cb, void *user);
 
-bool exchange_get_order_async(const char *name,
+async_rc_t exchange_get_order_async(const char *name,
     const char *order_id,
     exchange_done_order_cb_t cb, void *user);
 
-bool exchange_list_orders_async(const char *name,
+async_rc_t exchange_list_orders_async(const char *name,
     const char *status, const char *product_id,
     exchange_done_orders_cb_t cb, void *user);
 
-bool exchange_list_fills_async(const char *name,
+async_rc_t exchange_list_fills_async(const char *name,
     const char *order_id, const char *product_id, int64_t start_ms,
     exchange_done_fills_cb_t cb, void *user);
 
-bool exchange_get_accounts_async(const char *name,
+async_rc_t exchange_get_accounts_async(const char *name,
     exchange_done_accounts_cb_t cb, void *user);
 
-// KR-2: candle fetch — public market data; no auth gate. On pre-flight
-// FAIL (unknown exchange, missing vtable hook, unsupported granularity),
-// the typed callback fires synchronously with `err` populated and the
-// function returns FAIL. Otherwise SUCCESS means the request was queued
-// and the callback will fire asynchronously.
-bool exchange_fetch_candles_async(const char *name, const char *product_id,
+// KR-2: candle fetch — public market data; no auth gate. Follows the
+// capability-surface contract above.
+async_rc_t exchange_fetch_candles_async(const char *name, const char *product_id,
     exchange_granularity_t gran, int64_t since_ms, int64_t until_ms,
     exchange_done_candles_cb_t cb, void *user);
 
 // MW-1: bulk-ticker fetch — single REST call returning all pairs the
-// exchange exposes. Public market data; no auth gate. On pre-flight
-// FAIL (unknown exchange, missing vtable hook), the typed callback
-// fires synchronously with `err` populated and the function returns
-// FAIL. Otherwise SUCCESS means the request was queued and the
-// callback will fire asynchronously on the protocol plugin's curl
-// worker thread.
-bool exchange_fetch_all_tickers_async(const char *name,
+// exchange exposes. Public market data; no auth gate. Follows the
+// capability-surface contract above; on ASYNC_AIRBORNE the callback
+// fires on the protocol plugin's curl worker thread.
+async_rc_t exchange_fetch_all_tickers_async(const char *name,
     exchange_done_tickers_cb_t cb, void *user);
 
 // KR-2: WS subscribe. The protocol plugin is responsible for per-channel
@@ -812,12 +816,12 @@ exchange_name_list(char (*out_arr)[EXCHANGE_NAME_SZ], uint32_t out_cap,
   return(fn(out_arr, out_cap, out_count));
 }
 
-static inline bool
+static inline async_rc_t
 exchange_place_order_async(const char *name,
     const exchange_place_order_req_t *req,
     exchange_done_order_cb_t cb, void *user)
 {
-  typedef bool (*fn_t)(const char *, const exchange_place_order_req_t *,
+  typedef async_rc_t (*fn_t)(const char *, const exchange_place_order_req_t *,
       exchange_done_order_cb_t, void *);
   static fn_t cached = NULL;
   fn_t        fn     = __atomic_load_n(&cached, __ATOMIC_ACQUIRE);
@@ -839,11 +843,11 @@ exchange_place_order_async(const char *name,
   return(fn(name, req, cb, user));
 }
 
-static inline bool
+static inline async_rc_t
 exchange_cancel_order_async(const char *name, const char *order_id,
     exchange_done_order_cb_t cb, void *user)
 {
-  typedef bool (*fn_t)(const char *, const char *,
+  typedef async_rc_t (*fn_t)(const char *, const char *,
       exchange_done_order_cb_t, void *);
   static fn_t cached = NULL;
   fn_t        fn     = __atomic_load_n(&cached, __ATOMIC_ACQUIRE);
@@ -865,11 +869,11 @@ exchange_cancel_order_async(const char *name, const char *order_id,
   return(fn(name, order_id, cb, user));
 }
 
-static inline bool
+static inline async_rc_t
 exchange_get_order_async(const char *name, const char *order_id,
     exchange_done_order_cb_t cb, void *user)
 {
-  typedef bool (*fn_t)(const char *, const char *,
+  typedef async_rc_t (*fn_t)(const char *, const char *,
       exchange_done_order_cb_t, void *);
   static fn_t cached = NULL;
   fn_t        fn     = __atomic_load_n(&cached, __ATOMIC_ACQUIRE);
@@ -891,12 +895,12 @@ exchange_get_order_async(const char *name, const char *order_id,
   return(fn(name, order_id, cb, user));
 }
 
-static inline bool
+static inline async_rc_t
 exchange_list_orders_async(const char *name, const char *status,
     const char *product_id,
     exchange_done_orders_cb_t cb, void *user)
 {
-  typedef bool (*fn_t)(const char *, const char *, const char *,
+  typedef async_rc_t (*fn_t)(const char *, const char *, const char *,
       exchange_done_orders_cb_t, void *);
   static fn_t cached = NULL;
   fn_t        fn     = __atomic_load_n(&cached, __ATOMIC_ACQUIRE);
@@ -918,12 +922,12 @@ exchange_list_orders_async(const char *name, const char *status,
   return(fn(name, status, product_id, cb, user));
 }
 
-static inline bool
+static inline async_rc_t
 exchange_list_fills_async(const char *name, const char *order_id,
     const char *product_id, int64_t start_ms,
     exchange_done_fills_cb_t cb, void *user)
 {
-  typedef bool (*fn_t)(const char *, const char *, const char *,
+  typedef async_rc_t (*fn_t)(const char *, const char *, const char *,
       int64_t, exchange_done_fills_cb_t, void *);
   static fn_t cached = NULL;
   fn_t        fn     = __atomic_load_n(&cached, __ATOMIC_ACQUIRE);
@@ -945,11 +949,11 @@ exchange_list_fills_async(const char *name, const char *order_id,
   return(fn(name, order_id, product_id, start_ms, cb, user));
 }
 
-static inline bool
+static inline async_rc_t
 exchange_get_accounts_async(const char *name,
     exchange_done_accounts_cb_t cb, void *user)
 {
-  typedef bool (*fn_t)(const char *, exchange_done_accounts_cb_t, void *);
+  typedef async_rc_t (*fn_t)(const char *, exchange_done_accounts_cb_t, void *);
   static fn_t cached = NULL;
   fn_t        fn     = __atomic_load_n(&cached, __ATOMIC_ACQUIRE);
 
@@ -970,12 +974,12 @@ exchange_get_accounts_async(const char *name,
   return(fn(name, cb, user));
 }
 
-static inline bool
+static inline async_rc_t
 exchange_fetch_candles_async(const char *name, const char *product_id,
     exchange_granularity_t gran, int64_t since_ms, int64_t until_ms,
     exchange_done_candles_cb_t cb, void *user)
 {
-  typedef bool (*fn_t)(const char *, const char *, exchange_granularity_t,
+  typedef async_rc_t (*fn_t)(const char *, const char *, exchange_granularity_t,
       int64_t, int64_t, exchange_done_candles_cb_t, void *);
   static fn_t cached = NULL;
   fn_t        fn     = __atomic_load_n(&cached, __ATOMIC_ACQUIRE);
@@ -997,11 +1001,11 @@ exchange_fetch_candles_async(const char *name, const char *product_id,
   return(fn(name, product_id, gran, since_ms, until_ms, cb, user));
 }
 
-static inline bool
+static inline async_rc_t
 exchange_fetch_all_tickers_async(const char *name,
     exchange_done_tickers_cb_t cb, void *user)
 {
-  typedef bool (*fn_t)(const char *, exchange_done_tickers_cb_t, void *);
+  typedef async_rc_t (*fn_t)(const char *, exchange_done_tickers_cb_t, void *);
   static fn_t cached = NULL;
   fn_t        fn     = __atomic_load_n(&cached, __ATOMIC_ACQUIRE);
 

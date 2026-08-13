@@ -188,16 +188,22 @@ static void             cmc_global_cache_store(struct json_object *jdata);
 
 static void             cmc_listings_done(const curl_response_t *resp);
 static void             cmc_info_done(const curl_response_t *resp);
-static bool             cmc_submit_info(cmc_request_t *req);
 static void             cmc_quotes_done(const curl_response_t *resp);
 static void             cmc_global_done(const curl_response_t *resp);
-static bool             cmc_submit_listings(cmc_request_t *req);
-static bool             cmc_abort_unsent(cmc_request_t *req, const char *err);
-static bool             cmc_detail_abort(cmc_request_t *req, bool deliver,
+
+// The submit chain. Every one of these is a leg of a public
+// *_fetch_*_async, so each returns that entry point's verdict verbatim
+// — which is why `deliver_on_fail` exists: the same helper serves the
+// caller-still-on-the-stack leg and the one where the callback is the
+// only way left to reach the consumer.
+static async_rc_t       cmc_submit_info(cmc_request_t *req);
+static async_rc_t       cmc_submit_listings(cmc_request_t *req);
+static async_rc_t       cmc_abort_unsent(cmc_request_t *req, const char *err);
+static async_rc_t       cmc_detail_abort(cmc_request_t *req, bool deliver,
                             const char *err);
-static bool             cmc_submit_quotes(cmc_request_t *req,
+static async_rc_t       cmc_submit_quotes(cmc_request_t *req,
                             bool deliver_on_fail);
-static bool             cmc_submit_global(cmc_request_t *req);
+static async_rc_t       cmc_submit_global(cmc_request_t *req);
 
 static void             cmc_poll_tick(task_t *t);
 

@@ -1179,7 +1179,8 @@ stock_cmd(const cmd_ctx_t *ctx)
     r = stock_req_new(ctx);
     snprintf(r->query, sizeof(r->query), "%s", a.query);
 
-    if(stockquote_search_async(a.query, stock_search_done, r) != SUCCESS)
+    if(stockquote_search_async(a.query, stock_search_done, r)
+        == ASYNC_FAILED_UNDELIVERED)
     {
       cmd_reply(ctx,
           "Couldn't reach the quote service — try again shortly.");
@@ -1218,7 +1219,8 @@ stock_cmd(const cmd_ctx_t *ctx)
   r = stock_req_new(ctx);
   r->verbose = a.verbose;
 
-  if(stockquote_fetch_async(symv, a.nsyms, stock_batch_done, r) != SUCCESS)
+  if(stockquote_fetch_async(symv, a.nsyms, stock_batch_done, r)
+      == ASYNC_FAILED_UNDELIVERED)
   {
     cmd_reply(ctx, "Couldn't reach the quote service — try again shortly.");
     mem_free(r);

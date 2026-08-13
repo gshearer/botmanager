@@ -483,7 +483,7 @@ kr_candles_exchange_resp(int http_status, const char *body, size_t body_len,
   kr_req_release(r);
 }
 
-bool
+async_rc_t
 kraken_fetch_candles_async(const char *pair, uint32_t interval_minutes,
     int64_t since_sec, uint8_t prio,
     kraken_done_candles_cb_t cb, void *user)
@@ -494,7 +494,7 @@ kraken_fetch_candles_async(const char *pair, uint32_t interval_minutes,
   int           n;
 
   if(pair == NULL || pair[0] == '\0' || interval_minutes == 0 || cb == NULL)
-    return(FAIL);
+    return(ASYNC_FAILED_UNDELIVERED);
 
   r = kr_req_alloc();
   r->type         = KR_REQ_CANDLES;
@@ -519,7 +519,7 @@ kraken_fetch_candles_async(const char *pair, uint32_t interval_minutes,
   if(n < 0 || (size_t)n >= sizeof(path))
   {
     kr_deliver_candles_fail(r, "Error: Kraken OHLC path overflow");
-    return(FAIL);
+    return(ASYNC_FAILED_DELIVERED);
   }
 
   if(exchange_request("kraken", prio, EXCHANGE_OP_REST_GET,
@@ -527,10 +527,10 @@ kraken_fetch_candles_async(const char *pair, uint32_t interval_minutes,
   {
     kr_deliver_candles_fail(r,
         "Error: failed to submit Kraken OHLC request");
-    return(FAIL);
+    return(ASYNC_FAILED_DELIVERED);
   }
 
-  return(SUCCESS);
+  return(ASYNC_AIRBORNE);
 }
 
 // ------------------------------------------------------------------
@@ -650,7 +650,7 @@ kr_assetpairs_silent_cb(const kraken_assetpairs_result_t *res, void *user)
         "assetpairs refresh: %s (count=%u)", res->err, res->count);
 }
 
-bool
+async_rc_t
 kraken_assetpairs_refresh_async(kraken_done_assetpairs_cb_t cb, void *user)
 {
   kr_request_t *r;
@@ -667,10 +667,10 @@ kraken_assetpairs_refresh_async(kraken_done_assetpairs_cb_t cb, void *user)
     kr_deliver_assetpairs_fail(r,
         "Error: failed to submit Kraken AssetPairs request",
         kr_pairs_count());
-    return(FAIL);
+    return(ASYNC_FAILED_DELIVERED);
   }
 
-  return(SUCCESS);
+  return(ASYNC_AIRBORNE);
 }
 
 // ------------------------------------------------------------------
@@ -771,13 +771,13 @@ kr_balance_done(const curl_response_t *resp)
   kr_req_release(r);
 }
 
-bool
+async_rc_t
 kraken_get_balance_async(kraken_done_balances_cb_t cb, void *user)
 {
   kr_request_t *r;
 
   if(cb == NULL)
-    return(FAIL);
+    return(ASYNC_FAILED_UNDELIVERED);
 
   r = kr_req_alloc();
   r->type        = KR_REQ_BALANCE;
@@ -787,7 +787,7 @@ kraken_get_balance_async(kraken_done_balances_cb_t cb, void *user)
   if(!kr_apikey_configured())
   {
     kr_deliver_balances_fail(r, KR_ERR_NO_CREDS);
-    return(FAIL);
+    return(ASYNC_FAILED_DELIVERED);
   }
 
   if(kr_submit_private(r, CURL_PRIO_NORMAL, KR_PATH_BALANCE_EX,
@@ -795,10 +795,10 @@ kraken_get_balance_async(kraken_done_balances_cb_t cb, void *user)
   {
     kr_deliver_balances_fail(r,
         "Error: failed to submit Kraken BalanceEx request");
-    return(FAIL);
+    return(ASYNC_FAILED_DELIVERED);
   }
 
-  return(SUCCESS);
+  return(ASYNC_AIRBORNE);
 }
 
 // ------------------------------------------------------------------
@@ -905,7 +905,7 @@ kr_addorder_done(const curl_response_t *resp)
   kr_req_release(r);
 }
 
-bool
+async_rc_t
 kraken_add_order_async(const kraken_place_order_req_t *req,
     kraken_done_order_cb_t cb, void *user)
 {
@@ -919,7 +919,7 @@ kraken_add_order_async(const kraken_place_order_req_t *req,
   bool          is_sell;
 
   if(req == NULL || cb == NULL)
-    return(FAIL);
+    return(ASYNC_FAILED_UNDELIVERED);
 
   r = kr_req_alloc();
   r->type     = KR_REQ_ADD_ORDER;
@@ -936,7 +936,7 @@ kraken_add_order_async(const kraken_place_order_req_t *req,
   if(!kr_apikey_configured())
   {
     kr_deliver_order_fail(r, KR_ERR_NO_CREDS);
-    return(FAIL);
+    return(ASYNC_FAILED_DELIVERED);
   }
 
   is_limit  = (strcmp(req->type, "limit")  == 0);
@@ -948,14 +948,14 @@ kraken_add_order_async(const kraken_place_order_req_t *req,
   {
     kr_deliver_order_fail(r,
         "Error: Kraken supports order types 'limit' and 'market'");
-    return(FAIL);
+    return(ASYNC_FAILED_DELIVERED);
   }
 
   if(!is_buy && !is_sell)
   {
     kr_deliver_order_fail(r,
         "Error: Kraken side must be 'buy' or 'sell'");
-    return(FAIL);
+    return(ASYNC_FAILED_DELIVERED);
   }
 
   // Kraken's AddOrder takes `volume` (base-ccy size); funds-quoted
@@ -966,27 +966,27 @@ kraken_add_order_async(const kraken_place_order_req_t *req,
     kr_deliver_order_fail(r,
         "Error: Kraken requires size, not funds; "
         "pre-compute via last_price");
-    return(FAIL);
+    return(ASYNC_FAILED_DELIVERED);
   }
 
   if(req->size <= 0.0)
   {
     kr_deliver_order_fail(r, "Error: positive size required");
-    return(FAIL);
+    return(ASYNC_FAILED_DELIVERED);
   }
 
   if(is_limit && req->price <= 0.0)
   {
     kr_deliver_order_fail(r,
         "Error: positive price required for a limit order");
-    return(FAIL);
+    return(ASYNC_FAILED_DELIVERED);
   }
 
   if(is_market && req->post_only)
   {
     kr_deliver_order_fail(r,
         "Error: post_only is invalid on market orders");
-    return(FAIL);
+    return(ASYNC_FAILED_DELIVERED);
   }
 
   kr_pair_lookup_rest(req->product_id, rest_pair, sizeof(rest_pair));
@@ -994,7 +994,7 @@ kraken_add_order_async(const kraken_place_order_req_t *req,
   if(rest_pair[0] == '\0')
   {
     kr_deliver_order_fail(r, "Error: unknown product_id");
-    return(FAIL);
+    return(ASYNC_FAILED_DELIVERED);
   }
 
   kr_form_init(&form, form_buf, sizeof(form_buf));
@@ -1006,7 +1006,7 @@ kraken_add_order_async(const kraken_place_order_req_t *req,
   {
     kr_deliver_order_fail(r,
         "Error: Kraken AddOrder body overflow");
-    return(FAIL);
+    return(ASYNC_FAILED_DELIVERED);
   }
 
   if(is_limit
@@ -1014,7 +1014,7 @@ kraken_add_order_async(const kraken_place_order_req_t *req,
   {
     kr_deliver_order_fail(r,
         "Error: Kraken AddOrder body overflow (price)");
-    return(FAIL);
+    return(ASYNC_FAILED_DELIVERED);
   }
 
   // TIF — GTC is the implicit default; emit only IOC / FOK.
@@ -1024,14 +1024,14 @@ kraken_add_order_async(const kraken_place_order_req_t *req,
     {
       kr_deliver_order_fail(r,
           "Error: Kraken AddOrder supports tif GTC/IOC/FOK only");
-      return(FAIL);
+      return(ASYNC_FAILED_DELIVERED);
     }
 
     if(kr_form_add(&form, "timeinforce", req->tif) != SUCCESS)
     {
       kr_deliver_order_fail(r,
           "Error: Kraken AddOrder body overflow (tif)");
-      return(FAIL);
+      return(ASYNC_FAILED_DELIVERED);
     }
   }
 
@@ -1040,7 +1040,7 @@ kraken_add_order_async(const kraken_place_order_req_t *req,
   {
     kr_deliver_order_fail(r,
         "Error: Kraken AddOrder body overflow (post_only)");
-    return(FAIL);
+    return(ASYNC_FAILED_DELIVERED);
   }
 
   if(req->validate
@@ -1048,7 +1048,7 @@ kraken_add_order_async(const kraken_place_order_req_t *req,
   {
     kr_deliver_order_fail(r,
         "Error: Kraken AddOrder body overflow (validate)");
-    return(FAIL);
+    return(ASYNC_FAILED_DELIVERED);
   }
 
   if(req->client_oid[0] != '\0'
@@ -1056,7 +1056,7 @@ kraken_add_order_async(const kraken_place_order_req_t *req,
   {
     kr_deliver_order_fail(r,
         "Error: Kraken AddOrder body overflow (cl_ord_id)");
-    return(FAIL);
+    return(ASYNC_FAILED_DELIVERED);
   }
 
   if(kr_submit_private(r, CURL_PRIO_NORMAL, KR_PATH_ADD_ORDER,
@@ -1064,10 +1064,10 @@ kraken_add_order_async(const kraken_place_order_req_t *req,
   {
     kr_deliver_order_fail(r,
         "Error: failed to submit Kraken AddOrder request");
-    return(FAIL);
+    return(ASYNC_FAILED_DELIVERED);
   }
 
-  return(SUCCESS);
+  return(ASYNC_AIRBORNE);
 }
 
 // ------------------------------------------------------------------
@@ -1134,7 +1134,7 @@ kr_cancelorder_done(const curl_response_t *resp)
   kr_req_release(r);
 }
 
-bool
+async_rc_t
 kraken_cancel_order_async(const char *order_id,
     kraken_done_order_cb_t cb, void *user)
 {
@@ -1143,7 +1143,7 @@ kraken_cancel_order_async(const char *order_id,
   char          form_buf[KR_BODY_SZ];
 
   if(order_id == NULL || order_id[0] == '\0' || cb == NULL)
-    return(FAIL);
+    return(ASYNC_FAILED_UNDELIVERED);
 
   r = kr_req_alloc();
   r->type     = KR_REQ_CANCEL_ORDER;
@@ -1154,7 +1154,7 @@ kraken_cancel_order_async(const char *order_id,
   if(!kr_apikey_configured())
   {
     kr_deliver_order_fail(r, KR_ERR_NO_CREDS);
-    return(FAIL);
+    return(ASYNC_FAILED_DELIVERED);
   }
 
   kr_form_init(&form, form_buf, sizeof(form_buf));
@@ -1162,7 +1162,7 @@ kraken_cancel_order_async(const char *order_id,
   if(kr_form_add(&form, "txid", order_id) != SUCCESS)
   {
     kr_deliver_order_fail(r, "Error: Kraken CancelOrder body overflow");
-    return(FAIL);
+    return(ASYNC_FAILED_DELIVERED);
   }
 
   if(kr_submit_private(r, CURL_PRIO_NORMAL, KR_PATH_CANCEL_ORDER,
@@ -1170,10 +1170,10 @@ kraken_cancel_order_async(const char *order_id,
   {
     kr_deliver_order_fail(r,
         "Error: failed to submit Kraken CancelOrder request");
-    return(FAIL);
+    return(ASYNC_FAILED_DELIVERED);
   }
 
-  return(SUCCESS);
+  return(ASYNC_AIRBORNE);
 }
 
 // ------------------------------------------------------------------
@@ -1246,7 +1246,7 @@ kr_queryorder_done(const curl_response_t *resp)
   kr_req_release(r);
 }
 
-bool
+async_rc_t
 kraken_query_order_async(const char *order_id,
     kraken_done_order_cb_t cb, void *user)
 {
@@ -1255,7 +1255,7 @@ kraken_query_order_async(const char *order_id,
   char          form_buf[KR_BODY_SZ];
 
   if(order_id == NULL || order_id[0] == '\0' || cb == NULL)
-    return(FAIL);
+    return(ASYNC_FAILED_UNDELIVERED);
 
   r = kr_req_alloc();
   r->type     = KR_REQ_QUERY_ORDER;
@@ -1266,7 +1266,7 @@ kraken_query_order_async(const char *order_id,
   if(!kr_apikey_configured())
   {
     kr_deliver_order_fail(r, KR_ERR_NO_CREDS);
-    return(FAIL);
+    return(ASYNC_FAILED_DELIVERED);
   }
 
   kr_form_init(&form, form_buf, sizeof(form_buf));
@@ -1274,7 +1274,7 @@ kraken_query_order_async(const char *order_id,
   if(kr_form_add(&form, "txid", order_id) != SUCCESS)
   {
     kr_deliver_order_fail(r, "Error: Kraken QueryOrders body overflow");
-    return(FAIL);
+    return(ASYNC_FAILED_DELIVERED);
   }
 
   if(kr_submit_private(r, CURL_PRIO_NORMAL, KR_PATH_QUERY_ORDERS,
@@ -1282,10 +1282,10 @@ kraken_query_order_async(const char *order_id,
   {
     kr_deliver_order_fail(r,
         "Error: failed to submit Kraken QueryOrders request");
-    return(FAIL);
+    return(ASYNC_FAILED_DELIVERED);
   }
 
-  return(SUCCESS);
+  return(ASYNC_AIRBORNE);
 }
 
 // ------------------------------------------------------------------
@@ -1381,13 +1381,13 @@ kr_closedorders_done(const curl_response_t *resp)
   kr_orderslist_done_inner((kr_request_t *)resp->user_data, resp, "closed");
 }
 
-bool
+async_rc_t
 kraken_open_orders_async(kraken_done_orders_cb_t cb, void *user)
 {
   kr_request_t *r;
 
   if(cb == NULL)
-    return(FAIL);
+    return(ASYNC_FAILED_UNDELIVERED);
 
   r = kr_req_alloc();
   r->type      = KR_REQ_OPEN_ORDERS;
@@ -1397,7 +1397,7 @@ kraken_open_orders_async(kraken_done_orders_cb_t cb, void *user)
   if(!kr_apikey_configured())
   {
     kr_deliver_orders_fail(r, KR_ERR_NO_CREDS);
-    return(FAIL);
+    return(ASYNC_FAILED_DELIVERED);
   }
 
   if(kr_submit_private(r, CURL_PRIO_NORMAL, KR_PATH_OPEN_ORDERS,
@@ -1405,13 +1405,13 @@ kraken_open_orders_async(kraken_done_orders_cb_t cb, void *user)
   {
     kr_deliver_orders_fail(r,
         "Error: failed to submit Kraken OpenOrders request");
-    return(FAIL);
+    return(ASYNC_FAILED_DELIVERED);
   }
 
-  return(SUCCESS);
+  return(ASYNC_AIRBORNE);
 }
 
-bool
+async_rc_t
 kraken_closed_orders_async(int64_t start_sec, kraken_done_orders_cb_t cb,
     void *user)
 {
@@ -1420,7 +1420,7 @@ kraken_closed_orders_async(int64_t start_sec, kraken_done_orders_cb_t cb,
   char          form_buf[KR_BODY_SZ];
 
   if(cb == NULL)
-    return(FAIL);
+    return(ASYNC_FAILED_UNDELIVERED);
 
   r = kr_req_alloc();
   r->type      = KR_REQ_CLOSED_ORDERS;
@@ -1431,7 +1431,7 @@ kraken_closed_orders_async(int64_t start_sec, kraken_done_orders_cb_t cb,
   if(!kr_apikey_configured())
   {
     kr_deliver_orders_fail(r, KR_ERR_NO_CREDS);
-    return(FAIL);
+    return(ASYNC_FAILED_DELIVERED);
   }
 
   kr_form_init(&form, form_buf, sizeof(form_buf));
@@ -1440,7 +1440,7 @@ kraken_closed_orders_async(int64_t start_sec, kraken_done_orders_cb_t cb,
       && kr_form_add_int(&form, "start", start_sec) != SUCCESS)
   {
     kr_deliver_orders_fail(r, "Error: Kraken ClosedOrders body overflow");
-    return(FAIL);
+    return(ASYNC_FAILED_DELIVERED);
   }
 
   if(kr_submit_private(r, CURL_PRIO_NORMAL, KR_PATH_CLOSED_ORDERS,
@@ -1448,10 +1448,10 @@ kraken_closed_orders_async(int64_t start_sec, kraken_done_orders_cb_t cb,
   {
     kr_deliver_orders_fail(r,
         "Error: failed to submit Kraken ClosedOrders request");
-    return(FAIL);
+    return(ASYNC_FAILED_DELIVERED);
   }
 
-  return(SUCCESS);
+  return(ASYNC_AIRBORNE);
 }
 
 // ------------------------------------------------------------------
@@ -1604,7 +1604,7 @@ kr_tradeshistory_done(const curl_response_t *resp)
   kr_req_release(r);
 }
 
-bool
+async_rc_t
 kraken_trades_history_async(const char *order_id, const char *product_id,
     int64_t start_sec, kraken_done_fills_cb_t cb, void *user)
 {
@@ -1613,7 +1613,7 @@ kraken_trades_history_async(const char *order_id, const char *product_id,
   char          form_buf[KR_BODY_SZ];
 
   if(cb == NULL)
-    return(FAIL);
+    return(ASYNC_FAILED_UNDELIVERED);
 
   r = kr_req_alloc();
   r->type     = KR_REQ_TRADES_HISTORY;
@@ -1630,7 +1630,7 @@ kraken_trades_history_async(const char *order_id, const char *product_id,
   if(!kr_apikey_configured())
   {
     kr_deliver_fills_fail(r, KR_ERR_NO_CREDS);
-    return(FAIL);
+    return(ASYNC_FAILED_DELIVERED);
   }
 
   kr_form_init(&form, form_buf, sizeof(form_buf));
@@ -1639,7 +1639,7 @@ kraken_trades_history_async(const char *order_id, const char *product_id,
       && kr_form_add_int(&form, "start", start_sec) != SUCCESS)
   {
     kr_deliver_fills_fail(r, "Error: Kraken TradesHistory body overflow");
-    return(FAIL);
+    return(ASYNC_FAILED_DELIVERED);
   }
 
   if(kr_submit_private(r, CURL_PRIO_NORMAL, KR_PATH_TRADES_HISTORY,
@@ -1647,8 +1647,8 @@ kraken_trades_history_async(const char *order_id, const char *product_id,
   {
     kr_deliver_fills_fail(r,
         "Error: failed to submit Kraken TradesHistory request");
-    return(FAIL);
+    return(ASYNC_FAILED_DELIVERED);
   }
 
-  return(SUCCESS);
+  return(ASYNC_AIRBORNE);
 }

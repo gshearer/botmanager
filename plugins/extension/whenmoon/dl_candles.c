@@ -159,7 +159,7 @@ wm_dl_candles_dispatch_one(dl_jobtable_t *t, dl_job_t *j)
   // generic surface.
   if(exchange_fetch_candles_async(j->exchange, j->exchange_symbol,
         EXCH_GRAN_1M, start_s * 1000, (end_s - 1) * 1000,
-        wm_dl_candles_on_page, ctx) != SUCCESS)
+        wm_dl_candles_on_page, ctx) != ASYNC_AIRBORNE)
   {
     // On submit failure the exchange shim still fires the completion
     // callback synchronously with res->err set, so `ctx` ownership has

@@ -28,6 +28,7 @@
 #include <stddef.h>
 #include <stdint.h>
 
+#include "async.h"
 #include "common.h"  // SUCCESS/FAIL
 
 // The plugin's name, and so both its dlsym handle and the root of its
@@ -191,10 +192,10 @@ typedef void (*tmdb_person_cb_t)(const tmdb_person_res_t *, void *user);
 // Real function declarations — visible only inside the tmdb plugin (where
 // TMDB_INTERNAL is defined). External consumers go through the shims.
 //
-// Every async call obeys the same ownership contract: it returns FAIL
-// *before* firing the callback (bad args, no token, transport refusal) —
-// the caller still owns `user`; or it returns SUCCESS and fires the
-// callback exactly once (the callback then owns `user`).
+// Every async call here returns ASYNC_AIRBORNE or
+// ASYNC_FAILED_UNDELIVERED and never ASYNC_FAILED_DELIVERED — a
+// refusal (bad args, no token, transport refusal) always leaves `user`
+// yours. See include/async.h for what the values oblige you to do.
 // ----------------------------------------------------------------------
 
 #ifdef TMDB_INTERNAL
@@ -203,50 +204,39 @@ typedef void (*tmdb_person_cb_t)(const tmdb_person_res_t *, void *user);
 bool tmdb_configured(void);
 
 // ----------------------------------------------------------------------
-// Async failure contract — all four below (PLUGIN.md §Async failure
-// semantics, which MUSTs this be stated and MUSTs you not guess it).
+// All four below return only ASYNC_AIRBORNE or
+// ASYNC_FAILED_UNDELIVERED. The undelivered causes are all pre-flight:
+// NULL/empty or out-of-range argument, no API key configured, URL
+// overflow, or the curl request could not be created or submitted.
 //
-// tmdb is in the "FAIL ⇒ the callback did NOT fire" row, opposite the
-// exchange drivers. For every `*_async` here:
-//
-//   FAIL    — nothing was dispatched and your callback will never run.
-//             **You still own your closure: free it, and answer the
-//             user yourself.** Causes are all pre-flight: NULL/empty or
-//             out-of-range argument, no API key configured, URL
-//             overflow, or the curl request could not be created or
-//             submitted.
-//   SUCCESS — the callback runs exactly once. Usually later, on the
-//             curl worker.
-//
-// ⚠ But three of them can run it **synchronously, before this call
-// returns** — a warm cache is answered in place (`tmdb_title_async`,
+// ⚠ ASYNC_AIRBORNE does not mean "later". Three of them answer a warm
+// cache **in place, before this call returns** (`tmdb_title_async`,
 // `tmdb_person_async`, `tmdb_trending_async`; `tmdb_search_async` has
-// no cache and is always deferred). SUCCESS therefore does NOT mean
-// "later", and a caller holding a lock across the call can re-enter
-// itself through its own callback. Take that seriously or call from a
-// task worker.
+// no cache and is always deferred), so a caller holding a lock across
+// the call can re-enter itself through its own callback. Take that
+// seriously or call from a task worker.
 // ----------------------------------------------------------------------
 
 // Search. `kind` selects the endpoint: TMDB_MEDIA_UNKNOWN → /search/multi
 // (hits carry per-item media); MOVIE/TV/PERSON → the typed endpoint (all
-// hits take `kind`). No cache: on SUCCESS the callback always runs
-// later, on the curl worker.
-bool tmdb_search_async(tmdb_media_t kind, const char *query,
+// hits take `kind`). No cache: the callback always runs later, on the
+// curl worker.
+async_rc_t tmdb_search_async(tmdb_media_t kind, const char *query,
     tmdb_search_cb_t cb, void *user);
 
-// Full detail for one title. `kind` must be MOVIE or TV. ⚠ Cached: on
-// SUCCESS the callback may already have run, inside this call.
-bool tmdb_title_async(tmdb_media_t kind, int32_t id,
+// Full detail for one title. `kind` must be MOVIE or TV. ⚠ Cached: the
+// callback may already have run, inside this call.
+async_rc_t tmdb_title_async(tmdb_media_t kind, int32_t id,
     tmdb_title_cb_t cb, void *user);
 
-// Full detail for one person. ⚠ Cached: on SUCCESS the callback may
-// already have run, inside this call.
-bool tmdb_person_async(int32_t id, tmdb_person_cb_t cb, void *user);
+// Full detail for one person. ⚠ Cached: the callback may already have
+// run, inside this call.
+async_rc_t tmdb_person_async(int32_t id, tmdb_person_cb_t cb, void *user);
 
 // Trending list. `kind` is UNKNOWN (all), MOVIE, or TV. `weekly` selects
-// the day/week window. ⚠ Cached: on SUCCESS the callback may already
-// have run, inside this call.
-bool tmdb_trending_async(tmdb_media_t kind, bool weekly,
+// the day/week window. ⚠ Cached: the callback may already have run,
+// inside this call.
+async_rc_t tmdb_trending_async(tmdb_media_t kind, bool weekly,
     tmdb_search_cb_t cb, void *user);
 
 #endif // TMDB_INTERNAL
@@ -285,11 +275,11 @@ tmdb_configured(void)
   return(fn());
 }
 
-static inline bool
+static inline async_rc_t
 tmdb_search_async(tmdb_media_t kind, const char *query,
     tmdb_search_cb_t cb, void *user)
 {
-  typedef bool (*fn_t)(tmdb_media_t, const char *, tmdb_search_cb_t, void *);
+  typedef async_rc_t (*fn_t)(tmdb_media_t, const char *, tmdb_search_cb_t, void *);
   static fn_t cached = NULL;
   fn_t        fn     = __atomic_load_n(&cached, __ATOMIC_ACQUIRE);
 
@@ -310,11 +300,11 @@ tmdb_search_async(tmdb_media_t kind, const char *query,
   return(fn(kind, query, cb, user));
 }
 
-static inline bool
+static inline async_rc_t
 tmdb_title_async(tmdb_media_t kind, int32_t id,
     tmdb_title_cb_t cb, void *user)
 {
-  typedef bool (*fn_t)(tmdb_media_t, int32_t, tmdb_title_cb_t, void *);
+  typedef async_rc_t (*fn_t)(tmdb_media_t, int32_t, tmdb_title_cb_t, void *);
   static fn_t cached = NULL;
   fn_t        fn     = __atomic_load_n(&cached, __ATOMIC_ACQUIRE);
 
@@ -335,10 +325,10 @@ tmdb_title_async(tmdb_media_t kind, int32_t id,
   return(fn(kind, id, cb, user));
 }
 
-static inline bool
+static inline async_rc_t
 tmdb_person_async(int32_t id, tmdb_person_cb_t cb, void *user)
 {
-  typedef bool (*fn_t)(int32_t, tmdb_person_cb_t, void *);
+  typedef async_rc_t (*fn_t)(int32_t, tmdb_person_cb_t, void *);
   static fn_t cached = NULL;
   fn_t        fn     = __atomic_load_n(&cached, __ATOMIC_ACQUIRE);
 
@@ -359,11 +349,11 @@ tmdb_person_async(int32_t id, tmdb_person_cb_t cb, void *user)
   return(fn(id, cb, user));
 }
 
-static inline bool
+static inline async_rc_t
 tmdb_trending_async(tmdb_media_t kind, bool weekly,
     tmdb_search_cb_t cb, void *user)
 {
-  typedef bool (*fn_t)(tmdb_media_t, bool, tmdb_search_cb_t, void *);
+  typedef async_rc_t (*fn_t)(tmdb_media_t, bool, tmdb_search_cb_t, void *);
   static fn_t cached = NULL;
   fn_t        fn     = __atomic_load_n(&cached, __ATOMIC_ACQUIRE);
 

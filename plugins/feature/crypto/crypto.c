@@ -1462,7 +1462,8 @@ crypto_cmd_crypto(const cmd_ctx_t *ctx)
     r = crypto_req_new(ctx);
     r->kind = CRYPTO_REQ_MCAP;
 
-    if(coinmarketcap_fetch_global_async(crypto_done_mcap, r) != SUCCESS)
+    if(coinmarketcap_fetch_global_async(crypto_done_mcap, r)
+        == ASYNC_FAILED_UNDELIVERED)
     {
       cmd_reply(ctx,
           "Error: failed to submit market-wide request. "
@@ -1489,7 +1490,8 @@ crypto_cmd_crypto(const cmd_ctx_t *ctx)
     r->kind = CRYPTO_REQ_VERBOSE;
 
     if(coinmarketcap_fetch_detail_async(symbol, rank,
-        crypto_done_detail, r) != SUCCESS)
+        crypto_done_detail, r)
+        == ASYNC_FAILED_UNDELIVERED)
     {
       cmd_reply(ctx,
           "Error: failed to submit detail request. "
@@ -1521,7 +1523,8 @@ crypto_cmd_crypto(const cmd_ctx_t *ctx)
   r->limit          = stack_req.limit;
   memcpy(r->selectors, stack_req.selectors, sizeof(r->selectors));
 
-  if(coinmarketcap_fetch_listings_async(crypto_done_listings, r) != SUCCESS)
+  if(coinmarketcap_fetch_listings_async(crypto_done_listings, r)
+      == ASYNC_FAILED_UNDELIVERED)
   {
     cmd_reply(ctx,
         "Error: failed to submit listings request. "

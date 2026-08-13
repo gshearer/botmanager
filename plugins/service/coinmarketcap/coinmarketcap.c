@@ -728,7 +728,7 @@ cmc_classify_http(const curl_response_t *resp, char *buf, size_t sz)
 
 // HTTP submit helpers
 
-static bool
+static async_rc_t
 cmc_submit_listings(cmc_request_t *req)
 {
   curl_request_t *cr;
@@ -754,7 +754,7 @@ cmc_submit_listings(cmc_request_t *req)
     return(cmc_abort_unsent(req,
         "Error: failed to submit API request"));
 
-  return(SUCCESS);
+  return(ASYNC_AIRBORNE);
 }
 
 // Metadata leg of a detail request. Whatever happens here the request
@@ -819,7 +819,7 @@ cmc_info_done(const curl_response_t *resp)
   cmc_submit_quotes(r, true);
 }
 
-static bool
+static async_rc_t
 cmc_submit_info(cmc_request_t *req)
 {
   curl_request_t *cr;
@@ -840,39 +840,39 @@ cmc_submit_info(cmc_request_t *req)
   if(curl_request_submit(cr) != SUCCESS)
     return(cmc_submit_quotes(req, false));
 
-  return(SUCCESS);
+  return(ASYNC_AIRBORNE);
 }
 
 // A request that never reached the wire, dropped while its caller is
-// still on the stack. The header promises that on FAIL the callback is
-// NOT invoked — the caller owns the user-facing message — so firing it
-// here as well is what makes a consumer reply twice and free its
-// closure twice. The reason survives in the log instead.
-static bool
+// still on the stack. ASYNC_FAILED_UNDELIVERED is the whole point: the
+// caller owns the user-facing message, so firing the callback here as
+// well is what makes a consumer reply twice and free its closure twice.
+// The reason survives in the log instead.
+static async_rc_t
 cmc_abort_unsent(cmc_request_t *req, const char *err)
 {
   clam(CLAM_WARN, CMC_CTX, "request dropped before submit: %s", err);
   cmc_req_release(req);
 
-  return(FAIL);
+  return(ASYNC_FAILED_UNDELIVERED);
 }
 
 // Detail requests have a second leg: once the metadata fetch has
 // returned, the caller is long gone and the consumer is reachable only
 // through its callback. `deliver` distinguishes the two cases.
-static bool
+static async_rc_t
 cmc_detail_abort(cmc_request_t *req, bool deliver, const char *err)
 {
   if(deliver)
   {
     cmc_deliver_detail_fail(req, err);
-    return(FAIL);
+    return(ASYNC_FAILED_DELIVERED);
   }
 
   return(cmc_abort_unsent(req, err));
 }
 
-static bool
+static async_rc_t
 cmc_submit_quotes(cmc_request_t *req, bool deliver_on_fail)
 {
   curl_request_t *cr;
@@ -922,15 +922,13 @@ cmc_submit_quotes(cmc_request_t *req, bool deliver_on_fail)
   curl_request_add_header(cr, "Accept: application/json");
 
   if(curl_request_submit(cr) != SUCCESS)
-  {
-    cmc_deliver_detail_fail(req, "Error: failed to submit API request");
-    return(FAIL);
-  }
+    return(cmc_detail_abort(req, deliver_on_fail,
+        "Error: failed to submit API request"));
 
-  return(SUCCESS);
+  return(ASYNC_AIRBORNE);
 }
 
-static bool
+static async_rc_t
 cmc_submit_global(cmc_request_t *req)
 {
   char hdr[CMC_HDR_SZ];
@@ -951,7 +949,7 @@ cmc_submit_global(cmc_request_t *req)
     return(cmc_abort_unsent(req,
         "Error: failed to submit API request"));
 
-  return(SUCCESS);
+  return(ASYNC_AIRBORNE);
 }
 
 // Curl callbacks
@@ -1334,7 +1332,7 @@ coinmarketcap_global_cache_fresh(void)
   return(fresh);
 }
 
-bool
+async_rc_t
 coinmarketcap_fetch_listings_async(
     coinmarketcap_done_listings_cb_t done_cb, void *user)
 {
@@ -1342,7 +1340,7 @@ coinmarketcap_fetch_listings_async(
   cmc_request_t *r;
 
   if(apikey == NULL || apikey[0] == '\0')
-    return(FAIL);
+    return(ASYNC_FAILED_UNDELIVERED);
 
   r = cmc_req_alloc();
   r->type         = CMC_REQ_LISTINGS;
@@ -1357,7 +1355,7 @@ coinmarketcap_fetch_listings_async(
   return(cmc_submit_listings(r));
 }
 
-bool
+async_rc_t
 coinmarketcap_fetch_detail_async(const char *symbol, int32_t rank,
     coinmarketcap_done_detail_cb_t done_cb, void *user)
 {
@@ -1365,11 +1363,11 @@ coinmarketcap_fetch_detail_async(const char *symbol, int32_t rank,
   cmc_request_t *r;
 
   if(apikey == NULL || apikey[0] == '\0')
-    return(FAIL);
+    return(ASYNC_FAILED_UNDELIVERED);
 
   // Exactly one of symbol/rank must be supplied.
   if((symbol == NULL || symbol[0] == '\0') && rank <= 0)
-    return(FAIL);
+    return(ASYNC_FAILED_UNDELIVERED);
 
   r = cmc_req_alloc();
   r->type      = CMC_REQ_DETAIL;
@@ -1397,7 +1395,7 @@ coinmarketcap_fetch_detail_async(const char *symbol, int32_t rank,
   return(cmc_submit_quotes(r, false));
 }
 
-bool
+async_rc_t
 coinmarketcap_fetch_global_async(
     coinmarketcap_done_global_cb_t done_cb, void *user)
 {
@@ -1405,7 +1403,7 @@ coinmarketcap_fetch_global_async(
   cmc_request_t *r;
 
   if(apikey == NULL || apikey[0] == '\0')
-    return(FAIL);
+    return(ASYNC_FAILED_UNDELIVERED);
 
   r = cmc_req_alloc();
   r->type      = CMC_REQ_GLOBAL;

@@ -1238,7 +1238,7 @@ stockquote_provider_caps(void)
   return(caps);
 }
 
-bool
+async_rc_t
 stockquote_fetch_async(const char *const *syms, uint8_t n,
     stockquote_batch_cb_t cb, void *user)
 {
@@ -1249,10 +1249,10 @@ stockquote_fetch_async(const char *const *syms, uint8_t n,
   bool        want_spark;
 
   if(cb == NULL || syms == NULL)
-    return(FAIL);
+    return(ASYNC_FAILED_UNDELIVERED);
 
   if(n == 0 || n > YF_MAX_BATCH)
-    return(FAIL);
+    return(ASYNC_FAILED_UNDELIVERED);
 
   ttl = (uint32_t)kv_get_uint("plugin.yahoofinance.cache_ttl");
 
@@ -1313,7 +1313,7 @@ stockquote_fetch_async(const char *const *syms, uint8_t n,
     mem_free(p);
 
   yf_slot_done(b);   // consume the +1 guard
-  return(SUCCESS);
+  return(ASYNC_AIRBORNE);
 }
 
 static void
@@ -1414,7 +1414,7 @@ emit:
   mem_free(r);
 }
 
-bool
+async_rc_t
 stockquote_search_async(const char *query, stockquote_search_cb_t cb,
     void *user)
 {
@@ -1425,17 +1425,17 @@ stockquote_search_async(const char *query, stockquote_search_cb_t cb,
   yf_search_req_t *r;
 
   if(cb == NULL || query == NULL || query[0] == '\0')
-    return(FAIL);
+    return(ASYNC_FAILED_UNDELIVERED);
 
   if(yf_urlencode(query, enc, sizeof(enc)) >= sizeof(enc))
-    return(FAIL);
+    return(ASYNC_FAILED_UNDELIVERED);
 
   need = snprintf(url, sizeof(url),
       "%s?q=%s&quotesCount=%d&newsCount=0", YF_SEARCH_URL, enc,
       YF_SEARCH_MAX);
 
   if(need < 0 || (size_t)need >= sizeof(url))
-    return(FAIL);
+    return(ASYNC_FAILED_UNDELIVERED);
 
   r = mem_alloc(YF_CTX, "search", sizeof(*r));
   r->cb   = cb;
@@ -1446,7 +1446,7 @@ stockquote_search_async(const char *query, stockquote_search_cb_t cb,
   if(cr == NULL)
   {
     mem_free(r);
-    return(FAIL);
+    return(ASYNC_FAILED_UNDELIVERED);
   }
 
   yf_apply_common(cr);
@@ -1454,13 +1454,13 @@ stockquote_search_async(const char *query, stockquote_search_cb_t cb,
   if(curl_request_submit(cr) != SUCCESS)
   {
     mem_free(r);
-    return(FAIL);
+    return(ASYNC_FAILED_UNDELIVERED);
   }
 
-  return(SUCCESS);
+  return(ASYNC_AIRBORNE);
 }
 
-bool
+async_rc_t
 stockquote_series_async(const char *sym, quote_range_t range,
     stockquote_series_cb_t cb, void *user)
 {
@@ -1471,7 +1471,7 @@ stockquote_series_async(const char *sym, quote_range_t range,
   (void)cb;
   (void)user;
 
-  return(FAIL);
+  return(ASYNC_FAILED_UNDELIVERED);
 }
 
 // ----------------------------------------------------------------------

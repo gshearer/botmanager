@@ -522,7 +522,8 @@ rawg_on_pick(const rawg_search_res_t *res, void *user)
     return;
   }
 
-  if(rawg_game_async(best->id, rawg_on_game, r) != SUCCESS)
+  if(rawg_game_async(best->id, rawg_on_game, r)
+      == ASYNC_FAILED_UNDELIVERED)
   {
     cmd_reply(&ctx, "Couldn't load details — try again shortly.");
     mem_free(r);
@@ -685,7 +686,8 @@ rawg_cmd(const cmd_ctx_t *ctx)
     r->year      = a.year;
     r->verbose   = a.verbose;
 
-    if(rawg_list_async(a.list_kind, a.year, rawg_on_list, r) != SUCCESS)
+    if(rawg_list_async(a.list_kind, a.year, rawg_on_list, r)
+        == ASYNC_FAILED_UNDELIVERED)
     {
       cmd_reply(ctx, "Couldn't reach RAWG — try again shortly.");
       mem_free(r);
@@ -706,9 +708,11 @@ rawg_cmd(const cmd_ctx_t *ctx)
   snprintf(r->query, sizeof(r->query), "%s", a.query);
 
   if(a.mode == RAWG_MODE_LIST)
-    ok = rawg_search_async(a.query, rawg_on_list, r) == SUCCESS;
+    ok = rawg_search_async(a.query, rawg_on_list, r)
+        != ASYNC_FAILED_UNDELIVERED;
   else
-    ok = rawg_search_async(a.query, rawg_on_pick, r) == SUCCESS;
+    ok = rawg_search_async(a.query, rawg_on_pick, r)
+        != ASYNC_FAILED_UNDELIVERED;
 
   if(!ok)
   {

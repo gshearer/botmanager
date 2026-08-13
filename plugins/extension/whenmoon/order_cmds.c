@@ -236,7 +236,7 @@ wm_order_cmd_buysell(const cmd_ctx_t *ctx, const char *side)
   }
 
   if(exchange_place_order_async(exch, &req,
-        wm_order_place_done, ac) != SUCCESS)
+        wm_order_place_done, ac) != ASYNC_AIRBORNE)
   {
     // exchange_place_order_async fired wm_order_place_done with
     // the err already — and that callback freed `ac`. Do not
@@ -321,7 +321,7 @@ wm_order_cmd_cancel(const cmd_ctx_t *ctx)
   }
 
   if(exchange_cancel_order_async(exch_tok, oid_tok,
-        wm_order_cancel_done, ac) != SUCCESS)
+        wm_order_cancel_done, ac) != ASYNC_AIRBORNE)
   {
     // wm_order_cancel_done fired with err and freed `ac`.
     return;

@@ -307,7 +307,7 @@ wxg_forecast_done(const curl_response_t *resp)
 // Public mechanism API
 // ----------------------------------------------------------------------
 
-bool
+async_rc_t
 weathergov_forecast_async(const weathergov_point_t *pt, const char *units,
     weathergov_forecast_cb_t cb, void *user)
 {
@@ -315,7 +315,7 @@ weathergov_forecast_async(const weathergov_point_t *pt, const char *units,
   wxg_request_t *r;
 
   if(cb == NULL || pt == NULL || !weathergov_enabled())
-    return(FAIL);
+    return(ASYNC_FAILED_UNDELIVERED);
 
   // "us" and "si" are the only values the endpoint accepts; anything
   // else is answered 400, so an unrecognised one becomes the default
@@ -342,8 +342,8 @@ weathergov_forecast_async(const weathergov_point_t *pt, const char *units,
   if(wxg_http_get(url, r->ua, wxg_forecast_done, r) != SUCCESS)
   {
     wxg_req_release(r);
-    return(FAIL);
+    return(ASYNC_FAILED_UNDELIVERED);
   }
 
-  return(SUCCESS);
+  return(ASYNC_AIRBORNE);
 }

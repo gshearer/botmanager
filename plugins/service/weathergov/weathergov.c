@@ -533,7 +533,7 @@ weathergov_enabled(void)
   return(kv_get_uint("plugin.weathergov.enabled") != 0);
 }
 
-bool
+async_rc_t
 weathergov_point_async(double lat, double lon,
     weathergov_point_cb_t cb, void *user)
 {
@@ -542,7 +542,7 @@ weathergov_point_async(double lat, double lon,
   wxg_request_t *r;
 
   if(cb == NULL || !weathergov_enabled())
-    return(FAIL);
+    return(ASYNC_FAILED_UNDELIVERED);
 
   r = wxg_req_alloc();
   r->type     = WXG_REQ_POINT;
@@ -573,7 +573,7 @@ weathergov_point_async(double lat, double lon,
         r->acc.point.covered ? r->acc.point.point.grid_id : "uncovered");
 
     wxg_point_deliver(r);
-    return(SUCCESS);
+    return(ASYNC_AIRBORNE);
   }
 
   pthread_mutex_unlock(&wxg_point_cache_mu);
@@ -583,10 +583,10 @@ weathergov_point_async(double lat, double lon,
   if(wxg_http_get(url, r->ua, wxg_point_done, r) != SUCCESS)
   {
     wxg_req_release(r);
-    return(FAIL);
+    return(ASYNC_FAILED_UNDELIVERED);
   }
 
-  return(SUCCESS);
+  return(ASYNC_AIRBORNE);
 }
 
 // ----------------------------------------------------------------------

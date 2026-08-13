@@ -430,13 +430,13 @@ db_query(const char *sql, db_result_t *result)
   return(ret);
 }
 
-bool
+async_rc_t
 db_query_async(const char *sql, db_cb_t cb, void *data)
 {
   db_async_ctx_t *ctx;
 
   if(!db_ready || driver == NULL || sql == NULL || cb == NULL)
-    return(FAIL);
+    return(ASYNC_FAILED_UNDELIVERED);
 
   ctx = mem_alloc("db", "async_ctx", sizeof(db_async_ctx_t));
 
@@ -447,7 +447,7 @@ db_query_async(const char *sql, db_cb_t cb, void *data)
   task_add("db_query", TASK_THREAD, 128, async_cb, ctx);
 
   clam(CLAM_DEBUG, "db_query_async", "submitted: %s", sql);
-  return(SUCCESS);
+  return(ASYNC_AIRBORNE);
 }
 
 bool

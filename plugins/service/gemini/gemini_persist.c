@@ -268,7 +268,7 @@ gem_symbols_load_or_refresh_async(void)
         "SELECT native, base, quote,"
         " EXTRACT(EPOCH FROM (NOW() - fetched_at))::bigint AS age_sec"
         " FROM gemini_symbols",
-        gem_symbols_load_cb, NULL) != SUCCESS)
+        gem_symbols_load_cb, NULL) == ASYNC_FAILED_UNDELIVERED)
   {
     // DB unreachable / submit failed → never leave the cache empty;
     // fall through to a direct network refresh.

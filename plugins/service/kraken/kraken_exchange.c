@@ -668,7 +668,7 @@ kr_exch_map_granularity(exchange_granularity_t gran, uint32_t *out_minutes)
 
 // ---- trampolines ----
 
-static bool
+static async_rc_t
 kr_exch_place_order_async(const exchange_place_order_req_t *req,
     exchange_done_order_cb_t cb, void *user)
 {
@@ -678,7 +678,7 @@ kr_exch_place_order_async(const exchange_place_order_req_t *req,
   if(req == NULL || cb == NULL)
   {
     kr_exch_fail_order(cb, user, "invalid place_order arguments");
-    return(FAIL);
+    return(ASYNC_FAILED_DELIVERED);
   }
 
   fwd           = kr_fwd_new(KR_FWD_ORDER, user);
@@ -699,19 +699,19 @@ kr_exch_place_order_async(const exchange_place_order_req_t *req,
   return(kraken_add_order_async(&inner, kr_exch_order_done_adapter, fwd));
 }
 
-static bool
+static async_rc_t
 kr_exch_cancel_order_async(const char *order_id,
     exchange_done_order_cb_t cb, void *user)
 {
   kr_exch_fwd_t       *fwd;
 
   if(cb == NULL)
-    return(FAIL);
+    return(ASYNC_FAILED_UNDELIVERED);
 
   if(order_id == NULL || order_id[0] == '\0')
   {
     kr_exch_fail_order(cb, user, "order_id required");
-    return(FAIL);
+    return(ASYNC_FAILED_DELIVERED);
   }
 
   fwd           = kr_fwd_new(KR_FWD_ORDER, user);
@@ -720,19 +720,19 @@ kr_exch_cancel_order_async(const char *order_id,
   return(kraken_cancel_order_async(order_id, kr_exch_order_done_adapter, fwd));
 }
 
-static bool
+static async_rc_t
 kr_exch_get_order_async(const char *order_id,
     exchange_done_order_cb_t cb, void *user)
 {
   kr_exch_fwd_t       *fwd;
 
   if(cb == NULL)
-    return(FAIL);
+    return(ASYNC_FAILED_UNDELIVERED);
 
   if(order_id == NULL || order_id[0] == '\0')
   {
     kr_exch_fail_order(cb, user, "order_id required");
-    return(FAIL);
+    return(ASYNC_FAILED_DELIVERED);
   }
 
   fwd           = kr_fwd_new(KR_FWD_ORDER, user);
@@ -749,7 +749,7 @@ kr_exch_get_order_async(const char *order_id,
 // side filtering but the generic surface doesn't expect a partial set.
 // For v1 we just forward without filtering — callers that need a
 // product-specific cut should walk the returned list.
-static bool
+static async_rc_t
 kr_exch_list_orders_async(const char *status, const char *product_id,
     exchange_done_orders_cb_t cb, void *user)
 {
@@ -759,7 +759,7 @@ kr_exch_list_orders_async(const char *status, const char *product_id,
   (void)product_id;
 
   if(cb == NULL)
-    return(FAIL);
+    return(ASYNC_FAILED_UNDELIVERED);
 
   fwd            = kr_fwd_new(KR_FWD_ORDERS, user);
   fwd->cb.orders = cb;
@@ -775,7 +775,7 @@ kr_exch_list_orders_async(const char *status, const char *product_id,
   return(kraken_open_orders_async(kr_exch_orders_done_adapter, fwd));
 }
 
-static bool
+static async_rc_t
 kr_exch_list_fills_async(const char *order_id, const char *product_id,
     int64_t start_ms, exchange_done_fills_cb_t cb, void *user)
 {
@@ -783,7 +783,7 @@ kr_exch_list_fills_async(const char *order_id, const char *product_id,
   int64_t              start_sec;
 
   if(cb == NULL)
-    return(FAIL);
+    return(ASYNC_FAILED_UNDELIVERED);
 
   fwd           = kr_fwd_new(KR_FWD_FILLS, user);
   fwd->cb.fills = cb;
@@ -794,13 +794,13 @@ kr_exch_list_fills_async(const char *order_id, const char *product_id,
         kr_exch_fills_done_adapter, fwd));
 }
 
-static bool
+static async_rc_t
 kr_exch_get_accounts_async(exchange_done_accounts_cb_t cb, void *user)
 {
   kr_exch_fwd_t          *fwd;
 
   if(cb == NULL)
-    return(FAIL);
+    return(ASYNC_FAILED_UNDELIVERED);
 
   fwd              = kr_fwd_new(KR_FWD_ACCOUNTS, user);
   fwd->cb.accounts = cb;
@@ -808,7 +808,7 @@ kr_exch_get_accounts_async(exchange_done_accounts_cb_t cb, void *user)
   return(kraken_get_balance_async(kr_exch_accounts_done_adapter, fwd));
 }
 
-static bool
+static async_rc_t
 kr_exch_fetch_candles_async(const char *product_id,
     exchange_granularity_t gran, int64_t since_ms, int64_t until_ms,
     exchange_done_candles_cb_t cb, void *user)
@@ -818,18 +818,18 @@ kr_exch_fetch_candles_async(const char *product_id,
   int64_t                since_sec;
 
   if(cb == NULL)
-    return(FAIL);
+    return(ASYNC_FAILED_UNDELIVERED);
 
   if(product_id == NULL || product_id[0] == '\0')
   {
     kr_exch_fail_candles(cb, user, "product_id required");
-    return(FAIL);
+    return(ASYNC_FAILED_DELIVERED);
   }
 
   if(kr_exch_map_granularity(gran, &interval_min) != SUCCESS)
   {
     kr_exch_fail_candles(cb, user, "unsupported granularity for Kraken");
-    return(FAIL);
+    return(ASYNC_FAILED_DELIVERED);
   }
 
   fwd             = kr_fwd_new(KR_FWD_CANDLES, user);
@@ -838,16 +838,12 @@ kr_exch_fetch_candles_async(const char *product_id,
 
   since_sec = (since_ms > 0) ? (since_ms / 1000) : 0;
 
-  if(kraken_fetch_candles_async(product_id, interval_min, since_sec,
+  // `fwd` belongs to the typed wrapper from here, so its verdict on
+  // delivery is this adapter's verdict too — pass it through rather
+  // than restating it.
+  return(kraken_fetch_candles_async(product_id, interval_min, since_sec,
         EXCHANGE_PRIO_MARKET_BACKFILL,
-        kr_exch_candles_done_adapter, fwd) != SUCCESS)
-  {
-    // kraken_fetch_candles_async fires the typed cb synchronously on
-    // FAIL; the adapter has already freed `fwd`.
-    return(FAIL);
-  }
-
-  return(SUCCESS);
+        kr_exch_candles_done_adapter, fwd));
 }
 
 // ------------------------------------------------------------------ //
@@ -1150,14 +1146,14 @@ kr_exch_tickers_resp(int http_status, const char *body, size_t body_len,
   json_object_put(root);
 }
 
-static bool
+static async_rc_t
 kr_exch_fetch_all_tickers_async(exchange_done_tickers_cb_t cb, void *user)
 {
   kr_exch_fwd_t *fwd;
   kr_exch_fwd_t  dead;
 
   if(cb == NULL)
-    return(FAIL);
+    return(ASYNC_FAILED_UNDELIVERED);
 
   fwd             = kr_fwd_new(KR_FWD_TICKERS, user);
   fwd->cb.tickers = cb;
@@ -1170,10 +1166,10 @@ kr_exch_fetch_all_tickers_async(exchange_done_tickers_cb_t cb, void *user)
     kr_fwd_retire(fwd, &dead);
     cb(false, "failed to submit Kraken Ticker request",
         NULL, 0, user);
-    return(FAIL);
+    return(ASYNC_FAILED_DELIVERED);
   }
 
-  return(SUCCESS);
+  return(ASYNC_AIRBORNE);
 }
 
 // ------------------------------------------------------------------ //

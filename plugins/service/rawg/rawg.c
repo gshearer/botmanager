@@ -713,7 +713,7 @@ rawg_configured(void)
   return(tok != NULL && tok[0] != '\0');
 }
 
-bool
+async_rc_t
 rawg_search_async(const char *query, rawg_search_cb_t cb, void *user)
 {
   const char     *tok;
@@ -724,22 +724,22 @@ rawg_search_async(const char *query, rawg_search_cb_t cb, void *user)
   rawg_req_t     *req;
 
   if(cb == NULL || query == NULL || query[0] == '\0')
-    return(FAIL);
+    return(ASYNC_FAILED_UNDELIVERED);
 
   tok = kv_get_creds("plugin.rawg.creds.apikey");
 
   if(tok == NULL || tok[0] == '\0')
-    return(FAIL);
+    return(ASYNC_FAILED_UNDELIVERED);
 
   if(rawg_urlencode(query, enc, sizeof(enc)) >= sizeof(enc))
-    return(FAIL);
+    return(ASYNC_FAILED_UNDELIVERED);
 
   need = snprintf(url, sizeof(url),
       "%s/games?search=%s&search_precise=true&page_size=%u&key=%s",
       RAWG_API_BASE, enc, rawg_page_size(), tok);
 
   if(need < 0 || (size_t)need >= sizeof(url))
-    return(FAIL);
+    return(ASYNC_FAILED_UNDELIVERED);
 
   req = mem_alloc(RAWG_CTX, "req", sizeof(*req));
   memset(req, 0, sizeof(*req));
@@ -752,7 +752,7 @@ rawg_search_async(const char *query, rawg_search_cb_t cb, void *user)
   if(cr == NULL)
   {
     mem_free(req);
-    return(FAIL);
+    return(ASYNC_FAILED_UNDELIVERED);
   }
 
   rawg_apply_opts(cr);
@@ -760,13 +760,13 @@ rawg_search_async(const char *query, rawg_search_cb_t cb, void *user)
   if(curl_request_submit(cr) != SUCCESS)
   {
     mem_free(req);
-    return(FAIL);
+    return(ASYNC_FAILED_UNDELIVERED);
   }
 
-  return(SUCCESS);
+  return(ASYNC_AIRBORNE);
 }
 
-bool
+async_rc_t
 rawg_game_async(int32_t id, rawg_game_cb_t cb, void *user)
 {
   const char     *tok;
@@ -779,12 +779,12 @@ rawg_game_async(int32_t id, rawg_game_cb_t cb, void *user)
   rawg_req_t     *req;
 
   if(cb == NULL || id <= 0)
-    return(FAIL);
+    return(ASYNC_FAILED_UNDELIVERED);
 
   tok = kv_get_creds("plugin.rawg.creds.apikey");
 
   if(tok == NULL || tok[0] == '\0')
-    return(FAIL);
+    return(ASYNC_FAILED_UNDELIVERED);
 
   ttl = (uint32_t)kv_get_uint("plugin.rawg.cache_ttl");
   now = time(NULL);
@@ -797,14 +797,14 @@ rawg_game_async(int32_t id, rawg_game_cb_t cb, void *user)
     res.status = RAWG_OK;
     res.game   = cached_v;
     cb(&res, user);
-    return(SUCCESS);
+    return(ASYNC_AIRBORNE);
   }
 
   need = snprintf(url, sizeof(url), "%s/games/%d?key=%s",
       RAWG_API_BASE, id, tok);
 
   if(need < 0 || (size_t)need >= sizeof(url))
-    return(FAIL);
+    return(ASYNC_FAILED_UNDELIVERED);
 
   req = mem_alloc(RAWG_CTX, "req", sizeof(*req));
   memset(req, 0, sizeof(*req));
@@ -818,7 +818,7 @@ rawg_game_async(int32_t id, rawg_game_cb_t cb, void *user)
   if(cr == NULL)
   {
     mem_free(req);
-    return(FAIL);
+    return(ASYNC_FAILED_UNDELIVERED);
   }
 
   rawg_apply_opts(cr);
@@ -826,13 +826,13 @@ rawg_game_async(int32_t id, rawg_game_cb_t cb, void *user)
   if(curl_request_submit(cr) != SUCCESS)
   {
     mem_free(req);
-    return(FAIL);
+    return(ASYNC_FAILED_UNDELIVERED);
   }
 
-  return(SUCCESS);
+  return(ASYNC_AIRBORNE);
 }
 
-bool
+async_rc_t
 rawg_list_async(rawg_list_kind_t kind, int32_t year, rawg_search_cb_t cb,
     void *user)
 {
@@ -853,12 +853,12 @@ rawg_list_async(rawg_list_kind_t kind, int32_t year, rawg_search_cb_t cb,
   rawg_req_t     *req;
 
   if(cb == NULL)
-    return(FAIL);
+    return(ASYNC_FAILED_UNDELIVERED);
 
   tok = kv_get_creds("plugin.rawg.creds.apikey");
 
   if(tok == NULL || tok[0] == '\0')
-    return(FAIL);
+    return(ASYNC_FAILED_UNDELIVERED);
 
   switch(kind)
   {
@@ -896,7 +896,7 @@ rawg_list_async(rawg_list_kind_t kind, int32_t year, rawg_search_cb_t cb,
     res.hits   = n > 0 ? hits : NULL;
     res.n      = n;
     cb(&res, user);
-    return(SUCCESS);
+    return(ASYNC_AIRBORNE);
   }
 
   rawg_list_dates(kind, year, dates, sizeof(dates));
@@ -911,7 +911,7 @@ rawg_list_async(rawg_list_kind_t kind, int32_t year, rawg_search_cb_t cb,
       RAWG_API_BASE, ord, dates_clause, extra, rawg_page_size(), tok);
 
   if(need < 0 || (size_t)need >= sizeof(url))
-    return(FAIL);
+    return(ASYNC_FAILED_UNDELIVERED);
 
   req = mem_alloc(RAWG_CTX, "req", sizeof(*req));
   memset(req, 0, sizeof(*req));
@@ -925,7 +925,7 @@ rawg_list_async(rawg_list_kind_t kind, int32_t year, rawg_search_cb_t cb,
   if(cr == NULL)
   {
     mem_free(req);
-    return(FAIL);
+    return(ASYNC_FAILED_UNDELIVERED);
   }
 
   rawg_apply_opts(cr);
@@ -933,10 +933,10 @@ rawg_list_async(rawg_list_kind_t kind, int32_t year, rawg_search_cb_t cb,
   if(curl_request_submit(cr) != SUCCESS)
   {
     mem_free(req);
-    return(FAIL);
+    return(ASYNC_FAILED_UNDELIVERED);
   }
 
-  return(SUCCESS);
+  return(ASYNC_AIRBORNE);
 }
 
 // ----------------------------------------------------------------------

@@ -27,6 +27,7 @@
 #include <stddef.h>
 #include <stdint.h>
 
+#include "async.h"
 #include "common.h"  // SUCCESS/FAIL
 
 // The plugin's name, and so both its dlsym handle and the root of its
@@ -158,10 +159,10 @@ typedef void (*rawg_game_cb_t)(const rawg_game_res_t *, void *user);
 // Real function declarations — visible only inside the rawg plugin (where
 // RAWG_INTERNAL is defined). External consumers go through the shims.
 //
-// Every async call obeys the same ownership contract: it returns FAIL
-// *before* firing the callback (bad args, no key, transport refusal) —
-// the caller still owns `user`; or it returns SUCCESS and fires the
-// callback exactly once (the callback then owns `user`).
+// Every async call here returns ASYNC_AIRBORNE or
+// ASYNC_FAILED_UNDELIVERED and never ASYNC_FAILED_DELIVERED — a
+// refusal (bad args, no key, transport refusal) always leaves `user`
+// yours. See include/async.h for what the values oblige you to do.
 // ----------------------------------------------------------------------
 
 #ifdef RAWG_INTERNAL
@@ -170,40 +171,31 @@ typedef void (*rawg_game_cb_t)(const rawg_game_res_t *, void *user);
 bool rawg_configured(void);
 
 // ----------------------------------------------------------------------
-// Async failure contract — all three below (PLUGIN.md §Async failure
-// semantics, which MUSTs this be stated and MUSTs you not guess it).
+// All three below return only ASYNC_AIRBORNE or
+// ASYNC_FAILED_UNDELIVERED. The undelivered causes are all pre-flight:
+// NULL/empty argument, no API key configured, URL overflow, or the curl
+// request could not be created or submitted.
 //
-// rawg is in the "FAIL ⇒ the callback did NOT fire" row, opposite the
-// exchange drivers. For every `*_async` here:
-//
-//   FAIL    — nothing was dispatched and your callback will never run.
-//             **You still own your closure: free it, and answer the
-//             user yourself.** Causes are all pre-flight: NULL/empty
-//             argument, no API key configured, URL overflow, or the
-//             curl request could not be created or submitted.
-//   SUCCESS — the callback runs exactly once. Usually later, on the
-//             curl worker.
-//
-// ⚠ But two of them can run it **synchronously, before this call
-// returns** — a warm cache is answered in place (`rawg_game_async`,
+// ⚠ ASYNC_AIRBORNE does not mean "later". Two of them answer a warm
+// cache **in place, before this call returns** (`rawg_game_async`,
 // `rawg_list_async`; `rawg_search_async` has no cache and is always
-// deferred). SUCCESS therefore does NOT mean "later", and a caller
-// holding a lock across the call can re-enter itself through its own
-// callback. Take that seriously or call from a task worker.
+// deferred), so a caller holding a lock across the call can re-enter
+// itself through its own callback. Take that seriously or call from a
+// task worker.
 // ----------------------------------------------------------------------
 
-// Free-text search over the games catalogue. No cache: on SUCCESS the
-// callback always runs later, on the curl worker.
-bool rawg_search_async(const char *query, rawg_search_cb_t cb, void *user);
+// Free-text search over the games catalogue. No cache: the callback
+// always runs later, on the curl worker.
+async_rc_t rawg_search_async(const char *query, rawg_search_cb_t cb, void *user);
 
-// Full detail for one game by numeric id. ⚠ Cached: on SUCCESS the
-// callback may already have run, inside this call.
-bool rawg_game_async(int32_t id, rawg_game_cb_t cb, void *user);
+// Full detail for one game by numeric id. ⚠ Cached: the callback may
+// already have run, inside this call.
+async_rc_t rawg_game_async(int32_t id, rawg_game_cb_t cb, void *user);
 
 // A ranked list. `year` == 0 uses the kind's default date window; a
-// positive year windows to that whole calendar year. ⚠ Cached: on
-// SUCCESS the callback may already have run, inside this call.
-bool rawg_list_async(rawg_list_kind_t kind, int32_t year,
+// positive year windows to that whole calendar year. ⚠ Cached: the
+// callback may already have run, inside this call.
+async_rc_t rawg_list_async(rawg_list_kind_t kind, int32_t year,
     rawg_search_cb_t cb, void *user);
 
 #endif // RAWG_INTERNAL
@@ -242,10 +234,10 @@ rawg_configured(void)
   return(fn());
 }
 
-static inline bool
+static inline async_rc_t
 rawg_search_async(const char *query, rawg_search_cb_t cb, void *user)
 {
-  typedef bool (*fn_t)(const char *, rawg_search_cb_t, void *);
+  typedef async_rc_t (*fn_t)(const char *, rawg_search_cb_t, void *);
   static fn_t cached = NULL;
   fn_t        fn     = __atomic_load_n(&cached, __ATOMIC_ACQUIRE);
 
@@ -266,10 +258,10 @@ rawg_search_async(const char *query, rawg_search_cb_t cb, void *user)
   return(fn(query, cb, user));
 }
 
-static inline bool
+static inline async_rc_t
 rawg_game_async(int32_t id, rawg_game_cb_t cb, void *user)
 {
-  typedef bool (*fn_t)(int32_t, rawg_game_cb_t, void *);
+  typedef async_rc_t (*fn_t)(int32_t, rawg_game_cb_t, void *);
   static fn_t cached = NULL;
   fn_t        fn     = __atomic_load_n(&cached, __ATOMIC_ACQUIRE);
 
@@ -289,11 +281,11 @@ rawg_game_async(int32_t id, rawg_game_cb_t cb, void *user)
   return(fn(id, cb, user));
 }
 
-static inline bool
+static inline async_rc_t
 rawg_list_async(rawg_list_kind_t kind, int32_t year,
     rawg_search_cb_t cb, void *user)
 {
-  typedef bool (*fn_t)(rawg_list_kind_t, int32_t, rawg_search_cb_t, void *);
+  typedef async_rc_t (*fn_t)(rawg_list_kind_t, int32_t, rawg_search_cb_t, void *);
   static fn_t cached = NULL;
   fn_t        fn     = __atomic_load_n(&cached, __ATOMIC_ACQUIRE);
 

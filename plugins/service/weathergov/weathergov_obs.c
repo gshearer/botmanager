@@ -404,7 +404,7 @@ wxg_stations_done(const curl_response_t *resp)
 // Public mechanism API
 // ----------------------------------------------------------------------
 
-bool
+async_rc_t
 weathergov_current_async(const weathergov_point_t *pt, const char *units,
     weathergov_current_cb_t cb, void *user)
 {
@@ -413,7 +413,7 @@ weathergov_current_async(const weathergov_point_t *pt, const char *units,
   bool           warm;
 
   if(cb == NULL || pt == NULL || !weathergov_enabled())
-    return(FAIL);
+    return(ASYNC_FAILED_UNDELIVERED);
 
   if(units == NULL || strcmp(units, "si") != 0)
     units = "us";
@@ -444,10 +444,10 @@ weathergov_current_async(const weathergov_point_t *pt, const char *units,
     if(wxg_obs_submit(r) != SUCCESS)
     {
       wxg_req_release(r);
-      return(FAIL);
+      return(ASYNC_FAILED_UNDELIVERED);
     }
 
-    return(SUCCESS);
+    return(ASYNC_AIRBORNE);
   }
 
   snprintf(url, sizeof(url), "%s/%s/stations", WXG_GRID_URL, r->grid);
@@ -455,8 +455,8 @@ weathergov_current_async(const weathergov_point_t *pt, const char *units,
   if(wxg_http_get(url, r->ua, wxg_stations_done, r) != SUCCESS)
   {
     wxg_req_release(r);
-    return(FAIL);
+    return(ASYNC_FAILED_UNDELIVERED);
   }
 
-  return(SUCCESS);
+  return(ASYNC_AIRBORNE);
 }

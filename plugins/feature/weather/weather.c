@@ -301,14 +301,14 @@ weather_point_done(const weathergov_point_result_t *res, void *user)
 
   r->point = res->point;
 
-  // A FAIL means the callback did NOT fire, so the request is still ours
-  // to hand on to openweather — never a reply and never a free.
+  // Only ASYNC_FAILED_UNDELIVERED leaves the request ours to hand on to
+  // openweather — never a reply and never a free.
   if(r->kind == WEATHER_REQ_CURRENT)
     submitted = (weathergov_current_async(&res->point, units,
-        weather_current_done, r) == SUCCESS);
+        weather_current_done, r) != ASYNC_FAILED_UNDELIVERED);
   else
     submitted = (weathergov_forecast_async(&res->point, units,
-        weather_forecast_done, r) == SUCCESS);
+        weather_forecast_done, r) != ASYNC_FAILED_UNDELIVERED);
 
   if(submitted)
     return;
@@ -362,7 +362,7 @@ weather_alerts_done(const weathergov_alert_result_t *res, void *user)
       || r->kind == WEATHER_REQ_CURRENT))
   {
     if(weathergov_point_async(r->loc.lat, r->loc.lon,
-        weather_point_done, r) == SUCCESS)
+        weather_point_done, r) != ASYNC_FAILED_UNDELIVERED)
       return;
 
     clam(CLAM_DEBUG, WEATHER_CTX, "route %s: weathergov refused the point "
@@ -439,7 +439,7 @@ weather_cmd_weather(const cmd_ctx_t *ctx)
     // A FAIL here means the callback did NOT fire, so the request is
     // still ours to hand on — never a reply and never a free.
     if(weathergov_alerts_async(loc.lat, loc.lon,
-        weather_alerts_done, r) == SUCCESS)
+        weather_alerts_done, r) != ASYNC_FAILED_UNDELIVERED)
       return;
 
     clam(CLAM_DEBUG, WEATHER_CTX, "route %s: weathergov refused the alerts "

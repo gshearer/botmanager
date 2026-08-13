@@ -469,13 +469,11 @@ wm_market_engine_real_submit_locked(whenmoon_market_t *mk,
   }
 
   if(exchange_place_order_async(mk->exchange_name, &req,
-        wm_live_market_order_done, ctx) != SUCCESS)
+        wm_live_market_order_done, ctx) != ASYNC_AIRBORNE)
   {
-    // exchange_place_order_async fires the done_cb synchronously with
-    // res->err set when it returns FAIL. The done_cb has already
-    // reaped the pending row + freed ctx by the time we get here.
+    // The done_cb has already reaped the pending row and freed ctx.
     // Do NOT touch state.
-    ERRSET("exchange_place_order_async returned FAIL"
+    ERRSET("exchange_place_order_async refused the submit"
         " (done_cb already fired)");
     return(FAIL);
   }
@@ -1270,13 +1268,10 @@ wm_live_fills_poll_tick(task_t *t)
     snprintf(ctx->product_id, sizeof(ctx->product_id), "%s",
         mkts->arr[i]->product_id);
 
-    if(exchange_list_fills_async(ctx->exchange_name, NULL,
-           ctx->product_id, cursor_ms,
-           wm_live_on_fills, ctx) != SUCCESS)
-    {
-      // wm_live_on_fills already invoked synchronously with res->err
-      // set on FAIL; ctx already freed.
-    }
+    // Nothing to check: a refusal is ASYNC_FAILED_DELIVERED, so
+    // wm_live_on_fills has already run with res->err set and freed ctx.
+    (void)exchange_list_fills_async(ctx->exchange_name, NULL,
+        ctx->product_id, cursor_ms, wm_live_on_fills, ctx);
   }
 
   pthread_rwlock_unlock(&mkts->arr_lock);
@@ -1420,7 +1415,7 @@ wm_live_engine_start(void)
 
     if(exchange_list_orders_async(names[i], "OPEN", NULL,
            wm_live_boot_reconcile_cb,
-           wm_live_reconcile_names[i]) != SUCCESS)
+           wm_live_reconcile_names[i]) != ASYNC_AIRBORNE)
       clam(CLAM_DEBUG, WM_LIVE_CTX,
           "boot reconcile submit failed (%s)", names[i]);
   }

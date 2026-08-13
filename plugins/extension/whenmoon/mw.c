@@ -1397,7 +1397,7 @@ mw_periodic_cb(task_t *t)
 
   if(dispatch
       && exchange_fetch_all_tickers_async(ex->name,
-            mw_tickers_done_cb, ex) != SUCCESS)
+            mw_tickers_done_cb, ex) != ASYNC_AIRBORNE)
     clam(CLAM_WARN, MW_CTX, "%s: dispatch FAIL", ex->name);
 
   t->state = TASK_ENDED;   // periodic — "iteration done, reschedule"

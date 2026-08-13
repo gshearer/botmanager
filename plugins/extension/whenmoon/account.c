@@ -213,7 +213,7 @@ wm_account_tick(task_t *t)
   }
 
   if(exchange_get_accounts_async(slot->exchange_name,
-        wm_account_on_accounts, ctx) != SUCCESS)
+        wm_account_on_accounts, ctx) != ASYNC_AIRBORNE)
   {
     // exchange_get_accounts_async fires the typed cb synchronously with
     // err set on FAIL; the cb has already freed ctx. Do not touch.
@@ -280,7 +280,7 @@ wm_account_fast_forward(const char *exchange_name)
     return;
 
   if(exchange_get_accounts_async(exchange_name,
-        wm_account_on_accounts, ctx) != SUCCESS)
+        wm_account_on_accounts, ctx) != ASYNC_AIRBORNE)
     clam(CLAM_INFO, WHENMOON_CTX,
         "account fast-forward submit failed (exchange=%s)",
         exchange_name);
@@ -446,7 +446,7 @@ wm_account_start(whenmoon_state_t *st)
 
       if(ctx != NULL
           && exchange_get_accounts_async(slot->exchange_name,
-                wm_account_on_accounts, ctx) != SUCCESS)
+                wm_account_on_accounts, ctx) != ASYNC_AIRBORNE)
         clam(CLAM_INFO, WHENMOON_CTX,
             "initial account fetch submit failed (exchange=%s)",
             slot->exchange_name);

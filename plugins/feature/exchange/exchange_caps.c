@@ -261,7 +261,7 @@ exchange_name_list(char (*out_arr)[EXCHANGE_NAME_SZ], uint32_t out_cap,
 // Async dispatch verbs                                                //
 // ------------------------------------------------------------------ //
 
-bool
+async_rc_t
 exchange_place_order_async(const char *name,
     const exchange_place_order_req_t *req,
     exchange_done_order_cb_t cb, void *user)
@@ -270,12 +270,12 @@ exchange_place_order_async(const char *name,
   char        err[EXCHANGE_ERR_SZ];
 
   if(req == NULL || cb == NULL)
-    return(FAIL);
+    return(ASYNC_FAILED_UNDELIVERED);
 
   if(resolve_authed(name, &e, err, sizeof(err)) != SUCCESS)
   {
     fail_order_cb(cb, user, err);
-    return(FAIL);
+    return(ASYNC_FAILED_DELIVERED);
   }
 
   if(e->vt->place_order_async == NULL)
@@ -283,20 +283,13 @@ exchange_place_order_async(const char *name,
     snprintf(err, sizeof(err),
         "%s: place_order not supported", name);
     fail_order_cb(cb, user, err);
-    return(FAIL);
+    return(ASYNC_FAILED_DELIVERED);
   }
 
-  if(e->vt->place_order_async(req, cb, user) != SUCCESS)
-  {
-    // Hook fired its own typed cb with err on FAIL — do not double-
-    // fire here.
-    return(FAIL);
-  }
-
-  return(SUCCESS);
+  return(e->vt->place_order_async(req, cb, user));
 }
 
-bool
+async_rc_t
 exchange_cancel_order_async(const char *name, const char *order_id,
     exchange_done_order_cb_t cb, void *user)
 {
@@ -304,18 +297,18 @@ exchange_cancel_order_async(const char *name, const char *order_id,
   char        err[EXCHANGE_ERR_SZ];
 
   if(cb == NULL)
-    return(FAIL);
+    return(ASYNC_FAILED_UNDELIVERED);
 
   if(order_id == NULL || order_id[0] == '\0')
   {
     fail_order_cb(cb, user, "order_id required");
-    return(FAIL);
+    return(ASYNC_FAILED_DELIVERED);
   }
 
   if(resolve_authed(name, &e, err, sizeof(err)) != SUCCESS)
   {
     fail_order_cb(cb, user, err);
-    return(FAIL);
+    return(ASYNC_FAILED_DELIVERED);
   }
 
   if(e->vt->cancel_order_async == NULL)
@@ -323,16 +316,13 @@ exchange_cancel_order_async(const char *name, const char *order_id,
     snprintf(err, sizeof(err),
         "%s: cancel_order not supported", name);
     fail_order_cb(cb, user, err);
-    return(FAIL);
+    return(ASYNC_FAILED_DELIVERED);
   }
 
-  if(e->vt->cancel_order_async(order_id, cb, user) != SUCCESS)
-    return(FAIL);
-
-  return(SUCCESS);
+  return(e->vt->cancel_order_async(order_id, cb, user));
 }
 
-bool
+async_rc_t
 exchange_get_order_async(const char *name, const char *order_id,
     exchange_done_order_cb_t cb, void *user)
 {
@@ -340,18 +330,18 @@ exchange_get_order_async(const char *name, const char *order_id,
   char        err[EXCHANGE_ERR_SZ];
 
   if(cb == NULL)
-    return(FAIL);
+    return(ASYNC_FAILED_UNDELIVERED);
 
   if(order_id == NULL || order_id[0] == '\0')
   {
     fail_order_cb(cb, user, "order_id required");
-    return(FAIL);
+    return(ASYNC_FAILED_DELIVERED);
   }
 
   if(resolve_authed(name, &e, err, sizeof(err)) != SUCCESS)
   {
     fail_order_cb(cb, user, err);
-    return(FAIL);
+    return(ASYNC_FAILED_DELIVERED);
   }
 
   if(e->vt->get_order_async == NULL)
@@ -359,16 +349,13 @@ exchange_get_order_async(const char *name, const char *order_id,
     snprintf(err, sizeof(err),
         "%s: get_order not supported", name);
     fail_order_cb(cb, user, err);
-    return(FAIL);
+    return(ASYNC_FAILED_DELIVERED);
   }
 
-  if(e->vt->get_order_async(order_id, cb, user) != SUCCESS)
-    return(FAIL);
-
-  return(SUCCESS);
+  return(e->vt->get_order_async(order_id, cb, user));
 }
 
-bool
+async_rc_t
 exchange_list_orders_async(const char *name, const char *status,
     const char *product_id,
     exchange_done_orders_cb_t cb, void *user)
@@ -377,12 +364,12 @@ exchange_list_orders_async(const char *name, const char *status,
   char        err[EXCHANGE_ERR_SZ];
 
   if(cb == NULL)
-    return(FAIL);
+    return(ASYNC_FAILED_UNDELIVERED);
 
   if(resolve_authed(name, &e, err, sizeof(err)) != SUCCESS)
   {
     fail_orders_cb(cb, user, err);
-    return(FAIL);
+    return(ASYNC_FAILED_DELIVERED);
   }
 
   if(e->vt->list_orders_async == NULL)
@@ -390,16 +377,13 @@ exchange_list_orders_async(const char *name, const char *status,
     snprintf(err, sizeof(err),
         "%s: list_orders not supported", name);
     fail_orders_cb(cb, user, err);
-    return(FAIL);
+    return(ASYNC_FAILED_DELIVERED);
   }
 
-  if(e->vt->list_orders_async(status, product_id, cb, user) != SUCCESS)
-    return(FAIL);
-
-  return(SUCCESS);
+  return(e->vt->list_orders_async(status, product_id, cb, user));
 }
 
-bool
+async_rc_t
 exchange_list_fills_async(const char *name, const char *order_id,
     const char *product_id, int64_t start_ms,
     exchange_done_fills_cb_t cb, void *user)
@@ -408,12 +392,12 @@ exchange_list_fills_async(const char *name, const char *order_id,
   char        err[EXCHANGE_ERR_SZ];
 
   if(cb == NULL)
-    return(FAIL);
+    return(ASYNC_FAILED_UNDELIVERED);
 
   if(resolve_authed(name, &e, err, sizeof(err)) != SUCCESS)
   {
     fail_fills_cb(cb, user, err);
-    return(FAIL);
+    return(ASYNC_FAILED_DELIVERED);
   }
 
   if(e->vt->list_fills_async == NULL)
@@ -421,17 +405,14 @@ exchange_list_fills_async(const char *name, const char *order_id,
     snprintf(err, sizeof(err),
         "%s: list_fills not supported", name);
     fail_fills_cb(cb, user, err);
-    return(FAIL);
+    return(ASYNC_FAILED_DELIVERED);
   }
 
-  if(e->vt->list_fills_async(order_id, product_id, start_ms,
-        cb, user) != SUCCESS)
-    return(FAIL);
-
-  return(SUCCESS);
+  return(e->vt->list_fills_async(order_id, product_id, start_ms,
+        cb, user));
 }
 
-bool
+async_rc_t
 exchange_get_accounts_async(const char *name,
     exchange_done_accounts_cb_t cb, void *user)
 {
@@ -439,12 +420,12 @@ exchange_get_accounts_async(const char *name,
   char        err[EXCHANGE_ERR_SZ];
 
   if(cb == NULL)
-    return(FAIL);
+    return(ASYNC_FAILED_UNDELIVERED);
 
   if(resolve_authed(name, &e, err, sizeof(err)) != SUCCESS)
   {
     fail_accounts_cb(cb, user, err);
-    return(FAIL);
+    return(ASYNC_FAILED_DELIVERED);
   }
 
   if(e->vt->get_accounts_async == NULL)
@@ -452,20 +433,17 @@ exchange_get_accounts_async(const char *name,
     snprintf(err, sizeof(err),
         "%s: get_accounts not supported", name);
     fail_accounts_cb(cb, user, err);
-    return(FAIL);
+    return(ASYNC_FAILED_DELIVERED);
   }
 
-  if(e->vt->get_accounts_async(cb, user) != SUCCESS)
-    return(FAIL);
-
-  return(SUCCESS);
+  return(e->vt->get_accounts_async(cb, user));
 }
 
 // ------------------------------------------------------------------ //
 // KR-2: candle fetch (public market data — no auth gate)              //
 // ------------------------------------------------------------------ //
 
-bool
+async_rc_t
 exchange_fetch_candles_async(const char *name, const char *product_id,
     exchange_granularity_t gran, int64_t since_ms, int64_t until_ms,
     exchange_done_candles_cb_t cb, void *user)
@@ -474,18 +452,18 @@ exchange_fetch_candles_async(const char *name, const char *product_id,
   char        err[EXCHANGE_ERR_SZ];
 
   if(cb == NULL)
-    return(FAIL);
+    return(ASYNC_FAILED_UNDELIVERED);
 
   if(product_id == NULL || product_id[0] == '\0')
   {
     fail_candles_cb(cb, user, "product_id required");
-    return(FAIL);
+    return(ASYNC_FAILED_DELIVERED);
   }
 
   if(resolve_exchange(name, &e, err, sizeof(err)) != SUCCESS)
   {
     fail_candles_cb(cb, user, err);
-    return(FAIL);
+    return(ASYNC_FAILED_DELIVERED);
   }
 
   if(e->vt->fetch_candles_async == NULL)
@@ -493,21 +471,18 @@ exchange_fetch_candles_async(const char *name, const char *product_id,
     snprintf(err, sizeof(err),
         "%s: fetch_candles not supported", name);
     fail_candles_cb(cb, user, err);
-    return(FAIL);
+    return(ASYNC_FAILED_DELIVERED);
   }
 
-  if(e->vt->fetch_candles_async(product_id, gran, since_ms, until_ms,
-        cb, user) != SUCCESS)
-    return(FAIL);
-
-  return(SUCCESS);
+  return(e->vt->fetch_candles_async(product_id, gran, since_ms, until_ms,
+        cb, user));
 }
 
 // ------------------------------------------------------------------ //
 // MW-1: bulk-ticker fetch (public market data — no auth gate)         //
 // ------------------------------------------------------------------ //
 
-bool
+async_rc_t
 exchange_fetch_all_tickers_async(const char *name,
     exchange_done_tickers_cb_t cb, void *user)
 {
@@ -515,12 +490,12 @@ exchange_fetch_all_tickers_async(const char *name,
   char        err[EXCHANGE_ERR_SZ];
 
   if(cb == NULL)
-    return(FAIL);
+    return(ASYNC_FAILED_UNDELIVERED);
 
   if(resolve_exchange(name, &e, err, sizeof(err)) != SUCCESS)
   {
     fail_tickers_cb(cb, user, err);
-    return(FAIL);
+    return(ASYNC_FAILED_DELIVERED);
   }
 
   if(e->vt->fetch_all_tickers == NULL)
@@ -528,13 +503,10 @@ exchange_fetch_all_tickers_async(const char *name,
     snprintf(err, sizeof(err),
         "%s: fetch_all_tickers not supported", name);
     fail_tickers_cb(cb, user, err);
-    return(FAIL);
+    return(ASYNC_FAILED_DELIVERED);
   }
 
-  if(e->vt->fetch_all_tickers(cb, user) != SUCCESS)
-    return(FAIL);
-
-  return(SUCCESS);
+  return(e->vt->fetch_all_tickers(cb, user));
 }
 
 // ------------------------------------------------------------------ //

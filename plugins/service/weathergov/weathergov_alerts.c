@@ -649,7 +649,7 @@ wxg_alerts_done(const curl_response_t *resp)
 // Public mechanism API
 // ----------------------------------------------------------------------
 
-bool
+async_rc_t
 weathergov_alerts_async(double lat, double lon,
     weathergov_alerts_cb_t cb, void *user)
 {
@@ -657,7 +657,7 @@ weathergov_alerts_async(double lat, double lon,
   wxg_request_t *r;
 
   if(cb == NULL || !weathergov_enabled())
-    return(FAIL);
+    return(ASYNC_FAILED_UNDELIVERED);
 
   r = wxg_req_alloc();
   r->type      = WXG_REQ_ALERTS;
@@ -680,8 +680,8 @@ weathergov_alerts_async(double lat, double lon,
   if(wxg_http_get(url, r->ua, wxg_alerts_done, r) != SUCCESS)
   {
     wxg_req_release(r);
-    return(FAIL);
+    return(ASYNC_FAILED_UNDELIVERED);
   }
 
-  return(SUCCESS);
+  return(ASYNC_AIRBORNE);
 }

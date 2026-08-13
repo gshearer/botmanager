@@ -17,6 +17,7 @@
 #include <stddef.h>
 #include <stdint.h>
 
+#include "async.h"
 #include "common.h"  // SUCCESS/FAIL
 
 // Size limits used by the result structs. Fixed sizes let callers
@@ -238,21 +239,26 @@ bool coinmarketcap_listings_cache_fresh(void);
 // configured cache TTL.
 bool coinmarketcap_global_cache_fresh(void);
 
+// All three *_async below return only ASYNC_AIRBORNE or
+// ASYNC_FAILED_UNDELIVERED, never ASYNC_FAILED_DELIVERED — a refusal
+// (no API key, an unresolvable rank, curl declining the submit) leaves
+// `user` the caller's to reply on and free. The detail path's second
+// leg is the reason cmc_detail_abort() takes a `deliver` flag: once the
+// caller has returned, the callback is the only way left to reach it.
+
 // Force a refresh of the listings cache. On success, done_cb fires with
 // res->err == ""; consumer then reads via coinmarketcap_get_listings().
-// Returns FAIL if the request could not be queued (e.g. no API key); on
-// FAIL the callback is NOT invoked.
-bool coinmarketcap_fetch_listings_async(
+async_rc_t coinmarketcap_fetch_listings_async(
     coinmarketcap_done_listings_cb_t done_cb, void *user);
 
 // Fetch extended detail for a single coin by symbol (case-insensitive)
 // or rank. Exactly one of symbol or rank must be supplied (symbol != NULL
 // vs rank > 0).
-bool coinmarketcap_fetch_detail_async(const char *symbol, int32_t rank,
+async_rc_t coinmarketcap_fetch_detail_async(const char *symbol, int32_t rank,
     coinmarketcap_done_detail_cb_t done_cb, void *user);
 
 // Force a refresh of the global metrics cache.
-bool coinmarketcap_fetch_global_async(
+async_rc_t coinmarketcap_fetch_global_async(
     coinmarketcap_done_global_cb_t done_cb, void *user);
 
 // Returns the current value of plugin.coinmarketcap.default_limit.
@@ -427,11 +433,11 @@ coinmarketcap_global_cache_fresh(void)
   return(fn());
 }
 
-static inline bool
+static inline async_rc_t
 coinmarketcap_fetch_listings_async(
     coinmarketcap_done_listings_cb_t done_cb, void *user)
 {
-  typedef bool (*fn_t)(coinmarketcap_done_listings_cb_t, void *);
+  typedef async_rc_t (*fn_t)(coinmarketcap_done_listings_cb_t, void *);
   static fn_t cached = NULL;
   fn_t        fn     = __atomic_load_n(&cached, __ATOMIC_ACQUIRE);
 
@@ -453,11 +459,11 @@ coinmarketcap_fetch_listings_async(
   return(fn(done_cb, user));
 }
 
-static inline bool
+static inline async_rc_t
 coinmarketcap_fetch_detail_async(const char *symbol, int32_t rank,
     coinmarketcap_done_detail_cb_t done_cb, void *user)
 {
-  typedef bool (*fn_t)(const char *, int32_t,
+  typedef async_rc_t (*fn_t)(const char *, int32_t,
       coinmarketcap_done_detail_cb_t, void *);
   static fn_t cached = NULL;
   fn_t        fn     = __atomic_load_n(&cached, __ATOMIC_ACQUIRE);
@@ -480,11 +486,11 @@ coinmarketcap_fetch_detail_async(const char *symbol, int32_t rank,
   return(fn(symbol, rank, done_cb, user));
 }
 
-static inline bool
+static inline async_rc_t
 coinmarketcap_fetch_global_async(
     coinmarketcap_done_global_cb_t done_cb, void *user)
 {
-  typedef bool (*fn_t)(coinmarketcap_done_global_cb_t, void *);
+  typedef async_rc_t (*fn_t)(coinmarketcap_done_global_cb_t, void *);
   static fn_t cached = NULL;
   fn_t        fn     = __atomic_load_n(&cached, __ATOMIC_ACQUIRE);
 
