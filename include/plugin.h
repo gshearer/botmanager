@@ -304,9 +304,17 @@ void plugin_unmap_notify_unregister(plugin_unmap_cb_t cb);
 typedef void (*plugin_audit_emit_t)(const char *line, void *data);
 
 // Report every registration still pointing into the named plugin's
-// mapping — one emitted line per leaked reference. `emit` may be NULL
-// to count without reporting.
-// returns: number of leaked references (0 == clean).
+// mapping — one emitted line each. `emit` may be NULL to count without
+// reporting.
+//
+// The count means different things either side of teardown, and the
+// caller supplies the noun. Against a RUNNING plugin it is the
+// **worklist**: the live surface its teardown will have to account for,
+// and for a healthy plugin that is exactly what should be there.
+// Called after `deinit()` during unload it is the **verdict**, and a
+// non-zero one refuses the dlclose. Only the second is a leak — say so
+// only there (PA-4, 2026-08-13).
+// returns: number of registrations still naming the mapping.
 uint32_t plugin_audit(const char *plugin_name, plugin_audit_emit_t emit,
     void *data);
 

@@ -294,10 +294,21 @@ plugin_unload(const char *name, plugin_unload_report_t *report)
     char     offender[PLUGIN_OFFENDER_SZ];
     uint32_t residual;
 
+    // Both arms are INFO because both describe a complete teardown.
+    // Class A cleanup is core's job (PLUGIN.md §Class A): a plugin MAY
+    // release its own registrations, is never required to, and for a
+    // method plugin's per-bot instance KV releasing them is actively
+    // wrong. This line was CLAM_WARN until 2026-08-13, which made the
+    // single most common warning in the tree a report of correct
+    // behaviour — 1,739 WARN against 1,222 INFO over the log's whole
+    // life, 59% of every teardown ever performed. Do not restore it:
+    // what a reclaim count measures is how much core did, not how much
+    // the plugin got wrong. The verdict that *is* a defect is the
+    // residual refusal below, and it is already loud.
     if(reclaimed > 0)
-      clam(CLAM_WARN, "plugin_audit",
-          "'%s': deinit() left %u registration(s); core reclaimed them",
-          name, reclaimed);
+      clam(CLAM_INFO, "plugin_audit",
+          "'%s': deinit() complete; core reclaimed %u Class-A "
+          "registration(s)", name, reclaimed);
 
     else
       clam(CLAM_INFO, "plugin_audit", "'%s': deinit() complete", name);
@@ -2849,24 +2860,32 @@ plugin_audit_all_cb(const char *name, const char *version, const char *path,
     plugin_type_t type, const char *kind, plugin_state_t state, void *data)
 {
   const cmd_ctx_t *ctx = data;
-  uint32_t         leaks;
+  uint32_t         owed;
   char             line[PLUGIN_NAME_SZ + 96];
 
   (void)version; (void)path; (void)type; (void)kind; (void)state;
 
-  leaks = plugin_audit(name, NULL, NULL);
+  owed = plugin_audit(name, NULL, NULL);
 
-  snprintf(line, sizeof(line), "  %-24s %s%u" CLR_RESET " leaked "
-      "reference(s)", name, leaks > 0 ? CLR_YELLOW : CLR_GREEN, leaks);
+  snprintf(line, sizeof(line), "  %-24s %s%u" CLR_RESET " registration(s) "
+      "its teardown owes", name, owed > 0 ? CLR_YELLOW : CLR_GREEN, owed);
   cmd_reply(ctx, line);
 }
 
 // /plugin audit <name> | all — report-only; never refuses anything.
+//
+// The noun matters and it is not "leak". Against a RUNNING plugin this
+// counts its live surface — the registrations its teardown will have to
+// account for — which for a healthy plugin is exactly what should be
+// there (chat 612, whenmoon 212, measured 2026-08-12). That is the
+// worklist. "Leaked" and "residual" belong to the unload verdict alone,
+// where the count is taken AFTER deinit() and a non-zero one refuses
+// the dlclose.
 static void
 plugin_cmd_audit(const cmd_ctx_t *ctx)
 {
   const char *name = ctx->parsed->argv[0];
-  uint32_t    leaks;
+  uint32_t    owed;
   char        buf[PLUGIN_NAME_SZ + 96];
 
   if(strcmp(name, "all") == 0)
@@ -2884,18 +2903,18 @@ plugin_cmd_audit(const cmd_ctx_t *ctx)
     return;
   }
 
-  leaks = plugin_audit(name, plugin_audit_reply, (void *)ctx);
+  owed = plugin_audit(name, plugin_audit_reply, (void *)ctx);
 
-  if(leaks == 0)
+  if(owed == 0)
   {
     snprintf(buf, sizeof(buf), "%s: " CLR_GREEN "clean" CLR_RESET
-        " — no live references into its mapping", name);
+        " — teardown owes nothing", name);
     cmd_reply(ctx, buf);
     return;
   }
 
   snprintf(buf, sizeof(buf), "%s: " CLR_YELLOW "%u" CLR_RESET
-      " leaked reference(s) — listed above", name, leaks);
+      " registration(s) its teardown owes — listed above", name, owed);
   cmd_reply(ctx, buf);
 }
 
@@ -2988,11 +3007,13 @@ plugin_cmd_unload(const cmd_ctx_t *ctx)
     return;
   }
 
+  // Not yellow, and not phrased as a shortfall: Class A is core's to
+  // reclaim (PLUGIN.md §Class A), so this is accounting, not a warning.
   if(report.reclaimed > 0)
   {
     snprintf(buf, sizeof(buf), CLR_GREEN "unloaded" CLR_RESET " "
-        CLR_BOLD "%s" CLR_RESET " — its deinit() left " CLR_YELLOW "%u"
-        CLR_RESET " registration(s), reclaimed by core",
+        CLR_BOLD "%s" CLR_RESET " (teardown clean) — core reclaimed "
+        CLR_BOLD "%u" CLR_RESET " Class-A registration(s)",
         name, report.reclaimed);
     cmd_reply(ctx, buf);
     return;
