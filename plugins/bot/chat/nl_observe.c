@@ -52,32 +52,48 @@ typedef bool (*geocode_city_fn_t)(const char *, char *, size_t);
 typedef bool (*geocode_zip_fn_t)(const char *, double *, double *,
     char *, size_t);
 
+typedef struct
+{
+  geocode_city_fn_t city;
+  geocode_zip_fn_t  zip;
+} geocode_api_t;
+
 static geocode_city_fn_t  fn_geocode_city_sync;
 static geocode_zip_fn_t   fn_geocode_zip_sync;
-static bool               geocode_resolved;
 
+// Re-resolved on every call, and the caller calls through the copy it
+// is handed rather than the slot. Both halves are load-bearing:
+//
+//   * plugin_dlsym_cached stores NULL into a registered slot when the
+//     target unloads (dlsym_cache_on_plugin_unload, core/plugin.c), so
+//     a resolve-once latch here left the observer blind for the life of
+//     the daemon after a single `/plugin reload openweather` — no fact
+//     written, and the zip-first weather default plus the soul's watch
+//     both starve. A provider loaded later must start serving without
+//     a chat reload, which is exactly what soul_wx_resolve() does.
+//   * that store comes from the unload thread, so the slots are written
+//     RELEASE and read ACQUIRE, per the contract plugin_dlsym_cached
+//     states in include/plugin.h.
 static bool
-resolve_openweather_geocode(void)
+resolve_openweather_geocode(geocode_api_t *api)
 {
-  if(!geocode_resolved)
-  {
-    union { void *obj; geocode_city_fn_t fn; } uc;
-    union { void *obj; geocode_zip_fn_t  fn; } uz;
+  union { void *obj; geocode_city_fn_t fn; } uc;
+  union { void *obj; geocode_zip_fn_t  fn; } uz;
 
-    uc.obj = plugin_dlsym_cached("openweather",
-        "openweather_geocode_city_sync",
-        (void **)&fn_geocode_city_sync);
-    fn_geocode_city_sync = uc.fn;
+  uc.obj = plugin_dlsym_cached("openweather",
+      "openweather_geocode_city_sync",
+      (void **)&fn_geocode_city_sync);
+  __atomic_store_n(&fn_geocode_city_sync, uc.fn, __ATOMIC_RELEASE);
 
-    uz.obj = plugin_dlsym_cached("openweather",
-        "openweather_geocode_zip_sync",
-        (void **)&fn_geocode_zip_sync);
-    fn_geocode_zip_sync = uz.fn;
+  uz.obj = plugin_dlsym_cached("openweather",
+      "openweather_geocode_zip_sync",
+      (void **)&fn_geocode_zip_sync);
+  __atomic_store_n(&fn_geocode_zip_sync, uz.fn, __ATOMIC_RELEASE);
 
-    geocode_resolved = true;
-  }
+  api->city = __atomic_load_n(&fn_geocode_city_sync, __ATOMIC_ACQUIRE);
+  api->zip  = __atomic_load_n(&fn_geocode_zip_sync,  __ATOMIC_ACQUIRE);
 
-  return(fn_geocode_city_sync != NULL && fn_geocode_zip_sync != NULL);
+  return(api->city != NULL && api->zip != NULL);
 }
 
 // A bare 5-digit token is a US zip: the model emits them readily and
@@ -130,6 +146,7 @@ nl_observe_task(task_t *t)
   nl_observe_task_data_t *d = t->data;
   method_msg_t            synth;
   mem_dossier_fact_t      fact;
+  geocode_api_t           geo;
   char                    zip[32];
   // The canonical label is a fact-key segment, so size it as one: a name
   // that overran MEM_FACT_KEY_SZ would key a row nothing could correct.
@@ -143,7 +160,7 @@ nl_observe_task(task_t *t)
     return;
   }
 
-  if(!resolve_openweather_geocode())
+  if(!resolve_openweather_geocode(&geo))
   {
     clam(CLAM_DEBUG, OBS_CTX, "openweather not loaded; skip");
     goto done;
@@ -158,7 +175,7 @@ nl_observe_task(task_t *t)
     double lat;
     double lon;
 
-    if(fn_geocode_zip_sync(d->user_label, &lat, &lon, NULL, 0) != SUCCESS)
+    if(geo.zip(d->user_label, &lat, &lon, NULL, 0) != SUCCESS)
     {
       clam(CLAM_DEBUG, OBS_CTX,
           "geocode zip '%s' FAIL (no such zip)", d->user_label);
@@ -170,7 +187,7 @@ nl_observe_task(task_t *t)
   {
     zip[0] = '\0';
 
-    if(fn_geocode_city_sync(d->user_label, zip, sizeof(zip)) != SUCCESS)
+    if(geo.city(d->user_label, zip, sizeof(zip)) != SUCCESS)
     {
       clam(CLAM_DEBUG, OBS_CTX,
           "geocode '%s' FAIL (hallucinated or misspelled)",

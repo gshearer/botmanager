@@ -566,11 +566,14 @@ typedef struct
   uint8_t                   n_carriers;
 } soul_wx_uniq_t;
 
-// Tolerant resolution, the nl_observe pattern: a missing provider
-// idles the watch instead of aborting the daemon the way the
-// api-header shims would. Re-attempted while incomplete, so a
-// provider loaded later starts serving without a chat reload;
-// plugin_dlsym_cached registers each slot for unload invalidation.
+// Tolerant resolution: a missing provider idles the watch instead of
+// aborting the daemon the way the api-header shims would. Re-resolved
+// on every call — plugin_dlsym_cached NULLs a registered slot when its
+// target unloads, so a latch here would idle the watch permanently,
+// where re-resolving lets a provider loaded later start serving with
+// no chat reload. That NULL is stored by the unload thread, hence
+// RELEASE on the way in and ACQUIRE on the way out: the caller is
+// handed its own copies and calls through those, never the slots.
 typedef bool (*soul_wx_geo_city_fn_t)(const char *, char *, size_t);
 typedef bool (*soul_wx_geo_zip_fn_t)(const char *, double *, double *,
     char *, size_t);
@@ -578,13 +581,21 @@ typedef bool (*soul_wx_enabled_fn_t)(void);
 typedef bool (*soul_wx_alerts_fn_t)(double, double,
     weathergov_alerts_cb_t, void *);
 
+typedef struct
+{
+  soul_wx_geo_city_fn_t geo_city;
+  soul_wx_geo_zip_fn_t  geo_zip;
+  soul_wx_enabled_fn_t  enabled;
+  soul_wx_alerts_fn_t   alerts;
+} soul_wx_api_t;
+
 static soul_wx_geo_city_fn_t soul_wx_geo_city_fn;
 static soul_wx_geo_zip_fn_t  soul_wx_geo_zip_fn;
 static soul_wx_enabled_fn_t  soul_wx_enabled_fn;
 static soul_wx_alerts_fn_t   soul_wx_alerts_fn;
 
 static bool
-soul_wx_resolve(void)
+soul_wx_resolve(soul_wx_api_t *api)
 {
   union { void *obj; soul_wx_geo_city_fn_t fn; } uc;
   union { void *obj; soul_wx_geo_zip_fn_t  fn; } uz;
@@ -593,22 +604,27 @@ soul_wx_resolve(void)
 
   uc.obj = plugin_dlsym_cached("openweather",
       "openweather_geocode_city_sync", (void **)&soul_wx_geo_city_fn);
-  soul_wx_geo_city_fn = uc.fn;
+  __atomic_store_n(&soul_wx_geo_city_fn, uc.fn, __ATOMIC_RELEASE);
 
   uz.obj = plugin_dlsym_cached("openweather",
       "openweather_geocode_zip_sync", (void **)&soul_wx_geo_zip_fn);
-  soul_wx_geo_zip_fn = uz.fn;
+  __atomic_store_n(&soul_wx_geo_zip_fn, uz.fn, __ATOMIC_RELEASE);
 
   ue.obj = plugin_dlsym_cached("weathergov",
       "weathergov_enabled", (void **)&soul_wx_enabled_fn);
-  soul_wx_enabled_fn = ue.fn;
+  __atomic_store_n(&soul_wx_enabled_fn, ue.fn, __ATOMIC_RELEASE);
 
   ua.obj = plugin_dlsym_cached("weathergov",
       "weathergov_alerts_async", (void **)&soul_wx_alerts_fn);
-  soul_wx_alerts_fn = ua.fn;
+  __atomic_store_n(&soul_wx_alerts_fn, ua.fn, __ATOMIC_RELEASE);
 
-  return(soul_wx_geo_city_fn != NULL && soul_wx_geo_zip_fn != NULL
-      && soul_wx_enabled_fn != NULL && soul_wx_alerts_fn != NULL);
+  api->geo_city = __atomic_load_n(&soul_wx_geo_city_fn, __ATOMIC_ACQUIRE);
+  api->geo_zip  = __atomic_load_n(&soul_wx_geo_zip_fn,  __ATOMIC_ACQUIRE);
+  api->enabled  = __atomic_load_n(&soul_wx_enabled_fn,  __ATOMIC_ACQUIRE);
+  api->alerts   = __atomic_load_n(&soul_wx_alerts_fn,   __ATOMIC_ACQUIRE);
+
+  return(api->geo_city != NULL && api->geo_zip != NULL
+      && api->enabled != NULL && api->alerts != NULL);
 }
 
 static weathergov_severity_t
@@ -633,17 +649,18 @@ soul_wx_severity_floor(const char *bot_name)
 // fail one months later (cache cold, provider hiccup, place renamed).
 // A miss is a quiet skip, never an error.
 static bool
-soul_wx_geocode(const char *label, double *lat, double *lon)
+soul_wx_geocode(const soul_wx_api_t *api, const char *label,
+    double *lat, double *lon)
 {
   char zip[32];
 
   if(chatbot_label_is_zip(label))
-    return(soul_wx_geo_zip_fn(label, lat, lon, NULL, 0));
+    return(api->geo_zip(label, lat, lon, NULL, 0));
 
-  if(soul_wx_geo_city_fn(label, zip, sizeof(zip)) != SUCCESS)
+  if(api->geo_city(label, zip, sizeof(zip)) != SUCCESS)
     return(FAIL);
 
-  return(soul_wx_geo_zip_fn(zip, lat, lon, NULL, 0));
+  return(api->geo_zip(zip, lat, lon, NULL, 0));
 }
 
 // "Tue 1:45 PM" in the alert's own locality — every CAP timestamp
@@ -1117,6 +1134,7 @@ soul_chore_weather(soul_sched_t *s, uint32_t chore,
 {
   soul_wx_sweep_t *sweep;
   db_result_t     *res;
+  soul_wx_api_t    wx;
   uint32_t         rows;
   char             sql[1024];
   char             key[KV_KEY_SZ];
@@ -1130,7 +1148,7 @@ soul_chore_weather(soul_sched_t *s, uint32_t chore,
   if(kv_get_uint(key) == 0)
     return(false);
 
-  if(!soul_wx_resolve())
+  if(!soul_wx_resolve(&wx))
   {
     clam(CLAM_DEBUG, SOUL_CTX,
         "bot=%s weather watch idle (weather providers not loaded)",
@@ -1138,7 +1156,7 @@ soul_chore_weather(soul_sched_t *s, uint32_t chore,
     return(false);
   }
 
-  if(!soul_wx_enabled_fn())
+  if(!wx.enabled())
   {
     clam(CLAM_DEBUG, SOUL_CTX,
         "bot=%s weather watch idle (weathergov disabled)", s->bot_name);
@@ -1225,7 +1243,7 @@ soul_chore_weather(soul_sched_t *s, uint32_t chore,
     // Geocode on this worker (fact 9; the service's caches absorb the
     // repeats). A fact that no longer resolves is skipped quietly —
     // it was written only after a successful geocode, but facts age.
-    if(soul_wx_geocode(city, &lat, &lon) != SUCCESS)
+    if(soul_wx_geocode(&wx, city, &lat, &lon) != SUCCESS)
     {
       clam(CLAM_DEBUG, SOUL_CTX,
           "bot=%s watch geocode '%s' FAIL — skipped", s->bot_name, city);
@@ -1299,8 +1317,7 @@ soul_chore_weather(soul_sched_t *s, uint32_t chore,
   {
     soul_wx_point_t *pt = &sweep->points[p];
 
-    if(soul_wx_alerts_fn(pt->lat, pt->lon, soul_wx_fetch_cb, pt)
-        == SUCCESS)
+    if(wx.alerts(pt->lat, pt->lon, soul_wx_fetch_cb, pt) == SUCCESS)
       continue;
 
     if(__atomic_sub_fetch(&sweep->pending, 1, __ATOMIC_ACQ_REL) == 0)
