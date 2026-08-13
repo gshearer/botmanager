@@ -163,8 +163,7 @@ plugin_load(const char *path)
   // Create a plugin record.
   rec = mem_alloc("plugin", "record", sizeof(plugin_rec_t));
 
-  strncpy(rec->path, path, PLUGIN_PATH_SZ - 1);
-  rec->path[PLUGIN_PATH_SZ - 1] = '\0';
+  strlcpy(rec->path, path, PLUGIN_PATH_SZ);
   rec->handle = handle;
   rec->desc   = desc;
   rec->state  = PLUGIN_LOADED;
@@ -2065,16 +2064,11 @@ plugin_show_iter_cb(const char *name, const char *version,
 
   r = &st->rows[st->count];
 
-  strncpy(r->name, name, PLUGIN_NAME_SZ - 1);
-  r->name[PLUGIN_NAME_SZ - 1] = '\0';
-  strncpy(r->version, version, PLUGIN_VER_SZ - 1);
-  r->version[PLUGIN_VER_SZ - 1] = '\0';
-  strncpy(r->type, plugin_type_name(type), sizeof(r->type) - 1);
-  r->type[sizeof(r->type) - 1] = '\0';
-  strncpy(r->kind, kind, PLUGIN_NAME_SZ - 1);
-  r->kind[PLUGIN_NAME_SZ - 1] = '\0';
-  strncpy(r->state, plugin_state_name(state), sizeof(r->state) - 1);
-  r->state[sizeof(r->state) - 1] = '\0';
+  strlcpy(r->name, name, PLUGIN_NAME_SZ);
+  strlcpy(r->version, version, PLUGIN_VER_SZ);
+  strlcpy(r->type, plugin_type_name(type), sizeof(r->type));
+  strlcpy(r->kind, kind, PLUGIN_NAME_SZ);
+  strlcpy(r->state, plugin_state_name(state), sizeof(r->state));
 
   // Sum memory allocations whose module matches the plugin kind.
   mm = (plugin_mem_match_t){ .module = kind[0] != '\0' ? kind : name,
@@ -2282,8 +2276,7 @@ plugin_find_so_by_name(const char *dir, const char *name,
     if(desc != NULL && dlerror() == NULL
         && strcasecmp(desc->name, name) == 0)
     {
-      strncpy(out_path, path, out_sz - 1);
-      out_path[out_sz - 1] = '\0';
+      strlcpy(out_path, path, out_sz);
       found = true;
     }
 
@@ -3144,8 +3137,7 @@ plugin_load_autoload(const char *plugin_dir)
     return(0);
 
   // Work on a mutable copy for tokenization.
-  strncpy(buf, list, sizeof(buf) - 1);
-  buf[sizeof(buf) - 1] = '\0';
+  strlcpy(buf, list, sizeof(buf));
 
   for(char *tok = strtok_r(buf, ",", &saveptr); tok != NULL;
       tok = strtok_r(NULL, ",", &saveptr))

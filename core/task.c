@@ -143,8 +143,7 @@ task_create(const char *name, task_type_t type, uint8_t priority,
 {
   task_t *t = mem_alloc("task", "task", sizeof(task_t));
 
-  strncpy(t->name, name, TASK_NAME_SZ - 1);
-  t->name[TASK_NAME_SZ - 1] = '\0';
+  strlcpy(t->name, name, TASK_NAME_SZ);
   t->state       = TASK_WAITING;
   t->type        = type;
   t->kind        = TASK_ONCE;

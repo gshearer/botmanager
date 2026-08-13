@@ -81,7 +81,7 @@ method_register(const method_driver_t *drv, const char *name)
 
   inst = mem_alloc("method", "instance", sizeof(*inst));
   memset(inst, 0, sizeof(*inst));
-  strncpy(inst->name, name, METHOD_NAME_SZ - 1);
+  strlcpy(inst->name, name, METHOD_NAME_SZ);
   inst->driver = drv;
   inst->state = METHOD_ENABLED;
 
@@ -427,7 +427,7 @@ method_subscribe(method_inst_t *inst, const char *name,
   }
 
   s = sub_get();
-  strncpy(s->name, name, METHOD_SUB_NAME_SZ - 1);
+  strlcpy(s->name, name, METHOD_SUB_NAME_SZ);
   s->cb = cb;
   s->data = data;
 
@@ -757,8 +757,7 @@ method_iterate_drivers(method_driver_iter_cb_t cb, void *data)
 
     if(!dup && count < MAX_DRIVER_KINDS)
     {
-      strncpy(kinds[count], m->driver->name, METHOD_NAME_SZ - 1);
-      kinds[count][METHOD_NAME_SZ - 1] = '\0';
+      strlcpy(kinds[count], m->driver->name, METHOD_NAME_SZ);
       count++;
     }
   }
@@ -843,8 +842,7 @@ method_exit(void)
   {
     char name[METHOD_NAME_SZ];
 
-    strncpy(name, method_list->name, METHOD_NAME_SZ - 1);
-    name[METHOD_NAME_SZ - 1] = '\0';
+    strlcpy(name, method_list->name, METHOD_NAME_SZ);
     method_unregister(name);
   }
 

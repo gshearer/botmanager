@@ -128,8 +128,8 @@ mem_alloc(const char *module, const char *name, size_t sz)
   e->sz = sz;
   e->ptr = ptr;
   e->timestamp = time(NULL);
-  strncpy(e->module, module, MEM_MODULE_SZ - 1);
-  strncpy(e->name, name, MEM_NAME_SZ - 1);
+  strlcpy(e->module, module, MEM_MODULE_SZ);
+  strlcpy(e->name, name, MEM_NAME_SZ);
 
   bucket = mem_hash(ptr);
 
@@ -321,8 +321,8 @@ mem_show_agg_cb(const char *module, const char *name, size_t sz,
 
   r = &st->rows[st->count++];
 
-  strncpy(r->module, module, MEM_MODULE_SZ - 1);
-  strncpy(r->name, name, MEM_NAME_SZ - 1);
+  strlcpy(r->module, module, MEM_MODULE_SZ);
+  strlcpy(r->name, name, MEM_NAME_SZ);
   r->count = 1;
   r->total_sz = sz;
 }

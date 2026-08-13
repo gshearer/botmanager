@@ -228,24 +228,24 @@ db_init(const db_driver_t *drv)
 
   // Read credentials from bootstrap config.
   v = bconf_get("DBHOST");
-  strncpy(creds.host, v ? v : "localhost", sizeof(creds.host) - 1);
+  strlcpy(creds.host, v ? v : "localhost", sizeof(creds.host));
 
   creds.port = (uint16_t)bconf_get_int("DBPORT", 5432);
 
   v = bconf_get("DBNAME");
 
   if(v != NULL)
-    strncpy(creds.dbname, v, sizeof(creds.dbname) - 1);
+    strlcpy(creds.dbname, v, sizeof(creds.dbname));
 
   v = bconf_get("DBUSER");
 
   if(v != NULL)
-    strncpy(creds.user, v, sizeof(creds.user) - 1);
+    strlcpy(creds.user, v, sizeof(creds.user));
 
   v = bconf_get("DBPASS");
 
   if(v != NULL)
-    strncpy(creds.pass, v, sizeof(creds.pass) - 1);
+    strlcpy(creds.pass, v, sizeof(creds.pass));
 
   // Read optional pool configuration from bootstrap config.
   pmax = bconf_get_int("DBPOOL", 0);

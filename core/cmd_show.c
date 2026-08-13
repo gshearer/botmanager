@@ -102,10 +102,8 @@ show_kv_iter_cb(const char *key, kv_type_t type,
   if(gr->count >= SHOW_LIMIT)
     return;
 
-  strncpy(gr->entries[gr->count].key, key, KV_KEY_SZ - 1);
-  gr->entries[gr->count].key[KV_KEY_SZ - 1] = '\0';
-  strncpy(gr->entries[gr->count].val, val, KV_STR_SZ - 1);
-  gr->entries[gr->count].val[KV_STR_SZ - 1] = '\0';
+  strlcpy(gr->entries[gr->count].key, key, KV_KEY_SZ);
+  strlcpy(gr->entries[gr->count].val, val, KV_STR_SZ);
   gr->entries[gr->count].type = type;
   gr->count++;
 }
@@ -201,7 +199,7 @@ show_method_inst_cb(const char *name, const char *kind,
   }
 
   else
-    strncpy(uptime, "-", sizeof(uptime));
+    strlcpy(uptime, "-", sizeof(uptime));
 
   snprintf(line, sizeof(line),
       "  %-16s kind=%-12s state=%-12s in=%-6lu out=%-6lu subs=%u up=%s",

@@ -81,8 +81,7 @@ list_add(uint32_t id, const char *name, time_t created)
   userns_t *ns = mem_alloc("userns", "namespace", sizeof(userns_t));
 
   ns->id = id;
-  strncpy(ns->name, name, USERNS_NAME_SZ - 1);
-  ns->name[USERNS_NAME_SZ - 1] = '\0';
+  strlcpy(ns->name, name, USERNS_NAME_SZ);
   ns->created = created;
   ns->mfa_cache = NULL;
   ns->next = userns_list;

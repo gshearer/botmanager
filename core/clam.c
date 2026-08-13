@@ -110,7 +110,7 @@ clam(uint8_t sev, const char *context, const char *fmt, ...)
 
   memset(&m, 0, sizeof(m));
   m.sev = sev;
-  strncpy(m.context, context, CLAM_CTX_SZ - 1);
+  strlcpy(m.context, context, CLAM_CTX_SZ);
 
   va_start(ap, fmt);
   vsnprintf(m.msg, CLAM_MSG_SZ, fmt, ap);
@@ -191,11 +191,11 @@ clam_subscribe(const char *name, uint8_t sev, const char *regex,
   s->sev = sev;
   s->cb = cb;
   s->owner_pc = owner_pc;
-  strncpy(s->name, name, CLAM_SUB_NAME_SZ - 1);
+  strlcpy(s->name, name, CLAM_SUB_NAME_SZ);
 
   if(regex != NULL && regex[0] != '\0')
   {
-    strncpy(s->regex_str, regex, CLAM_REGEX_SZ - 1);
+    strlcpy(s->regex_str, regex, CLAM_REGEX_SZ);
 
     if(regcomp(&s->regex_compiled, regex, REG_EXTENDED | REG_NOSUB) == 0)
       s->has_regex = true;

@@ -824,8 +824,7 @@ ask_field_copy(char *dst, size_t dst_sz, const char *src)
   if(src == NULL)
     src = "";
 
-  strncpy(dst, src, dst_sz - 1);
-  dst[dst_sz - 1] = '\0';
+  strlcpy(dst, src, dst_sz);
 }
 
 static void

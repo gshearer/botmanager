@@ -60,8 +60,7 @@ irc_resolve_server(irc_state_t *st)
   if(v == NULL || v[0] == '\0')
     return(FAIL);
 
-  strncpy(st->host, v, IRC_HOST_SZ - 1);
-  st->host[IRC_HOST_SZ - 1] = '\0';
+  strlcpy(st->host, v, IRC_HOST_SZ);
 
   // Read port.
   snprintf(key, sizeof(key), IRC_NET_PREFIX "%s.%s.port",
@@ -117,38 +116,37 @@ irc_load_config(irc_state_t *st)
     return(FAIL);
   }
 
-  strncpy(st->network, v, IRC_NET_NAME_SZ - 1);
-  st->network[IRC_NET_NAME_SZ - 1] = '\0';
+  strlcpy(st->network, v, IRC_NET_NAME_SZ);
 
   snprintf(key, sizeof(key), "%snick", st->kv_prefix);
   v = kv_get_str(key);
 
   if(v != NULL)
-    strncpy(st->nick, v, IRC_NICK_SZ - 1);
+    strlcpy(st->nick, v, IRC_NICK_SZ);
 
   snprintf(key, sizeof(key), "%snick2", st->kv_prefix);
   v = kv_get_str(key);
 
   if(v != NULL)
-    strncpy(st->nick2, v, IRC_NICK_SZ - 1);
+    strlcpy(st->nick2, v, IRC_NICK_SZ);
 
   snprintf(key, sizeof(key), "%snick3", st->kv_prefix);
   v = kv_get_str(key);
 
   if(v != NULL)
-    strncpy(st->nick3, v, IRC_NICK_SZ - 1);
+    strlcpy(st->nick3, v, IRC_NICK_SZ);
 
   snprintf(key, sizeof(key), "%suser", st->kv_prefix);
   v = kv_get_str(key);
 
   if(v != NULL)
-    strncpy(st->user, v, IRC_NICK_SZ - 1);
+    strlcpy(st->user, v, IRC_NICK_SZ);
 
   snprintf(key, sizeof(key), "%srealname", st->kv_prefix);
   v = kv_get_str(key);
 
   if(v != NULL)
-    strncpy(st->realname, v, KV_STR_SZ - 1);
+    strlcpy(st->realname, v, KV_STR_SZ);
 
   // --- Network-level keys (irc.net.<name>.*) ---
 
@@ -156,7 +154,7 @@ irc_load_config(irc_state_t *st)
   v = kv_get_str(key);
 
   if(v != NULL)
-    strncpy(st->pass, v, KV_STR_SZ - 1);
+    strlcpy(st->pass, v, KV_STR_SZ);
 
   snprintf(key, sizeof(key), IRC_NET_PREFIX "%s.reconnect_delay",
       st->network);
@@ -350,7 +348,7 @@ irc_handle_privmsg(irc_state_t *st, const irc_parsed_msg_t *p)
   // Build message context on stack.
   memset(&msg, 0, sizeof(msg));
 
-  strncpy(msg.sender, p->nick, METHOD_SENDER_SZ - 1);
+  strlcpy(msg.sender, p->nick, METHOD_SENDER_SZ);
 
   // Determine channel: if the target is our nick, it's a DM (leave empty).
   // Extract the first word from params as the target.
@@ -393,11 +391,11 @@ irc_handle_privmsg(irc_state_t *st, const irc_parsed_msg_t *p)
   }
 
   else
-    strncpy(msg.text, body, METHOD_TEXT_SZ - 1);
+    strlcpy(msg.text, body, METHOD_TEXT_SZ);
   msg.timestamp = time(NULL);
 
   // Store full prefix in metadata for diagnostics / auth context.
-  strncpy(msg.metadata, p->prefix, METHOD_META_SZ - 1);
+  strlcpy(msg.metadata, p->prefix, METHOD_META_SZ);
 
   // Project the prefix onto the generic identity tuple consumers see.
   // Failure (malformed prefix, unsafe bytes) leaves all four fields
@@ -446,10 +444,7 @@ irc_botname_from_inst(const char *inst_name, char *out, size_t out_sz)
   }
 
   else
-  {
-    strncpy(out, inst_name, out_sz - 1);
-    out[out_sz - 1] = '\0';
-  }
+    strlcpy(out, inst_name, out_sz);
 }
 
 // Deferred task callback: check if user is still unidentified, kick if so.
@@ -800,10 +795,7 @@ irc_handle_topic332(irc_state_t *st, const irc_parsed_msg_t *pp)
   ch = irc_chan_find(st, channel);
 
   if(ch != NULL)
-  {
-    strncpy(ch->topic, p.trailing, IRC_LINE_SZ - 1);
-    ch->topic[IRC_LINE_SZ - 1] = '\0';
-  }
+    strlcpy(ch->topic, p.trailing, IRC_LINE_SZ);
 
   pthread_mutex_unlock(&st->chan_mutex);
 }
@@ -943,14 +935,10 @@ irc_handle_join(irc_state_t *st, const irc_parsed_msg_t *pp)
     delay = 30;
 
   kc = mem_alloc("irc", "kick_check", sizeof(*kc));
-  strncpy(kc->inst_name, st->inst_name, METHOD_NAME_SZ - 1);
-  kc->inst_name[METHOD_NAME_SZ - 1] = '\0';
-  strncpy(kc->channel, channel, IRC_CHAN_SZ);
-  kc->channel[IRC_CHAN_SZ] = '\0';
-  strncpy(kc->nick, p.nick, IRC_NICK_SZ - 1);
-  kc->nick[IRC_NICK_SZ - 1] = '\0';
-  strncpy(kc->host, p.host, IRC_HOST_SZ - 1);
-  kc->host[IRC_HOST_SZ - 1] = '\0';
+  strlcpy(kc->inst_name, st->inst_name, sizeof(kc->inst_name));
+  strlcpy(kc->channel, channel, sizeof(kc->channel));
+  strlcpy(kc->nick, p.nick, sizeof(kc->nick));
+  strlcpy(kc->host, p.host, sizeof(kc->host));
 
   task_add_deferred("irc-kick-unident",
       TASK_ANY, 200, delay * 1000, irc_kick_unident_task, kc);
@@ -1033,16 +1021,12 @@ irc_handle_nick(irc_state_t *st, const irc_parsed_msg_t *pp)
   // The argument arrives in a line-sized field but names a nick, and every
   // other nick this driver stores is IRC_NICK_SZ. Clamp once, here, so the
   // rename, the delivered message and the MFA all agree on the same string.
-  strncpy(new_nick, raw_nick, sizeof(new_nick) - 1);
-  new_nick[sizeof(new_nick) - 1] = '\0';
+  strlcpy(new_nick, raw_nick, sizeof(new_nick));
 
   irc_chan_rename_nick(st, p.nick, new_nick);
 
   if(strncasecmp(p.nick, st->cur_nick, IRC_NICK_SZ) == 0)
-  {
-    strncpy(st->cur_nick, new_nick, IRC_NICK_SZ - 1);
-    st->cur_nick[IRC_NICK_SZ - 1] = '\0';
-  }
+    strlcpy(st->cur_nick, new_nick, IRC_NICK_SZ);
 
   // Deliver NICK_CHANGE so dossier-aware bots can merge both identities.
   // The new identity goes in the regular nickname/username/hostname/
@@ -1050,11 +1034,11 @@ irc_handle_nick(irc_state_t *st, const irc_parsed_msg_t *pp)
   // both into the same dossier without re-running the scorer.
   memset(&nmsg, 0, sizeof(nmsg));
   nmsg.kind = METHOD_MSG_NICK_CHANGE;
-  strncpy(nmsg.sender, p.nick,    METHOD_SENDER_SZ - 1);
-  strncpy(nmsg.text,   new_nick,  METHOD_TEXT_SZ   - 1);
+  strlcpy(nmsg.sender, p.nick, METHOD_SENDER_SZ);
+  strlcpy(nmsg.text, new_nick, METHOD_TEXT_SZ);
   snprintf(nmsg.metadata, METHOD_META_SZ, "%s!%s@%s",
       new_nick, p.user, p.host);
-  strncpy(nmsg.prev_metadata, p.prefix, METHOD_META_SZ - 1);
+  strlcpy(nmsg.prev_metadata, p.prefix, METHOD_META_SZ);
 
   (void)irc_identity_fill_quad(nmsg.metadata,
       nmsg.nickname,    sizeof(nmsg.nickname),
@@ -1104,8 +1088,7 @@ irc_handle_topic(irc_state_t *st, const irc_parsed_msg_t *pp)
 
   if(ch != NULL)
   {
-    strncpy(ch->topic, new_topic, IRC_LINE_SZ - 1);
-    ch->topic[IRC_LINE_SZ - 1] = '\0';
+    strlcpy(ch->topic, new_topic, IRC_LINE_SZ);
     have_ops = ch->have_ops;
   }
 
@@ -1309,8 +1292,7 @@ irc_handle_nickinuse(irc_state_t *st, const irc_parsed_msg_t *pp)
 
   if(next != NULL)
   {
-    strncpy(st->cur_nick, next, IRC_NICK_SZ - 1);
-    st->cur_nick[IRC_NICK_SZ - 1] = '\0';
+    strlcpy(st->cur_nick, next, IRC_NICK_SZ);
     clam(CLAM_WARN, "irc", "nick in use, trying '%s'", st->cur_nick);
     irc_send_raw(st, "NICK %s", st->cur_nick);
   }
@@ -1571,23 +1553,14 @@ static void *
 irc_create(const char *inst_name)
 {
   irc_state_t *st = mem_alloc("irc", "state", sizeof(*st));
-  const char *suffix = "_irc";
-  size_t nlen = strlen(inst_name);
-  size_t slen = strlen(suffix);
   char botname[BOT_NAME_SZ] = {0};
 
   memset(st, 0, sizeof(*st));
 
-  strncpy(st->inst_name, inst_name, METHOD_NAME_SZ - 1);
+  strlcpy(st->inst_name, inst_name, sizeof(st->inst_name));
 
-  // Derive bot name from inst_name by stripping the trailing "_irc".
   // Convention: inst_name = "{botname}_irc" (set by admin_cmd_bot_bind).
-
-  if(nlen > slen &&
-      strcmp(inst_name + nlen - slen, suffix) == 0)
-    strncpy(botname, inst_name, nlen - slen);
-  else
-    strncpy(botname, inst_name, BOT_NAME_SZ - 1);
+  irc_botname_from_inst(inst_name, botname, sizeof(botname));
 
   snprintf(st->kv_prefix, sizeof(st->kv_prefix),
       "bot.%s.irc.", botname);
@@ -1759,8 +1732,7 @@ irc_get_self(void *handle, char *buf, size_t buf_sz)
   if(st->cur_nick[0] == '\0')
     return(FAIL);
 
-  strncpy(buf, st->cur_nick, buf_sz - 1);
-  buf[buf_sz - 1] = '\0';
+  strlcpy(buf, st->cur_nick, buf_sz);
   return(SUCCESS);
 }
 

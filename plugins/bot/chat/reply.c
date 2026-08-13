@@ -1614,8 +1614,7 @@ chatbot_nl_kv_collect_cb(const char *key, const kv_nl_t *nl, void *data)
   if(col->n >= CHATBOT_NL_KV_CANDIDATES) return;
   if(key == NULL || nl == NULL) return;
 
-  strncpy(col->keys[col->n], key, KV_KEY_SZ - 1);
-  col->keys[col->n][KV_KEY_SZ - 1] = '\0';
+  strlcpy(col->keys[col->n], key, KV_KEY_SZ);
   col->nls[col->n] = nl;
   col->n++;
 }
@@ -1643,14 +1642,12 @@ chatbot_nl_kv_suffix(const char *key, const char *botname,
 
     if(strncmp(key, prefix, plen) == 0)
     {
-      strncpy(out, key + plen, out_sz - 1);
-      out[out_sz - 1] = '\0';
+      strlcpy(out, key + plen, out_sz);
       return;
     }
   }
 
-  strncpy(out, key, out_sz - 1);
-  out[out_sz - 1] = '\0';
+  strlcpy(out, key, out_sz);
 }
 
 // Root-level iterator callback: record every command that declares an

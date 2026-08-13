@@ -171,16 +171,10 @@ userns_user_get_lastseen(const userns_t *ns, const char *username,
     *ts_out = (ts_str != NULL) ? (time_t)strtoll(ts_str, NULL, 10) : 0;
 
   if(method_out != NULL && method_sz > 0)
-  {
-    strncpy(method_out, meth ? meth : "", method_sz - 1);
-    method_out[method_sz - 1] = '\0';
-  }
+    strlcpy(method_out, meth ? meth : "", method_sz);
 
   if(mfa_out != NULL && mfa_sz > 0)
-  {
-    strncpy(mfa_out, mfa ? mfa : "", mfa_sz - 1);
-    mfa_out[mfa_sz - 1] = '\0';
-  }
+    strlcpy(mfa_out, mfa ? mfa : "", mfa_sz);
 
   db_result_free(r);
   return(SUCCESS);
@@ -391,16 +385,10 @@ userns_user_get_info(const userns_t *ns, const char *username,
   desc = db_result_get(r, 0, 1);
 
   if(uuid_out != NULL && uuid_sz > 0)
-  {
-    strncpy(uuid_out, uuid ? uuid : "", uuid_sz - 1);
-    uuid_out[uuid_sz - 1] = '\0';
-  }
+    strlcpy(uuid_out, uuid ? uuid : "", uuid_sz);
 
   if(desc_out != NULL && desc_sz > 0)
-  {
-    strncpy(desc_out, desc ? desc : "", desc_sz - 1);
-    desc_out[desc_sz - 1] = '\0';
-  }
+    strlcpy(desc_out, desc ? desc : "", desc_sz);
 
   db_result_free(r);
   return(SUCCESS);

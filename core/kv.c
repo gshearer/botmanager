@@ -166,8 +166,7 @@ str_to_val(kv_type_t type, const char *str, kv_val_t *val)
       return(SUCCESS);
 
     case KV_STR:
-      strncpy(val->str, str, KV_STR_SZ - 1);
-      val->str[KV_STR_SZ - 1] = '\0';
+      strlcpy(val->str, str, KV_STR_SZ);
       return(SUCCESS);
 
     case KV_BOOL:
@@ -205,8 +204,7 @@ val_to_str(kv_type_t type, const kv_val_t *val, char *buf, size_t bufsz)
     case KV_DOUBLE:  snprintf(buf, bufsz, "%.17g",  val->d);  break;
     case KV_LDOUBLE: snprintf(buf, bufsz, "%.21Lg", val->ld);  break;
     case KV_STR:
-      strncpy(buf, val->str, bufsz - 1);
-      buf[bufsz - 1] = '\0';
+      strlcpy(buf, val->str, bufsz);
       break;
     case KV_BOOL:
       snprintf(buf, bufsz, "%s", val->u8 ? "true" : "false");
@@ -352,8 +350,7 @@ kv_db_lookup_one(const char *key, int *out_type, char *out_val, size_t out_sz)
     if(db_type != NULL && db_val != NULL)
     {
       *out_type = atoi(db_type);
-      strncpy(out_val, db_val, out_sz - 1);
-      out_val[out_sz - 1] = '\0';
+      strlcpy(out_val, db_val, out_sz);
       hit = true;
     }
   }
@@ -408,8 +405,7 @@ kv_register_owned(const char *key, kv_type_t type, const char *default_val,
   // Allocate and populate entry.
   e = mem_alloc("kv", "entry", sizeof(kv_entry_t));
 
-  strncpy(e->key, key, KV_KEY_SZ - 1);
-  e->key[KV_KEY_SZ - 1] = '\0';
+  strlcpy(e->key, key, KV_KEY_SZ);
   e->type     = type;
   e->val      = val;
   e->cb       = cb;
@@ -937,10 +933,7 @@ kv_get_val_str(const char *key, char *buf, size_t bufsz)
   }
 
   if(e->secret && !kv_admin_active)
-  {
-    strncpy(buf, KV_REDACTED_VALUE, bufsz - 1);
-    buf[bufsz - 1] = '\0';
-  }
+    strlcpy(buf, KV_REDACTED_VALUE, bufsz);
 
   else
     val_to_str(e->type, &e->val, buf, bufsz);
@@ -1037,8 +1030,7 @@ kv_register_nl(const char *key, const kv_nl_t *nl)
   }
 
   r = mem_alloc("kv", "nl_reg", sizeof(kv_nl_reg_t));
-  strncpy(r->key, key, KV_KEY_SZ - 1);
-  r->key[KV_KEY_SZ - 1] = '\0';
+  strlcpy(r->key, key, KV_KEY_SZ);
   r->nl   = nl;
   r->next = kv_nl_head;
   kv_nl_head = r;
@@ -1173,10 +1165,7 @@ kv_iterate_prefix(const char *prefix, kv_iter_cb_t cb, void *data)
         char val_str[KV_VAL_BUF];
 
         if(e->secret && !kv_admin_active)
-        {
-          strncpy(val_str, KV_REDACTED_VALUE, sizeof(val_str) - 1);
-          val_str[sizeof(val_str) - 1] = '\0';
-        }
+          strlcpy(val_str, KV_REDACTED_VALUE, sizeof(val_str));
 
         else
           val_to_str(e->type, &e->val, val_str, sizeof(val_str));

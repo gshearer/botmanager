@@ -343,8 +343,7 @@ userns_mfa_match(const userns_t *ns, const char *mfa_string)
         continue;
 
       // Match found.
-      strncpy(matched_user, e->username, USERNS_USER_SZ - 1);
-      matched_user[USERNS_USER_SZ - 1] = '\0';
+      strlcpy(matched_user, e->username, USERNS_USER_SZ);
 
       pthread_rwlock_unlock(&c->lock);
       __atomic_add_fetch(&userns_stat_mfa_matches, 1, __ATOMIC_RELAXED);

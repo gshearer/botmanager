@@ -511,7 +511,7 @@ resolve_lookup(const char *name, resolve_type_t qtype,
   }
 
   req = resolve_req_alloc();
-  strncpy(req->name, name, RESOLVE_NAME_SZ - 1);
+  strlcpy(req->name, name, RESOLVE_NAME_SZ);
   req->qtype     = qtype;
   req->cb        = cb;
   req->user_data = user_data;

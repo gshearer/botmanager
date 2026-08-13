@@ -526,7 +526,7 @@ bot_create(const bot_driver_t *drv, const char *name)
 
   inst = mem_alloc("bot", "instance", sizeof(*inst));
   memset(inst, 0, sizeof(*inst));
-  strncpy(inst->name, name, BOT_NAME_SZ - 1);
+  strlcpy(inst->name, name, BOT_NAME_SZ);
   inst->driver = drv;
   inst->state = BOT_CREATED;
 
@@ -681,8 +681,7 @@ bot_destroy(const char *name)
     char saved_name[BOT_NAME_SZ];
 
     snprintf(prefix, sizeof(prefix), "bot.%s.", inst->name);
-    strncpy(saved_name, inst->name, BOT_NAME_SZ - 1);
-    saved_name[BOT_NAME_SZ - 1] = '\0';
+    strlcpy(saved_name, inst->name, BOT_NAME_SZ);
 
     pthread_mutex_unlock(&bot_mutex);
 
@@ -774,10 +773,10 @@ bot_bind_method(bot_inst_t *inst, const char *method_name,
   }
 
   bm = bm_get();
-  strncpy(bm->method_name, method_name, METHOD_NAME_SZ - 1);
+  strlcpy(bm->method_name, method_name, METHOD_NAME_SZ);
 
   if(method_kind != NULL)
-    strncpy(bm->method_kind, method_kind, PLUGIN_NAME_SZ - 1);
+    strlcpy(bm->method_kind, method_kind, PLUGIN_NAME_SZ);
 
   // Prepend to list.
   bm->next = inst->methods;
@@ -1113,8 +1112,7 @@ bot_discover_user(bot_inst_t *inst, const char *mfa_string)
   discovered[j] = '\0';
 
   // Resolve collisions with numeric suffix.
-  strncpy(candidate, discovered, USERNS_USER_SZ - 1);
-  candidate[USERNS_USER_SZ - 1] = '\0';
+  strlcpy(candidate, discovered, USERNS_USER_SZ);
 
   for(uint32_t suffix = 1;
       userns_user_exists(ns, candidate) && suffix < 1000;
@@ -1139,8 +1137,7 @@ bot_discover_user(bot_inst_t *inst, const char *mfa_string)
       "'%s': discovered user '%s' from '%s'",
       inst->name, candidate, mfa_string);
 
-  strncpy(discovered, candidate, USERNS_USER_SZ - 1);
-  discovered[USERNS_USER_SZ - 1] = '\0';
+  strlcpy(discovered, candidate, USERNS_USER_SZ);
   return(discovered);
 }
 
@@ -2173,8 +2170,7 @@ bot_restore_instances(char auto_names[][BOT_NAME_SZ],
 
       if(kv_get_uint(as_key) != 0 && *auto_count < 64)
       {
-        strncpy(auto_names[*auto_count], name, BOT_NAME_SZ - 1);
-        auto_names[*auto_count][BOT_NAME_SZ - 1] = '\0';
+        strlcpy(auto_names[*auto_count], name, BOT_NAME_SZ);
         (*auto_count)++;
       }
     }
@@ -2294,8 +2290,7 @@ bot_exit(void)
   while(bot_list != NULL)
   {
     char name[BOT_NAME_SZ];
-    strncpy(name, bot_list->name, BOT_NAME_SZ - 1);
-    name[BOT_NAME_SZ - 1] = '\0';
+    strlcpy(name, bot_list->name, BOT_NAME_SZ);
     bot_destroy(name);
   }
 

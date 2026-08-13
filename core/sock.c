@@ -986,7 +986,7 @@ sock_create(const char *name, sock_type_t type,
   s = mem_alloc("sock", "session", sizeof(*s));
   memset(s, 0, sizeof(*s));
 
-  strncpy(s->name, name ? name : "unnamed", SOCK_NAME_SZ - 1);
+  strlcpy(s->name, name ? name : "unnamed", SOCK_NAME_SZ);
   s->type    = type;
   s->state   = SOCK_STATE_CREATED;
   s->fd      = -1;
@@ -1111,7 +1111,7 @@ sock_connect(sock_session_t *session, const char *host, uint16_t port,
       return(FAIL);
     }
 
-    strncpy(session->path, path, SOCK_PATH_SZ - 1);
+    strlcpy(session->path, path, SOCK_PATH_SZ);
   }
 
   else
@@ -1122,7 +1122,7 @@ sock_connect(sock_session_t *session, const char *host, uint16_t port,
       return(FAIL);
     }
 
-    strncpy(session->host, host, SOCK_HOST_SZ - 1);
+    strlcpy(session->host, host, SOCK_HOST_SZ);
     session->port = port;
   }
 

@@ -109,14 +109,11 @@ userns_cache_populate(userns_cache_t *c, uint32_t ns_id)
 
     e = mem_alloc("userns", "mfa_cache_entry", sizeof(*e));
 
-    strncpy(e->pattern, pattern, USERNS_MFA_PATTERN_SZ - 1);
-    e->pattern[USERNS_MFA_PATTERN_SZ - 1] = '\0';
+    strlcpy(e->pattern, pattern, USERNS_MFA_PATTERN_SZ);
 
-    strncpy(e->username, username, USERNS_USER_SZ - 1);
-    e->username[USERNS_USER_SZ - 1] = '\0';
+    strlcpy(e->username, username, USERNS_USER_SZ);
 
-    strncpy(e->uuid, uuid, USERNS_UUID_SZ - 1);
-    e->uuid[USERNS_UUID_SZ - 1] = '\0';
+    strlcpy(e->uuid, uuid, USERNS_UUID_SZ);
 
     bucket = util_fnv1a_ci(pattern) % MFA_CACHE_BUCKETS;
     e->next = c->buckets[bucket];

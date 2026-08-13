@@ -535,15 +535,14 @@ wm_bt_file_open(const char *path, char *err, size_t err_cap)
   // Identity fields — mirror the heap-build's stub-market plumbing so
   // downstream renderers (clam, /show whenmoon backtest) see the same
   // shape as a heap-built snapshot. product_id is the wire form
-  // (WM_PRODUCT_ID_SZ=24); we silently truncate the canonical
-  // "<exch>-<base>-<quote>" into it via strncpy + explicit NUL to
-  // mirror the heap-build's snprintf-truncate behaviour without
-  // tripping gcc's format-truncation diagnostic.
+  // (WM_PRODUCT_ID_SZ=24); the canonical "<exch>-<base>-<quote>" is
+  // silently truncated into it, mirroring the heap-build's
+  // snprintf-truncate behaviour. The truncation is deliberate, so
+  // strlcpy's return is not tested.
   snprintf(snap->mkt.market_id_str, sizeof(snap->mkt.market_id_str),
       "%s", hdr->source_market_id);
-  strncpy(snap->mkt.product_id, hdr->source_market_id,
-      sizeof(snap->mkt.product_id) - 1u);
-  snap->mkt.product_id[sizeof(snap->mkt.product_id) - 1u] = '\0';
+  strlcpy(snap->mkt.product_id, hdr->source_market_id,
+      sizeof(snap->mkt.product_id));
   snap->mkt.market_id = -1;        // mmap'd snapshot has no DB row binding
 
   if(pthread_mutex_init(&snap->mkt.lock, NULL) != 0)

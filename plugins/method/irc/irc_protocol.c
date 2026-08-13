@@ -83,7 +83,7 @@ irc_parse_line(const char *line, irc_parsed_msg_t *out)
 
     if(end == NULL)
     {
-      strncpy(out->command, pos, sizeof(out->command) - 1);
+      strlcpy(out->command, pos, sizeof(out->command));
       return;
     }
 
@@ -114,24 +114,21 @@ irc_parse_line(const char *line, irc_parsed_msg_t *out)
       memcpy(out->params, pos, plen);
       out->params[plen] = '\0';
 
-      strncpy(out->trailing, trail + 2, IRC_LINE_SZ - 1);
-      out->trailing[IRC_LINE_SZ - 1] = '\0';
+      strlcpy(out->trailing, trail + 2, IRC_LINE_SZ);
       out->has_trailing = true;
     }
 
     else if(*pos == ':')
     {
       // No params, just trailing.
-      strncpy(out->trailing, pos + 1, IRC_LINE_SZ - 1);
-      out->trailing[IRC_LINE_SZ - 1] = '\0';
+      strlcpy(out->trailing, pos + 1, IRC_LINE_SZ);
       out->has_trailing = true;
     }
 
     else
     {
       // All remaining text is params.
-      strncpy(out->params, pos, IRC_LINE_SZ - 1);
-      out->params[IRC_LINE_SZ - 1] = '\0';
+      strlcpy(out->params, pos, IRC_LINE_SZ);
     }
   }
 }
@@ -250,8 +247,7 @@ irc_send_registration(irc_state_t *st)
   if(st->pass[0] != '\0')
     irc_send_raw(st, "PASS %s", st->pass);
 
-  strncpy(st->cur_nick, st->nick, IRC_NICK_SZ - 1);
-  st->cur_nick[IRC_NICK_SZ - 1] = '\0';
+  strlcpy(st->cur_nick, st->nick, IRC_NICK_SZ);
 
   irc_send_raw(st, "NICK %s", st->cur_nick);
   irc_send_raw(st, "USER %s 0 * :%s", st->user, st->realname);
@@ -277,7 +273,7 @@ irc_expand_vars(const char *tmpl, char *out, size_t out_sz,
   }
 
   else
-    strncpy(botname, st->inst_name, METHOD_NAME_SZ - 1);
+    strlcpy(botname, st->inst_name, METHOD_NAME_SZ);
 
   p = tmpl;
 

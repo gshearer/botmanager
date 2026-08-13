@@ -29,8 +29,7 @@ irc_chan_get(irc_state_t *st, const char *channel)
 
   ch = mem_alloc("irc", "channel", sizeof(*ch));
   memset(ch, 0, sizeof(*ch));
-  strncpy(ch->name, channel, IRC_CHAN_SZ);
-  ch->name[IRC_CHAN_SZ] = '\0';
+  strlcpy(ch->name, channel, sizeof(ch->name));
   ch->next = st->channels;
   st->channels = ch;
 
@@ -80,8 +79,7 @@ irc_chan_add_nick(irc_state_t *st, const char *channel, const char *nick)
   }
 
   m = mem_alloc("irc", "member", sizeof(*m));
-  strncpy(m->nick, nick, IRC_NICK_SZ - 1);
-  m->nick[IRC_NICK_SZ - 1] = '\0';
+  strlcpy(m->nick, nick, IRC_NICK_SZ);
   m->userhost[0] = '\0';
   m->mode_flags = 0;
   m->next = ch->members;
@@ -177,8 +175,7 @@ irc_chan_rename_nick(irc_state_t *st, const char *old_nick,
     {
       if(strcasecmp(m->nick, old_nick) == 0)
       {
-        strncpy(m->nick, new_nick, IRC_NICK_SZ - 1);
-        m->nick[IRC_NICK_SZ - 1] = '\0';
+        strlcpy(m->nick, new_nick, IRC_NICK_SZ);
         break;
       }
     }

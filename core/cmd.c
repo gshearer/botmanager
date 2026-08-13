@@ -24,7 +24,7 @@ set_get(void)
     memset(s, 0, sizeof(*s));
   }
 
-  strncpy(s->prefix, "!", CMD_PREFIX_SZ - 1);
+  strlcpy(s->prefix, "!", CMD_PREFIX_SZ);
   return(s);
 }
 
@@ -184,8 +184,7 @@ resolve_parent_path_locked(const char *path)
     return(NULL);
 
   // Copy path so we can tokenize on '/'.
-  strncpy(buf, path, sizeof(buf) - 1);
-  buf[sizeof(buf) - 1] = '\0';
+  strlcpy(buf, path, sizeof(buf));
 
   // First segment: root-level lookup.
   tok = buf;
@@ -310,18 +309,18 @@ reg_populate_def(const char *module, const char *name,
   memset(d, 0, sizeof(*d));
 
   if(module != NULL)
-    strncpy(d->module, module, CMD_MODULE_SZ - 1);
+    strlcpy(d->module, module, CMD_MODULE_SZ);
 
-  strncpy(d->name, name, CMD_NAME_SZ - 1);
+  strlcpy(d->name, name, CMD_NAME_SZ);
 
   if(abbrev != NULL && abbrev[0] != '\0')
-    strncpy(d->abbrev, abbrev, CMD_NAME_SZ - 1);
+    strlcpy(d->abbrev, abbrev, CMD_NAME_SZ);
 
   d->usage       = usage;
   d->description = description;
   d->help_long   = help_long;
 
-  strncpy(d->group, group, USERNS_GROUP_SZ - 1);
+  strlcpy(d->group, group, USERNS_GROUP_SZ);
   d->level   = level;
   d->scope   = scope;
   d->cb      = cb;
@@ -849,8 +848,7 @@ cmd_set_prefix(bot_inst_t *inst, const char *prefix)
   pthread_mutex_lock(&cmd_mutex);
 
   s = set_ensure_locked(inst);
-  strncpy(s->prefix, prefix, CMD_PREFIX_SZ - 1);
-  s->prefix[CMD_PREFIX_SZ - 1] = '\0';
+  strlcpy(s->prefix, prefix, CMD_PREFIX_SZ);
 
   pthread_mutex_unlock(&cmd_mutex);
 
@@ -1050,16 +1048,12 @@ cmd_parse_args(const char *args, const cmd_arg_desc_t *desc,
         else
         {
           // No closing quote — treat entire remainder literally.
-          strncpy(bufs[i], p, CMD_ARG_SZ - 1);
-          bufs[i][CMD_ARG_SZ - 1] = '\0';
+          strlcpy(bufs[i], p, CMD_ARG_SZ);
         }
       }
 
       else
-      {
-        strncpy(bufs[i], p, CMD_ARG_SZ - 1);
-        bufs[i][CMD_ARG_SZ - 1] = '\0';
-      }
+        strlcpy(bufs[i], p, CMD_ARG_SZ);
 
       parsed->argv[i] = bufs[i];
       parsed->argc = i + 1;
@@ -1550,7 +1544,7 @@ cmd_dispatch(bot_inst_t *inst, const method_msg_t *msg)
   td->cb_data = cb_data;
   td->bot = inst;
   memcpy(&td->msg, msg, sizeof(method_msg_t));
-  strncpy(td->args, args, METHOD_TEXT_SZ - 1);
+  strlcpy(td->args, args, METHOD_TEXT_SZ);
 
   // td is zeroed above, so copying just the characters terminates the
   // field for free — and skips strncpy's zero-fill of the whole buffer
@@ -2482,7 +2476,7 @@ cmd_dispatch_resolved(bot_inst_t *inst, const method_msg_t *msg,
   memcpy(&td->msg, msg, sizeof(method_msg_t));
 
   if(args != NULL)
-    strncpy(td->args, args, METHOD_TEXT_SZ - 1);
+    strlcpy(td->args, args, METHOD_TEXT_SZ);
 
   // See cmd_dispatch: td is zeroed, so the characters alone are enough.
   if(username != NULL)

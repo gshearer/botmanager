@@ -502,8 +502,7 @@ bctl_drv_get_context(void *handle, const char *sender,
   (void)handle;
   (void)sender;
 
-  strncpy(ctx, "botmanctl", ctx_sz - 1);
-  ctx[ctx_sz - 1] = '\0';
+  strlcpy(ctx, "botmanctl", ctx_sz);
   return(SUCCESS);
 }
 
@@ -791,9 +790,8 @@ botmanctl_set_user_ns(const char *name)
   if(bctl_reply_target == NULL || name == NULL)
     return;
 
-  strncpy(bctl_reply_target->user_ns_cd, name,
-      sizeof(bctl_reply_target->user_ns_cd) - 1);
-  bctl_reply_target->user_ns_cd[sizeof(bctl_reply_target->user_ns_cd) - 1] = '\0';
+  strlcpy(bctl_reply_target->user_ns_cd, name,
+      sizeof(bctl_reply_target->user_ns_cd));
 }
 
 // Public API

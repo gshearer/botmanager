@@ -11,8 +11,7 @@ resolve_path(const char *path, char *out, size_t out_sz)
 
   if(path != NULL)
   {
-    strncpy(out, path, out_sz - 1);
-    out[out_sz - 1] = '\0';
+    strlcpy(out, path, out_sz);
     return;
   }
 
@@ -41,8 +40,7 @@ store(const char *key, const char *val)
   {
     if(strncasecmp(entries[i].key, key, BCONF_KEY_SZ) == 0)
     {
-      strncpy(entries[i].val, val, BCONF_VAL_SZ - 1);
-      entries[i].val[BCONF_VAL_SZ - 1] = '\0';
+      strlcpy(entries[i].val, val, BCONF_VAL_SZ);
       return;
     }
   }
@@ -54,10 +52,8 @@ store(const char *key, const char *val)
     return;
   }
 
-  strncpy(entries[entry_count].key, key, BCONF_KEY_SZ - 1);
-  entries[entry_count].key[BCONF_KEY_SZ - 1] = '\0';
-  strncpy(entries[entry_count].val, val, BCONF_VAL_SZ - 1);
-  entries[entry_count].val[BCONF_VAL_SZ - 1] = '\0';
+  strlcpy(entries[entry_count].key, key, BCONF_KEY_SZ);
+  strlcpy(entries[entry_count].val, val, BCONF_VAL_SZ);
   entry_count++;
 }
 
