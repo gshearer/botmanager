@@ -2847,7 +2847,7 @@ plugin_cmd_load(const cmd_ctx_t *ctx)
   cmd_reply(ctx, buf);
 }
 
-// /plugin audit — report registrations that would dangle after dlclose
+// /plugin audit — the registrations a plugin's teardown must account for
 
 static void
 plugin_audit_reply(const char *line, void *data)
@@ -3254,14 +3254,20 @@ plugin_register_commands(void)
 
   cmd_register("plugin", "audit",
       "plugin audit <name> | all",
-      "Report registrations that would dangle after unload",
+      "Report the registrations a plugin's teardown must account for",
       "Sweeps every registry that retains a pointer — commands, KV,\n"
       "clam subscribers, bot KV contributors and driver bindings,\n"
       "method drivers, tasks, in-flight curl requests, the dlsym\n"
       "shim cache, and the DB driver — and reports each one that\n"
-      "points into the named plugin's mapping. Those are exactly the\n"
-      "references that would dangle once the plugin is dlclose'd, so\n"
-      "a non-zero count is a bug in that plugin's deinit().\n\n"
+      "points into the named plugin's mapping.\n\n"
+      "Against a RUNNING plugin this is a worklist, not a verdict: a\n"
+      "healthy plugin's live surface is supposed to be here, and a\n"
+      "large count means a large plugin. Most of it is Class A —\n"
+      "commands, KV, clam subscribers, bot KV contributors, dlsym\n"
+      "slots — which core reclaims at unload whether or not the\n"
+      "plugin releases them itself. Only Class B (tasks, in-flight\n"
+      "requests, bound vtables) can refuse an unload, and the real\n"
+      "verdict is taken automatically after deinit() runs.\n\n"
       "Attribution is by the object's load address, not by any name\n"
       "the plugin registers under.\n\n"
       "Report-only: this command never unloads or refuses anything.\n"
