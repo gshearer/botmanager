@@ -8,6 +8,7 @@
 #include "db.h"
 #include "inference.h"
 
+#include <ctype.h>
 #include <inttypes.h>
 #include <math.h>
 #include <stdio.h>
@@ -22,6 +23,22 @@ typedef struct
   int64_t id;
   float   score;
 } memory_hit_t;
+
+// How many hits the recall scan asks for per slot it may keep.
+//
+// The scan ranks by cosine alone, so a line somebody repeated verbatim
+// wins as many slots as it has copies (three, measured — `TODO.md
+// §CHAT-RECALL-DEDUP-1`). Deduping a top-K-sized fetch would only make
+// the block *smaller*; over-fetching first means the slots a duplicate
+// vacates are backfilled with rows that would otherwise never have been
+// looked at.
+#define MEMORY_RECALL_OVERFETCH 3
+
+// Ceiling on everything the recall path holds on the stack: the hit
+// buffer, the hydrated rows, and the dedup's ranking scratch. It is also
+// the hard clamp on the over-fetch, so `recall_top_k` at its own maximum
+// simply stops over-fetching rather than overrunning anything.
+#define MEMORY_RECALL_SCRATCH 64
 
 // In-place insertion into a top-K buffer (sorted descending).
 static void
@@ -319,6 +336,142 @@ memory_msgs_from_ids(int ns_id, const memory_hit_t *hits, size_t n_hits,
   return(n);
 }
 
+static const char *
+memory_text_skip_ws(const char *p)
+{
+  while(*p != '\0' && isspace((unsigned char)*p))
+    p++;
+
+  return(p);
+}
+
+// Are two logged lines the same utterance? ASCII case-folded, runs of
+// whitespace collapsed to one separator, both ends trimmed.
+//
+// Compared on the fly rather than through normalized copies: this runs
+// on the reply path over `MEM_MSG_TEXT_SZ` strings, and a scratch buffer
+// per comparison would be the only allocation in the whole dedup. It is
+// deliberately no cleverer than that — near-duplicate scoring is
+// reply.c's trigram machinery and does not belong here (a retrieved row
+// that merely *resembles* another still carries its own evidence).
+static bool
+memory_text_norm_eq(const char *x, const char *y)
+{
+  if(x == NULL || y == NULL)
+    return(x == y);
+
+  x = memory_text_skip_ws(x);
+  y = memory_text_skip_ws(y);
+
+  while(*x != '\0' && *y != '\0')
+  {
+    bool wx = isspace((unsigned char)*x) != 0;
+    bool wy = isspace((unsigned char)*y) != 0;
+
+    if(wx != wy)
+      return(false);
+
+    if(wx)
+    {
+      x = memory_text_skip_ws(x);
+      y = memory_text_skip_ws(y);
+      continue;
+    }
+
+    if(tolower((unsigned char)*x) != tolower((unsigned char)*y))
+      return(false);
+
+    x++;
+    y++;
+  }
+
+  // Whatever is left can only be trailing whitespace, which normalizes
+  // away on both sides.
+  return(*memory_text_skip_ws(x) == '\0'
+      && *memory_text_skip_ws(y) == '\0');
+}
+
+// Collapse recall rows that say the same thing, then keep the `keep`
+// best of what survives. Returns the new row count; `m` is rewritten in
+// place and the caller's row order (newest first) is preserved, so the
+// trim is invisible to everything downstream except the block getting
+// fuller.
+//
+// `n` must not exceed MEMORY_RECALL_SCRATCH — the ranking pass indexes
+// fixed scratch, which is what keeps this allocation-free.
+static size_t
+memory_recall_dedup(mem_msg_t *m, size_t n, size_t keep)
+{
+  size_t idx[MEMORY_RECALL_SCRATCH];
+  bool   sel[MEMORY_RECALL_SCRATCH];
+  size_t uniq;
+  size_t out;
+
+  if(m == NULL || n == 0 || keep == 0)
+    return(0);
+
+  if(n > MEMORY_RECALL_SCRATCH)
+    n = MEMORY_RECALL_SCRATCH;
+
+  // Pass 1 — one row per utterance, the highest-cosine copy of it. The
+  // copies are byte-identical to the model, so which id survives matters
+  // only to the trace; the cosine is what has to be the strongest,
+  // because the trim below ranks on it.
+  uniq = 0;
+  for(size_t i = 0; i < n; i++)
+  {
+    size_t j;
+
+    for(j = 0; j < uniq; j++)
+    {
+      if(memory_text_norm_eq(m[j].text, m[i].text))
+        break;
+    }
+
+    if(j < uniq)
+    {
+      if(m[i].score > m[j].score)
+        m[j] = m[i];
+
+      continue;
+    }
+
+    m[uniq++] = m[i];
+  }
+
+  if(uniq <= keep)
+    return(uniq);
+
+  // Pass 2 — rank the survivors by cosine, mark the best `keep`, and
+  // compact in place. Insertion rank over an index array: `uniq` is the
+  // recall over-fetch, bounded by the scratch above.
+  for(size_t i = 0; i < uniq; i++)
+  {
+    size_t p = i;
+
+    while(p > 0 && m[idx[p - 1]].score < m[i].score)
+    {
+      idx[p] = idx[p - 1];
+      p--;
+    }
+
+    idx[p] = i;
+  }
+
+  memset(sel, 0, sizeof(sel));
+  for(size_t i = 0; i < keep; i++)
+    sel[idx[i]] = true;
+
+  out = 0;
+  for(size_t i = 0; i < uniq; i++)
+  {
+    if(sel[i])
+      m[out++] = m[i];
+  }
+
+  return(out);
+}
+
 // Dedup-merge two mem_msg_t arrays by id, preserving first-array order.
 // Output is a fresh mem_alloc'd buffer; caller frees. On OOM, *out is
 // left NULL and *n_out is 0 so callers can fall back cleanly.
@@ -347,12 +500,16 @@ memory_merge_msgs(const mem_msg_t *a, size_t na,
   for(size_t i = 0; i < na; i++)
     dst[n++] = a[i];
 
+  // Same row, or the same utterance logged as a different row: a name
+  // mention and a recall hit reach here from independent queries, so
+  // without the text test one restated line injects twice.
   for(size_t j = 0; j < nb; j++)
   {
     bool dup = false;
     for(size_t i = 0; i < n; i++)
     {
-      if(dst[i].id == b[j].id)
+      if(dst[i].id == b[j].id
+          || memory_text_norm_eq(dst[i].text, b[j].text))
       {
         dup = true;
         break;
@@ -697,12 +854,14 @@ static void
 memory_retrieve_dossier_embed_done(const llm_embed_response_t *resp)
 {
   memory_retrieve_dossier_ctx_t *c = resp->user_data;
-  mem_msg_t recall_msgs[64];
+  mem_msg_t recall_msgs[MEMORY_RECALL_SCRATCH];
   size_t n_recall;
+  size_t n_kept;
   mem_msg_t *merged;
   size_t     n_merged;
-  memory_hit_t hits[64];
+  memory_hit_t hits[MEMORY_RECALL_SCRATCH];
   size_t n_hits;
+  uint32_t fetch_k;
 
   if(!resp->ok || resp->n_vectors < 1 || resp->dim == 0)
   {
@@ -715,22 +874,32 @@ memory_retrieve_dossier_embed_done(const llm_embed_response_t *resp)
     return;
   }
 
+  // Over-fetch, then spend the slots on distinct utterances. The scan
+  // cannot do this itself — it ranks ids by cosine and never sees the
+  // text, which only arrives with the hydration below.
+  fetch_k = c->top_k * MEMORY_RECALL_OVERFETCH;
+  if(fetch_k > MEMORY_RECALL_SCRATCH)
+    fetch_k = MEMORY_RECALL_SCRATCH;
+
   n_hits = 0;
   memory_recall_scan_convo(c->ns_id, c->dossier_id, c->model,
-      resp->dim, resp->vectors[0], c->top_k, c->min_cos_x100,
+      resp->dim, resp->vectors[0], fetch_k, c->min_cos_x100,
       c->query_esc, hits, &n_hits);
 
   n_recall = memory_msgs_from_ids(c->ns_id, hits, n_hits,
-      recall_msgs, 64);
+      recall_msgs, MEMORY_RECALL_SCRATCH);
+
+  n_kept = memory_recall_dedup(recall_msgs, n_recall, c->top_k);
 
   merged = NULL;
   n_merged = 0;
   memory_merge_msgs(c->mention_msgs, c->n_mention_msgs,
-      recall_msgs, n_recall, &merged, &n_merged);
+      recall_msgs, n_kept, &merged, &n_merged);
 
   clam(CLAM_DEBUG, "memory",
-      "recall: ns=%d dossier=%" PRId64 " hits=%zu merged=%zu",
-      c->ns_id, c->dossier_id, n_hits, n_merged);
+      "recall: ns=%d dossier=%" PRId64
+      " hits=%zu rows=%zu kept=%zu merged=%zu",
+      c->ns_id, c->dossier_id, n_hits, n_recall, n_kept, n_merged);
 
   c->cb(c->facts, c->n_facts,
         merged != NULL ? merged : c->mention_msgs,
