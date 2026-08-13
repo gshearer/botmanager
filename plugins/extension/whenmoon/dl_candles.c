@@ -147,13 +147,6 @@ wm_dl_candles_dispatch_one(dl_jobtable_t *t, dl_job_t *j)
 
   ctx = mem_alloc("whenmoon.dl", "candle_ctx", sizeof(*ctx));
 
-  if(ctx == NULL)
-  {
-    // WM-DL-RACE-1: same as the table_ensure path.
-    wm_dl_record_dispatch_error(t, j, "candle ctx alloc failed");
-    return(FAIL);
-  }
-
   ctx->table          = t;
   ctx->job_id         = j->id;
   ctx->window_start_s = start_s;
@@ -202,9 +195,6 @@ wm_dl_candles_insert_page(int32_t market_id,
 
   sql = mem_alloc("whenmoon.dl", "candle_insert", cap);
 
-  if(sql == NULL)
-    return(0);
-
   len += (size_t)snprintf(sql + len, cap - len,
       "INSERT INTO %s (ts, low, high, open, close, volume) VALUES ",
       table);
@@ -218,12 +208,6 @@ wm_dl_candles_insert_page(int32_t market_id,
     {
       size_t new_cap = cap * 2;
       char  *new_sql = mem_realloc(sql, new_cap);
-
-      if(new_sql == NULL)
-      {
-        mem_free(sql);
-        return(0);
-      }
 
       sql = new_sql;
       cap = new_cap;
@@ -257,12 +241,6 @@ wm_dl_candles_insert_page(int32_t market_id,
   {
     size_t new_cap = cap + 64;
     char  *new_sql = mem_realloc(sql, new_cap);
-
-    if(new_sql == NULL)
-    {
-      mem_free(sql);
-      return(0);
-    }
 
     sql = new_sql;
     cap = new_cap;

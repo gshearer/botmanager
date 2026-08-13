@@ -189,8 +189,6 @@ knowledge_vec_to_bytea_literal(const float *vec, uint32_t dim)
 
   const unsigned char *bytes;
   size_t w;
-  if(out == NULL)
-    return(NULL);
 
   bytes = (const unsigned char *)vec;
   w = 0;
@@ -234,9 +232,6 @@ knowledge_bytea_to_vec(const char *cell, uint32_t expected_dim)
     return(NULL);
 
   out = mem_alloc("knowledge", "vec", n_bytes);
-
-  if(out == NULL)
-    return(NULL);
 
   bytes = (unsigned char *)out;
   h = cell + 2;
@@ -386,12 +381,6 @@ knowledge_write_embedding(int64_t chunk_id, const char *model,
 
   cap = strlen(hex) + strlen(e_model) + 256;
   sql = mem_alloc("knowledge", "embed_sql", cap);
-
-  if(sql == NULL)
-  {
-    mem_free(hex); mem_free(e_model);
-    return(FAIL);
-  }
 
   snprintf(sql, cap,
       "INSERT INTO knowledge_chunk_embeddings (chunk_id, model, dim, vec)"
@@ -645,14 +634,6 @@ knowledge_spawn_singles_retry(knowledge_batch_result_t *ctx,
 
   rt = mem_alloc("knowledge", "singles_task",
       sizeof(*rt));
-  if(rt == NULL)
-  {
-    clam(CLAM_WARN, "knowledge",
-        "singles retry alloc failed; chunks %zu..%zu lose embeddings",
-        start, start + count);
-    knowledge_batch_result_free(ctx);
-    return;
-  }
 
   rt->n = count;
   snprintf(rt->model,  sizeof(rt->model),  "%s", ctx->model);
@@ -702,13 +683,6 @@ knowledge_singles_retry_task(task_t *t)
     // Build a size-1 result ctx, transferring text ownership.
     ctx = mem_alloc("knowledge", "single_ctx",
         sizeof(*ctx));
-    if(ctx == NULL)
-    {
-      mem_free(rt->texts[i]);
-      rt->texts[i] = NULL;
-      setup_failed++;
-      continue;
-    }
     memset(ctx, 0, sizeof(*ctx));
     ctx->n               = 1;
     ctx->chunk_ids[0]    = rt->chunk_ids[i];
@@ -766,15 +740,6 @@ knowledge_batch_flush(knowledge_batch_t *b)
     return(SUCCESS);
 
   ctx = mem_alloc("knowledge", "batch_ctx", sizeof(*ctx));
-  if(ctx == NULL)
-  {
-    clam(CLAM_WARN, "knowledge",
-        "batch flush alloc failure — dropping %zu pending chunk(s)",
-        b->n);
-    b->chunks_embedded_fail += b->n;
-    knowledge_batch_drop_pending(b);
-    return(FAIL);
-  }
 
   memset(ctx, 0, sizeof(*ctx));
   ctx->n = b->n;
@@ -861,12 +826,6 @@ knowledge_corpus_upsert(const char *name, const char *description)
 
   sql_sz = strlen(e_name) + strlen(e_desc) + 256;
   sql = mem_alloc("knowledge", "corpus_sql", sql_sz);
-
-  if(sql == NULL)
-  {
-    mem_free(e_name); mem_free(e_desc);
-    return(FAIL);
-  }
 
   // Only overwrite the description when a non-empty value is supplied;
   // a bare ingest call (no description arg) shouldn't clobber a
@@ -1007,12 +966,6 @@ knowledge_insert_chunk_raw(const char *corpus, const char *source_url,
   sql_sz = strlen(e_corp) + strlen(e_url) + strlen(e_sec)
       + strlen(e_txt) + 512;
   sql = mem_alloc("knowledge", "chunk_sql", sql_sz);
-
-  if(sql == NULL)
-  {
-    mem_free(e_corp); mem_free(e_url); mem_free(e_sec); mem_free(e_txt);
-    return(FAIL);
-  }
 
   snprintf(sql, sql_sz,
       "INSERT INTO knowledge_chunks"
@@ -1155,12 +1108,6 @@ knowledge_insert_image(int64_t chunk_id, const char *url,
       + strlen(e_subj) + 256;
   sql = mem_alloc("knowledge", "image_sql", sql_sz);
 
-  if(sql == NULL)
-  {
-    mem_free(e_url); mem_free(e_page); mem_free(e_cap); mem_free(e_subj);
-    return(FAIL);
-  }
-
   snprintf(sql, sql_sz,
       "INSERT INTO knowledge_images"
       " (chunk_id, url, page_url, caption, subject, width_px, height_px)"
@@ -1298,12 +1245,6 @@ knowledge_scan(const char *corpus_list, const char *model, uint32_t dim,
 
   sz = strlen(in_clause) + strlen(e_model) + 256;
   sql = mem_alloc("knowledge", "scan_sql", sz);
-
-  if(sql == NULL)
-  {
-    mem_free(e_model);
-    return;
-  }
 
   snprintf(sql, sz,
       "SELECT e.chunk_id, e.vec"
@@ -1528,12 +1469,6 @@ knowledge_retrieve(const char *corpus, const char *query,
 
   c = mem_alloc("knowledge", "rag_ctx", sizeof(*c));
 
-  if(c == NULL)
-  {
-    cb(NULL, 0, user);
-    return(FAIL);
-  }
-
   snprintf(c->corpus, sizeof(c->corpus), "%s", corpus);
   snprintf(c->model,  sizeof(c->model),  "%s", model);
   c->top_k = top_k;
@@ -1686,12 +1621,6 @@ knowledge_images_by_subject(const char *corpus_list,
   sql_sz = strlen(e_subj) * 2 + strlen(in_clause)
       + strlen(age_clause) + 1024;
   sql = mem_alloc("knowledge", "img_subj_sql", sql_sz);
-
-  if(sql == NULL)
-  {
-    mem_free(e_subj);
-    return(0);
-  }
 
   snprintf(sql, sql_sz,
       "SELECT ki.id, ki.chunk_id, ki.url, COALESCE(ki.page_url, ''),"

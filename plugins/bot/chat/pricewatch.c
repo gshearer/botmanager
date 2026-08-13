@@ -1452,9 +1452,6 @@ chatbot_pricewatch_run(soul_sched_t *sched, uint32_t chore,
 
   sweep = mem_alloc("chat", "pricewatch_sweep", sizeof(*sweep));
 
-  if(sweep == NULL)
-    return(false);
-
   memset(sweep, 0, sizeof(*sweep));
   sweep->sched = sched;
   sweep->chore = chore;

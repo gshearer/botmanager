@@ -109,18 +109,9 @@ kr_assetpairs_persist(void)
   snap = mem_alloc(KR_CTX, "persist.snap",
       (size_t)KRAKEN_PAIRS_CAP * sizeof(*snap));
 
-  if(snap == NULL)
-    return(FAIL);
-
   n = kr_pairs_snapshot(snap, KRAKEN_PAIRS_CAP);
 
   sql = mem_alloc(KR_CTX, "persist.sql", cap);
-
-  if(sql == NULL)
-  {
-    mem_free(snap);
-    return(FAIL);
-  }
 
   // Single transaction: clear the table, then bulk-insert the snapshot.
   // An empty cache still emits BEGIN; DELETE; COMMIT; to clear stale
@@ -137,18 +128,8 @@ kr_assetpairs_persist(void)
   {
     if(cap - len < 128)
     {
-      size_t new_cap = cap * 2;
-      char  *new_sql = mem_realloc(sql, new_cap);
-
-      if(new_sql == NULL)
-      {
-        mem_free(sql);
-        mem_free(snap);
-        return(FAIL);
-      }
-
-      sql = new_sql;
-      cap = new_cap;
+      cap *= 2;
+      sql  = mem_realloc(sql, cap);
     }
 
     // altname/canonical/wsname are exchange-issued pair identifiers
@@ -172,17 +153,8 @@ kr_assetpairs_persist(void)
 
   if(cap - len < 64)
   {
-    size_t new_cap = cap + 64;
-    char  *new_sql = mem_realloc(sql, new_cap);
-
-    if(new_sql == NULL)
-    {
-      mem_free(sql);
-      return(FAIL);
-    }
-
-    sql = new_sql;
-    cap = new_cap;
+    cap += 64;
+    sql  = mem_realloc(sql, cap);
   }
 
   // Terminate the INSERT (only emitted when rows were appended), then

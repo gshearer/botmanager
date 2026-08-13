@@ -138,9 +138,6 @@ cb_exchange_build_request(exchange_op_kind_t kind, const char *path,
 
   h = mem_alloc("coinbase.exch", "handle", sizeof(*h));
 
-  if(h == NULL)
-    return(FAIL);
-
   memset(h, 0, sizeof(*h));
   h->kind = kind;
   memcpy(h->path, path, plen);
@@ -160,12 +157,6 @@ cb_exchange_build_request(exchange_op_kind_t kind, const char *path,
     }
 
     h->body = mem_alloc("coinbase.exch", "body", h->body_len + 1);
-
-    if(h->body == NULL)
-    {
-      mem_free(h);
-      return(FAIL);
-    }
 
     memcpy(h->body, body_json, h->body_len);
     h->body[h->body_len] = '\0';
@@ -1070,13 +1061,6 @@ cb_exch_tickers_resp(int http_status, const char *body, size_t body_len,
   rows = mem_alloc(CB_CTX, "exch.tickers",
       row_cap * sizeof(*rows));
 
-  if(rows == NULL)
-  {
-    json_object_put(root);
-    cb_exch_deliver_tickers(&fwd, false, "out of memory", NULL, 0);
-    return;
-  }
-
   for(i = 0; i < len && kept < row_cap; i++)
   {
     struct json_object         *row = json_object_array_get_idx(products, i);
@@ -1384,9 +1368,6 @@ cb_exch_ws_subscribe(const exchange_ws_channel_t *channels,
   }
 
   sub = mem_alloc(CB_CTX, "exch.ws_sub", sizeof(*sub));
-
-  if(sub == NULL)
-    return(FAIL);
 
   sub->user_cb = cb;
   sub->user    = user;

@@ -798,7 +798,6 @@ volunteer_ingest_cb(const char *bot_name, const char *topic_name,
     return;
 
   job = mem_alloc("chatbot", "volunteer_job", sizeof(*job));
-  if(job == NULL) return;
 
   memset(job, 0, sizeof(*job));
   snprintf(job->bot_name,   sizeof(job->bot_name),   "%s", bot_name);

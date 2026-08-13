@@ -535,9 +535,6 @@ extract_dispatch(const char *bot_name, uint32_t ns_id,
 
   prompt = mem_alloc("chat", "extract_prompt", EXTRACT_PROMPT_MAX_SZ);
 
-  if(prompt == NULL)
-    return(0);
-
   plen = extract_prompt_build(parts, n_parts, msgs, n_msgs,
       prompt, EXTRACT_PROMPT_MAX_SZ);
 
@@ -1224,11 +1221,6 @@ extract_schedule(const char *bot_name, uint32_t ns_id,
   if(s == NULL)
   {
     s = mem_alloc("chat", "extract_state", sizeof(*s));
-    if(s == NULL)
-    {
-      pthread_mutex_unlock(&extract_sched_mutex);
-      return;
-    }
     snprintf(s->bot_name, sizeof(s->bot_name), "%s", bot_name);
     s->next            = extract_sched_head;
     extract_sched_head = s;

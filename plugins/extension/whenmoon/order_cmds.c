@@ -52,9 +52,6 @@ wm_order_async_ctx_new(const cmd_ctx_t *ctx, const char *label)
 
   ac = mem_alloc(WHENMOON_CTX, "order.async", sizeof(*ac));
 
-  if(ac == NULL)
-    return(NULL);
-
   memset(ac, 0, sizeof(*ac));
   ac->inst = ctx->msg->inst;
 

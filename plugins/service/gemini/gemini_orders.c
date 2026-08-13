@@ -90,9 +90,6 @@ gem_batch_alloc(gemini_done_symbols_cb_t cb, void *user)
 
   b = mem_alloc(GEM_CTX, "symbols.batch", sizeof(*b));
 
-  if(b == NULL)
-    return(NULL);
-
   memset(b, 0, sizeof(*b));
   pthread_mutex_init(&b->lock, NULL);
   b->cb   = cb;
@@ -343,9 +340,6 @@ gem_symbols_listing_resp(int http_status, const char *body, size_t body_len,
 
     dr = gem_req_alloc();
 
-    if(dr == NULL)
-      continue;
-
     dr->type  = GEM_REQ_SYMBOL_DETAILS;
     dr->batch = b;
     snprintf(dr->detail_symbol, sizeof(dr->detail_symbol), "%s", sym);
@@ -425,12 +419,6 @@ gemini_symbols_refresh_async(gemini_done_symbols_cb_t cb, void *user)
     return(FAIL);
 
   r = gem_req_alloc();
-
-  if(r == NULL)
-  {
-    gem_batch_free(b);
-    return(FAIL);
-  }
 
   r->type  = GEM_REQ_SYMBOLS;
   r->batch = b;
@@ -965,9 +953,6 @@ gemini_fetch_candles_async(const char *pair, exchange_granularity_t gran,
 
   r = gem_req_alloc();
 
-  if(r == NULL)
-    return(FAIL);
-
   r->type       = GEM_REQ_CANDLES;
   r->since_ms   = since_ms;
   r->until_ms   = until_ms;
@@ -1110,9 +1095,6 @@ gemini_get_balance_async(gemini_done_balances_cb_t cb, void *user)
 
   r = gem_req_alloc();
 
-  if(r == NULL)
-    return(FAIL);
-
   r->type        = GEM_REQ_BALANCE;
   r->cb.balances = cb;
   r->user        = user;
@@ -1246,9 +1228,6 @@ gemini_add_order_async(const gemini_place_order_req_t *req,
     return(FAIL);
 
   r = gem_req_alloc();
-
-  if(r == NULL)
-    return(FAIL);
 
   r->type     = GEM_REQ_ADD_ORDER;
   r->cb.order = cb;
@@ -1447,9 +1426,6 @@ gemini_cancel_order_async(const char *order_id,
 
   r = gem_req_alloc();
 
-  if(r == NULL)
-    return(FAIL);
-
   r->type     = GEM_REQ_CANCEL_ORDER;
   r->cb.order = cb;
   r->user     = user;
@@ -1531,9 +1507,6 @@ gemini_query_order_async(const char *order_id,
     return(FAIL);
 
   r = gem_req_alloc();
-
-  if(r == NULL)
-    return(FAIL);
 
   r->type     = GEM_REQ_QUERY_ORDER;
   r->cb.order = cb;
@@ -1666,9 +1639,6 @@ gemini_active_orders_async(gemini_done_orders_cb_t cb, void *user)
     return(FAIL);
 
   r = gem_req_alloc();
-
-  if(r == NULL)
-    return(FAIL);
 
   r->type      = GEM_REQ_ACTIVE_ORDERS;
   r->cb.orders = cb;
@@ -1839,9 +1809,6 @@ gemini_mytrades_async(const char *product_id, int64_t since_ms,
     return(FAIL);
 
   r = gem_req_alloc();
-
-  if(r == NULL)
-    return(FAIL);
 
   r->type     = GEM_REQ_MYTRADES;
   r->cb.fills = cb;

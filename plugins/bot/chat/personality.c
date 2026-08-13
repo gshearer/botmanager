@@ -47,12 +47,6 @@ mp_slurp(const char *path)
 
   buf = mem_alloc("chatbot", "pfile", CHATBOT_PERSONALITY_BODY_SZ);
 
-  if(buf == NULL)
-  {
-    fclose(fp);
-    return(NULL);
-  }
-
   n = fread(buf, 1, CHATBOT_PERSONALITY_BODY_SZ - 1, fp);
 
   buf[n] = '\0';
@@ -386,12 +380,6 @@ chatbot_personality_read(const char *name, chatbot_personality_t *out)
   interests_buf = mem_alloc("chatbot", "interests_buf",
       CHATBOT_INTERESTS_JSON_SZ);
 
-  if(interests_buf == NULL)
-  {
-    mem_free(raw);
-    return(FAIL);
-  }
-
   if(mp_parse_frontmatter(raw,
       pname, sizeof(pname),
       pdesc, sizeof(pdesc),
@@ -415,12 +403,6 @@ chatbot_personality_read(const char *name, chatbot_personality_t *out)
   out->interests_json = interests_buf;   // transfer ownership
 
   mem_free(raw);
-
-  if(out->body == NULL)
-  {
-    chatbot_personality_free(out);
-    return(FAIL);
-  }
 
   return(SUCCESS);
 }
@@ -500,9 +482,6 @@ chatbot_contract_read(const char *name, char **out_body)
 
   *out_body = mem_strdup("chatbot", "contract", body_ptr);
   mem_free(raw);
-
-  if(*out_body == NULL)
-    return(FAIL);
 
   return(SUCCESS);
 }

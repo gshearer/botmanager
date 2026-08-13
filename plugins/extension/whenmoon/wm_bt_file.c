@@ -530,15 +530,6 @@ wm_bt_file_open(const char *path, char *err, size_t err_cap)
 
   snap = mem_alloc(WM_BT_FILE_CTX, "snapshot", sizeof(*snap));
 
-  if(snap == NULL)
-  {
-    if(err != NULL)
-      snprintf(err, err_cap, "out of memory allocating snapshot");
-    munmap(base, sz);
-    close(fd);
-    return(NULL);
-  }
-
   memset(snap, 0, sizeof(*snap));
 
   // Identity fields — mirror the heap-build's stub-market plumbing so

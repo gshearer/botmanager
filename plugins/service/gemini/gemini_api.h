@@ -250,10 +250,13 @@ bool gemini_apikey_configured(void);
 // it allocates anything: a NULL callback or a missing/empty required
 // parameter returns FAIL immediately, and there is no callback to fire
 // (you did not supply one, or the call was malformed) and nothing was
-// taken from you. Every reachable failure *after* that point delivers
-// through gem_deliver_*_fail(). Which entry points have such a check is
-// noted on each below — `gemini_symbols_refresh_async` deliberately has
-// none, because a NULL callback is legal there.
+// taken from you. It is the *only* exception: every failure after that
+// point delivers through gem_deliver_*_fail(), with no branch in
+// between, because the request allocation cannot fail — gem_req_alloc()
+// pops a freelist or falls through to the aborting allocator. Which
+// entry points have such a check is noted on each below —
+// `gemini_symbols_refresh_async` deliberately has none, because a NULL
+// callback is legal there.
 //
 // This convention has killed the daemon twice tree-wide, most recently
 // 2026-08-12, so it is written down here rather than inferred from a

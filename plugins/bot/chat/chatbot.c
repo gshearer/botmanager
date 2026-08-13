@@ -1351,8 +1351,6 @@ chatbot_create(bot_inst_t *inst)
   const char *prefix;
   char key[KV_KEY_SZ];
 
-  if(st == NULL) return(NULL);
-
   memset(st, 0, sizeof(*st));
   st->inst = inst;
   st->created_at = time(NULL);
@@ -2161,7 +2159,6 @@ chatbot_coalesce_enqueue(chatbot_state_t *st, const method_msg_t *msg,
   pthread_mutex_unlock(&st->coalesce_mutex);
 
   fl = mem_alloc("chatbot", "coalesce_flush", sizeof(*fl));
-  if(fl == NULL) return(true);  // line still buffered; just no new task
   fl->st = st;
   fl->slot_idx = (uint32_t)idx;
   fl->seq = seq_snapshot;

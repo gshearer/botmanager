@@ -181,13 +181,6 @@ chatbot_vision_maybe_submit(chatbot_state_t *st, const method_msg_t *msg)
 
   // Build ctx for the async hop.
   ctx = mem_alloc("vision", "ctx", sizeof(*ctx));
-  if(ctx == NULL)
-  {
-    pthread_mutex_lock(&st->vision_flight_mutex);
-    if(st->vision_in_flight > 0) st->vision_in_flight--;
-    pthread_mutex_unlock(&st->vision_flight_mutex);
-    return(true);
-  }
 
   ctx->st     = st;
   ctx->method = msg->inst;
@@ -416,7 +409,6 @@ vision_on_fetch_done(const curl_response_t *resp)
   // Base64-encode. Capacity = ceil(n/3)*4 + 1.
   b64_cap = ((resp->body_len + 2) / 3) * 4 + 1;
   b64     = mem_alloc("vision", "b64", b64_cap);
-  if(b64 == NULL) goto done;
 
   b64_written = util_b64_encode(resp->body, resp->body_len, b64, b64_cap);
   if(b64_written == 0)

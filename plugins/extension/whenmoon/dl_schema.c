@@ -199,9 +199,6 @@ wm_dl_install_candle_upsample_fn(void)
   sql = mem_alloc(WM_DL_CTX, "upsample_ddl",
       (size_t)wm_dl_candle_upsample_ddl_len + 1);
 
-  if(sql == NULL)
-    return(FAIL);
-
   memcpy(sql, wm_dl_candle_upsample_ddl,
       (size_t)wm_dl_candle_upsample_ddl_len);
   sql[wm_dl_candle_upsample_ddl_len] = '\0';

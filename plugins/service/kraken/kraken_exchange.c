@@ -111,9 +111,6 @@ kr_exchange_build_request(exchange_op_kind_t kind, const char *path,
 
   h = mem_alloc(KR_CTX ".exch", "handle", sizeof(*h));
 
-  if(h == NULL)
-    return(FAIL);
-
   memset(h, 0, sizeof(*h));
   h->kind = kind;
   memcpy(h->path, path, plen);
@@ -133,12 +130,6 @@ kr_exchange_build_request(exchange_op_kind_t kind, const char *path,
     }
 
     h->body = mem_alloc(KR_CTX ".exch", "body", h->body_len + 1);
-
-    if(h->body == NULL)
-    {
-      mem_free(h);
-      return(FAIL);
-    }
 
     memcpy(h->body, body_json, h->body_len);
     h->body[h->body_len] = '\0';
@@ -1084,13 +1075,6 @@ kr_exch_tickers_resp(int http_status, const char *body, size_t body_len,
 
   rows = mem_alloc(KR_CTX, "exch.tickers",
       row_cap * sizeof(*rows));
-
-  if(rows == NULL)
-  {
-    json_object_put(root);
-    kr_exch_deliver_tickers(&fwd, false, "out of memory", NULL, 0);
-    return;
-  }
 
   json_object_object_foreach(result, wire_key, pair_obj)
   {

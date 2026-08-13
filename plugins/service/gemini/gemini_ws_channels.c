@@ -1506,12 +1506,6 @@ gem_ws_subscribe(const exchange_ws_channel_t *channels, uint32_t n_channels,
 
   sub = mem_alloc(GEM_CTX ".ws", "sub", sizeof(*sub));
 
-  if(sub == NULL)
-  {
-    pthread_mutex_unlock(&gem_ws_ch.mu);
-    return(FAIL);
-  }
-
   memset(sub, 0, sizeof(*sub));
   sub->id           = ++gem_ws_ch.next_id;
   sub->cb           = cb;

@@ -1604,9 +1604,6 @@ cmd_sink_register(cmd_sink_fn_t fn, void *data)
 
   s = mem_alloc("cmd", "sink", sizeof(*s));
 
-  if(s == NULL)
-    return(0);
-
   pthread_mutex_lock(&cmd_sink_mutex);
   id        = cmd_sink_next_id++;
   s->id     = id;

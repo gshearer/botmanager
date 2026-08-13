@@ -367,12 +367,6 @@ wm_bt_cmd_run_emit_charts(
   top_idx = mem_alloc("whenmoon.backtest", "charts_top_idx",
       sizeof(*top_idx) * (size_t)top_n);
 
-  if(top_idx == NULL)
-  {
-    clam(CLAM_WARN, WM_BT_CMD_CTX, "charts: top-K alloc failed");
-    return;
-  }
-
   actual = wm_bt_topk_compute(results, n_results, top_n, top_idx);
 
   // Chart every grain the snapshot carries (1m..1d), not just the
@@ -690,13 +684,6 @@ wm_bt_run_task_cb(task_t *t)
 
   sweep_results = mem_alloc("whenmoon.backtest", "sweep_results",
       sizeof(*sweep_results) * (size_t)job->plan.total_iters);
-
-  if(sweep_results == NULL)
-  {
-    clam(CLAM_WARN, WM_BT_CMD_CTX,
-        "run %s: out of memory allocating sweep result table", job->name);
-    goto done;
-  }
 
   // WM-BT-8: zero the table so the per-row fills pointer starts at NULL;
   // this lets the free-fills walker run safely on any exit path even
@@ -1432,13 +1419,6 @@ wm_bt_cmd_run(const cmd_ctx_t *ctx)
 
     job = mem_alloc("whenmoon.backtest", "run_task", sizeof(*job));
 
-    if(job == NULL)
-    {
-      cmd_reply(ctx, "out of memory");
-      wm_backtest_snapshot_free(snap);
-      return;
-    }
-
     memset(job, 0, sizeof(*job));
     job->snap           = snap;    // ownership transfers to the task
     job->plan           = sweep_plan;
@@ -1913,12 +1893,6 @@ wm_bt_cmd_compile(const cmd_ctx_t *ctx)
   // multi-million-row snapshot build, and the .wm write — to a
   // lowest-priority worker task so the issuing session returns now.
   job = mem_alloc("whenmoon.backtest", "compile_task", sizeof(*job));
-
-  if(job == NULL)
-  {
-    cmd_reply(ctx, "out of memory");
-    return;
-  }
 
   memset(job, 0, sizeof(*job));
   job->market_id = market_id;

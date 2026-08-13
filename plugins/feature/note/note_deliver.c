@@ -293,9 +293,6 @@ note_observe(const method_msg_t *msg, void *data)
 
   d = mem_alloc(NOTE_CTX, "deliver", sizeof(*d));
 
-  if(d == NULL)
-    return;
-
   memset(d, 0, sizeof(*d));
   snprintf(d->method_name, sizeof(d->method_name), "%s", method_name);
   snprintf(d->user, sizeof(d->user), "%s", user);
@@ -355,9 +352,6 @@ note_attach_bot(const char *botname)
 
   ctx = mem_alloc(NOTE_CTX, "actx", sizeof(*ctx));
 
-  if(ctx == NULL)
-    return;
-
   snprintf(ctx->bot, sizeof(ctx->bot), "%s", botname);
   snprintf(sub_name, sizeof(sub_name), "note:%.48s", botname);
 
@@ -368,13 +362,6 @@ note_attach_bot(const char *botname)
   }
 
   node = mem_alloc(NOTE_CTX, "attach", sizeof(*node));
-
-  if(node == NULL)
-  {
-    method_unsubscribe(inst, sub_name);
-    mem_free(ctx);
-    return;
-  }
 
   snprintf(node->method_name, sizeof(node->method_name), "%s",
       method_inst_name(inst));
@@ -448,9 +435,6 @@ note_on_bot_start(const clam_msg_t *msg)
     return;
 
   copy = mem_strdup(NOTE_CTX, "botname", name);
-
-  if(copy == NULL)
-    return;
 
   if(task_add(NOTE_CTX, TASK_ANY, 200, note_attach_task, copy) == NULL)
     mem_free(copy);

@@ -367,12 +367,6 @@ verb_llm_memories(const cmd_ctx_t *ctx, bot_inst_t *bot, const char *rest)
 
   st = mem_alloc("chatbot", "mem_rag_state", sizeof(*st));
 
-  if(st == NULL)
-  {
-    cmd_reply(ctx, "memory_retrieve_ns alloc failed");
-    return;
-  }
-
   st->inst = ctx->msg->inst;
   snprintf(st->target, sizeof(st->target), "%s",
       ctx->msg->channel[0] != '\0' ? ctx->msg->channel : ctx->msg->sender);
@@ -606,12 +600,6 @@ verb_llm_knowledge(const cmd_ctx_t *ctx, bot_inst_t *bot, const char *rest)
   }
 
   st = mem_alloc("chatbot", "kw_rag_state", sizeof(*st));
-
-  if(st == NULL)
-  {
-    cmd_reply(ctx, "knowledge_retrieve alloc failed");
-    return;
-  }
 
   st->inst = ctx->msg->inst;
   snprintf(st->target, sizeof(st->target), "%s",

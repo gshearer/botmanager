@@ -354,9 +354,6 @@ wm_dl_load_jobs(dl_jobtable_t *t)
 
     j = mem_alloc("whenmoon.dl", "job", sizeof(*j));
 
-    if(j == NULL)
-      break;
-
     memset(j, 0, sizeof(*j));
 
     v = db_result_get(res, i, 0);
@@ -750,12 +747,6 @@ wm_dl_job_enqueue(whenmoon_state_t *st,
 
   j = mem_alloc("whenmoon.dl", "job", sizeof(*j));
 
-  if(j == NULL)
-  {
-    snprintf(err, err_cap, "out of memory");
-    return(FAIL);
-  }
-
   memset(j, 0, sizeof(*j));
   j->id               = new_id;
   j->market_id        = market_id;
@@ -889,9 +880,6 @@ wm_dl_job_list_iterate(whenmoon_state_t *st,
   {
     dl_job_t *c = mem_alloc("whenmoon.dl", "job_snap", sizeof(*c));
 
-    if(c == NULL)
-      break;
-
     memcpy(c, j, sizeof(*c));
     c->next = NULL;
     *pp = c;
@@ -930,9 +918,6 @@ wm_dl_jobtable_init(whenmoon_state_t *st)
   max_concurrent = (uint32_t)max_u;
 
   t = mem_alloc("whenmoon.dl", "jobtable", sizeof(*t));
-
-  if(t == NULL)
-    return(FAIL);
 
   memset(t, 0, sizeof(*t));
   t->st              = st;

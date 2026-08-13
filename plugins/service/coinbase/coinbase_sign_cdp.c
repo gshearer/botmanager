@@ -87,9 +87,6 @@ cb_pem_unescape(const char *src)
   in_len = strlen(src);
   out    = mem_alloc(CB_CTX, "cdp pem", in_len + 1);
 
-  if(out == NULL)
-    return(NULL);
-
   for(i = 0, o = 0; i < in_len; i++)
   {
     if(src[i] == '\\' && i + 1 < in_len)
@@ -183,12 +180,6 @@ cb_load_cdp_key_locked(EVP_PKEY **out)
   }
 
   snap = mem_alloc(CB_CTX, "cdp pem snap", pem_len + 1);
-
-  if(snap == NULL)
-  {
-    EVP_PKEY_free(pk);
-    return(FAIL);
-  }
 
   memcpy(snap, pem, pem_len + 1);
 

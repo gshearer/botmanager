@@ -336,8 +336,6 @@ ug_attach_bot(const char *botname)
   }
 
   ctx = mem_alloc(UG_CTX, "actx", sizeof(*ctx));
-  if(ctx == NULL)
-    return;
 
   snprintf(ctx->bot, sizeof(ctx->bot), "%s", botname);
   snprintf(sub_name, sizeof(sub_name), "urlgrabber:%.48s", botname);
@@ -349,12 +347,6 @@ ug_attach_bot(const char *botname)
   }
 
   node = mem_alloc(UG_CTX, "attach", sizeof(*node));
-  if(node == NULL)
-  {
-    method_unsubscribe(inst, sub_name);
-    mem_free(ctx);
-    return;
-  }
 
   snprintf(node->method_name, sizeof(node->method_name), "%s",
       method_inst_name(inst));
@@ -492,8 +484,6 @@ ug_on_bot_start(const clam_msg_t *msg)
     return;
 
   copy = mem_strdup(UG_CTX, "botname", name);
-  if(copy == NULL)
-    return;
 
   if(task_add(UG_CTX, TASK_ANY, 200, ug_attach_task, copy) == NULL)
     mem_free(copy);
@@ -551,8 +541,6 @@ ug_on_url_offer(const clam_msg_t *msg)
       "ug_on_url_offer's sscanf widths must track these sizes");
 
   off = mem_alloc(UG_CTX, "offer", sizeof(*off));
-  if(off == NULL)
-    return;
 
   if(sscanf(msg->msg, "%63s %63s %127s %2047s",
       off->bot, off->method, off->channel, off->url) != 4)

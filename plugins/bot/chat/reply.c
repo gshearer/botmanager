@@ -2447,7 +2447,6 @@ assemble_prompt(chatbot_req_t *r, const mem_fact_t *facts, size_t nf,
   bool public_reply;
 
   r->system_prompt = mem_alloc("chatbot", "sysprompt", CHATBOT_PROMPT_SZ);
-  if(r->system_prompt == NULL) return;
 
   pos = 0;
   buf = r->system_prompt;
@@ -2904,7 +2903,6 @@ chatbot_reply_submit(chatbot_state_t *st, const method_msg_t *msg,
   if(st == NULL || msg == NULL) return;
 
   r = mem_alloc("chatbot", "req", sizeof(*r));
-  if(r == NULL) return;
   memset(r, 0, sizeof(*r));
 
   r->st                = st;
@@ -3229,11 +3227,6 @@ chatbot_reply_submit_vision(chatbot_state_t *st, const method_msg_t *msg,
   }
 
   r = mem_alloc("chatbot", "req", sizeof(*r));
-  if(r == NULL)
-  {
-    mem_free(image_b64);
-    return;
-  }
   memset(r, 0, sizeof(*r));
 
   r->st                = st;

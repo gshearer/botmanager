@@ -46,9 +46,6 @@ wm_sync_fetch_begin(size_t result_sz)
 
   w = mem_alloc("whenmoon", "sync_fetch", sizeof(*w) + result_sz);
 
-  if(w == NULL)
-    return(NULL);
-
   memset(w, 0, sizeof(*w) + result_sz);
   pthread_mutex_init(&w->mu, NULL);
   pthread_cond_init(&w->cv, NULL);

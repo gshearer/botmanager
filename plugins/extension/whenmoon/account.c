@@ -137,9 +137,6 @@ wm_account_ctx_new(whenmoon_state_t *st, const char *exchange_name)
 
   ctx = mem_alloc("whenmoon", "acct.refresh_ctx", sizeof(*ctx));
 
-  if(ctx == NULL)
-    return(NULL);
-
   ctx->st = st;
   snprintf(ctx->exchange_name, sizeof(ctx->exchange_name), "%s",
       exchange_name);
@@ -377,9 +374,6 @@ wm_account_init(whenmoon_state_t *st)
     return(FAIL);
 
   acc = mem_alloc("whenmoon", "account", sizeof(*acc));
-
-  if(acc == NULL)
-    return(FAIL);
 
   memset(acc, 0, sizeof(*acc));
   st->account = acc;

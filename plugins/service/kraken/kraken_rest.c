@@ -337,9 +337,6 @@ kr_build_private_body(const char *nonce_str, size_t nonce_len,
 
   p = mem_alloc(KR_CTX, "private_body", total + 1);
 
-  if(p == NULL)
-    return(FAIL);
-
   memcpy(p, "nonce=", 6);
   memcpy(p + 6, nonce_str, nonce_len);
 

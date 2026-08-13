@@ -369,12 +369,6 @@ claude_pending_read_file(const char *path, char **out_text, size_t *out_len)
 
   text = mem_alloc(CLAUDE_CTX, "pending-text", cap);
 
-  if(text == NULL)
-  {
-    close(fd);
-    return(false);
-  }
-
   for(;;)
   {
     ssize_t n;
@@ -384,9 +378,6 @@ claude_pending_read_file(const char *path, char **out_text, size_t *out_len)
       size_t ncap = cap * 2;
 
       chunk = mem_alloc(CLAUDE_CTX, "pending-text", ncap);
-
-      if(chunk == NULL)
-        break;
 
       memcpy(chunk, text, have);
       mem_free(text);
@@ -670,9 +661,6 @@ claude_build_envp(const claude_session_t *s, const char *network,
     env_n++;
 
   envp = mem_alloc(CLAUDE_CTX, "envp", (env_n + 4) * sizeof(*envp));
-
-  if(envp == NULL)
-    return(NULL);
 
   for(size_t i = 0; i < env_n; i++)
     envp[i] = environ[i];
@@ -1116,28 +1104,18 @@ claude_init(void)
     {
       claude_pending_retry_ctx_t *r = mem_alloc(CLAUDE_CTX, "retry",
           sizeof(*r));
+      int delay_sec;
 
-      if(r == NULL)
-      {
-        clam(CLAM_WARN, CLAUDE_CTX,
-            "pending retry ctx alloc failed; dropping stash");
-        claude_pending_clear();
-      }
+      r->attempt = 0;
 
-      else
-      {
-        int delay_sec;
-        r->attempt = 0;
+      delay_sec = CLAUDE_DELIVERY_RETRY_DELAYS[0];
 
-        delay_sec = CLAUDE_DELIVERY_RETRY_DELAYS[0];
+      clam(CLAM_INFO, CLAUDE_CTX,
+          "deliver: pending found (%lds old); first attempt in %ds",
+          (long)age, delay_sec);
 
-        clam(CLAM_INFO, CLAUDE_CTX,
-            "deliver: pending found (%lds old); first attempt in %ds",
-            (long)age, delay_sec);
-
-        task_add_deferred("claude_deliver", TASK_ANY, 100,
-            (uint32_t)delay_sec * 1000U, claude_pending_deliver, r);
-      }
+      task_add_deferred("claude_deliver", TASK_ANY, 100,
+          (uint32_t)delay_sec * 1000U, claude_pending_deliver, r);
     }
   }
 

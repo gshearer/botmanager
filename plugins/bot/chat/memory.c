@@ -377,9 +377,6 @@ memory_vec_to_bytea_literal(const float *vec, uint32_t dim)
   const unsigned char *bytes;
   size_t w;
 
-  if(out == NULL)
-    return(NULL);
-
   bytes = (const unsigned char *)vec;
   w = 0;
   out[w++] = '\'';
@@ -427,9 +424,6 @@ memory_bytea_to_vec(const char *cell, uint32_t expected_dim)
     return(NULL);
 
   out = mem_alloc("memory", "vec", n_bytes);
-
-  if(out == NULL)
-    return(NULL);
 
   bytes = (unsigned char *)out;
   h = cell + 2;
@@ -495,12 +489,6 @@ memory_write_embedding(const char *table, const char *id_col, int64_t id,
 
   cap = strlen(hex) + strlen(e_model) + 256;
   sql = mem_alloc("memory", "embed_sql", cap);
-
-  if(sql == NULL)
-  {
-    mem_free(hex); mem_free(e_model);
-    return(FAIL);
-  }
 
   snprintf(sql, cap,
       "INSERT INTO %s (%s, model, dim, vec)"
@@ -690,9 +678,6 @@ memory_submit_embed(int64_t id, const char *model, const char *text,
     return;
 
   c = mem_alloc("memory", "embed_ctx", sizeof(*c));
-
-  if(c == NULL)
-    return;
 
   c->id = id;
   snprintf(c->model, sizeof(c->model), "%s", model);

@@ -72,9 +72,6 @@ wm_strategy_init(wm_strategy_ctx_t *ctx)
 
   s = mem_alloc("strategy." TST_NAME, "state", sizeof(*s));
 
-  if(s == NULL)
-    return(-1);
-
   s->prev_sign = 0;
   s->have_prev = false;
 

@@ -943,9 +943,6 @@ atk_db_blow_apply(const atk_blow_t *b)
 
   sql = mem_alloc(ATK_CTX, "blow_sql", need);
 
-  if(sql == NULL)
-    goto out;
-
   snprintf(sql, need,
       "BEGIN;"
 
@@ -1187,9 +1184,6 @@ atk_db_sweep_apply(const atk_sweep_t *s)
 
   sql = mem_alloc(ATK_CTX, "sweep_sql", need);
 
-  if(sql == NULL)
-    goto out;
-
   sql[0] = '\0';
 
   // The attacker: one blow, one wave spent, one bonus consumed — and the
@@ -1349,9 +1343,6 @@ atk_db_heal_apply(const atk_heal_t *h)
              + strlen(t.scores));
 
   sql = mem_alloc(ATK_CTX, "heal_sql", need);
-
-  if(sql == NULL)
-    goto out;
 
   snprintf(sql, need,
       "BEGIN;"
@@ -1850,9 +1841,6 @@ atk_db_dot_tick(const atk_dot_hit_t *h)
              + strlen(t.players) + strlen(t.scores) + strlen(t.dots));
 
   sql = mem_alloc(ATK_CTX, "dot_tick_sql", need);
-
-  if(sql == NULL)
-    goto out;
 
   snprintf(sql, need,
       "BEGIN;"

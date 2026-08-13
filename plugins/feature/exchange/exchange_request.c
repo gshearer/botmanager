@@ -46,12 +46,6 @@ exchange_dup(const char *module, const char *name, const char *s,
   len = strlen(s);
   out = mem_alloc(module, name, len + 1);
 
-  if(out == NULL)
-  {
-    if(out_len != NULL) *out_len = 0;
-    return(NULL);
-  }
-
   memcpy(out, s, len);
   out[len] = '\0';
 
@@ -71,9 +65,6 @@ exchange_req_new(exchange_t *exch, uint8_t prio,
     return(NULL);
 
   r = mem_alloc("exchange.req", "req", sizeof(*r));
-
-  if(r == NULL)
-    return(NULL);
 
   memset(r, 0, sizeof(*r));
   r->exch    = exch;

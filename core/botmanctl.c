@@ -181,11 +181,6 @@ bctl_client_add(bctl_server_t *srv, int fd)
   }
 
   c = mem_alloc("botmanctl", "client", sizeof(bctl_client_t));
-  if(c == NULL)
-  {
-    close(fd);
-    return(NULL);
-  }
 
   memset(c, 0, sizeof(*c));
   c->fd = fd;
@@ -275,8 +270,6 @@ bctl_drv_create(const char *inst_name)
   (void)inst_name;
 
   srv = mem_alloc("botmanctl", "server", sizeof(bctl_server_t));
-  if(srv == NULL)
-    return(NULL);
 
   memset(srv, 0, sizeof(*srv));
   srv->listen_fd = -1;

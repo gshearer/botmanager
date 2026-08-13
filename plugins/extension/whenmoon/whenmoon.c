@@ -489,13 +489,6 @@ whenmoon_init(void)
 
   st = mem_alloc("whenmoon", "state", sizeof(*st));
 
-  if(st == NULL)
-  {
-    wm_market_persist_global_destroy();
-    TA_Shutdown();
-    return(FAIL);
-  }
-
   memset(st, 0, sizeof(*st));
   whenmoon_state = st;
 

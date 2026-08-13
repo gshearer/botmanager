@@ -382,9 +382,6 @@ wm_strategy_registry_init(whenmoon_state_t *st)
 
   reg = mem_alloc("whenmoon", "strategy_reg", sizeof(*reg));
 
-  if(reg == NULL)
-    return(FAIL);
-
   memset(reg, 0, sizeof(*reg));
 
   if(pthread_mutex_init(&reg->lock, NULL) != 0)
@@ -730,9 +727,6 @@ wm_strategy_make_loaded(const plugin_desc_t *pd, const char *plugin_path)
 
   ls = mem_alloc("whenmoon", "strategy", sizeof(*ls));
 
-  if(ls == NULL)
-    return(NULL);
-
   memset(ls, 0, sizeof(*ls));
   snprintf(ls->name, sizeof(ls->name), "%s", pd->kind);
   snprintf(ls->plugin_name, sizeof(ls->plugin_name), "%s", pd->name);
@@ -1056,16 +1050,6 @@ wm_strategy_attach(whenmoon_state_t *st,
   }
 
   att = mem_alloc("whenmoon", "attach", sizeof(*att));
-
-  if(att == NULL)
-  {
-    pthread_mutex_unlock(&reg->lock);
-    pthread_rwlock_unlock(&st->markets->arr_lock);
-
-    if(err != NULL)
-      snprintf(err, err_cap, "out of memory");
-    return(WM_ATTACH_OOM);
-  }
 
   memset(att, 0, sizeof(*att));
   att->owner = ls;

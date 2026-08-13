@@ -70,9 +70,6 @@ wm_aggregator_init(whenmoon_market_t *mk, uint32_t history_1d_min)
 
   a = mem_alloc("whenmoon", "aggregator", sizeof(*a));
 
-  if(a == NULL)
-    return(FAIL);
-
   memset(a, 0, sizeof(*a));
   a->history_1d           = history_1d_min;
   a->dispatch_strategies  = true;

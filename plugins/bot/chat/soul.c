@@ -451,9 +451,6 @@ soul_on_seen(const char *bot_name, const method_msg_t *msg)
 
   j = mem_alloc("chat", "soul_presence_job", sizeof(*j));
 
-  if(j == NULL)
-    return;
-
   memset(j, 0, sizeof(*j));
   snprintf(j->bot_name, sizeof(j->bot_name), "%s", bot_name);
   j->ns_id = ns_id;
@@ -1206,12 +1203,6 @@ soul_chore_weather(soul_sched_t *s, uint32_t chore,
 
   sweep = mem_alloc("chat", "soul_wx_sweep", sizeof(*sweep));
 
-  if(sweep == NULL)
-  {
-    db_result_free(res);
-    return(false);
-  }
-
   memset(sweep, 0, sizeof(*sweep));
   sweep->sched = s;
   sweep->chore = chore;
@@ -1550,12 +1541,6 @@ soul_schedule(const char *bot_name, uint32_t ns_id, uint32_t interval_secs)
   if(s == NULL)
   {
     s = mem_alloc("chat", "soul_sched", sizeof(*s));
-
-    if(s == NULL)
-    {
-      pthread_mutex_unlock(&soul_mutex);
-      return;
-    }
 
     memset(s, 0, sizeof(*s));
     snprintf(s->bot_name, sizeof(s->bot_name), "%s", bot_name);

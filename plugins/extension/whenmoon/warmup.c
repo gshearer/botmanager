@@ -568,14 +568,6 @@ wm_market_warmup_begin(whenmoon_state_t *st, whenmoon_market_t *mk)
 
   ctx = mem_alloc("whenmoon", "warm_recheck", sizeof(*ctx));
 
-  if(ctx == NULL)
-  {
-    clam(CLAM_WARN, WHENMOON_CTX,
-        "warmup %s: recheck ctx alloc failed — stuck warming",
-        mk->market_id_str);
-    return;
-  }
-
   ctx->st    = st;
   ctx->gen   = gen;
   ctx->iters = 0;

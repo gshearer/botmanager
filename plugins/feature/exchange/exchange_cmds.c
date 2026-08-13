@@ -161,17 +161,8 @@ exch_tickers_done(bool success, const char *err,
     w->rows = mem_alloc(EXCHANGE_CTX, "tickers.rows",
         n * sizeof(*w->rows));
 
-    if(w->rows == NULL)
-    {
-      w->success = false;
-      snprintf(w->err, sizeof(w->err), "%s", "out of memory");
-      w->n = 0;
-    }
-    else
-    {
-      memcpy(w->rows, snaps, n * sizeof(*w->rows));
-      w->n = n;
-    }
+    memcpy(w->rows, snaps, n * sizeof(*w->rows));
+    w->n = n;
   }
 
   w->done = true;
@@ -286,12 +277,6 @@ exch_cmd_tickers(const cmd_ctx_t *ctx)
   }
 
   w = mem_alloc(EXCHANGE_CTX, "tickers.wait", sizeof(*w));
-
-  if(w == NULL)
-  {
-    cmd_reply(ctx, "out of memory");
-    return;
-  }
 
   memset(w, 0, sizeof(*w));
   w->refs = 2;   // waiter + cb

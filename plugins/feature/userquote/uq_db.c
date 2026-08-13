@@ -186,9 +186,6 @@ uq_db_add(uint32_t ns_id, const char *method, const char *channel,
 
     sql = mem_alloc(UQ_CTX, "add_sql", need);
 
-    if(sql == NULL)
-      goto out;
-
     snprintf(sql, need,
         "INSERT INTO %s (ns_id, method, channel, sayer, quoter, quote)"
         " VALUES (%" PRIu32 ", '%s', '%s', '%s', '%s', '%s')"

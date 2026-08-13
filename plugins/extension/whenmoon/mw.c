@@ -1225,10 +1225,6 @@ mw_tickers_done_cb(bool success, const char *err,
   pending = mem_alloc(WHENMOON_CTX, "mw.emits",
       (size_t)MW_EMIT_BUF_CAP * sizeof(*pending));
 
-  if(pending == NULL)
-    clam(CLAM_WARN, MW_CTX, "%s: emit buf alloc FAIL — skipping"
-        " detection this tick", ex->name);
-
   pthread_mutex_lock(&ex->lock);
 
   // Disabled between dispatch + completion — drop result.
@@ -1422,9 +1418,6 @@ mw_exch_alloc_pairs(mw_exch_t *ex, uint32_t ring_n)
   ex->pairs = mem_alloc(WHENMOON_CTX, "mw.pairs",
       (size_t)MW_PAIRS_CAP * sizeof(*ex->pairs));
 
-  if(ex->pairs == NULL)
-    return(FAIL);
-
   memset(ex->pairs, 0, (size_t)MW_PAIRS_CAP * sizeof(*ex->pairs));
   ex->pair_cap   = MW_PAIRS_CAP;
   ex->pair_count = 0;
@@ -1434,47 +1427,11 @@ mw_exch_alloc_pairs(mw_exch_t *ex, uint32_t ring_n)
     ex->pairs[i].ring = mem_alloc(WHENMOON_CTX, "mw.ring",
         (size_t)ring_n * sizeof(*ex->pairs[i].ring));
 
-    if(ex->pairs[i].ring == NULL)
-    {
-      // Roll back: free already-allocated rings + ts arrays, then pairs[].
-      uint32_t j;
-
-      for(j = 0; j < i; j++)
-      {
-        mem_free(ex->pairs[j].ring);
-        if(ex->pairs[j].ring_ts != NULL)
-          mem_free(ex->pairs[j].ring_ts);
-      }
-
-      mem_free(ex->pairs);
-      ex->pairs    = NULL;
-      ex->pair_cap = 0;
-      return(FAIL);
-    }
-
     // MW-3: parallel ts[] for velocity walk-back. Allocated lockstep
     // with ring[]; freed in the same loop in mw_exch_free_pairs.
     ex->pairs[i].ring_ts = mem_alloc(WHENMOON_CTX, "mw.ring_ts",
         (size_t)ring_n * sizeof(*ex->pairs[i].ring_ts));
 
-    if(ex->pairs[i].ring_ts == NULL)
-    {
-      uint32_t j;
-
-      mem_free(ex->pairs[i].ring);
-      ex->pairs[i].ring = NULL;
-
-      for(j = 0; j < i; j++)
-      {
-        mem_free(ex->pairs[j].ring);
-        mem_free(ex->pairs[j].ring_ts);
-      }
-
-      mem_free(ex->pairs);
-      ex->pairs    = NULL;
-      ex->pair_cap = 0;
-      return(FAIL);
-    }
   }
 
   return(SUCCESS);
@@ -2042,9 +1999,6 @@ mw_build_topn(mw_topn_row_t *out, const mw_exch_t *ex, uint32_t ring_n,
   work = mem_alloc(WHENMOON_CTX, "mw.topn",
       (size_t)ex->pair_count * sizeof(*work));
 
-  if(work == NULL)
-    return(0);
-
   for(i = 0; i < ex->pair_count; i++)
   {
     const exchange_ticker_snapshot_t *s =
@@ -2181,14 +2135,6 @@ mw_render_status_exch(method_inst_t *inst, const char *target,
       (size_t)MW_TOPN * sizeof(*rows_pct));
   rows_vol = mem_alloc(WHENMOON_CTX, "mw.topn.vol",
       (size_t)MW_TOPN * sizeof(*rows_vol));
-
-  if(rows_pct == NULL || rows_vol == NULL)
-  {
-    pthread_mutex_unlock(&mw_g.mtx);
-    if(rows_pct != NULL) mem_free(rows_pct);
-    if(rows_vol != NULL) mem_free(rows_vol);
-    return(FAIL);
-  }
 
   pthread_mutex_lock(&ex->lock);
 

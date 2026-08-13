@@ -282,7 +282,6 @@ chatbot_nl_observe_location_slot(bot_inst_t *bot,
     return;
 
   d = mem_alloc(OBS_CTX, "task_data", sizeof(*d));
-  if(d == NULL) return;
 
   memset(d, 0, sizeof(*d));
   d->ns_id = ns_id;

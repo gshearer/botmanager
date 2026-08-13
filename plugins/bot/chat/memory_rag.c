@@ -94,8 +94,6 @@ memory_scan_embeddings(const char *join_sql, const char *id_col,
   sz = strlen(join_sql) + strlen(e_model) + 256;
   sql = mem_alloc("memory", "rag_scan_sql", sz);
 
-  if(sql == NULL) { mem_free(e_model); return; }
-
   snprintf(sql, sz,
       "SELECT e.%s, e.vec %s AND e.model = '%s' AND e.dim = %u",
       id_col, join_sql, e_model, dim);
@@ -515,8 +513,6 @@ memory_merge_msgs(const mem_msg_t *a, size_t na,
 
   dst = mem_alloc("memory", "rag_merged_msgs",
       sizeof(*dst) * cap);
-  if(dst == NULL)
-    return;
 
   n = 0;
   for(size_t i = 0; i < na; i++)
@@ -577,8 +573,6 @@ memory_recall_scan_convo(int ns_id, int64_t dossier_id,
   join_sz = 256 + (exclude_esc != NULL ? strlen(exclude_esc) : 0);
 
   join = mem_alloc("memory", "rag_recall_join", join_sz);
-  if(join == NULL)
-    return;
 
   snprintf(join, join_sz,
       "FROM conversation_embeddings e JOIN conversation_log x"
@@ -687,12 +681,6 @@ memory_retrieve_ns(int ns_id, const char *query,
       qbuf, sizeof(qbuf));
 
   c = mem_alloc("memory", "rag_ctx", sizeof(*c));
-
-  if(c == NULL)
-  {
-    cb(NULL, 0, NULL, 0, user);
-    return(FAIL);
-  }
 
   c->ns_id = ns_id;
   c->top_k = top_k ? top_k : cfg.rag_top_k;
@@ -1000,11 +988,6 @@ memory_retrieve_dossier(int ns_id, int64_t dossier_id, const char *query,
   own_pf = mem_alloc("memory", "rag_pfacts_own",
       sizeof(*own_pf) * (own_cap + toward_cap));
   msgs = NULL;
-  if(own_pf == NULL)
-  {
-    cb(NULL, 0, NULL, 0, user);
-    return(FAIL);
-  }
 
   n_own = memory_get_dossier_facts(dossier_id, MEM_FACT_KIND_ANY,
       own_pf, own_cap);
@@ -1067,13 +1050,6 @@ memory_retrieve_dossier(int ns_id, int64_t dossier_id, const char *query,
 
   rc = mem_alloc("memory",
       "rag_dossier_ctx", sizeof(*rc));
-  if(rc == NULL)
-  {
-    cb(facts, n_facts_total, msgs, n_msgs, user);
-    if(facts != NULL) mem_free(facts);
-    if(msgs  != NULL) mem_free(msgs);
-    return(SUCCESS);
-  }
 
   rc->ns_id          = ns_id;
   rc->dossier_id     = dossier_id;

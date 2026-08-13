@@ -711,15 +711,6 @@ acq_reactive_sxng_done(const sxng_response_t *resp)
     src = mem_alloc(ACQUIRE_CTX, "reactive_source",
         sizeof(*src));
 
-    if(src == NULL)
-    {
-      clam(CLAM_WARN, ACQUIRE_CTX,
-          "%s: source ctx alloc failed url='%s'",
-          acq_ctx_mode(ctx), r->url);
-      reactive_job_release_source(ctx);
-      continue;
-    }
-
     memset(src, 0, sizeof(*src));
     src->parent = ctx;
 

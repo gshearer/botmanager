@@ -187,9 +187,6 @@ note_db_add(uint32_t ns_id, const char *sender, const char *recipient,
 
     sql = mem_alloc(NOTE_CTX, "add_sql", need);
 
-    if(sql == NULL)
-      goto out;
-
     snprintf(sql, need,
         "INSERT INTO %s (ns_id, sender, recipient, body, method, channel)"
         " VALUES (%" PRIu32 ", '%s', '%s', '%s', '%s', '%s')"

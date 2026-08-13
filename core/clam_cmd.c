@@ -474,12 +474,6 @@ cmd_clam_subscribe(const cmd_ctx_t *ctx)
   }
 
   s = mem_alloc("clam_cmd", "user_sub", sizeof(*s));
-  if(s == NULL)
-  {
-    pthread_mutex_unlock(&clam_cmd_mutex);
-    cmd_reply(ctx, "out of memory");
-    return;
-  }
   memset(s, 0, sizeof(*s));
 
   snprintf(s->name, sizeof(s->name), "%s", name);
@@ -630,33 +624,27 @@ render_dest(const ccd_dest_t *d, char *out, size_t out_sz)
 
 // Append one rendered line into a heap-grown buffer. Each line occupies a
 // fixed SHOW_CLAM_LINE_SZ slot so the whole block is a single allocation.
-static bool
+static void
 show_clam_push(char **lines, size_t *n_lines, size_t *cap,
     const char *text)
 {
   if(*n_lines == *cap)
   {
-    size_t  ncap = *cap == 0 ? 16 : *cap * 2;
-    char   *grown;
+    size_t ncap = *cap == 0 ? 16 : *cap * 2;
 
     // mem_realloc() aborts on a NULL pointer (alloc.c:166) — it is not a
     // malloc() substitute. Use mem_alloc() for the first block, then grow.
     if(*lines == NULL)
-      grown = mem_alloc("clam_cmd", "show_lines", ncap * SHOW_CLAM_LINE_SZ);
+      *lines = mem_alloc("clam_cmd", "show_lines", ncap * SHOW_CLAM_LINE_SZ);
     else
-      grown = mem_realloc(*lines, ncap * SHOW_CLAM_LINE_SZ);
+      *lines = mem_realloc(*lines, ncap * SHOW_CLAM_LINE_SZ);
 
-    if(grown == NULL)
-      return(false);
-
-    *lines = grown;
-    *cap   = ncap;
+    *cap = ncap;
   }
 
   snprintf(*lines + *n_lines * SHOW_CLAM_LINE_SZ, SHOW_CLAM_LINE_SZ,
       "%s", text);
   (*n_lines)++;
-  return(true);
 }
 
 static void
@@ -688,8 +676,7 @@ cmd_show_clam(const cmd_ctx_t *ctx)
         s->has_regex ? s->regex_str : "*",
         s->owner[0] != '\0' ? s->owner : "-");
 
-    if(!show_clam_push(&lines, &n_lines, &cap, hdr))
-      break;
+    show_clam_push(&lines, &n_lines, &cap, hdr);
 
     for(size_t d = 0; d < s->n_dests; d++)
     {
@@ -699,8 +686,7 @@ cmd_show_clam(const cmd_ctx_t *ctx)
       render_dest(&s->dests[d], dbuf, sizeof(dbuf));
       snprintf(line, sizeof(line), "      -> %s", dbuf);
 
-      if(!show_clam_push(&lines, &n_lines, &cap, line))
-        break;
+      show_clam_push(&lines, &n_lines, &cap, line);
     }
 
     n++;

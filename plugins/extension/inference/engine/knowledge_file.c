@@ -54,7 +54,6 @@ kw_slurp(const char *path, size_t *out_len)
   rewind(fp);
 
   buf = mem_alloc("knowledge", "slurp", (size_t)sz + 1);
-  if(buf == NULL) { fclose(fp); return(NULL); }
 
   n = fread(buf, 1, (size_t)sz, fp);
   buf[n] = '\0';
@@ -284,7 +283,6 @@ kw_chunk_markdown(kw_ingest_t *ing, const char *body)
   // buffer exceeds chunk_max.
   section = mem_alloc("knowledge", "md_section",
       ing->chunk_max + KNOWLEDGE_CHUNK_TEXT_SZ + 1);
-  if(section == NULL) return;
 
   sec_len = 0;
   sec_cap = ing->chunk_max + KNOWLEDGE_CHUNK_TEXT_SZ;
@@ -377,7 +375,6 @@ kw_chunk_plaintext(kw_ingest_t *ing, const char *body)
 
   buf = mem_alloc("knowledge", "txt_buf",
       ing->chunk_max + KNOWLEDGE_CHUNK_TEXT_SZ + 1);
-  if(buf == NULL) return;
 
   len = 0;
   cap = ing->chunk_max + KNOWLEDGE_CHUNK_TEXT_SZ;

@@ -1169,13 +1169,6 @@ wm_bt_render_topn_txt(const char *sweep_dir,
   indices = mem_alloc(WM_BT_REPORT_CTX, "topn_indices",
       sizeof(*indices) * (size_t)n_results);
 
-  if(indices == NULL)
-  {
-    if(err != NULL)
-      snprintf(err, err_cap, "topn_indices alloc failed");
-    return(FAIL);
-  }
-
   top_k = wm_bt_topk_compute(results, n_results, plan->top_k, indices);
 
   fp = fopen(tmp, "w");
@@ -1434,13 +1427,6 @@ wm_bt_render_report_md(const char *sweep_dir,
 
   indices = mem_alloc(WM_BT_REPORT_CTX, "report_indices",
       sizeof(*indices) * (size_t)n_results);
-
-  if(indices == NULL)
-  {
-    if(err != NULL)
-      snprintf(err, err_cap, "report_indices alloc failed");
-    return(FAIL);
-  }
 
   top_k = wm_bt_topk_compute(results, n_results, plan->top_k, indices);
 
@@ -2740,13 +2726,6 @@ wm_bt_render_index_html(const char *sweep_dir,
   indices = mem_alloc(WM_BT_REPORT_CTX, "index_indices",
       sizeof(*indices) * (size_t)n_results);
 
-  if(indices == NULL)
-  {
-    if(err != NULL)
-      snprintf(err, err_cap, "index_indices alloc failed");
-    return(FAIL);
-  }
-
   top_k = wm_bt_topk_compute(results, n_results, top_n, indices);
 
   fp = fopen(tmp, "w");
@@ -3718,13 +3697,6 @@ wm_bt_render_sweep_html(const char *sweep_dir,
   indices = mem_alloc(WM_BT_REPORT_CTX, "sweep_indices",
       sizeof(*indices) * (size_t)n_results);
 
-  if(indices == NULL)
-  {
-    if(err != NULL)
-      snprintf(err, err_cap, "sweep_indices alloc failed");
-    return(FAIL);
-  }
-
   top_k = wm_bt_topk_compute(results, n_results, plan->top_k, indices);
 
   fp = fopen(tmp, "w");
@@ -4072,23 +4044,6 @@ wm_bt_dir_listdir(const char *path, wm_bt_dir_listing_t *out,
       grown = mem_alloc(WM_BT_REPORT_CTX, "dir_names",
           sizeof(*grown) * (size_t)new_cap);
 
-      if(grown == NULL)
-      {
-        closedir(dir);
-
-        if(err != NULL)
-          snprintf(err, err_cap, "dir_names alloc failed");
-
-        if(names != NULL)
-        {
-          uint32_t k;
-          for(k = 0; k < n; k++) mem_free(names[k]);
-          mem_free(names);
-        }
-
-        return(FAIL);
-      }
-
       if(names != NULL)
       {
         memcpy(grown, names, sizeof(*grown) * (size_t)n);
@@ -4101,23 +4056,6 @@ wm_bt_dir_listdir(const char *path, wm_bt_dir_listing_t *out,
 
     len  = strlen(de->d_name);
     copy = mem_alloc(WM_BT_REPORT_CTX, "dir_name", len + 1);
-
-    if(copy == NULL)
-    {
-      closedir(dir);
-
-      if(err != NULL)
-        snprintf(err, err_cap, "dir_name alloc failed");
-
-      if(names != NULL)
-      {
-        uint32_t k;
-        for(k = 0; k < n; k++) mem_free(names[k]);
-        mem_free(names);
-      }
-
-      return(FAIL);
-    }
 
     memcpy(copy, de->d_name, len + 1);
     names[n++] = copy;

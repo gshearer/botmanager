@@ -463,14 +463,6 @@ wm_market_engine_real_submit_locked(whenmoon_market_t *mk,
 
     ctx = mem_alloc(WM_LIVE_CTX, "live_market_done_ctx", sizeof(*ctx));
 
-    if(ctx == NULL)
-    {
-      // Roll back the pending row.
-      mk->session.pending_n--;
-      ERRSET("oom");
-      return(FAIL);
-    }
-
     snprintf(ctx->market_id_str, sizeof(ctx->market_id_str), "%s",
         mk->market_id_str);
     snprintf(ctx->coid, sizeof(ctx->coid), "%s", coid);
@@ -917,13 +909,6 @@ wm_live_ws_resub_all(whenmoon_state_t *st)
   pid_ptrs = mem_alloc("whenmoon.live", "ws_pids",
       sizeof(*pid_ptrs) * m->n_markets);
 
-  if(pid_ptrs == NULL)
-  {
-    pthread_rwlock_unlock(&m->arr_lock);
-    clam(CLAM_WARN, WM_LIVE_CTX, "user-channel resub alloc failed");
-    return;
-  }
-
   // For each distinct exchange in the running set, gather its
   // product_ids and (if creds are configured) issue one user-channel
   // subscribe. Capacity, dedup, and skip-on-no-creds mirror the
@@ -1277,7 +1262,6 @@ wm_live_fills_poll_tick(task_t *t)
       continue;
 
     ctx = mem_alloc(WM_LIVE_CTX, "fills_ctx", sizeof(*ctx));
-    if(ctx == NULL) continue;
 
     snprintf(ctx->market_id_str, sizeof(ctx->market_id_str), "%s",
         mkts->arr[i]->market_id_str);

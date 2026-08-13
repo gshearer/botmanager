@@ -719,14 +719,6 @@ wm_bt_assets_write_joined(const char *path, const char *const *parts,
 
   buf = mem_alloc("whenmoon.bt.report", "asset_join", total + 1);
 
-  if(buf == NULL)
-  {
-    if(err != NULL)
-      snprintf(err, err_cap, "asset join alloc failed");
-
-    return(FAIL);
-  }
-
   for(i = 0; parts[i] != NULL; i++)
   {
     size_t len = strlen(parts[i]);

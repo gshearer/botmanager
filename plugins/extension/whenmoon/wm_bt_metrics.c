@@ -48,14 +48,6 @@ wm_bt_equity_series_build(const wm_market_fill_t *fills, uint32_t n,
   pts = mem_alloc(WM_BT_METRICS_CTX, "equity_points",
       sizeof(*pts) * ((size_t)n + 1u));
 
-  if(pts == NULL)
-  {
-    if(err != NULL)
-      snprintf(err, err_cap, "equity_points alloc failed (n=%u)", n);
-
-    return(FAIL);
-  }
-
   if(!isfinite(start_cash))
     start_cash = 0.0;
 

@@ -53,8 +53,7 @@ typedef struct
 static bool
 wm_mp_buf_grow(wm_mp_buf_t *b, size_t need)
 {
-  size_t  new_cap;
-  char   *p;
+  size_t new_cap;
 
   if(b == NULL || b->oom)
     return(FAIL);
@@ -67,15 +66,7 @@ wm_mp_buf_grow(wm_mp_buf_t *b, size_t need)
   while(new_cap < b->off + need + 1)
     new_cap *= 2;
 
-  p = mem_realloc(b->buf, new_cap);
-
-  if(p == NULL)
-  {
-    b->oom = true;
-    return(FAIL);
-  }
-
-  b->buf = p;
+  b->buf = mem_realloc(b->buf, new_cap);
   b->cap = new_cap;
   return(SUCCESS);
 }
@@ -418,14 +409,6 @@ wm_mp_build_upsert_locked(const whenmoon_market_t *mk)
   last_signal.buf = mem_alloc("whenmoon", "mp_json_signal",  WM_MP_BUF_INIT_CAP);
   sql.buf         = mem_alloc("whenmoon", "mp_sql",          WM_MP_SQL_INIT_CAP);
 
-  if(stats_paper.buf == NULL || stats_real.buf == NULL ||
-     fills_paper.buf == NULL || fills_real.buf == NULL ||
-     pending.buf == NULL || last_signal.buf == NULL || sql.buf == NULL)
-  {
-    oom = true;
-    goto out;
-  }
-
   stats_paper.cap = WM_MP_JSON_INIT_CAP;
   stats_real.cap  = WM_MP_JSON_INIT_CAP;
   fills_paper.cap = WM_MP_JSON_INIT_CAP;
@@ -628,12 +611,6 @@ wm_mp_enqueue_owned(int32_t market_id, const char *instance,
 
   e = mem_alloc("whenmoon", "mp_entry", sizeof(*e));
 
-  if(e == NULL)
-  {
-    pthread_mutex_unlock(&wm_mp_g_lock);
-    return(FAIL);
-  }
-
   memset(e, 0, sizeof(*e));
   e->market_id = market_id;
   snprintf(e->instance, sizeof(e->instance), "%s", instance);
@@ -684,9 +661,6 @@ wm_market_persist_disable(int32_t market_id, const char *instance)
     instance = "";
 
   sql = mem_alloc("whenmoon", "mp_disable_sql", cap);
-
-  if(sql == NULL)
-    return(FAIL);
 
   // WM-MI-2: drop this instance out of the running set but KEEP the row
   // so its final paper P&L stays inspectable. The instance label is

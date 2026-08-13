@@ -342,13 +342,6 @@ wm_backtest_snapshot_build(int32_t market_id_db,
 
   snap = mem_alloc("whenmoon.backtest", "snapshot", sizeof(*snap));
 
-  if(snap == NULL)
-  {
-    if(err != NULL)
-      snprintf(err, err_cap, "out of memory");
-    return(NULL);
-  }
-
   memset(snap, 0, sizeof(*snap));
 
   // WM-BT-2: heap-built snapshot — not file-backed. map_fd is -1 to

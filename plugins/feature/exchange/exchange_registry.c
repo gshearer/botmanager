@@ -127,9 +127,6 @@ exchange_registry_add(const char *name,
 
   e = mem_alloc("exchange.reg", "exch", sizeof(*e));
 
-  if(e == NULL)
-    return(FAIL);
-
   memset(e, 0, sizeof(*e));
   memcpy(e->name, name, nlen);
   e->name[nlen] = '\0';

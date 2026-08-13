@@ -948,12 +948,6 @@ llm_test_inject_response(const char *content)
   size_t n   = strlen(content);
   char  *dup = mem_alloc("llm", "test_pending", n + 1);
 
-  if(dup == NULL)
-  {
-    pthread_mutex_unlock(&llm_test_pending_mutex);
-    return(FAIL);
-  }
-
   memcpy(dup, content, n + 1);
   llm_test_pending = dup;
 

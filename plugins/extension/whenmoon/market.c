@@ -129,9 +129,6 @@ wm_market_grow(whenmoon_markets_t *m, uint32_t needed)
   {
     next = mem_alloc("whenmoon", "market_arr", new_sz);
 
-    if(next == NULL)
-      return(FAIL);
-
     memset(next, 0, new_sz);
   }
 
@@ -140,9 +137,6 @@ wm_market_grow(whenmoon_markets_t *m, uint32_t needed)
     old_sz = (size_t)m->cap * sizeof(*m->arr);
 
     next = mem_realloc(m->arr, new_sz);
-
-    if(next == NULL)
-      return(FAIL);
 
     memset((char *)next + old_sz, 0, new_sz - old_sz);
   }
@@ -212,15 +206,6 @@ wm_market_resub_ws(whenmoon_state_t *st)
 
   pid_ptrs = mem_alloc("whenmoon", "ws_pids",
       sizeof(*pid_ptrs) * m->n_markets);
-
-  if(pid_ptrs == NULL)
-  {
-    clam(CLAM_INFO, WHENMOON_CTX,
-        "ws resub alloc failed (no live stream)");
-    wm_live_ws_resub_all(st);
-    pthread_rwlock_unlock(&m->arr_lock);
-    return;
-  }
 
   // For each distinct exchange in the running set, gather its
   // product_ids and issue one subscribe. The "have we already bound
@@ -331,9 +316,6 @@ wm_market_kick_backfill(whenmoon_state_t *st,
     instance = "";
 
   ctx = mem_alloc("whenmoon", "backfill_ctx", sizeof(*ctx));
-
-  if(ctx == NULL)
-    return;
 
   ctx->st = st;
   snprintf(ctx->exchange_name, sizeof(ctx->exchange_name), "%s",
@@ -1068,9 +1050,6 @@ wm_market_init(whenmoon_state_t *st)
 
   m = mem_alloc("whenmoon", "markets", sizeof(*m));
 
-  if(m == NULL)
-    return(FAIL);
-
   memset(m, 0, sizeof(*m));
 
   // WM-MKT-ARR-UAF-1: default (reader-preferring) attributes — see the
@@ -1204,12 +1183,6 @@ wm_market_add(whenmoon_state_t *st,
   // complete do we take the write lock and publish it. A failure on this
   // path is a simple free — no arr touch, no rollback of a live slot.
   mk = mem_alloc("whenmoon", "market", sizeof(*mk));
-
-  if(mk == NULL)
-  {
-    if(err != NULL) snprintf(err, err_cap, "alloc failed");
-    return(FAIL);
-  }
 
   memset(mk, 0, sizeof(*mk));
   snprintf(mk->exchange_name, sizeof(mk->exchange_name), "%s", exchange);
@@ -1608,13 +1581,6 @@ wm_market_create_synthetic(const char *market_id_str,
   }
 
   mk = mem_alloc(WHENMOON_CTX, "market_synth", sizeof(*mk));
-
-  if(mk == NULL)
-  {
-    if(errbuf != NULL && errbuf_sz > 0)
-      snprintf(errbuf, errbuf_sz, "oom");
-    return(FAIL);
-  }
 
   memset(mk, 0, sizeof(*mk));
 

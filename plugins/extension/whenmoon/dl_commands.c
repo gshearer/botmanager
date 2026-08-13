@@ -349,12 +349,6 @@ wm_dl_cmd_download_market(const cmd_ctx_t *ctx, whenmoon_state_t *st,
   gaps = mem_alloc(WM_DL_CTX, "gaps",
       (size_t)WM_DL_GAPS_FANOUT_CAP * sizeof(*gaps));
 
-  if(gaps == NULL)
-  {
-    cmd_reply(ctx, "out of memory");
-    return;
-  }
-
   n_gaps = wm_gap_find_row_gaps(market_id,
       range_start, range_end, gaps, WM_DL_GAPS_FANOUT_CAP);
 
@@ -604,12 +598,6 @@ wm_dl_cmd_show_download_candles(const cmd_ctx_t *ctx)
 
   rows = mem_alloc("whenmoon.dl", "agg_candles",
       (size_t)WM_DL_CANDLES_OUT_CAP * sizeof(*rows));
-
-  if(rows == NULL)
-  {
-    cmd_reply(ctx, "out of memory");
-    return;
-  }
 
   // Persistence is 1m-only; surface the raw 1m bars through the
   // upsample helper at gran=60 (a passthrough) so callers see the

@@ -1299,15 +1299,6 @@ wm_bt_sweep_run(whenmoon_state_t *st,
   threads = mem_alloc("whenmoon.sweep", "threads",
       sizeof(*threads) * plan->workers);
 
-  if(threads == NULL)
-  {
-    wm_bt_sweep_active_dec();
-
-    if(err != NULL)
-      snprintf(err, err_cap, "thread array alloc failed");
-    return(FAIL);
-  }
-
   for(i = 0; i < plan->workers; i++)
   {
     if(pthread_create(&threads[i], NULL,
@@ -1392,9 +1383,6 @@ wm_bt_topk_compute(const wm_bt_sweep_result_t *results,
 
   tmp = mem_alloc("whenmoon.sweep", "topk_entries",
       sizeof(*tmp) * (size_t)n_results);
-
-  if(tmp == NULL)
-    return(0);
 
   for(i = 0; i < n_results; i++)
   {
@@ -1634,12 +1622,6 @@ wm_bt_sweep_render_topk(const cmd_ctx_t *ctx,
   indices = mem_alloc("whenmoon.sweep", "topk_indices",
       sizeof(*indices) * (size_t)n);
 
-  if(indices == NULL)
-  {
-    cmd_reply(ctx, "render: out of memory");
-    return;
-  }
-
   top_k = wm_bt_topk_compute(results, n, plan->top_k, indices);
   wm_bt_topk_to_ctx(ctx, plan, mode, results, indices, top_k, n, n_ok);
 
@@ -1721,16 +1703,6 @@ wm_bt_sweep_run_oos_validation(whenmoon_state_t *st,
       sizeof(*top_idx)   * (size_t)top_k);
   top_score = mem_alloc("whenmoon.sweep", "oos_top_score",
       sizeof(*top_score) * (size_t)top_k);
-
-  if(top_idx == NULL || top_score == NULL)
-  {
-    if(top_idx   != NULL) mem_free(top_idx);
-    if(top_score != NULL) mem_free(top_score);
-
-    if(err != NULL)
-      snprintf(err, err_cap, "oos validation alloc failed");
-    return(FAIL);
-  }
 
   for(i = 0; i < top_k; i++)
   {
@@ -1892,9 +1864,6 @@ wm_bt_perfold_one_row(whenmoon_state_t *st, wm_backtest_snapshot_t *snap,
   folds = mem_alloc("whenmoon.sweep", "wf_folds",
       sizeof(*folds) * (size_t)walk->n);
 
-  if(folds == NULL)
-    return(false);
-
   memset(folds, 0, sizeof(*folds) * (size_t)walk->n);
 
   wm_bt_sweep_iter_indices(plan, src_iter, indices);
@@ -2009,13 +1978,6 @@ wm_bt_sweep_run_walk_perfold(whenmoon_state_t *st,
 
   top_idx = mem_alloc("whenmoon.sweep", "wf_top_idx",
       sizeof(*top_idx) * (size_t)plan->total_iters);
-
-  if(top_idx == NULL)
-  {
-    if(err != NULL)
-      snprintf(err, err_cap, "walk-perfold alloc failed");
-    return(FAIL);
-  }
 
   // Reuse the shared top-K selector (score desc). For the single-config
   // competition run total_iters == 1 ⇒ top_k == 1 ⇒ the lone row.
