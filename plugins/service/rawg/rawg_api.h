@@ -169,14 +169,40 @@ typedef void (*rawg_game_cb_t)(const rawg_game_res_t *, void *user);
 // True when plugin.rawg.creds.apikey is configured.
 bool rawg_configured(void);
 
-// Free-text search over the games catalogue.
+// ----------------------------------------------------------------------
+// Async failure contract — all three below (PLUGIN.md §Async failure
+// semantics, which MUSTs this be stated and MUSTs you not guess it).
+//
+// rawg is in the "FAIL ⇒ the callback did NOT fire" row, opposite the
+// exchange drivers. For every `*_async` here:
+//
+//   FAIL    — nothing was dispatched and your callback will never run.
+//             **You still own your closure: free it, and answer the
+//             user yourself.** Causes are all pre-flight: NULL/empty
+//             argument, no API key configured, URL overflow, or the
+//             curl request could not be created or submitted.
+//   SUCCESS — the callback runs exactly once. Usually later, on the
+//             curl worker.
+//
+// ⚠ But two of them can run it **synchronously, before this call
+// returns** — a warm cache is answered in place (`rawg_game_async`,
+// `rawg_list_async`; `rawg_search_async` has no cache and is always
+// deferred). SUCCESS therefore does NOT mean "later", and a caller
+// holding a lock across the call can re-enter itself through its own
+// callback. Take that seriously or call from a task worker.
+// ----------------------------------------------------------------------
+
+// Free-text search over the games catalogue. No cache: on SUCCESS the
+// callback always runs later, on the curl worker.
 bool rawg_search_async(const char *query, rawg_search_cb_t cb, void *user);
 
-// Full detail for one game by numeric id.
+// Full detail for one game by numeric id. ⚠ Cached: on SUCCESS the
+// callback may already have run, inside this call.
 bool rawg_game_async(int32_t id, rawg_game_cb_t cb, void *user);
 
 // A ranked list. `year` == 0 uses the kind's default date window; a
-// positive year windows to that whole calendar year.
+// positive year windows to that whole calendar year. ⚠ Cached: on
+// SUCCESS the callback may already have run, inside this call.
 bool rawg_list_async(rawg_list_kind_t kind, int32_t year,
     rawg_search_cb_t cb, void *user);
 

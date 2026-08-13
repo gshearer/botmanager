@@ -232,6 +232,35 @@ typedef void (*gemini_done_symbols_cb_t)(
 // creds.private_key base64-decodes cleanly.
 bool gemini_apikey_configured(void);
 
+// ------------------------------------------------------------------
+// Async failure contract — the whole file (PLUGIN.md §Async failure
+// semantics, which MUSTs this be stated and MUSTs you not guess it).
+//
+// Gemini is in the "FAIL ⇒ the callback has ALREADY fired" row, with
+// `coinbase` and `kraken`. So for every `*_async` below:
+//
+//   SUCCESS — the callback fires later, from the curl-multi thread.
+//   FAIL    — the callback has already fired synchronously, inside the
+//             call, with `res->err` populated. **Free nothing and say
+//             nothing**: your closure was consumed by that callback,
+//             and the tracked allocator aborts the daemon with no FATAL
+//             line if you free it twice.
+//
+// The one exception is the argument check an entry point makes before
+// it allocates anything: a NULL callback or a missing/empty required
+// parameter returns FAIL immediately, and there is no callback to fire
+// (you did not supply one, or the call was malformed) and nothing was
+// taken from you. Every reachable failure *after* that point delivers
+// through gem_deliver_*_fail(). Which entry points have such a check is
+// noted on each below — `gemini_symbols_refresh_async` deliberately has
+// none, because a NULL callback is legal there.
+//
+// This convention has killed the daemon twice tree-wide, most recently
+// 2026-08-12, so it is written down here rather than inferred from a
+// neighbour: the neighbouring plugin's behaviour is not evidence of
+// this one's.
+// ------------------------------------------------------------------
+
 // Refresh the symbols cache via GET /v1/symbols followed by per-symbol
 // GET /v1/symbols/details/<sym>. Safe to call with cb=NULL for the
 // fire-and-forget pattern. The cache is populated by side-effect via
@@ -242,6 +271,10 @@ bool gemini_apikey_configured(void);
 // populator issues one detail request per listed symbol, completing
 // asynchronously. The callback fires once after the last detail
 // response lands; partial-failure rows are skipped silently.
+//
+// FAIL: the callback has already fired — no argument check precedes it,
+// because cb=NULL is legal here and a silent stand-in is substituted, so
+// every reachable failure runs the batch's finaliser on the way out.
 bool gemini_symbols_refresh_async(gemini_done_symbols_cb_t cb, void *user);
 
 // ------------------------------------------------------------------
@@ -250,6 +283,12 @@ bool gemini_symbols_refresh_async(gemini_done_symbols_cb_t cb, void *user);
 // internal TUs). Each runs the corresponding gem_submit_{public,
 // private} call, parses the response, and fires the typed callback on
 // the curl worker thread.
+//
+// All seven follow the file's contract above: FAIL means the typed
+// callback has already fired with `res->err` set, so free nothing —
+// **except** for the argument check each makes first (NULL callback, or
+// the required parameter named in its own comment), which returns FAIL
+// having allocated nothing and fired nothing.
 // ------------------------------------------------------------------
 
 // Public GET /v2/candles/<native>/<time_frame>. since_ms / until_ms are

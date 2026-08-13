@@ -202,21 +202,50 @@ typedef void (*tmdb_person_cb_t)(const tmdb_person_res_t *, void *user);
 // True when plugin.tmdb.creds.apikey is configured.
 bool tmdb_configured(void);
 
+// ----------------------------------------------------------------------
+// Async failure contract — all four below (PLUGIN.md §Async failure
+// semantics, which MUSTs this be stated and MUSTs you not guess it).
+//
+// tmdb is in the "FAIL ⇒ the callback did NOT fire" row, opposite the
+// exchange drivers. For every `*_async` here:
+//
+//   FAIL    — nothing was dispatched and your callback will never run.
+//             **You still own your closure: free it, and answer the
+//             user yourself.** Causes are all pre-flight: NULL/empty or
+//             out-of-range argument, no API key configured, URL
+//             overflow, or the curl request could not be created or
+//             submitted.
+//   SUCCESS — the callback runs exactly once. Usually later, on the
+//             curl worker.
+//
+// ⚠ But three of them can run it **synchronously, before this call
+// returns** — a warm cache is answered in place (`tmdb_title_async`,
+// `tmdb_person_async`, `tmdb_trending_async`; `tmdb_search_async` has
+// no cache and is always deferred). SUCCESS therefore does NOT mean
+// "later", and a caller holding a lock across the call can re-enter
+// itself through its own callback. Take that seriously or call from a
+// task worker.
+// ----------------------------------------------------------------------
+
 // Search. `kind` selects the endpoint: TMDB_MEDIA_UNKNOWN → /search/multi
 // (hits carry per-item media); MOVIE/TV/PERSON → the typed endpoint (all
-// hits take `kind`).
+// hits take `kind`). No cache: on SUCCESS the callback always runs
+// later, on the curl worker.
 bool tmdb_search_async(tmdb_media_t kind, const char *query,
     tmdb_search_cb_t cb, void *user);
 
-// Full detail for one title. `kind` must be MOVIE or TV.
+// Full detail for one title. `kind` must be MOVIE or TV. ⚠ Cached: on
+// SUCCESS the callback may already have run, inside this call.
 bool tmdb_title_async(tmdb_media_t kind, int32_t id,
     tmdb_title_cb_t cb, void *user);
 
-// Full detail for one person.
+// Full detail for one person. ⚠ Cached: on SUCCESS the callback may
+// already have run, inside this call.
 bool tmdb_person_async(int32_t id, tmdb_person_cb_t cb, void *user);
 
 // Trending list. `kind` is UNKNOWN (all), MOVIE, or TV. `weekly` selects
-// the day/week window.
+// the day/week window. ⚠ Cached: on SUCCESS the callback may already
+// have run, inside this call.
 bool tmdb_trending_async(tmdb_media_t kind, bool weekly,
     tmdb_search_cb_t cb, void *user);
 

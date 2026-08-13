@@ -105,6 +105,20 @@ void db_result_set_value(db_result_t *r, uint32_t row, uint32_t col,
 
 bool db_query(const char *sql, db_result_t *result);
 
+// Run `sql` on a task worker and hand the result to `cb`. `sql` is
+// copied; the caller may free it on return.
+//
+// Async failure contract (PLUGIN.md §Async failure semantics, which
+// MUSTs this be stated and MUSTs you not guess it): this is the
+// "FAIL ⇒ the callback did NOT fire" row.
+//
+//   FAIL    — refused before anything was queued: the DB is not ready,
+//             no driver is bound, or `sql`/`cb` is NULL. Your callback
+//             will never run, so **you still own `data`** — free it and
+//             report the failure yourself.
+//   SUCCESS — the work is queued; `cb` runs exactly once, later, on a
+//             task worker. Never synchronously, so `data` may safely be
+//             owned by the callback from this point.
 bool db_query_async(const char *sql, db_cb_t cb, void *data);
 
 // Stream a SELECT row-by-row without materializing a db_result_t. Runs
