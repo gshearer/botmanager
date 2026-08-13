@@ -47,7 +47,7 @@ static void
 cmd_show_personalities(const cmd_ctx_t *ctx)
 {
   char       dir[PATH_MAX];
-  char       hdr[256];
+  char       hdr[PATH_MAX + 64];   // the line quotes a whole path
   ps_state_t st = { .ctx = ctx, .count = 0 };
 
   if(!chatbot_personality_path(dir, sizeof(dir)))

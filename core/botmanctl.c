@@ -373,7 +373,17 @@ bctl_drv_connect(void *handle)
 
   memset(&addr, 0, sizeof(addr));
   addr.sun_family = AF_UNIX;
-  snprintf(addr.sun_path, sizeof(addr.sun_path), "%s", srv->sock_path);
+
+  // sun_path is 108 bytes and sock_path is longer, so a silent truncation
+  // would bind a socket nobody is looking for. Refuse instead.
+  if(snprintf(addr.sun_path, sizeof(addr.sun_path), "%s", srv->sock_path)
+      >= (int)sizeof(addr.sun_path))
+  {
+    clam(CLAM_WARN, "botmanctl", "socket path too long (max %zu): %s",
+        sizeof(addr.sun_path) - 1, srv->sock_path);
+    close(fd);
+    return(FAIL);
+  }
 
   if(bind(fd, (struct sockaddr *)&addr, sizeof(addr)) < 0)
   {

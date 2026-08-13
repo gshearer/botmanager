@@ -445,7 +445,10 @@ main(int argc, char *argv[])
 
     if(bs.instances == 0)
     {
-      clam(CLAM_INFO, "main", "");
+      // "%s" with an empty argument, not a bare "": the format attribute
+      // rejects a zero-length literal, and these two are blank spacer
+      // lines around the banner, not accidents.
+      clam(CLAM_INFO, "main", "%s", "");
       clam(CLAM_INFO, "main",
           "Welcome to BotManager. No bot instances are configured.");
       clam(CLAM_INFO, "main",
@@ -454,7 +457,7 @@ main(int argc, char *argv[])
       clam(CLAM_INFO, "main", "  show           — show configuration values");
       clam(CLAM_INFO, "main", "  set            — set a configuration value");
       clam(CLAM_INFO, "main", "  status         — system health dashboard");
-      clam(CLAM_INFO, "main", "");
+      clam(CLAM_INFO, "main", "%s", "");
     }
   }
 

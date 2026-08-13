@@ -601,9 +601,13 @@ method_send_emote(method_inst_t *inst, const char *target, const char *text)
 
   else if(inst->driver->send != NULL)
   {
-    // Fallback: "*text*" via plain send.
+    // Fallback: "*text*" via plain send. The precision reserves room for
+    // both asterisks and the terminator, so a full-length emote loses its
+    // tail rather than its closing marker.
     char wrapped[METHOD_TEXT_SZ];
-    snprintf(wrapped, sizeof(wrapped), "*%s*", buf);
+
+    snprintf(wrapped, sizeof(wrapped), "*%.*s*",
+        (int)(sizeof(wrapped) - 3), buf);
     rc = inst->driver->send(inst->handle, target, wrapped);
   }
 

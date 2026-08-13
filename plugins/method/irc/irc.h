@@ -17,6 +17,11 @@
 // and the only thing an MFA pattern is matched against beyond the nick.
 #define IRC_USERHOST_SZ (IRC_NICK_SZ + IRC_HOST_SZ + 2)
 
+// "nick!user@host" — an MFA pattern rebuilt from the parsed parts. Sized
+// from those parts rather than from IRC_PREFIX_SZ, which is the size of
+// the *received* prefix and is smaller than the three fields it feeds.
+#define IRC_MFA_SZ      (IRC_NICK_SZ + IRC_USERHOST_SZ + 1)
+
 // Sanitised KICK/KILL reason. Short enough that the command envelope
 // (verb, channel, target) always fits inside IRC_LINE_SZ.
 #define IRC_EJECT_REASON_SZ 200
@@ -38,6 +43,17 @@
 // Channel name size (without # prefix) for KV key segments.
 #define IRC_CHAN_SZ     64
 #define IRC_CHAN_MAX_MEMBERS 512
+
+// "bot." + a BOT_NAME_SZ name + ".irc." never reaches 80, and saying so is
+// what lets the compiler prove every derived key fits KV_KEY_SZ — including
+// the per-channel admin keys, which append a second IRC_CHAN_SZ segment.
+// Same reasoning, same number, as the reachy driver's REACHY_KV_PREFIX_SZ.
+#define IRC_KV_PREFIX_SZ 80
+
+// The same idea one segment deeper: "bot.<name>.irc.chan.<channel>." is
+// the root of every per-channel setting, and its longest leaf is
+// ".admin.kick_unident_delay".
+#define IRC_KV_CHAN_PREFIX_SZ 144
 
 // Member mode flags (tracked from NAMES prefixes and MODE changes).
 #define IRC_MFLAG_OP     0x01  // @ — channel operator
@@ -89,7 +105,7 @@ typedef struct
 {
   // Instance identity.
   char              inst_name[METHOD_NAME_SZ];
-  char              kv_prefix[KV_KEY_SZ]; // "bot.<botname>.irc."
+  char              kv_prefix[IRC_KV_PREFIX_SZ]; // "bot.<botname>.irc."
   method_inst_t    *inst;           // set by connect(), not create()
 
   // Socket session (core socket service).
@@ -168,11 +184,6 @@ typedef struct
 #include <stdarg.h>
 #include "validate.h"
 #include "irc_identity.h"
-
-// Forward declarations (irc.c only).
-static void irc_sock_cb(const sock_event_t *event, void *user_data);
-static void irc_reconnect_task(task_t *t);
-static void irc_attempt_connect(irc_state_t *st);
 
 // Server name collection (shared by resolve and listing).
 typedef struct
@@ -336,6 +347,21 @@ void    irc_apply_chan_admin(irc_state_t *st, const char *channel);
 bool irc_valid_name(const char *name);
 void irc_address_to_key(const char *address, char *out, size_t out_sz);
 
+#endif // IRC_INTERNAL
+
+// irc.c's own material. IRC_INTERNAL is shared by all five translation
+// units of this driver, so anything `static` that only irc.c defines has
+// to sit behind its own guard — otherwise every other TU is told a
+// function exists that it will never see, which is exactly the
+// "declared static but never defined" the compiler used to report.
+// irc_commands.c has the same arrangement below.
+#ifdef IRC_DRIVER_INTERNAL
+
+// Forward declarations (irc.c only).
+static void irc_sock_cb(const sock_event_t *event, void *user_data);
+static void irc_reconnect_task(task_t *t);
+static void irc_attempt_connect(irc_state_t *st);
+
 // Forward declarations for driver vtable.
 static void *irc_create(const char *inst_name);
 static void irc_destroy(void *handle);
@@ -354,41 +380,6 @@ static method_eject_t irc_eject_probe(void *handle, const char *channel,
     const char *target);
 static bool irc_eject(void *handle, const char *channel, const char *target,
     method_eject_t force, const char *reason);
-
-// Argument specs for IRC subcommands.
-static const cmd_arg_desc_t ad_irc_netname[] = {
-  { "name", CMD_ARG_CUSTOM, CMD_ARG_REQUIRED, IRC_NET_NAME_SZ, irc_valid_name },
-};
-
-static const cmd_arg_desc_t ad_irc_srv_add[] = {
-  { "network", CMD_ARG_CUSTOM,    CMD_ARG_REQUIRED, IRC_NET_NAME_SZ, irc_valid_name },
-  { "host",    CMD_ARG_HOSTNAME,  CMD_ARG_REQUIRED, IRC_HOST_SZ,     NULL },
-  { "port",    CMD_ARG_PORT,      CMD_ARG_OPTIONAL, 8,               NULL },
-};
-
-static const cmd_arg_desc_t ad_irc_srv_del[] = {
-  { "network", CMD_ARG_CUSTOM,    CMD_ARG_REQUIRED, IRC_NET_NAME_SZ, irc_valid_name },
-  { "host",    CMD_ARG_HOSTNAME,  CMD_ARG_REQUIRED, IRC_HOST_SZ,     NULL },
-};
-
-static const cmd_arg_desc_t ad_irc_srv_list[] = {
-  { "network", CMD_ARG_CUSTOM, CMD_ARG_OPTIONAL, IRC_NET_NAME_SZ, irc_valid_name },
-};
-
-static const cmd_arg_desc_t ad_irc_chan_add[] = {
-  { "bot",     CMD_ARG_ALNUM,   CMD_ARG_REQUIRED, BOT_NAME_SZ,  NULL },
-  { "channel", CMD_ARG_CHANNEL, CMD_ARG_REQUIRED, IRC_CHAN_SZ,   NULL },
-  { "key",     CMD_ARG_NONE,    CMD_ARG_OPTIONAL, IRC_LINE_SZ,  NULL },
-};
-
-static const cmd_arg_desc_t ad_irc_chan_del[] = {
-  { "bot",     CMD_ARG_ALNUM,   CMD_ARG_REQUIRED, BOT_NAME_SZ, NULL },
-  { "channel", CMD_ARG_CHANNEL, CMD_ARG_REQUIRED, IRC_CHAN_SZ,  NULL },
-};
-
-static const cmd_arg_desc_t ad_irc_chan_list[] = {
-  { "bot", CMD_ARG_ALNUM, CMD_ARG_REQUIRED, BOT_NAME_SZ, NULL },
-};
 
 // IRC color table for mIRC-compatible color codes.
 static const color_table_t irc_colors = {
@@ -427,6 +418,46 @@ static const method_driver_t irc_driver = {
   .eject         = irc_eject,
 };
 
-#endif // IRC_INTERNAL
+#endif // IRC_DRIVER_INTERNAL
+
+// irc_commands.c's own material — see the note above IRC_DRIVER_INTERNAL.
+#ifdef IRC_CMD_INTERNAL
+
+// Argument specs for IRC subcommands.
+static const cmd_arg_desc_t ad_irc_netname[] = {
+  { "name", CMD_ARG_CUSTOM, CMD_ARG_REQUIRED, IRC_NET_NAME_SZ, irc_valid_name },
+};
+
+static const cmd_arg_desc_t ad_irc_srv_add[] = {
+  { "network", CMD_ARG_CUSTOM,    CMD_ARG_REQUIRED, IRC_NET_NAME_SZ, irc_valid_name },
+  { "host",    CMD_ARG_HOSTNAME,  CMD_ARG_REQUIRED, IRC_HOST_SZ,     NULL },
+  { "port",    CMD_ARG_PORT,      CMD_ARG_OPTIONAL, 8,               NULL },
+};
+
+static const cmd_arg_desc_t ad_irc_srv_del[] = {
+  { "network", CMD_ARG_CUSTOM,    CMD_ARG_REQUIRED, IRC_NET_NAME_SZ, irc_valid_name },
+  { "host",    CMD_ARG_HOSTNAME,  CMD_ARG_REQUIRED, IRC_HOST_SZ,     NULL },
+};
+
+static const cmd_arg_desc_t ad_irc_srv_list[] = {
+  { "network", CMD_ARG_CUSTOM, CMD_ARG_OPTIONAL, IRC_NET_NAME_SZ, irc_valid_name },
+};
+
+static const cmd_arg_desc_t ad_irc_chan_add[] = {
+  { "bot",     CMD_ARG_ALNUM,   CMD_ARG_REQUIRED, BOT_NAME_SZ,  NULL },
+  { "channel", CMD_ARG_CHANNEL, CMD_ARG_REQUIRED, IRC_CHAN_SZ,   NULL },
+  { "key",     CMD_ARG_NONE,    CMD_ARG_OPTIONAL, IRC_LINE_SZ,  NULL },
+};
+
+static const cmd_arg_desc_t ad_irc_chan_del[] = {
+  { "bot",     CMD_ARG_ALNUM,   CMD_ARG_REQUIRED, BOT_NAME_SZ, NULL },
+  { "channel", CMD_ARG_CHANNEL, CMD_ARG_REQUIRED, IRC_CHAN_SZ,  NULL },
+};
+
+static const cmd_arg_desc_t ad_irc_chan_list[] = {
+  { "bot", CMD_ARG_ALNUM, CMD_ARG_REQUIRED, BOT_NAME_SZ, NULL },
+};
+
+#endif // IRC_CMD_INTERNAL
 
 #endif // BM_IRC_H

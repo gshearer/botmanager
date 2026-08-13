@@ -1097,7 +1097,9 @@ wm_bt_sweep_run_one(wm_bt_pool_t *pool, uint32_t iter,
   wm_bt_sweep_result_t *result = &pool->results[iter];
   wm_backtest_result_t  bt_result;
   char                  synth_id[WM_MARKET_ID_STR_SZ];
-  char                  err[160];
+  // Wide enough for a whole KV key plus its message: a sweep error that
+  // cannot name the key it failed on is not much of an error.
+  char                  err[KV_KEY_SZ + 64];
   bool                  iter_ok;
 
   memset(result, 0, sizeof(*result));
@@ -1773,7 +1775,7 @@ wm_bt_sweep_run_oos_validation(whenmoon_state_t *st,
     uint32_t              indices[WM_BT_SWEEP_MAX_PARAMS] = {0};
     char                  synth_id[WM_MARKET_ID_STR_SZ];
     wm_backtest_result_t  bt_result;
-    char                  iter_err[160];
+    char                  iter_err[KV_KEY_SZ + 64];
     bool                  iter_ok;
 
     if(top_idx[i] == UINT32_MAX)
@@ -1902,7 +1904,7 @@ wm_bt_perfold_one_row(whenmoon_state_t *st, wm_backtest_snapshot_t *snap,
     const wm_bt_window_t *win = &walk->windows[w];
     char                  synth_id[WM_MARKET_ID_STR_SZ];
     wm_backtest_result_t  bt_result;
-    char                  iter_err[160];
+    char                  iter_err[KV_KEY_SZ + 64];
     bool                  iter_ok;
 
     folds[w].start_ts_ms = win->start_ts_ms;

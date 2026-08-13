@@ -131,7 +131,9 @@ nl_observe_task(task_t *t)
   method_msg_t            synth;
   mem_dossier_fact_t      fact;
   char                    zip[32];
-  char                    canon[128];
+  // The canonical label is a fact-key segment, so size it as one: a name
+  // that overran MEM_FACT_KEY_SZ would key a row nothing could correct.
+  char                    canon[MEM_FACT_KEY_SZ - sizeof("city_of_interest:")];
   int64_t                 did;
   time_t                  now;
 

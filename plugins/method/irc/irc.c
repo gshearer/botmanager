@@ -1,6 +1,7 @@
 // botmanager — MIT
 // IRC method plugin: socket lifecycle, protocol dispatch, per-channel state.
 #define IRC_INTERNAL
+#define IRC_DRIVER_INTERNAL
 #include "irc.h"
 
 static bool
@@ -871,7 +872,7 @@ irc_handle_join(irc_state_t *st, const irc_parsed_msg_t *pp)
   bool have_ops;
   char botname[METHOD_NAME_SZ] = {0};
   bot_inst_t *bot;
-  char mfa[IRC_PREFIX_SZ];
+  char mfa[IRC_MFA_SZ];
   char ubuf[USERNS_USER_SZ];
   uint32_t delay;
   irc_kick_check_t *kc;
@@ -1022,11 +1023,18 @@ static void
 irc_handle_nick(irc_state_t *st, const irc_parsed_msg_t *pp)
 {
   const irc_parsed_msg_t p = *pp;
-  const char *new_nick = p.has_trailing ? p.trailing : p.params;
+  const char  *raw_nick = p.has_trailing ? p.trailing : p.params;
+  char         new_nick[IRC_NICK_SZ];
   method_msg_t nmsg;
 
-  if(new_nick[0] == '\0')
+  if(raw_nick[0] == '\0')
     return;
+
+  // The argument arrives in a line-sized field but names a nick, and every
+  // other nick this driver stores is IRC_NICK_SZ. Clamp once, here, so the
+  // rename, the delivered message and the MFA all agree on the same string.
+  strncpy(new_nick, raw_nick, sizeof(new_nick) - 1);
+  new_nick[sizeof(new_nick) - 1] = '\0';
 
   irc_chan_rename_nick(st, p.nick, new_nick);
 
@@ -1581,7 +1589,7 @@ irc_create(const char *inst_name)
   else
     strncpy(botname, inst_name, BOT_NAME_SZ - 1);
 
-  snprintf(st->kv_prefix, KV_KEY_SZ,
+  snprintf(st->kv_prefix, sizeof(st->kv_prefix),
       "bot.%s.irc.", botname);
 
   st->reconnect_delay = 30;

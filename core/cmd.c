@@ -1552,8 +1552,11 @@ cmd_dispatch(bot_inst_t *inst, const method_msg_t *msg)
   memcpy(&td->msg, msg, sizeof(method_msg_t));
   strncpy(td->args, args, METHOD_TEXT_SZ - 1);
 
+  // td is zeroed above, so copying just the characters terminates the
+  // field for free — and skips strncpy's zero-fill of the whole buffer
+  // on a path every command takes.
   if(username != NULL)
-    strncpy(td->username, username, USERNS_USER_SZ - 1);
+    memcpy(td->username, username, strnlen(username, USERNS_USER_SZ - 1));
 
   td->arg_desc  = arg_desc;
   td->arg_count = arg_count;
@@ -2484,8 +2487,9 @@ cmd_dispatch_resolved(bot_inst_t *inst, const method_msg_t *msg,
   if(args != NULL)
     strncpy(td->args, args, METHOD_TEXT_SZ - 1);
 
+  // See cmd_dispatch: td is zeroed, so the characters alone are enough.
   if(username != NULL)
-    strncpy(td->username, username, USERNS_USER_SZ - 1);
+    memcpy(td->username, username, strnlen(username, USERNS_USER_SZ - 1));
 
   td->arg_desc  = def->arg_desc;
   td->arg_count = def->arg_count;

@@ -362,7 +362,9 @@ handle_privmsg(const char *params, const char *nick)
   size_t tlen;
   const char *text;
   char clean[BUF_SZ];
-  char fmtline[BUF_SZ];
+  // fmtline decorates clean with a channel and a nick, so it is sized from
+  // all three rather than from clean alone.
+  char fmtline[BUF_SZ + 2 * CMD_SZ + 16];
 
   if(sp == NULL)
     return;
@@ -384,7 +386,10 @@ handle_privmsg(const char *params, const char *nick)
   snprintf(clean, sizeof(clean), "%s", text);
   strip_irc_fmt(clean);
 
-  snprintf(fmtline, sizeof(fmtline), "[%s] <%s> %s", chan, nick, clean);
+  // nick arrives as a bare pointer into the parsed line; bound it to the
+  // same width the channel already gets.
+  snprintf(fmtline, sizeof(fmtline), "[%s] <%.*s> %s",
+      chan, (int)sizeof(chan) - 1, nick, clean);
   printf("%s\n", fmtline);
   fflush(stdout);
   ctl_send_line(fmtline);
@@ -396,7 +401,8 @@ handle_notice(const char *params, const char *nick)
 {
   const char *text = strchr(params, ':');
   char clean[BUF_SZ];
-  char fmtline[BUF_SZ];
+  // fmtline decorates clean, so it cannot be the same size as clean.
+  char fmtline[BUF_SZ + 128];
 
   if(text != NULL)
     text++;

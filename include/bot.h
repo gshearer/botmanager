@@ -413,6 +413,15 @@ typedef struct
   uint32_t max_methods;
 } bot_cfg_t;
 
+#endif // BOT_INTERNAL
+
+// The registry itself — the one list of bots, its lock, and its counters.
+// Separate from BOT_INTERNAL because these are *definitions*, not
+// declarations: a second translation unit that defined BOT_INTERNAL would
+// get its own private, permanently-empty bot list and its own mutex, and
+// nothing would say so. Only bot.c may define this guard.
+#ifdef BOT_REGISTRY_INTERNAL
+
 static bot_cfg_t bot_cfg = {
   .max_methods = 16,
 };
@@ -429,10 +438,9 @@ static bool             bot_ready = false;
 static bot_method_t    *bot_method_freelist    = NULL;
 static uint32_t         bot_method_free_count  = 0;
 
-
 static uint32_t         bot_stat_discoveries   = 0;
 
-#endif // BOT_INTERNAL
+#endif // BOT_REGISTRY_INTERNAL
 
 #ifdef BOT_CMD_INTERNAL
 

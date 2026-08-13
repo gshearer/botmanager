@@ -497,7 +497,17 @@ ctl_connect(const char *path)
 
   memset(&addr, 0, sizeof(addr));
   addr.sun_family = AF_UNIX;
-  snprintf(addr.sun_path, sizeof(addr.sun_path), "%s", path);
+
+  // A truncated sun_path would connect to a different socket, or to none,
+  // and report the untruncated name in the error. Refuse instead.
+  if(snprintf(addr.sun_path, sizeof(addr.sun_path), "%s", path)
+      >= (int)sizeof(addr.sun_path))
+  {
+    fprintf(stderr, "socket path too long (max %zu): %s\n",
+        sizeof(addr.sun_path) - 1, path);
+    close(fd);
+    return(-1);
+  }
 
   if(connect(fd, (struct sockaddr *)&addr, sizeof(addr)) < 0)
   {

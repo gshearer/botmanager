@@ -1047,14 +1047,23 @@ chatbot_engagement_rename(chatbot_engagement_t *e,
 
   pthread_mutex_lock(&e->mutex);
 
-  for(size_t i = 0; i < CHATBOT_ENGAGEMENT_SLOTS; i++)
+  // new_user rides in on method_msg_t.text, which is line-sized; a sender
+  // is not. Measure once against the field a sender is stored in.
   {
-    chatbot_engagement_slot_t *s = &e->slots[i];
+    size_t nlen = strnlen(new_user, METHOD_SENDER_SZ - 1);
 
-    if(s->channel[0] == '\0') continue;
+    for(size_t i = 0; i < CHATBOT_ENGAGEMENT_SLOTS; i++)
+    {
+      chatbot_engagement_slot_t *s = &e->slots[i];
 
-    if(strcasecmp(s->user, old_user) == 0)
-      snprintf(s->user, sizeof(s->user), "%s", new_user);
+      if(s->channel[0] == '\0') continue;
+
+      if(strcasecmp(s->user, old_user) == 0)
+      {
+        memcpy(s->user, new_user, nlen);
+        s->user[nlen] = '\0';
+      }
+    }
   }
 
   pthread_mutex_unlock(&e->mutex);

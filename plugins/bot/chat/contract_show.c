@@ -46,7 +46,7 @@ static void
 cmd_show_contracts(const cmd_ctx_t *ctx)
 {
   char       dir[PATH_MAX];
-  char       hdr[256];
+  char       hdr[PATH_MAX + 64];   // the line quotes a whole path
   cs_state_t st = { .ctx = ctx, .count = 0 };
 
   if(!chatbot_contract_path(dir, sizeof(dir)))

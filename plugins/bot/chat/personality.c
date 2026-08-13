@@ -137,7 +137,16 @@ mp_resolve_path(const char *name, char *out, size_t sz)
   if(!chatbot_personality_path(dir, sizeof(dir)))
     return(false);
 
-  snprintf(out, sz, "%s/%s.txt", dir, name);
+  // dir is PATH_MAX and out is CHATBOT_PERSONALITY_PATH_SZ, so a deep
+  // personalitypath can outrun the result. Refuse rather than hand back a
+  // truncated path that names some other file, or none.
+  if(snprintf(out, sz, "%s/%s.txt", dir, name) >= (int)sz)
+  {
+    clam(CLAM_WARN, "chatbot",
+        "personality path too long for '%s' under '%s'", name, dir);
+    return(false);
+  }
+
   return(true);
 }
 
@@ -461,7 +470,12 @@ chatbot_contract_read(const char *name, char **out_body)
   if(!chatbot_contract_path(dir, sizeof(dir)))
     return(FAIL);
 
-  snprintf(path, sizeof(path), "%s/%s.txt", dir, name);
+  if(snprintf(path, sizeof(path), "%s/%s.txt", dir, name) >= (int)sizeof(path))
+  {
+    clam(CLAM_WARN, "chatbot",
+        "contract path too long for '%s' under '%s'", name, dir);
+    return(FAIL);
+  }
 
   raw = mp_slurp(path);
 
@@ -648,7 +662,11 @@ chatbot_contract_read_header(const char *name, persona_header_t *hdr)
     return(SUCCESS);
   }
 
-  snprintf(path, sizeof(path), "%s/%s.txt", dir, name);
+  if(snprintf(path, sizeof(path), "%s/%s.txt", dir, name) >= (int)sizeof(path))
+  {
+    snprintf(hdr->err, sizeof(hdr->err), "path too long");
+    return(SUCCESS);
+  }
 
   if(stat(path, &sb) == 0)
     hdr->bytes = sb.st_size;

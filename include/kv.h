@@ -7,7 +7,14 @@
 
 #include "nl.h"
 
-#define KV_KEY_SZ  128
+// Longest key the tree's own grammar can compose, not a round number:
+// the IRC driver's per-channel admin keys are
+// "bot." + BOT_NAME_SZ + ".irc.chan." + IRC_CHAN_SZ + ".admin.kick_unident_delay"
+// = 166 bytes at the limits its own argument validators allow. At 128 those
+// keys truncated silently, and two long channel names sharing a prefix
+// collapsed onto one row. Nothing persists this size — the `kv.key` column
+// is unbounded `text` — so it costs only the in-memory cache entry.
+#define KV_KEY_SZ  192
 #define KV_STR_SZ  256
 
 // Substituted for any secret KV value when read without an active admin

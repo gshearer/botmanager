@@ -123,6 +123,7 @@ claude_load_preamble(const char *cwd, const char *rel_path,
   char path[512];
   size_t have;
   int fd;
+  int n;
   size_t cap;
   *out_len = 0;
   if(bufsz > 0) buf[0] = '\0';
@@ -131,10 +132,17 @@ claude_load_preamble(const char *cwd, const char *rel_path,
     return(SUCCESS);
 
 
+  // A truncated path names a different file, so refuse to open one.
   if(rel_path[0] == '/' || cwd == NULL || cwd[0] == '\0')
-    snprintf(path, sizeof(path), "%s", rel_path);
+    n = snprintf(path, sizeof(path), "%s", rel_path);
   else
-    snprintf(path, sizeof(path), "%s/%s", cwd, rel_path);
+    n = snprintf(path, sizeof(path), "%s/%s", cwd, rel_path);
+
+  if(n < 0 || (size_t)n >= sizeof(path))
+  {
+    clam(CLAM_WARN, "claude", "preamble path too long: %s", rel_path);
+    return(FAIL);
+  }
 
   fd = open(path, O_RDONLY | O_CLOEXEC);
 

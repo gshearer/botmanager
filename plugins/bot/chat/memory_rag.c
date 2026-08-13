@@ -137,16 +137,36 @@ memory_scan_embeddings(const char *join_sql, const char *id_col,
   mem_free(e_model);
 }
 
+// Composes "(id,id,...)". snprintf returns what it *would* have written, so
+// accumulating it blindly walks `w` past out_sz and makes `out_sz - w`
+// underflow into a huge size_t — the write then runs off the end. Stop at
+// the last id that fits and always close the parenthesis.
 static void
 memory_build_in_list(char *out, size_t out_sz,
     const memory_hit_t *hits, size_t n)
 {
   size_t w = 0;
-  w += (size_t)snprintf(out + w, out_sz - w, "(");
+  int    r;
+
+  if(out == NULL || out_sz < 3)
+    return;
+
+  out[w++] = '(';
+
   for(size_t i = 0; i < n; i++)
-    w += (size_t)snprintf(out + w, out_sz - w,
-        "%s%" PRId64, i == 0 ? "" : ",", hits[i].id);
-  snprintf(out + w, out_sz - w, ")");
+  {
+    // One byte held back for the ')'.
+    r = snprintf(out + w, out_sz - w - 1, "%s%" PRId64,
+        (i == 0) ? "" : ",", hits[i].id);
+
+    if(r < 0 || (size_t)r >= out_sz - w - 1)
+      break;
+
+    w += (size_t)r;
+  }
+
+  out[w++] = ')';
+  out[w]   = '\0';
 }
 
 #define MEMORY_MSG_SELECT_COLS \
@@ -185,7 +205,9 @@ memory_deliver_hits(const memory_hit_t *msg_hits, size_t n_msgs,
   {
     char in_list[32 * 64];
     db_result_t *res;
-    char sql[2048];
+    // Sized off the IN-list rather than a round number: a truncated query
+    // is not a shorter query, it is a syntax error.
+    char sql[sizeof(in_list) + 512];
 
     memory_build_in_list(in_list, sizeof(in_list), msg_hits, n_msgs);
 
@@ -289,8 +311,8 @@ memory_msgs_from_ids(int ns_id, const memory_hit_t *hits, size_t n_hits,
 {
   db_result_t *res;
   size_t n;
-  char sql[2048];
   char in_list[32 * 64];
+  char sql[sizeof(in_list) + 512];   // see memory_deliver_hits
 
   if(n_hits == 0 || out == NULL || cap == 0)
     return(0);

@@ -25,10 +25,19 @@ Both commands run from the project root (`/mnt/fast/doc/projects/botmanager`).
 Re-running `meson setup build` is unnecessary after the first time —
 `ninja -C build` picks up `meson.build` changes automatically.
 
-The build is expected to be **warning-free for files you touched**. A few
-pre-existing `-Wmissing-field-initializers` and `-Wformat-truncation`
-warnings exist in `plugins/service/coinmarketcap` and `plugins/method/irc`;
-don't introduce new warnings.
+The build is **warning-free, tree-wide** — a full clean `ninja -C build`
+emits zero warnings, and that is the standard (`AGENTS.md`, the
+`posixc-pro` skill). There are no grandfathered exceptions any more:
+PLUGIN-AUDIT-1 lead (A) closed the last 77 on 2026-08-12. If you add one,
+you own it. `-Wno-missing-field-initializers` is the single project-wide
+suppression and its reason is stated in the root `meson.build`.
+
+To check what you introduced, clean first — an incremental build only
+reports on the files it recompiled:
+
+```sh
+ninja -C build -t clean && ninja -C build 2>&1 | grep -c 'warning:'
+```
 
 `scripts/gen_version_h.sh` runs every build and bumps the `BUILDNUM` file
 at the project root.

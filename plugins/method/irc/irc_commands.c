@@ -2,6 +2,7 @@
 // IRC plugin operator commands: /irc network|server|channel, /show irc.
 
 #define IRC_INTERNAL
+#define IRC_CMD_INTERNAL
 #include "irc.h"
 
 #include <string.h>
@@ -383,7 +384,7 @@ irc_cmd_channel_add(const cmd_ctx_t *ctx)
   const char *raw_chan  = ctx->parsed->argv[1];
   const char *chankey   = ctx->parsed->argc > 2 ? ctx->parsed->argv[2] : NULL;
   const char *channel;
-  char prefix[KV_KEY_SZ];
+  char prefix[IRC_KV_CHAN_PREFIX_SZ];
   char key[KV_KEY_SZ];
   char buf[256];
 
@@ -491,7 +492,7 @@ static void
 irc_cmd_channel_list(const cmd_ctx_t *ctx)
 {
   const char *botname = ctx->parsed->argv[0];
-  char chan_prefix[KV_KEY_SZ];
+  char chan_prefix[IRC_KV_CHAN_PREFIX_SZ];
   irc_chan_collect_t cc;
   char buf[128];
 

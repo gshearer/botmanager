@@ -115,17 +115,6 @@ static const char *sev_label[] = {
   [CLAM_DEBUG5] = " DBG5",
 };
 
-static const char *sev_color[] = {
-  [CLAM_FATAL]  = CON_RED,
-  [CLAM_WARN]   = CON_YELLOW,
-  [CLAM_INFO]   = CON_GREEN,
-  [CLAM_DEBUG]  = CON_CYAN,
-  [CLAM_DEBUG2] = CON_PURPLE,
-  [CLAM_DEBUG3] = CON_BLUE,
-  [CLAM_DEBUG4] = CON_WHITE,
-  [CLAM_DEBUG5] = CON_WHITE,
-};
-
 #endif // CLAM_INTERNAL
 
 #endif // BM_CLAM_H

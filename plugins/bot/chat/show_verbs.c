@@ -761,8 +761,10 @@ verb_llm_interests(const cmd_ctx_t *ctx, bot_inst_t *bot, const char *rest)
 
   for(size_t i = 0; i < n; i++)
   {
+    // The snapshot crosses a plugin boundary; bound the read to the field
+    // it came from rather than trusting it to be terminated.
     snprintf(stats[i].topic_name, sizeof(stats[i].topic_name),
-        "%s", topics[i].name);
+        "%.*s", (int)sizeof(topics[i].name) - 1, topics[i].name);
     snprintf(stats[i].last_proactive, sizeof(stats[i].last_proactive),
         "%s", "-");
     snprintf(stats[i].last_reactive,  sizeof(stats[i].last_reactive),
@@ -779,10 +781,10 @@ verb_llm_interests(const cmd_ctx_t *ctx, bot_inst_t *bot, const char *rest)
   for(size_t i = 0; i < n; i++)
   {
     snprintf(line, sizeof(line),
-        "  %-12s mode=%-8s weight=%-3u kw=%-2zu"
+        "  %-12.*s mode=%-8s weight=%-3u kw=%-2zu"
         "  q=%-4" PRIu64 " ing=%-4" PRIu64
         "  last_proactive=%s  last_reactive=%s",
-        topics[i].name,
+        (int)sizeof(topics[i].name) - 1, topics[i].name,
         verb_interests_mode_label(topics[i].mode),
         topics[i].proactive_weight,
         topics[i].n_keywords,

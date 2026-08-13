@@ -467,10 +467,6 @@ static plugin_unmap_rec_t plugin_unmap_listeners[PLUGIN_UNMAP_MAX_LISTENERS];
 static uint32_t           n_unmap_listeners = 0;
 static pthread_mutex_t    plugin_unmap_mutex = PTHREAD_MUTEX_INITIALIZER;
 
-static uint32_t      n_discovered  = 0;
-static uint32_t      n_rejected    = 0;
-static uint32_t      n_load_errors = 0;
-
 #endif // PLUGIN_INTERNAL
 
 #endif // BM_PLUGIN_H

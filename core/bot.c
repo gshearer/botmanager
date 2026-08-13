@@ -1,6 +1,7 @@
 // botmanager — MIT
 // Bot-instance registry, lifecycle (add/start/stop/restore), method binding.
 #define BOT_INTERNAL
+#define BOT_REGISTRY_INTERNAL
 #include "bot.h"
 #include "cmd.h"
 
