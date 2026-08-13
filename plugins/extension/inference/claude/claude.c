@@ -66,14 +66,25 @@ static const cmd_arg_desc_t claude_cmd_args[] = {
 };
 
 // ------------------------------------------------------------------ //
-// Reply helper -- split on LF, send each line                         //
+// Reply helper -- split on LF, translate markup, send each line       //
 // ------------------------------------------------------------------ //
+//
+// The CLI cannot emit raw control bytes: asked for "\033[1m" or "\x02" it
+// reproduces the *notation*, and those literal characters are what land in
+// the channel. So the preamble advertises markup it can actually type --
+// `**bold**` and `<red>...</red>` -- and color_markup_translate() rewrites
+// it into the method-agnostic markers from colors.h. method_send() then
+// resolves those to the driver's native codes, so one reply renders
+// correctly on IRC and on the botmanctl console alike. The rewrite also
+// drops any bare \x01 the CLI printed, so captured output cannot forge a
+// marker. Both the live path and the post-restart stash come through here.
 
 static void
 claude_reply_multi(method_inst_t *inst, const char *target,
     const char *text)
 {
   const char *p;
+
   if(inst == NULL || target == NULL || text == NULL)
     return;
 
@@ -89,13 +100,18 @@ claude_reply_multi(method_inst_t *inst, const char *target,
 
     else
     {
-      char   buf[METHOD_TEXT_SZ];
-      size_t copy = (len < sizeof(buf) - 1) ? len : sizeof(buf) - 1;
+      char   raw[METHOD_TEXT_SZ];
+      char   marked[METHOD_TEXT_SZ];
+      size_t copy = (len < sizeof(raw) - 1) ? len : sizeof(raw) - 1;
 
-      memcpy(buf, p, copy);
-      buf[copy] = '\0';
+      memcpy(raw, p, copy);
+      raw[copy] = '\0';
 
-      method_send(inst, target, buf);
+      // Never grows: every markup token is at least two bytes and
+      // becomes exactly two, so an equal-sized destination suffices.
+      color_markup_translate(marked, sizeof(marked), raw);
+
+      method_send(inst, target, marked);
     }
 
     if(nl == NULL)
