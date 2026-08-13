@@ -127,8 +127,10 @@ typedef struct
   // Both are optional, and NULL is the honest answer for a plugin whose
   // whole state is registrations (every leaf command plugin, every
   // strategy). The snapshot must NOT live in the plugin's own mapping —
-  // it is unmapped between the two calls — so persist it (the DB is
-  // already proven for whenmoon's markets) or hand it to core.
+  // it is unmapped between the two calls — so persist it, or hold
+  // nothing and rebuild in resume(). The DB is the store, already
+  // proven for whenmoon's markets; there is no core stash and none is
+  // planned (PLUGIN.md §Optional — suspend() / resume() says why).
   //
   // suspend() runs before stop(), in reverse dependency order across
   // the whole closure, and FAIL there refuses the reload while it is
