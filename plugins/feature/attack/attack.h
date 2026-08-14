@@ -269,6 +269,14 @@ typedef struct
 // One resolved turn, ready to be written. The `*_user` names are
 // namespace-scoped usernames and are the identity of record; the
 // `*_nick` names are display-only and are refreshed on every blow.
+//
+// Two damage numbers travel together, exactly as they do on a heal.
+// `dmg` is what the engine rolled: it decides the tier, fills the crit
+// columns, and is the number the room is told, because it is the force
+// of the swing. `dealt` is what the health bar actually lost. They
+// differ on one blow only — the killing one, where the target had less
+// left than the roll — and every damage TALLY takes `dealt`, for the
+// same reason atk_db_heal_apply() refuses to credit overheal.
 typedef struct
 {
   int64_t     round_id;
@@ -278,6 +286,7 @@ typedef struct
   const char *tgt_user;
   const char *tgt_nick;
   int32_t     dmg;
+  int32_t     dealt;
   int32_t     wave;      // the wave the attacker is spending
   bool        crit;
   bool        new_top;   // this crit is the round's heaviest so far
@@ -306,6 +315,11 @@ typedef struct
 // `tgt_user` is the combatant who was actually named: they take the same
 // damage as everyone else and are the one the lifetime `best_crit_on`
 // records, because they are who the attacker was swinging at.
+//
+// Unlike atk_blow_t this carries no `dealt`, because atk_victim_t already
+// holds the health on both sides of the blow: what each combatant lost is
+// `hp - hp_left`, and the attacker is credited with that sum. A third
+// field would only restate what two of them already say.
 typedef struct
 {
   int64_t             round_id;
@@ -444,7 +458,13 @@ typedef struct
   bool           expired;   // this is the last tick it will ever take
 } atk_dot_due_t;
 
-// One decay tick, resolved and ready to be written.
+// One decay tick, resolved and ready to be written. `dmg` is this tick's
+// share of the plan and `dealt` what the victim actually lost — the same
+// split atk_blow_t carries, and it matters here for one tick only. A
+// tick deals less than its share exactly when it reaches zero, and that
+// tick is by construction the affliction's last, so `dmg_total` can
+// stop short of `dmg_plan` on a kill but the schedule that reads it back
+// never sees a capped value.
 typedef struct
 {
   int64_t     dot_id;
@@ -453,6 +473,7 @@ typedef struct
   const char *victim;
   const char *source;
   int32_t     dmg;
+  int32_t     dealt;
   uint32_t    tick_secs;
   bool        last;      // the affliction is spent after this tick
   bool        fatal;     // this tick takes the victim to 0 hp

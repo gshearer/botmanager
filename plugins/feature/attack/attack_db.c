@@ -950,12 +950,19 @@ atk_db_blow_apply(const atk_blow_t *b)
       // with it any deferral bonus, in the SAME transaction that applied
       // it. Never in a second statement: a daemon death between the two
       // would hand somebody a permanent bonus.
+      //
+      // The two damage columns here take different numbers on purpose:
+      // `best_crit` describes the swing, so it keeps the roll, while
+      // `dmg_given` is a tally of harm done and takes what landed.
       "UPDATE %s SET nickname = '%s', dmg_given = dmg_given + %d,"
       " blows = blows + 1, crits = crits + %d,"
       " best_crit = GREATEST(best_crit, %d), last_wave = %d, bonus_pct = 0"
       " WHERE round_id = %" PRId64 " AND username = '%s';"
 
-      // The target takes it. hp floors at zero; died_at is stamped once.
+      // The target takes it. The health arithmetic is left on the ROLL and
+      // floored by GREATEST, so the column that owns hit points keeps its
+      // own bound instead of trusting a number worked out elsewhere; only
+      // the tally takes what was actually lost. died_at is stamped once.
       "UPDATE %s SET nickname = '%s', hp = GREATEST(hp - %d, 0),"
       " dmg_taken = dmg_taken + %d,"
       " died_at = CASE WHEN hp - %d <= 0 AND died_at IS NULL"
@@ -996,18 +1003,18 @@ atk_db_blow_apply(const atk_blow_t *b)
       "%s"
       "COMMIT;",
 
-      t.players, e_src_n, b->dmg, b->crit ? 1 : 0,
+      t.players, e_src_n, b->dealt, b->crit ? 1 : 0,
       b->crit ? b->dmg : 0, b->wave, b->round_id, e_src_u,
 
-      t.players, e_tgt_n, b->dmg, b->dmg, b->dmg, b->round_id, e_tgt_u,
+      t.players, e_tgt_n, b->dmg, b->dealt, b->dmg, b->round_id, e_tgt_u,
 
       t.rounds, top, b->round_id,
 
-      t.scores, b->ns_id, e_src_u, e_src_n, b->dmg, b->crit ? 1 : 0,
+      t.scores, b->ns_id, e_src_u, e_src_n, b->dealt, b->crit ? 1 : 0,
       b->crit ? b->dmg : 0, b->crit ? e_tgt_u : "",
       t.scores, t.scores, t.scores, t.scores, t.scores, t.scores,
 
-      t.scores, b->ns_id, e_tgt_u, e_tgt_n, b->dmg,
+      t.scores, b->ns_id, e_tgt_u, e_tgt_n, b->dealt,
       t.scores,
 
       t.rounds, b->round_id, t.players,
@@ -1143,6 +1150,7 @@ atk_db_sweep_apply(const atk_sweep_t *s)
   char         top[320] = "";
   size_t       need;
   size_t       off = 0;
+  int32_t      dealt = 0;   // what the swing actually took, over everyone
   uint32_t     i;
   uint32_t     n;
   bool         ok = FAIL;
@@ -1173,6 +1181,11 @@ atk_db_sweep_apply(const atk_sweep_t *s)
     if(e_vic_u[i] == NULL || e_vic_n[i] == NULL)
       goto out;
 
+    // One roll landed on everybody, but a combatant can only lose the
+    // health they had: a sweep through three opponents with a hit point
+    // each is worth three, however hard it was thrown.
+    dealt += s->victim[i].hp - s->victim[i].hp_left;
+
     need += 1024 + 8 * (strlen(e_vic_u[i]) + strlen(e_vic_n[i])
                         + strlen(t.players) + strlen(t.scores));
   }
@@ -1188,13 +1201,16 @@ atk_db_sweep_apply(const atk_sweep_t *s)
 
   // The attacker: one blow, one wave spent, one bonus consumed — and the
   // damage of every victim credited at once, because it was one swing.
+  // `best_crit` keeps the roll for the same reason it does on the single
+  // blow: it describes how hard the swing was thrown, not how much of it
+  // the pit had health left to absorb.
   if(atk_sql_cat(sql, need, &off,
         "BEGIN;"
         "UPDATE %s SET nickname = '%s', dmg_given = dmg_given + %d,"
         " blows = blows + 1, crits = crits + %d,"
         " best_crit = GREATEST(best_crit, %d), last_wave = %d, bonus_pct = 0"
         " WHERE round_id = %" PRId64 " AND username = '%s';",
-        t.players, e_src_n, s->dmg * (int32_t)n, s->crit ? 1 : 0,
+        t.players, e_src_n, dealt, s->crit ? 1 : 0,
         s->crit ? s->dmg : 0, s->wave, s->round_id, e_src_u) != SUCCESS)
     goto out;
 
@@ -1214,9 +1230,11 @@ atk_db_sweep_apply(const atk_sweep_t *s)
           " nickname = EXCLUDED.nickname,"
           " dmg_taken = %s.dmg_taken + EXCLUDED.dmg_taken,"
           " last_seen = NOW();",
-          t.players, e_vic_n[i], s->dmg, s->dmg, s->dmg, s->round_id,
+          t.players, e_vic_n[i], s->dmg,
+          s->victim[i].hp - s->victim[i].hp_left, s->dmg, s->round_id,
           e_vic_u[i],
-          t.scores, s->ns_id, e_vic_u[i], e_vic_n[i], s->dmg,
+          t.scores, s->ns_id, e_vic_u[i], e_vic_n[i],
+          s->victim[i].hp - s->victim[i].hp_left,
           t.scores) != SUCCESS)
       goto out;
 
@@ -1238,7 +1256,7 @@ atk_db_sweep_apply(const atk_sweep_t *s)
         " THEN EXCLUDED.best_crit_on ELSE %s.best_crit_on END,"
         " last_seen = NOW();",
         t.rounds, top, s->round_id,
-        t.scores, s->ns_id, e_src_u, e_src_n, s->dmg * (int32_t)n,
+        t.scores, s->ns_id, e_src_u, e_src_n, dealt,
         s->crit ? 1 : 0, s->crit ? s->dmg : 0, s->crit ? e_tgt_u : "",
         t.scores, t.scores, t.scores, t.scores, t.scores,
         t.scores) != SUCCESS)
@@ -1845,8 +1863,10 @@ atk_db_dot_tick(const atk_dot_hit_t *h)
   snprintf(sql, need,
       "BEGIN;"
 
-      // The victim bleeds. hp floors at zero; died_at is stamped once.
-      // Nothing here touches last_wave: decay is not a swing.
+      // The victim bleeds. As on the blow path the health arithmetic keeps
+      // the tick's whole share and lets GREATEST floor it, while the tally
+      // beside it takes only what the victim had left to give. died_at is
+      // stamped once. Nothing here touches last_wave: decay is not a swing.
       "UPDATE %s SET hp = GREATEST(hp - %d, 0), dmg_taken = dmg_taken + %d,"
       " died_at = CASE WHEN hp - %d <= 0 AND died_at IS NULL"
       " THEN NOW() ELSE died_at END"
@@ -1862,7 +1882,10 @@ atk_db_dot_tick(const atk_dot_hit_t *h)
       "UPDATE %s SET dmg_given = dmg_given + %d, last_seen = NOW()"
       " WHERE ns_id = %" PRIu32 " AND username = '%s';"
 
-      // The affliction's own ledger and its next deadline. The deadline
+      // The affliction's own ledger and its next deadline. `dmg_total`
+      // counts what the wound actually took, so a killing tick leaves it
+      // short of `dmg_plan` — the remainder was never dealt, exactly as
+      // the unspent damage of a swept affliction never was. The deadline
       // advances from the one it just met, not from now: the task wakes
       // on its own cadence and can only ever service a tick LATE, so
       // NOW() + interval would compound that lateness into a drift of
@@ -1876,11 +1899,11 @@ atk_db_dot_tick(const atk_dot_hit_t *h)
       "%s"
       "COMMIT;",
 
-      t.players, h->dmg, h->dmg, h->dmg, h->round_id, e_vic,
-      t.players, h->dmg, h->round_id, e_src,
-      t.scores,  h->dmg, h->ns_id, e_vic,
-      t.scores,  h->dmg, h->ns_id, e_src,
-      t.dots,    h->dmg, h->tick_secs, h->tick_secs,
+      t.players, h->dmg, h->dealt, h->dmg, h->round_id, e_vic,
+      t.players, h->dealt, h->round_id, e_src,
+      t.scores,  h->dealt, h->ns_id, e_vic,
+      t.scores,  h->dealt, h->ns_id, e_src,
+      t.dots,    h->dealt, h->tick_secs, h->tick_secs,
       (h->last || h->fatal) ? ATK_DOT_SPENT : ATK_DOT_LIVE, h->dot_id,
       death);
 

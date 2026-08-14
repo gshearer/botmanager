@@ -694,6 +694,7 @@ atk_cmd_attack(const cmd_ctx_t *ctx)
     .tgt_user = tgt_user,
     .tgt_nick = nick,
     .dmg      = dmg,
+    .dealt    = tgt.hp - new_hp,
     .wave     = round.wave,
     .crit     = crit,
     .new_top  = (crit && dmg > round.top_crit),

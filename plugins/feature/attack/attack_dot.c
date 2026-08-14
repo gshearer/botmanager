@@ -136,6 +136,7 @@ atk_dot_service(const atk_dot_due_t *d, const atk_tunables_t *t)
     .victim    = d->victim,
     .source    = d->source,
     .dmg       = dmg,
+    .dealt     = victim.hp - new_hp,
     .tick_secs = t->dot_tick_secs,
     .last      = d->expired,
     .fatal     = fatal,
