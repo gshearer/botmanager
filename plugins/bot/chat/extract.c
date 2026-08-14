@@ -3,7 +3,11 @@
 #define EXTRACT_INTERNAL
 #include "extract.h"
 
+#define CHATBOT_INTERNAL
+#include "chatbot.h"
+
 #include "alloc.h"
+#include "bot.h"
 #include "common.h"
 #include "clam.h"
 #include "db.h"
@@ -11,6 +15,7 @@
 #include "inference.h"
 #include "json.h"
 #include "kv.h"
+#include "method.h"
 #include "task.h"
 
 #include <ctype.h>
@@ -382,6 +387,94 @@ extract_parse_aliases(const char *content, size_t content_len,
 
 // Alias validator (DB-backed) + synthetic signature builder.
 
+// Rejection scan over the loaded bots. `match` latches: bot_iterate has
+// no early exit, so once the answer is known the remaining callbacks
+// cost one branch each.
+typedef struct
+{
+  const char *alias;
+  bool        match;
+} extract_botname_scan_t;
+
+static void
+extract_botname_cb(const char *name, const char *method_kinds,
+    bot_state_t state, uint32_t method_count, const char *userns_name,
+    uint64_t cmd_count, time_t last_activity, void *data)
+{
+  extract_botname_scan_t *s = data;
+  chatbot_names_t         names;
+  bot_inst_t             *inst;
+  method_inst_t          *m;
+  char                    nick[METHOD_SENDER_SZ];
+
+  (void)method_kinds;
+  (void)state;
+  (void)method_count;
+  (void)userns_name;
+  (void)cmd_count;
+  (void)last_activity;
+
+  if(s->match || name == NULL)
+    return;
+
+  if(strcasecmp(s->alias, name) == 0)
+  {
+    s->match = true;
+    return;
+  }
+
+  // The nick it is wearing right now, which need not be its configured
+  // name (CHAT-PROMPT-SELF-NICK-1) and is what a transcript's address
+  // prefixes actually carry. Reaching back into core here is safe by
+  // design: bot_iterate snapshots under bot_mutex and runs the callback
+  // with the lock released, precisely so a callback may call back in.
+  inst = bot_find(name);
+  m    = (inst != NULL) ? bot_first_method(inst) : NULL;
+
+  nick[0] = '\0';
+
+  if(m != NULL)
+    method_get_self(m, nick, sizeof(nick));
+
+  if(nick[0] != '\0' && strcasecmp(s->alias, nick) == 0)
+  {
+    s->match = true;
+    return;
+  }
+
+  // The `bot.<n>.aka` short names are the sharpest case of the three:
+  // they ARE informal shortenings of a name, which is exactly the shape
+  // the extractor is asked to emit. Read through chatbot_names_resolve
+  // rather than the KV directly so the list keeps one parse — its
+  // "-" sentinel and length rule are not worth owning twice.
+  chatbot_names_resolve(name, NULL, &names);
+
+  for(size_t i = 0; i < names.n_aka; i++)
+    if(strcasecmp(s->alias, names.aka[i]) == 0)
+    {
+      s->match = true;
+      return;
+    }
+}
+
+// True when `alias` names a loaded bot — its configured name, the nick
+// it is wearing right now, or one of its `bot.<n>.aka` short names.
+//
+// Scope is every loaded bot, not just the sweep's namespace. Bots from
+// different namespaces share IRC channels, so a transcript carries
+// "<otherbot>:" address prefixes a namespace filter would miss, and no
+// human's informal nickname is ever a running bot's — the wider set
+// rejects nothing it should have kept.
+static bool
+extract_alias_is_bot_name(const char *alias)
+{
+  extract_botname_scan_t s = { .alias = alias, .match = false };
+
+  bot_iterate(extract_botname_cb, &s);
+
+  return(s.match);
+}
+
 static bool
 extract_alias_validate(uint32_t ns_id, int64_t dossier_id,
     const char *alias, const extract_participant_t *parts, size_t n_parts)
@@ -405,6 +498,15 @@ extract_alias_validate(uint32_t ns_id, int64_t dossier_id,
   for(size_t i = 0; i < alen; i++)
     if(!isalnum((unsigned char)alias[i]))
       return(false);
+
+  // A bot is not a dossier, so the signature walk below collides with
+  // nothing when the model hands back the bot's OWN name — and a
+  // transcript is full of "<bot>:" address prefixes for it to latch
+  // onto. That is CHAT-ALIAS-1, observed live as dossier 3 gaining the
+  // alias "lessclam" at confidence 0.8. Checked ahead of the query
+  // because it needs no DB round trip.
+  if(extract_alias_is_bot_name(alias))
+    return(false);
 
   // Walk every IRC signature in this namespace whose nickname matches.
   // Alias rows are identifiable by their empty username/hostname/
