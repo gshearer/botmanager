@@ -558,30 +558,60 @@ memory_merge_msgs(const mem_msg_t *a, size_t na,
 // a synthesised query, and a byte-identical *earlier* line carries
 // nothing the query does not already say. Re-asking a question must not
 // evict its answer — which is exactly what was measured happening.
+//
+// `drop_echoes` keeps the asker's own prior *questions* out of the scan
+// (CHAT-RECALL-ECHO-1). This pool is dossier-scoped, so every
+// EXCHANGE_IN row in it is by construction a question this same person
+// put to this same bot — and the bot's answer to it is not in the pool
+// at all, because memory.embed_own_replies is off and no EXCHANGE_OUT
+// row is ever embedded. Retrieval could therefore only ever hand back
+// the asking, never the answer: measured at 66.9% of slots on a
+// question-shaped query against a 6-16% pool base rate, with every slot
+// an echo on 12 of 37 such queries.
+//
+// The filter belongs here rather than after hydration because an echo
+// must not consume an over-fetch slot either — the x3 over-fetch is
+// dedup headroom (CHAT-RECALL-DEDUP-1), not a budget to spend twice.
+//
+// A literal '?' is the whole test on both sides, and that is measured,
+// not assumed: all 90 EXCHANGE_IN echo slots carried one, and none was
+// an interrogative that lacked it. An opener word list was tried and
+// bought nothing (24 vs 25 wins over 29 blind pairwise judgements),
+// so the question mark is the rule — a query without one simply does
+// not trigger the filter.
 static void
 memory_recall_scan_convo(int ns_id, int64_t dossier_id,
     const char *model, uint32_t dim, const float *qvec,
     uint32_t top_k, uint32_t min_cos_x100, const char *exclude_esc,
-    memory_hit_t *out, size_t *n_out)
+    bool drop_echoes, memory_hit_t *out, size_t *n_out)
 {
   char  *join;
   size_t join_sz;
   size_t n;
+  char   echo_clause[64];
 
   *n_out = 0;
 
-  join_sz = 256 + (exclude_esc != NULL ? strlen(exclude_esc) : 0);
+  echo_clause[0] = '\0';
+
+  if(drop_echoes)
+    snprintf(echo_clause, sizeof(echo_clause),
+        " AND NOT (x.kind = %d AND x.text LIKE '%%?%%')",
+        (int)MEM_MSG_EXCHANGE_IN);
+
+  join_sz = 320 + (exclude_esc != NULL ? strlen(exclude_esc) : 0);
 
   join = mem_alloc("memory", "rag_recall_join", join_sz);
 
   snprintf(join, join_sz,
       "FROM conversation_embeddings e JOIN conversation_log x"
       " ON e.msg_id = x.id"
-      " WHERE x.ns_id = %d AND x.dossier_id = %" PRId64 "%s%s%s",
+      " WHERE x.ns_id = %d AND x.dossier_id = %" PRId64 "%s%s%s%s",
       ns_id, dossier_id,
       exclude_esc != NULL ? " AND x.text <> '" : "",
       exclude_esc != NULL ? exclude_esc      : "",
-      exclude_esc != NULL ? "'"              : "");
+      exclude_esc != NULL ? "'"              : "",
+      echo_clause);
 
   n = 0;
   memory_scan_embeddings(join, "msg_id", model, dim, qvec,
@@ -843,6 +873,11 @@ typedef struct
   // — a wasted slot is a far better failure than a malformed WHERE.
   char                 *query_esc;
 
+  // Was the inbound line a question? Decided from the raw query at
+  // submit time, because query_esc is what db_escape made of it.
+  // CHAT-RECALL-ECHO-1; see memory_recall_scan_convo().
+  bool                  drop_echoes;
+
   mem_fact_t           *facts;
   size_t                n_facts;
   mem_msg_t            *mention_msgs;
@@ -894,7 +929,7 @@ memory_retrieve_dossier_embed_done(const llm_embed_response_t *resp)
   n_hits = 0;
   memory_recall_scan_convo(c->ns_id, c->dossier_id, c->model,
       resp->dim, resp->vectors[0], fetch_k, c->min_cos_x100,
-      c->query_esc, hits, &n_hits);
+      c->query_esc, c->drop_echoes, hits, &n_hits);
 
   n_recall = memory_msgs_from_ids(c->ns_id, hits, n_hits,
       recall_msgs, MEMORY_RECALL_SCRATCH);
@@ -1058,6 +1093,7 @@ memory_retrieve_dossier(int ns_id, int64_t dossier_id, const char *query,
   rc->cb             = cb;
   rc->user           = user;
   rc->query_esc      = db_escape(query);
+  rc->drop_echoes    = strchr(query, '?') != NULL;
   rc->facts          = facts;
   rc->n_facts        = n_facts_total;
   rc->mention_msgs   = msgs;
