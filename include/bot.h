@@ -399,6 +399,11 @@ struct bot_inst
   bot_method_t          *methods;      // linked list of bound methods
   uint32_t               method_count;
   userns_t              *userns;       // optional user namespace
+  // The three counters below are written from a method's delivery
+  // thread and read from a command thread, so every access to them
+  // goes through __atomic_* with relaxed ordering — never a plain
+  // increment or load, on either side. They are display state; the
+  // ordering they do not promise is ordering nothing else needs.
   uint64_t               msg_count;    // total messages received
   uint64_t               cmd_count;    // total commands dispatched
   time_t                 last_activity; // last message received

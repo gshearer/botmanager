@@ -21,6 +21,10 @@ static bool plugin_quiesce(const plugin_rec_t *target, uint32_t timeout_ms,
 static void audit_emit_clam(const char *line, void *data);
 static void plugin_unmap_broadcast(uintptr_t lo, uintptr_t hi);
 
+// Caller holds one of the registry's two locks (plugin.h documents
+// which read needs which). The record it returns outlives the call only
+// under `plugin_mutate_mutex`; a reader holding the list lock must copy
+// what it needs before releasing.
 static plugin_rec_t *
 find_by_name(const char *name)
 {
@@ -119,8 +123,8 @@ plugin_provides(const plugin_desc_t *desc, const char *feature)
 
 // Public API
 
-bool
-plugin_load(const char *path)
+static bool
+plugin_load_locked(const char *path)
 {
   void                *handle;
   const plugin_desc_t *desc;
@@ -168,10 +172,13 @@ plugin_load(const char *path)
   rec->desc   = desc;
   rec->state  = PLUGIN_LOADED;
 
-  // Prepend to list.
+  // Prepend to list. The record is fully built first, so a reader that
+  // takes the list lock either does not see it or sees all of it.
+  pthread_mutex_lock(&plugin_list_mutex);
   rec->next = plugins;
   plugins   = rec;
   n_plugins++;
+  pthread_mutex_unlock(&plugin_list_mutex);
 
   clam(CLAM_INFO, "plugin", "loaded '%s' v%s (%s%s%s) from %s",
       desc->name, desc->version, plugin_type_name(desc->type),
@@ -187,7 +194,18 @@ plugin_load(const char *path)
 }
 
 bool
-plugin_unload(const char *name, plugin_unload_report_t *report)
+plugin_load(const char *path)
+{
+  bool rc;
+
+  pthread_mutex_lock(&plugin_mutate_mutex);
+  rc = plugin_load_locked(path);
+  pthread_mutex_unlock(&plugin_mutate_mutex);
+  return(rc);
+}
+
+static bool
+plugin_unload_locked(const char *name, plugin_unload_report_t *report)
 {
   plugin_rec_t  *target;
   plugin_rec_t **pp;
@@ -354,28 +372,55 @@ plugin_unload(const char *name, plugin_unload_report_t *report)
     }
   }
 
-  // Remove from list.
-  pp = &plugins;
-
-  while(*pp != NULL)
+  // Remove from list. Unlinking is the only part that takes the list
+  // lock: once the record is out, no reader can reach it, and dlclose()
+  // runs .so destructors while mem_free() takes the allocator's lock —
+  // neither belongs under a lock a logging thread may be waiting on.
   {
-    if(*pp == target)
+    bool unlinked = false;
+
+    pthread_mutex_lock(&plugin_list_mutex);
+
+    pp = &plugins;
+
+    while(*pp != NULL)
     {
-      *pp = target->next;
-      clam(CLAM_INFO, "plugin", "unloading '%s'", name);
+      if(*pp == target)
+      {
+        *pp = target->next;
+        n_plugins--;
+        unlinked = true;
+        break;
+      }
 
-      if(target->handle != NULL)
-        dlclose(target->handle);  // synthetic providers have no handle
-
-      mem_free(target);
-      n_plugins--;
-      return(SUCCESS);
+      pp = &(*pp)->next;
     }
 
-    pp = &(*pp)->next;
+    pthread_mutex_unlock(&plugin_list_mutex);
+
+    if(!unlinked)
+      return(FAIL);  // unreachable: a mutator holds the record steady
+
+    clam(CLAM_INFO, "plugin", "unloading '%s'", name);
+
+    if(target->handle != NULL)
+      dlclose(target->handle);  // synthetic providers have no handle
+
+    mem_free(target);
   }
 
-  return(FAIL);  // unreachable
+  return(SUCCESS);
+}
+
+bool
+plugin_unload(const char *name, plugin_unload_report_t *report)
+{
+  bool rc;
+
+  pthread_mutex_lock(&plugin_mutate_mutex);
+  rc = plugin_unload_locked(name, report);
+  pthread_mutex_unlock(&plugin_mutate_mutex);
+  return(rc);
 }
 
 // Every loaded plugin that transitively requires a feature `target`
@@ -619,8 +664,8 @@ plugin_suspend_range(const plugin_snap_t *snap, uint32_t n, const char *name,
   return(SUCCESS);
 }
 
-bool
-plugin_reload(const char *name, plugin_reload_report_t *report)
+static bool
+plugin_reload_locked(const char *name, plugin_reload_report_t *report)
 {
   plugin_rec_t  *target;
   plugin_snap_t *snap;
@@ -768,6 +813,17 @@ plugin_reload(const char *name, plugin_reload_report_t *report)
   return(SUCCESS);
 }
 
+bool
+plugin_reload(const char *name, plugin_reload_report_t *report)
+{
+  bool rc;
+
+  pthread_mutex_lock(&plugin_mutate_mutex);
+  rc = plugin_reload_locked(name, report);
+  pthread_mutex_unlock(&plugin_mutate_mutex);
+  return(rc);
+}
+
 uint32_t
 plugin_discover(const char *dir)
 {
@@ -778,10 +834,16 @@ plugin_discover(const char *dir)
   if(dir == NULL || !plugin_ready)
     return(0);
 
+  // Held across the whole sweep, and recursively across the subdirectory
+  // recursion below, so a directory's worth of plugins arrives as one
+  // registry change rather than as N racing ones.
+  pthread_mutex_lock(&plugin_mutate_mutex);
+
   d = opendir(dir);
 
   if(d == NULL)
   {
+    pthread_mutex_unlock(&plugin_mutate_mutex);
     clam(CLAM_WARN, "plugin", "cannot open directory '%s': %s",
         dir, strerror(errno));
     return(0);
@@ -817,11 +879,12 @@ plugin_discover(const char *dir)
     if(len < 4 || strcmp(ent->d_name + len - 3, ".so") != 0)
       continue;
 
-    if(plugin_load(path) == SUCCESS)
+    if(plugin_load_locked(path) == SUCCESS)
       loaded++;
   }
 
   closedir(d);
+  pthread_mutex_unlock(&plugin_mutate_mutex);
   return(loaded);
 }
 
@@ -868,12 +931,19 @@ static void
 resolve_apply_order(plugin_rec_t **arr, const uint32_t *order,
     uint32_t count)
 {
+  // Relinking the whole list is a write, so it takes the list lock as
+  // well as the mutate lock the caller already holds. The logging comes
+  // after the release: clam() must never run under this one.
+  pthread_mutex_lock(&plugin_list_mutex);
+
   plugins = arr[order[0]];
 
   for(uint32_t i = 0; i < count - 1; i++)
     arr[order[i]]->next = arr[order[i + 1]];
 
   arr[order[count - 1]]->next = NULL;
+
+  pthread_mutex_unlock(&plugin_list_mutex);
 
   clam(CLAM_DEBUG, "plugin", "dependency order resolved (%u plugins):",
       count);
@@ -915,8 +985,8 @@ resolve_report_failures(plugin_rec_t **arr, const bool *placed,
     clam(CLAM_WARN, "plugin", "circular dependency detected");
 }
 
-bool
-plugin_resolve(void)
+static bool
+plugin_resolve_locked(void)
 {
   uint32_t        count;
   plugin_rec_t  **arr;
@@ -995,10 +1065,29 @@ plugin_resolve(void)
 }
 
 bool
+plugin_resolve(void)
+{
+  bool rc;
+
+  pthread_mutex_lock(&plugin_mutate_mutex);
+  rc = plugin_resolve_locked();
+  pthread_mutex_unlock(&plugin_mutate_mutex);
+  return(rc);
+}
+
+// The four lifecycle sweeps walk the registry and call into each plugin
+// on the way past, so each holds the mutate lock for its whole length:
+// the walk needs the list to hold still, and a callback is free to read
+// the registry (which takes the list lock) or to re-enter the loader
+// (which recursion covers).
+
+bool
 plugin_init_all(void)
 {
   if(!plugin_ready)
     return(FAIL);
+
+  pthread_mutex_lock(&plugin_mutate_mutex);
 
   for(plugin_rec_t *p = plugins; p != NULL; p = p->next)
   {
@@ -1030,12 +1119,14 @@ plugin_init_all(void)
     {
       clam(CLAM_FATAL, "plugin", "'%s' init callback failed",
           p->desc->name);
+      pthread_mutex_unlock(&plugin_mutate_mutex);
       return(FAIL);
     }
 
     p->state = PLUGIN_INITIALIZED;
   }
 
+  pthread_mutex_unlock(&plugin_mutate_mutex);
   return(SUCCESS);
 }
 
@@ -1044,6 +1135,8 @@ plugin_start_all(void)
 {
   if(!plugin_ready)
     return(FAIL);
+
+  pthread_mutex_lock(&plugin_mutate_mutex);
 
   for(plugin_rec_t *p = plugins; p != NULL; p = p->next)
   {
@@ -1056,12 +1149,14 @@ plugin_start_all(void)
     {
       clam(CLAM_FATAL, "plugin", "'%s' start callback failed",
           p->desc->name);
+      pthread_mutex_unlock(&plugin_mutate_mutex);
       return(FAIL);
     }
 
     p->state = PLUGIN_RUNNING;
   }
 
+  pthread_mutex_unlock(&plugin_mutate_mutex);
   return(SUCCESS);
 }
 
@@ -1072,17 +1167,26 @@ plugin_stop_all(void)
   plugin_rec_t **arr;
   uint32_t       idx = 0;
 
-  if(!plugin_ready || n_plugins == 0)
+  if(!plugin_ready)
     return;
 
+  pthread_mutex_lock(&plugin_mutate_mutex);
+
   count = n_plugins;
+
+  if(count == 0)
+  {
+    pthread_mutex_unlock(&plugin_mutate_mutex);
+    return;
+  }
+
   arr = mem_alloc("plugin", "stop_all",
       count * sizeof(plugin_rec_t *));
 
-  for(plugin_rec_t *p = plugins; p != NULL; p = p->next)
+  for(plugin_rec_t *p = plugins; p != NULL && idx < count; p = p->next)
     arr[idx++] = p;
 
-  for(uint32_t i = count; i > 0; i--)
+  for(uint32_t i = idx; i > 0; i--)
   {
     plugin_rec_t *p = arr[i - 1];
 
@@ -1098,6 +1202,7 @@ plugin_stop_all(void)
   }
 
   mem_free(arr);
+  pthread_mutex_unlock(&plugin_mutate_mutex);
 }
 
 void
@@ -1107,17 +1212,26 @@ plugin_deinit_all(void)
   plugin_rec_t **arr;
   uint32_t       idx = 0;
 
-  if(!plugin_ready || n_plugins == 0)
+  if(!plugin_ready)
     return;
 
+  pthread_mutex_lock(&plugin_mutate_mutex);
+
   count = n_plugins;
+
+  if(count == 0)
+  {
+    pthread_mutex_unlock(&plugin_mutate_mutex);
+    return;
+  }
+
   arr = mem_alloc("plugin", "deinit_all",
       count * sizeof(plugin_rec_t *));
 
-  for(plugin_rec_t *p = plugins; p != NULL; p = p->next)
+  for(plugin_rec_t *p = plugins; p != NULL && idx < count; p = p->next)
     arr[idx++] = p;
 
-  for(uint32_t i = count; i > 0; i--)
+  for(uint32_t i = idx; i > 0; i--)
   {
     plugin_rec_t *p = arr[i - 1];
 
@@ -1133,69 +1247,103 @@ plugin_deinit_all(void)
   }
 
   mem_free(arr);
+  pthread_mutex_unlock(&plugin_mutate_mutex);
 }
+
+// The three lookups below run on service, task and curl threads while a
+// command thread may be reloading, so each takes the list lock for the
+// walk. The descriptor they hand back is a different question with its
+// own answer — `PLUGIN.md §Pointers core cannot see`.
 
 const plugin_desc_t *
 plugin_find(const char *name)
 {
-  plugin_rec_t *rec;
+  const plugin_rec_t  *rec;
+  const plugin_desc_t *desc;
 
   if(name == NULL)
     return(NULL);
 
-  rec = find_by_name(name);
+  pthread_mutex_lock(&plugin_list_mutex);
+  rec  = find_by_name(name);
+  desc = (rec != NULL) ? rec->desc : NULL;
+  pthread_mutex_unlock(&plugin_list_mutex);
 
-  return(rec ? rec->desc : NULL);
+  return(desc);
 }
 
 const plugin_desc_t *
 plugin_find_feature(const char *feature)
 {
+  const plugin_desc_t *hit = NULL;
+
   if(feature == NULL)
     return(NULL);
 
-  for(plugin_rec_t *p = plugins; p != NULL; p = p->next)
-  {
+  pthread_mutex_lock(&plugin_list_mutex);
+
+  for(const plugin_rec_t *p = plugins; p != NULL && hit == NULL; p = p->next)
     for(uint32_t i = 0; i < p->desc->provides_count; i++)
       if(strcmp(p->desc->provides[i].name, feature) == 0)
-        return(p->desc);
-  }
+      {
+        hit = p->desc;
+        break;
+      }
 
-  return(NULL);
+  pthread_mutex_unlock(&plugin_list_mutex);
+  return(hit);
 }
 
 const plugin_desc_t *
 plugin_find_type(plugin_type_t type, const char *kind)
 {
-  for(plugin_rec_t *p = plugins; p != NULL; p = p->next)
+  const plugin_desc_t *hit = NULL;
+
+  pthread_mutex_lock(&plugin_list_mutex);
+
+  for(const plugin_rec_t *p = plugins; p != NULL; p = p->next)
   {
     if(p->desc->type != type)
       continue;
 
     if(kind == NULL || kind[0] == '\0' || strcmp(p->desc->kind, kind) == 0)
-      return(p->desc);
+    {
+      hit = p->desc;
+      break;
+    }
   }
 
-  return(NULL);
+  pthread_mutex_unlock(&plugin_list_mutex);
+  return(hit);
 }
 
 plugin_state_t
 plugin_get_state(const char *name)
 {
-  plugin_rec_t *rec;
+  const plugin_rec_t *rec;
+  plugin_state_t      state;
 
   if(name == NULL)
     return(PLUGIN_UNLOADED);
 
-  rec = find_by_name(name);
+  pthread_mutex_lock(&plugin_list_mutex);
+  rec   = find_by_name(name);
+  state = (rec != NULL) ? rec->state : PLUGIN_UNLOADED;
+  pthread_mutex_unlock(&plugin_list_mutex);
 
-  return(rec ? rec->state : PLUGIN_UNLOADED);
+  return(state);
 }
 
 uint32_t
 plugin_count(void)
 {
-  return(n_plugins);
+  uint32_t n;
+
+  pthread_mutex_lock(&plugin_list_mutex);
+  n = n_plugins;
+  pthread_mutex_unlock(&plugin_list_mutex);
+
+  return(n);
 }
 
 // Resolve a symbol out of a named plugin's .so. Plugins are dlopen'd
@@ -1206,19 +1354,25 @@ plugin_count(void)
 void *
 plugin_dlsym(const char *plugin_name, const char *symbol)
 {
-  plugin_rec_t *rec;
+  const plugin_rec_t *rec;
+  void               *handle;
 
   if(plugin_name == NULL || symbol == NULL)
     return(NULL);
 
-  rec = find_by_name(plugin_name);
+  // The handle comes out from under the list lock so the loader lock is
+  // never taken beneath it (the same ordering plugin_map_of() keeps).
+  pthread_mutex_lock(&plugin_list_mutex);
+  rec    = find_by_name(plugin_name);
+  handle = (rec != NULL) ? rec->handle : NULL;
+  pthread_mutex_unlock(&plugin_list_mutex);
 
-  if(rec == NULL || rec->handle == NULL)
+  if(handle == NULL)
     return(NULL);
 
   // Clear any pending dlerror so a NULL return is unambiguous.
   dlerror();
-  return(dlsym(rec->handle, symbol));
+  return(dlsym(handle, symbol));
 }
 
 // Look up the .so file path containing `addr` via dladdr(3). Returns
@@ -1396,18 +1550,21 @@ plugin_map_phdr_cb(struct dl_phdr_info *info, size_t size, void *data)
   return(1);  // stop the walk
 }
 
-// Resolve the mapping that contains `rec`'s descriptor — the descriptor
-// is a const object in the .so, so it is always a valid probe.
+// Resolve the mapping that contains a plugin's descriptor — the
+// descriptor is a const object in the .so, so it is always a valid
+// probe. It takes the descriptor rather than the record so a reader can
+// copy that one pointer out from under the list lock and take the
+// loader lock afterwards, never beneath it.
 static bool
-plugin_map_of(const plugin_rec_t *rec, plugin_map_t *out)
+plugin_map_of(const plugin_desc_t *desc, plugin_map_t *out)
 {
   plugin_map_probe_t probe;
 
-  if(rec == NULL || rec->handle == NULL || rec->desc == NULL)
+  if(desc == NULL)
     return(FAIL);
 
   memset(out, 0, sizeof(*out));
-  probe.probe = (uintptr_t)rec->desc;
+  probe.probe = (uintptr_t)desc;
   probe.out   = out;
   probe.found = false;
 
@@ -1416,18 +1573,41 @@ plugin_map_of(const plugin_rec_t *rec, plugin_map_t *out)
   return(probe.found ? SUCCESS : FAIL);
 }
 
+// The descriptor of a loaded plugin that actually has a mapping, or
+// NULL — for the two public readers that go on to resolve that mapping.
+// One pointer is all they need out of the registry, and taking it under
+// the list lock keeps dl_iterate_phdr() out from under that lock.
+// A synthetic core provider has no handle and so no mapping; it reads
+// here as "not found", which is what both callers already did with it.
+static const plugin_desc_t *
+plugin_mapped_desc(const char *name)
+{
+  const plugin_rec_t  *rec;
+  const plugin_desc_t *desc = NULL;
+
+  pthread_mutex_lock(&plugin_list_mutex);
+
+  rec = find_by_name(name);
+
+  if(rec != NULL && rec->handle != NULL)
+    desc = rec->desc;
+
+  pthread_mutex_unlock(&plugin_list_mutex);
+  return(desc);
+}
+
 bool
 plugin_owns_ptr(const char *plugin_name, const void *ptr)
 {
-  const plugin_rec_t *rec;
-  plugin_map_t        map;
+  const plugin_desc_t *desc;
+  plugin_map_t         map;
 
   if(plugin_name == NULL || ptr == NULL)
     return(false);
 
-  rec = find_by_name(plugin_name);
+  desc = plugin_mapped_desc(plugin_name);
 
-  if(rec == NULL || plugin_map_of(rec, &map) != SUCCESS)
+  if(desc == NULL || plugin_map_of(desc, &map) != SUCCESS)
     return(false);
 
   return((uintptr_t)ptr >= map.lo && (uintptr_t)ptr < map.hi);
@@ -1544,7 +1724,7 @@ plugin_reclaim(const plugin_rec_t *target)
   if(target == NULL || target->handle == NULL)
     return(0);
 
-  if(plugin_map_of(target, &map) != SUCCESS)
+  if(plugin_map_of(target->desc, &map) != SUCCESS)
   {
     clam(CLAM_WARN, "plugin_reclaim",
         "'%s': cannot resolve its mapping; nothing reclaimed",
@@ -1661,23 +1841,24 @@ audit_curl_cb(const curl_iter_req_t *req, void *data)
 uint32_t
 plugin_audit(const char *plugin_name, plugin_audit_emit_t emit, void *data)
 {
-  plugin_audit_ctx_t  ctx;
-  const plugin_rec_t *rec;
-  const db_driver_t  *db_drv;
-  uint32_t            leaks;
+  plugin_audit_ctx_t   ctx;
+  const plugin_desc_t *desc;
+  const db_driver_t   *db_drv;
+  uint32_t             leaks;
 
   if(plugin_name == NULL)
     return(0);
 
-  rec = find_by_name(plugin_name);
+  // NULL here covers both "not loaded" and "synthetic core provider" —
+  // the latter carries no mapping, so nothing of it can dangle.
+  desc = plugin_mapped_desc(plugin_name);
 
-  // Synthetic core providers carry no mapping — nothing can dangle.
-  if(rec == NULL || rec->handle == NULL)
+  if(desc == NULL)
     return(0);
 
   memset(&ctx, 0, sizeof(ctx));
 
-  if(plugin_map_of(rec, &ctx.map) != SUCCESS)
+  if(plugin_map_of(desc, &ctx.map) != SUCCESS)
   {
     clam(CLAM_WARN, "plugin_audit",
         "'%s': cannot resolve its mapping; audit skipped", plugin_name);
@@ -1830,7 +2011,7 @@ plugin_quiesce(const plugin_rec_t *target, uint32_t timeout_ms,
 
   memset(&ctx, 0, sizeof(ctx));
 
-  if(plugin_map_of(target, &ctx.map) != SUCCESS)
+  if(plugin_map_of(target->desc, &ctx.map) != SUCCESS)
   {
     clam(CLAM_WARN, "plugin", "'%s': cannot resolve its mapping; "
         "quiescence unverified", target->desc->name);
@@ -1873,7 +2054,10 @@ plugin_get_stats(plugin_stats_t *out)
     return;
 
   memset(out, 0, sizeof(*out));
+
+  pthread_mutex_lock(&plugin_list_mutex);
   out->loaded = n_plugins;
+  pthread_mutex_unlock(&plugin_list_mutex);
 }
 
 const char *
@@ -1969,13 +2153,21 @@ plugin_kv_group_register(const plugin_kv_group_t *group, ...)
   return(registered);
 }
 
+// Unlike plugin_iterate() below, this one hands the callback pointers
+// straight into each plugin's .rodata — a descriptor and a group inside
+// it — so a snapshot would copy nothing that mattered. It takes the
+// mutate lock instead, which is the only thing that stops the mapping
+// under those pointers going away mid-walk. The cost is that /show
+// schema waits behind a reload in progress, which is what it should do.
 void
 plugin_kv_group_iterate(plugin_kv_group_iter_cb_t cb, void *data)
 {
   if(cb == NULL)
     return;
 
-  for(plugin_rec_t *p = plugins; p != NULL; p = p->next)
+  pthread_mutex_lock(&plugin_mutate_mutex);
+
+  for(const plugin_rec_t *p = plugins; p != NULL; p = p->next)
   {
     if(p->desc == NULL || p->desc->kv_groups == NULL)
       continue;
@@ -1983,19 +2175,74 @@ plugin_kv_group_iterate(plugin_kv_group_iter_cb_t cb, void *data)
     for(uint32_t i = 0; i < p->desc->kv_groups_count; i++)
       cb(p->desc, &p->desc->kv_groups[i], data);
   }
+
+  pthread_mutex_unlock(&plugin_mutate_mutex);
 }
 
 // Plugin iteration
 
+// One row of what plugin_iterate hands a callback. Everything in the
+// signature is a string or a scalar, so the copy is complete: the
+// callback can outlive the plugin it describes without holding a
+// pointer into it, and the walk itself needs the list lock only.
+typedef struct
+{
+  char           name   [PLUGIN_NAME_SZ];
+  char           version[PLUGIN_VER_SZ];
+  char           path   [PLUGIN_PATH_SZ];
+  char           kind   [PLUGIN_NAME_SZ];
+  plugin_type_t  type;
+  plugin_state_t state;
+} plugin_iter_snap_t;
+
+// A callback here is free to reload plugins, reply over a method, or
+// call back into the registry (wm_strategy_scan does the first,
+// /help the second), so the fan-out runs with no lock held at all.
 void
 plugin_iterate(plugin_iterate_cb_t cb, void *data)
 {
+  plugin_iter_snap_t *snap;
+  uint32_t            count;
+  uint32_t            n = 0;
+
   if(cb == NULL)
     return;
 
-  for(plugin_rec_t *p = plugins; p != NULL; p = p->next)
-    cb(p->desc->name, p->desc->version, p->path,
-        p->desc->type, p->desc->kind, p->state, data);
+  pthread_mutex_lock(&plugin_list_mutex);
+
+  count = n_plugins;
+
+  if(count == 0)
+  {
+    pthread_mutex_unlock(&plugin_list_mutex);
+    return;
+  }
+
+  // Allocated inside the lock deliberately: sizing outside it and
+  // filling inside would silently drop a plugin loaded in the gap, and
+  // mem_alloc() is a leaf — it takes only the allocator's own mutex and
+  // logs nothing on the success path.
+  snap = mem_alloc("plugin", "iter_snap", count * sizeof(*snap));
+
+  for(const plugin_rec_t *p = plugins; p != NULL && n < count; p = p->next)
+  {
+    plugin_iter_snap_t *s = &snap[n++];
+
+    strlcpy(s->name,    p->desc->name,    sizeof(s->name));
+    strlcpy(s->version, p->desc->version, sizeof(s->version));
+    strlcpy(s->path,    p->path,          sizeof(s->path));
+    strlcpy(s->kind,    p->desc->kind,    sizeof(s->kind));
+    s->type  = p->desc->type;
+    s->state = p->state;
+  }
+
+  pthread_mutex_unlock(&plugin_list_mutex);
+
+  for(uint32_t i = 0; i < n; i++)
+    cb(snap[i].name, snap[i].version, snap[i].path,
+        snap[i].type, snap[i].kind, snap[i].state, data);
+
+  mem_free(snap);
 }
 
 // /show plugin command
@@ -2093,11 +2340,16 @@ plugin_show_cmp(const void *a, const void *b)
 static bool
 plugin_is_loaded_path(const char *path)
 {
-  for(plugin_rec_t *p = plugins; p != NULL; p = p->next)
-    if(strcmp(p->path, path) == 0)
-      return(true);
+  bool hit = false;
 
-  return(false);
+  pthread_mutex_lock(&plugin_list_mutex);
+
+  for(const plugin_rec_t *p = plugins; p != NULL && !hit; p = p->next)
+    if(strcmp(p->path, path) == 0)
+      hit = true;
+
+  pthread_mutex_unlock(&plugin_list_mutex);
+  return(hit);
 }
 
 static void
@@ -2931,29 +3183,51 @@ plugin_cmd_unload(const cmd_ctx_t *ctx)
   }
 
   // Pre-check dependencies to give a user-friendly error message.
-  // Iterate all loaded plugins and check if any require a feature
-  // that this plugin provides.
-  for(plugin_rec_t *q = plugins; q != NULL; q = q->next)
+  // Iterate all loaded plugins and check if any require a feature this
+  // plugin provides. The names of the first such pair are copied out
+  // under the list lock and the reply is composed after it: cmd_reply()
+  // reaches method_send() and clam(), neither of which may run beneath
+  // a registry lock.
   {
-    if(strcmp(q->desc->name, pd->name) == 0)
-      continue;
+    char dependent[PLUGIN_NAME_SZ] = "";
+    char feature  [PLUGIN_NAME_SZ] = "";
 
-    for(uint32_t r = 0; r < q->desc->requires_count; r++)
+    pthread_mutex_lock(&plugin_list_mutex);
+
+    for(const plugin_rec_t *q = plugins;
+        q != NULL && dependent[0] == '\0'; q = q->next)
     {
-      for(uint32_t p = 0; p < pd->provides_count; p++)
+      if(strcmp(q->desc->name, pd->name) == 0)
+        continue;
+
+      for(uint32_t r = 0; r < q->desc->requires_count; r++)
       {
-        if(strcmp(q->desc->requires[r].name,
-            pd->provides[p].name) == 0)
+        for(uint32_t p = 0; p < pd->provides_count; p++)
         {
-          snprintf(buf, sizeof(buf),
-              "cannot unload " CLR_BOLD "%s" CLR_RESET
-              ": " CLR_BOLD "%s" CLR_RESET
-              " depends on feature " CLR_CYAN "%s" CLR_RESET,
-              name, q->desc->name, pd->provides[p].name);
-          cmd_reply(ctx, buf);
-          return;
+          if(strcmp(q->desc->requires[r].name, pd->provides[p].name) != 0)
+            continue;
+
+          strlcpy(dependent, q->desc->name, sizeof(dependent));
+          strlcpy(feature, pd->provides[p].name, sizeof(feature));
+          break;
         }
+
+        if(dependent[0] != '\0')
+          break;
       }
+    }
+
+    pthread_mutex_unlock(&plugin_list_mutex);
+
+    if(dependent[0] != '\0')
+    {
+      snprintf(buf, sizeof(buf),
+          "cannot unload " CLR_BOLD "%s" CLR_RESET
+          ": " CLR_BOLD "%s" CLR_RESET
+          " depends on feature " CLR_CYAN "%s" CLR_RESET,
+          name, dependent, feature);
+      cmd_reply(ctx, buf);
+      return;
     }
   }
 
@@ -3322,9 +3596,11 @@ plugin_register_synthetic(uint32_t slot, const char *feature_name)
   rec->handle = NULL;         // synthetic: no .so backing
   rec->state  = PLUGIN_RUNNING; // synthetic: always "running"
 
+  pthread_mutex_lock(&plugin_list_mutex);
   rec->next = plugins;
   plugins   = rec;
   n_plugins++;
+  pthread_mutex_unlock(&plugin_list_mutex);
   return(SUCCESS);
 }
 
@@ -3344,13 +3620,20 @@ plugin_register_core_providers(void)
 void
 plugin_init(void)
 {
-  plugins      = NULL;
-  n_plugins    = 0;
+  pthread_mutex_lock(&plugin_mutate_mutex);
+
+  pthread_mutex_lock(&plugin_list_mutex);
+  plugins   = NULL;
+  n_plugins = 0;
+  pthread_mutex_unlock(&plugin_list_mutex);
+
   plugin_ready = true;
 
   // Core-provided features must exist before `plugin_discover()`
   // so that discovered plugins can resolve `.requires = "core_*"`.
   plugin_register_core_providers();
+
+  pthread_mutex_unlock(&plugin_mutate_mutex);
 
   clam(CLAM_DEBUG, "plugin", "subsystem initialized");
 }
@@ -3365,6 +3648,8 @@ plugin_exit(void)
   plugin_stop_all();
   plugin_deinit_all();
 
+  pthread_mutex_lock(&plugin_mutate_mutex);
+
   // Dlclose in reverse dependency order (dependents before providers).
   if(n_plugins > 0)
   {
@@ -3374,10 +3659,18 @@ plugin_exit(void)
 
     uint32_t idx = 0;
 
-    for(plugin_rec_t *p = plugins; p != NULL; p = p->next)
+    for(plugin_rec_t *p = plugins; p != NULL && idx < count; p = p->next)
       arr[idx++] = p;
 
-    for(uint32_t i = count; i > 0; i--)
+    // The list is emptied before anything is freed: after this a reader
+    // that takes the list lock finds nothing, rather than a record whose
+    // mapping is being torn down under it.
+    pthread_mutex_lock(&plugin_list_mutex);
+    plugins   = NULL;
+    n_plugins = 0;
+    pthread_mutex_unlock(&plugin_list_mutex);
+
+    for(uint32_t i = idx; i > 0; i--)
     {
       plugin_rec_t *r = arr[i - 1];
 
@@ -3392,8 +3685,8 @@ plugin_exit(void)
     mem_free(arr);
   }
 
-  plugins      = NULL;
-  n_plugins    = 0;
   plugin_ready = false;
+  pthread_mutex_unlock(&plugin_mutate_mutex);
+
   clam(CLAM_INFO, "plugin", "subsystem shut down");
 }

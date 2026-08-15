@@ -113,50 +113,90 @@ render_file(const clam_msg_t *m, char *out, size_t out_sz)
       short_label[sev], CLAM_CTX_SZ, m->context, m->msg);
 }
 
+// A file destination writes to a FILE* the subscription owns, and
+// cmd_clam_unsubscribe() fcloses it. Carrying that handle out of the
+// lock would be a use-after-close, so this one dispatches in place —
+// which costs a buffered fputs and a flush to a local file, not the
+// stalled socket the send path below has to worry about.
 static void
-dest_dispatch(const ccd_dest_t *d, const clam_msg_t *m,
-    const char *chat_line)
+dest_write_file(const ccd_dest_t *d, const clam_msg_t *m)
 {
-  method_inst_t *inst = NULL;
-  const char    *target = NULL;
+  char buf[CLAM_CTX_SZ + CLAM_MSG_SZ + 48];
 
-  switch(d->kind)
-  {
-    case CCD_HERE:
-      inst   = method_find(d->method_name);
-      target = d->target;
-      break;
-
-    case CCD_METHOD:
-    {
-      bot_inst_t *b = bot_find(d->bot_name);
-      if(b == NULL) return;            // bot gone; silently skip
-      inst   = bot_resolve_method(b, d->method_key);
-      target = d->target;
-      break;
-    }
-
-    case CCD_FILE:
-    {
-      char buf[CLAM_CTX_SZ + CLAM_MSG_SZ + 48];
-
-      if(d->fp == NULL) return;
-
-      render_file(m, buf, sizeof(buf));
-      fputs(buf, d->fp);
-      fflush(d->fp);
-      return;
-    }
-  }
-
-  if(inst == NULL || target == NULL || target[0] == '\0')
+  if(d->fp == NULL)
     return;
 
-  method_send(inst, target, chat_line);
+  render_file(m, buf, sizeof(buf));
+  fputs(buf, d->fp);
+  fflush(d->fp);
 }
+
+// What a socket destination needs, copied out of the subscription so
+// the send can run with clam_cmd_mutex released. The full ccd_dest_t is
+// over 4 KiB (PATH_MAX) and this path runs on every clam() call, so the
+// lift takes the fields a send reads and leaves the rest behind.
+typedef struct
+{
+  ccd_kind_t kind;
+  char       method_name[METHOD_NAME_SZ];
+  char       bot_name   [BOT_NAME_SZ];
+  char       method_key [METHOD_NAME_SZ];
+  char       target     [METHOD_CHANNEL_SZ];
+} ccd_send_t;
+
+static void
+dest_lift(const ccd_dest_t *d, ccd_send_t *out)
+{
+  out->kind = d->kind;
+  strlcpy(out->method_name, d->method_name, sizeof(out->method_name));
+  strlcpy(out->bot_name,    d->bot_name,    sizeof(out->bot_name));
+  strlcpy(out->method_key,  d->method_key,  sizeof(out->method_key));
+  strlcpy(out->target,      d->target,      sizeof(out->target));
+}
+
+static void
+dest_send(const ccd_send_t *d, const char *chat_line)
+{
+  method_inst_t *inst = NULL;
+
+  if(d->kind == CCD_HERE)
+    inst = method_find(d->method_name);
+
+  else
+  {
+    bot_inst_t *b = bot_find(d->bot_name);
+
+    if(b == NULL)
+      return;                          // bot gone; silently skip
+
+    inst = bot_resolve_method(b, d->method_key);
+  }
+
+  if(inst == NULL || d->target[0] == '\0')
+    return;
+
+  method_send(inst, d->target, chat_line);
+}
+
+// Every send this fan-out can lift out of the lock in one pass. Past
+// the cap the overflow is dispatched in place, which is correct and
+// merely slower — a silently dropped log line would not be. Kept small
+// deliberately: the array is a stack frame on every clam() call, and a
+// daemon with more than a handful of log-to-IRC destinations does not
+// exist.
+#define CLAM_CMD_FANOUT_MAX 8
 
 // Shared clam subscriber callback — fans out to every user subscription.
 // Runs under clam_mutex on the publisher's thread; must be fast.
+//
+// The socket sends deliberately happen after clam_cmd_mutex is
+// released. method_send() is a write to a peer that can stall for as
+// long as the peer likes, and holding the subscription list across it
+// blocks every /clam subscribe, /clam unsubscribe and /show clam behind
+// that peer. ⚠ It does NOT make clam() itself concurrent: clam.c holds
+// the global clam_mutex across this whole callback, so a stalled send
+// still stalls every thread that logs. That serialization is clam.c's
+// to answer for, not this file's.
 
 static void
 clam_cmd_shared_cb(const clam_msg_t *m)
@@ -166,6 +206,9 @@ clam_cmd_shared_cb(const clam_msg_t *m)
 
   char chat_line[CLAM_CTX_SZ + CLAM_MSG_SZ + 16];
   bool chat_built = false;
+
+  ccd_send_t fan[CLAM_CMD_FANOUT_MAX];
+  uint32_t   n_fan = 0;
 
   pthread_mutex_lock(&clam_cmd_mutex);
 
@@ -193,10 +236,29 @@ clam_cmd_shared_cb(const clam_msg_t *m)
     }
 
     for(size_t i = 0; i < s->n_dests; i++)
-      dest_dispatch(&s->dests[i], m, chat_line);
+    {
+      const ccd_dest_t *d = &s->dests[i];
+
+      if(d->kind == CCD_FILE)
+        dest_write_file(d, m);
+
+      else if(n_fan < CLAM_CMD_FANOUT_MAX)
+        dest_lift(d, &fan[n_fan++]);
+
+      else
+      {
+        ccd_send_t over;
+
+        dest_lift(d, &over);
+        dest_send(&over, chat_line);
+      }
+    }
   }
 
   pthread_mutex_unlock(&clam_cmd_mutex);
+
+  for(uint32_t i = 0; i < n_fan; i++)
+    dest_send(&fan[i], chat_line);
 }
 
 // clam_subscribe and clam_unsubscribe MUST be called with clam_cmd_mutex
@@ -445,6 +507,7 @@ cmd_clam_subscribe(const cmd_ctx_t *ctx)
   const char *err;
   unsigned long sev_u;
   clam_user_sub_t *s;
+  size_t n_dests;
   char ack[256];
 
   regex_str = (ctx->parsed->argc > 2)
@@ -464,15 +527,24 @@ cmd_clam_subscribe(const cmd_ctx_t *ctx)
     return;
   }
 
-  pthread_mutex_lock(&clam_cmd_mutex);
-
-  if(sub_find_locked(name) != NULL)
-  {
-    pthread_mutex_unlock(&clam_cmd_mutex);
-    cmd_reply(ctx, "subscription name already in use");
-    return;
-  }
-
+  // The whole record is built with clam_cmd_mutex RELEASED, and the lock
+  // is taken only for the duplicate check and the insert. ⭐ Measured
+  // 2026-08-15 under TSan: building it under the lock put `bot_find()` —
+  // reached from parse_one_dest() resolving a `bot:kind:#chan`
+  // destination — inside clam_cmd_mutex, and that is one edge of a live
+  // three-lock cycle:
+  //
+  //   clam_cmd_mutex -> bot_mutex   (here, resolving a destination)
+  //   bot_mutex      -> clam_mutex  (bot_create -> the driver's create()
+  //                                  -> cmd_set_prefix -> clam(); root
+  //                                  TODO.md §SC-20)
+  //   clam_mutex     -> clam_cmd_mutex (clam() fanning out to
+  //                                  clam_cmd_shared_cb)
+  //
+  // The other two edges are correct and consistent; this one is the
+  // inversion, so removing it is what breaks the cycle. It also takes
+  // regcomp() and the destination fopen()s off the lock, neither of
+  // which the list ever needed to be held for.
   s = mem_alloc("clam_cmd", "user_sub", sizeof(*s));
   memset(s, 0, sizeof(*s));
 
@@ -489,7 +561,6 @@ cmd_clam_subscribe(const cmd_ctx_t *ctx)
           REG_EXTENDED | REG_NOSUB) != 0)
     {
       mem_free(s);
-      pthread_mutex_unlock(&clam_cmd_mutex);
       cmd_reply(ctx, "invalid regex");
       return;
     }
@@ -502,13 +573,25 @@ cmd_clam_subscribe(const cmd_ctx_t *ctx)
   {
     char buf[256];
 
-    if(s->has_regex) regfree(&s->regex_compiled);
-    mem_free(s);
-    pthread_mutex_unlock(&clam_cmd_mutex);
+    sub_free(s);
     snprintf(buf, sizeof(buf), "dest error: %s", err);
     cmd_reply(ctx, buf);
     return;
   }
+
+  pthread_mutex_lock(&clam_cmd_mutex);
+
+  if(sub_find_locked(name) != NULL)
+  {
+    pthread_mutex_unlock(&clam_cmd_mutex);
+    sub_free(s);          // closes the file destinations it just opened
+    cmd_reply(ctx, "subscription name already in use");
+    return;
+  }
+
+  // Read out of the record before it is published: past the insert it
+  // belongs to the list, and a concurrent /clam unsubscribe may free it.
+  n_dests = s->n_dests;
 
   s->next = clam_cmd_subs;
   clam_cmd_subs = s;
@@ -528,7 +611,7 @@ cmd_clam_subscribe(const cmd_ctx_t *ctx)
 
   snprintf(ack, sizeof(ack),
       "subscribed '%s' at sev %u with %zu destination%s",
-      name, (unsigned)sev_u, s->n_dests, s->n_dests == 1 ? "" : "s");
+      name, (unsigned)sev_u, n_dests, n_dests == 1 ? "" : "s");
   cmd_reply(ctx, ack);
 }
 

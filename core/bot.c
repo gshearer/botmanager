@@ -238,8 +238,12 @@ bot_msg_handler(const method_msg_t *msg, void *data)
     }
   }
 
-  bot->msg_count++;
-  bot->last_activity = time(NULL);
+  // Both counters are written from every bound method's delivery thread
+  // and read from a command thread, so neither is safe as a plain
+  // increment. Relaxed ordering is all a display counter needs: nothing
+  // downstream of the read depends on what else the writer had done.
+  __atomic_add_fetch(&bot->msg_count, 1, __ATOMIC_RELAXED);
+  __atomic_store_n(&bot->last_activity, time(NULL), __ATOMIC_RELAXED);
   bot_witness_record(bot, msg);
   bot->driver->on_message(bot->handle, msg);
 }
@@ -358,6 +362,15 @@ bot_kv_fanout_method(const char *name, const char *method_kind)
       snap[i].method_cb(name, method_kind, snap[i].user);
 }
 
+// One back-fill target: a bot, and either a bound method kind or the
+// empty string for the bot-level row. Lifted out of the registry so the
+// contributor runs with bot_mutex released.
+typedef struct
+{
+  char bot [BOT_NAME_SZ];
+  char kind[PLUGIN_NAME_SZ];
+} bot_kv_target_t;
+
 void
 bot_kv_contributor_register(bot_kv_bot_cb_t bot_cb,
     bot_kv_method_cb_t method_cb, void *user)
@@ -387,19 +400,73 @@ bot_kv_contributor_register(bot_kv_bot_cb_t bot_cb,
   // already-bound methods, so a late/hot-reloaded plugin catches up.
   // kv_register is idempotent-quiet only for new keys, so we invoke the
   // single new contributor rather than the full fan-out.
-  pthread_mutex_lock(&bot_mutex);
-
-  for(bot_inst_t *b = bot_list; b != NULL; b = b->next)
+  //
+  // The names are copied out first and the contributor is called with
+  // bot_mutex released. A contributor is plugin code whose whole job is
+  // to kv_register(), and kv_register() logs — a clam destination routed
+  // to a bot resolves through bot_find(), which takes this lock on the
+  // same thread and self-deadlocks it (bot_iterate() documents the
+  // chain). Nothing here holds a pointer past the release: a bot
+  // destroyed in the gap costs one stale `bot.<name>.*` key, which
+  // bot_destroy()'s own kv_delete_prefix() is the answer to.
   {
-    if(bot_cb != NULL)
-      bot_cb(b->name, user);
+    bot_kv_target_t *tgt;
+    uint32_t         count = 0;
+    uint32_t         n     = 0;
 
-    if(method_cb != NULL)
-      for(bot_method_t *m = b->methods; m != NULL; m = m->next)
-        method_cb(b->name, m->method_kind, user);
+    pthread_mutex_lock(&bot_mutex);
+
+    for(const bot_inst_t *b = bot_list; b != NULL; b = b->next)
+    {
+      count++;                                  // the bot-level row
+
+      if(method_cb != NULL)
+        for(const bot_method_t *m = b->methods; m != NULL; m = m->next)
+          count++;
+    }
+
+    if(count == 0)
+    {
+      pthread_mutex_unlock(&bot_mutex);
+      return;
+    }
+
+    tgt = mem_alloc("bot", "kv_backfill", count * sizeof(*tgt));
+
+    for(const bot_inst_t *b = bot_list; b != NULL && n < count; b = b->next)
+    {
+      strlcpy(tgt[n].bot, b->name, sizeof(tgt[n].bot));
+      tgt[n].kind[0] = '\0';
+      n++;
+
+      if(method_cb == NULL)
+        continue;
+
+      for(const bot_method_t *m = b->methods; m != NULL && n < count;
+          m = m->next)
+      {
+        strlcpy(tgt[n].bot, b->name, sizeof(tgt[n].bot));
+        strlcpy(tgt[n].kind, m->method_kind, sizeof(tgt[n].kind));
+        n++;
+      }
+    }
+
+    pthread_mutex_unlock(&bot_mutex);
+
+    for(uint32_t i = 0; i < n; i++)
+    {
+      if(tgt[i].kind[0] == '\0')
+      {
+        if(bot_cb != NULL)
+          bot_cb(tgt[i].bot, user);
+      }
+
+      else
+        method_cb(tgt[i].bot, tgt[i].kind, user);
+    }
+
+    mem_free(tgt);
   }
-
-  pthread_mutex_unlock(&bot_mutex);
 }
 
 void
@@ -1130,7 +1197,7 @@ bot_discover_user(bot_inst_t *inst, const char *mfa_string)
   // Add the triggering MFA pattern.
   userns_user_add_mfa(ns, candidate, mfa_string);
 
-  bot_stat_discoveries++;
+  __atomic_add_fetch(&bot_stat_discoveries, 1, __ATOMIC_RELAXED);
   __atomic_add_fetch(&userns_stat_discoveries, 1, __ATOMIC_RELAXED);
 
   clam(CLAM_INFO, "bot_discover_user",
@@ -1352,7 +1419,8 @@ bot_get_stats(bot_stats_t *out)
   out->instances        = bot_count;
   out->running          = 0;
   out->methods          = 0;
-  out->discovered_users = bot_stat_discoveries;
+  out->discovered_users =
+      __atomic_load_n(&bot_stat_discoveries, __ATOMIC_RELAXED);
 
   for(bot_inst_t *b = bot_list; b != NULL; b = b->next)
   {
@@ -1418,8 +1486,8 @@ bot_iterate(bot_iter_cb_t cb, void *data)
     else
       s->userns_name[0] = '\0';
 
-    s->cmd_count     = b->cmd_count;
-    s->last_activity = b->last_activity;
+    s->cmd_count     = __atomic_load_n(&b->cmd_count, __ATOMIC_RELAXED);
+    s->last_activity = __atomic_load_n(&b->last_activity, __ATOMIC_RELAXED);
     count++;
   }
 
@@ -1889,13 +1957,15 @@ bot_inc_cmd_count(bot_inst_t *inst)
 uint64_t
 bot_cmd_count(const bot_inst_t *inst)
 {
-  return(inst != NULL ? inst->cmd_count : 0);
+  return(inst != NULL
+      ? __atomic_load_n(&inst->cmd_count, __ATOMIC_RELAXED) : 0);
 }
 
 time_t
 bot_last_activity(const bot_inst_t *inst)
 {
-  return(inst != NULL ? inst->last_activity : 0);
+  return(inst != NULL
+      ? __atomic_load_n(&inst->last_activity, __ATOMIC_RELAXED) : 0);
 }
 
 // Subsystem lifecycle

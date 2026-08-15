@@ -2224,44 +2224,96 @@ cmd_invoke(const cmd_def_t *def, const cmd_ctx_t *ctx)
 
 // Command iteration
 
+// Both iterators collect the nodes to visit while cmd_mutex is held and
+// call back with it released. Two things force the release and one
+// forces the snapshot.
+//
+// The release: a callback may re-enter cmd_iterate_children — /help's
+// per-bot verb listing and the chat plugin's NL vocabulary builder both
+// recurse — on a mutex that is not recursive, and it may cmd_reply(),
+// which reaches method_send() -> clam().
+//
+// The snapshot: walking the list across that release instead, which is
+// the shape this replaced, re-read `->next` out of a node a concurrent
+// /plugin reload had already freed in the gap (cmd_reclaim_owned() and
+// cmd_unregister_path() free cmd_list nodes under this same lock) and
+// followed it. Copying the pointers first cannot leave the list, which
+// bounds the exposure to the one node the callback is handed. Closing
+// that last window means not handing out node pointers at all — a
+// change to cmd_iter_cb_t's contract, not to this function.
+
+// Call `cb` for each of `n` collected nodes with no lock held, then
+// release the snapshot if it was heap-allocated.
+static void
+cmd_iterate_fanout(const cmd_def_t **snap, uint32_t n, const cmd_def_t **stack,
+    cmd_iter_cb_t cb, void *data)
+{
+  for(uint32_t i = 0; i < n; i++)
+    cb(snap[i], data);
+
+  if(snap != stack)
+    mem_free(snap);
+}
+
+// Nodes held on the stack before the snapshot spills to the heap. Sized
+// past the tree's root count so the common walk allocates nothing.
+#define CMD_ITER_STACK_MAX 64
+
 void
 cmd_iterate_root(cmd_iter_cb_t cb, void *data)
 {
+  const cmd_def_t  *stack[CMD_ITER_STACK_MAX];
+  const cmd_def_t **snap  = stack;
+  uint32_t          count = 0;
+  uint32_t          n     = 0;
+
   if(cb == NULL)
     return;
 
   pthread_mutex_lock(&cmd_mutex);
 
-  for(cmd_def_t *d = cmd_list; d != NULL; d = d->next)
-  {
-    if(d->parent != NULL)
-      continue;
+  for(const cmd_def_t *d = cmd_list; d != NULL; d = d->next)
+    if(d->parent == NULL)
+      count++;
 
-    pthread_mutex_unlock(&cmd_mutex);
-    cb(d, data);
-    pthread_mutex_lock(&cmd_mutex);
-  }
+  if(count > CMD_ITER_STACK_MAX)
+    snap = mem_alloc("cmd", "iter_snap", count * sizeof(*snap));
+
+  for(const cmd_def_t *d = cmd_list; d != NULL && n < count; d = d->next)
+    if(d->parent == NULL)
+      snap[n++] = d;
 
   pthread_mutex_unlock(&cmd_mutex);
+
+  cmd_iterate_fanout(snap, n, stack, cb, data);
 }
 
 void
 cmd_iterate_children(const cmd_def_t *parent, cmd_iter_cb_t cb, void *data)
 {
+  const cmd_def_t  *stack[CMD_ITER_STACK_MAX];
+  const cmd_def_t **snap  = stack;
+  uint32_t          count = 0;
+  uint32_t          n     = 0;
+
   if(parent == NULL || cb == NULL)
     return;
 
   pthread_mutex_lock(&cmd_mutex);
 
-  for(cmd_def_t *c = ((cmd_def_t *)parent)->children; c != NULL;
+  for(const cmd_def_t *c = parent->children; c != NULL; c = c->sibling)
+    count++;
+
+  if(count > CMD_ITER_STACK_MAX)
+    snap = mem_alloc("cmd", "iter_snap", count * sizeof(*snap));
+
+  for(const cmd_def_t *c = parent->children; c != NULL && n < count;
       c = c->sibling)
-  {
-    pthread_mutex_unlock(&cmd_mutex);
-    cb(c, data);
-    pthread_mutex_lock(&cmd_mutex);
-  }
+    snap[n++] = c;
 
   pthread_mutex_unlock(&cmd_mutex);
+
+  cmd_iterate_fanout(snap, n, stack, cb, data);
 }
 
 void

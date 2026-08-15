@@ -567,22 +567,47 @@ userns_user_set_cd(const userns_t *ns, const char *username,
 
 // Owner identity
 
+// The callback is handed a name and nothing else, so a snapshot taken
+// under the lock is the whole of what it needs — and the lock can then
+// be released for the length of the fan-out, which it must be: a
+// callback may reply, and cmd_reply reaches clam() and the identity
+// surface, both of which come back through this lock.
+//
+// Walking the list across that release — the shape this replaced —
+// re-read `ns->next` out of a node a concurrent userns_delete() had
+// freed in the gap, and followed it. Copying first is what makes the
+// walk itself unable to leave the list.
 void
 userns_iterate(userns_iter_cb_t cb, void *data)
 {
+  char    (*names)[USERNS_NAME_SZ] = NULL;
+  uint32_t  count = 0;
+  uint32_t  n     = 0;
+
   if(cb == NULL)
     return;
 
   pthread_mutex_lock(&userns_mutex);
 
-  for(userns_t *ns = userns_list; ns != NULL; ns = ns->next)
+  for(const userns_t *ns = userns_list; ns != NULL; ns = ns->next)
+    count++;
+
+  if(count > 0)
   {
-    pthread_mutex_unlock(&userns_mutex);
-    cb(ns->name, data);
-    pthread_mutex_lock(&userns_mutex);
+    names = mem_alloc("userns", "iter_snap", count * sizeof(*names));
+
+    for(const userns_t *ns = userns_list; ns != NULL && n < count;
+        ns = ns->next)
+      strlcpy(names[n++], ns->name, USERNS_NAME_SZ);
   }
 
   pthread_mutex_unlock(&userns_mutex);
+
+  for(uint32_t i = 0; i < n; i++)
+    cb(names[i], data);
+
+  if(names != NULL)
+    mem_free(names);
 }
 
 bool

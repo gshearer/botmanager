@@ -463,13 +463,50 @@ typedef struct plugin_rec
   char                  path[PLUGIN_PATH_SZ];
   void                 *handle;     // dlopen handle
   const plugin_desc_t  *desc;       // points into .so memory
-  plugin_state_t        state;
+  // Written by a mutator (which holds both locks below) and read by
+  // /show plugin and plugin_get_state() under the list lock alone, so
+  // the field carries its own atomicity rather than a third rule.
+  _Atomic plugin_state_t state;
   struct plugin_rec    *next;
 } plugin_rec_t;
 
+// The registry's two locks, and why there are two.
+//
+// `plugin_mutate_mutex` serialises the mutators — load, unload, reload,
+// resolve, the lifecycle sweeps, register_synthetic — against each
+// other, and is held for the whole of one. It is RECURSIVE because
+// plugin_reload() legitimately re-enters plugin_unload() and
+// plugin_load(), and it is held across plugin lifecycle callbacks,
+// which are free to read the registry. Holding it is what makes a
+// plugin_rec_t* stable for the length of a mutator: only a mutator ever
+// frees a record, and no second mutator can be running. That exclusion
+// is the answer to "refcount the handed-out record" — there is nothing
+// left for a refcount to protect.
+//
+// `plugin_list_mutex` protects the `plugins` linkage and `n_plugins`
+// against concurrent READERS, which take nothing else. It is held for
+// pointer-chasing and field copies only — never across clam(), a plugin
+// callback, dlclose(), or an emit — so it cannot join a lock cycle.
+//
+// The discipline that makes the pair sound is asymmetric, and it is the
+// whole of it: **a write takes BOTH, a read takes EITHER.** A reader
+// under the list lock cannot race a writer (the writer holds it too);
+// a mutator-internal walk under the mutate lock cannot race a writer
+// (there is no second mutator). Order is mutate -> list, never the
+// reverse.
+//
+// What neither lock addresses, because it is a different question with
+// a settled answer elsewhere: the `const plugin_desc_t *` these
+// functions hand out points into the plugin's mapping and dies at
+// dlclose. That is `PLUGIN.md §Pointers core cannot see` — re-resolve
+// on every call, never latch.
+static pthread_mutex_t    plugin_mutate_mutex =
+    PTHREAD_RECURSIVE_MUTEX_INITIALIZER_NP;
+static pthread_mutex_t    plugin_list_mutex   = PTHREAD_MUTEX_INITIALIZER;
+
 static plugin_rec_t      *plugins             = NULL;
 static uint32_t           n_plugins           = 0;
-static bool               plugin_ready        = false;
+static _Atomic bool       plugin_ready        = false;
 static dlsym_cache_rec_t *dlsym_cache_head    = NULL;
 static pthread_mutex_t    dlsym_cache_mutex   = PTHREAD_MUTEX_INITIALIZER;
 
