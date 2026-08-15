@@ -60,9 +60,14 @@ struct task
   task_kind_t     kind;             // lifecycle kind (default TASK_ONCE)
   uint8_t         priority;         // 0 = highest, 254 = lowest
 
-  // Set by callback before returning.
-  task_state_t    state;
-  time_t          sleep_until;      // for TASK_SLEEPING
+  // Set by callback before returning, on whatever thread is running it
+  // and under no lock of ours; task_iterate() reads both under
+  // task_lock (measured, TSan 2026-08-15). An iteration wants a whole
+  // value, not a synchronised one — it is describing a task that is
+  // running and will have moved on regardless — so _Atomic is the fix
+  // and neither the worker nor the walk takes anything extra.
+  _Atomic task_state_t state;
+  _Atomic time_t  sleep_until;      // for TASK_SLEEPING
 
   // Kind-specific fields.
   uint32_t        interval_ms;      // for TASK_PERIODIC (milliseconds)

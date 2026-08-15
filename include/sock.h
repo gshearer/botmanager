@@ -241,7 +241,10 @@ struct sock_session
   uint8_t            *read_buf;
   uint32_t            read_buf_sz;
 
-  // Send queue (protected by send_lock).
+  // Send queue (protected by send_lock). send_queued is the queue's own
+  // bookkeeping and every access to it — the limit test included — is
+  // under the lock: read outside it, two concurrent senders both see
+  // room and both take it (measured, TSan 2026-08-15).
   pthread_mutex_t     send_lock;
   sock_sendbuf_t     *send_head;
   sock_sendbuf_t     *send_tail;
@@ -255,12 +258,17 @@ struct sock_session
   // under a second lock on its hot path for a single byte.
   _Atomic bool        epollout_armed;
 
+  // Written by whichever thread moved bytes — the epoll worker, or a
+  // consumer draining its own send queue — and read by sock_iterate()
+  // and the timeout sweep, which hold sock_mutex and nothing the writer
+  // takes. Statistics and deadlines, so a reader wants a whole value
+  // rather than a synchronised one: _Atomic, no lock on either side.
   _Atomic time_t      connect_started;
-  time_t              connected_at;
-  time_t              last_activity;
+  _Atomic time_t      connected_at;
+  _Atomic time_t      last_activity;
 
-  uint64_t            bytes_in;
-  uint64_t            bytes_out;
+  _Atomic uint64_t    bytes_in;
+  _Atomic uint64_t    bytes_out;
 
   // For future multi-worker distribution.
   uint8_t             worker_id;

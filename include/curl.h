@@ -429,10 +429,13 @@ static pthread_cond_t     curl_slot_cond;
 // observed by the multi loop, which performs the cancellation work and
 // signals curl_drain_cond when finished. curl_shutting_down is checked
 // by curl_request_submit / _submit_wait to refuse new traffic from
-// every thread once the drain is initiated.
-static volatile bool      curl_shutting_down   = false;
-static volatile bool      curl_drain_initiated = false;
-static volatile bool      curl_drain_complete  = false;
+// every thread once the drain is initiated. All three are _Atomic and
+// not volatile: the multi loop reads them holding nothing while the
+// shutdown path writes them holding curl_submit_mutex (measured, TSan
+// 2026-08-15), and volatile promises ordering to no one.
+static _Atomic bool       curl_shutting_down   = false;
+static _Atomic bool       curl_drain_initiated = false;
+static _Atomic bool       curl_drain_complete  = false;
 static pthread_cond_t     curl_drain_cond;
 
 // In-flight bookkeeping. curl_active_qs is per-priority so the

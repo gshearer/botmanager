@@ -1333,7 +1333,9 @@ bool
 sock_send(sock_session_t *session, const void *buf, size_t len)
 {
   sock_sendbuf_t *sb;
+  uint32_t queued;
   bool need_wake;
+  bool full;
 
   if(session == NULL || buf == NULL || len == 0)
     return(FAIL);
@@ -1341,31 +1343,42 @@ sock_send(sock_session_t *session, const void *buf, size_t len)
   if(session->state != SOCK_STATE_CONNECTED)
     return(FAIL);
 
-  // Check send queue limit.
-  if(sock_cfg.send_queue_max > 0 &&
-      session->send_queued + (uint32_t)len > sock_cfg.send_queue_max)
-  {
-    clam(CLAM_WARN, "sock", "[%s] send queue full (%u bytes)",
-        session->name, session->send_queued);
-    return(FAIL);
-  }
-
+  // Built before the lock and given back unused on refusal: the queue
+  // limit is the queue's own state and cannot be tested outside the
+  // lock that owns it, and sock_sbuf_alloc() is a freelist pop.
   sb = sock_sbuf_alloc(buf, len);
 
   pthread_mutex_lock(&session->send_lock);
 
-  if(session->send_tail != NULL)
-    session->send_tail->next = sb;
+  queued = session->send_queued;
+  full   = (sock_cfg.send_queue_max > 0 &&
+      queued + (uint32_t)len > sock_cfg.send_queue_max);
 
-  else
-    session->send_head = sb;
+  if(!full)
+  {
+    if(session->send_tail != NULL)
+      session->send_tail->next = sb;
 
-  session->send_tail = sb;
-  session->send_queued += (uint32_t)len;
+    else
+      session->send_head = sb;
+
+    session->send_tail = sb;
+    session->send_queued += (uint32_t)len;
+  }
 
   need_wake = !session->epollout_armed;
 
   pthread_mutex_unlock(&session->send_lock);
+
+  // Both of these run with send_lock released: a clam() destination may
+  // be an IRC bot, whose delivery comes back through sock_send().
+  if(full)
+  {
+    sock_sbuf_release(sb);
+    clam(CLAM_WARN, "sock", "[%s] send queue full (%u bytes)",
+        session->name, queued);
+    return(FAIL);
+  }
 
   if(need_wake)
     sock_wake_worker(session);
@@ -1388,9 +1401,11 @@ sock_close(sock_session_t *session)
 
   session->state = SOCK_STATE_CLOSING;
 
-  // Best-effort: flush remaining send queue.
-  if(session->fd >= 0 && session->send_head != NULL)
-    sock_drain_sendq(session);
+  // Best-effort: flush remaining send queue. The queue head is
+  // send_lock's to look at and the drain answers "nothing to send" and
+  // "no fd" for itself, under both locks, so there is nothing to test
+  // out here that would not be a guess by the time it was acted on.
+  sock_drain_sendq(session);
 
   sock_session_close_fd(session);
   sock_deliver(session, SOCK_EVENT_DISCONNECT, NULL, 0, 0);

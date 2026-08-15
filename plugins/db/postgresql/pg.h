@@ -15,7 +15,10 @@ extern const db_driver_t pg_driver;
 #include <libpq-fe.h>
 
 // Last error from a failed connect (no handle available to query).
-static char pg_last_error[DB_ERROR_SZ] = "";
+// Thread-local: every pool worker connects on its own, and the error
+// belongs to the thread whose connect failed — shared, it hands a
+// caller somebody else's failure (measured, TSan 2026-08-15).
+static _Thread_local char pg_last_error[DB_ERROR_SZ] = "";
 
 #endif // PG_INTERNAL
 
