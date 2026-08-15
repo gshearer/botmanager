@@ -46,6 +46,103 @@ sock_sbuf_release(sock_sendbuf_t *sb)
   pthread_mutex_unlock(&sock_sbuf_mutex);
 }
 
+// Session lifetime
+//
+// The owner holds one reference from sock_create() until sock_destroy();
+// every thread that is about to use a session takes a second one first.
+// sock_destroy() unlinks and detaches but never waits, so the freeing
+// happens wherever the count reaches zero — which is the only shape that
+// works here, because the owner destroys a bot holding bot_mutex and
+// method_mutex and the callback it would otherwise wait for needs both.
+
+// Free a detached session with no references left. Runs on whichever
+// thread dropped the last one; nothing else can reach the session by
+// then, so no lock is needed beyond the freelist's own.
+static void
+sock_free(sock_session_t *s)
+{
+  sock_done_cb_t  done    = s->done;
+  void           *cb_data = s->cb_data;
+  sock_sendbuf_t *sb      = s->send_head;
+
+  while(sb != NULL)
+  {
+    sock_sendbuf_t *next = sb->next;
+
+    sock_sbuf_release(sb);
+    sb = next;
+  }
+
+  pthread_mutex_destroy(&s->send_lock);
+  pthread_mutex_destroy(&s->io_lock);
+
+  mem_free(s->read_buf);
+
+  clam(CLAM_DEBUG, "sock", "[%s] session destroyed", s->name);
+
+  mem_free(s);
+
+  if(done != NULL)
+    done(cb_data);
+}
+
+// Resolve an epoll event back to a live session. A detached session is
+// off sock_list, so a stale event simply finds nothing.
+static sock_session_t *
+sock_hold_by_id(uint64_t id)
+{
+  sock_session_t *s;
+
+  pthread_mutex_lock(&sock_mutex);
+
+  for(s = sock_list; s != NULL; s = s->next)
+  {
+    if(s->id == id)
+    {
+      s->refs++;
+      break;
+    }
+  }
+
+  pthread_mutex_unlock(&sock_mutex);
+
+  return(s);
+}
+
+void
+sock_hold(sock_session_t *session)
+{
+  if(session == NULL)
+    return;
+
+  pthread_mutex_lock(&sock_mutex);
+  session->refs++;
+  pthread_mutex_unlock(&sock_mutex);
+}
+
+void
+sock_release(sock_session_t *session)
+{
+  bool last;
+
+  if(session == NULL)
+    return;
+
+  pthread_mutex_lock(&sock_mutex);
+  last = (--session->refs == 0 && session->detached);
+  pthread_mutex_unlock(&sock_mutex);
+
+  if(last)
+    sock_free(session);
+}
+
+void
+sock_set_done(sock_session_t *session, sock_done_cb_t fn)
+{
+  if(session != NULL)
+    session->done = fn;
+}
+
 // Internal helpers
 
 // Deliver an event to the session's consumer callback.
@@ -82,10 +179,13 @@ sock_wake_worker(sock_session_t *s)
     (void)write(w->wake_fd, &val, sizeof(val));
 }
 
-// Close the session's fd and update state.
+// Close the session's fd and update state. Idempotent: whoever gets
+// io_lock first does the work and everyone after sees fd == -1.
 static void
 sock_session_close_fd(sock_session_t *s)
 {
+  pthread_mutex_lock(&s->io_lock);
+
   // Clean up TLS before closing fd.
   sock_tls_cleanup(s);
 
@@ -102,14 +202,23 @@ sock_session_close_fd(sock_session_t *s)
   }
 
   s->state = SOCK_STATE_CLOSED;
+
+  pthread_mutex_unlock(&s->io_lock);
 }
 
+// Push as much of the send queue onto the wire as it will take. Returns
+// true only when the queue is empty; every other exit — would-block, a
+// fatal write, a partial send, a closed fd — means "come back on the
+// next EPOLLOUT" and is one answer to the caller.
 static bool
 sock_drain_sendq(sock_session_t *s)
 {
+  bool drained = false;
+
+  pthread_mutex_lock(&s->io_lock);
   pthread_mutex_lock(&s->send_lock);
 
-  while(s->send_head != NULL)
+  while(s->fd >= 0 && s->send_head != NULL)
   {
     sock_sendbuf_t *sb = s->send_head;
     size_t remaining = sb->len - sb->offset;
@@ -119,39 +228,19 @@ sock_drain_sendq(sock_session_t *s)
     {
       n = SSL_write(s->tls, sb->data + sb->offset, (int)remaining);
 
+      // Would-block and fatal alike: stop here. A fatal TLS error is
+      // reported by the EPOLLERR the same socket is about to raise.
       if(n <= 0)
-      {
-        int ssl_err = SSL_get_error(s->tls, (int)n);
-
-        if(ssl_err == SSL_ERROR_WANT_WRITE ||
-            ssl_err == SSL_ERROR_WANT_READ)
-        {
-          pthread_mutex_unlock(&s->send_lock);
-          return(false);
-        }
-
-        // Fatal TLS write error.
-        pthread_mutex_unlock(&s->send_lock);
-        return(false);
-      }
+        break;
     }
 
     else
     {
       n = send(s->fd, sb->data + sb->offset, remaining, MSG_NOSIGNAL);
 
+      // EAGAIN or a real error — the latter is caught by EPOLLERR.
       if(n < 0)
-      {
-        if(errno == EAGAIN || errno == EWOULDBLOCK)
-        {
-          pthread_mutex_unlock(&s->send_lock);
-          return(false);
-        }
-
-        // Real error — will be caught by EPOLLERR.
-        pthread_mutex_unlock(&s->send_lock);
-        return(false);
-      }
+        break;
     }
 
     sb->offset += (size_t)n;
@@ -160,26 +249,24 @@ sock_drain_sendq(sock_session_t *s)
 
     __atomic_fetch_add(&sock_total_out, (uint64_t)n, __ATOMIC_RELAXED);
 
-    if(sb->offset >= sb->len)
-    {
-      s->send_head = sb->next;
+    // Partial send — stop here, wait for the next EPOLLOUT.
+    if(sb->offset < sb->len)
+      break;
 
-      if(s->send_head == NULL)
-        s->send_tail = NULL;
+    s->send_head = sb->next;
 
-      sock_sbuf_release(sb);
-    }
+    if(s->send_head == NULL)
+      s->send_tail = NULL;
 
-    else
-    {
-      // Partial send — stop here, wait for next EPOLLOUT.
-      pthread_mutex_unlock(&s->send_lock);
-      return(false);
-    }
+    sock_sbuf_release(sb);
   }
 
+  drained = (s->send_head == NULL);
+
   pthread_mutex_unlock(&s->send_lock);
-  return(true);
+  pthread_mutex_unlock(&s->io_lock);
+
+  return(drained);
 }
 
 // Arm or disarm EPOLLOUT for a session.
@@ -192,11 +279,54 @@ sock_epoll_rearm(sock_worker_t *w, sock_session_t *s, bool want_out)
   if(want_out)
     events |= EPOLLOUT;
 
-  ev.events  = events;
-  ev.data.ptr = s;
+  ev.events    = events;
+  ev.data.u64  = s->id;
 
-  epoll_ctl(w->epoll_fd, EPOLL_CTL_MOD, s->fd, &ev);
+  pthread_mutex_lock(&s->io_lock);
+
+  if(s->fd >= 0)
+    epoll_ctl(w->epoll_fd, EPOLL_CTL_MOD, s->fd, &ev);
+
+  pthread_mutex_unlock(&s->io_lock);
+
   s->epollout_armed = want_out;
+}
+
+// Read and clear SO_ERROR. Under io_lock because the fd it asks about
+// must not be closed and reissued to somebody else mid-call.
+static int
+sock_pending_error(sock_session_t *s)
+{
+  int       err    = 0;
+  socklen_t errlen = sizeof(err);
+
+  pthread_mutex_lock(&s->io_lock);
+
+  if(s->fd >= 0)
+    getsockopt(s->fd, SOL_SOCKET, SO_ERROR, &err, &errlen);
+
+  pthread_mutex_unlock(&s->io_lock);
+
+  return(err);
+}
+
+// Take ownership of a freshly connected fd and register it with the
+// session's epoll worker. Events carry the session id, never its
+// address: a completed batch can name a session the owner has since
+// destroyed, and only an id survives that honestly.
+static void
+sock_adopt_fd(sock_session_t *s, int fd, uint32_t events)
+{
+  sock_worker_t *w = &sock_workers[s->worker_id];
+  struct epoll_event ev;
+
+  ev.events   = events;
+  ev.data.u64 = s->id;
+
+  pthread_mutex_lock(&s->io_lock);
+  s->fd = fd;
+  epoll_ctl(w->epoll_fd, EPOLL_CTL_ADD, fd, &ev);
+  pthread_mutex_unlock(&s->io_lock);
 }
 
 // Set TCP keepalive on a connected socket.
@@ -218,7 +348,9 @@ sock_set_keepalive(int fd, uint32_t interval)
 
 // TLS helpers
 
-// Free TLS resources for a session.
+// Free TLS resources for a session. Caller must hold io_lock: an SSL
+// object freed under a thread still reading it is a use-after-free
+// inside OpenSSL's own locking (measured, TSan 2026-08-15).
 static void
 sock_tls_cleanup(sock_session_t *s)
 {
@@ -243,12 +375,29 @@ static bool
 sock_tls_handshake(sock_session_t *s)
 {
   int rc;
-  int err;
-  sock_worker_t *w;
+  int err = 0;
+  sock_worker_t *w = &sock_workers[s->worker_id];
   unsigned long ssl_err;
   char errbuf[128];
+  char version[32] = {0};
+
+  pthread_mutex_lock(&s->io_lock);
+
+  if(s->tls == NULL || s->fd < 0)
+  {
+    pthread_mutex_unlock(&s->io_lock);
+    return(true);
+  }
 
   rc = SSL_connect(s->tls);
+
+  if(rc == 1)
+    strlcpy(version, SSL_get_version(s->tls), sizeof version);
+  else
+    err = SSL_get_error(s->tls, rc);
+
+  pthread_mutex_unlock(&s->io_lock);
+
   if(rc == 1)
   {
     // Handshake complete.
@@ -256,27 +405,23 @@ sock_tls_handshake(sock_session_t *s)
     s->last_activity = time(NULL);
     s->connected_at  = s->last_activity;
 
-    w = &sock_workers[s->worker_id];
     sock_epoll_rearm(w, s, false);
 
     clam(CLAM_INFO, "sock", "[%s] TLS handshake complete (%s)",
-        s->name, SSL_get_version(s->tls));
+        s->name, version);
 
     sock_deliver(s, SOCK_EVENT_CONNECTED, NULL, 0, 0);
     return(true);
   }
 
-  err = SSL_get_error(s->tls, rc);
   if(err == SSL_ERROR_WANT_READ)
   {
-    w = &sock_workers[s->worker_id];
     sock_epoll_rearm(w, s, false);
     return(false);
   }
 
   if(err == SSL_ERROR_WANT_WRITE)
   {
-    w = &sock_workers[s->worker_id];
     sock_epoll_rearm(w, s, true);
     return(false);
   }
@@ -292,7 +437,7 @@ sock_tls_handshake(sock_session_t *s)
   clam(CLAM_WARN, "sock", "[%s] TLS handshake failed: %s",
       s->name, errbuf);
 
-  sock_tls_cleanup(s);
+  // close_fd cleans TLS up under io_lock — do not free it first.
   sock_session_close_fd(s);
   sock_deliver(s, SOCK_EVENT_ERROR, NULL, 0, ECONNABORTED);
   return(true);
@@ -316,6 +461,7 @@ sock_unix_connect_task(task_t *t)
     sock_deliver(s, SOCK_EVENT_ERROR, NULL, 0, errno);
     s->state = SOCK_STATE_CLOSED;
     t->state = TASK_ENDED;
+    sock_release(s);
     return;
   }
 
@@ -326,34 +472,19 @@ sock_unix_connect_task(task_t *t)
   rc = connect(fd, (struct sockaddr *)&addr, sizeof(addr));
   if(rc == 0)
   {
-    sock_worker_t *w = &sock_workers[s->worker_id];
-    struct epoll_event ev;
-
     // Immediate connect.
-    s->fd = fd;
+    sock_adopt_fd(s, fd, EPOLLIN | EPOLLET);
     s->state = SOCK_STATE_CONNECTED;
     s->last_activity = time(NULL);
     s->connected_at  = s->last_activity;
-
-    // Register with epoll.
-    ev.events   = EPOLLIN | EPOLLET;
-    ev.data.ptr = s;
-    epoll_ctl(w->epoll_fd, EPOLL_CTL_ADD, fd, &ev);
 
     sock_deliver(s, SOCK_EVENT_CONNECTED, NULL, 0, 0);
   }
 
   else if(errno == EINPROGRESS)
   {
-    sock_worker_t *w = &sock_workers[s->worker_id];
-    struct epoll_event ev;
-
-    s->fd = fd;
+    sock_adopt_fd(s, fd, EPOLLOUT | EPOLLET);
     s->state = SOCK_STATE_CONNECTING;
-
-    ev.events   = EPOLLOUT | EPOLLET;
-    ev.data.ptr = s;
-    epoll_ctl(w->epoll_fd, EPOLL_CTL_ADD, fd, &ev);
     sock_wake_worker(s);
   }
 
@@ -367,6 +498,9 @@ sock_unix_connect_task(task_t *t)
   }
 
   t->state = TASK_ENDED;
+
+  // The reference sock_connect() took for this leg.
+  sock_release(s);
 }
 
 // Resolve callback for TCP/UDP connections
@@ -378,7 +512,6 @@ sock_resolve_done(const resolve_result_t *result)
   int socktype;
   int fd = -1;
   int rc = -1;
-  sock_worker_t *w;
 
   if(result->status != 0 || result->count == 0)
   {
@@ -387,6 +520,7 @@ sock_resolve_done(const resolve_result_t *result)
         result->error ? result->error : "no records");
     sock_deliver(s, SOCK_EVENT_ERROR, NULL, 0, EHOSTUNREACH);
     s->state = SOCK_STATE_CLOSED;
+    sock_release(s);
     return;
   }
 
@@ -401,6 +535,7 @@ sock_resolve_done(const resolve_result_t *result)
         s->name);
     sock_deliver(s, SOCK_EVENT_ERROR, NULL, 0, ENOSYS);
     s->state = SOCK_STATE_CLOSED;
+    sock_release(s);
     return;
   }
 
@@ -456,33 +591,29 @@ sock_resolve_done(const resolve_result_t *result)
         s->name, s->host, s->port);
     sock_deliver(s, SOCK_EVENT_ERROR, NULL, 0, ECONNREFUSED);
     s->state = SOCK_STATE_CLOSED;
+    sock_release(s);
     return;
   }
-
-  s->fd = fd;
 
   // Apply TCP keepalive if configured.
   if(s->type == SOCK_TCP)
     sock_set_keepalive(fd, sock_cfg.keepalive);
 
-  w = &sock_workers[s->worker_id];
-
   if(rc == 0)
   {
-    struct epoll_event ev;
-
     // Immediate connect.
-    ev.events   = EPOLLIN | EPOLLET;
-    ev.data.ptr = s;
-    epoll_ctl(w->epoll_fd, EPOLL_CTL_ADD, fd, &ev);
+    sock_adopt_fd(s, fd, EPOLLIN | EPOLLET);
 
     if(s->tls_enabled)
     {
       clam(CLAM_INFO, "sock", "[%s] TCP connected to %s:%u, starting TLS",
           s->name, s->host, s->port);
 
+      pthread_mutex_lock(&s->io_lock);
       SSL_set_fd(s->tls, s->fd);
       SSL_set_tlsext_host_name(s->tls, s->host);
+      pthread_mutex_unlock(&s->io_lock);
+
       s->state = SOCK_STATE_TLS_HANDSHAKE;
       sock_tls_handshake(s);
     }
@@ -502,16 +633,14 @@ sock_resolve_done(const resolve_result_t *result)
 
   else
   {
-    struct epoll_event ev;
-
     // EINPROGRESS — register for EPOLLOUT to detect completion.
+    sock_adopt_fd(s, fd, EPOLLOUT | EPOLLET);
     s->state = SOCK_STATE_CONNECTING;
-
-    ev.events   = EPOLLOUT | EPOLLET;
-    ev.data.ptr = s;
-    epoll_ctl(w->epoll_fd, EPOLL_CTL_ADD, fd, &ev);
     sock_wake_worker(s);
   }
+
+  // The reference sock_connect() took for this leg.
+  sock_release(s);
 }
 
 // Timeout checking (called from epoll loop)
@@ -547,10 +676,13 @@ sock_check_timeouts(void)
             s->name, (long)elapsed);
 
         // Must unlock sock_mutex before delivering event (callback
-        // may call sock_destroy which takes sock_mutex).
+        // may call sock_destroy which takes sock_mutex) — so take a
+        // reference first, or the callback's destroy frees `s` under us.
+        s->refs++;
         pthread_mutex_unlock(&sock_mutex);
         sock_session_close_fd(s);
         sock_deliver(s, SOCK_EVENT_ERROR, NULL, 0, ETIMEDOUT);
+        sock_release(s);
         pthread_mutex_lock(&sock_mutex);
 
         // Restart scan — list may have changed.
@@ -571,9 +703,11 @@ sock_check_timeouts(void)
         clam(CLAM_INFO, "sock", "[%s] idle timeout after %lds",
             s->name, (long)idle);
 
+        s->refs++;
         pthread_mutex_unlock(&sock_mutex);
         sock_session_close_fd(s);
         sock_deliver(s, SOCK_EVENT_DISCONNECT, NULL, 0, 0);
+        sock_release(s);
         pthread_mutex_lock(&sock_mutex);
 
         s = sock_list;
@@ -585,6 +719,194 @@ sock_check_timeouts(void)
   }
 
   pthread_mutex_unlock(&sock_mutex);
+}
+
+// Handle one epoll event for one session. The caller holds a reference
+// for the whole of this function, which is why every `return` below is
+// safe where the old inline `continue`s were not: the owner may destroy
+// the session from another thread at any point in here, and the freeing
+// simply waits for the reference to go back.
+static void
+sock_epoll_event(sock_worker_t *w, sock_session_t *s, uint32_t events)
+{
+  if(s->state == SOCK_STATE_CLOSED || s->fd < 0)
+    return;
+
+  // Error or hangup.
+  if(events & (EPOLLERR | EPOLLHUP))
+  {
+    if(s->state == SOCK_STATE_CONNECTING)
+    {
+      int err = sock_pending_error(s);
+
+      clam(CLAM_WARN, "sock", "[%s] connect failed: %s",
+          s->name, strerror(err ? err : ECONNREFUSED));
+      sock_session_close_fd(s);
+      sock_deliver(s, SOCK_EVENT_ERROR, NULL, 0,
+          err ? err : ECONNREFUSED);
+    }
+
+    else
+    {
+      clam(CLAM_DEBUG, "sock", "[%s] connection lost", s->name);
+      sock_session_close_fd(s);
+      sock_deliver(s, SOCK_EVENT_DISCONNECT, NULL, 0, 0);
+    }
+
+    return;
+  }
+
+  // Writable.
+  if(events & EPOLLOUT)
+  {
+    if(s->state == SOCK_STATE_CONNECTING)
+    {
+      // Connect completed — check for error.
+      int err = sock_pending_error(s);
+
+      if(err != 0)
+      {
+        clam(CLAM_WARN, "sock", "[%s] connect failed: %s",
+            s->name, strerror(err));
+        sock_session_close_fd(s);
+        sock_deliver(s, SOCK_EVENT_ERROR, NULL, 0, err);
+      }
+
+      else if(s->tls_enabled)
+      {
+        clam(CLAM_INFO, "sock", "[%s] TCP connected to %s:%u, starting TLS",
+            s->name, s->host, s->port);
+
+        pthread_mutex_lock(&s->io_lock);
+        SSL_set_fd(s->tls, s->fd);
+        SSL_set_tlsext_host_name(s->tls, s->host);
+        pthread_mutex_unlock(&s->io_lock);
+
+        s->state = SOCK_STATE_TLS_HANDSHAKE;
+        sock_epoll_rearm(w, s, false);
+        sock_tls_handshake(s);
+      }
+
+      else
+      {
+        s->state = SOCK_STATE_CONNECTED;
+        s->last_activity = time(NULL);
+        s->connected_at  = s->last_activity;
+        sock_epoll_rearm(w, s, false);
+
+        clam(CLAM_INFO, "sock", "[%s] connected to %s:%u",
+            s->name, s->host, s->port);
+
+        sock_deliver(s, SOCK_EVENT_CONNECTED, NULL, 0, 0);
+      }
+    }
+
+    else if(s->state == SOCK_STATE_TLS_HANDSHAKE)
+      sock_tls_handshake(s);
+
+    else if(s->state == SOCK_STATE_CONNECTED)
+    {
+      // Drain send queue.
+      if(sock_drain_sendq(s))
+        sock_epoll_rearm(w, s, false);
+
+      s->last_activity = time(NULL);
+    }
+  }
+
+  // Readable.
+  if(events & EPOLLIN)
+  {
+    if(s->state == SOCK_STATE_TLS_HANDSHAKE)
+    {
+      sock_tls_handshake(s);
+      return;
+    }
+
+    if(s->state != SOCK_STATE_CONNECTED || s->fd < 0)
+      return;
+
+    // Edge-triggered: read until EAGAIN.
+    for(;;)
+    {
+      ssize_t nr;
+      int     ssl_err = 0;
+      int     rderr   = 0;
+
+      // The read itself is the only part that touches the fd and the
+      // SSL object, so it — and nothing after it — takes io_lock. The
+      // consumer callback below must never run under it: a callback is
+      // free to close its own session, and free to block on a lock the
+      // destroying thread already holds.
+      pthread_mutex_lock(&s->io_lock);
+
+      if(s->fd < 0)
+      {
+        pthread_mutex_unlock(&s->io_lock);
+        return;
+      }
+
+      if(s->tls != NULL)
+      {
+        nr = SSL_read(s->tls, s->read_buf, (int)s->read_buf_sz);
+
+        if(nr <= 0)
+          ssl_err = SSL_get_error(s->tls, (int)nr);
+      }
+
+      else
+      {
+        nr = recv(s->fd, s->read_buf, s->read_buf_sz, 0);
+
+        if(nr < 0)
+          rderr = errno;
+      }
+
+      pthread_mutex_unlock(&s->io_lock);
+
+      if(nr <= 0)
+      {
+        if(ssl_err == SSL_ERROR_WANT_READ || ssl_err == SSL_ERROR_WANT_WRITE)
+          return;
+
+        if(rderr == EAGAIN || rderr == EWOULDBLOCK)
+          return;
+
+        if(rderr == EINTR)
+          continue;
+
+        if(nr == 0 || ssl_err == SSL_ERROR_ZERO_RETURN)
+        {
+          clam(CLAM_DEBUG, "sock", "[%s] peer closed connection", s->name);
+          sock_session_close_fd(s);
+          sock_deliver(s, SOCK_EVENT_DISCONNECT, NULL, 0, 0);
+          return;
+        }
+
+        if(ssl_err != 0)
+          clam(CLAM_WARN, "sock", "[%s] SSL_read error (%d)",
+              s->name, ssl_err);
+        else
+          clam(CLAM_WARN, "sock", "[%s] recv error: %s",
+              s->name, strerror(rderr));
+
+        sock_session_close_fd(s);
+        sock_deliver(s, SOCK_EVENT_ERROR, NULL, 0, ssl_err ? EIO : rderr);
+        return;
+      }
+
+      s->bytes_in += (uint64_t)nr;
+      s->last_activity = time(NULL);
+
+      __atomic_fetch_add(&sock_total_in, (uint64_t)nr, __ATOMIC_RELAXED);
+
+      sock_deliver(s, SOCK_EVENT_DATA, s->read_buf, (size_t)nr, 0);
+
+      // Session may have been closed in the callback.
+      if(s->state != SOCK_STATE_CONNECTED || s->fd < 0)
+        return;
+    }
+  }
 }
 
 // Epoll worker thread (persistent task)
@@ -618,8 +940,9 @@ sock_epoll_task(task_t *t)
   {
     struct epoll_event wake_ev;
 
-    wake_ev.events  = EPOLLIN;
-    wake_ev.data.ptr = &w->wake_fd;
+    // Session ids start at 1, so 0 unambiguously names the wake fd.
+    wake_ev.events   = EPOLLIN;
+    wake_ev.data.u64 = 0;
     epoll_ctl(w->epoll_fd, EPOLL_CTL_ADD, w->wake_fd, &wake_ev);
   }
 
@@ -650,7 +973,7 @@ sock_epoll_task(task_t *t)
       struct epoll_event *ev = &events[i];
 
       // Wake event — drain eventfd, then scan for pending sends.
-      if(ev->data.ptr == &w->wake_fd)
+      if(ev->data.u64 == 0)
       {
         uint64_t val;
         sock_session_t *s;
@@ -684,189 +1007,18 @@ sock_epoll_task(task_t *t)
         continue;
       }
 
-      // Session event.
+      // Session event. The batch carries an id rather than an address
+      // precisely because the session it names may already be gone —
+      // a hold that finds nothing is the normal outcome of a destroy
+      // that raced this batch, not an error.
       {
-      sock_session_t *s = ev->data.ptr;
+        sock_session_t *s = sock_hold_by_id(ev->data.u64);
 
-      if(s->state == SOCK_STATE_CLOSED || s->fd < 0)
-        continue;
-
-      // Error or hangup.
-      if(ev->events & (EPOLLERR | EPOLLHUP))
-      {
-        if(s->state == SOCK_STATE_CONNECTING)
-        {
-          int err = 0;
-          socklen_t errlen = sizeof(err);
-
-          getsockopt(s->fd, SOL_SOCKET, SO_ERROR, &err, &errlen);
-
-          clam(CLAM_WARN, "sock", "[%s] connect failed: %s",
-              s->name, strerror(err ? err : ECONNREFUSED));
-          sock_session_close_fd(s);
-          sock_deliver(s, SOCK_EVENT_ERROR, NULL, 0,
-              err ? err : ECONNREFUSED);
-        }
-
-        else
-        {
-          clam(CLAM_DEBUG, "sock", "[%s] connection lost", s->name);
-          sock_session_close_fd(s);
-          sock_deliver(s, SOCK_EVENT_DISCONNECT, NULL, 0, 0);
-        }
-
-        continue;
-      }
-
-      // Writable.
-      if(ev->events & EPOLLOUT)
-      {
-        if(s->state == SOCK_STATE_CONNECTING)
-        {
-          // Connect completed — check for error.
-          int err = 0;
-          socklen_t errlen = sizeof(err);
-          getsockopt(s->fd, SOL_SOCKET, SO_ERROR, &err, &errlen);
-
-          if(err != 0)
-          {
-            clam(CLAM_WARN, "sock", "[%s] connect failed: %s",
-                s->name, strerror(err));
-            sock_session_close_fd(s);
-            sock_deliver(s, SOCK_EVENT_ERROR, NULL, 0, err);
-          }
-
-          else if(s->tls_enabled)
-          {
-            clam(CLAM_INFO, "sock", "[%s] TCP connected to %s:%u, starting TLS",
-                s->name, s->host, s->port);
-
-            SSL_set_fd(s->tls, s->fd);
-            SSL_set_tlsext_host_name(s->tls, s->host);
-            s->state = SOCK_STATE_TLS_HANDSHAKE;
-            sock_epoll_rearm(w, s, false);
-            sock_tls_handshake(s);
-          }
-
-          else
-          {
-            s->state = SOCK_STATE_CONNECTED;
-            s->last_activity = time(NULL);
-            s->connected_at  = s->last_activity;
-            sock_epoll_rearm(w, s, false);
-
-            clam(CLAM_INFO, "sock", "[%s] connected to %s:%u",
-                s->name, s->host, s->port);
-
-            sock_deliver(s, SOCK_EVENT_CONNECTED, NULL, 0, 0);
-          }
-        }
-
-        else if(s->state == SOCK_STATE_TLS_HANDSHAKE)
-          sock_tls_handshake(s);
-
-        else if(s->state == SOCK_STATE_CONNECTED)
-        {
-          // Drain send queue.
-          bool drained = sock_drain_sendq(s);
-
-          if(drained)
-            sock_epoll_rearm(w, s, false);
-
-          s->last_activity = time(NULL);
-        }
-      }
-
-      // Readable.
-      if(ev->events & EPOLLIN)
-      {
-        if(s->state == SOCK_STATE_TLS_HANDSHAKE)
-        {
-          sock_tls_handshake(s);
-          continue;
-        }
-
-        if(s->state != SOCK_STATE_CONNECTED || s->fd < 0)
+        if(s == NULL)
           continue;
 
-        // Edge-triggered: read until EAGAIN.
-        for(;;)
-        {
-          ssize_t nr;
-
-          if(s->tls != NULL)
-          {
-            nr = SSL_read(s->tls, s->read_buf, (int)s->read_buf_sz);
-
-            if(nr <= 0)
-            {
-              int ssl_err = SSL_get_error(s->tls, (int)nr);
-
-              if(ssl_err == SSL_ERROR_WANT_READ ||
-                  ssl_err == SSL_ERROR_WANT_WRITE)
-                break;
-
-              if(ssl_err == SSL_ERROR_ZERO_RETURN || nr == 0)
-              {
-                clam(CLAM_DEBUG, "sock", "[%s] TLS peer closed",
-                    s->name);
-                sock_tls_cleanup(s);
-                sock_session_close_fd(s);
-                sock_deliver(s, SOCK_EVENT_DISCONNECT, NULL, 0, 0);
-                break;
-              }
-
-              clam(CLAM_WARN, "sock", "[%s] SSL_read error (%d)",
-                  s->name, ssl_err);
-              sock_tls_cleanup(s);
-              sock_session_close_fd(s);
-              sock_deliver(s, SOCK_EVENT_ERROR, NULL, 0, EIO);
-              break;
-            }
-          }
-
-          else
-          {
-            nr = recv(s->fd, s->read_buf, s->read_buf_sz, 0);
-
-            if(nr == 0)
-            {
-              clam(CLAM_DEBUG, "sock", "[%s] peer closed connection",
-                  s->name);
-              sock_session_close_fd(s);
-              sock_deliver(s, SOCK_EVENT_DISCONNECT, NULL, 0, 0);
-              break;
-            }
-
-            if(nr < 0)
-            {
-              if(errno == EAGAIN || errno == EWOULDBLOCK)
-                break;
-
-              if(errno == EINTR)
-                continue;
-
-              clam(CLAM_WARN, "sock", "[%s] recv error: %s",
-                  s->name, strerror(errno));
-              sock_session_close_fd(s);
-              sock_deliver(s, SOCK_EVENT_ERROR, NULL, 0, errno);
-              break;
-            }
-          }
-
-          s->bytes_in += (uint64_t)nr;
-          s->last_activity = time(NULL);
-
-          __atomic_fetch_add(&sock_total_in, (uint64_t)nr,
-              __ATOMIC_RELAXED);
-
-          sock_deliver(s, SOCK_EVENT_DATA, s->read_buf, (size_t)nr, 0);
-
-          // Session may have been closed in callback.
-          if(s->state != SOCK_STATE_CONNECTED || s->fd < 0)
-            break;
-        }
-      }
+        sock_epoll_event(w, s, ev->events);
+        sock_release(s);
       }
     }
 
@@ -998,9 +1150,13 @@ sock_create(const char *name, sock_type_t type,
   s->read_buf    = mem_alloc("sock", "read_buf", s->read_buf_sz);
 
   pthread_mutex_init(&s->send_lock, NULL);
+  pthread_mutex_init(&s->io_lock, NULL);
 
   // Round-robin assignment across active workers.
   pthread_mutex_lock(&sock_mutex);
+
+  s->id   = sock_next_id++;
+  s->refs = 1;                  // the caller's, given back by sock_destroy
 
   s->worker_id = sock_next_worker;
   sock_next_worker = (sock_next_worker + 1) % sock_worker_count;
@@ -1129,6 +1285,13 @@ sock_connect(sock_session_t *session, const char *host, uint16_t port,
   session->state = SOCK_STATE_RESOLVING;
   session->connect_started = time(NULL);
 
+  // The connect leg runs on somebody else's thread and holds the
+  // session pointer until it lands — which is long enough for the owner
+  // to destroy it, so the leg carries a reference of its own. It is
+  // dropped in sock_resolve_done() / sock_unix_connect_task(), on every
+  // path out of them.
+  sock_hold(session);
+
   if(session->type == SOCK_UNIX)
   {
     // Unix sockets don't need DNS — submit direct connect task.
@@ -1140,6 +1303,7 @@ sock_connect(sock_session_t *session, const char *host, uint16_t port,
       clam(CLAM_WARN, "sock", "[%s] failed to submit unix connect task",
           session->name);
       session->state = SOCK_STATE_CLOSED;
+      sock_release(session);
       return(FAIL);
     }
   }
@@ -1153,6 +1317,7 @@ sock_connect(sock_session_t *session, const char *host, uint16_t port,
       clam(CLAM_WARN, "sock", "[%s] failed to submit resolve for '%s'",
           session->name, session->host);
       session->state = SOCK_STATE_CLOSED;
+      sock_release(session);
       return(FAIL);
     }
   }
@@ -1231,16 +1396,18 @@ sock_close(sock_session_t *session)
   sock_deliver(session, SOCK_EVENT_DISCONNECT, NULL, 0, 0);
 }
 
-// Destroy a session and free all resources. Removes from the session
-// list, drains the send queue, frees the read buffer, and releases the
-// session struct. Must not be called from within a callback for the
-// same session. Force-closes the fd if still open.
+// Give up ownership of a session. Force-closes the fd, unlinks it from
+// the session list so no new work can find it, and hands back the
+// reference sock_create() issued. It NEVER waits: the caller may be
+// holding locks the in-flight callback needs, so the freeing belongs to
+// whichever thread drops the last reference — here, if nothing is in
+// flight (the common case, and byte-for-byte the old behaviour).
 // session: session handle (NULL is a safe no-op)
 void
 sock_destroy(sock_session_t *session)
 {
   sock_session_t **pp;
-  sock_sendbuf_t *sb;
+  bool last;
 
   if(session == NULL)
     return;
@@ -1249,9 +1416,9 @@ sock_destroy(sock_session_t *session)
   if(session->state != SOCK_STATE_CLOSED)
     sock_session_close_fd(session);
 
-  // Remove from session list.
   pthread_mutex_lock(&sock_mutex);
 
+  // Remove from session list.
   pp = &sock_list;
 
   while(*pp != NULL)
@@ -1266,34 +1433,13 @@ sock_destroy(sock_session_t *session)
     pp = &(*pp)->next;
   }
 
+  session->detached = true;
+  last = (--session->refs == 0);
+
   pthread_mutex_unlock(&sock_mutex);
 
-  // Free send queue.
-  pthread_mutex_lock(&session->send_lock);
-  sb = session->send_head;
-
-  while(sb != NULL)
-  {
-    sock_sendbuf_t *next = sb->next;
-
-    sock_sbuf_release(sb);
-    sb = next;
-  }
-
-  session->send_head = NULL;
-  session->send_tail = NULL;
-  session->send_queued = 0;
-  pthread_mutex_unlock(&session->send_lock);
-
-  pthread_mutex_destroy(&session->send_lock);
-
-  // Free read buffer.
-  mem_free(session->read_buf);
-  session->read_buf = NULL;
-
-  clam(CLAM_DEBUG, "sock", "[%s] session destroyed", session->name);
-
-  mem_free(session);
+  if(last)
+    sock_free(session);
 }
 
 int

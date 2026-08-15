@@ -145,7 +145,13 @@ task_handle_t task_add_deferred(const char *name, task_type_t type,
 // currently running, a flag is set so task_finish treats the next
 // TASK_ENDED return as terminal rather than rescheduling. Does not
 // block waiting for a running callback to complete.
-void task_cancel(task_handle_t h);
+//
+// Returns true only when the task was dequeued and freed WITHOUT ever
+// running — which is the answer a caller needs when the task owns a
+// reference on the caller's behalf: true means the callback will never
+// run and its reference is the caller's to drop; false means it has run
+// or is running and has dropped the reference itself.
+bool task_cancel(task_handle_t h);
 
 // Returns a task in RUNNING state, or NULL if none available.
 task_t *task_assign(task_type_t type);

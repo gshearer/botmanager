@@ -108,6 +108,22 @@ typedef struct
   char              kv_prefix[IRC_KV_PREFIX_SZ]; // "bot.<botname>.irc."
   method_inst_t    *inst;           // set by connect(), not create()
 
+  // Lifetime. irc_destroy() runs with bot_mutex AND method_mutex held,
+  // on a thread the epoll worker's callback can be waiting on, so it
+  // must never wait for that callback to drain. Instead the state is
+  // reference counted — one for the method instance, one for the socket
+  // session (given back by its done hook), one per armed reconnect
+  // task — and `dead` tells a callback that arrives anyway to touch
+  // nothing: `inst` belongs to core and is freed the instant
+  // irc_destroy() returns.
+  uint32_t          refs;
+  _Atomic bool      dead;
+
+  // Guards `session` and `reconnect_task` — the two handles that outlive
+  // the thread that set them. Held for pointer swaps only, never across
+  // a socket callback or a connect.
+  pthread_mutex_t   sess_lock;
+
   // Socket session (core socket service).
   sock_session_t   *session;
 
@@ -200,6 +216,12 @@ void irc_srv_list_cb(const char *key, kv_type_t type,
 void irc_chan_collect_cb(const char *key, kv_type_t type,
     const char *val, void *data);
 void irc_init_networks(void);
+
+// A referenced socket session, or NULL when there is none. The caller
+// must sock_release() it — that reference is the whole reason a send
+// from a command thread cannot race the owner destroying the bot.
+sock_session_t *irc_session_ref(irc_state_t *st);
+
 bool irc_send_raw(irc_state_t *st, const char *fmt, ...)
     __attribute__((format(printf, 2, 3)));
 void irc_register_commands(void);

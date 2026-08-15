@@ -4,6 +4,158 @@
 #define IRC_DRIVER_INTERNAL
 #include "irc.h"
 
+static void irc_reconnect_task(task_t *t);
+static void irc_sock_cb(const sock_event_t *event, void *user_data);
+
+// Driver state lifetime
+//
+// Three holders can outlive irc_destroy(): the socket session (a
+// callback may be running on the epoll worker right now), an armed
+// reconnect task, and the method instance itself. irc_destroy() is
+// called with bot_mutex and method_mutex held and the callback it would
+// wait for needs both — so it hands back its own reference and leaves.
+// Whoever is last out does the freeing.
+
+static void
+irc_state_hold(irc_state_t *st)
+{
+  __atomic_add_fetch(&st->refs, 1, __ATOMIC_RELAXED);
+}
+
+static void
+irc_state_release(irc_state_t *st)
+{
+  if(__atomic_sub_fetch(&st->refs, 1, __ATOMIC_ACQ_REL) != 0)
+    return;
+
+  irc_chan_clear_all(st);
+  pthread_mutex_destroy(&st->chan_mutex);
+  pthread_mutex_destroy(&st->sess_lock);
+
+  clam(CLAM_DEBUG, "irc", "[%s] state released", st->inst_name);
+  mem_free(st);
+}
+
+// The socket service calls this once, after the last reference to the
+// session has gone — i.e. once no sock callback can reach us again.
+static void
+irc_sock_done(void *user_data)
+{
+  irc_state_release(user_data);
+}
+
+sock_session_t *
+irc_session_ref(irc_state_t *st)
+{
+  sock_session_t *s;
+
+  pthread_mutex_lock(&st->sess_lock);
+  s = st->session;
+
+  if(s != NULL)
+    sock_hold(s);
+
+  pthread_mutex_unlock(&st->sess_lock);
+
+  return(s);
+}
+
+// Detach the session and hand the owner's reference to the caller, who
+// owes it a sock_destroy().
+static sock_session_t *
+irc_session_take(irc_state_t *st)
+{
+  sock_session_t *s;
+
+  pthread_mutex_lock(&st->sess_lock);
+  s = st->session;
+  st->session = NULL;
+  pthread_mutex_unlock(&st->sess_lock);
+
+  return(s);
+}
+
+// Create the session if there is none, and return it referenced. NULL
+// means the driver is dead or the socket service refused.
+static sock_session_t *
+irc_session_open(irc_state_t *st)
+{
+  sock_session_t *s;
+
+  pthread_mutex_lock(&st->sess_lock);
+
+  if(st->session == NULL && !st->dead)
+  {
+    st->session = sock_create(st->inst_name, SOCK_TCP, irc_sock_cb, st);
+
+    if(st->session != NULL)
+    {
+      irc_state_hold(st);
+      sock_set_done(st->session, irc_sock_done);
+    }
+  }
+
+  s = st->session;
+
+  if(s != NULL)
+    sock_hold(s);
+
+  pthread_mutex_unlock(&st->sess_lock);
+
+  return(s);
+}
+
+// Arm the reconnect backoff. The task carries a reference for the whole
+// of its wait, because nothing on the teardown path can wait for it.
+static void
+irc_arm_reconnect(irc_state_t *st)
+{
+  char tname[METHOD_NAME_SZ + 16];
+
+  snprintf(tname, sizeof(tname), "irc_recon_%s", st->inst_name);
+
+  pthread_mutex_lock(&st->sess_lock);
+
+  // One backoff at a time, and none at all once the driver is dead.
+  if(!st->dead && st->reconnect_task == TASK_HANDLE_NONE)
+  {
+    irc_state_hold(st);
+    st->reconnect_task = task_add_deferred(tname, TASK_THREAD, 100,
+        st->reconnect_delay * 1000, irc_reconnect_task, st);
+  }
+
+  pthread_mutex_unlock(&st->sess_lock);
+}
+
+// Retire the driver: no new session, no new backoff, and every socket
+// callback from here on is a no-op. Idempotent — both halves of the
+// teardown (disconnect then destroy) call it, and either may be the
+// first if the instance was never connected.
+static void
+irc_mark_dead(irc_state_t *st)
+{
+  pthread_mutex_lock(&st->sess_lock);
+  st->dead = true;
+  pthread_mutex_unlock(&st->sess_lock);
+}
+
+// Cancel an armed backoff. task_cancel() reports whether it dequeued the
+// task before it ever ran — the only case in which its reference is
+// ours to drop.
+static void
+irc_cancel_reconnect(irc_state_t *st)
+{
+  task_handle_t h;
+
+  pthread_mutex_lock(&st->sess_lock);
+  h = st->reconnect_task;
+  st->reconnect_task = TASK_HANDLE_NONE;
+  pthread_mutex_unlock(&st->sess_lock);
+
+  if(task_cancel(h))
+    irc_state_release(st);
+}
+
 static bool
 irc_resolve_server(irc_state_t *st)
 {
@@ -1346,7 +1498,10 @@ irc_process_buffer(irc_state_t *st)
   char *end;
   size_t remaining;
 
-  while((end = strstr(start, "\r\n")) != NULL)
+  // A single read can carry many lines, and handling one can take long
+  // enough for the bot to be destroyed underneath us — every handler
+  // reaches st->inst, which core frees the moment irc_destroy() returns.
+  while(!st->dead && (end = strstr(start, "\r\n")) != NULL)
   {
     *end = '\0';
 
@@ -1378,6 +1533,13 @@ static void
 irc_sock_cb(const sock_event_t *event, void *user_data)
 {
   irc_state_t *st = user_data;
+
+  // The reference the session holds keeps `st` alive, but st->inst is
+  // core's: method_unregister() frees it the moment irc_destroy()
+  // returns. A dead driver therefore reports nothing and parses
+  // nothing — there is no state left worth updating.
+  if(st->dead)
+    return;
 
   switch(event->type)
   {
@@ -1419,9 +1581,7 @@ irc_sock_cb(const sock_event_t *event, void *user_data)
         clam(CLAM_INFO, "irc",
             "reconnecting in %us", st->reconnect_delay);
 
-        st->reconnect_task = task_add_deferred("irc_reconnect",
-            TASK_THREAD, 100,
-            st->reconnect_delay * 1000, irc_reconnect_task, st);
+        irc_arm_reconnect(st);
       }
 
       break;
@@ -1441,9 +1601,7 @@ irc_sock_cb(const sock_event_t *event, void *user_data)
         clam(CLAM_INFO, "irc",
             "reconnecting in %us", st->reconnect_delay);
 
-        st->reconnect_task = task_add_deferred("irc_reconnect",
-            TASK_THREAD, 100,
-            st->reconnect_delay * 1000, irc_reconnect_task, st);
+        irc_arm_reconnect(st);
       }
 
       break;
@@ -1456,7 +1614,9 @@ irc_sock_cb(const sock_event_t *event, void *user_data)
 static void
 irc_attempt_connect(irc_state_t *st)
 {
-  if(pool_shutting_down() || st->shutdown)
+  sock_session_t *s;
+
+  if(pool_shutting_down() || st->shutdown || st->dead)
     return;
 
   // Operator status is per-connection: the new session starts without it
@@ -1468,51 +1628,35 @@ irc_attempt_connect(irc_state_t *st)
   {
     clam(CLAM_WARN, "irc",
         "configuration incomplete, retrying in %us", st->reconnect_delay);
-
-    {
-      char tname[METHOD_NAME_SZ + 16];
-      snprintf(tname, sizeof(tname), "irc_recon_%s", st->inst_name);
-      st->reconnect_task = task_add_deferred(tname, TASK_THREAD, 100,
-          st->reconnect_delay * 1000, irc_reconnect_task, st);
-    }
+    irc_arm_reconnect(st);
     return;
   }
 
   // Create session if needed (first connect or after destroy).
-  if(st->session == NULL)
+  s = irc_session_open(st);
+
+  if(s == NULL)
   {
-    st->session = sock_create(st->inst_name, SOCK_TCP, irc_sock_cb, st);
-
-    if(st->session == NULL)
-    {
-      clam(CLAM_WARN, "irc", "failed to create socket session");
-
-      st->reconnect_task = task_add_deferred("irc_reconnect",
-          TASK_THREAD, 100,
-          st->reconnect_delay * 1000, irc_reconnect_task, st);
-      return;
-    }
+    clam(CLAM_WARN, "irc", "failed to create socket session");
+    irc_arm_reconnect(st);
+    return;
   }
 
   // Enable TLS if the network server requires it.
   if(st->tls)
-    sock_set_tls(st->session, st->tls_verify);
+    sock_set_tls(s, st->tls_verify);
 
   // Initiate async connect (DNS + TCP).
-  if(sock_connect(st->session, st->host, st->port, NULL) != SUCCESS)
+  if(sock_connect(s, st->host, st->port, NULL) != SUCCESS)
   {
     clam(CLAM_WARN, "irc", "sock_connect failed, retrying in %us",
         st->reconnect_delay);
-
-    {
-      char tname[METHOD_NAME_SZ + 16];
-      snprintf(tname, sizeof(tname), "irc_recon_%s", st->inst_name);
-      st->reconnect_task = task_add_deferred(tname, TASK_THREAD, 100,
-          st->reconnect_delay * 1000, irc_reconnect_task, st);
-    }
+    sock_release(s);
+    irc_arm_reconnect(st);
     return;
   }
 
+  sock_release(s);
   clam(CLAM_DEBUG, "irc", "connecting to %s:%u", st->host, st->port);
 }
 
@@ -1520,31 +1664,35 @@ irc_attempt_connect(irc_state_t *st)
 static void
 irc_reconnect_task(task_t *t)
 {
-  irc_state_t *st = t->data;
+  irc_state_t    *st = t->data;
+  sock_session_t *old;
 
   // Clear the pending-task handle so irc_disconnect does not try to
-  // cancel a task that is already firing. A stale handle would still
-  // be safe (task_cancel on an already-ended id is a debug-logged
-  // no-op), but zeroing avoids the spurious log line.
+  // cancel a task that is already firing — and so the next backoff can
+  // arm, since irc_arm_reconnect refuses while one is outstanding.
+  pthread_mutex_lock(&st->sess_lock);
   st->reconnect_task = TASK_HANDLE_NONE;
+  pthread_mutex_unlock(&st->sess_lock);
 
-  // Another path (explicit stop, shutdown) may have disabled us
-  // between scheduling and firing. Bail before touching the session.
-  if(st->shutdown || pool_shutting_down())
+  // Another path (explicit stop, destroy, shutdown) may have disabled
+  // us between scheduling and firing. Bail before touching the session.
+  if(st->dead || st->shutdown || pool_shutting_down())
   {
     t->state = TASK_ENDED;
+    irc_state_release(st);
     return;
   }
 
   // Destroy stale session before reconnecting.
-  if(st->session != NULL)
-  {
-    sock_destroy(st->session);
-    st->session = NULL;
-  }
+  old = irc_session_take(st);
+
+  if(old != NULL)
+    sock_destroy(old);
 
   irc_attempt_connect(st);
   t->state = TASK_ENDED;
+
+  irc_state_release(st);
 }
 
 // Method driver callbacks
@@ -1566,19 +1714,31 @@ irc_create(const char *inst_name)
       "bot.%s.irc.", botname);
 
   st->reconnect_delay = 30;
+  st->refs            = 1;   // the method instance's, given back by destroy()
 
   pthread_mutex_init(&st->chan_mutex, NULL);
+  pthread_mutex_init(&st->sess_lock, NULL);
   return(st);
 }
 
+// Give up the method instance's claim on the driver state. Runs with
+// bot_mutex and method_mutex held — see the lifetime note on
+// irc_state_t — so it hands back every reference this side owns and
+// returns immediately. Anything still in flight frees the state itself.
 static void
 irc_destroy(void *handle)
 {
-  irc_state_t *st = handle;
+  irc_state_t    *st = handle;
+  sock_session_t *s;
 
-  irc_chan_clear_all(st);
-  pthread_mutex_destroy(&st->chan_mutex);
-  mem_free(st);
+  irc_mark_dead(st);
+  s = irc_session_take(st);
+  irc_cancel_reconnect(st);
+
+  if(s != NULL)
+    sock_destroy(s);
+
+  irc_state_release(st);
 }
 
 // Gracefully disconnect from the IRC server. Sends a QUIT message
@@ -1589,31 +1749,42 @@ irc_destroy(void *handle)
 static void
 irc_disconnect(void *handle)
 {
-  irc_state_t *st = handle;
+  irc_state_t    *st = handle;
+  sock_session_t *s;
 
   st->shutdown = true;
   __atomic_store_n(&st->is_oper, false, __ATOMIC_RELAXED);
+
+  // method_unregister() is the only caller of a driver's disconnect(),
+  // and it calls destroy() five lines later — so this instance is
+  // finished, and saying so here is what keeps the sock_close() below
+  // from running irc_sock_cb on THIS thread while the epoll worker is
+  // running it on its own (measured, TSan 2026-08-15: two concurrent
+  // DISCONNECT deliveries writing st->registered/connected/buf_len).
+  // It also retires st->inst well before method_unregister frees it,
+  // rather than in the instant after destroy() returns.
+  irc_mark_dead(st);
 
   // Cancel any pending deferred reconnect so the scheduler drops it
   // before the delay expires. Without this, a stop/start cycle during
   // the reconnect backoff could fire a spurious second connection
   // (previously observed on Libera as a stale pacmanpundit_ nick).
-  if(st->reconnect_task != TASK_HANDLE_NONE)
-  {
-    task_cancel(st->reconnect_task);
-    st->reconnect_task = TASK_HANDLE_NONE;
-  }
+  irc_cancel_reconnect(st);
 
   irc_chan_clear_all(st);
 
   // Always close an existing session, connected or not. A half-open
   // session whose fd we leak here remains visible to the peer and
   // only clears on ping-timeout (several minutes on Libera).
-  if(st->session != NULL)
+  s = irc_session_ref(st);
+
+  if(s != NULL)
   {
     if(st->connected)
       irc_send_raw(st, "QUIT :shutting down");
-    sock_close(st->session);
+
+    sock_close(s);
+    sock_release(s);
   }
 }
 

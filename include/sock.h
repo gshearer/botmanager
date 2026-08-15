@@ -39,6 +39,13 @@ typedef struct
 // non-blocking.
 typedef void (*sock_cb_t)(const sock_event_t *event, void *user_data);
 
+// Invoked exactly once, by whichever thread drops the last reference to
+// a destroyed session — the epoll worker if a callback was in flight,
+// otherwise inline inside sock_destroy(). The session is already gone
+// when this runs, which is precisely what it announces: no sock_cb_t
+// can touch the consumer's state any more.
+typedef void (*sock_done_cb_t)(void *user_data);
+
 // Does not connect yet. name is a human-readable label for logging
 // (max 39 chars).
 sock_session_t *sock_create(const char *name, sock_type_t type,
@@ -64,8 +71,21 @@ bool sock_send(sock_session_t *session, const void *buf, size_t len);
 // teardown completes. Do not call sock_send() after this.
 void sock_close(sock_session_t *session);
 
-// Must not be called from within a callback for the same session. If
-// the session is still connected, it is force-closed first.
+// Register the completion hook. Must be called before sock_connect().
+void sock_set_done(sock_session_t *session, sock_done_cb_t fn);
+
+// Reference counting. A session outlives sock_destroy() for exactly as
+// long as somebody still holds it, which is what keeps the epoll worker
+// safe while the owner tears the connection down. sock_hold() requires
+// the caller to already guarantee liveness — it is a second reference,
+// never the first. Every hold needs one release.
+void sock_hold(sock_session_t *session);
+void sock_release(sock_session_t *session);
+
+// Give up ownership: the session is force-closed, unlinked, and the
+// owner's reference dropped. It NEVER waits for an in-flight callback —
+// the last reference to leave frees the session and runs the done hook.
+// Safe to call from within a callback for the same session.
 void sock_destroy(sock_session_t *session);
 
 // Returns -1 if not connected.
@@ -174,12 +194,40 @@ typedef struct sock_sendbuf
 // 2026-08-15). _Atomic rather than the lock because the writers are
 // spread across the connect, resolve and close paths and only the
 // reader ever held it — a stale deadline mis-times a connect timeout.
+// Lifetime (all three under sock_mutex): `id` is the session's identity
+// for epoll, because a completed event batch can name a session the
+// owner has already destroyed and a raw pointer there is ABA-unsafe —
+// ids are monotonic and never reused, so a stale event resolves to
+// nothing instead of to whoever took the address. `refs` counts the
+// owner plus every in-flight user (an epoll event body, a timeout
+// delivery, an async connect leg, a consumer mid-send); `detached` says
+// the owner has gone, so the last reference to leave does the freeing.
+//
+// io_lock serialises the fd and the SSL object between the epoll worker
+// and whoever tears the session down. It is held for syscall-length
+// regions only and NEVER across the consumer callback — a callback may
+// re-enter sock_close() on its own session, and it may block on locks
+// the destroying thread already holds.
 struct sock_session
 {
   char                name[SOCK_NAME_SZ];
   sock_type_t         type;
   _Atomic sock_state_t state;
-  int                 fd;
+
+  // io_lock covers every *use* of the fd — the syscall must not be
+  // issued on a descriptor another thread is closing and the kernel may
+  // already have handed to somebody else. The plain "is there still a
+  // socket here?" guards read it without the lock, though, and that
+  // read races the close (measured, TSan 2026-08-15), so the field is
+  // atomic as well: a guard gets -1 or a live fd, never a torn value.
+  _Atomic int         fd;
+
+  uint64_t            id;
+  uint32_t            refs;
+  bool                detached;
+  sock_done_cb_t      done;
+
+  pthread_mutex_t     io_lock;
 
   sock_cb_t           cb;
   void               *cb_data;
@@ -254,6 +302,7 @@ typedef struct
 static sock_session_t  *sock_list         = NULL;
 static pthread_mutex_t  sock_mutex;
 static uint32_t         sock_count        = 0;
+static uint64_t         sock_next_id      = 1;   // 0 marks the wake fd
 static sock_worker_t    sock_workers[SOCK_MAX_WORKERS];
 static uint8_t          sock_worker_count = 0;
 static uint8_t          sock_next_worker  = 0;   // round-robin counter
@@ -277,6 +326,10 @@ static void sock_deliver(sock_session_t *s, sock_event_type_t type,
 static void sock_wake_worker(sock_session_t *s);
 static void sock_tls_cleanup(sock_session_t *s);
 static bool sock_tls_handshake(sock_session_t *s);
+static void sock_free(sock_session_t *s);
+static sock_session_t *sock_hold_by_id(uint64_t id);
+static void sock_epoll_event(sock_worker_t *w, sock_session_t *s,
+    uint32_t events);
 
 #endif // SOCK_INTERNAL
 

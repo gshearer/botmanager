@@ -141,9 +141,11 @@ bool
 irc_send_raw(irc_state_t *st, const char *fmt, ...)
 {
   char line[IRC_LINE_SZ];
+  sock_session_t *s;
   va_list ap;
   size_t total;
   int n;
+  bool rc;
 
   va_start(ap, fmt);
   n = vsnprintf(line, sizeof(line) - 2, fmt, ap);
@@ -161,10 +163,20 @@ irc_send_raw(irc_state_t *st, const char *fmt, ...)
 
   total = (size_t)(n + 2);
 
-  if(st->session == NULL || !st->connected)
+  if(!st->connected)
     return(FAIL);
 
-  if(sock_send(st->session, line, total) != SUCCESS)
+  // Any thread may send; the owner may be destroying the bot on
+  // another. A reference is what makes the two safe together.
+  s = irc_session_ref(st);
+
+  if(s == NULL)
+    return(FAIL);
+
+  rc = sock_send(s, line, total);
+  sock_release(s);
+
+  if(rc != SUCCESS)
   {
     clam(CLAM_WARN, "irc", "send failed");
     return(FAIL);

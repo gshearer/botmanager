@@ -353,7 +353,7 @@ list_unlink(task_t **head, task_t *t)
   return(false);
 }
 
-void
+bool
 task_cancel(task_handle_t h)
 {
   task_t *t;
@@ -363,7 +363,7 @@ task_cancel(task_handle_t h)
   task_kind_t kind = TASK_ONCE;
 
   if(h == TASK_HANDLE_NONE)
-    return;
+    return(false);
 
   pthread_mutex_lock(&task_lock);
 
@@ -441,6 +441,8 @@ task_cancel(task_handle_t h)
     clam(CLAM_DEBUG, "task_cancel",
         "handle %" PRIu64 " not found (already ended or invalid)",
         (uint64_t)h);
+
+  return(found_queued);
 }
 
 task_t *
