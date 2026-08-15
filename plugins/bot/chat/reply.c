@@ -1063,7 +1063,7 @@ reply_nl_bridge(chatbot_req_t *r, const char *text)
 
   if(prefix == NULL || prefix[0] == '\0') prefix = "/";
 
-  synth.inst = r->method;
+  method_msg_bind(&synth, r->method);
   snprintf(synth.sender,  sizeof(synth.sender),  "%s", r->sender);
   snprintf(synth.channel, sizeof(synth.channel), "%s", r->channel);
   // Forward the original protocol identity (IRC "nick!ident@host" etc.)
@@ -2466,7 +2466,7 @@ prompt_emit_nl_commands(char *buf, size_t pos, size_t cap,
   if(pos >= cap)
     return pos;
 
-  preflight.inst = r->method;
+  method_msg_bind(&preflight, r->method);
   snprintf(preflight.sender,  sizeof(preflight.sender),  "%s", r->sender);
   snprintf(preflight.channel, sizeof(preflight.channel), "%s", r->channel);
   // Forward the protocol identity (e.g. IRC "nick!ident@host") so

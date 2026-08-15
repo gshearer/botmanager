@@ -363,7 +363,7 @@ deferred_row_to_msg(const db_result_t *res, uint32_t i, method_msg_t *msg,
     return(NULL);
 
   memset(msg, 0, sizeof(*msg));
-  msg->inst      = inst;
+  method_msg_bind(msg, inst);
   msg->timestamp = now;
 
   deferred_copy_col(msg->sender,      sizeof(msg->sender),      res, i, DC_SENDER);

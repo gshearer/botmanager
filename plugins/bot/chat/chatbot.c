@@ -2076,7 +2076,7 @@ chatbot_coalesce_fire(task_t *t)
   {
     size_t n;
 
-    synth.inst = slot->method;
+    method_msg_bind(&synth, slot->method);
     synth.is_action = slot->is_action;
     snprintf(synth.sender,   sizeof(synth.sender),   "%s", slot->sender);
     snprintf(synth.metadata, sizeof(synth.metadata), "%s", slot->metadata);

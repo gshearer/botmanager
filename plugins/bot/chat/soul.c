@@ -779,7 +779,7 @@ soul_wx_announce(chatbot_state_t *st, method_inst_t *method,
   size_t                   off  = 0;
 
   memset(&msg, 0, sizeof(msg));
-  msg.inst      = method;
+  method_msg_bind(&msg, method);
   msg.timestamp = now;
 
   snprintf(msg.sender,      sizeof(msg.sender),      "%s", lead->sender);

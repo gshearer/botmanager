@@ -396,7 +396,7 @@ chatbot_followups_run(const char *bot_name, uint32_t ns_id, bot_inst_t *bot)
     // what a method delivers on this method's lines — the presence
     // trigger matches the sighting against exactly these two fields.
     memset(&msg, 0, sizeof(msg));
-    msg.inst      = method;
+    method_msg_bind(&msg, method);
     msg.timestamp = now;
 
     snprintf(msg.sender, sizeof(msg.sender), "%s", label);

@@ -673,7 +673,7 @@ volunteer_submit(chatbot_state_t *st, const volunteer_job_t *job,
   }
 
   memset(&msg, 0, sizeof(msg));
-  msg.inst      = method;
+  method_msg_bind(&msg, method);
   msg.timestamp = time(NULL);
 
   // `sender` is synthetic: not the bot's nick (so dossier resolution

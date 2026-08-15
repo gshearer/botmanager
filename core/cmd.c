@@ -1695,13 +1695,24 @@ cmd_sink_deliver(uint64_t id, const char *line)
 
 // Reply helper
 
+// A reply may be minutes younger than the message that asked for it: an
+// async command copies the whole method_msg_t and answers once its HTTP
+// round trip lands, by which time a `/plugin reload irc` can have
+// unregistered the instance the copy points at. So the send resolves by
+// NAME (method.h §method_msg_t) — the copy holds no lifetime, and an
+// instance that has gone away answers NULL here instead of a freed
+// pointer's driver.
 bool
 cmd_reply(const cmd_ctx_t *ctx, const char *text)
 {
+  const char    *target;
+  method_inst_t *inst;
+  bool           rc;
+
   if(ctx == NULL || text == NULL)
     return(FAIL);
 
-  if(ctx->msg == NULL || ctx->msg->inst == NULL)
+  if(ctx->msg == NULL || ctx->msg->inst_name[0] == '\0')
     return(FAIL);
 
   // Reply-sink divert: a registered collector owns this command's
@@ -1712,13 +1723,20 @@ cmd_reply(const cmd_ctx_t *ctx, const char *text)
       && cmd_sink_deliver(ctx->msg->reply_sink_id, text))
     return(SUCCESS);
 
-  {
-    const char *target = ctx->msg->channel[0] != '\0'
-        ? ctx->msg->channel
-        : ctx->msg->sender;
+  inst = method_find(ctx->msg->inst_name);
 
-    return(method_send(ctx->msg->inst, target, text));
-  }
+  if(inst == NULL)
+    return(FAIL);
+
+  target = ctx->msg->channel[0] != '\0'
+      ? ctx->msg->channel
+      : ctx->msg->sender;
+
+  rc = method_send(inst, target, text);
+
+  method_release(inst);
+
+  return(rc);
 }
 
 // Built-in commands
@@ -2456,7 +2474,7 @@ cmd_dispatch_as(const char *cmd_name, const char *args,
 
   // Synthetic message (drives reply routing + logs).
   memset(&msg, 0, sizeof(msg));
-  msg.inst = inst;
+  method_msg_bind(&msg, inst);
   snprintf(msg.sender, METHOD_SENDER_SZ, "%s",
       username != NULL ? username : "(anon)");
   msg.timestamp = time(NULL);

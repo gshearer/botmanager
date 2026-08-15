@@ -553,6 +553,24 @@ method_unsubscribe(method_inst_t *inst, const char *name)
 }
 
 void
+method_msg_bind(method_msg_t *msg, method_inst_t *inst)
+{
+  if(msg == NULL)
+    return;
+
+  msg->inst = inst;
+
+  // The name is immutable from registration, so it needs no lock — and
+  // it is what every copy of this message replies through once the
+  // pointer has expired.
+  if(inst != NULL)
+    strlcpy(msg->inst_name, inst->name, sizeof msg->inst_name);
+
+  else
+    msg->inst_name[0] = '\0';
+}
+
+void
 method_deliver(method_inst_t *inst, method_msg_t *msg)
 {
   method_msg_cb_t  cbs[METHOD_MAX_SUBS];
@@ -564,7 +582,7 @@ method_deliver(method_inst_t *inst, method_msg_t *msg)
     return;
 
   // Stamp the originating instance.
-  msg->inst = inst;
+  method_msg_bind(msg, inst);
 
   if(msg->timestamp == 0)
     msg->timestamp = time(NULL);

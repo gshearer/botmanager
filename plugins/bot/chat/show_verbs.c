@@ -251,10 +251,13 @@ verb_llm_personas(const cmd_ctx_t *ctx, bot_inst_t *bot, const char *rest)
 // submits the query embed to the llm worker pool and fires mem_rag_cb
 // from that thread long after the verb returned and `cmd_ctx_t` died.
 // We snapshot the reply target up front and send from the cb directly.
+// The instance is snapshotted by NAME, not by pointer: a `/plugin
+// reload irc` in that window frees the instance the verb saw
+// (method.h §method_msg_t).
 typedef struct
 {
-  method_inst_t *inst;
-  char           target[METHOD_SENDER_SZ];
+  char inst_name[METHOD_NAME_SZ];
+  char target[METHOD_SENDER_SZ];
 } mem_rag_state_t;
 
 // Owns `user`: frees it on every path. memory_retrieve_ns guarantees
@@ -264,7 +267,16 @@ mem_rag_cb(const mem_fact_t *facts, size_t n_facts,
     const mem_msg_t *msgs, size_t n_msgs, void *user)
 {
   mem_rag_state_t *st = user;
+  method_inst_t *inst = method_find(st->inst_name);
   char line[1400];
+
+  // The instance the query was asked on may have been reloaded away
+  // while the embed was in flight; there is then nowhere to answer.
+  if(inst == NULL)
+  {
+    mem_free(st);
+    return;
+  }
 
   // Namespace-wide retrieval is message-only — facts are dossier-keyed
   // and reached through /show dossier <name> facts.
@@ -290,12 +302,13 @@ mem_rag_cb(const mem_fact_t *facts, size_t n_facts,
         (double)msgs[i].score, ts,
         msgs[i].channel[0] ? msgs[i].channel : "dm",
         msgs[i].text);
-    method_send(st->inst, st->target, line);
+    method_send(inst, st->target, line);
   }
 
   if(n_msgs == 0)
-    method_send(st->inst, st->target, "(no hits)");
+    method_send(inst, st->target, "(no hits)");
 
+  method_release(inst);
   mem_free(st);
 }
 
@@ -359,7 +372,7 @@ verb_llm_memories(const cmd_ctx_t *ctx, bot_inst_t *bot, const char *rest)
   // The callback fires on the llm worker thread after the query embed
   // completes, so `ctx` is gone by then — snapshot the reply target into
   // heap state the cb frees.
-  if(ctx->msg == NULL || ctx->msg->inst == NULL)
+  if(ctx->msg == NULL || ctx->msg->inst_name[0] == '\0')
   {
     cmd_reply(ctx, "internal error: no method context for async reply");
     return;
@@ -367,7 +380,7 @@ verb_llm_memories(const cmd_ctx_t *ctx, bot_inst_t *bot, const char *rest)
 
   st = mem_alloc("chatbot", "mem_rag_state", sizeof(*st));
 
-  st->inst = ctx->msg->inst;
+  strlcpy(st->inst_name, ctx->msg->inst_name, sizeof st->inst_name);
   snprintf(st->target, sizeof(st->target), "%s",
       ctx->msg->channel[0] != '\0' ? ctx->msg->channel : ctx->msg->sender);
 
@@ -455,15 +468,22 @@ verb_stats(const cmd_ctx_t *ctx, bot_inst_t *bot, const char *rest)
 // destination) up front and use `method_send` directly from the cb.
 typedef struct
 {
-  method_inst_t *inst;
-  char           target[METHOD_SENDER_SZ];
+  char inst_name[METHOD_NAME_SZ];
+  char target[METHOD_SENDER_SZ];
 } kw_rag_state_t;
 
 static void
 kw_rag_cb(const knowledge_chunk_t *chunks, size_t n, void *user)
 {
   kw_rag_state_t *st = user;
+  method_inst_t *inst = method_find(st->inst_name);
   char line[1400];
+
+  if(inst == NULL)
+  {
+    mem_free(st);
+    return;
+  }
 
   for(size_t i = 0; i < n; i++)
   {
@@ -475,12 +495,13 @@ kw_rag_cb(const knowledge_chunk_t *chunks, size_t n, void *user)
         chunks[i].section_heading[0] ? "] " : "",
         (int)(sizeof(line) > 256 ? 256 : sizeof(line) - 1),
         chunks[i].text);
-    method_send(st->inst, st->target, line);
+    method_send(inst, st->target, line);
   }
 
   if(n == 0)
-    method_send(st->inst, st->target, "(no hits)");
+    method_send(inst, st->target, "(no hits)");
 
+  method_release(inst);
   mem_free(st);
 }
 
@@ -593,7 +614,7 @@ verb_llm_knowledge(const cmd_ctx_t *ctx, bot_inst_t *bot, const char *rest)
   // fires asynchronously on the curl worker thread, so we can't rely on
   // `ctx` (stack-lifetime) or a stack-resident accumulator — snapshot
   // the reply target into heap state that the cb frees when done.
-  if(ctx->msg == NULL || ctx->msg->inst == NULL)
+  if(ctx->msg == NULL || ctx->msg->inst_name[0] == '\0')
   {
     cmd_reply(ctx, "internal error: no method context for async reply");
     return;
@@ -601,7 +622,7 @@ verb_llm_knowledge(const cmd_ctx_t *ctx, bot_inst_t *bot, const char *rest)
 
   st = mem_alloc("chatbot", "kw_rag_state", sizeof(*st));
 
-  st->inst = ctx->msg->inst;
+  strlcpy(st->inst_name, ctx->msg->inst_name, sizeof st->inst_name);
   snprintf(st->target, sizeof(st->target), "%s",
       ctx->msg->channel[0] != '\0' ? ctx->msg->channel : ctx->msg->sender);
 

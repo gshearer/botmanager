@@ -33,12 +33,15 @@
 #define WM_ORDER_TARGET_SZ   128
 #define WM_ORDER_LABEL_SZ     96
 
-// Heap-owned reply target captured at handler entry.
+// Heap-owned reply target captured at handler entry. The instance is
+// captured by NAME: the order round trip outlives the dispatching turn,
+// and a `/plugin reload irc` inside it frees whatever the handler saw
+// (method.h §method_msg_t).
 typedef struct
 {
-  method_inst_t *inst;
-  char           target[WM_ORDER_TARGET_SZ];
-  char           label[WM_ORDER_LABEL_SZ];   // e.g. "buy coinbase-btc-usd"
+  char inst_name[METHOD_NAME_SZ];
+  char target[WM_ORDER_TARGET_SZ];
+  char label[WM_ORDER_LABEL_SZ];   // e.g. "buy coinbase-btc-usd"
 } wm_order_async_ctx_t;
 
 static wm_order_async_ctx_t *
@@ -47,13 +50,13 @@ wm_order_async_ctx_new(const cmd_ctx_t *ctx, const char *label)
   wm_order_async_ctx_t *ac;
   const char           *target;
 
-  if(ctx == NULL || ctx->msg == NULL || ctx->msg->inst == NULL)
+  if(ctx == NULL || ctx->msg == NULL || ctx->msg->inst_name[0] == '\0')
     return(NULL);
 
   ac = mem_alloc(WHENMOON_CTX, "order.async", sizeof(*ac));
 
   memset(ac, 0, sizeof(*ac));
-  ac->inst = ctx->msg->inst;
+  strlcpy(ac->inst_name, ctx->msg->inst_name, sizeof ac->inst_name);
 
   target = ctx->msg->channel[0] != '\0'
       ? ctx->msg->channel
@@ -70,10 +73,19 @@ wm_order_async_ctx_new(const cmd_ctx_t *ctx, const char *label)
 static void
 wm_order_async_send(wm_order_async_ctx_t *ac, const char *text)
 {
-  if(ac == NULL || ac->inst == NULL || ac->target[0] == '\0' || text == NULL)
+  method_inst_t *inst;
+
+  if(ac == NULL || ac->inst_name[0] == '\0' || ac->target[0] == '\0'
+      || text == NULL)
     return;
 
-  method_send(ac->inst, ac->target, text);
+  inst = method_find(ac->inst_name);
+
+  if(inst == NULL)
+    return;
+
+  method_send(inst, ac->target, text);
+  method_release(inst);
 }
 
 // ------------------------------------------------------------------ //

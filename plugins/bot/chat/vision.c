@@ -28,7 +28,12 @@ typedef struct
   chatbot_hold_t   hold;
 
   chatbot_state_t *st;
-  method_inst_t   *method;
+
+  // The method is named, never pointed at: the image fetch can outlast
+  // a `/plugin reload irc`, and the instance the line arrived on is
+  // resolved again at reply time (method.h §method_msg_t).
+  char             method_name     [METHOD_NAME_SZ];
+
   char             sender          [METHOD_SENDER_SZ];
   char             sender_metadata [METHOD_META_SZ];
   char             channel         [METHOD_CHANNEL_SZ];
@@ -189,7 +194,7 @@ chatbot_vision_maybe_submit(chatbot_state_t *st, const method_msg_t *msg)
   chatbot_hold_link(&ctx->hold, st, NULL);
 
   ctx->st     = st;
-  ctx->method = msg->inst;
+  strlcpy(ctx->method_name, msg->inst_name, sizeof ctx->method_name);
   snprintf(ctx->sender,          sizeof(ctx->sender),          "%s", msg->sender);
   snprintf(ctx->sender_metadata, sizeof(ctx->sender_metadata), "%s", msg->metadata);
   snprintf(ctx->channel,         sizeof(ctx->channel),         "%s", msg->channel);
@@ -354,6 +359,7 @@ vision_on_fetch_done(const curl_response_t *resp)
   char        *b64       = NULL;
   size_t       b64_cap;
   size_t       b64_written;
+  method_inst_t *method;
   method_msg_t synth;
 
   if(resp == NULL || resp->user_data == NULL) return;
@@ -442,11 +448,27 @@ vision_on_fetch_done(const curl_response_t *resp)
     goto done;
   }
 
+  // The reply pipeline takes its own reference off synth.inst, so the
+  // instance must be live in this frame — resolve it by name and hold
+  // it across the submit. Gone means the method the picture arrived on
+  // was reloaded away while it downloaded; there is nobody to answer.
+  method = method_find(ctx->method_name);
+
+  if(method == NULL)
+  {
+    clam(CLAM_DEBUG, "vision",
+        "method '%s' gone; dropping url='%s'",
+        ctx->method_name, ctx->image_url);
+    mem_free(b64);
+    b64 = NULL;
+    goto done;
+  }
+
   // Synthesise a method_msg_t matching what chatbot_observe would
   // have built, so chatbot_reply_submit_vision can populate
   // chatbot_req_t from a single argument.
   memset(&synth, 0, sizeof(synth));
-  synth.inst = ctx->method;
+  method_msg_bind(&synth, method);
   synth.kind = METHOD_MSG_MESSAGE;
   snprintf(synth.sender,   sizeof(synth.sender),   "%s", ctx->sender);
   snprintf(synth.metadata, sizeof(synth.metadata), "%s", ctx->sender_metadata);
@@ -459,6 +481,8 @@ vision_on_fetch_done(const curl_response_t *resp)
   chatbot_reply_submit_vision(ctx->st, &synth, ctx->image_url,
       b64, mime_canon);
   b64 = NULL;
+
+  method_release(method);
 
 done:
   if(b64 != NULL) mem_free(b64);

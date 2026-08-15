@@ -157,23 +157,25 @@ static void
 searxng_cmd_offer_url(const cmd_ctx_t *ctx, const char *url)
 {
   const char *bot;
-  const char *method;
   char        payload[CLAM_MSG_SZ];
 
-  // A search answered in private has no room to annotate.
-  if(ctx->bot == NULL || ctx->msg == NULL || ctx->msg->channel[0] == '\0')
+  // A search answered in private has no room to annotate. The offer is
+  // made from the async completion, so the instance is named rather
+  // than dereferenced — msg->inst expired with the dispatching turn
+  // (method.h §method_msg_t).
+  if(ctx->bot == NULL || ctx->msg == NULL || ctx->msg->channel[0] == '\0'
+      || ctx->msg->inst_name[0] == '\0')
     return;
 
-  bot    = bot_inst_name(ctx->bot);
-  method = method_inst_name(ctx->msg->inst);
+  bot = bot_inst_name(ctx->bot);
 
-  if(bot == NULL || method == NULL)
+  if(bot == NULL)
     return;
 
   // clam truncates at CLAM_MSG_SZ without saying so, and half a URL is
   // worse than no URL — decline to offer one that would not survive.
   if(snprintf(payload, sizeof(payload), "%s %s %s %s",
-      bot, method, ctx->msg->channel, url) >= (int)sizeof(payload))
+      bot, ctx->msg->inst_name, ctx->msg->channel, url) >= (int)sizeof(payload))
     return;
 
   clam(CLAM_INFO, "url_offer", "%s", payload);

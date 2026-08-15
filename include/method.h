@@ -85,7 +85,25 @@ typedef struct method_inst method_inst_t;
 // the originating method.
 typedef struct
 {
-  method_inst_t *inst;                    // originating method instance
+  // The originating instance, and its name. Both are set together by
+  // method_msg_bind() — never assign either on its own.
+  //
+  // `inst` is a borrowed pointer, good for the delivering turn and no
+  // longer: method_deliver() holds a reference across the fan-out, and
+  // a subscriber that returns has spent it. A copy of this struct that
+  // outlives the turn — every async command keeps one across its HTTP
+  // round trip — therefore carries a pointer that a `/plugin reload`
+  // may already have freed.
+  //
+  // `inst_name` is the field such a copy replies through. A name has no
+  // lifetime, so the copy has none either: method_find(inst_name) at
+  // the moment of use answers with a reference or with NULL, and NULL
+  // means the instance is gone and the reply has nowhere to go. This is
+  // the same ruling bot bindings took — a binding is a NAME, not a
+  // lifetime (core/AGENTS.md §Method instance lifetime).
+  method_inst_t *inst;
+  char           inst_name[METHOD_NAME_SZ];
+
   char           sender[METHOD_SENDER_SZ];    // sender identity (method-level)
   char           channel[METHOD_CHANNEL_SZ];  // channel/group (empty for DM)
   char           text[METHOD_TEXT_SZ];        // raw message text
@@ -303,12 +321,20 @@ bool method_subscribe(method_inst_t *inst, const char *name,
 
 bool method_unsubscribe(method_inst_t *inst, const char *name);
 
+// Stamp a message with the instance it belongs to, pointer and name
+// together. method_deliver() calls it for every delivered message;
+// anything building a synthetic message calls it instead of assigning
+// msg->inst by hand, or the copy loses the only field it can reply
+// through. Takes no reference: the caller's outlives the call.
+void method_msg_bind(method_msg_t *msg, method_inst_t *inst);
+
 // Called by method plugins when a message arrives from the platform.
-// msg->inst is set automatically, and holds a reference for the length
-// of the fan-out — a subscriber may read it long after the driver that
-// delivered it was told to go away. A subscriber that keeps msg->inst
-// past its own callback (an async command copies the whole message)
-// must take its own method_hold().
+// msg->inst and msg->inst_name are set automatically, and the instance
+// is held for the length of the fan-out — a subscriber may read it long
+// after the driver that delivered it was told to go away. A subscriber
+// that keeps the message past its own callback (an async command copies
+// the whole thing) must reply through method_find(msg->inst_name); the
+// pointer is not its to keep.
 void method_deliver(method_inst_t *inst, method_msg_t *msg);
 
 // Routes through the driver's connect() callback. Typically called by

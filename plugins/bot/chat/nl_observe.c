@@ -44,7 +44,9 @@ typedef struct
   char            hostname[METHOD_HOSTNAME_SZ];
   char            verified_id[METHOD_VERIFIED_ID_SZ];
   char            user_label[128];
-  method_inst_t  *inst;
+  // Named, not pointed at: the geocode hop outlives the turn, and the
+  // instance can be reloaded away meanwhile (method.h §method_msg_t).
+  char            inst_name[METHOD_NAME_SZ];
   bot_inst_t     *bot;
 } nl_observe_task_data_t;
 
@@ -144,6 +146,7 @@ static void
 nl_observe_task(task_t *t)
 {
   nl_observe_task_data_t *d = t->data;
+  method_inst_t          *inst;
   method_msg_t            synth;
   mem_dossier_fact_t      fact;
   geocode_api_t           geo;
@@ -205,8 +208,19 @@ nl_observe_task(task_t *t)
     goto done;
   }
 
+  // The dossier signature is keyed by method kind, so the instance has
+  // to be live to answer for it. Gone means the line's method was
+  // reloaded away while we geocoded — there is no signature to write.
+  inst = method_find(d->inst_name);
+
+  if(inst == NULL)
+  {
+    clam(CLAM_DEBUG, OBS_CTX, "method '%s' gone; skip", d->inst_name);
+    goto done;
+  }
+
   memset(&synth, 0, sizeof(synth));
-  synth.inst = d->inst;
+  method_msg_bind(&synth, inst);
   snprintf(synth.sender,      sizeof(synth.sender),      "%s", d->sender);
   snprintf(synth.channel,     sizeof(synth.channel),     "%s", d->channel);
   snprintf(synth.metadata,    sizeof(synth.metadata),    "%s", d->metadata);
@@ -216,6 +230,8 @@ nl_observe_task(task_t *t)
   snprintf(synth.verified_id, sizeof(synth.verified_id), "%s", d->verified_id);
 
   did = chat_user_dossier_id(&synth, d->ns_id, d->sender, true);
+
+  method_release(inst);
 
   if(did <= 0)
   {
@@ -285,8 +301,8 @@ chatbot_nl_observe_location_slot(bot_inst_t *bot,
 
   memset(d, 0, sizeof(*d));
   d->ns_id = ns_id;
-  d->inst  = msg->inst;
   d->bot   = bot;
+  strlcpy(d->inst_name, msg->inst_name, sizeof d->inst_name);
   snprintf(d->sender,      sizeof(d->sender),      "%s", msg->sender);
   snprintf(d->channel,     sizeof(d->channel),     "%s", msg->channel);
   snprintf(d->metadata,    sizeof(d->metadata),    "%s", msg->metadata);
