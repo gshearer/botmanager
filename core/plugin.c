@@ -2022,11 +2022,28 @@ plugin_quiesce(const plugin_rec_t *target, uint32_t timeout_ms,
 
   for(;;)
   {
+    char     bot_name[BOT_NAME_SZ];
+    uint32_t delivering;
+
     ctx.holders     = 0;
     ctx.offender[0] = '\0';
 
     task_iterate(quiesce_task_cb, &ctx);
     curl_iterate_active(quiesce_curl_cb, &ctx);
+
+    // A message delivery inside a bot driver's on_message() is the
+    // third Class-B holding, and the loudest: unmapping the code it is
+    // running is a SIGSEGV, not a dangling pointer somebody may never
+    // dereference (root TODO.md §SC-SAN-FINDINGS → SAN-18). The bot
+    // registry counts them for us; they clear in milliseconds.
+    delivering = bot_driver_inflight_owned(ctx.map.lo, ctx.map.hi,
+        bot_name, sizeof(bot_name));
+
+    if(delivering > 0)
+    {
+      quiesce_hold(&ctx, "bot", bot_name, "delivering");
+      ctx.holders += delivering - 1;
+    }
 
     if(ctx.holders == 0)
       return(SUCCESS);

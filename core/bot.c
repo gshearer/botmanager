@@ -45,7 +45,7 @@ bm_put(bot_method_t *m)
 
 // Internal message forwarding callback.
 // This is the method_msg_cb_t registered with method_subscribe().
-// data points to the bot_inst_t.
+// `data` carries the bot's id, not its address — see bot_driver_acquire.
 // Match sender against a comma-separated ignore list. Each token is a
 // shell-style glob pattern (?, *, [set]), matched case-insensitively
 // against the full sender nick.
@@ -199,43 +199,239 @@ bot_last_public_line(const bot_inst_t *inst, const method_inst_t *method,
   return(hit);
 }
 
-static void
-bot_msg_handler(const method_msg_t *msg, void *data)
+// The driver reference
+//
+// A bot's vtable and its handle belong to a plugin's mapping, and
+// bot_msg_handler runs on a method's delivery thread — the one thread
+// bot_life_mutex does not serialise. Reading the two fields unlocked
+// and calling through them was SAN-18, a reproducible SIGSEGV from an
+// ordinary /plugin reload: bot_suspend_driver() NULLs both under
+// bot_mutex and destroy()s the handle after releasing it, so a delivery
+// already past the guard called into freed state — and the dlclose
+// behind it unmapped on_message() as well.
+//
+// The answer is sock_session_t's (core/AGENTS.md §Patterns): lift both
+// fields and take a reference in one locked step, work released, and
+// let whoever leaves last run the teardown the detaching thread left
+// behind. Nothing waits. What holds the mapping open meanwhile is the
+// count itself — plugin_quiesce() polls bot_driver_inflight_owned() and
+// will not let the dlclose past while it reads non-zero.
+
+// Resolve a subscriber id to its live instance and take a reference to
+// the driver it is bound to. Fails when the bot is gone or its vtable
+// is detached, which is what "the bot has gone deaf for the length of a
+// reload" means on this path.
+static bool
+bot_driver_acquire(uint64_t id, bot_inst_t **inst_out,
+    const bot_driver_t **drv_out, void **handle_out)
 {
-  bot_inst_t *bot = (bot_inst_t *)data;
+  bool ok = false;
 
-  if(bot == NULL || bot->driver == NULL || bot->driver->on_message == NULL)
-    return;
+  pthread_mutex_lock(&bot_mutex);
 
-  // Bot-level ignore_nicks (glob list). Cheapest filter — check first.
+  for(bot_inst_t *b = bot_list; b != NULL; b = b->next)
   {
-    char        key[KV_KEY_SZ];
-    const char *list;
+    if(b->id != id || b->driver == NULL)
+      continue;
 
-    snprintf(key, sizeof(key), "bot.%s.ignore_nicks", bot->name);
-    list = kv_get_str(key);
-    if(bot_sender_ignored(list, msg->sender))
+    *inst_out   = b;
+    *drv_out    = b->driver;
+    *handle_out = b->handle;
+    b->refs++;
+    ok = true;
+    break;
+  }
+
+  pthread_mutex_unlock(&bot_mutex);
+  return(ok);
+}
+
+// Run what a detached driver still owes. No lock is held: both calls
+// log, take the plugin's own locks, and may re-enter the bot API.
+static void
+bot_driver_teardown(const bot_driver_t *drv, void *handle, bool stop)
+{
+  if(stop && drv->stop != NULL)
+    drv->stop(handle);
+
+  if(drv->destroy != NULL && handle != NULL)
+    drv->destroy(handle);
+}
+
+static void
+bot_release(bot_inst_t *inst)
+{
+  const bot_driver_t *drv    = NULL;
+  void               *handle = NULL;
+  bool                stop   = false;
+  bool                doomed;
+
+  pthread_mutex_lock(&bot_mutex);
+
+  // Claim the owed teardown BEFORE dropping the reference. The count is
+  // what holds the mapping open, so it must not read zero to a poller
+  // while destroy() is still executing inside it.
+  if(inst->refs == 1 && inst->dying_drv != NULL)
+  {
+    drv                = inst->dying_drv;
+    handle             = inst->dying_handle;
+    stop               = inst->dying_stop;
+    inst->dying_drv    = NULL;
+    inst->dying_handle = NULL;
+    inst->dying_stop   = false;
+  }
+
+  pthread_mutex_unlock(&bot_mutex);
+
+  if(drv != NULL)
+  {
+    bot_driver_teardown(drv, handle, stop);
+
+    // The one line that says the deferral actually happened. Without it
+    // the mechanism is invisible in the log precisely when it matters.
+    clam(CLAM_DEBUG, "bot_release",
+        "'%s': ran the driver teardown a reload handed to this delivery",
+        inst->name);
+  }
+
+  pthread_mutex_lock(&bot_mutex);
+  inst->refs--;
+  doomed = (inst->refs == 0 && inst->doomed);
+
+  if(doomed)
+    bot_deferred_frees--;
+
+  pthread_mutex_unlock(&bot_mutex);
+
+  // bot_destroy() unlinked the instance and handed us the free: nothing
+  // can reach it any more, and nobody else is inside it.
+  if(doomed)
+    mem_free(inst);
+}
+
+// Take the vtable out of the instance and settle what it owes. Call
+// with bot_life_mutex held and bot_mutex released. Returns with
+// inst->driver NULL, so no new delivery can enter; the teardown runs
+// here when nothing is inside — the common case, and byte for byte the
+// behaviour this replaced — or on the last delivery's way out when
+// something is.
+static void
+bot_driver_detach(bot_inst_t *inst, bool stop)
+{
+  const bot_driver_t *drv;
+  void               *handle;
+  uint32_t            held = 0;
+  bool                now  = false;
+
+  pthread_mutex_lock(&bot_mutex);
+
+  drv    = inst->driver;
+  handle = inst->handle;
+  held   = inst->refs;
+
+  inst->driver = NULL;
+  inst->handle = NULL;
+
+  if(drv != NULL)
+  {
+    now = (held == 0);
+
+    if(!now)
     {
-      clam(CLAM_DEBUG, "bot_msg",
-          "%s: dropped %s (ignore_nicks)",
-          bot->name, msg->sender);
-      return;
+      inst->dying_drv    = drv;
+      inst->dying_handle = handle;
+      inst->dying_stop   = stop;
     }
   }
 
-  // Bot-level ignore_regex (POSIX ERE matched against payload).
-  {
-    char        key[KV_KEY_SZ];
-    const char *pattern;
+  pthread_mutex_unlock(&bot_mutex);
 
-    snprintf(key, sizeof(key), "bot.%s.ignore_regex", bot->name);
-    pattern = kv_get_str(key);
-    if(bot_payload_ignored(pattern, msg->text))
+  if(now)
+    bot_driver_teardown(drv, handle, stop);
+
+  else if(drv != NULL)
+    clam(CLAM_DEBUG, "bot_suspend",
+        "'%s': %u delivery(ies) in flight; its driver teardown goes to the "
+        "last one out", inst->name, held);
+}
+
+// Take a bot's method bindings down: unsubscribe, unregister the
+// instances the bot itself created, and clear the fields readers see.
+// `stop_at` bounds the walk (NULL = all of it) so bot_start()'s
+// rollback can share it — a binding that never came up is skipped by
+// its own flags, which is what lets one helper serve rollback,
+// bot_stop() and bot_destroy() alike.
+//
+// Call with bot_life_mutex held and bot_mutex released:
+// method_unsubscribe() and method_unregister() both log unconditionally,
+// and a clam destination routed to a bot resolves through bot_find().
+static void
+bot_methods_down(bot_inst_t *inst, const bot_method_t *stop_at)
+{
+  for(bot_method_t *m = inst->methods; m != stop_at; m = m->next)
+  {
+    if(m->subscribed && m->inst != NULL)
     {
-      clam(CLAM_DEBUG, "bot_msg",
-          "%s: dropped payload (ignore_regex)", bot->name);
-      return;
+      method_unsubscribe(m->inst, inst->name);
+      m->subscribed = false;
     }
+
+    // Not gated on m->inst: a subscribe that failed after the register
+    // leaves the flag set and the pointer cleared, and the instance is
+    // owed an unregister either way. Gating on both is what used to
+    // leak it.
+    if(m->created_by_bot)
+    {
+      method_unregister(m->method_name);
+      m->created_by_bot = false;
+    }
+
+    m->inst = NULL;
+  }
+}
+
+static void
+bot_msg_handler(const method_msg_t *msg, void *data)
+{
+  const uint64_t      id = (uint64_t)(uintptr_t)data;
+  bot_inst_t         *bot;
+  const bot_driver_t *drv;
+  void               *handle;
+  char                key[KV_KEY_SZ];
+  const char         *list;
+  const char         *pattern;
+
+  if(!bot_driver_acquire(id, &bot, &drv, &handle))
+    return;
+
+  if(drv->on_message == NULL)
+  {
+    bot_release(bot);
+    return;
+  }
+
+  // Bot-level ignore_nicks (glob list). Cheapest filter — check first.
+  snprintf(key, sizeof(key), "bot.%s.ignore_nicks", bot->name);
+  list = kv_get_str(key);
+
+  if(bot_sender_ignored(list, msg->sender))
+  {
+    clam(CLAM_DEBUG, "bot_msg", "%s: dropped %s (ignore_nicks)",
+        bot->name, msg->sender);
+    bot_release(bot);
+    return;
+  }
+
+  // Bot-level ignore_regex (POSIX ERE matched against payload).
+  snprintf(key, sizeof(key), "bot.%s.ignore_regex", bot->name);
+  pattern = kv_get_str(key);
+
+  if(bot_payload_ignored(pattern, msg->text))
+  {
+    clam(CLAM_DEBUG, "bot_msg", "%s: dropped payload (ignore_regex)",
+        bot->name);
+    bot_release(bot);
+    return;
   }
 
   // Both counters are written from every bound method's delivery thread
@@ -245,7 +441,8 @@ bot_msg_handler(const method_msg_t *msg, void *data)
   __atomic_add_fetch(&bot->msg_count, 1, __ATOMIC_RELAXED);
   __atomic_store_n(&bot->last_activity, time(NULL), __ATOMIC_RELAXED);
   bot_witness_record(bot, msg);
-  bot->driver->on_message(bot->handle, msg);
+  drv->on_message(handle, msg);
+  bot_release(bot);
 }
 
 // Instance management
@@ -564,6 +761,46 @@ bot_audit_iterate_bindings(bot_audit_cb_t cb, void *data)
   pthread_mutex_unlock(&bot_mutex);
 }
 
+uint32_t
+bot_driver_inflight_owned(uintptr_t lo, uintptr_t hi,
+    char *out, size_t out_cap)
+{
+  uint32_t n = 0;
+
+  if(out != NULL && out_cap > 0)
+    out[0] = '\0';
+
+  if(lo >= hi)
+    return(0);
+
+  pthread_mutex_lock(&bot_mutex);
+
+  for(bot_inst_t *b = bot_list; b != NULL; b = b->next)
+  {
+    uintptr_t drv;
+
+    if(b->refs == 0)
+      continue;
+
+    // Attached while a delivery runs, or already detached with the
+    // teardown owed — the pointer is in the mapping either way, and it
+    // is the vtable that names whose mapping this is.
+    drv = (uintptr_t)(b->driver != NULL
+        ? (const void *)b->driver : (const void *)b->dying_drv);
+
+    if(drv < lo || drv >= hi)
+      continue;
+
+    if(n == 0 && out != NULL && out_cap > 0)
+      strlcpy(out, b->name, out_cap);
+
+    n++;
+  }
+
+  pthread_mutex_unlock(&bot_mutex);
+  return(n);
+}
+
 // Create a new bot instance.
 // drv: bot driver interface (must not be NULL)
 bot_inst_t *
@@ -577,6 +814,7 @@ bot_create(const bot_driver_t *drv, const char *name)
     return(NULL);
   }
 
+  pthread_mutex_lock(&bot_life_mutex);
   pthread_mutex_lock(&bot_mutex);
 
   // Check for duplicate name.
@@ -585,26 +823,32 @@ bot_create(const bot_driver_t *drv, const char *name)
     if(strncasecmp(b->name, name, BOT_NAME_SZ) == 0)
     {
       pthread_mutex_unlock(&bot_mutex);
+      pthread_mutex_unlock(&bot_life_mutex);
       clam(CLAM_WARN, "bot_create",
           "duplicate instance name: '%s'", name);
       return(NULL);
     }
   }
 
+  pthread_mutex_unlock(&bot_mutex);
+
   inst = mem_alloc("bot", "instance", sizeof(*inst));
   memset(inst, 0, sizeof(*inst));
   strlcpy(inst->name, name, BOT_NAME_SZ);
+  inst->id     = __atomic_add_fetch(&bot_next_id, 1, __ATOMIC_RELAXED);
   inst->driver = drv;
-  inst->state = BOT_CREATED;
+  inst->state  = BOT_CREATED;
 
-  // Call driver create() if provided.
+  // Call driver create() if provided. Released: create() logs, and the
+  // instance is not on the list yet — bot_life_mutex is what reserves
+  // the name across the call.
   if(drv->create != NULL)
   {
     inst->handle = drv->create(inst);
 
     if(inst->handle == NULL)
     {
-      pthread_mutex_unlock(&bot_mutex);
+      pthread_mutex_unlock(&bot_life_mutex);
       clam(CLAM_WARN, "bot_create",
           "driver create() failed for '%s'", name);
       mem_free(inst);
@@ -613,10 +857,10 @@ bot_create(const bot_driver_t *drv, const char *name)
   }
 
   // Prepend to list.
+  pthread_mutex_lock(&bot_mutex);
   inst->next = bot_list;
   bot_list = inst;
   bot_count++;
-
   pthread_mutex_unlock(&bot_mutex);
 
   // Register per-bot KV keys.
@@ -655,6 +899,8 @@ bot_create(const bot_driver_t *drv, const char *name)
   // was released above and contributor callbacks only touch KV.
   bot_kv_fanout_bot(name);
 
+  pthread_mutex_unlock(&bot_life_mutex);
+
   clam(CLAM_INFO, "bot_create",
       "created '%s' (driver: %s)", name, drv->name);
   return(inst);
@@ -665,59 +911,56 @@ bool
 bot_destroy(const char *name)
 {
   bot_inst_t *inst = NULL;
-  bot_inst_t *prev = NULL;
+  char        prefix[BOT_NAME_SZ + 8];
+  char        saved_name[BOT_NAME_SZ];
+  bool        free_now;
 
   if(name == NULL || name[0] == '\0')
     return(FAIL);
 
+  pthread_mutex_lock(&bot_life_mutex);
   pthread_mutex_lock(&bot_mutex);
 
-  for(inst = bot_list; inst != NULL; prev = inst, inst = inst->next)
+  for(inst = bot_list; inst != NULL; inst = inst->next)
     if(strncasecmp(inst->name, name, BOT_NAME_SZ) == 0)
       break;
 
+  pthread_mutex_unlock(&bot_mutex);
+
   if(inst == NULL)
   {
-    pthread_mutex_unlock(&bot_mutex);
+    pthread_mutex_unlock(&bot_life_mutex);
     clam(CLAM_WARN, "bot_destroy", "not found: '%s'", name);
     return(FAIL);
   }
 
-  // Stop if running.
+  // The pointer outlives that unlock because bot_life_mutex is held:
+  // bot_destroy() is the only thing that unlinks an instance, and no
+  // second lifecycle operation can be running.
+  strlcpy(saved_name, inst->name, BOT_NAME_SZ);
+  snprintf(prefix, sizeof(prefix), "bot.%s.", saved_name);
+
+  // Stop if running. Inline rather than bot_stop() so the bot never
+  // passes back through CREATED, where an autostart could pick it up.
   if(inst->state == BOT_RUNNING)
   {
-    // Inline stop logic to avoid recursive lock.
+    const bot_driver_t *drv    = inst->driver;
+    void               *handle = inst->handle;
+
     inst->state = BOT_STOPPING;
 
+    if(drv != NULL && drv->stop != NULL)
+      drv->stop(handle);
 
-    if(inst->driver != NULL && inst->driver->stop != NULL)
-      inst->driver->stop(inst->handle);
-
-    // Unsubscribe from all methods and destroy bot-created instances.
-    for(bot_method_t *m = inst->methods; m != NULL; m = m->next)
-    {
-      if(m->subscribed && m->inst != NULL)
-      {
-        method_unsubscribe(m->inst, inst->name);
-        m->subscribed = false;
-      }
-
-      if(m->created_by_bot && m->inst != NULL)
-      {
-        method_unregister(m->method_name);
-        m->created_by_bot = false;
-      }
-
-      m->inst = NULL;
-    }
-
+    bot_methods_down(inst, NULL);
     inst->state = BOT_CREATED;
   }
 
-  // Call driver destroy().
-  if(inst->driver != NULL && inst->driver->destroy != NULL
-      && inst->handle != NULL)
-    inst->driver->destroy(inst->handle);
+  // Hand the vtable back. A delivery still inside on_message() takes
+  // the destroy() with it on its way out; nothing waits here.
+  bot_driver_detach(inst, false);
+
+  pthread_mutex_lock(&bot_mutex);
 
   // Free all method bindings.
   {
@@ -726,6 +969,7 @@ bot_destroy(const char *name)
     while(m != NULL)
     {
       bot_method_t *next = m->next;
+
       bm_put(m);
       m = next;
     }
@@ -735,31 +979,36 @@ bot_destroy(const char *name)
   inst->method_count = 0;
 
   // Unlink from list.
-  if(prev != NULL)
-    prev->next = inst->next;
-  else
-    bot_list = inst->next;
+  for(bot_inst_t **pp = &bot_list; *pp != NULL; pp = &(*pp)->next)
+    if(*pp == inst)
+    {
+      *pp = inst->next;
+      bot_count--;
+      break;
+    }
 
-  bot_count--;
+  // Off the list, so bot_driver_acquire() can no longer find it and the
+  // reference count can only fall. Whoever drops the last one frees it.
+  inst->doomed = true;
+  free_now     = (inst->refs == 0);
 
-  {
-    // Build KV prefix for namespace deletion.
-    char prefix[BOT_NAME_SZ + 8];
-    char saved_name[BOT_NAME_SZ];
+  if(!free_now)
+    bot_deferred_frees++;
 
-    snprintf(prefix, sizeof(prefix), "bot.%s.", inst->name);
-    strlcpy(saved_name, inst->name, BOT_NAME_SZ);
+  pthread_mutex_unlock(&bot_mutex);
 
-    pthread_mutex_unlock(&bot_mutex);
+  // Delete KV namespace outside the lock (kv_delete_prefix has its own).
+  // Skip during shutdown — the DB state must survive for bot_restore().
+  if(bot_ready)
+    kv_delete_prefix(prefix);
 
-    // Delete KV namespace outside lock (kv_delete_prefix has its own).
-    // Skip during shutdown — the DB state must survive for bot_restore().
-    if(bot_ready)
-      kv_delete_prefix(prefix);
+  pthread_mutex_unlock(&bot_life_mutex);
 
-    clam(CLAM_INFO, "bot_destroy", "destroyed '%s'", saved_name);
-  }
-  mem_free(inst);
+  clam(CLAM_INFO, "bot_destroy", "destroyed '%s'", saved_name);
+
+  if(free_now)
+    mem_free(inst);
+
   return(SUCCESS);
 }
 
@@ -807,20 +1056,25 @@ bot_bind_method(bot_inst_t *inst, const char *method_name,
     return(FAIL);
   }
 
+  pthread_mutex_lock(&bot_life_mutex);
   pthread_mutex_lock(&bot_mutex);
 
   if(inst->state != BOT_CREATED)
   {
+    bot_state_t state = inst->state;
+
     pthread_mutex_unlock(&bot_mutex);
+    pthread_mutex_unlock(&bot_life_mutex);
     clam(CLAM_WARN, "bot_bind_method",
         "'%s': cannot bind while %s",
-        inst->name, bot_state_name(inst->state));
+        inst->name, bot_state_name(state));
     return(FAIL);
   }
 
   if(inst->method_count >= bot_cfg.max_methods)
   {
     pthread_mutex_unlock(&bot_mutex);
+    pthread_mutex_unlock(&bot_life_mutex);
     clam(CLAM_WARN, "bot_bind_method",
         "'%s': method limit reached (%u)", inst->name, bot_cfg.max_methods);
     return(FAIL);
@@ -832,6 +1086,7 @@ bot_bind_method(bot_inst_t *inst, const char *method_name,
     if(strncasecmp(m->method_name, method_name, METHOD_NAME_SZ) == 0)
     {
       pthread_mutex_unlock(&bot_mutex);
+      pthread_mutex_unlock(&bot_life_mutex);
       clam(CLAM_WARN, "bot_bind_method",
           "'%s': method '%s' already bound",
           inst->name, method_name);
@@ -852,9 +1107,6 @@ bot_bind_method(bot_inst_t *inst, const char *method_name,
 
   pthread_mutex_unlock(&bot_mutex);
 
-  clam(CLAM_DEBUG, "bot_bind_method",
-      "'%s': bound method '%s'", inst->name, method_name);
-
   // Register per-method identity timeout KV.
   if(method_kind != NULL && method_kind[0] != '\0')
   {
@@ -866,6 +1118,10 @@ bot_bind_method(bot_inst_t *inst, const char *method_name,
         "(0=use maxidleauth)");
   }
 
+  pthread_mutex_unlock(&bot_life_mutex);
+
+  clam(CLAM_DEBUG, "bot_bind_method",
+      "'%s': bound method '%s'", inst->name, method_name);
   return(SUCCESS);
 }
 
@@ -877,14 +1133,18 @@ bot_unbind_method(bot_inst_t *inst, const char *method_name)
   if(inst == NULL || method_name == NULL || method_name[0] == '\0')
     return(FAIL);
 
+  pthread_mutex_lock(&bot_life_mutex);
   pthread_mutex_lock(&bot_mutex);
 
   if(inst->state != BOT_CREATED)
   {
+    bot_state_t state = inst->state;
+
     pthread_mutex_unlock(&bot_mutex);
+    pthread_mutex_unlock(&bot_life_mutex);
     clam(CLAM_WARN, "bot_unbind_method",
         "'%s': cannot unbind while %s",
-        inst->name, bot_state_name(inst->state));
+        inst->name, bot_state_name(state));
     return(FAIL);
   }
 
@@ -900,6 +1160,7 @@ bot_unbind_method(bot_inst_t *inst, const char *method_name)
       inst->method_count--;
       bm_put(m);
       pthread_mutex_unlock(&bot_mutex);
+      pthread_mutex_unlock(&bot_life_mutex);
 
       clam(CLAM_DEBUG, "bot_unbind_method",
           "'%s': unbound method '%s'", inst->name, method_name);
@@ -908,6 +1169,7 @@ bot_unbind_method(bot_inst_t *inst, const char *method_name)
   }
 
   pthread_mutex_unlock(&bot_mutex);
+  pthread_mutex_unlock(&bot_life_mutex);
   clam(CLAM_DEBUG, "bot_unbind_method",
       "'%s': method '%s' not bound", inst->name, method_name);
   return(FAIL);
@@ -1210,52 +1472,44 @@ bot_discover_user(bot_inst_t *inst, const char *mfa_string)
 
 // Lifecycle
 
-// Rollback helper: unsubscribe and destroy bot-created method instances.
-// Must be called with bot_mutex held. Rolls back methods from
-// inst->methods up to (but not including) stop_at.
-static void
-bot_start_rollback(bot_inst_t *inst, bot_method_t *stop_at)
-{
-  for(bot_method_t *r = inst->methods; r != stop_at; r = r->next)
-  {
-    if(r->subscribed)
-    {
-      method_unsubscribe(r->inst, inst->name);
-      r->subscribed = false;
-    }
-
-    if(r->created_by_bot)
-    {
-      method_unregister(r->method_name);
-      r->created_by_bot = false;
-    }
-
-    r->inst = NULL;
-  }
-}
-
+// Every foreign call below runs with bot_mutex released. What makes
+// that safe is bot_life_mutex: it is held for the whole of the
+// operation, and every mutator of the binding list takes it, so the
+// list this walks cannot change under the walk. Holding bot_mutex
+// instead — which is what these did until 2026-08-15 — put a clam()
+// under it at every step, and put `bot_mutex -> task_mutex` into a
+// lock-order cycle by way of the driver's own start()
+// (root TODO.md §SC-SAN-FINDINGS → SAN-19, cycle B).
 bool
 bot_start(bot_inst_t *inst)
 {
+  const bot_driver_t *drv;
+  void               *handle;
+
   if(inst == NULL)
     return(FAIL);
 
-  pthread_mutex_lock(&bot_mutex);
+  pthread_mutex_lock(&bot_life_mutex);
 
   if(inst->state != BOT_CREATED)
   {
-    pthread_mutex_unlock(&bot_mutex);
+    bot_state_t state = inst->state;
+
+    pthread_mutex_unlock(&bot_life_mutex);
     clam(CLAM_WARN, "bot_start",
         "'%s': cannot start from state %s",
-        inst->name, bot_state_name(inst->state));
+        inst->name, bot_state_name(state));
     return(FAIL);
   }
 
+  drv    = inst->driver;
+  handle = inst->handle;
+
   // A reload holding the driver is transient, and starting into a NULL
   // vtable is not. Refuse for the few seconds it takes to come back.
-  if(inst->driver == NULL)
+  if(drv == NULL)
   {
-    pthread_mutex_unlock(&bot_mutex);
+    pthread_mutex_unlock(&bot_life_mutex);
     clam(CLAM_WARN, "bot_start",
         "'%s': its driver is detached by a plugin reload in progress",
         inst->name);
@@ -1265,10 +1519,10 @@ bot_start(bot_inst_t *inst)
   // Resolve and subscribe to all bound methods.
   for(bot_method_t *m = inst->methods; m != NULL; m = m->next)
   {
-    m->inst = method_find(m->method_name);
+    method_inst_t *mi = method_find(m->method_name);
 
     // If no existing instance, create one on demand from the plugin.
-    if(m->inst == NULL && m->method_kind[0] != '\0')
+    if(mi == NULL && m->method_kind[0] != '\0')
     {
       const plugin_desc_t *pd =
           plugin_find_type(PLUGIN_METHOD, m->method_kind);
@@ -1276,28 +1530,37 @@ bot_start(bot_inst_t *inst)
       if(pd != NULL && pd->ext != NULL)
       {
         const method_driver_t *mdrv = (const method_driver_t *)pd->ext;
-        m->inst = method_register(mdrv, m->method_name);
 
-        if(m->inst != NULL)
+        mi = method_register(mdrv, m->method_name);
+
+        if(mi != NULL)
           m->created_by_bot = true;
       }
     }
 
-    if(m->inst == NULL)
+    m->inst = mi;
+
+    if(mi == NULL)
     {
-      bot_start_rollback(inst, m);
-      pthread_mutex_unlock(&bot_mutex);
+      bot_methods_down(inst, m->next);
+      pthread_mutex_unlock(&bot_life_mutex);
       clam(CLAM_WARN, "bot_start",
           "'%s': method '%s' not found (kind: %s)",
           inst->name, m->method_name, m->method_kind);
       return(FAIL);
     }
 
-    if(method_subscribe(m->inst, inst->name, bot_msg_handler, inst) != SUCCESS)
+    // The subscriber carries the bot's id, never its address: a
+    // delivery resolves it under bot_mutex and cannot be handed a
+    // freed instance (SAN-18).
+    if(method_subscribe(mi, inst->name, bot_msg_handler,
+        (void *)(uintptr_t)inst->id) != SUCCESS)
     {
-      bot_start_rollback(inst, m);
-      m->inst = NULL;
-      pthread_mutex_unlock(&bot_mutex);
+      // m->next, not m: this binding's own instance was registered
+      // above and is owed an unregister too. Stopping short of it is
+      // what used to leak it.
+      bot_methods_down(inst, m->next);
+      pthread_mutex_unlock(&bot_life_mutex);
       clam(CLAM_WARN, "bot_start",
           "'%s': failed to subscribe to '%s'",
           inst->name, m->method_name);
@@ -1308,27 +1571,24 @@ bot_start(bot_inst_t *inst)
   }
 
   // Call driver start().
-  if(inst->driver->start != NULL)
+  if(drv->start != NULL && drv->start(handle) != SUCCESS)
   {
-    if(inst->driver->start(inst->handle) != SUCCESS)
-    {
-      bot_start_rollback(inst, NULL);
-      pthread_mutex_unlock(&bot_mutex);
-      clam(CLAM_WARN, "bot_start",
-          "'%s': driver start() failed", inst->name);
-      return(FAIL);
-    }
+    bot_methods_down(inst, NULL);
+    pthread_mutex_unlock(&bot_life_mutex);
+    clam(CLAM_WARN, "bot_start",
+        "'%s': driver start() failed", inst->name);
+    return(FAIL);
   }
 
   inst->state = BOT_RUNNING;
 
-  pthread_mutex_unlock(&bot_mutex);
-
-  // Connect bot-created method instances (outside lock — connect may
-  // initiate async I/O with its own locking).
+  // Connect bot-created method instances (connect may initiate async
+  // I/O with its own locking).
   for(bot_method_t *m = inst->methods; m != NULL; m = m->next)
     if(m->created_by_bot && m->inst != NULL)
       method_connect(m->inst);
+
+  pthread_mutex_unlock(&bot_life_mutex);
 
   clam(CLAM_INFO, "bot_start", "'%s' started (%u methods)",
       inst->name, inst->method_count);
@@ -1338,48 +1598,39 @@ bot_start(bot_inst_t *inst)
 bool
 bot_stop(bot_inst_t *inst)
 {
+  const bot_driver_t *drv;
+  void               *handle;
+
   if(inst == NULL)
     return(FAIL);
 
-  pthread_mutex_lock(&bot_mutex);
+  pthread_mutex_lock(&bot_life_mutex);
 
   if(inst->state != BOT_RUNNING)
   {
-    pthread_mutex_unlock(&bot_mutex);
+    bot_state_t state = inst->state;
+
+    pthread_mutex_unlock(&bot_life_mutex);
     clam(CLAM_WARN, "bot_stop",
         "'%s': cannot stop from state %s",
-        inst->name, bot_state_name(inst->state));
+        inst->name, bot_state_name(state));
     return(FAIL);
   }
 
   inst->state = BOT_STOPPING;
+  drv         = inst->driver;
+  handle      = inst->handle;
 
   // Call driver stop(). NULL while a reload holds the driver — the
   // suspend already stopped it.
-  if(inst->driver != NULL && inst->driver->stop != NULL)
-    inst->driver->stop(inst->handle);
+  if(drv != NULL && drv->stop != NULL)
+    drv->stop(handle);
 
-  // Unsubscribe from all methods and destroy bot-created instances.
-  for(bot_method_t *m = inst->methods; m != NULL; m = m->next)
-  {
-    if(m->subscribed && m->inst != NULL)
-    {
-      method_unsubscribe(m->inst, inst->name);
-      m->subscribed = false;
-    }
-
-    if(m->created_by_bot && m->inst != NULL)
-    {
-      method_unregister(m->method_name);
-      m->created_by_bot = false;
-    }
-
-    m->inst = NULL;
-  }
+  bot_methods_down(inst, NULL);
 
   inst->state = BOT_CREATED;
 
-  pthread_mutex_unlock(&bot_mutex);
+  pthread_mutex_unlock(&bot_life_mutex);
 
   clam(CLAM_INFO, "bot_stop", "'%s' stopped", inst->name);
   return(SUCCESS);
@@ -1537,26 +1788,17 @@ bot_find_bound_to_driver(const char *driver_name, char *out_name,
 
 // Suspend / resume across a plugin reload
 
-// One bot's driver, lifted out of the instance and not yet torn down.
-// The lift happens under bot_mutex and the teardown after it: once the
-// vtable is out of the instance no delivery thread can reach the driver,
-// so its stop()/destroy() are free to call back into the bot API.
-typedef struct
-{
-  const bot_driver_t *drv;
-  void               *handle;
-  bool                running;
-} bot_detach_t;
-
 uint32_t
 bot_suspend_driver(const char *driver_name)
 {
-  bot_detach_t det[BOT_SUSPEND_MAX];
-  uint32_t     n = 0;
+  bot_inst_t *det[BOT_SUSPEND_MAX];
+  bool        running[BOT_SUSPEND_MAX];
+  uint32_t    n = 0;
 
   if(driver_name == NULL || driver_name[0] == '\0')
     return(0);
 
+  pthread_mutex_lock(&bot_life_mutex);
   pthread_mutex_lock(&bot_mutex);
 
   for(bot_inst_t *b = bot_list; b != NULL && n < BOT_SUSPEND_MAX; b = b->next)
@@ -1567,35 +1809,29 @@ bot_suspend_driver(const char *driver_name)
     if(strcmp(b->driver->name, driver_name) != 0)
       continue;
 
-    det[n].drv     = b->driver;
-    det[n].handle  = b->handle;
-    det[n].running = (b->state == BOT_RUNNING);
-    n++;
-
     memset(&b->susp, 0, sizeof(b->susp));
     b->susp.driver      = true;
     b->susp.was_running = (b->state == BOT_RUNNING);
     snprintf(b->susp.driver_name, sizeof(b->susp.driver_name), "%s",
         driver_name);
 
-    // The state is left alone deliberately. The bot is still subscribed
-    // to its methods and still the owner of its sessions; it has only
-    // lost the ability to answer, which bot_msg_handler already treats
-    // as "drop the message".
-    b->driver = NULL;
-    b->handle = NULL;
+    // The instances outlive this unlock because bot_life_mutex is held:
+    // only bot_destroy() unlinks one, and it is a lifecycle operation.
+    running[n] = b->susp.was_running;
+    det[n]     = b;
+    n++;
   }
 
   pthread_mutex_unlock(&bot_mutex);
 
+  // The bot's state is left alone deliberately. It is still subscribed
+  // to its methods and still the owner of its sessions; it has only
+  // lost the ability to answer, which bot_msg_handler already treats as
+  // "drop the message".
   for(uint32_t i = 0; i < n; i++)
-  {
-    if(det[i].running && det[i].drv->stop != NULL)
-      det[i].drv->stop(det[i].handle);
+    bot_driver_detach(det[i], running[i]);
 
-    if(det[i].drv->destroy != NULL && det[i].handle != NULL)
-      det[i].drv->destroy(det[i].handle);
-  }
+  pthread_mutex_unlock(&bot_life_mutex);
 
   if(n > 0)
     clam(CLAM_INFO, "bot_suspend",
@@ -1614,6 +1850,7 @@ bot_resume_driver(const bot_driver_t *drv, const char *kind)
   if(drv == NULL || drv->name == NULL)
     return(0);
 
+  pthread_mutex_lock(&bot_life_mutex);
   pthread_mutex_lock(&bot_mutex);
 
   for(bot_inst_t *b = bot_list; b != NULL && n < BOT_SUSPEND_MAX; b = b->next)
@@ -1671,6 +1908,8 @@ bot_resume_driver(const bot_driver_t *drv, const char *kind)
     resumed++;
   }
 
+  pthread_mutex_unlock(&bot_life_mutex);
+
   if(resumed > 0)
     clam(CLAM_INFO, "bot_resume",
         "re-attached %u bot(s) to driver '%s'", resumed, drv->name);
@@ -1689,6 +1928,7 @@ bot_suspend_method(const char *method_kind)
   if(method_kind == NULL || method_kind[0] == '\0')
     return(0);
 
+  pthread_mutex_lock(&bot_life_mutex);
   pthread_mutex_lock(&bot_mutex);
 
   for(bot_inst_t *b = bot_list; b != NULL && n < BOT_SUSPEND_MAX; b = b->next)
@@ -1755,6 +1995,8 @@ bot_suspend_method(const char *method_kind)
     pthread_mutex_unlock(&bot_mutex);
   }
 
+  pthread_mutex_unlock(&bot_life_mutex);
+
   if(suspended > 0)
     clam(CLAM_INFO, "bot_suspend",
         "suspended %u bot(s) bound to method '%s'; %u stopped",
@@ -1774,6 +2016,7 @@ bot_resume_method(const char *method_kind)
   if(method_kind == NULL || method_kind[0] == '\0')
     return(0);
 
+  pthread_mutex_lock(&bot_life_mutex);
   pthread_mutex_lock(&bot_mutex);
 
   for(bot_inst_t *b = bot_list; b != NULL && n < BOT_SUSPEND_MAX; b = b->next)
@@ -1824,6 +2067,8 @@ bot_resume_method(const char *method_kind)
 
     resumed++;
   }
+
+  pthread_mutex_unlock(&bot_life_mutex);
 
   if(resumed > 0)
     clam(CLAM_INFO, "bot_resume",
@@ -1975,7 +2220,19 @@ bot_last_activity(const bot_inst_t *inst)
 void
 bot_init(void)
 {
+  pthread_mutexattr_t attr;
+
   pthread_mutex_init(&bot_mutex, NULL);
+
+  // Recursive for the reason plugin_mutate_mutex is: one lifecycle
+  // operation legitimately reaches another on the same thread —
+  // bot_suspend_method() calls bot_stop(), bot_resume_method() calls
+  // bot_start() — and so may a driver callback made from inside one.
+  pthread_mutexattr_init(&attr);
+  pthread_mutexattr_settype(&attr, PTHREAD_MUTEX_RECURSIVE);
+  pthread_mutex_init(&bot_life_mutex, &attr);
+  pthread_mutexattr_destroy(&attr);
+
   bot_ready = true;
 
   clam(CLAM_INFO, "bot_init", "bot subsystem initialized");
@@ -2342,8 +2599,41 @@ bot_restore(void)
   return(SUCCESS);
 }
 
+// Wait, bounded, for the frees bot_destroy() handed to a delivery still
+// inside its bot. bot_exit() runs ahead of pool_exit()/sock_exit(), so a
+// message can genuinely be in flight when the last bot goes — but
+// bot_destroy() unsubscribes before it unlinks, so no new one starts and
+// what is left drains in milliseconds.
+// returns: SUCCESS when nothing is outstanding, FAIL on timeout.
+static bool
+bot_exit_drain(void)
+{
+  static const struct timespec nap =
+      { 0, (long)BOT_EXIT_DRAIN_STEP * 1000L * 1000L };
+
+  uint32_t left = 0;
+
+  for(uint32_t waited = 0; waited < BOT_EXIT_DRAIN_MS;
+      waited += BOT_EXIT_DRAIN_STEP)
+  {
+    pthread_mutex_lock(&bot_mutex);
+    left = bot_deferred_frees;
+    pthread_mutex_unlock(&bot_mutex);
+
+    if(left == 0)
+      return(SUCCESS);
+
+    nanosleep(&nap, NULL);
+  }
+
+  clam(CLAM_WARN, "bot_exit",
+      "%u instance(s) still hold a delivery after %d ms; leaving the bot "
+      "locks standing so their free does not fault", left, BOT_EXIT_DRAIN_MS);
+  return(FAIL);
+}
+
 // Shut down the bot subsystem. Stops and destroys all instances,
-// frees the method binding freelist, and destroys the mutex.
+// frees the method binding freelist, and destroys the mutexes.
 void
 bot_exit(void)
 {
@@ -2379,7 +2669,14 @@ bot_exit(void)
   bot_method_freelist = NULL;
   bot_method_free_count = 0;
 
-  pthread_mutex_destroy(&bot_mutex);
+  // Destroying a lock somebody is still about to take is its own defect
+  // class; leaving one standing at exit costs a process that is ending
+  // anyway nothing at all.
+  if(bot_exit_drain() == SUCCESS)
+  {
+    pthread_mutex_destroy(&bot_life_mutex);
+    pthread_mutex_destroy(&bot_mutex);
+  }
 }
 
 void *

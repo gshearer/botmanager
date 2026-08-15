@@ -53,6 +53,7 @@ regex (the literal context portion, before any `<placeholder>`).
 | `bot_reclaim` | core/bot.c | Class-A reclamation of a plugin's KV contributors |
 | `bot_register_driver_kv` | core/bot.c | per-driver KV registration |
 | `bot_register_method_kv` | core/bot.c | per-method KV registration |
+| `bot_release` | core/bot.c | a delivery running the driver teardown a reload deferred to it |
 | `bot_restore` | core/bot.c | bot restore from persistent store |
 | `bot_resume` | core/bot.c | re-attaching a bot to a reloaded driver/method |
 | `bot_say` | core/bot_cmd.c | `/say` command (bot emits to a channel) |

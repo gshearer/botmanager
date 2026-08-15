@@ -292,6 +292,19 @@ void bot_kv_contributor_unregister(void *user);
 // Returns the number of contributors removed.
 uint32_t bot_reclaim_contributors_owned(uintptr_t lo, uintptr_t hi);
 
+// Bots executing inside a driver vtable that lies in [lo,hi) right now:
+// a message delivery in flight, or the deferred teardown of a driver a
+// reload has already detached. Both are Class-B references core cannot
+// reclaim, and unmapping on_message() out from under one is a SIGSEGV
+// (root TODO.md §SC-SAN-FINDINGS → SAN-18), so plugin_quiesce() polls
+// this alongside the task and curl queues before it lets a dlclose
+// proceed. Names the first one in `out` when out_cap > 0.
+//
+// The count is a moment's reading: a delivery that ends between the
+// call and its use is gone. That is exactly what quiescence polls for.
+uint32_t bot_driver_inflight_owned(uintptr_t lo, uintptr_t hi,
+    char *out, size_t out_cap);
+
 // Audit hooks: yield the pointers the bot registry retains on a
 // plugin's behalf — the contributor table's callbacks and cookies, and
 // each instance's bound driver vtable.
@@ -352,9 +365,14 @@ typedef struct bot_method
 {
   char               method_name[METHOD_NAME_SZ];
   char               method_kind[PLUGIN_NAME_SZ]; // plugin kind (e.g., "irc")
-  method_inst_t     *inst;          // resolved at start time
-  bool               subscribed;    // true if currently subscribed
-  bool               created_by_bot; // true if bot_start() created the instance
+  // Written by a lifecycle operation, which walks this list with
+  // bot_mutex released (bot_life_mutex is what makes the walk safe),
+  // and read unlocked by /bot show and bot_resolve_method on a command
+  // thread. _Atomic is the whole of what that needs: a reader wants one
+  // field's current value and never a consistent pair of them.
+  method_inst_t * _Atomic inst;     // resolved at start time
+  _Atomic bool       subscribed;    // true if currently subscribed
+  _Atomic bool       created_by_bot; // true if bot_start() created the instance
   struct bot_method *next;
 } bot_method_t;
 
@@ -366,6 +384,15 @@ typedef struct bot_method
 // How many bots one reload can put down at once. A cascade that touches
 // more than this on a dev instance is not a cascade, it is a restart.
 #define BOT_SUSPEND_MAX  64
+
+// bot_exit() waits this long, in 10 ms steps, for a delivery that was in
+// flight when its bot was destroyed to free the instance — it does that
+// under bot_mutex, so the mutex has to outlive it. Deliveries stop
+// arriving the moment bot_destroy() unsubscribes, so in practice this
+// costs nothing; the bound is there so a wedged delivery cannot wedge
+// the shutdown.
+#define BOT_EXIT_DRAIN_MS    500
+#define BOT_EXIT_DRAIN_STEP  10
 
 typedef struct
 {
@@ -393,9 +420,20 @@ typedef struct
 struct bot_inst
 {
   char                   name[BOT_NAME_SZ];
-  const bot_driver_t    *driver;
-  void                  *handle;       // driver-specific state
-  bot_state_t            state;
+  // Identity a subscriber can carry without carrying the address.
+  // method_deliver() fans out from a snapshot taken under its own lock,
+  // so a bot destroyed in the gap would hand bot_msg_handler a freed
+  // pointer; the id makes the lookup and the reference one locked step.
+  // Assigned once at creation and never reused.
+  uint64_t               id;
+  // The vtable, the handle it belongs to, and the state readers watch.
+  // All three are read without bot_mutex — by bot_driver_name(),
+  // bot_get_handle() and /bot show — so all three carry their own
+  // atomicity. Lifetime is a separate question, and `refs` below is its
+  // answer.
+  const bot_driver_t * _Atomic driver;
+  void * _Atomic         handle;       // driver-specific state
+  _Atomic bot_state_t    state;
   bot_method_t          *methods;      // linked list of bound methods
   uint32_t               method_count;
   userns_t              *userns;       // optional user namespace
@@ -410,6 +448,17 @@ struct bot_inst
   bot_witness_t          witness[BOT_WITNESS_MAX]; // last public lines
   uint32_t               witness_next;  // round-robin insert cursor
   bot_suspend_t          susp;         // set only across a plugin reload
+  // Message deliveries in flight, and what a teardown that landed
+  // during one still owes. bot_msg_handler lifts (driver, handle) under
+  // bot_mutex and holds a reference for the length of the callback; a
+  // reload or a /bot del that arrives meanwhile detaches the vtable
+  // under the same lock and leaves the rest here for whoever leaves
+  // last. Nothing ever waits — see bot_release().
+  uint32_t               refs;
+  const bot_driver_t    *dying_drv;    // teardown owed by the last holder
+  void                  *dying_handle;
+  bool                   dying_stop;   // ...and stop() before destroy()
+  bool                   doomed;       // unlinked; the last holder frees it
   struct bot_inst       *next;
 };
 
@@ -433,6 +482,28 @@ static bot_cfg_t bot_cfg = {
 
 static bot_inst_t      *bot_list  = NULL;
 static pthread_mutex_t  bot_mutex;
+
+// Serialises the lifecycle operations — create, start, stop, destroy,
+// bind, unbind, suspend, resume — each for its whole length. That is
+// what lets every one of them make its foreign calls (the driver
+// vtable, method_find/register/subscribe/unsubscribe/unregister, all of
+// which log) with bot_mutex released and still find the binding list
+// exactly as it left it. Recursive for the reason plugin_mutate_mutex
+// is: bot_suspend_method() calls bot_stop() and bot_resume_method()
+// calls bot_start() on the same thread.
+//
+// Order is life -> bot. Never take this while holding bot_mutex, and
+// never hold bot_mutex across anything that can clam(): a clam
+// destination routed to a bot resolves through bot_find().
+static pthread_mutex_t  bot_life_mutex;
+
+// Never reused, so a stale subscriber id resolves to nothing.
+static uint64_t         bot_next_id = 0;
+
+// Instances unlinked with a delivery still inside them, whose free the
+// last holder owes. bot_exit() waits for this to reach zero before it
+// destroys the locks that holder is about to take.
+static uint32_t         bot_deferred_frees = 0;
 
 // Guards the per-bot witness rings (written on the delivery thread, read
 // from command worker threads). Static-initialised — no bot_init hook.
