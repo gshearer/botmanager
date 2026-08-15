@@ -357,7 +357,10 @@ bctl_drv_connect(void *handle)
   // Remove stale socket file if it exists.
   unlink(srv->sock_path);
 
-  fd = socket(AF_UNIX, SOCK_STREAM, 0);
+  // CLOEXEC: core/proc.c fork+execvp()s helpers (the claude bridge, ninja,
+  // git, acquire shells) from other threads, and none of them has any use
+  // for the operator's control socket.
+  fd = socket(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0);
   if(fd < 0)
   {
     clam(CLAM_WARN, "botmanctl", "socket(): %s", strerror(errno));
@@ -693,7 +696,7 @@ bctl_task_cb(task_t *t)
     {
       int cfd;
 
-      cfd = accept(srv->listen_fd, NULL, NULL);
+      cfd = accept4(srv->listen_fd, NULL, NULL, SOCK_CLOEXEC);
       if(cfd >= 0)
         bctl_client_add(srv, cfd);
     }

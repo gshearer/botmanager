@@ -995,6 +995,12 @@ cmd_show_group(const cmd_ctx_t *ctx)
 // caller's admin rights are the authority, so no old password is
 // required; this is the lockout-recovery path for an account whose
 // holder cannot log in. The self-service twin is `user password`.
+//
+// The password is on the command line, so this path is private-only like
+// its twin. The gate cannot live in the registration: `set user` also
+// carries the `groupdesc` child, which is a public-safe command sharing
+// the one registration — hence the same test the dispatcher applies,
+// applied here to the pass path alone.
 
 static void
 cmd_set_user(const cmd_ctx_t *ctx)
@@ -1003,6 +1009,19 @@ cmd_set_user(const cmd_ctx_t *ctx)
   userns_t   *ns;
   const char *username;
   const char *password;
+
+  if(ctx->msg != NULL && ctx->msg->inst != NULL
+      && ctx->msg->channel[0] != '\0')
+  {
+    clam(CLAM_WARN, "set user pass",
+        "'%s' refused: password reset attempted in public channel '%s'",
+        ctx->username != NULL ? ctx->username : "(unknown)",
+        ctx->msg->channel);
+
+    cmd_reply(ctx, "This command can only be used in private messages — "
+        "and the password you just typed is now public. Choose another.");
+    return;
+  }
 
   ns = userns_session_resolve(ctx);
 
@@ -1301,7 +1320,8 @@ userns_register_commands(void)
       "Resets another user's password without their old password, on\n"
       "the authority of your admin rights. Use this to recover an\n"
       "account whose holder is locked out; users change their own\n"
-      "password with /user password.\n"
+      "password with /user password. Private messages only — the new\n"
+      "password appears on the command line.\n"
       "Subcommand: groupdesc",
       USERNS_GROUP_ADMIN, 100, CMD_SCOPE_ANY, METHOD_T_ANY,
       cmd_set_user, NULL, "set", "u", ad_set_user, 3, NULL, NULL);

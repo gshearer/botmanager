@@ -314,13 +314,16 @@ match_entry(const mfa_cache_entry_t *e, const mfa_parts_t *in)
 
 // Match an MFA string against all cached patterns in a namespace.
 // Input format is handle!username@hostname. First match wins.
-// returns: matching username (static buffer, valid until next call), or NULL
+// returns: matching username (per-thread buffer, valid until this thread's
+// next call), or NULL. The buffer is _Thread_local because the scan runs
+// under a READ lock — concurrent matchers would otherwise share one buffer
+// and misattribute each other's users on the auth surface.
 const char *
 userns_mfa_match(const userns_t *ns, const char *mfa_string)
 {
   userns_cache_t *c;
   mfa_parts_t in;
-  static char matched_user[USERNS_USER_SZ];
+  static _Thread_local char matched_user[USERNS_USER_SZ];
 
   if(!userns_ready || ns == NULL || mfa_string == NULL || mfa_string[0] == '\0')
     return(NULL);

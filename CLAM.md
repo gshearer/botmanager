@@ -116,6 +116,7 @@ regex (the literal context portion, before any `<placeholder>`).
 | `pool_shutdown` | core/pool.c | worker pool shutdown drain |
 | `proc` | core/proc.c | child-process spawn / wait (`PROC_CTX`) |
 | `resolve` | core/resolve.c | identity resolution path |
+| `set user pass` | core/userns_cmd.c | admin password reset — the actor of a reset, and a reset refused for being asked in public |
 | `sig_exit` | core/sig.c | signal subsystem teardown |
 | `sig_init` | core/sig.c | signal subsystem init |
 | `sock` | core/sock.c | core socket helpers |
