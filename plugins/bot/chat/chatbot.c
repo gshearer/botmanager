@@ -1343,6 +1343,10 @@ chatbot_classify_with_engagement(chatbot_state_t *st,
 
 // ---------- driver callbacks ----------
 
+// Defined with the coalescer it takes down; both stop() and destroy()
+// call it, and neither can be moved below it.
+static void chatbot_coalesce_shutdown(chatbot_state_t *);
+
 static void *
 chatbot_create(bot_inst_t *inst)
 {
@@ -1357,6 +1361,7 @@ chatbot_create(bot_inst_t *inst)
   pthread_rwlock_init(&st->lock, NULL);
   pthread_mutex_init(&st->flight_mutex, NULL);
   pthread_mutex_init(&st->coalesce_mutex, NULL);
+  pthread_cond_init(&st->coalesce_idle, NULL);
   pthread_mutex_init(&st->engagement.mutex, NULL);
   pthread_mutex_init(&st->handoff.mutex,    NULL);
   pthread_mutex_init(&st->volunteer.mutex,  NULL);
@@ -1391,8 +1396,14 @@ chatbot_destroy(void *handle)
   chatbot_state_t *st = handle;
   if(st == NULL) return;
 
+  // Before anything else: no coalesce task may still name `st`.
+  // bot_destroy() reaches here without a stop() (bot.c passes
+  // stop=false), so this cannot be left to chatbot_stop() alone.
+  chatbot_coalesce_shutdown(st);
+
   pthread_rwlock_destroy(&st->lock);
   pthread_mutex_destroy(&st->flight_mutex);
+  pthread_cond_destroy(&st->coalesce_idle);
   pthread_mutex_destroy(&st->coalesce_mutex);
   pthread_mutex_destroy(&st->engagement.mutex);
   pthread_mutex_destroy(&st->handoff.mutex);
@@ -1603,6 +1614,12 @@ chatbot_stop(void *handle)
   soul_unschedule(bot_inst_name(st->inst));
   acquire_unregister_bot(bot_inst_name(st->inst));
   extract_unschedule(bot_inst_name(st->inst));
+
+  // The coalescer last, because it is the one that can still be
+  // *running* rather than merely scheduled: PLUGIN.md §Lifecycle
+  // Contract's join, for the only thread this driver leaves in its own
+  // mapping. Repeated by chatbot_destroy(); the second call is a no-op.
+  chatbot_coalesce_shutdown(st);
 }
 
 // Evaluate speak policy for a (possibly coalesced) message and, if it
@@ -1951,12 +1968,28 @@ chatbot_log_line(chatbot_state_t *st, const method_msg_t *msg,
 
 // ---------- paste coalescing ----------
 
-typedef struct
+struct chatbot_coalesce_flush
 {
   chatbot_state_t *st;
   uint32_t        slot_idx;
   uint32_t        seq;
-} chatbot_coalesce_flush_t;
+};
+
+// Drop one flush task out of the pending count. This is the last thing
+// a fire callback may touch on `st`: the waiter in
+// chatbot_coalesce_shutdown() cannot leave pthread_cond_wait() until
+// the unlock below has completed, and nothing frees `st` before that
+// waiter returns.
+static void
+chatbot_coalesce_retire(chatbot_state_t *st)
+{
+  pthread_mutex_lock(&st->coalesce_mutex);
+
+  if(st->coalesce_pending > 0 && --st->coalesce_pending == 0)
+    pthread_cond_broadcast(&st->coalesce_idle);
+
+  pthread_mutex_unlock(&st->coalesce_mutex);
+}
 
 // Find an existing coalesce slot for (method, sender), or an empty one.
 // Must be called with st->coalesce_mutex held. Returns slot index or -1
@@ -1988,18 +2021,17 @@ static void
 chatbot_coalesce_fire(task_t *t)
 {
   chatbot_coalesce_flush_t *fl = t->data;
-  chatbot_state_t *st;
-  chatbot_coalesce_slot_t *slot;
+  chatbot_state_t *st = fl->st;
+  chatbot_coalesce_slot_t *slot = &st->coalesce[fl->slot_idx];
   method_msg_t synth = {0};
   mem_msg_kind_t kind;
   bool slot_any_direct;
   bool fire;
+  bool dropped;
+  uint32_t lines;
+  bool truncated;
 
   t->state = TASK_ENDED;
-  if(fl == NULL) return;
-
-  st = fl->st;
-  slot = &st->coalesce[fl->slot_idx];
 
   // Take a copy of the slot under the lock, then release. We must not
   // hold coalesce_mutex across the reply-submit path (which runs through
@@ -2007,9 +2039,25 @@ chatbot_coalesce_fire(task_t *t)
   kind = MEM_MSG_WITNESS;
   slot_any_direct = false;
   fire = false;
+  dropped = false;
+  lines = 0;
+  truncated = false;
 
   pthread_mutex_lock(&st->coalesce_mutex);
-  if(slot->in_use && slot->seq == fl->seq)
+
+  // A matching seq proves the slot has not been appended to since we
+  // were scheduled, and therefore that the handles below are still
+  // ours to clear.
+  if(slot->seq == fl->seq)
+  {
+    slot->flush     = TASK_HANDLE_NONE;
+    slot->flush_arg = NULL;
+  }
+
+  if(st->coalesce_down)
+    dropped = (slot->in_use && slot->seq == fl->seq);
+
+  else if(slot->in_use && slot->seq == fl->seq)
   {
     size_t n;
 
@@ -2034,19 +2082,30 @@ chatbot_coalesce_fire(task_t *t)
     synth.timestamp = slot->first_ts;
     kind = slot->was_addressed ? MEM_MSG_EXCHANGE_IN : MEM_MSG_WITNESS;
     slot_any_direct = slot->any_direct;
-
-    if(slot->lines > 1)
-      clam(CLAM_DEBUG, "chatbot",
-          "coalesced %u lines from '%s' on '%s'%s",
-          slot->lines, slot->sender,
-          slot->channel[0] ? slot->channel : "(dm)",
-          slot->truncated ? " (truncated)" : "");
+    lines           = slot->lines;
+    truncated       = slot->truncated;
 
     // Clear the slot for reuse.
     memset(slot, 0, sizeof(*slot));
     fire = true;
   }
   pthread_mutex_unlock(&st->coalesce_mutex);
+
+  // The handle is on its way out and this block will never be spoken
+  // to — say so, because a silently swallowed paste is otherwise
+  // indistinguishable from the crash this replaced.
+  if(dropped)
+    clam(CLAM_DEBUG, "chatbot",
+        "coalesced block dropped: bot handle is stopping");
+
+  // Outside the lock on purpose: a clam() destination can route back
+  // through a bot, and no lock may be held across that fan-out.
+  if(lines > 1)
+    clam(CLAM_DEBUG, "chatbot",
+        "coalesced %u lines from '%s' on '%s'%s",
+        lines, synth.sender,
+        synth.channel[0] != '\0' ? synth.channel : "(dm)",
+        truncated ? " (truncated)" : "");
 
   if(fire)
   {
@@ -2063,6 +2122,9 @@ chatbot_coalesce_fire(task_t *t)
     chatbot_consider_speaking(st, &synth, kind, r);
   }
 
+  // Last touch of `st`. Past this line the handle may be freed by a
+  // teardown that was waiting on exactly this call.
+  chatbot_coalesce_retire(st);
   mem_free(fl);
 }
 
@@ -2080,6 +2142,9 @@ chatbot_coalesce_enqueue(chatbot_state_t *st, const method_msg_t *msg,
     uint32_t coalesce_ms)
 {
   chatbot_coalesce_flush_t *fl;
+  chatbot_coalesce_flush_t *prev_arg;
+  task_handle_t prev;
+  task_handle_t h;
   size_t llen;
   size_t room;
   char line[METHOD_TEXT_SZ + METHOD_SENDER_SZ + 8];
@@ -2093,13 +2158,29 @@ chatbot_coalesce_enqueue(chatbot_state_t *st, const method_msg_t *msg,
   is_new = false;
   seq_snapshot = 0;
 
+  // Allocated ahead of the lock so the slot's owner is published in the
+  // same critical section that bumps `seq` — teardown reads the pair as
+  // one fact.
+  fl = mem_alloc("chatbot", "coalesce_flush", sizeof(*fl));
+
   pthread_mutex_lock(&st->coalesce_mutex);
+
+  // Teardown has begun: this handle takes no new tasks. The caller
+  // falls back to per-line handling, which runs inside the delivery
+  // reference that is holding the driver up.
+  if(st->coalesce_down)
+  {
+    pthread_mutex_unlock(&st->coalesce_mutex);
+    mem_free(fl);
+    return(false);
+  }
 
   idx = chatbot_coalesce_find_slot(st, msg->inst, msg->sender, &is_new);
   if(idx < 0)
   {
     // All slots in use; fall back to per-line handling for this sender.
     pthread_mutex_unlock(&st->coalesce_mutex);
+    mem_free(fl);
     return(false);
   }
 
@@ -2156,17 +2237,112 @@ chatbot_coalesce_enqueue(chatbot_state_t *st, const method_msg_t *msg,
   s->seq++;
   seq_snapshot = s->seq;
 
+  // This append supersedes whatever was scheduled against the slot, so
+  // take ownership of the predecessor and hand the slot to `fl`. The
+  // handle is armed after the submit below; until then the slot names
+  // the closure but has nothing to cancel, which is the honest state.
+  prev         = s->flush;
+  prev_arg     = s->flush_arg;
+  s->flush     = TASK_HANDLE_NONE;
+  s->flush_arg = fl;
+
+  fl->st       = st;
+  fl->slot_idx = (uint32_t)idx;
+  fl->seq      = seq_snapshot;
+  st->coalesce_pending++;
+
   pthread_mutex_unlock(&st->coalesce_mutex);
 
-  fl = mem_alloc("chatbot", "coalesce_flush", sizeof(*fl));
-  fl->st = st;
-  fl->slot_idx = (uint32_t)idx;
-  fl->seq = seq_snapshot;
+  // Cancelled before it ran means its closure and its share of the
+  // pending count never reached the callback, so both are ours to drop
+  // (include/task.h — that is exactly what the return value answers).
+  if(task_cancel(prev))
+  {
+    mem_free(prev_arg);
+    chatbot_coalesce_retire(st);
+  }
 
-  task_add_deferred("chatbot_coalesce", TASK_ANY, 100,
+  h = task_add_deferred("chatbot_coalesce", TASK_ANY, 100,
       coalesce_ms, chatbot_coalesce_fire, fl);
 
+  // Arm the handle if the slot is still ours. It may not be: the task
+  // can have fired already, or a second line from the same sender can
+  // have landed in the window above. Either way the loser stays
+  // uncancellable and simply retires itself on its stale `seq` — which
+  // costs teardown a wait, never a use-after-free.
+  pthread_mutex_lock(&st->coalesce_mutex);
+
+  // `flush_arg` non-NULL under an unchanged `seq` can only be `fl`:
+  // nothing else writes the field, and every writer bumps `seq` in the
+  // same critical section. Testing it rather than `fl` keeps a freed
+  // pointer out of the comparison.
+  if(s->seq == seq_snapshot && s->flush_arg != NULL)
+    s->flush = h;
+
+  pthread_mutex_unlock(&st->coalesce_mutex);
+
   return(true);
+}
+
+// Put the coalescer down for good: refuse new flushes, cancel the ones
+// still in the timer queue, and wait out the one that is already
+// running. Idempotent, because a handle reaches teardown by two routes
+// — bot_suspend_driver()'s stop()+destroy() and bot_destroy()'s bare
+// destroy() — and the invariant it establishes (no task holds `st`) is
+// the one chatbot_destroy() needs before it frees anything.
+//
+// SAN-21 lived in the gap this closes. `st` is destroyed at *suspend*
+// time, so plugin_quiesce — which only runs at unload — never sees the
+// window; and a generation counter cannot cover it either, because the
+// object the racing task dereferences is the mutex itself.
+static void
+chatbot_coalesce_shutdown(chatbot_state_t *st)
+{
+  task_handle_t             dead[CHATBOT_COALESCE_SLOTS];
+  chatbot_coalesce_flush_t *dead_arg[CHATBOT_COALESCE_SLOTS];
+  uint32_t                  n = 0;
+
+  pthread_mutex_lock(&st->coalesce_mutex);
+
+  st->coalesce_down = true;
+
+  for(uint32_t i = 0; i < CHATBOT_COALESCE_SLOTS; i++)
+  {
+    chatbot_coalesce_slot_t *s = &st->coalesce[i];
+
+    if(s->flush == TASK_HANDLE_NONE)
+      continue;
+
+    dead[n]     = s->flush;
+    dead_arg[n] = s->flush_arg;
+    n++;
+
+    s->flush     = TASK_HANDLE_NONE;
+    s->flush_arg = NULL;
+  }
+
+  pthread_mutex_unlock(&st->coalesce_mutex);
+
+  // Cancelled outside the lock: task_cancel() logs, and a clam()
+  // destination can route back through a bot.
+  for(uint32_t i = 0; i < n; i++)
+  {
+    if(!task_cancel(dead[i]))
+      continue;
+
+    mem_free(dead_arg[i]);
+    chatbot_coalesce_retire(st);
+  }
+
+  // Whatever is left is inside the callback right now. It cannot block
+  // on the reload's own locks — the flush path takes neither
+  // plugin_mutate_mutex nor bot_life_mutex — so this wait terminates.
+  pthread_mutex_lock(&st->coalesce_mutex);
+
+  while(st->coalesce_pending > 0)
+    pthread_cond_wait(&st->coalesce_idle, &st->coalesce_mutex);
+
+  pthread_mutex_unlock(&st->coalesce_mutex);
 }
 
 // ---------- reactive acquisition scan ----------

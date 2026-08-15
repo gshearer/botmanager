@@ -178,6 +178,11 @@ typedef struct
 #define CHATBOT_COALESCE_TEXT_SZ  (8 * 1024)
 #define CHATBOT_COALESCE_MAX_LINES 64
 
+// The flush task's closure (defined in chatbot.c). A slot keeps the
+// live one so chatbot_coalesce_shutdown() can cancel the task and
+// reclaim the closure the task would otherwise have freed itself.
+typedef struct chatbot_coalesce_flush chatbot_coalesce_flush_t;
+
 typedef struct
 {
   bool            in_use;
@@ -209,6 +214,16 @@ typedef struct
   uint32_t        lines;
   uint32_t        seq;             // bumped on each append; flush task checks for staleness
   time_t          first_ts;
+
+  // The one flush task this slot currently owns, and the closure it
+  // will free when it runs. Written under coalesce_mutex; both are the
+  // slot's answer to "who is scheduled against me right now", which is
+  // what lets teardown cancel it instead of racing it. An append
+  // supersedes its predecessor, so at most one task per slot is ever
+  // cancellable; a task that lost that race is stale, no-ops on `seq`
+  // and retires itself.
+  task_handle_t   flush;
+  chatbot_coalesce_flush_t *flush_arg;
 } chatbot_coalesce_slot_t;
 
 // CV-7 Part B — per-(method, target) anti-repeat ring for the CV-4
@@ -431,7 +446,19 @@ typedef struct
   chatbot_cooldown_slot_t cooldowns[CHATBOT_COOLDOWN_SLOTS];
   uint32_t               cooldown_next;  // LRU write cursor
 
+  // SAN-21: the coalescer is the one path that hands work to a task
+  // against this handle, so it is the one path core's delivery refcount
+  // cannot cover — the handle is destroyed at *suspend* time, long
+  // before plugin_unload polls quiesce. `pending` counts flush tasks
+  // scheduled and not yet retired; `down` refuses new ones and tells a
+  // fire already past the gate to drop its block on the floor.
+  // chatbot_coalesce_shutdown() waits on `idle` for the count to reach
+  // zero, which is the join PLUGIN.md §Lifecycle Contract asks stop()
+  // for.
   pthread_mutex_t        coalesce_mutex;
+  pthread_cond_t         coalesce_idle;
+  uint32_t               coalesce_pending;
+  bool                   coalesce_down;
   chatbot_coalesce_slot_t coalesce[CHATBOT_COALESCE_SLOTS];
 
   // CV-7 Part B — CV-4 direct-address SKIP fallback anti-repeat ring.
