@@ -175,7 +175,13 @@ typedef struct
   // reconnect; cleared by the task itself when it fires, and
   // cancelled by irc_disconnect so the task doesn't fire after the
   // method has been stopped.
+  //
+  // `reconnect_arming` reserves that slot while irc_arm_reconnect() is
+  // submitting with sess_lock released — task_add_deferred() logs, and
+  // clam() reaches back into sess_lock through a bot:irc: destination.
+  // Anyone who clears it is refusing the backoff being submitted.
   task_handle_t     reconnect_task;
+  bool              reconnect_arming;
 
   // Channel member tracking. Also backs get_context(): a member's
   // `userhost` is the authoritative nick -> user@host mapping, so

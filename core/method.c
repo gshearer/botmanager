@@ -118,6 +118,7 @@ method_unregister(const char *name)
   method_inst_t *inst = NULL;
   method_inst_t *prev = NULL;
   method_sub_t  *s;
+  void          *handle;
 
   if(name == NULL || name[0] == '\0')
     return(FAIL);
@@ -153,9 +154,19 @@ method_unregister(const char *name)
   inst->subs = NULL;
   inst->sub_count = 0;
 
-  // Call driver destroy().
-  if(inst->driver->destroy != NULL && inst->handle != NULL)
-    inst->driver->destroy(inst->handle);
+  // Retire the instance *before* the driver state it points at, because
+  // something will still try to send through it while destroy() runs:
+  // a driver logs on its way down, and a clam destination routed to a
+  // bot resolves through bot_resolve_method() — which still hands back
+  // this instance, since the binding is only cleared once we return.
+  // Not AVAILABLE and holding no handle is what turns that delivery
+  // into a refusal instead of a read of freed memory.
+  handle       = inst->handle;
+  inst->handle = NULL;
+  inst->state  = METHOD_ENABLED;
+
+  if(inst->driver->destroy != NULL && handle != NULL)
+    inst->driver->destroy(handle);
 
   // Unlink from list.
   if(prev != NULL)

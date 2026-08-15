@@ -28,11 +28,15 @@ irc_state_release(irc_state_t *st)
   if(__atomic_sub_fetch(&st->refs, 1, __ATOMIC_ACQ_REL) != 0)
     return;
 
+  // Say so before the teardown, not after. clam() fans out to its
+  // destinations on this thread, and one of them can be a bot bound to
+  // this very driver — a delivery that reaches irc_session_ref() and
+  // takes a mutex the two lines below have already destroyed.
+  clam(CLAM_DEBUG, "irc", "[%s] state released", st->inst_name);
+
   irc_chan_clear_all(st);
   pthread_mutex_destroy(&st->chan_mutex);
   pthread_mutex_destroy(&st->sess_lock);
-
-  clam(CLAM_DEBUG, "irc", "[%s] state released", st->inst_name);
   mem_free(st);
 }
 
@@ -77,22 +81,44 @@ irc_session_take(irc_state_t *st)
 
 // Create the session if there is none, and return it referenced. NULL
 // means the driver is dead or the socket service refused.
+//
+// sock_create() logs, and clam() holds clam_mutex across a fan-out that
+// a bot:irc: destination carries back into irc_send() -> irc_session_ref()
+// -> sess_lock. Building the session under sess_lock therefore closes a
+// lock-order cycle, so it is built with the lock released and installed
+// afterwards; a loser of that race destroys the session it just made.
 static sock_session_t *
 irc_session_open(irc_state_t *st)
 {
   sock_session_t *s;
+  sock_session_t *fresh;
+
+  pthread_mutex_lock(&st->sess_lock);
+  s = st->session;
+
+  if(s != NULL)
+    sock_hold(s);
+
+  pthread_mutex_unlock(&st->sess_lock);
+
+  if(s != NULL || st->dead)
+    return(s);
+
+  fresh = sock_create(st->inst_name, SOCK_TCP, irc_sock_cb, st);
+
+  if(fresh == NULL)
+    return(NULL);
 
   pthread_mutex_lock(&st->sess_lock);
 
   if(st->session == NULL && !st->dead)
   {
-    st->session = sock_create(st->inst_name, SOCK_TCP, irc_sock_cb, st);
-
-    if(st->session != NULL)
-    {
-      irc_state_hold(st);
-      sock_set_done(st->session, irc_sock_done);
-    }
+    // The reference this takes is the session's, given back by
+    // irc_sock_done() once no socket callback can reach us again.
+    irc_state_hold(st);
+    sock_set_done(fresh, irc_sock_done);
+    st->session = fresh;
+    fresh       = NULL;
   }
 
   s = st->session;
@@ -102,29 +128,63 @@ irc_session_open(irc_state_t *st)
 
   pthread_mutex_unlock(&st->sess_lock);
 
+  if(fresh != NULL)
+    sock_destroy(fresh);
+
   return(s);
 }
 
 // Arm the reconnect backoff. The task carries a reference for the whole
 // of its wait, because nothing on the teardown path can wait for it.
+//
+// task_add_deferred() logs, so it runs with sess_lock released for the
+// reason irc_session_open() does. `reconnect_arming` reserves the slot
+// across that window; whoever clears it — a cancel, or the task itself
+// firing early — is telling us the handle is no longer wanted.
 static void
 irc_arm_reconnect(irc_state_t *st)
 {
-  char tname[METHOD_NAME_SZ + 16];
+  char          tname[METHOD_NAME_SZ + 16];
+  task_handle_t h;
+  uint32_t      delay;
+  bool          wanted;
 
   snprintf(tname, sizeof(tname), "irc_recon_%s", st->inst_name);
 
   pthread_mutex_lock(&st->sess_lock);
 
   // One backoff at a time, and none at all once the driver is dead.
-  if(!st->dead && st->reconnect_task == TASK_HANDLE_NONE)
+  if(st->dead || st->reconnect_arming || st->reconnect_task != TASK_HANDLE_NONE)
   {
-    irc_state_hold(st);
-    st->reconnect_task = task_add_deferred(tname, TASK_THREAD, 100,
-        st->reconnect_delay * 1000, irc_reconnect_task, st);
+    pthread_mutex_unlock(&st->sess_lock);
+    return;
   }
 
+  st->reconnect_arming = true;
+  delay                = st->reconnect_delay;
+  irc_state_hold(st);
   pthread_mutex_unlock(&st->sess_lock);
+
+  h = task_add_deferred(tname, TASK_THREAD, 100, delay * 1000,
+      irc_reconnect_task, st);
+
+  pthread_mutex_lock(&st->sess_lock);
+  wanted = st->reconnect_arming;
+  st->reconnect_arming = false;
+
+  if(wanted)
+    st->reconnect_task = h;
+
+  pthread_mutex_unlock(&st->sess_lock);
+
+  // Nothing was scheduled, so the reference is ours to give back; and a
+  // task nobody wants any more is ours to unwind, on task_cancel()'s
+  // usual terms.
+  if(h == TASK_HANDLE_NONE)
+    irc_state_release(st);
+
+  else if(!wanted && task_cancel(h))
+    irc_state_release(st);
 }
 
 // Retire the driver: no new session, no new backoff, and every socket
@@ -141,7 +201,8 @@ irc_mark_dead(irc_state_t *st)
 
 // Cancel an armed backoff. task_cancel() reports whether it dequeued the
 // task before it ever ran — the only case in which its reference is
-// ours to drop.
+// ours to drop. Clearing `reconnect_arming` hands a backoff still being
+// submitted the same job, since its handle is not ours to see yet.
 static void
 irc_cancel_reconnect(irc_state_t *st)
 {
@@ -149,7 +210,8 @@ irc_cancel_reconnect(irc_state_t *st)
 
   pthread_mutex_lock(&st->sess_lock);
   h = st->reconnect_task;
-  st->reconnect_task = TASK_HANDLE_NONE;
+  st->reconnect_task   = TASK_HANDLE_NONE;
+  st->reconnect_arming = false;
   pthread_mutex_unlock(&st->sess_lock);
 
   if(task_cancel(h))
@@ -1670,8 +1732,12 @@ irc_reconnect_task(task_t *t)
   // Clear the pending-task handle so irc_disconnect does not try to
   // cancel a task that is already firing — and so the next backoff can
   // arm, since irc_arm_reconnect refuses while one is outstanding.
+  // Clearing `reconnect_arming` too covers firing before the arming
+  // thread has stored our handle: it would otherwise store a handle
+  // that has already run, and nothing would ever arm again.
   pthread_mutex_lock(&st->sess_lock);
-  st->reconnect_task = TASK_HANDLE_NONE;
+  st->reconnect_task   = TASK_HANDLE_NONE;
+  st->reconnect_arming = false;
   pthread_mutex_unlock(&st->sess_lock);
 
   // Another path (explicit stop, destroy, shutdown) may have disabled
