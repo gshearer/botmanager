@@ -25,7 +25,8 @@ static time_t          atk_dot_idle_since = 0;
 // ------------------------------------------------------------------ //
 
 // The room this row names, or NULL when the method has been removed out
-// from under the round. One dead room never aborts the batch.
+// from under the round. One dead room never aborts the batch. Returns a
+// held reference — release it with method_release().
 static method_inst_t *
 atk_dot_room(const atk_dot_due_t *d)
 {
@@ -62,7 +63,10 @@ atk_dot_speak(const atk_dot_due_t *d, const atk_tunables_t *t,
   method_send(inst, d->channel, line);
 
   if(!fatal)
+  {
+    method_release(inst);
     return;
+  }
 
   if(t->eject_on_death)
   {
@@ -83,6 +87,8 @@ atk_dot_speak(const atk_dot_due_t *d, const atk_tunables_t *t,
       d->source, d->victim,
       (d->noun[0] != '\0') ? d->noun : atk_fallback_noun(d->kind),
       (int)force);
+
+  method_release(inst);
 }
 
 // The lock is the turn lock, not a lock of this file's own: a tick

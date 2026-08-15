@@ -529,6 +529,10 @@ volunteer_cascade(chatbot_state_t *st, volunteer_job_t *job,
   memset(&cc, 0, sizeof(cc));
   method_list_joined_channels(method, volunteer_collect_joined_cb, &cc);
 
+  // The roster is copied out; nothing below this line touches the
+  // instance again.
+  method_release(method);
+
   if(cc.n_channels == 0)
   {
     clam(CLAM_DEBUG, "chatbot",
@@ -664,6 +668,7 @@ volunteer_submit(chatbot_state_t *st, const volunteer_job_t *job,
   {
     clam(CLAM_DEBUG, "chatbot",
         "volunteer skip bot=%s chan=%s reason=muted", job->bot_name, chan);
+    method_release(method);
     return;
   }
 
@@ -738,6 +743,7 @@ volunteer_submit(chatbot_state_t *st, const volunteer_job_t *job,
   // it keeps the bridge — a volunteered line may legitimately reach for
   // a command.
   chatbot_reply_submit(st, &msg, false, false, false);
+  method_release(method);
 }
 
 // Task callback — consumes a volunteer_job_t that was queued from the

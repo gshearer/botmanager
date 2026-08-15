@@ -50,10 +50,52 @@ sub_put(method_sub_t *s)
   method_sub_free_count++;
 }
 
+// Instance lifetime
+//
+// See `include/method.h` for the contract: every handout is a reference
+// and the last one out frees. Nothing here ever waits for a holder —
+// method_unregister() runs from bot_stop() and the delivery it would be
+// waiting for takes method_mutex on its way through.
+
+static void
+inst_free(method_inst_t *inst)
+{
+  clam(CLAM_DEBUG, "method_release", "'%s': instance freed", inst->name);
+  mem_free(inst);
+}
+
+void
+method_hold(method_inst_t *inst)
+{
+  if(inst == NULL)
+    return;
+
+  pthread_mutex_lock(&method_mutex);
+  inst->refs++;
+  pthread_mutex_unlock(&method_mutex);
+}
+
+void
+method_release(method_inst_t *inst)
+{
+  bool last;
+
+  if(inst == NULL)
+    return;
+
+  pthread_mutex_lock(&method_mutex);
+  last = (--inst->refs == 0);
+  pthread_mutex_unlock(&method_mutex);
+
+  if(last)
+    inst_free(inst);
+}
+
 // Instance management
 
 // Register a new method instance.
 // drv: driver interface (must not be NULL)
+// Returns a new reference — see method_release().
 method_inst_t *
 method_register(const method_driver_t *drv, const char *name)
 {
@@ -84,6 +126,10 @@ method_register(const method_driver_t *drv, const char *name)
   strlcpy(inst->name, name, METHOD_NAME_SZ);
   inst->driver = drv;
   inst->state = METHOD_ENABLED;
+
+  // One reference for the registry, one for the caller. The failure
+  // path below frees directly: nothing has seen the instance yet.
+  inst->refs = 2;
 
   // Call driver create() if provided.
   if(drv->create != NULL)
@@ -119,6 +165,7 @@ method_unregister(const char *name)
   method_inst_t *prev = NULL;
   method_sub_t  *s;
   void          *handle;
+  bool           was_up;
 
   if(name == NULL || name[0] == '\0')
     return(FAIL);
@@ -135,11 +182,6 @@ method_unregister(const char *name)
     clam(CLAM_WARN, "method_unregister", "not found: '%s'", name);
     return(FAIL);
   }
-
-  // Disconnect if running or available.
-  if((inst->state == METHOD_RUNNING || inst->state == METHOD_AVAILABLE)
-      && inst->driver->disconnect != NULL)
-    inst->driver->disconnect(inst->handle);
 
   // Remove all subscribers.
   s = inst->subs;
@@ -161,14 +203,16 @@ method_unregister(const char *name)
   // this instance, since the binding is only cleared once we return.
   // Not AVAILABLE and holding no handle is what turns that delivery
   // into a refusal instead of a read of freed memory.
+  was_up       = (inst->state == METHOD_RUNNING
+      || inst->state == METHOD_AVAILABLE);
   handle       = inst->handle;
   inst->handle = NULL;
   inst->state  = METHOD_ENABLED;
 
-  if(inst->driver->destroy != NULL && handle != NULL)
-    inst->driver->destroy(handle);
-
-  // Unlink from list.
+  // Unlink before the driver teardown, so a lookup racing it answers
+  // "gone" rather than handing out an instance whose driver state is
+  // being freed. We still hold the registry's reference, so `inst`
+  // itself stays put until the release at the bottom.
   if(prev != NULL)
     prev->next = inst->next;
   else
@@ -178,8 +222,23 @@ method_unregister(const char *name)
 
   pthread_mutex_unlock(&method_mutex);
 
+  // Both driver calls run with method_mutex RELEASED. They are foreign
+  // calls: they log, they take their own locks, and a driver that kept
+  // the pointer it was registered with gives that reference back here —
+  // method_release() takes method_mutex, so under the lock this is a
+  // self-deadlock rather than a teardown.
+  if(was_up && inst->driver->disconnect != NULL)
+    inst->driver->disconnect(handle);
+
+  if(inst->driver->destroy != NULL && handle != NULL)
+    inst->driver->destroy(handle);
+
   clam(CLAM_INFO, "method_unregister", "unregistered '%s'", name);
-  mem_free(inst);
+
+  // The registry's own reference, given back. A delivery that resolved
+  // this instance a moment ago is still reading it on another thread;
+  // it holds too, and whichever of us leaves last does the freeing.
+  method_release(inst);
   return(SUCCESS);
 }
 
@@ -195,6 +254,10 @@ method_find(const char *name)
   {
     if(strncasecmp(m->name, name, METHOD_NAME_SZ) == 0)
     {
+      // Taken under the lock that publishes the list, which is what
+      // makes it a reference and not a guess: an instance still linked
+      // here has not yet reached method_unregister's release.
+      m->refs++;
       pthread_mutex_unlock(&method_mutex);
       return(m);
     }
@@ -515,6 +578,12 @@ method_deliver(method_inst_t *inst, method_msg_t *msg)
   // clam_mutex across its own dispatch loop, wedges every other thread
   // that logs). The cap is enforced in method_subscribe, so the list
   // never outruns the snapshot array.
+  //
+  // The same lock buys the instance's lifetime for the fan-out. A
+  // subscriber reads msg->inst for the length of a whole bot turn, and
+  // a reload can unregister underneath it: bot_suspend_method ->
+  // bot_stop -> method_unregister used to free the instance while
+  // chatbot_log_line was still reading its kind.
   pthread_mutex_lock(&method_mutex);
 
   for(method_sub_t *s = inst->subs; s != NULL && n < METHOD_MAX_SUBS;
@@ -527,11 +596,14 @@ method_deliver(method_inst_t *inst, method_msg_t *msg)
   }
 
   inst->msg_in++;
+  inst->refs++;
 
   pthread_mutex_unlock(&method_mutex);
 
   for(i = 0; i < n; i++)
     cbs[i](msg, datas[i]);
+
+  method_release(inst);
 }
 
 // Connection management

@@ -162,7 +162,10 @@ typedef struct
   char           botname  [BOT_NAME_SZ];
   char           kv_prefix[REACHY_KV_PREFIX_SZ];  // "bot.<bot>.reachy."
 
-  method_inst_t *inst;      // resolved in connect(); NULL before it
+  // Resolved in connect(); NULL before it. A held reference — core's
+  // instance is reference counted too, and this one keeps it readable
+  // for a worker still in here after core has unregistered it.
+  method_inst_t *inst;
 
   uint32_t       refs;      // atomic
   bool           shutdown;  // atomic

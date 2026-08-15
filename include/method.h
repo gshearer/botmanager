@@ -224,13 +224,37 @@ typedef struct
   uint64_t total_msg_out; // sum of all instances' msg_out
 } method_stats_t;
 
+// Reference counting. Every function that hands back a method_inst_t *
+// hands back a reference along with it — method_register(),
+// method_find(), and bot.h's bot_first_method() / bot_resolve_method()
+// — and the caller owes each one a method_release().
+//
+// The instance outlives method_unregister() for exactly as long as
+// somebody still holds it. It cannot simply wait for them: a delivery
+// runs the whole bot turn (method_deliver -> bot_msg_handler -> the
+// chat plugin, seconds of it), and method_unregister runs from
+// bot_stop with method_mutex to take. So the registry hands its own
+// reference back at unregister, the instance is refused from that
+// moment on (no handle, not AVAILABLE), and the last holder to leave
+// frees it.
+//
+// method_hold() is a SECOND reference, never the first: the caller must
+// already hold one, or otherwise guarantee the instance is live.
+void method_hold(method_inst_t *inst);
+void method_release(method_inst_t *inst);
+
+// Returns a NEW reference; release it with method_release().
 method_inst_t *method_register(const method_driver_t *drv, const char *name);
 
 // Disconnects if running/available, invokes driver destroy(), removes
-// all subscribers.
+// all subscribers. Gives back the registry's own reference — a holder
+// keeps the instance alive past this call.
 bool method_unregister(const char *name);
 
+// Returns a NEW reference, or NULL if no instance of that name is
+// registered. Release it with method_release().
 method_inst_t *method_find(const char *name);
+
 const char *method_inst_name(const method_inst_t *inst);
 
 // Driver kind of an instance (e.g., "irc", "botmanctl").
@@ -280,7 +304,11 @@ bool method_subscribe(method_inst_t *inst, const char *name,
 bool method_unsubscribe(method_inst_t *inst, const char *name);
 
 // Called by method plugins when a message arrives from the platform.
-// msg->inst is set automatically.
+// msg->inst is set automatically, and holds a reference for the length
+// of the fan-out — a subscriber may read it long after the driver that
+// delivered it was told to go away. A subscriber that keeps msg->inst
+// past its own callback (an async command copies the whole message)
+// must take its own method_hold().
 void method_deliver(method_inst_t *inst, method_msg_t *msg);
 
 // Routes through the driver's connect() callback. Typically called by
@@ -370,12 +398,20 @@ typedef struct method_sub
 
 // Method instance: registered by a method plugin, holds driver state
 // and subscriber chain.
+//
+// `refs` counts the registry plus every outstanding holder — a bot's
+// binding, a driver's own back-pointer, an in-flight delivery, an async
+// command's copied message. It is guarded by method_mutex, never
+// atomic on its own: the count and the list membership that publishes
+// it change together. method_unregister() unlinks the instance and
+// hands back the registry's reference; whoever leaves last frees.
 struct method_inst
 {
   char                    name[METHOD_NAME_SZ];
   const method_driver_t  *driver;
   void                   *handle;    // driver-specific state
   method_state_t          state;
+  uint32_t                refs;
   method_sub_t           *subs;      // subscriber list
   uint32_t                sub_count;
   uint64_t                msg_in;    // total messages delivered

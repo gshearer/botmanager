@@ -12,9 +12,14 @@ static void irc_sock_cb(const sock_event_t *event, void *user_data);
 // Three holders can outlive irc_destroy(): the socket session (a
 // callback may be running on the epoll worker right now), an armed
 // reconnect task, and the method instance itself. irc_destroy() is
-// called with bot_mutex and method_mutex held and the callback it would
-// wait for needs both — so it hands back its own reference and leaves.
-// Whoever is last out does the freeing.
+// called from a teardown the callback it would wait for can be blocked
+// behind — so it hands back its own reference and leaves. Whoever is
+// last out does the freeing.
+//
+// `st->inst` is the same bargain seen from the other side: core's
+// method instance is reference counted too, and the reference taken in
+// irc_connect() is what keeps it readable for a callback still running
+// here after core has unregistered it.
 
 static void
 irc_state_hold(irc_state_t *st)
@@ -33,6 +38,12 @@ irc_state_release(irc_state_t *st)
   // this very driver — a delivery that reaches irc_session_ref() and
   // takes a mutex the two lines below have already destroyed.
   clam(CLAM_DEBUG, "irc", "[%s] state released", st->inst_name);
+
+  // The method instance reference irc_connect() took. Held for as long
+  // as st->inst is readable — an epoll worker still inside this driver
+  // is exactly who core's unregister cannot wait for.
+  method_release(st->inst);
+  st->inst = NULL;
 
   irc_chan_clear_all(st);
   pthread_mutex_destroy(&st->chan_mutex);
@@ -687,18 +698,12 @@ irc_kick_unident_task(task_t *t)
   inst = method_find(kc->inst_name);
 
   if(inst == NULL)
-  {
-    mem_free(kc);
-    return;
-  }
+    goto done;
 
   st = method_get_handle(inst);
 
   if(st == NULL || !st->connected)
-  {
-    mem_free(kc);
-    return;
-  }
+    goto done;
 
   // Check bot still has ops on the channel.
   pthread_mutex_lock(&st->chan_mutex);
@@ -712,10 +717,7 @@ irc_kick_unident_task(task_t *t)
   pthread_mutex_unlock(&st->chan_mutex);
 
   if(!have_ops || !still_here)
-  {
-    mem_free(kc);
-    return;
-  }
+    goto done;
 
   // Check if user is now identified.
   irc_botname_from_inst(kc->inst_name, botname, sizeof(botname));
@@ -723,10 +725,7 @@ irc_kick_unident_task(task_t *t)
   bot = bot_find(botname);
 
   if(bot == NULL)
-  {
-    mem_free(kc);
-    return;
-  }
+    goto done;
 
   // Resolve via the method context map (real nick!user@host — the
   // stateless resolver needs exact metadata, not a glob).
@@ -734,8 +733,7 @@ irc_kick_unident_task(task_t *t)
       ubuf, sizeof(ubuf)))
   {
     // User identified in time.
-    mem_free(kc);
-    return;
+    goto done;
   }
 
   // Still unidentified — kick.
@@ -753,6 +751,9 @@ irc_kick_unident_task(task_t *t)
   clam(CLAM_INFO, "irc", "%s: kicked unidentified user %s",
       kc->channel, kc->nick);
 
+done:
+
+  method_release(inst);
   mem_free(kc);
 }
 
@@ -1562,7 +1563,8 @@ irc_process_buffer(irc_state_t *st)
 
   // A single read can carry many lines, and handling one can take long
   // enough for the bot to be destroyed underneath us — every handler
-  // reaches st->inst, which core frees the moment irc_destroy() returns.
+  // reaches st->inst, which core has retired by then even though our
+  // reference keeps it readable.
   while(!st->dead && (end = strstr(start, "\r\n")) != NULL)
   {
     *end = '\0';
@@ -1596,9 +1598,10 @@ irc_sock_cb(const sock_event_t *event, void *user_data)
 {
   irc_state_t *st = user_data;
 
-  // The reference the session holds keeps `st` alive, but st->inst is
-  // core's: method_unregister() frees it the moment irc_destroy()
-  // returns. A dead driver therefore reports nothing and parses
+  // The reference the session holds keeps `st` alive and the one
+  // irc_connect() took keeps `st->inst` readable, but a retired
+  // instance holds no driver handle and answers every send with a
+  // refusal. A dead driver therefore reports nothing and parses
   // nothing — there is no state left worth updating.
   if(st->dead)
     return;
@@ -1787,10 +1790,11 @@ irc_create(const char *inst_name)
   return(st);
 }
 
-// Give up the method instance's claim on the driver state. Runs with
-// bot_mutex and method_mutex held — see the lifetime note on
-// irc_state_t — so it hands back every reference this side owns and
-// returns immediately. Anything still in flight frees the state itself.
+// Give up the method instance's claim on the driver state. Runs from a
+// teardown the callback it would wait for can be blocked behind — see
+// the lifetime note on irc_state_t — so it hands back every reference
+// this side owns and returns immediately. Anything still in flight
+// frees the state itself.
 static void
 irc_destroy(void *handle)
 {
@@ -1827,8 +1831,8 @@ irc_disconnect(void *handle)
   // from running irc_sock_cb on THIS thread while the epoll worker is
   // running it on its own (measured, TSan 2026-08-15: two concurrent
   // DISCONNECT deliveries writing st->registered/connected/buf_len).
-  // It also retires st->inst well before method_unregister frees it,
-  // rather than in the instant after destroy() returns.
+  // It also stops this side reaching st->inst well before the last
+  // reference to it goes, rather than in the instant after destroy().
   irc_mark_dead(st);
 
   // Cancel any pending deferred reconnect so the scheduler drops it
@@ -2206,8 +2210,11 @@ irc_connect(void *handle)
 {
   irc_state_t *st = handle;
 
-  // Resolve the back-pointer to the method instance.
-  st->inst = method_find(st->inst_name);
+  // Resolve the back-pointer to the method instance. It is a held
+  // reference, given back in irc_state_release(); a re-entered
+  // connect() must not take a second one.
+  if(st->inst == NULL)
+    st->inst = method_find(st->inst_name);
 
   if(st->inst == NULL)
   {

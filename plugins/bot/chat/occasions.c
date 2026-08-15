@@ -128,7 +128,7 @@ chatbot_occasions_run(const char *bot_name, uint32_t ns_id, bot_inst_t *bot)
 {
   db_result_t   *res;
   method_inst_t *method;
-  const char    *method_name;
+  char           method_name[METHOD_NAME_SZ];
   struct tm      today;
   time_t         now  = time(NULL);
   uint32_t       rows;
@@ -147,10 +147,19 @@ chatbot_occasions_run(const char *bot_name, uint32_t ns_id, bot_inst_t *bot)
   // delivered, which is a sighting that may be days away. Skipping the
   // scan overnight would only mean a wish written later on the same
   // day, and would risk losing one entirely to the two-day window.
+  // The name is copied out and the reference given straight back: the
+  // scan below is a database round trip, and the row it writes names
+  // the method rather than pointing at it.
   method = bot_first_method(bot);
-  method_name = method != NULL ? method_inst_name(method) : NULL;
+  method_name[0] = '\0';
 
-  if(method_name == NULL || method_name[0] == '\0')
+  if(method != NULL)
+  {
+    strlcpy(method_name, method_inst_name(method), sizeof(method_name));
+    method_release(method);
+  }
+
+  if(method_name[0] == '\0')
   {
     clam(CLAM_DEBUG, OCCASIONS_CTX,
         "bot=%s occasions idle (no method bound to deliver on)", bot_name);

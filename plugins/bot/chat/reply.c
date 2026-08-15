@@ -418,10 +418,15 @@ fact_kind_name(mem_fact_kind_t k)
   return("fact");
 }
 
+// The instance reference r->method carries is given back here — the
+// reply streams from a curl worker long after the turn that started it,
+// and a `plugin reload irc` in between unregisters the instance the
+// stream is still writing to.
 static void
 req_free(chatbot_req_t *r)
 {
   if(r == NULL) return;
+  method_release(r->method);
   if(r->personality_body) mem_free(r->personality_body);
   if(r->contract_body)    mem_free(r->contract_body);
   if(r->system_prompt)    mem_free(r->system_prompt);
@@ -2862,6 +2867,7 @@ chatbot_reply_submit(chatbot_state_t *st, const method_msg_t *msg,
 
   r->st                = st;
   r->method            = msg->inst;
+  method_hold(r->method);
   r->was_addressed     = was_addressed;
   r->is_direct_address = is_direct_address;
   r->is_action_at_bot  = msg->is_action && was_addressed;
@@ -3186,6 +3192,7 @@ chatbot_reply_submit_vision(chatbot_state_t *st, const method_msg_t *msg,
 
   r->st                = st;
   r->method            = msg->inst;
+  method_hold(r->method);
   r->was_addressed     = true;   // vision path is always "for the bot"
   r->is_direct_address = true;
   r->is_action_at_bot  = msg->is_action;

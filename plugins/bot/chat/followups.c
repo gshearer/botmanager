@@ -252,7 +252,7 @@ chatbot_followups_run(const char *bot_name, uint32_t ns_id, bot_inst_t *bot)
 {
   db_result_t   *res;
   method_inst_t *method;
-  const char    *method_name;
+  char           method_name[METHOD_NAME_SZ];
   time_t         now  = time(NULL);
   uint32_t       rows;
   uint32_t       sent = 0;
@@ -268,10 +268,19 @@ chatbot_followups_run(const char *bot_name, uint32_t ns_id, bot_inst_t *bot)
   // Quiet hours are not asked about here, for occasions.c's reason:
   // writing a row is not speech. The cue it becomes is gated at the
   // moment it is delivered, which is a sighting that may be days away.
+  // The name is copied out and the reference given straight back: the
+  // scan below is a database round trip, and the row it writes names
+  // the method rather than pointing at it.
   method = bot_first_method(bot);
-  method_name = method != NULL ? method_inst_name(method) : NULL;
+  method_name[0] = '\0';
 
-  if(method_name == NULL || method_name[0] == '\0')
+  if(method != NULL)
+  {
+    strlcpy(method_name, method_inst_name(method), sizeof(method_name));
+    method_release(method);
+  }
+
+  if(method_name[0] == '\0')
   {
     clam(CLAM_DEBUG, FOLLOWUPS_CTX,
         "bot=%s followups idle (no method bound to deliver on)", bot_name);

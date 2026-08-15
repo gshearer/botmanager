@@ -103,6 +103,7 @@ regex (the literal context portion, before any `<placeholder>`).
 | `method_exit` | core/method.c | method subsystem teardown |
 | `method_init` | core/method.c | method subsystem init |
 | `method_register` | core/method.c | method driver registration |
+| `method_release` | core/method.c | last reference gone, instance freed |
 | `method_send` | core/method.c | method send (text) |
 | `method_send_emote` | core/method.c | method send (emote) |
 | `method_set_state` | core/method.c | method state transition |

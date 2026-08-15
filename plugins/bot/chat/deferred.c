@@ -347,7 +347,8 @@ chatbot_deferred_insert(uint32_t ns_id, int64_t dossier,
 // whole (the dcfc359 coalescer lesson: a synthetic cue missing any of
 // it resolves to no dossier and the reply loses the asker's memory),
 // and the method is re-resolved by NAME so nothing dangles across a
-// reload.
+// reload — msg->inst comes back HELD, and the caller owes it a
+// method_release() once the row is delivered or abandoned.
 static method_inst_t *
 deferred_row_to_msg(const db_result_t *res, uint32_t i, method_msg_t *msg,
     time_t now)
@@ -646,6 +647,7 @@ deferred_deliver_row(const char *bot_name, uint32_t ns_id,
         "bot=%s deferred %" PRId64 " (%s) held by the voice governor — %s",
         bot_name, id, source,
         back ? "returned to pending" : "occurrence skipped (successor stands)");
+    method_release(msg.inst);
     return;
   }
 
@@ -654,6 +656,8 @@ deferred_deliver_row(const char *bot_name, uint32_t ns_id,
 
   else
     deferred_deliver_say(st, &msg, source, body, ago);
+
+  method_release(msg.inst);
 }
 
 void

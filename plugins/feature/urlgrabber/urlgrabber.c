@@ -323,7 +323,10 @@ ug_attach_bot(const char *botname)
 
   kind = method_inst_kind(inst);
   if(kind == NULL)
+  {
+    method_release(inst);
     return;
+  }
 
   // Register knobs for every channel this bot is configured for, so they
   // are settable the instant urlgrabber is up (no need to wait for chatter).
@@ -342,6 +345,7 @@ ug_attach_bot(const char *botname)
 
   if(method_subscribe(inst, sub_name, ug_observe, ctx) != SUCCESS)
   {
+    method_release(inst);
     mem_free(ctx);                      // already attached (dup) — no-op
     return;
   }
@@ -357,6 +361,8 @@ ug_attach_bot(const char *botname)
   node->next     = ug_attachments;
   ug_attachments = node;
   pthread_mutex_unlock(&ug_attach_lock);
+
+  method_release(inst);
 
   clam(CLAM_INFO, UG_CTX, "attached observer to bot '%s' (%s)",
       botname, node->method_name);
@@ -380,7 +386,10 @@ ug_detach_all(void)
     method_inst_t *inst = method_find(node->method_name);
 
     if(inst != NULL)
+    {
       method_unsubscribe(inst, node->sub_name);
+      method_release(inst);
+    }
 
     mem_free(node->ctx);
     mem_free(node);
@@ -522,6 +531,7 @@ ug_offer_task(task_t *t)
   if(inst != NULL && bot_find(off->bot) != NULL)
     ug_consider(off->bot, inst, off->channel, off->url);
 
+  method_release(inst);
   mem_free(off);
 }
 

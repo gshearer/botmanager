@@ -320,11 +320,14 @@ admin_cmd_say(const cmd_ctx_t *ctx)
 
   if(!method_send(method, target, message))
   {
+    method_release(method);
     clam(CLAM_WARN, "bot_say", "send failed: bot=%s target=%s", name, target);
     snprintf(buf, sizeof(buf), "send failed: %s -> %s", name, target);
     cmd_reply(ctx, buf);
     return;
   }
+
+  method_release(method);
 
   clam(CLAM_INFO, "bot_say", "bot=%s target=%s", name, target);
   snprintf(buf, sizeof(buf), "sent: %s -> %s", name, target);

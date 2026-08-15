@@ -153,6 +153,12 @@ reachy_state_unref(reachy_state_t *st)
   if(__atomic_sub_fetch(&st->refs, 1, __ATOMIC_ACQ_REL) != 0)
     return;
 
+  // The method instance reference connect() took. Held for as long as
+  // st->inst is readable: a worker still inside this driver is exactly
+  // who core's unregister cannot wait for.
+  method_release(st->inst);
+  st->inst = NULL;
+
   pthread_cond_destroy(&st->wake_cond);
   pthread_cond_destroy(&st->mouth_cond);
   pthread_mutex_destroy(&st->wake_mutex);
@@ -1701,7 +1707,10 @@ reachy_connect(void *handle)
   double          weight;
   task_handle_t   h;
 
-  st->inst = method_find(st->inst_name);
+  // A held reference, given back in reachy_state_unref(); a re-entered
+  // connect() must not take a second one.
+  if(st->inst == NULL)
+    st->inst = method_find(st->inst_name);
 
   if(st->inst == NULL)
   {

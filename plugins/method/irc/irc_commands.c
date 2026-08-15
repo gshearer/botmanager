@@ -358,11 +358,15 @@ irc_cmd_server(const cmd_ctx_t *ctx)
 
 // Helpers
 
+// The driver state outlives the reference used to reach it — it is
+// reference counted in its own right and every caller here is a command
+// thread reading it under the instance's own locks.
 static irc_state_t *
 irc_find_state_for_bot(const char *botname)
 {
   char inst_name[METHOD_NAME_SZ];
   method_inst_t *inst;
+  irc_state_t   *st;
 
   snprintf(inst_name, sizeof(inst_name), "%s_irc", botname);
 
@@ -371,7 +375,9 @@ irc_find_state_for_bot(const char *botname)
   if(inst == NULL)
     return(NULL);
 
-  return(method_get_handle(inst));
+  st = method_get_handle(inst);
+  method_release(inst);
+  return(st);
 }
 
 // /channel operator command

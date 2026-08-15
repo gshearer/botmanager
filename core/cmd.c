@@ -1166,6 +1166,18 @@ cmd_creds_visible(const method_inst_t *inst, bool admin)
       && method_inst_type(inst) == METHOD_T_BOTMANCTL);
 }
 
+// A dispatched command outlives the delivery that produced it — the
+// message is copied by value and the callback runs on a task thread —
+// so the copy carries its own reference to the originating method
+// instance. Without it, a `/plugin reload` between dispatch and reply
+// unregisters the instance the reply is about to be sent on.
+static void
+cmd_task_data_free(cmd_task_data_t *d)
+{
+  method_release(d->msg.inst);
+  mem_free(d);
+}
+
 // Task callback for async command execution. Parses args if the command
 // has an arg spec, then invokes the command callback.
 static void
@@ -1193,7 +1205,7 @@ cmd_task_cb(task_t *t)
     if(!cmd_parse_args(d->args, d->arg_desc, d->arg_count,
         d->arg_bufs, &parsed, &ctx, d->usage))
     {
-      mem_free(d);
+      cmd_task_data_free(d);
       t->state = TASK_ENDED;
       return;
     }
@@ -1213,7 +1225,7 @@ cmd_task_cb(task_t *t)
   if(creds)
     kv_admin_context_set(false);
 
-  mem_free(d);
+  cmd_task_data_free(d);
 
   t->state = TASK_ENDED;
 }
@@ -1553,6 +1565,7 @@ cmd_dispatch(bot_inst_t *inst, const method_msg_t *msg)
   td->cb_data = cb_data;
   td->bot = inst;
   memcpy(&td->msg, msg, sizeof(method_msg_t));
+  method_hold(td->msg.inst);
   strlcpy(td->args, args, METHOD_TEXT_SZ);
 
   // td is zeroed above, so copying just the characters terminates the
@@ -1575,7 +1588,7 @@ cmd_dispatch(bot_inst_t *inst, const method_msg_t *msg)
     clam(CLAM_WARN, "cmd_dispatch",
         "'%s': failed to submit task for '%s'",
         bot_inst_name(inst), cmd_name);
-    mem_free(td);
+    cmd_task_data_free(td);
     return(FAIL);
   }
 
@@ -2541,6 +2554,7 @@ cmd_dispatch_resolved(bot_inst_t *inst, const method_msg_t *msg,
   td->cb_data   = def->data;
   td->bot       = inst;
   memcpy(&td->msg, msg, sizeof(method_msg_t));
+  method_hold(td->msg.inst);
 
   if(args != NULL)
     strlcpy(td->args, args, METHOD_TEXT_SZ);
@@ -2562,7 +2576,7 @@ cmd_dispatch_resolved(bot_inst_t *inst, const method_msg_t *msg,
     clam(CLAM_WARN, "cmd_dispatch_resolved",
         "'%s': failed to submit task for '%s'",
         bot_inst_name(inst), def->name);
-    mem_free(td);
+    cmd_task_data_free(td);
     return(FAIL);
   }
 

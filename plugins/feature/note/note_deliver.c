@@ -233,6 +233,8 @@ note_deliver_task(task_t *t)
         got, d->user, d->target);
 
 out:
+
+  method_release(inst);
   mem_free(d);
 }
 
@@ -357,6 +359,7 @@ note_attach_bot(const char *botname)
 
   if(method_subscribe(inst, sub_name, note_observe, ctx) != SUCCESS)
   {
+    method_release(inst);
     mem_free(ctx);                      // already attached (dup) — no-op
     return;
   }
@@ -372,6 +375,8 @@ note_attach_bot(const char *botname)
   node->next       = note_attachments;
   note_attachments = node;
   pthread_mutex_unlock(&note_attach_lock);
+
+  method_release(inst);
 
   clam(CLAM_INFO, NOTE_CTX, "attached observer to bot '%s' (%s)",
       botname, node->method_name);
@@ -395,7 +400,10 @@ note_detach_all(void)
     method_inst_t *inst = method_find(node->method_name);
 
     if(inst != NULL)
+    {
       method_unsubscribe(inst, node->sub_name);
+      method_release(inst);
+    }
 
     mem_free(node->ctx);
     mem_free(node);

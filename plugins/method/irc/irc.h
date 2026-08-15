@@ -108,14 +108,15 @@ typedef struct
   char              kv_prefix[IRC_KV_PREFIX_SZ]; // "bot.<botname>.irc."
   method_inst_t    *inst;           // set by connect(), not create()
 
-  // Lifetime. irc_destroy() runs with bot_mutex AND method_mutex held,
-  // on a thread the epoll worker's callback can be waiting on, so it
-  // must never wait for that callback to drain. Instead the state is
-  // reference counted — one for the method instance, one for the socket
-  // session (given back by its done hook), one per armed reconnect
-  // task — and `dead` tells a callback that arrives anyway to touch
-  // nothing: `inst` belongs to core and is freed the instant
-  // irc_destroy() returns.
+  // Lifetime. irc_destroy() runs on a thread the epoll worker's
+  // callback can be waiting on, so it must never wait for that callback
+  // to drain. Instead the state is reference counted — one for the
+  // method instance, one for the socket session (given back by its done
+  // hook), one per armed reconnect task — and `dead` tells a callback
+  // that arrives anyway to touch nothing. `inst` is core's, and the
+  // reference connect() took keeps it alive for exactly as long as this
+  // state is; `dead` still gates it, because a retired instance has no
+  // driver handle left to act on.
   uint32_t          refs;
   _Atomic bool      dead;
 

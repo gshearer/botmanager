@@ -530,11 +530,14 @@ claude_pending_deliver(task_t *t)
         "deliver: delivered %zu bytes to %s post-restart (attempt %d)",
         text_len, target, r->attempt);
     claude_pending_clear();
+    method_release(inst);
     mem_free(text);
     mem_free(r);
     t->state = TASK_ENDED;
     return;
   }
+
+  method_release(inst);
 
   if(text != NULL)
     mem_free(text);

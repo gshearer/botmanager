@@ -368,6 +368,8 @@ bot_driver_detach(bot_inst_t *inst, bool stop)
 static void
 bot_methods_down(bot_inst_t *inst, const bot_method_t *stop_at)
 {
+  method_inst_t *old;
+
   for(bot_method_t *m = inst->methods; m != stop_at; m = m->next)
   {
     if(m->subscribed && m->inst != NULL)
@@ -386,7 +388,11 @@ bot_methods_down(bot_inst_t *inst, const bot_method_t *stop_at)
       m->created_by_bot = false;
     }
 
+    // The binding's own reference, taken when bot_start() resolved it.
+    // Given back last: everything above this line reads the instance.
+    old = m->inst;
     m->inst = NULL;
+    method_release(old);
   }
 }
 
@@ -2096,13 +2102,29 @@ bot_method_count(const bot_inst_t *inst)
   return(inst->method_count);
 }
 
+// A binding caches the instance it resolved at start time, but the
+// pointer is a hint and the name is the fact: these two walk the list
+// with no lock at all, so by the time a caller reads the address a
+// reload may already have unregistered it. Re-resolving through the
+// registry is what makes the reference safe to hand out — method_find()
+// takes it under method_mutex, so a binding whose instance is gone
+// answers NULL instead of an address somebody is about to free.
+static method_inst_t *
+bot_method_ref(const bot_method_t *m)
+{
+  if(m == NULL || m->inst == NULL)
+    return(NULL);
+
+  return(method_find(m->method_name));
+}
+
 method_inst_t *
 bot_first_method(const bot_inst_t *inst)
 {
-  if(inst == NULL || inst->methods == NULL)
+  if(inst == NULL)
     return(NULL);
 
-  return(inst->methods->inst);
+  return(bot_method_ref(inst->methods));
 }
 
 method_inst_t *
@@ -2116,12 +2138,12 @@ bot_resolve_method(const bot_inst_t *inst, const char *key)
   // would also match.
   for(bot_method_t *m = inst->methods; m != NULL; m = m->next)
     if(strncasecmp(m->method_name, key, METHOD_NAME_SZ) == 0)
-      return(m->inst);
+      return(bot_method_ref(m));
 
   // Kind match: first binding of the requested plugin kind.
   for(bot_method_t *m = inst->methods; m != NULL; m = m->next)
     if(strncasecmp(m->method_kind, key, PLUGIN_NAME_SZ) == 0)
-      return(m->inst);
+      return(bot_method_ref(m));
 
   return(NULL);
 }

@@ -172,10 +172,13 @@ dest_send(const ccd_send_t *d, const char *chat_line)
     inst = bot_resolve_method(b, d->method_key);
   }
 
-  if(inst == NULL || d->target[0] == '\0')
+  if(inst == NULL)
     return;
 
-  method_send(inst, d->target, chat_line);
+  if(d->target[0] != '\0')
+    method_send(inst, d->target, chat_line);
+
+  method_release(inst);
 }
 
 // Every send this fan-out can lift out of the lock in one pass. Past
@@ -387,7 +390,8 @@ parse_one_dest(const char *tok, const cmd_ctx_t *ctx, ccd_dest_t *out)
     char bot_n[BOT_NAME_SZ];
     char mkey [METHOD_NAME_SZ];
     char tgt  [METHOD_CHANNEL_SZ];
-    bot_inst_t *b;
+    bot_inst_t    *b;
+    method_inst_t *mi;
 
     if(!split_method_spec(tok, bot_n, sizeof(bot_n),
           mkey, sizeof(mkey), tgt, sizeof(tgt)))
@@ -397,8 +401,14 @@ parse_one_dest(const char *tok, const cmd_ctx_t *ctx, ccd_dest_t *out)
     if(b == NULL)
       return("bot not found");
 
-    if(bot_resolve_method(b, mkey) == NULL)
+    // Existence check only — the destination is stored by name and
+    // re-resolved at every send, so the reference goes straight back.
+    mi = bot_resolve_method(b, mkey);
+
+    if(mi == NULL)
       return("bot has no binding matching method");
+
+    method_release(mi);
 
     out->kind = CCD_METHOD;
     snprintf(out->bot_name,   sizeof(out->bot_name),   "%s", bot_n);

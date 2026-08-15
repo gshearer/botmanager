@@ -435,7 +435,10 @@ extract_botname_cb(const char *name, const char *method_kinds,
   nick[0] = '\0';
 
   if(m != NULL)
+  {
     method_get_self(m, nick, sizeof(nick));
+    method_release(m);
+  }
 
   if(nick[0] != '\0' && strcasecmp(s->alias, nick) == 0)
   {

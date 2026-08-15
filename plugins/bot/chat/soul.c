@@ -1085,6 +1085,7 @@ soul_wx_batch_task(task_t *t)
         "bot=%s weather sweep dropped (bot gone, chat off, or muted)",
         sweep->bot_name);
 
+  method_release(method);
   soul_chore_done(sweep->sched, sweep->chore);
   mem_free(sweep);
   t->state = TASK_ENDED;

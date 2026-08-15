@@ -194,6 +194,11 @@ uint32_t bot_resume_method(const char *method_kind);
 // helpers (e.g. chatbot volunteer speech) that need a valid
 // method_inst_t for an outbound channel send without reconstructing
 // the routing layer.
+//
+// Both this and bot_resolve_method() return a NEW reference; release it
+// with method_release() (`method.h` §Reference counting). NULL comes
+// back for a binding whose instance a reload has unregistered, which is
+// the same answer as no binding at all — the caller had nowhere to send.
 method_inst_t *bot_first_method(const bot_inst_t *inst);
 
 // Resolve a method instance bound to this bot from `key`, which may be

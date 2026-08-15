@@ -752,6 +752,7 @@ ug_fetch_done(const curl_response_t *resp)
   snprintf(line, sizeof(line), CLR_CYAN "\xC2\xBB" CLR_RESET " %s", title);
 
   method_send(method, fc->channel, line);
+  method_release(method);
 
 out:
   mem_free(fc);

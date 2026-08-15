@@ -291,6 +291,10 @@ bctl_drv_destroy(void *handle)
     return;
 
   srv = handle;
+
+  // The reference botmanctl_register_method() stored in srv->inst,
+  // given back where the thing that stored it dies.
+  method_release(srv->inst);
   pthread_mutex_destroy(&srv->client_mutex);
   mem_free(srv);
 }
