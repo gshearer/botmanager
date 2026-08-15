@@ -1401,6 +1401,15 @@ chatbot_destroy(void *handle)
   // stop=false), so this cannot be left to chatbot_stop() alone.
   chatbot_coalesce_shutdown(st);
 
+  // Then the async work that outlives its turn — a reply still
+  // streaming, a vision fetch, a cue waiting on a worker. The coalescer
+  // goes first because it is what starts them; after it, nothing new
+  // can be born. Repeated from chatbot_stop() for the same reason the
+  // coalescer is, and for one more: at `quit` the whole of this runs at
+  // bot_exit(), three steps before the engine cancels what is still on
+  // the wire (root TODO.md §SC-SAN-FINDINGS SAN-27).
+  chatbot_reply_shutdown(st);
+
   pthread_rwlock_destroy(&st->lock);
   pthread_mutex_destroy(&st->flight_mutex);
   pthread_cond_destroy(&st->coalesce_idle);
@@ -1620,6 +1629,12 @@ chatbot_stop(void *handle)
   // Contract's join, for the only thread this driver leaves in its own
   // mapping. Repeated by chatbot_destroy(); the second call is a no-op.
   chatbot_coalesce_shutdown(st);
+
+  // And the work already airborne against this handle. A delivery still
+  // inside on_message can submit a fresh reply after this returns —
+  // chatbot_destroy() runs the same drain, and bot.c defers it to the
+  // last delivery out, so that one is the closing pass.
+  chatbot_reply_shutdown(st);
 }
 
 // Evaluate speak policy for a (possibly coalesced) message and, if it

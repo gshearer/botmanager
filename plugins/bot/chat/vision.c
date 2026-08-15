@@ -23,6 +23,10 @@
 // the ctx is local to this file.
 typedef struct
 {
+  // The fetch outlives the turn that started it, so the ctx is on the
+  // reply pipeline's live list and a bot teardown can disown it.
+  chatbot_hold_t   hold;
+
   chatbot_state_t *st;
   method_inst_t   *method;
   char             sender          [METHOD_SENDER_SZ];
@@ -182,6 +186,8 @@ chatbot_vision_maybe_submit(chatbot_state_t *st, const method_msg_t *msg)
   // Build ctx for the async hop.
   ctx = mem_alloc("vision", "ctx", sizeof(*ctx));
 
+  chatbot_hold_link(&ctx->hold, st, NULL);
+
   ctx->st     = st;
   ctx->method = msg->inst;
   snprintf(ctx->sender,          sizeof(ctx->sender),          "%s", msg->sender);
@@ -206,11 +212,17 @@ chatbot_vision_maybe_submit(chatbot_state_t *st, const method_msg_t *msg)
     pthread_mutex_lock(&st->vision_flight_mutex);
     if(st->vision_in_flight > 0) st->vision_in_flight--;
     pthread_mutex_unlock(&st->vision_flight_mutex);
+    chatbot_hold_unlink(&ctx->hold);
     mem_free(ctx);
     return(true);
   }
 
   curl_request_set_follow_redirects(req, false);
+
+  // Named before the submit, not after: once the transfer is on the
+  // wire the completion callback owns `ctx` and may already have freed
+  // it, and `req` with it.
+  chatbot_hold_set_curl(&ctx->hold, curl_request_id(req));
 
   if(curl_request_submit(req) != SUCCESS)
   {
@@ -219,6 +231,7 @@ chatbot_vision_maybe_submit(chatbot_state_t *st, const method_msg_t *msg)
     pthread_mutex_lock(&st->vision_flight_mutex);
     if(st->vision_in_flight > 0) st->vision_in_flight--;
     pthread_mutex_unlock(&st->vision_flight_mutex);
+    chatbot_hold_unlink(&ctx->hold);
     mem_free(ctx);
     return(true);
   }
@@ -347,6 +360,15 @@ vision_on_fetch_done(const curl_response_t *resp)
 
   ctx = resp->user_data;
 
+  // The bot was destroyed while the image was on the wire. Everything
+  // below — the flight counter included — reads through ctx->st.
+  if(chatbot_hold_disowned(&ctx->hold))
+  {
+    chatbot_hold_unlink(&ctx->hold);
+    mem_free(ctx);
+    return;
+  }
+
   if(resp->status != 200)
   {
     clam(CLAM_WARN, "vision",
@@ -445,5 +467,6 @@ done:
   if(ctx->st->vision_in_flight > 0) ctx->st->vision_in_flight--;
   pthread_mutex_unlock(&ctx->st->vision_flight_mutex);
 
+  chatbot_hold_unlink(&ctx->hold);
   mem_free(ctx);
 }

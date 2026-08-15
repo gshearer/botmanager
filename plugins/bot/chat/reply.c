@@ -5,14 +5,17 @@
 #include "chatbot.h"
 
 #include "clam.h"
+#include "curl.h"
 #include "inference.h"
 
+#include <errno.h>
 #include <inttypes.h>
 #include <regex.h>
 #include <strings.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
 
 // chatbot_req_t and its size/layout macros live in chatbot.h's
 // CHATBOT_INTERNAL block. The chatbot_mention tag below is reply-local.
@@ -29,6 +32,150 @@ struct chatbot_mention
   mem_dossier_fact_t  facts[CHATBOT_MENTION_FACTS_CAP];
 };
 typedef struct chatbot_mention chatbot_mention_t;
+
+// Live records that outlive their turn (chatbot.h §chatbot_hold_t)
+//
+// Module-level rather than a field on chatbot_state_t, which is the
+// whole point: these records outlive the state they name, and the list
+// is what a teardown uses to make sure they no longer do. The mutex is
+// leaf — nothing under it calls back into chat — and the one engine
+// call made while holding it (llm_cancel_user) walks curl's own lists
+// and writes an eventfd, so no delivery is ever waiting on us.
+
+static pthread_mutex_t hold_mutex = PTHREAD_MUTEX_INITIALIZER;
+static pthread_cond_t  hold_cond  = PTHREAD_COND_INITIALIZER;
+static chatbot_hold_t *hold_head  = NULL;
+
+void
+chatbot_hold_link(chatbot_hold_t *h, chatbot_state_t *st,
+    const void *llm_user)
+{
+  pthread_mutex_lock(&hold_mutex);
+
+  h->st       = st;
+  h->llm_user = llm_user;
+  h->curl_id  = 0;
+  h->disowned = false;
+  h->next     = hold_head;
+  hold_head   = h;
+
+  pthread_mutex_unlock(&hold_mutex);
+}
+
+void
+chatbot_hold_set_curl(chatbot_hold_t *h, uint64_t curl_id)
+{
+  pthread_mutex_lock(&hold_mutex);
+  h->curl_id = curl_id;
+  pthread_mutex_unlock(&hold_mutex);
+}
+
+bool
+chatbot_hold_disowned(const chatbot_hold_t *h)
+{
+  bool disowned;
+
+  pthread_mutex_lock(&hold_mutex);
+  disowned = h->disowned;
+  pthread_mutex_unlock(&hold_mutex);
+
+  return(disowned);
+}
+
+void
+chatbot_hold_unlink(chatbot_hold_t *h)
+{
+  chatbot_hold_t **pp;
+
+  pthread_mutex_lock(&hold_mutex);
+
+  for(pp = &hold_head; *pp != NULL; pp = &(*pp)->next)
+    if(*pp == h)
+    {
+      *pp = h->next;
+      break;
+    }
+
+  h->next = NULL;
+  h->st   = NULL;
+
+  pthread_cond_broadcast(&hold_cond);
+  pthread_mutex_unlock(&hold_mutex);
+}
+
+// Nothing here frees a record: a record is only ever freed by the
+// callback holding it, which is exactly why the wait exists. A callback
+// that had already read `disowned` as false keeps its record on the list
+// for the whole of its body, so finding none is proof that no thread is
+// still inside one — and a callback that re-arms another async leg
+// leaves the record listed for the next one to disown.
+void
+chatbot_reply_shutdown(chatbot_state_t *st)
+{
+  struct timespec deadline;
+  uint32_t        disowned  = 0;
+  uint32_t        cancelled = 0;
+  uint32_t        stranded  = 0;
+  bool            waiting;
+
+  if(st == NULL) return;
+
+  clock_gettime(CLOCK_REALTIME, &deadline);
+  deadline.tv_sec += CHATBOT_REPLY_DRAIN_SECS;
+
+  pthread_mutex_lock(&hold_mutex);
+
+  for(chatbot_hold_t *h = hold_head; h != NULL; h = h->next)
+  {
+    if(h->st != st)
+      continue;
+
+    h->disowned = true;
+    disowned++;
+
+    if(h->llm_user != NULL)
+      cancelled += llm_cancel_user(h->llm_user);
+
+    if(h->curl_id != 0 && curl_request_cancel(h->curl_id) == SUCCESS)
+      cancelled++;
+  }
+
+  for(;;)
+  {
+    waiting = false;
+
+    for(chatbot_hold_t *h = hold_head; h != NULL; h = h->next)
+      if(h->st == st)
+      {
+        waiting = true;
+        break;
+      }
+
+    if(!waiting)
+      break;
+
+    if(pthread_cond_timedwait(&hold_cond, &hold_mutex, &deadline)
+        == ETIMEDOUT)
+      break;
+  }
+
+  for(chatbot_hold_t *h = hold_head; h != NULL; h = h->next)
+    if(h->st == st)
+      stranded++;
+
+  pthread_mutex_unlock(&hold_mutex);
+
+  if(stranded > 0)
+    clam(CLAM_WARN, "chatbot",
+        "%u reply record(s) did not come back within %u s; the bot "
+        "handle is freed with them still airborne", stranded,
+        CHATBOT_REPLY_DRAIN_SECS);
+
+  else if(disowned > 0)
+    clam(CLAM_DEBUG, "chatbot",
+        "disowned %u airborne reply record(s) (%u cancelled at their "
+        "engine); all came back", disowned, cancelled);
+}
 
 // In-flight accounting + per-channel cooldown table
 
@@ -421,7 +568,10 @@ fact_kind_name(mem_fact_kind_t k)
 // The instance reference r->method carries is given back here — the
 // reply streams from a curl worker long after the turn that started it,
 // and a `plugin reload irc` in between unregisters the instance the
-// stream is still writing to.
+// stream is still writing to. The hold goes back on the same breath and
+// for the same reason, one lifetime further out: a `quit` frees the bot
+// handle at bot_exit(), three steps before the engine cancels what is
+// still on the wire.
 static void
 req_free(chatbot_req_t *r)
 {
@@ -435,6 +585,7 @@ req_free(chatbot_req_t *r)
   if(r->stash_mentions)   mem_free(r->stash_mentions);
   if(r->stash_images)     mem_free(r->stash_images);
   if(r->image_b64)        mem_free(r->image_b64);
+  chatbot_hold_unlink(&r->hold);
   mem_free(r);
 }
 
@@ -797,6 +948,11 @@ nl_single_location_default(const cmd_nl_t *nl)
 
 typedef struct
 {
+  // The cue is spawned from inside llm_done, so it is born while a
+  // teardown may already be draining this bot; it carries a hold for
+  // the same reason the request does.
+  chatbot_hold_t   hold;
+
   chatbot_state_t *st;
   method_msg_t     msg;           // synth copy, text replaced by the cue
   bool             was_addressed;
@@ -814,8 +970,14 @@ nl_bridge_ask_task(task_t *t)
 
   if(d != NULL)
   {
-    chatbot_reply_submit(d->st, &d->msg, d->was_addressed,
-        d->is_direct, true);
+    // Submit first, unlink second: the request it creates links its own
+    // hold before this one goes, so a drain never sees the bot's work
+    // momentarily finished.
+    if(!chatbot_hold_disowned(&d->hold))
+      chatbot_reply_submit(d->st, &d->msg, d->was_addressed,
+          d->is_direct, true);
+
+    chatbot_hold_unlink(&d->hold);
     mem_free(d);
   }
 
@@ -961,6 +1123,7 @@ reply_nl_bridge(chatbot_req_t *r, const char *text)
     d = mem_alloc("chat", "nl_ask_cue", sizeof(*d));
 
     memset(d, 0, sizeof(*d));
+    chatbot_hold_link(&d->hold, r->st, NULL);
     d->st            = r->st;
     d->msg           = synth;
     d->was_addressed = r->was_addressed;
@@ -981,6 +1144,7 @@ reply_nl_bridge(chatbot_req_t *r, const char *text)
 
     if(task_add("nl_bridge", TASK_ANY, 150, nl_bridge_ask_task, d) == NULL)
     {
+      chatbot_hold_unlink(&d->hold);
       mem_free(d);
       method_send(r->method, r->reply_target, CHATBOT_NL_DENIED_TEXT);
     }
@@ -1421,6 +1585,11 @@ llm_chunk(llm_request_t *req, const char *delta, size_t delta_len,
   r = user;
   if(r == NULL || delta == NULL || delta_len == 0) return;
 
+  // The bot went away mid-stream. Drop the delta on the floor rather
+  // than resolve it into a line: every send path from here reads
+  // r->st->inst for its log context. llm_done frees the record.
+  if(chatbot_hold_disowned(&r->hold)) return;
+
   for(size_t i = 0; i < delta_len; i++)
   {
     char c = delta[i];
@@ -1463,6 +1632,17 @@ llm_done(const llm_chat_response_t *resp)
   mem_msg_t log = {0};
 
   if(r == NULL) return;
+
+  // The bot this reply belongs to has been destroyed — at `quit` that
+  // is bot_exit(), which runs before the engine cancel that delivered
+  // us. Give the record back and read nothing through r->st: the
+  // in-flight counter it would decrement is inside the freed handle
+  // (root TODO.md §SC-SAN-FINDINGS SAN-27).
+  if(chatbot_hold_disowned(&r->hold))
+  {
+    req_free(r);
+    return;
+  }
 
   inflight_bump(r->st, -1);
 
@@ -2746,6 +2926,12 @@ knowledge_cb(const knowledge_chunk_t *chunks, size_t n, void *user)
   size_t ni;
   bool recency_ordered;
 
+  if(chatbot_hold_disowned(&r->hold))
+  {
+    req_free(r);
+    return;
+  }
+
   knowledge_gather_images(r, chunks, n, &images, &ni, &recency_ordered);
 
   // Transfer ownership onto r so req_free handles the free on any path.
@@ -2777,6 +2963,13 @@ retrieve_cb(const mem_fact_t *facts, size_t n_facts,
   // two indexed tables (dossier and dossier_facts) so the extra
   // latency is small even with a handful of mentions.
   chatbot_mention_t mentions[CHATBOT_MENTION_DOSSIERS_CAP];
+
+  if(chatbot_hold_disowned(&r->hold))
+  {
+    req_free(r);
+    return;
+  }
+
   memset(mentions, 0, sizeof(mentions));
 
   for(size_t i = 0; i < r->n_mentions; i++)
@@ -2864,6 +3057,10 @@ chatbot_reply_submit(chatbot_state_t *st, const method_msg_t *msg,
 
   r = mem_alloc("chatbot", "req", sizeof(*r));
   memset(r, 0, sizeof(*r));
+
+  // Before the first early return: from here on every exit is req_free,
+  // and req_free is what takes the record back off the list.
+  chatbot_hold_link(&r->hold, st, r);
 
   r->st                = st;
   r->method            = msg->inst;
@@ -3189,6 +3386,8 @@ chatbot_reply_submit_vision(chatbot_state_t *st, const method_msg_t *msg,
 
   r = mem_alloc("chatbot", "req", sizeof(*r));
   memset(r, 0, sizeof(*r));
+
+  chatbot_hold_link(&r->hold, st, r);
 
   r->st                = st;
   r->method            = msg->inst;
