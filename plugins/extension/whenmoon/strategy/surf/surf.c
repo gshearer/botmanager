@@ -224,7 +224,7 @@ surf_entry_cross_up(const surf_state_t *s, const wm_candle_full_t *bar)
     {
       float ema20 = bar->ind[WM_IND_EMA_20];
 
-      if(isnanf(ema20) || !s->have_prev_above)
+      if(isnan(ema20) || !s->have_prev_above)
         return(false);
 
       return(!s->prev_above_ema && bar->close > (double)ema20);
@@ -234,7 +234,7 @@ surf_entry_cross_up(const surf_state_t *s, const wm_candle_full_t *bar)
     {
       float rsi = bar->ind[WM_IND_RSI_14];
 
-      if(isnanf(rsi) || !s->have_prev_rsi)
+      if(isnan(rsi) || !s->have_prev_rsi)
         return(false);
 
       return(s->prev_rsi <= s->mom_thresh && (double)rsi > s->mom_thresh);
@@ -245,7 +245,7 @@ surf_entry_cross_up(const surf_state_t *s, const wm_candle_full_t *bar)
     {
       float hist = bar->ind[WM_IND_MACD_HIST];
 
-      if(isnanf(hist) || !s->have_prev_hist)
+      if(isnan(hist) || !s->have_prev_hist)
         return(false);
 
       return(s->prev_hist <= 0.0 && (double)hist > 0.0);
@@ -265,14 +265,14 @@ surf_momentum_faded(const surf_state_t *s, const wm_candle_full_t *bar)
     {
       float ema20 = bar->ind[WM_IND_EMA_20];
 
-      return(!isnanf(ema20) && bar->close < (double)ema20);
+      return(!isnan(ema20) && bar->close < (double)ema20);
     }
 
     case 2:
     {
       float rsi = bar->ind[WM_IND_RSI_14];
 
-      return(!isnanf(rsi) && (double)rsi < s->mom_thresh);
+      return(!isnan(rsi) && (double)rsi < s->mom_thresh);
     }
 
     case 0:
@@ -280,7 +280,7 @@ surf_momentum_faded(const surf_state_t *s, const wm_candle_full_t *bar)
     {
       float hist = bar->ind[WM_IND_MACD_HIST];
 
-      return(!isnanf(hist) && (double)hist < 0.0);
+      return(!isnan(hist) && (double)hist < 0.0);
     }
   }
 }
@@ -293,19 +293,19 @@ surf_track_prev(surf_state_t *s, const wm_candle_full_t *bar)
   float ema20 = bar->ind[WM_IND_EMA_20];
   float rsi   = bar->ind[WM_IND_RSI_14];
 
-  if(!isnanf(hist))
+  if(!isnan(hist))
   {
     s->prev_hist      = (double)hist;
     s->have_prev_hist = true;
   }
 
-  if(!isnanf(ema20))
+  if(!isnan(ema20))
   {
     s->prev_above_ema  = bar->close > (double)ema20;
     s->have_prev_above = true;
   }
 
-  if(!isnanf(rsi))
+  if(!isnan(rsi))
   {
     s->prev_rsi      = (double)rsi;
     s->have_prev_rsi = true;
@@ -536,7 +536,7 @@ wm_strategy_on_bar(wm_strategy_ctx_t *ctx,
 
   else
   {
-    bool   have_atr  = !isnanf(atr) && atr > 0.0f;
+    bool   have_atr  = !isnan(atr) && atr > 0.0f;
     double chand_lv  = -1.0;
     bool   want_fade = (s->exit_mode == 1 || s->exit_mode == 2);
     bool   want_chand = (s->exit_mode == 0 || s->exit_mode == 2);

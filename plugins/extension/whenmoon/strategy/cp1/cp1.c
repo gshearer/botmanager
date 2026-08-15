@@ -145,12 +145,12 @@ cp1_regime_ok(const cp1_state_t *s, const wm_candle_full_t *bar)
     case 0:
       return(true);
     case 1:
-      return(!isnanf(sma200) && bar->close > sma200);
+      return(!isnan(sma200) && bar->close > sma200);
     case 2:
-      return(!isnanf(sma50) && !isnanf(sma200) && sma50 > sma200);
+      return(!isnan(sma50) && !isnan(sma200) && sma50 > sma200);
     case 3:
     default:
-      return(!isnanf(sma50) && !isnanf(sma200) &&
+      return(!isnan(sma50) && !isnan(sma200) &&
              bar->close > sma200 && sma50 > sma200);
   }
 }
@@ -328,7 +328,7 @@ wm_strategy_on_bar(wm_strategy_ctx_t *ctx,
   else
   {
     double chan_lo  = cp1_window_low(s, s->exit_n);
-    bool   have_atr = !isnanf(atr) && atr > 0.0f;
+    bool   have_atr = !isnan(atr) && atr > 0.0f;
     double trail_lv = -1.0;
 
     if(bar->close > s->peak_close)

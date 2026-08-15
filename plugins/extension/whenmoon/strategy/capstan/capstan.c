@@ -154,7 +154,7 @@ capstan_tide_up(const capstan_state_t *s, const wm_candle_full_t *bar)
   {
     float ma = bar->ind[s->tide_slot];
 
-    return(!isnanf(ma) && bar->close > (double)ma);
+    return(!isnan(ma) && bar->close > (double)ma);
   }
 }
 
@@ -440,10 +440,10 @@ wm_strategy_on_bar(wm_strategy_ctx_t *ctx,
 
       // Entry needs a live ATR anchor; the optional NATR floor skips
       // dead-vol tape. Both fail closed.
-      if(isnanf(atr) || atr <= 0.0f)
+      if(isnan(atr) || atr <= 0.0f)
         return;
 
-      if(s->min_natr > 0.0 && (isnanf(natr) || (double)natr < s->min_natr))
+      if(s->min_natr > 0.0 && (isnan(natr) || (double)natr < s->min_natr))
         return;
 
       sig.score      = 1.0;

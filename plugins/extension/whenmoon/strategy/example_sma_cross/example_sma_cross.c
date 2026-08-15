@@ -205,7 +205,7 @@ wm_strategy_on_bar(wm_strategy_ctx_t *ctx,
 
   // Indicator slots return NaN until enough history has accumulated.
   // Skip until both fast and slow are populated.
-  if(isnanf(fast) || isnanf(slow))
+  if(isnan(fast) || isnan(slow))
     return;
 
   if(fast > slow)       sign =  1;

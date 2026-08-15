@@ -137,7 +137,7 @@ wm_strategy_on_bar(wm_strategy_ctx_t *ctx,
   slow = bar->ind[WM_IND_SMA_25];
 
   // Both populated only after slow_period closes have accumulated.
-  if(isnanf(fast) || isnanf(slow))
+  if(isnan(fast) || isnan(slow))
     return;
 
   if(fast > slow)       sign =  1;

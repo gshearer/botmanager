@@ -517,7 +517,7 @@ wm_strategy_on_bar(wm_strategy_ctx_t *ctx,
 
     // Entry needs a live ATR anchor and a live short mean; both fail
     // closed so an unwarm slot can never be read as a dislocation.
-    if(isnanf(atr) || atr <= 0.0f || isnanf(mean))
+    if(isnan(atr) || atr <= 0.0f || isnan(mean))
       return;
 
     if(bar->close > (double)mean - s->dip_atr * (double)atr)
@@ -526,7 +526,7 @@ wm_strategy_on_bar(wm_strategy_ctx_t *ctx,
     // Velocity gate (v0.2): the displacement must have ARRIVED, not
     // accumulated. Fails closed while MOM_10 is unwarm.
     if(s->impulse_atr > 0.0
-        && (isnanf(mom) || (double)mom > -s->impulse_atr * (double)atr))
+        && (isnan(mom) || (double)mom > -s->impulse_atr * (double)atr))
       return;
 
     // CRASH stabilization confirm: take the first up-bar, never the

@@ -182,7 +182,7 @@ jug_regime_up(const jug_state_t *s, const wm_candle_full_t *bar4h)
   {
     float regma = bar4h->ind[s->regma_slot];
 
-    return(!isnanf(regma) && bar4h->close > (double)regma);
+    return(!isnan(regma) && bar4h->close > (double)regma);
   }
 
   return(s->d1_have && !isnan(s->d1_regma) && s->d1_close > s->d1_regma);
@@ -455,9 +455,9 @@ wm_strategy_on_bar(wm_strategy_ctx_t *ctx,
   sig.ts_ms = bar->ts_close_ms;
 
   {
-    bool have_adx  = !isnanf(adx);
+    bool have_adx  = !isnan(adx);
     bool strong    = have_adx && (double)adx >= s->adx_entry;
-    bool dir_up    = !isnanf(ema20) && bar->close > (double)ema20;
+    bool dir_up    = !isnan(ema20) && bar->close > (double)ema20;
     bool d1_strong = (s->d1_adx_min <= 0.0) ||
                      (s->d1_have && !isnan(s->d1_adx) &&
                       s->d1_adx >= s->d1_adx_min);
@@ -484,7 +484,7 @@ wm_strategy_on_bar(wm_strategy_ctx_t *ctx,
     }
     else
     {
-      bool   have_atr    = !isnanf(atr) && atr > 0.0f;
+      bool   have_atr    = !isnan(atr) && atr > 0.0f;
       double chand_lv     = -1.0;
       bool   want_fade    = (s->exit_mode == 1 || s->exit_mode == 2);
       bool   want_chand   = (s->exit_mode == 0 || s->exit_mode == 2);

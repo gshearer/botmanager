@@ -480,7 +480,7 @@ wm_strategy_on_bar(wm_strategy_ctx_t *ctx,
   rsi       = bar->ind[WM_IND_RSI_14];
   adx       = bar->ind[WM_IND_ADX_14];
   regime_up = riptide_regime_up(s);
-  have_core = !isnanf(ema20) && !isnanf(atr) && atr > 0.0f;
+  have_core = !isnan(ema20) && !isnan(atr) && atr > 0.0f;
 
   memset(&sig, 0, sizeof(sig));
   sig.ts_ms = bar->ts_close_ms;
@@ -499,9 +499,9 @@ wm_strategy_on_bar(wm_strategy_ctx_t *ctx,
                         (have_core &&
                          tick_diff >= s->trigger_atr_min * (double)atr));
     bool   rsi_ok    = (s->rsi_max >= 100.0) ||
-                       (!isnanf(rsi) && (double)rsi <= s->rsi_max);
+                       (!isnan(rsi) && (double)rsi <= s->rsi_max);
     bool   adx_ok    = (s->adx_max >= 100.0) ||
-                       (!isnanf(adx) && (double)adx <= s->adx_max);
+                       (!isnan(adx) && (double)adx <= s->adx_max);
 
     if(!regime_up || !have_core)
       s->armed = false;

@@ -1104,15 +1104,33 @@ parse_args(int argc, char *argv[], struct irc_cfg *cfg)
   {
     switch(opt)
     {
-      case 's': cfg->host       = optarg;                 break;
-      case 'p': cfg->port       = (uint16_t)atoi(optarg); break;
-      case 'n': cfg->nick       = optarg;                 break;
-      case 'u': cfg->user       = optarg;                 break;
-      case 'c': cfg->channel    = optarg;                 break;
-      case 'C': cfg->ctl_path   = optarg;                 break;
-      case 'T': cfg->use_tls    = false;                    break;
-      case 'V': cfg->tls_verify = true;                    break;
-      case 'r': cfg->raw_mode   = true;                    break;
+      case 's': cfg->host       = optarg; break;
+      case 'n': cfg->nick       = optarg; break;
+      case 'u': cfg->user       = optarg; break;
+      case 'c': cfg->channel    = optarg; break;
+      case 'C': cfg->ctl_path   = optarg; break;
+      case 'T': cfg->use_tls    = false;  break;
+      case 'V': cfg->tls_verify = true;   break;
+      case 'r': cfg->raw_mode   = true;   break;
+
+      case 'p':
+      {
+        char *end;
+        long  port;
+
+        errno = 0;
+        port  = strtol(optarg, &end, 10);
+
+        if(errno != 0 || end == optarg || *end != '\0' || port < 1 || port > 65535)
+        {
+          fprintf(stderr, "port must be 1-65535\n");
+          return(-1);
+        }
+
+        cfg->port = (uint16_t)port;
+        break;
+      }
+
       case 'h':
         print_usage();
         return(1);

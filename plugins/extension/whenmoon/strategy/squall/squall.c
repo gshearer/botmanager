@@ -350,7 +350,7 @@ squall_decide(wm_strategy_ctx_t *ctx, squall_state_t *s,
 
   close     = bar->close;
   atr       = bar->ind[WM_IND_ATR_14];
-  have_core = !isnanf(atr) && atr > 0.0f;
+  have_core = !isnan(atr) && atr > 0.0f;
 
   memset(&sig, 0, sizeof(sig));
   sig.ts_ms = bar->ts_close_ms;
@@ -591,7 +591,7 @@ wm_strategy_on_bar(wm_strategy_ctx_t *ctx,
   {
     float natr = bar->ind[WM_IND_NATR_14];
 
-    if(!isnanf(natr))
+    if(!isnan(natr))
     {
       if(!s->in_position && squall_is_coiled(s, (double)natr))
       {

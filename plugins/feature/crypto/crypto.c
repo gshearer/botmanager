@@ -10,6 +10,7 @@
 #include "userns.h"
 
 #include <ctype.h>
+#include <errno.h>
 #include <inttypes.h>
 #include <math.h>
 #include <stdarg.h>
@@ -312,15 +313,25 @@ crypto_parse_sort_col(const char *s)
   return(-1);
 }
 
+// A market rank straight off the wire: digits only, and small enough for the
+// selector's int32_t. Leading sign or space is rejected by the first-digit
+// test, trailing garbage by the endptr test, and 20 nines by errno.
 static bool
-crypto_is_digits(const char *s)
+crypto_parse_rank(const char *s, int32_t *out)
 {
-  if(s[0] == '\0')
+  char *end;
+  long  val;
+
+  if(s[0] < '0' || s[0] > '9')
     return(false);
 
-  for(int i = 0; s[i] != '\0'; i++)
-    if(s[i] < '0' || s[i] > '9')
-      return(false);
+  errno = 0;
+  val   = strtol(s, &end, 10);
+
+  if(errno != 0 || *end != '\0' || val > INT32_MAX)
+    return(false);
+
+  *out = (int32_t)val;
 
   return(true);
 }
@@ -329,12 +340,15 @@ static bool
 crypto_parse_piece(const char *piece, crypto_selector_t *sel)
 {
   const char *dash = strchr(piece, '-');
+  int32_t     rank = 0;
 
   if(dash != NULL && dash != piece)
   {
     const char *right;
     char        left[16] = {0};
     size_t      llen     = (size_t)(dash - piece);
+    int32_t     lo       = 0;
+    int32_t     hi       = 0;
 
     if(llen >= sizeof(left))
       return(false);
@@ -344,27 +358,20 @@ crypto_parse_piece(const char *piece, crypto_selector_t *sel)
 
     right = dash + 1;
 
-    if(crypto_is_digits(left) && crypto_is_digits(right))
+    if(crypto_parse_rank(left, &lo) && crypto_parse_rank(right, &hi))
     {
       sel->kind     = CRYPTO_SEL_RANGE;
-      sel->range.lo = atoi(left);
-      sel->range.hi = atoi(right);
-
-      if(sel->range.lo > sel->range.hi)
-      {
-        int32_t tmp   = sel->range.lo;
-        sel->range.lo = sel->range.hi;
-        sel->range.hi = tmp;
-      }
+      sel->range.lo = (lo <= hi) ? lo : hi;
+      sel->range.hi = (lo <= hi) ? hi : lo;
 
       return(true);
     }
   }
 
-  if(crypto_is_digits(piece))
+  if(crypto_parse_rank(piece, &rank))
   {
     sel->kind = CRYPTO_SEL_RANK;
-    sel->rank = atoi(piece);
+    sel->rank = rank;
     return(true);
   }
 

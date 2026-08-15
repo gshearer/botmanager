@@ -676,15 +676,22 @@ main_parse_args(int argc, char *argv[], botmanctl_opts_t *out)
         break;
 
       case 'S':
-        out->subscribe_sev = atoi(optarg);
+      {
+        char *end;
+        long  sev;
 
-        if(out->subscribe_sev < 0 || out->subscribe_sev > 7)
+        errno = 0;
+        sev   = strtol(optarg, &end, 10);
+
+        if(errno != 0 || end == optarg || *end != '\0' || sev < 0 || sev > 7)
         {
           fprintf(stderr, "severity must be 0-7\n");
           return(1);
         }
 
+        out->subscribe_sev = (int)sev;
         break;
+      }
 
       case 'r':
         out->subscribe_regex = optarg;

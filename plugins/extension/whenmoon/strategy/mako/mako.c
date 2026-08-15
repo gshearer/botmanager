@@ -666,9 +666,9 @@ wm_strategy_on_bar(wm_strategy_ctx_t *ctx,
     float  ema      = bar->ind[WM_IND_EMA_20];
     float  atr      = bar->ind[WM_IND_ATR_14];
     float  bbl      = bar->ind[WM_IND_BB_LOWER];
-    bool   have_ind = !isnanf(ema) && !isnanf(atr) && atr > 0.0f;
+    bool   have_ind = !isnan(ema) && !isnan(atr) && atr > 0.0f;
     double anchor   = (s->dip_ref == 1) ? (double)bbl : (double)ema;
-    bool   have_anchor = have_ind && (s->dip_ref == 0 || !isnanf(bbl));
+    bool   have_anchor = have_ind && (s->dip_ref == 0 || !isnan(bbl));
 
     if(!s->in_position)
     {
@@ -755,7 +755,7 @@ wm_strategy_on_bar(wm_strategy_ctx_t *ctx,
   else
   {
     float  atr       = bar->ind[WM_IND_ATR_14];
-    bool   have_atr  = !isnanf(atr) && atr > 0.0f;
+    bool   have_atr  = !isnan(atr) && atr > 0.0f;
     double chand_lv  = -1.0;
     bool   hit_chand;
     bool   hit_regime;

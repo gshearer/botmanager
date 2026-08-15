@@ -401,7 +401,7 @@ wm_strategy_on_bar(wm_strategy_ctx_t *ctx,
 
     if(have_peak && dd_state)
       why = "dd";
-    else if(!isnanf(natr) && keel_vol_blowout(s, (double)natr))
+    else if(!isnan(natr) && keel_vol_blowout(s, (double)natr))
       why = "vol";
 
     if(why != NULL)
@@ -440,7 +440,7 @@ wm_strategy_on_bar(wm_strategy_ctx_t *ctx,
       s->flat_bars++;
 
       if(s->flat_bars >= s->min_flat && !dd_state &&
-         !isnanf(ma) && close > (double)ma)
+         !isnan(ma) && close > (double)ma)
       {
         sig.score      = 1.0;
         sig.confidence = 0.6;
@@ -457,7 +457,7 @@ wm_strategy_on_bar(wm_strategy_ctx_t *ctx,
   // windows only ever hold strictly-prior bars.
   keel_close_push(s, close);
 
-  if(!isnanf(natr))
+  if(!isnan(natr))
     keel_natr_push(s, (double)natr);
 
   if(fire)
