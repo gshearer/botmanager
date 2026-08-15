@@ -92,11 +92,14 @@ check_spare(void)
   {
     if(spawn_worker_locked())
     {
-      uint16_t n = pool_size;
+      // Both counters are snapshotted here: reading pool_idle after the
+      // unlock raced every worker's guarded pool_idle++ for one log line.
+      uint16_t n     = pool_size;
+      uint16_t spare = pool_idle;
 
       pthread_mutex_unlock(&pool_mutex);
       clam(CLAM_DEBUG, "pool", "scaled to %u workers (spare: %u)",
-          n, pool_idle);
+          n, spare);
       return;
     }
   }

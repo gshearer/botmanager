@@ -343,21 +343,32 @@ struct curl_request
   struct curl_request *next;
 };
 
+// _Atomic for the same reason as sock_cfg_t: curl_load_config() runs on
+// a command thread and every reader here is the multi loop or a drain
+// (measured, TSan 2026-08-15). user_agent is not a scalar and cannot be
+// covered this way — it is rewritten in place while the drain reads it,
+// an unmeasured sibling of the same race.
 typedef struct
 {
-  uint32_t timeout;           // default request timeout (seconds)
-  uint32_t connect_timeout;   // connection timeout (seconds)
-  uint32_t max_active;        // max concurrent transfers
-  uint32_t max_queued;        // max pending in submit queue
-  uint32_t max_response_sz;   // max response body size (bytes)
-  uint32_t poll_timeout;      // multi poll timeout (ms)
-  uint32_t max_conns;         // max total connections in pool
-  uint32_t max_host_conns;    // max connections per host
-  uint32_t verbose;           // enable curl verbose logging
-  char     user_agent[CURL_UA_SZ]; // default User-Agent string
+  _Atomic uint32_t timeout;           // default request timeout (seconds)
+  _Atomic uint32_t connect_timeout;   // connection timeout (seconds)
+  _Atomic uint32_t max_active;        // max concurrent transfers
+  _Atomic uint32_t max_queued;        // max pending in submit queue
+  _Atomic uint32_t max_response_sz;   // max response body size (bytes)
+  _Atomic uint32_t poll_timeout;      // multi poll timeout (ms)
+  _Atomic uint32_t max_conns;         // max total connections in pool
+  _Atomic uint32_t max_host_conns;    // max connections per host
+  _Atomic uint32_t verbose;           // enable curl verbose logging
+  char             user_agent[CURL_UA_SZ]; // default User-Agent string
 } curl_cfg_t;
 
+// Owned by the multi loop thread from creation to cleanup. A config
+// change used to reach in and curl_multi_setopt() it from the command
+// thread -- a data race on the pointer AND concurrent use of a handle
+// libcurl only allows one thread to drive. The loop applies the two
+// connection limits itself when this flag is set.
 static CURLM             *curl_multi_handle = NULL;
+static _Atomic bool       curl_conn_opts_dirty = false;
 static task_handle_t      curl_task         = TASK_HANDLE_NONE;
 static int                curl_wake_fd      = -1;
 static bool               curl_ready        = false;

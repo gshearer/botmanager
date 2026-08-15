@@ -104,6 +104,11 @@ task_t *task_create(const char *name, task_type_t type, uint8_t priority,
 // TASK_DEFERRED tasks are placed in the timer queue if sleep_until is set.
 void task_submit(task_t *t);
 
+// Create and submit in one call. ⚠ The returned pointer is only ever
+// safe to test against NULL: the task is queued before this returns, so
+// a worker may already have run it and freed the struct. Anything that
+// needs to name the task afterwards wants a handle — task_add_deferred
+// or task_add_periodic.
 task_t *task_add(const char *name, task_type_t type, uint8_t priority,
     task_cb_t cb, void *data);
 

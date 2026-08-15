@@ -167,11 +167,18 @@ typedef struct sock_sendbuf
   struct sock_sendbuf *next;
 } sock_sendbuf_t;
 
+// state and connect_started are the two scalars more than one thread
+// touches without agreeing on a lock: sock_connect() writes both from
+// whichever thread asked for the connection, while the epoll worker
+// reads them in sock_check_timeouts() under sock_mutex (measured, TSan
+// 2026-08-15). _Atomic rather than the lock because the writers are
+// spread across the connect, resolve and close paths and only the
+// reader ever held it — a stale deadline mis-times a connect timeout.
 struct sock_session
 {
   char                name[SOCK_NAME_SZ];
   sock_type_t         type;
-  sock_state_t        state;
+  _Atomic sock_state_t state;
   int                 fd;
 
   sock_cb_t           cb;
@@ -191,9 +198,16 @@ struct sock_session
   sock_sendbuf_t     *send_head;
   sock_sendbuf_t     *send_tail;
   uint32_t            send_queued;    // bytes currently queued
-  bool                epollout_armed;
 
-  time_t              connect_started;
+  // Filed with the send queue but not actually guarded by send_lock:
+  // sock_send() reads it holding the lock, sock_epoll_rearm() writes it
+  // on the epoll worker holding nothing (measured, TSan 2026-08-15).
+  // A stale read costs a missed or redundant worker wake, so _Atomic is
+  // enough — taking send_lock inside rearm would put the epoll thread
+  // under a second lock on its hot path for a single byte.
+  _Atomic bool        epollout_armed;
+
+  _Atomic time_t      connect_started;
   time_t              connected_at;
   time_t              last_activity;
 
@@ -219,17 +233,22 @@ typedef struct
   task_handle_t task;         // persist task handle
 } sock_worker_t;
 
+// Every field is written by a `set kv` on a command thread and read by
+// the epoll worker with no lock between them (measured, TSan
+// 2026-08-15). A live knob is a one-word scalar, so _Atomic is the
+// whole fix: the reader gets the old value or the new one, never a
+// torn one, and neither side takes a lock to say so.
 typedef struct
 {
-  uint32_t connect_timeout;
-  uint32_t read_buf_sz;
-  uint32_t send_queue_max;
-  uint32_t idle_timeout;
-  uint32_t keepalive;
-  uint32_t max_sessions;
-  uint32_t epoll_max_events;
-  uint32_t epoll_timeout;
-  uint32_t epoll_workers;
+  _Atomic uint32_t connect_timeout;
+  _Atomic uint32_t read_buf_sz;
+  _Atomic uint32_t send_queue_max;
+  _Atomic uint32_t idle_timeout;
+  _Atomic uint32_t keepalive;
+  _Atomic uint32_t max_sessions;
+  _Atomic uint32_t epoll_max_events;
+  _Atomic uint32_t epoll_timeout;
+  _Atomic uint32_t epoll_workers;
 } sock_cfg_t;
 
 static sock_session_t  *sock_list         = NULL;

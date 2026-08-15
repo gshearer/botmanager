@@ -39,7 +39,12 @@ typedef struct
   task_handle_t   reader;           // joined by cb_ws_stop; never a task_t *
   bool            exit_requested;
 
-  bool            enabled;          // latched copy of plugin.coinbase.ws_enabled
+  // Latched copy of plugin.coinbase.ws_enabled. _Atomic because the two
+  // writers disagree on the lock: cb_ws_start() latches it on the main
+  // thread holding nothing, the reader re-latches it in
+  // cb_ws_apply_reconfig_locked() under w->lock (measured, TSan
+  // 2026-08-15). One byte, so atomicity is the whole fix.
+  _Atomic bool    enabled;
 
   char            url[CB_URL_SZ];
   uint32_t        reconnect_base_ms;

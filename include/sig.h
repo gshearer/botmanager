@@ -74,10 +74,12 @@ static volatile sig_atomic_t shutdown_signal = 0;
 
 // Set by sig_request_shutdown() — programmatic shutdown requests
 // (e.g. /quit). Read by pool_run_parent via sig_shutdown_requested().
-// Volatile because it's written on a worker thread and read on the
-// parent thread without taking a lock; task_wake_all() in
-// sig_request_shutdown() provides the ordering guarantee.
-static volatile bool internal_shutdown = false;
+// _Atomic, not volatile: it is written on a command thread and read on
+// the parent thread with no lock between them, and volatile promises
+// nothing about that (measured as a data race, TSan 2026-08-15).
+// task_wake_all() in sig_request_shutdown() is what makes the parent
+// look promptly; it was never what made the flag safe to read.
+static _Atomic bool internal_shutdown = false;
 
 static bool sig_active = false;
 

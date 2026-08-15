@@ -299,20 +299,27 @@ task_handle_t
 task_add_periodic(const char *name, task_type_t type,
     uint8_t priority, uint32_t interval_ms, task_cb_t cb, void *data)
 {
-  task_t *t = task_create(name, type, priority, cb, data);
+  task_t       *t  = task_create(name, type, priority, cb, data);
+  task_handle_t id = t->id;
 
   t->kind        = TASK_PERIODIC;
   t->interval_ms = interval_ms;
 
+  // The handle is read BEFORE submitting, never after: the instant
+  // task_submit returns, a worker may already have run the task to
+  // completion and freed it (measured, TSan 2026-08-15, on the
+  // task_add_deferred twin below). task_add_persist has always done it
+  // this way and says why.
   task_submit(t);
-  return(t->id);
+  return(id);
 }
 
 task_handle_t
 task_add_deferred(const char *name, task_type_t type,
     uint8_t priority, uint32_t delay_ms, task_cb_t cb, void *data)
 {
-  task_t *t = task_create(name, type, priority, cb, data);
+  task_t       *t  = task_create(name, type, priority, cb, data);
+  task_handle_t id = t->id;
 
   t->kind        = TASK_DEFERRED;
   t->sleep_until = time(NULL) + (time_t)(delay_ms / 1000);
@@ -321,8 +328,11 @@ task_add_deferred(const char *name, task_type_t type,
   if(delay_ms > 0 && t->sleep_until <= time(NULL))
     t->sleep_until = time(NULL) + 1;
 
+  // Snapshot the handle before submitting -- see task_add_periodic.
+  // A zero-delay deferred task goes straight to the ready queue, so
+  // `t` can be freed by a worker before this thread reads it back.
   task_submit(t);
-  return(t->id);
+  return(id);
 }
 
 // Unlink `t` from the singly-linked list headed at `*head` if present.

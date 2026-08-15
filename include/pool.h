@@ -77,24 +77,32 @@ typedef enum
 } worker_state_t;
 
 typedef struct
+// jobs, last_active and wstate are the three a worker updates about
+// itself with no lock -- per task completion in worker_entry() and
+// pool_run_parent() -- while pool_get_stats() and the persist reapers
+// read them under pool_mutex (measured, TSan 2026-08-15). Everything
+// else here is written only under that lock.
 {
-  uint8_t        id;
-  pthread_t      thread;
-  uint64_t       jobs;
-  time_t         created;
-  time_t         last_active;
-  worker_state_t wstate;
-  bool           idle;        // true while in task_wait
-  task_handle_t  task_id;     // persist slots only; what pool_join_persist matches
+  uint8_t                id;
+  pthread_t              thread;
+  _Atomic uint64_t       jobs;
+  time_t                 created;
+  _Atomic time_t         last_active;
+  _Atomic worker_state_t wstate;
+  bool                   idle;    // true while in task_wait
+  task_handle_t          task_id; // persist slots only; what pool_join_persist matches
 } worker_t;
 
+// _Atomic for the same reason as sock_cfg_t / curl_cfg_t: pool_load_config()
+// runs on a command thread while workers read these in should_retire()
+// (measured, TSan 2026-08-15).
 typedef struct
 {
-  uint16_t max_threads;
-  uint16_t min_threads;
-  uint16_t min_spare;
-  uint32_t max_idle_secs;
-  uint32_t wait_ms;
+  _Atomic uint16_t max_threads;
+  _Atomic uint16_t min_threads;
+  _Atomic uint16_t min_spare;
+  _Atomic uint32_t max_idle_secs;
+  _Atomic uint32_t wait_ms;
 } pool_cfg_t;
 
 static pool_cfg_t pool_cfg = {

@@ -1285,6 +1285,17 @@ curl_multi_loop(task_t *t)
     if(curl_drain_initiated && !curl_drain_complete)
       curl_run_shutdown_drain();
 
+    // 0b. Apply any connection-limit change a `set kv` left for us.
+    if(curl_conn_opts_dirty)
+    {
+      curl_conn_opts_dirty = false;
+
+      curl_multi_setopt(curl_multi_handle, CURLMOPT_MAX_TOTAL_CONNECTIONS,
+          (long)curl_cfg.max_conns);
+      curl_multi_setopt(curl_multi_handle, CURLMOPT_MAX_HOST_CONNECTIONS,
+          (long)curl_cfg.max_host_conns);
+    }
+
     // 1. Drain any newly submitted requests into multi.
     curl_drain_queue();
 
@@ -1440,14 +1451,9 @@ curl_load_config(void)
     snprintf(curl_cfg.user_agent, sizeof(curl_cfg.user_agent),
         "%s", CURL_DEF_USER_AGENT);
 
-  // Apply connection pool changes to multi handle if running.
-  if(curl_multi_handle != NULL)
-  {
-    curl_multi_setopt(curl_multi_handle, CURLMOPT_MAX_TOTAL_CONNECTIONS,
-        (long)curl_cfg.max_conns);
-    curl_multi_setopt(curl_multi_handle, CURLMOPT_MAX_HOST_CONNECTIONS,
-        (long)curl_cfg.max_host_conns);
-  }
+  // Hand the connection limits to the loop that owns the multi handle
+  // rather than setting them from this thread.
+  curl_conn_opts_dirty = true;
 }
 
 // Statistics and utility

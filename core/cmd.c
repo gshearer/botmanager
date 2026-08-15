@@ -597,6 +597,15 @@ cmd_unregister_path(const char *path)
   if(path == NULL || path[0] == '\0')
     return(0);
 
+  // Every plugin unregisters its verbs from deinit(), which main.c runs
+  // at step 6 -- long after cmd_exit() (step 1b) has freed every
+  // definition and destroyed cmd_mutex. Locking it there is undefined
+  // behaviour that glibc happens to tolerate, and it is loud: TSan
+  // counted 89 reports in one shutdown. There is nothing left to
+  // unregister once the subsystem is down, so say so before the lock.
+  if(!cmd_ready)
+    return(0);
+
   pthread_mutex_lock(&cmd_mutex);
   d = resolve_parent_path_locked(path);
 
@@ -1616,6 +1625,12 @@ cmd_sink_unregister(uint64_t id)
   cmd_sink_t *dead = NULL;
 
   if(id == 0)
+    return;
+
+  // Same window as cmd_unregister_path: a plugin retracts its sinks
+  // from stop() (main.c step 2), by which point cmd_exit() has already
+  // freed the registry and destroyed cmd_sink_mutex.
+  if(!cmd_ready)
     return;
 
   pthread_mutex_lock(&cmd_sink_mutex);

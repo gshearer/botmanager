@@ -2,6 +2,7 @@
 // Tracked allocator wrappers (mem_alloc / mem_free) with diagnostics.
 #define MEM_INTERNAL
 #include "alloc.h"
+#include "clam.h"
 #include "cmd.h"
 #include "colors.h"
 #include "util.h"
@@ -473,9 +474,16 @@ mem_exit(void)
     {
       next = e->next;
       leaked++;
-      fprintf(stderr,
-          "[WARN] mem_exit: LEAK: '%s/%s' %zu bytes (allocated at %ld)\n",
+
+      // Through clam(), not stderr: daemonize() puts fd 2 on /dev/null,
+      // so this report — the tree's real leak detector, since LSan still
+      // reaches every block through this journal and calls it
+      // still-reachable — went nowhere for the daemon's whole life.
+      // clam is shut down after us (main.c) and its emit path takes no
+      // tracked allocation, so it is still safe to call from here.
+      clam(CLAM_WARN, "mem_exit", "LEAK: '%s/%s' %zu bytes (allocated at %ld)",
           e->module, e->name, e->sz, (long)e->timestamp);
+
       mem_heap_sz -= e->sz;
       free(e->ptr);
       free(e);
@@ -503,10 +511,10 @@ mem_exit(void)
   mem_freelist_count = 0;
 
   if(leaked > 0)
-    fprintf(stderr, "[WARN] mem_exit: %lu allocation(s) leaked\n",
+    clam(CLAM_WARN, "mem_exit", "%lu allocation(s) leaked",
         (unsigned long)leaked);
 
-  fprintf(stdout, "[INFO] mem_exit: memory manager shut down (heap: %zu)\n",
+  clam(CLAM_INFO, "mem_exit", "memory manager shut down (heap: %zu)",
       mem_heap_sz);
 
   pthread_mutex_destroy(&mem_mutex);

@@ -215,7 +215,9 @@ bool cmd_register(const char *module, const char *name,
 //   "irc/network/list"  a leaf three levels deep
 // Removal is depth-first: every descendant is freed before its parent,
 // so no definition is ever reparented. An unresolved path is silent --
-// teardown must be idempotent.
+// teardown must be idempotent, and so is a call made after cmd_exit():
+// a plugin's deinit() runs long after the registry it is unregistering
+// from was freed, and gets 0.
 // returns: number of definitions removed; 0 if the path does not resolve
 uint32_t cmd_unregister_path(const char *path);
 
