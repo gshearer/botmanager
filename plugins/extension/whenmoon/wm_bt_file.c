@@ -545,7 +545,7 @@ wm_bt_file_open(const char *path, char *err, size_t err_cap)
       sizeof(snap->mkt.product_id));
   snap->mkt.market_id = -1;        // mmap'd snapshot has no DB row binding
 
-  if(pthread_mutex_init(&snap->mkt.lock, NULL) != 0)
+  if(wm_market_lock_init(&snap->mkt.lock) != SUCCESS)
   {
     mem_free(snap);
     munmap(base, sz);

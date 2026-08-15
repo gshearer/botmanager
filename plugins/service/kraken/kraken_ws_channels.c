@@ -170,6 +170,15 @@ static struct
   kr_ws_corr_entry_t       corr_ring[KR_WS_CH_REQ_RING_SIZE];
   _Atomic uint32_t         next_req_id;
 
+  // SAN-10 (coinbase twin, OBS-5): consumer callbacks run with `mu`
+  // RELEASED (see kr_ws_fanout), so the lock no longer answers "is a
+  // callback running?". This counter does, and it is what keeps
+  // kr_ws_unsubscribe's contract — it returns only once nothing is
+  // inside a consumer's callback. Both are mu-guarded; `drain` is
+  // broadcast as the count reaches zero.
+  uint32_t                 in_dispatch;
+  pthread_cond_t           drain;
+
   bool                     initialized;
 } kr_ws_ch;
 
@@ -673,11 +682,36 @@ kr_ws_get_int64_loose(struct json_object *obj, const char *key)
 }
 
 // Deliver one event to every sub whose channel/product set covers it.
-// Caller holds kr_ws_ch.mu — callbacks fire with the lock taken,
-// matching the documented no-reentry contract on the consumer.
+// Takes kr_ws_ch.mu itself; the caller must NOT hold it.
+//
+// SAN-10 (the coinbase twin flagged DEDUCED as OBS-5): the matching
+// subscribers are collected under the lock and called with it released.
+// A consumer callback is another plugin's code and takes that plugin's
+// locks — whenmoon's takes the markets rwlock — while whenmoon's
+// subscribe path takes them the other way round, market rwlock then
+// this mutex. Fanning out under `mu` closes that cycle. It was measured
+// on coinbase; kraken has never been exercised under TSan, and this is
+// the same code with a different wire format.
+//
+// `in_dispatch` replaces the lock as unsubscribe's barrier: it is
+// raised before the lock goes and dropped after the last callback
+// returns, so an unsubscribe that has already unlinked its sub still
+// waits for a delivery in flight. A consumer callback still must not
+// call kr_ws_subscribe / kr_ws_unsubscribe — that now waits on itself
+// rather than deadlocking on the mutex.
 static void
-kr_ws_fanout_locked(const exchange_ws_event_t *ev)
+kr_ws_fanout(const exchange_ws_event_t *ev)
 {
+  struct
+  {
+    exchange_ws_event_cb_t cb;
+    void                  *user;
+  }        targets[KR_WS_CH_MAX_SUBS];   // subscribe caps the list at this
+  uint32_t n = 0;
+  uint32_t i;
+
+  pthread_mutex_lock(&kr_ws_ch.mu);
+
   for(struct exchange_ws_sub *s = kr_ws_ch.head; s != NULL; s = s->next)
   {
     bool match;
@@ -695,7 +729,7 @@ kr_ws_fanout_locked(const exchange_ws_event_t *ev)
     else
     {
       match = false;
-      for(uint32_t i = 0; i < s->n_products; i++)
+      for(i = 0; i < s->n_products; i++)
       {
         if(strcmp(s->products[i], ev->product_id) == 0)
         {
@@ -706,8 +740,43 @@ kr_ws_fanout_locked(const exchange_ws_event_t *ev)
     }
 
     if(match && s->cb != NULL)
-      s->cb(ev, s->user);
+    {
+      targets[n].cb   = s->cb;
+      targets[n].user = s->user;
+      n++;
+    }
   }
+
+  if(n == 0)
+  {
+    pthread_mutex_unlock(&kr_ws_ch.mu);
+    return;
+  }
+
+  kr_ws_ch.in_dispatch++;
+
+  pthread_mutex_unlock(&kr_ws_ch.mu);
+
+  for(i = 0; i < n; i++)
+    targets[i].cb(ev, targets[i].user);
+
+  pthread_mutex_lock(&kr_ws_ch.mu);
+
+  kr_ws_ch.in_dispatch--;
+
+  if(kr_ws_ch.in_dispatch == 0)
+    pthread_cond_broadcast(&kr_ws_ch.drain);
+
+  pthread_mutex_unlock(&kr_ws_ch.mu);
+}
+
+// Wait out every consumer callback currently in flight. Caller holds
+// kr_ws_ch.mu; it is released while waiting and held again on return.
+static void
+kr_ws_drain_dispatch_locked(void)
+{
+  while(kr_ws_ch.in_dispatch > 0)
+    pthread_cond_wait(&kr_ws_ch.drain, &kr_ws_ch.mu);
 }
 
 // ------ per-channel parsers ------
@@ -716,7 +785,7 @@ kr_ws_fanout_locked(const exchange_ws_event_t *ev)
 // contains per-frame metadata that's threaded in as `frame_time_ms`.
 
 static void
-kr_ws_dispatch_ticker_locked(struct json_object *row, int64_t frame_time_ms)
+kr_ws_dispatch_ticker(struct json_object *row, int64_t frame_time_ms)
 {
   exchange_ws_event_t   ev = {0};
   exchange_ws_ticker_t *t  = &ev.payload.ticker;
@@ -739,11 +808,11 @@ kr_ws_dispatch_ticker_locked(struct json_object *row, int64_t frame_time_ms)
   t->high_24h   = kr_ws_get_decimal(row, "high");
   t->time_ms    = frame_time_ms;
 
-  kr_ws_fanout_locked(&ev);
+  kr_ws_fanout(&ev);
 }
 
 static void
-kr_ws_dispatch_trade_row_locked(struct json_object *row, int64_t frame_time_ms)
+kr_ws_dispatch_trade_row(struct json_object *row, int64_t frame_time_ms)
 {
   exchange_ws_event_t  ev = {0};
   exchange_ws_match_t *m  = &ev.payload.match;
@@ -776,11 +845,11 @@ kr_ws_dispatch_trade_row_locked(struct json_object *row, int64_t frame_time_ms)
   if(m->time_ms == 0)
     m->time_ms = frame_time_ms;
 
-  kr_ws_fanout_locked(&ev);
+  kr_ws_fanout(&ev);
 }
 
 static void
-kr_ws_dispatch_ohlc_row_locked(struct json_object *row, int64_t frame_time_ms)
+kr_ws_dispatch_ohlc_row(struct json_object *row, int64_t frame_time_ms)
 {
   exchange_ws_event_t  ev = {0};
   exchange_ws_ohlc_t  *o  = &ev.payload.ohlc;
@@ -820,7 +889,7 @@ kr_ws_dispatch_ohlc_row_locked(struct json_object *row, int64_t frame_time_ms)
   if(o->ts_open_ms == 0)
     o->ts_open_ms = o->time_ms;
 
-  kr_ws_fanout_locked(&ev);
+  kr_ws_fanout(&ev);
 }
 
 // Kraken v2 executions row carries the order lifecycle:
@@ -834,7 +903,7 @@ kr_ws_dispatch_ohlc_row_locked(struct json_object *row, int64_t frame_time_ms)
 // On exec_type=="trade" the row also carries a fill snapshot: trade_id,
 // last_qty, last_price.
 static void
-kr_ws_dispatch_executions_row_locked(struct json_object *row,
+kr_ws_dispatch_executions_row(struct json_object *row,
     int64_t frame_time_ms)
 {
   char         exec_type[16] = {0};
@@ -891,7 +960,7 @@ kr_ws_dispatch_executions_row_locked(struct json_object *row,
     if(f->time_ms == 0)
       f->time_ms = frame_time_ms;
 
-    kr_ws_fanout_locked(&ev);
+    kr_ws_fanout(&ev);
   }
   else
   {
@@ -926,7 +995,7 @@ kr_ws_dispatch_executions_row_locked(struct json_object *row,
 
     o->creation_time_ms = o->time_ms;
 
-    kr_ws_fanout_locked(&ev);
+    kr_ws_fanout(&ev);
   }
 }
 
@@ -935,7 +1004,7 @@ kr_ws_dispatch_executions_row_locked(struct json_object *row,
 // status="balances_update" so consumers can ignore-or-handle. KR-5
 // keeps the channel parsed for completeness but no consumer drives it.
 static void
-kr_ws_dispatch_balances_row_locked(struct json_object *row,
+kr_ws_dispatch_balances_row(struct json_object *row,
     int64_t frame_time_ms)
 {
   (void)row;
@@ -1089,8 +1158,10 @@ kr_ws_channels_dispatch(const char *buf, size_t len)
 
   n = json_object_array_length(data);
 
-  pthread_mutex_lock(&kr_ws_ch.mu);
-
+  // No lock here: the parsers below read the frame and nothing else,
+  // and kr_ws_fanout takes kr_ws_ch.mu for exactly as long as it needs
+  // the subscriber list (SAN-10). The ack handler above keeps its own
+  // hold — it is the one path that touches the slot table.
   for(i = 0; i < n; i++)
   {
     struct json_object *row = json_object_array_get_idx(data, i);
@@ -1100,26 +1171,24 @@ kr_ws_channels_dispatch(const char *buf, size_t len)
     switch(ch)
     {
       case KR_CH_TICKER:
-        kr_ws_dispatch_ticker_locked(row, frame_time_ms);
+        kr_ws_dispatch_ticker(row, frame_time_ms);
         break;
       case KR_CH_TRADE:
-        kr_ws_dispatch_trade_row_locked(row, frame_time_ms);
+        kr_ws_dispatch_trade_row(row, frame_time_ms);
         break;
       case KR_CH_OHLC:
-        kr_ws_dispatch_ohlc_row_locked(row, frame_time_ms);
+        kr_ws_dispatch_ohlc_row(row, frame_time_ms);
         break;
       case KR_CH_EXECUTIONS:
-        kr_ws_dispatch_executions_row_locked(row, frame_time_ms);
+        kr_ws_dispatch_executions_row(row, frame_time_ms);
         break;
       case KR_CH_BALANCES:
-        kr_ws_dispatch_balances_row_locked(row, frame_time_ms);
+        kr_ws_dispatch_balances_row(row, frame_time_ms);
         break;
       case KR_CH__COUNT:
         break;
     }
   }
-
-  pthread_mutex_unlock(&kr_ws_ch.mu);
 
   json_object_put(root);
 }
@@ -1475,6 +1544,13 @@ kr_ws_unsubscribe(exchange_ws_sub_t *handle)
 
   sub_id = handle->id;
 
+  // Unlinked above, so no further fan-out can pick this sub up; wait
+  // out the deliveries already running before the handle — and the
+  // consumer's `user` behind it — goes away. SAN-10: the fan-out no
+  // longer holds `mu`, so the unlink alone is not the barrier it used
+  // to be.
+  kr_ws_drain_dispatch_locked();
+
   // Decrement refcounts on every slot this sub held. Walk the abstract
   // channel mask, expand each abstract channel to its internal
   // kr_ws_channel_t list, and decrement the matching slot.
@@ -1550,6 +1626,7 @@ kr_ws_channels_init(void)
 
   memset(&kr_ws_ch, 0, sizeof(kr_ws_ch));
   pthread_mutex_init(&kr_ws_ch.mu, NULL);
+  pthread_cond_init(&kr_ws_ch.drain, NULL);
   atomic_store(&kr_ws_ch.next_req_id, 0u);
 
   for(uint32_t i = 0; i < KR_WS_CH_REQ_RING_SIZE; i++)
@@ -1570,19 +1647,27 @@ kr_ws_channels_deinit(void)
 
   pthread_mutex_lock(&kr_ws_ch.mu);
 
+  // Drop the list first so nothing new fans out, then wait out what is
+  // already inside a consumer callback — freeing a sub under a live
+  // delivery is the same hazard kr_ws_unsubscribe drains for.
   s = kr_ws_ch.head;
+
+  kr_ws_ch.head    = NULL;
+  kr_ws_ch.n_subs  = 0;
+  kr_ws_ch.n_slots = 0;
+
+  kr_ws_drain_dispatch_locked();
+
   while(s != NULL)
   {
     n = s->next;
     mem_free(s);
     s = n;
   }
-  kr_ws_ch.head    = NULL;
-  kr_ws_ch.n_subs  = 0;
-  kr_ws_ch.n_slots = 0;
 
   pthread_mutex_unlock(&kr_ws_ch.mu);
 
+  pthread_cond_destroy(&kr_ws_ch.drain);
   pthread_mutex_destroy(&kr_ws_ch.mu);
   kr_ws_ch.initialized = false;
 

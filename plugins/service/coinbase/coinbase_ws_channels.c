@@ -96,6 +96,14 @@ static struct
   uint64_t                last_sub_sent_ms;
   uint64_t                last_ack_ms;
 
+  // SAN-10: consumer callbacks run with `mu` RELEASED (see cb_ws_fanout),
+  // so the lock no longer answers "is a callback running?". This counter
+  // does, and it is what keeps coinbase_ws_unsubscribe's contract — it
+  // returns only once nothing is inside a consumer's callback. Both are
+  // mu-guarded; `drain` is broadcast as the count reaches zero.
+  uint32_t                in_dispatch;
+  pthread_cond_t          drain;
+
   bool                    initialized;
 } cb_ws_ch;
 
@@ -486,12 +494,36 @@ cb_ws_send_delta_locked(const char *op, cb_ws_slot_pred_t pred,
 // ----------------------------------------------------------------------
 
 // Deliver one event to every sub whose channel/product set covers the
-// event. Called with cb_ws_ch.mu held — callbacks are invoked with the
-// lock taken, which matches the documented no-reentry contract on the
-// consumer callback.
+// event. Takes cb_ws_ch.mu itself; the caller must NOT hold it.
+//
+// SAN-10: the matching subscribers are collected under the lock and
+// called with it released. A consumer callback is another plugin's
+// code and takes that plugin's locks — whenmoon's takes the markets
+// rwlock — while whenmoon's subscribe path takes them the other way
+// round, market rwlock then this mutex. Fanning out under `mu` closed
+// that cycle; TSan measured it on the resub the operator re-applies by
+// hand.
+//
+// `in_dispatch` replaces the lock as unsubscribe's barrier: it is
+// raised before the lock goes and dropped after the last callback
+// returns, so an unsubscribe that has already unlinked its sub still
+// waits for a delivery in flight. The consumer contract is unchanged
+// in the direction that matters — a callback still must not call
+// coinbase_ws_subscribe / _unsubscribe, which would now wait on itself
+// rather than deadlock on the mutex.
 static void
-cb_ws_fanout_locked(const coinbase_ws_event_t *ev)
+cb_ws_fanout(const coinbase_ws_event_t *ev)
 {
+  struct
+  {
+    coinbase_ws_event_cb_t cb;
+    void                  *user;
+  }        targets[CB_WS_CH_MAX_SUBS];   // subscribe caps the list at this
+  uint32_t n = 0;
+  uint32_t i;
+
+  pthread_mutex_lock(&cb_ws_ch.mu);
+
   for(struct coinbase_ws_sub *s = cb_ws_ch.head; s != NULL; s = s->next)
   {
     bool match;
@@ -507,7 +539,7 @@ cb_ws_fanout_locked(const coinbase_ws_event_t *ev)
     else
     {
       match = false;
-      for(uint32_t i = 0; i < s->n_products; i++)
+      for(i = 0; i < s->n_products; i++)
       {
         if(strcmp(s->products[i], ev->product_id) == 0)
         {
@@ -518,8 +550,43 @@ cb_ws_fanout_locked(const coinbase_ws_event_t *ev)
     }
 
     if(match)
-      s->cb(ev, s->user);
+    {
+      targets[n].cb   = s->cb;
+      targets[n].user = s->user;
+      n++;
+    }
   }
+
+  if(n == 0)
+  {
+    pthread_mutex_unlock(&cb_ws_ch.mu);
+    return;
+  }
+
+  cb_ws_ch.in_dispatch++;
+
+  pthread_mutex_unlock(&cb_ws_ch.mu);
+
+  for(i = 0; i < n; i++)
+    targets[i].cb(ev, targets[i].user);
+
+  pthread_mutex_lock(&cb_ws_ch.mu);
+
+  cb_ws_ch.in_dispatch--;
+
+  if(cb_ws_ch.in_dispatch == 0)
+    pthread_cond_broadcast(&cb_ws_ch.drain);
+
+  pthread_mutex_unlock(&cb_ws_ch.mu);
+}
+
+// Wait out every consumer callback currently in flight. Caller holds
+// cb_ws_ch.mu; it is released while waiting and held again on return.
+static void
+cb_ws_drain_dispatch_locked(void)
+{
+  while(cb_ws_ch.in_dispatch > 0)
+    pthread_cond_wait(&cb_ws_ch.drain, &cb_ws_ch.mu);
 }
 
 // --- per-channel parsers ---
@@ -546,7 +613,7 @@ cb_ws_lower_ascii(char *s)
 }
 
 static void
-cb_ws_dispatch_heartbeats_locked(struct json_object *event,
+cb_ws_dispatch_heartbeats(struct json_object *event,
     int64_t frame_time_ms)
 {
   coinbase_ws_heartbeat_t hb = {0};
@@ -568,11 +635,11 @@ cb_ws_dispatch_heartbeats_locked(struct json_object *event,
   ev.gap        = false;
   ev.payload    = &hb;
 
-  cb_ws_fanout_locked(&ev);
+  cb_ws_fanout(&ev);
 }
 
 static void
-cb_ws_dispatch_ticker_locked(struct json_object *event,
+cb_ws_dispatch_ticker(struct json_object *event,
     coinbase_ws_channel_t ch, int64_t frame_time_ms)
 {
   struct json_object *tickers;
@@ -616,12 +683,12 @@ cb_ws_dispatch_ticker_locked(struct json_object *event,
     pe.gap        = false;
     pe.payload    = &out;
 
-    cb_ws_fanout_locked(&pe);
+    cb_ws_fanout(&pe);
   }
 }
 
 static void
-cb_ws_dispatch_market_trades_locked(struct json_object *event,
+cb_ws_dispatch_market_trades(struct json_object *event,
     int64_t frame_time_ms)
 {
   struct json_object *trades;
@@ -666,12 +733,12 @@ cb_ws_dispatch_market_trades_locked(struct json_object *event,
     pe.gap        = false;
     pe.payload    = &m;
 
-    cb_ws_fanout_locked(&pe);
+    cb_ws_fanout(&pe);
   }
 }
 
 static void
-cb_ws_dispatch_l2_locked(struct json_object *event, int64_t frame_time_ms)
+cb_ws_dispatch_l2(struct json_object *event, int64_t frame_time_ms)
 {
   coinbase_ws_l2update_t  u   = {0};
   coinbase_ws_event_t     ev  = {0};
@@ -737,7 +804,7 @@ cb_ws_dispatch_l2_locked(struct json_object *event, int64_t frame_time_ms)
   ev.gap        = false;
   ev.payload    = &u;
 
-  cb_ws_fanout_locked(&ev);
+  cb_ws_fanout(&ev);
 }
 
 // Pull a JSON field that the gateway emits as either a quoted decimal
@@ -767,7 +834,7 @@ cb_ws_get_decimal_loose(struct json_object *obj, const char *key)
 // observations on the same order_id when no separate `fills[]` array
 // is present.
 static void
-cb_ws_dispatch_user_order_locked(struct json_object *order_obj,
+cb_ws_dispatch_user_order(struct json_object *order_obj,
     int64_t frame_time_ms)
 {
   coinbase_ws_user_event_t  evp = {0};
@@ -808,7 +875,7 @@ cb_ws_dispatch_user_order_locked(struct json_object *order_obj,
   pe.gap        = false;
   pe.payload    = &evp;
 
-  cb_ws_fanout_locked(&pe);
+  cb_ws_fanout(&pe);
 }
 
 // Parse one entry from `events[].fills[]`. Coinbase's AT docs describe
@@ -817,7 +884,7 @@ cb_ws_dispatch_user_order_locked(struct json_object *order_obj,
 // the live engine sees fills the moment the gateway starts emitting
 // them. Until then, fill detail is derived from order-update deltas.
 static void
-cb_ws_dispatch_user_fill_locked(struct json_object *fill_obj,
+cb_ws_dispatch_user_fill(struct json_object *fill_obj,
     int64_t frame_time_ms)
 {
   coinbase_ws_user_event_t  evp = {0};
@@ -855,11 +922,11 @@ cb_ws_dispatch_user_fill_locked(struct json_object *fill_obj,
   pe.gap        = false;
   pe.payload    = &evp;
 
-  cb_ws_fanout_locked(&pe);
+  cb_ws_fanout(&pe);
 }
 
 static void
-cb_ws_dispatch_user_locked(struct json_object *event,
+cb_ws_dispatch_user(struct json_object *event,
     int64_t frame_time_ms)
 {
   struct json_object *orders;
@@ -879,7 +946,7 @@ cb_ws_dispatch_user_locked(struct json_object *event,
 
       if(o == NULL) continue;
 
-      cb_ws_dispatch_user_order_locked(o, frame_time_ms);
+      cb_ws_dispatch_user_order(o, frame_time_ms);
     }
   }
 
@@ -895,13 +962,13 @@ cb_ws_dispatch_user_locked(struct json_object *event,
 
       if(f == NULL) continue;
 
-      cb_ws_dispatch_user_fill_locked(f, frame_time_ms);
+      cb_ws_dispatch_user_fill(f, frame_time_ms);
     }
   }
 }
 
 static void
-cb_ws_dispatch_status_locked(struct json_object *event,
+cb_ws_dispatch_status(struct json_object *event,
     int64_t frame_time_ms)
 {
   coinbase_ws_status_t st = {0};
@@ -916,7 +983,7 @@ cb_ws_dispatch_status_locked(struct json_object *event,
   ev.gap        = false;
   ev.payload    = &st;
 
-  cb_ws_fanout_locked(&ev);
+  cb_ws_fanout(&ev);
 }
 
 // ----------------------------------------------------------------------
@@ -930,6 +997,7 @@ cb_ws_channels_init(void)
 
   memset(&cb_ws_ch, 0, sizeof(cb_ws_ch));
   pthread_mutex_init(&cb_ws_ch.mu, NULL);
+  pthread_cond_init(&cb_ws_ch.drain, NULL);
   cb_ws_ch.initialized = true;
 
   clam(CLAM_DEBUG, CB_CTX, "ws channel multiplexer initialized");
@@ -945,19 +1013,27 @@ cb_ws_channels_deinit(void)
 
   pthread_mutex_lock(&cb_ws_ch.mu);
 
+  // Drop the list first so nothing new fans out, then wait out what is
+  // already inside a consumer callback — freeing a sub under a live
+  // delivery is the same hazard coinbase_ws_unsubscribe drains for.
   s = cb_ws_ch.head;
+
+  cb_ws_ch.head    = NULL;
+  cb_ws_ch.n_subs  = 0;
+  cb_ws_ch.n_slots = 0;
+
+  cb_ws_drain_dispatch_locked();
+
   while(s != NULL)
   {
     n = s->next;
     mem_free(s);
     s = n;
   }
-  cb_ws_ch.head    = NULL;
-  cb_ws_ch.n_subs  = 0;
-  cb_ws_ch.n_slots = 0;
 
   pthread_mutex_unlock(&cb_ws_ch.mu);
 
+  pthread_cond_destroy(&cb_ws_ch.drain);
   pthread_mutex_destroy(&cb_ws_ch.mu);
   cb_ws_ch.initialized = false;
 
@@ -1091,8 +1167,9 @@ cb_ws_channels_dispatch(const char *buf, size_t len)
 
   ev_n = json_object_array_length(events);
 
-  pthread_mutex_lock(&cb_ws_ch.mu);
-
+  // No lock here: the parsers below read the frame and nothing else,
+  // and cb_ws_fanout takes cb_ws_ch.mu for exactly as long as it needs
+  // the subscriber list (SAN-10).
   for(i = 0; i < ev_n; i++)
   {
     struct json_object *event = json_object_array_get_idx(events, i);
@@ -1100,26 +1177,24 @@ cb_ws_channels_dispatch(const char *buf, size_t len)
     if(event == NULL) continue;
 
     if(strcmp(channel, "heartbeats") == 0)
-      cb_ws_dispatch_heartbeats_locked(event, frame_time_ms);
+      cb_ws_dispatch_heartbeats(event, frame_time_ms);
     else if(strcmp(channel, "ticker") == 0)
-      cb_ws_dispatch_ticker_locked(event, COINBASE_CH_TICKER,
+      cb_ws_dispatch_ticker(event, COINBASE_CH_TICKER,
           frame_time_ms);
     else if(strcmp(channel, "ticker_batch") == 0)
-      cb_ws_dispatch_ticker_locked(event, COINBASE_CH_TICKER_BATCH,
+      cb_ws_dispatch_ticker(event, COINBASE_CH_TICKER_BATCH,
           frame_time_ms);
     else if(strcmp(channel, "market_trades") == 0)
-      cb_ws_dispatch_market_trades_locked(event, frame_time_ms);
+      cb_ws_dispatch_market_trades(event, frame_time_ms);
     else if(strcmp(channel, "l2_data") == 0)
-      cb_ws_dispatch_l2_locked(event, frame_time_ms);
+      cb_ws_dispatch_l2(event, frame_time_ms);
     else if(strcmp(channel, "status") == 0)
-      cb_ws_dispatch_status_locked(event, frame_time_ms);
+      cb_ws_dispatch_status(event, frame_time_ms);
     else if(strcmp(channel, "user") == 0)
-      cb_ws_dispatch_user_locked(event, frame_time_ms);
+      cb_ws_dispatch_user(event, frame_time_ms);
     else
       clam(CLAM_DEBUG3, CB_CTX, "ws ignoring channel=%s", channel);
   }
-
-  pthread_mutex_unlock(&cb_ws_ch.mu);
 
   json_object_put(root);
 }
@@ -1319,6 +1394,13 @@ coinbase_ws_unsubscribe(coinbase_ws_sub_t *sub)
   }
 
   sub_id = sub->id;
+
+  // Unlinked above, so no further fan-out can pick this sub up; wait
+  // out the deliveries already running before the handle — and the
+  // consumer's `user` behind it — goes away. SAN-10: the fan-out no
+  // longer holds `mu`, so the unlink alone is not the barrier it used
+  // to be.
+  cb_ws_drain_dispatch_locked();
 
   // Decrement refcounts on every slot this sub held.
   for(int ch = 0; ch < COINBASE_CH__COUNT; ch++)

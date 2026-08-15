@@ -333,6 +333,10 @@ typedef struct whenmoon_market
   double                last_px;
   int64_t               last_tick_ms;
 
+  // RECURSIVE — see wm_market_lock_init, which is the only sanctioned
+  // way to initialise it. Guards everything below plus the grain rings;
+  // ordered strictly after the container's `arr_lock` and strictly
+  // before the strategy registry's lock.
   pthread_mutex_t       lock;
 
   // WM-MK-2: market position model. Append-only — existing field
@@ -413,6 +417,24 @@ struct whenmoon_markets
 
 // Forward decl to keep this header independent of whenmoon.h.
 struct whenmoon_state;
+
+// Initialise a `whenmoon_market_t.lock`. Every market lock in the tree
+// — running set, synthetic, mmap'd snapshot — goes through here, and
+// every one of them is RECURSIVE.
+//
+// That is load-bearing, not convenience. wm_strategy_dispatch_bar holds
+// the market lock across the strategy's on_bar callback, and the
+// callback's wm_strategy_emit_signal re-enters
+// wm_market_engine_on_signal_with_mk, which takes the same lock on the
+// same thread. Releasing it around the callback instead — what
+// WM-MK-3-B did — is what put this lock and the strategy registry's in
+// a lock-order inversion (SAN-9): the registry lock was still held over
+// the re-acquire, while the aggregator path takes them the other way
+// round. Recursion answers the re-entry without ever ordering the two.
+//
+// FAIL only when the platform refuses the attribute; a market whose
+// lock did not initialise must not be published.
+bool wm_market_lock_init(pthread_mutex_t *lock);
 
 // Init: allocates the empty container. No DB or KV reads here — the
 // running set is populated by wm_market_restore on plugin start or

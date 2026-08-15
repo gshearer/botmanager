@@ -372,7 +372,7 @@ wm_backtest_snapshot_build(int32_t market_id_db,
       "%s", source_market_id);
   snap->mkt.market_id = market_id_db;
 
-  if(pthread_mutex_init(&snap->mkt.lock, NULL) != 0)
+  if(wm_market_lock_init(&snap->mkt.lock) != SUCCESS)
   {
     mem_free(snap);
 

@@ -11,23 +11,27 @@
 //
 // Locking discipline:
 //   - The registry has its own mutex (registry->lock).
+//   - Lock order is market_lock -> registry_lock, with no exception.
+//     Strategy admin commands take only the registry lock; nothing in
+//     the tree takes the registry lock and then a market lock.
 //   - Bar-close dispatch is called by aggregator.c with the per-market
-//     lock held. The dispatch path takes the registry lock briefly to
-//     find matching attachments, holds it for the iteration (the
-//     "be fast" rule keeps the hold time tiny), then releases.
-//   - WM-MK-3-B: dispatch_bar / dispatch_trade DROP mkt->lock around
-//     the strategy on_bar_fn / on_trade_fn callback so the strategy's
-//     wm_strategy_emit_signal can re-enter wm_market_engine_on_signal
-//     (which takes mkt->lock itself) without deadlocking.
-//     reg->lock stays held to keep `att` valid — wm_strategy_detach_market
-//     takes reg->lock so a concurrent market remove cannot tear down
-//     the attachment under us.
-//   - Strategy admin commands take only the registry lock.
-//   - Lock order: market_lock -> registry_lock. Strategy commands
-//     never take a market lock; nothing inverts this order. The
-//     dispatch path's mkt->lock re-acquire (after drop) does NOT
-//     deadlock because no other code path holds mkt->lock and then
-//     tries to take reg->lock.
+//     lock held. It takes the registry lock on top, holds BOTH across
+//     the strategy's on_bar_fn / on_trade_fn callback, and releases the
+//     registry lock before returning — so the market lock is never
+//     acquired while the registry lock is held, in this path or under
+//     it.
+//   - SAN-9: WM-MK-3-B used to drop mkt->lock around the callback and
+//     re-take it afterwards, to let the strategy's
+//     wm_strategy_emit_signal re-enter wm_market_engine_on_signal.
+//     That re-acquire ran under reg->lock and inverted the order
+//     against the aggregator path — TSan measured the cycle on three
+//     market locks against the one registry lock. The re-entry is now
+//     answered where it belongs, by making mkt->lock recursive
+//     (wm_market_lock_init); nothing in the dispatch path releases a
+//     lock it did not take.
+//   - Holding reg->lock across the callback is also what keeps `att`
+//     valid: wm_strategy_detach_market takes reg->lock, so a concurrent
+//     market remove cannot tear the attachment down under the callback.
 //   - WM-SU-1: the plugin-unmap listener takes reg->lock as well. It
 //     runs on the unloading thread between a strategy's deinit() and
 //     its dlclose, so that lock is precisely what serializes the
@@ -1252,11 +1256,12 @@ wm_strategy_seed_replay_cursors(whenmoon_state_t *st,
 
   reg = st->strategies;
 
-  // Snapshot the session under mk->lock and release it BEFORE taking
-  // reg->lock. Holding both would invert the dispatch path's ordering
-  // (reg->lock held across a mkt->lock re-acquire — see the locking
-  // discipline note at the head of this file), so the two locks are
-  // deliberately never held together here.
+  // Snapshot the session under mk->lock and release it before taking
+  // reg->lock. Holding both in that order would be legal (see the
+  // locking discipline at the head of this file), but the seed pass
+  // needs nothing from the market once the snapshot is taken, and a
+  // registry walk under a market lock is a hold nobody has to reason
+  // about.
   pthread_mutex_lock(&mk->lock);
   snap = mk->session;
   pthread_mutex_unlock(&mk->lock);
@@ -1644,24 +1649,22 @@ wm_strategy_dispatch_bar(whenmoon_state_t *st,
   pre_emit_ts = att->ctx.has_last_signal
       ? att->ctx.last_signal.ts_ms : 0;
 
-  // WM-MK-3-B: copy the bar onto the stack so the strategy callback
-  // sees a stable view, then drop mkt->lock around the callback. The
-  // callback may emit a signal that re-enters
-  // wm_market_engine_on_signal, which takes mkt->lock itself; without
-  // the drop we'd deadlock. reg->lock stays held to keep `att` valid
-  // (wm_market_remove takes reg->lock via wm_strategy_detach_market
-  // before tearing the slot down, so dropping mkt->lock here cannot
-  // race a market remove). The original `bar` pointer (into mkt's
-  // grain ring) may be invalidated by a concurrent push during the
-  // drop window; post-callback reads use the cached ts_close_ms
-  // snapshot below.
+  // Both locks are held across the callback, in the one order this
+  // plugin ever takes them. The strategy's wm_strategy_emit_signal
+  // re-enters wm_market_engine_on_signal_with_mk, which takes
+  // mkt->lock again on this thread — a recursive acquire, which is
+  // exactly what mkt->lock is initialised for (wm_market_lock_init).
+  // reg->lock held across the callback is what keeps `att` valid and
+  // what the WM-SU-1 unmap listener blocks on while a dispatch is
+  // still inside the strategy's .text.
+  //
+  // The bar is copied onto the stack anyway: the callback signature is
+  // a const view, and a copy says so without depending on the callee.
   {
-    wm_candle_full_t bar_copy   = *bar;
+    wm_candle_full_t bar_copy    = *bar;
     int64_t          ts_close_ms = bar->ts_close_ms;
 
-    pthread_mutex_unlock(&mkt->lock);
     att->owner->on_bar_fn(&att->ctx, mkt, gran, &bar_copy);
-    pthread_mutex_lock(&mkt->lock);
 
     emitted_this_tick = att->ctx.has_last_signal
         && att->ctx.last_signal.ts_ms != pre_emit_ts
@@ -1705,18 +1708,16 @@ wm_strategy_dispatch_trade(whenmoon_state_t *st,
   pre_emit_ts = att->ctx.has_last_signal
       ? att->ctx.last_signal.ts_ms : 0;
 
-  // WM-MK-3-B: copy trade onto stack and drop mkt->lock around the
-  // callback (same shape as dispatch_bar). The trade pointer's
-  // backing storage is the WS event payload — it is not part of
-  // mkt's mutable state — but matching the bar dispatch's
-  // copy-then-drop discipline keeps the locking pattern uniform.
+  // Same shape as dispatch_bar: both locks held across the callback,
+  // the re-entry through emit_signal handled by mkt->lock's recursion.
+  // The trade pointer's backing storage is the WS event payload — not
+  // part of mkt's mutable state — but the copy keeps the two dispatch
+  // paths reading identically.
   {
     wm_trade_t trade_copy = *trade;
     int64_t    ts_ms      = trade->ts_ms;
 
-    pthread_mutex_unlock(&mkt->lock);
     att->owner->on_trade_fn(&att->ctx, mkt, &trade_copy);
-    pthread_mutex_lock(&mkt->lock);
 
     emitted_this_tick = att->ctx.has_last_signal
         && att->ctx.last_signal.ts_ms != pre_emit_ts;

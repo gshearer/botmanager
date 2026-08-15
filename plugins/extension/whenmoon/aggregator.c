@@ -313,11 +313,10 @@ wm_aggregator_emit_empty_1m(whenmoon_market_t *mk, int64_t bar_start_ms)
 // market_lock -> registry_lock; strategy admin commands take only
 // the registry lock so the order is consistent.
 //
-// WM-MK-3-B: wm_strategy_dispatch_bar drops mk->lock around the
-// strategy callback so the callback's emit path can re-enter
-// wm_market_engine_on_signal (which takes mk->lock itself) without
-// deadlocking. The drop window is bounded by the registry lock so
-// the attachment cannot be torn down from under the callback.
+// SAN-9: mk->lock is held across the strategy callback and stays held
+// — the emit path's re-entry into wm_market_engine_on_signal takes it
+// recursively on the same thread. Dropping it there instead is what
+// used to invert the order against this very function.
 static void
 wm_aggregator_push_bar(whenmoon_market_t *mk, wm_gran_t gran,
     const wm_candle_full_t *bar)

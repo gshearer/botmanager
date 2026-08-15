@@ -62,6 +62,31 @@ static const exchange_ws_channel_t wm_ws_channels[] = {
 // Container helpers                                                  //
 // ------------------------------------------------------------------ //
 
+// The one initialiser for every per-market mutex in the tree. Why it is
+// recursive, and what breaks if it is not, is on the prototype in
+// market.h — read that before changing the attribute.
+bool
+wm_market_lock_init(pthread_mutex_t *lock)
+{
+  pthread_mutexattr_t attr;
+
+  if(lock == NULL)
+    return(FAIL);
+
+  if(pthread_mutexattr_init(&attr) != 0)
+    return(FAIL);
+
+  if(pthread_mutexattr_settype(&attr, PTHREAD_MUTEX_RECURSIVE) != 0
+      || pthread_mutex_init(lock, &attr) != 0)
+  {
+    pthread_mutexattr_destroy(&attr);
+    return(FAIL);
+  }
+
+  pthread_mutexattr_destroy(&attr);
+  return(SUCCESS);
+}
+
 // WM-MI-1: find by (exchange, product_id, instance) — the running-set
 // dedup key. Multi-exchange running sets can carry the same product_id
 // (e.g. "BTC-USD") on more than one exchange, and multiple instances can
@@ -1200,7 +1225,13 @@ wm_market_add(whenmoon_state_t *st,
   }
 
   mk->market_id = market_id;
-  pthread_mutex_init(&mk->lock, NULL);
+
+  if(wm_market_lock_init(&mk->lock) != SUCCESS)
+  {
+    if(err != NULL) snprintf(err, err_cap, "market lock init failed");
+    mem_free(mk);
+    return(FAIL);
+  }
 
   // WM-MK-2: install the per-market position model with default-init
   // values. Lazy KV refresh replaces cached params on first engine call;
@@ -1606,7 +1637,13 @@ wm_market_create_synthetic(const char *market_id_str,
   mk->last_px      = src->last_px;
   mk->last_tick_ms = src->last_tick_ms;
 
-  pthread_mutex_init(&mk->lock, NULL);
+  if(wm_market_lock_init(&mk->lock) != SUCCESS)
+  {
+    if(errbuf != NULL && errbuf_sz > 0)
+      snprintf(errbuf, errbuf_sz, "market lock init failed");
+    mem_free(mk);
+    return(FAIL);
+  }
 
   wm_market_session_init(&mk->session);
   mk->session.mode = WM_MARKET_MODE_PAPER;
