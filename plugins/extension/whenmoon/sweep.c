@@ -1839,9 +1839,8 @@ wm_bt_sweep_run_oos_validation(whenmoon_state_t *st,
 // back-to-back result row (`.trade`) is left untouched.
 
 // Run every window in `walk` as an independent single-window iteration for
-// one result row and fill `row->folds`. Returns true when at least one
-// fold iteration completed (folds allocated); false on alloc failure only.
-static bool
+// one result row and fill `row->folds`.
+static void
 wm_bt_perfold_one_row(whenmoon_state_t *st, wm_backtest_snapshot_t *snap,
     const char *strategy_name, const wm_bt_sweep_plan_t *plan,
     const wm_bt_window_set_t *walk,
@@ -1940,7 +1939,6 @@ wm_bt_perfold_one_row(whenmoon_state_t *st, wm_backtest_snapshot_t *snap,
 
   row->folds   = folds;
   row->n_folds = walk->n;
-  return(true);
 }
 
 bool
@@ -1994,9 +1992,9 @@ wm_bt_sweep_run_walk_perfold(whenmoon_state_t *st,
     if(src >= plan->total_iters || !results[src].ok)
       continue;
 
-    if(wm_bt_perfold_one_row(st, snap, strategy_name, plan, walk,
-           base_params, src, &results[src]))
-      n_done++;
+    wm_bt_perfold_one_row(st, snap, strategy_name, plan, walk,
+        base_params, src, &results[src]);
+    n_done++;
   }
 
   mem_free(top_idx);

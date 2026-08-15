@@ -955,33 +955,29 @@ reply_nl_bridge(chatbot_req_t *r, const char *text)
 
     d = mem_alloc("chat", "nl_ask_cue", sizeof(*d));
 
-    if(d != NULL)
+    memset(d, 0, sizeof(*d));
+    d->st            = r->st;
+    d->msg           = synth;
+    d->was_addressed = r->was_addressed;
+    d->is_direct     = r->is_direct_address;
+    d->msg.reply_sink_id = 0;
+    d->msg.timestamp     = time(NULL);
+
+    snprintf(d->msg.text, sizeof(d->msg.text),
+        "[internal cue: %s asked \"%s\" but you don't know where "
+        "they live. Ask %s now, in one short line and in character, "
+        "for their city or zip code. Do not promise to look "
+        "anything up yet.]",
+        nick, excerpt, nick);
+
+    clam(CLAM_INFO, "nl_bridge",
+        "no location default for sender=%s — cueing ask instead of "
+        "dispatch", r->sender);
+
+    if(task_add("nl_bridge", TASK_ANY, 150, nl_bridge_ask_task, d) == NULL)
     {
-      memset(d, 0, sizeof(*d));
-      d->st            = r->st;
-      d->msg           = synth;
-      d->was_addressed = r->was_addressed;
-      d->is_direct     = r->is_direct_address;
-      d->msg.reply_sink_id = 0;
-      d->msg.timestamp     = time(NULL);
-
-      snprintf(d->msg.text, sizeof(d->msg.text),
-          "[internal cue: %s asked \"%s\" but you don't know where "
-          "they live. Ask %s now, in one short line and in character, "
-          "for their city or zip code. Do not promise to look "
-          "anything up yet.]",
-          nick, excerpt, nick);
-
-      clam(CLAM_INFO, "nl_bridge",
-          "no location default for sender=%s — cueing ask instead of "
-          "dispatch", r->sender);
-
-      if(task_add("nl_bridge", TASK_ANY, 150, nl_bridge_ask_task, d)
-          == NULL)
-      {
-        mem_free(d);
-        method_send(r->method, r->reply_target, CHATBOT_NL_DENIED_TEXT);
-      }
+      mem_free(d);
+      method_send(r->method, r->reply_target, CHATBOT_NL_DENIED_TEXT);
     }
 
     return;
@@ -2682,15 +2678,12 @@ knowledge_gather_images(chatbot_req_t *r,
     rag_img = mem_alloc("chatbot", "stash_images_rag",
         sizeof(knowledge_image_t) * cap);
 
-    if(rag_img != NULL)
-    {
-      rag_n = knowledge_images_for_chunks(ids, n_ids, rag_img, cap);
+    rag_n = knowledge_images_for_chunks(ids, n_ids, rag_img, cap);
 
-      if(rag_n == 0)
-      {
-        mem_free(rag_img);
-        rag_img = NULL;
-      }
+    if(rag_n == 0)
+    {
+      mem_free(rag_img);
+      rag_img = NULL;
     }
   }
 
@@ -2702,17 +2695,14 @@ knowledge_gather_images(chatbot_req_t *r,
     sub_img = mem_alloc("chatbot", "stash_images_sub",
         sizeof(knowledge_image_t) * sub_cap);
 
-    if(sub_img != NULL)
-    {
-      sub_n = knowledge_images_by_subject(r->knowledge_corpus,
-          r->image_subject, sub_cap, r->subject_max_age_days,
-          sub_img, sub_cap);
+    sub_n = knowledge_images_by_subject(r->knowledge_corpus,
+        r->image_subject, sub_cap, r->subject_max_age_days,
+        sub_img, sub_cap);
 
-      if(sub_n == 0)
-      {
-        mem_free(sub_img);
-        sub_img = NULL;
-      }
+    if(sub_n == 0)
+    {
+      mem_free(sub_img);
+      sub_img = NULL;
     }
   }
 
@@ -2721,8 +2711,8 @@ knowledge_gather_images(chatbot_req_t *r,
     images = mem_alloc("chatbot", "stash_images",
         sizeof(knowledge_image_t) * cap);
 
-    if(images != NULL && !knowledge_merge_images(rag_img, rag_n,
-          sub_img, sub_n, images, cap, &ni))
+    if(!knowledge_merge_images(rag_img, rag_n, sub_img, sub_n,
+          images, cap, &ni))
     {
       mem_free(images);
       images = NULL;
@@ -2776,7 +2766,6 @@ retrieve_cb(const mem_fact_t *facts, size_t n_facts,
     const mem_msg_t *msgs, size_t n_msgs, void *user)
 {
   chatbot_req_t *r = user;
-  bool stash_ok;
 
   // Fan out fact + label fetch for each dossier the sender named.
   // The array is stack-sized; lookups are synchronous, each hitting
@@ -2807,61 +2796,30 @@ retrieve_cb(const mem_fact_t *facts, size_t n_facts,
   }
 
   // Corpus bound → stash everything (memory callback's arrays are only
-  // valid for our lifetime) and chain into knowledge_retrieve. On stash
-  // failure fall back to a memory-only submit so the user still gets a
-  // reply — the persona's base model knowledge still applies.
-  stash_ok = true;
-
+  // valid for our lifetime) and chain into knowledge_retrieve.
   if(n_facts > 0)
   {
     r->stash_facts = mem_alloc("chatbot", "stash_facts",
         sizeof(mem_fact_t) * n_facts);
-    if(r->stash_facts != NULL)
-    {
-      memcpy(r->stash_facts, facts, sizeof(mem_fact_t) * n_facts);
-      r->stash_nf = n_facts;
-    }
-
-    else
-      stash_ok = false;
+    memcpy(r->stash_facts, facts, sizeof(mem_fact_t) * n_facts);
+    r->stash_nf = n_facts;
   }
 
-  if(stash_ok && n_msgs > 0)
+  if(n_msgs > 0)
   {
     r->stash_msgs = mem_alloc("chatbot", "stash_msgs",
         sizeof(mem_msg_t) * n_msgs);
-    if(r->stash_msgs != NULL)
-    {
-      memcpy(r->stash_msgs, msgs, sizeof(mem_msg_t) * n_msgs);
-      r->stash_nm = n_msgs;
-    }
-
-    else
-      stash_ok = false;
+    memcpy(r->stash_msgs, msgs, sizeof(mem_msg_t) * n_msgs);
+    r->stash_nm = n_msgs;
   }
 
-  if(stash_ok && r->n_mentions > 0)
+  if(r->n_mentions > 0)
   {
     r->stash_mentions = mem_alloc("chatbot", "stash_mentions",
         sizeof(chatbot_mention_t) * r->n_mentions);
-    if(r->stash_mentions != NULL)
-    {
-      memcpy(r->stash_mentions, mentions,
-          sizeof(chatbot_mention_t) * r->n_mentions);
-      r->stash_nmentions = r->n_mentions;
-    }
-
-    else
-      stash_ok = false;
-  }
-
-  if(!stash_ok)
-  {
-    clam(CLAM_WARN, "chatbot",
-        "knowledge stash alloc failed — submitting memory-only reply");
-    assemble_and_submit(r, facts, n_facts, msgs, n_msgs,
-        mentions, r->n_mentions, NULL, 0, NULL, 0);
-    return;
+    memcpy(r->stash_mentions, mentions,
+        sizeof(chatbot_mention_t) * r->n_mentions);
+    r->stash_nmentions = r->n_mentions;
   }
 
   if(knowledge_retrieve(r->knowledge_corpus, r->text,

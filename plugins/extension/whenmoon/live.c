@@ -1607,12 +1607,6 @@ wm_market_reconcile_real_cash(whenmoon_market_t *mk, double *out_cash,
   // use-after-free our stack (cf. finding_gemini_prime_use_after_free).
   w = wm_sync_fetch_begin(sizeof(res));
 
-  if(w == NULL)
-  {
-    RC_ERR("out of memory");
-    return(FAIL);
-  }
-
   (void)exchange_get_accounts_async(mk->exchange_name,
       wm_reconcile_on_accounts, w);
 

@@ -334,7 +334,7 @@ bool cmd_reply(const cmd_ctx_t *ctx, const char *text);
 // sinks in stop() before its mapping goes away.
 typedef void (*cmd_sink_fn_t)(void *data, const char *line);
 
-// Returns the new sink id (non-zero), or 0 on NULL fn / alloc failure.
+// Returns the new sink id (non-zero), or 0 on a NULL fn.
 uint64_t cmd_sink_register(cmd_sink_fn_t fn, void *data);
 
 // Unknown / already-removed ids are a no-op.

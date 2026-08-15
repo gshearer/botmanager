@@ -589,12 +589,9 @@ dispatch_done_cb(const llm_chat_response_t *resp)
   {
     w->content = mem_alloc("chat", "extract_resp", resp->content_len + 1);
 
-    if(w->content != NULL)
-    {
-      memcpy(w->content, resp->content, resp->content_len);
-      w->content[resp->content_len] = '\0';
-      w->content_len = resp->content_len;
-    }
+    memcpy(w->content, resp->content, resp->content_len);
+    w->content[resp->content_len] = '\0';
+    w->content_len = resp->content_len;
   }
 
   if(resp->error != NULL)

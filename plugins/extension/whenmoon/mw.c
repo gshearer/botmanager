@@ -1218,10 +1218,7 @@ mw_tickers_done_cb(bool success, const char *err,
 
   // MW-3: heap-allocate the per-tick emit buffer. 256 × ~1060 bytes
   // ≈ 272 KiB — too large for the curl-worker thread stack on some
-  // distros' default 256 KiB pthread default. On alloc FAIL we skip
-  // detection for this tick (pair state stays untouched so next tick
-  // can still transition) but still update the ring + counters, so
-  // operators see polling continuing in /show whenmoon mw.
+  // distros' default 256 KiB pthread default.
   pending = mem_alloc(WHENMOON_CTX, "mw.emits",
       (size_t)MW_EMIT_BUF_CAP * sizeof(*pending));
 
@@ -1231,8 +1228,7 @@ mw_tickers_done_cb(bool success, const char *err,
   if(!ex->enabled)
   {
     pthread_mutex_unlock(&ex->lock);
-    if(pending != NULL)
-      mem_free(pending);
+    mem_free(pending);
     return;
   }
 
@@ -1286,11 +1282,8 @@ mw_tickers_done_cb(bool success, const char *err,
 
     mw_ring_push(&ex->pairs[slot], &snaps[i], ring_n, now_ms);
 
-    // MW-3: detector hook. Caller (this loop) holds ex->lock; the
-    // returned `pending[]` slot is consumed AFTER lock release.
-    if(pending == NULL)
-      continue;
-
+    // MW-3: detector hook. Caller (this loop) holds ex->lock; every
+    // `pending[]` slot queued here is consumed AFTER lock release.
     // MW-5: ADD on first observation of a new slot, suppressed during
     // the bootstrap tick so we don't flood on enable.
     if(just_inserted && ex->tick_id > 1)
@@ -1316,7 +1309,7 @@ mw_tickers_done_cb(bool success, const char *err,
   // following a non-trivial population — likely an API outage; we'd
   // rather surface one WARN than flood the bus with thousands of
   // false REMs.
-  if(pending != NULL && ex->tick_id > 1)
+  if(ex->tick_id > 1)
   {
     if(n == 0 && ex->total_pairs_seen >= 100)
       clam(CLAM_WARN, MW_CTX,
@@ -1335,11 +1328,8 @@ mw_tickers_done_cb(bool success, const char *err,
 
   // MW-3: drain outside the lock so a slow CLAM subscriber cb cannot
   // extend ex->lock hold time.
-  if(pending != NULL)
-  {
-    mw_drain_emits(pending, n_pending);
-    mem_free(pending);
-  }
+  mw_drain_emits(pending, n_pending);
+  mem_free(pending);
 
   if(n_dropped_emits > 0)
     clam(CLAM_WARN, MW_CTX,
@@ -1407,10 +1397,8 @@ mw_periodic_cb(task_t *t)
 // Internal lifecycle helpers                                          //
 // ------------------------------------------------------------------ //
 
-// Allocates pairs[] + per-pair rings for one exchange slot. Returns
-// SUCCESS on success; on failure any partial allocation is rolled back
-// and the slot is left in its zeroed state.
-static bool
+// Allocates pairs[] + per-pair rings for one exchange slot.
+static void
 mw_exch_alloc_pairs(mw_exch_t *ex, uint32_t ring_n)
 {
   uint32_t i;
@@ -1433,8 +1421,6 @@ mw_exch_alloc_pairs(mw_exch_t *ex, uint32_t ring_n)
         (size_t)ring_n * sizeof(*ex->pairs[i].ring_ts));
 
   }
-
-  return(SUCCESS);
 }
 
 static void
@@ -1662,13 +1648,7 @@ mw_start(void)
 
     ex->task = TASK_HANDLE_NONE;
 
-    if(mw_exch_alloc_pairs(ex, mw_g.ring_n) != SUCCESS)
-    {
-      clam(CLAM_WARN, MW_CTX,
-          "%s: pairs allocation FAIL — skipping", ex->name);
-      pthread_mutex_destroy(&ex->lock);
-      continue;
-    }
+    mw_exch_alloc_pairs(ex, mw_g.ring_n);
 
     mw_g.n_exch++;
 

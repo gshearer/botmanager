@@ -227,23 +227,20 @@ memory_deliver_hits(const memory_hit_t *msg_hits, size_t n_msgs,
       msgs = mem_alloc("memory", "rag_msgs",
           sizeof(mem_msg_t) * res->rows);
 
-      if(rows != NULL && msgs != NULL)
-      {
+      for(uint32_t i = 0; i < res->rows; i++)
+        memory_parse_msg_row(res, i, &rows[i]);
+
+      for(size_t h = 0; h < n_msgs && nm < res->rows; h++)
         for(uint32_t i = 0; i < res->rows; i++)
-          memory_parse_msg_row(res, i, &rows[i]);
+          if(rows[i].id == msg_hits[h].id)
+          {
+            msgs[nm] = rows[i];
+            msgs[nm].score = msg_hits[h].score;
+            nm++;
+            break;
+          }
 
-        for(size_t h = 0; h < n_msgs && nm < res->rows; h++)
-          for(uint32_t i = 0; i < res->rows; i++)
-            if(rows[i].id == msg_hits[h].id)
-            {
-              msgs[nm] = rows[i];
-              msgs[nm].score = msg_hits[h].score;
-              nm++;
-              break;
-            }
-      }
-
-      if(rows != NULL) mem_free(rows);
+      mem_free(rows);
     }
 
     db_result_free(res);
@@ -493,8 +490,8 @@ memory_recall_dedup(mem_msg_t *m, size_t n, size_t keep)
 }
 
 // Dedup-merge two mem_msg_t arrays by id, preserving first-array order.
-// Output is a fresh mem_alloc'd buffer; caller frees. On OOM, *out is
-// left NULL and *n_out is 0 so callers can fall back cleanly.
+// Output is a fresh mem_alloc'd buffer; caller frees. With both inputs
+// empty, *out is left NULL and *n_out is 0 so callers can fall back.
 static void
 memory_merge_msgs(const mem_msg_t *a, size_t na,
     const mem_msg_t *b, size_t nb,
@@ -1037,22 +1034,16 @@ memory_retrieve_dossier(int ns_id, int64_t dossier_id, const char *query,
   {
     facts = mem_alloc("memory", "rag_facts",
         sizeof(*facts) * n_facts_total);
-    if(facts != NULL)
-    {
-      for(size_t i = 0; i < n_facts_total; i++)
-        memory_pf_to_fact(&own_pf[i], &facts[i]);
-    }
 
-    else
-      n_facts_total = 0;
+    for(size_t i = 0; i < n_facts_total; i++)
+      memory_pf_to_fact(&own_pf[i], &facts[i]);
   }
 
   n_msgs = 0;
   if(msg_cap > 0)
   {
     msgs = mem_alloc("memory", "rag_mention_msgs", sizeof(*msgs) * msg_cap);
-    if(msgs != NULL)
-      n_msgs = memory_get_mention_msgs(ns_id, dossier_id, msgs, msg_cap);
+    n_msgs = memory_get_mention_msgs(ns_id, dossier_id, msgs, msg_cap);
   }
 
   mem_free(own_pf);

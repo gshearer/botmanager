@@ -220,15 +220,6 @@ wm_bal_render(const cmd_ctx_t *ctx, const char *exchange_name, bool force)
   {
     wm_sync_fetch_t *w = wm_sync_fetch_begin(sizeof(res));
 
-    if(w == NULL)
-    {
-      snprintf(header, sizeof(header),
-          CLR_BOLD "  %s" CLR_RESET "  " CLR_RED "FAIL" CLR_RESET
-          ": out of memory", exchange_name);
-      cmd_reply(ctx, header);
-      return;
-    }
-
     // The callback may run inline on a synchronous FAIL; the bridge
     // tolerates either ordering.
     (void)exchange_get_accounts_async(exchange_name, wm_bal_on_accounts, w);

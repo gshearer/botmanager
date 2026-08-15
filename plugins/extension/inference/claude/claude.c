@@ -307,18 +307,10 @@ claude_run_and_wait(const char *const *argv, const char *cwd,
   len = w.len;
   copy = mem_alloc(CLAUDE_CTX, "subproc-out", len + 1);
 
-  if(copy != NULL)
-  {
-    if(len > 0 && w.buf != NULL)
-      memcpy(copy, w.buf, len);
-    copy[len] = '\0';
-  }
+  if(len > 0 && w.buf != NULL)
+    memcpy(copy, w.buf, len);
 
-  else
-    // Out-of-memory on the copy is treated as "no output" -- the
-    // caller still gets valid status and proc_free reclaims the
-    // handle's buffer.
-    len = 0;
+  copy[len] = '\0';
 
   *out_buf = copy;
   *out_len = len;
@@ -648,7 +640,7 @@ claude_load_session(claude_session_t *s)
 }
 
 // Build child environment: inherit ours, append BOTMAN_* vars. Returns a
-// malloc'd envp the caller must mem_free, or NULL on allocation failure.
+// heap envp the caller must mem_free.
 static char **
 claude_build_envp(const claude_session_t *s, const char *network,
     const char *target, char *env_method, size_t env_method_sz,
@@ -992,12 +984,6 @@ claude_cmd(const cmd_ctx_t *ctx)
       env_method, sizeof(env_method),
       env_target, sizeof(env_target),
       env_bctl,   sizeof(env_bctl));
-
-  if(envp == NULL)
-  {
-    cmd_reply(ctx, "claude: out of memory preparing environment");
-    goto release;
-  }
 
   claude_build_argv(&s, prompt, argv);
 

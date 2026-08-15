@@ -37,7 +37,7 @@
 typedef struct wm_sync_fetch wm_sync_fetch_t;
 
 // Allocate a handle owning a zeroed result buffer of `result_sz` bytes.
-// refs = 2 (the waiter + the callback). Returns NULL on OOM.
+// refs = 2 (the waiter + the callback).
 wm_sync_fetch_t *wm_sync_fetch_begin(size_t result_sz);
 
 // Called from the typed completion callback. Copies `src` (clamped to

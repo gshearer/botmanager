@@ -94,12 +94,6 @@ wm_show_orders_render(const cmd_ctx_t *ctx, const char *exchange)
 
   w = wm_sync_fetch_begin(sizeof(res));
 
-  if(w == NULL)
-  {
-    cmd_reply(ctx, "  out of memory");
-    return;
-  }
-
   // The callback may run inline on a synchronous FAIL; the bridge
   // tolerates either ordering.
   (void)exchange_list_orders_async(exchange, "OPEN", NULL,

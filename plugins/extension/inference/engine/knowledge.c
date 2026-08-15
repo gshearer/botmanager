@@ -507,9 +507,6 @@ knowledge_batch_add(knowledge_batch_t *b, int64_t chunk_id, const char *text)
     return(FAIL);
 
   b->texts[b->n] = mem_strdup("knowledge", "batch_text", text);
-  if(b->texts[b->n] == NULL)
-    return(FAIL);
-
   b->chunk_ids[b->n] = chunk_id;
   b->n++;
   return(SUCCESS);
@@ -1361,24 +1358,21 @@ knowledge_deliver_hits(const knowledge_hit_t *hits, size_t n,
       chunks = mem_alloc("knowledge", "rag_chunks",
           sizeof(knowledge_chunk_t) * res->rows);
 
-      if(chunks != NULL)
+      for(uint32_t i = 0; i < res->rows; i++)
       {
-        for(uint32_t i = 0; i < res->rows; i++)
-        {
-          knowledge_parse_chunk_row(res, i, &chunks[nc]);
+        knowledge_parse_chunk_row(res, i, &chunks[nc]);
 
-          // Stamp the score from the hit buffer (SELECT order may
-          // differ from ranking order; match by id).
-          for(size_t h = 0; h < n; h++)
+        // Stamp the score from the hit buffer (SELECT order may
+        // differ from ranking order; match by id).
+        for(size_t h = 0; h < n; h++)
+        {
+          if(hits[h].id == chunks[nc].id)
           {
-            if(hits[h].id == chunks[nc].id)
-            {
-              chunks[nc].score = hits[h].score;
-              break;
-            }
+            chunks[nc].score = hits[h].score;
+            break;
           }
-          nc++;
         }
+        nc++;
       }
     }
 

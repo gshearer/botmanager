@@ -533,17 +533,14 @@ wm_market_warmup_begin(whenmoon_state_t *st, whenmoon_market_t *mk)
     // because no strategy emits any.
     wm_warmup_ctx_t *lc = mem_alloc("whenmoon", "warmup_ctx", sizeof(*lc));
 
-    if(lc != NULL)
-    {
-      lc->st             = st;
-      snprintf(lc->market_id_str, sizeof(lc->market_id_str), "%s",
-          mk->market_id_str);
-      lc->limit_override = 0;
+    lc->st             = st;
+    snprintf(lc->market_id_str, sizeof(lc->market_id_str), "%s",
+        mk->market_id_str);
+    lc->limit_override = 0;
 
-      if(task_add_deferred("wm_warmup", TASK_ANY, 200, 50,
-             wm_aggregator_load_history_task, lc) == TASK_HANDLE_NONE)
-        mem_free(lc);
-    }
+    if(task_add_deferred("wm_warmup", TASK_ANY, 200, 50,
+           wm_aggregator_load_history_task, lc) == TASK_HANDLE_NONE)
+      mem_free(lc);
 
     wm_warm_set_state(mk, WM_WARM_READY);
 

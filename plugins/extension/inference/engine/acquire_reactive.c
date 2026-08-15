@@ -459,16 +459,13 @@ acq_reactive_curl_done(const curl_response_t *cresp)
     src->images = mem_alloc(ACQUIRE_CTX, "extracted_images",
         sizeof(*src->images) * cap);
 
-    if(src->images != NULL)
-    {
-      src->n_images = acq_extract_images(cresp->body, cresp->body_len,
-          src->page_url, src->images, cap);
+    src->n_images = acq_extract_images(cresp->body, cresp->body_len,
+        src->page_url, src->images, cap);
 
-      if(src->n_images == 0)
-      {
-        mem_free(src->images);
-        src->images = NULL;
-      }
+    if(src->n_images == 0)
+    {
+      mem_free(src->images);
+      src->images = NULL;
     }
   }
 

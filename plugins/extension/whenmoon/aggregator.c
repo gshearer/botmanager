@@ -87,21 +87,6 @@ wm_aggregator_init(whenmoon_market_t *mk, uint32_t history_1d_min)
 
     mk->grain_arr[g] = mem_alloc("whenmoon", "grain", sz);
 
-    if(mk->grain_arr[g] == NULL)
-    {
-      uint32_t k;
-
-      for(k = 0; k < g; k++)
-      {
-        mem_free(mk->grain_arr[k]);
-        mk->grain_arr[k] = NULL;
-        mk->grain_cap[k] = 0;
-      }
-
-      mem_free(a);
-      return(FAIL);
-    }
-
     memset(mk->grain_arr[g], 0, sz);
     mk->grain_n[g]      = 0;
     mk->grain_cap[g]    = bars;

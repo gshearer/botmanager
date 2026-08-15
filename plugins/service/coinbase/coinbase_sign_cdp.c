@@ -72,7 +72,7 @@ static char            *cb_cdp_pem_snap  = NULL;  // last-parsed PEM source
 // PEM into freshstart/.env as a single line with backslash-n
 // separators; PEM_read_bio_PrivateKey only recognises actual newlines.
 // Returns a freshly mem_alloc'd NUL-terminated string the caller owns;
-// NULL on allocation failure.
+// NULL only for a NULL `src`.
 static char *
 cb_pem_unescape(const char *src)
 {
