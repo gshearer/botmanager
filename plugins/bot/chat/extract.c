@@ -19,6 +19,7 @@
 #include "task.h"
 
 #include <ctype.h>
+#include <errno.h>
 #include <inttypes.h>
 #include <pthread.h>
 #include <stdio.h>
@@ -562,18 +563,183 @@ extract_alias_validate(uint32_t ns_id, int64_t dossier_id,
 }
 
 // Dispatch: blocking LLM call + parse + upsert
+//
+// The wait context is heap-owned and refcounted — one reference for the
+// waiter, one for the callback — rather than a stack frame whose address
+// is handed to an async callback. A reply landing after the wait gave up
+// then drops the last reference instead of locking a destroyed mutex
+// inside a reclaimed frame (SC-1). The idiom is wm_exch_query.h's
+// wm_sync_fetch_t, built after a crash of exactly this shape.
+//
+// Every wait is linked into extract_waits for as long as its waiter
+// holds a reference, so extract_stop() can abandon the lot. Without that
+// a sweep sits inside its 60 s wait while core's 5 s Class-B grace runs
+// out; core then refuses the dlclose and leaves the plugin
+// deinitialized-but-still-mapped — a zombie that keeps every bot on IRC
+// and loses its mind until a daemon restart (measured 2026-08-14 on a
+// routine /plugin reload inference).
+//
+// Lock order is extract_wait_mutex then extract_wait_t.mu, never the
+// reverse: the list walk in extract_stop() is the only place that holds
+// both.
 
-typedef struct
+typedef struct extract_wait
 {
   pthread_mutex_t mu;
   pthread_cond_t  cv;
-  bool            done;
+  int             refs;       // waiter + callback
+  bool            done;       // the callback delivered
+  bool            abandoned;  // extract_stop() cut this wait short
   bool            ok;
   long            http_status;
-  char           *content;
+  char           *content;    // handle-owned until the waiter takes it
   size_t          content_len;
   char            err[256];
+
+  struct extract_wait *next;  // extract_waits, under extract_wait_mutex
 } extract_wait_t;
+
+// What a settled wait hands back. `content` transfers to the caller.
+typedef struct
+{
+  bool    ok;
+  bool    timed_out;
+  bool    abandoned;
+  long    http_status;
+  char   *content;
+  size_t  content_len;
+  char    err[256];
+} extract_result_t;
+
+static pthread_mutex_t  extract_wait_mutex = PTHREAD_MUTEX_INITIALIZER;
+static extract_wait_t  *extract_waits      = NULL;
+static bool             extract_stopping   = false;
+
+static bool
+extract_stop_requested(void)
+{
+  bool stopping;
+
+  pthread_mutex_lock(&extract_wait_mutex);
+  stopping = extract_stopping;
+  pthread_mutex_unlock(&extract_wait_mutex);
+
+  return(stopping);
+}
+
+// Drop one reference; the last one out frees the handle and any body the
+// callback left in it — an abandoned wait is the only case where one is
+// still here, since a waiter that settles takes it.
+static void
+wait_release(extract_wait_t *w)
+{
+  bool last;
+
+  pthread_mutex_lock(&w->mu);
+  last = (--w->refs == 0);
+  pthread_mutex_unlock(&w->mu);
+
+  if(!last)
+    return;
+
+  if(w->content != NULL)
+    mem_free(w->content);
+
+  pthread_cond_destroy(&w->cv);
+  pthread_mutex_destroy(&w->mu);
+  mem_free(w);
+}
+
+// refs = 2: this waiter, and the callback llm_chat_submit is about to be
+// handed. Returns NULL once a stop is in flight — the loader is waiting
+// on this thread and no fresh LLM call may start behind it.
+static extract_wait_t *
+wait_begin(void)
+{
+  extract_wait_t *w;
+
+  pthread_mutex_lock(&extract_wait_mutex);
+
+  if(extract_stopping)
+  {
+    pthread_mutex_unlock(&extract_wait_mutex);
+    return(NULL);
+  }
+
+  w = mem_alloc("chat", "extract_wait", sizeof(*w));
+
+  memset(w, 0, sizeof(*w));
+  pthread_mutex_init(&w->mu, NULL);
+  pthread_cond_init(&w->cv, NULL);
+  w->refs       = 2;
+  w->next       = extract_waits;
+  extract_waits = w;
+
+  pthread_mutex_unlock(&extract_wait_mutex);
+
+  return(w);
+}
+
+// Take `w` out of the abandonable set. The waiter's reference is what
+// keeps a linked handle alive, so this runs before the waiter releases.
+static void
+wait_unlink(extract_wait_t *w)
+{
+  pthread_mutex_lock(&extract_wait_mutex);
+
+  for(extract_wait_t **pp = &extract_waits; *pp != NULL; pp = &(*pp)->next)
+    if(*pp == w)
+    {
+      *pp = w->next;
+      break;
+    }
+
+  pthread_mutex_unlock(&extract_wait_mutex);
+}
+
+// Block until the callback delivers, the bound expires, or extract_stop()
+// abandons the wait. Fills *out and always drops the caller's reference,
+// so `w` is dead on return; a delivered body transfers to out->content.
+static void
+wait_settle(extract_wait_t *w, uint32_t timeout_secs, extract_result_t *out)
+{
+  struct timespec until;
+  int             rc = 0;
+  bool            done;
+  bool            abandoned;
+
+  memset(out, 0, sizeof(*out));
+
+  clock_gettime(CLOCK_REALTIME, &until);
+  until.tv_sec += timeout_secs;
+
+  pthread_mutex_lock(&w->mu);
+
+  while(!w->done && !w->abandoned && rc != ETIMEDOUT)
+    rc = pthread_cond_timedwait(&w->cv, &w->mu, &until);
+
+  done      = w->done;
+  abandoned = w->abandoned;
+
+  // An answer that arrived as the stop landed is still an answer.
+  if(done)
+  {
+    out->ok          = w->ok;
+    out->http_status = w->http_status;
+    out->content     = w->content;
+    out->content_len = w->content_len;
+    w->content       = NULL;
+    strlcpy(out->err, w->err, sizeof(out->err));
+  }
+
+  pthread_mutex_unlock(&w->mu);
+
+  out->abandoned = abandoned && !done;
+  out->timed_out = !abandoned && !done;
+
+  wait_unlink(w);
+  wait_release(w);
+}
 
 static void
 dispatch_done_cb(const llm_chat_response_t *resp)
@@ -595,11 +761,13 @@ dispatch_done_cb(const llm_chat_response_t *resp)
   }
 
   if(resp->error != NULL)
-    snprintf(w->err, sizeof(w->err), "%s", resp->error);
+    strlcpy(w->err, resp->error, sizeof(w->err));
 
   w->done = true;
   pthread_cond_broadcast(&w->cv);
   pthread_mutex_unlock(&w->mu);
+
+  wait_release(w);
 }
 
 size_t
@@ -612,13 +780,12 @@ extract_dispatch(const char *bot_name, uint32_t ns_id,
   size_t n_written;
   mem_dossier_fact_t facts[EXTRACT_MAX_FACTS];
   size_t n_parsed;
-  bool done;
   uint32_t to;
-  struct timespec until;
   llm_message_t messages[2];
   memset(messages, 0, sizeof(messages));
   llm_chat_params_t params;
-  extract_wait_t w;
+  extract_wait_t   *w;
+  extract_result_t  res;
   size_t plen;
   char *prompt;
 
@@ -643,9 +810,13 @@ extract_dispatch(const char *bot_name, uint32_t ns_id,
     return(0);
   }
 
-  memset(&w, 0, sizeof(w));
-  pthread_mutex_init(&w.mu, NULL);
-  pthread_cond_init(&w.cv, NULL);
+  w = wait_begin();
+
+  if(w == NULL)
+  {
+    mem_free(prompt);
+    return(0);
+  }
 
   memset(&params, 0, sizeof(params));
   params.temperature  = 0.2f;
@@ -660,43 +831,50 @@ extract_dispatch(const char *bot_name, uint32_t ns_id,
   STAT_BUMP(llm_calls);
 
   if(llm_chat_submit(model_name, &params, messages, 2,
-        dispatch_done_cb, NULL, &w) != SUCCESS)
+        dispatch_done_cb, NULL, w) != SUCCESS)
   {
+    // llm_chat_submit refuses undelivered only: a FAIL means done_cb
+    // will never run, so this thread owns both references.
     STAT_BUMP(llm_errors);
-    pthread_mutex_destroy(&w.mu);
-    pthread_cond_destroy(&w.cv);
+    wait_unlink(w);
+    wait_release(w);
+    wait_release(w);
     mem_free(prompt);
     return(0);
   }
 
-  // Block until done_cb fires (or timeout).
+  // Block until done_cb fires, the bound expires, or a stop cuts in.
   to = timeout_secs == 0 ? 60 : timeout_secs;
 
-  clock_gettime(CLOCK_REALTIME, &until);
-  until.tv_sec += to;
-
-  pthread_mutex_lock(&w.mu);
-  while(!w.done)
-    if(pthread_cond_timedwait(&w.cv, &w.mu, &until) != 0)
-      break;
-  done = w.done;
-  pthread_mutex_unlock(&w.mu);
+  wait_settle(w, to, &res);
 
   mem_free(prompt);
 
-  if(!done || !w.ok || w.content == NULL)
+  if(!res.ok || res.content == NULL)
   {
-    STAT_BUMP(llm_errors);
-    if(!done)
-      clam(CLAM_WARN, "extract", "dispatch timeout (%u s)", to);
+    if(res.abandoned)
+      clam(CLAM_DEBUG, "extract", "dispatch abandoned mid-call (stopping)");
 
-    mem_free(w.content);
-    pthread_mutex_destroy(&w.mu);
-    pthread_cond_destroy(&w.cv);
+    else
+    {
+      STAT_BUMP(llm_errors);
+
+      if(res.timed_out)
+        clam(CLAM_WARN, "extract", "dispatch timeout (%u s)", to);
+      else
+        clam(CLAM_WARN, "extract", "dispatch failed (http %ld)%s%s",
+            res.http_status, res.err[0] != '\0' ? ": " : "", res.err);
+    }
+
+    // Only a delivered ok response carries a body, so this is normally
+    // nothing to free — but mem_free aborts on NULL, so ask first.
+    if(res.content != NULL)
+      mem_free(res.content);
+
     return(0);
   }
 
-  n_parsed = extract_parse_response(w.content, w.content_len,
+  n_parsed = extract_parse_response(res.content, res.content_len,
       parts, n_parts, min_conf,
       facts, EXTRACT_MAX_FACTS);
 
@@ -733,14 +911,12 @@ extract_dispatch(const char *bot_name, uint32_t ns_id,
     if(cap == 0) cap = 3;
     if(cap > EXTRACT_MAX_ALIASES) cap = EXTRACT_MAX_ALIASES;
 
-    n_aliases = extract_parse_aliases(w.content, w.content_len,
+    n_aliases = extract_parse_aliases(res.content, res.content_len,
         parts, n_parts, alias_min_conf,
         aliases, (size_t)cap);
   }
 
-  mem_free(w.content);
-  pthread_mutex_destroy(&w.mu);
-  pthread_cond_destroy(&w.cv);
+  mem_free(res.content);
 
   n_written = 0;
 
@@ -1168,6 +1344,7 @@ extract_run_once(const char *bot_name, uint32_t ns_id)
   int64_t               new_hwm;
   size_t n_msgs;
   extract_sched_t *s;
+  bool stopped;
   float min_conf;
   uint32_t max_per_hour;
   int64_t hwm;
@@ -1243,6 +1420,7 @@ extract_run_once(const char *bot_name, uint32_t ns_id)
   qsort(msgs, n_msgs, sizeof(msgs[0]), msg_channel_cmp);
 
   written = 0;
+  stopped = false;
 
   for(size_t lo = 0; lo < n_msgs; )
   {
@@ -1261,14 +1439,29 @@ extract_run_once(const char *bot_name, uint32_t ns_id)
           min_conf, 0);
 
     lo = hi;
+
+    // A stop is the loader waiting on this thread inside its Class-B
+    // grace: abandon the remaining partitions rather than start another
+    // LLM call it would have to wait out.
+    if(extract_stop_requested())
+    {
+      stopped = true;
+      break;
+    }
   }
 
   // Advance the high-water mark on any successful dispatch so the same
   // rows aren't reprocessed every tick. On hard failure (written == 0
   // and dispatch saw an error), we still advance: reprocessing a known-
-  // bad batch just wastes LLM calls.
-  snprintf(key, sizeof(key), "bot.%s.behavior.fact_extract.hwm", bot_name);
-  (void)kv_set_uint(key, (uint64_t)new_hwm);
+  // bad batch just wastes LLM calls. A stop is the one case that must
+  // NOT advance — the partitions it skipped were never read, and a
+  // partition it did read costs only an affirm the second time round
+  // (MEM_MERGE_OBSERVE writes no new value for what it already wrote).
+  if(!stopped)
+  {
+    snprintf(key, sizeof(key), "bot.%s.behavior.fact_extract.hwm", bot_name);
+    (void)kv_set_uint(key, (uint64_t)new_hwm);
+  }
 
   return(written);
 }
@@ -1386,6 +1579,12 @@ extract_init(void)
   pthread_mutex_init(&extract_stat_mutex, NULL);
   memset(&extract_stats, 0, sizeof(extract_stats));
 
+  // Re-arm after a previous stop: this mapping may be initialized again
+  // without ever being unloaded.
+  pthread_mutex_lock(&extract_wait_mutex);
+  extract_stopping = false;
+  pthread_mutex_unlock(&extract_wait_mutex);
+
   // Renders the canonical vocabulary into the system prompt. Here, and
   // not lazily at first use, because sweeps run on task workers and
   // this is the last single-threaded moment we get.
@@ -1405,6 +1604,25 @@ void
 extract_stop(void)
 {
   uint32_t cancelled = 0;
+  uint32_t abandoned = 0;
+
+  // Refuse further LLM calls, then cut every wait a sweep is already
+  // blocked in. A sweep left inside its 60 s wait outlives core's 5 s
+  // Class-B grace, and core answers that by refusing the dlclose — the
+  // plugin survives deinit still mapped, which costs a daemon restart.
+  pthread_mutex_lock(&extract_wait_mutex);
+  extract_stopping = true;
+
+  for(extract_wait_t *w = extract_waits; w != NULL; w = w->next)
+  {
+    pthread_mutex_lock(&w->mu);
+    w->abandoned = true;
+    pthread_cond_broadcast(&w->cv);
+    pthread_mutex_unlock(&w->mu);
+    abandoned++;
+  }
+
+  pthread_mutex_unlock(&extract_wait_mutex);
 
   pthread_mutex_lock(&extract_sched_mutex);
 
@@ -1422,19 +1640,39 @@ extract_stop(void)
 
   pthread_mutex_unlock(&extract_sched_mutex);
 
-  if(cancelled > 0)
-    clam(CLAM_DEBUG, "extract", "cancelled %u sweep task(s)", cancelled);
+  if(cancelled > 0 || abandoned > 0)
+    clam(CLAM_DEBUG, "extract",
+        "cancelled %u sweep task(s), abandoned %u in-flight LLM wait(s)",
+        cancelled, abandoned);
 }
 
 void
 extract_exit(void)
 {
   extract_sched_t *s;
+  uint32_t         live = 0;
 
   if(!extract_ready)
     return;
 
   extract_ready = false;
+
+  // Nothing to free here: an abandoned wait is unlinked and released by
+  // its own waiter, and the callback's reference is the engine's to drop
+  // (it orphans the request instead when this mapping goes first, which
+  // strands the handle — bounded, and the price of never touching a
+  // frame that may already be gone). A non-empty list means a sweep did
+  // not unwind inside the loader's grace, which is worth saying out loud.
+  pthread_mutex_lock(&extract_wait_mutex);
+
+  for(extract_wait_t *w = extract_waits; w != NULL; w = w->next)
+    live++;
+
+  pthread_mutex_unlock(&extract_wait_mutex);
+
+  if(live > 0)
+    clam(CLAM_WARN, "extract",
+        "%u LLM wait(s) still unwinding at exit", live);
 
   // Free the sweep list. Each entry is a live task's `data`, so
   // extract_stop() must already have cancelled them.

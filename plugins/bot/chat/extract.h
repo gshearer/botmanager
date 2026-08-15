@@ -30,9 +30,11 @@
 // mutex; does not touch the DB.
 void extract_init(void);
 
-// Cancel every scheduled per-bot sweep. Must run before extract_exit()
-// on the unload path: exit() frees the sweep state each armed task
-// holds a pointer to.
+// Cancel every scheduled per-bot sweep and abandon every LLM wait a
+// sweep is already blocked in, so a running sweep returns inside the
+// loader's Class-B grace instead of holding the mapping open. Must run
+// before extract_exit() on the unload path: exit() frees the sweep state
+// each armed task holds a pointer to.
 void extract_stop(void);
 
 // Shut down the extract subsystem. Safe to call from shutdown path
@@ -191,7 +193,10 @@ size_t extract_parts_assemble(const mem_msg_t *msgs, size_t n_msgs,
     extract_participant_t *parts_out, size_t parts_cap);
 
 // Synchronous single-partition dispatch. Builds the prompt, calls
-// llm_chat_submit (blocking until done_cb fires), parses the response,
+// llm_chat_submit and blocks on a refcounted heap wait until the
+// callback delivers, the bound expires, or extract_stop() abandons the
+// call (a late callback then frees the wait rather than writing into a
+// dead frame — SC-1). Parses the response,
 // and upserts accepted facts via memory_upsert_dossier_fact with
 // MEM_MERGE_OBSERVE — the sweep is a rank-1 source, so it fills gaps
 // and affirms, and can never overwrite what a person stated. Bumps
