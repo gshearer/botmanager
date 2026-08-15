@@ -612,8 +612,17 @@ typedef struct
 } extract_result_t;
 
 static pthread_mutex_t  extract_wait_mutex = PTHREAD_MUTEX_INITIALIZER;
+static pthread_cond_t   extract_wait_cond  = PTHREAD_COND_INITIALIZER;
 static extract_wait_t  *extract_waits      = NULL;
 static bool             extract_stopping   = false;
+
+// How long extract_stop() will wait for the engine to hand back the
+// requests it just cancelled. Every one of them normally lands within a
+// curl-loop lap; the bound exists so a wedged transfer costs a WARN and
+// a stranded 384-byte handle instead of a stalled loader.
+#define EXTRACT_STOP_DRAIN_SECS  5
+
+static void wait_unlink(extract_wait_t *);
 
 static bool
 extract_stop_requested(void)
@@ -627,9 +636,14 @@ extract_stop_requested(void)
   return(stopping);
 }
 
-// Drop one reference; the last one out frees the handle and any body the
-// callback left in it — an abandoned wait is the only case where one is
-// still here, since a waiter that settles takes it.
+// Drop one reference; the last one out unlinks the handle and frees it
+// along with any body the callback left in it — an abandoned wait is the
+// only case where one is still here, since a waiter that settles takes it.
+//
+// Unlinking here rather than at settle is what makes extract_stop()'s
+// drain possible: while the callback's reference is outstanding the
+// handle is still in the set, so the stop can see that it is owed one
+// and wait for it.
 static void
 wait_release(extract_wait_t *w)
 {
@@ -641,6 +655,8 @@ wait_release(extract_wait_t *w)
 
   if(!last)
     return;
+
+  wait_unlink(w);
 
   if(w->content != NULL)
     mem_free(w->content);
@@ -680,8 +696,9 @@ wait_begin(void)
   return(w);
 }
 
-// Take `w` out of the abandonable set. The waiter's reference is what
-// keeps a linked handle alive, so this runs before the waiter releases.
+// Take `w` out of the abandonable set. Called once, by whichever
+// reference leaves last, so the set holds exactly the waits that are
+// still owed something — which is what extract_stop() drains.
 static void
 wait_unlink(extract_wait_t *w)
 {
@@ -694,6 +711,7 @@ wait_unlink(extract_wait_t *w)
       break;
     }
 
+  pthread_cond_broadcast(&extract_wait_cond);
   pthread_mutex_unlock(&extract_wait_mutex);
 }
 
@@ -737,7 +755,9 @@ wait_settle(extract_wait_t *w, uint32_t timeout_secs, extract_result_t *out)
   out->abandoned = abandoned && !done;
   out->timed_out = !abandoned && !done;
 
-  wait_unlink(w);
+  // The handle leaves the abandonable set when its *last* reference
+  // goes, not this one: an abandoned wait still owes a callback, and
+  // extract_stop() has to be able to see that it does.
   wait_release(w);
 }
 
@@ -834,9 +854,9 @@ extract_dispatch(const char *bot_name, uint32_t ns_id,
         dispatch_done_cb, NULL, w) != SUCCESS)
   {
     // llm_chat_submit refuses undelivered only: a FAIL means done_cb
-    // will never run, so this thread owns both references.
+    // will never run, so this thread owns both references. The second
+    // release is the one that unlinks.
     STAT_BUMP(llm_errors);
-    wait_unlink(w);
     wait_release(w);
     wait_release(w);
     mem_free(prompt);
@@ -1603,13 +1623,22 @@ extract_register_config(void)
 void
 extract_stop(void)
 {
-  uint32_t cancelled = 0;
-  uint32_t abandoned = 0;
+  uint32_t        cancelled = 0;
+  uint32_t        abandoned = 0;
+  uint32_t        killed    = 0;
+  uint32_t        stranded  = 0;
+  struct timespec deadline;
 
   // Refuse further LLM calls, then cut every wait a sweep is already
   // blocked in. A sweep left inside its 60 s wait outlives core's 5 s
   // Class-B grace, and core answers that by refusing the dlclose — the
   // plugin survives deinit still mapped, which costs a daemon restart.
+  //
+  // Abandoning the waiter is only half of it: the callback's reference
+  // is the engine's to drop, and it can only drop it by *arriving*. So
+  // ask the engine to cancel the request as well — a cancelled request
+  // still delivers, into code that is still mapped here, and the handle
+  // frees itself on the way past (root TODO.md §SC-SAN-FINDINGS SAN-12).
   pthread_mutex_lock(&extract_wait_mutex);
   extract_stopping = true;
 
@@ -1620,9 +1649,34 @@ extract_stop(void)
     pthread_cond_broadcast(&w->cv);
     pthread_mutex_unlock(&w->mu);
     abandoned++;
+    killed += llm_cancel_user(w);
   }
 
+  // Then wait for them. A cancelled request delivers into this mapping
+  // within a curl-loop lap, and the callback is what drops the last
+  // reference — but the loader is already on its way to the unmap
+  // broadcast that would clear the callback instead, and a handle whose
+  // callback is cleared is a handle nothing will ever free. Losing that
+  // race is the whole of SAN-12; refusing to run it is the fix.
+  clock_gettime(CLOCK_REALTIME, &deadline);
+  deadline.tv_sec += EXTRACT_STOP_DRAIN_SECS;
+
+  while(extract_waits != NULL)
+  {
+    if(pthread_cond_timedwait(&extract_wait_cond, &extract_wait_mutex,
+        &deadline) == ETIMEDOUT)
+      break;
+  }
+
+  for(extract_wait_t *w = extract_waits; w != NULL; w = w->next)
+    stranded++;
+
   pthread_mutex_unlock(&extract_wait_mutex);
+
+  if(stranded > 0)
+    clam(CLAM_WARN, "extract", "%u LLM wait(s) did not come back within "
+        "%u s; their handles are stranded", stranded,
+        EXTRACT_STOP_DRAIN_SECS);
 
   pthread_mutex_lock(&extract_sched_mutex);
 
@@ -1642,8 +1696,9 @@ extract_stop(void)
 
   if(cancelled > 0 || abandoned > 0)
     clam(CLAM_DEBUG, "extract",
-        "cancelled %u sweep task(s), abandoned %u in-flight LLM wait(s)",
-        cancelled, abandoned);
+        "cancelled %u sweep task(s), abandoned %u in-flight LLM wait(s) "
+        "(%u request(s) cancelled at the engine)",
+        cancelled, abandoned, killed);
 }
 
 void
@@ -1657,12 +1712,12 @@ extract_exit(void)
 
   extract_ready = false;
 
-  // Nothing to free here: an abandoned wait is unlinked and released by
-  // its own waiter, and the callback's reference is the engine's to drop
-  // (it orphans the request instead when this mapping goes first, which
-  // strands the handle — bounded, and the price of never touching a
-  // frame that may already be gone). A non-empty list means a sweep did
-  // not unwind inside the loader's grace, which is worth saying out loud.
+  // Nothing to free here: a wait leaves the set when its last reference
+  // does, and extract_stop() has already cancelled every request the
+  // set was owed and waited for the callbacks. A non-empty list means
+  // that drain hit its bound — it has said so once already, and the
+  // handles are stranded rather than freeable, because the callback
+  // they belong to may still be on its way.
   pthread_mutex_lock(&extract_wait_mutex);
 
   for(extract_wait_t *w = extract_waits; w != NULL; w = w->next)

@@ -158,6 +158,28 @@ bool curl_request_submit(curl_request_t *req);
 // loop's own worker (that would deadlock).
 bool curl_request_submit_wait(curl_request_t *req);
 
+// The request's stable identity, for curl_request_cancel. Read it
+// before curl_request_submit — ownership of the handle transfers
+// there and the pointer stops being the caller's. Ids are never
+// reused, so one that has been delivered simply matches nothing.
+uint64_t curl_request_id(const curl_request_t *req);
+
+// Ask the subsystem to abandon request `id`. Thread-safe and
+// non-blocking: the request is flagged and the multi loop finishes it
+// with CURLE_ABORTED_BY_CALLBACK, so the completion callback still
+// fires — on the multi-loop thread, with resp.cancelled true, exactly
+// as the shutdown drain delivers one. A caller tearing down therefore
+// waits for its own callback, not for the transfer.
+//
+// returns: SUCCESS when a queued or in-flight request carried `id` and
+// is now flagged; FAIL when none did.
+//
+// A request is briefly reachable by neither walk — between leaving the
+// submit queue and entering the in-flight list, while the multi loop
+// builds its easy handle. A caller that must be certain re-issues the
+// cancel while it waits; that is what llm's stop-drain does.
+bool curl_request_cancel(uint64_t id);
+
 bool curl_get(const char *url, curl_done_cb_t cb, void *user_data);
 
 bool curl_post(const char *url, const char *content_type,
@@ -285,6 +307,16 @@ typedef struct curl_hdr
 
 struct curl_request
 {
+  // Identity that outlives the pointer: the struct is freelist-backed,
+  // so an address recycles and an id does not. curl_request_cancel
+  // matches on this.
+  uint64_t            id;
+
+  // Set by curl_request_cancel from any thread, acted on by the multi
+  // loop's cancellation sweep. Atomic because the loop reads it during
+  // its own unlocked traversal of the in-flight list.
+  _Atomic bool        cancel_requested;
+
   curl_method_t       method;
   curl_req_state_t    state;
   curl_prio_t         prio;
@@ -435,12 +467,16 @@ static uint64_t           curl_submit_rejected = 0;
 
 static curl_request_t    *curl_req_free     = NULL;
 static pthread_mutex_t    curl_req_mutex;
+// Handed out under curl_req_mutex, one per created request. Starts at
+// 1 so a zeroed struct never carries a live id.
+static uint64_t           curl_req_next_id  = 0;
 
 static void    curl_multi_loop(task_t *t);
 static void    curl_drain_queue(void);
 static void    curl_finish_request(curl_request_t *req, CURLcode result);
 static void    curl_finish_cancelled(curl_request_t *req);
 static void    curl_run_shutdown_drain(void);
+static void    curl_sweep_cancelled(void);
 static void    curl_request_release(curl_request_t *req);
 static size_t  curl_write_cb(char *ptr, size_t size, size_t nmemb,
                    void *userdata);

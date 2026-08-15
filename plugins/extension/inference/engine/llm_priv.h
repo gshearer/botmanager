@@ -40,11 +40,13 @@ void llm_init(void);
 void llm_register_config(void);
 void llm_register_commands(void);
 
-// PLIFE-5: stop scheduling new work. Retries and dialect negotiations
-// re-arm themselves off the curl callback thread, so a plugin unload
-// needs the engine to stop topping up the in-flight set before anything
-// can wait for it to drain. In-flight requests are delivered normally —
-// a failure, if that is what they are.
+// PLIFE-5: stop scheduling new work, then cancel and drain what is
+// already airborne. Retries and dialect negotiations re-arm themselves
+// off the curl callback thread, so the engine must first stop topping
+// up the in-flight set; what remains is cancelled at the curl layer and
+// waited out here, because every one of those requests holds callback
+// pointers into this plugin's mapping and core's quiescence barrier
+// cannot see them (root TODO.md §SC-LLM-INFLIGHT).
 void llm_stop(void);
 
 void llm_exit(void);
@@ -95,6 +97,13 @@ bool llm_stt_submit(const char *model_name, const void *wav, size_t wav_len,
 bool llm_tts_submit(const char *model_name, const llm_tts_params_t *params,
     const char *text, llm_tts_done_cb_t done_cb, void *user_data);
 
+// Cancel every airborne request submitted with `user_data`. A cancelled
+// request still delivers its done callback, with ok=false, so a caller
+// tearing down waits for a callback it owns rather than for a transfer
+// it does not. Safe to call from the requester's own stop().
+// returns: how many requests were flagged.
+uint32_t llm_cancel_user(const void *user_data);
+
 void llm_get_stats(llm_stats_t *out);
 
 typedef void (*llm_iter_cb_t)(const char *model_name, llm_kind_t kind,
@@ -129,6 +138,14 @@ void llm_iterate_active(llm_iter_cb_t cb, void *data);
 // and have the server refuse it. Twenty-five minutes of 16 kHz mono
 // S16LE is far past any utterance the ear will ever hand us.
 #define LLM_STT_WAV_MAX       (48u * 1024u * 1024u)
+
+// Bounds on the two teardown waits. `stop` cancels the in-flight set
+// and waits for the callbacks it just guaranteed; the unmap sweep waits
+// only for consumer callbacks already running, which is why it is much
+// shorter. Both exist so a hung callback costs a WARN and a refused
+// unload rather than a wedged loader thread.
+#define LLM_STOP_DRAIN_SECS   10
+#define LLM_UNMAP_DRAIN_SECS  2
 
 // Per-model request-dialect negotiation (LLM-DIALECT-1).
 #define LLM_DIR_FIELD_SZ    64   // canonical builder field / wire name
@@ -305,6 +322,11 @@ struct llm_request
   // silent drops. Carried through the retry path so scheduled retries
   // also block rather than failing fast on transient saturation.
   bool                  blocking_submit;
+
+  // The curl request carrying the current attempt, for
+  // curl_request_cancel. Re-stamped on every retry; 0 while nothing of
+  // this request is on the wire.
+  uint64_t              curl_id;
 
   // Timing.
   struct timespec       started;

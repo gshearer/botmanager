@@ -609,6 +609,33 @@ llm_model_iterate(llm_model_iter_cb_t cb, void *user)
   fn(cb, user);
 }
 
+// The one shim that tolerates a missing provider instead of aborting.
+// Its whole purpose is teardown — a requester cancelling what it has
+// airborne from its own stop() — and on that path "inference is not
+// loaded" is the ordinary case rather than a programming error, with
+// nothing left to cancel when it holds. Nothing is latched on the miss:
+// plugin_dlsym_cached only fills the slot on a resolve.
+static inline uint32_t
+llm_cancel_user(const void *user_data)
+{
+  typedef uint32_t (*fn_t)(const void *);
+  static fn_t cached = NULL;
+  fn_t        fn     = __atomic_load_n(&cached, __ATOMIC_ACQUIRE);
+
+  if(fn == NULL)
+  {
+    union { void *obj; fn_t fn; } u;
+
+    u.obj = plugin_dlsym_cached("inference", "llm_cancel_user", (void **)&cached);
+    if(u.obj == NULL)
+      return(0);
+
+    fn = u.fn;
+    __atomic_store_n(&cached, fn, __ATOMIC_RELEASE);
+  }
+  return(fn(user_data));
+}
+
 // -------- Knowledge --------
 
 static inline bool

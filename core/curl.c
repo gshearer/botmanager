@@ -57,6 +57,7 @@ static curl_request_t *
 curl_req_alloc(void)
 {
   curl_request_t *req = NULL;
+  uint64_t        id;
 
   pthread_mutex_lock(&curl_req_mutex);
 
@@ -66,12 +67,15 @@ curl_req_alloc(void)
     curl_req_free = req->next;
   }
 
+  id = ++curl_req_next_id;
+
   pthread_mutex_unlock(&curl_req_mutex);
 
   if(req == NULL)
     req = mem_alloc("curl", "request", sizeof(*req));
 
   memset(req, 0, sizeof(*req));
+  req->id = id;
 
   return(req);
 }
@@ -646,6 +650,65 @@ curl_request_submit(curl_request_t *req)
   // Wake the multi loop.
   {
     uint64_t val = 1;
+    (void)write(curl_wake_fd, &val, sizeof(val));
+  }
+
+  return(SUCCESS);
+}
+
+uint64_t
+curl_request_id(const curl_request_t *req)
+{
+  return(req != NULL ? req->id : 0);
+}
+
+// Flag the request in `list` (chained through ->next) carrying `id`.
+// Caller holds whichever lock guards that list.
+static bool
+curl_flag_cancel(curl_request_t *list, uint64_t id)
+{
+  for(curl_request_t *p = list; p != NULL; p = p->next)
+  {
+    if(p->id != id)
+      continue;
+
+    p->cancel_requested = true;
+    return(true);
+  }
+
+  return(false);
+}
+
+bool
+curl_request_cancel(uint64_t id)
+{
+  bool found = false;
+
+  if(id == 0)
+    return(FAIL);
+
+  pthread_mutex_lock(&curl_submit_mutex);
+
+  for(uint32_t i = 0; i < CURL_PRIO__COUNT && !found; i++)
+    found = curl_flag_cancel(curl_submit_qs[i].head, id);
+
+  pthread_mutex_unlock(&curl_submit_mutex);
+
+  if(!found)
+  {
+    pthread_mutex_lock(&curl_active_mutex);
+    found = curl_flag_cancel(curl_active_head, id);
+    pthread_mutex_unlock(&curl_active_mutex);
+  }
+
+  if(!found)
+    return(FAIL);
+
+  // The same wake the submit path uses: the sweep runs at the top of
+  // the next iteration rather than whenever the poll happens to expire.
+  {
+    uint64_t val = 1;
+
     (void)write(curl_wake_fd, &val, sizeof(val));
   }
 
@@ -1234,6 +1297,74 @@ curl_run_shutdown_drain(void)
   pthread_mutex_unlock(&curl_submit_mutex);
 }
 
+// Act on every request curl_request_cancel has flagged. Runs on the
+// multi-loop thread — the only one allowed to touch an easy handle or
+// to fire a completion callback. A flagged request that finished
+// naturally in the meantime is simply no longer here; the flag dies
+// with the struct.
+static void
+curl_sweep_cancelled(void)
+{
+  curl_request_t *cancel_list = NULL;
+  curl_request_t *p;
+  curl_request_t *next;
+
+  // Queued: unlink from whichever sub-queue holds them and rebuild that
+  // queue's tail on the way past. Delivery happens below, outside the
+  // lock — a completion callback is free to submit again.
+  pthread_mutex_lock(&curl_submit_mutex);
+
+  for(uint32_t i = 0; i < CURL_PRIO__COUNT; i++)
+  {
+    curl_submit_q_t  *q  = &curl_submit_qs[i];
+    curl_request_t  **pp = &q->head;
+
+    q->tail = NULL;
+
+    while(*pp != NULL)
+    {
+      curl_request_t *r = *pp;
+
+      if(!r->cancel_requested)
+      {
+        q->tail = r;
+        pp = &r->next;
+        continue;
+      }
+
+      *pp = r->next;
+      q->count--;
+      curl_submit_total--;
+      r->next     = cancel_list;
+      cancel_list = r;
+    }
+  }
+
+  if(cancel_list != NULL)
+    pthread_cond_broadcast(&curl_slot_cond);
+
+  pthread_mutex_unlock(&curl_submit_mutex);
+
+  while(cancel_list != NULL)
+  {
+    next = cancel_list->next;
+    cancel_list->next = NULL;
+    curl_finish_cancelled(cancel_list);
+    cancel_list = next;
+  }
+
+  // In-flight: curl_finish_request unlinks each one and zeroes its next
+  // pointer, so cache the successor before the call. This thread is the
+  // list's only writer, so its own traversal needs no lock.
+  for(p = curl_active_head; p != NULL; p = next)
+  {
+    next = p->next;
+
+    if(p->cancel_requested)
+      curl_finish_request(p, CURLE_ABORTED_BY_CALLBACK);
+  }
+}
+
 static void
 curl_multi_loop(task_t *t)
 {
@@ -1295,6 +1426,11 @@ curl_multi_loop(task_t *t)
       curl_multi_setopt(curl_multi_handle, CURLMOPT_MAX_HOST_CONNECTIONS,
           (long)curl_cfg.max_host_conns);
     }
+
+    // 0c. Retire anything a caller cancelled since the last pass. Ahead
+    // of the drain so a request cancelled while still queued never
+    // reaches the wire at all.
+    curl_sweep_cancelled();
 
     // 1. Drain any newly submitted requests into multi.
     curl_drain_queue();

@@ -11,6 +11,7 @@
 #include "userns.h"
 #include "util.h"
 
+#include <errno.h>
 #include <inttypes.h>
 #include <stdarg.h>
 #include <stdio.h>
@@ -19,8 +20,11 @@
 
 // Module state
 
-static bool             llm_ready = false;
-static bool             llm_stopping = false;
+// _Atomic because both are written on a command thread (init, stop,
+// exit) and read on the curl callback thread, which is where the retry
+// and negotiation gates live.
+static _Atomic bool     llm_ready = false;
+static _Atomic bool     llm_stopping = false;
 llm_cfg_t               llm_cfg;
 
 // Freelist.
@@ -30,6 +34,19 @@ static pthread_mutex_t  llm_req_mutex;
 // In-flight request list (for /show llm).
 static llm_request_t   *llm_active_head = NULL;
 static pthread_mutex_t  llm_active_mutex;
+
+// Signalled whenever the in-flight list shrinks or a delivery window
+// closes: llm_stop() waits for both to reach zero, llm_unmap_cb() for
+// the second alone.
+static pthread_cond_t   llm_active_cond;
+
+// Consumer callbacks this engine is currently *inside*. A requester's
+// callbacks are cleared under llm_active_mutex when its mapping goes
+// away, so a delivery that starts after the clear sees NULL and one
+// that started before it is waited out here — which is what makes
+// "the requester was unloaded" a decision taken once instead of a
+// pointer read racing an unmap (root TODO.md §SC-SAN-FINDINGS SAN-22).
+static uint32_t         llm_delivering = 0;
 
 // Model cache.
 llm_model_t            *llm_models_head = NULL;
@@ -348,27 +365,97 @@ llm_active_add(llm_request_t *req)
   pthread_mutex_unlock(&llm_active_mutex);
 }
 
+// Caller holds llm_active_mutex.
+static void
+llm_active_unlink_locked(llm_request_t *req)
+{
+  llm_request_t **pp = &llm_active_head;
+
+  if(!req->in_flight)
+    return;
+
+  while(*pp != NULL && *pp != req)
+    pp = &(*pp)->next_active;
+
+  if(*pp == req)
+  {
+    *pp = req->next_active;
+    llm_active_count--;
+  }
+
+  req->in_flight   = false;
+  req->next_active = NULL;
+
+  pthread_cond_broadcast(&llm_active_cond);
+}
+
 static void
 llm_active_remove(llm_request_t *req)
 {
   pthread_mutex_lock(&llm_active_mutex);
+  llm_active_unlink_locked(req);
+  pthread_mutex_unlock(&llm_active_mutex);
+}
 
-  if(req->in_flight)
-  {
-    llm_request_t **pp = &llm_active_head;
+// The requester's callbacks, lifted out of a request under
+// llm_active_mutex — the same lock llm_unmap_cb clears them under — so
+// that whichever of the two happens first, it happens completely.
+typedef struct
+{
+  llm_chat_done_cb_t   chat;
+  llm_embed_done_cb_t  embed;
+  llm_image_done_cb_t  image;
+  llm_stt_done_cb_t    stt;
+  llm_tts_done_cb_t    tts;
+  llm_chunk_cb_t       chunk;
+  void                *user;
+} llm_delivery_t;
 
-    while(*pp != NULL && *pp != req)
-      pp = &(*pp)->next_active;
+// Caller holds llm_active_mutex.
+static void
+llm_delivery_snap_locked(llm_request_t *req, llm_delivery_t *d)
+{
+  d->chat  = req->chat_done_cb;
+  d->embed = req->embed_done_cb;
+  d->image = req->image_done_cb;
+  d->stt   = req->stt_done_cb;
+  d->tts   = req->tts_done_cb;
+  d->chunk = req->chunk_cb;
+  d->user  = req->user_data;
 
-    if(*pp == req)
-    {
-      *pp = req->next_active;
-      llm_active_count--;
-    }
+  llm_delivering++;
+}
 
-    req->in_flight = false;
-    req->next_active = NULL;
-  }
+// Open a delivery window over a request that stays in flight — the
+// streaming chunk path, which delivers many times per request.
+static void
+llm_delivery_open(llm_request_t *req, llm_delivery_t *d)
+{
+  pthread_mutex_lock(&llm_active_mutex);
+  llm_delivery_snap_locked(req, d);
+  pthread_mutex_unlock(&llm_active_mutex);
+}
+
+// The terminal handover: unlink the request and take its callbacks in
+// one hold of the lock. Both halves must be atomic together — an
+// unlinked request is invisible to llm_unmap_cb, so from that instant
+// the open window is the only thing keeping the mapping alive.
+static void
+llm_delivery_take(llm_request_t *req, llm_delivery_t *d)
+{
+  pthread_mutex_lock(&llm_active_mutex);
+  llm_active_unlink_locked(req);
+  llm_delivery_snap_locked(req, d);
+  pthread_mutex_unlock(&llm_active_mutex);
+}
+
+static void
+llm_delivery_close(void)
+{
+  pthread_mutex_lock(&llm_active_mutex);
+
+  if(--llm_delivering == 0)
+    pthread_cond_broadcast(&llm_active_cond);
 
   pthread_mutex_unlock(&llm_active_mutex);
 }
@@ -2216,11 +2303,20 @@ llm_sse_event_cb(const char *data, size_t len, void *user)
 
   if(n > 0)
   {
+    llm_delivery_t d;
+
     llm_assembled_append(req, out, (size_t)n);
     req->bytes_seen += (size_t)n;
 
-    if(req->chunk_cb != NULL)
-      req->chunk_cb(req, out, (size_t)n, req->user_data);
+    // The chunk callback is the one this engine calls most often and
+    // the one a reload cascade unmapped underneath it — never read it
+    // out of the request unguarded.
+    llm_delivery_open(req, &d);
+
+    if(d.chunk != NULL)
+      d.chunk(req, out, (size_t)n, d.user);
+
+    llm_delivery_close();
   }
 
   mem_free(out);
@@ -2286,12 +2382,15 @@ llm_deliver_chat(llm_request_t *req, bool ok, long http_status,
     const char *err)
 {
   llm_chat_response_t resp;
+  llm_delivery_t      d;
 
   // The retried request finally succeeded — persist whatever dialect
   // directives it learned so later calls skip the negotiation round-trip.
   // (No-op when nothing was staged, i.e. every normal request.)
   if(ok)
     llm_model_params_flush_staged(req);
+
+  llm_delivery_take(req, &d);
 
   memset(&resp, 0, sizeof(resp));
   resp.request           = req;
@@ -2304,14 +2403,14 @@ llm_deliver_chat(llm_request_t *req, bool ok, long http_status,
   resp.completion_tokens = req->completion_tokens;
   resp.finish_reason     = req->finish_reason;
   resp.error             = ok ? NULL : (err != NULL ? err : req->errbuf);
-  resp.user_data         = req->user_data;
+  resp.user_data         = d.user;
 
-  llm_active_remove(req);
   llm_accumulate_stats(req, ok);
 
-  if(req->chat_done_cb != NULL)
-    req->chat_done_cb(&resp);
+  if(d.chat != NULL)
+    d.chat(&resp);
 
+  llm_delivery_close();
   llm_req_release(req);
 }
 
@@ -2320,6 +2419,9 @@ llm_deliver_embed(llm_request_t *req, bool ok, long http_status,
     const char *err)
 {
   llm_embed_response_t resp;
+  llm_delivery_t       d;
+
+  llm_delivery_take(req, &d);
 
   memset(&resp, 0, sizeof(resp));
   resp.request     = req;
@@ -2330,14 +2432,14 @@ llm_deliver_embed(llm_request_t *req, bool ok, long http_status,
   resp.vectors     = req->vectors;
   resp.n_vectors   = req->n_vectors;
   resp.error       = ok ? NULL : (err != NULL ? err : req->errbuf);
-  resp.user_data   = req->user_data;
+  resp.user_data   = d.user;
 
-  llm_active_remove(req);
   llm_accumulate_stats(req, ok);
 
-  if(req->embed_done_cb != NULL)
-    req->embed_done_cb(&resp);
+  if(d.embed != NULL)
+    d.embed(&resp);
 
+  llm_delivery_close();
   llm_req_release(req);
 }
 
@@ -2346,6 +2448,7 @@ llm_deliver_image(llm_request_t *req, bool ok, long http_status,
     const char *err)
 {
   llm_image_response_t resp;
+  llm_delivery_t       d;
 
   // As on the chat path: the retry that finally succeeded may have learned a
   // dialect directive (the gpt-image family's rejection of `response_format`
@@ -2353,6 +2456,8 @@ llm_deliver_image(llm_request_t *req, bool ok, long http_status,
   // body on the first try.
   if(ok)
     llm_model_params_flush_staged(req);
+
+  llm_delivery_take(req, &d);
 
   memset(&resp, 0, sizeof(resp));
   resp.request        = req;
@@ -2365,14 +2470,14 @@ llm_deliver_image(llm_request_t *req, bool ok, long http_status,
                           : "image/png";
   resp.revised_prompt = req->image_revised;
   resp.error          = ok ? NULL : (err != NULL ? err : req->errbuf);
-  resp.user_data      = req->user_data;
+  resp.user_data      = d.user;
 
-  llm_active_remove(req);
   llm_accumulate_stats(req, ok);
 
-  if(req->image_done_cb != NULL)
-    req->image_done_cb(&resp);
+  if(d.image != NULL)
+    d.image(&resp);
 
+  llm_delivery_close();
   llm_req_release(req);
 }
 
@@ -2381,6 +2486,9 @@ llm_deliver_stt(llm_request_t *req, bool ok, long http_status,
     const char *err)
 {
   llm_stt_response_t resp;
+  llm_delivery_t     d;
+
+  llm_delivery_take(req, &d);
 
   memset(&resp, 0, sizeof(resp));
   resp.request     = req;
@@ -2390,14 +2498,14 @@ llm_deliver_stt(llm_request_t *req, bool ok, long http_status,
   resp.text        = req->assembled != NULL ? req->assembled : "";
   resp.text_len    = req->assembled_len;
   resp.error       = ok ? NULL : (err != NULL ? err : req->errbuf);
-  resp.user_data   = req->user_data;
+  resp.user_data   = d.user;
 
-  llm_active_remove(req);
   llm_accumulate_stats(req, ok);
 
-  if(req->stt_done_cb != NULL)
-    req->stt_done_cb(&resp);
+  if(d.stt != NULL)
+    d.stt(&resp);
 
+  llm_delivery_close();
   llm_req_release(req);
 }
 
@@ -2406,6 +2514,9 @@ llm_deliver_tts(llm_request_t *req, bool ok, long http_status,
     const char *err)
 {
   llm_tts_response_t resp;
+  llm_delivery_t     d;
+
+  llm_delivery_take(req, &d);
 
   memset(&resp, 0, sizeof(resp));
   resp.request      = req;
@@ -2416,14 +2527,14 @@ llm_deliver_tts(llm_request_t *req, bool ok, long http_status,
   resp.bytes_len    = req->assembled_len;
   resp.content_type = req->resp_content_type;
   resp.error        = ok ? NULL : (err != NULL ? err : req->errbuf);
-  resp.user_data    = req->user_data;
+  resp.user_data    = d.user;
 
-  llm_active_remove(req);
   llm_accumulate_stats(req, ok);
 
-  if(req->tts_done_cb != NULL)
-    req->tts_done_cb(&resp);
+  if(d.tts != NULL)
+    d.tts(&resp);
 
+  llm_delivery_close();
   llm_req_release(req);
 }
 
@@ -2447,6 +2558,17 @@ static void
 llm_retry_task(task_t *t)
 {
   llm_request_t *req = (llm_request_t *)t->data;
+
+  // The engine latched off between the failure and this trampoline.
+  // Putting another request on the wire now is exactly what llm_stop()
+  // exists to prevent, and the drain it is running is waiting for this
+  // request — so deliver the failure instead.
+  if(llm_stopping)
+  {
+    snprintf(req->errbuf, sizeof(req->errbuf), "engine stopping");
+    llm_deliver(req, false, req->http_status, req->errbuf);
+    return;
+  }
 
   pthread_mutex_lock(&llm_stat_mutex);
   llm_stat_retries++;
@@ -2701,6 +2823,11 @@ llm_issue_request(llm_request_t *req)
   if(cr == NULL)
     return(FAIL);
 
+  // Take the identity now: ownership of `cr` transfers at submit and
+  // the pointer stops being ours. This is what llm_stop() and
+  // llm_cancel_user() hand back to curl_request_cancel().
+  req->curl_id = curl_request_id(cr);
+
   // JSON unless the request said otherwise — only the speech-to-text
   // path does, and only to carry its multipart boundary.
   if(curl_request_set_body(cr,
@@ -2753,11 +2880,15 @@ llm_issue_request(llm_request_t *req)
       : curl_request_submit(cr);
 
   if(ok != SUCCESS)
+  {
+    req->curl_id = 0;
     return(FAIL);
+  }
 
   return(SUCCESS);
 
 fail:
+  req->curl_id = 0;
   return(FAIL);
 }
 
@@ -3284,17 +3415,34 @@ llm_register_kv(void)
 
 // Lifecycle
 
-// A request's done-callback belongs to whoever asked for the completion,
-// and that requester can be unloaded while its answer is still in flight
-// — a `/plugin reload` of a chat plugin with an LLM call outstanding.
-// Nothing else can see these pointers: they live in this plugin's
-// request list, not in any registry core walks, so the loader tells us
-// the range and we drop them ourselves. The request itself is left to
-// finish and free normally; it simply delivers to nobody.
+static bool
+llm_addr_in(uintptr_t addr, uintptr_t lo, uintptr_t hi)
+{
+  return(addr != 0 && addr >= lo && addr < hi);
+}
+
+// A request's callbacks belong to whoever asked for the completion, and
+// that requester can be unloaded while its answer is still in flight —
+// a `/plugin reload` of a chat plugin mid-stream. Nothing else can see
+// these pointers: they live in this plugin's request list, not in any
+// registry core walks, so the loader tells us the range and we drop
+// them ourselves. The request itself is left to finish and free
+// normally; it simply delivers to nobody.
+//
+// ⭑ Dropping them is not enough on its own. The chunk callback of a
+// streaming request runs on the curl thread with no lock of ours held,
+// so this sweep also waits out every delivery window opened before the
+// drop — otherwise "we cleared the pointer" is an answer to a thread
+// that had already loaded it (root TODO.md §SC-SAN-FINDINGS SAN-22).
+// The wait is bounded: a quiescence barrier and an audit still stand
+// between here and the dlclose, and naming a stuck consumer callback is
+// more use than blocking the loader on it forever.
 static void
 llm_unmap_cb(uintptr_t lo, uintptr_t hi, void *data)
 {
-  uint32_t orphaned = 0;
+  uint32_t        orphaned = 0;
+  uint32_t        stuck    = 0;
+  struct timespec deadline;
 
   (void)data;
 
@@ -3302,18 +3450,23 @@ llm_unmap_cb(uintptr_t lo, uintptr_t hi, void *data)
 
   for(llm_request_t *r = llm_active_head; r != NULL; r = r->next_active)
   {
-    uintptr_t cb = 0;
+    uintptr_t done = 0;
 
     switch(r->type)
     {
-      case LLM_REQ_CHAT:  cb = (uintptr_t)fn_addr(&r->chat_done_cb);  break;
-      case LLM_REQ_EMBED: cb = (uintptr_t)fn_addr(&r->embed_done_cb); break;
-      case LLM_REQ_IMAGE: cb = (uintptr_t)fn_addr(&r->image_done_cb); break;
-      case LLM_REQ_STT:   cb = (uintptr_t)fn_addr(&r->stt_done_cb);   break;
-      case LLM_REQ_TTS:   cb = (uintptr_t)fn_addr(&r->tts_done_cb);   break;
+      case LLM_REQ_CHAT:  done = (uintptr_t)fn_addr(&r->chat_done_cb);  break;
+      case LLM_REQ_EMBED: done = (uintptr_t)fn_addr(&r->embed_done_cb); break;
+      case LLM_REQ_IMAGE: done = (uintptr_t)fn_addr(&r->image_done_cb); break;
+      case LLM_REQ_STT:   done = (uintptr_t)fn_addr(&r->stt_done_cb);   break;
+      case LLM_REQ_TTS:   done = (uintptr_t)fn_addr(&r->tts_done_cb);   break;
     }
 
-    if(cb == 0 || cb < lo || cb >= hi)
+    // The chunk callback is a second, independent pointer into the
+    // requester — a streaming chat request carries one and it outlived
+    // this test until 2026-08-15, which is the whole of SAN-22.
+    if(!llm_addr_in(done, lo, hi)
+        && !llm_addr_in((uintptr_t)fn_addr(&r->chunk_cb), lo, hi)
+        && !llm_addr_in((uintptr_t)r->user_data, lo, hi))
       continue;
 
     r->chat_done_cb  = NULL;
@@ -3321,8 +3474,24 @@ llm_unmap_cb(uintptr_t lo, uintptr_t hi, void *data)
     r->image_done_cb = NULL;
     r->stt_done_cb   = NULL;
     r->tts_done_cb   = NULL;
+    r->chunk_cb      = NULL;
     r->user_data     = NULL;
     orphaned++;
+  }
+
+  if(orphaned > 0)
+  {
+    clock_gettime(CLOCK_REALTIME, &deadline);
+    deadline.tv_sec += LLM_UNMAP_DRAIN_SECS;
+
+    while(llm_delivering > 0)
+    {
+      if(pthread_cond_timedwait(&llm_active_cond, &llm_active_mutex,
+          &deadline) == ETIMEDOUT)
+        break;
+    }
+
+    stuck = llm_delivering;
   }
 
   pthread_mutex_unlock(&llm_active_mutex);
@@ -3330,6 +3499,40 @@ llm_unmap_cb(uintptr_t lo, uintptr_t hi, void *data)
   if(orphaned > 0)
     clam(CLAM_WARN, "llm", "%u in-flight request(s) lost their requester "
         "to an unload; they will complete and deliver nothing", orphaned);
+
+  if(stuck > 0)
+    clam(CLAM_WARN, "llm", "%u consumer callback(s) still running after "
+        "%u s; the unload proceeds without them", stuck,
+        LLM_UNMAP_DRAIN_SECS);
+}
+
+// curl_request_cancel() is called with llm_active_mutex held, here and
+// in llm_stop(). It walks curl's own two lists and writes an eventfd —
+// it cannot re-enter this engine, and curl holds no lock of its own
+// across a completion callback, so llm_active_mutex → curl's locks is
+// the only order that exists.
+uint32_t
+llm_cancel_user(const void *user_data)
+{
+  uint32_t n = 0;
+
+  if(user_data == NULL || !llm_ready)
+    return(0);
+
+  pthread_mutex_lock(&llm_active_mutex);
+
+  for(llm_request_t *r = llm_active_head; r != NULL; r = r->next_active)
+  {
+    if(r->user_data != user_data || r->curl_id == 0)
+      continue;
+
+    if(curl_request_cancel(r->curl_id) == SUCCESS)
+      n++;
+  }
+
+  pthread_mutex_unlock(&llm_active_mutex);
+
+  return(n);
 }
 
 void
@@ -3340,6 +3543,7 @@ llm_init(void)
 
   pthread_mutex_init(&llm_req_mutex, NULL);
   pthread_mutex_init(&llm_active_mutex, NULL);
+  pthread_cond_init(&llm_active_cond, NULL);
   pthread_mutex_init(&llm_stat_mutex, NULL);
   pthread_rwlock_init(&llm_models_lock, NULL);
   pthread_rwlock_init(&llm_services_lock, NULL);
@@ -3377,10 +3581,56 @@ llm_register_config(void)
 void
 llm_stop(void)
 {
+  struct timespec deadline;
+  uint32_t        left;
+
   if(!llm_ready)
     return;
 
+  // 1. Latch off everything that re-arms itself — the submit paths, the
+  // retry backoff and the dialect negotiation — so the in-flight set has
+  // a reason to reach zero.
   llm_stopping = true;
+
+  // 2. Cancel what is on the wire, then wait for the callbacks. Core's
+  // quiescence barrier cannot do this for us: it range-tests the curl
+  // request's callbacks, which for a request this engine submitted name
+  // *this* mapping and never the requester's, so it waits out the full
+  // LLM timeout and then refuses the unload — the plugin zombies with a
+  // FATAL naming an in-flight request (root TODO.md §SC-LLM-INFLIGHT).
+  // A cancelled request still delivers, so what we wait for is our own
+  // callbacks finishing, not the completion of a transfer.
+  clock_gettime(CLOCK_REALTIME, &deadline);
+  deadline.tv_sec += LLM_STOP_DRAIN_SECS;
+
+  pthread_mutex_lock(&llm_active_mutex);
+
+  while(llm_active_count > 0 || llm_delivering > 0)
+  {
+    // Re-issued every pass on purpose. A request in the moment between
+    // leaving curl's submit queue and entering its in-flight list is
+    // reachable by neither walk, and a retry that fires under the latch
+    // above puts a fresh id on a request we have already cancelled once.
+    for(llm_request_t *r = llm_active_head; r != NULL; r = r->next_active)
+      if(r->curl_id != 0)
+        curl_request_cancel(r->curl_id);
+
+    if(pthread_cond_timedwait(&llm_active_cond, &llm_active_mutex,
+        &deadline) == ETIMEDOUT)
+      break;
+  }
+
+  left = llm_active_count + llm_delivering;
+
+  pthread_mutex_unlock(&llm_active_mutex);
+
+  if(left > 0)
+    clam(CLAM_WARN, "llm", "%u request(s) still airborne after a %u s "
+        "cancel-and-drain; the unload will refuse rather than crash",
+        left, LLM_STOP_DRAIN_SECS);
+
+  else
+    clam(CLAM_DEBUG, "llm", "stop: in-flight set drained");
 }
 
 void
@@ -3395,9 +3645,10 @@ llm_exit(void)
 
   plugin_unmap_notify_unregister(llm_unmap_cb);
 
-  // Drain the in-flight list. Anything still here has a done-callback
-  // in this plugin's .text that we can no longer deliver — which is
-  // why llm_stop() ran first and why the count is worth naming.
+  // Drop the in-flight list. Anything still here outlived llm_stop()'s
+  // cancel-and-drain, so it has a done-callback in this plugin's .text
+  // that we can no longer deliver — the count is what the operator
+  // needs to see, and the unload's own audit will refuse over it.
   pthread_mutex_lock(&llm_active_mutex);
 
   leaked = llm_active_count;
@@ -3435,6 +3686,7 @@ llm_exit(void)
   llm_model_params_clear();
 
   pthread_mutex_destroy(&llm_req_mutex);
+  pthread_cond_destroy(&llm_active_cond);
   pthread_mutex_destroy(&llm_active_mutex);
   pthread_mutex_destroy(&llm_stat_mutex);
   pthread_rwlock_destroy(&llm_models_lock);
