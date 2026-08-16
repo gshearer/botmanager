@@ -40,7 +40,6 @@
 #include <stdint.h>
 
 #include "async.h"
-#include "common.h"  // SUCCESS/FAIL
 
 // ----------------------------------------------------------------------
 // Enumerations (every one has UNKNOWN = 0 so a zeroed struct is "unknown")
@@ -67,6 +66,10 @@ typedef enum
   MARKET_STATE_CLOSED
 } market_state_t;
 
+// Obligation: on an envelope (quote_batch_t, quote_search_res_t,
+// quote_series_res_t) this is the DISPATCH status only, so a two-state
+// test of it is incomplete — the per-symbol outcomes live in
+// quotes[i].status and must be iterated. On a quote_t it is complete.
 typedef enum
 {
   QUOTE_OK = 0,
@@ -153,8 +156,8 @@ typedef struct
   // provider that issues one request per symbol reports every real
   // outcome — including a total failure — in quotes[i].status. Consumers
   // MUST iterate quotes[i].status per symbol and never shortcut on this
-  // field. (A pre-dispatch failure returns FAIL from the submit call and
-  // never fires the callback at all.)
+  // field. (A pre-dispatch failure returns ASYNC_FAILED_UNDELIVERED from
+  // the submit call and never fires the callback at all.)
   quote_status_t status;
   char           message[128]; // human-readable detail; "" on success
   quote_t       *quotes;       // n entries, one per requested symbol (order preserved)
@@ -281,7 +284,7 @@ stockquote_fetch_async(const char *const *syms, uint8_t n,
     if(p == NULL)
     {
       clam(CLAM_WARN, "stockquote", "no stock_quotes provider loaded");
-      return(FAIL);
+      return(ASYNC_FAILED_UNDELIVERED);
     }
     u.obj = plugin_dlsym_cached(p->name, "stockquote_fetch_async",
         (void **)&cached);
@@ -313,7 +316,7 @@ stockquote_search_async(const char *query,
     if(p == NULL)
     {
       clam(CLAM_WARN, "stockquote", "no stock_quotes provider loaded");
-      return(FAIL);
+      return(ASYNC_FAILED_UNDELIVERED);
     }
     u.obj = plugin_dlsym_cached(p->name, "stockquote_search_async",
         (void **)&cached);
@@ -346,7 +349,7 @@ stockquote_series_async(const char *sym, quote_range_t range,
     if(p == NULL)
     {
       clam(CLAM_WARN, "stockquote", "no stock_quotes provider loaded");
-      return(FAIL);
+      return(ASYNC_FAILED_UNDELIVERED);
     }
     u.obj = plugin_dlsym_cached(p->name, "stockquote_series_async",
         (void **)&cached);

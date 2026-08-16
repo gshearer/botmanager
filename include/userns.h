@@ -251,6 +251,9 @@ bool userns_user_set_cd(const userns_t *ns, const char *username,
 // every later resolve is TMFA_NONE. Rows persist in user_mfa_temp
 // and reload with the namespace, so identities survive restarts.
 
+// Obligation: success is TMFA_OK == 1, not 0, so a two-state test of
+// this reports a match as a failure. Switch on it. TMFA_EXPIRED carries
+// the notify-once obligation described above; TMFA_NONE carries none.
 typedef enum
 {
   TMFA_NONE,                  // no entry matches this metadata
