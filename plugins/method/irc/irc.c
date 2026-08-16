@@ -799,17 +799,15 @@ static const struct {
 };
 
 static void
-irc_handle_ping(irc_state_t *st, const irc_parsed_msg_t *pp)
+irc_handle_ping(irc_state_t *st, const irc_parsed_msg_t *p)
 {
-  const irc_parsed_msg_t p = *pp;
-
-  irc_send_raw(st, "PONG :%s", p.has_trailing ? p.trailing : "");
+  irc_send_raw(st, "PONG :%s", p->has_trailing ? p->trailing : "");
 }
 
 static void
-irc_handle_welcome(irc_state_t *st, const irc_parsed_msg_t *pp)
+irc_handle_welcome(irc_state_t *st, const irc_parsed_msg_t *p)
 {
-  (void)pp;
+  (void)p;
   st->registered = true;
   clam(CLAM_INFO, "irc", "registered as %s on %s", st->cur_nick, st->host);
   method_set_state(st->inst, METHOD_AVAILABLE);
@@ -832,21 +830,20 @@ irc_handle_welcome(irc_state_t *st, const irc_parsed_msg_t *pp)
 // registration. This is the only confirmation that the bot holds IRC
 // operator privileges, and it is what lets irc_eject reach for KILL.
 static void
-irc_handle_youreoper(irc_state_t *st, const irc_parsed_msg_t *pp)
+irc_handle_youreoper(irc_state_t *st, const irc_parsed_msg_t *p)
 {
-  (void)pp;
+  (void)p;
 
   __atomic_store_n(&st->is_oper, true, __ATOMIC_RELAXED);
   clam(CLAM_INFO, "irc", "granted IRC operator status");
 }
 
 static void
-irc_handle_namreply(irc_state_t *st, const irc_parsed_msg_t *pp)
+irc_handle_namreply(irc_state_t *st, const irc_parsed_msg_t *p)
 {
-  const irc_parsed_msg_t p = *pp;
   // Find the channel name (last word in params starting with # or &).
   const char *chan = NULL;
-  const char *s = p.params;
+  const char *s = p->params;
 
   while(*s != '\0')
   {
@@ -859,7 +856,7 @@ irc_handle_namreply(irc_state_t *st, const irc_parsed_msg_t *pp)
     s++;
   }
 
-  if(chan == NULL || !p.has_trailing)
+  if(chan == NULL || !p->has_trailing)
     return;
 
   // Extract channel name (up to space or end).
@@ -876,7 +873,7 @@ irc_handle_namreply(irc_state_t *st, const irc_parsed_msg_t *pp)
   channel[i] = '\0';
 
   // Parse nicks from trailing, capturing mode prefixes (@+%~&).
-  p_nick = p.trailing;
+  p_nick = p->trailing;
 
   while(*p_nick != '\0')
   {
@@ -933,10 +930,9 @@ irc_handle_namreply(irc_state_t *st, const irc_parsed_msg_t *pp)
 }
 
 static void
-irc_handle_endnames(irc_state_t *st, const irc_parsed_msg_t *pp)
+irc_handle_endnames(irc_state_t *st, const irc_parsed_msg_t *p)
 {
-  const irc_parsed_msg_t p = *pp;
-  const char *s = p.params;
+  const char *s = p->params;
   char channel[IRC_CHAN_SZ + 1];
   size_t ci = 0;
   irc_channel_t *ch;
@@ -980,10 +976,9 @@ irc_handle_endnames(irc_state_t *st, const irc_parsed_msg_t *pp)
 }
 
 static void
-irc_handle_topic332(irc_state_t *st, const irc_parsed_msg_t *pp)
+irc_handle_topic332(irc_state_t *st, const irc_parsed_msg_t *p)
 {
-  const irc_parsed_msg_t p = *pp;
-  const char *s = p.params;
+  const char *s = p->params;
   char channel[IRC_CHAN_SZ + 1];
   size_t ci = 0;
   irc_channel_t *ch;
@@ -1002,7 +997,7 @@ irc_handle_topic332(irc_state_t *st, const irc_parsed_msg_t *pp)
 
   channel[ci] = '\0';
 
-  if(!p.has_trailing || (channel[0] != '#' && channel[0] != '&'))
+  if(!p->has_trailing || (channel[0] != '#' && channel[0] != '&'))
     return;
 
   pthread_mutex_lock(&st->chan_mutex);
@@ -1010,7 +1005,7 @@ irc_handle_topic332(irc_state_t *st, const irc_parsed_msg_t *pp)
   ch = irc_chan_find(st, channel);
 
   if(ch != NULL)
-    strlcpy(ch->topic, p.trailing, IRC_LINE_SZ);
+    strlcpy(ch->topic, p->trailing, IRC_LINE_SZ);
 
   pthread_mutex_unlock(&st->chan_mutex);
 }
@@ -1068,11 +1063,10 @@ irc_handle_whoreply(irc_state_t *st, const irc_parsed_msg_t *p)
 }
 
 static void
-irc_handle_join(irc_state_t *st, const irc_parsed_msg_t *pp)
+irc_handle_join(irc_state_t *st, const irc_parsed_msg_t *p)
 {
-  const irc_parsed_msg_t p = *pp;
   // Channel is in trailing or params depending on server.
-  const char *channel = p.has_trailing ? p.trailing : p.params;
+  const char *channel = p->has_trailing ? p->trailing : p->params;
   const char *channame;
   char key[KV_KEY_SZ];
   irc_channel_t *ch;
@@ -1087,21 +1081,21 @@ irc_handle_join(irc_state_t *st, const irc_parsed_msg_t *pp)
   if(channel[0] == '\0')
     return;
 
-  irc_chan_add_nick(st, channel, p.nick);
+  irc_chan_add_nick(st, channel, p->nick);
 
   // Record the joiner's user@host from the JOIN prefix so they are
   // resolvable before their first line. This runs after the member
   // exists, which is what gives irc_user_seen() somewhere to write.
-  if(p.user[0] != '\0' && p.host[0] != '\0')
+  if(p->user[0] != '\0' && p->host[0] != '\0')
   {
     char uh[IRC_USERHOST_SZ];
 
-    snprintf(uh, sizeof(uh), "%s@%s", p.user, p.host);
-    irc_user_seen(st, p.nick, uh);
+    snprintf(uh, sizeof(uh), "%s@%s", p->user, p->host);
+    irc_user_seen(st, p->nick, uh);
   }
 
   // Handle our own joins.
-  if(strncasecmp(p.nick, st->cur_nick, IRC_NICK_SZ) == 0)
+  if(strncasecmp(p->nick, st->cur_nick, IRC_NICK_SZ) == 0)
   {
     clam(CLAM_INFO, "irc", "joined %s", channel);
     irc_handle_self_join(st, channel);
@@ -1135,10 +1129,10 @@ irc_handle_join(irc_state_t *st, const irc_parsed_msg_t *pp)
 
   irc_botname_from_inst(st->inst_name, botname, sizeof(botname));
   bot = bot_find(botname);
-  snprintf(mfa, sizeof(mfa), "%s!%s@%s", p.nick, p.user, p.host);
+  snprintf(mfa, sizeof(mfa), "%s!%s@%s", p->nick, p->user, p->host);
 
   if(bot != NULL &&
-     bot_identity_resolve(bot, st->inst, p.nick, mfa,
+     bot_identity_resolve(bot, st->inst, p->nick, mfa,
         ubuf, sizeof(ubuf)))
     return;
 
@@ -1152,61 +1146,57 @@ irc_handle_join(irc_state_t *st, const irc_parsed_msg_t *pp)
   kc = mem_alloc("irc", "kick_check", sizeof(*kc));
   strlcpy(kc->inst_name, st->inst_name, sizeof(kc->inst_name));
   strlcpy(kc->channel, channel, sizeof(kc->channel));
-  strlcpy(kc->nick, p.nick, sizeof(kc->nick));
-  strlcpy(kc->host, p.host, sizeof(kc->host));
+  strlcpy(kc->nick, p->nick, sizeof(kc->nick));
+  strlcpy(kc->host, p->host, sizeof(kc->host));
 
   task_add_deferred("irc-kick-unident",
       TASK_ANY, 200, delay * 1000, irc_kick_unident_task, kc);
 }
 
 static void
-irc_handle_part(irc_state_t *st, const irc_parsed_msg_t *pp)
+irc_handle_part(irc_state_t *st, const irc_parsed_msg_t *p)
 {
-  const irc_parsed_msg_t p = *pp;
   char channel[IRC_CHAN_SZ + 1];
   size_t i = 0;
 
-  while(p.params[i] != '\0' && p.params[i] != ' ' && i < IRC_CHAN_SZ)
+  while(p->params[i] != '\0' && p->params[i] != ' ' && i < IRC_CHAN_SZ)
   {
-    channel[i] = p.params[i];
+    channel[i] = p->params[i];
     i++;
   }
 
   channel[i] = '\0';
 
-  if(strncasecmp(p.nick, st->cur_nick, IRC_NICK_SZ) == 0)
+  if(strncasecmp(p->nick, st->cur_nick, IRC_NICK_SZ) == 0)
     irc_chan_remove(st, channel);
   else
-    irc_chan_remove_nick(st, channel, p.nick);
+    irc_chan_remove_nick(st, channel, p->nick);
 }
 
 static void
-irc_handle_quit(irc_state_t *st, const irc_parsed_msg_t *pp)
+irc_handle_quit(irc_state_t *st, const irc_parsed_msg_t *p)
 {
-  const irc_parsed_msg_t p = *pp;
-
-  irc_chan_remove_nick_all(st, p.nick);
+  irc_chan_remove_nick_all(st, p->nick);
 }
 
 static void
-irc_handle_kick(irc_state_t *st, const irc_parsed_msg_t *pp)
+irc_handle_kick(irc_state_t *st, const irc_parsed_msg_t *p)
 {
-  const irc_parsed_msg_t p = *pp;
   char channel[IRC_CHAN_SZ + 1];
   char kicked[IRC_NICK_SZ];
   size_t i = 0;
   const char *k;
   size_t j = 0;
 
-  while(p.params[i] != '\0' && p.params[i] != ' ' && i < IRC_CHAN_SZ)
+  while(p->params[i] != '\0' && p->params[i] != ' ' && i < IRC_CHAN_SZ)
   {
-    channel[i] = p.params[i];
+    channel[i] = p->params[i];
     i++;
   }
 
   channel[i] = '\0';
 
-  k = p.params + i;
+  k = p->params + i;
 
   while(*k == ' ')
     k++;
@@ -1223,10 +1213,9 @@ irc_handle_kick(irc_state_t *st, const irc_parsed_msg_t *pp)
 }
 
 static void
-irc_handle_nick(irc_state_t *st, const irc_parsed_msg_t *pp)
+irc_handle_nick(irc_state_t *st, const irc_parsed_msg_t *p)
 {
-  const irc_parsed_msg_t p = *pp;
-  const char  *raw_nick = p.has_trailing ? p.trailing : p.params;
+  const char  *raw_nick = p->has_trailing ? p->trailing : p->params;
   char         new_nick[IRC_NICK_SZ];
   method_msg_t nmsg;
 
@@ -1238,9 +1227,9 @@ irc_handle_nick(irc_state_t *st, const irc_parsed_msg_t *pp)
   // rename, the delivered message and the MFA all agree on the same string.
   strlcpy(new_nick, raw_nick, sizeof(new_nick));
 
-  irc_chan_rename_nick(st, p.nick, new_nick);
+  irc_chan_rename_nick(st, p->nick, new_nick);
 
-  if(strncasecmp(p.nick, st->cur_nick, IRC_NICK_SZ) == 0)
+  if(strncasecmp(p->nick, st->cur_nick, IRC_NICK_SZ) == 0)
     strlcpy(st->cur_nick, new_nick, IRC_NICK_SZ);
 
   // Deliver NICK_CHANGE so dossier-aware bots can merge both identities.
@@ -1249,11 +1238,11 @@ irc_handle_nick(irc_state_t *st, const irc_parsed_msg_t *pp)
   // both into the same dossier without re-running the scorer.
   memset(&nmsg, 0, sizeof(nmsg));
   nmsg.kind = METHOD_MSG_NICK_CHANGE;
-  strlcpy(nmsg.sender, p.nick, METHOD_SENDER_SZ);
+  strlcpy(nmsg.sender, p->nick, METHOD_SENDER_SZ);
   strlcpy(nmsg.text, new_nick, METHOD_TEXT_SZ);
   snprintf(nmsg.metadata, METHOD_META_SZ, "%s!%s@%s",
-      new_nick, p.user, p.host);
-  strlcpy(nmsg.prev_metadata, p.prefix, METHOD_META_SZ);
+      new_nick, p->user, p->host);
+  strlcpy(nmsg.prev_metadata, p->prefix, METHOD_META_SZ);
 
   (void)irc_identity_fill_quad(nmsg.metadata,
       nmsg.nickname,    sizeof(nmsg.nickname),
@@ -1272,9 +1261,8 @@ irc_handle_nick(irc_state_t *st, const irc_parsed_msg_t *pp)
 }
 
 static void
-irc_handle_topic(irc_state_t *st, const irc_parsed_msg_t *pp)
+irc_handle_topic(irc_state_t *st, const irc_parsed_msg_t *p)
 {
-  const irc_parsed_msg_t p = *pp;
   char channel[IRC_CHAN_SZ + 1];
   size_t ci = 0;
   const char *new_topic;
@@ -1284,9 +1272,9 @@ irc_handle_topic(irc_state_t *st, const irc_parsed_msg_t *pp)
   const char *wanted;
   char key[KV_KEY_SZ];
 
-  while(p.params[ci] != '\0' && p.params[ci] != ' ' && ci < IRC_CHAN_SZ)
+  while(p->params[ci] != '\0' && p->params[ci] != ' ' && ci < IRC_CHAN_SZ)
   {
-    channel[ci] = p.params[ci];
+    channel[ci] = p->params[ci];
     ci++;
   }
 
@@ -1295,7 +1283,7 @@ irc_handle_topic(irc_state_t *st, const irc_parsed_msg_t *pp)
   if(channel[0] != '#' && channel[0] != '&')
     return;
 
-  new_topic = p.has_trailing ? p.trailing : "";
+  new_topic = p->has_trailing ? p->trailing : "";
 
   pthread_mutex_lock(&st->chan_mutex);
 
@@ -1309,7 +1297,7 @@ irc_handle_topic(irc_state_t *st, const irc_parsed_msg_t *pp)
 
   pthread_mutex_unlock(&st->chan_mutex);
 
-  if(!have_ops || strncasecmp(p.nick, st->cur_nick, IRC_NICK_SZ) == 0)
+  if(!have_ops || strncasecmp(p->nick, st->cur_nick, IRC_NICK_SZ) == 0)
     return;
 
   channame = channel + 1;
@@ -1333,14 +1321,13 @@ irc_handle_topic(irc_state_t *st, const irc_parsed_msg_t *pp)
   {
     irc_send_raw(st, "TOPIC %s :%s", channel, wanted);
     clam(CLAM_INFO, "irc", "%s: restored topic (changed by %s)",
-        channel, p.nick);
+        channel, p->nick);
   }
 }
 
 static void
-irc_handle_mode(irc_state_t *st, const irc_parsed_msg_t *pp)
+irc_handle_mode(irc_state_t *st, const irc_parsed_msg_t *p)
 {
-  const irc_parsed_msg_t p = *pp;
   char channel[IRC_CHAN_SZ + 1];
   size_t ci = 0;
   const char *mp;
@@ -1356,9 +1343,9 @@ irc_handle_mode(irc_state_t *st, const irc_parsed_msg_t *pp)
   const char *val;
   char key[KV_KEY_SZ];
 
-  while(p.params[ci] != '\0' && p.params[ci] != ' ' && ci < IRC_CHAN_SZ)
+  while(p->params[ci] != '\0' && p->params[ci] != ' ' && ci < IRC_CHAN_SZ)
   {
-    channel[ci] = p.params[ci];
+    channel[ci] = p->params[ci];
     ci++;
   }
 
@@ -1367,7 +1354,7 @@ irc_handle_mode(irc_state_t *st, const irc_parsed_msg_t *pp)
   if(channel[0] != '#' && channel[0] != '&')
     return;
 
-  mp = p.params + ci;
+  mp = p->params + ci;
 
   while(*mp == ' ')
     mp++;
@@ -1385,7 +1372,7 @@ irc_handle_mode(irc_state_t *st, const irc_parsed_msg_t *pp)
 
   // mp now points at the first parameter nick (or '\0').
   param_ptr = mp;
-  is_self = (strncasecmp(p.nick, st->cur_nick, IRC_NICK_SZ) == 0);
+  is_self = (strncasecmp(p->nick, st->cur_nick, IRC_NICK_SZ) == 0);
 
   pthread_mutex_lock(&st->chan_mutex);
 
@@ -1451,7 +1438,7 @@ irc_handle_mode(irc_state_t *st, const irc_parsed_msg_t *pp)
 
           if(!adding)
             clam(CLAM_INFO, "irc", "%s: lost ops (deopped by %s)",
-                channel, p.nick);
+                channel, p->nick);
         }
       }
     }
@@ -1488,16 +1475,16 @@ irc_handle_mode(irc_state_t *st, const irc_parsed_msg_t *pp)
   {
     irc_send_raw(st, "MODE %s +k %s", channel, val);
     clam(CLAM_INFO, "irc", "%s: restored channel key (removed by %s)",
-        channel, p.nick);
+        channel, p->nick);
   }
 }
 
 static void
-irc_handle_nickinuse(irc_state_t *st, const irc_parsed_msg_t *pp)
+irc_handle_nickinuse(irc_state_t *st, const irc_parsed_msg_t *p)
 {
   const char *next = NULL;
 
-  (void)pp;
+  (void)p;
   st->nick_attempt++;
 
   if(st->nick_attempt == 1 && st->nick2[0] != '\0')
@@ -1517,12 +1504,10 @@ irc_handle_nickinuse(irc_state_t *st, const irc_parsed_msg_t *pp)
 }
 
 static void
-irc_handle_error(irc_state_t *st, const irc_parsed_msg_t *pp)
+irc_handle_error(irc_state_t *st, const irc_parsed_msg_t *p)
 {
-  const irc_parsed_msg_t p = *pp;
-
   clam(CLAM_WARN, "irc", "server error: %s",
-      p.has_trailing ? p.trailing : p.params);
+      p->has_trailing ? p->trailing : p->params);
   st->connected = false;
 }
 
