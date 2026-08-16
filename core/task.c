@@ -112,6 +112,32 @@ free_chain(task_t *t)
   }
 }
 
+// Terminal accounting for a task about to be freed: give back its kind
+// slot, promote any linked continuation to the ready queue, and drop it
+// from the total. Caller holds task_lock; the free happens once the
+// caller has released it.
+static void
+task_retire_locked(task_t *t)
+{
+  if(t->kind == TASK_PERIODIC)
+    stats.periodic--;
+
+  if(t->kind == TASK_PERSIST)
+    stats.persist--;
+
+  if(t->link != NULL)
+  {
+    task_t *child = t->link;
+
+    child->state = TASK_WAITING;
+    ready_insert(child);
+    stats.linked--;
+    stats.waiting++;
+  }
+
+  stats.total--;
+}
+
 static bool
 type_matches(task_type_t task_type, task_type_t request_type)
 {
@@ -587,28 +613,13 @@ task_finish(task_t *t)
         break;
       }
 
-      // Periodic task during shutdown — free it and decrement periodic.
-      if(t->kind == TASK_PERIODIC)
-        stats.periodic--;
-
-      // Persist task ending — decrement persist count.
-      if(t->kind == TASK_PERSIST)
-        stats.persist--;
-
-      // Promote linked child to the ready queue.
-      if(t->link != NULL)
-      {
-        task_t *child = t->link;
-
-        child->state = TASK_WAITING;
-        ready_insert(child);
-        stats.linked--;
-        stats.waiting++;
-      }
-      stats.total--;
+      task_retire_locked(t);
       do_free = true;
       break;
 
+    // Not task_retire_locked: a continuation must not run because the
+    // task that would have led to it failed, and FATAL takes the whole
+    // daemon down behind us anyway.
     case TASK_FATAL:
       if(t->kind == TASK_PERIODIC)
         stats.periodic--;
@@ -630,12 +641,18 @@ task_finish(task_t *t)
       stats.sleeping++;
       break;
 
+    // TASK_RUNNING — the callback returned without choosing a next
+    // state, which include/task.h requires it to do. It is off every
+    // list now, so the only alternatives are to free it or to lose it;
+    // treat it as ended and say whose it was.
     default:
+      task_retire_locked(t);
+      do_free = true;
       break;
   }
 
   // Signal if new work is available.
-  if(result == TASK_WAITING || result == TASK_ENDED)
+  if(result == TASK_WAITING || result == TASK_ENDED || do_free)
     pthread_cond_signal(&task_cond);
 
   pthread_mutex_unlock(&task_lock);
@@ -644,6 +661,12 @@ task_finish(task_t *t)
   {
     if(result == TASK_FATAL)
       clam(CLAM_FATAL, "task_finish", "task '%s' returned FATAL", t->name);
+
+    else if(result != TASK_ENDED)
+      clam(CLAM_WARN, "task_finish",
+          "task '%s' returned in state %s — include/task.h requires the "
+          "callback to set a next state; ending it", t->name,
+          task_state_name(result));
 
     mem_free(t);
   }

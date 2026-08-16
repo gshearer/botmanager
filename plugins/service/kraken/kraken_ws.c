@@ -49,7 +49,7 @@ typedef struct
   curl_socket_t   sockfd;
   kr_ws_state_t   state;
 
-  pthread_mutex_t lock;             // guards easy, state, rx_buf
+  pthread_mutex_t lock;             // guards easy, state, rx_buf, enabled
 
   task_handle_t   reader;           // joined by kr_ws_stop; never a task_t *
   bool            exit_requested;
@@ -195,7 +195,16 @@ kr_ws_init(void)
 void
 kr_ws_start(void)
 {
-  kr_ws.enabled = (kv_get_uint("plugin.kraken.ws_enabled") != 0);
+  bool enabled = (kv_get_uint("plugin.kraken.ws_enabled") != 0);
+
+  // `enabled` belongs to the session lock: the reader rewrites it from
+  // kr_ws_apply_reconfig_locked, and a KV callback that lands between
+  // the spawn below and this function returning makes that concurrent
+  // with us. Latch under the lock and log from the snapshot — the log
+  // line must not hold it (a clam destination can re-enter a plugin).
+  pthread_mutex_lock(&kr_ws.lock);
+  kr_ws.enabled = enabled;
+  pthread_mutex_unlock(&kr_ws.lock);
 
   if(kr_ws.reader != TASK_HANDLE_NONE)
     return;
@@ -211,7 +220,7 @@ kr_ws_start(void)
   }
 
   clam(CLAM_INFO, KR_CTX, "ws subsystem started (enabled=%s)",
-      kr_ws.enabled ? "true" : "false");
+      enabled ? "true" : "false");
 }
 
 bool

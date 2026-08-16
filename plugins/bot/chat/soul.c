@@ -381,6 +381,8 @@ soul_presence_task(task_t *t)
   bot_inst_t          *bot;
   chatbot_state_t     *st;
 
+  t->state = TASK_ENDED;                // one-shot; set before any return
+
   if(j == NULL)
     return;
 

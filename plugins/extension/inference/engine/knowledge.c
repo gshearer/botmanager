@@ -660,6 +660,9 @@ knowledge_singles_retry_task(task_t *t)
 {
   knowledge_singles_t *rt = t->data;
   size_t submitted, setup_failed;
+
+  t->state = TASK_ENDED;                // one-shot; set before any return
+
   if(rt == NULL)
     return;
 

@@ -474,6 +474,8 @@ ug_attach_task(task_t *t)
 {
   char *botname = t->data;
 
+  t->state = TASK_ENDED;                // one-shot; set before any return
+
   if(botname != NULL)
   {
     ug_attach_bot(botname);
@@ -520,6 +522,8 @@ ug_offer_task(task_t *t)
 {
   ug_offer_t    *off = t->data;
   method_inst_t *inst;
+
+  t->state = TASK_ENDED;                // one-shot; set before any return
 
   if(off == NULL)
     return;

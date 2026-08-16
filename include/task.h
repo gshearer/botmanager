@@ -48,6 +48,10 @@ typedef struct task task_t;
 // For TASK_PERSIST: callback contains its own loop, sets TASK_ENDED
 // when done (typically on shutdown).
 // For TASK_PERIODIC: TASK_ENDED means "iteration done, reschedule".
+// A callback that returns still in TASK_RUNNING is treated as ENDED and
+// named in a WARN — the task is off every list by then, so the only
+// alternative to freeing it is leaking it. A one-shot body with several
+// returns should set the state once, up top, rather than at each of them.
 typedef void (*task_cb_t)(task_t *t);
 
 // Dynamically allocated, lives in a sorted ready queue or timer queue

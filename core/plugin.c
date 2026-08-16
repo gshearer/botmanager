@@ -1494,6 +1494,30 @@ dlsym_cache_on_plugin_unload(const plugin_rec_t *target)
   pthread_mutex_unlock(&dlsym_cache_mutex);
 }
 
+// Drop every dlsym-cache entry. The slots the records point at live in
+// plugin text that is about to be unmapped, so nothing is written back
+// through them — the record itself is all we own. Called from
+// plugin_exit only, once no plugin is left to re-register.
+static void
+dlsym_cache_clear(void)
+{
+  dlsym_cache_rec_t *r;
+
+  pthread_mutex_lock(&dlsym_cache_mutex);
+
+  while((r = dlsym_cache_head) != NULL)
+  {
+    dlsym_cache_head = r->next;
+
+    if(r->consumer_so != NULL)
+      mem_free((char *)r->consumer_so);
+
+    mem_free(r);
+  }
+
+  pthread_mutex_unlock(&dlsym_cache_mutex);
+}
+
 // Ownership attribution and the teardown audit
 //
 // A plugin's mapping is the ground truth for "does this pointer die at
@@ -3701,6 +3725,9 @@ plugin_exit(void)
 
     mem_free(arr);
   }
+
+  // Every mapping the cache described is gone, so the records are too.
+  dlsym_cache_clear();
 
   plugin_ready = false;
   pthread_mutex_unlock(&plugin_mutate_mutex);

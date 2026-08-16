@@ -194,6 +194,8 @@ note_deliver_task(task_t *t)
   time_t          now = time(NULL);
   int             got;
 
+  t->state = TASK_ENDED;                // one-shot; set before any return
+
   if(d == NULL)
     return;
 
@@ -419,6 +421,8 @@ static void
 note_attach_task(task_t *t)
 {
   char *botname = t->data;
+
+  t->state = TASK_ENDED;                // one-shot; set before any return
 
   if(botname != NULL)
   {
