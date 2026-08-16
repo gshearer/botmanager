@@ -1166,6 +1166,76 @@ cmd_creds_visible(const method_inst_t *inst, bool admin)
       && method_inst_type(inst) == METHOD_T_BOTMANCTL);
 }
 
+// In-flight accounting
+//
+// The barrier that guards a dlclose walks the task and curl queues and
+// the bot registry (core/plugin.c, plugin_quiesce). A command handler
+// is in none of them: the task's own callback is cmd_task_cb, which
+// lives in core, and cmd_dispatch_as runs the handler with no task at
+// all. So the three dispatchers below record the handler themselves,
+// and cmd_inflight_owned() answers for the mapping it lives in.
+
+static void
+cmd_inflight_enter(cmd_inflight_t *node, cmd_cb_t cb, const char *name)
+{
+  node->cb = cb;
+  strlcpy(node->name, name != NULL ? name : "(unnamed)", sizeof(node->name));
+
+  pthread_mutex_lock(&cmd_inflight_mutex);
+  node->next        = cmd_inflight_list;
+  cmd_inflight_list = node;
+  pthread_mutex_unlock(&cmd_inflight_mutex);
+}
+
+static void
+cmd_inflight_leave(cmd_inflight_t *node)
+{
+  cmd_inflight_t **pp;
+
+  pthread_mutex_lock(&cmd_inflight_mutex);
+
+  for(pp = &cmd_inflight_list; *pp != NULL; pp = &(*pp)->next)
+  {
+    if(*pp != node)
+      continue;
+
+    *pp = node->next;
+    break;
+  }
+
+  pthread_mutex_unlock(&cmd_inflight_mutex);
+}
+
+uint32_t
+cmd_inflight_owned(uintptr_t lo, uintptr_t hi, char *out, size_t out_cap)
+{
+  uint32_t n = 0;
+
+  if(out != NULL && out_cap > 0)
+    out[0] = '\0';
+
+  if(lo >= hi)
+    return(0);
+
+  pthread_mutex_lock(&cmd_inflight_mutex);
+
+  for(const cmd_inflight_t *c = cmd_inflight_list; c != NULL; c = c->next)
+  {
+    uintptr_t addr = (uintptr_t)fn_addr(&c->cb);
+
+    if(addr < lo || addr >= hi)
+      continue;
+
+    if(n == 0 && out != NULL && out_cap > 0)
+      strlcpy(out, c->name, out_cap);
+
+    n++;
+  }
+
+  pthread_mutex_unlock(&cmd_inflight_mutex);
+  return(n);
+}
+
 // A dispatched command outlives the delivery that produced it — the
 // message is copied by value and the callback runs on a task thread —
 // so the copy carries its own reference to the originating method
@@ -1187,6 +1257,7 @@ cmd_task_cb(task_t *t)
   const char      *uname;
   bool             admin;
   bool             creds;
+  cmd_inflight_t   node;
 
   cmd_ctx_t ctx = {
     .bot      = d->bot,
@@ -1197,6 +1268,11 @@ cmd_task_cb(task_t *t)
     .data     = d->cb_data,
   };
 
+  // Opens before the parse, not before the call: arg_desc is the
+  // plugin's too, and 4 of the 53 plugin descriptor tables name a
+  // validator cmd_parse_args reaches through.
+  cmd_inflight_enter(&node, d->cb, d->name);
+
   // Pre-parse and validate arguments if the command has an arg spec.
   cmd_args_t parsed;
 
@@ -1206,6 +1282,7 @@ cmd_task_cb(task_t *t)
         d->arg_bufs, &parsed, &ctx, d->usage))
     {
       cmd_task_data_free(d);
+      cmd_inflight_leave(&node);
       t->state = TASK_ENDED;
       return;
     }
@@ -1226,6 +1303,7 @@ cmd_task_cb(task_t *t)
     kv_admin_context_set(false);
 
   cmd_task_data_free(d);
+  cmd_inflight_leave(&node);
 
   t->state = TASK_ENDED;
 }
@@ -1573,6 +1651,7 @@ cmd_dispatch(bot_inst_t *inst, const method_msg_t *msg)
   td->arg_desc  = arg_desc;
   td->arg_count = arg_count;
   td->usage     = usage;
+  strlcpy(td->name, cmd_name, sizeof(td->name));
 
   // Submit task.
   snprintf(task_name, sizeof(task_name), "cmd:%s", cmd_name);
@@ -2240,8 +2319,16 @@ cmd_get_nl(const cmd_def_t *def)
 void
 cmd_invoke(const cmd_def_t *def, const cmd_ctx_t *ctx)
 {
+  cmd_inflight_t node;
+
   if(def == NULL || def->cb == NULL || ctx == NULL)
     return;
+
+  // The third way a plugin's handler runs, and the one that needs the
+  // record most: the OUTER command here is core's (`/bot <name> <verb>`
+  // in core/bot_cmd.c), so the enclosing dispatcher's node names core's
+  // mapping and the leaf's would go uncounted.
+  cmd_inflight_enter(&node, def->cb, def->name);
 
   if(def->arg_desc != NULL && def->arg_count > 0 && ctx->parsed == NULL)
   {
@@ -2249,17 +2336,19 @@ cmd_invoke(const cmd_def_t *def, const cmd_ctx_t *ctx)
     char       arg_bufs[CMD_MAX_ARGS][CMD_ARG_SZ];
     cmd_ctx_t  sub;
 
-    if(!cmd_parse_args(ctx->args, def->arg_desc, def->arg_count,
+    if(cmd_parse_args(ctx->args, def->arg_desc, def->arg_count,
         arg_bufs, &parsed, ctx, def->usage))
-      return;
-
-    sub = *ctx;
-    sub.parsed = &parsed;
-    (def->cb)(&sub);
-    return;
+    {
+      sub = *ctx;
+      sub.parsed = &parsed;
+      (def->cb)(&sub);
+    }
   }
 
-  (def->cb)(ctx);
+  else
+    (def->cb)(ctx);
+
+  cmd_inflight_leave(&node);
 }
 
 // Command iteration
@@ -2441,6 +2530,8 @@ cmd_dispatch_as(const char *cmd_name, const char *args,
   cmd_ctx_t ctx;
   cmd_args_t parsed;
   char arg_bufs[CMD_MAX_ARGS][CMD_ARG_SZ];
+  cmd_inflight_t node;
+  char cmd_leaf[CMD_NAME_SZ];
 
   if(cmd_name == NULL || cmd_name[0] == '\0')
     return(FAIL);
@@ -2478,6 +2569,7 @@ cmd_dispatch_as(const char *cmd_name, const char *args,
   usage = d->usage;
   req_level = d->level;
   memcpy(req_group, d->group, USERNS_GROUP_SZ);
+  strlcpy(cmd_leaf, d->name, sizeof(cmd_leaf));
 
   pthread_mutex_unlock(&cmd_mutex);
 
@@ -2513,11 +2605,19 @@ cmd_dispatch_as(const char *cmd_name, const char *args,
     .parsed   = NULL,
   };
 
+  // From here on a pointer into the plugin's mapping is live on this
+  // thread — and on this path there is no task for the barrier to find
+  // even in principle, so the record is the only thing that names it.
+  cmd_inflight_enter(&node, cb, cmd_leaf);
+
   if(ad != NULL && ac > 0)
   {
     memset(arg_bufs, 0, sizeof(arg_bufs));
     if(!cmd_parse_args(args, ad, ac, arg_bufs, &parsed, &ctx, usage))
+    {
+      cmd_inflight_leave(&node);
       return(SUCCESS);    // validation failed, error already sent
+    }
 
     ctx.parsed = &parsed;
   }
@@ -2535,6 +2635,8 @@ cmd_dispatch_as(const char *cmd_name, const char *args,
     if(creds)
       kv_admin_context_set(false);
   }
+
+  cmd_inflight_leave(&node);
 
   // No bot_inc_cmd_count here, and that is not an oversight: this path
   // asserts a caller identity against a method instance with no bot
@@ -2593,6 +2695,7 @@ cmd_dispatch_resolved(bot_inst_t *inst, const method_msg_t *msg,
   td->arg_desc  = def->arg_desc;
   td->arg_count = def->arg_count;
   td->usage     = def->usage;
+  strlcpy(td->name, def->name, sizeof(td->name));
 
   snprintf(task_name, sizeof(task_name), "cmd:%s", def->name);
 
@@ -2667,6 +2770,7 @@ cmd_init(void)
 {
   pthread_mutex_init(&cmd_mutex, NULL);
   pthread_mutex_init(&cmd_sink_mutex, NULL);
+  pthread_mutex_init(&cmd_inflight_mutex, NULL);
 
   // Register core built-in commands.
   cmd_register("cmd", "help",
@@ -2810,6 +2914,25 @@ cmd_exit(void)
           "%u reply sink(s) still registered at shutdown", leaked);
   }
 
+  // Nothing to free — every node is a live stack frame — but a
+  // non-empty list means a handler outlived the subsystem, which is
+  // the one thing this accounting exists to make impossible.
+  {
+    uint32_t running = 0;
+
+    pthread_mutex_lock(&cmd_inflight_mutex);
+
+    for(const cmd_inflight_t *c = cmd_inflight_list; c != NULL; c = c->next)
+      running++;
+
+    pthread_mutex_unlock(&cmd_inflight_mutex);
+
+    if(running > 0)
+      clam(CLAM_WARN, "cmd_exit",
+          "%u command handler(s) still executing at shutdown", running);
+  }
+
   pthread_mutex_destroy(&cmd_mutex);
   pthread_mutex_destroy(&cmd_sink_mutex);
+  pthread_mutex_destroy(&cmd_inflight_mutex);
 }

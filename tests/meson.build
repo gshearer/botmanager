@@ -109,6 +109,20 @@ test_curl_submit_wait = executable('test_curl_submit_wait',
   dependencies : core_deps,
 )
 
+# The quiescence barrier asks cmd_inflight_owned() whether a command
+# handler is running inside the mapping it is about to unmap. A wrong
+# answer has no error path: the unload proceeds and the handler resumes
+# at an address that is no longer code — measured as a SIGSEGV whose
+# fault site was inside libc. A mapping is just an address range, so
+# these cases need no dlopen; they drive cmd_invoke() and let a handler
+# ask about its own address.
+test_cmd_inflight = executable('test_cmd_inflight',
+  'test_cmd_inflight.c',
+  include_directories : [include_directories('.'), inc_include],
+  link_with : [test_harness, libcore],
+  dependencies : core_deps,
+)
+
 test('util', test_util)
 test('colors', test_colors)
 test('json', test_json)
@@ -119,3 +133,4 @@ test('fact_merge', test_fact_merge)
 test('kv_bot', test_kv_bot)
 test('kv_str', test_kv_str)
 test('curl_submit_wait', test_curl_submit_wait)
+test('cmd_inflight', test_cmd_inflight)

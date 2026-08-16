@@ -10,6 +10,11 @@
 static void dlsym_cache_on_plugin_unload(const plugin_rec_t *target);
 
 // Forward decl — defined alongside plugin_audit, which shares its
+// phdr walk. Called from plugin_unload's early refusals, which run
+// before anything has been torn down.
+static bool plugin_map_of(const plugin_desc_t *desc, plugin_map_t *out);
+
+// Forward decl — defined alongside plugin_audit, which shares its
 // mapping lookup. Called from plugin_unload between deinit and dlclose.
 static uint32_t plugin_reclaim(const plugin_rec_t *target);
 
@@ -255,6 +260,35 @@ plugin_unload_locked(const char *name, plugin_unload_report_t *report)
           "cannot unload '%s': bot '%s' is bound to its driver "
           "(state=%s); stop and destroy the bot first",
           name, bot_name, bot_state_name(bot_state));
+      return(FAIL);
+    }
+  }
+
+  // Refuse early if one of this plugin's command handlers is running.
+  //
+  // The barrier further down is what makes the guarantee — a command
+  // can start in the gap between here and there — but by the time it
+  // runs, stop(), deinit() and plugin_reclaim() have already happened,
+  // so a refusal there leaves a zombie: nothing of the plugin works
+  // and it still needs a restart. Refusing HERE leaves it untouched
+  // and working, and the operator simply retries. plugin_exit()
+  // dlcloses directly and never comes through this path, so this
+  // cannot wedge shutdown.
+  {
+    plugin_map_t map;
+    char         cmd_name[CMD_NAME_SZ];
+    uint32_t     running = 0;
+
+    if(plugin_map_of(target->desc, &map) == SUCCESS)
+      running = cmd_inflight_owned(map.lo, map.hi, cmd_name,
+          sizeof(cmd_name));
+
+    if(running > 0)
+    {
+      clam(CLAM_WARN, "plugin",
+          "cannot unload '%s': %u of its command handler(s) still "
+          "executing (first is '%s'); nothing was touched — retry once "
+          "it finishes", name, running, cmd_name);
       return(FAIL);
     }
   }
@@ -2047,7 +2081,9 @@ plugin_quiesce(const plugin_rec_t *target, uint32_t timeout_ms,
   for(;;)
   {
     char     bot_name[BOT_NAME_SZ];
+    char     cmd_name[CMD_NAME_SZ];
     uint32_t delivering;
+    uint32_t running;
 
     ctx.holders     = 0;
     ctx.offender[0] = '\0';
@@ -2067,6 +2103,22 @@ plugin_quiesce(const plugin_rec_t *target, uint32_t timeout_ms,
     {
       quiesce_hold(&ctx, "bot", bot_name, "delivering");
       ctx.holders += delivering - 1;
+    }
+
+    // A command handler executing in the mapping is the fourth Class-B
+    // holding, and the task walk above cannot see it: a command task's
+    // own callback is core's cmd_task_cb, and cmd_dispatch_as runs the
+    // handler with no task at all. Measured 2026-08-16 — an unload
+    // under a running handler unmapped its .text and the daemon took a
+    // SIGSEGV whose fault address was inside the freed mapping (root
+    // TODO.md §OBS-15).
+    running = cmd_inflight_owned(ctx.map.lo, ctx.map.hi,
+        cmd_name, sizeof(cmd_name));
+
+    if(running > 0)
+    {
+      quiesce_hold(&ctx, "command", cmd_name, "running");
+      ctx.holders += running - 1;
     }
 
     if(ctx.holders == 0)

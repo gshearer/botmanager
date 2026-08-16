@@ -238,6 +238,13 @@ uint32_t cmd_reclaim_owned(uintptr_t lo, uintptr_t hi);
 // When /help resolves to this command and there are remaining tokens
 // that don't match children, the extender is called instead of showing
 // "unknown command". child NULL means root-level.
+//
+// ⚠ Core only, today and by intent. The extender is called with
+// cmd_mutex released and nothing counts it, so an extender living in a
+// plugin would be a Class-B reference the quiescence barrier cannot
+// see — the defect cmd_inflight_owned() exists to close for handlers.
+// Both registrants in the tree are core (core/bot_cmd.c); a plugin
+// registering one owes the same accounting first.
 bool cmd_set_help_extender(const char *name, const char *child,
     cmd_help_extender_t ext);
 
@@ -381,6 +388,25 @@ void cmd_iterate_root(cmd_iter_cb_t cb, void *data);
 void cmd_iterate_children(const cmd_def_t *parent, cmd_iter_cb_t cb,
     void *data);
 
+// Commands whose handler is executing inside a mapping in [lo,hi)
+// right now. A plugin's cmd_cb_t is a Class-B reference core cannot
+// reclaim: cmd_reclaim_owned() frees the cmd_def_t before dlclose, but
+// the function itself may be on a worker's stack, and unmapping it out
+// from under one is a SIGSEGV (root TODO.md §OBS-15). The task queue
+// cannot answer this — a command task's own cb is core's cmd_task_cb,
+// one pointer above the plugin's — so plugin_quiesce() polls this
+// alongside it. Names the first one in `out` when out_cap > 0.
+//
+// The window covers the argument parse as well as the call: arg_desc
+// and any cmd_arg_validator_t it names live in the same mapping.
+//
+// Nothing waits. What holds the mapping open meanwhile is the count
+// itself (core/AGENTS.md §Patterns), so the reading is a moment's: a
+// handler that returns between the call and its use is gone, which is
+// exactly what quiescence polls for.
+uint32_t cmd_inflight_owned(uintptr_t lo, uintptr_t hi,
+    char *out, size_t out_cap);
+
 // Audit hook: yields every pointer the command registry retains, one
 // invocation per (definition, field). `subject` is the definition's
 // slash-joined registration path — the same address space
@@ -488,8 +514,28 @@ typedef struct
   const char    *usage;                      // usage string (static, not copied)
   const cmd_arg_desc_t *arg_desc;            // argument descriptors (NULL = none)
   uint8_t        arg_count;                  // number of arg descriptors
+  char           name[CMD_NAME_SZ];          // for the quiescence offender line
   char           arg_bufs[CMD_MAX_ARGS][CMD_ARG_SZ]; // token storage
 } cmd_task_data_t;
+
+// One node per command handler currently executing, spliced onto the
+// in-flight list by the dispatcher that runs it. The node lives in the
+// CALLER'S STACK FRAME: allocation-free, cannot fail, and cannot
+// overflow the way a fixed slot table would — a full table's only
+// honest answer is "proceed uncounted", which is the defect itself.
+// The frame outlives the call by construction.
+typedef struct cmd_inflight
+{
+  cmd_cb_t             cb;                 // the handler running
+  char                 name[CMD_NAME_SZ];  // for the offender line
+  struct cmd_inflight *next;
+} cmd_inflight_t;
+
+// Bracket one handler invocation. `leave` must run on every path out,
+// including the one where argument parsing refused.
+static void cmd_inflight_enter(cmd_inflight_t *node, cmd_cb_t cb,
+    const char *name);
+static void cmd_inflight_leave(cmd_inflight_t *node);
 
 // Reply-sink registry node. Singly linked; the list stays short (one
 // live sink per in-flight captured command) so linear lookup is fine.
@@ -515,6 +561,14 @@ static bool             cmd_ready        = false;
 static cmd_sink_t      *cmd_sinks        = NULL;
 static uint64_t         cmd_sink_next_id = 1;
 static pthread_mutex_t  cmd_sink_mutex;
+
+// The in-flight list gets its own mutex for the same reason the sinks
+// do, only harder: a handler replies, and cmd_reply -> method_send ->
+// clam() must never run under a lock (core/AGENTS.md). Enter and leave
+// hold this for a pointer splice and nothing else; the callback itself
+// runs with it released.
+static cmd_inflight_t  *cmd_inflight_list    = NULL;
+static pthread_mutex_t  cmd_inflight_mutex;
 
 static cmd_set_t       *cmd_set_freelist     = NULL;
 static uint32_t         cmd_set_free_count   = 0;
