@@ -670,7 +670,6 @@ text_prefix_for(bot_inst_t *inst, const method_msg_t *msg)
   const char *kind;
   const char *bname;
   const char *pfx;
-  char key[KV_KEY_SZ];
 
   if(msg->inst == NULL)
     return(cmd_get_prefix(inst));
@@ -681,8 +680,7 @@ text_prefix_for(bot_inst_t *inst, const method_msg_t *msg)
   if(kind == NULL || bname == NULL)
     return(cmd_get_prefix(inst));
 
-  snprintf(key, sizeof(key), "bot.%s.%s.prefix", bname, kind);
-  pfx = kv_get_str(key);
+  pfx = kv_get_bot_method_str(bname, kind, "prefix");
 
   return((pfx != NULL && pfx[0] != '\0') ? pfx : cmd_get_prefix(inst));
 }

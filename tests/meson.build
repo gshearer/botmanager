@@ -74,6 +74,17 @@ test_fact_merge = executable('test_fact_merge',
   link_with : [test_harness],
 )
 
+# The per-bot key accessors compose a key for ~110 call sites. Their one
+# silent failure is a key too long to compose reading as the shorter key
+# it truncates onto, so this suite drives kv.c's own table through the
+# public accessors — kv_init() is DB-free, and nothing here flushes.
+test_kv_bot = executable('test_kv_bot',
+  'test_kv_bot.c',
+  include_directories : [include_directories('.'), inc_include],
+  link_with : [test_harness, libcore],
+  dependencies : core_deps,
+)
+
 test('util', test_util)
 test('colors', test_colors)
 test('json', test_json)
@@ -81,3 +92,4 @@ test('irc_parse', test_irc_parse)
 test('db_txn', test_db_txn)
 test('cooldown', test_cooldown)
 test('fact_merge', test_fact_merge)
+test('kv_bot', test_kv_bot)

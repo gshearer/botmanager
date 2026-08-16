@@ -768,7 +768,6 @@ chatbot_names_resolve(const char *botname, const method_msg_t *msg,
 {
   const char *list;
   char        copy[KV_STR_SZ];
-  char        key[128];
   char       *save = NULL;
 
   if(out == NULL) return;
@@ -780,9 +779,7 @@ chatbot_names_resolve(const char *botname, const method_msg_t *msg,
 
   if(botname == NULL || botname[0] == '\0') return;
 
-  snprintf(key, sizeof(key), "bot.%s.aka", botname);
-
-  list = kv_get_str(key);
+  list = kv_get_bot_str(botname, "aka");
 
   if(list == NULL || list[0] == '\0') return;
 
@@ -1353,7 +1350,6 @@ chatbot_create(bot_inst_t *inst)
   chatbot_state_t *st = mem_alloc("chatbot", "state", sizeof(*st));
   const char *name;
   const char *prefix;
-  char key[KV_KEY_SZ];
 
   memset(st, 0, sizeof(*st));
   st->inst = inst;
@@ -1377,10 +1373,7 @@ chatbot_create(bot_inst_t *inst)
     cmd_set_prefix(inst, prefix);
 
   // Seed active personality from per-instance KV (may be empty).
-  snprintf(key, sizeof(key), "bot.%s.behavior.personality",
-      bot_inst_name(inst));
-
-  name = kv_get_str(key);
+  name = kv_get_bot_str(bot_inst_name(inst), "behavior.personality");
   if(name == NULL || name[0] == '\0')
     name = kv_get_str("plugin.chat.default_personality");
 
@@ -1475,15 +1468,13 @@ static void
 chatbot_register_interests(chatbot_state_t *st)
 {
   const char *botname = bot_inst_name(st->inst);
-  char key[128];
   acquire_topic_t topics[CHATBOT_TOPIC_CACHE_MAX];
   size_t n;
   chatbot_personality_t p;
   char persona[CHATBOT_PERSONALITY_NAME_SZ];
   const char *corpus;
 
-  snprintf(key, sizeof(key), "bot.%s.acquired_corpus", botname);
-  corpus = kv_get_str(key);
+  corpus = kv_get_bot_str(botname, "acquired_corpus");
 
   if(corpus == NULL || corpus[0] == '\0')
     return;
@@ -1577,7 +1568,6 @@ chatbot_start(void *handle)
   userns_t *ns;
   uint32_t  ns_id;
   const char *botname;
-  char key[128];
 
   if(st == NULL) return(SUCCESS);
 
@@ -1592,19 +1582,15 @@ chatbot_start(void *handle)
 
   // Soul heartbeat — every chat-enabled bot gets one; its tick re-reads
   // the gates (enabled, mute, interval) fresh each fire.
-  snprintf(key, sizeof(key), "bot.%s.behavior.chat.enabled", botname);
-  if(kv_get_uint(key) != 0)
-  {
-    snprintf(key, sizeof(key), "bot.%s.behavior.soul.interval_secs", botname);
-    soul_schedule(botname, ns_id, (uint32_t)kv_get_uint(key));
-  }
+  if(kv_get_bot_uint(botname, "behavior.chat.enabled") != 0)
+    soul_schedule(botname, ns_id, (uint32_t)kv_get_bot_uint(botname,
+        "behavior.soul.interval_secs"));
 
-  snprintf(key, sizeof(key), "bot.%s.behavior.fact_extract.enabled", botname);
-  if(kv_get_uint(key) == 0)
+  if(kv_get_bot_uint(botname, "behavior.fact_extract.enabled") == 0)
     return(SUCCESS);
 
-  snprintf(key, sizeof(key), "bot.%s.behavior.fact_extract.interval_secs", botname);
-  interval = (uint32_t)kv_get_uint(key);
+  interval = (uint32_t)kv_get_bot_uint(botname,
+      "behavior.fact_extract.interval_secs");
 
   extract_schedule(botname, ns_id, interval);
   return(SUCCESS);
@@ -1645,7 +1631,6 @@ chatbot_consider_speaking(chatbot_state_t *st, const method_msg_t *msg,
     mem_msg_kind_t kind, chatbot_classify_reason_t reason)
 {
   const char *botname = bot_inst_name(st->inst);
-  char key[128];
   chatbot_speak_t decision;
   uint32_t ewin;
   const char *target;
@@ -1674,23 +1659,22 @@ chatbot_consider_speaking(chatbot_state_t *st, const method_msg_t *msg,
   // image URL is present, vision is the bot's response to the message.
   if(chatbot_vision_maybe_submit(st, msg)) return;
 
-  snprintf(key, sizeof(key), "bot.%s.behavior.max_inflight", botname);
-  max_inflight = (uint32_t)kv_get_uint(key);
+  max_inflight = (uint32_t)kv_get_bot_uint(botname, "behavior.max_inflight");
 
-  snprintf(key, sizeof(key), "bot.%s.behavior.speak.interject_prob", botname);
-  interject_prob = (uint32_t)kv_get_uint(key);
+  interject_prob = (uint32_t)kv_get_bot_uint(botname,
+      "behavior.speak.interject_prob");
 
-  snprintf(key, sizeof(key), "bot.%s.behavior.speak.witness_base_prob", botname);
-  witness_base_prob = (uint32_t)kv_get_uint(key);
+  witness_base_prob = (uint32_t)kv_get_bot_uint(botname,
+      "behavior.speak.witness_base_prob");
 
-  snprintf(key, sizeof(key), "bot.%s.behavior.speak.reply_cooldown_secs", botname);
-  cooldown = (uint32_t)kv_get_uint(key);
+  cooldown = (uint32_t)kv_get_bot_uint(botname,
+      "behavior.speak.reply_cooldown_secs");
 
-  snprintf(key, sizeof(key), "bot.%s.behavior.speak.witness_interject_cooldown_secs", botname);
-  witness_cd = (uint32_t)kv_get_uint(key);
+  witness_cd = (uint32_t)kv_get_bot_uint(botname,
+      "behavior.speak.witness_interject_cooldown_secs");
 
-  snprintf(key, sizeof(key), "bot.%s.behavior.speak.engagement_window_secs", botname);
-  ewin = (uint32_t)kv_get_uint(key);
+  ewin = (uint32_t)kv_get_bot_uint(botname,
+      "behavior.speak.engagement_window_secs");
 
   target = msg->channel[0] != '\0' ? msg->channel : msg->sender;
   now = time(NULL);
@@ -1809,7 +1793,6 @@ chatbot_resolve_dossier(chatbot_state_t *st, const method_msg_t *msg)
   const char *label;
   dossier_sig_t sig;
   dossier_id_t pid;
-  char key[128];
   const char *matched_user;
   uint32_t    matched_uid;
   const char *method_kind;
@@ -1846,9 +1829,8 @@ chatbot_resolve_dossier(chatbot_state_t *st, const method_msg_t *msg)
 
   // Anonymous-dossier toggle: when off, only MFA-matched senders get
   // a dossier; others resolve to 0 and their messages log without one.
-  snprintf(key, sizeof(key), "bot.%s.behavior.anonymous_dossiers",
-      bot_inst_name(st->inst));
-  allow_anon = (kv_get_uint(key) != 0);
+  allow_anon = (kv_get_bot_uint(bot_inst_name(st->inst),
+      "behavior.anonymous_dossiers") != 0);
 
   create = (matched_user != NULL) || allow_anon;
 
@@ -2620,7 +2602,6 @@ chatbot_observe(chatbot_state_t *st, const method_msg_t *msg)
   bool engagement_require_reply;
   uint32_t engagement_window;
   const char *botname;
-  char key[128];
   chatbot_names_t names;
 
   botname = bot_inst_name(st->inst);
@@ -2632,14 +2613,14 @@ chatbot_observe(chatbot_state_t *st, const method_msg_t *msg)
   // Sticky engagement knobs (per message, same cadence as the rest of
   // the per-line KV reads below). Two small integer reads — no point
   // in a cached-config struct for this.
-  snprintf(key, sizeof(key), "bot.%s.behavior.speak.engagement_window_secs", botname);
-  engagement_window = (uint32_t)kv_get_uint(key);
+  engagement_window = (uint32_t)kv_get_bot_uint(botname,
+      "behavior.speak.engagement_window_secs");
 
-  snprintf(key, sizeof(key), "bot.%s.behavior.speak.engagement_require_reply", botname);
-  engagement_require_reply = (kv_get_uint(key) != 0);
+  engagement_require_reply = (kv_get_bot_uint(botname,
+      "behavior.speak.engagement_require_reply") != 0);
 
-  snprintf(key, sizeof(key), "bot.%s.behavior.speak.handoff_window_secs", botname);
-  handoff_window = (uint32_t)kv_get_uint(key);
+  handoff_window = (uint32_t)kv_get_bot_uint(botname,
+      "behavior.speak.handoff_window_secs");
   if(handoff_window == 0)
     handoff_window = CHATBOT_HANDOFF_WINDOW_DEFAULT_SECS;
 
@@ -2673,8 +2654,7 @@ chatbot_observe(chatbot_state_t *st, const method_msg_t *msg)
   // Drop WITNESS lines if witness logging is disabled for this instance.
   if(kind == MEM_MSG_WITNESS)
   {
-    snprintf(key, sizeof(key), "bot.%s.behavior.witness_log", botname);
-    if(kv_get_uint(key) == 0)
+    if(kv_get_bot_uint(botname, "behavior.witness_log") == 0)
       return;
   }
 
@@ -2718,8 +2698,7 @@ chatbot_observe(chatbot_state_t *st, const method_msg_t *msg)
       msg->channel[0] ? msg->channel : "(dm)",
       msg->text);
 
-  snprintf(key, sizeof(key), "bot.%s.behavior.coalesce_ms", botname);
-  coalesce_ms = (uint32_t)kv_get_uint(key);
+  coalesce_ms = (uint32_t)kv_get_bot_uint(botname, "behavior.coalesce_ms");
 
   if(chatbot_coalesce_enqueue(st, msg, kind, reason, coalesce_ms))
     return;
@@ -2746,7 +2725,6 @@ static void
 chatbot_on_message(void *handle, const method_msg_t *msg)
 {
   chatbot_state_t *st = handle;
-  char key[KV_KEY_SZ];
 
   if(st == NULL || msg == NULL) return;
 
@@ -2761,10 +2739,7 @@ chatbot_on_message(void *handle, const method_msg_t *msg)
   if(text_dispatch_message(st->inst, msg))
     return;
 
-  snprintf(key, sizeof(key), "bot.%s.behavior.chat.enabled",
-      bot_inst_name(st->inst));
-
-  if(kv_get_uint(key) == 0)
+  if(kv_get_bot_uint(bot_inst_name(st->inst), "behavior.chat.enabled") == 0)
     return;
 
   chatbot_observe(st, msg);

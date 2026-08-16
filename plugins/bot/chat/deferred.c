@@ -863,7 +863,6 @@ static bool
 deferred_ask_open(const cmd_ctx_t *ctx, const char *duration,
     deferred_ask_t *a)
 {
-  char     key[KV_KEY_SZ];
   uint32_t cap;
   int64_t  pending;
 
@@ -878,9 +877,8 @@ deferred_ask_open(const cmd_ctx_t *ctx, const char *duration,
 
   if(a->on_presence)
   {
-    snprintf(key, sizeof(key), "bot.%s.behavior.soul.deferred.back_quiet_secs",
-        bot_inst_name(ctx->bot));
-    a->secs = (uint64_t)kv_get_uint(key);
+    a->secs = (uint64_t)kv_get_bot_uint(bot_inst_name(ctx->bot),
+        "behavior.soul.deferred.back_quiet_secs");
 
     if(a->secs == 0)
       a->secs = DEFERRED_BACK_QUIET_DEFAULT;
@@ -914,10 +912,7 @@ deferred_ask_open(const cmd_ctx_t *ctx, const char *duration,
   // Both kinds are delivered as persona speech — even a `run` reports
   // its outcome in voice — so a command-only bot would accept the work
   // and never speak it. Refuse the dead letter up front.
-  snprintf(key, sizeof(key), "bot.%s.behavior.chat.enabled",
-      bot_inst_name(ctx->bot));
-
-  if(kv_get_uint(key) == 0)
+  if(kv_get_bot_uint(bot_inst_name(ctx->bot), "behavior.chat.enabled") == 0)
   {
     cmd_reply(ctx, "this bot doesn't speak (chat is disabled) — it"
         " would take this and never deliver it");
@@ -939,9 +934,8 @@ deferred_ask_open(const cmd_ctx_t *ctx, const char *duration,
     return(FAIL);
   }
 
-  snprintf(key, sizeof(key), "bot.%s.behavior.soul.deferred.max_pending",
-      bot_inst_name(ctx->bot));
-  cap = (uint32_t)kv_get_uint(key);
+  cap = (uint32_t)kv_get_bot_uint(bot_inst_name(ctx->bot),
+      "behavior.soul.deferred.max_pending");
 
   if(cap == 0)
     cap = DEFERRED_MAX_PENDING_DEFAULT;

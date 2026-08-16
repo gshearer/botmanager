@@ -369,23 +369,16 @@ pricewatch_crossed(double price, int64_t dir, double threshold)
 static bool
 pricewatch_enabled(const char *bot_name)
 {
-  char key[KV_KEY_SZ];
 
-  snprintf(key, sizeof(key), "bot.%s.behavior.soul.pricewatch.enabled",
-      bot_name);
-
-  return(kv_get_uint(key) != 0);
+  return(kv_get_bot_uint(bot_name, "behavior.soul.pricewatch.enabled") != 0);
 }
 
 static void
 pricewatch_exchange_for(const char *bot_name, char *dst, size_t cap)
 {
   const char *v;
-  char        key[KV_KEY_SZ];
 
-  snprintf(key, sizeof(key), "bot.%s.behavior.soul.pricewatch.exchange",
-      bot_name);
-  v = kv_get_str(key);
+  v = kv_get_bot_str(bot_name, "behavior.soul.pricewatch.exchange");
 
   snprintf(dst, cap, "%s",
       v != NULL && v[0] != '\0' ? v : PRICEWATCH_EXCHANGE_DEFAULT);
@@ -752,7 +745,6 @@ cmd_pricewatch(const cmd_ctx_t *ctx)
   int64_t           pending;
   char              pair[EXCHANGE_PRODUCT_ID_SZ];
   char              owner_pred[768];
-  char              key[KV_KEY_SZ];
   char              ack[256];
   char              num[48];
 
@@ -806,9 +798,7 @@ cmd_pricewatch(const cmd_ctx_t *ctx)
 
   // The report is persona speech through the deferred spine, so a
   // command-only bot would take the watch and never speak it.
-  snprintf(key, sizeof(key), "bot.%s.behavior.chat.enabled", bot_name);
-
-  if(kv_get_uint(key) == 0)
+  if(kv_get_bot_uint(bot_name, "behavior.chat.enabled") == 0)
   {
     cmd_reply(ctx, "this bot doesn't speak (chat is disabled) — it would"
         " take this and never tell you");
@@ -830,9 +820,8 @@ cmd_pricewatch(const cmd_ctx_t *ctx)
     return;
   }
 
-  snprintf(key, sizeof(key), "bot.%s.behavior.soul.deferred.max_pending",
-      bot_name);
-  cap = (uint32_t)kv_get_uint(key);
+  cap = (uint32_t)kv_get_bot_uint(bot_name,
+      "behavior.soul.deferred.max_pending");
 
   if(cap == 0)
     cap = PRICEWATCH_MAX_PENDING_DEFAULT;

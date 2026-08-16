@@ -122,8 +122,7 @@ ask_kv_proto_cb(const char *botname, const char *protocol, void *user)
   (void)user;
 
   // Materialise the protocol default from the bot tier it was created under.
-  snprintf(key, sizeof(key), "bot.%s.ask.default", botname);
-  inherit = kv_get_str(key);
+  inherit = kv_get_bot_str(botname, "ask.default");
   snprintf(def, sizeof(def), "%s", inherit != NULL ? inherit : "");
 
   snprintf(key, sizeof(key), "bot.%s.%s.ask.default", botname, protocol);

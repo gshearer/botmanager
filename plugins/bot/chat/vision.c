@@ -85,7 +85,6 @@ chatbot_vision_maybe_submit(chatbot_state_t *st, const method_msg_t *msg)
 {
   const char *botname;
   const char *target;
-  char        key[128];
   char        image_url[1024];
   // The one composed key in the plugin, and the reason COOLDOWN_KEY_SZ
   // sits above METHOD_CHANNEL_SZ: a 127-byte target plus ':' plus 16
@@ -107,14 +106,11 @@ chatbot_vision_maybe_submit(chatbot_state_t *st, const method_msg_t *msg)
   if(botname == NULL || botname[0] == '\0') return(false);
 
   // Master switch.
-  snprintf(key, sizeof(key),
-      "bot.%s.behavior.image_vision.enabled", botname);
-  if(kv_get_uint(key) == 0) return(false);
+  if(kv_get_bot_uint(botname,
+      "behavior.image_vision.enabled") == 0) return(false);
 
   // Public-only gate. Empty channel means DM.
-  snprintf(key, sizeof(key),
-      "bot.%s.behavior.image_vision.allow_dm", botname);
-  allow_dm = (kv_get_uint(key) != 0);
+  allow_dm = (kv_get_bot_uint(botname, "behavior.image_vision.allow_dm") != 0);
   if(msg->channel[0] == '\0' && !allow_dm) return(false);
 
   // URL detection.
@@ -137,9 +133,8 @@ chatbot_vision_maybe_submit(chatbot_state_t *st, const method_msg_t *msg)
   target = msg->channel[0] != '\0' ? msg->channel : msg->sender;
 
   // Channel cooldown.
-  snprintf(key, sizeof(key),
-      "bot.%s.behavior.image_vision.cooldown_secs", botname);
-  cooldown = (uint32_t)kv_get_uint(key);
+  cooldown = (uint32_t)kv_get_bot_uint(botname,
+      "behavior.image_vision.cooldown_secs");
   if(cooldown == 0) cooldown = 60;
 
   if(vision_cooldown_hot(&st->vision_cd, target, cooldown, now,
@@ -150,9 +145,8 @@ chatbot_vision_maybe_submit(chatbot_state_t *st, const method_msg_t *msg)
   }
 
   // Per-URL cooldown.
-  snprintf(key, sizeof(key),
-      "bot.%s.behavior.image_vision.url_cooldown_secs", botname);
-  url_cd = (uint32_t)kv_get_uint(key);
+  url_cd = (uint32_t)kv_get_bot_uint(botname,
+      "behavior.image_vision.url_cooldown_secs");
   if(url_cd == 0) url_cd = 600;
 
   vision_url_cd_key(target, image_url, url_cd_key, sizeof(url_cd_key));
@@ -173,9 +167,8 @@ chatbot_vision_maybe_submit(chatbot_state_t *st, const method_msg_t *msg)
   }
 
   // Concurrent-fetch cap.
-  snprintf(key, sizeof(key),
-      "bot.%s.behavior.image_vision.max_inflight", botname);
-  max_inflight = (uint32_t)kv_get_uint(key);
+  max_inflight = (uint32_t)kv_get_bot_uint(botname,
+      "behavior.image_vision.max_inflight");
   if(max_inflight == 0) max_inflight = 1;
 
   pthread_mutex_lock(&st->vision_flight_mutex);
@@ -207,9 +200,8 @@ chatbot_vision_maybe_submit(chatbot_state_t *st, const method_msg_t *msg)
   snprintf(ctx->image_url,       sizeof(ctx->image_url),       "%s", image_url);
   ctx->is_action = msg->is_action;
 
-  snprintf(key, sizeof(key),
-      "bot.%s.behavior.image_vision.max_bytes", botname);
-  ctx->max_bytes = (uint32_t)kv_get_uint(key);
+  ctx->max_bytes = (uint32_t)kv_get_bot_uint(botname,
+      "behavior.image_vision.max_bytes");
   if(ctx->max_bytes == 0) ctx->max_bytes = 8 * 1000 * 1000;
 
   // Fire the fetch.

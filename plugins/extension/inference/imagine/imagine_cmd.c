@@ -111,8 +111,7 @@ imagine_kv_method_cb(const char *botname, const char *method_kind, void *user)
 
   (void)user;
 
-  snprintf(key, sizeof(key), "bot.%s.imagine.default", botname);
-  inherit = kv_get_str(key);
+  inherit = kv_get_bot_str(botname, "imagine.default");
   snprintf(def, sizeof(def), "%s", inherit != NULL ? inherit : "");
 
   snprintf(key, sizeof(key), "bot.%s.%s.imagine.default", botname, method_kind);

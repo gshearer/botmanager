@@ -321,7 +321,6 @@ volunteer_cascade(chatbot_state_t *st, volunteer_job_t *job,
 {
   const char *bot_name = job->bot_name;
   uint32_t    relevance = job->relevance;
-  char        kbuf[160];
   time_t      now = time(NULL);
   uint32_t min_since_own;
   uint32_t min_quiet;
@@ -338,8 +337,7 @@ volunteer_cascade(chatbot_state_t *st, volunteer_job_t *job,
   uint32_t floor;
 
   // (a) Master switch.
-  snprintf(kbuf, sizeof(kbuf), "bot.%s.behavior.volunteer.enabled", bot_name);
-  if(kv_get_uint(kbuf) == 0)
+  if(kv_get_bot_uint(bot_name, "behavior.volunteer.enabled") == 0)
   {
     clam(CLAM_DEBUG, "chatbot",
         "volunteer skip bot=%s reason=disabled", bot_name);
@@ -347,9 +345,8 @@ volunteer_cascade(chatbot_state_t *st, volunteer_job_t *job,
   }
 
   // (b) Relevance floor.
-  snprintf(kbuf, sizeof(kbuf),
-      "bot.%s.behavior.volunteer.relevance_floor", bot_name);
-  floor = (uint32_t)kv_get_uint(kbuf);
+  floor = (uint32_t)kv_get_bot_uint(bot_name,
+      "behavior.volunteer.relevance_floor");
   if(floor > 0 && relevance < floor)
   {
     clam(CLAM_DEBUG, "chatbot",
@@ -377,9 +374,8 @@ volunteer_cascade(chatbot_state_t *st, volunteer_job_t *job,
   // (b2) Subject ring — case-insensitive exact match on the acquire-
   // resolved subject string. Catches re-ingests that produce a fresh
   // chunk_id for the same underlying story.
-  snprintf(kbuf, sizeof(kbuf),
-      "bot.%s.behavior.volunteer.subject_cooldown_secs", bot_name);
-  subj_cd = (uint32_t)kv_get_uint(kbuf);
+  subj_cd = (uint32_t)kv_get_bot_uint(bot_name,
+      "behavior.volunteer.subject_cooldown_secs");
   if(subj_cd > 0 && job->subject[0] != '\0')
   {
     time_t last_subj;
@@ -399,8 +395,7 @@ volunteer_cascade(chatbot_state_t *st, volunteer_job_t *job,
   }
 
   // (c) Probability roll.
-  snprintf(kbuf, sizeof(kbuf), "bot.%s.behavior.volunteer.prob", bot_name);
-  prob = (uint32_t)kv_get_uint(kbuf);
+  prob = (uint32_t)kv_get_bot_uint(bot_name, "behavior.volunteer.prob");
   if(prob == 0)
   {
     clam(CLAM_DEBUG, "chatbot",
@@ -417,9 +412,7 @@ volunteer_cascade(chatbot_state_t *st, volunteer_job_t *job,
   }
 
   // (d) Hourly cap (under the volunteer ring mutex).
-  snprintf(kbuf, sizeof(kbuf),
-      "bot.%s.behavior.volunteer.max_per_hour", bot_name);
-  hcap = (uint32_t)kv_get_uint(kbuf);
+  hcap = (uint32_t)kv_get_bot_uint(bot_name, "behavior.volunteer.max_per_hour");
   if(hcap == 0) hcap = 3;
 
   pthread_mutex_lock(&st->volunteer.mutex);
@@ -445,9 +438,8 @@ volunteer_cascade(chatbot_state_t *st, volunteer_job_t *job,
   // the last CHATBOT_VOLUNTEER_EMBED_RING posted chunks. Gated behind
   // the hourly cap because it requires a DB read plus up to
   // CHATBOT_VOLUNTEER_EMBED_RING cosine evaluations.
-  snprintf(kbuf, sizeof(kbuf),
-      "bot.%s.behavior.volunteer.dedup_threshold", bot_name);
-  thresh = (uint32_t)kv_get_uint(kbuf);
+  thresh = (uint32_t)kv_get_bot_uint(bot_name,
+      "behavior.volunteer.dedup_threshold");
   if(thresh > 0)
   {
     uint32_t dim = knowledge_get_chunk_embedding(job->chunk_id,
@@ -506,21 +498,17 @@ volunteer_cascade(chatbot_state_t *st, volunteer_job_t *job,
 
   // KV defaults are pinned at schema registration; 0 means "gate
   // disabled" (not "use the compiled default"). Read raw.
-  snprintf(kbuf, sizeof(kbuf),
-      "bot.%s.behavior.volunteer.channel_cooldown_secs", bot_name);
-  chan_cooldown = (uint32_t)kv_get_uint(kbuf);
+  chan_cooldown = (uint32_t)kv_get_bot_uint(bot_name,
+      "behavior.volunteer.channel_cooldown_secs");
 
-  snprintf(kbuf, sizeof(kbuf),
-      "bot.%s.behavior.volunteer.max_quiet_secs", bot_name);
-  max_quiet = (uint32_t)kv_get_uint(kbuf);
+  max_quiet = (uint32_t)kv_get_bot_uint(bot_name,
+      "behavior.volunteer.max_quiet_secs");
 
-  snprintf(kbuf, sizeof(kbuf),
-      "bot.%s.behavior.volunteer.min_quiet_secs", bot_name);
-  min_quiet = (uint32_t)kv_get_uint(kbuf);
+  min_quiet = (uint32_t)kv_get_bot_uint(bot_name,
+      "behavior.volunteer.min_quiet_secs");
 
-  snprintf(kbuf, sizeof(kbuf),
-      "bot.%s.behavior.volunteer.min_since_own_secs", bot_name);
-  min_since_own = (uint32_t)kv_get_uint(kbuf);
+  min_since_own = (uint32_t)kv_get_bot_uint(bot_name,
+      "behavior.volunteer.min_since_own_secs");
 
   for(size_t i = 0; i < cc.n_channels; i++)
   {

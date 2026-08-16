@@ -34,7 +34,6 @@ verb_text_summary(const cmd_ctx_t *ctx, bot_inst_t *bot, const char *rest)
   const char *pname;
   bool converses;
   char line[512];
-  char key[128];
   const char *name;
 
   (void)rest;
@@ -65,8 +64,7 @@ verb_text_summary(const cmd_ctx_t *ctx, bot_inst_t *bot, const char *rest)
 
   // Other names it answers to. Only rendered when set — a bot that
   // answers to its nick alone has nothing to say here.
-  snprintf(key, sizeof(key), "bot.%s.aka", name);
-  aka = kv_get_str(key);
+  aka = kv_get_bot_str(name, "aka");
 
   if(aka != NULL && aka[0] != '\0')
   {
@@ -77,8 +75,7 @@ verb_text_summary(const cmd_ctx_t *ctx, bot_inst_t *bot, const char *rest)
   // Conversational half. Everything below this row is inert when the
   // toggle is off, so say so plainly rather than printing a persona and
   // a model the bot will never use.
-  snprintf(key, sizeof(key), "bot.%s.behavior.chat.enabled", name);
-  converses = (kv_get_uint(key) != 0);
+  converses = (kv_get_bot_uint(name, "behavior.chat.enabled") != 0);
 
   snprintf(line, sizeof(line), "  converse:    %s",
       converses ? CLR_GREEN "enabled" CLR_RESET
@@ -86,8 +83,7 @@ verb_text_summary(const cmd_ctx_t *ctx, bot_inst_t *bot, const char *rest)
   cmd_reply(ctx, line);
 
   // Active persona.
-  snprintf(key, sizeof(key), "bot.%s.behavior.personality", name);
-  pname = kv_get_str(key);
+  pname = kv_get_bot_str(name, "behavior.personality");
   if(pname != NULL && pname[0] != '\0')
   {
     chatbot_personality_t p = {0};
@@ -118,8 +114,7 @@ verb_text_summary(const cmd_ctx_t *ctx, bot_inst_t *bot, const char *rest)
   cmd_reply(ctx, line);
 
   // Mute state.
-  snprintf(key, sizeof(key), "bot.%s.behavior.mute_until", name);
-  mute_until = kv_get_uint(key);
+  mute_until = kv_get_bot_uint(name, "behavior.mute_until");
   now = time(NULL);
   if(mute_until > (uint64_t)now)
   {
@@ -135,21 +130,18 @@ verb_text_summary(const cmd_ctx_t *ctx, bot_inst_t *bot, const char *rest)
   cmd_reply(ctx, line);
 
   // Interject probability.
-  snprintf(key, sizeof(key), "bot.%s.behavior.speak.interject_prob", name);
   snprintf(line, sizeof(line), "  verbosity:   %lu  (interject_prob)",
-      (unsigned long)kv_get_uint(key));
+      (unsigned long)kv_get_bot_uint(name, "behavior.speak.interject_prob"));
   cmd_reply(ctx, line);
 
   // Chat model.
-  snprintf(key, sizeof(key), "bot.%s.chat_model", name);
-  model = kv_get_str(key);
+  model = kv_get_bot_str(name, "chat_model");
   snprintf(line, sizeof(line), "  chat_model:  %s",
       (model && model[0]) ? model : "(default)");
   cmd_reply(ctx, line);
 
   // NL bridge.
-  snprintf(key, sizeof(key), "bot.%s.behavior.nl_bridge_cmds", name);
-  nl = kv_get_str(key);
+  nl = kv_get_bot_str(name, "behavior.nl_bridge_cmds");
 
   if(nl == NULL || nl[0] == '\0')
     ; // nl_state stays "disabled"
@@ -176,16 +168,13 @@ verb_model(const cmd_ctx_t *ctx, bot_inst_t *bot, const char *rest)
 {
   const char *model;
   const char *name;
-  char        key[128];
   char        line[256];
 
   (void)rest;
 
   name = bot_inst_name(bot);
 
-  snprintf(key, sizeof(key), "bot.%s.chat_model", name);
-
-  model = kv_get_str(key);
+  model = kv_get_bot_str(name, "chat_model");
 
   if(model == NULL || model[0] == '\0')
     model = kv_get_str("llm.default_chat_model");
@@ -206,14 +195,12 @@ static void
 verb_llm_personas(const cmd_ctx_t *ctx, bot_inst_t *bot, const char *rest)
 {
   const char *active;
-  char key[128];
   const char *name;
 
   (void)rest;
 
   name = bot_inst_name(bot);
-  snprintf(key, sizeof(key), "bot.%s.behavior.personality", name);
-  active = kv_get_str(key);
+  active = kv_get_bot_str(name, "behavior.personality");
 
   if(active == NULL || active[0] == '\0')
     cmd_reply(ctx, "  " CLR_GRAY "(no active persona)" CLR_RESET);
@@ -509,15 +496,13 @@ static void
 verb_llm_knowledge(const cmd_ctx_t *ctx, bot_inst_t *bot, const char *rest)
 {
   const char *name = bot_inst_name(bot);
-  char key[128];
   kw_rag_state_t *st;
   char line[512];
   const char *cl;
   char corpus_list[CHATBOT_CORPUS_LIST_SZ];
 
   // Read the bot's corpus list from KV (semicolon-separated).
-  snprintf(key, sizeof(key), "bot.%s.corpus", name);
-  cl = kv_get_str(key);
+  cl = kv_get_bot_str(name, "corpus");
   snprintf(corpus_list, sizeof(corpus_list), "%s", cl ? cl : "");
 
   if(corpus_list[0] == '\0')

@@ -988,6 +988,87 @@ kv_set_cb(const char *key, kv_cb_t cb, void *cb_data)
   return(SUCCESS);
 }
 
+// Per-bot keys — the one place the "bot.<name>[.<kind>].<suffix>"
+// grammar is written for reading. Its write side is
+// bot_register_driver_kv() / bot_register_method_kv() in core/bot.c,
+// which lay the same two forms down from a plugin's instance schema.
+//
+// Composing here rather than at ~150 call sites buys one thing those
+// copies could not have: a truncated key is refused and logged instead
+// of quietly addressing the shorter key it collapsed onto.
+
+static bool
+kv_bot_key(char *buf, size_t sz, const char *name, const char *kind,
+    const char *suffix)
+{
+  int n;
+
+  if(name == NULL || name[0] == '\0' || suffix == NULL || suffix[0] == '\0')
+    return(FAIL);
+
+  if(kind != NULL && kind[0] != '\0')
+    n = snprintf(buf, sz, "bot.%s.%s.%s", name, kind, suffix);
+
+  else
+    n = snprintf(buf, sz, "bot.%s.%s", name, suffix);
+
+  if(n < 0 || (size_t)n >= sz)
+  {
+    clam(CLAM_WARN, "kv_bot_key",
+        "key too long for bot '%s'%s%s suffix '%s' — refusing rather than"
+        " addressing the key it truncates onto", name,
+        (kind != NULL) ? " method " : "", (kind != NULL) ? kind : "", suffix);
+    return(FAIL);
+  }
+
+  return(SUCCESS);
+}
+
+uint64_t
+kv_get_bot_uint(const char *name, const char *suffix)
+{
+  return(kv_get_bot_method_uint(name, NULL, suffix));
+}
+
+uint64_t
+kv_get_bot_method_uint(const char *name, const char *kind, const char *suffix)
+{
+  char key[KV_KEY_SZ];
+
+  if(kv_bot_key(key, sizeof(key), name, kind, suffix) != SUCCESS)
+    return(0);
+
+  return(kv_get_uint(key));
+}
+
+const char *
+kv_get_bot_str(const char *name, const char *suffix)
+{
+  return(kv_get_bot_method_str(name, NULL, suffix));
+}
+
+const char *
+kv_get_bot_method_str(const char *name, const char *kind, const char *suffix)
+{
+  char key[KV_KEY_SZ];
+
+  if(kv_bot_key(key, sizeof(key), name, kind, suffix) != SUCCESS)
+    return(NULL);
+
+  return(kv_get_str(key));
+}
+
+bool
+kv_set_bot_uint(const char *name, const char *suffix, uint64_t val)
+{
+  char key[KV_KEY_SZ];
+
+  if(kv_bot_key(key, sizeof(key), name, NULL, suffix) != SUCCESS)
+    return(FAIL);
+
+  return(kv_set_uint(key, val));
+}
+
 // NL responder registry — attach / lookup / iterate.
 //
 // The underlying KV must already be registered: an nl_register_nl call

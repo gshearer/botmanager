@@ -1335,13 +1335,9 @@ cmd_dispatch(bot_inst_t *inst, const method_msg_t *msg)
 
     if(kind != NULL && bname != NULL)
     {
-      char pfx_key[KV_KEY_SZ];
       const char *kv_pfx;
 
-      snprintf(pfx_key, sizeof(pfx_key),
-          "bot.%s.%s.prefix", bname, kind);
-
-      kv_pfx = kv_get_str(pfx_key);
+      kv_pfx = kv_get_bot_method_str(bname, kind, "prefix");
 
       if(kv_pfx != NULL && kv_pfx[0] != '\0')
         prefix = kv_pfx;

@@ -403,7 +403,6 @@ bot_msg_handler(const method_msg_t *msg, void *data)
   bot_inst_t         *bot;
   const bot_driver_t *drv;
   void               *handle;
-  char                key[KV_KEY_SZ];
   const char         *list;
   const char         *pattern;
 
@@ -417,8 +416,7 @@ bot_msg_handler(const method_msg_t *msg, void *data)
   }
 
   // Bot-level ignore_nicks (glob list). Cheapest filter — check first.
-  snprintf(key, sizeof(key), "bot.%s.ignore_nicks", bot->name);
-  list = kv_get_str(key);
+  list = kv_get_bot_str(bot->name, "ignore_nicks");
 
   if(bot_sender_ignored(list, msg->sender))
   {
@@ -429,8 +427,7 @@ bot_msg_handler(const method_msg_t *msg, void *data)
   }
 
   // Bot-level ignore_regex (POSIX ERE matched against payload).
-  snprintf(key, sizeof(key), "bot.%s.ignore_regex", bot->name);
-  pattern = kv_get_str(key);
+  pattern = kv_get_bot_str(bot->name, "ignore_regex");
 
   if(bot_payload_ignored(pattern, msg->text))
   {
@@ -1345,20 +1342,13 @@ bot_identity_resolve(bot_inst_t *inst, method_inst_t *method,
   // bot-level maxidleauth; 0 = temporary identities never expire.
   {
     const char *kind = (method != NULL) ? method_inst_kind(method) : NULL;
-    char        key[KV_KEY_SZ];
 
     if(kind != NULL)
-    {
-      snprintf(key, sizeof(key), "bot.%s.%s.identtimeout",
-          inst->name, kind);
-      timeout = (uint32_t)kv_get_uint(key);
-    }
+      timeout = (uint32_t)kv_get_bot_method_uint(inst->name, kind,
+          "identtimeout");
 
     if(timeout == 0)
-    {
-      snprintf(key, sizeof(key), "bot.%s.maxidleauth", inst->name);
-      timeout = (uint32_t)kv_get_uint(key);
-    }
+      timeout = (uint32_t)kv_get_bot_uint(inst->name, "maxidleauth");
   }
 
   switch(userns_tmfa_resolve(ns, meta, timeout, user, sizeof(user)))
@@ -1393,7 +1383,6 @@ const char *
 bot_discover_user(bot_inst_t *inst, const char *mfa_string)
 {
   static _Thread_local char discovered[USERNS_USER_SZ];
-  char        key[KV_KEY_SZ];
   uint8_t     enabled;
   userns_t   *ns;
   const char *bang;
@@ -1405,8 +1394,7 @@ bot_discover_user(bot_inst_t *inst, const char *mfa_string)
     return(NULL);
 
   // Check if discovery is enabled for this bot.
-  snprintf(key, sizeof(key), "bot.%s.userdiscovery", inst->name);
-  enabled = (uint8_t)kv_get_uint(key);
+  enabled = (uint8_t)kv_get_bot_uint(inst->name, "userdiscovery");
 
   if(enabled == 0)
     return(NULL);
@@ -2503,21 +2491,16 @@ bot_restore_instances(char auto_names[][BOT_NAME_SZ],
 
     // Set user namespace from KV if configured.
     {
-      char        ns_key[KV_KEY_SZ];
       const char *ns_val;
 
-      snprintf(ns_key, sizeof(ns_key), "bot.%s.userns", name);
-      ns_val = kv_get_str(ns_key);
+      ns_val = kv_get_bot_str(name, "userns");
       if(ns_val != NULL && ns_val[0] != '\0')
         bot_set_userns(inst, ns_val);
     }
 
     // Track auto-start candidates via KV.
     {
-      char as_key[KV_KEY_SZ];
-      snprintf(as_key, sizeof(as_key), "bot.%s.autostart", name);
-
-      if(kv_get_uint(as_key) != 0 && *auto_count < 64)
+      if(kv_get_bot_uint(name, "autostart") != 0 && *auto_count < 64)
       {
         strlcpy(auto_names[*auto_count], name, BOT_NAME_SZ);
         (*auto_count)++;

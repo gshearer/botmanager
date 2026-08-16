@@ -879,29 +879,10 @@ static void
 acq_sweep_read_bot_policy(const char *bot_name,
     uint32_t *out_max_mb, uint32_t *out_ttl_days)
 {
-  // Make the bot_name bound visible to gcc's format-truncation
-  // analysis via an explicit strnlen — otherwise the const-char*
-  // parameter has no provable upper bound and the snprintf below
-  // emits a false-positive -Wformat-truncation.
-  char     name[ACQUIRE_BOT_NAME_SZ];
-  size_t   name_len = strnlen(bot_name, sizeof(name) - 1);
-
-  char     key[KV_KEY_SZ];
-  uint32_t max_mb;
-  uint32_t ttl_days;
-  memcpy(name, bot_name, name_len);
-  name[name_len] = '\0';
-
-  max_mb = 0;
-  ttl_days = 0;
-
-  snprintf(key, sizeof(key),
-      "bot.%s.acquired_corpus_max_mb", name);
-  max_mb = (uint32_t)kv_get_uint(key);
-
-  snprintf(key, sizeof(key),
-      "bot.%s.acquired_corpus_ttl_days", name);
-  ttl_days = (uint32_t)kv_get_uint(key);
+  uint32_t max_mb   = (uint32_t)kv_get_bot_uint(bot_name,
+      "acquired_corpus_max_mb");
+  uint32_t ttl_days = (uint32_t)kv_get_bot_uint(bot_name,
+      "acquired_corpus_ttl_days");
 
   if(max_mb == 0)
     max_mb = ACQUIRE_DEF_CORPUS_MAX_MB;

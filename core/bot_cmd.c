@@ -1063,11 +1063,9 @@ cmd_show_bot(const cmd_ctx_t *ctx)
 
   // Autostart.
   {
-    char key[KV_KEY_SZ];
     uint64_t autostart;
 
-    snprintf(key, sizeof(key), "bot.%s.autostart", inst->name);
-    autostart = kv_get_uint(key);
+    autostart = kv_get_bot_uint(inst->name, "autostart");
 
     snprintf(line, sizeof(line),
         "  " CLR_CYAN "Autostart:" CLR_RESET "  %s",

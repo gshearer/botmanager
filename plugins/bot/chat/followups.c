@@ -257,12 +257,8 @@ chatbot_followups_run(const char *bot_name, uint32_t ns_id, bot_inst_t *bot)
   uint32_t       rows;
   uint32_t       sent = 0;
   char           sql[1280];
-  char           key[KV_KEY_SZ];
 
-  snprintf(key, sizeof(key), "bot.%s.behavior.soul.followups.enabled",
-      bot_name);
-
-  if(kv_get_uint(key) == 0)
+  if(kv_get_bot_uint(bot_name, "behavior.soul.followups.enabled") == 0)
     return;
 
   // Quiet hours are not asked about here, for occasions.c's reason:

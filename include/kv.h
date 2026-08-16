@@ -132,6 +132,47 @@ bool kv_get_val_str(const char *key, char *buf, size_t bufsz);
 // Key must already be registered. cb NULL clears.
 bool kv_set_cb(const char *key, kv_cb_t cb, void *cb_data);
 
+// --- per-bot keys ------------------------------------------------------
+//
+// One bot instance's settings live under a composed key, and the
+// grammar is core's own: driver-scoped is "bot.<name>.<suffix>",
+// method-scoped is "bot.<name>.<kind>.<suffix>". Those are exactly the
+// two forms bot_register_driver_kv() and bot_register_method_kv() build
+// when they lay a plugin's instance schema down over a bot, so `suffix`
+// here is the schema entry's own bare key ("behavior.chat.enabled",
+// "nick") and nothing else needs spelling.
+//
+// Read these through the accessors below rather than composing the key
+// at the call site. The composition has one silent failure — a name and
+// suffix that together overrun KV_KEY_SZ address a *different*, shorter
+// key, which then answers with somebody else's value or with the unset
+// 0 — and it is the failure this project has already paid for once (see
+// KV_KEY_SZ above, where two long channel names collapsed onto one
+// row). Composed in one place it is caught and logged instead; a
+// truncated key reads as unset and writes nothing.
+//
+// An absent bot name, kind or suffix reads as unset for the same
+// reason: there is no key to name, and a caller that could not identify
+// its bot has nothing different to do about it.
+
+// Returns 0 for missing, type-mismatched or uncomposable keys.
+uint64_t kv_get_bot_uint(const char *name, const char *suffix);
+
+// Returns 0 for missing, type-mismatched or uncomposable keys.
+uint64_t kv_get_bot_method_uint(const char *name, const char *kind,
+    const char *suffix);
+
+// Storage pointer with kv_get_str's lifetime and its NULL semantics.
+const char *kv_get_bot_str(const char *name, const char *suffix);
+
+// Storage pointer with kv_get_str's lifetime and its NULL semantics.
+const char *kv_get_bot_method_str(const char *name, const char *kind,
+    const char *suffix);
+
+// Fails on key not found, type mismatch, out of range, or a key that
+// does not compose.
+bool kv_set_bot_uint(const char *name, const char *suffix, uint64_t val);
+
 // WARNING: invoked under the KV lock — do NOT call kv_* functions.
 typedef void (*kv_iter_cb_t)(const char *key, kv_type_t type,
     const char *value_str, void *data);

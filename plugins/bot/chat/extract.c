@@ -907,13 +907,11 @@ extract_dispatch(const char *bot_name, uint32_t ns_id,
   extract_alias_t aliases[EXTRACT_MAX_ALIASES];
   size_t          n_aliases    = 0;
   bool            aliases_on   = false;
-  char            alias_key[160];
 
   if(bot_name != NULL && bot_name[0] != '\0')
   {
-    snprintf(alias_key, sizeof(alias_key),
-        "bot.%s.behavior.fact_extract.aliases_enabled", bot_name);
-    aliases_on = (kv_get_uint(alias_key) != 0);
+    aliases_on = (kv_get_bot_uint(bot_name,
+        "behavior.fact_extract.aliases_enabled") != 0);
   }
 
   if(aliases_on)
@@ -922,15 +920,13 @@ extract_dispatch(const char *bot_name, uint32_t ns_id,
     uint32_t cap;
     float    alias_min_conf;
 
-    snprintf(alias_key, sizeof(alias_key),
-        "bot.%s.behavior.fact_extract.aliases_min_conf", bot_name);
-    pct = (uint32_t)kv_get_uint(alias_key);
+    pct = (uint32_t)kv_get_bot_uint(bot_name,
+        "behavior.fact_extract.aliases_min_conf");
     if(pct > 100) pct = 100;
     alias_min_conf = (float)pct / 100.0f;
 
-    snprintf(alias_key, sizeof(alias_key),
-        "bot.%s.behavior.fact_extract.aliases_per_sweep_max", bot_name);
-    cap = (uint32_t)kv_get_uint(alias_key);
+    cap = (uint32_t)kv_get_bot_uint(bot_name,
+        "behavior.fact_extract.aliases_per_sweep_max");
     if(cap == 0) cap = 3;
     if(cap > EXTRACT_MAX_ALIASES) cap = EXTRACT_MAX_ALIASES;
 
@@ -1372,7 +1368,6 @@ extract_run_once(const char *bot_name, uint32_t ns_id)
   uint32_t max_per_hour;
   int64_t hwm;
   uint32_t batch_cap;
-  char key[128];
 
   if(!extract_ready || bot_name == NULL || bot_name[0] == '\0')
     return(0);
@@ -1380,23 +1375,20 @@ extract_run_once(const char *bot_name, uint32_t ns_id)
   STAT_BUMP(sweeps_total);
 
   // Read per-bot KV.
-
-  snprintf(key, sizeof(key), "bot.%s.behavior.fact_extract.enabled", bot_name);
-  if(kv_get_uint(key) == 0)
+  if(kv_get_bot_uint(bot_name, "behavior.fact_extract.enabled") == 0)
     return(0);
 
-  snprintf(key, sizeof(key), "bot.%s.behavior.fact_extract.batch_cap", bot_name);
-  batch_cap = (uint32_t)kv_get_uint(key);
+  batch_cap = (uint32_t)kv_get_bot_uint(bot_name,
+      "behavior.fact_extract.batch_cap");
   if(batch_cap == 0) batch_cap = 20;
 
-  snprintf(key, sizeof(key), "bot.%s.behavior.fact_extract.hwm", bot_name);
-  hwm = (int64_t)kv_get_uint(key);
+  hwm = (int64_t)kv_get_bot_uint(bot_name, "behavior.fact_extract.hwm");
 
-  snprintf(key, sizeof(key), "bot.%s.behavior.fact_extract.max_per_hour", bot_name);
-  max_per_hour = (uint32_t)kv_get_uint(key);
+  max_per_hour = (uint32_t)kv_get_bot_uint(bot_name,
+      "behavior.fact_extract.max_per_hour");
 
-  snprintf(key, sizeof(key), "bot.%s.behavior.fact_extract.min_conf", bot_name);
-  min_conf = (float)kv_get_uint(key) / 100.0f;
+  min_conf = (float)kv_get_bot_uint(bot_name,
+      "behavior.fact_extract.min_conf") / 100.0f;
 
   // Rate-limit check + record.
   pthread_mutex_lock(&extract_sched_mutex);
@@ -1420,8 +1412,7 @@ extract_run_once(const char *bot_name, uint32_t ns_id)
     return(0);
 
   // Chat model lookup.
-  snprintf(key, sizeof(key), "bot.%s.chat_model", bot_name);
-  cm = kv_get_str(key);
+  cm = kv_get_bot_str(bot_name, "chat_model");
   if(cm == NULL || cm[0] == '\0')
     cm = kv_get_str("llm.default_chat_model");
 
@@ -1482,8 +1473,8 @@ extract_run_once(const char *bot_name, uint32_t ns_id)
   // (MEM_MERGE_OBSERVE writes no new value for what it already wrote).
   if(!stopped)
   {
-    snprintf(key, sizeof(key), "bot.%s.behavior.fact_extract.hwm", bot_name);
-    (void)kv_set_uint(key, (uint64_t)new_hwm);
+    (void)kv_set_bot_uint(bot_name,
+        "behavior.fact_extract.hwm", (uint64_t)new_hwm);
   }
 
   return(written);

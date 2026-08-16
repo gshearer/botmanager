@@ -45,8 +45,7 @@ chatbot_mute_active(const char *botname)
   char     key[KV_KEY_SZ];
   uint64_t until;
 
-  snprintf(key, sizeof(key), "bot.%s.behavior.mute_until", botname);
-  until = kv_get_uint(key);
+  until = kv_get_bot_uint(botname, "behavior.mute_until");
 
   if(until == 0)
     return(false);
@@ -75,7 +74,6 @@ cmd_bot_hush(const cmd_ctx_t *ctx)
   char buf[128];
   uint64_t until;
   const char *botname;
-  char key[KV_KEY_SZ];
 
   if(secs == 0)
   {
@@ -85,11 +83,9 @@ cmd_bot_hush(const cmd_ctx_t *ctx)
 
   botname = bot_inst_name(ctx->bot);
 
-  snprintf(key, sizeof(key), "bot.%s.behavior.mute_until", botname);
-
   until = (uint64_t)time(NULL) + secs;
 
-  if(kv_set_uint(key, until) != SUCCESS)
+  if(kv_set_bot_uint(botname, "behavior.mute_until", until) != SUCCESS)
   {
     cmd_reply(ctx, "failed to set mute");
     return;
@@ -121,7 +117,6 @@ cmd_bot_refresh_prompts(const cmd_ctx_t *ctx)
   const char *contract;
   const char *persona;
   const char *botname;
-  char        key[KV_KEY_SZ];
 
   if(st == NULL)
   {
@@ -131,18 +126,14 @@ cmd_bot_refresh_prompts(const cmd_ctx_t *ctx)
 
   botname = bot_inst_name(ctx->bot);
 
-  snprintf(key, sizeof(key), "bot.%s.behavior.personality", botname);
-
-  persona = kv_get_str(key);
+  persona = kv_get_bot_str(botname, "behavior.personality");
 
   if(persona == NULL || persona[0] == '\0')
     persona = kv_get_str("plugin.chat.default_personality");
   if(persona == NULL)
     persona = "";
 
-  snprintf(key, sizeof(key), "bot.%s.behavior.contract", botname);
-
-  contract = kv_get_str(key);
+  contract = kv_get_bot_str(botname, "behavior.contract");
 
   if(contract == NULL || contract[0] == '\0')
     contract = kv_get_str("plugin.chat.default_contract");

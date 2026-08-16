@@ -2975,7 +2975,6 @@ chatbot_reply_submit(chatbot_state_t *st, const method_msg_t *msg,
   const char *cm;
   const char *cl;
   const char *botname;
-  char key[128];
   chatbot_personality_t p = {0};
   char pname[CHATBOT_PERSONALITY_NAME_SZ];
   chatbot_req_t *r;
@@ -3025,12 +3024,9 @@ chatbot_reply_submit(chatbot_state_t *st, const method_msg_t *msg,
 
   if(pname[0] == '\0')
   {
-    char pkey[KV_KEY_SZ];
     const char *kv_name;
 
-    snprintf(pkey, sizeof(pkey), "bot.%s.behavior.personality",
-        bot_inst_name(st->inst));
-    kv_name = kv_get_str(pkey);
+    kv_name = kv_get_bot_str(bot_inst_name(st->inst), "behavior.personality");
     if(kv_name == NULL || kv_name[0] == '\0')
       kv_name = kv_get_str("plugin.chat.default_personality");
     if(kv_name != NULL)
@@ -3073,8 +3069,7 @@ chatbot_reply_submit(chatbot_state_t *st, const method_msg_t *msg,
     char cname[CHATBOT_PERSONALITY_NAME_SZ];
     const char *cv;
 
-    snprintf(key, sizeof(key), "bot.%s.behavior.contract", botname);
-    cv = kv_get_str(key);
+    cv = kv_get_bot_str(botname, "behavior.contract");
     if(cv == NULL || cv[0] == '\0')
       cv = kv_get_str("plugin.chat.default_contract");
     snprintf(cname, sizeof(cname), "%s", cv ? cv : "");
@@ -3103,8 +3098,7 @@ chatbot_reply_submit(chatbot_state_t *st, const method_msg_t *msg,
   // knowledge_retrieve after the memory pass completes. knowledge_top_k
   // stays 0 so the knowledge subsystem falls back to its own KV default
   // (rag_top_k).
-  snprintf(key, sizeof(key), "bot.%s.corpus", botname);
-  cl = kv_get_str(key);
+  cl = kv_get_bot_str(botname, "corpus");
   snprintf(r->knowledge_corpus, sizeof(r->knowledge_corpus),
       "%s", cl ? cl : "");
   r->knowledge_top_k = 0;
@@ -3138,16 +3132,14 @@ chatbot_reply_submit(chatbot_state_t *st, const method_msg_t *msg,
     kw_image_intent_match(msg->text,
         r->image_subject, sizeof(r->image_subject));
 
-  snprintf(key, sizeof(key), "bot.%s.chat_model", botname);
-  cm = kv_get_str(key);
+  cm = kv_get_bot_str(botname, "chat_model");
   if(cm == NULL || cm[0] == '\0') cm = kv_get_str("llm.default_chat_model");
   snprintf(r->chat_model, sizeof(r->chat_model), "%s", cm ? cm : "");
 
-  snprintf(key, sizeof(key), "bot.%s.speak_temperature", botname);
-  r->temperature = (float)kv_get_uint(key) / 100.0f;   // stored as int*100
+  r->temperature = (float)kv_get_bot_uint(botname,
+      "speak_temperature") / 100.0f;   // stored as int*100
 
-  snprintf(key, sizeof(key), "bot.%s.max_reply_tokens", botname);
-  r->max_tokens = (uint32_t)kv_get_uint(key);
+  r->max_tokens = (uint32_t)kv_get_bot_uint(botname, "max_reply_tokens");
 
   // The interpret cue's second submit keeps the allowlist empty: no
   // COMMANDS block is rendered into its prompt and reply_nl_bridge
@@ -3155,23 +3147,22 @@ chatbot_reply_submit(chatbot_state_t *st, const method_msg_t *msg,
   // command (D3: one ask → one command → one reply).
   if(!nl_bridge_off)
   {
-    snprintf(key, sizeof(key), "bot.%s.behavior.nl_bridge_cmds", botname);
-    nlc = kv_get_str(key);
+    nlc = kv_get_bot_str(botname, "behavior.nl_bridge_cmds");
     snprintf(r->nl_bridge_cmds, sizeof(r->nl_bridge_cmds),
         "%s", nlc ? nlc : "");
   }
 
   // Mention-expansion budget knobs. Clamp top_k to the compile-time
   // cap so assemble_prompt's fixed-size facts array never overruns.
-  snprintf(key, sizeof(key), "bot.%s.behavior.mention.top_k", botname);
-  r->mention_top_k = (uint32_t)kv_get_uint(key);
+  r->mention_top_k = (uint32_t)kv_get_bot_uint(botname,
+      "behavior.mention.top_k");
   if(r->mention_top_k == 0)
     r->mention_top_k = 6;
   if(r->mention_top_k > CHATBOT_MENTION_FACTS_CAP)
     r->mention_top_k = CHATBOT_MENTION_FACTS_CAP;
 
-  snprintf(key, sizeof(key), "bot.%s.behavior.mention.max_chars", botname);
-  r->mention_max_chars = (uint32_t)kv_get_uint(key);
+  r->mention_max_chars = (uint32_t)kv_get_bot_uint(botname,
+      "behavior.mention.max_chars");
   if(r->mention_max_chars == 0)
     r->mention_max_chars = 2048;
 
@@ -3208,8 +3199,7 @@ chatbot_reply_submit(chatbot_state_t *st, const method_msg_t *msg,
     size_t n;
     uint32_t cap;
 
-    snprintf(key, sizeof(key), "bot.%s.behavior.mention.max_dossiers", botname);
-    cap = (uint32_t)kv_get_uint(key);
+    cap = (uint32_t)kv_get_bot_uint(botname, "behavior.mention.max_dossiers");
     if(cap == 0)
       cap = 4;
     if(cap > CHATBOT_MENTION_DOSSIERS_CAP)
@@ -3300,7 +3290,6 @@ chatbot_reply_submit_vision(chatbot_state_t *st, const method_msg_t *msg,
   const char *cm;
   const char *cl;
   const char *botname;
-  char key[128];
   chatbot_personality_t p = {0};
   char pname[CHATBOT_PERSONALITY_NAME_SZ];
   chatbot_req_t *r;
@@ -3353,12 +3342,9 @@ chatbot_reply_submit_vision(chatbot_state_t *st, const method_msg_t *msg,
 
   if(pname[0] == '\0')
   {
-    char pkey[KV_KEY_SZ];
     const char *kv_name;
 
-    snprintf(pkey, sizeof(pkey), "bot.%s.behavior.personality",
-        bot_inst_name(st->inst));
-    kv_name = kv_get_str(pkey);
+    kv_name = kv_get_bot_str(bot_inst_name(st->inst), "behavior.personality");
     if(kv_name == NULL || kv_name[0] == '\0')
       kv_name = kv_get_str("plugin.chat.default_personality");
     if(kv_name != NULL)
@@ -3394,8 +3380,7 @@ chatbot_reply_submit_vision(chatbot_state_t *st, const method_msg_t *msg,
     char cname[CHATBOT_PERSONALITY_NAME_SZ];
     const char *cv;
 
-    snprintf(key, sizeof(key), "bot.%s.behavior.contract", botname);
-    cv = kv_get_str(key);
+    cv = kv_get_bot_str(botname, "behavior.contract");
     if(cv == NULL || cv[0] == '\0')
       cv = kv_get_str("plugin.chat.default_contract");
     snprintf(cname, sizeof(cname), "%s", cv ? cv : "");
@@ -3419,14 +3404,12 @@ chatbot_reply_submit_vision(chatbot_state_t *st, const method_msg_t *msg,
   }
 
   // Knowledge-corpus binding — optionally skipped on the vision path.
-  snprintf(key, sizeof(key), "bot.%s.corpus", botname);
-  cl = kv_get_str(key);
+  cl = kv_get_bot_str(botname, "corpus");
   snprintf(r->knowledge_corpus, sizeof(r->knowledge_corpus),
       "%s", cl ? cl : "");
 
-  snprintf(key, sizeof(key),
-      "bot.%s.behavior.image_vision.skip_knowledge", botname);
-  if(kv_get_uint(key) != 0) r->knowledge_corpus[0] = '\0';
+  if(kv_get_bot_uint(botname, "behavior.image_vision.skip_knowledge") != 0)
+    r->knowledge_corpus[0] = '\0';
 
   r->knowledge_top_k = 0;
   r->knowledge_max_chars = (uint32_t)kv_get_uint(
@@ -3447,44 +3430,39 @@ chatbot_reply_submit_vision(chatbot_state_t *st, const method_msg_t *msg,
   r->images_recency_ordered = false;
 
   // Resolve vision model: per-bot vision.model → chat_model → global default.
-  snprintf(key, sizeof(key),
-      "bot.%s.behavior.image_vision.model", botname);
-  cm = kv_get_str(key);
+  cm = kv_get_bot_str(botname, "behavior.image_vision.model");
   if(cm == NULL || cm[0] == '\0')
   {
-    snprintf(key, sizeof(key), "bot.%s.chat_model", botname);
-    cm = kv_get_str(key);
+    cm = kv_get_bot_str(botname, "chat_model");
   }
   if(cm == NULL || cm[0] == '\0')
     cm = kv_get_str("llm.default_chat_model");
   snprintf(r->chat_model, sizeof(r->chat_model), "%s", cm ? cm : "");
 
-  snprintf(key, sizeof(key), "bot.%s.speak_temperature", botname);
-  r->temperature = (float)kv_get_uint(key) / 100.0f;
+  r->temperature = (float)kv_get_bot_uint(botname,
+      "speak_temperature") / 100.0f;
 
-  snprintf(key, sizeof(key), "bot.%s.max_reply_tokens", botname);
-  r->max_tokens = (uint32_t)kv_get_uint(key);
+  r->max_tokens = (uint32_t)kv_get_bot_uint(botname, "max_reply_tokens");
 
   // NL bridge stays available on the vision path (no reason to block
   // a follow-up command the model might emit).
   {
     const char *nlc;
-    snprintf(key, sizeof(key), "bot.%s.behavior.nl_bridge_cmds", botname);
-    nlc = kv_get_str(key);
+    nlc = kv_get_bot_str(botname, "behavior.nl_bridge_cmds");
     snprintf(r->nl_bridge_cmds, sizeof(r->nl_bridge_cmds),
         "%s", nlc ? nlc : "");
   }
 
   // Mention-expansion knobs — same clamps as the text path.
-  snprintf(key, sizeof(key), "bot.%s.behavior.mention.top_k", botname);
-  r->mention_top_k = (uint32_t)kv_get_uint(key);
+  r->mention_top_k = (uint32_t)kv_get_bot_uint(botname,
+      "behavior.mention.top_k");
   if(r->mention_top_k == 0)
     r->mention_top_k = 6;
   if(r->mention_top_k > CHATBOT_MENTION_FACTS_CAP)
     r->mention_top_k = CHATBOT_MENTION_FACTS_CAP;
 
-  snprintf(key, sizeof(key), "bot.%s.behavior.mention.max_chars", botname);
-  r->mention_max_chars = (uint32_t)kv_get_uint(key);
+  r->mention_max_chars = (uint32_t)kv_get_bot_uint(botname,
+      "behavior.mention.max_chars");
   if(r->mention_max_chars == 0)
     r->mention_max_chars = 2048;
 

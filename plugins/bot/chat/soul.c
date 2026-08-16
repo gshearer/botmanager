@@ -630,11 +630,8 @@ static weathergov_severity_t
 soul_wx_severity_floor(const char *bot_name)
 {
   const char *v;
-  char        key[KV_KEY_SZ];
 
-  snprintf(key, sizeof(key),
-      "bot.%s.behavior.soul.weather.min_severity", bot_name);
-  v = kv_get_str(key);
+  v = kv_get_bot_str(bot_name, "behavior.soul.weather.min_severity");
 
   if(v == NULL || v[0] == '\0')   return(WEATHERGOV_SEV_SEVERE);
   if(strcmp(v, "minor")    == 0)  return(WEATHERGOV_SEV_MINOR);
@@ -886,7 +883,6 @@ soul_wx_batch_task(task_t *t)
   uint32_t               held     = 0;
   uint32_t               quiet    = 0;
   time_t                 now      = time(NULL);
-  char                   key[KV_KEY_SZ];
 
   // Re-resolve the bot by NAME — nothing dangles across a reload (the
   // note plugin's rule) — and re-check the speech gates: a hush or a
@@ -898,10 +894,8 @@ soul_wx_batch_task(task_t *t)
   if(bot != NULL && bot_get_state(bot) == BOT_RUNNING)
     st = bot_get_handle(bot);
 
-  snprintf(key, sizeof(key), "bot.%s.behavior.chat.enabled",
-      sweep->bot_name);
-
-  if(kv_get_uint(key) == 0 || chatbot_mute_active(sweep->bot_name))
+  if(kv_get_bot_uint(sweep->bot_name, "behavior.chat.enabled") == 0
+      || chatbot_mute_active(sweep->bot_name))
     st = NULL;
 
   if(st != NULL)
@@ -1137,15 +1131,11 @@ soul_chore_weather(soul_sched_t *s, uint32_t chore,
   soul_wx_api_t    wx;
   uint32_t         rows;
   char             sql[1024];
-  char             key[KV_KEY_SZ];
 
   (void)st;
   (void)bot;
 
-  snprintf(key, sizeof(key), "bot.%s.behavior.soul.weather.enabled",
-      s->bot_name);
-
-  if(kv_get_uint(key) == 0)
+  if(kv_get_bot_uint(s->bot_name, "behavior.soul.weather.enabled") == 0)
     return(false);
 
   if(!soul_wx_resolve(&wx))
@@ -1403,9 +1393,7 @@ soul_tick_cb(task_t *t)
   // Live cadence: re-reading the knob every tick makes a KV change
   // take effect on the next fire — in-callback interval_ms mutation is
   // the blessed mechanism (acquire_reactive precedent).
-  snprintf(key, sizeof(key), "bot.%s.behavior.soul.interval_secs",
-      bot_name);
-  interval = (uint32_t)kv_get_uint(key);
+  interval = (uint32_t)kv_get_bot_uint(bot_name, "behavior.soul.interval_secs");
 
   if(interval == 0)                     interval = SOUL_INTERVAL_DEFAULT_SECS;
   if(interval < SOUL_INTERVAL_MIN_SECS) interval = SOUL_INTERVAL_MIN_SECS;
@@ -1423,9 +1411,7 @@ soul_tick_cb(task_t *t)
     return;
   }
 
-  snprintf(key, sizeof(key), "bot.%s.behavior.chat.enabled", bot_name);
-
-  if(kv_get_uint(key) == 0)
+  if(kv_get_bot_uint(bot_name, "behavior.chat.enabled") == 0)
   {
     t->state = TASK_ENDED;
     return;
