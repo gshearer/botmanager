@@ -114,7 +114,7 @@ gem_ws_md_channel_name(gem_ws_channel_t ch)
 // exchange_ws_channel_t enum so fanout membership tests are single-op.//
 // ------------------------------------------------------------------ //
 
-struct exchange_ws_sub
+typedef struct gem_ws_sub
 {
   uint32_t                id;
   exchange_ws_event_cb_t  cb;
@@ -127,8 +127,8 @@ struct exchange_ws_sub
   char                    products[GEM_WS_CH_MAX_PRODUCTS_PER_SUB]
                                   [EXCHANGE_PRODUCT_ID_SZ];
 
-  struct exchange_ws_sub *next;
-};
+  struct gem_ws_sub      *next;
+} gem_ws_sub_t;
 
 typedef enum
 {
@@ -161,7 +161,7 @@ typedef struct
 static struct
 {
   pthread_mutex_t          mu;
-  struct exchange_ws_sub  *head;
+  gem_ws_sub_t            *head;
   uint32_t                 next_id;
   uint32_t                 n_subs;
 
@@ -546,7 +546,7 @@ gem_ws_emit_unsubscribe_locked(void)
 static void
 gem_ws_fanout_locked(const exchange_ws_event_t *ev)
 {
-  for(struct exchange_ws_sub *s = gem_ws_ch.head; s != NULL; s = s->next)
+  for(gem_ws_sub_t *s = gem_ws_ch.head; s != NULL; s = s->next)
   {
     bool match;
 
@@ -1426,9 +1426,9 @@ gem_ws_channel_from_exch(exchange_ws_channel_t in)
 bool
 gem_ws_subscribe(const exchange_ws_channel_t *channels, uint32_t n_channels,
     const char *const *product_ids, uint32_t n_products,
-    exchange_ws_event_cb_t cb, void *user, exchange_ws_sub_t **out_handle)
+    exchange_ws_event_cb_t cb, void *user, void **out_handle)
 {
-  struct exchange_ws_sub *sub;
+  gem_ws_sub_t           *sub;
   uint32_t                channel_mask     = 0;
   bool                    has_user_channel = false;
   bool                    has_per_symbol   = false;
@@ -1617,11 +1617,12 @@ gem_ws_subscribe(const exchange_ws_channel_t *channels, uint32_t n_channels,
 }
 
 void
-gem_ws_unsubscribe(exchange_ws_sub_t *handle)
+gem_ws_unsubscribe(void *driver_sub)
 {
-  struct exchange_ws_sub **pp;
-  uint32_t                  sub_id;
-  uint32_t                  i;
+  gem_ws_sub_t  *handle = driver_sub;
+  gem_ws_sub_t **pp;
+  uint32_t       sub_id;
+  uint32_t       i;
 
   if(handle == NULL || !gem_ws_ch.initialized) return;
 
@@ -1706,8 +1707,8 @@ gem_ws_channels_init(void)
 void
 gem_ws_channels_deinit(void)
 {
-  struct exchange_ws_sub *s;
-  struct exchange_ws_sub *n;
+  gem_ws_sub_t *s;
+  gem_ws_sub_t *n;
 
   if(!gem_ws_ch.initialized) return;
 

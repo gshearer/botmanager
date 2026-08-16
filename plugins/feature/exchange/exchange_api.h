@@ -451,11 +451,19 @@ typedef struct exchange_ws_sub exchange_ws_sub_t;
 // a reload-time drain around a guaranteed final callback. See
 // PLUGIN.md §Lifecycle Contract.
 //
-// WS subscriptions are the exception, and the obligation runs the other
-// way: no driver files an exchange_ws_event_cb_t, because a subscription
-// outlives any request. Every consumer must call exchange_ws_unsubscribe
-// for every live binding on its own teardown path — whenmoon does, in
-// market.c:wm_market_destroy and live.c:wm_live_shutdown.
+// WS subscriptions are the exception, and the handle is the
+// abstraction's: exchange_ws_subscribe returns a wrapper that records
+// the registration generation it was issued under. Passing it to
+// exchange_ws_unsubscribe is safe at ANY later time — if the protocol
+// plugin has been cycled since (its deinit frees every subscriber
+// node it issued), the abstraction drops the dead handle instead of
+// forwarding it (OBS-19: forwarding it was a double free that killed
+// the daemon). Dropping does NOT resubscribe: after a provider
+// reload the feed is gone until the consumer rebuilds it (OBS-23).
+// Every consumer still owes exchange_ws_unsubscribe for every live
+// binding on its own teardown path — whenmoon does, in
+// market.c:wm_market_resub_ws / wm_market_destroy and
+// live.c:wm_live_ws_resub_all / wm_live_engine_destroy.
 typedef void (*exchange_done_order_cb_t)(
     const exchange_order_result_t *res, void *user);
 typedef void (*exchange_done_orders_cb_t)(
@@ -550,13 +558,18 @@ typedef struct
                                     exchange_granularity_t gran,
                                     int64_t since_ms, int64_t until_ms,
                                     exchange_done_candles_cb_t cb, void *u);
+  //
+  // The driver's own subscriber node is what crosses this boundary, not
+  // the public handle: the abstraction wraps it (see exchange_api.h's WS
+  // paragraph above) so a node from a cycled registration is dropped
+  // rather than forwarded here.
   bool   (*ws_subscribe)(const exchange_ws_channel_t *channels,
                          uint32_t n_channels,
                          const char *const *product_ids,
                          uint32_t n_products,
                          exchange_ws_event_cb_t cb, void *u,
-                         exchange_ws_sub_t **out_handle);
-  void   (*ws_unsubscribe)(exchange_ws_sub_t *handle);
+                         void **out_driver_sub);
+  void   (*ws_unsubscribe)(void *driver_sub);
 
   // MW-1 capability hook. Bulk-ticker fetch — single REST call returning
   // a snapshot row per pair. Public market data; no auth gate. NULL =

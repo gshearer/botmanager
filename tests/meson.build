@@ -141,6 +141,25 @@ test_kraken_ws_channels = executable('test_kraken_ws_channels',
   dependencies : core_deps,
 )
 
+# A protocol plugin's deinit frees every WS subscriber node it issued,
+# and the registry entry naming that plugin survives the unload — so
+# after a reload the consumer's handle resolves to a live exchange again
+# and a freed pointer reaches the revived driver. The second free has no
+# error path: it is a [FATAL] on a stderr that is /dev/null, or, once the
+# address has been reused, an innocent block released in silence. These
+# cases drive the abstraction's public surface with a driver stub whose
+# teardown frees what it issued, which is the whole mechanism.
+test_exchange_ws_gen = executable('test_exchange_ws_gen',
+  'test_exchange_ws_gen.c',
+  '../plugins/feature/exchange/exchange_caps.c',
+  '../plugins/feature/exchange/exchange_registry.c',
+  '../plugins/feature/exchange/exchange_limiter.c',
+  include_directories : [include_directories('.'), inc_include,
+                         include_directories('../plugins/feature/exchange')],
+  link_with : [test_harness, libcore],
+  dependencies : core_deps,
+)
+
 # The method traffic counters are written by whatever thread replies —
 # method_send holds no lock — and read under method_mutex into
 # /show methods. A lost increment is silent and permanent, so these
@@ -166,4 +185,5 @@ test('kv_str', test_kv_str)
 test('curl_submit_wait', test_curl_submit_wait)
 test('cmd_inflight', test_cmd_inflight)
 test('kraken_ws_channels', test_kraken_ws_channels)
+test('exchange_ws_gen', test_exchange_ws_gen)
 test('method_stats', test_method_stats)

@@ -458,9 +458,11 @@ cb_exch_deinit(void)
 
 // KR-2: WS subscriber state. The protocol-side coinbase_ws_sub_t is
 // opaque to the exchange layer; we wrap it together with the user-
-// supplied exchange typed callback + user pointer. The wrapper itself
-// IS the `exchange_ws_sub_t` handle exposed upward — we cast it.
-typedef struct exchange_ws_sub
+// supplied exchange typed callback + user pointer. This wrapper is the
+// driver node the abstraction takes custody of — it lives and dies with
+// this mapping, and the abstraction's own handle wraps it again so a
+// node from an earlier registration never comes back here (OBS-19).
+typedef struct cb_exch_ws_sub
 {
   coinbase_ws_sub_t       *inner;
   exchange_ws_event_cb_t   user_cb;
@@ -1333,7 +1335,7 @@ static bool
 cb_exch_ws_subscribe(const exchange_ws_channel_t *channels,
     uint32_t n_channels, const char *const *product_ids,
     uint32_t n_products, exchange_ws_event_cb_t cb, void *user,
-    exchange_ws_sub_t **out_handle)
+    void **out_handle)
 {
   cb_exch_ws_sub_t      *sub;
   coinbase_ws_channel_t  cb_chans[COINBASE_CH__COUNT];
@@ -1377,17 +1379,15 @@ cb_exch_ws_subscribe(const exchange_ws_channel_t *channels,
     return(FAIL);
   }
 
-  // The wrapper IS the handle exposed upward — cast directly. The
-  // opaque `exchange_ws_sub_t` forward-decl in exchange_api.h binds to
-  // this struct at the cb_exch_ws_sub_t typedef site.
+  // The wrapper IS the driver node the abstraction takes custody of.
   *out_handle = sub;
   return(SUCCESS);
 }
 
 static void
-cb_exch_ws_unsubscribe(exchange_ws_sub_t *handle)
+cb_exch_ws_unsubscribe(void *driver_sub)
 {
-  cb_exch_ws_sub_t *sub = handle;
+  cb_exch_ws_sub_t *sub = driver_sub;
 
   if(sub == NULL)
     return;

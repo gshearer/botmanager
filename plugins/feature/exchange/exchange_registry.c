@@ -208,6 +208,7 @@ exchange_unregister(const char *name)
 
   e->dead    = true;
   e->vt      = NULL;
+  e->ws_gen++;
   q_head     = e->q_head;
   e->q_head  = NULL;
   e->q_count = 0;

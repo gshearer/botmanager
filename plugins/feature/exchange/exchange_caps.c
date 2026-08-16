@@ -525,8 +525,11 @@ exchange_ws_subscribe(const char *name,
     exchange_ws_event_cb_t cb, void *user,
     exchange_ws_sub_t **out_handle)
 {
-  exchange_t *e = NULL;
-  char        err[EXCHANGE_ERR_SZ];
+  exchange_ws_sub_t *sub;
+  exchange_t        *e          = NULL;
+  void              *driver_sub = NULL;
+  uint64_t           gen;
+  char               err[EXCHANGE_ERR_SZ];
 
   if(out_handle != NULL)
     *out_handle = NULL;
@@ -548,27 +551,57 @@ exchange_ws_subscribe(const char *name,
     return(FAIL);
   }
 
+  // Read the generation BEFORE the driver call. An unregister landing in
+  // between leaves the stamp one behind, so the handle is born dead —
+  // the driver's own deinit frees the node, and the wrapper drops.
+  pthread_mutex_lock(&e->lock);
+  gen = e->ws_gen;
+  pthread_mutex_unlock(&e->lock);
+
   if(e->vt->ws_subscribe(channels, n_channels, product_ids, n_products,
-        cb, user, out_handle) != SUCCESS)
+        cb, user, &driver_sub) != SUCCESS || driver_sub == NULL)
     return(FAIL);
 
+  sub             = mem_alloc("exchange.ws", "sub", sizeof(*sub));
+  sub->exch       = e;
+  sub->gen        = gen;
+  sub->driver_sub = driver_sub;
+
+  *out_handle = sub;
   return(SUCCESS);
 }
 
+// Dispatch is by the handle's own binding, never by `name` — the wrapper
+// knows which registration issued it, and a caller that names the wrong
+// exchange used to leak the node in silence. `name` survives as a log
+// field only.
 void
 exchange_ws_unsubscribe(const char *name, exchange_ws_sub_t *handle)
 {
-  exchange_t *e;
+  const exchange_protocol_vtable_t *vt;
+  exchange_t                       *e;
+  bool                              live;
 
-  if(handle == NULL || name == NULL || name[0] == '\0')
+  if(handle == NULL)
     return;
 
-  e = exchange_find(name);
+  e = handle->exch;
 
-  // Tolerate "plugin already unregistered" — handle invalidated by
-  // exchange_unregister; nothing further to do.
-  if(e == NULL || e->vt == NULL || e->vt->ws_unsubscribe == NULL)
-    return;
+  pthread_mutex_lock(&e->lock);
 
-  e->vt->ws_unsubscribe(handle);
+  vt   = e->vt;
+  live = (!e->dead && vt != NULL && vt->ws_unsubscribe != NULL &&
+          handle->gen == e->ws_gen);
+
+  pthread_mutex_unlock(&e->lock);
+
+  if(live)
+    vt->ws_unsubscribe(handle->driver_sub);
+
+  else
+    clam(CLAM_DEBUG, EXCHANGE_CTX,
+        "ws unsubscribe: stale handle for '%s' dropped (registration cycled)",
+        (name != NULL) ? name : "?");
+
+  mem_free(handle);
 }

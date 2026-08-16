@@ -288,7 +288,7 @@ event_cb(const exchange_ws_event_t *ev, void *user)
 }
 
 static void
-subscribe_products(exchange_ws_sub_t **out, const char *const *products,
+subscribe_products(void **out, const char *const *products,
     uint32_t n_products)
 {
   const exchange_ws_channel_t channels[] = { EXCH_WS_TICKER };
@@ -299,7 +299,7 @@ subscribe_products(exchange_ws_sub_t **out, const char *const *products,
 }
 
 static void
-subscribe_one(exchange_ws_sub_t **out, const char *product)
+subscribe_one(void **out, const char *product)
 {
   const char *const products[] = { product };
 
@@ -330,7 +330,7 @@ inject_ack(const char *method, uint32_t req_id, bool success,
 }
 
 static void
-subscribe_and_ack(exchange_ws_sub_t **out, const char *product,
+subscribe_and_ack(void **out, const char *product,
     const char *sym)
 {
   subscribe_one(out, product);
@@ -354,9 +354,9 @@ subscribe_and_ack(exchange_ws_sub_t **out, const char *product,
 static void
 case_unsub_ack_forges_a_stranger(void)
 {
-  exchange_ws_sub_t *aaa   = NULL;
-  exchange_ws_sub_t *bbb   = NULL;
-  exchange_ws_sub_t *probe = NULL;
+  void *aaa   = NULL;
+  void *bbb   = NULL;
+  void *probe = NULL;
   uint32_t           rid_bbb;
   uint32_t           rid_unsub;
 
@@ -408,11 +408,11 @@ c2_unsubscribe_entry(void *arg)
 static void
 case_wrong_slot_across_the_release(void)
 {
-  exchange_ws_sub_t *ppp   = NULL;
-  exchange_ws_sub_t *qqq   = NULL;
-  exchange_ws_sub_t *rrr   = NULL;
-  exchange_ws_sub_t *sss   = NULL;
-  exchange_ws_sub_t *probe = NULL;
+  void *ppp   = NULL;
+  void *qqq   = NULL;
+  void *rrr   = NULL;
+  void *sss   = NULL;
+  void *probe = NULL;
   pthread_t          t;
 
   fixture_reset();
@@ -454,7 +454,7 @@ case_wrong_slot_across_the_release(void)
 // the cursor, which this does not. The slot wants a subscribe, nothing
 // emits one, and nothing tries again until the next reconcile trigger.
 
-static exchange_ws_sub_t *c4_sub;
+static void *c4_sub;
 
 static void *
 c4_subscribe_entry(void *arg)
@@ -471,8 +471,8 @@ c4_subscribe_entry(void *arg)
 static void
 case_a_moved_slot_loses_its_emission(void)
 {
-  exchange_ws_sub_t *aaa = NULL;
-  exchange_ws_sub_t *bbb = NULL;
+  void *aaa = NULL;
+  void *bbb = NULL;
   pthread_t          t;
 
   fixture_reset();
@@ -506,8 +506,8 @@ case_a_moved_slot_loses_its_emission(void)
 static void
 case_fanout_and_teardown(void)
 {
-  exchange_ws_sub_t *aaa = NULL;
-  exchange_ws_sub_t *bbb = NULL;
+  void *aaa = NULL;
+  void *bbb = NULL;
   const char        *tick =
       "{\"channel\":\"ticker\",\"data\":"
       "[{\"symbol\":\"AAA/USD\",\"last\":1.0}]}";
@@ -550,9 +550,9 @@ case_fanout_and_teardown(void)
 static void
 case_ack_semantics(void)
 {
-  exchange_ws_sub_t *first  = NULL;
-  exchange_ws_sub_t *second = NULL;
-  exchange_ws_sub_t *third  = NULL;
+  void *first  = NULL;
+  void *second = NULL;
+  void *third  = NULL;
   uint32_t           rid;
 
   fixture_reset();

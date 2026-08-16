@@ -151,6 +151,13 @@ struct exchange
   // exchange_unregister().
   bool                              dead;
 
+  // OBS-19: registration generation. Bumped under `lock` by
+  // exchange_unregister; a ws handle records the value it was issued
+  // under, and exchange_ws_unsubscribe forwards to the driver only on a
+  // match — a handle from a dead registration is dropped, because the
+  // driver's deinit already freed the node it names.
+  uint64_t                          ws_gen;
+
   // Stall-pump task handle. Non-zero when a deferred re-dispatch is
   // armed for the moment the bucket refills. Set under e->lock; cleared
   // under e->lock from the pump callback (or by exchange_unregister
@@ -165,6 +172,15 @@ struct exchange
   int64_t                           breaker_tripped_until_ms;
 
   exchange_t                       *next;   // registry list
+};
+
+// OBS-19: the public opaque handle. Owned by the abstraction; the
+// driver's node lives and dies with the registration that issued it.
+struct exchange_ws_sub
+{
+  exchange_t *exch;        // immortal (tombstone semantics)
+  uint64_t    gen;         // e->ws_gen at subscribe time
+  void       *driver_sub;  // protocol plugin's node; dead once gen mismatches
 };
 
 // exchange_registry.c

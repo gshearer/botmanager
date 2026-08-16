@@ -46,11 +46,16 @@ void    kr_ws_channels_dispatch(const char *buf, size_t len);
 //   * private channels were requested but credentials are unconfigured.
 // On SUCCESS the handle is non-NULL and every matching event fires `cb`
 // until kr_ws_unsubscribe(handle).
+//
+// The handle is this multiplexer's own subscriber node, and it lives and
+// dies with this mapping: kr_ws_channels_deinit frees every node still
+// outstanding. The abstraction wraps it and never forwards one issued by
+// an earlier registration, so nothing stale reaches here (OBS-19).
 bool    kr_ws_subscribe(const exchange_ws_channel_t *channels,
             uint32_t n_channels, const char *const *product_ids,
             uint32_t n_products, exchange_ws_event_cb_t cb, void *user,
-            exchange_ws_sub_t **out_handle);
+            void **out_handle);
 
-void    kr_ws_unsubscribe(exchange_ws_sub_t *handle);
+void    kr_ws_unsubscribe(void *driver_sub);
 
 #endif // BM_KRAKEN_WS_CHANNELS_H
