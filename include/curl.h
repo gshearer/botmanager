@@ -141,22 +141,29 @@ bool curl_request_set_prio(curl_request_t *req, curl_prio_t prio);
 // the curl subsystem -- the caller must not use req after this call.
 bool curl_request_submit(curl_request_t *req);
 
-// Blocking variant of curl_request_submit. When the submit queue is
-// full, waits on an internal condition variable instead of returning
-// FAIL. Wakes when the drain thread frees slots. Designed for bulk
-// pipelines (e.g. knowledge corpus ingest) where the caller prefers
-// backpressure to silent drops and has the luxury of a dedicated
-// worker thread.
+// Backpressure variant of curl_request_submit. When the submit queue
+// is full, waits up to wait_ms for the drain thread to free a slot
+// instead of returning FAIL immediately. Designed for bulk pipelines
+// (e.g. knowledge corpus ingest) where the caller prefers backpressure
+// to silent drops.
 //
 // Does NOT log a queue-full WARN -- the whole point is to wait
-// quietly. On successful enqueue, ownership transfers to the curl
-// subsystem as usual. Returns FAIL only when the subsystem itself is
-// shutting down (curl_ready goes false); on FAIL the request is
-// released internally.
+// quietly; only the timeout is worth a line. On successful enqueue,
+// ownership transfers to the curl subsystem as usual.
+//
+// Returns FAIL when the wait expires, when the subsystem is shutting
+// down, and on a malformed request; on FAIL the request is released
+// internally. `wait_ms` of 0 does not wait at all -- it is the
+// fast-fail submit without the WARN.
+//
+// The bound is the caller's whole protection: nothing else here
+// shortens the wait, and the queue only drains as fast as the slowest
+// endpoint ahead of it lets it. Never pass a bound you are not
+// prepared to sit through on the thread you are on.
 //
 // Thread-safe. May be called from any thread except the curl multi
 // loop's own worker (that would deadlock).
-bool curl_request_submit_wait(curl_request_t *req);
+bool curl_request_submit_wait(curl_request_t *req, uint32_t wait_ms);
 
 // The request's stable identity, for curl_request_cancel. Read it
 // before curl_request_submit — ownership of the handle transfers
@@ -423,6 +430,9 @@ static pthread_mutex_t    curl_submit_mutex;
 // Signalled whenever the submit queue's fill drops (drain thread runs,
 // subsystem shuts down) so threads blocked in curl_request_submit_wait
 // can re-check capacity without polling or generating log noise.
+// Carries a CLOCK_MONOTONIC attr, unlike every other condition in this
+// tree: waiters on it hold a deadline that is the caller's only bound,
+// and a settime or an NTP step must not be able to extend it.
 static pthread_cond_t     curl_slot_cond;
 
 // Shutdown drain bookkeeping. Set by curl_begin_shutdown (any thread);

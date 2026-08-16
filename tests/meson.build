@@ -96,6 +96,19 @@ test_kv_str = executable('test_kv_str',
   dependencies : core_deps,
 )
 
+# The backpressure submit is the one call in the tree that parks a
+# caller on a condition another host controls. Its bound is the whole
+# protection and its failure is silent — a parked thread logs nothing —
+# so this suite states the bound as elapsed milliseconds. It runs the
+# real subsystem with the drain disabled (core.curl.max_active = 0), so
+# no case touches the network.
+test_curl_submit_wait = executable('test_curl_submit_wait',
+  'test_curl_submit_wait.c',
+  include_directories : [include_directories('.'), inc_include],
+  link_with : [test_harness, libcore],
+  dependencies : core_deps,
+)
+
 test('util', test_util)
 test('colors', test_colors)
 test('json', test_json)
@@ -105,3 +118,4 @@ test('cooldown', test_cooldown)
 test('fact_merge', test_fact_merge)
 test('kv_bot', test_kv_bot)
 test('kv_str', test_kv_str)
+test('curl_submit_wait', test_curl_submit_wait)

@@ -2875,8 +2875,8 @@ llm_issue_request(llm_request_t *req)
     curl_request_set_chunk_cb(cr, llm_curl_chunk_cb, req);
   }
 
-  ok = req->blocking_submit
-      ? curl_request_submit_wait(cr)
+  ok = req->submit_wait_ms > 0
+      ? curl_request_submit_wait(cr, req->submit_wait_ms)
       : curl_request_submit(cr);
 
   if(ok != SUCCESS)
@@ -3014,12 +3014,12 @@ llm_chat_submit(const char *model_name,
 }
 
 // Shared setup + submit for llm_embed_submit / llm_embed_submit_wait.
-// blocking=false → fast-fail on queue-full; blocking=true → block on
-// curl_request_submit_wait until a slot opens.
+// submit_wait_ms=0 → fast-fail on queue-full; non-zero → wait that
+// long in curl_request_submit_wait for a slot before giving up.
 static bool
 llm_embed_submit_impl(const char *model_name,
     const char *const *inputs, size_t n_inputs,
-    llm_embed_done_cb_t done_cb, void *user_data, bool blocking)
+    llm_embed_done_cb_t done_cb, void *user_data, uint32_t submit_wait_ms)
 {
   llm_model_t m;
   llm_request_t *req;
@@ -3057,7 +3057,7 @@ llm_embed_submit_impl(const char *model_name,
   req->embed_done_cb   = done_cb;
   req->user_data       = user_data;
   req->streaming       = false;
-  req->blocking_submit = blocking;
+  req->submit_wait_ms  = submit_wait_ms;
 
   llm_clam_prompt_embed(model_name, inputs, n_inputs);
 
@@ -3086,7 +3086,7 @@ llm_embed_submit(const char *model_name,
     llm_embed_done_cb_t done_cb, void *user_data)
 {
   return(llm_embed_submit_impl(model_name, inputs, n_inputs,
-      done_cb, user_data, false)); // blocking
+      done_cb, user_data, 0)); // submit_wait_ms — fast-fail
 }
 
 bool
@@ -3095,7 +3095,7 @@ llm_embed_submit_wait(const char *model_name,
     llm_embed_done_cb_t done_cb, void *user_data)
 {
   return(llm_embed_submit_impl(model_name, inputs, n_inputs,
-      done_cb, user_data, true)); // blocking
+      done_cb, user_data, llm_cfg.embed_submit_wait_ms));
 }
 
 bool
@@ -3380,6 +3380,8 @@ llm_load_config(void)
   llm_cfg.timeout_secs       = (uint32_t)kv_get_uint("llm.timeout_secs");
   llm_cfg.max_context_tokens = (uint32_t)kv_get_uint("llm.max_context_tokens");
   llm_cfg.streaming_idle_ms  = (uint32_t)kv_get_uint("llm.streaming_idle_ms");
+  llm_cfg.embed_submit_wait_ms =
+      (uint32_t)kv_get_uint("llm.embed_submit_wait_ms");
 
   if(llm_cfg.max_retries == 0)
     llm_cfg.max_retries = 1;   // at least one attempt
@@ -3410,6 +3412,10 @@ llm_register_kv(void)
       llm_kv_changed, NULL, "Default max context tokens");
   kv_register("llm.streaming_idle_ms", KV_UINT32, "30000",
       llm_kv_changed, NULL, "Streaming idle timeout in milliseconds");
+  kv_register("llm.embed_submit_wait_ms", KV_UINT32, "60000",
+      llm_kv_changed, NULL,
+      "How long a bulk embed submit waits for a curl queue slot before"
+      " giving up (0 = never wait)");
 }
 
 
@@ -3554,6 +3560,7 @@ llm_init(void)
   llm_cfg.timeout_secs       = LLM_DEF_TIMEOUT_SECS;
   llm_cfg.max_context_tokens = LLM_DEF_MAX_CONTEXT;
   llm_cfg.streaming_idle_ms  = LLM_DEF_STREAMING_IDLE_MS;
+  llm_cfg.embed_submit_wait_ms = LLM_DEF_EMBED_SUBMIT_WAIT_MS;
 
   plugin_unmap_notify_register(llm_unmap_cb, NULL);
 

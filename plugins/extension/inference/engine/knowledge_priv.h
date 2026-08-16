@@ -114,6 +114,15 @@ typedef struct
   uint64_t  chunks_submitted;
   uint64_t  chunks_embedded_ok;                   // inferred from flush result
   uint64_t  chunks_embedded_fail;
+
+  // Set by the first flush that could not hand its request to curl —
+  // the queue never freed a slot within the bound, or the engine is
+  // going away. Both mean every later flush would pay the same wait,
+  // so the batch stops accepting chunks and the walk above it stops
+  // emitting them: a chunk row inserted after this point could only
+  // ever be a row with no embedding, invisible to retrieval and
+  // duplicated by the re-run that would fix it.
+  bool      aborted;
 } knowledge_batch_t;
 
 // Shared helpers between knowledge.c and knowledge_file.c.
@@ -125,12 +134,24 @@ void knowledge_batch_free(knowledge_batch_t *b);
 bool knowledge_batch_add(knowledge_batch_t *b, int64_t chunk_id,
     const char *text);
 
+// What one walk did. `aborted` is the one field a caller must report
+// rather than total: the counts below it are then a prefix of the
+// corpus, not the corpus.
+typedef struct
+{
+  size_t   files;
+  size_t   chunks;
+  size_t   skipped;
+  uint64_t embed_ok;
+  uint64_t embed_fail;
+  bool     aborted;
+} knowledge_ingest_stats_t;
+
 // File/directory ingest pipeline — owned by knowledge_file.c, driven
 // by the /knowledge ingest command in knowledge.c. Returns SUCCESS
-// when the walk completes; populates the out-pointer stats.
+// when the path was walkable at all (FAIL is a stat/open refusal, not
+// an ingest that stopped early); fills `out` either way.
 bool knowledge_ingest_path(const char *corpus, const char *path,
-    const char *base_url_or_NULL,
-    size_t *out_files, size_t *out_chunks, size_t *out_skipped,
-    uint64_t *out_embed_ok, uint64_t *out_embed_fail);
+    const char *base_url_or_NULL, knowledge_ingest_stats_t *out);
 
 #endif // BM_KNOWLEDGE_PRIV_H

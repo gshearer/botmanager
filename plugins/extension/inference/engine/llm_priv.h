@@ -158,6 +158,14 @@ void llm_iterate_active(llm_iter_cb_t cb, void *data);
 #define LLM_DEF_TIMEOUT_SECS      300
 #define LLM_DEF_MAX_CONTEXT       8192
 #define LLM_DEF_STREAMING_IDLE_MS 30000
+
+// How long a bulk embed submit will sit against a full curl queue.
+// Sized to be unreachable while the endpoint answers at all — the
+// queue holds 256 and frees a slot the moment any one of them
+// completes — and decisive when it has stopped: well inside the 300 s
+// each queued request may itself take before its own timeout fires.
+#define LLM_DEF_EMBED_SUBMIT_WAIT_MS 60000
+
 #define LLM_RETRY_CAP_MS          30000
 #define LLM_ASSEMBLED_INIT_CAP    1024
 
@@ -168,6 +176,7 @@ typedef struct
   uint32_t timeout_secs;
   uint32_t max_context_tokens;
   uint32_t streaming_idle_ms;
+  uint32_t embed_submit_wait_ms;
 } llm_cfg_t;
 
 // In-memory mirror of an llm_services row: one OpenAI-compatible provider,
@@ -316,12 +325,14 @@ struct llm_request
   // Retry state.
   uint32_t              attempt;
 
-  // Backpressure: when true, llm_issue_request uses curl_request_submit_wait
-  // (blocks on a full queue) instead of curl_request_submit (fails fast).
+  // Backpressure: when non-zero, llm_issue_request uses
+  // curl_request_submit_wait and gives it this many milliseconds to
+  // find a queue slot, instead of curl_request_submit's fast fail.
   // Set by llm_embed_submit_wait for bulk pipelines that cannot afford
   // silent drops. Carried through the retry path so scheduled retries
-  // also block rather than failing fast on transient saturation.
-  bool                  blocking_submit;
+  // also wait rather than failing fast on transient saturation. Zero
+  // is the ordinary non-blocking submit.
+  uint32_t              submit_wait_ms;
 
   // The curl request carrying the current attempt, for
   // curl_request_cancel. Re-stamped on every retry; 0 while nothing of

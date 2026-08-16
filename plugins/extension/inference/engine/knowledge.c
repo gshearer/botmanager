@@ -502,6 +502,9 @@ knowledge_batch_add(knowledge_batch_t *b, int64_t chunk_id, const char *text)
     return(SUCCESS);
   }
 
+  if(b->aborted)
+    return(FAIL);
+
   if(b->n >= b->max_fill
       && knowledge_batch_flush(b) != SUCCESS)
     return(FAIL);
@@ -778,10 +781,17 @@ knowledge_batch_flush(knowledge_batch_t *b)
 
   else
   {
+    // Every reason this fails is a property of the engine or the queue
+    // behind it, not of these chunks: an unresolvable model, a shutting
+    // -down subsystem, or a curl queue that did not free a slot inside
+    // llm.embed_submit_wait_ms. Retrying the next batch would buy the
+    // same answer one bound later, so the batch stops here and says so.
     clam(CLAM_WARN, "knowledge",
-        "batch submit_wait returned FAIL (model='%s', n=%zu) —"
-        " chunks have no embedding", b->model, b->n);
+        "batch submit_wait returned FAIL (model='%s', n=%zu) — chunks"
+        " have no embedding; aborting the rest of this ingest",
+        b->model, b->n);
     b->chunks_embedded_fail += b->n;
+    b->aborted = true;
     mem_free(ctx);
     knowledge_batch_drop_pending(b);   // submit never happened,
                                        // free batch's texts
@@ -791,12 +801,17 @@ knowledge_batch_flush(knowledge_batch_t *b)
 }
 
 // Final flush + any cleanup. Safe to call on a zeroed batch or after
-// previous flushes.
+// previous flushes. An aborted batch is not flushed again — the
+// closing flush would sit out the same bound the aborting one already
+// proved nothing was waiting behind.
 void
 knowledge_batch_free(knowledge_batch_t *b)
 {
   if(b == NULL) return;
-  knowledge_batch_flush(b);
+
+  if(!b->aborted)
+    knowledge_batch_flush(b);
+
   knowledge_batch_drop_pending(b);
 }
 

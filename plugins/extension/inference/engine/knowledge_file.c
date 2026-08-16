@@ -214,6 +214,12 @@ kw_emit_chunk(kw_ingest_t *ing, const char *start, const char *end)
   int64_t id;
   if(start == NULL || end <= start) return;
 
+  // The batch gave up on the engine. The INSERT below would still
+  // succeed — which is the trap: it would leave a chunk row no
+  // retrieval can ever reach, and no re-ingest can replace without
+  // duplicating. Stop emitting instead.
+  if(ing->batch != NULL && ing->batch->aborted) return;
+
   len = (size_t)(end - start);
 
   // Strip leading whitespace; enforce a minimum length so we don't
@@ -257,8 +263,14 @@ kw_emit_chunk(kw_ingest_t *ing, const char *start, const char *end)
 
   ing->emitted++;
 
-  if(ing->batch != NULL)
-    knowledge_batch_add(ing->batch, id, text);
+  // The row is already in the table, so a batch that will not take it
+  // is a chunk with no embedding — count it as one. This is the chunk
+  // whose own add is what discovered the abort: without this the
+  // command's "failed" line is short by exactly that one, and the row
+  // it does not mention is as orphaned as the four it does.
+  if(ing->batch != NULL
+      && knowledge_batch_add(ing->batch, id, text) != SUCCESS)
+    ing->batch->chunks_embedded_fail++;
 }
 
 // Section-aware markdown chunker. Heading runs define section bounds
@@ -515,11 +527,16 @@ kw_ingest_file(const char *corpus, const char *path,
 // (llm_embed_submit_wait → curl_request_submit_wait). The rest of the
 // daemon (IRC dispatch, chat replies, etc.) continues on other pool
 // workers; ingest backpressure does not stall the whole process.
+//
+// That wait is bounded by llm.embed_submit_wait_ms, and the bound is
+// what makes this function returnable: without it a queue behind a
+// silent endpoint parks this thread for as long as that endpoint
+// likes, and neither the operator nor a plugin reload can call it
+// back. When the bound fires the walk stops where it is and says so
+// in `out->aborted` — the counts are then a prefix, not a total.
 bool
 knowledge_ingest_path(const char *corpus, const char *path,
-    const char *base_url_or_NULL,
-    size_t *out_files, size_t *out_chunks, size_t *out_skipped,
-    uint64_t *out_embed_ok, uint64_t *out_embed_fail)
+    const char *base_url_or_NULL, knowledge_ingest_stats_t *out)
 {
   struct stat st;
   knowledge_cfg_t cfg;
@@ -528,6 +545,11 @@ knowledge_ingest_path(const char *corpus, const char *path,
   char embed_model[KNOWLEDGE_EMBED_MODEL_SZ];
   knowledge_batch_t batch;
   size_t files, chunks, skipped;
+  if(out == NULL)
+    return(FAIL);
+
+  memset(out, 0, sizeof(*out));
+
   if(stat(path, &st) != 0)
     return(FAIL);
 
@@ -579,6 +601,8 @@ knowledge_ingest_path(const char *corpus, const char *path,
     {
       struct stat est;
       size_t sk;
+      if(batch.aborted) break;
+
       if(de->d_name[0] == '.') continue;
 
       snprintf(entry, sizeof(entry), "%s/%s", path, de->d_name);
@@ -607,14 +631,16 @@ knowledge_ingest_path(const char *corpus, const char *path,
     return(FAIL);
   }
 
-  // Drain the final partial batch and tear down.
+  // Drain the final partial batch and tear down. The closing flush can
+  // itself abort, so the stats are read after it, never before.
   knowledge_batch_free(&batch);
 
-  if(out_files)      *out_files      = files;
-  if(out_chunks)     *out_chunks     = chunks;
-  if(out_skipped)    *out_skipped    = skipped;
-  if(out_embed_ok)   *out_embed_ok   = batch.chunks_embedded_ok;
-  if(out_embed_fail) *out_embed_fail = batch.chunks_embedded_fail;
+  out->files      = files;
+  out->chunks     = chunks;
+  out->skipped    = skipped;
+  out->embed_ok   = batch.chunks_embedded_ok;
+  out->embed_fail = batch.chunks_embedded_fail;
+  out->aborted    = batch.aborted;
 
   return(SUCCESS);
 }

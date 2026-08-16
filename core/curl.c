@@ -710,29 +710,73 @@ curl_request_cancel(uint64_t id)
 
 // Convenience functions
 
-// Blocking variant of curl_request_submit. When the submit queue is
-// full, waits on curl_slot_cond instead of returning FAIL. The drain
-// thread broadcasts this condition when it clears the queue, so
+// Backpressure variant of curl_request_submit. When the submit queue
+// is full, waits on curl_slot_cond instead of returning FAIL. The
+// drain thread broadcasts this condition when it clears the queue, so
 // waiters wake naturally without polling and without generating the
 // "queue full" WARN that the fast-fail path emits on every rejection.
 //
-// Spurious wakeups are handled by the while-loop; false is returned
-// only when the subsystem has shut down.
+// The wait is bounded because nothing else bounds it. The queue only
+// drains as the endpoints ahead of it answer, and one that accepts a
+// connection and never replies holds its slot for the request's whole
+// timeout (llm's embed default is 300 s) — so an unbounded wait here
+// is a thread parked for as long as the sickest peer decides, on a
+// pool worker, with no way to call it back. The caller's bound is the
+// only thing that ends it, which is why the deadline runs on
+// CLOCK_MONOTONIC and why the expiry is worth a WARN.
+//
+// Spurious wakeups are handled by the while-loop.
 //
 // Does not call curl_request_submit (which would log the WARN on
 // every transient queue-full condition). Duplicates the enqueue path
 // instead — ~15 lines of acceptable duplication for clean semantics.
 bool
-curl_request_submit_wait(curl_request_t *req)
+curl_request_submit_wait(curl_request_t *req, uint32_t wait_ms)
 {
+  struct timespec deadline;
+  bool            expired = false;
+
   if(req == NULL || req->state != CURL_REQ_CREATED)
     return(FAIL);
+
+  clock_gettime(CLOCK_MONOTONIC, &deadline);
+
+  deadline.tv_sec  += (time_t)(wait_ms / 1000U);
+  deadline.tv_nsec += (long)(wait_ms % 1000U) * 1000000L;
+
+  if(deadline.tv_nsec >= 1000000000L)
+  {
+    deadline.tv_sec  += 1;
+    deadline.tv_nsec -= 1000000000L;
+  }
 
   pthread_mutex_lock(&curl_submit_mutex);
 
   while(curl_ready && !curl_shutting_down &&
         curl_submit_total >= curl_cfg.max_queued)
-    pthread_cond_wait(&curl_slot_cond, &curl_submit_mutex);
+  {
+    if(pthread_cond_timedwait(&curl_slot_cond, &curl_submit_mutex,
+        &deadline) == ETIMEDOUT)
+    {
+      expired = true;
+      break;
+    }
+  }
+
+  if(expired)
+  {
+    uint32_t queued = curl_submit_total;
+
+    pthread_mutex_unlock(&curl_submit_mutex);
+
+    clam(CLAM_WARN, "curl",
+        "submit_wait: no queue slot within %u ms (%u queued, cap %u);"
+        " the endpoints ahead of it are not draining",
+        wait_ms, queued, curl_cfg.max_queued);
+
+    curl_request_release(req);
+    return(FAIL);
+  }
 
   if(!curl_ready || curl_shutting_down)
   {
@@ -1693,8 +1737,19 @@ curl_init(void)
 
   pthread_mutex_init(&curl_submit_mutex, NULL);
   pthread_mutex_init(&curl_req_mutex, NULL);
-  pthread_cond_init(&curl_slot_cond, NULL);
   pthread_cond_init(&curl_drain_cond, NULL);
+
+  // curl_slot_cond alone runs on CLOCK_MONOTONIC: a submit_wait
+  // caller's deadline is the only bound on its wait, so the wall clock
+  // moving must not be able to lengthen it.
+  {
+    pthread_condattr_t attr;
+
+    pthread_condattr_init(&attr);
+    pthread_condattr_setclock(&attr, CLOCK_MONOTONIC);
+    pthread_cond_init(&curl_slot_cond, &attr);
+    pthread_condattr_destroy(&attr);
+  }
 
   // Set defaults before KV may be available.
   curl_cfg.timeout         = CURL_DEF_TIMEOUT;

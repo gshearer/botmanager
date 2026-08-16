@@ -49,8 +49,7 @@ cmd_knowledge_ingest(const cmd_ctx_t *ctx)
   const char *base_url = (ctx->parsed->argc > 2) ? ctx->parsed->argv[2] : NULL;
 
   char line[256];
-  size_t files, chunks, skipped;
-  uint64_t embed_ok, embed_fail;
+  knowledge_ingest_stats_t st;
   if(knowledge_corpus_upsert(corpus, NULL) != SUCCESS)
   {
     cmd_reply(ctx, "error: corpus upsert failed");
@@ -66,14 +65,7 @@ cmd_knowledge_ingest(const cmd_ctx_t *ctx)
         "ingesting '%s' into corpus '%s' …", path, corpus);
   cmd_reply(ctx, line);
 
-  files = 0;
-  chunks = 0;
-  skipped = 0;
-  embed_ok = 0;
-  embed_fail = 0;
-  if(knowledge_ingest_path(corpus, path, base_url,
-        &files, &chunks, &skipped,
-        &embed_ok, &embed_fail) != SUCCESS)
+  if(knowledge_ingest_path(corpus, path, base_url, &st) != SUCCESS)
   {
     cmd_reply(ctx, "error: ingest failed (stat/open)");
     return;
@@ -81,15 +73,37 @@ cmd_knowledge_ingest(const cmd_ctx_t *ctx)
 
   snprintf(line, sizeof(line),
       "ingested %zu chunk(s) from %zu file(s) (%zu skipped).",
-      chunks, files, skipped);
+      st.chunks, st.files, st.skipped);
   cmd_reply(ctx, line);
 
   snprintf(line, sizeof(line),
       "embeds submitted: %llu; failed: %llu. "
       "(Completion is asynchronous; /show knowledge tracks progress.)",
-      (unsigned long long)embed_ok,
-      (unsigned long long)embed_fail);
+      (unsigned long long)st.embed_ok,
+      (unsigned long long)st.embed_fail);
   cmd_reply(ctx, line);
+
+  // An abort makes the two lines above a prefix of the corpus rather
+  // than the corpus, and the chunks it already inserted carry no
+  // vector. Say both — a re-run inserts them a second time, since
+  // nothing about ingest is idempotent.
+  if(st.aborted)
+  {
+    cmd_reply(ctx,
+        "ABORTED: the embed engine stopped taking work (see the curl"
+        " submit_wait warning), so the walk stopped early.");
+
+    snprintf(line, sizeof(line),
+        "%llu chunk(s) are stored WITHOUT an embedding and are invisible"
+        " to retrieval.",
+        (unsigned long long)st.embed_fail);
+    cmd_reply(ctx, line);
+
+    cmd_reply(ctx,
+        "Fix the engine, then delete the corpus and ingest it again —"
+        " re-running over the same path duplicates every chunk it"
+        " already stored.");
+  }
 }
 
 // ---- /knowledge corpus <container> + /knowledge corpus {upsert,del} ----
