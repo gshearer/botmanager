@@ -219,6 +219,72 @@ sxng_deliver_fail(const sxng_req_t *r, const char *msg)
     r->cb(&resp);
 }
 
+// ----------------------------------------------------------------------
+// URL normalisation
+// ----------------------------------------------------------------------
+
+// The scheme a scheme-relative URL is completed with. Deliberately not
+// the endpoint's own: our SearXNG instance answers over plain http on a
+// LAN address, while the hosts these URLs name are public CDNs serving
+// https. A browser inherits the surrounding document's scheme; we have
+// no document.
+#define SXNG_URL_SCHEME "https:"
+
+// SearXNG passes an engine's URLs through exactly as the engine wrote
+// them, and several engines — flickr among them — write the
+// scheme-relative form, "//live.staticflickr.com/…". Inside a page that
+// is a whole URL, because the page's own scheme completes it. Printed
+// into an IRC line it is a dead string: no client resolves it, and
+// neither does anything downstream of us (urlgrabber, the inference
+// layer's acquisition). Complete it here, where the bytes stop being
+// SearXNG's and become ours.
+//
+// A repair, not a validator: every other URL shape, malformed ones
+// included, passes through untouched.
+static void
+sxng_url_absolutize(char *url, size_t cap)
+{
+  const size_t pfx = sizeof(SXNG_URL_SCHEME) - 1;
+  size_t       len;
+
+  if(url[0] != '/' || url[1] != '/')
+    return;
+
+  len = strnlen(url, cap);
+
+  // No room for the scheme means the extractor already truncated this
+  // URL into its field, and half a URL is worse than none.
+  if(len + pfx >= cap)
+  {
+    clam(CLAM_WARN, SXNG_CTX,
+        "scheme-relative URL fills its %zu-byte field; dropped", cap);
+    url[0] = '\0';
+    return;
+  }
+
+  memmove(url + pfx, url, len + 1);
+  memcpy(url, SXNG_URL_SCHEME, pfx);
+}
+
+// json_get_str for a field that carries a URL — same contract, plus the
+// repair above. Every URL-shaped field of a result row is read through
+// this, so no engine quirk reaches a caller uncompleted.
+//
+// Returns false for a key that is absent, empty, or whose value the
+// repair had to drop: all three are "this engine gave us no URL", which
+// is what the callers with a fallback key need to hear.
+static bool
+sxng_get_url(struct json_object *item, const char *key, char *out,
+    size_t cap)
+{
+  if(!json_get_str(item, key, out, cap))
+    return(false);
+
+  sxng_url_absolutize(out, cap);
+
+  return(out[0] != '\0');
+}
+
 // Populate the per-category extras union on a freshly-extracted result
 // row. The common-field extractor (sxng_result_spec) has already filled
 // title / url / snippet / engine / score; this fills whatever optional
@@ -236,12 +302,12 @@ sxng_extract_extras(struct json_object *item, sxng_result_t *r,
     {
       int w;
       int h;
-      json_get_str(item, "img_src", r->extras.image.src,
+      sxng_get_url(item, "img_src", r->extras.image.src,
           sizeof(r->extras.image.src));
 
-      if(!json_get_str(item, "thumbnail_src", r->extras.image.thumbnail,
+      if(!sxng_get_url(item, "thumbnail_src", r->extras.image.thumbnail,
           sizeof(r->extras.image.thumbnail)))
-        json_get_str(item, "thumbnail", r->extras.image.thumbnail,
+        sxng_get_url(item, "thumbnail", r->extras.image.thumbnail,
             sizeof(r->extras.image.thumbnail));
 
       json_get_str(item, "resolution", r->extras.image.resolution,
@@ -265,19 +331,19 @@ sxng_extract_extras(struct json_object *item, sxng_result_t *r,
     case SXNG_CAT_NEWS:
       json_get_str(item, "publishedDate", r->extras.news.published,
           sizeof(r->extras.news.published));
-      json_get_str(item, "img_src", r->extras.news.img_src,
+      sxng_get_url(item, "img_src", r->extras.news.img_src,
           sizeof(r->extras.news.img_src));
       json_get_str(item, "source", r->extras.news.source,
           sizeof(r->extras.news.source));
       break;
 
     case SXNG_CAT_VIDEOS:
-      if(!json_get_str(item, "thumbnail_src", r->extras.video.thumbnail,
+      if(!sxng_get_url(item, "thumbnail_src", r->extras.video.thumbnail,
           sizeof(r->extras.video.thumbnail)))
-        json_get_str(item, "thumbnail", r->extras.video.thumbnail,
+        sxng_get_url(item, "thumbnail", r->extras.video.thumbnail,
             sizeof(r->extras.video.thumbnail));
 
-      json_get_str(item, "iframe_src", r->extras.video.iframe_src,
+      sxng_get_url(item, "iframe_src", r->extras.video.iframe_src,
           sizeof(r->extras.video.iframe_src));
       json_get_str(item, "author", r->extras.video.author,
           sizeof(r->extras.video.author));
@@ -418,6 +484,10 @@ sxng_curl_done(const curl_response_t *cresp)
       if(!json_extract(item, &out[kept], sxng_result_spec,
           SXNG_CTX ":result"))
         continue;   // required field (url) missing; skip row
+
+      // The spec copies `url` verbatim; it is as scheme-relative-prone
+      // as any field in the extras union.
+      sxng_url_absolutize(out[kept].url, sizeof(out[kept].url));
 
       out[kept].category = r.category;
       sxng_extract_extras(item, &out[kept], r.category);
