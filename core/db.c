@@ -89,6 +89,30 @@ conn_acquire(void)
   return(NULL);
 }
 
+// Report a refusal the driver never saw. Every early return on the
+// query paths goes through here so the caller reads one field for the
+// reason whether the statement ran or not.
+static bool
+result_fail(db_result_t *r, const char *why)
+{
+  if(r != NULL)
+  {
+    r->ok = false;
+    strlcpy(r->error, why, sizeof(r->error));
+  }
+
+  return(FAIL);
+}
+
+// A bound-parameter call is well-formed when the count fits the array
+// the drivers are built around and the array is there for every value
+// the count claims.
+static bool
+params_ok(const char *const *params, uint16_t n_params)
+{
+  return(n_params <= DB_PARAMS_MAX && (params != NULL || n_params == 0));
+}
+
 static void
 result_clear(db_result_t *r)
 {
@@ -155,6 +179,22 @@ reaper_cb(task_t *t)
   t->sleep_until = now + db_pcfg.reap_interval;
 }
 
+static void
+async_ctx_free(db_async_ctx_t *ctx)
+{
+  if(ctx->params != NULL)
+  {
+    for(uint16_t i = 0; i < ctx->n_params; i++)
+      if(ctx->params[i] != NULL)
+        mem_free(ctx->params[i]);
+
+    mem_free(ctx->params);
+  }
+
+  mem_free(ctx->sql);
+  mem_free(ctx);
+}
+
 // Async query task callback.
 static void
 async_cb(task_t *t)
@@ -175,7 +215,13 @@ async_cb(task_t *t)
   }
 
   result = db_result_alloc();
-  ok = driver->query(c->handle, ctx->sql, result);
+
+  if(ctx->params != NULL)
+    ok = driver->query_params(c->handle, ctx->sql,
+        (const char *const *)ctx->params, ctx->n_params, result);
+
+  else
+    ok = driver->query(c->handle, ctx->sql, result);
 
   __atomic_add_fetch(&db_stat_queries, 1, __ATOMIC_RELAXED);
 
@@ -188,8 +234,7 @@ async_cb(task_t *t)
   // Invoke user callback (takes ownership of result).
   ctx->cb(result, ctx->data);
 
-  mem_free(ctx->sql);
-  mem_free(ctx);
+  async_ctx_free(ctx);
 
   t->state = TASK_ENDED;
 }
@@ -394,30 +439,52 @@ db_query(const char *sql, db_result_t *result)
   bool       ret;
 
   if(!db_ready || driver == NULL)
-  {
-    if(result != NULL)
-    {
-      result->ok = false;
-      snprintf(result->error, DB_ERROR_SZ, "db not initialized");
-    }
-    return(FAIL);
-  }
+    return(result_fail(result, "db not initialized"));
 
   c = conn_acquire();
 
   if(c == NULL)
-  {
-    if(result != NULL)
-    {
-      result->ok = false;
-      snprintf(result->error, DB_ERROR_SZ, "no connection available");
-    }
-    return(FAIL);
-  }
+    return(result_fail(result, "no connection available"));
 
   clam(CLAM_DEBUG, "db_query", "sql: %s", sql);
 
   ret = driver->query(c->handle, sql, result);
+
+  __atomic_add_fetch(&db_stat_queries, 1, __ATOMIC_RELAXED);
+
+  if(ret != SUCCESS)
+    __atomic_add_fetch(&db_stat_errors, 1, __ATOMIC_RELAXED);
+
+  c->queries++;
+  conn_release(c);
+
+  return(ret);
+}
+
+bool
+db_query_params(const char *sql, const char *const *params,
+    uint16_t n_params, db_result_t *result)
+{
+  db_conn_t *c;
+  bool       ret;
+
+  if(!db_ready || driver == NULL || sql == NULL)
+    return(result_fail(result, "db not initialized"));
+
+  if(driver->query_params == NULL)
+    return(result_fail(result, "driver lacks bound parameters"));
+
+  if(!params_ok(params, n_params))
+    return(result_fail(result, "malformed parameter list"));
+
+  c = conn_acquire();
+
+  if(c == NULL)
+    return(result_fail(result, "no connection available"));
+
+  clam(CLAM_DEBUG, "db_query", "sql: %s (%u param(s))", sql, n_params);
+
+  ret = driver->query_params(c->handle, sql, params, n_params, result);
 
   __atomic_add_fetch(&db_stat_queries, 1, __ATOMIC_RELAXED);
 
@@ -440,13 +507,52 @@ db_query_async(const char *sql, db_cb_t cb, void *data)
 
   ctx = mem_alloc("db", "async_ctx", sizeof(db_async_ctx_t));
 
-  ctx->sql  = mem_strdup("db", "async_sql", sql);
-  ctx->cb   = cb;
-  ctx->data = data;
+  ctx->sql      = mem_strdup("db", "async_sql", sql);
+  ctx->params   = NULL;
+  ctx->n_params = 0;
+  ctx->cb       = cb;
+  ctx->data     = data;
 
   task_add("db_query", TASK_THREAD, 128, async_cb, ctx);
 
   clam(CLAM_DEBUG, "db_query_async", "submitted: %s", sql);
+  return(ASYNC_AIRBORNE);
+}
+
+async_rc_t
+db_query_params_async(const char *sql, const char *const *params,
+    uint16_t n_params, db_cb_t cb, void *data)
+{
+  db_async_ctx_t *ctx;
+
+  if(!db_ready || driver == NULL || sql == NULL || cb == NULL
+      || driver->query_params == NULL || !params_ok(params, n_params))
+    return(ASYNC_FAILED_UNDELIVERED);
+
+  ctx = mem_alloc("db", "async_ctx", sizeof(db_async_ctx_t));
+
+  ctx->sql      = mem_strdup("db", "async_sql", sql);
+  ctx->params   = NULL;
+  ctx->n_params = n_params;
+  ctx->cb       = cb;
+  ctx->data     = data;
+
+  // The values must outlive the caller's frame, so they are copied
+  // alongside the statement. A NULL element stays NULL — that is SQL
+  // NULL, not a missing string.
+  if(n_params > 0)
+  {
+    ctx->params = mem_alloc("db", "async_params", sizeof(char *) * n_params);
+
+    for(uint16_t i = 0; i < n_params; i++)
+      ctx->params[i] = params[i] != NULL
+          ? mem_strdup("db", "async_param", params[i]) : NULL;
+  }
+
+  task_add("db_query", TASK_THREAD, 128, async_cb, ctx);
+
+  clam(CLAM_DEBUG, "db_query_async", "submitted: %s (%u param(s))",
+      sql, n_params);
   return(ASYNC_AIRBORNE);
 }
 
@@ -493,6 +599,157 @@ db_query_stream(const char *sql, db_row_cb_t row_cb, void *data,
   conn_release(c);
 
   return(ret);
+}
+
+// Transactions
+//
+// The pool hands out a connection per statement, so a transaction is
+// exactly one thing: a connection held across several. The handle owns
+// that pin — the slot stays ACTIVE and locked until commit or rollback
+// hands it back — which is why the two enders also free the handle and
+// why nothing else may block underneath one.
+
+db_txn_t *
+db_txn_begin(char *err, size_t err_cap)
+{
+  db_conn_t *c;
+  db_txn_t  *txn;
+
+  if(!db_ready || driver == NULL || driver->txn == NULL)
+  {
+    if(err != NULL)
+      strlcpy(err, "db has no transaction support", err_cap);
+
+    return(NULL);
+  }
+
+  c = conn_acquire();
+
+  if(c == NULL)
+  {
+    if(err != NULL)
+      strlcpy(err, "no connection available", err_cap);
+
+    return(NULL);
+  }
+
+  if(driver->txn(c->handle, DB_TXN_BEGIN, err, err_cap) != SUCCESS)
+  {
+    conn_release(c);
+    return(NULL);
+  }
+
+  txn = mem_alloc("db", "txn", sizeof(db_txn_t));
+
+  txn->conn   = c;
+  txn->failed = false;
+
+  return(txn);
+}
+
+// Both statement paths, sharing the one thing that matters here: a
+// failure latches, because everything after it in this transaction is
+// going to be discarded anyway and the engine will refuse it regardless.
+static bool
+txn_run(db_txn_t *txn, const char *sql, const char *const *params,
+    uint16_t n_params, db_result_t *result)
+{
+  bool ret;
+
+  if(txn == NULL || sql == NULL)
+    return(result_fail(result, "no transaction"));
+
+  if(txn->failed)
+    return(result_fail(result, "transaction already failed"));
+
+  if(params != NULL && (driver->query_params == NULL
+      || !params_ok(params, n_params)))
+    return(result_fail(result, "driver lacks bound parameters"));
+
+  clam(CLAM_DEBUG, "db_txn", "sql: %s (%u param(s))", sql, n_params);
+
+  if(params != NULL)
+    ret = driver->query_params(txn->conn->handle, sql, params,
+        n_params, result);
+
+  else
+    ret = driver->query(txn->conn->handle, sql, result);
+
+  __atomic_add_fetch(&db_stat_queries, 1, __ATOMIC_RELAXED);
+
+  if(ret != SUCCESS)
+  {
+    __atomic_add_fetch(&db_stat_errors, 1, __ATOMIC_RELAXED);
+    txn->failed = true;
+  }
+
+  txn->conn->queries++;
+  return(ret);
+}
+
+bool
+db_txn_query(db_txn_t *txn, const char *sql, db_result_t *result)
+{
+  return(txn_run(txn, sql, NULL, 0, result));
+}
+
+bool
+db_txn_query_params(db_txn_t *txn, const char *sql,
+    const char *const *params, uint16_t n_params, db_result_t *result)
+{
+  return(txn_run(txn, sql, params, n_params, result));
+}
+
+// End the transaction and give the connection back. `op` is what the
+// caller asked for; a COMMIT that fails still has to end the
+// transaction, so it falls through to a rollback of its own.
+static bool
+txn_end(db_txn_t *txn, db_txn_op_t op)
+{
+  char err[DB_ERROR_SZ] = {0};
+  bool ret;
+
+  ret = driver->txn(txn->conn->handle, op, err, sizeof(err));
+
+  if(op == DB_TXN_COMMIT && ret != SUCCESS)
+  {
+    __atomic_add_fetch(&db_stat_errors, 1, __ATOMIC_RELAXED);
+    driver->txn(txn->conn->handle, DB_TXN_ROLLBACK, NULL, 0);
+  }
+
+  conn_release(txn->conn);
+  mem_free(txn);
+
+  // Logged with the pin already given back: a clam() subscriber is free
+  // to reach the database itself.
+  if(ret != SUCCESS)
+    clam(CLAM_WARN, "db_txn", "%s failed: %s",
+        op == DB_TXN_COMMIT ? "commit" : "rollback",
+        err[0] != '\0' ? err : "(no driver error)");
+
+  return(ret);
+}
+
+bool
+db_txn_commit(db_txn_t *txn)
+{
+  if(txn == NULL)
+    return(FAIL);
+
+  if(txn->failed)
+  {
+    txn_end(txn, DB_TXN_ROLLBACK);
+    return(FAIL);
+  }
+
+  return(txn_end(txn, DB_TXN_COMMIT));
+}
+
+void
+db_txn_rollback(db_txn_t *txn)
+{
+  if(txn != NULL)
+    txn_end(txn, DB_TXN_ROLLBACK);
 }
 
 // returns: mem_alloc'd escaped string (caller frees), or NULL on failure

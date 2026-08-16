@@ -20,6 +20,17 @@ extern const db_driver_t pg_driver;
 // caller somebody else's failure (measured, TSan 2026-08-15).
 static _Thread_local char pg_last_error[DB_ERROR_SZ] = "";
 
+// What the pool holds as its opaque handle. libpq's own connection
+// cannot say whether an open transaction is deliberate, and the driver
+// has to know: the per-query cleanup that rescues a leaked transaction
+// would otherwise roll back every caller-owned one on its first
+// statement.
+typedef struct
+{
+  PGconn *conn;
+  bool    in_txn;
+} pg_conn_t;
+
 #endif // PG_INTERNAL
 
 #endif

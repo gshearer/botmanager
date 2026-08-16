@@ -504,15 +504,30 @@ dossier_set_user(dossier_id_t dossier_id, int user_id)
 
 // Merge
 
+// One statement of a merge, with the driver's complaint labelled by the
+// step that provoked it. A failure here ends the whole transaction, so
+// there is nothing to undo at the call site — say what broke and return.
+static bool
+dossier_txn_step(db_txn_t *txn, const char *sql, const char *what)
+{
+  db_result_t *res = db_result_alloc();
+  bool         ok  = (db_txn_query(txn, sql, res) == SUCCESS) && res->ok;
+
+  if(!ok && res->error[0] != '\0')
+    clam(CLAM_WARN, "dossier", "%s: %s", what, res->error);
+
+  db_result_free(res);
+  return(ok ? SUCCESS : FAIL);
+}
+
 // Absorb a single source dossier into the survivor: reassign signatures
 // and facts that don't collide, let colliding rows fall through ON
 // DELETE CASCADE when the source row is removed, and unify the counters
-// on the survivor.
+// on the survivor. Four statements that are one change — the caller's
+// transaction is what makes them so.
 static bool
-dossier_merge_one(dossier_id_t survivor, dossier_id_t source)
+dossier_merge_one(db_txn_t *txn, dossier_id_t survivor, dossier_id_t source)
 {
-  db_result_t *res;
-  bool ok;
   char sql[DOSSIER_SQL_SZ];
 
   if(survivor == source)
@@ -533,15 +548,7 @@ dossier_merge_one(dossier_id_t survivor, dossier_id_t source)
       "                    AND ps2.verified_id = ps.verified_id)",
       (int64_t)survivor, (int64_t)source, (int64_t)survivor);
 
-  res = db_result_alloc();
-  ok = (db_query(sql, res) == SUCCESS) && res->ok;
-
-  if(!ok && res->error[0] != '\0')
-    clam(CLAM_WARN, "dossier", "merge sig: %s", res->error);
-
-  db_result_free(res);
-
-  if(!ok)
+  if(dossier_txn_step(txn, sql, "merge sig") != SUCCESS)
     return(FAIL);
 
   // Reassign facts that don't collide.
@@ -554,15 +561,7 @@ dossier_merge_one(dossier_id_t survivor, dossier_id_t source)
       "                    AND pf2.fact_key   = pf.fact_key)",
       (int64_t)survivor, (int64_t)source, (int64_t)survivor);
 
-  res = db_result_alloc();
-  ok = (db_query(sql, res) == SUCCESS) && res->ok;
-
-  if(!ok && res->error[0] != '\0')
-    clam(CLAM_WARN, "dossier", "merge facts: %s", res->error);
-
-  db_result_free(res);
-
-  if(!ok)
+  if(dossier_txn_step(txn, sql, "merge facts") != SUCCESS)
     return(FAIL);
 
   // Unify counters on the survivor using LEAST/GREATEST.
@@ -575,15 +574,7 @@ dossier_merge_one(dossier_id_t survivor, dossier_id_t source)
       " WHERE s.id = %" PRId64 " AND src.id = %" PRId64,
       (int64_t)survivor, (int64_t)source);
 
-  res = db_result_alloc();
-  ok = (db_query(sql, res) == SUCCESS) && res->ok;
-
-  if(!ok && res->error[0] != '\0')
-    clam(CLAM_WARN, "dossier", "merge unify: %s", res->error);
-
-  db_result_free(res);
-
-  if(!ok)
+  if(dossier_txn_step(txn, sql, "merge unify") != SUCCESS)
     return(FAIL);
 
   // Delete the source dossier; any remaining colliding signatures and
@@ -592,14 +583,7 @@ dossier_merge_one(dossier_id_t survivor, dossier_id_t source)
       "DELETE FROM dossier WHERE id = %" PRId64,
       (int64_t)source);
 
-  res = db_result_alloc();
-  ok = (db_query(sql, res) == SUCCESS) && res->ok;
-
-  if(!ok && res->error[0] != '\0')
-    clam(CLAM_WARN, "dossier", "merge delete: %s", res->error);
-
-  db_result_free(res);
-  return(ok ? SUCCESS : FAIL);
+  return(dossier_txn_step(txn, sql, "merge delete"));
 }
 
 bool
@@ -608,6 +592,8 @@ dossier_merge(dossier_id_t survivor_id,
 {
   uint64_t merged;
   dossier_info_t s_info;
+  db_txn_t *txn;
+  char err[DB_ERROR_SZ];
 
   if(!dossier_ready || survivor_id <= 0
       || absorbed_ids == NULL || n_absorbed == 0)
@@ -638,16 +624,35 @@ dossier_merge(dossier_id_t survivor_id,
     }
   }
 
+  // Every absorbed dossier lands or none does. A merge that stopped
+  // halfway used to leave the sources it had already emptied behind as
+  // signature-less shells, and nothing downstream could tell them from
+  // dossiers that were always empty.
+  err[0] = '\0';
+  txn = db_txn_begin(err, sizeof(err));
+
+  if(txn == NULL)
+  {
+    clam(CLAM_WARN, "dossier", "merge: no transaction: %s",
+        err[0] != '\0' ? err : "(no driver error)");
+    return(FAIL);
+  }
+
   merged = 0;
 
   for(size_t i = 0; i < n_absorbed; i++)
   {
-    if(dossier_merge_one(survivor_id, absorbed_ids[i]) == SUCCESS)
-      merged++;
-
-    else
+    if(dossier_merge_one(txn, survivor_id, absorbed_ids[i]) != SUCCESS)
+    {
+      db_txn_rollback(txn);
       return(FAIL);
+    }
+
+    merged++;
   }
+
+  if(db_txn_commit(txn) != SUCCESS)
+    return(FAIL);
 
   dossier_stat_bump_merges(merged);
   return(SUCCESS);
@@ -720,11 +725,14 @@ dossier_split_signature(int64_t signature_id, dossier_id_t *out_new_id)
 {
   bool ok;
   dossier_id_t new_id;
-  char *e_label;
   uint32_t sig_count;
   db_result_t *res;
+  db_txn_t *txn;
   dossier_id_t src_pid;
   uint32_t     ns_id;
+  const char  *params[2];
+  char         ns_txt[16];
+  char         err[DB_ERROR_SZ];
   char         label[DOSSIER_LABEL_SZ] = {0};
   char sql[DOSSIER_SQL_SZ];
 
@@ -784,23 +792,36 @@ dossier_split_signature(int64_t signature_id, dossier_id_t *out_new_id)
   if(sig_count <= 1)
     return(FAIL);
 
-  // Create a bare new dossier in the same namespace.
-  e_label = db_escape(label);
+  // The new dossier and the signature that justifies it are one change:
+  // a bare dossier nobody points at is not a lesser outcome, it is a
+  // shell that every later candidate search has to step around. The
+  // hand-rolled compensating DELETE this replaces could itself fail,
+  // and then the orphan was permanent.
+  err[0] = '\0';
+  txn = db_txn_begin(err, sizeof(err));
 
-  if(e_label == NULL)
+  if(txn == NULL)
+  {
+    clam(CLAM_WARN, "dossier", "split: no transaction: %s",
+        err[0] != '\0' ? err : "(no driver error)");
     return(FAIL);
+  }
 
-  snprintf(sql, sizeof(sql),
-      "INSERT INTO dossier (ns_id, display_label)"
-      " VALUES (%u, '%s') RETURNING id",
-      ns_id, e_label);
+  // The label is a stored value, so it is bound rather than quoted into
+  // the statement — the escape it used to need was one more thing every
+  // future edit here had to remember.
+  snprintf(ns_txt, sizeof(ns_txt), "%u", ns_id);
 
-  mem_free(e_label);
+  params[0] = ns_txt;
+  params[1] = label;
 
   res = db_result_alloc();
   new_id = 0;
 
-  if(db_query(sql, res) == SUCCESS && res->ok && res->rows > 0)
+  if(db_txn_query_params(txn,
+      "INSERT INTO dossier (ns_id, display_label)"
+      " VALUES ($1::INTEGER, $2) RETURNING id",
+      params, 2, res) == SUCCESS && res->ok && res->rows > 0)
   {
     const char *v = db_result_get(res, 0, 0);
     if(v != NULL) new_id = (dossier_id_t)strtoll(v, NULL, 10);
@@ -812,7 +833,10 @@ dossier_split_signature(int64_t signature_id, dossier_id_t *out_new_id)
   db_result_free(res);
 
   if(new_id == 0)
+  {
+    db_txn_rollback(txn);
     return(FAIL);
+  }
 
   // Reassign the signature to the new dossier.
   snprintf(sql, sizeof(sql),
@@ -821,7 +845,7 @@ dossier_split_signature(int64_t signature_id, dossier_id_t *out_new_id)
       (int64_t)new_id, signature_id);
 
   res = db_result_alloc();
-  ok = (db_query(sql, res) == SUCCESS) && res->ok;
+  ok = (db_txn_query(txn, sql, res) == SUCCESS) && res->ok;
 
   if(!ok && res->error[0] != '\0')
     clam(CLAM_WARN, "dossier", "split reassign: %s", res->error);
@@ -830,23 +854,12 @@ dossier_split_signature(int64_t signature_id, dossier_id_t *out_new_id)
 
   if(!ok)
   {
-    // Roll back the new dossier row to avoid orphaning it. A rollback
-    // that itself fails leaves the orphan behind, so say so — nobody
-    // downstream can tell from the FAIL that a row was left over.
-    snprintf(sql, sizeof(sql),
-        "DELETE FROM dossier WHERE id = %" PRId64,
-        (int64_t)new_id);
-    res = db_result_alloc();
-
-    if(db_query(sql, res) != SUCCESS || !res->ok)
-      clam(CLAM_WARN, "dossier",
-          "split rollback failed, dossier %" PRId64 " orphaned: %s",
-          (int64_t)new_id,
-          res->error[0] != '\0' ? res->error : "(no driver error)");
-
-    db_result_free(res);
+    db_txn_rollback(txn);
     return(FAIL);
   }
+
+  if(db_txn_commit(txn) != SUCCESS)
+    return(FAIL);
 
   *out_new_id = new_id;
   return(SUCCESS);

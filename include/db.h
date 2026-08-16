@@ -9,6 +9,13 @@
 
 #define DB_ERROR_SZ  256
 
+// Bind parameters per statement. A parameter carries a value, never
+// syntax: the driver sends it out of band, so nothing in it can be read
+// as SQL and no escape is owed. Placeholders are `$1`..`$n`, `params[i]`
+// binds `$(i + 1)`, a NULL element is SQL NULL, and one call carries
+// exactly one statement.
+#define DB_PARAMS_MAX  32
+
 typedef enum
 {
   DB_CONN_IDLE,     // connected, not in use
@@ -40,6 +47,14 @@ typedef void (*db_cb_t)(db_result_t *result, void *data);
 typedef bool (*db_row_cb_t)(uint32_t row, uint32_t cols,
     const char *const *values, void *data);
 
+// Transaction control verb, passed to the driver's txn() entry point.
+typedef enum
+{
+  DB_TXN_BEGIN,
+  DB_TXN_COMMIT,
+  DB_TXN_ROLLBACK
+} db_txn_op_t;
+
 // Functions a DB plugin must implement.
 typedef struct
 {
@@ -57,6 +72,18 @@ typedef struct
   // Invokes row_cb once per row without materializing a db_result_t.
   bool (*query_stream)(void *handle, const char *sql,
       db_row_cb_t row_cb, void *data, char *err, size_t err_cap);
+
+  // Optional bound-parameter execution - NULL if the driver has none.
+  // n_params is already bounded by DB_PARAMS_MAX when this is called.
+  bool (*query_params)(void *handle, const char *sql,
+      const char *const *params, uint16_t n_params, db_result_t *result);
+
+  // Optional transaction control - NULL if the driver has none. The
+  // caller pins this handle for the whole BEGIN..COMMIT/ROLLBACK span,
+  // so the driver must suspend any per-query transaction cleanup of its
+  // own between them: an open transaction is the caller's intent here,
+  // not the leak it looks like on the one-statement path.
+  bool (*txn)(void *handle, db_txn_op_t op, char *err, size_t err_cap);
 
   // Returns a mem_alloc'd escaped string (caller frees).
   char *(*escape)(void *handle, const char *input);
@@ -128,6 +155,51 @@ async_rc_t db_query_async(const char *sql, db_cb_t cb, void *data);
 bool db_query_stream(const char *sql, db_row_cb_t row_cb, void *data,
     char *err, size_t err_cap);
 
+// Run one statement with its values bound out of band. Prefer this to
+// db_escape() + "%s" wherever a value comes from anywhere but this
+// source file: there is no escape to forget and no quoting to get
+// wrong. Returns FAIL when the driver has no parameter support, when
+// n_params exceeds DB_PARAMS_MAX, or on the ordinary query failures —
+// `result->error` carries which.
+bool db_query_params(const char *sql, const char *const *params,
+    uint16_t n_params, db_result_t *result);
+
+// db_query_async() with values bound out of band. `sql` and every
+// non-NULL parameter are copied; the caller may free them on return.
+// Return values are db_query_async()'s, plus ASYNC_FAILED_UNDELIVERED
+// when n_params exceeds DB_PARAMS_MAX or a NULL params array is paired
+// with a non-zero count.
+async_rc_t db_query_params_async(const char *sql, const char *const *params,
+    uint16_t n_params, db_cb_t cb, void *data);
+
+// A transaction pins one pool connection from db_txn_begin() until
+// db_txn_commit() or db_txn_rollback(), either of which frees the
+// handle. The pin is what makes the statements one unit, so it is also
+// the cost: hold it for the mutation and nothing else — never across an
+// async wait, a network call, or a second db_txn_begin() on the same
+// thread. Statements issued through db_query() meanwhile take a
+// different connection and are NOT part of the transaction.
+typedef struct db_txn db_txn_t;
+
+// Returns NULL when the driver has no transaction support, when no
+// connection is free, or when BEGIN itself fails (err filled when
+// non-NULL).
+db_txn_t *db_txn_begin(char *err, size_t err_cap);
+
+bool db_txn_query(db_txn_t *txn, const char *sql, db_result_t *result);
+
+bool db_txn_query_params(db_txn_t *txn, const char *sql,
+    const char *const *params, uint16_t n_params, db_result_t *result);
+
+// Commit and free. Returns FAIL — having rolled back instead — if any
+// statement on this handle failed: an engine that aborts a transaction
+// on its first error reports the later COMMIT as a success, and that
+// success means the opposite of what it says.
+bool db_txn_commit(db_txn_t *txn);
+
+// Roll back and free. NULL is a no-op.
+void db_txn_rollback(db_txn_t *txn);
+
 // Returns a mem_alloc'd escaped string (caller frees), or NULL on failure.
 char *db_escape(const char *input);
 
@@ -196,13 +268,25 @@ static bool               db_ready = false;
 static uint64_t           db_stat_queries = 0;
 static uint64_t           db_stat_errors  = 0;
 
-// Passed through task system.
+// Passed through task system. `params` is NULL on the plain path; on
+// the bound path it holds n_params deep copies, any of which may be
+// NULL for SQL NULL.
 typedef struct
 {
-  char    *sql;
-  db_cb_t  cb;
-  void    *data;
+  char     *sql;
+  char    **params;
+  uint16_t  n_params;
+  db_cb_t   cb;
+  void     *data;
 } db_async_ctx_t;
+
+// A pinned connection plus the one thing COMMIT cannot be trusted to
+// report: whether a statement on it already failed.
+struct db_txn
+{
+  db_conn_t *conn;      // locked and ACTIVE for the life of the handle
+  bool       failed;
+};
 
 #endif // DB_INTERNAL
 

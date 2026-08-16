@@ -42,6 +42,17 @@ test_irc_parse = executable('test_irc_parse',
   dependencies : core_deps,
 )
 
+# The DB facade decides things no engine ever sees — which statement it
+# declined to send, which verb it sent instead. This suite drives it
+# through a driver that runs no SQL and only records, so those decisions
+# are what the cases read. No database is involved.
+test_db_txn = executable('test_db_txn',
+  'test_db_txn.c',
+  include_directories : [include_directories('.'), inc_include],
+  link_with : [test_harness, libcore],
+  dependencies : core_deps,
+)
+
 # The FACT-1 ladder is SQL, so its suite drives psql against the
 # configured database inside a rolled-back transaction, and SKIPs when
 # that database is unreachable. It needs no core symbols — only the
@@ -57,4 +68,5 @@ test('util', test_util)
 test('colors', test_colors)
 test('json', test_json)
 test('irc_parse', test_irc_parse)
+test('db_txn', test_db_txn)
 test('fact_merge', test_fact_merge)
