@@ -1532,8 +1532,12 @@ irc_handle_line(irc_state_t *st, const char *line)
   irc_parsed_msg_t p;
   size_t i;
 
-  irc_parse_line(line, &p);
   clam(CLAM_DEBUG3, "irc", "<< %s", line);
+
+  // A line the parser refused was not the line the server sent; the
+  // parser has already said which field did not fit.
+  if(irc_parse_line(line, &p) != SUCCESS)
+    return;
 
   for(i = 0; irc_cmd_table[i].cmd != NULL; i++)
   {

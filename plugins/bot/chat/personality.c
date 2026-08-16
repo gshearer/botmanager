@@ -331,8 +331,17 @@ chatbot_personality_free(chatbot_personality_t *p)
   if(p == NULL)
     return;
 
-  if(p->body != NULL)           { mem_free(p->body);           p->body           = NULL; }
-  if(p->interests_json != NULL) { mem_free(p->interests_json); p->interests_json = NULL; }
+  if(p->body != NULL)
+  {
+    mem_free(p->body);
+    p->body = NULL;
+  }
+
+  if(p->interests_json != NULL)
+  {
+    mem_free(p->interests_json);
+    p->interests_json = NULL;
+  }
 }
 
 // Frontmatter shape:

@@ -2025,6 +2025,19 @@ cmd_builtin_help(const cmd_ctx_t *ctx)
       rest++;
   }
 
+  // The listings omit a command the caller may not run; the detail view
+  // must answer the same way, or /help <cmd> reports the existence,
+  // usage and subcommand tree of everything it hides. Unknown and
+  // forbidden read alike on purpose.
+  if(!help_check_access(ctx, d))
+  {
+    char buf[CMD_NAME_SZ + 32];
+    pthread_mutex_unlock(&cmd_mutex);
+    snprintf(buf, sizeof(buf), "unknown command: %s", args);
+    cmd_reply(ctx, buf);
+    return;
+  }
+
   // If the command has a help extender, delegate to it. This handles
   // both trailing tokens (e.g. /help show bot pacman llm personas)
   // and bare invocations (e.g. /help show bot) where the extender

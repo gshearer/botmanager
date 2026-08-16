@@ -11,16 +11,20 @@
 #define IRC_LINE_SZ     512
 #define IRC_NICK_SZ     32
 #define IRC_HOST_SZ     256
-#define IRC_PREFIX_SZ   256
 
 // "user@host" — the two halves of a prefix that survive a nick change,
 // and the only thing an MFA pattern is matched against beyond the nick.
 #define IRC_USERHOST_SZ (IRC_NICK_SZ + IRC_HOST_SZ + 2)
 
-// "nick!user@host" — an MFA pattern rebuilt from the parsed parts. Sized
-// from those parts rather than from IRC_PREFIX_SZ, which is the size of
-// the *received* prefix and is smaller than the three fields it feeds.
+// "nick!user@host" — an MFA pattern rebuilt from the parsed parts.
 #define IRC_MFA_SZ      (IRC_NICK_SZ + IRC_USERHOST_SZ + 1)
+
+// The *received* prefix, sized from the three fields it feeds so that
+// nothing a peer can legally send is shortened on the way in: the parsed
+// host reaches bot_identity_resolve() and userns_mfa_match(), and a
+// silently rewritten one is an authority decision made on bytes nobody
+// sent. A prefix that overflows even this is refused, not clamped.
+#define IRC_PREFIX_SZ   IRC_MFA_SZ
 
 // Sanitised KICK/KILL reason. Short enough that the command envelope
 // (verb, channel, target) always fits inside IRC_LINE_SZ.
@@ -233,9 +237,14 @@ bool irc_send_raw(irc_state_t *st, const char *fmt, ...)
     __attribute__((format(printf, 2, 3)));
 void irc_register_commands(void);
 
-// Protocol helpers (defined in irc_protocol.c).
-void irc_parse_prefix(const char *prefix, char *nick, char *user, char *host);
-void irc_parse_line(const char *line, irc_parsed_msg_t *out);
+// Line parsing (irc_parse.c); the formatters below are irc_protocol.c.
+// Both refuse rather than shorten anything an identity is resolved
+// from: FAIL means the prefix, or the nick/user/host of a user prefix,
+// did not fit, and the line is not the one the peer sent. A server-name
+// prefix, over-long params and over-long trailing text are truncated
+// and logged instead — they carry a message, not an identity.
+bool irc_parse_prefix(const char *prefix, char *nick, char *user, char *host);
+bool irc_parse_line(const char *line, irc_parsed_msg_t *out);
 bool irc_send_privmsg(irc_state_t *st, const char *target, const char *text);
 void irc_send_registration(irc_state_t *st);
 void irc_expand_vars(const char *tmpl, char *out, size_t out_sz,

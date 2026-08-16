@@ -68,6 +68,69 @@ json_escape(const char *in, char *out, size_t out_cap)
   return(w);
 }
 
+// Read the four hex digits of a \uXXXX escape at `p`. False means the
+// escape is malformed and its bytes are not ours to consume.
+static bool
+json_hex4(const char *p, unsigned int *out)
+{
+  unsigned int cp = 0;
+
+  for(int k = 0; k < 4; k++)
+  {
+    char h = p[k];
+
+    cp <<= 4;
+
+    if(h >= '0' && h <= '9')      cp |= (unsigned int)(h - '0');
+    else if(h >= 'a' && h <= 'f') cp |= (unsigned int)(h - 'a' + 10);
+    else if(h >= 'A' && h <= 'F') cp |= (unsigned int)(h - 'A' + 10);
+    else                          return(false);
+  }
+
+  *out = cp;
+  return(true);
+}
+
+// Emit one code point as UTF-8 and return the bytes written. Three
+// values cannot survive the C string this builds and become U+FFFD
+// instead: U+0000 would truncate it, and a lone surrogate or an
+// out-of-range value would make it invalid UTF-8 for everything
+// downstream. Never writes more bytes than the escape it came from
+// occupied, which is what keeps json_unescape's `len + 1` promise.
+static size_t
+json_emit_utf8(char *out, unsigned int cp)
+{
+  if(cp == 0 || (cp >= 0xD800 && cp <= 0xDFFF) || cp > 0x10FFFF)
+    cp = 0xFFFD;
+
+  if(cp < 0x80)
+  {
+    out[0] = (char)cp;
+    return(1);
+  }
+
+  if(cp < 0x800)
+  {
+    out[0] = (char)(0xC0 | (cp >> 6));
+    out[1] = (char)(0x80 | (cp & 0x3F));
+    return(2);
+  }
+
+  if(cp < 0x10000)
+  {
+    out[0] = (char)(0xE0 | (cp >> 12));
+    out[1] = (char)(0x80 | ((cp >> 6) & 0x3F));
+    out[2] = (char)(0x80 | (cp & 0x3F));
+    return(3);
+  }
+
+  out[0] = (char)(0xF0 | (cp >> 18));
+  out[1] = (char)(0x80 | ((cp >> 12) & 0x3F));
+  out[2] = (char)(0x80 | ((cp >> 6) & 0x3F));
+  out[3] = (char)(0x80 | (cp & 0x3F));
+  return(4);
+}
+
 size_t
 json_unescape(const char *in, size_t len, char *out)
 {
@@ -97,36 +160,39 @@ json_unescape(const char *in, size_t len, char *out)
       case 'r':  out[w++] = '\r'; break;
       case 't':  out[w++] = '\t'; break;
       case 'u':
-        if(i + 4 < len)
+      {
+        unsigned int cp;
+        unsigned int lo;
+        size_t       next;
+
+        // Malformed or cut short: pass the two bytes we hold through
+        // unchanged rather than inventing a code point for them. The
+        // digits that follow are copied by the ordinary path.
+        if(i + 4 >= len || !json_hex4(in + i + 1, &cp))
         {
-          unsigned int cp = 0;
-          for(int k = 0; k < 4; k++)
-          {
-            char h = in[i + 1 + k];
-            cp <<= 4;
-            if(h >= '0' && h <= '9')      cp |= (unsigned int)(h - '0');
-            else if(h >= 'a' && h <= 'f') cp |= (unsigned int)(h - 'a' + 10);
-            else if(h >= 'A' && h <= 'F') cp |= (unsigned int)(h - 'A' + 10);
-          }
-          i += 4;
-
-          // Minimal UTF-8 emit (no surrogate pair handling).
-          if(cp < 0x80)
-            out[w++] = (char)cp;
-          else if(cp < 0x800)
-          {
-            out[w++] = (char)(0xC0 | (cp >> 6));
-            out[w++] = (char)(0x80 | (cp & 0x3F));
-          }
-
-          else
-          {
-            out[w++] = (char)(0xE0 | (cp >> 12));
-            out[w++] = (char)(0x80 | ((cp >> 6) & 0x3F));
-            out[w++] = (char)(0x80 | (cp & 0x3F));
-          }
+          out[w++] = '\\';
+          out[w++] = 'u';
+          break;
         }
+
+        i += 4;
+        next = i + 1;
+
+        // A non-BMP code point arrives as a surrogate pair and is one
+        // character; decoding the halves separately is the CESU-8 that
+        // turns every emoji downstream into mojibake.
+        if(cp >= 0xD800 && cp <= 0xDBFF && next + 5 < len
+            && in[next] == '\\' && in[next + 1] == 'u'
+            && json_hex4(in + next + 2, &lo)
+            && lo >= 0xDC00 && lo <= 0xDFFF)
+        {
+          cp = 0x10000 + ((cp - 0xD800) << 10) + (lo - 0xDC00);
+          i = next + 5;
+        }
+
+        w += json_emit_utf8(out + w, cp);
         break;
+      }
       default:
         out[w++] = n;
         break;

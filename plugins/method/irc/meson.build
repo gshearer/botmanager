@@ -1,6 +1,7 @@
 irc_plugin = shared_library('irc',
   'irc.c',
   'irc_channel.c',
+  'irc_parse.c',
   'irc_protocol.c',
   'irc_commands.c',
   'irc_identity.c',

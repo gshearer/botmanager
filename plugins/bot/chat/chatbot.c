@@ -2239,7 +2239,12 @@ chatbot_coalesce_enqueue(chatbot_state_t *st, const method_msg_t *msg,
   llen = strlen(line);
   room = (s->text_len < sizeof(s->text))
       ? (sizeof(s->text) - 1 - s->text_len) : 0;
-  if(llen > room) { llen = room; s->truncated = true; }
+  if(llen > room)
+  {
+    llen = room;
+    s->truncated = true;
+  }
+
   memcpy(s->text + s->text_len, line, llen);
   s->text_len += llen;
   s->text[s->text_len] = '\0';

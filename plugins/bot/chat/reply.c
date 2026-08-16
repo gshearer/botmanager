@@ -1392,7 +1392,12 @@ anti_repeat_jaccard_pct(const char *a, const char *b)
   i = 0, j = 0, inter = 0;
   while(i < na_n && j < nb_n)
   {
-    if(tga[i] == tgb[j]) { inter++; i++; j++; }
+    if(tga[i] == tgb[j])
+    {
+      inter++;
+      i++;
+      j++;
+    }
 
     else if(tga[i] < tgb[j]) i++;
     else j++;
@@ -2793,7 +2798,11 @@ knowledge_merge_images(const knowledge_image_t *rag_img, size_t rag_n,
 
       for(size_t j = 0; j < ni; j++)
       {
-        if(images[j].id == arr[i].id) { dup = true; break; }
+        if(images[j].id == arr[i].id)
+        {
+          dup = true;
+          break;
+        }
       }
 
       if(dup) continue;

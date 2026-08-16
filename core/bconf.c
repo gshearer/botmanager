@@ -3,35 +3,40 @@
 #define BCONF_INTERNAL
 #include "bconf.h"
 
-static void
+// argv and the environment are outside bytes: a path that does not fit
+// names a different file, so a truncated one is refused rather than
+// opened. FAIL leaves `out` unusable.
+static bool
 resolve_path(const char *path, char *out, size_t out_sz)
 {
   const char *base;
   const char *home;
+  int         n;
 
   if(path != NULL)
-  {
-    strlcpy(out, path, out_sz);
-    return;
-  }
+    return(strlcpy(out, path, out_sz) < out_sz ? SUCCESS : FAIL);
 
   base = getenv("XDG_CONFIG_HOME");
 
   if(base != NULL && base[0] != '\0')
-    snprintf(out, out_sz, "%s/botmanager/botman.conf", base);
+    n = snprintf(out, out_sz, "%s/botmanager/botman.conf", base);
 
   else
   {
     home = getenv("HOME");
 
     if(home != NULL && home[0] != '\0')
-      snprintf(out, out_sz, "%s/.config/botmanager/botman.conf", home);
+      n = snprintf(out, out_sz, "%s/.config/botmanager/botman.conf", home);
 
     else
-      snprintf(out, out_sz, ".config/botmanager/botman.conf");
+      n = snprintf(out, out_sz, ".config/botmanager/botman.conf");
   }
+
+  return(n > 0 && (size_t)n < out_sz ? SUCCESS : FAIL);
 }
 
+// Both strings arrive already bounded — parse_line refuses a key or a
+// value that does not fit — so neither copy below can truncate.
 static void
 store(const char *key, const char *val)
 {
@@ -125,8 +130,15 @@ parse_line(const char *line, uint32_t linenum)
 
   vlen = (size_t)(vend - vstart);
 
+  // A shortened value is a different setting — a database URL missing
+  // its tail, a key missing its last characters — and every consumer
+  // downstream would treat it as what the operator wrote.
   if(vlen >= BCONF_VAL_SZ)
-    vlen = BCONF_VAL_SZ - 1;
+  {
+    clam(CLAM_WARN, "bconf", "line %u: value for '%s' exceeds %d bytes, "
+        "ignoring", linenum, key, BCONF_VAL_SZ - 1);
+    return(false);
+  }
 
   memcpy(val, vstart, vlen);
   val[vlen] = '\0';
@@ -146,10 +158,15 @@ bconf_init(const char *path)
   uint32_t linenum = 0;
   uint32_t parsed  = 0;
 
-  resolve_path(path, filepath, sizeof(filepath));
-
   entries = mem_alloc("bconf", "entries", sizeof(bconf_entry_t) * BCONF_MAX);
   entry_count = 0;
+
+  if(resolve_path(path, filepath, sizeof(filepath)) != SUCCESS)
+  {
+    clam(CLAM_WARN, "bconf_init", "config path exceeds %d bytes", PATH_MAX - 1);
+    bconf_ready = true;
+    return(FAIL);
+  }
 
   fp = fopen(filepath, "r");
 

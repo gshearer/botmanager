@@ -31,8 +31,14 @@
 size_t json_escape(const char *in, char *out, size_t out_cap);
 
 // Unescape a JSON-quoted string body (the bytes between the quotes) of
-// length `len` into `out`. `out` must be at least `len + 1` bytes.
-// Handles \" \\ \/ \b \f \n \r \t and \uXXXX BMP codepoints.
+// length `len` into `out`. `out` must be at least `len + 1` bytes; no
+// escape ever decodes to more bytes than it occupied. Handles \" \\ \/
+// \b \f \n \r \t and \uXXXX, surrogate pairs included.
+//
+// The result is a C string, so three inputs cannot be reproduced
+// faithfully and become U+FFFD: a NUL escape, an unpaired surrogate,
+// and a value past U+10FFFF. A \u escape that is malformed or cut
+// short is not decoded at all — its bytes pass through as written.
 size_t json_unescape(const char *in, size_t len, char *out);
 
 // Declarative extraction:

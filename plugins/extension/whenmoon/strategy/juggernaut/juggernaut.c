@@ -1,5 +1,5 @@
-// botmanager -- MIT
-// juggernaut -- ADX trend-strength-gated momentum rider (4h decision grain).
+// botmanager — MIT
+// juggernaut — ADX trend-strength-gated momentum rider (4h decision grain).
 //
 // cp1/cp2/surf all gate entries on trend DIRECTION (a regime MA, a MACD/EMA/
 // RSI cross). None of them ask whether the trend has any STRENGTH behind it,
