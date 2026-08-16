@@ -147,14 +147,17 @@ typedef struct
   char             last_err[128];
 } kr_ws_slot_t;
 
-// Req-id correlator. Each outbound subscribe carries a fresh req_id; the
-// slot index is parked in the ring. Acks route back via kr_ws_corr_pop.
-// Stale entries are overwritten as the ring wraps; 256 slots covers every
-// realistic burst.
+// Req-id correlator. Each outbound frame carries a fresh req_id and
+// parks the slot's IDENTITY — never its index: an index is only true
+// for as long as the hold that read it, and the ack it answers arrives
+// a round trip later, by which time a compact may have moved another
+// slot into that position (OBS-5). Stale entries are overwritten as the
+// ring wraps; 256 slots covers every realistic burst.
 typedef struct
 {
-  uint32_t req_id;     // 0 = empty
-  int32_t  slot_idx;   // -1 = none
+  uint32_t         req_id;                              // 0 = empty
+  kr_ws_channel_t  channel;
+  char             symbol_ws[EXCHANGE_PRODUCT_ID_SZ];
 } kr_ws_corr_entry_t;
 
 static struct
@@ -223,7 +226,12 @@ kr_ws_slot_alloc_locked(kr_ws_channel_t ch, const char *symbol_ws)
 }
 
 // Drop slots whose refcount hit zero after an unsubscribe emission.
-// Swap-with-last is safe because no external index escapes this module.
+// Swap-with-last reshuffles the table, which is safe because nothing
+// outside this hold remembers a position: the correlator ring parks
+// (channel, symbol_ws) and a req_id, and reconcile re-derives every
+// slot by that identity before writing it (OBS-5). Both sides have to
+// stay true together — store an index anywhere and this becomes a
+// silent write to the wrong subscription.
 static void
 kr_ws_slots_compact_locked(void)
 {
@@ -244,13 +252,14 @@ kr_ws_slots_compact_locked(void)
 // Req-id correlator                                                   //
 // ------------------------------------------------------------------ //
 
-// Allocate a new req_id and park (req_id → slot_idx) in the ring. Older
-// entries at the same ring index are evicted silently. Caller holds mu.
+// Allocate a new req_id and park (req_id → slot identity) in the ring.
+// Older entries at the same ring index are evicted silently. Caller
+// holds mu.
 static uint32_t
-kr_ws_corr_push_locked(int32_t slot_idx)
+kr_ws_corr_push_locked(kr_ws_channel_t ch, const char *symbol_ws)
 {
-  uint32_t rid;
-  uint32_t idx;
+  kr_ws_corr_entry_t *ent;
+  uint32_t            rid;
 
   for(;;)
   {
@@ -261,34 +270,38 @@ kr_ws_corr_push_locked(int32_t slot_idx)
       break;
   }
 
-  idx = rid % KR_WS_CH_REQ_RING_SIZE;
+  ent = &kr_ws_ch.corr_ring[rid % KR_WS_CH_REQ_RING_SIZE];
 
-  kr_ws_ch.corr_ring[idx].req_id   = rid;
-  kr_ws_ch.corr_ring[idx].slot_idx = slot_idx;
+  ent->req_id  = rid;
+  ent->channel = ch;
+
+  strlcpy(ent->symbol_ws, (symbol_ws != NULL) ? symbol_ws : "",
+      sizeof(ent->symbol_ws));
 
   return(rid);
 }
 
-static int32_t
+// Returns the parked entry by value; a `.req_id` of 0 is a miss, which
+// is the sentinel the ring already reserves for an empty entry.
+static kr_ws_corr_entry_t
 kr_ws_corr_pop_locked(uint32_t req_id)
 {
-  uint32_t idx;
-  int32_t  slot_idx;
+  kr_ws_corr_entry_t ent = {0};
+  uint32_t           idx;
 
   if(req_id == 0)
-    return(-1);
+    return(ent);
 
   idx = req_id % KR_WS_CH_REQ_RING_SIZE;
 
   if(kr_ws_ch.corr_ring[idx].req_id != req_id)
-    return(-1);
+    return(ent);
 
-  slot_idx = kr_ws_ch.corr_ring[idx].slot_idx;
+  ent = kr_ws_ch.corr_ring[idx];
 
-  kr_ws_ch.corr_ring[idx].req_id   = 0;
-  kr_ws_ch.corr_ring[idx].slot_idx = -1;
+  kr_ws_ch.corr_ring[idx].req_id = 0;
 
-  return(slot_idx);
+  return(ent);
 }
 
 // ------------------------------------------------------------------ //
@@ -372,17 +385,18 @@ kr_ws_render_frame(char *out, size_t cap, const char *op,
   return(pos);
 }
 
-// Emit `op` for a single slot. Lock held by caller; caller releases
-// before calling this so kr_ws_send_text doesn't invert lock order.
+// Emit `op` for one (channel, symbol) pair. Takes the identity rather
+// than a slot pointer: mu is released around this call, so a pointer
+// into the slot table would not survive it.
 static bool
-kr_ws_emit_one(const char *op, kr_ws_slot_t *snap_slot,
+kr_ws_emit_one(const char *op, kr_ws_channel_t ch, const char *symbol_ws,
     uint32_t req_id, const char *token)
 {
   char    frame[KR_WS_TX_BUF_SZ];
   size_t  len;
 
-  len = kr_ws_render_frame(frame, sizeof(frame), op, snap_slot->channel,
-      snap_slot->symbol_ws, req_id, token);
+  len = kr_ws_render_frame(frame, sizeof(frame), op, ch, symbol_ws,
+      req_id, token);
 
   if(len == 0)
     return(FAIL);
@@ -393,9 +407,19 @@ kr_ws_emit_one(const char *op, kr_ws_slot_t *snap_slot,
 // ------------------------------------------------------------------ //
 // Reconcile: emit subscribe / unsubscribe frames for pending deltas.  //
 //                                                                      //
-// Walks the slot table; for each slot in the requested transition,    //
-// allocates a req_id, releases mu, fires kr_ws_send_text, retakes mu. //
-// Mu must be held by caller; this function temporarily releases it.   //
+// Three phases, because the transport cannot be driven under mu and a  //
+// slot index cannot survive letting go of it (OBS-5):                  //
+//                                                                      //
+//   1. one coherent scan under the caller's hold, collecting the       //
+//      identity + req_id of every slot in the requested transition,    //
+//   2. the whole batch emitted with mu released exactly once,          //
+//   3. post-emit state applied by re-deriving each slot from its       //
+//      identity, guarded by the req_id it was minted for.              //
+//                                                                      //
+// The scan being one hold is what makes the walk itself safe: a        //
+// compaction can no longer move an unvisited slot below the cursor.    //
+// Mu must be held by caller; this function releases it once, in the    //
+// middle, and returns holding it.                                      //
 // ------------------------------------------------------------------ //
 
 typedef enum
@@ -404,16 +428,32 @@ typedef enum
   KR_RECONCILE_UNSUB   // emit unsubscribe for slots refcount==0
 } kr_reconcile_op_t;
 
+// One pending emission. Carries the slot's identity rather than its
+// position, so phase 3 can find the slot again whatever the table did
+// while the frame was in flight.
+typedef struct
+{
+  kr_ws_channel_t  channel;
+  char             symbol_ws[EXCHANGE_PRODUCT_ID_SZ];
+  uint32_t         rid;
+  bool             rc;                     // kr_ws_emit_one's verdict
+} kr_ws_emit_item_t;
+
 static void
 kr_ws_reconcile_locked(kr_reconcile_op_t op, const char *token)
 {
-  kr_ws_slot_t  snap;
-  uint32_t      i;
-  uint32_t      rid;
-  bool          want;
-  bool          ok;
-  const char   *opname = (op == KR_RECONCILE_SUB ? "subscribe" : "unsubscribe");
+  // ~4.5 KB of frame. Reconcile runs on subscribe, unsubscribe and
+  // reconnect — never per message — and the table it mirrors is a
+  // fixed 128 slots.
+  kr_ws_emit_item_t  items[KR_WS_CH_MAX_SLOTS];
+  uint32_t           n_items = 0;
+  uint32_t           i;
+  uint32_t           k;
+  bool               want;
+  const char        *opname = (op == KR_RECONCILE_SUB ? "subscribe"
+                                                      : "unsubscribe");
 
+  // Phase 1 — collect under the caller's hold.
   for(i = 0; i < kr_ws_ch.n_slots; i++)
   {
     kr_ws_slot_t *s = &kr_ws_ch.slots[i];
@@ -443,39 +483,71 @@ kr_ws_reconcile_locked(kr_reconcile_op_t op, const char *token)
         && (token == NULL || token[0] == '\0'))
       continue;
 
-    rid = kr_ws_corr_push_locked((int32_t)i);
+    items[n_items].rid     = kr_ws_corr_push_locked(s->channel,
+        s->symbol_ws);
+    items[n_items].channel = s->channel;
+    items[n_items].rc      = FAIL;
+
+    strlcpy(items[n_items].symbol_ws, s->symbol_ws,
+        sizeof(items[n_items].symbol_ws));
 
     if(op == KR_RECONCILE_SUB)
     {
-      s->req_id = rid;
+      s->req_id = items[n_items].rid;
       s->state  = KR_SUB_SUBSCRIBING;
     }
 
-    snap = *s;
+    n_items++;
+  }
 
-    pthread_mutex_unlock(&kr_ws_ch.mu);
-    ok = kr_ws_emit_one(opname, &snap, rid, token);
-    pthread_mutex_lock(&kr_ws_ch.mu);
+  if(n_items == 0)
+    return;
 
-    if(i >= kr_ws_ch.n_slots)   // slot table mutated under us — restart
-    {
-      i = (uint32_t)-1;
-      continue;
-    }
+  // Phase 2 — emit with mu released. Frames render from the snapshots
+  // above and touch no shared state, so the log lines belong here too.
+  pthread_mutex_unlock(&kr_ws_ch.mu);
 
-    s = &kr_ws_ch.slots[i];
+  for(k = 0; k < n_items; k++)
+  {
+    items[k].rc = kr_ws_emit_one(opname, items[k].channel,
+        items[k].symbol_ws, items[k].rid, token);
 
-    // SUCCESS=false / FAIL=true convention: a raw `!ok` test inverts
+    // SUCCESS=false / FAIL=true convention: a raw `!rc` test inverts
     // the meaning of the return value. Compare against SUCCESS so the
     // deferred-send branch only fires on actual transport failure.
-    if(ok != SUCCESS)
-    {
+    if(items[k].rc != SUCCESS)
       clam(CLAM_DEBUG, KR_CTX,
           "ws %s ch=%s sym=%s deferred (send failed; retry on next "
           "open)",
-          opname, kr_ws_channel_name(snap.channel), snap.symbol_ws);
+          opname, kr_ws_channel_name(items[k].channel),
+          items[k].symbol_ws);
+    else
+      clam(CLAM_INFO, KR_CTX,
+          "ws %s ch=%s sym=%s req_id=%u",
+          opname, kr_ws_channel_name(items[k].channel),
+          items[k].symbol_ws, items[k].rid);
+  }
 
-      if(op == KR_RECONCILE_SUB)
+  pthread_mutex_lock(&kr_ws_ch.mu);
+
+  // Phase 3 — apply by identity. A slot that went away owes nothing;
+  // one that has since been re-emitted holds a newer req_id and must
+  // not be stomped by this pass's verdict.
+  for(k = 0; k < n_items; k++)
+  {
+    kr_ws_slot_t *s;
+    int32_t       idx;
+
+    idx = kr_ws_slot_find_locked(items[k].channel, items[k].symbol_ws);
+
+    if(idx < 0)
+      continue;
+
+    s = &kr_ws_ch.slots[idx];
+
+    if(items[k].rc != SUCCESS)
+    {
+      if(op == KR_RECONCILE_SUB && s->req_id == items[k].rid)
       {
         s->state  = KR_SUB_IDLE;
         s->req_id = 0;
@@ -483,10 +555,6 @@ kr_ws_reconcile_locked(kr_reconcile_op_t op, const char *token)
 
       continue;
     }
-
-    clam(CLAM_INFO, KR_CTX,
-        "ws %s ch=%s sym=%s req_id=%u",
-        opname, kr_ws_channel_name(snap.channel), snap.symbol_ws, rid);
 
     if(op == KR_RECONCILE_UNSUB)
     {
@@ -1019,13 +1087,21 @@ kr_ws_dispatch_balances_row(struct json_object *row,
 //    "success":true,"req_id":N}
 // or:
 //   {"method":"subscribe","success":false,"error":"...","req_id":N}
+//
+// Subscribe and unsubscribe acks arrive on the same shape and route
+// here alike, and the ack lands a round trip after the frame that
+// earned it. The correlator names the slot by identity and the req_id
+// guard below decides whether this ack is still the one that slot is
+// waiting on — without it an unsubscribe ack forges ACTIVE onto
+// whatever the table has since put in the emitter's place (OBS-5).
 static void
 kr_ws_handle_ack_locked(struct json_object *root)
 {
-  bool      success = false;
-  int32_t   req_id  = 0;
-  int32_t   slot_idx;
-  char      err_str[128] = {0};
+  kr_ws_corr_entry_t ent;
+  bool               success = false;
+  int32_t            req_id  = 0;
+  int32_t            slot_idx;
+  char               err_str[128] = {0};
 
   json_get_bool (root, "success", &success);
   json_get_int  (root, "req_id",  &req_id);
@@ -1034,15 +1110,38 @@ kr_ws_handle_ack_locked(struct json_object *root)
   if(req_id == 0)
     return;
 
-  slot_idx = kr_ws_corr_pop_locked((uint32_t)req_id);
+  ent = kr_ws_corr_pop_locked((uint32_t)req_id);
 
-  if(slot_idx < 0 || (uint32_t)slot_idx >= kr_ws_ch.n_slots)
+  if(ent.req_id == 0)
   {
     clam(CLAM_DEBUG, KR_CTX, "ws ack req_id=%d: no matching slot", req_id);
     return;
   }
 
+  slot_idx = kr_ws_slot_find_locked(ent.channel, ent.symbol_ws);
+
+  // The healthy outcome for every unsubscribe ack: kr_ws_unsubscribe
+  // emits and compacts under one hold, so the slot is always gone by
+  // the time its own ack arrives.
+  if(slot_idx < 0)
+  {
+    clam(CLAM_DEBUG, KR_CTX, "ws ack req_id=%d: slot ch=%s sym=%s gone",
+        req_id, kr_ws_channel_name(ent.channel), ent.symbol_ws);
+    return;
+  }
+
   kr_ws_slot_t *s = &kr_ws_ch.slots[slot_idx];
+
+  // Only the ack for the slot's LAST subscribe emission may write it.
+  // `req_id` is set on the subscribe side alone, so an unsubscribe ack
+  // and a superseded subscribe ack both fall out here.
+  if(s->req_id != (uint32_t)req_id)
+  {
+    clam(CLAM_DEBUG, KR_CTX,
+        "ws ack req_id=%d: stale/foreign (slot ch=%s sym=%s holds %u)",
+        req_id, kr_ws_channel_name(s->channel), s->symbol_ws, s->req_id);
+    return;
+  }
 
   if(success)
   {
@@ -1222,12 +1321,10 @@ kr_ws_channels_on_open(void)
       kr_ws_ch.slots[i].state = KR_SUB_IDLE;
   }
 
-  // Discard pending acks from the previous session.
+  // Discard pending acks from the previous session. Clearing the req_id
+  // empties the entry; the identity behind it is never read without one.
   for(uint32_t i = 0; i < KR_WS_CH_REQ_RING_SIZE; i++)
-  {
-    kr_ws_ch.corr_ring[i].req_id   = 0;
-    kr_ws_ch.corr_ring[i].slot_idx = -1;
-  }
+    kr_ws_ch.corr_ring[i].req_id = 0;
 
   need_token = kr_ws_has_private_pending_locked();
 
@@ -1629,8 +1726,8 @@ kr_ws_channels_init(void)
   pthread_cond_init(&kr_ws_ch.drain, NULL);
   atomic_store(&kr_ws_ch.next_req_id, 0u);
 
-  for(uint32_t i = 0; i < KR_WS_CH_REQ_RING_SIZE; i++)
-    kr_ws_ch.corr_ring[i].slot_idx = -1;
+  // The memset above is the ring's reset: a zero req_id is the empty
+  // entry, and nothing reads the identity beside it without one.
 
   kr_ws_ch.initialized = true;
 

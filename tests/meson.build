@@ -123,6 +123,24 @@ test_cmd_inflight = executable('test_cmd_inflight',
   dependencies : core_deps,
 )
 
+# The kraken WS multiplexer names a slot by its index in two places that
+# outlive the lock hold which made the index true — across the reconcile
+# emit window and across the ack round trip — while compaction reshuffles
+# by swap-with-last. Every wrong answer is silent: fanout reads the
+# subscriber list and never the slot table, so the damage lands on what
+# the next reconcile decides to emit — a feed that never subscribes, an
+# unsubscribe that never goes out. These cases drive the public surface
+# only; the send stub is the interleaving control point.
+test_kraken_ws_channels = executable('test_kraken_ws_channels',
+  'test_kraken_ws_channels.c',
+  '../plugins/service/kraken/kraken_ws_channels.c',
+  include_directories : [include_directories('.'), inc_include,
+                         include_directories('../plugins/service/kraken'),
+                         include_directories('../plugins/feature/exchange')],
+  link_with : [test_harness, libcore],
+  dependencies : core_deps,
+)
+
 test('util', test_util)
 test('colors', test_colors)
 test('json', test_json)
@@ -134,3 +152,4 @@ test('kv_bot', test_kv_bot)
 test('kv_str', test_kv_str)
 test('curl_submit_wait', test_curl_submit_wait)
 test('cmd_inflight', test_cmd_inflight)
+test('kraken_ws_channels', test_kraken_ws_channels)
