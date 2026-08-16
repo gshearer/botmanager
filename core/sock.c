@@ -274,6 +274,7 @@ sock_epoll_rearm(sock_worker_t *w, sock_session_t *s, bool want_out)
 {
   uint32_t events = EPOLLIN | EPOLLET;
   struct epoll_event ev;
+  int err = 0;
 
   if(want_out)
     events |= EPOLLOUT;
@@ -283,10 +284,20 @@ sock_epoll_rearm(sock_worker_t *w, sock_session_t *s, bool want_out)
 
   pthread_mutex_lock(&s->io_lock);
 
-  if(s->fd >= 0)
-    epoll_ctl(w->epoll_fd, EPOLL_CTL_MOD, s->fd, &ev);
+  if(s->fd >= 0 && epoll_ctl(w->epoll_fd, EPOLL_CTL_MOD, s->fd, &ev) != 0)
+    err = errno;
 
   pthread_mutex_unlock(&s->io_lock);
+
+  // A refused MOD leaves the interest set as it was, so the flag has to
+  // say what epoll believes, not what we asked for: claiming EPOLLOUT
+  // that never arrives stalls the send queue for the session's life.
+  if(err != 0)
+  {
+    clam(CLAM_WARN, "sock", "[%s] epoll rearm (out=%d) failed: %s",
+        s->name, (int)want_out, strerror(err));
+    return;
+  }
 
   s->epollout_armed = want_out;
 }
@@ -313,19 +324,40 @@ sock_pending_error(sock_session_t *s)
 // session's epoll worker. Events carry the session id, never its
 // address: a completed batch can name a session the owner has since
 // destroyed, and only an id survives that honestly.
-static void
+//
+// Returns false when epoll would not take the fd, having closed it and
+// left the session without one: a registration that failed is a socket
+// epoll will never speak for, and a session that believes it is armed
+// simply hangs. errno is the epoll_ctl failure, for the caller's event.
+static bool
 sock_adopt_fd(sock_session_t *s, int fd, uint32_t events)
 {
   sock_worker_t *w = &sock_workers[s->worker_id];
   struct epoll_event ev;
+  int err = 0;
 
   ev.events   = events;
   ev.data.u64 = s->id;
 
   pthread_mutex_lock(&s->io_lock);
-  s->fd = fd;
-  epoll_ctl(w->epoll_fd, EPOLL_CTL_ADD, fd, &ev);
+
+  if(epoll_ctl(w->epoll_fd, EPOLL_CTL_ADD, fd, &ev) != 0)
+    err = errno;
+  else
+    s->fd = fd;
+
   pthread_mutex_unlock(&s->io_lock);
+
+  if(err == 0)
+    return(true);
+
+  // Logged with the lock released — a clam destination may be an IRC
+  // bot, and that delivery comes back through this session's send path.
+  clam(CLAM_WARN, "sock", "[%s] epoll registration failed: %s",
+      s->name, strerror(err));
+  close(fd);
+  errno = err;
+  return(false);
 }
 
 // Set TCP keepalive on a connected socket.
@@ -472,19 +504,35 @@ sock_unix_connect_task(task_t *t)
   if(rc == 0)
   {
     // Immediate connect.
-    sock_adopt_fd(s, fd, EPOLLIN | EPOLLET);
-    s->state = SOCK_STATE_CONNECTED;
-    s->last_activity = time(NULL);
-    s->connected_at  = s->last_activity;
+    if(!sock_adopt_fd(s, fd, EPOLLIN | EPOLLET))
+    {
+      sock_deliver(s, SOCK_EVENT_ERROR, NULL, 0, errno);
+      s->state = SOCK_STATE_CLOSED;
+    }
 
-    sock_deliver(s, SOCK_EVENT_CONNECTED, NULL, 0, 0);
+    else
+    {
+      s->state = SOCK_STATE_CONNECTED;
+      s->last_activity = time(NULL);
+      s->connected_at  = s->last_activity;
+
+      sock_deliver(s, SOCK_EVENT_CONNECTED, NULL, 0, 0);
+    }
   }
 
   else if(errno == EINPROGRESS)
   {
-    sock_adopt_fd(s, fd, EPOLLOUT | EPOLLET);
-    s->state = SOCK_STATE_CONNECTING;
-    sock_wake_worker(s);
+    if(!sock_adopt_fd(s, fd, EPOLLOUT | EPOLLET))
+    {
+      sock_deliver(s, SOCK_EVENT_ERROR, NULL, 0, errno);
+      s->state = SOCK_STATE_CLOSED;
+    }
+
+    else
+    {
+      s->state = SOCK_STATE_CONNECTING;
+      sock_wake_worker(s);
+    }
   }
 
   else
@@ -601,7 +649,13 @@ sock_resolve_done(const resolve_result_t *result)
   if(rc == 0)
   {
     // Immediate connect.
-    sock_adopt_fd(s, fd, EPOLLIN | EPOLLET);
+    if(!sock_adopt_fd(s, fd, EPOLLIN | EPOLLET))
+    {
+      sock_deliver(s, SOCK_EVENT_ERROR, NULL, 0, errno);
+      s->state = SOCK_STATE_CLOSED;
+      sock_release(s);
+      return;
+    }
 
     if(s->tls_enabled)
     {
@@ -630,10 +684,15 @@ sock_resolve_done(const resolve_result_t *result)
     }
   }
 
+  else if(!sock_adopt_fd(s, fd, EPOLLOUT | EPOLLET))
+  {
+    sock_deliver(s, SOCK_EVENT_ERROR, NULL, 0, errno);
+    s->state = SOCK_STATE_CLOSED;
+  }
+
   else
   {
-    // EINPROGRESS — register for EPOLLOUT to detect completion.
-    sock_adopt_fd(s, fd, EPOLLOUT | EPOLLET);
+    // EINPROGRESS — registered for EPOLLOUT to detect completion.
     s->state = SOCK_STATE_CONNECTING;
     sock_wake_worker(s);
   }
@@ -942,7 +1001,21 @@ sock_epoll_task(task_t *t)
     // Session ids start at 1, so 0 unambiguously names the wake fd.
     wake_ev.events   = EPOLLIN;
     wake_ev.data.u64 = 0;
-    epoll_ctl(w->epoll_fd, EPOLL_CTL_ADD, w->wake_fd, &wake_ev);
+
+    // Without the wake fd the worker only ever notices work when its
+    // epoll_wait times out — a worker that cannot be woken is not a
+    // worker, so this fails the task rather than running degraded.
+    if(epoll_ctl(w->epoll_fd, EPOLL_CTL_ADD, w->wake_fd, &wake_ev) != 0)
+    {
+      clam(CLAM_FATAL, "sock", "epoll ADD wake_fd failed: %s",
+          strerror(errno));
+      close(w->wake_fd);
+      close(w->epoll_fd);
+      w->wake_fd  = -1;
+      w->epoll_fd = -1;
+      t->state = TASK_FATAL;
+      return;
+    }
   }
 
   clam(CLAM_INFO, "sock", "epoll worker %u started", w->id);

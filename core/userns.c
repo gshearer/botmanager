@@ -978,9 +978,13 @@ userns_user_lookup_ci(const userns_t *ns, const char *username,
   if(esc_user == NULL)
     return(false);
 
+  // Case-insensitive *equality*, never ILIKE: db_escape neutralizes
+  // quotes and nothing else, and '_' is a legal username byte — as a
+  // pattern it is a single-character wildcard, so "a_ice" would resolve
+  // to "alice" and hand back another user's canonical name.
   snprintf(sql, sizeof(sql),
       "SELECT username FROM userns_user WHERE ns_id = %u"
-      " AND username ILIKE '%s' LIMIT 1",
+      " AND LOWER(username) = LOWER('%s') LIMIT 1",
       ns->id, esc_user);
 
   mem_free(esc_user);

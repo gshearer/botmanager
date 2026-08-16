@@ -960,12 +960,16 @@ dossier_is_stopword(const char *tok, size_t len)
 
 // Extract the next alphanumeric token of length >= 3 into `out` (NUL
 // terminated). Returns a pointer to the position *after* the token in
-// `src`, or NULL when no more tokens are available.
+// `src`, or NULL when no more tokens are available. `out` is emptied
+// first: the caller reads it as the skip signal, and a token it does
+// not want must not leave the previous one standing there.
 static const char *
 dossier_next_token(const char *src, char *out, size_t out_sz)
 {
   size_t len;
   const char *start;
+
+  out[0] = '\0';
 
   // Skip to first alnum byte.
   while(*src != '\0' && !isalnum((unsigned char)*src)) src++;
@@ -975,11 +979,10 @@ dossier_next_token(const char *src, char *out, size_t out_sz)
   while(*src != '\0' && isalnum((unsigned char)*src)) src++;
 
   len = (size_t)(src - start);
-  if(len < 3 || len >= out_sz) {
-    // Too short or too long: skip and caller will call us again.
-    if(len >= out_sz) return(src);   // still advance past oversized token
+
+  // Too short or too long: skip it and let the caller ask again.
+  if(len < 3 || len >= out_sz)
     return(src);
-  }
 
   memcpy(out, start, len);
   out[len] = '\0';
@@ -1070,7 +1073,7 @@ dossier_find_mentions(uint32_t ns_id, const char *method_kind,
     if(t[0] == '\0') continue;   // too-short, try next
     if(dossier_is_stopword(t, strlen(t))) continue;
 
-    snprintf(tokbuf[n_tokens], sizeof(tokbuf[n_tokens]), "%s", t);
+    strlcpy(tokbuf[n_tokens], t, sizeof(tokbuf[n_tokens]));
     tokens[n_tokens] = tokbuf[n_tokens];
     n_tokens++;
   }

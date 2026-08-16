@@ -409,7 +409,11 @@ resolve_via_res_query(resolve_request_t *req, resolve_result_t *result)
         snprintf(rec->soa.rname, RESOLVE_NAME_SZ, "%s", dname);
         p += n;
 
-        if(p + 20 <= rdata + rdlen)
+        // Compare sizes, not pointers: dn_expand is bounded by the
+        // answer buffer, not by this record, so `p + 20` on a short
+        // rdata forms a pointer past one-past-the-end — undefined even
+        // uncomputed, and a certain UBSan report.
+        if(rdlen >= 20 && (size_t)(p - rdata) <= (size_t)rdlen - 20)
         {
           rec->soa.serial  = ntohl(*(const uint32_t *)(p));
           rec->soa.refresh = ntohl(*(const uint32_t *)(p + 4));
@@ -517,12 +521,22 @@ resolve_lookup(const char *name, resolve_type_t qtype,
   req->user_data = user_data;
   req->submitted = time(NULL);
 
+  // A refused submission is not a lookup: the pool is full and nothing
+  // will ever call back, so the request goes back on the freelist and
+  // the counters below never see it.
+  if(task_add("resolve", TASK_THREAD, 100, resolve_task, req) == NULL)
+  {
+    clam(CLAM_WARN, "resolve",
+        "task pool refused the lookup for '%s'", name);
+    resolve_req_release(req);
+    return(FAIL);
+  }
+
   // Counted at submission, so an in-flight lookup is already visible
   // in /show resolve; resolve_task() books any failure on completion.
   __atomic_fetch_add(&resolve_stat_queries, 1, __ATOMIC_RELAXED);
   __atomic_fetch_add(&resolve_stat_by_type[qtype], 1, __ATOMIC_RELAXED);
 
-  task_add("resolve", TASK_THREAD, 100, resolve_task, req);
   return(SUCCESS);
 }
 

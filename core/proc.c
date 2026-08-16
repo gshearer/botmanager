@@ -311,6 +311,7 @@ proc_spawn(const proc_spec_t *spec)
   proc_handle_t *h;
   int            pfd[2] = { -1, -1 };
   int            saved_errno;
+  int            rc;
   pid_t          pid;
 
   if(spec == NULL || spec->argv == NULL || spec->argv[0] == NULL
@@ -345,30 +346,34 @@ proc_spawn(const proc_spec_t *spec)
   h->user        = spec->user;
   h->timeout_sec = spec->timeout_sec;
 
-  if(pthread_mutex_init(&h->lock, NULL) != 0)
+  // pthread_* return their error code and leave errno untouched, so
+  // every one of them below reports the return value, never errno.
+  rc = pthread_mutex_init(&h->lock, NULL);
+
+  if(rc != 0)
   {
-    saved_errno = errno;
-    clam(CLAM_WARN, PROC_CTX, "mutex_init failed errno=%d (%s)",
-        saved_errno, strerror(saved_errno));
+    clam(CLAM_WARN, PROC_CTX, "mutex_init failed rc=%d (%s)",
+        rc, strerror(rc));
     mem_free(h->buf);
     mem_free(h);
     close(pfd[0]);
     close(pfd[1]);
-    errno = saved_errno;
+    errno = rc;
     return(NULL);
   }
 
-  if(pthread_cond_init(&h->wd_idle, NULL) != 0)
+  rc = pthread_cond_init(&h->wd_idle, NULL);
+
+  if(rc != 0)
   {
-    saved_errno = errno;
-    clam(CLAM_WARN, PROC_CTX, "cond_init failed errno=%d (%s)",
-        saved_errno, strerror(saved_errno));
+    clam(CLAM_WARN, PROC_CTX, "cond_init failed rc=%d (%s)",
+        rc, strerror(rc));
     pthread_mutex_destroy(&h->lock);
     mem_free(h->buf);
     mem_free(h);
     close(pfd[0]);
     close(pfd[1]);
-    errno = saved_errno;
+    errno = rc;
     return(NULL);
   }
 
@@ -422,11 +427,12 @@ proc_spawn(const proc_spec_t *spec)
   h->pid       = pid;
   h->stdout_fd = pfd[0];
 
-  if(pthread_create(&h->reader_tid, NULL, proc_reader, h) != 0)
+  rc = pthread_create(&h->reader_tid, NULL, proc_reader, h);
+
+  if(rc != 0)
   {
-    saved_errno = errno;
-    clam(CLAM_WARN, PROC_CTX, "reader pthread_create failed errno=%d (%s)",
-        saved_errno, strerror(saved_errno));
+    clam(CLAM_WARN, PROC_CTX, "reader pthread_create failed rc=%d (%s)",
+        rc, strerror(rc));
     // Child is already running; reap it after signalling so we don't
     // leak a zombie.
     kill(pid, SIGKILL);
@@ -436,15 +442,16 @@ proc_spawn(const proc_spec_t *spec)
     pthread_mutex_destroy(&h->lock);
     mem_free(h->buf);
     mem_free(h);
-    errno = saved_errno;
+    errno = rc;
     return(NULL);
   }
 
-  if(pthread_create(&h->waiter_tid, NULL, proc_waiter, h) != 0)
+  rc = pthread_create(&h->waiter_tid, NULL, proc_waiter, h);
+
+  if(rc != 0)
   {
-    saved_errno = errno;
-    clam(CLAM_WARN, PROC_CTX, "waiter pthread_create failed errno=%d (%s)",
-        saved_errno, strerror(saved_errno));
+    clam(CLAM_WARN, PROC_CTX, "waiter pthread_create failed rc=%d (%s)",
+        rc, strerror(rc));
     // Kill the child to force EOF on the read pipe so the reader
     // thread exits; then join it before tearing down the handle.
     kill(pid, SIGKILL);
@@ -454,7 +461,7 @@ proc_spawn(const proc_spec_t *spec)
     pthread_mutex_destroy(&h->lock);
     mem_free(h->buf);
     mem_free(h);
-    errno = saved_errno;
+    errno = rc;
     return(NULL);
   }
 

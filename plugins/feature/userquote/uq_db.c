@@ -270,11 +270,13 @@ uq_db_get(uint32_t ns_id, int64_t id, const char *sayer, uq_quote_t *out)
 
     // Case-insensitive search key, least-recently-viewed first — the
     // classic quotebot rotation so repeated recalls cycle the book.
+    // Equality, not ILIKE: '_' is a legal nick byte and as a pattern it
+    // matches any character, so one nick recalls another's quotes.
     snprintf(sql, sizeof(sql),
         "SELECT id, sayer, quoter, quote,"
         " to_char(created_at, 'YYYY-MM-DD HH24:MI'),"
         " to_char(lastview,   'YYYY-MM-DD HH24:MI')"
-        " FROM %s WHERE ns_id = %" PRIu32 " AND sayer ILIKE '%s'"
+        " FROM %s WHERE ns_id = %" PRIu32 " AND LOWER(sayer) = LOWER('%s')"
         " ORDER BY lastview ASC LIMIT 1",
         table, ns_id, e_sayer);
   }

@@ -96,7 +96,8 @@ admin_cmd_bot_add(const cmd_ctx_t *ctx)
   const plugin_desc_t *pd;
   const bot_driver_t *drv;
   bot_inst_t *inst;
-  char buf[BOT_NAME_SZ + PLUGIN_NAME_SZ + 32];
+  bool persisted = false;
+  char buf[BOT_NAME_SZ + PLUGIN_NAME_SZ + 64];
 
   if(bot_find(name) != NULL)
   {
@@ -140,12 +141,19 @@ admin_cmd_bot_add(const cmd_ctx_t *ctx)
     return;
   }
 
-  // Persist to database.
+  // Persist to database. db_escape returns NULL when the pool cannot
+  // hand out a connection, so the escapes are freed only where they
+  // exist — mem_free aborts on NULL — and the reply tells the operator
+  // when the bot lives in memory alone.
   {
     char *e_name = db_escape(name);
     char *e_kind = db_escape(kind);
 
-    if(e_name != NULL && e_kind != NULL)
+    if(e_name == NULL || e_kind == NULL)
+      clam(CLAM_WARN, "bot_add",
+          "escape failed, '%s' not persisted (database unavailable)", name);
+
+    else
     {
       char sql[512];
       db_result_t *r;
@@ -156,21 +164,28 @@ admin_cmd_bot_add(const cmd_ctx_t *ctx)
           e_name, e_kind);
 
       r = db_result_alloc();
+
       if(db_query(sql, r) != SUCCESS)
         clam(CLAM_WARN, "bot_add", "DB persist failed: %s", r->error);
+      else
+        persisted = true;
 
       db_result_free(r);
     }
 
-    mem_free(e_name);
-    mem_free(e_kind);
+    if(e_name != NULL)
+      mem_free(e_name);
+
+    if(e_kind != NULL)
+      mem_free(e_kind);
   }
 
   // Register per-instance KV keys declared by the bot driver
   // (e.g., chat's "behavior.personality" → "bot.<name>.behavior.personality").
   bot_register_driver_kv(name, kind);
 
-  snprintf(buf, sizeof(buf), "bot created: %s (kind: %s)", name, kind);
+  snprintf(buf, sizeof(buf), "bot created: %s (kind: %s)%s", name, kind,
+      persisted ? "" : " — NOT persisted, will not survive a restart");
   cmd_reply(ctx, buf);
 }
 
@@ -185,11 +200,18 @@ admin_cmd_bot_del(const cmd_ctx_t *ctx)
 
   if(bot_destroy(name) == SUCCESS)
   {
-    // Remove from database (CASCADE deletes bot_methods rows).
+    // Remove from database (CASCADE deletes bot_methods rows). A row
+    // left behind is resurrected by bot_restore on the next start, so
+    // a failed delete is worth saying out loud.
     char *e_name = db_escape(name);
-    char buf[BOT_NAME_SZ + 32];
+    bool  removed = false;
+    char  buf[BOT_NAME_SZ + 64];
 
-    if(e_name != NULL)
+    if(e_name == NULL)
+      clam(CLAM_WARN, "bot_del",
+          "escape failed, '%s' left in the database", name);
+
+    else
     {
       char sql[256];
       db_result_t *r;
@@ -198,14 +220,18 @@ admin_cmd_bot_del(const cmd_ctx_t *ctx)
           "DELETE FROM bot_instances WHERE name = '%s'", e_name);
 
       r = db_result_alloc();
+
       if(db_query(sql, r) != SUCCESS)
         clam(CLAM_WARN, "bot_del", "DB persist failed: %s", r->error);
+      else
+        removed = true;
 
       db_result_free(r);
       mem_free(e_name);
     }
 
-    snprintf(buf, sizeof(buf), "bot destroyed: %s", name);
+    snprintf(buf, sizeof(buf), "bot destroyed: %s%s", name,
+        removed ? "" : " — still in the database, it will return on restart");
     cmd_reply(ctx, buf);
   }
 
@@ -353,11 +379,17 @@ admin_cmd_bot_bind(const cmd_ctx_t *ctx)
   if(bot_bind_method(inst, inst_name, method_kind) == SUCCESS)
   {
     // Persist method binding.
-    char *e_bot = db_escape(botname);
+    char *e_bot  = db_escape(botname);
     char *e_kind = db_escape(method_kind);
-    char buf[256];
+    bool  persisted = false;
+    char  buf[256];
 
-    if(e_bot != NULL && e_kind != NULL)
+    if(e_bot == NULL || e_kind == NULL)
+      clam(CLAM_WARN, "bot_bind",
+          "escape failed, %s/%s not persisted (database unavailable)",
+          botname, method_kind);
+
+    else
     {
       char sql[512];
       db_result_t *r;
@@ -368,20 +400,27 @@ admin_cmd_bot_bind(const cmd_ctx_t *ctx)
           e_bot, e_kind);
 
       r = db_result_alloc();
+
       if(db_query(sql, r) != SUCCESS)
         clam(CLAM_WARN, "bot_bind", "DB persist failed: %s", r->error);
+      else
+        persisted = true;
 
       db_result_free(r);
     }
 
-    mem_free(e_bot);
-    mem_free(e_kind);
+    if(e_bot != NULL)
+      mem_free(e_bot);
+
+    if(e_kind != NULL)
+      mem_free(e_kind);
 
     // Register per-bot method KV keys (bot.<botname>.<kind>.*).
     bot_register_method_kv(botname, method_kind);
 
-    snprintf(buf, sizeof(buf), "%s: added method %s (instance: %s)",
-        botname, method_kind, inst_name);
+    snprintf(buf, sizeof(buf), "%s: added method %s (instance: %s)%s",
+        botname, method_kind, inst_name,
+        persisted ? "" : " — NOT persisted, will not survive a restart");
     cmd_reply(ctx, buf);
   }
 
@@ -414,12 +453,18 @@ admin_cmd_bot_unbind(const cmd_ctx_t *ctx)
 
   if(bot_unbind_method(inst, inst_name) == SUCCESS)
   {
-    // Remove method binding from database.
-    char *e_bot = db_escape(botname);
+    // Remove method binding from database. A surviving row is re-bound
+    // by bot_restore_methods on the next start.
+    char *e_bot  = db_escape(botname);
     char *e_kind = db_escape(method_kind);
-    char buf[128];
+    bool  removed = false;
+    char  buf[160];
 
-    if(e_bot != NULL && e_kind != NULL)
+    if(e_bot == NULL || e_kind == NULL)
+      clam(CLAM_WARN, "bot_unbind",
+          "escape failed, %s/%s left in the database", botname, method_kind);
+
+    else
     {
       char sql[512];
       db_result_t *r;
@@ -430,16 +475,24 @@ admin_cmd_bot_unbind(const cmd_ctx_t *ctx)
           e_bot, e_kind);
 
       r = db_result_alloc();
+
       if(db_query(sql, r) != SUCCESS)
         clam(CLAM_WARN, "bot_unbind", "DB persist failed: %s", r->error);
+      else
+        removed = true;
 
       db_result_free(r);
     }
 
-    mem_free(e_bot);
-    mem_free(e_kind);
+    if(e_bot != NULL)
+      mem_free(e_bot);
 
-    snprintf(buf, sizeof(buf), "%s: removed method %s", botname, method_kind);
+    if(e_kind != NULL)
+      mem_free(e_kind);
+
+    snprintf(buf, sizeof(buf), "%s: removed method %s%s",
+        botname, method_kind,
+        removed ? "" : " — still in the database, it will return on restart");
     cmd_reply(ctx, buf);
   }
 

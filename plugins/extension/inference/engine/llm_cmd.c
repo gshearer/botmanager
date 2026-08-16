@@ -137,6 +137,14 @@ llm_service_models_store(const char *service, struct json_object *root)
   n     = (int)json_object_array_length(data);
   e_svc = db_escape(service);
 
+  // db_escape returns NULL when the pool has no connection to escape
+  // against — the query would fail anyway, and mem_free aborts on NULL.
+  if(e_svc == NULL)
+  {
+    clam(CLAM_WARN, "llm", "refresh %s: database unavailable", service);
+    return(-1);
+  }
+
   snprintf(sql, sizeof(sql),
       "DELETE FROM llm_service_models WHERE service_name='%s'", e_svc);
   res = db_result_alloc();
@@ -168,6 +176,9 @@ llm_service_models_store(const char *service, struct json_object *root)
       continue;
 
     e_mid = db_escape(llm_model_id_canon(model_id));
+
+    if(e_mid == NULL)
+      continue;
 
     if(json_get_int64(item, "max_model_len", &max_len) && max_len > 0)
       snprintf(sql, sizeof(sql),
@@ -214,6 +225,10 @@ llm_service_set_probe_http(const char *name, long status)
   char         sql[256];
 
   e_name = db_escape(name);
+
+  if(e_name == NULL)
+    return;
+
   snprintf(sql, sizeof(sql),
       "UPDATE llm_services SET probe_http=%ld WHERE name='%s'",
       status, e_name);
@@ -498,6 +513,15 @@ llm_probe_embed_dim_done_cb(const curl_response_t *resp)
   }
 
   e_name = db_escape(pctx->name);
+
+  if(e_name == NULL)
+  {
+    clam(CLAM_WARN, "llm",
+        "probe %s: embed_dim not stored (database unavailable)", pctx->name);
+    mem_free(pctx);
+    return;
+  }
+
   snprintf(sql, sizeof(sql),
       "UPDATE llm_models SET embed_dim=%zu WHERE name='%s'", dim, e_name);
   mem_free(e_name);
@@ -656,10 +680,24 @@ cmd_llm_add_service(const cmd_ctx_t *ctx)
 
   e_name = db_escape(name);
   e_url  = db_escape(base_url);
+
+  if(e_name == NULL || e_url == NULL)
+  {
+    if(e_name != NULL)
+      mem_free(e_name);
+
+    if(e_url != NULL)
+      mem_free(e_url);
+
+    cmd_reply(ctx, "error: database unavailable");
+    return;
+  }
+
   snprintf(sql, sizeof(sql),
       "INSERT INTO llm_services (name, base_url) VALUES ('%s', '%s')",
       e_name, e_url);
-  mem_free(e_name); mem_free(e_url);
+  mem_free(e_name);
+  mem_free(e_url);
 
   res = db_result_alloc();
 
@@ -702,6 +740,12 @@ cmd_llm_del_service(const cmd_ctx_t *ctx)
 
   name   = ctx->parsed->argv[0];
   e_name = db_escape(name);
+
+  if(e_name == NULL)
+  {
+    cmd_reply(ctx, "error: database unavailable");
+    return;
+  }
 
   // Block deletion while any defined model still references the service.
   snprintf(sql, sizeof(sql),
@@ -830,6 +874,12 @@ cmd_llm_add_model(const cmd_ctx_t *ctx)
 
   e_svc = db_escape(service);
 
+  if(e_svc == NULL)
+  {
+    cmd_reply(ctx, "error: database unavailable");
+    return;
+  }
+
   // Service must exist.
   snprintf(sql, sizeof(sql),
       "SELECT 1 FROM llm_services WHERE name='%s'", e_svc);
@@ -850,6 +900,13 @@ cmd_llm_add_model(const cmd_ctx_t *ctx)
   e_mid    = db_escape(model_id);
   max_ctx  = llm_cfg.max_context_tokens;
   in_cache = false;
+
+  if(e_mid == NULL)
+  {
+    mem_free(e_svc);
+    cmd_reply(ctx, "error: database unavailable");
+    return;
+  }
 
   snprintf(sql, sizeof(sql),
       "SELECT max_model_len FROM llm_service_models "
@@ -898,12 +955,23 @@ cmd_llm_add_model(const cmd_ctx_t *ctx)
   }
 
   e_name = db_escape(name);
+
+  if(e_name == NULL)
+  {
+    mem_free(e_svc);
+    mem_free(e_mid);
+    cmd_reply(ctx, "error: database unavailable");
+    return;
+  }
+
   snprintf(sql, sizeof(sql),
       "INSERT INTO llm_models (name, kind, service_name, model_id, "
       "embed_dim, max_context) VALUES ('%s', '%s', '%s', '%s', 0, %u)",
       e_name, llm_kind_to_str(k), e_svc, e_mid, max_ctx);
 
-  mem_free(e_name); mem_free(e_svc); mem_free(e_mid);
+  mem_free(e_name);
+  mem_free(e_svc);
+  mem_free(e_mid);
 
   res = db_result_alloc();
 
@@ -947,6 +1015,13 @@ cmd_llm_del_model(const cmd_ctx_t *ctx)
 
   name   = ctx->parsed->argv[0];
   e_name = db_escape(name);
+
+  if(e_name == NULL)
+  {
+    cmd_reply(ctx, "error: database unavailable");
+    return;
+  }
+
   snprintf(sql, sizeof(sql),
       "DELETE FROM llm_models WHERE name='%s'", e_name);
   mem_free(e_name);
@@ -1415,6 +1490,13 @@ cmd_show_llm_service_models(const cmd_ctx_t *ctx, const char *name)
   uint32_t     shown = 0;
 
   e_name = db_escape(name);
+
+  if(e_name == NULL)
+  {
+    cmd_reply(ctx, "error: database unavailable");
+    return;
+  }
+
   snprintf(sql, sizeof(sql),
       "SELECT model_id, max_model_len FROM llm_service_models "
       "WHERE service_name='%s' ORDER BY model_id", e_name);
@@ -1468,6 +1550,14 @@ cmd_show_llm_service_summary(const cmd_ctx_t *ctx, const char *where_name)
   if(where_name != NULL)
   {
     char *e_name = db_escape(where_name);
+
+    // An unescapable filter must not widen into "list everything".
+    if(e_name == NULL)
+    {
+      cmd_reply(ctx, "error: database unavailable");
+      return;
+    }
+
     snprintf(where, sizeof(where), " WHERE s.name='%s'", e_name);
     mem_free(e_name);
   }

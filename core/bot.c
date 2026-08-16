@@ -2563,7 +2563,14 @@ bot_restore_methods(void)
     // Reconstruct method instance name: "{botname}_{method_kind}"
     snprintf(inst_name, sizeof(inst_name), "%s_%s", bname, mkind);
 
-    bot_bind_method(inst, inst_name, mkind);
+    // A bind that failed leaves a bot the operator believes is bound —
+    // and the KV keys below would advertise a method it does not have.
+    if(bot_bind_method(inst, inst_name, mkind) != SUCCESS)
+    {
+      clam(CLAM_WARN, "bot_restore",
+          "failed to bind method '%s' to '%s'", mkind, bname);
+      continue;
+    }
 
     // Register per-bot method KV keys (bot.<bname>.<mkind>.*).
     bot_register_method_kv(bname, mkind);

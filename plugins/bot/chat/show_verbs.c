@@ -748,7 +748,7 @@ verb_llm_interests(const cmd_ctx_t *ctx, bot_inst_t *bot, const char *rest)
   char header[256];
   verb_interests_stats_t stats[VERB_INTERESTS_CAP];
   const char *name;
-  acquire_topic_t topics[VERB_INTERESTS_CAP];
+  acquire_topic_t *topics;
   size_t n;
 
   (void)rest;
@@ -756,12 +756,17 @@ verb_llm_interests(const cmd_ctx_t *ctx, bot_inst_t *bot, const char *rest)
   name = bot_inst_name(bot);
 
   // A generous but bounded snapshot buffer; acquire topics are
-  // personality-capped to a handful per bot.
+  // personality-capped to a handful per bot. It lives on the heap
+  // because one acquire_topic_t is ~11 KB and a command runs on a
+  // pool worker, whose stack is nothing like a main thread's.
+  topics = mem_alloc("chatbot", "interests_snapshot",
+      sizeof(*topics) * VERB_INTERESTS_CAP);
 
   n = acquire_get_topic_snapshot(name, topics, VERB_INTERESTS_CAP);
 
   if(n == 0)
   {
+    mem_free(topics);
     cmd_reply(ctx, "no acquisition topics registered");
     return;
   }
@@ -803,6 +808,8 @@ verb_llm_interests(const cmd_ctx_t *ctx, bot_inst_t *bot, const char *rest)
         stats[i].last_reactive);
     cmd_reply(ctx, line);
   }
+
+  mem_free(topics);
 }
 
 // ---- /show extract {root,stats} ---------------------------------------
