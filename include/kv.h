@@ -97,10 +97,19 @@ double kv_get_double(const char *key);
 // Returns 0.0 for missing or type-mismatched keys.
 long double kv_get_ldouble(const char *key);
 
-// Returns pointer to internal storage (valid until value changes), or
-// NULL. ⚠ NULL also means "registered, but not KV_STR" — this reads
-// only string keys, so it is no use for asking whether a UINT32 or BOOL
-// key has a value. There is no such question to ask: a registered key
+// Returns an interned string that lives for the process, or NULL.
+//
+// The pointer never dangles and the bytes behind it never change. A
+// KV string value is immutable: kv_set installs a *different* interned
+// string rather than writing over this one, and dropping the entry
+// (kv_unregister, a plugin unload's kv_reclaim_owned) does not touch
+// it. So a held pointer can only go STALE — it keeps answering with
+// the value the key had when it was read. Re-read the key wherever
+// that matters; there is no lifetime to manage and nothing to copy.
+//
+// ⚠ NULL also means "registered, but not KV_STR" — this reads only
+// string keys, so it is no use for asking whether a UINT32 or BOOL key
+// has a value. There is no such question to ask: a registered key
 // always answers with its default, so the typed getter above IS the
 // value, and 0 from it means the key says 0.
 const char *kv_get_str(const char *key);
@@ -294,10 +303,13 @@ void kv_exit(void);
 
 #include <limits.h>
 
-#define KV_BUCKETS    64
-#define KV_VAL_BUF    300    // serialization buffer
+#define KV_BUCKETS        64
+#define KV_INTERN_BUCKETS 128
+#define KV_VAL_BUF        300    // serialization buffer
 
-// str member makes this 256 bytes.
+// A string value is a pointer into the intern table below, never inline
+// storage: that is what lets kv_get_str hand the pointer out and walk
+// away. long double is the widest member, so this is 16 bytes.
 typedef union
 {
   int8_t      i8;
@@ -311,7 +323,7 @@ typedef union
   float       f;
   double      d;
   long double ld;
-  char        str[KV_STR_SZ];
+  const char *str;
 } kv_val_t;
 
 typedef struct kv_entry
@@ -328,9 +340,29 @@ typedef struct kv_entry
   struct kv_entry *next;     // hash chain
 } kv_entry_t;
 
-static kv_entry_t      *kv_table[KV_BUCKETS];
+// The intern table: every distinct string a KV value has ever held,
+// stored once and never freed until kv_exit(). It is what makes the
+// pointer kv_get_str returns outlive both the value and the entry —
+// nothing here is ever rewritten in place or unlinked, so a reader
+// holding one needs no lock, no copy and no lifetime.
+//
+// It grows by one node per *distinct* string ever stored, which in this
+// tree is an operator setting a key, not a hot path: repeat values cost
+// nothing. Guarded by its own mutex, taken while kv_mutex may be held
+// and never the other way round; it calls nothing, least of all clam().
+typedef struct kv_str_node
+{
+  struct kv_str_node *next;
+  size_t              len;
+  char                s[];
+} kv_str_node_t;
+
+static kv_entry_t       *kv_table[KV_BUCKETS];
+static kv_str_node_t    *kv_intern_table[KV_INTERN_BUCKETS];
+static pthread_mutex_t   kv_intern_mutex = PTHREAD_MUTEX_INITIALIZER;
 static pthread_mutex_t   kv_mutex;
 static uint32_t          kv_count = 0;
+static uint32_t          kv_intern_count = 0;
 static bool              kv_ready = false;
 static bool              kv_loaded = false;  // true once kv_load() completes
 

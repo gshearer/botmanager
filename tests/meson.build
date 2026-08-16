@@ -85,6 +85,17 @@ test_kv_bot = executable('test_kv_bot',
   dependencies : core_deps,
 )
 
+# kv_get_str hands ~205 sites a pointer they use after the lock is
+# gone. Both ways that promise can break are silent — a value rewritten
+# under a reader, an entry freed under one — so this suite states the
+# lifetime as pointer identity, which is red without a sanitizer.
+test_kv_str = executable('test_kv_str',
+  'test_kv_str.c',
+  include_directories : [include_directories('.'), inc_include],
+  link_with : [test_harness, libcore],
+  dependencies : core_deps,
+)
+
 test('util', test_util)
 test('colors', test_colors)
 test('json', test_json)
@@ -93,3 +104,4 @@ test('db_txn', test_db_txn)
 test('cooldown', test_cooldown)
 test('fact_merge', test_fact_merge)
 test('kv_bot', test_kv_bot)
+test('kv_str', test_kv_str)

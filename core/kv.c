@@ -87,6 +87,49 @@ find_locked(const char *key)
   return(NULL);
 }
 
+// Return the one immortal copy of the first KV_STR_SZ-1 bytes of s,
+// creating it if this is the first time that string has been stored.
+// The bound is the same one the inline buffer used to impose, so an
+// over-long value truncates exactly as it always did.
+//
+// Never returns NULL: mem_alloc aborts rather than fail.
+static const char *
+kv_intern(const char *s)
+{
+  kv_str_node_t *n;
+  size_t         len    = strnlen(s, KV_STR_SZ - 1);
+  uint32_t       h      = 5381;
+  uint32_t       bucket;
+
+  for(size_t i = 0; i < len; i++)
+    h = ((h << 5) + h) + (uint8_t)s[i];
+
+  bucket = h % KV_INTERN_BUCKETS;
+
+  pthread_mutex_lock(&kv_intern_mutex);
+
+  for(n = kv_intern_table[bucket]; n != NULL; n = n->next)
+    if(n->len == len && memcmp(n->s, s, len) == 0)
+    {
+      pthread_mutex_unlock(&kv_intern_mutex);
+      return(n->s);
+    }
+
+  n = mem_alloc("kv", "string", sizeof(*n) + len + 1);
+
+  n->len = len;
+  memcpy(n->s, s, len);
+  n->s[len] = '\0';
+
+  n->next                 = kv_intern_table[bucket];
+  kv_intern_table[bucket] = n;
+  kv_intern_count++;
+
+  pthread_mutex_unlock(&kv_intern_mutex);
+
+  return(n->s);
+}
+
 static bool
 str_to_val(kv_type_t type, const char *str, kv_val_t *val)
 {
@@ -166,7 +209,7 @@ str_to_val(kv_type_t type, const char *str, kv_val_t *val)
       return(SUCCESS);
 
     case KV_STR:
-      strlcpy(val->str, str, KV_STR_SZ);
+      val->str = kv_intern(str);
       return(SUCCESS);
 
     case KV_BOOL:
@@ -220,6 +263,11 @@ val_changed(kv_type_t type, const kv_val_t *old, const kv_val_t *new)
 {
   char a[KV_VAL_BUF], b[KV_VAL_BUF];
 
+  // Interning makes pointer identity value identity, so the string case
+  // answers without serializing 600 bytes to compare them.
+  if(type == KV_STR)
+    return(old->str != new->str);
+
   val_to_str(type, old, a, sizeof(a));
   val_to_str(type, new, b, sizeof(b));
   return(strcmp(a, b) != 0);
@@ -231,10 +279,10 @@ val_changed(kv_type_t type, const kv_val_t *old, const kv_val_t *new)
 static bool
 apply_val(kv_entry_t *e, const kv_val_t *new_val)
 {
-  bool        changed;
-  kv_cb_t     cb;
-  void       *cb_data;
-  const char *key;
+  char     key[KV_KEY_SZ];
+  bool     changed;
+  kv_cb_t  cb;
+  void    *cb_data;
 
   changed = val_changed(e->type, &e->val, new_val);
 
@@ -246,7 +294,12 @@ apply_val(kv_entry_t *e, const kv_val_t *new_val)
 
   cb      = changed ? e->cb : NULL;
   cb_data = e->cb_data;
-  key     = e->key;
+
+  // The callback runs with the lock released, so it cannot be handed
+  // e->key: a concurrent kv_unregister or a plugin unload's
+  // kv_reclaim_owned frees the entry out from under it. The value it
+  // will read back needs no such care — see kv_get_str.
+  strlcpy(key, e->key, sizeof(key));
 
   pthread_mutex_unlock(&kv_mutex);
 
@@ -1876,7 +1929,8 @@ kv_init(void)
 void
 kv_exit(void)
 {
-  uint32_t freed = 0;
+  uint32_t freed    = 0;
+  uint32_t interned = 0;
 
   if(!kv_ready)
     return;
@@ -1922,8 +1976,33 @@ kv_exit(void)
 
   pthread_mutex_unlock(&kv_nl_mutex);
 
+  // The intern table outlives every entry by design; shutdown is the one
+  // point at which no reader can still hold one of its strings.
+  pthread_mutex_lock(&kv_intern_mutex);
+
+  for(uint32_t b = 0; b < KV_INTERN_BUCKETS; b++)
+  {
+    kv_str_node_t *n = kv_intern_table[b];
+
+    while(n != NULL)
+    {
+      kv_str_node_t *next = n->next;
+
+      mem_free(n);
+      n = next;
+    }
+
+    kv_intern_table[b] = NULL;
+  }
+
+  interned        = kv_intern_count;
+  kv_intern_count = 0;
+
+  pthread_mutex_unlock(&kv_intern_mutex);
+
   kv_ready = false;
 
-  clam(CLAM_INFO, "kv_exit", "configuration shut down (%u entries freed)",
-      freed);
+  clam(CLAM_INFO, "kv_exit",
+      "configuration shut down (%u entries, %u interned strings freed)",
+      freed, interned);
 }
