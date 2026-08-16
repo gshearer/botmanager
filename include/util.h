@@ -93,11 +93,22 @@ bool util_find_image_url(const char *text, char *out, size_t out_cap);
 // Returns `out`, so it can be used inline as a clam() argument.
 const char *util_redact_url(const char *url, char *out, size_t out_cap);
 
-// Reject URLs that would SSRF onto private / link-local / loopback /
-// cloud-metadata IPs, or that use any non-https scheme. Hostname-only
-// (does not resolve DNS); operators needing rebind resistance should
-// firewall bot egress to deny RFC 1918. Returns true when the URL is
-// safe to fetch.
+// Reject URLs that would SSRF onto an internal address, or that use any
+// non-https scheme. Returns true when the URL is safe to fetch.
+//
+// The host must be a DNS name: every IP literal is refused, in every
+// encoding and whatever it addresses, rather than the unsafe ranges
+// being enumerated. Enumerating ranges means enumerating spellings too,
+// and one address has many — `127.1`, `0177.0.0.1` and `2130706433` all
+// reach 127.0.0.1 through the resolver. Refusing the whole form costs
+// only the ability to fetch from a bare public address, which the
+// chat-sourced URLs this gate exists for never are.
+//
+// Hostname-only: it does not resolve DNS, so a name whose A record
+// points at 127.0.0.1 passes, and so does a rebind between this check
+// and the connect. That is the standing limit of a URL-shaped gate —
+// operators needing resistance to either should firewall bot egress to
+// deny RFC 1918.
 bool util_url_is_safe_https(const char *url);
 
 // Bump an eventfd's counter so the loop polling it runs a turn now rather

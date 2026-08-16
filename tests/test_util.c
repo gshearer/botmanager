@@ -77,29 +77,50 @@ static const struct
   { "host longer than the scratch buffer", "https://" H280 ".com/", false },
   { "localhost", "https://localhost/x", false },
   { "localhost subdomain", "https://localhost.localdomain/", false },
+  // Dotted-quad literals, private and public alike: the gate refuses the
+  // whole form, so these pin the policy and not a range table.
   { "loopback v4", "https://127.0.0.1/", false },
   { "private 10/8", "https://10.0.0.5/", false },
   { "private 192.168/16", "https://192.168.1.1/", false },
-  { "private 172.16/12 low edge", "https://172.16.0.1/", false },
-  { "private 172.16/12 high edge", "https://172.31.255.255/", false },
-  { "just below 172.16/12", "https://172.15.0.1/", true },
-  { "just above 172.16/12", "https://172.32.0.1/", true },
+  { "private 172.16/12", "https://172.16.0.1/", false },
   { "link-local v4", "https://169.254.1.1/", false },
   { "cloud metadata", "https://169.254.169.254/latest/meta-data/", false },
   { "zero net", "https://0.0.0.0/", false },
-  // Bracketed hosts: the scan may only end at a colon when there are
-  // no brackets, where it introduces a port. Ending there inside them
-  // cut [fe80::1] to "fe80" and made every literal test below dead.
+  { "public v4 literal is refused with them", "https://93.184.216.34/x", false },
+  // Alternate spellings of 127.0.0.1. Each was measured through
+  // getaddrinfo(), which is what curl resolves with, and each reached
+  // 127.0.0.1; inet_pton(AF_INET) parses none of the four, which is why
+  // the gate reads them with inet_aton().
+  { "integer-encoded v4", "https://2130706433/", false },
+  { "hex-encoded v4", "https://0x7f000001/", false },
+  { "octal-encoded v4", "https://0177.0.0.1/", false },
+  { "short-form v4", "https://127.1/", false },
+  // A bracket introduces an IP literal and may introduce nothing else,
+  // so it is refused before the host scan ever runs — which is why the
+  // last two cases, neither of them a literal, are refusals too.
   { "loopback v6", "https://[::1]/", false },
+  { "expanded loopback v6", "https://[0:0:0:0:0:0:0:1]/", false },
+  { "ipv4-mapped loopback v6", "https://[::ffff:127.0.0.1]/", false },
+  { "unspecified v6", "https://[::]/", false },
   { "link-local v6", "https://[fe80::1]/", false },
   { "link-local v6 with a zone id", "https://[fe80::1%25eth0]/", false },
   { "unique-local v6 fc00::/8", "https://[fc00::1]/", false },
   { "unique-local v6 fd00::/8", "https://[fd00::1]/", false },
-  { "public v6", "https://[2606:4700::1111]/", true },
-  { "public v6 with a port", "https://[2606:4700::1111]:8443/", true },
-  // ⚠ The gate matches literal prefixes, so an equivalent spelling of
-  // a blocked address still passes: 0:0:0:0:0:0:0:1, ::ffff:127.0.0.1,
-  // 2130706433. Filed as SC-SSRF-1 — a numeric fix, not a case.
+  { "public v6 literal is refused with them", "https://[2606:4700::1111]/",
+    false },
+  { "bracket wrapping a name", "https://[example.com]/", false },
+  { "unclosed bracket", "https://[::1/", false },
+  // Names, not literals. The first two were false positives under the
+  // old fc/fd prefix tests, which read any name beginning fc or fd plus
+  // a hex digit as a unique-local address.
+  { "name beginning fc + hex digit", "https://fc2.example.com/i.png", true },
+  { "name beginning fd + hex digit", "https://fdn.example.com/i.png", true },
+  { "numeric labels that are not an address",
+    "https://1.2.3.4.example.com/i.png", true },
+  // The documented limit, pinned deliberately: the gate does not
+  // resolve, so a name whose A record points at 127.0.0.1 passes.
+  { "gate is hostname-only, not resolved",
+    "https://192.168.1.1.nip.io/i.png", true },
 };
 
 // util_b64_encode / util_b64url_encode. `url` selects the encoder;

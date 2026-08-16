@@ -2,6 +2,7 @@
 // Small string, path, and time helpers shared across the daemon.
 #include "util.h"
 
+#include <arpa/inet.h>
 #include <ctype.h>
 #include <errno.h>
 #include <stdint.h>
@@ -404,31 +405,6 @@ util_find_image_url(const char *text, char *out, size_t out_cap)
   return(false);
 }
 
-// Returns true if host matches an unsafe IPv4 prefix. host is already
-// lowercased and unbracketed.
-static bool
-util_host_is_ipv4_unsafe(const char *host)
-{
-  unsigned int a;
-  unsigned int b;
-  int n;
-
-  // Loopback prefix and zero-net prefix as cheap textual checks first.
-  if(strncmp(host, "127.", 4) == 0)     return(true);
-  if(strncmp(host, "10.", 3) == 0)      return(true);
-  if(strncmp(host, "192.168.", 8) == 0) return(true);
-  if(strncmp(host, "169.254.", 8) == 0) return(true);
-  if(strncmp(host, "0.", 2) == 0)       return(true);
-  if(strcmp(host, "0.0.0.0") == 0)      return(true);
-
-  // 172.16.0.0/12 → first octet 172, second in [16, 31].
-  if(sscanf(host, "%u.%u%n", &a, &b, &n) == 2)
-    if(a == 172 && b >= 16 && b <= 31)
-      return(true);
-
-  return(false);
-}
-
 // Query-parameter name fragments that mark a value as a credential. Matched
 // case-insensitively as substrings, so this stays short and still covers the
 // hyphenated and prefixed spellings services actually use.
@@ -547,9 +523,9 @@ util_redact_url(const char *url, char *out, size_t out_cap)
 bool
 util_url_is_safe_https(const char *url)
 {
+  struct in_addr addr;
   char host[256];
   size_t hlen;
-  bool bracketed;
   const char *p;
   const char *host_start;
 
@@ -560,19 +536,18 @@ util_url_is_safe_https(const char *url)
 
   host_start = url + 8;
 
-  // Strip optional IPv6 bracket.
-  bracketed = (*host_start == '[');
+  // A bracket introduces an IP literal and may introduce nothing else
+  // (RFC 3986 §3.2.2), and every literal is refused below whatever it
+  // addresses — so the bracket alone is the answer, and one wrapping
+  // something unparsable is refused rather than retried as a name.
+  // Refusing here is also why the scan below need not know brackets
+  // exist: no bracketed host reaches it.
+  if(*host_start == '[') return(false);
 
-  if(bracketed)
-    host_start++;
-
-  // Host runs until ']', '/', '?', '#', or end — and until ':' only
-  // when unbracketed, where that colon introduces a port. Inside
-  // brackets it separates hextets, and stopping there would cut
-  // [fe80::1] down to "fe80", which matches no literal test below.
+  // Host runs until ':', '/', '?', '#', or end; that colon introduces
+  // a port.
   p = host_start;
-  while(*p != '\0' && *p != ']' && *p != '/' && *p != '?' && *p != '#'
-      && (bracketed || *p != ':'))
+  while(*p != '\0' && *p != ':' && *p != '/' && *p != '?' && *p != '#')
     p++;
 
   hlen = (size_t)(p - host_start);
@@ -584,26 +559,20 @@ util_url_is_safe_https(const char *url)
 
   host[hlen] = '\0';
 
-  // localhost forms.
+  // localhost forms — names, so no literal test below reaches them.
   if(strcmp(host, "localhost") == 0)        return(false);
   if(strncmp(host, "localhost.", 10) == 0)  return(false);
 
-  // Cloud metadata literal (belt-and-braces; also caught by 169.254.).
-  if(strcmp(host, "169.254.169.254") == 0)  return(false);
-
-  // IPv6 literal forms.
-  if(strcmp(host, "::1") == 0)              return(false);
-  if(strncmp(host, "fe80:", 5) == 0)        return(false);
-  if(strncmp(host, "fc", 2) == 0
-      && (host[2] == ':' || (host[2] >= '0' && host[2] <= '9')
-          || (host[2] >= 'a' && host[2] <= 'f')))
-    return(false);
-  if(strncmp(host, "fd", 2) == 0
-      && (host[2] == ':' || (host[2] >= '0' && host[2] <= '9')
-          || (host[2] >= 'a' && host[2] <= 'f')))
-    return(false);
-
-  if(util_host_is_ipv4_unsafe(host)) return(false);
+  // Every IP literal is refused, whatever it addresses. Enumerating the
+  // unsafe ranges would mean enumerating their spellings too, and
+  // `2130706433`, `0x7f000001`, `0177.0.0.1` and `127.1` are all
+  // 127.0.0.1 wearing a different hat. inet_aton() and not inet_pton()
+  // precisely because it accepts that legacy set — as does the
+  // getaddrinfo() curl resolves with, while inet_pton() parses none of
+  // the four, so a range test built on it would pass every one. A
+  // public literal is refused with them: this gate's URLs come out of
+  // chat, where a bare address is not a real image host.
+  if(inet_aton(host, &addr) == 1) return(false);
 
   return(true);
 }
