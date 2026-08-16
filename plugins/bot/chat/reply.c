@@ -200,31 +200,16 @@ inflight_bump(chatbot_state_t *st, int delta)
   pthread_mutex_unlock(&st->flight_mutex);
 }
 
-// Cooldown ring: LRU-evict-on-insert. Searches are linear over 16 slots.
+// The reply cooldown ring. st->lock is the ring's lock — a read lock is
+// enough to peek, and set-active already holds the write lock for the
+// fields alongside it, so a stamp costs no extra contention.
 void
 chatbot_inflight_record_reply(chatbot_state_t *st, const char *key, time_t now)
 {
-  uint32_t slot;
-
-  if(st == NULL || key == NULL) return;
+  if(st == NULL) return;
 
   pthread_rwlock_wrlock(&st->lock);
-
-  for(uint32_t i = 0; i < CHATBOT_COOLDOWN_SLOTS; i++)
-  {
-    if(strcmp(st->cooldowns[i].key, key) == 0)
-    {
-      st->cooldowns[i].last_reply = now;
-      pthread_rwlock_unlock(&st->lock);
-      return;
-    }
-  }
-
-  slot = st->cooldown_next % CHATBOT_COOLDOWN_SLOTS;
-  snprintf(st->cooldowns[slot].key, sizeof(st->cooldowns[slot].key), "%s", key);
-  st->cooldowns[slot].last_reply = now;
-  st->cooldown_next++;
-
+  cooldown_ring_stamp(st->cooldowns, CHATBOT_COOLDOWN_SLOTS, key, now);
   pthread_rwlock_unlock(&st->lock);
 }
 
@@ -233,58 +218,32 @@ chatbot_inflight_last_reply(chatbot_state_t *st, const char *key)
 {
   time_t t;
 
-  if(st == NULL || key == NULL) return(0);
+  if(st == NULL) return(0);
 
   pthread_rwlock_rdlock(&st->lock);
-  t = 0;
-
-  for(uint32_t i = 0; i < CHATBOT_COOLDOWN_SLOTS; i++)
-  {
-    if(strcmp(st->cooldowns[i].key, key) == 0)
-    {
-      t = st->cooldowns[i].last_reply;
-      break;
-    }
-  }
-
+  t = cooldown_ring_peek(st->cooldowns, CHATBOT_COOLDOWN_SLOTS, key,
+      st->created_at);
   pthread_rwlock_unlock(&st->lock);
-
-  // TEXT-COOLDOWN-1 — an unstamped slot yields 0, which every caller's
-  // `> 0` gate reads as "free to speak". Floor to the handle's creation
-  // time so a reloaded bot serves out one cooldown window first.
-  if(t < st->created_at) t = st->created_at;
 
   return(t);
 }
 
-// VF-3 — per-target witness-interject cooldown ring. Same LRU shape as
-// the volunteer channel ring (see volunteer.c); kept small because a
-// bot typically sees only a handful of active targets between cooldown
-// windows. Stamped ONLY on a successful WITNESS interject submit —
-// direct-address replies bypass this budget by design.
+// VF-3 — per-target witness-interject cooldown ring. Kept small because
+// a bot typically sees only a handful of active targets between
+// cooldown windows. Stamped ONLY on a successful WITNESS interject
+// submit — direct-address replies bypass this budget by design.
 
 time_t
 chatbot_last_witness_interject(chatbot_state_t *st, const char *target)
 {
   time_t t;
 
-  if(st == NULL || target == NULL || target[0] == '\0') return(0);
-
-  t = 0;
+  if(st == NULL) return(0);
 
   pthread_mutex_lock(&st->witness_cd.mutex);
-  for(size_t i = 0; i < CHATBOT_WITNESS_COOLDOWN_SLOTS; i++)
-  {
-    if(strcmp(st->witness_cd.slots[i].target, target) == 0)
-    {
-      t = st->witness_cd.slots[i].last_interject;
-      break;
-    }
-  }
+  t = cooldown_ring_peek(st->witness_cd.slots,
+      CHATBOT_WITNESS_COOLDOWN_SLOTS, target, st->created_at);
   pthread_mutex_unlock(&st->witness_cd.mutex);
-
-  // TEXT-COOLDOWN-1 — see chatbot_inflight_last_reply().
-  if(t < st->created_at) t = st->created_at;
 
   return(t);
 }
@@ -293,52 +252,11 @@ void
 chatbot_stamp_witness_interject(chatbot_state_t *st, const char *target,
     time_t now)
 {
-  size_t oldest;
-  time_t oldest_t;
-
-  if(st == NULL || target == NULL || target[0] == '\0') return;
+  if(st == NULL) return;
 
   pthread_mutex_lock(&st->witness_cd.mutex);
-
-  // Existing slot: refresh in place.
-  for(size_t i = 0; i < CHATBOT_WITNESS_COOLDOWN_SLOTS; i++)
-  {
-    if(strcmp(st->witness_cd.slots[i].target, target) == 0)
-    {
-      st->witness_cd.slots[i].last_interject = now;
-      pthread_mutex_unlock(&st->witness_cd.mutex);
-      return;
-    }
-  }
-
-  // Empty slot.
-  for(size_t i = 0; i < CHATBOT_WITNESS_COOLDOWN_SLOTS; i++)
-  {
-    if(st->witness_cd.slots[i].target[0] == '\0')
-    {
-      snprintf(st->witness_cd.slots[i].target,
-          sizeof(st->witness_cd.slots[i].target), "%s", target);
-      st->witness_cd.slots[i].last_interject = now;
-      pthread_mutex_unlock(&st->witness_cd.mutex);
-      return;
-    }
-  }
-
-  // Ring full: evict the oldest (min last_interject) and take its slot.
-  oldest = 0;
-  oldest_t = st->witness_cd.slots[0].last_interject;
-  for(size_t i = 1; i < CHATBOT_WITNESS_COOLDOWN_SLOTS; i++)
-  {
-    if(st->witness_cd.slots[i].last_interject < oldest_t)
-    {
-      oldest = i;
-      oldest_t = st->witness_cd.slots[i].last_interject;
-    }
-  }
-  snprintf(st->witness_cd.slots[oldest].target,
-      sizeof(st->witness_cd.slots[oldest].target), "%s", target);
-  st->witness_cd.slots[oldest].last_interject = now;
-
+  cooldown_ring_stamp(st->witness_cd.slots,
+      CHATBOT_WITNESS_COOLDOWN_SLOTS, target, now);
   pthread_mutex_unlock(&st->witness_cd.mutex);
 }
 

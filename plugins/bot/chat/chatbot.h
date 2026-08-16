@@ -93,6 +93,7 @@ void chatbot_personality_free(struct chatbot_personality_s *p);
 #include "bot.h"
 #include "cmd.h"
 #include "common.h"
+#include "cooldown.h"
 #include "extract.h"
 #include "kv.h"
 #include "alloc.h"
@@ -158,16 +159,12 @@ typedef struct chatbot_personality_s
   time_t  updated;
 } chatbot_personality_t;
 
-// Tiny per-channel cooldown ring (fixed size — overflow entries are
-// LRU-evicted). Keeps speak policy fully in-memory without a DB round
-// trip. Separate counters per DM sender and per channel.
+// Tiny per-channel reply cooldown ring — a cooldown.h slot table, so
+// its matching, eviction and reload floor are that module's (this one
+// used to run a FIFO write cursor under a comment claiming LRU). Keeps
+// speak policy fully in-memory without a DB round trip; one slot per
+// channel or DM sender, whichever the line arrived on.
 #define CHATBOT_COOLDOWN_SLOTS 16
-
-typedef struct
-{
-  char    key[METHOD_CHANNEL_SZ];   // channel name or sender nick
-  time_t  last_reply;
-} chatbot_cooldown_slot_t;
 
 // Paste coalescing: pending per-sender buffer. A new line from the same
 // (method, sender) appends to this buffer and bumps `seq`; a deferred
@@ -323,20 +320,15 @@ typedef struct
 // which WITNESS-driven interjects fire on a given channel (or DM
 // sender) regardless of the probability roll. Direct-address replies
 // do not consume this budget, so the ring is stamped only from the
-// INTERJECT branch in chatbot_consider_speaking. LRU on write; 8 slots
-// is sufficient for a bot joined to a handful of targets.
+// INTERJECT branch in chatbot_consider_speaking. A cooldown.h slot
+// table keyed on the target; 8 slots is sufficient for a bot joined to
+// a handful of them.
 #define CHATBOT_WITNESS_COOLDOWN_SLOTS 8
 
 typedef struct
 {
-  char    target[METHOD_CHANNEL_SZ];    // channel or DM sender; empty = unused
-  time_t  last_interject;               // 0 = slot cleared
-} chatbot_witness_cooldown_slot_t;
-
-typedef struct
-{
-  chatbot_witness_cooldown_slot_t slots[CHATBOT_WITNESS_COOLDOWN_SLOTS];
-  pthread_mutex_t                 mutex;
+  cooldown_slot_t slots[CHATBOT_WITNESS_COOLDOWN_SLOTS];
+  pthread_mutex_t mutex;
 } chatbot_witness_cooldown_t;
 
 // V1 — per-channel volunteer cooldown ring + per-bot hourly cap.
@@ -372,12 +364,6 @@ typedef struct
 
 typedef struct
 {
-  char     subject[ACQUIRE_SUBJECT_SZ]; // empty = empty
-  time_t   volunteered_at;
-} chatbot_volunteer_subject_slot_t;
-
-typedef struct
-{
   int64_t  chunk_id;                    // 0 = empty
   time_t   volunteered_at;
   uint32_t dim;                         // 0 = empty
@@ -393,26 +379,19 @@ typedef struct
 
   // V2 — content dedup rings. See the block comment above.
   chatbot_volunteer_chunk_slot_t   chunk_ring [CHATBOT_VOLUNTEER_CHUNK_RING];
-  chatbot_volunteer_subject_slot_t subj_ring  [CHATBOT_VOLUNTEER_SUBJECT_RING];
+  cooldown_slot_t                  subj_ring  [CHATBOT_VOLUNTEER_SUBJECT_RING];
   chatbot_volunteer_embed_slot_t   embed_ring [CHATBOT_VOLUNTEER_EMBED_RING];
 } chatbot_volunteer_state_t;
 
-// IV3 vision cooldowns — structurally mirrors cooldowns[] but kept
-// separate so vision accounting runs under its own mutex and can't
-// starve reply accounting.
+// IV3 vision cooldowns — the same cooldown.h slot table as cooldowns[]
+// but kept separate so vision accounting runs under its own mutex and
+// can't starve reply accounting.
 #define CHATBOT_VISION_CD_SLOTS 16
 
 typedef struct
 {
-  char    key[METHOD_CHANNEL_SZ];
-  time_t  last_reply;
-} chatbot_vision_cd_slot_t;
-
-typedef struct
-{
-  chatbot_vision_cd_slot_t slots[CHATBOT_VISION_CD_SLOTS];
-  uint32_t                 next;
-  pthread_mutex_t          mutex;
+  cooldown_slot_t slots[CHATBOT_VISION_CD_SLOTS];
+  pthread_mutex_t mutex;
 } chatbot_vision_cd_t;
 
 // Per-instance bot state.
@@ -443,8 +422,7 @@ typedef struct
   uint32_t          in_flight;        // in-flight reply requests
   pthread_mutex_t   flight_mutex;
 
-  chatbot_cooldown_slot_t cooldowns[CHATBOT_COOLDOWN_SLOTS];
-  uint32_t               cooldown_next;  // LRU write cursor
+  cooldown_slot_t         cooldowns[CHATBOT_COOLDOWN_SLOTS];
 
   // SAN-21: the coalescer is the one path that hands work to a task
   // against this handle, so it is the one path core's delivery refcount
@@ -769,14 +747,16 @@ void chatbot_inflight_record_reply(chatbot_state_t *st,
 
 // TEXT-COOLDOWN-1: the getter never returns less than st->created_at,
 // so an unstamped target reads as "spoke when this handle was created"
-// rather than "never spoke". Returns 0 only for a NULL argument.
+// rather than "never spoke". Returns 0 only for an empty or NULL
+// target — see cooldown.h for why that one case is unfloored.
 time_t chatbot_inflight_last_reply(chatbot_state_t *st,
     const char *channel_or_sender);
 
 // VF-3 — witness-interject cooldown helpers. Keyed by `target`
-// (channel for channel traffic, sender for DMs). Pure LRU under the
-// dedicated witness_cd.mutex. TEXT-COOLDOWN-1: the getter floors its
-// result to st->created_at, so it returns 0 only for an empty target.
+// (channel for channel traffic, sender for DMs), over a cooldown.h
+// slot table under the dedicated witness_cd.mutex. TEXT-COOLDOWN-1:
+// the getter floors its result to st->created_at, so it returns 0 only
+// for an empty target.
 time_t chatbot_last_witness_interject(chatbot_state_t *st,
     const char *target);
 void chatbot_stamp_witness_interject(chatbot_state_t *st,

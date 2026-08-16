@@ -53,6 +53,16 @@ test_db_txn = executable('test_db_txn',
   dependencies : core_deps,
 )
 
+# The cooldown ring is a plugin translation unit that calls nothing but
+# libc, so this suite compiles that one file directly and links no core.
+test_cooldown = executable('test_cooldown',
+  'test_cooldown.c',
+  '../plugins/bot/chat/cooldown.c',
+  include_directories : [include_directories('.'), inc_include,
+                         include_directories('../plugins/bot/chat')],
+  link_with : [test_harness],
+)
+
 # The FACT-1 ladder is SQL, so its suite drives psql against the
 # configured database inside a rolled-back transaction, and SKIPs when
 # that database is unreachable. It needs no core symbols — only the
@@ -69,4 +79,5 @@ test('colors', test_colors)
 test('json', test_json)
 test('irc_parse', test_irc_parse)
 test('db_txn', test_db_txn)
+test('cooldown', test_cooldown)
 test('fact_merge', test_fact_merge)

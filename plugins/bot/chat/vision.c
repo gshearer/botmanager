@@ -87,7 +87,12 @@ chatbot_vision_maybe_submit(chatbot_state_t *st, const method_msg_t *msg)
   const char *target;
   char        key[128];
   char        image_url[1024];
-  char        url_cd_key[METHOD_CHANNEL_SZ + 32];
+  // The one composed key in the plugin, and the reason COOLDOWN_KEY_SZ
+  // sits above METHOD_CHANNEL_SZ: a 127-byte target plus ':' plus 16
+  // hex digits used to lose the hash to the slot's 128-byte field, and
+  // a stamp truncated that way can never be matched by the peek after
+  // it — the dedup went cold and churned a slot per image.
+  char        url_cd_key[COOLDOWN_KEY_SZ];
   uint32_t    cooldown;
   uint32_t    url_cd;
   uint32_t    max_inflight;
@@ -247,61 +252,32 @@ chatbot_vision_maybe_submit(chatbot_state_t *st, const method_msg_t *msg)
 }
 
 // ----------------------------------------------------------------------
-// Cooldown rings (mirror of chatbot_inflight_record_reply)
+// Cooldown rings
 // ----------------------------------------------------------------------
 
-// TEXT-COOLDOWN-1 — `floor_at` raises an unstamped (or stale) slot to a
-// caller-chosen instant, normally the bot handle's creation time, so a
-// ring emptied by a plugin reload does not read as "never replied here".
-// Pass 0 to disable the floor (see the per-URL dedup ring's call site).
+// Both rings are cooldown.h slot tables; these two wrap the ring's own
+// mutex around them and turn a stamp into the question the caller
+// actually asks. `floor_at` is TEXT-COOLDOWN-1's reload floor — see
+// cooldown.h, and the per-URL call site for the one ring that passes 0.
 static bool
 vision_cooldown_hot(chatbot_vision_cd_t *ring, const char *key,
     uint32_t cooldown_secs, time_t now, time_t floor_at)
 {
-  bool hot = false;
-  time_t last = 0;
+  time_t last;
 
   pthread_mutex_lock(&ring->mutex);
-
-  for(size_t i = 0; i < CHATBOT_VISION_CD_SLOTS; i++)
-  {
-    if(strcmp(ring->slots[i].key, key) == 0)
-    {
-      last = ring->slots[i].last_reply;
-      break;
-    }
-  }
-
+  last = cooldown_ring_peek(ring->slots, CHATBOT_VISION_CD_SLOTS, key,
+      floor_at);
   pthread_mutex_unlock(&ring->mutex);
 
-  if(last < floor_at) last = floor_at;
-  if(last > 0) hot = (now - last) < (time_t)cooldown_secs;
-
-  return(hot);
+  return(last > 0 && (now - last) < (time_t)cooldown_secs);
 }
 
 static void
 vision_cooldown_stamp(chatbot_vision_cd_t *ring, const char *key, time_t now)
 {
-  uint32_t slot;
-
   pthread_mutex_lock(&ring->mutex);
-
-  for(size_t i = 0; i < CHATBOT_VISION_CD_SLOTS; i++)
-  {
-    if(strcmp(ring->slots[i].key, key) == 0)
-    {
-      ring->slots[i].last_reply = now;
-      pthread_mutex_unlock(&ring->mutex);
-      return;
-    }
-  }
-
-  slot = ring->next % CHATBOT_VISION_CD_SLOTS;
-  snprintf(ring->slots[slot].key, sizeof(ring->slots[slot].key), "%s", key);
-  ring->slots[slot].last_reply = now;
-  ring->next++;
-
+  cooldown_ring_stamp(ring->slots, CHATBOT_VISION_CD_SLOTS, key, now);
   pthread_mutex_unlock(&ring->mutex);
 }
 

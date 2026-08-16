@@ -183,62 +183,26 @@ volunteer_chunk_ring_stamp_locked(chatbot_volunteer_state_t *v,
   v->chunk_ring[oldest].volunteered_at = now;
 }
 
+// The subject ring is a cooldown.h slot table; it is the one of the
+// four volunteer rings that is keyed by a string and stamped by a
+// clock, and its lock is the shared st->volunteer.mutex the caller
+// already holds — which is why the module locks nothing itself. No
+// reload floor: the sibling channel ring supplies the post-reload quiet
+// window (the `last_volunteered` floor in volunteer_cascade's gate (f)).
 static time_t
 volunteer_subject_ring_last_locked(chatbot_volunteer_state_t *v,
     const char *subject)
 {
-  if(subject == NULL || subject[0] == '\0') return(0);
-
-  for(size_t i = 0; i < CHATBOT_VOLUNTEER_SUBJECT_RING; i++)
-    if(v->subj_ring[i].subject[0] != '\0'
-        && strcasecmp(v->subj_ring[i].subject, subject) == 0)
-      return(v->subj_ring[i].volunteered_at);
-  return(0);
+  return(cooldown_ring_peek(v->subj_ring, CHATBOT_VOLUNTEER_SUBJECT_RING,
+      subject, 0));
 }
 
 static void
 volunteer_subject_ring_stamp_locked(chatbot_volunteer_state_t *v,
     const char *subject, time_t now)
 {
-  size_t oldest;
-  time_t oldest_t;
-
-  if(subject == NULL || subject[0] == '\0') return;
-
-  for(size_t i = 0; i < CHATBOT_VOLUNTEER_SUBJECT_RING; i++)
-  {
-    if(v->subj_ring[i].subject[0] != '\0'
-        && strcasecmp(v->subj_ring[i].subject, subject) == 0)
-    {
-      v->subj_ring[i].volunteered_at = now;
-      return;
-    }
-  }
-
-  for(size_t i = 0; i < CHATBOT_VOLUNTEER_SUBJECT_RING; i++)
-  {
-    if(v->subj_ring[i].subject[0] == '\0')
-    {
-      snprintf(v->subj_ring[i].subject, sizeof(v->subj_ring[i].subject),
-          "%s", subject);
-      v->subj_ring[i].volunteered_at = now;
-      return;
-    }
-  }
-
-  oldest = 0;
-  oldest_t = v->subj_ring[0].volunteered_at;
-  for(size_t i = 1; i < CHATBOT_VOLUNTEER_SUBJECT_RING; i++)
-  {
-    if(v->subj_ring[i].volunteered_at < oldest_t)
-    {
-      oldest = i;
-      oldest_t = v->subj_ring[i].volunteered_at;
-    }
-  }
-  snprintf(v->subj_ring[oldest].subject, sizeof(v->subj_ring[oldest].subject),
-      "%s", subject);
-  v->subj_ring[oldest].volunteered_at = now;
+  cooldown_ring_stamp(v->subj_ring, CHATBOT_VOLUNTEER_SUBJECT_RING,
+      subject, now);
 }
 
 // Scans the embed ring for the highest cosine against `vec`. Skips slots
