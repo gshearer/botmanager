@@ -648,10 +648,7 @@ curl_request_submit(curl_request_t *req)
   pthread_mutex_unlock(&curl_submit_mutex);
 
   // Wake the multi loop.
-  {
-    uint64_t val = 1;
-    (void)write(curl_wake_fd, &val, sizeof(val));
-  }
+  util_evfd_wake(curl_wake_fd, "curl");
 
   return(SUCCESS);
 }
@@ -706,11 +703,7 @@ curl_request_cancel(uint64_t id)
 
   // The same wake the submit path uses: the sweep runs at the top of
   // the next iteration rather than whenever the poll happens to expire.
-  {
-    uint64_t val = 1;
-
-    (void)write(curl_wake_fd, &val, sizeof(val));
-  }
+  util_evfd_wake(curl_wake_fd, "curl");
 
   return(SUCCESS);
 }
@@ -770,10 +763,7 @@ curl_request_submit_wait(curl_request_t *req)
   pthread_mutex_unlock(&curl_submit_mutex);
 
   // Wake the multi loop (same as curl_request_submit).
-  {
-    uint64_t val = 1;
-    (void)write(curl_wake_fd, &val, sizeof(val));
-  }
+  util_evfd_wake(curl_wake_fd, "curl");
 
   return(SUCCESS);
 }
@@ -1148,10 +1138,7 @@ curl_drain_queue(void)
   pthread_mutex_unlock(&curl_submit_mutex);
 
   // Consume the eventfd so it doesn't keep firing.
-  {
-    uint64_t val;
-    (void)read(curl_wake_fd, &val, sizeof(val));
-  }
+  util_evfd_drain(curl_wake_fd, "curl");
 }
 
 // Wall-clock millisecond reader used by the shutdown drain to enforce
@@ -1779,10 +1766,7 @@ curl_begin_shutdown(void)
   // Wake the multi loop so it picks up curl_drain_initiated this turn
   // rather than after the next poll timeout.
   if(curl_wake_fd >= 0)
-  {
-    uint64_t one = 1;
-    (void)write(curl_wake_fd, &one, sizeof(one));
-  }
+    util_evfd_wake(curl_wake_fd, "curl");
 
   // Wait for the multi loop to finish the drain. The drain itself is
   // bounded by CURL_DRAIN_DEADLINE_MS for in-flight TRANSACTIONAL

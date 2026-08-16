@@ -172,11 +172,10 @@ sock_deliver(sock_session_t *s, sock_event_type_t type,
 static void
 sock_wake_worker(sock_session_t *s)
 {
-  uint64_t val = 1;
   sock_worker_t *w = &sock_workers[s->worker_id];
 
   if(w->wake_fd >= 0)
-    (void)write(w->wake_fd, &val, sizeof(val));
+    util_evfd_wake(w->wake_fd, "sock");
 }
 
 // Close the session's fd and update state. Idempotent: whoever gets
@@ -975,10 +974,9 @@ sock_epoll_task(task_t *t)
       // Wake event — drain eventfd, then scan for pending sends.
       if(ev->data.u64 == 0)
       {
-        uint64_t val;
         sock_session_t *s;
 
-        (void)read(w->wake_fd, &val, sizeof(val));
+        util_evfd_drain(w->wake_fd, "sock");
 
         // Arm EPOLLOUT for any session with pending sends.
         pthread_mutex_lock(&sock_mutex);

@@ -12,6 +12,25 @@ project('botmanager', 'c',
 # schemas, cmd_arg_desc_t specs) — silence the cosmetic warning.
 add_project_arguments('-Wno-missing-field-initializers', language : 'c')
 
+# The clean-build set is -Wall -Wextra -Wpedantic -Wformat-security; the first
+# three are warning_level=3. -Wformat-security is in none of them: a printf(s)
+# whose s came from outside is silent under all three and under FORTIFY.
+add_project_arguments('-Wformat-security', language : 'c')
+
+# Release hardening. -D_FORTIFY_SOURCE=3 needs -O1 or better and warns when it
+# does not have it, so it is set per configuration rather than globally; the
+# other two cost nothing at any optimization level and are unconditional.
+add_project_arguments('-fstack-protector-strong', '-fstack-clash-protection',
+  language : 'c')
+
+# ...and a sanitizer build is not a release build. FORTIFY redirects the very
+# libc entry points ASan replaces with its own instrumented ones, so leaving it
+# on there trades a report that names the overflow for a bare __chk abort that
+# does not. The gate is silent either way, which is the reason to state it here.
+if get_option('optimization') != '0' and get_option('b_sanitize') == 'none'
+  add_project_arguments('-D_FORTIFY_SOURCE=3', language : 'c')
+endif
+
 bm_version_major = '0'
 bm_version_minor = '1'
 

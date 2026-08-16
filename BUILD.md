@@ -32,6 +32,24 @@ PLUGIN-AUDIT-1 lead (A) closed the last 77 on 2026-08-12. If you add one,
 you own it. `-Wno-missing-field-initializers` is the single project-wide
 suppression and its reason is stated in the root `meson.build`.
 
+The warning set is `-Wall -Wextra -Wpedantic` (`warning_level=3`) plus
+`-Wformat-security`, which is in none of the other three. The default
+`build` configuration is also **hardened**: `-fstack-protector-strong`
+and `-fstack-clash-protection` unconditionally, and `-D_FORTIFY_SOURCE=3`
+whenever optimization is on and no sanitizer is. FORTIFY turns on
+`warn_unused_result` for `read`/`write`, so a discarded return there is a
+build error's worth of noise — and a `(void)` cast does **not** silence
+it. Core's eventfd wake/drain goes through `util_evfd_wake()` /
+`util_evfd_drain()`; do not open-code one.
+
+A sanitizer configuration deliberately drops FORTIFY — it redirects the
+same libc entry points ASan replaces, and a `__chk` abort names far less
+than an ASan report does:
+
+```sh
+meson setup build-asan -Db_sanitize=address,undefined -Doptimization=1 -Ddebug=true
+```
+
 To check what you introduced, clean first — an incremental build only
 reports on the files it recompiled:
 

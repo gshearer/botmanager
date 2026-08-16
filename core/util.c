@@ -3,6 +3,7 @@
 #include "util.h"
 
 #include <ctype.h>
+#include <errno.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -599,4 +600,33 @@ util_url_is_safe_https(const char *url)
   if(util_host_is_ipv4_unsafe(host)) return(false);
 
   return(true);
+}
+
+// eventfd wake / drain
+
+void
+util_evfd_wake(int fd, const char *ctx)
+{
+  uint64_t val = 1;
+
+  if(write(fd, &val, sizeof(val)) == (ssize_t)sizeof(val))
+    return;
+
+  clam(CLAM_WARN, ctx, "eventfd wake failed: %s", strerror(errno));
+}
+
+void
+util_evfd_drain(int fd, const char *ctx)
+{
+  uint64_t val;
+
+  if(read(fd, &val, sizeof(val)) == (ssize_t)sizeof(val))
+    return;
+
+  // The fd is non-blocking and the wake is level-triggered, so an empty
+  // counter means a concurrent reader got there first.
+  if(errno == EAGAIN || errno == EWOULDBLOCK)
+    return;
+
+  clam(CLAM_WARN, ctx, "eventfd drain failed: %s", strerror(errno));
 }

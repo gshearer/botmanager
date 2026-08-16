@@ -100,4 +100,17 @@ const char *util_redact_url(const char *url, char *out, size_t out_cap);
 // safe to fetch.
 bool util_url_is_safe_https(const char *url);
 
+// Bump an eventfd's counter so the loop polling it runs a turn now rather
+// than when its poll expires. Best-effort by design — a lost wake costs one
+// poll timeout and nothing else — but every way it can fail is a defect: a
+// stale fd, or a counter saturated because nobody is draining. Both are
+// logged under the caller's own clam context, which `ctx` names. Both of
+// these therefore clam() on the failure path — call them with no lock held.
+void util_evfd_wake(int fd, const char *ctx);
+
+// Consume the counter an epoll wake reported, so the level-triggered event
+// stops firing. An empty counter is a wake another reader already drained,
+// not a failure, and is silent.
+void util_evfd_drain(int fd, const char *ctx);
+
 #endif // BM_UTIL_H

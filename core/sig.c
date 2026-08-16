@@ -13,6 +13,29 @@ sig_shutdown_handler(int signum)
     shutdown_signal = signum;
 }
 
+// Write a whole diagnostic to stderr from inside a signal handler. clam()
+// is not async-signal-safe and the process re-raises the moment this
+// returns, so there is no recovery to attempt and none is attempted: the
+// loop is here to survive a short write, not to report one.
+// s:   bytes to write
+// len: how many
+static void
+sig_write_stderr(const char *s, size_t len)
+{
+  ssize_t n;
+
+  while(len > 0)
+  {
+    n = write(STDERR_FILENO, s, len);
+
+    if(n <= 0)
+      return;
+
+    s   += (size_t)n;
+    len -= (size_t)n;
+  }
+}
+
 // Async-signal-safe handler for fatal signals: write to stderr, re-raise.
 // Uses only write() which is async-signal-safe.
 // signum: the signal number received
@@ -32,9 +55,9 @@ sig_fatal_handler(int signum)
   }
 
   // Async-signal-safe output.
-  write(STDERR_FILENO, "[FATAL] caught signal: ", 23);
-  write(STDERR_FILENO, name, strlen(name));
-  write(STDERR_FILENO, "\n", 1);
+  sig_write_stderr("[FATAL] caught signal: ", 23);
+  sig_write_stderr(name, strlen(name));
+  sig_write_stderr("\n", 1);
 
   memset(&sa, 0, sizeof(sa));
   sa.sa_handler = SIG_DFL;

@@ -139,6 +139,7 @@ void sock_iterate(sock_iter_cb_t cb, void *data);
 #include "pool.h"
 #include "resolve.h"
 #include "task.h"
+#include "util.h"      // util_evfd_wake / _drain — the epoll worker's wake fd
 
 #include <errno.h>
 #include <fcntl.h>
