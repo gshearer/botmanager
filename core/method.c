@@ -669,7 +669,7 @@ method_send(method_inst_t *inst, const char *target, const char *text)
   rc = inst->driver->send(inst->handle, target, buf);
 
   if(rc == SUCCESS)
-    inst->msg_out++;
+    __atomic_add_fetch(&inst->msg_out, 1, __ATOMIC_RELAXED);
 
   return(rc);
 }
@@ -720,7 +720,7 @@ method_send_emote(method_inst_t *inst, const char *target, const char *text)
   }
 
   if(rc == SUCCESS)
-    inst->msg_out++;
+    __atomic_add_fetch(&inst->msg_out, 1, __ATOMIC_RELAXED);
 
   return(rc);
 }
@@ -809,7 +809,7 @@ method_iterate_instances(method_inst_iter_cb_t cb, void *data)
     snprintf(s->kind, sizeof(s->kind), "%s", kind);
     s->state        = m->state;
     s->msg_in       = m->msg_in;
-    s->msg_out      = m->msg_out;
+    s->msg_out      = __atomic_load_n(&m->msg_out, __ATOMIC_RELAXED);
     s->sub_count    = m->sub_count;
     s->connected_at = m->connected_at;
     count++;
@@ -903,7 +903,7 @@ method_get_stats(method_stats_t *out)
   {
     out->subscribers   += m->sub_count;
     out->total_msg_in  += m->msg_in;
-    out->total_msg_out += m->msg_out;
+    out->total_msg_out += __atomic_load_n(&m->msg_out, __ATOMIC_RELAXED);
   }
 
   pthread_mutex_unlock(&method_mutex);

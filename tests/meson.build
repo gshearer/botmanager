@@ -141,6 +141,19 @@ test_kraken_ws_channels = executable('test_kraken_ws_channels',
   dependencies : core_deps,
 )
 
+# The method traffic counters are written by whatever thread replies —
+# method_send holds no lock — and read under method_mutex into
+# /show methods. A lost increment is silent and permanent, so these
+# rows state the contract as exact arithmetic over the public surface:
+# red under a plain -O2 build (lost updates) and red under
+# -fsanitize=thread, with no daemon and no network.
+test_method_stats = executable('test_method_stats',
+  'test_method_stats.c',
+  include_directories : [include_directories('.'), inc_include],
+  link_with : [test_harness, libcore],
+  dependencies : core_deps,
+)
+
 test('util', test_util)
 test('colors', test_colors)
 test('json', test_json)
@@ -153,3 +166,4 @@ test('kv_str', test_kv_str)
 test('curl_submit_wait', test_curl_submit_wait)
 test('cmd_inflight', test_cmd_inflight)
 test('kraken_ws_channels', test_kraken_ws_channels)
+test('method_stats', test_method_stats)

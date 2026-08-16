@@ -440,8 +440,11 @@ struct method_inst
   uint32_t                refs;
   method_sub_t           *subs;      // subscriber list
   uint32_t                sub_count;
-  uint64_t                msg_in;    // total messages delivered
-  uint64_t                msg_out;   // total messages sent
+  uint64_t                msg_in;    // total messages delivered; written and
+                                     // read under method_mutex only
+  uint64_t                msg_out;   // total messages sent; relaxed __atomic —
+                                     // senders hold no lock, readers load
+                                     // atomically under method_mutex
   time_t                  connected_at; // timestamp of METHOD_AVAILABLE, 0 if not
   struct method_inst     *next;
 };
