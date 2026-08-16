@@ -105,6 +105,7 @@ atk_cmd_end(const cmd_ctx_t *ctx, const userns_t *ns)
   char        line[ATK_LINE_SZ];
   const char *who;
   bool        found;
+  bool        ended = FAIL;
 
   who = (ctx->msg->nickname[0] != '\0') ? ctx->msg->nickname : ctx->username;
 
@@ -114,13 +115,21 @@ atk_cmd_end(const cmd_ctx_t *ctx, const userns_t *ns)
       ctx->msg->channel, &round);
 
   if(found)
-    atk_db_round_abandon(round.id);
+    ended = atk_db_round_abandon(round.id);
 
   pthread_mutex_unlock(&atk_turn_lock);
 
   if(!found)
   {
     cmd_reply(ctx, "⚔ Nothing is happening here.");
+    return;
+  }
+
+  // The UPDATE is what ends the round; announcing the end without it
+  // leaves the pit open and every fighter's next blow lands in it.
+  if(ended != SUCCESS)
+  {
+    cmd_reply(ctx, "⚔ The fight refuses to end. Try again in a moment.");
     return;
   }
 
@@ -439,10 +448,13 @@ atk_cmd_attack(const cmd_ctx_t *ctx)
   // round_max_idle_secs is over, and this attack retires it and opens a
   // fresh one in the same step. Every !attack or !heal resets last_action,
   // so a pit that anyone is still fighting in never expires.
+  // Retire it only if the retirement actually landed (atk_exec logs the
+  // failure): announcing an end the database refused would open a second
+  // round beside a first one still marked active.
   if(atk_db_round_find(ns->id, method, channel, &round) &&
-     round.idle > (int64_t)t.round_max_idle_secs)
+     round.idle > (int64_t)t.round_max_idle_secs &&
+     atk_db_round_abandon(round.id) == SUCCESS)
   {
-    atk_db_round_abandon(round.id);
     cmd_reply(ctx, "⚔ The old fight is over. A new one begins.");
 
     // Clear the whole snapshot, not just the id: the dead round's

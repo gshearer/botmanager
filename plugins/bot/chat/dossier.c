@@ -830,12 +830,20 @@ dossier_split_signature(int64_t signature_id, dossier_id_t *out_new_id)
 
   if(!ok)
   {
-    // Roll back the new dossier row to avoid orphaning it.
+    // Roll back the new dossier row to avoid orphaning it. A rollback
+    // that itself fails leaves the orphan behind, so say so — nobody
+    // downstream can tell from the FAIL that a row was left over.
     snprintf(sql, sizeof(sql),
         "DELETE FROM dossier WHERE id = %" PRId64,
         (int64_t)new_id);
     res = db_result_alloc();
-    db_query(sql, res);
+
+    if(db_query(sql, res) != SUCCESS || !res->ok)
+      clam(CLAM_WARN, "dossier",
+          "split rollback failed, dossier %" PRId64 " orphaned: %s",
+          (int64_t)new_id,
+          res->error[0] != '\0' ? res->error : "(no driver error)");
+
     db_result_free(res);
     return(FAIL);
   }

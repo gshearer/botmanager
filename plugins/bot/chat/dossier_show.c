@@ -3,6 +3,7 @@
 
 #include "common.h"
 #include "bot.h"
+#include "clam.h"
 #include "cmd.h"
 #include "colors.h"
 #include "db.h"
@@ -224,6 +225,14 @@ render_dossier_detail(const cmd_ctx_t *ctx, dossier_id_t did)
       cmd_reply(ctx, line);
     }
   }
+
+  // An omitted section reads as "none"; a failed read is not none.
+  else if(res->error[0] != '\0')
+  {
+    clam(CLAM_WARN, "dossier", "show signatures: %s", res->error);
+    cmd_reply(ctx, "  " CLR_CYAN "signatures:" CLR_RESET " (read failed)");
+  }
+
   db_result_free(res);
 
   // Facts.
@@ -252,6 +261,13 @@ render_dossier_detail(const cmd_ctx_t *ctx, dossier_id_t did)
       cmd_reply(ctx, line);
     }
   }
+
+  else if(res->error[0] != '\0')
+  {
+    clam(CLAM_WARN, "dossier", "show facts: %s", res->error);
+    cmd_reply(ctx, "  " CLR_CYAN "facts:" CLR_RESET " (read failed)");
+  }
+
   db_result_free(res);
 }
 

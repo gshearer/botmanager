@@ -243,6 +243,9 @@ memory_deliver_hits(const memory_hit_t *msg_hits, size_t n_msgs,
       mem_free(rows);
     }
 
+    else if(res->error[0] != '\0')
+      clam(CLAM_WARN, "memory", "hydrate scan rows: %s", res->error);
+
     db_result_free(res);
   }
 
@@ -348,6 +351,9 @@ memory_msgs_from_ids(int ns_id, const memory_hit_t *hits, size_t n_hits,
       m->score = memory_hit_score(hits, n_hits, m->id);
     }
   }
+
+  else if(res->error[0] != '\0')
+    clam(CLAM_WARN, "memory", "msgs_from_ids: %s", res->error);
 
   db_result_free(res);
   return(n);
@@ -778,6 +784,10 @@ memory_get_toward_facts(int64_t dossier_id,
     for(uint32_t i = 0; i < res->rows && n < cap; i++)
       memory_parse_dossier_fact_row(res, i, &out[n++]);
   }
+
+  else if(res->error[0] != '\0')
+    clam(CLAM_WARN, "memory", "get_toward_facts: %s", res->error);
+
   db_result_free(res);
   return(n);
 }
@@ -845,6 +855,10 @@ memory_get_mention_msgs(int ns_id, int64_t dossier_id,
       v = db_result_get(res, i, 8); if(v) m->ts = (time_t)strtoll(v, NULL, 10);
     }
   }
+
+  else if(res->error[0] != '\0')
+    clam(CLAM_WARN, "memory", "get_mention_msgs: %s", res->error);
+
   db_result_free(res);
   return(n);
 }

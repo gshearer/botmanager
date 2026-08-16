@@ -234,13 +234,16 @@ chatbot_row_owner_pred(const method_msg_t *msg, char *dst, size_t cap)
   return(ok);
 }
 
-static uint32_t
+// The count behind the per-owner rate limit, or -1 when the count could
+// not be taken. A limit whose test failed must refuse, not admit: the
+// caller distinguishes the two and says which happened.
+static int64_t
 deferred_pending_for(uint32_t ns_id, const char *owner_pred)
 {
   db_result_t *res;
   const char  *cell;
   char         sql[1024];
-  uint32_t     n = 0;
+  int64_t      n = -1;
 
   snprintf(sql, sizeof(sql),
       "SELECT COUNT(*) FROM chat_deferred WHERE ns_id = %" PRIu32
@@ -248,12 +251,13 @@ deferred_pending_for(uint32_t ns_id, const char *owner_pred)
 
   res = db_result_alloc();
 
-  if(res == NULL)
-    return(0);
-
   if(db_query(sql, res) == SUCCESS && res->ok && res->rows > 0
       && (cell = db_result_get(res, 0, 0)) != NULL)
-    n = (uint32_t)strtoul(cell, NULL, 10);
+    n = (int64_t)strtoll(cell, NULL, 10);
+
+  else
+    clam(CLAM_WARN, DEFERRED_CTX, "pending count failed: %s",
+        res->error[0] != '\0' ? res->error : "(no driver error)");
 
   db_result_free(res);
   return(n);
@@ -861,6 +865,7 @@ deferred_ask_open(const cmd_ctx_t *ctx, const char *duration,
 {
   char     key[KV_KEY_SZ];
   uint32_t cap;
+  int64_t  pending;
 
   memset(a, 0, sizeof(*a));
 
@@ -941,7 +946,16 @@ deferred_ask_open(const cmd_ctx_t *ctx, const char *duration,
   if(cap == 0)
     cap = DEFERRED_MAX_PENDING_DEFAULT;
 
-  if(deferred_pending_for(a->ns->id, a->owner_pred) >= cap)
+  pending = deferred_pending_for(a->ns->id, a->owner_pred);
+
+  if(pending < 0)
+  {
+    cmd_reply(ctx, "I couldn't check what you already have pending — "
+        "try again shortly");
+    return(FAIL);
+  }
+
+  if(pending >= (int64_t)cap)
   {
     char msg[128];
 

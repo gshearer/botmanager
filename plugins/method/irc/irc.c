@@ -2144,6 +2144,10 @@ irc_init_networks(void)
   if(db_query("SELECT key, type, value FROM kv "
                "WHERE key LIKE 'irc.net.%'", r) != SUCCESS)
   {
+    // Indistinguishable from "no networks are defined" unless it says
+    // so, and every network definition is missing for the whole run.
+    clam(CLAM_WARN, "irc", "network restore failed: %s",
+        r->error[0] != '\0' ? r->error : "(no driver error)");
     db_result_free(r);
     return;
   }

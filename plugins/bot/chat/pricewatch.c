@@ -704,13 +704,15 @@ cmd_show_bot_watchlist(const cmd_ctx_t *ctx)
 
 // ---------- /pricewatch ----------
 
-static uint32_t
+// The count behind the per-owner watch limit, or -1 when the count could
+// not be taken; deferred_pending_for's contract, for the same reason.
+static int64_t
 pricewatch_pending_for(uint32_t ns_id, const char *owner_pred)
 {
   db_result_t *res;
   const char  *cell;
   char         sql[1024];
-  uint32_t     n = 0;
+  int64_t      n = -1;
 
   snprintf(sql, sizeof(sql),
       "SELECT COUNT(*) FROM chat_pricewatch WHERE ns_id = %" PRIu32
@@ -718,12 +720,13 @@ pricewatch_pending_for(uint32_t ns_id, const char *owner_pred)
 
   res = db_result_alloc();
 
-  if(res == NULL)
-    return(0);
-
   if(db_query(sql, res) == SUCCESS && res->ok && res->rows > 0
       && (cell = db_result_get(res, 0, 0)) != NULL)
-    n = (uint32_t)strtoul(cell, NULL, 10);
+    n = (int64_t)strtoll(cell, NULL, 10);
+
+  else
+    clam(CLAM_WARN, PRICEWATCH_CTX, "pending count failed: %s",
+        res->error[0] != '\0' ? res->error : "(no driver error)");
 
   db_result_free(res);
   return(n);
@@ -746,6 +749,7 @@ cmd_pricewatch(const cmd_ctx_t *ctx)
   double            threshold;
   double            spot;
   uint32_t          cap;
+  int64_t           pending;
   char              pair[EXCHANGE_PRODUCT_ID_SZ];
   char              owner_pred[768];
   char              key[KV_KEY_SZ];
@@ -833,7 +837,16 @@ cmd_pricewatch(const cmd_ctx_t *ctx)
   if(cap == 0)
     cap = PRICEWATCH_MAX_PENDING_DEFAULT;
 
-  if(pricewatch_pending_for(ns->id, owner_pred) >= cap)
+  pending = pricewatch_pending_for(ns->id, owner_pred);
+
+  if(pending < 0)
+  {
+    cmd_reply(ctx, "I couldn't check how many watches you already have — "
+        "try again shortly");
+    return;
+  }
+
+  if(pending >= (int64_t)cap)
   {
     char msg[160];
 
