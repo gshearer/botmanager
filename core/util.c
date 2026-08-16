@@ -549,6 +549,7 @@ util_url_is_safe_https(const char *url)
 {
   char host[256];
   size_t hlen;
+  bool bracketed;
   const char *p;
   const char *host_start;
 
@@ -560,13 +561,18 @@ util_url_is_safe_https(const char *url)
   host_start = url + 8;
 
   // Strip optional IPv6 bracket.
-  if(*host_start == '[')
+  bracketed = (*host_start == '[');
+
+  if(bracketed)
     host_start++;
 
-  // Host runs until ']', '/', ':', '?', '#', or end.
+  // Host runs until ']', '/', '?', '#', or end — and until ':' only
+  // when unbracketed, where that colon introduces a port. Inside
+  // brackets it separates hextets, and stopping there would cut
+  // [fe80::1] down to "fe80", which matches no literal test below.
   p = host_start;
-  while(*p != '\0' && *p != ']' && *p != '/' && *p != ':'
-      && *p != '?' && *p != '#')
+  while(*p != '\0' && *p != ']' && *p != '/' && *p != '?' && *p != '#'
+      && (bracketed || *p != ':'))
     p++;
 
   hlen = (size_t)(p - host_start);

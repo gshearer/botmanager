@@ -62,9 +62,37 @@ at the project root.
 
 ## Test
 
-The test suite has been removed. New tests will be reintroduced in a
-future pass; for now, verify changes by building and manually exercising
-the running daemon via `botmanctl` and `ircspyctl`.
+```sh
+ninja -C build && cd build && meson test
+```
+
+Three suites, in `tests/`. They are **deliberately tiny and stay that
+way**: the suite covers silent wrongness only — a secret written to a
+log, a fetch of a private address, forged formatting, a person's fact
+quietly overwritten. Loud, recoverable, plugin-local failures are
+untested by design, so most changes owe no test; verify those by
+building and exercising the running daemon via `botmanctl` and
+`ircspyctl` as before. The reasoning is root `TODO.md` axes A27/A28/A31.
+
+| Suite | Covers |
+|---|---|
+| `tests/test_util.c` | `util_redact_url`, `util_url_is_safe_https`, `util_b64_*` |
+| `tests/test_colors.c` | `color_markup_translate` |
+| `tests/test_fact_merge.c` | the FACT-1 fact merge ladder |
+
+`test_fact_merge` needs Postgres, because the ladder *is* SQL: it
+renders the same `MEM_FACT_OBSERVE_SQL` template `memory.c` sends
+against a TEMP table that shadows `dossier_facts`, inside a rolled-back
+transaction. It reads `botman.conf` itself and **skips** when the
+database is unreachable, so a green `meson test` is not proof it ran —
+`meson test -v` shows its check count.
+
+Both sanitizer configurations build and run the suites too, and that is
+worth doing for anything touching them:
+
+```sh
+ninja -C build-asan && ASAN_OPTIONS=detect_leaks=1 build-asan/tests/test_util
+```
 
 ## Outputs
 
@@ -73,6 +101,7 @@ the running daemon via `botmanctl` and `ircspyctl`.
 | `build/core/botman` | Main daemon binary |
 | `build/tools/botmanctl`, `build/tools/ircspy`, `build/tools/ircspyctl` | CLI tools — see `tools/AGENTS.md` |
 | `build/plugins/<type>/<name>/lib<name>.so` | Runtime-loadable plugins |
+| `build/tests/test_*` | Test binaries — run via `meson test`, or directly |
 | `build/version.h` | Generated each build |
 
 ## Install

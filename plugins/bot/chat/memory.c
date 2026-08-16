@@ -887,36 +887,10 @@ memory_upsert_dossier_fact(const mem_dossier_fact_t *fact,
           (double)fact->confidence);
       break;
 
-    // One statement, one round trip, and a WHERE that makes rejection
-    // mean *untouched* rather than "written back identically" — the
-    // difference matters, because a no-op UPDATE still bumps nothing
-    // but a written-back last_seen would reorder the prompt.
-    //
-    // observed_at is refreshed here too, and that single assignment is
-    // the whole of the decay fix: the clock measures how stale the
-    // EVIDENCE is, so an accepted observation restarts it. Nothing
-    // else refreshes it, which is exactly why the legacy drift-pile
-    // still ages out on the existing schedule.
+    // The statement itself lives in memory.h beside the fragments it
+    // composes, so tests/test_fact_merge.c replays this exact ladder.
     case MEM_MERGE_OBSERVE:
-      n = snprintf(sql, cap,
-          "INSERT INTO dossier_facts"
-          " (dossier_id, kind, fact_key, fact_value, source, channel, confidence)"
-          " VALUES (%" PRId64 ", %d, '%s', '%s', '%s', '%s', %f)"
-          " ON CONFLICT (dossier_id, kind, fact_key) DO UPDATE"
-          " SET fact_value  = CASE WHEN " MEM_FACT_REPLACES
-          "         THEN EXCLUDED.fact_value ELSE dossier_facts.fact_value END,"
-          "     source      = CASE WHEN " MEM_FACT_REPLACES
-          "         OR " MEM_FACT_UPGRADES
-          "         THEN EXCLUDED.source ELSE dossier_facts.source END,"
-          "     channel     = CASE WHEN " MEM_FACT_REPLACES
-          "         OR " MEM_FACT_UPGRADES
-          "         THEN EXCLUDED.channel ELSE dossier_facts.channel END,"
-          "     confidence  = CASE WHEN " MEM_FACT_REPLACES
-          "         THEN EXCLUDED.confidence"
-          "         ELSE GREATEST(dossier_facts.confidence, EXCLUDED.confidence) END,"
-          "     observed_at = NOW(),"
-          "     last_seen   = NOW()"
-          " WHERE " MEM_FACT_AFFIRM " OR " MEM_FACT_REPLACES,
+      n = snprintf(sql, cap, MEM_FACT_OBSERVE_SQL,
           fact->dossier_id, (int)fact->kind, e_key, e_val, e_src, e_chan,
           (double)fact->confidence);
       break;
