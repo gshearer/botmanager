@@ -136,10 +136,15 @@ typedef struct kr_ws_sub
   struct kr_ws_sub       *next;
 } kr_ws_sub_t;
 
+// The two -ING states mean the same thing in opposite directions: a frame
+// for this slot is on the wire, and no other reconcile pass may emit one
+// for it until phase 3 or an ack resolves it (OBS-20, OBS-35). Every
+// other value is a settled belief about what the gateway holds.
 typedef enum
 {
   KR_SUB_IDLE,
   KR_SUB_SUBSCRIBING,
+  KR_SUB_UNSUBSCRIBING,
   KR_SUB_ACTIVE,
   KR_SUB_FAILED
 } kr_sub_state_t;
@@ -147,7 +152,8 @@ typedef enum
 // Per (channel, symbol) dedup slot. `symbol_ws` is the empty string for
 // channels that aren't symbol-keyed (executions / balances).
 // `state` advances IDLE → SUBSCRIBING (frame sent) → ACTIVE (ack
-// received) or FAILED (ack with success=false / timeout).
+// received) or FAILED (ack with success=false / timeout); a departing
+// slot goes ACTIVE → UNSUBSCRIBING (frame sent) → IDLE.
 typedef struct
 {
   kr_ws_channel_t  channel;
@@ -250,7 +256,8 @@ kr_ws_slots_compact_locked(void)
   for(uint32_t i = 0; i < kr_ws_ch.n_slots; )
   {
     if(kr_ws_ch.slots[i].refcount == 0
-        && kr_ws_ch.slots[i].state != KR_SUB_SUBSCRIBING)
+        && kr_ws_ch.slots[i].state != KR_SUB_SUBSCRIBING
+        && kr_ws_ch.slots[i].state != KR_SUB_UNSUBSCRIBING)
     {
       kr_ws_ch.slots[i] = kr_ws_ch.slots[kr_ws_ch.n_slots - 1];
       kr_ws_ch.n_slots--;
@@ -430,6 +437,9 @@ kr_ws_emit_one(const char *op, kr_ws_channel_t ch, const char *symbol_ws,
 //                                                                      //
 // The scan being one hold is what makes the walk itself safe: a        //
 // compaction can no longer move an unvisited slot below the cursor.    //
+// A slot with a frame already in flight is not collected by phase 1 —  //
+// that is what makes two overlapping passes emit one frame between     //
+// them instead of two.                                                 //
 // Mu must be held by caller; this function releases it once, in the    //
 // middle, and returns holding it.                                      //
 // ------------------------------------------------------------------ //
@@ -470,6 +480,7 @@ kr_ws_reconcile_locked(kr_reconcile_op_t op, const char *token, int only_sid)
   uint32_t           i;
   uint32_t           k;
   bool               want;
+  bool               orphaned = false;
   const char        *opname = (op == KR_RECONCILE_SUB ? "subscribe"
                                                       : "unsubscribe");
 
@@ -485,16 +496,39 @@ kr_ws_reconcile_locked(kr_reconcile_op_t op, const char *token, int only_sid)
     if(op == KR_RECONCILE_SUB)
     {
       // Only emit for slots that have at least one consumer and aren't
-      // already known active (or in-flight). A slot in FAILED stays
-      // failed until the caller removes it; we don't auto-retry here.
+      // already known active. A slot in FAILED stays failed until the
+      // caller removes it; we don't auto-retry here.
+      //
+      // The in-flight test is the other half, and it is what makes two
+      // overlapping passes safe (OBS-35). `sent_upstream` does not go
+      // true until the ACK lands, so for one whole round trip a slot
+      // that already has a frame on the wire still answers yes here —
+      // and the second pass mints a second req_id for it. On a lazily
+      // opened private session that overlap is the normal path, not a
+      // race: the session opens BECAUSE of the subscribe that kicked
+      // the token fetch, so on-open and the token trampoline reconcile
+      // the same slots microseconds apart.
+      //
+      // The trade: a subscribe whose ack never arrives at all now waits
+      // for its session's next open rather than for the next unrelated
+      // reconcile. Kraken answers every subscribe, and a session that
+      // goes quiet is dropped by the idle watchdog, whose on-open resets
+      // these slots to IDLE.
       want = (s->refcount > 0
+              && s->state != KR_SUB_SUBSCRIBING
               && (s->state == KR_SUB_IDLE || !s->sent_upstream));
     }
     else
     {
       // Only emit unsubscribe for slots whose refcount has dropped to
-      // zero and which the gateway currently has live.
-      want = (s->refcount == 0 && s->sent_upstream);
+      // zero and which the gateway currently has live — and never for
+      // one whose unsubscribe is already on the wire. Two consumers
+      // leaving at once is enough: `sent_upstream` is not cleared until
+      // phase 3, so each pass sees the other's target still looking
+      // live and unsubscribes it a second time (OBS-20).
+      want = (s->refcount == 0
+              && s->sent_upstream
+              && s->state != KR_SUB_UNSUBSCRIBING);
     }
 
     if(!want)
@@ -520,6 +554,13 @@ kr_ws_reconcile_locked(kr_reconcile_op_t op, const char *token, int only_sid)
       s->req_id = items[n_items].rid;
       s->state  = KR_SUB_SUBSCRIBING;
     }
+
+    // No req_id on this side. `req_id` is what the ack handler matches
+    // against, and an unsubscribe ack that matched would forge ACTIVE +
+    // sent_upstream onto the slot — the exact write OBS-5's guard exists
+    // to refuse. The state is the whole guard here.
+    else
+      s->state = KR_SUB_UNSUBSCRIBING;
 
     n_items++;
   }
@@ -577,18 +618,45 @@ kr_ws_reconcile_locked(kr_reconcile_op_t op, const char *token, int only_sid)
         s->req_id = 0;
       }
 
+      // An unsubscribe that never left is not in flight. Hand the slot
+      // back the belief it had: `sent_upstream` was never touched, and
+      // the only thing that sets it is the same ack that sets ACTIVE, so
+      // ACTIVE is exactly where this slot came from. Without this the
+      // slot is stranded — no pass wants it and compaction skips it.
+      if(op == KR_RECONCILE_UNSUB && s->state == KR_SUB_UNSUBSCRIBING)
+        s->state = KR_SUB_ACTIVE;
+
       continue;
     }
 
     if(op == KR_RECONCILE_UNSUB)
     {
-      // Drop the upstream tracking immediately so a subsequent
-      // resubscribe by the same caller re-emits cleanly.
+      // The frame is on the wire, so this records what was SENT rather
+      // than what we would prefer: the gateway no longer holds this
+      // slot. That is why it is unconditional.
       s->sent_upstream = false;
       s->state         = KR_SUB_IDLE;
       s->req_id        = 0;
+
+      // ...but a consumer may have arrived for this very feed while the
+      // frame was in flight, and its own reconcile could not emit — the
+      // slot was UNSUBSCRIBING. Nothing else will trigger for it. The
+      // primitive owes that guarantee itself rather than borrowing
+      // whenmoon's full-rebuild flow (OBS-20).
+      if(s->refcount > 0)
+        orphaned = true;
     }
   }
+
+  // One tail pass for whatever the loop above handed back to a live
+  // consumer, and it is ordered: the unsubscribe reached the transport in
+  // phase 2, so the subscribe that replaces it cannot overtake it on the
+  // socket. KR_RECONCILE_SUB never sets `orphaned`, so this recurses
+  // exactly once; `token` and `only_sid` carry through unchanged, and a
+  // private slot cannot reach here without the token that got it past
+  // phase 1 in the first place.
+  if(orphaned)
+    kr_ws_reconcile_locked(KR_RECONCILE_SUB, token, only_sid);
 }
 
 // Synchronous probe whether the slot table contains any private slot

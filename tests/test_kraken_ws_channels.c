@@ -479,6 +479,10 @@ case_wrong_slot_across_the_release(void)
   test_check_sz(SUITE,
       "a live slot keeps its upstream state when a neighbour's "
       "unsubscribe resumes", 1, n_frames_with("subscribe", "RRR"));
+
+  test_check_sz(SUITE,
+      "an unsubscribe already in flight is not emitted a second time",
+      1, n_frames_with("unsubscribe", "QQQ"));
 }
 
 // ------------------------------------------------------------------ //
@@ -590,7 +594,6 @@ case_ack_semantics(void)
 {
   void *first  = NULL;
   void *second = NULL;
-  void *third  = NULL;
   uint32_t           rid;
 
   fixture_reset();
@@ -606,13 +609,17 @@ case_ack_semantics(void)
       2, n_frames_with("subscribe", "EEE"));
 
   // The rid above has already been answered; replaying it must not mark
-  // the pending slot active, which a third consumer's reconcile shows.
+  // the pending slot active. A pending slot is no longer re-emitted for
+  // (OBS-35), so the question goes to the unsubscribe surface instead:
+  // a slot the gateway never confirmed is owed no unsubscribe frame, and
+  // a forged ACTIVE would produce one.
   inject_ack("subscribe", rid, true, NULL);
 
-  subscribe_one(&third, "EEE-USD");
+  kr_ws_unsubscribe(first);
+  kr_ws_unsubscribe(second);
 
   test_check_sz(SUITE, "a replayed ack cannot mark a pending slot active",
-      3, n_frames_with("subscribe", "EEE"));
+      0, n_frames_with("unsubscribe", "EEE"));
 }
 
 // ------------------------------------------------------------------ //
@@ -684,6 +691,149 @@ case_private_routes_to_the_auth_gateway(void)
     kr_ws_unsubscribe(sub);
 }
 
+// ------------------------------------------------------------------ //
+// c8 — two reconcile passes over one in-flight slot (OBS-35)          //
+// ------------------------------------------------------------------ //
+//
+// `sent_upstream` is not set until the ack lands, so for one whole round
+// trip a slot that already has a subscribe on the wire still answers
+// "yes" to "do you want one". Any second pass in that window mints a
+// second req_id and emits again — two frames for one slot, the later ack
+// dropped by the correlator, and Kraken free to answer the second with
+// 'Already subscribed'. On a lazily-opened private session the overlap is
+// not a race but the NORMAL path: the session opens BECAUSE of the
+// subscribe that kicked the token fetch, so `kr_ws_channels_on_open` and
+// the token trampoline reconcile the same two slots microseconds apart.
+// Measured live 2026-08-17: executions/balances went out as req_id 5,6
+// and then 3,4. The park reproduces the same overlap with one thread.
+
+static void *c8_sub;
+
+static void *
+c8_subscribe_entry(void *arg)
+{
+  const exchange_ws_channel_t channels[] = { EXCH_WS_USER };
+
+  (void)arg;
+
+  kr_ws_subscribe(channels, 1, NULL, 0, event_cb, NULL, &c8_sub);
+
+  return(NULL);
+}
+
+static void
+case_two_passes_over_one_inflight_slot(void)
+{
+  const exchange_ws_channel_t channels[] = { EXCH_WS_USER };
+  void                       *second = NULL;
+  pthread_t                   t;
+
+  fixture_reset();
+
+  stub_have_creds = true;
+  c8_sub          = NULL;
+
+  arm_park("subscribe", "executions");
+
+  // One sub over two private slots: executions emits first and parks,
+  // leaving both slots SUBSCRIBING with `mu` free.
+  pthread_create(&t, NULL, c8_subscribe_entry, NULL);
+  wait_parked();
+
+  // A second consumer of the same account channels — two whenmoon
+  // markets is all this takes. Its reconcile sees both slots mid-flight.
+  kr_ws_subscribe(channels, 1, NULL, 0, event_cb, NULL, &second);
+
+  release_park();
+  pthread_join(t, NULL);
+
+  test_check_sz(SUITE, "an in-flight subscribe is not minted a second time",
+      1, n_frames_with("subscribe", "executions"));
+  test_check_sz(SUITE, "nor is the sibling channel it was batched with",
+      1, n_frames_with("subscribe", "balances"));
+
+  if(c8_sub != NULL) kr_ws_unsubscribe(c8_sub);
+  if(second != NULL) kr_ws_unsubscribe(second);
+}
+
+// The reconnect path is what the in-flight test must NOT cost: a gateway
+// that flapped forgot everything, and `kr_ws_channels_on_open` resets its
+// own session's slots before it reconciles. Green on both sides of the
+// fix — it is here so the fix cannot quietly trade one for the other.
+
+static void
+case_a_flap_still_resubscribes(void)
+{
+  const exchange_ws_channel_t channels[] = { EXCH_WS_USER };
+  void                       *sub = NULL;
+
+  fixture_reset();
+
+  stub_have_creds = true;
+
+  kr_ws_subscribe(channels, 1, NULL, 0, event_cb, NULL, &sub);
+
+  test_check_sz(SUITE, "the first open emits one subscribe",
+      1, n_frames_with("subscribe", "executions"));
+
+  kr_ws_channels_on_open(KR_WS_PRIVATE);
+
+  test_check_sz(SUITE, "and a flap emits it again",
+      2, n_frames_with("subscribe", "executions"));
+
+  if(sub != NULL) kr_ws_unsubscribe(sub);
+}
+
+// ------------------------------------------------------------------ //
+// c9 — a slot re-subscribed inside the unsubscribe window (OBS-20)    //
+// ------------------------------------------------------------------ //
+//
+// The unsubscribe frame is on the wire and the table still says ACTIVE,
+// so the arriving consumer's own reconcile has nothing to emit — and the
+// unsubscribing pass then clears `sent_upstream` and walks away. The slot
+// ends refcount=1 / IDLE with no frame and no pending trigger, waiting on
+// a reconcile nothing in the primitive promises. whenmoon's full-rebuild
+// flow happens to provide one; a second consumer of this driver would not
+// inherit that, which is the whole reason OBS-20 was filed.
+
+static void *
+c9_unsubscribe_entry(void *arg)
+{
+  kr_ws_unsubscribe(arg);
+
+  return(NULL);
+}
+
+static void
+case_resubscribe_inside_the_unsubscribe_window(void)
+{
+  void      *aaa   = NULL;
+  void      *again = NULL;
+  pthread_t  t;
+
+  fixture_reset();
+
+  subscribe_and_ack(&aaa, "AAA-USD", "AAA");
+
+  arm_park("unsubscribe", "AAA");
+
+  pthread_create(&t, NULL, c9_unsubscribe_entry, aaa);
+  wait_parked();
+
+  subscribe_one(&again, "AAA-USD");
+
+  release_park();
+  pthread_join(t, NULL);
+
+  test_check_sz(SUITE,
+      "a slot re-subscribed inside the unsubscribe window is re-emitted",
+      2, n_frames_with("subscribe", "AAA"));
+  test_check_sz(SUITE, "and the unsubscribe it raced went out exactly once",
+      1, n_frames_with("unsubscribe", "AAA"));
+
+  if(again != NULL) kr_ws_unsubscribe(again);
+}
+
 int
 main(void)
 {
@@ -696,6 +846,9 @@ main(void)
   case_fanout_and_teardown();
   case_ack_semantics();
   case_private_routes_to_the_auth_gateway();
+  case_two_passes_over_one_inflight_slot();
+  case_a_flap_still_resubscribes();
+  case_resubscribe_inside_the_unsubscribe_window();
 
   kr_ws_channels_deinit();
 
