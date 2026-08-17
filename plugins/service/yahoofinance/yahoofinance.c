@@ -270,10 +270,7 @@ yf_session_acquire(yf_pend_t *p, char *cookie, size_t cookie_cap,
   time_t       now   = time(NULL);
   bool         start = false;
 
-  ttl = (uint32_t)kv_get_uint("plugin.yahoofinance.session_ttl");
-
-  if(ttl == 0)
-    ttl = 3600;
+  ttl = (uint32_t)kv_get_uint_or_default("plugin.yahoofinance.session_ttl");
 
   pthread_mutex_lock(&yf_sess_lock);
 
@@ -341,12 +338,11 @@ yf_session_fail(const char *why)
 {
   uint32_t backoff;
 
-  backoff = (uint32_t)kv_get_uint("plugin.yahoofinance.session_backoff");
-
   // A zero backoff would let every quote restart a mint that just
-  // failed; the enrichment is not worth a retry storm.
-  if(backoff == 0)
-    backoff = 900;
+  // failed; the enrichment is not worth a retry storm, so an operator
+  // who sets 0 gets the declared default back.
+  backoff = (uint32_t)kv_get_uint_or_default(
+      "plugin.yahoofinance.session_backoff");
 
   pthread_mutex_lock(&yf_sess_lock);
 
@@ -1254,10 +1250,7 @@ stockquote_fetch_async(const char *const *syms, uint8_t n,
   if(n == 0 || n > YF_MAX_BATCH)
     return(ASYNC_FAILED_UNDELIVERED);
 
-  ttl = (uint32_t)kv_get_uint("plugin.yahoofinance.cache_ttl");
-
-  if(ttl == 0)
-    ttl = 20;
+  ttl = (uint32_t)kv_get_uint_or_default("plugin.yahoofinance.cache_ttl");
 
   now = time(NULL);
 

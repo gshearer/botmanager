@@ -481,6 +481,7 @@ kv_register_owned(const char *key, kv_type_t type, const char *default_val,
   strlcpy(e->key, key, KV_KEY_SZ);
   e->type     = type;
   e->val      = val;
+  e->def      = val;   // what the declaration said, kept for kv_get_uint_or_default
   e->cb       = cb;
   e->cb_data  = cb_data;
   e->help     = (help != NULL) ? intern_help(help) : NULL;
@@ -600,6 +601,26 @@ kv_get_int(const char *key)
   return(result);
 }
 
+// Widen whichever member of `v` the type names. A type that holds no
+// integer reads as 0, which is kv_get_uint's answer for it either way.
+static uint64_t
+val_as_uint(kv_type_t type, const kv_val_t *v)
+{
+  switch(type)
+  {
+    case KV_UINT8:  return(v->u8);
+    case KV_UINT16: return(v->u16);
+    case KV_UINT32: return(v->u32);
+    case KV_UINT64: return(v->u64);
+    case KV_INT8:   return((uint64_t)v->i8);
+    case KV_INT16:  return((uint64_t)v->i16);
+    case KV_INT32:  return((uint64_t)v->i32);
+    case KV_INT64:  return((uint64_t)v->i64);
+    case KV_BOOL:   return((uint64_t)v->u8);
+    default:        return(0);
+  }
+}
+
 uint64_t
 kv_get_uint(const char *key)
 {
@@ -610,20 +631,30 @@ kv_get_uint(const char *key)
   e = find_locked(key);
 
   if(e != NULL)
+    result = val_as_uint(e->type, &e->val);
+
+  pthread_mutex_unlock(&kv_mutex);
+
+  return(result);
+}
+
+uint64_t
+kv_get_uint_or_default(const char *key)
+{
+  uint64_t    result = 0;
+  kv_entry_t *e;
+
+  pthread_mutex_lock(&kv_mutex);
+  e = find_locked(key);
+
+  // One lookup answers both: the default travels with the entry, so the
+  // substitution costs nothing a plain read did not already pay.
+  if(e != NULL)
   {
-    switch(e->type)
-    {
-      case KV_UINT8:  result = e->val.u8;               break;
-      case KV_UINT16: result = e->val.u16;              break;
-      case KV_UINT32: result = e->val.u32;              break;
-      case KV_UINT64: result = e->val.u64;              break;
-      case KV_INT8:   result = (uint64_t)e->val.i8;    break;
-      case KV_INT16:  result = (uint64_t)e->val.i16;   break;
-      case KV_INT32:  result = (uint64_t)e->val.i32;   break;
-      case KV_INT64:  result = (uint64_t)e->val.i64;   break;
-      case KV_BOOL:   result = (uint64_t)e->val.u8;    break;
-      default: break;
-    }
+    result = val_as_uint(e->type, &e->val);
+
+    if(result == 0)
+      result = val_as_uint(e->type, &e->def);
   }
 
   pthread_mutex_unlock(&kv_mutex);
@@ -1112,6 +1143,17 @@ kv_get_bot_method_uint(const char *name, const char *kind, const char *suffix)
     return(0);
 
   return(kv_get_uint(key));
+}
+
+uint64_t
+kv_get_bot_uint_or_default(const char *name, const char *suffix)
+{
+  char key[KV_KEY_SZ];
+
+  if(kv_bot_key(key, sizeof(key), name, NULL, suffix) != SUCCESS)
+    return(0);
+
+  return(kv_get_uint_or_default(key));
 }
 
 const char *

@@ -412,8 +412,8 @@ volunteer_cascade(chatbot_state_t *st, volunteer_job_t *job,
   }
 
   // (d) Hourly cap (under the volunteer ring mutex).
-  hcap = (uint32_t)kv_get_bot_uint(bot_name, "behavior.volunteer.max_per_hour");
-  if(hcap == 0) hcap = 3;
+  hcap = (uint32_t)kv_get_bot_uint_or_default(bot_name,
+      "behavior.volunteer.max_per_hour");
 
   pthread_mutex_lock(&st->volunteer.mutex);
 

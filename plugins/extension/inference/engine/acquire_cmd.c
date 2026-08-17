@@ -879,16 +879,12 @@ static void
 acq_sweep_read_bot_policy(const char *bot_name,
     uint32_t *out_max_mb, uint32_t *out_ttl_days)
 {
-  uint32_t max_mb   = (uint32_t)kv_get_bot_uint(bot_name,
+  // The cap falls back to its declared default; the TTL does not — 0 days
+  // is that key's own default and means "never expire".
+  *out_max_mb   = (uint32_t)kv_get_bot_uint_or_default(bot_name,
       "acquired_corpus_max_mb");
-  uint32_t ttl_days = (uint32_t)kv_get_bot_uint(bot_name,
+  *out_ttl_days = (uint32_t)kv_get_bot_uint(bot_name,
       "acquired_corpus_ttl_days");
-
-  if(max_mb == 0)
-    max_mb = ACQUIRE_DEF_CORPUS_MAX_MB;
-
-  *out_max_mb   = max_mb;
-  *out_ttl_days = ttl_days;
 }
 
 static bool

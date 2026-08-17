@@ -296,7 +296,6 @@ typedef struct
 // See finding_sticky_engagement_answers_others.md for the Run-7
 // observation that motivated this gate.
 #define CHATBOT_HANDOFF_SLOTS                  8
-#define CHATBOT_HANDOFF_WINDOW_DEFAULT_SECS    45
 
 typedef struct
 {

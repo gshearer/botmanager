@@ -1138,10 +1138,7 @@ irc_handle_join(irc_state_t *st, const irc_parsed_msg_t *p)
 
   snprintf(key, sizeof(key), "%schan.%s.admin.kick_unident_delay",
       st->kv_prefix, channame);
-  delay = (uint32_t)kv_get_uint(key);
-
-  if(delay == 0)
-    delay = 30;
+  delay = (uint32_t)kv_get_uint_or_default(key);
 
   kc = mem_alloc("irc", "kick_check", sizeof(*kc));
   strlcpy(kc->inst_name, st->inst_name, sizeof(kc->inst_name));

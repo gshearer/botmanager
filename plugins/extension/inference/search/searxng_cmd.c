@@ -409,12 +409,7 @@ searxng_cmd_dispatch(const cmd_ctx_t *ctx, sxng_category_t category)
   // clamps the final count to [min_results, max_results], so an
   // over-large -n is honoured only up to max_results.
   if(!have_n || n_wanted == 0)
-  {
-    n_wanted = (uint32_t)kv_get_uint("plugin.searxng.min_results");
-
-    if(n_wanted == 0)
-      n_wanted = 1;
-  }
+    n_wanted = (uint32_t)kv_get_uint_or_default("plugin.searxng.min_results");
 
   r = mem_alloc(SEARXNG_CMD_CTX, "req", sizeof(*r));
   memset(r, 0, sizeof(*r));

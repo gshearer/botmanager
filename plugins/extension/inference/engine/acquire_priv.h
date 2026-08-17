@@ -109,7 +109,6 @@ size_t acquire_get_topic_snapshot(const char *bot_name,
 // and (optionally) TTL-expires old chunks.
 #define ACQUIRE_DEF_SWEEP_INTERVAL_SECS        3600
 #define ACQUIRE_MIN_SWEEP_INTERVAL_SECS        60
-#define ACQUIRE_DEF_CORPUS_MAX_MB              200
 #define ACQUIRE_SWEEP_DELETE_BATCH             100
 
 // A6 defaults — reactive path.

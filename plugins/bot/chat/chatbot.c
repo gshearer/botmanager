@@ -1582,8 +1582,9 @@ chatbot_start(void *handle)
   // Soul heartbeat — every chat-enabled bot gets one; its tick re-reads
   // the gates (enabled, mute, interval) fresh each fire.
   if(kv_get_bot_uint(botname, "behavior.chat.enabled") != 0)
-    soul_schedule(botname, ns_id, (uint32_t)kv_get_bot_uint(botname,
-        "behavior.soul.interval_secs"));
+    soul_schedule(botname, ns_id,
+        (uint32_t)kv_get_bot_uint_or_default(botname,
+            "behavior.soul.interval_secs"));
 
   if(kv_get_bot_uint(botname, "behavior.fact_extract.enabled") == 0)
     return(SUCCESS);
@@ -2612,10 +2613,8 @@ chatbot_observe(chatbot_state_t *st, const method_msg_t *msg)
   engagement_require_reply = (kv_get_bot_uint(botname,
       "behavior.speak.engagement_require_reply") != 0);
 
-  handoff_window = (uint32_t)kv_get_bot_uint(botname,
+  handoff_window = (uint32_t)kv_get_bot_uint_or_default(botname,
       "behavior.speak.handoff_window_secs");
-  if(handoff_window == 0)
-    handoff_window = CHATBOT_HANDOFF_WINDOW_DEFAULT_SECS;
 
   reason = CHATBOT_CLASSIFY_WITNESS;
   kind = chatbot_classify_with_engagement(st, msg, &names,

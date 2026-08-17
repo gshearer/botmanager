@@ -143,9 +143,8 @@ chatbot_vision_maybe_submit(chatbot_state_t *st, const method_msg_t *msg)
   target = msg->channel[0] != '\0' ? msg->channel : msg->sender;
 
   // Channel cooldown.
-  cooldown = (uint32_t)kv_get_bot_uint(botname,
+  cooldown = (uint32_t)kv_get_bot_uint_or_default(botname,
       "behavior.image_vision.cooldown_secs");
-  if(cooldown == 0) cooldown = 60;
 
   if(vision_cooldown_hot(&st->vision_cd, target, cooldown, now,
       st->created_at))
@@ -155,15 +154,14 @@ chatbot_vision_maybe_submit(chatbot_state_t *st, const method_msg_t *msg)
   }
 
   // Per-URL cooldown.
-  url_cd = (uint32_t)kv_get_bot_uint(botname,
+  url_cd = (uint32_t)kv_get_bot_uint_or_default(botname,
       "behavior.image_vision.url_cooldown_secs");
-  if(url_cd == 0) url_cd = 600;
 
   vision_url_cd_key(target, image_url, url_cd_key, sizeof(url_cd_key));
 
   // No creation-time floor here, deliberately. This ring is a per-URL
   // dedup, not a rate throttle: flooring it would make a reloaded bot
-  // ignore EVERY image for url_cooldown_secs (600s by default) to avoid
+  // ignore EVERY image for url_cooldown_secs to avoid
   // the far rarer case of re-describing one URL relinked across the
   // reload. The channel ring above already supplies the post-reload
   // quiet window.
@@ -177,9 +175,8 @@ chatbot_vision_maybe_submit(chatbot_state_t *st, const method_msg_t *msg)
   }
 
   // Concurrent-fetch cap.
-  max_inflight = (uint32_t)kv_get_bot_uint(botname,
+  max_inflight = (uint32_t)kv_get_bot_uint_or_default(botname,
       "behavior.image_vision.max_inflight");
-  if(max_inflight == 0) max_inflight = 1;
 
   pthread_mutex_lock(&st->vision_flight_mutex);
   if(st->vision_in_flight >= max_inflight)

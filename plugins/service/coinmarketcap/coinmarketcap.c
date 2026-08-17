@@ -188,10 +188,7 @@ cmc_cache_valid(void)
   if(cmc_cache_count == 0)
     return(false);
 
-  ttl = (uint32_t)kv_get_uint("plugin.coinmarketcap.cache_ttl");
-
-  if(ttl == 0)
-    ttl = 60;
+  ttl = (uint32_t)kv_get_uint_or_default("plugin.coinmarketcap.cache_ttl");
 
   return((time(NULL) - cmc_cache_time) < (time_t)ttl);
 }
@@ -203,10 +200,7 @@ cmc_global_cache_valid(void)
   if(cmc_global_cache_time == 0)
     return(false);
 
-  ttl = (uint32_t)kv_get_uint("plugin.coinmarketcap.cache_ttl");
-
-  if(ttl == 0)
-    ttl = 60;
+  ttl = (uint32_t)kv_get_uint_or_default("plugin.coinmarketcap.cache_ttl");
 
   return((time(NULL) - cmc_global_cache_time) < (time_t)ttl);
 }
@@ -218,14 +212,12 @@ cmc_global_cache_valid(void)
 static bool
 cmc_info_lookup(const char *symbol, cmc_info_t *out)
 {
-  uint32_t ttl   = (uint32_t)kv_get_uint("plugin.coinmarketcap.info_ttl");
+  uint32_t ttl   = (uint32_t)kv_get_uint_or_default(
+      "plugin.coinmarketcap.info_ttl");
   bool     found = false;
 
   if(symbol == NULL || symbol[0] == '\0')
     return(false);
-
-  if(ttl == 0)
-    ttl = 86400;
 
   pthread_mutex_lock(&cmc_info_mu);
 
@@ -1464,10 +1456,8 @@ cmc_kv_changed(const char *key, void *data)
 
   if(poll && cmc_poll_task == TASK_HANDLE_NONE)
   {
-    uint32_t ttl = (uint32_t)kv_get_uint("plugin.coinmarketcap.cache_ttl");
-
-    if(ttl == 0)
-      ttl = 60;
+    uint32_t ttl = (uint32_t)kv_get_uint_or_default(
+        "plugin.coinmarketcap.cache_ttl");
 
     cmc_poll_task = task_add_periodic("cmc_poll", TASK_THREAD,
         200, ttl * 1000, cmc_poll_tick, NULL);
@@ -1485,10 +1475,8 @@ cmc_start(void)
 
   if((uint8_t)kv_get_uint("plugin.coinmarketcap.poll"))
   {
-    uint32_t ttl = (uint32_t)kv_get_uint("plugin.coinmarketcap.cache_ttl");
-
-    if(ttl == 0)
-      ttl = 60;
+    uint32_t ttl = (uint32_t)kv_get_uint_or_default(
+        "plugin.coinmarketcap.cache_ttl");
 
     cmc_poll_task = task_add_periodic("cmc_poll", TASK_THREAD,
         200, ttl * 1000, cmc_poll_tick, NULL);

@@ -427,10 +427,7 @@ giphy_fetch(giphy_mode_t mode, const char *query, size_t n_wanted,
     return(FAIL);
   }
 
-  kv_max = (uint32_t)kv_get_uint(GIPHY_KV_MAX);
-
-  if(kv_max == 0)
-    kv_max = 3;
+  kv_max = (uint32_t)kv_get_uint_or_default(GIPHY_KV_MAX);
 
   if(kv_max > GIPHY_MAX_RESULTS)
     kv_max = GIPHY_MAX_RESULTS;

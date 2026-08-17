@@ -91,6 +91,23 @@ int64_t kv_get_int(const char *key);
 // Returns 0 for missing or type-mismatched keys.
 uint64_t kv_get_uint(const char *key);
 
+// The same read, with an explicit 0 answered by the key's *declared*
+// default rather than by 0.
+//
+// This is for the knob whose help says "0 = the default": the operator's
+// escape hatch back to the shipped value without having to know it.
+// Written the obvious way — read, then `if(v == 0) v = 10;` — that
+// declaration is now in two places, and this tree had 28 such pairs
+// agreeing only by hand (OBS-13). The schema entry is the declaration;
+// this reads it.
+//
+// ⚠ Opt in per call site, never blanket. A knob where 0 is a *value* —
+// "no TTL", "disabled", "no cooldown" — must keep using kv_get_uint, and
+// most do. If the key's own declared default is 0 the two are identical.
+//
+// Returns 0 for a missing key: an undeclared key has no default to give.
+uint64_t kv_get_uint_or_default(const char *key);
+
 // Returns 0.0 for missing or type-mismatched keys.
 double kv_get_double(const char *key);
 
@@ -173,6 +190,10 @@ bool kv_set_cb(const char *key, kv_cb_t cb, void *cb_data);
 
 // Returns 0 for missing, type-mismatched or uncomposable keys.
 uint64_t kv_get_bot_uint(const char *name, const char *suffix);
+
+// kv_get_uint_or_default over a per-bot key — read its contract there
+// before reaching for this one.
+uint64_t kv_get_bot_uint_or_default(const char *name, const char *suffix);
 
 // Returns 0 for missing, type-mismatched or uncomposable keys.
 uint64_t kv_get_bot_method_uint(const char *name, const char *kind,
@@ -350,6 +371,7 @@ typedef struct kv_entry
   char             key[KV_KEY_SZ];
   kv_type_t        type;
   kv_val_t         val;
+  kv_val_t         def;      // the declared default, parsed once at registration
   kv_cb_t          cb;
   void            *cb_data;
   const char      *help;     // human-readable help (static, may be NULL)

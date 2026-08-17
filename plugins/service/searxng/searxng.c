@@ -552,22 +552,18 @@ sxng_search(const char *query, sxng_category_t category, size_t n_wanted,
     return(FAIL);
   }
 
-  kv_max = (uint32_t)kv_get_uint("plugin.searxng.max_results");
-  kv_min = (uint32_t)kv_get_uint("plugin.searxng.min_results");
+  kv_max = (uint32_t)kv_get_uint_or_default("plugin.searxng.max_results");
+  kv_min = (uint32_t)kv_get_uint_or_default("plugin.searxng.min_results");
   safe = (uint32_t)kv_get_uint("plugin.searxng.safesearch");
   to_sec = (uint32_t)kv_get_uint("plugin.searxng.timeout_secs");
 
-  if(kv_max == 0)
-    kv_max = 10;
   if(kv_max > SXNG_HARDMAX_RESULTS)
     kv_max = SXNG_HARDMAX_RESULTS;
 
-  // Result floor. Default 1; can never exceed the per-query cap. A
-  // caller passing 0 still means "use the default cap" (preserves the
-  // inference layer's contract), so the floor only ever raises an
-  // explicit-but-too-small request up to kv_min.
-  if(kv_min == 0)
-    kv_min = 1;
+  // Result floor. Can never exceed the per-query cap. A caller passing 0
+  // still means "use the default cap" (preserves the inference layer's
+  // contract), so the floor only ever raises an explicit-but-too-small
+  // request up to kv_min.
   if(kv_min > kv_max)
     kv_min = kv_max;
 
@@ -578,7 +574,6 @@ sxng_search(const char *query, sxng_category_t category, size_t n_wanted,
 
   if(safe > 2)
     safe = 2;
-
 
   if(sxng_urlencode(query, encoded, sizeof(encoded)) >= sizeof(encoded))
   {

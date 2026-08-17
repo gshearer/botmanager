@@ -925,9 +925,8 @@ extract_dispatch(const char *bot_name, uint32_t ns_id,
     if(pct > 100) pct = 100;
     alias_min_conf = (float)pct / 100.0f;
 
-    cap = (uint32_t)kv_get_bot_uint(bot_name,
+    cap = (uint32_t)kv_get_bot_uint_or_default(bot_name,
         "behavior.fact_extract.aliases_per_sweep_max");
-    if(cap == 0) cap = 3;
     if(cap > EXTRACT_MAX_ALIASES) cap = EXTRACT_MAX_ALIASES;
 
     n_aliases = extract_parse_aliases(res.content, res.content_len,
@@ -1378,9 +1377,8 @@ extract_run_once(const char *bot_name, uint32_t ns_id)
   if(kv_get_bot_uint(bot_name, "behavior.fact_extract.enabled") == 0)
     return(0);
 
-  batch_cap = (uint32_t)kv_get_bot_uint(bot_name,
+  batch_cap = (uint32_t)kv_get_bot_uint_or_default(bot_name,
       "behavior.fact_extract.batch_cap");
-  if(batch_cap == 0) batch_cap = 20;
 
   hwm = (int64_t)kv_get_bot_uint(bot_name, "behavior.fact_extract.hwm");
 

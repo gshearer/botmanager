@@ -3049,9 +3049,8 @@ chatbot_reply_submit(chatbot_state_t *st, const method_msg_t *msg,
     size_t n;
     uint32_t cap;
 
-    cap = (uint32_t)kv_get_bot_uint(botname, "behavior.mention.max_dossiers");
-    if(cap == 0)
-      cap = 4;
+    cap = (uint32_t)kv_get_bot_uint_or_default(botname,
+        "behavior.mention.max_dossiers");
     if(cap > CHATBOT_MENTION_DOSSIERS_CAP)
       cap = CHATBOT_MENTION_DOSSIERS_CAP;
 

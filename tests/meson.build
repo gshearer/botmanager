@@ -112,6 +112,17 @@ test_kv_bot = executable('test_kv_bot',
   dependencies : core_deps,
 )
 
+# 28 read sites wrote a knob's default a second time, downstream of the
+# schema that already declared it (OBS-13). The pairs agreed, so what
+# these cases hold is the property that made them agree by hand: a
+# declaration is what the read answers with.
+test_kv_default = executable('test_kv_default',
+  'test_kv_default.c',
+  include_directories : [include_directories('.'), inc_include],
+  link_with : [test_harness, libcore],
+  dependencies : core_deps,
+)
+
 # kv_get_str hands ~205 sites a pointer they use after the lock is
 # gone. Both ways that promise can break are silent — a value rewritten
 # under a reader, an entry freed under one — so this suite states the
@@ -257,6 +268,7 @@ test('hold', test_hold)
 test('fact_merge', test_fact_merge)
 test('kv_bot', test_kv_bot)
 test('kv_str', test_kv_str)
+test('kv_default', test_kv_default)
 test('curl_submit_wait', test_curl_submit_wait)
 test('cmd_inflight', test_cmd_inflight)
 test('kraken_ws_channels', test_kraken_ws_channels)

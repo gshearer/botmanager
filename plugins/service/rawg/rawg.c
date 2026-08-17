@@ -645,10 +645,7 @@ emit:
 static uint32_t
 rawg_page_size(void)
 {
-  uint32_t ps = (uint32_t)kv_get_uint("plugin.rawg.page_size");
-
-  if(ps == 0)
-    ps = 10;
+  uint32_t ps = (uint32_t)kv_get_uint_or_default("plugin.rawg.page_size");
 
   if(ps > RAWG_HITS_MAX)
     ps = RAWG_HITS_MAX;

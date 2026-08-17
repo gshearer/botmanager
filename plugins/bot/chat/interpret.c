@@ -55,8 +55,6 @@
 #define INTERPRET_PREMISE_SZ   768
 
 #define INTERPRET_SETTLE_MIN_MS      100
-#define INTERPRET_SETTLE_DEFAULT_MS  1500
-#define INTERPRET_WAIT_DEFAULT_SECS  20
 
 typedef struct
 {
@@ -410,12 +408,11 @@ chatbot_interpret_begin(chatbot_state_t *st, const method_msg_t *synth,
   uint32_t settle;
   uint32_t max_wait;
 
-  settle = (uint32_t)kv_get_uint("plugin.chat.interpret.settle_ms");
-  if(settle == 0) settle = INTERPRET_SETTLE_DEFAULT_MS;
+  settle = (uint32_t)kv_get_uint_or_default("plugin.chat.interpret.settle_ms");
   if(settle < INTERPRET_SETTLE_MIN_MS) settle = INTERPRET_SETTLE_MIN_MS;
 
-  max_wait = (uint32_t)kv_get_uint("plugin.chat.interpret.max_wait_secs");
-  if(max_wait == 0) max_wait = INTERPRET_WAIT_DEFAULT_SECS;
+  max_wait = (uint32_t)kv_get_uint_or_default(
+      "plugin.chat.interpret.max_wait_secs");
 
   pthread_mutex_lock(&interpret_mutex);
 
