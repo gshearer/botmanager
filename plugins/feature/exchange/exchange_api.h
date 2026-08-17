@@ -480,6 +480,15 @@ typedef void (*exchange_done_candles_cb_t)(
 typedef void (*exchange_ws_event_cb_t)(const exchange_ws_event_t *ev,
     void *user);
 
+// OBS-23: registration-watch callback. Fired after every SUCCESSFUL
+// exchange registration — fresh or revived — with no exchange locks
+// held, on the registering plugin's lifecycle thread (inside a /plugin
+// op, under core's plugin serialization). `name` is valid for the
+// duration of the call; copy it to keep it. The callback may call back
+// into any exchange_* API and must be brief. Unregistration does NOT
+// fire it.
+typedef void (*exchange_watch_cb_t)(const char *name, void *user);
+
 // Per-exchange protocol vtable.
 //
 // `build_request` prepares an opaque protocol-specific request handle
@@ -600,8 +609,9 @@ bool exchange_request(const char *exchange, uint8_t prio,
     exchange_response_cb_t cb, void *user);
 
 // Register an exchange-protocol implementation. Called from the
-// protocol plugin's `init()` (e.g. coinbase_init) once. The vtable
-// pointer must outlive the abstraction (typical: const file-scope).
+// protocol plugin's `start()` once (init is too early — the registry is
+// queried during whenmoon's start). The vtable pointer must outlive the
+// abstraction (typical: const file-scope).
 // Returns FAIL when `name` is empty or already registered.
 bool exchange_register(const char *name,
     const exchange_protocol_vtable_t *vt);
@@ -610,6 +620,16 @@ bool exchange_register(const char *name,
 // surfaced as failures to their callbacks. Safe to call from the
 // protocol plugin's `deinit()`.
 void exchange_unregister(const char *name);
+
+// OBS-23: watch registrations. A consumer whose state is keyed to a
+// registration (WS subscriptions) registers here and rebuilds on fire.
+// The (cb, user) pair is the identity: duplicates are refused, and the
+// SAME pair must be passed to unregister. A consumer MUST unregister
+// before its own mapping is torn down (deinit) — a stale callback
+// pointer is a crash on the next registration. Table is small and
+// fixed (4 slots); FAIL on NULL cb, duplicate, or full table.
+bool exchange_watch_register(exchange_watch_cb_t cb, void *user);
+void exchange_watch_unregister(exchange_watch_cb_t cb, void *user);
 
 // ------------------------------------------------------------------ //
 // Capability surface (WM-OR-1).                                        //
@@ -778,6 +798,54 @@ exchange_unregister(const char *name)
     __atomic_store_n(&cached, fn, __ATOMIC_RELEASE);
   }
   fn(name);
+}
+
+static inline bool
+exchange_watch_register(exchange_watch_cb_t cb, void *user)
+{
+  typedef bool (*fn_t)(exchange_watch_cb_t, void *);
+  static fn_t cached = NULL;
+  fn_t        fn     = __atomic_load_n(&cached, __ATOMIC_ACQUIRE);
+
+  if(fn == NULL)
+  {
+    union { void *obj; fn_t fn; } u;
+
+    u.obj = plugin_dlsym_cached("exchange", "exchange_watch_register", (void **)&cached);
+    if(u.obj == NULL)
+    {
+      clam(CLAM_FATAL, "exchange",
+          "dlsym failed: exchange_watch_register");
+      abort();
+    }
+    fn = u.fn;
+    __atomic_store_n(&cached, fn, __ATOMIC_RELEASE);
+  }
+  return(fn(cb, user));
+}
+
+static inline void
+exchange_watch_unregister(exchange_watch_cb_t cb, void *user)
+{
+  typedef void (*fn_t)(exchange_watch_cb_t, void *);
+  static fn_t cached = NULL;
+  fn_t        fn     = __atomic_load_n(&cached, __ATOMIC_ACQUIRE);
+
+  if(fn == NULL)
+  {
+    union { void *obj; fn_t fn; } u;
+
+    u.obj = plugin_dlsym_cached("exchange", "exchange_watch_unregister", (void **)&cached);
+    if(u.obj == NULL)
+    {
+      clam(CLAM_FATAL, "exchange",
+          "dlsym failed: exchange_watch_unregister");
+      abort();
+    }
+    fn = u.fn;
+    __atomic_store_n(&cached, fn, __ATOMIC_RELEASE);
+  }
+  fn(cb, user);
 }
 
 static inline bool

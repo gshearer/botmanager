@@ -109,6 +109,15 @@ kr_start(void)
 {
   uint32_t refresh_sec;
 
+  // OBS-23: prime the pair cache from the persisted snapshot BEFORE
+  // registering. Registration fires feature_exchange's registration
+  // watch, and whenmoon rebuilds its WS subscriptions synchronously
+  // inside that call — with an empty cache those subscriptions carry
+  // pass-through symbols (`ETH-USD`) that Kraken rejects, and the feed
+  // stays dead until an operator market op. One SELECT, no network; the
+  // async load below still re-judges staleness and refreshes.
+  kr_assetpairs_prime_sync();
+
   // Self-register with the feature_exchange abstraction so candle
   // traffic + private order/account traffic flows through the
   // priority queue + token bucket.
@@ -127,11 +136,11 @@ kr_start(void)
   // Downstream consumers (e.g. wm_market_restore in whenmoon_start) may
   // dispatch OHLC / WS-subscribe requests before the async load lands,
   // routing abstraction-side symbols (e.g. `BTC-USD`) through
-  // kr_pair_lookup_rest / _ws. On a warm restart the DB snapshot
-  // repopulates the cache within the same boot, so the prior
-  // EQuery:Unknown race is avoided in the common case; a cold/stale
-  // cache falls back to the network refresh and pass-through lookups
-  // until it lands, matching the periodic-refresh behaviour.
+  // kr_pair_lookup_rest / _ws. The synchronous prime above closes that
+  // window whenever a persisted snapshot exists — which is every restart
+  // after the first. A DB with no snapshot at all still falls back to the
+  // network refresh and pass-through lookups until it lands, matching the
+  // periodic-refresh behaviour.
   //
   // The initial prime runs exactly once: when the periodic task is
   // created its first tick fires immediately on submit (task_add_periodic

@@ -160,6 +160,25 @@ test_exchange_ws_gen = executable('test_exchange_ws_gen',
   dependencies : core_deps,
 )
 
+# Dropping a stale handle safely is not the same as coming back: after a
+# provider reload the revived registration owns an empty slot table, and
+# a consumer whose state is keyed to that registration is never told —
+# whenmoon's market feed streamed nothing until an unrelated market
+# command happened to rebuild it. The registration watch is that
+# telling. These cases hold the contract the consumer leans on: fires on
+# SUCCESS only, fresh and revived alike, and with no lock held, so the
+# callback may subscribe again from inside the fire.
+test_exchange_watch = executable('test_exchange_watch',
+  'test_exchange_watch.c',
+  '../plugins/feature/exchange/exchange_caps.c',
+  '../plugins/feature/exchange/exchange_registry.c',
+  '../plugins/feature/exchange/exchange_limiter.c',
+  include_directories : [include_directories('.'), inc_include,
+                         include_directories('../plugins/feature/exchange')],
+  link_with : [test_harness, libcore],
+  dependencies : core_deps,
+)
+
 # The method traffic counters are written by whatever thread replies —
 # method_send holds no lock — and read under method_mutex into
 # /show methods. A lost increment is silent and permanent, so these
@@ -186,4 +205,5 @@ test('curl_submit_wait', test_curl_submit_wait)
 test('cmd_inflight', test_cmd_inflight)
 test('kraken_ws_channels', test_kraken_ws_channels)
 test('exchange_ws_gen', test_exchange_ws_gen)
+test('exchange_watch', test_exchange_watch)
 test('method_stats', test_method_stats)

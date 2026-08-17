@@ -714,6 +714,23 @@ fail:
   return(FAIL);
 }
 
+// OBS-23: a provider's (re)registration is the moment its slot table is
+// empty and every subscription we held against it is stale (OBS-19
+// makes the stale handles safe to drop; it deliberately does not
+// resubscribe — this does). Runs on the registering plugin's lifecycle
+// thread under core's plugin serialization — the same environment this
+// plugin's own start-time restore resub runs in at every boot.
+static void
+wm_exchange_watch_cb(const char *name, void *user)
+{
+  whenmoon_state_t *st = user;
+
+  clam(CLAM_INFO, WHENMOON_CTX,
+      "exchange '%s' registered; rebuilding ws subscriptions", name);
+
+  wm_market_resub_ws(st);
+}
+
 // WM-MR-1: restore runs in start (post-kv_load) so per-plugin KV reads
 // see the persisted values rather than the kv_register defaults.
 static bool
@@ -723,6 +740,14 @@ whenmoon_start(void)
 
   if(st == NULL)
     return(SUCCESS);
+
+  // OBS-23: watch provider registrations for the life of the plugin.
+  // Plugin-op serialization means no fire can land while this start()
+  // itself is executing, and the callback NULL-guards st->markets.
+  if(exchange_watch_register(wm_exchange_watch_cb, st) != SUCCESS)
+    clam(CLAM_WARN, WHENMOON_CTX,
+        "exchange watch register failed; a provider reload will need a "
+        "market stop/start to restore the feed");
 
   if(wm_market_restore(st) != SUCCESS)
     clam(CLAM_INFO, WHENMOON_CTX,
@@ -786,6 +811,11 @@ static void
 whenmoon_deinit(void)
 {
   whenmoon_state_t *st = whenmoon_state;
+
+  // OBS-23: stop the registration watch before any state the callback
+  // reads is torn down. deinit, not stop() — stop can refuse (live
+  // sweeps) and the plugin then keeps running, watched.
+  exchange_watch_unregister(wm_exchange_watch_cb, whenmoon_state);
 
   // Cancel the sweep BEFORE `st` is freed — the task reads through it.
   wm_warm_tailfill_global_destroy();

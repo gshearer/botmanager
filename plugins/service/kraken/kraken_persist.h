@@ -28,6 +28,14 @@ bool kr_assetpairs_ensure_table(void);
 // a successful network refresh.
 bool kr_assetpairs_persist(void);
 
+// OBS-23: populate the in-memory pair cache from the persisted snapshot
+// SYNCHRONOUSLY, before this plugin registers with feature_exchange —
+// registration is what makes a consumer rebuild its WS subscriptions,
+// and a rebuild against an empty cache binds pass-through symbols that
+// Kraken refuses. Age is not judged here; the async load that follows
+// re-judges it. No network, one SELECT. Called from kr_start only.
+void kr_assetpairs_prime_sync(void);
+
 // Async startup prime: load the persisted snapshot from the DB and, if
 // it is empty or stale, fire a background network refresh that
 // re-persists on completion. Returns immediately. Called from kr_start

@@ -193,58 +193,43 @@ kr_assetpairs_persist(void)
 // Prime (DB → cache, refresh-on-stale)
 // ------------------------------------------------------------------
 
-// Async load result handler. Takes ownership of `res` (db_cb_t
-// contract). Repopulates the in-memory cache from a fresh snapshot;
-// fires a background network refresh when the snapshot is missing,
-// failed, or older than the staleness window.
-static void
-kr_assetpairs_load_cb(db_result_t *res, void *data)
+// The snapshot SELECT, shared by the async load and the synchronous
+// prime. Cols: 0=altname 1=canonical 2=wsname 3=age_sec.
+static const char kr_assetpairs_snapshot_sql[] =
+  "SELECT altname, canonical, wsname,"
+  " EXTRACT(EPOCH FROM (NOW() - fetched_at))::bigint AS age_sec"
+  " FROM kraken_assetpairs";
+
+// The oldest row's age, in seconds — the snapshot's age.
+static int64_t
+kr_assetpairs_snapshot_age(const db_result_t *res)
 {
-  uint32_t refresh_sec;
   int64_t  max_age = 0;
-  int64_t  age;
-  uint32_t n       = 0;
   uint32_t i;
 
-  (void)data;
-
-  if(res == NULL || !res->ok || res->rows == 0)
-  {
-    db_result_free(res);
-    (void)kraken_assetpairs_refresh_async(
-        kr_assetpairs_refresh_persist_cb, NULL);
-    return;
-  }
-
-  // Cols: 0=altname 1=canonical 2=wsname 3=age_sec. Take the oldest
-  // row's age as the snapshot age.
   for(i = 0; i < res->rows; i++)
   {
     const char *age_s = db_result_get(res, i, 3);
 
     if(age_s != NULL)
     {
-      age = (int64_t)strtoll(age_s, NULL, 10);
+      int64_t age = (int64_t)strtoll(age_s, NULL, 10);
 
       if(age > max_age)
         max_age = age;
     }
   }
 
-  refresh_sec = (uint32_t)kv_get_uint("plugin.kraken.assetpairs_refresh_sec");
+  return(max_age);
+}
 
-  // refresh_sec == 0 disables the periodic refresh; treat any existing
-  // snapshot as fresh regardless of age (only an empty table refreshes).
-  if(refresh_sec > 0 && max_age >= (int64_t)refresh_sec)
-  {
-    db_result_free(res);
-    clam(CLAM_INFO, KR_CTX,
-        "assetpairs: cache stale (age %llds >= %u s); refreshing",
-        (long long)max_age, refresh_sec);
-    (void)kraken_assetpairs_refresh_async(
-        kr_assetpairs_refresh_persist_cb, NULL);
-    return;
-  }
+// Replace the in-memory cache with the snapshot's rows. Returns how many
+// were applied.
+static uint32_t
+kr_assetpairs_apply(const db_result_t *res)
+{
+  uint32_t n = 0;
+  uint32_t i;
 
   kr_pairs_clear();
 
@@ -261,19 +246,99 @@ kr_assetpairs_load_cb(db_result_t *res, void *data)
     }
   }
 
+  return(n);
+}
+
+// Async load result handler. Takes ownership of `res` (db_cb_t
+// contract). Repopulates the in-memory cache from a fresh snapshot;
+// fires a background network refresh when the snapshot is missing,
+// failed, or older than the staleness window.
+static void
+kr_assetpairs_load_cb(db_result_t *res, void *data)
+{
+  uint32_t refresh_sec;
+  int64_t  max_age;
+  uint32_t n;
+
+  (void)data;
+
+  if(res == NULL || !res->ok || res->rows == 0)
+  {
+    db_result_free(res);
+    (void)kraken_assetpairs_refresh_async(
+        kr_assetpairs_refresh_persist_cb, NULL);
+    return;
+  }
+
+  max_age     = kr_assetpairs_snapshot_age(res);
+  refresh_sec = (uint32_t)kv_get_uint("plugin.kraken.assetpairs_refresh_sec");
+
+  // refresh_sec == 0 disables the periodic refresh; treat any existing
+  // snapshot as fresh regardless of age (only an empty table refreshes).
+  if(refresh_sec > 0 && max_age >= (int64_t)refresh_sec)
+  {
+    db_result_free(res);
+    clam(CLAM_INFO, KR_CTX,
+        "assetpairs: cache stale (age %llds >= %u s); refreshing",
+        (long long)max_age, refresh_sec);
+    (void)kraken_assetpairs_refresh_async(
+        kr_assetpairs_refresh_persist_cb, NULL);
+    return;
+  }
+
+  n = kr_assetpairs_apply(res);
+
   db_result_free(res);
 
   clam(CLAM_INFO, KR_CTX,
       "assetpairs: loaded %u from cache (age %llds)", n, (long long)max_age);
 }
 
+// OBS-23: the pair cache must be populated BEFORE this plugin registers
+// with feature_exchange, because registration is what tells a consumer
+// its subscriptions are stale — and whenmoon rebuilds them synchronously
+// inside that call. kr_ws_subscribe resolves each product to its wsname
+// at slot-creation time (kraken_ws_channels.c), so a rebuild that runs
+// against an empty cache binds the pass-through symbol (`ETH-USD`) and
+// Kraken rejects the subscription outright: "Currency pair not in ISO
+// 4217-A3 format". Measured on 2026-08-16 — the feed stayed dead until
+// an operator market op re-subscribed against a warm cache.
+//
+// So this is the second synchronous DB touch on the startup path, and it
+// is deliberate: one indexed SELECT of a ~1.4k-row table against the
+// pool, no network. Staleness is NOT judged here — a stale name map
+// still resolves every pair a fresh one does, and the async load that
+// follows re-judges it properly and refreshes from the network when it
+// must. An empty or unreachable snapshot leaves the cache as it was and
+// the async path handles it, which is exactly today's behaviour.
+void
+kr_assetpairs_prime_sync(void)
+{
+  db_result_t *res = db_result_alloc();
+  uint32_t     n;
+
+  if(db_query(kr_assetpairs_snapshot_sql, res) != SUCCESS || !res->ok
+      || res->rows == 0)
+  {
+    db_result_free(res);
+    clam(CLAM_INFO, KR_CTX,
+        "assetpairs: no persisted snapshot to prime; async load will refresh");
+    return;
+  }
+
+  n = kr_assetpairs_apply(res);
+
+  clam(CLAM_INFO, KR_CTX,
+      "assetpairs: primed %u from cache (age %llds) before registration",
+      n, (long long)kr_assetpairs_snapshot_age(res));
+
+  db_result_free(res);
+}
+
 void
 kr_assetpairs_load_or_refresh_async(void)
 {
-  if(db_query_async(
-        "SELECT altname, canonical, wsname,"
-        " EXTRACT(EPOCH FROM (NOW() - fetched_at))::bigint AS age_sec"
-        " FROM kraken_assetpairs",
+  if(db_query_async(kr_assetpairs_snapshot_sql,
         kr_assetpairs_load_cb, NULL) == ASYNC_FAILED_UNDELIVERED)
   {
     // DB unreachable / submit failed → never leave the cache empty;

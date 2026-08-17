@@ -397,7 +397,8 @@ struct whenmoon_markets
   // Per-exchange WebSocket bindings covering {TICKER, TRADES}. One
   // entry per distinct exchange in the running set; the binding's
   // ws_sub aggregates every product_id from markets bound to that
-  // exchange. Rebuilt wholesale on every add/remove via
+  // exchange. Rebuilt wholesale on every add/remove and on every
+  // provider (re)registration (OBS-23 watch) via
   // wm_market_resub_ws. NULL ws_sub means the most recent subscribe
   // attempt for that exchange failed; the slot stays so a follow-up
   // resub retries.
@@ -501,6 +502,14 @@ bool wm_market_remove(struct whenmoon_state *st,
 // and call wm_market_add(..., persist=false) for each. SUCCESS even
 // when zero markets are enabled; FAIL only on a hard DB error.
 bool wm_market_restore(struct whenmoon_state *st);
+
+// Rebuild the whole WS subscription set — market feed AND the live
+// trader's user channels — against the current running set. Full
+// teardown + fresh subscribe per distinct exchange; idempotent;
+// respects markets->defer_resub; serialized by market.c's
+// wm_resub_lock. Callers hold NO whenmoon lock. Callers: add / remove /
+// restore, and the OBS-23 registration watch in whenmoon.c.
+void wm_market_resub_ws(struct whenmoon_state *st);
 
 // Parse "<exchange>-<base>-<quote>" (lowercase dash form). Splits on
 // '-', requires exactly 3 non-empty tokens, lowercases all output, and

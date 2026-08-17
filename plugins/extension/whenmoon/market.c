@@ -58,6 +58,17 @@ static const exchange_ws_channel_t wm_ws_channels[] = {
   EXCH_WS_TRADES,
 };
 
+// OBS-23: serializes every ws_bindings rebuild. Before the registration
+// watch, all callers were market commands and overlap needed two
+// near-simultaneous ops; the watch adds a caller on the plugin
+// lifecycle thread, so the "writer-vs-writer serialization is a
+// separate, pre-existing concern" note that used to sit in
+// wm_market_resub_ws is retired by this lock. Order: wm_resub_lock →
+// arr_lock(rd) → per-driver locks; nothing takes them the other way.
+// clam() under it is safe — no clam destination path re-enters a
+// whenmoon lock (the resub already logs under arr_lock today).
+static pthread_mutex_t wm_resub_lock = PTHREAD_MUTEX_INITIALIZER;
+
 // ------------------------------------------------------------------ //
 // Container helpers                                                  //
 // ------------------------------------------------------------------ //
@@ -181,7 +192,11 @@ wm_market_grow(whenmoon_markets_t *m, uint32_t needed)
 // by that exchange ride a single subscribe call. The live trader's
 // user-channel reconcile (wm_live_ws_resub_all) runs once at the end
 // against the same partitioning.
-static void
+//
+// OBS-23: also reached from the exchange registration watch
+// (whenmoon.c), so this is no longer a command-thread-only path — see
+// wm_resub_lock above.
+void
 wm_market_resub_ws(whenmoon_state_t *st)
 {
   whenmoon_markets_t *m;
@@ -194,12 +209,17 @@ wm_market_resub_ws(whenmoon_state_t *st)
 
   m = st->markets;
 
+  pthread_mutex_lock(&wm_resub_lock);
+
   // WM-RESUB-COALESCE-1: during a bulk restore, per-add resubs are
   // suppressed; wm_market_restore issues ONE resub after its add-loop.
   // Rebuilding the whole subscription N times storms coinbase into
   // starving the feed (see finding_ws_resub_storm_starves_feed).
   if(m->defer_resub)
+  {
+    pthread_mutex_unlock(&wm_resub_lock);
     return;
+  }
 
   // WM-MKT-ARR-UAF-1: rdlock across the whole rebuild — the arr walks below
   // must see a stable pointer block, and the pid pointers gathered into
@@ -208,7 +228,7 @@ wm_market_resub_ws(whenmoon_state_t *st)
   // releasing it). Deadlock-safe: everything nested here (wm_live_ws_resub_all,
   // any tick callback) only ever takes rdlock, and recursive read-locking is
   // permitted under the default reader-preferring attributes. (ws_bindings
-  // writer-vs-writer serialization is a separate, pre-existing concern.)
+  // writers are serialized by wm_resub_lock — OBS-23.)
   pthread_rwlock_rdlock(&m->arr_lock);
 
   for(i = 0; i < m->n_ws_bindings; i++)
@@ -226,6 +246,7 @@ wm_market_resub_ws(whenmoon_state_t *st)
   {
     wm_live_ws_resub_all(st);
     pthread_rwlock_unlock(&m->arr_lock);
+    pthread_mutex_unlock(&wm_resub_lock);
     return;
   }
 
@@ -322,6 +343,7 @@ wm_market_resub_ws(whenmoon_state_t *st)
 
   wm_live_ws_resub_all(st);
   pthread_rwlock_unlock(&m->arr_lock);
+  pthread_mutex_unlock(&wm_resub_lock);
 }
 
 // Fire a one-shot candle backfill into the per-market live ring.
@@ -1103,6 +1125,10 @@ wm_market_destroy(whenmoon_state_t *st)
 
   m = st->markets;
 
+  // OBS-23: deliberately outside wm_resub_lock. Deinit runs after core
+  // has drained command handlers (OBS-15's barrier) and under plugin-op
+  // serialization, and the registration watch is unregistered first
+  // (whenmoon_deinit), so no rebuild can be concurrent with this walk.
   for(i = 0; i < m->n_ws_bindings; i++)
   {
     if(m->ws_bindings[i].ws_sub != NULL)

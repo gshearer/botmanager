@@ -14,6 +14,44 @@ static exchange_t       *exchange_registry      = NULL;
 static pthread_mutex_t   exchange_registry_lock;
 static bool              exchange_registry_ready = false;
 
+// OBS-23: registration watchers. See exchange_api.h for the contract.
+// All mutation and every fire happen inside plugin lifecycle callbacks,
+// which core serializes under plugin_mutate_mutex; the mutex here keeps
+// the module honest on its own anyway. Never held across a callback or
+// a clam().
+typedef struct
+{
+  exchange_watch_cb_t cb;
+  void               *user;
+} exchange_watch_slot_t;
+
+#define EXCHANGE_WATCH_MAX 4
+
+static exchange_watch_slot_t exchange_watchers[EXCHANGE_WATCH_MAX];
+static pthread_mutex_t       exchange_watch_lock =
+    PTHREAD_MUTEX_INITIALIZER;
+
+// Snapshot-then-invoke: a callback may re-enter this module (subscribe,
+// find, even watch_register), so nothing is held across the calls.
+static void
+exchange_watch_fire(const char *name)
+{
+  exchange_watch_slot_t snap[EXCHANGE_WATCH_MAX];
+  uint32_t              n = 0;
+  uint32_t              i;
+
+  pthread_mutex_lock(&exchange_watch_lock);
+
+  for(i = 0; i < EXCHANGE_WATCH_MAX; i++)
+    if(exchange_watchers[i].cb != NULL)
+      snap[n++] = exchange_watchers[i];
+
+  pthread_mutex_unlock(&exchange_watch_lock);
+
+  for(i = 0; i < n; i++)
+    snap[i].cb(name, snap[i].user);
+}
+
 void
 exchange_registry_init(void)
 {
@@ -47,6 +85,11 @@ exchange_registry_destroy(void)
   }
 
   pthread_mutex_destroy(&exchange_registry_lock);
+
+  pthread_mutex_lock(&exchange_watch_lock);
+  memset(exchange_watchers, 0, sizeof(exchange_watchers));
+  pthread_mutex_unlock(&exchange_watch_lock);
+
   exchange_registry_ready = false;
 }
 
@@ -122,6 +165,8 @@ exchange_registry_add(const char *name,
         e->name, (unsigned)vt->advertised_rps,
         (unsigned)vt->advertised_burst);
 
+    exchange_watch_fire(e->name);
+
     return(SUCCESS);
   }
 
@@ -151,6 +196,8 @@ exchange_registry_add(const char *name,
       e->name, (unsigned)vt->advertised_rps,
       (unsigned)vt->advertised_burst);
 
+  exchange_watch_fire(e->name);
+
   return(SUCCESS);
 }
 
@@ -178,6 +225,69 @@ bool
 exchange_register(const char *name, const exchange_protocol_vtable_t *vt)
 {
   return(exchange_registry_add(name, vt));
+}
+
+bool
+exchange_watch_register(exchange_watch_cb_t cb, void *user)
+{
+  int32_t  free_slot = -1;
+  uint32_t i;
+
+  if(cb == NULL)
+    return(FAIL);
+
+  pthread_mutex_lock(&exchange_watch_lock);
+
+  for(i = 0; i < EXCHANGE_WATCH_MAX; i++)
+  {
+    if(exchange_watchers[i].cb == cb && exchange_watchers[i].user == user)
+    {
+      pthread_mutex_unlock(&exchange_watch_lock);
+      clam(CLAM_WARN, EXCHANGE_CTX,
+          "watch register rejected: duplicate callback");
+      return(FAIL);
+    }
+
+    if(exchange_watchers[i].cb == NULL && free_slot < 0)
+      free_slot = (int32_t)i;
+  }
+
+  if(free_slot < 0)
+  {
+    pthread_mutex_unlock(&exchange_watch_lock);
+    clam(CLAM_WARN, EXCHANGE_CTX,
+        "watch register rejected: table full (%d)", EXCHANGE_WATCH_MAX);
+    return(FAIL);
+  }
+
+  exchange_watchers[free_slot].cb   = cb;
+  exchange_watchers[free_slot].user = user;
+
+  pthread_mutex_unlock(&exchange_watch_lock);
+  return(SUCCESS);
+}
+
+void
+exchange_watch_unregister(exchange_watch_cb_t cb, void *user)
+{
+  uint32_t i;
+
+  if(cb == NULL)
+    return;
+
+  pthread_mutex_lock(&exchange_watch_lock);
+
+  for(i = 0; i < EXCHANGE_WATCH_MAX; i++)
+  {
+    if(exchange_watchers[i].cb == cb && exchange_watchers[i].user == user)
+    {
+      exchange_watchers[i].cb   = NULL;
+      exchange_watchers[i].user = NULL;
+      break;
+    }
+  }
+
+  pthread_mutex_unlock(&exchange_watch_lock);
 }
 
 // Mark dead + drain the queue: every pending request is surfaced as
