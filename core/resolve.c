@@ -190,6 +190,30 @@ resolve_via_getaddrinfo(resolve_request_t *req, resolve_result_t *result)
 
 // All other types via res_nquery
 
+// An integer field inside a DNS answer sits wherever the message put it: the
+// rdata's offset depends on the names before it, and every name is
+// length-prefixed and compressible. So the wire gives no alignment guarantee
+// and a `*(const uint16_t *)p` load is undefined on bytes we did not lay out
+// — UBSan reports it on ordinary traffic, and a strict-alignment target
+// faults. Read the bytes, then convert.
+static uint16_t
+resolve_rd16(const unsigned char *p)
+{
+  uint16_t v;
+
+  memcpy(&v, p, sizeof(v));
+  return(ntohs(v));
+}
+
+static uint32_t
+resolve_rd32(const unsigned char *p)
+{
+  uint32_t v;
+
+  memcpy(&v, p, sizeof(v));
+  return(ntohl(v));
+}
+
 static int
 resolve_to_qtype_ns(resolve_type_t qtype)
 {
@@ -365,7 +389,7 @@ resolve_via_res_nquery(resolve_request_t *req, resolve_result_t *result)
       case RESOLVE_MX:
         if(rdlen >= 2)
         {
-          rec->mx.priority = ntohs(*(const uint16_t *)rdata);
+          rec->mx.priority = resolve_rd16(rdata);
 
           if(dn_expand(answer, answer + len,
               rdata + 2, dname, sizeof(dname)) >= 0)
@@ -424,9 +448,9 @@ resolve_via_res_nquery(resolve_request_t *req, resolve_result_t *result)
       case RESOLVE_SRV:
         if(rdlen >= 6)
         {
-          rec->srv.priority = ntohs(*(const uint16_t *)(rdata));
-          rec->srv.weight   = ntohs(*(const uint16_t *)(rdata + 2));
-          rec->srv.port     = ntohs(*(const uint16_t *)(rdata + 4));
+          rec->srv.priority = resolve_rd16(rdata);
+          rec->srv.weight   = resolve_rd16(rdata + 2);
+          rec->srv.port     = resolve_rd16(rdata + 4);
 
           if(dn_expand(answer, answer + len,
               rdata + 6, dname, sizeof(dname)) >= 0)
@@ -459,11 +483,11 @@ resolve_via_res_nquery(resolve_request_t *req, resolve_result_t *result)
         // uncomputed, and a certain UBSan report.
         if(rdlen >= 20 && (size_t)(p - rdata) <= (size_t)rdlen - 20)
         {
-          rec->soa.serial  = ntohl(*(const uint32_t *)(p));
-          rec->soa.refresh = ntohl(*(const uint32_t *)(p + 4));
-          rec->soa.retry   = ntohl(*(const uint32_t *)(p + 8));
-          rec->soa.expire  = ntohl(*(const uint32_t *)(p + 12));
-          rec->soa.minimum = ntohl(*(const uint32_t *)(p + 16));
+          rec->soa.serial  = resolve_rd32(p);
+          rec->soa.refresh = resolve_rd32(p + 4);
+          rec->soa.retry   = resolve_rd32(p + 8);
+          rec->soa.expire  = resolve_rd32(p + 12);
+          rec->soa.minimum = resolve_rd32(p + 16);
         }
 
         break;
