@@ -66,12 +66,6 @@ gem_symbols_ensure_table(void)
 
   res = db_result_alloc();
 
-  if(res == NULL)
-  {
-    pthread_mutex_unlock(&gem_symbols_ensure_lock);
-    return(FAIL);
-  }
-
   if(db_query(gem_symbols_ddl, res) != SUCCESS || !res->ok)
   {
     clam(CLAM_WARN, GEM_CTX, "symbols: ensure table failed: %s",
@@ -164,12 +158,6 @@ gem_symbols_persist(void)
       n > 0 ? " ON CONFLICT (native) DO NOTHING;" : "");
 
   dbres = db_result_alloc();
-
-  if(dbres == NULL)
-  {
-    mem_free(sql);
-    return(FAIL);
-  }
 
   if(db_query(sql, dbres) == SUCCESS && dbres->ok)
   {

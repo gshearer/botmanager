@@ -718,12 +718,6 @@ wm_aggregator_load_history(whenmoon_state_t *st, const char *market_id_str,
 
   res = db_result_alloc();
 
-  if(res == NULL)
-  {
-    pthread_rwlock_unlock(&st->markets->arr_lock);
-    return;
-  }
-
   // STEP 0: bracket the (remote) fetch. wm_dl_now_ms() is monotonic
   // (memory wm_dl_now_ms_is_monotonic) — never wm_now_ms() here.
   t0 = wm_dl_now_ms();

@@ -87,9 +87,6 @@ atk_run_ddl(const char *sql)
   db_result_t *res = db_result_alloc();
   bool         ok  = SUCCESS;
 
-  if(res == NULL)
-    return(FAIL);
-
   if(db_query(sql, res) != SUCCESS || !res->ok)
   {
     clam(CLAM_WARN, ATK_CTX, "ddl failed: %s",
@@ -324,9 +321,6 @@ atk_exec(const char *sql, const char *what, uint32_t *affected)
   db_result_t *res = db_result_alloc();
   bool         ok  = FAIL;
 
-  if(res == NULL)
-    return(FAIL);
-
   if(db_query(sql, res) == SUCCESS && res->ok)
   {
     if(affected != NULL)
@@ -381,7 +375,7 @@ atk_db_round_find(uint32_t ns_id, const char *method, const char *channel,
 
   res = db_result_alloc();
 
-  if(res != NULL && db_query(sql, res) == SUCCESS && res->ok && res->rows == 1)
+  if(db_query(sql, res) == SUCCESS && res->ok && res->rows == 1)
   {
     out->id       = atk_col_i64(res, 0, 0);
     out->wave     = atk_col_i32(res, 0, 1);
@@ -445,12 +439,12 @@ atk_db_round_open(uint32_t ns_id, const char *method, const char *channel,
 
   res = db_result_alloc();
 
-  if(res != NULL && db_query(sql, res) == SUCCESS && res->ok && res->rows == 1)
+  if(db_query(sql, res) == SUCCESS && res->ok && res->rows == 1)
     id = atk_col_i64(res, 0, 0);
 
   else
     clam(CLAM_WARN, ATK_CTX, "round open failed: %s",
-        (res != NULL && res->error[0] != '\0')
+        (res->error[0] != '\0')
             ? res->error : "(no driver error)");
 
 out:
@@ -549,7 +543,7 @@ atk_db_player_get(int64_t round_id, const char *username,
 
   res = db_result_alloc();
 
-  if(res != NULL && db_query(sql, res) == SUCCESS && res->ok && res->rows == 1)
+  if(db_query(sql, res) == SUCCESS && res->ok && res->rows == 1)
   {
     atk_col_str(out->nickname, sizeof(out->nickname), res, 0, 0);
     out->hp        = atk_col_i32(res, 0, 1);
@@ -604,7 +598,7 @@ atk_db_classes_dealt(int64_t round_id, atk_dealt_t *out)
 
   res = db_result_alloc();
 
-  if(res != NULL && db_query(sql, res) == SUCCESS && res->ok)
+  if(db_query(sql, res) == SUCCESS && res->ok)
   {
     for(i = 0; i < res->rows; i++)
     {
@@ -617,7 +611,7 @@ atk_db_classes_dealt(int64_t round_id, atk_dealt_t *out)
 
   else
     clam(CLAM_WARN, ATK_CTX, "dealt-class read failed: %s",
-        (res != NULL && res->error[0] != '\0') ? res->error
+        (res->error[0] != '\0') ? res->error
                                                : "(no driver error)");
 
   db_result_free(res);
@@ -652,7 +646,7 @@ atk_db_pending(int64_t round_id, int32_t wave, char *out, size_t cap)
 
   res = db_result_alloc();
 
-  if(res != NULL && db_query(sql, res) == SUCCESS && res->ok && res->rows == 1)
+  if(db_query(sql, res) == SUCCESS && res->ok && res->rows == 1)
   {
     atk_col_str(out, cap, res, 0, 0);
     ok = SUCCESS;
@@ -710,7 +704,7 @@ atk_db_card_find(uint32_t ns_id, const char *method, const char *channel,
 
   res = db_result_alloc();
 
-  if(res != NULL && db_query(sql, res) == SUCCESS && res->ok && res->rows == 1)
+  if(db_query(sql, res) == SUCCESS && res->ok && res->rows == 1)
   {
     out->id     = atk_col_i64(res, 0, 0);
     atk_col_str(out->channel, sizeof(out->channel), res, 0, 1);
@@ -765,7 +759,7 @@ atk_db_card_roster(int64_t round_id, atk_card_row_t *out, uint32_t cap,
 
   res = db_result_alloc();
 
-  if(res != NULL && db_query(sql, res) == SUCCESS && res->ok)
+  if(db_query(sql, res) == SUCCESS && res->ok)
   {
     for(n = 0; n < res->rows && n < cap; n++)
     {
@@ -790,7 +784,7 @@ atk_db_card_roster(int64_t round_id, atk_card_row_t *out, uint32_t cap,
   // the failure has to say so somewhere.
   else
     clam(CLAM_WARN, ATK_CTX, "round card roster failed: %s",
-        (res != NULL && res->error[0] != '\0') ? res->error
+        (res->error[0] != '\0') ? res->error
                                                : "(no driver error)");
 
   db_result_free(res);
@@ -828,7 +822,7 @@ atk_db_scores(uint32_t ns_id, uint32_t limit, atk_score_row_t *out,
 
   res = db_result_alloc();
 
-  if(res != NULL && db_query(sql, res) == SUCCESS && res->ok)
+  if(db_query(sql, res) == SUCCESS && res->ok)
   {
     for(n = 0; n < res->rows && n < limit; n++)
     {
@@ -876,7 +870,7 @@ atk_db_deadliest(uint32_t ns_id, char *by, size_t by_cap, char *on,
 
   res = db_result_alloc();
 
-  if(res != NULL && db_query(sql, res) == SUCCESS && res->ok && res->rows == 1)
+  if(db_query(sql, res) == SUCCESS && res->ok && res->rows == 1)
   {
     atk_col_str(by, by_cap, res, 0, 0);
     atk_col_str(on, on_cap, res, 0, 1);
@@ -1075,7 +1069,7 @@ atk_db_living(int64_t round_id, const char *except, atk_victim_t *out,
 
   res = db_result_alloc();
 
-  if(res != NULL && db_query(sql, res) == SUCCESS && res->ok)
+  if(db_query(sql, res) == SUCCESS && res->ok)
   {
     for(n = 0; n < res->rows && n < cap; n++)
     {
@@ -1090,7 +1084,7 @@ atk_db_living(int64_t round_id, const char *except, atk_victim_t *out,
 
   else
     clam(CLAM_WARN, ATK_CTX, "living roster failed: %s",
-        (res != NULL && res->error[0] != '\0') ? res->error
+        (res->error[0] != '\0') ? res->error
                                                : "(no driver error)");
 
   db_result_free(res);
@@ -1658,7 +1652,7 @@ atk_db_dot_marks(int64_t round_id, atk_dot_mark_t *out, uint32_t cap)
 
   res = db_result_alloc();
 
-  if(res == NULL || db_query(sql, res) != SUCCESS || !res->ok)
+  if(db_query(sql, res) != SUCCESS || !res->ok)
     goto out;
 
   for(row = 0; row < res->rows; row++)
@@ -1729,7 +1723,7 @@ atk_db_dot_due(atk_dot_due_t *out, uint32_t cap)
 
   res = db_result_alloc();
 
-  if(res != NULL && db_query(sql, res) == SUCCESS && res->ok)
+  if(db_query(sql, res) == SUCCESS && res->ok)
   {
     for(n = 0; n < res->rows && n < cap; n++)
     {
@@ -1788,7 +1782,7 @@ atk_db_dot_live(void)
 
   res = db_result_alloc();
 
-  if(res != NULL && db_query(sql, res) == SUCCESS && res->ok && res->rows == 1)
+  if(db_query(sql, res) == SUCCESS && res->ok && res->rows == 1)
     n = (uint32_t)atk_col_i64(res, 0, 0);
 
   db_result_free(res);

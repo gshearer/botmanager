@@ -300,11 +300,10 @@ chatbot_followups_run(const char *bot_name, uint32_t ns_id, bot_inst_t *bot)
 
   res = db_result_alloc();
 
-  if(res == NULL || db_query(sql, res) != SUCCESS || !res->ok)
+  if(db_query(sql, res) != SUCCESS || !res->ok)
   {
-    if(res != NULL)
-      clam(CLAM_WARN, FOLLOWUPS_CTX, "event scan failed: %s",
-          res->error[0] != '\0' ? res->error : "(no driver error)");
+    clam(CLAM_WARN, FOLLOWUPS_CTX, "event scan failed: %s",
+        res->error[0] != '\0' ? res->error : "(no driver error)");
 
     db_result_free(res);
     return;

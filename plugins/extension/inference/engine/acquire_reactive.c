@@ -252,7 +252,7 @@ acq_topic_stats_bump(const char *bot, const char *topic,
 
   if(db_query(sql, res) != SUCCESS || !res->ok)
     clam(CLAM_WARN, ACQUIRE_CTX, "topic_stats upsert failed: %s",
-        res != NULL ? res->error : "(null)");
+        res->error);
 
   db_result_free(res);
 }

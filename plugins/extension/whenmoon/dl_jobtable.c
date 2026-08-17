@@ -305,16 +305,13 @@ wm_dl_job_clear_in_flight(dl_jobtable_t *t, dl_job_t *j)
 static bool
 wm_dl_load_jobs(dl_jobtable_t *t)
 {
-  db_result_t *res = NULL;
+  db_result_t *res;
   bool         ok = FAIL;
   uint32_t     loaded = 0;
 
   // Pull core job columns + joined market fields so we can populate
   // exchange_symbol without a second query per job.
   res = db_result_alloc();
-
-  if(res == NULL)
-    goto out;
 
   // Trade-tape downloads were retired alongside the per-pair trade
   // tables; legacy rows where kind = 'trades' are filtered out at
@@ -428,7 +425,7 @@ wm_dl_load_jobs(dl_jobtable_t *t)
         loaded, loaded == 1 ? "" : "s");
 
 out:
-  if(res != NULL) db_result_free(res);
+  db_result_free(res);
 
   return(ok);
 }
@@ -559,12 +556,6 @@ wm_dl_job_persist(dl_jobtable_t *t, const dl_job_t *j)
 
   res = db_result_alloc();
 
-  if(res == NULL)
-  {
-    mem_free(e_err);
-    return;
-  }
-
   if(db_query(sql, res) != SUCCESS || !res->ok)
     clam(CLAM_WARN, WM_DL_CTX,
         "job persist failed for id=%" PRId64 ": %s",
@@ -633,9 +624,6 @@ wm_dl_insert_job(int32_t market_id,
 
   res = db_result_alloc();
 
-  if(res == NULL)
-    goto out;
-
   if(db_query(sql, res) == SUCCESS && res->ok && res->rows == 1)
   {
     const char *s_id = db_result_get(res, 0, 0);
@@ -649,8 +637,7 @@ wm_dl_insert_job(int32_t market_id,
 
   else
     clam(CLAM_WARN, WM_DL_CTX, "job insert failed: %s",
-        res != NULL && res->error[0] != '\0'
-            ? res->error : "(no driver error)");
+        res->error[0] != '\0' ? res->error : "(no driver error)");
 
 out:
   if(res   != NULL) db_result_free(res);

@@ -251,12 +251,6 @@ wm_dl_candles_insert_page(int32_t market_id,
 
   dbres = db_result_alloc();
 
-  if(dbres == NULL)
-  {
-    mem_free(sql);
-    return(0);
-  }
-
   if(db_query(sql, dbres) == SUCCESS && dbres->ok)
     written = dbres->rows_affected;
 
@@ -557,9 +551,6 @@ wm_dl_candles_query_aggregated(int32_t market_id, int32_t gran_secs,
     goto out;
 
   res = db_result_alloc();
-
-  if(res == NULL)
-    goto out;
 
   if(db_query(sql, res) != SUCCESS || !res->ok)
   {

@@ -63,9 +63,6 @@ uq_run_ddl(const char *sql)
   db_result_t *res = db_result_alloc();
   bool         ok  = SUCCESS;
 
-  if(res == NULL)
-    return(FAIL);
-
   if(db_query(sql, res) != SUCCESS || !res->ok)
   {
     clam(CLAM_WARN, UQ_CTX, "ddl failed: %s",
@@ -195,7 +192,7 @@ uq_db_add(uint32_t ns_id, const char *method, const char *channel,
 
   res = db_result_alloc();
 
-  if(res != NULL && db_query(sql, res) == SUCCESS && res->ok &&
+  if(db_query(sql, res) == SUCCESS && res->ok &&
      res->rows == 1)
   {
     const char *s = db_result_get(res, 0, 0);
@@ -206,7 +203,7 @@ uq_db_add(uint32_t ns_id, const char *method, const char *channel,
 
   else
     clam(CLAM_WARN, UQ_CTX, "quote insert failed: %s",
-        (res != NULL && res->error[0] != '\0')
+        (res->error[0] != '\0')
             ? res->error : "(no driver error)");
 
 out:
@@ -292,7 +289,7 @@ uq_db_get(uint32_t ns_id, int64_t id, const char *sayer, uq_quote_t *out)
 
   res = db_result_alloc();
 
-  if(res != NULL && db_query(sql, res) == SUCCESS && res->ok &&
+  if(db_query(sql, res) == SUCCESS && res->ok &&
      res->rows == 1)
   {
     const char *s_id = db_result_get(res, 0, 0);
@@ -323,9 +320,7 @@ uq_db_get(uint32_t ns_id, int64_t id, const char *sayer, uq_quote_t *out)
 
     res = db_result_alloc();
 
-    if(res != NULL)
-      (void)db_query(sql, res);
-
+    (void)db_query(sql, res);
     db_result_free(res);
   }
 
@@ -356,12 +351,12 @@ uq_db_del(uint32_t ns_id, int64_t id)
 
   res = db_result_alloc();
 
-  if(res != NULL && db_query(sql, res) == SUCCESS && res->ok)
+  if(db_query(sql, res) == SUCCESS && res->ok)
     affected = (int)res->rows_affected;
 
   else
     clam(CLAM_WARN, UQ_CTX, "quote delete failed: %s",
-        (res != NULL && res->error[0] != '\0')
+        (res->error[0] != '\0')
             ? res->error : "(no driver error)");
 
   db_result_free(res);

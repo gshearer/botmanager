@@ -711,21 +711,18 @@ wm_mp_run_drained(wm_mp_entry_t *head)
     {
       res = db_result_alloc();
 
-      if(res != NULL)
-      {
-        if(db_query(e->sql, res) != SUCCESS || !res->ok)
-          clam(CLAM_WARN, WHENMOON_CTX,
-              "market-state persist failed (market_id=%" PRId32 "): %s",
-              e->market_id,
-              res->error[0] != '\0' ? res->error : "(no driver error)");
-        else
-          clam(CLAM_DEBUG2, WHENMOON_CTX,
-              "market-state persisted (market_id=%" PRId32
-              ", affected=%u)",
-              e->market_id, res->rows_affected);
+      if(db_query(e->sql, res) != SUCCESS || !res->ok)
+        clam(CLAM_WARN, WHENMOON_CTX,
+            "market-state persist failed (market_id=%" PRId32 "): %s",
+            e->market_id,
+            res->error[0] != '\0' ? res->error : "(no driver error)");
 
-        db_result_free(res);
-      }
+      else
+        clam(CLAM_DEBUG2, WHENMOON_CTX,
+            "market-state persisted (market_id=%" PRId32 ", affected=%u)",
+            e->market_id, res->rows_affected);
+
+      db_result_free(res);
 
       mem_free(e->sql);
     }
@@ -1038,7 +1035,7 @@ wm_mp_parse_json_or_null(const char *raw)
 bool
 wm_market_persist_restore_all(whenmoon_state_t *st)
 {
-  db_result_t        *res = NULL;
+  db_result_t        *res;
   bool                ok = SUCCESS;
   uint32_t            n_restored = 0;
   uint32_t            n_skipped  = 0;
@@ -1048,9 +1045,6 @@ wm_market_persist_restore_all(whenmoon_state_t *st)
     return(FAIL);
 
   res = db_result_alloc();
-
-  if(res == NULL)
-    return(FAIL);
 
   if(db_query(
          "SELECT market_id, mode, position_side, position_qty,"
@@ -1240,7 +1234,7 @@ wm_market_persist_restore_all(whenmoon_state_t *st)
       n_restored, n_skipped);
 
 out:
-  if(res != NULL) db_result_free(res);
+  db_result_free(res);
 
   return(ok);
 }

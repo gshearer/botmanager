@@ -426,9 +426,6 @@ pricewatch_on_watchlist(const char *bot_name, const char *pair,
 
   res = db_result_alloc();
 
-  if(res == NULL)
-    return(false);
-
   if(db_query(sql, res) == SUCCESS && res->ok && res->rows > 0)
   {
     found = true;
@@ -520,7 +517,7 @@ cmd_bot_watchlist(const cmd_ctx_t *ctx)
 
   res = db_result_alloc();
 
-  if(res == NULL || db_query(sql, res) != SUCCESS || !res->ok)
+  if(db_query(sql, res) != SUCCESS || !res->ok)
   {
     db_result_free(res);
     cmd_reply(ctx, "could not update the watchlist");
@@ -593,7 +590,7 @@ cmd_show_bot_watchlist(const cmd_ctx_t *ctx)
 
   res = db_result_alloc();
 
-  if(res == NULL || db_query(sql, res) != SUCCESS || !res->ok)
+  if(db_query(sql, res) != SUCCESS || !res->ok)
   {
     db_result_free(res);
     cmd_reply(ctx, "query failed");
@@ -909,7 +906,7 @@ cmd_pricewatch_list(const cmd_ctx_t *ctx)
 
   res = db_result_alloc();
 
-  if(res == NULL || db_query(sql, res) != SUCCESS || !res->ok)
+  if(db_query(sql, res) != SUCCESS || !res->ok)
   {
     db_result_free(res);
     cmd_reply(ctx, "could not read your price watches");
@@ -969,7 +966,7 @@ cmd_pricewatch_cancel(const cmd_ctx_t *ctx)
 
   res = db_result_alloc();
 
-  if(res == NULL || db_query(sql, res) != SUCCESS || !res->ok)
+  if(db_query(sql, res) != SUCCESS || !res->ok)
   {
     db_result_free(res);
     cmd_reply(ctx, "could not cancel it");
@@ -1080,9 +1077,6 @@ pricewatch_report(const pricewatch_sweep_t *sweep, const pricewatch_row_t *row,
       " AND fired_at IS NULL RETURNING id", row->id);
 
   res = db_result_alloc();
-
-  if(res == NULL)
-    return(false);
 
   won = (db_query(sql, res) == SUCCESS && res->ok && res->rows > 0);
   db_result_free(res);
@@ -1296,9 +1290,6 @@ pricewatch_load_pairs(pricewatch_sweep_t *sweep)
 
   res = db_result_alloc();
 
-  if(res == NULL)
-    return(0);
-
   if(db_query(sql, res) == SUCCESS && res->ok)
     for(uint32_t i = 0; i < res->rows && sweep->n_quotes < PRICEWATCH_PAIRS_MAX;
         i++)
@@ -1349,9 +1340,6 @@ pricewatch_load_rows(pricewatch_sweep_t *sweep)
   mem_free(e_bot);
 
   res = db_result_alloc();
-
-  if(res == NULL)
-    return;
 
   if(db_query(sql, res) == SUCCESS && res->ok)
     for(uint32_t i = 0; i < res->rows && sweep->n_rows < PRICEWATCH_ROWS_MAX;

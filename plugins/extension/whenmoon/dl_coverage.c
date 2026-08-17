@@ -59,9 +59,6 @@ wm_candle_newest_ms(int32_t market_id)
 
   res = db_result_alloc();
 
-  if(res == NULL)
-    return(0);
-
   if(db_query(sql, res) == SUCCESS && res->ok && res->rows > 0)
   {
     const char *s = db_result_get(res, 0, 0);
@@ -171,12 +168,6 @@ wm_cov_check_sanity(const wm_coverage_t *iv)
   }
 
   res = db_result_alloc();
-
-  if(res == NULL)
-  {
-    ok = FAIL;
-    goto out;
-  }
 
   if(db_query(sql, res) != SUCCESS || !res->ok)
   {
@@ -315,9 +306,6 @@ wm_cov_merge_tx(const wm_coverage_t *iv)
 
   res = db_result_alloc();
 
-  if(res == NULL)
-    goto out;
-
   if(db_query(sql, res) == SUCCESS && res->ok)
   {
     ok = SUCCESS;
@@ -447,9 +435,6 @@ wm_gap_find_row_gaps(int32_t market_id,
 
   res = db_result_alloc();
 
-  if(res == NULL)
-    goto out;
-
   if(db_query(sql, res) != SUCCESS || !res->ok)
   {
     clam(CLAM_WARN, WM_DL_CTX,
@@ -574,9 +559,6 @@ wm_gap_largest_missing(int32_t market_id,
     goto out;
 
   res = db_result_alloc();
-
-  if(res == NULL)
-    goto out;
 
   if(db_query(sql, res) != SUCCESS || !res->ok)
   {

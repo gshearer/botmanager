@@ -67,12 +67,6 @@ kr_assetpairs_ensure_table(void)
 
   res = db_result_alloc();
 
-  if(res == NULL)
-  {
-    pthread_mutex_unlock(&kr_assetpairs_ensure_lock);
-    return(FAIL);
-  }
-
   if(db_query(kr_assetpairs_ddl, res) != SUCCESS || !res->ok)
   {
     clam(CLAM_WARN, KR_CTX, "assetpairs: ensure table failed: %s",
@@ -166,12 +160,6 @@ kr_assetpairs_persist(void)
       n > 0 ? " ON CONFLICT (altname) DO NOTHING;" : "");
 
   dbres = db_result_alloc();
-
-  if(dbres == NULL)
-  {
-    mem_free(sql);
-    return(FAIL);
-  }
 
   if(db_query(sql, dbres) == SUCCESS && dbres->ok)
   {

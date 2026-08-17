@@ -889,9 +889,6 @@ wm_market_set_enabled(int32_t market_id, bool enabled)
 
   res = db_result_alloc();
 
-  if(res == NULL)
-    return(FAIL);
-
   if(db_query(sql, res) == SUCCESS && res->ok)
     ok = SUCCESS;
 
@@ -1530,7 +1527,7 @@ wm_market_remove(whenmoon_state_t *st,
 bool
 wm_market_restore(whenmoon_state_t *st)
 {
-  db_result_t *res = NULL;
+  db_result_t *res;
   uint32_t     i;
   uint32_t     n_restored = 0;
   bool         ok = SUCCESS;
@@ -1539,9 +1536,6 @@ wm_market_restore(whenmoon_state_t *st)
     return(FAIL);
 
   res = db_result_alloc();
-
-  if(res == NULL)
-    return(FAIL);
 
   // WM-MI-2: the per-instance running set lives in wm_market_state
   // (enabled=TRUE), joined to wm_market for the product coordinates. One
@@ -1611,7 +1605,7 @@ wm_market_restore(whenmoon_state_t *st)
       "%u running market(s) restored", n_restored);
 
 out:
-  if(res != NULL) db_result_free(res);
+  db_result_free(res);
 
   return(ok);
 }

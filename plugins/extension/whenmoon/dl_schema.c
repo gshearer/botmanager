@@ -167,9 +167,6 @@ wm_dl_run_ddl(const char *sql)
 
   res = db_result_alloc();
 
-  if(res == NULL)
-    return(FAIL);
-
   if(db_query(sql, res) != SUCCESS || !res->ok)
   {
     clam(CLAM_WARN, WM_DL_CTX, "ddl failed: %s",
@@ -205,12 +202,6 @@ wm_dl_install_candle_upsample_fn(void)
 
   res = db_result_alloc();
 
-  if(res == NULL)
-  {
-    mem_free(sql);
-    return(FAIL);
-  }
-
   if(db_query(sql, res) == SUCCESS && res->ok)
     ok = SUCCESS;
 
@@ -238,9 +229,6 @@ wm_dl_reset_orphan_jobs(void)
   bool         ok = FAIL;
 
   res = db_result_alloc();
-
-  if(res == NULL)
-    return(FAIL);
 
   if(db_query(
          "UPDATE wm_download_job"
@@ -400,9 +388,6 @@ wm_bt_bar_ms_one(int32_t market_id, const char *agg, int64_t *out_ms)
 
   res = db_result_alloc();
 
-  if(res == NULL)
-    return(FAIL);
-
   if(db_query(sql, res) != SUCCESS || !res->ok)
     goto out;
 
@@ -484,7 +469,7 @@ wm_market_lookup_or_create(const char *exchange, const char *base_asset,
 
   res = db_result_alloc();
 
-  if(res != NULL && db_query(sql, res) == SUCCESS && res->ok &&
+  if(db_query(sql, res) == SUCCESS && res->ok &&
      res->rows == 1)
   {
     const char *s = db_result_get(res, 0, 0);
@@ -509,7 +494,7 @@ wm_market_lookup_or_create(const char *exchange, const char *base_asset,
 
   res = db_result_alloc();
 
-  if(res != NULL && db_query(sql, res) == SUCCESS && res->ok &&
+  if(db_query(sql, res) == SUCCESS && res->ok &&
      res->rows == 1)
   {
     const char *s = db_result_get(res, 0, 0);
@@ -522,7 +507,7 @@ wm_market_lookup_or_create(const char *exchange, const char *base_asset,
     clam(CLAM_WARN, WM_DL_CTX,
         "market create failed for %s:%s:%s (%s): %s",
         exchange, base_asset, quote_asset, exchange_symbol,
-        (res != NULL && res->error[0] != '\0')
+        (res->error[0] != '\0')
             ? res->error : "(no driver error)");
 
   db_result_free(res);

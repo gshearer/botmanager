@@ -85,9 +85,6 @@ stock_run_ddl(const char *sql)
   db_result_t *res = db_result_alloc();
   bool         ok  = SUCCESS;
 
-  if(res == NULL)
-    return(FAIL);
-
   if(db_query(sql, res) != SUCCESS || !res->ok)
   {
     clam(CLAM_WARN, STOCK_CTX, "ddl failed: %s",
@@ -228,7 +225,7 @@ stock_row_read(uint32_t ns_id, const char *name, stock_symset_t *out)
 
   res = db_result_alloc();
 
-  if(res != NULL && db_query(sql, res) == SUCCESS && res->ok)
+  if(db_query(sql, res) == SUCCESS && res->ok)
   {
     if(res->rows == 1)
     {
@@ -244,7 +241,7 @@ stock_row_read(uint32_t ns_id, const char *name, stock_symset_t *out)
 
   else
     clam(CLAM_WARN, STOCK_CTX, "list read failed: %s",
-        (res != NULL && res->error[0] != '\0')
+        (res->error[0] != '\0')
             ? res->error : "(no driver error)");
 
   db_result_free(res);
@@ -279,12 +276,12 @@ stock_row_write(uint32_t ns_id, const char *name, const stock_symset_t *set)
 
   res = db_result_alloc();
 
-  if(res != NULL && db_query(sql, res) == SUCCESS && res->ok)
+  if(db_query(sql, res) == SUCCESS && res->ok)
     rc = STOCK_LIST_OK;
 
   else
     clam(CLAM_WARN, STOCK_CTX, "list write failed: %s",
-        (res != NULL && res->error[0] != '\0')
+        (res->error[0] != '\0')
             ? res->error : "(no driver error)");
 
 out:
@@ -314,12 +311,12 @@ stock_row_drop(uint32_t ns_id, const char *name)
 
   res = db_result_alloc();
 
-  if(res != NULL && db_query(sql, res) == SUCCESS && res->ok)
+  if(db_query(sql, res) == SUCCESS && res->ok)
     rc = STOCK_LIST_OK;
 
   else
     clam(CLAM_WARN, STOCK_CTX, "list drop failed: %s",
-        (res != NULL && res->error[0] != '\0')
+        (res->error[0] != '\0')
             ? res->error : "(no driver error)");
 
   db_result_free(res);
@@ -479,7 +476,7 @@ stock_lists_names(uint32_t ns_id, char *out, size_t cap, uint32_t *count)
 
   res = db_result_alloc();
 
-  if(res != NULL && db_query(sql, res) == SUCCESS && res->ok)
+  if(db_query(sql, res) == SUCCESS && res->ok)
   {
     uint32_t r;
 
@@ -510,7 +507,7 @@ stock_lists_names(uint32_t ns_id, char *out, size_t cap, uint32_t *count)
 
   else
     clam(CLAM_WARN, STOCK_CTX, "list enumerate failed: %s",
-        (res != NULL && res->error[0] != '\0')
+        (res->error[0] != '\0')
             ? res->error : "(no driver error)");
 
   db_result_free(res);

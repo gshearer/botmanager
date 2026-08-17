@@ -65,9 +65,6 @@ note_run_ddl(const char *sql)
   db_result_t *res = db_result_alloc();
   bool         ok  = SUCCESS;
 
-  if(res == NULL)
-    return(FAIL);
-
   if(db_query(sql, res) != SUCCESS || !res->ok)
   {
     clam(CLAM_WARN, NOTE_CTX, "ddl failed: %s",
@@ -196,7 +193,7 @@ note_db_add(uint32_t ns_id, const char *sender, const char *recipient,
 
   res = db_result_alloc();
 
-  if(res != NULL && db_query(sql, res) == SUCCESS && res->ok
+  if(db_query(sql, res) == SUCCESS && res->ok
       && res->rows == 1)
   {
     const char *s = db_result_get(res, 0, 0);
@@ -207,7 +204,7 @@ note_db_add(uint32_t ns_id, const char *sender, const char *recipient,
 
   else
     clam(CLAM_WARN, NOTE_CTX, "note insert failed: %s",
-        (res != NULL && res->error[0] != '\0')
+        (res->error[0] != '\0')
             ? res->error : "(no driver error)");
 
 out:
@@ -253,7 +250,7 @@ note_db_pending_count(uint32_t ns_id, const char *recipient)
 
   res = db_result_alloc();
 
-  if(res != NULL && db_query(sql, res) == SUCCESS && res->ok
+  if(db_query(sql, res) == SUCCESS && res->ok
       && res->rows == 1)
   {
     const char *s = db_result_get(res, 0, 0);
@@ -326,7 +323,7 @@ note_db_claim(uint32_t ns_id, const char *recipient, note_row_t *out,
 
   res = db_result_alloc();
 
-  if(res != NULL && db_query(sql, res) == SUCCESS && res->ok)
+  if(db_query(sql, res) == SUCCESS && res->ok)
   {
     uint32_t rows = (res->rows < cap) ? res->rows : cap;
 
@@ -346,7 +343,7 @@ note_db_claim(uint32_t ns_id, const char *recipient, note_row_t *out,
 
   else
     clam(CLAM_WARN, NOTE_CTX, "note claim failed: %s",
-        (res != NULL && res->error[0] != '\0')
+        (res->error[0] != '\0')
             ? res->error : "(no driver error)");
 
   db_result_free(res);
@@ -376,7 +373,7 @@ note_db_pending_reload(void)
 
   res = db_result_alloc();
 
-  if(res != NULL && db_query(sql, res) == SUCCESS && res->ok)
+  if(db_query(sql, res) == SUCCESS && res->ok)
   {
     for(uint32_t i = 0; i < res->rows; i++)
     {

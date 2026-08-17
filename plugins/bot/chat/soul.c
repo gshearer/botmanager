@@ -224,9 +224,6 @@ soul_claim_take(uint32_t ns_id, const char *key, time_t expires)
 
   res = db_result_alloc();
 
-  if(res == NULL)
-    return(false);
-
   if(db_query(sql, res) != SUCCESS || !res->ok)
     clam(CLAM_WARN, SOUL_CTX, "claim '%s' failed: %s", key,
         res->error[0] != '\0' ? res->error : "(no driver error)");
@@ -1142,11 +1139,10 @@ soul_chore_weather(soul_sched_t *s, uint32_t chore,
 
   res = db_result_alloc();
 
-  if(res == NULL || db_query(sql, res) != SUCCESS || !res->ok)
+  if(db_query(sql, res) != SUCCESS || !res->ok)
   {
-    if(res != NULL)
-      clam(CLAM_WARN, SOUL_CTX, "watch scan failed: %s",
-          res->error[0] != '\0' ? res->error : "(no driver error)");
+    clam(CLAM_WARN, SOUL_CTX, "watch scan failed: %s",
+        res->error[0] != '\0' ? res->error : "(no driver error)");
 
     db_result_free(res);
     return(false);

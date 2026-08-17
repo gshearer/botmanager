@@ -93,9 +93,6 @@ chatbot_deferred_ensure_schema(void)
 {
   db_result_t *res = db_result_alloc();
 
-  if(res == NULL)
-    return;
-
   // The chat DDL discipline (memory_ensure_schema): owner-run
   // idempotent batches at plugin start(), after dossier_register_config
   // so the dossier(id) FK target exists.
@@ -670,11 +667,10 @@ chatbot_deferred_run_due(const char *bot_name, uint32_t ns_id,
 
   res = db_result_alloc();
 
-  if(res == NULL || db_query(sql, res) != SUCCESS || !res->ok)
+  if(db_query(sql, res) != SUCCESS || !res->ok)
   {
-    if(res != NULL)
-      clam(CLAM_WARN, DEFERRED_CTX, "deferred claim failed: %s",
-          res->error[0] != '\0' ? res->error : "(no driver error)");
+    clam(CLAM_WARN, DEFERRED_CTX, "deferred claim failed: %s",
+        res->error[0] != '\0' ? res->error : "(no driver error)");
 
     db_result_free(res);
     return;
@@ -721,7 +717,7 @@ chatbot_deferred_presence_scan(const char *bot_name, uint32_t ns_id,
 
   res = db_result_alloc();
 
-  if(res != NULL && db_query(sql, res) == SUCCESS && res->ok)
+  if(db_query(sql, res) == SUCCESS && res->ok)
     for(uint32_t i = 0; i < res->rows; i++)
     {
       const char *id  = db_result_get(res, i, 0);
@@ -748,11 +744,10 @@ chatbot_deferred_presence_scan(const char *bot_name, uint32_t ns_id,
 
   res = db_result_alloc();
 
-  if(res == NULL || db_query(sql, res) != SUCCESS || !res->ok)
+  if(db_query(sql, res) != SUCCESS || !res->ok)
   {
-    if(res != NULL)
-      clam(CLAM_WARN, DEFERRED_CTX, "presence scan failed: %s",
-          res->error[0] != '\0' ? res->error : "(no driver error)");
+    clam(CLAM_WARN, DEFERRED_CTX, "presence scan failed: %s",
+        res->error[0] != '\0' ? res->error : "(no driver error)");
 
     db_result_free(res);
     return(0);
@@ -788,11 +783,10 @@ chatbot_deferred_deliver_presence(const char *bot_name, uint32_t ns_id,
 
   res = db_result_alloc();
 
-  if(res == NULL || db_query(sql, res) != SUCCESS || !res->ok)
+  if(db_query(sql, res) != SUCCESS || !res->ok)
   {
-    if(res != NULL)
-      clam(CLAM_WARN, DEFERRED_CTX, "presence claim failed: %s",
-          res->error[0] != '\0' ? res->error : "(no driver error)");
+    clam(CLAM_WARN, DEFERRED_CTX, "presence claim failed: %s",
+        res->error[0] != '\0' ? res->error : "(no driver error)");
 
     db_result_free(res);
     return;
@@ -1209,7 +1203,7 @@ cmd_in_list(const cmd_ctx_t *ctx)
 
   res = db_result_alloc();
 
-  if(res == NULL || db_query(sql, res) != SUCCESS || !res->ok)
+  if(db_query(sql, res) != SUCCESS || !res->ok)
   {
     db_result_free(res);
     cmd_reply(ctx, "could not read your pending work");
@@ -1286,7 +1280,7 @@ cmd_in_cancel(const cmd_ctx_t *ctx)
 
   res = db_result_alloc();
 
-  if(res == NULL || db_query(sql, res) != SUCCESS || !res->ok)
+  if(db_query(sql, res) != SUCCESS || !res->ok)
   {
     db_result_free(res);
     cmd_reply(ctx, "could not cancel it");
@@ -1347,7 +1341,7 @@ cmd_show_deferred(const cmd_ctx_t *ctx)
 
   res = db_result_alloc();
 
-  if(res == NULL || db_query(sql, res) != SUCCESS || !res->ok)
+  if(db_query(sql, res) != SUCCESS || !res->ok)
   {
     db_result_free(res);
     cmd_reply(ctx, "query failed");

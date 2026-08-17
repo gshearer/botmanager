@@ -224,9 +224,6 @@ soul_voice_permits(const char *bot_name, uint32_t ns_id, int64_t dossier_id,
 
   res = db_result_alloc();
 
-  if(res == NULL)
-    return(false);
-
   // A failed query is not a refusal and must not be reported as one —
   // the bot stays quiet either way, but only one of the two is the
   // governor doing its job.
