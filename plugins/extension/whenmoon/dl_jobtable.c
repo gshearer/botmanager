@@ -898,9 +898,9 @@ wm_dl_jobtable_init(whenmoon_state_t *st)
   if(st->downloader != NULL)
     return(SUCCESS);
 
-  max_u = kv_get_uint("plugin.whenmoon.downloader.max_concurrent_jobs");
+  max_u = kv_get_uint_or_default(
+      "plugin.whenmoon.downloader.max_concurrent_jobs");
 
-  if(max_u == 0) max_u = 4;
   if(max_u > WM_DL_JOBS_MAX) max_u = WM_DL_JOBS_MAX;
   max_concurrent = (uint32_t)max_u;
 

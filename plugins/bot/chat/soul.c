@@ -36,7 +36,6 @@
 
 #define SOUL_CTX "soul"
 
-#define SOUL_INTERVAL_DEFAULT_SECS 60
 #define SOUL_INTERVAL_MIN_SECS     5
 
 // Weather watch (D8) bounds. A sweep is one tick's fan-out: the watch
@@ -1355,9 +1354,9 @@ soul_tick_cb(task_t *t)
   // Live cadence: re-reading the knob every tick makes a KV change
   // take effect on the next fire — in-callback interval_ms mutation is
   // the blessed mechanism (acquire_reactive precedent).
-  interval = (uint32_t)kv_get_bot_uint(bot_name, "behavior.soul.interval_secs");
+  interval = (uint32_t)kv_get_bot_uint_or_default(bot_name,
+      "behavior.soul.interval_secs");
 
-  if(interval == 0)                     interval = SOUL_INTERVAL_DEFAULT_SECS;
   if(interval < SOUL_INTERVAL_MIN_SECS) interval = SOUL_INTERVAL_MIN_SECS;
 
   t->interval_ms = interval * 1000U;
@@ -1479,9 +1478,6 @@ soul_schedule(const char *bot_name, uint32_t ns_id, uint32_t interval_secs)
 
   if(!soul_ready || bot_name == NULL || bot_name[0] == '\0')
     return;
-
-  if(interval_secs == 0)
-    interval_secs = SOUL_INTERVAL_DEFAULT_SECS;
 
   if(interval_secs < SOUL_INTERVAL_MIN_SECS)
     interval_secs = SOUL_INTERVAL_MIN_SECS;

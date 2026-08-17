@@ -68,11 +68,6 @@
 // stays true rather than becoming a lie.
 #define PRICEWATCH_REPORT_TTL_SECS  (12 * 3600)
 
-// Same number as the deferred spine's cap, read from the same knob and
-// counted separately: ten pending reminders and ten armed watches are
-// each reasonable, twenty of one is not.
-#define PRICEWATCH_MAX_PENDING_DEFAULT  10
-
 #define PRICEWATCH_EXCHANGE_DEFAULT  "coinbase"
 
 // Which way the price has to move. Stored as the SMALLINT `dir`, so
@@ -777,11 +772,11 @@ cmd_pricewatch(const cmd_ctx_t *ctx)
     return;
   }
 
-  cap = (uint32_t)kv_get_bot_uint(bot_name,
+  // The deferred spine's knob, read here and counted separately: ten
+  // pending reminders and ten armed watches are each reasonable, twenty
+  // of one is not.
+  cap = (uint32_t)kv_get_bot_uint_or_default(bot_name,
       "behavior.soul.deferred.max_pending");
-
-  if(cap == 0)
-    cap = PRICEWATCH_MAX_PENDING_DEFAULT;
 
   pending = pricewatch_pending_for(ns->id, owner_pred);
 

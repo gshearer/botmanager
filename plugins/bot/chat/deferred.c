@@ -53,8 +53,6 @@
 // from turning the tick into a spin loop.
 #define DEFERRED_REPEAT_MIN     300
 
-#define DEFERRED_MAX_PENDING_DEFAULT 10
-
 // The word that buys a presence row instead of a timed one, and how
 // long it stays disarmed first. You are, necessarily, present when you
 // ask for "when I'm back" — so the row waits out a floor before it
@@ -891,11 +889,8 @@ deferred_ask_open(const cmd_ctx_t *ctx, const char *duration,
     return(FAIL);
   }
 
-  cap = (uint32_t)kv_get_bot_uint(bot_inst_name(ctx->bot),
+  cap = (uint32_t)kv_get_bot_uint_or_default(bot_inst_name(ctx->bot),
       "behavior.soul.deferred.max_pending");
-
-  if(cap == 0)
-    cap = DEFERRED_MAX_PENDING_DEFAULT;
 
   pending = deferred_pending_for(a->ns->id, a->owner_pred);
 
