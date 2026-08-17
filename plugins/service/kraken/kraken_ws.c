@@ -1,15 +1,24 @@
 // botmanager — MIT
 // Kraken WebSocket v2 transport.
 //
-// Owns a single libcurl WebSocket session against `wss://ws.kraken.com/v2`.
-// A dedicated persist task runs the recv loop; reconnect is driven by
-// exponential backoff with KR_WS_MAX_BACKOFF_MS as the cap and the
-// `plugin.kraken.ws_reconnect_ms` KV as the base. Liveness watchdogs
-// pair an idle timeout (drop after KR_WS_IDLE_TIMEOUT_MS) with client-
-// side pings every KR_WS_PING_INTERVAL_MS.
+// Owns TWO libcurl WebSocket sessions — Kraken splits its v2 channels
+// across two endpoints and each refuses the other's (kraken_ws.h carries
+// the measurement). Everything below is per-session state driven by a
+// per-session persist task; the only shared thing is the token cache at
+// the bottom of the file, since one account has one token.
+//
+// Reconnect is driven by exponential backoff with KR_WS_MAX_BACKOFF_MS
+// as the cap and the `plugin.kraken.ws_reconnect_ms` KV as the base.
+// Liveness watchdogs pair an idle timeout (drop after
+// KR_WS_IDLE_TIMEOUT_MS) with client-side pings every
+// KR_WS_PING_INTERVAL_MS — the ping is what keeps a subscribed-but-quiet
+// or an unsubscribed session alive, since Kraken heartbeats only a
+// session that holds a subscription but pongs any keepalive.
 //
 // Raw text frames are reassembled across chunks and forwarded to
-// kr_ws_channels_dispatch via kr_ws_dispatch_frame.
+// kr_ws_channels_dispatch via kr_ws_dispatch_frame. Both readers reach
+// that dispatcher concurrently; it takes its own lock and holds none of
+// ours.
 //
 // The token cache lives here too. Every consumer subscribe path that
 // needs an authenticated payload (executions, balances) snapshots the
@@ -45,6 +54,10 @@
 
 typedef struct
 {
+  kr_ws_session_id_t sid;
+  const char     *label;            // "public" / "private", for logs
+  const char     *url_key;          // KV key this session's URL comes from
+
   CURL           *easy;
   curl_socket_t   sockfd;
   kr_ws_state_t   state;
@@ -55,6 +68,12 @@ typedef struct
   bool            exit_requested;
 
   bool            enabled;          // latched copy of plugin.kraken.ws_enabled
+
+  // Set from a KV change callback, cleared by this session's reader on
+  // its next tick so the reader — not the caller's thread — owns the
+  // state transition. Per-session: one flag between two readers would be
+  // consumed by whichever woke first, and the other would never reconnect.
+  _Atomic bool    reconfig_req;
 
   char            url[KR_URL_SZ];
   uint32_t        reconnect_base_ms;
@@ -73,13 +92,22 @@ typedef struct
   size_t          rx_cap;
 } kr_ws_t;
 
-static kr_ws_t kr_ws;
+static kr_ws_t kr_ws_pub;
+static kr_ws_t kr_ws_prv;
 
-// Set from a KV change callback; cleared by the reader on its next tick
-// so the reader — not the caller's thread — owns the state transition.
-static _Atomic bool kr_ws_reconfig_req;
+static kr_ws_t *
+kr_ws_session(kr_ws_session_id_t sid)
+{
+  switch(sid)
+  {
+    case KR_WS_PUBLIC:  return(&kr_ws_pub);
+    case KR_WS_PRIVATE: return(&kr_ws_prv);
+  }
 
-// Internal helpers. All *_locked helpers require kr_ws.lock held by caller.
+  return(&kr_ws_pub);
+}
+
+// Internal helpers. All *_locked helpers require w->lock held by caller.
 
 static void     kr_ws_reader              (task_t *t);
 static bool     kr_ws_open_locked         (kr_ws_t *w);
@@ -126,8 +154,9 @@ kr_ws_dispatch_frame(const char *buf, size_t len)
 }
 
 bool
-kr_ws_send_text(const char *buf, size_t len)
+kr_ws_send_text(kr_ws_session_id_t sid, const char *buf, size_t len)
 {
+  kr_ws_t *w = kr_ws_session(sid);
   CURLcode rc;
   size_t   sent = 0;
   bool     ok   = FAIL;
@@ -135,27 +164,27 @@ kr_ws_send_text(const char *buf, size_t len)
   if(buf == NULL || len == 0)
     return(FAIL);
 
-  pthread_mutex_lock(&kr_ws.lock);
+  pthread_mutex_lock(&w->lock);
 
-  if(kr_ws.state == KR_WS_OPEN && kr_ws.easy != NULL)
+  if(w->state == KR_WS_OPEN && w->easy != NULL)
   {
-    rc = curl_ws_send(kr_ws.easy, buf, len, &sent, 0, CURLWS_TEXT);
+    rc = curl_ws_send(w->easy, buf, len, &sent, 0, CURLWS_TEXT);
 
     if(rc == CURLE_OK && sent == len)
     {
       ok = SUCCESS;
-      clam(CLAM_DEBUG3, KR_CTX, "ws send (%zu bytes)", len);
+      clam(CLAM_DEBUG3, KR_CTX, "ws[%s] send (%zu bytes)", w->label, len);
     }
     else
       clam(CLAM_WARN, KR_CTX,
-          "ws send_text failed rc=%d sent=%zu/%zu",
-          (int)rc, sent, len);
+          "ws[%s] send_text failed rc=%d sent=%zu/%zu",
+          w->label, (int)rc, sent, len);
   }
   else
-    clam(CLAM_DEBUG, KR_CTX, "ws send_text dropped: state=%s",
-        kr_ws_state_name(kr_ws.state));
+    clam(CLAM_DEBUG, KR_CTX, "ws[%s] send_text dropped: state=%s",
+        w->label, kr_ws_state_name(w->state));
 
-  pthread_mutex_unlock(&kr_ws.lock);
+  pthread_mutex_unlock(&w->lock);
 
   return(ok);
 }
@@ -164,32 +193,71 @@ kr_ws_send_text(const char *buf, size_t len)
 // Lifecycle                                                           //
 // ------------------------------------------------------------------ //
 
+static void
+kr_ws_session_zero(kr_ws_t *w, kr_ws_session_id_t sid, const char *label,
+    const char *url_key)
+{
+  memset(w, 0, sizeof(*w));
+
+  pthread_mutex_init(&w->lock, NULL);
+
+  w->sid     = sid;
+  w->label   = label;
+  w->url_key = url_key;
+  w->state   = KR_WS_DISCONNECTED;
+  w->sockfd  = CURL_SOCKET_BAD;
+  w->reader  = TASK_HANDLE_NONE;
+
+  atomic_store(&w->reconfig_req, false);
+}
+
 void
 kr_ws_init(void)
 {
-  memset(&kr_ws, 0, sizeof(kr_ws));
-
-  pthread_mutex_init(&kr_ws.lock, NULL);
-
-  kr_ws.state  = KR_WS_DISCONNECTED;
-  kr_ws.sockfd = CURL_SOCKET_BAD;
-  kr_ws.reader = TASK_HANDLE_NONE;
-
-  atomic_store(&kr_ws_reconfig_req, false);
+  kr_ws_session_zero(&kr_ws_pub, KR_WS_PUBLIC,  "public",
+      "plugin.kraken.ws_url_public");
+  kr_ws_session_zero(&kr_ws_prv, KR_WS_PRIVATE, "private",
+      "plugin.kraken.ws_url_private");
 
   // Any config knob that materially changes which endpoint we should be
-  // attached to triggers a reconnect. The callback is deliberately
-  // lock-free — the reader polls kr_ws_reconfig_req at the top of each
-  // iteration so there is no risk of the caller's thread taking the
-  // session lock while kv_set is already holding the KV registry lock.
-  kv_set_cb("plugin.kraken.ws_enabled",     kr_ws_kv_cb, &kr_ws);
-  kv_set_cb("plugin.kraken.ws_url_public",  kr_ws_kv_cb, &kr_ws);
-  kv_set_cb("plugin.kraken.ws_url_private", kr_ws_kv_cb, &kr_ws);
+  // attached to triggers a reconnect, of the session that knob describes
+  // and no other — a credential rotation must not interrupt market data.
+  // The callback is deliberately lock-free — each reader polls its own
+  // reconfig_req at the top of each iteration so there is no risk of the
+  // caller's thread taking a session lock while kv_set is already
+  // holding the KV registry lock.
+  kv_set_cb("plugin.kraken.ws_enabled",     kr_ws_kv_cb, NULL);
+  kv_set_cb("plugin.kraken.ws_url_public",  kr_ws_kv_cb, NULL);
+  kv_set_cb("plugin.kraken.ws_url_private", kr_ws_kv_cb, NULL);
 
   // Token cache invalidation when creds change. The channel multiplexer
   // re-fetches lazily on the next private subscribe.
-  kv_set_cb("plugin.kraken.creds.apikey",     kr_ws_kv_cb, &kr_ws);
-  kv_set_cb("plugin.kraken.creds.private_key", kr_ws_kv_cb, &kr_ws);
+  kv_set_cb("plugin.kraken.creds.apikey",      kr_ws_kv_cb, NULL);
+  kv_set_cb("plugin.kraken.creds.private_key", kr_ws_kv_cb, NULL);
+}
+
+static void
+kr_ws_session_start(kr_ws_t *w, bool enabled, const char *task_name)
+{
+  // `enabled` belongs to the session lock: the reader rewrites it from
+  // kr_ws_apply_reconfig_locked, and a KV callback that lands between
+  // the spawn below and this function returning makes that concurrent
+  // with us. Latch under the lock and log from the snapshot — the log
+  // line must not hold it (a clam destination can re-enter a plugin).
+  pthread_mutex_lock(&w->lock);
+  w->enabled = enabled;
+  pthread_mutex_unlock(&w->lock);
+
+  if(w->reader != TASK_HANDLE_NONE)
+    return;
+
+  w->exit_requested = false;
+
+  w->reader = task_add_persist(task_name, 50, kr_ws_reader, w);
+
+  if(w->reader == TASK_HANDLE_NONE)
+    clam(CLAM_WARN, KR_CTX, "ws[%s]: failed to spawn reader task",
+        w->label);
 }
 
 void
@@ -197,83 +265,89 @@ kr_ws_start(void)
 {
   bool enabled = (kv_get_uint("plugin.kraken.ws_enabled") != 0);
 
-  // `enabled` belongs to the session lock: the reader rewrites it from
-  // kr_ws_apply_reconfig_locked, and a KV callback that lands between
-  // the spawn below and this function returning makes that concurrent
-  // with us. Latch under the lock and log from the snapshot — the log
-  // line must not hold it (a clam destination can re-enter a plugin).
-  pthread_mutex_lock(&kr_ws.lock);
-  kr_ws.enabled = enabled;
-  pthread_mutex_unlock(&kr_ws.lock);
+  kr_ws_session_start(&kr_ws_pub, enabled, "kraken_ws_pub");
+  kr_ws_session_start(&kr_ws_prv, enabled, "kraken_ws_prv");
 
-  if(kr_ws.reader != TASK_HANDLE_NONE)
-    return;
-
-  kr_ws.exit_requested = false;
-
-  kr_ws.reader = task_add_persist("kraken_ws", 50, kr_ws_reader, &kr_ws);
-
-  if(kr_ws.reader == TASK_HANDLE_NONE)
-  {
-    clam(CLAM_WARN, KR_CTX, "ws: failed to spawn reader task");
-    return;
-  }
-
-  clam(CLAM_INFO, KR_CTX, "ws subsystem started (enabled=%s)",
-      enabled ? "true" : "false");
+  clam(CLAM_INFO, KR_CTX,
+      "ws subsystem started (enabled=%s, %d sessions)",
+      enabled ? "true" : "false", KR_WS_N_SESSIONS);
 }
 
-bool
-kr_ws_stop(void)
+static bool
+kr_ws_session_stop(kr_ws_t *w)
 {
-  if(kr_ws.reader == TASK_HANDLE_NONE)
+  if(w->reader == TASK_HANDLE_NONE)
     return(SUCCESS);
 
-  pthread_mutex_lock(&kr_ws.lock);
-  kr_ws.exit_requested = true;
-  pthread_mutex_unlock(&kr_ws.lock);
+  pthread_mutex_lock(&w->lock);
+  w->exit_requested = true;
+  pthread_mutex_unlock(&w->lock);
 
   // Waiting for the reader to *say* it is done is not enough: the loop
   // body is our .text, so the unload cannot proceed until the thread has
   // actually left it. Join, and report the timeout upward rather than
   // pressing on into dlclose.
-  if(!task_persist_join(kr_ws.reader, KR_WS_STOP_WAIT_MS))
+  if(!task_persist_join(w->reader, KR_WS_STOP_WAIT_MS))
   {
     clam(CLAM_WARN, KR_CTX,
-        "ws stop: reader did not exit within %d ms — unload is unsafe",
-        KR_WS_STOP_WAIT_MS);
+        "ws[%s] stop: reader did not exit within %d ms — unload is unsafe",
+        w->label, KR_WS_STOP_WAIT_MS);
     return(FAIL);
   }
 
-  kr_ws.reader = TASK_HANDLE_NONE;
+  w->reader = TASK_HANDLE_NONE;
 
-  clam(CLAM_INFO, KR_CTX, "ws subsystem stopped");
   return(SUCCESS);
+}
+
+bool
+kr_ws_stop(void)
+{
+  bool ok = SUCCESS;
+
+  // Both, unconditionally: a session left running because its sibling
+  // timed out is a second thread in a mapping already being torn down.
+  if(kr_ws_session_stop(&kr_ws_pub) != SUCCESS) ok = FAIL;
+  if(kr_ws_session_stop(&kr_ws_prv) != SUCCESS) ok = FAIL;
+
+  if(ok == SUCCESS)
+    clam(CLAM_INFO, KR_CTX, "ws subsystem stopped");
+
+  return(ok);
+}
+
+static void
+kr_ws_session_deinit(kr_ws_t *w)
+{
+  pthread_mutex_lock(&w->lock);
+
+  kr_ws_close_locked(w);
+
+  if(w->rx_buf != NULL)
+  {
+    mem_free(w->rx_buf);
+    w->rx_buf = NULL;
+    w->rx_cap = 0;
+    w->rx_len = 0;
+  }
+
+  pthread_mutex_unlock(&w->lock);
+
+  pthread_mutex_destroy(&w->lock);
 }
 
 void
 kr_ws_deinit(void)
 {
-  // A reader we could not join still owns the session and the lock;
+  // A reader we could not join still owns its session and its lock;
   // tearing either down under it is the crash we are here to prevent.
+  // One failed join therefore keeps BOTH sessions intact — the caller
+  // has already been told the unload is unsafe.
   if(kr_ws_stop() != SUCCESS)
     return;
 
-  pthread_mutex_lock(&kr_ws.lock);
-
-  kr_ws_close_locked(&kr_ws);
-
-  if(kr_ws.rx_buf != NULL)
-  {
-    mem_free(kr_ws.rx_buf);
-    kr_ws.rx_buf = NULL;
-    kr_ws.rx_cap = 0;
-    kr_ws.rx_len = 0;
-  }
-
-  pthread_mutex_unlock(&kr_ws.lock);
-
-  pthread_mutex_destroy(&kr_ws.lock);
+  kr_ws_session_deinit(&kr_ws_pub);
+  kr_ws_session_deinit(&kr_ws_prv);
 }
 
 // ------------------------------------------------------------------ //
@@ -296,8 +370,8 @@ kr_ws_set_state_locked(kr_ws_t *w, kr_ws_state_t s)
   if(w->state == s)
     return;
 
-  clam(CLAM_DEBUG, KR_CTX, "ws state %s -> %s",
-      kr_ws_state_name(w->state), kr_ws_state_name(s));
+  clam(CLAM_DEBUG, KR_CTX, "ws[%s] state %s -> %s",
+      w->label, kr_ws_state_name(w->state), kr_ws_state_name(s));
 
   w->state = s;
 }
@@ -308,7 +382,7 @@ kr_ws_reload_url_locked(kr_ws_t *w)
   const char *base;
   size_t      blen;
 
-  base = kv_get_str("plugin.kraken.ws_url_public");
+  base = kv_get_str(w->url_key);
 
   if(base == NULL || base[0] == '\0')
   {
@@ -328,15 +402,35 @@ kr_ws_reload_url_locked(kr_ws_t *w)
   w->url[blen] = '\0';
 }
 
+// Which session a changed knob describes. The URL keys and the creds
+// name exactly one; anything else registered here (ws_enabled) is the
+// subsystem's own switch and reaches both.
 static void
 kr_ws_kv_cb(const char *key, void *data)
 {
+  bool pub;
+  bool prv;
+
   (void)data;
 
-  clam(CLAM_INFO, KR_CTX,
-      "ws config changed (%s); reconnect scheduled on next tick", key);
+  if(key == NULL)
+    return;
 
-  atomic_store(&kr_ws_reconfig_req, true);
+  pub = (strcmp(key, kr_ws_pub.url_key) == 0);
+  prv = (strcmp(key, kr_ws_prv.url_key) == 0)
+        || (strcmp(key, "plugin.kraken.creds.apikey") == 0)
+        || (strcmp(key, "plugin.kraken.creds.private_key") == 0);
+
+  if(!pub && !prv)
+    pub = prv = true;
+
+  clam(CLAM_INFO, KR_CTX,
+      "ws config changed (%s); reconnect scheduled on next tick (%s%s%s)",
+      key, pub ? "public" : "", (pub && prv) ? "+" : "",
+      prv ? "private" : "");
+
+  if(pub) atomic_store(&kr_ws_pub.reconfig_req, true);
+  if(prv) atomic_store(&kr_ws_prv.reconfig_req, true);
 }
 
 // Drop any live session and land in DISCONNECTED so the reader's normal
@@ -373,7 +467,8 @@ kr_ws_open_locked(kr_ws_t *w)
 
   if(w->url[0] == '\0')
   {
-    clam(CLAM_WARN, KR_CTX, "ws open: no URL configured");
+    clam(CLAM_WARN, KR_CTX, "ws[%s] open: no URL configured (%s)",
+        w->label, w->url_key);
     return(FAIL);
   }
 
@@ -381,7 +476,7 @@ kr_ws_open_locked(kr_ws_t *w)
 
   if(w->easy == NULL)
   {
-    clam(CLAM_WARN, KR_CTX, "ws open: curl_easy_init failed");
+    clam(CLAM_WARN, KR_CTX, "ws[%s] open: curl_easy_init failed", w->label);
     return(FAIL);
   }
 
@@ -402,8 +497,9 @@ kr_ws_open_locked(kr_ws_t *w)
 
   if(rc != CURLE_OK)
   {
-    clam(CLAM_WARN, KR_CTX, "ws open: handshake failed url='%s' rc=%d (%s)",
-        w->url, (int)rc, curl_easy_strerror(rc));
+    clam(CLAM_WARN, KR_CTX,
+        "ws[%s] open: handshake failed url='%s' rc=%d (%s)",
+        w->label, w->url, (int)rc, curl_easy_strerror(rc));
 
     curl_easy_cleanup(w->easy);
     w->easy = NULL;
@@ -415,7 +511,8 @@ kr_ws_open_locked(kr_ws_t *w)
       || sock == CURL_SOCKET_BAD)
   {
     clam(CLAM_WARN, KR_CTX,
-        "ws open: no socket available after handshake url='%s'", w->url);
+        "ws[%s] open: no socket available after handshake url='%s'",
+        w->label, w->url);
 
     curl_easy_cleanup(w->easy);
     w->easy   = NULL;
@@ -435,7 +532,7 @@ kr_ws_open_locked(kr_ws_t *w)
 
   kr_ws_set_state_locked(w, KR_WS_OPEN);
 
-  clam(CLAM_INFO, KR_CTX, "ws opened url='%s'", w->url);
+  clam(CLAM_INFO, KR_CTX, "ws[%s] opened url='%s'", w->label, w->url);
 
   return(SUCCESS);
 }
@@ -493,16 +590,16 @@ kr_ws_schedule_reconnect_locked(kr_ws_t *w, const char *why)
     if(now - w->last_crit_log >= 60)
     {
       clam(CLAM_WARN, KR_CTX,
-          "ws flapping: %u consecutive failures (last why=%s)",
-          w->consec_fails, why != NULL ? why : "?");
+          "ws[%s] flapping: %u consecutive failures (last why=%s)",
+          w->label, w->consec_fails, why != NULL ? why : "?");
 
       w->last_crit_log = now;
     }
   }
   else
     clam(CLAM_INFO, KR_CTX,
-        "ws reconnect in %u ms (why=%s)",
-        w->backoff_ms, why != NULL ? why : "?");
+        "ws[%s] reconnect in %u ms (why=%s)",
+        w->label, w->backoff_ms, why != NULL ? why : "?");
 
   kr_ws_set_state_locked(w, KR_WS_RECONNECTING);
 }
@@ -524,13 +621,13 @@ kr_ws_send_ping_locked(kr_ws_t *w)
 
   if(rc != CURLE_OK)
   {
-    clam(CLAM_WARN, KR_CTX, "ws ping failed rc=%d", (int)rc);
+    clam(CLAM_WARN, KR_CTX, "ws[%s] ping failed rc=%d", w->label, (int)rc);
     return(FAIL);
   }
 
   w->last_ping_ms = kr_ws_now_ms();
 
-  clam(CLAM_DEBUG3, KR_CTX, "ws ping sent");
+  clam(CLAM_DEBUG3, KR_CTX, "ws[%s] ping sent", w->label);
 
   return(SUCCESS);
 }
@@ -548,11 +645,11 @@ kr_ws_send_pong_locked(kr_ws_t *w, const char *buf, size_t len)
 
   if(rc != CURLE_OK)
   {
-    clam(CLAM_WARN, KR_CTX, "ws pong failed rc=%d", (int)rc);
+    clam(CLAM_WARN, KR_CTX, "ws[%s] pong failed rc=%d", w->label, (int)rc);
     return(FAIL);
   }
 
-  clam(CLAM_DEBUG3, KR_CTX, "ws pong sent (%zu bytes)", len);
+  clam(CLAM_DEBUG3, KR_CTX, "ws[%s] pong sent (%zu bytes)", w->label, len);
 
   return(SUCCESS);
 }
@@ -573,8 +670,8 @@ kr_ws_rx_append_locked(kr_ws_t *w, const char *data, size_t len)
 
   if(need > KR_WS_ASSEMBLY_CAP)
   {
-    clam(CLAM_WARN, KR_CTX, "ws reassembly overflow (%zu > %u)",
-        need, KR_WS_ASSEMBLY_CAP);
+    clam(CLAM_WARN, KR_CTX, "ws[%s] reassembly overflow (%zu > %u)",
+        w->label, need, KR_WS_ASSEMBLY_CAP);
     return(FAIL);
   }
 
@@ -623,7 +720,7 @@ kr_ws_on_frame_locked(kr_ws_t *w, const char *data, size_t len,
 
   if(flags & CURLWS_PONG)
   {
-    clam(CLAM_DEBUG3, KR_CTX, "ws pong recv (%zu bytes)", len);
+    clam(CLAM_DEBUG3, KR_CTX, "ws[%s] pong recv (%zu bytes)", w->label, len);
     return;
   }
 
@@ -636,7 +733,8 @@ kr_ws_on_frame_locked(kr_ws_t *w, const char *data, size_t len,
   // Kraken v2 never sends binary — drop it and keep going.
   if(flags & CURLWS_BINARY)
   {
-    clam(CLAM_DEBUG2, KR_CTX, "ws ignoring binary frame (%zu bytes)", len);
+    clam(CLAM_DEBUG2, KR_CTX, "ws[%s] ignoring binary frame (%zu bytes)",
+        w->label, len);
     return;
   }
 
@@ -692,20 +790,27 @@ kr_ws_reader(task_t *t)
 {
   kr_ws_t *w = t->data;
 
-  clam(CLAM_DEBUG, KR_CTX, "ws reader thread started");
+  clam(CLAM_DEBUG, KR_CTX, "ws[%s] reader thread started", w->label);
 
   while(!pool_shutting_down())
   {
     bool     want_open;
+    bool     want_session;
     uint64_t now_ms;
 
     // Pick up any pending config change posted by the KV callback.
-    if(atomic_exchange(&kr_ws_reconfig_req, false))
+    if(atomic_exchange(&w->reconfig_req, false))
     {
       pthread_mutex_lock(&w->lock);
       kr_ws_apply_reconfig_locked(w);
       pthread_mutex_unlock(&w->lock);
     }
+
+    // Asked BEFORE the session lock: the answer needs kr_ws_ch.mu, and
+    // the lock order is kr_ws_ch.mu (outer) → w->lock (inner). This is
+    // what makes the private session lazy — it is wanted only while
+    // credentials exist and a private subscription is on the table.
+    want_session = kr_ws_channels_session_wanted(w->sid);
 
     pthread_mutex_lock(&w->lock);
 
@@ -722,9 +827,9 @@ kr_ws_reader(task_t *t)
     if(w->reconnect_base_ms == 0)
       w->reconnect_base_ms = 2000;
 
-    want_open = w->enabled;
+    want_open = w->enabled && want_session;
 
-    // Disabled: ensure session is closed and idle in DISCONNECTED.
+    // Not wanted: ensure session is closed and idle in DISCONNECTED.
     if(!want_open)
     {
       if(w->state != KR_WS_DISCONNECTED)
@@ -778,7 +883,7 @@ kr_ws_reader(task_t *t)
       // → w->lock (inner); holding w->lock while taking kr_ws_ch.mu
       // would invert and deadlock.
       pthread_mutex_unlock(&w->lock);
-      kr_ws_channels_on_open();
+      kr_ws_channels_on_open(w->sid);
       pthread_mutex_lock(&w->lock);
     }
 
@@ -799,8 +904,8 @@ kr_ws_reader(task_t *t)
     if(now_ms - w->last_frame_ms > KR_WS_IDLE_TIMEOUT_MS)
     {
       clam(CLAM_WARN, KR_CTX,
-          "ws idle timeout (%u ms) — forcing reconnect",
-          KR_WS_IDLE_TIMEOUT_MS);
+          "ws[%s] idle timeout (%u ms) — forcing reconnect",
+          w->label, KR_WS_IDLE_TIMEOUT_MS);
       kr_ws_schedule_reconnect_locked(w, "idle timeout");
       pthread_mutex_unlock(&w->lock);
       continue;
@@ -824,7 +929,8 @@ kr_ws_reader(task_t *t)
 
         if(pr < 0 && errno != EINTR)
         {
-          clam(CLAM_WARN, KR_CTX, "ws poll error: %s", strerror(errno));
+          clam(CLAM_WARN, KR_CTX, "ws[%s] poll error: %s", w->label,
+              strerror(errno));
 
           pthread_mutex_lock(&w->lock);
           kr_ws_schedule_reconnect_locked(w, "poll error");
@@ -858,8 +964,8 @@ kr_ws_reader(task_t *t)
 
         if(rc != CURLE_OK)
         {
-          clam(CLAM_WARN, KR_CTX, "ws recv error rc=%d (%s)",
-              (int)rc, curl_easy_strerror(rc));
+          clam(CLAM_WARN, KR_CTX, "ws[%s] recv error rc=%d (%s)",
+              w->label, (int)rc, curl_easy_strerror(rc));
           kr_ws_schedule_reconnect_locked(w, "recv error");
           break;
         }
@@ -881,7 +987,7 @@ kr_ws_reader(task_t *t)
   kr_ws_set_state_locked(w, KR_WS_DISCONNECTED);
   pthread_mutex_unlock(&w->lock);
 
-  clam(CLAM_DEBUG, KR_CTX, "ws reader thread exited");
+  clam(CLAM_DEBUG, KR_CTX, "ws[%s] reader thread exited", w->label);
 
   t->state = TASK_ENDED;
 }

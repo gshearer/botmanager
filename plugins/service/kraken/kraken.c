@@ -32,6 +32,11 @@ static const plugin_kv_entry_t kr_kv_schema[] =
 {
   { "plugin.kraken.rest_url",       KV_STR,
     "https://api.kraken.com",       NULL, NULL, NULL },
+  // Two endpoints, two sessions, and neither is a fallback for the
+  // other: Kraken v2 refuses account channels on the public URL and
+  // market channels on the auth URL (OBS-18). The private session is
+  // opened only while credentials exist and something is subscribed on
+  // it.
   { "plugin.kraken.ws_url_public",  KV_STR,
     "wss://ws.kraken.com/v2",       NULL, NULL, NULL },
   { "plugin.kraken.ws_url_private", KV_STR,

@@ -49,6 +49,7 @@
 
 static pthread_mutex_t  ledger_mutex = PTHREAD_MUTEX_INITIALIZER;
 static char             frames[LEDGER_MAX][KR_WS_TX_BUF_SZ];
+static kr_ws_session_id_t frame_sid[LEDGER_MAX];
 static size_t           n_frames;
 
 // The armed park, matched as two independent substrings of the frame so
@@ -76,7 +77,7 @@ frame_is(const char *frame, const char *op, const char *sym)
 }
 
 bool
-kr_ws_send_text(const char *buf, size_t len)
+kr_ws_send_text(kr_ws_session_id_t sid, const char *buf, size_t len)
 {
   bool   hold = false;
   size_t n;
@@ -85,6 +86,8 @@ kr_ws_send_text(const char *buf, size_t len)
 
   if(n_frames < LEDGER_MAX)
   {
+    frame_sid[n_frames] = sid;
+
     // buf is a pointer and a length, so the copy takes the length —
     // the ledger's own NUL is what the substring searches below rely on.
     n = (len < sizeof(frames[0]) - 1) ? len : sizeof(frames[0]) - 1;
@@ -120,9 +123,13 @@ kr_ws_send_text(const char *buf, size_t len)
   return(SUCCESS);
 }
 
-// The remaining five out-of-file references. Public channels reach none
-// of the token path; a case that did would be a case bug, so acquire
-// refuses rather than inventing a completion.
+// The remaining five out-of-file references. A public-only case reaches
+// none of the token path; `stub_have_creds` is what a private case flips
+// to reach it, and acquire still refuses rather than inventing a
+// completion — the private routing is decided at render time, before any
+// acquire could land.
+
+static bool stub_have_creds;
 
 void
 kr_pair_lookup_ws(const char *input, char *out, size_t cap)
@@ -136,22 +143,29 @@ kr_pair_lookup_ws(const char *input, char *out, size_t cap)
 bool
 kr_apikey_configured(void)
 {
-  return(false);
+  return(stub_have_creds);
 }
 
 bool
 kr_ws_token_snapshot(char *out, size_t cap)
 {
-  if(out != NULL && cap > 0)
-    out[0] = '\0';
+  if(out == NULL || cap == 0)
+    return(FAIL);
 
-  return(FAIL);
+  out[0] = '\0';
+
+  if(!stub_have_creds)
+    return(FAIL);
+
+  strlcpy(out, "stub-token", cap);
+
+  return(SUCCESS);
 }
 
 bool
 kr_ws_token_needs_refresh(void)
 {
-  return(true);
+  return(!stub_have_creds);
 }
 
 bool
@@ -178,6 +192,28 @@ n_frames_with(const char *op, const char *sym)
   for(i = 0; i < n_frames; i++)
   {
     if(frame_is(frames[i], op, sym))
+      count++;
+  }
+
+  pthread_mutex_unlock(&ledger_mutex);
+
+  return(count);
+}
+
+// The same count, restricted to one gateway. Which endpoint a frame was
+// handed to is invisible to every other assertion in this file, and it
+// is the whole subject of c7.
+static size_t
+n_frames_on(kr_ws_session_id_t sid, const char *op, const char *sym)
+{
+  size_t count = 0;
+  size_t i;
+
+  pthread_mutex_lock(&ledger_mutex);
+
+  for(i = 0; i < n_frames; i++)
+  {
+    if(frame_sid[i] == sid && frame_is(frames[i], op, sym))
       count++;
   }
 
@@ -254,6 +290,8 @@ fixture_reset(void)
 {
   kr_ws_channels_deinit();
   kr_ws_channels_init();
+
+  stub_have_creds = false;
 
   pthread_mutex_lock(&ledger_mutex);
 
@@ -577,6 +615,75 @@ case_ack_semantics(void)
       3, n_frames_with("subscribe", "EEE"));
 }
 
+// ------------------------------------------------------------------ //
+// c7 — a private channel is rendered for the private gateway (OBS-18) //
+// ------------------------------------------------------------------ //
+//
+// Kraken serves market data and account data on two endpoints, and each
+// refuses the other's channels outright: all 42 executions/balances
+// subscribes this tree had ever sent went to `ws.kraken.com` and came
+// back `Private data and trading are unavailable on this endpoint`.
+// Nothing about that is loud where a consumer can see it — the handle is
+// live, the slot is FAILED, the feed simply never arrives — so which
+// gateway each frame is handed to is pinned here rather than left to a
+// WARN in a log.
+//
+// The second half is the lazy predicate the transport reads: an
+// authenticated session is worth holding open exactly while something is
+// subscribed on it.
+
+static void
+case_private_routes_to_the_auth_gateway(void)
+{
+  const exchange_ws_channel_t both[]     = { EXCH_WS_TICKER, EXCH_WS_USER };
+  const char *const           products[] = { "BTC-USD" };
+  void                       *sub        = NULL;
+
+  fixture_reset();
+
+  stub_have_creds = true;
+
+  test_check_bool(SUITE, "the private session is unwanted while idle",
+      false, kr_ws_channels_session_wanted(KR_WS_PRIVATE));
+
+  kr_ws_subscribe(both, 2, products, 1, event_cb, NULL, &sub);
+
+  test_check_sz(SUITE, "ticker is rendered for the public gateway",
+      1, n_frames_on(KR_WS_PUBLIC, "subscribe", "ticker"));
+  test_check_sz(SUITE, "executions is rendered for the private gateway",
+      1, n_frames_on(KR_WS_PRIVATE, "subscribe", "executions"));
+  test_check_sz(SUITE, "balances is rendered for the private gateway",
+      1, n_frames_on(KR_WS_PRIVATE, "subscribe", "balances"));
+
+  // The defect itself: account channels arriving at the public endpoint.
+  test_check_sz(SUITE, "no account channel reaches the public gateway",
+      0, n_frames_on(KR_WS_PUBLIC, "subscribe", "executions")
+         + n_frames_on(KR_WS_PUBLIC, "subscribe", "balances"));
+  test_check_sz(SUITE, "no market channel reaches the private gateway",
+      0, n_frames_on(KR_WS_PRIVATE, "subscribe", "ticker"));
+
+  test_check_bool(SUITE, "a private subscription makes the session wanted",
+      true, kr_ws_channels_session_wanted(KR_WS_PRIVATE));
+  test_check_bool(SUITE, "the public session is wanted regardless",
+      true, kr_ws_channels_session_wanted(KR_WS_PUBLIC));
+
+  kr_ws_unsubscribe(sub);
+
+  test_check_bool(SUITE, "the last private consumer leaving closes it",
+      false, kr_ws_channels_session_wanted(KR_WS_PRIVATE));
+
+  // Credentials are a precondition of the session, not only of the
+  // subscribe: without them there is nothing to authenticate with.
+  kr_ws_subscribe(both, 2, products, 1, event_cb, NULL, &sub);
+  stub_have_creds = false;
+
+  test_check_bool(SUITE, "no credentials means no private session",
+      false, kr_ws_channels_session_wanted(KR_WS_PRIVATE));
+
+  if(sub != NULL)
+    kr_ws_unsubscribe(sub);
+}
+
 int
 main(void)
 {
@@ -588,6 +695,7 @@ main(void)
   case_a_moved_slot_loses_its_emission();
   case_fanout_and_teardown();
   case_ack_semantics();
+  case_private_routes_to_the_auth_gateway();
 
   kr_ws_channels_deinit();
 

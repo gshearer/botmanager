@@ -44,6 +44,13 @@ Two surfaces, served by the same plugin:
 | REST | `https://api.kraken.com` | `API-Key` + `API-Sign` HMAC-SHA512 on every private POST; public GETs are unauthenticated | OHLC candles, BalanceEx, AddOrder, CancelOrder, QueryOrders, Open/ClosedOrders, TradesHistory, AssetPairs cache |
 | WebSocket v2 | `wss://ws.kraken.com/v2` (public), `wss://ws-auth.kraken.com/v2` (private) | Public channels are unauthenticated; private channels embed a token from `POST /0/private/GetWebSocketsToken` in the subscribe payload | Live streams: `ticker`, `trade`, `ohlc`, `executions`, `balances`, `heartbeat` |
 
+The two WebSocket URLs are **two live sessions**, not a URL and a
+fallback: each endpoint refuses the other's channels outright, whatever
+the subscribe carries (measured both directions, OBS-18). The private
+session is opened lazily — only while credentials are configured and
+something is actually subscribed on it — so a daemon with WS enabled and
+no account subscription holds one connection, not two.
+
 Kraken does not publish a sandbox surface. The REST + WS URLs are the
 single production target.
 
@@ -81,7 +88,7 @@ Hard layering rules apply (`plugins/service/AGENTS.md`):
 | `plugin.kraken.creds.apikey` | STR (secret) | `` | API key string. Sent verbatim in `API-Key`. |
 | `plugin.kraken.creds.private_key` | STR (secret) | `` | Base64-encoded HMAC secret. Decoded once and cached. |
 | `plugin.kraken.rest_enabled` | BOOL | `true` | Enable REST dispatcher. |
-| `plugin.kraken.ws_enabled` | BOOL | `false` | Enable WebSocket reader. |
+| `plugin.kraken.ws_enabled` | BOOL | `false` | Enable both WebSocket readers. |
 | `plugin.kraken.ws_reconnect_ms` | UINT32 | `2000` | Initial WebSocket reconnect backoff (capped at 60 s). |
 | `plugin.kraken.request_timeout` | UINT32 | `15` | Per-call REST timeout. |
 | `plugin.kraken.assetpairs_refresh_sec` | UINT32 | `86400` | Cadence for the altname/canonical/wsname cache refresh. |

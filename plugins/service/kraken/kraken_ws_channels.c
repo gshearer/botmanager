@@ -80,6 +80,18 @@ kr_ws_channel_is_private(kr_ws_channel_t ch)
   return(ch == KR_CH_EXECUTIONS || ch == KR_CH_BALANCES);
 }
 
+// Which gateway a channel's frames belong on. This is the ONLY place
+// that decision is made: Kraken serves public market data and private
+// account data on two endpoints, each of which refuses the other's
+// channels outright (OBS-18), so a frame sent to the wrong one is not
+// degraded — it is refused, and refused silently as far as the consumer
+// is concerned.
+static kr_ws_session_id_t
+kr_ws_session_for_channel(kr_ws_channel_t ch)
+{
+  return(kr_ws_channel_is_private(ch) ? KR_WS_PRIVATE : KR_WS_PUBLIC);
+}
+
 static bool
 kr_ws_channel_is_per_symbol(kr_ws_channel_t ch)
 {
@@ -401,7 +413,7 @@ kr_ws_emit_one(const char *op, kr_ws_channel_t ch, const char *symbol_ws,
   if(len == 0)
     return(FAIL);
 
-  return(kr_ws_send_text(frame, len));
+  return(kr_ws_send_text(kr_ws_session_for_channel(ch), frame, len));
 }
 
 // ------------------------------------------------------------------ //
@@ -428,6 +440,14 @@ typedef enum
   KR_RECONCILE_UNSUB   // emit unsubscribe for slots refcount==0
 } kr_reconcile_op_t;
 
+// `only_sid` restricts a pass to the slots belonging to one gateway.
+// KR_WS_SID_ANY is the whole table, and is right wherever the emit is
+// opportunistic: a frame for a session that is not open simply fails to
+// send and its slot stays IDLE for that session's own on-open pass. A
+// reconnect pass must NOT use it — resetting the sibling session's live
+// slots would unsubscribe a feed nothing has flapped.
+#define KR_WS_SID_ANY (-1)
+
 // One pending emission. Carries the slot's identity rather than its
 // position, so phase 3 can find the slot again whatever the table did
 // while the frame was in flight.
@@ -440,7 +460,7 @@ typedef struct
 } kr_ws_emit_item_t;
 
 static void
-kr_ws_reconcile_locked(kr_reconcile_op_t op, const char *token)
+kr_ws_reconcile_locked(kr_reconcile_op_t op, const char *token, int only_sid)
 {
   // ~4.5 KB of frame. Reconcile runs on subscribe, unsubscribe and
   // reconnect — never per message — and the table it mirrors is a
@@ -457,6 +477,10 @@ kr_ws_reconcile_locked(kr_reconcile_op_t op, const char *token)
   for(i = 0; i < kr_ws_ch.n_slots; i++)
   {
     kr_ws_slot_t *s = &kr_ws_ch.slots[i];
+
+    if(only_sid != KR_WS_SID_ANY
+        && (int)kr_ws_session_for_channel(s->channel) != only_sid)
+      continue;
 
     if(op == KR_RECONCILE_SUB)
     {
@@ -605,8 +629,14 @@ kr_ws_token_then_reconcile_cb(bool ok, void *user)
   have_token = kr_ws_token_snapshot(token, sizeof(token));
 
   pthread_mutex_lock(&kr_ws_ch.mu);
+
+  // KR_WS_SID_ANY: the token is the private session's business, but a
+  // public slot left IDLE by an earlier failed send costs nothing to
+  // retry here and the private session may not even be open yet — its
+  // own on-open pass is what actually flushes these.
   kr_ws_reconcile_locked(KR_RECONCILE_SUB,
-      have_token == SUCCESS ? token : NULL);
+      have_token == SUCCESS ? token : NULL, KR_WS_SID_ANY);
+
   pthread_mutex_unlock(&kr_ws_ch.mu);
 }
 
@@ -1296,10 +1326,14 @@ kr_ws_channels_dispatch(const char *buf, size_t len)
 // On-open hook                                                        //
 // ------------------------------------------------------------------ //
 
+// One session flapped and came back. Everything here is scoped to THAT
+// session: the sibling's gateway never forgot anything, and resetting
+// its live slots would re-emit subscribes for feeds that are still
+// streaming.
 void
-kr_ws_channels_on_open(void)
+kr_ws_channels_on_open(kr_ws_session_id_t sid)
 {
-  bool need_token;
+  bool need_token = false;
 
   if(!kr_ws_ch.initialized) return;
 
@@ -1311,22 +1345,35 @@ kr_ws_channels_on_open(void)
     return;
   }
 
-  // Reset state on every slot — the gateway forgot us across the flap.
+  // Reset state on this session's slots — its gateway forgot us across
+  // the flap.
   for(uint32_t i = 0; i < kr_ws_ch.n_slots; i++)
   {
-    kr_ws_ch.slots[i].sent_upstream = false;
-    kr_ws_ch.slots[i].req_id        = 0;
+    kr_ws_slot_t *s = &kr_ws_ch.slots[i];
 
-    if(kr_ws_ch.slots[i].refcount > 0)
-      kr_ws_ch.slots[i].state = KR_SUB_IDLE;
+    if(kr_ws_session_for_channel(s->channel) != sid)
+      continue;
+
+    s->sent_upstream = false;
+    s->req_id        = 0;
+
+    if(s->refcount > 0)
+      s->state = KR_SUB_IDLE;
   }
 
-  // Discard pending acks from the previous session. Clearing the req_id
-  // empties the entry; the identity behind it is never read without one.
+  // Discard this session's pending acks from the connection that just
+  // died; the sibling's are still in flight and answerable. Clearing the
+  // req_id empties the entry; the identity beside it is never read
+  // without one, and it is that identity which says whose entry it is.
   for(uint32_t i = 0; i < KR_WS_CH_REQ_RING_SIZE; i++)
-    kr_ws_ch.corr_ring[i].req_id = 0;
+  {
+    if(kr_ws_ch.corr_ring[i].req_id != 0
+        && kr_ws_session_for_channel(kr_ws_ch.corr_ring[i].channel) == sid)
+      kr_ws_ch.corr_ring[i].req_id = 0;
+  }
 
-  need_token = kr_ws_has_private_pending_locked();
+  if(sid == KR_WS_PRIVATE)
+    need_token = kr_ws_has_private_pending_locked();
 
   if(need_token)
   {
@@ -1334,23 +1381,60 @@ kr_ws_channels_on_open(void)
 
     if(kr_ws_token_snapshot(token, sizeof(token)) == SUCCESS)
     {
-      kr_ws_reconcile_locked(KR_RECONCILE_SUB, token);
+      kr_ws_reconcile_locked(KR_RECONCILE_SUB, token, (int)sid);
       pthread_mutex_unlock(&kr_ws_ch.mu);
       return;
     }
 
     // No fresh token — kick a fetch and reconcile from the trampoline
-    // when it lands. Public slots wait alongside (kr_ws_token_then_
-    // reconcile_cb passes the token through unconditionally; if the
-    // token snapshot fails it still flushes public slots).
+    // when it lands. Nothing on this session can flush without one.
     pthread_mutex_unlock(&kr_ws_ch.mu);
     (void)kr_ws_token_acquire(kr_ws_token_then_reconcile_cb, NULL);
     return;
   }
 
-  // Public-only set — no token needed. Reconcile inline.
-  kr_ws_reconcile_locked(KR_RECONCILE_SUB, NULL);
+  // Public session, or a private one with nothing pending: no token is
+  // owed either way. Reconcile inline.
+  kr_ws_reconcile_locked(KR_RECONCILE_SUB, NULL, (int)sid);
   pthread_mutex_unlock(&kr_ws_ch.mu);
+}
+
+// Whether the transport should hold this session open at all. Market
+// data is the reason the subsystem exists, so the public session is
+// wanted whenever WS is enabled; the private one is wanted only while
+// credentials exist and something is actually subscribed to it — an
+// authenticated session with nothing on it earns nothing.
+//
+// Deliberately NOT kr_ws_has_private_pending_locked: that answers "is
+// there a subscribe still to send", which goes false the moment the ack
+// lands. An ACTIVE private slot is exactly the case that must keep the
+// session up.
+bool
+kr_ws_channels_session_wanted(kr_ws_session_id_t sid)
+{
+  bool wanted = false;
+
+  if(sid == KR_WS_PUBLIC)
+    return(true);
+
+  if(!kr_ws_ch.initialized || !kr_apikey_configured())
+    return(false);
+
+  pthread_mutex_lock(&kr_ws_ch.mu);
+
+  for(uint32_t i = 0; i < kr_ws_ch.n_slots; i++)
+  {
+    if(kr_ws_ch.slots[i].refcount > 0
+        && kr_ws_session_for_channel(kr_ws_ch.slots[i].channel) == sid)
+    {
+      wanted = true;
+      break;
+    }
+  }
+
+  pthread_mutex_unlock(&kr_ws_ch.mu);
+
+  return(wanted);
 }
 
 // ------------------------------------------------------------------ //
@@ -1593,7 +1677,10 @@ kr_ws_subscribe(const exchange_ws_channel_t *channels, uint32_t n_channels,
     if(kr_ws_token_snapshot(token, sizeof(token)) == SUCCESS
         && !kr_ws_token_needs_refresh())
     {
-      kr_ws_reconcile_locked(KR_RECONCILE_SUB, token);
+      // KR_WS_SID_ANY: this sub may cover both classes at once. An
+      // emit for a session that is not open fails and its slot waits
+      // for that session's own on-open pass.
+      kr_ws_reconcile_locked(KR_RECONCILE_SUB, token, KR_WS_SID_ANY);
       pthread_mutex_unlock(&kr_ws_ch.mu);
     }
     else
@@ -1604,7 +1691,7 @@ kr_ws_subscribe(const exchange_ws_channel_t *channels, uint32_t n_channels,
   }
   else
   {
-    kr_ws_reconcile_locked(KR_RECONCILE_SUB, NULL);
+    kr_ws_reconcile_locked(KR_RECONCILE_SUB, NULL, KR_WS_SID_ANY);
     pthread_mutex_unlock(&kr_ws_ch.mu);
   }
 
@@ -1700,7 +1787,8 @@ kr_ws_unsubscribe(void *driver_sub)
     char token[KR_WS_TOKEN_SZ] = {0};
 
     (void)kr_ws_token_snapshot(token, sizeof(token));
-    kr_ws_reconcile_locked(KR_RECONCILE_UNSUB, token[0] ? token : NULL);
+    kr_ws_reconcile_locked(KR_RECONCILE_UNSUB, token[0] ? token : NULL,
+        KR_WS_SID_ANY);
   }
 
   // Reap empty slots.

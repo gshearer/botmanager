@@ -1,19 +1,33 @@
 // kraken_ws.h — Kraken WebSocket v2 transport.
 //
-// One long-lived libcurl WebSocket session against `wss://ws.kraken.com/v2`.
-// Public channels (ticker, trade, ohlc) and private channels (executions,
-// balances) all multiplex over the same session — Kraken's v2 docs accept
-// both flavours on the public URL when the subscribe carries a token.
-// `plugin.kraken.ws_url_private` is exposed as a fallback knob; it is not
-// the default.
+// TWO long-lived libcurl WebSocket sessions, because Kraken's v2 gateway
+// splits its channels across two endpoints and each refuses the other's
+// (measured 2026-08-17, OBS-18):
 //
-// A dedicated reader task drives curl_ws_recv; reconnect uses exponential
+//   KR_WS_PUBLIC  `wss://ws.kraken.com/v2`       ticker, trade, ohlc
+//   KR_WS_PRIVATE `wss://ws-auth.kraken.com/v2`  executions, balances
+//
+// A private subscribe on the public URL comes back `Private data and
+// trading are unavailable on this endpoint. Try ws-auth.kraken.com`, and
+// a public subscribe on the auth URL comes back with the mirror image of
+// that sentence. There is no single endpoint that serves both, whatever
+// a token is attached to.
+//
+// The private session is opened LAZILY — only while credentials are
+// configured and the slot table holds a private subscription — since an
+// authenticated session with nothing on it earns nothing. It is not a
+// liveness hazard either way: an unsubscribed session receives no
+// heartbeat, but Kraken pongs the keepalive ping, which is what arrests
+// the idle watchdog.
+//
+// A dedicated reader task per session drives curl_ws_recv; reconnect uses exponential
 // backoff with the per-tick KV `plugin.kraken.ws_reconnect_ms` as the base
 // (capped at KR_WS_MAX_BACKOFF_MS). Reassembly buffers grow on demand
 // inside KR_WS_ASSEMBLY_CAP.
 //
 // The token cache is shared with kraken_ws_channels.c — every private
-// subscribe inlines `token` from the cached value. Acquisition runs
+// subscribe on the private session inlines `token` from the cached value
+// (`Token(s) not found` is the gateway's answer without one). Acquisition runs
 // asynchronously through `POST /0/private/GetWebSocketsToken`; the cache
 // is monotonic and refreshed pre-emptively at KR_WS_TOKEN_REFRESH_MS.
 
@@ -62,6 +76,17 @@ typedef enum
   KR_WS_RECONNECTING
 } kr_ws_state_t;
 
+// Which of the two gateways a frame belongs on. Derived from the channel
+// alone — kraken_ws_channels.c owns that mapping — so no caller ever
+// picks an endpoint by hand.
+typedef enum
+{
+  KR_WS_PUBLIC  = 0,
+  KR_WS_PRIVATE = 1
+} kr_ws_session_id_t;
+
+#define KR_WS_N_SESSIONS 2
+
 // ------------------------------------------------------------------ //
 // Lifecycle. Paired with kr_init / kr_start / kr_stop / kr_deinit in   //
 // kraken.c.                                                           //
@@ -70,20 +95,24 @@ typedef enum
 void    kr_ws_init  (void);
 void    kr_ws_start (void);
 
-// kr_ws_stop signals the reader and *joins* it, up to KR_WS_STOP_WAIT_MS.
-// FAIL means the thread is still inside this plugin's mapping, which
-// makes the unload unsafe — it is propagated out of the plugin's stop()
-// rather than logged and swallowed.
+// kr_ws_stop signals BOTH readers and *joins* them, up to
+// KR_WS_STOP_WAIT_MS each. FAIL means a thread is still inside this
+// plugin's mapping, which makes the unload unsafe — it is propagated out
+// of the plugin's stop() rather than logged and swallowed. Every session
+// is signalled and joined even after one has failed: a session left
+// running because a sibling timed out is a second live thread in a
+// mapping already being torn down.
 bool    kr_ws_stop  (void);
 void    kr_ws_deinit(void);
 
 // Human-readable name for a session state (logging).
 const char *kr_ws_state_name(kr_ws_state_t s);
 
-// Send a UTF-8 text frame on the active session. Thread-safe. Returns
-// FAIL when the session is not OPEN or curl_ws_send errors. The channel
-// multiplexer retries on the next reconnect via kr_ws_channels_on_open.
-bool    kr_ws_send_text(const char *buf, size_t len);
+// Send a UTF-8 text frame on one session. Thread-safe. Returns FAIL when
+// that session is not OPEN or curl_ws_send errors — which is the normal
+// answer for a private frame rendered before the lazy session has opened;
+// the channel multiplexer retries it on the next kr_ws_channels_on_open.
+bool    kr_ws_send_text(kr_ws_session_id_t sid, const char *buf, size_t len);
 
 // Reader-thread hook for a fully-reassembled text frame. Forwards to
 // kr_ws_channels_dispatch. Pointer is only valid for the call duration.

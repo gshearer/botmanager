@@ -1,6 +1,7 @@
 // kraken_ws_channels.h — Kraken WebSocket v2 channel multiplexer.
 //
-// Layered on top of kraken_ws.c's single-session transport. Owns:
+// Layered on top of kraken_ws.c's two-session transport, and the only
+// place that decides which of the two a channel belongs on. Owns:
 //   * the local subscriber list (one per `exchange_ws_subscribe` caller),
 //   * a (channel, symbol) slot table that refcounts shared subscribers,
 //   * the JSON-RPC req_id correlator that pairs subscribe acks with the
@@ -9,12 +10,14 @@
 //     fanned-out `exchange_ws_event_t` events.
 //
 // On reconnect the slot table drives a full resubscribe so consumer
-// callbacks never miss a beat across a flap.
+// callbacks never miss a beat across a flap — scoped to the session that
+// flapped, since the other gateway forgot nothing.
 
 #ifndef BM_KRAKEN_WS_CHANNELS_H
 #define BM_KRAKEN_WS_CHANNELS_H
 
 #include "exchange_api.h"
+#include "kraken_ws.h"
 
 #include <stdbool.h>
 #include <stddef.h>
@@ -24,14 +27,22 @@
 void    kr_ws_channels_init  (void);
 void    kr_ws_channels_deinit(void);
 
-// Called from kraken_ws.c the moment the session transitions to OPEN.
-// Rebuilds the upstream subscription set from the live slot table and
-// emits one subscribe per channel covering all live products. Resets
-// every slot's `sent_upstream` flag before rendering so a session that
-// had previously received subscribe acks gets a fresh resubscribe after
-// a flap. The session lock must NOT be held by the caller — this function
-// calls kr_ws_send_text internally.
-void    kr_ws_channels_on_open(void);
+// Called from kraken_ws.c the moment a session transitions to OPEN.
+// Rebuilds that session's upstream subscription set from the live slot
+// table and emits one subscribe per channel covering all live products.
+// Resets those slots' `sent_upstream` flags before rendering so a
+// session that had previously received subscribe acks gets a fresh
+// resubscribe after a flap; slots belonging to the OTHER session are
+// left untouched. The session lock must NOT be held by the caller —
+// this function calls kr_ws_send_text internally.
+void    kr_ws_channels_on_open(kr_ws_session_id_t sid);
+
+// Whether the transport should hold `sid` open. KR_WS_PUBLIC is always
+// wanted; KR_WS_PRIVATE only while credentials are configured and the
+// slot table holds a private subscription — which is what makes the
+// private session lazy. Takes kr_ws_ch.mu, so the caller must hold no
+// session lock (lock order: kr_ws_ch.mu outer, w->lock inner).
+bool    kr_ws_channels_session_wanted(kr_ws_session_id_t sid);
 
 // Reader-thread hook for the reassembled text frame. Parses the JSON,
 // routes acks to the correlator, fans out data frames to every matching
