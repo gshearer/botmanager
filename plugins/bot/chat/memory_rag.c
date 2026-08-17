@@ -6,6 +6,7 @@
 #include "memory.h"
 
 #include "db.h"
+#include "hold.h"
 #include "inference.h"
 
 #include <ctype.h>
@@ -642,6 +643,13 @@ memory_recall_scan_convo(int ns_id, int64_t dossier_id,
 
 typedef struct
 {
+  // First member, and on the live list from allocation to free — core
+  // cannot see an LLM request, so a recall airborne at unload is the
+  // plugin's to drain (hold.h). Owner NULL: a recall is submitted on
+  // behalf of a bot but the record belongs to the memory subsystem,
+  // which outlives any one of them.
+  chatbot_hold_t        hold;
+
   int                   ns_id;
   uint32_t              top_k;
   char                  model[MEM_EMBED_MODEL_SZ];
@@ -654,11 +662,25 @@ memory_retrieve_ns_embed_done(const llm_embed_response_t *resp)
 {
   memory_retrieval_ctx_t *c = resp->user_data;
 
+  // ⚠ The disowned arm still DELIVERS, empty. `c->user` is the
+  // caller's own record — a chatbot_req_t carrying its own hold, freed
+  // only by its own callback. Swallow the delivery and that record
+  // never unwinds, its hold never unlinks, and a different drain waits
+  // its five seconds out and strands it.
+  if(chatbot_hold_disowned(&c->hold))
+  {
+    c->cb(NULL, 0, NULL, 0, c->user);
+    chatbot_hold_unlink(&c->hold);
+    mem_free(c);
+    return;
+  }
+
   if(!resp->ok || resp->n_vectors < 1 || resp->dim == 0)
   {
     clam(CLAM_WARN, "memory", "retrieve embed failed: %s",
         resp->error ? resp->error : "(no detail)");
     c->cb(NULL, 0, NULL, 0, c->user);
+    chatbot_hold_unlink(&c->hold);
     mem_free(c);
     return;
   }
@@ -666,6 +688,7 @@ memory_retrieve_ns_embed_done(const llm_embed_response_t *resp)
   memory_retrieve_ns_with_vec(c->ns_id, c->model, resp->dim,
       resp->vectors[0], c->top_k, c->cb, c->user);
 
+  chatbot_hold_unlink(&c->hold);
   mem_free(c);
 }
 
@@ -721,10 +744,13 @@ memory_retrieve_ns(int ns_id, const char *query,
   c->user  = user;
   snprintf(c->model, sizeof(c->model), "%s", cfg.embed_model);
 
+  chatbot_hold_link(&c->hold, NULL, c);
+
   if(llm_embed_submit(cfg.embed_model, inputs, 1,
       memory_retrieve_ns_embed_done, c) != SUCCESS)
   {
     cb(NULL, 0, NULL, 0, user);
+    chatbot_hold_unlink(&c->hold);
     mem_free(c);
     return(FAIL);
   }
@@ -870,6 +896,10 @@ memory_get_mention_msgs(int ns_id, int64_t dossier_id,
 // delivers the combined payload through the caller's cb once.
 typedef struct
 {
+  // First member, and on the live list from allocation to free — the
+  // same gap in core's barrier the other three cover (hold.h).
+  chatbot_hold_t        hold;
+
   int                   ns_id;
   int64_t               dossier_id;
   uint32_t              top_k;
@@ -900,6 +930,9 @@ memory_retrieve_dossier_ctx_free(memory_retrieve_dossier_ctx_t *c)
 {
   if(c == NULL)
     return;
+
+  chatbot_hold_unlink(&c->hold);
+
   if(c->facts        != NULL) mem_free(c->facts);
   if(c->mention_msgs != NULL) mem_free(c->mention_msgs);
   if(c->query_esc    != NULL) mem_free(c->query_esc);
@@ -918,6 +951,18 @@ memory_retrieve_dossier_embed_done(const llm_embed_response_t *resp)
   memory_hit_t hits[MEMORY_RECALL_SCRATCH];
   size_t n_hits;
   uint32_t fetch_k;
+
+  // Disowned: deliver the mention-only result the embed-failure arm
+  // below already builds, for the reason spelled out at
+  // memory_retrieve_ns_embed_done — the caller's record is freed by
+  // its own callback and nothing else can free it.
+  if(chatbot_hold_disowned(&c->hold))
+  {
+    c->cb(c->facts, c->n_facts,
+          c->mention_msgs, c->n_mention_msgs, c->user);
+    memory_retrieve_dossier_ctx_free(c);
+    return;
+  }
 
   if(!resp->ok || resp->n_vectors < 1 || resp->dim == 0)
   {
@@ -1104,6 +1149,8 @@ memory_retrieve_dossier(int ns_id, int64_t dossier_id, const char *query,
   rc->mention_msgs   = msgs;
   rc->n_mention_msgs = n_msgs;
   snprintf(rc->model, sizeof(rc->model), "%s", cfg.embed_model);
+
+  chatbot_hold_link(&rc->hold, NULL, rc);
 
   if(llm_embed_submit(cfg.embed_model, inputs, 1,
       memory_retrieve_dossier_embed_done, rc) != SUCCESS)

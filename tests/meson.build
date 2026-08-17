@@ -63,6 +63,24 @@ test_cooldown = executable('test_cooldown',
   link_with : [test_harness],
 )
 
+# The chat plugin's drain for the async records core cannot see. A
+# shutdown that returns early is silent until a reload lands on a
+# running callback months later, which is exactly the silent-wrongness
+# bar this directory is filtered to. hold.c includes no chat header —
+# that is the property the whole scheme rests on — so this suite
+# compiles the one file directly; inference_include is for the dlsym
+# shim it calls llm_cancel_user through, and libcore resolves clam()
+# and curl_request_cancel.
+test_hold = executable('test_hold',
+  'test_hold.c',
+  '../plugins/bot/chat/hold.c',
+  include_directories : [include_directories('.'), inc_include,
+                         inference_include,
+                         include_directories('../plugins/bot/chat')],
+  link_with : [test_harness, libcore],
+  dependencies : core_deps,
+)
+
 # The FACT-1 ladder is SQL, so its suite drives psql against the
 # configured database inside a rolled-back transaction, and SKIPs when
 # that database is unreachable. It needs no core symbols — only the
@@ -213,6 +231,7 @@ test('json', test_json)
 test('irc_parse', test_irc_parse)
 test('db_txn', test_db_txn)
 test('cooldown', test_cooldown)
+test('hold', test_hold)
 test('fact_merge', test_fact_merge)
 test('kv_bot', test_kv_bot)
 test('kv_str', test_kv_str)

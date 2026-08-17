@@ -7,6 +7,7 @@
 #include "botmanctl.h"
 #include "cmd.h"
 #include "db.h"
+#include "hold.h"
 #include "inference.h"
 #include "method.h"
 #include "task.h"
@@ -516,6 +517,13 @@ memory_write_embedding(const char *table, const char *id_col, int64_t id,
 
 typedef struct
 {
+  // First member, and on the live list from allocation to free: core's
+  // quiescence barrier range-tests tasks and curl requests and can see
+  // neither side of an LLM request, so this record is the plugin's to
+  // drain (hold.h). Owner NULL — the embed belongs to the plugin, not
+  // to any one bot.
+  chatbot_hold_t hold;
+
   int64_t id;
   char    model[MEM_EMBED_MODEL_SZ];
 } memory_embed_ctx_t;
@@ -525,10 +533,18 @@ memory_embed_done(const llm_embed_response_t *resp)
 {
   memory_embed_ctx_t *c = resp->user_data;
 
+  if(chatbot_hold_disowned(&c->hold))
+  {
+    chatbot_hold_unlink(&c->hold);
+    mem_free(c);
+    return;
+  }
+
   if(!resp->ok || resp->n_vectors < 1 || resp->dim == 0)
   {
     clam(CLAM_WARN, "memory", "embed failed: %s",
         resp->error ? resp->error : "(no detail)");
+    chatbot_hold_unlink(&c->hold);
     mem_free(c);
     return;
   }
@@ -536,6 +552,7 @@ memory_embed_done(const llm_embed_response_t *resp)
   memory_write_embedding("conversation_embeddings", "msg_id",
       c->id, c->model, resp->dim, resp->vectors[0]);
 
+  chatbot_hold_unlink(&c->hold);
   mem_free(c);
 }
 
@@ -682,6 +699,10 @@ memory_submit_embed(int64_t id, const char *model, const char *text,
   c->id = id;
   snprintf(c->model, sizeof(c->model), "%s", model);
 
+  // Linked before the submit, never after: from the instant the engine
+  // has this pointer the completion can be running.
+  chatbot_hold_link(&c->hold, NULL, c);
+
   if(llm_embed_submit(model, inputs, 1, memory_embed_done, c) != SUCCESS)
   {
     // Model missing / unregistered / queue full -- log once.
@@ -692,6 +713,7 @@ memory_submit_embed(int64_t id, const char *model, const char *text,
           "embed submit failed (model '%s' unavailable); skipping", model);
       warned = true;
     }
+    chatbot_hold_unlink(&c->hold);
     mem_free(c);
   }
 }
@@ -1517,9 +1539,18 @@ memory_register_commands(void)
 void
 memory_stop(void)
 {
-  // A backfill outlives any one command, so stop it here rather than
-  // letting its pump re-arm into an unloading mapping.
+  // The flag first. The pump tests it before it fetches and before it
+  // arms, so from this line nothing new can be submitted — which is
+  // what makes the drain below converge instead of chasing its own
+  // tail.
   memory_backfill_stop();
+
+  // Then the records core cannot see. A task and a curl request are
+  // range-tested by plugin_quiesce; an LLM request carries a callback
+  // into this mapping that appears in llm's private list and nowhere
+  // else, so the wait is the plugin's to own. NULL owner means the
+  // plugin's own work rather than any one bot's (hold.h).
+  chatbot_hold_shutdown(NULL);
 
   if(memory_sweep_task == TASK_HANDLE_NONE)
     return;
@@ -1542,6 +1573,12 @@ memory_exit(void)
   // memory_stop()'s business — by here it must already be cancelled.
   memory_sweep_task = TASK_HANDLE_NONE;
 
+  // Under the write lock, mirroring memory_exclude_regex_compile(): a
+  // reader takes the read lock around its regexec, and core runs
+  // deinit() BEFORE its quiescence barrier by design, so a pump task
+  // can still be inside the gate here.
+  pthread_rwlock_wrlock(&memory_exclude_rx_lock);
+
   if(memory_exclude_rx_valid)
   {
     regfree(&memory_exclude_rx);
@@ -1549,6 +1586,8 @@ memory_exit(void)
   }
 
   memory_exclude_rx_pattern[0] = '\0';
+
+  pthread_rwlock_unlock(&memory_exclude_rx_lock);
 
   pthread_mutex_destroy(&memory_cfg_mutex);
   pthread_mutex_destroy(&memory_stat_mutex);

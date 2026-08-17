@@ -1401,7 +1401,7 @@ chatbot_destroy(void *handle)
   // coalescer is, and for one more: at `quit` the whole of this runs at
   // bot_exit(), three steps before the engine cancels what is still on
   // the wire (root TODO.md §SC-SAN-FINDINGS SAN-27).
-  chatbot_reply_shutdown(st);
+  chatbot_hold_shutdown(st);
 
   pthread_rwlock_destroy(&st->lock);
   pthread_mutex_destroy(&st->flight_mutex);
@@ -1620,7 +1620,7 @@ chatbot_stop(void *handle)
   // inside on_message can submit a fresh reply after this returns —
   // chatbot_destroy() runs the same drain, and bot.c defers it to the
   // last delivery out, so that one is the closing pass.
-  chatbot_reply_shutdown(st);
+  chatbot_hold_shutdown(st);
 }
 
 // Evaluate speak policy for a (possibly coalesced) message and, if it

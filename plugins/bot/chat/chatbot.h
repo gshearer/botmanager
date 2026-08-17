@@ -94,6 +94,7 @@ void chatbot_personality_free(struct chatbot_personality_s *p);
 #include "cmd.h"
 #include "common.h"
 #include "cooldown.h"
+#include "hold.h"
 #include "extract.h"
 #include "kv.h"
 #include "alloc.h"
@@ -718,17 +719,6 @@ bool chatbot_reply_init(void);
 // from chatbot_plugin_deinit.
 void chatbot_reply_deinit(void);
 
-// Disown every piece of async work that still names `st`, cancel what
-// can be cancelled at its engine, and wait for the callbacks to arrive.
-// Called from BOTH chatbot_stop() and chatbot_destroy(): bot_destroy()
-// reaches destroy() with no stop() when the bot was never RUNNING, and
-// a delivery that is still inside on_message can submit a fresh reply
-// after stop() has already drained. Returns once nothing airborne can
-// still dereference `st` — or after CHATBOT_REPLY_DRAIN_SECS, which
-// logs a WARN and leaves the stragglers disowned rather than blocking
-// the shutdown for ever.
-void chatbot_reply_shutdown(chatbot_state_t *st);
-
 // ---- volunteer.c (V1 — spontaneous post-acquire speech) ----
 
 // Register the acquire post-ingest callback. Called once from
@@ -811,55 +801,6 @@ void chatbot_stamp_witness_interject(chatbot_state_t *st,
 // truncation cap CHATBOT_RECENT_REPLY_TEXT_SZ lives in memory.h (same
 // size the stored mem_recent_reply_t buffer uses).
 #define CHATBOT_RECENT_REPLIES_MAX         10
-
-// Seconds chatbot_reply_shutdown() will wait for disowned work to come
-// back. Sized against core's Class-B grace: a straggler must cost the
-// shutdown less than the unload it is holding up.
-#define CHATBOT_REPLY_DRAIN_SECS           5
-
-// Teardown accounting for any record that outlives the turn that made
-// it. A reply streams from a curl worker long after the line that asked
-// for it, and `st` is freed the moment its bot is destroyed — which at
-// `quit` is bot_exit(), three shutdown steps before the LLM engine
-// cancels what is on the wire. Every such record carries a hold and is
-// on reply.c's list from allocation to free; a bot teardown walks the
-// list, disowns its own entries, cancels them at their engine and waits
-// for the callbacks to arrive. A disowned callback frees its record and
-// dereferences no field of `st`.
-typedef struct chatbot_hold
-{
-  struct chatbot_hold *next;
-  chatbot_state_t     *st;
-
-  // What to ask an engine to cut short. `llm_user` is the user_data an
-  // LLM request was submitted with, `curl_id` a plain HTTP request's
-  // stable identity; either may be absent, since a record between two
-  // async legs has nothing on the wire. A cancelled request still
-  // delivers, so these only shorten the wait — the drain is what makes
-  // it safe.
-  const void          *llm_user;
-  uint64_t             curl_id;
-
-  bool                 disowned;
-} chatbot_hold_t;
-
-// Put `h` on the live list, owned by `st`. `llm_user` is the user_data
-// the record's LLM requests will carry (NULL when it submits none).
-void chatbot_hold_link(chatbot_hold_t *h, chatbot_state_t *st,
-    const void *llm_user);
-
-// Name the HTTP request this record is currently waiting on, so a
-// teardown can cancel it. 0 clears.
-void chatbot_hold_set_curl(chatbot_hold_t *h, uint64_t curl_id);
-
-// True once a bot teardown has disowned this record. Every callback
-// that resumes one asks first: a true answer means free it and touch
-// nothing under `st`.
-bool chatbot_hold_disowned(const chatbot_hold_t *h);
-
-// Take `h` off the live list and wake any drain waiting on it. Called
-// from the record's own free path, never before it.
-void chatbot_hold_unlink(chatbot_hold_t *h);
 
 // Forward: full definition lives in reply.c, where the mention bundle
 // is assembled. chatbot_req_t only holds a heap-pointer.

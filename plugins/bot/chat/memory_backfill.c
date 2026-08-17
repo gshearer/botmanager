@@ -7,6 +7,7 @@
 #include "bot.h"
 #include "cmd.h"
 #include "db.h"
+#include "hold.h"
 #include "inference.h"
 #include "method.h"
 #include "task.h"
@@ -35,7 +36,15 @@ typedef struct
   bool     running;
   bool     stopping;
   uint32_t ns_id;
-  int64_t  hwm;                        // highest conversation_log.id read
+  // Highest conversation_log.id read — a SCAN cursor, not a work
+  // cursor. The resume point is backfill_fetch()'s LEFT JOIN, which
+  // already excludes every row any previous run embedded; losing this
+  // on a reload costs one re-read of the rows a run SKIPPED and
+  // re-embeds nothing. Persisting it would be worse than useless: the
+  // next run would start past every row a configuration change (a
+  // lower min_chars, an edited exclusion regex, a newly eligible kind)
+  // had just made eligible, permanently and with no verb to reset it.
+  int64_t  hwm;
   char     model[MEM_EMBED_MODEL_SZ];
   uint32_t min_chars;
   uint32_t batch_size;
@@ -60,6 +69,13 @@ static memory_backfill_t bf;
 // DB.
 typedef struct
 {
+  // First member, and on the live list from allocation to free. core's
+  // quiescence barrier range-tests tasks and curl requests; it can see
+  // neither side of an LLM request, so a batch airborne at unload is
+  // the plugin's to drain (hold.h). Owner NULL — a backfill belongs to
+  // the plugin, not to any one bot.
+  chatbot_hold_t hold;
+
   size_t   n;
   int64_t  ids[MEM_EMBED_BATCH_MAX];
   char    *texts[MEM_EMBED_BATCH_MAX];
@@ -79,6 +95,8 @@ static void backfill_embed_done(const llm_embed_response_t *resp);
 static void
 backfill_batch_free(memory_backfill_batch_t *b)
 {
+  chatbot_hold_unlink(&b->hold);
+
   for(size_t i = 0; i < b->n; i++)
     if(b->texts[i] != NULL)
       mem_free(b->texts[i]);
@@ -136,6 +154,10 @@ backfill_fetch(void)
   pthread_mutex_unlock(&backfill_mutex);
 
   b = mem_alloc("memory", "backfill_batch", sizeof(*b));
+
+  // Linked at birth rather than at submit, so every path that frees a
+  // batch — including the scan-failed one below — unlinks it.
+  chatbot_hold_link(&b->hold, NULL, b);
 
   pthread_mutex_lock(&backfill_mutex);
   snprintf(b->model, sizeof(b->model), "%s", bf.model);
@@ -244,6 +266,16 @@ backfill_finish(const char *why)
   long     secs;
 
   pthread_mutex_lock(&backfill_mutex);
+
+  // Two paths can now reach here for one run — a disowned completion
+  // and the pump that was already stopping — so the tally is logged
+  // once, by whichever arrives first.
+  if(!bf.running)
+  {
+    pthread_mutex_unlock(&backfill_mutex);
+    return;
+  }
+
   bf.running   = false;
   bf.stopping  = false;
   bf.in_flight = false;
@@ -286,6 +318,24 @@ static void
 backfill_retry_singles(memory_backfill_batch_t *b)
 {
   size_t retried = 0;
+  bool   stopping;
+
+  pthread_mutex_lock(&backfill_mutex);
+  stopping = bf.stopping;
+  pthread_mutex_unlock(&backfill_mutex);
+
+  // A batch that failed during a stop must end, not fan out into 32
+  // fresh requests against a mapping that is being unloaded.
+  if(stopping)
+  {
+    pthread_mutex_lock(&backfill_mutex);
+    bf.failed += b->n;
+    pthread_mutex_unlock(&backfill_mutex);
+
+    backfill_batch_free(b);
+    backfill_finish("stopped");
+    return;
+  }
 
   for(size_t i = 0; i < b->n; i++)
   {
@@ -295,6 +345,7 @@ backfill_retry_singles(memory_backfill_batch_t *b)
       continue;
 
     s = mem_alloc("memory", "backfill_batch", sizeof(*s));
+    chatbot_hold_link(&s->hold, NULL, s);
     s->n            = 1;
     s->ids[0]       = b->ids[i];
     s->texts[0]     = b->texts[i];
@@ -332,6 +383,15 @@ backfill_embed_done(const llm_embed_response_t *resp)
 {
   memory_backfill_batch_t *b = resp->user_data;
   bool stopping;
+
+  // Disowned: the mapping is going. Free the batch, close the run out
+  // and touch nothing else — no pump to arm, no single to retry.
+  if(chatbot_hold_disowned(&b->hold))
+  {
+    backfill_batch_free(b);
+    backfill_finish("stopped");
+    return;
+  }
 
   if(!resp->ok || resp->dim == 0)
   {
