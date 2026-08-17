@@ -248,6 +248,11 @@ typedef struct
   curl_method_t   method;
   uint32_t        elapsed_secs;
   bool            in_flight;    // false = still queued, not yet dispatched
+  // True while this thread is *inside* the submitter's completion
+  // callback — the only state in which the request holds the
+  // submitter's code and locks, and the one an unload must wait out
+  // before that plugin's deinit() tears them down.
+  bool            delivering;
   curl_done_cb_t  cb;
   void           *cb_data;
   curl_chunk_cb_t chunk_cb;     // NULL unless streaming
@@ -325,7 +330,13 @@ struct curl_request
   _Atomic bool        cancel_requested;
 
   curl_method_t       method;
-  curl_req_state_t    state;
+
+  // _Atomic on the declaration, per the tree's cross-thread-scalar
+  // ruling (core/AGENTS.md §Patterns): written by the multi loop when a
+  // transfer ends, read by an unloading thread that needs to know
+  // whether this request is on the wire or *inside* the submitter's
+  // completion callback. No reader changed to gain it.
+  _Atomic curl_req_state_t state;
   curl_prio_t         prio;
   char                url[CURL_URL_SZ];
   uint32_t            timeout_secs;     // 0 = use default

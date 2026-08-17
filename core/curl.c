@@ -1662,6 +1662,7 @@ curl_iter_fill(const curl_request_t *r, bool in_flight,
   out->method       = r->method;
   out->elapsed_secs = 0;
   out->in_flight    = in_flight;
+  out->delivering   = (r->state == CURL_REQ_DONE);
   out->cb           = r->cb;
   out->cb_data      = r->cb_data;
   out->chunk_cb     = r->chunk_cb;

@@ -22,7 +22,7 @@ static uint32_t plugin_reclaim(const plugin_rec_t *target);
 // iterators, and both are called from plugin_unload after the Class-A
 // sweep, before dlclose.
 static bool plugin_quiesce(const plugin_rec_t *target, uint32_t timeout_ms,
-    char *offender, size_t offender_cap);
+    bool running_only, char *offender, size_t offender_cap);
 static void audit_emit_clam(const char *line, void *data);
 static void plugin_unmap_broadcast(uintptr_t lo, uintptr_t hi);
 
@@ -318,6 +318,22 @@ plugin_unload_locked(const char *name, plugin_unload_report_t *report)
 
   if(target->state == PLUGIN_INITIALIZED || target->state == PLUGIN_STOPPING)
   {
+    // Wait out what stop() just took off the queues BEFORE deinit runs.
+    // stop() cancels; it does not join what is already executing, and a
+    // callback in that window reads the very state deinit() is about to
+    // tear down — including the locks it takes on the way in. Destroying
+    // a mutex a live holder still locks is undefined behaviour that
+    // reports as the *next* subsystem's fault, and no sanitizer here
+    // attributes it back (root TODO.md §SC-OBSERVED OBS-34).
+    //
+    // The same barrier runs again after plugin_reclaim, and both are
+    // needed: this one protects the plugin's own teardown, that one
+    // protects the dlclose. Free when nothing holds — one pass over four
+    // registries — and it never refuses: the verdict stays where it was,
+    // with the audit below.
+    plugin_quiesce(target, (uint32_t)kv_get_int(KV_UNLOAD_QUIESCE_MS),
+        true, NULL, 0);
+
     clam(CLAM_DEBUG, "plugin", "deinitializing '%s' before unload", name);
 
     if(target->desc->deinit != NULL)
@@ -369,7 +385,7 @@ plugin_unload_locked(const char *name, plugin_unload_report_t *report)
     // a policy. Waiting for one to end, however, is always correct — so
     // give the transient half its budget before judging what is left.
     plugin_quiesce(target, (uint32_t)kv_get_int(KV_UNLOAD_QUIESCE_MS),
-        offender, sizeof(offender));
+        false, offender, sizeof(offender));
 
     residual = plugin_audit(name, NULL, NULL);
 
@@ -1991,6 +2007,7 @@ typedef struct
 {
   plugin_map_t map;
   uint32_t     holders;                    // this pass only; reset per poll
+  bool         running_only;               // see plugin_quiesce
   char         offender[PLUGIN_OFFENDER_SZ];
 } plugin_quiesce_ctx_t;
 
@@ -2027,6 +2044,11 @@ quiesce_task_cb(const task_iter_info_t *info, void *data)
       && !quiesce_in_map(ctx, info->data))
     return;
 
+  // A queued or sleeping task is not executing anything: it holds no
+  // lock of the plugin's and deinit() is where most plugins cancel it.
+  if(ctx->running_only && info->state != TASK_RUNNING)
+    return;
+
   quiesce_hold(ctx, "task", info->name, task_state_name(info->state));
 }
 
@@ -2041,18 +2063,31 @@ quiesce_curl_cb(const curl_iter_req_t *req, void *data)
       && !quiesce_in_map(ctx, req->chunk_user))
     return;
 
+  // A transfer on the wire holds nothing of the submitter's; only the
+  // completion callback does, and only while it runs.
+  if(ctx->running_only && !req->delivering)
+    return;
+
   quiesce_hold(ctx, "request", req->url,
-      req->in_flight ? "in-flight" : "queued");
+      req->delivering ? "delivering" :
+      (req->in_flight ? "in-flight" : "queued"));
 }
 
 // Blocks the unloading thread — an operator/command thread — for at
 // most `timeout_ms`. Never called from a worker: plugin_unload's own
 // callers are command handlers and the whenmoon strategy reload.
+//
+// running_only narrows the question from "does anything still NAME this
+// mapping" (what dlclose needs to know) to "is anything still EXECUTING
+// in it" (what the plugin's own deinit() needs to know). A queued task
+// or a transfer on the wire answers the first and not the second, and
+// waiting on those before deinit would charge the full budget to every
+// plugin that cancels its Class-B in deinit() rather than stop().
 // returns: SUCCESS when nothing in the queues names the mapping any
 // more, FAIL on timeout (caller refuses the unload).
 static bool
 plugin_quiesce(const plugin_rec_t *target, uint32_t timeout_ms,
-    char *offender, size_t offender_cap)
+    bool running_only, char *offender, size_t offender_cap)
 {
   static const struct timespec nap =
       { 0, (long)PLUGIN_QUIESCE_POLL_MS * 1000L * 1000L };
@@ -2068,6 +2103,7 @@ plugin_quiesce(const plugin_rec_t *target, uint32_t timeout_ms,
     return(SUCCESS);
 
   memset(&ctx, 0, sizeof(ctx));
+  ctx.running_only = running_only;
 
   if(plugin_map_of(target->desc, &ctx.map) != SUCCESS)
   {
@@ -2133,9 +2169,15 @@ plugin_quiesce(const plugin_rec_t *target, uint32_t timeout_ms,
   if(offender != NULL && offender_cap > 0)
     snprintf(offender, offender_cap, "%s", ctx.offender);
 
-  clam(CLAM_WARN, "plugin", "'%s': %u Class-B reference(s) still name its "
-      "mapping after %u ms; first is %s", target->desc->name, ctx.holders,
-      timeout_ms, ctx.offender);
+  if(running_only)
+    clam(CLAM_WARN, "plugin", "'%s': %u Class-B holder(s) still EXECUTING "
+        "in its mapping after %u ms; deinit() proceeds over them — first "
+        "is %s", target->desc->name, ctx.holders, timeout_ms, ctx.offender);
+
+  else
+    clam(CLAM_WARN, "plugin", "'%s': %u Class-B reference(s) still name its "
+        "mapping after %u ms; first is %s", target->desc->name, ctx.holders,
+        timeout_ms, ctx.offender);
 
   return(FAIL);
 }
