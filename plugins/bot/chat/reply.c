@@ -850,10 +850,7 @@ reply_nl_bridge(chatbot_req_t *r, const char *text)
   // synthesized downstream of this dispatch (nl_observe's dossier
   // resolve, the interpret cue's second submit) refuses an all-empty
   // tuple by design — the dcfc359 coalescer lesson.
-  snprintf(synth.nickname,    sizeof(synth.nickname),    "%s", r->nickname);
-  snprintf(synth.username,    sizeof(synth.username),    "%s", r->username);
-  snprintf(synth.hostname,    sizeof(synth.hostname),    "%s", r->hostname);
-  snprintf(synth.verified_id, sizeof(synth.verified_id), "%s", r->verified_id);
+  chat_identity_apply(&r->who, &synth);
   synth.timestamp = time(NULL);
 
   if(!cmd_permits(r->st->inst, &synth, def))
@@ -886,7 +883,7 @@ reply_nl_bridge(chatbot_req_t *r, const char *text)
     const char         *nick;
     char                excerpt[240];
 
-    nick = r->nickname[0] != '\0' ? r->nickname : r->sender;
+    nick = r->who.nickname[0] != '\0' ? r->who.nickname : r->sender;
 
     if(strlen(r->text) >= sizeof(excerpt))
       snprintf(excerpt, sizeof(excerpt), "%.*s…",
@@ -936,7 +933,7 @@ reply_nl_bridge(chatbot_req_t *r, const char *text)
   // exhaustion returns 0: the command dispatches uncaptured and the
   // channel gets the verbatim block, never silence.
   {
-    const char *nick = r->nickname[0] != '\0' ? r->nickname : r->sender;
+    const char *nick = r->who.nickname[0] != '\0' ? r->who.nickname : r->sender;
     char        excerpt[240];
     char        premise[512];
 
@@ -2854,10 +2851,7 @@ chatbot_reply_submit(chatbot_state_t *st, const method_msg_t *msg,
 
   snprintf(r->sender,          sizeof(r->sender),          "%s", msg->sender);
   snprintf(r->sender_metadata, sizeof(r->sender_metadata), "%s", msg->metadata);
-  snprintf(r->nickname,        sizeof(r->nickname),        "%s", msg->nickname);
-  snprintf(r->username,        sizeof(r->username),        "%s", msg->username);
-  snprintf(r->hostname,        sizeof(r->hostname),        "%s", msg->hostname);
-  snprintf(r->verified_id,     sizeof(r->verified_id),     "%s", msg->verified_id);
+  chat_identity_take(&r->who, msg);
   snprintf(r->channel,         sizeof(r->channel),         "%s", msg->channel);
 
   // Frame the incoming line as an emote when it is a /me action, unless
@@ -3170,10 +3164,7 @@ chatbot_reply_submit_vision(chatbot_state_t *st, const method_msg_t *msg,
 
   snprintf(r->sender,          sizeof(r->sender),          "%s", msg->sender);
   snprintf(r->sender_metadata, sizeof(r->sender_metadata), "%s", msg->metadata);
-  snprintf(r->nickname,        sizeof(r->nickname),        "%s", msg->nickname);
-  snprintf(r->username,        sizeof(r->username),        "%s", msg->username);
-  snprintf(r->hostname,        sizeof(r->hostname),        "%s", msg->hostname);
-  snprintf(r->verified_id,     sizeof(r->verified_id),     "%s", msg->verified_id);
+  chat_identity_take(&r->who, msg);
   snprintf(r->channel,         sizeof(r->channel),         "%s", msg->channel);
 
   if(msg->is_action && strncmp(msg->text, "* ", 2) != 0)

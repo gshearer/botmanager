@@ -62,25 +62,6 @@ voice_class_name(soul_class_t cls)
   }
 }
 
-static bool
-voice_exec(const char *sql)
-{
-  db_result_t *res = db_result_alloc();
-  bool         ok;
-
-  if(res == NULL)
-    return(FAIL);
-
-  ok = (db_query(sql, res) == SUCCESS && res->ok) ? SUCCESS : FAIL;
-
-  if(ok != SUCCESS)
-    clam(CLAM_WARN, VOICE_CTX, "sql failed: %s",
-        res->error[0] != '\0' ? res->error : "(no driver error)");
-
-  db_result_free(res);
-  return(ok);
-}
-
 // The descriptor table in chatbot.c is the single source of every
 // default here: an instance key is registered with its default at bind
 // time, so a bot with no DB row of its own still reads 23 / 8 / true /
@@ -110,21 +91,21 @@ soul_voice_ensure_schema(void)
   // thing it has said. The chat DDL discipline (memory_ensure_schema):
   // owner-run idempotent batches at plugin start(), after
   // dossier_register_config so the dossier(id) FK target exists.
-  (void)voice_exec(
+  (void)db_exec(
       "CREATE TABLE IF NOT EXISTS chat_soul_voice_log ("
       " id         BIGSERIAL    PRIMARY KEY,"
       " ns_id      INTEGER      NOT NULL REFERENCES userns(id) ON DELETE CASCADE,"
       " dossier_id BIGINT       REFERENCES dossier(id) ON DELETE SET NULL,"
       " class      SMALLINT     NOT NULL,"
       " spoken_at  TIMESTAMPTZ  NOT NULL DEFAULT NOW()"
-      ")");
+      ")", VOICE_CTX);
 
   // Both budget counts are (ns, class, recency); the per-person one
   // narrows that by dossier, which the row count at this scale makes
   // free.
-  (void)voice_exec(
+  (void)db_exec(
       "CREATE INDEX IF NOT EXISTS idx_chat_soul_voice_recent"
-      " ON chat_soul_voice_log(ns_id, class, spoken_at)");
+      " ON chat_soul_voice_log(ns_id, class, spoken_at)", VOICE_CTX);
 }
 
 bool
@@ -201,7 +182,7 @@ soul_voice_permits(const char *bot_name, uint32_t ns_id, int64_t dossier_id,
         " VALUES (%" PRIu32 ", %s, %d) RETURNING id",
         ns_id, dossier, (int)cls);
 
-    (void)voice_exec(sql);
+    (void)db_exec(sql, VOICE_CTX);
     return(true);
   }
 
@@ -270,7 +251,7 @@ soul_voice_permits(const char *bot_name, uint32_t ns_id, int64_t dossier_id,
 void
 soul_voice_purge(void)
 {
-  (void)voice_exec("DELETE FROM chat_soul_voice_log"
+  (void)db_exec("DELETE FROM chat_soul_voice_log"
       " WHERE spoken_at < NOW() - INTERVAL '"
-      VOICE_RETENTION_HOURS " hours'");
+      VOICE_RETENTION_HOURS " hours'", VOICE_CTX);
 }

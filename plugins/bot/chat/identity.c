@@ -134,6 +134,24 @@ chat_identity_token_score(const char *token, const dossier_sig_t *sig)
   return(0.0f);
 }
 
+void
+chat_identity_take(chat_identity_t *id, const method_msg_t *msg)
+{
+  strlcpy(id->nickname,    msg->nickname,    sizeof id->nickname);
+  strlcpy(id->username,    msg->username,    sizeof id->username);
+  strlcpy(id->hostname,    msg->hostname,    sizeof id->hostname);
+  strlcpy(id->verified_id, msg->verified_id, sizeof id->verified_id);
+}
+
+void
+chat_identity_apply(const chat_identity_t *id, method_msg_t *msg)
+{
+  strlcpy(msg->nickname,    id->nickname,    sizeof msg->nickname);
+  strlcpy(msg->username,    id->username,    sizeof msg->username);
+  strlcpy(msg->hostname,    id->hostname,    sizeof msg->hostname);
+  strlcpy(msg->verified_id, id->verified_id, sizeof msg->verified_id);
+}
+
 int64_t
 chat_user_dossier_id(const method_msg_t *msg, uint32_t ns_id,
     const char *display_label, bool create_if_missing)

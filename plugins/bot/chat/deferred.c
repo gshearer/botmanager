@@ -133,43 +133,6 @@ chatbot_deferred_ensure_schema(void)
 
 // ---------- small shared plumbing ----------
 
-static bool
-deferred_exec(const char *sql)
-{
-  db_result_t *res = db_result_alloc();
-  bool         ok;
-
-  if(res == NULL)
-    return(FAIL);
-
-  ok = (db_query(sql, res) == SUCCESS && res->ok) ? SUCCESS : FAIL;
-
-  if(ok != SUCCESS)
-    clam(CLAM_WARN, DEFERRED_CTX, "sql failed: %s",
-        res->error[0] != '\0' ? res->error : "(no driver error)");
-
-  db_result_free(res);
-  return(ok);
-}
-
-static void
-deferred_copy_col(char *dst, size_t cap, const db_result_t *res,
-    uint32_t row, uint32_t col)
-{
-  const char *s = db_result_get(res, row, col);
-
-  snprintf(dst, cap, "%s", s != NULL ? s : "");
-}
-
-static int64_t
-deferred_col_i64(const db_result_t *res, uint32_t row, uint32_t col,
-    int64_t dflt)
-{
-  const char *s = db_result_get(res, row, col);
-
-  return(s != NULL && s[0] != '\0' ? (int64_t)strtoll(s, NULL, 10) : dflt);
-}
-
 // Copy stored user text into a prompt-bound buffer: control bytes
 // become spaces so a line typed weeks ago cannot smuggle framing into
 // today's cue.
@@ -338,7 +301,7 @@ chatbot_deferred_insert(uint32_t ns_id, int64_t dossier,
         e[E_BODY], e[E_CMD], on_presence ? "TRUE" : "FALSE",
         (unsigned long long)secs, expires_cell);
 
-    ok = deferred_exec(sql);
+    ok = db_exec(sql, DEFERRED_CTX);
   }
 
   deferred_free_escaped(e, E_COUNT);
@@ -360,7 +323,7 @@ deferred_row_to_msg(const db_result_t *res, uint32_t i, method_msg_t *msg,
   method_inst_t *inst;
   char           mname[METHOD_NAME_SZ];
 
-  deferred_copy_col(mname, sizeof(mname), res, i, DC_METHOD_NAME);
+  db_result_copy(mname, sizeof(mname), res, i, DC_METHOD_NAME);
   inst = method_find(mname);
 
   if(inst == NULL)
@@ -370,13 +333,13 @@ deferred_row_to_msg(const db_result_t *res, uint32_t i, method_msg_t *msg,
   method_msg_bind(msg, inst);
   msg->timestamp = now;
 
-  deferred_copy_col(msg->sender,      sizeof(msg->sender),      res, i, DC_SENDER);
-  deferred_copy_col(msg->nickname,    sizeof(msg->nickname),    res, i, DC_NICKNAME);
-  deferred_copy_col(msg->username,    sizeof(msg->username),    res, i, DC_USERNAME);
-  deferred_copy_col(msg->hostname,    sizeof(msg->hostname),    res, i, DC_HOSTNAME);
-  deferred_copy_col(msg->verified_id, sizeof(msg->verified_id), res, i, DC_VERIFIED_ID);
-  deferred_copy_col(msg->metadata,    sizeof(msg->metadata),    res, i, DC_METADATA);
-  deferred_copy_col(msg->channel,     sizeof(msg->channel),     res, i, DC_CHANNEL);
+  db_result_copy(msg->sender,      sizeof(msg->sender),      res, i, DC_SENDER);
+  db_result_copy(msg->nickname,    sizeof(msg->nickname),    res, i, DC_NICKNAME);
+  db_result_copy(msg->username,    sizeof(msg->username),    res, i, DC_USERNAME);
+  db_result_copy(msg->hostname,    sizeof(msg->hostname),    res, i, DC_HOSTNAME);
+  db_result_copy(msg->verified_id, sizeof(msg->verified_id), res, i, DC_VERIFIED_ID);
+  db_result_copy(msg->metadata,    sizeof(msg->metadata),    res, i, DC_METADATA);
+  db_result_copy(msg->channel,     sizeof(msg->channel),     res, i, DC_CHANNEL);
 
   return(inst);
 }
@@ -400,7 +363,7 @@ deferred_unclaim(int64_t id, int64_t repeat_secs)
 
   snprintf(sql, sizeof(sql),
       "UPDATE chat_deferred SET delivered_at = NULL WHERE id = %" PRId64, id);
-  (void)deferred_exec(sql);
+  (void)db_exec(sql, DEFERRED_CTX);
   return(true);
 }
 
@@ -580,15 +543,15 @@ deferred_deliver_row(const char *bot_name, uint32_t ns_id,
     uint32_t i, time_t now)
 {
   method_msg_t msg;
-  int64_t      id      = deferred_col_i64(res, i, DC_ID, 0);
-  int64_t      kind    = deferred_col_i64(res, i, DC_KIND, DEFERRED_KIND_SAY);
-  time_t       created = (time_t)deferred_col_i64(res, i, DC_CREATED, now);
+  int64_t      id      = db_result_get_i64(res, i, DC_ID, 0);
+  int64_t      kind    = db_result_get_i64(res, i, DC_KIND, DEFERRED_KIND_SAY);
+  time_t       created = (time_t)db_result_get_i64(res, i, DC_CREATED, now);
   const char  *expired = db_result_get(res, i, DC_EXPIRED);
   char         source[24];
   char         body[CMD_ARG_SZ];
   char         ago[32];
 
-  deferred_copy_col(source, sizeof(source), res, i, DC_SOURCE);
+  db_result_copy(source, sizeof(source), res, i, DC_SOURCE);
 
   // Expiry is claim-and-drop: a wish two days stale or a watch whose
   // window closed is worse spoken late than never spoken at all.
@@ -606,7 +569,7 @@ deferred_deliver_row(const char *bot_name, uint32_t ns_id,
     // mid-reload) the row goes back to pending, so a re-bound method
     // delivers LATE rather than never. Leaving it claimed would eat
     // the work silently — the one outcome worse than lateness.
-    bool back = deferred_unclaim(id, deferred_col_i64(res, i, DC_REPEAT, 0));
+    bool back = deferred_unclaim(id, db_result_get_i64(res, i, DC_REPEAT, 0));
 
     clam(CLAM_WARN, DEFERRED_CTX,
         "bot=%s deferred %" PRId64 " method gone — %s", bot_name, id,
@@ -642,10 +605,10 @@ deferred_deliver_row(const char *bot_name, uint32_t ns_id,
   // hour is spoken on the next sighting, or not at all after two days
   // — which is exactly the promise the chore made when it wrote it.
   if(!soul_voice_permits(bot_name, ns_id,
-      deferred_col_i64(res, i, DC_DOSSIER, 0),
+      db_result_get_i64(res, i, DC_DOSSIER, 0),
       deferred_source_class(source), false))
   {
-    bool back = deferred_unclaim(id, deferred_col_i64(res, i, DC_REPEAT, 0));
+    bool back = deferred_unclaim(id, db_result_get_i64(res, i, DC_REPEAT, 0));
 
     clam(CLAM_INFO, DEFERRED_CTX,
         "bot=%s deferred %" PRId64 " (%s) held by the voice governor — %s",
@@ -799,10 +762,10 @@ chatbot_deferred_presence_scan(const char *bot_name, uint32_t ns_id,
   {
     char source[24];
 
-    out[n].id = deferred_col_i64(res, i, 0, 0);
-    deferred_copy_col(out[n].nickname, sizeof(out[n].nickname), res, i, 1);
-    deferred_copy_col(out[n].sender,   sizeof(out[n].sender),   res, i, 2);
-    deferred_copy_col(source,          sizeof(source),          res, i, 3);
+    out[n].id = db_result_get_i64(res, i, 0, 0);
+    db_result_copy(out[n].nickname, sizeof(out[n].nickname), res, i, 1);
+    db_result_copy(out[n].sender,   sizeof(out[n].sender),   res, i, 2);
+    db_result_copy(source,          sizeof(source),          res, i, 3);
     out[n].cls = deferred_source_class(source);
   }
 
@@ -1167,7 +1130,7 @@ deferred_render(const cmd_ctx_t *ctx, const db_result_t *res, bool with_who)
     char        venue[METHOD_CHANNEL_SZ];
     char        body [192];
     const char *pres = db_result_get(res, i, 7);
-    int64_t     secs = deferred_col_i64(res, i, 4, 0);
+    int64_t     secs = db_result_get_i64(res, i, 4, 0);
     bool        back = (pres != NULL && (pres[0] == 't' || pres[0] == 'T'));
 
     char        when [48];
@@ -1188,23 +1151,23 @@ deferred_render(const cmd_ctx_t *ctx, const db_result_t *res, bool with_who)
     else
       snprintf(when, sizeof(when), "now");
 
-    deferred_copy_col(id,    sizeof(id),    res, i, 0);
-    deferred_copy_col(src,   sizeof(src),   res, i, 1);
-    deferred_copy_col(body,  sizeof(body),  res, i, 3);
-    deferred_copy_col(venue, sizeof(venue), res, i, 5);
+    db_result_copy(id,    sizeof(id),    res, i, 0);
+    db_result_copy(src,   sizeof(src),   res, i, 1);
+    db_result_copy(body,  sizeof(body),  res, i, 3);
+    db_result_copy(venue, sizeof(venue), res, i, 5);
 
     if(with_who)
     {
       char nick[METHOD_SENDER_SZ];
 
-      deferred_copy_col(nick, sizeof(nick), res, i, 6);
+      db_result_copy(nick, sizeof(nick), res, i, 6);
       snprintf(who, sizeof(who), CLR_CYAN "%s" CLR_RESET " ", nick);
     }
 
     snprintf(line, sizeof(line),
         "  " CLR_BOLD "%s" CLR_RESET "  %s%s/%s  %s  %s: %s",
         id, who, src,
-        deferred_col_i64(res, i, 2, DEFERRED_KIND_SAY) == DEFERRED_KIND_RUN
+        db_result_get_i64(res, i, 2, DEFERRED_KIND_SAY) == DEFERRED_KIND_RUN
             ? "run" : "say",
         when, venue[0] != '\0' ? venue : "DM", body);
 

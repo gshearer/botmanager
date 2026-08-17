@@ -34,15 +34,10 @@ typedef struct
   char            sender[METHOD_SENDER_SZ];
   char            channel[METHOD_CHANNEL_SZ];
   char            metadata[METHOD_META_SZ];
-  // The identity tuple, carried whole: chat_user_dossier_id refuses an
-  // all-empty tuple by design, so a task data missing it resolved
-  // dossier 0 on every dispatch and this observer never wrote a fact
-  // in its life (CHAT-NLOBSERVE-1; the dcfc359 coalescer disease in a
-  // second location).
-  char            nickname[METHOD_NICKNAME_SZ];
-  char            username[METHOD_USERNAME_SZ];
-  char            hostname[METHOD_HOSTNAME_SZ];
-  char            verified_id[METHOD_VERIFIED_ID_SZ];
+  // Carried whole — this observer once shipped without it and never
+  // wrote a fact in its life (CHAT-NLOBSERVE-1; identity.h
+  // §chat_identity_t has the rest of the history).
+  chat_identity_t who;
   char            user_label[128];
   // Named, not pointed at: the geocode hop outlives the turn, and the
   // instance can be reloaded away meanwhile (method.h §method_msg_t).
@@ -224,10 +219,7 @@ nl_observe_task(task_t *t)
   snprintf(synth.sender,      sizeof(synth.sender),      "%s", d->sender);
   snprintf(synth.channel,     sizeof(synth.channel),     "%s", d->channel);
   snprintf(synth.metadata,    sizeof(synth.metadata),    "%s", d->metadata);
-  snprintf(synth.nickname,    sizeof(synth.nickname),    "%s", d->nickname);
-  snprintf(synth.username,    sizeof(synth.username),    "%s", d->username);
-  snprintf(synth.hostname,    sizeof(synth.hostname),    "%s", d->hostname);
-  snprintf(synth.verified_id, sizeof(synth.verified_id), "%s", d->verified_id);
+  chat_identity_apply(&d->who, &synth);
 
   did = chat_user_dossier_id(&synth, d->ns_id, d->sender, true);
 
@@ -306,10 +298,7 @@ chatbot_nl_observe_location_slot(bot_inst_t *bot,
   snprintf(d->sender,      sizeof(d->sender),      "%s", msg->sender);
   snprintf(d->channel,     sizeof(d->channel),     "%s", msg->channel);
   snprintf(d->metadata,    sizeof(d->metadata),    "%s", msg->metadata);
-  snprintf(d->nickname,    sizeof(d->nickname),    "%s", msg->nickname);
-  snprintf(d->username,    sizeof(d->username),    "%s", msg->username);
-  snprintf(d->hostname,    sizeof(d->hostname),    "%s", msg->hostname);
-  snprintf(d->verified_id, sizeof(d->verified_id), "%s", msg->verified_id);
+  chat_identity_take(&d->who, msg);
   snprintf(d->user_label,  sizeof(d->user_label),  "%s", value);
 
   t = task_add(OBS_CTX, TASK_ANY, 200, nl_observe_task, d);

@@ -11,6 +11,7 @@
 #include "attack.h"
 
 #include "colors.h"
+#include "display.h"
 #include "util.h"
 
 #include <inttypes.h>
@@ -60,128 +61,6 @@
 // display columns, and a display column is at most four UTF-8 bytes.
 // Sized from the geometry so the cell buffer provably swallows it.
 #define ATK_NAME_SZ  ((ATK_W_NAME - 1) * 4 + 1)
-
-// ------------------------------------------------------------------ //
-// Alignment                                                           //
-// ------------------------------------------------------------------ //
-
-// Visible column count: an abstract color marker ("\x01" + id) is two
-// bytes of zero width, and every glyph the pit draws — block, skull,
-// arrow, en-dash — is a single-column code point, so counting UTF-8 lead
-// bytes is the column count. Same shape as stock.c's renderer.
-static size_t
-atk_vis_len(const char *s)
-{
-  size_t n = 0;
-
-  while(*s != '\0')
-  {
-    unsigned char c = (unsigned char)*s;
-
-    if(c == '\x01' && s[1] != '\0')
-    {
-      s += 2;
-      continue;
-    }
-
-    if((c & 0xc0) != 0x80)
-      n++;
-
-    s++;
-  }
-
-  return(n);
-}
-
-// Right-align: shift the content up and fill the gap with spaces.
-static void
-atk_pad(char *buf, size_t sz, int width)
-{
-  size_t vis = atk_vis_len(buf);
-  size_t raw = strlen(buf);
-  int    pad = width - (int)vis;
-  int    i;
-
-  if(pad <= 0 || raw + (size_t)pad + 1 > sz)
-    return;
-
-  memmove(buf + pad, buf, raw + 1);
-
-  for(i = 0; i < pad; i++)
-    buf[i] = ' ';
-}
-
-// Left-align: trail spaces until the cell fills its width.
-static void
-atk_padr(char *buf, size_t sz, int width)
-{
-  size_t vis = atk_vis_len(buf);
-  size_t raw = strlen(buf);
-  int    pad = width - (int)vis;
-  int    i;
-
-  if(pad <= 0)
-    return;
-
-  if(raw + (size_t)pad + 1 > sz)
-    pad = (int)(sz - raw - 1);
-
-  for(i = 0; i < pad; i++)
-    buf[raw + (size_t)i] = ' ';
-
-  buf[raw + (size_t)pad] = '\0';
-}
-
-// Copy at most `cols` display columns, never splitting a UTF-8 sequence.
-// `src` is a nickname straight from the database: no color markers, but
-// no guarantee of ASCII either.
-static void
-atk_fit(const char *src, int cols, char *dst, size_t sz)
-{
-  size_t n = 0;
-  int    w = 0;
-
-  while(*src != '\0' && w < cols)
-  {
-    unsigned char c   = (unsigned char)*src;
-    size_t        len = 1;
-    size_t        k;
-
-    if((c & 0xe0) == 0xc0)      len = 2;
-    else if((c & 0xf0) == 0xe0) len = 3;
-    else if((c & 0xf8) == 0xf0) len = 4;
-
-    // A NUL inside the sequence (a name byte-truncated mid-glyph on its
-    // way into a VARCHAR) bounds len to the bytes actually there.
-    for(k = 0; k < len; k++)
-      if(src[k] == '\0')
-      {
-        len = k;
-        break;
-      }
-
-    if(len == 0 || n + len + 1 > sz)
-      break;
-
-    for(k = 0; k < len; k++)
-      dst[n++] = src[k];
-
-    src += len;
-    w++;
-  }
-
-  dst[n] = '\0';
-}
-
-// Append one finished cell to a line, stopping cleanly at capacity.
-static void
-atk_cat(char *line, size_t cap, const char *cell)
-{
-  size_t n = strlen(line);
-
-  if(n + 1 < cap)
-    snprintf(line + n, cap - n, "%s", cell);
-}
 
 // Render a number into at most `width - 1` columns, so a cell always
 // keeps one space between itself and its neighbour. Lifetime damage
@@ -278,7 +157,7 @@ atk_hp_bar(char *out, size_t cap, int32_t hp, int32_t hp_max)
   if(hp <= 0)
   {
     snprintf(out, cap, CLR_RED "☠" CLR_RESET);
-    atk_padr(out, cap, ATK_W_BAR);
+    display_align_left(out, cap, ATK_W_BAR);
     return;
   }
 
@@ -321,38 +200,38 @@ atk_card_header(const cmd_ctx_t *ctx)
   snprintf(line, sizeof(line), "%s  ", CLR_GRAY);
 
   snprintf(cell, sizeof(cell), "combatant");
-  atk_padr(cell, sizeof(cell), ATK_W_NAME);
-  atk_cat(line, sizeof(line), cell);
+  display_align_left(cell, sizeof(cell), ATK_W_NAME);
+  display_cat(line, sizeof(line), cell);
 
   snprintf(cell, sizeof(cell), "class");
-  atk_padr(cell, sizeof(cell), ATK_W_CLASS);
-  atk_cat(line, sizeof(line), cell);
+  display_align_left(cell, sizeof(cell), ATK_W_CLASS);
+  display_cat(line, sizeof(line), cell);
 
   snprintf(cell, sizeof(cell), "health");
-  atk_padr(cell, sizeof(cell), ATK_W_BAR + 1);
-  atk_cat(line, sizeof(line), cell);
+  display_align_left(cell, sizeof(cell), ATK_W_BAR + 1);
+  display_cat(line, sizeof(line), cell);
 
   snprintf(cell, sizeof(cell), "hp");
-  atk_pad(cell, sizeof(cell), ATK_W_HP);
-  atk_cat(line, sizeof(line), cell);
+  display_align_right(cell, sizeof(cell), ATK_W_HP);
+  display_cat(line, sizeof(line), cell);
 
   snprintf(cell, sizeof(cell), "dealt");
-  atk_pad(cell, sizeof(cell), ATK_W_NUM);
-  atk_cat(line, sizeof(line), cell);
+  display_align_right(cell, sizeof(cell), ATK_W_NUM);
+  display_cat(line, sizeof(line), cell);
 
   snprintf(cell, sizeof(cell), "taken");
-  atk_pad(cell, sizeof(cell), ATK_W_NUM);
-  atk_cat(line, sizeof(line), cell);
+  display_align_right(cell, sizeof(cell), ATK_W_NUM);
+  display_cat(line, sizeof(line), cell);
 
   snprintf(cell, sizeof(cell), "healed");
-  atk_pad(cell, sizeof(cell), ATK_W_HEALED);
-  atk_cat(line, sizeof(line), cell);
+  display_align_right(cell, sizeof(cell), ATK_W_HEALED);
+  display_cat(line, sizeof(line), cell);
 
   snprintf(cell, sizeof(cell), "crit");
-  atk_pad(cell, sizeof(cell), ATK_W_CRIT);
-  atk_cat(line, sizeof(line), cell);
+  display_align_right(cell, sizeof(cell), ATK_W_CRIT);
+  display_cat(line, sizeof(line), cell);
 
-  atk_cat(line, sizeof(line), CLR_RESET);
+  display_cat(line, sizeof(line), CLR_RESET);
   cmd_reply(ctx, line);
 }
 
@@ -373,7 +252,7 @@ atk_card_marks(char *out, size_t cap, const atk_card_row_t *row,
     if(strcmp(marks[i].victim, row->user) != 0)
       continue;
 
-    atk_cat(out, cap, " ");
+    display_cat(out, cap, " ");
 
     for(k = 0; k < marks[i].n; k++)
     {
@@ -382,7 +261,7 @@ atk_card_marks(char *out, size_t cap, const atk_card_row_t *row,
       snprintf(cell, sizeof(cell), "%s%s" CLR_RESET,
           atk_dot_color_of(marks[i].kinds[k]),
           atk_dot_emoji_of(marks[i].kinds[k]));
-      atk_cat(out, cap, cell);
+      display_cat(out, cap, cell);
     }
 
     return;
@@ -402,28 +281,28 @@ atk_card_row(const cmd_ctx_t *ctx, const atk_card_row_t *row,
   char       line[ATK_LINE_SZ];
 
   line[0] = '\0';
-  atk_cat(line, sizeof(line), "  ");
+  display_cat(line, sizeof(line), "  ");
 
   // One column of breathing room is reserved so a long name never runs
   // into the bar.
-  atk_fit(row->name, ATK_W_NAME - 1, name, sizeof(name));
+  display_fit(row->name, ATK_W_NAME - 1, name, sizeof(name), NULL);
   snprintf(cell, sizeof(cell), "%s%s" CLR_RESET,
       alive ? CLR_CYAN : CLR_GRAY, name);
-  atk_padr(cell, sizeof(cell), ATK_W_NAME);
-  atk_cat(line, sizeof(line), cell);
+  display_align_left(cell, sizeof(cell), ATK_W_NAME);
+  display_cat(line, sizeof(line), cell);
 
   // The sheet they were dealt — a label, and never a number. A row
   // written before classes existed simply has none to show.
-  atk_fit(row->class, ATK_W_CLASS - 1, type, sizeof(type));
+  display_fit(row->class, ATK_W_CLASS - 1, type, sizeof(type), NULL);
   snprintf(cell, sizeof(cell), "%s%s" CLR_RESET,
       alive ? CLR_PURPLE : CLR_GRAY,
       (type[0] != '\0') ? type : "—");
-  atk_padr(cell, sizeof(cell), ATK_W_CLASS);
-  atk_cat(line, sizeof(line), cell);
+  display_align_left(cell, sizeof(cell), ATK_W_CLASS);
+  display_cat(line, sizeof(line), cell);
 
   atk_hp_bar(cell, sizeof(cell), row->hp, row->hp_max);
-  atk_cat(line, sizeof(line), cell);
-  atk_cat(line, sizeof(line), " ");
+  display_cat(line, sizeof(line), cell);
+  display_cat(line, sizeof(line), " ");
 
   // Each half of "74/100" gets half the column, so even a pit tuned to
   // the six-figure ceiling still reads as "100K/100K".
@@ -431,20 +310,20 @@ atk_card_row(const cmd_ctx_t *ctx, const atk_card_row_t *row,
   atk_fmt_num(max, sizeof(max), row->hp_max, ATK_W_HP / 2);
   snprintf(cell, sizeof(cell), "%s%s" CLR_RESET "/%s",
       alive ? CLR_WHITE : CLR_GRAY, num, max);
-  atk_pad(cell, sizeof(cell), ATK_W_HP);
-  atk_cat(line, sizeof(line), cell);
+  display_align_right(cell, sizeof(cell), ATK_W_HP);
+  display_cat(line, sizeof(line), cell);
 
   atk_fmt_num(cell, sizeof(cell), row->dmg_given, ATK_W_NUM);
-  atk_pad(cell, sizeof(cell), ATK_W_NUM);
-  atk_cat(line, sizeof(line), cell);
+  display_align_right(cell, sizeof(cell), ATK_W_NUM);
+  display_cat(line, sizeof(line), cell);
 
   atk_fmt_num(cell, sizeof(cell), row->dmg_taken, ATK_W_NUM);
-  atk_pad(cell, sizeof(cell), ATK_W_NUM);
-  atk_cat(line, sizeof(line), cell);
+  display_align_right(cell, sizeof(cell), ATK_W_NUM);
+  display_cat(line, sizeof(line), cell);
 
   atk_healed_cell(cell, sizeof(cell), row->heal_given);
-  atk_pad(cell, sizeof(cell), ATK_W_HEALED);
-  atk_cat(line, sizeof(line), cell);
+  display_align_right(cell, sizeof(cell), ATK_W_HEALED);
+  display_cat(line, sizeof(line), cell);
 
   if(row->best_crit > 0)
   {
@@ -455,13 +334,13 @@ atk_card_row(const cmd_ctx_t *ctx, const atk_card_row_t *row,
   else
     snprintf(cell, sizeof(cell), CLR_GRAY "×" CLR_RESET);
 
-  atk_pad(cell, sizeof(cell), ATK_W_CRIT);
-  atk_cat(line, sizeof(line), cell);
+  display_align_right(cell, sizeof(cell), ATK_W_CRIT);
+  display_cat(line, sizeof(line), cell);
 
   // Outside the grid, after the last padded cell: the markers are a
   // ragged tail, not a column, so no width promise is broken.
   atk_card_marks(cell, sizeof(cell), row, marks, n_marks);
-  atk_cat(line, sizeof(line), cell);
+  display_cat(line, sizeof(line), cell);
 
   // The pending deferral bonus rides in the same ragged tail, and for the
   // same reason: it is true of a minority of rows and a column of blanks
@@ -470,7 +349,7 @@ atk_card_row(const cmd_ctx_t *ctx, const atk_card_row_t *row,
   {
     snprintf(cell, sizeof(cell),
         " " CLR_BOLD CLR_YELLOW "⚡+%d%%" CLR_RESET, row->bonus_pct);
-    atk_cat(line, sizeof(line), cell);
+    display_cat(line, sizeof(line), cell);
   }
 
   cmd_reply(ctx, line);
@@ -585,47 +464,47 @@ atk_board_header(const cmd_ctx_t *ctx)
   snprintf(line, sizeof(line), "%s  ", CLR_GRAY);
 
   snprintf(cell, sizeof(cell), "#");
-  atk_pad(cell, sizeof(cell), ATK_W_RANK);
-  atk_cat(line, sizeof(line), cell);
-  atk_cat(line, sizeof(line), " ");
+  display_align_right(cell, sizeof(cell), ATK_W_RANK);
+  display_cat(line, sizeof(line), cell);
+  display_cat(line, sizeof(line), " ");
 
   snprintf(cell, sizeof(cell), "combatant");
-  atk_padr(cell, sizeof(cell), ATK_W_NAME);
-  atk_cat(line, sizeof(line), cell);
+  display_align_left(cell, sizeof(cell), ATK_W_NAME);
+  display_cat(line, sizeof(line), cell);
 
   snprintf(cell, sizeof(cell), "rounds");
-  atk_pad(cell, sizeof(cell), ATK_W_ROUNDS);
-  atk_cat(line, sizeof(line), cell);
+  display_align_right(cell, sizeof(cell), ATK_W_ROUNDS);
+  display_cat(line, sizeof(line), cell);
 
   snprintf(cell, sizeof(cell), "kills");
-  atk_pad(cell, sizeof(cell), ATK_W_KILLS);
-  atk_cat(line, sizeof(line), cell);
+  display_align_right(cell, sizeof(cell), ATK_W_KILLS);
+  display_cat(line, sizeof(line), cell);
 
   snprintf(cell, sizeof(cell), "deaths");
-  atk_pad(cell, sizeof(cell), ATK_W_DEATHS);
-  atk_cat(line, sizeof(line), cell);
+  display_align_right(cell, sizeof(cell), ATK_W_DEATHS);
+  display_cat(line, sizeof(line), cell);
 
   snprintf(cell, sizeof(cell), "dealt");
-  atk_pad(cell, sizeof(cell), ATK_W_DEALT);
-  atk_cat(line, sizeof(line), cell);
+  display_align_right(cell, sizeof(cell), ATK_W_DEALT);
+  display_cat(line, sizeof(line), cell);
 
   snprintf(cell, sizeof(cell), "taken");
-  atk_pad(cell, sizeof(cell), ATK_W_TAKEN);
-  atk_cat(line, sizeof(line), cell);
+  display_align_right(cell, sizeof(cell), ATK_W_TAKEN);
+  display_cat(line, sizeof(line), cell);
 
   snprintf(cell, sizeof(cell), "healed");
-  atk_pad(cell, sizeof(cell), ATK_W_HEALED);
-  atk_cat(line, sizeof(line), cell);
+  display_align_right(cell, sizeof(cell), ATK_W_HEALED);
+  display_cat(line, sizeof(line), cell);
 
   snprintf(cell, sizeof(cell), "crits");
-  atk_pad(cell, sizeof(cell), ATK_W_CRITS);
-  atk_cat(line, sizeof(line), cell);
+  display_align_right(cell, sizeof(cell), ATK_W_CRITS);
+  display_cat(line, sizeof(line), cell);
 
   snprintf(cell, sizeof(cell), "best");
-  atk_pad(cell, sizeof(cell), ATK_W_BEST);
-  atk_cat(line, sizeof(line), cell);
+  display_align_right(cell, sizeof(cell), ATK_W_BEST);
+  display_cat(line, sizeof(line), cell);
 
-  atk_cat(line, sizeof(line), CLR_RESET);
+  display_cat(line, sizeof(line), CLR_RESET);
   cmd_reply(ctx, line);
 }
 
@@ -645,47 +524,47 @@ atk_board_row(const cmd_ctx_t *ctx, uint32_t rank,
   char        line[ATK_LINE_SZ];
 
   line[0] = '\0';
-  atk_cat(line, sizeof(line), "  ");
+  display_cat(line, sizeof(line), "  ");
 
   snprintf(cell, sizeof(cell), "%s%" PRIu32 CLR_RESET, tint, rank);
-  atk_pad(cell, sizeof(cell), ATK_W_RANK);
-  atk_cat(line, sizeof(line), cell);
-  atk_cat(line, sizeof(line), " ");
+  display_align_right(cell, sizeof(cell), ATK_W_RANK);
+  display_cat(line, sizeof(line), cell);
+  display_cat(line, sizeof(line), " ");
 
-  atk_fit(row->name, ATK_W_NAME - 1, name, sizeof(name));
+  display_fit(row->name, ATK_W_NAME - 1, name, sizeof(name), NULL);
   snprintf(cell, sizeof(cell), "%s%s" CLR_RESET, tint, name);
-  atk_padr(cell, sizeof(cell), ATK_W_NAME);
-  atk_cat(line, sizeof(line), cell);
+  display_align_left(cell, sizeof(cell), ATK_W_NAME);
+  display_cat(line, sizeof(line), cell);
 
   atk_fmt_num(cell, sizeof(cell), row->rounds, ATK_W_ROUNDS);
-  atk_pad(cell, sizeof(cell), ATK_W_ROUNDS);
-  atk_cat(line, sizeof(line), cell);
+  display_align_right(cell, sizeof(cell), ATK_W_ROUNDS);
+  display_cat(line, sizeof(line), cell);
 
   atk_fmt_num(num, sizeof(num), row->kills, ATK_W_KILLS);
   snprintf(cell, sizeof(cell), CLR_GREEN "%s" CLR_RESET, num);
-  atk_pad(cell, sizeof(cell), ATK_W_KILLS);
-  atk_cat(line, sizeof(line), cell);
+  display_align_right(cell, sizeof(cell), ATK_W_KILLS);
+  display_cat(line, sizeof(line), cell);
 
   atk_fmt_num(num, sizeof(num), row->deaths, ATK_W_DEATHS);
   snprintf(cell, sizeof(cell), CLR_RED "%s" CLR_RESET, num);
-  atk_pad(cell, sizeof(cell), ATK_W_DEATHS);
-  atk_cat(line, sizeof(line), cell);
+  display_align_right(cell, sizeof(cell), ATK_W_DEATHS);
+  display_cat(line, sizeof(line), cell);
 
   atk_fmt_num(cell, sizeof(cell), row->dmg_given, ATK_W_DEALT);
-  atk_pad(cell, sizeof(cell), ATK_W_DEALT);
-  atk_cat(line, sizeof(line), cell);
+  display_align_right(cell, sizeof(cell), ATK_W_DEALT);
+  display_cat(line, sizeof(line), cell);
 
   atk_fmt_num(cell, sizeof(cell), row->dmg_taken, ATK_W_TAKEN);
-  atk_pad(cell, sizeof(cell), ATK_W_TAKEN);
-  atk_cat(line, sizeof(line), cell);
+  display_align_right(cell, sizeof(cell), ATK_W_TAKEN);
+  display_cat(line, sizeof(line), cell);
 
   atk_healed_cell(cell, sizeof(cell), row->heal_given);
-  atk_pad(cell, sizeof(cell), ATK_W_HEALED);
-  atk_cat(line, sizeof(line), cell);
+  display_align_right(cell, sizeof(cell), ATK_W_HEALED);
+  display_cat(line, sizeof(line), cell);
 
   atk_fmt_num(cell, sizeof(cell), row->crits, ATK_W_CRITS);
-  atk_pad(cell, sizeof(cell), ATK_W_CRITS);
-  atk_cat(line, sizeof(line), cell);
+  display_align_right(cell, sizeof(cell), ATK_W_CRITS);
+  display_cat(line, sizeof(line), cell);
 
   if(row->best_crit > 0)
     atk_fmt_num(cell, sizeof(cell), row->best_crit, ATK_W_BEST);
@@ -693,8 +572,8 @@ atk_board_row(const cmd_ctx_t *ctx, uint32_t rank,
   else
     snprintf(cell, sizeof(cell), CLR_GRAY "×" CLR_RESET);
 
-  atk_pad(cell, sizeof(cell), ATK_W_BEST);
-  atk_cat(line, sizeof(line), cell);
+  display_align_right(cell, sizeof(cell), ATK_W_BEST);
+  display_cat(line, sizeof(line), cell);
 
   cmd_reply(ctx, line);
 }
@@ -805,10 +684,10 @@ atk_flav_bands(const cmd_ctx_t *ctx, const atk_tunables_t *t)
           cat != ATK_FLAV_MINOR ? " · " : "", atk_flav_label[cat],
           lo[cat], hi[cat]);
 
-    atk_cat(line, sizeof(line), cell);
+    display_cat(line, sizeof(line), cell);
   }
 
-  atk_cat(line, sizeof(line), CLR_RESET);
+  display_cat(line, sizeof(line), CLR_RESET);
   cmd_reply(ctx, line);
 }
 
@@ -831,23 +710,23 @@ atk_classes_header(const cmd_ctx_t *ctx)
   snprintf(line, sizeof(line), "%s  ", CLR_GRAY);
 
   snprintf(cell, sizeof(cell), "class");
-  atk_padr(cell, sizeof(cell), ATK_W_CLASS);
-  atk_cat(line, sizeof(line), cell);
+  display_align_left(cell, sizeof(cell), ATK_W_CLASS);
+  display_cat(line, sizeof(line), cell);
 
   snprintf(cell, sizeof(cell), "damage");
-  atk_pad(cell, sizeof(cell), ATK_W_MOVES);
-  atk_cat(line, sizeof(line), cell);
+  display_align_right(cell, sizeof(cell), ATK_W_MOVES);
+  display_cat(line, sizeof(line), cell);
 
   snprintf(cell, sizeof(cell), "decay");
-  atk_pad(cell, sizeof(cell), ATK_W_DECAY);
-  atk_cat(line, sizeof(line), cell);
+  display_align_right(cell, sizeof(cell), ATK_W_DECAY);
+  display_cat(line, sizeof(line), cell);
 
   snprintf(cell, sizeof(cell), "heal");
-  atk_pad(cell, sizeof(cell), ATK_W_HEAL);
-  atk_cat(line, sizeof(line), cell);
+  display_align_right(cell, sizeof(cell), ATK_W_HEAL);
+  display_cat(line, sizeof(line), cell);
 
-  atk_cat(line, sizeof(line), " description");
-  atk_cat(line, sizeof(line), CLR_RESET);
+  display_cat(line, sizeof(line), " description");
+  display_cat(line, sizeof(line), CLR_RESET);
   cmd_reply(ctx, line);
 }
 
@@ -863,35 +742,35 @@ atk_classes_row(const cmd_ctx_t *ctx, const atk_class_info_t *info)
   char line[ATK_LINE_SZ];
 
   line[0] = '\0';
-  atk_cat(line, sizeof(line), "  ");
+  display_cat(line, sizeof(line), "  ");
 
   // Fitted rather than printed straight: a stem is bounded by the
   // grammar, but the cell is what has to hold it, and one column of
   // breathing room keeps a long class name off the count beside it.
-  atk_fit(info->type, ATK_W_CLASS - 1, name, sizeof(name));
-  atk_fit(info->desc, ATK_CLASS_DESC_SZ - 1, desc, sizeof(desc));
+  display_fit(info->type, ATK_W_CLASS - 1, name, sizeof(name), NULL);
+  display_fit(info->desc, ATK_CLASS_DESC_SZ - 1, desc, sizeof(desc), NULL);
 
   snprintf(cell, sizeof(cell), CLR_CYAN "%s" CLR_RESET, name);
-  atk_padr(cell, sizeof(cell), ATK_W_CLASS);
-  atk_cat(line, sizeof(line), cell);
+  display_align_left(cell, sizeof(cell), ATK_W_CLASS);
+  display_cat(line, sizeof(line), cell);
 
   atk_fmt_num(cell, sizeof(cell), info->n[ATK_SEC_DAMAGE], ATK_W_MOVES);
-  atk_pad(cell, sizeof(cell), ATK_W_MOVES);
-  atk_cat(line, sizeof(line), cell);
+  display_align_right(cell, sizeof(cell), ATK_W_MOVES);
+  display_cat(line, sizeof(line), cell);
 
   atk_fmt_num(cell, sizeof(cell), info->n[ATK_SEC_DOT], ATK_W_DECAY);
-  atk_pad(cell, sizeof(cell), ATK_W_DECAY);
-  atk_cat(line, sizeof(line), cell);
+  display_align_right(cell, sizeof(cell), ATK_W_DECAY);
+  display_cat(line, sizeof(line), cell);
 
   atk_fmt_num(cell, sizeof(cell), info->n[ATK_SEC_HEAL], ATK_W_HEAL);
-  atk_pad(cell, sizeof(cell), ATK_W_HEAL);
-  atk_cat(line, sizeof(line), cell);
+  display_align_right(cell, sizeof(cell), ATK_W_HEAL);
+  display_cat(line, sizeof(line), cell);
 
   // The description is the last cell on the row, so it is the one thing
   // that never needs padding — and the fallback says what it is.
   snprintf(cell, sizeof(cell), " %s%s", desc,
       info->builtin ? CLR_GRAY " (built-in fallback)" CLR_RESET : "");
-  atk_cat(line, sizeof(line), cell);
+  display_cat(line, sizeof(line), cell);
 
   cmd_reply(ctx, line);
 }

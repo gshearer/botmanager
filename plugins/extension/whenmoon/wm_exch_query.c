@@ -5,6 +5,7 @@
 #include "wm_exch_query.h"
 #include "alloc.h"
 #include "colors.h"
+#include "display.h"
 
 #include <errno.h>
 #include <pthread.h>
@@ -187,59 +188,4 @@ wm_fmt_pct(double pct, int prec, char *buf, size_t cap)
     snprintf(buf, cap, CLR_RED "%+.*f%%" CLR_RESET, prec, pct);
 
   return(buf);
-}
-
-size_t
-wm_vis_len(const char *s)
-{
-  size_t n = 0;
-
-  while(*s != '\0')
-  {
-    // colors.h escapes are a two-byte pair: the \x01 marker + one code
-    // letter. Skip both so only visible glyphs count toward the width.
-    if(*s == '\x01' && s[1] != '\0')
-    {
-      s += 2;
-      continue;
-    }
-
-    // UTF-8 continuation bytes (10xxxxxx) belong to the glyph opened by
-    // their lead byte — count the glyph once (e.g. "—" is 3 bytes, 1
-    // column) so a multibyte cell still aligns.
-    if(((unsigned char)*s & 0xC0) != 0x80)
-      n++;
-
-    s++;
-  }
-
-  return(n);
-}
-
-void
-wm_col_pad(char *buf, size_t cap, int width, bool rjust)
-{
-  size_t vis = wm_vis_len(buf);
-  size_t raw = strlen(buf);
-  int    pad = width - (int)vis;
-
-  if(pad <= 0 || raw + (size_t)pad + 1 > cap)
-    return;
-
-  if(rjust)
-  {
-    // Shift the payload right and blank the leading gap.
-    memmove(buf + pad, buf, raw + 1);
-
-    for(int i = 0; i < pad; i++)
-      buf[i] = ' ';
-  }
-  else
-  {
-    // Append trailing spaces after the existing NUL-terminated payload.
-    for(int i = 0; i < pad; i++)
-      buf[raw + (size_t)i] = ' ';
-
-    buf[raw + (size_t)pad] = '\0';
-  }
 }

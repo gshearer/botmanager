@@ -15,6 +15,7 @@ libcore_sources = [
   'cmd.c',
   'curl.c',
   'db.c',
+  'display.c',
   'json.c',
   'kv.c',
   'alloc.c',

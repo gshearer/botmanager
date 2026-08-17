@@ -11,6 +11,7 @@
 #include "tmdb_cmd.h"
 
 #include "colors.h"
+#include "display.h"
 
 #include <stdio.h>
 #include <string.h>
@@ -24,50 +25,6 @@ static const char tmdb_usage[] =
 // ----------------------------------------------------------------------
 // Small formatters
 // ----------------------------------------------------------------------
-
-// Copy up to `cols` UTF-8 display columns of `src` into `dst`, never
-// splitting a code point, appending "…" when truncated.
-static void
-tmdb_fit(const char *src, int cols, char *dst, size_t sz)
-{
-  size_t n     = 0;
-  int    w     = 0;
-  bool   trunc = false;
-
-  while(*src != '\0' && w < cols)
-  {
-    unsigned char c   = (unsigned char)*src;
-    size_t        len = 1;
-
-    if((c & 0xe0) == 0xc0)      len = 2;
-    else if((c & 0xf0) == 0xe0) len = 3;
-    else if((c & 0xf8) == 0xf0) len = 4;
-
-    for(size_t k = 0; k < len; k++)
-      if(src[k] == '\0')
-      {
-        len = k;
-        break;
-      }
-
-    if(len == 0 || n + len + 4 > sz)   // +4 reserves room for a trailing "…"
-      break;
-
-    for(size_t k = 0; k < len; k++)
-      dst[n++] = src[k];
-
-    src += len;
-    w++;
-  }
-
-  if(*src != '\0')
-    trunc = true;
-
-  dst[n] = '\0';
-
-  if(trunc && n + 4 <= sz)
-    snprintf(dst + n, sz - n, "…");
-}
 
 // Compact integer count: 11200 -> "11.2k", 1500000 -> "1.5M".
 static void
@@ -357,7 +314,7 @@ tmdb_render_title(const cmd_ctx_t *ctx, const tmdb_title_t *t, bool verbose)
   {
     char tag[TMDB_TAGLINE_SZ];
 
-    tmdb_fit(t->tagline, 180, tag, sizeof(tag));
+    display_fit(t->tagline, 180, tag, sizeof(tag), "…");
     snprintf(line, sizeof(line), CLR_GRAY "“%s”" CLR_RESET, tag);
     cmd_reply(ctx, line);
   }
@@ -367,7 +324,7 @@ tmdb_render_title(const cmd_ctx_t *ctx, const tmdb_title_t *t, bool verbose)
   {
     char ov[TMDBCMD_REPLY_SZ];
 
-    tmdb_fit(t->overview, verbose ? 340 : 240, ov, sizeof(ov));
+    display_fit(t->overview, verbose ? 340 : 240, ov, sizeof(ov), "…");
     cmd_reply(ctx, ov);
   }
 
@@ -521,7 +478,7 @@ tmdb_render_person(const cmd_ctx_t *ctx, const tmdb_person_t *p, bool verbose)
   {
     char kf[TMDB_KNOWNFOR_SZ];
 
-    tmdb_fit(p->known_for, 300, kf, sizeof(kf));
+    display_fit(p->known_for, 300, kf, sizeof(kf), "…");
     snprintf(line, sizeof(line),
         CLR_GRAY "★ known for" CLR_RESET " %s", kf);
     cmd_reply(ctx, line);
@@ -532,7 +489,7 @@ tmdb_render_person(const cmd_ctx_t *ctx, const tmdb_person_t *p, bool verbose)
   {
     char bio[TMDBCMD_REPLY_SZ];
 
-    tmdb_fit(p->biography, 340, bio, sizeof(bio));
+    display_fit(p->biography, 340, bio, sizeof(bio), "…");
     cmd_reply(ctx, bio);
   }
 

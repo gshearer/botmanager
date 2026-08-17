@@ -2067,10 +2067,7 @@ chatbot_coalesce_fire(task_t *t)
     // reply is assembled with no facts and no recall at all. Carrying
     // it is what makes a coalesced reply as well-informed as an
     // uncoalesced one.
-    snprintf(synth.nickname,    sizeof(synth.nickname),    "%s", slot->nickname);
-    snprintf(synth.username,    sizeof(synth.username),    "%s", slot->username);
-    snprintf(synth.hostname,    sizeof(synth.hostname),    "%s", slot->hostname);
-    snprintf(synth.verified_id, sizeof(synth.verified_id), "%s", slot->verified_id);
+    chat_identity_apply(&slot->who, &synth);
     n = slot->text_len;
     if(n >= sizeof(synth.text)) n = sizeof(synth.text) - 1;
     memcpy(synth.text, slot->text, n);
@@ -2199,10 +2196,7 @@ chatbot_coalesce_enqueue(chatbot_state_t *st, const method_msg_t *msg,
   // it being current. Metadata alone is not enough — the resolver
   // rejects an empty tuple before it ever looks at metadata.
   snprintf(s->metadata,    sizeof(s->metadata),    "%s", msg->metadata);
-  snprintf(s->nickname,    sizeof(s->nickname),    "%s", msg->nickname);
-  snprintf(s->username,    sizeof(s->username),    "%s", msg->username);
-  snprintf(s->hostname,    sizeof(s->hostname),    "%s", msg->hostname);
-  snprintf(s->verified_id, sizeof(s->verified_id), "%s", msg->verified_id);
+  chat_identity_take(&s->who, msg);
 
   // Append " " separator for very short pastes, otherwise newline — the
   // model reads newline-joined blocks as pasted content and space-joined

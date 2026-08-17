@@ -23,6 +23,15 @@ test_colors = executable('test_colors',
   dependencies : core_deps,
 )
 
+# Six renderers grew their own copy of this column arithmetic and the
+# copies had started to disagree (OBS-8). One copy, one set of cases.
+test_display = executable('test_display',
+  'test_display.c',
+  include_directories : [include_directories('.'), inc_include],
+  link_with : [test_harness, libcore],
+  dependencies : core_deps,
+)
+
 test_json = executable('test_json',
   'test_json.c',
   include_directories : [include_directories('.'), inc_include],
@@ -239,6 +248,7 @@ test_shutdown_reason = executable('test_shutdown_reason',
 
 test('util', test_util)
 test('colors', test_colors)
+test('display', test_display)
 test('json', test_json)
 test('irc_parse', test_irc_parse)
 test('db_txn', test_db_txn)

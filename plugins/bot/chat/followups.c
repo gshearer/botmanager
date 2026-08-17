@@ -224,15 +224,6 @@ followups_when_phrase(long long days)
   return("in the last week");
 }
 
-static void
-followups_copy_col(char *dst, size_t cap, const db_result_t *res,
-    uint32_t row, uint32_t col)
-{
-  const char *s = db_result_get(res, row, col);
-
-  snprintf(dst, cap, "%s", s != NULL ? s : "");
-}
-
 // The cue payload: what is true, and how it is known. It names the
 // person by the name they are addressed by, states only what they
 // themselves said, and stops — the spine's `say` frame wraps it with
@@ -347,13 +338,13 @@ chatbot_followups_run(const char *bot_name, uint32_t ns_id, bot_inst_t *bot)
         || fact_key[strlen(FOLLOWUPS_KEY_PREFIX)] == '\0')
       continue;
 
-    followups_copy_col(value, sizeof(value), res, i, 1);
-    followups_copy_col(label, sizeof(label), res, i, 4);
+    db_result_copy(value, sizeof(value), res, i, 1);
+    db_result_copy(label, sizeof(label), res, i, 4);
 
     // Signature nickname first, dossier label as fallback; a row with
     // neither is unaddressable and skipped whole.
     if(label[0] == '\0')
-      followups_copy_col(label, sizeof(label), res, i, 3);
+      db_result_copy(label, sizeof(label), res, i, 3);
 
     if(label[0] == '\0')
       continue;
@@ -396,11 +387,11 @@ chatbot_followups_run(const char *bot_name, uint32_t ns_id, bot_inst_t *bot)
     msg.timestamp = now;
 
     snprintf(msg.sender, sizeof(msg.sender), "%s", label);
-    followups_copy_col(msg.channel,     sizeof(msg.channel),     res, i, 2);
-    followups_copy_col(msg.nickname,    sizeof(msg.nickname),    res, i, 4);
-    followups_copy_col(msg.username,    sizeof(msg.username),    res, i, 5);
-    followups_copy_col(msg.hostname,    sizeof(msg.hostname),    res, i, 6);
-    followups_copy_col(msg.verified_id, sizeof(msg.verified_id), res, i, 7);
+    db_result_copy(msg.channel,     sizeof(msg.channel),     res, i, 2);
+    db_result_copy(msg.nickname,    sizeof(msg.nickname),    res, i, 4);
+    db_result_copy(msg.username,    sizeof(msg.username),    res, i, 5);
+    db_result_copy(msg.hostname,    sizeof(msg.hostname),    res, i, 6);
+    db_result_copy(msg.verified_id, sizeof(msg.verified_id), res, i, 7);
 
     followups_event_label(event, sizeof(event), fact_key);
     followups_compose_ask(ask, sizeof(ask), label, event,

@@ -188,16 +188,10 @@ typedef struct
   char            sender[METHOD_SENDER_SZ];
   char            metadata[METHOD_META_SZ];
   char            channel[METHOD_CHANNEL_SZ];
-  // The identity tuple, carried so the flush can rebuild a message
-  // chatbot_resolve_dossier() will actually resolve. It bails to 0 when
-  // all four are empty, so a synth message missing them silently
-  // disabled every RAG path on the reply — facts, mention rows and
-  // semantic recall alike — while the per-line logger, which never sees
-  // the synth message, kept resolving the same speaker correctly.
-  char            nickname[METHOD_NICKNAME_SZ];
-  char            username[METHOD_USERNAME_SZ];
-  char            hostname[METHOD_HOSTNAME_SZ];
-  char            verified_id[METHOD_VERIFIED_ID_SZ];
+  // Carried so the flush can rebuild a message
+  // chatbot_resolve_dossier() will actually resolve — see
+  // identity.h §chat_identity_t for what a partial copy costs.
+  chat_identity_t who;
   char            text[CHATBOT_COALESCE_TEXT_SZ];
   size_t          text_len;
   bool            was_addressed;   // sticky: any line in the block classified as EXCHANGE_IN
@@ -831,15 +825,11 @@ typedef struct
   // synth, and downstream features (e.g. "note the weather-queried
   // city on the sender's dossier") silently fail.
   char            sender_metadata[METHOD_META_SZ];
-  // The four-field identity tuple, snapshotted for the same reason as
-  // sender_metadata: every message the bridge synthesizes downstream of
-  // this request (dispatch synth, nl_observe, interpret cue) must carry
-  // it or chat_user_dossier_id refuses to resolve and the sender loses
-  // facts and recall — the dcfc359 coalescer lesson, once per path.
-  char            nickname[METHOD_NICKNAME_SZ];
-  char            username[METHOD_USERNAME_SZ];
-  char            hostname[METHOD_HOSTNAME_SZ];
-  char            verified_id[METHOD_VERIFIED_ID_SZ];
+  // Snapshotted for the same reason as sender_metadata: every message
+  // the bridge synthesizes downstream of this request (dispatch synth,
+  // nl_observe, interpret cue) must carry it or chat_user_dossier_id
+  // refuses to resolve — identity.h §chat_identity_t.
+  chat_identity_t who;
   char            channel[METHOD_CHANNEL_SZ];
   char            reply_target[METHOD_CHANNEL_SZ];
   char            text[METHOD_TEXT_SZ];

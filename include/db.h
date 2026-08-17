@@ -134,6 +134,27 @@ void db_result_set_value(db_result_t *r, uint32_t row, uint32_t col,
 
 bool db_query(const char *sql, db_result_t *result);
 
+// Run one statement for its effect, logging a failure under `clam_ctx`
+// (which must be a context registered in CLAM.md — the caller's own, so
+// the line names the subsystem that wanted the write). SUCCESS/FAIL, so
+// a caller whose next step depends on the write can notice a miss.
+//
+// For a SELECT, use db_query() and read the result.
+bool db_exec(const char *sql, const char *clam_ctx);
+
+// Read one cell into a fixed buffer. An absent cell — out of bounds, or
+// SQL NULL — is the empty string, which is what a row assembled out of
+// COALESCE'd columns expects and what keeps every caller from writing
+// the same NULL check.
+void db_result_copy(char *dst, size_t cap, const db_result_t *r,
+    uint32_t row, uint32_t col);
+
+// Read one cell as an integer, or `dflt` when the cell is absent or
+// empty. A cell that holds something unparseable reads as 0 — the same
+// answer the strtoll() at ~59 call sites in this tree already gives it.
+int64_t db_result_get_i64(const db_result_t *r, uint32_t row, uint32_t col,
+    int64_t dflt);
+
 // Run `sql` on a task worker and hand the result to `cb`. `sql` is
 // copied; the caller may free it on return.
 //

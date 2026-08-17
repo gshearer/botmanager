@@ -101,15 +101,6 @@ occasions_falls_today(const char *mmdd, const struct tm *today)
       && !occasions_is_leap(today->tm_year + 1900));
 }
 
-static void
-occasions_copy_col(char *dst, size_t cap, const db_result_t *res,
-    uint32_t row, uint32_t col)
-{
-  const char *s = db_result_get(res, row, col);
-
-  snprintf(dst, cap, "%s", s != NULL ? s : "");
-}
-
 // The cue payload, and the reason this chore may exist at all: it says
 // what to say and how it is known, and it names the person by the name
 // they are addressed by — never a dossier id, never a fact key. The
@@ -214,13 +205,13 @@ chatbot_occasions_run(const char *bot_name, uint32_t ns_id, bot_inst_t *bot)
     char         ckey [96];
     char         wish [CMD_ARG_SZ];
 
-    occasions_copy_col(mmdd,  sizeof(mmdd),  res, i, 0);
-    occasions_copy_col(label, sizeof(label), res, i, 3);
+    db_result_copy(mmdd,  sizeof(mmdd),  res, i, 0);
+    db_result_copy(label, sizeof(label), res, i, 3);
 
     // Signature nickname first, dossier label as fallback; a row with
     // neither is unaddressable and skipped whole.
     if(label[0] == '\0')
-      occasions_copy_col(label, sizeof(label), res, i, 2);
+      db_result_copy(label, sizeof(label), res, i, 2);
 
     if(label[0] == '\0')
       continue;
@@ -258,11 +249,11 @@ chatbot_occasions_run(const char *bot_name, uint32_t ns_id, bot_inst_t *bot)
     msg.timestamp = now;
 
     snprintf(msg.sender, sizeof(msg.sender), "%s", label);
-    occasions_copy_col(msg.channel,     sizeof(msg.channel),     res, i, 1);
-    occasions_copy_col(msg.nickname,    sizeof(msg.nickname),    res, i, 3);
-    occasions_copy_col(msg.username,    sizeof(msg.username),    res, i, 4);
-    occasions_copy_col(msg.hostname,    sizeof(msg.hostname),    res, i, 5);
-    occasions_copy_col(msg.verified_id, sizeof(msg.verified_id), res, i, 6);
+    db_result_copy(msg.channel,     sizeof(msg.channel),     res, i, 1);
+    db_result_copy(msg.nickname,    sizeof(msg.nickname),    res, i, 3);
+    db_result_copy(msg.username,    sizeof(msg.username),    res, i, 4);
+    db_result_copy(msg.hostname,    sizeof(msg.hostname),    res, i, 5);
+    db_result_copy(msg.verified_id, sizeof(msg.verified_id), res, i, 6);
 
     occasions_compose_wish(wish, sizeof(wish), label);
 

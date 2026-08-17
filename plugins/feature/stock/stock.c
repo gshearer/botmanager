@@ -7,6 +7,7 @@
 #include "stock.h"
 
 #include "colors.h"
+#include "display.h"
 #include "userns.h"
 
 #include <ctype.h>
@@ -18,131 +19,6 @@
 // ----------------------------------------------------------------------
 // Column / string helpers (color-marker + UTF-8 aware)
 // ----------------------------------------------------------------------
-
-// Visible column count: abstract color markers ("\x01" + id) are 2 bytes
-// of zero width; a UTF-8 code point is one column (every glyph we emit —
-// block, arrow, en-dash — is a single-column BMP character), so we count
-// lead bytes only.
-static size_t
-stock_visible_len(const char *s)
-{
-  size_t n = 0;
-
-  while(*s != '\0')
-  {
-    unsigned char c = (unsigned char)*s;
-
-    if(c == '\x01' && s[1] != '\0')
-    {
-      s += 2;
-      continue;
-    }
-
-    if((c & 0xc0) != 0x80)
-      n++;
-
-    s++;
-  }
-
-  return(n);
-}
-
-// Right-align: shift content and prepend spaces until it fills `width`
-// visible columns. No-op if it already meets or exceeds the width.
-static void
-stock_pad(char *buf, size_t sz, int width)
-{
-  size_t vis = stock_visible_len(buf);
-  size_t raw = strlen(buf);
-  int    pad = width - (int)vis;
-
-  if(pad <= 0 || raw + (size_t)pad + 1 > sz)
-    return;
-
-  memmove(buf + pad, buf, raw + 1);
-
-  for(int i = 0; i < pad; i++)
-    buf[i] = ' ';
-}
-
-// Left-align: append spaces until content fills `width` visible columns.
-static void
-stock_padr(char *buf, size_t sz, int width)
-{
-  size_t vis = stock_visible_len(buf);
-  size_t raw = strlen(buf);
-  int    pad = width - (int)vis;
-
-  if(pad <= 0)
-    return;
-
-  if(raw + (size_t)pad + 1 > sz)
-    pad = (int)(sz - raw - 1);
-
-  for(int i = 0; i < pad; i++)
-    buf[raw + (size_t)i] = ' ';
-
-  buf[raw + (size_t)pad] = '\0';
-}
-
-// Copy at most `cols` display columns of `src` into `dst`, never splitting
-// a UTF-8 sequence, always NUL-terminating. `src` is raw provider text
-// (no color markers).
-static void
-stock_fit(const char *src, int cols, char *dst, size_t sz)
-{
-  size_t n = 0;
-  int    w = 0;
-
-  while(*src != '\0' && w < cols)
-  {
-    unsigned char c   = (unsigned char)*src;
-    size_t        len = 1;
-
-    if((c & 0xe0) == 0xc0)      len = 2;
-    else if((c & 0xf0) == 0xe0) len = 3;
-    else if((c & 0xf8) == 0xf0) len = 4;
-
-    // A NUL inside the sequence (provider-side byte truncation mid-glyph)
-    // bounds len to the bytes actually present, so src never advances past
-    // the terminator.
-    for(size_t k = 0; k < len; k++)
-      if(src[k] == '\0')
-      {
-        len = k;
-        break;
-      }
-
-    if(len == 0 || n + len + 1 > sz)
-      break;
-
-    for(size_t k = 0; k < len; k++)
-      dst[n++] = src[k];
-
-    src += len;
-    w++;
-  }
-
-  dst[n] = '\0';
-}
-
-// Bounded string append that tolerates a full buffer without underflow.
-static size_t
-stock_append(char *dst, size_t sz, size_t pos, const char *s)
-{
-  int w;
-
-  if(pos + 1 >= sz)
-    return(pos);
-
-  w = snprintf(dst + pos, sz - pos, "%s", s);
-
-  if(w < 0)
-    return(pos);
-
-  pos += (size_t)w;
-  return(pos > sz - 1 ? sz - 1 : pos);
-}
 
 // ----------------------------------------------------------------------
 // Value formatters
@@ -338,10 +214,10 @@ stock_row(const cmd_ctx_t *ctx, const quote_t *q)
   }
 
   snprintf(sym, sizeof(sym), CLR_YELLOW "%s" CLR_RESET, q->symbol);
-  stock_padr(sym, sizeof(sym), 8);
+  display_align_left(sym, sizeof(sym), 8);
 
-  stock_fit(q->name[0] != '\0' ? q->name : q->symbol, 18, name, sizeof(name));
-  stock_padr(name, sizeof(name), 18);
+  display_fit(q->name[0] != '\0' ? q->name : q->symbol, 18, name, sizeof(name), NULL);
+  display_align_left(name, sizeof(name), 18);
 
   if(isnan(q->price))
     snprintf(price, sizeof(price), CLR_GRAY "—" CLR_RESET);
@@ -352,24 +228,24 @@ stock_row(const cmd_ctx_t *ctx, const quote_t *q)
     stock_fmt_price(q->price, q->price_decimals, tmp, sizeof(tmp));
     snprintf(price, sizeof(price), CLR_BOLD CLR_WHITE "%s" CLR_RESET, tmp);
   }
-  stock_pad(price, sizeof(price), 10);
+  display_align_right(price, sizeof(price), 10);
 
   stock_fmt_pct(q->change_pct, chg, sizeof(chg));
-  stock_pad(chg, sizeof(chg), 11);
+  display_align_right(chg, sizeof(chg), 11);
 
   stock_fmt_range(q->day_low, q->day_high, q->price_decimals,
       dayr, sizeof(dayr));
-  stock_pad(dayr, sizeof(dayr), 19);
+  display_align_right(dayr, sizeof(dayr), 19);
 
   stock_fmt_range(q->year_low, q->year_high, q->price_decimals,
       yearr, sizeof(yearr));
-  stock_pad(yearr, sizeof(yearr), 21);
+  display_align_right(yearr, sizeof(yearr), 21);
 
   if(isnan(q->volume))
     snprintf(vol, sizeof(vol), CLR_GRAY "—" CLR_RESET);
   else
     stock_fmt_vol(q->volume, vol, sizeof(vol));
-  stock_pad(vol, sizeof(vol), 9);
+  display_align_right(vol, sizeof(vol), 9);
 
   snprintf(line, sizeof(line), " %s %s %s %s %s %s %s",
       sym, name, price, chg, dayr, yearr, vol);
@@ -409,13 +285,12 @@ stock_reply_table(const cmd_ctx_t *ctx, const quote_batch_t *batch)
 static void
 stock_gauge(const cmd_ctx_t *ctx, const quote_t *q)
 {
-  char        bar[256];
+  char        bar[256] = "";
   char        line[STOCK_REPLY_SZ];
   char        lo[24];
   char        hi[24];
   const char *barclr;
   double      frac;
-  size_t      pos = 0;
   int         filled;
 
   if(isnan(q->year_low) || isnan(q->year_high) || isnan(q->price)
@@ -431,16 +306,16 @@ stock_gauge(const cmd_ctx_t *ctx, const quote_t *q)
          : frac <= (1.0 / 3.0) ? CLR_RED
          : CLR_YELLOW;
 
-  pos = stock_append(bar, sizeof(bar), pos, barclr);
+  display_cat(bar, sizeof(bar), barclr);
 
   for(int i = 0; i < STOCK_GAUGE_CELLS; i++)
   {
     if(i + 1 == filled)
-      pos = stock_append(bar, sizeof(bar), pos, CLR_CYAN);
+      display_cat(bar, sizeof(bar), CLR_CYAN);
     else if(i == filled)
-      pos = stock_append(bar, sizeof(bar), pos, CLR_GRAY);
+      display_cat(bar, sizeof(bar), CLR_GRAY);
 
-    pos = stock_append(bar, sizeof(bar), pos, i < filled ? "█" : "░");
+    display_cat(bar, sizeof(bar), i < filled ? "█" : "░");
   }
 
   stock_fmt_price(q->year_low,  q->price_decimals, lo, sizeof(lo));
@@ -461,12 +336,11 @@ stock_sparkline(const cmd_ctx_t *ctx, const quote_t *q)
   static const char *const glyph[8] = {
     "▁", "▂", "▃", "▄", "▅", "▆", "▇", "█"
   };
-  char        spark[8 * 32 + 8];
+  char        spark[8 * 32 + 8] = "";
   char        line[STOCK_REPLY_SZ];
   const char *clr;
   float       lo;
   float       hi;
-  size_t      pos = 0;
   uint16_t    n;
 
   if(q->spark_n == 0)
@@ -496,7 +370,7 @@ stock_sparkline(const cmd_ctx_t *ctx, const quote_t *q)
     if(lvl < 0) lvl = 0;
     if(lvl > 7) lvl = 7;
 
-    pos = stock_append(spark, sizeof(spark), pos, glyph[lvl]);
+    display_cat(spark, sizeof(spark), glyph[lvl]);
   }
 
   clr = ((!isnan(q->change) && q->change < 0.0)
@@ -727,10 +601,10 @@ stock_reply_search(const cmd_ctx_t *ctx, const quote_search_res_t *res,
     char               meta[96];
 
     snprintf(sym, sizeof(sym), CLR_YELLOW "%s" CLR_RESET, h->symbol);
-    stock_padr(sym, sizeof(sym), 8);
+    display_align_left(sym, sizeof(sym), 8);
 
-    stock_fit(h->name[0] != '\0' ? h->name : "—", 28, name, sizeof(name));
-    stock_padr(name, sizeof(name), 28);
+    display_fit(h->name[0] != '\0' ? h->name : "—", 28, name, sizeof(name), NULL);
+    display_align_left(name, sizeof(name), 28);
 
     stock_klass_str(h->klass, klass, sizeof(klass));
 

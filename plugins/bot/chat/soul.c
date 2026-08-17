@@ -180,34 +180,6 @@ soul_chore_done(soul_sched_t *s, uint32_t chore)
 
 // Run one statement, logging failure. SUCCESS/FAIL so the un-claim
 // path can notice a miss.
-static bool
-soul_db_exec(const char *sql)
-{
-  db_result_t *res = db_result_alloc();
-  bool         ok;
-
-  if(res == NULL)
-    return(FAIL);
-
-  ok = (db_query(sql, res) == SUCCESS && res->ok) ? SUCCESS : FAIL;
-
-  if(ok != SUCCESS)
-    clam(CLAM_WARN, SOUL_CTX, "sql failed: %s",
-        res->error[0] != '\0' ? res->error : "(no driver error)");
-
-  db_result_free(res);
-  return(ok);
-}
-
-static void
-soul_copy_col(char *dst, size_t cap, const db_result_t *res,
-    uint32_t row, uint32_t col)
-{
-  const char *s = db_result_get(res, row, col);
-
-  snprintf(dst, cap, "%s", s != NULL ? s : "");
-}
-
 // ---------- the generic claim (CARE-5) ----------
 //
 // One ledger behind every "at most once" the soul needs: an alert
@@ -273,8 +245,8 @@ soul_claim_purge(void)
   // again: the alert is long gone, the birthday long over. The two
   // days are slack, not policy — a row that costs nothing to keep is
   // cheaper than a boundary argued over.
-  (void)soul_db_exec("DELETE FROM chat_soul_claims"
-      " WHERE expires IS NOT NULL AND expires < NOW() - INTERVAL '2 days'");
+  (void)db_exec("DELETE FROM chat_soul_claims"
+      " WHERE expires IS NOT NULL AND expires < NOW() - INTERVAL '2 days'", SOUL_CTX);
 }
 
 // ---------- chore: the deferred spine (CARE-1) ----------
@@ -496,10 +468,7 @@ typedef struct
   char  city[128];                     // fact_value, as the user typed it
   char  channel[METHOD_CHANNEL_SZ];    // where the fact was observed; "" = DM
   char  sender[METHOD_SENDER_SZ];
-  char  nickname[METHOD_NICKNAME_SZ];
-  char  username[METHOD_USERNAME_SZ];
-  char  hostname[METHOD_HOSTNAME_SZ];
-  char  verified_id[METHOD_VERIFIED_ID_SZ];
+  chat_identity_t who;
 } soul_wx_watcher_t;
 
 typedef struct
@@ -782,10 +751,7 @@ soul_wx_announce(chatbot_state_t *st, method_inst_t *method,
   msg.timestamp = now;
 
   snprintf(msg.sender,      sizeof(msg.sender),      "%s", lead->sender);
-  snprintf(msg.nickname,    sizeof(msg.nickname),    "%s", lead->nickname);
-  snprintf(msg.username,    sizeof(msg.username),    "%s", lead->username);
-  snprintf(msg.hostname,    sizeof(msg.hostname),    "%s", lead->hostname);
-  snprintf(msg.verified_id, sizeof(msg.verified_id), "%s", lead->verified_id);
+  chat_identity_apply(&lead->who, &msg);
 
   if(tgt->dm_watcher == NULL)
     snprintf(msg.channel, sizeof(msg.channel), "%s", tgt->channel);
@@ -1213,13 +1179,13 @@ soul_chore_weather(soul_sched_t *s, uint32_t chore,
     char               label[METHOD_NICKNAME_SZ];
     char               pkey[32];
 
-    soul_copy_col(city,  sizeof(city),  res, i, 0);
-    soul_copy_col(label, sizeof(label), res, i, 3);
+    db_result_copy(city,  sizeof(city),  res, i, 0);
+    db_result_copy(label, sizeof(label), res, i, 3);
 
     // Signature nickname first, dossier label as fallback; a row with
     // neither is unaddressable and skipped whole.
     if(label[0] == '\0')
-      soul_copy_col(label, sizeof(label), res, i, 2);
+      db_result_copy(label, sizeof(label), res, i, 2);
 
     if(city[0] == '\0' || label[0] == '\0')
       continue;
@@ -1270,11 +1236,11 @@ soul_chore_weather(soul_sched_t *s, uint32_t chore,
     did           = db_result_get(res, i, 7);
     w->dossier_id = did != NULL ? strtoll(did, NULL, 10) : 0;
 
-    soul_copy_col(w->channel,     sizeof(w->channel),     res, i, 1);
-    soul_copy_col(w->nickname,    sizeof(w->nickname),    res, i, 3);
-    soul_copy_col(w->username,    sizeof(w->username),    res, i, 4);
-    soul_copy_col(w->hostname,    sizeof(w->hostname),    res, i, 5);
-    soul_copy_col(w->verified_id, sizeof(w->verified_id), res, i, 6);
+    db_result_copy(w->channel,     sizeof(w->channel),     res, i, 1);
+    db_result_copy(w->who.nickname,    sizeof(w->who.nickname),    res, i, 3);
+    db_result_copy(w->who.username,    sizeof(w->who.username),    res, i, 4);
+    db_result_copy(w->who.hostname,    sizeof(w->who.hostname),    res, i, 5);
+    db_result_copy(w->who.verified_id, sizeof(w->who.verified_id), res, i, 6);
     snprintf(w->sender, sizeof(w->sender), "%s", label);
   }
 
@@ -1656,12 +1622,12 @@ soul_ensure_schema(void)
   // a string the chore composes: the primary key IS the claim, which
   // is why there is no separate "seen" bookkeeping anywhere. Two days
   // past expiry it is swept (soul_claim_purge, every tick).
-  (void)soul_db_exec(
+  (void)db_exec(
       "CREATE TABLE IF NOT EXISTS chat_soul_claims ("
       " claim_key  VARCHAR(256) NOT NULL,"
       " ns_id      INTEGER      NOT NULL REFERENCES userns(id) ON DELETE CASCADE,"
       " claimed_at TIMESTAMPTZ  NOT NULL DEFAULT NOW(),"
       " expires    TIMESTAMPTZ,"
       " PRIMARY KEY(claim_key, ns_id)"
-      ")");
+      ")", SOUL_CTX);
 }

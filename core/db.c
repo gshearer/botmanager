@@ -374,6 +374,40 @@ db_result_alloc(void)
   return(mem_alloc("db", "result", sizeof(db_result_t)));
 }
 
+bool
+db_exec(const char *sql, const char *clam_ctx)
+{
+  db_result_t *res = db_result_alloc();
+  bool         ok;
+
+  ok = (db_query(sql, res) == SUCCESS && res->ok) ? SUCCESS : FAIL;
+
+  if(ok != SUCCESS)
+    clam(CLAM_WARN, clam_ctx, "sql failed: %s",
+        res->error[0] != '\0' ? res->error : "(no driver error)");
+
+  db_result_free(res);
+  return(ok);
+}
+
+void
+db_result_copy(char *dst, size_t cap, const db_result_t *r, uint32_t row,
+    uint32_t col)
+{
+  const char *s = db_result_get(r, row, col);
+
+  strlcpy(dst, s != NULL ? s : "", cap);
+}
+
+int64_t
+db_result_get_i64(const db_result_t *r, uint32_t row, uint32_t col,
+    int64_t dflt)
+{
+  const char *s = db_result_get(r, row, col);
+
+  return(s != NULL && s[0] != '\0' ? (int64_t)strtoll(s, NULL, 10) : dflt);
+}
+
 // Free a result struct and all its dynamic data.
 // r: result to free (NULL is a no-op)
 void

@@ -97,10 +97,7 @@ typedef struct
   char     method_name[METHOD_NAME_SZ];
   char     channel    [METHOD_CHANNEL_SZ];
   char     sender     [METHOD_SENDER_SZ];
-  char     nickname   [METHOD_NICKNAME_SZ];
-  char     username   [METHOD_USERNAME_SZ];
-  char     hostname   [METHOD_HOSTNAME_SZ];
-  char     verified_id[METHOD_VERIFIED_ID_SZ];
+  chat_identity_t who;
   char     metadata   [METHOD_META_SZ];
 } pricewatch_row_t;
 
@@ -139,43 +136,6 @@ typedef async_rc_t (*pricewatch_tickers_fn_t)(const char *,
 static pricewatch_tickers_fn_t pricewatch_tickers_fn;
 
 // ---------- small shared plumbing ----------
-
-static bool
-pricewatch_exec(const char *sql)
-{
-  db_result_t *res = db_result_alloc();
-  bool         ok;
-
-  if(res == NULL)
-    return(FAIL);
-
-  ok = (db_query(sql, res) == SUCCESS && res->ok) ? SUCCESS : FAIL;
-
-  if(ok != SUCCESS)
-    clam(CLAM_WARN, PRICEWATCH_CTX, "sql failed: %s",
-        res->error[0] != '\0' ? res->error : "(no driver error)");
-
-  db_result_free(res);
-  return(ok);
-}
-
-static void
-pricewatch_copy_col(char *dst, size_t cap, const db_result_t *res,
-    uint32_t row, uint32_t col)
-{
-  const char *s = db_result_get(res, row, col);
-
-  snprintf(dst, cap, "%s", s != NULL ? s : "");
-}
-
-static int64_t
-pricewatch_col_i64(const db_result_t *res, uint32_t row, uint32_t col,
-    int64_t dflt)
-{
-  const char *s = db_result_get(res, row, col);
-
-  return(s != NULL && s[0] != '\0' ? (int64_t)strtoll(s, NULL, 10) : dflt);
-}
 
 static double
 pricewatch_col_f64(const db_result_t *res, uint32_t row, uint32_t col)
@@ -396,7 +356,7 @@ chatbot_pricewatch_ensure_schema(void)
   // The watchlist has no ns_id and wants none: a bot belongs to exactly
   // one namespace, and the list is a statement about what THIS bot is
   // willing to watch (§D6), not about who may ask.
-  (void)pricewatch_exec(
+  (void)db_exec(
       "CREATE TABLE IF NOT EXISTS chat_watchlist ("
       " bot_name   VARCHAR(64)  NOT NULL,"
       " pair       VARCHAR(32)  NOT NULL,"
@@ -405,9 +365,9 @@ chatbot_pricewatch_ensure_schema(void)
       " last_price NUMERIC,"
       " last_seen  TIMESTAMPTZ,"
       " PRIMARY KEY (bot_name, pair)"
-      ")");
+      ")", PRICEWATCH_CTX);
 
-  (void)pricewatch_exec(
+  (void)db_exec(
       "CREATE TABLE IF NOT EXISTS chat_pricewatch ("
       " id          BIGSERIAL    PRIMARY KEY,"
       " ns_id       INTEGER      NOT NULL REFERENCES userns(id) ON DELETE CASCADE,"
@@ -426,12 +386,12 @@ chatbot_pricewatch_ensure_schema(void)
       " threshold   NUMERIC      NOT NULL,"
       " created_at  TIMESTAMPTZ  NOT NULL DEFAULT NOW(),"
       " fired_at    TIMESTAMPTZ"
-      ")");
+      ")", PRICEWATCH_CTX);
 
   // The sweep's only hot query is "what is still armed for this bot".
-  (void)pricewatch_exec(
+  (void)db_exec(
       "CREATE INDEX IF NOT EXISTS idx_chat_pricewatch_armed"
-      " ON chat_pricewatch(ns_id, bot_name) WHERE fired_at IS NULL");
+      " ON chat_pricewatch(ns_id, bot_name) WHERE fired_at IS NULL", PRICEWATCH_CTX);
 }
 
 // ---------- the watchlist ----------
@@ -573,8 +533,8 @@ cmd_bot_watchlist(const cmd_ctx_t *ctx)
 
   else
   {
-    int64_t gone    = pricewatch_col_i64(res, 0, 0, 0);
-    int64_t dropped = pricewatch_col_i64(res, 0, 1, 0);
+    int64_t gone    = db_result_get_i64(res, 0, 0, 0);
+    int64_t dropped = db_result_get_i64(res, 0, 1, 0);
 
     if(gone == 0)
       snprintf(ack, sizeof(ack), "%s was not on %s's watchlist.",
@@ -658,17 +618,17 @@ cmd_show_bot_watchlist(const cmd_ctx_t *ctx)
   for(uint32_t i = 0; i < res->rows; i++)
   {
     const char *seen  = db_result_get(res, i, 3);
-    int64_t     armed = pricewatch_col_i64(res, i, 4, 0);
+    int64_t     armed = db_result_get_i64(res, i, 4, 0);
     char        pair[EXCHANGE_PRODUCT_ID_SZ];
     char        price[48];
     char        age[32];
     char        line[256];
 
-    pricewatch_copy_col(pair, sizeof(pair), res, i, 0);
+    db_result_copy(pair, sizeof(pair), res, i, 0);
 
     if(seen != NULL && (seen[0] == 't' || seen[0] == 'T'))
     {
-      util_fmt_duration((time_t)pricewatch_col_i64(res, i, 2, 0), age,
+      util_fmt_duration((time_t)db_result_get_i64(res, i, 2, 0), age,
           sizeof(age));
       pricewatch_fmt_price(pricewatch_col_f64(res, i, 1), price,
           sizeof(price));
@@ -901,14 +861,14 @@ pricewatch_render(const cmd_ctx_t *ctx, const db_result_t *res)
     char        num  [48];
     char        line [320];
 
-    pricewatch_copy_col(id,    sizeof(id),    res, i, 0);
-    pricewatch_copy_col(pair,  sizeof(pair),  res, i, 1);
-    pricewatch_copy_col(venue, sizeof(venue), res, i, 4);
+    db_result_copy(id,    sizeof(id),    res, i, 0);
+    db_result_copy(pair,  sizeof(pair),  res, i, 1);
+    db_result_copy(venue, sizeof(venue), res, i, 4);
     pricewatch_fmt_price(pricewatch_col_f64(res, i, 3), num, sizeof(num));
 
     snprintf(line, sizeof(line), "  " CLR_BOLD "%s" CLR_RESET "  %s %s %s"
         "  %s%s", id, pair,
-        pricewatch_dir_word(pricewatch_col_i64(res, i, 2, PRICEWATCH_BELOW)),
+        pricewatch_dir_word(db_result_get_i64(res, i, 2, PRICEWATCH_BELOW)),
         num, venue[0] != '\0' ? venue : "DM",
         (fired != NULL && (fired[0] == 't' || fired[0] == 'T'))
             ? "  " CLR_GRAY "(spent)" CLR_RESET : "");
@@ -1084,7 +1044,7 @@ chatbot_pricewatch_insert(uint32_t ns_id, int64_t dossier,
         e[E_HOST], e[E_VID], e[E_META], e[E_METH], e[E_CHAN], pair, dir,
         threshold);
 
-    ok = pricewatch_exec(sql);
+    ok = db_exec(sql, PRICEWATCH_CTX);
   }
 
   for(size_t i = 0; i < E_COUNT; i++)
@@ -1134,10 +1094,7 @@ pricewatch_report(const pricewatch_sweep_t *sweep, const pricewatch_row_t *row,
   msg.timestamp = now;
 
   snprintf(msg.sender,      sizeof(msg.sender),      "%s", row->sender);
-  snprintf(msg.nickname,    sizeof(msg.nickname),    "%s", row->nickname);
-  snprintf(msg.username,    sizeof(msg.username),    "%s", row->username);
-  snprintf(msg.hostname,    sizeof(msg.hostname),    "%s", row->hostname);
-  snprintf(msg.verified_id, sizeof(msg.verified_id), "%s", row->verified_id);
+  chat_identity_apply(&row->who, &msg);
   snprintf(msg.metadata,    sizeof(msg.metadata),    "%s", row->metadata);
   snprintf(msg.channel,     sizeof(msg.channel),     "%s", row->channel);
 
@@ -1222,7 +1179,7 @@ pricewatch_batch_task(task_t *t)
           " last_seen = NOW() FROM (VALUES %s) AS v(pair, price)"
           " WHERE w.bot_name = '%s' AND w.pair = v.pair", sql, e_bot);
       mem_free(e_bot);
-      (void)pricewatch_exec(stmt);
+      (void)db_exec(stmt, PRICEWATCH_CTX);
     }
   }
 
@@ -1350,7 +1307,7 @@ pricewatch_load_pairs(pricewatch_sweep_t *sweep)
       char                raw[64];
       char                canon[EXCHANGE_PRODUCT_ID_SZ];
 
-      pricewatch_copy_col(raw, sizeof(raw), res, i, 0);
+      db_result_copy(raw, sizeof(raw), res, i, 0);
 
       if(!pricewatch_canon_pair(raw, canon, sizeof(canon))
           || strcmp(raw, canon) != 0)
@@ -1403,22 +1360,22 @@ pricewatch_load_rows(pricewatch_sweep_t *sweep)
       pricewatch_row_t *row = &sweep->rows[sweep->n_rows];
 
       memset(row, 0, sizeof(*row));
-      row->id         = pricewatch_col_i64(res, i, 0, 0);
-      row->dossier_id = pricewatch_col_i64(res, i, 1, 0);
-      row->dir        = (uint8_t)pricewatch_col_i64(res, i, 3,
+      row->id         = db_result_get_i64(res, i, 0, 0);
+      row->dossier_id = db_result_get_i64(res, i, 1, 0);
+      row->dir        = (uint8_t)db_result_get_i64(res, i, 3,
                             PRICEWATCH_BELOW);
       row->threshold  = pricewatch_col_f64(res, i, 4);
       row->observed   = NAN;
 
-      pricewatch_copy_col(row->pair,        sizeof(row->pair),        res, i, 2);
-      pricewatch_copy_col(row->method_name, sizeof(row->method_name), res, i, 5);
-      pricewatch_copy_col(row->channel,     sizeof(row->channel),     res, i, 6);
-      pricewatch_copy_col(row->sender,      sizeof(row->sender),      res, i, 7);
-      pricewatch_copy_col(row->nickname,    sizeof(row->nickname),    res, i, 8);
-      pricewatch_copy_col(row->username,    sizeof(row->username),    res, i, 9);
-      pricewatch_copy_col(row->hostname,    sizeof(row->hostname),    res, i, 10);
-      pricewatch_copy_col(row->verified_id, sizeof(row->verified_id), res, i, 11);
-      pricewatch_copy_col(row->metadata,    sizeof(row->metadata),    res, i, 12);
+      db_result_copy(row->pair,        sizeof(row->pair),        res, i, 2);
+      db_result_copy(row->method_name, sizeof(row->method_name), res, i, 5);
+      db_result_copy(row->channel,     sizeof(row->channel),     res, i, 6);
+      db_result_copy(row->sender,      sizeof(row->sender),      res, i, 7);
+      db_result_copy(row->who.nickname,    sizeof(row->who.nickname),    res, i, 8);
+      db_result_copy(row->who.username,    sizeof(row->who.username),    res, i, 9);
+      db_result_copy(row->who.hostname,    sizeof(row->who.hostname),    res, i, 10);
+      db_result_copy(row->who.verified_id, sizeof(row->who.verified_id), res, i, 11);
+      db_result_copy(row->metadata,    sizeof(row->metadata),    res, i, 12);
 
       if(isfinite(row->threshold))
         sweep->n_rows++;

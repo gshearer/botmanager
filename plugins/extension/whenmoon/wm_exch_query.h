@@ -70,24 +70,13 @@ const char *wm_fmt_age(int64_t age_ms, char *buf, size_t cap);
 //
 // Shared by the operator telemetry tables (`/show whenmoon markets`,
 // `/show whenmoon market` session list). Percentages carry a green/red
-// tint by sign so a wall of markets reads at a glance; the padding
-// helpers are color-aware so a cell's inline `\x01…` control bytes don't
-// throw the column alignment off.
+// tint by sign so a wall of markets reads at a glance. Column padding is
+// `display.h`'s (OBS-8), which counts a cell's inline `\x01…` control
+// bytes as the zero width they are.
 
 // Format a signed percentage with a sign-driven tint: green when > 0,
 // red when < 0, plain when exactly 0 ("+1.4%", "-0.8%", "0.0%"). `prec`
 // fractional digits. Returns `buf`.
 const char *wm_fmt_pct(double pct, int prec, char *buf, size_t cap);
-
-// Visible width of `s`, skipping the two-byte `\x01<code>` color escapes
-// (colors.h) so alignment math counts glyphs, not control bytes.
-size_t wm_vis_len(const char *s);
-
-// Pad `buf` to a visible `width`, in place. `rjust` right-justifies
-// (leading spaces — for numeric columns); otherwise left-justifies
-// (trailing spaces — for labels). No-op when already at/over width or
-// when the padded result would not fit `cap`. Color escapes are ignored
-// for the width computation.
-void wm_col_pad(char *buf, size_t cap, int width, bool rjust);
 
 #endif

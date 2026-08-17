@@ -14,6 +14,7 @@
 
 #include "cmd.h"
 #include "colors.h"
+#include "display.h"
 #include "common.h"
 #include "userns.h"
 
@@ -876,7 +877,8 @@ wm_table_head(const cmd_ctx_t *ctx, const wm_tcol_t *cols, uint32_t n)
   for(i = 0; i < n; i++)
   {
     snprintf(cell, sizeof(cell), "%s", cols[i].label);
-    wm_col_pad(cell, sizeof(cell), cols[i].width, cols[i].rjust);
+    if(cols[i].rjust) display_align_right(cell, sizeof(cell), cols[i].width);
+    else              display_align_left (cell, sizeof(cell), cols[i].width);
     off += (size_t)snprintf(line + off, sizeof(line) - off, "%s", cell);
   }
 
@@ -897,7 +899,8 @@ wm_table_head(const cmd_ctx_t *ctx, const wm_tcol_t *cols, uint32_t n)
       cell[j] = '-';
     cell[d] = '\0';
 
-    wm_col_pad(cell, sizeof(cell), cols[i].width, cols[i].rjust);
+    if(cols[i].rjust) display_align_right(cell, sizeof(cell), cols[i].width);
+    else              display_align_left (cell, sizeof(cell), cols[i].width);
     off += (size_t)snprintf(line + off, sizeof(line) - off, "%s", cell);
   }
 
@@ -1065,7 +1068,7 @@ wm_obs_render_subscriptions(const cmd_ctx_t *ctx, whenmoon_state_t *st)
         "  " CLR_CYAN "%s" CLR_RESET, cell);
 
     snprintf(cell, sizeof(cell), "%u", rw->n_sessions);
-    wm_col_pad(cell, sizeof(cell), WM_MKT_COL_SESS, true);
+    display_align_right(cell, sizeof(cell), WM_MKT_COL_SESS);
     off += (size_t)snprintf(line + off, sizeof(line) - off, "%s", cell);
 
     if(rw->last_px > 0.0)
@@ -1074,7 +1077,7 @@ wm_obs_render_subscriptions(const cmd_ctx_t *ctx, whenmoon_state_t *st)
     else
       snprintf(price, sizeof(price), CLR_GRAY "—" CLR_RESET);
 
-    wm_col_pad(price, sizeof(price), WM_MKT_COL_PRICE, true);
+    display_align_right(price, sizeof(price), WM_MKT_COL_PRICE);
     off += (size_t)snprintf(line + off, sizeof(line) - off, "%s", price);
 
     for(g = 0; g < WM_GRAN_MAX; g++)
@@ -1085,7 +1088,7 @@ wm_obs_render_subscriptions(const cmd_ctx_t *ctx, whenmoon_state_t *st)
       else
         snprintf(cell, sizeof(cell), CLR_GRAY "—" CLR_RESET);
 
-      wm_col_pad(cell, sizeof(cell), WM_MKT_COL_GRAIN, true);
+      display_align_right(cell, sizeof(cell), WM_MKT_COL_GRAIN);
       off += (size_t)snprintf(line + off, sizeof(line) - off, "%s", cell);
     }
 
@@ -1116,7 +1119,7 @@ static void
 wm_ses_append(char *line, size_t line_sz, size_t *off,
     char *cell, size_t cell_sz, int width)
 {
-  wm_col_pad(cell, cell_sz, width, true);
+  display_align_right(cell, cell_sz, width);
   *off += (size_t)snprintf(line + *off, line_sz - *off, "%s", cell);
 }
 

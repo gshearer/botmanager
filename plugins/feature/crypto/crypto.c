@@ -7,6 +7,7 @@
 #include "crypto.h"
 
 #include "colors.h"
+#include "display.h"
 #include "userns.h"
 
 #include <ctype.h>
@@ -48,42 +49,6 @@ crypto_fmt_price(double price, char *buf, size_t sz)
   if(price >= 0.01)    return(snprintf(buf, sz, "$%.4f", price));
 
   return(snprintf(buf, sz, "$%.6f", price));
-}
-
-static size_t
-crypto_visible_len(const char *s)
-{
-  size_t n = 0;
-
-  while(*s != '\0')
-  {
-    if(*s == '\x01' && s[1] != '\0')
-    {
-      s += 2;
-      continue;
-    }
-
-    n++;
-    s++;
-  }
-
-  return(n);
-}
-
-static void
-crypto_pad(char *buf, size_t sz, int width)
-{
-  size_t vis = crypto_visible_len(buf);
-  size_t raw = strlen(buf);
-  int    pad = width - (int)vis;
-
-  if(pad <= 0 || raw + (size_t)pad + 1 > sz)
-    return;
-
-  memmove(buf + pad, buf, raw + 1);
-
-  for(int i = 0; i < pad; i++)
-    buf[i] = ' ';
 }
 
 // Two-decimal money for the --mcap card, where the whole market moves
@@ -987,10 +952,10 @@ num:        cmp = (av > bv) - (av < bv);
     crypto_fmt_pct   (c->pct_7d,      p7d,   sizeof(p7d));
     crypto_fmt_vol   (c->volume_24h,  vol,   sizeof(vol));
 
-    crypto_pad(p1h,  sizeof(p1h),  7);
-    crypto_pad(p24h, sizeof(p24h), 7);
-    crypto_pad(p7d,  sizeof(p7d),  7);
-    crypto_pad(vol,  sizeof(vol), 10);
+    display_align_right(p1h,  sizeof(p1h),  7);
+    display_align_right(p24h, sizeof(p24h), 7);
+    display_align_right(p7d,  sizeof(p7d),  7);
+    display_align_right(vol,  sizeof(vol), 10);
 
     snprintf(line, sizeof(line),
         " %4d  " CLR_YELLOW "%-6s" CLR_RESET

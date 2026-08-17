@@ -6,6 +6,8 @@
 #define CHATBOT_INTERNAL
 #include "vision.h"
 
+#include "identity.h"
+
 #include "clam.h"
 #include "curl.h"
 #include "kv.h"
@@ -37,6 +39,14 @@ typedef struct
   char             sender          [METHOD_SENDER_SZ];
   char             sender_metadata [METHOD_META_SZ];
   char             channel         [METHOD_CHANNEL_SZ];
+
+  // The reply this fetch ends in is assembled from the synthetic message
+  // below, and chat_user_dossier_id() refuses an all-empty tuple — so
+  // without this the description came back with no facts, no mention
+  // rows and no recall, and logged against nobody (OBS-8; the same drop
+  // dcfc359 and CHAT-NLOBSERVE-1 each paid for once).
+  chat_identity_t  who;
+
   char             text            [METHOD_TEXT_SZ];
   char             image_url       [1024];
   uint32_t         max_bytes;
@@ -196,6 +206,7 @@ chatbot_vision_maybe_submit(chatbot_state_t *st, const method_msg_t *msg)
   snprintf(ctx->sender,          sizeof(ctx->sender),          "%s", msg->sender);
   snprintf(ctx->sender_metadata, sizeof(ctx->sender_metadata), "%s", msg->metadata);
   snprintf(ctx->channel,         sizeof(ctx->channel),         "%s", msg->channel);
+  chat_identity_take(&ctx->who, msg);
   snprintf(ctx->text,            sizeof(ctx->text),            "%s", msg->text);
   snprintf(ctx->image_url,       sizeof(ctx->image_url),       "%s", image_url);
   ctx->is_action = msg->is_action;
@@ -441,6 +452,7 @@ vision_on_fetch_done(const curl_response_t *resp)
   snprintf(synth.sender,   sizeof(synth.sender),   "%s", ctx->sender);
   snprintf(synth.metadata, sizeof(synth.metadata), "%s", ctx->sender_metadata);
   snprintf(synth.channel,  sizeof(synth.channel),  "%s", ctx->channel);
+  chat_identity_apply(&ctx->who, &synth);
   snprintf(synth.text,     sizeof(synth.text),     "%s", ctx->text);
   synth.is_action = ctx->is_action;
   synth.timestamp = time(NULL);

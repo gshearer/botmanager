@@ -11,6 +11,7 @@
 #include "rawg_cmd.h"
 
 #include "colors.h"
+#include "display.h"
 
 #include <stdio.h>
 #include <string.h>
@@ -22,50 +23,6 @@ static const char rawg_usage[] =
 // ----------------------------------------------------------------------
 // Small formatters
 // ----------------------------------------------------------------------
-
-// Copy up to `cols` UTF-8 display columns of `src` into `dst`, never
-// splitting a code point, appending "…" when truncated.
-static void
-rawg_fit(const char *src, int cols, char *dst, size_t sz)
-{
-  size_t n     = 0;
-  int    w     = 0;
-  bool   trunc = false;
-
-  while(*src != '\0' && w < cols)
-  {
-    unsigned char c   = (unsigned char)*src;
-    size_t        len = 1;
-
-    if((c & 0xe0) == 0xc0)      len = 2;
-    else if((c & 0xf0) == 0xe0) len = 3;
-    else if((c & 0xf8) == 0xf0) len = 4;
-
-    for(size_t k = 0; k < len; k++)
-      if(src[k] == '\0')
-      {
-        len = k;
-        break;
-      }
-
-    if(len == 0 || n + len + 4 > sz)   // +4 reserves room for a trailing "…"
-      break;
-
-    for(size_t k = 0; k < len; k++)
-      dst[n++] = src[k];
-
-    src += len;
-    w++;
-  }
-
-  if(*src != '\0')
-    trunc = true;
-
-  dst[n] = '\0';
-
-  if(trunc && n + 4 <= sz)
-    snprintf(dst + n, sz - n, "…");
-}
 
 // Compact integer count: 11200 -> "11.2k", 1500000 -> "1.5M".
 static void
@@ -289,7 +246,7 @@ rawg_render_game(const cmd_ctx_t *ctx, const rawg_game_t *g, bool verbose)
   {
     char desc[RAWGCMD_REPLY_SZ];
 
-    rawg_fit(g->description, 340, desc, sizeof(desc));
+    display_fit(g->description, 340, desc, sizeof(desc), "…");
     cmd_reply(ctx, desc);
   }
 
@@ -324,7 +281,7 @@ rawg_render_game(const cmd_ctx_t *ctx, const rawg_game_t *g, bool verbose)
   {
     char tags[RAWG_TAGS_SZ];
 
-    rawg_fit(g->tags, 220, tags, sizeof(tags));
+    display_fit(g->tags, 220, tags, sizeof(tags), "…");
     snprintf(line, sizeof(line), CLR_GRAY "tags" CLR_RESET " %s", tags);
     cmd_reply(ctx, line);
   }
