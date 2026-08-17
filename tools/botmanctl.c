@@ -4,6 +4,7 @@
 #include "botmanctl.h"
 
 #include <errno.h>
+#include <poll.h>
 #include <signal.h>
 #include <stdbool.h>
 #include <stdio.h>
@@ -12,6 +13,7 @@
 #include <sys/socket.h>
 #include <sys/un.h>
 #include <termios.h>
+#include <time.h>
 #include <unistd.h>
 
 // Signal flag for clean subscribe mode shutdown.
@@ -519,8 +521,64 @@ ctl_connect(const char *path)
   return(fd);
 }
 
+// Keep printing whatever the server sends for up to linger_ms after the
+// response delimiter. An async command answers from a pool worker after
+// the dispatch that asked for it has already returned — the reply is
+// addressed to this session and arrives, but by then a one-shot has
+// closed the socket. The deadline is absolute and recomputed each pass,
+// so a steady trickle of output cannot extend it.
+static void
+ctl_linger(int fd, int linger_ms)
+{
+  struct timespec start;
+
+  clock_gettime(CLOCK_MONOTONIC, &start);
+
+  for(;;)
+  {
+    struct timespec now;
+    struct pollfd   pfd = { .fd = fd, .events = POLLIN };
+    char            buf[BUF_SZ];
+    ssize_t         n;
+    long            left;
+
+    clock_gettime(CLOCK_MONOTONIC, &now);
+    left = linger_ms - ((now.tv_sec - start.tv_sec) * 1000
+        + (now.tv_nsec - start.tv_nsec) / 1000000);
+
+    if(left <= 0)
+      return;
+
+    if(poll(&pfd, 1, (int)left) <= 0)
+      return;
+
+    n = read(fd, buf, sizeof(buf));
+
+    // Peer closed, or nothing more is coming.
+    if(n <= 0)
+      return;
+
+    // More delimiters may arrive — the server writes one per line it
+    // dispatches — so print the text between them and drop them.
+    for(ssize_t i = 0; i < n; )
+    {
+      ssize_t end = i;
+
+      while(end < n && buf[end] != '\0')
+        end++;
+
+      if(end > i)
+        fwrite(buf + i, 1, (size_t)(end - i), stdout);
+
+      i = (end < n) ? end + 1 : end;
+    }
+
+    fflush(stdout);
+  }
+}
+
 static int
-ctl_send_recv(int fd, const char *cmd)
+ctl_send_recv(int fd, const char *cmd, int linger_ms)
 {
   // Send command with newline.
   size_t len = strlen(cmd);
@@ -565,9 +623,20 @@ ctl_send_recv(int fd, const char *cmd)
     {
       if(buf[i] == '\0')
       {
-        // Print everything before the null byte.
+        // Print everything before the null byte — and everything after
+        // it in the same buffer, which used to be discarded: a reply
+        // that outlived its dispatch lands there.
         if(i > 0)
           fwrite(buf, 1, i, stdout);
+
+        if(i + 1 < n)
+          fwrite(buf + i + 1, 1, (size_t)(n - i - 1), stdout);
+
+        if(linger_ms > 0)
+        {
+          fflush(stdout);
+          ctl_linger(fd, linger_ms);
+        }
 
         return(0);
       }
@@ -636,6 +705,8 @@ print_usage(const char *prog)
   printf("              (sugar for -S 3 -r 'bot=<bot>\\b')\n");
   printf("  -u <user>   Dispatch commands asserting this username\n");
   printf("              (default: @owner; used to test userns perms)\n");
+  printf("  -w <ms>     After the response, keep printing late output for <ms>\n");
+  printf("              (async commands answer after the prompt returns; default 0)\n");
   printf("  -h          Show this help\n");
   printf("\n");
   printf("Modes:\n");
@@ -652,6 +723,7 @@ typedef struct {
   int         subscribe_sev;
   const char *subscribe_regex;
   const char *as_user;
+  int         linger_ms;          // -w: how long to keep reading late output
   char        attach_regex[128];
   int         first_cmd_arg;      // optind after parse
 } botmanctl_opts_t;
@@ -665,9 +737,10 @@ main_parse_args(int argc, char *argv[], botmanctl_opts_t *out)
   out->subscribe_sev    = -1;
   out->subscribe_regex  = NULL;
   out->as_user          = NULL;
+  out->linger_ms        = 0;
   out->attach_regex[0]  = '\0';
 
-  while((opt = getopt(argc, argv, "s:S:r:u:A:h")) != -1)
+  while((opt = getopt(argc, argv, "s:S:r:u:A:w:h")) != -1)
   {
     switch(opt)
     {
@@ -696,6 +769,25 @@ main_parse_args(int argc, char *argv[], botmanctl_opts_t *out)
       case 'r':
         out->subscribe_regex = optarg;
         break;
+
+      case 'w':
+      {
+        char *end;
+        long  ms;
+
+        errno = 0;
+        ms    = strtol(optarg, &end, 10);
+
+        if(errno != 0 || end == optarg || *end != '\0'
+            || ms < 0 || ms > 60000)
+        {
+          fprintf(stderr, "linger must be 0-60000 ms\n");
+          return(1);
+        }
+
+        out->linger_ms = (int)ms;
+        break;
+      }
 
       case 'u':
         out->as_user = optarg;
@@ -764,7 +856,8 @@ main_apply_as_user(int fd, const char *as_user)
 }
 
 static int
-main_one_shot(int fd, int optind_start, int argc, char *argv[])
+main_one_shot(int fd, int optind_start, int argc, char *argv[],
+    int linger_ms)
 {
   char cmd[CMD_SZ];
   size_t off = 0;
@@ -790,7 +883,7 @@ main_one_shot(int fd, int optind_start, int argc, char *argv[])
   }
 
   cmd[off] = '\0';
-  rc = ctl_send_recv(fd, cmd);
+  rc = ctl_send_recv(fd, cmd, linger_ms);
 
   return(rc < 0 ? 1 : 0);
 }
@@ -838,7 +931,7 @@ main_read_line(char *line, size_t line_sz, bool interactive, bool line_edit)
 }
 
 static int
-main_interactive_loop(int fd)
+main_interactive_loop(int fd, int linger_ms)
 {
   char line[CMD_SZ];
   // interactive: stdin is a TTY. line_edit: stdin AND stdout are TTYs
@@ -859,7 +952,7 @@ main_interactive_loop(int fd)
     if(line_edit)
       hist_push(line);
 
-    if(ctl_send_recv(fd, line) < 0)
+    if(ctl_send_recv(fd, line, linger_ms) < 0)
     {
       fprintf(stderr, "connection lost\n");
       return(1);
@@ -910,12 +1003,13 @@ main(int argc, char *argv[])
   // Remaining args after options → one-shot command.
   if(opts.first_cmd_arg < argc)
   {
-    rc = main_one_shot(fd, opts.first_cmd_arg, argc, argv);
+    rc = main_one_shot(fd, opts.first_cmd_arg, argc, argv,
+        opts.linger_ms);
     close(fd);
     return(rc);
   }
 
-  rc = main_interactive_loop(fd);
+  rc = main_interactive_loop(fd, opts.linger_ms);
   close(fd);
   return(rc);
 }

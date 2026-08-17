@@ -416,8 +416,9 @@ registered identity:
 build/tools/botmanctl -u doc "bot mini say hello there"
 ```
 
-⚠ **Async replies never come back through botmanctl** (`bctl_reply_target` is
-cleared when dispatch returns). Judge by the *action*: check
+⭑ **Async replies come back through botmanctl since OBS-29** — but a one-shot
+exits at the response delimiter unless told to stay, so ask with
+`botmanctl -w 8000 …`. Judging by the *action* is still the stronger check:
 `/tmp/reachy_mini_sounds/reachy_say.wav` on the robot is seconds old — at
 24 kHz stereo 16-bit, `bytes / 96000` ≈ seconds of speech.
 

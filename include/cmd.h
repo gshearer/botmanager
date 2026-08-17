@@ -301,8 +301,13 @@ bool cmd_permits(bot_inst_t *inst, const method_msg_t *msg,
 // `ns` may be NULL only for well-known system identities that the
 // command system will accept as pre-authenticated (today: the literal
 // owner principal with a synthetic full-membership profile).
+// `reply_route` is the caller's driver-private reply address, copied
+// into the synthetic message so replies produced after this call
+// returns still reach the session that asked; NULL or empty leaves the
+// message routed by sender as before.
 bool cmd_dispatch_as(const char *cmd_name, const char *args,
-    method_inst_t *inst, userns_t *ns, const char *username);
+    method_inst_t *inst, userns_t *ns, const char *username,
+    const char *reply_route);
 
 // Dispatch a pre-resolved command definition. Bypasses cmd_dispatch's
 // root-walk + subcommand resolution AND the permission / scope /

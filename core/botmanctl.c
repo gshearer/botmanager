@@ -192,6 +192,7 @@ bctl_client_add(bctl_server_t *srv, int fd)
   snprintf(c->as_user, sizeof(c->as_user), "%s", USERNS_OWNER_USER);
 
   pthread_mutex_lock(&srv->client_mutex);
+  c->id = bctl_next_client_id++;
   c->next = srv->clients;
   srv->clients = c;
   srv->client_count++;
@@ -477,29 +478,145 @@ bctl_drv_disconnect(void *handle)
   }
 }
 
+// A route token is 'c' + the decimal client id. Parsed rather than
+// trusted: any caller may hand method_send() any string.
+static bool
+bctl_route_id(const char *target, uint64_t *id)
+{
+  char     *end;
+  uint64_t  val;
+
+  if(target == NULL || target[0] != 'c' || target[1] == '\0')
+    return(false);
+
+  errno = 0;
+  val   = strtoull(target + 1, &end, 10);
+
+  if(errno != 0 || *end != '\0' || val == 0)
+    return(false);
+
+  *id = val;
+  return(true);
+}
+
+// One write per line: the newline used to be a second write() and two
+// threads' lines interleaved inside one line (root TODO.md §OBS-29 T5).
+static size_t
+bctl_line_build(char *out, size_t out_sz, const char *text)
+{
+  size_t n = strnlen(text, out_sz - 1);
+
+  if(n == 0)
+    return(0);
+
+  memcpy(out, text, n);
+  out[n++] = '\n';
+  return(n);
+}
+
+// The dispatch thread's writer. Blocking, and it must stay blocking: a
+// long `show kv` is hundreds of lines and dropping any of them is a
+// silent truncation of an operator's output.
+static bool
+bctl_client_write(bctl_client_t *c, const char *text)
+{
+  char   out[METHOD_TEXT_SZ + 1];
+  size_t n;
+  size_t off = 0;
+
+  if(c == NULL || c->fd < 0 || text == NULL)
+    return(FAIL);
+
+  n = bctl_line_build(out, sizeof(out), text);
+  if(n == 0)
+    return(SUCCESS);
+
+  while(off < n)
+  {
+    ssize_t wrote = write(c->fd, out + off, n - off);
+
+    if(wrote < 0)
+    {
+      if(errno == EINTR)
+        continue;
+
+      return(FAIL);
+    }
+
+    off += (size_t)wrote;
+  }
+
+  return(SUCCESS);
+}
+
+// The foreign thread's writer, called with client_mutex held — which
+// bctl_clam_cb takes while holding clam_mutex, so this must never block
+// and must never clam(): a stalled reader here stops every clam() in
+// the daemon. A late reply is best-effort by that constraint; EAGAIN
+// drops the line.
+static bool
+bctl_client_send_locked(bctl_client_t *c, const char *text)
+{
+  char    out[METHOD_TEXT_SZ + 1];
+  size_t  n;
+  ssize_t wrote;
+
+  n = bctl_line_build(out, sizeof(out), text);
+  if(n == 0)
+    return(SUCCESS);
+
+  wrote = send(c->fd, out, n, MSG_DONTWAIT | MSG_NOSIGNAL);
+  return(wrote == (ssize_t)n ? SUCCESS : FAIL);
+}
+
 static bool
 bctl_drv_send(void *handle, const char *target, const char *text)
 {
-  size_t len;
+  bctl_server_t *srv = handle;
+  uint64_t       id;
+  bool           rc = FAIL;
 
-  (void)handle;
-  (void)target;
-
-  if(bctl_reply_target == NULL || bctl_reply_target->fd < 0
-      || text == NULL)
+  if(srv == NULL || text == NULL)
     return(FAIL);
 
-  len = strlen(text);
-  if(len == 0)
-    return(SUCCESS);
+  if(bctl_route_id(target, &id))
+  {
+    // The dispatch running on THIS thread owns this client, and the
+    // sweep that could free it runs on this thread too — so no lock,
+    // and the blocking write every long reply depends on.
+    if(bctl_dispatch_client != NULL && bctl_dispatch_client->id == id)
+      return(bctl_client_write(bctl_dispatch_client, text));
 
-  if(write(bctl_reply_target->fd, text, len) < 0)
+    // Otherwise the answer outlived its dispatch: resolve the client by
+    // an id that is never reused, and write it under the list lock so
+    // the fd cannot be closed and recycled underneath us.
+    pthread_mutex_lock(&srv->client_mutex);
+
+    for(bctl_client_t *c = srv->clients; c != NULL; c = c->next)
+    {
+      if(c->id != id || c->closing || c->fd < 0)
+        continue;
+
+      rc = bctl_client_send_locked(c, text);
+      break;
+    }
+
+    pthread_mutex_unlock(&srv->client_mutex);
+
+    // A route that resolves to nothing is a client that has gone, and
+    // it must NOT fall through to whoever this thread is serving —
+    // that fall-through is the misroute rebuilt by hand.
+    return(rc);
+  }
+
+  // No route: a caller that reached method_send() with a sender or a
+  // channel — a plugin replying by hand, the driver's own session
+  // replies. It can only mean the dispatch on this thread, and on any
+  // other thread it means nobody.
+  if(bctl_dispatch_client == NULL)
     return(FAIL);
 
-  if(write(bctl_reply_target->fd, "\n", 1) < 0)
-    return(FAIL);
-
-  return(SUCCESS);
+  return(bctl_client_write(bctl_dispatch_client, text));
 }
 
 static bool
@@ -548,6 +665,7 @@ bctl_dispatch(bctl_server_t *srv, bctl_client_t *c, char *line)
   size_t len;
   char *args;
   const char *as_user;
+  char route[METHOD_ROUTE_SZ];
   userns_t *ns = NULL;
 
   // Strip leading whitespace.
@@ -596,7 +714,7 @@ bctl_dispatch(bctl_server_t *srv, bctl_client_t *c, char *line)
       snprintf(c->as_user, sizeof(c->as_user), "%s", as_args);
 
     snprintf(reply, sizeof(reply), "now dispatching as: %s", c->as_user);
-    bctl_drv_send(srv, NULL, reply);
+    bctl_client_write(c, reply);
     return;
   }
 
@@ -619,8 +737,11 @@ bctl_dispatch(bctl_server_t *srv, bctl_client_t *c, char *line)
       args++;
   }
 
-  // Set reply target so bctl_drv_send routes to this client.
-  bctl_reply_target = c;
+  // Name this client twice: once for the reply the command body writes
+  // on this thread, and once — as a route the message carries — for the
+  // reply an async body produces after this call has returned.
+  snprintf(route, sizeof(route), "c%" PRIu64, c->id);
+  bctl_dispatch_client = c;
 
   // Dispatch via the unified command system. Identity is asserted
   // from this client's session state — defaulting to @owner at connect
@@ -638,16 +759,16 @@ bctl_dispatch(bctl_server_t *srv, bctl_client_t *c, char *line)
     ns = userns_first();
   }
 
-  if(cmd_dispatch_as(line, args, srv->inst, ns, as_user) != SUCCESS)
+  if(cmd_dispatch_as(line, args, srv->inst, ns, as_user, route) != SUCCESS)
   {
     // Send error back to client.
     char errmsg[BCTL_INPUT_SZ];
 
     snprintf(errmsg, sizeof(errmsg), "unknown command: %s (try help)", line);
-    bctl_drv_send(srv, NULL, errmsg);
+    bctl_client_write(c, errmsg);
   }
 
-  bctl_reply_target = NULL;
+  bctl_dispatch_client = NULL;
 }
 
 // Persist task: poll listener and clients
@@ -785,20 +906,20 @@ bctl_task_cb(task_t *t)
 const char *
 botmanctl_get_user_ns(void)
 {
-  if(bctl_reply_target == NULL)
+  if(bctl_dispatch_client == NULL)
     return("");
 
-  return(bctl_reply_target->user_ns_cd);
+  return(bctl_dispatch_client->user_ns_cd);
 }
 
 void
 botmanctl_set_user_ns(const char *name)
 {
-  if(bctl_reply_target == NULL || name == NULL)
+  if(bctl_dispatch_client == NULL || name == NULL)
     return;
 
-  strlcpy(bctl_reply_target->user_ns_cd, name,
-      sizeof(bctl_reply_target->user_ns_cd));
+  strlcpy(bctl_dispatch_client->user_ns_cd, name,
+      sizeof(bctl_dispatch_client->user_ns_cd));
 }
 
 // Public API

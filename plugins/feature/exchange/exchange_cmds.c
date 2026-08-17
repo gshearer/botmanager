@@ -7,16 +7,16 @@
 //
 // Reply discipline: the command dispatch task waits on a pthread_cond_t
 // for the underlying `exchange_fetch_all_tickers_async` callback to
-// fire, then renders the snapshot via `cmd_reply`. This is required for
-// botmanctl, whose protocol driver routes `cmd_reply` / `method_send`
-// to the requesting client only while the dispatch task is on the call
-// stack (`bctl_reply_target` in core/botmanctl.c is set only between
-// cmd_dispatch_as begin/end). An async-from-curl-thread reply path
-// would arrive after the dispatch task returns and would be silently
-// dropped. The fetch typically completes in ~150-700 ms (single REST
-// hit + token-bucket dispatch); the wait is hard-capped at 30 s with a
-// timeout reply so a wedged exchange never leaves the worker thread
-// blocked forever.
+// fire, then renders the snapshot via `cmd_reply`. That wait is no
+// longer forced by the control socket — since OBS-29 a message carries
+// its own reply address (`method_msg_t.reply_route`) and a reply
+// produced on a curl thread after the dispatch returned reaches the
+// session that asked. It is kept because a synchronous verb is what
+// this diagnostic wants: one command, one rendered table, no interleave
+// with whatever the operator types next. The fetch typically completes
+// in ~150-700 ms (single REST hit + token-bucket dispatch); the wait is
+// hard-capped at 30 s with a timeout reply so a wedged exchange never
+// leaves the worker thread blocked forever.
 //
 // MW-2..MW-5 will add stateful marketwatch verbs under
 // `/whenmoon mw` / `/show whenmoon mw`; this file stays narrowly scoped

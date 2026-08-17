@@ -12,6 +12,7 @@
 #define METHOD_CHANNEL_SZ  128
 #define METHOD_TEXT_SZ     2048
 #define METHOD_META_SZ     512
+#define METHOD_ROUTE_SZ    32
 
 // Quad-tuple identity field bounds. Each method driver fills whatever it
 // has, leaves the rest empty. The chat plugin's identity scorer treats
@@ -126,6 +127,16 @@ typedef struct
   // the id survives every hop for free, and a stale id after the owner
   // unregistered falls through to normal delivery.
   uint64_t reply_sink_id;
+
+  // Driver-private reply address, opaque to core and empty for every
+  // method that does not use one. cmd_reply() prefers it over
+  // channel/sender, so an answer produced long after the dispatch
+  // returned still names the session that asked instead of whichever
+  // one the driver happens to be serving now. Bytes and not a pointer,
+  // for the same reason inst_name is a name: this struct is deep-copied
+  // by value with no ownership protocol, so a route can have no
+  // lifetime. botmanctl's client id is the only user today.
+  char reply_route[METHOD_ROUTE_SZ];
 
   // Generic method-level identity for the sender. The method plugin
   // populates whatever it has; consumers (chat, audit, etc.) treat the

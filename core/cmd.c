@@ -1803,9 +1803,18 @@ cmd_reply(const cmd_ctx_t *ctx, const char *text)
   if(inst == NULL)
     return(FAIL);
 
-  target = ctx->msg->channel[0] != '\0'
-      ? ctx->msg->channel
-      : ctx->msg->sender;
+  // A driver-private route outranks both, and only a driver that
+  // serves more than one session ever sets one: it is the difference
+  // between naming the session that asked and naming whoever the
+  // driver is serving at the instant the answer exists.
+  if(ctx->msg->reply_route[0] != '\0')
+    target = ctx->msg->reply_route;
+
+  else if(ctx->msg->channel[0] != '\0')
+    target = ctx->msg->channel;
+
+  else
+    target = ctx->msg->sender;
 
   rc = method_send(inst, target, text);
 
@@ -2516,7 +2525,8 @@ check_permission(userns_t *ns, const char *username,
 // (no bypasses). Executes synchronously.
 bool
 cmd_dispatch_as(const char *cmd_name, const char *args,
-    method_inst_t *inst, userns_t *ns, const char *username)
+    method_inst_t *inst, userns_t *ns, const char *username,
+    const char *reply_route)
 {
   cmd_def_t *d;
   method_type_t inst_type;
@@ -2580,6 +2590,9 @@ cmd_dispatch_as(const char *cmd_name, const char *args,
       username != NULL ? username : "(anon)");
   msg.timestamp = time(NULL);
 
+  if(reply_route != NULL)
+    strlcpy(msg.reply_route, reply_route, sizeof(msg.reply_route));
+
   // Permission check — same formula as cmd_dispatch.
   if(!check_permission(ns, username, req_group, req_level))
   {
@@ -2591,7 +2604,9 @@ cmd_dispatch_as(const char *cmd_name, const char *args,
 
     // Surface the denial on the originating method so interactive
     // tools (botmanctl, etc.) see the rejection.
-    method_send(inst, msg.sender, "Permission denied.");
+    method_send(inst,
+        msg.reply_route[0] != '\0' ? msg.reply_route : msg.sender,
+        "Permission denied.");
 
     __atomic_add_fetch(&cmd_stat_denials, 1, __ATOMIC_RELAXED);
     return(SUCCESS);

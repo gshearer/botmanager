@@ -192,6 +192,21 @@ test_method_stats = executable('test_method_stats',
   dependencies : core_deps,
 )
 
+# The control socket serves several sessions at once and an async verb
+# answers long after the dispatch that asked for it returned. Handing
+# that answer to whoever the driver is serving at that instant is silent
+# wrongness across a session boundary — one operator's output printed
+# into another's terminal, on a path that runs with the credential
+# context open. These cases drive the real driver over real AF_UNIX
+# clients with two test verbs: one that answers from a pool worker, one
+# that holds a dispatch window open while it does.
+test_botmanctl_route = executable('test_botmanctl_route',
+  'test_botmanctl_route.c',
+  include_directories : [include_directories('.'), inc_include],
+  link_with : [test_harness, libcore],
+  dependencies : core_deps,
+)
+
 test('util', test_util)
 test('colors', test_colors)
 test('json', test_json)
@@ -207,3 +222,4 @@ test('kraken_ws_channels', test_kraken_ws_channels)
 test('exchange_ws_gen', test_exchange_ws_gen)
 test('exchange_watch', test_exchange_watch)
 test('method_stats', test_method_stats)
+test('botmanctl_route', test_botmanctl_route)

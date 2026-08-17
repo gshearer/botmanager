@@ -31,6 +31,7 @@ void botmanctl_set_user_ns(const char *name);
 #include "task.h"
 
 #include <errno.h>
+#include <inttypes.h>
 #include <poll.h>
 #include <regex.h>
 #include <sys/socket.h>
@@ -49,6 +50,7 @@ typedef enum {
 typedef struct bctl_client
 {
   int                  fd;
+  uint64_t             id;               // reply address; monotonic, never reused
   bctl_mode_t          mode;
   char                 user_ns_cd[64];   // per-session working namespace
   char                 as_user[USERNS_USER_SZ]; // asserted identity for dispatch (default @owner)
@@ -75,12 +77,24 @@ typedef struct
 static bctl_server_t *bctl_state  = NULL;
 static bool           bctl_active = false;
 
-// Set before cmd_dispatch_owner, cleared after.
-static bctl_client_t *bctl_reply_target = NULL;
+// Allocated under client_mutex; a 64-bit counter never wraps back onto a
+// live client, so a late reply can never address a recycled slot.
+static uint64_t bctl_next_client_id = 1;
+
+// The client whose command this thread is running RIGHT NOW, and nothing
+// else: set around cmd_dispatch_as on the poll thread and cleared after.
+// A reply that crosses a thread boundary carries its own route in
+// method_msg_t.reply_route and must never read this. Thread-local for the
+// same reason kv_admin_active is (core/kv.c) — it is per-dispatch state,
+// and a dispatch belongs to one thread.
+static __thread bctl_client_t *bctl_dispatch_client = NULL;
 
 // Shared CLAM subscriber for all botmanctl subscribe clients.
 static bool bctl_clam_subscribed = false;
 
+static bool  bctl_route_id(const char *target, uint64_t *id);
+static bool  bctl_client_write(bctl_client_t *c, const char *text);
+static bool  bctl_client_send_locked(bctl_client_t *c, const char *text);
 static void  bctl_task_cb(task_t *t);
 static void  bctl_dispatch(bctl_server_t *srv, bctl_client_t *c, char *line);
 static void  bctl_handle_subscribe(bctl_server_t *srv, bctl_client_t *c,
