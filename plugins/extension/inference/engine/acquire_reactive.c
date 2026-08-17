@@ -512,9 +512,13 @@ acq_reactive_curl_done(const curl_response_t *cresp)
 // the first cut). `page_url` feeds into knowledge_insert_image as the
 // page context for each image; ignored when n_images == 0.
 //
-// Returns SUCCESS if the chunk landed, FAIL otherwise. The reactive
-// caller uses that signal to bump its per-ctx ingest count only when
-// the insert actually took effect (preserves the pre-seam invariant).
+// Returns SUCCESS iff a NEW chunk row landed, FAIL otherwise. Since
+// OBS-16 a digest this corpus already holds byte-for-byte is one of the
+// FAIL cases: it is neither an ingest nor an error, and the one caller
+// (acq_reactive_digest_done) does the same nothing for both. The
+// reactive caller uses that signal to bump its per-ctx ingest count
+// only when the insert actually took effect (preserves the pre-seam
+// invariant).
 bool
 acq_ingest_digest_result(const char *bot_name, const char *topic_name,
     const char *subject, const char *dest_corpus, bool is_proactive,
@@ -522,9 +526,10 @@ acq_ingest_digest_result(const char *bot_name, const char *topic_name,
     const acq_image_extract_t *images, size_t n_images,
     const char *page_url)
 {
-  const char *mode;
-  char        section[KNOWLEDGE_SECTION_SZ];
-  int64_t     id;
+  const char          *mode;
+  char                 section[KNOWLEDGE_SECTION_SZ];
+  knowledge_chunk_rc_t rc;
+  int64_t              id;
 
   mode = is_proactive ? "proactive" : "reactive";
 
@@ -534,12 +539,27 @@ acq_ingest_digest_result(const char *bot_name, const char *topic_name,
 
   id = 0;
 
-  if(knowledge_insert_chunk(dest_corpus, NULL, section,
-      resp->summary, &id) != SUCCESS)
+  rc = knowledge_insert_chunk(dest_corpus, NULL, section,
+      resp->summary, &id);
+
+  if(rc == KNOWLEDGE_CHUNK_FAILED)
   {
     clam(CLAM_WARN, ACQUIRE_CTX,
         "%s: knowledge_insert_chunk failed corpus='%s' bot=%s topic=%s",
         mode, dest_corpus, bot_name, topic_name);
+    return(FAIL);
+  }
+
+  // A digest this corpus already holds, byte for byte. Not an ingest
+  // and not a failure: the images are already on the row that is
+  // already there, and the volunteer consumer was told about it the
+  // first time. Nothing downstream should run twice.
+  if(rc != KNOWLEDGE_CHUNK_INSERTED)
+  {
+    clam(CLAM_INFO, ACQUIRE_CTX,
+        "%s duplicate bot=%s topic=%s subject='%s' chunk=%ld%s",
+        mode, bot_name, topic_name, subject, (long)id,
+        rc == KNOWLEDGE_CHUNK_UNEMBEDDED ? " (re-embedding)" : "");
     return(FAIL);
   }
 

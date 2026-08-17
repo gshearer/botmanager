@@ -118,6 +118,21 @@ test_fact_merge = executable('test_fact_merge',
   link_with : [test_harness],
 )
 
+# Ingest idempotency (OBS-16) is one SQL statement and one unique index,
+# so the only honest test of it runs them — same shape as fact_merge:
+# psql inside a rolled-back transaction over TEMP tables that shadow the
+# real ones, SKIP when the database is unreachable. The statement comes
+# from knowledge_priv.h so it cannot drift from the one production
+# sends, and that header is all this needs — no plugin symbols, hence
+# no libcore.
+test_knowledge_dedup = executable('test_knowledge_dedup',
+  'test_knowledge_dedup.c',
+  include_directories : [include_directories('.'), inc_include,
+                         include_directories(
+                             '../plugins/extension/inference/engine')],
+  link_with : [test_harness],
+)
+
 # The per-bot key accessors compose a key for ~110 call sites. Their one
 # silent failure is a key too long to compose reading as the shorter key
 # it truncates onto, so this suite drives kv.c's own table through the
@@ -298,6 +313,7 @@ test('cooldown', test_cooldown)
 test('hold', test_hold)
 test('warm_chain', test_warm_chain)
 test('fact_merge', test_fact_merge)
+test('knowledge_dedup', test_knowledge_dedup)
 test('kv_bot', test_kv_bot)
 test('kv_str', test_kv_str)
 test('kv_default', test_kv_default)

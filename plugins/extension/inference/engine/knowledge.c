@@ -323,6 +323,25 @@ knowledge_ensure_tables(void)
       "CREATE INDEX IF NOT EXISTS idx_knowledge_chunks_corpus"
       " ON knowledge_chunks(corpus)");
 
+  // Idempotency (OBS-16). md5(text) and not the sha256 the row asked
+  // for: sha256 needs a bytea, convert_to() is only STABLE so an index
+  // may not call it, and text::bytea reinterprets the value — two
+  // different chunks hash equal, and a chunk whose text opens "\x"
+  // followed by a non-hex byte makes the INSERT raise.
+  //
+  // section_heading is in the key on purpose. Two archwiki sections
+  // legitimately carry the same body; leaving it out drops one of them
+  // and catches nothing extra (the acquired corpus dedups identically
+  // either way).
+  //
+  // A database written before this index has duplicates and this DDL
+  // refuses until they are gone — the DELETE is in
+  // KNOWLEDGE.md §Idempotency, and knowledge_run_ddl's WARN quotes the
+  // duplicated key.
+  knowledge_run_ddl(
+      "CREATE UNIQUE INDEX IF NOT EXISTS knowledge_chunks_dedup"
+      " ON knowledge_chunks(corpus, source_url, section_heading, md5(text))");
+
   knowledge_run_ddl(
       "CREATE TABLE IF NOT EXISTS knowledge_chunk_embeddings ("
       " chunk_id  BIGINT      PRIMARY KEY"
@@ -947,7 +966,7 @@ knowledge_corpus_iterate(knowledge_corpus_iter_cb_t cb, void *user)
 // transient single-chunk batch so one-off callers keep working
 // without knowing about the batch machinery.
 
-bool
+knowledge_chunk_rc_t
 knowledge_insert_chunk_raw(const char *corpus, const char *source_url,
     const char *section_heading, const char *text, int64_t *out_id)
 {
@@ -957,12 +976,14 @@ knowledge_insert_chunk_raw(const char *corpus, const char *source_url,
   char *e_url;
   char *sql;
   bool ok;
+  bool inserted;
+  bool embedded;
   char *e_sec;
   int64_t new_id;
   char *e_txt;
   if(!knowledge_ready || corpus == NULL || corpus[0] == '\0'
       || text == NULL || text[0] == '\0')
-    return(FAIL);
+    return(KNOWLEDGE_CHUNK_FAILED);
 
   e_corp = db_escape(corpus);
   e_url = db_escape(source_url      != NULL ? source_url      : "");
@@ -975,29 +996,33 @@ knowledge_insert_chunk_raw(const char *corpus, const char *source_url,
     if(e_url)  mem_free(e_url);
     if(e_sec)  mem_free(e_sec);
     if(e_txt)  mem_free(e_txt);
-    return(FAIL);
+    return(KNOWLEDGE_CHUNK_FAILED);
   }
 
+  // +1024, not +512: the template itself is ~760 bytes before a single
+  // value is interpolated.
   sql_sz = strlen(e_corp) + strlen(e_url) + strlen(e_sec)
-      + strlen(e_txt) + 512;
+      + strlen(e_txt) + 1024;
   sql = mem_alloc("knowledge", "chunk_sql", sql_sz);
 
-  snprintf(sql, sql_sz,
-      "INSERT INTO knowledge_chunks"
-      " (corpus, source_url, section_heading, text)"
-      " VALUES ('%s', '%s', '%s', '%s')"
-      " RETURNING id",
+  snprintf(sql, sql_sz, KNOWLEDGE_INSERT_CHUNK_SQL,
       e_corp, e_url, e_sec, e_txt);
 
   res = db_result_alloc();
   ok = (db_query(sql, res) == SUCCESS) && res->ok && res->rows == 1;
   new_id = 0;
+  inserted = false;
+  embedded = false;
 
   if(ok)
   {
-    const char *id_s = db_result_get(res, 0, 0);
-    if(id_s != NULL)
-      new_id = (int64_t)strtoll(id_s, NULL, 10);
+    const char *id_s  = db_result_get(res, 0, 0);
+    const char *ins_s = db_result_get(res, 0, 1);
+    const char *emb_s = db_result_get(res, 0, 2);
+
+    if(id_s != NULL)  new_id   = (int64_t)strtoll(id_s, NULL, 10);
+    if(ins_s != NULL) inserted = (strtoll(ins_s, NULL, 10) != 0);
+    if(emb_s != NULL) embedded = (strtoll(emb_s, NULL, 10) != 0);
   }
 
   else if(res->error[0] != '\0')
@@ -1011,12 +1036,17 @@ knowledge_insert_chunk_raw(const char *corpus, const char *source_url,
   mem_free(e_txt);
 
   if(!ok || new_id == 0)
-    return(FAIL);
+    return(KNOWLEDGE_CHUNK_FAILED);
 
-  // Bump corpus last_ingested. Best-effort; don't fail the insert on a
-  // secondary update error.
+  // last_ingested means "when this corpus last gained content", so a
+  // resume that inserts nothing does not move it — and a 34,899-chunk
+  // re-ingest stops spending an UPDATE per chunk to say nothing.
+  if(inserted)
   {
+    // Bump corpus last_ingested. Best-effort; don't fail the insert on
+    // a secondary update error.
     char *e_c2 = db_escape(corpus);
+
     if(e_c2 != NULL)
     {
       char u_sql[256];
@@ -1029,44 +1059,54 @@ knowledge_insert_chunk_raw(const char *corpus, const char *source_url,
       db_result_free(ur);
       mem_free(e_c2);
     }
-  }
 
-  pthread_mutex_lock(&knowledge_stat_mutex);
-  knowledge_stat_inserts++;
-  pthread_mutex_unlock(&knowledge_stat_mutex);
+    pthread_mutex_lock(&knowledge_stat_mutex);
+    knowledge_stat_inserts++;
+    pthread_mutex_unlock(&knowledge_stat_mutex);
+  }
 
   if(out_id != NULL)
     *out_id = new_id;
 
-  return(SUCCESS);
+  return(inserted    ? KNOWLEDGE_CHUNK_INSERTED
+      : embedded     ? KNOWLEDGE_CHUNK_PRESENT
+      :                KNOWLEDGE_CHUNK_UNEMBEDDED);
 }
 
-bool
+knowledge_chunk_rc_t
 knowledge_insert_chunk(const char *corpus, const char *source_url,
     const char *section_heading, const char *text, int64_t *out_id)
 {
+  knowledge_chunk_rc_t rc;
   int64_t new_id = 0;
   char model[KNOWLEDGE_EMBED_MODEL_SZ];
-  if(knowledge_insert_chunk_raw(corpus, source_url, section_heading,
-        text, &new_id) != SUCCESS)
-    return(FAIL);
+  rc = knowledge_insert_chunk_raw(corpus, source_url, section_heading,
+      text, &new_id);
 
-  // Route the single chunk through a size-1 batch so the embed path
-  // is identical to bulk ingest. Single-chunk batches are trivially
-  // correct and let us keep exactly one embed-submit code path.
-  knowledge_effective_embed_model(model, sizeof(model));
+  if(rc == KNOWLEDGE_CHUNK_FAILED)
+    return(rc);
 
-  if(model[0] != '\0')
+  // A row that is already there and already embedded is the whole point
+  // of the index: re-embedding it spends exactly the request the index
+  // exists to save. Everything else still owes a vector, and routing it
+  // through a size-1 batch keeps one embed-submit code path.
+  if(rc != KNOWLEDGE_CHUNK_PRESENT)
   {
-    knowledge_batch_t b;
-    knowledge_batch_init(&b, corpus, model, 1);
-    knowledge_batch_add(&b, new_id, text);
-    knowledge_batch_free(&b);
+    knowledge_effective_embed_model(model, sizeof(model));
+
+    if(model[0] != '\0')
+    {
+      knowledge_batch_t b;
+      knowledge_batch_init(&b, corpus, model, 1);
+      knowledge_batch_add(&b, new_id, text);
+      knowledge_batch_free(&b);
+    }
   }
 
   if(out_id != NULL)
     *out_id = new_id;
-  return(SUCCESS);
+
+  return(rc);
 }
 
 // Image insert path

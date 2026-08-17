@@ -47,8 +47,67 @@ uint32_t knowledge_corpus_iterate(knowledge_corpus_iter_cb_t cb,
     void *user);
 
 // Chunk / image ingest.
-bool knowledge_insert_chunk(const char *corpus, const char *source_url,
-    const char *section_heading, const char *text, int64_t *out_id);
+
+// One chunk insert's outcome. Four, because the caller owes each a
+// different thing: embed it / embed it and say the corpus was resumed /
+// skip it / report a failure.
+//
+// INSERTED is 0 == SUCCESS (common.h), so a two-state `!= SUCCESS` test
+// comes out incomplete rather than wrong: it separates "a new row
+// landed" from everything else and loses only which of the other three
+// obligations applies. PRESENT and UNEMBEDDED are NOT failures — the
+// row is in the table either way; only UNEMBEDDED still owes a vector.
+typedef enum
+{
+  KNOWLEDGE_CHUNK_INSERTED = 0,   // new row; embed it
+  KNOWLEDGE_CHUNK_UNEMBEDDED,     // row was already there, vector-less; embed it
+  KNOWLEDGE_CHUNK_PRESENT,        // row was already there and complete; skip it
+  KNOWLEDGE_CHUNK_FAILED          // nothing landed; *out_id untouched
+} knowledge_chunk_rc_t;
+
+// The chunk insert, as one printf template, so the statement
+// tests/test_knowledge_dedup.c replays is the statement production
+// sends. Arguments in order: corpus, source_url, section_heading, text
+// — every one already db_escape'd by the caller, and every one
+// interpolated EXACTLY ONCE. That is what the `cand` CTE buys: the
+// obvious form spells the text a second time in the md5 comparison,
+// which doubles the sizing and lets the two copies drift.
+//
+// The row it returns is (id, inserted, embedded):
+//   inserted=1              a new row landed          → embed it
+//   inserted=0, embedded=0  the row was already there → embed it (resume)
+//   inserted=0, embedded=1  already there and complete → skip
+//
+// The conflict target must be spelled exactly as the index in
+// knowledge_ensure_tables() is, or Postgres refuses to infer it.
+#define KNOWLEDGE_INSERT_CHUNK_SQL \
+    "WITH cand AS (SELECT '%s'::text AS corpus, '%s'::text AS source_url," \
+    "                     '%s'::text AS section_heading, '%s'::text AS text)," \
+    "     ins AS (" \
+    "       INSERT INTO knowledge_chunks" \
+    "         (corpus, source_url, section_heading, text)" \
+    "       SELECT corpus, source_url, section_heading, text FROM cand" \
+    "       ON CONFLICT (corpus, source_url, section_heading, md5(text))" \
+    "         DO NOTHING" \
+    "       RETURNING id)" \
+    " SELECT id, 1 AS inserted, 0 AS embedded FROM ins" \
+    " UNION ALL" \
+    " SELECT k.id, 0, (SELECT COUNT(*) FROM knowledge_chunk_embeddings e" \
+    "                   WHERE e.chunk_id = k.id)::int" \
+    "   FROM knowledge_chunks k, cand c" \
+    "  WHERE k.corpus = c.corpus AND k.source_url = c.source_url" \
+    "    AND k.section_heading = c.section_heading" \
+    "    AND md5(k.text) = md5(c.text)" \
+    "    AND NOT EXISTS (SELECT 1 FROM ins)" \
+    "  LIMIT 1"
+
+knowledge_chunk_rc_t knowledge_insert_chunk_raw(const char *corpus,
+    const char *source_url, const char *section_heading, const char *text,
+    int64_t *out_id);
+
+knowledge_chunk_rc_t knowledge_insert_chunk(const char *corpus,
+    const char *source_url, const char *section_heading, const char *text,
+    int64_t *out_id);
 
 bool knowledge_insert_image(int64_t chunk_id, const char *url,
     const char *page_url, const char *caption, const char *subject,
@@ -120,8 +179,11 @@ typedef struct
   // going away. Both mean every later flush would pay the same wait,
   // so the batch stops accepting chunks and the walk above it stops
   // emitting them: a chunk row inserted after this point could only
-  // ever be a row with no embedding, invisible to retrieval and
-  // duplicated by the re-run that would fix it.
+  // ever be a row with no embedding, invisible to retrieval — and
+  // since OBS-16 it would also BLOCK the re-run that repairs it, by
+  // being the row the dedup key matches. The re-run does repair it
+  // (it re-embeds a vector-less row), which is exactly why the walk
+  // must still stop rather than fill the corpus with more of them.
   bool      aborted;
 } knowledge_batch_t;
 
@@ -142,6 +204,8 @@ typedef struct
   size_t   files;
   size_t   chunks;
   size_t   skipped;
+  size_t   duplicates;   // rows already present AND already embedded
+  size_t   reembedded;   // rows already present with no vector — resumed
   uint64_t embed_ok;
   uint64_t embed_fail;
   bool     aborted;

@@ -29,12 +29,6 @@
 // budget on large repeats. Zero overlap across section boundaries.
 #define KNOWLEDGE_CHUNK_OVERLAP  200
 
-// Forward decl: knowledge.c owns the raw-insert; knowledge_file.c calls
-// it for each emitted chunk. Exposed inside the module via the internal
-// header block below.
-bool knowledge_insert_chunk_raw(const char *corpus, const char *source_url,
-    const char *section_heading, const char *text, int64_t *out_id);
-
 static char *
 kw_slurp(const char *path, size_t *out_len)
 {
@@ -198,6 +192,8 @@ typedef struct
   uint32_t            chunk_max;
   size_t              emitted;   // inserted chunk count (DB rows)
   size_t              skipped;   // chunks skipped as too short
+  size_t              duplicates; // already stored AND already embedded
+  size_t              reembedded; // already stored, vector-less — resumed
   knowledge_batch_t  *batch;     // embed accumulator, shared across files
 } kw_ingest_t;
 
@@ -211,13 +207,16 @@ kw_emit_chunk(kw_ingest_t *ing, const char *start, const char *end)
   size_t len;
   char text[KNOWLEDGE_CHUNK_TEXT_SZ];
   size_t clean_len;
+  knowledge_chunk_rc_t rc;
   int64_t id;
   if(start == NULL || end <= start) return;
 
   // The batch gave up on the engine. The INSERT below would still
   // succeed — which is the trap: it would leave a chunk row no
-  // retrieval can ever reach, and no re-ingest can replace without
-  // duplicating. Stop emitting instead.
+  // retrieval can ever reach. Since OBS-16 a re-ingest *does* repair
+  // such a row rather than duplicating it, and that is exactly why the
+  // walk must still stop here: emitting more vector-less rows makes
+  // more work for the re-run, not less. Stop emitting instead.
   if(ing->batch != NULL && ing->batch->aborted) return;
 
   len = (size_t)(end - start);
@@ -257,11 +256,26 @@ kw_emit_chunk(kw_ingest_t *ing, const char *start, const char *end)
   }
 
   id = 0;
-  if(knowledge_insert_chunk_raw(ing->corpus, ing->source_url,
-        ing->heading, text, &id) != SUCCESS)
+  rc = knowledge_insert_chunk_raw(ing->corpus, ing->source_url,
+      ing->heading, text, &id);
+
+  if(rc == KNOWLEDGE_CHUNK_FAILED)
     return;
 
-  ing->emitted++;
+  // Already stored and already retrievable. Counting it as a chunk
+  // would make the command's headline number a lie about what the walk
+  // added, which is the number the operator is deciding on.
+  if(rc == KNOWLEDGE_CHUNK_PRESENT)
+  {
+    ing->duplicates++;
+    return;
+  }
+
+  if(rc == KNOWLEDGE_CHUNK_UNEMBEDDED)
+    ing->reembedded++;
+
+  else
+    ing->emitted++;
 
   // The row is already in the table, so a batch that will not take it
   // is a chunk with no embedding — count it as one. This is the chunk
@@ -471,10 +485,13 @@ kw_derive_source_url(char *out, size_t sz, const char *base_url,
   snprintf(out, sz, "%s/%.*s", base_url, (int)baselen, base);
 }
 
-static size_t
+// Four counters is where separate out-params stop being readable, so
+// this accumulates straight into the walk's stats block.
+static void
 kw_ingest_file(const char *corpus, const char *path,
     const char *base_url_or_NULL,
-    uint32_t chunk_max, knowledge_batch_t *batch, size_t *out_skipped)
+    uint32_t chunk_max, knowledge_batch_t *batch,
+    knowledge_ingest_stats_t *acc)
 {
   size_t len = 0;
   char *body = kw_slurp(path, &len);
@@ -485,7 +502,7 @@ kw_ingest_file(const char *corpus, const char *path,
   if(body == NULL)
   {
     clam(CLAM_WARN, "knowledge", "ingest: cannot read '%s'", path);
-    return(0);
+    return;
   }
 
   source_url = path;
@@ -513,8 +530,10 @@ kw_ingest_file(const char *corpus, const char *path,
 
   mem_free(body);
 
-  if(out_skipped != NULL) *out_skipped = ing.skipped;
-  return(ing.emitted);
+  acc->chunks     += ing.emitted;
+  acc->skipped    += ing.skipped;
+  acc->duplicates += ing.duplicates;
+  acc->reembedded += ing.reembedded;
 }
 
 // Ingest a file or every .md/.txt/.markdown at the top of a directory.
@@ -544,7 +563,6 @@ knowledge_ingest_path(const char *corpus, const char *path,
   uint32_t batch_size;
   char embed_model[KNOWLEDGE_EMBED_MODEL_SZ];
   knowledge_batch_t batch;
-  size_t files, chunks, skipped;
   if(out == NULL)
     return(FAIL);
 
@@ -572,17 +590,12 @@ knowledge_ingest_path(const char *corpus, const char *path,
 
   knowledge_batch_init(&batch, corpus, embed_model, batch_size);
 
-  files = 0;
-  chunks = 0;
-  skipped = 0;
-
+  // The memset above already zeroed every counter, including the two
+  // OBS-16 added.
   if(S_ISREG(st.st_mode))
   {
-    size_t sk = 0;
-    chunks += kw_ingest_file(corpus, path, base_url_or_NULL,
-        chunk_max, &batch, &sk);
-    skipped += sk;
-    files = 1;
+    kw_ingest_file(corpus, path, base_url_or_NULL, chunk_max, &batch, out);
+    out->files = 1;
   }
 
   else if(S_ISDIR(st.st_mode))
@@ -600,7 +613,6 @@ knowledge_ingest_path(const char *corpus, const char *path,
     while((de = readdir(d)) != NULL)
     {
       struct stat est;
-      size_t sk;
       if(batch.aborted) break;
 
       if(de->d_name[0] == '.') continue;
@@ -615,11 +627,9 @@ knowledge_ingest_path(const char *corpus, const char *path,
           && !kw_path_has_ext(entry, ".txt"))
         continue;
 
-      sk = 0;
-      chunks += kw_ingest_file(corpus, entry, base_url_or_NULL,
-          chunk_max, &batch, &sk);
-      skipped += sk;
-      files++;
+      kw_ingest_file(corpus, entry, base_url_or_NULL, chunk_max, &batch,
+          out);
+      out->files++;
     }
 
     closedir(d);
@@ -635,9 +645,6 @@ knowledge_ingest_path(const char *corpus, const char *path,
   // itself abort, so the stats are read after it, never before.
   knowledge_batch_free(&batch);
 
-  out->files      = files;
-  out->chunks     = chunks;
-  out->skipped    = skipped;
   out->embed_ok   = batch.chunks_embedded_ok;
   out->embed_fail = batch.chunks_embedded_fail;
   out->aborted    = batch.aborted;

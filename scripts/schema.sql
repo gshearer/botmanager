@@ -183,6 +183,14 @@ CREATE TABLE IF NOT EXISTS knowledge_chunks (
   created         TIMESTAMPTZ  NOT NULL DEFAULT NOW()
 );
 CREATE INDEX IF NOT EXISTS idx_knowledge_chunks_corpus ON knowledge_chunks(corpus);
+-- Ingest idempotency (OBS-16): a chunk is identified by its corpus, its
+-- source, its heading and its content. md5 and not sha256 because
+-- sha256 needs a bytea, convert_to() is only STABLE so an index may not
+-- call it, and text::bytea reinterprets the value. The heading is in the
+-- key because two sections legitimately carry the same body.
+-- See plugins/extension/inference/KNOWLEDGE.md §Idempotency.
+CREATE UNIQUE INDEX IF NOT EXISTS knowledge_chunks_dedup
+  ON knowledge_chunks(corpus, source_url, section_heading, md5(text));
 
 CREATE TABLE IF NOT EXISTS knowledge_chunk_embeddings (
   chunk_id  BIGINT      PRIMARY KEY REFERENCES knowledge_chunks(id) ON DELETE CASCADE,

@@ -72,8 +72,9 @@ cmd_knowledge_ingest(const cmd_ctx_t *ctx)
   }
 
   snprintf(line, sizeof(line),
-      "ingested %zu chunk(s) from %zu file(s) (%zu skipped).",
-      st.chunks, st.files, st.skipped);
+      "ingested %zu new chunk(s) from %zu file(s)"
+      " (%zu skipped, %zu already present, %zu re-embedded).",
+      st.chunks, st.files, st.skipped, st.duplicates, st.reembedded);
   cmd_reply(ctx, line);
 
   snprintf(line, sizeof(line),
@@ -85,8 +86,8 @@ cmd_knowledge_ingest(const cmd_ctx_t *ctx)
 
   // An abort makes the two lines above a prefix of the corpus rather
   // than the corpus, and the chunks it already inserted carry no
-  // vector. Say both — a re-run inserts them a second time, since
-  // nothing about ingest is idempotent.
+  // vector. Say both — the re-run that repairs them is the same
+  // command, because since OBS-16 ingest is a resume.
   if(st.aborted)
   {
     cmd_reply(ctx,
@@ -100,9 +101,9 @@ cmd_knowledge_ingest(const cmd_ctx_t *ctx)
     cmd_reply(ctx, line);
 
     cmd_reply(ctx,
-        "Fix the engine, then delete the corpus and ingest it again —"
-        " re-running over the same path duplicates every chunk it"
-        " already stored.");
+        "Fix the engine, then run the same command again: ingest is"
+        " idempotent, so a re-run skips what is already stored and"
+        " embeds only the chunks that still have no vector.");
   }
 }
 
