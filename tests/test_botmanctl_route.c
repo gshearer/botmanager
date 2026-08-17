@@ -18,16 +18,10 @@
 // worker; `hold` occupies a dispatch window synchronously, so a late
 // reply lands while the driver is demonstrably serving someone else.
 //
-// ⚠ Under `-Db_sanitize=address` (and thread) this binary reports a
-// heap-use-after-free in `bctl_task_cb` **after every row has passed**.
-// It is neither this suite's nor OBS-29's: `botmanctl_exit()` frees
-// every client through `bctl_drv_disconnect` without first stopping the
-// persist poll thread, which is still inside the loop reading them. It
-// reproduces identically against pre-OBS-29 core (control run,
-// 2026-08-16) and is filed as `OBS-31` in root TODO.md. The daemon
-// never took the hit because it exits the process rather than calling
-// `botmanctl_exit` and carrying on. Every check is clean under both
-// sanitizers and no report names the routing path.
+// ⚠ The teardown order here — botmanctl_exit() BEFORE pool_exit() —
+// is deliberate and is itself the regression test for OBS-31: it is
+// the order main.c does NOT use, so it is the only place in the tree
+// that exercises botmanctl_exit()'s own join. Do not "tidy" it.
 
 #include "test.h"
 

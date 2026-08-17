@@ -9,8 +9,10 @@ void botmanctl_register_method(void);
 // Must be called during the config registration phase.
 void botmanctl_register_config(void);
 
-// Closes all connections, unlinks the socket file, and unregisters the
-// method instance.
+// Stops and joins the poll thread, closes all connections, unlinks the
+// socket file, and unregisters the method instance. Safe to call with the
+// thread pool still running; main.c calls it after pool_exit() has already
+// joined that thread, which costs nothing.
 void botmanctl_exit(void);
 
 // Returns empty string if no namespace cd is set or no dispatch is active.
@@ -41,6 +43,7 @@ void botmanctl_set_user_ns(const char *name);
 #define BCTL_INPUT_SZ      512
 #define BCTL_SOCK_PATH_SZ  256
 #define BCTL_MAX_CLIENTS   16
+#define BCTL_STOP_WAIT_MS  5000
 
 typedef enum {
   BCTL_MODE_COMMAND,    // interactive command mode
@@ -76,6 +79,13 @@ typedef struct
 
 static bctl_server_t *bctl_state  = NULL;
 static bool           bctl_active = false;
+
+// The persist poll thread's handle and its stop flag. botmanctl_exit()
+// must join that thread before anything frees a client out from under
+// it — main.c gets there first by ordering (pool_exit at step 4), and
+// nothing else in the tree does. See core/AGENTS.md §Patterns (OBS-31).
+static task_handle_t bctl_task     = TASK_HANDLE_NONE;
+static _Atomic bool  bctl_stopping = false;
 
 // Allocated under client_mutex; a 64-bit counter never wraps back onto a
 // live client, so a late reply can never address a recycled slot.

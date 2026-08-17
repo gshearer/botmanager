@@ -785,7 +785,7 @@ bctl_task_cb(task_t *t)
     return;
   }
 
-  while(!pool_shutting_down())
+  while(!pool_shutting_down() && !bctl_stopping)
   {
     // Build pollfd array: slot 0 = listener, slots 1..N = clients.
     struct pollfd fds[1 + BCTL_MAX_CLIENTS];
@@ -883,6 +883,12 @@ bctl_task_cb(task_t *t)
     }
 
     // Sweep: remove all clients marked for closing.
+    // Swept without client_mutex, and correctly: this thread is the
+    // list's only mutator (bctl_client_add and bctl_client_remove both
+    // run here), and the one foreign mutator — bctl_drv_disconnect —
+    // can no longer run while this thread lives (botmanctl_exit joins
+    // it first). Taking the lock here would be wrong as well as
+    // unnecessary: bctl_client_remove takes it and clam()s under it.
     {
       bctl_client_t *c = srv->clients;
 
@@ -973,6 +979,8 @@ botmanctl_register_method(void)
 
   // Start the persist task.
   t = task_add_persist("botmanctl", 0, bctl_task_cb, NULL);
+  bctl_task = t;
+
   if(t == TASK_HANDLE_NONE)
   {
     clam(CLAM_WARN, "botmanctl", "failed to start listener task");
@@ -997,7 +1005,23 @@ botmanctl_exit(void)
 
   clam(CLAM_INFO, "botmanctl", "shutting down");
 
-  bctl_active = false;
+  bctl_active   = false;
+  bctl_stopping = true;
+
+  // The poll thread is reading the very clients method_unregister is
+  // about to free. Refusing to unregister is the safe answer to a join
+  // that did not complete: an instance leaked at exit costs a mem_exit
+  // line, and freeing it here costs a use-after-free.
+  if(!task_persist_join(bctl_task, BCTL_STOP_WAIT_MS))
+  {
+    clam(CLAM_WARN, "botmanctl",
+        "poll thread still running after %d ms; leaving the socket up "
+        "(its clients and server block will show in mem_exit)",
+        BCTL_STOP_WAIT_MS);
+    return;
+  }
+
+  bctl_task  = TASK_HANDLE_NONE;
   bctl_state = NULL;
 
   method_unregister("botmanctl");
