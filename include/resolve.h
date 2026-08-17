@@ -96,13 +96,14 @@ typedef void (*resolve_cb_t)(const resolve_result_t *result);
 
 // Thread-safe.
 //
-// core.resolve.timeout is a bound only on the res_nquery path (every type
-// but A/AAAA), where the call site owns the resolver state. A and AAAA go
-// through getaddrinfo, which exposes no per-call bound and on a host whose
-// nsswitch.conf answers `hosts:` from nss-resolve never reaches glibc's DNS
-// code at all -- there the knob only reports a late answer, and what
-// actually bounds the wait is the host's NSS stack. A socket's connect leg
-// is bounded at the caller instead, by core.sock.connect_timeout.
+// This is the POSIX resolver on a worker thread, deliberately: a task blocks
+// in getaddrinfo (A/AAAA) or res_nquery (everything else) and the answer comes
+// back on the callback. Neither call takes a bound from us -- getaddrinfo
+// exposes none, and where nsswitch.conf answers `hosts:` from nss-resolve it
+// never reaches glibc's DNS code at all -- so core.resolve.timeout is patience,
+// not a bound: it decides how a FAILURE reads and when a late answer is
+// logged, never whether an answer is kept. A socket's connect leg is bounded
+// at the caller, by core.sock.connect_timeout.
 bool resolve_lookup(const char *name, resolve_type_t qtype,
     resolve_cb_t cb, void *user_data);
 

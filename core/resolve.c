@@ -49,7 +49,7 @@ resolve_load_config(void)
   resolve_cfg.max_pending = (uint32_t)kv_get_uint("core.resolve.max_pending");
 
   if(resolve_cfg.timeout == 0)
-    resolve_cfg.timeout = 10;
+    resolve_cfg.timeout = 30;
 
   if(resolve_cfg.max_pending == 0)
     resolve_cfg.max_pending = 64;
@@ -1140,12 +1140,14 @@ resolve_init(void)
 void
 resolve_register_config(void)
 {
-  kv_register("core.resolve.timeout",     KV_UINT32, "10",
+  kv_register("core.resolve.timeout",     KV_UINT32, "30",
       resolve_kv_changed, NULL,
-      "Per-lookup DNS budget in seconds. Bounds the res_nquery path "
-      "(every type but A/AAAA); on the A/AAAA path getaddrinfo takes no "
-      "bound and a late answer is only logged. A socket's connect leg is "
-      "bounded by core.sock.connect_timeout instead");
+      "How long a lookup may take before it is called late, in seconds. "
+      "The resolver is the system one: a worker thread blocks in "
+      "getaddrinfo/res_nquery and neither takes a bound from us, so this "
+      "decides how a FAILURE reads (timed out, or the DNS error itself) and "
+      "when a late answer is logged — never whether an answer is kept. A "
+      "socket's connect leg is bounded by core.sock.connect_timeout");
   kv_register("core.resolve.max_pending", KV_UINT32, "64",
       resolve_kv_changed, NULL,
       "Maximum concurrent pending DNS lookups");
