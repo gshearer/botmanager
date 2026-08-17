@@ -21,6 +21,12 @@
 // which holds a thread inside the window with `mu` released, and that
 // is the whole fixture. Assertions read the emitted frame set, because
 // what the module emits is the only thing a consumer can observe.
+//
+// c10..c13 are a different subject on the same table (OBS-21): what the
+// slot table BELIEVES the gateway holds, against what it actually holds.
+// The two diverge whenever a refusal is misread, an ack outlives its
+// consumer, or a frame that never left is forgotten anyway — and the
+// endpoint is the same silence as above, a gateway streaming to nobody.
 
 #include "test.h"
 
@@ -58,6 +64,12 @@ static size_t           n_frames;
 static char             park_op[32];
 static char             park_sym[32];
 
+// The armed send-FAILURE, matched the same two ways and cleared as it
+// fires. A transport that refuses one named frame is the only way a case
+// can reach phase 3's send-failure arm, and c12/c13 are what need it.
+static char             fail_op[32];
+static char             fail_sym[32];
+
 static pthread_mutex_t  gate_mutex = PTHREAD_MUTEX_INITIALIZER;
 static pthread_cond_t   gate_cond  = PTHREAD_COND_INITIALIZER;
 static bool             parked;
@@ -80,6 +92,7 @@ bool
 kr_ws_send_text(kr_ws_session_id_t sid, const char *buf, size_t len)
 {
   bool   hold = false;
+  bool   die  = false;
   size_t n;
 
   pthread_mutex_lock(&ledger_mutex);
@@ -102,6 +115,13 @@ kr_ws_send_text(kr_ws_session_id_t sid, const char *buf, size_t len)
       park_op[0] = '\0';
     }
 
+    if(fail_op[0] != '\0'
+        && frame_is(frames[n_frames], fail_op, fail_sym))
+    {
+      die        = true;
+      fail_op[0] = '\0';
+    }
+
     n_frames++;
   }
 
@@ -119,6 +139,9 @@ kr_ws_send_text(kr_ws_session_id_t sid, const char *buf, size_t len)
 
     pthread_mutex_unlock(&gate_mutex);
   }
+
+  if(die)
+    return(FAIL);
 
   return(SUCCESS);
 }
@@ -264,6 +287,17 @@ arm_park(const char *op, const char *sym)
 }
 
 static void
+arm_fail(const char *op, const char *sym)
+{
+  pthread_mutex_lock(&ledger_mutex);
+
+  strlcpy(fail_op, op, sizeof(fail_op));
+  strlcpy(fail_sym, sym, sizeof(fail_sym));
+
+  pthread_mutex_unlock(&ledger_mutex);
+}
+
+static void
 wait_parked(void)
 {
   pthread_mutex_lock(&gate_mutex);
@@ -298,6 +332,8 @@ fixture_reset(void)
   n_frames    = 0;
   park_op[0]  = '\0';
   park_sym[0] = '\0';
+  fail_op[0]  = '\0';
+  fail_sym[0] = '\0';
 
   pthread_mutex_unlock(&ledger_mutex);
 
@@ -383,7 +419,7 @@ subscribe_and_ack(void **out, const char *product,
 // always shorter by the time the unsubscribe ack arrives. When another
 // slot has taken the compacted index, that ack is applied to it — and
 // the parser cannot tell an unsubscribe ack from a subscribe one, so
-// the write forges ACTIVE / sent_upstream onto a slot the gateway has
+// the write forges ACTIVE / gateway_holds onto a slot the gateway has
 // never confirmed. The victim's own ack then finds its index past the
 // end of the table and is dropped, leaving the forgery standing: the
 // slot is believed live, every later reconcile skips it, and the feed
@@ -431,7 +467,7 @@ case_unsub_ack_forges_a_stranger(void)
 // free; the second runs to completion, compacting two slots out and
 // swapping two survivors down into their indexes. The first then
 // resumes on a raw index that now names a live subscription and writes
-// its post-emit bookkeeping onto it — clearing sent_upstream on a feed
+// its post-emit bookkeeping onto it — clearing gateway_holds on a feed
 // nobody unsubscribed. The damage shows on the next reconcile, which
 // re-emits a subscribe for a slot the gateway already holds.
 
@@ -695,7 +731,7 @@ case_private_routes_to_the_auth_gateway(void)
 // c8 — two reconcile passes over one in-flight slot (OBS-35)          //
 // ------------------------------------------------------------------ //
 //
-// `sent_upstream` is not set until the ack lands, so for one whole round
+// `gateway_holds` is not set until the ack lands, so for one whole round
 // trip a slot that already has a subscribe on the wire still answers
 // "yes" to "do you want one". Any second pass in that window mints a
 // second req_id and emits again — two frames for one slot, the later ack
@@ -790,7 +826,7 @@ case_a_flap_still_resubscribes(void)
 //
 // The unsubscribe frame is on the wire and the table still says ACTIVE,
 // so the arriving consumer's own reconcile has nothing to emit — and the
-// unsubscribing pass then clears `sent_upstream` and walks away. The slot
+// unsubscribing pass then clears `gateway_holds` and walks away. The slot
 // ends refcount=1 / IDLE with no frame and no pending trigger, waiting on
 // a reconcile nothing in the primitive promises. whenmoon's full-rebuild
 // flow happens to provide one; a second consumer of this driver would not
@@ -834,6 +870,141 @@ case_resubscribe_inside_the_unsubscribe_window(void)
   if(again != NULL) kr_ws_unsubscribe(again);
 }
 
+// ------------------------------------------------------------------ //
+// c10 — the refusal that is a statement about the GATEWAY (OBS-21)    //
+// ------------------------------------------------------------------ //
+//
+// Kraken answers a subscribe for something it already holds with
+// `'Already subscribed'`, and the ack handler used to file that as a
+// refusal: the slot went FAILED with `gateway_holds = false` while the
+// product streamed perfectly well. Two things follow, and both are the
+// same mistake — every later reconcile asks again and draws the same
+// answer, and the departing consumer's unsubscribe is never emitted,
+// because the flag that says "the gateway holds this" was cleared by the
+// gateway telling us it holds it.
+
+static void
+case_the_refusal_that_means_the_gateway_holds_it(void)
+{
+  void     *aaa = NULL;
+  void     *bbb = NULL;
+  uint32_t  rid;
+
+  fixture_reset();
+
+  subscribe_one(&aaa, "AAA-USD");
+  rid = rid_of("subscribe", "AAA");
+
+  inject_ack("subscribe", rid, false, "Already subscribed");
+
+  // Any reconcile will do; a second product is the cheapest one.
+  subscribe_one(&bbb, "BBB-USD");
+
+  test_check_sz(SUITE,
+      "a slot the gateway already holds is not subscribed a second time",
+      1, n_frames_with("subscribe", "AAA"));
+
+  kr_ws_unsubscribe(aaa);
+
+  test_check_sz(SUITE,
+      "and it is unsubscribed when its last consumer leaves",
+      1, n_frames_with("unsubscribe", "AAA"));
+
+  kr_ws_unsubscribe(bbb);
+}
+
+// ------------------------------------------------------------------ //
+// c11 — the ack that lands after the last consumer left (OBS-21)      //
+// ------------------------------------------------------------------ //
+//
+// The mirror of c9. There, a consumer ARRIVED inside an unsubscribe
+// window; here one LEAVES inside a subscribe window. No unsubscribe is
+// owed at the moment it goes — the gateway has not confirmed anything —
+// the slot survives compaction because a frame is in flight, and then the
+// ack makes it live with nobody behind it. No pass wants a refcount-0
+// slot and compaction is not running, so it streams to nobody until some
+// unrelated unsubscribe happens along.
+
+static void
+case_an_ack_that_lands_after_the_last_consumer_left(void)
+{
+  void     *aaa = NULL;
+  uint32_t  rid;
+
+  fixture_reset();
+
+  subscribe_one(&aaa, "AAA-USD");
+  rid = rid_of("subscribe", "AAA");
+
+  kr_ws_unsubscribe(aaa);
+
+  inject_ack("subscribe", rid, true, NULL);
+
+  test_check_sz(SUITE,
+      "a slot that goes live with no consumer is unsubscribed at once",
+      1, n_frames_with("unsubscribe", "AAA"));
+}
+
+// ------------------------------------------------------------------ //
+// c12 — the unsubscribe whose frame never left (OBS-21)               //
+// ------------------------------------------------------------------ //
+//
+// Phase 3 hands a slot whose unsubscribe failed to send back to ACTIVE
+// (OBS-20) — correct, the gateway may well still hold it — and
+// compaction on the next line then dropped it anyway. Nothing can retry
+// what is no longer in the table.
+
+static void
+case_an_unsubscribe_that_never_left(void)
+{
+  void *aaa = NULL;
+  void *bbb = NULL;
+
+  fixture_reset();
+
+  subscribe_and_ack(&aaa, "AAA-USD", "AAA");
+  subscribe_and_ack(&bbb, "BBB-USD", "BBB");
+
+  arm_fail("unsubscribe", "AAA");
+
+  kr_ws_unsubscribe(aaa);
+
+  // Any later UNSUB pass is the retry the surviving slot is owed.
+  kr_ws_unsubscribe(bbb);
+
+  test_check_sz(SUITE,
+      "an unsubscribe that never left is retried by the next pass",
+      2, n_frames_with("unsubscribe", "AAA"));
+}
+
+// ------------------------------------------------------------------ //
+// c13 — and the guard c12 must not be bought with                     //
+// ------------------------------------------------------------------ //
+//
+// Keeping a slot the gateway holds must not resurrect a subscription
+// nobody wants: a flap means that gateway forgot everything, so the
+// on-open pass has to forget it too rather than re-emit for it. Green on
+// both sides of the fix, and here so neither can quietly trade the other.
+
+static void
+case_a_flap_does_not_revive_a_departed_slot(void)
+{
+  void *aaa = NULL;
+
+  fixture_reset();
+
+  subscribe_and_ack(&aaa, "AAA-USD", "AAA");
+
+  arm_fail("unsubscribe", "AAA");
+
+  kr_ws_unsubscribe(aaa);
+
+  kr_ws_channels_on_open(KR_WS_PUBLIC);
+
+  test_check_sz(SUITE, "a flap does not revive a departed slot",
+      1, n_frames_with("subscribe", "AAA"));
+}
+
 int
 main(void)
 {
@@ -849,6 +1020,10 @@ main(void)
   case_two_passes_over_one_inflight_slot();
   case_a_flap_still_resubscribes();
   case_resubscribe_inside_the_unsubscribe_window();
+  case_the_refusal_that_means_the_gateway_holds_it();
+  case_an_ack_that_lands_after_the_last_consumer_left();
+  case_an_unsubscribe_that_never_left();
+  case_a_flap_does_not_revive_a_departed_slot();
 
   kr_ws_channels_deinit();
 

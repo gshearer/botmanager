@@ -50,6 +50,7 @@
 #include <stdatomic.h>
 #include <stdio.h>
 #include <string.h>
+#include <strings.h>
 #include <time.h>
 
 // ------------------------------------------------------------------ //
@@ -60,6 +61,12 @@
 #define KR_WS_CH_MAX_PRODUCTS_PER_SUB   16
 #define KR_WS_CH_MAX_SLOTS             128
 #define KR_WS_CH_REQ_RING_SIZE         256
+
+// The one subscribe refusal that is a statement about the GATEWAY rather
+// than about our request: it holds this exact (channel, symbol) already.
+// Measured verbatim 41 times over 2026-08-16..17 and it is one of only
+// three refusal strings this tree has ever received (OBS-21).
+#define KR_WS_ERR_ALREADY_HELD "Already subscribed"
 
 // Internal channel enum. Maps to Kraken v2 channel strings via
 // kr_ws_channel_name(). The PRIVATE flag distinguishes channels that
@@ -161,7 +168,7 @@ typedef struct
   uint32_t         refcount;
   kr_sub_state_t   state;
   uint32_t         req_id;        // last subscribe req_id; 0 = none in flight
-  bool             sent_upstream; // true once subscribe ack received
+  bool             gateway_holds;  // true once the gateway confirms it
   char             last_err[128];
 } kr_ws_slot_t;
 
@@ -243,19 +250,29 @@ kr_ws_slot_alloc_locked(kr_ws_channel_t ch, const char *symbol_ws)
   return(s);
 }
 
-// Drop slots whose refcount hit zero after an unsubscribe emission.
-// Swap-with-last reshuffles the table, which is safe because nothing
-// outside this hold remembers a position: the correlator ring parks
-// (channel, symbol_ws) and a req_id, and reconcile re-derives every
+// Drop slots whose refcount hit zero and which the gateway is known not
+// to hold. Swap-with-last reshuffles the table, which is safe because
+// nothing outside this hold remembers a position: the correlator ring
+// parks (channel, symbol_ws) and a req_id, and reconcile re-derives every
 // slot by that identity before writing it (OBS-5). Both sides have to
-// stay true together — store an index anywhere and this becomes a
-// silent write to the wrong subscription.
+// stay true together — store an index anywhere and this becomes a silent
+// write to the wrong subscription.
+//
+// `gateway_holds` is the whole guard (OBS-21): forgetting a slot the
+// gateway still holds leaves it streaming to nobody, and no later pass
+// can emit for what is no longer in the table. Such a slot is not
+// stranded — refcount 0 with gateway_holds is exactly what phase 1 UNSUB
+// wants, so the next pass emits, phase 3 clears the flag, and the pass
+// after that reaps it. The two -ING tests are belt to that brace: a slot
+// with a frame on the wire must not be swapped out from under its own
+// phase 3 (OBS-20).
 static void
 kr_ws_slots_compact_locked(void)
 {
   for(uint32_t i = 0; i < kr_ws_ch.n_slots; )
   {
     if(kr_ws_ch.slots[i].refcount == 0
+        && !kr_ws_ch.slots[i].gateway_holds
         && kr_ws_ch.slots[i].state != KR_SUB_SUBSCRIBING
         && kr_ws_ch.slots[i].state != KR_SUB_UNSUBSCRIBING)
     {
@@ -496,11 +513,15 @@ kr_ws_reconcile_locked(kr_reconcile_op_t op, const char *token, int only_sid)
     if(op == KR_RECONCILE_SUB)
     {
       // Only emit for slots that have at least one consumer and aren't
-      // already known active. A slot in FAILED stays failed until the
-      // caller removes it; we don't auto-retry here.
+      // already known active. A FAILED slot IS retried here, by every
+      // later reconcile — `gateway_holds` is false on it, so the second
+      // disjunct below is always true. That is the only recovery a
+      // transient refusal has, and `c1`/`c6` pin it. The refusal that
+      // used to make the retry harmful is no longer a refusal (OBS-21):
+      // `'Already subscribed'` now lands the slot ACTIVE.
       //
       // The in-flight test is the other half, and it is what makes two
-      // overlapping passes safe (OBS-35). `sent_upstream` does not go
+      // overlapping passes safe (OBS-35). `gateway_holds` does not go
       // true until the ACK lands, so for one whole round trip a slot
       // that already has a frame on the wire still answers yes here —
       // and the second pass mints a second req_id for it. On a lazily
@@ -516,18 +537,18 @@ kr_ws_reconcile_locked(kr_reconcile_op_t op, const char *token, int only_sid)
       // these slots to IDLE.
       want = (s->refcount > 0
               && s->state != KR_SUB_SUBSCRIBING
-              && (s->state == KR_SUB_IDLE || !s->sent_upstream));
+              && (s->state == KR_SUB_IDLE || !s->gateway_holds));
     }
     else
     {
       // Only emit unsubscribe for slots whose refcount has dropped to
       // zero and which the gateway currently has live — and never for
       // one whose unsubscribe is already on the wire. Two consumers
-      // leaving at once is enough: `sent_upstream` is not cleared until
+      // leaving at once is enough: `gateway_holds` is not cleared until
       // phase 3, so each pass sees the other's target still looking
       // live and unsubscribes it a second time (OBS-20).
       want = (s->refcount == 0
-              && s->sent_upstream
+              && s->gateway_holds
               && s->state != KR_SUB_UNSUBSCRIBING);
     }
 
@@ -557,7 +578,7 @@ kr_ws_reconcile_locked(kr_reconcile_op_t op, const char *token, int only_sid)
 
     // No req_id on this side. `req_id` is what the ack handler matches
     // against, and an unsubscribe ack that matched would forge ACTIVE +
-    // sent_upstream onto the slot — the exact write OBS-5's guard exists
+    // gateway_holds onto the slot — the exact write OBS-5's guard exists
     // to refuse. The state is the whole guard here.
     else
       s->state = KR_SUB_UNSUBSCRIBING;
@@ -619,7 +640,7 @@ kr_ws_reconcile_locked(kr_reconcile_op_t op, const char *token, int only_sid)
       }
 
       // An unsubscribe that never left is not in flight. Hand the slot
-      // back the belief it had: `sent_upstream` was never touched, and
+      // back the belief it had: `gateway_holds` was never touched, and
       // the only thing that sets it is the same ack that sets ACTIVE, so
       // ACTIVE is exactly where this slot came from. Without this the
       // slot is stranded — no pass wants it and compaction skips it.
@@ -634,7 +655,7 @@ kr_ws_reconcile_locked(kr_reconcile_op_t op, const char *token, int only_sid)
       // The frame is on the wire, so this records what was SENT rather
       // than what we would prefer: the gateway no longer holds this
       // slot. That is why it is unconditional.
-      s->sent_upstream = false;
+      s->gateway_holds = false;
       s->state         = KR_SUB_IDLE;
       s->req_id        = 0;
 
@@ -671,10 +692,28 @@ kr_ws_has_private_pending_locked(void)
 
     if(s->refcount > 0
         && kr_ws_channel_is_private(s->channel)
-        && (s->state == KR_SUB_IDLE || !s->sent_upstream))
+        && (s->state == KR_SUB_IDLE || !s->gateway_holds))
       return(true);
   }
   return(false);
+}
+
+// Emit the unsubscribe every consumerless slot the gateway still holds
+// has earned, then forget the ones whose frame is away. Mu held; the
+// reconcile releases it in the middle and returns holding it. A stale
+// token is fine for an unsubscribe — worst case the gateway has already
+// forgotten the slot.
+static void
+kr_ws_reap_unwanted_locked(void)
+{
+  char token[KR_WS_TOKEN_SZ] = {0};
+
+  (void)kr_ws_token_snapshot(token, sizeof(token));
+
+  kr_ws_reconcile_locked(KR_RECONCILE_UNSUB,
+      token[0] != '\0' ? token : NULL, KR_WS_SID_ANY);
+
+  kr_ws_slots_compact_locked();
 }
 
 // ------------------------------------------------------------------ //
@@ -1192,10 +1231,14 @@ kr_ws_dispatch_balances_row(struct json_object *row,
 // guard below decides whether this ack is still the one that slot is
 // waiting on — without it an unsubscribe ack forges ACTIVE onto
 // whatever the table has since put in the emitter's place (OBS-5).
-static void
+//
+// Returns true when the slot it just made ACTIVE has no consumer left,
+// which is the caller's cue to reap it (OBS-21).
+static bool
 kr_ws_handle_ack_locked(struct json_object *root)
 {
   kr_ws_corr_entry_t ent;
+  bool               held    = false;
   bool               success = false;
   int32_t            req_id  = 0;
   int32_t            slot_idx;
@@ -1206,14 +1249,14 @@ kr_ws_handle_ack_locked(struct json_object *root)
   json_get_str  (root, "error",   err_str, sizeof(err_str));
 
   if(req_id == 0)
-    return;
+    return(false);
 
   ent = kr_ws_corr_pop_locked((uint32_t)req_id);
 
   if(ent.req_id == 0)
   {
     clam(CLAM_DEBUG, KR_CTX, "ws ack req_id=%d: no matching slot", req_id);
-    return;
+    return(false);
   }
 
   slot_idx = kr_ws_slot_find_locked(ent.channel, ent.symbol_ws);
@@ -1225,7 +1268,7 @@ kr_ws_handle_ack_locked(struct json_object *root)
   {
     clam(CLAM_DEBUG, KR_CTX, "ws ack req_id=%d: slot ch=%s sym=%s gone",
         req_id, kr_ws_channel_name(ent.channel), ent.symbol_ws);
-    return;
+    return(false);
   }
 
   kr_ws_slot_t *s = &kr_ws_ch.slots[slot_idx];
@@ -1238,31 +1281,47 @@ kr_ws_handle_ack_locked(struct json_object *root)
     clam(CLAM_DEBUG, KR_CTX,
         "ws ack req_id=%d: stale/foreign (slot ch=%s sym=%s holds %u)",
         req_id, kr_ws_channel_name(s->channel), s->symbol_ws, s->req_id);
-    return;
+    return(false);
   }
 
-  if(success)
+  // `'Already subscribed'` is the gateway telling us it holds this exact
+  // (channel, symbol). Reading it as a refusal is what made the table
+  // and the gateway diverge with nothing to reconcile them (OBS-21): the
+  // slot went FAILED with `gateway_holds = false` while the product
+  // streamed perfectly well, every later reconcile asked again and drew
+  // the same answer, and the departing consumer's unsubscribe was never
+  // emitted at all.
+  held = (!success && strcasecmp(err_str, KR_WS_ERR_ALREADY_HELD) == 0);
+
+  if(success || held)
   {
     s->state         = KR_SUB_ACTIVE;
-    s->sent_upstream = true;
+    s->gateway_holds = true;
     s->last_err[0]   = '\0';
     s->req_id        = 0;
 
-    clam(CLAM_INFO, KR_CTX, "ws subscribe ack ch=%s sym=%s req_id=%d",
+    clam(CLAM_INFO, KR_CTX, "ws subscribe ack%s ch=%s sym=%s req_id=%d",
+        held ? " (gateway already held it)" : "",
         kr_ws_channel_name(s->channel), s->symbol_ws, req_id);
-  }
-  else
-  {
-    s->state         = KR_SUB_FAILED;
-    s->sent_upstream = false;
-    s->req_id        = 0;
-    snprintf(s->last_err, sizeof(s->last_err), "%s",
-        err_str[0] ? err_str : "subscribe failed");
 
-    clam(CLAM_WARN, KR_CTX,
-        "ws subscribe FAIL ch=%s sym=%s req_id=%d err='%s'",
-        kr_ws_channel_name(s->channel), s->symbol_ws, req_id, s->last_err);
+    // The consumer may have left while this was in flight. Nothing else
+    // will notice: no SUB pass wants a refcount-0 slot, no UNSUB pass
+    // wanted it a moment ago because the gateway had not confirmed it,
+    // and compaction is not running. The caller emits for it.
+    return(s->refcount == 0);
   }
+
+  s->state         = KR_SUB_FAILED;
+  s->gateway_holds = false;
+  s->req_id        = 0;
+  snprintf(s->last_err, sizeof(s->last_err), "%s",
+      err_str[0] ? err_str : "subscribe failed");
+
+  clam(CLAM_WARN, KR_CTX,
+      "ws subscribe FAIL ch=%s sym=%s req_id=%d err='%s'",
+      kr_ws_channel_name(s->channel), s->symbol_ws, req_id, s->last_err);
+
+  return(false);
 }
 
 void
@@ -1308,7 +1367,10 @@ kr_ws_channels_dispatch(const char *buf, size_t len)
           || strcmp(method, "unsubscribe") == 0))
   {
     pthread_mutex_lock(&kr_ws_ch.mu);
-    kr_ws_handle_ack_locked(root);
+
+    if(kr_ws_handle_ack_locked(root))
+      kr_ws_reap_unwanted_locked();
+
     pthread_mutex_unlock(&kr_ws_ch.mu);
 
     json_object_put(root);
@@ -1422,12 +1484,19 @@ kr_ws_channels_on_open(kr_ws_session_id_t sid)
     if(kr_ws_session_for_channel(s->channel) != sid)
       continue;
 
-    s->sent_upstream = false;
+    s->gateway_holds = false;
     s->req_id        = 0;
-
-    if(s->refcount > 0)
-      s->state = KR_SUB_IDLE;
+    s->state         = KR_SUB_IDLE;
   }
+
+  // A departed slot must not outlive the connection that held it. The
+  // reset above is what makes it forgettable — nothing this session sent
+  // can still be answered — and nothing else runs compaction on this
+  // path, so a slot that lost its last consumer mid-flight would sit in
+  // the table forever with no pass willing to touch it (OBS-21).
+  // Compaction is global and that is safe: a sibling-session slot the
+  // gateway still holds carries `gateway_holds` and is skipped.
+  kr_ws_slots_compact_locked();
 
   // Discard this session's pending acks from the connection that just
   // died; the sibling's are still in flight and answerable. Clearing the
@@ -1847,20 +1916,9 @@ kr_ws_unsubscribe(void *driver_sub)
     }
   }
 
-  // Unsubscribe walk — public channels only need a token-less frame;
-  // private channels need the cached token. We bypass the strict needs-
-  // refresh check (a stale token is still acceptable for unsubscribe;
-  // worst case the gateway already forgot the slot).
-  {
-    char token[KR_WS_TOKEN_SZ] = {0};
-
-    (void)kr_ws_token_snapshot(token, sizeof(token));
-    kr_ws_reconcile_locked(KR_RECONCILE_UNSUB, token[0] ? token : NULL,
-        KR_WS_SID_ANY);
-  }
-
-  // Reap empty slots.
-  kr_ws_slots_compact_locked();
+  // Unsubscribe walk — the reaper emits for every slot this sub was the
+  // last consumer of, then forgets the ones whose frame is away.
+  kr_ws_reap_unwanted_locked();
 
   mem_free(handle);
 

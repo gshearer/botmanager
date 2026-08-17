@@ -30,11 +30,13 @@ void    kr_ws_channels_deinit(void);
 // Called from kraken_ws.c the moment a session transitions to OPEN.
 // Rebuilds that session's upstream subscription set from the live slot
 // table and emits one subscribe per channel covering all live products.
-// Resets those slots' `sent_upstream` flags before rendering so a
-// session that had previously received subscribe acks gets a fresh
-// resubscribe after a flap; slots belonging to the OTHER session are
-// left untouched. The session lock must NOT be held by the caller —
-// this function calls kr_ws_send_text internally.
+// Resets that session's slots before rendering — nothing it sent can
+// still be answered — so a session that had previously received
+// subscribe acks gets a fresh resubscribe after a flap, and reaps the
+// ones whose last consumer left while a frame was in flight. Slots
+// belonging to the OTHER session are left untouched. The session lock
+// must NOT be held by the caller — this function calls kr_ws_send_text
+// internally.
 void    kr_ws_channels_on_open(kr_ws_session_id_t sid);
 
 // Whether the transport should hold `sid` open. KR_WS_PUBLIC is always
