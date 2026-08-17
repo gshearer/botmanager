@@ -46,7 +46,13 @@ static pthread_cond_t   llm_active_cond;
 // that started before it is waited out here — which is what makes
 // "the requester was unloaded" a decision taken once instead of a
 // pointer read racing an unmap (root TODO.md §SC-SAN-FINDINGS SAN-22).
+//
+// The count answers llm_stop()'s "is anything still running in me";
+// the list answers llm_unmap_cb()'s narrower "is anything still
+// running in THAT mapping", which the count cannot (root TODO.md
+// §SC-OBSERVED OBS-33).
 static uint32_t         llm_delivering = 0;
+static struct llm_delivery *llm_delivery_head = NULL;
 
 // Model cache.
 llm_model_t            *llm_models_head = NULL;
@@ -400,7 +406,14 @@ llm_active_remove(llm_request_t *req)
 // The requester's callbacks, lifted out of a request under
 // llm_active_mutex — the same lock llm_unmap_cb clears them under — so
 // that whichever of the two happens first, it happens completely.
-typedef struct
+//
+// The window is a stack object of the delivering thread, and it is
+// linked into llm_delivery_head for exactly as long as that thread is
+// inside the consumer. It therefore carries the one fact the bare
+// count never had: WHICH mapping is being called into. Nothing but the
+// owning thread and llm_unmap_cb's walk ever reads it, both under
+// llm_active_mutex.
+typedef struct llm_delivery
 {
   llm_chat_done_cb_t   chat;
   llm_embed_done_cb_t  embed;
@@ -409,6 +422,7 @@ typedef struct
   llm_tts_done_cb_t    tts;
   llm_chunk_cb_t       chunk;
   void                *user;
+  struct llm_delivery *next;
 } llm_delivery_t;
 
 // Caller holds llm_active_mutex.
@@ -423,6 +437,8 @@ llm_delivery_snap_locked(llm_request_t *req, llm_delivery_t *d)
   d->chunk = req->chunk_cb;
   d->user  = req->user_data;
 
+  d->next           = llm_delivery_head;
+  llm_delivery_head = d;
   llm_delivering++;
 }
 
@@ -450,12 +466,25 @@ llm_delivery_take(llm_request_t *req, llm_delivery_t *d)
 }
 
 static void
-llm_delivery_close(void)
+llm_delivery_close(llm_delivery_t *d)
 {
+  llm_delivery_t **pp = &llm_delivery_head;
+
   pthread_mutex_lock(&llm_active_mutex);
 
-  if(--llm_delivering == 0)
-    pthread_cond_broadcast(&llm_active_cond);
+  while(*pp != NULL && *pp != d)
+    pp = &(*pp)->next;
+
+  if(*pp == d)
+    *pp = d->next;
+
+  d->next = NULL;
+  llm_delivering--;
+
+  // Broadcast on every close, not only the last: llm_unmap_cb waits on
+  // its own mapping's windows and llm_stop() on all of them, so the
+  // wake condition is per-waiter and this thread cannot evaluate it.
+  pthread_cond_broadcast(&llm_active_cond);
 
   pthread_mutex_unlock(&llm_active_mutex);
 }
@@ -2316,7 +2345,7 @@ llm_sse_event_cb(const char *data, size_t len, void *user)
     if(d.chunk != NULL)
       d.chunk(req, out, (size_t)n, d.user);
 
-    llm_delivery_close();
+    llm_delivery_close(&d);
   }
 
   mem_free(out);
@@ -2410,7 +2439,7 @@ llm_deliver_chat(llm_request_t *req, bool ok, long http_status,
   if(d.chat != NULL)
     d.chat(&resp);
 
-  llm_delivery_close();
+  llm_delivery_close(&d);
   llm_req_release(req);
 }
 
@@ -2439,7 +2468,7 @@ llm_deliver_embed(llm_request_t *req, bool ok, long http_status,
   if(d.embed != NULL)
     d.embed(&resp);
 
-  llm_delivery_close();
+  llm_delivery_close(&d);
   llm_req_release(req);
 }
 
@@ -2477,7 +2506,7 @@ llm_deliver_image(llm_request_t *req, bool ok, long http_status,
   if(d.image != NULL)
     d.image(&resp);
 
-  llm_delivery_close();
+  llm_delivery_close(&d);
   llm_req_release(req);
 }
 
@@ -2505,7 +2534,7 @@ llm_deliver_stt(llm_request_t *req, bool ok, long http_status,
   if(d.stt != NULL)
     d.stt(&resp);
 
-  llm_delivery_close();
+  llm_delivery_close(&d);
   llm_req_release(req);
 }
 
@@ -2534,7 +2563,7 @@ llm_deliver_tts(llm_request_t *req, bool ok, long http_status,
   if(d.tts != NULL)
     d.tts(&resp);
 
-  llm_delivery_close();
+  llm_delivery_close(&d);
   llm_req_release(req);
 }
 
@@ -3427,6 +3456,27 @@ llm_addr_in(uintptr_t addr, uintptr_t lo, uintptr_t hi)
   return(addr != 0 && addr >= lo && addr < hi);
 }
 
+// Open delivery windows whose consumer lives in [lo, hi) — the threads
+// this engine is currently executing inside the departing mapping.
+// Caller holds llm_active_mutex.
+static uint32_t
+llm_delivery_into_locked(uintptr_t lo, uintptr_t hi)
+{
+  uint32_t n = 0;
+
+  for(const llm_delivery_t *d = llm_delivery_head; d != NULL; d = d->next)
+    if(llm_addr_in((uintptr_t)fn_addr(&d->chat), lo, hi)
+        || llm_addr_in((uintptr_t)fn_addr(&d->embed), lo, hi)
+        || llm_addr_in((uintptr_t)fn_addr(&d->image), lo, hi)
+        || llm_addr_in((uintptr_t)fn_addr(&d->stt), lo, hi)
+        || llm_addr_in((uintptr_t)fn_addr(&d->tts), lo, hi)
+        || llm_addr_in((uintptr_t)fn_addr(&d->chunk), lo, hi)
+        || llm_addr_in((uintptr_t)d->user, lo, hi))
+      n++;
+
+  return(n);
+}
+
 // A request's callbacks belong to whoever asked for the completion, and
 // that requester can be unloaded while its answer is still in flight —
 // a `/plugin reload` of a chat plugin mid-stream. Nothing else can see
@@ -3443,6 +3493,16 @@ llm_addr_in(uintptr_t addr, uintptr_t lo, uintptr_t hi)
 // The wait is bounded: a quiescence barrier and an audit still stand
 // between here and the dlclose, and naming a stuck consumer callback is
 // more use than blocking the loader on it forever.
+//
+// ⚠ The wait is over the delivery LIST, never over the orphan count.
+// llm_delivery_take unlinks a request from llm_active_head *before* it
+// calls the consumer, so a requester whose last request has just been
+// taken is invisible to the sweep above while executing inside the
+// mapping: the count is 0 and the only thing standing between that
+// thread and dlclose is this drain (root TODO.md §SC-OBSERVED OBS-33).
+// And the list is what keeps that honest — waiting on the bare
+// llm_delivering count would park every plugin unload in the daemon
+// behind any LLM delivery anywhere.
 static void
 llm_unmap_cb(uintptr_t lo, uintptr_t hi, void *data)
 {
@@ -3485,19 +3545,21 @@ llm_unmap_cb(uintptr_t lo, uintptr_t hi, void *data)
     orphaned++;
   }
 
-  if(orphaned > 0)
+  stuck = llm_delivery_into_locked(lo, hi);
+
+  if(stuck > 0)
   {
     clock_gettime(CLOCK_REALTIME, &deadline);
     deadline.tv_sec += LLM_UNMAP_DRAIN_SECS;
 
-    while(llm_delivering > 0)
+    while(llm_delivery_into_locked(lo, hi) > 0)
     {
       if(pthread_cond_timedwait(&llm_active_cond, &llm_active_mutex,
           &deadline) == ETIMEDOUT)
         break;
     }
 
-    stuck = llm_delivering;
+    stuck = llm_delivery_into_locked(lo, hi);
   }
 
   pthread_mutex_unlock(&llm_active_mutex);
@@ -3507,9 +3569,9 @@ llm_unmap_cb(uintptr_t lo, uintptr_t hi, void *data)
         "to an unload; they will complete and deliver nothing", orphaned);
 
   if(stuck > 0)
-    clam(CLAM_WARN, "llm", "%u consumer callback(s) still running after "
-        "%u s; the unload proceeds without them", stuck,
-        LLM_UNMAP_DRAIN_SECS);
+    clam(CLAM_WARN, "llm", "%u consumer callback(s) still running inside "
+        "the departing mapping after %u s; the unload proceeds without "
+        "them", stuck, LLM_UNMAP_DRAIN_SECS);
 }
 
 // curl_request_cancel() is called with llm_active_mutex held, here and
