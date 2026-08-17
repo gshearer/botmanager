@@ -22,6 +22,7 @@
 #include "indicators.h"
 #include "market.h"
 #include "strategy.h"
+#include "warm_chain.h"
 #include "warmup.h"
 #include "whenmoon.h"
 
@@ -825,35 +826,47 @@ wm_aggregator_load_history(whenmoon_state_t *st, const char *market_id_str,
   pthread_rwlock_unlock(&st->markets->arr_lock);
 }
 
-// Thin task wrapper: replays then frees its heap ctx. Used for the
-// feed-only / no-strategy warm (full ring); the strategy path calls
-// wm_aggregator_load_history directly from the convergence re-check.
+// Thin task wrapper: replays, then ends its chain (which frees the heap
+// ctx). Used for the feed-only / no-strategy warm (full ring); the
+// strategy path calls wm_aggregator_load_history directly from the
+// convergence re-check. This is the expensive of OBS-43's two chains —
+// a full 1m ring is 288,000 bars, and one measured replay ran 27.5 s.
 void
 wm_aggregator_load_history_task(task_t *t)
 {
+  wm_warm_chain_t *chain;
   wm_warmup_ctx_t *wctx;
 
   if(t == NULL)
     return;
 
-  wctx = t->data;
+  chain    = t->data;
+  t->state = TASK_ENDED;
 
-  if(wctx == NULL)
+  if(chain == NULL)
+    return;
+
+  // OBS-43: enter BEFORE the warmup slot is acquired, so the drain path
+  // never holds one. A leaked slot permanently lowers
+  // WM_WARMUP_MAX_CONCURRENT for the life of the daemon and every later
+  // warmup then re-defers forever.
+  if(!wm_warm_chain_enter(chain))
   {
-    t->state = TASK_ENDED;
+    wm_warm_chain_close(chain);
     return;
   }
 
+  wctx = wm_warm_chain_ctx(chain);
+
   // STEP 1 (WM-WARMUP-HERD-1): bound concurrent full-ring replays. Over
-  // the cap, re-defer this same task (ctx stays heap-owned) rather than
+  // the cap, re-arm this same chain (ctx stays chain-owned) rather than
   // landing another remote-DB fetch on the herd.
   if(!wm_warmup_try_acquire())
   {
-    if(task_add_deferred("wm_warmup", TASK_ANY, 200, WM_WARMUP_DEFER_MS,
-           wm_aggregator_load_history_task, wctx) == TASK_HANDLE_NONE)
-      mem_free(wctx);   // couldn't reschedule — drop rather than leak
+    if(!wm_warm_chain_arm(chain, "wm_warmup", WM_WARMUP_DEFER_MS,
+        wm_aggregator_load_history_task))
+      wm_warm_chain_close(chain);
 
-    t->state = TASK_ENDED;
     return;
   }
 
@@ -862,6 +875,5 @@ wm_aggregator_load_history_task(task_t *t)
 
   wm_warmup_release();
 
-  mem_free(wctx);
-  t->state = TASK_ENDED;
+  wm_warm_chain_close(chain);
 }

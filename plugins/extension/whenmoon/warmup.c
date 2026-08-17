@@ -8,6 +8,7 @@
 #include "market.h"
 #include "strategy.h"
 #include "warmup.h"
+#include "warm_chain.h"
 #include "dl_coverage.h"
 #include "dl_jobtable.h"
 
@@ -21,8 +22,10 @@
 #include <string.h>
 
 // Heap context carried (and re-owned) across the self-rescheduling
-// convergence re-check deferred task. The single in-flight task owns it
-// and frees it when it stops. The market is identified by canonical id
+// convergence re-check deferred task. The chain owns it — see
+// warm_chain.h — and wm_warm_chain_close is the one place it is freed,
+// whether the market promoted, retired, or a stop() drained the chain
+// out from under it. The market is identified by canonical id
 // (re-resolved each tick) plus the warmup generation it belongs to, so a
 // stopped market or a superseding warmup_begin retires the timer.
 //
@@ -195,8 +198,10 @@ wm_warm_set_state(whenmoon_market_t *mk, wm_warmup_state_t s)
 static void
 wm_market_warmup_recheck_task(task_t *t)
 {
+  wm_warm_chain_t     *chain;
   wm_warm_timer_ctx_t *ctx;
   whenmoon_market_t   *mk;
+  pthread_rwlock_t    *arr;
   int64_t              lookback;
   int64_t              ring_ms;
   int64_t              eff;
@@ -206,32 +211,46 @@ wm_market_warmup_recheck_task(task_t *t)
   if(t == NULL)
     return;
 
-  ctx = t->data;
+  chain    = t->data;
+  t->state = TASK_ENDED;
 
-  if(ctx == NULL)
+  if(chain == NULL)
+    return;
+
+  // OBS-43: enter BEFORE anything of the plugin's is touched — above
+  // all before arr_lock below. A body that takes the container lock and
+  // only then discovers a drain is in progress has already touched the
+  // state the drain is holding stop() open to protect.
+  if(!wm_warm_chain_enter(chain))
   {
-    t->state = TASK_ENDED;
+    wm_warm_chain_close(chain);
     return;
   }
+
+  ctx = wm_warm_chain_ctx(chain);
 
   // WM-MKT-ARR-UAF-1: wm_warm_timer_live returns a bare mk; hold rdlock
   // across the call and ALL use of mk below (until this task ends), so a
   // concurrent market remove cannot free the session under us.
   if(ctx->st == NULL || ctx->st->markets == NULL)
   {
-    mem_free(ctx);
-    t->state = TASK_ENDED;
+    wm_warm_chain_close(chain);
     return;
   }
 
-  pthread_rwlock_rdlock(&ctx->st->markets->arr_lock);
+  // Cache the container lock: past a successful wm_warm_chain_arm the
+  // next hop may already be running and may already have closed the
+  // chain, so nothing below an arm may dereference `ctx` again — not
+  // even to find the lock it still has to release.
+  arr = &ctx->st->markets->arr_lock;
+
+  pthread_rwlock_rdlock(arr);
   mk = wm_warm_timer_live(ctx);
 
   if(mk == NULL)
   {
-    pthread_rwlock_unlock(&ctx->st->markets->arr_lock);
-    mem_free(ctx);
-    t->state = TASK_ENDED;
+    pthread_rwlock_unlock(arr);
+    wm_warm_chain_close(chain);
     return;
   }
 
@@ -276,13 +295,15 @@ wm_market_warmup_recheck_task(task_t *t)
         mk->market_id_str, wm_warmup_active_count(),
         WM_WARMUP_MAX_CONCURRENT);
 
-    if(task_add_deferred("wm_warm_recheck", TASK_ANY, 200,
-           WM_WARM_RECHECK_INTERVAL_MS, wm_market_warmup_recheck_task, ctx)
-           == TASK_HANDLE_NONE)
-      mem_free(ctx);
+    if(!wm_warm_chain_arm(chain, "wm_warm_recheck",
+           WM_WARM_RECHECK_INTERVAL_MS, wm_market_warmup_recheck_task))
+    {
+      pthread_rwlock_unlock(arr);
+      wm_warm_chain_close(chain);
+      return;
+    }
 
-    pthread_rwlock_unlock(&ctx->st->markets->arr_lock);
-    t->state = TASK_ENDED;
+    pthread_rwlock_unlock(arr);
     return;
   }
 
@@ -305,9 +326,8 @@ wm_market_warmup_recheck_task(task_t *t)
     // one global sweep keyed on the candle table, and it picks this market
     // up on its next tick now that the state is READY.
 
-    pthread_rwlock_unlock(&ctx->st->markets->arr_lock);
-    mem_free(ctx);
-    t->state = TASK_ENDED;
+    pthread_rwlock_unlock(arr);
+    wm_warm_chain_close(chain);
     return;
   }
 
@@ -322,20 +342,27 @@ wm_market_warmup_recheck_task(task_t *t)
 
   ctx->iters++;
 
-  if(task_add_deferred("wm_warm_recheck", TASK_ANY, 200,
-         WM_WARM_RECHECK_INTERVAL_MS, wm_market_warmup_recheck_task, ctx)
-         == TASK_HANDLE_NONE)
+  if(!wm_warm_chain_arm(chain, "wm_warm_recheck",
+         WM_WARM_RECHECK_INTERVAL_MS, wm_market_warmup_recheck_task))
   {
-    clam(CLAM_WARN, WHENMOON_CTX,
-        "warmup %s: recheck reschedule failed — stuck warming",
-        mk->market_id_str);
-    mem_free(ctx);
+    // DEBUG, not WARN: since OBS-43 a refused arm has two meanings, and
+    // the common one is correct behaviour — stop() is draining and this
+    // chain is meant to end here. A warning that fires on every clean
+    // unload is the mistake core/plugin.c:361 documents having made for
+    // 1,739 lines.
+    clam(CLAM_DEBUG, WHENMOON_CTX,
+        "warmup %s: recheck not rescheduled (shutting down or submit"
+        " failed)", mk->market_id_str);
+
+    // WM-MKT-ARR-UAF-1: last use of mk done — release the container
+    // rdlock BEFORE the close; the close is not a substitute for it.
+    pthread_rwlock_unlock(arr);
+    wm_warm_chain_close(chain);
+    return;
   }
 
   // WM-MKT-ARR-UAF-1: last use of mk done — release the container rdlock.
-  pthread_rwlock_unlock(&ctx->st->markets->arr_lock);
-
-  t->state = TASK_ENDED;
+  pthread_rwlock_unlock(arr);
 }
 
 // --------------------------------------------------------------------
@@ -513,6 +540,7 @@ wm_market_warmup_begin(whenmoon_state_t *st, whenmoon_market_t *mk)
   int64_t              now;
   uint32_t             gen;
   wm_warm_timer_ctx_t *ctx;
+  wm_warm_chain_t     *chain;
 
   if(st == NULL || mk == NULL)
     return;
@@ -532,15 +560,21 @@ wm_market_warmup_begin(whenmoon_state_t *st, whenmoon_market_t *mk)
     // indicators + charts populate, then READY. Nothing gates on advice
     // because no strategy emits any.
     wm_warmup_ctx_t *lc = mem_alloc("whenmoon", "warmup_ctx", sizeof(*lc));
+    wm_warm_chain_t *chain;
 
     lc->st             = st;
     snprintf(lc->market_id_str, sizeof(lc->market_id_str), "%s",
         mk->market_id_str);
     lc->limit_override = 0;
 
-    if(task_add_deferred("wm_warmup", TASK_ANY, 200, 50,
-           wm_aggregator_load_history_task, lc) == TASK_HANDLE_NONE)
+    chain = wm_warm_chain_open(lc, mem_free);
+
+    if(chain == NULL)
       mem_free(lc);
+
+    else if(!wm_warm_chain_arm(chain, "wm_warmup", 50,
+        wm_aggregator_load_history_task))
+      wm_warm_chain_close(chain);
 
     wm_warm_set_state(mk, WM_WARM_READY);
 
@@ -571,11 +605,20 @@ wm_market_warmup_begin(whenmoon_state_t *st, whenmoon_market_t *mk)
   snprintf(ctx->market_id_str, sizeof(ctx->market_id_str), "%s",
       mk->market_id_str);
 
-  if(task_add_deferred("wm_warm_recheck", TASK_ANY, 200,
-         WM_WARM_RECHECK_INTERVAL_MS, wm_market_warmup_recheck_task, ctx)
-         == TASK_HANDLE_NONE)
+  chain = wm_warm_chain_open(ctx, mem_free);
+
+  if(chain == NULL)
   {
     mem_free(ctx);
+    clam(CLAM_WARN, WHENMOON_CTX,
+        "warmup %s: recheck not scheduled (plugin stopping) — stuck"
+        " warming", mk->market_id_str);
+  }
+
+  else if(!wm_warm_chain_arm(chain, "wm_warm_recheck",
+      WM_WARM_RECHECK_INTERVAL_MS, wm_market_warmup_recheck_task))
+  {
+    wm_warm_chain_close(chain);
     clam(CLAM_WARN, WHENMOON_CTX,
         "warmup %s: recheck schedule failed — stuck warming",
         mk->market_id_str);

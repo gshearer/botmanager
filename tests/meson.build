@@ -90,6 +90,23 @@ test_hold = executable('test_hold',
   dependencies : core_deps,
 )
 
+# whenmoon's barrier for a deferred task that re-arms itself. A drain
+# that returns while a body is still inside the plugin is a dlclose over
+# live code and says nothing at the time — OBS-43 crashed a reload
+# months after the chain was written. warm_chain.c includes no whenmoon
+# header (that is the property the scheme rests on), so this suite
+# compiles the one file directly; libcore is for the REAL task queues,
+# and since no worker pool is started here a deferred sits in the timer
+# queue and nothing runs it — exactly the determinism a drain test wants.
+test_warm_chain = executable('test_warm_chain',
+  'test_warm_chain.c',
+  '../plugins/extension/whenmoon/warm_chain.c',
+  include_directories : [include_directories('.'), inc_include,
+                         include_directories('../plugins/extension/whenmoon')],
+  link_with : [test_harness, libcore],
+  dependencies : core_deps,
+)
+
 # The FACT-1 ladder is SQL, so its suite drives psql against the
 # configured database inside a rolled-back transaction, and SKIPs when
 # that database is unreachable. It needs no core symbols — only the
@@ -279,6 +296,7 @@ test('irc_parse', test_irc_parse)
 test('db_txn', test_db_txn)
 test('cooldown', test_cooldown)
 test('hold', test_hold)
+test('warm_chain', test_warm_chain)
 test('fact_merge', test_fact_merge)
 test('kv_bot', test_kv_bot)
 test('kv_str', test_kv_str)

@@ -17,6 +17,7 @@
 #include "mw.h"
 #include "strategy.h"
 #include "sweep.h"
+#include "warm_chain.h"
 #include "warmup.h"
 #include "wm_exch_query.h"
 
@@ -483,6 +484,10 @@ whenmoon_init(void)
   memset(st, 0, sizeof(*st));
   whenmoon_state = st;
 
+  // A fresh life re-enables warmup arming: the previous life's stop()
+  // left the chain registry closed on its way out (warm_chain.h).
+  wm_warm_chain_reset();
+
   // Order: markets container first (no DB or KV reads), then account,
   // then downloader DDL + scheduler. wm_market_restore runs in
   // whenmoon_start (post-kv_load) so plugin KV reads have settled.
@@ -789,12 +794,17 @@ whenmoon_start(void)
 // running sweep has worker threads inside this plugin's .text and has
 // cached strategy function pointers for the length of an iteration —
 // no default teardown makes unmapping that safe, so the refusal is
-// ours to make. Everything else whenmoon owns (periodic tasks, the
-// supervisor tick, marketwatch pairs) is cancelled and drained on the
-// deinit path below.
+// ours to make.
+//
+// The order below is load-bearing. Every step that can REFUSE comes
+// first, cheapest first, because a stop() that returns FAIL leaves the
+// plugin running and intact (core/plugin.c:305) — so nothing may have
+// been destroyed by the time one of them says no. The unconditional
+// cancels come last, after the last possible refusal.
 static bool
 whenmoon_stop(void)
 {
+  char     offender[TASK_NAME_SZ];
   uint32_t sweeps = wm_bt_sweep_active_count();
 
   if(sweeps > 0)
@@ -803,6 +813,30 @@ whenmoon_stop(void)
         "stop refused: %u backtest sweep(s) still running", sweeps);
     return(FAIL);
   }
+
+  // OBS-43: the warmup chains re-arm themselves and kept no handle, so
+  // nothing could end them — deinit() then destroyed the markets rwlock
+  // under a replay that was still holding it. Core's barrier cannot
+  // cover this: its pre-deinit pass skips a task that has not started,
+  // and its post-deinit pass waits a fixed budget a long replay
+  // outlasts (measured: a 288,000-bar full-ring warm ran 27.5 s against
+  // core's 5 s).
+  if(!wm_warm_chain_drain(WM_WARM_DRAIN_MS, offender, sizeof(offender)))
+  {
+    clam(CLAM_WARN, WHENMOON_CTX,
+        "stop refused: warmup task '%s' still running after %u ms — every"
+        " cancelled chain has been re-armed, the plugin is untouched,"
+        " retry", offender, WM_WARM_DRAIN_MS);
+    return(FAIL);
+  }
+
+  // Nothing below can refuse, so these are unconditional. Cancel in
+  // stop(), never in deinit() (OBS-34) — each is idempotent (verified
+  // per site) and each is still called from the deinit path for the
+  // lives where stop() never ran: an init()-failure unload, or
+  // plugin_stop_all() ordering.
+  wm_warm_tailfill_global_destroy();
+  mw_stop();
 
   return(SUCCESS);
 }

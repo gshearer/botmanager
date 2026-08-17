@@ -14,7 +14,14 @@
 //     carries the `@<strategy>` instance suffix). A self-rescheduling
 //     DEFERRED task guarded by whenmoon_market.warmup_gen (see market.h),
 //     so a stopped market or a superseding warmup_begin retires it. It
-//     ends for good once the market is promoted to READY. No task_cancel.
+//     ends when the market is promoted to READY — or when whenmoon_stop
+//     drains it. OBS-43: it used to end ONLY the first way, and that
+//     sentence was the defect written down as an intention. A deferred
+//     that re-arms itself and keeps no handle cannot be cancelled by
+//     anyone, so deinit() destroyed the markets rwlock under a body that
+//     was still holding it. Both warmup timers are now wm_warm_chain_t —
+//     arm through wm_warm_chain_arm or do not arm — and warm_chain.h is
+//     where their lifecycle lives.
 //
 //   * Authoritative tail-fill — WM-TAILFILL-COALESCE-1: ONE GLOBAL
 //     periodic task for the whole plugin, NOT one per session. The work
