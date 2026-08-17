@@ -504,8 +504,9 @@ claude_pending_deliver(task_t *t)
     return;
   }
 
-  // Snapshot KV strings into locals — kv_get_str hands back internal
-  // storage that an operator /set kv could invalidate mid-send.
+  // Snapshot the three keys into locals so the send reads one
+  // consistent set: an operator /set kv between two reads would
+  // otherwise deliver half of the previous pending reply.
   network[0] = '\0';
   target[0]  = '\0';
   path[0]    = '\0';

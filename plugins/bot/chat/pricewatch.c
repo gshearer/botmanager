@@ -883,14 +883,14 @@ cmd_pricewatch(const cmd_ctx_t *ctx)
   cmd_reply(ctx, ack);
 }
 
-// Columns 0..5 are what the renderer reads; both listing queries below
-// produce exactly this shape.
+// Columns 0..5 are what the renderer reads; the listing query below
+// produces exactly this shape.
 #define PRICEWATCH_LIST_COLS \
     "id, pair, dir, threshold, channel," \
-    " (fired_at IS NOT NULL), COALESCE(NULLIF(nickname,''), sender)"
+    " (fired_at IS NOT NULL)"
 
 static void
-pricewatch_render(const cmd_ctx_t *ctx, const db_result_t *res, bool with_who)
+pricewatch_render(const cmd_ctx_t *ctx, const db_result_t *res)
 {
   for(uint32_t i = 0; i < res->rows; i++)
   {
@@ -898,7 +898,6 @@ pricewatch_render(const cmd_ctx_t *ctx, const db_result_t *res, bool with_who)
     char        id   [24];
     char        pair [EXCHANGE_PRODUCT_ID_SZ];
     char        venue[METHOD_CHANNEL_SZ];
-    char        who  [160] = "";
     char        num  [48];
     char        line [320];
 
@@ -907,16 +906,8 @@ pricewatch_render(const cmd_ctx_t *ctx, const db_result_t *res, bool with_who)
     pricewatch_copy_col(venue, sizeof(venue), res, i, 4);
     pricewatch_fmt_price(pricewatch_col_f64(res, i, 3), num, sizeof(num));
 
-    if(with_who)
-    {
-      char nick[METHOD_SENDER_SZ];
-
-      pricewatch_copy_col(nick, sizeof(nick), res, i, 6);
-      snprintf(who, sizeof(who), CLR_CYAN "%s" CLR_RESET " ", nick);
-    }
-
-    snprintf(line, sizeof(line), "  " CLR_BOLD "%s" CLR_RESET "  %s%s %s %s"
-        "  %s%s", id, who, pair,
+    snprintf(line, sizeof(line), "  " CLR_BOLD "%s" CLR_RESET "  %s %s %s"
+        "  %s%s", id, pair,
         pricewatch_dir_word(pricewatch_col_i64(res, i, 2, PRICEWATCH_BELOW)),
         num, venue[0] != '\0' ? venue : "DM",
         (fired != NULL && (fired[0] == 't' || fired[0] == 'T'))
@@ -971,7 +962,7 @@ cmd_pricewatch_list(const cmd_ctx_t *ctx)
   else
   {
     cmd_reply(ctx, "price watches:");
-    pricewatch_render(ctx, res, false);
+    pricewatch_render(ctx, res);
   }
 
   db_result_free(res);

@@ -480,8 +480,7 @@ kw_rag_cb(const knowledge_chunk_t *chunks, size_t n, void *user)
         chunks[i].section_heading[0] ? "[" : "",
         chunks[i].section_heading,
         chunks[i].section_heading[0] ? "] " : "",
-        (int)(sizeof(line) > 256 ? 256 : sizeof(line) - 1),
-        chunks[i].text);
+        256, chunks[i].text);
     method_send(inst, st->target, line);
   }
 

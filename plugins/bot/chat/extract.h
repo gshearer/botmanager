@@ -14,10 +14,9 @@
 // response, validates each candidate fact, and writes accepted facts
 // through memory_upsert_dossier_fact.
 //
-// Chunk F-1 (this revision) lands only the plumbing: init/exit, KV
-// registration hooks, a stub run_once that returns 0, and stats
-// counters. Real extraction (F-2), scheduling + high-water mark (F-3),
-// and the admin command + docs (F-4) land in follow-up chunks.
+// The sweep runs itself: extract_schedule gives a bot one periodic
+// task (extract_sweep_task_cb) that calls extract_run_once on the
+// interval the bot's KV asks for; extract_unschedule takes it away.
 //
 // Concurrency: extract_init / extract_exit are single-threaded. All
 // other public entry points are safe to call from any task thread

@@ -292,9 +292,8 @@ reachy_wait_for(reachy_state_t *st, reachy_wait_t *p, uint32_t ms)
 // Instance KV readers
 // ----------------------------------------------------------------------
 
-// kv_get_str hands back internal storage that is only valid until the
-// value changes, so every read copies out immediately — which is also
-// why there is no reachy_kv_str returning a borrowed pointer.
+// Copies out into the caller's fixed-size buffer, and answers a missing
+// or non-KV_STR key with an empty string rather than NULL.
 static void
 reachy_kv_copy(const reachy_state_t *st, const char *suffix, char *out,
     size_t cap)

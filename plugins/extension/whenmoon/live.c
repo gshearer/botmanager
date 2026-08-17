@@ -1931,8 +1931,6 @@ wm_live_disc_freeze_check(const char *filled_market_id_str)
   if(deposit <= 0.0 || frac <= 0.0)
     return;
 
-  // kv_get_str points at internal storage valid only until the value
-  // changes — copy before parsing.
   val = kv_get_str(WM_DISC_KV_MARKETS);
 
   if(val == NULL || val[0] == '\0')

@@ -783,9 +783,8 @@ chatbot_names_resolve(const char *botname, const method_msg_t *msg,
 
   if(list == NULL || list[0] == '\0') return;
 
-  // Copied out whole before it is touched: kv_get_str hands back
-  // internal storage valid only until the value changes, and strtok_r
-  // writes into what it walks.
+  // Copied out whole before it is touched: strtok_r writes into what it
+  // walks, and what it would walk here is the KV's own string.
   snprintf(copy, sizeof(copy), "%s", list);
 
   for(char *tok = strtok_r(copy, ",", &save);

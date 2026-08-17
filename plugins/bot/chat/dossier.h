@@ -86,10 +86,11 @@ typedef struct
   uint32_t     message_count;
 } dossier_info_t;
 
-// Subsystem statistics snapshot.
+// Subsystem statistics snapshot. Every counter is since dossier_init()
+// zeroed it, so a plugin reload restarts all five from zero.
 typedef struct
 {
-  uint64_t  resolves;      // lifetime dossier_resolve() calls
+  uint64_t  resolves;      // dossier_resolve() calls
   uint64_t  creates;       // dossiers created (resolve miss + create)
   uint64_t  sightings;     // sightings recorded (matches + new rows)
   uint64_t  merges;        // dossiers merged (absorbed rows)

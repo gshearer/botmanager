@@ -49,8 +49,8 @@ reachycmd_bot_prefix(const cmd_ctx_t *ctx, char *out, size_t cap)
   return(SUCCESS);
 }
 
-// kv_get_str hands back internal storage only valid until the value
-// changes, so a read copies out immediately.
+// Copies out into the caller's fixed-size buffer, and answers a missing
+// or non-KV_STR key with an empty string rather than NULL.
 static void
 reachycmd_kv_copy(const char *prefix, const char *suffix, char *out,
     size_t cap)

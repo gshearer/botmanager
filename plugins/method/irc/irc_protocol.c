@@ -4,7 +4,6 @@
 #define IRC_INTERNAL
 #include "irc.h"
 
-// PRIVMSG builder with 512-byte line splitting (IRC RFC 2812).
 // Raw IRC line send: format, append CRLF, write to the session.
 // Callers use irc_send_privmsg / irc_send_emote for IRC-specific wrappers;
 // this helper exists for bare protocol commands (NICK, USER, JOIN, ...).
@@ -57,6 +56,7 @@ irc_send_raw(irc_state_t *st, const char *fmt, ...)
   return(SUCCESS);
 }
 
+// PRIVMSG builder with 512-byte line splitting (IRC RFC 2812).
 bool
 irc_send_privmsg(irc_state_t *st, const char *target, const char *text)
 {

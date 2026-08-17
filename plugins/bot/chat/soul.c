@@ -1646,7 +1646,7 @@ soul_exit(void)
 
 // The soul's own durable state — the claim ledger every chore dedups
 // against. Deferred work lives in chat_deferred and deferred.c raises
-// it. The chat DDL discipline (memory_ensure_tables): owner-run
+// it. The chat DDL discipline (memory_ensure_schema): owner-run
 // idempotent batches at plugin start(), after dossier_register_config
 // so the dossier(id) FK target exists.
 void

@@ -151,10 +151,10 @@ cb_load_cdp_key_locked(EVP_PKEY **out)
   if(out == NULL)
     return(FAIL);
 
-  // kv_get_str returns the same pointer for repeat reads, but the
-  // backing string mutates on kv_set; the snapshot compare is cheap
-  // and decisive. Read under admin context — secret-tier KV would
-  // otherwise hand back KV_REDACTED_VALUE.
+  // A kv_set installs a different string rather than rewriting this
+  // one, so the snapshot compare below is what notices a rotated key.
+  // Read under admin context — secret-tier KV would otherwise hand
+  // back KV_REDACTED_VALUE.
   kv_admin_context_set(true);
   pem = kv_get_str("plugin.coinbase.creds.private_key_pem");
   kv_admin_context_set(false);
