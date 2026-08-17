@@ -456,6 +456,10 @@ typedef struct
   uint32_t       max_ticks; // ticks it was minted with
   uint32_t       ticks;     // ticks already taken
   bool           expired;   // this is the last tick it will ever take
+  // Past expires_at — one cadence beyond the last tick it was ever
+  // scheduled for. Only a row nobody serviced can be here, so it says
+  // "this wound is over" whatever stranded it.
+  bool           stale;
 } atk_dot_due_t;
 
 // One decay tick, resolved and ready to be written. `dmg` is this tick's
@@ -816,6 +820,12 @@ uint32_t atk_db_dot_live(void);
 // Without this the idle counter could never reach zero.
 bool atk_db_dot_sweep(void);
 
+// Retire every live affliction already past expires_at — a row stranded
+// by a reload or a restart, which is the only way one gets here. START
+// ONLY: it must never run while the decay task is queued. Returns how
+// many rows it retired.
+uint32_t atk_db_dot_reap_stale(void);
+
 // Retire one affliction the decay task could not act on — an absent
 // method, a victim already dead.
 bool atk_db_dot_cancel(int64_t dot_id);
@@ -958,6 +968,12 @@ const char *atk_dot_emoji_of(atk_dot_kind_t kind);
 const char *atk_dot_color_of(atk_dot_kind_t kind);
 
 // ---- The decay task (attack_dot.c) --------------------------------- //
+
+// Pick up the afflictions a previous incarnation left behind: retire the
+// ones already past expires_at, then queue the task only if a live fight
+// survived. start() is the ONLY caller — the reap is safe precisely
+// because the task cannot be running when it happens.
+void atk_dot_resume(void);
 
 // Start the decay task if it is not already queued, and clear its idle
 // clock either way. Called after an affliction lands, OUTSIDE the turn

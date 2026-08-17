@@ -1715,7 +1715,12 @@ atk_db_dot_due(atk_dot_due_t *out, uint32_t cap)
       // source's class is joined in rather than stored a second time on
       // the row. LEFT, because the wound outlives the bookkeeping: a
       // source whose row is gone simply speaks the neutral lines.
-      " COALESCE(p.class, '')"
+      " COALESCE(p.class, ''),"
+      // expires_at's first and only reader: one cadence past the last
+      // tick this row was ever scheduled for. A row nobody serviced is
+      // the only kind that can be here, and this is what tells the tick
+      // path that waiting for its room is no longer worth anything.
+      " (NOW() > d.expires_at)"
       " FROM %s d JOIN %s r ON r.id = d.round_id"
       " LEFT JOIN %s p ON p.round_id = d.round_id AND p.username = d.source"
       " WHERE d.state = %d AND r.state = %d AND d.next_tick <= NOW()"
@@ -1728,7 +1733,7 @@ atk_db_dot_due(atk_dot_due_t *out, uint32_t cap)
   {
     for(n = 0; n < res->rows && n < cap; n++)
     {
-      const char *expired;
+      const char *flag;
 
       out[n].id       = atk_col_i64(res, n, 0);
       out[n].round_id = atk_col_i64(res, n, 1);
@@ -1744,8 +1749,8 @@ atk_db_dot_due(atk_dot_due_t *out, uint32_t cap)
       out[n].kind = (atk_dot_kind_t)atk_col_i32(res, n, 9);
 
       // Postgres renders a boolean as 't' or 'f'.
-      expired = db_result_get(res, n, 10);
-      out[n].expired = (expired != NULL && expired[0] == 't');
+      flag           = db_result_get(res, n, 10);
+      out[n].expired = (flag != NULL && flag[0] == 't');
 
       atk_col_str(out[n].noun, sizeof(out[n].noun), res, n, 11);
 
@@ -1755,6 +1760,9 @@ atk_db_dot_due(atk_dot_due_t *out, uint32_t cap)
       out[n].ticks     = (uint32_t)atk_col_i32(res, n, 15);
 
       atk_col_str(out[n].class, sizeof(out[n].class), res, n, 16);
+
+      flag         = db_result_get(res, n, 17);
+      out[n].stale = (flag != NULL && flag[0] == 't');
     }
   }
 
@@ -1803,6 +1811,31 @@ atk_db_dot_sweep(void)
       ATK_ROUND_ACTIVE);
 
   return(atk_exec(sql, "dot sweep", NULL));
+}
+
+// The first reader expires_at has ever had. A row the decay task never
+// serviced is over one cadence past its last scheduled tick, and this
+// judges it. Called ONLY from start(), where the task is by definition
+// not running — which is what makes it safe: a healthy backlog behind
+// ATK_DOT_BATCH can never be reaped by it.
+uint32_t
+atk_db_dot_reap_stale(void)
+{
+  atk_tables_t t;
+  char         sql[256];
+  uint32_t     affected = 0;
+
+  if(atk_tables_resolve(&t) != SUCCESS)
+    return(0);
+
+  snprintf(sql, sizeof(sql),
+      "UPDATE %s SET state = %d WHERE state = %d AND expires_at < NOW()",
+      t.dots, ATK_DOT_CANCELLED, ATK_DOT_LIVE);
+
+  if(atk_exec(sql, "dot reap", &affected) != SUCCESS)
+    return(0);
+
+  return(affected);
 }
 
 bool

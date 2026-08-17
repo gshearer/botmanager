@@ -42,23 +42,14 @@ atk_dot_room(const atk_dot_due_t *d)
 // Announce, and — only on a death — open the door. The order below is
 // the plugin's one law, and it is easier to get wrong here than on the
 // turn path because there is no cmd_reply() to hide behind.
+//
+// CONSUMES `inst`: the caller resolved it, this releases it on every path.
 static void
 atk_dot_speak(const atk_dot_due_t *d, const atk_tunables_t *t,
-    const char *line, bool fatal)
+    method_inst_t *inst, const char *line, bool fatal)
 {
-  method_inst_t *inst = atk_dot_room(d);
   method_eject_t force = METHOD_EJECT_NONE;
   char           reason[128];
-
-  if(inst == NULL)
-  {
-    // A fatal tick already marked the row spent and closed the round;
-    // only a survivable one is still live enough to cancel.
-    if(!fatal)
-      atk_db_dot_cancel(d->id);
-
-    return;
-  }
 
   method_send(inst, d->channel, line);
 
@@ -98,6 +89,7 @@ atk_dot_speak(const atk_dot_due_t *d, const atk_tunables_t *t,
 static void
 atk_dot_service(const atk_dot_due_t *d, const atk_tunables_t *t)
 {
+  method_inst_t *inst;
   atk_player_t  victim;
   atk_dot_hit_t hit;
   atk_move_t    move;
@@ -109,6 +101,28 @@ atk_dot_service(const atk_dot_due_t *d, const atk_tunables_t *t)
   int32_t       new_hp;
   bool          fatal;
 
+  // The room is resolved BEFORE the tick is charged, and OUTSIDE the turn
+  // lock so this file never holds it across a method call. A tick
+  // committed to a victim whose room cannot be addressed is health spent
+  // on a line nobody hears — and on a cold boot EVERY room is missing,
+  // because plugin_start_all() runs a whole bot_restore() ahead of the
+  // first method_register() and a periodic's first iteration fires
+  // immediately.
+  inst = atk_dot_room(d);
+
+  if(inst == NULL)
+  {
+    // Not yet, or never? expires_at is the plugin's own answer. Before it
+    // the room may simply not be up yet: leave the row completely
+    // untouched — no tick, no cancel, no deadline move — and the next
+    // iteration finds it again. After it the wound is over however the
+    // room went, and holding it live would keep the task off its linger.
+    if(d->stale)
+      atk_db_dot_cancel(d->id);
+
+    return;
+  }
+
   pthread_mutex_lock(&atk_turn_lock);
 
   // A victim already cooling took their death from someone else's blade
@@ -116,6 +130,7 @@ atk_dot_service(const atk_dot_due_t *d, const atk_tunables_t *t)
   if(!atk_db_player_get(d->round_id, d->victim, &victim) || victim.hp <= 0)
   {
     pthread_mutex_unlock(&atk_turn_lock);
+    method_release(inst);
     atk_db_dot_cancel(d->id);
     return;
   }
@@ -154,6 +169,7 @@ atk_dot_service(const atk_dot_due_t *d, const atk_tunables_t *t)
     // concerned it never happened. The deadline has not moved, so the
     // next iteration tries again.
     pthread_mutex_unlock(&atk_turn_lock);
+    method_release(inst);
     return;
   }
 
@@ -177,7 +193,7 @@ atk_dot_service(const atk_dot_due_t *d, const atk_tunables_t *t)
 
   pthread_mutex_unlock(&atk_turn_lock);
 
-  atk_dot_speak(d, t, line, fatal);
+  atk_dot_speak(d, t, inst, line, fatal);
 }
 
 // ------------------------------------------------------------------ //
@@ -246,6 +262,32 @@ atk_dot_task_cb(task_t *t)
     clam(CLAM_INFO, ATK_CTX,
         "no afflictions for %" PRIu32 "s — the decay task leaves the queue",
         tun.dot_linger_secs);
+}
+
+// Called from start(). A previous incarnation's afflictions are still in
+// the table and the task that serviced them died with it, so: reap what
+// is past saving, then queue the task only if a real fight survived.
+// The lazy start is deliberate (AGENTS.md §The decay task) — a daemon
+// that has never had an affliction must not carry a periodic for an hour
+// to find that out.
+void
+atk_dot_resume(void)
+{
+  uint32_t reaped = atk_db_dot_reap_stale();
+  uint32_t live   = atk_db_dot_live();
+
+  if(reaped > 0)
+    clam(CLAM_INFO, ATK_CTX,
+        "%" PRIu32 " affliction(s) reaped — stranded past their last tick",
+        reaped);
+
+  if(live == 0)
+    return;
+
+  clam(CLAM_INFO, ATK_CTX,
+      "%" PRIu32 " affliction(s) still live — the decay task resumes", live);
+
+  atk_dot_wake();
 }
 
 void

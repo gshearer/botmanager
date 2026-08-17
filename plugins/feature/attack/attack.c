@@ -220,6 +220,12 @@ atk_start(void)
   clam(CLAM_INFO, ATK_CTX, "%u character class(es) loaded, %u rejected",
       rep.accepted, rep.rejected);
 
+  // Afflictions outlive the mapping that was ticking them, and the task
+  // does not. Never a bare atk_dot_wake() here: a periodic's first
+  // iteration runs IMMEDIATELY, and on a cold boot that lands before any
+  // method instance exists — which cancels the very rows it came to save.
+  atk_dot_resume();
+
   return(SUCCESS);
 }
 
