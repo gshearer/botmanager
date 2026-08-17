@@ -63,6 +63,29 @@ resolve_kv_changed(const char *key, void *data)
   resolve_load_config();
 }
 
+// The budget spans a queue wait and a blocking call, so it is measured on
+// the one clock a settime cannot walk.
+static time_t
+resolve_mono_secs(void)
+{
+  struct timespec ts;
+
+  clock_gettime(CLOCK_MONOTONIC, &ts);
+  return(ts.tv_sec);
+}
+
+// True once the request has outlived core.resolve.timeout, counted from
+// the moment the worker was about to block rather than from submission.
+static bool
+resolve_overdue(const resolve_request_t *req, time_t *elapsed_out)
+{
+  time_t elapsed = resolve_mono_secs() - req->started;
+
+  *elapsed_out = elapsed;
+
+  return(resolve_cfg.timeout > 0 && elapsed > (time_t)resolve_cfg.timeout);
+}
+
 // A/AAAA resolution via getaddrinfo
 
 static void
@@ -71,6 +94,7 @@ resolve_via_getaddrinfo(resolve_request_t *req, resolve_result_t *result)
   struct addrinfo hints, *res, *rp;
   int              rc;
   time_t           elapsed;
+  bool             overdue;
   uint32_t         count;
 
   memset(&hints, 0, sizeof(hints));
@@ -86,28 +110,27 @@ resolve_via_getaddrinfo(resolve_request_t *req, resolve_result_t *result)
 
   rc = getaddrinfo(req->name, NULL, &hints, &res);
 
-  // Check timeout.
-  if(resolve_cfg.timeout > 0)
-  {
-    elapsed = time(NULL) - req->submitted;
+  overdue = resolve_overdue(req, &elapsed);
 
-    if(elapsed > (time_t)resolve_cfg.timeout)
-    {
-      if(rc == 0)
-        freeaddrinfo(res);
-
-      result->status = ETIMEDOUT;
-      result->error  = "DNS resolution timed out";
-      return;
-    }
-  }
-
+  // The budget is consulted on the failure arm only. Nothing here can
+  // shorten the wait -- getaddrinfo has no per-call bound -- so spending
+  // it on a completed answer would not time a lookup out, it would throw
+  // one away.
   if(rc != 0)
   {
-    result->status = rc;
-    result->error  = gai_strerror(rc);
+    result->status = overdue ? ETIMEDOUT : rc;
+    result->error  = overdue ? "DNS resolution timed out" : gai_strerror(rc);
     return;
   }
+
+  // A late answer is still the answer the caller asked for. The WARN is
+  // the whole of the knob's job on this path: it is the only signal that
+  // the resolver is why something was slow.
+  if(overdue)
+    clam(CLAM_WARN, "resolve",
+        "%s %s: answered after %lds, past the %us budget — delivering anyway",
+        resolve_type_name(req->qtype), req->name, (long)elapsed,
+        resolve_cfg.timeout);
 
   // Count results.
   count = 0;
@@ -195,6 +218,7 @@ resolve_via_res_nquery(resolve_request_t *req, resolve_result_t *result)
   int                len;
   int                herr;
   time_t             elapsed;
+  bool               overdue;
   ns_msg             msg;
   int                an_count;
 
@@ -223,21 +247,19 @@ resolve_via_res_nquery(resolve_request_t *req, resolve_result_t *result)
 
   res_nclose(&rs);
 
-  // Check timeout.
-  if(resolve_cfg.timeout > 0)
-  {
-    elapsed = time(NULL) - req->submitted;
+  overdue = resolve_overdue(req, &elapsed);
 
-    if(elapsed > (time_t)resolve_cfg.timeout)
+  // Same split as the getaddrinfo path: the budget decides only how a
+  // failure is reported, never whether an answer survives.
+  if(len < 0)
+  {
+    if(overdue)
     {
       result->status = ETIMEDOUT;
       result->error  = "DNS resolution timed out";
       return;
     }
-  }
 
-  if(len < 0)
-  {
     result->status = herr;
 
     switch(herr)
@@ -251,6 +273,12 @@ resolve_via_res_nquery(resolve_request_t *req, resolve_result_t *result)
 
     return;
   }
+
+  if(overdue)
+    clam(CLAM_WARN, "resolve",
+        "%s %s: answered after %lds, past the %us budget — delivering anyway",
+        resolve_type_name(req->qtype), req->name, (long)elapsed,
+        resolve_cfg.timeout);
 
   // Parse the DNS response.
   if(ns_initparse(answer, len, &msg) < 0)
@@ -457,6 +485,10 @@ resolve_task(task_t *t)
 
   resolve_result_t result;
 
+  // Stamped here, not at submission: the budget is meant to describe the
+  // lookup, and everything before this point is queue.
+  req->started = resolve_mono_secs();
+
   memset(&result, 0, sizeof(result));
   snprintf(result.name, RESOLVE_NAME_SZ, "%s", req->name);
   result.qtype     = req->qtype;
@@ -535,7 +567,6 @@ resolve_lookup(const char *name, resolve_type_t qtype,
   req->qtype     = qtype;
   req->cb        = cb;
   req->user_data = user_data;
-  req->submitted = time(NULL);
 
   // A refused submission is not a lookup: the pool is full and nothing
   // will ever call back, so the request goes back on the freelist and
@@ -1111,7 +1142,10 @@ resolve_register_config(void)
 {
   kv_register("core.resolve.timeout",     KV_UINT32, "10",
       resolve_kv_changed, NULL,
-      "DNS resolution timeout in seconds");
+      "Per-lookup DNS budget in seconds. Bounds the res_nquery path "
+      "(every type but A/AAAA); on the A/AAAA path getaddrinfo takes no "
+      "bound and a late answer is only logged. A socket's connect leg is "
+      "bounded by core.sock.connect_timeout instead");
   kv_register("core.resolve.max_pending", KV_UINT32, "64",
       resolve_kv_changed, NULL,
       "Maximum concurrent pending DNS lookups");

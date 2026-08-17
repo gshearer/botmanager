@@ -560,6 +560,18 @@ sock_resolve_done(const resolve_result_t *result)
   int fd = -1;
   int rc = -1;
 
+  // The connect watchdog covers SOCK_STATE_RESOLVING and defaults to the
+  // same 10 s this leg does, so it can fail and close the session while
+  // the lookup is still out. A late answer must not reopen a session whose
+  // owner has already been told it is dead.
+  if(s->state != SOCK_STATE_RESOLVING)
+  {
+    clam(CLAM_DEBUG, "sock", "[%s] late DNS answer for '%s' — session is %s",
+        s->name, s->host, sock_state_name(s->state));
+    sock_release(s);
+    return;
+  }
+
   if(result->status != 0 || result->count == 0)
   {
     clam(CLAM_WARN, "sock", "[%s] DNS failed for '%s': %s",

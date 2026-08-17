@@ -95,6 +95,14 @@ typedef struct
 typedef void (*resolve_cb_t)(const resolve_result_t *result);
 
 // Thread-safe.
+//
+// core.resolve.timeout is a bound only on the res_nquery path (every type
+// but A/AAAA), where the call site owns the resolver state. A and AAAA go
+// through getaddrinfo, which exposes no per-call bound and on a host whose
+// nsswitch.conf answers `hosts:` from nss-resolve never reaches glibc's DNS
+// code at all -- there the knob only reports a late answer, and what
+// actually bounds the wait is the host's NSS stack. A socket's connect leg
+// is bounded at the caller instead, by core.sock.connect_timeout.
 bool resolve_lookup(const char *name, resolve_type_t qtype,
     resolve_cb_t cb, void *user_data);
 
@@ -145,6 +153,7 @@ void resolve_register_commands(void);
 #include <netinet/in.h>
 #include <resolv.h>
 #include <arpa/nameser.h>
+#include <time.h>
 
 // Maximum records returned from a single query.
 #define RESOLVE_MAX_RECORDS 64
@@ -159,7 +168,8 @@ typedef struct resolve_request
   resolve_type_t          qtype;
   resolve_cb_t            cb;
   void                   *user_data;
-  time_t                  submitted;
+  time_t                  started;    // CLOCK_MONOTONIC secs, stamped by the
+                                      // worker, not at submission
   struct resolve_request *next;
 } resolve_request_t;
 
