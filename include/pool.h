@@ -118,7 +118,17 @@ static pthread_mutex_t  pool_mutex;
 static uint16_t         pool_size = 0;    // alive elastic workers (not parent)
 static uint16_t         pool_idle = 0;    // elastic workers in task_wait
 static uint16_t         pool_peak = 0;    // high-water mark of pool_size
-static bool             pool_stopping = false;
+// _Atomic for the same reason as pool_cfg_t above, and it is the widest
+// instance of it in the tree: pool_shutdown() writes this on whichever
+// thread asked to stop, while every elastic worker loop, the parent
+// loop and every TASK_PERSIST callback in the daemon read it through
+// pool_shutting_down() (measured, TSan 2026-08-17). A one-word flag is
+// a knob like any other -- the reader gets the old value or the new
+// one, and pays at most one more poll interval for the old one.
+static _Atomic bool     pool_stopping = false;
+
+// Not atomic on purpose: written by pool_init() / pool_exit() and read
+// by pool_exit(), all on the main thread.
 static bool             pool_ready = false;
 
 // Separate from elastic pool.

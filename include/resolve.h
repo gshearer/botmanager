@@ -174,10 +174,15 @@ typedef struct resolve_request
   struct resolve_request *next;
 } resolve_request_t;
 
+// _Atomic for the same reason as sock_cfg_t / curl_cfg_t / pool_cfg_t:
+// resolve_load_config() runs on whichever thread set the key, while the
+// submit path reads max_pending and the workers read timeout on their
+// own threads (measured, TSan 2026-08-17). The mutex the cap check
+// holds is not the discipline -- the writer does not take it.
 typedef struct
 {
-  uint32_t timeout;       // per-query timeout in seconds
-  uint32_t max_pending;   // max concurrent resolve tasks
+  _Atomic uint32_t timeout;       // per-query timeout in seconds
+  _Atomic uint32_t max_pending;   // max concurrent resolve tasks
 } resolve_cfg_t;
 
 static bool                resolve_ready    = false;

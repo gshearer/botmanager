@@ -456,7 +456,13 @@ struct method_inst
   char                    name[METHOD_NAME_SZ];
   const method_driver_t  *driver;
   void                   *handle;    // driver-specific state
-  method_state_t          state;
+  _Atomic method_state_t  state;     // method_set_state writes this on a
+                                     // driver thread holding no lock, so the
+                                     // locked readers race it exactly as much
+                                     // as the unlocked ones. _Atomic settles
+                                     // what the load is, not what it means:
+                                     // the view is ADVISORY by design and
+                                     // method_send says so at its check
   uint32_t                refs;
   method_sub_t           *subs;      // subscriber list
   uint32_t                sub_count;
@@ -465,7 +471,9 @@ struct method_inst
   uint64_t                msg_out;   // total messages sent; relaxed __atomic —
                                      // senders hold no lock, readers load
                                      // atomically under method_mutex
-  time_t                  connected_at; // timestamp of METHOD_AVAILABLE, 0 if not
+  _Atomic time_t          connected_at; // timestamp of METHOD_AVAILABLE, 0 if
+                                     // not; written beside `state` and read by
+                                     // the /show methods snapshot
   struct method_inst     *next;
 };
 

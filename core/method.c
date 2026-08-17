@@ -651,8 +651,9 @@ method_connect(method_inst_t *inst)
 bool
 method_send(method_inst_t *inst, const char *target, const char *text)
 {
-  char buf[METHOD_TEXT_SZ];
-  bool rc;
+  char           buf[METHOD_TEXT_SZ];
+  method_state_t state;
+  bool           rc;
 
   if(inst == NULL || target == NULL || text == NULL)
     return(FAIL);
@@ -664,11 +665,17 @@ method_send(method_inst_t *inst, const char *target, const char *text)
     return(FAIL);
   }
 
-  if(inst->state != METHOD_AVAILABLE)
+  // Advisory, and deliberately so: nothing holds a lock across the
+  // check and the send, so the driver may retire one instruction later
+  // and the send is refused downstream instead. One load, so the
+  // refusal names the state it actually tested.
+  state = inst->state;
+
+  if(state != METHOD_AVAILABLE)
   {
     clam(CLAM_WARN, "method_send",
         "'%s': not available (state: %s)",
-        inst->name, method_state_name(inst->state));
+        inst->name, method_state_name(state));
     return(FAIL);
   }
 
@@ -689,17 +696,21 @@ method_send(method_inst_t *inst, const char *target, const char *text)
 bool
 method_send_emote(method_inst_t *inst, const char *target, const char *text)
 {
-  char buf[METHOD_TEXT_SZ];
-  bool rc;
+  char           buf[METHOD_TEXT_SZ];
+  method_state_t state;
+  bool           rc;
 
   if(inst == NULL || target == NULL || text == NULL)
     return(FAIL);
 
-  if(inst->state != METHOD_AVAILABLE)
+  // Advisory for the same reason as method_send's check above.
+  state = inst->state;
+
+  if(state != METHOD_AVAILABLE)
   {
     clam(CLAM_WARN, "method_send_emote",
         "'%s': not available (state: %s)",
-        inst->name, method_state_name(inst->state));
+        inst->name, method_state_name(state));
     return(FAIL);
   }
 
