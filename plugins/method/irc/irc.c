@@ -1806,7 +1806,7 @@ irc_destroy(void *handle)
 // visible to the peer), and neutralises any pending reconnect task
 // so it does not fire after the method has been stopped.
 static void
-irc_disconnect(void *handle)
+irc_disconnect(void *handle, const char *reason)
 {
   irc_state_t    *st = handle;
   sock_session_t *s;
@@ -1839,8 +1839,14 @@ irc_disconnect(void *handle)
 
   if(s != NULL)
   {
+    // The last thing a channel sees of this bot. `reason` carries the
+    // operator's words when /quit supplied any and is empty otherwise;
+    // it reaches the wire verbatim because it was already stripped of
+    // the CR and LF that would end the QUIT early and forge a command
+    // after it (sig_reason_sanitize).
     if(st->connected)
-      irc_send_raw(st, "QUIT :shutting down");
+      irc_send_raw(st, "QUIT :%s",
+          reason[0] != '\0' ? reason : "shutting down");
 
     sock_close(s);
     sock_release(s);

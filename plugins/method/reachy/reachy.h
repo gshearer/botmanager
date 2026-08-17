@@ -343,7 +343,7 @@ static void reachy_posture_wake(const reachy_state_t *);
 static void *reachy_create(const char *);
 static void reachy_destroy(void *);
 static bool reachy_connect(void *);
-static void reachy_disconnect(void *);
+static void reachy_disconnect(void *, const char *);
 static bool reachy_send(void *, const char *, const char *);
 static bool reachy_get_context(void *, const char *, char *, size_t);
 static bool reachy_get_self(void *, char *, size_t);

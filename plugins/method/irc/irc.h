@@ -404,7 +404,7 @@ static void irc_attempt_connect(irc_state_t *st);
 static void *irc_create(const char *inst_name);
 static void irc_destroy(void *handle);
 static bool irc_connect(void *handle);
-static void irc_disconnect(void *handle);
+static void irc_disconnect(void *handle, const char *reason);
 static bool irc_send(void *handle, const char *target, const char *text);
 static bool irc_send_emote(void *handle, const char *target, const char *text);
 static bool irc_get_context(void *handle, const char *sender,

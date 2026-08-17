@@ -103,8 +103,49 @@ sig_caught(void)
 }
 
 void
-sig_request_shutdown(void)
+sig_reason_sanitize(char *dst, size_t sz, const char *src)
 {
+  size_t i = 0;
+
+  if(sz == 0)
+    return;
+
+  while(src != NULL && i < sz - 1 && src[i] != '\0')
+  {
+    unsigned char c = (unsigned char)src[i];
+
+    // Cast first: on a signed char every byte of a multi-byte UTF-8
+    // sequence is negative, so an unqualified `< 0x20` would eat the
+    // operator's accents and emoji along with the newlines.
+    dst[i] = (c < 0x20 || c == 0x7f) ? ' ' : src[i];
+    i++;
+  }
+
+  dst[i] = '\0';
+}
+
+void
+sig_shutdown_reason(char *dst, size_t sz)
+{
+  if(sz == 0)
+    return;
+
+  pthread_mutex_lock(&reason_mutex);
+  strlcpy(dst, shutdown_reason, sz);
+  pthread_mutex_unlock(&reason_mutex);
+}
+
+void
+sig_request_shutdown(const char *reason)
+{
+  // Sanitize on the way in, once. Every reader past this point — core's
+  // shutdown log, method_unregister, whatever a driver puts on a wire —
+  // takes the stored bytes as trusted, which is only true because this
+  // is the single door they came through.
+  pthread_mutex_lock(&reason_mutex);
+  sig_reason_sanitize(shutdown_reason, sizeof(shutdown_reason), reason);
+  pthread_mutex_unlock(&reason_mutex);
+
   internal_shutdown = true;
 
   // Wake the parent loop (which is sleeping in task_wait) so it

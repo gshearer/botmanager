@@ -1798,9 +1798,17 @@ reachy_connect(void *handle)
 // method_deliver — and no method_* calls. Both threads are told the same
 // way, on the two condvars they sleep on.
 static void
-reachy_disconnect(void *handle)
+reachy_disconnect(void *handle, const char *reason)
 {
   reachy_state_t *st = handle;
+
+  // The robot is handed the operator's parting words and deliberately
+  // does not speak them. Its mouth is a synthesize-upload-play round
+  // trip on a thread this call has just told to stop, and a goodbye
+  // that holds the whole daemon's teardown open for several seconds is
+  // a worse goodbye than silence. Whoever wants it said should say it
+  // through the bot before quitting.
+  (void)reason;
 
   __atomic_store_n(&st->shutdown, true, __ATOMIC_RELEASE);
 

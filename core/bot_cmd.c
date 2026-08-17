@@ -1148,11 +1148,28 @@ cmd_show_bot(const cmd_ctx_t *ctx)
 // would exit on pool_shutting_down() before main reached
 // curl_begin_shutdown(), and the drain wait would stall ~11s waiting
 // on a thread that already left.
+//
+// The optional reason is the rest of the line, and it is the daemon's
+// last word to anyone watching: every method driver is handed it as it
+// takes its bot down, and IRC puts it in the QUIT so a channel reads
+// why its regular just left instead of a bare "shutting down".
+static const cmd_arg_desc_t ad_quit[] = {
+  { "reason", CMD_ARG_NONE, CMD_ARG_OPTIONAL | CMD_ARG_REST, 0, NULL },
+};
+
 static void
 admin_cmd_quit(const cmd_ctx_t *ctx)
 {
-  cmd_reply(ctx, "operator requested shutdown");
-  sig_request_shutdown();
+  const char *reason = ctx->parsed->argc > 0 ? ctx->parsed->argv[0] : NULL;
+  char        buf[SIG_REASON_SZ + 64];
+
+  if(reason != NULL)
+    snprintf(buf, sizeof(buf), "operator requested shutdown: %s", reason);
+  else
+    strlcpy(buf, "operator requested shutdown", sizeof(buf));
+
+  cmd_reply(ctx, buf);
+  sig_request_shutdown(reason);
 }
 
 // NL hints
@@ -1298,11 +1315,17 @@ bot_register_commands(void)
       NULL, NULL, ad_say, (uint8_t)(sizeof(ad_say) / sizeof(ad_say[0])),
       NULL, NULL);
 
-  cmd_register("bot", "quit", "quit",
+  cmd_register("bot", "quit", "quit [reason]",
       "Graceful shutdown",
       "Initiates a graceful shutdown of BotManager. All in-flight\n"
       "work is drained, plugins are unloaded in reverse dependency\n"
-      "order, and resources are released cleanly.",
+      "order, and resources are released cleanly.\n"
+      "\n"
+      "[reason] is the rest of the line and is passed to every method\n"
+      "as the bot goes down: on IRC it becomes the QUIT message the\n"
+      "channel sees, in place of the default \"shutting down\".\n"
+      "Example: /quit rebuilding the kraken feed, back in two minutes",
       USERNS_GROUP_OWNER, USERNS_OWNER_LEVEL, CMD_SCOPE_ANY, METHOD_T_ANY, admin_cmd_quit, NULL,
-      NULL, NULL, NULL, 0, NULL, NULL);
+      NULL, NULL, ad_quit, (uint8_t)(sizeof(ad_quit) / sizeof(ad_quit[0])),
+      NULL, NULL);
 }

@@ -428,10 +428,16 @@ bctl_drv_connect(void *handle)
 }
 
 static void
-bctl_drv_disconnect(void *handle)
+bctl_drv_disconnect(void *handle, const char *reason)
 {
   bctl_server_t *srv = handle;
   bctl_client_t *c;
+
+  // Nothing to say it to: this tears the listening socket down, and a
+  // client still attached is reading a stream that ends, not a line.
+  // The operator who typed the reason is on the other end of one of
+  // these sockets and already has it in their own scrollback.
+  (void)reason;
 
   if(srv == NULL)
     return;

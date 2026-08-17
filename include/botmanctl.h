@@ -113,7 +113,7 @@ static void  bctl_clam_cb(const clam_msg_t *m);
 static void *bctl_drv_create(const char *inst_name);
 static void  bctl_drv_destroy(void *handle);
 static bool  bctl_drv_connect(void *handle);
-static void  bctl_drv_disconnect(void *handle);
+static void  bctl_drv_disconnect(void *handle, const char *reason);
 static bool  bctl_drv_send(void *handle, const char *target, const char *text);
 static bool  bctl_drv_get_context(void *handle, const char *sender,
                  char *ctx, size_t ctx_sz);

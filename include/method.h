@@ -192,7 +192,15 @@ typedef struct
 
   // Called when the method should transition toward AVAILABLE.
   bool (*connect)(void *handle);
-  void (*disconnect)(void *handle);
+
+  // `reason` is the parting message: the operator's own words for why
+  // this instance is going down, for a driver to show whoever is
+  // watching. It is NEVER NULL and is EMPTY when there are no such
+  // words — a plain `bot stop`, a signal, a bare /quit — which a driver
+  // reads as "say it your own way". Already stripped of control bytes
+  // at its boundary (`sig_reason_sanitize`), so it is safe to put
+  // straight onto a one-line-per-message protocol.
+  void (*disconnect)(void *handle, const char *reason);
 
   bool (*send)(void *handle, const char *target, const char *text);
 
@@ -420,6 +428,7 @@ void method_exit(void);
 #include "common.h"
 #include "clam.h"
 #include "alloc.h"
+#include "sig.h"
 
 #define METHOD_SUB_NAME_SZ  64
 #define METHOD_MAX_SUBS     32

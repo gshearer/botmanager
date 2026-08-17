@@ -471,10 +471,16 @@ shutdown:
 
   // Log shutdown reason.
   {
-    int caught = sig_caught();
+    int  caught = sig_caught();
+    char reason[SIG_REASON_SZ];
+
+    sig_shutdown_reason(reason, sizeof(reason));
 
     if(caught != 0)
       clam(CLAM_INFO, "main", "shutdown: %s received", sig_name(caught));
+
+    else if(reason[0] != '\0')
+      clam(CLAM_INFO, "main", "shutdown: internal request: %s", reason);
 
     else
       clam(CLAM_INFO, "main", "shutdown: internal request");

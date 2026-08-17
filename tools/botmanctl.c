@@ -958,9 +958,16 @@ main_interactive_loop(int fd, int linger_ms)
       return(1);
     }
 
-    // Exit after quit — daemon is shutting down.
-    if(strcasecmp(line, "quit") == 0 || strcasecmp(line, "/quit") == 0)
-      break;
+    // Exit after quit — daemon is shutting down. Compare the verb
+    // alone: /quit takes an optional reason, and matching the whole
+    // line would leave this loop prompting at a daemon that is gone.
+    {
+      const char *verb = line[0] == '/' ? line + 1 : line;
+      size_t      n    = strcspn(verb, " \t");
+
+      if(n == 4 && strncasecmp(verb, "quit", 4) == 0)
+        break;
+    }
   }
 
   return(0);

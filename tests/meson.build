@@ -225,6 +225,18 @@ test_botmanctl_route = executable('test_botmanctl_route',
   dependencies : core_deps,
 )
 
+# The shutdown reason is operator text that ends up on a wire where the
+# line ending IS the message boundary — an IRC QUIT. A CR or LF that
+# survived the copy would close that QUIT and deliver everything after
+# it as a further command from an owner-level bot, and nothing on the
+# path would report it. These cases hold the boundary that folds them.
+test_shutdown_reason = executable('test_shutdown_reason',
+  'test_shutdown_reason.c',
+  include_directories : [include_directories('.'), inc_include],
+  link_with : [test_harness, libcore],
+  dependencies : core_deps,
+)
+
 test('util', test_util)
 test('colors', test_colors)
 test('json', test_json)
@@ -242,3 +254,4 @@ test('exchange_ws_gen', test_exchange_ws_gen)
 test('exchange_watch', test_exchange_watch)
 test('method_stats', test_method_stats)
 test('botmanctl_route', test_botmanctl_route)
+test('shutdown_reason', test_shutdown_reason)

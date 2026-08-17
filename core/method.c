@@ -228,7 +228,15 @@ method_unregister(const char *name)
   // method_release() takes method_mutex, so under the lock this is a
   // self-deadlock rather than a teardown.
   if(was_up && inst->driver->disconnect != NULL)
-    inst->driver->disconnect(handle);
+  {
+    char reason[SIG_REASON_SZ];
+
+    // The registry is where the operator's words meet the drivers: a
+    // /quit reason reaches every instance this teardown walks, and a
+    // stop outside a shutdown finds this empty and says nothing.
+    sig_shutdown_reason(reason, sizeof(reason));
+    inst->driver->disconnect(handle, reason);
+  }
 
   if(inst->driver->destroy != NULL && handle != NULL)
     inst->driver->destroy(handle);
