@@ -567,6 +567,7 @@ static void
 rawg_search_done(const curl_response_t *resp)
 {
   rawg_req_t         *req     = (rawg_req_t *)resp->user_data;
+  uint64_t            slot    = req->slot;
   struct json_object *root    = NULL;
   struct json_object *results = NULL;
   rawg_search_res_t   res;
@@ -601,12 +602,17 @@ emit:
     json_object_put(root);
 
   mem_free(req);
+
+  // Last, always: the drain in rawg_stop() is waiting on this line, and
+  // everything above it reads state rawg_deinit() is about to tear down.
+  curl_flight_close(&rawg_flight, slot);
 }
 
 static void
 rawg_game_done(const curl_response_t *resp)
 {
   rawg_req_t         *req  = (rawg_req_t *)resp->user_data;
+  uint64_t            slot    = req->slot;
   struct json_object *root = NULL;
   rawg_game_res_t     res;
 
@@ -635,6 +641,8 @@ emit:
     json_object_put(root);
 
   mem_free(req);
+
+  curl_flight_close(&rawg_flight, slot);
 }
 
 // ----------------------------------------------------------------------
@@ -744,18 +752,30 @@ rawg_search_async(const char *query, rawg_search_cb_t cb, void *user)
   req->search_cb = cb;
   req->user      = user;
 
+  // Opened before the request exists: a completion can run on a curl
+  // worker before the submit has returned, so the slot has to be there
+  // for it to close. FAIL means rawg is stopping and will not start work
+  // whose callback it cannot wait out.
+  if(curl_flight_open(&rawg_flight, &req->slot) != SUCCESS)
+  {
+    mem_free(req);
+    return(ASYNC_FAILED_UNDELIVERED);
+  }
+
   cr = curl_request_create(CURL_METHOD_GET, url, rawg_search_done, req);
 
   if(cr == NULL)
   {
+    curl_flight_close(&rawg_flight, req->slot);
     mem_free(req);
     return(ASYNC_FAILED_UNDELIVERED);
   }
 
   rawg_apply_opts(cr);
 
-  if(curl_request_submit(cr) != SUCCESS)
+  if(curl_flight_relay(&rawg_flight, cr, &req->slot) != SUCCESS)
   {
+    curl_flight_close(&rawg_flight, req->slot);
     mem_free(req);
     return(ASYNC_FAILED_UNDELIVERED);
   }
@@ -810,18 +830,26 @@ rawg_game_async(int32_t id, rawg_game_cb_t cb, void *user)
   req->game_cb = cb;
   req->user    = user;
 
+  if(curl_flight_open(&rawg_flight, &req->slot) != SUCCESS)
+  {
+    mem_free(req);
+    return(ASYNC_FAILED_UNDELIVERED);
+  }
+
   cr = curl_request_create(CURL_METHOD_GET, url, rawg_game_done, req);
 
   if(cr == NULL)
   {
+    curl_flight_close(&rawg_flight, req->slot);
     mem_free(req);
     return(ASYNC_FAILED_UNDELIVERED);
   }
 
   rawg_apply_opts(cr);
 
-  if(curl_request_submit(cr) != SUCCESS)
+  if(curl_flight_relay(&rawg_flight, cr, &req->slot) != SUCCESS)
   {
+    curl_flight_close(&rawg_flight, req->slot);
     mem_free(req);
     return(ASYNC_FAILED_UNDELIVERED);
   }
@@ -917,18 +945,26 @@ rawg_list_async(rawg_list_kind_t kind, int32_t year, rawg_search_cb_t cb,
   req->user      = user;
   snprintf(req->list_key, sizeof(req->list_key), "%s", key);
 
+  if(curl_flight_open(&rawg_flight, &req->slot) != SUCCESS)
+  {
+    mem_free(req);
+    return(ASYNC_FAILED_UNDELIVERED);
+  }
+
   cr = curl_request_create(CURL_METHOD_GET, url, rawg_search_done, req);
 
   if(cr == NULL)
   {
+    curl_flight_close(&rawg_flight, req->slot);
     mem_free(req);
     return(ASYNC_FAILED_UNDELIVERED);
   }
 
   rawg_apply_opts(cr);
 
-  if(curl_request_submit(cr) != SUCCESS)
+  if(curl_flight_relay(&rawg_flight, cr, &req->slot) != SUCCESS)
   {
+    curl_flight_close(&rawg_flight, req->slot);
     mem_free(req);
     return(ASYNC_FAILED_UNDELIVERED);
   }
@@ -944,6 +980,7 @@ static bool
 rawg_init(void)
 {
   pthread_mutex_init(&rawg_cache_mu, NULL);
+  curl_flight_init(&rawg_flight);
   memset(rawg_game_cache, 0, sizeof(rawg_game_cache));
   memset(rawg_list_cache, 0, sizeof(rawg_list_cache));
   rawg_game_cursor = 0;
@@ -953,6 +990,7 @@ rawg_init(void)
   // which is worse than absent — fail the init and let the loader skip it.
   if(rawg_cmd_register() != SUCCESS)
   {
+    curl_flight_destroy(&rawg_flight);
     pthread_mutex_destroy(&rawg_cache_mu);
     return(FAIL);
   }
@@ -961,10 +999,30 @@ rawg_init(void)
   return(SUCCESS);
 }
 
+// The plugin's whole Class-B holding is its in-flight curl set: no
+// threads, no tasks, no bound vtable. A cancelled request still
+// delivers, so what this waits for is rawg's own callbacks finishing —
+// not the transfers.
+static bool
+rawg_stop(void)
+{
+  uint32_t left = curl_flight_drain(&rawg_flight, RAWG_STOP_DRAIN_MS);
+
+  if(left == 0)
+    return(SUCCESS);
+
+  clam(CLAM_WARN, RAWG_CTX, "%u request(s) still airborne after a %u ms "
+      "cancel-and-drain; refusing the unload rather than deinitializing "
+      "under their callbacks", left, (uint32_t)RAWG_STOP_DRAIN_MS);
+
+  return(FAIL);
+}
+
 static void
 rawg_deinit(void)
 {
   rawg_cmd_unregister();
+  curl_flight_destroy(&rawg_flight);
   pthread_mutex_destroy(&rawg_cache_mu);
   clam(CLAM_INFO, RAWG_CTX, "rawg plugin deinitialized");
 }
@@ -987,7 +1045,7 @@ const plugin_desc_t bm_plugin_desc = {
   .kv_schema_count = sizeof(rawg_kv_schema) / sizeof(rawg_kv_schema[0]),
   .init            = rawg_init,
   .start           = NULL,
-  .stop            = NULL,
+  .stop            = rawg_stop,
   .deinit          = rawg_deinit,
   .ext             = NULL,
 };

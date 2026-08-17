@@ -802,6 +802,7 @@ static void
 tmdb_search_done(const curl_response_t *resp)
 {
   tmdb_req_t         *req     = (tmdb_req_t *)resp->user_data;
+  uint64_t            slot    = req->slot;
   struct json_object *root    = NULL;
   struct json_object *results = NULL;
   tmdb_search_res_t   res;
@@ -836,12 +837,17 @@ emit:
     json_object_put(root);
 
   mem_free(req);
+
+  // Last, always: the drain in tmdb_stop() is waiting on this line, and
+  // everything above it reads state tmdb_deinit() is about to tear down.
+  curl_flight_close(&tmdb_flight, slot);
 }
 
 static void
 tmdb_title_done(const curl_response_t *resp)
 {
   tmdb_req_t         *req  = (tmdb_req_t *)resp->user_data;
+  uint64_t            slot    = req->slot;
   struct json_object *root = NULL;
   tmdb_title_res_t    res;
 
@@ -870,12 +876,15 @@ emit:
     json_object_put(root);
 
   mem_free(req);
+
+  curl_flight_close(&tmdb_flight, slot);
 }
 
 static void
 tmdb_person_done(const curl_response_t *resp)
 {
   tmdb_req_t         *req  = (tmdb_req_t *)resp->user_data;
+  uint64_t            slot    = req->slot;
   struct json_object *root = NULL;
   tmdb_person_res_t   res;
 
@@ -904,6 +913,8 @@ emit:
     json_object_put(root);
 
   mem_free(req);
+
+  curl_flight_close(&tmdb_flight, slot);
 }
 
 // ----------------------------------------------------------------------
@@ -967,18 +978,30 @@ tmdb_search_async(tmdb_media_t kind, const char *query,
   req->search_cb = cb;
   req->user      = user;
 
+  // Opened before the request exists: a completion can run on a curl
+  // worker before the submit has returned, so the slot has to be there
+  // for it to close. FAIL means tmdb is stopping and will not start work
+  // whose callback it cannot wait out.
+  if(curl_flight_open(&tmdb_flight, &req->slot) != SUCCESS)
+  {
+    mem_free(req);
+    return(ASYNC_FAILED_UNDELIVERED);
+  }
+
   cr = curl_request_create(CURL_METHOD_GET, url, tmdb_search_done, req);
 
   if(cr == NULL)
   {
+    curl_flight_close(&tmdb_flight, req->slot);
     mem_free(req);
     return(ASYNC_FAILED_UNDELIVERED);
   }
 
   tmdb_apply_auth(cr, tok);
 
-  if(curl_request_submit(cr) != SUCCESS)
+  if(curl_flight_relay(&tmdb_flight, cr, &req->slot) != SUCCESS)
   {
+    curl_flight_close(&tmdb_flight, req->slot);
     mem_free(req);
     return(ASYNC_FAILED_UNDELIVERED);
   }
@@ -1047,18 +1070,26 @@ tmdb_title_async(tmdb_media_t kind, int32_t id, tmdb_title_cb_t cb, void *user)
   req->title_cb = cb;
   req->user     = user;
 
+  if(curl_flight_open(&tmdb_flight, &req->slot) != SUCCESS)
+  {
+    mem_free(req);
+    return(ASYNC_FAILED_UNDELIVERED);
+  }
+
   cr = curl_request_create(CURL_METHOD_GET, url, tmdb_title_done, req);
 
   if(cr == NULL)
   {
+    curl_flight_close(&tmdb_flight, req->slot);
     mem_free(req);
     return(ASYNC_FAILED_UNDELIVERED);
   }
 
   tmdb_apply_auth(cr, tok);
 
-  if(curl_request_submit(cr) != SUCCESS)
+  if(curl_flight_relay(&tmdb_flight, cr, &req->slot) != SUCCESS)
   {
+    curl_flight_close(&tmdb_flight, req->slot);
     mem_free(req);
     return(ASYNC_FAILED_UNDELIVERED);
   }
@@ -1121,18 +1152,26 @@ tmdb_person_async(int32_t id, tmdb_person_cb_t cb, void *user)
   req->person_cb = cb;
   req->user      = user;
 
+  if(curl_flight_open(&tmdb_flight, &req->slot) != SUCCESS)
+  {
+    mem_free(req);
+    return(ASYNC_FAILED_UNDELIVERED);
+  }
+
   cr = curl_request_create(CURL_METHOD_GET, url, tmdb_person_done, req);
 
   if(cr == NULL)
   {
+    curl_flight_close(&tmdb_flight, req->slot);
     mem_free(req);
     return(ASYNC_FAILED_UNDELIVERED);
   }
 
   tmdb_apply_auth(cr, tok);
 
-  if(curl_request_submit(cr) != SUCCESS)
+  if(curl_flight_relay(&tmdb_flight, cr, &req->slot) != SUCCESS)
   {
+    curl_flight_close(&tmdb_flight, req->slot);
     mem_free(req);
     return(ASYNC_FAILED_UNDELIVERED);
   }
@@ -1206,18 +1245,26 @@ tmdb_trending_async(tmdb_media_t kind, bool weekly, tmdb_search_cb_t cb,
   req->user      = user;
   snprintf(req->trend_key, sizeof(req->trend_key), "%s", key);
 
+  if(curl_flight_open(&tmdb_flight, &req->slot) != SUCCESS)
+  {
+    mem_free(req);
+    return(ASYNC_FAILED_UNDELIVERED);
+  }
+
   cr = curl_request_create(CURL_METHOD_GET, url, tmdb_search_done, req);
 
   if(cr == NULL)
   {
+    curl_flight_close(&tmdb_flight, req->slot);
     mem_free(req);
     return(ASYNC_FAILED_UNDELIVERED);
   }
 
   tmdb_apply_auth(cr, tok);
 
-  if(curl_request_submit(cr) != SUCCESS)
+  if(curl_flight_relay(&tmdb_flight, cr, &req->slot) != SUCCESS)
   {
+    curl_flight_close(&tmdb_flight, req->slot);
     mem_free(req);
     return(ASYNC_FAILED_UNDELIVERED);
   }
@@ -1233,6 +1280,7 @@ static bool
 tmdb_init(void)
 {
   pthread_mutex_init(&tmdb_cache_mu, NULL);
+  curl_flight_init(&tmdb_flight);
   memset(tmdb_title_cache, 0, sizeof(tmdb_title_cache));
   memset(tmdb_person_cache, 0, sizeof(tmdb_person_cache));
   memset(tmdb_trend_cache, 0, sizeof(tmdb_trend_cache));
@@ -1244,6 +1292,7 @@ tmdb_init(void)
   // which is worse than absent — fail the init and let the loader skip it.
   if(tmdb_cmd_register() != SUCCESS)
   {
+    curl_flight_destroy(&tmdb_flight);
     pthread_mutex_destroy(&tmdb_cache_mu);
     return(FAIL);
   }
@@ -1252,10 +1301,32 @@ tmdb_init(void)
   return(SUCCESS);
 }
 
+// The plugin's whole Class-B holding is its in-flight curl set: no
+// threads, no tasks, no bound vtable. A cancelled request still
+// delivers, so what this waits for is tmdb's own callbacks finishing —
+// not the transfers. Measured 2026-08-17: without it, a reload during
+// tmdb_search_done left that callback's next trylock on tmdb_cache_mu
+// returning EINVAL, and the cache write proceeded unguarded.
+static bool
+tmdb_stop(void)
+{
+  uint32_t left = curl_flight_drain(&tmdb_flight, TMDB_STOP_DRAIN_MS);
+
+  if(left == 0)
+    return(SUCCESS);
+
+  clam(CLAM_WARN, TMDB_CTX, "%u request(s) still airborne after a %u ms "
+      "cancel-and-drain; refusing the unload rather than deinitializing "
+      "under their callbacks", left, (uint32_t)TMDB_STOP_DRAIN_MS);
+
+  return(FAIL);
+}
+
 static void
 tmdb_deinit(void)
 {
   tmdb_cmd_unregister();
+  curl_flight_destroy(&tmdb_flight);
   pthread_mutex_destroy(&tmdb_cache_mu);
   clam(CLAM_INFO, TMDB_CTX, "tmdb plugin deinitialized");
 }
@@ -1278,7 +1349,7 @@ const plugin_desc_t bm_plugin_desc = {
   .kv_schema_count = sizeof(tmdb_kv_schema) / sizeof(tmdb_kv_schema[0]),
   .init            = tmdb_init,
   .start           = NULL,
-  .stop            = NULL,
+  .stop            = tmdb_stop,
   .deinit          = tmdb_deinit,
   .ext             = NULL,
 };

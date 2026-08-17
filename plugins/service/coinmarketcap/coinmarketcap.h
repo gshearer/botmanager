@@ -11,6 +11,7 @@
 #include "clam.h"
 #include "common.h"
 #include "curl.h"
+#include "curl_flight.h"
 #include "kv.h"
 #include "alloc.h"
 #include "json.h"
@@ -106,6 +107,11 @@ typedef struct cmc_request
   // pointer and is never filed. See the registry section in
   // coinmarketcap.c.
   struct cmc_request  *next_active;
+
+  // This request's slot in cmc_flight: an idle token between legs, the
+  // current leg's curl id while one is on the wire. Opened by
+  // cmc_req_alloc, moved by each submit, closed by cmc_req_release.
+  uint64_t             slot;
 } cmc_request_t;
 
 // The caller's half of a request, lifted off it under the registry lock
@@ -138,6 +144,19 @@ static pthread_mutex_t  cmc_info_mu;
 // Request freelist.
 static cmc_request_t   *cmc_free     = NULL;
 static pthread_mutex_t  cmc_free_mu;
+
+// Every request this plugin has in the air, so cmc_stop() can cancel
+// the legs and wait out their callbacks before cmc_deinit() destroys the
+// locks those callbacks take (PLUGIN.md §Lifecycle Contract). Wider than
+// the in-flight registry below on purpose: the poll path submits
+// requests with no caller to file, and their callbacks reach the cache
+// just the same.
+static curl_flight_t    cmc_flight;
+
+// How long cmc_stop() will wait for its own completion callbacks. A
+// cancelled transfer is delivered on the multi loop's next pass, so this
+// is a scheduling margin, not a network timeout.
+#define CMC_STOP_DRAIN_MS 3000
 
 // In-flight registry. Guards `next_active` linkage and every read or
 // write of a request's caller half.

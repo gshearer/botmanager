@@ -37,6 +37,7 @@
 #include "userns.h"
 
 #include <pthread.h>
+#include <stdatomic.h>
 #include <sys/types.h>
 
 // Log tag used by every clam() call in this plugin.

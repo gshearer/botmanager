@@ -38,6 +38,8 @@ wxg_req_alloc(void)
 void
 wxg_req_release(wxg_request_t *r)
 {
+  uint64_t slot = r->slot;
+
   pthread_mutex_lock(&wxg_active_mutex);
   wxg_req_untrack_locked(r);
   pthread_mutex_unlock(&wxg_active_mutex);
@@ -46,6 +48,11 @@ wxg_req_release(wxg_request_t *r)
   r->next = wxg_free;
   wxg_free = r;
   pthread_mutex_unlock(&wxg_free_mu);
+
+  // Last, always: every terminal path in this plugin ends here, so this
+  // is where the drain in wxg_stop() learns the work is over — and
+  // everything above it touches state wxg_deinit() is about to free.
+  curl_flight_close(&wxg_flight, slot);
 }
 
 // ----------------------------------------------------------------------
@@ -74,9 +81,15 @@ wxg_req_release(wxg_request_t *r)
 // what is no longer there. A bounded leak on an operator action beats a
 // SIGSEGV. See PLUGIN.md §Lifecycle Contract.
 
-void
+bool
 wxg_req_track(wxg_request_t *r)
 {
+  // The flight is what stop() waits on, so the slot opens before the
+  // registry entry does. A grounded flight refuses here, and the entry
+  // point hands the work straight back to its caller.
+  if(curl_flight_open(&wxg_flight, &r->slot) != SUCCESS)
+    return(FAIL);
+
   pthread_mutex_lock(&wxg_active_mutex);
 
   r->next_active = wxg_active_head;
@@ -84,6 +97,8 @@ wxg_req_track(wxg_request_t *r)
   wxg_active_count++;
 
   pthread_mutex_unlock(&wxg_active_mutex);
+
+  return(SUCCESS);
 }
 
 // Caller holds wxg_active_mutex. A no-op for a request that is not on
@@ -187,19 +202,21 @@ wxg_ua(char *out, size_t sz)
 // The one place a weather.gov transfer is built. curl_get() cannot set a
 // User-Agent, so it can never be used against this API.
 bool
-wxg_http_get(const char *url, const char *ua, curl_done_cb_t cb, void *user)
+wxg_http_get(const char *url, wxg_request_t *r, curl_done_cb_t cb)
 {
-  curl_request_t *req = curl_request_create(CURL_METHOD_GET, url, cb, user);
+  curl_request_t *req = curl_request_create(CURL_METHOD_GET, url, cb, r);
 
   if(req == NULL)
     return(FAIL);
 
-  curl_request_set_user_agent(req, ua);
+  curl_request_set_user_agent(req, r->ua);
   curl_request_add_header(req, "Accept: application/geo+json");
   curl_request_set_timeout(req,
       (uint32_t)kv_get_uint("plugin.weathergov.timeout_secs"));
 
-  return(curl_request_submit(req));
+  // The slot moves to this leg's id before the submit, so a completion
+  // that beats the return still finds something to close.
+  return(curl_flight_relay(&wxg_flight, req, &r->slot));
 }
 
 // The single response classifier. Three outcomes, and only the first is
@@ -558,7 +575,11 @@ weathergov_point_async(double lat, double lon,
 
   // File it before anything can be submitted, never after: a completion
   // can run on a curl worker before the submitting call has returned.
-  wxg_req_track(r);
+  if(wxg_req_track(r) != SUCCESS)
+  {
+    wxg_req_release(r);
+    return(ASYNC_FAILED_UNDELIVERED);
+  }
 
   pthread_mutex_lock(&wxg_point_cache_mu);
   cached = wxg_point_lookup(r->coord);
@@ -580,7 +601,7 @@ weathergov_point_async(double lat, double lon,
 
   snprintf(url, sizeof(url), "%s/%s", WXG_POINTS_URL, r->coord);
 
-  if(wxg_http_get(url, r->ua, wxg_point_done, r) != SUCCESS)
+  if(wxg_http_get(url, r, wxg_point_done) != SUCCESS)
   {
     wxg_req_release(r);
     return(ASYNC_FAILED_UNDELIVERED);
@@ -599,12 +620,33 @@ wxg_init(void)
   pthread_mutex_init(&wxg_free_mu, NULL);
   pthread_mutex_init(&wxg_point_cache_mu, NULL);
   memset(wxg_point_cache, 0, sizeof(wxg_point_cache));
+  curl_flight_init(&wxg_flight);
 
   plugin_unmap_notify_register(wxg_unmap_cb, NULL);
 
   clam(CLAM_INFO, WXG_CTX, "weathergov plugin initialized");
 
   return(SUCCESS);
+}
+
+// The plugin's whole Class-B holding is the work in wxg_flight: no
+// threads, no tasks, no bound vtable. A cancelled request still
+// delivers, so what this waits for is weathergov's own callbacks
+// finishing — not the transfers.
+static bool
+wxg_stop(void)
+{
+  uint32_t left = curl_flight_drain(&wxg_flight, WXG_STOP_DRAIN_MS);
+
+  if(left == 0)
+    return(SUCCESS);
+
+  clam(CLAM_WARN, WXG_CTX, "%u weather.gov request(s) still airborne after "
+      "a %u ms cancel-and-drain; refusing the unload rather than "
+      "deinitializing under their callbacks", left,
+      (uint32_t)WXG_STOP_DRAIN_MS);
+
+  return(FAIL);
 }
 
 static void
@@ -618,11 +660,12 @@ wxg_deinit(void)
   stranded = wxg_active_count;
   pthread_mutex_unlock(&wxg_active_mutex);
 
-  // Nothing to free here: a stranded request is still owned by a live
-  // curl transfer whose completion lives in the mapping now going away.
-  // Core's residual audit sees those — wxg_*_done is curl_iter_req_t.cb
-  // for every one — so it is the audit that refuses the dlclose, not us.
-  // Naming the count here is what makes that refusal legible.
+  // Nothing to free here, and since wxg_stop() this is normally zero:
+  // the drain has already cancelled every leg and waited out its
+  // callback. A survivor means the drain timed out, stop() refused the
+  // unload, and we are on the shutdown path instead — where core's
+  // residual audit sees them, since wxg_*_done is curl_iter_req_t.cb for
+  // every one. Naming the count is what makes that legible.
   if(stranded > 0)
     clam(CLAM_WARN, WXG_CTX, "%u weather.gov request(s) still in flight at "
         "deinit", stranded);
@@ -657,6 +700,8 @@ wxg_deinit(void)
 
   pthread_mutex_destroy(&wxg_point_cache_mu);
 
+  curl_flight_destroy(&wxg_flight);
+
   // Owned by the observation chain, freed here: one plugin, one place
   // that gives its memory back.
   wxg_station_cache_clear();
@@ -679,7 +724,7 @@ const plugin_desc_t bm_plugin_desc = {
   .kv_schema_count = 4,
   .init            = wxg_init,
   .start           = NULL,
-  .stop            = NULL,
+  .stop            = wxg_stop,
   .deinit          = wxg_deinit,
   .ext             = NULL,
 };

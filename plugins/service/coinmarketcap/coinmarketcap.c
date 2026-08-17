@@ -31,12 +31,21 @@ cmc_req_alloc(void)
 
   memset(r, 0, sizeof(*r));
 
+  // Every request gets a slot, including the poll path's, which is never
+  // filed in the registry below because it has no caller to lose. The
+  // return is deliberately not checked: a grounded flight leaves the
+  // slot closed, every submit below then refuses, and the request goes
+  // down its own abort path without ever reaching the wire.
+  (void)curl_flight_open(&cmc_flight, &r->slot);
+
   return(r);
 }
 
 static void
 cmc_req_release(cmc_request_t *r)
 {
+  uint64_t slot = r->slot;
+
   pthread_mutex_lock(&cmc_active_mutex);
   cmc_req_untrack_locked(r);
   pthread_mutex_unlock(&cmc_active_mutex);
@@ -45,6 +54,11 @@ cmc_req_release(cmc_request_t *r)
   r->next = cmc_free;
   cmc_free = r;
   pthread_mutex_unlock(&cmc_free_mu);
+
+  // Last, always: every terminal path in this plugin ends here, so this
+  // is where the drain in cmc_stop() learns the request is over — and
+  // everything above it touches state cmc_deinit() is about to free.
+  curl_flight_close(&cmc_flight, slot);
 }
 
 // ----------------------------------------------------------------------
@@ -742,7 +756,7 @@ cmc_submit_listings(cmc_request_t *req)
   curl_request_add_header(cr, hdr);
   curl_request_add_header(cr, "Accept: application/json");
 
-  if(curl_request_submit(cr) != SUCCESS)
+  if(curl_flight_relay(&cmc_flight, cr, &req->slot) != SUCCESS)
     return(cmc_abort_unsent(req,
         "Error: failed to submit API request"));
 
@@ -829,7 +843,7 @@ cmc_submit_info(cmc_request_t *req)
   curl_request_add_header(cr, hdr);
   curl_request_add_header(cr, "Accept: application/json");
 
-  if(curl_request_submit(cr) != SUCCESS)
+  if(curl_flight_relay(&cmc_flight, cr, &req->slot) != SUCCESS)
     return(cmc_submit_quotes(req, false));
 
   return(ASYNC_AIRBORNE);
@@ -913,7 +927,7 @@ cmc_submit_quotes(cmc_request_t *req, bool deliver_on_fail)
   curl_request_add_header(cr, hdr);
   curl_request_add_header(cr, "Accept: application/json");
 
-  if(curl_request_submit(cr) != SUCCESS)
+  if(curl_flight_relay(&cmc_flight, cr, &req->slot) != SUCCESS)
     return(cmc_detail_abort(req, deliver_on_fail,
         "Error: failed to submit API request"));
 
@@ -937,7 +951,7 @@ cmc_submit_global(cmc_request_t *req)
   curl_request_add_header(cr, hdr);
   curl_request_add_header(cr, "Accept: application/json");
 
-  if(curl_request_submit(cr) != SUCCESS)
+  if(curl_flight_relay(&cmc_flight, cr, &req->slot) != SUCCESS)
     return(cmc_abort_unsent(req,
         "Error: failed to submit API request"));
 
@@ -1432,6 +1446,7 @@ cmc_init(void)
   pthread_mutex_init(&cmc_free_mu, NULL);
   pthread_mutex_init(&cmc_info_mu, NULL);
   pthread_rwlock_init(&cmc_cache_rwl, NULL);
+  curl_flight_init(&cmc_flight);
   memset(cmc_cache, 0, sizeof(cmc_cache));
   memset(cmc_info_cache, 0, sizeof(cmc_info_cache));
   memset(&cmc_global_cache, 0, sizeof(cmc_global_cache));
@@ -1485,6 +1500,35 @@ cmc_start(void)
   return(SUCCESS);
 }
 
+// Two holdings: the poll tick, which submits, and the requests already
+// in the air. The tick is cancelled first so the drain has a set that
+// can reach zero — a cancelled request still delivers, so what the drain
+// waits for is coinmarketcap's own callbacks finishing, not the
+// transfers.
+static bool
+cmc_stop(void)
+{
+  uint32_t left;
+
+  if(cmc_poll_task != TASK_HANDLE_NONE)
+  {
+    task_cancel(cmc_poll_task);
+    cmc_poll_task = TASK_HANDLE_NONE;
+  }
+
+  left = curl_flight_drain(&cmc_flight, CMC_STOP_DRAIN_MS);
+
+  if(left == 0)
+    return(SUCCESS);
+
+  clam(CLAM_WARN, CMC_CTX, "%u market request(s) still airborne after a "
+      "%u ms cancel-and-drain; refusing the unload rather than "
+      "deinitializing under their callbacks", left,
+      (uint32_t)CMC_STOP_DRAIN_MS);
+
+  return(FAIL);
+}
+
 static void
 cmc_deinit(void)
 {
@@ -1498,11 +1542,12 @@ cmc_deinit(void)
   stranded = cmc_active_count;
   pthread_mutex_unlock(&cmc_active_mutex);
 
-  // Nothing to free here: a stranded request is still owned by a live
-  // curl transfer whose completion lives in the mapping now going away.
-  // Core's residual audit sees those — cmc_*_done is curl_iter_req_t.cb
-  // for every one — so it is the audit that refuses the dlclose, not us.
-  // Naming the count here is what makes that refusal legible.
+  // Nothing to free here, and since cmc_stop() this is normally zero:
+  // the drain has already cancelled every leg and waited out its
+  // callback. A survivor means the drain timed out, stop() refused the
+  // unload, and we are on the shutdown path instead — where core's
+  // residual audit sees them, since cmc_*_done is curl_iter_req_t.cb for
+  // every one. Naming the count is what makes that legible.
   if(stranded > 0)
     clam(CLAM_WARN, CMC_CTX, "%u market request(s) still in flight at "
         "deinit", stranded);
@@ -1523,6 +1568,8 @@ cmc_deinit(void)
 
   pthread_rwlock_destroy(&cmc_cache_rwl);
 
+  curl_flight_destroy(&cmc_flight);
+
   clam(CLAM_INFO, CMC_CTX, "coinmarketcap plugin deinitialized");
 }
 
@@ -1541,7 +1588,7 @@ const plugin_desc_t bm_plugin_desc = {
   .kv_schema_count = sizeof(cmc_kv_schema) / sizeof(cmc_kv_schema[0]),
   .init            = cmc_init,
   .start           = cmc_start,
-  .stop            = NULL,
+  .stop            = cmc_stop,
   .deinit          = cmc_deinit,
   .ext             = NULL,
 };

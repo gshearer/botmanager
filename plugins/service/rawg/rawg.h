@@ -13,6 +13,7 @@
 #include "clam.h"
 #include "common.h"
 #include "curl.h"
+#include "curl_flight.h"
 #include "json.h"
 #include "kv.h"
 #include "plugin.h"
@@ -77,6 +78,7 @@ typedef struct
   rawg_search_cb_t search_cb;                // SEARCH / LIST
   rawg_game_cb_t   game_cb;                  // GAME
   void            *user;
+  uint64_t         slot;                     // rawg_flight (see below)
 } rawg_req_t;
 
 // Module state: detail + list caches, one mutex covering both.
@@ -85,6 +87,16 @@ static rawg_list_ent_t rawg_list_cache[RAWG_LIST_CACHE_SZ];
 static uint32_t        rawg_game_cursor = 0;
 static uint32_t        rawg_list_cursor = 0;
 static pthread_mutex_t rawg_cache_mu;
+
+// Every request this plugin puts on the wire, so rawg_stop() can cancel
+// them and wait out their callbacks before rawg_deinit() destroys the
+// cache mutex those callbacks take (PLUGIN.md §Lifecycle Contract).
+static curl_flight_t   rawg_flight;
+
+// How long rawg_stop() will wait for its own completion callbacks. A
+// cancelled transfer is delivered on the multi loop's next pass, so this
+// is a scheduling margin, not a network timeout.
+#define RAWG_STOP_DRAIN_MS 3000
 
 // KV schema
 

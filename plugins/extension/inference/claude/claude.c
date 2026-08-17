@@ -21,7 +21,53 @@ extern char **environ;
 static void  claude_cmd(const cmd_ctx_t *ctx);
 static void  claude_show_cmd(const cmd_ctx_t *ctx);
 static bool  claude_init(void);
+static bool  claude_stop(void);
 static void  claude_deinit(void);
+static void  claude_pending_deliver(task_t *t);
+
+// The post-restart delivery retry, which is this plugin's whole Class-B
+// holding — a deferred task callback living in this mapping, re-armed by
+// itself up to CLAUDE_DELIVERY_MAX_ATTEMPTS times over several minutes.
+// Unloading with one pending leaves a task pointing into freed .text,
+// which core's residual audit catches by refusing the unload after
+// deinit() has already run: a zombie. claude_stop() takes it back.
+//
+// Atomic because the arming happens on a task worker and the sweep on
+// the loader thread, and the two must not disagree about whether a task
+// exists (root TODO.md §SC-OBSERVED OBS-32's rule: the flag is _Atomic
+// at the declaration, and no reader changes).
+static _Atomic task_handle_t                claude_deliver_task
+                                                = TASK_HANDLE_NONE;
+static claude_pending_retry_ctx_t *_Atomic  claude_deliver_ctx  = NULL;
+static _Atomic bool                         claude_stopping     = false;
+
+// Arm the next delivery attempt and publish its handle. Re-checks the
+// stop latch after publishing: a claude_stop() that swept between the
+// caller's check and this line would never see the task we just armed,
+// so we take it back ourselves.
+static void
+claude_deliver_arm(uint32_t delay_ms, claude_pending_retry_ctx_t *r)
+{
+  task_handle_t h;
+
+  claude_deliver_ctx  = r;
+  claude_deliver_task = task_add_deferred("claude_deliver", TASK_ANY, 100,
+      delay_ms, claude_pending_deliver, r);
+
+  if(!claude_stopping)
+    return;
+
+  h = atomic_exchange(&claude_deliver_task, TASK_HANDLE_NONE);
+
+  if(h != TASK_HANDLE_NONE && task_cancel(h))
+  {
+    claude_pending_retry_ctx_t *ctx = atomic_exchange(&claude_deliver_ctx,
+        NULL);
+
+    if(ctx != NULL)
+      mem_free(ctx);
+  }
+}
 
 static bool  claude_run_and_wait(const char *const *argv, const char *cwd,
                  const char *const *envp,
@@ -35,7 +81,6 @@ static void  claude_reply_multi(method_inst_t *inst, const char *target,
 static bool  claude_load_preamble(const char *cwd, const char *rel_path,
                  char *buf, size_t bufsz, size_t *out_len);
 static void  claude_pending_clear(void);
-static void  claude_pending_deliver(task_t *t);
 
 static void  claude_prompt_append(char *prompt, size_t cap, size_t *len,
                  const char *tok);
@@ -451,8 +496,7 @@ claude_pending_send_chunks(task_t *t, claude_pending_retry_ctx_t *r,
       r->attempt, delay_sec);
 
   r->attempt = next;
-  task_add_deferred("claude_deliver", TASK_ANY, 100,
-      (uint32_t)delay_sec * 1000U, claude_pending_deliver, r);
+  claude_deliver_arm((uint32_t)delay_sec * 1000U, r);
 
   t->state = TASK_ENDED;
 }
@@ -1120,12 +1164,37 @@ claude_init(void)
           "deliver: pending found (%lds old); first attempt in %ds",
           (long)age, delay_sec);
 
-      task_add_deferred("claude_deliver", TASK_ANY, 100,
-          (uint32_t)delay_sec * 1000U, claude_pending_deliver, r);
+      claude_deliver_arm((uint32_t)delay_sec * 1000U, r);
     }
   }
 
   clam(CLAM_INFO, CLAUDE_CTX, "claude plugin initialized");
+  return(SUCCESS);
+}
+
+// One holding, one sweep. task_cancel returns true only when the task
+// was dequeued without ever running, which is exactly when its context
+// is ours to free — a false means the callback has it and frees its own.
+// The loop runs again because a retry that slipped past the latch can
+// arm one more, and claude_deliver_arm's own re-check makes that the
+// last one.
+static bool
+claude_stop(void)
+{
+  task_handle_t h;
+
+  claude_stopping = true;
+
+  while((h = atomic_exchange(&claude_deliver_task, TASK_HANDLE_NONE))
+      != TASK_HANDLE_NONE)
+  {
+    claude_pending_retry_ctx_t *ctx = atomic_exchange(&claude_deliver_ctx,
+        NULL);
+
+    if(task_cancel(h) && ctx != NULL)
+      mem_free(ctx);
+  }
+
   return(SUCCESS);
 }
 
@@ -1157,7 +1226,7 @@ const plugin_desc_t bm_plugin_desc = {
   .kv_schema_count = sizeof(claude_kv_schema) / sizeof(claude_kv_schema[0]),
   .init            = claude_init,
   .start           = NULL,
-  .stop            = NULL,
+  .stop            = claude_stop,
   .deinit          = claude_deinit,
   .ext             = NULL,
 };

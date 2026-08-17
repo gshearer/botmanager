@@ -147,6 +147,20 @@ test_curl_submit_wait = executable('test_curl_submit_wait',
   dependencies : core_deps,
 )
 
+# A plugin's stop() proves the negative core cannot: that no completion
+# callback of its own is running or ever will be. The failure mode is
+# silent in both directions — a drain that returns early lets deinit()
+# tear down under a live callback, and a drain that never returns turns
+# an unload into a hang — so this suite states both halves in elapsed
+# milliseconds. Same fixture as curl_submit_wait: the real subsystem
+# with core.curl.max_active = 0, so no case touches the network.
+test_curl_flight = executable('test_curl_flight',
+  'test_curl_flight.c',
+  include_directories : [include_directories('.'), inc_include],
+  link_with : [test_harness, libcore],
+  dependencies : core_deps,
+)
+
 # The quiescence barrier asks cmd_inflight_owned() whether a command
 # handler is running inside the mapping it is about to unmap. A wrong
 # answer has no error path: the unload proceeds and the handler resumes
@@ -270,6 +284,7 @@ test('kv_bot', test_kv_bot)
 test('kv_str', test_kv_str)
 test('kv_default', test_kv_default)
 test('curl_submit_wait', test_curl_submit_wait)
+test('curl_flight', test_curl_flight)
 test('cmd_inflight', test_cmd_inflight)
 test('kraken_ws_channels', test_kraken_ws_channels)
 test('exchange_ws_gen', test_exchange_ws_gen)

@@ -13,6 +13,7 @@
 #include "clam.h"
 #include "common.h"
 #include "curl.h"
+#include "curl_flight.h"
 #include "json.h"
 #include "kv.h"
 #include "plugin.h"
@@ -87,6 +88,7 @@ typedef struct
   tmdb_title_cb_t  title_cb;             // TITLE
   tmdb_person_cb_t person_cb;            // PERSON
   void            *user;
+  uint64_t         slot;                 // tmdb_flight (see below)
 } tmdb_req_t;
 
 // Module state: detail + trending caches, one mutex covering all three.
@@ -97,6 +99,17 @@ static uint32_t          tmdb_title_cursor  = 0;
 static uint32_t          tmdb_person_cursor = 0;
 static uint32_t          tmdb_trend_cursor  = 0;
 static pthread_mutex_t   tmdb_cache_mu;
+
+// Every request this plugin puts on the wire, so tmdb_stop() can cancel
+// them and wait out their callbacks before tmdb_deinit() destroys the
+// cache mutex those callbacks take (PLUGIN.md §Lifecycle Contract). This
+// is the plugin the rule was measured on.
+static curl_flight_t     tmdb_flight;
+
+// How long tmdb_stop() will wait for its own completion callbacks. A
+// cancelled transfer is delivered on the multi loop's next pass, so this
+// is a scheduling margin, not a network timeout.
+#define TMDB_STOP_DRAIN_MS 3000
 
 // KV schema
 

@@ -673,11 +673,15 @@ weathergov_alerts_async(double lat, double lon,
 
   // File it before anything can be submitted, never after: a completion
   // can run on a curl worker before the submitting call has returned.
-  wxg_req_track(r);
+  if(wxg_req_track(r) != SUCCESS)
+  {
+    wxg_req_release(r);
+    return(ASYNC_FAILED_UNDELIVERED);
+  }
 
   snprintf(url, sizeof(url), "%s?point=%s", WXG_ALERTS_URL, r->coord);
 
-  if(wxg_http_get(url, r->ua, wxg_alerts_done, r) != SUCCESS)
+  if(wxg_http_get(url, r, wxg_alerts_done) != SUCCESS)
   {
     wxg_req_release(r);
     return(ASYNC_FAILED_UNDELIVERED);

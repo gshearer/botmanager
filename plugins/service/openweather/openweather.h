@@ -10,6 +10,7 @@
 #include "clam.h"
 #include "common.h"
 #include "curl.h"
+#include "curl_flight.h"
 #include "kv.h"
 #include "alloc.h"
 #include "json.h"
@@ -133,6 +134,11 @@ typedef struct ow_request
   // lists are disjoint in time but the freelist is not the thing the
   // unmap sweep walks. See the registry section in openweather.c.
   struct ow_request  *next_active;
+
+  // This request's slot in ow_flight: an idle token between legs, the
+  // current leg's curl id while one is on the wire. Opened by
+  // ow_req_track, moved by ow_http_get, closed by ow_req_release.
+  uint64_t            slot;
 } ow_request_t;
 
 // The caller's half of a request, lifted off it under the registry lock
@@ -184,6 +190,18 @@ typedef struct ow_citycache
 static ow_request_t    *ow_free     = NULL;
 static pthread_mutex_t  ow_free_mu;
 
+// Every chain this plugin has in the air, so ow_stop() can cancel the
+// legs and wait out their callbacks before ow_deinit() destroys the
+// mutexes those callbacks take (PLUGIN.md §Lifecycle Contract). One slot
+// per request, not per leg: geocode -> One Call -> hi/lo -> one GET per
+// alert is a single piece of work wearing a new curl id each time.
+static curl_flight_t      ow_flight;
+
+// How long ow_stop() will wait for its own completion callbacks. A
+// cancelled transfer is delivered on the multi loop's next pass, so this
+// is a scheduling margin, not a network timeout.
+#define OW_STOP_DRAIN_MS 3000
+
 // In-flight registry. Guards `next_active` linkage and every read or
 // write of a request's caller half.
 static ow_request_t    *ow_active_head  = NULL;
@@ -215,7 +233,7 @@ static void             ow_geo_insert(const char *zipcode, double lat,
                             double lon, const char *name);
 static ow_request_t    *ow_req_alloc(void);
 static void             ow_req_release(ow_request_t *r);
-static void             ow_req_track(ow_request_t *r);
+static bool             ow_req_track(ow_request_t *r);
 static void             ow_req_untrack_locked(ow_request_t *r);
 static void             ow_req_take_caller(ow_request_t *r,
                             ow_caller_t *out);

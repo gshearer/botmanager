@@ -659,6 +659,17 @@ curl_request_id(const curl_request_t *req)
   return(req != NULL ? req->id : 0);
 }
 
+bool
+curl_request_abandon(curl_request_t *req)
+{
+  if(req == NULL || req->state != CURL_REQ_CREATED)
+    return(FAIL);
+
+  curl_request_release(req);
+
+  return(SUCCESS);
+}
+
 // Flag the request in `list` (chained through ->next) carrying `id`.
 // Caller holds whichever lock guards that list.
 static bool

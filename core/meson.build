@@ -14,6 +14,7 @@ libcore_sources = [
   'colors.c',
   'cmd.c',
   'curl.c',
+  'curl_flight.c',
   'db.c',
   'display.c',
   'json.c',

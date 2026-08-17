@@ -183,6 +183,8 @@ ow_req_alloc(void)
 static void
 ow_req_release(ow_request_t *r)
 {
+  uint64_t slot = r->slot;
+
   pthread_mutex_lock(&ow_active_mutex);
   ow_req_untrack_locked(r);
   pthread_mutex_unlock(&ow_active_mutex);
@@ -191,6 +193,11 @@ ow_req_release(ow_request_t *r)
   r->next = ow_free;
   ow_free = r;
   pthread_mutex_unlock(&ow_free_mu);
+
+  // Last, always: every terminal path in this plugin ends here, so this
+  // is where the drain in ow_stop() learns the chain is over — and
+  // everything above it touches state ow_deinit() is about to free.
+  curl_flight_close(&ow_flight, slot);
 }
 
 // ----------------------------------------------------------------------
@@ -222,9 +229,15 @@ ow_req_release(ow_request_t *r)
 // how to free its own context, and the caller is precisely what is no
 // longer there. A bounded leak on an operator action beats a SIGSEGV.
 
-static void
+// The flight is what stop() waits on, so the slot opens before the
+// registry entry does. A grounded flight refuses here, and the entry
+// point hands the work straight back to its caller.
+static bool
 ow_req_track(ow_request_t *r)
 {
+  if(curl_flight_open(&ow_flight, &r->slot) != SUCCESS)
+    return(FAIL);
+
   pthread_mutex_lock(&ow_active_mutex);
 
   r->next_active = ow_active_head;
@@ -232,6 +245,22 @@ ow_req_track(ow_request_t *r)
   ow_active_count++;
 
   pthread_mutex_unlock(&ow_active_mutex);
+
+  return(SUCCESS);
+}
+
+// One leg of `r`. Takes the request rather than a bare user pointer
+// because the leg has to move r's flight slot before it is submitted: a
+// completion can run on a curl worker before the submit has returned.
+static bool
+ow_http_get(const char *url, ow_request_t *r, curl_done_cb_t cb)
+{
+  curl_request_t *req = curl_request_create(CURL_METHOD_GET, url, cb, r);
+
+  if(req == NULL)
+    return(FAIL);
+
+  return(curl_flight_relay(&ow_flight, req, &r->slot));
 }
 
 // Caller holds ow_active_mutex. A no-op for a request that is not on the
@@ -1054,7 +1083,7 @@ ow_submit_current(ow_request_t *r)
       "%s?lat=%.6f&lon=%.6f&units=%s&appid=%s",
       OW_ONECALL_CURRENT_URL, r->lat, r->lon, r->units, r->apikey);
 
-  if(curl_get(url, ow_current_done, r) != SUCCESS)
+  if(ow_http_get(url, r, ow_current_done) != SUCCESS)
   {
     ow_deliver_current_err(r, "Error: failed to submit weather request");
     ow_req_release(r);
@@ -1116,7 +1145,7 @@ ow_submit_daily(ow_request_t *r)
       OW_ONECALL_TIMELINE_URL, r->lat, r->lon,
       OW_FCAST_DAILY_CNT, r->units, r->apikey);
 
-  if(curl_get(url, ow_daily_done, r) != SUCCESS)
+  if(ow_http_get(url, r, ow_daily_done) != SUCCESS)
   {
     ow_deliver_forecast_err(r, "Error: failed to submit forecast request");
     ow_req_release(r);
@@ -1177,7 +1206,7 @@ ow_submit_hourly(ow_request_t *r)
       OW_ONECALL_TIMELINE_URL, r->lat, r->lon,
       OW_FCAST_HOURLY_CNT, r->units, r->apikey);
 
-  if(curl_get(url, ow_hourly_done, r) != SUCCESS)
+  if(ow_http_get(url, r, ow_hourly_done) != SUCCESS)
   {
     ow_deliver_forecast_err(r, "Error: failed to submit forecast request");
     ow_req_release(r);
@@ -1248,7 +1277,7 @@ ow_submit_next_alert(ow_request_t *r)
   snprintf(url, sizeof(url), "%s/%s?appid=%s",
       OW_ONECALL_ALERT_URL, enc, r->apikey);
 
-  if(curl_get(url, ow_alert_done, r) != SUCCESS)
+  if(ow_http_get(url, r, ow_alert_done) != SUCCESS)
   {
     // Skip this id and continue; recursion depth is bounded by
     // OPENWEATHER_ALERT_MAX.
@@ -1521,7 +1550,7 @@ ow_kick_off(ow_request_t *r)
   snprintf(url, sizeof(url), "%s?zip=%s&appid=%s",
       OW_GEO_URL, r->zipcode, r->apikey);
 
-  if(curl_get(url, ow_geocode_done, r) != SUCCESS)
+  if(ow_http_get(url, r, ow_geocode_done) != SUCCESS)
     return(FAIL);
 
   return(SUCCESS);
@@ -1549,7 +1578,11 @@ openweather_fetch_current(const char *zipcode,
 
   // File it before anything can be submitted, never after: a completion
   // can run on a curl worker before the submitting call has returned.
-  ow_req_track(r);
+  if(ow_req_track(r) != SUCCESS)
+  {
+    ow_req_release(r);
+    return(FAIL);
+  }
 
   pr = ow_prepare_request(r, zipcode, errbuf, sizeof(errbuf));
 
@@ -1594,7 +1627,11 @@ ow_fetch_forecast_common(ow_req_type_t type, const char *zipcode,
   r->cb.forecast = done_cb;
   r->user        = user;
 
-  ow_req_track(r);
+  if(ow_req_track(r) != SUCCESS)
+  {
+    ow_req_release(r);
+    return(FAIL);
+  }
 
   pr = ow_prepare_request(r, zipcode, errbuf, sizeof(errbuf));
 
@@ -2000,6 +2037,7 @@ typedef struct ow_sync_slot
   int              refcount;
   bool             done;
   bool             abandoned;
+  uint64_t         slot;     // ow_flight; closed by ow_sync_cb
   long             status;
   char            *body;
   size_t           body_len;
@@ -2051,7 +2089,42 @@ ow_sync_cb(const curl_response_t *resp)
 
   pthread_mutex_unlock(&slot->mu);
 
-  ow_slot_unref(slot);
+  {
+    uint64_t flight_slot = slot->slot;
+
+    ow_slot_unref(slot);
+
+    // Last, always — ow_slot_unref may have freed `slot`.
+    curl_flight_close(&ow_flight, flight_slot);
+  }
+}
+
+// The sync rendezvous is its own piece of work: one leg, one slot, and
+// no ow_request_t to hang it off. Opening before the submit is what lets
+// ow_stop() cancel a geocode a worker thread is parked on.
+static bool
+ow_http_get_slot(const char *url, ow_sync_slot_t *slot)
+{
+  curl_request_t *req;
+
+  if(curl_flight_open(&ow_flight, &slot->slot) != SUCCESS)
+    return(FAIL);
+
+  req = curl_request_create(CURL_METHOD_GET, url, ow_sync_cb, slot);
+
+  if(req == NULL)
+  {
+    curl_flight_close(&ow_flight, slot->slot);
+    return(FAIL);
+  }
+
+  if(curl_flight_relay(&ow_flight, req, &slot->slot) != SUCCESS)
+  {
+    curl_flight_close(&ow_flight, slot->slot);
+    return(FAIL);
+  }
+
+  return(SUCCESS);
 }
 
 static char *
@@ -2069,7 +2142,7 @@ ow_http_get_sync(const char *url, uint32_t timeout_secs,
   pthread_cond_init(&slot->cv, NULL);
   slot->refcount = 2;
 
-  if(curl_get(url, ow_sync_cb, slot) != SUCCESS)
+  if(ow_http_get_slot(url, slot) != SUCCESS)
   {
     ow_slot_unref(slot);
     ow_slot_unref(slot);
@@ -2479,6 +2552,7 @@ ow_init(void)
 {
   pthread_mutex_init(&ow_free_mu, NULL);
   pthread_mutex_init(&ow_geo_cache_mu, NULL);
+  curl_flight_init(&ow_flight);
   memset(ow_geo_cache,  0, sizeof(ow_geo_cache));
   memset(ow_city_cache, 0, sizeof(ow_city_cache));
 
@@ -2487,6 +2561,28 @@ ow_init(void)
   clam(CLAM_INFO, OW_CTX, "openweather plugin initialized");
 
   return(SUCCESS);
+}
+
+// The plugin's whole Class-B holding is the work in ow_flight: no
+// threads, no tasks, no bound vtable. A cancelled request still
+// delivers, so what this waits for is openweather's own callbacks
+// finishing — not the transfers. It also unparks a worker sitting in
+// ow_http_get_sync: that geocode is cancelled here, and its rendezvous
+// wakes with an empty body rather than waiting out its own timeout.
+static bool
+ow_stop(void)
+{
+  uint32_t left = curl_flight_drain(&ow_flight, OW_STOP_DRAIN_MS);
+
+  if(left == 0)
+    return(SUCCESS);
+
+  clam(CLAM_WARN, OW_CTX, "%u weather request(s) still airborne after a "
+      "%u ms cancel-and-drain; refusing the unload rather than "
+      "deinitializing under their callbacks", left,
+      (uint32_t)OW_STOP_DRAIN_MS);
+
+  return(FAIL);
 }
 
 static void
@@ -2500,11 +2596,12 @@ ow_deinit(void)
   stranded = ow_active_count;
   pthread_mutex_unlock(&ow_active_mutex);
 
-  // Nothing to free here: a stranded request is still owned by a live
-  // curl transfer whose completion lives in the mapping now going away.
-  // Core's residual audit sees those — ow_*_done is curl_iter_req_t.cb
-  // for every one — so it is the audit that refuses the dlclose, not us.
-  // Naming the count here is what makes that refusal legible.
+  // Nothing to free here, and since ow_stop() this is normally zero: the
+  // drain has already cancelled every leg and waited out its callback. A
+  // survivor means the drain timed out, stop() refused the unload, and
+  // we are on the shutdown path instead — where core's residual audit
+  // sees them, since ow_*_done is curl_iter_req_t.cb for every one.
+  // Naming the count is what makes that legible.
   if(stranded > 0)
     clam(CLAM_WARN, OW_CTX, "%u weather request(s) still in flight at "
         "deinit", stranded);
@@ -2555,6 +2652,8 @@ ow_deinit(void)
 
   pthread_mutex_destroy(&ow_geo_cache_mu);
 
+  curl_flight_destroy(&ow_flight);
+
   clam(CLAM_INFO, OW_CTX, "openweather plugin deinitialized");
 }
 
@@ -2573,7 +2672,7 @@ const plugin_desc_t bm_plugin_desc = {
   .kv_schema_count = 3,
   .init            = ow_init,
   .start           = NULL,
-  .stop            = NULL,
+  .stop            = ow_stop,
   .deinit          = ow_deinit,
   .ext             = NULL,
 };

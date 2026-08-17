@@ -171,6 +171,13 @@ bool curl_request_submit_wait(curl_request_t *req, uint32_t wait_ms);
 // reused, so one that has been delivered simply matches nothing.
 uint64_t curl_request_id(const curl_request_t *req);
 
+// Give back a request that was built and will now never be sent. The
+// only way to free a CREATED request without submitting it — every
+// other path out of curl_request_create ends in a submit, which owns
+// the handle from then on. FAIL when the request is past CREATED, where
+// the subsystem owns it and this call would double-free.
+bool curl_request_abandon(curl_request_t *req);
+
 // Ask the subsystem to abandon request `id`. Thread-safe and
 // non-blocking: the request is flagged and the multi loop finishes it
 // with CURLE_ABORTED_BY_CALLBACK, so the completion callback still

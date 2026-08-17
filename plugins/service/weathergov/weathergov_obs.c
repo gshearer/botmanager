@@ -334,7 +334,7 @@ wxg_obs_done(const curl_response_t *resp)
   snprintf(url, sizeof(url), "%s/%s/forecast?units=%s", WXG_GRID_URL,
       r->grid, r->units);
 
-  if(wxg_http_get(url, r->ua, wxg_obs_forecast_done, r) != SUCCESS)
+  if(wxg_http_get(url, r, wxg_obs_forecast_done) != SUCCESS)
     wxg_current_deliver(r);
 }
 
@@ -348,7 +348,7 @@ wxg_obs_submit(wxg_request_t *r)
   snprintf(url, sizeof(url), "%s/%s/observations/latest", WXG_STATIONS_URL,
       r->station);
 
-  return(wxg_http_get(url, r->ua, wxg_obs_done, r));
+  return(wxg_http_get(url, r, wxg_obs_done));
 }
 
 // Leg 1 -> leg 2. features[0] is the nearest station: the list arrives
@@ -432,7 +432,11 @@ weathergov_current_async(const weathergov_point_t *pt, const char *units,
 
   // File it before anything can be submitted, never after: a completion
   // can run on a curl worker before the submitting call has returned.
-  wxg_req_track(r);
+  if(wxg_req_track(r) != SUCCESS)
+  {
+    wxg_req_release(r);
+    return(ASYNC_FAILED_UNDELIVERED);
+  }
 
   warm = wxg_station_lookup(r->grid, r->station, sizeof(r->station));
 
@@ -452,7 +456,7 @@ weathergov_current_async(const weathergov_point_t *pt, const char *units,
 
   snprintf(url, sizeof(url), "%s/%s/stations", WXG_GRID_URL, r->grid);
 
-  if(wxg_http_get(url, r->ua, wxg_stations_done, r) != SUCCESS)
+  if(wxg_http_get(url, r, wxg_stations_done) != SUCCESS)
   {
     wxg_req_release(r);
     return(ASYNC_FAILED_UNDELIVERED);

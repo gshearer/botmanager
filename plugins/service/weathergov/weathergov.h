@@ -11,6 +11,7 @@
 #include "clam.h"
 #include "common.h"
 #include "curl.h"
+#include "curl_flight.h"
 #include "kv.h"
 #include "alloc.h"
 #include "json.h"
@@ -133,6 +134,11 @@ typedef struct wxg_request
   // lists are disjoint in time but the freelist is not the thing the
   // unmap sweep walks. See the registry section in weathergov.c.
   struct wxg_request *next_active;
+
+  // This request's slot in wxg_flight: 0 between legs, the current
+  // leg's curl id while one is on the wire. Opened by wxg_req_track,
+  // moved by wxg_http_get, closed by wxg_req_release.
+  uint64_t            slot;
 } wxg_request_t;
 
 // The caller's half of a request, lifted off it under the registry lock
@@ -168,8 +174,9 @@ void           wxg_req_release(wxg_request_t *r);
 
 // File a request BEFORE anything can be submitted, never after: a
 // completion can run on a curl worker before the submitting call has
-// returned.
-void           wxg_req_track(wxg_request_t *r);
+// returned. FAIL means the plugin is stopping and the caller must
+// refuse the work — its callback could not be waited out.
+bool           wxg_req_track(wxg_request_t *r);
 
 // Lift the caller's half off `r` and unlink it, both under the registry
 // lock. Deliver through the returned copy, never through `r->cb` — see
@@ -177,8 +184,10 @@ void           wxg_req_track(wxg_request_t *r);
 void           wxg_req_take_caller(wxg_request_t *r, wxg_caller_t *out);
 
 void           wxg_ua(char *out, size_t sz);
-bool           wxg_http_get(const char *url, const char *ua,
-                   curl_done_cb_t cb, void *user);
+// One leg of `r`. Takes the request rather than a bare user pointer
+// because the leg has to move r's flight slot before it is submitted.
+bool           wxg_http_get(const char *url, wxg_request_t *r,
+                   curl_done_cb_t cb);
 bool           wxg_http_status_ok(const curl_response_t *resp, char *err,
                    size_t err_sz, bool *covered);
 
@@ -344,6 +353,18 @@ static pthread_mutex_t    wxg_free_mu;
 static wxg_request_t     *wxg_active_head  = NULL;
 static uint32_t           wxg_active_count = 0;
 static pthread_mutex_t    wxg_active_mutex = PTHREAD_MUTEX_INITIALIZER;
+
+// Every piece of work this plugin has in the air, so wxg_stop() can
+// cancel the legs and wait out their callbacks before wxg_deinit()
+// destroys the mutexes those callbacks take (PLUGIN.md §Lifecycle
+// Contract). One slot per request, not per leg: point -> forecast ->
+// observation is one piece of work wearing three curl ids.
+static curl_flight_t      wxg_flight;
+
+// How long wxg_stop() will wait for its own completion callbacks. A
+// cancelled transfer is delivered on the multi loop's next pass, so this
+// is a scheduling margin, not a network timeout.
+#define WXG_STOP_DRAIN_MS 3000
 
 static wxg_pointcache_t  *wxg_point_cache[WXG_POINT_CACHE_BUCKETS];
 static pthread_mutex_t    wxg_point_cache_mu;
