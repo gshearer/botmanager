@@ -14,6 +14,11 @@
 // crash, so the suite is red on a regression under a plain -O2 build
 // and does not need a sanitizer to notice.
 
+// The help string carries the same promise for the same reason (OBS-14):
+// "static caller-owned storage" meant static *in the owning .so*, so the
+// pointer outlived the mapping it pointed into. Those rows live at the
+// bottom of this file.
+
 #include "test.h"
 
 #include "alloc.h"
@@ -160,6 +165,92 @@ case_non_string_keys(void)
       "", kv_get_str("t.empty"));
 }
 
+// A help string long enough to prove the value bound does NOT apply to it:
+// help text is prose and routinely runs past KV_STR_SZ.
+#define LONG_HELP_LEN (KV_STR_SZ + 200)
+
+// The row OBS-14 is about. Every registration hands core a `const char *`
+// the caller swears is static — and it is, in the caller's own .so, which
+// a plugin unload unmaps out from under the one reader in core. There is
+// no dlclose to stage in a unit test, so the equivalent is staged here:
+// storage the registry does not own, released after the registration.
+// Failure is silent either way — a freed buffer usually still reads back
+// the right bytes.
+static void
+case_help_outlives_its_storage(void)
+{
+  char       *owned = mem_alloc("test", "help", 64);
+  const char *held;
+
+  strlcpy(owned, "the caller's storage", 64);
+
+  kv_register("t.help", KV_UINT32, "1", NULL, NULL, owned);
+
+  held = kv_get_help("t.help");
+
+  test_check_str(SUITE, "help reads back what was registered",
+      "the caller's storage", held);
+
+  test_check_bool(SUITE, "and it is not the caller's pointer",
+      true, held != owned);
+
+  // The caller's storage goes away, exactly as its mapping does.
+  memset(owned, 'z', 63);
+  owned[63] = '\0';
+  mem_free(owned);
+
+  test_check_str(SUITE, "the held pointer survives its storage",
+      "the caller's storage", held);
+
+  test_check_str(SUITE, "and so does a fresh read",
+      "the caller's storage", kv_get_help("t.help"));
+}
+
+// Interning is what makes the row above cheap: the per-bot schemas hand
+// one literal to five bots' worth of keys.
+static void
+case_help_interning(void)
+{
+  kv_register("t.h1", KV_BOOL, "false", NULL, NULL, "one spelling");
+  kv_register("t.h2", KV_BOOL, "false", NULL, NULL, "one spelling");
+
+  test_check_bool(SUITE, "equal help is one string",
+      true, kv_get_help("t.h1") == kv_get_help("t.h2"));
+
+  test_check_bool(SUITE, "unequal help is not",
+      true, kv_get_help("t.h1") != kv_get_help("t.help"));
+}
+
+// NULL help is legal (irc.c registers one) and must not become "".
+static void
+case_help_absent(void)
+{
+  kv_register("t.h0", KV_BOOL, "false", NULL, NULL, NULL);
+
+  test_check_bool(SUITE, "NULL help stays NULL",
+      true, kv_get_help("t.h0") == NULL);
+
+  test_check_bool(SUITE, "an unregistered key reads NULL help",
+      true, kv_get_help("t.nope") == NULL);
+}
+
+// KV_STR_SZ bounds a value because a value is serialized into buffers of
+// that size. Help is prose and answers only to the renderer, so the bound
+// must not reach it — truncating it would be a new silent defect.
+static void
+case_help_is_not_bounded_like_a_value(void)
+{
+  char help[LONG_HELP_LEN + 1];
+
+  memset(help, 'h', sizeof(help) - 1);
+  help[sizeof(help) - 1] = '\0';
+
+  kv_register("t.hlong", KV_BOOL, "false", NULL, NULL, help);
+
+  test_check_sz(SUITE, "long help is kept whole",
+      LONG_HELP_LEN, strlen(kv_get_help("t.hlong")));
+}
+
 int
 main(void)
 {
@@ -172,6 +263,11 @@ main(void)
   case_interning();
   case_bound();
   case_non_string_keys();
+
+  case_help_outlives_its_storage();
+  case_help_interning();
+  case_help_absent();
+  case_help_is_not_bounded_like_a_value();
 
   return(test_report(SUITE));
 }

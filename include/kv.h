@@ -129,7 +129,14 @@ bool kv_set_str(const char *key, const char *val);
 
 bool kv_exists(const char *key);
 
-// Returns help text pointer (may be NULL), or NULL if key not found.
+// Returns an interned help string, or NULL — for a key that has none as
+// much as for a key that does not exist.
+//
+// kv_register interns whatever it is handed, so the caller's storage is
+// its own business: a literal, a stack buffer or a plugin's .rodata are
+// all copied in, and the pointer this returns outlives every one of them
+// (OBS-14). Help is never rewritten in place and never re-read from the
+// database, so unlike kv_get_str's answer it cannot even go stale.
 const char *kv_get_help(const char *key);
 
 // Returns NULL if key not found.
@@ -211,8 +218,9 @@ bool kv_unregister(const char *key);
 // one loaded object's mapping -- along with any NL responder whose hint
 // lives in that same range. KV entries are Class A (see root TODO.md
 // §PLIFE-3): core reclaims whatever a plugin's deinit() left, because a
-// retained cb / help pointer into an unmapped .so is a crash, and the
-// persisted row survives to rehydrate the key on reload.
+// retained cb pointer into an unmapped .so is a crash, and the persisted
+// row survives to rehydrate the key on reload. (help is no longer among
+// them -- kv_register interns it. See kv_get_help.)
 // Returns the number of entries removed.
 uint32_t kv_reclaim_owned(uintptr_t lo, uintptr_t hi);
 
@@ -222,6 +230,17 @@ const char *kv_type_name(kv_type_t type);
 // NL-bridge visible (/kv <suffix>) only when an nl_t is attached via
 // kv_register_nl. All strings and arrays are static / caller-owned;
 // the registry stores pointers only and never copies.
+//
+// ⚠ This is a graph of pointers, not a string, so it gets none of the
+// lifetime kv_get_str and kv_get_help promise -- interning it would mean
+// copying the graph. "Static" here means static *in the owning object*,
+// and a plugin unload unmaps it: core drops the registration
+// (kv_reclaim_owned), but a reader that RETAINS a `const kv_nl_t *`
+// across that unload is holding a dead page. Read it, use it, drop it --
+// or keep the hint in the same object as the code that holds it, which
+// is why the arrangement is safe today (every hint in the tree is chat's
+// and every reader of one is chat's). A second consumer inherits no such
+// guarantee. OBS-14.
 typedef struct
 {
   const char         *when;              // REQUIRED — LLM cue

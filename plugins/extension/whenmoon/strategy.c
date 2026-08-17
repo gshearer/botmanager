@@ -263,10 +263,10 @@ wm_strategy_register_global_param(const char *strategy_name,
   wm_strategy_format_default(p, def, sizeof(def));
   type = wm_strategy_param_kv_type(p->type);
 
-  // Owned by the strategy, not by us: `p` and its help string live in
-  // the strategy plugin's .rodata, so the entry has to name that
-  // mapping or it survives the strategy's unload with a dangling help
-  // pointer -- which is exactly what an unload audit reports.
+  // Owned by the strategy, not by us: `p` lives in the strategy
+  // plugin's .rodata, so the entry has to name that mapping or a param
+  // slot survives the strategy that defined it. (The help string is no
+  // longer part of the argument -- kv_register interns it, OBS-14.)
   if(kv_register_owned(path, type, def, NULL, NULL,
          p->help != NULL ? p->help : "", p) != SUCCESS)
     clam(CLAM_WARN, WHENMOON_CTX,

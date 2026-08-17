@@ -1616,9 +1616,9 @@ mw_start(void)
       continue;
     }
 
-    // Per-exchange KV registration, table-driven. Keys are copied by
-    // kv_register; help pointers are NOT — the table's literals keep
-    // them alive for the process lifetime (WM-MW-HELP-1). MW-3
+    // Per-exchange KV registration, table-driven. Keys and help are
+    // both copied by kv_register (help is interned since OBS-14), so
+    // the table's storage is ours alone to reason about. MW-3
     // detector thresholds share the `0 → default` convention except
     // min_vol_usd, where 0 is a valid operator-set "no floor" (see
     // mw_load_detector_thresholds). A non-SUCCESS return means the

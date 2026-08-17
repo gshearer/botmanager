@@ -87,17 +87,16 @@ find_locked(const char *key)
   return(NULL);
 }
 
-// Return the one immortal copy of the first KV_STR_SZ-1 bytes of s,
-// creating it if this is the first time that string has been stored.
-// The bound is the same one the inline buffer used to impose, so an
-// over-long value truncates exactly as it always did.
+// Return the one immortal copy of the first `len` bytes of s, creating
+// it if this is the first time those bytes have been stored. Callers
+// choose the length because the two things interned here answer to
+// different bounds: a value truncates at KV_STR_SZ-1, help does not.
 //
 // Never returns NULL: mem_alloc aborts rather than fail.
 static const char *
-kv_intern(const char *s)
+intern_bytes(const char *s, size_t len)
 {
   kv_str_node_t *n;
-  size_t         len    = strnlen(s, KV_STR_SZ - 1);
   uint32_t       h      = 5381;
   uint32_t       bucket;
 
@@ -128,6 +127,27 @@ kv_intern(const char *s)
   pthread_mutex_unlock(&kv_intern_mutex);
 
   return(n->s);
+}
+
+// A KV value. The bound is the one the entry's inline buffer used to
+// impose, so an over-long value truncates exactly as it always did.
+static const char *
+kv_intern(const char *s)
+{
+  return(intern_bytes(s, strnlen(s, KV_STR_SZ - 1)));
+}
+
+// A KV help string (OBS-14). "Static caller-owned storage" meant static
+// in the *owning plugin's* mapping, so the pointer the registry retained
+// outlived the object it pointed into and the one reader in core
+// (cmd.c's `/help kv`) read an unmapped page. Interning gives help the
+// same lifetime kv_get_str's answer has: immortal, and nobody's to free.
+// No bound applies — help is prose, and truncating it would trade a rare
+// crash for a permanent silent one.
+static const char *
+intern_help(const char *s)
+{
+  return(intern_bytes(s, strlen(s)));
 }
 
 static bool
@@ -463,7 +483,7 @@ kv_register_owned(const char *key, kv_type_t type, const char *default_val,
   e->val      = val;
   e->cb       = cb;
   e->cb_data  = cb_data;
-  e->help     = help;
+  e->help     = (help != NULL) ? intern_help(help) : NULL;
   e->owner_pc = owner_pc;
   e->dirty    = true;   // new entries need DB persistence
   e->secret   = kv_is_secret_key(key);
