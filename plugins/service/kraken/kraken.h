@@ -39,6 +39,9 @@
 #define KR_BODY_SZ       4096
 // Error message buffer for transient classifier output.
 #define KR_ERR_SZ        128
+// How long kr_stop() waits for its own completion callbacks to finish
+// after cancelling them. The same budget every flighted plugin uses.
+#define KR_STOP_DRAIN_MS 3000
 
 // kraken_exchange.c — vtable registration with the feature_exchange
 // abstraction. Called from kr_start.

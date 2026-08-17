@@ -14,6 +14,7 @@
 #define KR_INTERNAL
 #include "kraken.h"
 
+#include "curl_flight.h"
 #include "json.h"
 
 #include <pthread.h>
@@ -26,6 +27,13 @@
 
 static kr_request_t   *kr_req_free = NULL;
 static pthread_mutex_t kr_req_mu;
+
+// Every kraken transfer — typed wrapper, exchange-vtable dispatch, WS
+// token mint — is sent from one of the two submitters below, so one
+// flight covers the plugin. kr_req_mu itself is the reason it has to:
+// kr_rest_deinit destroys it, and every completion path takes it on the
+// way out through kr_req_release (root TODO.md §SC-OBSERVED OBS-39).
+static curl_flight_t   kr_flight;
 
 // ------------------------------------------------------------------
 // Freelist
@@ -57,8 +65,12 @@ kr_req_alloc(void)
 void
 kr_req_release(kr_request_t *r)
 {
+  uint64_t slot;
+
   if(r == NULL)
     return;
+
+  slot = r->slot;
 
   if(r->body != NULL)
   {
@@ -71,6 +83,11 @@ kr_req_release(kr_request_t *r)
   r->next     = kr_req_free;
   kr_req_free = r;
   pthread_mutex_unlock(&kr_req_mu);
+
+  // Last, always: every typed path in this plugin ends here, so this is
+  // where kr_rest_drain() learns the work is over — and kr_req_mu, just
+  // above it, is one of the locks kr_deinit() destroys.
+  curl_flight_close(&kr_flight, slot);
 }
 
 // ------------------------------------------------------------------
@@ -266,8 +283,8 @@ kr_classify_exchange(int http_status, const char *body, size_t body_len,
 // ------------------------------------------------------------------
 
 bool
-kr_submit_public(void *user_data, uint8_t prio, const char *path,
-    curl_done_cb_t done_cb)
+kr_submit_public(void *user_data, uint64_t *slot, uint8_t prio,
+    const char *path, curl_done_cb_t done_cb)
 {
   curl_request_t *cr;
   char            base[KR_URL_SZ];
@@ -275,7 +292,7 @@ kr_submit_public(void *user_data, uint8_t prio, const char *path,
   uint32_t        timeout_secs;
   int             n;
 
-  if(path == NULL || path[0] == '\0' || done_cb == NULL)
+  if(path == NULL || slot == NULL || path[0] == '\0' || done_cb == NULL)
     return(FAIL);
 
   if(kr_rest_base_url(base, sizeof(base)) != SUCCESS)
@@ -292,12 +309,23 @@ kr_submit_public(void *user_data, uint8_t prio, const char *path,
     return(FAIL);
   }
 
+  // Nothing is on the wire until the relay below, so the slot opens
+  // here: every refusal above it has nothing to give back, and a
+  // grounded flight turns the work away before curl ever sees it.
+  if(curl_flight_open(&kr_flight, slot) != SUCCESS)
+  {
+    clam(CLAM_WARN, KR_CTX,
+        "submit: kraken is stopping; refusing path='%s'", path);
+    return(FAIL);
+  }
+
   cr = curl_request_create(CURL_METHOD_GET, url, done_cb, user_data);
 
   if(cr == NULL)
   {
     clam(CLAM_WARN, KR_CTX,
         "submit: curl_request_create failed url='%s'", url);
+    curl_flight_close(&kr_flight, *slot);
     return(FAIL);
   }
 
@@ -308,10 +336,11 @@ kr_submit_public(void *user_data, uint8_t prio, const char *path,
   if(timeout_secs > 0)
     (void)curl_request_set_timeout(cr, timeout_secs);
 
-  if(curl_request_submit(cr) != SUCCESS)
+  if(curl_flight_relay(&kr_flight, cr, slot) != SUCCESS)
   {
     clam(CLAM_WARN, KR_CTX,
         "submit: curl_request_submit failed url='%s'", url);
+    curl_flight_close(&kr_flight, *slot);
     return(FAIL);
   }
 
@@ -355,8 +384,9 @@ kr_build_private_body(const char *nonce_str, size_t nonce_len,
 }
 
 bool
-kr_submit_private(void *user_data, uint8_t prio, const char *path,
-    const char *body, size_t body_len, curl_done_cb_t done_cb)
+kr_submit_private(void *user_data, uint64_t *slot, uint8_t prio,
+    const char *path, const char *body, size_t body_len,
+    curl_done_cb_t done_cb)
 {
   curl_request_t *cr;
   char            base[KR_URL_SZ];
@@ -372,7 +402,7 @@ kr_submit_private(void *user_data, uint8_t prio, const char *path,
   uint32_t        timeout_secs;
   int             n;
 
-  if(path == NULL || path[0] == '\0' || done_cb == NULL)
+  if(path == NULL || slot == NULL || path[0] == '\0' || done_cb == NULL)
     return(FAIL);
 
   if(!kr_apikey_configured())
@@ -459,6 +489,17 @@ kr_submit_private(void *user_data, uint8_t prio, const char *path,
     return(FAIL);
   }
 
+  // As in kr_submit_public: the slot opens where the transfer begins,
+  // not where the caller committed, so every refusal above gives back
+  // nothing and a stopping plugin refuses here.
+  if(curl_flight_open(&kr_flight, slot) != SUCCESS)
+  {
+    clam(CLAM_WARN, KR_CTX,
+        "private submit: kraken is stopping; refusing path='%s'", path);
+    mem_free(full_body);
+    return(FAIL);
+  }
+
   cr = curl_request_create(CURL_METHOD_POST, url, done_cb, user_data);
 
   if(cr == NULL)
@@ -466,6 +507,7 @@ kr_submit_private(void *user_data, uint8_t prio, const char *path,
     clam(CLAM_WARN, KR_CTX,
         "private submit: curl_request_create failed url='%s'", url);
     mem_free(full_body);
+    curl_flight_close(&kr_flight, *slot);
     return(FAIL);
   }
 
@@ -485,10 +527,11 @@ kr_submit_private(void *user_data, uint8_t prio, const char *path,
   // The curl subsystem copied the body bytes into its own buffer.
   mem_free(full_body);
 
-  if(curl_request_submit(cr) != SUCCESS)
+  if(curl_flight_relay(&kr_flight, cr, slot) != SUCCESS)
   {
     clam(CLAM_WARN, KR_CTX,
         "private submit: curl_request_submit failed url='%s'", url);
+    curl_flight_close(&kr_flight, *slot);
     return(FAIL);
   }
 
@@ -640,6 +683,19 @@ void
 kr_rest_init(void)
 {
   pthread_mutex_init(&kr_req_mu, NULL);
+  curl_flight_init(&kr_flight);
+}
+
+uint32_t
+kr_rest_drain(uint32_t ms)
+{
+  return(curl_flight_drain(&kr_flight, ms));
+}
+
+void
+kr_rest_slot_close(uint64_t slot)
+{
+  curl_flight_close(&kr_flight, slot);
 }
 
 void
@@ -661,4 +717,6 @@ kr_rest_deinit(void)
 
   pthread_mutex_unlock(&kr_req_mu);
   pthread_mutex_destroy(&kr_req_mu);
+
+  curl_flight_destroy(&kr_flight);
 }

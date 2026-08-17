@@ -161,13 +161,30 @@ gem_start(void)
 static bool
 gem_stop(void)
 {
+  uint32_t left;
+
   if(gem_symbols_task != TASK_HANDLE_NONE)
   {
     task_cancel(gem_symbols_task);
     gem_symbols_task = TASK_HANDLE_NONE;
   }
 
-  // The reader threads are the plugin's only Class-B holding. If one
+  // Before the reader join: cancelling the periodic above does not
+  // cover the symbols request that periodic already submitted, whose
+  // completion takes gem_req_mu and the batch lock that gem_deinit()
+  // is a moment from destroying (OBS-39).
+  left = gem_rest_drain(GEM_STOP_DRAIN_MS);
+
+  if(left > 0)
+  {
+    clam(CLAM_WARN, GEM_CTX, "%u gemini REST request(s) still airborne "
+        "after a %u ms cancel-and-drain; refusing the unload rather than "
+        "deinitializing under their callbacks", left,
+        (uint32_t)GEM_STOP_DRAIN_MS);
+    return(FAIL);
+  }
+
+  // The reader threads are the plugin's other Class-B holding. If one
   // will not come home, say so — an unload past this point unmaps the
   // code it is standing in.
   return(gem_ws_stop());

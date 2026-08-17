@@ -106,6 +106,11 @@ typedef struct cb_request
   } cb;
   void          *user;
 
+  // This request's slot in the plugin's flight: the submitter opens it,
+  // cb_req_release closes it. 0 until the first submit, and again once
+  // it is closed.
+  uint64_t       slot;
+
   struct cb_request *next;   // freelist linkage
 } cb_request_t;
 
@@ -121,6 +126,10 @@ bool    cb_apikey_configured(void);
 // trailing NUL. ~600-700 B in practice for our claim set; 1024 leaves
 // slack for a long key_name string.
 #define CB_JWT_SZ        1024
+
+// How long cb_stop() waits for its own completion callbacks to finish
+// after cancelling them. The same budget every flighted plugin uses.
+#define CB_STOP_DRAIN_MS 3000
 
 // Build a fresh CDP-style JWT for `method path` against the configured
 // REST host. `method` is uppercase ("GET"/"POST"/"DELETE"); `path` is
@@ -148,6 +157,20 @@ void    cb_cdp_deinit(void);
 // Lifecycle. Paired with cb_init / cb_deinit in coinbase.c.
 void            cb_rest_init(void);
 void            cb_rest_deinit(void);
+
+// From cb_stop(): ground the plugin's curl_flight_t, cancel whatever is
+// on the wire and wait up to `ms` for the callbacks to finish with the
+// state cb_deinit() is about to tear down. Returns the number of pieces
+// of work still open — a non-zero return is a stop() that must refuse.
+// Every coinbase transfer rides this flight.
+uint32_t        cb_rest_drain(uint32_t ms);
+
+// Give a slot back. For the one request shape that is not cb_request_t
+// — the exchange-vtable handle, whose terminal path lives in another
+// translation unit. The LAST statement of that path: it is what the
+// drain waits for, so anything after it runs against state deinit() may
+// already have freed.
+void            cb_rest_slot_close(uint64_t slot);
 
 // Freelist-managed request context. Zero-initialized on hand-out;
 // caller populates `type`, `cb.<member>`, `user`, and any selectors
@@ -182,7 +205,13 @@ const char *    cb_classify_http(const curl_response_t *resp,
 // `cb_request_t *` as `user_data` and CURL_PRIO_NORMAL as `prio`; the
 // exchange-vtable path passes its own handle and the abstraction's
 // per-request priority byte.
-bool    cb_submit_private(void *user_data, uint8_t prio,
+//
+// `slot` is the caller's flight handle — &r->slot, &h->slot, whatever
+// the completion callback will still be holding when it closes it. The
+// submitter opens it just before the transfer is built and gives it
+// back on every failure of its own, so a FAIL return leaves nothing to
+// close; a stopping plugin refuses here.
+bool    cb_submit_private(void *user_data, uint64_t *slot, uint8_t prio,
             curl_method_t method, const char *path,
             const char *body, size_t body_len,
             curl_done_cb_t done_cb);
@@ -198,8 +227,11 @@ bool    cb_submit_private(void *user_data, uint8_t prio,
 // match EXCHANGE_PRIO_* on purpose so the exchange-vtable submit can
 // pass its 8-bit priority through unchanged). Legacy typed callers
 // (products / ticker) pass CURL_PRIO_NORMAL.
-bool    cb_submit_public(void *user_data, uint8_t prio, const char *path,
-            curl_done_cb_t done_cb);
+//
+// `slot` is the caller's flight handle, exactly as for
+// cb_submit_private.
+bool    cb_submit_public(void *user_data, uint64_t *slot, uint8_t prio,
+            const char *path, curl_done_cb_t done_cb);
 
 // coinbase_exchange.c — vtable registration with the feature_exchange
 // abstraction. Called from cb_init.

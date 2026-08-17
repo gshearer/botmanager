@@ -38,6 +38,12 @@ typedef struct
 
   exchange_response_cb_t  abstr_cb;
   void                   *abstr_user;
+
+  // This dispatch's slot in the plugin's flight (gemini_rest.c). The
+  // submitter opens it; the completion adapter closes it, which is the
+  // end of this mapping's part in the work — the abstraction frees the
+  // handle itself, later and without touching gemini state.
+  uint64_t                slot;
 } gem_exchange_handle_t;
 
 // ------------------------------------------------------------------ //
@@ -50,11 +56,13 @@ gem_exchange_curl_done(const curl_response_t *resp)
   gem_exchange_handle_t  *h = (gem_exchange_handle_t *)resp->user_data;
   exchange_response_cb_t  cb;
   void                   *user;
+  uint64_t                slot;
   bool                    transport_err;
 
   if(h == NULL)
     return;
 
+  slot          = h->slot;
   cb            = h->abstr_cb;
   user          = h->abstr_user;
   transport_err = (resp->curl_code != 0);
@@ -78,6 +86,12 @@ gem_exchange_curl_done(const curl_response_t *resp)
       cb((int)resp->status, resp->body, resp->body_len, NULL, user);
     }
   }
+
+  // Last: the consumer's callback above runs inside this mapping and
+  // reaches back into gemini (the pair cache, the typed adapters), so
+  // the work is not over until it returns. The handle itself outlives
+  // this — the abstraction frees it — and touches no gemini lock.
+  gem_rest_slot_close(slot);
 }
 
 // ------------------------------------------------------------------ //
@@ -170,13 +184,13 @@ gem_exchange_submit(void *handle, uint8_t prio,
       return(FAIL);
     }
 
-    if(gem_submit_private(h, prio, h->path, h->body, h->body_len,
+    if(gem_submit_private(h, &h->slot, prio, h->path, h->body, h->body_len,
           gem_exchange_curl_done) != SUCCESS)
       return(FAIL);
   }
   else
   {
-    if(gem_submit_public(h, prio, h->path, gem_exchange_curl_done)
+    if(gem_submit_public(h, &h->slot, prio, h->path, gem_exchange_curl_done)
         != SUCCESS)
       return(FAIL);
   }

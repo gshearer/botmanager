@@ -16,6 +16,7 @@
 #include "clam.h"
 #include "common.h"
 #include "curl.h"
+#include "curl_flight.h"
 #include "json.h"
 #include "kv.h"
 #include "plugin.h"
@@ -56,6 +57,9 @@
 #define YF_MAX_BATCH    24    // matches yf_batch_t.out[] capacity
 #define YF_SEARCH_MAX   8     // hits returned by a search
 #define YF_CACHE_SZ     64    // per-symbol TTL cache slots
+// How long yf_stop() waits for its own completion callbacks to finish
+// after cancelling them. The same budget every flighted plugin uses.
+#define YF_STOP_DRAIN_MS 3000
 #define YF_SPARK_RAW    512   // max raw close[] points sampled per quote
 #define YF_CRUMB_SZ     64    // crumb token ("ib1a2Yc3dE" shaped)
 #define YF_SYMLIST_SZ   (YF_MAX_BATCH * (YF_ENC_SZ + 1))  // joined ?symbols=
@@ -76,7 +80,7 @@ typedef struct
 // whoever finally resolves it — the cache, the v7 hop, the v8 hop, or an
 // error path. A slot parked on the session queue still owes its unit, so
 // the batch cannot die underneath a pending mint.
-typedef struct
+typedef struct yf_batch
 {
   stockquote_batch_cb_t cb;
   void                 *user;
@@ -93,6 +97,8 @@ typedef struct
   bool                  spark_sent;    // its chart hop is already away
 
   quote_t               out[YF_MAX_BATCH];
+
+  struct yf_batch      *next_active;   // yf_batch_head linkage
 } yf_batch_t;
 
 // Per-request sub-context: which batch, which output slot. spark_only
@@ -103,6 +109,10 @@ typedef struct
   yf_batch_t *batch;
   uint8_t     slot;
   bool        spark_only;
+
+  // This hop's slot in yf_flight — named `flight` rather than `slot`
+  // because `slot` here is already the batch's output index.
+  uint64_t    flight;
 } yf_sub_t;
 
 // A set of slots within one batch that still needs fetching: either
@@ -117,13 +127,23 @@ struct yf_pend
   uint8_t     slots[YF_MAX_BATCH];
   uint8_t     n_slots;
   bool        retried;
+
+  // This set of slots' slot in yf_flight. One handle across both v7
+  // attempts: a crumb rejection re-dispatches the same yf_pend_t, which
+  // is one piece of work wearing a second transfer.
+  uint64_t    flight;
+
   yf_pend_t  *next;
 };
 
 // Mint context: carries the cookie from hop 1 into hop 2.
 typedef struct
 {
-  char cookie[CURL_COOKIE_SZ];
+  char     cookie[CURL_COOKIE_SZ];
+
+  // The mint's slot in yf_flight, held across both hops: the cookie GET
+  // and the crumb GET are one piece of work.
+  uint64_t flight;
 } yf_mint_t;
 
 // Session lifecycle. NONE and FAILED both mean "no usable crumb"; they
@@ -146,10 +166,13 @@ typedef enum
 } yf_acquire_t;
 
 // Search request context (search returns a single result set, no batch).
-typedef struct
+typedef struct yf_search_req
 {
   stockquote_search_cb_t cb;
   void                  *user;
+  uint64_t               flight;   // this search's slot in yf_flight
+
+  struct yf_search_req  *next_active;   // yf_search_head linkage
 } yf_search_req_t;
 
 // Module state: the per-symbol TTL cache. cursor gives round-robin
@@ -162,6 +185,28 @@ static pthread_rwlock_t yf_cache_rwl;
 // yf_sess_lock, including the wait queue — a mint is minted ONCE no
 // matter how many quotes race for it, and everyone who asked meanwhile
 // is on `yf_sess_queue` waiting for the same answer.
+// Every yahoofinance transfer rides this: the mint's two hops, the v7
+// batch quote, each v8 chart hop and each search. yf_deinit destroys
+// yf_cache_rwl and yf_sess_lock, and every one of those completions
+// takes one or both of them (root TODO.md §SC-OBSERVED OBS-39).
+static curl_flight_t    yf_flight;
+
+// The consumer's callback is the one thing in a batch or a search that
+// does not belong to this plugin: `stock` hands it over and `stock` is
+// unloaded FIRST when a reload cascades through us. Core cannot see it
+// — plugin_quiesce range-tests curl_iter_req_t.cb, which for every one
+// of our transfers names THIS mapping — so we keep our own list and
+// NULL what an unload takes away. Measured 2026-08-17: without it, the
+// drain in yf_stop() delivers a cancelled batch into `stock`'s freed
+// .text and the daemon dies with no FATAL line.
+//
+// A batch whose caller left still completes; it simply reports to
+// nobody, and the caller's `user` is leaked because only the caller
+// knew how to free it (PLUGIN.md §Lifecycle Contract).
+static pthread_mutex_t  yf_active_mu = PTHREAD_MUTEX_INITIALIZER;
+static yf_batch_t      *yf_batch_head  = NULL;
+static yf_search_req_t *yf_search_head = NULL;
+
 static pthread_mutex_t  yf_sess_lock;
 static yf_sess_state_t  yf_sess_state    = YF_SESS_NONE;
 static char             yf_sess_cookie[CURL_COOKIE_SZ];
@@ -215,6 +260,14 @@ static bool          yf_cache_lookup(const char *sym, quote_t *out,
 static void          yf_cache_store(const quote_t *q);
 static void          yf_extract_spark(struct json_object *result0, quote_t *q);
 
+static void          yf_ctx_free(void *ctx, uint64_t flight);
+static void          yf_batch_track(yf_batch_t *b);
+static void          yf_batch_take_cb(yf_batch_t *b,
+                         stockquote_batch_cb_t *cb, void **user);
+static void          yf_search_track(yf_search_req_t *r);
+static void          yf_search_take_cb(yf_search_req_t *r,
+                         stockquote_search_cb_t *cb, void **user);
+static void          yf_unmap_cb(uintptr_t lo, uintptr_t hi, void *data);
 static void          yf_slot_done(yf_batch_t *b);
 static void          yf_chart_done(const curl_response_t *resp);
 static void          yf_search_done(const curl_response_t *resp);

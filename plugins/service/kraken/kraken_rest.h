@@ -30,6 +30,20 @@
 void    kr_rest_init(void);
 void    kr_rest_deinit(void);
 
+// From kr_stop(): ground the plugin's curl_flight_t, cancel whatever is
+// on the wire and wait up to `ms` for the callbacks to finish with the
+// state kr_deinit() is about to tear down. Returns the number of pieces
+// of work still open — a non-zero return is a stop() that must refuse.
+// Every kraken transfer rides this flight, whichever submitter sent it.
+uint32_t kr_rest_drain(uint32_t ms);
+
+// Give a slot back. For the two request shapes that are not
+// kr_request_t — the exchange-vtable handle and the WS token fetch —
+// whose terminal paths live in other translation units. The LAST
+// statement of that path: it is what the drain waits for, so anything
+// after it runs against state deinit() may already have freed.
+void    kr_rest_slot_close(uint64_t slot);
+
 // ------------------------------------------------------------------
 // Request context shared across typed wrappers + the curl completion
 // adapters. Freelist-managed; exactly one callback member is valid
@@ -79,6 +93,11 @@ typedef struct kr_request
     kraken_done_assetpairs_cb_t   assetpairs;
   } cb;
   void          *user;
+
+  // This request's slot in the plugin's flight: the submitter opens it,
+  // kr_req_release closes it. 0 until the first submit, and again once
+  // it is closed.
+  uint64_t       slot;
 
   struct kr_request *next;   // freelist linkage
 } kr_request_t;
@@ -137,10 +156,17 @@ bool    kr_rest_base_url(char *out, size_t cap);
 // echoed verbatim back through curl_response_t::user_data; `prio`
 // follows the CURL_PRIO_* byte values (which match EXCHANGE_PRIO_*).
 //
-// Returns FAIL when the base URL is unset, the path overflows, or
-// curl rejects the request. On FAIL the caller must emit any user-
-// facing failure callback (the request context is not released here).
-bool    kr_submit_public(void *user_data, uint8_t prio,
+// `slot` is the caller's flight handle — &r->slot, &h->slot, whatever
+// the completion callback will still be holding when it closes it. The
+// submitter opens it just before the transfer is built and gives it
+// back on every failure of its own, so a FAIL return leaves nothing to
+// close.
+//
+// Returns FAIL when the base URL is unset, the path overflows, the
+// plugin is stopping, or curl rejects the request. On FAIL the caller
+// must emit any user-facing failure callback (the request context is
+// not released here).
+bool    kr_submit_public(void *user_data, uint64_t *slot, uint8_t prio,
             const char *path, curl_done_cb_t done_cb);
 
 // Submit a private REST POST. `path` is the part AFTER /0/private/.
@@ -153,7 +179,7 @@ bool    kr_submit_public(void *user_data, uint8_t prio,
 //
 // FAILs early on absent credentials. On any non-FAIL path the body
 // caller passed in is left untouched.
-bool    kr_submit_private(void *user_data, uint8_t prio,
+bool    kr_submit_private(void *user_data, uint64_t *slot, uint8_t prio,
             const char *path, const char *body, size_t body_len,
             curl_done_cb_t done_cb);
 

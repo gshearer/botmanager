@@ -30,6 +30,20 @@
 void    gem_rest_init(void);
 void    gem_rest_deinit(void);
 
+// From gem_stop(): ground the plugin's curl_flight_t, cancel whatever
+// is on the wire and wait up to `ms` for the callbacks to finish with
+// the state gem_deinit() is about to tear down. Returns the number of
+// pieces of work still open — a non-zero return is a stop() that must
+// refuse. Every gemini transfer rides this flight.
+uint32_t gem_rest_drain(uint32_t ms);
+
+// Give a slot back. For the one request shape that is not
+// gem_request_t — the exchange-vtable handle, whose terminal path
+// lives in another translation unit. The LAST statement of that path:
+// it is what the drain waits for, so anything after it runs against
+// state deinit() may already have freed.
+void    gem_rest_slot_close(uint64_t slot);
+
 // ------------------------------------------------------------------
 // Request context shared across typed wrappers + the curl completion
 // adapters. Freelist-managed; exactly one callback member is valid
@@ -90,6 +104,11 @@ typedef struct gem_request
   // batch; per-request pointer is borrowed.
   void          *batch;
 
+  // This request's slot in the plugin's flight: the submitter opens it,
+  // gem_req_release closes it. 0 until the first submit, and again once
+  // it is closed.
+  uint64_t       slot;
+
   struct gem_request *next;   // freelist linkage
 } gem_request_t;
 
@@ -147,10 +166,17 @@ bool    gem_rest_base_url(char *out, size_t cap);
 // verbatim back through curl_response_t::user_data; `prio` follows the
 // CURL_PRIO_* byte values (which match EXCHANGE_PRIO_*).
 //
-// Returns FAIL when the base URL is unset, the path overflows, or
-// curl rejects the request. On FAIL the caller must emit any user-
-// facing failure callback (the request context is not released here).
-bool    gem_submit_public(void *user_data, uint8_t prio,
+// `slot` is the caller's flight handle — &r->slot, &h->slot, whatever
+// the completion callback will still be holding when it closes it. The
+// submitter opens it just before the transfer is built and gives it
+// back on every failure of its own, so a FAIL return leaves nothing to
+// close.
+//
+// Returns FAIL when the base URL is unset, the path overflows, the
+// plugin is stopping, or curl rejects the request. On FAIL the caller
+// must emit any user-facing failure callback (the request context is
+// not released here).
+bool    gem_submit_public(void *user_data, uint64_t *slot, uint8_t prio,
             const char *path, curl_done_cb_t done_cb);
 
 // Submit a private REST POST. `path` is the path portion of the URL
@@ -166,7 +192,7 @@ bool    gem_submit_public(void *user_data, uint8_t prio,
 //
 // FAILs early on absent credentials. The caller-provided
 // `payload_json` is left untouched.
-bool    gem_submit_private(void *user_data, uint8_t prio,
+bool    gem_submit_private(void *user_data, uint64_t *slot, uint8_t prio,
             const char *path, const char *payload_json,
             size_t payload_len, curl_done_cb_t done_cb);
 

@@ -186,13 +186,31 @@ kr_start(void)
 static bool
 kr_stop(void)
 {
+  uint32_t left;
+
   if(kr_assetpairs_task != TASK_HANDLE_NONE)
   {
     task_cancel(kr_assetpairs_task);
     kr_assetpairs_task = TASK_HANDLE_NONE;
   }
 
-  // The reader thread is the plugin's only Class-B holding. If it will
+  // Before the reader join, because a grounded flight is what stops the
+  // reader asking for another WS token on its way out. Cancelling the
+  // periodic above does not cover the AssetPairs request that periodic
+  // already submitted: its completion calls kr_pairs_add, and
+  // kr_pairs_deinit destroys that lock a moment later (OBS-39).
+  left = kr_rest_drain(KR_STOP_DRAIN_MS);
+
+  if(left > 0)
+  {
+    clam(CLAM_WARN, KR_CTX, "%u kraken REST request(s) still airborne "
+        "after a %u ms cancel-and-drain; refusing the unload rather than "
+        "deinitializing under their callbacks", left,
+        (uint32_t)KR_STOP_DRAIN_MS);
+    return(FAIL);
+  }
+
+  // The reader thread is the plugin's other Class-B holding. If it will
   // not come home, say so — an unload past this point unmaps the code
   // it is standing in.
   return(kr_ws_stop());

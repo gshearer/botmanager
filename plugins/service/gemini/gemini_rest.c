@@ -19,6 +19,7 @@
 #define GEM_INTERNAL
 #include "gemini.h"
 
+#include "curl_flight.h"
 #include "gemini_sign.h"
 #include "json.h"
 
@@ -32,6 +33,13 @@
 
 static gem_request_t  *gem_req_free = NULL;
 static pthread_mutex_t gem_req_mu;
+
+// Every gemini transfer — typed wrapper or exchange-vtable dispatch —
+// is sent from one of the two submitters below, so one flight covers
+// the plugin. gem_req_mu itself is the reason it has to: gem_rest_deinit
+// destroys it, and every completion path takes it on the way out
+// through gem_req_release (root TODO.md §SC-OBSERVED OBS-39).
+static curl_flight_t   gem_flight;
 
 // ------------------------------------------------------------------
 // Freelist
@@ -63,8 +71,12 @@ gem_req_alloc(void)
 void
 gem_req_release(gem_request_t *r)
 {
+  uint64_t slot;
+
   if(r == NULL)
     return;
+
+  slot = r->slot;
 
   if(r->payload != NULL)
   {
@@ -77,6 +89,11 @@ gem_req_release(gem_request_t *r)
   r->next      = gem_req_free;
   gem_req_free = r;
   pthread_mutex_unlock(&gem_req_mu);
+
+  // Last, always: every typed path in this plugin ends here, so this is
+  // where gem_rest_drain() learns the work is over — and gem_req_mu,
+  // just above it, is one of the locks gem_deinit() destroys.
+  curl_flight_close(&gem_flight, slot);
 }
 
 // ------------------------------------------------------------------
@@ -308,8 +325,8 @@ gem_classify_exchange(int http_status, const char *body, size_t body_len,
 // ------------------------------------------------------------------
 
 bool
-gem_submit_public(void *user_data, uint8_t prio, const char *path,
-    curl_done_cb_t done_cb)
+gem_submit_public(void *user_data, uint64_t *slot, uint8_t prio,
+    const char *path, curl_done_cb_t done_cb)
 {
   curl_request_t *cr;
   char            base[GEM_URL_SZ];
@@ -317,7 +334,7 @@ gem_submit_public(void *user_data, uint8_t prio, const char *path,
   uint32_t        timeout_secs;
   int             n;
 
-  if(path == NULL || path[0] == '\0' || done_cb == NULL)
+  if(path == NULL || slot == NULL || path[0] == '\0' || done_cb == NULL)
     return(FAIL);
 
   if(gem_rest_base_url(base, sizeof(base)) != SUCCESS)
@@ -334,12 +351,23 @@ gem_submit_public(void *user_data, uint8_t prio, const char *path,
     return(FAIL);
   }
 
+  // Nothing is on the wire until the relay below, so the slot opens
+  // here: every refusal above it has nothing to give back, and a
+  // grounded flight turns the work away before curl ever sees it.
+  if(curl_flight_open(&gem_flight, slot) != SUCCESS)
+  {
+    clam(CLAM_WARN, GEM_CTX,
+        "submit: gemini is stopping; refusing path='%s'", path);
+    return(FAIL);
+  }
+
   cr = curl_request_create(CURL_METHOD_GET, url, done_cb, user_data);
 
   if(cr == NULL)
   {
     clam(CLAM_WARN, GEM_CTX,
         "submit: curl_request_create failed url='%s'", url);
+    curl_flight_close(&gem_flight, *slot);
     return(FAIL);
   }
 
@@ -350,10 +378,11 @@ gem_submit_public(void *user_data, uint8_t prio, const char *path,
   if(timeout_secs > 0)
     (void)curl_request_set_timeout(cr, timeout_secs);
 
-  if(curl_request_submit(cr) != SUCCESS)
+  if(curl_flight_relay(&gem_flight, cr, slot) != SUCCESS)
   {
     clam(CLAM_WARN, GEM_CTX,
         "submit: curl_request_submit failed url='%s'", url);
+    curl_flight_close(&gem_flight, *slot);
     return(FAIL);
   }
 
@@ -361,8 +390,9 @@ gem_submit_public(void *user_data, uint8_t prio, const char *path,
 }
 
 bool
-gem_submit_private(void *user_data, uint8_t prio, const char *path,
-    const char *payload_json, size_t payload_len, curl_done_cb_t done_cb)
+gem_submit_private(void *user_data, uint64_t *slot, uint8_t prio,
+    const char *path, const char *payload_json, size_t payload_len,
+    curl_done_cb_t done_cb)
 {
   curl_request_t *cr;
   char            base[GEM_URL_SZ];
@@ -463,12 +493,23 @@ gem_submit_private(void *user_data, uint8_t prio, const char *path,
     return(FAIL);
   }
 
+  // As in gem_submit_public: the slot opens where the transfer begins,
+  // not where the caller committed, so every refusal above gives back
+  // nothing and a stopping plugin refuses here.
+  if(curl_flight_open(&gem_flight, slot) != SUCCESS)
+  {
+    clam(CLAM_WARN, GEM_CTX,
+        "private submit: gemini is stopping; refusing path='%s'", path);
+    return(FAIL);
+  }
+
   cr = curl_request_create(CURL_METHOD_POST, url, done_cb, user_data);
 
   if(cr == NULL)
   {
     clam(CLAM_WARN, GEM_CTX,
         "private submit: curl_request_create failed url='%s'", url);
+    curl_flight_close(&gem_flight, *slot);
     return(FAIL);
   }
 
@@ -490,10 +531,11 @@ gem_submit_private(void *user_data, uint8_t prio, const char *path,
   // content-type so it matches Gemini's documented contract.
   curl_request_set_body(cr, "text/plain", "", 0);
 
-  if(curl_request_submit(cr) != SUCCESS)
+  if(curl_flight_relay(&gem_flight, cr, slot) != SUCCESS)
   {
     clam(CLAM_WARN, GEM_CTX,
         "private submit: curl_request_submit failed url='%s'", url);
+    curl_flight_close(&gem_flight, *slot);
     return(FAIL);
   }
 
@@ -508,6 +550,19 @@ void
 gem_rest_init(void)
 {
   pthread_mutex_init(&gem_req_mu, NULL);
+  curl_flight_init(&gem_flight);
+}
+
+uint32_t
+gem_rest_drain(uint32_t ms)
+{
+  return(curl_flight_drain(&gem_flight, ms));
+}
+
+void
+gem_rest_slot_close(uint64_t slot)
+{
+  curl_flight_close(&gem_flight, slot);
 }
 
 void
@@ -529,4 +584,6 @@ gem_rest_deinit(void)
 
   pthread_mutex_unlock(&gem_req_mu);
   pthread_mutex_destroy(&gem_req_mu);
+
+  curl_flight_destroy(&gem_flight);
 }

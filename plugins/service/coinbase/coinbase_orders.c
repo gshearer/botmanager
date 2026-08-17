@@ -990,7 +990,7 @@ coinbase_place_order_async(const coinbase_place_order_req_t *req,
   r->body     = body;
   r->body_len = body_len;
 
-  if(cb_submit_private(r, CURL_PRIO_NORMAL, CURL_METHOD_POST,
+  if(cb_submit_private(r, &r->slot, CURL_PRIO_NORMAL, CURL_METHOD_POST,
         CB_PATH_ORDERS, body, body_len, cb_order_done) != SUCCESS)
   {
     cb_deliver_order_fail(r,
@@ -1035,7 +1035,7 @@ coinbase_cancel_order_async(const char *order_id,
   r->body     = body;
   r->body_len = body_len;
 
-  if(cb_submit_private(r, CURL_PRIO_NORMAL, CURL_METHOD_POST,
+  if(cb_submit_private(r, &r->slot, CURL_PRIO_NORMAL, CURL_METHOD_POST,
         CB_PATH_BATCH_CANCEL, body, body_len, cb_cancel_done) != SUCCESS)
   {
     cb_deliver_order_fail(r,
@@ -1077,7 +1077,7 @@ coinbase_get_order_async(const char *order_id,
     return(ASYNC_FAILED_DELIVERED);
   }
 
-  if(cb_submit_private(r, CURL_PRIO_NORMAL, CURL_METHOD_GET, path,
+  if(cb_submit_private(r, &r->slot, CURL_PRIO_NORMAL, CURL_METHOD_GET, path,
         NULL, 0, cb_order_done) != SUCCESS)
   {
     cb_deliver_order_fail(r,
@@ -1160,7 +1160,7 @@ coinbase_list_orders_async(const char *status, const char *product_id,
     }
   }
 
-  if(cb_submit_private(r, CURL_PRIO_NORMAL, CURL_METHOD_GET, path,
+  if(cb_submit_private(r, &r->slot, CURL_PRIO_NORMAL, CURL_METHOD_GET, path,
         NULL, 0, cb_orders_list_done) != SUCCESS)
   {
     cb_deliver_orders_fail(r,
@@ -1187,7 +1187,7 @@ coinbase_get_accounts_async(coinbase_done_accounts_cb_t cb, void *user)
     return(ASYNC_FAILED_DELIVERED);
   }
 
-  if(cb_submit_private(r, CURL_PRIO_NORMAL, CURL_METHOD_GET,
+  if(cb_submit_private(r, &r->slot, CURL_PRIO_NORMAL, CURL_METHOD_GET,
         CB_PATH_ACCOUNTS, NULL, 0, cb_accounts_done) != SUCCESS)
   {
     cb_deliver_accounts_fail(r,
@@ -1438,7 +1438,7 @@ coinbase_list_fills_async(const char *order_id, const char *product_id,
     }
   }
 
-  if(cb_submit_private(r, CURL_PRIO_NORMAL, CURL_METHOD_GET, path,
+  if(cb_submit_private(r, &r->slot, CURL_PRIO_NORMAL, CURL_METHOD_GET, path,
         NULL, 0, cb_fills_list_done) != SUCCESS)
   {
     cb_deliver_fills_fail(r,

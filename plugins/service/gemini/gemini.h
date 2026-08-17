@@ -43,6 +43,9 @@
 #define GEM_BODY_SZ       4096
 // Error message buffer for transient classifier output.
 #define GEM_ERR_SZ        128
+// How long gem_stop() waits for its own completion callbacks to finish
+// after cancelling them. The same budget every flighted plugin uses.
+#define GEM_STOP_DRAIN_MS 3000
 // Symbols cache capacity. Gemini's `/v1/symbols` returns 419 entries
 // as of 2026-05 (spot + perpetuals + multi-stablecoin pairs); 1024
 // leaves comfortable headroom for growth + new quote-currency

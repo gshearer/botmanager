@@ -417,22 +417,31 @@ yf_session_start_mint(void)
 
   m = mem_alloc(YF_CTX, "mint", sizeof(*m));
   m->cookie[0] = '\0';
+  m->flight    = 0;
+
+  // Both hops ride one slot: the mint is one piece of work.
+  if(curl_flight_open(&yf_flight, &m->flight) != SUCCESS)
+  {
+    mem_free(m);
+    yf_session_fail("yahoofinance is stopping");
+    return;
+  }
 
   cr = curl_request_create(CURL_METHOD_GET, YF_COOKIE_URL, yf_cookie_done, m);
 
   if(cr == NULL)
   {
-    mem_free(m);
     yf_session_fail("cookie request not created");
+    yf_ctx_free(m, m->flight);
     return;
   }
 
   yf_apply_common(cr);
 
-  if(curl_request_submit(cr) != SUCCESS)
+  if(curl_flight_relay(&yf_flight, cr, &m->flight) != SUCCESS)
   {
-    mem_free(m);
     yf_session_fail("cookie request not submitted");
+    yf_ctx_free(m, m->flight);
   }
 }
 
@@ -447,8 +456,8 @@ yf_cookie_done(const curl_response_t *resp)
 
   if(resp->set_cookie == NULL || resp->set_cookie[0] == '\0')
   {
-    mem_free(m);
     yf_session_fail("no Set-Cookie from the cookie endpoint");
+    yf_ctx_free(m, m->flight);
     return;
   }
 
@@ -461,18 +470,20 @@ yf_cookie_done(const curl_response_t *resp)
 
   if(cr == NULL)
   {
-    mem_free(m);
     yf_session_fail("crumb request not created");
+    yf_ctx_free(m, m->flight);
     return;
   }
 
   yf_apply_common(cr);
   curl_request_add_header(cr, hdr);
 
-  if(curl_request_submit(cr) != SUCCESS)
+  // The second leg of the same slot — the drain has been waiting for
+  // this mint since hop 1 and keeps waiting until the crumb lands.
+  if(curl_flight_relay(&yf_flight, cr, &m->flight) != SUCCESS)
   {
-    mem_free(m);
     yf_session_fail("crumb request not submitted");
+    yf_ctx_free(m, m->flight);
   }
 }
 
@@ -483,13 +494,14 @@ yf_crumb_done(const curl_response_t *resp)
   yf_mint_t *m = (yf_mint_t *)resp->user_data;
   char       crumb[YF_CRUMB_SZ];
   char       why[64];
+  uint64_t   flight;
   size_t     n;
 
   if(resp->curl_code != 0 || resp->status != 200 || resp->body == NULL)
   {
     snprintf(why, sizeof(why), "crumb endpoint HTTP %ld", resp->status);
-    mem_free(m);
     yf_session_fail(why);
+    yf_ctx_free(m, m->flight);
     return;
   }
 
@@ -498,8 +510,8 @@ yf_crumb_done(const curl_response_t *resp)
   // pass every test below while being useless as a token.
   if(resp->body_len >= sizeof(crumb))
   {
-    mem_free(m);
     yf_session_fail("crumb endpoint returned an over-long body");
+    yf_ctx_free(m, m->flight);
     return;
   }
 
@@ -512,14 +524,20 @@ yf_crumb_done(const curl_response_t *resp)
 
   if(!yf_crumb_plausible(crumb))
   {
-    mem_free(m);
     yf_session_fail("crumb endpoint returned prose, not a token");
+    yf_ctx_free(m, m->flight);
     return;
   }
 
   yf_session_publish(m->cookie, crumb);
+  flight = m->flight;
   mem_free(m);
+
+  // The drain re-dispatches every slot parked behind this mint, under
+  // yf_sess_lock — work this mint owes, so the slot closes after it and
+  // not before (yf_session_fail above is the same argument).
   yf_session_drain();
+  curl_flight_close(&yf_flight, flight);
 }
 
 // ----------------------------------------------------------------------
@@ -728,6 +746,142 @@ yf_apply_v7(struct json_object *item, quote_t *q)
 // Fan-out completion
 // ----------------------------------------------------------------------
 
+// Free a request context and give its flight slot back. The close is
+// LAST because it is what yf_stop()'s drain waits for: anything after
+// it may be running against state yf_deinit() has already torn down
+// (include/curl_flight.h). A context that never reached a submitter
+// carries a zero handle, which closes nothing.
+static void
+yf_ctx_free(void *ctx, uint64_t flight)
+{
+  mem_free(ctx);
+  curl_flight_close(&yf_flight, flight);
+}
+
+// ----------------------------------------------------------------------
+// The consumer-callback registry — see yahoofinance.h for why it exists
+// ----------------------------------------------------------------------
+
+static void
+yf_batch_track(yf_batch_t *b)
+{
+  pthread_mutex_lock(&yf_active_mu);
+  b->next_active = yf_batch_head;
+  yf_batch_head  = b;
+  pthread_mutex_unlock(&yf_active_mu);
+}
+
+// Lift the caller's half off the batch and unlink it, both under the
+// registry lock. The read has to happen in the same critical section
+// the sweep would NULL it in — read it afterwards and the two
+// interleave, which is the whole bug. Clearing as we go also makes a
+// second delivery on the same batch structurally impossible.
+static void
+yf_batch_take_cb(yf_batch_t *b, stockquote_batch_cb_t *cb, void **user)
+{
+  yf_batch_t **pp;
+
+  pthread_mutex_lock(&yf_active_mu);
+
+  for(pp = &yf_batch_head; *pp != NULL; pp = &(*pp)->next_active)
+  {
+    if(*pp != b)
+      continue;
+
+    *pp = b->next_active;
+    b->next_active = NULL;
+    break;
+  }
+
+  *cb   = b->cb;
+  *user = b->user;
+
+  b->cb   = NULL;
+  b->user = NULL;
+
+  pthread_mutex_unlock(&yf_active_mu);
+}
+
+static void
+yf_search_track(yf_search_req_t *r)
+{
+  pthread_mutex_lock(&yf_active_mu);
+  r->next_active = yf_search_head;
+  yf_search_head = r;
+  pthread_mutex_unlock(&yf_active_mu);
+}
+
+// The search twin of yf_batch_take_cb.
+static void
+yf_search_take_cb(yf_search_req_t *r, stockquote_search_cb_t *cb,
+    void **user)
+{
+  yf_search_req_t **pp;
+
+  pthread_mutex_lock(&yf_active_mu);
+
+  for(pp = &yf_search_head; *pp != NULL; pp = &(*pp)->next_active)
+  {
+    if(*pp != r)
+      continue;
+
+    *pp = r->next_active;
+    r->next_active = NULL;
+    break;
+  }
+
+  *cb   = r->cb;
+  *user = r->user;
+
+  r->cb   = NULL;
+  r->user = NULL;
+
+  pthread_mutex_unlock(&yf_active_mu);
+}
+
+// A mapping is going away. Drop every consumer callback that lives
+// inside it, both lists under one lock — the delivery sites read the
+// pointer under the same lock, so a fire cannot interleave with one.
+static void
+yf_unmap_cb(uintptr_t lo, uintptr_t hi, void *data)
+{
+  uint32_t orphaned = 0;
+
+  (void)data;
+
+  pthread_mutex_lock(&yf_active_mu);
+
+  for(yf_batch_t *b = yf_batch_head; b != NULL; b = b->next_active)
+  {
+    uintptr_t cb = (uintptr_t)fn_addr(&b->cb);
+
+    if(cb == 0 || cb < lo || cb >= hi)
+      continue;
+
+    b->cb   = NULL;
+    b->user = NULL;
+    orphaned++;
+  }
+
+  for(yf_search_req_t *r = yf_search_head; r != NULL; r = r->next_active)
+  {
+    uintptr_t cb = (uintptr_t)fn_addr(&r->cb);
+
+    if(cb == 0 || cb < lo || cb >= hi)
+      continue;
+
+    r->cb   = NULL;
+    r->user = NULL;
+    orphaned++;
+  }
+
+  pthread_mutex_unlock(&yf_active_mu);
+
+  if(orphaned > 0)
+    clam(CLAM_WARN, YF_CTX, "%u quote/search request(s) lost their caller "
+        "to an unload; they will complete and report to nobody", orphaned);
+}
+
 // Decrement the batch's pending count; the thread that observes the final
 // 1 -> 0 transition delivers the assembled batch and frees it.
 static void
@@ -746,14 +900,22 @@ yf_slot_done(yf_batch_t *b)
       yf_cache_store(&b->out[0]);
     }
 
-    quote_batch_t r = {
+    quote_batch_t         r = {
       .status  = QUOTE_OK,
       .message = "",
       .quotes  = b->out,
       .n       = b->n_total,
     };
+    stockquote_batch_cb_t cb;
+    void                 *user;
 
-    b->cb(&r, b->user);
+    yf_batch_take_cb(b, &cb, &user);
+
+    // NULL means the consumer was unloaded while this batch was in the
+    // air: it completes, and reports to nobody.
+    if(cb != NULL)
+      cb(&r, user);
+
     mem_free(b);
   }
 }
@@ -878,7 +1040,7 @@ done:
     json_object_put(root);
 
   yf_slot_done(b);
-  mem_free(sub);
+  yf_ctx_free(sub, sub->flight);
 }
 
 // ----------------------------------------------------------------------
@@ -919,20 +1081,29 @@ yf_submit_chart(yf_batch_t *b, uint8_t slot, const char *sym, bool spark_only)
   sub->batch      = b;
   sub->slot       = slot;
   sub->spark_only = spark_only;
+  sub->flight     = 0;
+
+  if(curl_flight_open(&yf_flight, &sub->flight) != SUCCESS)
+  {
+    // Stopping. The caller answers a FAIL by resolving the slot, so
+    // the batch still completes — it just completes unenriched.
+    mem_free(sub);
+    return(FAIL);
+  }
 
   cr = curl_request_create(CURL_METHOD_GET, url, yf_chart_done, sub);
 
   if(cr == NULL)
   {
-    mem_free(sub);
+    yf_ctx_free(sub, sub->flight);
     return(FAIL);
   }
 
   yf_apply_common(cr);
 
-  if(curl_request_submit(cr) != SUCCESS)
+  if(curl_flight_relay(&yf_flight, cr, &sub->flight) != SUCCESS)
   {
-    mem_free(sub);
+    yf_ctx_free(sub, sub->flight);
     return(FAIL);
   }
 
@@ -1010,7 +1181,7 @@ yf_dispatch_v7(yf_pend_t *p, const char *cookie, const char *crumb)
 
   if(n_keep == 0)
   {
-    mem_free(p);
+    yf_ctx_free(p, p->flight);
     return;
   }
 
@@ -1022,7 +1193,7 @@ yf_dispatch_v7(yf_pend_t *p, const char *cookie, const char *crumb)
   if(need < 0 || (size_t)need >= sizeof(url))
   {
     yf_dispatch_v8(b, keep, n_keep);
-    mem_free(p);
+    yf_ctx_free(p, p->flight);
     return;
   }
 
@@ -1040,12 +1211,23 @@ yf_dispatch_v7(yf_pend_t *p, const char *cookie, const char *crumb)
   memcpy(p->slots, keep, n_keep);
   p->n_slots = n_keep;
 
+  // A crumb rejection re-dispatches this same yf_pend_t, so the slot
+  // may already be open from the first attempt; opening is therefore
+  // conditional and the relay below carries whichever handle it has.
+  if(p->flight == 0 && curl_flight_open(&yf_flight, &p->flight) != SUCCESS)
+  {
+    // Stopping: v8 refuses too, so every slot resolves unavailable.
+    yf_dispatch_v8(b, p->slots, p->n_slots);
+    mem_free(p);
+    return;
+  }
+
   cr = curl_request_create(CURL_METHOD_GET, url, yf_quote_done, p);
 
   if(cr == NULL)
   {
     yf_dispatch_v8(b, p->slots, p->n_slots);
-    mem_free(p);
+    yf_ctx_free(p, p->flight);
     return;
   }
 
@@ -1053,10 +1235,10 @@ yf_dispatch_v7(yf_pend_t *p, const char *cookie, const char *crumb)
   snprintf(hdr, sizeof(hdr), "Cookie: %s", cookie);
   curl_request_add_header(cr, hdr);
 
-  if(curl_request_submit(cr) != SUCCESS)
+  if(curl_flight_relay(&yf_flight, cr, &p->flight) != SUCCESS)
   {
     yf_dispatch_v8(b, p->slots, p->n_slots);
-    mem_free(p);
+    yf_ctx_free(p, p->flight);
   }
 }
 
@@ -1072,7 +1254,7 @@ yf_dispatch(yf_pend_t *p)
   if(!yf_enrich_enabled())
   {
     yf_dispatch_v8(p->batch, p->slots, p->n_slots);
-    mem_free(p);
+    yf_ctx_free(p, p->flight);
     return;
   }
 
@@ -1088,7 +1270,7 @@ yf_dispatch(yf_pend_t *p)
   }
 
   yf_dispatch_v8(p->batch, p->slots, p->n_slots);
-  mem_free(p);
+  yf_ctx_free(p, p->flight);
 }
 
 // One v7 response -> every slot it was asked about. Runs on the curl
@@ -1124,7 +1306,7 @@ yf_quote_done(const curl_response_t *resp)
     clam(CLAM_INFO, YF_CTX,
         "v7 quote refused the freshly minted crumb; falling back to v8");
     yf_dispatch_v8(b, p->slots, p->n_slots);
-    mem_free(p);
+    yf_ctx_free(p, p->flight);
     return;
   }
 
@@ -1138,14 +1320,14 @@ yf_quote_done(const curl_response_t *resp)
       yf_slot_done(b);
     }
 
-    mem_free(p);
+    yf_ctx_free(p, p->flight);
     return;
   }
 
   if(resp->curl_code != 0 || resp->status != 200)
   {
     yf_dispatch_v8(b, p->slots, p->n_slots);
-    mem_free(p);
+    yf_ctx_free(p, p->flight);
     return;
   }
 
@@ -1167,7 +1349,7 @@ yf_quote_done(const curl_response_t *resp)
       json_object_put(root);
 
     yf_dispatch_v8(b, p->slots, p->n_slots);
-    mem_free(p);
+    yf_ctx_free(p, p->flight);
     return;
   }
 
@@ -1210,7 +1392,7 @@ yf_quote_done(const curl_response_t *resp)
   }
 
   json_object_put(root);
-  mem_free(p);
+  yf_ctx_free(p, p->flight);
 }
 
 // ----------------------------------------------------------------------
@@ -1263,16 +1445,20 @@ stockquote_fetch_async(const char *const *syms, uint8_t n,
   b = mem_alloc(YF_CTX, "batch", sizeof(*b));
   b->cb          = cb;
   b->user        = user;
+  b->next_active = NULL;
   b->n_total     = n;
   b->n_pending   = (uint8_t)(n + 1);   // +1 guard consumed after dispatch
   b->spark_n     = 0;
   b->spark_merge = want_spark && yf_enrich_enabled();
   b->spark_sent  = false;
 
+  yf_batch_track(b);
+
   p = mem_alloc(YF_CTX, "pend", sizeof(*p));
   p->batch   = b;
   p->n_slots = 0;
   p->retried = false;
+  p->flight  = 0;
   p->next    = NULL;
 
   for(uint8_t i = 0; i < n; i++)
@@ -1303,7 +1489,7 @@ stockquote_fetch_async(const char *const *syms, uint8_t n,
     yf_dispatch(p);
 
   else
-    mem_free(p);
+    yf_ctx_free(p, p->flight);
 
   yf_slot_done(b);   // consume the +1 guard
   return(ASYNC_AIRBORNE);
@@ -1312,13 +1498,15 @@ stockquote_fetch_async(const char *const *syms, uint8_t n,
 static void
 yf_search_done(const curl_response_t *resp)
 {
-  yf_search_req_t    *r    = (yf_search_req_t *)resp->user_data;
-  struct json_object *root = NULL;
-  struct json_object *jq;
-  quote_hit_t        *hits = NULL;
-  quote_search_res_t  res;
-  size_t              len;
-  uint8_t             kept = 0;
+  yf_search_req_t       *r    = (yf_search_req_t *)resp->user_data;
+  struct json_object    *root = NULL;
+  struct json_object    *jq;
+  quote_hit_t           *hits = NULL;
+  quote_search_res_t     res;
+  stockquote_search_cb_t cb;
+  void                  *user;
+  size_t                 len;
+  uint8_t                kept = 0;
 
   memset(&res, 0, sizeof(res));
   res.status = QUOTE_OK;
@@ -1395,8 +1583,12 @@ yf_search_done(const curl_response_t *resp)
   res.n    = kept;
 
 emit:
-  if(r->cb != NULL)
-    r->cb(&res, r->user);
+  yf_search_take_cb(r, &cb, &user);
+
+  // NULL means the consumer was unloaded while this search was in the
+  // air: it completes, and reports to nobody.
+  if(cb != NULL)
+    cb(&res, user);
 
   if(hits != NULL)
     mem_free(hits);
@@ -1404,7 +1596,7 @@ emit:
   if(root != NULL)
     json_object_put(root);
 
-  mem_free(r);
+  yf_ctx_free(r, r->flight);
 }
 
 async_rc_t
@@ -1431,22 +1623,32 @@ stockquote_search_async(const char *query, stockquote_search_cb_t cb,
     return(ASYNC_FAILED_UNDELIVERED);
 
   r = mem_alloc(YF_CTX, "search", sizeof(*r));
-  r->cb   = cb;
-  r->user = user;
+  r->cb          = cb;
+  r->user        = user;
+  r->flight      = 0;
+  r->next_active = NULL;
 
-  cr = curl_request_create(CURL_METHOD_GET, url, yf_search_done, r);
+  yf_search_track(r);
 
-  if(cr == NULL)
+  if(curl_flight_open(&yf_flight, &r->flight) != SUCCESS)
   {
     mem_free(r);
     return(ASYNC_FAILED_UNDELIVERED);
   }
 
+  cr = curl_request_create(CURL_METHOD_GET, url, yf_search_done, r);
+
+  if(cr == NULL)
+  {
+    yf_ctx_free(r, r->flight);
+    return(ASYNC_FAILED_UNDELIVERED);
+  }
+
   yf_apply_common(cr);
 
-  if(curl_request_submit(cr) != SUCCESS)
+  if(curl_flight_relay(&yf_flight, cr, &r->flight) != SUCCESS)
   {
-    mem_free(r);
+    yf_ctx_free(r, r->flight);
     return(ASYNC_FAILED_UNDELIVERED);
   }
 
@@ -1474,6 +1676,8 @@ stockquote_series_async(const char *sym, quote_range_t range,
 static bool
 yf_init(void)
 {
+  curl_flight_init(&yf_flight);
+  plugin_unmap_notify_register(yf_unmap_cb, NULL);
   pthread_rwlock_init(&yf_cache_rwl, NULL);
   memset(yf_cache, 0, sizeof(yf_cache));
   yf_cache_cursor = 0;
@@ -1499,6 +1703,7 @@ static bool
 yf_stop(void)
 {
   yf_pend_t *q;
+  uint32_t   left;
 
   pthread_mutex_lock(&yf_sess_lock);
   yf_sess_shutdown = true;
@@ -1517,8 +1722,30 @@ yf_stop(void)
       yf_slot_done(b);
     }
 
-    mem_free(q);
+    yf_ctx_free(q, q->flight);
     q = next;
+  }
+
+  // Everything else is on the wire: the mint's two hops, a v7 batch, a
+  // chart hop, a search. Their completions take yf_sess_lock and
+  // yf_cache_rwl, both of which yf_deinit() destroys (OBS-39).
+  left = curl_flight_drain(&yf_flight, YF_STOP_DRAIN_MS);
+
+  if(left > 0)
+  {
+    clam(CLAM_WARN, YF_CTX, "%u yahoofinance request(s) still airborne "
+        "after a %u ms cancel-and-drain; refusing the unload rather than "
+        "deinitializing under their callbacks", left,
+        (uint32_t)YF_STOP_DRAIN_MS);
+
+    // A refused unload has to leave a working plugin behind — the
+    // flight un-grounds itself on this path, and the mint gate is the
+    // other half of that.
+    pthread_mutex_lock(&yf_sess_lock);
+    yf_sess_shutdown = false;
+    pthread_mutex_unlock(&yf_sess_lock);
+
+    return(FAIL);
   }
 
   return(SUCCESS);
@@ -1527,8 +1754,10 @@ yf_stop(void)
 static void
 yf_deinit(void)
 {
+  plugin_unmap_notify_unregister(yf_unmap_cb);
   pthread_rwlock_destroy(&yf_cache_rwl);
   pthread_mutex_destroy(&yf_sess_lock);
+  curl_flight_destroy(&yf_flight);
   clam(CLAM_INFO, YF_CTX, "yahoofinance plugin deinitialized");
 }
 

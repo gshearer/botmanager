@@ -790,7 +790,7 @@ kraken_get_balance_async(kraken_done_balances_cb_t cb, void *user)
     return(ASYNC_FAILED_DELIVERED);
   }
 
-  if(kr_submit_private(r, CURL_PRIO_NORMAL, KR_PATH_BALANCE_EX,
+  if(kr_submit_private(r, &r->slot, CURL_PRIO_NORMAL, KR_PATH_BALANCE_EX,
         NULL, 0, kr_balance_done) != SUCCESS)
   {
     kr_deliver_balances_fail(r,
@@ -1059,7 +1059,7 @@ kraken_add_order_async(const kraken_place_order_req_t *req,
     return(ASYNC_FAILED_DELIVERED);
   }
 
-  if(kr_submit_private(r, CURL_PRIO_NORMAL, KR_PATH_ADD_ORDER,
+  if(kr_submit_private(r, &r->slot, CURL_PRIO_NORMAL, KR_PATH_ADD_ORDER,
         form.buf, form.len, kr_addorder_done) != SUCCESS)
   {
     kr_deliver_order_fail(r,
@@ -1165,7 +1165,7 @@ kraken_cancel_order_async(const char *order_id,
     return(ASYNC_FAILED_DELIVERED);
   }
 
-  if(kr_submit_private(r, CURL_PRIO_NORMAL, KR_PATH_CANCEL_ORDER,
+  if(kr_submit_private(r, &r->slot, CURL_PRIO_NORMAL, KR_PATH_CANCEL_ORDER,
         form.buf, form.len, kr_cancelorder_done) != SUCCESS)
   {
     kr_deliver_order_fail(r,
@@ -1277,7 +1277,7 @@ kraken_query_order_async(const char *order_id,
     return(ASYNC_FAILED_DELIVERED);
   }
 
-  if(kr_submit_private(r, CURL_PRIO_NORMAL, KR_PATH_QUERY_ORDERS,
+  if(kr_submit_private(r, &r->slot, CURL_PRIO_NORMAL, KR_PATH_QUERY_ORDERS,
         form.buf, form.len, kr_queryorder_done) != SUCCESS)
   {
     kr_deliver_order_fail(r,
@@ -1400,7 +1400,7 @@ kraken_open_orders_async(kraken_done_orders_cb_t cb, void *user)
     return(ASYNC_FAILED_DELIVERED);
   }
 
-  if(kr_submit_private(r, CURL_PRIO_NORMAL, KR_PATH_OPEN_ORDERS,
+  if(kr_submit_private(r, &r->slot, CURL_PRIO_NORMAL, KR_PATH_OPEN_ORDERS,
         NULL, 0, kr_openorders_done) != SUCCESS)
   {
     kr_deliver_orders_fail(r,
@@ -1443,7 +1443,7 @@ kraken_closed_orders_async(int64_t start_sec, kraken_done_orders_cb_t cb,
     return(ASYNC_FAILED_DELIVERED);
   }
 
-  if(kr_submit_private(r, CURL_PRIO_NORMAL, KR_PATH_CLOSED_ORDERS,
+  if(kr_submit_private(r, &r->slot, CURL_PRIO_NORMAL, KR_PATH_CLOSED_ORDERS,
         form.buf, form.len, kr_closedorders_done) != SUCCESS)
   {
     kr_deliver_orders_fail(r,
@@ -1642,7 +1642,7 @@ kraken_trades_history_async(const char *order_id, const char *product_id,
     return(ASYNC_FAILED_DELIVERED);
   }
 
-  if(kr_submit_private(r, CURL_PRIO_NORMAL, KR_PATH_TRADES_HISTORY,
+  if(kr_submit_private(r, &r->slot, CURL_PRIO_NORMAL, KR_PATH_TRADES_HISTORY,
         form.buf, form.len, kr_tradeshistory_done) != SUCCESS)
   {
     kr_deliver_fills_fail(r,

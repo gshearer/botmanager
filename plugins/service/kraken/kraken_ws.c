@@ -1026,6 +1026,12 @@ static struct
   kr_ws_token_waiter_t waiters[KR_WS_TOKEN_MAX_WAITERS];
   uint32_t             n_waiters;
 
+  // The mint's slot in the plugin's flight (kraken_rest.c). One mint is
+  // in the air at a time — `in_flight` above is what guarantees it — so
+  // one handle serves, and kr_ws_token_done closes it after the fan-out
+  // has run every waiter's callback.
+  uint64_t        slot;
+
   bool            initialized;
 } kr_token = { .lock = PTHREAD_MUTEX_INITIALIZER };
 
@@ -1128,6 +1134,12 @@ kr_ws_token_done(const curl_response_t *resp)
   struct json_object *result_obj;
   char                token[KR_WS_TOKEN_SZ] = {0};
   bool                ok         = FAIL;
+  uint64_t            slot;
+
+  // Taken before the fan-out, because the fan-out clears `in_flight`
+  // and the next mint may claim the field before this one is finished
+  // with it.
+  slot = kr_token.slot;
 
   kind = kr_classify_curl(resp, errbuf, sizeof(errbuf));
 
@@ -1173,6 +1185,10 @@ fanout:
   pthread_mutex_lock(&kr_token.lock);
   kr_ws_token_fan_out_locked(ok);
   pthread_mutex_unlock(&kr_token.lock);
+
+  // Last: the fan-out hands the token to every parked subscriber, and
+  // those callbacks take the session locks kr_ws_deinit destroys.
+  kr_rest_slot_close(slot);
 }
 
 bool
@@ -1223,7 +1239,8 @@ kr_ws_token_acquire(kr_ws_token_done_cb_t cb, void *user)
   // CURL_PRIO_TRANSACTIONAL because every private subscribe blocks on
   // a fresh token; missing this with backfill priority would let bulk
   // candle backfill starve out a live subscribe.
-  if(kr_submit_private(NULL, CURL_PRIO_TRANSACTIONAL, "GetWebSocketsToken",
+  if(kr_submit_private(NULL, &kr_token.slot, CURL_PRIO_TRANSACTIONAL,
+        "GetWebSocketsToken",
         NULL, 0, kr_ws_token_done) != SUCCESS)
   {
     pthread_mutex_lock(&kr_token.lock);

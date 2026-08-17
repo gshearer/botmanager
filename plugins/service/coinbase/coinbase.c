@@ -82,7 +82,23 @@ cb_start(void)
 static bool
 cb_stop(void)
 {
-  // The reader thread is the plugin's only Class-B holding. If it will
+  uint32_t left;
+
+  // Before the reader join. Nothing here cancelled a REST transfer
+  // until now: a completion takes cb_req_mu on its way out through
+  // cb_req_release, and cb_deinit() destroys that lock (OBS-39).
+  left = cb_rest_drain(CB_STOP_DRAIN_MS);
+
+  if(left > 0)
+  {
+    clam(CLAM_WARN, CB_CTX, "%u coinbase REST request(s) still airborne "
+        "after a %u ms cancel-and-drain; refusing the unload rather than "
+        "deinitializing under their callbacks", left,
+        (uint32_t)CB_STOP_DRAIN_MS);
+    return(FAIL);
+  }
+
+  // The reader thread is the plugin's other Class-B holding. If it will
   // not come home, say so — an unload past this point unmaps the code
   // it is standing in.
   return(cb_ws_stop());

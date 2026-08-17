@@ -52,6 +52,12 @@ typedef struct
   // Wired in submit. Routed back through cb_exchange_curl_done.
   exchange_response_cb_t  abstr_cb;
   void                   *abstr_user;
+
+  // This dispatch's slot in the plugin's flight (coinbase_rest.c). The
+  // submitter opens it; the completion adapter closes it, which is the
+  // end of this mapping's part in the work — the abstraction frees the
+  // handle itself, later and without touching coinbase state.
+  uint64_t                slot;
 } cb_exchange_handle_t;
 
 // ------------------------------------------------------------------ //
@@ -64,11 +70,13 @@ cb_exchange_curl_done(const curl_response_t *resp)
   cb_exchange_handle_t   *h    = (cb_exchange_handle_t *)resp->user_data;
   exchange_response_cb_t  cb;
   void                   *user;
+  uint64_t                slot;
   bool                    transport_err;
 
   if(h == NULL)
     return;
 
+  slot          = h->slot;
   cb            = h->abstr_cb;
   user          = h->abstr_user;
   transport_err = (resp->curl_code != 0);
@@ -105,6 +113,11 @@ cb_exchange_curl_done(const curl_response_t *resp)
   // will fire shortly after this returns (success path) or after retry
   // exhaustion (which uses a different handle each attempt, since
   // exchange_arm_retry calls free_request between attempts).
+
+  // Last: the consumer's callback above runs inside this mapping and
+  // reaches back into coinbase, so the work is not over until it
+  // returns. The handle outlives this and touches no coinbase lock.
+  cb_rest_slot_close(slot);
 }
 
 // ------------------------------------------------------------------ //
@@ -203,7 +216,7 @@ cb_exchange_submit(void *handle, uint8_t prio,
   // through unchanged (CURL-PRIO-3).
   if(is_private)
   {
-    if(cb_submit_private(h, prio,
+    if(cb_submit_private(h, &h->slot, prio,
           cb_exchange_method_for_kind(h->kind),
           h->path, h->body, h->body_len,
           cb_exchange_curl_done) != SUCCESS)
@@ -211,7 +224,8 @@ cb_exchange_submit(void *handle, uint8_t prio,
   }
   else
   {
-    if(cb_submit_public(h, prio, h->path, cb_exchange_curl_done) != SUCCESS)
+    if(cb_submit_public(h, &h->slot, prio, h->path, cb_exchange_curl_done)
+        != SUCCESS)
       return(FAIL);
   }
 

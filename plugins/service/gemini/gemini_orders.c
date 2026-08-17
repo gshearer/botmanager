@@ -982,7 +982,7 @@ gemini_fetch_candles_async(const char *pair, exchange_granularity_t gran,
     return(ASYNC_FAILED_DELIVERED);
   }
 
-  if(gem_submit_public(r, prio, path, gem_candles_done) != SUCCESS)
+  if(gem_submit_public(r, &r->slot, prio, path, gem_candles_done) != SUCCESS)
   {
     gem_deliver_candles_fail(r,
         "Error: failed to submit Gemini /v2/candles request");
@@ -1119,7 +1119,7 @@ gemini_get_balance_async(gemini_done_balances_cb_t cb, void *user)
     return(ASYNC_FAILED_DELIVERED);
   }
 
-  if(gem_submit_private(r, EXCHANGE_PRIO_TRANSACTIONAL, GEM_PATH_BALANCES,
+  if(gem_submit_private(r, &r->slot, EXCHANGE_PRIO_TRANSACTIONAL, GEM_PATH_BALANCES,
         body, (size_t)n, gem_balances_done) != SUCCESS)
   {
     gem_deliver_balances_fail(r,
@@ -1378,7 +1378,7 @@ gemini_add_order_async(const gemini_place_order_req_t *req,
     return(ASYNC_FAILED_DELIVERED);
   }
 
-  if(gem_submit_private(r, EXCHANGE_PRIO_TRANSACTIONAL, GEM_PATH_ORDER_NEW,
+  if(gem_submit_private(r, &r->slot, EXCHANGE_PRIO_TRANSACTIONAL, GEM_PATH_ORDER_NEW,
         body, (size_t)n, gem_order_new_done) != SUCCESS)
   {
     gem_deliver_order_fail(r,
@@ -1464,7 +1464,7 @@ gemini_cancel_order_async(const char *order_id,
     return(ASYNC_FAILED_DELIVERED);
   }
 
-  if(gem_submit_private(r, EXCHANGE_PRIO_TRANSACTIONAL, GEM_PATH_ORDER_CANCEL,
+  if(gem_submit_private(r, &r->slot, EXCHANGE_PRIO_TRANSACTIONAL, GEM_PATH_ORDER_CANCEL,
         body, (size_t)n, gem_order_cancel_done) != SUCCESS)
   {
     gem_deliver_order_fail(r,
@@ -1546,7 +1546,7 @@ gemini_query_order_async(const char *order_id,
     return(ASYNC_FAILED_DELIVERED);
   }
 
-  if(gem_submit_private(r, EXCHANGE_PRIO_TRANSACTIONAL, GEM_PATH_ORDER_STATUS,
+  if(gem_submit_private(r, &r->slot, EXCHANGE_PRIO_TRANSACTIONAL, GEM_PATH_ORDER_STATUS,
         body, (size_t)n, gem_order_status_done) != SUCCESS)
   {
     gem_deliver_order_fail(r,
@@ -1664,7 +1664,7 @@ gemini_active_orders_async(gemini_done_orders_cb_t cb, void *user)
     return(ASYNC_FAILED_DELIVERED);
   }
 
-  if(gem_submit_private(r, EXCHANGE_PRIO_TRANSACTIONAL, GEM_PATH_ORDERS,
+  if(gem_submit_private(r, &r->slot, EXCHANGE_PRIO_TRANSACTIONAL, GEM_PATH_ORDERS,
         body, (size_t)n, gem_active_orders_done) != SUCCESS)
   {
     gem_deliver_orders_fail(r,
@@ -1871,7 +1871,7 @@ gemini_mytrades_async(const char *product_id, int64_t since_ms,
     return(ASYNC_FAILED_DELIVERED);
   }
 
-  if(gem_submit_private(r, EXCHANGE_PRIO_TRANSACTIONAL, GEM_PATH_MYTRADES,
+  if(gem_submit_private(r, &r->slot, EXCHANGE_PRIO_TRANSACTIONAL, GEM_PATH_MYTRADES,
         body, (size_t)n, gem_mytrades_done) != SUCCESS)
   {
     gem_deliver_fills_fail(r,

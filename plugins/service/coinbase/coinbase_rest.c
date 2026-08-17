@@ -19,6 +19,7 @@
 #include "exchange_api.h"
 
 #include "curl.h"
+#include "curl_flight.h"
 #include "json.h"
 
 #include <inttypes.h>
@@ -69,6 +70,13 @@ cb_gran_seconds_to_at_name(int32_t seconds, char *out, size_t cap)
 static cb_request_t       *cb_req_free = NULL;
 static pthread_mutex_t     cb_req_mu;
 
+// Every coinbase transfer — typed wrapper or exchange-vtable dispatch —
+// is sent from one of the two submitters below, so one flight covers
+// the plugin. cb_req_mu itself is the reason it has to: cb_rest_deinit
+// destroys it, and every completion path takes it on the way out
+// through cb_req_release (root TODO.md §SC-OBSERVED OBS-39).
+static curl_flight_t       cb_flight;
+
 // Freelist helpers. Shared with coinbase_orders.c via coinbase.h.
 
 cb_request_t *
@@ -97,6 +105,8 @@ cb_req_alloc(void)
 void
 cb_req_release(cb_request_t *r)
 {
+  uint64_t slot = r->slot;
+
   if(r->body != NULL)
   {
     mem_free(r->body);
@@ -108,6 +118,11 @@ cb_req_release(cb_request_t *r)
   r->next = cb_req_free;
   cb_req_free = r;
   pthread_mutex_unlock(&cb_req_mu);
+
+  // Last, always: every typed path in this plugin ends here, so this is
+  // where cb_rest_drain() learns the work is over — and cb_req_mu, just
+  // above it, is one of the locks cb_deinit() destroys.
+  curl_flight_close(&cb_flight, slot);
 }
 
 // HTTP classification. Shared with coinbase_orders.c via coinbase.h.
@@ -184,13 +199,16 @@ cb_deliver_candles_fail(cb_request_t *r, const char *err)
 // the request is released and no callback fires.
 
 bool
-cb_submit_public(void *user_data, uint8_t prio, const char *path,
-    curl_done_cb_t done_cb)
+cb_submit_public(void *user_data, uint64_t *slot, uint8_t prio,
+    const char *path, curl_done_cb_t done_cb)
 {
   curl_request_t *cr;
   char            base[CB_URL_SZ];
   char            url [CB_URL_SZ];
   int             n;
+
+  if(slot == NULL)
+    return(FAIL);
 
   if(cb_rest_base_url(base, sizeof(base)) != SUCCESS)
   {
@@ -206,22 +224,34 @@ cb_submit_public(void *user_data, uint8_t prio, const char *path,
     return(FAIL);
   }
 
+  // Nothing is on the wire until the relay below, so the slot opens
+  // here: every refusal above it has nothing to give back, and a
+  // grounded flight turns the work away before curl ever sees it.
+  if(curl_flight_open(&cb_flight, slot) != SUCCESS)
+  {
+    clam(CLAM_WARN, CB_CTX,
+         "submit: coinbase is stopping; refusing path='%s'", path);
+    return(FAIL);
+  }
+
   cr = curl_request_create(CURL_METHOD_GET, url, done_cb, user_data);
 
   if(cr == NULL)
   {
     clam(CLAM_WARN, CB_CTX, "submit: curl_request_create failed url='%s'",
          url);
+    curl_flight_close(&cb_flight, *slot);
     return(FAIL);
   }
 
   curl_request_add_header(cr, "Accept: application/json");
   (void)curl_request_set_prio(cr, (curl_prio_t)prio);
 
-  if(curl_request_submit(cr) != SUCCESS)
+  if(curl_flight_relay(&cb_flight, cr, slot) != SUCCESS)
   {
     clam(CLAM_WARN, CB_CTX, "submit: curl_request_submit failed url='%s'",
          url);
+    curl_flight_close(&cb_flight, *slot);
     return(FAIL);
   }
 
@@ -238,7 +268,7 @@ cb_submit_public(void *user_data, uint8_t prio, const char *path,
 // `curl_response_t::user_data`. Legacy typed callers pass their
 // `cb_request_t *`; the exchange-vtable path passes its own handle.
 bool
-cb_submit_private(void *user_data, uint8_t prio,
+cb_submit_private(void *user_data, uint64_t *slot, uint8_t prio,
     curl_method_t method, const char *path,
     const char *body, size_t body_len,
     curl_done_cb_t done_cb)
@@ -250,7 +280,7 @@ cb_submit_private(void *user_data, uint8_t prio,
   char            auth_hdr[CB_JWT_SZ + 32];
   int             n;
 
-  if(!cb_apikey_configured())
+  if(slot == NULL || !cb_apikey_configured())
     return(FAIL);
 
   if(cb_rest_base_url(base, sizeof(base)) != SUCCESS)
@@ -277,12 +307,23 @@ cb_submit_private(void *user_data, uint8_t prio,
     return(FAIL);
   }
 
+  // As in cb_submit_public: the slot opens where the transfer begins,
+  // not where the caller committed, so every refusal above gives back
+  // nothing and a stopping plugin refuses here.
+  if(curl_flight_open(&cb_flight, slot) != SUCCESS)
+  {
+    clam(CLAM_WARN, CB_CTX,
+         "private submit: coinbase is stopping; refusing path='%s'", path);
+    return(FAIL);
+  }
+
   cr = curl_request_create(method, url, done_cb, user_data);
 
   if(cr == NULL)
   {
     clam(CLAM_WARN, CB_CTX,
          "private submit: curl_request_create failed url='%s'", url);
+    curl_flight_close(&cb_flight, *slot);
     return(FAIL);
   }
 
@@ -295,10 +336,11 @@ cb_submit_private(void *user_data, uint8_t prio,
   if(body != NULL && body_len > 0)
     curl_request_set_body(cr, "application/json", body, body_len);
 
-  if(curl_request_submit(cr) != SUCCESS)
+  if(curl_flight_relay(&cb_flight, cr, slot) != SUCCESS)
   {
     clam(CLAM_WARN, CB_CTX,
          "private submit: curl_request_submit failed url='%s'", url);
+    curl_flight_close(&cb_flight, *slot);
     return(FAIL);
   }
 
@@ -530,6 +572,19 @@ void
 cb_rest_init(void)
 {
   pthread_mutex_init(&cb_req_mu, NULL);
+  curl_flight_init(&cb_flight);
+}
+
+uint32_t
+cb_rest_drain(uint32_t ms)
+{
+  return(curl_flight_drain(&cb_flight, ms));
+}
+
+void
+cb_rest_slot_close(uint64_t slot)
+{
+  curl_flight_close(&cb_flight, slot);
 }
 
 void
@@ -547,4 +602,6 @@ cb_rest_deinit(void)
 
   pthread_mutex_unlock(&cb_req_mu);
   pthread_mutex_destroy(&cb_req_mu);
+
+  curl_flight_destroy(&cb_flight);
 }
