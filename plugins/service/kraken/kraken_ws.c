@@ -303,14 +303,19 @@ kr_ws_session_stop(kr_ws_t *w)
 bool
 kr_ws_stop(void)
 {
-  bool ok = SUCCESS;
+  bool ok  = SUCCESS;
+  bool ran = (kr_ws_pub.reader != TASK_HANDLE_NONE)
+             || (kr_ws_prv.reader != TASK_HANDLE_NONE);
 
   // Both, unconditionally: a session left running because its sibling
   // timed out is a second thread in a mapping already being torn down.
   if(kr_ws_session_stop(&kr_ws_pub) != SUCCESS) ok = FAIL;
   if(kr_ws_session_stop(&kr_ws_prv) != SUCCESS) ok = FAIL;
 
-  if(ok == SUCCESS)
+  // kr_ws_deinit calls this a second time to be sure of the joins before
+  // it destroys anything; that call has nothing to stop and nothing to
+  // announce.
+  if(ok == SUCCESS && ran)
     clam(CLAM_INFO, KR_CTX, "ws subsystem stopped");
 
   return(ok);
