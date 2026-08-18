@@ -547,6 +547,8 @@ capstan_plugin_init(void)
 static void
 capstan_plugin_deinit(void)
 {
+  wm_strategy_detach_self(CAPSTAN_NAME);
+
   clam(CLAM_INFO, CAPSTAN_LOG_CTX, "%s deinit", CAPSTAN_NAME);
 }
 

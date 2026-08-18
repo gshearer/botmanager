@@ -598,6 +598,8 @@ surf_plugin_init(void)
 static void
 surf_plugin_deinit(void)
 {
+  wm_strategy_detach_self(SURF_NAME);
+
   clam(CLAM_INFO, SURF_LOG_CTX, "%s deinit", SURF_NAME);
 }
 

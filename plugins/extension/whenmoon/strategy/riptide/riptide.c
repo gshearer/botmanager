@@ -584,6 +584,8 @@ riptide_plugin_init(void)
 static void
 riptide_plugin_deinit(void)
 {
+  wm_strategy_detach_self(RIPTIDE_NAME);
+
   clam(CLAM_INFO, RIPTIDE_LOG_CTX, "%s deinit", RIPTIDE_NAME);
 }
 

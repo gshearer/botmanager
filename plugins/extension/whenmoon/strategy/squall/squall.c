@@ -628,6 +628,8 @@ squall_plugin_init(void)
 static void
 squall_plugin_deinit(void)
 {
+  wm_strategy_detach_self(SQUALL_NAME);
+
   clam(CLAM_INFO, SQUALL_LOG_CTX, "%s deinit", SQUALL_NAME);
 }
 

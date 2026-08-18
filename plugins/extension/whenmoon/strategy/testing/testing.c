@@ -201,6 +201,8 @@ tst_plugin_init(void)
 static void
 tst_plugin_deinit(void)
 {
+  wm_strategy_detach_self(TST_NAME);
+
   clam(CLAM_INFO, TST_LOG_CTX, "%s deinit", TST_NAME);
 }
 

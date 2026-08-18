@@ -720,6 +720,8 @@ cc2_plugin_init(void)
 static void
 cc2_plugin_deinit(void)
 {
+  wm_strategy_detach_self(CC2_NAME);
+
   clam(CLAM_INFO, CC2_LOG_CTX, "%s deinit", CC2_NAME);
 }
 

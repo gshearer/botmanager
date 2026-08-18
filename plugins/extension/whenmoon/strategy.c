@@ -442,6 +442,72 @@ wm_strategy_free_loaded_locked(loaded_strategy_t *ls)
 }
 
 // ----------------------------------------------------------------------- //
+// A strategy detaching itself on the way out (OBS-26)                     //
+// ----------------------------------------------------------------------- //
+//
+// The listener below is told a mapping is going away, and by then it is
+// too late to run the strategy's finalize_fn. A plugin's own deinit()
+// is not: it runs strictly earlier, it is under none of the listener
+// restrictions in include/plugin.h, and at that moment both mappings
+// are still whole. So the strategy asks whenmoon to take its
+// attachments back while it can still be asked anything at all, and the
+// existing detach path does the rest — the same finalize-then-free that
+// /whenmoon strategy detach has always run.
+//
+// The registry row is deliberately LEFT for the listener to drop. That
+// keeps one owner for the row and turns the listener's attachment count
+// into the audit of this call: zero means the strategy cleaned up after
+// itself, non-zero means it did not and says so.
+
+uint32_t
+wm_strategy_detach_self_impl(const char *strategy_name)
+{
+  whenmoon_state_t         *st;
+  wm_strategy_registry_t   *reg;
+  loaded_strategy_t        *ls;
+  wm_strategy_attachment_t *a;
+  wm_strategy_attachment_t *next;
+  uint32_t                  n = 0;
+
+  st = whenmoon_get_state();
+
+  if(st == NULL || st->strategies == NULL || strategy_name == NULL)
+    return(0);
+
+  reg = st->strategies;
+
+  pthread_mutex_lock(&reg->lock);
+
+  ls = wm_strategy_find_loaded(st, strategy_name);
+
+  if(ls != NULL)
+  {
+    a = ls->attachments;
+
+    while(a != NULL)
+    {
+      next = a->next;
+      wm_strategy_free_attachment_locked(ls, a);
+      a    = next;
+      n++;
+    }
+
+    ls->attachments   = NULL;
+    ls->n_attachments = 0;
+  }
+
+  pthread_mutex_unlock(&reg->lock);
+
+  // After the unlock, never under it.
+  if(n > 0)
+    clam(CLAM_INFO, WHENMOON_CTX,
+        "strategy '%s' detached itself on unload: %u attachment(s) "
+        "finalized", strategy_name, n);
+
+  return(n);
+}
+
+// ----------------------------------------------------------------------- //
 // A strategy .so leaving under us (WM-SU-1)                               //
 // ----------------------------------------------------------------------- //
 //
@@ -463,15 +529,20 @@ wm_strategy_free_loaded_locked(loaded_strategy_t *ls)
 // dispatch_bar / dispatch_trade hold reg->lock across the callback.
 // That is what makes the mapping safe to close, not luck.
 //
-// The attachments go with the row, and we deliberately do NOT call the
-// strategy's finalize_fn on the way out: include/plugin.h forbids a
-// listener from calling plugin_* APIs, and every finalize in the tree
-// reaches wm_strategy_ctx_get_user(), which is a plugin_dlsym_cached
-// shim — re-entering the loader from inside its own teardown. The
-// plugin's deinit() has already run besides. Whatever per-attachment
-// state the strategy allocated is leaked, which the WARN says out loud:
-// a bounded, tracked leak on an unload path is the better half of that
-// trade.
+// This listener still cannot call the strategy's finalize_fn, and that
+// has not changed: include/plugin.h forbids a listener from calling
+// plugin_* APIs, and every finalize in the tree reaches
+// wm_strategy_ctx_get_user(), which is a plugin_dlsym_cached shim —
+// re-entering the loader from inside its own teardown.
+//
+// OBS-26: what changed is that it should no longer have to. A strategy
+// calls wm_strategy_detach_self() from its own deinit(), which runs
+// earlier and legally, so by the time this listener sees the mapping
+// the row is expected to hold nothing. A row that still has
+// attachments here is therefore an ANOMALY, not routine — one
+// strategy forgot the call — and the WARN below is the only thing that
+// will ever say so. It is a backstop, and the leak it reports is the
+// residual cost of a per-strategy contract, not the design.
 
 // True when any entry point cached for `ls` lies in the departing
 // mapping. One hit condemns the row — all five come from one .so.
@@ -538,14 +609,16 @@ wm_strategy_unmap_cb(uintptr_t lo, uintptr_t hi, void *data)
     ls->on_bar_fn   = NULL;
     ls->on_trade_fn = NULL;
 
-    // Losing a row nothing was attached to is routine bookkeeping; the
-    // loud case is the one that leaks, so only that one is a WARN.
+    // OBS-26: an empty row is now the expected outcome, so the WARN
+    // reports a strategy that did not do its half rather than
+    // explaining normal behaviour.
     if(n_att > 0)
       clam(CLAM_WARN, WHENMOON_CTX,
-          "strategy '%s' (%s) unloaded out from under the registry; "
-          "dropped its row and %u attachment(s) without finalize — any "
-          "per-attachment state it allocated is leaked",
-          ls->name, ls->plugin_name, n_att);
+          "strategy '%s' (%s) unloaded still holding %u attachment(s) — "
+          "its deinit() did not call wm_strategy_detach_self(\"%s\"), so "
+          "finalize never ran and whatever per-attachment state it "
+          "allocated is leaked",
+          ls->name, ls->plugin_name, n_att, ls->name);
 
     else
       clam(CLAM_INFO, WHENMOON_CTX,

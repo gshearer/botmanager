@@ -599,6 +599,8 @@ cc1_plugin_init(void)
 static void
 cc1_plugin_deinit(void)
 {
+  wm_strategy_detach_self(CC1_NAME);
+
   clam(CLAM_INFO, CC1_LOG_CTX, "%s deinit", CC1_NAME);
 }
 

@@ -302,6 +302,8 @@ sxt_plugin_init(void)
 static void
 sxt_plugin_deinit(void)
 {
+  wm_strategy_detach_self(SXT_NAME);
+
   clam(CLAM_INFO, SXT_LOG_CTX, "%s deinit", SXT_NAME);
 }
 

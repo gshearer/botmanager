@@ -487,6 +487,8 @@ keel_plugin_init(void)
 static void
 keel_plugin_deinit(void)
 {
+  wm_strategy_detach_self(KEEL_NAME);
+
   clam(CLAM_INFO, KEEL_LOG_CTX, "%s deinit", KEEL_NAME);
 }
 

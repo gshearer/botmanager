@@ -265,9 +265,18 @@ typedef struct
 //
 // Allocated by whenmoon at attach time, freed at detach. Strategies
 // stash their private state via wm_strategy_ctx_set_user; whenmoon
-// keeps the slot but does not interpret the pointer. The ctx persists
-// across reloads only when the user explicitly re-attaches; reload
-// detaches all attachments first.
+// keeps the slot but does not interpret the pointer. The ctx never
+// survives an unload: `/whenmoon strategy reload` detaches and replays
+// the attachments for you, and a `/plugin reload` of the strategy
+// drops them — so re-attaching afterwards is the user's job, and the
+// state a strategy gets back is always fresh.
+//
+// OBS-26: "reload detaches all attachments first" is only true because
+// the strategy makes it true. A `/plugin reload` gives whenmoon no
+// chance to run finalize once the mapping is going, so every strategy
+// calls wm_strategy_detach_self() from its own deinit() — see that
+// shim below. A strategy that omits the call leaks its per-attachment
+// state and is named in a WARN from whenmoon's unmap listener.
 
 typedef struct wm_strategy_ctx wm_strategy_ctx_t;
 
@@ -426,6 +435,55 @@ wm_strategy_ctx_strategy_name(wm_strategy_ctx_t *ctx)
     __atomic_store_n(&cached, fn, __ATOMIC_RELEASE);
   }
   return(fn(ctx));
+}
+
+// -------- unload --------
+
+// OBS-26: MANDATORY from every strategy plugin's deinit(), passing its
+// own name — the one the registry keys on, i.e. what
+// wm_strategy_describe reported and bm_plugin_desc.kind carries.
+//
+// Whenmoon learns a strategy .so is going away only through core's
+// unmap listener, which fires after this deinit() and may not call back
+// into the departing mapping, so finalize can never run from there.
+// This call is the last legal moment: it runs wm_strategy_finalize for
+// every attachment this strategy still holds, while both mappings are
+// whole. Omit it and that state leaks — whenmoon's listener will name
+// the strategy in a WARN, which is a backstop, not a substitute.
+//
+// Idempotent, and safe for a strategy that was never attached: returns
+// the number of attachments finalized, zero included. A strategy is
+// free to ignore the count.
+//
+// ⚠ Unlike its sibling shims this one does NOT abort on a resolve
+// miss. It runs on a teardown path where whenmoon may legitimately be
+// gone already, and killing the daemon during an unload to report a
+// leak would cost far more than the leak; the listener's WARN covers
+// that case, if there is still a listener to run it.
+static inline uint32_t
+wm_strategy_detach_self(const char *strategy_name)
+{
+  typedef uint32_t (*fn_t)(const char *);
+  static fn_t cached = NULL;
+  fn_t        fn     = __atomic_load_n(&cached, __ATOMIC_ACQUIRE);
+
+  if(fn == NULL)
+  {
+    union { void *obj; fn_t fn; } u;
+
+    u.obj = plugin_dlsym_cached("whenmoon",
+        "wm_strategy_detach_self_impl", (void **)&cached);
+    if(u.obj == NULL)
+    {
+      clam(CLAM_WARN, "whenmoon",
+          "dlsym failed: wm_strategy_detach_self_impl — '%s' cannot "
+          "finalize its attachments", strategy_name);
+      return(0);
+    }
+    fn = u.fn;
+    __atomic_store_n(&cached, fn, __ATOMIC_RELEASE);
+  }
+  return(fn(strategy_name));
 }
 
 // -------- signal emission --------

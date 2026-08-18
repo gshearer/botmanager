@@ -298,6 +298,15 @@ loaded_strategy_t *wm_strategy_find_loaded(struct whenmoon_state *st,
 
 void wm_strategy_emit_signal_impl(wm_strategy_ctx_t *ctx,
     const wm_strategy_signal_t *sig);
+
+// OBS-26: called from a strategy plugin's own deinit(), so it takes no
+// state handle — it resolves the singleton itself, exactly as the shim
+// caller cannot. Finalizes and frees every attachment the named
+// strategy holds and returns how many; leaves the registry row for the
+// unmap listener to drop. Idempotent, and a no-op for a strategy that
+// is not loaded or holds nothing.
+uint32_t wm_strategy_detach_self_impl(const char *strategy_name);
+
 void wm_strategy_ctx_set_user_impl(wm_strategy_ctx_t *ctx, void *user);
 void *wm_strategy_ctx_get_user_impl(wm_strategy_ctx_t *ctx);
 const char *wm_strategy_ctx_market_id_impl(wm_strategy_ctx_t *ctx);

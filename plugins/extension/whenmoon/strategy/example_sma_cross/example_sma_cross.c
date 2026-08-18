@@ -271,6 +271,8 @@ esc_plugin_init(void)
 static void
 esc_plugin_deinit(void)
 {
+  wm_strategy_detach_self(ESC_NAME);
+
   clam(CLAM_INFO, ESC_LOG_CTX, "%s deinit", ESC_NAME);
 }
 

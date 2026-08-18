@@ -800,6 +800,8 @@ mako_plugin_init(void)
 static void
 mako_plugin_deinit(void)
 {
+  wm_strategy_detach_self(MAKO_NAME);
+
   clam(CLAM_INFO, MAKO_LOG_CTX, "%s deinit", MAKO_NAME);
 }
 

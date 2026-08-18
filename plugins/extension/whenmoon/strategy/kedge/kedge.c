@@ -364,6 +364,8 @@ kdg_plugin_init(void)
 static void
 kdg_plugin_deinit(void)
 {
+  wm_strategy_detach_self(KDG_NAME);
+
   clam(CLAM_INFO, KDG_LOG_CTX, "%s deinit", KDG_NAME);
 }
 

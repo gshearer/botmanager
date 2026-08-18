@@ -605,6 +605,8 @@ fathom_plugin_init(void)
 static void
 fathom_plugin_deinit(void)
 {
+  wm_strategy_detach_self(FATHOM_NAME);
+
   clam(CLAM_INFO, FATHOM_LOG_CTX, "%s deinit", FATHOM_NAME);
 }
 

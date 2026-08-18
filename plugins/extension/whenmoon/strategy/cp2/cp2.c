@@ -576,6 +576,8 @@ cp2_plugin_init(void)
 static void
 cp2_plugin_deinit(void)
 {
+  wm_strategy_detach_self(CP2_NAME);
+
   clam(CLAM_INFO, CP2_LOG_CTX, "%s deinit", CP2_NAME);
 }
 

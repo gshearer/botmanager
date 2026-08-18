@@ -558,6 +558,8 @@ jug_plugin_init(void)
 static void
 jug_plugin_deinit(void)
 {
+  wm_strategy_detach_self(JUG_NAME);
+
   clam(CLAM_INFO, JUG_LOG_CTX, "%s deinit", JUG_NAME);
 }
 
