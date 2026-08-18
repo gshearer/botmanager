@@ -330,6 +330,12 @@ typedef enum
   EXCH_WS_USER
 } exchange_ws_channel_t;
 
+// `price` is the LAST TRADED price, never a book level: coinbase and
+// kraken read it off their venue's ticker row, and gemini — whose MD v2
+// has no ticker channel — synthesizes it from the trades it has parsed,
+// falling back to the mid only until the product first trades. A driver
+// must not publish a ticker it cannot price; consumers assign this field
+// into a mark that paper and real fills execute against (OBS-58).
 typedef struct
 {
   char    product_id[EXCHANGE_PRODUCT_ID_SZ];

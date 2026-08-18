@@ -227,10 +227,24 @@ gem_pair_to_native(const char *in, char *out, size_t cap)
     out[o] = '\0';
 }
 
+// Mirrors the live heuristic split closely enough for these cases:
+// every symbol here is a 3-letter base against USD, so "BTCUSD" comes
+// back as "BTC-USD" — which is what a subscriber registered, and
+// therefore what fan-out matches on.
 void
 gem_pair_to_abstr(const char *in, char *out, size_t cap)
 {
-  strlcpy(out, (in != NULL) ? in : "", cap);
+  size_t len = (in != NULL) ? strlen(in) : 0;
+
+  if(out == NULL || cap == 0) return;
+
+  out[0] = '\0';
+
+  if(len == 6)
+    snprintf(out, cap, "%.3s-%.3s", in, in + 3);
+
+  else
+    strlcpy(out, (in != NULL) ? in : "", cap);
 }
 
 // ------------------------------------------------------------------ //
@@ -478,6 +492,199 @@ case_g5(void)
   gem_ws_channels_deinit();
 }
 
+// ------------------------------------------------------------------ //
+// OBS-58 — what price a synthesized ticker publishes                  //
+//                                                                      //
+// Gemini has no ticker channel; this module builds one out of the l2   //
+// diff stream. The price it published used to be the price of whatever //
+// row sat last in `changes`, which is a book level chosen by frame     //
+// layout — including a level being REMOVED, and including the top of   //
+// the ask ladder on the opening full-book snapshot. Consumers assign   //
+// that field into the mark a paper or real fill executes against, so   //
+// the wrongness is silent and expensive.                               //
+//                                                                      //
+// Prices are asserted in hundredths so a failure prints the number.    //
+// ------------------------------------------------------------------ //
+
+#define PX_MAX 32
+
+static double px_seen[PX_MAX];
+static size_t n_px;
+
+static void
+px_event_cb(const exchange_ws_event_t *ev, void *user)
+{
+  (void)user;
+
+  if(ev->channel != EXCH_WS_TICKER) return;
+  if(n_px >= PX_MAX) return;
+
+  px_seen[n_px++] = ev->payload.ticker.price;
+}
+
+static size_t
+px_cents(double px)
+{
+  return((size_t)(px * 100.0 + 0.5));
+}
+
+static void *
+sub_ticker(const char *product)
+{
+  const exchange_ws_channel_t ch = EXCH_WS_TICKER;
+  void                       *h  = NULL;
+
+  n_px = 0;
+
+  gem_ws_subscribe(&ch, 1, &product, 1, px_event_cb, NULL, &h);
+
+  return(h);
+}
+
+static void
+feed_md(const char *json)
+{
+  gem_ws_channels_dispatch_md(json, strlen(json));
+}
+
+// g6 — the opening full-book snapshot. Its last row is the top of the
+// ask ladder: a resting order at $12.3B, which is what `px=1.2345679e+10`
+// was. No trade has been seen, so the mid is the answer.
+static void
+case_g6(void)
+{
+  void *h;
+
+  gem_ws_channels_init();
+  ledger_reset();
+
+  h = sub_ticker("BTC-USD");
+
+  feed_md("{\"type\":\"l2_updates\",\"symbol\":\"BTCUSD\",\"changes\":["
+      "[\"buy\",\"59412.50\",\"1.0\"],"
+      "[\"sell\",\"59413.50\",\"1.0\"],"
+      "[\"sell\",\"12345679000.00\",\"1.0\"]]}");
+
+  test_check_sz(SUITE, "g6: one ticker from one l2_updates", 1, n_px);
+  test_check_sz(SUITE, "g6: price is the mid, not the last diff row",
+      px_cents(59413.00), px_cents(px_seen[0]));
+
+  gem_ws_unsubscribe(h);
+  gem_ws_channels_deinit();
+}
+
+// g7 — a level being REMOVED sits last in the diff. The old sweep set
+// the price before it tested qty, so a level the venue just deleted
+// priced the tick.
+static void
+case_g7(void)
+{
+  void *h;
+
+  gem_ws_channels_init();
+  ledger_reset();
+
+  h = sub_ticker("ETH-USD");
+
+  feed_md("{\"type\":\"l2_updates\",\"symbol\":\"ETHUSD\",\"changes\":["
+      "[\"buy\",\"2000.00\",\"1.0\"],"
+      "[\"sell\",\"2002.00\",\"1.0\"],"
+      "[\"sell\",\"2500.00\",\"0\"]]}");
+
+  test_check_sz(SUITE, "g7: a removed level does not price the tick",
+      px_cents(2001.00), px_cents(px_seen[0]));
+
+  gem_ws_unsubscribe(h);
+  gem_ws_channels_deinit();
+}
+
+// g8 — trades ride inside the same envelope as the diff. The frame's
+// own trade must reach the mark before the ticker reads it, or every
+// such ticker is one frame stale.
+static void
+case_g8(void)
+{
+  void *h;
+
+  gem_ws_channels_init();
+  ledger_reset();
+
+  h = sub_ticker("SOL-USD");
+
+  feed_md("{\"type\":\"l2_updates\",\"symbol\":\"SOLUSD\",\"changes\":["
+      "[\"buy\",\"140.00\",\"1.0\"],"
+      "[\"sell\",\"141.00\",\"1.0\"]],"
+      "\"trades\":[{\"event_id\":1,\"timestamp\":1755400000000,"
+      "\"price\":\"140.25\",\"quantity\":\"0.5\",\"side\":\"buy\"}]}");
+
+  test_check_sz(SUITE, "g8: the frame's own trade prices its ticker",
+      px_cents(140.25), px_cents(px_seen[0]));
+
+  gem_ws_unsubscribe(h);
+  gem_ws_channels_deinit();
+}
+
+// g9 — a standalone `trade` envelope, then a diff-only frame. The mark
+// persists across frames, so the ticker keeps reporting a traded price
+// rather than falling back to the mid.
+static void
+case_g9(void)
+{
+  void *h;
+
+  gem_ws_channels_init();
+  ledger_reset();
+
+  h = sub_ticker("BTC-USD");
+
+  feed_md("{\"type\":\"trade\",\"symbol\":\"BTCUSD\",\"event_id\":7,"
+      "\"timestamp\":1755400000000,\"price\":\"59500.00\","
+      "\"quantity\":\"0.1\",\"side\":\"sell\"}");
+
+  feed_md("{\"type\":\"l2_updates\",\"symbol\":\"BTCUSD\",\"changes\":["
+      "[\"buy\",\"59412.50\",\"1.0\"],"
+      "[\"sell\",\"59413.50\",\"1.0\"]]}");
+
+  test_check_sz(SUITE, "g9: exactly one ticker (the trade emits none)",
+      1, n_px);
+  test_check_sz(SUITE, "g9: the last trade outranks the mid",
+      px_cents(59500.00), px_cents(px_seen[0]));
+
+  gem_ws_unsubscribe(h);
+  gem_ws_channels_deinit();
+}
+
+// g10 — a diff carrying nothing priceable emits NO ticker. Publishing
+// 0.0 would be worse than publishing nothing: the consumer assigns it
+// straight into the fill mark, so a zero erases a good price.
+static void
+case_g10(void)
+{
+  void *h;
+
+  gem_ws_channels_init();
+  ledger_reset();
+
+  h = sub_ticker("BTC-USD");
+
+  feed_md("{\"type\":\"l2_updates\",\"symbol\":\"BTCUSD\",\"changes\":["
+      "[\"buy\",\"0\",\"1.0\"]]}");
+
+  test_check_sz(SUITE, "g10: an unpriceable diff emits no ticker",
+      0, n_px);
+
+  // One side alone is still a price — better than none, and never
+  // wrong by more than the spread.
+  feed_md("{\"type\":\"l2_updates\",\"symbol\":\"BTCUSD\",\"changes\":["
+      "[\"buy\",\"59412.50\",\"1.0\"]]}");
+
+  test_check_sz(SUITE, "g10: one live side prices the tick",
+      px_cents(59412.50), px_cents(px_seen[0]));
+
+  gem_ws_unsubscribe(h);
+  gem_ws_channels_deinit();
+}
+
 int
 main(void)
 {
@@ -488,6 +695,11 @@ main(void)
   case_g3();
   case_g4();
   case_g5();
+  case_g6();
+  case_g7();
+  case_g8();
+  case_g9();
+  case_g10();
 
   return(test_report(SUITE));
 }

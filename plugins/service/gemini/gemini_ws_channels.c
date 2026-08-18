@@ -177,6 +177,16 @@ typedef struct
   char             last_err[128];
 } gem_ws_slot_t;
 
+// OBS-58: one last-traded price per abstract product id. Survives a
+// session flap deliberately — a reconnect does not make the last trade
+// untrue, and the alternative is a resubscribe window in which every
+// synthesized ticker falls back to the mid.
+typedef struct
+{
+  char   product_abstr[EXCHANGE_PRODUCT_ID_SZ];
+  double price;
+} gem_ws_mark_t;
+
 static struct
 {
   pthread_mutex_t          mu;
@@ -186,6 +196,16 @@ static struct
 
   gem_ws_slot_t            slots[GEM_WS_CH_MAX_SLOTS];
   uint32_t                 n_slots;
+
+  // OBS-58: last traded price per abstract product. Gemini's MD v2 has
+  // no ticker channel — gem_ws_md_channel_name maps EXCH_WS_TICKER onto
+  // `l2` — so the ticker we publish is synthesized, and its `price` has
+  // to come from somewhere. It comes from here: the trades this
+  // multiplexer has already parsed, which is the same quantity coinbase
+  // and kraken read straight off their venue's ticker row. Written and
+  // read under `mu`, by the MD reader thread only.
+  gem_ws_mark_t            marks[GEM_WS_CH_MAX_SLOTS];
+  uint32_t                 n_marks;
 
   _Atomic uint32_t         next_req_id;
 
@@ -767,9 +787,72 @@ gem_ws_json_int64(struct json_object *obj, const char *key)
   return((int64_t)json_object_get_int64(v));
 }
 
+// Record a traded price. Table is append-only over the process
+// lifetime; GEM_WS_CH_MAX_SLOTS bounds the subscribable product set, so
+// it cannot be outgrown by a product we are subscribed to.
+static void
+gem_ws_mark_note_locked(const char *product_abstr, double price)
+{
+  uint32_t i;
+
+  if(product_abstr == NULL || product_abstr[0] == '\0' || price <= 0.0)
+    return;
+
+  for(i = 0; i < gem_ws_ch.n_marks; i++)
+  {
+    if(strcmp(gem_ws_ch.marks[i].product_abstr, product_abstr) == 0)
+    {
+      gem_ws_ch.marks[i].price = price;
+      return;
+    }
+  }
+
+  if(gem_ws_ch.n_marks >= GEM_WS_CH_MAX_SLOTS)
+  {
+    clam(CLAM_WARN, GEM_CTX ".ws.md",
+        "mark table full (%u) — no last price for %s",
+        gem_ws_ch.n_marks, product_abstr);
+    return;
+  }
+
+  i = gem_ws_ch.n_marks++;
+
+  strlcpy(gem_ws_ch.marks[i].product_abstr, product_abstr,
+      sizeof(gem_ws_ch.marks[i].product_abstr));
+  gem_ws_ch.marks[i].price = price;
+}
+
+// 0.0 when this product has not traded since the mapping loaded.
+static double
+gem_ws_mark_get_locked(const char *product_abstr)
+{
+  uint32_t i;
+
+  if(product_abstr == NULL) return(0.0);
+
+  for(i = 0; i < gem_ws_ch.n_marks; i++)
+  {
+    if(strcmp(gem_ws_ch.marks[i].product_abstr, product_abstr) == 0)
+      return(gem_ws_ch.marks[i].price);
+  }
+
+  return(0.0);
+}
+
 // Emit one TICKER event derived from the latest top-of-book in the
-// l2_updates payload. `changes` is the diff array — we sweep it to
-// compute the best bid + best ask + last-known price.
+// l2_updates payload. `changes` is the diff array — we sweep it for the
+// best bid and best ask.
+//
+// OBS-58: `price` is NOT taken from this sweep. Until 2026-08-17 it was
+// the price of whatever row happened to sit last in the diff, assigned
+// before the qty==0 test below, so a *removed* level a long way off the
+// book set the published price — and on a fresh socket, where the first
+// l2_updates is the whole book, that was the top of the ask ladder
+// (`px=1.2345679e+10`, a resting order at $12.3B). 348 of 6,876 logged
+// ticks were off by more than 0.5%. It is the last traded price now,
+// falling back to the mid and then to whichever side of the book we
+// have. See exchange_api.h's exchange_ws_ticker_t for what the field
+// means across venues.
 static void
 gem_ws_md_emit_ticker_from_l2(const char *product_abstr,
     struct json_object *changes, int64_t time_ms)
@@ -780,7 +863,7 @@ gem_ws_md_emit_ticker_from_l2(const char *product_abstr,
   size_t                n;
   double                best_bid = 0.0;
   double                best_ask = 0.0;
-  double                last     = 0.0;
+  double                price    = 0.0;
 
   if(changes == NULL) return;
 
@@ -811,8 +894,6 @@ gem_ws_md_emit_ticker_from_l2(const char *product_abstr,
 
     if(side == NULL || price <= 0.0) continue;
 
-    last = price;
-
     // qty=0 means the level was removed; only count populated levels
     // toward best bid/ask.
     if(qty <= 0.0) continue;
@@ -829,7 +910,22 @@ gem_ws_md_emit_ticker_from_l2(const char *product_abstr,
     }
   }
 
-  if(best_bid == 0.0 && best_ask == 0.0 && last == 0.0)
+  price = gem_ws_mark_get_locked(product_abstr);
+
+  if(price <= 0.0)
+  {
+    if(best_bid > 0.0 && best_ask > 0.0)
+      price = (best_bid + best_ask) / 2.0;
+
+    else
+      price = (best_bid > 0.0) ? best_bid : best_ask;
+  }
+
+  // Nothing knowable about this product yet. Publishing a zero would be
+  // worse than publishing nothing: whenmoon assigns ticker price into
+  // mk->last_px unconditionally, and last_px is the mark a paper or
+  // real fill executes against (market_engine.c).
+  if(price <= 0.0)
     return;
 
   ev.channel = EXCH_WS_TICKER;
@@ -838,7 +934,7 @@ gem_ws_md_emit_ticker_from_l2(const char *product_abstr,
 
   t->best_bid = best_bid;
   t->best_ask = best_ask;
-  t->price    = last;
+  t->price    = price;
   // 24h aggregates left at 0.0 — Gemini's MD v2 doesn't surface them.
   t->volume_24h = 0.0;
   t->low_24h    = 0.0;
@@ -890,6 +986,7 @@ gem_ws_md_emit_trades_array(const char *product_abstr,
 
     if(m->time_ms == 0) m->time_ms = fallback_time_ms;
 
+    gem_ws_mark_note_locked(product_abstr, m->price);
     gem_ws_fanout_locked(&ev);
   }
 }
@@ -921,11 +1018,15 @@ gem_ws_md_handle_l2_updates_locked(struct json_object *root)
   changes = json_get_array(root, "changes");
   trades  = json_get_array(root, "trades");
 
-  if(changes != NULL)
-    gem_ws_md_emit_ticker_from_l2(symbol_abstr, changes, time_ms);
-
+  // OBS-58: trades first. They carry the price the ticker synthesized
+  // from `changes` publishes, so a frame that carries both must record
+  // its own trades before the ticker reads the mark — otherwise every
+  // such ticker is one frame stale.
   if(trades != NULL)
     gem_ws_md_emit_trades_array(symbol_abstr, trades, time_ms);
+
+  if(changes != NULL)
+    gem_ws_md_emit_ticker_from_l2(symbol_abstr, changes, time_ms);
 }
 
 // Standalone `trade` envelope:
@@ -973,6 +1074,7 @@ gem_ws_md_handle_trade_locked(struct json_object *root)
 
   if(m->time_ms == 0) m->time_ms = time_ms;
 
+  gem_ws_mark_note_locked(symbol_abstr, m->price);
   gem_ws_fanout_locked(&ev);
 }
 
@@ -1863,6 +1965,7 @@ gem_ws_channels_deinit(void)
   gem_ws_ch.head    = NULL;
   gem_ws_ch.n_subs  = 0;
   gem_ws_ch.n_slots = 0;
+  gem_ws_ch.n_marks = 0;
 
   pthread_mutex_unlock(&gem_ws_ch.mu);
 
