@@ -27,6 +27,33 @@
 #define WM_STRATEGY_SHOW_MAX_ATTACH  64
 
 // ----------------------------------------------------------------------- //
+// OBS-57: the registry reconciles when it is READ                         //
+// ----------------------------------------------------------------------- //
+//
+// The registry is a cache of a loader fact, and core tells us only half
+// of that fact. plugin_unmap_notify fires when a strategy's mapping
+// goes away and the WM-SU-1 listener drops the row; there is no arrival
+// counterpart, so nothing in core can tell us a strategy came back.
+// wm_strategy_registry_scan ran in exactly two places — whenmoon_init
+// and wm_strategy_reload — and neither is on the path of a bare
+// `/plugin reload strategy_<x>`. Measured: the row went and never
+// returned, `/whenmoon strategy reload` then refused it as "not
+// loaded", and only remapping whenmoon brought it back.
+//
+// Every entry point below therefore scans before it reads. The scan is
+// idempotent, adds only rows it cannot already find, and takes reg->lock
+// itself — so it is called here, before any of these handlers reach a
+// lock, and never from a path that holds one. Cost is one
+// plugin_iterate on an operator-typed command.
+//
+// Reconciling on read rather than on an arrival event is deliberate: it
+// is correct for load paths nobody wired a hook into, `/plugin load` of
+// a brand-new strategy .so included. What it does NOT restore is the
+// ATTACHMENTS — that is the documented contract (whenmoon_strategy.h,
+// "re-attaching afterwards is the user's job"), and this fix is what
+// makes that sentence true again, because until now the user could not.
+
+// ----------------------------------------------------------------------- //
 // WM-WARMUP-2 / WM-MI-3: per-market strategy binding KV sync              //
 //                                                                         //
 // The binding `plugin.whenmoon.market.<id>.strategy` (singular) names    //
@@ -82,6 +109,8 @@ wm_strategy_cmd_attach(const cmd_ctx_t *ctx)
     cmd_reply(ctx, "whenmoon: strategy registry not ready");
     return;
   }
+
+  wm_strategy_registry_scan(st);   // OBS-57 — see the note above
 
   p = ctx->args != NULL ? ctx->args : "";
 
@@ -227,6 +256,11 @@ wm_strategy_cmd_reload(const cmd_ctx_t *ctx)
     cmd_reply(ctx, "whenmoon: strategy registry not ready");
     return;
   }
+
+  // OBS-57 — see the note above. This one is the recovery path: before
+  // the scan, a strategy that a `/plugin reload` had dropped could not
+  // be reloaded here either, because the lookup missed the row.
+  wm_strategy_registry_scan(st);
 
   p = ctx->args != NULL ? ctx->args : "";
 
@@ -564,6 +598,8 @@ wm_strategy_cmd_show(const cmd_ctx_t *ctx)
     cmd_reply(ctx, "whenmoon: strategy registry not ready");
     return;
   }
+
+  wm_strategy_registry_scan(st);   // OBS-57 — see the note above
 
   p = ctx->args != NULL ? ctx->args : "";
 

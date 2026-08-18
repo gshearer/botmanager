@@ -458,6 +458,20 @@ wm_strategy_free_loaded_locked(loaded_strategy_t *ls)
 // keeps one owner for the row and turns the listener's attachment count
 // into the audit of this call: zero means the strategy cleaned up after
 // itself, non-zero means it did not and says so.
+//
+// OBS-57: the count is also the only warning anyone gets. Each of those
+// attachments is a market that had an advisor when the operator typed
+// `/plugin reload strategy_<x>` and has none after it — a paper or real
+// session keeps running, keeps marking to market and keeps its open
+// position, but no signal can ever reach it again. That was measured on
+// a live paper session holding an open long: it simply held. Core
+// answers the operator with a green "reloaded" and whenmoon cannot
+// change that reply, so this line is the whole signal. It is a WARN
+// naming the markets, not an INFO counting them.
+
+// Markets named in the OBS-57 warning before the list is truncated with
+// an ellipsis. The line is a prompt to go and look, not an inventory.
+#define WM_DETACH_SELF_NAMED_MAX  8
 
 uint32_t
 wm_strategy_detach_self_impl(const char *strategy_name)
@@ -467,14 +481,17 @@ wm_strategy_detach_self_impl(const char *strategy_name)
   loaded_strategy_t        *ls;
   wm_strategy_attachment_t *a;
   wm_strategy_attachment_t *next;
-  uint32_t                  n = 0;
+  char                      markets[512];
+  uint32_t                  n_named = 0;
+  uint32_t                  n       = 0;
 
   st = whenmoon_get_state();
 
   if(st == NULL || st->strategies == NULL || strategy_name == NULL)
     return(0);
 
-  reg = st->strategies;
+  reg        = st->strategies;
+  markets[0] = '\0';
 
   pthread_mutex_lock(&reg->lock);
 
@@ -487,8 +504,20 @@ wm_strategy_detach_self_impl(const char *strategy_name)
     while(a != NULL)
     {
       next = a->next;
+
+      // Name the market before the attachment is freed. Formatting
+      // only — the clam() that prints this waits for the unlock.
+      if(n_named < WM_DETACH_SELF_NAMED_MAX)
+      {
+        if(markets[0] != '\0')
+          strlcat(markets, ", ", sizeof markets);
+
+        strlcat(markets, a->ctx.market_id_str, sizeof markets);
+        n_named++;
+      }
+
       wm_strategy_free_attachment_locked(ls, a);
-      a    = next;
+      a = next;
       n++;
     }
 
@@ -500,9 +529,13 @@ wm_strategy_detach_self_impl(const char *strategy_name)
 
   // After the unlock, never under it.
   if(n > 0)
-    clam(CLAM_INFO, WHENMOON_CTX,
-        "strategy '%s' detached itself on unload: %u attachment(s) "
-        "finalized", strategy_name, n);
+    clam(CLAM_WARN, WHENMOON_CTX,
+        "strategy '%s' unloaded with %u live attachment(s): %s%s — those "
+        "market(s) keep running with NO advisor and any open position "
+        "stays open, because nothing will re-attach for you. Re-attach "
+        "with /whenmoon strategy attach <market_id> %s",
+        strategy_name, n, markets,
+        n > n_named ? ", ..." : "", strategy_name);
 
   return(n);
 }
