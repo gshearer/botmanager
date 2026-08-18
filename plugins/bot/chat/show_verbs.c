@@ -234,18 +234,44 @@ verb_llm_personas(const cmd_ctx_t *ctx, bot_inst_t *bot, const char *rest)
 
 // ---- /show bot <name> llm memories [<query>] --------------------------
 
-// Heap-owned state that survives the verb's return. memory_retrieve_ns
-// submits the query embed to the llm worker pool and fires mem_rag_cb
-// from that thread long after the verb returned and `cmd_ctx_t` died.
-// We snapshot the reply target up front and send from the cb directly.
+// Where a verb's answer goes when it arrives after the verb has
+// returned. Both async verbs in this file — `llm memories` and `llm
+// knowledge` — hand their query to a worker pool and are fired back
+// from that thread long after `cmd_ctx_t` has died, so both snapshot
+// the reply target on the heap and both carry exactly this and nothing
+// else. One type, therefore.
+//
 // The instance is snapshotted by NAME, not by pointer: a `/plugin
 // reload irc` in that window frees the instance the verb saw
 // (method.h §method_msg_t).
+//
+// `route` is the driver-private reply address (OBS-29). It outranks the
+// channel/sender pair for the same reason cmd_reply prefers it: it
+// names the session that asked, not whoever the driver happens to be
+// serving when the answer exists. A driver that serves one session at
+// a time leaves it empty.
 typedef struct
 {
   char inst_name[METHOD_NAME_SZ];
   char target[METHOD_SENDER_SZ];
-} mem_rag_state_t;
+  char route[METHOD_ROUTE_SZ];
+} verb_reply_to_t;
+
+static void
+verb_reply_to_snapshot(verb_reply_to_t *to, const cmd_ctx_t *ctx)
+{
+  strlcpy(to->inst_name, ctx->msg->inst_name, sizeof to->inst_name);
+  strlcpy(to->route, ctx->msg->reply_route, sizeof to->route);
+  strlcpy(to->target,
+      ctx->msg->channel[0] != '\0' ? ctx->msg->channel : ctx->msg->sender,
+      sizeof to->target);
+}
+
+static const char *
+verb_reply_to_addr(const verb_reply_to_t *to)
+{
+  return(to->route[0] != '\0' ? to->route : to->target);
+}
 
 // Owns `user`: frees it on every path. memory_retrieve_ns guarantees
 // exactly one delivery, including on its own failure returns.
@@ -253,8 +279,9 @@ static void
 mem_rag_cb(const mem_fact_t *facts, size_t n_facts,
     const mem_msg_t *msgs, size_t n_msgs, void *user)
 {
-  mem_rag_state_t *st = user;
+  verb_reply_to_t *st = user;
   method_inst_t *inst = method_find(st->inst_name);
+  const char *to = verb_reply_to_addr(st);
   char line[1400];
 
   // The instance the query was asked on may have been reloaded away
@@ -289,11 +316,11 @@ mem_rag_cb(const mem_fact_t *facts, size_t n_facts,
         (double)msgs[i].score, ts,
         msgs[i].channel[0] ? msgs[i].channel : "dm",
         msgs[i].text);
-    method_send(inst, st->target, line);
+    method_send(inst, to, line);
   }
 
   if(n_msgs == 0)
-    method_send(inst, st->target, "(no hits)");
+    method_send(inst, to, "(no hits)");
 
   method_release(inst);
   mem_free(st);
@@ -303,7 +330,7 @@ static void
 verb_llm_memories(const cmd_ctx_t *ctx, bot_inst_t *bot, const char *rest)
 {
   userns_t *ns = bot_get_userns(bot);
-  mem_rag_state_t *st;
+  verb_reply_to_t *st;
 
   if(ns == NULL) { cmd_reply(ctx, "bot has no userns bound"); return; }
 
@@ -367,9 +394,7 @@ verb_llm_memories(const cmd_ctx_t *ctx, bot_inst_t *bot, const char *rest)
 
   st = mem_alloc("chatbot", "mem_rag_state", sizeof(*st));
 
-  strlcpy(st->inst_name, ctx->msg->inst_name, sizeof st->inst_name);
-  snprintf(st->target, sizeof(st->target), "%s",
-      ctx->msg->channel[0] != '\0' ? ctx->msg->channel : ctx->msg->sender);
+  verb_reply_to_snapshot(st, ctx);
 
   // No mem_free(st) on FAIL: memory_retrieve_ns delivers the callback on
   // its failure paths too, and the callback already freed it.
@@ -448,22 +473,12 @@ verb_stats(const cmd_ctx_t *ctx, bot_inst_t *bot, const char *rest)
 // top hits with cosine scores. Mirrors `llm memories` but over the
 // corpus-scoped embedding table rather than per-user facts.
 
-// Heap-owned state that survives the verb's return. `knowledge_retrieve`
-// submits the query embed to the curl worker pool and fires `kw_rag_cb`
-// from that thread after the verb has already returned and `cmd_ctx_t`
-// is gone. We snapshot the reply target (method instance + channel/DM
-// destination) up front and use `method_send` directly from the cb.
-typedef struct
-{
-  char inst_name[METHOD_NAME_SZ];
-  char target[METHOD_SENDER_SZ];
-} kw_rag_state_t;
-
 static void
 kw_rag_cb(const knowledge_chunk_t *chunks, size_t n, void *user)
 {
-  kw_rag_state_t *st = user;
+  verb_reply_to_t *st = user;
   method_inst_t *inst = method_find(st->inst_name);
+  const char *to = verb_reply_to_addr(st);
   char line[1400];
 
   if(inst == NULL)
@@ -481,11 +496,11 @@ kw_rag_cb(const knowledge_chunk_t *chunks, size_t n, void *user)
         chunks[i].section_heading,
         chunks[i].section_heading[0] ? "] " : "",
         256, chunks[i].text);
-    method_send(inst, st->target, line);
+    method_send(inst, to, line);
   }
 
   if(n == 0)
-    method_send(inst, st->target, "(no hits)");
+    method_send(inst, to, "(no hits)");
 
   method_release(inst);
   mem_free(st);
@@ -495,7 +510,7 @@ static void
 verb_llm_knowledge(const cmd_ctx_t *ctx, bot_inst_t *bot, const char *rest)
 {
   const char *name = bot_inst_name(bot);
-  kw_rag_state_t *st;
+  verb_reply_to_t *st;
   char line[512];
   const char *cl;
   char corpus_list[CHATBOT_CORPUS_LIST_SZ];
@@ -606,9 +621,7 @@ verb_llm_knowledge(const cmd_ctx_t *ctx, bot_inst_t *bot, const char *rest)
 
   st = mem_alloc("chatbot", "kw_rag_state", sizeof(*st));
 
-  strlcpy(st->inst_name, ctx->msg->inst_name, sizeof st->inst_name);
-  snprintf(st->target, sizeof(st->target), "%s",
-      ctx->msg->channel[0] != '\0' ? ctx->msg->channel : ctx->msg->sender);
+  verb_reply_to_snapshot(st, ctx);
 
   if(knowledge_retrieve(corpus_list, rest, 0, kw_rag_cb, st) != SUCCESS)
   {

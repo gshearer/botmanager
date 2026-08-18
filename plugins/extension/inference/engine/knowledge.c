@@ -308,6 +308,22 @@ knowledge_ensure_tables(void)
       " created        TIMESTAMPTZ  NOT NULL DEFAULT NOW()"
       ")");
 
+  // A *page-chunked* corpus holds at most one chunk per page, so a
+  // later digest of a page replaces the earlier one rather than joining
+  // it (knowledge_page_supersede). The acquisition engine's corpora are
+  // page-chunked and say so on their first ingest; a file-ingested
+  // corpus is NOT, because it splits one page into many chunks that
+  // share corpus, source_url and section_heading — archwiki carries up
+  // to 43 of them, and superseding there would delete 42.
+  //
+  // The flag lives on the corpus because the corpus is the only place
+  // the distinction is knowable at the moment of the DELETE, and it
+  // defaults FALSE so a corpus that has never claimed the invariant can
+  // never lose a row to it.
+  knowledge_run_ddl(
+      "ALTER TABLE knowledge_corpora ADD COLUMN IF NOT EXISTS"
+      " page_chunked BOOLEAN NOT NULL DEFAULT FALSE");
+
   knowledge_run_ddl(
       "CREATE TABLE IF NOT EXISTS knowledge_chunks ("
       " id              BIGSERIAL    PRIMARY KEY,"
@@ -1071,6 +1087,111 @@ knowledge_insert_chunk_raw(const char *corpus, const char *source_url,
   return(inserted    ? KNOWLEDGE_CHUNK_INSERTED
       : embedded     ? KNOWLEDGE_CHUNK_PRESENT
       :                KNOWLEDGE_CHUNK_UNEMBEDDED);
+}
+
+// Claims the page-chunked invariant for a corpus: at most one chunk per
+// page, later digests replacing earlier ones. Idempotent, and a no-op
+// write once the flag is set. Only a caller that writes whole-page
+// chunks may claim it — see the DDL for what it costs to be wrong.
+void
+knowledge_corpus_mark_page_chunked(const char *corpus)
+{
+  char *e_corp;
+  char sql[256];
+  db_result_t *res;
+
+  if(!knowledge_ready || corpus == NULL || corpus[0] == '\0')
+    return;
+
+  e_corp = db_escape(corpus);
+
+  if(e_corp == NULL)
+    return;
+
+  snprintf(sql, sizeof(sql),
+      "UPDATE knowledge_corpora SET page_chunked = TRUE"
+      " WHERE name = '%s' AND NOT page_chunked", e_corp);
+
+  res = db_result_alloc();
+
+  if(db_query(sql, res) != SUCCESS && res->error[0] != '\0')
+    clam(CLAM_WARN, "knowledge", "mark_page_chunked: %s", res->error);
+
+  db_result_free(res);
+  mem_free(e_corp);
+}
+
+// A *page chunk* is the whole digest of one page, so a corpus holds at
+// most one per (corpus, source_url, section_heading): a later digest of
+// the same page replaces the earlier ones rather than joining them.
+// This is the acquisition path's shape and only its own — the file
+// ingest path splits one page into many chunks that share all three
+// columns, and must never route through here.
+//
+// Deletes every row for the named page except `keep_id`; the embedding
+// and image rows follow on the foreign keys' ON DELETE CASCADE. A page
+// with no URL cannot be named, so it is never superseded — the caller
+// gets 0 and keeps whatever the corpus already held.
+//
+// The DELETE carries its own guard: a corpus that has not claimed the
+// page-chunked invariant loses nothing, whatever the caller believed.
+//
+// Returns the number of chunk rows removed.
+uint32_t
+knowledge_page_supersede(const char *corpus, const char *source_url,
+    const char *section_heading, int64_t keep_id)
+{
+  char *e_corp;
+  char *e_url;
+  char *e_sec;
+  char *sql;
+  size_t sql_sz;
+  db_result_t *res;
+  uint32_t removed;
+
+  if(!knowledge_ready || corpus == NULL || corpus[0] == '\0'
+      || source_url == NULL || source_url[0] == '\0' || keep_id == 0)
+    return(0);
+
+  e_corp = db_escape(corpus);
+  e_url  = db_escape(source_url);
+  e_sec  = db_escape(section_heading != NULL ? section_heading : "");
+
+  if(e_corp == NULL || e_url == NULL || e_sec == NULL)
+  {
+    if(e_corp != NULL) mem_free(e_corp);
+    if(e_url  != NULL) mem_free(e_url);
+    if(e_sec  != NULL) mem_free(e_sec);
+    return(0);
+  }
+
+  sql_sz = strlen(e_corp) + strlen(e_url) + strlen(e_sec) + 256;
+  sql = mem_alloc("knowledge", "supersede_sql", sql_sz);
+
+  snprintf(sql, sql_sz,
+      "DELETE FROM knowledge_chunks k"
+      " WHERE k.corpus = '%s' AND k.source_url = '%s'"
+      "   AND k.section_heading = '%s' AND k.id <> %" PRId64
+      "   AND EXISTS (SELECT 1 FROM knowledge_corpora c"
+      "                WHERE c.name = k.corpus AND c.page_chunked)",
+      e_corp, e_url, e_sec, keep_id);
+
+  res = db_result_alloc();
+  removed = 0;
+
+  if(db_query(sql, res) == SUCCESS && res->ok)
+    removed = res->rows_affected;
+
+  else if(res->error[0] != '\0')
+    clam(CLAM_WARN, "knowledge", "page_supersede: %s", res->error);
+
+  db_result_free(res);
+  mem_free(sql);
+  mem_free(e_corp);
+  mem_free(e_url);
+  mem_free(e_sec);
+
+  return(removed);
 }
 
 knowledge_chunk_rc_t

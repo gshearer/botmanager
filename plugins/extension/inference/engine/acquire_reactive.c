@@ -509,8 +509,9 @@ acq_reactive_curl_done(const curl_response_t *cresp)
 // callback dispatch in one place.
 //
 // `images` may be NULL (feed path has no per-item image extraction in
-// the first cut). `page_url` feeds into knowledge_insert_image as the
-// page context for each image; ignored when n_images == 0.
+// the first cut). `page_url` is the chunk's own source_url as well as
+// the page context for each image, and it is what makes a corpus row
+// citable and supersedable; an empty one costs both.
 //
 // Returns SUCCESS iff a NEW chunk row landed, FAIL otherwise. Since
 // OBS-16 a digest this corpus already holds byte-for-byte is one of the
@@ -539,8 +540,13 @@ acq_ingest_digest_result(const char *bot_name, const char *topic_name,
 
   id = 0;
 
-  rc = knowledge_insert_chunk(dest_corpus, NULL, section,
-      resp->summary, &id);
+  // The page's URL is the chunk's provenance, and it is the axis that
+  // separates a re-digest from new content: two digests of one URL are
+  // the same page reworded, two digests under one section_heading with
+  // different URLs are different sites. Passing NULL here left every
+  // acquired row anonymous and both distinctions unmakeable.
+  rc = knowledge_insert_chunk(dest_corpus,
+      page_url != NULL ? page_url : "", section, resp->summary, &id);
 
   if(rc == KNOWLEDGE_CHUNK_FAILED)
   {
@@ -548,6 +554,28 @@ acq_ingest_digest_result(const char *bot_name, const char *topic_name,
         "%s: knowledge_insert_chunk failed corpus='%s' bot=%s topic=%s",
         mode, dest_corpus, bot_name, topic_name);
     return(FAIL);
+  }
+
+  // The acquisition engine writes one chunk per page, which is the
+  // invariant knowledge_page_supersede acts on; claim it before asking
+  // for the collapse, so a corpus this engine has never written cannot
+  // lose a row to it.
+  knowledge_corpus_mark_page_chunked(dest_corpus);
+
+  // This digest is now the corpus's answer for this page, so the
+  // digests it replaces go. Runs on the duplicate path too: an
+  // unchanged page still supersedes whatever older wording of itself
+  // the corpus is holding, which is how a corpus that has been
+  // accumulating converges instead of merely stopping.
+  {
+    uint32_t gone = knowledge_page_supersede(dest_corpus,
+        page_url != NULL ? page_url : "", section, id);
+
+    if(gone > 0)
+      clam(CLAM_INFO, ACQUIRE_CTX,
+          "%s superseded %u older digest%s of page '%s' (chunk=%ld)",
+          mode, gone, gone == 1 ? "" : "s",
+          page_url != NULL ? page_url : "", (long)id);
   }
 
   // A digest this corpus already holds, byte for byte. Not an ingest

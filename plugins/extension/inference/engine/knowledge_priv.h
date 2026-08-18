@@ -109,6 +109,11 @@ knowledge_chunk_rc_t knowledge_insert_chunk(const char *corpus,
     const char *source_url, const char *section_heading, const char *text,
     int64_t *out_id);
 
+void knowledge_corpus_mark_page_chunked(const char *corpus);
+
+uint32_t knowledge_page_supersede(const char *corpus,
+    const char *source_url, const char *section_heading, int64_t keep_id);
+
 bool knowledge_insert_image(int64_t chunk_id, const char *url,
     const char *page_url, const char *caption, const char *subject,
     int width_px, int height_px);
