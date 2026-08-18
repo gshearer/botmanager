@@ -12,12 +12,17 @@
 // KV-edits at runtime force a re-decode on the next request without
 // racing with in-flight signs.
 //
-// Nonces are monotonic 64-bit counters. The latest value is persisted
-// to `plugin.kraken.last_nonce` (best-effort) so a daemon restart never
-// re-uses a nonce — Kraken rejects out-of-order nonces with
-// `EAPI:Invalid nonce`. First nonce after a fresh install is seeded to
-// `time(NULL) * 1e6` so it is comfortably ahead of any historical
-// nonce on the key.
+// Nonces are monotonic 64-bit counters. Kraken rejects out-of-order
+// nonces with `EAPI:Invalid nonce`.
+//
+// ⭑ What guarantees monotonicity across a restart is the SEED, not the
+// persisted row: every start takes `max(plugin.kraken.last_nonce,
+// time(NULL) * 1e6)`, so the microsecond clock floor is already ahead
+// of any nonce minted in a previous second and a lost row costs
+// nothing. The row is an optimisation, and its write is best-effort in
+// the strict sense (OBS-59): kr_next_nonce only marks the KV entry
+// dirty, and the value reaches the database when something flushes, at
+// kv_exit(), or when this plugin is unloaded.
 
 #ifndef BM_KRAKEN_SIGN_H
 #define BM_KRAKEN_SIGN_H

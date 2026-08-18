@@ -52,8 +52,9 @@ static const plugin_kv_entry_t gem_kv_schema[] =
   { "plugin.gemini.request_timeout",     KV_UINT32, "15",    NULL, NULL, NULL },
   { "plugin.gemini.symbols_refresh_sec", KV_UINT32, "86400", NULL, NULL, NULL },
 
-  // Monotonic nonce — persisted per-request best-effort so a daemon
-  // restart never re-uses one.
+  // Monotonic nonce. Marked dirty per request, written when something
+  // flushes (OBS-59); the seed's clock floor is what actually keeps a
+  // restart from re-using one.
   { "plugin.gemini.last_nonce",          KV_UINT64, "0",     NULL, NULL, NULL },
 };
 

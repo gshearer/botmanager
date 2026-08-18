@@ -1662,7 +1662,10 @@ uint32_t
 kv_reclaim_owned(uintptr_t lo, uintptr_t hi)
 {
   kv_nl_reg_t **rp;
+  kv_entry_t   *doomed  = NULL;   // unlinked, awaiting persist + free
   uint32_t      removed = 0;
+  uint32_t      saved   = 0;
+  uint32_t      lost    = 0;
 
   if(lo >= hi)
     return(0);
@@ -1686,7 +1689,12 @@ kv_reclaim_owned(uintptr_t lo, uintptr_t hi)
         else
           kv_table[b] = next;
 
-        mem_free(e);
+        // OBS-59: unlinked, NOT freed. A dirty entry still owes the
+        // database a write, and persist_entry issues a remote query —
+        // which must not run under kv_mutex. Reaped below, unlocked.
+        e->next = doomed;
+        doomed  = e;
+
         kv_count--;
         removed++;
       }
@@ -1699,6 +1707,63 @@ kv_reclaim_owned(uintptr_t lo, uintptr_t hi)
   }
 
   pthread_mutex_unlock(&kv_mutex);
+
+  // OBS-59: this is kv_exit()'s flush, scoped to one mapping and run at
+  // the last moment its entries still exist. Until it was added, a value
+  // set through kv_set() died here silently: apply_val only marks the
+  // entry dirty, kv_flush() is the sole writer, and nothing outside the
+  // `set kv` and IRC command surfaces calls it — so a plugin's own
+  // kv_set never reached the DB, and this loop freed the evidence. The
+  // measured case was whenmoon's strategy binding: `/plugin reload
+  // whenmoon` forgot which strategy a market ran, and — because
+  // kv_register then adopts the older row — a market the operator had
+  // DETACHED came back attached.
+  //
+  // ⛔ It persists every dirty entry, exactly as kv_flush() does,
+  // including a registration default nobody ever set. That is
+  // deliberate: this path is a flush, and a second persistence policy
+  // that disagreed with kv_flush() about what a dirty entry means would
+  // be worse than the write it saves. Measured live on a whenmoon
+  // reload: 18 values written, inside the same log second as the rest of
+  // the cascade.
+  //
+  // The entries are off the table, so nothing can reach them and the
+  // query below is unsynchronised by construction; the value strings a
+  // reader may still hold live in the intern table, never here.
+  //
+  // A graceful shutdown does not come through here at all — plugin_exit
+  // dlcloses without plugin_reclaim, and kv_exit() has already flushed
+  // by then (main.c orders kv_exit before plugin_exit). This runs only
+  // on an unload, where the database is still open.
+  while(doomed != NULL)
+  {
+    kv_entry_t *dead = doomed;
+
+    doomed = doomed->next;
+
+    if(dead->dirty)
+    {
+      if(persist_entry(dead) == SUCCESS)
+        saved++;
+
+      else
+        lost++;
+    }
+
+    mem_free(dead);
+  }
+
+  // Both lines name a value that a reader would otherwise never learn
+  // the fate of: silence here is what the row was filed for.
+  if(saved > 0)
+    clam(CLAM_INFO, "kv_reclaim",
+        "persisted %u unsaved value(s) before unmapping their owner",
+        saved);
+
+  if(lost > 0)
+    clam(CLAM_WARN, "kv_reclaim",
+        "%u unsaved value(s) could NOT be written and are gone with the"
+        " mapping", lost);
 
   // NL responders are keyed by hint pointer rather than by owner: the
   // hint is the only thing the registry retains, and it is exactly what

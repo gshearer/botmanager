@@ -20,12 +20,17 @@
 //   * HMAC is SHA-384, not SHA-512.
 //   * Signature output is lowercase hex, not base64.
 //
-// Nonces are monotonic 64-bit counters. The latest value is persisted to
-// `plugin.gemini.last_nonce` (best-effort) so a daemon restart never
-// re-uses a nonce — Gemini rejects out-of-order nonces with a hard
-// error. First nonce after a fresh install is seeded to
-// `max(persisted, time(NULL) * 1e6)` so it is comfortably ahead of any
-// historical nonce on the key.
+// Nonces are monotonic 64-bit counters. Gemini rejects out-of-order
+// nonces with a hard error.
+//
+// ⭑ What guarantees monotonicity across a restart is the SEED, not the
+// persisted row: every start takes `max(plugin.gemini.last_nonce,
+// time(NULL) * 1e6)`, so the microsecond clock floor is already ahead
+// of any nonce minted in a previous second and a lost row costs
+// nothing. The row is an optimisation, and its write is best-effort in
+// the strict sense (OBS-59): gem_next_nonce only marks the KV entry
+// dirty, and the value reaches the database when something flushes, at
+// kv_exit(), or when this plugin is unloaded.
 
 #ifndef BM_GEMINI_SIGN_H
 #define BM_GEMINI_SIGN_H

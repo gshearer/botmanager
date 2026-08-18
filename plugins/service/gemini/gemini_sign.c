@@ -145,8 +145,13 @@ gem_next_nonce(uint64_t *out)
   n = ++gem_sign.next_nonce;
   pthread_mutex_unlock(&gem_sign.lock);
 
-  // Persist for restart-safety. A torn write loses at most one nonce,
-  // which Gemini rejects with a hard error; the operator clears by
+  // Best-effort only, and nothing here depends on it: kv_set marks the
+  // entry dirty and kv_flush() is the sole writer, so this value reaches
+  // the database when something else flushes, at kv_exit(), or when this
+  // plugin is unloaded (OBS-59) — never on this line. What actually
+  // keeps a nonce ahead is the seed above, max(persisted, now_us): a
+  // lost row costs nothing because the clock floor outruns it. Losing
+  // one anyway is harmless — Gemini rejects with a hard error; the operator clears by
   // bumping plugin.gemini.last_nonce by hand.
   (void)kv_set_uint("plugin.gemini.last_nonce", n);
 

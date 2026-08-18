@@ -195,6 +195,21 @@ test_kv_reset = executable('test_kv_reset',
   dependencies : core_deps,
 )
 
+# kv_set() marks an entry dirty and returns; kv_flush() is the only
+# writer, and a plugin unload's kv_reclaim_owned() used to free the entry
+# without consulting the flag — so a value a plugin set reached no row
+# and the free took the evidence. The failure is silent in both
+# directions, and the worse one is the second: a cleared value that never
+# landed leaves the older row to be adopted, so a strategy an operator
+# DETACHED re-attaches itself on the next reload (OBS-59). Same recording
+# driver as kv_reset above — the statements sent are the subject.
+test_kv_reclaim = executable('test_kv_reclaim',
+  'test_kv_reclaim.c',
+  include_directories : [include_directories('.'), inc_include],
+  link_with : [test_harness, libcore],
+  dependencies : core_deps,
+)
+
 # kv_get_str hands ~205 sites a pointer they use after the lock is
 # gone. Both ways that promise can break are silent — a value rewritten
 # under a reader, an entry freed under one — so this suite states the
@@ -385,6 +400,7 @@ test('set_bot', test_set_bot)
 test('kv_str', test_kv_str)
 test('kv_default', test_kv_default)
 test('kv_reset', test_kv_reset)
+test('kv_reclaim', test_kv_reclaim)
 test('curl_submit_wait', test_curl_submit_wait)
 test('curl_flight', test_curl_flight)
 test('cmd_inflight', test_cmd_inflight)

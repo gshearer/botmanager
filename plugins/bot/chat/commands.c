@@ -42,7 +42,6 @@ chatbot_parse_duration_secs(const char *s)
 bool
 chatbot_mute_active(const char *botname)
 {
-  char     key[KV_KEY_SZ];
   uint64_t until;
 
   until = kv_get_bot_uint(botname, "behavior.mute_until");
@@ -53,7 +52,12 @@ chatbot_mute_active(const char *botname)
   if((time_t)until > time(NULL))
     return(true);
 
-  kv_set_uint(key, 0);
+  // OBS-59: the lazy clear used to hand kv_set_uint an UNINITIALISED
+  // `key` buffer — so it read stack garbage as a key string and the
+  // clear documented above never happened. The per-bot setter builds
+  // the key the same way the reader two lines up does, which is the
+  // whole reason there is no buffer here any more.
+  (void)kv_set_bot_uint(botname, "behavior.mute_until", 0);
   return(false);
 }
 
