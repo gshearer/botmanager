@@ -725,15 +725,22 @@ fail:
 // resubscribe — this does). Runs on the registering plugin's lifecycle
 // thread under core's plugin serialization — the same environment this
 // plugin's own start-time restore resub runs in at every boot.
+//
+// ⭑ OBS-41: `name` is passed through as `stale_exchange` rather than
+// logged and discarded. Only THIS provider's handles are dead — the
+// generation the abstraction stamps them with is per-exchange — so only
+// this provider is rebuilt, and every other venue's feed is left
+// running. Dropping the name here is what made a gemini reload cost the
+// live Coinbase feed ~17 seconds of ticks.
 static void
 wm_exchange_watch_cb(const char *name, void *user)
 {
   whenmoon_state_t *st = user;
 
   clam(CLAM_INFO, WHENMOON_CTX,
-      "exchange '%s' registered; rebuilding ws subscriptions", name);
+      "exchange '%s' registered; rebuilding its ws subscriptions", name);
 
-  wm_market_resub_ws(st);
+  wm_market_resub_ws(st, name);
 }
 
 // WM-MR-1: restore runs in start (post-kv_load) so per-plugin KV reads

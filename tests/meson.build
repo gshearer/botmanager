@@ -107,6 +107,21 @@ test_warm_chain = executable('test_warm_chain',
   dependencies : core_deps,
 )
 
+# The one predicate that decides whether a live WS subscription may be
+# left alone (OBS-41). Both wrong answers are silent: "same" when the set
+# changed leaves a market with no feed, and "differs" when it did not
+# restores the ~17 s tick gap the diff exists to end. ws_binding.c
+# includes no whenmoon header — the property that lets this suite compile
+# it directly, as warm_chain.c does — and calls nothing but libc, so no
+# core is linked.
+test_ws_binding = executable('test_ws_binding',
+  'test_ws_binding.c',
+  '../plugins/extension/whenmoon/ws_binding.c',
+  include_directories : [include_directories('.'), inc_include,
+                         include_directories('../plugins/extension/whenmoon')],
+  link_with : [test_harness],
+)
+
 # The FACT-1 ladder is SQL, so its suite drives psql against the
 # configured database inside a rolled-back transaction, and SKIPs when
 # that database is unreachable. It needs no core symbols — only the
@@ -343,3 +358,4 @@ test('exchange_watch', test_exchange_watch)
 test('method_stats', test_method_stats)
 test('botmanctl_route', test_botmanctl_route)
 test('shutdown_reason', test_shutdown_reason)
+test('ws_binding', test_ws_binding)

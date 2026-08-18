@@ -182,25 +182,135 @@ wm_market_grow(whenmoon_markets_t *m, uint32_t needed)
   return(SUCCESS);
 }
 
-// Rebuild the WS subscription set with the current running markets.
-// Called after every add/remove. Tearing down the prior bindings first
-// is safe: wm_market_on_event shorts on st->markets == NULL (which
-// stays set), but the handle close means no new events fire in
-// parallel.
+// ------------------------------------------------------------------ //
+// WS binding slots (OBS-41)                                          //
+// ------------------------------------------------------------------ //
+//
+// `n_ws_bindings` is a HIGH-WATER MARK, not a count — slots are
+// tombstoned in place and never compacted, because the slot address is
+// the driver's `user` pointer. The rule and what compaction would cost
+// are on `ws_bindings[]` in market.h; these three helpers are the only
+// code that indexes the array outside the reconcile itself.
+
+// The slot bound to `exch`, or NULL. Skips tombstones explicitly: an
+// empty name could not match a real exchange, but relying on that is
+// how a later reader talks themselves out of the skip elsewhere.
+static wm_market_ws_binding_t *
+wm_market_binding_find(whenmoon_markets_t *m, const char *exch)
+{
+  uint32_t i;
+
+  for(i = 0; i < m->n_ws_bindings; i++)
+  {
+    if(m->ws_bindings[i].exchange_name[0] == '\0')
+      continue;
+
+    if(strncmp(m->ws_bindings[i].exchange_name, exch,
+          EXCHANGE_NAME_SZ) == 0)
+      return(&m->ws_bindings[i]);
+  }
+
+  return(NULL);
+}
+
+// First tombstone, else the next never-used index, else NULL (cap).
+// Reuse is safe because a tombstone is written only AFTER
+// exchange_ws_unsubscribe has returned, and that call is synchronous
+// with respect to callbacks — kraken_ws_channels.c and
+// coinbase_ws_channels.c both drain in-flight callbacks before
+// returning — so no tick can still be inside the slot it releases.
+static wm_market_ws_binding_t *
+wm_market_binding_alloc(whenmoon_markets_t *m)
+{
+  uint32_t i;
+
+  for(i = 0; i < m->n_ws_bindings; i++)
+  {
+    if(m->ws_bindings[i].exchange_name[0] == '\0')
+      return(&m->ws_bindings[i]);
+  }
+
+  if(m->n_ws_bindings >= WM_MARKET_MAX_WS_BINDINGS)
+    return(NULL);
+
+  return(&m->ws_bindings[m->n_ws_bindings++]);
+}
+
+// Unsubscribe and tombstone IN PLACE. The slot address is deliberately
+// preserved; only its contents are cleared.
+static void
+wm_market_binding_drop(wm_market_ws_binding_t *b)
+{
+  if(b->ws_sub != NULL)
+    exchange_ws_unsubscribe(b->exchange_name, b->ws_sub);
+
+  b->ws_sub           = NULL;
+  b->exchange_name[0] = '\0';
+  wm_ws_product_set_clear(&b->products);
+}
+
+// Subscribe `exch`'s products into an empty (or freshly dropped) slot
+// and record what was asked for, so the next reconcile has something to
+// diff against. A failed subscribe leaves ws_sub NULL, which the
+// reconcile reads as "retry me".
+static void
+wm_market_binding_bind(wm_market_ws_binding_t *b, const char *exch,
+    const char *const *pids, uint32_t n_pids)
+{
+  strlcpy(b->exchange_name, exch, sizeof(b->exchange_name));
+  b->ws_sub = NULL;
+
+  if(!wm_ws_product_set_record(&b->products, pids, n_pids))
+    clam(CLAM_WARN, WHENMOON_CTX,
+        "%s: %u products exceeds the %u a binding remembers; "
+        "every mutation will resubscribe it",
+        exch, (unsigned)n_pids, (unsigned)WM_WS_BINDING_MAX_PRODUCTS);
+
+  // Pass the binding pointer as user so wm_market_on_event can read the
+  // originating exchange directly. The slot is stable for the binding's
+  // lifetime — see wm_market_binding_alloc for why reuse is safe.
+  if(exchange_ws_subscribe(exch,
+        wm_ws_channels,
+        sizeof(wm_ws_channels) / sizeof(wm_ws_channels[0]),
+        pids, n_pids,
+        wm_market_on_event, b,
+        &b->ws_sub) != SUCCESS || b->ws_sub == NULL)
+  {
+    clam(CLAM_INFO, WHENMOON_CTX,
+        "ws subscribe failed for %s (no live stream)", exch);
+    b->ws_sub = NULL;
+  }
+}
+
+// Reconcile the WS subscription set against the current running
+// markets. Called after every add/remove and from the OBS-23
+// registration watch.
+//
+// OBS-41: this used to tear down EVERY binding and resubscribe from
+// scratch, so starting a kraken market unsubscribed and resubscribed
+// coinbase — measured three times on 2026-08-17 as ~17 s with no ticks
+// at all on the coinbase feed, because the resubscribe frame goes out
+// immediately and then sits unacked until the driver's 15 s watchdog
+// forces a reconnect. An exchange whose desired product set already
+// matches its binding is now left alone entirely.
 //
 // One ws_sub per distinct exchange in the running set; products owned
 // by that exchange ride a single subscribe call. The live trader's
 // user-channel reconcile (wm_live_ws_resub_all) runs once at the end
-// against the same partitioning.
+// against the same partitioning and the same `stale_exchange`.
 //
 // OBS-23: also reached from the exchange registration watch
 // (whenmoon.c), so this is no longer a command-thread-only path — see
-// wm_resub_lock above.
+// wm_resub_lock above. That path passes the registrant's name as
+// `stale_exchange`: its handles are dead (its own exchange_unregister
+// bumped its ws_gen) while every other exchange's are provably live, so
+// it wants a full rebuild of exactly one exchange.
 void
-wm_market_resub_ws(whenmoon_state_t *st)
+wm_market_resub_ws(whenmoon_state_t *st, const char *stale_exchange)
 {
   whenmoon_markets_t *m;
   const char        **pid_ptrs = NULL;
+  bool                wanted[WM_MARKET_MAX_WS_BINDINGS];
   uint32_t            i;
   uint32_t            j;
 
@@ -213,15 +323,17 @@ wm_market_resub_ws(whenmoon_state_t *st)
 
   // WM-RESUB-COALESCE-1: during a bulk restore, per-add resubs are
   // suppressed; wm_market_restore issues ONE resub after its add-loop.
-  // Rebuilding the whole subscription N times storms coinbase into
-  // starving the feed (see finding_ws_resub_storm_starves_feed).
+  // Still wanted under the diff — each of N adds changes its OWN
+  // exchange's set, so N adds would still emit N times for it.
   if(m->defer_resub)
   {
     pthread_mutex_unlock(&wm_resub_lock);
     return;
   }
 
-  // WM-MKT-ARR-UAF-1: rdlock across the whole rebuild — the arr walks below
+  memset(wanted, 0, sizeof(wanted));
+
+  // WM-MKT-ARR-UAF-1: rdlock across the whole reconcile — the arr walks below
   // must see a stable pointer block, and the pid pointers gathered into
   // pid_ptrs alias session-owned (pointer-stable) memory. This is always
   // reached OUTSIDE the writer's wrlock (add/remove call resub_ws after
@@ -231,117 +343,95 @@ wm_market_resub_ws(whenmoon_state_t *st)
   // writers are serialized by wm_resub_lock — OBS-23.)
   pthread_rwlock_rdlock(&m->arr_lock);
 
-  for(i = 0; i < m->n_ws_bindings; i++)
+  // Pass 1 — every distinct exchange the running set wants. Each is
+  // kept, rebuilt, or newly bound; `wanted` records which slot answered
+  // for it so pass 2 can drop the rest. The "have we handled this
+  // exchange?" check is O(n_ws_bindings), bounded by 8; O(N²) over the
+  // running set is fine at these scales.
+  if(m->n_markets > 0)
   {
-    if(m->ws_bindings[i].ws_sub != NULL)
-      exchange_ws_unsubscribe(m->ws_bindings[i].exchange_name,
-          m->ws_bindings[i].ws_sub);
+    pid_ptrs = mem_alloc("whenmoon", "ws_pids",
+        sizeof(*pid_ptrs) * m->n_markets);
 
-    m->ws_bindings[i].ws_sub           = NULL;
-    m->ws_bindings[i].exchange_name[0] = '\0';
-  }
-  m->n_ws_bindings = 0;
-
-  if(m->n_markets == 0)
-  {
-    wm_live_ws_resub_all(st);
-    pthread_rwlock_unlock(&m->arr_lock);
-    pthread_mutex_unlock(&wm_resub_lock);
-    return;
-  }
-
-  pid_ptrs = mem_alloc("whenmoon", "ws_pids",
-      sizeof(*pid_ptrs) * m->n_markets);
-
-  // For each distinct exchange in the running set, gather its
-  // product_ids and issue one subscribe. The "have we already bound
-  // this exchange?" check is O(n_ws_bindings) which is bounded by 8;
-  // O(N²) over the running set is fine at these scales.
-  for(i = 0; i < m->n_markets; i++)
-  {
-    const char             *exch = m->arr[i]->exchange_name;
-    wm_market_ws_binding_t *b;
-    uint32_t                n_pids;
-    bool                    seen;
-
-    seen = false;
-    for(j = 0; j < m->n_ws_bindings; j++)
+    for(i = 0; i < m->n_markets; i++)
     {
-      if(strncmp(m->ws_bindings[j].exchange_name, exch,
-            EXCHANGE_NAME_SZ) == 0)
-      {
-        seen = true;
-        break;
-      }
-    }
+      const char             *exch = m->arr[i]->exchange_name;
+      wm_market_ws_binding_t *b    = wm_market_binding_find(m, exch);
+      uint32_t                n_pids;
 
-    if(seen)
-      continue;
-
-    if(m->n_ws_bindings >= WM_MARKET_MAX_WS_BINDINGS)
-    {
-      clam(CLAM_WARN, WHENMOON_CTX,
-          "ws bindings cap (%u) exceeded; %s skipped",
-          (unsigned)WM_MARKET_MAX_WS_BINDINGS, exch);
-      continue;
-    }
-
-    // WM-MI-1: dedup product_ids across instances — N instances of one
-    // product must yield ONE subscription, not N. O(n_pids) inner scan
-    // is fine at these scales (a handful of products per exchange).
-    n_pids = 0;
-    for(j = i; j < m->n_markets; j++)
-    {
-      uint32_t k;
-      bool     dup;
-
-      if(strncmp(m->arr[j]->exchange_name, exch, EXCHANGE_NAME_SZ) != 0)
+      if(b != NULL && wanted[(uint32_t)(b - m->ws_bindings)])
         continue;
 
-      dup = false;
-      for(k = 0; k < n_pids; k++)
+      // WM-MI-1: dedup product_ids across instances — N instances of one
+      // product must yield ONE subscription, not N. O(n_pids) inner scan
+      // is fine at these scales (a handful of products per exchange).
+      n_pids = 0;
+      for(j = i; j < m->n_markets; j++)
       {
-        if(strncmp(pid_ptrs[k], m->arr[j]->product_id,
-              WM_PRODUCT_ID_SZ) == 0)
+        uint32_t k;
+        bool     dup;
+
+        if(strncmp(m->arr[j]->exchange_name, exch, EXCHANGE_NAME_SZ) != 0)
+          continue;
+
+        dup = false;
+        for(k = 0; k < n_pids; k++)
         {
-          dup = true;
-          break;
+          if(strncmp(pid_ptrs[k], m->arr[j]->product_id,
+                WM_PRODUCT_ID_SZ) == 0)
+          {
+            dup = true;
+            break;
+          }
         }
+
+        if(!dup)
+          pid_ptrs[n_pids++] = m->arr[j]->product_id;
       }
 
-      if(!dup)
-        pid_ptrs[n_pids++] = m->arr[j]->product_id;
+      if(b == NULL)
+      {
+        b = wm_market_binding_alloc(m);
+
+        if(b == NULL)
+        {
+          clam(CLAM_WARN, WHENMOON_CTX,
+              "ws bindings cap (%u) exceeded; %s skipped",
+              (unsigned)WM_MARKET_MAX_WS_BINDINGS, exch);
+          continue;
+        }
+
+        wm_market_binding_bind(b, exch, pid_ptrs, n_pids);
+      }
+
+      // A failed prior subscribe (ws_sub NULL) retries; the registrant
+      // of a (re)registration rebuilds regardless of its set, because
+      // its handles are dead; everything else rebuilds only when the
+      // set it bound is no longer the set that is wanted.
+      else if(b->ws_sub == NULL
+          || (stale_exchange != NULL
+              && strncmp(exch, stale_exchange, EXCHANGE_NAME_SZ) == 0)
+          || wm_ws_product_set_differs(&b->products, pid_ptrs, n_pids))
+      {
+        wm_market_binding_drop(b);
+        wm_market_binding_bind(b, exch, pid_ptrs, n_pids);
+      }
+
+      wanted[(uint32_t)(b - m->ws_bindings)] = true;
     }
 
-    b = &m->ws_bindings[m->n_ws_bindings];
-    snprintf(b->exchange_name, sizeof(b->exchange_name), "%s", exch);
-    b->ws_sub = NULL;
-
-    // Pass the binding pointer as user so wm_market_on_event can read
-    // the originating exchange directly. Binding slot is stable for
-    // the binding's lifetime: tear-down zeroes the slot before the
-    // next rebuild reuses it, and exchange_ws_unsubscribe is
-    // synchronous w.r.t. callbacks (kraken_ws_channels.c +
-    // coinbase_ws_channels.c both drain inflight callbacks before
-    // returning).
-    if(exchange_ws_subscribe(exch,
-          wm_ws_channels,
-          sizeof(wm_ws_channels) / sizeof(wm_ws_channels[0]),
-          pid_ptrs, n_pids,
-          wm_market_on_event, b,
-          &b->ws_sub) != SUCCESS || b->ws_sub == NULL)
-    {
-      clam(CLAM_INFO, WHENMOON_CTX,
-          "ws subscribe failed for %s (no live stream)", exch);
-      b->ws_sub = NULL;
-    }
-
-    m->n_ws_bindings++;
+    mem_free(pid_ptrs);
   }
 
-  mem_free(pid_ptrs);
+  // Pass 2 — bindings the running set no longer wants. This is also the
+  // whole of the n_markets == 0 case.
+  for(i = 0; i < m->n_ws_bindings; i++)
+  {
+    if(!wanted[i] && m->ws_bindings[i].exchange_name[0] != '\0')
+      wm_market_binding_drop(&m->ws_bindings[i]);
+  }
 
-  wm_live_ws_resub_all(st);
+  wm_live_ws_resub_all(st, stale_exchange);
   pthread_rwlock_unlock(&m->arr_lock);
   pthread_mutex_unlock(&wm_resub_lock);
 }
@@ -1126,14 +1216,12 @@ wm_market_destroy(whenmoon_state_t *st)
   // has drained command handlers (OBS-15's barrier) and under plugin-op
   // serialization, and the registration watch is unregistered first
   // (whenmoon_deinit), so no rebuild can be concurrent with this walk.
+  // OBS-41: n_ws_bindings is a high-water mark, so this walk sees
+  // tombstones; wm_market_binding_drop is a no-op on them. It is zeroed
+  // only here, where the whole table dies with the plugin.
   for(i = 0; i < m->n_ws_bindings; i++)
-  {
-    if(m->ws_bindings[i].ws_sub != NULL)
-      exchange_ws_unsubscribe(m->ws_bindings[i].exchange_name,
-          m->ws_bindings[i].ws_sub);
-    m->ws_bindings[i].ws_sub           = NULL;
-    m->ws_bindings[i].exchange_name[0] = '\0';
-  }
+    wm_market_binding_drop(&m->ws_bindings[i]);
+
   m->n_ws_bindings = 0;
 
   if(m->arr != NULL)
@@ -1337,7 +1425,7 @@ wm_market_add(whenmoon_state_t *st,
     pthread_mutex_unlock(&mk->lock);
   }
 
-  wm_market_resub_ws(st);
+  wm_market_resub_ws(st, NULL);
   wm_market_kick_backfill(st, exchange, product_id, instance);
 
   // WM-WARMUP-2 / WM-MI-3: auto-attach the declared strategy binding,
@@ -1511,7 +1599,7 @@ wm_market_remove(whenmoon_state_t *st,
     (void)wm_market_persist_disable(market_id, inst_str);
   }
 
-  wm_market_resub_ws(st);
+  wm_market_resub_ws(st, NULL);
 
   clam(CLAM_INFO, WHENMOON_CTX,
       "market %s stopped (market_id=%" PRId32 "%s)",
@@ -1599,7 +1687,7 @@ wm_market_restore(whenmoon_state_t *st)
   // restored set (one subscribe per exchange + the user-channel sub),
   // instead of the N cycles the per-add path would have fired.
   st->markets->defer_resub = false;
-  wm_market_resub_ws(st);
+  wm_market_resub_ws(st, NULL);
 
   clam(CLAM_INFO, WHENMOON_CTX,
       "%u running market(s) restored", n_restored);

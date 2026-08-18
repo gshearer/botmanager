@@ -36,13 +36,20 @@ void wm_live_engine_start(void);
 
 // Hook called from market.c after the active product list mutates.
 // Reconciles the user-channel WS bindings against the current running
-// set: tears down all prior bindings, then groups markets by exchange
-// and (re)subscribes one user-channel WS per exchange whose
-// credentials are configured. Exchanges without credentials are
-// skipped silently — once creds appear the next market mutation will
-// retry. Passing a state with zero markets tears every binding down.
+// set: markets are grouped by exchange and one user-channel WS is held
+// per exchange whose credentials are configured. Exchanges without
+// credentials are skipped silently — once creds appear the next market
+// mutation binds them. Passing a state with zero markets (or NULL)
+// drops every binding.
+//
+// OBS-41: a DIFF, not a rebuild — an exchange whose product set already
+// matches its binding is not unsubscribed. `stale_exchange` carries the
+// same meaning as in wm_market_resub_ws: NULL for a market mutation,
+// otherwise the provider that just (re)registered and is rebuilt
+// unconditionally because its handles are dead.
 struct whenmoon_state;
-void wm_live_ws_resub_all(struct whenmoon_state *st);
+void wm_live_ws_resub_all(struct whenmoon_state *st,
+    const char *stale_exchange);
 
 // Per-market real-mode market-engine submit. Reads risk gates from
 // `mk->session`, mints a client_order_id, registers a pending row in

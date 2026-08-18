@@ -23,7 +23,8 @@
 // bindings. wm_live_ws_resub_all walks the running market set and
 // reconciles one binding per distinct exchange whose credentials are
 // available. Exchanges without creds are skipped (next market
-// mutation retries).
+// mutation binds them). OBS-41: the reconcile is a diff — a binding
+// whose product set has not changed is left alone.
 //
 // Locking:
 //   - g_live.mu protects g_live.last_fills_cursor_ms.
@@ -67,10 +68,23 @@
 // Engine global state                                                     //
 // ----------------------------------------------------------------------- //
 
+// OBS-41: mirrors wm_market_ws_binding_t, including `products` — the
+// set this binding actually subscribed with, which is what makes the
+// reconcile a diff instead of a rebuild.
+//
+// ⚠ The ASYMMETRY with the market side is deliberate and load-bearing:
+// the market side hands the driver the BINDING SLOT as its `user`
+// pointer, so its slots may never move while a binding is live. This
+// side passes `user = NULL` (see the subscribe below) and has no such
+// constraint. The tombstone discipline is followed here anyway, so the
+// two loops read alike — but they are not alike, and "harmonising" the
+// market side onto a compacting array would silently misattribute
+// ticks. Do not.
 typedef struct
 {
   char                 exchange_name[EXCHANGE_NAME_SZ];
   exchange_ws_sub_t   *ws_sub;
+  wm_ws_product_set_t  products;
 } wm_live_ws_binding_t;
 
 static struct
@@ -80,8 +94,11 @@ static struct
   bool                 initialized;
 
   // Per-exchange user-channel bindings. One slot per distinct
-  // exchange in the running set with credentials configured. Rebuilt
-  // wholesale on every wm_live_ws_resub_all call.
+  // exchange in the running set with credentials configured.
+  // Reconciled — not rebuilt — on every wm_live_ws_resub_all call, and
+  // like the market side `n_ws_bindings` is a HIGH-WATER MARK: slots
+  // are tombstoned in place, so every walk skips
+  // `exchange_name[0] == '\0'`.
   wm_live_ws_binding_t ws_bindings[WM_LIVE_MAX_EXCHANGES];
   uint32_t             n_ws_bindings;
   whenmoon_state_t    *ws_st;
@@ -100,6 +117,7 @@ static struct
 // Forward declarations — definitions further down.
 static void wm_live_ws_user_event_cb(const exchange_ws_event_t *ev,
     void *user);
+static void wm_live_binding_drop(wm_live_ws_binding_t *b);
 static void wm_live_fills_poll_tick(task_t *t);
 static void wm_live_disc_register_kvs(void);
 
@@ -137,13 +155,8 @@ wm_live_engine_destroy(void)
   // g_live.initialized = false (still true here, but the ws_sub
   // null-out below means no new events).
   for(uint32_t i = 0; i < g_live.n_ws_bindings; i++)
-  {
-    if(g_live.ws_bindings[i].ws_sub != NULL)
-      exchange_ws_unsubscribe(g_live.ws_bindings[i].exchange_name,
-          g_live.ws_bindings[i].ws_sub);
-    g_live.ws_bindings[i].ws_sub           = NULL;
-    g_live.ws_bindings[i].exchange_name[0] = '\0';
-  }
+    wm_live_binding_drop(&g_live.ws_bindings[i]);
+
   g_live.n_ws_bindings = 0;
   g_live.ws_st         = NULL;
 
@@ -870,145 +883,226 @@ wm_live_ws_user_event_cb(const exchange_ws_event_t *ev, void *user)
 // WS resub (called from market.c)                                         //
 // ----------------------------------------------------------------------- //
 
-void
-wm_live_ws_resub_all(whenmoon_state_t *st)
+// The slot bound to `exch`, or NULL. Tombstones are skipped explicitly
+// — see the ws_bindings comment on g_live.
+static wm_live_ws_binding_t *
+wm_live_binding_find(const char *exch)
 {
-  static const exchange_ws_channel_t channels[] = { EXCH_WS_USER };
-  whenmoon_markets_t                *m;
-  const char                       **pid_ptrs;
-  uint32_t                           i;
-  uint32_t                           j;
-
-  if(!g_live.initialized) return;
+  uint32_t i;
 
   for(i = 0; i < g_live.n_ws_bindings; i++)
   {
-    if(g_live.ws_bindings[i].ws_sub != NULL)
-      exchange_ws_unsubscribe(g_live.ws_bindings[i].exchange_name,
-          g_live.ws_bindings[i].ws_sub);
-    g_live.ws_bindings[i].ws_sub           = NULL;
-    g_live.ws_bindings[i].exchange_name[0] = '\0';
+    if(g_live.ws_bindings[i].exchange_name[0] == '\0')
+      continue;
+
+    if(strncmp(g_live.ws_bindings[i].exchange_name, exch,
+          EXCHANGE_NAME_SZ) == 0)
+      return(&g_live.ws_bindings[i]);
   }
-  g_live.n_ws_bindings = 0;
-  g_live.ws_st         = st;
 
-  if(st == NULL || st->markets == NULL || st->markets->n_markets == 0)
-    return;
+  return(NULL);
+}
 
-  m = st->markets;
+// First tombstone, else the next never-used index, else NULL (cap).
+static wm_live_ws_binding_t *
+wm_live_binding_alloc(void)
+{
+  uint32_t i;
 
-  // WM-MKT-ARR-UAF-1: rdlock across the whole gather+subscribe — pid_ptrs
-  // alias the sessions' product_id buffers and are consumed by
-  // exchange_ws_subscribe below, so no concurrent remove may free a
-  // session until we are done. Recursive rdlock is safe: this is
-  // sometimes reached from wm_market_resub_ws which already holds rdlock.
-  pthread_rwlock_rdlock(&m->arr_lock);
-
-  pid_ptrs = mem_alloc("whenmoon.live", "ws_pids",
-      sizeof(*pid_ptrs) * m->n_markets);
-
-  // For each distinct exchange in the running set, gather its
-  // product_ids and (if creds are configured) issue one user-channel
-  // subscribe. Capacity, dedup, and skip-on-no-creds mirror the
-  // market-side resub loop.
-  for(i = 0; i < m->n_markets; i++)
+  for(i = 0; i < g_live.n_ws_bindings; i++)
   {
-    const char             *exch = m->arr[i]->exchange_name;
-    exchange_capabilities_t caps;
-    wm_live_ws_binding_t   *b;
-    uint32_t                n_pids;
-    bool                    seen;
+    if(g_live.ws_bindings[i].exchange_name[0] == '\0')
+      return(&g_live.ws_bindings[i]);
+  }
 
-    seen = false;
-    for(j = 0; j < g_live.n_ws_bindings; j++)
+  if(g_live.n_ws_bindings >= WM_LIVE_MAX_EXCHANGES)
+    return(NULL);
+
+  return(&g_live.ws_bindings[g_live.n_ws_bindings++]);
+}
+
+// Unsubscribe and tombstone in place. A no-op on a slot already empty.
+static void
+wm_live_binding_drop(wm_live_ws_binding_t *b)
+{
+  if(b->ws_sub != NULL)
+    exchange_ws_unsubscribe(b->exchange_name, b->ws_sub);
+
+  b->ws_sub           = NULL;
+  b->exchange_name[0] = '\0';
+  wm_ws_product_set_clear(&b->products);
+}
+
+static void
+wm_live_binding_bind(wm_live_ws_binding_t *b, const char *exch,
+    const char *const *pids, uint32_t n_pids)
+{
+  static const exchange_ws_channel_t channels[] = { EXCH_WS_USER };
+
+  strlcpy(b->exchange_name, exch, sizeof(b->exchange_name));
+  b->ws_sub = NULL;
+
+  if(!wm_ws_product_set_record(&b->products, pids, n_pids))
+    clam(CLAM_WARN, WM_LIVE_CTX,
+        "%s: %u products exceeds the %u a binding remembers; "
+        "every mutation will resubscribe its user channel",
+        exch, (unsigned)n_pids, (unsigned)WM_WS_BINDING_MAX_PRODUCTS);
+
+  // `user` is NULL here — unlike the market side, which passes the
+  // binding slot itself. That is the whole reason this side needs no
+  // slot-stability rule; see wm_live_ws_binding_t.
+  if(exchange_ws_subscribe(exch, channels,
+        sizeof(channels) / sizeof(channels[0]),
+        pids, n_pids,
+        wm_live_ws_user_event_cb, NULL,
+        &b->ws_sub) != SUCCESS || b->ws_sub == NULL)
+  {
+    clam(CLAM_WARN, WM_LIVE_CTX,
+        "user-channel WS subscribe failed (exchange=%s n_products=%u)",
+        exch, (unsigned)n_pids);
+    b->ws_sub = NULL;
+  }
+  else
+  {
+    clam(CLAM_INFO, WM_LIVE_CTX,
+        "user-channel WS subscribed (exchange=%s n_products=%u)",
+        exch, (unsigned)n_pids);
+  }
+}
+
+// OBS-41: a diff, exactly like the market-side reconcile that calls it,
+// and with the same `stale_exchange` meaning — NULL for a market
+// mutation, otherwise the provider that just (re)registered and whose
+// handles are dead regardless of what its product set says.
+void
+wm_live_ws_resub_all(whenmoon_state_t *st, const char *stale_exchange)
+{
+  whenmoon_markets_t   *m;
+  const char          **pid_ptrs = NULL;
+  bool                  wanted[WM_LIVE_MAX_EXCHANGES];
+  uint32_t              i;
+  uint32_t              j;
+
+  if(!g_live.initialized) return;
+
+  memset(wanted, 0, sizeof(wanted));
+  g_live.ws_st = st;
+
+  m = st != NULL ? st->markets : NULL;
+
+  if(m != NULL && m->n_markets > 0)
+  {
+    // WM-MKT-ARR-UAF-1: rdlock across the whole gather+subscribe — pid_ptrs
+    // alias the sessions' product_id buffers and are consumed by
+    // exchange_ws_subscribe below, so no concurrent remove may free a
+    // session until we are done. Recursive rdlock is safe: this is
+    // sometimes reached from wm_market_resub_ws which already holds rdlock.
+    pthread_rwlock_rdlock(&m->arr_lock);
+
+    pid_ptrs = mem_alloc("whenmoon.live", "ws_pids",
+        sizeof(*pid_ptrs) * m->n_markets);
+
+    // For each distinct exchange in the running set, gather its
+    // product_ids and (if creds are configured) reconcile one
+    // user-channel subscription. Capacity, dedup and skip-on-no-creds
+    // mirror the market-side reconcile.
+    for(i = 0; i < m->n_markets; i++)
     {
-      if(strncmp(g_live.ws_bindings[j].exchange_name, exch,
-            EXCHANGE_NAME_SZ) == 0)
-      {
-        seen = true;
-        break;
-      }
-    }
+      const char             *exch = m->arr[i]->exchange_name;
+      exchange_capabilities_t caps;
+      wm_live_ws_binding_t   *b    = wm_live_binding_find(exch);
+      uint32_t                n_pids;
 
-    if(seen)
-      continue;
-
-    if(g_live.n_ws_bindings >= WM_LIVE_MAX_EXCHANGES)
-    {
-      clam(CLAM_WARN, WM_LIVE_CTX,
-          "user-channel binding cap (%u) reached; %s skipped",
-          (unsigned)WM_LIVE_MAX_EXCHANGES, exch);
-      continue;
-    }
-
-    // Creds are required for the user channel; the exchange-side
-    // subscribe FAILs closed when they are absent. Skip silently —
-    // once creds appear the next market mutation will retry.
-    if(exchange_get_capabilities(exch, &caps) != SUCCESS
-        || !caps.has_credentials)
-    {
-      clam(CLAM_DEBUG, WM_LIVE_CTX,
-          "user-channel sub deferred: no creds for %s yet", exch);
-      continue;
-    }
-
-    // WM-MI-1: dedup product_ids across instances — N instances of one
-    // product must yield ONE user-channel subscription, not N. Without
-    // this the duplicate ids scale with instance count and overflow the
-    // exchange driver's fixed per-sub product array (coinbase caps at
-    // CB_WS_CH_MAX_PRODUCTS_PER_SUB). Mirrors the market-side resub loop
-    // in market.c:wm_market_resub_ws.
-    n_pids = 0;
-    for(j = i; j < m->n_markets; j++)
-    {
-      uint32_t k;
-      bool     dup;
-
-      if(strncmp(m->arr[j]->exchange_name, exch, EXCHANGE_NAME_SZ) != 0)
+      if(b != NULL && wanted[(uint32_t)(b - g_live.ws_bindings)])
         continue;
 
-      dup = false;
-      for(k = 0; k < n_pids; k++)
+      // Creds are required for the user channel; the exchange-side
+      // subscribe FAILs closed when they are absent. Skip — leaving
+      // `wanted` unset, so a binding this exchange still holds is
+      // dropped below and no slot is created while creds are missing.
+      //
+      // ⚠ OBS-41 D4: that missing slot IS the creds-appeared retry, and
+      // the diff must not lose it. A diff visits every exchange in the
+      // running set on every mutation, and "no binding exists but one
+      // is now possible" is a change like any other — so the first
+      // mutation after creds appear binds it, exactly as the wholesale
+      // rebuild used to.
+      if(exchange_get_capabilities(exch, &caps) != SUCCESS
+          || !caps.has_credentials)
       {
-        if(strncmp(pid_ptrs[k], m->arr[j]->product_id,
-              WM_PRODUCT_ID_SZ) == 0)
-        {
-          dup = true;
-          break;
-        }
+        clam(CLAM_DEBUG, WM_LIVE_CTX,
+            "user-channel sub deferred: no creds for %s yet", exch);
+        continue;
       }
 
-      if(!dup)
-        pid_ptrs[n_pids++] = m->arr[j]->product_id;
+      // WM-MI-1: dedup product_ids across instances — N instances of one
+      // product must yield ONE user-channel subscription, not N. Without
+      // this the duplicate ids scale with instance count and overflow the
+      // exchange driver's fixed per-sub product array (coinbase caps at
+      // CB_WS_CH_MAX_PRODUCTS_PER_SUB). Mirrors the market-side reconcile
+      // in market.c:wm_market_resub_ws.
+      n_pids = 0;
+      for(j = i; j < m->n_markets; j++)
+      {
+        uint32_t k;
+        bool     dup;
+
+        if(strncmp(m->arr[j]->exchange_name, exch, EXCHANGE_NAME_SZ) != 0)
+          continue;
+
+        dup = false;
+        for(k = 0; k < n_pids; k++)
+        {
+          if(strncmp(pid_ptrs[k], m->arr[j]->product_id,
+                WM_PRODUCT_ID_SZ) == 0)
+          {
+            dup = true;
+            break;
+          }
+        }
+
+        if(!dup)
+          pid_ptrs[n_pids++] = m->arr[j]->product_id;
+      }
+
+      if(b == NULL)
+      {
+        b = wm_live_binding_alloc();
+
+        if(b == NULL)
+        {
+          clam(CLAM_WARN, WM_LIVE_CTX,
+              "user-channel binding cap (%u) reached; %s skipped",
+              (unsigned)WM_LIVE_MAX_EXCHANGES, exch);
+          continue;
+        }
+
+        wm_live_binding_bind(b, exch, pid_ptrs, n_pids);
+      }
+
+      else if(b->ws_sub == NULL
+          || (stale_exchange != NULL
+              && strncmp(exch, stale_exchange, EXCHANGE_NAME_SZ) == 0)
+          || wm_ws_product_set_differs(&b->products, pid_ptrs, n_pids))
+      {
+        wm_live_binding_drop(b);
+        wm_live_binding_bind(b, exch, pid_ptrs, n_pids);
+      }
+
+      wanted[(uint32_t)(b - g_live.ws_bindings)] = true;
     }
 
-    b = &g_live.ws_bindings[g_live.n_ws_bindings];
-    snprintf(b->exchange_name, sizeof(b->exchange_name), "%s", exch);
-    b->ws_sub = NULL;
-
-    if(exchange_ws_subscribe(exch, channels,
-          sizeof(channels) / sizeof(channels[0]),
-          pid_ptrs, n_pids,
-          wm_live_ws_user_event_cb, NULL,
-          &b->ws_sub) != SUCCESS || b->ws_sub == NULL)
-    {
-      clam(CLAM_WARN, WM_LIVE_CTX,
-          "user-channel WS subscribe failed (exchange=%s n_products=%u)",
-          exch, (unsigned)n_pids);
-      b->ws_sub = NULL;
-    }
-    else
-    {
-      clam(CLAM_INFO, WM_LIVE_CTX,
-          "user-channel WS subscribed (exchange=%s n_products=%u)",
-          exch, (unsigned)n_pids);
-    }
-
-    g_live.n_ws_bindings++;
+    mem_free(pid_ptrs);
+    pthread_rwlock_unlock(&m->arr_lock);
   }
 
-  mem_free(pid_ptrs);
-  pthread_rwlock_unlock(&m->arr_lock);
+  // Bindings the running set no longer wants — also the whole of the
+  // "no markets at all" case.
+  for(i = 0; i < g_live.n_ws_bindings; i++)
+  {
+    if(!wanted[i] && g_live.ws_bindings[i].exchange_name[0] != '\0')
+      wm_live_binding_drop(&g_live.ws_bindings[i]);
+  }
 }
 
 // ----------------------------------------------------------------------- //

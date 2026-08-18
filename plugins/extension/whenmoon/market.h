@@ -18,6 +18,7 @@
 #define BM_WHENMOON_MARKET_H
 
 #include "whenmoon_strategy.h"   // wm_candle_full_t + wm_gran_t + WM_GRAN_MAX
+#include "ws_binding.h"          // wm_ws_product_set_t (leaf; no gate)
 
 // Whenmoon-internal translation units pull the full aggregator +
 // exchange-abstraction types transitively. Strategy plugins don't
@@ -269,6 +270,17 @@ struct exchange_ws_sub;
 // exchange in the running set; whenmoon_markets carries an array.
 // `exchange_name` mirrors EXCHANGE_NAME_SZ (32) so strategies that
 // include market.h don't need exchange_api.h on the path.
+//
+// ⛔ OBS-41: the slot's ADDRESS is handed to the driver as the `user`
+// argument of exchange_ws_subscribe, and wm_market_on_event
+// dereferences it on every tick to learn which venue the tick came
+// from. A slot must therefore never move or change meaning while its
+// binding is live — see whenmoon_markets.ws_bindings below for the
+// tombstone discipline that follows from it.
+//
+// `products` is what this binding actually subscribed with. Without it
+// there is nothing to diff a desired set against, and a mutation on one
+// exchange can only rebuild every exchange (OBS-41's whole finding).
 typedef struct
 {
 #ifdef WHENMOON_INTERNAL
@@ -277,7 +289,16 @@ typedef struct
   char                     exchange_name[32];  // mirror EXCHANGE_NAME_SZ
 #endif
   struct exchange_ws_sub  *ws_sub;
+  wm_ws_product_set_t      products;
 } wm_market_ws_binding_t;
+
+// ws_binding.h is a leaf and cannot include this header, so its two
+// sizing constants are copies. These assertions are what stop them
+// drifting.
+_Static_assert(WM_WS_PRODUCT_ID_SZ == WM_PRODUCT_ID_SZ,
+    "ws_binding.h's product-id mirror drifted from WM_PRODUCT_ID_SZ");
+_Static_assert(WM_WS_BINDING_MAX_PRODUCTS == 4 * WM_MARKET_INIT_CAP,
+    "a binding must remember more products than the market array starts with");
 
 // Compile-time ceiling on the number of distinct exchanges that can
 // hold an active WS binding. Mirrors WM_LIVE_MAX_EXCHANGES; lifting
@@ -397,11 +418,26 @@ struct whenmoon_markets
   // Per-exchange WebSocket bindings covering {TICKER, TRADES}. One
   // entry per distinct exchange in the running set; the binding's
   // ws_sub aggregates every product_id from markets bound to that
-  // exchange. Rebuilt wholesale on every add/remove and on every
-  // provider (re)registration (OBS-23 watch) via
+  // exchange. Reconciled — not rebuilt — on every add/remove and on
+  // every provider (re)registration (OBS-23 watch) via
   // wm_market_resub_ws. NULL ws_sub means the most recent subscribe
   // attempt for that exchange failed; the slot stays so a follow-up
   // resub retries.
+  //
+  // ⛔⛔ OBS-41 D3-A: slots are TOMBSTONED IN PLACE and NEVER COMPACTED.
+  // A dropped binding leaves `exchange_name[0] == '\0'` and `ws_sub ==
+  // NULL` exactly where it sat; allocation reuses the first tombstone.
+  // This is not tidiness — the slot address is the driver's `user`
+  // pointer (see wm_market_ws_binding_t), so compacting would leave a
+  // LIVE subscription whose `user` now names a slot describing a
+  // DIFFERENT exchange, and ticks from venue A would be attributed to
+  // venue B silently, only for markets the mutation never touched.
+  //
+  // ⚠⚠ Consequently `n_ws_bindings` is a HIGH-WATER MARK, not a count:
+  // it is the number of slots ever used, and slots below it may be
+  // empty. Every walk of this array must skip `exchange_name[0] ==
+  // '\0'`. There are three (wm_market_resub_ws's reconcile and drop
+  // passes, wm_market_destroy) plus market.c's slot find/alloc helpers.
   wm_market_ws_binding_t   ws_bindings[WM_MARKET_MAX_WS_BINDINGS];
   uint32_t                 n_ws_bindings;
 
@@ -503,13 +539,30 @@ bool wm_market_remove(struct whenmoon_state *st,
 // when zero markets are enabled; FAIL only on a hard DB error.
 bool wm_market_restore(struct whenmoon_state *st);
 
-// Rebuild the whole WS subscription set — market feed AND the live
-// trader's user channels — against the current running set. Full
-// teardown + fresh subscribe per distinct exchange; idempotent;
+// Reconcile the whole WS subscription set — market feed AND the live
+// trader's user channels — against the current running set. Idempotent;
 // respects markets->defer_resub; serialized by market.c's
 // wm_resub_lock. Callers hold NO whenmoon lock. Callers: add / remove /
 // restore, and the OBS-23 registration watch in whenmoon.c.
-void wm_market_resub_ws(struct whenmoon_state *st);
+//
+// OBS-41: this is a DIFF, not a rebuild. An exchange whose desired
+// product set already matches what its binding subscribed with is not
+// touched at all — no unsubscribe, no resubscribe, no gap in its feed.
+//
+// `stale_exchange` names an exchange whose handles are dead regardless
+// of what its product set says, and is rebuilt unconditionally:
+//
+//   NULL      a market mutation — diff every exchange.
+//   non-NULL  that provider just (re)registered, so exchange_unregister
+//             has bumped ITS ws_gen and only its handles are invalid
+//             (exchange_api.h:454-466 — the generation is per-exchange).
+//             Rebuild it; diff the rest.
+//
+// ⛔ Passing NULL from the registration watch would leave the newly
+// registered provider's dead binding in place — its product set
+// compares equal to itself — and its feed would never come back.
+void wm_market_resub_ws(struct whenmoon_state *st,
+    const char *stale_exchange);
 
 // Parse "<exchange>-<base>-<quote>" (lowercase dash form). Splits on
 // '-', requires exactly 3 non-empty tokens, lowercases all output, and
