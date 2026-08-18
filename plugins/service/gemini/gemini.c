@@ -92,8 +92,9 @@ gem_init(void)
   gem_ws_channels_init();  // stub in GEM-1; real body in GEM-3
 
   // EXCH-PRIME-1: ensure the persisted symbol cache table exists. The
-  // DB pool is up by plugin_init_all; this is the only synchronous DB
-  // touch on the startup path.
+  // DB pool is up by plugin_init_all. This is one of the two synchronous
+  // DB touches on the startup path; the other is gem_symbols_prime_sync
+  // in gem_start (OBS-47). Neither touches the network.
   (void)gem_symbols_ensure_table();
 
   clam(CLAM_INFO, GEM_CTX, "gemini plugin initialized");
@@ -105,6 +106,15 @@ static bool
 gem_start(void)
 {
   uint32_t refresh_sec;
+
+  // OBS-47: prime the symbol cache from the persisted snapshot BEFORE
+  // registering. Registration fires feature_exchange's registration
+  // watch, and a consumer rebuilding its WS subscriptions inside that
+  // call resolves each product against this cache — an empty one binds
+  // pass-through symbols instead of Gemini's native names. One SELECT,
+  // no network; the async load below still re-judges staleness and
+  // refreshes.
+  gem_symbols_prime_sync();
 
   // Self-register with the feature_exchange abstraction. In GEM-1 the
   // vtable is skeletal (every capability hook NULL except

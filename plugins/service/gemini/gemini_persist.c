@@ -179,56 +179,45 @@ gem_symbols_persist(void)
 // Prime (DB → cache, refresh-on-stale)
 // ------------------------------------------------------------------
 
-// Async load result handler. Takes ownership of `res` (db_cb_t
-// contract). Repopulates the in-memory cache from a fresh snapshot;
-// fires a background network refresh when the snapshot is missing,
-// failed, or older than the staleness window.
-static void
-gem_symbols_load_cb(db_result_t *res, void *data)
+// The snapshot SELECT, shared by the async load and the synchronous
+// prime. Cols: 0=native 1=base 2=quote 3=age_sec.
+static const char gem_symbols_snapshot_sql[] =
+  "SELECT native, base, quote,"
+  " EXTRACT(EPOCH FROM (NOW() - fetched_at))::bigint AS age_sec"
+  " FROM gemini_symbols";
+
+// The oldest row's age, in seconds — the snapshot's age.
+static int64_t
+gem_symbols_snapshot_age(const db_result_t *res)
 {
-  uint32_t refresh_sec;
   int64_t  max_age = 0;
-  int64_t  age;
-  uint32_t n       = 0;
   uint32_t i;
 
-  (void)data;
-
-  if(res == NULL || !res->ok || res->rows == 0)
-  {
-    db_result_free(res);
-    (void)gemini_symbols_refresh_async(gem_symbols_refresh_persist_cb, NULL);
-    return;
-  }
-
-  // Cols: 0=native 1=base 2=quote 3=age_sec. Take the oldest row's age
-  // as the snapshot age.
   for(i = 0; i < res->rows; i++)
   {
     const char *age_s = db_result_get(res, i, 3);
 
     if(age_s != NULL)
     {
-      age = (int64_t)strtoll(age_s, NULL, 10);
+      int64_t age = (int64_t)strtoll(age_s, NULL, 10);
 
       if(age > max_age)
         max_age = age;
     }
   }
 
-  refresh_sec = (uint32_t)kv_get_uint("plugin.gemini.symbols_refresh_sec");
+  return(max_age);
+}
 
-  // refresh_sec == 0 disables the periodic refresh; treat any existing
-  // snapshot as fresh regardless of age (only an empty table refreshes).
-  if(refresh_sec > 0 && max_age >= (int64_t)refresh_sec)
-  {
-    db_result_free(res);
-    clam(CLAM_INFO, GEM_CTX,
-        "symbols: cache stale (age %llds >= %u s); refreshing",
-        (long long)max_age, refresh_sec);
-    (void)gemini_symbols_refresh_async(gem_symbols_refresh_persist_cb, NULL);
-    return;
-  }
+// Replace the in-memory cache with the snapshot's rows. Returns how many
+// were applied. Borrows `res` — freeing it belongs to the caller, whose
+// two call sites hold it under different ownership conventions (the
+// async cb is handed `res` by db_cb_t; the sync prime allocates it).
+static uint32_t
+gem_symbols_apply(const db_result_t *res)
+{
+  uint32_t n = 0;
+  uint32_t i;
 
   gem_pairs_clear();
 
@@ -243,19 +232,101 @@ gem_symbols_load_cb(db_result_t *res, void *data)
       n++;
   }
 
+  return(n);
+}
+
+// Async load result handler. Takes ownership of `res` (db_cb_t
+// contract). Repopulates the in-memory cache from the snapshot; fires a
+// background network refresh when the snapshot is missing, failed, or
+// older than the staleness window.
+static void
+gem_symbols_load_cb(db_result_t *res, void *data)
+{
+  uint32_t refresh_sec;
+  int64_t  max_age;
+  uint32_t n;
+
+  (void)data;
+
+  if(res == NULL || !res->ok || res->rows == 0)
+  {
+    db_result_free(res);
+    (void)gemini_symbols_refresh_async(gem_symbols_refresh_persist_cb, NULL);
+    return;
+  }
+
+  max_age     = gem_symbols_snapshot_age(res);
+  refresh_sec = (uint32_t)kv_get_uint("plugin.gemini.symbols_refresh_sec");
+  n           = gem_symbols_apply(res);
+
   db_result_free(res);
+
+  // OBS-47: a stale snapshot is applied and THEN refreshed. It is the
+  // same data the fan-out will mostly return, and the refresh overwrites
+  // it when it lands — whereas declining to apply leaves the cache empty
+  // for the whole duration of an N+1 fan-out over ~347 symbols, and
+  // every translation in that window takes the pass-through arm. Only
+  // the missing/failed arm above cannot apply.
+  //
+  // refresh_sec == 0 disables the periodic refresh; treat any existing
+  // snapshot as fresh regardless of age (only an empty table refreshes).
+  if(refresh_sec > 0 && max_age >= (int64_t)refresh_sec)
+  {
+    clam(CLAM_INFO, GEM_CTX,
+        "symbols: loaded %u from cache but stale (age %llds >= %u s); "
+        "refreshing", n, (long long)max_age, refresh_sec);
+    (void)gemini_symbols_refresh_async(gem_symbols_refresh_persist_cb, NULL);
+    return;
+  }
 
   clam(CLAM_INFO, GEM_CTX,
       "symbols: loaded %u from cache (age %llds)", n, (long long)max_age);
 }
 
+// OBS-47: the symbol cache must be populated BEFORE this plugin
+// registers with feature_exchange. Registration fires feature_exchange's
+// registration watch, and a consumer that rebuilds its subscriptions
+// inside that call resolves each product against the cache at
+// slot-creation time — against an empty one it binds the pass-through
+// symbol instead of Gemini's native name. gem_symbols_load_or_refresh_async
+// cannot serve that: it is deliberately async so no network I/O blocks
+// start().
+//
+// So this is the second synchronous DB touch on the startup path, and it
+// is deliberate: one SELECT of a ~350-row table against the pool, no
+// network. Staleness is NOT judged here — a stale name map still
+// resolves every pair a fresh one does, and the async load that follows
+// re-judges it properly and refreshes when it must. An empty or
+// unreachable snapshot leaves the cache as it was (gem_symbols_apply,
+// which clears, is not reached) and the async path handles it.
+void
+gem_symbols_prime_sync(void)
+{
+  db_result_t *res = db_result_alloc();
+  uint32_t     n;
+
+  if(db_query(gem_symbols_snapshot_sql, res) != SUCCESS || !res->ok
+      || res->rows == 0)
+  {
+    db_result_free(res);
+    clam(CLAM_INFO, GEM_CTX,
+        "symbols: no persisted snapshot to prime; async load will refresh");
+    return;
+  }
+
+  n = gem_symbols_apply(res);
+
+  clam(CLAM_INFO, GEM_CTX,
+      "symbols: primed %u from cache (age %llds) before registration",
+      n, (long long)gem_symbols_snapshot_age(res));
+
+  db_result_free(res);
+}
+
 void
 gem_symbols_load_or_refresh_async(void)
 {
-  if(db_query_async(
-        "SELECT native, base, quote,"
-        " EXTRACT(EPOCH FROM (NOW() - fetched_at))::bigint AS age_sec"
-        " FROM gemini_symbols",
+  if(db_query_async(gem_symbols_snapshot_sql,
         gem_symbols_load_cb, NULL) == ASYNC_FAILED_UNDELIVERED)
   {
     // DB unreachable / submit failed → never leave the cache empty;

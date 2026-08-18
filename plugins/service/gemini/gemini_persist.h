@@ -18,8 +18,9 @@
 
 // Create the gemini_symbols table if it does not exist. Idempotent
 // (CREATE TABLE IF NOT EXISTS); a per-daemon once-latch suppresses log
-// noise when many bots start concurrently. Called from gem_init. The
-// only synchronous DB touch on the startup path.
+// noise when many bots start concurrently. Called from gem_init. One of
+// the two synchronous DB touches on the startup path — the other is
+// gem_symbols_prime_sync below (OBS-47).
 bool gem_symbols_ensure_table(void);
 
 // Snapshot the in-memory cache into the gemini_symbols table inside a
@@ -27,6 +28,14 @@ bool gem_symbols_ensure_table(void);
 // clears the DB rows. Called from gem_symbols_refresh_persist_cb after a
 // successful network refresh.
 bool gem_symbols_persist(void);
+
+// OBS-47: synchronous startup prime — one SELECT of the persisted
+// snapshot, applied unconditionally, no staleness test and no network.
+// Must be called from gem_start BEFORE gem_exchange_register_vtable, so
+// a consumer rebuilding its subscriptions inside the registration watch
+// resolves against a populated cache. A missing, failed or empty
+// snapshot leaves the cache untouched; the async load below refreshes.
+void gem_symbols_prime_sync(void);
 
 // Async startup prime: load the persisted snapshot from the DB and, if
 // it is empty or stale, fire a background network refresh that

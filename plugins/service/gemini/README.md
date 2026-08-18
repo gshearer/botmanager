@@ -170,20 +170,43 @@ The symbols cache (`gemini_pairs.c`, capacity `GEM_SYMS_CAP = 1024`)
 maps any of the three onto the others. `gem_pair_to_native` /
 `gem_pair_to_abstr` translate at the call site; cache miss falls
 back to a heuristic split on the conventional quote currencies
-(`usdt, usdc, busd, dai, usd, eur, gbp, sgd, btc, eth`). Refreshed
-by the periodic `gem.symbols` task, which fires immediately on
-registration (synchronous prime, 10 s bounded) and then on the
-interval set by `plugin.gemini.symbols_refresh_sec` (default
-86400 s).
+(`usdt, usdc, busd, dai, usd, eur, gbp, sgd, btc, eth`).
 
-The cache is populated in two stages: `GET /v1/symbols` returns the
-flat native list, then a per-symbol `GET /v1/symbols/details/<sym>`
-yields the base + quote split (no batch endpoint exists). At
-Gemini's ~150 spot pairs and the default `rate_limit_rps = 5`, a
-full refresh takes ~30 s; the synchronous prime barrier expires at
-10 s and the cache continues populating in the background — lookups
-during that window fall through to the heuristic, which is
-sufficient for the abstraction-side `BTC-USD` canonicalisation.
+**Startup, in order (`gem_start`).** Three steps, and the order is the
+contract:
+
+1. `gem_symbols_prime_sync()` — one SELECT of the persisted
+   `gemini_symbols` snapshot (347 rows, measured 2026-08-17), applied
+   unconditionally. **No network, no staleness test.**
+2. `gem_exchange_register_vtable()` — registration fires
+   feature_exchange's registration watch, and a consumer rebuilds its WS
+   subscriptions *synchronously inside that call*, resolving each product
+   against the cache step 1 just filled.
+3. the periodic `gem.symbols` task, whose first tick fires immediately on
+   submit and calls `gem_symbols_load_or_refresh_async()` — which
+   re-judges the snapshot's age and refreshes from the network only when
+   it is missing or older than `plugin.gemini.symbols_refresh_sec`
+   (default 86400 s).
+
+⚠ Step 1 exists because step 2 cannot wait for step 3 (`OBS-47`). It is
+the second and last synchronous DB touch on the startup path — the other
+is `gem_symbols_ensure_table()` in `gem_init` — and neither touches the
+network: nothing blocks `start()` on Gemini's fan-out, so the operator
+control socket comes up regardless. A missing, failed or empty snapshot
+leaves the cache as it was and step 3 handles it.
+
+⭑ A **stale** snapshot is applied and *then* refreshed, never discarded
+in favour of a fetch that has not landed: it is the same data the fetch
+will mostly return, and declining to apply it would empty the cache for
+the whole duration of the fan-out below.
+
+The cache is populated from the network in two stages: `GET /v1/symbols`
+returns the flat native list, then a per-symbol
+`GET /v1/symbols/details/<sym>` yields the base + quote split (no batch
+endpoint exists). At Gemini's 347 spot symbols and the default
+`rate_limit_rps = 5` that N+1 fan-out runs for a minute or more, entirely
+in the background — which is precisely why the snapshot, and not the
+fetch, is what registration waits on.
 
 ## Namespace split: `plugin.gemini.*` vs `plugin.whenmoon.exchange.gemini.*`
 
