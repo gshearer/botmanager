@@ -1445,6 +1445,29 @@ kv_delete_prefix(const char *prefix)
   return(deleted);
 }
 
+// Drop one key's persisted row. Issued unconditionally by both callers
+// below — a 0-row DELETE is harmless when the key was never persisted,
+// and it is what lets a DB-only orphan be swept with nothing in memory.
+// Caller must NOT hold kv_mutex (this does DB I/O).
+static void
+kv_row_delete(const char *key)
+{
+  char *esc = db_escape(key);
+
+  if(esc != NULL)
+  {
+    char         sql[KV_KEY_SZ + 64];
+    db_result_t *r;
+
+    snprintf(sql, sizeof(sql), "DELETE FROM kv WHERE key = '%s'", esc);
+    mem_free(esc);
+
+    r = db_result_alloc();
+    db_query(sql, r);
+    db_result_free(r);
+  }
+}
+
 // Delete exactly ONE key from the live registry and its persisted row.
 // Unlike kv_delete_prefix this matches the whole key, so a janitor can
 // drop a single orphan without nuking a namespace. The DB DELETE is issued
@@ -1485,27 +1508,78 @@ kv_delete(const char *key)
   pthread_mutex_unlock(&kv_mutex);
 
   // Drop the persisted row (exact match), whether or not it was live.
-  {
-    char *esc = db_escape(key);
-
-    if(esc != NULL)
-    {
-      char         sql[KV_KEY_SZ + 64];
-      db_result_t *r;
-
-      snprintf(sql, sizeof(sql), "DELETE FROM kv WHERE key = '%s'", esc);
-      mem_free(esc);
-
-      r = db_result_alloc();
-      db_query(sql, r);
-      db_result_free(r);
-    }
-  }
+  kv_row_delete(key);
 
   if(found)
     clam(CLAM_INFO, "kv_delete", "deleted key '%s'", key);
 
   return(found);
+}
+
+// Revert a registered key to the default its declaration named, and drop
+// its persisted row so the next boot reads that declaration too.
+//
+// ⚠⚠ The invariant is a NEGATIVE and it is the whole point: `dirty` must
+// be FALSE when this returns. cmd_set_kv calls kv_flush() on success and
+// kv_flush() persists every dirty entry, so a reset routed through
+// apply_val — whose job is to raise that flag — would re-INSERT the row
+// it had just deleted, inside the same command. The flag is cleared
+// rather than merely left alone, because another writer may have raised
+// it earlier and never flushed; that pending write is exactly what a
+// revert discards. Nothing reports the failure: the operator sees the
+// old value again after a restart and cannot tell why (OBS-50 T4).
+//
+// The cb-under-released-lock pattern is copied from apply_val for its
+// stated reason — a concurrent kv_unregister or a plugin unload's
+// kv_reclaim_owned frees the entry — and not called, for the one above.
+//
+// Returns true iff a registered entry was found, whether or not its
+// value differed from the default. An unregistered key is kv_delete's
+// subject, not this one: there is no declaration to revert to.
+bool
+kv_reset(const char *key)
+{
+  kv_entry_t *e;
+  char        k[KV_KEY_SZ];
+  bool        changed;
+  kv_cb_t     cb;
+  void       *cb_data;
+
+  if(key == NULL || key[0] == '\0')
+    return(false);
+
+  pthread_mutex_lock(&kv_mutex);
+
+  e = find_locked(key);
+
+  if(e == NULL)
+  {
+    pthread_mutex_unlock(&kv_mutex);
+    return(false);
+  }
+
+  changed = val_changed(e->type, &e->val, &e->def);
+
+  if(changed)
+    e->val = e->def;
+
+  e->dirty = false;
+
+  cb      = changed ? e->cb : NULL;
+  cb_data = e->cb_data;
+
+  strlcpy(k, e->key, sizeof(k));
+
+  pthread_mutex_unlock(&kv_mutex);
+
+  if(cb != NULL)
+    cb(k, cb_data);
+
+  kv_row_delete(k);
+
+  clam(CLAM_INFO, "kv_reset", "reset key '%s' to its declared default", k);
+
+  return(true);
 }
 
 // Drop the NL responder attached to `key`, if any. Internal helper —

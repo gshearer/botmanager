@@ -91,6 +91,16 @@ cmd_db_orphans(const cmd_ctx_t *ctx)
 // is the escape hatch for orphans a schema change stranded: keys no longer
 // in any plugin's schema linger in memory (loaded at startup) and in the
 // DB, and nothing else evicts them short of a restart.
+//
+// ⛔ Not the same operation as `set kv --delete <key>`, and neither
+// replaces the other (OBS-50). This one retires an orphaned ROW and
+// unregisters whatever claimed it — which is why it must not be pointed
+// at a live knob: a key that is not registered is indistinguishable from
+// one that never existed, so every read silently takes its fallback.
+// `set kv --delete` retires a registered key's stored VALUE, reverting it
+// to its declaration with the entry left in place. And this one is still
+// the only tool for a DB-only orphan, because kv_reset cannot see a row
+// with no live entry.
 static void
 cmd_db_delete_kv(const cmd_ctx_t *ctx)
 {
@@ -207,6 +217,11 @@ cmd_db_register(void)
       "prefix — from the live registry and its persisted row. Use it to\n"
       "sweep orphans a schema change stranded (keys no longer owned by any\n"
       "plugin), which otherwise linger in memory until the next restart.\n"
+      "\n"
+      "This retires an orphaned ROW and unregisters what claimed it. To\n"
+      "retire a registered key's stored VALUE — reverting it to its\n"
+      "declared default with the key still registered — use\n"
+      "/set kv --delete <key> instead. Two operations, not one.\n"
       "\n"
       "Example:\n"
       "  /db delete kv plugin.ask.system",

@@ -170,6 +170,19 @@ test_kv_default = executable('test_kv_default',
   dependencies : core_deps,
 )
 
+# kv_reset's correctness is a negative — the entry must be left CLEAN —
+# and the flush that would expose it is the same flush the command
+# issues on success, so a revert routed through apply_val re-persists the
+# row it just dropped and says nothing at the time. These cases install a
+# db driver that runs no SQL and records what the facade asked of it, so
+# the statements are what they read; no database is involved.
+test_kv_reset = executable('test_kv_reset',
+  'test_kv_reset.c',
+  include_directories : [include_directories('.'), inc_include],
+  link_with : [test_harness, libcore],
+  dependencies : core_deps,
+)
+
 # kv_get_str hands ~205 sites a pointer they use after the lock is
 # gone. Both ways that promise can break are silent — a value rewritten
 # under a reader, an entry freed under one — so this suite states the
@@ -348,6 +361,7 @@ test('knowledge_dedup', test_knowledge_dedup)
 test('kv_bot', test_kv_bot)
 test('kv_str', test_kv_str)
 test('kv_default', test_kv_default)
+test('kv_reset', test_kv_reset)
 test('curl_submit_wait', test_curl_submit_wait)
 test('curl_flight', test_curl_flight)
 test('cmd_inflight', test_cmd_inflight)

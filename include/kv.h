@@ -227,6 +227,34 @@ uint32_t kv_delete_prefix(const char *prefix);
 // entry was removed. Intended for admin janitoring (see /db delete kv).
 bool kv_delete(const char *key);
 
+// Revert a REGISTERED key to the default its declaration named, and drop
+// its persisted row. The entry, its callback and its help stay exactly
+// where they were — only the stored value goes, which is what separates
+// this from kv_delete: that one unlinks the entry, and a key that is not
+// registered is indistinguishable from one that never existed (reads
+// return NULL and every caller silently takes its fallback).
+//
+// The declared default needs no storage of its own — kv_entry_t.def has
+// held it since registration, and kv_get_uint_or_default already reads
+// it.
+//
+// ⚠⚠ Leaves `dirty` FALSE. Everything in this contract rests on that:
+// kv_flush() persists every dirty entry, so a reset that raised the flag
+// would re-INSERT the row it just dropped, and the operator would find
+// the old value back after a restart with nothing having reported it.
+// See the definition. Fires the change callback exactly once when the
+// value actually differed from the default, with kv_mutex released.
+//
+// ⚠ Returns a predicate — `true` is the good outcome, as for kv_exists
+// and kv_delete beside it, and NOT common.h's inverted SUCCESS. The two
+// conventions sit side by side in this header and a `!= SUCCESS` on this
+// one compiles and means the opposite.
+//
+// Returns true iff a registered entry was found. Exposed as
+// `set kv --delete <key>`; /db delete kv is the other operation — a
+// DB-only orphan with no live entry, which this cannot see.
+bool kv_reset(const char *key);
+
 // In-memory removal of a registered KV entry — drops the kv_entry_t
 // (including its cached cb pointer, cb_data, and help pointer, all of
 // which may live in plugin .text/.rodata) and any attached NL

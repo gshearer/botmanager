@@ -45,7 +45,7 @@ static const cmd_arg_desc_t ad_set_kv[] = {
   { "value", CMD_ARG_NONE,   CMD_ARG_OPTIONAL | CMD_ARG_REST, 0,         NULL },
 };
 
-// /set kv <key> <value>  ·  /set kv --clear <key>
+// /set kv <key> <value>  ·  /set kv --clear <key>  ·  --delete <key>
 //
 // An empty value used to be untypeable here: `value` was REQUIRED, so a
 // bare key failed arg parsing, and `""` stored the two literal quote
@@ -71,10 +71,12 @@ typedef enum
 {
   SET_KV_ASSIGN = 0,   // set kv <key> <value>
   SET_KV_CLEAR,        // set kv --clear <key>
+  SET_KV_DELETE,       // set kv --delete <key>
 } set_kv_verb_t;
 
 static const char set_kv_usage[] =
-    "usage: set kv <key> <value> | set kv --clear <key>";
+    "usage: set kv <key> <value> | set kv --clear <key> "
+    "| set kv --delete <key>";
 
 // Empty a KV_STR key. "" parses for KV_STR alone — str_to_val interns it
 // unconditionally there and every other arm fails on `end == str`, so
@@ -117,6 +119,57 @@ set_kv_clear(const cmd_ctx_t *ctx, const char *key)
   cmd_reply(ctx, buf);
 }
 
+// Retire a key's stored value. Two different retirements live here and
+// the operator cannot tell them apart from the outside, so the reply
+// says which happened: a registered key keeps its binding and goes back
+// to what its declaration named, while an unregistered one has no
+// declaration to go back to and only its row goes.
+//
+// ⛔ No kv_flush() on this path. kv_reset leaves the entry clean exactly
+// so nothing re-persists the row it just dropped; flushing here would be
+// asking the one question this verb exists to answer NO.
+static void
+set_kv_delete(const cmd_ctx_t *ctx, const char *key)
+{
+  char buf[KV_KEY_SZ + KV_STR_SZ + 128];
+
+  if(!kv_exists(key))
+  {
+    kv_delete(key);
+    snprintf(buf, sizeof(buf),
+        "%s is not registered — dropped any persisted row "
+        "(that is /db delete kv's job)", key);
+  }
+
+  else if(!kv_reset(key))
+    snprintf(buf, sizeof(buf), "could not reset %s", key);
+
+  // A secret's reply states the action and never the value, on this arm
+  // as on --clear.
+  else if(kv_is_secret_key(key))
+    snprintf(buf, sizeof(buf),
+        "%s reverted to its declared default — secret; value not shown",
+        key);
+
+  else
+  {
+    char val[KV_STR_SZ];
+
+    // ⚠ kv_get_val_str answers with common.h's inverted SUCCESS (false),
+    // not with a predicate's true — unlike kv_exists and kv_reset either
+    // side of it. A bare `!` here reads every success as a failure, and
+    // the only symptom is a reply that says "?".
+    if(kv_get_val_str(key, val, sizeof(val)) != SUCCESS)
+      strlcpy(val, "?", sizeof(val));
+
+    snprintf(buf, sizeof(buf),
+        "%s reverted to its declared default (%s) and its row dropped",
+        key, val);
+  }
+
+  cmd_reply(ctx, buf);
+}
+
 static void
 cmd_set_kv(const cmd_ctx_t *ctx)
 {
@@ -127,6 +180,8 @@ cmd_set_kv(const cmd_ctx_t *ctx)
 
   if(strcmp(first, "--clear") == 0)
     verb = SET_KV_CLEAR;
+  else if(strcmp(first, "--delete") == 0)
+    verb = SET_KV_DELETE;
 
   key = (verb == SET_KV_ASSIGN) ? first : rest;
 
@@ -151,6 +206,12 @@ cmd_set_kv(const cmd_ctx_t *ctx)
   if(verb == SET_KV_CLEAR)
   {
     set_kv_clear(ctx, key);
+    return;
+  }
+
+  if(verb == SET_KV_DELETE)
+  {
+    set_kv_delete(ctx, key);
     return;
   }
 
@@ -326,7 +387,7 @@ void
 cmd_set_register(void)
 {
   cmd_register("cmd", "kv",
-      "set kv <key> <value> | set kv --clear <key>",
+      "set kv <key> <value> | set kv --clear|--delete <key>",
       "Set a configuration value",
       "--clear empties a STR key — the empty value `set kv` could not\n"
       "otherwise express, since a bare key fails arg parsing and \"\" is\n"
@@ -334,12 +395,21 @@ cmd_set_register(void)
       "type: \"\" parses for STR alone, and an empty number would have to\n"
       "mean zero, which is a value and not an absence.\n"
       "\n"
-      "The flag goes after `kv`, not before it. It is not available on\n"
+      "--delete retires a registered key's STORED value: the key reverts\n"
+      "to the default its declaration named and its database row goes, so\n"
+      "the next boot reads the declaration. The key itself stays\n"
+      "registered. This is not /db delete kv, which drops a persisted row\n"
+      "that no live key claims — that one is still the only tool for an\n"
+      "orphan, and it unregisters, which for a live key would make the\n"
+      "knob stop existing.\n"
+      "\n"
+      "The flags go after `kv`, not before it. They are not available on\n"
       "`set bot` — that command's three-arg/four-arg disambiguation keys\n"
       "on whether a value follows, so a flag inverts it.\n"
       "\n"
-      "Example:\n"
-      "  /set kv --clear plugin.urlgrabber.crawler_agent",
+      "Examples:\n"
+      "  /set kv --clear plugin.urlgrabber.crawler_agent\n"
+      "  /set kv --delete plugin.tmdb.language",
       USERNS_GROUP_ADMIN, 100, CMD_SCOPE_ANY, METHOD_T_ANY,
       cmd_set_kv, NULL, "set", NULL, ad_set_kv, 2, NULL, NULL);
 
