@@ -72,6 +72,11 @@
 #define GEM_WS_CH_MAX_SUBS              GEM_SUBS_MAX
 #define GEM_WS_CH_MAX_PRODUCTS_PER_SUB  GEM_PRODS_PER_SUB_MAX
 #define GEM_WS_CH_MAX_SLOTS             GEM_SLOTS_MAX
+
+// Gemini's WS symbol form: the uppercase concatenated pair, `BTCUSD`.
+// Named because the reap copies one out from under `mu` and the copy
+// must be able to hold whatever the slot holds (OBS-42).
+#define GEM_WS_SYM_NATIVE_SZ            16
 #define GEM_WS_CH_REQ_RING_SIZE         GEM_REQ_ID_RING
 
 // Internal channel enum. EXCH_WS_BOOK_L2 is not exposed; the four
@@ -135,7 +140,14 @@ typedef enum
   GEM_SUB_IDLE,
   GEM_SUB_SUBSCRIBING,
   GEM_SUB_ACTIVE,
-  GEM_SUB_FAILED
+  GEM_SUB_FAILED,
+
+  // A slot whose unsubscribe frame is already on the wire (OBS-42).
+  // Both windows in which `mu` is dropped are guarded by this: a
+  // concurrent reap skips it rather than emitting a second frame, and
+  // compaction refuses it rather than swapping a slot out from under
+  // its own completion.
+  GEM_SUB_UNSUBSCRIBING
 } gem_sub_state_t;
 
 // Per-(channel, native_sym) dedup slot. `symbol_native` is the empty
@@ -150,11 +162,18 @@ typedef enum
 typedef struct
 {
   gem_ws_channel_t channel;
-  char             symbol_native[16];   // Gemini WS form: BTCUSD
+  char             symbol_native[GEM_WS_SYM_NATIVE_SZ];
   uint32_t         refcount;
   gem_sub_state_t  state;
   uint32_t         req_id;        // monotonic per slot; informational
-  bool             sent_upstream; // true once subscribe ack received
+
+  // OBS-42: the gateway holds this subscription, and nothing may
+  // forget the slot while it does. Set by the ack, cleared only by a
+  // successful unsubscribe or by a session flap. It is the compaction
+  // guard, which is why it is not named for what we sent: read at the
+  // guard, `!gateway_holds` must mean "the gateway does not have it",
+  // never "we never sent it".
+  bool             gateway_holds;
   char             last_err[128];
 } gem_ws_slot_t;
 
@@ -302,15 +321,25 @@ gem_ws_slot_alloc_locked(gem_ws_channel_t ch, const char *symbol_native)
   return(s);
 }
 
-// Drop slots whose refcount hit zero. Swap-with-last is safe because
-// no external index escapes this module.
+// Drop slots whose refcount hit zero AND that nothing is still
+// waiting on. Swap-with-last is safe because no external index
+// escapes this module — but an index held across a dropped `mu` is
+// not an escape the compiler can see, which is why the two states
+// below are refused (OBS-42 D4).
+//
+// The `gateway_holds` conjunct is the one that matters: forgetting a
+// slot the gateway still streams leaves that feed running to nobody,
+// and no later pass will ever emit for it because the table no longer
+// records it.
 static void
 gem_ws_slots_compact_locked(void)
 {
   for(uint32_t i = 0; i < gem_ws_ch.n_slots; )
   {
     if(gem_ws_ch.slots[i].refcount == 0
-        && gem_ws_ch.slots[i].state != GEM_SUB_SUBSCRIBING)
+        && !gem_ws_ch.slots[i].gateway_holds
+        && gem_ws_ch.slots[i].state != GEM_SUB_SUBSCRIBING
+        && gem_ws_ch.slots[i].state != GEM_SUB_UNSUBSCRIBING)
     {
       gem_ws_ch.slots[i] = gem_ws_ch.slots[gem_ws_ch.n_slots - 1];
       gem_ws_ch.n_slots--;
@@ -451,7 +480,7 @@ gem_ws_emit_resubscribe_locked(void)
       if(s->channel == ch && s->refcount > 0)
       {
         s->state         = GEM_SUB_SUBSCRIBING;
-        s->sent_upstream = false;
+        s->gateway_holds = false;
       }
     }
 
@@ -481,56 +510,137 @@ gem_ws_emit_resubscribe_locked(void)
   }
 }
 
-// Emit unsubscribe frames for slots whose refcount has dropped to
-// zero AND were previously acked. Mu held by caller; temporarily
-// released around the send.
+// One slot's identity, copied out from under `mu`. OBS-42 D4: the
+// table is compacted by swap-with-last, so an INDEX taken before `mu`
+// is dropped names a different slot afterwards — and the writes at the
+// end of phase B landed on whatever had been swapped in, clearing a
+// live feed's flag so its own unsubscribe could never be emitted.
+// Identity is the only thing that survives a compaction.
+typedef struct
+{
+  gem_ws_channel_t channel;
+  char             symbol_native[GEM_WS_SYM_NATIVE_SZ];
+} gem_ws_ident_t;
+
+// Emit unsubscribe frames for slots whose refcount has dropped to zero
+// and that the gateway still holds. Mu held by caller; released around
+// each send.
+//
+// Two phases, because `mu` cannot be held across gem_ws_send_text:
+//
+//   A — one uninterrupted hold: choose the slots, copy their
+//       IDENTITIES, and mark each UNSUBSCRIBING. The mark is what makes
+//       a concurrent pass skip a slot whose frame is already on the
+//       wire, and what stops compaction moving it.
+//   B — per identity: render, drop mu, send, retake mu, then re-find
+//       the slot BY IDENTITY and write only if it is still the slot we
+//       marked.
+//
+// The old shape walked by index across the gap and restarted the walk
+// from 0 whenever the table shrank, which both re-emitted for slots it
+// had already handled and wrote onto the neighbour that a compaction
+// had swapped into the index it was holding.
 static void
 gem_ws_emit_unsubscribe_locked(void)
 {
-  uint32_t i;
+  gem_ws_ident_t ident[GEM_WS_CH_MAX_SLOTS];
+  uint32_t       n = 0;
+  uint32_t       i;
 
+  // Phase A — pick and mark, mu never dropped.
   for(i = 0; i < gem_ws_ch.n_slots; i++)
   {
-    gem_ws_slot_t  snap;
-    gem_ws_slot_t *s   = &gem_ws_ch.slots[i];
+    gem_ws_slot_t *s = &gem_ws_ch.slots[i];
+
+    if(s->refcount != 0) continue;
+    if(!s->gateway_holds) continue;
+    if(s->state == GEM_SUB_UNSUBSCRIBING) continue;
+
+    // GEM_CH_USER has no wire name (gem_ws_md_channel_name returns
+    // NULL for it), so a reap that took it would render nothing and
+    // silently mark a slot it can never unmark.
+    if(!gem_ws_channel_is_per_symbol(s->channel)) continue;
+
+    s->state = GEM_SUB_UNSUBSCRIBING;
+
+    ident[n].channel = s->channel;
+    strlcpy(ident[n].symbol_native, s->symbol_native,
+        sizeof(ident[n].symbol_native));
+    n++;
+  }
+
+  // Phase B — one send per identity.
+  for(i = 0; i < n; i++)
+  {
     char           frame[GEM_WS_TX_BUF_SZ];
     size_t         flen;
     bool           ok;
+    int32_t        idx;
+    gem_ws_slot_t *s;
 
-    if(s->refcount != 0) continue;
-    if(!s->sent_upstream) continue;
-    if(!gem_ws_channel_is_per_symbol(s->channel)) continue;
+    flen = gem_ws_render_unsubscribe_one(ident[i].channel,
+        ident[i].symbol_native, frame, sizeof(frame));
 
-    snap = *s;
+    if(flen == 0)
+    {
+      // Nothing went out, so the mark has to come off or the slot is
+      // stranded: no pass wants it and compaction refuses it.
+      idx = gem_ws_slot_find_locked(ident[i].channel,
+          ident[i].symbol_native);
 
-    flen = gem_ws_render_unsubscribe_one(snap.channel, snap.symbol_native,
-        frame, sizeof(frame));
+      if(idx >= 0 && gem_ws_ch.slots[idx].state == GEM_SUB_UNSUBSCRIBING)
+        gem_ws_ch.slots[idx].state = GEM_SUB_ACTIVE;
 
-    if(flen == 0) continue;
+      continue;
+    }
 
     pthread_mutex_unlock(&gem_ws_ch.mu);
     ok = gem_ws_send_text(GEM_WS_MD, frame, flen);
     pthread_mutex_lock(&gem_ws_ch.mu);
 
-    if(i >= gem_ws_ch.n_slots) { i = (uint32_t)-1; continue; }
+    // Re-find by identity, never by index. A slot that is no longer
+    // UNSUBSCRIBING is not the one this frame was for.
+    idx = gem_ws_slot_find_locked(ident[i].channel,
+        ident[i].symbol_native);
 
-    s = &gem_ws_ch.slots[i];
+    if(idx < 0)
+      continue;
+
+    s = &gem_ws_ch.slots[idx];
+
+    if(s->state != GEM_SUB_UNSUBSCRIBING)
+      continue;
 
     if(ok != SUCCESS)
     {
       clam(CLAM_DEBUG, GEM_CTX ".ws.md",
           "%s unsubscribe deferred (send failed)",
-          gem_ws_md_channel_name(snap.channel));
+          gem_ws_md_channel_name(ident[i].channel));
+
+      // Back to the belief it came from: gateway_holds was never
+      // touched, and the only thing that sets it also sets ACTIVE.
+      s->state = GEM_SUB_ACTIVE;
       continue;
     }
 
     clam(CLAM_INFO, GEM_CTX ".ws.md",
         "%s unsubscribe sent sym=%s",
-        gem_ws_md_channel_name(snap.channel), snap.symbol_native);
+        gem_ws_md_channel_name(ident[i].channel), ident[i].symbol_native);
 
-    s->sent_upstream = false;
+    s->gateway_holds = false;
     s->state         = GEM_SUB_IDLE;
   }
+}
+
+// The one place a slot nobody wants is given back. Emit first, then
+// compact — compaction refuses a slot the gateway still holds, so a
+// slot only becomes forgettable once its unsubscribe has actually
+// gone out.
+static void
+gem_ws_reap_unwanted_locked(void)
+{
+  gem_ws_emit_unsubscribe_locked();
+  gem_ws_slots_compact_locked();
 }
 
 // ------------------------------------------------------------------ //
@@ -948,16 +1058,25 @@ gem_ws_md_handle_candles_1m_locked(struct json_object *root)
 //    "subscriptions":[{"name":"l2","symbols":["BTCUSD","ETHUSD"]}, ...]}
 //
 // Correlate by (channel, symbol) since Gemini's MD v2 does not echo
-// JSON-RPC ids. Mark every matching slot ACTIVE + sent_upstream=true.
-static void
+// JSON-RPC ids. Mark every matching slot ACTIVE + gateway_holds=true.
+//
+// OBS-42 D1: returns true when at least one slot it just made ACTIVE
+// has refcount 0 — the consumer left between the subscribe frame going
+// out and this ack landing. Its own unsubscribe already ran and skipped
+// the slot, because at that moment the gateway did not hold it yet, and
+// no pass will ever look again. The caller reaps on true; without that,
+// the gateway streams a symbol to nobody until an unrelated consumer
+// happens to unsubscribe.
+static bool
 gem_ws_md_handle_sub_ack_locked(struct json_object *root)
 {
   struct json_object *subs;
   size_t              n;
   size_t              i;
+  bool                unwanted = false;
 
   subs = json_get_array(root, "subscriptions");
-  if(subs == NULL) return;
+  if(subs == NULL) return(false);
 
   n = (size_t)json_object_array_length(subs);
 
@@ -1003,13 +1122,18 @@ gem_ws_md_handle_sub_ack_locked(struct json_object *root)
       if(idx < 0) continue;
 
       gem_ws_ch.slots[idx].state         = GEM_SUB_ACTIVE;
-      gem_ws_ch.slots[idx].sent_upstream = true;
+      gem_ws_ch.slots[idx].gateway_holds = true;
       gem_ws_ch.slots[idx].last_err[0]   = '\0';
+
+      if(gem_ws_ch.slots[idx].refcount == 0)
+        unwanted = true;
 
       clam(CLAM_INFO, GEM_CTX ".ws.md",
           "subscription_ack ch=%s sym=%s", name, sym);
     }
   }
+
+  return(unwanted);
 }
 
 // ------------------------------------------------------------------ //
@@ -1293,7 +1417,12 @@ gem_ws_channels_dispatch_md(const char *buf, size_t len)
   }
   else if(strcmp(type, "subscription_ack") == 0)
   {
-    gem_ws_md_handle_sub_ack_locked(root);
+    // OBS-42 D1: an ack that landed on a slot nobody wants any more is
+    // the only moment that slot becomes reapable, so it is reaped here
+    // under the same hold rather than waiting for an unrelated
+    // consumer to leave.
+    if(gem_ws_md_handle_sub_ack_locked(root))
+      gem_ws_reap_unwanted_locked();
   }
   else if(strcmp(type, "l2_updates") == 0)
   {
@@ -1387,14 +1516,26 @@ gem_ws_channels_on_open(gem_ws_session_id_t sid)
     return;
   }
 
-  // Reset state on every slot — the gateway forgot us across the flap.
+  // Reset state on every slot — the gateway forgot us across the flap,
+  // so nothing this session sent can still be answered.
+  //
+  // OBS-42 D3: the reset is UNCONDITIONAL. It used to skip refcount-0
+  // slots, which is exactly the set that needs it: a slot stranded at
+  // SUBSCRIBING by a consumer that left before its ack survived every
+  // flap, because compaction refuses SUBSCRIBING and nothing else ever
+  // looked at it. It held one of GEM_WS_CH_MAX_SLOTS for the life of
+  // the mapping, and the table's occupancy stopped tracking live
+  // subscriptions and started tracking ever-subscribed pairs.
   for(uint32_t i = 0; i < gem_ws_ch.n_slots; i++)
   {
-    gem_ws_ch.slots[i].sent_upstream = false;
-
-    if(gem_ws_ch.slots[i].refcount > 0)
-      gem_ws_ch.slots[i].state = GEM_SUB_IDLE;
+    gem_ws_ch.slots[i].gateway_holds = false;
+    gem_ws_ch.slots[i].state         = GEM_SUB_IDLE;
   }
+
+  // Now that nothing is held or in flight, the slots nobody wants are
+  // forgettable — and must go before the resubscribe, or we re-ask the
+  // gateway for feeds no consumer is left to read.
+  gem_ws_slots_compact_locked();
 
   gem_ws_emit_resubscribe_locked();
 
@@ -1671,13 +1812,11 @@ gem_ws_unsubscribe(void *driver_sub)
     }
   }
 
-  // Emit unsubscribe frames for slots that hit zero. The MD session
-  // may not be OPEN — silent FAIL, which is fine: the gateway forgets
-  // the subscription when the slot drops out of the table.
-  gem_ws_emit_unsubscribe_locked();
-
-  // Reap empty slots.
-  gem_ws_slots_compact_locked();
+  // Give back every slot that just hit zero. The MD session may not be
+  // OPEN — a silent send failure is fine, and leaves the slot ACTIVE
+  // and un-compacted so the next open resubscribes it rather than
+  // forgetting a feed the gateway is still streaming.
+  gem_ws_reap_unwanted_locked();
 
   mem_free(handle);
 

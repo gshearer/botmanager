@@ -37,9 +37,13 @@ void    gem_ws_channels_deinit(void);
 //
 //   GEM_WS_MD: rebuild the upstream MD subscription set from the live
 //   slot table and emit one subscribe per channel covering every live
-//   native symbol. Resets every slot's `sent_upstream` flag before
-//   rendering so a session that had previously been acked gets a fresh
-//   resubscribe after a flap.
+//   native symbol. Resets every slot's `gateway_holds` flag and its
+//   state before rendering — UNCONDITIONALLY, including slots at
+//   refcount 0 — then compacts, then emits. The reset is what makes a
+//   departed slot forgettable: before OBS-42 it skipped refcount-0
+//   slots, which is exactly the set that could not be forgotten any
+//   other way, and the table's occupancy drifted from live
+//   subscriptions towards ever-subscribed pairs until it filled.
 //
 //   GEM_WS_OE: no subscribe frame — Gemini's order-events stream is
 //   account-implicit. The hook just logs the OPEN transition.

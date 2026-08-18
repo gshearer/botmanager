@@ -270,6 +270,24 @@ RPC-style req_id (Gemini doesn't carry one on the wire). The Order
 Events socket has no subscribe frame — open is acked with a
 `subscription_ack` envelope and the server starts streaming.
 
+**An ack can outlive the consumer that caused it, and that is a case
+the dispatcher handles rather than a case that cannot happen**
+(`OBS-42`). A consumer leaving between the subscribe frame going out
+and its ack landing correctly emits no unsubscribe — at that moment the
+gateway does not hold the subscription yet — so when the ack arrives it
+lands on a slot at `refcount == 0`. `gem_ws_md_handle_sub_ack_locked`
+reports that, and the dispatcher reaps the slot under the same lock
+hold. Without it the gateway streams that symbol to nobody until some
+unrelated consumer happens to unsubscribe.
+
+Because there is no req_id, **identity — `(channel, symbol_native)` —
+is the only correlator this driver has**, and it is what the unsubscribe
+emit re-derives its slot from after dropping `mu` around the send. It
+must never re-derive by index: the slot table compacts by
+swap-with-last, so an index taken before the lock was dropped names a
+different slot afterwards, and the completion's writes land on whatever
+was swapped in.
+
 ### Sequence gaps
 
 Gemini WS frames carry no per-product sequence number that the

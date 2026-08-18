@@ -215,6 +215,22 @@ test_cmd_inflight = executable('test_cmd_inflight',
 # the next reconcile decides to emit — a feed that never subscribes, an
 # unsubscribe that never goes out. These cases drive the public surface
 # only; the send stub is the interleaving control point.
+# Gemini's slot table carries the same subject as kraken's — what the
+# table BELIEVES the gateway holds against what it actually holds — but
+# arrives at it through four divergences kraken does not have, because
+# Gemini MD v2 echoes no req_id and so has no correlator ring. Every
+# consequence is silent: fan-out never reads slot state, so a wrong
+# belief corrupts only what the NEXT pass emits (OBS-42).
+test_gemini_ws_channels = executable('test_gemini_ws_channels',
+  'test_gemini_ws_channels.c',
+  '../plugins/service/gemini/gemini_ws_channels.c',
+  include_directories : [include_directories('.'), inc_include,
+                         include_directories('../plugins/service/gemini'),
+                         include_directories('../plugins/feature/exchange')],
+  link_with : [test_harness, libcore],
+  dependencies : core_deps,
+)
+
 test_kraken_ws_channels = executable('test_kraken_ws_channels',
   'test_kraken_ws_channels.c',
   '../plugins/service/kraken/kraken_ws_channels.c',
@@ -321,6 +337,7 @@ test('curl_submit_wait', test_curl_submit_wait)
 test('curl_flight', test_curl_flight)
 test('cmd_inflight', test_cmd_inflight)
 test('kraken_ws_channels', test_kraken_ws_channels)
+test('gemini_ws_channels', test_gemini_ws_channels)
 test('exchange_ws_gen', test_exchange_ws_gen)
 test('exchange_watch', test_exchange_watch)
 test('method_stats', test_method_stats)
