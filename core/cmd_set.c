@@ -42,22 +42,123 @@ validate_kv_key(const char *str)
 
 static const cmd_arg_desc_t ad_set_kv[] = {
   { "key",   CMD_ARG_CUSTOM, CMD_ARG_REQUIRED,                KV_KEY_SZ, validate_kv_key },
-  { "value", CMD_ARG_NONE,   CMD_ARG_REQUIRED | CMD_ARG_REST, 0,         NULL },
+  { "value", CMD_ARG_NONE,   CMD_ARG_OPTIONAL | CMD_ARG_REST, 0,         NULL },
 };
 
-// /set kv <key> <value>
+// /set kv <key> <value>  ·  /set kv --clear <key>
+//
+// An empty value used to be untypeable here: `value` was REQUIRED, so a
+// bare key failed arg parsing, and `""` stored the two literal quote
+// characters. Four plugins invented a sentinel vocabulary to route
+// around that — giphy, urlgrabber and chat's memory each decode
+// ""/"\"\""/none/off, and chat's aka list invented a lone "-" — and the
+// same word means "broadest allowed" in one of them and "feature off"
+// in the others (OBS-50). `--clear` is the verb they were working
+// around.
+//
+// The flag lives INSIDE the subcommand. `set --clear kv <key>` puts it
+// ahead of the child, which would need flag handling in core/cmd.c's
+// dispatcher and a flag concept in cmd_arg_desc_t — the framework every
+// plugin in this tree registers against. That form was measured and
+// refused on exactly that blast radius; do not re-propose it.
+//
+// ⚠ validate_kv_key accepts '-', so "--clear" passes validation as a key
+// and arrives in the key position rather than being rejected. The flag
+// test is therefore positional and explicit — argv[0], nowhere else —
+// never a fallthrough from a lookup that failed.
+
+typedef enum
+{
+  SET_KV_ASSIGN = 0,   // set kv <key> <value>
+  SET_KV_CLEAR,        // set kv --clear <key>
+} set_kv_verb_t;
+
+static const char set_kv_usage[] =
+    "usage: set kv <key> <value> | set kv --clear <key>";
+
+// Empty a KV_STR key. "" parses for KV_STR alone — str_to_val interns it
+// unconditionally there and every other arm fails on `end == str`, so
+// the other types self-refuse — but they refuse as "invalid value for
+// X", which describes the wrong event when the operator supplied no
+// value at all. Name the type instead.
+static void
+set_kv_clear(const cmd_ctx_t *ctx, const char *key)
+{
+  const char *type;
+  char        buf[KV_KEY_SZ + 128];
+
+  type = kv_get_type_name(key);
+
+  if(type == NULL)
+    snprintf(buf, sizeof(buf), "unknown key: %s", key);
+
+  else if(strcmp(type, "STR") != 0)
+    snprintf(buf, sizeof(buf),
+        "cannot clear %s: it is %s, and only STR holds an empty value",
+        key, type);
+
+  else if(kv_set(key, "") != SUCCESS)
+    snprintf(buf, sizeof(buf), "could not clear %s", key);
+
+  else
+  {
+    kv_flush();
+
+    // A secret's reply states the action and never the value. And a
+    // cleared credential is not restorable from anything on disk: keys
+    // here are installed by hand and live in no file, so say so.
+    if(kv_is_secret_key(key))
+      snprintf(buf, sizeof(buf),
+          "cleared %s — secret; re-enter it by hand to restore", key);
+    else
+      snprintf(buf, sizeof(buf), "cleared %s (now empty)", key);
+  }
+
+  cmd_reply(ctx, buf);
+}
 
 static void
 cmd_set_kv(const cmd_ctx_t *ctx)
 {
-  const char *key = ctx->parsed->argv[0];
-  const char *value = ctx->parsed->argv[1];
+  const char   *first = ctx->parsed->argv[0];
+  const char   *rest  = ctx->parsed->argc > 1 ? ctx->parsed->argv[1] : NULL;
+  set_kv_verb_t verb  = SET_KV_ASSIGN;
+  const char   *key;
 
-  if(kv_set(key, value) == SUCCESS)
+  if(strcmp(first, "--clear") == 0)
+    verb = SET_KV_CLEAR;
+
+  key = (verb == SET_KV_ASSIGN) ? first : rest;
+
+  if(key == NULL || (verb == SET_KV_ASSIGN && rest == NULL))
+  {
+    cmd_reply(ctx, set_kv_usage);
+    return;
+  }
+
+  // Only argv[0] carries the descriptor's validator, and on a flag the
+  // key is argv[1] — which is REST, so it can hold whitespace and
+  // anything else the operator typed.
+  if(verb != SET_KV_ASSIGN && !validate_kv_key(key))
+  {
+    char buf[KV_KEY_SZ + 32];
+
+    snprintf(buf, sizeof(buf), "invalid key: %s", key);
+    cmd_reply(ctx, buf);
+    return;
+  }
+
+  if(verb == SET_KV_CLEAR)
+  {
+    set_kv_clear(ctx, key);
+    return;
+  }
+
+  if(kv_set(key, rest) == SUCCESS)
   {
     char buf[KV_KEY_SZ + KV_STR_SZ + 8];
 
-    snprintf(buf, sizeof(buf), "%s = %s", key, value);
+    snprintf(buf, sizeof(buf), "%s = %s", key, rest);
     cmd_reply(ctx, buf);
     kv_flush();
   }
@@ -225,9 +326,20 @@ void
 cmd_set_register(void)
 {
   cmd_register("cmd", "kv",
-      "set kv <key> <value>",
+      "set kv <key> <value> | set kv --clear <key>",
       "Set a configuration value",
-      NULL,
+      "--clear empties a STR key — the empty value `set kv` could not\n"
+      "otherwise express, since a bare key fails arg parsing and \"\" is\n"
+      "stored as two literal quote characters. Refused on every other\n"
+      "type: \"\" parses for STR alone, and an empty number would have to\n"
+      "mean zero, which is a value and not an absence.\n"
+      "\n"
+      "The flag goes after `kv`, not before it. It is not available on\n"
+      "`set bot` — that command's three-arg/four-arg disambiguation keys\n"
+      "on whether a value follows, so a flag inverts it.\n"
+      "\n"
+      "Example:\n"
+      "  /set kv --clear plugin.urlgrabber.crawler_agent",
       USERNS_GROUP_ADMIN, 100, CMD_SCOPE_ANY, METHOD_T_ANY,
       cmd_set_kv, NULL, "set", NULL, ad_set_kv, 2, NULL, NULL);
 
