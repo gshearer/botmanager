@@ -6,10 +6,9 @@
 //   * a per-(channel, native_sym) slot table that refcounts shared
 //     subscribers so N consumers watching the same feed share one
 //     upstream subscription,
-//   * a monotonic req_id counter (informational — Gemini Market Data
-//     v2 does not echo req_ids on the wire; correlation against
-//     `subscription_ack` envelopes goes through (channel, symbol)
-//     matching instead),
+//   * a monotonic req_id counter (informational only — Gemini Market
+//     Data v2 echoes nothing at all: no req_ids, and no acknowledgement
+//     of any kind. There is nothing on the wire to correlate against),
 //   * per-channel parsers turning one inbound MD/OE frame into one or
 //     more fanned-out exchange_ws_event_t events.
 //
@@ -19,22 +18,29 @@
 //     {"type":"subscribe",
 //      "subscriptions":[
 //        {"name":"l2",         "symbols":["BTCUSD","ETHUSD"]},
-//        {"name":"candles_1m", "symbols":["BTCUSD"]},
-//        {"name":"trades",     "symbols":["BTCUSD"]}
+//        {"name":"candles_1m", "symbols":["BTCUSD"]}
 //      ]}
+//
+//   ⛔ Those are the ONLY two channels this gateway has (OBS-55). A
+//   third line naming `trades` used to be rendered here and the whole
+//   frame was answered {"reason":"InvalidJson","result":"error"};
+//   `trade` singular is refused identically. Trade prints arrive
+//   inside the `l2` stream.
 //
 //   MD frames:
 //     heartbeat        — {"type":"heartbeat",...}                      no-op
-//     subscription_ack — confirms subscribe; correlated by (chan,sym)
 //     l2_updates       — initial snapshot + ongoing diff updates;
 //                         carries inline `trades` arrays
 //     trade            — individual trade prints
 //     candles_1m_updates — initial/streaming 1-minute bars
+//     {"result":"error","reason":...} — the gateway REFUSING a frame we
+//                         sent. Typeless, so it is matched before the
+//                         type test and logged at WARN (OBS-55).
+//     ⛔ NO subscription_ack: this gateway confirms nothing (OBS-53).
 //
 //   OE subscribe — none. Account-implicit. HMAC handshake auths.
 //
 //   OE frames:
-//     subscription_ack — log only
 //     heartbeat        — no-op
 //     [array]          — initial snapshot list
 //     initial / accepted / booked / fill / cancelled / rejected /
@@ -79,14 +85,24 @@
 #define GEM_WS_SYM_NATIVE_SZ            16
 #define GEM_WS_CH_REQ_RING_SIZE         GEM_REQ_ID_RING
 
-// Internal channel enum. EXCH_WS_BOOK_L2 is not exposed; the four
-// remaining abstract channels each map to exactly one Gemini channel.
+// Internal channel enum. EXCH_WS_BOOK_L2 is not exposed, and the
+// mapping from the remaining abstract channels is NOT one-to-one:
+// OBS-55 measured that this gateway has no `trades` channel, so
+// EXCH_WS_TICKER and EXCH_WS_TRADES both land on `l2`, which carries
+// book diffs and trade prints in the same stream.
 typedef enum
 {
-  GEM_CH_TICKER      = 0,    // derived from l2_updates best-bid/ask
-  GEM_CH_TRADES      = 1,    // `trades` channel
-  GEM_CH_OHLC_1M     = 2,    // `candles_1m` channel
-  GEM_CH_USER        = 3,    // Order Events stream (account-implicit)
+  // ⚠ These values are DENSE and must stay dense: every per-channel
+  // pass is `for(c = 0; c < GEM_CH__COUNT; c++)`, so a hole is a
+  // channel that does not exist being rendered and marked per-symbol.
+  // OBS-55 removed `GEM_CH_TRADES = 1` (this gateway has no trades
+  // channel) and renumbered rather than leaving the gap behind.
+  // Nothing persists or transmits these — the slot table is in-memory
+  // and the subscription mask is keyed by the ABSTRACT
+  // exchange_ws_channel_t — so renumbering is free.
+  GEM_CH_TICKER      = 0,    // `l2`; also carries trade + book events
+  GEM_CH_OHLC_1M     = 1,    // `candles_1m` channel
+  GEM_CH_USER        = 2,    // Order Events stream (account-implicit)
   GEM_CH__COUNT
 } gem_ws_channel_t;
 
@@ -105,7 +121,6 @@ gem_ws_md_channel_name(gem_ws_channel_t ch)
   switch(ch)
   {
     case GEM_CH_TICKER:  return("l2");
-    case GEM_CH_TRADES:  return("trades");
     case GEM_CH_OHLC_1M: return("candles_1m");
     case GEM_CH_USER:    return(NULL);
     case GEM_CH__COUNT:  break;
@@ -157,8 +172,8 @@ typedef enum
 //
 // `symbol_native` is the WS form Gemini emits, which is the uppercase
 // concatenated `BTCUSD` (gem_pair_to_native returns lowercase `btcusd`
-// for REST; we uppercase at slot-insert time so subscription_ack
-// matching can compare byte-for-byte against incoming envelopes).
+// for REST; we uppercase at slot-insert time so it compares
+// byte-for-byte against the symbols in incoming envelopes).
 typedef struct
 {
   gem_ws_channel_t channel;
@@ -1458,6 +1473,34 @@ gem_ws_channels_dispatch_md(const char *buf, size_t len)
   root = json_parse_buf(buf, len, GEM_CTX ".ws.md");
   if(root == NULL) return;
 
+  // OBS-55 — the venue refuses with a typeless envelope, so this test
+  // must come BEFORE the one below or a hard error the driver caused is
+  // filed as an anonymous frame. Shape:
+  //   {"reason":"InvalidJson","result":"error"}
+  // WARN, not DEBUG: it is always a defect on our side — a channel this
+  // gateway does not have, or a frame it will not parse — and the whole
+  // reason OBS-55 needed a live gate to find is that the refusal used to
+  // be indistinguishable from noise.
+  {
+    char result[16] = {0};
+
+    if(json_get_str(root, "result", result, sizeof(result))
+        && strcmp(result, "error") == 0)
+    {
+      char reason[64] = {0};
+
+      if(!json_get_str(root, "reason", reason, sizeof(reason)))
+        strlcpy(reason, "(no reason given)", sizeof(reason));
+
+      clam(CLAM_WARN, GEM_CTX ".ws.md",
+          "gateway REFUSED a frame we sent: reason='%s' (%zu bytes)",
+          reason, len);
+
+      json_object_put(root);
+      return;
+    }
+  }
+
   if(!json_get_str(root, "type", type, sizeof(type)))
   {
     // Post-GEM-VERIFY-1: pre-fix this fired ~61×/connect because the
@@ -1465,8 +1508,12 @@ gem_ws_channels_dispatch_md(const char *buf, size_t len)
     // snapshots that happened to parse as valid JSON (no `type` at
     // the partial top level). With the CURLWS_CONT-gated reassembly
     // in gem_ws_on_frame_locked, the path is reached only for
-    // genuinely typeless server envelopes (rare). Logged at DBG5 so
-    // it's invisible at default debug verbosity.
+    // genuinely typeless server envelopes.
+    //
+    // ⚠ OBS-55: this comment used to say "(rare)". It was reached on
+    // EVERY connection, by the `trades` subscribe this driver sent to
+    // a gateway that has no such channel — the arm above now names
+    // that, and the render that caused it is gone.
     clam(CLAM_DEBUG5, GEM_CTX ".ws.md",
         "frame without type (%zu bytes)", len);
     json_object_put(root);
@@ -1607,7 +1654,25 @@ gem_ws_channel_from_exch(exchange_ws_channel_t in)
   switch(in)
   {
     case EXCH_WS_TICKER:  return(GEM_CH_TICKER);
-    case EXCH_WS_TRADES:  return(GEM_CH_TRADES);
+    // OBS-55 — this gateway has NO trades channel, in either spelling
+    // (`trades` and `trade` are both answered `InvalidJson`, measured
+    // against the same pair in the same minute). Trades arrive as
+    // `"type":"trade"` frames INSIDE the `l2` stream, so a consumer
+    // asking for trades wants exactly the subscription a ticker
+    // consumer wants, and says so here.
+    //
+    // ⭑ This is a mapping and not a refusal on purpose: a consumer
+    // asking for trades ALONE still gets a wire subscription. Today
+    // whenmoon is the only caller and it always asks for ticker and
+    // trades together, so dropping the render would have worked — on
+    // today's callers. The API permits trades-only, and that is what
+    // this is priced on.
+    //
+    // Delivery is unaffected either way: gem_ws_fanout_locked gates on
+    // the SUBSCRIPTION's abstract channel mask, never on the slot
+    // table, so a trade event still reaches exactly the consumers who
+    // asked for EXCH_WS_TRADES.
+    case EXCH_WS_TRADES:  return(GEM_CH_TICKER);
     case EXCH_WS_OHLC_1M: return(GEM_CH_OHLC_1M);
     case EXCH_WS_USER:    return(GEM_CH_USER);
     case EXCH_WS_BOOK_L2: return(GEM_CH__COUNT);

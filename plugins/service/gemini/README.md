@@ -7,7 +7,7 @@ Service plugin (`PLUGIN_SERVICE`) for Gemini Spot, served at
 Provides the `exchange_gemini` capability tag and self-registers an
 exchange vtable with `feature_exchange`. The same gemini plugin
 handles every Gemini interaction — REST (candles, balances, orders,
-fills, symbols) and WebSocket (l2, trade, candles_1m_updates,
+fills, symbols) and WebSocket (l2, candles_1m,
 order events).
 
 Auth is **HMAC-SHA384** over a base64-encoded JSON payload — Gemini's
@@ -49,7 +49,7 @@ Two surfaces, served by the same plugin:
 | Surface | URL | Auth | Purpose |
 |---------|-----|------|---------|
 | REST | `https://api.gemini.com` | Public GETs unauthenticated; private POSTs carry `X-GEMINI-APIKEY` + `X-GEMINI-PAYLOAD` + `X-GEMINI-SIGNATURE` HMAC-SHA384 | OHLC candles, balances, new/cancel/status order, active orders, my trades, symbols + symbols/details cache |
-| WebSocket Market Data v2 | `wss://api.gemini.com/v2/marketdata` | Unauthenticated, multi-symbol, channel-based | Live streams: `l2` (top-of-book → derived ticker), `trade`, `candles_1m_updates`, `subscription_ack` envelope |
+| WebSocket Market Data v2 | `wss://api.gemini.com/v2/marketdata` | Unauthenticated, multi-symbol, channel-based | Live streams: **`l2`** (book diffs → derived ticker, and `type:trade` prints arrive inside it) and **`candles_1m`**. ⛔ Those are the only two subscribable channels: `trades`/`trade` are both answered `{"reason":"InvalidJson","result":"error"}`, and **there is no `subscription_ack`** — this gateway acknowledges nothing, a subscribe with the snapshot and an unsubscribe with silence (`OBS-53`, `OBS-55`; rig `temp/obs53/`). |
 | WebSocket Order Events | `wss://api.gemini.com/v1/order/events` | HMAC headers on the HTTP handshake — no token endpoint | Per-account stream: `initial / accepted / booked / fill / cancelled / closed` → fans out as `EXCH_WS_USER_KIND_ORDER` / `EXCH_WS_USER_KIND_FILL` events |
 
 Gemini does not publish a sandbox surface. The REST + WS URLs are the
@@ -109,7 +109,7 @@ Hard layering rules apply (`plugins/service/AGENTS.md`):
 | Key | Type | Default | Role |
 |-----|------|---------|------|
 | `plugin.gemini.rest_url` | STR | `https://api.gemini.com` | REST base URL. |
-| `plugin.gemini.ws_url_marketdata` | STR | `wss://api.gemini.com/v2/marketdata` | Public WebSocket URL (l2, trade, candles_1m_updates). |
+| `plugin.gemini.ws_url_marketdata` | STR | `wss://api.gemini.com/v2/marketdata` | Public WebSocket URL (`l2`, `candles_1m` — the only two channels it has). |
 | `plugin.gemini.ws_url_order_events` | STR | `wss://api.gemini.com/v1/order/events` | Private WebSocket URL. `?heartbeat=true` is appended at connect time only when the operator-set value does not already carry a query string. |
 | `plugin.gemini.creds.apikey` | STR (secret) | `` | Master/primary/scoped API key id. Sent verbatim in `X-GEMINI-APIKEY`. |
 | `plugin.gemini.creds.private_key` | STR (secret) | `` | Base64-encoded HMAC-SHA384 secret. Decoded once and cached. |

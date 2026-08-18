@@ -84,6 +84,24 @@ frame_is(const char *frame, const char *op, const char *sym)
   return(strstr(frame, needle) != NULL && strstr(frame, sym) != NULL);
 }
 
+// OBS-55: count frames that NAME a wire channel, whatever the op. The
+// question this answers is not "did we unsubscribe" but "did we ever
+// utter a channel name this gateway does not have".
+static size_t
+count_naming(const char *chan_name)
+{
+  char   needle[48];
+  size_t n = 0;
+
+  snprintf(needle, sizeof(needle), "\"name\":\"%s\"", chan_name);
+
+  for(size_t i = 0; i < n_frames; i++)
+    if(strstr(frames[i], needle) != NULL)
+      n++;
+
+  return(n);
+}
+
 static size_t
 count_frames(const char *op, const char *sym)
 {
@@ -263,6 +281,19 @@ static void *
 sub_one(const char *product)
 {
   const exchange_ws_channel_t ch = EXCH_WS_TICKER;
+  void                       *h  = NULL;
+
+  gem_ws_subscribe(&ch, 1, &product, 1, noop_event_cb, NULL, &h);
+
+  return(h);
+}
+
+// A consumer that asks for TRADES and nothing else — the case the API
+// permits and no caller in this tree currently exercises (OBS-55).
+static void *
+sub_one_trades(const char *product)
+{
+  const exchange_ws_channel_t ch = EXCH_WS_TRADES;
   void                       *h  = NULL;
 
   gem_ws_subscribe(&ch, 1, &product, 1, noop_event_cb, NULL, &h);
@@ -673,6 +704,48 @@ case_g10(void)
   gem_ws_channels_deinit();
 }
 
+// g11 — OBS-55: this gateway has no `trades` channel in either
+// spelling, so the driver must never name one, and a consumer asking
+// for trades alone must still end up subscribed to the stream trades
+// actually arrive on (`l2`).
+static void
+case_g11(void)
+{
+  void *h;
+
+  gem_ws_channels_init();
+  ledger_reset();
+
+  h = sub_one_trades("BTC-USD");
+
+  test_check_sz(SUITE,
+      "g11: a trades-only consumer still gets a subscription",
+      1, count_frames("subscribe", "BTCUSD"));
+  test_check_sz(SUITE,
+      "g11: and it is the l2 channel trades actually arrive on",
+      1, count_naming("l2"));
+  test_check_sz(SUITE,
+      "g11: no frame names the `trades` channel the venue refuses",
+      0, count_naming("trades"));
+
+  gem_ws_unsubscribe(h);
+  gem_ws_channels_deinit();
+
+  // The ticker path must be unchanged by the remap: still one l2
+  // subscribe, still no `trades`.
+  gem_ws_channels_init();
+  ledger_reset();
+
+  h = sub_one("BTC-USD");
+  test_check_sz(SUITE, "g11: a ticker-only consumer is unchanged",
+      1, count_naming("l2"));
+  test_check_sz(SUITE, "g11: and still names no `trades`",
+      0, count_naming("trades"));
+
+  gem_ws_unsubscribe(h);
+  gem_ws_channels_deinit();
+}
+
 int
 main(void)
 {
@@ -688,6 +761,7 @@ main(void)
   case_g8();
   case_g9();
   case_g10();
+  case_g11();
 
   return(test_report(SUITE));
 }
