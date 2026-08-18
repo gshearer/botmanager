@@ -165,6 +165,39 @@ case_non_string_keys(void)
       "", kv_get_str("t.empty"));
 }
 
+// The pair OBS-37 rests on. Eleven read sites had their
+// `if(s == NULL || s[0] == '\0') s = <the declaration>;` fallback deleted,
+// and both halves of that deletion are invisible when they break: the
+// first arm turning live is a NULL walking into a "%s", and the second
+// arm turning live again is `set kv --clear` being silently swallowed by
+// a substituted default.
+static void
+case_declared_default_and_clear(void)
+{
+  kv_register("t.decl", KV_STR, "en-US", NULL, NULL, "");
+
+  test_check_str(SUITE, "a registered key answers with its declaration",
+      "en-US", kv_get_str("t.decl"));
+
+  test_check_bool(SUITE, "and never answers NULL, so a fallback is dead",
+      true, kv_get_str("t.decl") != NULL);
+
+  // What `set kv --clear` does. The declaration must NOT come back: it
+  // is reachable again only through kv_reset (`set kv --delete`).
+  kv_set("t.decl", "");
+
+  test_check_str(SUITE, "a cleared key answers empty, not its declaration",
+      "", kv_get_str("t.decl"));
+
+  test_check_bool(SUITE, "a cleared key is still not NULL",
+      true, kv_get_str("t.decl") != NULL);
+
+  kv_reset("t.decl");
+
+  test_check_str(SUITE, "and kv_reset is what brings the declaration back",
+      "en-US", kv_get_str("t.decl"));
+}
+
 // A help string long enough to prove the value bound does NOT apply to it:
 // help text is prose and routinely runs past KV_STR_SZ.
 #define LONG_HELP_LEN (KV_STR_SZ + 200)
@@ -263,6 +296,7 @@ main(void)
   case_interning();
   case_bound();
   case_non_string_keys();
+  case_declared_default_and_clear();
 
   case_help_outlives_its_storage();
   case_help_interning();

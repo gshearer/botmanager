@@ -2772,14 +2772,14 @@ chatbot_plugin_init(void)
   // Kind-wide KV: directory of personality files. Registered directly
   // (not via kv_schema / kv_inst_schema) because the key sits under
   // the "bot.<kind>." prefix rather than "plugin.<kind>." or per-bot.
-  if(kv_register("bot.chat.personalitypath", KV_STR, "./personalities",
-        NULL, NULL,
+  if(kv_register("bot.chat.personalitypath", KV_STR,
+        CHATBOT_PERSONALITY_DIR, NULL, NULL,
         "Filesystem directory scanned for *.txt personality files."
         " Read on demand by the chat reply pipeline.") != SUCCESS)
     return(FAIL);
 
   if(kv_register("bot.chat.contractpath", KV_STR,
-        "./personalities/contracts", NULL, NULL,
+        CHATBOT_CONTRACT_DIR, NULL, NULL,
         "Filesystem directory holding *.txt output contract files."
         " Selected per-bot via bot.<name>.behavior.contract (or the plugin"
         " default plugin.chat.default_contract).") != SUCCESS)

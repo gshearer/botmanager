@@ -193,8 +193,8 @@ wxg_ua(char *out, size_t sz)
 {
   const char *ua = kv_get_str("plugin.weathergov.user_agent");
 
-  if(ua == NULL || ua[0] == '\0')
-    ua = wxg_kv_schema[1].default_val;
+  if(ua[0] == '\0')
+    ua = WXG_UA_DEFAULT;
 
   snprintf(out, sz, "%s", ua);
 }

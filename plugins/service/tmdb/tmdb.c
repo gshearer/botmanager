@@ -955,9 +955,6 @@ tmdb_search_async(tmdb_media_t kind, const char *query,
 
   lang = kv_get_str("plugin.tmdb.language");
 
-  if(lang == NULL || lang[0] == '\0')
-    lang = "en-US";
-
   path = kind == TMDB_MEDIA_MOVIE  ? "movie"
        : kind == TMDB_MEDIA_TV     ? "tv"
        : kind == TMDB_MEDIA_PERSON ? "person"
@@ -1050,9 +1047,6 @@ tmdb_title_async(tmdb_media_t kind, int32_t id, tmdb_title_cb_t cb, void *user)
 
   lang = kv_get_str("plugin.tmdb.language");
 
-  if(lang == NULL || lang[0] == '\0')
-    lang = "en-US";
-
   path = kind == TMDB_MEDIA_TV ? "tv" : "movie";
 
   need = snprintf(url, sizeof(url),
@@ -1133,9 +1127,6 @@ tmdb_person_async(int32_t id, tmdb_person_cb_t cb, void *user)
   }
 
   lang = kv_get_str("plugin.tmdb.language");
-
-  if(lang == NULL || lang[0] == '\0')
-    lang = "en-US";
 
   need = snprintf(url, sizeof(url),
       "%s/person/%d?append_to_response=combined_credits,external_ids"
@@ -1227,9 +1218,6 @@ tmdb_trending_async(tmdb_media_t kind, bool weekly, tmdb_search_cb_t cb,
   }
 
   lang = kv_get_str("plugin.tmdb.language");
-
-  if(lang == NULL || lang[0] == '\0')
-    lang = "en-US";
 
   need = snprintf(url, sizeof(url), "%s/trending/%s/%s?language=%s",
       TMDB_API_BASE, path, win, lang);

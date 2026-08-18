@@ -1516,10 +1516,14 @@ ow_prepare_request(ow_request_t *r, const char *zipcode,
   snprintf(r->zipcode, sizeof(r->zipcode), "%s", zipcode);
   snprintf(r->apikey,  sizeof(r->apikey),  "%s", apikey);
 
+  // `set kv --clear` is refused rather than passed on: the weather
+  // feature reads anything that is not "imperial" as metric, so an empty
+  // knob would silently split the two legs — Celsius upstream at
+  // weather.gov, Kelvin here.
   units = kv_get_str("plugin.openweather.units");
 
   snprintf(r->units, sizeof(r->units), "%s",
-      (units != NULL && units[0] != '\0') ? units : "imperial");
+      units[0] != '\0' ? units : OW_UNITS_DEFAULT);
 
   pthread_mutex_lock(&ow_geo_cache_mu);
   cached = ow_geo_lookup(r->zipcode);
@@ -1681,10 +1685,8 @@ openweather_units_kv_value(void)
 {
   const char *units = kv_get_str("plugin.openweather.units");
 
-  if(units == NULL || units[0] == '\0')
-    return("imperial");
-
-  return(units);
+  // Same refusal as ow_prepare_request — the consumer has no empty state.
+  return(units[0] != '\0' ? units : OW_UNITS_DEFAULT);
 }
 
 // String helpers (local to the city-name path)

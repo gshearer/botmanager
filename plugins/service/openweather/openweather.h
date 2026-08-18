@@ -217,10 +217,15 @@ static ow_citycache_t  *ow_city_cache[OW_CITY_CACHE_BUCKETS];
 
 static bool             ow_validate_zipcode(const char *s);
 
+// The units knob is three-state (imperial / metric / standard) and has no
+// empty member, so both read sites refuse an empty value and fall back
+// here rather than restating the string (see openweather.c).
+#define OW_UNITS_DEFAULT "imperial"
+
 static const plugin_kv_entry_t ow_kv_schema[] = {
   { "plugin.openweather.creds.apikey",         KV_STR,    "",
     "OpenWeatherMap API key" },
-  { "plugin.openweather.units",          KV_STR,    "imperial",
+  { "plugin.openweather.units",          KV_STR,    OW_UNITS_DEFAULT,
     "Temperature units: imperial, metric, or standard" },
   { "plugin.openweather.geo_cache_ttl",  KV_UINT32, "86400",
     "Geocoding cache time-to-live in seconds" },

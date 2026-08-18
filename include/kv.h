@@ -129,6 +129,24 @@ long double kv_get_ldouble(const char *key);
 // has a value. There is no such question to ask: a registered key
 // always answers with its default, so the typed getter above IS the
 // value, and 0 from it means the key says 0.
+//
+// ⛔ A read site must not restate the key's declared default. A
+// registered key never answers NULL and answers with its declaration
+// until somebody sets a value, so the obvious
+// `if(s == NULL || s[0] == '\0') s = "en-US";` written under a schema
+// entry that already says "en-US" has a dead first arm — and a second
+// arm that can only fire when the operator ran `set kv --clear`.
+// Substituting the default there does not restore a default: it
+// silently refuses the clear, and writes the declaration down twice so
+// the two can drift. Let an empty value through where it is legal
+// downstream; where it is not, refuse it in the plugin's own words and
+// name the declaration rather than repeat it.
+//
+// This is why the string half needs no `kv_get_str_or_default` twin of
+// kv_get_uint_or_default above: 0 is typeable and ambiguous, so the
+// integer knob had to buy its escape hatch at the read site, while
+// `set kv --clear` and `set kv --delete` now say "empty" and "the
+// shipped value" separately at the command surface (OBS-37, OBS-50).
 const char *kv_get_str(const char *key);
 
 bool kv_set(const char *key, const char *val);

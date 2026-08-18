@@ -27,6 +27,9 @@
 // Guard against injection *and* against an identifier Postgres would
 // refuse: the prefix is pasted into DDL and queries verbatim, so it must
 // be letters, digits and underscores, and must not open with a digit.
+// That covers `set kv --clear` too — validate_alnum refuses an empty
+// string, so the clear is reported here instead of being swallowed by a
+// fallback restating the schema's own default.
 static bool
 atk_table_prefix(char *out, size_t cap)
 {
@@ -35,9 +38,6 @@ atk_table_prefix(char *out, size_t cap)
 
   if(out == NULL || cap == 0)
     return(FAIL);
-
-  if(name == NULL || name[0] == '\0')
-    name = "attack";
 
   len = strlen(name);
 

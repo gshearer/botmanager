@@ -371,11 +371,15 @@ static pthread_mutex_t    wxg_point_cache_mu;
 
 // Configuration schema
 
+// wxg_ua() refuses an empty User-Agent and falls back here. It used to
+// reach for wxg_kv_schema[1].default_val, which silently means something
+// else the moment a row is inserted above it.
+#define WXG_UA_DEFAULT "botmanager/1.0 (+set plugin.weathergov.user_agent)"
+
 static const plugin_kv_entry_t wxg_kv_schema[] = {
   { "plugin.weathergov.enabled",         KV_UINT8,  "1",
     "Master switch; 0 = never call weather.gov" },
-  { "plugin.weathergov.user_agent",      KV_STR,
-    "botmanager/1.0 (+set plugin.weathergov.user_agent)",
+  { "plugin.weathergov.user_agent",      KV_STR, WXG_UA_DEFAULT,
     "User-Agent sent to weather.gov; NWS asks that it name a contact" },
   { "plugin.weathergov.timeout_secs",    KV_UINT32, "8",
     "Per-request timeout in seconds" },

@@ -94,8 +94,9 @@ mp_skip_frontmatter(char *raw)
 }
 
 // Resolve the configured personality directory. Public helper shared
-// with personality_show.c. Always succeeds: absent / empty KV falls
-// back to "./personalities".
+// with personality_show.c. Always succeeds: the key is registered, so
+// only `set kv --clear` can answer empty, and an empty directory is not
+// a directory — refuse it and stay on the declaration.
 bool
 chatbot_personality_path(char *out_path, size_t sz)
 {
@@ -106,8 +107,8 @@ chatbot_personality_path(char *out_path, size_t sz)
 
   p = kv_get_str("bot.chat.personalitypath");
 
-  if(p == NULL || p[0] == '\0')
-    p = "./personalities";
+  if(p[0] == '\0')
+    p = CHATBOT_PERSONALITY_DIR;
 
   snprintf(out_path, sz, "%s", p);
   return(true);
@@ -417,8 +418,7 @@ chatbot_personality_read(const char *name, chatbot_personality_t *out)
 }
 
 // Resolve the configured contract directory. Public helper shared
-// with contract_show.c. Always succeeds: absent / empty KV falls
-// back to "./personalities/contracts".
+// with contract_show.c. Same refusal as chatbot_personality_path.
 bool
 chatbot_contract_path(char *out_path, size_t sz)
 {
@@ -429,8 +429,8 @@ chatbot_contract_path(char *out_path, size_t sz)
 
   p = kv_get_str("bot.chat.contractpath");
 
-  if(p == NULL || p[0] == '\0')
-    p = "./personalities/contracts";
+  if(p[0] == '\0')
+    p = CHATBOT_CONTRACT_DIR;
 
   snprintf(out_path, sz, "%s", p);
   return(true);

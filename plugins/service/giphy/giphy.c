@@ -303,13 +303,13 @@ giphy_curl_done(const curl_response_t *cresp)
 // ----------------------------------------------------------------------
 
 // Resolve plugin.giphy.rating into a ready-to-append "&rating=<val>" URL
-// fragment. Any of unset, empty, a literal "" (what /set kv stores for a
-// quoted empty — the command surface cannot store a genuine empty
-// string), "none", or "off" mean "broadest allowed", which maps to
-// rating=r: Giphy's public API tops out there in practice, and stating
-// it explicitly is safer than omitting the param, since some endpoints
-// default an absent rating to g-rated. There is no true "unfiltered"
-// value in the Giphy API — r is as broad as it serves.
+// fragment. Any of unset, empty, a literal "" (what `set kv` stored for
+// a quoted empty before `set kv --clear` existed, and values typed then
+// are still out there), "none", or "off" mean "broadest allowed", which
+// maps to rating=r: Giphy's public API tops out there in practice, and
+// stating it explicitly is safer than omitting the param, since some
+// endpoints default an absent rating to g-rated. There is no true
+// "unfiltered" value in the Giphy API — r is as broad as it serves.
 static void
 giphy_rating_frag(char *out, size_t cap)
 {
@@ -336,9 +336,6 @@ giphy_build_url(giphy_mode_t mode, const char *key, const char *enc,
   int         need;
 
   giphy_rating_frag(rating, sizeof(rating));
-
-  if(lang == NULL || lang[0] == '\0')
-    lang = "en";
 
   switch(mode)
   {

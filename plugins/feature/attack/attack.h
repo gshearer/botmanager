@@ -27,6 +27,11 @@
 // CLAM context (registered in CLAM.md).
 #define ATK_CTX            "attack"
 
+// Where the character sheets live. Named once so the schema entry and
+// atk_tunables_load() cannot drift; an empty directory is not one, so
+// `set kv --clear` on ATK_KV_CLASSES is refused and lands back here.
+#define ATK_CLASSES_DIR    "../plugins/feature/attack/characters"
+
 // KV keys (registered under the plugin schema). Twenty-five, and the
 // count is load-bearing: every number the pit uses is here, because a
 // character sheet may not carry one.

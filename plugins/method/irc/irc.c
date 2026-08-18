@@ -740,12 +740,13 @@ irc_kick_unident_task(task_t *t)
   channame = (kc->channel[0] == '#') ?
       kc->channel + 1 : kc->channel;
 
+  // Registered with the channel's group (irc.h) when the channel was
+  // added, so the declaration answers here and there is none to restate.
+  // An empty reason is what `set kv --clear` on the key asks for, and
+  // KICK takes one.
   snprintf(key, sizeof(key), "%schan.%s.admin.kick_unident_msg",
       st->kv_prefix, channame);
   msg = kv_get_str(key);
-
-  if(msg == NULL || msg[0] == '\0')
-    msg = "You must identify to use this channel";
 
   irc_send_raw(st, "KICK %s %s :%s", kc->channel, kc->nick, msg);
   clam(CLAM_INFO, "irc", "%s: kicked unidentified user %s",

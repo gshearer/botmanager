@@ -18,6 +18,15 @@
 #include <stddef.h>
 #include <sys/types.h>
 
+// The two directories the personality loader reads, declared here so
+// chatbot_plugin_init()'s kv_register and personality.c's resolvers say
+// the same thing once. Neither key has a meaningful empty value — an
+// empty directory resolves against the daemon's working directory and
+// the catalogue comes back silently empty — so `set kv --clear` on
+// either is refused at the read site and lands back here.
+#define CHATBOT_PERSONALITY_DIR "./personalities"
+#define CHATBOT_CONTRACT_DIR    "./personalities/contracts"
+
 // Header-only view of a personality file (frontmatter parse only).
 // Used by /show personalities to render a catalogue row without
 // slurping the body or the contract. `ok == false` means the parse
@@ -65,7 +74,7 @@ bool chatbot_contract_read(const char *name, char **out_body);
 
 // Resolve the configured contract directory into out_path. Public
 // helper shared between personality.c and contract_show.c. Always
-// succeeds (fallback: "./personalities/contracts").
+// succeeds (fallback: CHATBOT_CONTRACT_DIR).
 bool chatbot_contract_path(char *out_path, size_t sz);
 
 // Read only the frontmatter header of a contract file. Populates

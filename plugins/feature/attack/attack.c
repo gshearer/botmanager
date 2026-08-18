@@ -24,7 +24,7 @@
 static const plugin_kv_entry_t atk_kv_schema[] = {
   { ATK_KV_PREFIX,     KV_STR,    "attack",
     "Table-name prefix for the pit's four tables (bare SQL identifier)" },
-  { ATK_KV_CLASSES,    KV_STR,    "../plugins/feature/attack/characters",
+  { ATK_KV_CLASSES,    KV_STR,    ATK_CLASSES_DIR,
     "Directory the character sheets are read from; relative paths "
     "resolve against the daemon's working directory" },
   { ATK_KV_START_HP,   KV_UINT32, "100",
@@ -126,8 +126,7 @@ atk_tunables_load(atk_tunables_t *out)
   path = kv_get_str(ATK_KV_CLASSES);
 
   snprintf(out->classes_path, sizeof(out->classes_path), "%s",
-      (path != NULL && path[0] != '\0')
-          ? path : "../plugins/feature/attack/characters");
+      path[0] != '\0' ? path : ATK_CLASSES_DIR);
 
   out->start_hp        = atk_clamp(kv_get_uint(ATK_KV_START_HP),   1, 100000);
   out->dmg_max         = atk_clamp(kv_get_uint(ATK_KV_DMG_MAX),    1, 1000);

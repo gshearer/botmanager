@@ -1062,12 +1062,6 @@ yf_submit_chart(yf_batch_t *b, uint8_t slot, const char *sym, bool spark_only)
   range    = kv_get_str("plugin.yahoofinance.spark_range");
   interval = kv_get_str("plugin.yahoofinance.spark_interval");
 
-  if(range == NULL || range[0] == '\0')
-    range = "1d";
-
-  if(interval == NULL || interval[0] == '\0')
-    interval = "5m";
-
   if(yf_urlencode(sym, enc, sizeof(enc)) >= sizeof(enc))
     return(FAIL);
 

@@ -32,13 +32,13 @@ note_table_name(char *out, size_t cap)
   if(out == NULL || cap == 0)
     return(FAIL);
 
-  if(name == NULL || name[0] == '\0')
-    name = "notes";
-
   len = strlen(name);
 
   // Guard against injection: the table name is pasted into DDL/queries
   // verbatim, so it must be a bare identifier (letters, digits, '_').
+  // That covers `set kv --clear` too — validate_alnum refuses an empty
+  // string, so the clear is reported here instead of being swallowed by
+  // a fallback restating the schema's own default.
   if(len >= cap || !validate_alnum(name, cap - 1))
   {
     clam(CLAM_WARN, NOTE_CTX,
