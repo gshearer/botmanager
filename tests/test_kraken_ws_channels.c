@@ -319,6 +319,18 @@ release_park(void)
   pthread_mutex_unlock(&gate_mutex);
 }
 
+// Clears the frame ledger without touching the table — for a case that
+// wants to read what one later call emitted.
+static void
+ledger_reset_frames(void)
+{
+  pthread_mutex_lock(&ledger_mutex);
+
+  n_frames = 0;
+
+  pthread_mutex_unlock(&ledger_mutex);
+}
+
 static void
 fixture_reset(void)
 {
@@ -361,7 +373,9 @@ event_cb(const exchange_ws_event_t *ev, void *user)
   strlcpy(ev_product, ev->product_id, sizeof(ev_product));
 }
 
-static void
+// Returns the driver's own verdict — OBS-51 made that verdict mean
+// something, so a case may read it.
+static bool
 subscribe_products(void **out, const char *const *products,
     uint32_t n_products)
 {
@@ -369,7 +383,8 @@ subscribe_products(void **out, const char *const *products,
 
   *out = NULL;
 
-  kr_ws_subscribe(channels, 1, products, n_products, event_cb, NULL, out);
+  return(kr_ws_subscribe(channels, 1, products, n_products, event_cb,
+      NULL, out));
 }
 
 static void
@@ -1005,6 +1020,86 @@ case_a_flap_does_not_revive_a_departed_slot(void)
       1, n_frames_with("subscribe", "AAA"));
 }
 
+// ------------------------------------------------------------------ //
+// OBS-51 — the SUCCESS that meant "some of it"                        //
+// ------------------------------------------------------------------ //
+//
+// The slot loop skipped what it could not seat and the function
+// returned SUCCESS regardless, so a consumer held a live handle for a
+// feed no frame was ever emitted for. Nothing repairs that: whenmoon's
+// reconcile diffs the set it REQUESTED against the set it wants, so a
+// binding that is live-but-incomplete matches and is never re-driven.
+//
+// The table is filled to 127 of 128 deliberately: a two-symbol call can
+// then seat exactly one of its pair, which is the shape the old code
+// answered SUCCESS to. What proves the give-back is the call AFTER it —
+// the last slot has to be free again for a fresh single-symbol
+// subscribe to reach the wire.
+
+static void
+case_a_partial_arm_is_refused_whole(void)
+{
+  // Wide enough for the widest int the format can render, which is what
+  // -Wformat-truncation measures — not for the 8 bytes the loop makes.
+  char        products[16][32];
+  const char *pp[16];
+  void       *fill[8];
+  void       *h  = NULL;
+  bool        rc;
+  int         i;
+  int         j;
+
+  fixture_reset();
+
+  for(i = 0; i < 8; i++)
+  {
+    uint32_t n = (i == 7) ? 15 : 16;
+
+    for(j = 0; j < (int)n; j++)
+    {
+      snprintf(products[j], sizeof(products[j]), "%c%02d-USD",
+          (char)('A' + i), j);
+      pp[j] = products[j];
+    }
+
+    rc = subscribe_products(&fill[i], pp, n);
+
+    test_check_bool(SUITE, "OBS-51: the table fills without refusing",
+        SUCCESS, rc);
+  }
+
+  ledger_reset_frames();
+
+  pp[0] = "X00-USD";
+  pp[1] = "X01-USD";
+  rc    = subscribe_products(&h, pp, 2);
+
+  test_check_bool(SUITE,
+      "OBS-51: one seat for two symbols is refused, not half-taken",
+      FAIL, rc);
+  test_check_bool(SUITE, "OBS-51: and hands back no handle", true,
+      h == NULL);
+  test_check_sz(SUITE,
+      "OBS-51: the seat it could take never reaches the wire",
+      0, n_frames_with("subscribe", "X00"));
+
+  ledger_reset_frames();
+
+  pp[0] = "Y00-USD";
+  rc    = subscribe_products(&h, pp, 1);
+
+  test_check_bool(SUITE,
+      "OBS-51: the refused call gave its seat back, so the next "
+      "subscriber gets it", SUCCESS, rc);
+  test_check_sz(SUITE, "OBS-51: and that subscribe is on the wire",
+      1, n_frames_with("subscribe", "Y00"));
+
+  kr_ws_unsubscribe(h);
+
+  for(i = 0; i < 8; i++)
+    kr_ws_unsubscribe(fill[i]);
+}
+
 int
 main(void)
 {
@@ -1024,6 +1119,7 @@ main(void)
   case_an_ack_that_lands_after_the_last_consumer_left();
   case_an_unsubscribe_that_never_left();
   case_a_flap_does_not_revive_a_departed_slot();
+  case_a_partial_arm_is_refused_whole();
 
   kr_ws_channels_deinit();
 

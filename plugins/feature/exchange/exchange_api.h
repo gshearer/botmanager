@@ -711,6 +711,15 @@ async_rc_t exchange_fetch_all_tickers_async(const char *name,
 // On FAIL `*out_handle` is NULL and the function returns FAIL — the
 // fanout callback never fires. On SUCCESS the handle is non-NULL and
 // every matching event fires `cb` until exchange_ws_unsubscribe(handle).
+//
+// OBS-51: SUCCESS means the handle covers EVERY (channel, product) pair
+// the call asked for. A driver that can seat only some of them — its
+// slot table is full — must seat none and return FAIL, because partial
+// coverage is unreportable through this interface and unrepairable
+// behind it: whenmoon's reconcile diffs the set it REQUESTED against
+// the set it wants, so a binding that is live-but-incomplete matches
+// and is never re-driven. A NULL handle is the one answer a consumer
+// reads as "retry me". All three drivers implement it that way.
 bool exchange_ws_subscribe(const char *name,
     const exchange_ws_channel_t *channels, uint32_t n_channels,
     const char *const *product_ids, uint32_t n_products,

@@ -271,6 +271,16 @@ test_gemini_ws_channels = executable('test_gemini_ws_channels',
   dependencies : core_deps,
 )
 
+test_coinbase_ws_channels = executable('test_coinbase_ws_channels',
+  'test_coinbase_ws_channels.c',
+  '../plugins/service/coinbase/coinbase_ws_channels.c',
+  include_directories : [include_directories('.'), inc_include,
+                         include_directories('../plugins/service/coinbase'),
+                         include_directories('../plugins/feature/exchange')],
+  link_with : [test_harness, libcore],
+  dependencies : core_deps,
+)
+
 test_kraken_ws_channels = executable('test_kraken_ws_channels',
   'test_kraken_ws_channels.c',
   '../plugins/service/kraken/kraken_ws_channels.c',
@@ -380,6 +390,7 @@ test('curl_flight', test_curl_flight)
 test('cmd_inflight', test_cmd_inflight)
 test('kraken_ws_channels', test_kraken_ws_channels)
 test('gemini_ws_channels', test_gemini_ws_channels)
+test('coinbase_ws_channels', test_coinbase_ws_channels)
 test('exchange_ws_gen', test_exchange_ws_gen)
 test('exchange_watch', test_exchange_watch)
 test('method_stats', test_method_stats)

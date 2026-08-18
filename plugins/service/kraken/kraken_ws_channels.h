@@ -64,6 +64,11 @@ void    kr_ws_channels_dispatch(const char *buf, size_t len);
 // dies with this mapping: kr_ws_channels_deinit frees every node still
 // outstanding. The abstraction wraps it and never forwards one issued by
 // an earlier registration, so nothing stale reaches here (OBS-19).
+//
+// OBS-51: SUCCESS means the handle covers EVERY (channel, symbol) pair
+// asked for. A call that cannot seat all of them seats none, gives back
+// what it took and returns FAIL — partial coverage is unreportable here
+// and the consumer cannot repair it, so refusing is the honest answer.
 bool    kr_ws_subscribe(const exchange_ws_channel_t *channels,
             uint32_t n_channels, const char *const *product_ids,
             uint32_t n_products, exchange_ws_event_cb_t cb, void *user,

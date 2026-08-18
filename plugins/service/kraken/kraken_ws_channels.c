@@ -1609,6 +1609,34 @@ kr_ws_channel_from_exch(exchange_ws_channel_t in,
   }
 }
 
+// OBS-51: give back an incomplete arm. Every refcount this call took
+// comes off, so a slot it allocated falls to zero and compacts away —
+// nothing has been emitted for it yet, so none is `gateway_holds` and
+// none can be stranded. Order matters: the deltas are indexed by slot
+// position, so they must be applied BEFORE the compaction that moves
+// slots. Caller holds `mu` and frees `sub` after unlocking.
+static void
+kr_ws_sub_rollback_locked(kr_ws_sub_t *sub, const uint32_t *rc_delta)
+{
+  kr_ws_sub_t **pp;
+  uint32_t      i;
+
+  for(i = 0; i < kr_ws_ch.n_slots; i++)
+    kr_ws_ch.slots[i].refcount -= rc_delta[i];
+
+  kr_ws_slots_compact_locked();
+
+  for(pp = &kr_ws_ch.head; *pp != NULL; pp = &(*pp)->next)
+  {
+    if(*pp == sub)
+    {
+      *pp = sub->next;
+      kr_ws_ch.n_subs--;
+      break;
+    }
+  }
+}
+
 // ------------------------------------------------------------------ //
 // Public API: kr_ws_subscribe / kr_ws_unsubscribe                     //
 // ------------------------------------------------------------------ //
@@ -1622,6 +1650,10 @@ kr_ws_subscribe(const exchange_ws_channel_t *channels, uint32_t n_channels,
   uint32_t                channel_mask     = 0;
   bool                    has_private      = false;
   bool                    has_per_symbol   = false;
+  uint32_t                rc_delta[KR_WS_CH_MAX_SLOTS] = {0};
+  uint32_t                n_wanted         = 0;
+  uint32_t                n_armed          = 0;
+  uint32_t                n_slots_seen     = 0;
   uint32_t                i;
 
   if(out_handle == NULL)
@@ -1763,6 +1795,8 @@ kr_ws_subscribe(const exchange_ws_channel_t *channels, uint32_t n_channels,
 
           kr_pair_lookup_ws(sub->products[p], sym_ws, sizeof(sym_ws));
 
+          n_wanted++;
+
           idx = kr_ws_slot_find_locked(kch, sym_ws);
 
           if(idx < 0)
@@ -1780,11 +1814,15 @@ kr_ws_subscribe(const exchange_ws_channel_t *channels, uint32_t n_channels,
           }
 
           kr_ws_ch.slots[idx].refcount++;
+          rc_delta[idx]++;
+          n_armed++;
         }
       }
       else
       {
         int32_t idx = kr_ws_slot_find_locked(kch, "");
+
+        n_wanted++;
 
         if(idx < 0)
         {
@@ -1801,8 +1839,33 @@ kr_ws_subscribe(const exchange_ws_channel_t *channels, uint32_t n_channels,
         }
 
         kr_ws_ch.slots[idx].refcount++;
+        rc_delta[idx]++;
+        n_armed++;
       }
     }
+  }
+
+  // OBS-51: SUCCESS means the handle covers every pair it asked for.
+  // A partial arm cannot be reported through this interface and cannot
+  // be repaired by the consumer either — whenmoon's reconcile diffs the
+  // set it REQUESTED against the set it wants, so a binding that is
+  // live-but-incomplete matches and is never re-driven. Refuse the
+  // whole call instead: a NULL handle is the one answer that reconcile
+  // reads as "retry me".
+  if(n_armed < n_wanted)
+  {
+    n_slots_seen = kr_ws_ch.n_slots;
+
+    kr_ws_sub_rollback_locked(sub, rc_delta);
+    pthread_mutex_unlock(&kr_ws_ch.mu);
+    mem_free(sub);
+
+    clam(CLAM_WARN, KR_CTX,
+        "ws subscribe: armed %u of %u (channel,symbol) pairs — refusing "
+        "the whole call (slots %u/%u)",
+        n_armed, n_wanted, n_slots_seen, KR_WS_CH_MAX_SLOTS);
+
+    return(FAIL);
   }
 
   // Reconcile. If private slots are pending and we don't have a fresh

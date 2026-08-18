@@ -1199,6 +1199,35 @@ cb_ws_channels_dispatch(const char *buf, size_t len)
   json_object_put(root);
 }
 
+// OBS-51: give back an incomplete arm. Every refcount this call took
+// comes off, so a slot it allocated falls to zero and compacts away —
+// nothing has been emitted for it yet, so no slot the gateway holds can
+// be reaped by this path. Order matters: the deltas are indexed by slot
+// position, so they must be applied BEFORE the compaction that moves
+// slots. Caller holds `mu` and frees `sub` after unlocking.
+static void
+cb_ws_sub_rollback_locked(struct coinbase_ws_sub *sub,
+    const uint32_t *rc_delta)
+{
+  struct coinbase_ws_sub **pp;
+  uint32_t                 i;
+
+  for(i = 0; i < cb_ws_ch.n_slots; i++)
+    cb_ws_ch.slots[i].refcount -= rc_delta[i];
+
+  cb_ws_slots_compact_locked();
+
+  for(pp = &cb_ws_ch.head; *pp != NULL; pp = &(*pp)->next)
+  {
+    if(*pp == sub)
+    {
+      *pp = sub->next;
+      cb_ws_ch.n_subs--;
+      break;
+    }
+  }
+}
+
 // ----------------------------------------------------------------------
 // Public API — exported via plugin_dlsym
 // ----------------------------------------------------------------------
@@ -1210,6 +1239,10 @@ coinbase_ws_subscribe(const coinbase_ws_channel_t *channels,
 {
   struct coinbase_ws_sub *sub;
   uint32_t                channel_mask     = 0;
+  uint32_t                rc_delta[CB_WS_CH_MAX_SLOTS] = {0};
+  uint32_t                n_wanted         = 0;
+  uint32_t                n_armed          = 0;
+  uint32_t                n_slots_seen     = 0;
   size_t                  i;
   bool                    has_product_chan = false;
 
@@ -1316,6 +1349,8 @@ coinbase_ws_subscribe(const coinbase_ws_channel_t *channels,
     {
       int32_t idx = cb_ws_slot_find_locked(cch, "");
 
+      n_wanted++;
+
       if(idx < 0)
       {
         cb_ws_slot_t *sl = cb_ws_slot_alloc_locked(cch, "");
@@ -1331,6 +1366,8 @@ coinbase_ws_subscribe(const coinbase_ws_channel_t *channels,
       }
 
       cb_ws_ch.slots[idx].refcount++;
+      rc_delta[idx]++;
+      n_armed++;
     }
     else
     {
@@ -1338,6 +1375,8 @@ coinbase_ws_subscribe(const coinbase_ws_channel_t *channels,
       {
         const char *pid = sub->products[i];
         int32_t     idx = cb_ws_slot_find_locked(cch, pid);
+
+        n_wanted++;
 
         if(idx < 0)
         {
@@ -1354,8 +1393,33 @@ coinbase_ws_subscribe(const coinbase_ws_channel_t *channels,
         }
 
         cb_ws_ch.slots[idx].refcount++;
+        rc_delta[idx]++;
+        n_armed++;
       }
     }
+  }
+
+  // OBS-51: SUCCESS means the handle covers every pair it asked for.
+  // A partial arm cannot be reported through this interface and cannot
+  // be repaired by the consumer either — whenmoon's reconcile diffs the
+  // set it REQUESTED against the set it wants, so a binding that is
+  // live-but-incomplete matches and is never re-driven. Refuse the
+  // whole call instead: a NULL handle is the one answer that reconcile
+  // reads as "retry me".
+  if(n_armed < n_wanted)
+  {
+    n_slots_seen = cb_ws_ch.n_slots;
+
+    cb_ws_sub_rollback_locked(sub, rc_delta);
+    pthread_mutex_unlock(&cb_ws_ch.mu);
+    mem_free(sub);
+
+    clam(CLAM_WARN, CB_CTX,
+        "ws subscribe: armed %u of %u (channel,product) pairs — refusing "
+        "the whole call (slots %u/%u)",
+        n_armed, n_wanted, n_slots_seen, CB_WS_CH_MAX_SLOTS);
+
+    return(NULL);
   }
 
   // Emit subscribe for every slot that's live but not yet upstream.

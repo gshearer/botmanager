@@ -1680,6 +1680,34 @@ gem_ws_channel_from_exch(exchange_ws_channel_t in)
   return(GEM_CH__COUNT);
 }
 
+// OBS-51: give back an incomplete arm. Every refcount this call took
+// comes off, so a slot it allocated falls to zero and compacts away —
+// nothing has been emitted for it yet, so none is `wire_subscribed` and
+// none can be stranded. Order matters: the deltas are indexed by slot
+// position, so they must be applied BEFORE the compaction that moves
+// slots. Caller holds `mu` and frees `sub` after unlocking.
+static void
+gem_ws_sub_rollback_locked(gem_ws_sub_t *sub, const uint32_t *rc_delta)
+{
+  gem_ws_sub_t **pp;
+  uint32_t       i;
+
+  for(i = 0; i < gem_ws_ch.n_slots; i++)
+    gem_ws_ch.slots[i].refcount -= rc_delta[i];
+
+  gem_ws_slots_compact_locked();
+
+  for(pp = &gem_ws_ch.head; *pp != NULL; pp = &(*pp)->next)
+  {
+    if(*pp == sub)
+    {
+      *pp = sub->next;
+      gem_ws_ch.n_subs--;
+      break;
+    }
+  }
+}
+
 // ------------------------------------------------------------------ //
 // Public API: gem_ws_subscribe / gem_ws_unsubscribe                   //
 // ------------------------------------------------------------------ //
@@ -1693,6 +1721,10 @@ gem_ws_subscribe(const exchange_ws_channel_t *channels, uint32_t n_channels,
   uint32_t                channel_mask     = 0;
   bool                    has_user_channel = false;
   bool                    has_per_symbol   = false;
+  uint32_t                rc_delta[GEM_WS_CH_MAX_SLOTS] = {0};
+  uint32_t                n_wanted         = 0;
+  uint32_t                n_armed          = 0;
+  uint32_t                n_slots_seen     = 0;
   uint32_t                i;
 
   if(out_handle == NULL)
@@ -1840,6 +1872,8 @@ gem_ws_subscribe(const exchange_ws_channel_t *channels, uint32_t n_channels,
           continue;
         }
 
+        n_wanted++;
+
         idx = gem_ws_slot_find_locked(mapped, sym_native);
 
         if(idx < 0)
@@ -1857,8 +1891,33 @@ gem_ws_subscribe(const exchange_ws_channel_t *channels, uint32_t n_channels,
         }
 
         gem_ws_ch.slots[idx].refcount++;
+        rc_delta[idx]++;
+        n_armed++;
       }
     }
+  }
+
+  // OBS-51: SUCCESS means the handle covers every pair it asked for.
+  // A partial arm cannot be reported through this interface and cannot
+  // be repaired by the consumer either — whenmoon's reconcile diffs the
+  // set it REQUESTED against the set it wants, so a binding that is
+  // live-but-incomplete matches and is never re-driven. Refuse the
+  // whole call instead: a NULL handle is the one answer that reconcile
+  // reads as "retry me".
+  if(n_armed < n_wanted)
+  {
+    n_slots_seen = gem_ws_ch.n_slots;
+
+    gem_ws_sub_rollback_locked(sub, rc_delta);
+    pthread_mutex_unlock(&gem_ws_ch.mu);
+    mem_free(sub);
+
+    clam(CLAM_WARN, GEM_CTX ".ws",
+        "subscribe: armed %u of %u (channel,symbol) pairs — refusing the "
+        "whole call (slots %u/%u)",
+        n_armed, n_wanted, n_slots_seen, GEM_WS_CH_MAX_SLOTS);
+
+    return(FAIL);
   }
 
   // Reconcile the upstream MD subscription set. The MD session may

@@ -288,6 +288,19 @@ sub_one(const char *product)
   return(h);
 }
 
+// One consumer over N symbols of the ticker channel, keeping the
+// call's own verdict — which is what OBS-51 is about.
+static bool
+sub_many(const char *const *products, uint32_t n, void **out_handle)
+{
+  const exchange_ws_channel_t ch = EXCH_WS_TICKER;
+
+  *out_handle = NULL;
+
+  return(gem_ws_subscribe(&ch, 1, products, n, noop_event_cb, NULL,
+      out_handle));
+}
+
 // A consumer that asks for TRADES and nothing else — the case the API
 // permits and no caller in this tree currently exercises (OBS-55).
 static void *
@@ -746,6 +759,96 @@ case_g11(void)
   gem_ws_channels_deinit();
 }
 
+// g12 — OBS-51: a subscribe that cannot arm every (channel, symbol)
+// pair it asked for is refused whole, and gives back everything it
+// took.
+//
+// The old contract skipped the pairs it could not seat and returned
+// SUCCESS anyway, so a consumer held a live handle for a feed no frame
+// was ever emitted for. Nothing repairs that: whenmoon's reconcile
+// diffs the set it REQUESTED against the set it wants, so a binding
+// that is live-but-incomplete matches and is never re-driven — which
+// is why the answer here is refusal rather than a partial success the
+// caller cannot act on.
+//
+// The table fills at 8 subs x 16 symbols = 128 slots. The half that
+// needs proving is the give-back, and the public surface shows it: a
+// refcount the refused call left behind would hold its slot alive, and
+// the real holder's own unsubscribe would then emit nothing for it.
+static void
+case_g12(void)
+{
+  // Wide enough for the widest int the format can render, which is what
+  // -Wformat-truncation measures — not for the 8 bytes the loop makes.
+  char        products[16][32];
+  const char *pp[16];
+  void       *fill[8];
+  void       *h  = NULL;
+  bool        rc;
+  int         i;
+  int         j;
+
+  gem_ws_channels_init();
+  ledger_reset();
+
+  for(i = 0; i < 8; i++)
+  {
+    for(j = 0; j < 16; j++)
+    {
+      snprintf(products[j], sizeof(products[j]), "%c%02d-USD",
+          (char)('A' + i), j);
+      pp[j] = products[j];
+    }
+
+    rc = sub_many(pp, 16, &fill[i]);
+
+    test_check_bool(SUITE, "g12: the table fills without refusing",
+        SUCCESS, rc);
+  }
+
+  ledger_reset();
+
+  pp[0] = "ZZZ-USD";
+  rc    = sub_many(pp, 1, &h);
+
+  test_check_bool(SUITE,
+      "g12: a subscribe that can arm nothing is refused", FAIL, rc);
+  test_check_bool(SUITE, "g12: and hands back no handle", true,
+      h == NULL);
+  test_check_sz(SUITE,
+      "g12: nothing goes on the wire for the refused symbol",
+      0, count_frames("subscribe", "ZZZUSD"));
+
+  // The partial: one symbol that already has a slot, one that cannot
+  // get one. Under the old contract this returned SUCCESS with half a
+  // feed; now it is refused, and the refcount it took on the seated
+  // symbol has to come back off.
+  pp[0] = "A00-USD";
+  pp[1] = "ZZZ-USD";
+  rc    = sub_many(pp, 2, &h);
+
+  test_check_bool(SUITE,
+      "g12: a partial arm is refused too", FAIL, rc);
+
+  // Walks the subscriber list — a refused node left linked would be
+  // read here after its free (this case earns its keep under ASan).
+  feed_md("{\"type\":\"l2_updates\",\"symbol\":\"A01USD\",\"changes\":["
+      "[\"buy\",\"10.00\",\"1.0\"],[\"sell\",\"10.50\",\"1.0\"]]}");
+
+  ledger_reset();
+  gem_ws_unsubscribe(fill[0]);
+
+  test_check_sz(SUITE,
+      "g12: the refused call gave its refcount back, so the holder's "
+      "own leave releases the slot",
+      1, count_frames("unsubscribe", "A00USD"));
+
+  for(i = 1; i < 8; i++)
+    gem_ws_unsubscribe(fill[i]);
+
+  gem_ws_channels_deinit();
+}
+
 int
 main(void)
 {
@@ -762,6 +865,7 @@ main(void)
   case_g9();
   case_g10();
   case_g11();
+  case_g12();
 
   return(test_report(SUITE));
 }

@@ -453,6 +453,18 @@ async_rc_t coinbase_list_fills_async(const char *order_id,
 // channel (`user`, `full`) while credentials are not configured. No
 // upstream frame is sent on FAIL.
 //
+// OBS-51: "capacity is exhausted" is answered a pair at a time and the
+// answer is all-or-nothing — a call that cannot seat every (channel,
+// product) pair it asked for seats NONE and returns NULL. Until
+// 2026-08-18 this paragraph described the contract and the code did
+// something else: it skipped what it could not seat and handed back a
+// handle anyway. ⚠ Every subscribe silently adds `heartbeats` +
+// `status` to its own mask and all three are product-keyed, so ONE
+// single-product ticker subscribe seats THREE slots — and the channel
+// walk is in enum order, so under the old code the housekeeping pairs
+// won the last seats and the caller's own data channel was the one
+// dropped.
+//
 // Safe to call before the WS session is open — subscriptions land in
 // the registry and are sent the moment the session reaches OPEN. On
 // reconnect, live subscriptions are resent transparently; consumer
