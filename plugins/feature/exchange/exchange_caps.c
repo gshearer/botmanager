@@ -107,64 +107,51 @@ fail_tickers_cb(exchange_done_tickers_cb_t cb, void *user, const char *err)
   cb(false, err != NULL ? err : "error", NULL, 0, user);
 }
 
-// Resolve `name` without any auth check. Used by public market-data
-// verbs (candles, public WS channels). Writes a human-readable error
-// into `errbuf` on FAIL.
-static bool
-resolve_exchange(const char *name, exchange_t **out_e,
-    char *errbuf, size_t errbuf_sz)
+// Resolve `name` to a vtable snapshot, without any auth check. Used by
+// public market-data verbs (candles, tickers, public WS channels).
+// Returns NULL — with a human-readable reason in `errbuf` — when the
+// name is unusable or its registration is a tombstone. What a shim gets
+// back is the vtable itself, deliberately: dispatching through a second
+// read of `e->vt` is the window exchange_unregister writes into
+// (OBS-24, exchange.h at exchange_vt_snapshot).
+static const exchange_protocol_vtable_t *
+resolve_exchange(const char *name, char *errbuf, size_t errbuf_sz)
 {
-  exchange_t *e;
+  const exchange_protocol_vtable_t *vt;
 
   if(name == NULL || name[0] == '\0')
   {
     snprintf(errbuf, errbuf_sz, "exchange name required");
-    return(FAIL);
+    return(NULL);
   }
 
-  e = exchange_find(name);
+  vt = exchange_vt_snapshot(exchange_find(name));
 
-  if(e == NULL || e->vt == NULL)
-  {
+  if(vt == NULL)
     snprintf(errbuf, errbuf_sz, "%s: not registered", name);
-    return(FAIL);
-  }
 
-  *out_e = e;
-  return(SUCCESS);
+  return(vt);
 }
 
-// Resolve `name` and check `is_authenticated`. Writes a human-readable
-// error into `errbuf` on FAIL. Caller uses `errbuf` when firing the
-// synthetic typed callback so the message reaches the consumer.
-static bool
-resolve_authed(const char *name, exchange_t **out_e,
-    char *errbuf, size_t errbuf_sz)
+// The same, plus `is_authenticated`. Caller uses `errbuf` when firing
+// the synthetic typed callback so the message reaches the consumer.
+static const exchange_protocol_vtable_t *
+resolve_authed(const char *name, char *errbuf, size_t errbuf_sz)
 {
-  exchange_t *e;
+  const exchange_protocol_vtable_t *vt;
 
-  if(name == NULL || name[0] == '\0')
-  {
-    snprintf(errbuf, errbuf_sz, "exchange name required");
-    return(FAIL);
-  }
+  vt = resolve_exchange(name, errbuf, errbuf_sz);
 
-  e = exchange_find(name);
+  if(vt == NULL)
+    return(NULL);
 
-  if(e == NULL || e->vt == NULL)
-  {
-    snprintf(errbuf, errbuf_sz, "%s: not registered", name);
-    return(FAIL);
-  }
-
-  if(e->vt->is_authenticated == NULL || !e->vt->is_authenticated())
+  if(vt->is_authenticated == NULL || !vt->is_authenticated())
   {
     snprintf(errbuf, errbuf_sz, "%s: api keys not configured", name);
-    return(FAIL);
+    return(NULL);
   }
 
-  *out_e = e;
-  return(SUCCESS);
+  return(vt);
 }
 
 // ------------------------------------------------------------------ //
@@ -174,8 +161,9 @@ resolve_authed(const char *name, exchange_t **out_e,
 bool
 exchange_get_capabilities(const char *name, exchange_capabilities_t *out)
 {
-  exchange_t *e;
-  size_t      nlen;
+  const exchange_protocol_vtable_t *vt;
+  exchange_t                       *e;
+  size_t                            nlen;
 
   if(out == NULL)
     return(FAIL);
@@ -185,11 +173,14 @@ exchange_get_capabilities(const char *name, exchange_capabilities_t *out)
   if(name == NULL || name[0] == '\0')
     return(FAIL);
 
-  e = exchange_find(name);
+  e  = exchange_find(name);
+  vt = exchange_vt_snapshot(e);
 
-  if(e == NULL || e->vt == NULL)
+  if(vt == NULL)
     return(FAIL);
 
+  // `name` is written before the entry is published and never again, so
+  // the registry lock exchange_find took is all it needs.
   nlen = strnlen(e->name, sizeof(e->name));
 
   if(nlen >= sizeof(out->name))
@@ -197,10 +188,10 @@ exchange_get_capabilities(const char *name, exchange_capabilities_t *out)
 
   memcpy(out->name, e->name, nlen);
   out->name[nlen]       = '\0';
-  out->has_credentials  = e->vt->is_authenticated != NULL
-                       && e->vt->is_authenticated();
-  out->advertised_rps   = e->vt->advertised_rps;
-  out->advertised_burst = e->vt->advertised_burst;
+  out->has_credentials  = vt->is_authenticated != NULL
+                       && vt->is_authenticated();
+  out->advertised_rps   = vt->advertised_rps;
+  out->advertised_burst = vt->advertised_burst;
   return(SUCCESS);
 }
 
@@ -266,19 +257,21 @@ exchange_place_order_async(const char *name,
     const exchange_place_order_req_t *req,
     exchange_done_order_cb_t cb, void *user)
 {
-  exchange_t *e   = NULL;
-  char        err[EXCHANGE_ERR_SZ];
+  const exchange_protocol_vtable_t *vt;
+  char                              err[EXCHANGE_ERR_SZ];
 
   if(req == NULL || cb == NULL)
     return(ASYNC_FAILED_UNDELIVERED);
 
-  if(resolve_authed(name, &e, err, sizeof(err)) != SUCCESS)
+  vt = resolve_authed(name, err, sizeof(err));
+
+  if(vt == NULL)
   {
     fail_order_cb(cb, user, err);
     return(ASYNC_FAILED_DELIVERED);
   }
 
-  if(e->vt->place_order_async == NULL)
+  if(vt->place_order_async == NULL)
   {
     snprintf(err, sizeof(err),
         "%s: place_order not supported", name);
@@ -286,15 +279,15 @@ exchange_place_order_async(const char *name,
     return(ASYNC_FAILED_DELIVERED);
   }
 
-  return(e->vt->place_order_async(req, cb, user));
+  return(vt->place_order_async(req, cb, user));
 }
 
 async_rc_t
 exchange_cancel_order_async(const char *name, const char *order_id,
     exchange_done_order_cb_t cb, void *user)
 {
-  exchange_t *e = NULL;
-  char        err[EXCHANGE_ERR_SZ];
+  const exchange_protocol_vtable_t *vt;
+  char                              err[EXCHANGE_ERR_SZ];
 
   if(cb == NULL)
     return(ASYNC_FAILED_UNDELIVERED);
@@ -305,13 +298,15 @@ exchange_cancel_order_async(const char *name, const char *order_id,
     return(ASYNC_FAILED_DELIVERED);
   }
 
-  if(resolve_authed(name, &e, err, sizeof(err)) != SUCCESS)
+  vt = resolve_authed(name, err, sizeof(err));
+
+  if(vt == NULL)
   {
     fail_order_cb(cb, user, err);
     return(ASYNC_FAILED_DELIVERED);
   }
 
-  if(e->vt->cancel_order_async == NULL)
+  if(vt->cancel_order_async == NULL)
   {
     snprintf(err, sizeof(err),
         "%s: cancel_order not supported", name);
@@ -319,15 +314,15 @@ exchange_cancel_order_async(const char *name, const char *order_id,
     return(ASYNC_FAILED_DELIVERED);
   }
 
-  return(e->vt->cancel_order_async(order_id, cb, user));
+  return(vt->cancel_order_async(order_id, cb, user));
 }
 
 async_rc_t
 exchange_get_order_async(const char *name, const char *order_id,
     exchange_done_order_cb_t cb, void *user)
 {
-  exchange_t *e = NULL;
-  char        err[EXCHANGE_ERR_SZ];
+  const exchange_protocol_vtable_t *vt;
+  char                              err[EXCHANGE_ERR_SZ];
 
   if(cb == NULL)
     return(ASYNC_FAILED_UNDELIVERED);
@@ -338,13 +333,15 @@ exchange_get_order_async(const char *name, const char *order_id,
     return(ASYNC_FAILED_DELIVERED);
   }
 
-  if(resolve_authed(name, &e, err, sizeof(err)) != SUCCESS)
+  vt = resolve_authed(name, err, sizeof(err));
+
+  if(vt == NULL)
   {
     fail_order_cb(cb, user, err);
     return(ASYNC_FAILED_DELIVERED);
   }
 
-  if(e->vt->get_order_async == NULL)
+  if(vt->get_order_async == NULL)
   {
     snprintf(err, sizeof(err),
         "%s: get_order not supported", name);
@@ -352,7 +349,7 @@ exchange_get_order_async(const char *name, const char *order_id,
     return(ASYNC_FAILED_DELIVERED);
   }
 
-  return(e->vt->get_order_async(order_id, cb, user));
+  return(vt->get_order_async(order_id, cb, user));
 }
 
 async_rc_t
@@ -360,19 +357,21 @@ exchange_list_orders_async(const char *name, const char *status,
     const char *product_id,
     exchange_done_orders_cb_t cb, void *user)
 {
-  exchange_t *e = NULL;
-  char        err[EXCHANGE_ERR_SZ];
+  const exchange_protocol_vtable_t *vt;
+  char                              err[EXCHANGE_ERR_SZ];
 
   if(cb == NULL)
     return(ASYNC_FAILED_UNDELIVERED);
 
-  if(resolve_authed(name, &e, err, sizeof(err)) != SUCCESS)
+  vt = resolve_authed(name, err, sizeof(err));
+
+  if(vt == NULL)
   {
     fail_orders_cb(cb, user, err);
     return(ASYNC_FAILED_DELIVERED);
   }
 
-  if(e->vt->list_orders_async == NULL)
+  if(vt->list_orders_async == NULL)
   {
     snprintf(err, sizeof(err),
         "%s: list_orders not supported", name);
@@ -380,7 +379,7 @@ exchange_list_orders_async(const char *name, const char *status,
     return(ASYNC_FAILED_DELIVERED);
   }
 
-  return(e->vt->list_orders_async(status, product_id, cb, user));
+  return(vt->list_orders_async(status, product_id, cb, user));
 }
 
 async_rc_t
@@ -388,19 +387,21 @@ exchange_list_fills_async(const char *name, const char *order_id,
     const char *product_id, int64_t start_ms,
     exchange_done_fills_cb_t cb, void *user)
 {
-  exchange_t *e = NULL;
-  char        err[EXCHANGE_ERR_SZ];
+  const exchange_protocol_vtable_t *vt;
+  char                              err[EXCHANGE_ERR_SZ];
 
   if(cb == NULL)
     return(ASYNC_FAILED_UNDELIVERED);
 
-  if(resolve_authed(name, &e, err, sizeof(err)) != SUCCESS)
+  vt = resolve_authed(name, err, sizeof(err));
+
+  if(vt == NULL)
   {
     fail_fills_cb(cb, user, err);
     return(ASYNC_FAILED_DELIVERED);
   }
 
-  if(e->vt->list_fills_async == NULL)
+  if(vt->list_fills_async == NULL)
   {
     snprintf(err, sizeof(err),
         "%s: list_fills not supported", name);
@@ -408,7 +409,7 @@ exchange_list_fills_async(const char *name, const char *order_id,
     return(ASYNC_FAILED_DELIVERED);
   }
 
-  return(e->vt->list_fills_async(order_id, product_id, start_ms,
+  return(vt->list_fills_async(order_id, product_id, start_ms,
         cb, user));
 }
 
@@ -416,19 +417,21 @@ async_rc_t
 exchange_get_accounts_async(const char *name,
     exchange_done_accounts_cb_t cb, void *user)
 {
-  exchange_t *e = NULL;
-  char        err[EXCHANGE_ERR_SZ];
+  const exchange_protocol_vtable_t *vt;
+  char                              err[EXCHANGE_ERR_SZ];
 
   if(cb == NULL)
     return(ASYNC_FAILED_UNDELIVERED);
 
-  if(resolve_authed(name, &e, err, sizeof(err)) != SUCCESS)
+  vt = resolve_authed(name, err, sizeof(err));
+
+  if(vt == NULL)
   {
     fail_accounts_cb(cb, user, err);
     return(ASYNC_FAILED_DELIVERED);
   }
 
-  if(e->vt->get_accounts_async == NULL)
+  if(vt->get_accounts_async == NULL)
   {
     snprintf(err, sizeof(err),
         "%s: get_accounts not supported", name);
@@ -436,7 +439,7 @@ exchange_get_accounts_async(const char *name,
     return(ASYNC_FAILED_DELIVERED);
   }
 
-  return(e->vt->get_accounts_async(cb, user));
+  return(vt->get_accounts_async(cb, user));
 }
 
 // ------------------------------------------------------------------ //
@@ -448,8 +451,8 @@ exchange_fetch_candles_async(const char *name, const char *product_id,
     exchange_granularity_t gran, int64_t since_ms, int64_t until_ms,
     exchange_done_candles_cb_t cb, void *user)
 {
-  exchange_t *e = NULL;
-  char        err[EXCHANGE_ERR_SZ];
+  const exchange_protocol_vtable_t *vt;
+  char                              err[EXCHANGE_ERR_SZ];
 
   if(cb == NULL)
     return(ASYNC_FAILED_UNDELIVERED);
@@ -460,13 +463,15 @@ exchange_fetch_candles_async(const char *name, const char *product_id,
     return(ASYNC_FAILED_DELIVERED);
   }
 
-  if(resolve_exchange(name, &e, err, sizeof(err)) != SUCCESS)
+  vt = resolve_exchange(name, err, sizeof(err));
+
+  if(vt == NULL)
   {
     fail_candles_cb(cb, user, err);
     return(ASYNC_FAILED_DELIVERED);
   }
 
-  if(e->vt->fetch_candles_async == NULL)
+  if(vt->fetch_candles_async == NULL)
   {
     snprintf(err, sizeof(err),
         "%s: fetch_candles not supported", name);
@@ -474,7 +479,7 @@ exchange_fetch_candles_async(const char *name, const char *product_id,
     return(ASYNC_FAILED_DELIVERED);
   }
 
-  return(e->vt->fetch_candles_async(product_id, gran, since_ms, until_ms,
+  return(vt->fetch_candles_async(product_id, gran, since_ms, until_ms,
         cb, user));
 }
 
@@ -486,19 +491,21 @@ async_rc_t
 exchange_fetch_all_tickers_async(const char *name,
     exchange_done_tickers_cb_t cb, void *user)
 {
-  exchange_t *e = NULL;
-  char        err[EXCHANGE_ERR_SZ];
+  const exchange_protocol_vtable_t *vt;
+  char                              err[EXCHANGE_ERR_SZ];
 
   if(cb == NULL)
     return(ASYNC_FAILED_UNDELIVERED);
 
-  if(resolve_exchange(name, &e, err, sizeof(err)) != SUCCESS)
+  vt = resolve_exchange(name, err, sizeof(err));
+
+  if(vt == NULL)
   {
     fail_tickers_cb(cb, user, err);
     return(ASYNC_FAILED_DELIVERED);
   }
 
-  if(e->vt->fetch_all_tickers == NULL)
+  if(vt->fetch_all_tickers == NULL)
   {
     snprintf(err, sizeof(err),
         "%s: fetch_all_tickers not supported", name);
@@ -506,7 +513,7 @@ exchange_fetch_all_tickers_async(const char *name,
     return(ASYNC_FAILED_DELIVERED);
   }
 
-  return(e->vt->fetch_all_tickers(cb, user));
+  return(vt->fetch_all_tickers(cb, user));
 }
 
 // ------------------------------------------------------------------ //
@@ -525,11 +532,11 @@ exchange_ws_subscribe(const char *name,
     exchange_ws_event_cb_t cb, void *user,
     exchange_ws_sub_t **out_handle)
 {
-  exchange_ws_sub_t *sub;
-  exchange_t        *e          = NULL;
-  void              *driver_sub = NULL;
-  uint64_t           gen;
-  char               err[EXCHANGE_ERR_SZ];
+  const exchange_protocol_vtable_t *vt;
+  exchange_ws_sub_t                *sub;
+  exchange_t                       *e;
+  void                             *driver_sub = NULL;
+  uint64_t                          gen;
 
   if(out_handle != NULL)
     *out_handle = NULL;
@@ -538,27 +545,43 @@ exchange_ws_subscribe(const char *name,
      n_channels == 0)
     return(FAIL);
 
-  if(resolve_exchange(name, &e, err, sizeof(err)) != SUCCESS)
+  e = exchange_find(name);
+
+  if(e == NULL)
   {
-    clam(CLAM_INFO, "exchange", "ws_subscribe FAIL: %s", err);
+    clam(CLAM_INFO, "exchange",
+        "ws_subscribe FAIL: %s: not registered",
+        (name != NULL) ? name : "?");
     return(FAIL);
   }
 
-  if(e->vt->ws_subscribe == NULL)
+  // One hold for both fields — this is the only caller that needs the
+  // vtable and the generation to describe the same registration, and it
+  // is why it resolves by hand rather than through resolve_exchange.
+  // Reading the generation BEFORE the driver call is the older half of
+  // the rule (OBS-19): an unregister landing after this leaves the stamp
+  // one behind, so the handle is born dead — the driver's own deinit
+  // frees the node, and the wrapper drops.
+  pthread_mutex_lock(&e->lock);
+  vt  = e->vt;
+  gen = e->ws_gen;
+  pthread_mutex_unlock(&e->lock);
+
+  if(vt == NULL)
+  {
+    clam(CLAM_INFO, "exchange", "ws_subscribe FAIL: %s: not registered",
+        name);
+    return(FAIL);
+  }
+
+  if(vt->ws_subscribe == NULL)
   {
     clam(CLAM_INFO, "exchange",
         "ws_subscribe FAIL: %s: ws_subscribe not supported", name);
     return(FAIL);
   }
 
-  // Read the generation BEFORE the driver call. An unregister landing in
-  // between leaves the stamp one behind, so the handle is born dead —
-  // the driver's own deinit frees the node, and the wrapper drops.
-  pthread_mutex_lock(&e->lock);
-  gen = e->ws_gen;
-  pthread_mutex_unlock(&e->lock);
-
-  if(e->vt->ws_subscribe(channels, n_channels, product_ids, n_products,
+  if(vt->ws_subscribe(channels, n_channels, product_ids, n_products,
         cb, user, &driver_sub) != SUCCESS || driver_sub == NULL)
     return(FAIL);
 

@@ -188,6 +188,22 @@ void          exchange_registry_init(void);
 void          exchange_registry_destroy(void);
 exchange_t   *exchange_find(const char *name);
 
+// Read `e`'s protocol vtable under `e->lock`. NULL means the entry is a
+// tombstone — `dead` is set exactly when `vt` is cleared, and both are
+// written together under that lock, so the pointer answers both
+// questions. A NULL caller resolves to NULL.
+//
+// OBS-24: every dispatch path takes its pointer from here and calls
+// through the value it was handed, never through `e->vt`.
+// exchange_unregister NULLs that field from the unloading plugin's
+// thread, so testing it and calling through it are two reads with a
+// write between them — the daemon dies on a NULL vtable call, on a
+// stderr that is /dev/null. A snapshot cannot become NULL after the
+// test. What no lock here can cover is an unload completing while a
+// driver call is executing; that residue belongs to core's quiesce
+// barrier and plugin_unmap_notify.
+const exchange_protocol_vtable_t *exchange_vt_snapshot(exchange_t *e);
+
 // Append-or-update used by exchange_register. Returns FAIL on dup.
 bool          exchange_registry_add(const char *name,
                   const exchange_protocol_vtable_t *vt);

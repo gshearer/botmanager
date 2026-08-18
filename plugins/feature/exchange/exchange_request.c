@@ -99,17 +99,24 @@ exchange_req_new(exchange_t *exch, uint8_t prio,
 void
 exchange_req_free(exchange_req_t *r)
 {
+  const exchange_protocol_vtable_t *vt;
+
   if(r == NULL)
     return;
 
   // The protocol handle's lifetime is tied to the abstraction; it is
   // the protocol plugin's job to keep it alive across submit() until
   // free_request() runs. Releasing it here is the abstraction's last
-  // step before freeing the request itself.
-  if(r->proto_handle != NULL && r->exch != NULL && r->exch->vt != NULL
-      && r->exch->vt->free_request != NULL)
+  // step before freeing the request itself. A tombstoned registration
+  // has no free_request to call — the driver's own deinit took the
+  // handle with it.
+  if(r->proto_handle != NULL)
   {
-    r->exch->vt->free_request(r->proto_handle);
+    vt = exchange_vt_snapshot(r->exch);
+
+    if(vt != NULL && vt->free_request != NULL)
+      vt->free_request(r->proto_handle);
+
     r->proto_handle = NULL;
   }
 
@@ -254,9 +261,6 @@ exchange_pump_cb(task_t *t)
   exch->pump_handle = TASK_HANDLE_NONE;
   pthread_mutex_unlock(&exch->lock);
 
-  if(exch->dead)
-    return;
-
   exchange_dispatch(exch);
 }
 
@@ -296,24 +300,36 @@ exchange_arm_pump_locked(exchange_t *exch)
 static void
 exchange_retry_task_cb(task_t *t)
 {
-  exchange_req_t *r = t->data;
+  exchange_req_t *r      = t->data;
+  bool            queued = false;
 
   t->state = TASK_ENDED;
 
   if(r == NULL)
     return;
 
-  if(r->exch == NULL || r->exch->dead)
+  // Re-enqueue at the same priority. The scheduled retry already paid
+  // its delay; on re-dispatch we'll fetch a fresh token. The liveness
+  // test shares the push's hold: exchange_unregister drains the queue
+  // under this lock, so a request pushed after that drain would sit on
+  // a tombstone and its caller would never hear back.
+  if(r->exch != NULL)
+  {
+    pthread_mutex_lock(&r->exch->lock);
+
+    queued = (r->exch->vt != NULL);
+
+    if(queued)
+      exchange_q_push_locked(r->exch, r);
+
+    pthread_mutex_unlock(&r->exch->lock);
+  }
+
+  if(!queued)
   {
     exchange_req_fail(r, 0, "exchange unregistered during retry");
     return;
   }
-
-  // Re-enqueue at the same priority. The scheduled retry already paid
-  // its delay; on re-dispatch we'll fetch a fresh token.
-  pthread_mutex_lock(&r->exch->lock);
-  exchange_q_push_locked(r->exch, r);
-  pthread_mutex_unlock(&r->exch->lock);
 
   exchange_dispatch(r->exch);
 }
@@ -321,8 +337,9 @@ exchange_retry_task_cb(task_t *t)
 static void
 exchange_arm_retry(exchange_req_t *r)
 {
-  uint32_t      delay_ms;
-  task_handle_t h;
+  const exchange_protocol_vtable_t *vt;
+  uint32_t                          delay_ms;
+  task_handle_t                     h;
 
   r->attempts++;
 
@@ -337,10 +354,13 @@ exchange_arm_retry(exchange_req_t *r)
   // Free the protocol handle from the prior attempt; the next attempt
   // will rebuild it via vtable.build_request. This is the only spot
   // where we keep the request alive and drop the handle.
-  if(r->proto_handle != NULL && r->exch != NULL && r->exch->vt != NULL
-      && r->exch->vt->free_request != NULL)
+  if(r->proto_handle != NULL)
   {
-    r->exch->vt->free_request(r->proto_handle);
+    vt = exchange_vt_snapshot(r->exch);
+
+    if(vt != NULL && vt->free_request != NULL)
+      vt->free_request(r->proto_handle);
+
     r->proto_handle = NULL;
   }
 
@@ -478,21 +498,28 @@ exchange_internal_response_cb(int http_status, const char *body,
 void
 exchange_dispatch(exchange_t *exch)
 {
-  exchange_req_t *r;
-  bool            built;
-  bool            submitted;
+  const exchange_protocol_vtable_t *vt;
+  exchange_req_t                   *r;
+  bool                              built;
+  bool                              submitted;
 
-  if(exch == NULL || exch->dead)
+  if(exch == NULL)
     return;
 
+  // One hold for the vtable snapshot and the pop it will serve, so the
+  // request and the driver it is about to reach come from the same
+  // registration. A tombstone (vt == NULL) has already had its queue
+  // drained by exchange_unregister: nothing to pop, nothing to pump.
   pthread_mutex_lock(&exch->lock);
-  r = exchange_q_pop_eligible_locked(exch);
+
+  vt = exch->vt;
+  r  = (vt != NULL) ? exchange_q_pop_eligible_locked(exch) : NULL;
 
   // Pop returned NULL with a non-empty queue: tokens are dry, no
   // request could be promoted. Arm the stall pump so we re-enter
   // dispatch once the bucket has had time to refill — see the long
   // comment above exchange_pump_cb. Cheap when armed; idempotent.
-  if(r == NULL && exch->q_count > 0)
+  if(r == NULL && vt != NULL && exch->q_count > 0)
     exchange_arm_pump_locked(exch);
 
   pthread_mutex_unlock(&exch->lock);
@@ -500,9 +527,9 @@ exchange_dispatch(exchange_t *exch)
   if(r == NULL)
     return;
 
-  // Off-lock vtable calls — protocol plugin owns its own threading.
-  if(exch->vt == NULL || exch->vt->build_request == NULL
-      || exch->vt->submit == NULL)
+  // Off-lock vtable calls, through the snapshot — protocol plugin owns
+  // its own threading.
+  if(vt->build_request == NULL || vt->submit == NULL)
   {
     exchange_req_fail(r, 0, "exchange protocol vtable invalid");
 
@@ -517,7 +544,7 @@ exchange_dispatch(exchange_t *exch)
     return;
   }
 
-  built = exch->vt->build_request(r->kind, r->path, r->body,
+  built = vt->build_request(r->kind, r->path, r->body,
       &r->proto_handle);
 
   if(built != SUCCESS || r->proto_handle == NULL)
@@ -534,7 +561,7 @@ exchange_dispatch(exchange_t *exch)
     return;
   }
 
-  submitted = exch->vt->submit(r->proto_handle, r->prio,
+  submitted = vt->submit(r->proto_handle, r->prio,
       exchange_internal_response_cb, r);
 
   if(submitted != SUCCESS)
@@ -575,6 +602,7 @@ exchange_request(const char *exchange, uint8_t prio,
 {
   exchange_t     *exch;
   exchange_req_t *r;
+  bool            queued;
 
   if(cb == NULL || path == NULL || path[0] == '\0')
     return(FAIL);
@@ -589,17 +617,30 @@ exchange_request(const char *exchange, uint8_t prio,
     return(FAIL);
   }
 
-  if(exch->dead)
-    return(FAIL);
-
   r = exchange_req_new(exch, prio, kind, path, body_json, cb, user);
 
   if(r == NULL)
     return(FAIL);
 
+  // The tombstone test shares the push's hold, for the reason
+  // exchange_retry_task_cb states: exchange_unregister drains this queue
+  // under this lock, and a request pushed after the drain is never
+  // completed. FAIL here means the callback did not fire and never will,
+  // which is this entry point's documented contract.
   pthread_mutex_lock(&exch->lock);
-  exchange_q_push_locked(exch, r);
+
+  queued = (exch->vt != NULL);
+
+  if(queued)
+    exchange_q_push_locked(exch, r);
+
   pthread_mutex_unlock(&exch->lock);
+
+  if(!queued)
+  {
+    exchange_req_free(r);
+    return(FAIL);
+  }
 
   exchange_dispatch(exch);
   return(SUCCESS);

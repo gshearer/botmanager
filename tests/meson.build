@@ -384,6 +384,26 @@ test_shutdown_reason = executable('test_shutdown_reason',
   dependencies : core_deps,
 )
 
+# A capability shim is told the vtable is present and then dereferences
+# it again to reach the hook, both times unlocked, while the unloading
+# plugin's deinit NULLs that field under the exchange lock. `/plugin
+# reload kraken` cycles no dependent, so whenmoon dispatches straight
+# through the window and the daemon dies on a stderr that is /dev/null.
+# These cases race a dispatch pair against a registration cycle: SEGV
+# pre-fix on a plain build, a reported read/write pair under TSan.
+test_exchange_vt_race = executable('test_exchange_vt_race',
+  'test_exchange_vt_race.c',
+  '../plugins/feature/exchange/exchange_caps.c',
+  '../plugins/feature/exchange/exchange_registry.c',
+  '../plugins/feature/exchange/exchange_request.c',
+  '../plugins/feature/exchange/exchange_retry.c',
+  '../plugins/feature/exchange/exchange_limiter.c',
+  include_directories : [include_directories('.'), inc_include,
+                         include_directories('../plugins/feature/exchange')],
+  link_with : [test_harness, libcore],
+  dependencies : core_deps,
+)
+
 test('util', test_util)
 test('colors', test_colors)
 test('display', test_display)
@@ -409,6 +429,7 @@ test('gemini_ws_channels', test_gemini_ws_channels)
 test('coinbase_ws_channels', test_coinbase_ws_channels)
 test('exchange_ws_gen', test_exchange_ws_gen)
 test('exchange_watch', test_exchange_watch)
+test('exchange_vt_race', test_exchange_vt_race)
 test('method_stats', test_method_stats)
 test('botmanctl_route', test_botmanctl_route)
 test('shutdown_reason', test_shutdown_reason)

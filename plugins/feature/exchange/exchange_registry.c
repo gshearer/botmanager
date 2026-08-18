@@ -117,6 +117,21 @@ exchange_find(const char *name)
   return(found);
 }
 
+const exchange_protocol_vtable_t *
+exchange_vt_snapshot(exchange_t *e)
+{
+  const exchange_protocol_vtable_t *vt;
+
+  if(e == NULL)
+    return(NULL);
+
+  pthread_mutex_lock(&e->lock);
+  vt = e->vt;
+  pthread_mutex_unlock(&e->lock);
+
+  return(vt);
+}
+
 bool
 exchange_registry_add(const char *name,
     const exchange_protocol_vtable_t *vt)
