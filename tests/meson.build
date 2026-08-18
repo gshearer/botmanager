@@ -152,6 +152,18 @@ test_knowledge_dedup = executable('test_knowledge_dedup',
 # silent failure is a key too long to compose reading as the shorter key
 # it truncates onto, so this suite drives kv.c's own table through the
 # public accessors — kv_init() is DB-free, and nothing here flushes.
+# `set bot` decides which real KV key a write lands on, and that pick has
+# been wrong twice (OBS-54). A wrong form is a silent write to an
+# adjacent registered knob, so the parse is a pure function and this is
+# its table. No bot subsystem, no KV store, no daemon.
+test_set_bot = executable('test_set_bot',
+  'test_set_bot.c',
+  include_directories : [include_directories('.'), inc_include,
+                         include_directories('../core')],
+  link_with : [test_harness, libcore],
+  dependencies : core_deps,
+)
+
 test_kv_bot = executable('test_kv_bot',
   'test_kv_bot.c',
   include_directories : [include_directories('.'), inc_include],
@@ -359,6 +371,7 @@ test('warm_chain', test_warm_chain)
 test('fact_merge', test_fact_merge)
 test('knowledge_dedup', test_knowledge_dedup)
 test('kv_bot', test_kv_bot)
+test('set_bot', test_set_bot)
 test('kv_str', test_kv_str)
 test('kv_default', test_kv_default)
 test('kv_reset', test_kv_reset)

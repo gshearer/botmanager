@@ -1,6 +1,9 @@
 // botmanager — MIT
 // /set subcommands (registered as children of the /set parent).
 
+#define CMD_SET_INTERNAL
+#include "cmd_set.h"
+
 #include "common.h"
 #include "bot.h"
 #include "cmd.h"
@@ -66,13 +69,6 @@ static const cmd_arg_desc_t ad_set_kv[] = {
 // and arrives in the key position rather than being rejected. The flag
 // test is therefore positional and explicit — argv[0], nowhere else —
 // never a fallthrough from a lookup that failed.
-
-typedef enum
-{
-  SET_KV_ASSIGN = 0,   // set kv <key> <value>
-  SET_KV_CLEAR,        // set kv --clear <key>
-  SET_KV_DELETE,       // set kv --delete <key>
-} set_kv_verb_t;
 
 static const char set_kv_usage[] =
     "usage: set kv <key> <value> | set kv --clear <key> "
@@ -175,17 +171,17 @@ cmd_set_kv(const cmd_ctx_t *ctx)
 {
   const char   *first = ctx->parsed->argv[0];
   const char   *rest  = ctx->parsed->argc > 1 ? ctx->parsed->argv[1] : NULL;
-  set_kv_verb_t verb  = SET_KV_ASSIGN;
+  set_verb_t    verb  = SET_VERB_ASSIGN;
   const char   *key;
 
   if(strcmp(first, "--clear") == 0)
-    verb = SET_KV_CLEAR;
+    verb = SET_VERB_CLEAR;
   else if(strcmp(first, "--delete") == 0)
-    verb = SET_KV_DELETE;
+    verb = SET_VERB_DELETE;
 
-  key = (verb == SET_KV_ASSIGN) ? first : rest;
+  key = (verb == SET_VERB_ASSIGN) ? first : rest;
 
-  if(key == NULL || (verb == SET_KV_ASSIGN && rest == NULL))
+  if(key == NULL || (verb == SET_VERB_ASSIGN && rest == NULL))
   {
     cmd_reply(ctx, set_kv_usage);
     return;
@@ -194,7 +190,7 @@ cmd_set_kv(const cmd_ctx_t *ctx)
   // Only argv[0] carries the descriptor's validator, and on a flag the
   // key is argv[1] — which is REST, so it can hold whitespace and
   // anything else the operator typed.
-  if(verb != SET_KV_ASSIGN && !validate_kv_key(key))
+  if(verb != SET_VERB_ASSIGN && !validate_kv_key(key))
   {
     char buf[KV_KEY_SZ + 32];
 
@@ -203,13 +199,13 @@ cmd_set_kv(const cmd_ctx_t *ctx)
     return;
   }
 
-  if(verb == SET_KV_CLEAR)
+  if(verb == SET_VERB_CLEAR)
   {
     set_kv_clear(ctx, key);
     return;
   }
 
-  if(verb == SET_KV_DELETE)
+  if(verb == SET_VERB_DELETE)
   {
     set_kv_delete(ctx, key);
     return;
@@ -254,130 +250,290 @@ cmd_set_kv(const cmd_ctx_t *ctx)
 // while every real per-method knob had to be written through raw
 // `set kv bot.<n>.<method>.<key>`. Method kinds ("irc", "reachy") don't
 // collide with KV key segments, so this stays unambiguous in practice.
+//
+// That is the SECOND time this disambiguation has been wrong, and OBS-54
+// is the third. It also asked "does a value follow the second token?",
+// which is not a question about the form at all: with the value absent,
+// `set bot karan reachy attention.mode` picked the three-arg form and
+// addressed bot.karan.reachy — a different, adjacent key — rather than
+// saying the value was missing. Nothing here reads a value to decide a
+// form any more; the token count and the method lookup decide it, and a
+// missing value is reported as one.
+
+static const char set_bot_usage[] =
+    "usage: set bot <bot> [<kind>] <key> <value> | "
+    "set bot <bot> --clear|--delete [<kind>] <key>";
 
 static const cmd_arg_desc_t ad_set_bot[] = {
   { "bot",  CMD_ARG_ALNUM, CMD_ARG_REQUIRED,                BOT_NAME_SZ, NULL },
   { "rest", CMD_ARG_NONE,  CMD_ARG_REQUIRED | CMD_ARG_REST, 0,           NULL },
 };
 
+// One whitespace-delimited token. Advances *p past the token and the
+// whitespace behind it, and answers the token's length — 0 at the end of
+// the blob, where *tok is left on the terminator.
+static size_t
+set_token(const char **p, const char **tok)
+{
+  const char *s = *p;
+  size_t      len;
+
+  *tok = s;
+
+  while(*s != '\0' && *s != ' ' && *s != '\t')
+    s++;
+
+  len = (size_t)(s - *tok);
+
+  while(*s == ' ' || *s == '\t')
+    s++;
+
+  *p = s;
+
+  return(len);
+}
+
+static set_verb_t
+set_verb_of(const char *tok, size_t len)
+{
+  if(len == 7 && memcmp(tok, "--clear", 7) == 0)
+    return(SET_VERB_CLEAR);
+
+  if(len == 8 && memcmp(tok, "--delete", 8) == 0)
+    return(SET_VERB_DELETE);
+
+  return(SET_VERB_ASSIGN);
+}
+
+// A three-arg key carries a '.' or a '_'; a bare word in that position
+// followed by two more tokens is almost always a method kind the bot has
+// not bound, and saying so beats writing bot.<bot>.<typo>.
+static bool
+set_looks_like_key(const char *tok, size_t len)
+{
+  size_t i;
+
+  for(i = 0; i < len; i++)
+    if(tok[i] == '.' || tok[i] == '_')
+      return(true);
+
+  return(false);
+}
+
+set_bot_rc_t
+set_bot_parse(const char *botname, const char *rest,
+    set_bot_has_kind_fn has_kind, const bot_inst_t *bot,
+    set_bot_parse_t *out)
+{
+  const char *a1;
+  size_t      a1_len;
+  const char *a2;
+  size_t      a2_len;
+  const char *tail;
+  const char *kind       = NULL;
+  size_t      kind_len   = 0;
+  const char *suffix     = NULL;
+  size_t      suffix_len = 0;
+  char        cand[PLUGIN_NAME_SZ];
+  bool        four       = false;
+  int         n;
+
+  out->verb    = SET_VERB_ASSIGN;
+  out->value   = NULL;
+  out->key[0]  = '\0';
+  out->kind[0] = '\0';
+
+  while(*rest == ' ' || *rest == '\t')
+    rest++;
+
+  a1_len = set_token(&rest, &a1);
+
+  if(a1_len == 0)
+    return(SET_BOT_USAGE);
+
+  // A flag is recognised in this position and nowhere else, which is the
+  // rule `set kv` already keeps (OBS-50): validate_kv_key accepts '-', so
+  // a flag-shaped token is a legal key AND a legal value, and only where
+  // it sits can tell them apart. Everything past this point is data,
+  // "--clear" included.
+  out->verb = set_verb_of(a1, a1_len);
+
+  if(out->verb != SET_VERB_ASSIGN)
+  {
+    a1_len = set_token(&rest, &a1);
+
+    if(a1_len == 0)
+      return(SET_BOT_USAGE);
+  }
+
+  a2_len = set_token(&rest, &a2);
+  tail   = rest;
+
+  // The form question is "is there a second token, and does the first
+  // name a method this bot has bound?" — never "is there a value?".
+  if(a2_len > 0)
+  {
+    snprintf(cand, sizeof(cand), "%.*s", (int)a1_len, a1);
+    four = has_kind(bot, cand);
+  }
+
+  if(out->verb == SET_VERB_ASSIGN)
+  {
+    if(a2_len == 0)
+      return(SET_BOT_USAGE);
+
+    if(four)
+    {
+      // <kind> <key> and nothing else: the value is missing, and this is
+      // the case OBS-54 answered by silently addressing another key.
+      if(*tail == '\0')
+        return(SET_BOT_USAGE);
+
+      kind       = a1;
+      kind_len   = a1_len;
+      suffix     = a2;
+      suffix_len = a2_len;
+      out->value = tail;
+    }
+
+    else
+    {
+      if(*tail != '\0' && !set_looks_like_key(a1, a1_len))
+      {
+        snprintf(out->kind, sizeof(out->kind), "%.*s", (int)a1_len, a1);
+        return(SET_BOT_NO_METHOD);
+      }
+
+      suffix     = a1;
+      suffix_len = a1_len;
+      out->value = a2;   // a2 onward, so a value may hold whitespace
+    }
+  }
+
+  // A flag form names a key and stops. Two tokens can only be
+  // <kind> <key>; anything after them is a value the verb has no use for.
+  else if(a2_len == 0)
+  {
+    suffix     = a1;
+    suffix_len = a1_len;
+  }
+
+  else if(*tail != '\0')
+    return(SET_BOT_USAGE);
+
+  else if(!four)
+  {
+    // Two tokens after a flag can only be <kind> <key>. If the first
+    // does not name a bound method, say which mistake it was: a method
+    // this bot lacks, or a value the verb has no use for.
+    if(set_looks_like_key(a1, a1_len))
+      return(SET_BOT_USAGE);
+
+    snprintf(out->kind, sizeof(out->kind), "%.*s", (int)a1_len, a1);
+    return(SET_BOT_NO_METHOD);
+  }
+
+  else
+  {
+    kind       = a1;
+    kind_len   = a1_len;
+    suffix     = a2;
+    suffix_len = a2_len;
+  }
+
+  if(kind != NULL)
+    n = snprintf(out->key, sizeof(out->key), "bot.%s.%.*s.%.*s",
+        botname, (int)kind_len, kind, (int)suffix_len, suffix);
+  else
+    n = snprintf(out->key, sizeof(out->key), "bot.%s.%.*s",
+        botname, (int)suffix_len, suffix);
+
+  // A truncated key is the one silent failure on this path: it lands on
+  // a shorter spelling that can be a real registered knob (KV_KEY_SZ's
+  // own comment records this tree paying for that once).
+  if(n < 0 || (size_t)n >= sizeof(out->key))
+    return(SET_BOT_KEY_TOO_LONG);
+
+  return(SET_BOT_OK);
+}
+
 static void
 cmd_set_bot(const cmd_ctx_t *ctx)
 {
-  const char *botname = ctx->parsed->argv[0];
-  const char *rest    = ctx->parsed->argv[1];
-  bot_inst_t *bot;
-  const char *t1;
-  size_t      t1_len;
-  const char *t2;
-  size_t      t2_len;
-  char        method[PLUGIN_NAME_SZ];
-  bool        four_form;
-  char        key[KV_KEY_SZ];
-  const char *value;
+  const char     *botname = ctx->parsed->argv[0];
+  const char     *rest    = ctx->parsed->argv[1];
+  bot_inst_t     *bot;
+  set_bot_parse_t p;
+  char            buf[KV_KEY_SZ + KV_STR_SZ + 64];
 
   bot = bot_find(botname);
+
   if(bot == NULL)
   {
-    char buf[BOT_NAME_SZ + 32];
     snprintf(buf, sizeof(buf), "no such bot: %s", botname);
     cmd_reply(ctx, buf);
     return;
   }
 
-  while(*rest == ' ' || *rest == '\t') rest++;
-  t1 = rest;
-  while(*rest != '\0' && *rest != ' ' && *rest != '\t') rest++;
-  t1_len = (size_t)(rest - t1);
-  while(*rest == ' ' || *rest == '\t') rest++;
-
-  if(t1_len == 0 || *rest == '\0')
+  switch(set_bot_parse(botname, rest, bot_has_method_kind, bot, &p))
   {
-    cmd_reply(ctx, "usage: set bot <bot> [<kind>] <key> <value>");
-    return;
-  }
+    case SET_BOT_OK:
+      break;
 
-  t2 = rest;
-  while(*rest != '\0' && *rest != ' ' && *rest != '\t') rest++;
-  t2_len = (size_t)(rest - t2);
-  while(*rest == ' ' || *rest == '\t') rest++;
+    case SET_BOT_USAGE:
+      cmd_reply(ctx, set_bot_usage);
+      return;
 
-  // If the first token names a method this bot has bound, treat as
-  // 4-arg form (bot method key value); else 3-arg form (bot key value).
-  snprintf(method, sizeof(method), "%.*s", (int)t1_len, t1);
-  four_form = (bot_has_method_kind(bot, method)
-      && t2_len > 0 && *rest != '\0');
-
-  // Reject a method-looking-but-wrong second token to catch the common
-  // mistake "set bot <name> irc ..." against a bot with no irc binding.
-  if(!four_form && t2_len > 0 && *rest != '\0')
-  {
-    // Heuristic: a 3-form key normally contains a dot. A bare alpha
-    // first token followed by another token + value almost certainly
-    // means the user typed the wrong method. Fall through to 3-form
-    // anyway, but if the bare token doesn't look like a key, error.
-    bool looks_like_key = false;
-    for(size_t i = 0; i < t1_len; i++)
-      if(t1[i] == '.' || t1[i] == '_') { looks_like_key = true; break; }
-    if(!looks_like_key)
-    {
-      char buf[BOT_NAME_SZ + PLUGIN_NAME_SZ + 32];
-      snprintf(buf, sizeof(buf), "%s has no %.*s method",
-          botname, (int)t1_len, t1);
+    case SET_BOT_NO_METHOD:
+      snprintf(buf, sizeof(buf), "%s has no %s method", botname, p.kind);
       cmd_reply(ctx, buf);
       return;
-    }
-  }
 
-  if(four_form)
-  {
-    snprintf(key, sizeof(key), "bot.%s.%.*s.%.*s",
-        botname, (int)t1_len, t1, (int)t2_len, t2);
-    value = rest;
-  }
-
-  else
-  {
-    snprintf(key, sizeof(key), "bot.%s.%.*s", botname, (int)t1_len, t1);
-    // If only one token followed (no value), error — we already
-    // checked *rest != '\0' for the four-form, so here t2 is the value.
-    if(t2_len == 0)
-    {
-      cmd_reply(ctx, "usage: set bot <bot> [<kind>] <key> <value>");
+    case SET_BOT_KEY_TOO_LONG:
+      snprintf(buf, sizeof(buf),
+          "key too long: bot.%s.%s overruns %d bytes", botname, rest,
+          (int)KV_KEY_SZ);
+      cmd_reply(ctx, buf);
       return;
-    }
-    value = t2;
   }
 
-  if(!validate_kv_key(key))
+  if(!validate_kv_key(p.key))
   {
-    char buf[KV_KEY_SZ + 32];
-    snprintf(buf, sizeof(buf), "invalid key: %s", key);
+    snprintf(buf, sizeof(buf), "invalid key: %s", p.key);
     cmd_reply(ctx, buf);
     return;
   }
 
-  if(!kv_exists(key))
+  if(!kv_exists(p.key))
   {
-    char buf[KV_KEY_SZ + 32];
-    snprintf(buf, sizeof(buf), "unknown configuration key: %s", key);
+    snprintf(buf, sizeof(buf), "unknown configuration key: %s", p.key);
     cmd_reply(ctx, buf);
     return;
   }
 
-  if(kv_set(key, value) != SUCCESS)
+  // The two flag arms are `set kv`'s, reached through a key this command
+  // composed rather than one the operator spelled out.
+  if(p.verb == SET_VERB_CLEAR)
   {
-    char buf[KV_KEY_SZ + 32];
-    snprintf(buf, sizeof(buf), "invalid value for %s", key);
+    set_kv_clear(ctx, p.key);
+    return;
+  }
+
+  if(p.verb == SET_VERB_DELETE)
+  {
+    set_kv_delete(ctx, p.key);
+    return;
+  }
+
+  if(kv_set(p.key, p.value) != SUCCESS)
+  {
+    snprintf(buf, sizeof(buf), "invalid value for %s", p.key);
     cmd_reply(ctx, buf);
     return;
   }
 
-  {
-    char buf[KV_KEY_SZ + KV_STR_SZ + 8];
-
-    snprintf(buf, sizeof(buf), "%s = %s", key, value);
-    cmd_reply(ctx, buf);
-  }
+  snprintf(buf, sizeof(buf), "%s = %s", p.key, p.value);
+  cmd_reply(ctx, buf);
   kv_flush();
 }
 
@@ -403,9 +559,11 @@ cmd_set_register(void)
       "orphan, and it unregisters, which for a live key would make the\n"
       "knob stop existing.\n"
       "\n"
-      "The flags go after `kv`, not before it. They are not available on\n"
-      "`set bot` — that command's three-arg/four-arg disambiguation keys\n"
-      "on whether a value follows, so a flag inverts it.\n"
+      "The flags go after `kv`, not before it. `set bot` takes the same\n"
+      "two, in the same position — after the bot name, ahead of the key\n"
+      "(OBS-54). A flag is recognised by where it sits and nowhere else,\n"
+      "on both commands, because validate_kv_key accepts '-' and so a\n"
+      "flag-shaped token is a legal key and a legal value alike.\n"
       "\n"
       "Examples:\n"
       "  /set kv --clear plugin.urlgrabber.crawler_agent\n"
@@ -414,13 +572,26 @@ cmd_set_register(void)
       cmd_set_kv, NULL, "set", NULL, ad_set_kv, 2, NULL, NULL);
 
   cmd_register("cmd", "bot",
-      "set bot <bot> [<method>] <key> <value>",
+      "set bot <bot> [<method>] <key> <value> | "
+      "set bot <bot> --clear|--delete [<method>] <key>",
       "Set a per-bot configuration value (sugar over /set kv)",
       "Builds the namespaced KV path for a bot. Three-arg form writes\n"
       "bot.<bot>.<key>; four-arg form writes bot.<bot>.<method>.<key>\n"
-      "and requires <method> to name a method the bot has bound.\n"
+      "and requires <method> to name a method the bot has bound. Which\n"
+      "form you get is decided by the token count and that lookup — never\n"
+      "by whether a value follows, which is what made an absent value\n"
+      "address a different real key (OBS-54).\n"
       "Refuses keys that are not registered.\n"
-      "Example: /set bot mini reachy attention.mode name",
+      "\n"
+      "--clear and --delete mean exactly what they mean on `set kv`, and\n"
+      "go after the bot name: this is the tier where an empty value is\n"
+      "most wanted, since bot.<n>.behavior.aka is why a `-` sentinel had\n"
+      "to be invented to spell one.\n"
+      "\n"
+      "Examples:\n"
+      "  /set bot mini reachy attention.mode name\n"
+      "  /set bot mini --clear behavior.aka\n"
+      "  /set bot mini --delete reachy tts_voice",
       USERNS_GROUP_ADMIN, 100, CMD_SCOPE_ANY, METHOD_T_ANY,
       cmd_set_bot, NULL, "set", NULL, ad_set_bot,
       (uint8_t)(sizeof(ad_set_bot) / sizeof(ad_set_bot[0])), NULL, NULL);
