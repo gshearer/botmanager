@@ -271,18 +271,6 @@ sub_one(const char *product)
 }
 
 // The gateway's answer for the l2 channel over one symbol.
-static void
-feed_ack(const char *native)
-{
-  char buf[256];
-  int  n;
-
-  n = snprintf(buf, sizeof(buf),
-      "{\"type\":\"subscription_ack\",\"subscriptions\":"
-      "[{\"name\":\"l2\",\"symbols\":[\"%s\"]}]}", native);
-
-  gem_ws_channels_dispatch_md(buf, (size_t)n);
-}
 
 typedef struct
 {
@@ -303,11 +291,18 @@ unsub_thread(void *arg)
 // Cases                                                               //
 // ------------------------------------------------------------------ //
 
-// g1 — the ack that outlived its consumer. The consumer leaves between
-// the subscribe frame going out and the ack landing, so its own
-// unsubscribe correctly emits nothing (the gateway does not hold it
-// yet). When the ack then lands, the slot is ACTIVE at refcount 0 and
-// nothing else in the module will ever look at it again.
+// g1 — the consumer that left right after its subscribe went out.
+//
+// ⛔ This case used to assert the OPPOSITE, and it was wrong about the
+// venue, not about the code (OBS-53). It was written around a
+// `subscription_ack` and asserted that a consumer leaving before that
+// ack emits NO unsubscribe — "the gateway does not hold it yet". But
+// wss://api.gemini.com/v2/marketdata sends no ack, ever, so "before
+// the ack" was every moment there is, and "emits none" was the defect:
+// the feed ran on to nobody until the socket dropped.
+//
+// The subscribe send is now the confirmation, so the window this case
+// was built around does not exist and the answer is one frame, at once.
 static void
 case_g1(void)
 {
@@ -322,12 +317,7 @@ case_g1(void)
 
   gem_ws_unsubscribe(h);
   test_check_sz(SUITE,
-      "g1: a consumer leaving before its ack emits no unsubscribe",
-      0, count_frames("unsubscribe", "BTCUSD"));
-
-  feed_ack("BTCUSD");
-  test_check_sz(SUITE,
-      "g1: the ack that lands on a departed consumer is unsubscribed",
+      "g1: a consumer leaving after its subscribe went out unsubscribes",
       1, count_frames("unsubscribe", "BTCUSD"));
 
   gem_ws_channels_deinit();
@@ -386,8 +376,6 @@ case_g3(void)
   ha = sub_one("BTC-USD");
   hb = sub_one("ETH-USD");
 
-  feed_ack("BTCUSD");
-  feed_ack("ETHUSD");
 
   ledger_reset();
   arm_park("unsubscribe", "BTCUSD");
@@ -433,9 +421,6 @@ case_g4(void)
   hb = sub_one("ETH-USD");
   hc = sub_one("SOL-USD");
 
-  feed_ack("BTCUSD");
-  feed_ack("ETHUSD");
-  feed_ack("SOLUSD");
 
   ledger_reset();
   arm_park("unsubscribe", "BTCUSD");
@@ -464,9 +449,13 @@ case_g4(void)
   gem_ws_channels_deinit();
 }
 
-// g5 — regression, green at HEAD and after. The fix must invent no
-// frames: an acked consumer leaving emits exactly one unsubscribe, and
-// an unacked one emits none.
+// g5 — the fix must invent no frames and skip none: a consumer that
+// leaves emits exactly one unsubscribe, whatever else happened.
+//
+// ⛔ The second half of this case also asserted the defect (OBS-53):
+// "an unacked consumer leaving emits none". At a venue that
+// acknowledges nothing, every consumer is an unacked consumer, so that
+// row asserted that no consumer is ever unsubscribed.
 static void
 case_g5(void)
 {
@@ -476,18 +465,17 @@ case_g5(void)
   ledger_reset();
 
   h = sub_one("BTC-USD");
-  feed_ack("BTCUSD");
   gem_ws_unsubscribe(h);
 
-  test_check_sz(SUITE, "g5: an acked consumer leaving emits one unsubscribe",
+  test_check_sz(SUITE, "g5: a consumer leaving emits one unsubscribe",
       1, count_frames("unsubscribe", "BTCUSD"));
 
   ledger_reset();
   h = sub_one("ETH-USD");
   gem_ws_unsubscribe(h);
 
-  test_check_sz(SUITE, "g5: an unacked consumer leaving emits none",
-      0, count_frames("unsubscribe", "ETHUSD"));
+  test_check_sz(SUITE, "g5: and the same for a second symbol",
+      1, count_frames("unsubscribe", "ETHUSD"));
 
   gem_ws_channels_deinit();
 }

@@ -167,13 +167,26 @@ typedef struct
   gem_sub_state_t  state;
   uint32_t         req_id;        // monotonic per slot; informational
 
-  // OBS-42: the gateway holds this subscription, and nothing may
-  // forget the slot while it does. Set by the ack, cleared only by a
-  // successful unsubscribe or by a session flap. It is the compaction
-  // guard, which is why it is not named for what we sent: read at the
-  // guard, `!gateway_holds` must mean "the gateway does not have it",
-  // never "we never sent it".
-  bool             gateway_holds;
+  // OBS-42 named this `wire_subscribed` and forbade it meaning "we sent
+  // it", because the guard below needs "the gateway does not have it".
+  // ⛔ OBS-53 measured that the distinction is UNAVAILABLE HERE:
+  // wss://api.gemini.com/v2/marketdata acknowledges nothing — not a
+  // subscribe, not an unsubscribe — so whether the gateway holds a
+  // subscription is not observable at this venue, ever.
+  //
+  // So the field records what we can know and what we are on the hook
+  // for: a subscribe for this slot went out on the wire, therefore an
+  // unsubscribe is owed and the slot may not be forgotten. Set on a
+  // successful subscribe send; cleared by a successful unsubscribe
+  // send or a session flap.
+  //
+  // The asymmetry is what makes send-success the safe belief, and it
+  // was measured, not assumed: believing the wire carries a
+  // subscription it does not costs ONE redundant unsubscribe frame,
+  // which this venue accepts in silence; believing it does not when it
+  // does is OBS-53 itself — a feed streaming to nobody that no later
+  // pass can name.
+  bool             wire_subscribed;
   char             last_err[128];
 } gem_ws_slot_t;
 
@@ -347,8 +360,8 @@ gem_ws_slot_alloc_locked(gem_ws_channel_t ch, const char *symbol_native)
 // not an escape the compiler can see, which is why the two states
 // below are refused (OBS-42 D4).
 //
-// The `gateway_holds` conjunct is the one that matters: forgetting a
-// slot the gateway still streams leaves that feed running to nobody,
+// The `wire_subscribed` conjunct is the one that matters: forgetting a
+// slot whose subscribe went out leaves that feed running to nobody,
 // and no later pass will ever emit for it because the table no longer
 // records it.
 static void
@@ -357,7 +370,7 @@ gem_ws_slots_compact_locked(void)
   for(uint32_t i = 0; i < gem_ws_ch.n_slots; )
   {
     if(gem_ws_ch.slots[i].refcount == 0
-        && !gem_ws_ch.slots[i].gateway_holds
+        && !gem_ws_ch.slots[i].wire_subscribed
         && gem_ws_ch.slots[i].state != GEM_SUB_SUBSCRIBING
         && gem_ws_ch.slots[i].state != GEM_SUB_UNSUBSCRIBING)
     {
@@ -500,7 +513,7 @@ gem_ws_emit_resubscribe_locked(void)
       if(s->channel == ch && s->refcount > 0)
       {
         s->state         = GEM_SUB_SUBSCRIBING;
-        s->gateway_holds = false;
+        s->wire_subscribed = false;
       }
     }
 
@@ -523,6 +536,23 @@ gem_ws_emit_resubscribe_locked(void)
           s->state = GEM_SUB_IDLE;
       }
       continue;
+    }
+
+    // OBS-53 — the send IS the confirmation, because nothing else ever
+    // arrives. Match on (channel, SUBSCRIBING) rather than on an index
+    // remembered from before the unlock: the table is compacted by
+    // swap-with-last, so an index does not survive the gap (OBS-42 D4).
+    // A slot added for this channel while the lock was down is IDLE,
+    // not SUBSCRIBING, so this cannot claim a subscribe it never sent.
+    for(i = 0; i < gem_ws_ch.n_slots; i++)
+    {
+      gem_ws_slot_t *s = &gem_ws_ch.slots[i];
+
+      if(s->channel == ch && s->state == GEM_SUB_SUBSCRIBING)
+      {
+        s->state           = GEM_SUB_ACTIVE;
+        s->wire_subscribed = true;
+      }
     }
 
     clam(CLAM_INFO, GEM_CTX ".ws.md", "%s subscribe sent (%zu bytes)",
@@ -573,7 +603,7 @@ gem_ws_emit_unsubscribe_locked(void)
     gem_ws_slot_t *s = &gem_ws_ch.slots[i];
 
     if(s->refcount != 0) continue;
-    if(!s->gateway_holds) continue;
+    if(!s->wire_subscribed) continue;
     if(s->state == GEM_SUB_UNSUBSCRIBING) continue;
 
     // GEM_CH_USER has no wire name (gem_ws_md_channel_name returns
@@ -637,7 +667,7 @@ gem_ws_emit_unsubscribe_locked(void)
           "%s unsubscribe deferred (send failed)",
           gem_ws_md_channel_name(ident[i].channel));
 
-      // Back to the belief it came from: gateway_holds was never
+      // Back to the belief it came from: wire_subscribed was never
       // touched, and the only thing that sets it also sets ACTIVE.
       s->state = GEM_SUB_ACTIVE;
       continue;
@@ -647,7 +677,7 @@ gem_ws_emit_unsubscribe_locked(void)
         "%s unsubscribe sent sym=%s",
         gem_ws_md_channel_name(ident[i].channel), ident[i].symbol_native);
 
-    s->gateway_holds = false;
+    s->wire_subscribed = false;
     s->state         = GEM_SUB_IDLE;
   }
 }
@@ -1155,88 +1185,20 @@ gem_ws_md_handle_candles_1m_locked(struct json_object *root)
   }
 }
 
-// MD subscription_ack envelope. Body shape:
-//   {"type":"subscription_ack",
-//    "subscriptions":[{"name":"l2","symbols":["BTCUSD","ETHUSD"]}, ...]}
+// ⛔ The `subscription_ack` handler that stood here is DELETED (OBS-53).
+// It correlated an ack envelope by (channel, symbol) and was the only
+// writer of the slot's held flag — and this venue never sends one.
+// Measured five independent ways: zero such lines across the daemon's
+// entire logged history, zero across ~7 minutes of live l2, and three
+// fresh probe runs (l2/BTCUSD, l2/PAXGUSD, candles_1m/PAXGUSD) in which
+// the subscribe was answered by the snapshot and nothing else.
 //
-// Correlate by (channel, symbol) since Gemini's MD v2 does not echo
-// JSON-RPC ids. Mark every matching slot ACTIVE + gateway_holds=true.
-//
-// OBS-42 D1: returns true when at least one slot it just made ACTIVE
-// has refcount 0 — the consumer left between the subscribe frame going
-// out and this ack landing. Its own unsubscribe already ran and skipped
-// the slot, because at that moment the gateway did not hold it yet, and
-// no pass will ever look again. The caller reaps on true; without that,
-// the gateway streams a symbol to nobody until an unrelated consumer
-// happens to unsubscribe.
-static bool
-gem_ws_md_handle_sub_ack_locked(struct json_object *root)
-{
-  struct json_object *subs;
-  size_t              n;
-  size_t              i;
-  bool                unwanted = false;
-
-  subs = json_get_array(root, "subscriptions");
-  if(subs == NULL) return(false);
-
-  n = (size_t)json_object_array_length(subs);
-
-  for(i = 0; i < n; i++)
-  {
-    struct json_object  *sub = json_object_array_get_idx(subs, (int)i);
-    struct json_object  *syms_arr;
-    char                 name[24] = {0};
-    gem_ws_channel_t     ch;
-    size_t               j;
-    size_t               m;
-
-    if(sub == NULL) continue;
-    if(!json_get_str(sub, "name", name, sizeof(name))) continue;
-
-    if(strcmp(name, "l2") == 0)               ch = GEM_CH_TICKER;
-    else if(strcmp(name, "trades") == 0)      ch = GEM_CH_TRADES;
-    else if(strcmp(name, "candles_1m") == 0)  ch = GEM_CH_OHLC_1M;
-    else
-    {
-      clam(CLAM_DEBUG, GEM_CTX ".ws.md",
-          "subscription_ack: unknown channel name='%s'", name);
-      continue;
-    }
-
-    syms_arr = json_get_array(sub, "symbols");
-    if(syms_arr == NULL) continue;
-
-    m = (size_t)json_object_array_length(syms_arr);
-
-    for(j = 0; j < m; j++)
-    {
-      struct json_object *v = json_object_array_get_idx(syms_arr, (int)j);
-      const char         *sym;
-      int32_t             idx;
-
-      if(v == NULL) continue;
-
-      sym = json_object_get_string(v);
-      if(sym == NULL || sym[0] == '\0') continue;
-
-      idx = gem_ws_slot_find_locked(ch, sym);
-      if(idx < 0) continue;
-
-      gem_ws_ch.slots[idx].state         = GEM_SUB_ACTIVE;
-      gem_ws_ch.slots[idx].gateway_holds = true;
-      gem_ws_ch.slots[idx].last_err[0]   = '\0';
-
-      if(gem_ws_ch.slots[idx].refcount == 0)
-        unwanted = true;
-
-      clam(CLAM_INFO, GEM_CTX ".ws.md",
-          "subscription_ack ch=%s sym=%s", name, sym);
-    }
-  }
-
-  return(unwanted);
-}
+// Its OBS-42 D1 duty — reaping a slot whose consumer left inside the
+// ack window — is not dropped, it is DESIGNED OUT: the subscribe send
+// now marks the slot ACTIVE under the same lock it was rendered under,
+// so the window it guarded no longer exists. If Gemini ever starts
+// acking, nothing breaks: the slot is already ACTIVE and the envelope
+// falls through to the unhandled-type debug line.
 
 // ------------------------------------------------------------------ //
 // OE: Order Events parser                                             //
@@ -1517,15 +1479,6 @@ gem_ws_channels_dispatch_md(const char *buf, size_t len)
   {
     // No-op; transport layer counts as liveness.
   }
-  else if(strcmp(type, "subscription_ack") == 0)
-  {
-    // OBS-42 D1: an ack that landed on a slot nobody wants any more is
-    // the only moment that slot becomes reapable, so it is reaped here
-    // under the same hold rather than waiting for an unrelated
-    // consumer to leave.
-    if(gem_ws_md_handle_sub_ack_locked(root))
-      gem_ws_reap_unwanted_locked();
-  }
   else if(strcmp(type, "l2_updates") == 0)
   {
     gem_ws_md_handle_l2_updates_locked(root);
@@ -1630,7 +1583,7 @@ gem_ws_channels_on_open(gem_ws_session_id_t sid)
   // subscriptions and started tracking ever-subscribed pairs.
   for(uint32_t i = 0; i < gem_ws_ch.n_slots; i++)
   {
-    gem_ws_ch.slots[i].gateway_holds = false;
+    gem_ws_ch.slots[i].wire_subscribed = false;
     gem_ws_ch.slots[i].state         = GEM_SUB_IDLE;
   }
 
