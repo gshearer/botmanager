@@ -1434,11 +1434,11 @@ wm_market_add(whenmoon_state_t *st,
   // min_history. An empty binding = feed-only (manual hand-trade) and
   // wm_market_warmup_begin promotes straight to READY.
   {
-    char        binding_key[160];
+    char        binding_key[WM_STRATEGY_BINDING_KEY_SZ];
     const char *binding;
 
-    snprintf(binding_key, sizeof(binding_key),
-        "plugin.whenmoon.market.%s.strategy", mk->market_id_str);
+    wm_strategy_binding_key(mk->market_id_str, binding_key,
+        sizeof(binding_key));
 
     // Register before reading: kv_set (used by the attach/detach binding
     // sync) rejects unregistered keys, and kv_register adopts any

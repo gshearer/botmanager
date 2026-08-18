@@ -42,6 +42,9 @@ typedef struct
 
 static void wm_market_warmup_recheck_task(task_t *t);
 
+static void wm_warm_recheck_rearm(wm_warm_chain_t *, pthread_rwlock_t *,
+    const char *);
+
 const char *
 wm_warmup_state_name(wm_warmup_state_t s)
 {
@@ -195,6 +198,41 @@ wm_warm_set_state(whenmoon_market_t *mk, wm_warmup_state_t s)
 // Timer tasks
 // --------------------------------------------------------------------
 
+// Schedule the next re-check and release the container rdlock, whichever
+// way the arm goes. Every non-terminal exit of the body below funnels
+// through here: three copies of this ten-line shape had drifted apart on
+// which of them logged the refusal.
+//
+// WM-MKT-ARR-UAF-1: `arr` is the caller's cached container lock and is
+// released on both paths — the close is not a substitute for it.
+// `market_id_str` is the caller's live mk, read only on the refusal path
+// — which is why it is a parameter and not fetched from the chain's ctx:
+// past a successful arm the next hop may already have closed the chain,
+// and a name taken from it there would be read out of freed memory.
+static void
+wm_warm_recheck_rearm(wm_warm_chain_t *chain, pthread_rwlock_t *arr,
+    const char *market_id_str)
+{
+  if(wm_warm_chain_arm(chain, "wm_warm_recheck",
+         WM_WARM_RECHECK_INTERVAL_MS, wm_market_warmup_recheck_task))
+  {
+    pthread_rwlock_unlock(arr);
+    return;
+  }
+
+  // DEBUG, not WARN: since OBS-43 a refused arm has two meanings, and
+  // the common one is correct behaviour — stop() is draining and this
+  // chain is meant to end here. A warning that fires on every clean
+  // unload is the mistake core/plugin.c:361 documents having made for
+  // 1,739 lines.
+  clam(CLAM_DEBUG, WHENMOON_CTX,
+      "warmup %s: recheck not rescheduled (shutting down or submit"
+      " failed)", market_id_str);
+
+  pthread_rwlock_unlock(arr);
+  wm_warm_chain_close(chain);
+}
+
 static void
 wm_market_warmup_recheck_task(task_t *t)
 {
@@ -202,6 +240,7 @@ wm_market_warmup_recheck_task(task_t *t)
   wm_warm_timer_ctx_t *ctx;
   whenmoon_market_t   *mk;
   pthread_rwlock_t    *arr;
+  char                 binding[WM_STRATEGY_NAME_SZ];
   int64_t              lookback;
   int64_t              ring_ms;
   int64_t              eff;
@@ -244,6 +283,13 @@ wm_market_warmup_recheck_task(task_t *t)
   // even to find the lock it still has to release.
   arr = &ctx->st->markets->arr_lock;
 
+  // OBS-45: read the declared binding BEFORE the container lock, off the
+  // ctx's own copy of the id. wm_market_add reads this key with no
+  // arr_lock held and that is the tree's only precedent for the pair;
+  // taking KV under the container lock would invent a second order for
+  // no gain.
+  wm_strategy_binding_get(ctx->market_id_str, binding, sizeof(binding));
+
   pthread_rwlock_rdlock(arr);
   mk = wm_warm_timer_live(ctx);
 
@@ -255,12 +301,40 @@ wm_market_warmup_recheck_task(task_t *t)
   }
 
   lookback = wm_market_required_lookback_ms(ctx->st, mk);
-  ring_ms  = (int64_t)mk->grain_cap[WM_GRAN_1M] * 60000;
-  eff      = (lookback < ring_ms) ? lookback : ring_ms;
-  now      = wm_now_ms();
 
-  // Roster emptied while warming, or a window shorter than the live-close
-  // tolerance — promote without chasing more history.
+  // OBS-45: an empty roster on a market that DECLARES an advisor is not
+  // convergence — it is a reload cascade, which unloads every strategy
+  // .so before whenmoon's own stop() and leaves the registry honestly
+  // empty for the length of it. Promoting on that reading warms the
+  // market by a roster that is merely invisible, and because eff is then
+  // 0 the replay below asks load_history for `0` — which that function
+  // reads as the FULL 1m ring, the widest possible window reached from
+  // the narrowest possible intent. Measured 2026-08-17: 288,000 bars and
+  // ~9.7 s each on three sessions at once, inside stop()'s drain.
+  //
+  // So hold: re-arm without advancing iters (the herd-cap branch's
+  // precedent — this tick did no work worth counting) and without
+  // replaying anything. A cascade then drains the chain; a runtime
+  // attach bumps warmup_gen and retires it. Nothing here re-attaches,
+  // and nothing should: wm_strategy_detach_self already WARNs the
+  // operator by name (OBS-57), which is the signal this hold rides on.
+  if(lookback == 0 && binding[0] != '\0')
+  {
+    clam(CLAM_DEBUG, WHENMOON_CTX,
+        "warmup %s: roster empty but binding names '%s' — holding"
+        " (the advisor's .so is gone, not detached)",
+        mk->market_id_str, binding);
+
+    wm_warm_recheck_rearm(chain, arr, mk->market_id_str);
+    return;
+  }
+
+  ring_ms = (int64_t)mk->grain_cap[WM_GRAN_1M] * 60000;
+  eff     = (lookback < ring_ms) ? lookback : ring_ms;
+  now     = wm_now_ms();
+
+  // Genuinely feed-only (the binding is clear), or a window shorter than
+  // the live-close tolerance — promote without chasing more history.
   if(lookback == 0 || eff <= WM_WARM_TAIL_TOLERANCE_MS)
     converged = true;
 
@@ -295,15 +369,7 @@ wm_market_warmup_recheck_task(task_t *t)
         mk->market_id_str, wm_warmup_active_count(),
         WM_WARMUP_MAX_CONCURRENT);
 
-    if(!wm_warm_chain_arm(chain, "wm_warm_recheck",
-           WM_WARM_RECHECK_INTERVAL_MS, wm_market_warmup_recheck_task))
-    {
-      pthread_rwlock_unlock(arr);
-      wm_warm_chain_close(chain);
-      return;
-    }
-
-    pthread_rwlock_unlock(arr);
+    wm_warm_recheck_rearm(chain, arr, mk->market_id_str);
     return;
   }
 
@@ -342,27 +408,9 @@ wm_market_warmup_recheck_task(task_t *t)
 
   ctx->iters++;
 
-  if(!wm_warm_chain_arm(chain, "wm_warm_recheck",
-         WM_WARM_RECHECK_INTERVAL_MS, wm_market_warmup_recheck_task))
-  {
-    // DEBUG, not WARN: since OBS-43 a refused arm has two meanings, and
-    // the common one is correct behaviour — stop() is draining and this
-    // chain is meant to end here. A warning that fires on every clean
-    // unload is the mistake core/plugin.c:361 documents having made for
-    // 1,739 lines.
-    clam(CLAM_DEBUG, WHENMOON_CTX,
-        "warmup %s: recheck not rescheduled (shutting down or submit"
-        " failed)", mk->market_id_str);
-
-    // WM-MKT-ARR-UAF-1: last use of mk done — release the container
-    // rdlock BEFORE the close; the close is not a substitute for it.
-    pthread_rwlock_unlock(arr);
-    wm_warm_chain_close(chain);
-    return;
-  }
-
-  // WM-MKT-ARR-UAF-1: last use of mk done — release the container rdlock.
-  pthread_rwlock_unlock(arr);
+  // WM-MKT-ARR-UAF-1: last use of mk done — the re-arm releases the
+  // container rdlock on both of its paths.
+  wm_warm_recheck_rearm(chain, arr, mk->market_id_str);
 }
 
 // --------------------------------------------------------------------
@@ -534,6 +582,7 @@ wm_warm_tailfill_global_destroy(void)
 void
 wm_market_warmup_begin(whenmoon_state_t *st, whenmoon_market_t *mk)
 {
+  char                 binding[WM_STRATEGY_NAME_SZ];
   int64_t              lookback;
   int64_t              ring_ms;
   int64_t              eff;
@@ -554,7 +603,17 @@ wm_market_warmup_begin(whenmoon_state_t *st, whenmoon_market_t *mk)
 
   lookback = wm_market_required_lookback_ms(st, mk);
 
-  if(lookback == 0)
+  wm_strategy_binding_get(mk->market_id_str, binding, sizeof(binding));
+
+  // OBS-45: the roster is only half the question — see the recheck
+  // above. A market whose binding is CLEAR has no advisor and never
+  // will, so an empty roster is the whole truth and full-ring is the
+  // deliberate depth. A market whose binding NAMES one and has no
+  // attachment is the other case entirely: wm_market_add's binding
+  // attach failed (the .so is not loaded, or a cascade has it), and
+  // reading that as feed-only would promote straight to READY on an
+  // advisor that is merely absent.
+  if(lookback == 0 && binding[0] == '\0')
   {
     // Feed-only (no strategies): shallow full-ring DB warm so /show
     // indicators + charts populate, then READY. Nothing gates on advice
@@ -590,12 +649,22 @@ wm_market_warmup_begin(whenmoon_state_t *st, whenmoon_market_t *mk)
   eff     = (lookback < ring_ms) ? lookback : ring_ms;
   now     = wm_now_ms();
 
+  // eff is 0 in the binding-without-attachment case, and enqueue_gaps
+  // answers a zero-width window with 0 before it touches the DB.
   (void)wm_warmup_enqueue_gaps(st, mk->market_id, mk->exchange_name,
       mk->product_id, now - eff, now);
 
-  clam(CLAM_INFO, WHENMOON_CTX,
-      "warmup %s: warming (lookback=%lld ms, eff=%lld ms)",
-      mk->market_id_str, (long long)lookback, (long long)eff);
+  if(lookback == 0)
+    clam(CLAM_WARN, WHENMOON_CTX,
+        "warmup %s: binding names strategy '%s' but nothing is attached"
+        " — held warming, no advice can reach this market until it is"
+        " (/whenmoon strategy attach %s %s)",
+        mk->market_id_str, binding, mk->market_id_str, binding);
+
+  else
+    clam(CLAM_INFO, WHENMOON_CTX,
+        "warmup %s: warming (lookback=%lld ms, eff=%lld ms)",
+        mk->market_id_str, (long long)lookback, (long long)eff);
 
   ctx = mem_alloc("whenmoon", "warm_recheck", sizeof(*ctx));
 

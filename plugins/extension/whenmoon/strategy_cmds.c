@@ -63,26 +63,20 @@
 // ----------------------------------------------------------------------- //
 
 static void
-wm_binding_kv_key(const char *market_id_str, char *out, size_t cap)
-{
-  snprintf(out, cap, "plugin.whenmoon.market.%s.strategy", market_id_str);
-}
-
-static void
 wm_binding_set(const char *market_id_str, const char *name)
 {
-  char key[160];
+  char key[WM_STRATEGY_BINDING_KEY_SZ];
 
-  wm_binding_kv_key(market_id_str, key, sizeof(key));
+  wm_strategy_binding_key(market_id_str, key, sizeof(key));
   (void)kv_set_str(key, name);
 }
 
 static void
 wm_binding_clear(const char *market_id_str)
 {
-  char key[160];
+  char key[WM_STRATEGY_BINDING_KEY_SZ];
 
-  wm_binding_kv_key(market_id_str, key, sizeof(key));
+  wm_strategy_binding_key(market_id_str, key, sizeof(key));
   (void)kv_set_str(key, "");
 }
 

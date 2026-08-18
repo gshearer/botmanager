@@ -175,6 +175,33 @@ wm_strategy_kv_get_str(const char *market_id, const char *strategy,
 }
 
 // ----------------------------------------------------------------------- //
+// Per-market strategy binding                                             //
+// ----------------------------------------------------------------------- //
+
+void
+wm_strategy_binding_key(const char *market_id_str, char *out, size_t cap)
+{
+  snprintf(out, cap, "plugin.whenmoon.market.%s.strategy", market_id_str);
+}
+
+void
+wm_strategy_binding_get(const char *market_id_str, char *out, size_t cap)
+{
+  char        key[WM_STRATEGY_BINDING_KEY_SZ];
+  const char *val;
+
+  wm_strategy_binding_key(market_id_str, key, sizeof(key));
+
+  val = kv_get_str(key);
+
+  // NULL is not "" here: it means no market ever registered this key,
+  // which a caller holding a stale id can still ask about. Both answers
+  // are feed-only, so they converge — but the guard is real, and it
+  // belongs here rather than at every call site.
+  strlcpy(out, val != NULL ? val : "", cap);
+}
+
+// ----------------------------------------------------------------------- //
 // Param-default formatting helper                                         //
 // ----------------------------------------------------------------------- //
 //

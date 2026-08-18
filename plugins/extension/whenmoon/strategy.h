@@ -52,6 +52,46 @@ const char *wm_strategy_kv_get_str(const char *market_id,
     const char *strategy, const char *key, const char *dflt);
 
 // -----------------------------------------------------------------------
+// Per-market strategy binding (WM-WARMUP-2 / WM-MI-3)
+// -----------------------------------------------------------------------
+//
+// `plugin.whenmoon.market.<id>.strategy` names the ONE strategy a
+// market auto-attaches and warms at start; "" is the registered
+// default and means feed-only. wm_market_add registers it and the
+// attach/detach verbs keep it in sync.
+//
+// ⚠ It survives a daemon RESTART and not a plugin RELOAD, which is the
+// wrong way round: kv_set marks the entry dirty and only kv_flush()
+// writes, nothing on the attach path calls it, and a plugin unload
+// reclaims the entry — so the value dies with the mapping (OBS-59).
+// That does NOT affect the OBS-45 reads below: whenmoon's KV is still
+// registered throughout the cascade window, which is the only moment
+// they consult it.
+//
+// OBS-45: this binding is the only thing that separates "this market
+// has no strategy" from "this market's strategy .so is temporarily
+// gone". The registry cannot tell them apart and never will — a
+// departing strategy's deinit() calls wm_strategy_detach_self, so an
+// iterate over it truthfully reports zero attachments for the whole
+// length of a reload cascade, which unloads every strategy .so before
+// whenmoon's own stop(). A warmup that reads that zero as feed-only
+// sizes the market by a roster that is merely invisible.
+//
+// A .so leaving never touches the binding; only the operator's detach
+// verb clears it. That is what makes it the answer.
+
+#define WM_STRATEGY_BINDING_KEY_SZ  160
+
+void wm_strategy_binding_key(const char *market_id_str, char *out,
+    size_t cap);
+
+// Copies the declared binding into `out` ("" = feed-only). Reads a
+// KV-owned pointer and copies it, so the answer outlives any
+// concurrent kv_set.
+void wm_strategy_binding_get(const char *market_id_str, char *out,
+    size_t cap);
+
+// -----------------------------------------------------------------------
 // Strategy ctx (opaque to strategy plugins)
 // -----------------------------------------------------------------------
 //
