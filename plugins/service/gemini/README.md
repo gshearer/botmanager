@@ -258,27 +258,42 @@ Events parser) use the same collapse so the generic
 | `exchange_ws_channel_t` | Gemini wire channel | Notes |
 |-------------------------|---------------------|-------|
 | `EXCH_WS_TICKER` | `l2` | Gemini publishes no native ticker channel; the multiplexer derives ticker events from `l2_updates` top-of-book frames. |
-| `EXCH_WS_TRADES` | `trade` | One `EXCH_WS_TRADES` event per `type:trade` envelope. |
+| `EXCH_WS_TRADES` | `l2` | One `EXCH_WS_TRADES` event per `type:trade` envelope — which arrives **inside the `l2` stream**. ⛔ There is no separate trades channel: `gem_ws_md_channel_name` renders `"trades"` and the endpoint answers `{"reason":"InvalidJson","result":"error"}`; `"trade"` singular, as this table used to claim, is refused the same way. Both measured 2026-08-17 (`OBS-55`). |
 | `EXCH_WS_OHLC_1M` | `candles_1m` | 1-minute bars only. |
 | `EXCH_WS_USER` | Order Events session | Maps `accepted / booked / fill / cancelled / closed` onto `EXCH_WS_USER_KIND_ORDER` / `EXCH_WS_USER_KIND_FILL` (fills carry both an `ORDER` update for status + a `FILL` event for the executed quantity). |
 | `EXCH_WS_BOOK_L2` | unsupported | `gem_ws_subscribe` returns FAIL synchronously. |
 
-The Market Data v2 socket emits a `subscription_ack` envelope after
-every subscribe + resubscribe; the dispatcher correlates the ack
-against the slot table by `(channel, native_sym)` rather than by an
-RPC-style req_id (Gemini doesn't carry one on the wire). The Order
-Events socket has no subscribe frame — open is acked with a
-`subscription_ack` envelope and the server starts streaming.
+⛔⛔ **The Market Data v2 socket does NOT emit a `subscription_ack`, and
+this paragraph used to say that it did.** Measured live 2026-08-17
+(`OBS-42`'s `G6`, filed as `OBS-53`): zero acks across ~7 minutes of
+live `l2` feed, zero across the daemon's entire logged history, and
+none to an external probe sending this driver's exact subscribe frame
+for two different symbols — the reply is the `l2` snapshot and then a
+`heartbeat`. A subscribe here is confirmed only by data arriving.
+⚠ **Do not read the parser as evidence of the protocol.** The handler
+below exists and is correct; nothing on this endpoint has ever reached
+it. The Order Events socket is a separate question and is not covered
+by this measurement — it needs credentials this tree does not have.
+
+**Consequence, and it is live today**: `gateway_holds` is written only
+by the ack handler, and the unsubscribe emit refuses a slot that does
+not have it, so **no unsubscribe frame is ever sent to this venue** and
+an unwanted slot sits at `refcount == 0` in `SUBSCRIBING`, which
+compaction refuses by design. `gem_ws_channels_on_open`'s unconditional
+reset is the only thing that reclaims it, so the strand is bounded by
+the socket's lifetime rather than being permanent. Kraken, by contrast,
+acks every subscribe and unsubscribes on the wire — verified side by
+side on one daemon.
 
 **An ack can outlive the consumer that caused it, and that is a case
 the dispatcher handles rather than a case that cannot happen**
-(`OBS-42`). A consumer leaving between the subscribe frame going out
-and its ack landing correctly emits no unsubscribe — at that moment the
-gateway does not hold the subscription yet — so when the ack arrives it
-lands on a slot at `refcount == 0`. `gem_ws_md_handle_sub_ack_locked`
-reports that, and the dispatcher reaps the slot under the same lock
-hold. Without it the gateway streams that symbol to nobody until some
-unrelated consumer happens to unsubscribe.
+(`OBS-42`) — at any venue that sends one. A consumer leaving between
+the subscribe frame going out and its ack landing correctly emits no
+unsubscribe — at that moment the gateway does not hold the subscription
+yet — so when the ack arrives it lands on a slot at `refcount == 0`.
+`gem_ws_md_handle_sub_ack_locked` reports that, and the dispatcher reaps
+the slot under the same lock hold. Without it the gateway streams that
+symbol to nobody until some unrelated consumer happens to unsubscribe.
 
 Because there is no req_id, **identity — `(channel, symbol_native)` —
 is the only correlator this driver has**, and it is what the unsubscribe
