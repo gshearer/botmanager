@@ -31,6 +31,28 @@
 
 #include <stddef.h>
 
+// The house width for strict-formatted output: a table, the rule under
+// its header, a card's frame — anything whose columns have to line up
+// down the page. Ninety columns.
+//
+// A renderer's total is DERIVED from this, never chosen for itself, so
+// widening one column means naming which other column pays for it. That
+// is the whole point of the constant: the number lives in one place and
+// a grid that drifts off it drifts visibly.
+//
+// It is a default, not a law. A view with a real reason to sit
+// elsewhere — a one-line status, a prose card meant to be read rather
+// than scanned — says so where it defines its own total. What it must
+// not do is pick a width silently.
+//
+// ⚠ The renderers that predate this rule agree with neither it nor each
+// other: `!stock` draws 103, `!crypto` 85, `show attack` 73. They are
+// **not** being swept. Bring one onto DISPLAY_COLS when you are already
+// reworking its geometry for some other reason, never as an errand of
+// its own — the same standing the tree gives its `snprintf`-copies and
+// its inline cell reads.
+#define DISPLAY_COLS  90
+
 // Visible columns in `s`, per the two rules above.
 size_t display_vis_len(const char *s);
 
@@ -54,6 +76,14 @@ void display_align_left (char *buf, size_t cap, int width);
 // pass "…" for an ellipsis, NULL for a hard stop. Its own bytes are
 // reserved out of `cap` before copying, so the mark can never be the
 // thing that does not fit.
+//
+// ⚠ The mark is reserved out of `cap` — the BYTE budget — and not out
+// of `cols`. A truncated result is therefore `cols + 1` columns wide,
+// not `cols`. A padded cell absorbs that in its padding and never
+// notices; the LAST cell of a row has no padding to absorb it, so a
+// caller sizing a grid from `cols` puts one column past its own rule
+// exactly when a value is long enough to be marked. Budget `cols` as
+// the width you want MINUS the mark.
 //
 // `src` is raw text: no color markers are expected in it, and a marker
 // there would be copied as two ordinary bytes and counted as two
