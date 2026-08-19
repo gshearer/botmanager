@@ -143,7 +143,15 @@ weather_fmt_temp_w(char *buf, size_t sz, double temp, const char *units,
 // that a whole-line shift beat shearing the columns within a line, and
 // what that bought was one row of a seven-row table visibly indented
 // past its neighbours. The current-conditions line is not a grid and is
-// free either way; the hourly view still leads its cells with one.
+// free either way.
+//
+// The hourly view draws NO icon, which is the same rule reaching its
+// other conclusion. That grid puts two cells on a line, so the only
+// icon-safe position — the line's tail, with nothing to its right —
+// exists once and there are two hours competing for it. An icon closing
+// the LEFT cell still sits in front of the whole right column and
+// shears it exactly as leading did. Text carries the sky there instead:
+// the condition is already spelled out in 16 columns and coloured.
 //
 // ⭑ Codes 900–905 are a PRIVATE range, and the one place this axis
 // extends past OpenWeather's numbering. weather.gov names five sky
@@ -816,10 +824,17 @@ weather_reply_forecast_daily(const cmd_ctx_t *ctx,
 // wrap already-padded content), so a cell's on-screen width is constant
 // and the second column lands at a predictable position. The layout is
 //
-//   {icon} {Day} {time}  {temp}°{u}  {condition:16}  {pop}
+//   {Day} {time}  {temp}°{u}  {condition:16}  {pop}
 //
-// which measures ~42 display columns; two cells plus a two-space gutter
+// which measures ~39 display columns; two cells plus a two-space gutter
 // stay under the 100-column budget with room to spare.
+//
+// No condition icon: its rendered width is the reader's client's
+// business (see weather_condition_icon), and unlike the daily view
+// there is no position in a two-cell line where nothing is aligned
+// against it. Leading each cell with one is what board #12 reported —
+// the left cell's glyph pushed the second column a space over on some
+// rows and not others.
 //
 // The trailing precipitation-probability field is shown only when there
 // *is* a chance (mirroring the daily view): a dry hour leaves the
@@ -830,7 +845,6 @@ void
 weather_hour_cell(char *buf, size_t sz, const openweather_forecast_hour_t *h,
     const char *units, const char *tu, int tz_offset)
 {
-  const char *icon = weather_condition_icon(h->condition_id);
   const char *dclr = weather_condition_color(h->condition_id);
   const char *day_name = "???";
   char temp[40];
@@ -866,8 +880,8 @@ weather_hour_cell(char *buf, size_t sz, const openweather_forecast_hour_t *h,
   weather_fmt_precip(pop_str, sizeof(pop_str), pop);
 
   snprintf(buf, sz,
-      "%s %-3s %4s  %s\xc2\xb0%s  %s%s" CLR_RESET "  %s",
-      icon, day_name, time_str, temp, tu, dclr, desc_pad, pop_str);
+      "%-3s %4s  %s\xc2\xb0%s  %s%s" CLR_RESET "  %s",
+      day_name, time_str, temp, tu, dclr, desc_pad, pop_str);
 }
 
 // Double-column hourly forecast: 24 hours collapse into ~12 reply
