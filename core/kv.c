@@ -443,12 +443,39 @@ kv_register(const char *key, kv_type_t type, const char *default_val,
       __builtin_return_address(0)));
 }
 
+// Which part of a re-registration the standing entry disagrees with, or
+// NULL when the two declarations say the same thing. Re-registering a key
+// is the design here — a method plugin's per-bot instance KV is replayed
+// on every rebind, and releasing it would be wrong (PLUGIN.md §Class A).
+// Caller holds kv_mutex; help is interned, so identical prose is one
+// pointer.
+static const char *
+reg_differs(const kv_entry_t *e, kv_type_t type, const kv_val_t *def,
+    kv_cb_t cb, void *cb_data, const char *help)
+{
+  if(e->type != type)
+    return("type");
+
+  // Only past the type check do the two defaults name the same union member.
+  if(val_changed(type, &e->def, def))
+    return("default");
+
+  if(e->cb != cb || e->cb_data != cb_data)
+    return("callback");
+
+  if(e->help != help)
+    return("help text");
+
+  return(NULL);
+}
+
 bool
 kv_register_owned(const char *key, kv_type_t type, const char *default_val,
     kv_cb_t cb, void *cb_data, const char *help, const void *owner_pc)
 {
   kv_val_t       val;
   kv_entry_t    *e;
+  const char    *help_i;
   uint32_t       bucket;
 
   if(key == NULL || default_val == NULL)
@@ -465,13 +492,37 @@ kv_register_owned(const char *key, kv_type_t type, const char *default_val,
     return(FAIL);
   }
 
+  // Interned above the lock so the duplicate comparison below is a pointer
+  // test, and so kv_intern_mutex is not taken under kv_mutex to make it.
+  help_i = (help != NULL) ? intern_help(help) : NULL;
+
   pthread_mutex_lock(&kv_mutex);
 
-  // Check for duplicate.
-  if(find_locked(key) != NULL)
+  // Check for duplicate. The first declaration wins and nothing it holds is
+  // touched, so a replay of that same declaration is correct behaviour and
+  // says so quietly — the alternative made a WARN out of the design, 736 of
+  // them in one log, in a tree where the identical words from cmd_register
+  // mean the command does not exist (AGENTS.md §Two Different "Memory"
+  // Concepts). Same ruling, same reason, as plugin.c's reclaim count. Only a
+  // declaration that actually differs has lost something, and that one is
+  // still loud.
+  e = find_locked(key);
+
+  if(e != NULL)
   {
+    const char *differs = reg_differs(e, type, &val, cb, cb_data, help_i);
+
     pthread_mutex_unlock(&kv_mutex);
-    clam(CLAM_WARN, "kv_register", "duplicate key '%s'", key);
+
+    if(differs == NULL)
+      clam(CLAM_DEBUG, "kv_register",
+          "'%s' already registered; keeping the existing declaration", key);
+
+    else
+      clam(CLAM_WARN, "kv_register",
+          "'%s' already registered with a different %s; the existing "
+          "declaration stands and this one is discarded", key, differs);
+
     return(FAIL);
   }
 
@@ -484,7 +535,7 @@ kv_register_owned(const char *key, kv_type_t type, const char *default_val,
   e->def      = val;   // what the declaration said, kept for kv_get_uint_or_default
   e->cb       = cb;
   e->cb_data  = cb_data;
-  e->help     = (help != NULL) ? intern_help(help) : NULL;
+  e->help     = help_i;
   e->owner_pc = owner_pc;
   e->dirty    = true;   // new entries need DB persistence
   e->secret   = kv_is_secret_key(key);
