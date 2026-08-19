@@ -29,6 +29,12 @@
 bool wm_market_persist_global_init(void);
 void wm_market_persist_global_destroy(void);
 
+// Cancel the flush periodic. Called from whenmoon_stop so the task is
+// off the queues before the unload, rather than one tick ahead of a
+// mapping that is about to go (OBS-44). The final flush stays in
+// wm_market_persist_global_destroy. Idempotent.
+void wm_market_persist_global_stop(void);
+
 // Snapshot one market's session under `mk->lock` and enqueue the
 // UPSERT. Caller MUST hold `mk->lock`. Allocations happen on the hot
 // path, but the SQL is built into a single heap buffer per call so
@@ -43,9 +49,9 @@ bool wm_market_persist_locked(whenmoon_market_t *mk);
 bool wm_market_persist_disable(int32_t market_id, const char *instance);
 
 // Drain every pending entry synchronously and run each statement on
-// the calling thread. Used at SIGTERM (called from
-// `wm_market_persist_global_destroy` before task_cancel) so the final
-// snapshot survives a restart.
+// the calling thread. Used at SIGTERM (the first act of
+// `wm_market_persist_global_destroy`) so the final snapshot survives a
+// restart.
 void wm_market_persist_flush_all(void);
 
 // Plugin-start restore: enumerate `wm_market_state` rows + hydrate

@@ -782,15 +782,20 @@ wm_market_persist_global_init(void)
 }
 
 void
+wm_market_persist_global_stop(void)
+{
+  if(wm_mp_g_task == TASK_HANDLE_NONE)
+    return;
+
+  task_cancel(wm_mp_g_task);
+  wm_mp_g_task = TASK_HANDLE_NONE;
+}
+
+void
 wm_market_persist_global_destroy(void)
 {
   wm_market_persist_flush_all();
-
-  if(wm_mp_g_task != TASK_HANDLE_NONE)
-  {
-    task_cancel(wm_mp_g_task);
-    wm_mp_g_task = TASK_HANDLE_NONE;
-  }
+  wm_market_persist_global_stop();
 }
 
 // ------------------------------------------------------------------ //

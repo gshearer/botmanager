@@ -28,6 +28,11 @@
 bool wm_live_engine_init(void);
 void wm_live_engine_destroy(void);
 
+// Cancel the REST /fills poll periodic. Called from whenmoon_stop so
+// core's pre-deinit barrier stands between the last tick and the lock
+// wm_live_engine_destroy tears down (OBS-44). Idempotent.
+void wm_live_engine_stop(void);
+
 // Late-stage start hook. Called from whenmoon_start (after kv_load).
 // Schedules the REST /fills safety-net poll periodic and runs the boot
 // reconcile (advisory log of any open orders left at the gateway).

@@ -842,8 +842,17 @@ whenmoon_stop(void)
   // per site) and each is still called from the deinit path for the
   // lives where stop() never ran: an init()-failure unload, or
   // plugin_stop_all() ordering.
+  //
+  // OBS-44 added the last three. The downloader's supervisor is the one
+  // periodic deliberately left in deinit(): wm_dl_supervisor_drain
+  // already cancels AND waits out a running tick under its own lock, so
+  // it does not need core's barrier — and it would bring an unbounded
+  // condvar wait into stop() if it moved.
   wm_warm_tailfill_global_destroy();
   mw_stop();
+  wm_account_stop(whenmoon_state);
+  wm_live_engine_stop();
+  wm_market_persist_global_stop();
 
   return(SUCCESS);
 }

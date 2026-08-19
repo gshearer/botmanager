@@ -142,13 +142,23 @@ wm_live_engine_init(void)
 }
 
 void
+wm_live_engine_stop(void)
+{
+  if(!g_live.initialized) return;
+
+  task_cancel(g_live.fills_poll_task);
+  g_live.fills_poll_task = TASK_HANDLE_NONE;
+}
+
+void
 wm_live_engine_destroy(void)
 {
   if(!g_live.initialized) return;
 
-  // Cancel periodic first so no fresh tick fires on freed state.
-  task_cancel(g_live.fills_poll_task);
-  g_live.fills_poll_task = TASK_HANDLE_NONE;
+  // Idempotent; whenmoon_stop has normally already run it. The tick
+  // takes g_live.mu and mkts->arr_lock, both destroyed on this path, so
+  // the cancel on its own was never the barrier it read as.
+  wm_live_engine_stop();
 
   // Drop WS subscriptions before destroying the lock — the WS reader
   // can fire callbacks on a worker thread; better to let those see

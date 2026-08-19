@@ -173,8 +173,9 @@ wm_account_tick(task_t *t)
   whenmoon_state_t         *st;
   wm_account_refresh_ctx_t *ctx;
 
-  // task_cancel runs synchronously, so destroy never frees slot while
-  // this tick is in flight. The null check is belt-and-braces.
+  // OBS-44: the cancel that ends this periodic runs in whenmoon_stop,
+  // so core's pre-deinit barrier stands between it and the free below.
+  // task_cancel alone would not — it does not join (task.h:156).
   slot = t->data;
 
   if(slot == NULL)
@@ -457,6 +458,24 @@ wm_account_start(whenmoon_state_t *st)
 }
 
 void
+wm_account_stop(whenmoon_state_t *st)
+{
+  whenmoon_account_t *acc;
+  uint32_t            i;
+
+  if(st == NULL || st->account == NULL)
+    return;
+
+  acc = st->account;
+
+  for(i = 0; i < acc->n_slots; i++)
+  {
+    task_cancel(acc->slots[i].refresh_task);
+    acc->slots[i].refresh_task = TASK_HANDLE_NONE;
+  }
+}
+
+void
 wm_account_destroy(whenmoon_state_t *st)
 {
   whenmoon_account_t *acc;
@@ -467,13 +486,10 @@ wm_account_destroy(whenmoon_state_t *st)
 
   acc = st->account;
 
-  // Cancel every periodic synchronously so no stale tick fires after
-  // the per-slot lock is destroyed below.
-  for(i = 0; i < acc->n_slots; i++)
-  {
-    task_cancel(acc->slots[i].refresh_task);
-    acc->slots[i].refresh_task = TASK_HANDLE_NONE;
-  }
+  // Idempotent: whenmoon_stop already ran this for every life that had
+  // one. The lives that did not are an init() failure and a plugin core
+  // never brought to RUNNING.
+  wm_account_stop(st);
 
   // Detach first so a racing wm_account_on_accounts callback sees
   // st->account == NULL and bails before touching freed memory.

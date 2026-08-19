@@ -57,8 +57,8 @@ typedef struct wm_account_slot
   char                  last_err[128];        // empty on success
 
   // Per-slot periodic. TASK_HANDLE_NONE when slot init failed to
-  // schedule. Cancelled synchronously in wm_account_destroy so no stale
-  // tick fires after free.
+  // schedule. Cancelled in wm_account_stop — see there for why the
+  // cancel cannot live in wm_account_destroy.
   task_handle_t         refresh_task;
 
   pthread_mutex_t       lock;
@@ -85,8 +85,16 @@ bool wm_account_init(struct whenmoon_state *st);
 // exchanges.
 bool wm_account_start(struct whenmoon_state *st);
 
-// Destroy: cancels every per-slot task synchronously, destroys mutexes,
-// frees the container. Safe on a state whose account pointer is NULL.
+// Stop: cancel every per-slot periodic. Belongs in whenmoon_stop, not
+// in wm_account_destroy: task_cancel does not join, so a cancel issued
+// beside the free below leaves a tick that started in between reading a
+// slot that is already gone. Core's pre-deinit quiescence barrier is
+// what closes that window, and it only runs between stop() and
+// deinit() (OBS-34, OBS-44). Idempotent; safe on a NULL account.
+void wm_account_stop(struct whenmoon_state *st);
+
+// Destroy: destroys mutexes, frees the container. Safe on a state whose
+// account pointer is NULL.
 void wm_account_destroy(struct whenmoon_state *st);
 
 // Async callback invoked by feature_exchange on accounts fetch
