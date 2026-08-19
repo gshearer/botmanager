@@ -70,9 +70,16 @@ typedef struct
   time_t               backoff_until;
   uint32_t             consec_fails;
   time_t               last_crit_log;
-  // Throttle "OE auth not configured" warnings to one per minute so a
-  // persistent unauth state doesn't flood the log.
-  time_t               last_auth_warn;
+  // Consecutive authorization refusals (HTTP 401/403 on the handshake).
+  // Counted apart from consec_fails because they are not the same kind
+  // of failure: a dropped socket may come back, a declined credential
+  // will not. GEM_WS_MAX_AUTH_FAIL of them parks the session (OBS-56).
+  uint32_t             auth_fails;
+  // Status the venue answered the last failed handshake with, 0 when it
+  // never answered one. Read from CURLINFO_RESPONSE_CODE, which curl
+  // fills on a refused upgrade (rc=22) and leaves at 0 for a transport
+  // failure — the discriminator was always there, unread.
+  long                 last_http_status;
 
   uint64_t             last_frame_ms;
   uint64_t             last_ping_ms;
@@ -109,6 +116,8 @@ static bool     gem_ws_send_pong_locked    (gem_ws_session_t *s,
                     const char *buf, size_t len);
 static bool     gem_ws_rx_append_locked    (gem_ws_session_t *s,
                     const char *data, size_t len);
+static void     gem_ws_park_locked              (gem_ws_session_t *s,
+                    const char *why);
 static void     gem_ws_schedule_reconnect_locked(gem_ws_session_t *s,
                     const char *why);
 static void     gem_ws_set_state_locked    (gem_ws_session_t *s,
@@ -132,6 +141,7 @@ gem_ws_state_name(gem_ws_state_t s)
     case GEM_WS_CONNECTING:   return("CONNECTING");
     case GEM_WS_OPEN:         return("OPEN");
     case GEM_WS_RECONNECTING: return("RECONNECTING");
+    case GEM_WS_DISABLED:     return("DISABLED");
   }
 
   return("UNKNOWN");
@@ -461,10 +471,17 @@ gem_ws_apply_reconfig_locked(gem_ws_session_t *s)
   if(s->state == GEM_WS_OPEN || s->state == GEM_WS_CONNECTING)
     gem_ws_close_locked(s);
 
+  // This is also the re-arm for a parked session, and the reason
+  // gem_ws_park_locked can simply stop: every knob that could make a
+  // parked cause untrue — both creds keys, both URLs, ws_enabled — is
+  // watched by gem_ws_kv_cb, which bumps the reconfig generation that
+  // brings the reader here. Landing in DISCONNECTED with the counters
+  // clear is a full retry from scratch (OBS-56).
   gem_ws_set_state_locked(s, GEM_WS_DISCONNECTED);
   s->backoff_until = 0;
   s->backoff_ms    = 0;
   s->consec_fails  = 0;
+  s->auth_fails    = 0;
 }
 
 // ------------------------------------------------------------------ //
@@ -501,8 +518,15 @@ gem_ws_open_md_locked(gem_ws_session_t *s)
 
   if(rc != CURLE_OK)
   {
-    clam(CLAM_WARN, s->log_ctx, "open: handshake failed url='%s' rc=%d (%s)",
-        s->url, (int)rc, curl_easy_strerror(rc));
+    // Ask the handle what the peer said before throwing it away: a
+    // refused upgrade is rc=22 with the status in CURLINFO_RESPONSE_CODE,
+    // a transport failure leaves it 0. The caller needs the difference —
+    // one of them is worth retrying and the other is not.
+    curl_easy_getinfo(s->easy, CURLINFO_RESPONSE_CODE, &s->last_http_status);
+
+    clam(CLAM_WARN, s->log_ctx,
+        "open: handshake failed url='%s' rc=%d (%s) http=%ld",
+        s->url, (int)rc, curl_easy_strerror(rc), s->last_http_status);
 
     curl_easy_cleanup(s->easy);
     s->easy = NULL;
@@ -656,8 +680,15 @@ gem_ws_open_oe_locked(gem_ws_session_t *s)
 
   if(rc != CURLE_OK)
   {
-    clam(CLAM_WARN, s->log_ctx, "open: handshake failed url='%s' rc=%d (%s)",
-        s->url, (int)rc, curl_easy_strerror(rc));
+    // Ask the handle what the peer said before throwing it away: a
+    // refused upgrade is rc=22 with the status in CURLINFO_RESPONSE_CODE,
+    // a transport failure leaves it 0. The caller needs the difference —
+    // one of them is worth retrying and the other is not.
+    curl_easy_getinfo(s->easy, CURLINFO_RESPONSE_CODE, &s->last_http_status);
+
+    clam(CLAM_WARN, s->log_ctx,
+        "open: handshake failed url='%s' rc=%d (%s) http=%ld",
+        s->url, (int)rc, curl_easy_strerror(rc), s->last_http_status);
 
     curl_easy_cleanup(s->easy);
     s->easy = NULL;
@@ -691,11 +722,21 @@ gem_ws_open_locked(gem_ws_session_t *s)
   if(s->easy != NULL)
     gem_ws_close_locked(s);
 
+  // Clear it here rather than in the two open paths: this function has
+  // an early return above them, and a status left over from the last
+  // attempt would be read by the caller as this attempt's answer.
+  s->last_http_status = 0;
+
   gem_ws_reload_url_locked(s);
 
   if(s->url[0] == '\0')
   {
-    clam(CLAM_WARN, s->log_ctx, "open: no URL configured");
+    // A URL that is not configured is the creds case wearing different
+    // clothes — a local read, permanently the same answer, and since
+    // `set kv --clear` an operator can type it (OBS-50 made the empty
+    // KV_STR reachable). Park on it for the same reason, re-armed by the
+    // same watch: gem_ws_kv_cb covers both URL keys (OBS-56).
+    gem_ws_park_locked(s, "no URL configured");
     return(FAIL);
   }
 
@@ -713,6 +754,7 @@ gem_ws_open_locked(gem_ws_session_t *s)
   s->backoff_ms    = 0;
   s->backoff_until = 0;
   s->consec_fails  = 0;
+  s->auth_fails    = 0;
   s->last_crit_log = 0;
 
   gem_ws_set_state_locked(s, GEM_WS_OPEN);
@@ -739,6 +781,46 @@ gem_ws_close_locked(gem_ws_session_t *s)
 
   s->sockfd = CURL_SOCKET_BAD;
   s->rx_len = 0;
+}
+
+// 401 and 403 are the two answers that mean "we read your credentials
+// and declined them". Everything else the venue can say about a
+// handshake — and every transport failure, which leaves the status 0 —
+// may differ on the next attempt.
+static bool
+gem_ws_status_is_auth_refusal(long http_status)
+{
+  return(http_status == 401 || http_status == 403);
+}
+
+// Settle the session: stop trying, say so once, and leave it alone. The
+// counters are zeroed so a later re-arm starts from a clean ladder
+// rather than resuming a backoff nobody waited out.
+//
+// This is the answer to a cause the next attempt cannot change —
+// credentials that are absent, or credentials the venue has refused.
+// Routing one of those into gem_ws_schedule_reconnect_locked() asks the
+// same question forever at one attempt a minute, parks the session in
+// RECONNECTING when it is neither trying nor able, and leaves the flap
+// WARN — this driver's loudest recurring line — permanently occupied by
+// a configuration fact (OBS-56).
+static void
+gem_ws_park_locked(gem_ws_session_t *s, const char *why)
+{
+  gem_ws_close_locked(s);
+
+  s->backoff_ms    = 0;
+  s->backoff_until = 0;
+  s->consec_fails  = 0;
+  s->auth_fails    = 0;
+  s->last_crit_log = 0;
+
+  clam(CLAM_WARN, s->log_ctx,
+      "not retrying: %s. Set the credentials (or toggle "
+      "plugin.gemini.ws_enabled) to re-arm; a plugin reload does too",
+      why);
+
+  gem_ws_set_state_locked(s, GEM_WS_DISABLED);
 }
 
 static void
@@ -1056,29 +1138,58 @@ gem_ws_reader(task_t *t)
       }
 
       // Auth pre-check on the Order Events session: short-circuit
-      // before curl_easy_init when creds are unconfigured so the
-      // reconnect reason reflects what actually blocked the open
-      // (instead of "handshake failed" — there was never a
-      // handshake). Throttle the operator-facing log to one entry
-      // per minute (GEM-VERIFY-1).
+      // before curl_easy_init when creds are unconfigured, and PARK
+      // rather than ladder. Nothing about an unset KV key changes
+      // because we asked again, so there is nothing to retry and
+      // nothing to send the venue; the KV watch on the creds keys is
+      // what re-arms it (GEM-VERIFY-1, OBS-56).
       if(s->sid == GEM_WS_OE && !gem_apikey_configured())
       {
-        time_t now = time(NULL);
-
-        if(now - s->last_auth_warn >= 60)
-        {
-          clam(CLAM_INFO, s->log_ctx,
-              "api keys not configured; private stream disabled");
-          s->last_auth_warn = now;
-        }
-
-        gem_ws_schedule_reconnect_locked(s, "no creds");
+        gem_ws_park_locked(s, "api keys not configured, private stream down");
         pthread_mutex_unlock(&s->lock);
         continue;
       }
 
       if(gem_ws_open_locked(s) != SUCCESS)
       {
+        // The open path may have parked us on the way down (an
+        // unconfigured URL). A park is final until something re-arms it,
+        // so it outranks anything this branch would schedule.
+        if(s->state == GEM_WS_DISABLED)
+        {
+          pthread_mutex_unlock(&s->lock);
+          continue;
+        }
+
+        // A refused upgrade is the venue's verdict on our credentials,
+        // not a broken pipe: asking again gets the identical answer and
+        // spends an authorization failure at the endpoint to hear it.
+        // Allow a small run in case the refusal is momentary (a clock
+        // skew, a key mid-rotation) and then stop for good.
+        if(gem_ws_status_is_auth_refusal(s->last_http_status))
+        {
+          s->auth_fails++;
+
+          if(s->auth_fails >= GEM_WS_MAX_AUTH_FAIL)
+          {
+            char why[96];
+
+            snprintf(why, sizeof(why),
+                "the venue refused these credentials %u times (http %ld)",
+                s->auth_fails, s->last_http_status);
+
+            gem_ws_park_locked(s, why);
+            pthread_mutex_unlock(&s->lock);
+            continue;
+          }
+
+          gem_ws_schedule_reconnect_locked(s, "auth refused");
+          pthread_mutex_unlock(&s->lock);
+          continue;
+        }
+
+        s->auth_fails = 0;
+
         gem_ws_schedule_reconnect_locked(s, "handshake failed");
         pthread_mutex_unlock(&s->lock);
         continue;
@@ -1094,9 +1205,20 @@ gem_ws_reader(task_t *t)
       pthread_mutex_lock(&s->lock);
     }
 
+    // Parked, or between the states the branches above own. Neither has
+    // anything to poll, and neither may spin: this is the reader's only
+    // exit that is not preceded by a wait, and DISABLED makes it the
+    // steady state rather than a transient one.
     if(s->state != GEM_WS_OPEN)
     {
       pthread_mutex_unlock(&s->lock);
+
+      {
+        struct timespec ts =
+            { .tv_sec = 0, .tv_nsec = (long)GEM_WS_POLL_MS * 1000L * 1000L };
+        nanosleep(&ts, NULL);
+      }
+
       continue;
     }
 

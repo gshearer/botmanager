@@ -60,6 +60,12 @@
 #define GEM_WS_MAX_BACKOFF_MS    60000
 #define GEM_WS_STOP_WAIT_MS       5000
 #define GEM_WS_MAX_CONSEC_FAIL      10
+// An authorization refusal is not a transient failure: the venue has
+// looked at our credentials and declined them, and the next attempt
+// asks it the identical question. Three in a row and the session parks
+// for good — operator ruling 2026-08-18 (OBS-56), so nothing here sits
+// hammering an endpoint that is rejecting our key.
+#define GEM_WS_MAX_AUTH_FAIL         3
 #define GEM_SUBS_MAX                64
 #define GEM_PRODS_PER_SUB_MAX       16
 #define GEM_SLOTS_MAX              128

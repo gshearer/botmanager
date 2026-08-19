@@ -54,7 +54,15 @@ typedef enum
   GEM_WS_DISCONNECTED,
   GEM_WS_CONNECTING,
   GEM_WS_OPEN,
-  GEM_WS_RECONNECTING
+  GEM_WS_RECONNECTING,
+  // Settled and deliberate: not connected, not trying, and it will not
+  // try again on its own. DISCONNECTED is where a session waits between
+  // attempts; this is where one stops making them, because the cause is
+  // an answer that cannot change until somebody changes it — absent
+  // credentials, or a venue that has refused the ones we have. Re-armed
+  // by the KV watch on any creds/URL/enable change, or by a reload.
+  // (OBS-56)
+  GEM_WS_DISABLED
 } gem_ws_state_t;
 
 // Session identifier. Two transports live behind the same lifecycle:
