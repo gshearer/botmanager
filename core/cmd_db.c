@@ -68,19 +68,19 @@ static const cmd_arg_desc_t ad_db_delete_kv[] = {
 static void
 cmd_db(const cmd_ctx_t *ctx)
 {
-  cmd_reply(ctx, "usage: /db <subcommand> ...  (delete, orphans)");
+  cmd_reply(ctx, "usage: db <subcommand> ...  (delete, orphans)");
 }
 
 static void
 cmd_db_delete(const cmd_ctx_t *ctx)
 {
-  cmd_reply(ctx, "usage: /db delete <what> ...  (kv <key>)");
+  cmd_reply(ctx, "usage: db delete <what> ...  (kv <key>)");
 }
 
 static void
 cmd_db_orphans(const cmd_ctx_t *ctx)
 {
-  cmd_reply(ctx, "usage: /db orphans <what>  (kv)");
+  cmd_reply(ctx, "usage: db orphans <what>  (kv)");
 }
 
 // -----------------------------------------------------------------------
@@ -184,7 +184,7 @@ cmd_db_orphans_kv(const cmd_ctx_t *ctx)
   }
 
   snprintf(buf, sizeof(buf),
-      "%u orphan(s) — a row is kept until you drop it: /db delete kv <key>",
+      "%u orphan(s) — a row is kept until you drop it: db delete kv <key>",
       total);
   cmd_reply(ctx, buf);
 }
@@ -224,7 +224,7 @@ cmd_db_register(void)
       "/set kv --delete <key> instead. Two operations, not one.\n"
       "\n"
       "Example:\n"
-      "  /db delete kv plugin.ask.system",
+      "  db delete kv plugin.ask.system",
       USERNS_GROUP_ADMIN, DB_CMD_LEVEL, CMD_SCOPE_ANY, METHOD_T_ANY,
       cmd_db_delete_kv, NULL, "db/delete", NULL,
       ad_db_delete_kv, 1, NULL, NULL);
@@ -246,7 +246,7 @@ cmd_db_register(void)
       "\n"
       "A row also lands here when a schema change retires the key. Core\n"
       "cannot tell the two apart and never prunes on its own; when you are\n"
-      "sure a key is retired, drop it with /db delete kv <key>.",
+      "sure a key is retired, drop it with db delete kv <key>.",
       USERNS_GROUP_ADMIN, DB_CMD_LEVEL, CMD_SCOPE_ANY, METHOD_T_ANY,
       cmd_db_orphans_kv, NULL, "db/orphans", NULL, NULL, 0, NULL, NULL);
 }

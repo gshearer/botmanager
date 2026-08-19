@@ -134,7 +134,7 @@ set_kv_delete(const cmd_ctx_t *ctx, const char *key)
     kv_delete(key);
     snprintf(buf, sizeof(buf),
         "%s is not registered — dropped any persisted row "
-        "(that is /db delete kv's job)", key);
+        "(that is db delete kv's job)", key);
   }
 
   else if(!kv_reset(key))
@@ -554,7 +554,7 @@ cmd_set_register(void)
       "--delete retires a registered key's STORED value: the key reverts\n"
       "to the default its declaration named and its database row goes, so\n"
       "the next boot reads the declaration. The key itself stays\n"
-      "registered. This is not /db delete kv, which drops a persisted row\n"
+      "registered. This is not db delete kv, which drops a persisted row\n"
       "that no live key claims — that one is still the only tool for an\n"
       "orphan, and it unregisters, which for a live key would make the\n"
       "knob stop existing.\n"
@@ -566,15 +566,15 @@ cmd_set_register(void)
       "flag-shaped token is a legal key and a legal value alike.\n"
       "\n"
       "Examples:\n"
-      "  /set kv --clear plugin.urlgrabber.crawler_agent\n"
-      "  /set kv --delete plugin.tmdb.language",
+      "  set kv --clear plugin.urlgrabber.crawler_agent\n"
+      "  set kv --delete plugin.tmdb.language",
       USERNS_GROUP_ADMIN, 100, CMD_SCOPE_ANY, METHOD_T_ANY,
       cmd_set_kv, NULL, "set", NULL, ad_set_kv, 2, NULL, NULL);
 
   cmd_register("cmd", "bot",
       "set bot <bot> [<method>] <key> <value> | "
       "set bot <bot> --clear|--delete [<method>] <key>",
-      "Set a per-bot configuration value (sugar over /set kv)",
+      "Set a per-bot configuration value (sugar over set kv)",
       "Builds the namespaced KV path for a bot. Three-arg form writes\n"
       "bot.<bot>.<key>; four-arg form writes bot.<bot>.<method>.<key>\n"
       "and requires <method> to name a method the bot has bound. Which\n"
@@ -589,9 +589,9 @@ cmd_set_register(void)
       "to be invented to spell one.\n"
       "\n"
       "Examples:\n"
-      "  /set bot mini reachy attention.mode name\n"
-      "  /set bot mini --clear behavior.aka\n"
-      "  /set bot mini --delete reachy tts_voice",
+      "  set bot mini reachy attention.mode name\n"
+      "  set bot mini --clear behavior.aka\n"
+      "  set bot mini --delete reachy tts_voice",
       USERNS_GROUP_ADMIN, 100, CMD_SCOPE_ANY, METHOD_T_ANY,
       cmd_set_bot, NULL, "set", NULL, ad_set_bot,
       (uint8_t)(sizeof(ad_set_bot) / sizeof(ad_set_bot[0])), NULL, NULL);

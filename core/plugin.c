@@ -2916,7 +2916,7 @@ plugin_show_detail_emit(const cmd_ctx_t *ctx,
 
       snprintf(line, sizeof(line),
           "    " CLR_BOLD "%s" CLR_RESET
-          " " CLR_GRAY "(%u keys, cmd: /%s %s)" CLR_RESET
+          " " CLR_GRAY "(%u keys, cmd: %s %s)" CLR_RESET
           " \xe2\x80\x94 %s",
           g->name, g->schema_count, pd->name, g->cmd_name,
           g->description);
@@ -3147,7 +3147,7 @@ static const cmd_arg_desc_t ad_plugin_cmd_name[] = {
 static void
 plugin_cmd_plugin(const cmd_ctx_t *ctx)
 {
-  cmd_reply(ctx, "usage: /plugin <subcommand> ...");
+  cmd_reply(ctx, "usage: plugin <subcommand> ...");
 }
 
 // /plugin load <name> — find, load, resolve, init, and start a plugin.
@@ -3600,9 +3600,9 @@ plugin_register_commands(void)
       "Shows loaded plugins with type, kind, state, and approximate\n"
       "memory usage. Memory is estimated by matching each plugin's\n"
       "kind against tracked allocation module names.\n\n"
-      "Use /show plugin all to also list available .so files in\n"
+      "Use show plugin all to also list available .so files in\n"
       "the plugin directory that are not currently loaded.\n\n"
-      "Use /show plugin <name> to show detailed information about\n"
+      "Use show plugin <name> to show detailed information about\n"
       "a specific plugin including features, config keys, schema\n"
       "groups, and lifecycle callbacks.",
       USERNS_GROUP_OWNER, USERNS_OWNER_LEVEL, CMD_SCOPE_ANY, METHOD_T_ANY,
@@ -3672,7 +3672,7 @@ plugin_register_commands(void)
       "Attribution is by the object's load address, not by any name\n"
       "the plugin registers under.\n\n"
       "Report-only: this command never unloads or refuses anything.\n"
-      "Use /plugin audit all for a one-line summary per plugin.",
+      "Use plugin audit all for a one-line summary per plugin.",
       USERNS_GROUP_OWNER, USERNS_OWNER_LEVEL, CMD_SCOPE_ANY, METHOD_T_ANY,
       plugin_cmd_audit, NULL, "plugin", NULL, ad_plugin_cmd_name, 1, NULL, NULL);
 }

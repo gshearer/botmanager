@@ -817,7 +817,7 @@ clam_cmd_init(void)
       "Manage user subscriptions to the CLAM event bus",
       "Subscriptions route matching CLAM messages to one or more\n"
       "destinations. Subverbs: subscribe, unsubscribe. Reads go\n"
-      "through /show clam.",
+      "through show clam.",
       USERNS_GROUP_ADMIN, 100, CMD_SCOPE_ANY, METHOD_T_ANY,
       cmd_clam_root, NULL, NULL, NULL, NULL, 0, NULL, NULL);
 

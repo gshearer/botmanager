@@ -319,7 +319,7 @@ cmd_show_schema(const cmd_ctx_t *ctx)
   snprintf(hdr, sizeof(hdr), "  key pattern: %s", g->key_prefix);
   cmd_reply(ctx, hdr);
 
-  snprintf(hdr, sizeof(hdr), "  command: /%s %s", plugin_name, g->cmd_name);
+  snprintf(hdr, sizeof(hdr), "  command: %s %s", plugin_name, g->cmd_name);
   cmd_reply(ctx, hdr);
   cmd_reply(ctx, "  properties:");
 

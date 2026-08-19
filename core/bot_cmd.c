@@ -588,12 +588,12 @@ admin_cmd_bot(const cmd_ctx_t *ctx)
   const cmd_def_t *child;
   cmd_ctx_t sub;
 
-  if(p == NULL) { cmd_reply(ctx, "usage: /bot <subcommand> ..."); return; }
+  if(p == NULL) { cmd_reply(ctx, "usage: bot <subcommand> ..."); return; }
   while(*p == ' ' || *p == '\t') p++;
 
   if(*p == '\0')
   {
-    cmd_reply(ctx, "usage: /bot <subcommand> ...");
+    cmd_reply(ctx, "usage: bot <subcommand> ...");
     return;
   }
 
@@ -626,7 +626,7 @@ admin_cmd_bot(const cmd_ctx_t *ctx)
     char buf[PLUGIN_NAME_SZ + BOT_NAME_SZ + 64];
 
     snprintf(buf, sizeof(buf),
-        "usage: /bot %s <verb> [args...]", name);
+        "usage: bot %s <verb> [args...]", name);
     cmd_reply(ctx, buf);
     return;
   }
@@ -817,7 +817,7 @@ help_one_verb(const cmd_ctx_t *ctx, const cmd_def_t *parent,
   {
     char line[256];
 
-    snprintf(line, sizeof(line), "usage: /%s", usage);
+    snprintf(line, sizeof(line), "usage: %s", usage);
     cmd_reply(ctx, line);
   }
 
@@ -845,7 +845,7 @@ help_ext_bot(const cmd_ctx_t *ctx, const char *rest)
   if(name[0] == '\0')
   {
     cmd_reply(ctx, "");
-    cmd_reply(ctx, "available /bot <name> verbs (every bot, every method):");
+    cmd_reply(ctx, "available bot <name> verbs (every bot, every method):");
     help_list_children_for_bot(ctx, bot_root, NULL);
     return;
   }
@@ -866,7 +866,7 @@ help_ext_bot(const cmd_ctx_t *ctx, const char *rest)
   {
     char hdr[BOT_NAME_SZ + 32];
 
-    snprintf(hdr, sizeof(hdr), "verbs for /bot %s:", name);
+    snprintf(hdr, sizeof(hdr), "verbs for bot %s:", name);
     cmd_reply(ctx, hdr);
     help_list_children_for_bot(ctx, bot_root, inst);
     return;
@@ -900,7 +900,7 @@ help_ext_show_bot(const cmd_ctx_t *ctx, const char *rest)
   {
     cmd_reply(ctx, "");
     cmd_reply(ctx,
-        "available /show bot <name> verbs (every bot, every method):");
+        "available show bot <name> verbs (every bot, every method):");
     help_list_children_for_bot(ctx, show_bot, NULL);
     return;
   }
@@ -921,7 +921,7 @@ help_ext_show_bot(const cmd_ctx_t *ctx, const char *rest)
   {
     char hdr[BOT_NAME_SZ + 32];
 
-    snprintf(hdr, sizeof(hdr), "verbs for /show bot %s:", name);
+    snprintf(hdr, sizeof(hdr), "verbs for show bot %s:", name);
     cmd_reply(ctx, hdr);
     help_list_children_for_bot(ctx, show_bot, inst);
     return;
@@ -946,7 +946,7 @@ cmd_show_bot(const cmd_ctx_t *ctx)
   if(ctx->parsed == NULL || ctx->parsed->argc < 1
       || ctx->parsed->argv[0][0] == '\0')
   {
-    cmd_reply(ctx, "usage: /show bot <name> [<verb> [args...]]");
+    cmd_reply(ctx, "usage: show bot <name> [<verb> [args...]]");
     return;
   }
 
@@ -1223,7 +1223,7 @@ bot_register_commands(void)
       "<kind> names the bot plugin that gives the bot a mind and\n"
       "defaults to the only one loaded (chat); name it explicitly\n"
       "only when more than one exists.\n"
-      "Example: /bot add mybot",
+      "Example: bot add mybot",
       USERNS_GROUP_ADMIN, 100, CMD_SCOPE_ANY, METHOD_T_ANY, admin_cmd_bot_add, NULL, "bot", NULL,
       ad_bot_name_kind, 2, NULL, NULL);
 
@@ -1256,9 +1256,9 @@ bot_register_commands(void)
       "bot addmethod <name> <method>",
       "Add a method to a bot",
       "Adds a method plugin to a bot. The bot must be in CREATED\n"
-      "state (not running). Configure method settings via /set\n"
+      "state (not running). Configure method settings via set\n"
       "before starting.\n"
-      "Example: /bot addmethod mybot irc",
+      "Example: bot addmethod mybot irc",
       USERNS_GROUP_ADMIN, 100, CMD_SCOPE_ANY, METHOD_T_ANY, admin_cmd_bot_bind, NULL, "bot", "am",
       ad_bot_method, 2, NULL, NULL);
 
@@ -1310,7 +1310,7 @@ bot_register_commands(void)
       "Sends <message> through the named running bot's first bound\n"
       "method to <target> (an IRC #channel the bot has joined, or a\n"
       "nick for a DM). Used for out-of-band announcements.\n"
-      "Example: /say botman #cabal cp1 [mako] scored avg $/mo=812",
+      "Example: say botman #cabal cp1 [mako] scored avg $/mo=812",
       USERNS_GROUP_ADMIN, 100, CMD_SCOPE_ANY, METHOD_T_ANY, admin_cmd_say, NULL,
       NULL, NULL, ad_say, (uint8_t)(sizeof(ad_say) / sizeof(ad_say[0])),
       NULL, NULL);
@@ -1324,7 +1324,7 @@ bot_register_commands(void)
       "[reason] is the rest of the line and is passed to every method\n"
       "as the bot goes down: on IRC it becomes the QUIT message the\n"
       "channel sees, in place of the default \"shutting down\".\n"
-      "Example: /quit rebuilding the kraken feed, back in two minutes",
+      "Example: quit rebuilding the kraken feed, back in two minutes",
       USERNS_GROUP_OWNER, USERNS_OWNER_LEVEL, CMD_SCOPE_ANY, METHOD_T_ANY, admin_cmd_quit, NULL,
       NULL, NULL, ad_quit, (uint8_t)(sizeof(ad_quit) / sizeof(ad_quit[0])),
       NULL, NULL);

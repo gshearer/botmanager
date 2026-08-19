@@ -73,7 +73,7 @@ userns_session_resolve(const cmd_ctx_t *ctx)
     }
   }
 
-  cmd_reply(ctx, "no namespace set \xe2\x80\x94 use /user cd <namespace>");
+  cmd_reply(ctx, "no namespace set \xe2\x80\x94 use user cd <namespace>");
   return(NULL);
 }
 
@@ -779,10 +779,10 @@ cmd_show_user(const cmd_ctx_t *ctx)
   if(ctx->parsed == NULL || ctx->parsed->argc == 0)
   {
     cmd_reply(ctx,
-        "usage: /show user <username>");
+        "usage: show user <username>");
     cmd_reply(ctx,
-        CLR_GRAY "(use /show users to list all users;"
-        " /show dossier <name> for what the bot has learned)" CLR_RESET);
+        CLR_GRAY "(use show users to list all users;"
+        " show dossier <name> for what the bot has learned)" CLR_RESET);
     return;
   }
 
@@ -1152,7 +1152,7 @@ userns_register_commands(void)
       "user <subcommand> ...",
       "User and group management",
       "Manages namespaces, users, groups, MFA patterns, and permissions.\n"
-      "Set the working namespace with /user cd <namespace>.\n"
+      "Set the working namespace with user cd <namespace>.\n"
       "Subcommands: cd addns delns add del password addmfa delmfa\n"
       "autoidentify addgroup delgroup grant revoke",
       USERNS_GROUP_ADMIN, 100, CMD_SCOPE_ANY, METHOD_T_ANY,
@@ -1238,7 +1238,7 @@ userns_register_commands(void)
       "Enable or disable autoidentify for a user",
       "When autoidentify is enabled, the bot automatically creates\n"
       "an authenticated session for a user whose MFA pattern matches\n"
-      "an incoming message, without requiring !identify.",
+      "an incoming message, without requiring `identify`.",
       USERNS_GROUP_ADMIN, 100, CMD_SCOPE_ANY, METHOD_T_ANY,
       cmd_user_autoidentify, NULL, "user", "ai", ad_user_autoidentify, 2, NULL, NULL);
 
@@ -1289,7 +1289,7 @@ userns_register_commands(void)
       "With <username>, displays UUID, description, group memberships,\n"
       "and MFA patterns. For the namespace-wide user list, use\n"
       "/show users. This is the auth record only — for the facts and\n"
-      "conversation the bot has accumulated, use /show dossier <name>.",
+      "conversation the bot has accumulated, use show dossier <name>.",
       USERNS_GROUP_ADMIN, 100, CMD_SCOPE_ANY, METHOD_T_ANY,
       cmd_show_user, NULL, "show", "u", ad_show_user,
       (uint8_t)(sizeof(ad_show_user) / sizeof(ad_show_user[0])), NULL, NULL);
@@ -1320,7 +1320,7 @@ userns_register_commands(void)
       "Resets another user's password without their old password, on\n"
       "the authority of your admin rights. Use this to recover an\n"
       "account whose holder is locked out; users change their own\n"
-      "password with /user password. Private messages only — the new\n"
+      "password with user password. Private messages only — the new\n"
       "password appears on the command line.\n"
       "Subcommand: groupdesc",
       USERNS_GROUP_ADMIN, 100, CMD_SCOPE_ANY, METHOD_T_ANY,

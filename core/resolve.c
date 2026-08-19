@@ -1113,10 +1113,10 @@ resolve_register_commands(void)
       "For IPv4 or IPv6 addresses, performs a reverse (PTR) lookup.\n"
       "\n"
       "Examples:\n"
-      "  !resolve google.com\n"
-      "  !resolve google.com -v\n"
-      "  !resolve 8.8.8.8\n"
-      "  !resolve 2001:4860:4860::8888",
+      "  resolve google.com\n"
+      "  resolve google.com -v\n"
+      "  resolve 8.8.8.8\n"
+      "  resolve 2001:4860:4860::8888",
       USERNS_GROUP_EVERYONE, 0, CMD_SCOPE_ANY, METHOD_T_ANY, resolve_cmd_resolve, NULL, NULL, "res",
       ad_resolve, (uint8_t)(sizeof(ad_resolve) / sizeof(ad_resolve[0])),
       NULL, NULL);

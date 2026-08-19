@@ -1025,7 +1025,7 @@ cmd_parse_args(const char *args, const cmd_arg_desc_t *desc,
       if(!(desc[i].flags & CMD_ARG_OPTIONAL))
       {
         char buf[CMD_USAGE_SZ + 16];
-        snprintf(buf, sizeof(buf), "usage: /%s", usage);
+        snprintf(buf, sizeof(buf), "usage: %s", usage);
         cmd_reply(ctx, buf);
         return false;
       }
@@ -1893,7 +1893,7 @@ cmd_help_kv(const cmd_ctx_t *ctx, const char *name)
 
   if(name[0] == '\0')
   {
-    cmd_reply(ctx, "usage: /help kv <key>");
+    cmd_reply(ctx, "usage: help kv <key>");
     cmd_reply(ctx, "Show the description and type of a configuration key.");
     return;
   }
@@ -2015,7 +2015,7 @@ cmd_builtin_help(const cmd_ctx_t *ctx)
 
     snprintf(count_line, sizeof(count_line), "%u command(s)", count);
     cmd_reply(ctx, count_line);
-    cmd_reply(ctx, "Use /help <command> for detailed information.");
+    cmd_reply(ctx, "Use help <command> for detailed information.");
     return;
   }
 
@@ -2033,7 +2033,7 @@ cmd_builtin_help(const cmd_ctx_t *ctx)
   else if(strcmp(args, "-v") == 0)
   {
     // -v with no command argument: error.
-    cmd_reply(ctx, "usage: /help [-v] [command ...]");
+    cmd_reply(ctx, "usage: help [-v] [command ...]");
     return;
   }
 
@@ -2135,7 +2135,7 @@ cmd_builtin_help(const cmd_ctx_t *ctx)
     if(usage_copy != NULL && usage_copy[0] != '\0')
     {
       char line[CMD_USAGE_SZ + 16];
-      snprintf(line, sizeof(line), "usage: /%s", usage_copy);
+      snprintf(line, sizeof(line), "usage: %s", usage_copy);
       cmd_reply(ctx, line);
     }
 
@@ -2155,7 +2155,7 @@ cmd_builtin_help(const cmd_ctx_t *ctx)
   if(usage != NULL && usage[0] != '\0')
   {
     char line[CMD_USAGE_SZ + 16];
-    snprintf(line, sizeof(line), "usage: /%s", usage);
+    snprintf(line, sizeof(line), "usage: %s", usage);
     cmd_reply(ctx, line);
   }
 
@@ -2197,7 +2197,7 @@ cmd_builtin_help(const cmd_ctx_t *ctx)
 
     cmd_reply(ctx, "");
 
-    snprintf(shdr, sizeof(shdr), "subcommands of /%s:", cmd_path);
+    snprintf(shdr, sizeof(shdr), "subcommands of %s:", cmd_path);
     cmd_reply(ctx, shdr);
 
     child_count = help_show_children(ctx, d);
@@ -2218,14 +2218,14 @@ cmd_builtin_version(const cmd_ctx_t *ctx)
 static void
 cmd_builtin_show(const cmd_ctx_t *ctx)
 {
-  cmd_reply(ctx, "usage: /show <subcommand> ...");
+  cmd_reply(ctx, "usage: show <subcommand> ...");
 }
 
 // Built-in: set -- container for /set subcommands.
 static void
 cmd_builtin_set(const cmd_ctx_t *ctx)
 {
-  cmd_reply(ctx, "usage: /set <subcommand> ...");
+  cmd_reply(ctx, "usage: set <subcommand> ...");
 }
 
 // Command definition accessors
@@ -2792,9 +2792,9 @@ cmd_init(void)
       "help [-v] [command ...] | help kv <key>",
       "Command reference",
       "Lists all commands available on this bot instance.\n"
-      "Use /help <command> to see usage and subcommands.\n"
-      "Use /help -v <command> for verbose help.\n"
-      "Use /help kv <key> for configuration key help.",
+      "Use help <command> to see usage and subcommands.\n"
+      "Use help -v <command> for verbose help.\n"
+      "Use help kv <key> for configuration key help.",
       USERNS_GROUP_EVERYONE, 0, CMD_SCOPE_ANY, METHOD_T_ANY,
       cmd_builtin_help, NULL, NULL, "h", NULL, 0, NULL, &help_nl);
 
