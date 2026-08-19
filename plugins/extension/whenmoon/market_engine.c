@@ -116,6 +116,24 @@ wm_mk_kv_get_uint(const char *market_id_str, const char *suffix,
   return(kv_get_uint(path));
 }
 
+// OBS-62: the real-submit mark-staleness bound, in ms. Read fresh at
+// each submit so an operator `/set kv` retunes it without restarting the
+// market — the same reason wm_mk_paper_loss_halt_frac above reads fresh.
+// The key is DECLARED once, with its default and help, in
+// wm_market_session_refresh_kv; a registered key always answers with
+// that declaration (include/kv.h), so this is a bare read and a 0 is the
+// operator disabling the gate, not a key that went missing.
+int64_t
+wm_mk_mark_max_age_ms(const whenmoon_market_t *mk)
+{
+  char path[WM_MK_KV_BUF_SZ];
+
+  snprintf(path, sizeof(path),
+      "plugin.whenmoon.market.%s.mark_max_age_ms", mk->market_id_str);
+
+  return((int64_t)kv_get_uint(path));
+}
+
 // Caller MUST NOT hold mk->lock — KV reads can lazy-register, and
 // the function takes mk->lock internally to apply cached values
 // atomically. Writers serialise on mk->lock so concurrent
@@ -175,6 +193,18 @@ wm_market_session_refresh_kv(whenmoon_market_t *mk)
 
   if(pending_cap > WM_MARKET_PENDING_CAP)
     pending_cap = WM_MARKET_PENDING_CAP;
+
+  // OBS-62: declare the mark-staleness bound so `/set kv` and
+  // `/show kv` find it from the moment the market exists. Registered
+  // here and read at submit time by wm_mk_mark_max_age_ms — NOT cached
+  // in the session, so an operator can widen it mid-outage.
+  (void)wm_mk_kv_get_uint(mk->market_id_str, "mark_max_age_ms", "60000",
+      WM_MARKET_DEFAULT_MARK_MAX_AGE_MS,
+      "Real-mode mark staleness bound in milliseconds. A real submit is"
+      " refused when the last ticker or trade this market observed"
+      " arrived longer ago than this — the gate that asks whether the"
+      " market being priced against is still there. 0 disables it."
+      " Operator force-trades carrying an explicit price are exempt.");
 
   // WM-BREAKER-1: register the breaker knobs so `/set kv` finds them
   // before the first paper fill. Deliberately NOT cached in the
@@ -1101,7 +1131,7 @@ wm_market_engine_on_signal_with_mk(whenmoon_market_t *mk, double mark_px,
     (void)wm_market_engine_real_submit_locked(mk,
         (advice == WM_MK_ADVICE_BUY) ? 'b' : 's',
         qty, mark_px, sig->ts_ms != 0 ? sig->ts_ms : mark_ms,
-        sig, errbuf, sizeof(errbuf));
+        sig, false, errbuf, sizeof(errbuf));
 
     (void)wm_market_persist_locked(mk);
 
@@ -1238,6 +1268,7 @@ wm_market_engine_force_trade_locked(whenmoon_market_t *mk, char side,
   uint64_t         fills_pre;
   uint64_t         fills_post;
   bool             is_buy;
+  bool             px_named;
   bool             ok;
 
   #define ERRSET(...) do { \
@@ -1264,8 +1295,12 @@ wm_market_engine_force_trade_locked(whenmoon_market_t *mk, char side,
   mode   = mk->session.mode;
 
   // Resolve exec / limit px. Operator override always wins; otherwise
-  // fall through to last live ticker, then cached advice mark.
-  exec_px = px_override;
+  // fall through to last live ticker, then cached advice mark. OBS-62:
+  // an override is the operator pricing the order themselves, which is
+  // what waives the staleness gate below — the fallbacks are marks this
+  // plugin inferred and stay subject to it.
+  exec_px  = px_override;
+  px_named = (px_override > 0.0);
 
   if(exec_px <= 0.0)
   {
@@ -1282,8 +1317,9 @@ wm_market_engine_force_trade_locked(whenmoon_market_t *mk, char side,
   }
 
   // Real-mode dispatch — sig=NULL is honored by the helper (param
-  // reserved for future audit hooks per live.c:975). All five gates
-  // apply; helper self-logs CLAM_WARN on every gate trip and writes
+  // reserved for future audit hooks per live.c:975). Every gate applies
+  // except mark-staleness, which `px_named` waives (OBS-62); the
+  // helper self-logs CLAM_WARN on every gate trip and writes
   // `errbuf` for the verb to surface verbatim. No persist call here:
   // wm_market_engine_real_submit_locked already persists the pending
   // row, and the fill-arrival path persists from
@@ -1291,7 +1327,7 @@ wm_market_engine_force_trade_locked(whenmoon_market_t *mk, char side,
   if(mode == WM_MARKET_MODE_REAL)
   {
     ok = wm_market_engine_real_submit_locked(mk, side, qty, exec_px,
-        ts_ms, NULL, errbuf, errbuf_sz);
+        ts_ms, NULL, px_named, errbuf, errbuf_sz);
 
     if(ok == SUCCESS)
       clam(CLAM_INFO, WHENMOON_CTX,

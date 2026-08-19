@@ -234,6 +234,14 @@ typedef struct
 #define WM_MARKET_DEFAULT_QUOTE_ALLOC_FRAC     1.0
 #define WM_MARKET_DEFAULT_QUOTE_ALLOC_MAX      0.0
 
+// OBS-62: real-mode mark staleness bound (ms). Every other real-submit
+// gate asks a question about us; this one asks whether the market we are
+// pricing against is still there. Measured against `last_feed_ms` — see
+// the field for why the caller's stamp cannot answer it. 0 disables.
+// Read fresh at each submit so an operator `/set kv` retunes it without
+// restarting the market.
+#define WM_MARKET_DEFAULT_MARK_MAX_AGE_MS    60000u
+
 // Initial capacity for the plugin-global market array. Grows via
 // mem_realloc as `wm_market_add` inserts; there is no hard cap.
 #define WM_MARKET_INIT_CAP       8
@@ -403,6 +411,15 @@ typedef struct whenmoon_market
   // an append-only field per the WM-MK-2 discipline (offsets above stay
   // stable for strategies mirroring them).
   bool                  feed_gap;
+
+  // OBS-62: wall-clock ms at which this market last had a price event
+  // (ticker or trade) delivered to it — OUR arrival stamp, not the
+  // venue's. `last_tick_ms` above cannot serve: it carries the venue's
+  // own clock, which a kraken v2 ticker frame does not send at all
+  // (kr_ws_dispatch_ticker leaves it 0), and the caller's `mark_ms` is a
+  // claim a strategy sets for itself. Transient, and an append-only
+  // field per the WM-MK-2 discipline. 0 = nothing observed yet.
+  int64_t               last_feed_ms;
 } whenmoon_market_t;
 
 struct whenmoon_markets

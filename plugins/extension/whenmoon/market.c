@@ -1109,6 +1109,7 @@ wm_market_on_event(const exchange_ws_event_t *ev, void *user)
   whenmoon_state_t             *st;
   whenmoon_market_t            *mk;
   const char                   *exch;
+  int64_t                       recv_ms;
 
   if(ev == NULL || binding == NULL)
     return;
@@ -1121,6 +1122,10 @@ wm_market_on_event(const exchange_ws_event_t *ev, void *user)
 
   if(ev->seq_gap)
     wm_market_note_feed_gap(st, exch);
+
+  // One read for the whole fan-out: every instance on this product
+  // heard the same price at the same moment (OBS-62).
+  recv_ms = wm_now_ms();
 
   switch(ev->channel)
   {
@@ -1147,6 +1152,7 @@ wm_market_on_event(const exchange_ws_event_t *ev, void *user)
         pthread_mutex_lock(&mk->lock);
         mk->last_px      = t->price;
         mk->last_tick_ms = t->time_ms;
+        mk->last_feed_ms = recv_ms;
         pthread_mutex_unlock(&mk->lock);
       }
       pthread_rwlock_unlock(&st->markets->arr_lock);
@@ -1180,6 +1186,7 @@ wm_market_on_event(const exchange_ws_event_t *ev, void *user)
 
         mk->last_px      = m->price;
         mk->last_tick_ms = m->time_ms;
+        mk->last_feed_ms = recv_ms;
 
         // Drive the multi-grain cascade. Aggregator owns the close +
         // indicator pass; this hot path stays under one lock acquire.

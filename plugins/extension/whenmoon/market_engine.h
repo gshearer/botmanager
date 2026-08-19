@@ -111,6 +111,11 @@ void wm_market_session_refresh_kv(whenmoon_market_t *mk);
 double wm_mk_kv_get_double(const char *market_id_str, const char *suffix,
     const char *def_str, double def_val, const char *help);
 
+// OBS-62: this market's mark-staleness bound in ms, read fresh (0 =
+// the operator disabled the gate). Declared in
+// wm_market_session_refresh_kv; see WM_MARKET_DEFAULT_MARK_MAX_AGE_MS.
+int64_t wm_mk_mark_max_age_ms(const whenmoon_market_t *mk);
+
 // Signal entry point. Idempotent w.r.t. position direction:
 // no-op when the strategy advice already matches the current state.
 // Risk gates (daily-loss, max-notional, pending-cap) apply only when
@@ -146,6 +151,11 @@ void wm_market_engine_record_external_fill(const char *market_id_str,
 //   REAL           -> wm_market_engine_real_submit_locked unchanged
 //                     (credentials + daily-loss + pending-cap +
 //                     max-notional gates apply).
+//
+// OBS-62: an explicit `px_override` also waives the mark-staleness gate,
+// and nothing else. That price is the operator's own claim rather than a
+// mark this plugin inferred from a feed — and gating it would take the
+// manual exit away exactly when the feed has gone quiet.
 //
 // Resolved exec px (synth) / limit px (real):
 //   px_override > 0.0   -> use exactly (no synth slippage)

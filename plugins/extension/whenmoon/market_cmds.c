@@ -776,7 +776,8 @@ wm_market_register_verbs(void)
         "Change a market's mode. PAPER = synthetic fills against the"
         " cached mark + paper-stats accumulation. REAL = exchange"
         " submission + risk gates (daily-loss bps, max-notional,"
-        " pending-cap) + real-stats accumulation. MANUAL = strategies"
+        " pending-cap, mark staleness) + real-stats accumulation."
+        " MANUAL = strategies"
         " still receive ticks and log advice but the market takes no"
         " action; force-trades (WM-MK-4) drive the position. Refused"
         " when the market currently holds a position — flatten first.",
@@ -789,8 +790,8 @@ wm_market_register_verbs(void)
   // WM-MK-4: operator-issued forced trade. Bypasses strategy advisors
   // and the MANUAL mode "no auto-action" rule. Same fill-ledger choke
   // points as accepted strategy advice — apply_fill_locked for synth
-  // modes, real_submit_locked (with the four real-mode gates) for real
-  // mode.
+  // modes, real_submit_locked (with the real-mode gates) for real mode.
+  // An explicit px waives mark-staleness alone (OBS-62).
   if(cmd_register("whenmoon", "force",
         "whenmoon market force <exch>-<base>-<quote>[@<instance>]"
         " <buy|sell> <qty> [<px>]",
@@ -799,7 +800,9 @@ wm_market_register_verbs(void)
         " at <px> or last ticker (paper applies synth slippage only on"
         " the fallback path). Real mode: limit order via the exchange"
         " abstraction (credentials, daily-loss, pending-cap, and"
-        " max-notional gates apply; fill arrives asynchronously). Same"
+        " max-notional gates apply; fill arrives asynchronously). Giving"
+        " an explicit <px> also waives the mark-staleness gate — the"
+        " price is yours, not one inferred from a feed. Same"
         " fill ledger choke point as accepted strategy advice — stats"
         " accumulate in the current mode's ledger. Refused on"
         " sell-against-flat (manual+paper) and any real-mode gate trip.",

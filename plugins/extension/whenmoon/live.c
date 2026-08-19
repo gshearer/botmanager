@@ -345,7 +345,7 @@ wm_live_market_order_done(const exchange_order_result_t *res, void *user)
 bool
 wm_market_engine_real_submit_locked(whenmoon_market_t *mk,
     char side, double qty, double mark_px, int64_t mark_ms,
-    const wm_strategy_signal_t *sig,
+    const wm_strategy_signal_t *sig, bool px_named,
     char *errbuf, size_t errbuf_sz)
 {
   exchange_place_order_req_t  req;
@@ -355,6 +355,8 @@ wm_market_engine_real_submit_locked(whenmoon_market_t *mk,
   double                      starting_cash;
   double                      daily_cap;
   double                      clipped_qty;
+  int64_t                     mark_max_age_ms;
+  int64_t                     mark_age_ms;
   const char                 *side_str;
   bool                        is_buy;
 
@@ -449,6 +451,43 @@ wm_market_engine_real_submit_locked(whenmoon_market_t *mk,
         mk->session.max_notional, mark_px);
 
     clipped_qty = next;
+  }
+
+  // Gate 5: mark staleness (OBS-62). Every gate above asks a question
+  // about us; this one asks whether the market being priced against is
+  // still there. It measures `mk->last_feed_ms` — when a ticker or trade
+  // for this product last reached us — because neither stamp travelling
+  // with the price can answer: a strategy sets `mark_ms` for itself, and
+  // a synthesized catch-up bar wears a current timestamp over a
+  // carried-forward close. `px_named` waives the gate: the operator
+  // priced that order, and refusing it would take the manual exit away
+  // exactly when the feed has gone quiet.
+  mark_max_age_ms = px_named ? 0 : wm_mk_mark_max_age_ms(mk);
+
+  if(mark_max_age_ms > 0)
+  {
+    if(mk->last_feed_ms == 0)
+    {
+      ERRSET("no ticker or trade observed on %s yet", mk->market_id_str);
+      clam(CLAM_WARN, WM_LIVE_CTX,
+          "%s real submit FAIL: no price observed yet",
+          mk->market_id_str);
+      return(FAIL);
+    }
+
+    mark_age_ms = wm_now_ms() - mk->last_feed_ms;
+
+    if(mark_age_ms > mark_max_age_ms)
+    {
+      ERRSET("mark stale: last price %lldms ago, bound %lldms",
+          (long long)mark_age_ms, (long long)mark_max_age_ms);
+      clam(CLAM_WARN, WM_LIVE_CTX,
+          "%s real submit FAIL: last price %lldms ago >"
+          " mark_max_age_ms %lldms",
+          mk->market_id_str, (long long)mark_age_ms,
+          (long long)mark_max_age_ms);
+      return(FAIL);
+    }
   }
 
   // Build the place-order request. mk->product_id already carries the

@@ -7,7 +7,8 @@
 //
 // No per-exchange enable switch exists — registration of the exchange
 // (creds present + market in REAL mode) is the only gate beyond the
-// per-market risk caps (daily_loss_bps, max_notional, pending_cap).
+// per-market risk caps (daily_loss_bps, max_notional, pending_cap,
+// mark_max_age_ms).
 // Operator-side halt is /whenmoon manual, which flips every market into
 // MANUAL mode and short-circuits the real-submit path.
 //
@@ -64,10 +65,16 @@ void wm_live_ws_resub_all(struct whenmoon_state *st,
 // queued at the exchange abstraction; FAIL on gate trip, sizer hold,
 // OOM, or submit error (errbuf populated when non-NULL). FAIL leaves
 // no pending row. Gate cascade: credentials, daily_loss_bps,
-// pending-cap, max-notional clip.
+// pending-cap, max-notional clip, mark staleness.
+//
+// OBS-62: `px_named` says the price came from the operator rather than
+// from a mark this plugin inferred (a force-trade's explicit px), and
+// waives the staleness gate alone. `mark_ms` is recorded, never trusted
+// for freshness — a strategy sets it for itself; the gate measures
+// `mk->last_feed_ms`.
 bool wm_market_engine_real_submit_locked(whenmoon_market_t *mk,
     char side, double qty, double mark_px, int64_t mark_ms,
-    const wm_strategy_signal_t *sig,
+    const wm_strategy_signal_t *sig, bool px_named,
     char *errbuf, size_t errbuf_sz);
 
 // WM-DISC-1: discretionary-treasury freeze tripwire (CFO.md sec. 3).
