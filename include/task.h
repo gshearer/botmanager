@@ -31,6 +31,22 @@ typedef enum
   TASK_ANY          // any thread
 } task_type_t;
 
+// Which slice of the worker pool a task may occupy. Interactive work —
+// a command body, with someone waiting on the reply — may use every
+// worker there is. Background work is capped at the pool minus
+// `core.pool.reserve_interactive`, so no flood of it can leave a
+// command with nowhere to run: the resolver alone submits one task per
+// lookup and its own cap equals the whole pool.
+//
+// Background is the default and the common case. A task declares
+// itself interactive by setting `lane` between task_create() and
+// task_submit(); cmd.c is the only place that does.
+typedef enum
+{
+  TASK_BACKGROUND = 0,
+  TASK_INTERACTIVE
+} task_lane_t;
+
 // Controls the lifecycle of a task.
 typedef enum
 {
@@ -62,6 +78,7 @@ struct task
   char            name[TASK_NAME_SZ];
   task_type_t     type;
   task_kind_t     kind;             // lifecycle kind (default TASK_ONCE)
+  task_lane_t     lane;             // pool slice (default TASK_BACKGROUND)
   uint8_t         priority;         // 0 = highest, 254 = lowest
 
   // Set by callback before returning, on whatever thread is running it
@@ -163,7 +180,10 @@ task_handle_t task_add_deferred(const char *name, task_type_t type,
 bool task_cancel(task_handle_t h);
 
 // Returns a task in RUNNING state, or NULL if none available.
-task_t *task_assign(task_type_t type);
+// `allow_background` false narrows the walk to interactive tasks: the
+// asking worker holds no background slot, so it may only take work that
+// does not need one.
+task_t *task_assign(task_type_t type, bool allow_background);
 
 // Block until work may be available or timeout_ms expires.
 // Promotes expired sleeping tasks internally.

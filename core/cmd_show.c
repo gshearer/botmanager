@@ -728,6 +728,17 @@ cmd_show_pool(const cmd_ctx_t *ctx)
       active, ps.idle);
   cmd_reply(ctx, line);
 
+  // What a command would find waiting for it: background work is capped
+  // short of the pool so the difference is always somewhere to run.
+  snprintf(line, sizeof(line),
+      "  " CLR_CYAN "background" CLR_RESET "   "
+      "%s%u" CLR_RESET " / %u busy   "
+      CLR_GRAY "(%u reserved for commands)" CLR_RESET,
+      ps.bg_active >= ps.bg_budget ? CLR_YELLOW : CLR_GREEN,
+      ps.bg_active, ps.bg_budget,
+      max_threads > ps.bg_budget ? (uint32_t)(max_threads - ps.bg_budget) : 0);
+  cmd_reply(ctx, line);
+
   snprintf(line, sizeof(line),
       "  " CLR_CYAN "lifetime" CLR_RESET
       "     " CLR_BOLD "%lu" CLR_RESET " jobs completed",

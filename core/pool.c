@@ -107,6 +107,37 @@ check_spare(void)
   pthread_mutex_unlock(&pool_mutex);
 }
 
+// Claim one of the background slots. A worker holds a slot for exactly
+// as long as it runs a background task, so the count is the number of
+// workers a flood of background work can occupy — every worker above it
+// stays reachable by a command.
+//
+// Claimed BEFORE the queue walk rather than after it: sixty-four
+// workers waking together would each see room and each take background
+// work, which is the flood this exists to bound.
+static bool
+pool_bg_claim(void)
+{
+  bool got;
+
+  pthread_mutex_lock(&pool_mutex);
+  got = (pool_bg < pool_cfg.bg_budget);
+
+  if(got)
+    pool_bg++;
+
+  pthread_mutex_unlock(&pool_mutex);
+  return(got);
+}
+
+static void
+pool_bg_release(void)
+{
+  pthread_mutex_lock(&pool_mutex);
+  pool_bg--;
+  pthread_mutex_unlock(&pool_mutex);
+}
+
 static void *
 worker_entry(void *arg)
 {
@@ -122,8 +153,18 @@ worker_entry(void *arg)
   {
     task_t       *t;
     task_state_t  result;
+    bool          claimed;
+    bool          background;
 
-    t = task_assign(type);
+    claimed    = pool_bg_claim();
+    t          = task_assign(type, claimed);
+    background = (t != NULL && t->lane == TASK_BACKGROUND);
+
+    // A claim is permission to take background work, not a hold on the
+    // work taken: a worker that took none, or took an interactive task,
+    // gives its slot back before it can shut another worker out.
+    if(claimed && !background)
+      pool_bg_release();
 
     if(t == NULL)
     {
@@ -152,6 +193,9 @@ worker_entry(void *arg)
     // Execute the callback.
     t->cb(t);
     result = task_finish(t);
+
+    if(background)
+      pool_bg_release();
 
     w->jobs++;
     w->last_active = time(NULL);
@@ -266,6 +310,29 @@ persist_entry(void *arg)
 
 // Public API
 
+// Recompute how many workers may run background tasks at once. The
+// reserve is what is left for commands, so it cannot take the last
+// worker: a budget of zero is not a reservation, it is a pool that
+// never resolves a name again.
+static void
+pool_bg_budget_apply(void)
+{
+  uint16_t max     = pool_cfg.max_threads;
+  uint16_t reserve = pool_cfg.reserve;
+
+  if(reserve >= max)
+  {
+    clam(CLAM_WARN, "pool",
+        "reserve_interactive %u leaves no worker for background work "
+        "with max_threads %u — reserving %u",
+        reserve, max, (unsigned)(max - 1));
+    reserve = (uint16_t)(max - 1);
+  }
+
+  pool_cfg.reserve   = reserve;
+  pool_cfg.bg_budget = (uint16_t)(max - reserve);
+}
+
 // Override pool limits. Must be called before pool_init().
 // min_spare: minimum idle workers before scaling up
 // max_idle_secs: seconds before an idle worker retires
@@ -282,6 +349,8 @@ pool_set_limits(uint16_t max_threads, uint16_t min_threads,
   pool_cfg.min_threads   = min_threads;
   pool_cfg.min_spare     = min_spare;
   pool_cfg.max_idle_secs = max_idle_secs;
+
+  pool_bg_budget_apply();
 }
 
 // Initialize the thread pool. Allocates worker slots and spawns
@@ -349,7 +418,9 @@ pool_run_parent(void)
   {
     task_state_t result;
 
-    t = task_assign(TASK_PARENT);
+    // The parent is one dedicated thread, not part of the capacity the
+    // reserve divides up, so it never asks for a background slot.
+    t = task_assign(TASK_PARENT, true);
 
     if(t != NULL)
     {
@@ -580,6 +651,8 @@ pool_get_stats(pool_stats_t *out)
   out->idle         = pool_idle;
   out->persist      = persist_count;
   out->peak_workers = pool_peak;
+  out->bg_active    = pool_bg;
+  out->bg_budget    = pool_cfg.bg_budget;
 
   // Sum jobs across all worker slots.
   out->jobs_completed = 0;
@@ -609,6 +682,7 @@ pool_load_config(void)
   uint16_t min_spare     = (uint16_t)kv_get_uint("core.pool.min_spare");
   uint32_t max_idle_secs = (uint32_t)kv_get_uint("core.pool.max_idle_secs");
   uint32_t wait_ms       = (uint32_t)kv_get_uint("core.pool.wait_ms");
+  uint16_t reserve       = (uint16_t)kv_get_uint("core.pool.reserve_interactive");
 
   // Sanity clamps.
   if(max_threads < 1)   max_threads = 1;
@@ -624,6 +698,9 @@ pool_load_config(void)
   pool_cfg.min_spare     = min_spare;
   pool_cfg.max_idle_secs = max_idle_secs;
   pool_cfg.wait_ms       = wait_ms;
+  pool_cfg.reserve       = reserve;
+
+  pool_bg_budget_apply();
 }
 
 static void
@@ -649,6 +726,10 @@ pool_register_kv(void)
       pool_kv_changed, NULL, "Seconds before excess idle threads exit");
   kv_register("core.pool.wait_ms",       KV_UINT32, "1000",
       pool_kv_changed, NULL, "Thread work-queue wait timeout in milliseconds");
+  kv_register("core.pool.reserve_interactive", KV_UINT16, "8",
+      pool_kv_changed, NULL,
+      "Workers background work may never occupy, kept for command bodies "
+      "(0 lets background work fill the pool)");
 }
 
 // Register KV keys and load initial pool configuration from the store.
@@ -660,7 +741,8 @@ pool_register_config(void)
   pool_load_config();
 
   clam(CLAM_DEBUG, "pool", "config loaded from KV (max: %u, min: %u, "
-      "spare: %u, idle: %us, wait: %ums)",
+      "spare: %u, idle: %us, wait: %ums, reserve: %u)",
       pool_cfg.max_threads, pool_cfg.min_threads,
-      pool_cfg.min_spare, pool_cfg.max_idle_secs, pool_cfg.wait_ms);
+      pool_cfg.min_spare, pool_cfg.max_idle_secs, pool_cfg.wait_ms,
+      pool_cfg.reserve);
 }

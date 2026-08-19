@@ -1656,16 +1656,13 @@ cmd_dispatch(bot_inst_t *inst, const method_msg_t *msg)
   // Submit task.
   snprintf(task_name, sizeof(task_name), "cmd:%s", cmd_name);
 
-  t = task_add(task_name, TASK_THREAD, 128, cmd_task_cb, td);
-
-  if(t == NULL)
-  {
-    clam(CLAM_WARN, "cmd_dispatch",
-        "'%s': failed to submit task for '%s'",
-        bot_inst_name(inst), cmd_name);
-    cmd_task_data_free(td);
-    return(FAIL);
-  }
+  // The lane, not the priority, is what keeps a command answerable: a
+  // priority orders the queue and a queue is no use with every worker
+  // parked in a DNS lookup. Set before submit — a submitted task may
+  // already have run and been freed (task.h).
+  t = task_create(task_name, TASK_THREAD, 128, cmd_task_cb, td);
+  t->lane = TASK_INTERACTIVE;
+  task_submit(t);
 
   __atomic_add_fetch(&cmd_stat_dispatches, 1, __ATOMIC_RELAXED);
 
@@ -2714,16 +2711,10 @@ cmd_dispatch_resolved(bot_inst_t *inst, const method_msg_t *msg,
 
   snprintf(task_name, sizeof(task_name), "cmd:%s", def->name);
 
-  t = task_add(task_name, TASK_THREAD, 128, cmd_task_cb, td);
-
-  if(t == NULL)
-  {
-    clam(CLAM_WARN, "cmd_dispatch_resolved",
-        "'%s': failed to submit task for '%s'",
-        bot_inst_name(inst), def->name);
-    cmd_task_data_free(td);
-    return(FAIL);
-  }
+  // Interactive for the same reason cmd_dispatch's task is.
+  t = task_create(task_name, TASK_THREAD, 128, cmd_task_cb, td);
+  t->lane = TASK_INTERACTIVE;
+  task_submit(t);
 
   __atomic_add_fetch(&cmd_stat_dispatches, 1, __ATOMIC_RELAXED);
   bot_inc_cmd_count(inst);

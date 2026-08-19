@@ -173,6 +173,7 @@ task_create(const char *name, task_type_t type, uint8_t priority,
   t->state       = TASK_WAITING;
   t->type        = type;
   t->kind        = TASK_ONCE;
+  t->lane        = TASK_BACKGROUND;
   t->priority    = priority;
   t->cb          = cb;
   t->data        = data;
@@ -472,7 +473,7 @@ task_cancel(task_handle_t h)
 }
 
 task_t *
-task_assign(task_type_t type)
+task_assign(task_type_t type, bool allow_background)
 {
   task_t **pp;
 
@@ -481,15 +482,19 @@ task_assign(task_type_t type)
   // Promote any expired timers to the ready queue.
   timer_promote();
 
-  // Walk the ready queue (sorted by priority) and find the first
-  // task whose type matches.
+  // Walk the ready queue (sorted by priority) and find the first task
+  // this worker may run: its type has to match, and a worker holding no
+  // background slot passes over background work rather than waiting for
+  // one — the reserve is spent on the queue's interactive tasks, not on
+  // the head of it.
   pp = &ready_head;
 
   while(*pp != NULL)
   {
     task_t *t = *pp;
 
-    if(type_matches(t->type, type))
+    if(type_matches(t->type, type)
+        && (allow_background || t->lane == TASK_INTERACTIVE))
     {
       // Dequeue.
       *pp = t->next;

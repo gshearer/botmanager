@@ -13,6 +13,8 @@ typedef struct
   uint16_t persist;       // dedicated persist task threads
   uint64_t jobs_completed; // lifetime total tasks executed across all workers
   uint16_t peak_workers;  // high-water mark of worker count
+  uint16_t bg_active;     // workers currently running background tasks
+  uint16_t bg_budget;     // most that may do so at once
 } pool_stats_t;
 
 // Must be called before pool_init(). Defaults: max=64, min=1, spare=1,
@@ -103,6 +105,8 @@ typedef struct
   _Atomic uint16_t min_spare;
   _Atomic uint32_t max_idle_secs;
   _Atomic uint32_t wait_ms;
+  _Atomic uint16_t reserve;      // workers background work may not occupy
+  _Atomic uint16_t bg_budget;    // derived: max_threads - reserve, never 0
 } pool_cfg_t;
 
 static pool_cfg_t pool_cfg = {
@@ -111,6 +115,8 @@ static pool_cfg_t pool_cfg = {
   .min_spare     = 1,
   .max_idle_secs = 300,
   .wait_ms       = 1000,
+  .reserve       = 8,
+  .bg_budget     = 56,
 };
 
 static worker_t        *workers = NULL;
@@ -118,6 +124,7 @@ static pthread_mutex_t  pool_mutex;
 static uint16_t         pool_size = 0;    // alive elastic workers (not parent)
 static uint16_t         pool_idle = 0;    // elastic workers in task_wait
 static uint16_t         pool_peak = 0;    // high-water mark of pool_size
+static uint16_t         pool_bg   = 0;    // elastic workers on background work
 // _Atomic for the same reason as pool_cfg_t above, and it is the widest
 // instance of it in the tree: pool_shutdown() writes this on whichever
 // thread asked to stop, while every elastic worker loop, the parent
