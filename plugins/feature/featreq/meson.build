@@ -1,0 +1,10 @@
+featreq_plugin = shared_library('featreq',
+  'featreq.c',
+  'featreq_vocab.c',
+  'featreq_db.c',
+  'featreq_cmds.c',
+  'featreq_show.c',
+  include_directories : [inc_include],
+  override_options : ['b_lundef=false'],
+  install : true,
+)
