@@ -1074,6 +1074,34 @@ wm_market_on_candles(const exchange_candles_result_t *res, void *user)
   mem_free(ctx);
 }
 
+// OBS-65/61: a sequence gap is a fact about the CONNECTION, so it lands
+// on every market that connection feeds — not just the product whose
+// event happened to carry the report, and not just the channel it came
+// in on. Recorded, never acted on here: what makes it matter is whether
+// the window it covers is one the aggregator is about to fabricate over,
+// and only the aggregator knows that.
+static void
+wm_market_note_feed_gap(whenmoon_state_t *st, const char *exch)
+{
+  uint32_t i;
+
+  pthread_rwlock_rdlock(&st->markets->arr_lock);
+
+  for(i = 0; i < st->markets->n_markets; i++)
+  {
+    whenmoon_market_t *mk = st->markets->arr[i];
+
+    if(strncmp(mk->exchange_name, exch, EXCHANGE_NAME_SZ) != 0)
+      continue;
+
+    pthread_mutex_lock(&mk->lock);
+    mk->feed_gap = true;
+    pthread_mutex_unlock(&mk->lock);
+  }
+
+  pthread_rwlock_unlock(&st->markets->arr_lock);
+}
+
 void
 wm_market_on_event(const exchange_ws_event_t *ev, void *user)
 {
@@ -1090,6 +1118,9 @@ wm_market_on_event(const exchange_ws_event_t *ev, void *user)
 
   if(st == NULL || st->markets == NULL || exch == NULL || exch[0] == '\0')
     return;
+
+  if(ev->seq_gap)
+    wm_market_note_feed_gap(st, exch);
 
   switch(ev->channel)
   {

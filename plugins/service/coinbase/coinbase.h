@@ -333,9 +333,10 @@ void    cb_ws_channels_deinit(void);
 void    cb_ws_channels_on_open(void);
 
 // Reader-thread hook for the reassembled text frame. Parses the JSON,
-// applies sequence-gap detection, and fans out typed events to every
-// matching local subscriber. Takes ownership of nothing; the buffer
-// pointer is only valid for the duration of the call.
+// applies connection-level sequence-gap detection (OBS-65), and fans
+// out typed events to every matching local subscriber. Takes ownership
+// of nothing; the buffer pointer is only valid for the duration of the
+// call.
 void    cb_ws_channels_dispatch(const char *buf, size_t len);
 
 // Subscribe-ack watchdog probe for the transport's reader loop. True

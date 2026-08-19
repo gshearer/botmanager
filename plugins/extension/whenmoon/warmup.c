@@ -414,6 +414,108 @@ wm_market_warmup_recheck_task(task_t *t)
 }
 
 // --------------------------------------------------------------------
+// OBS-61: post-outage repair
+// --------------------------------------------------------------------
+
+// One hop off the reader thread, then the ordinary warmup lifecycle —
+// which already gap-fills the recent window from the venue and replays
+// it over a ring it resets first, so it repairs a hole without needing
+// to know one is there.
+static void
+wm_warmup_repair_task(task_t *t)
+{
+  wm_warm_chain_t   *chain;
+  wm_warmup_ctx_t   *ctx;
+  whenmoon_market_t *mk;
+  pthread_rwlock_t  *arr;
+
+  if(t == NULL)
+    return;
+
+  chain    = t->data;
+  t->state = TASK_ENDED;
+
+  if(chain == NULL)
+    return;
+
+  // OBS-43: enter before anything of the plugin's is touched, above all
+  // before the container lock.
+  if(!wm_warm_chain_enter(chain))
+  {
+    wm_warm_chain_close(chain);
+    return;
+  }
+
+  ctx = wm_warm_chain_ctx(chain);
+
+  if(ctx->st == NULL || ctx->st->markets == NULL)
+  {
+    wm_warm_chain_close(chain);
+    return;
+  }
+
+  arr = &ctx->st->markets->arr_lock;
+
+  // WM-MKT-ARR-UAF-1: hold the container lock across every use of mk, as
+  // the convergence re-check does — wm_market_warmup_begin takes no
+  // container lock of its own, and a market removed while the market was
+  // held warming is exactly the case this repair must survive.
+  pthread_rwlock_rdlock(arr);
+
+  mk = wm_market_lookup_by_id(ctx->st, ctx->market_id_str);
+
+  if(mk != NULL)
+    wm_market_warmup_begin(ctx->st, mk);
+
+  pthread_rwlock_unlock(arr);
+  wm_warm_chain_close(chain);
+}
+
+void
+wm_warmup_repair_arm(whenmoon_market_t *mk)
+{
+  whenmoon_state_t *st;
+  wm_warmup_ctx_t  *ctx;
+  wm_warm_chain_t  *chain;
+
+  st = whenmoon_get_state();
+
+  if(st == NULL || mk == NULL)
+    return;
+
+  // The half that must not depend on scheduling: a market that is not
+  // READY acts on no advice, and that is true from this line onward
+  // whether or not the task below ever runs.
+  wm_warm_set_state(mk, WM_WARM_WARMING);
+
+  ctx = mem_alloc("whenmoon", "warmup_ctx", sizeof(*ctx));
+
+  ctx->st             = st;
+  ctx->limit_override = 0;
+  snprintf(ctx->market_id_str, sizeof(ctx->market_id_str), "%s",
+      mk->market_id_str);
+
+  chain = wm_warm_chain_open(ctx, mem_free);
+
+  if(chain == NULL)
+  {
+    // Stopping. Nothing is owed: warmup runs from scratch on the next
+    // start, and a market that never starts again never acts.
+    mem_free(ctx);
+    return;
+  }
+
+  if(!wm_warm_chain_arm(chain, "wm_warm_repair", WM_WARM_REPAIR_DELAY_MS,
+      wm_warmup_repair_task))
+  {
+    wm_warm_chain_close(chain);
+    clam(CLAM_WARN, WHENMOON_CTX,
+        "market %s: feed-gap repair not scheduled — held warming",
+        mk->market_id_str);
+  }
+}
+
+// --------------------------------------------------------------------
 // WM-TAILFILL-COALESCE-1: global tail-fill sweep
 //
 // ONE periodic task for the plugin. Each tick: snapshot the DISTINCT

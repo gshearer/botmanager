@@ -163,21 +163,23 @@ typedef enum
 // valid for the duration of the callback. Consumers that need to keep
 // it must copy. Variant selected by `channel`.
 //
-// `gap` is reserved for future use and currently always false.
-// Coinbase's `sequence` is per-product-global (advances on every event
-// for the product across all channels), so per-(channel, product) gap
-// detection produces false positives on any partial subscription. True
-// integrity tracking requires a `full` subscription and per-product
-// (not per-channel) bookkeeping; we don't subscribe to `full` for
-// trading. The field is kept for ABI stability so consumers that
-// currently read it continue to compile and behave correctly (no gaps
-// reported = no spurious order-book snapshot refreshes).
+// `sequence` is the envelope's `sequence_num`: on Advanced Trade it
+// counts every frame the gateway sent THIS CONNECTION, densely, across
+// all channels, and it restarts at 0 on each connection. -1 on a frame
+// the gateway did not number.
+//
+// `gap` says frames were lost before this event — a skip in that
+// counter, or a reconnect. It is per SUBSCRIBER and reported once: the
+// first event delivered to you after the hole carries it. It answers
+// "was anything lost", never "which product" (OBS-65), which is enough
+// for a consumer choosing whether to trust a window of its own history
+// and not enough for one repairing a per-product order book.
 typedef struct
 {
   coinbase_ws_channel_t channel;
   const char           *product_id;  // NULL for status / server-wide
-  int64_t               sequence;    // channel-specific; 0 when n/a
-  bool                  gap;         // sequence jumped; payload may be stale
+  int64_t               sequence;    // frame # on this connection; -1 if none
+  bool                  gap;         // frames were lost before this event
   const void           *payload;     // points at a typed struct below
 } coinbase_ws_event_t;
 

@@ -424,10 +424,26 @@ typedef struct
 // Wrapping fanout event. `channel` discriminates the payload union;
 // `product_id` mirrors the inner payload's product where applicable so
 // fanout subscribers can switch on the wrapper alone.
+//
+// `seq_gap` (OBS-65) says the venue's own frame numbering shows frames
+// were lost before this event, or that the feed reconnected. It is a
+// fact about the CONNECTION — it does not say which products the lost
+// frames carried, and it must not be read as one. What it is for is the
+// question a consumer of derived history has to answer after a feed
+// outage: is the quiet interval I am about to reason over real, or is it
+// missing data? Reported once per hole per subscriber, on the first
+// event that subscriber receives after it.
+//
+// ⛔ False from kraken and gemini, and that is a statement about the
+// PROTOCOLS, not a stub: Kraken WS v2 and Gemini Market Data v2 have no
+// comparable dense per-connection counter that anyone has measured. A
+// consumer must therefore treat `false` as "no answer" rather than as
+// "no loss", and keep whatever coverage check it already had.
 typedef struct
 {
   exchange_ws_channel_t channel;
   char                  product_id[EXCHANGE_PRODUCT_ID_SZ];
+  bool                  seq_gap;
   union
   {
     exchange_ws_ticker_t      ticker;     // EXCH_WS_TICKER

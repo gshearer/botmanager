@@ -51,9 +51,12 @@
 // the handshake (handled in gemini_ws.c); no further multiplexer work
 // is needed beyond logging the OPEN transition.
 //
-// Per `finding_cb_ws_seq_gap_false_positive`, we leave
-// exchange_ws_event_t.gap ABI-only / always-false. No per-product gap
-// detection.
+// exchange_ws_event_t.seq_gap is always false from this driver, and
+// that is a fact about Gemini Market Data v2 rather than a stub: it
+// carries no dense per-connection frame counter of the kind OBS-65
+// measured on Coinbase Advanced Trade. Nobody has probed for one — if
+// you do, the census belongs in OBS-65's row, and per-PRODUCT gap
+// detection is still refused (`finding_cb_ws_seq_gap_false_positive`).
 
 #define GEM_INTERNAL
 #include "gemini.h"

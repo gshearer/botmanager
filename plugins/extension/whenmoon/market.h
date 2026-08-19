@@ -391,6 +391,15 @@ typedef struct whenmoon_market
   // stable per the WM-MK-2 discipline. Part of the running-set dedup key
   // (exchange, product_id, instance).
   char                  instance[WM_INSTANCE_LABEL_SZ];
+
+  // OBS-61: the venue has reported losing frames since this market last
+  // closed a bar, so the interval since then is not known to be quiet —
+  // it may only be unobserved. Set from wm_market_on_event on any
+  // channel, consumed by the aggregator at the one place the difference
+  // matters: whether to fabricate the minutes in between. Transient, and
+  // an append-only field per the WM-MK-2 discipline (offsets above stay
+  // stable for strategies mirroring them).
+  bool                  feed_gap;
 } whenmoon_market_t;
 
 struct whenmoon_markets

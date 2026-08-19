@@ -118,7 +118,8 @@ cb_ws_state_name(cb_ws_state_t s)
 
 // Hand the reassembled text frame off to the channel multiplexer
 // (CB5). The preview-only stub used by CB4 is gone; the multiplexer
-// owns per-frame JSON parse, sequence-gap accounting, and subscriber
+// owns per-frame JSON parse, sequence-gap accounting (OBS-65: every
+// numbered frame, including the ones it filters), and subscriber
 // fanout.
 void
 cb_ws_dispatch_frame(const char *buf, size_t len)

@@ -131,6 +131,46 @@ noop_event_cb(const coinbase_ws_event_t *ev, void *user)
   (void)user;
 }
 
+// c4's subscriber: what the consumer was told, in the order it was told.
+static bool     gaps[32];
+static int64_t  seqs[32];
+static size_t   n_events;
+
+static void
+recording_event_cb(const coinbase_ws_event_t *ev, void *user)
+{
+  (void)user;
+
+  if(ev == NULL || n_events >= 32)
+    return;
+
+  gaps[n_events] = ev->gap;
+  seqs[n_events] = ev->sequence;
+  n_events++;
+}
+
+// One ticker frame on the connection's counter. `seq` < 0 renders the
+// gateway's unnumbered {type:"error"} shape instead.
+static void
+feed_frame(int64_t seq)
+{
+  char buf[256];
+  int  n;
+
+  if(seq < 0)
+    n = snprintf(buf, sizeof(buf),
+        "{\"type\":\"error\",\"message\":\"rate limit exceeded\"}");
+
+  else
+    n = snprintf(buf, sizeof(buf),
+        "{\"channel\":\"ticker\",\"sequence_num\":%lld,\"events\":"
+        "[{\"tickers\":[{\"product_id\":\"BTC-USD\",\"price\":\"1\"}]}]}",
+        (long long)seq);
+
+  if(n > 0)
+    cb_ws_channels_dispatch(buf, (size_t)n);
+}
+
 static coinbase_ws_sub_t *
 sub_products(coinbase_ws_channel_t ch, const char *const *products,
     size_t n_products)
@@ -277,6 +317,62 @@ case_an_open_reconciles_from_the_slot_table(void)
   cb_ws_channels_deinit();
 }
 
+// c4 — OBS-65: the envelope's `sequence_num` counts every frame the
+// gateway sent THIS CONNECTION, so a skip in it is loss and nothing
+// else. What a consumer can observe is the report, and the report has
+// to be exact in both directions: a hole must reach it once, and a
+// frame the gateway never numbered must not invent one. The error frame
+// in the middle is the second half — measured 2026-08-19 arriving
+// between #1 and #2 without advancing the counter, so a tracker that
+// counted frames rather than reading their numbers would call it a gap.
+static void
+case_a_sequence_skip_is_reported_once(void)
+{
+  const char           *products[] = { "BTC-USD" };
+  coinbase_ws_channel_t channels[]  = { COINBASE_CH_TICKER };
+  coinbase_ws_sub_t    *h;
+
+  cb_ws_channels_init();
+  n_events = 0;
+
+  h = coinbase_ws_subscribe(channels, 1, products, 1,
+      recording_event_cb, NULL);
+
+  test_check_bool(SUITE, "c4: the fixture subscribe seats",
+      true, h != NULL);
+
+  feed_frame(0);
+  feed_frame(1);
+  feed_frame(-1);   // unnumbered: outside the sequence space entirely
+  feed_frame(2);
+  feed_frame(5);    // #3 and #4 never arrived
+  feed_frame(6);
+
+  test_check_sz(SUITE, "c4: every numbered frame reached the subscriber",
+      5, n_events);
+
+  test_check_bool(SUITE, "c4: a contiguous run reports no loss",
+      false, gaps[0] || gaps[1] || gaps[2]);
+  test_check_bool(SUITE, "c4: the skip reports loss",
+      true, gaps[3]);
+  test_check_bool(SUITE, "c4: and reports it once, not until repaired",
+      false, gaps[4]);
+  test_check_sz(SUITE, "c4: the frame carries its own number",
+      5, (size_t)seqs[3]);
+
+  // A reconnect restarts the counter at 0, which is not a skip — but the
+  // frames that flowed while the socket was down are loss all the same.
+  n_events = 0;
+  cb_ws_channels_on_open();
+  feed_frame(0);
+
+  test_check_bool(SUITE, "c4: a reconnect is loss too",
+      true, gaps[0]);
+
+  coinbase_ws_unsubscribe(h);
+  cb_ws_channels_deinit();
+}
+
 int
 main(void)
 {
@@ -292,6 +388,7 @@ main(void)
   case_a_subscribe_reaches_the_wire();
   case_a_partial_seat_is_refused_whole();
   case_an_open_reconciles_from_the_slot_table();
+  case_a_sequence_skip_is_reported_once();
 
   return(test_report(SUITE));
 }

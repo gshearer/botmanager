@@ -17,12 +17,20 @@
 //    "events":[{...}]}
 // where the per-event payload depends on the channel.
 //
-// Sequence gap detection is intentionally not performed. The
-// envelope's `sequence_num` is per-channel-per-connection (advances on
-// every frame the gateway sends us) — useful for connection-level
-// integrity but not directly comparable across consumer subsets. The
-// `coinbase_ws_event_t.gap` field is preserved as an ABI placeholder
-// and remains false.
+// Sequence-gap detection is performed here and it is CONNECTION-level
+// (OBS-65). The envelope's `sequence_num` is dense and per-connection —
+// measured 2026-08-19 as 0,1,2… with no skips, one counter shared by
+// `subscriptions`, `heartbeats` and `ticker` — so a skip is frames the
+// gateway sent us that we never saw. It answers "was anything lost",
+// never "which product", which is the question a consumer deciding
+// whether to trust a window of history actually has. Error frames carry
+// no `sequence_num`, so tracking only numbered frames cannot invent a
+// gap out of one.
+//
+// ⛔ `finding_cb_ws_seq_gap_false_positive` describes the LEGACY
+// Exchange API's per-product-global counter tracked per (channel,
+// product). Neither half of that mechanism exists here; its advice
+// against per-channel tracking still holds and this is not that.
 
 #define CB_INTERNAL
 #include "coinbase.h"
@@ -61,6 +69,13 @@ struct coinbase_ws_sub
   char                     products[CB_WS_CH_MAX_PRODUCTS_PER_SUB]
                                    [COINBASE_PRODUCT_ID_SZ];
 
+  // OBS-65: loss is a fact about the CONNECTION, but it has to be
+  // reported to each subscriber on an event that subscriber actually
+  // receives — the frame after a skip is often a heartbeat, and the
+  // exchange adapter drops those. So the flag is sticky per sub and
+  // cb_ws_fanout clears it as it delivers.
+  bool                     gap_pending;
+
   struct coinbase_ws_sub  *next;
 };
 
@@ -95,6 +110,13 @@ static struct
   // "subscriptions" ack forces a reconnect.
   uint64_t                last_sub_sent_ms;
   uint64_t                last_ack_ms;
+
+  // OBS-65: next `sequence_num` expected on this connection. Valid only
+  // once a numbered frame has arrived; the counter restarts at 0 on
+  // every connection, so cb_ws_channels_on_open invalidates it — and a
+  // re-open is itself known loss, which is why it also flags the subs.
+  int64_t                 seq_next;
+  bool                    seq_valid;
 
   // SAN-10: consumer callbacks run with `mu` RELEASED (see cb_ws_fanout),
   // so the lock no longer answers "is a callback running?". This counter
@@ -525,6 +547,7 @@ cb_ws_fanout(const coinbase_ws_event_t *ev)
   {
     coinbase_ws_event_cb_t cb;
     void                  *user;
+    bool                   gap;
   }        targets[CB_WS_CH_MAX_SUBS];   // subscribe caps the list at this
   uint32_t n = 0;
   uint32_t i;
@@ -558,8 +581,15 @@ cb_ws_fanout(const coinbase_ws_event_t *ev)
 
     if(match)
     {
+      // OBS-65: `gap` is this function's field, not the parsers'. Loss is
+      // a property of the connection and of what each subscriber has been
+      // told about it, neither of which a per-channel parser can see, so
+      // the pending flag is taken and cleared here under the same lock
+      // that snapshots the target.
       targets[n].cb   = s->cb;
       targets[n].user = s->user;
+      targets[n].gap  = s->gap_pending;
+      s->gap_pending  = false;
       n++;
     }
   }
@@ -575,7 +605,12 @@ cb_ws_fanout(const coinbase_ws_event_t *ev)
   pthread_mutex_unlock(&cb_ws_ch.mu);
 
   for(i = 0; i < n; i++)
-    targets[i].cb(ev, targets[i].user);
+  {
+    coinbase_ws_event_t one = *ev;
+
+    one.gap = targets[i].gap;
+    targets[i].cb(&one, targets[i].user);
+  }
 
   pthread_mutex_lock(&cb_ws_ch.mu);
 
@@ -621,7 +656,7 @@ cb_ws_lower_ascii(char *s)
 
 static void
 cb_ws_dispatch_heartbeats(struct json_object *event,
-    int64_t frame_time_ms)
+    int64_t frame_time_ms, int64_t frame_seq)
 {
   coinbase_ws_heartbeat_t hb = {0};
   coinbase_ws_event_t     ev = {0};
@@ -638,8 +673,7 @@ cb_ws_dispatch_heartbeats(struct json_object *event,
 
   ev.channel    = COINBASE_CH_HEARTBEAT;
   ev.product_id = NULL;
-  ev.sequence   = 0;
-  ev.gap        = false;
+  ev.sequence   = frame_seq;
   ev.payload    = &hb;
 
   cb_ws_fanout(&ev);
@@ -647,7 +681,7 @@ cb_ws_dispatch_heartbeats(struct json_object *event,
 
 static void
 cb_ws_dispatch_ticker(struct json_object *event,
-    coinbase_ws_channel_t ch, int64_t frame_time_ms)
+    coinbase_ws_channel_t ch, int64_t frame_time_ms, int64_t frame_seq)
 {
   struct json_object *tickers;
   size_t              n;
@@ -686,8 +720,7 @@ cb_ws_dispatch_ticker(struct json_object *event,
 
     pe.channel    = ch;
     pe.product_id = out.product_id[0] ? out.product_id : NULL;
-    pe.sequence   = 0;
-    pe.gap        = false;
+    pe.sequence   = frame_seq;
     pe.payload    = &out;
 
     cb_ws_fanout(&pe);
@@ -696,7 +729,7 @@ cb_ws_dispatch_ticker(struct json_object *event,
 
 static void
 cb_ws_dispatch_market_trades(struct json_object *event,
-    int64_t frame_time_ms)
+    int64_t frame_time_ms, int64_t frame_seq)
 {
   struct json_object *trades;
   size_t              n;
@@ -736,8 +769,7 @@ cb_ws_dispatch_market_trades(struct json_object *event,
 
     pe.channel    = COINBASE_CH_MATCHES;
     pe.product_id = m.product_id[0] ? m.product_id : NULL;
-    pe.sequence   = 0;
-    pe.gap        = false;
+    pe.sequence   = frame_seq;
     pe.payload    = &m;
 
     cb_ws_fanout(&pe);
@@ -745,7 +777,8 @@ cb_ws_dispatch_market_trades(struct json_object *event,
 }
 
 static void
-cb_ws_dispatch_l2(struct json_object *event, int64_t frame_time_ms)
+cb_ws_dispatch_l2(struct json_object *event, int64_t frame_time_ms,
+    int64_t frame_seq)
 {
   coinbase_ws_l2update_t  u   = {0};
   coinbase_ws_event_t     ev  = {0};
@@ -807,8 +840,7 @@ cb_ws_dispatch_l2(struct json_object *event, int64_t frame_time_ms)
 
   ev.channel    = COINBASE_CH_LEVEL2;
   ev.product_id = u.product_id[0] ? u.product_id : NULL;
-  ev.sequence   = 0;
-  ev.gap        = false;
+  ev.sequence   = frame_seq;
   ev.payload    = &u;
 
   cb_ws_fanout(&ev);
@@ -842,7 +874,7 @@ cb_ws_get_decimal_loose(struct json_object *obj, const char *key)
 // is present.
 static void
 cb_ws_dispatch_user_order(struct json_object *order_obj,
-    int64_t frame_time_ms)
+    int64_t frame_time_ms, int64_t frame_seq)
 {
   coinbase_ws_user_event_t  evp = {0};
   coinbase_ws_user_order_t *o   = &evp.u.order;
@@ -878,8 +910,7 @@ cb_ws_dispatch_user_order(struct json_object *order_obj,
 
   pe.channel    = COINBASE_CH_USER;
   pe.product_id = o->product_id[0] ? o->product_id : NULL;
-  pe.sequence   = 0;
-  pe.gap        = false;
+  pe.sequence   = frame_seq;
   pe.payload    = &evp;
 
   cb_ws_fanout(&pe);
@@ -892,7 +923,7 @@ cb_ws_dispatch_user_order(struct json_object *order_obj,
 // them. Until then, fill detail is derived from order-update deltas.
 static void
 cb_ws_dispatch_user_fill(struct json_object *fill_obj,
-    int64_t frame_time_ms)
+    int64_t frame_time_ms, int64_t frame_seq)
 {
   coinbase_ws_user_event_t  evp = {0};
   coinbase_ws_user_fill_t  *f   = &evp.u.fill;
@@ -925,8 +956,7 @@ cb_ws_dispatch_user_fill(struct json_object *fill_obj,
 
   pe.channel    = COINBASE_CH_USER;
   pe.product_id = f->product_id[0] ? f->product_id : NULL;
-  pe.sequence   = 0;
-  pe.gap        = false;
+  pe.sequence   = frame_seq;
   pe.payload    = &evp;
 
   cb_ws_fanout(&pe);
@@ -934,7 +964,7 @@ cb_ws_dispatch_user_fill(struct json_object *fill_obj,
 
 static void
 cb_ws_dispatch_user(struct json_object *event,
-    int64_t frame_time_ms)
+    int64_t frame_time_ms, int64_t frame_seq)
 {
   struct json_object *orders;
   struct json_object *fills;
@@ -953,7 +983,7 @@ cb_ws_dispatch_user(struct json_object *event,
 
       if(o == NULL) continue;
 
-      cb_ws_dispatch_user_order(o, frame_time_ms);
+      cb_ws_dispatch_user_order(o, frame_time_ms, frame_seq);
     }
   }
 
@@ -969,14 +999,14 @@ cb_ws_dispatch_user(struct json_object *event,
 
       if(f == NULL) continue;
 
-      cb_ws_dispatch_user_fill(f, frame_time_ms);
+      cb_ws_dispatch_user_fill(f, frame_time_ms, frame_seq);
     }
   }
 }
 
 static void
 cb_ws_dispatch_status(struct json_object *event,
-    int64_t frame_time_ms)
+    int64_t frame_time_ms, int64_t frame_seq)
 {
   coinbase_ws_status_t st = {0};
   coinbase_ws_event_t  ev = {0};
@@ -986,8 +1016,7 @@ cb_ws_dispatch_status(struct json_object *event,
 
   ev.channel    = COINBASE_CH_STATUS;
   ev.product_id = NULL;
-  ev.sequence   = 0;
-  ev.gap        = false;
+  ev.sequence   = frame_seq;
   ev.payload    = &st;
 
   cb_ws_fanout(&ev);
@@ -1053,6 +1082,21 @@ cb_ws_channels_on_open(void)
   if(!cb_ws_ch.initialized) return;
 
   pthread_mutex_lock(&cb_ws_ch.mu);
+
+  // OBS-65: `sequence_num` restarts at 0 on every connection, so it
+  // cannot be carried across one — and everything the gateway sent while
+  // we were away is loss like any other, which is why a RE-open flags
+  // every subscriber. A first-ever open has missed nothing, and
+  // seq_valid is what tells the two apart: it stays false until a
+  // numbered frame has actually arrived.
+  if(cb_ws_ch.seq_valid)
+  {
+    for(struct coinbase_ws_sub *s = cb_ws_ch.head; s != NULL; s = s->next)
+      s->gap_pending = true;
+  }
+
+  cb_ws_ch.seq_next  = 0;
+  cb_ws_ch.seq_valid = false;
 
   if(cb_ws_ch.n_slots == 0)
   {
@@ -1122,6 +1166,54 @@ cb_ws_channels_sub_ack_overdue(void)
   return(cb_ws_ch_now_ms() - sent > CB_WS_SUB_ACK_TIMEOUT_MS);
 }
 
+// OBS-65: account for one inbound frame and answer with its number, or
+// -1 for a frame the gateway did not number. Only the legacy
+// {type:"error"} shape is unnumbered, and it sits OUTSIDE the sequence
+// space rather than inside it — measured 2026-08-19: an error frame
+// arrived between #1 and #2 and the counter did not advance — so
+// ignoring unnumbered frames cannot manufacture a gap out of one.
+//
+// A skip means the gateway sent frames we never saw. Nothing here can
+// say what they carried, so every live subscriber is told and each
+// learns of it on its own next delivery (cb_ws_fanout).
+static int64_t
+cb_ws_seq_track(struct json_object *root)
+{
+  int64_t seq;
+  int64_t lost = 0;
+
+  if(!json_get_int64(root, "sequence_num", &seq) || seq < 0)
+    return(-1);
+
+  pthread_mutex_lock(&cb_ws_ch.mu);
+
+  if(cb_ws_ch.seq_valid && seq > cb_ws_ch.seq_next)
+  {
+    lost = seq - cb_ws_ch.seq_next;
+
+    for(struct coinbase_ws_sub *s = cb_ws_ch.head; s != NULL; s = s->next)
+      s->gap_pending = true;
+  }
+
+  // Forwards only. Frames arrive in the order the gateway sent them, so
+  // a number below the one expected cannot be a reordering — it would
+  // have to be a restart, and a restart arrives through on_open. Moving
+  // the counter backwards for one would invent a gap on the next frame.
+  if(!cb_ws_ch.seq_valid || seq >= cb_ws_ch.seq_next)
+    cb_ws_ch.seq_next = seq + 1;
+
+  cb_ws_ch.seq_valid = true;
+
+  pthread_mutex_unlock(&cb_ws_ch.mu);
+
+  if(lost > 0)
+    clam(CLAM_WARN, CB_CTX,
+        "ws sequence gap: %lld frame(s) lost before #%lld",
+        (long long)lost, (long long)seq);
+
+  return(seq);
+}
+
 void
 cb_ws_channels_dispatch(const char *buf, size_t len)
 {
@@ -1131,6 +1223,7 @@ cb_ws_channels_dispatch(const char *buf, size_t len)
   char                channel[64] = {0};
   char                ts[64];
   int64_t             frame_time_ms = 0;
+  int64_t             frame_seq;
   size_t              ev_n;
   size_t              i;
 
@@ -1138,6 +1231,11 @@ cb_ws_channels_dispatch(const char *buf, size_t len)
 
   root = json_parse_buf(buf, len, "coinbase:ws_recv");
   if(root == NULL) return;
+
+  // Before every early return below: the ack and error frames are on the
+  // same counter as the data ones, so a dispatcher that only accounted
+  // for what it fans out would read its own filtering as loss.
+  frame_seq = cb_ws_seq_track(root);
 
   // Gateway error frames keep the legacy {type:"error",message:"..."}
   // shape — surface them before looking for an Advanced Trade envelope.
@@ -1227,21 +1325,21 @@ cb_ws_channels_dispatch(const char *buf, size_t len)
     if(event == NULL) continue;
 
     if(strcmp(channel, "heartbeats") == 0)
-      cb_ws_dispatch_heartbeats(event, frame_time_ms);
+      cb_ws_dispatch_heartbeats(event, frame_time_ms, frame_seq);
     else if(strcmp(channel, "ticker") == 0)
       cb_ws_dispatch_ticker(event, COINBASE_CH_TICKER,
-          frame_time_ms);
+          frame_time_ms, frame_seq);
     else if(strcmp(channel, "ticker_batch") == 0)
       cb_ws_dispatch_ticker(event, COINBASE_CH_TICKER_BATCH,
-          frame_time_ms);
+          frame_time_ms, frame_seq);
     else if(strcmp(channel, "market_trades") == 0)
-      cb_ws_dispatch_market_trades(event, frame_time_ms);
+      cb_ws_dispatch_market_trades(event, frame_time_ms, frame_seq);
     else if(strcmp(channel, "l2_data") == 0)
-      cb_ws_dispatch_l2(event, frame_time_ms);
+      cb_ws_dispatch_l2(event, frame_time_ms, frame_seq);
     else if(strcmp(channel, "status") == 0)
-      cb_ws_dispatch_status(event, frame_time_ms);
+      cb_ws_dispatch_status(event, frame_time_ms, frame_seq);
     else if(strcmp(channel, "user") == 0)
-      cb_ws_dispatch_user(event, frame_time_ms);
+      cb_ws_dispatch_user(event, frame_time_ms, frame_seq);
     else
       clam(CLAM_DEBUG3, CB_CTX, "ws ignoring channel=%s", channel);
   }
@@ -1369,6 +1467,7 @@ coinbase_ws_subscribe(const coinbase_ws_channel_t *channels,
   sub->user         = user;
   sub->channel_mask = channel_mask;
   sub->n_products   = (uint32_t)n_products;
+  sub->gap_pending  = false;   // a fresh subscription has missed nothing
 
   for(i = 0; i < n_products; i++)
   {

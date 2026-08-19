@@ -81,6 +81,13 @@ struct whenmoon_market;
 // Re-defer interval for a warmup that hit the concurrency cap.
 #define WM_WARMUP_DEFER_MS            250u
 
+// OBS-61: how long a repair waits before it starts. Short — the market
+// is already held out of READY and is acting on nothing while it waits.
+// The hop exists to get the work off the WS reader thread, not to delay
+// it: the repair walks candle gaps against a remote Postgres, and that
+// thread also drains the paced control-frame queue (OBS-63).
+#define WM_WARM_REPAIR_DELAY_MS       50u
+
 // Begin (or restart) the warmup lifecycle for a market. Reads the
 // attached strategy to size the required history, enqueues DB
 // gap-fills for the recent window, and schedules the convergence
@@ -90,6 +97,17 @@ struct whenmoon_market;
 // prior timer retires). Called off mk->lock.
 void wm_market_warmup_begin(struct whenmoon_state *st,
     struct whenmoon_market *mk);
+
+// OBS-61: the venue reported lost frames and the aggregator refused to
+// fabricate the minutes they may have carried, so this market's live
+// ring has an honest hole in it. Hold the market out of READY — the
+// trade engine acts on advice only there, so it stops acting at once —
+// and schedule wm_market_warmup_begin to fill the gap from the venue's
+// own candles and replay them over the ring.
+//
+// Caller holds mk->lock (the lock is recursive; wm_warm_set_state takes
+// it again). The repair itself must not run on the caller's thread.
+void wm_warmup_repair_arm(struct whenmoon_market *mk);
 
 // WM-TAILFILL-COALESCE-1: start/stop the single global tail-fill sweep.
 // Init after `st` exists (the task reads the market array through it);

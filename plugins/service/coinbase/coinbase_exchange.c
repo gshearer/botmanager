@@ -1282,6 +1282,13 @@ cb_exch_ws_event_adapter(const coinbase_ws_event_t *ev, void *user)
 
   memset(&out, 0, sizeof(out));
 
+  // OBS-65: carry the connection's own verdict on lost frames through to
+  // the neutral event. Set on every channel, including the ones the
+  // switch below drops on the floor — a subscriber's report rides the
+  // first event IT receives, and the arms that return early are exactly
+  // the ones it never sees.
+  out.seq_gap = ev->gap;
+
   if(ev->product_id != NULL)
     snprintf(out.product_id, sizeof(out.product_id), "%s", ev->product_id);
 

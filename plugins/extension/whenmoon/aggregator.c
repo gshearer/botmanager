@@ -211,14 +211,43 @@ wm_aggregator_on_trade(whenmoon_market_t *mk, int64_t ts_ms,
   // Skip-bar fill. Any minutes between the closed pending bar and the
   // new bar get a synthetic empty 1m candle so the cascade arithmetic
   // stays correct on low-volume products.
+  //
+  // OBS-61: unless the venue has told us frames were lost, in which case
+  // a flat carry-forward minute is not a quiet minute — it is fabricated
+  // DURATION, pushed through the indicator pass and fanned out to every
+  // attached strategy, byte-identical to a minute that really had no
+  // trades and resident in the ring for its whole depth. Nothing a
+  // strategy can ask would separate the two. So refuse the window and
+  // repair it: wm_warmup_repair_arm holds the market out of READY (the
+  // engine acts on advice only there) and re-runs the warmup lifecycle,
+  // which fills the gap from the venue's own candles and replays them.
   {
     int64_t expected = a->pending_1m.bar_start_ms + 60000;
 
-    while(expected < bar_ms)
+    if(mk->feed_gap && expected < bar_ms)
     {
-      wm_aggregator_emit_empty_1m(mk, expected);
-      expected += 60000;
+      clam(CLAM_WARN, WHENMOON_CTX,
+          "market %s: feed gap confirmed by the venue — refusing to"
+          " synthesize %lld minute(s) and re-warming",
+          mk->market_id_str, (long long)((bar_ms - expected) / 60000));
+
+      wm_warmup_repair_arm(mk);
     }
+
+    else
+    {
+      while(expected < bar_ms)
+      {
+        wm_aggregator_emit_empty_1m(mk, expected);
+        expected += 60000;
+      }
+    }
+
+    // Either way the report is spent: it spoke for the interval that has
+    // just been decided. A gap that cost no minutes at all cost trades
+    // inside one bar instead — real, but not this row's hazard, and not
+    // worth re-warming a market over.
+    mk->feed_gap = false;
   }
 
   a->pending_1m.bar_start_ms = bar_ms;
