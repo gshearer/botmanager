@@ -677,6 +677,37 @@ wm_market_session_snapshot(whenmoon_market_t *mk,
   return(SUCCESS);
 }
 
+uint32_t
+wm_market_pending_snapshot(whenmoon_market_t *mk,
+    wm_market_pending_view_t *out, uint32_t cap)
+{
+  uint32_t n;
+  uint32_t i;
+
+  pthread_mutex_lock(&mk->lock);
+
+  n = mk->session.pending_n < cap ? mk->session.pending_n : cap;
+
+  for(i = 0; i < n; i++)
+  {
+    const wm_market_pending_t *p = &mk->session.pending[i];
+
+    strlcpy(out[i].coid,     p->coid,     sizeof(out[i].coid));
+    strlcpy(out[i].order_id, p->order_id, sizeof(out[i].order_id));
+    strlcpy(out[i].side,     p->side,     sizeof(out[i].side));
+
+    out[i].limit_px         = p->limit_px;
+    out[i].submitted_qty    = p->submitted_qty;
+    out[i].filled_qty       = p->filled_qty;
+    out[i].submitted_ms     = p->submitted_ms;
+    out[i].gateway_accepted = p->gateway_accepted;
+  }
+
+  pthread_mutex_unlock(&mk->lock);
+
+  return(n);
+}
+
 // ------------------------------------------------------------------ //
 // Canonical id parsing / formatting                                  //
 // ------------------------------------------------------------------ //

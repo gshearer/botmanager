@@ -744,6 +744,34 @@ typedef struct
 bool wm_market_session_snapshot(whenmoon_market_t *mk,
     wm_market_session_snapshot_t *out);
 
+// OBS-64: the displayable half of a pending row. Deliberately omits
+// `recorded_trade_ids[]` — 512 B of fill-dedup state no renderer wants —
+// which is what keeps a copy of the whole ring a stack copy (a
+// `wm_market_pending_t[WM_MARKET_PENDING_CAP]` is 22 KB) and is why the
+// rows are not in `wm_market_session_snapshot_t`: that struct is also
+// taken per backtest iteration.
+typedef struct
+{
+  char     coid[64];
+  char     order_id[64];
+  char     side[8];
+  double   limit_px;
+  double   submitted_qty;
+  double   filled_qty;
+  int64_t  submitted_ms;
+  bool     gateway_accepted;
+} wm_market_pending_view_t;
+
+// Copy up to `cap` of this market's outstanding pending rows under
+// `mk->lock`, oldest slot first, returning how many were copied. `mk`
+// must be a live pointer from `wm_market_lookup_by_id`.
+//
+// Orders are limit GTC (`live.c`), so a row here is a claim that an
+// order is RESTING at the venue — reading a long age as a stuck row is
+// the operator's judgement to make, never the code's.
+uint32_t wm_market_pending_snapshot(whenmoon_market_t *mk,
+    wm_market_pending_view_t *out, uint32_t cap);
+
 // Register the /show whenmoon market verbs (no-arg list + `<id>` detail
 // + `mk` alias). Called from `whenmoon_init` after the existing market
 // verb registration. Returns SUCCESS on full success, FAIL if any

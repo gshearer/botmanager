@@ -124,6 +124,15 @@ static void wm_live_disc_register_kvs(void);
 #define WM_LIVE_FILLS_POLL_SEC         30
 #define WM_LIVE_FILLS_POLL_OVERLAP_MS  (60 * 1000)
 
+// OBS-64: how far back a START may reach for the fills of orders that
+// were already outstanding. The steady-state cursor needs no bound — it
+// only ever moves forward — but a restart has to re-derive it, and an
+// order resting since last week would otherwise make the first poll ask
+// for a week of history against a 100-row page and push the recent fills
+// off it. A day is the same bound `WM_AGG_MAX_CATCHUP_1M` takes for the
+// same reason on the candle side.
+#define WM_LIVE_FILLS_MAX_CATCHUP_MS   (24 * 60 * 60 * 1000LL)
+
 // ----------------------------------------------------------------------- //
 // Lifecycle                                                               //
 // ----------------------------------------------------------------------- //
@@ -1468,6 +1477,51 @@ wm_live_boot_reconcile_cb(const exchange_orders_result_t *res, void *user)
       exchange_name);
 }
 
+// OBS-64: the submit time of the oldest pending row anywhere in the
+// running set, or 0 when nothing is outstanding. Called from the start
+// hook after wm_market_persist_restore_all, so these are the rows that
+// SURVIVED whatever took the daemon away — the window the fills poll has
+// to be able to reach back into.
+static int64_t
+wm_live_oldest_pending_ms(whenmoon_state_t *st, uint32_t *out_n)
+{
+  int64_t  oldest = 0;
+  uint32_t total  = 0;
+  uint32_t i;
+
+  if(st == NULL || st->markets == NULL)
+    return(0);
+
+  pthread_rwlock_rdlock(&st->markets->arr_lock);
+
+  for(i = 0; i < st->markets->n_markets; i++)
+  {
+    whenmoon_market_t *mk = st->markets->arr[i];
+    uint32_t           k;
+
+    pthread_mutex_lock(&mk->lock);
+
+    for(k = 0; k < mk->session.pending_n; k++)
+    {
+      int64_t ms = mk->session.pending[k].submitted_ms;
+
+      total++;
+
+      if(ms > 0 && (oldest == 0 || ms < oldest))
+        oldest = ms;
+    }
+
+    pthread_mutex_unlock(&mk->lock);
+  }
+
+  pthread_rwlock_unlock(&st->markets->arr_lock);
+
+  if(out_n != NULL)
+    *out_n = total;
+
+  return(oldest);
+}
+
 // Static storage for the per-exchange reconcile user-pointer. The
 // callback receives the const char * by-ref so we don't need to heap
 // the name; the slots live for the lifetime of the daemon.
@@ -1482,8 +1536,11 @@ wm_live_engine_start(void)
 {
   whenmoon_state_t *st;
   int64_t           now_ms;
+  int64_t           oldest_ms;
+  int64_t           seed_ms;
   char              names[WM_LIVE_MAX_EXCHANGES][EXCHANGE_NAME_SZ];
-  uint32_t          n_names = 0;
+  uint32_t          n_names   = 0;
+  uint32_t          n_pending = 0;
   uint32_t          i;
 
   if(!g_live.initialized) return;
@@ -1506,16 +1563,50 @@ wm_live_engine_start(void)
   // pulls every fill the server is willing to page back (hundreds of
   // potentially stale rows), and the orphan dedup walk would log them
   // all.
-  now_ms = wm_now_ms();
+  //
+  // OBS-64: but "the recent past" is the wrong window when orders were
+  // already outstanding. In steady state the cursor is a high-water mark
+  // over applied fills and covers an outage of any length; it lives in
+  // this mapping, though, so a start — or a `/plugin reload whenmoon` —
+  // re-derives it, and nothing else recovers a fill that landed while we
+  // were gone: the boot reconcile below lists only OPEN orders, and a
+  // fill whose pending row it cannot match is dropped as an orphan. So
+  // the floor is the oldest restored row's `submitted_ms`, bounded by
+  // WM_LIVE_FILLS_MAX_CATCHUP_MS.
+  now_ms    = wm_now_ms();
+  oldest_ms = wm_live_oldest_pending_ms(st, &n_pending);
+  seed_ms   = now_ms > WM_LIVE_FILLS_POLL_OVERLAP_MS
+      ? now_ms - WM_LIVE_FILLS_POLL_OVERLAP_MS
+      : 0;
+
+  if(oldest_ms > 0)
+  {
+    int64_t floor_ms = oldest_ms > WM_LIVE_FILLS_POLL_OVERLAP_MS
+        ? oldest_ms - WM_LIVE_FILLS_POLL_OVERLAP_MS
+        : 0;
+    int64_t bound_ms = now_ms > WM_LIVE_FILLS_MAX_CATCHUP_MS
+        ? now_ms - WM_LIVE_FILLS_MAX_CATCHUP_MS
+        : 0;
+    char    age[32];
+    char    age2[32];
+
+    if(floor_ms < bound_ms)
+      floor_ms = bound_ms;
+
+    if(floor_ms < seed_ms)
+      seed_ms = floor_ms;
+
+    clam(CLAM_INFO, WM_LIVE_CTX,
+        "%u pending order(s) restored, oldest submitted %s ago:"
+        " fills-poll will re-read from %s back",
+        n_pending, wm_fmt_age(now_ms - oldest_ms, age, sizeof(age)),
+        wm_fmt_age(now_ms - seed_ms, age2, sizeof(age2)));
+  }
 
   pthread_mutex_lock(&g_live.mu);
 
   if(g_live.last_fills_cursor_ms == 0)
-  {
-    g_live.last_fills_cursor_ms = now_ms > WM_LIVE_FILLS_POLL_OVERLAP_MS
-        ? now_ms - WM_LIVE_FILLS_POLL_OVERLAP_MS
-        : 0;
-  }
+    g_live.last_fills_cursor_ms = seed_ms;
 
   pthread_mutex_unlock(&g_live.mu);
 

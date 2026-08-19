@@ -1262,10 +1262,50 @@ wm_obs_render_fills(const cmd_ctx_t *ctx,
   }
 }
 
+// OBS-64: the outstanding orders, one line each. The orders are limit
+// GTC, so an old row is not by itself a fault — it may be resting at the
+// venue exactly as asked. This reports the age and leaves the judgement
+// to the reader, which is the only honest split: nothing in the code can
+// know what an implausible rest is for a given pair. The lever, when a
+// row IS stuck, is `/whenmoon order cancel <exchange> <order-id>` — the
+// venue's own CANCELLED event then reaps the row here.
+static void
+wm_obs_render_pending(const cmd_ctx_t *ctx,
+    const wm_market_pending_view_t *rows, uint32_t n)
+{
+  int64_t  now_ms = wm_now_ms();
+  uint32_t i;
+  char     line[256];
+
+  for(i = 0; i < n; i++)
+  {
+    const wm_market_pending_view_t *v = &rows[i];
+    char                            age[32];
+
+    if(v->submitted_ms > 0)
+      wm_fmt_age(now_ms - v->submitted_ms, age, sizeof(age));
+    else
+      strlcpy(age, "?", sizeof(age));
+
+    // Precisions on the two `%s` from the view are not decoration: the
+    // rows come from a fixed-size array, so the compiler bounds an
+    // unqualified `%s` by the whole array rather than one field.
+    snprintf(line, sizeof(line),
+        "    %-4.4s qty=%-12.8g px=%-10.4f filled=%-12.8g age=%-9s"
+        " %s %s=%.63s",
+        v->side, v->submitted_qty, v->limit_px, v->filled_qty, age,
+        v->gateway_accepted ? "accepted" : "unacked ",
+        v->order_id[0] != '\0' ? "ord"       : "coid",
+        v->order_id[0] != '\0' ? v->order_id : v->coid);
+    cmd_reply(ctx, line);
+  }
+}
+
 // Render the detail card.
 static void
 wm_obs_render_card(const cmd_ctx_t *ctx,
-    const wm_market_session_snapshot_t *snap)
+    const wm_market_session_snapshot_t *snap,
+    const wm_market_pending_view_t *pending, uint32_t n_pending)
 {
   const wm_market_stats_t *paper = &snap->stats[WM_MARKET_MODE_PAPER];
   const wm_market_stats_t *real  = &snap->stats[WM_MARKET_MODE_REAL];
@@ -1338,8 +1378,10 @@ wm_obs_render_card(const cmd_ctx_t *ctx,
   cmd_reply(ctx, line);
 
   snprintf(line, sizeof(line),
-      "  pending:     %u", snap->pending_n);
+      "  pending:     %u of %u", snap->pending_n, snap->pending_cap);
   cmd_reply(ctx, line);
+
+  wm_obs_render_pending(ctx, pending, n_pending);
 
   wm_obs_render_fills(ctx, snap, WM_MARKET_MODE_PAPER,
       "  recent paper fills (oldest first):");
@@ -1491,7 +1533,9 @@ wm_show_market_cmd(const cmd_ctx_t *ctx)
   // Otherwise treat the token as a session id → detail card.
   {
     wm_market_session_snapshot_t snap;
+    wm_market_pending_view_t     pending[WM_MARKET_PENDING_CAP];
     whenmoon_market_t           *mk;
+    uint32_t                     n_pending;
     char                         err[128];
 
     // WM-MKT-ARR-UAF-1: hold rdlock across lookup + snapshot (which reads
@@ -1509,9 +1553,11 @@ wm_show_market_cmd(const cmd_ctx_t *ctx)
     }
 
     wm_market_session_snapshot(mk, &snap);
+    n_pending = wm_market_pending_snapshot(mk, pending,
+        WM_MARKET_PENDING_CAP);
     pthread_rwlock_unlock(&m->arr_lock);
 
-    wm_obs_render_card(ctx, &snap);
+    wm_obs_render_card(ctx, &snap, pending, n_pending);
     wm_obs_render_strategies(ctx, st, tok);
   }
 }
