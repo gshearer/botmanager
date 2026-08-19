@@ -200,6 +200,11 @@ task_create(const char *name, task_type_t type, uint8_t priority,
 void
 task_submit(task_t *t)
 {
+  char        logname[TASK_NAME_SZ];
+  const char *logtype;
+  const char *logkind;
+  uint8_t     logprio;
+
   // Periodic tasks cannot have linked children (they never truly end).
   if(t->kind == TASK_PERIODIC && t->link != NULL)
   {
@@ -239,12 +244,22 @@ task_submit(task_t *t)
     stats.linked++;
   }
 
+  // Copied while the lock still makes `t` ours. Past the signal below
+  // a worker may already have run this task and freed it, which is the
+  // rule task.h states at task_add and this function was breaking:
+  // reading the name for a log line is still reading it. The clam()
+  // cannot move under the lock instead — that is the tree's deadlock
+  // edge — so the fields come out rather than the call going in.
+  strlcpy(logname, t->name, sizeof(logname));
+  logtype = task_type_name(t->type);
+  logkind = task_kind_name(t->kind);
+  logprio = t->priority;
+
   pthread_cond_signal(&task_cond);
   pthread_mutex_unlock(&task_lock);
 
   clam(CLAM_DEBUG, "task_submit", "'%s' (type: %s kind: %s prio: %u)",
-      t->name, task_type_name(t->type), task_kind_name(t->kind),
-      t->priority);
+      logname, logtype, logkind, logprio);
 }
 
 task_t *
