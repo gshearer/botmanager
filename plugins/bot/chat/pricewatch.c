@@ -68,8 +68,6 @@
 // stays true rather than becoming a lie.
 #define PRICEWATCH_REPORT_TTL_SECS  (12 * 3600)
 
-#define PRICEWATCH_EXCHANGE_DEFAULT  "coinbase"
-
 // Which way the price has to move. Stored as the SMALLINT `dir`, so
 // the values are part of the schema and may not be renumbered.
 typedef enum
@@ -328,6 +326,10 @@ pricewatch_enabled(const char *bot_name)
   return(kv_get_bot_uint(bot_name, "behavior.soul.pricewatch.enabled") != 0);
 }
 
+// An empty name is passed through, not defaulted: the schema declares
+// "coinbase" and substituting it here would refuse `set kv --clear`.
+// Clearing the key idles the sweep — the exact outcome the schema entry
+// promises for a name no exchange answers to.
 static void
 pricewatch_exchange_for(const char *bot_name, char *dst, size_t cap)
 {
@@ -335,8 +337,7 @@ pricewatch_exchange_for(const char *bot_name, char *dst, size_t cap)
 
   v = kv_get_bot_str(bot_name, "behavior.soul.pricewatch.exchange");
 
-  snprintf(dst, cap, "%s",
-      v != NULL && v[0] != '\0' ? v : PRICEWATCH_EXCHANGE_DEFAULT);
+  strlcpy(dst, v != NULL ? v : "", cap);
 }
 
 // ---------- schema ----------
