@@ -6,9 +6,11 @@
 //   * a per-(channel, native_sym) slot table that refcounts shared
 //     subscribers so N consumers watching the same feed share one
 //     upstream subscription,
-//   * a monotonic req_id counter (informational only — Gemini Market
-//     Data v2 echoes nothing at all: no req_ids, and no acknowledgement
-//     of any kind. There is nothing on the wire to correlate against),
+//   * a monotonic req_id counter — never a wire correlator, because
+//     Gemini Market Data v2 echoes nothing at all: no req_ids, and no
+//     acknowledgement of any kind. It stamps which PASS marked a slot,
+//     so two overlapping subscribe emits can tell their own verdicts
+//     apart (OBS-46),
 //   * per-channel parsers turning one inbound MD/OE frame into one or
 //     more fanned-out exchange_ws_event_t events.
 //
@@ -183,7 +185,13 @@ typedef struct
   char             symbol_native[GEM_WS_SYM_NATIVE_SZ];
   uint32_t         refcount;
   gem_sub_state_t  state;
-  uint32_t         req_id;        // monotonic per slot; informational
+  // Not a wire correlator — this gateway echoes nothing to correlate
+  // against. It is the CLAIM of the pass that last marked this slot
+  // SUBSCRIBING, and the completion writes its verdict only where its
+  // own claim still stands (OBS-46). Kraken's req_id does this same
+  // job in its own phase 3, where it is likewise never read off the
+  // wire.
+  uint32_t         req_id;
 
   // OBS-42 named this `wire_subscribed` and forbade it meaning "we sent
   // it", because the guard below needs "the gateway does not have it".
@@ -340,11 +348,26 @@ gem_ws_slot_find_locked(gem_ws_channel_t ch, const char *symbol_native)
   return(-1);
 }
 
+// A monotonic non-zero id. Zero is skipped so it can never collide
+// with a freshly memset slot.
+static uint32_t
+gem_ws_req_id_next(void)
+{
+  uint32_t rid;
+
+  for(;;)
+  {
+    rid = atomic_fetch_add(&gem_ws_ch.next_req_id, 1u) + 1u;
+
+    if(rid != 0)
+      return(rid);
+  }
+}
+
 static gem_ws_slot_t *
 gem_ws_slot_alloc_locked(gem_ws_channel_t ch, const char *symbol_native)
 {
   gem_ws_slot_t *s;
-  uint32_t       rid;
 
   if(gem_ws_ch.n_slots >= GEM_WS_CH_MAX_SLOTS)
     return(NULL);
@@ -354,17 +377,7 @@ gem_ws_slot_alloc_locked(gem_ws_channel_t ch, const char *symbol_native)
   memset(s, 0, sizeof(*s));
   s->channel = ch;
   s->state   = GEM_SUB_IDLE;
-
-  // Allocate a monotonic req_id for tracing — Gemini doesn't echo it
-  // back but operators can correlate against multiplexer logs.
-  for(;;)
-  {
-    rid = atomic_fetch_add(&gem_ws_ch.next_req_id, 1u) + 1u;
-
-    if(rid != 0)
-      break;
-  }
-  s->req_id = rid;
+  s->req_id  = gem_ws_req_id_next();
 
   snprintf(s->symbol_native, sizeof(s->symbol_native), "%s",
       (symbol_native != NULL) ? symbol_native : "");
@@ -500,84 +513,6 @@ gem_ws_render_unsubscribe_one(gem_ws_channel_t ch, const char *sym,
   return((size_t)n);
 }
 
-// Emit subscribe frames for every channel with live slots. Mu held
-// by caller; this function temporarily releases the lock when calling
-// gem_ws_send_text so the transport lock can be taken without
-// inverting order.
-static void
-gem_ws_emit_resubscribe_locked(void)
-{
-  for(int c = 0; c < GEM_CH__COUNT; c++)
-  {
-    gem_ws_channel_t  ch    = (gem_ws_channel_t)c;
-    char              frame[GEM_WS_TX_BUF_SZ];
-    size_t            flen;
-    bool              ok;
-    uint32_t          i;
-
-    if(!gem_ws_channel_is_per_symbol(ch)) continue;
-
-    flen = gem_ws_render_subscribe_for_channel_locked(ch, frame,
-        sizeof(frame));
-
-    if(flen == 0) continue;
-
-    // Mark slots SUBSCRIBING before releasing the lock — a concurrent
-    // unsubscribe must not free the slot during the send.
-    for(i = 0; i < gem_ws_ch.n_slots; i++)
-    {
-      gem_ws_slot_t *s = &gem_ws_ch.slots[i];
-
-      if(s->channel == ch && s->refcount > 0)
-      {
-        s->state         = GEM_SUB_SUBSCRIBING;
-        s->wire_subscribed = false;
-      }
-    }
-
-    pthread_mutex_unlock(&gem_ws_ch.mu);
-    ok = gem_ws_send_text(GEM_WS_MD, frame, flen);
-    pthread_mutex_lock(&gem_ws_ch.mu);
-
-    if(ok != SUCCESS)
-    {
-      clam(CLAM_DEBUG, GEM_CTX ".ws.md",
-          "%s subscribe deferred (send failed; retry on next open)",
-          gem_ws_md_channel_name(ch));
-
-      // Roll slots back to IDLE so the next open retries.
-      for(i = 0; i < gem_ws_ch.n_slots; i++)
-      {
-        gem_ws_slot_t *s = &gem_ws_ch.slots[i];
-
-        if(s->channel == ch && s->state == GEM_SUB_SUBSCRIBING)
-          s->state = GEM_SUB_IDLE;
-      }
-      continue;
-    }
-
-    // OBS-53 — the send IS the confirmation, because nothing else ever
-    // arrives. Match on (channel, SUBSCRIBING) rather than on an index
-    // remembered from before the unlock: the table is compacted by
-    // swap-with-last, so an index does not survive the gap (OBS-42 D4).
-    // A slot added for this channel while the lock was down is IDLE,
-    // not SUBSCRIBING, so this cannot claim a subscribe it never sent.
-    for(i = 0; i < gem_ws_ch.n_slots; i++)
-    {
-      gem_ws_slot_t *s = &gem_ws_ch.slots[i];
-
-      if(s->channel == ch && s->state == GEM_SUB_SUBSCRIBING)
-      {
-        s->state           = GEM_SUB_ACTIVE;
-        s->wire_subscribed = true;
-      }
-    }
-
-    clam(CLAM_INFO, GEM_CTX ".ws.md", "%s subscribe sent (%zu bytes)",
-        gem_ws_md_channel_name(ch), flen);
-  }
-}
-
 // One slot's identity, copied out from under `mu`. OBS-42 D4: the
 // table is compacted by swap-with-last, so an INDEX taken before `mu`
 // is dropped names a different slot afterwards — and the writes at the
@@ -589,6 +524,127 @@ typedef struct
   gem_ws_channel_t channel;
   char             symbol_native[GEM_WS_SYM_NATIVE_SZ];
 } gem_ws_ident_t;
+
+// What one subscribe pass rendered: the slots it named, each with the
+// claim it stamped on them. Identity survives a compaction; the claim
+// is what distinguishes this pass from the other one that may be in
+// the same window (OBS-46).
+typedef struct
+{
+  gem_ws_ident_t ident;
+  uint32_t       req_id;
+} gem_ws_claim_t;
+
+// Emit subscribe frames for every channel with live slots. Mu held
+// by caller; this function temporarily releases the lock when calling
+// gem_ws_send_text so the transport lock can be taken without
+// inverting order.
+//
+// Two producers reach here — the MD reader at OPEN, and any consumer
+// thread inside gem_ws_subscribe — so two passes can hold overlapping
+// slot sets inside that released window at once. The unsubscribe path
+// below is safe without a claim because its mark is EXCLUSIVE: phase A
+// skips a slot already UNSUBSCRIBING, so at most one pass owns one.
+// This mark is shared, and matching the completion on (channel,
+// SUBSCRIBING) named no pass, so each wrote its verdict over the
+// other's slots (OBS-46): a failing pass rolled back a slot whose
+// frame the other had already put on the wire, and `wire_subscribed`
+// was then never set for a subscription the gateway is streaming.
+//
+// So the mark stamps a claim and the completion applies BY IDENTITY,
+// gated on it. That is kraken's phase-3 shape (kr_ws_reconcile_locked),
+// and the half of it that transfers: its `s->req_id == items[k].rid`
+// test never reads the wire, which is the only reason this gateway's
+// silence does not rule it out.
+static void
+gem_ws_emit_resubscribe_locked(void)
+{
+  gem_ws_claim_t claim[GEM_WS_CH_MAX_SLOTS];
+
+  for(int c = 0; c < GEM_CH__COUNT; c++)
+  {
+    gem_ws_channel_t  ch    = (gem_ws_channel_t)c;
+    char              frame[GEM_WS_TX_BUF_SZ];
+    size_t            flen;
+    bool              ok;
+    uint32_t          n     = 0;
+    uint32_t          i;
+
+    if(!gem_ws_channel_is_per_symbol(ch)) continue;
+
+    flen = gem_ws_render_subscribe_for_channel_locked(ch, frame,
+        sizeof(frame));
+
+    if(flen == 0) continue;
+
+    // Mark before releasing the lock — a concurrent unsubscribe must
+    // not free the slot during the send — and keep what was claimed.
+    // ⛔ `wire_subscribed` is NOT cleared here. It means *a subscribe
+    // for this slot went out, so an unsubscribe is owed*, and this
+    // send has not happened yet: clearing it up front discarded a live
+    // subscription's debt whenever the send then failed, with no flap
+    // to restore it (OBS-46). Only a successful unsubscribe send and a
+    // session flap clear it, which is what its own contract says.
+    for(i = 0; i < gem_ws_ch.n_slots; i++)
+    {
+      gem_ws_slot_t *s = &gem_ws_ch.slots[i];
+
+      if(s->channel != ch || s->refcount == 0) continue;
+
+      s->req_id = gem_ws_req_id_next();
+      s->state  = GEM_SUB_SUBSCRIBING;
+
+      claim[n].ident.channel = ch;
+      strlcpy(claim[n].ident.symbol_native, s->symbol_native,
+          sizeof(claim[n].ident.symbol_native));
+      claim[n].req_id = s->req_id;
+      n++;
+    }
+
+    pthread_mutex_unlock(&gem_ws_ch.mu);
+    ok = gem_ws_send_text(GEM_WS_MD, frame, flen);
+    pthread_mutex_lock(&gem_ws_ch.mu);
+
+    // OBS-53 — the send IS the confirmation, because nothing else ever
+    // arrives. Re-find by identity, never by an index remembered from
+    // before the unlock: the table is compacted by swap-with-last, so
+    // an index does not survive the gap (OBS-42 D4).
+    for(i = 0; i < n; i++)
+    {
+      gem_ws_slot_t *s;
+      int32_t        idx;
+
+      idx = gem_ws_slot_find_locked(claim[i].ident.channel,
+          claim[i].ident.symbol_native);
+
+      if(idx < 0) continue;
+
+      s = &gem_ws_ch.slots[idx];
+
+      // A slot another pass has since re-marked, or that a reap has
+      // taken, is that pass's to answer for; it writes its own verdict.
+      if(s->state == GEM_SUB_SUBSCRIBING && s->req_id == claim[i].req_id)
+        s->state = (ok == SUCCESS) ? GEM_SUB_ACTIVE : GEM_SUB_IDLE;
+
+      // Unconditional, and only ever in this direction: the frame
+      // carried this slot, so the debt is real however the table has
+      // moved on. Claiming it twice costs one redundant unsubscribe
+      // frame, which this venue accepts in silence; failing to claim it
+      // once is a feed streaming to nobody (OBS-53).
+      if(ok == SUCCESS)
+        s->wire_subscribed = true;
+    }
+
+    if(ok != SUCCESS)
+      clam(CLAM_DEBUG, GEM_CTX ".ws.md",
+          "%s subscribe deferred (send failed; retry on next open)",
+          gem_ws_md_channel_name(ch));
+
+    else
+      clam(CLAM_INFO, GEM_CTX ".ws.md", "%s subscribe sent (%zu bytes)",
+          gem_ws_md_channel_name(ch), flen);
+  }
+}
 
 // Emit unsubscribe frames for slots whose refcount has dropped to zero
 // and that the gateway still holds. Mu held by caller; released around

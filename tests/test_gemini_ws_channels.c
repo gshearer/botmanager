@@ -138,6 +138,18 @@ arm_park(const char *op, const char *sym)
   pthread_mutex_unlock(&ledger_mutex);
 }
 
+// The armed send-FAILURE. Same two-substring match as the park, and a
+// case may arm both against the same frame: the stub tests them
+// independently, so an emit can be held open AND report failure.
+static void
+arm_fail(const char *op, const char *sym)
+{
+  pthread_mutex_lock(&ledger_mutex);
+  strlcpy(fail_op, op, sizeof(fail_op));
+  strlcpy(fail_sym, sym, sizeof(fail_sym));
+  pthread_mutex_unlock(&ledger_mutex);
+}
+
 static void
 wait_parked(void)
 {
@@ -327,6 +339,16 @@ unsub_thread(void *arg)
   unsub_arg_t *a = arg;
 
   gem_ws_unsubscribe(a->handle);
+
+  return(NULL);
+}
+
+static void *
+on_open_thread(void *arg)
+{
+  (void)arg;
+
+  gem_ws_channels_on_open(GEM_WS_MD);
 
   return(NULL);
 }
@@ -849,6 +871,96 @@ case_g12(void)
   gem_ws_channels_deinit();
 }
 
+// g13 — OBS-46: the pass that never left the ground took another
+// pass's slot down with it.
+//
+// Two producers enter the subscribe emit — the MD reader at OPEN and
+// any consumer thread — and both drop `mu` around the send. The mark
+// and the completion were matched on (channel, SUBSCRIBING), which
+// names no pass, so the failing pass's rollback wrote IDLE onto a slot
+// whose frame the OTHER pass had already put on the wire. The pass that
+// succeeded then matched nothing, and `wire_subscribed` was never set
+// for a subscription the gateway is streaming: at refcount 0 the slot
+// compacts away and the feed runs on to nobody, which is the failure
+// that field exists to prevent (OBS-42, OBS-53).
+static void
+case_g13(void)
+{
+  pthread_t th;
+  void     *ha;
+  void     *hb;
+
+  gem_ws_channels_init();
+  ledger_reset();
+
+  ha = sub_one("BTC-USD");
+
+  ledger_reset();
+  arm_park("subscribe", "BTCUSD");
+
+  // The MD reader's on-open resubscribe: it renders BTCUSD, marks it,
+  // and parks with the frame on the wire.
+  pthread_create(&th, NULL, on_open_thread, NULL);
+  wait_parked();
+
+  // A consumer arrives while that frame is in flight. Its own emit
+  // covers BTCUSD too — and fails.
+  arm_fail("subscribe", "SOLUSD");
+  hb = sub_one("SOL-USD");
+
+  release_park();
+  pthread_join(th, NULL);
+
+  ledger_reset();
+  gem_ws_unsubscribe(ha);
+
+  test_check_sz(SUITE,
+      "g13: a slot whose subscribe went out still owes its unsubscribe "
+      "after another pass's send failed",
+      1, count_frames("unsubscribe", "BTCUSD"));
+
+  gem_ws_unsubscribe(hb);
+  gem_ws_channels_deinit();
+}
+
+// g14 — OBS-46, the half that needs no second thread: the mark cleared
+// `wire_subscribed` before the send.
+//
+// The field's contract is *set on a successful subscribe send, cleared
+// by a successful unsubscribe send or a session flap* — and the mark
+// cleared it on every slot of the channel, live ones included, before
+// knowing whether this send would leave at all. `curl_ws_send` can fail
+// with the session still OPEN, and then no flap arrives to restore the
+// belief: the earlier subscription is still streaming and the table has
+// forgotten it is owed an unsubscribe.
+static void
+case_g14(void)
+{
+  void *ha;
+  void *hb;
+
+  gem_ws_channels_init();
+  ledger_reset();
+
+  ha = sub_one("BTC-USD");
+
+  // The second consumer's emit re-renders BTCUSD alongside ETHUSD, and
+  // this one does not reach the gateway.
+  arm_fail("subscribe", "ETHUSD");
+  hb = sub_one("ETH-USD");
+
+  ledger_reset();
+  gem_ws_unsubscribe(ha);
+
+  test_check_sz(SUITE,
+      "g14: a live slot keeps its unsubscribe debt when a later emit "
+      "fails to send",
+      1, count_frames("unsubscribe", "BTCUSD"));
+
+  gem_ws_unsubscribe(hb);
+  gem_ws_channels_deinit();
+}
+
 int
 main(void)
 {
@@ -866,6 +978,8 @@ main(void)
   case_g10();
   case_g11();
   case_g12();
+  case_g13();
+  case_g14();
 
   return(test_report(SUITE));
 }

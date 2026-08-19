@@ -5,10 +5,11 @@
 //   * a per-(channel, native_symbol) slot table that refcounts shared
 //     subscribers so N consumers watching the same feed share one
 //     upstream subscription,
-//   * a monotonic req_id counter (informational — Gemini Market Data
-//     v2 does not use JSON-RPC req_ids on the wire; correlation
-//     against `subscription_ack` envelopes goes through (channel,
-//     symbol) matching instead),
+//   * a monotonic req_id counter — Gemini Market Data v2 puts no
+//     req_ids on the wire and sends no `subscription_ack` to carry one
+//     (OBS-53), so it correlates nothing external. It records which
+//     PASS marked a slot, which is what lets two subscribe emits in
+//     the same window apply only their own verdicts (OBS-46),
 //   * per-channel parsers for `l2_updates`, `trade`, `candles_1m_updates`,
 //     plus the Order Events frame walker that surfaces
 //     `accepted/booked/fill/cancelled/rejected/closed` as
@@ -16,8 +17,8 @@
 //
 // On reconnect the slot table drives a full resubscribe so consumer
 // callbacks never miss a beat across a flap. The OE session has no
-// subscribe frame — open is acked by the server with a
-// `subscription_ack` envelope, then a stream of order events.
+// subscribe frame — it is account-implicit, authorised by the signed
+// handshake, and answers with a stream of order events.
 
 #ifndef BM_GEMINI_WS_CHANNELS_H
 #define BM_GEMINI_WS_CHANNELS_H
@@ -37,7 +38,7 @@ void    gem_ws_channels_deinit(void);
 //
 //   GEM_WS_MD: rebuild the upstream MD subscription set from the live
 //   slot table and emit one subscribe per channel covering every live
-//   native symbol. Resets every slot's `gateway_holds` flag and its
+//   native symbol. Resets every slot's `wire_subscribed` flag and its
 //   state before rendering — UNCONDITIONALLY, including slots at
 //   refcount 0 — then compacts, then emits. The reset is what makes a
 //   departed slot forgettable: before OBS-42 it skipped refcount-0
