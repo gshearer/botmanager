@@ -221,15 +221,27 @@ wm_aggregator_on_trade(whenmoon_market_t *mk, int64_t ts_ms,
   // repair it: wm_warmup_repair_arm holds the market out of READY (the
   // engine acts on advice only there) and re-runs the warmup lifecycle,
   // which fills the gap from the venue's own candles and replays them.
+  //
+  // OBS-63: and the same refusal bounds what this thread will do inline.
+  // Every venue here but Coinbase answers `seq_gap` false because nobody
+  // has asked its protocol, so a silent multi-hour hole arrives as a
+  // quiet market and synthesizes minute by minute — under mk->lock, on
+  // the WS reader thread that also drains the paced control-frame queue,
+  // and once per instance bound to the product. Past the bound the
+  // window is not a quiet market by any reading, and the repair is both
+  // the cheaper answer and the more honest one.
   {
     int64_t expected = a->pending_1m.bar_start_ms + 60000;
+    int64_t missing  = (expected < bar_ms) ? (bar_ms - expected) / 60000 : 0;
 
-    if(mk->feed_gap && expected < bar_ms)
+    if(missing > 0 && (mk->feed_gap || missing > WM_AGG_MAX_CATCHUP_1M))
     {
       clam(CLAM_WARN, WHENMOON_CTX,
-          "market %s: feed gap confirmed by the venue — refusing to"
-          " synthesize %lld minute(s) and re-warming",
-          mk->market_id_str, (long long)((bar_ms - expected) / 60000));
+          "market %s: refusing to synthesize %lld minute(s) and"
+          " re-warming — %s",
+          mk->market_id_str, (long long)missing,
+          mk->feed_gap ? "the venue confirmed a feed gap"
+                       : "past the inline catch-up bound");
 
       wm_warmup_repair_arm(mk);
     }
@@ -333,8 +345,8 @@ wm_aggregator_emit_empty_1m(whenmoon_market_t *mk, int64_t bar_start_ms)
 // Ring push + indicator pass                                         //
 // ------------------------------------------------------------------ //
 
-// Append `bar` to grain_arr[gran], shifting the ring left by one if at
-// capacity (so newest is always at grain_n[gran]-1). Then run the
+// Append `bar` to grain_arr[gran], trimming the oldest bars if the ring
+// is at capacity (so newest is always at grain_n[gran]-1). Then run the
 // TA-Lib indicator pass for that bar and fan the closed bar out to
 // every attached strategy whose grains_mask includes `gran`.
 //
@@ -361,8 +373,17 @@ wm_aggregator_push_bar(whenmoon_market_t *mk, wm_gran_t gran,
 
   if(n == cap)
   {
-    memmove(&ring[0], &ring[1], sizeof(*ring) * ((size_t)cap - 1));
-    n = cap - 1;
+    // OBS-63: one trim of cap/WM_AGG_RING_TRIM_DIV bars, not one shift
+    // per push. See that constant for the measurement — at the 1m
+    // grain's production depth this memmove is 68 MB and costs a
+    // hundred times the indicator pass below.
+    uint32_t trim = cap / WM_AGG_RING_TRIM_DIV;
+
+    if(trim == 0)
+      trim = 1;
+
+    memmove(&ring[0], &ring[trim], sizeof(*ring) * ((size_t)cap - trim));
+    n = cap - trim;
   }
 
   ring[n] = *bar;

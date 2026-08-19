@@ -334,10 +334,13 @@ typedef struct whenmoon_market
 
   // Multi-grain candle rings. `grain_cap[g]` slots of
   // `wm_candle_full_t`; `grain_n[g]` populated, oldest at index 0,
-  // newest at `grain_n[g] - 1`. Once full, the aggregator shifts the
-  // ring left by one to make room for the new bar (memmove cost is
-  // small at 200-day capacities and avoids ring-buffer wrap-around in
-  // the indicator computation hot path).
+  // newest at `grain_n[g] - 1`. The layout is flat rather than a
+  // wrap-around ring so the indicator pass can take a trailing window
+  // by pointer; the cost is that making room means a memmove, and at
+  // the 1m grain's 200-day depth that move is 68 MB. So a full ring is
+  // trimmed by WM_AGG_RING_TRIM_DIV (OBS-63), never by one bar, and
+  // `grain_n[g]` therefore sits a little under `grain_cap[g]` for most
+  // of a full ring's life. Nothing may read the two as equal.
   wm_candle_full_t     *grain_arr[WM_GRAN_MAX];
   uint32_t              grain_n[WM_GRAN_MAX];
   uint32_t              grain_cap[WM_GRAN_MAX];

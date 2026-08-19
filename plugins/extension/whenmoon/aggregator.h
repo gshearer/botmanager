@@ -88,6 +88,32 @@ typedef struct wm_aggregator
 // Default history requirement until WM-LT-3 lets strategies declare it.
 #define WM_AGG_DEFAULT_HISTORY_1D  200
 
+// OBS-63: a full ring is trimmed by cap/this many bars, not by one. At
+// the default depth the 1m ring is 288,000 x 248 B = 68 MB, and shifting
+// that left by one MEASURES 2.16 ms against 0.021 ms for the indicator
+// pass the same push runs — so once a ring is full the shift, not the
+// math, is what a bar costs, and a catch-up pays it per synthesized
+// minute. Trimming in one move amortises it to ~0.5 us.
+//
+// The price is that a ring holds between 98.4% and 100% of its
+// configured depth. Nothing reads it that way: the deepest declared
+// min_history is 256 bars, and a backtest snapshot sizes its rings so
+// this path never runs at all (wm_backtest_snapshot_build).
+#define WM_AGG_RING_TRIM_DIV  64u
+
+// OBS-63: minutes of missing 1m bars live ingest will synthesize inline
+// before it refuses the window and re-warms instead, on the OBS-61 path.
+// A whole day without one trade is an outage or a dead product, not a
+// quiet market — and the bound is what keeps the WS reader thread, which
+// also drains the paced control-frame queue, off an unbounded catch-up
+// under mk->lock. 1,440 minutes cost ~43 ms with the trim above and
+// ~3.2 s without it.
+//
+// Deliberately live-only: wm_aggregator_replay_bar runs the same loop on
+// a task thread, where the latency argument does not apply and a
+// backtest's bars must not be refused.
+#define WM_AGG_MAX_CATCHUP_1M  1440LL
+
 bool wm_aggregator_init(struct whenmoon_market *mk,
     uint32_t history_1d_min);
 void wm_aggregator_destroy(struct whenmoon_market *mk);
