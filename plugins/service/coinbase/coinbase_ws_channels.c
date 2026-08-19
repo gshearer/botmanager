@@ -269,6 +269,16 @@ cb_ws_slots_compact_locked(void)
     else
       i++;
   }
+
+  // Hygiene, not the guard: an empty table owes no ack, so stamps that
+  // describe one mean nothing. What actually disarms the watchdog is
+  // its own outstanding test — see cb_ws_channels_sub_ack_overdue,
+  // which explains why a stamp cannot be trusted to stay cleared.
+  if(cb_ws_ch.n_slots == 0)
+  {
+    cb_ws_ch.last_sub_sent_ms = 0;
+    cb_ws_ch.last_ack_ms      = 0;
+  }
 }
 
 // ----------------------------------------------------------------------
@@ -416,11 +426,8 @@ cb_ws_send_delta_locked(const char *op, cb_ws_slot_pred_t pred,
   char        held[128]  = {0};
   size_t      held_len   = 0;
   const char *jwt_p      = jwt;
-  bool        subscribing;
   size_t      len;
   bool        ok;
-
-  subscribing = (strcmp(op, "subscribe") == 0);
 
   if(cb_sign_jwt_ws(jwt, sizeof(jwt)) != SUCCESS)
     jwt_p = NULL;
@@ -451,7 +458,12 @@ cb_ws_send_delta_locked(const char *op, cb_ws_slot_pred_t pred,
         jwt_p);
     if(len == 0) continue;
 
-    ok = (cb_ws_send_json(frame, len) == SUCCESS);
+    // Queued, not sent: the gateway refuses an over-limit control frame
+    // instead of acking it, so a batch leaves one frame at a time
+    // (OBS-52). The INFO line and the watchdog stamp both move to the
+    // drain, where the send actually happens.
+    ok = (cb_ws_ctrl_enqueue(frame, len, op, cb_ws_channel_name(cch))
+        == SUCCESS);
 
     if(ok)
     {
@@ -464,17 +476,12 @@ cb_ws_send_delta_locked(const char *op, cb_ws_slot_pred_t pred,
 
         s->sent_upstream = new_sent_state;
       }
-
-      if(subscribing)
-        cb_ws_ch.last_sub_sent_ms = cb_ws_ch_now_ms();
-
-      clam(CLAM_INFO, CB_CTX, "ws %s ch=%s (%zu bytes)", op,
-          cb_ws_channel_name(cch), len);
     }
     else
     {
       clam(CLAM_DEBUG, CB_CTX,
-          "ws %s ch=%s held: session not open (will retry on open)",
+          "ws %s ch=%s held: session not open or send queue full"
+          " (will retry on open)",
           op, cb_ws_channel_name(cch));
     }
   }
@@ -1065,20 +1072,51 @@ cb_ws_channels_on_open(void)
   pthread_mutex_unlock(&cb_ws_ch.mu);
 }
 
+void
+cb_ws_channels_note_subscribe_sent(void)
+{
+  if(!cb_ws_ch.initialized) return;
+
+  pthread_mutex_lock(&cb_ws_ch.mu);
+  cb_ws_ch.last_sub_sent_ms = cb_ws_ch_now_ms();
+  pthread_mutex_unlock(&cb_ws_ch.mu);
+}
+
 bool
 cb_ws_channels_sub_ack_overdue(void)
 {
   uint64_t sent;
   uint64_t acked;
+  bool     outstanding = false;
 
   if(!cb_ws_ch.initialized) return(false);
 
   pthread_mutex_lock(&cb_ws_ch.mu);
+
   sent  = cb_ws_ch.last_sub_sent_ms;
   acked = cb_ws_ch.last_ack_ms;
+
+  // The question is not "was a subscribe sent" but "is one still
+  // outstanding", and only the slot table answers it (OBS-52). The
+  // stamps cannot: they are free-running, nothing lowers them, and a
+  // paced send stamps at the DRAIN — so a subscribe queued just before
+  // the last consumer left re-stamps after the table is already empty.
+  // Reaching the timeout below with nothing subscribed is unrecoverable
+  // by construction, because the resubscribe a reconnect runs renders no
+  // frame and so can never re-stamp: measured as an hour of reconnects
+  // at one every two seconds, ended only by a plugin reload.
+  for(uint32_t i = 0; i < cb_ws_ch.n_slots; i++)
+  {
+    if(cb_ws_ch.slots[i].sent_upstream)
+    {
+      outstanding = true;
+      break;
+    }
+  }
+
   pthread_mutex_unlock(&cb_ws_ch.mu);
 
-  if(sent == 0 || acked >= sent)
+  if(!outstanding || sent == 0 || acked >= sent)
     return(false);
 
   return(cb_ws_ch_now_ms() - sent > CB_WS_SUB_ACK_TIMEOUT_MS);
@@ -1119,6 +1157,18 @@ cb_ws_channels_dispatch(const char *buf, size_t len)
 
     clam(CLAM_WARN, CB_CTX, "ws server error: %s | frame=%s", msg,
         raw_json != NULL ? raw_json : "?");
+
+    // An error IS the gateway's answer, so it ends the ack wait (OBS-52).
+    // A refused subscribe never gets a "subscriptions" frame; waiting
+    // the full CB_WS_SUB_ACK_TIMEOUT_MS for one and then dropping a
+    // working socket adds an outage to a failure the WARN above has
+    // already reported. The stamps carry no per-channel identity, so
+    // this cannot tell which frame was refused — nothing in this
+    // watchdog ever could — but silence is the one state it exists to
+    // catch, and this is not silence.
+    pthread_mutex_lock(&cb_ws_ch.mu);
+    cb_ws_ch.last_ack_ms = cb_ws_ch_now_ms();
+    pthread_mutex_unlock(&cb_ws_ch.mu);
 
     json_object_put(root);
     return;

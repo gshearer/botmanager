@@ -54,6 +54,20 @@
 #define CB_WS_STOP_WAIT_MS      5000
 #define CB_WS_MAX_CONSEC_FAIL   10
 
+// OBS-52 — control-frame pacing. The gateway rate-limits subscribe /
+// unsubscribe frames and answers an over-limit one with
+// {"type":"error","message":"rate limit exceeded"} rather than a
+// "subscriptions" ack, which the ack watchdog cannot tell from silence.
+// Measured 2026-08-19 against advanced-trade-ws.coinbase.com
+// (temp/obs52): twelve control frames back-to-back gave eight acks and
+// four refusals; the same twelve at a 150 ms gap gave twelve acks.
+// 200 ms is that measurement with margin.
+#define CB_WS_CTRL_MIN_GAP_MS   200
+// Depth of the paced queue. One reconcile emits at most one frame per
+// channel; the worst burst observed was 22 frames from five
+// subscription handles mutating within the same second.
+#define CB_WS_CTRL_QUEUE_DEPTH  128
+
 typedef enum
 {
   CB_WS_DISCONNECTED,
@@ -61,6 +75,19 @@ typedef enum
   CB_WS_OPEN,
   CB_WS_RECONNECTING
 } cb_ws_state_t;
+
+// One rendered control frame waiting its turn on the paced queue.
+// `frame` is heap-owned by the queue and freed as the entry leaves it.
+// `op` and `channel` point at string literals, so they outlive the
+// entry; they are carried only so the send can be logged where it
+// actually happens rather than where it was rendered.
+typedef struct
+{
+  char       *frame;
+  size_t      len;
+  const char *op;
+  const char *channel;
+} cb_ws_ctrl_frame_t;
 
 // REST request type. Enum values for private endpoints are declared
 // here so the union shape is stable across the typed callers.
@@ -268,6 +295,14 @@ void    cb_ws_deinit(void);
 // re-sends live subscriptions on reconnect).
 bool    cb_ws_send_json(const char *buf, size_t len);
 
+// Queue one rendered control frame for paced delivery by the reader
+// thread. `buf` is copied. Returns FAIL — leaving the caller's slot
+// bookkeeping untouched, exactly as a refused send does, so the next
+// reconcile retries the frame — when the session is not OPEN or the
+// queue is full.
+bool    cb_ws_ctrl_enqueue(const char *buf, size_t len, const char *op,
+            const char *channel);
+
 // Human-readable name for a session state (logging / admin commands).
 const char *cb_ws_state_name(cb_ws_state_t s);
 
@@ -308,6 +343,11 @@ void    cb_ws_channels_dispatch(const char *buf, size_t len);
 // subscribe is silently ignored (INCIDENTS.md 2026-07-23), which the
 // idle watchdog can never see. Thread-safe; the caller owns the
 // response (schedule a reconnect) — this only reports.
+// Stamp the subscribe-ack watchdog at the moment a subscribe frame
+// really reaches the wire. Paced delivery separates the render from the
+// send by whole seconds, and it is the send the gateway answers.
+void    cb_ws_channels_note_subscribe_sent(void);
+
 bool    cb_ws_channels_sub_ack_overdue(void);
 
 #endif // CB_INTERNAL

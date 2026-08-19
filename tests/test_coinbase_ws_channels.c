@@ -10,8 +10,8 @@
 //
 // The cases drive the public surface only — subscribe, unsubscribe —
 // and read the emitted frame set, because what the module puts on the
-// wire is the only thing a consumer can observe. The send stub is the
-// whole fixture; no session, no reader thread, no JWT.
+// wire is the only thing a consumer can observe. The enqueue stub is
+// the whole fixture; no session, no reader thread, no JWT.
 //
 // ⚠ Every subscribe silently adds `heartbeats` + `status` to its own
 // channel mask, and coinbase keys ALL THREE by product, so one
@@ -61,9 +61,16 @@ cb_sign_jwt_ws(char *out, size_t cap)
   return(SUCCESS);
 }
 
+// The module renders a frame and hands it to the transport's paced
+// queue rather than sending it (OBS-52); what it emits is unchanged, so
+// this is the same ledger one seam further out.
 bool
-cb_ws_send_json(const char *buf, size_t len)
+cb_ws_ctrl_enqueue(const char *buf, size_t len, const char *op,
+    const char *channel)
 {
+  (void)op;
+  (void)channel;
+
   pthread_mutex_lock(&ledger_mutex);
 
   if(n_frames < LEDGER_MAX && buf != NULL)
@@ -232,6 +239,44 @@ case_a_partial_seat_is_refused_whole(void)
   cb_ws_channels_deinit();
 }
 
+// c3 — OBS-52: what a reconnect promises, because the paced queue's
+// failure path leans on it. A frame that is queued but never reaches
+// the wire leaves its slot reading sent_upstream, and the only thing
+// that repairs that is cb_ws_channels_on_open clearing every slot's
+// flag before it reconciles. So: an open must re-emit a live
+// subscription it has already emitted once, and must emit nothing at
+// all once the last subscription is gone.
+static void
+case_an_open_reconciles_from_the_slot_table(void)
+{
+  const char        *products[] = { "BTC-USD" };
+  coinbase_ws_sub_t *h;
+
+  cb_ws_channels_init();
+
+  h = sub_products(COINBASE_CH_TICKER, products, 1);
+
+  test_check_bool(SUITE, "c3: the fixture subscribe seats",
+      true, h != NULL);
+
+  // Already sent upstream once. A reconnect must not trust that.
+  ledger_reset();
+  cb_ws_channels_on_open();
+
+  test_check_sz(SUITE, "c3: an open re-emits a live subscription",
+      1, count_frames("subscribe", "ticker", "BTC-USD"));
+
+  coinbase_ws_unsubscribe(h);
+
+  ledger_reset();
+  cb_ws_channels_on_open();
+
+  test_check_sz(SUITE, "c3: and emits nothing once the last one is gone",
+      0, count_frames("subscribe", "ticker", NULL));
+
+  cb_ws_channels_deinit();
+}
+
 int
 main(void)
 {
@@ -246,6 +291,7 @@ main(void)
 
   case_a_subscribe_reaches_the_wire();
   case_a_partial_seat_is_refused_whole();
+  case_an_open_reconciles_from_the_slot_table();
 
   return(test_report(SUITE));
 }

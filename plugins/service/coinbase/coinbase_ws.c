@@ -61,6 +61,17 @@ typedef struct
   char           *rx_buf;
   size_t          rx_len;
   size_t          rx_cap;
+
+  // Paced control-frame queue (OBS-52). Rendered subscribe /
+  // unsubscribe frames wait here and leave one at a time, at least
+  // CB_WS_CTRL_MIN_GAP_MS apart. Guarded by `lock`; only the reader
+  // thread drains it, and it is emptied with the session, because a
+  // frame rendered against a session that has gone away is worse than
+  // no frame at all — the OPEN hook reconciles from the slot table.
+  cb_ws_ctrl_frame_t ctrl[CB_WS_CTRL_QUEUE_DEPTH];
+  uint32_t        ctrl_head;
+  uint32_t        ctrl_count;
+  uint64_t        ctrl_last_send_ms;
 } cb_ws_t;
 
 static cb_ws_t cb_ws;
@@ -79,6 +90,8 @@ static void     cb_ws_on_frame_locked(cb_ws_t *w, const char *data, size_t len,
 static bool     cb_ws_send_ping_locked(cb_ws_t *w);
 static bool     cb_ws_send_pong_locked(cb_ws_t *w, const char *buf, size_t len);
 static bool     cb_ws_rx_append_locked(cb_ws_t *w, const char *data, size_t len);
+static void     cb_ws_ctrl_flush_locked(cb_ws_t *w);
+static void     cb_ws_ctrl_drain     (cb_ws_t *w);
 static void     cb_ws_schedule_reconnect_locked(cb_ws_t *w, const char *why);
 static void     cb_ws_set_state_locked(cb_ws_t *w, cb_ws_state_t s);
 static void     cb_ws_reload_url_locked(cb_ws_t *w);
@@ -150,6 +163,108 @@ cb_ws_send_json(const char *buf, size_t len)
   pthread_mutex_unlock(&cb_ws.lock);
 
   return(ok);
+}
+
+bool
+cb_ws_ctrl_enqueue(const char *buf, size_t len, const char *op,
+    const char *channel)
+{
+  uint32_t slot;
+  bool     ok = FAIL;
+
+  if(buf == NULL || len == 0)
+    return(FAIL);
+
+  pthread_mutex_lock(&cb_ws.lock);
+
+  if(cb_ws.state == CB_WS_OPEN
+      && cb_ws.ctrl_count < CB_WS_CTRL_QUEUE_DEPTH)
+  {
+    slot = (cb_ws.ctrl_head + cb_ws.ctrl_count) % CB_WS_CTRL_QUEUE_DEPTH;
+
+    cb_ws.ctrl[slot].frame   = mem_alloc(CB_CTX, "ws_ctrl", len);
+    cb_ws.ctrl[slot].len     = len;
+    cb_ws.ctrl[slot].op      = op;
+    cb_ws.ctrl[slot].channel = channel;
+
+    memcpy(cb_ws.ctrl[slot].frame, buf, len);
+    cb_ws.ctrl_count++;
+
+    ok = SUCCESS;
+  }
+
+  pthread_mutex_unlock(&cb_ws.lock);
+
+  return(ok);
+}
+
+static void
+cb_ws_ctrl_flush_locked(cb_ws_t *w)
+{
+  uint32_t i;
+
+  for(i = 0; i < w->ctrl_count; i++)
+  {
+    uint32_t slot = (w->ctrl_head + i) % CB_WS_CTRL_QUEUE_DEPTH;
+
+    mem_free(w->ctrl[slot].frame);
+    w->ctrl[slot].frame = NULL;
+  }
+
+  if(w->ctrl_count > 0)
+    clam(CLAM_DEBUG, CB_CTX, "ws dropped %u queued control frame(s)",
+        w->ctrl_count);
+
+  w->ctrl_head  = 0;
+  w->ctrl_count = 0;
+}
+
+// Send at most one queued control frame, and only once the pacing gap
+// has elapsed. Called from the reader loop with w->lock RELEASED:
+// cb_ws_send_json takes it, and the stamp handed back to the channel
+// layer takes cb_ws_ch.mu, which is the outer lock of the pair.
+//
+// A send that fails here drops the frame while the slot table still
+// reads sent_upstream — recovered, not leaked: losing the session is
+// the only way to get here, cb_ws_close_locked empties this queue, and
+// cb_ws_channels_on_open clears every sent_upstream before it
+// reconciles.
+static void
+cb_ws_ctrl_drain(cb_ws_t *w)
+{
+  cb_ws_ctrl_frame_t e   = {0};
+  uint64_t           now = cb_ws_now_ms();
+
+  pthread_mutex_lock(&w->lock);
+
+  if(w->state == CB_WS_OPEN && w->ctrl_count > 0
+      && now - w->ctrl_last_send_ms >= CB_WS_CTRL_MIN_GAP_MS)
+  {
+    e = w->ctrl[w->ctrl_head];
+
+    w->ctrl[w->ctrl_head].frame = NULL;
+    w->ctrl_head               = (w->ctrl_head + 1) % CB_WS_CTRL_QUEUE_DEPTH;
+    w->ctrl_count--;
+    w->ctrl_last_send_ms       = now;
+  }
+
+  pthread_mutex_unlock(&w->lock);
+
+  if(e.frame == NULL)
+    return;
+
+  if(cb_ws_send_json(e.frame, e.len) == SUCCESS)
+  {
+    // The watchdog measures send-to-ack, and this is the send the
+    // gateway answers — not the render, which may be seconds behind.
+    if(strcmp(e.op, "subscribe") == 0)
+      cb_ws_channels_note_subscribe_sent();
+
+    clam(CLAM_INFO, CB_CTX, "ws %s ch=%s (%zu bytes)", e.op, e.channel,
+        e.len);
+  }
+
+  mem_free(e.frame);
 }
 
 // Lifecycle
@@ -394,10 +509,14 @@ cb_ws_open_locked(cb_ws_t *w)
   w->last_frame_ms = cb_ws_now_ms();
   w->last_ping_ms  = w->last_frame_ms;
   w->rx_len        = 0;
-  w->backoff_ms    = 0;
   w->backoff_until = 0;
-  w->consec_fails  = 0;
   w->last_crit_log = 0;
+
+  // backoff_ms and consec_fails deliberately survive a successful open
+  // (OBS-52): opening the socket is not evidence the session works, and
+  // the failure this ladder exists for tears down a socket that opened
+  // perfectly. cb_ws_on_frame_locked clears them on the first frame
+  // that carries content, which is the real proof.
 
   cb_ws_set_state_locked(w, CB_WS_OPEN);
 
@@ -423,6 +542,8 @@ cb_ws_close_locked(cb_ws_t *w)
 
   w->sockfd = CURL_SOCKET_BAD;
   w->rx_len = 0;
+
+  cb_ws_ctrl_flush_locked(w);
 }
 
 static void
@@ -571,12 +692,9 @@ cb_ws_on_frame_locked(cb_ws_t *w, const char *data, size_t len,
 {
   unsigned int flags = (unsigned int)meta->flags;
 
-  // Any byte from the peer is liveness proof: freshen the idle clock
-  // and drop the flap-storm counter back to zero.
+  // Any byte from the peer is liveness proof, and that is all the idle
+  // watchdog asks for.
   w->last_frame_ms = cb_ws_now_ms();
-  w->consec_fails  = 0;
-  w->backoff_ms    = 0;
-  w->backoff_until = 0;
 
   if(flags & CURLWS_PING)
   {
@@ -595,6 +713,17 @@ cb_ws_on_frame_locked(cb_ws_t *w, const char *data, size_t len,
     cb_ws_schedule_reconnect_locked(w, "peer close");
     return;
   }
+
+  // Progress, which is a different question (OBS-52). A pong proves the
+  // transport and nothing above it — this gateway pongs a subscription
+  // it has stopped answering — and a close frame is the opposite of
+  // progress, so neither may clear the flap ladder. Only a frame
+  // carrying content does. Zeroing these on a pong is what held an
+  // hour-long reconnect storm at a flat 2 s without ever reaching the
+  // flapping WARN.
+  w->consec_fails  = 0;
+  w->backoff_ms    = 0;
+  w->backoff_until = 0;
 
   // Coinbase Exchange never sends binary — drop it and keep going.
   if(flags & CURLWS_BINARY)
@@ -766,6 +895,11 @@ cb_ws_reader(task_t *t)
       curl_socket_t sock = w->sockfd;
 
       pthread_mutex_unlock(&w->lock);
+
+      // Paced control-frame delivery (OBS-52). Here rather than under
+      // the lock because the send re-takes it, and because the batch
+      // this drains was rendered on somebody else's thread.
+      cb_ws_ctrl_drain(w);
 
       // Subscribe-ack watchdog. Pongs keep last_frame_ms fresh, so a
       // gateway that silently ignores subscribes never trips the idle
