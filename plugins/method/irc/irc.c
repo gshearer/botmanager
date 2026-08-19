@@ -316,6 +316,13 @@ irc_resolve_server(irc_state_t *st)
   v = kv_get_str(key);
   snprintf(st->operator_pass, sizeof(st->operator_pass), "%s", v ? v : "");
 
+  // An empty pair is the normal case for a bot that is not meant to be an
+  // oper. A half-set pair is a wiped or mistyped credential, and OPER is
+  // then skipped as silently as if it had never been configured.
+  if((st->operator_name[0] == '\0') != (st->operator_pass[0] == '\0'))
+    clam(CLAM_WARN, "irc", "only one of " IRC_NET_PREFIX "%s.%s.operator_name"
+        "/_password is set — OPER will not be attempted", st->network, srv);
+
   // Read per-server output-queueing flag.
   snprintf(key, sizeof(key), IRC_NET_PREFIX "%s.%s.no_output_queueing",
       st->network, srv);
@@ -764,6 +771,7 @@ static void irc_handle_namreply(irc_state_t *, const irc_parsed_msg_t *);
 static void irc_handle_endnames(irc_state_t *, const irc_parsed_msg_t *);
 static void irc_handle_topic332(irc_state_t *, const irc_parsed_msg_t *);
 static void irc_handle_youreoper(irc_state_t *, const irc_parsed_msg_t *);
+static void irc_handle_badpassword(irc_state_t *, const irc_parsed_msg_t *);
 static void irc_handle_whoreply(irc_state_t *, const irc_parsed_msg_t *);
 static void irc_handle_join    (irc_state_t *, const irc_parsed_msg_t *);
 static void irc_handle_part    (irc_state_t *, const irc_parsed_msg_t *);
@@ -785,6 +793,8 @@ static const struct {
   { "353",     irc_handle_namreply },
   { "366",     irc_handle_endnames },
   { "381",     irc_handle_youreoper},
+  { "464",     irc_handle_badpassword},
+  { "491",     irc_handle_badpassword},
   { "332",     irc_handle_topic332 },
   { "JOIN",    irc_handle_join     },
   { "PART",    irc_handle_part     },
@@ -824,6 +834,11 @@ irc_handle_welcome(irc_state_t *st, const irc_parsed_msg_t *p)
     irc_send_raw(st, "OPER %s %s", st->operator_name, st->operator_pass);
   }
 
+  else
+    clam(CLAM_INFO, "irc", "no operator credentials for %s on %s — OPER not "
+        "attempted, operator-only actions such as KILL are unavailable",
+        st->network, st->host);
+
   irc_join_channels(st);
 }
 
@@ -837,6 +852,29 @@ irc_handle_youreoper(irc_state_t *st, const irc_parsed_msg_t *p)
 
   __atomic_store_n(&st->is_oper, true, __ATOMIC_RELAXED);
   clam(CLAM_INFO, "irc", "granted IRC operator status");
+}
+
+// ERR_PASSWDMISMATCH (464) and ERR_NOOPERHOST (491) — the server refused
+// a credential we offered. Past registration the only one the bot offers
+// is the OPER pair, and its refusal is otherwise invisible: is_oper stays
+// false and irc_eject silently loses KILL. Before registration a 464 is
+// the server password instead, and the link is about to close.
+static void
+irc_handle_badpassword(irc_state_t *st, const irc_parsed_msg_t *p)
+{
+  const char *why = p->has_trailing ? p->trailing : "no reason given";
+
+  if(!st->registered)
+  {
+    clam(CLAM_WARN, "irc", "%s on %s rejected the server password (%s: %s) — "
+        "the link will close", st->network, st->host, p->command, why);
+    return;
+  }
+
+  clam(CLAM_WARN, "irc", "%s on %s refused OPER as '%s' (%s: %s) — check "
+      "operator_name/_password; operator-only actions such as KILL are "
+      "unavailable", st->network, st->host, st->operator_name, p->command,
+      why);
 }
 
 static void
