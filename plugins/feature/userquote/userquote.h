@@ -51,6 +51,38 @@ typedef struct
   char    lastview[40];                // rendered timestamp
 } uq_quote_t;
 
+// How many sayers the `show quotes` leaderboard names.
+#define UQ_TOP_SAYERS       5
+
+// One leaderboard entry: a sayer and how many of the book is theirs.
+typedef struct
+{
+  char    name[UQ_SAYER_SZ];
+  int64_t count;
+} uq_tally_t;
+
+// Aggregate telemetry for one namespace's book. Every count is a plain
+// row count; `span_days` is the whole distance between the oldest and
+// newest capture, so it is 0 for a book of one.
+typedef struct
+{
+  int64_t    total;
+  int64_t    sayers;             // distinct, case-folded
+  int64_t    quoters;            // distinct, case-folded
+  int64_t    channels;           // distinct non-empty
+  char       oldest[24];         // YYYY-MM-DD, empty when the book is
+  char       newest[24];         // YYYY-MM-DD, empty when the book is
+  int64_t    span_days;
+  int64_t    avg_len;            // bytes
+  int64_t    max_len;            // bytes
+  int64_t    recent;             // captured in the last 30 days
+  int64_t    unseen;             // never recalled since capture
+  char       busiest[8];         // busiest calendar year, or empty
+  int64_t    busiest_n;
+  uq_tally_t top[UQ_TOP_SAYERS];
+  uint32_t   n_top;
+} uq_stats_t;
+
 // ---- DB layer (uq_db.c) -------------------------------------------- //
 
 // Resolve + validate the configured table name into `out`. FAIL if the
@@ -75,10 +107,21 @@ bool uq_db_get(uint32_t ns_id, int64_t id, const char *sayer,
 // or -1 on error.
 int uq_db_del(uint32_t ns_id, int64_t id);
 
+// Aggregate the whole book for `ns_id` into `out`. Three reads: the
+// aggregate row, the sayer leaderboard, the busiest year. FAIL only when
+// the store could not be read — an empty book is a zeroed struct and a
+// SUCCESS.
+bool uq_db_stats(uint32_t ns_id, uq_stats_t *out);
+
 // ---- Command surface (uq_cmds.c) ----------------------------------- //
 
 bool uq_commands_register(void);
 void uq_commands_unregister(void);
+
+// ---- Telemetry surface (uq_show.c) --------------------------------- //
+
+bool uq_show_register(void);
+void uq_show_unregister(void);
 
 #endif // USERQUOTE_INTERNAL
 

@@ -370,6 +370,10 @@ uq_commands_register(void)
         uq_del_args, 1, NULL, NULL) != SUCCESS)
     return(FAIL);
 
+  // `show quotes` hangs off the observability root, not off `quote`.
+  if(uq_show_register() != SUCCESS)
+    return(FAIL);
+
   return(SUCCESS);
 }
 
@@ -380,4 +384,5 @@ void
 uq_commands_unregister(void)
 {
   cmd_unregister_path("quote");
+  uq_show_unregister();
 }

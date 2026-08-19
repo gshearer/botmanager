@@ -362,3 +362,129 @@ uq_db_del(uint32_t ns_id, int64_t id)
   db_result_free(res);
   return(affected);
 }
+
+// ------------------------------------------------------------------ //
+// Telemetry                                                          //
+// ------------------------------------------------------------------ //
+
+// Run `sql` and hand the caller the result if it carries at least one
+// row. NULL when the query failed or matched nothing; the caller frees.
+static db_result_t *
+uq_select_rows(const char *sql)
+{
+  db_result_t *res = db_result_alloc();
+
+  if(db_query(sql, res) != SUCCESS || !res->ok)
+  {
+    clam(CLAM_WARN, UQ_CTX, "stats query failed: %s",
+        res->error[0] != '\0' ? res->error : "(no driver error)");
+    db_result_free(res);
+    return(NULL);
+  }
+
+  if(res->rows == 0)
+  {
+    db_result_free(res);
+    return(NULL);
+  }
+
+  return(res);
+}
+
+bool
+uq_db_stats(uint32_t ns_id, uq_stats_t *out)
+{
+  db_result_t *res;
+  char         table[UQ_TABLE_SZ];
+  char         sql[1280];
+
+  if(out == NULL)
+    return(FAIL);
+
+  memset(out, 0, sizeof(*out));
+
+  if(uq_table_name(table, sizeof(table)) != SUCCESS)
+    return(FAIL);
+
+  // The aggregate. Every column is COALESCEd because an empty book
+  // makes min/max/avg NULL, and an empty book is a legitimate answer
+  // here rather than a failure.
+  snprintf(sql, sizeof(sql),
+      "SELECT count(*),"
+      " count(DISTINCT LOWER(sayer)) FILTER (WHERE sayer <> ''),"
+      " count(DISTINCT LOWER(quoter)) FILTER (WHERE quoter <> ''),"
+      " count(DISTINCT channel) FILTER (WHERE channel <> ''),"
+      " COALESCE(to_char(min(created_at), 'YYYY-MM-DD'), ''),"
+      " COALESCE(to_char(max(created_at), 'YYYY-MM-DD'), ''),"
+      " COALESCE((EXTRACT(EPOCH FROM (max(created_at) - min(created_at)))"
+      "   / 86400)::bigint, 0),"
+      " COALESCE(round(avg(length(quote)))::bigint, 0),"
+      " COALESCE(max(length(quote))::bigint, 0),"
+      " count(*) FILTER (WHERE created_at >= NOW() - INTERVAL '30 days'),"
+      " count(*) FILTER (WHERE lastview <= created_at)"
+      " FROM %s WHERE ns_id = %" PRIu32,
+      table, ns_id);
+
+  res = uq_select_rows(sql);
+
+  if(res == NULL)
+    return(FAIL);
+
+  out->total     = db_result_get_i64(res, 0, 0, 0);
+  out->sayers    = db_result_get_i64(res, 0, 1, 0);
+  out->quoters   = db_result_get_i64(res, 0, 2, 0);
+  out->channels  = db_result_get_i64(res, 0, 3, 0);
+  db_result_copy(out->oldest, sizeof(out->oldest), res, 0, 4);
+  db_result_copy(out->newest, sizeof(out->newest), res, 0, 5);
+  out->span_days = db_result_get_i64(res, 0, 6, 0);
+  out->avg_len   = db_result_get_i64(res, 0, 7, 0);
+  out->max_len   = db_result_get_i64(res, 0, 8, 0);
+  out->recent    = db_result_get_i64(res, 0, 9, 0);
+  out->unseen    = db_result_get_i64(res, 0, 10, 0);
+
+  db_result_free(res);
+
+  if(out->total == 0)
+    return(SUCCESS);
+
+  // Leaderboard. Grouping on LOWER(sayer) folds the case variants of one
+  // nick into one line; min(sayer) picks a stable spelling to show.
+  snprintf(sql, sizeof(sql),
+      "SELECT min(sayer), count(*) FROM %s"
+      " WHERE ns_id = %" PRIu32 " AND sayer <> ''"
+      " GROUP BY LOWER(sayer) ORDER BY 2 DESC, 1 ASC LIMIT %d",
+      table, ns_id, UQ_TOP_SAYERS);
+
+  res = uq_select_rows(sql);
+
+  if(res != NULL)
+  {
+    uint32_t i;
+
+    for(i = 0; i < res->rows && i < UQ_TOP_SAYERS; i++)
+    {
+      db_result_copy(out->top[i].name, sizeof(out->top[i].name), res, i, 0);
+      out->top[i].count = db_result_get_i64(res, i, 1, 0);
+    }
+
+    out->n_top = i;
+    db_result_free(res);
+  }
+
+  snprintf(sql, sizeof(sql),
+      "SELECT to_char(created_at, 'YYYY'), count(*) FROM %s"
+      " WHERE ns_id = %" PRIu32
+      " GROUP BY 1 ORDER BY 2 DESC, 1 DESC LIMIT 1",
+      table, ns_id);
+
+  res = uq_select_rows(sql);
+
+  if(res != NULL)
+  {
+    db_result_copy(out->busiest, sizeof(out->busiest), res, 0, 0);
+    out->busiest_n = db_result_get_i64(res, 0, 1, 0);
+    db_result_free(res);
+  }
+
+  return(SUCCESS);
+}
