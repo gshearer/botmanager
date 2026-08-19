@@ -949,11 +949,13 @@ cb_ws_reader(task_t *t)
           continue;   // EINTR or timeout — re-check watchdogs on next tick
       }
 
-      // Socket has data. Drain whatever libcurl has buffered, capped at
-      // 64 iterations so a flood can't monopolize the lock indefinitely.
+      // Socket has data. Drain whatever libcurl has buffered, capped so
+      // a flood can't monopolize the lock — and so the paced control
+      // queue, which moves one frame per pass of this loop, is not held
+      // behind a long burst of market data.
       pthread_mutex_lock(&w->lock);
 
-      for(int i = 0; i < 64; i++)
+      for(int i = 0; i < CB_WS_RECV_BURST_MAX; i++)
       {
         char                         buf[CB_WS_RECV_BUF_SZ];
         size_t                       rlen = 0;

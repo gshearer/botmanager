@@ -61,6 +61,14 @@
 // carries the measurement that set it — a compiled copy of that number
 // would be a second declaration free to drift from it (OBS-48).
 #define CB_WS_CTRL_QUEUE_DEPTH  128
+// Frames drained from the socket before the reader loop comes back
+// around. It bounds how long the recv burst holds the session lock —
+// and, since the paced queue sends at most one frame per loop pass, it
+// is also the floor on how fast a subscribe can leave. Measured at 64:
+// one pass took ~1.5 s under a live tick feed, so a five-frame
+// reconcile paced at 200 ms actually took 20 s and the survivors' feed
+// was dark for 17 of them.
+#define CB_WS_RECV_BURST_MAX    8
 
 typedef enum
 {
