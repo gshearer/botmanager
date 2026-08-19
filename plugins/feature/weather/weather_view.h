@@ -70,6 +70,12 @@ typedef struct
 // period label against before deciding it will not fit.
 #define WEATHER_DAY_COLS      9
 
+// The wind column, which the daily view pads so the icon that CLOSES
+// each row lands in a straight column. Wide enough for "10-15mph NNW";
+// a wider one pushes only its own icon, since nothing is aligned
+// against that.
+#define WEATHER_WIND_COLS    12
+
 // One row of the daily forecast.
 //
 // Every optional field is paired with a `have_` flag rather than a

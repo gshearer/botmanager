@@ -128,9 +128,22 @@ weather_fmt_temp_w(char *buf, size_t sz, double temp, const char *units,
   return(snprintf(buf, sz, "%*.0f", width, temp));
 }
 
-// Map a weather condition ID to a Unicode weather emoji (UTF-8). Must
-// be placed at the START of each line so variable emoji width does
-// not break column alignment.
+// Map a weather condition ID to a Unicode weather emoji (UTF-8).
+//
+// ⚠ How many columns one of these occupies is NOT knowable here. Most
+// are text-presentation code points wearing U+FE0F (🌥️ is U+1F325 +
+// VS16), which a client may draw one column wide or two depending on
+// its width table and on which font supplied the glyph; a few (🌀, 🥵,
+// 🥶) are emoji-presentation and always two. So a row that draws one
+// of these next to a row that draws another can sit a column off.
+//
+// A view therefore either puts the icon where NOTHING is aligned
+// against it, or wears the offset. The daily table CLOSES each row with
+// it for that reason — an earlier design led with it, on the theory
+// that a whole-line shift beat shearing the columns within a line, and
+// what that bought was one row of a seven-row table visibly indented
+// past its neighbours. The current-conditions line is not a grid and is
+// free either way; the hourly view still leads its cells with one.
 //
 // ⭑ Codes 900–905 are a PRIVATE range, and the one place this axis
 // extends past OpenWeather's numbering. weather.gov names five sky
@@ -704,12 +717,19 @@ weather_reply_current(const cmd_ctx_t *ctx,
 
 // The 7-day view, one row per day:
 //
-//   {icon} {day:9}  {hi}/{lo}°{u}  {condition:22}  {rh:3}  {pop:4}  {wind}
+//   {day:9}  {hi}/{lo}°{u}  {condition:22}  {rh:3}  {pop:4}  {wind:12} {icon}
 //
-// 73 display columns, comfortably inside WEATHER_LINE_COLS. Every field
+// 76 display columns, comfortably inside WEATHER_LINE_COLS. Every field
 // is padded on its RAW text before colour markup wraps it — the reason
 // weather_fmt_temp_w exists — so the columns line up whatever the
 // temperature's digit count.
+//
+// The icon closes the row rather than opening it because its rendered
+// width is a property of the reader's client, not of this code (see
+// weather_condition_icon): last, it is the one thing on the line with
+// nothing to its right to push. Which is also why wind — until now the
+// deliberately unpadded final field — is padded: it stopped being
+// last.
 //
 // Humidity and precipitation are two fixed slots rather than one field
 // because the two providers are optional in opposite places: a
@@ -736,6 +756,7 @@ weather_reply_forecast_daily(const cmd_ctx_t *ctx,
     char desc_pad[24];
     char humid[8];
     char precip[24];
+    char wind[sizeof(d->wind) + sizeof(d->wind_dir)];
     char buf[WEATHER_REPLY_SZ];
 
     // Width-pad the numeric part to 3 visible chars (matching the hourly
@@ -763,20 +784,26 @@ weather_reply_forecast_daily(const cmd_ctx_t *ctx,
 
     weather_fmt_precip(precip, sizeof(precip), d->have_pop ? d->pop : 0);
 
-    // Wind closes the line and is the one field left unpadded: nothing
-    // sits to its right to fall out of alignment, and a padded "5mph"
-    // only opens a gap before the direction.
+    // Speed and heading are one column, joined here rather than in the
+    // format so the pad measures the pair. A provider that gave no
+    // heading leaves no gap in front of nothing.
+    if(d->wind_dir[0] != '\0')
+      snprintf(wind, sizeof(wind), "%s %s", d->wind, d->wind_dir);
+
+    else
+      strlcpy(wind, d->wind, sizeof(wind));
+
     snprintf(buf, sizeof(buf),
-        "%s %-*.*s  %s/%s\xc2\xb0%s"
+        "%-*.*s  %s/%s\xc2\xb0%s"
         "  %s%s" CLR_RESET
         "  %s"
         "  %s"
-        "  %s %s",
-        icon, WEATHER_DAY_COLS, WEATHER_DAY_COLS, d->day_name, chi, clo, tu,
+        "  %-*s %s",
+        WEATHER_DAY_COLS, WEATHER_DAY_COLS, d->day_name, chi, clo, tu,
         dclr, desc_pad,
         humid,
         precip,
-        d->wind, d->wind_dir);
+        WEATHER_WIND_COLS, wind, icon);
 
     cmd_reply(ctx, buf);
   }
