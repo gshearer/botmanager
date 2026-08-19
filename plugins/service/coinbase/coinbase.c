@@ -41,6 +41,17 @@ static const plugin_kv_entry_t cb_kv_schema[] = {
 
   // Operational budgets.
   { "plugin.coinbase.ws_reconnect_ms", KV_UINT32, "2000", NULL, NULL, NULL },
+
+  // Minimum gap between two WebSocket control frames (OBS-52). The
+  // gateway rate-limits subscribe / unsubscribe and answers an
+  // over-limit one with {"type":"error","message":"rate limit
+  // exceeded"} rather than a "subscriptions" ack, which the ack
+  // watchdog cannot tell from silence. Measured 2026-08-19 against
+  // advanced-trade-ws.coinbase.com (temp/obs52/cbwsprobe.c): twelve
+  // control frames back-to-back drew eight acks and four refusals; the
+  // same twelve at 150 ms drew twelve acks. 200 is that floor with
+  // margin. 0 disables pacing, which is how the latch was reproduced.
+  { "plugin.coinbase.ws_ctrl_gap_ms", KV_UINT32, "200", NULL, NULL, NULL },
   { "plugin.coinbase.request_timeout", KV_UINT32, "15", NULL, NULL, NULL },
 };
 

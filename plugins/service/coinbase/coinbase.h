@@ -54,18 +54,12 @@
 #define CB_WS_STOP_WAIT_MS      5000
 #define CB_WS_MAX_CONSEC_FAIL   10
 
-// OBS-52 — control-frame pacing. The gateway rate-limits subscribe /
-// unsubscribe frames and answers an over-limit one with
-// {"type":"error","message":"rate limit exceeded"} rather than a
-// "subscriptions" ack, which the ack watchdog cannot tell from silence.
-// Measured 2026-08-19 against advanced-trade-ws.coinbase.com
-// (temp/obs52): twelve control frames back-to-back gave eight acks and
-// four refusals; the same twelve at a 150 ms gap gave twelve acks.
-// 200 ms is that measurement with margin.
-#define CB_WS_CTRL_MIN_GAP_MS   200
-// Depth of the paced queue. One reconcile emits at most one frame per
-// channel; the worst burst observed was 22 frames from five
-// subscription handles mutating within the same second.
+// OBS-52 — depth of the paced control-frame queue. One reconcile emits
+// at most one frame per channel; the worst burst observed was 22 frames
+// from five subscription handles mutating within the same second. The
+// gap between sends is the `plugin.coinbase.ws_ctrl_gap_ms` knob, which
+// carries the measurement that set it — a compiled copy of that number
+// would be a second declaration free to drift from it (OBS-48).
 #define CB_WS_CTRL_QUEUE_DEPTH  128
 
 typedef enum

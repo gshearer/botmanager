@@ -64,7 +64,7 @@ typedef struct
 
   // Paced control-frame queue (OBS-52). Rendered subscribe /
   // unsubscribe frames wait here and leave one at a time, at least
-  // CB_WS_CTRL_MIN_GAP_MS apart. Guarded by `lock`; only the reader
+  // `ctrl_gap_ms` apart. Guarded by `lock`; only the reader
   // thread drains it, and it is emptied with the session, because a
   // frame rendered against a session that has gone away is worse than
   // no frame at all — the OPEN hook reconciles from the slot table.
@@ -72,6 +72,7 @@ typedef struct
   uint32_t        ctrl_head;
   uint32_t        ctrl_count;
   uint64_t        ctrl_last_send_ms;
+  uint32_t        ctrl_gap_ms;
 } cb_ws_t;
 
 static cb_ws_t cb_ws;
@@ -238,7 +239,7 @@ cb_ws_ctrl_drain(cb_ws_t *w)
   pthread_mutex_lock(&w->lock);
 
   if(w->state == CB_WS_OPEN && w->ctrl_count > 0
-      && now - w->ctrl_last_send_ms >= CB_WS_CTRL_MIN_GAP_MS)
+      && now - w->ctrl_last_send_ms >= w->ctrl_gap_ms)
   {
     e = w->ctrl[w->ctrl_head];
 
@@ -800,6 +801,11 @@ cb_ws_reader(task_t *t)
 
     if(w->reconnect_base_ms == 0)
       w->reconnect_base_ms = 2000;
+
+    // Same tick, same reason. Zero is a real setting here and means no
+    // pacing at all — the only way to reproduce the storm this queue
+    // exists to prevent — so it takes no fallback.
+    w->ctrl_gap_ms = (uint32_t)kv_get_uint("plugin.coinbase.ws_ctrl_gap_ms");
 
     want_open = w->enabled;
     now_ms    = cb_ws_now_ms();
