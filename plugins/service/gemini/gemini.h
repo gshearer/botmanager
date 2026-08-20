@@ -2,7 +2,7 @@
 //
 // Internal-only declarations. Public mechanism lives in gemini_api.h,
 // consumed by external callers via the dlsym-shim block gated with
-// !GEM_INTERNAL. Subsystems land per TODO.md chunks GEM-1..GEM-4.
+// !GEM_INTERNAL.
 //
 // GEM-1 ships the scaffold + HMAC-SHA384 signer + REST mechanism +
 // symbols cache. GEM-2 adds typed REST wrappers + vtable REST hooks.

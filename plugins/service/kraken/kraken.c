@@ -1,12 +1,11 @@
 // botmanager — MIT
 // Kraken Spot exchange service plugin (scaffolding).
 //
-// KR-3 ships the plugin descriptor, the KV schema, the lifecycle
-// hooks, the HMAC-SHA512 signer + nonce minter, and an exchange-
-// vtable registration with stubbed required slots. KR-4 lands the
-// REST endpoints (candles, orders, fills, balances, assetpairs); the
-// WebSocket v2 transport + channel multiplexer land in KR-5. See
-// TODO.md §KR-3..KR-6 for the chunk roadmap and README.md for scope.
+// Plugin descriptor, KV schema, lifecycle hooks, the HMAC-SHA512
+// signer + nonce minter, and the exchange-vtable registration. The
+// REST endpoints are in kraken_rest.c / kraken_orders.c and the
+// WebSocket v2 transport + channel multiplexer in kraken_ws.c.
+// Scope: README.md beside this file; conventions: AGENTS.md.
 #define KR_INTERNAL
 #include "kraken.h"
 

@@ -6,7 +6,7 @@
 // (gem_submit_public / gem_submit_private), the symbols cache, and
 // the skeletal exchange-vtable registration. GEM-2 lands the typed
 // REST wrappers; GEM-3 wires the WebSocket transport + channel
-// multiplexer. See TODO.md §GEM-1..GEM-4 for the chunk roadmap.
+// multiplexer.
 #define GEM_INTERNAL
 #include "gemini.h"
 
