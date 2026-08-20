@@ -89,7 +89,7 @@ static const char *const wm_dl_ddl_core[] = {
   // Per-market session state (position + paper/real ledgers + fills
   // rings + pending ring + cached params). JSONB carries the composite
   // blobs so future field additions are forward-compatible without
-  // ALTER TABLE (per the pre-1.0 freshstart policy in
+  // ALTER TABLE (per the pre-1.0 wipe-rather-than-migrate policy in
   // feedback_no_migration_planning.md).
   "CREATE TABLE IF NOT EXISTS wm_market_state ("
   " market_id          INT              NOT NULL,"

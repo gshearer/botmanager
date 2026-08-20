@@ -119,11 +119,12 @@
 #define SURF_HIST_1D   256u
 
 // Defaults — mirrored in the param schema below. These ARE the validated
-// full-corpus winner (header "VALIDATED CONFIG"); a freshstarted daemon
+// full-corpus winner (header "VALIDATED CONFIG"); a fresh daemon
 // reproduces it from a bare `backtest run <wm> surf`. (A long-running
 // daemon keeps the KV values registered at FIRST load — see "KV staleness"
 // in ../AGENTS.md — so reproduce on a stale daemon with the explicit
-// name=val args from the SCOREBOARD row, or freshstart.)
+// name=val args from the SCOREBOARD row, or `set kv --delete` each key
+// back to the declaration.)
 #define SURF_DEFAULT_REGIME_GRAIN   1.0   // 1 = 4h regime (fast tide)
 #define SURF_DEFAULT_REGIME_MA      0.0   // 0 = EMA_20 on the 4h regime grain
 #define SURF_DEFAULT_ENTRY_MODE     1.0   // 1 = close reclaims the 1h EMA_20

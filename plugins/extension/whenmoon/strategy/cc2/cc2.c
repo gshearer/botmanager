@@ -15,7 +15,8 @@
 //    the winner from a bare `backtest run <wm> cc2`. (Caveat: a long-running
 //    daemon keeps the KV values registered at FIRST load — see "KV
 //    staleness" in ../AGENTS.md — so reproduce with the explicit name=val
-//    args from SCOREBOARD.md, or freshstart.)
+//    args from SCOREBOARD.md, or `set kv --delete` each key back to the
+//    declaration.)
 //
 // ── The three levers, and what the sweeps actually found ─────────────────
 //

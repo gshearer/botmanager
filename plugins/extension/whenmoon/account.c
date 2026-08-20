@@ -395,7 +395,7 @@ wm_account_start(whenmoon_state_t *st)
   acc = st->account;
 
   // Idempotent: skip when slots already exist (start can be re-entered
-  // after a freshstart-style reload).
+  // after a reload).
   if(acc->n_slots > 0)
     return(SUCCESS);
 

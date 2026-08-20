@@ -665,7 +665,7 @@ whenmoon_init(void)
   }
 
   // WM-BT-6: chart generation toggle (consumed by WM-BT-8). Registered
-  // alongside the other backtest knobs so a single freshstart picks up
+  // alongside the other backtest knobs so one wipe+restore picks up
   // the entire backtest KV surface.
   if(kv_register("plugin.whenmoon.backtest.charts_enabled",
          KV_BOOL, "false", NULL, NULL,
