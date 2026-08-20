@@ -1473,7 +1473,7 @@ bot_discover_user(bot_inst_t *inst, const char *mfa_string)
 // instead — which is what these did until 2026-08-15 — put a clam()
 // under it at every step, and put `bot_mutex -> task_mutex` into a
 // lock-order cycle by way of the driver's own start()
-// (root TODO.md §SC-SAN-FINDINGS → SAN-19, cycle B).
+// (SAN-19, cycle B).
 bool
 bot_start(bot_inst_t *inst)
 {

@@ -6,7 +6,7 @@
 
 // The product set a WebSocket binding actually subscribed with, and the
 // order-insensitive comparison that decides whether it still matches
-// what the running market set wants (§SC-OBSERVED OBS-41).
+// what the running market set wants (OBS-41).
 //
 // Before this type existed there was nothing to compare against: the
 // bound set was an argument handed to exchange_ws_subscribe and then

@@ -11,7 +11,7 @@
 // that lets stop() end one. whenmoon's two warmup timers re-arm
 // themselves on every hop and retained no handle anywhere, so nothing
 // could cancel them: deinit() destroyed the markets rwlock under a body
-// that was still holding it (§SC-OBSERVED OBS-43).
+// that was still holding it (OBS-43).
 //
 // A handle alone is not enough, which is the whole reason this is a
 // type. The chain replaces its own handle on each hop, so cancelling

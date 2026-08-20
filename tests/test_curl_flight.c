@@ -8,7 +8,7 @@
 // *starts* rather than when it ends — and everything still looks right:
 // the drain returns zero, the unload proceeds, and the callback carries
 // on reading a mutex deinit() has since destroyed. Nothing crashes and
-// no sanitizer attributes it back (root TODO.md §SC-OBSERVED OBS-34).
+// no sanitizer attributes it back (OBS-34).
 //
 // That is the silent half, and it is why case_drain_waits_for_the_body
 // exists: its callback sleeps before landing, so a drain that returns

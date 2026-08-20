@@ -6,7 +6,7 @@
 // cancel: the handle you last saw is superseded by the hop you are
 // racing. whenmoon had two of them, so nothing ended the warmup at
 // unload and deinit() destroyed the markets rwlock under a replay that
-// was still holding it (§SC-OBSERVED OBS-43).
+// was still holding it (OBS-43).
 //
 // The two failures worth rows are both silent. A drain that returns
 // while a body is still inside the plugin is a dlclose over live code

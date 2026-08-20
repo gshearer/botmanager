@@ -55,7 +55,7 @@ void clam_audit_iterate(clam_audit_cb_t cb, void *data);
 
 // Drop every subscriber registered by code inside the address range
 // [lo,hi) — one loaded object's mapping. Subscribers are Class A (see
-// root TODO.md §PLIFE-3): the retained cb is dispatched from any thread
+// PLIFE-3): the retained cb is dispatched from any thread
 // that logs, so leaving one behind past dlclose crashes the next
 // clam() call, and dropping it only costs the plugin its own log feed.
 // Returns the number of subscribers removed.

@@ -74,7 +74,7 @@ static pthread_mutex_t     cb_req_mu;
 // is sent from one of the two submitters below, so one flight covers
 // the plugin. cb_req_mu itself is the reason it has to: cb_rest_deinit
 // destroys it, and every completion path takes it on the way out
-// through cb_req_release (root TODO.md §SC-OBSERVED OBS-39).
+// through cb_req_release (OBS-39).
 static curl_flight_t       cb_flight;
 
 // Freelist helpers. Shared with coinbase_orders.c via coinbase.h.

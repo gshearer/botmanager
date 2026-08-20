@@ -45,12 +45,12 @@ static pthread_cond_t   llm_active_cond;
 // away, so a delivery that starts after the clear sees NULL and one
 // that started before it is waited out here — which is what makes
 // "the requester was unloaded" a decision taken once instead of a
-// pointer read racing an unmap (root TODO.md §SC-SAN-FINDINGS SAN-22).
+// pointer read racing an unmap (SAN-22).
 //
 // The count answers llm_stop()'s "is anything still running in me";
 // the list answers llm_unmap_cb()'s narrower "is anything still
 // running in THAT mapping", which the count cannot (root TODO.md
-// §SC-OBSERVED OBS-33).
+// OBS-33).
 static uint32_t         llm_delivering = 0;
 static struct llm_delivery *llm_delivery_head = NULL;
 
@@ -3489,7 +3489,7 @@ llm_delivery_into_locked(uintptr_t lo, uintptr_t hi)
 // streaming request runs on the curl thread with no lock of ours held,
 // so this sweep also waits out every delivery window opened before the
 // drop — otherwise "we cleared the pointer" is an answer to a thread
-// that had already loaded it (root TODO.md §SC-SAN-FINDINGS SAN-22).
+// that had already loaded it (SAN-22).
 // The wait is bounded: a quiescence barrier and an audit still stand
 // between here and the dlclose, and naming a stuck consumer callback is
 // more use than blocking the loader on it forever.
@@ -3499,7 +3499,7 @@ llm_delivery_into_locked(uintptr_t lo, uintptr_t hi)
 // calls the consumer, so a requester whose last request has just been
 // taken is invisible to the sweep above while executing inside the
 // mapping: the count is 0 and the only thing standing between that
-// thread and dlclose is this drain (root TODO.md §SC-OBSERVED OBS-33).
+// thread and dlclose is this drain (OBS-33).
 // And the list is what keeps that honest — waiting on the bare
 // llm_delivering count would park every plugin unload in the daemon
 // behind any LLM delivery anywhere.
@@ -3666,7 +3666,7 @@ llm_stop(void)
   // request's callbacks, which for a request this engine submitted name
   // *this* mapping and never the requester's, so it waits out the full
   // LLM timeout and then refuses the unload — the plugin zombies with a
-  // FATAL naming an in-flight request (root TODO.md §SC-LLM-INFLIGHT).
+  // FATAL naming an in-flight request (SC-LLM-INFLIGHT).
   // A cancelled request still delivers, so what we wait for is our own
   // callbacks finishing, not the completion of a transfer.
   clock_gettime(CLOCK_REALTIME, &deadline);

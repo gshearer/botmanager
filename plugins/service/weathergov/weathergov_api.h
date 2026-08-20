@@ -140,7 +140,7 @@ typedef enum
 //
 // ⚠ `desc` and `instruction` are parsed and carried but rendered
 // NOWHERE. They run 250–900 bytes of prose and would flood a channel.
-// They exist for the proactive alerter (root TODO.md §WX-FORWARD); do
+// They exist for the proactive alerter (the soul's weather chore, SOUL-3); do
 // not delete them as dead weight.
 typedef struct
 {
@@ -205,7 +205,7 @@ typedef void (*weathergov_alerts_cb_t)(
 // terms as an alert's `desc`: `start` is a period's identity, and
 // `detail` is the meteorologist's own prose — the quality argument for
 // this provider in the first place, and what the proactive alerter
-// (root TODO.md §WX-FORWARD) will read. Neither is dead weight.
+// (the soul's weather chore, SOUL-3) will read. Neither is dead weight.
 //
 // There is no timezone here on purpose. Every period arrives already
 // LABELLED by upstream ("Today", "Tonight", "Wednesday Night"), so no

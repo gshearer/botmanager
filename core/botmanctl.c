@@ -506,7 +506,7 @@ bctl_route_id(const char *target, uint64_t *id)
 }
 
 // One write per line: the newline used to be a second write() and two
-// threads' lines interleaved inside one line (root TODO.md §OBS-29 T5).
+// threads' lines interleaved inside one line (OBS-29 T5).
 static size_t
 bctl_line_build(char *out, size_t out_sz, const char *text)
 {

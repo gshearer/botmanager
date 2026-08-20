@@ -223,7 +223,7 @@ uint32_t cmd_unregister_path(const char *path);
 
 // Drop every definition registered by code inside the address range
 // [lo,hi) — one loaded object's mapping. Commands are Class A (see root
-// TODO.md §PLIFE-3): dropping them is always correct and
+// PLIFE-3): dropping them is always correct and
 // order-independent, so core reclaims whatever a plugin's deinit() left
 // behind rather than letting it dangle past dlclose.
 //
@@ -397,7 +397,7 @@ void cmd_iterate_children(const cmd_def_t *parent, cmd_iter_cb_t cb,
 // right now. A plugin's cmd_cb_t is a Class-B reference core cannot
 // reclaim: cmd_reclaim_owned() frees the cmd_def_t before dlclose, but
 // the function itself may be on a worker's stack, and unmapping it out
-// from under one is a SIGSEGV (root TODO.md §OBS-15). The task queue
+// from under one is a SIGSEGV (OBS-15). The task queue
 // cannot answer this — a command task's own cb is core's cmd_task_cb,
 // one pointer above the plugin's — so plugin_quiesce() polls this
 // alongside it. Names the first one in `out` when out_cap > 0.

@@ -547,7 +547,7 @@ cmd_clam_subscribe(const cmd_ctx_t *ctx)
   //   clam_cmd_mutex -> bot_mutex   (here, resolving a destination)
   //   bot_mutex      -> clam_mutex  (bot_create -> the driver's create()
   //                                  -> cmd_set_prefix -> clam(); root
-  //                                  TODO.md §SC-20)
+  //                                  SC-20)
   //   clam_mutex     -> clam_cmd_mutex (clam() fanning out to
   //                                  clam_cmd_shared_cb)
   //

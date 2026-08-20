@@ -7,7 +7,7 @@
 // method_mutex. A mutex only one side takes orders nothing, so a plain
 // increment outside the lock loses updates silently and permanently:
 // /show methods under-reports and nothing ever reconciles it (root
-// TODO.md §OBS-17; OBS-15's TSan gate reported the pair six times).
+// OBS-17; OBS-15's TSan gate reported the pair six times).
 // These rows state the contract as exact arithmetic over the public
 // surface only, so the suite is red under a plain -O2 build (lost
 // increments at four contending threads) and red under

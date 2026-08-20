@@ -268,7 +268,7 @@ void *plugin_dlsym_cached(const char *plugin_name, const char *symbol,
 // True when `ptr` lies inside the mapping of the named loaded plugin.
 // Attribution is by the object's own PT_LOAD extent, never by a label
 // the plugin chooses (cmd_def_t.module and friends are not plugin
-// identity — see root TODO.md §PLIFE-1 "Standing facts").
+// identity — see PLIFE-1 "Standing facts").
 //
 // LIMITATION: only code and static data are attributable. A heap
 // pointer belongs to no mapping, so this catches exactly the

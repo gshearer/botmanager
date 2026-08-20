@@ -9,7 +9,7 @@
 // operator sees another operator's output in their own terminal, on a
 // path that runs with the credential context open — and the same
 // pointer read is a SEGV when the window closes underneath the write
-// (root TODO.md §OBS-29-TRUTH T1/T4).
+// (OBS-29-TRUTH T1/T4).
 //
 // No daemon and no database: the suite brings up the same subsystems
 // the socket needs, registers two test verbs, and drives the real

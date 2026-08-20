@@ -46,7 +46,7 @@ void llm_register_commands(void);
 // up the in-flight set; what remains is cancelled at the curl layer and
 // waited out here, because every one of those requests holds callback
 // pointers into this plugin's mapping and core's quiescence barrier
-// cannot see them (root TODO.md §SC-LLM-INFLIGHT).
+// cannot see them (SC-LLM-INFLIGHT).
 void llm_stop(void);
 
 void llm_exit(void);

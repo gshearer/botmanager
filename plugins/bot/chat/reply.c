@@ -1413,7 +1413,7 @@ llm_done(const llm_chat_response_t *resp)
   // is bot_exit(), which runs before the engine cancel that delivered
   // us. Give the record back and read nothing through r->st: the
   // in-flight counter it would decrement is inside the freed handle
-  // (root TODO.md §SC-SAN-FINDINGS SAN-27).
+  // (SAN-27).
   if(chatbot_hold_disowned(&r->hold))
   {
     req_free(r);

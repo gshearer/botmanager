@@ -32,7 +32,7 @@ static pthread_mutex_t kr_req_mu;
 // token mint — is sent from one of the two submitters below, so one
 // flight covers the plugin. kr_req_mu itself is the reason it has to:
 // kr_rest_deinit destroys it, and every completion path takes it on the
-// way out through kr_req_release (root TODO.md §SC-OBSERVED OBS-39).
+// way out through kr_req_release (OBS-39).
 static curl_flight_t   kr_flight;
 
 // ------------------------------------------------------------------

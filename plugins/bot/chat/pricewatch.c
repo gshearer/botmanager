@@ -444,7 +444,7 @@ static const cmd_arg_desc_t ad_bot_watchlist[] = {
 // One verb rather than two children: `add` and `del` differ by a
 // single statement and share every gate, and a grandchild under `bot`
 // would buy nothing but a deeper path. Registered under `bot`, so it
-// inherits the parent's admin gate (§TAXO-4-TRUTH 7) — which is the
+// inherits the parent's admin gate (TAXO-4) — which is the
 // whole of §D6's "admin-curated".
 static void
 cmd_bot_watchlist(const cmd_ctx_t *ctx)

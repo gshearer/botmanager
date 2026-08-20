@@ -188,7 +188,7 @@ static pthread_rwlock_t yf_cache_rwl;
 // Every yahoofinance transfer rides this: the mint's two hops, the v7
 // batch quote, each v8 chart hop and each search. yf_deinit destroys
 // yf_cache_rwl and yf_sess_lock, and every one of those completions
-// takes one or both of them (root TODO.md §SC-OBSERVED OBS-39).
+// takes one or both of them (OBS-39).
 static curl_flight_t    yf_flight;
 
 // The consumer's callback is the one thing in a batch or a search that

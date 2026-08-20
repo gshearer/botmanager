@@ -38,7 +38,7 @@ static pthread_mutex_t gem_req_mu;
 // is sent from one of the two submitters below, so one flight covers
 // the plugin. gem_req_mu itself is the reason it has to: gem_rest_deinit
 // destroys it, and every completion path takes it on the way out
-// through gem_req_release (root TODO.md §SC-OBSERVED OBS-39).
+// through gem_req_release (OBS-39).
 static curl_flight_t   gem_flight;
 
 // ------------------------------------------------------------------

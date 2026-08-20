@@ -19,7 +19,7 @@
 // mutex destroyed under that callback is undefined behaviour that
 // reports as nothing at all: locking a destroyed mutex returns EINVAL,
 // no caller in this tree checks it, and the write it was guarding simply
-// proceeds unguarded (root TODO.md §SC-OBSERVED OBS-34, measured live on
+// proceeds unguarded (OBS-34, measured live on
 // tmdb).
 //
 // The shape is llm_stop()'s, factored out of it: latch, cancel, wait for

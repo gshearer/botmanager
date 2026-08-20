@@ -626,7 +626,7 @@ soul_wx_geocode(const soul_wx_api_t *api, const char *label,
 
 // "Tue 1:45 PM" in the alert's own locality — every CAP timestamp
 // carries its offset inline and the service already parsed it out
-// (§WXG-TRUTH 5), so this is arithmetic, not a tz-database walk.
+// (`plugins/feature/weather/AGENTS.md`, fact 4), so this is arithmetic, not a tz-database walk.
 static void
 soul_wx_fmt_until(time_t ts, int32_t tz_offset, char *dst, size_t cap)
 {
@@ -1195,7 +1195,7 @@ soul_chore_weather(soul_sched_t *s, uint32_t chore,
       continue;
     }
 
-    // ≤4 decimals is the API's own resolution (§WXG-TRUTH 4), which
+    // ≤4 decimals is the API's own resolution (`plugins/feature/weather/AGENTS.md`, fact 2), which
     // makes the rounded string the natural coordinate identity: one
     // fetch per point however many users share it.
     snprintf(pkey, sizeof(pkey), "%.4f,%.4f", lat, lon);

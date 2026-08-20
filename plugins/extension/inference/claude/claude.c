@@ -34,7 +34,7 @@ static void  claude_pending_deliver(task_t *t);
 //
 // Atomic because the arming happens on a task worker and the sweep on
 // the loader thread, and the two must not disagree about whether a task
-// exists (root TODO.md §SC-OBSERVED OBS-32's rule: the flag is _Atomic
+// exists (OBS-32's rule: the flag is _Atomic
 // at the declaration, and no reader changes).
 static _Atomic task_handle_t                claude_deliver_task
                                                 = TASK_HANDLE_NONE;

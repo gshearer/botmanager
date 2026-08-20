@@ -1630,7 +1630,7 @@ extract_stop(void)
   // is the engine's to drop, and it can only drop it by *arriving*. So
   // ask the engine to cancel the request as well — a cancelled request
   // still delivers, into code that is still mapped here, and the handle
-  // frees itself on the way past (root TODO.md §SC-SAN-FINDINGS SAN-12).
+  // frees itself on the way past (SAN-12).
   pthread_mutex_lock(&extract_wait_mutex);
   extract_stopping = true;
 

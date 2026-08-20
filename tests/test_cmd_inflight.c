@@ -6,7 +6,7 @@
 // is wrong there is no error path and no log line: the unload proceeds,
 // the mapping goes away, and the handler resumes at an address that is
 // no longer code. Measured 2026-08-16 — the fault landed inside libc,
-// so even a backtrace named the wrong subsystem (root TODO.md §OBS-15).
+// so even a backtrace named the wrong subsystem (OBS-15).
 //
 // A mapping is only an address range, so no dlopen is needed here: a
 // handler brackets its own function address and asks about it. Every

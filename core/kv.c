@@ -601,7 +601,7 @@ kv_register_owned(const char *key, kv_type_t type, const char *default_val,
       pthread_mutex_unlock(&kv_mutex);
 
       // Doing this at DEBUG silently resets whatever was tuned — say it out
-      // loud (root TODO.md §PLIFE-4, the type-changed case).
+      // loud (PLIFE-4, the type-changed case).
       if(live)
         clam(CLAM_WARN, "kv_register",
             "'%s': persisted row is %s '%s' but the schema declares %s — "
@@ -2056,7 +2056,7 @@ kv_flush(void)
 // one of them. This is the operator's view of "keys a plugin used to
 // have": after an unload, core's Class-A sweep drops the binding and
 // deliberately leaves the row, because an unloaded plugin and a retired
-// key look identical from here (root TODO.md §PLIFE-4). Pruning therefore
+// key look identical from here (PLIFE-4). Pruning therefore
 // stays a deliberate act — /db delete kv <key>.
 uint32_t
 kv_iterate_orphans(kv_orphan_cb_t cb, void *data)

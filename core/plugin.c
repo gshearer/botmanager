@@ -324,7 +324,7 @@ plugin_unload_locked(const char *name, plugin_unload_report_t *report)
     // tear down — including the locks it takes on the way in. Destroying
     // a mutex a live holder still locks is undefined behaviour that
     // reports as the *next* subsystem's fault, and no sanitizer here
-    // attributes it back (root TODO.md §SC-OBSERVED OBS-34).
+    // attributes it back (OBS-34).
     //
     // The same barrier runs again after plugin_reclaim, and both are
     // needed: this one protects the plugin's own teardown, that one
@@ -1783,7 +1783,7 @@ plugin_unmap_broadcast(uintptr_t lo, uintptr_t hi)
 // Drop every Class-A registration still owned by `target` — the ones
 // core can define a correct default for, because dropping a pure
 // registry entry is order-independent and cannot be more wrong than
-// leaving it pointing at an unmapped object (root TODO.md §PLIFE-3).
+// leaving it pointing at an unmapped object (PLIFE-3).
 // Runs after deinit(), so what it finds is what the plugin did not
 // clean up itself.
 // returns: number of registrations reclaimed (0 == the plugin tore
@@ -2001,7 +2001,7 @@ audit_emit_clam(const char *line, void *data)
 // request whose response is still on the wire. Nothing is wrong with
 // them except that dlclose is one instruction ahead. So core waits, and
 // refuses only what is still holding the mapping when the budget runs
-// out (root TODO.md §PLIFE-6).
+// out (PLIFE-6).
 
 typedef struct
 {
@@ -2130,7 +2130,7 @@ plugin_quiesce(const plugin_rec_t *target, uint32_t timeout_ms,
     // A message delivery inside a bot driver's on_message() is the
     // third Class-B holding, and the loudest: unmapping the code it is
     // running is a SIGSEGV, not a dangling pointer somebody may never
-    // dereference (root TODO.md §SC-SAN-FINDINGS → SAN-18). The bot
+    // dereference (SAN-18). The bot
     // registry counts them for us; they clear in milliseconds.
     delivering = bot_driver_inflight_owned(ctx.map.lo, ctx.map.hi,
         bot_name, sizeof(bot_name));
@@ -2147,7 +2147,7 @@ plugin_quiesce(const plugin_rec_t *target, uint32_t timeout_ms,
     // handler with no task at all. Measured 2026-08-16 — an unload
     // under a running handler unmapped its .text and the daemon took a
     // SIGSEGV whose fault address was inside the freed mapping (root
-    // TODO.md §OBS-15).
+    // OBS-15).
     running = cmd_inflight_owned(ctx.map.lo, ctx.map.hi,
         cmd_name, sizeof(cmd_name));
 

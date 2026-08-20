@@ -1399,7 +1399,7 @@ chatbot_destroy(void *handle)
   // can be born. Repeated from chatbot_stop() for the same reason the
   // coalescer is, and for one more: at `quit` the whole of this runs at
   // bot_exit(), three steps before the engine cancels what is still on
-  // the wire (root TODO.md §SC-SAN-FINDINGS SAN-27).
+  // the wire (SAN-27).
   chatbot_hold_shutdown(st);
 
   pthread_rwlock_destroy(&st->lock);

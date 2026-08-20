@@ -291,7 +291,7 @@ void bot_kv_contributor_unregister(void *user);
 
 // Drop every contributor registered by code inside the address range
 // [lo,hi) — one loaded object's mapping. Contributors are Class A (see
-// root TODO.md §PLIFE-3): the table retains two function pointers and a
+// PLIFE-3): the table retains two function pointers and a
 // cookie, all of which die at dlclose, and the keys a contributor
 // layered on already stand on their own.
 // Returns the number of contributors removed.
@@ -301,7 +301,7 @@ uint32_t bot_reclaim_contributors_owned(uintptr_t lo, uintptr_t hi);
 // a message delivery in flight, or the deferred teardown of a driver a
 // reload has already detached. Both are Class-B references core cannot
 // reclaim, and unmapping on_message() out from under one is a SIGSEGV
-// (root TODO.md §SC-SAN-FINDINGS → SAN-18), so plugin_quiesce() polls
+// (SAN-18), so plugin_quiesce() polls
 // this alongside the task and curl queues before it lets a dlclose
 // proceed. Names the first one in `out` when out_cap > 0.
 //
