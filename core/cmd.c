@@ -1864,9 +1864,70 @@ help_check_access(const cmd_ctx_t *ctx, const cmd_def_t *d)
   }
 }
 
+static const char *
+help_skip_ws(const char *p)
+{
+  while(*p == ' ' || *p == '\t')
+    p++;
+
+  return(p);
+}
+
+// The argument form of a child, as it should appear under its row: the
+// child's own usage line with the parent path taken off the front, so
+// that a listing already titled "subcommands of feature" does not
+// repeat the word `feature` on every line.
+//
+// Returns NULL when there is nothing worth a second line — no usage
+// string, or one that is just the verb with no arguments after it.
+// That test is what keeps an argument-free listing (`plugin`, most of
+// `show`) exactly as tall as it is today.
+//
+// Called under cmd_mutex; the result points into the caller-owned
+// static usage string, which outlives the listing.
+static const char *
+help_arg_form(const cmd_def_t *c, const char *parent_path)
+{
+  const char *u = c->usage;
+  size_t      plen;
+
+  if(u == NULL || u[0] == '\0')
+    return(NULL);
+
+  plen = (parent_path != NULL) ? strlen(parent_path) : 0;
+
+  // Only a genuine `<parent> ` prefix comes off, and only when the
+  // parent path appears ONCE. A usage that spells an alternation out in
+  // full — `set kv <key> <value> | set kv --clear <key>` — names the
+  // parent again after the bar, and taking the front one off leaves a
+  // line that is half a path and reads as a typo. Those are shown
+  // whole; so is any usage written some other way.
+  if(plen > 0 && strncmp(u, parent_path, plen) == 0 && u[plen] == ' ')
+  {
+    if(strstr(u + plen, parent_path) == NULL)
+      u += plen + 1;
+  }
+
+  u = help_skip_ws(u);
+
+  // Past the verb, is there anything? strncmp rather than a scan for
+  // the name: `status` must not match the `status` inside a longer
+  // sibling's arguments.
+  if(strncmp(u, c->name, strlen(c->name)) == 0)
+  {
+    const char *rest = help_skip_ws(u + strlen(c->name));
+
+    if(*rest == '\0')
+      return(NULL);
+  }
+
+  return(u);
+}
+
 // Print child table for a command. Returns number of children shown.
 static uint32_t
-help_show_children(const cmd_ctx_t *ctx, const cmd_def_t *d)
+help_show_children(const cmd_ctx_t *ctx, const cmd_def_t *d,
+    const char *parent_path)
 {
   uint32_t count = 0;
   bool header_sent = false;
@@ -1893,10 +1954,25 @@ help_show_children(const cmd_ctx_t *ctx, const cmd_def_t *d)
       header_sent = true;
     }
 
+    const char *cargs = help_arg_form(c, parent_path);
+
     snprintf(line, sizeof(line), CMD_HELP_ROW, cname, cabbrev, cdesc);
     pthread_mutex_unlock(&cmd_mutex);
     cmd_reply(ctx, line);
     pthread_mutex_lock(&cmd_mutex);
+
+    // The row says what the verb does; this says how to type it. It is
+    // a second LINE rather than a fourth column because the grid above
+    // already runs past DISPLAY_COLS on its longest descriptions, so
+    // there is no width left to spend.
+    if(cargs != NULL)
+    {
+      snprintf(line, sizeof(line), "      " CLR_GRAY "%s" CLR_RESET, cargs);
+      pthread_mutex_unlock(&cmd_mutex);
+      cmd_reply(ctx, line);
+      pthread_mutex_lock(&cmd_mutex);
+    }
+
     count++;
     }
   }
@@ -2221,7 +2297,7 @@ cmd_builtin_help(const cmd_ctx_t *ctx)
     snprintf(shdr, sizeof(shdr), "subcommands of %s:", cmd_path);
     cmd_reply(ctx, shdr);
 
-    child_count = help_show_children(ctx, d);
+    child_count = help_show_children(ctx, d, cmd_path);
 
     snprintf(count_buf, sizeof(count_buf), "%u subcommand(s)", child_count);
     cmd_reply(ctx, count_buf);
