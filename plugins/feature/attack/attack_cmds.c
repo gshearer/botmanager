@@ -783,7 +783,7 @@ atk_article(const char *word)
 // cosmetic, and that is the operator's own brief: a cleric may spend a
 // turn restoring hit points and a wizard may not. It costs a whole turn,
 // which is what keeps it a trade rather than a gift — see the fairness
-// charter in TODO.md §2, which names this as the ONLY such asymmetry.
+// charter in AGENTS.md, which names this as the ONLY such asymmetry.
 static void
 atk_cmd_heal(const cmd_ctx_t *ctx)
 {
