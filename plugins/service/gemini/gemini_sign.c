@@ -1,6 +1,7 @@
 // botmanager — MIT
 // Gemini Spot REST signing — HMAC-SHA384 over the base64-encoded JSON
-// payload, keyed by the base64-decoded `creds.private_key`.
+// payload, keyed by `creds.private_key` VERBATIM (its ASCII bytes;
+// nothing is decoded out of it — OBS-67).
 //
 // The wire shape is documented at
 // docs.gemini.com/rest-api/#private-api-invocation.
@@ -37,11 +38,12 @@
 
 // Sizes
 //
-// Base64-decoded Gemini private keys are 48 bytes in practice; the
-// cached buffer caps at 1 KiB to absorb any future key-format
-// expansion without dynamic resize. The KV snapshot buffers hold the
-// source string we last decoded so a KV-edit forces a re-decode on the
-// next request.
+// A Gemini secret is 28 ASCII characters in practice and is used as
+// the HMAC key verbatim; the cached buffer caps at 1 KiB to absorb any
+// future key-format expansion without dynamic resize, and is the same
+// size as the snapshot so the copy needs no bound of its own. The KV
+// snapshot buffers hold the source strings so a KV edit forces a
+// refresh on the next request.
 #define GEM_SECRET_BIN_CAP    1024
 #define GEM_API_KEY_SNAP_SZ   256
 #define GEM_PRIV_KEY_SNAP_SZ  1024
@@ -63,8 +65,6 @@ static gem_sign_t gem_sign;
 
 // Forward declarations for static helpers.
 
-static bool   gem_b64_decode(const char *in, size_t in_len,
-                  uint8_t *out, size_t out_cap, size_t *out_len);
 static bool   gem_refresh_secret_locked(void);
 static bool   gem_hmac_sha384(const uint8_t *key, size_t key_len,
                   const uint8_t *msg, size_t msg_len,
@@ -96,7 +96,7 @@ gem_sign_init(void)
 
   // Best-effort prime of the cached secret; on FAIL the plugin runs
   // in public-only mode until creds are populated and the next sign
-  // attempt re-decodes.
+  // attempt refreshes.
   pthread_mutex_lock(&gem_sign.lock);
   (void)gem_refresh_secret_locked();
   pthread_mutex_unlock(&gem_sign.lock);
@@ -331,8 +331,6 @@ gem_refresh_secret_locked(void)
   const char *priv_key;
   size_t      api_len;
   size_t      priv_len;
-  size_t      decoded_len;
-  uint8_t     decoded[GEM_SECRET_BIN_CAP];
 
   kv_admin_context_set(true);
   api_key  = kv_get_str("plugin.gemini.creds.apikey");
@@ -363,108 +361,27 @@ gem_refresh_secret_locked(void)
     return(FAIL);
   }
 
-  if(gem_b64_decode(priv_key, priv_len, decoded, sizeof(decoded),
-          &decoded_len) != SUCCESS)
-  {
-    clam(CLAM_WARN, GEM_CTX,
-        "creds.private_key base64 decode failed");
-    gem_sign.secret_valid = false;
-    return(FAIL);
-  }
-
   memcpy(gem_sign.api_key_snap, api_key, api_len);
   gem_sign.api_key_snap[api_len] = '\0';
 
   memcpy(gem_sign.private_key_snap, priv_key, priv_len);
   gem_sign.private_key_snap[priv_len] = '\0';
 
+  // ⛔ The secret is the HMAC key AS IT IS WRITTEN — Gemini keys the
+  // MAC with the ASCII bytes of the secret, and nothing is decoded out
+  // of them. This used to base64-decode it, copied from kraken, whose
+  // secret genuinely is base64. A Gemini secret is 28 characters drawn
+  // from the base64 alphabet, so the decode SUCCEEDED and handed the
+  // MAC 21 bytes of garbage: every private request this plugin ever
+  // signed came back `InvalidSignature`, and on the Order Events
+  // upgrade that is an HTTP 400 (OBS-67).
+  //
+  // `priv_len` is bounded by the snapshot-size check above, and
+  // GEM_SECRET_BIN_CAP is that same size.
   OPENSSL_cleanse(gem_sign.secret_bin, sizeof(gem_sign.secret_bin));
-  memcpy(gem_sign.secret_bin, decoded, decoded_len);
-  gem_sign.secret_bin_len = decoded_len;
+  memcpy(gem_sign.secret_bin, priv_key, priv_len);
+  gem_sign.secret_bin_len = priv_len;
   gem_sign.secret_valid   = true;
-
-  OPENSSL_cleanse(decoded, sizeof(decoded));
-
-  return(SUCCESS);
-}
-
-// Standard-alphabet base64 decode. Tolerates trailing `=` padding +
-// embedded whitespace. Returns SUCCESS with `*out_len` populated; FAIL
-// on malformed input or buffer overrun.
-static bool
-gem_b64_decode(const char *in, size_t in_len, uint8_t *out, size_t out_cap,
-    size_t *out_len)
-{
-  static const int8_t map[256] =
-  {
-    ['A'] =  0, ['B'] =  1, ['C'] =  2, ['D'] =  3,
-    ['E'] =  4, ['F'] =  5, ['G'] =  6, ['H'] =  7,
-    ['I'] =  8, ['J'] =  9, ['K'] = 10, ['L'] = 11,
-    ['M'] = 12, ['N'] = 13, ['O'] = 14, ['P'] = 15,
-    ['Q'] = 16, ['R'] = 17, ['S'] = 18, ['T'] = 19,
-    ['U'] = 20, ['V'] = 21, ['W'] = 22, ['X'] = 23,
-    ['Y'] = 24, ['Z'] = 25,
-    ['a'] = 26, ['b'] = 27, ['c'] = 28, ['d'] = 29,
-    ['e'] = 30, ['f'] = 31, ['g'] = 32, ['h'] = 33,
-    ['i'] = 34, ['j'] = 35, ['k'] = 36, ['l'] = 37,
-    ['m'] = 38, ['n'] = 39, ['o'] = 40, ['p'] = 41,
-    ['q'] = 42, ['r'] = 43, ['s'] = 44, ['t'] = 45,
-    ['u'] = 46, ['v'] = 47, ['w'] = 48, ['x'] = 49,
-    ['y'] = 50, ['z'] = 51,
-    ['0'] = 52, ['1'] = 53, ['2'] = 54, ['3'] = 55,
-    ['4'] = 56, ['5'] = 57, ['6'] = 58, ['7'] = 59,
-    ['8'] = 60, ['9'] = 61,
-    ['+'] = 62, ['/'] = 63
-  };
-  static const bool valid_b64[256] =
-  {
-    ['A'] = 1, ['B'] = 1, ['C'] = 1, ['D'] = 1, ['E'] = 1, ['F'] = 1,
-    ['G'] = 1, ['H'] = 1, ['I'] = 1, ['J'] = 1, ['K'] = 1, ['L'] = 1,
-    ['M'] = 1, ['N'] = 1, ['O'] = 1, ['P'] = 1, ['Q'] = 1, ['R'] = 1,
-    ['S'] = 1, ['T'] = 1, ['U'] = 1, ['V'] = 1, ['W'] = 1, ['X'] = 1,
-    ['Y'] = 1, ['Z'] = 1,
-    ['a'] = 1, ['b'] = 1, ['c'] = 1, ['d'] = 1, ['e'] = 1, ['f'] = 1,
-    ['g'] = 1, ['h'] = 1, ['i'] = 1, ['j'] = 1, ['k'] = 1, ['l'] = 1,
-    ['m'] = 1, ['n'] = 1, ['o'] = 1, ['p'] = 1, ['q'] = 1, ['r'] = 1,
-    ['s'] = 1, ['t'] = 1, ['u'] = 1, ['v'] = 1, ['w'] = 1, ['x'] = 1,
-    ['y'] = 1, ['z'] = 1,
-    ['0'] = 1, ['1'] = 1, ['2'] = 1, ['3'] = 1, ['4'] = 1, ['5'] = 1,
-    ['6'] = 1, ['7'] = 1, ['8'] = 1, ['9'] = 1,
-    ['+'] = 1, ['/'] = 1
-  };
-  uint32_t  acc = 0;
-  int       bits = 0;
-  size_t    written = 0;
-  size_t    i;
-
-  if(in == NULL || out == NULL || out_len == NULL)
-    return(FAIL);
-
-  for(i = 0; i < in_len; i++)
-  {
-    unsigned char c = (unsigned char)in[i];
-
-    if(c == '=' || c == ' ' || c == '\t' || c == '\n' || c == '\r')
-      continue;
-
-    if(!valid_b64[c])
-      return(FAIL);
-
-    acc   = (acc << 6) | (uint32_t)map[c];
-    bits += 6;
-
-    if(bits >= 8)
-    {
-      bits -= 8;
-
-      if(written >= out_cap)
-        return(FAIL);
-
-      out[written++] = (uint8_t)((acc >> bits) & 0xFFu);
-    }
-  }
-
-  *out_len = written;
 
   return(SUCCESS);
 }
