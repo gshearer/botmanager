@@ -12,11 +12,13 @@
 //   /db delete kv <key>      drop one KV key from memory AND its DB row
 //   /db orphans              usage
 //   /db orphans kv           list persisted KV rows no live entry claims
+//   /db orphans userns       list rows keyed to a userns id that is gone
 //
 // Everything here is destructive by intent and admin-gated accordingly.
 
 #include "common.h"
 #include "cmd.h"
+#include "db.h"
 #include "kv.h"
 #include "userns.h"
 
@@ -53,6 +55,29 @@ db_validate_kv_key(const char *str)
   return(true);
 }
 
+// A table name read back out of the catalog is ours, but it still reaches
+// a statement by interpolation — SQL has no bind parameter for an
+// identifier. Anything outside the unquoted-identifier set is refused
+// rather than quoted, because no table in this tree needs quoting and a
+// name that does is a better thing to report than to run.
+static bool
+db_validate_table_name(const char *str)
+{
+  if(str == NULL || str[0] == '\0')
+    return(false);
+
+  for(const char *t = str; *t != '\0'; t++)
+  {
+    unsigned char ch = (unsigned char)*t;
+
+    if(!((ch >= 'a' && ch <= 'z') || (ch >= 'A' && ch <= 'Z') ||
+         (ch >= '0' && ch <= '9') || ch == '_'))
+      return(false);
+  }
+
+  return(true);
+}
+
 // -----------------------------------------------------------------------
 // Argument descriptors
 // -----------------------------------------------------------------------
@@ -80,7 +105,7 @@ cmd_db_delete(const cmd_ctx_t *ctx)
 static void
 cmd_db_orphans(const cmd_ctx_t *ctx)
 {
-  cmd_reply(ctx, "usage: db orphans <what>  (kv)");
+  cmd_reply(ctx, "usage: db orphans <what>  (kv, userns)");
 }
 
 // -----------------------------------------------------------------------
@@ -190,6 +215,160 @@ cmd_db_orphans_kv(const cmd_ctx_t *ctx)
 }
 
 // -----------------------------------------------------------------------
+// /db orphans userns
+// -----------------------------------------------------------------------
+
+// Postgres caps an identifier at NAMEDATALEN-1; nothing here needs more.
+#define DB_TABLE_NAME_SZ  64
+#define DB_ORPHAN_SQL_SZ  320
+
+// Every table that keys rows by user namespace carries an `ns_id`, and a
+// userns id is not stable across a wipe: freshstart drops and recreates
+// `userns`, so the ids move underneath everything that stored one. The
+// 2026-08-18 wipe moved drow from 4 to 2 and silently stranded 1,771
+// quotes that way.
+//
+// A foreign key is the obvious guard and it does not survive the event it
+// guards against: DROP TABLE userns CASCADE removes the constraints that
+// point AT userns while leaving the referencing tables in place, after
+// which CREATE TABLE IF NOT EXISTS is a no-op and never puts them back.
+// Measured 2026-08-20 — four chat tables declare the reference in their
+// DDL and carry no constraint in the live database.
+//
+// So this derives its answer from the rows rather than from a constraint,
+// and it finds its own subjects: the catalog names every table with an
+// `ns_id` column. A plugin's new table is covered the day it is created,
+// core is told nothing about any plugin, and there is no list anywhere to
+// fall out of date — which is the whole reason to prefer it.
+static const char db_orphan_ns_tables_sql[] =
+    "SELECT c.relname,"
+    " EXISTS (SELECT 1 FROM pg_constraint k"
+    "         WHERE k.conrelid = c.oid AND k.contype = 'f'"
+    "         AND a.attnum = ANY(k.conkey)) AS has_fk"
+    " FROM pg_class c"
+    " JOIN pg_namespace n ON n.oid = c.relnamespace"
+    " AND n.nspname = 'public'"
+    " JOIN pg_attribute a ON a.attrelid = c.oid"
+    " AND a.attname = 'ns_id' AND a.attnum > 0 AND NOT a.attisdropped"
+    " WHERE c.relkind = 'r'"
+    " ORDER BY c.relname";
+
+// Count one table's stranded rows and name the namespaces they point at.
+// The id is what identifies the generation — `ns 4` says which wipe left
+// them — so it is worth a column rather than a follow-up query.
+static bool
+db_orphan_scan_table(const char *table, int64_t *out_rows, char *out_ns,
+    size_t out_ns_cap)
+{
+  db_result_t *res = db_result_alloc();
+  char         sql[DB_ORPHAN_SQL_SZ];
+  bool         rc  = FAIL;
+
+  snprintf(sql, sizeof(sql),
+      "SELECT count(*),"
+      " COALESCE(string_agg(DISTINCT t.ns_id::text, ','), '')"
+      " FROM public.%s t"
+      " WHERE NOT EXISTS (SELECT 1 FROM userns u WHERE u.id = t.ns_id)",
+      table);
+
+  if(db_query(sql, res) == SUCCESS && res->ok && res->rows > 0)
+  {
+    *out_rows = db_result_get_i64(res, 0, 0, 0);
+    db_result_copy(out_ns, out_ns_cap, res, 0, 1);
+    rc = SUCCESS;
+  }
+
+  db_result_free(res);
+  return(rc);
+}
+
+// Report rows whose namespace is gone. A report only: whether a stranded
+// row is repaired onto the surviving namespace or dropped depends on what
+// the rows mean, which is the operator's call and not a thing core can
+// infer from a count.
+static void
+cmd_db_orphans_userns(const cmd_ctx_t *ctx)
+{
+  db_result_t *tables = db_result_alloc();
+  char         table[DB_TABLE_NAME_SZ];
+  char         has_fk[4];
+  char         nslist[96];
+  char         line[192];
+  int64_t      rows;
+  int64_t      total     = 0;
+  uint32_t     affected  = 0;
+  uint32_t     unguarded = 0;
+  uint32_t     i;
+
+  if(db_query(db_orphan_ns_tables_sql, tables) != SUCCESS || !tables->ok)
+  {
+    cmd_reply(ctx, "cannot read the table catalog — is the database up?");
+    db_result_free(tables);
+    return;
+  }
+
+  cmd_reply(ctx, "rows keyed to a userns id that no longer exists:");
+
+  for(i = 0; i < tables->rows; i++)
+  {
+    db_result_copy(table, sizeof(table), tables, i, 0);
+    db_result_copy(has_fk, sizeof(has_fk), tables, i, 1);
+
+    if(!db_validate_table_name(table))
+    {
+      cmd_reply(ctx, "  (skipped a table whose name needs quoting)");
+      continue;
+    }
+
+    // Postgres renders a boolean as "t" / "f".
+    if(has_fk[0] != 't')
+      unguarded++;
+
+    if(db_orphan_scan_table(table, &rows, nslist, sizeof(nslist)) != SUCCESS)
+    {
+      snprintf(line, sizeof(line), "  %-22s  unreadable", table);
+      cmd_reply(ctx, line);
+      continue;
+    }
+
+    if(rows == 0)
+      continue;
+
+    affected++;
+    total += rows;
+
+    snprintf(line, sizeof(line), "  %-22s %7lld  under ns %s%s",
+        table, (long long)rows, nslist,
+        has_fk[0] == 't' ? "" : "  (no FK)");
+    cmd_reply(ctx, line);
+  }
+
+  if(total == 0)
+    cmd_reply(ctx, "  none — every ns_id resolves to a live namespace");
+
+  else
+  {
+    snprintf(line, sizeof(line),
+        "%lld orphan(s) across %u table(s) — repair onto the surviving"
+        " namespace or drop them; neither is core's call",
+        (long long)total, affected);
+    cmd_reply(ctx, line);
+  }
+
+  // Worth saying even when nothing is stranded: an unguarded table is one
+  // the next wipe can strand again, and that is the actionable half.
+  if(unguarded > 0)
+  {
+    snprintf(line, sizeof(line),
+        "%u of %u ns_id table(s) carry no foreign key to userns",
+        unguarded, tables->rows);
+    cmd_reply(ctx, line);
+  }
+
+  db_result_free(tables);
+}
+
+// -----------------------------------------------------------------------
 // Registration
 // -----------------------------------------------------------------------
 
@@ -231,7 +410,7 @@ cmd_db_register(void)
 
   cmd_register("cmd", "orphans",
       "db orphans <what>",
-      "Report persisted state nothing claims (kv, ...)",
+      "Report persisted state nothing claims (kv, userns)",
       NULL,
       USERNS_GROUP_ADMIN, DB_CMD_LEVEL, CMD_SCOPE_ANY, METHOD_T_ANY,
       cmd_db_orphans, NULL, "db", NULL, NULL, 0, NULL, NULL);
@@ -249,4 +428,24 @@ cmd_db_register(void)
       "sure a key is retired, drop it with db delete kv <key>.",
       USERNS_GROUP_ADMIN, DB_CMD_LEVEL, CMD_SCOPE_ANY, METHOD_T_ANY,
       cmd_db_orphans_kv, NULL, "db/orphans", NULL, NULL, 0, NULL, NULL);
+
+  cmd_register("cmd", "userns",
+      "db orphans userns",
+      "List rows keyed to a userns id that no longer exists",
+      "A user namespace id is not stable. scripts/freshstart.sh drops and\n"
+      "recreates userns, so every id can move, and rows elsewhere that\n"
+      "stored one are then pointing at nothing. Nothing raises: reads are\n"
+      "scoped by ns_id, so a stranded row is simply never selected again\n"
+      "and the surface it fed goes quiet.\n"
+      "\n"
+      "A foreign key does not prevent this, which is the surprising part.\n"
+      "DROP TABLE userns CASCADE removes the constraints pointing at it\n"
+      "and leaves the referencing tables standing; CREATE TABLE IF NOT\n"
+      "EXISTS then finds the table present and never restores them.\n"
+      "\n"
+      "This reads the rows instead, over every table the catalog says has\n"
+      "an ns_id column — so a plugin's new table needs no registration\n"
+      "here. Run it after any freshstart.",
+      USERNS_GROUP_ADMIN, DB_CMD_LEVEL, CMD_SCOPE_ANY, METHOD_T_ANY,
+      cmd_db_orphans_userns, NULL, "db/orphans", NULL, NULL, 0, NULL, NULL);
 }
