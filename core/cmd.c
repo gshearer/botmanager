@@ -1848,6 +1848,25 @@ cmd_reply_table_head(const cmd_ctx_t *ctx, const char *head)
 #define CMD_HELP_ROW \
     "  " CLR_CYAN "%-20s" CLR_RESET " " CLR_GRAY "%-12s" CLR_RESET " %s"
 
+// What the row costs before its description starts: two of indent, the
+// twenty-column COMMAND cell, the twelve-column ABBREV cell, and the
+// space after each. The description is what is left of DISPLAY_COLS.
+//
+// A registered description is prose from whoever wrote the command and
+// nothing bounded it: whenmoon's `market` and `download` run past two
+// hundred columns, and the 256-byte line buffer below used to stop them
+// mid-word. So the last cell is fitted rather than trusted. Its mark
+// costs one column past `cols` (display.h) and a last cell has no
+// padding to absorb it, hence the extra minus one here and under the
+// argument form.
+#define CMD_HELP_DESC_COLS  (DISPLAY_COLS - (2 + 20 + 1 + 12 + 1) - 1)
+
+// The argument form's second line carries six of indent and nothing
+// else, so it is fitted against the same rule.
+#define CMD_HELP_ARGS_INDENT  "      "
+#define CMD_HELP_ARGS_COLS \
+    (DISPLAY_COLS - (int)(sizeof CMD_HELP_ARGS_INDENT - 1) - 1)
+
 // Permission check: can the caller see this command in help listings?
 static bool
 help_check_access(const cmd_ctx_t *ctx, const cmd_def_t *d)
@@ -1942,7 +1961,10 @@ help_show_children(const cmd_ctx_t *ctx, const cmd_def_t *d,
     const char *cname = c->name;
     const char *cabbrev = (c->abbrev[0] != '\0') ? c->abbrev : "-";
     const char *cdesc = c->description ? c->description : "";
-    char line[256];
+    // Both buffers are sized in BYTES for a fitted result measured in
+    // COLUMNS: a UTF-8 column costs up to four of them.
+    char line[512];
+    char fit[CMD_HELP_ARGS_COLS * 4 + 8];
 
     if(!header_sent)
     {
@@ -1956,7 +1978,8 @@ help_show_children(const cmd_ctx_t *ctx, const cmd_def_t *d,
 
     const char *cargs = help_arg_form(c, parent_path);
 
-    snprintf(line, sizeof(line), CMD_HELP_ROW, cname, cabbrev, cdesc);
+    display_fit(cdesc, CMD_HELP_DESC_COLS, fit, sizeof(fit), "…");
+    snprintf(line, sizeof(line), CMD_HELP_ROW, cname, cabbrev, fit);
     pthread_mutex_unlock(&cmd_mutex);
     cmd_reply(ctx, line);
     pthread_mutex_lock(&cmd_mutex);
@@ -1967,7 +1990,9 @@ help_show_children(const cmd_ctx_t *ctx, const cmd_def_t *d,
     // there is no width left to spend.
     if(cargs != NULL)
     {
-      snprintf(line, sizeof(line), "      " CLR_GRAY "%s" CLR_RESET, cargs);
+      display_fit(cargs, CMD_HELP_ARGS_COLS, fit, sizeof(fit), "…");
+      snprintf(line, sizeof(line),
+          CMD_HELP_ARGS_INDENT CLR_GRAY "%s" CLR_RESET, fit);
       pthread_mutex_unlock(&cmd_mutex);
       cmd_reply(ctx, line);
       pthread_mutex_lock(&cmd_mutex);
@@ -2089,7 +2114,8 @@ cmd_builtin_help(const cmd_ctx_t *ctx)
       const char *name;
       const char *abbrev;
       const char *desc;
-      char line[256];
+      char line[512];
+      char fit[CMD_HELP_ARGS_COLS * 4 + 8];
 
       if(d->parent != NULL)
         continue;
@@ -2099,7 +2125,8 @@ cmd_builtin_help(const cmd_ctx_t *ctx)
       name = d->name;
       abbrev = (d->abbrev[0] != '\0') ? d->abbrev : "-";
       desc = d->description ? d->description : "";
-      snprintf(line, sizeof(line), CMD_HELP_ROW, name, abbrev, desc);
+      display_fit(desc, CMD_HELP_DESC_COLS, fit, sizeof(fit), "…");
+      snprintf(line, sizeof(line), CMD_HELP_ROW, name, abbrev, fit);
 
       pthread_mutex_unlock(&cmd_mutex);
       cmd_reply(ctx, line);
