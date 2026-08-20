@@ -138,7 +138,7 @@ display_rule(char *line, size_t cap, int cols)
 
   for(i = 0; i < cols && n + 3 + sizeof(CLR_RESET) <= cap; i++)
   {
-    memcpy(line + n, "\u2500", 3);
+    memcpy(line + n, "─", 3);
     n += 3;
   }
 

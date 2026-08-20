@@ -784,7 +784,7 @@ cmd_show_clam(const cmd_ctx_t *ctx)
         "  " CLR_CYAN "%-20s" CLR_RESET " %s%-4s" CLR_RESET " %-16s %s",
         s->name, sev_color(sev), short_label[sev],
         s->owner[0] != '\0' ? s->owner
-                            : CLR_GRAY "\u2014" CLR_RESET,
+                            : CLR_GRAY "—" CLR_RESET,
         s->has_regex ? s->regex_str
                      : CLR_GRAY "(all)" CLR_RESET);
 
