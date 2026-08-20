@@ -293,7 +293,7 @@ cb_ws_init(void)
   kv_set_cb("plugin.coinbase.ws_url",      cb_ws_kv_cb, &cb_ws);
 
   // Advanced Trade requires a JWT on every subscribe; if creds arrive
-  // after the session opened (freshstart writes them post-launch), a
+  // after the session opened (they are installed by hand, post-launch), a
   // reconnect cycles through cb_ws_channels_on_open which retries the
   // queued subscribes with the new key.
   kv_set_cb("plugin.coinbase.creds.key_name",        cb_ws_kv_cb, &cb_ws);

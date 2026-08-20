@@ -68,8 +68,8 @@ static EVP_PKEY        *cb_cdp_pkey      = NULL;
 static char            *cb_cdp_pem_snap  = NULL;  // last-parsed PEM source
 
 // Translate any literal `\\n` / `\\r` escape sequences in `src` into
-// real newlines / carriage returns. Operators frequently render the
-// PEM into freshstart/.env as a single line with backslash-n
+// real newlines / carriage returns. A PEM pasted into a shell or an
+// env file is frequently rendered as a single line with backslash-n
 // separators; PEM_read_bio_PrivateKey only recognises actual newlines.
 // Returns a freshly mem_alloc'd NUL-terminated string the caller owns;
 // NULL only for a NULL `src`.

@@ -1439,7 +1439,7 @@ coinbase_ws_subscribe(const coinbase_ws_channel_t *channels,
 
   // Advanced Trade requires a JWT on every subscribe (public channels
   // included). Creds may not yet be in the KV at subscribe time
-  // (freshstart writes credentials post-launch); the slot still goes
+  // (credentials are installed by hand, post-launch); the slot still goes
   // into the table with sent_upstream=false, and cb_ws_send_delta_locked
   // retries on every reconcile. The creds-changed hook in coinbase_ws.c
   // schedules a reconnect that lands here via cb_ws_channels_on_open
