@@ -18,8 +18,17 @@
 // !news alone — with no query — is the one exception to "a search needs
 // words": it runs the standing plugin.searxng.news_query and prints
 // plugin.searxng.news_headlines stories as bare headlines.
+//
+// Every link printed here is offered to the shortener first (su_shorten), so
+// a result URL long enough to overrun the reply line arrives as a 31-byte
+// redirect instead. That happens at THIS layer and not in the searxng service,
+// because the same results also feed the acquisition engine, which files the
+// URL as knowledge_chunks.source_url and cites it into the model's prompt — a
+// corpus of opaque redirects would outlive whatever made them resolvable.
 #define SEARXNG_CMD_INTERNAL
 #include "searxng_cmd.h"
+
+#include "shorturl_api.h"
 
 #include "kv.h"
 
@@ -33,6 +42,15 @@ static void searxng_cmd_images (const cmd_ctx_t *ctx);
 static void searxng_cmd_news   (const cmd_ctx_t *ctx);
 static void searxng_cmd_videos (const cmd_ctx_t *ctx);
 static void searxng_cmd_music  (const cmd_ctx_t *ctx);
+
+// Every link one page can print. Slot i is result i's own link; slot
+// SXNG_MAX_RESULTS + i is the direct image a verbose !image prints beneath it,
+// which is a different URL and earns its own short form.
+//
+// Sized from the same constant that bounds the service's own results array, so
+// no count coming back from it can overrun this one and there is nothing to
+// range-check at the top of the loop.
+#define SXNG_CMD_LINKS_MAX      (SXNG_MAX_RESULTS * 2)
 
 // Per-line body cap for %.*s slots. Sized to leave room for the
 // widest leading label we emit ("   img: ", 8 bytes) plus the
@@ -50,8 +68,17 @@ static void searxng_cmd_music  (const cmd_ctx_t *ctx);
 
 // Append a single result row's category-specific extras as separate
 // reply lines. Skips empty fields silently.
+//
+// Every field is printed through a precision taken from its own declaration,
+// because `extras` is a UNION: the object size the compiler can prove for
+// `music.author` is the whole union — 2048 bytes, the size of `image.src` —
+// not the 128 that member actually holds. A bare %s there is an unbounded read
+// as far as the type system is concerned, and -Wformat-truncation says so. `img_link` is the form the direct
+// image is printed in — short if it was minted, the original if not — and is
+// meaningful only for an image result.
 static void
-searxng_cmd_emit_extras(cmd_ctx_t *ctx, const sxng_result_t *rr)
+searxng_cmd_emit_extras(cmd_ctx_t *ctx, const sxng_result_t *rr,
+    const char *img_link)
 {
   char line[SEARXNG_CMD_REPLY_SZ];
 
@@ -61,7 +88,7 @@ searxng_cmd_emit_extras(cmd_ctx_t *ctx, const sxng_result_t *rr)
       if(rr->extras.image.src[0] != '\0')
       {
         snprintf(line, sizeof(line), "   img: %.*s",
-            SXNG_CMD_LINE_BODY, rr->extras.image.src);
+            SXNG_CMD_LINE_BODY, img_link);
         cmd_reply(ctx, line);
       }
 
@@ -77,12 +104,14 @@ searxng_cmd_emit_extras(cmd_ctx_t *ctx, const sxng_result_t *rr)
       if(rr->extras.news.published[0] != '\0'
           || rr->extras.news.source[0] != '\0')
       {
-        snprintf(line, sizeof(line), "   %s%s%s",
+        snprintf(line, sizeof(line), "   %.*s%s%.*s",
+            (int)sizeof(rr->extras.news.source) - 1,
             rr->extras.news.source[0]    != '\0'
                 ? rr->extras.news.source : "",
             (rr->extras.news.source[0]    != '\0'
               && rr->extras.news.published[0] != '\0')
                 ? " — " : "",
+            (int)sizeof(rr->extras.news.published) - 1,
             rr->extras.news.published[0] != '\0'
                 ? rr->extras.news.published : "");
         cmd_reply(ctx, line);
@@ -94,17 +123,20 @@ searxng_cmd_emit_extras(cmd_ctx_t *ctx, const sxng_result_t *rr)
           || rr->extras.video.length[0] != '\0'
           || rr->extras.video.published[0] != '\0')
       {
-        snprintf(line, sizeof(line), "   %s%s%s%s%s",
+        snprintf(line, sizeof(line), "   %.*s%s%.*s%s%.*s",
+            (int)sizeof(rr->extras.video.author) - 1,
             rr->extras.video.author[0]    != '\0'
                 ? rr->extras.video.author : "",
             (rr->extras.video.author[0] != '\0'
               && rr->extras.video.length[0] != '\0')
                 ? " · " : "",
+            (int)sizeof(rr->extras.video.length) - 1,
             rr->extras.video.length[0]    != '\0'
                 ? rr->extras.video.length : "",
             (rr->extras.video.length[0] != '\0'
               && rr->extras.video.published[0] != '\0')
                 ? " · " : "",
+            (int)sizeof(rr->extras.video.published) - 1,
             rr->extras.video.published[0] != '\0'
                 ? rr->extras.video.published : "");
         cmd_reply(ctx, line);
@@ -115,12 +147,14 @@ searxng_cmd_emit_extras(cmd_ctx_t *ctx, const sxng_result_t *rr)
       if(rr->extras.music.author[0] != '\0'
           || rr->extras.music.published[0] != '\0')
       {
-        snprintf(line, sizeof(line), "   %s%s%s",
+        snprintf(line, sizeof(line), "   %.*s%s%.*s",
+            (int)sizeof(rr->extras.music.author) - 1,
             rr->extras.music.author[0]    != '\0'
                 ? rr->extras.music.author : "",
             (rr->extras.music.author[0] != '\0'
               && rr->extras.music.published[0] != '\0')
                 ? " — " : "",
+            (int)sizeof(rr->extras.music.published) - 1,
             rr->extras.music.published[0] != '\0'
                 ? rr->extras.music.published : "");
         cmd_reply(ctx, line);
@@ -144,6 +178,15 @@ searxng_cmd_result_link(const searxng_cmd_req_t *r, const sxng_result_t *rr)
     return(rr->extras.image.src);
 
   return(rr->url);
+}
+
+// The form a link is printed in. su_shorten leaves a slot empty for anything
+// it declined or could not mint, and that is not an error: shortening is
+// decoration, so the original is simply printed instead.
+static const char *
+searxng_cmd_printed(const char *original, const char *shortlink)
+{
+  return(shortlink[0] != '\0' ? shortlink : original);
 }
 
 // Offer a URL we just printed to whoever grabs titles (today: urlgrabber),
@@ -188,6 +231,8 @@ searxng_cmd_done(const sxng_response_t *resp)
   searxng_cmd_req_t *r = (searxng_cmd_req_t *)resp->user_data;
   cmd_ctx_t          ctx = r->ctx;
   char               line[SEARXNG_CMD_REPLY_SZ];
+  const char        *link[SXNG_CMD_LINKS_MAX];
+  char               shortlink[SXNG_CMD_LINKS_MAX][SU_SHORT_URL_SZ];
 
   ctx.msg = &r->msg;
 
@@ -209,6 +254,27 @@ searxng_cmd_done(const sxng_response_t *resp)
     return;
   }
 
+  // Collect every link the page will print, then mint them all before a single
+  // line goes out: a reply that showed the first result long before the last
+  // would be worse than the wait, and the mint is a LAN round trip per link.
+  for(size_t i = 0; i < resp->n_results; i++)
+  {
+    const sxng_result_t *rr = &resp->results[i];
+
+    link[i] = searxng_cmd_result_link(r, rr);
+
+    // The direct image is a second URL, and only a verbose !image prints it.
+    link[SXNG_MAX_RESULTS + i] =
+        (r->verbose && rr->category == SXNG_CAT_IMAGES
+            && rr->extras.image.src[0] != '\0')
+                ? rr->extras.image.src : NULL;
+  }
+
+  for(size_t i = resp->n_results; i < SXNG_MAX_RESULTS; i++)
+    link[i] = link[SXNG_MAX_RESULTS + i] = NULL;
+
+  su_shorten(link, SXNG_CMD_LINKS_MAX, shortlink);
+
   for(size_t i = 0; i < resp->n_results; i++)
   {
     const sxng_result_t *rr = &resp->results[i];
@@ -223,7 +289,8 @@ searxng_cmd_done(const sxng_response_t *resp)
       snprintf(line, sizeof(line), "%.*s — %.*s",
           SXNG_CMD_HEADLINE_HEAD,
           rr->title[0] != '\0' ? rr->title : "(untitled)",
-          SXNG_CMD_HEADLINE_TAIL, rr->url);
+          SXNG_CMD_HEADLINE_TAIL,
+          searxng_cmd_printed(link[i], shortlink[i]));
       cmd_reply(&ctx, line);
       continue;
     }
@@ -236,7 +303,7 @@ searxng_cmd_done(const sxng_response_t *resp)
     if(!r->verbose)
     {
       snprintf(line, sizeof(line), "%.*s", SXNG_CMD_LINE_BODY,
-          searxng_cmd_result_link(r, rr));
+          searxng_cmd_printed(link[i], shortlink[i]));
       cmd_reply(&ctx, line);
       continue;
     }
@@ -247,7 +314,7 @@ searxng_cmd_done(const sxng_response_t *resp)
     cmd_reply(&ctx, line);
 
     snprintf(line, sizeof(line), "   %.*s",
-        SXNG_CMD_LINE_BODY, rr->url);
+        SXNG_CMD_LINE_BODY, searxng_cmd_printed(link[i], shortlink[i]));
     cmd_reply(&ctx, line);
 
     if(rr->snippet[0] != '\0')
@@ -257,7 +324,9 @@ searxng_cmd_done(const sxng_response_t *resp)
       cmd_reply(&ctx, line);
     }
 
-    searxng_cmd_emit_extras(&ctx, rr);
+    searxng_cmd_emit_extras(&ctx, rr,
+        searxng_cmd_printed(rr->extras.image.src,
+            shortlink[SXNG_MAX_RESULTS + i]));
   }
 
   // A lone result is the one case worth a fetched title: the room is
@@ -568,8 +637,9 @@ const plugin_desc_t bm_plugin_desc = {
   .requires        = {
     { .name = "bot_chat" },
     { .name = "service_searxng" },
+    { .name = "service_shorturl" },
   },
-  .requires_count  = 2,
+  .requires_count  = 3,
   .kv_schema       = NULL,
   .kv_schema_count = 0,
   .init            = searxng_cmd_init,

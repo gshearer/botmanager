@@ -1,0 +1,33 @@
+# shorturl.socket — the listening end of the URL shortener's redirect daemon.
+#
+# ⚠ This pair installs ON THE WEB SERVER, not on the botman host. It is the
+# second unit in this project that does; senses/earbridge is the other.
+#
+#   sudo install -Dm644 web/shorturl/shorturl.socket /etc/systemd/system/
+#   sudo install -Dm644 web/shorturl/shorturl.service /etc/systemd/system/
+#   sudo systemctl daemon-reload
+#   sudo systemctl enable --now shorturl.socket
+#
+# Socket activation rather than spawn-fcgi, which is what the project used
+# before it moved into botmanager: libfcgi expects its listening socket on
+# file descriptor 0, and `Accept=no` here plus `StandardInput=socket` in the
+# service is exactly that, with no extra package to install.
+
+[Unit]
+Description=shorturl — FastCGI socket for the URL shortener
+
+[Socket]
+ListenStream=/run/shorturl/shorturl.sock
+SocketUser=http
+SocketGroup=http
+SocketMode=0660
+# The daemon is single-threaded and holds one PostgreSQL connection, so it
+# drains one request at a time. Measured on the live deployment: ~862 req/s
+# and ~99% served at 8 concurrent connections, ~58% at 20 — the rest refused
+# at the socket and reported by nginx as 502. They never reach the database,
+# so the hit counter stays exact either way. Past a sustained 8, run more
+# processes rather than raising this.
+Accept=no
+
+[Install]
+WantedBy=sockets.target

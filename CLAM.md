@@ -181,6 +181,7 @@ regex (the literal context portion, before any `<placeholder>`).
 | `reachyapi` | plugins/service/reachyapi/reachyapi.c | Reachy Mini robot daemon REST client — moves, motors, volume, sound, tracking, DoA (`REACHYAPI_CTX`) |
 | `rawg.cmd` | plugins/service/rawg/rawg_cmd.c | `!rawg` video-game info, the rawg plugin's own command surface (`RAWGCMD_CTX`) |
 | `searxng` | plugins/service/searxng/searxng.c | SearXNG service client (`SXNG_CTX`) |
+| `shorturl` | plugins/service/shorturl/shorturl.c | mints short links into the `urls` table an off-host FastCGI daemon resolves (`SU_CTX`) |
 | `tmdb` | plugins/service/tmdb/tmdb.c | The Movie Database API (`TMDB_CTX`) |
 | `tmdb.cmd` | plugins/service/tmdb/tmdb_cmd.c | `!tmdb` movie/TV/actor info, the tmdb plugin's own command surface (`TMDBCMD_CTX`) |
 | `weathergov` | plugins/service/weathergov/weathergov.c | National Weather Service (weather.gov) API client (`WXG_CTX`) |

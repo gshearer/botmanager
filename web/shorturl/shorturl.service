@@ -1,0 +1,49 @@
+# shorturl.service — resolves a short link and redirects. See shorturl.socket
+# beside this file for the install commands; the socket is what you enable.
+#
+# ⚠⚠ This daemon does NOT mint links. botmanager's shorturl plugin does, into
+# the same `urls` table, from the other host. The database role named here is
+# granted SELECT and UPDATE on that one table and nothing else — it can serve
+# a redirect and count the hit, and it cannot create one. That matters because
+# this is the internet-facing half: an INSERT privilege here would let anyone
+# who took the daemon point a lame.org link anywhere they liked.
+#
+# ⚠ Every variable in the credentials file must be `export`ed. The daemon
+# reads them with getenv(3), and a file sourced with `.` sets shell variables
+# only — systemd's EnvironmentFile= has no such trap, which is why the
+# credentials go there rather than through a wrapper script.
+#
+# nginx needs one location and nothing else. The path is decoration owned by
+# nginx — the daemon reads only QUERY_STRING — so a link is
+# https://lame.org/p0ada?kR7mQ2xB and the preface is whatever you route:
+#
+#   location = /p0ada {
+#       include      fastcgi_params;
+#       fastcgi_pass unix:/run/shorturl/shorturl.sock;
+#   }
+
+[Unit]
+Description=shorturl — URL shortener redirect daemon
+Requires=shorturl.socket
+After=shorturl.socket network-online.target
+
+[Service]
+Type=simple
+User=http
+Group=http
+# SHORTURL_DB_{HOST,PORT,NAME,USER,PASS}, and optionally SHORTURL_BASE_URL and
+# SHORTURL_NOT_FOUND_URL. NAME is botmanager's own database since the table
+# moved there; the daemon refuses to start if a required one is missing, and
+# names the one it wanted.
+EnvironmentFile=/etc/shorturl/shorturl.env
+# libfcgi wants the listening socket on fd 0; this is what puts it there.
+StandardInput=socket
+ExecStart=/usr/local/bin/shorturl.fcgi
+# It handles SIGTERM by refusing new requests, finishing the one in flight and
+# closing the database connection, so the default TERM-then-KILL is correct.
+Restart=on-failure
+RestartSec=5
+SyslogIdentifier=shorturl
+
+[Install]
+WantedBy=multi-user.target

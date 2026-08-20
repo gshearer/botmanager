@@ -42,6 +42,18 @@ test_json = executable('test_json',
 # The IRC parser is a plugin translation unit, so this suite compiles
 # that one file directly — irc_parse.c calls nothing but clam() and libc,
 # which is why it is a file of its own.
+# The trust boundary the URL shortener rests on. token_parse decides what the
+# off-host daemon will look up, url_valid decides what may reach a Location
+# header, and both are compiled into the daemon and the plugin alike — so this
+# is the one place a change to either is caught before it reaches two binaries.
+test_shorturl_token = executable('test_shorturl_token',
+  'test_shorturl_token.c',
+  '../web/shorturl/src/token.c',
+  '../web/shorturl/src/url.c',
+  include_directories : [include_directories('.'),
+                         include_directories('../web/shorturl')],
+)
+
 test_irc_parse = executable('test_irc_parse',
   'test_irc_parse.c',
   '../plugins/method/irc/irc_parse.c',
@@ -409,6 +421,7 @@ test('colors', test_colors)
 test('display', test_display)
 test('json', test_json)
 test('irc_parse', test_irc_parse)
+test('shorturl_token', test_shorturl_token)
 test('db_txn', test_db_txn)
 test('cooldown', test_cooldown)
 test('hold', test_hold)

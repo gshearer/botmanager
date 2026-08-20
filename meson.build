@@ -97,3 +97,7 @@ subdir('tests')
 # Out-of-daemon speech hosts for the reachy robot. Not plugins and not linked
 # against core — kokorod is a standalone daemon. Self-guarding on sherpa-onnx.
 subdir('senses/kokorod')
+# The URL shortener's off-host half: a FastCGI redirector and its admin CLI,
+# deployed to the web server by hand. botmanager's shorturl plugin mints into
+# the table this daemon serves. Self-guarding on libfcgi.
+subdir('web/shorturl')

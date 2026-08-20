@@ -90,6 +90,17 @@ if [ "$(psql_q "select to_regclass('kv') is not null;")" = "t" ]; then
                     order by key;")"
 fi
 
+# Short links are the one thing here that is visible from outside this
+# machine: they are already printed in channels and sitting in other people's
+# scrollback, and the redirect daemon on the web host resolves them from this
+# table. Wiping it does not lose a setting, it breaks published URLs — so the
+# count is worth stating before the prompt rather than after the fact.
+n_links=""
+if [ "$(psql_q "select to_regclass('urls') is not null;")" = "t" ]; then
+  n_links="$(psql_q "select count(*) from urls;")"
+  [ "$n_links" = "0" ] && n_links=""
+fi
+
 echo
 echo "  This is a FACTORY RESET of the botmanager instance below."
 echo
@@ -105,6 +116,13 @@ if [ -n "$creds" ]; then
   echo "  Credential keys that will be emptied — reinstall each by hand"
   echo "  afterwards; no file in this tree holds them:"
   printf '    %s\n' $creds
+  echo
+fi
+
+if [ -n "$n_links" ]; then
+  printf '  %s published short link(s) will stop resolving. Nothing else\n' "$n_links"
+  echo "  records them, and anyone holding one gets a 404:"
+  echo "      scripts/bm-save.sh save shorturl"
   echo
 fi
 
