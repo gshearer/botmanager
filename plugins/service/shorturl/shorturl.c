@@ -87,6 +87,17 @@ su_schema_ensure(void)
   if(db_exec(sql, SU_CTX) != SUCCESS)
     ok = FAIL;
 
+  // What makes a repeat cheap. On md5(target) rather than target, because a
+  // 2048-byte column makes a fat btree; deliberately NOT unique, so that two
+  // mints racing on the same target produce a harmless duplicate rather than a
+  // failed one. It costs the hit counter nothing: a HOT update needs no
+  // INDEXED column to change, and target never changes — only hits and
+  // last_hit_at do, and neither is indexed.
+  if(ok == SUCCESS && db_exec(
+      "CREATE INDEX IF NOT EXISTS " SHORTURL_TABLE "_target_md5_idx"
+      " ON " SHORTURL_TABLE " (md5(target))", SU_CTX) != SUCCESS)
+    ok = FAIL;
+
   if(ok == SUCCESS)
   {
     su_schema_done = true;
@@ -100,10 +111,10 @@ su_schema_ensure(void)
 
 // Minting
 
-// One row, one round trip, retried only on a token collision. SQL_INSERT is
-// the admin CLI's statement unchanged: ON CONFLICT DO NOTHING turns a taken
-// token into zero returned rows, which is cheaper to detect than parsing
-// SQLSTATE 23505 off the error.
+// One round trip, retried only on a token collision. The generated token is a
+// CANDIDATE: SQL_MINT answers with the one this target already had if it has
+// one, so searching the same URL twice prints the same link and its hits
+// accumulate on one row instead of scattering.
 static bool
 su_mint(const char *target, token_t *out)
 {
@@ -113,33 +124,49 @@ su_mint(const char *target, token_t *out)
   {
     const char  *params[2];
     db_result_t *res;
-    bool         inserted;
+    token_t      candidate;
 
     // Predicate, not SUCCESS/FAIL — see the note at the top of this file.
-    if(!token_generate(out))
+    if(!token_generate(&candidate))
     {
       clam(CLAM_WARN, SU_CTX, "getrandom refused entropy");
       return(FAIL);
     }
 
-    params[0] = out->s;
+    params[0] = candidate.s;
     params[1] = target;
 
     res = db_result_alloc();
 
-    if(db_query_params(SQL_INSERT, params, 2, res) != SUCCESS || !res->ok)
+    if(db_query_params(SQL_MINT, params, 2, res) != SUCCESS || !res->ok)
     {
-      clam(CLAM_WARN, SU_CTX, "insert failed: %s",
+      clam(CLAM_WARN, SU_CTX, "mint failed: %s",
           (res->error[0] != '\0') ? res->error : "(no driver error)");
       db_result_free(res);
       return(FAIL);
     }
 
-    inserted = res->rows == 1;
-    db_result_free(res);
+    if(res->rows == 1)
+    {
+      // The row is another writer's territory — the admin CLI mints too, and
+      // the token coming back need not be one this process generated. It
+      // re-enters through the same boundary an inbound token crosses, and
+      // db_result_get answers NULL out of bounds, which token_parse refuses.
+      bool parsed = token_parse(db_result_get(res, 0, 0), out);
 
-    if(inserted)
+      db_result_free(res);
+
+      if(!parsed)
+      {
+        clam(CLAM_WARN, SU_CTX, "row holds a token that is not one");
+        return(FAIL);
+      }
+
       return(SUCCESS);
+    }
+
+    // Zero rows: the candidate is taken. Draw another.
+    db_result_free(res);
   }
 
   clam(CLAM_WARN, SU_CTX, "%d token collisions running — keyspace exhausted?",

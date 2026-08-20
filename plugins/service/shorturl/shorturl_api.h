@@ -33,6 +33,11 @@
 // One database round trip per minted link, on the CALLING thread — call it
 // from a task or a completion, never under a lock.
 //
+// A target the table already holds gets that token back rather than a new one,
+// so the same URL always prints the same link and its hits accumulate on one
+// row. Two callers racing on a target it does NOT hold may each insert; the
+// duplicate is harmless and both tokens resolve alike.
+//
 // A slot is left EMPTY, and the caller must render the original URL, when the
 // shortener is disabled, the target is no longer than plugin.shorturl.min_len,
 // the target is not a legal redirect destination, or the database refused.
