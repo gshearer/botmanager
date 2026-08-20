@@ -1563,8 +1563,9 @@ out:
 // One statement, one round trip, and the stack cap enforced by the WHERE
 // clause rather than by a read-then-write another turn could race. At
 // the cap the INSERT ... SELECT simply affects no rows, which is why the
-// caller is told SUCCESS only when the row count says one landed.
-bool
+// row count — and not the statement's own success — is what says an
+// affliction landed.
+atk_inflict_t
 atk_db_dot_inflict(const atk_dot_new_t *d)
 {
   atk_tables_t t;
@@ -1575,12 +1576,12 @@ atk_db_dot_inflict(const atk_dot_new_t *d)
   char        *e_src_u  = NULL;
   char        *e_src_n  = NULL;
   char        *e_noun   = NULL;
-  char         sql[1792];
-  uint32_t     affected = 0;
-  bool         ok = FAIL;
+  char          sql[1792];
+  uint32_t      affected = 0;
+  atk_inflict_t ok = ATK_INFLICT_UNWRITTEN;
 
   if(d == NULL || d->round_id <= 0 || atk_tables_resolve(&t) != SUCCESS)
-    return(FAIL);
+    return(ATK_INFLICT_UNWRITTEN);
 
   e_meth  = db_escape(d->method      != NULL ? d->method      : "");
   e_chan  = db_escape(d->channel     != NULL ? d->channel     : "");
@@ -1613,8 +1614,11 @@ atk_db_dot_inflict(const atk_dot_new_t *d)
       d->tick_secs, (d->max_ticks + 1) * d->tick_secs,
       t.dots, d->round_id, e_vic_u, ATK_DOT_LIVE, d->stack_max);
 
-  if(atk_exec(sql, "dot inflict", &affected) == SUCCESS && affected > 0)
-    ok = SUCCESS;
+  // A statement that RAN and wrote nothing is the cap doing its work, and
+  // it is a different sentence in the pit from one that never ran at all.
+  // atk_exec() has already logged the second.
+  if(atk_exec(sql, "dot inflict", &affected) == SUCCESS)
+    ok = (affected > 0) ? ATK_INFLICT_LANDED : ATK_INFLICT_CAPPED;
 
 out:
   if(e_meth  != NULL) mem_free(e_meth);

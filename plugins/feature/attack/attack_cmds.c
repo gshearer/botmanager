@@ -617,7 +617,7 @@ atk_cmd_attack(const cmd_ctx_t *ctx)
       .stack_max   = t.dot_stack_max,
     };
 
-    bool landed;
+    atk_inflict_t landed;
 
     if(atk_db_turn_spend(round.id, ns->id, ctx->username, src_nick,
           round.wave) != SUCCESS)
@@ -628,29 +628,42 @@ atk_cmd_attack(const cmd_ctx_t *ctx)
       return;
     }
 
-    // At the stack cap the insert lands no row and says so by returning
-    // FAIL. The turn is still spent: a wasted affliction against an
-    // already-afflicted victim costs the same as any other wasted turn,
-    // and refunding it would hand affliction classes a free retry.
-    landed = (atk_db_dot_inflict(&wound) == SUCCESS);
+    // At the stack cap the insert lands no row. The turn is still spent:
+    // a wasted affliction against an already-afflicted victim costs the
+    // same as any other wasted turn, and refunding it would hand
+    // affliction classes a free retry. What it must not cost is the
+    // sentence — a turn and a wave that disappear without a line read as
+    // a broken pit, not as a mechanic, so all three answers speak. The
+    // cap is a rule of the game and says so in the pit's own words; a
+    // ledger that never took the row is a fault and wears the same
+    // sentence every other failed write here does.
+    landed = atk_db_dot_inflict(&wound);
 
-    if(landed)
+    if(landed == ATK_INFLICT_LANDED)
     {
       atk_render_dot_inflict(line, sizeof(line), src_nick, nick,
           wound.kind, wound.noun, spoken ? &move : NULL, bonus);
       cmd_reply(ctx, line);
     }
 
+    else if(landed == ATK_INFLICT_CAPPED)
+    {
+      snprintf(line, sizeof(line),
+          "⚔ " CLR_PURPLE "%s" CLR_RESET " is already carrying all the "
+          "pit allows. Your %s%s" CLR_RESET " finds no purchase.",
+          nick, atk_dot_color_of(wound.kind), wound.noun);
+      cmd_reply(ctx, line);
+    }
+
     else
-      clam(CLAM_DEBUG, ATK_CTX,
-          "round %" PRId64 ": no affliction landed on %s", round.id,
-          tgt_user);
+      cmd_reply(ctx, "☠ The affliction landed nowhere — the pit's "
+                     "ledger refused it.");
 
     pthread_mutex_unlock(&atk_turn_lock);
 
     // Last, and with no lock held: the task system is deliberately kept
     // off the turn path entirely.
-    if(landed)
+    if(landed == ATK_INFLICT_LANDED)
       atk_dot_wake();
 
     return;

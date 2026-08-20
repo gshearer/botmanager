@@ -511,6 +511,20 @@ typedef struct
   uint32_t       stack_max;  // enforced in SQL, not read-then-write
 } atk_dot_new_t;
 
+// What became of an attempted affliction. The turn is spent on all three
+// answers and every one of them owes the room a sentence, so the caller
+// may not stop at a two-state test: LANDED sits at 0 so such a test comes
+// out incomplete rather than wrong, separating "a row landed" from "it
+// did not" and losing only WHICH refusal to speak. CAPPED is a rule of
+// the game and UNWRITTEN is a fault in the machine; they must not read
+// alike in the pit.
+typedef enum
+{
+  ATK_INFLICT_LANDED = 0,  // a row landed, and the decay task is owed a wake
+  ATK_INFLICT_CAPPED,      // the victim already carries dot.stack_max
+  ATK_INFLICT_UNWRITTEN    // the ledger never took it
+} atk_inflict_t;
+
 // ---- Character sheets (attack_class.c) ----------------------------- //
 //
 // THE LAW, in one sentence: the engine owns every number, and a sheet
@@ -801,10 +815,12 @@ bool atk_db_defer_apply(int64_t round_id, const char *username,
     const char *nickname, int32_t wave, uint32_t bonus_pct);
 
 // Leave an affliction on a combatant. The stack cap is enforced inside
-// the statement, so at the cap this lands no row and returns FAIL — the
-// intended silence, not an error. SUCCESS means a row landed and the
-// caller owes the room an inflict line.
-bool atk_db_dot_inflict(const atk_dot_new_t *dot);
+// the statement, so at the cap the INSERT writes no row — and telling
+// that apart from a statement that FAILED is this function's job, not
+// the caller's: only here is it visible that the ledger ran and chose to
+// write nothing. `dot.stack_max` is clamped to at least 1 before it
+// arrives, so zero rows affected means the cap and can mean nothing else.
+atk_inflict_t atk_db_dot_inflict(const atk_dot_new_t *dot);
 
 // Who in this round is currently afflicted, and with what. Returns the
 // number of victims written, at most `cap`.
