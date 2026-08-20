@@ -113,34 +113,11 @@ CREATE TABLE IF NOT EXISTS bot_methods (
 -- The bearer token is not in any of these tables in any case; it lives
 -- in KV under llm.service.<name>.creds.apikey.
 
--- Personalities: named LLM system-prompt + behavior bundles loaded by
--- the llm bot driver. The loader/parser lands in Chunk E; the table
--- is defined here for schema co-location.
-
-CREATE TABLE IF NOT EXISTS personalities (
-  name           VARCHAR(64)  PRIMARY KEY,
-  description    VARCHAR(200) NOT NULL DEFAULT '',
-  body           TEXT         NOT NULL,
-  -- Output contract: wire-format rules (no parentheticals, sentinel
-  -- token for opting out of a turn, etc). Required field, resolved at
-  -- personality-load time from the path given by the personality
-  -- file's "contract:" frontmatter. The contract content is stored
-  -- inline rather than referenced by name so a personality is a
-  -- self-contained behavioral definition with no live cross-table
-  -- coupling. Multiple personalities can include the same contract
-  -- file at load time; updating the contract = reload the personas.
-  contract_body  TEXT         NOT NULL DEFAULT '',
-  -- Topic list for the acquisition engine. Stored opaquely as JSON
-  -- verbatim from the personality file's `interests:` frontmatter
-  -- block; parsed at bot start into acquire_topic_t[] by
-  -- llmbot_interests_parse. Empty = bot has no topics; no acquisition.
-  interests_json TEXT         NOT NULL DEFAULT '',
-  version        INTEGER      NOT NULL DEFAULT 1,
-  updated        TIMESTAMPTZ  NOT NULL DEFAULT NOW()
-);
--- Knowledge-corpus binding now lives on the bot instance, not the
--- personality: set `bot.<name>.corpus` to a semicolon-separated
--- list of corpus names to enable retrieval. See KNOWLEDGE.md.
+-- A `personalities` table was declared here for a loader that was never
+-- built: a personality is a .txt file under bot.chat.personalitypath,
+-- read at bot start, and no code has ever touched the table. It is not
+-- part of the schema. Corpus binding is on the bot instance too — set
+-- `bot.<name>.corpus` to a semicolon-separated list. See KNOWLEDGE.md.
 
 -- The memory subsystem's tables (conversation_log,
 -- conversation_embeddings) used to be declared here. Chunk R1 re-homed
