@@ -1883,12 +1883,16 @@ mw_send(method_inst_t *inst, const char *target, const char *text)
 static void
 mw_send_head(method_inst_t *inst, const char *target, const char *head)
 {
-  char rule[DISPLAY_RULE_SZ(MW_TABLE_COLS_MAX)];
+  char   rule[DISPLAY_RULE_SZ(MW_TABLE_COLS_MAX)];
+  size_t indent = strspn(head, " ");
 
   mw_send(inst, target, head);
 
-  rule[0] = '\0';
-  display_rule(rule, sizeof(rule), (int)display_vis_len(head));
+  // Indent and width both come off the header, so the top-N table's
+  // two-space margin carries to its rule and status's flush-left one
+  // does not gain one.
+  snprintf(rule, sizeof(rule), "%.*s", (int)indent, head);
+  display_rule(rule, sizeof(rule), (int)(display_vis_len(head) - indent));
   mw_send(inst, target, rule);
 }
 
