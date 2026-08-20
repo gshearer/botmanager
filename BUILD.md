@@ -117,5 +117,5 @@ bootstrap (sample format: see `core/bconf.c` parser for keys).
 - The daemon hardcodes plugin discovery via `dlopen()` — adding a new
   plugin directory means adding a `subdir(...)` line in the relevant
   `plugins/<type>/meson.build`.
-- After significant schema or KV changes, `scripts/freshstart.sh` to drop
+- After significant schema or KV changes, `scripts/bm-wipe.sh` to drop
   and rebuild the database. Pre-1.0 we do not write migrations.

@@ -411,7 +411,7 @@ knowledge_register_commands(void)
       "knowledge corpus upsert <name>",
       "Create (or ensure) a named corpus; thin wrapper over"
       " knowledge_corpus_upsert()",
-      "Useful as a bootstrap step — freshstart.sh uses this to create"
+      "Useful as a bootstrap step — bm-restore.sh uses this to create"
       " an acquired-content corpus before binding it via"
       " bot.<name>.llm.acquired_corpus. Idempotent: re-running is a"
       " no-op when the corpus already exists.",

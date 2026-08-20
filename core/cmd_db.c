@@ -223,7 +223,7 @@ cmd_db_orphans_kv(const cmd_ctx_t *ctx)
 #define DB_ORPHAN_SQL_SZ  320
 
 // Every table that keys rows by user namespace carries an `ns_id`, and a
-// userns id is not stable across a wipe: freshstart drops and recreates
+// userns id is not stable across a wipe: bm-wipe.sh drops and recreates
 // `userns`, so the ids move underneath everything that stored one. The
 // 2026-08-18 wipe moved drow from 4 to 2 and silently stranded 1,771
 // quotes that way.
@@ -432,11 +432,11 @@ cmd_db_register(void)
   cmd_register("cmd", "userns",
       "db orphans userns",
       "List rows keyed to a userns id that no longer exists",
-      "A user namespace id is not stable. scripts/freshstart.sh drops and\n"
-      "recreates userns, so every id can move, and rows elsewhere that\n"
-      "stored one are then pointing at nothing. Nothing raises: reads are\n"
-      "scoped by ns_id, so a stranded row is simply never selected again\n"
-      "and the surface it fed goes quiet.\n"
+      "A user namespace id is not stable. scripts/bm-wipe.sh drops it and\n"
+      "the daemon recreates it, so every id can move, and rows elsewhere\n"
+      "that stored one are then pointing at nothing. Nothing raises: reads\n"
+      "are scoped by ns_id, so a stranded row is simply never selected\n"
+      "again and the surface it fed goes quiet.\n"
       "\n"
       "A foreign key does not prevent this, which is the surprising part.\n"
       "DROP TABLE userns CASCADE removes the constraints pointing at it\n"
@@ -445,7 +445,7 @@ cmd_db_register(void)
       "\n"
       "This reads the rows instead, over every table the catalog says has\n"
       "an ns_id column — so a plugin's new table needs no registration\n"
-      "here. Run it after any freshstart.",
+      "here. Run it after any wipe+restore.",
       USERNS_GROUP_ADMIN, DB_CMD_LEVEL, CMD_SCOPE_ANY, METHOD_T_ANY,
       cmd_db_orphans_userns, NULL, "db/orphans", NULL, NULL, 0, NULL, NULL);
 }

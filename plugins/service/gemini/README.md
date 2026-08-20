@@ -140,9 +140,8 @@ AND `creds.private_key` base64-decodes cleanly. The cached decoded
 secret is invalidated transparently on any KV-edit — no daemon
 restart needed.
 
-Per `feedback_freshstart_never_shared`, credentials are installed
-manually post-`scripts/freshstart.sh`; they are not stored in any
-committed file and do not survive a freshstart.
+Credentials are installed manually after `scripts/bm-wipe.sh`; they are
+not stored in any committed file and do not survive a wipe.
 
 ### Nonce persistence
 
