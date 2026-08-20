@@ -8,6 +8,7 @@
 #include "colors.h"
 #include "curl.h"
 #include "db.h"
+#include "display.h"
 #include "kv.h"
 #include "main.h"
 #include "alloc.h"
@@ -29,6 +30,8 @@
 // Local types
 
 #define SHOW_LIMIT 256
+
+
 
 typedef struct
 {
@@ -91,6 +94,41 @@ fmt_duration(char *buf, size_t sz, time_t secs)
     snprintf(buf, sz, "%us", (uint32_t)secs);
 }
 
+// Table furniture
+
+// A section title, in the bold cyan /show has drawn them in since
+// `show status` was written.
+static void
+show_section(const cmd_ctx_t *ctx, const char *title)
+{
+  char line[128];
+
+  snprintf(line, sizeof(line), CLR_BOLD CLR_CYAN "%s" CLR_RESET, title);
+  cmd_reply(ctx, line);
+}
+
+// A card's section rule: half the house width. Short enough to sit
+// under a two-word title without reaching for the far margin, and
+// derived rather than picked so it follows DISPLAY_COLS if that moves.
+#define SHOW_SECTION_COLS  (DISPLAY_COLS / 2)
+
+// A section title with a rule under it — the form a card takes, where
+// there is no header row to carry one.
+static void
+show_section_rule(const cmd_ctx_t *ctx, const char *title)
+{
+  char rule[DISPLAY_RULE_SZ(SHOW_SECTION_COLS)];
+
+  show_section(ctx, title);
+
+  strlcpy(rule, "  ", sizeof(rule));
+  display_rule(rule, sizeof(rule), SHOW_SECTION_COLS);
+  cmd_reply(ctx, rule);
+}
+
+// The gray every renderer here reaches for when a cell has no value.
+#define SHOW_NONE  CLR_GRAY "(none)" CLR_RESET
+
 // /show kv [prefix]
 
 static void
@@ -150,8 +188,14 @@ cmd_show_kv(const cmd_ctx_t *ctx)
   {
     char line[KV_KEY_SZ + KV_STR_SZ + 32];
 
-    snprintf(line, sizeof(line), "  %s = %s (%s)",
-        gr.entries[i].key, gr.entries[i].val,
+    // An empty value is spelled rather than left blank: this table is
+    // read to find out what a key holds, and a bare "= " answers that
+    // ambiguously enough to be worth two words.
+    snprintf(line, sizeof(line),
+        "  " CLR_CYAN "%s" CLR_RESET " = %s " CLR_GRAY "(%s)" CLR_RESET,
+        gr.entries[i].key,
+        (gr.entries[i].val[0] != '\0') ? gr.entries[i].val
+                                       : CLR_GRAY "(empty)" CLR_RESET,
         kv_type_name(gr.entries[i].type));
     cmd_reply(ctx, line);
   }
@@ -167,7 +211,9 @@ show_method_type_cb(const char *name, method_type_t bit,
   char line[256];
 
   (void)bit;
-  snprintf(line, sizeof(line), "  %-12s — %s", name, desc);
+  snprintf(line, sizeof(line),
+      "  " CLR_CYAN "%-12s" CLR_RESET " " CLR_GRAY "—" CLR_RESET " %s",
+      name, desc);
   cmd_reply(st->ctx, line);
   st->count++;
 }
@@ -178,6 +224,7 @@ show_method_inst_cb(const char *name, const char *kind,
     uint32_t sub_count, time_t connected_at, void *data)
 {
   show_iter_state_t *st = data;
+  const char *state_clr;
   char line[256];
   char uptime[32];
 
@@ -201,9 +248,18 @@ show_method_inst_cb(const char *name, const char *kind,
   else
     strlcpy(uptime, "-", sizeof(uptime));
 
+  // AVAILABLE is connected, RUNNING is on its way there — the same
+  // three colors `show bots` gives a bot's state, for the same reason.
+  switch(state)
+  {
+    case METHOD_AVAILABLE: state_clr = CLR_GREEN;  break;
+    case METHOD_RUNNING:   state_clr = CLR_YELLOW; break;
+    default:               state_clr = CLR_RED;    break;
+  }
+
   snprintf(line, sizeof(line),
-      "  %-16s kind=%-12s state=%-12s in=%-6lu out=%-6lu subs=%u up=%s",
-      name, kind, method_state_name(state),
+      "  %-16s %-12s %s%-12s" CLR_RESET " %-6lu %-6lu %-5u %s",
+      name, kind, state_clr, method_state_name(state),
       (unsigned long)msg_in, (unsigned long)msg_out, sub_count, uptime);
   cmd_reply(st->ctx, line);
   st->count++;
@@ -214,18 +270,24 @@ cmd_show_methods(const cmd_ctx_t *ctx)
 {
   show_iter_state_t st = { .ctx = ctx, .count = 0 };
 
-  cmd_reply(ctx, "method types:");
+  show_section(ctx, "Method types");
+  cmd_reply_table_head(ctx,
+      "  " CLR_BOLD "NAME           DESCRIPTION" CLR_RESET);
   method_iterate_types(show_method_type_cb, &st);
 
   if(st.count == 0)
-    cmd_reply(ctx, "  (none)");
+    cmd_reply(ctx, "  " SHOW_NONE);
 
   st.count = 0;
-  cmd_reply(ctx, "method instances:");
+  cmd_reply(ctx, "");
+  show_section(ctx, "Method instances");
+  cmd_reply_table_head(ctx, "  " CLR_BOLD
+      "NAME             KIND         STATE        "
+      "IN     OUT    SUBS  UP" CLR_RESET);
   method_iterate_instances(show_method_inst_cb, &st);
 
   if(st.count == 0)
-    cmd_reply(ctx, "  (none)");
+    cmd_reply(ctx, "  " SHOW_NONE);
 }
 
 // /show schema [plugin [group]]
@@ -237,7 +299,9 @@ show_schema_iter_cb(const plugin_desc_t *plugin,
   const cmd_ctx_t *ctx = data;
   char line[256];
 
-  snprintf(line, sizeof(line), "  %-12s %-12s — %s",
+  snprintf(line, sizeof(line),
+      "  " CLR_CYAN "%-12s" CLR_RESET " %-12s "
+      CLR_GRAY "—" CLR_RESET " %s",
       plugin->name, group->name, group->description);
   cmd_reply(ctx, line);
 }
@@ -292,7 +356,8 @@ cmd_show_schema(const cmd_ctx_t *ctx)
     {
       char line[256];
 
-      snprintf(line, sizeof(line), "  %-12s — %s",
+      snprintf(line, sizeof(line),
+          "  " CLR_CYAN "%-12s" CLR_RESET " " CLR_GRAY "—" CLR_RESET " %s",
           pd->kv_groups[j].name, pd->kv_groups[j].description);
       cmd_reply(ctx, line);
     }
@@ -322,20 +387,41 @@ cmd_show_schema(const cmd_ctx_t *ctx)
   snprintf(hdr, sizeof(hdr), "  command: %s %s", plugin_name, g->cmd_name);
   cmd_reply(ctx, hdr);
   cmd_reply(ctx, "  properties:");
+  cmd_reply_table_head(ctx,
+      "    " CLR_BOLD "PROPERTY         TYPE     DEFAULT" CLR_RESET);
 
   for(uint32_t j = 0; j < g->schema_count; j++)
   {
     const plugin_kv_entry_t *e = &g->schema[j];
     char line[256];
 
-    snprintf(line, sizeof(line), "    %-16s %-8s default: %s",
+    // "default:" moved into the header — a label repeated down every
+    // row is a column that has not been named yet.
+    snprintf(line, sizeof(line),
+        "    " CLR_CYAN "%-16s" CLR_RESET " " CLR_GRAY "%-8s" CLR_RESET " %s",
         e->key, kv_type_name(e->type),
-        (e->default_val && e->default_val[0]) ? e->default_val : "(empty)");
+        (e->default_val && e->default_val[0]) ? e->default_val
+                                              : CLR_GRAY "(empty)" CLR_RESET);
     cmd_reply(ctx, line);
   }
 }
 
 // /show sockets
+
+// A session's state, colored by where it sits in its own life: settled
+// at either end, in motion between them. sock_state_t lives behind
+// SOCK_INTERNAL, so the name is what this surface has to work with.
+static const char *
+show_sock_state_color(const char *state)
+{
+  if(strcmp(state, "connected") == 0)
+    return(CLR_GREEN);
+
+  if(strcmp(state, "closed") == 0 || strcmp(state, "unknown") == 0)
+    return(CLR_RED);
+
+  return(CLR_YELLOW);
+}
 
 static void
 show_sock_cb(uint32_t id, sock_type_t type, int state,
@@ -343,6 +429,7 @@ show_sock_cb(uint32_t id, sock_type_t type, int state,
     bool tls, time_t connected_at, void *data)
 {
   show_iter_state_t *st = data;
+  const char *state_str;
   char line[512];
   char dur[32];
 
@@ -351,12 +438,16 @@ show_sock_cb(uint32_t id, sock_type_t type, int state,
   else
     snprintf(dur, sizeof(dur), "-");
 
+  state_str = sock_state_name(state);
+
   snprintf(line, sizeof(line),
-      "  %-3u %-5s %-12s %-30s in=%-8lu out=%-8lu %s %s",
-      id, sock_type_name(type), sock_state_name(state),
+      "  %-3u %-5s %s%-12s" CLR_RESET " %-30s %-8lu %-8lu %s%-3s"
+      CLR_RESET " %s",
+      id, sock_type_name(type),
+      show_sock_state_color(state_str), state_str,
       (remote && remote[0]) ? remote : "(local)",
       (unsigned long)bytes_in, (unsigned long)bytes_out,
-      tls ? "tls" : "   ", dur);
+      tls ? CLR_GREEN : "", tls ? "tls" : "", dur);
 
   cmd_reply(st->ctx, line);
   st->count++;
@@ -367,11 +458,14 @@ cmd_show_sockets(const cmd_ctx_t *ctx)
 {
   show_iter_state_t st = { .ctx = ctx, .count = 0 };
 
-  cmd_reply(ctx, "socket sessions:");
+  show_section(ctx, "Socket sessions");
+  cmd_reply_table_head(ctx, "  " CLR_BOLD
+      "ID  TYPE  STATE        REMOTE                         "
+      "IN       OUT      TLS AGE" CLR_RESET);
   sock_iterate(show_sock_cb, &st);
 
   if(st.count == 0)
-    cmd_reply(ctx, "  (none)");
+    cmd_reply(ctx, "  " SHOW_NONE);
 }
 
 // /show curl
@@ -382,7 +476,9 @@ show_curl_cb(const curl_iter_req_t *req, void *data)
   show_iter_state_t *st = data;
   char line[512];
 
-  snprintf(line, sizeof(line), "  %-7s %-6s %s",
+  snprintf(line, sizeof(line),
+      "  %s%-7s" CLR_RESET " " CLR_CYAN "%-6s" CLR_RESET " %s",
+      req->in_flight ? CLR_GREEN : CLR_YELLOW,
       req->in_flight ? "active" : "queued",
       curl_method_name(req->method), req->url);
   cmd_reply(st->ctx, line);
@@ -449,7 +545,10 @@ cmd_show_curl(const cmd_ctx_t *ctx)
   {
     show_iter_state_t st = { .ctx = ctx, .count = 0 };
 
-    cmd_reply(ctx, "outstanding requests:");
+    cmd_reply(ctx, "");
+    show_section(ctx, "Outstanding requests");
+    cmd_reply_table_head(ctx,
+        "  " CLR_BOLD "STATE   METHOD URL" CLR_RESET);
     curl_iterate_active(show_curl_cb, &st);
   }
 }
@@ -487,7 +586,8 @@ cmd_show_resolve(const cmd_ctx_t *ctx)
   {
     if(rs.by_type[i] > 0)
     {
-      snprintf(buf, sizeof(buf), "    %-6s %lu",
+      snprintf(buf, sizeof(buf),
+          "    " CLR_CYAN "%-6s" CLR_RESET " %lu",
           type_names[i], (unsigned long)rs.by_type[i]);
       cmd_reply(ctx, buf);
     }
@@ -521,7 +621,7 @@ show_identity_cb(const char *username, const char *metadata,
     snprintf(idle_dur, sizeof(idle_dur), "-");
 
   snprintf(line, sizeof(line),
-      "  %-20s %-40s age=%s idle=%s",
+      "  " CLR_BOLD "%-20s" CLR_RESET " %-40s %-10s %s",
       username, metadata, age_dur, idle_dur);
   cmd_reply(st->ctx, line);
   st->count++;
@@ -551,13 +651,17 @@ cmd_show_identities(const cmd_ctx_t *ctx)
     return;
   }
 
-  snprintf(hdr, sizeof(hdr), "temporary identities in '%s':", ns->name);
+  snprintf(hdr, sizeof(hdr), "temporary identities in "
+      CLR_BOLD "%s" CLR_RESET ":", ns->name);
   cmd_reply(ctx, hdr);
+  cmd_reply_table_head(ctx, "  " CLR_BOLD
+      "USERNAME             METADATA                                 "
+      "AGE        IDLE" CLR_RESET);
 
   userns_tmfa_iterate(ns, show_identity_cb, &st);
 
   if(st.count == 0)
-    cmd_reply(ctx, "  (none)");
+    cmd_reply(ctx, "  " SHOW_NONE);
 }
 
 // /show db
@@ -569,15 +673,16 @@ show_db_cb(uint16_t slot, db_conn_state_t state, uint64_t queries,
   show_iter_state_t *st = data;
   char line[256];
   const char *state_str;
+  const char *state_clr;
   char age[32];
   char idle[32];
 
   switch(state)
   {
-    case DB_CONN_IDLE:   state_str = "idle";   break;
-    case DB_CONN_ACTIVE: state_str = "active"; break;
-    case DB_CONN_FAIL:   state_str = "failed"; break;
-    default:             state_str = "?";      break;
+    case DB_CONN_IDLE:   state_str = "idle";   state_clr = CLR_CYAN;  break;
+    case DB_CONN_ACTIVE: state_str = "active"; state_clr = CLR_GREEN; break;
+    case DB_CONN_FAIL:   state_str = "failed"; state_clr = CLR_RED;   break;
+    default:             state_str = "?";      state_clr = CLR_GRAY;  break;
   }
 
   if(created > 0)
@@ -591,8 +696,8 @@ show_db_cb(uint16_t slot, db_conn_state_t state, uint64_t queries,
     snprintf(idle, sizeof(idle), "-");
 
   snprintf(line, sizeof(line),
-      "  %-3u %-6s queries=%-8lu age=%-10s idle=%s",
-      slot, state_str, (unsigned long)queries, age, idle);
+      "  %-4u %s%-6s" CLR_RESET " %-8lu %-10s %s",
+      slot, state_clr, state_str, (unsigned long)queries, age, idle);
   cmd_reply(st->ctx, line);
   st->count++;
 }
@@ -616,11 +721,13 @@ cmd_show_db(const cmd_ctx_t *ctx)
   {
     show_iter_state_t st = { .ctx = ctx, .count = 0 };
 
-    cmd_reply(ctx, "connections:");
+    show_section(ctx, "Connections");
+    cmd_reply_table_head(ctx,
+        "  " CLR_BOLD "SLOT STATE  QUERIES  AGE        IDLE" CLR_RESET);
     db_iterate_pool(show_db_cb, &st);
 
     if(st.count == 0)
-      cmd_reply(ctx, "  (none)");
+      cmd_reply(ctx, "  " SHOW_NONE);
   }
 }
 
@@ -666,8 +773,7 @@ pool_persist_cb(const task_iter_info_t *info, void *data)
   util_fmt_duration(time(NULL) - info->created, age, sizeof(age));
 
   snprintf(line, sizeof(line),
-      "    " CLR_PURPLE "%-22s" CLR_RESET
-      "  pri=%-3u  runs=%-6u  age=%s",
+      "    " CLR_PURPLE "%-22s" CLR_RESET " %-4u %-7u %s",
       info->name, info->priority, info->run_count, age);
   cmd_reply(st->ctx, line);
   st->count++;
@@ -705,10 +811,7 @@ cmd_show_pool(const cmd_ctx_t *ctx)
 
   // Header.
   cmd_reply(ctx, "");
-  cmd_reply(ctx, CLR_BOLD CLR_CYAN
-      "Thread Pool" CLR_RESET);
-  cmd_reply(ctx, CLR_GRAY
-      "  ─────────────────────────────────────────" CLR_RESET);
+  show_section_rule(ctx, "Thread Pool");
 
   fmt_util_bar(bar, sizeof(bar), active, max_threads);
 
@@ -760,9 +863,12 @@ cmd_show_pool(const cmd_ctx_t *ctx)
       CLR_PURPLE "%u" CLR_RESET " dedicated thread(s)", ps.persist);
   cmd_reply(ctx, line);
 
+  cmd_reply_table_head(ctx,
+      "    " CLR_BOLD "NAME                   PRI  RUNS    AGE" CLR_RESET);
   task_iterate(pool_persist_cb, &pst);
+
   if(pst.count == 0)
-    cmd_reply(ctx, "    " CLR_GRAY "(none)" CLR_RESET);
+    cmd_reply(ctx, "    " SHOW_NONE);
 
   // Task summary footer.
   cmd_reply(ctx, "");
@@ -803,18 +909,6 @@ static const char *
 err_color(uint64_t n)
 {
   return(n > 0 ? CLR_RED : CLR_GRAY);
-}
-
-// Section header line (bold cyan title + gray underline rule).
-static void
-status_section(const cmd_ctx_t *ctx, const char *title)
-{
-  char line[128];
-  snprintf(line, sizeof(line),
-      CLR_BOLD CLR_CYAN "%s" CLR_RESET, title);
-  cmd_reply(ctx, line);
-  cmd_reply(ctx, CLR_GRAY
-      "  ─────────────────────────────────────────" CLR_RESET);
 }
 
 static void
@@ -859,7 +953,7 @@ cmd_show_status(const cmd_ctx_t *ctx)
   cmd_reply(ctx, "");
 
   // ---- runtime ----
-  status_section(ctx, "Runtime");
+  show_section_rule(ctx, "Runtime");
 
   mem_get_stats(&ms);
   snprintf(buf, sizeof(buf),
@@ -902,7 +996,7 @@ cmd_show_status(const cmd_ctx_t *ctx)
   cmd_reply(ctx, "");
 
   // ---- network ----
-  status_section(ctx, "Network");
+  show_section_rule(ctx, "Network");
 
   sock_get_stats(&ss);
   snprintf(buf, sizeof(buf),
@@ -959,7 +1053,7 @@ cmd_show_status(const cmd_ctx_t *ctx)
   cmd_reply(ctx, "");
 
   // ---- application ----
-  status_section(ctx, "Application");
+  show_section_rule(ctx, "Application");
 
   bot_get_stats(&bs);
   snprintf(buf, sizeof(buf),
@@ -1001,7 +1095,7 @@ cmd_show_status(const cmd_ctx_t *ctx)
   cmd_reply(ctx, "");
 
   // ---- storage / plugins ----
-  status_section(ctx, "Storage");
+  show_section_rule(ctx, "Storage");
 
   db_get_pool_stats(&ds);
   snprintf(buf, sizeof(buf),

@@ -31,6 +31,8 @@
 #include "exchange_api.h"
 #include "alloc.h"
 #include "clam.h"
+#include "colors.h"
+#include "display.h"
 #include "common.h"
 #include "kv.h"
 #include "method.h"
@@ -96,7 +98,10 @@
 #define MW_KV_KEY_SZ              96
 
 // Output line widths.
-#define MW_LINE_SZ                256
+#define MW_LINE_SZ                320
+
+// The widest header the two tables below draw.
+#define MW_TABLE_COLS_MAX          80
 
 // Per-render top-N cutoffs.
 #define MW_TOPN                    10
@@ -1873,6 +1878,20 @@ mw_send(method_inst_t *inst, const char *target, const char *text)
   method_send(inst, target, text);
 }
 
+// A table's header and the rule beneath it, sized off the header the
+// way cmd_reply_table_head does for the command surfaces.
+static void
+mw_send_head(method_inst_t *inst, const char *target, const char *head)
+{
+  char rule[DISPLAY_RULE_SZ(MW_TABLE_COLS_MAX)];
+
+  mw_send(inst, target, head);
+
+  rule[0] = '\0';
+  display_rule(rule, sizeof(rule), (int)display_vis_len(head));
+  mw_send(inst, target, rule);
+}
+
 void
 mw_render_status(method_inst_t *inst, const char *target)
 {
@@ -1885,16 +1904,18 @@ mw_render_status(method_inst_t *inst, const char *target)
   now_ms = wm_dl_now_ms();
 
   snprintf(line, sizeof(line),
-      "marketwatch global=%s ring_n=%u",
+      CLR_BOLD CLR_CYAN "marketwatch" CLR_RESET " %s%s" CLR_RESET
+      " " CLR_GRAY "ring_n=%u" CLR_RESET,
+      mw_g.global_enabled ? CLR_GREEN : CLR_GRAY,
       mw_g.global_enabled ? "enabled" : "disabled",
       mw_g.ring_n);
   mw_send(inst, target, line);
 
   snprintf(line, sizeof(line),
-      "%-12s %-7s %-9s %-15s %6s %6s %6s",
-      "exchange", "enabled", "poll_sec", "last_poll",
-      "pairs", "polls", "drops");
-  mw_send(inst, target, line);
+      CLR_BOLD "%-12s %-7s %-9s %-15s %6s %6s %6s" CLR_RESET,
+      "EXCHANGE", "ON", "POLL_S", "LAST_POLL",
+      "PAIRS", "POLLS", "DROPS");
+  mw_send_head(inst, target, line);
 
   for(i = 0; i < mw_g.n_exch; i++)
   {
@@ -1915,8 +1936,10 @@ mw_render_status(method_inst_t *inst, const char *target)
     mw_fmt_age(age, sizeof(age), now_ms, last_poll_ms);
 
     snprintf(line, sizeof(line),
-        "%-12s %-7s %-9u %-15s %6u %6" PRIu64 " %6" PRIu64,
+        CLR_CYAN "%-12s" CLR_RESET " %s%-7s" CLR_RESET
+        " %-9u %-15s %6u %6" PRIu64 " %6" PRIu64,
         ex->name,
+        ex->enabled ? CLR_GREEN : CLR_GRAY,
         ex->enabled ? "yes" : "no",
         ex->poll_sec,
         age,
@@ -1927,7 +1950,8 @@ mw_render_status(method_inst_t *inst, const char *target)
   }
 
   if(mw_g.n_exch == 0)
-    mw_send(inst, target, "(no exchanges registered)");
+    mw_send(inst, target,
+        CLR_GRAY "(no exchanges registered)" CLR_RESET);
 
   pthread_mutex_unlock(&mw_g.mtx);
 }
@@ -2038,9 +2062,9 @@ mw_render_topn(method_inst_t *inst, const char *target,
   uint32_t i;
 
   snprintf(line, sizeof(line),
-      "  %-14s %-12s %8s %16s",
-      "product_id", "price", "pct_24h", "vol_24h_q");
-  mw_send(inst, target, line);
+      "  " CLR_BOLD "%-14s %-12s %8s %16s" CLR_RESET,
+      "PRODUCT_ID", "PRICE", "PCT_24H", "VOL_24H_Q");
+  mw_send_head(inst, target, line);
 
   for(i = 0; i < n; i++)
   {
@@ -2053,8 +2077,12 @@ mw_render_topn(method_inst_t *inst, const char *target,
     mw_fmt_dbl(vol_s,   sizeof(vol_s),   "%.2f", rows[i].vol_24h_quote);
 
     snprintf(line, sizeof(line),
-        "  %-14s %-12s %8s %16s",
-        rows[i].product_id, price_s, pct_s, vol_s);
+        "  " CLR_CYAN "%-14s" CLR_RESET " %-12s %s%8s" CLR_RESET " %16s",
+        rows[i].product_id, price_s,
+        isnan(rows[i].pct_24h) ? CLR_GRAY
+            : rows[i].pct_24h > 0.0 ? CLR_GREEN
+            : rows[i].pct_24h < 0.0 ? CLR_RED : CLR_RESET,
+        pct_s, vol_s);
     mw_send(inst, target, line);
   }
 }

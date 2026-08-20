@@ -75,12 +75,30 @@ sub_free(clam_user_sub_t *s)
 
 // Compose a chat-friendly single-line render of a clam message.
 // [DBG5 curl] create: https://...
+// Severity in four columns, indexed by level. Shared by both wire
+// renderers and by `show clam`, all of which want the same width.
+static const char *short_label[] = {
+  "FATL", "WARN", "INFO", " DBG", "DBG2", "DBG3", "DBG4", "DBG5"
+};
+
+// A severity's color, on the one scale the whole tree reads: red is
+// something broke, yellow is something might, cyan is routine, gray is
+// only interesting when you went looking for it.
+static const char *
+sev_color(uint8_t sev)
+{
+  switch(sev)
+  {
+    case CLAM_FATAL: return(CLR_RED);
+    case CLAM_WARN:  return(CLR_YELLOW);
+    case CLAM_INFO:  return(CLR_CYAN);
+    default:         return(CLR_GRAY);
+  }
+}
+
 static void
 render_chat(const clam_msg_t *m, char *out, size_t out_sz)
 {
-  static const char *short_label[] = {
-    "FATL", "WARN", "INFO", " DBG", "DBG2", "DBG3", "DBG4", "DBG5"
-  };
   uint8_t sev = m->sev;
   if(sev > CLAM_DEBUG5) sev = CLAM_DEBUG5;
 
@@ -93,9 +111,6 @@ render_chat(const clam_msg_t *m, char *out, size_t out_sz)
 static void
 render_file(const clam_msg_t *m, char *out, size_t out_sz)
 {
-  static const char *short_label[] = {
-    "FATL", "WARN", "INFO", " DBG", "DBG2", "DBG3", "DBG4", "DBG5"
-  };
   struct tm tm;
   time_t now;
   uint8_t sev;
@@ -763,11 +778,15 @@ cmd_show_clam(const cmd_ctx_t *ctx)
   {
     char hdr[SHOW_CLAM_LINE_SZ];
 
+    uint8_t sev = s->sev > CLAM_DEBUG5 ? CLAM_DEBUG5 : s->sev;
+
     snprintf(hdr, sizeof(hdr),
-        "  %-20s sev=%u regex=%s owner=%s",
-        s->name, s->sev,
-        s->has_regex ? s->regex_str : "*",
-        s->owner[0] != '\0' ? s->owner : "-");
+        "  " CLR_CYAN "%-20s" CLR_RESET " %s%-4s" CLR_RESET " %-16s %s",
+        s->name, sev_color(sev), short_label[sev],
+        s->owner[0] != '\0' ? s->owner
+                            : CLR_GRAY "\u2014" CLR_RESET,
+        s->has_regex ? s->regex_str
+                     : CLR_GRAY "(all)" CLR_RESET);
 
     show_clam_push(&lines, &n_lines, &cap, hdr);
 
@@ -777,7 +796,8 @@ cmd_show_clam(const cmd_ctx_t *ctx)
       char line[SHOW_CLAM_LINE_SZ];
 
       render_dest(&s->dests[d], dbuf, sizeof(dbuf));
-      snprintf(line, sizeof(line), "      -> %s", dbuf);
+      snprintf(line, sizeof(line),
+          "      " CLR_GRAY "\u2192" CLR_RESET " %s", dbuf);
 
       show_clam_push(&lines, &n_lines, &cap, line);
     }
@@ -789,9 +809,15 @@ cmd_show_clam(const cmd_ctx_t *ctx)
 
   if(n == 0)
   {
-    cmd_reply(ctx, "  (no user subscriptions)");
+    cmd_reply(ctx, "  " CLR_GRAY "(no user subscriptions)" CLR_RESET);
     return;
   }
+
+  // The header goes out here rather than into the line buffer above:
+  // it needs no lock, and cmd_reply under clam_cmd_mutex is the
+  // self-deadlock the comment at the top of this function describes.
+  cmd_reply_table_head(ctx, "  " CLR_BOLD
+      "NAME                 SEV  OWNER            REGEX" CLR_RESET);
 
   for(i = 0; i < n_lines; i++)
     cmd_reply(ctx, lines + i * SHOW_CLAM_LINE_SZ);

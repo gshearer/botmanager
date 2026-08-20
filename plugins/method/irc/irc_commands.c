@@ -5,6 +5,8 @@
 #define IRC_CMD_INTERNAL
 #include "irc.h"
 
+#include "colors.h"
+
 #include <string.h>
 
 // Server KV registration helper
@@ -700,13 +702,17 @@ irc_cmd_schema(const cmd_ctx_t *ctx)
   if(group_name == NULL || group_name[0] == '\0')
   {
     // List all schema groups.
-    cmd_reply(ctx, "IRC entity schemas:");
+    cmd_reply(ctx, CLR_BOLD CLR_CYAN "IRC entity schemas" CLR_RESET);
+    cmd_reply_table_head(ctx,
+        "  " CLR_BOLD "NAME           DESCRIPTION" CLR_RESET);
 
     for(uint32_t i = 0; i < IRC_KV_GROUPS_COUNT; i++)
     {
       char line[256];
 
-      snprintf(line, sizeof(line), "  %-12s — %s (managed by /irc %s)",
+      snprintf(line, sizeof(line),
+          "  " CLR_CYAN "%-12s" CLR_RESET " " CLR_GRAY "—" CLR_RESET
+          " %s " CLR_GRAY "(/irc %s)" CLR_RESET,
           irc_kv_groups[i].name,
           irc_kv_groups[i].description,
           irc_kv_groups[i].cmd_name);
@@ -745,15 +751,19 @@ irc_cmd_schema(const cmd_ctx_t *ctx)
   snprintf(hdr, sizeof(hdr), "  command: /irc %s", g->cmd_name);
   cmd_reply(ctx, hdr);
   cmd_reply(ctx, "  properties:");
+  cmd_reply_table_head(ctx,
+      "    " CLR_BOLD "PROPERTY         TYPE     DEFAULT" CLR_RESET);
 
   for(uint32_t i = 0; i < g->schema_count; i++)
   {
     const plugin_kv_entry_t *e = &g->schema[i];
     char line[256];
 
-    snprintf(line, sizeof(line), "    %-16s %-8s default: %s",
+    snprintf(line, sizeof(line),
+        "    " CLR_CYAN "%-16s" CLR_RESET " " CLR_GRAY "%-8s" CLR_RESET " %s",
         e->key, kv_type_name(e->type),
-        (e->default_val && e->default_val[0]) ? e->default_val : "(empty)");
+        (e->default_val && e->default_val[0]) ? e->default_val
+                                              : CLR_GRAY "(empty)" CLR_RESET);
     cmd_reply(ctx, line);
   }
 }

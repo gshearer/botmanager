@@ -328,6 +328,24 @@ bool cmd_dispatch_resolved(bot_inst_t *inst, const method_msg_t *msg,
 // reply_sink_id is diverted to that sink instead — see §Reply sinks.
 bool cmd_reply(const cmd_ctx_t *ctx, const char *text);
 
+// The widest header cmd_reply_table_head will draw a rule under. A
+// header past this keeps its rule — the rule simply stops at the
+// ceiling. No table in the tree comes near it.
+#define CMD_TABLE_COLS_MAX  160
+
+// Reply with a table's header row, and the rule that runs exactly as
+// far under it.
+//
+// Both the indent and the width are READ from `head` rather than passed
+// in, so a column that widens or a label that lengthens carries the rule
+// with it and the two can never fall out of step. Write `head` already
+// indented and already wearing its own emphasis — CLR_BOLD is the house
+// treatment — and the rule arrives in the gray display_rule draws.
+//
+// Two lines go out, so this must be called with no lock held that
+// cmd_reply's delivery path could re-enter.
+bool cmd_reply_table_head(const cmd_ctx_t *ctx, const char *head);
+
 // §Reply sinks — divert a dispatched command's cmd_reply() output to a
 // collector instead of the wire.
 //
@@ -457,6 +475,8 @@ void cmd_exit(void);
 
 #include "common.h"
 #include "clam.h"
+#include "colors.h"
+#include "display.h"
 #include "kv.h"
 #include "alloc.h"
 #include "pool.h"

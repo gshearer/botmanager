@@ -26,6 +26,7 @@
 #include "exchange.h"
 
 #include "cmd.h"
+#include "colors.h"
 #include "method.h"
 #include "userns.h"
 
@@ -39,7 +40,7 @@
 #include <time.h>
 
 #define EXCH_TICKERS_REPLY_CAP   50
-#define EXCH_TICKERS_LINE_SZ    256
+#define EXCH_TICKERS_LINE_SZ    320
 #define EXCH_TICKERS_WAIT_MS  60000
 
 // Heap-owned rendezvous between the dispatch task (waiter) and the
@@ -99,6 +100,35 @@ exch_tickers_status_name(exchange_ticker_status_t s)
     case EXCH_TICK_UNKNOWN:
     default:                   return("unknown");
   }
+}
+
+// A venue's own word for whether you can trade the pair right now.
+static const char *
+exch_tickers_status_color(exchange_ticker_status_t s)
+{
+  switch(s)
+  {
+    case EXCH_TICK_ONLINE:     return(CLR_GREEN);
+    case EXCH_TICK_OFFLINE:    return(CLR_RED);
+    case EXCH_TICK_LIMIT_ONLY:
+    case EXCH_TICK_POST_ONLY:  return(CLR_YELLOW);
+    case EXCH_TICK_UNKNOWN:
+    default:                   return(CLR_GRAY);
+  }
+}
+
+// Direction, on the colors a trader already reads a tape in. NaN — the
+// sentinel exch_tickers_fmt_double prints as "-" — is neither.
+static const char *
+exch_tickers_pct_color(double pct)
+{
+  if(isnan(pct))
+    return(CLR_GRAY);
+
+  if(pct > 0.0)
+    return(CLR_GREEN);
+
+  return(pct < 0.0 ? CLR_RED : CLR_RESET);
 }
 
 // Render a double sentinel-aware: NaN prints as "-".
@@ -182,19 +212,21 @@ exch_tickers_render(const cmd_ctx_t *ctx, const char *exch_name,
   size_t  shown;
 
   snprintf(line, sizeof(line),
-      "exchange=%s  ticker_count=%zu", exch_name, n);
+      CLR_BOLD CLR_CYAN "%s" CLR_RESET " " CLR_GRAY "—" CLR_RESET
+      " %zu ticker%s", exch_name, n, n == 1 ? "" : "s");
   cmd_reply(ctx, line);
 
   if(n == 0)
   {
-    cmd_reply(ctx, "  (no rows)");
+    cmd_reply(ctx, "  " CLR_GRAY "(no rows)" CLR_RESET);
     return;
   }
 
-  cmd_reply(ctx,
-      "product_id        price           pct_24h    vol_24h_b"
-      "         vol_24h_q          hi_24h      lo_24h      "
-      "vwap_24h    trades_24h  status");
+  cmd_reply_table_head(ctx, CLR_BOLD
+      "PRODUCT_ID        PRICE           PCT_24H    "
+      "VOL_24H_B          VOL_24H_Q          "
+      "HI_24H      LO_24H      VWAP_24H    "
+      "TRADES_24H  STATUS" CLR_RESET);
 
   shown = n < EXCH_TICKERS_REPLY_CAP ? n : EXCH_TICKERS_REPLY_CAP;
 
@@ -220,15 +252,20 @@ exch_tickers_render(const cmd_ctx_t *ctx, const char *exch_name,
     exch_tickers_fmt_uint64(trades, sizeof(trades), r->num_trades_24h);
 
     snprintf(line, sizeof(line),
-        "%-16s  %-14s  %-9s  %-18s %-18s %-11s %-11s %-11s %-10s  %s",
-        r->product_id, price, pct, volb, volq, hi, lo, vwap, trades,
+        CLR_CYAN "%-16s" CLR_RESET "  %-14s  %s%-9s" CLR_RESET
+        "  %-18s %-18s %-11s %-11s %-11s %-10s  %s%s" CLR_RESET,
+        r->product_id, price,
+        exch_tickers_pct_color(r->pct_24h), pct,
+        volb, volq, hi, lo, vwap, trades,
+        exch_tickers_status_color(r->status),
         exch_tickers_status_name(r->status));
     cmd_reply(ctx, line);
   }
 
   if(n > shown)
   {
-    snprintf(line, sizeof(line), "... %zu more", n - shown);
+    snprintf(line, sizeof(line),
+        CLR_GRAY "… %zu more" CLR_RESET, n - shown);
     cmd_reply(ctx, line);
   }
 }

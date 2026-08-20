@@ -812,7 +812,7 @@ task_show_cb(const task_iter_info_t *info, void *data)
 
   snprintf(line, sizeof(line),
       "  %-24s %s%-8s" CLR_RESET "  %s%-8s" CLR_RESET
-      "  %-6s  pri=%-3u  runs=%-6u  age=%-8s  %s",
+      "  %-6s  %-3u  %-6u  %-8s  %s",
       info->name,
       task_state_color(info->state), task_state_name(info->state),
       task_kind_color(info->kind),   task_kind_name(info->kind),
@@ -851,14 +851,17 @@ task_cmd_show(const cmd_ctx_t *ctx)
 
   if(ts.total == 0)
   {
-    cmd_reply(ctx, "  (none)");
+    cmd_reply(ctx, "  " CLR_GRAY "(none)" CLR_RESET);
     return;
   }
 
+  cmd_reply_table_head(ctx, "  " CLR_BOLD
+      "NAME                     STATE     KIND      TYPE    "
+      "PRI  RUNS    AGE       DETAIL" CLR_RESET);
   task_iterate(task_show_cb, &st);
 
   if(st.count == 0)
-    cmd_reply(ctx, "  (none)");
+    cmd_reply(ctx, "  " CLR_GRAY "(none)" CLR_RESET);
 }
 
 // Register the "show tasks" command with the command subsystem.

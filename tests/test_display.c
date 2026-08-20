@@ -152,6 +152,38 @@ cat_cases(void)
   test_check_str("cat", "an empty cell is a no-op", "", line);
 }
 
+// A rule is two color markers with glyphs between them, and the pair is
+// all-or-nothing: an opening gray with no closing reset would bleed its
+// color into every line printed after it, which is the one way this can
+// be wrong without looking wrong on the line that caused it.
+static const struct
+{
+  const char *name;
+  const char *seed;                              // what `line` holds first
+  size_t      cap;
+  int         cols;
+  const char *want;
+} rule_cases[] = {
+  { "draws the columns asked for", "", 32, 3,
+    CLR_GRAY "───" CLR_RESET },
+  { "appends past an indent",      "  ", 32, 2,
+    "  " CLR_GRAY "──" CLR_RESET },
+  // Zero columns is still a closed pair: a caller that measured its
+  // header as empty gets nothing visible, not a dangling marker.
+  { "zero columns",                "", 32, 0,
+    CLR_GRAY CLR_RESET },
+  // Room for the markers and one glyph, five asked for. The glyph loop
+  // reserves the reset on every pass, so it stops short rather than
+  // spending the last bytes on a glyph it cannot close.
+  { "capacity bounds the glyphs",  "", 8, 5,
+    CLR_GRAY "─" CLR_RESET },
+  // Not even the markers fit. Nothing is written at all — the seed
+  // survives, which is what distinguishes a refusal from a rule of
+  // width zero.
+  { "too small for the markers",   UNTOUCHED, 4, 3,
+    UNTOUCHED },
+};
+
 int
 main(void)
 {
@@ -182,6 +214,13 @@ main(void)
     display_fit(fit_cases[i].in, fit_cases[i].cols, buf, fit_cases[i].cap,
         fit_cases[i].mark);
     test_check_str("fit", fit_cases[i].name, fit_cases[i].want, buf);
+  }
+
+  for(size_t i = 0; i < sizeof(rule_cases) / sizeof(rule_cases[0]); i++)
+  {
+    strlcpy(buf, rule_cases[i].seed, sizeof(buf));
+    display_rule(buf, rule_cases[i].cap, rule_cases[i].cols);
+    test_check_str("rule", rule_cases[i].name, rule_cases[i].want, buf);
   }
 
   fit_truncated_sequence();

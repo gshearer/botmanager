@@ -3086,7 +3086,7 @@ plugin_cmd_show(const cmd_ctx_t *ctx)
   snprintf(line, sizeof(line),
       "  " CLR_BOLD "%-16s %-8s %-11s %-16s %-11s %8s" CLR_RESET,
       "NAME", "VERSION", "TYPE", "KIND", "STATE", "MEM");
-  cmd_reply(ctx, line);
+  cmd_reply_table_head(ctx, line);
 
   // Data rows.
   for(uint32_t i = 0; i < st.count; i++)

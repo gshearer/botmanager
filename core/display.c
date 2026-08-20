@@ -4,6 +4,8 @@
 #define DISPLAY_INTERNAL
 #include "display.h"
 
+#include "colors.h"
+
 #include <stdio.h>
 #include <string.h>
 
@@ -116,6 +118,31 @@ display_fit(const char *src, int cols, char *dst, size_t cap,
   // the caller's buffer was too small for the mark alone.
   if(*src != '\0' && mark != NULL && n + reserve <= cap)
     memcpy(dst + n, mark, reserve);
+}
+
+void
+display_rule(char *line, size_t cap, int cols)
+{
+  size_t n = strlen(line);
+  int    i;
+
+  // Both markers and the terminator have to fit before a single glyph
+  // is worth drawing. A rule wearing an opening gray and no closing
+  // reset would bleed its color into everything printed after it, so
+  // the two are all-or-nothing.
+  if(n + (sizeof(CLR_GRAY) - 1) + sizeof(CLR_RESET) > cap)
+    return;
+
+  memcpy(line + n, CLR_GRAY, sizeof(CLR_GRAY) - 1);
+  n += sizeof(CLR_GRAY) - 1;
+
+  for(i = 0; i < cols && n + 3 + sizeof(CLR_RESET) <= cap; i++)
+  {
+    memcpy(line + n, "\u2500", 3);
+    n += 3;
+  }
+
+  memcpy(line + n, CLR_RESET, sizeof(CLR_RESET));
 }
 
 void

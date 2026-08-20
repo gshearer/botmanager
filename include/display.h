@@ -91,6 +91,22 @@ void display_align_left (char *buf, size_t cap, int width);
 void display_fit(const char *src, int cols, char *dst, size_t cap,
     const char *mark);
 
+// Append a horizontal rule of `cols` columns to `line`, in the gray
+// every table in this tree draws its header rule in.
+//
+// The color lives here rather than at the call site because a rule has
+// exactly one job and every one of them should look identical; a table
+// that wants a different treatment is not asking for a rule. Like
+// display_cat, this finds the end of `line` by scanning for the NUL, so
+// a caller wanting an indent writes it into the buffer first.
+//
+// A rule is drawn as far as `cap` allows and no further.
+void display_rule(char *line, size_t cap, int cols);
+
+// Bytes a rule of `cols` columns occupies: three to the glyph, plus its
+// two color markers, a short indent and the NUL.
+#define DISPLAY_RULE_SZ(cols)  ((size_t)(cols) * 3 + 16)
+
 // Append a finished cell to a line, stopping cleanly at capacity.
 //
 // `line` must already be a string — a renderer that starts an empty one

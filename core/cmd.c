@@ -1820,7 +1820,33 @@ cmd_reply(const cmd_ctx_t *ctx, const char *text)
   return(rc);
 }
 
+bool
+cmd_reply_table_head(const cmd_ctx_t *ctx, const char *head)
+{
+  char   rule[DISPLAY_RULE_SZ(CMD_TABLE_COLS_MAX)];
+  size_t indent = strspn(head, " ");
+  bool   ok;
+
+  ok = cmd_reply(ctx, head);
+
+  // The rule inherits the header's own margin, then runs the width the
+  // header occupies — markers excluded, since they take no columns.
+  snprintf(rule, sizeof(rule), "%.*s", (int)indent, head);
+  display_rule(rule, sizeof(rule), (int)(display_vis_len(head) - indent));
+
+  return(cmd_reply(ctx, rule) && ok);
+}
+
 // Built-in commands
+
+// Both /help listings — the root one and a command's children — draw
+// this grid, so they are written once here rather than twice below.
+// An absent abbreviation is a gray dash: the column is a fact about
+// the command, and leaving it blank reads as a rendering slip.
+#define CMD_HELP_HEAD \
+    "  " CLR_BOLD "COMMAND              ABBREV       DESCRIPTION" CLR_RESET
+#define CMD_HELP_ROW \
+    "  " CLR_CYAN "%-20s" CLR_RESET " " CLR_GRAY "%-12s" CLR_RESET " %s"
 
 // Permission check: can the caller see this command in help listings?
 static bool
@@ -1859,15 +1885,15 @@ help_show_children(const cmd_ctx_t *ctx, const cmd_def_t *d)
 
     if(!header_sent)
     {
-      snprintf(line, sizeof(line), "  %-20s %-12s %s",
-          "COMMAND", "ABBREV", "DESCRIPTION");
+      // Two lines go out, and cmd_reply's delivery path re-enters this
+      // mutex — the same reason every other reply here brackets it.
       pthread_mutex_unlock(&cmd_mutex);
-      cmd_reply(ctx, line);
+      cmd_reply_table_head(ctx, CMD_HELP_HEAD);
       pthread_mutex_lock(&cmd_mutex);
       header_sent = true;
     }
 
-    snprintf(line, sizeof(line), "  %-20s %-12s %s", cname, cabbrev, cdesc);
+    snprintf(line, sizeof(line), CMD_HELP_ROW, cname, cabbrev, cdesc);
     pthread_mutex_unlock(&cmd_mutex);
     cmd_reply(ctx, line);
     pthread_mutex_lock(&cmd_mutex);
@@ -1975,15 +2001,11 @@ cmd_builtin_help(const cmd_ctx_t *ctx)
   // No arguments: list all root commands.
   if(ctx->args == NULL || ctx->args[0] == '\0')
   {
-    char hdr[256];
-    char count_line[32];
+    char count_line[64];
     uint32_t count = 0;
 
-    cmd_reply(ctx, "Available commands:");
-
-    snprintf(hdr, sizeof(hdr), "  %-20s %-12s %s",
-        "COMMAND", "ABBREV", "DESCRIPTION");
-    cmd_reply(ctx, hdr);
+    cmd_reply(ctx, CLR_BOLD CLR_CYAN "Available commands" CLR_RESET);
+    cmd_reply_table_head(ctx, CMD_HELP_HEAD);
 
     pthread_mutex_lock(&cmd_mutex);
     for(cmd_def_t *d = cmd_list; d != NULL; d = d->next)
@@ -2001,7 +2023,7 @@ cmd_builtin_help(const cmd_ctx_t *ctx)
       name = d->name;
       abbrev = (d->abbrev[0] != '\0') ? d->abbrev : "-";
       desc = d->description ? d->description : "";
-      snprintf(line, sizeof(line), "  %-20s %-12s %s", name, abbrev, desc);
+      snprintf(line, sizeof(line), CMD_HELP_ROW, name, abbrev, desc);
 
       pthread_mutex_unlock(&cmd_mutex);
       cmd_reply(ctx, line);
@@ -2010,9 +2032,11 @@ cmd_builtin_help(const cmd_ctx_t *ctx)
     }
     pthread_mutex_unlock(&cmd_mutex);
 
-    snprintf(count_line, sizeof(count_line), "%u command(s)", count);
+    snprintf(count_line, sizeof(count_line),
+        CLR_GRAY "%u command%s" CLR_RESET, count, count == 1 ? "" : "s");
     cmd_reply(ctx, count_line);
-    cmd_reply(ctx, "Use help <command> for detailed information.");
+    cmd_reply(ctx, CLR_GRAY "Use " CLR_RESET "help <command>"
+        CLR_GRAY " for detailed information." CLR_RESET);
     return;
   }
 
