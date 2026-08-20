@@ -951,9 +951,14 @@ void atk_render_trout(char *out, size_t cap, const char *src_nick,
 // `noun` the sheet that inflicted it chose (empty falls back to the
 // engine's plain word for that kind), and the class `move` supplying the
 // sentence (NULL falls back to the engine's neutral line).
+// `bonus_pct` renders the deferral badge on the inflict line; 0 draws
+// none. The badge is the whole of what a deferred combatant gets to see
+// on an affliction turn — the bonus has already scaled the roll the
+// wound will pay out, and naming the roll here would tell the victim how
+// long they have.
 void atk_render_dot_inflict(char *out, size_t cap, const char *src_nick,
     const char *tgt_nick, atk_dot_kind_t kind, const char *noun,
-    const atk_move_t *move);
+    const atk_move_t *move, uint32_t bonus_pct);
 
 void atk_render_dot_tick(char *out, size_t cap, const char *src_nick,
     const char *tgt_nick, int32_t dmg, int32_t hp, int32_t hp_max,

@@ -637,7 +637,7 @@ atk_cmd_attack(const cmd_ctx_t *ctx)
     if(landed)
     {
       atk_render_dot_inflict(line, sizeof(line), src_nick, nick,
-          wound.kind, wound.noun, spoken ? &move : NULL);
+          wound.kind, wound.noun, spoken ? &move : NULL, bonus);
       cmd_reply(ctx, line);
     }
 

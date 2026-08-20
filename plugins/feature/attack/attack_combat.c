@@ -448,12 +448,13 @@ atk_render_death(char *out, size_t cap, const char *slayer_nick,
 void
 atk_render_dot_inflict(char *out, size_t cap, const char *src_nick,
     const char *tgt_nick, atk_dot_kind_t kind, const char *noun,
-    const atk_move_t *move)
+    const atk_move_t *move, uint32_t bonus_pct)
 {
-  char src [ATK_NICK_SZ + 8];
-  char tgt [ATK_NICK_SZ + 8];
-  char aff [ATK_NOUN_SZ + 16];
-  char body[ATK_LINE_SZ];
+  char src  [ATK_NICK_SZ + 8];
+  char tgt  [ATK_NICK_SZ + 8];
+  char aff  [ATK_NOUN_SZ + 16];
+  char badge[32] = "";
+  char body [ATK_LINE_SZ];
 
   if(out == NULL || cap == 0)
     return;
@@ -471,9 +472,18 @@ atk_render_dot_inflict(char *out, size_t cap, const char *src_nick,
   atk_body(body, sizeof(body), move, atk_fallback_dot_inflict(kind),
       src, tgt, NULL, NULL, aff);
 
+  // A bonused affliction says why it is heavy, exactly as a bonused blow
+  // does. Without it a deferral that happened to land a wound looks like
+  // a turn spent for nothing: the badge is the only place the spent
+  // bonus surfaces on this path, since the line names no number and the
+  // damage arrives later, one tick at a time.
+  if(bonus_pct > 0)
+    snprintf(badge, sizeof(badge),
+        " " CLR_BOLD CLR_YELLOW "⚡+%" PRIu32 "%%" CLR_RESET, bonus_pct);
+
   // The glyph that will mark the victim on the round card leads the
   // line, so the two read as the same thing.
-  snprintf(out, cap, "%s %s", atk_dot_emoji_of(kind), body);
+  snprintf(out, cap, "%s %s%s", atk_dot_emoji_of(kind), body, badge);
 }
 
 // A tick is dressed like a blow — glyph, colour, and the survivor's
