@@ -122,8 +122,11 @@ void sock_exit(void);
 // state is cast from sock_state_t.
 const char *sock_state_name(int state);
 
-// Invoked once per active session while the session list lock is
-// held — must be fast.
+// Invoked once per active session, with the session list lock RELEASED
+// — the values arrive off a snapshot taken under it, so the callback is
+// free to reply, log or take any socket lock it needs. It was the other
+// way round until 2026-08-20, and `show sockets` self-deadlocked the
+// whole socket layer on its first row.
 typedef void (*sock_iter_cb_t)(uint32_t id, sock_type_t type, int state,
     const char *remote, uint64_t bytes_in, uint64_t bytes_out,
     bool tls, time_t connected_at, void *data);
@@ -307,6 +310,37 @@ typedef struct
   _Atomic uint32_t epoll_timeout;
   _Atomic uint32_t epoll_workers;
 } sock_cfg_t;
+
+// Per-session snapshot row for sock_iterate(). Lets the iteration invoke
+// its callback with sock_mutex released, which is not a nicety: a
+// callback that replies goes cmd_reply -> method_send -> irc_send_raw ->
+// irc_session_ref -> sock_hold, and sock_hold re-locks sock_mutex on the
+// same thread. sock_mutex is not recursive, so a callback run under the
+// lock is a hard self-deadlock — and it deadlocks holding the lock the
+// epoll worker needs, which takes the entire socket layer with it.
+// Measured 2026-08-20: one `show sockets` typed into #cabal wedged on
+// its first row, IRC went silent, every bot pinged out, and recovery
+// needed SIGKILL because shutdown joins the deadlocked thread.
+//
+// Same shape as method_iterate_instances(), which carries the same
+// comment about method_mutex. The difference is the sizing: that one
+// caps at a fixed 64 and drops the excess silently, which is defensible
+// only because method instances are inherently few. Sessions are not —
+// they are bounded instead by core.sock.max_sessions, which admission
+// enforces, so sock_count is an exact and trustworthy size. A `show
+// sockets` that quietly omits sessions is a wrong answer rather than a
+// short one.
+typedef struct
+{
+  char        remote[SOCK_HOST_SZ + 16];
+  uint64_t    bytes_in;
+  uint64_t    bytes_out;
+  time_t      connected_at;
+  uint32_t    id;
+  sock_type_t type;
+  int         state;
+  bool        tls;
+} sock_snap_t;
 
 static sock_session_t  *sock_list         = NULL;
 static pthread_mutex_t  sock_mutex;

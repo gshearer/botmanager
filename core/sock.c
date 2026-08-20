@@ -1625,37 +1625,70 @@ sock_state_name(int state)
   }
 }
 
-// Iterate all active socket sessions under the session list lock.
-// Each session's id, type, state, remote address, byte counters,
-// TLS flag, and connection timestamp are passed to the callback.
-// cb: iteration callback (must be fast — lock is held)
+// Iterate all active socket sessions. Each session's id, type, state,
+// remote address, byte counters, TLS flag and connection timestamp are
+// passed to the callback.
+//
+// The callback runs with sock_mutex RELEASED, off a snapshot taken under
+// it — a callback that replies re-enters sock_hold and would self-
+// deadlock otherwise. sock_snap_t in sock.h carries the full reasoning
+// and the incident it came from; a caller that emits is the normal case
+// here, not the exception.
 void
 sock_iterate(sock_iter_cb_t cb, void *data)
 {
-  uint32_t id = 0;
+  sock_snap_t *snap;
+  uint32_t     count = 0;
+  uint32_t     i;
 
   if(cb == NULL)
     return;
 
   pthread_mutex_lock(&sock_mutex);
 
-  for(sock_session_t *s = sock_list; s != NULL; s = s->next)
+  // mem_alloc aborts on a zero size, and an empty list has nothing to
+  // report anyway.
+  if(sock_count == 0)
   {
-    char remote[SOCK_HOST_SZ + 16];
+    pthread_mutex_unlock(&sock_mutex);
+    return;
+  }
+
+  snap = mem_alloc("sock", "iter_snap", sizeof(*snap) * sock_count);
+
+  // The bound is the allocation, not the list: sock_count and sock_list
+  // are written under this lock together, but the loop must not be the
+  // thing that trusts them to agree.
+  for(sock_session_t *s = sock_list; s != NULL && count < sock_count;
+      s = s->next)
+  {
+    sock_snap_t *r = &snap[count];
 
     if(s->type == SOCK_UNIX)
-      snprintf(remote, sizeof(remote), "%s", s->path);
+      strlcpy(r->remote, s->path, sizeof(r->remote));
     else if(s->host[0] != '\0')
-      snprintf(remote, sizeof(remote), "%s:%u", s->host, s->port);
+      snprintf(r->remote, sizeof(r->remote), "%s:%u", s->host, s->port);
     else
-      remote[0] = '\0';
+      r->remote[0] = '\0';
 
-    cb(id++, s->type, (int)s->state, remote,
-        s->bytes_in, s->bytes_out, s->tls_enabled,
-        s->connected_at, data);
+    r->id           = count;
+    r->type         = s->type;
+    r->state        = (int)s->state;
+    r->bytes_in     = s->bytes_in;
+    r->bytes_out    = s->bytes_out;
+    r->tls          = s->tls_enabled;
+    r->connected_at = s->connected_at;
+    count++;
   }
 
   pthread_mutex_unlock(&sock_mutex);
+
+  for(i = 0; i < count; i++)
+    cb(snap[i].id, snap[i].type, snap[i].state, snap[i].remote,
+        snap[i].bytes_in, snap[i].bytes_out, snap[i].tls,
+        snap[i].connected_at, data);
+
+  mem_free(snap);
 }
 
 // Subsystem lifecycle
