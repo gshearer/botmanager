@@ -1,9 +1,9 @@
 // botmanager — MIT
 // featreq write surface: `feature` files a request, `bug` files the
-// commonest kind of one, `feature status` moves a row along. Filing
-// needs a registered user (group `user`) because a request is
-// attributed; moving one needs the owner, because the board is theirs
-// to work through.
+// commonest kind of one, `feature status` moves a row along and
+// `feature note` writes the answer onto it. Filing needs a registered
+// user (group `user`) because a request is attributed; the other two
+// need the owner, because the board is theirs to work through.
 
 #define FEATREQ_INTERNAL
 #include "featreq.h"
@@ -22,19 +22,25 @@
 // The trust boundary                                                  //
 // ------------------------------------------------------------------ //
 
-// A description arrives as whatever the method handed us, and leaves
-// here as text safe to store and to echo back into a channel: no C0
-// controls (a stray \x01 would otherwise come back out of the DB as a
-// colour marker of the user's choosing), no tabs, no trailing space.
+// A description, or the note answering one, arrives as whatever the
+// method handed us and leaves here as text safe to store and to echo
+// back into a channel: no C0 controls (a stray \x01 would otherwise
+// come back out of the DB as a colour marker of the user's choosing),
+// no tabs, and no space at either end — the note surface hands us the
+// gap that followed the id, and a description that starts one column
+// in on the card is the tell.
 //
 // Dropping bytes below 0x20 cannot damage a UTF-8 sequence — every
 // continuation byte is >= 0x80 — so multi-byte text passes through
-// whole. Returns the length in display columns, which is what the cap
-// is expressed in.
+// whole. Returns the length in display columns, which is what both
+// caps are expressed in.
 static size_t
-fr_desc_clean(const char *in, char *out, size_t cap)
+fr_text_clean(const char *in, char *out, size_t cap)
 {
   size_t n = 0;
+
+  while(*in == ' ' || *in == '\t')
+    in++;
 
   for(; *in != '\0' && n + 1 < cap; in++)
   {
@@ -52,6 +58,34 @@ fr_desc_clean(const char *in, char *out, size_t cap)
 
   out[n] = '\0';
   return(display_vis_len(out));
+}
+
+// Both caps are measured in display columns and refused in the same
+// sentence, so the knob a reader would go and change is named by the
+// command's help rather than repeated here in two dialects.
+static void
+fr_cap_reply(const cmd_ctx_t *ctx, size_t cols, size_t max)
+{
+  char line[FR_LINE_SZ];
+
+  snprintf(line, sizeof(line),
+      "That's " CLR_YELLOW "%zu" CLR_RESET " characters and the limit "
+      "is " CLR_CYAN "%zu" CLR_RESET ". Trim it and I'll take it.",
+      cols, max);
+  cmd_reply(ctx, line);
+}
+
+// Both owner verbs address a request by id, and both have to say the
+// same thing about one that is not there.
+static void
+fr_no_such(const cmd_ctx_t *ctx, int64_t id)
+{
+  char line[FR_LINE_SZ];
+
+  snprintf(line, sizeof(line),
+      "Nothing on the board carries id " CLR_YELLOW "%" PRId64 CLR_RESET
+      ".", id);
+  cmd_reply(ctx, line);
 }
 
 // ------------------------------------------------------------------ //
@@ -159,7 +193,7 @@ fr_file(const cmd_ctx_t *ctx, fr_type_t type)
     return;
   }
 
-  cols = fr_desc_clean(p, desc, sizeof(desc));
+  cols = fr_text_clean(p, desc, sizeof(desc));
   max  = (size_t)kv_get_uint(FR_KV_MAX_DESC);
 
   if(cols == 0)
@@ -170,11 +204,7 @@ fr_file(const cmd_ctx_t *ctx, fr_type_t type)
 
   if(cols > max)
   {
-    snprintf(line, sizeof(line),
-        "That's " CLR_YELLOW "%zu" CLR_RESET " characters and the limit "
-        "is " CLR_CYAN "%zu" CLR_RESET ". Trim it and I'll take it.",
-        cols, max);
-    cmd_reply(ctx, line);
+    fr_cap_reply(ctx, cols, max);
     return;
   }
 
@@ -254,10 +284,7 @@ fr_cmd_status(const cmd_ctx_t *ctx)
 
   if(rc == FR_UPD_NO_ROW)
   {
-    snprintf(line, sizeof(line),
-        "Nothing on the board carries id " CLR_YELLOW "%" PRId64 CLR_RESET
-        ".", id);
-    cmd_reply(ctx, line);
+    fr_no_such(ctx, id);
     return;
   }
 
@@ -270,6 +297,93 @@ fr_cmd_status(const cmd_ctx_t *ctx)
   snprintf(line, sizeof(line),
       CLR_BOLD "#%" PRId64 CLR_RESET " is now %s%s" CLR_RESET ".",
       id, fr_status_color(status), fr_status_word(status));
+  cmd_reply(ctx, line);
+}
+
+// ------------------------------------------------------------------ //
+// feature note                                                        //
+// ------------------------------------------------------------------ //
+
+// No vocabulary in it, so a literal like `bug`'s. --clear is spelled
+// the way `set kv` spells it, for the same job.
+#define FR_NOTE_USAGE  "feature note <id> <text|--clear>"
+
+// The note is scanned out of ctx->args by hand for the reason the
+// description is (see the arg table below): declared as a REST argument
+// the framework would cut it to CMD_ARG_SZ long before the column cap
+// could measure it. Subcommand resolution has already eaten the word
+// `note`, so the id is the first token on this line.
+static void
+fr_cmd_note(const cmd_ctx_t *ctx)
+{
+  const char *p = (ctx->args != NULL) ? ctx->args : "";
+  char        tok[24];
+  char        note[FR_NOTE_SZ];
+  char        line[FR_LINE_SZ];
+  size_t      cols;
+  size_t      max;
+  int64_t     id;
+  fr_upd_t    rc;
+
+  p = fr_token(fr_skip_ws(p), tok, sizeof(tok));
+
+  if(!fr_all_digits(tok))
+  {
+    snprintf(line, sizeof(line), "usage: %s", FR_NOTE_USAGE);
+    cmd_reply(ctx, line);
+    return;
+  }
+
+  id   = (int64_t)strtoll(tok, NULL, 10);
+  cols = fr_text_clean(p, note, sizeof(note));
+  max  = (size_t)kv_get_uint(FR_KV_MAX_NOTE);
+
+  // --clear has to be the WHOLE of the note or it is prose: a note may
+  // perfectly well be about a flag, and quietly dropping the words
+  // after one would be a worse answer than writing them down.
+  if(strcasecmp(note, "--clear") == 0)
+  {
+    note[0] = '\0';
+    cols    = 0;
+  }
+
+  else if(cols == 0)
+  {
+    snprintf(line, sizeof(line), "usage: %s", FR_NOTE_USAGE);
+    cmd_reply(ctx, line);
+    return;
+  }
+
+  else if(cols > max)
+  {
+    fr_cap_reply(ctx, cols, max);
+    return;
+  }
+
+  rc = fr_db_set_note(id, note);
+
+  if(rc == FR_UPD_NO_ROW)
+  {
+    fr_no_such(ctx, id);
+    return;
+  }
+
+  if(rc != FR_UPD_OK)
+  {
+    cmd_reply(ctx, "I couldn't reach the board. :~(");
+    return;
+  }
+
+  if(note[0] == '\0')
+    snprintf(line, sizeof(line),
+        CLR_BOLD "#%" PRId64 CLR_RESET "'s note is gone.", id);
+
+  else
+    snprintf(line, sizeof(line),
+        CLR_GREEN "Noted" CLR_RESET " on " CLR_BOLD "#%" PRId64 CLR_RESET
+        " — " CLR_GRAY "show feature %" PRId64 CLR_RESET
+        " reads it back.", id, id);
+
   cmd_reply(ctx, line);
 }
 
@@ -324,9 +438,9 @@ fr_commands_register(void)
         "shorter. The description is capped at "
         "plugin.featreq.max_desc_cols characters. Read the board back "
         "with `show feature`, and one request in full with `show "
-        "feature <id>`. Note that a description beginning with the word "
-        "`status` is read as the owner's `feature status` subcommand — "
-        "start it with anything else.",
+        "feature <id>`. Note that a description beginning with `status` "
+        "or `note` is read as one of the owner's subcommands — start it "
+        "with anything else.",
         USERNS_GROUP_USER, 0, CMD_SCOPE_ANY, METHOD_T_ANY,
         fr_cmd_feature, NULL, NULL, "feat",
         NULL, 0, NULL, NULL) != SUCCESS)
@@ -356,13 +470,33 @@ fr_commands_register(void)
         "Move a request along the board (owner).",
         "Sets the request's status and stamps the moment it changed. "
         "Accepts `new`, `in-prog`, `completed` and `canceled` (also "
-        "`done` and `cancelled`). Nothing else on the board changes — a "
-        "request is never edited or deleted, only moved.",
+        "`done` and `cancelled`). The request itself is never edited or "
+        "deleted, only moved; `feature note` is where an answer to one "
+        "goes.",
         USERNS_GROUP_OWNER, 65535, CMD_SCOPE_ANY, METHOD_T_ANY,
         fr_cmd_status, NULL, "feature", NULL,
         fr_status_args,
         (uint8_t)(sizeof(fr_status_args) / sizeof(fr_status_args[0])),
         NULL, NULL) != SUCCESS)
+    return(FAIL);
+
+  // No arg spec, so ctx->args reaches the handler whole — see
+  // fr_cmd_note. That costs the framework's usage reply on a missing
+  // argument, which the handler answers with FR_NOTE_USAGE itself.
+  if(cmd_register("featreq", "note",
+        FR_NOTE_USAGE,
+        "Write the answer onto a request (owner).",
+        "Attaches a note to the request and stamps when it was written. "
+        "This is where an investigation's answer lives once the row is "
+        "closed — `show feature <id>` prints it under the description, "
+        "so it outlasts the channel it was worked out in. The board "
+        "itself does not show notes; the card does. A second note "
+        "replaces the first and `--clear` removes it, which is the only "
+        "way anything on a request is ever unwritten. The note is "
+        "capped at plugin.featreq.max_note_cols characters.",
+        USERNS_GROUP_OWNER, 65535, CMD_SCOPE_ANY, METHOD_T_ANY,
+        fr_cmd_note, NULL, "feature", NULL,
+        NULL, 0, NULL, NULL) != SUCCESS)
     return(FAIL);
 
   return(SUCCESS);

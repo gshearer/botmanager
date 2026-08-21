@@ -339,3 +339,17 @@ fr_token(const char *p, char *out, size_t cap)
   out[n] = '\0';
   return(p);
 }
+
+// A token that is a bare run of digits, and not empty — how both
+// surfaces recognise an id among the flags around it.
+bool
+fr_all_digits(const char *s)
+{
+  size_t i;
+
+  for(i = 0; s[i] != '\0'; i++)
+    if(s[i] < '0' || s[i] > '9')
+      return(false);
+
+  return(i > 0);
+}

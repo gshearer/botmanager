@@ -148,6 +148,29 @@ fr_age_text(char *out, size_t cap, time_t then, time_t now)
   util_fmt_duration((now > then) ? now - then : 0, out, cap);
 }
 
+// "2026-08-20 22:40  (10h55m ago)", the form both dated lines of the
+// card carry. Local time, because the operator reading the board is
+// the one who has to remember when they were sitting here; an absent
+// stamp is an em dash and no age at all.
+static void
+fr_stamp_text(char *out, size_t cap, time_t when, time_t now)
+{
+  struct tm tm;
+  char      date[64];
+  char      age [32];
+
+  if(when <= 0 || localtime_r(&when, &tm) == NULL)
+  {
+    strlcpy(out, "—", cap);
+    return;
+  }
+
+  strftime(date, sizeof(date), "%Y-%m-%d %H:%M", &tm);
+  util_fmt_duration((now > when) ? now - when : 0, age, sizeof(age));
+
+  snprintf(out, cap, "%s" CLR_GRAY "  (%s ago)" CLR_RESET, date, age);
+}
+
 // A colorized cell holding at most `width` columns of `text`.
 //
 // display_fit appends its mark OUTSIDE the column budget, so a cell
@@ -454,9 +477,10 @@ fr_table(const cmd_ctx_t *ctx, const fr_filter_t *f)
 
 // Emit `text` as indented lines of at most `cols` display columns,
 // broken on a space where there is one and mid-word only when a single
-// word is wider than the column itself.
+// word is wider than the column itself. `color` is what separates the
+// request from the answer to it — the card folds both.
 static void
-fr_wrap(const cmd_ctx_t *ctx, const char *text, int cols)
+fr_wrap(const cmd_ctx_t *ctx, const char *text, int cols, const char *color)
 {
   char line[FR_LINE_SZ];
 
@@ -483,8 +507,8 @@ fr_wrap(const cmd_ctx_t *ctx, const char *text, int cols)
     if(*p != '\0' && brk != NULL && brk > text)
       p = brk;
 
-    snprintf(line, sizeof(line), "  " CLR_WHITE "%.*s" CLR_RESET,
-        (int)(p - text), text);
+    snprintf(line, sizeof(line), "  %s%.*s" CLR_RESET,
+        color, (int)(p - text), text);
     cmd_reply(ctx, line);
 
     text = p;
@@ -502,8 +526,9 @@ fr_card(const cmd_ctx_t *ctx, const db_result_t *res)
   time_t      created = (time_t)db_result_get_i64(res, 0, FR_COL_CREATED, 0);
   time_t      changed = (time_t)db_result_get_i64(res, 0, FR_COL_CHANGED, 0);
   time_t      now     = time(NULL);
+  time_t      noted   = (time_t)db_result_get_i64(res, 0, FR_COL_NOTED, 0);
   const char *desc    = db_result_get(res, 0, FR_COL_DESC);
-  struct tm   tm;
+  const char *note    = db_result_get(res, 0, FR_COL_NOTE);
   char        word[FR_WORD_SZ];
   char        nick[FR_NAME_SZ];
   char        user[FR_NAME_SZ];
@@ -512,8 +537,8 @@ fr_card(const cmd_ctx_t *ctx, const db_result_t *res)
   char        via [FR_NAME_SZ * 3 + 64];
   char        who [FR_NAME_SZ * 4];
   char        tail[FR_NAME_SZ * 4];
-  char        when[64];
-  char        age [32];
+  char        stamp[96];
+  char        age  [32];
   char        line[FR_LINE_SZ];
   char        rule[FR_LINE_SZ];
 
@@ -575,19 +600,10 @@ fr_card(const cmd_ctx_t *ctx, const db_result_t *res)
       FR_W_CARD_LABEL, "from", who, tail);
   cmd_reply(ctx, line);
 
-  // Local time, because the operator reading the board is the one who
-  // has to remember when they were sitting here.
-  if(created > 0 && localtime_r(&created, &tm) != NULL)
-    strftime(when, sizeof(when), "%Y-%m-%d %H:%M", &tm);
+  fr_stamp_text(stamp, sizeof(stamp), created, now);
 
-  else
-    strlcpy(when, "—", sizeof(when));
-
-  util_fmt_duration((now > created) ? now - created : 0, age, sizeof(age));
-
-  snprintf(line, sizeof(line),
-      CLR_GRAY "  %-*s" CLR_RESET " %s" CLR_GRAY "  (%s ago)" CLR_RESET,
-      FR_W_CARD_LABEL, "filed", when, age);
+  snprintf(line, sizeof(line), CLR_GRAY "  %-*s" CLR_RESET " %s",
+      FR_W_CARD_LABEL, "filed", stamp);
   cmd_reply(ctx, line);
 
   util_fmt_duration((now > changed) ? now - changed : 0, age, sizeof(age));
@@ -601,7 +617,28 @@ fr_card(const cmd_ctx_t *ctx, const db_result_t *res)
 
   cmd_reply(ctx, " ");
 
-  fr_wrap(ctx, (desc != NULL) ? desc : "", FR_W_WRAP);
+  fr_wrap(ctx, (desc != NULL) ? desc : "", FR_W_WRAP, CLR_WHITE);
+
+  // The answer, where one has been written. A request that has none
+  // ends at its description exactly as it always did: an empty `note`
+  // line would say only that nobody has been here yet, which is what
+  // its absence already says.
+  //
+  // This is the whole of what the card gained — the table has no room
+  // for a note and no need of one, since recognising a request is its
+  // job and reading the answer is the card's.
+  if(note != NULL && note[0] != '\0')
+  {
+    cmd_reply(ctx, " ");
+
+    fr_stamp_text(stamp, sizeof(stamp), noted, now);
+
+    snprintf(line, sizeof(line), CLR_GRAY "  %-*s" CLR_RESET " %s",
+        FR_W_CARD_LABEL, "note", stamp);
+    cmd_reply(ctx, line);
+
+    fr_wrap(ctx, note, FR_W_WRAP, CLR_CYAN);
+  }
 
   cmd_reply(ctx, rule);
 }
@@ -632,18 +669,6 @@ fr_show_one(const cmd_ctx_t *ctx, int64_t id)
 // ------------------------------------------------------------------ //
 // show feature                                                        //
 // ------------------------------------------------------------------ //
-
-static bool
-fr_all_digits(const char *s)
-{
-  size_t i;
-
-  for(i = 0; s[i] != '\0'; i++)
-    if(s[i] < '0' || s[i] > '9')
-      return(false);
-
-  return(i > 0);
-}
 
 // Parse `[id] [--type X] [--status Y] [--sort Z]` in any order. `id`
 // stays -1 when no bare number was given, which is what selects the

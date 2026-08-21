@@ -3,8 +3,9 @@
 
 // featreq: a suggestion box. `feature [--type <bug|change>] <description>`
 // files a request, `bug <description>` files the commonest kind of one,
-// `show feature` reads the board back and `feature status` moves a row
-// along. The table is GLOBAL — one board for the whole daemon, not one
+// `show feature` reads the board back, `feature status` moves a row
+// along and `feature note` writes the answer onto it. The table is
+// GLOBAL — one board for the whole daemon, not one
 // per userns — because a request is about the software, not about the
 // room it was mentioned in.
 
@@ -32,6 +33,7 @@
 #define FR_KV_TABLE        "plugin.featreq.table"
 #define FR_KV_MAX_DESC     "plugin.featreq.max_desc_cols"
 #define FR_KV_LIST_ROWS    "plugin.featreq.list_rows"
+#define FR_KV_MAX_NOTE     "plugin.featreq.max_note_cols"
 
 // The table name is a SQL identifier, validated strict alnum/underscore
 // before it is ever pasted into a statement.
@@ -41,6 +43,12 @@
 // us — one method line — so sanitising never truncates and the only
 // bound the user meets is the configured column count.
 #define FR_DESC_SZ         METHOD_TEXT_SZ
+
+// The answer written back onto a request. Sized like a description and
+// for the same reason: cleaning only ever drops bytes, so a buffer as
+// wide as the widest line that can reach us cannot truncate one, and
+// the only bound a writer meets is the configured column count.
+#define FR_NOTE_SZ         METHOD_TEXT_SZ
 
 // One rendered, colorized line. A row is at most DISPLAY_COLS columns
 // and a column at most four UTF-8 bytes, so this holds the widest row
@@ -133,6 +141,7 @@ const char *fr_status_open_sql(char *out, size_t cap);
 // flag reads as one bad flag rather than as a flag plus a fragment.
 const char *fr_skip_ws(const char *p);
 const char *fr_token(const char *p, char *out, size_t cap);
+bool fr_all_digits(const char *s);
 
 // ------------------------------------------------------------------ //
 // DB layer (featreq_db.c)                                             //
@@ -144,7 +153,8 @@ const char *fr_token(const char *p, char *out, size_t cap);
 #define FR_SELECT_COLS \
     "id, req_type, status, nickname, method, username, botname," \
     " description, EXTRACT(EPOCH FROM created_at)::BIGINT," \
-    " EXTRACT(EPOCH FROM status_at)::BIGINT"
+    " EXTRACT(EPOCH FROM status_at)::BIGINT, note," \
+    " EXTRACT(EPOCH FROM note_at)::BIGINT"
 
 enum
 {
@@ -158,6 +168,8 @@ enum
   FR_COL_DESC,
   FR_COL_CREATED,
   FR_COL_CHANGED,
+  FR_COL_NOTE,
+  FR_COL_NOTED,
 };
 
 // Who filed it and from where. Every member is borrowed for the call.
@@ -205,6 +217,11 @@ int64_t fr_db_add(const fr_new_t *req);
 
 // Move a request to `status`, stamping status_at.
 fr_upd_t fr_db_set_status(int64_t id, fr_status_t status);
+
+// Write `note` onto a request, stamping note_at. An empty note CLEARS
+// both — a note written onto the wrong id is the one mistake here that
+// replacing it cannot undo.
+fr_upd_t fr_db_set_note(int64_t id, const char *note);
 
 // Fill `res` with the matching rows, ordered and capped. `res` is the
 // caller's, from db_result_alloc().

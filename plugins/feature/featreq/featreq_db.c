@@ -81,6 +81,10 @@ fr_schema_ensure(void)
   // username is who they are to us; botname is which bot heard it.
   // status_at starts equal to created_at — a request that has not moved
   // has still had its status set exactly once, when it was filed.
+  //
+  // note is the answer written back onto the request; note_at is NULL
+  // rather than 0 until one is, because "never noted" is a state the
+  // card has to be able to say out loud.
   snprintf(sql, sizeof(sql),
       "CREATE TABLE IF NOT EXISTS %s ("
       " id          BIGSERIAL   PRIMARY KEY,"
@@ -91,12 +95,29 @@ fr_schema_ensure(void)
       " username    VARCHAR(64) NOT NULL DEFAULT '',"
       " botname     VARCHAR(64) NOT NULL DEFAULT '',"
       " description TEXT        NOT NULL,"
+      " note        TEXT        NOT NULL DEFAULT '',"
       " created_at  TIMESTAMPTZ NOT NULL DEFAULT NOW(),"
-      " status_at   TIMESTAMPTZ NOT NULL DEFAULT NOW()"
+      " status_at   TIMESTAMPTZ NOT NULL DEFAULT NOW(),"
+      " note_at     TIMESTAMPTZ"
       ")", table, fr_type_word(FR_TYPE_FEAT), fr_status_word(FR_ST_NEW));
 
   if(db_exec(sql, FR_CTX) != SUCCESS)
     ok = FAIL;
+
+  // A board that predates the note columns is the operator's own queue
+  // and cannot be dropped to gain them, so they are added in place. One
+  // ALTER carries both actions and IF NOT EXISTS makes it idempotent —
+  // this runs on every start, like the CREATE above.
+  if(ok == SUCCESS)
+  {
+    snprintf(sql, sizeof(sql),
+        "ALTER TABLE %s"
+        " ADD COLUMN IF NOT EXISTS note TEXT NOT NULL DEFAULT '',"
+        " ADD COLUMN IF NOT EXISTS note_at TIMESTAMPTZ", table);
+
+    if(db_exec(sql, FR_CTX) != SUCCESS)
+      ok = FAIL;
+  }
 
   // Both reads the board offers — the whole list newest-first, and one
   // status's slice of it — are served by this one index.
@@ -350,6 +371,46 @@ fr_db_set_status(int64_t id, fr_status_t status)
 
   else
     clam(CLAM_WARN, FR_CTX, "status update failed: %s",
+        (res->error[0] != '\0') ? res->error : "(no driver error)");
+
+  db_result_free(res);
+  return(rc);
+}
+
+fr_upd_t
+fr_db_set_note(int64_t id, const char *note)
+{
+  const char  *params[2];
+  db_result_t *res = NULL;
+  char         table[FR_TABLE_SZ];
+  char         sql[512];
+  char         id_s[24];
+  fr_upd_t     rc  = FR_UPD_ERROR;
+
+  if(fr_table_name(table, sizeof(table)) != SUCCESS)
+    return(FR_UPD_ERROR);
+
+  snprintf(id_s, sizeof(id_s), "%" PRId64, id);
+
+  params[0] = note;
+  params[1] = id_s;
+
+  // The stamp is decided here rather than in a CASE over $1: whether a
+  // note is being written or cleared is the caller's question, already
+  // answered, and NOW()/NULL are this file's own constants either way.
+  // RETURNING separates "no such request" from a failed write, exactly
+  // as it does for a status move.
+  snprintf(sql, sizeof(sql),
+      "UPDATE %s SET note = $1, note_at = %s WHERE id = $2 RETURNING id",
+      table, (note[0] != '\0') ? "NOW()" : "NULL");
+
+  res = db_result_alloc();
+
+  if(db_query_params(sql, params, 2, res) == SUCCESS && res->ok)
+    rc = (res->rows == 1) ? FR_UPD_OK : FR_UPD_NO_ROW;
+
+  else
+    clam(CLAM_WARN, FR_CTX, "note update failed: %s",
         (res->error[0] != '\0') ? res->error : "(no driver error)");
 
   db_result_free(res);

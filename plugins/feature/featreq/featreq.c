@@ -3,8 +3,9 @@
 //
 // A suggestion box with a global table behind it: anyone registered can
 // file a request, anyone can read the board, and the owner moves rows
-// along it. No bot driver (`.ext = NULL`) and no per-bot state — the
-// board belongs to the daemon, not to a bot.
+// along it and writes the answers onto them. No bot driver
+// (`.ext = NULL`) and no per-bot state — the board belongs to the
+// daemon, not to a bot.
 
 #define FEATREQ_INTERNAL
 #include "featreq.h"
@@ -22,6 +23,8 @@ static const plugin_kv_entry_t fr_kv_schema[] = {
     "Longest description a request may carry, in characters" },
   { FR_KV_LIST_ROWS, KV_UINT32, "20",
     "Rows one `show feature` draws (0 = the default; 100 is the ceiling)" },
+  { FR_KV_MAX_NOTE,  KV_UINT32, "400",
+    "Longest note a request may carry, in characters" },
 };
 
 // ------------------------------------------------------------------ //
