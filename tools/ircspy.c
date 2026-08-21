@@ -211,15 +211,26 @@ ctl_setup(const char *path)
   return(0);
 }
 
+// Drop the control client and forget everything it left behind. The
+// assembly buffer is per-connection: a partial line from a client that went
+// away must never prepend itself to the next client's first command.
+static void
+ctl_client_drop(void)
+{
+  if(g_ctl_client >= 0)
+    close(g_ctl_client);
+
+  g_ctl_client   = -1;
+  g_ctl_deadline = 0;
+  g_ctloff       = 0;
+  g_ctl_overlong = false;
+}
+
 // Close and unlink the control socket.
 static void
 ctl_cleanup(void)
 {
-  if(g_ctl_client >= 0)
-  {
-    close(g_ctl_client);
-    g_ctl_client = -1;
-  }
+  ctl_client_drop();
 
   if(g_ctl_listen >= 0)
   {
@@ -243,9 +254,7 @@ ctl_send_line(const char *text)
   if(write(g_ctl_client, text, strlen(text)) < 0 ||
      write(g_ctl_client, "\n", 1) < 0)
   {
-    close(g_ctl_client);
-    g_ctl_client = -1;
-    g_ctl_deadline = 0;
+    ctl_client_drop();
     return;
   }
 
@@ -264,10 +273,10 @@ ctl_flush(void)
 
   if(write(g_ctl_client, &nul, 1) < 0)
   {
-    close(g_ctl_client);
-    g_ctl_client = -1;
-    g_ctl_deadline = 0;
+    ctl_client_drop();
+    return;
   }
+
   g_ctl_deadline = 0;
 }
 
@@ -951,6 +960,111 @@ handle_stdin_data(struct pollfd *fds, const struct poll_idx *idx)
   }
 }
 
+// Say why a control line was dropped, and open a response window so the
+// client is told rather than left waiting out the idle timer for an answer
+// that was never coming. ctl_flush draws the delimiter when the window ends,
+// exactly as it does for a line that ran.
+static void
+ctl_refuse(const char *text)
+{
+  if(g_ctl_client < 0)
+    return;
+
+  g_ctl_deadline = time(NULL) + CTL_IDLE_SEC;
+  ctl_send_line(text);
+}
+
+// Dispatch every complete line sitting in the control buffer. Guarantees on
+// return that the buffer has room for at least one more byte, so the reader
+// never has to test for a full buffer.
+static void
+ctl_drain_lines(void)
+{
+  for(;;)
+  {
+    const char *nl = memchr(g_ctlbuf, '\n', (size_t)g_ctloff);
+    size_t consumed;
+    size_t len;
+
+    if(nl == NULL)
+      break;
+
+    consumed = (size_t)(nl - g_ctlbuf) + 1;
+    len      = consumed - 1;
+
+    // Tolerate a CRLF writer.
+    while(len > 0 && g_ctlbuf[len - 1] == '\r')
+      len--;
+
+    g_ctlbuf[len] = '\0';
+
+    // The tail of a discarded over-length line is debris, not a command.
+    if(g_ctl_overlong)
+      g_ctl_overlong = false;
+
+    else
+    {
+      handle_user_input(g_ctlbuf);
+      g_ctl_deadline = time(NULL) + CTL_IDLE_SEC;
+    }
+
+    g_ctloff -= (int)consumed;
+
+    if(g_ctloff > 0)
+      memmove(g_ctlbuf, g_ctlbuf + consumed, (size_t)g_ctloff);
+
+    // A /quit line ends the session; what followed it in the same write is
+    // not ours to run.
+    if(g_quit)
+      return;
+  }
+
+  // A full buffer holding no newline can never complete: refuse it whole and
+  // swallow the remainder of that line as it arrives. Dispatching the
+  // fragment is how one command became two (board #46).
+  if(g_ctloff == (int)sizeof(g_ctlbuf))
+  {
+    char msg[64];
+
+    snprintf(msg, sizeof(msg), "ircspy: command exceeds %d bytes, discarded",
+             (int)sizeof(g_ctlbuf) - 1);
+
+    fprintf(stderr, "%s\n", msg);
+    ctl_refuse(msg);
+
+    g_ctloff       = 0;
+    g_ctl_overlong = true;
+  }
+}
+
+// One read(2) into the control buffer, followed by a drain of whatever it
+// completed. A command longer than one read arrives in pieces and is still
+// one command; two commands in one read are still two.
+static void
+ctl_read_once(void)
+{
+  ssize_t n = read(g_ctl_client, g_ctlbuf + g_ctloff,
+                   sizeof(g_ctlbuf) - (size_t)g_ctloff);
+
+  if(n < 0)
+  {
+    if(errno == EINTR || errno == EAGAIN)
+      return;
+
+    ctl_client_drop();
+    return;
+  }
+
+  if(n == 0)
+  {
+    ctl_client_drop();
+    return;
+  }
+
+  g_ctloff += (int)n;
+  ctl_drain_lines();
+}
+
 // Accept a new control client and read commands from an existing one.
 static void
 handle_ctl_events(struct pollfd *fds, const struct poll_idx *idx)
@@ -966,36 +1080,11 @@ handle_ctl_events(struct pollfd *fds, const struct poll_idx *idx)
 
   // Read command from connected client.
   if(idx->ctl_client >= 0 && (fds[idx->ctl_client].revents & POLLIN))
-  {
-    char input[CMD_SZ];
-    ssize_t n = read(g_ctl_client, input, sizeof(input) - 1);
+    ctl_read_once();
 
-    if(n <= 0)
-    {
-      close(g_ctl_client);
-      g_ctl_client = -1;
-      g_ctl_deadline = 0;
-    }
-
-    else
-    {
-      input[n] = '\0';
-
-      while(n > 0 && (input[n - 1] == '\n' || input[n - 1] == '\r'))
-        input[--n] = '\0';
-
-      handle_user_input(input);
-      g_ctl_deadline = time(NULL) + CTL_IDLE_SEC;
-    }
-  }
-
-  if(idx->ctl_client >= 0
+  if(g_ctl_client >= 0 && idx->ctl_client >= 0
       && (fds[idx->ctl_client].revents & (POLLERR | POLLHUP)))
-  {
-    close(g_ctl_client);
-    g_ctl_client = -1;
-    g_ctl_deadline = 0;
-  }
+    ctl_client_drop();
 }
 
 static void

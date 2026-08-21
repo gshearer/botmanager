@@ -85,6 +85,16 @@ static time_t g_ctl_deadline = 0;   // response collection deadline (monotonic)
 static bool   g_stdin_open  = true;  // false after stdin EOF
 static char   g_ctl_path[256];      // socket path for cleanup
 
+// Line buffer for partial control-socket reads. The socket is a stream and
+// carries no message boundaries: one command may take any number of reads and
+// one read may hold several. It is assembled exactly as stdin is, and the
+// state is per-connection — a client that goes away leaves nothing behind.
+static char g_ctlbuf[CMD_SZ];
+static int  g_ctloff = 0;
+
+// True while the tail of an over-length control line is being swallowed.
+static bool g_ctl_overlong = false;
+
 // Poll index tracker for the dynamic poll set built each iteration of
 // the main loop. Slots default to -1 when the corresponding source is
 // not in the poll set this iteration.
