@@ -24,6 +24,12 @@
 // them framing — so it must not be able to end that line itself.
 // `forge` is that fixture.
 //
+// The last two rows are the read side of that same frame. A stream
+// socket carries no message boundaries, so one read holds whatever the
+// kernel had — half a line, or a line and a half — and only a complete
+// line is a command. Dispatching a piece runs the operator's argument
+// as a command of its own (board #44).
+//
 // ⚠ The teardown order here — botmanctl_exit() BEFORE pool_exit() —
 // is deliberate and is itself the regression test for OBS-31: it is
 // the order main.c does NOT use, so it is the only place in the tree
@@ -62,6 +68,13 @@
 // reaches cmd_reply holding them.
 #define FORGE_TEXT    "FORGE1\nFORGE2\rFORGE3"
 #define FORGE_FOLDED  "FORGE1 FORGE2 FORGE3"
+
+// `mirror` answers with the size of the argument that reached the
+// dispatcher, which is the whole of what the client sent or nothing.
+// MIRROR_ARG_LEN is longer than any one write the split row makes, and
+// MIRROR_HUGE is longer than any line the socket could accept.
+#define MIRROR_ARG_LEN  600
+#define MIRROR_HUGE     8192
 
 // What slowecho carries across the thread boundary: the message by
 // value (core/resolve.c:1007-1009's shape — a copy holds no lifetime)
@@ -133,6 +146,20 @@ forge_cmd(const cmd_ctx_t *ctx)
   cmd_reply(ctx, FORGE_TEXT);
 }
 
+// The argument as the dispatcher received it, measured. A line that was
+// dispatched in pieces reports the first piece; one that was not
+// reports all of it.
+static void
+mirror_cmd(const cmd_ctx_t *ctx)
+{
+  char reply[64];
+
+  snprintf(reply, sizeof(reply), "mirror:%zu",
+      ctx->args != NULL ? strlen(ctx->args) : (size_t)0);
+
+  cmd_reply(ctx, reply);
+}
+
 static const cmd_arg_desc_t echo_args[] = {
   { .name = "token", .type = CMD_ARG_ALNUM }
 };
@@ -173,6 +200,26 @@ route_ask(int fd, const char *line)
   wrote = write(fd, buf, n);
 
   return(wrote == (ssize_t)n ? SUCCESS : FAIL);
+}
+
+// Write exactly what it is given, with no line of its own. route_ask
+// sends one command; this sends one piece of one.
+static bool
+route_write(int fd, const char *bytes, size_t len)
+{
+  size_t off = 0;
+
+  while(off < len)
+  {
+    ssize_t wrote = write(fd, bytes + off, len - off);
+
+    if(wrote <= 0)
+      return(FAIL);
+
+    off += (size_t)wrote;
+  }
+
+  return(SUCCESS);
 }
 
 // Drain whatever arrives within budget_ms into stream, NUL-terminated.
@@ -412,6 +459,84 @@ row_reply_cannot_forge_lines(void)
   close(a);
 }
 
+// One command, sent as two writes with a gap wide enough that the
+// server must read it twice. The halves are one line and one command:
+// the first read used to be dispatched on its own, which ran the
+// operator's command against half its argument and then ran the rest of
+// the argument as a command.
+static void
+row_split_line_is_one_command(void)
+{
+  char stream[ROUTE_STREAM_SZ];
+  char head[MIRROR_ARG_LEN + 8];
+  char tail[MIRROR_ARG_LEN + 2];
+  int  a = route_connect();
+  int  split = MIRROR_ARG_LEN / 3;
+
+  if(a < 0)
+    return;
+
+  memset(head, 'x', sizeof(head));
+  memcpy(head, "mirror ", 7);
+
+  memset(tail, 'x', sizeof(tail));
+  tail[MIRROR_ARG_LEN - split] = '\n';
+
+  route_write(a, head, 7 + (size_t)split);
+  route_sleep_ms(60);
+  route_write(a, tail, (size_t)(MIRROR_ARG_LEN - split) + 1);
+
+  route_drain(a, stream, sizeof(stream), 500);
+
+  {
+    char want[32];
+
+    snprintf(want, sizeof(want), "mirror:%d", MIRROR_ARG_LEN);
+    test_check_bool(SUITE, "split_line_is_one_command", true,
+        route_lines_all_are(stream, want));
+  }
+
+  close(a);
+}
+
+// A line past what the socket can hold is refused whole. It cannot be
+// dispatched — nothing has seen the end of it — and it must not be
+// dispatched in pieces either, so the tail is debris and the session
+// resumes at the next line.
+static void
+row_overlong_line_refused_whole(void)
+{
+  static char huge[MIRROR_HUGE + 16];
+  char        stream[ROUTE_STREAM_SZ];
+  int         a = route_connect();
+  bool        ok;
+
+  if(a < 0)
+    return;
+
+  memset(huge, 'y', sizeof(huge));
+  memcpy(huge, "mirror ", 7);
+  huge[MIRROR_HUGE] = '\n';
+
+  route_write(a, huge, MIRROR_HUGE + 1);
+  route_drain(a, stream, sizeof(stream), 300);
+
+  ok = (strstr(stream, "mirror:") == NULL)
+      && (strstr(stream, "too long") != NULL);
+
+  test_check_bool(SUITE, "overlong_line_refused_whole", true, ok);
+
+  // The debris was swallowed, not queued as commands: the very next
+  // line is answered normally.
+  route_ask(a, "version");
+  route_drain(a, stream, sizeof(stream), 500);
+
+  test_check_bool(SUITE, "overlong_line_resyncs", true,
+      strstr(stream, "BotManager") != NULL);
+
+  close(a);
+}
+
 int
 main(void)
 {
@@ -444,6 +569,11 @@ main(void)
       "everyone", 0, CMD_SCOPE_ANY, METHOD_T_ANY, hold_cmd, NULL,
       NULL, NULL, NULL, 0, NULL, NULL);
 
+  cmd_register("test", "mirror", "mirror <text>",
+      "Answer with the size of the argument that arrived", NULL,
+      "everyone", 0, CMD_SCOPE_ANY, METHOD_T_ANY, mirror_cmd, NULL,
+      NULL, NULL, NULL, 0, NULL, NULL);
+
   cmd_register("test", "forge", "forge",
       "Reply with a token that carries CR and LF", NULL,
       "everyone", 0, CMD_SCOPE_ANY, METHOD_T_ANY, forge_cmd, NULL,
@@ -468,6 +598,8 @@ main(void)
   row_gone_client_drops();
   row_line_is_one_write();
   row_reply_cannot_forge_lines();
+  row_split_line_is_one_command();
+  row_overlong_line_refused_whole();
 
   botmanctl_exit();
   pool_exit();

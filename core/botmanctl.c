@@ -784,14 +784,144 @@ bctl_dispatch(bctl_server_t *srv, bctl_client_t *c, char *line)
 
   if(cmd_dispatch_as(line, args, srv->inst, ns, as_user, route) != SUCCESS)
   {
-    // Send error back to client.
-    char errmsg[BCTL_INPUT_SZ];
+    // Send error back to client. Echo only as much of the word as could
+    // ever have named a command — the rest of a long one is noise, and
+    // the whole line can now be one.
+    char errmsg[CMD_NAME_SZ + 40];
 
-    snprintf(errmsg, sizeof(errmsg), "unknown command: %s (try help)", line);
+    snprintf(errmsg, sizeof(errmsg), "unknown command: %.*s (try help)",
+        CMD_NAME_SZ - 1, line);
     bctl_client_write(c, errmsg);
   }
 
   bctl_dispatch_client = NULL;
+}
+
+// Client input
+
+// End of one response. A client reads until this byte, so a line we
+// refuse owes one exactly as a line we ran does. Subscribe mode has no
+// responses and gets none — including for the SUBSCRIBE that put the
+// client there, which is why the mode is read after the dispatch.
+static void
+bctl_client_delimit(bctl_client_t *c)
+{
+  char nul = '\0';
+
+  if(c->mode != BCTL_MODE_COMMAND || c->closing)
+    return;
+
+  if(write(c->fd, &nul, 1) < 0)
+    c->closing = true;
+}
+
+// Say why a line was dropped, and end the response so the client stops
+// waiting for one. A subscriber is a listener — it gets nothing back,
+// not even this.
+static void
+bctl_client_refuse(bctl_client_t *c, const char *text)
+{
+  if(c->mode != BCTL_MODE_COMMAND)
+    return;
+
+  if(bctl_client_write(c, text) != SUCCESS)
+    c->closing = true;
+
+  bctl_client_delimit(c);
+}
+
+// One complete line: a command in command mode, nothing at all in
+// subscribe mode, where the client is a listener and its writes are
+// noise.
+static void
+bctl_client_line(bctl_server_t *srv, bctl_client_t *c, char *line)
+{
+  if(c->mode != BCTL_MODE_COMMAND)
+    return;
+
+  bctl_dispatch(srv, c, line);
+  bctl_client_delimit(c);
+}
+
+// Dispatch every complete line the buffer now holds and keep the rest
+// for the read that finishes it. Guarantees on return that the buffer
+// has room for at least one more byte.
+static void
+bctl_client_drain(bctl_server_t *srv, bctl_client_t *c)
+{
+  for(;;)
+  {
+    const char *nl;
+    size_t      consumed;
+
+    nl = memchr(c->in_buf, '\n', c->in_len);
+    if(nl == NULL)
+      break;
+
+    consumed = (size_t)(nl - c->in_buf) + 1;
+    c->in_buf[consumed - 1] = '\0';
+
+    // The tail of a discarded over-length line is debris, not a command.
+    if(c->in_overlong)
+      c->in_overlong = false;
+
+    else
+      bctl_client_line(srv, c, c->in_buf);
+
+    c->in_len -= consumed;
+
+    if(c->in_len > 0)
+      memmove(c->in_buf, c->in_buf + consumed, c->in_len);
+
+    if(c->closing)
+      return;
+  }
+
+  // A full buffer holding no newline can never complete. Say so once,
+  // then swallow the rest of that line as it arrives: dispatching the
+  // fragment is how a long command became two commands (board #44).
+  if(c->in_len == sizeof(c->in_buf) - 1)
+  {
+    if(!c->in_overlong)
+    {
+      char msg[64];
+
+      clam(CLAM_WARN, "botmanctl",
+          "client %" PRIu64 " line exceeds %zu bytes, discarded",
+          c->id, sizeof(c->in_buf) - 1);
+
+      snprintf(msg, sizeof(msg), "command too long (max %zu bytes)",
+          sizeof(c->in_buf) - 1);
+
+      bctl_client_refuse(c, msg);
+    }
+
+    c->in_len      = 0;
+    c->in_overlong = true;
+  }
+}
+
+// One read(2) into a client's assembly buffer, followed by a drain of
+// whatever it completed. The socket is a stream: a command longer than
+// one read arrives in pieces and is still one command.
+static void
+bctl_client_input(bctl_server_t *srv, bctl_client_t *c)
+{
+  ssize_t n;
+
+  n = read(c->fd, c->in_buf + c->in_len, sizeof(c->in_buf) - c->in_len - 1);
+
+  if(n <= 0)
+  {
+    if(n < 0 && (errno == EINTR || errno == EAGAIN))
+      return;
+
+    c->closing = true;
+    return;
+  }
+
+  c->in_len += (size_t)n;
+  bctl_client_drain(srv, c);
 }
 
 // Persist task: poll listener and clients
@@ -861,45 +991,7 @@ bctl_task_cb(task_t *t)
       bctl_client_t *c = client_map[i - 1];
 
       if(fds[i].revents & POLLIN)
-      {
-        char buf[BCTL_INPUT_SZ];
-        ssize_t n;
-
-        n = read(c->fd, buf, sizeof(buf) - 1);
-        if(n <= 0)
-          c->closing = true;
-
-        else
-        {
-          char *saveptr = NULL;
-          char *line;
-
-          buf[n] = '\0';
-
-          // Process each line in the received data.
-          line = strtok_r(buf, "\n", &saveptr);
-
-          while(line != NULL)
-          {
-            if(c->mode == BCTL_MODE_COMMAND)
-              bctl_dispatch(srv, c, line);
-
-            // Send end-of-response delimiter (command mode only).
-            if(c->mode == BCTL_MODE_COMMAND && !c->closing)
-            {
-              char nul = '\0';
-
-              if(write(c->fd, &nul, 1) < 0)
-              {
-                c->closing = true;
-                break;
-              }
-            }
-
-            line = strtok_r(NULL, "\n", &saveptr);
-          }
-        }
-      }
+        bctl_client_input(srv, c);
 
       if(fds[i].revents & (POLLERR | POLLHUP | POLLNVAL))
         c->closing = true;

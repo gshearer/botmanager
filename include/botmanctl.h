@@ -40,7 +40,12 @@ void botmanctl_set_user_ns(const char *name);
 #include <sys/un.h>
 #include <unistd.h>
 
-#define BCTL_INPUT_SZ      512
+// One command line, whole. The socket is a stream and carries no message
+// boundaries, so this is the assembly buffer a connection reassembles into
+// rather than the size of any one read: a line longer than it is refused,
+// never split. Sized off the reply side's own line unit — a command that
+// could not be answered on one line has no business being accepted.
+#define BCTL_INPUT_SZ      METHOD_TEXT_SZ
 #define BCTL_SOCK_PATH_SZ  256
 #define BCTL_MAX_CLIENTS   16
 #define BCTL_STOP_WAIT_MS  5000
@@ -58,6 +63,15 @@ typedef struct bctl_client
   char                 user_ns_cd[64];   // per-session working namespace
   char                 as_user[USERNS_USER_SZ]; // asserted identity for dispatch (default @owner)
   bool                 closing;          // marked for removal
+
+  // Command input, reassembled. One read carries whatever the kernel had —
+  // half a line, three lines, or a line and a half — and only complete ones
+  // are commands. The poll thread owns all three fields and nothing else
+  // touches them; on return from a drain there is always room for one more
+  // byte, so the reader never has to test for a full buffer.
+  char                 in_buf[BCTL_INPUT_SZ];
+  size_t               in_len;
+  bool                 in_overlong;      // swallowing a line that cannot fit
 
   // Subscribe mode state (only used when mode == BCTL_MODE_SUBSCRIBE):
   uint8_t              clam_sev;         // subscribed severity level
@@ -107,6 +121,12 @@ static bool  bctl_client_write(bctl_client_t *c, const char *text);
 static bool  bctl_client_send_locked(bctl_client_t *c, const char *text);
 static void  bctl_task_cb(task_t *t);
 static void  bctl_dispatch(bctl_server_t *srv, bctl_client_t *c, char *line);
+static void  bctl_client_delimit(bctl_client_t *c);
+static void  bctl_client_refuse(bctl_client_t *c, const char *text);
+static void  bctl_client_line(bctl_server_t *srv, bctl_client_t *c,
+                 char *line);
+static void  bctl_client_drain(bctl_server_t *srv, bctl_client_t *c);
+static void  bctl_client_input(bctl_server_t *srv, bctl_client_t *c);
 static void  bctl_handle_subscribe(bctl_server_t *srv, bctl_client_t *c,
                  char *args);
 static void  bctl_clam_cb(const clam_msg_t *m);
