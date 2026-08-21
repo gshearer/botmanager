@@ -1,11 +1,14 @@
 // botmanager — MIT
 // attack's read-only views: `show attack` draws the round burning in this
-// room, and `show attack scores` the lifetime standings of everyone who
-// has ever swung in this namespace.
+// room, `show attack scores` the lifetime standings of everyone who has
+// ever swung in this namespace, `show attack classes` the character
+// sheets on offer, and `show attack rules` the house rulebook.
 //
-// Both are plain SELECTs and take no lock. atk_turn_lock serialises
-// *writers*; a blow lands as one transaction, so the worst a reader can
-// catch is the instant between two finished turns.
+// The first two are plain SELECTs and take no lock. atk_turn_lock
+// serialises *writers*; a blow lands as one transaction, so the worst a
+// reader can catch is the instant between two finished turns. The last
+// two touch no table at all — they render the class registry and the
+// tunables, and are answerable with the pit empty.
 
 #define ATTACK_INTERNAL
 #include "attack.h"
@@ -818,6 +821,269 @@ atk_show_classes(const cmd_ctx_t *ctx)
 }
 
 // ------------------------------------------------------------------ //
+// show attack rules — the house rulebook                              //
+// ------------------------------------------------------------------ //
+
+// The rulebook is prose: it is read left to right rather than scanned
+// down columns, so it takes the round card's width instead of
+// DISPLAY_COLS. A player who has just read `show attack` should not see
+// the frame move between the two. display.h sanctions a view that states
+// its own total; this is that statement.
+#define ATK_W_RULES  ATK_W_CARD
+
+// Seconds in the unit a player would say them in. An idle clock is set
+// in round hours or whole minutes far more often than not, and "four
+// hours" reads as a rule where "14400 seconds" reads as a setting.
+//
+// No singular is spelled anywhere here and none can be reached: the
+// clock floors at 60 seconds, and each larger unit is entered only from
+// twice its own length, so every branch counts two or more of something.
+static void
+atk_rules_secs(char *out, size_t cap, uint32_t secs)
+{
+  if(secs >= 7200 && secs % 3600 == 0)
+    snprintf(out, cap, "%" PRIu32 " hours", secs / 3600);
+
+  else if(secs >= 120 && secs % 60 == 0)
+    snprintf(out, cap, "%" PRIu32 " minutes", secs / 60);
+
+  else
+    snprintf(out, cap, "%" PRIu32 " seconds", secs);
+}
+
+// One stanza's heading: the glyph, the rule's name, and the words a
+// player types to invoke it. `syntax` is NULL for a rule nobody invokes
+// — the sweep and the clock happen TO you.
+static void
+atk_rules_head(const cmd_ctx_t *ctx, const char *glyph, const char *name,
+    const char *syntax)
+{
+  char line[ATK_LINE_SZ];
+
+  if(syntax != NULL)
+    snprintf(line, sizeof(line),
+        "  %s  " CLR_BOLD "%s" CLR_RESET CLR_GRAY "  ·  " CLR_RESET
+        CLR_CYAN "%s" CLR_RESET, glyph, name, syntax);
+
+  else
+    snprintf(line, sizeof(line), "  %s  " CLR_BOLD "%s" CLR_RESET,
+        glyph, name);
+
+  cmd_reply(ctx, line);
+}
+
+// A stanza's body, wrapped to ATK_W_RULES and spoken one line at a time.
+//
+// The break is chosen on display_vis_len and never on strlen: a colour
+// marker is two bytes of no width, and measuring the bytes would wrap a
+// heavily coloured sentence a dozen columns early. Words are never
+// split, so a single word longer than the width overhangs it — none of
+// the vocabulary here comes close, and a hyphenator would be a page of
+// code to prevent something that cannot happen.
+static void
+atk_rules_body(const cmd_ctx_t *ctx, const char *text)
+{
+  const char *p = text;
+  char        line[ATK_LINE_SZ];
+  char        word[ATK_CELL_SZ];
+  size_t      used;
+  bool        empty;
+
+  strlcpy(line, "     ", sizeof(line));
+  used  = display_vis_len(line);
+  empty = true;
+
+  while(*p != '\0')
+  {
+    const char *sp   = strchr(p, ' ');
+    size_t      full = (sp != NULL) ? (size_t)(sp - p) : strlen(p);
+    size_t      len  = full;
+    size_t      vis;
+
+    if(full == 0)                   // a run of spaces; nothing to place
+    {
+      p++;
+      continue;
+    }
+
+    if(len >= sizeof(word))
+      len = sizeof(word) - 1;
+
+    memcpy(word, p, len);
+    word[len] = '\0';
+    vis = display_vis_len(word);
+
+    if(!empty && used + 1 + vis > (size_t)ATK_W_RULES)
+    {
+      display_cat(line, sizeof(line), CLR_RESET);
+      cmd_reply(ctx, line);
+      strlcpy(line, "     ", sizeof(line));
+      used  = display_vis_len(line);
+      empty = true;
+    }
+
+    if(!empty)
+    {
+      display_cat(line, sizeof(line), " ");
+      used++;
+    }
+
+    display_cat(line, sizeof(line), word);
+    used += vis;
+    empty = false;
+
+    p += full;
+
+    if(*p == ' ')
+      p++;
+  }
+
+  if(!empty)
+  {
+    display_cat(line, sizeof(line), CLR_RESET);
+    cmd_reply(ctx, line);
+  }
+}
+
+// The pit's own rules, at the numbers it is running right now.
+//
+// Every figure below is lifted from the tunables this turn would use —
+// nothing here is a literal, because a rulebook that has to be edited
+// when a knob moves is a rulebook that will one day be wrong. The damage
+// bands come from atk_flav_bands(), which reads them back out of
+// atk_severity() rather than deriving them a second time.
+static void
+atk_show_rules(const cmd_ctx_t *ctx)
+{
+  atk_tunables_t t;
+  char           line[ATK_LINE_SZ];
+  char           rule[ATK_LINE_SZ];
+  char           body[ATK_LINE_SZ * 2];
+  char           clock[64];
+
+  atk_tunables_load(&t);
+  atk_rules_secs(clock, sizeof(clock), t.round_max_idle_secs);
+
+  snprintf(line, sizeof(line),
+      "📜 " CLR_BOLD "THE DUELLING PIT — HOUSE RULES" CLR_RESET
+      CLR_GRAY " (as the pit is tuned right now)" CLR_RESET);
+  cmd_reply(ctx, line);
+
+  atk_rule(rule, sizeof(rule), ATK_W_RULES);
+  cmd_reply(ctx, rule);
+
+  // ---- the swing --------------------------------------------------- //
+
+  atk_rules_head(ctx, "⚔", "THE SWING", "!attack <nick>");
+  snprintf(body, sizeof(body),
+      "Damage is " CLR_YELLOW "1-%" PRIu32 CLR_RESET ", rolled "
+      "the same way for everybody: your class chooses the words and never "
+      "the numbers, so a sheet with forty critical lines hits exactly as "
+      "hard as one with a single line. You swing once per wave — when "
+      "every combatant still standing has taken their turn the wave "
+      "turns, and the pit comes round again. Your mark must be a "
+      "registered user in the room, and it must not be you.",
+      t.dmg_max);
+  atk_rules_body(ctx, body);
+
+  // ---- the mend ---------------------------------------------------- //
+
+  atk_rules_head(ctx, "✚", "THE MEND", "!heal [nick]");
+  snprintf(body, sizeof(body),
+      "Only a class that knows healing may mend, and " CLR_CYAN
+      "show attack classes" CLR_RESET " says which do. A minor mend "
+      "restores " CLR_GREEN "%" PRIu32 "-%" PRIu32 CLR_RESET " and a "
+      "major one " CLR_GREEN "%" PRIu32 "-%" PRIu32 CLR_RESET ", with "
+      CLR_YELLOW "%" PRIu32 "%%" CLR_RESET " of them coming up major — "
+      "the pit rolls that, not your class. Nobody is mended past the "
+      CLR_GREEN "%" PRIu32 CLR_RESET " hit points they opened on, and the "
+      "number announced is always the number the bar moved. Mending "
+      "spends your turn exactly as a swing does: it is a trade, never a "
+      "free action.",
+      t.heal_minor_min, t.heal_minor_max, t.heal_major_min,
+      t.heal_major_max, t.heal_major_pct, t.start_hp);
+  atk_rules_body(ctx, body);
+
+  // ---- the wait ---------------------------------------------------- //
+
+  atk_rules_head(ctx, "⏳", "THE WAIT", "!defer");
+  snprintf(body, sizeof(body),
+      "Give up your turn to bank " CLR_YELLOW "%" PRIu32 "-%" PRIu32 "%%"
+      CLR_RESET " on the next one. Deferrals ADD — " CLR_YELLOW "%" PRIu32
+      CLR_RESET " a round, hard ceiling " CLR_YELLOW "%" PRIu32 "%%"
+      CLR_RESET " — and the bonus scales the NUMBER only, so a bonused "
+      "blow still speaks in the words its plain roll earned; the "
+      CLR_BOLD CLR_YELLOW "⚡" CLR_RESET " on the line is what explains "
+      "the size of it. It pays a mend exactly as it pays a blow. An "
+      "unspent bonus dies with its round.",
+      t.defer_step_lo, t.defer_step_hi, t.defer_max, t.defer_cap_pct);
+  atk_rules_body(ctx, body);
+
+  // ---- the rot ----------------------------------------------------- //
+
+  atk_rules_head(ctx, "☣", "THE ROT", NULL);
+
+  if(t.dot_chance_pct > 0)
+    snprintf(body, sizeof(body),
+        CLR_YELLOW "%" PRIu32 "%%" CLR_RESET " of swings leave a wound "
+        "rather than a bruise: nothing lands at once, then " CLR_YELLOW
+        "%" PRIu32 CLR_RESET " ticks " CLR_YELLOW "%" PRIu32 CLR_RESET
+        " seconds apart carrying that same roll spread between them. Rot "
+        "is timing and not power — an affliction and a blow of equal "
+        "number cost a victim the same in the end. One combatant carries "
+        CLR_YELLOW "%" PRIu32 CLR_RESET " at a time, and a swing that "
+        "finds no room is spent all the same, bonus and all.",
+        t.dot_chance_pct, t.dot_max_ticks, t.dot_tick_secs,
+        t.dot_stack_max);
+
+  else
+    strlcpy(body, "Nothing festers here: the pit is tuned to leave no "
+                  "wounds behind at all.", sizeof(body));
+
+  atk_rules_body(ctx, body);
+
+  // ---- the sweep --------------------------------------------------- //
+
+  atk_rules_head(ctx, "💥", "THE SWEEP", NULL);
+
+  if(t.aoe_pct > 0)
+    snprintf(body, sizeof(body),
+        CLR_YELLOW "%" PRIu32 CLR_RESET " blows in a hundred go wide and "
+        "catch every combatant except the one who swung, for the same "
+        "number each. It needs at least two others standing to be worth "
+        "the name.", t.aoe_pct);
+
+  else
+    strlcpy(body, "No blow goes wide here: every swing lands on the one "
+                  "it was aimed at.", sizeof(body));
+
+  atk_rules_body(ctx, body);
+
+  // ---- the end ----------------------------------------------------- //
+
+  atk_rules_head(ctx, "☠", "THE END", "attack --end");
+  snprintf(body, sizeof(body),
+      "Everyone opens on " CLR_GREEN "%" PRIu32 CLR_RESET " hit points. "
+      "The first to reach 0 ends the round%s A brawl left silent for "
+      CLR_YELLOW "%s" CLR_RESET " is over on its own, and anyone who may "
+      "swing may close one early.",
+      t.start_hp,
+      t.eject_on_death
+          ? ", and the pit shows them the door where the room allows it."
+          : ".",
+      clock);
+  atk_rules_body(ctx, body);
+
+  // ---- the charter, and the numbers behind the words ---------------- //
+
+  cmd_reply(ctx, rule);
+  atk_flav_bands(ctx, &t);
+  cmd_reply(ctx, CLR_GRAY
+      "  every class rolls the same numbers; a sheet supplies only the "
+      "words." CLR_RESET);
+}
+
+// ------------------------------------------------------------------ //
 // Registration                                                        //
 // ------------------------------------------------------------------ //
 
@@ -869,6 +1135,25 @@ atk_show_register(void)
         "reload`.",
         USERNS_GROUP_EVERYONE, 0, CMD_SCOPE_ANY, METHOD_T_ANY,
         atk_show_classes, NULL, "show/attack", NULL,
+        NULL, 0, NULL, NULL) != SUCCESS)
+    return(FAIL);
+
+  // No nickname collision to trade against, unlike `attack reload`: this
+  // hangs off core's `show` parent, so a combatant called `rules` is as
+  // attackable as anyone else.
+  if(cmd_register("attack", "rules",
+        "show attack rules",
+        "How the pit works, at the numbers it is running now.",
+        "The whole game in one card: what a swing rolls, what a mend "
+        "restores, what surrendering a turn buys, how an affliction pays "
+        "itself out, when a blow goes wide, and what ends a round. Every "
+        "figure is read from the live tunables rather than written down, "
+        "so the card cannot go stale when an operator turns a knob — the "
+        "damage bands at the foot come from the same function the "
+        "renderer asks, and describe the pit exactly as it will play the "
+        "next blow.",
+        USERNS_GROUP_EVERYONE, 0, CMD_SCOPE_ANY, METHOD_T_ANY,
+        atk_show_rules, NULL, "show/attack", NULL,
         NULL, 0, NULL, NULL) != SUCCESS)
     return(FAIL);
 
