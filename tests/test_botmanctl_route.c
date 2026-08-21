@@ -12,11 +12,17 @@
 // (OBS-29-TRUTH T1/T4).
 //
 // No daemon and no database: the suite brings up the same subsystems
-// the socket needs, registers two test verbs, and drives the real
+// the socket needs, registers three test verbs, and drives the real
 // driver over real AF_UNIX clients. `slowecho` is the async fixture —
 // it copies the message the way core/resolve.c does and answers from a
 // worker; `hold` occupies a dispatch window synchronously, so a late
 // reply lands while the driver is demonstrably serving someone else.
+//
+// The last row is the other half of the same delivery: not who the
+// line reaches, but where it ends. One reply is one line — and the
+// text is a stored value, a fetched title, a model's line, none of
+// them framing — so it must not be able to end that line itself.
+// `forge` is that fixture.
 //
 // ⚠ The teardown order here — botmanctl_exit() BEFORE pool_exit() —
 // is deliberate and is itself the regression test for OBS-31: it is
@@ -49,6 +55,13 @@
 #define ROUTE_STREAM_SZ  8192   // one client's whole accumulated stream
 #define ROUTE_ECHO_MS    200    // how long slowecho takes to answer
 #define ROUTE_HOLD_MS    600    // how long hold keeps a dispatch window open
+
+// What `forge` replies, and the single line it has to arrive as. The
+// breaks stand in for the ones a real reply carries without choosing
+// to: json_unescape decodes them, so a fetched title or a stored value
+// reaches cmd_reply holding them.
+#define FORGE_TEXT    "FORGE1\nFORGE2\rFORGE3"
+#define FORGE_FOLDED  "FORGE1 FORGE2 FORGE3"
 
 // What slowecho carries across the thread boundary: the message by
 // value (core/resolve.c:1007-1009's shape — a copy holds no lifetime)
@@ -111,6 +124,13 @@ hold_cmd(const cmd_ctx_t *ctx)
 {
   route_sleep_ms(ROUTE_HOLD_MS);
   cmd_reply(ctx, "held");
+}
+
+// One cmd_reply carrying the bytes that used to draw their own lines.
+static void
+forge_cmd(const cmd_ctx_t *ctx)
+{
+  cmd_reply(ctx, FORGE_TEXT);
 }
 
 static const cmd_arg_desc_t echo_args[] = {
@@ -368,6 +388,30 @@ row_line_is_one_write(void)
   close(b);
 }
 
+// A reply owns its text and never its framing. What cmd_reply is
+// handed is whatever the command had — a stored value, a fetched
+// title, a model's line — and a CR or an LF inside one used to reach
+// the socket verbatim: further lines of operator output, drawn by the
+// reply itself, or a cursor return that overwrites the line already
+// printed. One reply is one line, whatever it contains.
+static void
+row_reply_cannot_forge_lines(void)
+{
+  char stream[ROUTE_STREAM_SZ];
+  int  a = route_connect();
+
+  if(a < 0)
+    return;
+
+  route_ask(a, "forge");
+  route_drain(a, stream, sizeof(stream), 500);
+
+  test_check_bool(SUITE, "reply_cannot_forge_lines", true,
+      route_lines_all_are(stream, FORGE_FOLDED));
+
+  close(a);
+}
+
 int
 main(void)
 {
@@ -400,6 +444,11 @@ main(void)
       "everyone", 0, CMD_SCOPE_ANY, METHOD_T_ANY, hold_cmd, NULL,
       NULL, NULL, NULL, 0, NULL, NULL);
 
+  cmd_register("test", "forge", "forge",
+      "Reply with a token that carries CR and LF", NULL,
+      "everyone", 0, CMD_SCOPE_ANY, METHOD_T_ANY, forge_cmd, NULL,
+      NULL, NULL, NULL, 0, NULL, NULL);
+
   botmanctl_register_method();
 
   probe = route_connect();
@@ -418,6 +467,7 @@ main(void)
   row_async_never_crossfeeds();
   row_gone_client_drops();
   row_line_is_one_write();
+  row_reply_cannot_forge_lines();
 
   botmanctl_exit();
   pool_exit();

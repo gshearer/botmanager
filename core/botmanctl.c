@@ -507,6 +507,18 @@ bctl_route_id(const char *target, uint64_t *id)
 
 // One write per line: the newline used to be a second write() and two
 // threads' lines interleaved inside one line (OBS-29 T5).
+//
+// That frame is also why the copy is not verbatim. The text is
+// whatever a command handed cmd_reply — a stored value, a fetched
+// title, a model's line — and none of them own the framing: an LF
+// inside one draws a further line of operator output, and a CR
+// returns the cursor and overwrites the line already there. Both fold
+// to a space, here at the one point both writers pass through.
+//
+// Only those two: this surface is ANSI and the escapes
+// color_translate puts in are the display. Silently, too —
+// bctl_client_send_locked runs under client_mutex, which bctl_clam_cb
+// takes under clam_mutex, so a clam() on this path is a deadlock edge.
 static size_t
 bctl_line_build(char *out, size_t out_sz, const char *text)
 {
@@ -516,6 +528,11 @@ bctl_line_build(char *out, size_t out_sz, const char *text)
     return(0);
 
   memcpy(out, text, n);
+
+  for(size_t i = 0; i < n; i++)
+    if(out[i] == '\r' || out[i] == '\n')
+      out[i] = ' ';
+
   out[n++] = '\n';
   return(n);
 }

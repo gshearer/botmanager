@@ -391,8 +391,11 @@ test_method_stats = executable('test_method_stats',
 # wrongness across a session boundary — one operator's output printed
 # into another's terminal, on a path that runs with the credential
 # context open. These cases drive the real driver over real AF_UNIX
-# clients with two test verbs: one that answers from a pool worker, one
-# that holds a dispatch window open while it does.
+# clients with three test verbs: one that answers from a pool worker,
+# one that holds a dispatch window open while it does, and one that
+# replies with the CR and LF a fetched title or a stored value carries
+# — the frame is a line, so a reply that keeps them draws operator
+# output of its own.
 test_botmanctl_route = executable('test_botmanctl_route',
   'test_botmanctl_route.c',
   include_directories : [include_directories('.'), inc_include],
