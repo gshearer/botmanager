@@ -519,7 +519,7 @@ static const cmd_arg_desc_t ad_subscribe[] = {
   { "sev",   CMD_ARG_DIGITS, CMD_ARG_REQUIRED, 2,                    NULL },
   { "regex", CMD_ARG_NONE,   CMD_ARG_OPTIONAL, CLAM_REGEX_SZ - 1,    NULL },
   { "dests", CMD_ARG_NONE,   CMD_ARG_OPTIONAL | CMD_ARG_REST,
-      PATH_MAX + 128, NULL },
+      0, NULL },
 };
 
 static void
