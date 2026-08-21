@@ -4,6 +4,32 @@
 #define IRC_INTERNAL
 #include "irc.h"
 
+// The trust boundary for everything this driver puts on the wire. A CR or
+// an LF inside the formatted body ends the command there and hands the
+// server the rest as a further one — from a bot that holds OPER — so they
+// are folded to spaces. Nothing arrives here holding a line break on
+// purpose: irc_send_raw supplies the terminator itself.
+//
+// Only those two, and deliberately not the whole control range
+// sig_reason_sanitize folds for the QUIT reason: colour (\x03), bold
+// (\x02), reset (\x0f) and the CTCP markers (\x01) are put in by
+// color_translate and irc_send_emote on purpose and have to reach the
+// channel intact. Returns how many bytes were folded.
+static int
+irc_fold_line_breaks(char *line, int len)
+{
+  int folded = 0;
+
+  for(int i = 0; i < len; i++)
+    if(line[i] == '\r' || line[i] == '\n')
+    {
+      line[i] = ' ';
+      folded++;
+    }
+
+  return(folded);
+}
+
 // Raw IRC line send: format, append CRLF, write to the session.
 // Callers use irc_send_privmsg / irc_send_emote for IRC-specific wrappers;
 // this helper exists for bare protocol commands (NICK, USER, JOIN, ...).
@@ -14,6 +40,7 @@ irc_send_raw(irc_state_t *st, const char *fmt, ...)
   sock_session_t *s;
   va_list ap;
   size_t total;
+  int folded;
   int n;
   bool rc;
 
@@ -26,6 +53,15 @@ irc_send_raw(irc_state_t *st, const char *fmt, ...)
 
   if((size_t)n > sizeof(line) - 3)
     n = (int)(sizeof(line) - 3);
+
+  // After the format, before the terminator: the one place every line
+  // this driver sends passes through, and the only one that can see a
+  // break a caller's %s argument smuggled in.
+  folded = irc_fold_line_breaks(line, n);
+
+  if(folded > 0)
+    clam(CLAM_WARN, "irc", "folded %d line break(s) out of an outbound %.*s",
+        folded, (int)strcspn(line, " "), line);
 
   line[n]     = '\r';
   line[n + 1] = '\n';
