@@ -68,7 +68,7 @@ static const plugin_kv_entry_t atk_kv_schema[] = {
     "across exactly this many ticks" },
   { ATK_KV_DOT_TICK,    KV_UINT32, "20",
     "Seconds between the ticks of an affliction" },
-  { ATK_KV_DOT_STACK,   KV_UINT32, "1",
+  { ATK_KV_DOT_STACK,   KV_UINT32, "3",
     "Afflictions one combatant may carry at once within a round" },
   { ATK_KV_DOT_LINGER,  KV_UINT32, "3600",
     "Seconds the decay task stays queued after the last affliction "
