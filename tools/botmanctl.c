@@ -842,7 +842,17 @@ main_apply_as_user(int fd, const char *as_user)
 
   n = snprintf(as_line, sizeof(as_line), "AS %s\n", as_user);
 
-  if(n > 0 && write(fd, as_line, (size_t)n) != n)
+  // snprintf reports the length the line WOULD have been, not what it
+  // wrote. Refuse rather than clamp: the daemon holds an identity in a
+  // 31-byte field, so a truncated -u would silently assert some other
+  // user whose name is a prefix of this one.
+  if(n < 0 || (size_t)n >= sizeof(as_line))
+  {
+    fprintf(stderr, "identity too long\n");
+    return(false);
+  }
+
+  if(write(fd, as_line, (size_t)n) != n)
   {
     fprintf(stderr, "failed to send AS identity\n");
     return(false);
