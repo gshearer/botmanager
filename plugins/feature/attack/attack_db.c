@@ -696,7 +696,12 @@ atk_db_card_find(uint32_t ns_id, const char *method, const char *channel,
 
   snprintf(sql, sizeof(sql),
       "SELECT id, channel, state, wave, blows,"
+      // The round's whole span, and the silence at the end of it. The
+      // view subtracts the second from the first to end a timed-out
+      // round at its last blow, and measures the second against
+      // round_max_idle_secs to know it timed out at all.
       " EXTRACT(EPOCH FROM (COALESCE(ended_at, NOW()) - started_at))::bigint,"
+      " EXTRACT(EPOCH FROM (NOW() - last_action))::bigint,"
       " top_crit, top_crit_by, top_crit_on, slayer, fallen"
       " FROM %s WHERE ns_id = %" PRIu32 "%s"
       " ORDER BY (state = %d) DESC, last_action DESC LIMIT 1",
@@ -712,11 +717,12 @@ atk_db_card_find(uint32_t ns_id, const char *method, const char *channel,
     out->wave   = atk_col_i32(res, 0, 3);
     out->blows  = atk_col_i32(res, 0, 4);
     out->length = atk_col_i64(res, 0, 5);
-    out->top_crit = atk_col_i32(res, 0, 6);
-    atk_col_str(out->top_by,  sizeof(out->top_by),  res, 0, 7);
-    atk_col_str(out->top_on,  sizeof(out->top_on),  res, 0, 8);
-    atk_col_str(out->slayer,  sizeof(out->slayer),  res, 0, 9);
-    atk_col_str(out->fallen,  sizeof(out->fallen),  res, 0, 10);
+    out->idle   = atk_col_i64(res, 0, 6);
+    out->top_crit = atk_col_i32(res, 0, 7);
+    atk_col_str(out->top_by,  sizeof(out->top_by),  res, 0, 8);
+    atk_col_str(out->top_on,  sizeof(out->top_on),  res, 0, 9);
+    atk_col_str(out->slayer,  sizeof(out->slayer),  res, 0, 10);
+    atk_col_str(out->fallen,  sizeof(out->fallen),  res, 0, 11);
     hit = true;
   }
 

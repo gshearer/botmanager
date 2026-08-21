@@ -378,6 +378,13 @@ typedef struct
   int32_t wave;
   int32_t blows;
   int64_t length;                // seconds start -> end, or -> now
+  // Seconds since last_action, and meaningful on an ACTIVE round only:
+  // it is the clock round_max_idle_secs is measured against, so the view
+  // can tell a brawl still running from one the next !attack will
+  // retire. Nothing reaps a round on a timer, so the row reads ACTIVE
+  // either way. On a finished round it merely counts up from the last
+  // blow and no reader wants it.
+  int64_t idle;
   int32_t top_crit;              // heaviest critical of the round, 0 = none
   char    top_by[ATK_USER_SZ];
   char    top_on[ATK_USER_SZ];

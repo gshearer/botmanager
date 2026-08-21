@@ -364,16 +364,19 @@ atk_show_round(const cmd_ctx_t *ctx)
   atk_card_t     card;
   atk_card_row_t rows [ATK_MAX_PLAYERS];
   atk_dot_mark_t marks[ATK_MAX_PLAYERS];
+  atk_tunables_t t;
   userns_t      *ns;
   const char    *state;
   char           line  [ATK_LINE_SZ];
   char           rule  [ATK_LINE_SZ];
   char           roster[ATK_ROSTER_SZ];
   char           dur   [32];
+  int64_t        span;
   uint32_t       shown;
   uint32_t       n_marks;
   uint32_t       total = 0;
   uint32_t       i;
+  bool           expired;
 
   ns = userns_session_resolve(ctx);
 
@@ -389,11 +392,30 @@ atk_show_round(const cmd_ctx_t *ctx)
     return;
   }
 
-  state = (card.state == ATK_ROUND_ACTIVE)  ? ""
-        : (card.state == ATK_ROUND_ENDED)   ? " · ended"
-        :                                       " · abandoned";
+  atk_tunables_load(&t);
 
-  util_fmt_duration((time_t)card.length, dur, sizeof(dur));
+  // Nothing reaps a round on a timer: the row still reads ACTIVE until
+  // somebody swings again, and only then does `!attack` retire it. All
+  // three verbs already treat a brawl silent for longer than
+  // round_max_idle_secs as over — the same comparison, in the same
+  // direction — and the rulebook promises as much. A card that drew one
+  // as live named combatants who owed a swing in a fight that had
+  // finished.
+  expired = (card.state == ATK_ROUND_ACTIVE) &&
+            card.idle > (int64_t)t.round_max_idle_secs;
+
+  state = expired                            ? " · timed out"
+        : (card.state == ATK_ROUND_ACTIVE)   ? ""
+        : (card.state == ATK_ROUND_ENDED)    ? " · ended"
+        :                                      " · abandoned";
+
+  // A brawl that ran out the clock ended at its last blow, not at the
+  // moment somebody happened to look at it — `length` runs to NOW()
+  // while ended_at is still NULL, so without this the header would set
+  // "timed out" beside a duration still counting up.
+  span = expired ? card.length - card.idle : card.length;
+
+  util_fmt_duration((time_t)span, dur, sizeof(dur));
   atk_rule(rule, sizeof(rule), ATK_W_CARD);
 
   snprintf(line, sizeof(line),
@@ -444,12 +466,24 @@ atk_show_round(const cmd_ctx_t *ctx)
     cmd_reply(ctx, line);
   }
 
-  if(card.state == ATK_ROUND_ACTIVE &&
-     atk_db_pending(card.id, card.wave, roster, sizeof(roster)) == SUCCESS &&
-     roster[0] != '\0')
+  // What the pit is still owed and how long it has to pay: both are
+  // claims about a fight still running, so both stand or fall together.
+  if(card.state == ATK_ROUND_ACTIVE && !expired)
   {
+    if(atk_db_pending(card.id, card.wave, roster, sizeof(roster)) == SUCCESS &&
+       roster[0] != '\0')
+    {
+      snprintf(line, sizeof(line),
+          "⏳ yet to swing this wave: " CLR_CYAN "%s" CLR_RESET, roster);
+      cmd_reply(ctx, line);
+    }
+
+    util_fmt_duration((time_t)((int64_t)t.round_max_idle_secs - card.idle),
+        dur, sizeof(dur));
+
     snprintf(line, sizeof(line),
-        "⏳ yet to swing this wave: " CLR_CYAN "%s" CLR_RESET, roster);
+        "⏱ the pit goes quiet in " CLR_YELLOW "%s" CLR_RESET
+        CLR_GRAY " unless somebody swings." CLR_RESET, dur);
     cmd_reply(ctx, line);
   }
 }
