@@ -62,6 +62,15 @@ irc_send(const char *fmt, ...)
   if(n < 0)
     return;
 
+  // vsnprintf reports the length the line WOULD have been, not the length it
+  // wrote: clamp to what is actually in buf before the CRLF goes on, or a
+  // long line (a 4 KB server PING reaches here) writes past the end of it.
+  if((size_t)n > sizeof(buf) - 3)
+  {
+    fprintf(stderr, "irc_send: line truncated to %zu bytes\n", sizeof(buf) - 3);
+    n = (int)(sizeof(buf) - 3);
+  }
+
   buf[n++] = '\r';
   buf[n++] = '\n';
 
