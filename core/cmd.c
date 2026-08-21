@@ -262,6 +262,19 @@ reg_validate_args(const char *name, const cmd_arg_desc_t *arg_desc,
           "'%s': CMD_ARG_CUSTOM requires a validator function", name);
       return(false);
     }
+
+    // The tokenizer fills one CMD_ARG_SZ row per argument and stops at
+    // maxlen, so a descriptor declaring more than a row holds writes
+    // into the next argument's row. Refusing here is what lets the
+    // parser take maxlen on trust, exactly as it takes arg_count.
+    if(arg_desc[i].maxlen >= CMD_ARG_SZ)
+    {
+      clam(CLAM_WARN, "cmd_register",
+          "'%s': arg '%s' maxlen %zu exceeds token storage (max %u)",
+          name, arg_desc[i].name ? arg_desc[i].name : "?",
+          arg_desc[i].maxlen, (unsigned)(CMD_ARG_SZ - 1));
+      return(false);
+    }
   }
 
   return(true);

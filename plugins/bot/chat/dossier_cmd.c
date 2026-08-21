@@ -81,7 +81,7 @@ static const cmd_arg_desc_t ad_dossier_fact_set[] =
   { "dossier_id", CMD_ARG_DIGITS, CMD_ARG_REQUIRED, 20,                NULL },
   { "kind",       CMD_ARG_ALNUM,  CMD_ARG_REQUIRED, 32,                NULL },
   { "key",        CMD_ARG_NONE,   CMD_ARG_REQUIRED, MEM_FACT_KEY_SZ,   NULL },
-  { "value",      CMD_ARG_NONE,   CMD_ARG_REQUIRED, MEM_FACT_VALUE_SZ, NULL },
+  { "value",      CMD_ARG_NONE,   CMD_ARG_REQUIRED, 0,                 NULL },
   { "conf",       CMD_ARG_NONE,   CMD_ARG_OPTIONAL, 16,                NULL },
 };
 

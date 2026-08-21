@@ -296,6 +296,18 @@ test_curl_flight = executable('test_curl_flight',
 # fault site was inside libc. A mapping is just an address range, so
 # these cases need no dlopen; they drive cmd_invoke() and let a handler
 # ask about its own address.
+# The tokenizer takes a descriptor's maxlen on trust and fills one
+# CMD_ARG_SZ row per argument, so registration is the only place that
+# can establish maxlen fits the row. A missing gate has no error path:
+# an over-declared argument writes into the next argument's row and the
+# handler reads an argv the token after it overwrote.
+test_cmd_argspec = executable('test_cmd_argspec',
+  'test_cmd_argspec.c',
+  include_directories : [include_directories('.'), inc_include],
+  link_with : [test_harness, libcore],
+  dependencies : core_deps,
+)
+
 test_cmd_inflight = executable('test_cmd_inflight',
   'test_cmd_inflight.c',
   include_directories : [include_directories('.'), inc_include],
@@ -470,6 +482,7 @@ test('kv_reset', test_kv_reset)
 test('kv_reclaim', test_kv_reclaim)
 test('curl_submit_wait', test_curl_submit_wait)
 test('curl_flight', test_curl_flight)
+test('cmd_argspec', test_cmd_argspec)
 test('cmd_inflight', test_cmd_inflight)
 test('kraken_ws_channels', test_kraken_ws_channels)
 test('gemini_ws_channels', test_gemini_ws_channels)

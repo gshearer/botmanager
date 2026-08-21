@@ -50,7 +50,9 @@ typedef enum
 
 typedef bool (*cmd_arg_validator_t)(const char *str);
 
-// One positional argument descriptor.
+// One positional argument descriptor. maxlen is bounded by the token
+// row the argument lands in: 0 means the CMD_ARG_SZ - 1 default, and
+// anything larger is refused at registration rather than truncated.
 typedef struct
 {
   const char           *name;      // display name for error messages

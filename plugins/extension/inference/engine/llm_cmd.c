@@ -1628,7 +1628,7 @@ cmd_show_llm_service(const cmd_ctx_t *ctx)
 
 static const cmd_arg_desc_t ad_add_service[] = {
   { "name",     CMD_ARG_NONE, CMD_ARG_REQUIRED, LLM_MODEL_NAME_SZ, NULL },
-  { "base_url", CMD_ARG_NONE, CMD_ARG_REQUIRED, LLM_ENDPOINT_SZ,   NULL },
+  { "base_url", CMD_ARG_NONE, CMD_ARG_REQUIRED, 0,                 NULL },
 };
 
 static const cmd_arg_desc_t ad_add_model[] = {

@@ -468,13 +468,13 @@ static const cmd_arg_desc_t ad_irc_netname[] = {
 
 static const cmd_arg_desc_t ad_irc_srv_add[] = {
   { "network", CMD_ARG_CUSTOM,    CMD_ARG_REQUIRED, IRC_NET_NAME_SZ, irc_valid_name },
-  { "host",    CMD_ARG_HOSTNAME,  CMD_ARG_REQUIRED, IRC_HOST_SZ,     NULL },
+  { "host",    CMD_ARG_HOSTNAME,  CMD_ARG_REQUIRED, IRC_HOST_SZ - 1, NULL },
   { "port",    CMD_ARG_PORT,      CMD_ARG_OPTIONAL, 8,               NULL },
 };
 
 static const cmd_arg_desc_t ad_irc_srv_del[] = {
   { "network", CMD_ARG_CUSTOM,    CMD_ARG_REQUIRED, IRC_NET_NAME_SZ, irc_valid_name },
-  { "host",    CMD_ARG_HOSTNAME,  CMD_ARG_REQUIRED, IRC_HOST_SZ,     NULL },
+  { "host",    CMD_ARG_HOSTNAME,  CMD_ARG_REQUIRED, IRC_HOST_SZ - 1, NULL },
 };
 
 static const cmd_arg_desc_t ad_irc_srv_list[] = {
@@ -484,7 +484,7 @@ static const cmd_arg_desc_t ad_irc_srv_list[] = {
 static const cmd_arg_desc_t ad_irc_chan_add[] = {
   { "bot",     CMD_ARG_ALNUM,   CMD_ARG_REQUIRED, BOT_NAME_SZ,  NULL },
   { "channel", CMD_ARG_CHANNEL, CMD_ARG_REQUIRED, IRC_CHAN_SZ,   NULL },
-  { "key",     CMD_ARG_NONE,    CMD_ARG_OPTIONAL, IRC_LINE_SZ,  NULL },
+  { "key",     CMD_ARG_NONE,    CMD_ARG_OPTIONAL, 0,            NULL },
 };
 
 static const cmd_arg_desc_t ad_irc_chan_del[] = {

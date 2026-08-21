@@ -22,7 +22,7 @@ static bool             math_validate_expr(const char *s);
 
 static const cmd_arg_desc_t math_ad[] = {
   { "expression", CMD_ARG_CUSTOM,
-    CMD_ARG_REQUIRED | CMD_ARG_REST, MATH_EXPR_SZ,
+    CMD_ARG_REQUIRED | CMD_ARG_REST, MATH_EXPR_SZ - 1,
     math_validate_expr },
 };
 

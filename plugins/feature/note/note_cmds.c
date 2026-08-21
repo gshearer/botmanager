@@ -176,7 +176,7 @@ note_cmd_leave(const cmd_ctx_t *ctx)
 static const cmd_arg_desc_t note_args[] = {
   { "user",    CMD_ARG_ALNUM, CMD_ARG_REQUIRED, USERNS_USER_SZ - 1, NULL },
   { "message", CMD_ARG_NONE,  CMD_ARG_REQUIRED | CMD_ARG_REST,
-      NOTE_BODY_SZ - 1, NULL },
+      0, NULL },
 };
 
 // NL hint: "tell X next time you see them that ..." is the natural way

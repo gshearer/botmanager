@@ -37,8 +37,8 @@ cmd_knowledge_root(const cmd_ctx_t *ctx)
 // kw_derive_source_url (knowledge_file.c) for the mapping rules.
 static const cmd_arg_desc_t ad_kw_ingest[] = {
   { "corpus",   CMD_ARG_ALNUM, CMD_ARG_REQUIRED, KNOWLEDGE_CORPUS_NAME_SZ - 1, NULL },
-  { "path",     CMD_ARG_NONE,  CMD_ARG_REQUIRED, 1024, NULL },
-  { "base-url", CMD_ARG_NONE,  CMD_ARG_OPTIONAL, KNOWLEDGE_SOURCE_URL_SZ - 1, NULL },
+  { "path",     CMD_ARG_NONE,  CMD_ARG_REQUIRED, 0, NULL },
+  { "base-url", CMD_ARG_NONE,  CMD_ARG_OPTIONAL, 0, NULL },
 };
 
 static void
