@@ -91,6 +91,26 @@ sub_put(clam_sub_t *s)
   clam_free_count++;
 }
 
+// A clam message IS one line, and every writer that frames it appends
+// the newline itself: clam_file_cb above, the no-subscriber printf
+// below, bctl_clam_cb's stream. The %s arguments do not know that. A
+// trailing break is the writer's own framing and goes; an interior one
+// becomes a space, because the text on both sides of it is still the
+// message. Narrow on purpose — \x02, \x03 and \x0f are display and
+// reach an IRC destination intact.
+static void
+msg_flatten(char *msg, size_t len)
+{
+  size_t i;
+
+  while(len > 0 && (msg[len - 1] == '\n' || msg[len - 1] == '\r'))
+    msg[--len] = '\0';
+
+  for(i = 0; i < len; i++)
+    if(msg[i] == '\n' || msg[i] == '\r')
+      msg[i] = ' ';
+}
+
 // Public API
 
 void
@@ -101,6 +121,7 @@ clam(uint8_t sev, const char *context, const char *fmt, ...)
   time_t     now;
   char       haystack[CLAM_CTX_SZ + CLAM_MSG_SZ + 2];
   bool       haystack_built = false;
+  int        len;
 
   // Re-entry guard: if we're already inside a subscriber dispatch on
   // this thread, drop the event rather than self-deadlock on the
@@ -113,8 +134,18 @@ clam(uint8_t sev, const char *context, const char *fmt, ...)
   strlcpy(m.context, context, CLAM_CTX_SZ);
 
   va_start(ap, fmt);
-  vsnprintf(m.msg, CLAM_MSG_SZ, fmt, ap);
+  len = vsnprintf(m.msg, CLAM_MSG_SZ, fmt, ap);
   va_end(ap);
+
+  // vsnprintf answers what it would have written, so clamp before the
+  // walk rather than measuring the buffer a second time.
+  if(len < 0)
+    len = 0;
+
+  else if((size_t)len >= CLAM_MSG_SZ)
+    len = CLAM_MSG_SZ - 1;
+
+  msg_flatten(m.msg, (size_t)len);
 
   pthread_mutex_lock(&clam_mutex);
 

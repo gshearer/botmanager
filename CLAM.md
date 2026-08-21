@@ -3,7 +3,11 @@
 CLAM is botmanager's internal log/event bus. Every line emitted via
 `clam(sev, ctx, fmt, ...)` carries a **context string** (≤60 chars,
 per `CLAM_CTX_SZ`) and a **message body** (≤1000 chars, per
-`CLAM_MSG_SZ`). Subscribers register a POSIX ERE that is matched
+`CLAM_MSG_SZ`). The body is **one line**: `clam()` drops a trailing
+CR/LF and folds an interior one to a space, because every writer that
+frames a message appends the newline itself — so a subscriber may frame
+`m->msg` as a line without scrubbing it, and a `%s` argument cannot
+forge one. Subscribers register a POSIX ERE that is matched
 against `"<context> <body>"`; matching subscribers receive the
 event via their callback. FATAL messages bypass the filter.
 

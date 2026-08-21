@@ -63,6 +63,19 @@ test_irc_parse = executable('test_irc_parse',
   dependencies : core_deps,
 )
 
+# The third door onto the same defect the two wire folds closed: a clam
+# message is framed as one line by every writer that takes it — the log
+# file, the botmanctl stream, the no-subscriber printf — and its %s
+# arguments carry whatever a caller had. A break in one forges a log
+# entry, stamp and severity included. Driven through the public API,
+# with a subscriber standing in for the writers.
+test_clam = executable('test_clam',
+  'test_clam.c',
+  include_directories : [include_directories('.'), inc_include],
+  link_with : [test_harness, libcore],
+  dependencies : core_deps,
+)
+
 # The other half of the same wire irc_parse.c reads: what this driver
 # hands the socket. A CR or an LF that survives the format ends the
 # command there and the server runs the rest as a further one, from a
@@ -441,6 +454,7 @@ test('display', test_display)
 test('json', test_json)
 test('irc_parse', test_irc_parse)
 test('irc_protocol', test_irc_protocol)
+test('clam', test_clam)
 test('shorturl_token', test_shorturl_token)
 test('db_txn', test_db_txn)
 test('cooldown', test_cooldown)
