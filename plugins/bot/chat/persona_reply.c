@@ -155,6 +155,16 @@ chatbot_persona_reply(void *handle, const cmd_ctx_t *ctx,
   if(st == NULL || ctx == NULL || ctx->msg == NULL)
     return(false);
 
+  // Somebody is already capturing this command's output to voice it --
+  // the NL bridge, or the deferred spine (interpret.c). That is the
+  // PROSE register and it owns its own persona pass, so answering here
+  // would both bypass the collector, which only cmd_reply feeds, and
+  // arrive beside the "(no output)" cue the empty capture settles into.
+  // Declining hands the line back to cmd_reply, which is what the
+  // capture is waiting for. This knob is for the BANGED register.
+  if(ctx->msg->reply_sink_id != 0)
+    return(false);
+
   botname = bot_inst_name(st->inst);
 
   // The conversational half is this bot's whole permission to speak in
