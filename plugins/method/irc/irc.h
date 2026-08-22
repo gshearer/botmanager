@@ -463,37 +463,37 @@ static const method_driver_t irc_driver = {
 
 // Argument specs for IRC subcommands.
 static const cmd_arg_desc_t ad_irc_netname[] = {
-  { "name", CMD_ARG_CUSTOM, CMD_ARG_REQUIRED, IRC_NET_NAME_SZ, irc_valid_name },
+  { "name", CMD_ARG_CUSTOM, CMD_ARG_REQUIRED, IRC_NET_NAME_SZ - 1, irc_valid_name },
 };
 
 static const cmd_arg_desc_t ad_irc_srv_add[] = {
-  { "network", CMD_ARG_CUSTOM,    CMD_ARG_REQUIRED, IRC_NET_NAME_SZ, irc_valid_name },
-  { "host",    CMD_ARG_HOSTNAME,  CMD_ARG_REQUIRED, IRC_HOST_SZ - 1, NULL },
-  { "port",    CMD_ARG_PORT,      CMD_ARG_OPTIONAL, 8,               NULL },
+  { "network", CMD_ARG_CUSTOM,   CMD_ARG_REQUIRED, IRC_NET_NAME_SZ - 1, irc_valid_name },
+  { "host",    CMD_ARG_HOSTNAME, CMD_ARG_REQUIRED, IRC_HOST_SZ - 1,     NULL },
+  { "port",    CMD_ARG_PORT,     CMD_ARG_OPTIONAL, 8,                   NULL },
 };
 
 static const cmd_arg_desc_t ad_irc_srv_del[] = {
-  { "network", CMD_ARG_CUSTOM,    CMD_ARG_REQUIRED, IRC_NET_NAME_SZ, irc_valid_name },
-  { "host",    CMD_ARG_HOSTNAME,  CMD_ARG_REQUIRED, IRC_HOST_SZ - 1, NULL },
+  { "network", CMD_ARG_CUSTOM,   CMD_ARG_REQUIRED, IRC_NET_NAME_SZ - 1, irc_valid_name },
+  { "host",    CMD_ARG_HOSTNAME, CMD_ARG_REQUIRED, IRC_HOST_SZ - 1,     NULL },
 };
 
 static const cmd_arg_desc_t ad_irc_srv_list[] = {
-  { "network", CMD_ARG_CUSTOM, CMD_ARG_OPTIONAL, IRC_NET_NAME_SZ, irc_valid_name },
+  { "network", CMD_ARG_CUSTOM, CMD_ARG_OPTIONAL, IRC_NET_NAME_SZ - 1, irc_valid_name },
 };
 
 static const cmd_arg_desc_t ad_irc_chan_add[] = {
-  { "bot",     CMD_ARG_ALNUM,   CMD_ARG_REQUIRED, BOT_NAME_SZ,  NULL },
-  { "channel", CMD_ARG_CHANNEL, CMD_ARG_REQUIRED, IRC_CHAN_SZ,   NULL },
-  { "key",     CMD_ARG_NONE,    CMD_ARG_OPTIONAL, 0,            NULL },
+  { "bot",     CMD_ARG_ALNUM,   CMD_ARG_REQUIRED, BOT_NAME_SZ - 1, NULL },
+  { "channel", CMD_ARG_CHANNEL, CMD_ARG_REQUIRED, IRC_CHAN_SZ - 1, NULL },
+  { "key",     CMD_ARG_NONE,    CMD_ARG_OPTIONAL, 0,               NULL },
 };
 
 static const cmd_arg_desc_t ad_irc_chan_del[] = {
-  { "bot",     CMD_ARG_ALNUM,   CMD_ARG_REQUIRED, BOT_NAME_SZ, NULL },
-  { "channel", CMD_ARG_CHANNEL, CMD_ARG_REQUIRED, IRC_CHAN_SZ,  NULL },
+  { "bot",     CMD_ARG_ALNUM,   CMD_ARG_REQUIRED, BOT_NAME_SZ - 1, NULL },
+  { "channel", CMD_ARG_CHANNEL, CMD_ARG_REQUIRED, IRC_CHAN_SZ - 1, NULL },
 };
 
 static const cmd_arg_desc_t ad_irc_chan_list[] = {
-  { "bot", CMD_ARG_ALNUM, CMD_ARG_REQUIRED, BOT_NAME_SZ, NULL },
+  { "bot", CMD_ARG_ALNUM, CMD_ARG_REQUIRED, BOT_NAME_SZ - 1, NULL },
 };
 
 #endif // IRC_CMD_INTERNAL

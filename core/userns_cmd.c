@@ -80,59 +80,59 @@ userns_session_resolve(const cmd_ctx_t *ctx)
 // Argument descriptors (no namespace arg — it comes from cd)
 
 static const cmd_arg_desc_t ad_user_cd[] = {
-  { "namespace", CMD_ARG_ALNUM, CMD_ARG_REQUIRED, USERNS_NAME_SZ, NULL },
+  { "namespace", CMD_ARG_ALNUM, CMD_ARG_REQUIRED, USERNS_NAME_SZ - 1, NULL },
 };
 
 static const cmd_arg_desc_t ad_user_add[] = {
-  { "username", CMD_ARG_ALNUM, CMD_ARG_REQUIRED,              USERNS_USER_SZ, NULL },
-  { "password", CMD_ARG_NONE,  CMD_ARG_REQUIRED | CMD_ARG_REST, 0,            NULL },
+  { "username", CMD_ARG_ALNUM, CMD_ARG_REQUIRED,                USERNS_USER_SZ - 1, NULL },
+  { "password", CMD_ARG_NONE,  CMD_ARG_REQUIRED | CMD_ARG_REST, 0,                  NULL },
 };
 
 static const cmd_arg_desc_t ad_user_del[] = {
-  { "username", CMD_ARG_ALNUM, CMD_ARG_REQUIRED, USERNS_USER_SZ, NULL },
+  { "username", CMD_ARG_ALNUM, CMD_ARG_REQUIRED, USERNS_USER_SZ - 1, NULL },
 };
 
 static const cmd_arg_desc_t ad_user_addmfa[] = {
-  { "username", CMD_ARG_ALNUM, CMD_ARG_REQUIRED,                USERNS_USER_SZ, NULL },
-  { "pattern",  CMD_ARG_NONE,  CMD_ARG_REQUIRED | CMD_ARG_REST, 0,              NULL },
+  { "username", CMD_ARG_ALNUM, CMD_ARG_REQUIRED,                USERNS_USER_SZ - 1, NULL },
+  { "pattern",  CMD_ARG_NONE,  CMD_ARG_REQUIRED | CMD_ARG_REST, 0,                  NULL },
 };
 
 static const cmd_arg_desc_t ad_user_delmfa[] = {
-  { "username", CMD_ARG_ALNUM, CMD_ARG_REQUIRED,                USERNS_USER_SZ, NULL },
-  { "pattern",  CMD_ARG_NONE,  CMD_ARG_REQUIRED | CMD_ARG_REST, 0,              NULL },
+  { "username", CMD_ARG_ALNUM, CMD_ARG_REQUIRED,                USERNS_USER_SZ - 1, NULL },
+  { "pattern",  CMD_ARG_NONE,  CMD_ARG_REQUIRED | CMD_ARG_REST, 0,                  NULL },
 };
 
 static const cmd_arg_desc_t ad_user_autoidentify[] = {
-  { "username", CMD_ARG_ALNUM, CMD_ARG_REQUIRED, USERNS_USER_SZ, NULL },
-  { "on|off",   CMD_ARG_ALNUM, CMD_ARG_REQUIRED, 4,              NULL },
+  { "username", CMD_ARG_ALNUM, CMD_ARG_REQUIRED, USERNS_USER_SZ - 1, NULL },
+  { "on|off",   CMD_ARG_ALNUM, CMD_ARG_REQUIRED, 4,                  NULL },
 };
 
 static const cmd_arg_desc_t ad_user_addgroup[] = {
-  { "name",        CMD_ARG_ALNUM, CMD_ARG_REQUIRED,                USERNS_GROUP_SZ, NULL },
-  { "description", CMD_ARG_NONE,  CMD_ARG_REQUIRED | CMD_ARG_REST, 0,               NULL },
+  { "name",        CMD_ARG_ALNUM, CMD_ARG_REQUIRED,                USERNS_GROUP_SZ - 1, NULL },
+  { "description", CMD_ARG_NONE,  CMD_ARG_REQUIRED | CMD_ARG_REST, 0,                   NULL },
 };
 
 static const cmd_arg_desc_t ad_user_delgroup[] = {
-  { "name", CMD_ARG_ALNUM, CMD_ARG_REQUIRED, USERNS_GROUP_SZ, NULL },
+  { "name", CMD_ARG_ALNUM, CMD_ARG_REQUIRED, USERNS_GROUP_SZ - 1, NULL },
 };
 
 static const cmd_arg_desc_t ad_user_grant[] = {
-  { "username", CMD_ARG_ALNUM,  CMD_ARG_REQUIRED, USERNS_USER_SZ,  NULL },
-  { "group",    CMD_ARG_ALNUM,  CMD_ARG_REQUIRED, USERNS_GROUP_SZ, NULL },
-  { "level",    CMD_ARG_CUSTOM, CMD_ARG_REQUIRED, 0,               admin_validate_level },
+  { "username", CMD_ARG_ALNUM,  CMD_ARG_REQUIRED, USERNS_USER_SZ - 1,  NULL },
+  { "group",    CMD_ARG_ALNUM,  CMD_ARG_REQUIRED, USERNS_GROUP_SZ - 1, NULL },
+  { "level",    CMD_ARG_CUSTOM, CMD_ARG_REQUIRED, 0,                   admin_validate_level },
 };
 
 static const cmd_arg_desc_t ad_user_revoke[] = {
-  { "username", CMD_ARG_ALNUM, CMD_ARG_REQUIRED, USERNS_USER_SZ,  NULL },
-  { "group",    CMD_ARG_ALNUM, CMD_ARG_REQUIRED, USERNS_GROUP_SZ, NULL },
+  { "username", CMD_ARG_ALNUM, CMD_ARG_REQUIRED, USERNS_USER_SZ - 1,  NULL },
+  { "group",    CMD_ARG_ALNUM, CMD_ARG_REQUIRED, USERNS_GROUP_SZ - 1, NULL },
 };
 
 static const cmd_arg_desc_t ad_user_addns[] = {
-  { "namespace", CMD_ARG_ALNUM, CMD_ARG_REQUIRED, USERNS_NAME_SZ, NULL },
+  { "namespace", CMD_ARG_ALNUM, CMD_ARG_REQUIRED, USERNS_NAME_SZ - 1, NULL },
 };
 
 static const cmd_arg_desc_t ad_user_delns[] = {
-  { "namespace", CMD_ARG_ALNUM, CMD_ARG_REQUIRED, USERNS_NAME_SZ, NULL },
+  { "namespace", CMD_ARG_ALNUM, CMD_ARG_REQUIRED, USERNS_NAME_SZ - 1, NULL },
 };
 
 // Self-service password change, on the /user side of the tree.
@@ -145,24 +145,24 @@ static const cmd_arg_desc_t ad_user_password[] = {
 // middle "pass" token is an argument, not a subcommand; see
 // set_user_verb_check.
 static const cmd_arg_desc_t ad_set_user[] = {
-  { "username", CMD_ARG_ALNUM,  CMD_ARG_REQUIRED,                USERNS_USER_SZ, NULL },
-  { "pass",     CMD_ARG_CUSTOM, CMD_ARG_REQUIRED,                8,              set_user_verb_check },
-  { "password", CMD_ARG_NONE,   CMD_ARG_REQUIRED | CMD_ARG_REST, 0,              NULL },
+  { "username", CMD_ARG_ALNUM,  CMD_ARG_REQUIRED,                USERNS_USER_SZ - 1, NULL },
+  { "pass",     CMD_ARG_CUSTOM, CMD_ARG_REQUIRED,                8,                  set_user_verb_check },
+  { "password", CMD_ARG_NONE,   CMD_ARG_REQUIRED | CMD_ARG_REST, 0,                  NULL },
 };
 
 static const cmd_arg_desc_t ad_set_user_groupdesc[] = {
-  { "groupname",   CMD_ARG_ALNUM, CMD_ARG_REQUIRED,                USERNS_GROUP_SZ, NULL },
-  { "description", CMD_ARG_NONE,  CMD_ARG_REQUIRED | CMD_ARG_REST, 0,               NULL },
+  { "groupname",   CMD_ARG_ALNUM, CMD_ARG_REQUIRED,                USERNS_GROUP_SZ - 1, NULL },
+  { "description", CMD_ARG_NONE,  CMD_ARG_REQUIRED | CMD_ARG_REST, 0,                   NULL },
 };
 
 // /show subcommand argument descriptors. /show user takes a username
 // and nothing else — it has no verbs.
 static const cmd_arg_desc_t ad_show_user[] = {
-  { "username", CMD_ARG_ALNUM, CMD_ARG_OPTIONAL, USERNS_USER_SZ, NULL },
+  { "username", CMD_ARG_ALNUM, CMD_ARG_OPTIONAL, USERNS_USER_SZ - 1, NULL },
 };
 
 static const cmd_arg_desc_t ad_show_group[] = {
-  { "groupname", CMD_ARG_ALNUM, CMD_ARG_OPTIONAL, USERNS_GROUP_SZ, NULL },
+  { "groupname", CMD_ARG_ALNUM, CMD_ARG_OPTIONAL, USERNS_GROUP_SZ - 1, NULL },
 };
 
 // /user parent — show usage and current namespace

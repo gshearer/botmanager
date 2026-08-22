@@ -55,16 +55,16 @@ typedef struct
 // Argument descriptors
 
 static const cmd_arg_desc_t ad_show_kv[] = {
-  { "prefix", CMD_ARG_NONE, CMD_ARG_OPTIONAL, KV_KEY_SZ, NULL },
+  { "prefix", CMD_ARG_NONE, CMD_ARG_OPTIONAL, KV_KEY_SZ - 1, NULL },
 };
 
 static const cmd_arg_desc_t ad_show_schema[] = {
-  { "plugin", CMD_ARG_ALNUM, CMD_ARG_OPTIONAL, PLUGIN_NAME_SZ, NULL },
-  { "group",  CMD_ARG_ALNUM, CMD_ARG_OPTIONAL, 0,              NULL },
+  { "plugin", CMD_ARG_ALNUM, CMD_ARG_OPTIONAL, PLUGIN_NAME_SZ - 1, NULL },
+  { "group",  CMD_ARG_ALNUM, CMD_ARG_OPTIONAL, 0,                  NULL },
 };
 
 static const cmd_arg_desc_t ad_show_identities[] = {
-  { "botname", CMD_ARG_ALNUM, CMD_ARG_REQUIRED, BOT_NAME_SZ, NULL },
+  { "botname", CMD_ARG_ALNUM, CMD_ARG_REQUIRED, BOT_NAME_SZ - 1, NULL },
 };
 
 // Duration formatter

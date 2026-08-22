@@ -2604,7 +2604,7 @@ plugin_show_scan_available(const char *dir, const cmd_ctx_t *ctx,
 
 // Argument descriptor for /show plugin.
 static const cmd_arg_desc_t ad_show_plugin[] = {
-  { "name", CMD_ARG_ALNUM, CMD_ARG_OPTIONAL, PLUGIN_NAME_SZ, NULL },
+  { "name", CMD_ARG_ALNUM, CMD_ARG_OPTIONAL, PLUGIN_NAME_SZ - 1, NULL },
 };
 
 // Recursively scan a directory for a .so whose descriptor name matches.
@@ -3140,7 +3140,7 @@ plugin_cmd_show(const cmd_ctx_t *ctx)
 
 // Argument descriptor for /plugin load and /plugin unload.
 static const cmd_arg_desc_t ad_plugin_cmd_name[] = {
-  { "name", CMD_ARG_ALNUM, CMD_ARG_REQUIRED, PLUGIN_NAME_SZ, NULL },
+  { "name", CMD_ARG_ALNUM, CMD_ARG_REQUIRED, PLUGIN_NAME_SZ - 1, NULL },
 };
 
 // /plugin parent handler: display usage when no subcommand given.

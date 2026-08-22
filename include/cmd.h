@@ -54,6 +54,10 @@ typedef bool (*cmd_arg_validator_t)(const char *str);
 // row the argument lands in: 0 means the CMD_ARG_SZ - 1 default, and
 // anything larger is refused at registration rather than truncated.
 // Input over it is refused too — the parser never trims a token to fit.
+// It is a LENGTH, not a buffer size: where the consumer stores the token
+// in a char[X_SZ], the descriptor says X_SZ - 1. A bare X_SZ admits one
+// character past what that field holds, and the copy at the far end is
+// the thing that loses it.
 typedef struct
 {
   const char           *name;      // display name for error messages

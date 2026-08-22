@@ -1627,38 +1627,38 @@ cmd_show_llm_service(const cmd_ctx_t *ctx)
 // -----------------------------------------------------------------------
 
 static const cmd_arg_desc_t ad_add_service[] = {
-  { "name",     CMD_ARG_NONE, CMD_ARG_REQUIRED, LLM_MODEL_NAME_SZ, NULL },
-  { "base_url", CMD_ARG_NONE, CMD_ARG_REQUIRED, 0,                 NULL },
+  { "name",     CMD_ARG_NONE, CMD_ARG_REQUIRED, LLM_MODEL_NAME_SZ - 1, NULL },
+  { "base_url", CMD_ARG_NONE, CMD_ARG_REQUIRED, 0,                     NULL },
 };
 
 static const cmd_arg_desc_t ad_add_model[] = {
-  { "type",     CMD_ARG_NONE, CMD_ARG_REQUIRED, 16,                NULL },
-  { "name",     CMD_ARG_NONE, CMD_ARG_REQUIRED, LLM_MODEL_NAME_SZ, NULL },
-  { "service",  CMD_ARG_NONE, CMD_ARG_REQUIRED, LLM_MODEL_NAME_SZ, NULL },
-  { "model_id", CMD_ARG_NONE, CMD_ARG_REQUIRED, LLM_MODEL_ID_SZ,   NULL },
+  { "type",     CMD_ARG_NONE, CMD_ARG_REQUIRED, 16,                    NULL },
+  { "name",     CMD_ARG_NONE, CMD_ARG_REQUIRED, LLM_MODEL_NAME_SZ - 1, NULL },
+  { "service",  CMD_ARG_NONE, CMD_ARG_REQUIRED, LLM_MODEL_NAME_SZ - 1, NULL },
+  { "model_id", CMD_ARG_NONE, CMD_ARG_REQUIRED, LLM_MODEL_ID_SZ - 1,   NULL },
 };
 
 static const cmd_arg_desc_t ad_del_one[] = {
-  { "name", CMD_ARG_NONE, CMD_ARG_REQUIRED, LLM_MODEL_NAME_SZ, NULL },
+  { "name", CMD_ARG_NONE, CMD_ARG_REQUIRED, LLM_MODEL_NAME_SZ - 1, NULL },
 };
 
 static const cmd_arg_desc_t ad_llm_service[] = {
-  { "name",   CMD_ARG_NONE, CMD_ARG_REQUIRED, LLM_MODEL_NAME_SZ, NULL },
-  { "action", CMD_ARG_NONE, CMD_ARG_REQUIRED, 16,                NULL },
+  { "name",   CMD_ARG_NONE, CMD_ARG_REQUIRED, LLM_MODEL_NAME_SZ - 1, NULL },
+  { "action", CMD_ARG_NONE, CMD_ARG_REQUIRED, 16,                    NULL },
 };
 
 static const cmd_arg_desc_t ad_llm_probe[] = {
-  { "name", CMD_ARG_NONE, CMD_ARG_REQUIRED, LLM_MODEL_NAME_SZ, NULL },
+  { "name", CMD_ARG_NONE, CMD_ARG_REQUIRED, LLM_MODEL_NAME_SZ - 1, NULL },
 };
 
 static const cmd_arg_desc_t ad_llm_test[] = {
-  { "name",   CMD_ARG_NONE, CMD_ARG_REQUIRED, LLM_MODEL_NAME_SZ, NULL },
-  { "prompt", CMD_ARG_NONE, CMD_ARG_OPTIONAL | CMD_ARG_REST, 0,  NULL },
+  { "name",   CMD_ARG_NONE, CMD_ARG_REQUIRED,                LLM_MODEL_NAME_SZ - 1, NULL },
+  { "prompt", CMD_ARG_NONE, CMD_ARG_OPTIONAL | CMD_ARG_REST, 0,                     NULL },
 };
 
 static const cmd_arg_desc_t ad_show_service[] = {
-  { "name",   CMD_ARG_NONE, CMD_ARG_OPTIONAL, LLM_MODEL_NAME_SZ, NULL },
-  { "action", CMD_ARG_NONE, CMD_ARG_OPTIONAL, 16,                NULL },
+  { "name",   CMD_ARG_NONE, CMD_ARG_OPTIONAL, LLM_MODEL_NAME_SZ - 1, NULL },
+  { "action", CMD_ARG_NONE, CMD_ARG_OPTIONAL, 16,                    NULL },
 };
 
 static void

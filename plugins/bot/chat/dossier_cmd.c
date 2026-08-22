@@ -66,9 +66,9 @@ chatbot_dossiersweep_cmd_register(void)
 
 static const cmd_arg_desc_t ad_dossier_merge[] =
 {
-  { "bot",      CMD_ARG_ALNUM, CMD_ARG_REQUIRED, BOT_NAME_SZ,        NULL },
-  { "username", CMD_ARG_ALNUM, CMD_ARG_REQUIRED, USERNS_USER_SZ - 1, NULL },
-  { "ids",      CMD_ARG_NONE,  CMD_ARG_REQUIRED | CMD_ARG_REST, 0,   NULL },
+  { "bot",      CMD_ARG_ALNUM, CMD_ARG_REQUIRED,                BOT_NAME_SZ - 1,    NULL },
+  { "username", CMD_ARG_ALNUM, CMD_ARG_REQUIRED,                USERNS_USER_SZ - 1, NULL },
+  { "ids",      CMD_ARG_NONE,  CMD_ARG_REQUIRED | CMD_ARG_REST, 0,                  NULL },
 };
 
 static const cmd_arg_desc_t ad_dossier_split[] =
@@ -78,11 +78,11 @@ static const cmd_arg_desc_t ad_dossier_split[] =
 
 static const cmd_arg_desc_t ad_dossier_fact_set[] =
 {
-  { "dossier_id", CMD_ARG_DIGITS, CMD_ARG_REQUIRED, 20,                NULL },
-  { "kind",       CMD_ARG_ALNUM,  CMD_ARG_REQUIRED, 32,                NULL },
-  { "key",        CMD_ARG_NONE,   CMD_ARG_REQUIRED, MEM_FACT_KEY_SZ,   NULL },
-  { "value",      CMD_ARG_NONE,   CMD_ARG_REQUIRED, 0,                 NULL },
-  { "conf",       CMD_ARG_NONE,   CMD_ARG_OPTIONAL, 16,                NULL },
+  { "dossier_id", CMD_ARG_DIGITS, CMD_ARG_REQUIRED, 20,                  NULL },
+  { "kind",       CMD_ARG_ALNUM,  CMD_ARG_REQUIRED, 32,                  NULL },
+  { "key",        CMD_ARG_NONE,   CMD_ARG_REQUIRED, MEM_FACT_KEY_SZ - 1, NULL },
+  { "value",      CMD_ARG_NONE,   CMD_ARG_REQUIRED, 0,                   NULL },
+  { "conf",       CMD_ARG_NONE,   CMD_ARG_OPTIONAL, 16,                  NULL },
 };
 
 static const cmd_arg_desc_t ad_dossier_fact_del[] =

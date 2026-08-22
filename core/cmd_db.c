@@ -83,7 +83,7 @@ db_validate_table_name(const char *str)
 // -----------------------------------------------------------------------
 
 static const cmd_arg_desc_t ad_db_delete_kv[] = {
-  { "key", CMD_ARG_CUSTOM, CMD_ARG_REQUIRED, KV_KEY_SZ, db_validate_kv_key },
+  { "key", CMD_ARG_CUSTOM, CMD_ARG_REQUIRED, KV_KEY_SZ - 1, db_validate_kv_key },
 };
 
 // -----------------------------------------------------------------------

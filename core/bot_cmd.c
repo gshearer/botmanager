@@ -36,17 +36,17 @@ resolve_named_bot(const cmd_ctx_t *ctx, const char *name)
 // Argument descriptors
 
 static const cmd_arg_desc_t ad_bot_name_kind[] = {
-  { "name", CMD_ARG_ALNUM, CMD_ARG_REQUIRED, BOT_NAME_SZ,    NULL },
-  { "kind", CMD_ARG_NONE,  CMD_ARG_OPTIONAL, PLUGIN_NAME_SZ, NULL },
+  { "name", CMD_ARG_ALNUM, CMD_ARG_REQUIRED, BOT_NAME_SZ - 1,    NULL },
+  { "kind", CMD_ARG_NONE,  CMD_ARG_OPTIONAL, PLUGIN_NAME_SZ - 1, NULL },
 };
 
 static const cmd_arg_desc_t ad_bot_name[] = {
-  { "name", CMD_ARG_ALNUM, CMD_ARG_REQUIRED, BOT_NAME_SZ, NULL },
+  { "name", CMD_ARG_ALNUM, CMD_ARG_REQUIRED, BOT_NAME_SZ - 1, NULL },
 };
 
 static const cmd_arg_desc_t ad_bot_method[] = {
-  { "name",   CMD_ARG_ALNUM, CMD_ARG_REQUIRED, BOT_NAME_SZ,    NULL },
-  { "method", CMD_ARG_ALNUM, CMD_ARG_REQUIRED, PLUGIN_NAME_SZ, NULL },
+  { "name",   CMD_ARG_ALNUM, CMD_ARG_REQUIRED, BOT_NAME_SZ - 1,    NULL },
+  { "method", CMD_ARG_ALNUM, CMD_ARG_REQUIRED, PLUGIN_NAME_SZ - 1, NULL },
 };
 
 // What a scan of the loaded plugins found on the PLUGIN_BOT axis: the
@@ -307,9 +307,9 @@ admin_cmd_bot_stop(const cmd_ctx_t *ctx)
 // for out-of-band announcements — e.g. the strategy competitors posting
 // their scoreboard row to #cabal via the "botman" command bot.
 static const cmd_arg_desc_t ad_say[] = {
-  { "bot",     CMD_ARG_ALNUM, CMD_ARG_REQUIRED,               BOT_NAME_SZ, NULL },
-  { "target",  CMD_ARG_NONE,  CMD_ARG_REQUIRED,               0,           NULL },
-  { "message", CMD_ARG_NONE,  CMD_ARG_REQUIRED | CMD_ARG_REST, 0,          NULL },
+  { "bot",     CMD_ARG_ALNUM, CMD_ARG_REQUIRED,                BOT_NAME_SZ - 1, NULL },
+  { "target",  CMD_ARG_NONE,  CMD_ARG_REQUIRED,                0,               NULL },
+  { "message", CMD_ARG_NONE,  CMD_ARG_REQUIRED | CMD_ARG_REST, 0,               NULL },
 };
 
 static void
@@ -715,8 +715,8 @@ cmd_show_bots(const cmd_ctx_t *ctx)
 // with a kind_filter that names a method the bot has bound.
 
 static const cmd_arg_desc_t ad_show_bot[] = {
-  { "name", CMD_ARG_ALNUM, CMD_ARG_REQUIRED,            BOT_NAME_SZ, NULL },
-  { "rest", CMD_ARG_NONE,  CMD_ARG_OPTIONAL | CMD_ARG_REST, 0,       NULL },
+  { "name", CMD_ARG_ALNUM, CMD_ARG_REQUIRED,                BOT_NAME_SZ - 1, NULL },
+  { "rest", CMD_ARG_NONE,  CMD_ARG_OPTIONAL | CMD_ARG_REST, 0,               NULL },
 };
 
 static const char *

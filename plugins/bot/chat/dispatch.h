@@ -54,8 +54,8 @@ void text_dispatch_summary(const cmd_ctx_t *ctx, bot_inst_t *bot);
 
 // Argument descriptors for the authentication commands.
 static const cmd_arg_desc_t text_ad_identify[] = {
-  { "username", CMD_ARG_ALNUM, CMD_ARG_REQUIRED,              USERNS_USER_SZ, NULL },
-  { "password", CMD_ARG_NONE,  CMD_ARG_REQUIRED | CMD_ARG_REST, 0,            NULL },
+  { "username", CMD_ARG_ALNUM, CMD_ARG_REQUIRED,                USERNS_USER_SZ - 1, NULL },
+  { "password", CMD_ARG_NONE,  CMD_ARG_REQUIRED | CMD_ARG_REST, 0,                  NULL },
 };
 
 static const cmd_arg_desc_t text_ad_register[] = {
@@ -63,7 +63,7 @@ static const cmd_arg_desc_t text_ad_register[] = {
 };
 
 static const cmd_arg_desc_t text_ad_id[] = {
-  { "nickname", CMD_ARG_ALNUM, CMD_ARG_OPTIONAL, METHOD_SENDER_SZ, NULL },
+  { "nickname", CMD_ARG_ALNUM, CMD_ARG_OPTIONAL, METHOD_SENDER_SZ - 1, NULL },
 };
 
 #endif // TEXT_DISPATCH_INTERNAL

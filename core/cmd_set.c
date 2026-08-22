@@ -44,8 +44,8 @@ validate_kv_key(const char *str)
 // Argument descriptors
 
 static const cmd_arg_desc_t ad_set_kv[] = {
-  { "key",   CMD_ARG_CUSTOM, CMD_ARG_REQUIRED,                KV_KEY_SZ, validate_kv_key },
-  { "value", CMD_ARG_NONE,   CMD_ARG_OPTIONAL | CMD_ARG_REST, 0,         NULL },
+  { "key",   CMD_ARG_CUSTOM, CMD_ARG_REQUIRED,                KV_KEY_SZ - 1, validate_kv_key },
+  { "value", CMD_ARG_NONE,   CMD_ARG_OPTIONAL | CMD_ARG_REST, 0,             NULL },
 };
 
 // /set kv <key> <value>  ·  /set kv --clear <key>  ·  --delete <key>
@@ -265,8 +265,8 @@ static const char set_bot_usage[] =
     "set bot <bot> --clear|--delete [<kind>] <key>";
 
 static const cmd_arg_desc_t ad_set_bot[] = {
-  { "bot",  CMD_ARG_ALNUM, CMD_ARG_REQUIRED,                BOT_NAME_SZ, NULL },
-  { "rest", CMD_ARG_NONE,  CMD_ARG_REQUIRED | CMD_ARG_REST, 0,           NULL },
+  { "bot",  CMD_ARG_ALNUM, CMD_ARG_REQUIRED,                BOT_NAME_SZ - 1, NULL },
+  { "rest", CMD_ARG_NONE,  CMD_ARG_REQUIRED | CMD_ARG_REST, 0,               NULL },
 };
 
 // One whitespace-delimited token. Advances *p past the token and the

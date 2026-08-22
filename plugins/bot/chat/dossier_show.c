@@ -379,8 +379,8 @@ render_candidate_row(const cmd_ctx_t *ctx, const dossier_info_t *info)
 
 static const cmd_arg_desc_t ad_show_dossiers_candidates[] =
 {
-  { "bot",  CMD_ARG_ALNUM, CMD_ARG_REQUIRED, BOT_NAME_SZ,    NULL },
-  { "user", CMD_ARG_ALNUM, CMD_ARG_REQUIRED, USERNS_USER_SZ, NULL },
+  { "bot",  CMD_ARG_ALNUM, CMD_ARG_REQUIRED, BOT_NAME_SZ - 1,    NULL },
+  { "user", CMD_ARG_ALNUM, CMD_ARG_REQUIRED, USERNS_USER_SZ - 1, NULL },
 };
 
 static void
