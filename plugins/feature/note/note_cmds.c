@@ -101,8 +101,8 @@ note_cmd_leave(const cmd_ctx_t *ctx)
 
   if(lastseen > 0 && (time(NULL) - lastseen) < (time_t)min_idle)
   {
-    char idle[32];
-    char window[32];
+    char idle  [UTIL_DURATION_SZ];
+    char window[UTIL_DURATION_SZ];
 
     util_fmt_duration(time(NULL) - lastseen, idle, sizeof(idle));
     util_fmt_duration((time_t)min_idle, window, sizeof(window));

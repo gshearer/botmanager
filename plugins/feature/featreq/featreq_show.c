@@ -88,14 +88,13 @@ typedef struct
 #define FR_FIT_SZ    (DISPLAY_COLS * 4 + 8)
 #define FR_CELL_SZ   (FR_FIT_SZ + 8)
 
-// A dated line's three buffers. Each is sized for what it can actually
-// hold — "2026-08-21 22:22" and util_fmt_duration's widest form, which
-// is "<days>d<hours>h" — because slack in an intermediate is not free
-// here: the compiler prices an snprintf by its arguments' DECLARED
-// sizes, so a 64-byte date and a 32-byte age joined into a stamp read
-// as a possible truncation of a line that in practice runs to forty.
+// A dated line's buffers. Each is sized for what it can actually hold —
+// "2026-08-21 22:22", and UTIL_DURATION_SZ for the age — because slack
+// in an intermediate is not free here: the compiler prices an snprintf
+// by its arguments' DECLARED sizes, so a 64-byte date and a 32-byte age
+// joined into a stamp read as a possible truncation of a line that in
+// practice runs to forty.
 #define FR_DATE_SZ   24
-#define FR_AGE_SZ    16
 #define FR_STAMP_SZ  96
 
 // ------------------------------------------------------------------ //
@@ -167,7 +166,7 @@ fr_stamp_text(char *out, size_t cap, time_t when, time_t now)
 {
   struct tm tm;
   char      date[FR_DATE_SZ];
-  char      age [FR_AGE_SZ];
+  char      age [UTIL_DURATION_SZ];
 
   if(when <= 0 || localtime_r(&when, &tm) == NULL)
   {
@@ -244,7 +243,7 @@ fr_cols_measure(const db_result_t *res, time_t now, fr_cols_t *w)
     fr_type_t   type   = FR_TYPE_FEAT;
     fr_status_t status = FR_ST_NEW;
     char        buf[FR_WORD_SZ];
-    char        age[FR_AGE_SZ];
+    char        age[UTIL_DURATION_SZ];
 
     snprintf(buf, sizeof(buf), "#%" PRId64,
         db_result_get_i64(res, i, FR_COL_ID, 0));
@@ -331,7 +330,7 @@ fr_table_row(const cmd_ctx_t *ctx, const db_result_t *res, uint32_t row,
   fr_type_t   type   = FR_TYPE_FEAT;
   fr_status_t status = FR_ST_NEW;
   char        word[FR_WORD_SZ];
-  char        age [FR_AGE_SZ];
+  char        age [UTIL_DURATION_SZ];
   char        cell[FR_CELL_SZ];
   char        line[FR_LINE_SZ];
 
@@ -548,7 +547,7 @@ fr_card(const cmd_ctx_t *ctx, const db_result_t *res)
   char        who [FR_NAME_SZ * 4];
   char        tail[FR_NAME_SZ * 4];
   char        stamp[FR_STAMP_SZ];
-  char        age  [FR_AGE_SZ];
+  char        age  [UTIL_DURATION_SZ];
   char        line[FR_LINE_SZ];
   char        rule[FR_LINE_SZ];
 

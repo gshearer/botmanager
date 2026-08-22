@@ -764,7 +764,7 @@ static void
 pool_persist_cb(const task_iter_info_t *info, void *data)
 {
   pool_persist_state_t *st;
-  char age[16];
+  char age[UTIL_DURATION_SZ];
   char line[256];
 
   if(info->kind != TASK_PERSIST) return;

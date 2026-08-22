@@ -791,7 +791,7 @@ task_show_cb(const task_iter_info_t *info, void *data)
   task_show_state_t *st = data;
   char               line[512];
   time_t             now = time(NULL);
-  char               age[16];
+  char               age[UTIL_DURATION_SZ];
   char               extra[32] = "";
 
   // Age: time since creation.
@@ -804,7 +804,7 @@ task_show_cb(const task_iter_info_t *info, void *data)
 
   else if(info->state == TASK_SLEEPING && info->sleep_until > now)
   {
-    char rem[16];
+    char rem[UTIL_DURATION_SZ];
 
     util_fmt_duration(info->sleep_until - now, rem, sizeof(rem));
     snprintf(extra, sizeof(extra), "in %s", rem);

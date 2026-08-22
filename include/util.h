@@ -19,6 +19,12 @@ void util_fmt_bytes(size_t bytes, char *buf, size_t sz);
 // Format seconds into a compact human-readable duration.
 // Output examples: "12s", "3m42s", "2h15m", "1d6h". Negative input is
 // clamped to 0.
+//
+// UTIL_DURATION_SZ is the whole output space, so a caller never has to
+// derive one: the widest form is "<days>d<hours>h", and at the top of a
+// 64-bit time_t that is "106751991167300d23h" plus its NUL.
+#define UTIL_DURATION_SZ 20
+
 void util_fmt_duration(time_t secs, char *buf, size_t sz);
 
 // Case-sensitive 32-bit FNV-1a hash.

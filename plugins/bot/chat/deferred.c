@@ -544,7 +544,7 @@ deferred_deliver_row(const char *bot_name, uint32_t ns_id,
   const char  *expired = db_result_get(res, i, DC_EXPIRED);
   char         source[24];
   char         body[CMD_ARG_SZ];
-  char         ago[32];
+  char         ago[UTIL_DURATION_SZ];
 
   db_result_copy(source, sizeof(source), res, i, DC_SOURCE);
 
@@ -1112,7 +1112,7 @@ deferred_render(const cmd_ctx_t *ctx, const db_result_t *res, bool with_who)
 
   for(uint32_t i = 0; i < res->rows; i++)
   {
-    char        due  [32];
+    char        due  [UTIL_DURATION_SZ];
     char        who  [160] = "";
     char        id   [24];
     char        src  [24];

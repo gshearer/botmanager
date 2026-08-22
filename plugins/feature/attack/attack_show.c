@@ -370,7 +370,7 @@ atk_show_round(const cmd_ctx_t *ctx)
   char           line  [ATK_LINE_SZ];
   char           rule  [ATK_LINE_SZ];
   char           roster[ATK_ROSTER_SZ];
-  char           dur   [32];
+  char           dur   [UTIL_DURATION_SZ];
   int64_t        span;
   uint32_t       shown;
   uint32_t       n_marks;

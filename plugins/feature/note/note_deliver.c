@@ -211,7 +211,7 @@ note_deliver_task(task_t *t)
 
   for(int i = 0; i < got; i++)
   {
-    char age[32];
+    char age[UTIL_DURATION_SZ];
     char line[NOTE_BODY_SZ + 256];
 
     util_fmt_duration(now - rows[i].created, age, sizeof(age));

@@ -614,7 +614,7 @@ cmd_show_bot_watchlist(const cmd_ctx_t *ctx)
     int64_t     armed = db_result_get_i64(res, i, 4, 0);
     char        pair[EXCHANGE_PRODUCT_ID_SZ];
     char        price[48];
-    char        age[32];
+    char        age[UTIL_DURATION_SZ];
     char        line[256];
 
     db_result_copy(pair, sizeof(pair), res, i, 0);

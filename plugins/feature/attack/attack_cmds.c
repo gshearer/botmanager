@@ -101,7 +101,7 @@ static void
 atk_cmd_end(const cmd_ctx_t *ctx, const userns_t *ns)
 {
   atk_round_t round;
-  char        age [64];
+  char        age [UTIL_DURATION_SZ];
   char        line[ATK_LINE_SZ];
   const char *who;
   bool        found;
