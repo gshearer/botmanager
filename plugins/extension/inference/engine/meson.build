@@ -7,6 +7,7 @@ inference_sources = [
   'knowledge.c',
   'knowledge_cmd.c',
   'knowledge_file.c',
+  'knowledge_fetch.c',
   'acquire.c',
   'acquire_html.c',
   'acquire_cmd.c',

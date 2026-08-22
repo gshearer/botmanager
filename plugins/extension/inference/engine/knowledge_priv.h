@@ -110,6 +110,7 @@ knowledge_chunk_rc_t knowledge_insert_chunk(const char *corpus,
     int64_t *out_id);
 
 void knowledge_corpus_mark_page_chunked(const char *corpus);
+bool knowledge_corpus_is_page_chunked(const char *corpus);
 
 uint32_t knowledge_page_supersede(const char *corpus,
     const char *source_url, const char *section_heading, int64_t keep_id);
@@ -136,6 +137,12 @@ uint32_t knowledge_get_chunk_embedding(int64_t chunk_id, float *out,
     uint32_t out_cap);
 
 void knowledge_get_stats(knowledge_stats_t *out);
+
+// URL-fetch knobs for /knowledge ingest. Read live off KV at fetch
+// time rather than cached in knowledge_cfg_t — curl copies both, and
+// neither is on a hot path.
+#define KW_KV_FETCH_UA       "knowledge.fetch_user_agent"
+#define KW_KV_FETCH_TIMEOUT  "knowledge.fetch_timeout_secs"
 
 #define KNOWLEDGE_DEF_RAG_TOP_K          5
 #define KNOWLEDGE_DEF_RAG_MAX_CTX_CHARS  3072
@@ -222,5 +229,23 @@ typedef struct
 // an ingest that stopped early); fills `out` either way.
 bool knowledge_ingest_path(const char *corpus, const char *path,
     const char *base_url_or_NULL, knowledge_ingest_stats_t *out);
+
+// In-memory twin of knowledge_ingest_path, for a body that never was a
+// file. FAIL on a NULL or empty body; fills `out` either way.
+bool knowledge_ingest_text(const char *corpus, const char *source_url,
+    const char *section_heading, const char *body, size_t len,
+    knowledge_ingest_stats_t *out);
+
+// URL ingest — owned by knowledge_fetch.c, driven by the /knowledge
+// ingest command when its path argument carries an http(s) scheme.
+// Replies to `ctx` asynchronously; the corpus upsert is its own.
+struct cmd_ctx;
+#ifndef BM_CMD_CTX_T_DEFINED
+#define BM_CMD_CTX_T_DEFINED
+typedef struct cmd_ctx cmd_ctx_t;
+#endif
+
+void knowledge_fetch_start(const cmd_ctx_t *ctx, const char *corpus,
+    const char *url);
 
 #endif // BM_KNOWLEDGE_PRIV_H

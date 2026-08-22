@@ -139,6 +139,18 @@ knowledge_register_kv(void)
       " utilisation on batching-aware embed endpoints; bounded at"
       " compile time by KNOWLEDGE_EMBED_BATCH_MAX. Default 32.");
 
+  // A fetch wears a browser's name for the same reason urlgrabber's does:
+  // declaring ourselves a bot draws a WAF challenge that silently starves
+  // whole sites. The value is a knob because the arms race outlives any
+  // compiled default, and an empty one legally means "send no User-Agent".
+  kv_register(KW_KV_FETCH_UA, KV_STR,
+      "Mozilla/5.0 (X11; Linux x86_64; rv:128.0) Gecko/20100101 Firefox/128.0",
+      NULL, NULL,
+      "User-Agent sent when /knowledge ingest fetches a URL");
+  kv_register(KW_KV_FETCH_TIMEOUT, KV_UINT32, "20",
+      NULL, NULL,
+      "HTTP timeout in seconds for a /knowledge ingest URL fetch");
+
   // Reply-pipeline image/citation knobs. reply.c reads them directly
   // via kv_get_* at submit time, so no cfg cache slot is needed; the
   // registration just pins the key + default + help text.
@@ -1119,6 +1131,45 @@ knowledge_corpus_mark_page_chunked(const char *corpus)
 
   db_result_free(res);
   mem_free(e_corp);
+}
+
+// Reads the flag its `mark_` twin sets. A corpus that does not exist,
+// and a query that could not run, both answer false: the one caller is
+// deciding whether to warn, and inventing a warning out of a DB fault
+// would be the less honest of the two mistakes.
+bool
+knowledge_corpus_is_page_chunked(const char *corpus)
+{
+  char *e_corp;
+  char sql[256];
+  db_result_t *res;
+  bool flagged;
+
+  if(!knowledge_ready || corpus == NULL || corpus[0] == '\0')
+    return(false);
+
+  e_corp = db_escape(corpus);
+
+  if(e_corp == NULL)
+    return(false);
+
+  snprintf(sql, sizeof(sql),
+      "SELECT page_chunked FROM knowledge_corpora WHERE name = '%s'",
+      e_corp);
+
+  res = db_result_alloc();
+  flagged = false;
+
+  if(db_query(sql, res) == SUCCESS && res->ok && res->rows == 1)
+  {
+    const char *v = db_result_get(res, 0, 0);
+
+    flagged = (v != NULL && (v[0] == 't' || v[0] == 'T' || v[0] == '1'));
+  }
+
+  db_result_free(res);
+  mem_free(e_corp);
+  return(flagged);
 }
 
 // A *page chunk* is the whole digest of one page, so a corpus holds at

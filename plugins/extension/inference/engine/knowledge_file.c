@@ -1,5 +1,5 @@
 // botmanager — MIT
-// Knowledge file ingest: slurp, UTF-8-safe chunker, markdown/plain walker.
+// Knowledge ingest: slurp, UTF-8-safe chunkers, file walker, text entry.
 
 #include "knowledge_priv.h"
 
@@ -445,6 +445,57 @@ kw_chunk_plaintext(kw_ingest_t *ing, const char *body)
   mem_free(buf);
 }
 
+// Size-only splitter for a body with no structure left in it. The HTML
+// stripper collapses every whitespace run — newlines included — so a
+// fetched page arrives as one line: kw_chunk_plaintext finds no "\n\n",
+// measures the whole body as a single paragraph, refuses it against its
+// buffer and emits nothing at all. Break on the size budget instead,
+// backing up to the last space so a chunk does not end mid-word, and
+// carry the same overlap the other two carry.
+//
+// The heading belongs to the caller here — it names the page, not a
+// section — so unlike its two siblings this one does not reset it.
+static void
+kw_chunk_flow(kw_ingest_t *ing, const char *body, size_t len)
+{
+  size_t pos = 0;
+
+  if(body == NULL || len == 0) return;
+
+  while(pos < len)
+  {
+    size_t take = len - pos;
+    size_t back;
+
+    if(take <= ing->chunk_max)
+    {
+      kw_emit_chunk(ing, body + pos, body + len);
+      return;
+    }
+
+    take = ing->chunk_max;
+    back = take;
+
+    // Back up to the last space in the window. The floor keeps `take`
+    // above the overlap, which is what makes the advance below strictly
+    // positive: a window of unbroken bytes — a base64 blob, CJK with no
+    // spaces — splits mid-token rather than looping forever. chunk_max is
+    // clamped at 256 and the floor is 201, so the window always has room.
+    while(back > KNOWLEDGE_CHUNK_OVERLAP + 1 && body[pos + back] != ' ')
+      back--;
+
+    if(back > KNOWLEDGE_CHUNK_OVERLAP + 1)
+      take = back;
+
+    kw_emit_chunk(ing, body + pos, body + pos + take);
+
+    if(ing->batch != NULL && ing->batch->aborted)
+      return;
+
+    pos += take - KNOWLEDGE_CHUNK_OVERLAP;
+  }
+}
+
 static bool
 kw_path_has_ext(const char *path, const char *ext)
 {
@@ -536,6 +587,39 @@ kw_ingest_file(const char *corpus, const char *path,
   acc->reembedded += ing.reembedded;
 }
 
+// Open the embed accumulator an ingest walk runs against, and hand back
+// the clamped chunk size it should split at. Both entry points below
+// need the identical eighteen lines: a config snapshot, the two clamps,
+// and one embed-model resolve — resolved once here rather than per
+// chunk, because a model swap mid-walk mixes vector dimensions into the
+// same corpus. The caller owns `out_batch` and must knowledge_batch_free
+// it; that closing flush is where the final stats appear.
+static void
+kw_batch_open(const char *corpus, uint32_t *out_chunk_max,
+    knowledge_batch_t *out_batch)
+{
+  knowledge_cfg_t cfg;
+  uint32_t chunk_max;
+  uint32_t batch_size;
+  char embed_model[KNOWLEDGE_EMBED_MODEL_SZ];
+
+  knowledge_cfg_snapshot(&cfg);
+  chunk_max = cfg.chunk_max_chars;
+  if(chunk_max < 256) chunk_max = 256;
+  if(chunk_max > 8192) chunk_max = 8192;
+
+  batch_size = cfg.embed_batch_size;
+  if(batch_size == 0)
+    batch_size = KNOWLEDGE_DEF_EMBED_BATCH_SIZE;
+  if(batch_size > KNOWLEDGE_EMBED_BATCH_MAX)
+    batch_size = KNOWLEDGE_EMBED_BATCH_MAX;
+
+  knowledge_effective_embed_model(embed_model, sizeof(embed_model));
+
+  knowledge_batch_init(out_batch, corpus, embed_model, batch_size);
+  *out_chunk_max = chunk_max;
+}
+
 // Ingest a file or every .md/.txt/.markdown at the top of a directory.
 // Directory walk is non-recursive by design — most corpus layouts are
 // flat (one file per wiki page). Recursive ingest can land as a follow
@@ -558,10 +642,7 @@ knowledge_ingest_path(const char *corpus, const char *path,
     const char *base_url_or_NULL, knowledge_ingest_stats_t *out)
 {
   struct stat st;
-  knowledge_cfg_t cfg;
   uint32_t chunk_max;
-  uint32_t batch_size;
-  char embed_model[KNOWLEDGE_EMBED_MODEL_SZ];
   knowledge_batch_t batch;
   if(out == NULL)
     return(FAIL);
@@ -571,24 +652,7 @@ knowledge_ingest_path(const char *corpus, const char *path,
   if(stat(path, &st) != 0)
     return(FAIL);
 
-  knowledge_cfg_snapshot(&cfg);
-  chunk_max = cfg.chunk_max_chars;
-  if(chunk_max < 256) chunk_max = 256;
-  if(chunk_max > 8192) chunk_max = 8192;
-
-  batch_size = cfg.embed_batch_size;
-  if(batch_size == 0)
-    batch_size = KNOWLEDGE_DEF_EMBED_BATCH_SIZE;
-  if(batch_size > KNOWLEDGE_EMBED_BATCH_MAX)
-    batch_size = KNOWLEDGE_EMBED_BATCH_MAX;
-
-  // Resolve the effective embed model once at the top of the ingest so
-  // the batch uses a consistent model for every flush. A model swap
-  // mid-ingest is rare and undesirable (mixed dims corrupt the corpus);
-  // we snapshot instead of re-reading per chunk.
-  knowledge_effective_embed_model(embed_model, sizeof(embed_model));
-
-  knowledge_batch_init(&batch, corpus, embed_model, batch_size);
+  kw_batch_open(corpus, &chunk_max, &batch);
 
   // The memset above already zeroed every counter, including the two
   // OBS-16 added.
@@ -645,6 +709,60 @@ knowledge_ingest_path(const char *corpus, const char *path,
   // itself abort, so the stats are read after it, never before.
   knowledge_batch_free(&batch);
 
+  out->embed_ok   = batch.chunks_embedded_ok;
+  out->embed_fail = batch.chunks_embedded_fail;
+  out->aborted    = batch.aborted;
+
+  return(SUCCESS);
+}
+
+// The in-memory twin of knowledge_ingest_path: same emitter, same batch,
+// same stats — the bytes arrive from a fetch instead of a file, with no
+// structure left for the section-aware splitter to use, and the heading
+// names the page rather than a section inside it.
+//
+// ⚠ Runs on a task worker, never on the curl thread: the batch flush
+// inside blocks on llm_embed_submit_wait, which needs the curl worker to
+// drain the queue it is waiting on.
+bool
+knowledge_ingest_text(const char *corpus, const char *source_url,
+    const char *section_heading, const char *body, size_t len,
+    knowledge_ingest_stats_t *out)
+{
+  uint32_t chunk_max;
+  knowledge_batch_t batch;
+  kw_ingest_t ing;
+
+  if(out == NULL)
+    return(FAIL);
+
+  memset(out, 0, sizeof(*out));
+
+  if(corpus == NULL || body == NULL || len == 0)
+    return(FAIL);
+
+  kw_batch_open(corpus, &chunk_max, &batch);
+
+  ing = (kw_ingest_t){0};
+  ing.corpus     = corpus;
+  ing.source_url = source_url;
+  ing.chunk_max  = chunk_max;
+  ing.batch      = &batch;
+
+  if(section_heading != NULL)
+    kw_copy_trimmed(ing.heading, sizeof(ing.heading), section_heading,
+        strlen(section_heading));
+
+  kw_chunk_flow(&ing, body, len);
+
+  // The closing flush can abort, so every counter is read after it.
+  knowledge_batch_free(&batch);
+
+  out->files      = 1;
+  out->chunks     = ing.emitted;
+  out->skipped    = ing.skipped;
+  out->duplicates = ing.duplicates;
+  out->reembedded = ing.reembedded;
   out->embed_ok   = batch.chunks_embedded_ok;
   out->embed_fail = batch.chunks_embedded_fail;
   out->aborted    = batch.aborted;

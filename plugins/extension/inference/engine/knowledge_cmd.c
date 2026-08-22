@@ -12,6 +12,7 @@
 #include <inttypes.h>
 #include <stdio.h>
 #include <string.h>
+#include <strings.h>
 #include <time.h>
 
 // Commands
@@ -41,6 +42,16 @@ static const cmd_arg_desc_t ad_kw_ingest[] = {
   { "base-url", CMD_ARG_NONE,  CMD_ARG_OPTIONAL, 0, NULL },
 };
 
+// A path that opens with an http(s) scheme is a URL, and nothing on this
+// filesystem can be one. That is the whole detection: the two forms
+// cannot collide, so neither needs a flag to tell them apart.
+static bool
+kw_arg_is_url(const char *s)
+{
+  return(strncasecmp(s, "http://", 7) == 0
+      || strncasecmp(s, "https://", 8) == 0);
+}
+
 static void
 cmd_knowledge_ingest(const cmd_ctx_t *ctx)
 {
@@ -50,6 +61,20 @@ cmd_knowledge_ingest(const cmd_ctx_t *ctx)
 
   char line[256];
   knowledge_ingest_stats_t st;
+  if(kw_arg_is_url(path))
+  {
+    if(base_url != NULL && base_url[0] != '\0')
+    {
+      cmd_reply(ctx, "base-url does not apply to a URL fetch —"
+          " a fetched page's source_url is the URL itself");
+      return;
+    }
+
+    // knowledge_fetch_start owns the upsert and every reply from here on.
+    knowledge_fetch_start(ctx, corpus, path);
+    return;
+  }
+
   if(knowledge_corpus_upsert(corpus, NULL) != SUCCESS)
   {
     cmd_reply(ctx, "error: corpus upsert failed");
@@ -385,8 +410,8 @@ knowledge_register_commands(void)
 
   // /knowledge ingest <corpus> <path> [base-url]
   cmd_register("knowledge", "ingest",
-      "knowledge ingest <corpus> <path> [base-url]",
-      "Ingest a file or directory into a corpus",
+      "knowledge ingest <corpus> <path|url> [base-url]",
+      "Ingest a file, directory or URL into a corpus",
       "Slurps the file (or every .md/.markdown/.txt in a directory),"
       " splits into chunks, and writes them to the named corpus."
       " Creates the corpus on first use. Embeddings are submitted"
@@ -394,7 +419,14 @@ knowledge_register_commands(void)
       " base-url is given, each chunk's source_url becomes"
       " '<base-url>/<filename-stem>' — so a throwaway ingest dir"
       " (e.g. mktemp scratch) can still produce citable public URLs"
-      " (e.g. https://wiki.archlinux.org/title/ZFS).",
+      " (e.g. https://wiki.archlinux.org/title/ZFS)."
+      " An http:// or https:// argument is fetched instead: the page is"
+      " stripped to text and chunked VERBATIM — not digested — with the"
+      " URL itself as source_url and the page's <title> as the section"
+      " heading. base-url does not apply to that form, and the answer"
+      " arrives asynchronously, so give botmanctl a -w. An argument"
+      " longer than 255 bytes is silently truncated by the command"
+      " parser, which this path cannot detect.",
       USERNS_GROUP_ADMIN, 100, CMD_SCOPE_PRIVATE, METHOD_T_ANY,
       cmd_knowledge_ingest, NULL, "knowledge", "i",
       ad_kw_ingest, (uint8_t)(sizeof(ad_kw_ingest) / sizeof(ad_kw_ingest[0])), NULL, NULL);
