@@ -12,11 +12,27 @@
 # botman daemon on this same host (the robot never talks to it directly; the
 # ear bridge ships WAVs to botman and botman does the transcribing).
 #
-# The server is the distro package `whisper.cpp-cuda` (AUR), not a source
-# build — operator preference, 2026-08-03, and it is the better deal: pacman
-# owns the upgrade path and the CUDA linkage is real (`ldd` shows
-# libggml-cuda, libcudart, libcublas). Only the model weights are ours to
-# fetch, via senses/whisper/fetch-model.sh. Nothing here is built by meson.
+# The server is a distro package, not a source build — operator preference,
+# 2026-08-03. It moved from AUR to the official repos on 2026-08-22: the AUR
+# `whisper.cpp-cuda` linked ffmpeg directly, so the 8 -> 9 soname bump (ffmpeg
+# 2:8.1.2-11 -> 2:9.0-5, 2026-08-07) left it unable to start at all, and the
+# robot was deaf for a fortnight before anyone asked it to listen. `extra`
+# now carries the same upstream 1.9.1 at the same /usr/bin/whisper-server, so
+# the fix was a swap rather than a rebuild:
+#
+#   whisper-cpp + ggml-cuda + ggml-cpu   (extra)
+#   replacing whisper.cpp-cuda + ggml-cuda-git  (AUR)
+#
+# ⚠ Three packages, and the third is not optional despite what pacman says.
+# `ggml` declares every backend an *optional* dependency, so a plain
+# `pacman -S whisper-cpp ggml-cuda` yields a server that loads the model, finds
+# the 4090, reports `backends = 1` and then aborts on
+# GGML_ASSERT(device) — whisper asks for a CPU device for the ops CUDA does not
+# take, and with no ggml-cpu installed there is no device to hand back.
+# CUDA alone is not a working configuration.
+#
+# Only the model weights are ours to fetch, via senses/whisper/fetch-model.sh.
+# Nothing here is built by meson.
 #
 # Port map for the initiative: robot daemon 8000, earbridge 8090 (on the
 # robot), kokorod 8003, whisper-server 8004. The DGX Spark holds 8001/8002.
@@ -52,6 +68,11 @@ ExecStart=/usr/bin/whisper-server \
     -m /mnt/fast/doc/projects/botmanager/senses/whisper/models/ggml-large-v3-turbo.bin \
     --host 127.0.0.1 --port 8004 \
     --suppress-nst -nth 0.8
+# ggml 0.21 loads its compute backends as separate .so files and does NOT
+# search /usr/lib/ggml on its own — without this the registry comes up with
+# zero devices and the GGML_ASSERT(device) in the header fires before the
+# port is ever bound.
+Environment=GGML_BACKEND_PATH=/usr/lib/ggml
 # The model load is ~1.6 GB off disk into VRAM; give it room before systemd
 # decides the unit is wedged.
 TimeoutStartSec=180
