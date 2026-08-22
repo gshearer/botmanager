@@ -1137,9 +1137,11 @@ acq_feed_digest_done(const acquire_digest_response_t *resp)
   // is_proactive = true: feed fetches are scheduled, not user-driven.
   // Consumers downstream classify them alongside proactive SXNG
   // results.
+  // The feed's subject is the item's own title, so it doubles as the
+  // chunk's page label — the one caller that has one.
   (void)acq_ingest_digest_result(emit->bot_name, emit->topic_name,
       emit->subject, emit->dest_corpus, true, resp,
-      NULL, 0, emit->page_url);
+      NULL, 0, emit->subject, emit->page_url);
 
   mem_free(emit);
 }

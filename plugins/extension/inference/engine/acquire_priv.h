@@ -405,6 +405,12 @@ void acq_feeds_tick(acquire_bot_entry_t *e);
 // `images = NULL, n_images = 0` (no image extraction for feed items
 // in the first cut).
 //
+// `subject` is the errand — the phrase the search ran on, and what any
+// harvested image is filed under. `page_label` is a property of the
+// page and may be NULL; it is the only thing that reaches the chunk's
+// section_heading, which is half the key knowledge_page_supersede()
+// collapses a re-digest by.
+//
 // Returns SUCCESS if knowledge_insert_chunk landed a row (the reactive
 // caller uses this to bump its per-ctx ingest count); FAIL on chunk-
 // insert failure. Does NOT report image-insert failures — those are
@@ -414,6 +420,6 @@ bool acq_ingest_digest_result(const char *bot_name,
     const char *dest_corpus, bool is_proactive,
     const acquire_digest_response_t *resp,
     const acq_image_extract_t *images, size_t n_images,
-    const char *page_url);
+    const char *page_label, const char *page_url);
 
 #endif // BM_ACQUIRE_PRIV_H

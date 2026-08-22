@@ -509,7 +509,8 @@ acq_reactive_curl_done(const curl_response_t *cresp)
 // callback dispatch in one place.
 //
 // `images` may be NULL (feed path has no per-item image extraction in
-// the first cut). `page_url` is the chunk's own source_url as well as
+// the first cut), and so may `page_label` — see the header. `page_url`
+// is the chunk's own source_url as well as
 // the page context for each image, and it is what makes a corpus row
 // citable and supersedable; an empty one costs both. It arrives as the
 // link that was fetched and is stored canonical (util_url_canon), which
@@ -528,7 +529,7 @@ acq_ingest_digest_result(const char *bot_name, const char *topic_name,
     const char *subject, const char *dest_corpus, bool is_proactive,
     const acquire_digest_response_t *resp,
     const acq_image_extract_t *images, size_t n_images,
-    const char *page_url)
+    const char *page_label, const char *page_url)
 {
   const char          *mode;
   char                 canon[KNOWLEDGE_IMAGE_URL_SZ];
@@ -546,9 +547,18 @@ acq_ingest_digest_result(const char *bot_name, const char *topic_name,
   // row's identity is canonicalized; the fetch used the URL as given.
   util_url_canon(page_url != NULL ? page_url : "", canon, sizeof(canon));
 
-  // Section heading carries the subject so retrieval surfaces it.
-  snprintf(section, sizeof(section), "%s: %s",
-      topic_name, subject);
+  // The heading labels the page, never the errand that reached it. A
+  // caller passes a label only where it has one belonging to the page
+  // itself — the feed's item title — because the heading is the other
+  // half of what the supersede below matches on, and the SXNG paths'
+  // `subject` is a noun phrase lifted from whichever chat line
+  // triggered the fetch. One page found from three conversations wore
+  // three headings and collapsed onto none of them.
+  if(page_label != NULL && page_label[0] != '\0')
+    snprintf(section, sizeof(section), "%s: %s", topic_name, page_label);
+
+  else
+    strlcpy(section, topic_name, sizeof(section));
 
   id = 0;
 
@@ -690,7 +700,7 @@ acq_reactive_digest_done(const acquire_digest_response_t *resp)
 
   if(acq_ingest_digest_result(ctx->bot_name, ctx->topic_name, ctx->subject,
       ctx->dest_corpus, ctx->is_proactive, resp,
-      src->images, src->n_images, src->page_url) == SUCCESS)
+      src->images, src->n_images, NULL, src->page_url) == SUCCESS)
   {
     pthread_mutex_lock(&ctx->lock);
     ctx->n_inserted++;
@@ -1045,10 +1055,9 @@ acq_proactive_fire_locked(acquire_bot_entry_t *e, size_t topic_idx,
   if(e->topic_proactive_counter != NULL)
     e->topic_proactive_counter[topic_idx]++;
 
-  // Build the ctx. Subject = topic name so the eventual chunk's
-  // section_heading reads "<topic>: <topic>" — useful for eyeballing
-  // a corpus and immediately seeing which proactive run produced
-  // which chunk. Keywords CSV still comes off the topic so the
+  // Build the ctx. Subject = topic name: a scheduled run has no chat
+  // line to lift one from, and it is what any image harvested off the
+  // page is filed under. Keywords CSV still comes off the topic so the
   // digester has the same lexical anchors as the reactive path.
   ctx = mem_alloc(ACQUIRE_CTX, "proactive_ctx",
       sizeof(*ctx));
