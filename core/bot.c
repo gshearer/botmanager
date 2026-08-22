@@ -448,6 +448,47 @@ bot_msg_handler(const method_msg_t *msg, void *data)
   bot_release(bot);
 }
 
+// A command surface asking the mind for a line in its own voice. The
+// reference discipline is bot_msg_handler's, for the same reason: the
+// vtable and the handle belong to a plugin that a /plugin reload may
+// be detaching right now, and a command body runs on a worker thread
+// long after the delivery that dispatched it returned.
+//
+// The reference ends when persona_reply() does. A mind that answers
+// asynchronously is holding its own async work open by its own means
+// -- chat's chatbot_hold_t -- exactly as it already must for the
+// replies it submits from on_message; a bot reference held across an
+// LLM round trip would stall every reload for the length of one.
+bool
+bot_persona_reply(const cmd_ctx_t *ctx, const char *instruction,
+    const char *plain)
+{
+  bot_inst_t         *bot;
+  const bot_driver_t *drv;
+  void               *handle;
+  bool                spoke;
+
+  if(ctx == NULL || ctx->bot == NULL || plain == NULL)
+    return(false);
+
+  // ctx->bot is a bare pointer the dispatcher put in the task data, so
+  // the id read is as unlocked as every bot_inst_name(ctx->bot) in the
+  // tree. Past the acquire the instance is pinned and the vtable is
+  // known attached.
+  if(!bot_driver_acquire(ctx->bot->id, &bot, &drv, &handle))
+    return(false);
+
+  if(drv->persona_reply == NULL)
+  {
+    bot_release(bot);
+    return(false);
+  }
+
+  spoke = drv->persona_reply(handle, ctx, instruction, plain);
+  bot_release(bot);
+  return(spoke);
+}
+
 // Instance management
 
 // KV change callback for bot.<name>.userns.

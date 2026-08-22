@@ -961,6 +961,37 @@ typedef struct
   uint32_t           anti_repeat_threshold_pct;
 } chatbot_req_t;
 
+// ---- show_verbs.c — answering after the verb has returned ----
+
+// Everything a reply needs once `cmd_ctx_t` is gone. A worker-pool
+// callback fires long after the verb returned, so the target is
+// snapshotted on the heap and the method instance by NAME, never by
+// pointer: a `/plugin reload irc` in that window frees the instance the
+// verb saw (method.h §method_msg_t).
+//
+// `route` is the driver-private reply address (OBS-29) and outranks the
+// channel/sender pair for the reason cmd_reply prefers it -- it names
+// the session that asked, not whoever the driver is serving when the
+// answer exists. A driver that serves one session at a time leaves it
+// empty. Omitting it loses the whole reply over botmanctl, silently.
+typedef struct
+{
+  char inst_name[METHOD_NAME_SZ];
+  char target[METHOD_SENDER_SZ];
+  char route[METHOD_ROUTE_SZ];
+} verb_reply_to_t;
+
+void verb_reply_to_snapshot(verb_reply_to_t *to, const cmd_ctx_t *ctx);
+const char *verb_reply_to_addr(const verb_reply_to_t *to);
+
+// ---- persona_reply.c — a command surface borrowing the bot's voice ----
+
+// The bot_driver_t.persona_reply slot (include/bot.h). Declines --
+// leaving the caller to reply for itself -- when the conversational
+// half is off, no persona resolves, or the request cannot be launched.
+bool chatbot_persona_reply(void *handle, const cmd_ctx_t *ctx,
+    const char *instruction, const char *plain);
+
 // ---- interpret.c ----
 // (Below chatbot_req_t — the begin call reads the request record.)
 

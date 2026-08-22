@@ -23,6 +23,14 @@ typedef enum
 
 typedef struct bot_inst bot_inst_t;
 
+// Forward decl: cmd_ctx_t lives in cmd.h (tagged struct) and is
+// passed through opaque where needed.
+struct cmd_ctx;
+#ifndef BM_CMD_CTX_T_DEFINED
+#define BM_CMD_CTX_T_DEFINED
+typedef struct cmd_ctx cmd_ctx_t;
+#endif
+
 // Functions a bot-behaviour plugin must implement. Stored in
 // plugin_desc_t.ext for PLUGIN_BOT plugins (chat).
 typedef struct
@@ -44,6 +52,17 @@ typedef struct
   // and is responsible for submitting tasks to the work queue as
   // needed. msg is valid for the duration of the callback.
   void (*on_message)(void *handle, const method_msg_t *msg);
+
+  // Optional: say `plain` in this bot's own voice. `instruction` tells
+  // the mind what the line is FOR; `plain` is the caller's own
+  // rendering, and doubles as what the mind falls back to when it
+  // cannot better it. A true return moves the whole obligation to
+  // reply -- exactly one, possibly long after this call returns --
+  // onto the mind; false leaves it with the caller, which is why a
+  // mind that declines must not have spoken. ctx is valid for this
+  // call only, so a mind answering later copies what it needs.
+  bool (*persona_reply)(void *handle, const cmd_ctx_t *ctx,
+      const char *instruction, const char *plain);
 } bot_driver_t;
 
 typedef struct
@@ -123,6 +142,17 @@ typedef void (*bot_iter_cb_t)(const char *name, const char *method_kinds,
     void *data);
 
 void bot_iterate(bot_iter_cb_t cb, void *data);
+
+// Ask the mind driving `ctx->bot` to say `plain` in its own voice --
+// a command surface's opt-in to a persona-written line without
+// reaching up into the plugin that owns the persona (PLUGIN.md Rule
+// 2). False means nothing was said and the caller must reply for
+// itself: no bot, no mind bound, no persona_reply slot, or a mind that
+// declined. The driver reference is held for the length of the call
+// and no longer; a mind that answers asynchronously owns that wait
+// itself, exactly as it does for on_message.
+bool bot_persona_reply(const cmd_ctx_t *ctx, const char *instruction,
+    const char *plain);
 
 const char *bot_driver_name(const bot_inst_t *inst);
 uint32_t bot_method_count(const bot_inst_t *inst);
@@ -346,14 +376,6 @@ void bot_register_commands(void);
 // with bot_has_method_kind(), so a verb is scoped by what the bot can
 // do, never by the plugin that gives it a mind -- every bot shares one
 // of those, which is why the mind's own verbs register kind-agnostic.
-
-// Forward decl: cmd_ctx_t lives in cmd.h (tagged struct) and is
-// passed through opaque where needed.
-struct cmd_ctx;
-#ifndef BM_CMD_CTX_T_DEFINED
-#define BM_CMD_CTX_T_DEFINED
-typedef struct cmd_ctx cmd_ctx_t;
-#endif
 
 #ifdef BOT_INTERNAL
 

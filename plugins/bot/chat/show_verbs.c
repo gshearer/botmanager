@@ -234,30 +234,12 @@ verb_llm_personas(const cmd_ctx_t *ctx, bot_inst_t *bot, const char *rest)
 
 // ---- /show bot <name> llm memories [<query>] --------------------------
 
-// Where a verb's answer goes when it arrives after the verb has
-// returned. Both async verbs in this file — `llm memories` and `llm
-// knowledge` — hand their query to a worker pool and are fired back
-// from that thread long after `cmd_ctx_t` has died, so both snapshot
-// the reply target on the heap and both carry exactly this and nothing
-// else. One type, therefore.
-//
-// The instance is snapshotted by NAME, not by pointer: a `/plugin
-// reload irc` in that window frees the instance the verb saw
-// (method.h §method_msg_t).
-//
-// `route` is the driver-private reply address (OBS-29). It outranks the
-// channel/sender pair for the same reason cmd_reply prefers it: it
-// names the session that asked, not whoever the driver happens to be
-// serving when the answer exists. A driver that serves one session at
-// a time leaves it empty.
-typedef struct
-{
-  char inst_name[METHOD_NAME_SZ];
-  char target[METHOD_SENDER_SZ];
-  char route[METHOD_ROUTE_SZ];
-} verb_reply_to_t;
-
-static void
+// Both async verbs in this file — `llm memories` and `llm knowledge` —
+// hand their query to a worker pool and are fired back from that thread
+// long after `cmd_ctx_t` has died. The type and why it holds what it
+// holds are chatbot.h's; persona_reply.c answers from a curl worker for
+// the same reason and shares both.
+void
 verb_reply_to_snapshot(verb_reply_to_t *to, const cmd_ctx_t *ctx)
 {
   strlcpy(to->inst_name, ctx->msg->inst_name, sizeof to->inst_name);
@@ -267,7 +249,7 @@ verb_reply_to_snapshot(verb_reply_to_t *to, const cmd_ctx_t *ctx)
       sizeof to->target);
 }
 
-static const char *
+const char *
 verb_reply_to_addr(const verb_reply_to_t *to)
 {
   return(to->route[0] != '\0' ? to->route : to->target);

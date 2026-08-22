@@ -225,6 +225,7 @@ halves. Same shape as `gemini` / `gemini.ws`.
 | `deferred` | plugins/bot/chat/deferred.c | the deferred spine — schedule, claim, delivery and fire-time permission refusals for `chat_deferred` (`DEFERRED_CTX`) |
 | `dossier` | plugins/bot/chat/dossier.c | dossier subsystem |
 | `extract` | plugins/bot/chat/extract.c | LLM-driven fact extraction |
+| `persona_reply` | plugins/bot/chat/persona_reply.c | the `bot_driver_t.persona_reply` slot — a command surface borrowing the bot's voice; logs a declined model, an unloadable persona and an unbound chat model (`PERSONA_REPLY_CTX`) |
 | `followups` | plugins/bot/chat/followups.c | the follow-ups chore — a plan whose date has passed claimed once, and the question held until its subject turns up (`FOLLOWUPS_CTX`) |
 | `identify` | plugins/bot/chat/dispatch.c | `!identify` auth + temp-MFA mint |
 | `interject` | plugins/bot/chat/volunteer.c | chatbot interjection scoring |
@@ -285,6 +286,7 @@ The command surfaces filed beside these engines (`ask`, `claude`,
 
 | Context | Source | Description |
 |---|---|---|
+| `coinflip` | plugins/misc/coinflip/coinflip.c | `!coinflip` toy; context declared for the plugin's command registration (`COINFLIP_CTX`) — the toy itself logs nothing |
 | `roulette` | plugins/misc/roulette/roulette.c | `!roulette` toy; logs only the IRC-operator KILL branch (`ROULETTE_CTX`) |
 
 ## Marketwatch event topics — `mw.<exch>.<event>.<id>`
