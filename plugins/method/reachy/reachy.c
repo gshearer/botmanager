@@ -706,8 +706,15 @@ reachy_deliver(reachy_state_t *st, const reachy_dispatch_t *d)
   // the chat plugin's observe path requires.
   memset(&msg, 0, sizeof(msg));
 
+  // nickname and username carry the same string on purpose. A mic has no
+  // envelope, so the configured speaker is the only identity there is —
+  // and chat_identity_score never scores a nickname alone, so with only
+  // nickname set every utterance scored 0 against its 0.75 threshold and
+  // minted a fresh dossier. verified_id stays empty: configuration is not
+  // attestation.
   snprintf(msg.sender,   sizeof(msg.sender),   "%s", speaker);
   snprintf(msg.nickname, sizeof(msg.nickname), "%s", speaker);
+  snprintf(msg.username, sizeof(msg.username), "%s", speaker);
   snprintf(msg.channel,  sizeof(msg.channel),  "%s", channel);
   snprintf(msg.text,     sizeof(msg.text),     "%s", d->text);
   snprintf(msg.metadata, sizeof(msg.metadata), "doa=%.2f", d->doa);
