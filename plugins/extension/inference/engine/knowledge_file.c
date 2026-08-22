@@ -237,9 +237,12 @@ kw_emit_chunk(kw_ingest_t *ing, const char *start, const char *end)
     return;
   }
 
-  if(len >= KNOWLEDGE_CHUNK_TEXT_SZ)
-    len = KNOWLEDGE_CHUNK_TEXT_SZ - 1;
-
+  // No cut of our own before the copy: chunk_max's ceiling is
+  // KNOWLEDGE_CHUNK_TEXT_SZ - 1, so `len` fits. The clamp that stood
+  // here read as the place over-long chunks were handled, and that was
+  // the whole trouble — it silently ate the tail of every chunk the
+  // splitters produced above 4295 bytes while the knob advertised
+  // 8192.
   kw_copy_trimmed(text, sizeof(text), start, len);
 
   // Repair UTF-8 at the chunk boundaries. The byte-oriented chunker
@@ -650,12 +653,16 @@ kw_ingest_file(const char *corpus, const char *path,
 }
 
 // Open the embed accumulator an ingest walk runs against, and hand back
-// the clamped chunk size it should split at. Both entry points below
-// need the identical eighteen lines: a config snapshot, the two clamps,
-// and one embed-model resolve — resolved once here rather than per
-// chunk, because a model swap mid-walk mixes vector dimensions into the
-// same corpus. The caller owns `out_batch` and must knowledge_batch_free
-// it; that closing flush is where the final stats appear.
+// the chunk size it should split at. Both entry points below need the
+// identical lines: a config snapshot and one embed-model resolve —
+// resolved once here rather than per chunk, because a model swap
+// mid-walk mixes vector dimensions into the same corpus. The caller
+// owns `out_batch` and must knowledge_batch_free it; that closing flush
+// is where the final stats appear.
+//
+// chunk_max arrives already clamped — knowledge_load_config owns that
+// range, so what the operator is shown and what the splitters cut at
+// cannot drift apart.
 static void
 kw_batch_open(const char *corpus, uint32_t *out_chunk_max,
     knowledge_batch_t *out_batch)
@@ -667,8 +674,6 @@ kw_batch_open(const char *corpus, uint32_t *out_chunk_max,
 
   knowledge_cfg_snapshot(&cfg);
   chunk_max = cfg.chunk_max_chars;
-  if(chunk_max < 256) chunk_max = 256;
-  if(chunk_max > 8192) chunk_max = 8192;
 
   batch_size = cfg.embed_batch_size;
   if(batch_size == 0)

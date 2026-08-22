@@ -147,6 +147,17 @@ void knowledge_get_stats(knowledge_stats_t *out);
 #define KNOWLEDGE_DEF_RAG_TOP_K          5
 #define KNOWLEDGE_DEF_RAG_MAX_CTX_CHARS  3072
 #define KNOWLEDGE_DEF_CHUNK_MAX_CHARS    1200
+
+// Range knowledge.chunk_max_chars is clamped to at load. The floor
+// keeps every splitter's advance strictly positive against
+// KNOWLEDGE_CHUNK_OVERLAP; the ceiling is the chunk carrier itself.
+// A chunk reaches the DB, and comes back out of it, through
+// knowledge_chunk_t's fixed `text` field, so a split wider than that
+// field holds is not a bigger chunk — kw_emit_chunk cuts it to fit and
+// the overlap cannot reach back far enough to cover what went, which
+// is a hole in the corpus rather than a shorter chunk.
+#define KNOWLEDGE_MIN_CHUNK_MAX_CHARS    256
+#define KNOWLEDGE_MAX_CHUNK_MAX_CHARS    (KNOWLEDGE_CHUNK_TEXT_SZ - 1)
 #define KNOWLEDGE_DEF_EMBED_BATCH_SIZE   32
 #define KNOWLEDGE_EMBED_MODEL_SZ         64
 

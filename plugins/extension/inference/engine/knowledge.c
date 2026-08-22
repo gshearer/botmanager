@@ -96,6 +96,23 @@ knowledge_load_config(void)
   if(c.chunk_max_chars == 0)
     c.chunk_max_chars = KNOWLEDGE_DEF_CHUNK_MAX_CHARS;
 
+  // Clamped here rather than at the ingest walk so the snapshot every
+  // reader takes — the splitters, `/knowledge config` — is the size
+  // that will actually be split at. The ceiling used to be 8192 and
+  // sat two thousand bytes above what a chunk row can carry.
+  if(c.chunk_max_chars < KNOWLEDGE_MIN_CHUNK_MAX_CHARS)
+    c.chunk_max_chars = KNOWLEDGE_MIN_CHUNK_MAX_CHARS;
+
+  if(c.chunk_max_chars > KNOWLEDGE_MAX_CHUNK_MAX_CHARS)
+  {
+    clam(CLAM_WARN, "knowledge",
+        "chunk_max_chars=%u exceeds the %u-byte chunk carrier;"
+        " splitting at %u", c.chunk_max_chars,
+        (unsigned)KNOWLEDGE_CHUNK_TEXT_SZ,
+        (unsigned)KNOWLEDGE_MAX_CHUNK_MAX_CHARS);
+    c.chunk_max_chars = KNOWLEDGE_MAX_CHUNK_MAX_CHARS;
+  }
+
   if(c.embed_batch_size == 0)
     c.embed_batch_size = KNOWLEDGE_DEF_EMBED_BATCH_SIZE;
   if(c.embed_batch_size > KNOWLEDGE_EMBED_BATCH_MAX)
@@ -132,7 +149,9 @@ knowledge_register_kv(void)
       "Max characters of knowledge context injected into the prompt");
   kv_register("knowledge.chunk_max_chars", KV_UINT32, "1200",
       knowledge_kv_changed, NULL,
-      "Max characters per chunk produced by the ingest chunker");
+      "Max characters per chunk produced by the ingest chunker."
+      " Clamped to what a chunk row can carry; a larger value is"
+      " logged and cut, never split at.");
   kv_register("knowledge.embed_batch_size", KV_UINT32, "32",
       knowledge_kv_changed, NULL,
       "Chunks per embed request. Higher = faster ingest and better GPU"
