@@ -980,10 +980,34 @@ cmd_arg_type_reason(cmd_arg_type_t type)
   }
 }
 
+// A descriptor's maxlen of 0 means "as much as the token row holds";
+// reg_validate_args has already refused anything larger than that.
+static size_t
+cmd_arg_maxlen(const cmd_arg_desc_t *desc)
+{
+  return(desc->maxlen > 0 ? desc->maxlen : CMD_ARG_SZ - 1);
+}
+
+// Refuse an over-long argument rather than cutting it down to fit. A
+// truncated URL or path still passes validation and still reaches the
+// callback, so silence here is the one outcome the parser must not have.
+static bool
+cmd_arg_reject_long(const cmd_arg_desc_t *desc, size_t maxlen,
+    const cmd_ctx_t *ctx)
+{
+  char buf[128];
+
+  snprintf(buf, sizeof(buf), "%s too long (max %zu characters)",
+      desc->name != NULL ? desc->name : "argument", maxlen);
+  cmd_reply(ctx, buf);
+
+  return(false);
+}
+
 static bool
 cmd_arg_validate(const cmd_arg_desc_t *desc, const char *str)
 {
-  size_t maxlen = desc->maxlen > 0 ? desc->maxlen : CMD_ARG_SZ - 1;
+  size_t maxlen = cmd_arg_maxlen(desc);
 
   switch(desc->type)
   {
@@ -1014,8 +1038,9 @@ cmd_arg_validate(const cmd_arg_desc_t *desc, const char *str)
 
 // Parse and validate arguments according to an arg spec. Tokenizes the
 // raw argument string into pre-allocated buffers, checks required arg
-// count, and validates each token. On failure, sends an error reply via
-// cmd_reply() and returns false.
+// count, and validates each token. A token longer than its descriptor
+// allows is an error, never a truncation. On failure, sends an error
+// reply via cmd_reply() and returns false.
 //
 static bool
 cmd_parse_args(const char *args, const cmd_arg_desc_t *desc,
@@ -1048,6 +1073,8 @@ cmd_parse_args(const char *args, const cmd_arg_desc_t *desc,
 
     if(desc[i].flags & CMD_ARG_REST)
     {
+      size_t maxlen = cmd_arg_maxlen(&desc[i]);
+
       // Optional quoting: if the remainder starts with a double-quote,
       // extract only the content between the quotes so that trailing
       // whitespace and other special characters are preserved exactly.
@@ -1060,22 +1087,20 @@ cmd_parse_args(const char *args, const cmd_arg_desc_t *desc,
         {
           size_t len = (size_t)(end - start);
 
-          if(len >= CMD_ARG_SZ)
-            len = CMD_ARG_SZ - 1;
+          if(len > maxlen)
+            return cmd_arg_reject_long(&desc[i], maxlen, ctx);
 
           memcpy(bufs[i], start, len);
           bufs[i][len] = '\0';
         }
 
-        else
-        {
-          // No closing quote — treat entire remainder literally.
-          strlcpy(bufs[i], p, CMD_ARG_SZ);
-        }
+        // No closing quote — treat entire remainder literally.
+        else if(strlcpy(bufs[i], p, maxlen + 1) > maxlen)
+          return cmd_arg_reject_long(&desc[i], maxlen, ctx);
       }
 
-      else
-        strlcpy(bufs[i], p, CMD_ARG_SZ);
+      else if(strlcpy(bufs[i], p, maxlen + 1) > maxlen)
+        return cmd_arg_reject_long(&desc[i], maxlen, ctx);
 
       parsed->argv[i] = bufs[i];
       parsed->argc = i + 1;
@@ -1099,7 +1124,7 @@ cmd_parse_args(const char *args, const cmd_arg_desc_t *desc,
     // Optional quoting: a leading double-quote causes extraction of
     // the content up to the next double-quote, preserving spaces.
     {
-      size_t maxlen = desc[i].maxlen > 0 ? desc[i].maxlen : CMD_ARG_SZ - 1;
+      size_t maxlen = cmd_arg_maxlen(&desc[i]);
       size_t j = 0;
 
       if(*p == '"')
@@ -1108,6 +1133,11 @@ cmd_parse_args(const char *args, const cmd_arg_desc_t *desc,
 
         while(*p != '\0' && *p != '"' && j < maxlen)
           bufs[i][j++] = *p++;
+
+        // Stopped on maxlen rather than on the closing quote: the rest
+        // of the quoted run would otherwise be read as the next token.
+        if(*p != '\0' && *p != '"')
+          return cmd_arg_reject_long(&desc[i], maxlen, ctx);
 
         if(*p == '"')
           p++;  // skip closing quote
@@ -1118,11 +1148,8 @@ cmd_parse_args(const char *args, const cmd_arg_desc_t *desc,
         while(*p != '\0' && *p != ' ' && *p != '\t' && j < maxlen)
           bufs[i][j++] = *p++;
 
-        // If there are more non-whitespace chars, the token was too long.
-        // Consume the rest of this token to keep parsing consistent.
         if(*p != '\0' && *p != ' ' && *p != '\t')
-          while(*p != '\0' && *p != ' ' && *p != '\t')
-            p++;
+          return cmd_arg_reject_long(&desc[i], maxlen, ctx);
       }
 
       bufs[i][j] = '\0';

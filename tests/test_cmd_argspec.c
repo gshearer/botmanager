@@ -1,5 +1,7 @@
 // botmanager — MIT
-// Cases for the argument-descriptor gate in cmd_register (include/cmd.h).
+// Cases for the maxlen contract on an argument descriptor (include/cmd.h),
+// at both of its ends: what cmd_register will accept, and what the
+// tokenizer does with a token that exceeds what was accepted.
 //
 // The tokenizer fills one CMD_ARG_SZ row per argument and stops at the
 // descriptor's maxlen, so registration is the only place that can
@@ -8,6 +10,12 @@
 // log line: an over-declared argument writes across the next argument's
 // row, and the handler reads an argv the token after it overwrote.
 // Nine descriptors in seven plugins declared one until 2026-08-21.
+//
+// The parser end is the same silence from the other direction. Stopping
+// at maxlen and dropping the overflow hands the callback a truncated URL
+// or path that still validates — and on the quoted branch the tail was
+// not dropped but re-read as the *next* argument (board #55). Every row
+// below drives the shipped path, cmd_invoke().
 
 #include "test.h"
 
@@ -15,6 +23,8 @@
 #include "clam.h"
 #include "cmd.h"
 #include "common.h"
+
+#include <string.h>
 
 #define SUITE "cmd_argspec"
 
@@ -60,12 +70,101 @@ static const struct
     "targspecover", ad_over_cap, FAIL },
 };
 
+// The parser end: what a handler was handed, or that it never ran.
+
+#define PROBE_MAXLEN 8
+
+static bool ran;
+static char seen[2][CMD_ARG_SZ];
+
+static void
+record_cmd(const cmd_ctx_t *ctx)
+{
+  ran = true;
+
+  for(uint8_t i = 0; i < 2; i++)
+    strlcpy(seen[i], ctx->parsed != NULL && i < ctx->parsed->argc
+        ? ctx->parsed->argv[i] : "", sizeof(seen[i]));
+}
+
+// Two rows so the quoted branch has somewhere to leak a tail into, and
+// a rest-of-line row, which carries its own copy of the same cut.
+static const cmd_arg_desc_t ad_pair[] = {
+  { "first",  CMD_ARG_NONE, CMD_ARG_REQUIRED, PROBE_MAXLEN, NULL },
+  { "second", CMD_ARG_NONE, CMD_ARG_OPTIONAL, PROBE_MAXLEN, NULL },
+};
+
+static const cmd_arg_desc_t ad_rest[] = {
+  { "line", CMD_ARG_NONE, CMD_ARG_REQUIRED | CMD_ARG_REST, PROBE_MAXLEN, NULL },
+};
+
+static const struct
+{
+  const char *name;
+  const char *cmd;
+  const char *args;
+  const char *first;    // what argv[0] must be, or NULL for "refused"
+  const char *second;   // ...and argv[1], which the tail must not reach
+} parse_cases[] = {
+  { "a token filling maxlen exactly reaches the handler",
+    "targspecpair", "12345678 tail", "12345678", "tail" },
+
+  { "a token one byte over maxlen is refused, not cut",
+    "targspecpair", "123456789", NULL, NULL },
+
+  { "a quoted token over maxlen is refused, not spilled onto the next arg",
+    "targspecpair", "\"123456789\"", NULL, NULL },
+
+  { "a rest-of-line over maxlen is refused, not cut",
+    "targspecrest", "123456789", NULL, NULL },
+
+  { "a quoted rest-of-line over maxlen is refused too",
+    "targspecrest", "\"123456789\"", NULL, NULL },
+};
+
+static void
+run_parse_cases(void)
+{
+  for(size_t i = 0; i < sizeof(parse_cases) / sizeof(parse_cases[0]); i++)
+  {
+    const cmd_def_t *def = cmd_find(parse_cases[i].cmd);
+    cmd_ctx_t        ctx;
+
+    ran = false;
+    memset(seen, 0, sizeof(seen));
+    memset(&ctx, 0, sizeof(ctx));
+    ctx.args = parse_cases[i].args;
+
+    cmd_invoke(def, &ctx);
+
+    if(parse_cases[i].first == NULL)
+    {
+      test_check_bool(SUITE, parse_cases[i].name, false, ran);
+      continue;
+    }
+
+    test_check_str(SUITE, parse_cases[i].name,
+        parse_cases[i].first, seen[0]);
+
+    test_check_str(SUITE, "and the argument after it is its own token",
+        parse_cases[i].second, seen[1]);
+  }
+}
+
 int
 main(void)
 {
   mem_init();
   clam_init();
   cmd_init();
+
+  cmd_register("test", "targspecpair", "targspecpair <first> [second]",
+      "argspec probe", NULL, USERNS_GROUP_EVERYONE, 0, CMD_SCOPE_ANY,
+      METHOD_T_ANY, record_cmd, NULL, NULL, NULL, ad_pair, 2, NULL, NULL);
+
+  cmd_register("test", "targspecrest", "targspecrest <line>",
+      "argspec probe", NULL, USERNS_GROUP_EVERYONE, 0, CMD_SCOPE_ANY,
+      METHOD_T_ANY, record_cmd, NULL, NULL, NULL, ad_rest, 1, NULL, NULL);
 
   for(size_t i = 0; i < sizeof(maxlen_cases) / sizeof(maxlen_cases[0]); i++)
   {
@@ -83,6 +182,8 @@ main(void)
         maxlen_cases[i].want == SUCCESS,
         cmd_find(maxlen_cases[i].cmd) != NULL);
   }
+
+  run_parse_cases();
 
   return(test_report(SUITE));
 }
