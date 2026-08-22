@@ -287,6 +287,60 @@ kw_emit_chunk(kw_ingest_t *ing, const char *start, const char *end)
     ing->batch->chunks_embedded_fail++;
 }
 
+// Size-only splitter for a run of bytes with no separator left in it.
+// Breaks on the size budget, backing up to the last space so a chunk
+// does not end mid-word, and carries the same overlap the other two
+// carry.
+//
+// It is the URL path's whole chunker — acq_strip_html collapses every
+// whitespace run, newlines included, so a fetched page arrives as one
+// line and neither separator-driven splitter can divide it — and it is
+// also where those two send a single paragraph or line that is larger
+// than their accumulator. Their alternative was dropping it.
+//
+// The heading belongs to the caller in all three uses, so unlike its
+// two siblings this one does not reset it.
+static void
+kw_chunk_flow(kw_ingest_t *ing, const char *body, size_t len)
+{
+  size_t pos = 0;
+
+  if(body == NULL || len == 0) return;
+
+  while(pos < len)
+  {
+    size_t take = len - pos;
+    size_t back;
+
+    if(take <= ing->chunk_max)
+    {
+      kw_emit_chunk(ing, body + pos, body + len);
+      return;
+    }
+
+    take = ing->chunk_max;
+    back = take;
+
+    // Back up to the last space in the window. The floor keeps `take`
+    // above the overlap, which is what makes the advance below strictly
+    // positive: a window of unbroken bytes — a base64 blob, CJK with no
+    // spaces — splits mid-token rather than looping forever. chunk_max is
+    // clamped at 256 and the floor is 201, so the window always has room.
+    while(back > KNOWLEDGE_CHUNK_OVERLAP + 1 && body[pos + back] != ' ')
+      back--;
+
+    if(back > KNOWLEDGE_CHUNK_OVERLAP + 1)
+      take = back;
+
+    kw_emit_chunk(ing, body + pos, body + pos + take);
+
+    if(ing->batch != NULL && ing->batch->aborted)
+      return;
+
+    pos += take - KNOWLEDGE_CHUNK_OVERLAP;
+  }
+}
+
 // Section-aware markdown chunker. Heading runs define section bounds
 // and become each chunk's `section_heading` column. Inside a section,
 // content is greedy-split at paragraph boundaries (double newline) up
@@ -349,18 +403,43 @@ kw_chunk_markdown(kw_ingest_t *ing, const char *body)
       continue;
     }
 
-    // Append line to the section buffer.
-    if(sec_len + llen + 2 < sec_cap)
+    // Append line to the section buffer. A line that will not fit
+    // beside what is already buffered flushes it first; one that will
+    // not fit an empty buffer either goes to the size splitter,
+    // because the accumulator can never hold it. Skipping the append
+    // instead — which is what this did — drops the line's whole
+    // content and moves no counter, so an .md of unwrapped paragraphs
+    // ingests short and reports success.
+    if(sec_len + llen + 2 >= sec_cap)
     {
-      memcpy(section + sec_len, p, llen);
-      sec_len += llen;
-      section[sec_len++] = '\n';
+      if(sec_len > 0)
+      {
+        kw_emit_chunk(ing, section, section + sec_len);
+        sec_len = 0;
+      }
+
+      if(llen + 2 >= sec_cap)
+      {
+        kw_chunk_flow(ing, p, llen);
+        p = (eol != NULL) ? eol + 1 : p + llen;
+        continue;
+      }
     }
+
+    memcpy(section + sec_len, p, llen);
+    sec_len += llen;
+    section[sec_len++] = '\n';
 
     // Once the buffer exceeds chunk_max, emit the first chunk_max bytes
     // and retain the last KNOWLEDGE_CHUNK_OVERLAP bytes as the opening
-    // context for the next chunk in the same section.
-    if(sec_len >= ing->chunk_max)
+    // context for the next chunk in the same section. Drain until the
+    // buffer is back under the budget: one append can carry several
+    // chunks' worth, and a single pass leaves the excess to be cut off
+    // by kw_emit_chunk's KNOWLEDGE_CHUNK_TEXT_SZ clamp later. Each
+    // round drops sec_len by chunk_max - KNOWLEDGE_CHUNK_OVERLAP, and
+    // chunk_max is clamped at 256 against an overlap of 200, so the
+    // walk is strictly downward.
+    while(sec_len >= ing->chunk_max)
     {
       size_t keep;
       size_t src;
@@ -413,14 +492,33 @@ kw_chunk_plaintext(kw_ingest_t *ing, const char *body)
     size_t pl = (para_end != NULL) ? (size_t)(para_end - p) + 1
         : strlen(p);
 
-    if(len + pl + 2 < cap)
+    // Same rule as the markdown chunker's, over paragraphs rather than
+    // lines: flush to make room, and hand a paragraph too large for an
+    // empty accumulator to the size splitter. A .txt whose paragraphs
+    // all exceed the buffer used to ingest as zero chunks.
+    if(len + pl + 2 >= cap)
     {
-      memcpy(buf + len, p, pl);
-      len += pl;
-      buf[len++] = '\n';
+      if(len > 0)
+      {
+        kw_emit_chunk(ing, buf, buf + len);
+        len = 0;
+      }
+
+      if(pl + 2 >= cap)
+      {
+        kw_chunk_flow(ing, p, pl);
+        p = (para_end != NULL) ? para_end + 2 : p + pl;
+        continue;
+      }
     }
 
-    if(len >= ing->chunk_max)
+    memcpy(buf + len, p, pl);
+    len += pl;
+    buf[len++] = '\n';
+
+    // Drain to under the budget rather than cutting one chunk off the
+    // front — see the markdown chunker's copy of this block.
+    while(len >= ing->chunk_max)
     {
       size_t keep;
       size_t src;
@@ -443,57 +541,6 @@ kw_chunk_plaintext(kw_ingest_t *ing, const char *body)
     kw_emit_chunk(ing, buf, buf + len);
 
   mem_free(buf);
-}
-
-// Size-only splitter for a body with no structure left in it. The HTML
-// stripper collapses every whitespace run — newlines included — so a
-// fetched page arrives as one line: kw_chunk_plaintext finds no "\n\n",
-// measures the whole body as a single paragraph, refuses it against its
-// buffer and emits nothing at all. Break on the size budget instead,
-// backing up to the last space so a chunk does not end mid-word, and
-// carry the same overlap the other two carry.
-//
-// The heading belongs to the caller here — it names the page, not a
-// section — so unlike its two siblings this one does not reset it.
-static void
-kw_chunk_flow(kw_ingest_t *ing, const char *body, size_t len)
-{
-  size_t pos = 0;
-
-  if(body == NULL || len == 0) return;
-
-  while(pos < len)
-  {
-    size_t take = len - pos;
-    size_t back;
-
-    if(take <= ing->chunk_max)
-    {
-      kw_emit_chunk(ing, body + pos, body + len);
-      return;
-    }
-
-    take = ing->chunk_max;
-    back = take;
-
-    // Back up to the last space in the window. The floor keeps `take`
-    // above the overlap, which is what makes the advance below strictly
-    // positive: a window of unbroken bytes — a base64 blob, CJK with no
-    // spaces — splits mid-token rather than looping forever. chunk_max is
-    // clamped at 256 and the floor is 201, so the window always has room.
-    while(back > KNOWLEDGE_CHUNK_OVERLAP + 1 && body[pos + back] != ' ')
-      back--;
-
-    if(back > KNOWLEDGE_CHUNK_OVERLAP + 1)
-      take = back;
-
-    kw_emit_chunk(ing, body + pos, body + pos + take);
-
-    if(ing->batch != NULL && ing->batch->aborted)
-      return;
-
-    pos += take - KNOWLEDGE_CHUNK_OVERLAP;
-  }
 }
 
 static bool
@@ -578,6 +625,21 @@ kw_ingest_file(const char *corpus, const char *path,
     kw_chunk_markdown(&ing, body);
   else
     kw_chunk_plaintext(&ing, body);
+
+  // A file with bytes in it that produced nothing at all — not one
+  // chunk, not one skip, not one duplicate. Say so: that is the shape
+  // the dropped-oversized-unit defect wore for as long as it lived,
+  // and the walk's own total cannot show it, because a directory of
+  // good files hides one silent file inside a healthy number. Still
+  // reachable above the fix — an .md of nothing but headings appends
+  // to no buffer and emits nothing. An aborted batch is excluded: it
+  // zeroes every file after it and is reported as itself.
+  if(len > 0
+      && ing.emitted == 0 && ing.skipped == 0
+      && ing.duplicates == 0 && ing.reembedded == 0
+      && (batch == NULL || !batch->aborted))
+    clam(CLAM_WARN, "knowledge",
+        "ingest: '%s' (%zu bytes) yielded no chunks", path, len);
 
   mem_free(body);
 
