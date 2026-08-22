@@ -111,6 +111,31 @@ const char *util_redact_url(const char *url, char *out, size_t out_cap);
 // deny RFC 1918.
 bool util_url_is_safe_https(const char *url);
 
+// Rewrite `url` into `out` as the form that names the page rather than
+// the link, so that two URLs which fetch one page come back as one
+// string. Returns `out` and always NUL-terminates, so it reads inline
+// like util_redact_url().
+//
+// Normalized: scheme and host lowercased, a default port dropped, a
+// label spelled "m" dropped while two labels survive it (the mobile
+// mirror — en.m.wikipedia.org), the fragment dropped, an empty path
+// written "/", and percent-triplets uppercased, decoding those that
+// spell an octet with no structural meaning (`%27` becomes `'`).
+//
+// Deliberately not normalized: the query, a non-empty path's trailing
+// slash, dot segments, and a leading "www.". Each of those can name a
+// different resource, and this string decides which knowledge rows
+// knowledge_page_supersede() DELETEs — over-collapsing here destroys a
+// page rather than deduplicating one. The query is identity: three rows
+// in the acquired corpus differ only by a `?lat=`/`?lon=` pair.
+//
+// Anything it cannot canonicalize comes back as a bounded copy of the
+// input — a NULL, a non-http(s) scheme, an authority carrying userinfo
+// or an IP literal, or a result that will not fit. out_cap must hold
+// strlen(url) + 2 for canonicalization to run at all, because a
+// truncated URL is a different URL.
+const char *util_url_canon(const char *url, char *out, size_t out_cap);
+
 // Bump an eventfd's counter so the loop polling it runs a turn now rather
 // than when its poll expires. Best-effort by design — a lost wake costs one
 // poll timeout and nothing else — but every way it can fail is a defect: a

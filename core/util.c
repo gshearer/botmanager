@@ -577,6 +577,228 @@ util_url_is_safe_https(const char *url)
   return(true);
 }
 
+// URL canonicalization
+
+static int
+util_url_hexval(char c)
+{
+  if(c >= '0' && c <= '9') return(c - '0');
+  if(c >= 'a' && c <= 'f') return(c - 'a' + 10);
+  if(c >= 'A' && c <= 'F') return(c - 'A' + 10);
+
+  return(-1);
+}
+
+// Octets that carry no structural meaning wherever they appear, so
+// encoding one changes its spelling and nothing else. The gen-delims
+// `:/?#[]@` and the query's `&=+` are absent on purpose: decoding one
+// of those rewrites what the URL is made of, not how it is written.
+static bool
+util_url_octet_is_bare(unsigned char c)
+{
+  if((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z')
+      || (c >= '0' && c <= '9'))
+    return(true);
+
+  if(c == '\0') return(false);
+
+  return(strchr("-._~!$'()*,;", (char)c) != NULL);
+}
+
+// Append the authority [host, host+len) at `pos`, lowercased, minus the
+// scheme's default port and minus any label spelled "m" — the mobile
+// mirror convention that made en.m.wikipedia.org a second page. The
+// label goes only while two survive it, so m.co keeps its host.
+static size_t
+util_url_canon_host(char *out, size_t pos, const char *host, size_t len,
+    bool https)
+{
+  const char *colon;
+  const char *hend;
+  const char *lp;
+  size_t      labels = 0;
+  size_t      mobile = 0;
+  bool        drop_m;
+  bool        first  = true;
+
+  colon = memchr(host, ':', len);
+  hend  = (colon != NULL) ? colon : host + len;
+
+  for(lp = host; lp < hend; )
+  {
+    const char *dot  = memchr(lp, '.', (size_t)(hend - lp));
+    const char *lend = (dot != NULL) ? dot : hend;
+
+    labels++;
+
+    if(lend - lp == 1 && (*lp == 'm' || *lp == 'M')) mobile++;
+
+    lp = lend + 1;
+  }
+
+  drop_m = (mobile > 0 && labels - mobile >= 2);
+
+  for(lp = host; lp < hend; )
+  {
+    const char *dot  = memchr(lp, '.', (size_t)(hend - lp));
+    const char *lend = (dot != NULL) ? dot : hend;
+    size_t      llen = (size_t)(lend - lp);
+
+    if(!(drop_m && llen == 1 && (*lp == 'm' || *lp == 'M')))
+    {
+      if(!first) out[pos++] = '.';
+
+      first = false;
+
+      for(size_t i = 0; i < llen; i++)
+        out[pos++] = (char)tolower((unsigned char)lp[i]);
+    }
+
+    lp = lend + 1;
+  }
+
+  if(colon != NULL)
+  {
+    const char *port = colon + 1;
+    size_t      plen = (size_t)((host + len) - port);
+    const char *dflt = https ? "443" : "80";
+    size_t      dlen = https ? 3 : 2;
+
+    // An empty port is the default port (RFC 3986 §3.2.3).
+    if(plen != 0 && !(plen == dlen && memcmp(port, dflt, dlen) == 0))
+    {
+      out[pos++] = ':';
+      memcpy(out + pos, port, plen);
+      pos += plen;
+    }
+  }
+
+  return(pos);
+}
+
+// Append [p, p+len) — path and query — with its percent-encoding
+// normalized. A triplet whose octet needs no encoding is decoded; the
+// rest keep theirs, uppercased. Anything that is not a well-formed
+// triplet is a literal '%' and copied as one.
+static size_t
+util_url_canon_pq(char *out, size_t pos, const char *p, size_t len)
+{
+  static const char hex[] = "0123456789ABCDEF";
+
+  for(size_t i = 0; i < len; i++)
+  {
+    int hi;
+    int lo;
+
+    if(p[i] != '%' || i + 2 >= len)
+    {
+      out[pos++] = p[i];
+      continue;
+    }
+
+    hi = util_url_hexval(p[i + 1]);
+    lo = util_url_hexval(p[i + 2]);
+
+    if(hi < 0 || lo < 0)
+    {
+      out[pos++] = p[i];
+      continue;
+    }
+
+    if(util_url_octet_is_bare((unsigned char)((hi << 4) | lo)))
+      out[pos++] = (char)((hi << 4) | lo);
+
+    else
+    {
+      out[pos++] = '%';
+      out[pos++] = hex[hi];
+      out[pos++] = hex[lo];
+    }
+
+    i += 2;
+  }
+
+  return(pos);
+}
+
+const char *
+util_url_canon(const char *url, char *out, size_t out_cap)
+{
+  const char *host;
+  const char *authority_end;
+  const char *frag;
+  size_t      len;
+  size_t      pos;
+  size_t      scheme_len;
+  bool        https;
+
+  if(out == NULL || out_cap == 0) return("");
+
+  if(url == NULL)
+  {
+    out[0] = '\0';
+    return(out);
+  }
+
+  https      = util_strncasecmp_ascii(url, "https://", 8) == 0;
+  scheme_len = https ? 8 : 0;
+
+  if(scheme_len == 0 && util_strncasecmp_ascii(url, "http://", 7) == 0)
+    scheme_len = 7;
+
+  len = strlen(url);
+
+  // Canonicalizing never adds more than the one byte an empty path
+  // costs, so this single test up front is what makes every write
+  // below fit — and a URL too long to canonicalize is stored as it
+  // arrived rather than as a prefix of itself.
+  if(scheme_len == 0 || out_cap < len + 2)
+  {
+    strlcpy(out, url, out_cap);
+    return(out);
+  }
+
+  host = url + scheme_len;
+
+  authority_end = host;
+  while(*authority_end != '\0' && *authority_end != '/'
+      && *authority_end != '?' && *authority_end != '#')
+    authority_end++;
+
+  // Userinfo is case-sensitive and an IP literal is bracketed rather
+  // than dotted; neither shape belongs to a page this is asked to
+  // name, so both keep the URL they arrived with.
+  if(memchr(host, '@', (size_t)(authority_end - host)) != NULL
+      || *host == '[')
+  {
+    strlcpy(out, url, out_cap);
+    return(out);
+  }
+
+  memcpy(out, https ? "https://" : "http://", scheme_len);
+  pos = scheme_len;
+
+  pos = util_url_canon_host(out, pos, host,
+      (size_t)(authority_end - host), https);
+
+  // A fragment is resolved by the client, so two URLs differing only
+  // there fetched the same bytes.
+  frag = strchr(authority_end, '#');
+
+  if(frag == NULL) frag = url + len;
+
+  // An empty path is "/" (RFC 3986 §6.2.3), whether or not a query
+  // follows it.
+  if(authority_end == frag || *authority_end != '/')
+    out[pos++] = '/';
+
+  pos = util_url_canon_pq(out, pos, authority_end,
+      (size_t)(frag - authority_end));
+
+  out[pos] = '\0';
+  return(out);
+}
+
 // eventfd wake / drain
 
 void

@@ -511,7 +511,10 @@ acq_reactive_curl_done(const curl_response_t *cresp)
 // `images` may be NULL (feed path has no per-item image extraction in
 // the first cut). `page_url` is the chunk's own source_url as well as
 // the page context for each image, and it is what makes a corpus row
-// citable and supersedable; an empty one costs both.
+// citable and supersedable; an empty one costs both. It arrives as the
+// link that was fetched and is stored canonical (util_url_canon), which
+// is what makes those two properties survive a page reachable by more
+// than one spelling.
 //
 // Returns SUCCESS iff a NEW chunk row landed, FAIL otherwise. Since
 // OBS-16 a digest this corpus already holds byte-for-byte is one of the
@@ -528,11 +531,20 @@ acq_ingest_digest_result(const char *bot_name, const char *topic_name,
     const char *page_url)
 {
   const char          *mode;
+  char                 canon[KNOWLEDGE_IMAGE_URL_SZ];
   char                 section[KNOWLEDGE_SECTION_SZ];
   knowledge_chunk_rc_t rc;
   int64_t              id;
 
   mode = is_proactive ? "proactive" : "reactive";
+
+  // What the page was fetched from is a link; what names it is the
+  // canonical form of that link. Search engines answer for one page
+  // with several — en.m.wikipedia.org beside en.wikipedia.org, `%27`
+  // beside `'` — and each spelling was a row of its own that neither
+  // the dedup key nor the supersede below could ever match. Only the
+  // row's identity is canonicalized; the fetch used the URL as given.
+  util_url_canon(page_url != NULL ? page_url : "", canon, sizeof(canon));
 
   // Section heading carries the subject so retrieval surfaces it.
   snprintf(section, sizeof(section), "%s: %s",
@@ -545,8 +557,8 @@ acq_ingest_digest_result(const char *bot_name, const char *topic_name,
   // the same page reworded, two digests under one section_heading with
   // different URLs are different sites. Passing NULL here left every
   // acquired row anonymous and both distinctions unmakeable.
-  rc = knowledge_insert_chunk(dest_corpus,
-      page_url != NULL ? page_url : "", section, resp->summary, &id);
+  rc = knowledge_insert_chunk(dest_corpus, canon, section,
+      resp->summary, &id);
 
   if(rc == KNOWLEDGE_CHUNK_FAILED)
   {
@@ -568,14 +580,13 @@ acq_ingest_digest_result(const char *bot_name, const char *topic_name,
   // the corpus is holding, which is how a corpus that has been
   // accumulating converges instead of merely stopping.
   {
-    uint32_t gone = knowledge_page_supersede(dest_corpus,
-        page_url != NULL ? page_url : "", section, id);
+    uint32_t gone = knowledge_page_supersede(dest_corpus, canon,
+        section, id);
 
     if(gone > 0)
       clam(CLAM_INFO, ACQUIRE_CTX,
           "%s superseded %u older digest%s of page '%s' (chunk=%ld)",
-          mode, gone, gone == 1 ? "" : "s",
-          page_url != NULL ? page_url : "", (long)id);
+          mode, gone, gone == 1 ? "" : "s", canon, (long)id);
   }
 
   // A digest this corpus already holds, byte for byte. Not an ingest
@@ -612,8 +623,7 @@ acq_ingest_digest_result(const char *bot_name, const char *topic_name,
     {
       const acq_image_extract_t *img = &images[i];
 
-      if(knowledge_insert_image(id, img->url,
-            page_url != NULL ? page_url : "",
+      if(knowledge_insert_image(id, img->url, canon,
             img->caption, subject,
             img->width_px, img->height_px) != SUCCESS)
         clam(CLAM_DEBUG, ACQUIRE_CTX,

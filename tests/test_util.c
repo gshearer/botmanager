@@ -1,6 +1,6 @@
 // botmanager — MIT
-// Cases for util.h's three silent-wrongness surfaces: URL redaction,
-// the SSRF gate, and base64.
+// Cases for util.h's silent-wrongness surfaces: URL redaction, the
+// SSRF gate, URL canonicalization, and base64.
 #include "test.h"
 #include "util.h"
 #include "common.h"
@@ -123,6 +123,72 @@ static const struct
     "https://192.168.1.1.nip.io/i.png", true },
 };
 
+// util_url_canon: the identity a knowledge row is stored under, and
+// what knowledge_page_supersede() DELETEs by. Over-collapsing destroys
+// a page; under-collapsing keeps the duplicate this exists to stop.
+static const struct
+{
+  const char *name;
+  const char *url;
+  size_t      cap;
+  const char *want;
+} canon_cases[] = {
+  { "canonical already", "https://en.wikipedia.org/wiki/Waifu", OUT_SZ,
+    "https://en.wikipedia.org/wiki/Waifu" },
+  // The three spellings one page arrived under, each collapsing onto
+  // the case above.
+  { "mobile mirror", "https://en.m.wikipedia.org/wiki/Waifu", OUT_SZ,
+    "https://en.wikipedia.org/wiki/Waifu" },
+  { "encoded apostrophe", "https://en.wikipedia.org/wiki/Sha%27Carri", OUT_SZ,
+    "https://en.wikipedia.org/wiki/Sha'Carri" },
+  { "bare apostrophe", "https://en.wikipedia.org/wiki/Sha'Carri", OUT_SZ,
+    "https://en.wikipedia.org/wiki/Sha'Carri" },
+  { "mobile label leads the host", "https://m.facebook.com/x", OUT_SZ,
+    "https://facebook.com/x" },
+  { "two labels keep their m", "https://m.co/x", OUT_SZ, "https://m.co/x" },
+  // Structure stays encoded whatever its case: decoding one of these
+  // would rewrite what the URL is made of.
+  { "structural triplets kept, hex uppercased", "https://h/a%2fb%3fc", OUT_SZ,
+    "https://h/a%2Fb%3Fc" },
+  { "NUL is not decoded", "https://h/a%00b", OUT_SZ, "https://h/a%00b" },
+  { "truncated triplet is a literal percent", "https://h/100%", OUT_SZ,
+    "https://h/100%" },
+  { "non-hex triplet is a literal percent", "https://h/%zz", OUT_SZ,
+    "https://h/%zz" },
+  { "scheme and host lowercase, path does not",
+    "HTTPS://EN.Wikipedia.ORG/Wiki/X", OUT_SZ,
+    "https://en.wikipedia.org/Wiki/X" },
+  { "default https port", "https://h:443/x", OUT_SZ, "https://h/x" },
+  { "default http port", "http://h:80/x", OUT_SZ, "http://h/x" },
+  { "empty port is the default", "https://h:/x", OUT_SZ, "https://h/x" },
+  { "other port is part of the host", "https://h:8443/x", OUT_SZ,
+    "https://h:8443/x" },
+  { "fragment is resolved by the client", "https://h/x#frag", OUT_SZ,
+    "https://h/x" },
+  { "empty path", "https://claude.com", OUT_SZ, "https://claude.com/" },
+  { "empty path before a query", "https://h?q=1", OUT_SZ, "https://h/?q=1" },
+  // The query is identity: these two are different forecasts.
+  { "query survives verbatim",
+    "https://forecast.weather.gov/MapClick.php?lat=30.265&lon=-97.7466",
+    OUT_SZ,
+    "https://forecast.weather.gov/MapClick.php?lat=30.265&lon=-97.7466" },
+  { "a path's trailing slash is its own", "https://h/x/", OUT_SZ,
+    "https://h/x/" },
+  // Shapes it declines to touch: each comes back as it arrived.
+  { "non-http scheme", "ftp://h/x", OUT_SZ, "ftp://h/x" },
+  { "a local path is not a URL", "/tmp/corpus/page.txt", OUT_SZ,
+    "/tmp/corpus/page.txt" },
+  { "userinfo is case-sensitive", "https://U:P@H/x", OUT_SZ,
+    "https://U:P@H/x" },
+  { "ip literal", "https://[::1]/x", OUT_SZ, "https://[::1]/x" },
+  { "null url", NULL, OUT_SZ, "" },
+  { "empty url", "", OUT_SZ, "" },
+  // A truncated URL is a different URL, so a buffer that cannot hold
+  // the canonical form holds the input instead — cut, but never
+  // silently renamed.
+  { "no room to canonicalize", "https://en.m.wikipedia.org/x", 6, "https" },
+};
+
 // util_b64_encode / util_b64url_encode. `url` selects the encoder;
 // a want of 0 bytes with UNTOUCHED output is a refusal.
 static const struct
@@ -196,6 +262,16 @@ main(void)
     test_check_bool("url_is_safe_https", safe_https_cases[i].name,
         safe_https_cases[i].want,
         util_url_is_safe_https(safe_https_cases[i].url));
+
+  for(size_t i = 0; i < sizeof(canon_cases) / sizeof(canon_cases[0]); i++)
+  {
+    const char *got;
+
+    memset(out, 0, sizeof(out));
+    got = util_url_canon(canon_cases[i].url, out, canon_cases[i].cap);
+    test_check_str("url_canon", canon_cases[i].name,
+        canon_cases[i].want, got);
+  }
 
   for(size_t i = 0;
       i < sizeof(b64_encode_cases) / sizeof(b64_encode_cases[0]); i++)
