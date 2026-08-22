@@ -67,33 +67,6 @@ static const cmd_arg_desc_t ad_show_identities[] = {
   { "botname", CMD_ARG_ALNUM, CMD_ARG_REQUIRED, BOT_NAME_SZ - 1, NULL },
 };
 
-// Duration formatter
-
-static void
-fmt_duration(char *buf, size_t sz, time_t secs)
-{
-  uint32_t d, h, m;
-
-  if(secs <= 0)
-  {
-    snprintf(buf, sz, "-");
-    return;
-  }
-
-  d = (uint32_t)(secs / 86400);
-  h = (uint32_t)((secs % 86400) / 3600);
-  m = (uint32_t)((secs % 3600) / 60);
-
-  if(d > 0)
-    snprintf(buf, sz, "%ud %uh %um", d, h, m);
-  else if(h > 0)
-    snprintf(buf, sz, "%uh %um", h, m);
-  else if(m > 0)
-    snprintf(buf, sz, "%um %us", m, (uint32_t)(secs % 60));
-  else
-    snprintf(buf, sz, "%us", (uint32_t)secs);
-}
-
 // Table furniture
 
 // A section title, in the bold cyan /show has drawn them in since
@@ -431,10 +404,10 @@ show_sock_cb(uint32_t id, sock_type_t type, int state,
   show_iter_state_t *st = data;
   const char *state_str;
   char line[512];
-  char dur[32];
+  char dur[UTIL_DURATION_SZ];
 
   if(connected_at > 0)
-    fmt_duration(dur, sizeof(dur), time(NULL) - connected_at);
+    util_fmt_duration(time(NULL) - connected_at, dur, sizeof(dur));
   else
     snprintf(dur, sizeof(dur), "-");
 
@@ -604,18 +577,18 @@ show_identity_cb(const char *username, const char *metadata,
 {
   show_iter_state_t *st = data;
   char line[384];
-  char age_dur[32];
-  char idle_dur[32];
+  char age_dur[UTIL_DURATION_SZ];
+  char idle_dur[UTIL_DURATION_SZ];
   time_t now = time(NULL);
 
   if(created > 0)
-    fmt_duration(age_dur, sizeof(age_dur), now - created);
+    util_fmt_duration(now - created, age_dur, sizeof(age_dur));
 
   else
     snprintf(age_dur, sizeof(age_dur), "-");
 
   if(last_seen > 0)
-    fmt_duration(idle_dur, sizeof(idle_dur), now - last_seen);
+    util_fmt_duration(now - last_seen, idle_dur, sizeof(idle_dur));
 
   else
     snprintf(idle_dur, sizeof(idle_dur), "-");
@@ -674,8 +647,8 @@ show_db_cb(uint16_t slot, db_conn_state_t state, uint64_t queries,
   char line[256];
   const char *state_str;
   const char *state_clr;
-  char age[32];
-  char idle[32];
+  char age[UTIL_DURATION_SZ];
+  char idle[UTIL_DURATION_SZ];
 
   switch(state)
   {
@@ -686,12 +659,12 @@ show_db_cb(uint16_t slot, db_conn_state_t state, uint64_t queries,
   }
 
   if(created > 0)
-    fmt_duration(age, sizeof(age), time(NULL) - created);
+    util_fmt_duration(time(NULL) - created, age, sizeof(age));
   else
     snprintf(age, sizeof(age), "-");
 
   if(last_used > 0)
-    fmt_duration(idle, sizeof(idle), time(NULL) - last_used);
+    util_fmt_duration(time(NULL) - last_used, idle, sizeof(idle));
   else
     snprintf(idle, sizeof(idle), "-");
 
