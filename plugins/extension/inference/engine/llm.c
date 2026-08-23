@@ -771,6 +771,21 @@ llm_services_reload(void)
           " Set 'none' for thinking models (e.g. Gemini) so the token"
           " budget funds the answer, not hidden reasoning.");
 
+    // Optional per-service 'priority' knob (DGX-14). vLLM under
+    // --scheduling-policy priority orders its waiting queue by the
+    // X-Vllm-Priority header, lower first, absent = 0. Set a negative value
+    // on a shared endpoint so the bot outranks whatever the operator is
+    // driving by hand. Empty = omit the header entirely.
+    snprintf(key, sizeof(key), "llm.service.%s.priority", s.name);
+
+    if(!kv_exists(key))
+      kv_register(key, KV_STR, "", NULL, NULL,
+          "Optional scheduling priority sent as the 'X-Vllm-Priority' header"
+          " on every request to this service (integer, lower is served"
+          " first). Empty = omit. Only vLLM served with"
+          " --scheduling-policy priority reads it; every other provider"
+          " ignores the header.");
+
     llm_services_upsert(&s);
   }
 
@@ -2874,6 +2889,40 @@ llm_issue_request(llm_request_t *req)
       char hdr[512];
       snprintf(hdr, sizeof(hdr), "Authorization: Bearer %s", key);
       curl_request_add_header(cr, hdr);
+    }
+  }
+
+  // Per-service scheduling priority (DGX-14). Read fresh per request so an
+  // operator can retune a shared endpoint without a restart. Sent only when
+  // the KV parses as an integer: a header vLLM cannot parse is silently
+  // dropped, which would leave a typo looking like it took.
+  if(req->service_name[0] != '\0')
+  {
+    char        pkey[LLM_KV_KEY_SZ];
+    const char *pval;
+
+    snprintf(pkey, sizeof(pkey), "llm.service.%s.priority", req->service_name);
+    pval = kv_get_str(pkey);
+
+    if(pval != NULL && pval[0] != '\0')
+    {
+      char *end;
+      long  prio;
+
+      errno = 0;
+      prio  = strtol(pval, &end, 10);
+
+      if(errno == 0 && end != pval && *end == '\0')
+      {
+        char hdr[64];
+
+        snprintf(hdr, sizeof(hdr), "X-Vllm-Priority: %ld", prio);
+        curl_request_add_header(cr, hdr);
+      }
+
+      else
+        clam(CLAM_WARN, "llm", "service '%s' priority '%s' is not an integer"
+            " — header omitted", req->service_name, pval);
     }
   }
 
