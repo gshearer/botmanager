@@ -26,6 +26,7 @@
 #include "userns.h"
 #include "kv.h"
 #include "util.h"
+#include "display.h"
 
 #include "inference.h"
 
@@ -39,6 +40,7 @@
 #define IMG_PROMPT_SZ      1200   // cap on the assembled prompt sent to the model
 #define IMG_PATH_SZ        768    // output_dir / public_base
 #define IMG_MODEL_SZ       64     // logical model name (llm registry handle)
+#define IMG_MODEL_ID_SZ    128    // a registry model id, at its widest
 #define IMG_SIZE_SZ        32     // "1024x1024" and friends
 #define IMG_FILENAME_SZ    64     // "imagine-<uuid>.png"
 #define IMG_FULLPATH_SZ    (IMG_PATH_SZ + IMG_FILENAME_SZ + 2)  // dir + '/' + file
@@ -74,15 +76,25 @@ typedef struct img_req
   time_t          begin;                   // submit time, for elapsed reporting
 } img_req_t;
 
+// One cascading knob, resolved: the winning value together with the full
+// KV key that produced it. imagine_first_nonempty returns the value and
+// throws the key away, which is why a `show imagine` disagreeing with
+// `show kv plugin.imagine.default` has no way to say which tier won.
+typedef struct
+{
+  const char *value;           // NULL when no tier is set
+  char        key[KV_KEY_SZ];  // "" when value is NULL
+} imagine_tiered_t;
+
 // Resolved per-request scope: the effective default model, the three
 // allowlist tiers (each a membership filter), and the effective size.
 typedef struct
 {
-  const char *def_model;     // most-specific non-empty, or NULL
-  const char *allow_plugin;  // absolute list
-  const char *allow_bot;     // narrows plugin (NULL/empty/"*" = no-op)
-  const char *allow_method;  // narrows bot    (NULL/empty/"*" = no-op)
-  const char *size;          // most-specific non-empty, or NULL
+  imagine_tiered_t  def_model;     // most-specific non-empty, or .value NULL
+  const char       *allow_plugin;  // absolute list
+  const char       *allow_bot;     // narrows plugin (NULL/empty/"*" = no-op)
+  const char       *allow_method;  // narrows bot    (NULL/empty/"*" = no-op)
+  const char       *size;          // most-specific non-empty, or NULL
 } imagine_scope_t;
 
 // One queue entry captured under the lock for display, so `!show imagine`
@@ -94,21 +106,68 @@ typedef struct
   char     text[IMG_PREVIEW_CHARS + 4];    // preview + "…" + NUL
 } img_snap_t;
 
-// One model row for the `!show imagine` menu.
+// One model row for the `!show imagine` table.
+//
+// The counters are the whole reason this stayed a table when `show ask`
+// became a card: renders, failures and mean latency differ down the page,
+// and a column that differs is a column a reader can scan. They come from
+// llm_model_stats and are therefore the ENGINE's numbers — generation
+// time only, and blind to the two failures that are imagine's own (a
+// request refused before submit, and a delivery that failed after the
+// engine succeeded). Neither is folded in here: `err` has to mean in this
+// table what it means in `show llm`.
 typedef struct
 {
-  char name    [IMG_MODEL_SZ];
-  char service [IMG_MODEL_SZ];
-  char model_id[IMG_MODEL_SZ];
-  bool is_def;
+  char     name    [IMG_MODEL_SZ];
+  char     service [IMG_MODEL_SZ];
+  char     model_id[IMG_MODEL_ID_SZ];
+  uint64_t requests;
+  uint64_t errors;
+  uint64_t ok_latency_ms;
+  bool     is_def;
 } img_model_row_t;
 
+// One walk of the registry, serving both halves of `!show imagine`: the
+// card above reads the def_* fields, the table below reads the rows.
+//
+// The default is captured before the kind and enabled filters, so a
+// default pointing at a disabled model — or at a chat model — still
+// reports as registered rather than as missing.
 typedef struct
 {
   const imagine_scope_t *scope;
   img_model_row_t        rows[IMG_SHOW_MAX];
-  size_t                 n_rows;
+  uint32_t               n_rows;
+  uint32_t               count;   // matched, including rows not stored
+  time_t                 since;   // when the engine started counting
+  bool                   def_found;
+  char                   def_service [IMG_MODEL_SZ];
+  char                   def_model_id[IMG_MODEL_ID_SZ];
 } img_model_state_t;
+
+// Column widths for the model table, measured against the live registry.
+// The lead gutter is the default star plus the space separating it from
+// the first cell; the model id is elastic and takes whatever is left of
+// DISPLAY_COLS.
+#define IMG_TBL_LEAD   2
+#define IMG_TBL_SVC   14     // "hiigara-zimage"
+#define IMG_TBL_NAME   6     // "gpti1m"
+#define IMG_TBL_REQ    5
+#define IMG_TBL_ERR    4
+#define IMG_TBL_AVG    6     // "123.4s"
+
+// A fitted cell: display_fit bounds it by columns, this bounds it by
+// bytes, and 90 columns of UTF-8 fits inside either way.
+#define IMG_CELL_SZ      256
+
+// A card line carries its value plus the indent, the label and ": ".
+#define IMG_CARD_LINE_SZ (IMG_CMD_REPLY_SZ + 64)
+
+// Card geometry, shared by every `  label   : value` line above it.
+#define IMG_CARD_INDENT      2
+#define IMG_CARD_LABEL       8
+#define IMG_CARD_VALUE_COLS  (DISPLAY_COLS - IMG_CARD_INDENT \
+                              - IMG_CARD_LABEL - 2)   // ": "
 
 static void imagine_pump(void);
 static void imagine_done(const llm_image_response_t *resp);

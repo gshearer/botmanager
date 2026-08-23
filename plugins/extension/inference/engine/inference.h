@@ -334,6 +334,13 @@ typedef void (*llm_tts_done_cb_t)(const llm_tts_response_t *resp);
 // appears in the plugin-internal llm_priv.h, which includes this header
 // first — both definitions are identical, but the guard makes the
 // include order irrelevant.
+//
+// ⚠⚠ It runs under the registry's read lock. A visitor that calls back
+// into the engine — llm_model_exists, llm_model_kind, llm_model_stats —
+// retakes that lock recursively or takes a second one beneath it, and
+// both `!show ask` and `!show imagine` did until 2026-08-23. Snapshot
+// from the parameters here and do everything else after the walk;
+// llm_cmd.c's llm_list_iter_cb / llm_list_annotate is the shape.
 #ifndef BM_LLM_MODEL_ITER_CB_T_DEFINED
 #define BM_LLM_MODEL_ITER_CB_T_DEFINED
 typedef void (*llm_model_iter_cb_t)(const char *name, llm_kind_t kind,

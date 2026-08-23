@@ -4,7 +4,7 @@
 //   !ask <query>          one prompt against the bot's default chat model
 //   !a <query>            short alias
 //   !ask -m <model> ...   pick a specific model from the per-bot allowlist
-//   !show ask             list the models available to !ask on this bot
+//   !show ask             the request !ask would make, and under what limits
 //
 // There is deliberately NO conversation memory and no context carry —
 // each call is an independent request (this is not the `chat` method,
@@ -19,6 +19,7 @@
 #include <strings.h>   // strcasecmp
 
 #include "colors.h"
+#include "display.h"   // DISPLAY_COLS, display_fit
 #include "bot.h"        // bot_inst_name
 
 // -----------------------------------------------------------------------
@@ -248,22 +249,82 @@ ask_first_nonempty(const char *a, const char *b, const char *c)
   return(NULL);
 }
 
+// One cascading knob, resolved: the winning value together with the full
+// KV key that produced it. ask_first_nonempty above returns the value and
+// throws the key away, which is why a `show ask` disagreeing with
+// `show kv plugin.ask.default` has no way to say which tier won.
+typedef struct
+{
+  const char *value;           // NULL when no tier is set
+  char        key[KV_KEY_SZ];  // "" when value is NULL
+} ask_tiered_t;
+
+// Resolve one cascading knob across all three tiers, most-specific first,
+// recording both halves. The keys are spelled here rather than borrowed
+// from ask_kv_bot / ask_kv_proto because the winner has to survive the
+// call, and those build theirs on the stack.
+static void
+ask_tier_resolve(const char *bot_name, const char *proto, const char *suffix,
+    ask_tiered_t *out)
+{
+  const char *v;
+
+  out->value  = NULL;
+  out->key[0] = '\0';
+
+  if(bot_name != NULL && proto != NULL)
+  {
+    snprintf(out->key, sizeof(out->key), "bot.%s.%s.ask.%s", bot_name, proto,
+        suffix);
+    v = kv_get_str(out->key);
+
+    if(v != NULL && v[0] != '\0')
+    {
+      out->value = v;
+      return;
+    }
+  }
+
+  if(bot_name != NULL)
+  {
+    snprintf(out->key, sizeof(out->key), "bot.%s.ask.%s", bot_name, suffix);
+    v = kv_get_str(out->key);
+
+    if(v != NULL && v[0] != '\0')
+    {
+      out->value = v;
+      return;
+    }
+  }
+
+  snprintf(out->key, sizeof(out->key), "plugin.ask.%s", suffix);
+  v = kv_get_str(out->key);
+
+  if(v != NULL && v[0] != '\0')
+  {
+    out->value = v;
+    return;
+  }
+
+  out->key[0] = '\0';
+}
+
 // Resolved per-request scope: the effective default model, the three
 // allowlist tiers (each a membership filter), and the reply ceilings.
 // Built once per command and threaded through the gate + reply loop.
 typedef struct
 {
-  const char *def_model;     // most-specific non-empty, or NULL
-  const char *allow_plugin;  // absolute list
-  const char *allow_bot;     // narrows plugin (NULL/empty/"*" = no-op)
-  const char *allow_proto;   // narrows bot    (NULL/empty/"*" = no-op)
-  const char *def_effort;    // most-specific non-empty, or NULL = unset
-  const char *effort_plugin; // the same three tiers, for -e
-  const char *effort_bot;
-  const char *effort_proto;
-  uint32_t    max_lines;     // min across present tiers
-  uint32_t    max_tokens;    // min across present tiers
-  uint32_t    max_cols;      // min across present tiers, buffer-clamped
+  ask_tiered_t  def_model;     // most-specific non-empty, or .value == NULL
+  const char   *allow_plugin;  // absolute list
+  const char   *allow_bot;     // narrows plugin (NULL/empty/"*" = no-op)
+  const char   *allow_proto;   // narrows bot    (NULL/empty/"*" = no-op)
+  ask_tiered_t  def_effort;    // most-specific non-empty, or .value == NULL
+  const char   *effort_plugin; // the same three tiers, for -e
+  const char   *effort_bot;
+  const char   *effort_proto;
+  uint32_t      max_lines;     // min across present tiers
+  uint32_t      max_tokens;    // min across present tiers
+  uint32_t      max_cols;      // min across present tiers, buffer-clamped
 } ask_scope_t;
 
 // True iff `model` is a whole comma/space-separated token of `csv`
@@ -284,12 +345,21 @@ ask_csv_contains(const char *csv, const char *model)
   return(false);
 }
 
+// A tier that imposes no restriction at all: unset, empty, or "*". The
+// card asks this directly — an `allowed` line under three open tiers is a
+// catalogue of everything, which is what `!show llm models chat` is for.
+static bool
+ask_tier_open(const char *csv)
+{
+  return(csv == NULL || csv[0] == '\0' || strcmp(csv, "*") == 0);
+}
+
 // A single allowlist tier admits `model` when it imposes no restriction
-// (unset / empty / "*") or explicitly lists it.
+// or explicitly lists it.
 static bool
 ask_tier_admits(const char *csv, const char *model)
 {
-  if(csv == NULL || csv[0] == '\0' || strcmp(csv, "*") == 0)
+  if(ask_tier_open(csv))
     return(true);
 
   return(ask_csv_contains(csv, model));
@@ -334,19 +404,13 @@ ask_scope_resolve(const char *bot_name, const char *proto, ask_scope_t *s)
 {
   memset(s, 0, sizeof(*s));
 
-  s->def_model = ask_first_nonempty(
-      ask_kv_proto(bot_name, proto, "default"),
-      ask_kv_bot(bot_name, "default"),
-      kv_get_str("plugin.ask.default"));
+  ask_tier_resolve(bot_name, proto, "default", &s->def_model);
 
   s->allow_plugin = kv_get_str("plugin.ask.allow");
   s->allow_bot    = ask_kv_bot(bot_name, "allow");
   s->allow_proto  = ask_kv_proto(bot_name, proto, "allow");
 
-  s->def_effort = ask_first_nonempty(
-      ask_kv_proto(bot_name, proto, "effort"),
-      ask_kv_bot(bot_name, "effort"),
-      kv_get_str("plugin.ask.effort"));
+  ask_tier_resolve(bot_name, proto, "effort", &s->def_effort);
 
   s->effort_plugin = kv_get_str("plugin.ask.effort_allow");
   s->effort_bot    = ask_kv_bot(bot_name, "effort_allow");
@@ -408,6 +472,24 @@ ask_read_prepend(const char *bot_name, const char *proto,
   return(n > 0 ? SUCCESS : FAIL);
 }
 
+// The allowlist half of the gate, for a model already known to exist and
+// to be of the right kind. It is split out because llm_model_iterate runs
+// its callback under the registry's read lock, so a row collected there
+// must be gated without calling back into the engine.
+static bool
+ask_allowed(const char *model, const ask_scope_t *s)
+{
+  // The resolved default is always reachable, even if the allowlists omit
+  // it — a bot can always run its own configured default.
+  if(s->def_model.value != NULL && strcasecmp(model, s->def_model.value) == 0)
+    return(true);
+
+  // Intersection: every present tier must admit the model.
+  return(ask_tier_admits(s->allow_plugin, model) &&
+         ask_tier_admits(s->allow_bot,    model) &&
+         ask_tier_admits(s->allow_proto,  model));
+}
+
 // Gate a model for !ask: it must exist, be a chat model (embed models stay
 // unreachable even under "*"), and either be the resolved default (always
 // self-allowed) or survive the intersection of all present allow tiers.
@@ -429,15 +511,7 @@ ask_model_ok(const char *model, const ask_scope_t *s)
   if(llm_model_kind(model, &kind) != SUCCESS || kind != LLM_KIND_CHAT)
     return(false);
 
-  // The resolved default is always reachable, even if the allowlists omit
-  // it — a bot can always run its own configured default.
-  if(s->def_model != NULL && strcasecmp(model, s->def_model) == 0)
-    return(true);
-
-  // Intersection: every present tier must admit the model.
-  return(ask_tier_admits(s->allow_plugin, model) &&
-         ask_tier_admits(s->allow_bot,    model) &&
-         ask_tier_admits(s->allow_proto,  model));
+  return(ask_allowed(model, s));
 }
 
 
@@ -459,7 +533,8 @@ ask_effort_ok(llm_effort_t e, const char *model, const ask_scope_t *s,
 
   // The resolved default is always self-allowed, exactly as the resolved
   // default model is — a bot can always run its own configuration.
-  is_default = s->def_effort != NULL && strcasecmp(wire, s->def_effort) == 0;
+  is_default = s->def_effort.value != NULL
+      && strcasecmp(wire, s->def_effort.value) == 0;
 
   if(!is_default
       && (!ask_tier_admits(s->effort_plugin, wire)
@@ -828,7 +903,7 @@ ask_cmd_handler(const cmd_ctx_t *ctx)
 
   static const char usage[] =
       "Usage: ask [-m <model>] [-e <effort>] <query>"
-      "  ·  !show ask lists models";
+      "  ·  !show ask reports the defaults";
 
   if(ctx->args == NULL || ctx->args[0] == '\0')
   {
@@ -847,7 +922,7 @@ ask_cmd_handler(const cmd_ctx_t *ctx)
   bot_name = (ctx->bot != NULL) ? bot_inst_name(ctx->bot) : NULL;
   proto    = ask_proto(ctx);
   ask_scope_resolve(bot_name, proto, &scope);
-  model    = flags.have_model ? flags.model : scope.def_model;
+  model    = flags.have_model ? flags.model : scope.def_model.value;
 
   if(!ask_model_ok(model, &scope))
   {
@@ -860,7 +935,7 @@ ask_cmd_handler(const cmd_ctx_t *ctx)
 
   // Effort is gated AFTER the model: "gpl accepts: low,medium,high" is
   // nonsense advice about a model the caller cannot reach anyway.
-  want_effort = flags.have_effort ? flags.effort : scope.def_effort;
+  want_effort = flags.have_effort ? flags.effort : scope.def_effort.value;
 
   if(llm_effort_from_str(want_effort, &effort) != SUCCESS)
   {
@@ -929,138 +1004,249 @@ ask_cmd_handler(const cmd_ctx_t *ctx)
   }
 }
 
-// Per-model visitor for !show ask. Collects one row per enabled chat
-// model the calling bot may reach; show_ask_handler emits them as an
-// aligned, colorized table, starring the default.
+// -----------------------------------------------------------------------
+// !show ask — one model, so a card and not a table
+//
+// A column whose value is identical on every row carries no information
+// (include/display.h). The menu that stood here had three — service,
+// model, model id — and every one of them was the registry restated,
+// identical for every caller, describing N models when !ask will use
+// exactly one. What it never said was which model, chosen by which tier,
+// at what effort, under what ceilings. That is a card.
+//
+// `show imagine` keeps its table because the same rule comes out the
+// other way there: its rows carry per-model counters and they differ.
+// -----------------------------------------------------------------------
 
-#define ASK_SHOW_MAX_ROWS 64
-#define ASK_SHOW_FIELD_SZ 96
+#define ASK_CARD_INDENT      2
+#define ASK_CARD_LABEL       8
+#define ASK_CARD_VALUE_COLS  (DISPLAY_COLS - ASK_CARD_INDENT \
+                              - ASK_CARD_LABEL - 2)   // ": "
+#define ASK_CARD_FIELD_SZ    128    // a registry model id, at its widest
+#define ASK_CARD_CELL_SZ     256    // a fitted cell: 90 columns of UTF-8
+#define ASK_CARD_ALLOWED_SZ  512
+#define ASK_CARD_EFFORTS_SZ  128    // a declared effort set is a short CSV
 
-typedef struct
-{
-  char name[ASK_SHOW_FIELD_SZ];      // arbitrary model name
-  char service[ASK_SHOW_FIELD_SZ];   // arbitrary service name
-  char model_id[ASK_SHOW_FIELD_SZ];  // full underlying model id
-  bool is_def;
-} ask_show_row_t;
-
-typedef struct
-{
-  const cmd_ctx_t   *ctx;
-  const ask_scope_t *scope;
-  ask_show_row_t     rows[ASK_SHOW_MAX_ROWS];
-  size_t             n_rows;
-} ask_show_state_t;
-
+// One card line, its value already coloured and already fitted.
 static void
-ask_field_copy(char *dst, size_t dst_sz, const char *src)
+ask_card(const cmd_ctx_t *ctx, const char *label, const char *value)
 {
-  if(src == NULL)
-    src = "";
+  char line[ASK_LINE_SZ];
 
-  strlcpy(dst, src, dst_sz);
+  snprintf(line, sizeof(line), "%*s%-*s: %s", ASK_CARD_INDENT, "",
+      ASK_CARD_LABEL, label, value);
+  cmd_reply(ctx, line);
 }
 
+// A card line whose value is one raw string: fit, then colour. Never the
+// other way round — display_fit measures columns and a colour marker is
+// two bytes of none (include/display.h).
 static void
-ask_show_model_cb(const char *name, llm_kind_t kind,
+ask_card_text(const cmd_ctx_t *ctx, const char *label, const char *color,
+    const char *text)
+{
+  char cell [ASK_CARD_CELL_SZ];
+  char value[ASK_CMD_REPLY_SZ];
+
+  display_fit(text, ASK_CARD_VALUE_COLS - 1, cell, sizeof(cell), "…");
+  snprintf(value, sizeof(value), "%s%s" CLR_RESET, color, cell);
+  ask_card(ctx, label, value);
+}
+
+// What the card needs out of the registry, gathered in the single pass
+// llm_model_iterate gives us.
+//
+// ⚠ The callback below runs under the registry's read lock. It touches
+// neither the engine nor KV — both take locks of their own, and the one
+// that matters here is the read lock a nested llm_model_exists would take
+// recursively. Everything else this card prints is read after the walk.
+typedef struct
+{
+  const ask_scope_t *scope;
+  bool               found;                          // default is registered
+  char               service [ASK_CARD_FIELD_SZ];
+  char               model_id[ASK_CARD_FIELD_SZ];
+  char               allowed [ASK_CARD_ALLOWED_SZ];  // space-separated names
+  uint32_t           n_allowed;
+} ask_card_state_t;
+
+static void
+ask_card_model_cb(const char *name, llm_kind_t kind,
     const char *service_name, const char *model_id,
     uint32_t embed_dim, uint32_t max_context, float default_temp,
     bool enabled, void *user)
 {
-  ask_show_state_t *s = (ask_show_state_t *)user;
-  ask_show_row_t   *r;
+  ask_card_state_t  *st = (ask_card_state_t *)user;
+  const ask_scope_t *s  = st->scope;
 
   (void)embed_dim;
   (void)max_context;
   (void)default_temp;
 
-  if(kind != LLM_KIND_CHAT || !enabled)
+  if(!st->found && s->def_model.value != NULL
+      && strcasecmp(name, s->def_model.value) == 0)
+  {
+    st->found = true;
+    strlcpy(st->service,  service_name != NULL ? service_name : "",
+        sizeof st->service);
+    strlcpy(st->model_id, model_id != NULL ? model_id : "",
+        sizeof st->model_id);
+  }
+
+  if(kind != LLM_KIND_CHAT || !enabled || !ask_allowed(name, s))
     return;
 
-  if(!ask_model_ok(name, s->scope))
-    return;
+  st->n_allowed++;
 
-  if(s->n_rows >= ASK_SHOW_MAX_ROWS)
-    return;
+  if(st->allowed[0] != '\0')
+    strlcat(st->allowed, " ", sizeof st->allowed);
 
-  r = &s->rows[s->n_rows++];
-
-  ask_field_copy(r->name, sizeof(r->name), name);
-  ask_field_copy(r->service, sizeof(r->service), service_name);
-  ask_field_copy(r->model_id, sizeof(r->model_id), model_id);
-
-  r->is_def = (s->scope->def_model != NULL &&
-               strcasecmp(name, s->scope->def_model) == 0);
+  strlcat(st->allowed, name, sizeof st->allowed);
 }
 
+// `model` — the name, the id it stands for, and the service that serves
+// it. An unregistered default is the case worth spelling out: !ask falls
+// through to llm.default_chat_model without a word, which is how a
+// deleted gf35 stayed configured on three bots for months.
 static void
-show_ask_emit(const ask_show_state_t *s)
+ask_card_model(const cmd_ctx_t *ctx, const ask_card_state_t *st,
+    const char *model)
 {
-  const cmd_ctx_t *ctx    = s->ctx;
-  size_t           w_svc  = strlen("service");
-  size_t           w_name = strlen("model");
-  char             line[ASK_CMD_REPLY_SZ];
+  char cell [ASK_CARD_FIELD_SZ];
+  char value[ASK_CMD_REPLY_SZ];
+  int  left;
 
-  if(s->n_rows == 0)
+  if(model == NULL)
   {
-    cmd_reply(ctx, "  " CLR_GRAY "(no models available here)" CLR_RESET);
+    ask_card(ctx, "model", CLR_RED "(none configured)" CLR_RESET);
     return;
   }
 
-  // Widen columns to the longest cell (header labels included).
-  for(size_t i = 0; i < s->n_rows; i++)
+  if(!st->found)
   {
-    size_t l;
-
-    l = strlen(s->rows[i].service);
-    if(l > w_svc)
-      w_svc = l;
-
-    l = strlen(s->rows[i].name);
-    if(l > w_name)
-      w_name = l;
+    snprintf(value, sizeof(value), CLR_WHITE "%s" CLR_RESET "   " CLR_YELLOW
+        "⚠ not registered — !ask will fall back" CLR_RESET, model);
+    ask_card(ctx, "model", value);
+    return;
   }
 
-  // Header row (three leading spaces align past the star column).
-  snprintf(line, sizeof(line),
-      "   " CLR_BOLD "%-*s  %-*s  %s" CLR_RESET,
-      (int)w_svc, "service", (int)w_name, "model", "model id");
-  cmd_reply(ctx, line);
+  // The id is the elastic cell and pays for whatever the name and the
+  // service spend; three spaces and the separator are the rest.
+  left = ASK_CARD_VALUE_COLS - (int)display_vis_len(model) - 3 - 5
+      - (int)display_vis_len(st->service);
 
-  for(size_t i = 0; i < s->n_rows; i++)
+  display_fit(st->model_id, left > 8 ? left : 8, cell, sizeof(cell), "…");
+
+  snprintf(value, sizeof(value), CLR_WHITE "%s" CLR_RESET "   " CLR_GRAY
+      "%s" CLR_RESET "  ·  " CLR_CYAN "%s" CLR_RESET, model, cell,
+      st->service);
+  ask_card(ctx, "model", value);
+}
+
+// `accepts` — the model's declared effort set, and the warning that comes
+// with a set refusing `none`: omitting the field on a thinking-only model
+// returns a 200 with empty content, which is the failure that went
+// unnoticed for eleven hours. One derivation, two renderers — the test is
+// llm_effort_set_admits, never a second copy of it.
+static void
+ask_card_accepts(const cmd_ctx_t *ctx, const char *model)
+{
+  char        key[KV_KEY_SZ];
+  char        set[ASK_CARD_EFFORTS_SZ];
+  char        value[ASK_CMD_REPLY_SZ];
+  const char *csv;
+
+  snprintf(key, sizeof(key), "llm.model.%s.efforts", model);
+  csv = kv_get_str(key);
+
+  // ⚠ Absent means UNDECLARED, which admits everything. A reader shown a
+  // blank draws the opposite conclusion (include/kv.h, the read-site rule).
+  if(csv == NULL || csv[0] == '\0')
   {
-    const ask_show_row_t *r = &s->rows[i];
-
-    snprintf(line, sizeof(line),
-        " %s " CLR_CYAN "%-*s" CLR_RESET "  " CLR_WHITE "%-*s" CLR_RESET
-        "  " CLR_GRAY "%s" CLR_RESET,
-        r->is_def ? CLR_YELLOW "★" CLR_RESET : " ",
-        (int)w_svc, r->service,
-        (int)w_name, r->name,
-        r->model_id);
-    cmd_reply(ctx, line);
+    ask_card(ctx, "accepts", CLR_GRAY "undeclared — nobody has measured this"
+        " model, not \"none accepted\"" CLR_RESET);
+    return;
   }
+
+  // Space-separated so it reads as a set rather than a CSV to paste back,
+  // and otherwise verbatim: an unrecognised token is the operator's typo,
+  // and swallowing it here hides the refusal `!ask -e` will hand back.
+  strlcpy(set, csv, sizeof set);
+
+  for(char *p = set; *p != '\0'; p++)
+    if(*p == ',')
+      *p = ' ';
+
+  snprintf(value, sizeof(value), CLR_WHITE "%s" CLR_RESET "%s", set,
+      llm_effort_set_admits(csv, LLM_EFFORT_NONE) ? ""
+          : "   " CLR_YELLOW "⚠ thinking-only" CLR_RESET);
+  ask_card(ctx, "accepts", value);
 }
 
 static void
 show_ask_handler(const cmd_ctx_t *ctx)
 {
-  ask_show_state_t s;
-  ask_scope_t      scope;
-  const char      *bot_name;
-  const char      *proto;
+  ask_card_state_t  st;
+  ask_scope_t       scope;
+  const char       *bot_name;
+  const char       *proto;
+  const char       *model;
+  char              value[ASK_CMD_REPLY_SZ];
 
   bot_name = (ctx->bot != NULL) ? bot_inst_name(ctx->bot) : NULL;
   proto    = ask_proto(ctx);
   ask_scope_resolve(bot_name, proto, &scope);
 
-  s.ctx    = ctx;
-  s.scope  = &scope;
-  s.n_rows = 0;
+  memset(&st, 0, sizeof(st));
+  st.scope = &scope;
+  llm_model_iterate(ask_card_model_cb, &st);
 
-  cmd_reply(ctx, CLR_BOLD "ask" CLR_RESET "  ·  models available here");
-  llm_model_iterate(ask_show_model_cb, &s);
-  show_ask_emit(&s);
+  model = scope.def_model.value;
+
+  cmd_reply(ctx, CLR_BOLD "ask" CLR_RESET
+      "  ·  one-shot LLM query, no memory");
+
+  ask_card_model(ctx, &st, model);
+
+  if(model != NULL)
+    ask_card_text(ctx, "from", CLR_GRAY, scope.def_model.key);
+
+  // ⛔ No value when nothing is set: printing one the plugin would not
+  // send is worse than printing none. The service's own
+  // llm.service.<name>.reasoning_effort decides in that case.
+  if(scope.def_effort.value == NULL)
+    ask_card(ctx, "effort", CLR_GRAY "unset — the service decides" CLR_RESET);
+
+  else
+  {
+    snprintf(value, sizeof(value), CLR_WHITE "%s" CLR_RESET "   " CLR_GRAY
+        "from %s" CLR_RESET, scope.def_effort.value, scope.def_effort.key);
+    ask_card(ctx, "effort", value);
+  }
+
+  if(st.found)
+    ask_card_accepts(ctx, model);
+
+  // Ceilings a caller hits without ever being told the number.
+  snprintf(value, sizeof(value), "%u tokens  ·  %u lines  ·  %u columns",
+      scope.max_tokens, scope.max_lines, scope.max_cols);
+  ask_card(ctx, "limits", value);
+
+  // The constraint, not a catalogue. With every tier open there is nothing
+  // here a caller does not already have from `!show llm models chat`, so
+  // the line says nothing at all — which is the behaviour that makes it
+  // worth having the day an operator narrows one.
+  if(!ask_tier_open(scope.allow_plugin) || !ask_tier_open(scope.allow_bot)
+      || !ask_tier_open(scope.allow_proto))
+  {
+    if(st.n_allowed == 0)
+      ask_card(ctx, "allowed", CLR_RED "(nothing — every tier excludes"
+          " every model)" CLR_RESET);
+    else
+      ask_card_text(ctx, "allowed", CLR_WHITE, st.allowed);
+  }
+
+  ask_card_text(ctx, "others", CLR_CYAN, "!show llm models chat");
 }
 
 // -----------------------------------------------------------------------
@@ -1073,7 +1259,7 @@ static const char ask_cmd_help[] =
     "  ask <query>          one-shot query against the bot's default model\n"
     "  a <query>            short alias\n"
     "  ask -m <model> ...   pick a specific model from the allowlist\n"
-    "  show ask             list the models available on this bot\n"
+    "  show ask             the request !ask would make on this bot\n"
     "\n"
     "Answers are STATELESS — no memory is kept and no conversation\n"
     "history is carried between calls (this is not the chat bot).\n"
@@ -1093,7 +1279,7 @@ ask_cmd_init(void)
     return(FAIL);
 
   if(cmd_register(ASK_CMD_CTX, "ask", "show ask",
-      "List chat models available to !ask on this bot", NULL,
+      "Report the model, effort and limits !ask would use here", NULL,
       USERNS_GROUP_EVERYONE, 0, CMD_SCOPE_ANY, METHOD_T_ANY,
       show_ask_handler, NULL, "show", NULL, NULL, 0, NULL, NULL) != SUCCESS)
   {

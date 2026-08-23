@@ -4,7 +4,7 @@
 //   !imagine <prompt>          generate against the bot's default image model
 //   !ig <prompt>               short alias
 //   !imagine -m <model> ...    pick a specific model from the per-bot allowlist
-//   !show imagine              queue status and the image models available here
+//   !show imagine              the request !imagine would make, and traffic
 //
 // The bot owns hosting: the image model is asked for base64 bytes, which
 // this command decodes, writes into a KV-configured web directory
@@ -18,6 +18,8 @@
 #include <stdio.h>
 #include <string.h>
 #include <strings.h>   // strcasecmp
+
+#include <inttypes.h>
 
 #include "colors.h"
 #include "bot.h"        // bot_inst_name
@@ -205,15 +207,74 @@ imagine_csv_contains(const char *csv, const char *model)
   return(false);
 }
 
+// A tier that imposes no restriction at all: unset, empty, or "*".
+static bool
+imagine_tier_open(const char *csv)
+{
+  return(csv == NULL || csv[0] == '\0' || strcmp(csv, "*") == 0);
+}
+
 // A single allowlist tier admits `model` when it imposes no restriction
-// (unset / empty / "*") or explicitly lists it.
+// or explicitly lists it.
 static bool
 imagine_tier_admits(const char *csv, const char *model)
 {
-  if(csv == NULL || csv[0] == '\0' || strcmp(csv, "*") == 0)
+  if(imagine_tier_open(csv))
     return(true);
 
   return(imagine_csv_contains(csv, model));
+}
+
+// Resolve one cascading knob across all three tiers, most-specific first,
+// recording both the winning value and the key that produced it. The keys
+// are spelled here rather than borrowed from imagine_kv_bot /
+// imagine_kv_method because the winner has to survive the call, and those
+// build theirs on the stack.
+static void
+imagine_tier_resolve(const char *bot_name, const char *method_kind,
+    const char *suffix, imagine_tiered_t *out)
+{
+  const char *v;
+
+  out->value  = NULL;
+  out->key[0] = '\0';
+
+  if(bot_name != NULL && method_kind != NULL)
+  {
+    snprintf(out->key, sizeof(out->key), "bot.%s.%s.imagine.%s", bot_name,
+        method_kind, suffix);
+    v = kv_get_str(out->key);
+
+    if(v != NULL && v[0] != '\0')
+    {
+      out->value = v;
+      return;
+    }
+  }
+
+  if(bot_name != NULL)
+  {
+    snprintf(out->key, sizeof(out->key), "bot.%s.imagine.%s", bot_name,
+        suffix);
+    v = kv_get_str(out->key);
+
+    if(v != NULL && v[0] != '\0')
+    {
+      out->value = v;
+      return;
+    }
+  }
+
+  snprintf(out->key, sizeof(out->key), "plugin.imagine.%s", suffix);
+  v = kv_get_str(out->key);
+
+  if(v != NULL && v[0] != '\0')
+  {
+    out->value = v;
+    return;
+  }
+
+  out->key[0] = '\0';
 }
 
 // Populate `s` for a request on (bot_name, method_kind). Any tier may be absent.
@@ -223,10 +284,7 @@ imagine_scope_resolve(const char *bot_name, const char *method_kind,
 {
   memset(s, 0, sizeof(*s));
 
-  s->def_model = imagine_first_nonempty(
-      imagine_kv_method(bot_name, method_kind, "default"),
-      imagine_kv_bot(bot_name, "default"),
-      kv_get_str("plugin.imagine.default"));
+  imagine_tier_resolve(bot_name, method_kind, "default", &s->def_model);
 
   s->allow_plugin = kv_get_str("plugin.imagine.allow");
   s->allow_bot    = imagine_kv_bot(bot_name, "allow");
@@ -281,6 +339,24 @@ imagine_read_prepend(const char *bot_name, const char *method_kind,
   return(n > 0 ? SUCCESS : FAIL);
 }
 
+// The allowlist half of the gate, for a model already known to exist and
+// to be of the right kind. It is split out because llm_model_iterate runs
+// its callback under the registry's read lock, so a row collected there
+// must be gated without calling back into the engine.
+static bool
+imagine_allowed(const char *model, const imagine_scope_t *s)
+{
+  // The resolved default is always reachable, even if the allowlists omit
+  // it — a bot can always run its own configured default.
+  if(s->def_model.value != NULL && strcasecmp(model, s->def_model.value) == 0)
+    return(true);
+
+  // Intersection: every present tier must admit the model.
+  return(imagine_tier_admits(s->allow_plugin, model) &&
+         imagine_tier_admits(s->allow_bot,    model) &&
+         imagine_tier_admits(s->allow_method, model));
+}
+
 // Gate a model for !imagine: it must exist, be an image model (chat/embed
 // models stay unreachable even under "*"), and either be the resolved
 // default (always self-allowed) or survive the intersection of all present
@@ -301,12 +377,7 @@ imagine_model_ok(const char *model, const imagine_scope_t *s)
   if(llm_model_kind(model, &kind) != SUCCESS || kind != LLM_KIND_IMAGE)
     return(false);
 
-  if(s->def_model != NULL && strcasecmp(model, s->def_model) == 0)
-    return(true);
-
-  return(imagine_tier_admits(s->allow_plugin,  model) &&
-         imagine_tier_admits(s->allow_bot,     model) &&
-         imagine_tier_admits(s->allow_method,  model));
+  return(imagine_allowed(model, s));
 }
 
 // -----------------------------------------------------------------------
@@ -722,7 +793,7 @@ imagine_cmd_handler(const cmd_ctx_t *ctx)
   bot_name    = (ctx->bot != NULL) ? bot_inst_name(ctx->bot) : NULL;
   method_kind = imagine_method(ctx);
   imagine_scope_resolve(bot_name, method_kind, &scope);
-  model       = have_model ? picked : scope.def_model;
+  model       = have_model ? picked : scope.def_model.value;
 
   if(!imagine_model_ok(model, &scope))
   {
@@ -886,8 +957,22 @@ imagine_snap(const img_req_t *r, img_snap_t *out)
   imagine_prompt_preview(r->prompt, out->text, sizeof(out->text));
 }
 
-// Per-model visitor: collect one row per enabled image model the calling
-// bot may reach.
+// -----------------------------------------------------------------------
+// !show imagine — a card above a table
+//
+// Both halves answer to the same rule: a column whose value is identical
+// on every row belongs in the header or in the command
+// (include/display.h). `show ask` lost its table to it because every cell
+// was the registry restated; this one keeps its table because
+// llm_model_stats gives every row different numbers. Same rule, opposite
+// answers — what differs is whether the rows do.
+// -----------------------------------------------------------------------
+
+// Snapshot only. llm_model_iterate runs this under the registry's read
+// lock, so nothing here calls back into the engine and nothing here reads
+// KV — both take locks of their own, and the counters wait for
+// imagine_models_annotate below. One walk, never two: a second one retakes
+// the lock and can see a different set of models.
 static void
 imagine_model_cb(const char *name, llm_kind_t kind, const char *service_name,
     const char *model_id, uint32_t embed_dim, uint32_t max_context,
@@ -900,97 +985,377 @@ imagine_model_cb(const char *name, llm_kind_t kind, const char *service_name,
   (void)max_context;
   (void)default_temp;
 
+  if(!s->def_found && s->scope->def_model.value != NULL
+      && strcasecmp(name, s->scope->def_model.value) == 0)
+  {
+    s->def_found = true;
+    strlcpy(s->def_service,  service_name != NULL ? service_name : "",
+        sizeof s->def_service);
+    strlcpy(s->def_model_id, model_id != NULL ? model_id : "",
+        sizeof s->def_model_id);
+  }
+
   if(kind != LLM_KIND_IMAGE || !enabled)
     return;
 
-  if(!imagine_model_ok(name, s->scope))
+  if(!imagine_allowed(name, s->scope))
     return;
+
+  s->count++;
 
   if(s->n_rows >= IMG_SHOW_MAX)
     return;
 
   row = &s->rows[s->n_rows++];
+  memset(row, 0, sizeof(*row));
 
-  snprintf(row->name,     sizeof(row->name),     "%s", name);
-  snprintf(row->service,  sizeof(row->service),  "%s",
-      service_name != NULL ? service_name : "");
-  snprintf(row->model_id, sizeof(row->model_id), "%s",
-      model_id != NULL ? model_id : "");
+  strlcpy(row->name,     name,                                sizeof row->name);
+  strlcpy(row->service,  service_name != NULL ? service_name : "",
+      sizeof row->service);
+  strlcpy(row->model_id, model_id != NULL ? model_id : "",
+      sizeof row->model_id);
 
-  row->is_def = (s->scope->def_model != NULL &&
-                 strcasecmp(name, s->scope->def_model) == 0);
+  row->is_def = s->scope->def_model.value != NULL
+      && strcasecmp(name, s->scope->def_model.value) == 0;
+}
+
+// The counters, once the registry lock is back down.
+//
+// ⚠ A model the engine has never seen answers FAIL, which is not the same
+// fact as "zero requests" and renders identically anyway — the row keeps
+// the zeros memset left it. The distinction has no reader.
+static void
+imagine_models_annotate(img_model_state_t *s)
+{
+  for(uint32_t i = 0; i < s->n_rows; i++)
+  {
+    img_model_row_t  *row = &s->rows[i];
+    llm_model_stats_t stats;
+    bool              seen;
+
+    seen = llm_model_stats(row->name, &stats) == SUCCESS;
+
+    // ⚠ The window is filled in either way, and every model shares it —
+    // it opens when the engine starts counting. A table of models the
+    // engine has never seen still owes the reader that date, or a fresh
+    // reload reads as "never used".
+    s->since = stats.since;
+
+    if(!seen)
+      continue;
+
+    row->requests      = stats.requests;
+    row->errors        = stats.errors;
+    row->ok_latency_ms = stats.ok_latency_ms;
+  }
+}
+
+// One fixed-width cell plus the grid's separator. The cell arrives already
+// coloured: markers count no columns, so padding sees through them.
+static void
+imagine_tbl_cell(char *line, size_t cap, const char *text, int width,
+    bool right)
+{
+  char cell[256];
+
+  strlcpy(cell, text, sizeof cell);
+
+  if(right)
+    display_align_right(cell, sizeof cell, width);
+  else
+    display_align_left(cell, sizeof cell, width);
+
+  display_cat(line, cap, cell);
+  display_cat(line, cap, "  ");
 }
 
 static void
-show_imagine_models(const cmd_ctx_t *ctx, const imagine_scope_t *scope)
+imagine_tbl_head(const cmd_ctx_t *ctx)
 {
-  img_model_state_t s;
-  size_t            w_svc  = strlen("service");
-  size_t            w_name = strlen("model");
-  char              line[IMG_CMD_REPLY_SZ];
+  char line[IMG_CMD_REPLY_SZ];
 
-  s.scope  = scope;
-  s.n_rows = 0;
+  // Indent first, emphasis second: cmd_reply_table_head reads the margin
+  // off the head with strspn, and a leading colour marker would hide it.
+  snprintf(line, sizeof(line), "%*s" CLR_BOLD, IMG_TBL_LEAD, "");
 
-  llm_model_iterate(imagine_model_cb, &s);
+  imagine_tbl_cell(line, sizeof(line), "service", IMG_TBL_SVC,  false);
+  imagine_tbl_cell(line, sizeof(line), "model",   IMG_TBL_NAME, false);
+  imagine_tbl_cell(line, sizeof(line), "req",     IMG_TBL_REQ,  true);
+  imagine_tbl_cell(line, sizeof(line), "err",     IMG_TBL_ERR,  true);
+  imagine_tbl_cell(line, sizeof(line), "avg",     IMG_TBL_AVG,  true);
+  display_cat(line, sizeof(line), "model id" CLR_RESET);
+  cmd_reply_table_head(ctx, line);
+}
 
-  if(s.n_rows == 0)
+static void
+imagine_tbl_row(const cmd_ctx_t *ctx, const img_model_row_t *row)
+{
+  char line[IMG_CMD_REPLY_SZ];
+  char cell[256];
+  int  left;
+
+  snprintf(line, sizeof(line), "%s ",
+      row->is_def ? CLR_YELLOW "★" CLR_RESET : " ");
+
+  snprintf(cell, sizeof(cell), CLR_CYAN "%s" CLR_RESET, row->service);
+  imagine_tbl_cell(line, sizeof(line), cell, IMG_TBL_SVC, false);
+
+  snprintf(cell, sizeof(cell), CLR_WHITE "%s" CLR_RESET, row->name);
+  imagine_tbl_cell(line, sizeof(line), cell, IMG_TBL_NAME, false);
+
+  if(row->requests > 0)
+    snprintf(cell, sizeof(cell), "%" PRIu64, row->requests);
+  else
+    strlcpy(cell, CLR_GRAY "—" CLR_RESET, sizeof cell);
+
+  imagine_tbl_cell(line, sizeof(line), cell, IMG_TBL_REQ, true);
+
+  if(row->errors > 0)
+    snprintf(cell, sizeof(cell), CLR_RED "%" PRIu64 CLR_RESET, row->errors);
+  else
+    strlcpy(cell, row->requests > 0 ? "0" : CLR_GRAY "—" CLR_RESET,
+        sizeof cell);
+
+  imagine_tbl_cell(line, sizeof(line), cell, IMG_TBL_ERR, true);
+
+  // The mean excludes failures — a failed render's elapsed time is a
+  // timeout, not a speed — so a model that has only ever failed has no
+  // mean to report, and that is the divide-by-zero guard as well.
+  if(row->requests > row->errors)
+    snprintf(cell, sizeof(cell), "%.1fs",
+        (double)(row->ok_latency_ms / (row->requests - row->errors)) / 1000.0);
+  else
+    strlcpy(cell, CLR_GRAY "—" CLR_RESET, sizeof cell);
+
+  imagine_tbl_cell(line, sizeof(line), cell, IMG_TBL_AVG, true);
+
+  // Measured rather than assumed: display_align_left lets a cell wider
+  // than its column win, by design, so a long service name shifts
+  // everything right of it and the id is what pays.
+  // ⚠ One column off the budget for the ellipsis: display_fit reserves its
+  // mark out of the BYTE budget, not the column budget, and a last cell
+  // has no padding to absorb the extra.
+  left = DISPLAY_COLS - (int)display_vis_len(line) - 1;
+
+  display_fit(row->model_id, left > 1 ? left : 1, cell, sizeof(cell), "…");
+  display_cat(line, sizeof(line), CLR_GRAY);
+  display_cat(line, sizeof(line), cell);
+  display_cat(line, sizeof(line), CLR_RESET);
+  cmd_reply(ctx, line);
+}
+
+static void
+show_imagine_models(const cmd_ctx_t *ctx, const img_model_state_t *s)
+{
+  char      line[IMG_CMD_REPLY_SZ];
+  char      when[48];
+  struct tm tm;
+
+  if(s->n_rows == 0)
   {
     cmd_reply(ctx, "  " CLR_GRAY "(no image models available here)" CLR_RESET);
     return;
   }
 
-  for(size_t i = 0; i < s.n_rows; i++)
+  imagine_tbl_head(ctx);
+
+  for(uint32_t i = 0; i < s->n_rows; i++)
+    imagine_tbl_row(ctx, &s->rows[i]);
+
+  // ⛔ Never silently: a cut-off table reads as "that is all of them".
+  if(s->count > s->n_rows)
   {
-    size_t l;
-
-    l = strlen(s.rows[i].service);
-    if(l > w_svc)
-      w_svc = l;
-
-    l = strlen(s.rows[i].name);
-    if(l > w_name)
-      w_name = l;
-  }
-
-  snprintf(line, sizeof(line), "   " CLR_BOLD "%-*s  %-*s  %s" CLR_RESET,
-      (int)w_svc, "service", (int)w_name, "model", "model id");
-  cmd_reply(ctx, line);
-
-  for(size_t i = 0; i < s.n_rows; i++)
-  {
-    const img_model_row_t *row = &s.rows[i];
-
-    snprintf(line, sizeof(line),
-        " %s " CLR_CYAN "%-*s" CLR_RESET "  " CLR_WHITE "%-*s" CLR_RESET
-        "  " CLR_GRAY "%s" CLR_RESET,
-        row->is_def ? CLR_YELLOW "★" CLR_RESET : " ",
-        (int)w_svc, row->service,
-        (int)w_name, row->name,
-        row->model_id);
+    snprintf(line, sizeof(line), "  " CLR_GRAY "… +%u more" CLR_RESET,
+        s->count - s->n_rows);
     cmd_reply(ctx, line);
   }
+
+  // The window is not decoration: a /plugin reload inference zeroes every
+  // number above it, and a table that does not say so reads as history.
+  if(s->since > 0 && localtime_r(&s->since, &tm) != NULL)
+  {
+    strftime(when, sizeof(when), "counters since %H:%M", &tm);
+    snprintf(line, sizeof(line), "  " CLR_GRAY "%s" CLR_RESET, when);
+    cmd_reply(ctx, line);
+  }
+}
+
+// -----------------------------------------------------------------------
+// The card
+// -----------------------------------------------------------------------
+
+// One card line, its value already coloured and already fitted.
+static void
+imagine_card(const cmd_ctx_t *ctx, const char *label, const char *value)
+{
+  char line[IMG_CARD_LINE_SZ];
+
+  snprintf(line, sizeof(line), "%*s%-*s: %s", IMG_CARD_INDENT, "",
+      IMG_CARD_LABEL, label, value);
+  cmd_reply(ctx, line);
+}
+
+// A card line whose value is one raw string: fit, then colour. Never the
+// other way round — display_fit measures columns and a colour marker is
+// two bytes of none (include/display.h).
+static void
+imagine_card_text(const cmd_ctx_t *ctx, const char *label, const char *color,
+    const char *text)
+{
+  char cell [IMG_CELL_SZ];
+  char value[IMG_CMD_REPLY_SZ];
+
+  display_fit(text, IMG_CARD_VALUE_COLS - 1, cell, sizeof(cell), "…");
+  snprintf(value, sizeof(value), "%s%s" CLR_RESET, color, cell);
+  imagine_card(ctx, label, value);
+}
+
+// `queue` — today's content, plus the three quotas that are configured and
+// invisible. A caller refused with "queue full" has no way to learn the
+// number otherwise.
+static void
+imagine_card_queue(const cmd_ctx_t *ctx, uint32_t running,
+    uint32_t max_inflight, uint32_t depth)
+{
+  char     value[IMG_CMD_REPLY_SZ];
+  char     deep [32];
+  uint32_t max_queue;
+
+  max_queue = (uint32_t)kv_get_uint("plugin.imagine.max_queue");
+
+  if(max_queue > 0)
+    snprintf(deep, sizeof(deep), "%u deep", max_queue);
+  else
+    strlcpy(deep, "unbounded", sizeof deep);
+
+  snprintf(value, sizeof(value),
+      "%s  (%u/%u running, %u waiting)   " CLR_GRAY
+      "quotas %u/user · %u/anon · %s" CLR_RESET,
+      running > 0 ? CLR_YELLOW "busy" CLR_RESET : "idle",
+      running, max_inflight, depth,
+      imagine_kv_count("plugin.imagine.max_per_user", 1),
+      imagine_kv_count("plugin.imagine.max_per_anonymous", 1),
+      deep);
+  imagine_card(ctx, "queue", value);
+}
+
+// `model` — the name, the id it stands for, and the service that serves
+// it. An unregistered default is worth spelling out: `llm add model` has
+// no upsert, so repointing a model is a del + add that leaves every KV
+// naming the old one pointing at nothing.
+static void
+imagine_card_model(const cmd_ctx_t *ctx, const img_model_state_t *s)
+{
+  const char *model = s->scope->def_model.value;
+  char        cell [IMG_MODEL_ID_SZ];
+  char        value[IMG_CMD_REPLY_SZ];
+  int         left;
+
+  if(model == NULL)
+  {
+    imagine_card(ctx, "model", CLR_RED "(none configured — set"
+        " plugin.imagine.default)" CLR_RESET);
+    return;
+  }
+
+  if(!s->def_found)
+  {
+    snprintf(value, sizeof(value), CLR_WHITE "%s" CLR_RESET "   " CLR_YELLOW
+        "⚠ not registered — !imagine will refuse every request" CLR_RESET,
+        model);
+    imagine_card(ctx, "model", value);
+    return;
+  }
+
+  // The id is the elastic cell and pays for whatever the name and the
+  // service spend; three spaces and the separator are the rest.
+  left = IMG_CARD_VALUE_COLS - (int)display_vis_len(model) - 3 - 5
+      - (int)display_vis_len(s->def_service);
+
+  display_fit(s->def_model_id, left > 8 ? left : 8, cell, sizeof(cell), "…");
+
+  snprintf(value, sizeof(value), CLR_WHITE "%s" CLR_RESET "   " CLR_GRAY
+      "%s" CLR_RESET "  ·  " CLR_CYAN "%s" CLR_RESET, model, cell,
+      s->def_service);
+  imagine_card(ctx, "model", value);
+}
+
+// `hosting` — the pair !imagine needs to answer at all. When either half
+// is empty every request is refused, and today it says so only at call
+// time; a misconfigured host is the likeliest reason this command is not
+// working, so the card shows it in red.
+static void
+imagine_card_hosting(const cmd_ctx_t *ctx)
+{
+  const char *dir  = kv_get_str("plugin.imagine.output_dir");
+  const char *base = kv_get_str("plugin.imagine.public_base");
+  char        a[IMG_CELL_SZ];
+  char        b[IMG_CELL_SZ];
+  char        value[IMG_CMD_REPLY_SZ];
+  int         room;
+  int         w_a;
+  int         w_b;
+
+  if(dir == NULL || dir[0] == '\0' || base == NULL || base[0] == '\0')
+  {
+    imagine_card(ctx, "hosting", CLR_RED "not configured — !imagine refuses"
+        " every request" CLR_RESET);
+    return;
+  }
+
+  // Two elastic cells sharing what the line has left. Only a pair that
+  // will not fit is split, and then the shorter half keeps its full width
+  // so the long path is the one that pays.
+  room = IMG_CARD_VALUE_COLS - 5;   // "  →  "
+  w_a  = (int)display_vis_len(dir);
+  w_b  = (int)display_vis_len(base);
+
+  if(w_a + w_b > room)
+  {
+    if(w_a <= room / 2)
+      w_b = room - w_a;
+    else if(w_b <= room / 2)
+      w_a = room - w_b;
+    else
+      w_a = w_b = room / 2;
+  }
+
+  display_fit(dir,  w_a, a, sizeof(a), "…");
+  display_fit(base, w_b, b, sizeof(b), "…");
+
+  snprintf(value, sizeof(value), CLR_GRAY "%s" CLR_RESET "  →  " CLR_CYAN
+      "%s" CLR_RESET, a, b);
+  imagine_card(ctx, "hosting", value);
 }
 
 static void
 show_imagine_handler(const cmd_ctx_t *ctx)
 {
-  imagine_scope_t scope;
-  const char     *bot_name;
-  const char     *method_kind;
-  img_snap_t      active[IMG_SHOW_MAX];
-  img_snap_t      queued[IMG_SHOW_MAX];
-  uint32_t        n_active = 0;
-  uint32_t        n_queued = 0;
-  uint32_t        depth;
-  uint32_t        running;
-  uint32_t        max_inflight;
-  char            line[IMG_CMD_REPLY_SZ];
+  imagine_scope_t   scope;
+  img_model_state_t models;
+  const char       *bot_name;
+  const char       *method_kind;
+  img_snap_t        active[IMG_SHOW_MAX];
+  img_snap_t        queued[IMG_SHOW_MAX];
+  uint32_t          n_active = 0;
+  uint32_t          n_queued = 0;
+  uint32_t          depth;
+  uint32_t          running;
+  uint32_t          max_inflight;
+  char              line[IMG_CMD_REPLY_SZ];
 
   bot_name     = (ctx->bot != NULL) ? bot_inst_name(ctx->bot) : NULL;
   method_kind  = imagine_method(ctx);
   max_inflight = imagine_kv_count("plugin.imagine.max_inflight", 1);
   imagine_scope_resolve(bot_name, method_kind, &scope);
+
+  // One walk of the registry for both halves — the card names the default
+  // and the table lists the traffic. A second walk retakes the read lock
+  // and can see a different set of models.
+  memset(&models, 0, sizeof(models));
+  models.scope = &scope;
+  llm_model_iterate(imagine_model_cb, &models);
+  imagine_models_annotate(&models);
 
   // Snapshot under the lock, emit after releasing it — cmd_reply re-enters
   // the delivery path, so the mutex is never held across a send.
@@ -1012,10 +1377,20 @@ show_imagine_handler(const cmd_ctx_t *ctx)
   cmd_reply(ctx, CLR_BOLD "imagine" CLR_RESET
       "  ·  text-to-image over the inference engine");
 
-  snprintf(line, sizeof(line), "  queue   : %s (%u/%u running, %u waiting)",
-      running > 0 ? CLR_YELLOW "busy" CLR_RESET : "idle",
-      running, max_inflight, depth);
-  cmd_reply(ctx, line);
+  imagine_card_queue(ctx, running, max_inflight, depth);
+  imagine_card_model(ctx, &models);
+
+  if(scope.def_model.value != NULL)
+    imagine_card_text(ctx, "from", CLR_GRAY, scope.def_model.key);
+
+  // ⛔ Never a dimension the plugin would not send: an empty size means
+  // the request omits the field entirely and the provider chooses.
+  imagine_card_text(ctx, "size", CLR_WHITE,
+      (scope.size != NULL && scope.size[0] != '\0') ? scope.size
+          : "provider default");
+
+  imagine_card_hosting(ctx);
+  imagine_card_text(ctx, "others", CLR_CYAN, "!show llm models image");
 
   for(uint32_t i = 0; i < n_active; i++)
   {
@@ -1040,7 +1415,7 @@ show_imagine_handler(const cmd_ctx_t *ctx)
     cmd_reply(ctx, line);
   }
 
-  show_imagine_models(ctx, &scope);
+  show_imagine_models(ctx, &models);
 }
 
 // -----------------------------------------------------------------------

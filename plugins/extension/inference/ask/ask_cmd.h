@@ -6,7 +6,8 @@
 // resolved chat model and prints the answer — no conversation memory,
 // no context carry (distinct from the `chat` method, which is the
 // personality bot). `-m <model>` selects from a per-bot allowlist;
-// `!show ask` renders the per-bot model menu with the default starred.
+// `!show ask` reports the model, tier, effort and ceilings a call
+// would resolve to.
 
 #ifdef ASK_CMD_INTERNAL
 
