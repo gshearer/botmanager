@@ -3012,18 +3012,19 @@ llm_issue_request(llm_request_t *req)
   else
     curl_request_add_header(cr, "Accept: application/json");
 
-  // Timeout.
+  // Timeouts. The total bound is the same for every request; a stream adds
+  // an IDLE bound on top of it, because a long answer is not a stalled one
+  // and llm.streaming_idle_ms names a gap between chunks, not a deadline.
   to = req->params.timeout_secs;
 
   if(to == 0)
-    to = req->streaming
-        ? (llm_cfg.streaming_idle_ms / 1000 + 1)
-        : llm_cfg.timeout_secs;
+    to = llm_cfg.timeout_secs;
 
   curl_request_set_timeout(cr, to);
 
   if(req->streaming)
   {
+    curl_request_set_idle_timeout(cr, llm_cfg.streaming_idle_ms / 1000 + 1);
     curl_request_set_accumulate(cr, false);
     curl_request_set_chunk_cb(cr, llm_curl_chunk_cb, req);
   }
@@ -3564,7 +3565,10 @@ llm_register_kv(void)
   kv_register("llm.max_context_tokens", KV_UINT32, "8192",
       llm_kv_changed, NULL, "Default max context tokens");
   kv_register("llm.streaming_idle_ms", KV_UINT32, "30000",
-      llm_kv_changed, NULL, "Streaming idle timeout in milliseconds");
+      llm_kv_changed, NULL,
+      "How long a streaming response may make NO progress before it is"
+      " abandoned. A gap between chunks, not a deadline: a long answer that"
+      " keeps arriving runs to llm.timeout_secs");
   kv_register("llm.embed_submit_wait_ms", KV_UINT32, "60000",
       llm_kv_changed, NULL,
       "How long a bulk embed submit waits for a curl queue slot before"
