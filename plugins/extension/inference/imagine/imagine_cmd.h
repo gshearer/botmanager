@@ -99,62 +99,47 @@ typedef struct
 
 // One queue entry captured under the lock for display, so `!show imagine`
 // never holds the lock across a reply.
+//
+// `begin` is stamped at SUBMIT, not at enqueue, so a request still waiting
+// carries 0 — which is the difference between an age and a dash on screen,
+// and the reason the renderer never subtracts from it blindly.
 typedef struct
 {
   uint32_t id;
   char     owner[USERNS_USER_SZ];
+  char     model[IMG_MODEL_SZ];
+  time_t   begin;                          // 0 while queued
   char     text[IMG_PREVIEW_CHARS + 4];    // preview + "…" + NUL
 } img_snap_t;
 
-// One model row for the `!show imagine` table.
+// What the card needs out of the registry: the default model's id and the
+// service that serves it.
 //
-// The counters are the whole reason this stayed a table when `show ask`
-// became a card: renders, failures and mean latency differ down the page,
-// and a column that differs is a column a reader can scan. They come from
-// llm_model_stats and are therefore the ENGINE's numbers — generation
-// time only, and blind to the two failures that are imagine's own (a
-// request refused before submit, and a delivery that failed after the
-// engine succeeded). Neither is folded in here: `err` has to mean in this
-// table what it means in `show llm`.
-typedef struct
-{
-  char     name    [IMG_MODEL_SZ];
-  char     service [IMG_MODEL_SZ];
-  char     model_id[IMG_MODEL_ID_SZ];
-  uint64_t requests;
-  uint64_t errors;
-  uint64_t ok_latency_ms;
-  bool     is_def;
-} img_model_row_t;
-
-// One walk of the registry, serving both halves of `!show imagine`: the
-// card above reads the def_* fields, the table below reads the rows.
+// ⛔ This is NOT a row collector any more. `show imagine` listed every
+// image model until 2026-08-23 and the operator ruled the list redundant:
+// `show llm models image` already draws that table, with per-model
+// counters, and both cards now point at it instead. What is left here is
+// one by-name lookup, which the registry has no shim for.
 //
-// The default is captured before the kind and enabled filters, so a
-// default pointing at a disabled model — or at a chat model — still
-// reports as registered rather than as missing.
+// The default is captured before any kind or enabled filter, so a default
+// pointing at a disabled model — or at a chat model — still reports as
+// registered rather than as missing.
 typedef struct
 {
   const imagine_scope_t *scope;
-  img_model_row_t        rows[IMG_SHOW_MAX];
-  uint32_t               n_rows;
-  uint32_t               count;   // matched, including rows not stored
-  time_t                 since;   // when the engine started counting
-  bool                   def_found;
-  char                   def_service [IMG_MODEL_SZ];
-  char                   def_model_id[IMG_MODEL_ID_SZ];
-} img_model_state_t;
+  bool                   found;
+  char                   service [IMG_MODEL_SZ];
+  char                   model_id[IMG_MODEL_ID_SZ];
+} img_model_lookup_t;
 
-// Column widths for the model table, measured against the live registry.
-// The lead gutter is the default star plus the space separating it from
-// the first cell; the model id is elastic and takes whatever is left of
-// DISPLAY_COLS.
-#define IMG_TBL_LEAD   2
-#define IMG_TBL_SVC   14     // "hiigara-zimage"
-#define IMG_TBL_NAME   6     // "gpti1m"
-#define IMG_TBL_REQ    5
-#define IMG_TBL_ERR    4
-#define IMG_TBL_AVG    6     // "123.4s"
+// Column widths for the queue table. `who` fits an IRC nick, `age` a
+// three-digit second count, and `prompt` is elastic — it takes whatever is
+// left of DISPLAY_COLS.
+#define IMG_Q_LEAD    2
+#define IMG_Q_ID      4     // "#128"
+#define IMG_Q_WHO    12
+#define IMG_Q_MODEL   7     // "gpti1m"
+#define IMG_Q_AGE     5     // "132s"
 
 // A fitted cell: display_fit bounds it by columns, this bounds it by
 // bytes, and 90 columns of UTF-8 fits inside either way.

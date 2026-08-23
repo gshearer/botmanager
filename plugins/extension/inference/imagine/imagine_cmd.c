@@ -4,7 +4,8 @@
 //   !imagine <prompt>          generate against the bot's default image model
 //   !ig <prompt>               short alias
 //   !imagine -m <model> ...    pick a specific model from the per-bot allowlist
-//   !show imagine              the request !imagine would make, and traffic
+//   !show imagine              the request !imagine would make
+//   !show imagine queue        what is running and what is waiting
 //
 // The bot owns hosting: the image model is asked for base64 bytes, which
 // this command decodes, writes into a KV-configured web directory
@@ -773,7 +774,7 @@ imagine_cmd_handler(const cmd_ctx_t *ctx)
   bool            waiting;
 
   static const char usage[] =
-      "Usage: imagine [-m <model>] <prompt>  ·  !show imagine lists models";
+      "Usage: imagine [-m <model>] <prompt>  ·  !show imagine for the setup";
 
   if(ctx->args == NULL || ctx->args[0] == '\0')
   {
@@ -952,232 +953,53 @@ imagine_prompt_preview(const char *prompt, char *out, size_t out_sz)
 static void
 imagine_snap(const img_req_t *r, img_snap_t *out)
 {
-  out->id = r->id;
-  snprintf(out->owner, sizeof(out->owner), "%s", r->owner);
+  out->id    = r->id;
+  out->begin = r->begin;
+  strlcpy(out->owner, r->owner, sizeof out->owner);
+  strlcpy(out->model, r->model, sizeof out->model);
   imagine_prompt_preview(r->prompt, out->text, sizeof(out->text));
 }
 
 // -----------------------------------------------------------------------
-// !show imagine — a card above a table
+// !show imagine — the request, and !show imagine queue — the pipe
 //
-// Both halves answer to the same rule: a column whose value is identical
-// on every row belongs in the header or in the command
-// (include/display.h). `show ask` lost its table to it because every cell
-// was the registry restated; this one keeps its table because
-// llm_model_stats gives every row different numbers. Same rule, opposite
-// answers — what differs is whether the rows do.
+// Neither one lists models. `show imagine` listed every image model until
+// 2026-08-23, and it was the wrong table in the wrong place: `show llm
+// models image` already draws it with per-model counters, so this card
+// names the ONE model a request would use, the settings that reach the
+// wire with it, and points at that table for the rest.
+//
+// The queue is a second view rather than a tail on this one, because the
+// two answer different questions — *what would happen if I asked* and
+// *what is happening now* — and only the second changes between two reads
+// a second apart.
 // -----------------------------------------------------------------------
 
-// Snapshot only. llm_model_iterate runs this under the registry's read
-// lock, so nothing here calls back into the engine and nothing here reads
-// KV — both take locks of their own, and the counters wait for
-// imagine_models_annotate below. One walk, never two: a second one retakes
-// the lock and can see a different set of models.
+// By-name lookup of the resolved default. Snapshot only: llm_model_iterate
+// runs this under the registry's read lock, so it calls neither the engine
+// nor KV, and it reads only its own parameters.
 static void
 imagine_model_cb(const char *name, llm_kind_t kind, const char *service_name,
     const char *model_id, uint32_t embed_dim, uint32_t max_context,
     float default_temp, bool enabled, void *user)
 {
-  img_model_state_t *s = (img_model_state_t *)user;
-  img_model_row_t   *row;
+  img_model_lookup_t *s = (img_model_lookup_t *)user;
 
+  (void)kind;
   (void)embed_dim;
   (void)max_context;
   (void)default_temp;
+  (void)enabled;
 
-  if(!s->def_found && s->scope->def_model.value != NULL
-      && strcasecmp(name, s->scope->def_model.value) == 0)
-  {
-    s->def_found = true;
-    strlcpy(s->def_service,  service_name != NULL ? service_name : "",
-        sizeof s->def_service);
-    strlcpy(s->def_model_id, model_id != NULL ? model_id : "",
-        sizeof s->def_model_id);
-  }
-
-  if(kind != LLM_KIND_IMAGE || !enabled)
+  if(s->found || s->scope->def_model.value == NULL
+      || strcasecmp(name, s->scope->def_model.value) != 0)
     return;
 
-  if(!imagine_allowed(name, s->scope))
-    return;
-
-  s->count++;
-
-  if(s->n_rows >= IMG_SHOW_MAX)
-    return;
-
-  row = &s->rows[s->n_rows++];
-  memset(row, 0, sizeof(*row));
-
-  strlcpy(row->name,     name,                                sizeof row->name);
-  strlcpy(row->service,  service_name != NULL ? service_name : "",
-      sizeof row->service);
-  strlcpy(row->model_id, model_id != NULL ? model_id : "",
-      sizeof row->model_id);
-
-  row->is_def = s->scope->def_model.value != NULL
-      && strcasecmp(name, s->scope->def_model.value) == 0;
-}
-
-// The counters, once the registry lock is back down.
-//
-// ⚠ A model the engine has never seen answers FAIL, which is not the same
-// fact as "zero requests" and renders identically anyway — the row keeps
-// the zeros memset left it. The distinction has no reader.
-static void
-imagine_models_annotate(img_model_state_t *s)
-{
-  for(uint32_t i = 0; i < s->n_rows; i++)
-  {
-    img_model_row_t  *row = &s->rows[i];
-    llm_model_stats_t stats;
-    bool              seen;
-
-    seen = llm_model_stats(row->name, &stats) == SUCCESS;
-
-    // ⚠ The window is filled in either way, and every model shares it —
-    // it opens when the engine starts counting. A table of models the
-    // engine has never seen still owes the reader that date, or a fresh
-    // reload reads as "never used".
-    s->since = stats.since;
-
-    if(!seen)
-      continue;
-
-    row->requests      = stats.requests;
-    row->errors        = stats.errors;
-    row->ok_latency_ms = stats.ok_latency_ms;
-  }
-}
-
-// One fixed-width cell plus the grid's separator. The cell arrives already
-// coloured: markers count no columns, so padding sees through them.
-static void
-imagine_tbl_cell(char *line, size_t cap, const char *text, int width,
-    bool right)
-{
-  char cell[IMG_CELL_SZ];
-
-  strlcpy(cell, text, sizeof cell);
-
-  if(right)
-    display_align_right(cell, sizeof cell, width);
-  else
-    display_align_left(cell, sizeof cell, width);
-
-  display_cat(line, cap, cell);
-  display_cat(line, cap, "  ");
-}
-
-static void
-imagine_tbl_head(const cmd_ctx_t *ctx)
-{
-  char line[IMG_CMD_REPLY_SZ];
-
-  // Indent first, emphasis second: cmd_reply_table_head reads the margin
-  // off the head with strspn, and a leading colour marker would hide it.
-  snprintf(line, sizeof(line), "%*s" CLR_BOLD, IMG_TBL_LEAD, "");
-
-  imagine_tbl_cell(line, sizeof(line), "service", IMG_TBL_SVC,  false);
-  imagine_tbl_cell(line, sizeof(line), "model",   IMG_TBL_NAME, false);
-  imagine_tbl_cell(line, sizeof(line), "req",     IMG_TBL_REQ,  true);
-  imagine_tbl_cell(line, sizeof(line), "err",     IMG_TBL_ERR,  true);
-  imagine_tbl_cell(line, sizeof(line), "avg",     IMG_TBL_AVG,  true);
-  display_cat(line, sizeof(line), "model id" CLR_RESET);
-  cmd_reply_table_head(ctx, line);
-}
-
-static void
-imagine_tbl_row(const cmd_ctx_t *ctx, const img_model_row_t *row)
-{
-  char line[IMG_CMD_REPLY_SZ];
-  char cell[IMG_CELL_SZ];
-  int  left;
-
-  snprintf(line, sizeof(line), "%s ",
-      row->is_def ? CLR_YELLOW "★" CLR_RESET : " ");
-
-  snprintf(cell, sizeof(cell), CLR_CYAN "%s" CLR_RESET, row->service);
-  imagine_tbl_cell(line, sizeof(line), cell, IMG_TBL_SVC, false);
-
-  snprintf(cell, sizeof(cell), CLR_WHITE "%s" CLR_RESET, row->name);
-  imagine_tbl_cell(line, sizeof(line), cell, IMG_TBL_NAME, false);
-
-  if(row->requests > 0)
-    snprintf(cell, sizeof(cell), "%" PRIu64, row->requests);
-  else
-    strlcpy(cell, CLR_GRAY "—" CLR_RESET, sizeof cell);
-
-  imagine_tbl_cell(line, sizeof(line), cell, IMG_TBL_REQ, true);
-
-  if(row->errors > 0)
-    snprintf(cell, sizeof(cell), CLR_RED "%" PRIu64 CLR_RESET, row->errors);
-  else
-    strlcpy(cell, row->requests > 0 ? "0" : CLR_GRAY "—" CLR_RESET,
-        sizeof cell);
-
-  imagine_tbl_cell(line, sizeof(line), cell, IMG_TBL_ERR, true);
-
-  // The mean excludes failures — a failed render's elapsed time is a
-  // timeout, not a speed — so a model that has only ever failed has no
-  // mean to report, and that is the divide-by-zero guard as well.
-  if(row->requests > row->errors)
-    snprintf(cell, sizeof(cell), "%.1fs",
-        (double)(row->ok_latency_ms / (row->requests - row->errors)) / 1000.0);
-  else
-    strlcpy(cell, CLR_GRAY "—" CLR_RESET, sizeof cell);
-
-  imagine_tbl_cell(line, sizeof(line), cell, IMG_TBL_AVG, true);
-
-  // Measured rather than assumed: display_align_left lets a cell wider
-  // than its column win, by design, so a long service name shifts
-  // everything right of it and the id is what pays.
-  // ⚠ One column off the budget for the ellipsis: display_fit reserves its
-  // mark out of the BYTE budget, not the column budget, and a last cell
-  // has no padding to absorb the extra.
-  left = DISPLAY_COLS - (int)display_vis_len(line) - 1;
-
-  display_fit(row->model_id, left > 1 ? left : 1, cell, sizeof(cell), "…");
-  display_cat(line, sizeof(line), CLR_GRAY);
-  display_cat(line, sizeof(line), cell);
-  display_cat(line, sizeof(line), CLR_RESET);
-  cmd_reply(ctx, line);
-}
-
-static void
-show_imagine_models(const cmd_ctx_t *ctx, const img_model_state_t *s)
-{
-  char      line[IMG_CMD_REPLY_SZ];
-  char      when[48];
-  struct tm tm;
-
-  if(s->n_rows == 0)
-  {
-    cmd_reply(ctx, "  " CLR_GRAY "(no image models available here)" CLR_RESET);
-    return;
-  }
-
-  imagine_tbl_head(ctx);
-
-  for(uint32_t i = 0; i < s->n_rows; i++)
-    imagine_tbl_row(ctx, &s->rows[i]);
-
-  // ⛔ Never silently: a cut-off table reads as "that is all of them".
-  if(s->count > s->n_rows)
-  {
-    snprintf(line, sizeof(line), "  " CLR_GRAY "… +%u more" CLR_RESET,
-        s->count - s->n_rows);
-    cmd_reply(ctx, line);
-  }
-
-  // The window is not decoration: a /plugin reload inference zeroes every
-  // number above it, and a table that does not say so reads as history.
-  if(s->since > 0 && localtime_r(&s->since, &tm) != NULL)
-  {
-    strftime(when, sizeof(when), "counters since %H:%M", &tm);
-    snprintf(line, sizeof(line), "  " CLR_GRAY "%s" CLR_RESET, when);
-    cmd_reply(ctx, line);
-  }
+  s->found = true;
+  strlcpy(s->service,  service_name != NULL ? service_name : "",
+      sizeof s->service);
+  strlcpy(s->model_id, model_id != NULL ? model_id : "",
+      sizeof s->model_id);
 }
 
 // -----------------------------------------------------------------------
@@ -1210,9 +1032,9 @@ imagine_card_text(const cmd_ctx_t *ctx, const char *label, const char *color,
   imagine_card(ctx, label, value);
 }
 
-// `queue` — today's content, plus the three quotas that are configured and
-// invisible. A caller refused with "queue full" has no way to learn the
-// number otherwise.
+// `queue` — a one-line summary, plus the three quotas that are configured
+// and invisible. A caller refused with "queue full" has no way to learn the
+// number otherwise. The rows themselves are `!show imagine queue`.
 static void
 imagine_card_queue(const cmd_ctx_t *ctx, uint32_t running,
     uint32_t max_inflight, uint32_t depth)
@@ -1244,7 +1066,7 @@ imagine_card_queue(const cmd_ctx_t *ctx, uint32_t running,
 // no upsert, so repointing a model is a del + add that leaves every KV
 // naming the old one pointing at nothing.
 static void
-imagine_card_model(const cmd_ctx_t *ctx, const img_model_state_t *s)
+imagine_card_model(const cmd_ctx_t *ctx, const img_model_lookup_t *s)
 {
   const char *model = s->scope->def_model.value;
   char        cell [IMG_MODEL_ID_SZ];
@@ -1258,7 +1080,7 @@ imagine_card_model(const cmd_ctx_t *ctx, const img_model_state_t *s)
     return;
   }
 
-  if(!s->def_found)
+  if(!s->found)
   {
     snprintf(value, sizeof(value), CLR_WHITE "%s" CLR_RESET "   " CLR_YELLOW
         "⚠ not registered — !imagine will refuse every request" CLR_RESET,
@@ -1270,14 +1092,48 @@ imagine_card_model(const cmd_ctx_t *ctx, const img_model_state_t *s)
   // The id is the elastic cell and pays for whatever the name and the
   // service spend; three spaces and the separator are the rest.
   left = IMG_CARD_VALUE_COLS - (int)display_vis_len(model) - 3 - 5
-      - (int)display_vis_len(s->def_service);
+      - (int)display_vis_len(s->service);
 
-  display_fit(s->def_model_id, left > 8 ? left : 8, cell, sizeof(cell), "…");
+  display_fit(s->model_id, left > 8 ? left : 8, cell, sizeof(cell), "…");
 
   snprintf(value, sizeof(value), CLR_WHITE "%s" CLR_RESET "   " CLR_GRAY
       "%s" CLR_RESET "  ·  " CLR_CYAN "%s" CLR_RESET, model, cell,
-      s->def_service);
+      s->service);
   imagine_card(ctx, "model", value);
+}
+
+// `style` — the prepend file, which silently rewrites every prompt this
+// bot sends and is otherwise reported nowhere. Its content is not shown:
+// it is a paragraph, and the path is what an operator needs to go edit.
+// ⚠ Read fresh at request time, so an unreadable path is a per-request
+// DEBUG line and nothing else — this is the only place it surfaces.
+static void
+imagine_card_style(const cmd_ctx_t *ctx, const char *bot_name,
+    const char *method_kind)
+{
+  imagine_tiered_t style;
+  char             cell [IMG_CELL_SZ];
+  char             value[IMG_CMD_REPLY_SZ];
+  FILE            *fp;
+  bool             readable;
+
+  imagine_tier_resolve(bot_name, method_kind, "prompt_prepend_file", &style);
+
+  if(style.value == NULL)
+    return;                    // nothing prepended; nothing to report
+
+  fp       = fopen(style.value, "r");
+  readable = fp != NULL;
+
+  if(fp != NULL)
+    fclose(fp);
+
+  display_fit(style.value, IMG_CARD_VALUE_COLS - 24, cell, sizeof(cell), "…");
+
+  snprintf(value, sizeof(value), "%s%s" CLR_RESET "   " CLR_GRAY "from %s"
+      CLR_RESET "%s", readable ? CLR_WHITE : CLR_RED, cell, style.key,
+      readable ? "" : "   " CLR_RED "⚠ unreadable" CLR_RESET);
+  imagine_card(ctx, "style", value);
 }
 
 // `hosting` — the pair !imagine needs to answer at all. When either half
@@ -1331,31 +1187,149 @@ imagine_card_hosting(const cmd_ctx_t *ctx)
 static void
 show_imagine_handler(const cmd_ctx_t *ctx)
 {
-  imagine_scope_t   scope;
-  img_model_state_t models;
-  const char       *bot_name;
-  const char       *method_kind;
-  img_snap_t        active[IMG_SHOW_MAX];
-  img_snap_t        queued[IMG_SHOW_MAX];
-  uint32_t          n_active = 0;
-  uint32_t          n_queued = 0;
-  uint32_t          depth;
-  uint32_t          running;
-  uint32_t          max_inflight;
-  char              line[IMG_CMD_REPLY_SZ];
+  imagine_scope_t    scope;
+  img_model_lookup_t models;
+  const char        *bot_name;
+  const char        *method_kind;
+  uint32_t           depth;
+  uint32_t           running;
+  uint32_t           max_inflight;
 
   bot_name     = (ctx->bot != NULL) ? bot_inst_name(ctx->bot) : NULL;
   method_kind  = imagine_method(ctx);
   max_inflight = imagine_kv_count("plugin.imagine.max_inflight", 1);
   imagine_scope_resolve(bot_name, method_kind, &scope);
 
-  // One walk of the registry for both halves — the card names the default
-  // and the table lists the traffic. A second walk retakes the read lock
-  // and can see a different set of models.
   memset(&models, 0, sizeof(models));
   models.scope = &scope;
   llm_model_iterate(imagine_model_cb, &models);
-  imagine_models_annotate(&models);
+
+  pthread_mutex_lock(&img_lock);
+  running = img_active_n;
+  depth   = img_depth;
+  pthread_mutex_unlock(&img_lock);
+
+  cmd_reply(ctx, CLR_BOLD "imagine" CLR_RESET
+      "  ·  text-to-image over the inference engine");
+
+  imagine_card_model(ctx, &models);
+
+  if(scope.def_model.value != NULL)
+    imagine_card_text(ctx, "from", CLR_GRAY, scope.def_model.key);
+
+  // ⛔ Never a dimension the plugin would not send: an empty size means
+  // the request omits the field entirely and the provider chooses.
+  // ⚠ size and the style prepend are the WHOLE of what this plugin puts on
+  // the wire beyond the prompt — llm_image_params_t carries size, n (fixed
+  // at 1) and a timeout, and has nowhere to put steps, seed or guidance.
+  imagine_card_text(ctx, "size", CLR_WHITE,
+      (scope.size != NULL && scope.size[0] != '\0') ? scope.size
+          : "provider default");
+
+  imagine_card_style(ctx, bot_name, method_kind);
+  imagine_card_hosting(ctx);
+  imagine_card_queue(ctx, running, max_inflight, depth);
+  imagine_card_text(ctx, "others", CLR_CYAN,
+      "!show llm models image  ·  !show imagine queue");
+}
+
+// -----------------------------------------------------------------------
+// The queue view
+// -----------------------------------------------------------------------
+
+// One fixed-width cell plus the grid's separator. The cell arrives already
+// coloured: markers count no columns, so padding sees through them.
+static void
+imagine_q_cell(char *line, size_t cap, const char *text, int width, bool right)
+{
+  char cell[IMG_CELL_SZ];
+
+  strlcpy(cell, text, sizeof cell);
+
+  if(right)
+    display_align_right(cell, sizeof cell, width);
+  else
+    display_align_left(cell, sizeof cell, width);
+
+  display_cat(line, cap, cell);
+  display_cat(line, cap, "  ");
+}
+
+static void
+imagine_q_head(const cmd_ctx_t *ctx)
+{
+  char line[IMG_CMD_REPLY_SZ];
+
+  // Indent first, emphasis second: cmd_reply_table_head reads the margin
+  // off the head with strspn, and a leading colour marker would hide it.
+  snprintf(line, sizeof(line), "%*s" CLR_BOLD, IMG_Q_LEAD, "");
+
+  imagine_q_cell(line, sizeof(line), "id",    IMG_Q_ID,    false);
+  imagine_q_cell(line, sizeof(line), "who",   IMG_Q_WHO,   false);
+  imagine_q_cell(line, sizeof(line), "model", IMG_Q_MODEL, false);
+  imagine_q_cell(line, sizeof(line), "age",   IMG_Q_AGE,   true);
+  display_cat(line, sizeof(line), "prompt" CLR_RESET);
+  cmd_reply_table_head(ctx, line);
+}
+
+// One row. `running` decides the lead glyph and whether there is an age to
+// print at all — a queued request has never been submitted, so its `begin`
+// is 0 and the elapsed time it would imply is fifty-six years.
+static void
+imagine_q_row(const cmd_ctx_t *ctx, const img_snap_t *s, bool running,
+    time_t now)
+{
+  char line[IMG_CMD_REPLY_SZ];
+  char cell[IMG_CELL_SZ];
+  int  left;
+
+  snprintf(line, sizeof(line), "%s ",
+      running ? CLR_GREEN "▸" CLR_RESET : " ");
+
+  snprintf(cell, sizeof(cell), CLR_GRAY "#%u" CLR_RESET, s->id);
+  imagine_q_cell(line, sizeof(line), cell, IMG_Q_ID, false);
+
+  snprintf(cell, sizeof(cell), CLR_CYAN "%s" CLR_RESET, s->owner);
+  imagine_q_cell(line, sizeof(line), cell, IMG_Q_WHO, false);
+
+  snprintf(cell, sizeof(cell), CLR_WHITE "%s" CLR_RESET, s->model);
+  imagine_q_cell(line, sizeof(line), cell, IMG_Q_MODEL, false);
+
+  if(running && s->begin > 0 && now >= s->begin)
+    snprintf(cell, sizeof(cell), "%lds", (long)(now - s->begin));
+  else
+    strlcpy(cell, CLR_GRAY "—" CLR_RESET, sizeof cell);
+
+  imagine_q_cell(line, sizeof(line), cell, IMG_Q_AGE, true);
+
+  // Measured rather than assumed: display_align_left lets a cell wider than
+  // its column win, by design, so a long nick shifts everything right of it
+  // and the prompt is what pays.
+  // ⚠ One column off the budget for the ellipsis: display_fit reserves its
+  // mark out of the BYTE budget, not the column budget, and a last cell has
+  // no padding to absorb the extra.
+  left = DISPLAY_COLS - (int)display_vis_len(line) - 1;
+
+  display_fit(s->text, left > 1 ? left : 1, cell, sizeof(cell), "…");
+  display_cat(line, sizeof(line), cell);
+  cmd_reply(ctx, line);
+}
+
+static void
+show_imagine_queue_handler(const cmd_ctx_t *ctx)
+{
+  img_snap_t active[IMG_SHOW_MAX];
+  img_snap_t queued[IMG_SHOW_MAX];
+  uint32_t   n_active = 0;
+  uint32_t   n_queued = 0;
+  uint32_t   depth;
+  uint32_t   running;
+  uint32_t   max_inflight;
+  time_t     now;
+  char       line[IMG_CMD_REPLY_SZ];
+
+  max_inflight = imagine_kv_count("plugin.imagine.max_inflight", 1);
+  now          = time(NULL);
 
   // Snapshot under the lock, emit after releasing it — cmd_reply re-enters
   // the delivery path, so the mutex is never held across a send.
@@ -1374,48 +1348,32 @@ show_imagine_handler(const cmd_ctx_t *ctx)
 
   pthread_mutex_unlock(&img_lock);
 
-  cmd_reply(ctx, CLR_BOLD "imagine" CLR_RESET
-      "  ·  text-to-image over the inference engine");
+  snprintf(line, sizeof(line), CLR_BOLD "imagine" CLR_RESET "  ·  queue   "
+      CLR_GRAY "%u/%u running, %u waiting" CLR_RESET,
+      running, max_inflight, depth);
+  cmd_reply(ctx, line);
 
-  imagine_card_queue(ctx, running, max_inflight, depth);
-  imagine_card_model(ctx, &models);
+  if(n_active == 0 && n_queued == 0)
+  {
+    cmd_reply(ctx, "  " CLR_GRAY "(nothing in the pipe)" CLR_RESET);
+    return;
+  }
 
-  if(scope.def_model.value != NULL)
-    imagine_card_text(ctx, "from", CLR_GRAY, scope.def_model.key);
-
-  // ⛔ Never a dimension the plugin would not send: an empty size means
-  // the request omits the field entirely and the provider chooses.
-  imagine_card_text(ctx, "size", CLR_WHITE,
-      (scope.size != NULL && scope.size[0] != '\0') ? scope.size
-          : "provider default");
-
-  imagine_card_hosting(ctx);
-  imagine_card_text(ctx, "others", CLR_CYAN, "!show llm models image");
+  imagine_q_head(ctx);
 
   for(uint32_t i = 0; i < n_active; i++)
-  {
-    snprintf(line, sizeof(line), "  render  : " CLR_GREEN "#%u" CLR_RESET
-        " %s " CLR_GRAY "(%s)" CLR_RESET,
-        active[i].id, active[i].text, active[i].owner);
-    cmd_reply(ctx, line);
-  }
+    imagine_q_row(ctx, &active[i], true, now);
 
   for(uint32_t i = 0; i < n_queued; i++)
-  {
-    snprintf(line, sizeof(line), "    %2u. " CLR_GRAY "#%u" CLR_RESET
-        " %s " CLR_GRAY "(%s)" CLR_RESET,
-        i + 1, queued[i].id, queued[i].text, queued[i].owner);
-    cmd_reply(ctx, line);
-  }
+    imagine_q_row(ctx, &queued[i], false, now);
 
+  // ⛔ Never silently: a cut-off list reads as "that is all of them".
   if(depth > n_queued)
   {
-    snprintf(line, sizeof(line), "    " CLR_GRAY "… +%u more" CLR_RESET,
+    snprintf(line, sizeof(line), "  " CLR_GRAY "… +%u more waiting" CLR_RESET,
         depth - n_queued);
     cmd_reply(ctx, line);
   }
-
-  show_imagine_models(ctx, &models);
 }
 
 // -----------------------------------------------------------------------
@@ -1428,7 +1386,8 @@ static const char imagine_cmd_help[] =
     "  imagine <prompt>          generate with the bot's default image model\n"
     "  ig <prompt>               short alias\n"
     "  imagine -m <model> ...    pick a specific model from the allowlist\n"
-    "  show imagine              queue status and the models available here\n"
+    "  show imagine              the model, settings and hosting in force\n"
+    "  show imagine queue        what is running and what is waiting\n"
     "\n"
     "The bot hosts the result: the image is written to a web-served\n"
     "directory and the reply is a link to it. Requires an operator to have\n"
@@ -1441,7 +1400,8 @@ static const char imagine_cmd_help[] =
     "Examples:\n"
     "  !imagine a red panda in a chef hat\n"
     "  !ig -m nanoflash a neon city skyline at dusk\n"
-    "  !show imagine";
+    "  !show imagine\n"
+    "  !show imagine queue";
 
 static bool
 imagine_cmd_init(void)
@@ -1453,12 +1413,26 @@ imagine_cmd_init(void)
     return(FAIL);
 
   if(cmd_register(IMG_CMD_CTX, "imagine", "show imagine",
-      "Show the !imagine queue and the image models available here", NULL,
+      "Report the model, settings and hosting !imagine would use here", NULL,
       USERNS_GROUP_EVERYONE, 0, CMD_SCOPE_ANY, METHOD_T_ANY,
       show_imagine_handler, NULL, "show", NULL, NULL, 0, NULL, NULL)
       != SUCCESS)
   {
     cmd_unregister_path("imagine");
+    return(FAIL);
+  }
+
+  // A child rather than an argument: the queue is a different question
+  // from the setup, and only this one changes between two reads a second
+  // apart. cmd_unregister_path("show/imagine") takes the subtree with it.
+  if(cmd_register(IMG_CMD_CTX, "queue", "show imagine queue",
+      "List the !imagine renders running and waiting", NULL,
+      USERNS_GROUP_EVERYONE, 0, CMD_SCOPE_ANY, METHOD_T_ANY,
+      show_imagine_queue_handler, NULL, "show/imagine", "q", NULL, 0,
+      NULL, NULL) != SUCCESS)
+  {
+    cmd_unregister_path("imagine");
+    cmd_unregister_path("show/imagine");
     return(FAIL);
   }
 
