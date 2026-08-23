@@ -326,6 +326,13 @@ static const plugin_kv_entry_t chatbot_inst_schema[] = {
     " speaker was a different user Y — treats the line as a reply to Y"
     " rather than a continuation of the bot-exchange. 0 disables the"
     " handoff gate.", NULL },
+  { "behavior.speak.floor_window_secs", KV_UINT32, "45",
+    "TURN-1: seconds after the bot asks a question on a channel that"
+    " the next line there is promoted to EXCHANGE_IN even though it"
+    " was not addressed to the bot. Consumed on first use — the second"
+    " line is ambient again. Only reachable on a method that declares"
+    " addressing (a microphone); IRC never produces an ambient line."
+    " 0 disables the floor.", NULL },
   { "behavior.speak.engagement_require_reply", KV_BOOL, "true",
     "When true (default), engagement is stamped only after the bot"
     " actually replies. When false, any inbound EXCHANGE_IN stamps the"
@@ -870,6 +877,7 @@ typedef enum
   CHATBOT_CLASSIFY_STICKY,
   CHATBOT_CLASSIFY_HANDOFF,
   CHATBOT_CLASSIFY_AMBIENT,
+  CHATBOT_CLASSIFY_FLOOR,
   CHATBOT_CLASSIFY_WITNESS
 } chatbot_classify_reason_t;
 
@@ -884,6 +892,7 @@ chatbot_classify_reason_tag(chatbot_classify_reason_t r)
     case CHATBOT_CLASSIFY_STICKY:   return("sticky");
     case CHATBOT_CLASSIFY_HANDOFF:  return("handoff");
     case CHATBOT_CLASSIFY_AMBIENT:  return("ambient");
+    case CHATBOT_CLASSIFY_FLOOR:    return("floor");
     case CHATBOT_CLASSIFY_WITNESS:  return("witness");
   }
   return("?");
@@ -1175,6 +1184,102 @@ chatbot_handoff_peek_other(chatbot_handoff_t *h,
   return(found);
 }
 
+// ---------- TURN-1 floor ring ----------
+//
+// The bot asked the room a question, and the answer will arrive with
+// no envelope on it. See chatbot_floor_t in chatbot.h for why this is
+// not the sticky ring wearing a hat.
+
+// Arm the channel's slot. LRU on insert, exactly as the handoff ring:
+// overflow evicts the oldest ask. Re-arming a channel that already
+// holds a slot restamps it, so the last question asked is the live one.
+void
+chatbot_floor_arm(chatbot_floor_t *f, const char *channel, time_t now)
+{
+  int    idx;
+  int    free_idx;
+  int    lru_idx;
+  time_t lru_ts;
+
+  if(f == NULL || channel == NULL || channel[0] == '\0')
+    return;
+
+  pthread_mutex_lock(&f->mutex);
+
+  free_idx = -1;
+  lru_idx = 0;
+  lru_ts = f->slots[0].asked_at;
+
+  for(int i = 0; i < CHATBOT_FLOOR_SLOTS; i++)
+  {
+    chatbot_floor_slot_t *s = &f->slots[i];
+
+    if(s->channel[0] == '\0')
+    {
+      if(free_idx < 0) free_idx = i;
+      continue;
+    }
+
+    if(strcmp(s->channel, channel) == 0)
+    {
+      s->asked_at = now;
+      pthread_mutex_unlock(&f->mutex);
+      return;
+    }
+
+    if(s->asked_at < lru_ts)
+    {
+      lru_ts  = s->asked_at;
+      lru_idx = i;
+    }
+  }
+
+  idx = (free_idx >= 0) ? free_idx : lru_idx;
+  strlcpy(f->slots[idx].channel, channel, sizeof f->slots[idx].channel);
+  f->slots[idx].asked_at = now;
+
+  pthread_mutex_unlock(&f->mutex);
+}
+
+// Consume the channel's slot. Returns true exactly once per armed
+// question: the slot is cleared on the way out, which is what stops a
+// television from answering the same question all evening.
+bool
+chatbot_floor_take(chatbot_floor_t *f, const char *channel, time_t now,
+    uint32_t window_secs)
+{
+  bool took;
+
+  if(f == NULL || channel == NULL || channel[0] == '\0'
+      || window_secs == 0)
+    return(false);
+
+  took = false;
+
+  pthread_mutex_lock(&f->mutex);
+
+  for(int i = 0; i < CHATBOT_FLOOR_SLOTS; i++)
+  {
+    chatbot_floor_slot_t *s = &f->slots[i];
+
+    if(s->channel[0] == '\0' || s->asked_at == 0)      continue;
+    if(strcmp(s->channel, channel) != 0)               continue;
+
+    if(now >= s->asked_at
+        && (uint64_t)(now - s->asked_at) < (uint64_t)window_secs)
+      took = true;
+
+    // Cleared either way: an ask that timed out is spent, and a clock
+    // that went backwards is not a reason to keep one alive.
+    s->channel[0] = '\0';
+    s->asked_at   = 0;
+    break;
+  }
+
+  pthread_mutex_unlock(&f->mutex);
+  return(took);
+}
+
 // IRC nick character class: letters, digits, underscore, hyphen, and
 // the IRC-RFC "special" chars. Good enough for the handoff detector,
 // which only needs to recognise a nick-looking token — false positives
@@ -1249,7 +1354,7 @@ static mem_msg_kind_t
 chatbot_classify_with_engagement(chatbot_state_t *st,
     const method_msg_t *msg, const chatbot_names_t *names,
     uint32_t window_secs, uint32_t handoff_window_secs,
-    chatbot_classify_reason_t *out_reason)
+    uint32_t floor_window_secs, chatbot_classify_reason_t *out_reason)
 {
   mem_msg_kind_t k;
   time_t now;
@@ -1264,6 +1369,11 @@ chatbot_classify_with_engagement(chatbot_state_t *st,
   // method collapses a whole room onto one sender, so the handoff gate
   // can never fire and the engagement ring would hold a single
   // permanently-warm slot shared by every speaker — and a television.
+  //
+  // TURN-1 adds the one state that argument leaves out: the bot just
+  // asked this channel a question. That is not a warm slot — it is
+  // armed by a question mark the bot itself wrote, spent by the first
+  // line that follows, and gone when floor_window_secs runs out.
   if(msg != NULL)
   {
     switch(msg->addressing)
@@ -1273,6 +1383,18 @@ chatbot_classify_with_engagement(chatbot_state_t *st,
         return(MEM_MSG_EXCHANGE_IN);
 
       case METHOD_ADDR_AMBIENT:
+        // TURN-1: unless the bot has the floor. It asked this channel a
+        // question and is owed an answer, and on a mic the answer never
+        // carries the name. Destructive — the first line in the window
+        // spends it, and the room goes quiet again.
+        if(msg->channel[0] != '\0'
+            && chatbot_floor_take(&st->floor, msg->channel, time(NULL),
+                floor_window_secs))
+        {
+          if(out_reason) *out_reason = CHATBOT_CLASSIFY_FLOOR;
+          return(MEM_MSG_EXCHANGE_IN);
+        }
+
         if(out_reason) *out_reason = CHATBOT_CLASSIFY_AMBIENT;
         return(MEM_MSG_WITNESS);
 
@@ -1359,6 +1481,7 @@ chatbot_create(bot_inst_t *inst)
   pthread_cond_init(&st->coalesce_idle, NULL);
   pthread_mutex_init(&st->engagement.mutex, NULL);
   pthread_mutex_init(&st->handoff.mutex,    NULL);
+  pthread_mutex_init(&st->floor.mutex,      NULL);
   pthread_mutex_init(&st->volunteer.mutex,  NULL);
   pthread_mutex_init(&st->witness_cd.mutex, NULL);
 
@@ -1408,6 +1531,7 @@ chatbot_destroy(void *handle)
   pthread_mutex_destroy(&st->coalesce_mutex);
   pthread_mutex_destroy(&st->engagement.mutex);
   pthread_mutex_destroy(&st->handoff.mutex);
+  pthread_mutex_destroy(&st->floor.mutex);
   pthread_mutex_destroy(&st->volunteer.mutex);
   pthread_mutex_destroy(&st->witness_cd.mutex);
   chatbot_vision_state_destroy(st);
@@ -1756,7 +1880,12 @@ chatbot_consider_speaking(chatbot_state_t *st, const method_msg_t *msg,
   // = false mode the inbound path stamps additionally. DMs have an
   // empty channel and do not engage the ring: they're already
   // promoted unconditionally by the stateless classifier.
-  if(kind == MEM_MSG_EXCHANGE_IN && msg->channel[0] != '\0')
+  //
+  // TURN-1: a floor promotion is explicitly excluded. The floor is one
+  // answer to one question; stamping it would hand a voice channel the
+  // permanently-warm slot the AMBIENT arm refuses to create.
+  if(kind == MEM_MSG_EXCHANGE_IN && msg->channel[0] != '\0'
+      && reason != CHATBOT_CLASSIFY_FLOOR)
     chatbot_engagement_stamp(&st->engagement, msg->channel, msg->sender, now);
 
   // VF-1: proves the legacy reply/interject path is the one that spoke.
@@ -1770,8 +1899,14 @@ chatbot_consider_speaking(chatbot_state_t *st, const method_msg_t *msg,
   // flushes reach this site via chatbot_consider_speaking with reason
   // synthesised at chatbot.c:1345-1346, so DIRECT propagates correctly
   // without an extra field on chatbot_coalesce_slot_t.
+  //
+  // TURN-1 widens is_direct_address to FLOOR deliberately: someone who
+  // just answered a question out loud is owed a noise rather than
+  // silence. Reverse it if the canned fallback proves worse than
+  // nothing on a voice method.
   chatbot_reply_submit(st, msg, decision == CHATBOT_SPEAK_REPLY,
-      reason == CHATBOT_CLASSIFY_DIRECT, false);
+      reason == CHATBOT_CLASSIFY_DIRECT || reason == CHATBOT_CLASSIFY_FLOOR,
+      false);
 
   // VF-3: stamp the per-target witness-interject ring ONLY after a
   // successful interject submit. Direct-address replies (REPLY) do
@@ -2023,6 +2158,7 @@ chatbot_coalesce_fire(task_t *t)
   method_msg_t synth = {0};
   mem_msg_kind_t kind;
   bool slot_any_direct;
+  bool slot_any_floor;
   bool fire;
   bool dropped;
   uint32_t lines;
@@ -2035,6 +2171,7 @@ chatbot_coalesce_fire(task_t *t)
   // memory/llm and could reenter chatbot code on the same thread).
   kind = MEM_MSG_WITNESS;
   slot_any_direct = false;
+  slot_any_floor = false;
   fire = false;
   dropped = false;
   lines = 0;
@@ -2076,6 +2213,7 @@ chatbot_coalesce_fire(task_t *t)
     synth.timestamp = slot->first_ts;
     kind = slot->was_addressed ? MEM_MSG_EXCHANGE_IN : MEM_MSG_WITNESS;
     slot_any_direct = slot->any_direct;
+    slot_any_floor  = slot->any_floor;
     lines           = slot->lines;
     truncated       = slot->truncated;
 
@@ -2109,6 +2247,13 @@ chatbot_coalesce_fire(task_t *t)
     chatbot_classify_reason_t r;
     if(slot_any_direct)
       r = CHATBOT_CLASSIFY_DIRECT;
+    // TURN-1: before the STICKY fallback, because a floor promotion
+    // that comes out of the flush labelled STICKY gets stamped into
+    // the engagement ring below — and on a mic that is one warm slot
+    // for the whole room, which is what the floor ring exists to
+    // avoid.
+    else if(slot_any_floor)
+      r = CHATBOT_CLASSIFY_FLOOR;
     else if(kind == MEM_MSG_EXCHANGE_IN)
       r = CHATBOT_CLASSIFY_STICKY;
     else
@@ -2229,6 +2374,7 @@ chatbot_coalesce_enqueue(chatbot_state_t *st, const method_msg_t *msg,
   if(s->lines > CHATBOT_COALESCE_MAX_LINES) s->truncated = true;
   if(kind == MEM_MSG_EXCHANGE_IN) s->was_addressed = true;
   if(reason == CHATBOT_CLASSIFY_DIRECT) s->any_direct = true;
+  if(reason == CHATBOT_CLASSIFY_FLOOR)  s->any_floor  = true;
 
   s->seq++;
   seq_snapshot = s->seq;
@@ -2593,6 +2739,7 @@ chatbot_observe(chatbot_state_t *st, const method_msg_t *msg)
   chatbot_classify_reason_t reason;
   mem_msg_kind_t kind;
   uint32_t handoff_window;
+  uint32_t floor_window;
   bool engagement_require_reply;
   uint32_t engagement_window;
   const char *botname;
@@ -2616,9 +2763,12 @@ chatbot_observe(chatbot_state_t *st, const method_msg_t *msg)
   handoff_window = (uint32_t)kv_get_bot_uint_or_default(botname,
       "behavior.speak.handoff_window_secs");
 
+  floor_window = (uint32_t)kv_get_bot_uint_or_default(botname,
+      "behavior.speak.floor_window_secs");
+
   reason = CHATBOT_CLASSIFY_WITNESS;
   kind = chatbot_classify_with_engagement(st, msg, &names,
-      engagement_window, handoff_window, &reason);
+      engagement_window, handoff_window, floor_window, &reason);
 
   // When the operator opts into require_reply=false, stamp on every
   // inbound EXCHANGE_IN — but only on DIRECT, never on a STICKY

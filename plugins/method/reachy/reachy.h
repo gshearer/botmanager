@@ -307,6 +307,7 @@ static bool reachy_word_char(char);
 static bool reachy_phrase_in(const char *, const char *);
 static char *reachy_trim(char *);
 static reachy_attn_t reachy_attention(reachy_state_t *, const char *);
+static void reachy_attn_extend(reachy_state_t *);
 static void reachy_deliver(reachy_state_t *, const reachy_dispatch_t *);
 static void reachy_dispatch_task(task_t *);
 static void reachy_stt_done(const llm_stt_response_t *);

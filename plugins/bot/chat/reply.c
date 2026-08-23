@@ -8,6 +8,7 @@
 #include "curl.h"
 #include "inference.h"
 
+#include <ctype.h>
 #include <errno.h>
 #include <inttypes.h>
 #include <regex.h>
@@ -1254,6 +1255,20 @@ send_line_marked(chatbot_req_t *r, const char *line, bool emote)
     method_send(r->method, r->reply_target, marked);
 }
 
+// TURN-1: did the bot just ask something? Last non-space byte only —
+// the bot's own output, so there is no testimony being edited here and
+// nothing is written back.
+static bool
+line_ends_in_question(const char *line)
+{
+  size_t n = strlen(line);
+
+  while(n > 0 && isspace((unsigned char)line[n - 1]))
+    n--;
+
+  return(n > 0 && line[n - 1] == '?');
+}
+
 // Route one completed reply line to the method. Lines beginning with
 // "/me " are sent as actions/emotes via method_send_emote (which falls
 // back to "*text*" on methods without native action support).
@@ -1344,6 +1359,13 @@ send_reply_line(chatbot_req_t *r, const char *line)
       return;
     }
   }
+
+  // TURN-1: the bot holds the floor. Last statement before the wire,
+  // so every gate above — SKIP, CV-13 anti-repeat, slash suppression —
+  // has already had its say and a line that never went out arms
+  // nothing. A multi-line reply arms once per '?' and the last wins.
+  if(r->channel[0] != '\0' && line_ends_in_question(line))
+    chatbot_floor_arm(&r->st->floor, r->channel, time(NULL));
 
   r->nonskip_lines_sent++;
   send_line_marked(r, line, false);

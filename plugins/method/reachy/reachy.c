@@ -677,6 +677,25 @@ reachy_attention(reachy_state_t *st, const char *text)
   return(listening ? REACHY_ATTN_AMBIENT : REACHY_ATTN_DROP);
 }
 
+// Re-open the listening window from now. The window has to run from
+// when SHE stopped, not from when the human last said her name: a
+// twenty-second spoken answer otherwise spends most of it, and the
+// follow-up arrives after the door has shut. Never shortens a window
+// that is already longer.
+static void
+reachy_attn_extend(reachy_state_t *st)
+{
+  time_t until = time(NULL)
+      + (time_t)reachy_kv_uint(st, "attention.window_s");
+
+  pthread_mutex_lock(&st->attn_mutex);
+
+  if(until > st->attn_until)
+    st->attn_until = until;
+
+  pthread_mutex_unlock(&st->attn_mutex);
+}
+
 static void
 reachy_deliver(reachy_state_t *st, const reachy_dispatch_t *d)
 {
@@ -1524,6 +1543,12 @@ reachy_speak(reachy_state_t *st, const char *text)
       up_ms, play_ms);
 
   reachy_pace(st, ms, reachy_kv_flag(st, "barge_in"));
+
+  // Unconditional on the pace verdict. A barge-in means a human is
+  // already speaking and the window is exactly what should be open; a
+  // teardown has reachy_stopping set and delivers nothing either way.
+  // Only the three early returns above skip it — nothing was said.
+  reachy_attn_extend(st);
 }
 
 // The mouth thread. Strictly one line at a time: the robot has one

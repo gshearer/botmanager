@@ -210,6 +210,11 @@ typedef struct
   // promotions — preserved so the flush callback can gate the CV-4
   // direct-address SKIP fallback correctly.
   bool            any_direct;
+  // TURN-1: same job as any_direct for the floor promotion. Without it
+  // the flush re-derives EXCHANGE_IN as STICKY and stamps the
+  // engagement ring, which on a voice channel is one warm slot shared
+  // by the whole room — the exact outcome the floor ring avoids.
+  bool            any_floor;
   bool            is_action;       // first-line-wins: the slot's opening line was an IRC /me action
   bool            truncated;       // set when the block exceeded buffer/line caps
   uint32_t        lines;
@@ -318,6 +323,30 @@ typedef struct
   chatbot_handoff_slot_t slots[CHATBOT_HANDOFF_SLOTS];
   pthread_mutex_t        mutex;
 } chatbot_handoff_t;
+
+// TURN-1 — per-channel "the bot is waiting for an answer" ring. A
+// microphone has no envelope: a spoken line that did not carry the
+// bot's name reaches us as METHOD_ADDR_AMBIENT and is witnessed, so a
+// question the bot asked the room can never be answered. This is the
+// third state neither half had — the bot just asked, and the next
+// thing said on that channel is the reply.
+//
+// Three bounds keep it from becoming a sticky slot by another name:
+// armed only by an outgoing line that ends in a question mark,
+// consumed on first use, and bounded by floor_window_secs.
+#define CHATBOT_FLOOR_SLOTS                    4
+
+typedef struct
+{
+  char    channel[METHOD_CHANNEL_SZ];   // empty = slot unused
+  time_t  asked_at;                     // 0 = consumed, or never armed
+} chatbot_floor_slot_t;
+
+typedef struct
+{
+  chatbot_floor_slot_t slots[CHATBOT_FLOOR_SLOTS];
+  pthread_mutex_t      mutex;
+} chatbot_floor_t;
 
 // VF-3 — per-target witness-interject cooldown ring. Caps the rate at
 // which WITNESS-driven interjects fire on a given channel (or DM
@@ -454,6 +483,11 @@ typedef struct
   // WITNESS when the channel's prior non-bot speaker was a different
   // user within the handoff window.
   chatbot_handoff_t       handoff;
+
+  // TURN-1 — per-channel floor ring. Armed by reply.c when an outgoing
+  // line ends in a question mark; consumed by the AMBIENT arm of the
+  // classifier, which is the only reader.
+  chatbot_floor_t         floor;
 
   // V1 — volunteer speech state. Per-channel last-volunteered ring +
   // hourly rate-limit counter. 16 slots is enough for a bot joined to
@@ -753,6 +787,16 @@ time_t chatbot_last_witness_interject(chatbot_state_t *st,
     const char *target);
 void chatbot_stamp_witness_interject(chatbot_state_t *st,
     const char *target, time_t now);
+
+// TURN-1 — the floor ring. `arm` is called from reply.c on the curl
+// worker when an outgoing line ends in a question mark; `take` is
+// called from the classifier and is DESTRUCTIVE — it consumes the
+// slot, so the first in-window utterance is the answer and the second
+// is ambient again. Both take the ring's own mutex; neither may be
+// called with any other chatbot lock held.
+void chatbot_floor_arm(chatbot_floor_t *f, const char *channel, time_t now);
+bool chatbot_floor_take(chatbot_floor_t *f, const char *channel, time_t now,
+    uint32_t window_secs);
 
 // Reply-path internals — chatbot_req_t and tunable caps used by reply.c.
 // Kept in the INTERNAL block so sibling translation units (volunteer.c,
