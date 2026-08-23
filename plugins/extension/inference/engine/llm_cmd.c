@@ -403,31 +403,93 @@ llm_list_emit_row(const cmd_ctx_t *ctx, const llm_list_state_t *st,
     llm_list_emit_thinking(ctx, st, row);
 }
 
+// What a ★ actually names. "default" alone was read as "the model I will
+// get", which is the one thing it does not mean: llm.c registers both knobs
+// and reads neither, and every consumer above resolves its own chain before
+// it ever falls back to one.
+//
+// Only CHAT and EMBED rows can be starred (llm_list_annotate), so a filtered
+// view that reaches here is one of those two kinds.
+static const char *
+llm_list_star_knob(const llm_list_state_t *st)
+{
+  if(!st->filtered)
+    return("the engine default for its kind");
+
+  if(st->want == LLM_KIND_CHAT)
+    return("llm.default_chat_model");
+
+  return("llm.default_embed_model");
+}
+
+// Join one legend clause onto `line`, with the separator every clause but
+// the first carries. `line` must already be a string.
+static void
+llm_legend_part(char *line, size_t cap, bool *first, const char *text)
+{
+  if(!*first)
+    display_cat(line, cap, " · ");
+
+  display_cat(line, cap, text);
+  *first = false;
+}
+
 static void
 llm_list_emit_legend(const cmd_ctx_t *ctx, const llm_list_state_t *st)
 {
-  bool marks   = false;
-  bool warn    = false;
-  bool undecl  = false;
+  bool starred  = false;
+  bool disabled = false;
+  bool warn     = false;
+  bool undecl   = false;
+  bool first    = true;
   char line[256];
 
   for(uint32_t i = 0; i < st->n_rows; i++)
   {
     const llm_list_row_t *row = &st->rows[i];
 
-    marks  = marks || row->is_default || !row->enabled;
-    warn   = warn  || row->thinking_only;
-    undecl = undecl
+    // Separate flags, not one `marks`: a table with a disabled row and no
+    // default was captioning a star nothing on it wore.
+    starred  = starred  || row->is_default;
+    disabled = disabled || !row->enabled;
+    warn     = warn     || row->thinking_only;
+    undecl   = undecl
         || (row->kind == LLM_KIND_CHAT && row->efforts[0] == '\0');
   }
 
-  if(marks || warn)
+  if(starred || disabled || warn)
   {
-    snprintf(line, sizeof(line), "  " CLR_GRAY "%s%s%s" CLR_RESET,
-        marks ? "★ default · ✗ disabled" : "",
-        marks && warn ? " · " : "",
-        warn ? "⚠ thinking-only: omitting the field returns empty" : "");
+    strlcpy(line, "  " CLR_GRAY, sizeof line);
+
+    if(starred)
+      llm_legend_part(line, sizeof(line), &first, "★ default");
+
+    if(disabled)
+      llm_legend_part(line, sizeof(line), &first, "✗ disabled");
+
+    if(warn)
+      llm_legend_part(line, sizeof(line), &first,
+          "⚠ thinking-only: omitting the field returns empty");
+
+    display_cat(line, sizeof(line), CLR_RESET);
     cmd_reply(ctx, line);
+  }
+
+  // ⚠ The star names a knob, not an outcome, and the knob is the fact worth
+  // printing: !ask never reads either one, chat reaches one only when
+  // bot.<n>.chat_model is empty, and !imagine has a third of its own. A
+  // reader who stops at the glyph has the right answer for no surface in
+  // particular. Its own line — folded into the key above, the three-clause
+  // case runs past DISPLAY_COLS.
+  if(starred)
+  {
+    snprintf(line, sizeof(line), "  " CLR_GRAY "★ = %s — a fallback, not a"
+        " promise" CLR_RESET, llm_list_star_knob(st));
+    cmd_reply(ctx, line);
+
+    if(!st->filtered || st->want == LLM_KIND_CHAT)
+      cmd_reply(ctx, "  " CLR_GRAY "what a surface really uses: !show ask"
+          " · !show imagine · !show bot <n> model" CLR_RESET);
   }
 
   // ⚠ Absent means UNDECLARED, not "accepts nothing". Without this line a

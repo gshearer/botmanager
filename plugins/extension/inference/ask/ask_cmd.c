@@ -1259,7 +1259,22 @@ static const char ask_cmd_help[] =
     "  ask <query>          one-shot query against the bot's default model\n"
     "  a <query>            short alias\n"
     "  ask -m <model> ...   pick a specific model from the allowlist\n"
+    "  ask -e <effort> ...  how hard that model thinks before answering\n"
     "  show ask             the request !ask would make on this bot\n"
+    "\n"
+    "Either flag may appear anywhere in the line; everything left over is\n"
+    "the query, so a question may safely begin with a dash.\n"
+    "\n"
+    "Effort is one of none, minimal, low, medium, high, xhigh — but each\n"
+    "model declares which of those it accepts, and the set is NOT a range:\n"
+    "a model offering low and high does not thereby offer medium. Read the\n"
+    "set before you are refused by it:\n"
+    "\n"
+    "  show ask               the set for the model THIS bot would use\n"
+    "  show llm models chat   every model, on its own \"thinking:\" line\n"
+    "\n"
+    "A model with no thinking line has declared nothing, which admits\n"
+    "every effort — it does not refuse them all.\n"
     "\n"
     "Answers are STATELESS — no memory is kept and no conversation\n"
     "history is carried between calls (this is not the chat bot).\n"
@@ -1267,12 +1282,13 @@ static const char ask_cmd_help[] =
     "Examples:\n"
     "  !ask why is the sky blue\n"
     "  !a -m gfll summarize the CAP theorem\n"
+    "  !ask -e high derive the CAP theorem from first principles\n"
     "  !show ask";
 
 static bool
 ask_cmd_init(void)
 {
-  if(cmd_register(ASK_CMD_CTX, "ask", "ask [-m <model>] <query>",
+  if(cmd_register(ASK_CMD_CTX, "ask", "ask [-m <model>] [-e <effort>] <query>",
       "One-shot LLM query (stateless, no memory)", ask_cmd_help,
       USERNS_GROUP_EVERYONE, 0, CMD_SCOPE_ANY, METHOD_T_ANY,
       ask_cmd_handler, NULL, NULL, "a", NULL, 0, NULL, NULL) != SUCCESS)
