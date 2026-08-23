@@ -509,6 +509,20 @@ curl_request_set_timeout(curl_request_t *req, uint32_t timeout_secs)
   return(SUCCESS);
 }
 
+// Set a per-request idle timeout: abandon the transfer when it makes no
+// progress for this long. Distinct from the total-transfer bound above.
+// req: request handle (must be in CREATED state)
+bool
+curl_request_set_idle_timeout(curl_request_t *req, uint32_t idle_secs)
+{
+  if(req == NULL || req->state != CURL_REQ_CREATED)
+    return(FAIL);
+
+  req->idle_secs = idle_secs;
+
+  return(SUCCESS);
+}
+
 // Set a per-request User-Agent, overriding the global KV default.
 // req: request handle (must be in CREATED state)
 bool
@@ -1107,6 +1121,16 @@ curl_drain_queue(void)
     curl_easy_setopt(easy, CURLOPT_TIMEOUT, (long)timeout);
     curl_easy_setopt(easy, CURLOPT_CONNECTTIMEOUT,
         (long)curl_cfg.connect_timeout);
+
+    // The stall detector, when the caller asked for one. LOW_SPEED_LIMIT is
+    // bytes per second and 1 is the smallest bound that still means "any
+    // progress at all", so the pair reads as: abandon this transfer after
+    // idle_secs of moving less than one byte a second.
+    if(req->idle_secs > 0)
+    {
+      curl_easy_setopt(easy, CURLOPT_LOW_SPEED_LIMIT, 1L);
+      curl_easy_setopt(easy, CURLOPT_LOW_SPEED_TIME, (long)req->idle_secs);
+    }
     curl_easy_setopt(easy, CURLOPT_FOLLOWLOCATION,
         req->follow_redirects ? 1L : 0L);
 

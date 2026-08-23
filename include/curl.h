@@ -112,6 +112,14 @@ const char *curl_response_header(const curl_response_t *resp,
 // timeout_secs of 0 uses the KV default.
 bool curl_request_set_timeout(curl_request_t *req, uint32_t timeout_secs);
 
+// A stream that stops PROGRESSING for idle_secs is abandoned, however long
+// the transfer has already run. This is the bound a long-running download or
+// a slow LLM stream wants: curl_request_set_timeout bounds the whole
+// transfer, so using it as a stall detector kills healthy slow transfers at
+// the same wall. Set both — the idle timeout catches a stall, the total one
+// is the outer bound. 0 (the default) means no idle bound.
+bool curl_request_set_idle_timeout(curl_request_t *req, uint32_t idle_secs);
+
 // ua is copied internally; NULL uses the KV default.
 bool curl_request_set_user_agent(curl_request_t *req, const char *ua);
 
@@ -347,6 +355,7 @@ struct curl_request
   curl_prio_t         prio;
   char                url[CURL_URL_SZ];
   uint32_t            timeout_secs;     // 0 = use default
+  uint32_t            idle_secs;        // 0 = no idle bound
   char                user_agent[CURL_UA_SZ]; // empty = use default
 
   // Heap-allocated, owned by request.
