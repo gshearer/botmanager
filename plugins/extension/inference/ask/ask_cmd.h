@@ -59,6 +59,18 @@ typedef struct
   uint32_t     max_cols;
 } ask_req_t;
 
+// The flag prefix of one !ask invocation: `-m <model>`, `-e <effort>`.
+// Each flag is optional and the have_* bit is what separates "not given"
+// from "given empty" — an unset effort must fall through to the tier
+// resolver, which is not the same as asking for one explicitly.
+typedef struct
+{
+  char model[128];
+  char effort[16];    // wire spelling; longest is "minimal"
+  bool have_model;
+  bool have_effort;
+} ask_flags_t;
+
 static bool ask_cmd_init(void);
 static void ask_cmd_deinit(void);
 

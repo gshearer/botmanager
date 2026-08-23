@@ -961,6 +961,14 @@ typedef struct
   char            chat_model[64];
   float           temperature;
   uint32_t        max_tokens;
+
+  // Reply-only reasoning effort, resolved from bot.<name>.reasoning_effort
+  // at submit time. UNSET — the common case — leaves the service's own
+  // llm.service.<name>.reasoning_effort in charge. Deliberately absent
+  // from the extract, persona-flourish and digest paths: each is
+  // background or one-line work on a small budget, where a raised effort
+  // buys nothing and can eat the whole budget thinking.
+  llm_effort_t    effort;
   // NL bridge allowlist. Semantics (see nl_bridge_list_permits):
   //   ""  → bridge disabled
   //   "*" → every NL-capable command that also passes cmd_permits

@@ -1208,10 +1208,12 @@ llm_clam_prompt_chat(const char *model_name,
 {
   clam(CLAM_DEBUG5, "llm",
       "prompt chat submit model=%s n_messages=%zu temp=%.3f"
-      " max_tokens=%u timeout=%us stream=%d",
+      " max_tokens=%u timeout=%us stream=%d effort=%s",
       model_name, n_msgs,
       (double)params->temperature, params->max_tokens,
-      params->timeout_secs, (int)params->stream);
+      params->timeout_secs, (int)params->stream,
+      params->effort != LLM_EFFORT_UNSET
+          ? llm_effort_wire(params->effort) : "(unset)");
 
   for(size_t i = 0; i < n_msgs; i++)
   {

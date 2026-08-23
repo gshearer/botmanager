@@ -38,6 +38,19 @@ static const plugin_kv_entry_t ask_kv_schema[] = {
   { "plugin.ask.allow",      KV_STR,    "*",
     "Absolute allowlist of exposable chat-model names ('*' = all enabled);"
     " bot / protocol tiers may only narrow this" },
+  // Effort is a membership test, never a ceiling: there is no order to
+  // clamp along (q38nv takes 'xhigh' and refuses 'high'), so the lower
+  // tiers narrow this list rather than lowering a number. Empty default =
+  // send nothing, which leaves llm.service.<name>.reasoning_effort in
+  // charge — the tuning every service already carries.
+  { "plugin.ask.effort",       KV_STR, "",
+    "Default reasoning_effort for !ask when no -e is given"
+    " (none|minimal|low|medium|high|xhigh). Empty = send nothing and let"
+    " the service's own llm.service.<name>.reasoning_effort decide" },
+  { "plugin.ask.effort_allow", KV_STR, "*",
+    "Absolute allowlist of reasoning_effort values !ask may be asked for"
+    " ('*' = any the model declares); bot / protocol tiers may only narrow"
+    " this. A raised effort spends the operator's paid quota" },
   { "plugin.ask.max_tokens", KV_UINT32, "1024",
     "Hard ceiling on max_tokens per !ask; bot / protocol tiers may only"
     " lower it" },
@@ -95,6 +108,22 @@ ask_kv_bot_cb(const char *botname, void *user)
   kv_register(key, KV_STR, "*", NULL, NULL,
       "Per-bot !ask allowlist ('*' = inherit; else narrows plugin.ask.allow)");
 
+  // Same materialisation as the default model above, and it is safe for
+  // the same reason: the plugin tier ships empty, so a bot created today
+  // inherits "unset" and keeps deferring to its service.
+  inherit = kv_get_str("plugin.ask.effort");
+  snprintf(def, sizeof(def), "%s", inherit != NULL ? inherit : "");
+
+  snprintf(key, sizeof(key), "bot.%s.ask.effort", botname);
+  kv_register(key, KV_STR, def, NULL, NULL,
+      "Per-bot !ask default reasoning_effort (empty inherits"
+      " plugin.ask.effort; empty everywhere = the service decides)");
+
+  snprintf(key, sizeof(key), "bot.%s.ask.effort_allow", botname);
+  kv_register(key, KV_STR, "*", NULL, NULL,
+      "Per-bot !ask effort allowlist ('*' = inherit; else narrows"
+      " plugin.ask.effort_allow)");
+
   snprintf(key, sizeof(key), "bot.%s.ask.max_tokens", botname);
   kv_register(key, KV_UINT32, "0", NULL, NULL,
       "Per-bot max_tokens cap for !ask (0 = inherit plugin ceiling)");
@@ -132,6 +161,19 @@ ask_kv_proto_cb(const char *botname, const char *protocol, void *user)
   snprintf(key, sizeof(key), "bot.%s.%s.ask.allow", botname, protocol);
   kv_register(key, KV_STR, "*", NULL, NULL,
       "Per-protocol !ask allowlist ('*' = inherit; else narrows the bot tier)");
+
+  inherit = kv_get_bot_str(botname, "ask.effort");
+  snprintf(def, sizeof(def), "%s", inherit != NULL ? inherit : "");
+
+  snprintf(key, sizeof(key), "bot.%s.%s.ask.effort", botname, protocol);
+  kv_register(key, KV_STR, def, NULL, NULL,
+      "Per-protocol !ask default reasoning_effort (empty inherits the bot"
+      " tier)");
+
+  snprintf(key, sizeof(key), "bot.%s.%s.ask.effort_allow", botname, protocol);
+  kv_register(key, KV_STR, "*", NULL, NULL,
+      "Per-protocol !ask effort allowlist ('*' = inherit; else narrows the"
+      " bot tier)");
 
   snprintf(key, sizeof(key), "bot.%s.%s.ask.max_tokens", botname, protocol);
   kv_register(key, KV_UINT32, "0", NULL, NULL,
@@ -215,6 +257,10 @@ typedef struct
   const char *allow_plugin;  // absolute list
   const char *allow_bot;     // narrows plugin (NULL/empty/"*" = no-op)
   const char *allow_proto;   // narrows bot    (NULL/empty/"*" = no-op)
+  const char *def_effort;    // most-specific non-empty, or NULL = unset
+  const char *effort_plugin; // the same three tiers, for -e
+  const char *effort_bot;
+  const char *effort_proto;
   uint32_t    max_lines;     // min across present tiers
   uint32_t    max_tokens;    // min across present tiers
   uint32_t    max_cols;      // min across present tiers, buffer-clamped
@@ -296,6 +342,15 @@ ask_scope_resolve(const char *bot_name, const char *proto, ask_scope_t *s)
   s->allow_plugin = kv_get_str("plugin.ask.allow");
   s->allow_bot    = ask_kv_bot(bot_name, "allow");
   s->allow_proto  = ask_kv_proto(bot_name, proto, "allow");
+
+  s->def_effort = ask_first_nonempty(
+      ask_kv_proto(bot_name, proto, "effort"),
+      ask_kv_bot(bot_name, "effort"),
+      kv_get_str("plugin.ask.effort"));
+
+  s->effort_plugin = kv_get_str("plugin.ask.effort_allow");
+  s->effort_bot    = ask_kv_bot(bot_name, "effort_allow");
+  s->effort_proto  = ask_kv_proto(bot_name, proto, "effort_allow");
 
   s->max_lines  = ask_ceiling(bot_name, proto, "max_lines",  1);
   s->max_tokens = ask_ceiling(bot_name, proto, "max_tokens", 1);
@@ -386,6 +441,51 @@ ask_model_ok(const char *model, const ask_scope_t *s)
 }
 
 
+// Gate an effort for !ask. Two independent membership tests and no
+// ordering anywhere: the caller's allowlist says what this bot may ASK
+// for, the model's declaration says what the provider will ACCEPT.
+// `why` is filled only on refusal.
+static bool
+ask_effort_ok(llm_effort_t e, const char *model, const ask_scope_t *s,
+    char *why, size_t why_sz)
+{
+  const char *wire = llm_effort_wire(e);
+  bool        is_default;
+  char        key[KV_KEY_SZ];
+  const char *declared;
+
+  if(e == LLM_EFFORT_UNSET)
+    return(true);                 // nothing is sent; nothing to gate
+
+  // The resolved default is always self-allowed, exactly as the resolved
+  // default model is — a bot can always run its own configuration.
+  is_default = s->def_effort != NULL && strcasecmp(wire, s->def_effort) == 0;
+
+  if(!is_default
+      && (!ask_tier_admits(s->effort_plugin, wire)
+          || !ask_tier_admits(s->effort_bot,   wire)
+          || !ask_tier_admits(s->effort_proto, wire)))
+  {
+    snprintf(why, why_sz, "effort '%s' is not allowed here", wire);
+    return(false);
+  }
+
+  snprintf(key, sizeof(key), "llm.model.%s.efforts", model);
+  declared = kv_get_str(key);
+
+  // llm_effort_set_admits answers true on an EMPTY set — undeclared means
+  // unmeasured, not forbidden (include/kv.h, the read-site rule) — so
+  // there is no empty-check to write here, and writing one would refuse
+  // every model whose set nobody has filled in yet.
+  if(!llm_effort_set_admits(declared, e))
+  {
+    snprintf(why, why_sz, "%s accepts: %s", model, declared);
+    return(false);
+  }
+
+  return(true);
+}
+
 // -----------------------------------------------------------------------
 // Argument parsing
 // -----------------------------------------------------------------------
@@ -408,34 +508,48 @@ ask_query_append(char *query, size_t cap, size_t *len, const char *tok)
     *len += (size_t)wrote < cap - *len ? (size_t)wrote : cap - *len - 1;
 }
 
-// Split the raw argument string into an optional "-m <model>" selection
-// and the residual query. "-m" is consumed on its first occurrence; a
-// trailing "-m" with no following token is dropped.
+// Split the raw argument string into the optional "-m <model>" and
+// "-e <effort>" selections and the residual query. Each flag is consumed
+// on its first occurrence; a trailing flag with no following token is
+// dropped. Anything else is query text, "-x" included — !ask is a natural
+// -language surface and refusing an unknown dash-word would eat the
+// question.
 static void
-ask_parse_flags(const char *args, char *model, size_t model_cap,
-    char *query, size_t query_cap, bool *have_model)
+ask_parse_flags(const char *args, ask_flags_t *f, char *query,
+    size_t query_cap)
 {
   char   scratch[METHOD_TEXT_SZ];
   char  *save;
   size_t qlen = 0;
 
   snprintf(scratch, sizeof(scratch), "%s", args);
-  model[0]    = '\0';
-  query[0]    = '\0';
-  *have_model = false;
+  memset(f, 0, sizeof(*f));
+  query[0] = '\0';
 
   for(char *tok = strtok_r(scratch, " \t", &save); tok != NULL;
       tok = strtok_r(NULL, " \t", &save))
   {
-    if(!*have_model && strcmp(tok, "-m") == 0)
+    if(!f->have_model && strcmp(tok, "-m") == 0)
     {
       char *m = strtok_r(NULL, " \t", &save);
 
       if(m == NULL)
         continue;                    // trailing "-m" with no value: drop
 
-      snprintf(model, model_cap, "%s", m);
-      *have_model = true;
+      strlcpy(f->model, m, sizeof(f->model));
+      f->have_model = true;
+      continue;
+    }
+
+    if(!f->have_effort && strcmp(tok, "-e") == 0)
+    {
+      char *e = strtok_r(NULL, " \t", &save);
+
+      if(e == NULL)
+        continue;                    // trailing "-e" with no value: drop
+
+      strlcpy(f->effort, e, sizeof(f->effort));
+      f->have_effort = true;
       continue;
     }
 
@@ -701,18 +815,20 @@ ask_cmd_handler(const cmd_ctx_t *ctx)
   const char        *bot_name;
   const char        *proto;
   const char        *model;
+  const char        *want_effort;
   ask_scope_t        scope;
-  char               picked[128];
+  ask_flags_t        flags;
+  llm_effort_t       effort;
   char               query[METHOD_TEXT_SZ];
   char               reply[ASK_CMD_REPLY_SZ];
   char               prepend[ASK_PREPEND_SZ];
-  bool               have_model;
   llm_message_t      msgs[2];
   size_t             n;
   llm_chat_params_t  p;
 
   static const char usage[] =
-      "Usage: ask [-m <model>] <query>  ·  !show ask lists models";
+      "Usage: ask [-m <model>] [-e <effort>] <query>"
+      "  ·  !show ask lists models";
 
   if(ctx->args == NULL || ctx->args[0] == '\0')
   {
@@ -720,8 +836,7 @@ ask_cmd_handler(const cmd_ctx_t *ctx)
     return;
   }
 
-  ask_parse_flags(ctx->args, picked, sizeof(picked),
-      query, sizeof(query), &have_model);
+  ask_parse_flags(ctx->args, &flags, query, sizeof(query));
 
   if(query[0] == '\0')
   {
@@ -732,13 +847,32 @@ ask_cmd_handler(const cmd_ctx_t *ctx)
   bot_name = (ctx->bot != NULL) ? bot_inst_name(ctx->bot) : NULL;
   proto    = ask_proto(ctx);
   ask_scope_resolve(bot_name, proto, &scope);
-  model    = have_model ? picked : scope.def_model;
+  model    = flags.have_model ? flags.model : scope.def_model;
 
   if(!ask_model_ok(model, &scope))
   {
     snprintf(reply, sizeof(reply),
         "unknown or unavailable model '%s' — try !show ask",
         (model != NULL && model[0] != '\0') ? model : "(none)");
+    cmd_reply(ctx, reply);
+    return;
+  }
+
+  // Effort is gated AFTER the model: "gpl accepts: low,medium,high" is
+  // nonsense advice about a model the caller cannot reach anyway.
+  want_effort = flags.have_effort ? flags.effort : scope.def_effort;
+
+  if(llm_effort_from_str(want_effort, &effort) != SUCCESS)
+  {
+    snprintf(reply, sizeof(reply),
+        "unknown effort '%s' — one of: none minimal low medium high xhigh",
+        want_effort);
+    cmd_reply(ctx, reply);
+    return;
+  }
+
+  if(!ask_effort_ok(effort, model, &scope, reply, sizeof(reply)))
+  {
     cmd_reply(ctx, reply);
     return;
   }
@@ -778,6 +912,7 @@ ask_cmd_handler(const cmd_ctx_t *ctx)
 
   p            = (llm_chat_params_t){ 0 };
   p.max_tokens = scope.max_tokens;
+  p.effort     = effort;
 
   // model/msgs/query are caller-owned only until submit returns
   // (the callee copies internally) — all live here for the call.

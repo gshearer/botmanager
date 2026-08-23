@@ -129,6 +129,15 @@ static const plugin_kv_entry_t chatbot_inst_schema[] = {
     "Sampling temperature, stored as int * 100 (e.g. 70 = 0.70)", NULL },
   { "max_reply_tokens", KV_UINT32, "256",
     "Upper bound on reply length in tokens", NULL },
+  { "reasoning_effort", KV_STR, "",
+    "Reasoning effort for this bot's REPLIES (none|minimal|low|medium|"
+    "high|xhigh). Empty falls through to the service's own"
+    " llm.service.<name>.reasoning_effort, which is where it has always"
+    " lived — set this only when one bot's model needs a different value"
+    " from the rest of its service. Applies to replies ONLY: fact"
+    " extraction, the persona flourish and knowledge digests keep the"
+    " service value on purpose (they are background or one-line work and"
+    " a raised effort buys them nothing).", NULL },
   { "corpus", KV_STR, "",
     "Knowledge corpora to retrieve from, semicolon-separated (e.g."
     " 'archwiki;linuxfoundation'). Each name must exist in"

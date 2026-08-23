@@ -2555,6 +2555,7 @@ assemble_and_submit(chatbot_req_t *r,
 
   params.temperature = r->temperature;
   params.max_tokens  = r->max_tokens;
+  params.effort      = r->effort;
   params.stream      = true;
 
   if(llm_chat_submit(r->chat_model, &params, messages, 2,
@@ -2832,6 +2833,29 @@ retrieve_cb(const mem_fact_t *facts, size_t n_facts,
   }
 }
 
+// The bot's configured reply effort, or UNSET when the key is empty (the
+// service's own llm.service.<name>.reasoning_effort then decides, which is
+// where this setting has always lived). A typo is named HERE rather than
+// sent: the provider would answer it with a 400 the reply path reports as
+// a bare failure, with nothing pointing at the KV that caused it.
+static llm_effort_t
+reply_bot_effort(const char *botname)
+{
+  const char  *val = kv_get_bot_str(botname, "reasoning_effort");
+  llm_effort_t e;
+
+  if(llm_effort_from_str(val, &e) != SUCCESS)
+  {
+    clam(CLAM_WARN, "chatbot",
+        "bot %s: reasoning_effort '%s' is not a known value"
+        " (none|minimal|low|medium|high|xhigh) — ignored; the service"
+        " value stands", botname, val);
+    return(LLM_EFFORT_UNSET);
+  }
+
+  return(e);
+}
+
 // Entry point.
 //   1. Captures a chatbot_req_t with everything needed to reply.
 //   2. Loads the active personality body.
@@ -3012,6 +3036,7 @@ chatbot_reply_submit(chatbot_state_t *st, const method_msg_t *msg,
       "speak_temperature") / 100.0f;   // stored as int*100
 
   r->max_tokens = (uint32_t)kv_get_bot_uint(botname, "max_reply_tokens");
+  r->effort     = reply_bot_effort(botname);
 
   // The interpret cue's second submit keeps the allowlist empty: no
   // COMMANDS block is rendered into its prompt and reply_nl_bridge
@@ -3311,6 +3336,7 @@ chatbot_reply_submit_vision(chatbot_state_t *st, const method_msg_t *msg,
       "speak_temperature") / 100.0f;
 
   r->max_tokens = (uint32_t)kv_get_bot_uint(botname, "max_reply_tokens");
+  r->effort     = reply_bot_effort(botname);
 
   // NL bridge stays available on the vision path (no reason to block
   // a follow-up command the model might emit).
