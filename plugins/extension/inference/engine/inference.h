@@ -16,13 +16,16 @@
 // in {llm,knowledge,acquire}_priv.h inside the inference plugin and
 // are not visible through this header.
 
+#include "common.h"  // SUCCESS / FAIL (llm_effort_from_str)
 #include "clam.h"
 #include "plugin.h"
 
 #include <stdbool.h>
 #include <stddef.h>
 #include <stdint.h>
-#include <stdlib.h>  // abort
+#include <stdlib.h>   // abort
+#include <string.h>   // strcmp, strlen  (llm_effort_from_str)
+#include <strings.h>  // strncasecmp     (llm_effort_set_admits)
 #include <time.h>
 
 // -----------------------------------------------------------------------
@@ -53,6 +56,110 @@ typedef enum
   LLM_KIND_STT,     // speech in, transcript out
   LLM_KIND_TTS      // text in, speech out
 } llm_kind_t;
+
+// Reasoning effort for a chat request — the OpenAI-compat `reasoning_effort`
+// field. UNSET is the neutral value at 0, so a zeroed llm_chat_params_t still
+// means "let the service's configured value decide", which is what every
+// caller that has no opinion wants. NONE is NOT UNSET: it sends the string
+// "none", and on a thinking-only model that is a different request from
+// sending nothing (LLM.md §Thinking / reasoning models).
+//
+// ⛔ These are TAGS, not a scale. There is no order here and there cannot be
+// one: measured 2026-08-23, RadixArk/Qwen3.8-27B-NVFP4 accepts `xhigh` and
+// REJECTS `high`, `minimal` exists only on Google and `xhigh` only on vLLM.
+// Never compare two of these with < or >, and never clamp against them — a
+// bound on effort is a membership test. LLM.md carries the measured table.
+//
+// APPEND ONLY, for the reason llm_kind_t is: the ordinal is what a sibling
+// .so compiled against an older copy of this header still believes.
+typedef enum
+{
+  LLM_EFFORT_UNSET = 0,   // omit the field; the service KV decides
+  LLM_EFFORT_NONE,        // send "none" — not the same as UNSET
+  LLM_EFFORT_MINIMAL,
+  LLM_EFFORT_LOW,
+  LLM_EFFORT_MEDIUM,
+  LLM_EFFORT_HIGH,
+  LLM_EFFORT_XHIGH
+} llm_effort_t;
+
+// Wire spelling, or "" for UNSET. Both directions live here rather than
+// behind a dlsym shim: it is a seven-entry table with no state, and a shim
+// around one would be a thin wrapper.
+static inline const char *
+llm_effort_wire(llm_effort_t e)
+{
+  static const char *const names[] = {
+    "", "none", "minimal", "low", "medium", "high", "xhigh"
+  };
+
+  return((size_t)e < sizeof names / sizeof names[0] ? names[e] : "");
+}
+
+// Membership of a DECLARED effort set — the comma- or space-separated wire
+// spellings in llm.model.<name>.efforts.
+//
+// ⚠ An EMPTY set means UNDECLARED, so it admits everything. Nobody has
+// measured that model yet; it does not mean the model refuses every value.
+// That is the KV's declared default and a read site may not substitute
+// something else for it (include/kv.h). Three callers want this — the ask
+// gate, the !show renderers and the engine — so it lives here rather than
+// three times.
+static inline bool
+llm_effort_set_admits(const char *csv, llm_effort_t e)
+{
+  const char *wire = llm_effort_wire(e);
+  const char *p;
+  size_t      n;
+
+  if(csv == NULL || csv[0] == '\0')
+    return(true);
+
+  n = strlen(wire);
+
+  if(n == 0)
+    return(true);                 // UNSET is always admissible
+
+  for(p = csv; *p != '\0'; p++)
+  {
+    if(strncasecmp(p, wire, n) != 0)
+      continue;
+
+    // Whole token only: a set naming "high" must not admit "xhigh", and
+    // one naming "xhigh" must not be matched by "high" at an offset.
+    if((p == csv || p[-1] == ',' || p[-1] == ' ' || p[-1] == '\t')
+        && (p[n] == '\0' || p[n] == ',' || p[n] == ' ' || p[n] == '\t'))
+      return(true);
+  }
+
+  return(false);
+}
+
+// Parse a wire spelling. SUCCESS/FAIL + out-param, matching
+// llm_kind_from_str: an unrecognised string is a distinct outcome from
+// UNSET and the caller has to be able to refuse it. NULL/"" is UNSET and
+// succeeds.
+static inline bool
+llm_effort_from_str(const char *s, llm_effort_t *out)
+{
+  if(out == NULL)
+    return(FAIL);
+
+  if(s == NULL || s[0] == '\0')
+  {
+    *out = LLM_EFFORT_UNSET;
+    return(SUCCESS);
+  }
+
+  for(int e = LLM_EFFORT_NONE; e <= LLM_EFFORT_XHIGH; e++)
+    if(strcmp(s, llm_effort_wire((llm_effort_t)e)) == 0)
+    {
+      *out = (llm_effort_t)e;
+      return(SUCCESS);
+    }
+
+  return(FAIL);
+}
 
 // Opaque request handle.
 typedef struct llm_request llm_request_t;
@@ -101,10 +208,11 @@ typedef struct
 // Request-level parameters. All zero fields mean "use model/config default".
 typedef struct
 {
-  float    temperature;    // 0 = model default
-  uint32_t max_tokens;     // 0 = model default (no upper bound sent)
-  uint32_t timeout_secs;   // 0 = KV default (llm.timeout_secs)
-  bool     stream;         // true -> chunk_cb is called per content delta
+  float        temperature;    // 0 = model default
+  uint32_t     max_tokens;     // 0 = model default (no upper bound sent)
+  uint32_t     timeout_secs;   // 0 = KV default (llm.timeout_secs)
+  bool         stream;         // true -> chunk_cb is called per content delta
+  llm_effort_t effort;         // UNSET = the service's reasoning_effort decides
 } llm_chat_params_t;
 
 // Response delivered to the chat completion callback. Valid for the

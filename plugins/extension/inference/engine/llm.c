@@ -867,6 +867,26 @@ llm_models_reload(void)
     m.enabled      = enabled && (enabled[0] == 't' || enabled[0] == 'T'
                                  || enabled[0] == '1');
 
+    // Per-model declared capability (LLM.md §Thinking / reasoning models).
+    // Chat only: it is a filter on a field no other kind sends. Registered
+    // here rather than at `llm add model` so a wipe-and-restore, a reload
+    // and a hand-written DB row all end up with the same slots.
+    if(m.kind == LLM_KIND_CHAT)
+    {
+      char mkey[LLM_KV_KEY_SZ];
+
+      snprintf(mkey, sizeof(mkey), "llm.model.%s.efforts", m.name);
+
+      if(!kv_exists(mkey))
+        kv_register(mkey, KV_STR, "", NULL, NULL,
+            "Reasoning-effort values this model ACCEPTS, comma-separated"
+            " (none|minimal|low|medium|high|xhigh). Declared by hand, never"
+            " probed — a provider returns quota exhaustion in the same 400"
+            " shape as a real rejection. Empty means undeclared, which is"
+            " NOT 'none allowed': an undeclared model accepts whatever the"
+            " caller's own allowlist admits and lets the provider judge.");
+    }
+
     llm_models_upsert(&m);
   }
 
@@ -1650,6 +1670,18 @@ llm_service_effort(const char *service_name)
   return((val != NULL && val[0] != '\0') ? val : NULL);
 }
 
+// The effort this request will actually send, or NULL to omit the field.
+// Precedence: the caller's explicit value, then the service KV, then
+// nothing. An explicit value overrides the KV — it does not merge with it.
+static const char *
+llm_effort_in_force(const llm_request_t *req)
+{
+  if(req->params.effort != LLM_EFFORT_UNSET)
+    return(llm_effort_wire(req->params.effort));
+
+  return(llm_service_effort(req->service_name));
+}
+
 // Emit the mutable chat-params tail (temperature / max_tokens / stream) and
 // the closing brace, applying the request's learned dialect directives: a
 // DROP omits the field, a RENAME emits it under a different wire name. Keep
@@ -1678,7 +1710,7 @@ llm_append_chat_params(llm_buf_t *b, const llm_request_t *req)
   // Optional per-service reasoning_effort (RSN-1). Kept in the params tail so
   // a DIALECT-1 negotiation retry (which rebuilds only the tail) preserves it.
   {
-    const char *reff = llm_service_effort(req->service_name);
+    const char *reff = llm_effort_in_force(req);
 
     if(reff != NULL)
       llm_buf_printf(b, ",\"reasoning_effort\":\"%s\"", reff);
@@ -2446,7 +2478,7 @@ llm_warn_empty_chat(const llm_request_t *req, long http_status)
       || req->assembled_len != 0)
     return;
 
-  reff = llm_service_effort(req->service_name);
+  reff = llm_effort_in_force(req);
 
   clam(CLAM_WARN, "llm",
       "model %s (service %s) answered 200 with no content —"
