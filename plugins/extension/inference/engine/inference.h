@@ -24,8 +24,8 @@
 #include <stddef.h>
 #include <stdint.h>
 #include <stdlib.h>   // abort
-#include <string.h>   // strcmp, strlen  (llm_effort_from_str)
-#include <strings.h>  // strncasecmp     (llm_effort_set_admits)
+#include <string.h>   // strlen          (llm_effort_set_admits)
+#include <strings.h>  // strcasecmp, strncasecmp  (both effort helpers)
 #include <time.h>
 
 // -----------------------------------------------------------------------
@@ -139,6 +139,15 @@ llm_effort_set_admits(const char *csv, llm_effort_t e)
 // llm_kind_from_str: an unrecognised string is a distinct outcome from
 // UNSET and the caller has to be able to refuse it. NULL/"" is UNSET and
 // succeeds.
+//
+// ⚠ Case-INSENSITIVE, and it has to be: this is the boundary every effort
+// string crosses — `!ask -e`, bot.<n>.reasoning_effort, plugin.ask.effort —
+// and every comparison downstream of it already folds (llm_effort_set_admits
+// here, ask_csv_contains and both default tests in ask_cmd.c). While this one
+// alone used strcmp, `-e High` was refused as an unknown value before it ever
+// reached the set it is a member of, and a KV holding `High` was WARNed and
+// dropped. The caller's case never survives the call: everything past this
+// point carries llm_effort_t and re-spells it with llm_effort_wire.
 static inline bool
 llm_effort_from_str(const char *s, llm_effort_t *out)
 {
@@ -152,7 +161,7 @@ llm_effort_from_str(const char *s, llm_effort_t *out)
   }
 
   for(int e = LLM_EFFORT_NONE; e <= LLM_EFFORT_XHIGH; e++)
-    if(strcmp(s, llm_effort_wire((llm_effort_t)e)) == 0)
+    if(strcasecmp(s, llm_effort_wire((llm_effort_t)e)) == 0)
     {
       *out = (llm_effort_t)e;
       return(SUCCESS);
