@@ -33,7 +33,7 @@
 // and per-(bot,protocol) keys are contributed dynamically at bot-create /
 // method-bind time — see ask_kv_bot_cb / ask_kv_proto_cb.
 static const plugin_kv_entry_t ask_kv_schema[] = {
-  { "plugin.ask.default",    KV_STR,    "gemini-flash3",
+  { "plugin.ask.default",    KV_STR,    "gfll",
     "Default chat model for !ask when no -m is given" },
   { "plugin.ask.allow",      KV_STR,    "*",
     "Absolute allowlist of exposable chat-model names ('*' = all enabled);"
@@ -945,7 +945,7 @@ static const char ask_cmd_help[] =
     "\n"
     "Examples:\n"
     "  !ask why is the sky blue\n"
-    "  !a -m gemini-flash3 summarize the CAP theorem\n"
+    "  !a -m gfll summarize the CAP theorem\n"
     "  !show ask";
 
 static bool
