@@ -1190,93 +1190,46 @@ chatbot_handoff_peek_other(chatbot_handoff_t *h,
 // no envelope on it. See chatbot_floor_t in chatbot.h for why this is
 // not the sticky ring wearing a hat.
 
-// Arm the channel's slot. LRU on insert, exactly as the handoff ring:
-// overflow evicts the oldest ask. Re-arming a channel that already
-// holds a slot restamps it, so the last question asked is the live one.
+// Arm the channel's slot. Re-arming restamps, so the last question
+// asked is the live one; the ring evicts LRU when a fifth channel
+// wants in.
 void
 chatbot_floor_arm(chatbot_floor_t *f, const char *channel, time_t now)
 {
-  int    idx;
-  int    free_idx;
-  int    lru_idx;
-  time_t lru_ts;
-
-  if(f == NULL || channel == NULL || channel[0] == '\0')
-    return;
+  if(f == NULL) return;
 
   pthread_mutex_lock(&f->mutex);
-
-  free_idx = -1;
-  lru_idx = 0;
-  lru_ts = f->slots[0].asked_at;
-
-  for(int i = 0; i < CHATBOT_FLOOR_SLOTS; i++)
-  {
-    chatbot_floor_slot_t *s = &f->slots[i];
-
-    if(s->channel[0] == '\0')
-    {
-      if(free_idx < 0) free_idx = i;
-      continue;
-    }
-
-    if(strcmp(s->channel, channel) == 0)
-    {
-      s->asked_at = now;
-      pthread_mutex_unlock(&f->mutex);
-      return;
-    }
-
-    if(s->asked_at < lru_ts)
-    {
-      lru_ts  = s->asked_at;
-      lru_idx = i;
-    }
-  }
-
-  idx = (free_idx >= 0) ? free_idx : lru_idx;
-  strlcpy(f->slots[idx].channel, channel, sizeof f->slots[idx].channel);
-  f->slots[idx].asked_at = now;
-
+  cooldown_ring_stamp(f->slots, CHATBOT_FLOOR_SLOTS, channel, now);
   pthread_mutex_unlock(&f->mutex);
 }
 
 // Consume the channel's slot. Returns true exactly once per armed
-// question: the slot is cleared on the way out, which is what stops a
-// television from answering the same question all evening.
+// question — the clear is what stops a television from answering the
+// same one all evening.
 bool
 chatbot_floor_take(chatbot_floor_t *f, const char *channel, time_t now,
     uint32_t window_secs)
 {
-  bool took;
+  time_t asked;
+  bool   took;
 
-  if(f == NULL || channel == NULL || channel[0] == '\0'
-      || window_secs == 0)
-    return(false);
-
-  took = false;
+  if(f == NULL || window_secs == 0) return(false);
 
   pthread_mutex_lock(&f->mutex);
 
-  for(int i = 0; i < CHATBOT_FLOOR_SLOTS; i++)
-  {
-    chatbot_floor_slot_t *s = &f->slots[i];
+  // Floored at 0 because 0 means "not armed" here, not "long ago".
+  asked = cooldown_ring_peek(f->slots, CHATBOT_FLOOR_SLOTS, channel, 0);
 
-    if(s->channel[0] == '\0' || s->asked_at == 0)      continue;
-    if(strcmp(s->channel, channel) != 0)               continue;
+  took = (asked != 0 && now >= asked
+      && (uint64_t)(now - asked) < (uint64_t)window_secs);
 
-    if(now >= s->asked_at
-        && (uint64_t)(now - s->asked_at) < (uint64_t)window_secs)
-      took = true;
-
-    // Cleared either way: an ask that timed out is spent, and a clock
-    // that went backwards is not a reason to keep one alive.
-    s->channel[0] = '\0';
-    s->asked_at   = 0;
-    break;
-  }
+  // Spent either way: an ask that timed out is over, and a clock that
+  // went backwards is not a reason to keep one alive. Clearing a key
+  // the ring never held is a no-op, so this needs no branch.
+  cooldown_ring_clear(f->slots, CHATBOT_FLOOR_SLOTS, channel);
 
   pthread_mutex_unlock(&f->mutex);
+
   return(took);
 }
 

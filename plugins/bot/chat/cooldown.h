@@ -8,18 +8,20 @@
 
 // A cooldown ring answers one question — "when did this last happen
 // here?" — over a fixed table of (key, stamp) slots scanned linearly.
-// Five of them live in this plugin: the reply cooldown and the
+// Six of them live in this plugin: the reply cooldown and the
 // witness-interject budget on chatbot_state_t, vision's channel
-// throttle and per-URL dedup, and the volunteer subject ring.
+// throttle and per-URL dedup, the volunteer subject ring, and TURN-1's
+// floor ring — the one whose read CONSUMES, which is what
+// cooldown_ring_clear is for.
 //
-// Three properties are the reason this is one module and not five
+// Three properties are the reason this is one module and not six
 // hand-rolled copies:
 //
-// - NOTHING HERE LOCKS. The owner picks the lock, because the five
-//   sit under five different ones: a shared rwlock (st->lock, read for
-//   peek and write for stamp), three dedicated mutexes, and one mutex
+// - NOTHING HERE LOCKS. The owner picks the lock, because the six
+//   sit under six different ones: a shared rwlock (st->lock, read for
+//   peek and write for stamp), four dedicated mutexes, and one mutex
 //   shared with three sibling rings that are NOT cooldown rings. A ring
-//   that owned a mutex would fit three of the five.
+//   that owned a mutex would fit four of the six.
 //
 // - MATCHING FOLDS CASE. Every key here is an IRC channel or nick, and
 //   both are case-insensitive per RFC 2812, so `#BotMan` and `#botman`
@@ -62,6 +64,12 @@ time_t cooldown_ring_peek(const cooldown_slot_t *slots, size_t n_slots,
 
 void cooldown_ring_stamp(cooldown_slot_t *slots, size_t n_slots,
     const char *key, time_t now);
+
+// Forget the key, freeing its slot. A ring whose read consumes — the
+// floor ring is the one such case — peeks, decides, and clears; a key
+// the ring never held is a no-op, so the decision needs no branch.
+void cooldown_ring_clear(cooldown_slot_t *slots, size_t n_slots,
+    const char *key);
 
 #ifdef COOLDOWN_INTERNAL
 

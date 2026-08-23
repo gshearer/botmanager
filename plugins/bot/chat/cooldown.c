@@ -79,3 +79,18 @@ cooldown_ring_stamp(cooldown_slot_t *slots, size_t n_slots,
   strlcpy(slots[slot].key, key, sizeof(slots[slot].key));
   slots[slot].stamp = now;
 }
+
+void
+cooldown_ring_clear(cooldown_slot_t *slots, size_t n_slots, const char *key)
+{
+  size_t hit;
+
+  if(key == NULL || key[0] == '\0') return;
+
+  hit = cooldown_ring_find(slots, n_slots, key);
+
+  if(hit == n_slots) return;
+
+  slots[hit].key[0] = '\0';
+  slots[hit].stamp  = 0;
+}

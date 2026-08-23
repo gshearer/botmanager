@@ -56,11 +56,27 @@ static const struct
   { "new key took the freed slot",   "d", 500 },
 };
 
+// Clearing. A ring whose read consumes — TURN-1's floor ring — peeks,
+// decides and clears unconditionally, so the no-op arms matter as much
+// as the hit: a clear that evicted the wrong slot would leave one
+// channel permanently armed and silently steal another's.
+static const struct
+{
+  const char *name;
+  const char *key;
+  time_t      want;
+} clear_cases[] = {
+  { "the cleared key is gone",        "x", 0   },
+  { "a differently-cased clear hits", "y", 0   },
+  { "the neighbour is untouched",     "z", 300 },
+};
+
 int
 main(void)
 {
   cooldown_slot_t peek_ring[RING_SLOTS];
   cooldown_slot_t evict_ring[RING_SLOTS];
+  cooldown_slot_t clear_ring[RING_SLOTS];
   cooldown_slot_t long_ring[RING_SLOTS];
 
   memset(peek_ring, 0, sizeof(peek_ring));
@@ -85,6 +101,30 @@ main(void)
         (size_t)evict_cases[i].want,
         (size_t)cooldown_ring_peek(evict_ring, RING_SLOTS,
             evict_cases[i].key, 0));
+
+  memset(clear_ring, 0, sizeof(clear_ring));
+  cooldown_ring_stamp(clear_ring, RING_SLOTS, "x", 100);
+  cooldown_ring_stamp(clear_ring, RING_SLOTS, "y", 200);
+  cooldown_ring_stamp(clear_ring, RING_SLOTS, "z", 300);
+  cooldown_ring_clear(clear_ring, RING_SLOTS, "x");
+  cooldown_ring_clear(clear_ring, RING_SLOTS, "Y");
+  cooldown_ring_clear(clear_ring, RING_SLOTS, "never-held");
+  cooldown_ring_clear(clear_ring, RING_SLOTS, NULL);
+
+  for(size_t i = 0; i < sizeof(clear_cases) / sizeof(clear_cases[0]); i++)
+    test_check_sz("clear", clear_cases[i].name,
+        (size_t)clear_cases[i].want,
+        (size_t)cooldown_ring_peek(clear_ring, RING_SLOTS,
+            clear_cases[i].key, 0));
+
+  // A cleared slot must be free for reuse, not merely unmatchable —
+  // otherwise a floor ring degrades to one usable slot per channel
+  // ever seen.
+  cooldown_ring_stamp(clear_ring, RING_SLOTS, "w", 400);
+  test_check_sz("clear", "a freed slot takes the next key", 400,
+      (size_t)cooldown_ring_peek(clear_ring, RING_SLOTS, "w", 0));
+  test_check_sz("clear", "and did not evict the neighbour", 300,
+      (size_t)cooldown_ring_peek(clear_ring, RING_SLOTS, "z", 0));
 
   memset(long_lower, 'a', sizeof(long_lower) - 1);
   memcpy(long_upper, long_lower, sizeof(long_upper));

@@ -334,18 +334,18 @@ typedef struct
 // Three bounds keep it from becoming a sticky slot by another name:
 // armed only by an outgoing line that ends in a question mark,
 // consumed on first use, and bounded by floor_window_secs.
+//
+// A cooldown.h slot table keyed on the channel — the sixth in the
+// plugin, and the one whose read CONSUMES, which is why that module
+// grew cooldown_ring_clear. 4 slots: a bot holds the floor on the
+// channel it just asked a question on, and asking on four at once and
+// being answered on the fifth is not a shape worth a bigger table.
 #define CHATBOT_FLOOR_SLOTS                    4
 
 typedef struct
 {
-  char    channel[METHOD_CHANNEL_SZ];   // empty = slot unused
-  time_t  asked_at;                     // 0 = consumed, or never armed
-} chatbot_floor_slot_t;
-
-typedef struct
-{
-  chatbot_floor_slot_t slots[CHATBOT_FLOOR_SLOTS];
-  pthread_mutex_t      mutex;
+  cooldown_slot_t slots[CHATBOT_FLOOR_SLOTS];
+  pthread_mutex_t mutex;
 } chatbot_floor_t;
 
 // VF-3 — per-target witness-interject cooldown ring. Caps the rate at
