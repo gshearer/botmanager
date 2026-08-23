@@ -1056,7 +1056,7 @@ static void
 imagine_tbl_cell(char *line, size_t cap, const char *text, int width,
     bool right)
 {
-  char cell[256];
+  char cell[IMG_CELL_SZ];
 
   strlcpy(cell, text, sizeof cell);
 
@@ -1091,7 +1091,7 @@ static void
 imagine_tbl_row(const cmd_ctx_t *ctx, const img_model_row_t *row)
 {
   char line[IMG_CMD_REPLY_SZ];
-  char cell[256];
+  char cell[IMG_CELL_SZ];
   int  left;
 
   snprintf(line, sizeof(line), "%s ",
