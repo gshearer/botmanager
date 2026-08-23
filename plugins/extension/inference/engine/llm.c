@@ -1632,6 +1632,24 @@ llm_model_params_flush_staged(llm_request_t *req)
 
 // Request body assembly
 
+// The service's reasoning_effort, or NULL when unset. Read fresh per call by
+// design — an operator retunes a shared endpoint without a restart — and the
+// pointer is KV-interned, so holding it needs no copy (include/kv.h).
+static const char *
+llm_service_effort(const char *service_name)
+{
+  char        key[LLM_KV_KEY_SZ];
+  const char *val;
+
+  if(service_name == NULL || service_name[0] == '\0')
+    return(NULL);
+
+  snprintf(key, sizeof(key), "llm.service.%s.reasoning_effort", service_name);
+  val = kv_get_str(key);
+
+  return((val != NULL && val[0] != '\0') ? val : NULL);
+}
+
 // Emit the mutable chat-params tail (temperature / max_tokens / stream) and
 // the closing brace, applying the request's learned dialect directives: a
 // DROP omits the field, a RENAME emits it under a different wire name. Keep
@@ -1657,18 +1675,12 @@ llm_append_chat_params(llm_buf_t *b, const llm_request_t *req)
       llm_buf_printf(b, ",\"%s\":%u", wf, req->params.max_tokens);
   }
 
-  // Optional per-service reasoning_effort (RSN-1). Read fresh per request so
-  // an operator can retune without a restart. Kept in the params tail so a
-  // DIALECT-1 negotiation retry (which rebuilds only the tail) preserves it.
+  // Optional per-service reasoning_effort (RSN-1). Kept in the params tail so
+  // a DIALECT-1 negotiation retry (which rebuilds only the tail) preserves it.
   {
-    char        rkey[LLM_KV_KEY_SZ];
-    const char *reff;
+    const char *reff = llm_service_effort(req->service_name);
 
-    snprintf(rkey, sizeof(rkey), "llm.service.%s.reasoning_effort",
-        req->service_name);
-    reff = kv_get_str(rkey);
-
-    if(reff != NULL && reff[0] != '\0')
+    if(reff != NULL)
       llm_buf_printf(b, ",\"reasoning_effort\":\"%s\"", reff);
   }
 
@@ -2420,6 +2432,33 @@ llm_accumulate_stats(llm_request_t *req, bool ok)
   pthread_mutex_unlock(&llm_stat_mutex);
 }
 
+// A 200 that carried no answer: the provider was reached, agreed, and said
+// nothing. On a thinking model that means the reasoning pass ate the whole
+// budget — the three wire shapes it arrives in are in LLM.md §Thinking /
+// reasoning models. Naming the effort here is the diagnosis; without it the
+// same failure went eleven hours unread.
+static void
+llm_warn_empty_chat(const llm_request_t *req, long http_status)
+{
+  const char *reff;
+
+  if(req->type != LLM_REQ_CHAT || http_status != 200
+      || req->assembled_len != 0)
+    return;
+
+  reff = llm_service_effort(req->service_name);
+
+  clam(CLAM_WARN, "llm",
+      "model %s (service %s) answered 200 with no content —"
+      " reasoning_effort=%s finish_reason=%s completion_tokens=%u."
+      " A thinking model with too small a budget spends it all thinking;"
+      " raise max_tokens or set llm.service.%s.reasoning_effort",
+      req->model_name, req->service_name,
+      reff != NULL ? reff : "(omitted)",
+      req->finish_reason[0] != '\0' ? req->finish_reason : "(none)",
+      req->completion_tokens, req->service_name);
+}
+
 // Deliver the final chat/embed callback and release the request.
 static void
 llm_deliver_chat(llm_request_t *req, bool ok, long http_status,
@@ -2433,6 +2472,8 @@ llm_deliver_chat(llm_request_t *req, bool ok, long http_status,
   // (No-op when nothing was staged, i.e. every normal request.)
   if(ok)
     llm_model_params_flush_staged(req);
+
+  llm_warn_empty_chat(req, http_status);
 
   llm_delivery_take(req, &d);
 
