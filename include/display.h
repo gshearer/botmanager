@@ -53,6 +53,17 @@
 // its inline cell reads.
 #define DISPLAY_COLS  90
 
+// The rule that decides which columns exist at all, before any of the
+// arithmetic above applies: a column whose value is identical on every row
+// carries no information, so it belongs in the header, or in the command.
+//
+// It is what lets a grid fit. `show llm models chat` drops its `kind`
+// column because the command already named the kind, and spends the width
+// on the context size it could not otherwise afford; the same table
+// refuses to carry a service's settings, which would repeat down the page.
+// A column that survives this test is one a reader can scan DOWN and learn
+// something from.
+
 // Visible columns in `s`, per the two rules above.
 size_t display_vis_len(const char *s);
 

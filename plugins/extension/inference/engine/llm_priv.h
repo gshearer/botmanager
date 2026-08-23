@@ -33,6 +33,7 @@ typedef struct
   uint64_t total_prompt_tokens;
   uint64_t total_completion_tokens;
   uint64_t total_latency_ms;
+  time_t   since;                    // when these counters started counting
 } llm_stats_t;
 
 // Lifecycle.
@@ -105,6 +106,9 @@ bool llm_tts_submit(const char *model_name, const llm_tts_params_t *params,
 uint32_t llm_cancel_user(const void *user_data);
 
 void llm_get_stats(llm_stats_t *out);
+
+// Per-model counters. Also exposed through inference.h's dlsym shim.
+bool llm_model_stats(const char *name, llm_model_stats_t *out);
 
 typedef void (*llm_iter_cb_t)(const char *model_name, llm_kind_t kind,
     bool streaming, uint32_t elapsed_secs, void *data);

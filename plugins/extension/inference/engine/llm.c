@@ -94,6 +94,33 @@ static uint64_t         llm_stat_time_ms  = 0;
 static uint32_t         llm_active_count  = 0;
 static uint32_t         llm_queued_count  = 0;
 
+// When the counters below started counting. All of this is process state, so
+// a /plugin reload inference puts it back to zero — which reads as "this
+// model has never been used" unless a renderer says what window it is
+// showing. Every one of them prints this.
+static time_t           llm_stat_since    = 0;
+
+// Per-model traffic, in a fixed table beside the global counters and under
+// the same lock: llm_accumulate_stats already holds llm_stat_mutex on every
+// delivery, so a row costs a linear scan of at most LLM_MODEL_STATS_MAX
+// inside a critical section that was already entered.
+//
+// A full table drops the sample. Sixty-four is four times the live registry,
+// and this is telemetry rather than accounting — growing it would put an
+// allocation on the delivery path for a row nobody has needed yet.
+#define LLM_MODEL_STATS_MAX  64
+
+typedef struct
+{
+  char     name[LLM_MODEL_NAME_SZ];
+  uint64_t requests;        // every delivery, ok or not
+  uint64_t errors;          // deliveries with ok == false
+  uint64_t ok_latency_ms;   // summed over the ok ones ONLY
+} llm_model_stat_t;
+
+static llm_model_stat_t llm_model_stats_tbl[LLM_MODEL_STATS_MAX];
+static uint32_t         llm_model_stats_n = 0;
+
 // Small utilities
 
 bool
@@ -2446,6 +2473,43 @@ llm_curl_chunk_cb(const curl_response_t *partial, const char *chunk,
 
 static bool llm_issue_request(llm_request_t *req);
 
+// Per-model half of the accumulation below. Caller holds llm_stat_mutex.
+//
+// Find-or-insert on the registered name: a `llm del model` + `llm add model`
+// keeps the counters, which is right — this is traffic, not configuration.
+static void
+llm_model_stat_bump(const char *name, bool ok, uint64_t ms)
+{
+  llm_model_stat_t *m = NULL;
+
+  for(uint32_t i = 0; i < llm_model_stats_n; i++)
+    if(strcmp(llm_model_stats_tbl[i].name, name) == 0)
+    {
+      m = &llm_model_stats_tbl[i];
+      break;
+    }
+
+  if(m == NULL)
+  {
+    // A full table drops the sample silently rather than allocating on the
+    // delivery path; the renderer's own row count is what would say so.
+    if(llm_model_stats_n >= LLM_MODEL_STATS_MAX)
+      return;
+
+    m = &llm_model_stats_tbl[llm_model_stats_n++];
+    strlcpy(m->name, name, sizeof m->name);
+  }
+
+  m->requests++;
+
+  // A failed request's elapsed time is a timeout, not a speed: averaging it
+  // in makes a healthy model look slow.
+  if(ok)
+    m->ok_latency_ms += ms;
+  else
+    m->errors++;
+}
+
 // Stats accumulation on final response.
 static void
 llm_accumulate_stats(llm_request_t *req, bool ok)
@@ -2462,6 +2526,8 @@ llm_accumulate_stats(llm_request_t *req, bool ok)
   llm_stat_prompt  += req->prompt_tokens;
   llm_stat_compl   += req->completion_tokens;
   llm_stat_time_ms += ms;
+
+  llm_model_stat_bump(req->model_name, ok, ms);
 
   pthread_mutex_unlock(&llm_stat_mutex);
 }
@@ -3498,6 +3564,7 @@ llm_get_stats(llm_stats_t *out)
   out->total_prompt_tokens      = llm_stat_prompt;
   out->total_completion_tokens  = llm_stat_compl;
   out->total_latency_ms         = llm_stat_time_ms;
+  out->since                    = llm_stat_since;
   pthread_mutex_unlock(&llm_stat_mutex);
 
   pthread_mutex_lock(&llm_active_mutex);
@@ -3505,6 +3572,38 @@ llm_get_stats(llm_stats_t *out)
   pthread_mutex_unlock(&llm_active_mutex);
 
   out->queued = llm_queued_count;
+}
+
+// FAIL means this model has no row, which is NOT the same as zero requests:
+// a registered model that has never run was never inserted. `out->since` is
+// filled either way, so a caller can report the window whatever it finds.
+bool
+llm_model_stats(const char *name, llm_model_stats_t *out)
+{
+  bool found = false;
+
+  if(name == NULL || out == NULL)
+    return(FAIL);
+
+  memset(out, 0, sizeof(*out));
+
+  pthread_mutex_lock(&llm_stat_mutex);
+
+  for(uint32_t i = 0; i < llm_model_stats_n; i++)
+    if(strcmp(llm_model_stats_tbl[i].name, name) == 0)
+    {
+      out->requests      = llm_model_stats_tbl[i].requests;
+      out->errors        = llm_model_stats_tbl[i].errors;
+      out->ok_latency_ms = llm_model_stats_tbl[i].ok_latency_ms;
+      found              = true;
+      break;
+    }
+
+  out->since = llm_stat_since;
+
+  pthread_mutex_unlock(&llm_stat_mutex);
+
+  return(found ? SUCCESS : FAIL);
 }
 
 void
@@ -3751,6 +3850,8 @@ llm_init(void)
   llm_cfg.max_context_tokens = LLM_DEF_MAX_CONTEXT;
   llm_cfg.streaming_idle_ms  = LLM_DEF_STREAMING_IDLE_MS;
   llm_cfg.embed_submit_wait_ms = LLM_DEF_EMBED_SUBMIT_WAIT_MS;
+
+  llm_stat_since = time(NULL);
 
   plugin_unmap_notify_register(llm_unmap_cb, NULL);
 

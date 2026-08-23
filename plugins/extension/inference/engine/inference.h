@@ -342,6 +342,28 @@ typedef void (*llm_model_iter_cb_t)(const char *name, llm_kind_t kind,
     bool enabled, void *user);
 #endif
 
+// What one model's traffic has actually looked like, from llm_model_stats().
+//
+// ⛔ These do NOT belong on llm_model_iter_cb_t above: it is a public
+// function-pointer type, and appending a parameter breaks every consumer
+// silently at the ABI. A by-name lookup is the whole reason this is a
+// second call.
+//
+// The mean is ok_latency_ms / (requests - errors) — a failed request's
+// elapsed time is a timeout, not a speed. Guard the divide: requests ==
+// errors is a model that has only ever failed.
+//
+// `since` is when the engine started counting, which is when the plugin
+// loaded. Print it: a reload zeroes the table, and a caller that reports
+// the numbers without the window invites them to be read as history.
+typedef struct
+{
+  uint64_t requests;
+  uint64_t errors;
+  uint64_t ok_latency_ms;
+  time_t   since;
+} llm_model_stats_t;
+
 // -----------------------------------------------------------------------
 // Knowledge types
 // -----------------------------------------------------------------------
@@ -686,6 +708,32 @@ llm_model_kind(const char *name, llm_kind_t *out)
     if(u.obj == NULL)
     {
       clam(CLAM_FATAL, "inference", "dlsym failed: llm_model_kind");
+      abort();
+    }
+    fn = u.fn;
+    __atomic_store_n(&cached, fn, __ATOMIC_RELEASE);
+  }
+  return(fn(name, out));
+}
+
+// SUCCESS with *out filled if this model has been seen since *out.since;
+// FAIL if it has not, which is NOT the same as zero requests — a registered
+// model that has never run has no row. `out->since` is filled either way.
+static inline bool
+llm_model_stats(const char *name, llm_model_stats_t *out)
+{
+  typedef bool (*fn_t)(const char *, llm_model_stats_t *);
+  static fn_t cached = NULL;
+  fn_t        fn     = __atomic_load_n(&cached, __ATOMIC_ACQUIRE);
+
+  if(fn == NULL)
+  {
+    union { void *obj; fn_t fn; } u;
+
+    u.obj = plugin_dlsym_cached("inference", "llm_model_stats", (void **)&cached);
+    if(u.obj == NULL)
+    {
+      clam(CLAM_FATAL, "inference", "dlsym failed: llm_model_stats");
       abort();
     }
     fn = u.fn;

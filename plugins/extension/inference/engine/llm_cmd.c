@@ -7,6 +7,7 @@
 #include "cmd.h"
 #include "colors.h"
 #include "db.h"
+#include "display.h"
 #include "json.h"
 #include "method.h"
 #include "userns.h"
@@ -51,53 +52,453 @@ llm_model_id_canon(const char *model_id)
   return(model_id);
 }
 
+// -----------------------------------------------------------------------
+// The model table
+//
+// One grid, two layouts. `show llm models` is a survey across every kind
+// and leads with `kind`; `show llm models chat` drops that column — the
+// command already said it — and spends what it saved on `ctx`. The two
+// layouts cost exactly the same, which is why one elastic budget serves
+// both.
+//
+// The rule behind every column here: a column whose value is identical on
+// every row carries no information, so it belongs in the header or in the
+// command. It is also why the per-service settings — reasoning_effort,
+// priority — are not in this table. They would repeat down the page; they
+// live on llm_service_line instead.
+// -----------------------------------------------------------------------
+
+#define LLM_LIST_MAX_ROWS  64
+#define LLM_EFFORTS_SZ     128
+
+// Column widths, measured against the live registry. The lead gutter is
+// two glyph slots — the default star and the disabled cross — plus the
+// space that separates it from the first cell.
+#define LLM_TBL_LEAD    3
+#define LLM_TBL_SVC    13     // "hiigara-image"
+#define LLM_TBL_NAME    9     // "gpt56luna"
+#define LLM_TBL_MID     6     // `kind` in the survey, `ctx`/`dim` when filtered
+#define LLM_TBL_REQ     5
+#define LLM_TBL_ERR     4
+#define LLM_TBL_AVG     6     // "123.4s"
+#define LLM_TBL_SEP     2
+
+// The model id is elastic and takes whatever is left of DISPLAY_COLS —
+// thirty-one columns when every cell before it fits its own, comfortably
+// past the twenty-six of "RadixArk/Qwen3.8-27B-NVFP4".
+
 typedef struct
 {
-  const cmd_ctx_t *ctx;
-  uint32_t         count;
+  char       name[LLM_MODEL_NAME_SZ];
+  char       service[LLM_MODEL_NAME_SZ];
+  char       model_id[LLM_MODEL_ID_SZ];
+  char       efforts[LLM_EFFORTS_SZ];   // the declared set; "" is UNDECLARED
+  llm_kind_t kind;
+  uint32_t   embed_dim;
+  uint32_t   max_context;
+  bool       enabled;
+  bool       is_default;                // an engine default names this model
+  bool       thinking_only;             // a declared set that refuses "none"
+  uint64_t   requests;
+  uint64_t   errors;
+  uint64_t   ok_latency_ms;
+} llm_list_row_t;
+
+typedef struct
+{
+  bool           filtered;
+  llm_kind_t     want;
+  uint32_t       count;                 // matched, including rows not stored
+  uint32_t       n_rows;
+  llm_list_row_t rows[LLM_LIST_MAX_ROWS];
 } llm_list_state_t;
 
+// Snapshot only. llm_model_iterate runs this under the models rwlock, and
+// everything else a row needs — the KV declarations, the per-model
+// counters — takes a lock of its own, so those wait for llm_list_annotate
+// below. One walk, never two: a second one retakes the rwlock and can see
+// a different set of models.
 static void
 llm_list_iter_cb(const char *name, llm_kind_t kind,
     const char *service_name, const char *model_id, uint32_t embed_dim,
     uint32_t max_context, float default_temp, bool enabled, void *user)
 {
-  llm_list_state_t *st;
-  char line[1024];  // fits service name + model_id + name + prefix bits
-  char dim_col[32];
+  llm_list_state_t *st = user;
+  llm_list_row_t   *row;
   (void)default_temp;
-  st = user;
 
-  // Only embed models have a meaningful dim — chat models carry 0.
-  if(kind == LLM_KIND_EMBED)
-    snprintf(dim_col, sizeof(dim_col), "dim=%u  ", embed_dim);
-  else
-    dim_col[0] = '\0';
+  if(st->filtered && kind != st->want)
+    return;
 
-  snprintf(line, sizeof(line),
-      "%s  %-5s  %s  %s  id=%s  %sctx=%u",
-      enabled ? "on " : "off",
-      llm_kind_to_str(kind),
-      name,
-      service_name,
-      model_id,
-      dim_col,
-      max_context);
-
-  cmd_reply(st->ctx, line);
   st->count++;
+
+  if(st->n_rows >= LLM_LIST_MAX_ROWS)
+    return;
+
+  row = &st->rows[st->n_rows++];
+  memset(row, 0, sizeof(*row));
+
+  strlcpy(row->name,     name,         sizeof row->name);
+  strlcpy(row->service,  service_name, sizeof row->service);
+  strlcpy(row->model_id, model_id,     sizeof row->model_id);
+
+  row->kind        = kind;
+  row->embed_dim   = embed_dim;
+  row->max_context = max_context;
+  row->enabled     = enabled;
+}
+
+static void
+llm_list_annotate(llm_list_state_t *st)
+{
+  // Interned, so both pointers outlive the loop (include/kv.h).
+  const char *def_chat  = kv_get_str("llm.default_chat_model");
+  const char *def_embed = kv_get_str("llm.default_embed_model");
+
+  for(uint32_t i = 0; i < st->n_rows; i++)
+  {
+    llm_list_row_t   *row = &st->rows[i];
+    llm_model_stats_t stats;
+    char              key[LLM_KV_KEY_SZ];
+    const char       *csv;
+
+    // ⛔ Only the engine's own two knobs may star a row. plugin.imagine
+    // .default looks like the missing third and is not ours: it belongs to
+    // a plugin above this one (PLUGIN.md §Layer Rules), and `show imagine`
+    // stars it from inside that plugin, where it belongs.
+    if(row->kind == LLM_KIND_CHAT)
+      row->is_default = def_chat != NULL && strcmp(def_chat, row->name) == 0;
+
+    else if(row->kind == LLM_KIND_EMBED)
+      row->is_default = def_embed != NULL && strcmp(def_embed, row->name) == 0;
+
+    if(row->kind == LLM_KIND_CHAT)
+    {
+      snprintf(key, sizeof(key), "llm.model.%s.efforts", row->name);
+      csv = kv_get_str(key);
+
+      if(csv != NULL)
+        strlcpy(row->efforts, csv, sizeof row->efforts);
+
+      // An empty set is UNDECLARED and admits everything, so it says
+      // nothing about `none` either way. Only a populated set that refuses
+      // it means the provider will not take the field omitted — which is
+      // the 200-with-empty-content failure the engine warns about after
+      // the fact, and this is where a reader sees it coming.
+      row->thinking_only = row->efforts[0] != '\0'
+          && !llm_effort_set_admits(row->efforts, LLM_EFFORT_NONE);
+    }
+
+    if(llm_model_stats(row->name, &stats) == SUCCESS)
+    {
+      row->requests      = stats.requests;
+      row->errors        = stats.errors;
+      row->ok_latency_ms = stats.ok_latency_ms;
+    }
+  }
+}
+
+// One fixed-width cell plus the grid's separator. The cell arrives already
+// coloured: markers count no columns, so padding sees through them
+// (include/display.h).
+static void
+llm_tbl_cell(char *line, size_t cap, const char *text, int width, bool right)
+{
+  char cell[256];
+
+  strlcpy(cell, text, sizeof cell);
+
+  if(right)
+    display_align_right(cell, sizeof cell, width);
+  else
+    display_align_left(cell, sizeof cell, width);
+
+  display_cat(line, cap, cell);
+  display_cat(line, cap, "  ");
+}
+
+// `llm  ·  chat models` on the left, the counter window on the right. The
+// window is not decoration: a /plugin reload inference zeroes every number
+// under it, and a table that does not say so reads as history.
+static void
+llm_list_emit_title(const cmd_ctx_t *ctx, const llm_list_state_t *st,
+    time_t since)
+{
+  char      left[128];
+  char      when[48];
+  char      line[256];
+  struct tm tm;
+  size_t    pad;
+
+  snprintf(left, sizeof(left), CLR_BOLD "llm" CLR_RESET "  ·  %s models",
+      st->filtered ? llm_kind_to_str(st->want) : "registered");
+
+  when[0] = '\0';
+
+  if(since > 0 && localtime_r(&since, &tm) != NULL)
+    strftime(when, sizeof(when), "counters since %H:%M", &tm);
+
+  if(when[0] == '\0')
+  {
+    cmd_reply(ctx, left);
+    return;
+  }
+
+  pad = DISPLAY_COLS - display_vis_len(left) - strlen(when);
+
+  // Unsigned, so a title wider than the house width comes out enormous
+  // rather than negative. One space is the floor either way.
+  if(pad == 0 || pad > DISPLAY_COLS)
+    pad = 1;
+
+  snprintf(line, sizeof(line), "%s%*s" CLR_GRAY "%s" CLR_RESET,
+      left, (int)pad, "", when);
+  cmd_reply(ctx, line);
+}
+
+static void
+llm_list_emit_head(const cmd_ctx_t *ctx, const llm_list_state_t *st)
+{
+  char line[512];
+
+  // Indent first, emphasis second: cmd_reply_table_head reads the margin
+  // off the head with strspn, and a leading colour marker would hide it.
+  snprintf(line, sizeof(line), "%*s" CLR_BOLD, LLM_TBL_LEAD, "");
+
+  if(!st->filtered)
+    llm_tbl_cell(line, sizeof(line), "kind", LLM_TBL_MID, false);
+
+  llm_tbl_cell(line, sizeof(line), "service", LLM_TBL_SVC,  false);
+  llm_tbl_cell(line, sizeof(line), "model",   LLM_TBL_NAME, false);
+
+  if(st->filtered)
+    llm_tbl_cell(line, sizeof(line),
+        st->want == LLM_KIND_EMBED ? "dim" : "ctx", LLM_TBL_MID, true);
+
+  llm_tbl_cell(line, sizeof(line), "req", LLM_TBL_REQ, true);
+  llm_tbl_cell(line, sizeof(line), "err", LLM_TBL_ERR, true);
+  llm_tbl_cell(line, sizeof(line), "avg", LLM_TBL_AVG, true);
+  display_cat(line, sizeof(line), "model id" CLR_RESET);
+  cmd_reply_table_head(ctx, line);
+}
+
+// The declared effort set, under its model's row.
+//
+// At twenty-three columns a set costs more than the three counters together
+// and is empty for four of the five kinds, so it is not a column. Truncating
+// it into a column is worse than a second line: `low medium high minimal`
+// cut to twelve reads `low medium…`, which is nothing a caller can type
+// into `!ask -e`.
+static void
+llm_list_emit_thinking(const cmd_ctx_t *ctx, const llm_list_state_t *st,
+    const llm_list_row_t *row)
+{
+  char set[LLM_EFFORTS_SZ];
+  char line[256];
+  int  indent = LLM_TBL_LEAD + LLM_TBL_SVC + LLM_TBL_SEP
+      + (st->filtered ? 0 : LLM_TBL_MID + LLM_TBL_SEP);
+
+  // Space-separated so it reads as a set rather than a CSV to paste back,
+  // and otherwise verbatim: an unrecognised token is the operator's typo,
+  // and swallowing it here hides the refusal `!ask -e` will hand back.
+  strlcpy(set, row->efforts, sizeof set);
+
+  for(char *p = set; *p != '\0'; p++)
+    if(*p == ',')
+      *p = ' ';
+
+  snprintf(line, sizeof(line), "%*s" CLR_GRAY "thinking:" CLR_RESET " %s%s",
+      indent, "", set,
+      row->thinking_only ? "  " CLR_YELLOW "⚠" CLR_RESET : "");
+  cmd_reply(ctx, line);
+}
+
+static void
+llm_list_emit_row(const cmd_ctx_t *ctx, const llm_list_state_t *st,
+    const llm_list_row_t *row)
+{
+  char line[512];
+  char cell[256];
+  int  left;
+
+  // The lead gutter carries two independent facts: a model an engine
+  // default points at, and a model an operator has switched off. Both at
+  // once is a broken config, and it shows as both.
+  snprintf(line, sizeof(line), "%s%s ",
+      row->is_default ? CLR_YELLOW "★" CLR_RESET : " ",
+      row->enabled    ? " " : CLR_RED "✗" CLR_RESET);
+
+  if(!st->filtered)
+  {
+    snprintf(cell, sizeof(cell), CLR_GRAY "%s" CLR_RESET,
+        llm_kind_to_str(row->kind));
+    llm_tbl_cell(line, sizeof(line), cell, LLM_TBL_MID, false);
+  }
+
+  snprintf(cell, sizeof(cell), CLR_CYAN "%s" CLR_RESET, row->service);
+  llm_tbl_cell(line, sizeof(line), cell, LLM_TBL_SVC, false);
+
+  snprintf(cell, sizeof(cell), CLR_WHITE "%s" CLR_RESET, row->name);
+  llm_tbl_cell(line, sizeof(line), cell, LLM_TBL_NAME, false);
+
+  // An embed model's vector width is the fact worth this column; every
+  // other kind wants its context size.
+  if(st->filtered)
+  {
+    snprintf(cell, sizeof(cell), "%u",
+        row->kind == LLM_KIND_EMBED ? row->embed_dim : row->max_context);
+    llm_tbl_cell(line, sizeof(line), cell, LLM_TBL_MID, true);
+  }
+
+  if(row->requests > 0)
+    snprintf(cell, sizeof(cell), "%" PRIu64, row->requests);
+  else
+    strlcpy(cell, CLR_GRAY "—" CLR_RESET, sizeof cell);
+
+  llm_tbl_cell(line, sizeof(line), cell, LLM_TBL_REQ, true);
+
+  if(row->errors > 0)
+    snprintf(cell, sizeof(cell), CLR_RED "%" PRIu64 CLR_RESET, row->errors);
+  else
+    strlcpy(cell, row->requests > 0 ? "0" : CLR_GRAY "—" CLR_RESET,
+        sizeof cell);
+
+  llm_tbl_cell(line, sizeof(line), cell, LLM_TBL_ERR, true);
+
+  // The mean excludes failures, so a model that has only ever failed has no
+  // mean to report — and that is the divide-by-zero guard as well.
+  //
+  // Milliseconds below a second: an embed round trip is tens of them, and
+  // one decimal of seconds renders the whole embed table as "0.0s".
+  if(row->requests > row->errors)
+  {
+    uint64_t mean = row->ok_latency_ms / (row->requests - row->errors);
+
+    if(mean < 1000)
+      snprintf(cell, sizeof(cell), "%" PRIu64 "ms", mean);
+    else
+      snprintf(cell, sizeof(cell), "%.1fs", (double)mean / 1000.0);
+  }
+
+  else
+    strlcpy(cell, CLR_GRAY "—" CLR_RESET, sizeof cell);
+
+  llm_tbl_cell(line, sizeof(line), cell, LLM_TBL_AVG, true);
+
+  // Measured rather than assumed: display_align_left lets a cell wider than
+  // its column win, by design (include/display.h), so a long model name
+  // shifts everything right of it. The id is the column that pays for that.
+  // ⚠ One column off the budget for the ellipsis: display_fit reserves its
+  // mark out of the BYTE budget, not the column budget, and a last cell has
+  // no padding to absorb the extra.
+  left = DISPLAY_COLS - (int)display_vis_len(line) - 1;
+
+  display_fit(row->model_id, left > 1 ? left : 1, cell, sizeof(cell), "…");
+  display_cat(line, sizeof(line), CLR_GRAY);
+  display_cat(line, sizeof(line), cell);
+  display_cat(line, sizeof(line), CLR_RESET);
+  cmd_reply(ctx, line);
+
+  if(row->efforts[0] != '\0')
+    llm_list_emit_thinking(ctx, st, row);
+}
+
+static void
+llm_list_emit_legend(const cmd_ctx_t *ctx, const llm_list_state_t *st)
+{
+  bool marks   = false;
+  bool warn    = false;
+  bool undecl  = false;
+  char line[256];
+
+  for(uint32_t i = 0; i < st->n_rows; i++)
+  {
+    const llm_list_row_t *row = &st->rows[i];
+
+    marks  = marks || row->is_default || !row->enabled;
+    warn   = warn  || row->thinking_only;
+    undecl = undecl
+        || (row->kind == LLM_KIND_CHAT && row->efforts[0] == '\0');
+  }
+
+  if(marks || warn)
+  {
+    snprintf(line, sizeof(line), "  " CLR_GRAY "%s%s%s" CLR_RESET,
+        marks ? "★ default · ✗ disabled" : "",
+        marks && warn ? " · " : "",
+        warn ? "⚠ thinking-only: omitting the field returns empty" : "");
+    cmd_reply(ctx, line);
+  }
+
+  // ⚠ Absent means UNDECLARED, not "accepts nothing". Without this line a
+  // reader draws the opposite conclusion from a blank.
+  if(undecl)
+    cmd_reply(ctx, "  " CLR_GRAY "a model with no thinking line has no"
+        " declared effort set — not \"none accepted\"" CLR_RESET);
+}
+
+static void
+llm_render_models(const cmd_ctx_t *ctx, bool filtered, llm_kind_t want)
+{
+  llm_list_state_t st;
+  llm_stats_t      window;
+  char             line[256];
+
+  st = (llm_list_state_t){ .filtered = filtered, .want = want };
+
+  llm_model_iterate(llm_list_iter_cb, &st);
+  llm_list_annotate(&st);
+
+  llm_get_stats(&window);
+  llm_list_emit_title(ctx, &st, window.since);
+
+  if(st.n_rows == 0)
+  {
+    if(filtered)
+      snprintf(line, sizeof(line), "  " CLR_GRAY "(no %s models registered)"
+          CLR_RESET, llm_kind_to_str(want));
+    else
+      strlcpy(line, "  " CLR_GRAY "(none)" CLR_RESET, sizeof line);
+
+    cmd_reply(ctx, line);
+    return;
+  }
+
+  llm_list_emit_head(ctx, &st);
+
+  for(uint32_t i = 0; i < st.n_rows; i++)
+    llm_list_emit_row(ctx, &st, &st.rows[i]);
+
+  // ⛔ Never silently: a cut-off table reads as "that is all of them".
+  if(st.count > st.n_rows)
+  {
+    snprintf(line, sizeof(line), "  " CLR_GRAY "… +%u more" CLR_RESET,
+        st.count - st.n_rows);
+    cmd_reply(ctx, line);
+  }
+
+  llm_list_emit_legend(ctx, &st);
 }
 
 static void
 cmd_llm_list(const cmd_ctx_t *ctx)
 {
-  llm_list_state_t st = { .ctx = ctx, .count = 0 };
+  llm_kind_t want     = LLM_KIND_CHAT;
+  bool       filtered = false;
 
-  cmd_reply(ctx, "registered llm models:");
-  llm_model_iterate(llm_list_iter_cb, &st);
+  if(ctx->parsed != NULL && ctx->parsed->argc > 0)
+  {
+    // Same closed vocabulary, refused in the same words as `llm add model`.
+    if(llm_kind_from_str(ctx->parsed->argv[0], &want) != SUCCESS)
+    {
+      cmd_reply(ctx, "error: type must be 'chat', 'embed', 'image', 'stt' or 'tts'");
+      return;
+    }
 
-  if(st.count == 0)
-    cmd_reply(ctx, "  (none)");
+    filtered = true;
+  }
+
+  llm_render_models(ctx, filtered, want);
 }
 
 // -----------------------------------------------------------------------
@@ -1374,61 +1775,93 @@ static void
 llm_show_iter_cb(const char *model_name, llm_kind_t kind, bool streaming,
     uint32_t elapsed_secs, void *data)
 {
-  llm_list_state_t *st = data;
+  const cmd_ctx_t *ctx = data;
   char line[256];
 
   snprintf(line, sizeof(line),
-      "  %-5s  %s  streaming=%s  elapsed=%us",
-      llm_kind_to_str(kind),
-      model_name,
-      streaming ? "y" : "n",
+      "    " CLR_WHITE "%-*s" CLR_RESET " " CLR_GRAY "%-*s" CLR_RESET
+      "  %s  elapsed %us",
+      LLM_TBL_NAME, model_name,
+      LLM_TBL_MID, llm_kind_to_str(kind),
+      streaming ? "streaming" : "buffered",
       elapsed_secs);
 
-  cmd_reply(st->ctx, line);
-  st->count++;
+  cmd_reply(ctx, line);
+}
+
+// Both registries are short lists read under their own rwlock, so these are
+// snapshots rather than promises — which is all the header line claims.
+static uint32_t
+llm_service_count(void)
+{
+  uint32_t n = 0;
+
+  pthread_rwlock_rdlock(&llm_services_lock);
+
+  for(const llm_service_t *s = llm_services_head; s != NULL; s = s->next)
+    n++;
+
+  pthread_rwlock_unlock(&llm_services_lock);
+
+  return(n);
+}
+
+static uint32_t
+llm_model_count(void)
+{
+  uint32_t n = 0;
+
+  pthread_rwlock_rdlock(&llm_models_lock);
+
+  for(const llm_model_t *m = llm_models_head; m != NULL; m = m->next)
+    n++;
+
+  pthread_rwlock_unlock(&llm_models_lock);
+
+  return(n);
 }
 
 static void
 cmd_show_llm(const cmd_ctx_t *ctx)
 {
   llm_stats_t s;
-  char buf[512];
+  char        buf[512];
+  char        when[48];
+  struct tm   tm;
+  uint64_t    avg_ms;
 
-  uint64_t avg_ms;
-  llm_list_state_t models;
   llm_get_stats(&s);
 
   avg_ms = s.total_requests > 0
       ? s.total_latency_ms / s.total_requests : 0;
 
+  when[0] = '\0';
+
+  if(s.since > 0 && localtime_r(&s.since, &tm) != NULL)
+    strftime(when, sizeof(when), "   since %H:%M", &tm);
+
   snprintf(buf, sizeof(buf),
-      "llm: %u active, %lu requests, %lu errors, %lu retries, avg %lu ms",
-      s.active,
-      (unsigned long)s.total_requests,
-      (unsigned long)s.total_errors,
-      (unsigned long)s.total_retries,
-      (unsigned long)avg_ms);
+      CLR_BOLD "llm" CLR_RESET "  ·  %u services, %u models, %u in flight",
+      llm_service_count(), llm_model_count(), s.active);
   cmd_reply(ctx, buf);
 
   snprintf(buf, sizeof(buf),
-      "  tokens: prompt=%lu completion=%lu",
-      (unsigned long)s.total_prompt_tokens,
-      (unsigned long)s.total_completion_tokens);
+      "  traffic : %" PRIu64 " requests · %" PRIu64 " errors · %" PRIu64
+      " retries · avg %" PRIu64 " ms" CLR_GRAY "%s" CLR_RESET,
+      s.total_requests, s.total_errors, s.total_retries, avg_ms, when);
   cmd_reply(ctx, buf);
 
-  cmd_reply(ctx, "models:");
-  models = (llm_list_state_t){ .ctx = ctx, .count = 0 };
-  llm_model_iterate(llm_list_iter_cb, &models);
-  if(models.count == 0)
-    cmd_reply(ctx, "  (none)");
+  snprintf(buf, sizeof(buf),
+      "  tokens  : %" PRIu64 " prompt · %" PRIu64 " completion",
+      s.total_prompt_tokens, s.total_completion_tokens);
+  cmd_reply(ctx, buf);
+
+  llm_render_models(ctx, false, LLM_KIND_CHAT);
 
   if(s.active > 0)
   {
-    llm_list_state_t st;
-    cmd_reply(ctx, "in-flight:");
-
-    st = (llm_list_state_t){ .ctx = ctx, .count = 0 };
-    llm_iterate_active(llm_show_iter_cb, &st);
+    cmd_reply(ctx, CLR_BOLD "  in flight" CLR_RESET);
+    llm_iterate_active(llm_show_iter_cb, (void *)ctx);
   }
 }
 
@@ -1441,9 +1874,11 @@ llm_service_line(const cmd_ctx_t *ctx, const char *name, const char *base,
 {
   char        key[LLM_KV_KEY_SZ];
   const char *token;
+  const char *effort;
   bool        key_set;
   long        probe;
   char        note[96];
+  char        eff[64];
   char        line[768];
   if(name == NULL)
     return;
@@ -1451,6 +1886,17 @@ llm_service_line(const cmd_ctx_t *ctx, const char *name, const char *base,
   snprintf(key, sizeof(key), "llm.service.%s.creds.apikey", name);
   token   = kv_get_str(key);
   key_set = token != NULL && token[0] != '\0';
+
+  // reasoning_effort is per SERVICE, so it belongs here and not in the
+  // model table, where it would repeat down the page. This line is
+  // free-form and deliberately not on DISPLAY_COLS; one short token is
+  // what it can afford.
+  snprintf(key, sizeof(key), "llm.service.%s.reasoning_effort", name);
+  effort = kv_get_str(key);
+  eff[0] = '\0';
+
+  if(effort != NULL && effort[0] != '\0')
+    snprintf(eff, sizeof(eff), "  effort=%s", effort);
 
   // Translate the last /models probe status into an at-a-glance note.
   // -1 = never probed; 0 = transport failure; 401/403 = auth wall.
@@ -1468,13 +1914,14 @@ llm_service_line(const cmd_ctx_t *ctx, const char *name, const char *base,
   snprintf(line, sizeof(line),
       CLR_BOLD "%s" CLR_RESET "  " CLR_GRAY "%s" CLR_RESET
       "  " CLR_CYAN "models=%s" CLR_RESET "  defined=%s  key=%s%s" CLR_RESET
-      "  " CLR_GRAY "refreshed=%s" CLR_RESET "%s",
+      "%s  " CLR_GRAY "refreshed=%s" CLR_RESET "%s",
       name,
       base ? base : "",
       cached ? cached : "0",
       defined ? defined : "0",
       key_set ? CLR_GREEN : CLR_RED,
       key_set ? "set" : "unset",
+      eff,
       (refreshed && refreshed[0]) ? refreshed : "never",
       note);
 
@@ -1540,10 +1987,10 @@ cmd_show_llm_service_models(const cmd_ctx_t *ctx, const char *name)
 static void
 cmd_show_llm_service_summary(const cmd_ctx_t *ctx, const char *where_name)
 {
-  db_result_t     *res;
-  char             sql[1024];
-  llm_list_state_t st = { .ctx = ctx, .count = 0 };
-  char             where[128];
+  db_result_t *res;
+  char         sql[1024];
+  char         where[128];
+  uint32_t     shown = 0;
 
   where[0] = '\0';
 
@@ -1580,13 +2027,13 @@ cmd_show_llm_service_summary(const cmd_ctx_t *ctx, const char *where_name)
           db_result_get(res, r, 0), db_result_get(res, r, 1),
           db_result_get(res, r, 2), db_result_get(res, r, 3),
           db_result_get(res, r, 4), db_result_get(res, r, 5));
-      st.count++;
+      shown++;
     }
   }
 
   db_result_free(res);
 
-  if(st.count == 0)
+  if(shown == 0)
   {
     if(where_name != NULL)
       cmd_reply(ctx, "error: no such service");
@@ -1654,6 +2101,10 @@ static const cmd_arg_desc_t ad_llm_probe[] = {
 static const cmd_arg_desc_t ad_llm_test[] = {
   { "name",   CMD_ARG_NONE, CMD_ARG_REQUIRED,                LLM_MODEL_NAME_SZ - 1, NULL },
   { "prompt", CMD_ARG_NONE, CMD_ARG_OPTIONAL | CMD_ARG_REST, 0,                     NULL },
+};
+
+static const cmd_arg_desc_t ad_show_models[] = {
+  { "type", CMD_ARG_NONE, CMD_ARG_OPTIONAL, 16, NULL },
 };
 
 static const cmd_arg_desc_t ad_show_service[] = {
@@ -1772,12 +2223,24 @@ llm_register_commands(void)
       USERNS_GROUP_ADMIN, 100, CMD_SCOPE_ANY, METHOD_T_ANY,
       cmd_show_llm, NULL, "show", "llm", NULL, 0, NULL, NULL);
 
+  // ⭐ The one verb in this file that is not admin (operator's ruling,
+  // 2026-08-23). It prints service names, model names, model ids and
+  // context sizes — no URL and no key, both of which live on
+  // llm_service_line, which is not this renderer. Every other command
+  // registered here stays USERNS_GROUP_ADMIN, `show llm` included: a
+  // parent's group does not gate a child's, since dispatch and
+  // cmd_permits both read the resolved leaf (core/cmd.c) and neither
+  // walks ancestors. ⚠ `user` is not `everyone` — an unidentified caller
+  // is refused with not_authenticated, which is a named refusal telling
+  // them to identify rather than a missing surface.
   cmd_register("llm", "models",
-      "show llm models",
-      "List registered LLM models",
+      "show llm models [type]",
+      "List registered LLM models, optionally one kind",
       NULL,
-      USERNS_GROUP_ADMIN, 100, CMD_SCOPE_ANY, METHOD_T_ANY,
-      cmd_llm_list, NULL, "show/llm", "m", NULL, 0, NULL, NULL);
+      USERNS_GROUP_USER, 0, CMD_SCOPE_ANY, METHOD_T_ANY,
+      cmd_llm_list, NULL, "show/llm", "m", ad_show_models,
+      (uint8_t)(sizeof(ad_show_models) / sizeof(ad_show_models[0])),
+      NULL, NULL);
 
   cmd_register("llm", "service",
       "show llm service [<name> [models]]",
