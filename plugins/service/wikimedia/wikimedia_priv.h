@@ -63,17 +63,22 @@ typedef enum
   WM_VERB_RESOLVE,
   WM_VERB_CLAIMS,
   WM_VERB_MENU,
-  WM_VERB_PROSE
+  WM_VERB_PROSE,
+  WM_VERB_PROPERTY,
+  WM_VERB_FACTS,
+  WM_VERB_REVERSE
 } wm_verb_t;
 
 // The caller's callback. A union so the unmap sweep can clear every arm
 // at once — all-bits-zero is the null test each delivery path makes.
 typedef union
 {
-  wm_resolve_cb_t resolve;
-  wm_claims_cb_t  claims;
-  wm_menu_cb_t    menu;
-  wm_prose_cb_t   prose;
+  wm_resolve_cb_t  resolve;   // also WM_VERB_REVERSE
+  wm_claims_cb_t   claims;
+  wm_menu_cb_t     menu;
+  wm_prose_cb_t    prose;
+  wm_property_cb_t property;
+  wm_facts_cb_t    facts;
 } wm_cb_u;
 
 typedef struct wm_work wm_work_t;
@@ -127,6 +132,42 @@ struct wm_work
       bool           full;
       wm_prose_res_t res;
     } prose;
+
+    struct
+    {
+      char              word[WM_QUERY_SZ];  // normalized: the cache key
+      wm_property_res_t res;
+    } property;
+
+    // The facts chain carries no parsed body across a hop: P31 comes
+    // back on its own, the menu is a nested wm_menu_async, and the
+    // entity-wide claims fetch is parsed against a menu that is already
+    // in hand by the time it lands.
+    struct
+    {
+      char           class[WM_P31_TRIES][WM_QID_SZ];
+      uint8_t        n_class;
+      uint8_t        at_class;
+      wm_menu_res_t  menu;
+      wm_facts_res_t res;
+    } facts;
+
+    struct
+    {
+      char          word[WM_QUERY_SZ];   // the property as the caller wrote it
+      char          value[WM_QID_SZ];    // the item the statement must name
+      wm_property_t cand[WM_PROP_CANDIDATES];
+      uint8_t       n_cand;
+
+      // One candidate's matches, filled by that candidate's own leg and
+      // read only after the fan-out barrier.
+      char    got[WM_PROP_CANDIDATES][WM_REVERSE_LIMIT][WM_QID_SZ];
+      uint8_t n_got[WM_PROP_CANDIDATES];
+      int32_t total[WM_PROP_CANDIDATES];
+      bool    reached;
+
+      wm_resolve_res_t res;
+    } reverse;
   } u;
 
   wm_work_t *next_active;
@@ -215,10 +256,27 @@ static void         wm_work_fail(wm_work_t *w, wm_status_t status,
 static void         wm_work_abandon(wm_work_t *w);
 static void         wm_leg_retire(wm_work_t *w);
 
+static wm_resolve_res_t *wm_window_of(wm_work_t *w);
+static bool         wm_window_fetch(wm_work_t *w, uint8_t slot);
 static void         wm_resolve_cirrus_done(const curl_response_t *resp);
 static void         wm_resolve_wbs_done(const curl_response_t *resp);
 static void         wm_resolve_merge(wm_work_t *w);
 static void         wm_resolve_window_done(const curl_response_t *resp);
+
+static const char  *wm_word_of(const wm_work_t *w);
+static void         wm_prop_adopt(wm_work_t *w, const wm_property_t *cand,
+                        uint8_t n);
+static bool         wm_prop_resolve(wm_work_t *w, const char *word);
+
+static void         wm_facts_p31_done(const curl_response_t *resp);
+static bool         wm_facts_menu_next(wm_work_t *w);
+static void         wm_facts_menu_done(const wm_menu_res_t *menu, void *user);
+static void         wm_facts_claims_done(const curl_response_t *resp);
+static void         wm_facts_labels_done(const curl_response_t *resp);
+
+static void         wm_reverse_dispatch(wm_work_t *w);
+static void         wm_reverse_leg_done(const curl_response_t *resp);
+static void         wm_reverse_choose(wm_work_t *w);
 
 static void         wm_prop_search_done(const curl_response_t *resp);
 static void         wm_claims_dispatch(wm_work_t *w);

@@ -520,6 +520,7 @@ wm_labels_apply(struct json_object *entities, wm_claims_res_t *res,
     const char *lang)
 {
   const char *lbl;
+  char        joined[WM_VALUE_SZ + WM_LABEL_SZ + 2];
 
   if(res->label[0] == '\0')
   {
@@ -554,8 +555,12 @@ wm_labels_apply(struct json_object *entities, wm_claims_res_t *res,
       if(lbl != NULL)
         strlcpy(c->value.unit, lbl, sizeof(c->value.unit));
 
-      strlcat(c->value.text, " ", sizeof(c->value.text));
-      strlcat(c->value.text, c->value.unit, sizeof(c->value.text));
+      // Written whole rather than appended to: gcc cannot see that a
+      // strlcat into a struct member is bounded and warns -Wnonnull on
+      // every such site.
+      snprintf(joined, sizeof(joined), "%s %s", c->value.text,
+          c->value.unit);
+      strlcpy(c->value.text, joined, sizeof(c->value.text));
     }
 
     for(uint8_t q = 0; q < c->n_quals; q++)
@@ -625,5 +630,305 @@ wm_rank_window(wm_candidate_t *hits, uint8_t n)
     }
 
     hits[j] = tmp;
+  }
+}
+
+
+// wbsearchentities&type=property, ranked as it ranked them. The
+// datatype rides along, which is why a property word never needs a
+// second lookup to know whether it is an external-id.
+uint8_t
+wm_props_parse(struct json_object *root, wm_property_t *out, uint8_t cap)
+{
+  struct json_object *hits;
+  uint8_t             n = 0;
+  int                 len;
+
+  hits = json_get_array(root, "search");
+  len  = hits != NULL ? (int)json_object_array_length(hits) : 0;
+
+  for(int i = 0; i < len && n < cap; i++)
+  {
+    struct json_object *hit = json_object_array_get_idx(hits, i);
+    wm_property_t      *p   = &out[n];
+
+    if(hit == NULL)
+      continue;
+
+    memset(p, 0, sizeof(*p));
+
+    if(!json_get_str(hit, "id", p->property, sizeof(p->property))
+        || !wm_is_qid(p->property, 'P'))
+      continue;
+
+    json_get_str(hit, "label", p->label, sizeof(p->label));
+    json_get_str(hit, "datatype", p->datatype, sizeof(p->datatype));
+    n++;
+  }
+
+  return(n);
+}
+
+
+// An entity's claims, reduced to what its type's menu names and put in
+// that order. The menu is already priority-ordered and already free of
+// external-ids, so this is an intersection and nothing more — a
+// property the entity has no statement for simply does not appear.
+//
+// `total` counts the statements that survived rank filtering and
+// dedup, up to WM_CLAIMS_MAX, so a consumer's "+7" is a count of
+// answers rather than of rows in the payload.
+uint8_t
+wm_facts_parse(struct json_object *claims, const wm_menu_res_t *menu,
+    wm_fact_t *out, uint8_t cap)
+{
+  uint8_t n = 0;
+
+  if(claims == NULL || menu == NULL)
+    return(0);
+
+  for(uint8_t i = 0; i < menu->n && n < cap; i++)
+  {
+    const wm_property_t *p = &menu->props[i];
+    wm_claim_t           got[WM_CLAIMS_MAX];
+    wm_fact_t           *f = &out[n];
+    uint8_t              have;
+
+    have = wm_claims_parse(claims, p->property, got, WM_CLAIMS_MAX);
+
+    if(have == 0)
+      continue;
+
+    memset(f, 0, sizeof(*f));
+    strlcpy(f->property, p->property, sizeof(f->property));
+    strlcpy(f->label, p->label, sizeof(f->label));
+    strlcpy(f->datatype, p->datatype, sizeof(f->datatype));
+    f->total = have;
+
+    for(uint8_t v = 0; v < have && f->n < WM_FACT_VALUES_MAX; v++)
+      f->values[f->n++] = got[v].value;
+
+    n++;
+  }
+
+  return(n);
+}
+
+
+// The item's own statements, in the order it makes them, for a type
+// whose class publishes no property menu. Wikidata curates P1963 for
+// broad classes and not for narrow ones — Q5 human has 103 entries,
+// "rock band" has none and neither does "band" above it — so a card
+// that only knows how to read a menu is empty for most of the world.
+//
+// Labels and datatypes are left blank: the batch that fills them is
+// also what says which of these are identifiers rather than answers,
+// and it has not run yet.
+//
+// ⭑ Which is why the FILTER here is by value kind and not by datatype.
+// A curated menu has already had its identifiers removed; a raw item
+// has not, and half of what a well-edited one holds is MusicBrainz
+// ids, Commons filenames and portal links. Every one of those is a
+// string, and everything a card actually wants to say — an item, a
+// date, a quantity, a place — is not. Keeping only the non-strings
+// costs "official website" and buys back population, inception, the
+// head of government and the line-up.
+uint8_t
+wm_facts_parse_any(struct json_object *claims, wm_fact_t *out, uint8_t cap)
+{
+  uint8_t n = 0;
+
+  if(claims == NULL)
+    return(0);
+
+  json_object_object_foreach(claims, key, val)
+  {
+    wm_claim_t got[WM_CLAIMS_MAX];
+    wm_fact_t *f = &out[n];
+    uint8_t    have;
+
+    (void)val;
+
+    if(n >= cap || !wm_is_qid(key, 'P'))
+      continue;
+
+    have = wm_claims_parse(claims, key, got, WM_CLAIMS_MAX);
+
+    if(have == 0 || got[0].value.kind == WM_VAL_TEXT)
+      continue;
+
+    memset(f, 0, sizeof(*f));
+    strlcpy(f->property, key, sizeof(f->property));
+    f->total = have;
+
+    for(uint8_t v = 0; v < have && f->n < WM_FACT_VALUES_MAX; v++)
+      f->values[f->n++] = got[v].value;
+
+    n++;
+  }
+
+  return(n);
+}
+
+
+// Everything in a fact block that is an id and wants to be a word. The
+// entity itself leads the batch: its label and description are the
+// card's heading and they cost nothing to carry here. A property with
+// no label comes next, ahead of any value — a row whose LABEL is a
+// P-id reads as broken, where a value that stayed an id merely reads
+// as unlovely.
+uint8_t
+wm_fact_ids_collect(const wm_facts_res_t *res, char (*out)[WM_QID_SZ],
+    uint8_t cap)
+{
+  uint8_t n = 0;
+
+  wm_id_push(out, &n, cap, res->qid);
+  wm_id_push(out, &n, cap, res->class_qid);
+
+  for(uint8_t i = 0; i < res->n; i++)
+  {
+    if(res->facts[i].label[0] == '\0')
+      wm_id_push(out, &n, cap, res->facts[i].property);
+  }
+
+  for(uint8_t i = 0; i < res->n; i++)
+  {
+    const wm_fact_t *f = &res->facts[i];
+
+    for(uint8_t v = 0; v < f->n; v++)
+    {
+      if(f->values[v].kind == WM_VAL_ITEM)
+        wm_id_push(out, &n, cap, f->values[v].qid);
+
+      if(f->values[v].kind == WM_VAL_QUANTITY)
+        wm_id_push(out, &n, cap, f->values[v].unit);
+    }
+  }
+
+  return(n);
+}
+
+
+// A page in one of Wikimedia's own namespaces, which is a
+// cross-reference to the encyclopedia's plumbing rather than a fact
+// about the subject. Q90 leads with its portal, its people category and
+// its infobox template, and none of the three is anything a reader
+// asked about Paris.
+static bool
+wm_is_wiki_admin(const char *label)
+{
+  static const char *const ns[] = {
+    "Category:", "Portal:", "Template:", "Wikipedia:", "Module:", "Help:"
+  };
+
+  for(size_t i = 0; i < sizeof(ns) / sizeof(ns[0]); i++)
+  {
+    if(strncmp(label, ns[i], strlen(ns[i])) == 0)
+      return(true);
+  }
+
+  return(false);
+}
+
+
+// The fact-block half of wm_labels_apply. What the batch could not
+// reach keeps its id — unlovely, never wrong.
+void
+wm_fact_labels_apply(struct json_object *entities, wm_facts_res_t *res,
+    const char *lang)
+{
+  struct json_object *ent = NULL;
+  const char         *lbl;
+  char                joined[WM_VALUE_SZ + WM_LABEL_SZ + 2];
+
+  lbl = wm_label_of(entities, res->qid, lang);
+
+  if(lbl != NULL)
+    strlcpy(res->label, lbl, sizeof(res->label));
+
+  lbl = wm_label_of(entities, res->class_qid, lang);
+
+  if(lbl != NULL)
+    strlcpy(res->class_label, lbl, sizeof(res->class_label));
+
+  if(entities != NULL
+      && json_object_object_get_ex(entities, res->qid, &ent))
+  {
+    struct json_object *descs = json_get_obj(ent, "descriptions");
+    struct json_object *loc   = descs != NULL ? json_get_obj(descs, lang)
+                                              : NULL;
+
+    if(loc != NULL)
+      json_get_str(loc, "value", res->description, sizeof(res->description));
+  }
+
+  // A block ordered by the item's own statements arrives with no labels
+  // and no datatypes; this batch is what fills them. A menu-ordered
+  // block already has both and finds nothing to do here.
+  for(uint8_t i = 0; i < res->n; i++)
+  {
+    wm_fact_t          *f    = &res->facts[i];
+    struct json_object *prop = NULL;
+
+    if(f->label[0] != '\0' || entities == NULL
+        || !json_object_object_get_ex(entities, f->property, &prop))
+      continue;
+
+    lbl = wm_label_of(entities, f->property, lang);
+
+    if(lbl != NULL)
+      strlcpy(f->label, lbl, sizeof(f->label));
+
+    json_get_str(prop, "datatype", f->datatype, sizeof(f->datatype));
+  }
+
+  for(uint8_t i = 0; i < res->n; i++)
+  {
+    wm_fact_t *f = &res->facts[i];
+
+    for(uint8_t v = 0; v < f->n; v++)
+    {
+      wm_value_t *val = &f->values[v];
+
+      if(val->kind == WM_VAL_ITEM)
+      {
+        lbl = wm_label_of(entities, val->qid, lang);
+
+        if(lbl != NULL)
+          strlcpy(val->text, lbl, sizeof(val->text));
+      }
+
+      if(val->kind == WM_VAL_QUANTITY && val->unit[0] != '\0')
+      {
+        lbl = wm_label_of(entities, val->unit, lang);
+
+        if(lbl != NULL)
+          strlcpy(val->unit, lbl, sizeof(val->unit));
+
+        snprintf(joined, sizeof(joined), "%s %s", val->text, val->unit);
+        strlcpy(val->text, joined, sizeof(val->text));
+      }
+    }
+  }
+
+  // Now that every row can be read, drop the ones that are not
+  // answers: an identifier, a row the batch could not name at all (a
+  // card of P-ids is worse than a shorter card), and a pointer into
+  // Wikimedia's own plumbing.
+  for(uint8_t i = 0; i < res->n; )
+  {
+    const wm_fact_t *f = &res->facts[i];
+
+    if(strcmp(f->datatype, "external-id") != 0 && f->label[0] != '\0'
+        && !(f->n > 0 && wm_is_wiki_admin(f->values[0].text)))
+    {
+      i++;
+      continue;
+    }
+
+    memmove(&res->facts[i], &res->facts[i + 1],
+        (size_t)(res->n - i - 1) * sizeof(res->facts[0]));
+    res->n--;
   }
 }

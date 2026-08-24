@@ -42,11 +42,8 @@
 // the tail is what the alternates line is for.
 #define WM_SEARCH_LIMIT  5
 
-// Property words resolve to a small ranked set, not a single answer, and
-// the first candidate with a statement on the subject wins. Three is
-// where the measured misses live: `height` puts the wanted P2048 at rank
-// 2, behind P2044 (elevation).
-#define WM_PROP_CANDIDATES 3
+// WM_PROP_CANDIDATES is public — a consumer sizing a wm_property_res_t
+// needs it — and lives in wikimedia_api.h beside the other shapes.
 
 // A P1963 menu can run past a hundred entries (Q5 human has 103) and is
 // priority-ordered, so the head is the useful part. We fetch metadata
@@ -54,10 +51,23 @@
 // and keep the first WM_MENU_MAX that survive the external-id filter.
 #define WM_MENU_FETCH    50
 
+// Types of one item tried for a menu before the fall back to its own
+// statement order. An item's first P31 is often its narrowest — Green
+// Day is a "rock band" and Paris a "territorial collectivity of France
+// with special status", and neither of those publishes a menu while
+// classes one step broader do.
+#define WM_P31_TRIES     3
+
 // The action API refuses more than 50 ids in one wbgetentities call, and
 // every batch this plugin builds is bounded by that rather than by its
 // own arithmetic.
 #define WM_IDS_MAX       50
+
+// How many items a reverse query asks the searcher for. Larger than the
+// forward window because "films directed by Ridley Scott" is a list
+// rather than a disambiguation, and the ranker still cuts it to
+// WM_CANDIDATES_MAX.
+#define WM_REVERSE_LIMIT 20
 
 // Flight slots one piece of work may hold at once: three concurrent legs
 // (the resolver's two searchers, or a property fan-out) plus the batched
@@ -123,6 +133,31 @@ void    wm_labels_apply(struct json_object *entities, wm_claims_res_t *res,
 
 // Sitelink count is the ranking key; hits[0] is the winner afterwards.
 void    wm_rank_window(wm_candidate_t *hits, uint8_t n);
+
+// wbsearchentities&type=property → ranked property candidates.
+uint8_t wm_props_parse(struct json_object *root, wm_property_t *out,
+            uint8_t cap);
+
+// An entity's whole claims object, reduced to the properties its type's
+// menu names and in that order. Statements are filtered exactly as
+// wm_claims_parse filters them, minus the qualifiers a fact block does
+// not carry.
+uint8_t wm_facts_parse(struct json_object *claims, const wm_menu_res_t *menu,
+            wm_fact_t *out, uint8_t cap);
+
+// The same block for an item whose type publishes no menu: its own
+// statements, in its own order.
+uint8_t wm_facts_parse_any(struct json_object *claims, wm_fact_t *out,
+            uint8_t cap);
+
+// The ids in a fact block that want to be words — item values and
+// quantity units — plus the entity itself, whose label and description
+// ride the same batch.
+uint8_t wm_fact_ids_collect(const wm_facts_res_t *res,
+            char (*out)[WM_QID_SZ], uint8_t cap);
+
+void    wm_fact_labels_apply(struct json_object *entities,
+            wm_facts_res_t *res, const char *lang);
 
 #endif // WIKIMEDIA_INTERNAL
 

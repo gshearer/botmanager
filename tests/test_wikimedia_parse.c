@@ -161,6 +161,42 @@ static const char time_fx[] =
 // The batched lookup's answer: labels for an item value, a quantity's
 // unit and a qualifier property — and one id it does not carry, which
 // must survive as itself rather than as an empty cell.
+// An item as wbgetclaims hands it over: a curated property, an
+// identifier, a pointer into Wikimedia's own plumbing, and one the
+// menu below does not name at all.
+static const char facts_fx[] =
+  "{\"claims\":{"
+    "\"P2013\":[{\"mainsnak\":{\"snaktype\":\"value\",\"property\":"
+      "\"P2013\",\"datavalue\":{\"value\":\"greenday\",\"type\":"
+      "\"string\"},\"datatype\":\"external-id\"},\"rank\":\"normal\"},"
+    "{\"mainsnak\":{\"snaktype\":\"value\",\"property\":\"P2013\","
+      "\"datavalue\":{\"value\":\"gd\",\"type\":\"string\"},"
+      "\"datatype\":\"external-id\"},\"rank\":\"normal\"}],"
+    "\"P910\":[{\"mainsnak\":" ITEM("Q9") ",\"rank\":\"normal\"}],"
+    "\"P527\":[{\"mainsnak\":" ITEM("Q1") ",\"rank\":\"normal\"},"
+      "{\"mainsnak\":" ITEM("Q3") ",\"rank\":\"normal\"}],"
+    "\"P571\":[{\"mainsnak\":" TIME_SNAK("+1982-00-00T00:00:00Z", "9")
+      ",\"rank\":\"normal\"}]"
+  "}}";
+
+// Labels for everything the block above will want to name.
+static const char facts_labels_fx[] =
+  "{\"entities\":{"
+    "\"P527\":{\"labels\":{\"en\":{\"value\":\"has part\"}},"
+      "\"datatype\":\"wikibase-item\"},"
+    "\"P571\":{\"labels\":{\"en\":{\"value\":\"inception\"}},"
+      "\"datatype\":\"time\"},"
+    "\"P910\":{\"labels\":{\"en\":{\"value\":\"main category\"}},"
+      "\"datatype\":\"wikibase-item\"},"
+    "\"P2013\":{\"labels\":{\"en\":{\"value\":\"Facebook id\"}},"
+      "\"datatype\":\"external-id\"},"
+    "\"Q1\":{\"labels\":{\"en\":{\"value\":\"Billie\"}}},"
+    "\"Q3\":{\"labels\":{\"en\":{\"value\":\"Mike\"}}},"
+    "\"Q9\":{\"labels\":{\"en\":{\"value\":\"Category:Green Day\"}}},"
+    "\"Q47871\":{\"labels\":{\"en\":{\"value\":\"Green Day\"}},"
+      "\"descriptions\":{\"en\":{\"value\":\"American rock band\"}}}"
+  "}}";
+
 static const char labels_fx[] =
   "{\"entities\":{"
     "\"P527\":{\"id\":\"P527\",\"datatype\":\"wikibase-item\",\"labels\":"
@@ -358,6 +394,79 @@ main(void)
 
     wm_qid_norm(qid_cases[i].in, out, WM_QID_SZ);
     test_check_str("qid_norm", qid_cases[i].name, qid_cases[i].norm, out);
+  }
+
+  // The fact block: which properties a card carries, in what order, and
+  // which of them are not answers at all.
+  {
+    struct json_object *doc;
+    struct json_object *ents;
+    wm_facts_res_t      res;
+    wm_menu_res_t       menu;
+    char                ids[WM_IDS_MAX][WM_QID_SZ];
+    uint8_t             n_ids;
+
+    doc  = json_parse_buf(facts_fx, sizeof(facts_fx) - 1, "test");
+    ents = json_parse_buf(facts_labels_fx, sizeof(facts_labels_fx) - 1,
+        "test");
+
+    if(doc == NULL || ents == NULL)
+      return(test_skip("wikimedia_parse", "fixture would not parse"));
+
+    // A menu names three properties; the item has statements for two of
+    // them, and the third simply does not appear.
+    memset(&menu, 0, sizeof(menu));
+    strlcpy(menu.props[0].property, "P571", WM_QID_SZ);
+    strlcpy(menu.props[0].label, "inception", WM_LABEL_SZ);
+    strlcpy(menu.props[1].property, "P2044", WM_QID_SZ);
+    strlcpy(menu.props[1].label, "elevation", WM_LABEL_SZ);
+    strlcpy(menu.props[2].property, "P527", WM_QID_SZ);
+    strlcpy(menu.props[2].label, "has part", WM_LABEL_SZ);
+    menu.n = 3;
+
+    memset(&res, 0, sizeof(res));
+    strlcpy(res.qid, "Q47871", sizeof(res.qid));
+    res.n = wm_facts_parse(json_get_obj(doc, "claims"), &menu, res.facts,
+        WM_FACTS_MAX);
+
+    test_check_sz("facts", "menu order, and only what has a value",
+        2, res.n);
+    test_check_str("facts", "the menu's order, not the item's",
+        "inception", res.facts[0].label);
+    test_check_str("facts", "and the second it named", "has part",
+        res.facts[1].label);
+
+    // The statement-ordered fall-back keeps only what a card can say:
+    // the identifiers and the Facebook handle are strings and go.
+    memset(&res, 0, sizeof(res));
+    strlcpy(res.qid, "Q47871", sizeof(res.qid));
+    res.n = wm_facts_parse_any(json_get_obj(doc, "claims"), res.facts,
+        WM_FACTS_MAX);
+
+    test_check_sz("facts", "no menu: every non-string property survives",
+        3, res.n);
+
+    n_ids = wm_fact_ids_collect(&res, ids, WM_IDS_MAX);
+    test_check_str("facts", "the item leads the label batch", "Q47871",
+        ids[0]);
+    test_check_bool("facts", "an unlabelled property rides it too", true,
+        n_ids >= 4);
+
+    wm_fact_labels_apply(json_get_obj(ents, "entities"), &res, "en");
+
+    test_check_str("facts", "the item's own label rides the batch",
+        "Green Day", res.label);
+    test_check_str("facts", "and its description", "American rock band",
+        res.description);
+    test_check_sz("facts", "the category pointer goes once it can be read",
+        2, res.n);
+    test_check_str("facts", "and the order the item stated survives it",
+        "has part", res.facts[0].label);
+    test_check_str("facts", "with its ids turned into words", "Billie",
+        res.facts[0].values[0].text);
+
+    json_object_put(doc);
+    json_object_put(ents);
   }
 
   return(test_report("wikimedia_parse"));

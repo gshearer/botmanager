@@ -216,6 +216,7 @@ halves. Same shape as `gemini` / `gemini.ws`.
 | `searxng` | plugins/extension/inference/search/searxng_cmd.c | `!search` / `!image` / `!news` / `!video` / `!music` command surface (`SEARXNG_CMD_CTX`) — shares the root context with the `searxng` service above |
 | `stock` | plugins/feature/stock/stock.c · plugins/feature/stock/stock_lists.c | `!stock` quote command and its per-userns symbol lists (`STOCK_CTX`) |
 | `weather` | plugins/feature/weather/weather.c | `/weather` command (`WEATHER_CTX`) |
+| `wiki` | plugins/feature/wiki/wiki.c · plugins/feature/wiki/wiki_render.c | `!wiki` — the deterministic Wikidata / Wikipedia surface over the `wikimedia` service (`WIKI_CTX`) |
 
 ## Method plugins (`plugins/method/`)
 

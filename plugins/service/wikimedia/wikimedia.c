@@ -402,6 +402,13 @@ wm_unmap_cb(uintptr_t lo, uintptr_t hi, void *data)
       case WM_VERB_CLAIMS:  cb = (uintptr_t)fn_addr(&w->cb.claims);  break;
       case WM_VERB_MENU:    cb = (uintptr_t)fn_addr(&w->cb.menu);    break;
       case WM_VERB_PROSE:   cb = (uintptr_t)fn_addr(&w->cb.prose);   break;
+
+      case WM_VERB_PROPERTY:
+        cb = (uintptr_t)fn_addr(&w->cb.property);
+        break;
+
+      case WM_VERB_FACTS:   cb = (uintptr_t)fn_addr(&w->cb.facts);   break;
+      case WM_VERB_REVERSE: cb = (uintptr_t)fn_addr(&w->cb.resolve); break;
     }
 
     if(cb == 0 || cb < lo || cb >= hi)
@@ -475,6 +482,21 @@ wm_work_finish(wm_work_t *w)
       if(cb.prose != NULL)
         cb.prose(&w->u.prose.res, user);
       break;
+
+    case WM_VERB_PROPERTY:
+      if(cb.property != NULL)
+        cb.property(&w->u.property.res, user);
+      break;
+
+    case WM_VERB_FACTS:
+      if(cb.facts != NULL)
+        cb.facts(&w->u.facts.res, user);
+      break;
+
+    case WM_VERB_REVERSE:
+      if(cb.resolve != NULL)
+        cb.resolve(&w->u.reverse.res, user);
+      break;
   }
 
   mem_free(w);
@@ -506,6 +528,21 @@ wm_work_fail(wm_work_t *w, wm_status_t status, const char *msg)
     case WM_VERB_PROSE:
       w->u.prose.res.status = status;
       strlcpy(w->u.prose.res.message, msg, WM_MSG_SZ);
+      break;
+
+    case WM_VERB_PROPERTY:
+      w->u.property.res.status = status;
+      strlcpy(w->u.property.res.message, msg, WM_MSG_SZ);
+      break;
+
+    case WM_VERB_FACTS:
+      w->u.facts.res.status = status;
+      strlcpy(w->u.facts.res.message, msg, WM_MSG_SZ);
+      break;
+
+    case WM_VERB_REVERSE:
+      w->u.reverse.res.status = status;
+      strlcpy(w->u.reverse.res.message, msg, WM_MSG_SZ);
       break;
   }
 
@@ -540,9 +577,10 @@ wm_leg_retire(wm_work_t *w)
 
   switch(w->verb)
   {
-    case WM_VERB_RESOLVE: wm_resolve_merge(w); break;
-    case WM_VERB_CLAIMS:  wm_claims_choose(w); break;
-    default:              break;  // menu and prose are chains, not fan-outs
+    case WM_VERB_RESOLVE: wm_resolve_merge(w);  break;
+    case WM_VERB_CLAIMS:  wm_claims_choose(w);  break;
+    case WM_VERB_REVERSE: wm_reverse_choose(w); break;
+    default:              break;  // the rest are chains, not fan-outs
   }
 }
 
@@ -648,17 +686,64 @@ wm_resolve_wbs_done(const curl_response_t *resp)
   wm_leg_retire(w);
 }
 
+// Which arm holds the candidate window. Two verbs produce one:
+// wm_resolve_async from a name, wm_reverse_async from a statement, and
+// everything downstream of the ids — weighing, labelling, ranking — is
+// the same work for both.
+static wm_resolve_res_t *
+wm_window_of(wm_work_t *w)
+{
+  return(w->verb == WM_VERB_REVERSE ? &w->u.reverse.res
+                                    : &w->u.resolve.res);
+}
+
+// Weigh a window whose hits already carry their ids. FAIL means the
+// work has NOT been failed and the caller still owes that.
+static bool
+wm_window_fetch(wm_work_t *w, uint8_t slot)
+{
+  wm_resolve_res_t *res = wm_window_of(w);
+  char              ids[WM_IDLIST_SZ];
+  char              url[WM_URL_SZ];
+  char              set[WM_CANDIDATES_MAX][WM_QID_SZ];
+  uint8_t           n = 0;
+  int               need;
+
+  for(uint8_t i = 0; i < res->n; i++)
+    wm_id_push(set, &n, WM_CANDIDATES_MAX, res->hits[i].qid);
+
+  if(n == 0 || wm_ids_join(set, n, ids, sizeof(ids)) != SUCCESS)
+    return(FAIL);
+
+  // props=sitelinks returns every sitelink rather than a count — Paris
+  // has 366 — and there is no count-only endpoint. ~33 KB is the
+  // ranker's price, and the operator has accepted it.
+  //
+  // languagefallback=1 is not optional and its absence is silent.
+  // Wikidata moved the label of anything spelled the same everywhere
+  // into the `mul` pseudo-language, so `languages=en` alone answers
+  // Albert Einstein with an EMPTY label object and a perfectly good
+  // English description beside it. With the fallback on, the value
+  // arrives still keyed `en` and nothing downstream has to know.
+  need = snprintf(url, sizeof(url),
+      "%s?action=wbgetentities&ids=%s&props=labels%%7Cdescriptions%%7C"
+      "sitelinks&languages=%s&languagefallback=1&format=json&formatversion=2",
+      wm_api_base(), ids, kv_get_str("plugin.wikimedia.language"));
+
+  if(need < 0 || (size_t)need >= sizeof(url))
+    return(FAIL);
+
+  return(wm_launch(w, slot, url, wm_resolve_window_done, w));
+}
+
 // Both searchers are in. Union them — relevance order first, then the
 // aliases nobody else found — and go and weigh the result.
 static void
 wm_resolve_merge(wm_work_t *w)
 {
   wm_resolve_res_t *res = &w->u.resolve.res;
-  char              ids[WM_IDLIST_SZ];
-  char              url[WM_URL_SZ];
   char              joined[WM_CANDIDATES_MAX][WM_QID_SZ];
   uint8_t           n = 0;
-  int               need;
 
   for(uint8_t i = 0; i < w->u.resolve.n_cirrus; i++)
     wm_id_push(joined, &n, WM_CANDIDATES_MAX, w->u.resolve.cirrus[i]);
@@ -685,22 +770,7 @@ wm_resolve_merge(wm_work_t *w)
 
   res->n = n;
 
-  if(wm_ids_join(joined, n, ids, sizeof(ids)) != SUCCESS)
-  {
-    wm_work_fail(w, WM_TRANSPORT, "candidate window would not fit a request");
-    return;
-  }
-
-  // props=sitelinks returns every sitelink rather than a count — Paris
-  // has 366 — and there is no count-only endpoint. ~33 KB is the
-  // ranker's price, and the operator has accepted it.
-  need = snprintf(url, sizeof(url),
-      "%s?action=wbgetentities&ids=%s&props=labels%%7Cdescriptions%%7C"
-      "sitelinks&languages=%s&format=json&formatversion=2",
-      wm_api_base(), ids, kv_get_str("plugin.wikimedia.language"));
-
-  if(need < 0 || (size_t)need >= sizeof(url)
-      || wm_launch(w, 2, url, wm_resolve_window_done, w) != SUCCESS)
+  if(wm_window_fetch(w, 2) != SUCCESS)
     wm_work_fail(w, WM_TRANSPORT, "could not weigh the candidate window");
 }
 
@@ -712,7 +782,7 @@ static void
 wm_resolve_window_done(const curl_response_t *resp)
 {
   wm_work_t          *w   = resp->user_data;
-  wm_resolve_res_t   *res = &w->u.resolve.res;
+  wm_resolve_res_t   *res = wm_window_of(w);
   struct json_object *root;
   struct json_object *entities;
   const char         *lang;
@@ -786,7 +856,12 @@ wm_resolve_window_done(const curl_response_t *resp)
 
   wm_rank_window(res->hits, res->n);
   res->status = WM_OK;
-  wm_resolve_cache_put(w->u.resolve.key, res);
+
+  // A reverse window is a different question every time — the property
+  // and the value both vary — so only the by-name resolver caches.
+  if(w->verb == WM_VERB_RESOLVE)
+    wm_resolve_cache_put(w->u.resolve.key, res);
+
   wm_work_finish(w);
 }
 
@@ -854,18 +929,71 @@ wm_claims_dispatch(wm_work_t *w)
   wm_leg_retire(w);  // the guard; `w` may be gone from here on
 }
 
-// The property word resolved. wbsearchentities hands back the label and
-// the datatype with the id, so this leg is the only one that has to run
-// for a word rather than a P-id.
+// ----------------------------------------------------------------------
+// The property word — one step, three verbs
+//
+// Turning "date of birth" into a ranked set of P-ids is the first half
+// of wm_claims_async, the first half of wm_reverse_async, and the whole
+// of wm_property_async. It is written once here and each verb says what
+// to do with the answer.
+// ----------------------------------------------------------------------
+
+static const char *
+wm_word_of(const wm_work_t *w)
+{
+  switch(w->verb)
+  {
+    case WM_VERB_CLAIMS:   return(w->u.claims.word);
+    case WM_VERB_REVERSE:  return(w->u.reverse.word);
+    case WM_VERB_PROPERTY: return(w->u.property.word);
+    default:               return("");
+  }
+}
+
+// The word resolved to `n` candidates. From here on `w` belongs to
+// whichever verb asked, and may already be freed when this returns.
+static void
+wm_prop_adopt(wm_work_t *w, const wm_property_t *cand, uint8_t n)
+{
+  switch(w->verb)
+  {
+    case WM_VERB_CLAIMS:
+      memcpy(w->u.claims.cand, cand, n * sizeof(*cand));
+      w->u.claims.n_cand = n;
+      wm_claims_dispatch(w);
+      break;
+
+    case WM_VERB_REVERSE:
+      memcpy(w->u.reverse.cand, cand, n * sizeof(*cand));
+      w->u.reverse.n_cand = n;
+      wm_reverse_dispatch(w);
+      break;
+
+    case WM_VERB_PROPERTY:
+      memcpy(w->u.property.res.cand, cand, n * sizeof(*cand));
+      w->u.property.res.n      = n;
+      w->u.property.res.status = WM_OK;
+      wm_work_finish(w);
+      break;
+
+    default:
+      wm_work_fail(w, WM_TRANSPORT, "property lookup on the wrong verb");
+      break;
+  }
+}
+
+// wbsearchentities hands back the label and the datatype with the id,
+// so this leg is the only one that has to run for a word rather than a
+// P-id.
 static void
 wm_prop_search_done(const curl_response_t *resp)
 {
   wm_work_t          *w = resp->user_data;
   struct json_object *root;
-  struct json_object *hits;
+  wm_property_t       cand[WM_PROP_CANDIDATES];
   wm_status_t         status;
   char                msg[WM_MSG_SZ];
-  int                 len;
+  uint8_t             n;
 
   root = wm_body(resp, &status, msg, sizeof(msg));
 
@@ -875,38 +1003,52 @@ wm_prop_search_done(const curl_response_t *resp)
     return;
   }
 
-  hits = json_get_array(root, "search");
-  len  = hits != NULL ? (int)json_object_array_length(hits) : 0;
-
-  for(int i = 0; i < len && w->u.claims.n_cand < WM_PROP_CANDIDATES; i++)
-  {
-    struct json_object *hit = json_object_array_get_idx(hits, i);
-    wm_property_t      *p   = &w->u.claims.cand[w->u.claims.n_cand];
-
-    if(hit == NULL)
-      continue;
-
-    memset(p, 0, sizeof(*p));
-
-    if(!json_get_str(hit, "id", p->property, sizeof(p->property))
-        || !wm_is_qid(p->property, 'P'))
-      continue;
-
-    json_get_str(hit, "label", p->label, sizeof(p->label));
-    json_get_str(hit, "datatype", p->datatype, sizeof(p->datatype));
-    w->u.claims.n_cand++;
-  }
-
+  n = wm_props_parse(root, cand, WM_PROP_CANDIDATES);
   json_object_put(root);
 
-  if(w->u.claims.n_cand == 0)
+  if(n == 0)
   {
     wm_work_fail(w, WM_NOT_FOUND, "");
     return;
   }
 
-  wm_prop_cache_put(w->u.claims.word, w->u.claims.cand, w->u.claims.n_cand);
-  wm_claims_dispatch(w);
+  wm_prop_cache_put(wm_word_of(w), cand, n);
+  wm_prop_adopt(w, cand, n);
+}
+
+// Put `word` in front of whichever verb owns `w`, from the cache where
+// it is warm and from the wire where it is not. SUCCESS means the work
+// has moved on and `w` is no longer the caller's to touch; FAIL means
+// nothing flew and the caller still owes the abandon.
+static bool
+wm_prop_resolve(wm_work_t *w, const char *word)
+{
+  wm_property_t cand[WM_PROP_CANDIDATES];
+  char          enc[WM_ENC_SZ];
+  char          url[WM_URL_SZ];
+  uint32_t      ttl = (uint32_t)kv_get_uint("plugin.wikimedia.cache_ttl");
+  uint8_t       n;
+  int           need;
+
+  if(ttl > 0 && wm_prop_cache_get(word, cand, &n, time(NULL), ttl))
+  {
+    wm_prop_adopt(w, cand, n);
+    return(SUCCESS);
+  }
+
+  if(wm_urlencode(word, enc, sizeof(enc)) >= sizeof(enc))
+    return(FAIL);
+
+  need = snprintf(url, sizeof(url),
+      "%s?action=wbsearchentities&search=%s&type=property&language=%s"
+      "&uselang=%s&limit=%d&format=json&formatversion=2",
+      wm_api_base(), enc, kv_get_str("plugin.wikimedia.language"),
+      kv_get_str("plugin.wikimedia.language"), WM_PROP_CANDIDATES);
+
+  if(need < 0 || (size_t)need >= sizeof(url))
+    return(FAIL);
+
+  return(wm_launch(w, 0, url, wm_prop_search_done, w));
 }
 
 // One candidate property's statements. Writes only its own arm of the
@@ -916,11 +1058,14 @@ wm_claims_leg_done(const curl_response_t *resp)
 {
   wm_leg_t           *leg = resp->user_data;
   wm_work_t          *w   = leg->work;
-  wm_claims_res_t    *got = &w->u.claims.got[leg->idx];
+  uint8_t             idx = leg->idx;
+  wm_claims_res_t    *got = &w->u.claims.got[idx];
   struct json_object *root;
   wm_status_t         status;
   char                msg[WM_MSG_SZ];
 
+  // The arm is read out of the leg before the leg goes: everything
+  // below wants the index, and it is this completion that frees it.
   mem_free(leg);
   root = wm_body(resp, &status, msg, sizeof(msg));
 
@@ -934,7 +1079,7 @@ wm_claims_leg_done(const curl_response_t *resp)
 
   got->status = WM_OK;
   got->n      = wm_claims_parse(json_get_obj(root, "claims"),
-      w->u.claims.cand[leg->idx].property, got->claims, WM_CLAIMS_MAX);
+      w->u.claims.cand[idx].property, got->claims, WM_CLAIMS_MAX);
 
   json_object_put(root);
   wm_leg_retire(w);
@@ -998,7 +1143,7 @@ wm_claims_choose(wm_work_t *w)
   }
 
   need = snprintf(url, sizeof(url),
-      "%s?action=wbgetentities&ids=%s&props=labels%%7Cdatatype&languages=%s"
+      "%s?action=wbgetentities&ids=%s&props=labels%%7Cdatatype&languages=%s&languagefallback=1"
       "&format=json&formatversion=2",
       wm_api_base(), ids, kv_get_str("plugin.wikimedia.language"));
 
@@ -1083,7 +1228,7 @@ wm_menu_props_done(const curl_response_t *resp)
   }
 
   need = snprintf(url, sizeof(url),
-      "%s?action=wbgetentities&ids=%s&props=labels%%7Cdatatype&languages=%s"
+      "%s?action=wbgetentities&ids=%s&props=labels%%7Cdatatype&languages=%s&languagefallback=1"
       "&format=json&formatversion=2",
       wm_api_base(), ids, kv_get_str("plugin.wikimedia.language"));
 
@@ -1306,6 +1451,338 @@ wm_prose_done(const curl_response_t *resp)
 }
 
 // ----------------------------------------------------------------------
+// wm_facts_async — what is worth reading about this item
+//
+// Four steps and no held payload: the type, the type's menu, the whole
+// claims object parsed straight against that menu, and one batched
+// lookup that turns the ids into words.
+// ----------------------------------------------------------------------
+
+static void
+wm_facts_p31_done(const curl_response_t *resp)
+{
+  wm_work_t          *w   = resp->user_data;
+  wm_facts_res_t     *res = &w->u.facts.res;
+  struct json_object *root;
+  wm_claim_t          got[WM_CLAIMS_MAX];
+  wm_status_t         status;
+  char                msg[WM_MSG_SZ];
+  uint8_t             n;
+
+  root = wm_body(resp, &status, msg, sizeof(msg));
+
+  if(root == NULL)
+  {
+    wm_work_fail(w, status, msg);
+    return;
+  }
+
+  n = wm_claims_parse(json_get_obj(root, "claims"), "P31", got,
+      WM_CLAIMS_MAX);
+  json_object_put(root);
+
+  for(uint8_t i = 0; i < n && w->u.facts.n_class < WM_P31_TRIES; i++)
+  {
+    if(got[i].value.kind == WM_VAL_ITEM)
+      strlcpy(w->u.facts.class[w->u.facts.n_class++], got[i].value.qid,
+          WM_QID_SZ);
+  }
+
+  if(w->u.facts.n_class == 0)
+  {
+    wm_work_fail(w, WM_NOT_FOUND, "");
+    return;
+  }
+
+  // The narrowest type is listed first and is the least likely to
+  // publish a menu, so the types are tried in order and the first one
+  // that answers decides the card's shape.
+  strlcpy(res->class_qid, w->u.facts.class[0], sizeof(res->class_qid));
+
+  if(wm_facts_menu_next(w) != SUCCESS)
+    wm_work_fail(w, WM_TRANSPORT, "could not read the property menu");
+}
+
+static bool
+wm_facts_menu_next(wm_work_t *w)
+{
+  return(wm_menu_async(w->u.facts.class[w->u.facts.at_class],
+      wm_facts_menu_done, w) == ASYNC_AIRBORNE ? SUCCESS : FAIL);
+}
+
+// The menu is in — warm from its own cache, or a moment ago off the
+// wire. Now the item itself, whole: props= empty drops the reference
+// blocks, and what is left is still the largest payload this plugin
+// fetches (a heavily-edited person runs past 250 KB).
+static void
+wm_facts_menu_done(const wm_menu_res_t *menu, void *user)
+{
+  wm_work_t *w = user;
+  char       url[WM_URL_SZ];
+  int        need;
+
+  // A menu is the preferred ordering, not the only one. Try each of the
+  // item's types in turn, then fall back to its own statement order —
+  // Wikidata curates P1963 for broad classes and not for narrow ones,
+  // so an absent menu is ordinary rather than exceptional.
+  if(menu->status == WM_OK)
+  {
+    w->u.facts.menu = *menu;
+    strlcpy(w->u.facts.res.class_qid, menu->class_qid,
+        sizeof(w->u.facts.res.class_qid));
+  }
+
+  else if(++w->u.facts.at_class < w->u.facts.n_class)
+  {
+    if(wm_facts_menu_next(w) != SUCCESS)
+      wm_work_fail(w, WM_TRANSPORT, "could not read the property menu");
+
+    return;
+  }
+
+
+  need = snprintf(url, sizeof(url),
+      "%s?action=wbgetclaims&entity=%s&props=&format=json&formatversion=2",
+      wm_api_base(), w->u.facts.res.qid);
+
+  if(need < 0 || (size_t)need >= sizeof(url)
+      || wm_launch(w, 1, url, wm_facts_claims_done, w) != SUCCESS)
+    wm_work_fail(w, WM_TRANSPORT, "could not read the item");
+}
+
+static void
+wm_facts_claims_done(const curl_response_t *resp)
+{
+  wm_work_t          *w   = resp->user_data;
+  wm_facts_res_t     *res = &w->u.facts.res;
+  struct json_object *root;
+  wm_status_t         status;
+  char                msg[WM_MSG_SZ];
+  char                ids[WM_IDLIST_SZ];
+  char                set[WM_IDS_MAX][WM_QID_SZ];
+  char                url[WM_URL_SZ];
+  uint8_t             n_ids;
+  int                 need;
+
+  root = wm_body(resp, &status, msg, sizeof(msg));
+
+  if(root == NULL)
+  {
+    wm_work_fail(w, status, msg);
+    return;
+  }
+
+  res->n = w->u.facts.menu.n > 0
+      ? wm_facts_parse(json_get_obj(root, "claims"), &w->u.facts.menu,
+            res->facts, WM_FACTS_MAX)
+      : wm_facts_parse_any(json_get_obj(root, "claims"), res->facts,
+            WM_FACTS_MAX);
+  json_object_put(root);
+  res->status = WM_OK;
+
+  // The batch is bounded and the facts are in priority order, so what
+  // it cannot reach is the tail of the card rather than its head.
+  n_ids = wm_fact_ids_collect(res, set, WM_IDS_MAX);
+
+  if(n_ids == 0 || wm_ids_join(set, n_ids, ids, sizeof(ids)) != SUCCESS)
+  {
+    wm_work_finish(w);
+    return;
+  }
+
+  need = snprintf(url, sizeof(url),
+      "%s?action=wbgetentities&ids=%s&props=labels%%7Cdescriptions"
+      "%%7Cdatatype&languages=%s&languagefallback=1&format=json"
+      "&formatversion=2",
+      wm_api_base(), ids, kv_get_str("plugin.wikimedia.language"));
+
+  // Not cosmetic here, unlike the claims path: a statement-ordered
+  // block has no labels and no datatypes until this lands, so a card
+  // without it is a column of P-ids and a run of identifiers.
+  if(need < 0 || (size_t)need >= sizeof(url)
+      || wm_launch(w, 2, url, wm_facts_labels_done, w) != SUCCESS)
+    wm_work_finish(w);
+}
+
+static void
+wm_facts_labels_done(const curl_response_t *resp)
+{
+  wm_work_t          *w = resp->user_data;
+  struct json_object *root;
+  wm_status_t         status;
+  char                msg[WM_MSG_SZ];
+
+  root = wm_body(resp, &status, msg, sizeof(msg));
+
+  if(root != NULL)
+  {
+    wm_fact_labels_apply(json_get_obj(root, "entities"), &w->u.facts.res,
+        kv_get_str("plugin.wikimedia.language"));
+    json_object_put(root);
+  }
+
+  wm_work_finish(w);
+}
+
+// ----------------------------------------------------------------------
+// wm_reverse_async — the statement read the other way round
+//
+// Same shape as wm_claims_async: fan the property candidates out, and
+// answer from the first that has anything to say. What lands is a
+// candidate window, so the tail of the work is the resolver's.
+// ----------------------------------------------------------------------
+
+static void
+wm_reverse_dispatch(wm_work_t *w)
+{
+  uint8_t launched = 0;
+  uint8_t missing  = 0;
+
+  // The +1 guard keeps `w` alive across the whole submit loop even when
+  // every leg completes before the loop returns.
+  atomic_store(&w->pending, (uint_least8_t)(w->u.reverse.n_cand + 1));
+
+  for(uint8_t i = 0; i < w->u.reverse.n_cand; i++)
+  {
+    char      url[WM_URL_SZ];
+    wm_leg_t *leg;
+    int       need;
+
+    // haswbstatement is CirrusSearch's structured filter: it is the one
+    // way to ask this question without SPARQL, which this plugin
+    // refuses on latency variance.
+    need = snprintf(url, sizeof(url),
+        "%s?action=query&list=search&srsearch=haswbstatement%%3A%s%%3D%s"
+        "&srlimit=%d&srnamespace=0&format=json&formatversion=2",
+        wm_api_base(), w->u.reverse.cand[i].property, w->u.reverse.value,
+        WM_REVERSE_LIMIT);
+
+    if(need < 0 || (size_t)need >= sizeof(url))
+    {
+      missing++;
+      continue;
+    }
+
+    leg       = mem_alloc(WIKIMEDIA_CTX, "leg", sizeof(*leg));
+    leg->work = w;
+    leg->idx  = i;
+
+    if(wm_launch(w, i, url, wm_reverse_leg_done, leg) != SUCCESS)
+    {
+      mem_free(leg);
+      missing++;
+      continue;
+    }
+
+    launched++;
+  }
+
+  if(launched == 0)
+  {
+    wm_work_fail(w, WM_TRANSPORT, "could not query wikidata");
+    return;
+  }
+
+  for(uint8_t i = 0; i < missing; i++)
+    wm_leg_retire(w);
+
+  wm_leg_retire(w);  // the guard; `w` may be gone from here on
+}
+
+static void
+wm_reverse_leg_done(const curl_response_t *resp)
+{
+  wm_leg_t           *leg = resp->user_data;
+  wm_work_t          *w   = leg->work;
+  uint8_t             idx = leg->idx;
+  struct json_object *root;
+  struct json_object *query;
+  struct json_object *hits;
+  struct json_object *info;
+  wm_status_t         status;
+  char                msg[WM_MSG_SZ];
+  int                 len;
+
+  mem_free(leg);
+  root = wm_body(resp, &status, msg, sizeof(msg));
+
+  if(root == NULL)
+  {
+    clam(CLAM_WARN, WIKIMEDIA_CTX, "reverse leg failed: %s",
+        msg[0] != '\0' ? msg : "no match");
+    wm_leg_retire(w);
+    return;
+  }
+
+  w->u.reverse.reached = true;
+  query = json_get_obj(root, "query");
+  info  = query != NULL ? json_get_obj(query, "searchinfo") : NULL;
+  hits  = query != NULL ? json_get_array(query, "search") : NULL;
+  len   = hits != NULL ? (int)json_object_array_length(hits) : 0;
+
+  if(info != NULL)
+    json_get_int(info, "totalhits", &w->u.reverse.total[idx]);
+
+  for(int i = 0; i < len && w->u.reverse.n_got[idx] < WM_REVERSE_LIMIT; i++)
+  {
+    struct json_object *hit = json_object_array_get_idx(hits, i);
+    char                qid[WM_QID_SZ];
+
+    qid[0] = '\0';
+
+    if(hit == NULL || !json_get_str(hit, "title", qid, sizeof(qid)))
+      continue;
+
+    // Namespace 0 on wikidata.org is items, so a page title IS a QID —
+    // but the id is about to be pasted into a URL, so it is checked
+    // rather than assumed.
+    if(!wm_is_qid(qid, 'Q'))
+      continue;
+
+    strlcpy(w->u.reverse.got[idx][w->u.reverse.n_got[idx]++], qid,
+        WM_QID_SZ);
+  }
+
+  json_object_put(root);
+  wm_leg_retire(w);
+}
+
+static void
+wm_reverse_choose(wm_work_t *w)
+{
+  wm_resolve_res_t *res = &w->u.reverse.res;
+  uint8_t           pick;
+  bool              answered = false;
+
+  for(pick = 0; pick < w->u.reverse.n_cand && !answered; pick++)
+    answered = w->u.reverse.n_got[pick] > 0;
+
+  if(!answered)
+  {
+    // Nothing holds that statement, and nothing is wrong either —
+    // unless no candidate was reachable at all, which is a different
+    // answer entirely.
+    if(w->u.reverse.reached)
+      wm_work_fail(w, WM_NOT_FOUND, "");
+    else
+      wm_work_fail(w, WM_TRANSPORT, "wikidata did not answer");
+
+    return;
+  }
+
+  pick--;
+
+  for(uint8_t i = 0; i < w->u.reverse.n_got[pick] && i < WM_CANDIDATES_MAX;
+      i++)
+    strlcpy(res->hits[res->n++].qid, w->u.reverse.got[pick][i], WM_QID_SZ);
+
+  res->total = w->u.reverse.total[pick];
+
+  if(wm_window_fetch(w, 3) != SUCCESS)
+    wm_work_fail(w, WM_TRANSPORT, "could not weigh the matches");
+}
+
+// ----------------------------------------------------------------------
 // Provider API — the mechanism contract
 // ----------------------------------------------------------------------
 
@@ -1389,10 +1866,6 @@ wm_claims_async(const char *qid, const char *property, wm_claims_cb_t cb,
 {
   wm_work_t *w;
   char       word[WM_QUERY_SZ];
-  char       enc[WM_ENC_SZ];
-  char       url[WM_URL_SZ];
-  uint32_t   ttl;
-  int        need;
 
   if(cb == NULL || !wm_is_qid(qid, 'Q') || property == NULL)
     return(ASYNC_FAILED_UNDELIVERED);
@@ -1417,29 +1890,7 @@ wm_claims_async(const char *qid, const char *property, wm_claims_cb_t cb,
     return(ASYNC_AIRBORNE);
   }
 
-  ttl = (uint32_t)kv_get_uint("plugin.wikimedia.cache_ttl");
-
-  if(ttl > 0 && wm_prop_cache_get(word, w->u.claims.cand,
-      &w->u.claims.n_cand, time(NULL), ttl))
-  {
-    wm_claims_dispatch(w);
-    return(ASYNC_AIRBORNE);
-  }
-
-  if(wm_urlencode(word, enc, sizeof(enc)) >= sizeof(enc))
-  {
-    wm_work_abandon(w);
-    return(ASYNC_FAILED_UNDELIVERED);
-  }
-
-  need = snprintf(url, sizeof(url),
-      "%s?action=wbsearchentities&search=%s&type=property&language=%s"
-      "&uselang=%s&limit=%d&format=json&formatversion=2",
-      wm_api_base(), enc, kv_get_str("plugin.wikimedia.language"),
-      kv_get_str("plugin.wikimedia.language"), WM_PROP_CANDIDATES);
-
-  if(need < 0 || (size_t)need >= sizeof(url)
-      || wm_launch(w, 0, url, wm_prop_search_done, w) != SUCCESS)
+  if(wm_prop_resolve(w, word) != SUCCESS)
   {
     wm_work_abandon(w);
     return(ASYNC_FAILED_UNDELIVERED);
@@ -1527,6 +1978,111 @@ wm_prose_async(const char *title, bool full, wm_prose_cb_t cb, void *user)
 
   if(need < 0 || (size_t)need >= sizeof(url)
       || wm_launch(w, 0, url, wm_prose_sitelink_done, w) != SUCCESS)
+  {
+    wm_work_abandon(w);
+    return(ASYNC_FAILED_UNDELIVERED);
+  }
+
+  return(ASYNC_AIRBORNE);
+}
+
+async_rc_t
+wm_property_async(const char *word, wm_property_cb_t cb, void *user)
+{
+  wm_work_t *w;
+  char       norm[WM_QUERY_SZ];
+
+  if(cb == NULL || word == NULL)
+    return(ASYNC_FAILED_UNDELIVERED);
+
+  wm_normalize(word, norm, sizeof(norm));
+
+  if(norm[0] == '\0')
+    return(ASYNC_FAILED_UNDELIVERED);
+
+  w = wm_work_open(WM_VERB_PROPERTY, user);
+  w->cb.property = cb;
+  strlcpy(w->u.property.word, norm, sizeof(w->u.property.word));
+  strlcpy(w->u.property.res.word, norm, sizeof(w->u.property.res.word));
+
+  // A P-id needs no search: it is the answer, and the label and
+  // datatype a caller may want are one wbgetentities away if it ever
+  // does. Nobody has asked, so nothing is spent.
+  if(wm_is_qid(word, 'P'))
+  {
+    wm_qid_norm(word, w->u.property.res.cand[0].property, WM_QID_SZ);
+    w->u.property.res.n      = 1;
+    w->u.property.res.status = WM_OK;
+    wm_work_finish(w);
+    return(ASYNC_AIRBORNE);
+  }
+
+  if(wm_prop_resolve(w, norm) != SUCCESS)
+  {
+    wm_work_abandon(w);
+    return(ASYNC_FAILED_UNDELIVERED);
+  }
+
+  return(ASYNC_AIRBORNE);
+}
+
+async_rc_t
+wm_facts_async(const char *qid, wm_facts_cb_t cb, void *user)
+{
+  wm_work_t *w;
+  char       url[WM_URL_SZ];
+  int        need;
+
+  if(cb == NULL || !wm_is_qid(qid, 'Q'))
+    return(ASYNC_FAILED_UNDELIVERED);
+
+  w = wm_work_open(WM_VERB_FACTS, user);
+  w->cb.facts = cb;
+  wm_qid_norm(qid, w->u.facts.res.qid, WM_QID_SZ);
+
+  need = snprintf(url, sizeof(url),
+      "%s?action=wbgetclaims&entity=%s&property=P31&props=&format=json"
+      "&formatversion=2", wm_api_base(), w->u.facts.res.qid);
+
+  if(need < 0 || (size_t)need >= sizeof(url)
+      || wm_launch(w, 0, url, wm_facts_p31_done, w) != SUCCESS)
+  {
+    wm_work_abandon(w);
+    return(ASYNC_FAILED_UNDELIVERED);
+  }
+
+  return(ASYNC_AIRBORNE);
+}
+
+async_rc_t
+wm_reverse_async(const char *property, const char *value_qid,
+    wm_resolve_cb_t cb, void *user)
+{
+  wm_work_t *w;
+  char       word[WM_QUERY_SZ];
+
+  if(cb == NULL || property == NULL || !wm_is_qid(value_qid, 'Q'))
+    return(ASYNC_FAILED_UNDELIVERED);
+
+  wm_normalize(property, word, sizeof(word));
+
+  if(word[0] == '\0')
+    return(ASYNC_FAILED_UNDELIVERED);
+
+  w = wm_work_open(WM_VERB_REVERSE, user);
+  w->cb.resolve = cb;
+  strlcpy(w->u.reverse.word, word, sizeof(w->u.reverse.word));
+  wm_qid_norm(value_qid, w->u.reverse.value, WM_QID_SZ);
+
+  if(wm_is_qid(property, 'P'))
+  {
+    wm_qid_norm(property, w->u.reverse.cand[0].property, WM_QID_SZ);
+    w->u.reverse.n_cand = 1;
+    wm_reverse_dispatch(w);
+    return(ASYNC_AIRBORNE);
+  }
+
+  if(wm_prop_resolve(w, word) != SUCCESS)
   {
     wm_work_abandon(w);
     return(ASYNC_FAILED_UNDELIVERED);

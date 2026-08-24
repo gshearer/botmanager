@@ -78,10 +78,22 @@
 #define WM_DATE_SZ        16   // "-0044-03-15" and every shorter precision
 #define WM_MSG_SZ         128
 
-#define WM_CANDIDATES_MAX 10   // the resolver's merged window
+#define WM_CANDIDATES_MAX 20   // the merged window, and a reverse query's
 #define WM_CLAIMS_MAX     12   // statements carried for one property
 #define WM_QUALS_MAX      3    // qualifiers carried per statement
 #define WM_MENU_MAX       32   // properties carried from a P1963 menu
+
+// An English word resolves to a small ranked set of properties, not to
+// one answer, and which of them wins is decided by the subject rather
+// than by the word. Three is where the measured misses live: "height"
+// puts the wanted P2048 at rank 2, behind P2044 (elevation).
+#define WM_PROP_CANDIDATES 3
+
+// A fact block: how many properties of an entity it carries, and how
+// many statements of each. Both are display budgets rather than limits
+// of the data -- wm_fact_t.total says what was left behind.
+#define WM_FACTS_MAX        24
+#define WM_FACT_VALUES_MAX  3
 
 typedef enum
 {
@@ -186,6 +198,11 @@ typedef struct
   char           message[WM_MSG_SZ];
   wm_candidate_t hits[WM_CANDIDATES_MAX];  // winner first
   uint8_t        n;
+
+  // Matches the searcher claimed, which is the count wm_reverse_async
+  // was asked about rather than the `n` it could carry. 0 where no
+  // searcher reported one, which is every wm_resolve_async answer.
+  int32_t        total;
 } wm_resolve_res_t;
 
 typedef struct
@@ -209,6 +226,50 @@ typedef struct
   uint8_t       n;
 } wm_menu_res_t;
 
+// One English word's ranked property candidates -- the step
+// wm_claims_async takes internally, exposed because a consumer parsing
+// free text has to know whether a word NAMES a property before it can
+// decide which words were the subject.
+typedef struct
+{
+  wm_status_t   status;
+  char          message[WM_MSG_SZ];
+  char          word[WM_LABEL_SZ];   // as normalized
+  wm_property_t cand[WM_PROP_CANDIDATES];
+  uint8_t       n;
+} wm_property_res_t;
+
+// One property of an entity and the values it holds. `total` is what
+// the entity actually has, so a consumer can say "+7" rather than
+// pretend the list is complete.
+typedef struct
+{
+  char       property[WM_QID_SZ];
+  char       label[WM_LABEL_SZ];
+  char       datatype[WM_DTYPE_SZ];
+  wm_value_t values[WM_FACT_VALUES_MAX];
+  uint8_t    n;
+  uint8_t    total;
+} wm_fact_t;
+
+// An entity's facts, ordered by the P1963 menu of its type and
+// restricted to properties it has values for. Qualifiers are NOT
+// carried: a fact block is a summary, and the statement a consumer
+// wants qualified is the one it asked for by name through
+// wm_claims_async.
+typedef struct
+{
+  wm_status_t status;
+  char        message[WM_MSG_SZ];
+  char        qid[WM_QID_SZ];
+  char        label[WM_LABEL_SZ];
+  char        description[WM_DESC_SZ];
+  char        class_qid[WM_QID_SZ];    // the P31 whose menu ordered this
+  char        class_label[WM_LABEL_SZ];
+  wm_fact_t   facts[WM_FACTS_MAX];
+  uint8_t     n;
+} wm_facts_res_t;
+
 typedef struct
 {
   wm_status_t status;
@@ -226,6 +287,8 @@ typedef void (*wm_resolve_cb_t)(const wm_resolve_res_t *, void *user);
 typedef void (*wm_claims_cb_t)(const wm_claims_res_t *, void *user);
 typedef void (*wm_menu_cb_t)(const wm_menu_res_t *, void *user);
 typedef void (*wm_prose_cb_t)(const wm_prose_res_t *, void *user);
+typedef void (*wm_property_cb_t)(const wm_property_res_t *, void *user);
+typedef void (*wm_facts_cb_t)(const wm_facts_res_t *, void *user);
 
 // ----------------------------------------------------------------------
 // Real function declarations — visible only inside the wikimedia plugin.
@@ -240,9 +303,12 @@ typedef void (*wm_prose_cb_t)(const wm_prose_res_t *, void *user);
 // IN PLACE, before the call returns, so a caller holding a lock across
 // one of them can re-enter itself through its own callback. Take that
 // seriously or call from a task worker. Per verb: wm_resolve_async and
-// wm_menu_async cache their whole result; wm_claims_async caches only
-// the word→property step, so a hit there still goes to the wire;
-// wm_prose_async does not cache at all and is always deferred.
+// wm_menu_async cache their whole result, and wm_property_async is that
+// same cache read directly, so it answers a known word in place every
+// time; wm_claims_async caches only the word→property step, so a hit
+// there still goes to the wire; wm_reverse_async and wm_facts_async
+// reach the wire on every call, and wm_prose_async does not cache at
+// all and is always deferred.
 // ----------------------------------------------------------------------
 
 #ifdef WIKIMEDIA_INTERNAL
@@ -279,6 +345,44 @@ async_rc_t wm_menu_async(const char *class_qid, wm_menu_cb_t cb,
 // whole article (tens of KB) over the lead summary (~2 KB).
 async_rc_t wm_prose_async(const char *title, bool full, wm_prose_cb_t cb,
     void *user);
+
+// English word → the properties it might name, best first.
+//
+// This is the first half of wm_claims_async published on its own, for
+// the one job it cannot do: deciding, with no subject in hand, whether
+// a run of words names a property at all. A consumer splitting free
+// text asks that of each candidate tail and keeps the ones that answer
+// WM_OK; which of them is RIGHT is still settled by value presence,
+// which is wm_claims_async's business and must not be rebuilt.
+// WM_NOT_FOUND means the word named nothing.
+async_rc_t wm_property_async(const char *word, wm_property_cb_t cb,
+    void *user);
+
+// Item → the facts worth reading about it, ordered by the P1963 menu
+// of its type where there is one and by the item's own statement order
+// where there is not. Wikidata curates that menu for broad classes and
+// not for narrow ones -- Q5 human has 103 entries, "rock band" has none
+// and neither does "band" above it -- so the fallback is the common
+// path rather than the exception.
+//
+// One entity-wide claims fetch, so the payload is the whole item (a
+// heavily-edited person runs past 250 KB) and the answer is bounded by
+// WM_FACTS_MAX rather than by what came back.
+//
+// WM_NOT_FOUND means the item has no P31 at all.
+async_rc_t wm_facts_async(const char *qid, wm_facts_cb_t cb, void *user);
+
+// (property word, value item) → the items that hold that statement.
+//
+// The mirror of wm_claims_async: that one asks what Ridley Scott
+// directed, this one asks what was directed BY him. The value arrives
+// already resolved because a consumer that had to name it in words had
+// to resolve it anyway, and its own answer -- which of several people
+// called that -- is the consumer's to report. Candidates come back
+// ranked by sitelink count exactly as wm_resolve_async's do, and
+// `total` carries how many matched before the window.
+async_rc_t wm_reverse_async(const char *property, const char *value_qid,
+    wm_resolve_cb_t cb, void *user);
 
 #endif // WIKIMEDIA_INTERNAL
 
@@ -389,6 +493,80 @@ wm_prose_async(const char *title, bool full, wm_prose_cb_t cb, void *user)
     __atomic_store_n(&cached, fn, __ATOMIC_RELEASE);
   }
   return(fn(title, full, cb, user));
+}
+
+static inline async_rc_t
+wm_property_async(const char *word, wm_property_cb_t cb, void *user)
+{
+  typedef async_rc_t (*fn_t)(const char *, wm_property_cb_t, void *);
+  static fn_t cached = NULL;
+  fn_t        fn     = __atomic_load_n(&cached, __ATOMIC_ACQUIRE);
+
+  if(fn == NULL)
+  {
+    union { void *obj; fn_t fn; } u;
+
+    u.obj = plugin_dlsym_cached(WIKIMEDIA_CTX, "wm_property_async",
+        (void **)&cached);
+    if(u.obj == NULL)
+    {
+      clam(CLAM_FATAL, WIKIMEDIA_CTX, "dlsym failed: wm_property_async");
+      abort();
+    }
+    fn = u.fn;
+    __atomic_store_n(&cached, fn, __ATOMIC_RELEASE);
+  }
+  return(fn(word, cb, user));
+}
+
+static inline async_rc_t
+wm_facts_async(const char *qid, wm_facts_cb_t cb, void *user)
+{
+  typedef async_rc_t (*fn_t)(const char *, wm_facts_cb_t, void *);
+  static fn_t cached = NULL;
+  fn_t        fn     = __atomic_load_n(&cached, __ATOMIC_ACQUIRE);
+
+  if(fn == NULL)
+  {
+    union { void *obj; fn_t fn; } u;
+
+    u.obj = plugin_dlsym_cached(WIKIMEDIA_CTX, "wm_facts_async",
+        (void **)&cached);
+    if(u.obj == NULL)
+    {
+      clam(CLAM_FATAL, WIKIMEDIA_CTX, "dlsym failed: wm_facts_async");
+      abort();
+    }
+    fn = u.fn;
+    __atomic_store_n(&cached, fn, __ATOMIC_RELEASE);
+  }
+  return(fn(qid, cb, user));
+}
+
+static inline async_rc_t
+wm_reverse_async(const char *property, const char *value_qid,
+    wm_resolve_cb_t cb, void *user)
+{
+  typedef async_rc_t (*fn_t)(const char *, const char *, wm_resolve_cb_t,
+      void *);
+  static fn_t cached = NULL;
+  fn_t        fn     = __atomic_load_n(&cached, __ATOMIC_ACQUIRE);
+
+  if(fn == NULL)
+  {
+    union { void *obj; fn_t fn; } u;
+
+    u.obj = plugin_dlsym_cached(WIKIMEDIA_CTX, "wm_reverse_async",
+        (void **)&cached);
+    if(u.obj == NULL)
+    {
+      clam(CLAM_FATAL, WIKIMEDIA_CTX, "dlsym failed: wm_reverse_async");
+      abort();
+    }
+    fn = u.fn;
+    __atomic_store_n(&cached, fn, __ATOMIC_RELEASE);
+  }
+  return(fn(property, value_qid, cb, user));
 }
 
 #endif // !WIKIMEDIA_INTERNAL && !WIKIMEDIA_TYPES_ONLY
