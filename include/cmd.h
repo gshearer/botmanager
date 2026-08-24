@@ -131,6 +131,13 @@ typedef struct
 typedef nl_example_t cmd_nl_example_t;
 
 // Top-level NL hint attached to a command registration.
+//
+// ⚠ BUDGET: `when` + `syntax` + every example must fit ONE 1024-byte
+// stanza in the chat plugin's COMMANDS builder. A declaration that
+// overflows it costs its own entry — the command becomes invisible to
+// the model while remaining perfectly typeable — and the only notice is
+// a WARN naming it. Keep `when` to a couple of sentences and let the
+// examples carry the grammar; they teach better than prose does.
 typedef struct
 {
   const char              *when;           // one-line intent phrase

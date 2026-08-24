@@ -930,6 +930,54 @@ wiki_cmd(const cmd_ctx_t *ctx)
   }
 }
 
+// The bridge's view of this command. Everything it teaches is grammar
+// the model would otherwise guess at, and the two things it guesses
+// wrong are the word ORDER (the property is the tail, never the head)
+// and the trailing `?`, which is a different question entirely.
+//
+// ⛔ The reverse form (`<property>=<value>`) is deliberately NOT taught.
+// It is the one shape that is easy to emit backwards — "who directed
+// Alien" is `/wiki alien director`, not `/wiki director=alien` — and a
+// confident wrong reading answers a question nobody asked. A person who
+// wants it can type it.
+static const cmd_nl_slot_t wiki_slots[] = {
+  { .name = "subject",  .type = CMD_NL_ARG_TOPIC,
+    .flags = CMD_NL_SLOT_REQUIRED },
+  { .name = "property", .type = CMD_NL_ARG_TOPIC,
+    .flags = CMD_NL_SLOT_OPTIONAL | CMD_NL_SLOT_REMAINDER },
+};
+
+static const cmd_nl_example_t wiki_examples[] = {
+  { .utterance  = "who was hypatia?",
+    .invocation = "/wiki hypatia" },
+  { .utterance  = "how tall is tom cruise?",
+    .invocation = "/wiki tom cruise height" },
+  { .utterance  = "what did marie curie die of?",
+    .invocation = "/wiki marie curie cause of death" },
+  { .utterance  = "who's in green day these days?",
+    .invocation = "/wiki \"green day\" members" },
+};
+
+static const cmd_nl_t wiki_nl = {
+  // ⚠ This whole declaration has a size budget — see cmd_nl_t in cmd.h.
+  .when          = "A question of fact about a real, identifiable thing — "
+                   "person, place, film, band, book, song, species, "
+                   "element, company — what it is, or one recorded "
+                   "property of it. Use it EVEN WHEN you think you know: "
+                   "you are confidently wrong about dates, heights and "
+                   "composers often enough to be worth the lookup. Not for "
+                   "opinions or arithmetic.",
+  .syntax        = "/wiki <subject> [property] — subject FIRST, property "
+                   "LAST, in the user's own words. Quote the subject to "
+                   "pin it. Never append a question mark; a trailing ? "
+                   "asks a different question.",
+  .slots         = wiki_slots,
+  .slot_count    = (uint8_t)(sizeof(wiki_slots) / sizeof(wiki_slots[0])),
+  .examples      = wiki_examples,
+  .example_count = (uint8_t)(sizeof(wiki_examples)
+                             / sizeof(wiki_examples[0])),
+};
+
 static const cmd_decl_t wiki_decl = {
   .module      = WIKI_CTX,
   .name        = "wiki",
@@ -952,6 +1000,7 @@ static const cmd_decl_t wiki_decl = {
   .scope       = CMD_SCOPE_ANY,
   .methods     = METHOD_T_ANY,
   .cb          = wiki_cmd,
+  .nl          = &wiki_nl,
 };
 
 static bool

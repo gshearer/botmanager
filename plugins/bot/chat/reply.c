@@ -1845,6 +1845,7 @@ chatbot_build_nl_commands_block(const chatbot_req_t *r,
     size_t sp;
     int n;
     char path[128];
+    bool too_long = false;
 
     if(nl == NULL) continue;   // defense-in-depth; collector checked
 
@@ -1861,13 +1862,12 @@ chatbot_build_nl_commands_block(const chatbot_req_t *r,
         (nl->syntax != NULL) ? nl->syntax : "");
 
     if(n < 0 || (size_t)n >= sizeof(stanza) - sp)
-    {
-      truncated = true;
-      break;
-    }
-    sp += (size_t)n;
+      too_long = true;
 
-    for(uint8_t e = 0; e < nl->example_count; e++)
+    else
+      sp += (size_t)n;
+
+    for(uint8_t e = 0; e < nl->example_count && !too_long; e++)
     {
       const cmd_nl_example_t *ex = &nl->examples[e];
 
@@ -1877,16 +1877,28 @@ chatbot_build_nl_commands_block(const chatbot_req_t *r,
           (ex->invocation != NULL) ? ex->invocation : "");
 
       if(n < 0 || (size_t)n >= sizeof(stanza) - sp)
-      {
-        truncated = true;
-        sp = 0;   // discard partial stanza
-        break;
-      }
-      sp += (size_t)n;
+        too_long = true;
+
+      else
+        sp += (size_t)n;
     }
 
-    if(truncated)
-      break;
+    // One command's own cmd_nl_t is too verbose for the scratch buffer.
+    // That is a defect in THAT command and nobody else's problem, so it
+    // is skipped rather than allowed to end the list — ending it here
+    // would delete every alphabetically later command as well, which is
+    // the exact failure the sentinel below exists to announce, reported
+    // against the byte cap it did not actually hit. Measured 2026-08-24
+    // with an over-written /wiki: 23 of 25 rendered, and the two lost
+    // were the two that came after w.
+    if(too_long)
+    {
+      clam(CLAM_WARN, "chatbot",
+          "bot=%s NL stanza for '%s' exceeds %zu bytes — that command is"
+          " invisible to the model; shorten its cmd_nl_t",
+          bot_inst_name(r->st->inst), path, sizeof(stanza));
+      continue;
+    }
 
     // Inter-stanza blank line.
     if(sp + 1 < sizeof(stanza))
@@ -1924,6 +1936,7 @@ chatbot_build_nl_commands_block(const chatbot_req_t *r,
     char           suffix[KV_KEY_SZ];
     size_t         sp;
     int            n;
+    bool           too_long = false;
 
     if(nl == NULL) continue;
 
@@ -1938,13 +1951,12 @@ chatbot_build_nl_commands_block(const chatbot_req_t *r,
         suffix);
 
     if(n < 0 || (size_t)n >= sizeof(stanza) - sp)
-    {
-      truncated = true;
-      break;
-    }
-    sp += (size_t)n;
+      too_long = true;
 
-    for(uint8_t e = 0; e < nl->example_count; e++)
+    else
+      sp += (size_t)n;
+
+    for(uint8_t e = 0; e < nl->example_count && !too_long; e++)
     {
       const nl_example_t *ex = &nl->examples[e];
 
@@ -1954,15 +1966,22 @@ chatbot_build_nl_commands_block(const chatbot_req_t *r,
           (ex->invocation != NULL) ? ex->invocation : "");
 
       if(n < 0 || (size_t)n >= sizeof(stanza) - sp)
-      {
-        truncated = true;
-        sp = 0;
-        break;
-      }
-      sp += (size_t)n;
+        too_long = true;
+
+      else
+        sp += (size_t)n;
     }
 
-    if(truncated) break;
+    // Same rule as the command loop above: an over-written declaration
+    // costs its own entry, never the ones behind it.
+    if(too_long)
+    {
+      clam(CLAM_WARN, "chatbot",
+          "bot=%s NL stanza for '/kv %s' exceeds %zu bytes — that knob is"
+          " invisible to the model; shorten its kv_nl_t",
+          botname, suffix, sizeof(stanza));
+      continue;
+    }
 
     if(sp + 1 < sizeof(stanza))
     {
