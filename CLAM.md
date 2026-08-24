@@ -287,6 +287,7 @@ The command surfaces filed beside these engines (`ask`, `claude`,
 | Context | Source | Description |
 |---|---|---|
 | `coinflip` | plugins/misc/coinflip/coinflip.c | `!coinflip` toy; context declared for the plugin's command registration (`COINFLIP_CTX`) — the toy itself logs nothing |
+| `dice` | plugins/misc/dice/dice.c | `!dice` toy; context declared for the plugin's command registration (`DICE_CTX`) — the toy itself logs nothing |
 | `roulette` | plugins/misc/roulette/roulette.c | `!roulette` toy; logs only the IRC-operator KILL branch (`ROULETTE_CTX`) |
 
 ## Marketwatch event topics — `mw.<exch>.<event>.<id>`
