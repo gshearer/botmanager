@@ -5,6 +5,7 @@
 #include "chatbot.h"
 
 #include "clam.h"
+#include "colors.h"
 
 #include <stdio.h>
 #include <string.h>
@@ -118,6 +119,7 @@ persona_done(const llm_chat_response_t *resp)
 {
   persona_req_t *r = resp->user_data;
   char           line[PERSONA_REPLY_LINE_SZ];
+  char           marked[PERSONA_REPLY_LINE_SZ];
 
   // A teardown claimed this record while the request was airborne. The
   // bot it was speaking for is gone, so there is nobody to answer and
@@ -141,9 +143,19 @@ persona_done(const llm_chat_response_t *resp)
 
   persona_first_line(resp->content, line, sizeof(line));
 
-  // An empty answer is not a line. Everything else the model produced
-  // is its own business — this is a toy's flourish, not a contract.
-  persona_req_send(r, line[0] != '\0' ? line : r->plain);
+  // The model half of the line, and only that half. A model types the
+  // markup it can reach — `**bold**`, `<red>…</red>` — and this rewrites
+  // it into the markers method_send resolves per driver, exactly as
+  // send_line_marked does for the streaming pipeline. r->plain is a
+  // command surface's own rendering, already written in those markers,
+  // and translating it would strip them: a bare \x01 in the source is
+  // dropped as a forgery (colors.h).
+  color_markup_translate(marked, sizeof(marked), line);
+
+  // An empty answer is not a line, and neither is one that was nothing
+  // but forged markers. Everything else the model produced is its own
+  // business — this is a toy's flourish, not a contract.
+  persona_req_send(r, marked[0] != '\0' ? marked : r->plain);
 }
 
 // The bot_driver_t.persona_reply slot. Declining is the common case and
