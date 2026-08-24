@@ -38,42 +38,29 @@ eightball_cmd(const cmd_ctx_t *ctx)
 {
   const char *answer = eightball_answers[util_rand(EIGHTBALL_COUNT)];
   char        line[256];
-  char        instruction[512];
+  char        facts[320];
 
   snprintf(line, sizeof(line),
       CLR_PURPLE "\xf0\x9f\x8e\xb1" CLR_RESET " %s", answer);
 
-  // What happened, never how to say it. The question is half of what
-  // happened here — a verdict with nothing to be a verdict about is
-  // not a line anyone can write — and it arrives whole: the argument
-  // is required, and one longer than its row is refused by the parser
-  // rather than truncated into it. The callee copies this before it
-  // returns (plugins/bot/chat/persona_reply.c), so the stack buffer is
-  // the whole lifetime it needs.
-  snprintf(instruction, sizeof instruction,
-      "Someone asked the Magic 8-Ball \"%s\" and the ball answered"
-      " \"%s\". Deliver that verdict, in your own voice.",
-      ctx->parsed->argv[0], answer);
+  // The question is the half the rendered line does not carry, and it
+  // arrives whole: the argument is required, and one longer than its row
+  // is refused by the parser rather than truncated into it.
+  snprintf(facts, sizeof facts,
+      "Someone asked the Magic 8-Ball \"%s\".", ctx->parsed->argv[0]);
 
-  if(kv_get_uint(EIGHTBALL_KV_IN_VOICE) != 0
-      && bot_persona_reply(ctx, instruction, line))
-    return;
-
-  cmd_reply(ctx, line);
+  cmd_reply_voiced(ctx, line, facts);
 }
 
 // Plugin lifecycle
 
-static const plugin_kv_entry_t eightball_kv_schema[] = {
-  { EIGHTBALL_KV_IN_VOICE, KV_BOOL, "false",
-    "Answer !8ball in the bot's persona voice instead of its own answer"
-    " table. Costs one LLM call per question and needs a bot whose"
-    " conversational half is on (bot.<name>.behavior.chat.enabled) — a"
-    " command bot ignores it and keeps the table." },
-};
-
 static const cmd_arg_desc_t eightball_args[] = {
   { "question", CMD_ARG_NONE, CMD_ARG_REQUIRED | CMD_ARG_REST, 0, NULL },
+};
+
+static const cmd_feat_t eightball_feat = {
+  .features      = CMD_FEAT_VOICE,
+  .voice_framing = EIGHTBALL_FRAMING,
 };
 
 static const cmd_decl_t eightball_decl = {
@@ -93,6 +80,7 @@ static const cmd_decl_t eightball_decl = {
   .abbrev      = "8",
   .arg_desc    = eightball_args,
   .arg_count   = 1,
+  .feat        = &eightball_feat,
 };
 
 static bool
@@ -122,9 +110,6 @@ const plugin_desc_t bm_plugin_desc = {
   .provides_count  = 1,
   .requires        = { { .name = "bot_chat" } },
   .requires_count  = 1,
-  .kv_schema       = eightball_kv_schema,
-  .kv_schema_count = sizeof(eightball_kv_schema)
-      / sizeof(eightball_kv_schema[0]),
   .init            = eightball_init,
   .start           = NULL,
   .stop            = NULL,

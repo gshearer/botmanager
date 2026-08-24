@@ -12,11 +12,9 @@
 
 #define DICE_CTX  "dice"
 
-// The one knob a misc toy is allowed. `plugin.<kind>.in_voice` is the
-// convention for offering a line to the bot's persona instead of the
-// local table (include/bot.h §bot_persona_reply); coinflip was its
-// first consumer and this is its second.
-#define DICE_KV_IN_VOICE  "plugin.dice.in_voice"
+// The fixed half of the persona prompt. dice_render already prints the
+// sides and the total, so the roll needs no facts alongside it.
+#define DICE_FRAMING  "Announce the result, in your own voice."
 
 // The die sizes this command rolls, and how many at once. Sides is an
 // allowlist rather than a range: 4/6/8/12/20 are the dice people own,

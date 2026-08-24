@@ -10,6 +10,8 @@
 #include "userns.h"
 
 #define CMD_NAME_SZ      32
+// "cmd." + a name + ".in_voice" + NUL.
+#define CMD_FEAT_KEY_SZ  (CMD_NAME_SZ + 16)
 #define CMD_MODULE_SZ    32
 #define CMD_USAGE_SZ     128
 #define CMD_PREFIX_SZ    8
@@ -155,6 +157,10 @@ typedef struct
   const char              *dispatch_text;
 } cmd_nl_t;
 
+// Defined below, beside the feature bits it carries; named here because
+// both cmd_ctx_t and cmd_decl_t hold one and both precede it.
+typedef struct cmd_feat cmd_feat_t;
+
 // Context passed to command callbacks. Contains everything needed
 // to process the command and send a response. Tagged struct so other
 // headers (e.g., bot.h) can forward-declare it without a cycle.
@@ -166,6 +172,13 @@ struct cmd_ctx
   const char          *username;  // authenticated username, or NULL
   const cmd_args_t    *parsed;    // pre-parsed args, or NULL if no spec
   void                *data;      // opaque callback data from registration
+
+  // The command's own identity, so a handler can reach the knobs its
+  // registration created without restating its own name. Both are
+  // plugin-owned and valid for this call only, held by the in-flight
+  // guard exactly as arg_desc is.
+  const char          *name;      // registered name, never NULL
+  const cmd_feat_t    *feat;      // what it declared, or NULL
 };
 #ifndef BM_CMD_CTX_T_DEFINED
 #define BM_CMD_CTX_T_DEFINED
@@ -183,9 +196,28 @@ typedef void (*cmd_cb_t)(const cmd_ctx_t *ctx);
 typedef void (*cmd_help_extender_t)(const cmd_ctx_t *ctx,
     const char *rest);
 
-// Filled in by CMD-FEAT-1; declared here so cmd_decl_t can carry the
-// field from birth.
-typedef struct cmd_feat cmd_feat_t;
+// Optional behaviours a command opts into. A command that declares one
+// must supply what it needs; cmd_register refuses it otherwise, so a
+// half-declared feature is a load-time failure rather than a surprise at
+// first use.
+typedef enum
+{
+  CMD_FEAT_VOICE = 1u << 0,   // output may be re-spoken by the bot's persona
+} cmd_feat_bits_t;
+
+// Reached as cmd_decl_t.feat; NULL means the command opts into nothing,
+// which is every command in the tree but the four misc toys. Pointed-at
+// storage is kept by the registry and must outlive the registration.
+struct cmd_feat
+{
+  uint32_t features;              // OR of cmd_feat_bits_t
+
+  // Required when CMD_FEAT_VOICE is set. The FIXED half of the prompt
+  // and nothing else -- the imperative, "Announce the result, in your
+  // own voice." Whatever varies per invocation is the `facts` argument
+  // to cmd_reply_voiced, because only the call site knows it.
+  const char *voice_framing;
+};
 
 // Everything cmd_register needs, named. Designated-initialised at every
 // site: an omitted field is zero, which is the "not used" value for all
@@ -361,6 +393,30 @@ bool cmd_dispatch_resolved(bot_inst_t *inst, const method_msg_t *msg,
 // replies to the sender directly. A message carrying a live
 // reply_sink_id is diverted to that sink instead — see §Reply sinks.
 bool cmd_reply(const cmd_ctx_t *ctx, const char *text);
+
+// Reply with `plain`, in the bot's persona where this command declared
+// CMD_FEAT_VOICE, its cmd.<name>.in_voice knob is on, and a mind will
+// take it. Anything else falls through to cmd_reply, so the line is
+// never dropped -- bot_persona_reply already answers false for "no bot,
+// no mind bound, no persona_reply slot, or a mind that declined".
+//
+// `facts` is what varies per invocation and is NOT already legible in
+// `plain` -- eightball's question, roulette's victim. NULL where `plain`
+// carries the whole story, which is the common case. The mind is sent
+// "<facts> <voice_framing>", or the framing alone when facts is NULL.
+//
+// ⚠ True from bot_persona_reply means the mind OWES the reply and will
+// send it seconds from now; it is a submit, not a call. A caller that
+// must be heard before some other effect lands keeps its own line and
+// calls cmd_reply directly (roulette does exactly this on a real KILL).
+void cmd_reply_voiced(const cmd_ctx_t *ctx, const char *plain,
+    const char *facts);
+
+// Write the knob key `def`'s registration created for CMD_FEAT_VOICE
+// into `buf`. ⚠ A PREDICATE, not a lifecycle result: true means the
+// command declared the feature, false means it did not and `buf` is
+// empty. Do not read it as SUCCESS/FAIL, which are inverted (common.h).
+bool cmd_feat_voice_key_of(const cmd_def_t *def, char *buf, size_t cap);
 
 // The widest header cmd_reply_table_head will draw a rule under. A
 // header past this keeps its rule — the rule simply stops at the
@@ -547,6 +603,7 @@ struct cmd_def
   uint8_t     arg_count;                // number of entries in arg_desc
   const char *const *kind_filter;       // NULL-terminated method-kind array; NULL = every bot
   const cmd_nl_t *nl;                   // NL hint (static, caller-owned) or NULL
+  const cmd_feat_t *feat;               // opted-in features (static, caller-owned) or NULL
   const void *owner_pc;                 // cmd_register() call site; identifies the owning object
   cmd_def_t  *parent;                   // parent command (NULL for root)
   cmd_def_t  *children;                 // first child (subcommand)
@@ -574,6 +631,7 @@ typedef struct
   const cmd_arg_desc_t *arg_desc;            // argument descriptors (NULL = none)
   uint8_t        arg_count;                  // number of arg descriptors
   char           name[CMD_NAME_SZ];          // for the quiescence offender line
+  const cmd_feat_t *feat;                    // declared features (plugin-owned) or NULL
   char           arg_bufs[CMD_MAX_ARGS][CMD_ARG_SZ]; // token storage
 } cmd_task_data_t;
 

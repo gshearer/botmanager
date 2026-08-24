@@ -1105,6 +1105,78 @@ cmd_show_status(const cmd_ctx_t *ctx)
 
 // Registration
 
+// /show command — what optional features a command declared, and the
+// state of each knob its declaration created. The answer to "can I turn
+// this on for that command", which kv alone can only answer by refusing
+// an unregistered key.
+
+static void
+cmd_show_command(const cmd_ctx_t *ctx)
+{
+  const cmd_def_t *def;
+  const char      *want;
+  char             key[CMD_FEAT_KEY_SZ];
+  char             title[CMD_NAME_SZ + 16];
+  char             line[256];
+
+  want = (ctx->parsed != NULL && ctx->parsed->argc > 0)
+      ? ctx->parsed->argv[0] : NULL;
+
+  if(want == NULL || want[0] == '\0')
+  {
+    cmd_reply(ctx, "usage: show command <name>");
+    return;
+  }
+
+  def = cmd_find(want);
+
+  // Root commands only, and say so rather than reading as "no features":
+  // nothing nested declares one today, and a silent miss on a subcommand
+  // would be indistinguishable from a plain command with nothing on.
+  if(def == NULL)
+  {
+    snprintf(line, sizeof(line),
+        "  no root command '%.*s' (subcommands are not addressable here)",
+        (int)(CMD_NAME_SZ - 1), want);
+    cmd_reply(ctx, line);
+    return;
+  }
+
+  snprintf(title, sizeof(title), "Command %s", cmd_get_name(def));
+  show_section(ctx, title);
+
+  if(!cmd_feat_voice_key_of(def, key, sizeof key))
+  {
+    cmd_reply(ctx, "  declares no optional features");
+    return;
+  }
+
+  snprintf(line, sizeof(line),
+      "  " CLR_BOLD "voice" CLR_RESET "  answers in the bot's persona; "
+      CLR_CYAN "%s" CLR_RESET " is %s", key,
+      kv_get_uint(key) != 0 ? CLR_GREEN "on" CLR_RESET
+                            : CLR_GRAY "off" CLR_RESET);
+  cmd_reply(ctx, line);
+}
+
+static const cmd_arg_desc_t ad_show_command[] = {
+  { "name", CMD_ARG_NONE, CMD_ARG_REQUIRED, CMD_NAME_SZ - 1, NULL },
+};
+
+static const cmd_decl_t show_command_decl = {
+  .module      = "cmd",
+  .name        = "command",
+  .usage       = "show command <name>",
+  .description = "Show a command's optional features and their knobs",
+  .group       = USERNS_GROUP_EVERYONE,
+  .scope       = CMD_SCOPE_ANY,
+  .methods     = METHOD_T_ANY,
+  .cb          = cmd_show_command,
+  .parent_path = "show",
+  .arg_desc    = ad_show_command,
+  .arg_count   = 1,
+};
+
 static const cmd_decl_t show_kv_decl = {
   .module      = "cmd",
   .name        = "kv",
@@ -1270,6 +1342,7 @@ static const cmd_decl_t show_version_decl = {
 void
 cmd_show_register(void)
 {
+  cmd_register(&show_command_decl);
   cmd_register(&show_kv_decl);
   cmd_register(&show_methods_decl);
   cmd_register(&show_status_decl);

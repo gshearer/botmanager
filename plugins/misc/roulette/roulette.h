@@ -14,12 +14,10 @@
 #define ROULETTE_CTX      "roulette"
 #define ROULETTE_CHAMBERS 6            // a classic single-action revolver
 
-// The one knob a misc toy is allowed. `plugin.<kind>.in_voice` is the
-// convention for offering a line to the bot's persona instead of the
-// local table (include/bot.h §bot_persona_reply); coinflip was its
-// first consumer, dice its second. ⚠ Read roulette_cmd before assuming
-// this toy offers every line it renders — one of them cannot wait.
-#define ROULETTE_KV_IN_VOICE  "plugin.roulette.in_voice"
+// The fixed half of the persona prompt. Who pulled and how it went
+// ride along as facts: the click line names nobody, and the bang line
+// names the puller only by way of its flavour string.
+#define ROULETTE_FRAMING  "Call it, in your own voice."
 
 static method_eject_t   roulette_eject_probe(const cmd_ctx_t *ctx);
 static void             roulette_eject(const cmd_ctx_t *ctx, method_eject_t force);

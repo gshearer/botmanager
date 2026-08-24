@@ -307,6 +307,40 @@ reg_check_collisions_locked(const char *name, const char *abbrev,
   return(true);
 }
 
+// The composed instruction. persona_reply gives instruction and the
+// command's own line 1024 bytes between them and truncates the pair, so
+// half of that is the most this half can honestly claim.
+#define CMD_VOICE_INSTRUCTION_SZ  512
+
+static const char cmd_feat_voice_help[] =
+    "Answer this command in the bot's persona voice instead of its own"
+    " output. Costs one LLM call per invocation and needs a bot whose"
+    " conversational half is on (bot.<name>.behavior.chat.enabled) -- a"
+    " command bot ignores it and keeps the plain line.";
+
+// One builder, so registration and reclaim cannot drift apart. Named for
+// the command rather than its plugin: wordnik raises !wotd and !dict from
+// one .so and they are separately voiceable.
+static void
+cmd_feat_voice_key(const char *name, char *buf, size_t cap)
+{
+  snprintf(buf, cap, "cmd.%s.in_voice", name);
+}
+
+// Drop a voiced command's knob as its definition goes away. Callers are
+// outside cmd_mutex; kv takes its own lock and this must not nest.
+static void
+cmd_feat_kv_drop(const cmd_def_t *d)
+{
+  char key[CMD_FEAT_KEY_SZ];
+
+  if(d->feat == NULL || (d->feat->features & CMD_FEAT_VOICE) == 0)
+    return;
+
+  cmd_feat_voice_key(d->name, key, sizeof key);
+  kv_unregister(key);
+}
+
 // Allocate, populate, and link a new cmd_def_t into the global list.
 // Caller must hold cmd_mutex.
 static cmd_def_t *
@@ -336,6 +370,7 @@ reg_populate_def(const cmd_decl_t *decl, cmd_def_t *parent)
   d->arg_count   = decl->arg_count;
   d->kind_filter = decl->kind_filter;
   d->nl          = decl->nl;
+  d->feat        = decl->feat;
 
   // Link to parent if specified.
   if(parent != NULL)
@@ -420,6 +455,30 @@ cmd_register(const cmd_decl_t *decl)
     }
   }
 
+  // A declared feature must arrive with what it needs. Refusing here
+  // makes a half-declaration a load-time failure naming the command,
+  // rather than a knob that registers and then does nothing.
+  if(decl->feat != NULL)
+  {
+    const cmd_feat_t *feat = decl->feat;
+
+    if((feat->features & ~(uint32_t)CMD_FEAT_VOICE) != 0)
+    {
+      clam(CLAM_WARN, "cmd_register",
+          "'%s': feat declares unknown bits 0x%x",
+          decl->name, feat->features & ~(uint32_t)CMD_FEAT_VOICE);
+      return(FAIL);
+    }
+
+    if((feat->features & CMD_FEAT_VOICE) != 0
+        && (feat->voice_framing == NULL || feat->voice_framing[0] == '\0'))
+    {
+      clam(CLAM_WARN, "cmd_register",
+          "'%s': declares CMD_FEAT_VOICE without voice_framing", decl->name);
+      return(FAIL);
+    }
+  }
+
   {
     cmd_def_t *parent = NULL;
     cmd_def_t *d;
@@ -461,6 +520,27 @@ cmd_register(const cmd_decl_t *decl)
         d->parent ? ", parent: " : "",
         d->parent ? d->parent->name : "");
   }
+
+  // The knob exists because the command asked for it, which is what
+  // makes it unsettable on a command that did not: kv refuses an
+  // unregistered key outright. Attributed to the registrant, not to us,
+  // so kv_reclaim_owned takes it with the plugin's other Class A state
+  // at unload (PLUGIN.md §Class A).
+  if(decl->feat != NULL && (decl->feat->features & CMD_FEAT_VOICE) != 0)
+  {
+    char key[CMD_FEAT_KEY_SZ];
+
+    cmd_feat_voice_key(decl->name, key, sizeof key);
+
+    // SUCCESS is false here (common.h), so this is != SUCCESS and never
+    // a bare negation -- the natural-bool reading inverts it.
+    if(kv_register_owned(key, KV_BOOL, "false", NULL, NULL,
+        cmd_feat_voice_help, owner_pc) != SUCCESS)
+      clam(CLAM_WARN, "cmd_register",
+          "'%s': registered, but its '%s' knob did not; it will answer "
+          "plainly", decl->name, key);
+  }
+
   return(SUCCESS);
 }
 
@@ -632,7 +712,10 @@ cmd_unregister_path(const char *path)
   }
 
   for(uint32_t i = 0; i < n; i++)
+  {
+    cmd_feat_kv_drop(victims[i]);
     mem_free(victims[i]);
+  }
 
   clam(CLAM_DEBUG, "cmd_unregister",
       "unregistered '%s' (%u definition(s))", path, (unsigned)n);
@@ -707,7 +790,10 @@ cmd_reclaim_owned(uintptr_t lo, uintptr_t hi)
     }
 
     for(uint32_t i = 0; i < n; i++)
+    {
+      cmd_feat_kv_drop(victims[i]);
       mem_free(victims[i]);
+    }
 
     // A foreign child under a reclaimed parent means some other object
     // hung its command off this one's node. It goes with the parent --
@@ -1296,6 +1382,8 @@ cmd_task_cb(task_t *t)
     .username = d->username[0] != '\0' ? d->username : NULL,
     .parsed   = NULL,
     .data     = d->cb_data,
+    .name     = d->name,
+    .feat     = d->feat,
   };
 
   // Opens before the parse, not before the call: arg_desc is the
@@ -1424,6 +1512,7 @@ cmd_dispatch(bot_inst_t *inst, const method_msg_t *msg)
   const cmd_arg_desc_t *arg_desc;
   uint8_t arg_count;
   const char *usage;
+  const cmd_feat_t *feat;
   const char *username;
   char ubuf[USERNS_USER_SZ];
   userns_t *ns_for_check;
@@ -1583,6 +1672,7 @@ cmd_dispatch(bot_inst_t *inst, const method_msg_t *msg)
   arg_desc = d->arg_desc;
   arg_count = d->arg_count;
   usage = d->usage;
+  feat = d->feat;
 
   pthread_mutex_unlock(&cmd_mutex);
 
@@ -1681,6 +1771,7 @@ cmd_dispatch(bot_inst_t *inst, const method_msg_t *msg)
   td->arg_desc  = arg_desc;
   td->arg_count = arg_count;
   td->usage     = usage;
+  td->feat      = feat;
   strlcpy(td->name, cmd_name, sizeof(td->name));
 
   // Submit task.
@@ -1848,6 +1939,65 @@ cmd_reply(const cmd_ctx_t *ctx, const char *text)
   method_release(inst);
 
   return(rc);
+}
+
+// The four misc toys each wrote this out, and the wording drifted between
+// them; the fixed half now lives in the declaration where it can be read
+// beside the command it speaks for.
+void
+cmd_reply_voiced(const cmd_ctx_t *ctx, const char *plain, const char *facts)
+{
+  char instruction[CMD_VOICE_INSTRUCTION_SZ];
+  char key[CMD_FEAT_KEY_SZ];
+
+  if(ctx == NULL || plain == NULL)
+    return;
+
+  if(ctx->feat == NULL || (ctx->feat->features & CMD_FEAT_VOICE) == 0
+      || ctx->name == NULL)
+  {
+    cmd_reply(ctx, plain);
+    return;
+  }
+
+  cmd_feat_voice_key(ctx->name, key, sizeof key);
+
+  if(kv_get_uint(key) == 0)
+  {
+    cmd_reply(ctx, plain);
+    return;
+  }
+
+  // What happened, then what to do about it. persona_reply labels
+  // `plain` as the tool's own output and prepends this, so anything
+  // already legible there is repetition rather than context — which is
+  // why `facts` is optional and most callers pass NULL.
+  if(facts != NULL && facts[0] != '\0')
+    snprintf(instruction, sizeof instruction, "%s %s", facts,
+        ctx->feat->voice_framing);
+  else
+    strlcpy(instruction, ctx->feat->voice_framing, sizeof instruction);
+
+  // False means the mind declined and owes nothing, so the line is ours
+  // to send. True means it will speak, including on its own failure.
+  if(!bot_persona_reply(ctx, instruction, plain))
+    cmd_reply(ctx, plain);
+}
+
+bool
+cmd_feat_voice_key_of(const cmd_def_t *def, char *buf, size_t cap)
+{
+  if(buf == NULL || cap == 0)
+    return(false);
+
+  buf[0] = '\0';
+
+  if(def == NULL || def->feat == NULL
+      || (def->feat->features & CMD_FEAT_VOICE) == 0)
+    return(false);
+
+  cmd_feat_voice_key(def->name, buf, cap);
+  return(true);
 }
 
 bool
@@ -2688,6 +2838,7 @@ cmd_dispatch_as(const char *cmd_name, const char *args,
   const cmd_arg_desc_t *ad;
   uint8_t ac;
   const char *usage;
+  const cmd_feat_t *feat;
   uint16_t req_level;
   char req_group[USERNS_GROUP_SZ];
   method_msg_t msg;
@@ -2731,6 +2882,7 @@ cmd_dispatch_as(const char *cmd_name, const char *args,
   ad = d->arg_desc;
   ac = d->arg_count;
   usage = d->usage;
+  feat = d->feat;
   req_level = d->level;
   memcpy(req_group, d->group, USERNS_GROUP_SZ);
   strlcpy(cmd_leaf, d->name, sizeof(cmd_leaf));
@@ -2766,12 +2918,18 @@ cmd_dispatch_as(const char *cmd_name, const char *args,
     return(SUCCESS);
   }
 
+  // .bot is NULL by construction here, so nothing on this path can be
+  // voiced -- bot_persona_reply refuses without a bot. The identity is
+  // filled anyway: the two ctx builders disagreeing about which fields
+  // they populate is how a later feature acquires a silent dead path.
   ctx = (cmd_ctx_t){
     .bot      = NULL,
     .msg      = &msg,
     .args     = args,
     .username = username,
     .parsed   = NULL,
+    .name     = cmd_leaf,
+    .feat     = feat,
   };
 
   // From here on a pointer into the plugin's mapping is live on this
@@ -2864,6 +3022,7 @@ cmd_dispatch_resolved(bot_inst_t *inst, const method_msg_t *msg,
   td->arg_desc  = def->arg_desc;
   td->arg_count = def->arg_count;
   td->usage     = def->usage;
+  td->feat      = def->feat;
   strlcpy(td->name, def->name, sizeof(td->name));
 
   snprintf(task_name, sizeof(task_name), "cmd:%s", def->name);

@@ -178,7 +178,6 @@ dice_cmd(const cmd_ctx_t *ctx)
   dice_spec_t  spec;
   dice_roll_t  roll;
   char         line[DICE_LINE_SZ];
-  char         instruction[256];
 
   if(!dice_parse(ctx->parsed, &spec))
   {
@@ -190,31 +189,14 @@ dice_cmd(const cmd_ctx_t *ctx)
   dice_roll(&spec, &roll);
   dice_render(&roll, line, sizeof line);
 
-  // What happened, never how to say it — the fixed half of the prompt
-  // belongs to the persona_reply slot. The callee copies this before it
-  // returns (plugins/bot/chat/persona_reply.c), so the stack buffer is
-  // the whole lifetime it needs.
-  snprintf(instruction, sizeof instruction,
-      "Someone just rolled %u %u-sided %s and the total is %u."
-      " Announce the result, in your own voice.",
-      roll.count, roll.sides, roll.count == 1 ? "die" : "dice",
-      roll.total);
-
-  if(kv_get_uint(DICE_KV_IN_VOICE) != 0
-      && bot_persona_reply(ctx, instruction, line))
-    return;
-
-  cmd_reply(ctx, line);
+  cmd_reply_voiced(ctx, line, NULL);
 }
 
 // Plugin lifecycle
 
-static const plugin_kv_entry_t dice_kv_schema[] = {
-  { DICE_KV_IN_VOICE, KV_BOOL, "false",
-    "Answer !dice in the bot's persona voice instead of its own flavour"
-    " table. Costs one LLM call per roll and needs a bot whose"
-    " conversational half is on (bot.<name>.behavior.chat.enabled) — a"
-    " command bot ignores it and keeps the table." },
+static const cmd_feat_t dice_feat = {
+  .features      = CMD_FEAT_VOICE,
+  .voice_framing = DICE_FRAMING,
 };
 
 static const cmd_arg_desc_t dice_args[] = {
@@ -266,6 +248,7 @@ static const cmd_decl_t dice_decl = {
   .arg_desc    = dice_args,
   .arg_count   = (uint8_t)(sizeof(dice_args) / sizeof(dice_args[0])),
   .nl          = &dice_nl,
+  .feat        = &dice_feat,
 };
 
 static bool
@@ -295,8 +278,6 @@ const plugin_desc_t bm_plugin_desc = {
   .provides_count  = 1,
   .requires        = { { .name = "bot_chat" } },
   .requires_count  = 1,
-  .kv_schema       = dice_kv_schema,
-  .kv_schema_count = sizeof(dice_kv_schema) / sizeof(dice_kv_schema[0]),
   .init            = dice_init,
   .start           = NULL,
   .stop            = NULL,

@@ -50,28 +50,10 @@ coinflip_cmd(const cmd_ctx_t *ctx)
   snprintf(line, sizeof(line),
       CLR_YELLOW "\xf0\x9f\xaa\x99" CLR_RESET " %s", face);
 
-  // The whole cost of borrowing the bot's voice. A true return means
-  // the mind owes the reply and will make it — including on its own
-  // failure, where it sends this very line. False means it declined
-  // (no persona, conversational half off, nothing registered) and the
-  // answer is ours to give, which is also the default with the knob
-  // unset.
-  if(kv_get_uint(COINFLIP_KV_IN_VOICE) != 0
-      && bot_persona_reply(ctx, COINFLIP_INSTRUCTION, line))
-    return;
-
-  cmd_reply(ctx, line);
+  cmd_reply_voiced(ctx, line, NULL);
 }
 
 // Plugin lifecycle
-
-static const plugin_kv_entry_t coinflip_kv_schema[] = {
-  { COINFLIP_KV_IN_VOICE, KV_BOOL, "false",
-    "Answer !coinflip in the bot's persona voice instead of its own"
-    " flavour table. Costs one LLM call per flip and needs a bot whose"
-    " conversational half is on (bot.<name>.behavior.chat.enabled) — a"
-    " command bot ignores it and keeps the table." },
-};
 
 static const cmd_nl_example_t coinflip_examples[] = {
   { .utterance = "flip a coin", .invocation = "/coinflip" },
@@ -90,6 +72,11 @@ static const cmd_nl_t coinflip_nl = {
       / sizeof(coinflip_examples[0])),
 };
 
+static const cmd_feat_t coinflip_feat = {
+  .features       = CMD_FEAT_VOICE,
+  .voice_framing  = COINFLIP_FRAMING,
+};
+
 static const cmd_decl_t coinflip_decl = {
   .module      = COINFLIP_CTX,
   .name        = "coinflip",
@@ -103,6 +90,7 @@ static const cmd_decl_t coinflip_decl = {
   .cb          = coinflip_cmd,
   .abbrev      = "cf",
   .nl          = &coinflip_nl,
+  .feat        = &coinflip_feat,
 };
 
 static bool
@@ -132,9 +120,6 @@ const plugin_desc_t bm_plugin_desc = {
   .provides_count  = 1,
   .requires        = { { .name = "bot_chat" } },
   .requires_count  = 1,
-  .kv_schema       = coinflip_kv_schema,
-  .kv_schema_count = sizeof(coinflip_kv_schema)
-      / sizeof(coinflip_kv_schema[0]),
   .init            = coinflip_init,
   .start           = NULL,
   .stop            = NULL,

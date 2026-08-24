@@ -12,17 +12,10 @@
 
 #define COINFLIP_CTX      "coinflip"
 
-// The one knob. `plugin.<kind>.in_voice` is the convention a command
-// surface declares to offer its output to the bot's persona instead of
-// its own table (include/bot.h §bot_persona_reply); this is its first
-// consumer, and any toy freshened later declares the same suffix.
-#define COINFLIP_KV_IN_VOICE  "plugin.coinflip.in_voice"
-
-// What the mind is told the line is FOR. The fixed half of the prompt —
-// register, length, no preamble — belongs to the persona_reply slot;
-// this half is the only part a consumer owns, and it says what
-// happened, never how to say it.
-#define COINFLIP_INSTRUCTION                                           \
+// What the mind is told the line is FOR. Wholly fixed — a flip has no
+// detail the rendered line does not already carry — so it is the whole
+// declaration and cmd_reply_voiced is passed no facts.
+#define COINFLIP_FRAMING                                               \
   "Someone just flipped a coin and you are calling the result."        \
   " Announce which side came up, in your own voice."
 

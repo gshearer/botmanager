@@ -12,11 +12,11 @@
 
 #define EIGHTBALL_CTX   "eightball"
 
-// The one knob a misc toy is allowed. `plugin.<kind>.in_voice` is the
-// convention for offering a line to the bot's persona instead of the
-// local table (include/bot.h §bot_persona_reply); coinflip was its
-// first consumer, dice its second.
-#define EIGHTBALL_KV_IN_VOICE   "plugin.eightball.in_voice"
+// The fixed half of the persona prompt. The rendered line carries the
+// ball's answer but not the question, so the question rides along as the
+// facts half -- a verdict with nothing to be a verdict about is not a
+// line anyone can write.
+#define EIGHTBALL_FRAMING  "Deliver that verdict, in your own voice."
 
 static void             eightball_cmd(const cmd_ctx_t *ctx);
 static bool             eightball_init(void);

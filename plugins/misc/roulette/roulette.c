@@ -86,7 +86,7 @@ roulette_cmd(const cmd_ctx_t *ctx)
   const char     *who;
   method_eject_t  force = METHOD_EJECT_NONE;
   char            line[256];
-  char            instruction[256];
+  char            facts[256];
   bool            dead;
 
   // Identify the trigger-puller for the death line; nickname when the
@@ -118,43 +118,33 @@ roulette_cmd(const cmd_ctx_t *ctx)
         CLR_GRAY "\xf0\x9f\x94\xab %s" CLR_RESET,
         roulette_click[util_rand(ROULETTE_CLICKS)]);
 
-  // What happened, never how to say it. The callee copies this before
-  // it returns (plugins/bot/chat/persona_reply.c), so the stack buffer
-  // is the whole lifetime it needs.
-  snprintf(instruction, sizeof instruction,
-      "%s just took a turn at Russian roulette and %s. Call it, in your"
-      " own voice.", who,
+  snprintf(facts, sizeof facts,
+      "%s just took a turn at Russian roulette and %s.", who,
       dead ? "the live round was under the hammer"
            : "the chamber came up empty");
 
   // The voice is the one thing a real KILL cannot afford to wait for.
-  // The mind answers seconds from now — bot_persona_reply is a submit,
+  // The mind answers seconds from now — the persona reply is a submit,
   // not a call — and the blow may not be held that long: it is the
   // reply going out first that is the whole ordering law above. So a
   // pull with a genuine removal behind it keeps its own line and stays
   // in the local register. Where the bang is pure theatre nobody is
   // going anywhere, and the mind is welcome to take its time.
-  if(force == METHOD_EJECT_NONE
-      && kv_get_uint(ROULETTE_KV_IN_VOICE) != 0
-      && bot_persona_reply(ctx, instruction, line))
+  if(force == METHOD_EJECT_NONE)
+  {
+    cmd_reply_voiced(ctx, line, facts);
     return;
+  }
 
   cmd_reply(ctx, line);
-
-  if(force != METHOD_EJECT_NONE)
-    roulette_eject(ctx, force);
+  roulette_eject(ctx, force);
 }
 
 // Plugin lifecycle
 
-static const plugin_kv_entry_t roulette_kv_schema[] = {
-  { ROULETTE_KV_IN_VOICE, KV_BOOL, "false",
-    "Answer !roulette in the bot's persona voice instead of its own"
-    " flavour table. Costs one LLM call per pull and needs a bot whose"
-    " conversational half is on (bot.<name>.behavior.chat.enabled) — a"
-    " command bot ignores it and keeps the table. A pull that ends in a"
-    " real KILL keeps the table regardless: the blow cannot wait on the"
-    " model, and it must not land before the line." },
+static const cmd_feat_t roulette_feat = {
+  .features      = CMD_FEAT_VOICE,
+  .voice_framing = ROULETTE_FRAMING,
 };
 
 static const cmd_decl_t roulette_decl = {
@@ -174,6 +164,7 @@ static const cmd_decl_t roulette_decl = {
   .methods     = METHOD_T_ANY,
   .cb          = roulette_cmd,
   .abbrev      = "rr",
+  .feat        = &roulette_feat,
 };
 
 static bool
@@ -203,9 +194,6 @@ const plugin_desc_t bm_plugin_desc = {
   .provides_count  = 1,
   .requires        = { { .name = "bot_chat" } },
   .requires_count  = 1,
-  .kv_schema       = roulette_kv_schema,
-  .kv_schema_count = sizeof(roulette_kv_schema)
-      / sizeof(roulette_kv_schema[0]),
   .init            = roulette_init,
   .start           = NULL,
   .stop            = NULL,
