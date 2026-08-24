@@ -349,6 +349,18 @@ test_coinbase_ws_channels = executable('test_coinbase_ws_channels',
   dependencies : core_deps,
 )
 
+# The wikimedia parse layer is a pure function of its arguments — no
+# KV, no curl, no module state — which is the whole reason it is its own
+# translation unit.
+test_wikimedia_parse = executable('test_wikimedia_parse',
+  'test_wikimedia_parse.c',
+  '../plugins/service/wikimedia/wikimedia_parse.c',
+  include_directories : [include_directories('.'), inc_include,
+                         include_directories('../plugins/service/wikimedia')],
+  link_with : [test_harness, libcore],
+  dependencies : core_deps,
+)
+
 test_kraken_ws_channels = executable('test_kraken_ws_channels',
   'test_kraken_ws_channels.c',
   '../plugins/service/kraken/kraken_ws_channels.c',
@@ -485,6 +497,7 @@ test('curl_flight', test_curl_flight)
 test('cmd_argspec', test_cmd_argspec)
 test('cmd_inflight', test_cmd_inflight)
 test('kraken_ws_channels', test_kraken_ws_channels)
+test('wikimedia_parse', test_wikimedia_parse)
 test('gemini_ws_channels', test_gemini_ws_channels)
 test('coinbase_ws_channels', test_coinbase_ws_channels)
 test('exchange_ws_gen', test_exchange_ws_gen)

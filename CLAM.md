@@ -189,6 +189,7 @@ regex (the literal context portion, before any `<placeholder>`).
 | `tmdb` | plugins/service/tmdb/tmdb.c | The Movie Database API (`TMDB_CTX`) |
 | `tmdb.cmd` | plugins/service/tmdb/tmdb_cmd.c | `!tmdb` movie/TV/actor info, the tmdb plugin's own command surface (`TMDBCMD_CTX`) |
 | `weathergov` | plugins/service/weathergov/weathergov.c | National Weather Service (weather.gov) API client (`WXG_CTX`) |
+| `wikimedia` | plugins/service/wikimedia/wikimedia.c | Wikidata claims + Wikipedia prose, keyless (`WIKIMEDIA_CTX`) |
 | `wordnik` | plugins/service/wordnik/wordnik.c | Wordnik word-of-the-day API (`WORDNIK_CTX`) |
 | `wordnik.cmd` | plugins/service/wordnik/wordnik_cmd.c | `!wotd` word of the day, the wordnik plugin's own command surface (`WORDNIK_CMD_CTX`) |
 | `yahoofinance` | plugins/service/yahoofinance/yahoofinance.c | Yahoo Finance stock-quote provider (`YF_CTX`) |

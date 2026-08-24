@@ -47,6 +47,7 @@ subdir('service/tmdb')
 subdir('service/giphy')
 subdir('service/rawg')
 subdir('service/wordnik')
+subdir('service/wikimedia')
 # reachyapi defines reachyapi_include, so it must precede both of its
 # consumers: the command surface and the method driver.
 subdir('service/reachyapi')
