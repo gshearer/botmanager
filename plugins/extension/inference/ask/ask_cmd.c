@@ -1285,19 +1285,38 @@ static const char ask_cmd_help[] =
     "  !ask -e high derive the CAP theorem from first principles\n"
     "  !show ask";
 
+static const cmd_decl_t ask_decl = {
+  .module      = ASK_CMD_CTX,
+  .name        = "ask",
+  .usage       = "ask [-m <model>] [-e <effort>] <query>",
+  .description = "One-shot LLM query (stateless, no memory)",
+  .help_long   = ask_cmd_help,
+  .group       = USERNS_GROUP_EVERYONE,
+  .scope       = CMD_SCOPE_ANY,
+  .methods     = METHOD_T_ANY,
+  .cb          = ask_cmd_handler,
+  .abbrev      = "a",
+};
+
+static const cmd_decl_t show_ask_decl = {
+  .module      = ASK_CMD_CTX,
+  .name        = "ask",
+  .usage       = "show ask",
+  .description = "Report the model, effort and limits !ask would use here",
+  .group       = USERNS_GROUP_EVERYONE,
+  .scope       = CMD_SCOPE_ANY,
+  .methods     = METHOD_T_ANY,
+  .cb          = show_ask_handler,
+  .parent_path = "show",
+};
+
 static bool
 ask_cmd_init(void)
 {
-  if(cmd_register(ASK_CMD_CTX, "ask", "ask [-m <model>] [-e <effort>] <query>",
-      "One-shot LLM query (stateless, no memory)", ask_cmd_help,
-      USERNS_GROUP_EVERYONE, 0, CMD_SCOPE_ANY, METHOD_T_ANY,
-      ask_cmd_handler, NULL, NULL, "a", NULL, 0, NULL, NULL) != SUCCESS)
+  if(cmd_register(&ask_decl) != SUCCESS)
     return(FAIL);
 
-  if(cmd_register(ASK_CMD_CTX, "ask", "show ask",
-      "Report the model, effort and limits !ask would use here", NULL,
-      USERNS_GROUP_EVERYONE, 0, CMD_SCOPE_ANY, METHOD_T_ANY,
-      show_ask_handler, NULL, "show", NULL, NULL, 0, NULL, NULL) != SUCCESS)
+  if(cmd_register(&show_ask_decl) != SUCCESS)
   {
     cmd_unregister_path("ask");
     return(FAIL);

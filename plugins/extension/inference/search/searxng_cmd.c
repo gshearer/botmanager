@@ -602,11 +602,20 @@ searxng_cmd_init(void)
   for(size_t i = 0; i < SEARXNG_CMD_TABLE_N; i++)
   {
     const searxng_cmd_entry_t *e = &searxng_cmd_table[i];
+    const cmd_decl_t decl = {
+      .module      = SEARXNG_CMD_CTX,
+      .name        = e->name,
+      .usage       = e->usage,
+      .description = e->desc,
+      .help_long   = searxng_cmd_help,
+      .group       = USERNS_GROUP_EVERYONE,
+      .scope       = CMD_SCOPE_ANY,
+      .methods     = METHOD_T_ANY,
+      .cb          = e->cb,
+      .abbrev      = e->abbrev,
+    };
 
-    if(cmd_register(SEARXNG_CMD_CTX, e->name, e->usage, e->desc,
-        searxng_cmd_help, USERNS_GROUP_EVERYONE, 0,
-        CMD_SCOPE_ANY, METHOD_T_ANY, e->cb, NULL,
-        NULL, e->abbrev, NULL, 0, NULL, NULL) != SUCCESS)
+    if(cmd_register(&decl) != SUCCESS)
     {
       searxng_cmd_unregister_all();
       return(FAIL);

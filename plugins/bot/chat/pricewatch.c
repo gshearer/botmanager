@@ -1469,88 +1469,130 @@ static const cmd_nl_t pricewatch_nl = {
   .dispatch_text = NULL,
 };
 
+static const cmd_decl_t pricewatch_decl = {
+  .module      = "chat",
+  .name        = "pricewatch",
+  .usage       = "pricewatch <PAIR> <above|below> <price>",
+  .description = "Be told once when a pair crosses a price",
+  .help_long   =
+      "Watches a trading pair and tells you, in the bot's own voice,\n"
+      "the first time it trades above (or below) the price you name:\n"
+      "'pricewatch BTC-USD below 90000'. Set it in a channel and the\n"
+      "answer lands there; set it in a DM and it comes back as a DM.\n"
+      "\n"
+      "It fires ONCE — ask again to re-arm. Prices read like 90000,\n"
+      "90k or $1.25, and a bare symbol means the dollar pair, so BTC\n"
+      "is BTC-USD. Only pairs on this bot's watchlist can be watched;\n"
+      "'show bot <name> watchlist' is the list, and an admin curates\n"
+      "it with 'bot <name> watchlist add <PAIR>'.\n"
+      "\n"
+      "Public market data only — the bot reads prices and never\n"
+      "trades. 'pricewatch list' shows yours (spent ones for a day\n"
+      "after); 'pricewatch cancel <id>' drops one.",
+  .group       = USERNS_GROUP_EVERYONE,
+  .scope       = CMD_SCOPE_ANY,
+  .methods     = METHOD_T_ANY,
+  .cb          = cmd_pricewatch,
+  .arg_desc    = ad_pricewatch,
+  .arg_count   = (uint8_t)(sizeof(ad_pricewatch) / sizeof(ad_pricewatch[0])),
+  .nl          = &pricewatch_nl,
+};
+
+static const cmd_decl_t pricewatch_list_decl = {
+  .module      = "chat",
+  .name        = "list",
+  .usage       = "pricewatch list",
+  .description = "List your price watches, armed and recently spent",
+  .help_long   =
+      "Everything you have watching, with the id 'pricewatch cancel'\n"
+      "takes. A watch that has already fired stays listed as (spent)\n"
+      "for a day so you can see that it did.",
+  .group       = USERNS_GROUP_EVERYONE,
+  .scope       = CMD_SCOPE_ANY,
+  .methods     = METHOD_T_ANY,
+  .cb          = cmd_pricewatch_list,
+  .parent_path = "pricewatch",
+};
+
+static const cmd_decl_t pricewatch_cancel_decl = {
+  .module      = "chat",
+  .name        = "cancel",
+  .usage       = "pricewatch cancel <id>",
+  .description = "Cancel one armed price watch by id",
+  .help_long   =
+      "Drops an armed watch. Yours to cancel means you set it; an\n"
+      "admin may cancel any watch in the namespace. A spent watch has\n"
+      "nothing left to cancel.",
+  .group       = USERNS_GROUP_EVERYONE,
+  .scope       = CMD_SCOPE_ANY,
+  .methods     = METHOD_T_ANY,
+  .cb          = cmd_pricewatch_cancel,
+  .parent_path = "pricewatch",
+  .arg_desc    = ad_pricewatch_cancel,
+  .arg_count   = (uint8_t)(sizeof(ad_pricewatch_cancel)
+                 / sizeof(ad_pricewatch_cancel[0])),
+};
+
+static const cmd_decl_t bot_watchlist_decl = {
+  .module      = "chat",
+  .name        = "watchlist",
+  .usage       = "bot <name> watchlist <add|del> <PAIR>",
+  .description = "Curate what a bot is willing to watch prices on",
+  .help_long   =
+      "Adds or removes an exchange product id (BTC-USD; a bare symbol\n"
+      "means the dollar pair) from this bot's watchlist. Users may set\n"
+      "price watches only on listed pairs, which is the whole scope\n"
+      "fence: public market data, no trading.\n"
+      "\n"
+      "A pair is not checked against the exchange here — the next\n"
+      "sweep prices it, and 'show bot <name> watchlist' shows what it\n"
+      "found, so a pair that never gets a price is one the exchange\n"
+      "does not publish. Removing a pair also cancels the armed\n"
+      "watches on it, and says how many.",
+  .group       = USERNS_GROUP_ADMIN,
+  .level       = 100,
+  .scope       = CMD_SCOPE_ANY,
+  .methods     = METHOD_T_ANY,
+  .cb          = cmd_bot_watchlist,
+  .parent_path = "bot",
+  .arg_desc    = ad_bot_watchlist,
+  .arg_count   = (uint8_t)(sizeof(ad_bot_watchlist)
+                 / sizeof(ad_bot_watchlist[0])),
+};
+
+static const cmd_decl_t show_bot_watchlist_decl = {
+  .module      = "chat",
+  .name        = "watchlist",
+  .usage       = "show bot <name> watchlist",
+  .description = "What a bot watches prices on, and what they last cost",
+  .help_long   =
+      "One line per pair: the last price the sweep saw, how long ago\n"
+      "it saw it, and how many watches are armed against it. A pair\n"
+      "with no price has not been priced yet — either the sweep has\n"
+      "not run or the exchange does not publish that pair.",
+  .group       = USERNS_GROUP_EVERYONE,
+  .scope       = CMD_SCOPE_ANY,
+  .methods     = METHOD_T_ANY,
+  .cb          = cmd_show_bot_watchlist,
+  .parent_path = "show/bot",
+};
+
 bool
 chatbot_pricewatch_register(void)
 {
-  if(cmd_register("chat", "pricewatch",
-        "pricewatch <PAIR> <above|below> <price>",
-        "Be told once when a pair crosses a price",
-        "Watches a trading pair and tells you, in the bot's own voice,\n"
-        "the first time it trades above (or below) the price you name:\n"
-        "'pricewatch BTC-USD below 90000'. Set it in a channel and the\n"
-        "answer lands there; set it in a DM and it comes back as a DM.\n"
-        "\n"
-        "It fires ONCE — ask again to re-arm. Prices read like 90000,\n"
-        "90k or $1.25, and a bare symbol means the dollar pair, so BTC\n"
-        "is BTC-USD. Only pairs on this bot's watchlist can be watched;\n"
-        "'show bot <name> watchlist' is the list, and an admin curates\n"
-        "it with 'bot <name> watchlist add <PAIR>'.\n"
-        "\n"
-        "Public market data only — the bot reads prices and never\n"
-        "trades. 'pricewatch list' shows yours (spent ones for a day\n"
-        "after); 'pricewatch cancel <id>' drops one.",
-        USERNS_GROUP_EVERYONE, 0, CMD_SCOPE_ANY, METHOD_T_ANY,
-        cmd_pricewatch, NULL, NULL, NULL,
-        ad_pricewatch,
-        (uint8_t)(sizeof(ad_pricewatch) / sizeof(ad_pricewatch[0])),
-        NULL, &pricewatch_nl) != SUCCESS)
+  if(cmd_register(&pricewatch_decl) != SUCCESS)
     return(FAIL);
 
-  if(cmd_register("chat", "list",
-        "pricewatch list",
-        "List your price watches, armed and recently spent",
-        "Everything you have watching, with the id 'pricewatch cancel'\n"
-        "takes. A watch that has already fired stays listed as (spent)\n"
-        "for a day so you can see that it did.",
-        USERNS_GROUP_EVERYONE, 0, CMD_SCOPE_ANY, METHOD_T_ANY,
-        cmd_pricewatch_list, NULL, "pricewatch", NULL,
-        NULL, 0, NULL, NULL) != SUCCESS)
+  if(cmd_register(&pricewatch_list_decl) != SUCCESS)
     goto fail_list;
 
-  if(cmd_register("chat", "cancel",
-        "pricewatch cancel <id>",
-        "Cancel one armed price watch by id",
-        "Drops an armed watch. Yours to cancel means you set it; an\n"
-        "admin may cancel any watch in the namespace. A spent watch has\n"
-        "nothing left to cancel.",
-        USERNS_GROUP_EVERYONE, 0, CMD_SCOPE_ANY, METHOD_T_ANY,
-        cmd_pricewatch_cancel, NULL, "pricewatch", NULL,
-        ad_pricewatch_cancel,
-        (uint8_t)(sizeof(ad_pricewatch_cancel)
-                  / sizeof(ad_pricewatch_cancel[0])),
-        NULL, NULL) != SUCCESS)
+  if(cmd_register(&pricewatch_cancel_decl) != SUCCESS)
     goto fail_cancel;
 
-  if(cmd_register("chat", "watchlist",
-        "bot <name> watchlist <add|del> <PAIR>",
-        "Curate what a bot is willing to watch prices on",
-        "Adds or removes an exchange product id (BTC-USD; a bare symbol\n"
-        "means the dollar pair) from this bot's watchlist. Users may set\n"
-        "price watches only on listed pairs, which is the whole scope\n"
-        "fence: public market data, no trading.\n"
-        "\n"
-        "A pair is not checked against the exchange here — the next\n"
-        "sweep prices it, and 'show bot <name> watchlist' shows what it\n"
-        "found, so a pair that never gets a price is one the exchange\n"
-        "does not publish. Removing a pair also cancels the armed\n"
-        "watches on it, and says how many.",
-        USERNS_GROUP_ADMIN, 100, CMD_SCOPE_ANY, METHOD_T_ANY,
-        cmd_bot_watchlist, NULL, "bot", NULL,
-        ad_bot_watchlist,
-        (uint8_t)(sizeof(ad_bot_watchlist) / sizeof(ad_bot_watchlist[0])),
-        NULL, NULL) != SUCCESS)
+  if(cmd_register(&bot_watchlist_decl) != SUCCESS)
     goto fail_watchlist;
 
-  if(cmd_register("chat", "watchlist",
-        "show bot <name> watchlist",
-        "What a bot watches prices on, and what they last cost",
-        "One line per pair: the last price the sweep saw, how long ago\n"
-        "it saw it, and how many watches are armed against it. A pair\n"
-        "with no price has not been priced yet — either the sweep has\n"
-        "not run or the exchange does not publish that pair.",
-        USERNS_GROUP_EVERYONE, 0, CMD_SCOPE_ANY, METHOD_T_ANY,
-        cmd_show_bot_watchlist, NULL, "show/bot", NULL,
-        NULL, 0, NULL, NULL) != SUCCESS)
+  if(cmd_register(&show_bot_watchlist_decl) != SUCCESS)
     goto fail_show;
 
   return(SUCCESS);

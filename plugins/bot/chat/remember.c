@@ -333,43 +333,60 @@ static const cmd_nl_t forget_nl = {
   .dispatch_text = NULL,
 };
 
+static const cmd_decl_t remember_decl = {
+  .module      = "chat",
+  .name        = "remember",
+  .usage       = "remember <key> <value>",
+  .description = "Keep a lasting fact about yourself",
+  .help_long   =
+      "Writes one fact to what the bot knows about YOU — there is no\n"
+      "way to write about anyone else, which is why anybody may use\n"
+      "it. Say it plainly and the bot works out the command:\n"
+      "'my favorite color is blue' keeps favorite_color.\n"
+      "\n"
+      "Saying it again with a different value replaces it, so this is\n"
+      "also how you correct something the bot got wrong. What the bot\n"
+      "picked up from ordinary conversation can never overwrite what\n"
+      "you state here.\n"
+      "\n"
+      "Keys are a fixed list — 'remember' with a key it does not keep\n"
+      "answers with the list. Use 'forget <key>' to drop one.",
+  .group       = USERNS_GROUP_EVERYONE,
+  .scope       = CMD_SCOPE_ANY,
+  .methods     = METHOD_T_ANY,
+  .cb          = cmd_remember,
+  .arg_desc    = ad_remember,
+  .arg_count   = (uint8_t)(sizeof(ad_remember) / sizeof(ad_remember[0])),
+  .nl          = &remember_nl,
+};
+
+static const cmd_decl_t forget_decl = {
+  .module      = "chat",
+  .name        = "forget",
+  .usage       = "forget <key>",
+  .description = "Drop a fact the bot keeps about you",
+  .help_long   =
+      "Removes what the bot has stored under one key for you, and\n"
+      "only for you. 'forget vehicle' after you sell the car.\n"
+      "\n"
+      "The bot may learn it again from what you say later — this is\n"
+      "not a mute, it is an erasure of what is stored now.",
+  .group       = USERNS_GROUP_EVERYONE,
+  .scope       = CMD_SCOPE_ANY,
+  .methods     = METHOD_T_ANY,
+  .cb          = cmd_forget,
+  .arg_desc    = ad_forget,
+  .arg_count   = (uint8_t)(sizeof(ad_forget) / sizeof(ad_forget[0])),
+  .nl          = &forget_nl,
+};
+
 bool
 chatbot_remember_register(void)
 {
-  if(cmd_register("chat", "remember",
-        "remember <key> <value>",
-        "Keep a lasting fact about yourself",
-        "Writes one fact to what the bot knows about YOU — there is no\n"
-        "way to write about anyone else, which is why anybody may use\n"
-        "it. Say it plainly and the bot works out the command:\n"
-        "'my favorite color is blue' keeps favorite_color.\n"
-        "\n"
-        "Saying it again with a different value replaces it, so this is\n"
-        "also how you correct something the bot got wrong. What the bot\n"
-        "picked up from ordinary conversation can never overwrite what\n"
-        "you state here.\n"
-        "\n"
-        "Keys are a fixed list — 'remember' with a key it does not keep\n"
-        "answers with the list. Use 'forget <key>' to drop one.",
-        USERNS_GROUP_EVERYONE, 0, CMD_SCOPE_ANY, METHOD_T_ANY,
-        cmd_remember, NULL, NULL, NULL,
-        ad_remember,
-        (uint8_t)(sizeof(ad_remember) / sizeof(ad_remember[0])),
-        NULL, &remember_nl) != SUCCESS)
+  if(cmd_register(&remember_decl) != SUCCESS)
     return(FAIL);
 
-  if(cmd_register("chat", "forget",
-        "forget <key>",
-        "Drop a fact the bot keeps about you",
-        "Removes what the bot has stored under one key for you, and\n"
-        "only for you. 'forget vehicle' after you sell the car.\n"
-        "\n"
-        "The bot may learn it again from what you say later — this is\n"
-        "not a mute, it is an erasure of what is stored now.",
-        USERNS_GROUP_EVERYONE, 0, CMD_SCOPE_ANY, METHOD_T_ANY,
-        cmd_forget, NULL, NULL, NULL,
-        ad_forget, (uint8_t)(sizeof(ad_forget) / sizeof(ad_forget[0])),
-        NULL, &forget_nl) != SUCCESS)
+  if(cmd_register(&forget_decl) != SUCCESS)
     goto fail_forget;
 
   return(SUCCESS);

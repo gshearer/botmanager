@@ -157,20 +157,29 @@ static const plugin_kv_entry_t roulette_kv_schema[] = {
     " model, and it must not land before the line." },
 };
 
-static bool
-roulette_init(void)
-{
-  if(cmd_register(ROULETTE_CTX, "roulette",
-      "roulette",
-      "Take your turn at Russian roulette",
+static const cmd_decl_t roulette_decl = {
+  .module      = ROULETTE_CTX,
+  .name        = "roulette",
+  .usage       = "roulette",
+  .description = "Take your turn at Russian roulette",
+  .help_long   =
       "Spin the cylinder and squeeze the trigger. One of six chambers\n"
       "holds a live round; the other five are empty. Every pull is an\n"
       "independent one-in-six gamble \xe2\x80\x94 the revolver keeps no memory.\n"
       "\n"
       "Example:\n"
       "  !roulette",
-      "everyone", 0, CMD_SCOPE_ANY, METHOD_T_ANY, roulette_cmd, NULL, NULL,
-      "rr", NULL, 0, NULL, NULL) != SUCCESS)
+  .group       = "everyone",
+  .scope       = CMD_SCOPE_ANY,
+  .methods     = METHOD_T_ANY,
+  .cb          = roulette_cmd,
+  .abbrev      = "rr",
+};
+
+static bool
+roulette_init(void)
+{
+  if(cmd_register(&roulette_decl) != SUCCESS)
     return(FAIL);
 
   return(SUCCESS);

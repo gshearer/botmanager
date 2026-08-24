@@ -905,6 +905,131 @@ static const cmd_nl_t show_bot_model_nl = {
 
 // ---- registration ------------------------------------------------------
 
+static const cmd_decl_t show_bot_default_decl = {
+  .module      = "chat",
+  .name        = ":default",
+  .usage       = "show bot <name>",
+  .description = "Text bot summary (commands, converse toggle, persona,"
+                 " model)",
+  .group       = USERNS_GROUP_ADMIN,
+  .level       = 100,
+  .scope       = CMD_SCOPE_ANY,
+  .methods     = METHOD_T_ANY,
+  .cb          = verb_text_summary_wrapper,
+  .parent_path = "show/bot",
+};
+
+static const cmd_decl_t show_bot_personas_decl = {
+  .module      = "llm",
+  .name        = "personas",
+  .usage       = "show bot <name> personas",
+  .description = "List personalities or show the active persona",
+  .group       = USERNS_GROUP_ADMIN,
+  .level       = 100,
+  .scope       = CMD_SCOPE_ANY,
+  .methods     = METHOD_T_ANY,
+  .cb          = verb_llm_personas_wrapper,
+  .parent_path = "show/bot",
+};
+
+static const cmd_decl_t show_bot_memories_decl = {
+  .module      = "llm",
+  .name        = "memories",
+  .usage       = "show bot <name> memories [<query>]",
+  .description = "Recent conversation log or RAG query over facts/messages",
+  .group       = USERNS_GROUP_ADMIN,
+  .level       = 100,
+  .scope       = CMD_SCOPE_ANY,
+  .methods     = METHOD_T_ANY,
+  .cb          = verb_llm_memories_wrapper,
+  .parent_path = "show/bot",
+};
+
+static const cmd_decl_t show_bot_stats_decl = {
+  .module      = "llm",
+  .name        = "stats",
+  .usage       = "show bot <name> stats",
+  .description = "Bot-instance counters (in-flight requests, namespace"
+                 " totals)",
+  .group       = USERNS_GROUP_ADMIN,
+  .level       = 100,
+  .scope       = CMD_SCOPE_ANY,
+  .methods     = METHOD_T_ANY,
+  .cb          = verb_stats_wrapper,
+  .parent_path = "show/bot",
+};
+
+static const cmd_decl_t show_bot_knowledge_decl = {
+  .module      = "llm",
+  .name        = "knowledge",
+  .usage       = "show bot <name> knowledge [<query>]",
+  .description = "Preview the bound knowledge corpus or run a RAG query"
+                 " against it",
+  .group       = USERNS_GROUP_ADMIN,
+  .level       = 100,
+  .scope       = CMD_SCOPE_ANY,
+  .methods     = METHOD_T_ANY,
+  .cb          = verb_llm_knowledge_wrapper,
+  .parent_path = "show/bot",
+};
+
+static const cmd_decl_t show_bot_interests_decl = {
+  .module      = "llm",
+  .name        = "interests",
+  .usage       = "show bot <name> interests",
+  .description = "List registered acquisition topics with per-topic runtime"
+                 " stats",
+  .group       = USERNS_GROUP_ADMIN,
+  .level       = 100,
+  .scope       = CMD_SCOPE_ANY,
+  .methods     = METHOD_T_ANY,
+  .cb          = verb_llm_interests_wrapper,
+  .parent_path = "show/bot",
+};
+
+static const cmd_decl_t show_bot_model_decl = {
+  .module      = "chat",
+  .name        = "model",
+  .usage       = "show bot <name> model",
+  .description = "Report the LLM model currently bound to a chat bot",
+  .help_long   =
+      "Reads bot.<name>.chat_model, falling back to\n"
+      "llm.default_chat_model when unset. Designed to back NL queries\n"
+      "like \"what LLM are you?\" via the NL bridge.",
+  .group       = USERNS_GROUP_EVERYONE,
+  .scope       = CMD_SCOPE_ANY,
+  .methods     = METHOD_T_ANY,
+  .cb          = verb_model_wrapper,
+  .parent_path = "show/bot",
+  .nl          = &show_bot_model_nl,
+};
+
+static const cmd_decl_t show_extract_decl = {
+  .module      = "extract",
+  .name        = "extract",
+  .usage       = "show extract <subcommand>",
+  .description = "Fact extraction subsystem read-only inspection",
+  .group       = USERNS_GROUP_ADMIN,
+  .level       = 100,
+  .scope       = CMD_SCOPE_ANY,
+  .methods     = METHOD_T_ANY,
+  .cb          = chatbot_show_extract_cmd,
+  .parent_path = "show",
+};
+
+static const cmd_decl_t show_extract_stats_decl = {
+  .module      = "extract",
+  .name        = "stats",
+  .usage       = "show extract stats",
+  .description = "Process-wide fact-extraction counters",
+  .group       = USERNS_GROUP_ADMIN,
+  .level       = 100,
+  .scope       = CMD_SCOPE_ANY,
+  .methods     = METHOD_T_ANY,
+  .cb          = chatbot_show_extract_stats_cmd,
+  .parent_path = "show/extract",
+};
+
 // Every verb below registers kind-agnostic (kind_filter NULL). A
 // kind_filter names *method* kinds, and these verbs belong to the mind
 // that drives every bot -- there is no method to name.
@@ -916,94 +1041,38 @@ chatbot_show_verbs_register(void)
   // The sole :default sentinel under show/bot — it renders both halves
   // (see verb_text_summary). With no kind_filter to keep them apart, a
   // second one collides outright.
-  if(cmd_register("chat", ":default",
-        "show bot <name>",
-        "Text bot summary (commands, converse toggle, persona, model)",
-        NULL,
-        USERNS_GROUP_ADMIN, 100, CMD_SCOPE_ANY, METHOD_T_ANY,
-        verb_text_summary_wrapper, NULL, "show/bot", NULL,
-        NULL, 0, NULL, NULL) != SUCCESS)
+  if(cmd_register(&show_bot_default_decl) != SUCCESS)
     return(FAIL);
 
-  if(cmd_register("llm", "personas",
-        "show bot <name> personas",
-        "List personalities or show the active persona",
-        NULL,
-        USERNS_GROUP_ADMIN, 100, CMD_SCOPE_ANY, METHOD_T_ANY,
-        verb_llm_personas_wrapper, NULL, "show/bot", NULL,
-        NULL, 0, NULL, NULL) != SUCCESS)
+  if(cmd_register(&show_bot_personas_decl) != SUCCESS)
     return(FAIL);
 
-  if(cmd_register("llm", "memories",
-        "show bot <name> memories [<query>]",
-        "Recent conversation log or RAG query over facts/messages",
-        NULL,
-        USERNS_GROUP_ADMIN, 100, CMD_SCOPE_ANY, METHOD_T_ANY,
-        verb_llm_memories_wrapper, NULL, "show/bot", NULL,
-        NULL, 0, NULL, NULL) != SUCCESS)
+  if(cmd_register(&show_bot_memories_decl) != SUCCESS)
     return(FAIL);
 
-  if(cmd_register("llm", "stats",
-        "show bot <name> stats",
-        "Bot-instance counters (in-flight requests, namespace totals)",
-        NULL,
-        USERNS_GROUP_ADMIN, 100, CMD_SCOPE_ANY, METHOD_T_ANY,
-        verb_stats_wrapper, NULL, "show/bot", NULL,
-        NULL, 0, NULL, NULL) != SUCCESS)
+  if(cmd_register(&show_bot_stats_decl) != SUCCESS)
     return(FAIL);
 
-  if(cmd_register("llm", "knowledge",
-        "show bot <name> knowledge [<query>]",
-        "Preview the bound knowledge corpus or run a RAG query against it",
-        NULL,
-        USERNS_GROUP_ADMIN, 100, CMD_SCOPE_ANY, METHOD_T_ANY,
-        verb_llm_knowledge_wrapper, NULL, "show/bot", NULL,
-        NULL, 0, NULL, NULL) != SUCCESS)
+  if(cmd_register(&show_bot_knowledge_decl) != SUCCESS)
     return(FAIL);
 
-  if(cmd_register("llm", "interests",
-        "show bot <name> interests",
-        "List registered acquisition topics with per-topic runtime stats",
-        NULL,
-        USERNS_GROUP_ADMIN, 100, CMD_SCOPE_ANY, METHOD_T_ANY,
-        verb_llm_interests_wrapper, NULL, "show/bot", NULL,
-        NULL, 0, NULL, NULL) != SUCCESS)
+  if(cmd_register(&show_bot_interests_decl) != SUCCESS)
     return(FAIL);
 
   // Everyone-gated by design so the NL bridge can route "what LLM are
   // you?" here without tripping the admin check. Read-only and leaks
   // nothing beyond the model identifier (already semi-public: the bot
   // broadcasts its nature in channel constantly).
-  if(cmd_register("chat", "model",
-        "show bot <name> model",
-        "Report the LLM model currently bound to a chat bot",
-        "Reads bot.<name>.chat_model, falling back to\n"
-        "llm.default_chat_model when unset. Designed to back NL queries\n"
-        "like \"what LLM are you?\" via the NL bridge.",
-        USERNS_GROUP_EVERYONE, 0, CMD_SCOPE_ANY, METHOD_T_ANY,
-        verb_model_wrapper, NULL, "show/bot", NULL,
-        NULL, 0, NULL, &show_bot_model_nl) != SUCCESS)
+  if(cmd_register(&show_bot_model_decl) != SUCCESS)
     return(FAIL);
 
   // /show extract {root,stats} — plain /show children, no kind filter.
   // Registered from the chat plugin since the extract subsystem moved
   // here in R2.
-  if(cmd_register("extract", "extract",
-        "show extract <subcommand>",
-        "Fact extraction subsystem read-only inspection",
-        NULL,
-        USERNS_GROUP_ADMIN, 100, CMD_SCOPE_ANY, METHOD_T_ANY,
-        chatbot_show_extract_cmd, NULL, "show", NULL,
-        NULL, 0, NULL, NULL) != SUCCESS)
+  if(cmd_register(&show_extract_decl) != SUCCESS)
     return(FAIL);
 
-  if(cmd_register("extract", "stats",
-        "show extract stats",
-        "Process-wide fact-extraction counters",
-        NULL,
-        USERNS_GROUP_ADMIN, 100, CMD_SCOPE_ANY, METHOD_T_ANY,
-        chatbot_show_extract_stats_cmd, NULL, "show/extract", NULL,
-        NULL, 0, NULL, NULL) != SUCCESS)
+  if(cmd_register(&show_extract_stats_decl) != SUCCESS)
     return(FAIL);
 
   return(SUCCESS);

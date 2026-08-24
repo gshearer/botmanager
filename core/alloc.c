@@ -420,16 +420,25 @@ mem_cmd_show(const cmd_ctx_t *ctx)
   cmd_reply(ctx, line);
 }
 
+static const cmd_decl_t show_memory_decl = {
+  .module      = "mem",
+  .name        = "memory",
+  .usage       = "show memory",
+  .description = "Show memory utilization",
+  .group       = USERNS_GROUP_ADMIN,
+  .level       = 100,
+  .scope       = CMD_SCOPE_ANY,
+  .methods     = METHOD_T_ANY,
+  .cb          = mem_cmd_show,
+  .parent_path = "show",
+  .abbrev      = "mem",
+};
+
 // Register the "/show memory" command. Must be called after cmd_init().
 void
 mem_register_commands(void)
 {
-  cmd_register("mem", "memory",
-      "show memory",
-      "Show memory utilization",
-      NULL,
-      USERNS_GROUP_ADMIN, 100, CMD_SCOPE_ANY, METHOD_T_ANY,
-      mem_cmd_show, NULL, "show", "mem", NULL, 0, NULL, NULL);
+  cmd_register(&show_memory_decl);
 }
 
 // Initialize the memory subsystem. Must be called before any mem_alloc.

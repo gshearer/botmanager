@@ -76,19 +76,29 @@ static const cmd_arg_desc_t eightball_args[] = {
   { "question", CMD_ARG_NONE, CMD_ARG_REQUIRED | CMD_ARG_REST, 0, NULL },
 };
 
+static const cmd_decl_t eightball_decl = {
+  .module      = EIGHTBALL_CTX,
+  .name        = "8ball",
+  .usage       = "8ball <question>",
+  .description = "Ask the Magic 8-Ball a question",
+  .help_long   = "Shake the Magic 8-Ball and receive its wisdom.\n"
+                 "You must ask a question for the ball to answer.\n"
+                 "\n"
+                 "Example:\n"
+                 "  !8ball Will it rain today?",
+  .group       = "everyone",
+  .scope       = CMD_SCOPE_ANY,
+  .methods     = METHOD_T_ANY,
+  .cb          = eightball_cmd,
+  .abbrev      = "8",
+  .arg_desc    = eightball_args,
+  .arg_count   = 1,
+};
+
 static bool
 eightball_init(void)
 {
-  if(cmd_register(EIGHTBALL_CTX, "8ball",
-      "8ball <question>",
-      "Ask the Magic 8-Ball a question",
-      "Shake the Magic 8-Ball and receive its wisdom.\n"
-      "You must ask a question for the ball to answer.\n"
-      "\n"
-      "Example:\n"
-      "  !8ball Will it rain today?",
-      "everyone", 0, CMD_SCOPE_ANY, METHOD_T_ANY, eightball_cmd, NULL, NULL, "8",
-      eightball_args, 1, NULL, NULL) != SUCCESS)
+  if(cmd_register(&eightball_decl) != SUCCESS)
     return(FAIL);
 
   return(SUCCESS);

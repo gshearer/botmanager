@@ -2194,207 +2194,268 @@ wm_bt_parent_cb(const cmd_ctx_t *ctx)
 // Registration                                                            //
 // ----------------------------------------------------------------------- //
 
+static const cmd_decl_t whenmoon_backtest_decl = {
+  .module      = "whenmoon",
+  .name        = "backtest",
+  .usage       = "whenmoon backtest <verb> ...",
+  .description = "Backtest runner + sweep planner.",
+  .help_long   = "Subcommands: run <path.wm> <strat> [name=value ...],"
+                 " compile <market_id> <path.wm> [<days>] [--until <date>],"
+                 " inspect <path.wm>,"
+                 " list,"
+                 " show <sweep_id>,"
+                 " reload <strat>.",
+  .group       = USERNS_GROUP_ADMIN,
+  .level       = 100,
+  .scope       = CMD_SCOPE_ANY,
+  .methods     = METHOD_T_ANY,
+  .cb          = wm_bt_parent_cb,
+  .parent_path = "whenmoon",
+};
+
+static const cmd_decl_t whenmoon_backtest_run_decl = {
+  .module      = "whenmoon",
+  .name        = "run",
+  .usage       = "whenmoon backtest run <path.wm> <strategy>"
+                 " [<name>=<v|[v,...]|lo:step:hi>] (repeatable)"
+                 " [--fee-bps N] [--slip-bps N] [--size-frac F] [--cash N]"
+                 " [--config <path.json>] [--threads N]"
+                 " [--rank-by realized|sharpe|sortino|equity|pf]"
+                 " [--top-n K] [--perfold-top N]"
+                 " [--walk-forward train=Td:test=Md:step=Sd]"
+                 " [--oos-tail PCT]"
+                 " [--fill close|next-open]"
+                 " [--holdout] [--charts]",
+  .description = "Run a backtest against a compiled .wm snapshot — single"
+                 " iteration, parameter sweep, walk-forward, or OOS-tail"
+                 " validation.",
+  .help_long   =
+      "mmap's the .wm file (compiled via /whenmoon backtest compile)"
+      " and walks the strategy through a paper trade book. Range +"
+      " corpus come from the .wm header; the verb no longer takes"
+      " dates. Positional `name=value` tokens are sweep axes routed"
+      " through the same parser as previous `--sweep` flags;"
+      " accepted value forms are bare list `v1,v2,v3`, bracketed"
+      " list `[v1,v2,v3]`, or range `lo:step:hi`. Zero axes = one"
+      " iteration; N axes = cartesian-product sweep.\n"
+      "--threads defaults to max(1, nproc - 2) so the host keeps"
+      " two cores free, further capped by the KV"
+      " plugin.whenmoon.backtest.max_threads (0 = no cap) and"
+      " clamped to [1, 64]. Workers run at nice 19 (lowest"
+      " priority) so a long sweep never starves IRC, marketwatch,"
+      " or the live engine. Each iteration runs on a private"
+      " trade-book registry so parallel workers do not contend on"
+      " a global mutex.\n"
+      "--config <path.json> loads a sweep matrix from a JSON file"
+      " shaped {\"params\": {\"name\": <scalar|list|{start,step,end}>,"
+      " ...}}. Inline `name=value` axes override matching entries"
+      " loaded from --config, regardless of argv order.\n"
+      "--rank-by selects the ranking metric (default realized).\n"
+      "--top-n caps the number of top rows shown after the run"
+      " (default 20 when sweeping, 1 otherwise) and the number of"
+      " rows the OOS post-pass validates.\n"
+      "--perfold-top N widens the walk-forward per-fold breakdown to"
+      " the top N configs independently of --top-n (default: follow"
+      " --top-n). Feeds wm_score.py --overfit (rank-stability/PBO"
+      " need a config×fold matrix). Each fold re-walks the full"
+      " snapshot for warmup, so N=100 on a big sweep is an overnight"
+      " run.\n"
+      "--walk-forward expands each param vector into N test windows"
+      " (train days warm the strategy state but only test windows"
+      " accumulate fills); the recorded score is the cumulative"
+      " test-window result. A post-pass then re-measures each test"
+      " window INDEPENDENTLY (own book from starting cash, warmed by"
+      " prior history) for the top-N rows and emits a non-compounding"
+      " per-fold breakdown as a windows[] array in iterations.jsonl"
+      " plus a per-window table (rank 1) in report.md.\n"
+      "--oos-tail PCT reserves the last PCT%% of the range as out-of"
+      "-sample; the sweep optimises on the head, then the post-pass"
+      " runs the top-N on the tail and stamps the OOS columns on"
+      " each row. PCT clamped to [1, 50].\n"
+      "--walk-forward and --oos-tail are mutually exclusive.\n"
+      "--fill selects the execution model (WM-RIGOR-5). `close`"
+      " (default) fills each signal at its own bar's close ± slip —"
+      " a free look at the close that generated the signal."
+      " `next-open` defers execution to the NEXT 1m bar and fills at"
+      " that bar's open ± slip (terminal-bar advice with no next bar"
+      " is dropped and counted in the log). Backtest-only; live"
+      " trading is unaffected. Compare both modes on a fixed config:"
+      " <10%% rr decay = healthy; >30%% = the edge was fill fiction.\n"
+      "--holdout is required when the corpus extends past the"
+      " 2025-03-31 research cutoff; the access is audit-logged"
+      " (COMPSTART.md §Holdout discipline).\n"
+      "Each invocation writes a sweep directory under"
+      " plugin.whenmoon.backtest.report_path (defaulting to"
+      " $HOME/.local/share/botmanager/backtests/) containing"
+      " manifest.json, iterations.jsonl, top-N.txt, report.md, and"
+      " a charts/ subdir. Single-config runs also write equity.jsonl"
+      " (daily MTM marks) + fills.jsonl; every run's metrics carry"
+      " mtm_max_dd + daily_sharpe_ann from the same daily marks"
+      " (per-fill max_drawdown only observes fill days).\n"
+      "--charts forces Lightweight Charts HTML emission for this"
+      " run (default-off unless"
+      " plugin.whenmoon.backtest.charts_enabled=true). SINGLE-CONFIG"
+      " RUNS ONLY: charts are a per-trade analysis artifact, so a"
+      " parameter sweep skips them (it would emit trades x grains x"
+      " top-K files) and emits only the ranked metrics — re-run the"
+      " chosen config with no sweep axes to chart it. One file per"
+      " matched buy→sell trade pair, for EVERY grain the snapshot"
+      " carries (1m..1d), written to charts/trade-M-<gran>.html, so"
+      " the count is round-trip-trades x grains. An index.html landing"
+      " page is also written at the sweep root: summary cards, swept"
+      " args + metrics, and a per-trade P/L table whose rows link to"
+      " each trade's per-grain charts — open it first.",
+  .group       = USERNS_GROUP_ADMIN,
+  .level       = 100,
+  .scope       = CMD_SCOPE_ANY,
+  .methods     = METHOD_T_ANY,
+  .cb          = wm_bt_cmd_run,
+  .parent_path = "whenmoon/backtest",
+};
+
+static const cmd_decl_t whenmoon_backtest_reload_decl = {
+  .module      = "whenmoon",
+  .name        = "reload",
+  .usage       = "whenmoon backtest reload <strategy_name>",
+  .description = "Reload a strategy plugin under the sweep gate.",
+  .help_long   = "Detaches all attachments, dlclose+dlopen+resolve+init the"
+                 " strategy plugin, re-scans the registry, then re-attaches"
+                 " the captured attachments automatically (WM-RELOAD-1)."
+                 " Acquires the global reload lock first and waits for"
+                 " in-flight sweep runs to drain (CLAM_INFO every 5s while"
+                 " waiting) — this prevents a dlclose from invalidating"
+                 " function pointers cached for an active worker iteration.",
+  .group       = USERNS_GROUP_ADMIN,
+  .level       = 100,
+  .scope       = CMD_SCOPE_ANY,
+  .methods     = METHOD_T_ANY,
+  .cb          = wm_bt_cmd_reload,
+  .parent_path = "whenmoon/backtest",
+};
+
+static const cmd_decl_t whenmoon_backtest_compile_decl = {
+  .module      = "whenmoon",
+  .name        = "compile",
+  .usage       = "whenmoon backtest compile <market_id> <path.wm> [<days>]"
+                 " [--until <date>]",
+  .description = "Compile a .wm snapshot file from persisted 1m candles"
+                 " (async).",
+  .help_long   =
+      "Validates the request, then returns immediately with a"
+      " 'task created' acknowledgement: the build runs on a worker"
+      " task at the lowest priority (254) so it never delays"
+      " interactive commands. Track it with /show tasks; the result"
+      " (or any failure) is reported in the log on completion.\n"
+      "The task builds an isolated wm_backtest_snapshot_t from the"
+      " wm_candles_<id> table over the most recent <days> of 1m"
+      " history (default 0 = all available history), then serialises"
+      " the snapshot to <path.wm> via mmap-friendly host-endian"
+      " binary form.\n"
+      "--until <date> (MM/dd/yyyy or YYYY-MM-DD, UTC midnight) caps"
+      " the range's newest edge so research corpora freeze at the"
+      " WM-RIGOR-6 holdout cutoff no matter when they are compiled;"
+      " a <days> lookback then anchors at the cap (days back from"
+      " <date>, not from now), so the two compose.\n"
+      "The binary form is host-portable across daemon restarts"
+      " (WM-BT-2 format magic 0x4D4E4257, version 1).\n"
+      "The pre-flight tolerates gaps of any size (illiquid early"
+      " history is legitimately sparse) and only refuses an entirely"
+      " empty range. Output is atomic via tmp+fsync+rename. Re-runs"
+      " overwrite an existing file at <path>.\n"
+      "Compiled .wm files survive daemon restarts and are the input"
+      " to /whenmoon backtest run in WM-BT-6.",
+  .group       = USERNS_GROUP_ADMIN,
+  .level       = 100,
+  .scope       = CMD_SCOPE_ANY,
+  .methods     = METHOD_T_ANY,
+  .cb          = wm_bt_cmd_compile,
+  .parent_path = "whenmoon/backtest",
+};
+
+static const cmd_decl_t whenmoon_backtest_inspect_decl = {
+  .module      = "whenmoon",
+  .name        = "inspect",
+  .usage       = "whenmoon backtest inspect <path.wm>",
+  .description = "Render the .wm file's header without loading any candles.",
+  .help_long   =
+      "Reads just the wm_bt_file_header_t at offset 0 and prints"
+      " each field on its own line: magic, file_version, indicator"
+      " schema version, bar_size, source_market_id, range, per-grain"
+      " bar counts + offsets. Stale-schema files inspect cleanly"
+      " (emits a NOTE) but cannot be loaded — recompile with the"
+      " current daemon to refresh the indicator schema.",
+  .group       = USERNS_GROUP_ADMIN,
+  .level       = 100,
+  .scope       = CMD_SCOPE_ANY,
+  .methods     = METHOD_T_ANY,
+  .cb          = wm_bt_cmd_inspect,
+  .parent_path = "whenmoon/backtest",
+};
+
+static const cmd_decl_t whenmoon_backtest_list_decl = {
+  .module      = "whenmoon",
+  .name        = "list",
+  .usage       = "whenmoon backtest list",
+  .description = "List on-disk sweeps, newest-first.",
+  .help_long   = "Walks plugin.whenmoon.backtest.report_path (default"
+                 " $HOME/.local/share/botmanager/backtests/) and prints one"
+                 " line per sweep directory whose name matches the canonical"
+                 " YYYYMMDD-HHMMSS-<strategy>-<short_market> prefix. Each line"
+                 " shows the sweep id, strategy, total iterations, ranking"
+                 " metric, and ok/fail counts pulled from manifest.json."
+                 " Sweeps with no manifest (interrupted writes) still appear,"
+                 " tagged '(no manifest)'.",
+  .group       = USERNS_GROUP_ADMIN,
+  .level       = 100,
+  .scope       = CMD_SCOPE_ANY,
+  .methods     = METHOD_T_ANY,
+  .cb          = wm_bt_cmd_list,
+  .parent_path = "whenmoon/backtest",
+};
+
+static const cmd_decl_t whenmoon_backtest_show_decl = {
+  .module      = "whenmoon",
+  .name        = "show",
+  .usage       = "whenmoon backtest show <sweep_id>",
+  .description = "Cat <sweep_dir>/report.md line-by-line.",
+  .help_long   =
+      "Looks up <sweep_id> under plugin.whenmoon.backtest.report_path"
+      " and streams its report.md back via cmd_reply. The renderer"
+      " materialises everything to disk at sweep end, so this verb"
+      " stays minimal — no JSON parsing, no recomputation. Sweeps"
+      " from before WM-BT-7 land here without a report.md and"
+      " surface a one-line note instead of a synthesised summary.",
+  .group       = USERNS_GROUP_ADMIN,
+  .level       = 100,
+  .scope       = CMD_SCOPE_ANY,
+  .methods     = METHOD_T_ANY,
+  .cb          = wm_bt_cmd_show,
+  .parent_path = "whenmoon/backtest",
+};
+
 bool
 wm_backtest_register_verbs(void)
 {
   // /whenmoon backtest parent.
-  if(cmd_register("whenmoon", "backtest",
-        "whenmoon backtest <verb> ...",
-        "Backtest runner + sweep planner.",
-        "Subcommands: run <path.wm> <strat> [name=value ...],"
-        " compile <market_id> <path.wm> [<days>] [--until <date>],"
-        " inspect <path.wm>,"
-        " list,"
-        " show <sweep_id>,"
-        " reload <strat>.",
-        USERNS_GROUP_ADMIN, 100, CMD_SCOPE_ANY, METHOD_T_ANY,
-        wm_bt_parent_cb, NULL, "whenmoon", NULL,
-        NULL, 0, NULL, NULL) != SUCCESS)
+  if(cmd_register(&whenmoon_backtest_decl) != SUCCESS)
     return(FAIL);
 
-  if(cmd_register("whenmoon", "run",
-        "whenmoon backtest run <path.wm> <strategy>"
-        " [<name>=<v|[v,...]|lo:step:hi>] (repeatable)"
-        " [--fee-bps N] [--slip-bps N] [--size-frac F] [--cash N]"
-        " [--config <path.json>] [--threads N]"
-        " [--rank-by realized|sharpe|sortino|equity|pf]"
-        " [--top-n K] [--perfold-top N]"
-        " [--walk-forward train=Td:test=Md:step=Sd]"
-        " [--oos-tail PCT]"
-        " [--fill close|next-open]"
-        " [--holdout] [--charts]",
-        "Run a backtest against a compiled .wm snapshot — single"
-        " iteration, parameter sweep, walk-forward, or OOS-tail"
-        " validation.",
-        "mmap's the .wm file (compiled via /whenmoon backtest compile)"
-        " and walks the strategy through a paper trade book. Range +"
-        " corpus come from the .wm header; the verb no longer takes"
-        " dates. Positional `name=value` tokens are sweep axes routed"
-        " through the same parser as previous `--sweep` flags;"
-        " accepted value forms are bare list `v1,v2,v3`, bracketed"
-        " list `[v1,v2,v3]`, or range `lo:step:hi`. Zero axes = one"
-        " iteration; N axes = cartesian-product sweep.\n"
-        "--threads defaults to max(1, nproc - 2) so the host keeps"
-        " two cores free, further capped by the KV"
-        " plugin.whenmoon.backtest.max_threads (0 = no cap) and"
-        " clamped to [1, 64]. Workers run at nice 19 (lowest"
-        " priority) so a long sweep never starves IRC, marketwatch,"
-        " or the live engine. Each iteration runs on a private"
-        " trade-book registry so parallel workers do not contend on"
-        " a global mutex.\n"
-        "--config <path.json> loads a sweep matrix from a JSON file"
-        " shaped {\"params\": {\"name\": <scalar|list|{start,step,end}>,"
-        " ...}}. Inline `name=value` axes override matching entries"
-        " loaded from --config, regardless of argv order.\n"
-        "--rank-by selects the ranking metric (default realized).\n"
-        "--top-n caps the number of top rows shown after the run"
-        " (default 20 when sweeping, 1 otherwise) and the number of"
-        " rows the OOS post-pass validates.\n"
-        "--perfold-top N widens the walk-forward per-fold breakdown to"
-        " the top N configs independently of --top-n (default: follow"
-        " --top-n). Feeds wm_score.py --overfit (rank-stability/PBO"
-        " need a config×fold matrix). Each fold re-walks the full"
-        " snapshot for warmup, so N=100 on a big sweep is an overnight"
-        " run.\n"
-        "--walk-forward expands each param vector into N test windows"
-        " (train days warm the strategy state but only test windows"
-        " accumulate fills); the recorded score is the cumulative"
-        " test-window result. A post-pass then re-measures each test"
-        " window INDEPENDENTLY (own book from starting cash, warmed by"
-        " prior history) for the top-N rows and emits a non-compounding"
-        " per-fold breakdown as a windows[] array in iterations.jsonl"
-        " plus a per-window table (rank 1) in report.md.\n"
-        "--oos-tail PCT reserves the last PCT%% of the range as out-of"
-        "-sample; the sweep optimises on the head, then the post-pass"
-        " runs the top-N on the tail and stamps the OOS columns on"
-        " each row. PCT clamped to [1, 50].\n"
-        "--walk-forward and --oos-tail are mutually exclusive.\n"
-        "--fill selects the execution model (WM-RIGOR-5). `close`"
-        " (default) fills each signal at its own bar's close ± slip —"
-        " a free look at the close that generated the signal."
-        " `next-open` defers execution to the NEXT 1m bar and fills at"
-        " that bar's open ± slip (terminal-bar advice with no next bar"
-        " is dropped and counted in the log). Backtest-only; live"
-        " trading is unaffected. Compare both modes on a fixed config:"
-        " <10%% rr decay = healthy; >30%% = the edge was fill fiction.\n"
-        "--holdout is required when the corpus extends past the"
-        " 2025-03-31 research cutoff; the access is audit-logged"
-        " (COMPSTART.md §Holdout discipline).\n"
-        "Each invocation writes a sweep directory under"
-        " plugin.whenmoon.backtest.report_path (defaulting to"
-        " $HOME/.local/share/botmanager/backtests/) containing"
-        " manifest.json, iterations.jsonl, top-N.txt, report.md, and"
-        " a charts/ subdir. Single-config runs also write equity.jsonl"
-        " (daily MTM marks) + fills.jsonl; every run's metrics carry"
-        " mtm_max_dd + daily_sharpe_ann from the same daily marks"
-        " (per-fill max_drawdown only observes fill days).\n"
-        "--charts forces Lightweight Charts HTML emission for this"
-        " run (default-off unless"
-        " plugin.whenmoon.backtest.charts_enabled=true). SINGLE-CONFIG"
-        " RUNS ONLY: charts are a per-trade analysis artifact, so a"
-        " parameter sweep skips them (it would emit trades x grains x"
-        " top-K files) and emits only the ranked metrics — re-run the"
-        " chosen config with no sweep axes to chart it. One file per"
-        " matched buy→sell trade pair, for EVERY grain the snapshot"
-        " carries (1m..1d), written to charts/trade-M-<gran>.html, so"
-        " the count is round-trip-trades x grains. An index.html landing"
-        " page is also written at the sweep root: summary cards, swept"
-        " args + metrics, and a per-trade P/L table whose rows link to"
-        " each trade's per-grain charts — open it first.",
-        USERNS_GROUP_ADMIN, 100, CMD_SCOPE_ANY, METHOD_T_ANY,
-        wm_bt_cmd_run, NULL, "whenmoon/backtest", NULL,
-        NULL, 0, NULL, NULL) != SUCCESS)
+  if(cmd_register(&whenmoon_backtest_run_decl) != SUCCESS)
     return(FAIL);
 
-  if(cmd_register("whenmoon", "reload",
-        "whenmoon backtest reload <strategy_name>",
-        "Reload a strategy plugin under the sweep gate.",
-        "Detaches all attachments, dlclose+dlopen+resolve+init the"
-        " strategy plugin, re-scans the registry, then re-attaches"
-        " the captured attachments automatically (WM-RELOAD-1)."
-        " Acquires the global reload lock first and waits for"
-        " in-flight sweep runs to drain (CLAM_INFO every 5s while"
-        " waiting) — this prevents a dlclose from invalidating"
-        " function pointers cached for an active worker iteration.",
-        USERNS_GROUP_ADMIN, 100, CMD_SCOPE_ANY, METHOD_T_ANY,
-        wm_bt_cmd_reload, NULL, "whenmoon/backtest", NULL,
-        NULL, 0, NULL, NULL) != SUCCESS)
+  if(cmd_register(&whenmoon_backtest_reload_decl) != SUCCESS)
     return(FAIL);
 
-  if(cmd_register("whenmoon", "compile",
-        "whenmoon backtest compile <market_id> <path.wm> [<days>]"
-        " [--until <date>]",
-        "Compile a .wm snapshot file from persisted 1m candles (async).",
-        "Validates the request, then returns immediately with a"
-        " 'task created' acknowledgement: the build runs on a worker"
-        " task at the lowest priority (254) so it never delays"
-        " interactive commands. Track it with /show tasks; the result"
-        " (or any failure) is reported in the log on completion.\n"
-        "The task builds an isolated wm_backtest_snapshot_t from the"
-        " wm_candles_<id> table over the most recent <days> of 1m"
-        " history (default 0 = all available history), then serialises"
-        " the snapshot to <path.wm> via mmap-friendly host-endian"
-        " binary form.\n"
-        "--until <date> (MM/dd/yyyy or YYYY-MM-DD, UTC midnight) caps"
-        " the range's newest edge so research corpora freeze at the"
-        " WM-RIGOR-6 holdout cutoff no matter when they are compiled;"
-        " a <days> lookback then anchors at the cap (days back from"
-        " <date>, not from now), so the two compose.\n"
-        "The binary form is host-portable across daemon restarts"
-        " (WM-BT-2 format magic 0x4D4E4257, version 1).\n"
-        "The pre-flight tolerates gaps of any size (illiquid early"
-        " history is legitimately sparse) and only refuses an entirely"
-        " empty range. Output is atomic via tmp+fsync+rename. Re-runs"
-        " overwrite an existing file at <path>.\n"
-        "Compiled .wm files survive daemon restarts and are the input"
-        " to /whenmoon backtest run in WM-BT-6.",
-        USERNS_GROUP_ADMIN, 100, CMD_SCOPE_ANY, METHOD_T_ANY,
-        wm_bt_cmd_compile, NULL, "whenmoon/backtest", NULL,
-        NULL, 0, NULL, NULL) != SUCCESS)
+  if(cmd_register(&whenmoon_backtest_compile_decl) != SUCCESS)
     return(FAIL);
 
-  if(cmd_register("whenmoon", "inspect",
-        "whenmoon backtest inspect <path.wm>",
-        "Render the .wm file's header without loading any candles.",
-        "Reads just the wm_bt_file_header_t at offset 0 and prints"
-        " each field on its own line: magic, file_version, indicator"
-        " schema version, bar_size, source_market_id, range, per-grain"
-        " bar counts + offsets. Stale-schema files inspect cleanly"
-        " (emits a NOTE) but cannot be loaded — recompile with the"
-        " current daemon to refresh the indicator schema.",
-        USERNS_GROUP_ADMIN, 100, CMD_SCOPE_ANY, METHOD_T_ANY,
-        wm_bt_cmd_inspect, NULL, "whenmoon/backtest", NULL,
-        NULL, 0, NULL, NULL) != SUCCESS)
+  if(cmd_register(&whenmoon_backtest_inspect_decl) != SUCCESS)
     return(FAIL);
 
-  if(cmd_register("whenmoon", "list",
-        "whenmoon backtest list",
-        "List on-disk sweeps, newest-first.",
-        "Walks plugin.whenmoon.backtest.report_path (default"
-        " $HOME/.local/share/botmanager/backtests/) and prints one"
-        " line per sweep directory whose name matches the canonical"
-        " YYYYMMDD-HHMMSS-<strategy>-<short_market> prefix. Each line"
-        " shows the sweep id, strategy, total iterations, ranking"
-        " metric, and ok/fail counts pulled from manifest.json."
-        " Sweeps with no manifest (interrupted writes) still appear,"
-        " tagged '(no manifest)'.",
-        USERNS_GROUP_ADMIN, 100, CMD_SCOPE_ANY, METHOD_T_ANY,
-        wm_bt_cmd_list, NULL, "whenmoon/backtest", NULL,
-        NULL, 0, NULL, NULL) != SUCCESS)
+  if(cmd_register(&whenmoon_backtest_list_decl) != SUCCESS)
     return(FAIL);
 
-  if(cmd_register("whenmoon", "show",
-        "whenmoon backtest show <sweep_id>",
-        "Cat <sweep_dir>/report.md line-by-line.",
-        "Looks up <sweep_id> under plugin.whenmoon.backtest.report_path"
-        " and streams its report.md back via cmd_reply. The renderer"
-        " materialises everything to disk at sweep end, so this verb"
-        " stays minimal — no JSON parsing, no recomputation. Sweeps"
-        " from before WM-BT-7 land here without a report.md and"
-        " surface a one-line note instead of a synthesised summary.",
-        USERNS_GROUP_ADMIN, 100, CMD_SCOPE_ANY, METHOD_T_ANY,
-        wm_bt_cmd_show, NULL, "whenmoon/backtest", NULL,
-        NULL, 0, NULL, NULL) != SUCCESS)
+  if(cmd_register(&whenmoon_backtest_show_decl) != SUCCESS)
     return(FAIL);
 
   return(SUCCESS);

@@ -383,18 +383,27 @@ static const char giphy_help[] =
     "  !giphy -r -v excited\n"
     "  !giphy -t -n 5";
 
+static const cmd_decl_t giphy_decl = {
+  .module      = GIPHY_CTX,
+  .name        = "giphy",
+  .usage       = GIPHY_CMD_USAGE,
+  .description = "Animated GIF search via Giphy (giphy.com)",
+  .help_long   = giphy_help,
+  .group       = USERNS_GROUP_EVERYONE,
+  .scope       = CMD_SCOPE_ANY,
+  .methods     = METHOD_T_ANY,
+  .cb          = giphy_cmd,
+  .abbrev      = "gif",
+  .nl          = &giphy_nl,
+};
+
 // The registry records GIPHY_CTX as the providing module: after the
 // merge the giphy plugin itself owns this command, and `/show commands`
 // should say so.
 bool
 giphy_cmd_register(void)
 {
-  if(cmd_register(GIPHY_CTX, "giphy", GIPHY_CMD_USAGE,
-      "Animated GIF search via Giphy (giphy.com)",
-      giphy_help,
-      USERNS_GROUP_EVERYONE, 0, CMD_SCOPE_ANY, METHOD_T_ANY,
-      giphy_cmd, NULL, NULL, "gif",
-      NULL, 0, NULL, &giphy_nl) != SUCCESS)
+  if(cmd_register(&giphy_decl) != SUCCESS)
     return(FAIL);
 
   clam(CLAM_INFO, GIPHY_CMD_CTX, "!giphy registered");

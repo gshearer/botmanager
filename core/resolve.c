@@ -1097,15 +1097,12 @@ resolve_cmd_resolve(const cmd_ctx_t *ctx)
     resolve_cmd_complete(req, (uint8_t)(qcount - submitted));
 }
 
-// Register the !resolve user command.
-void
-resolve_register_commands(void)
-{
-  pthread_mutex_init(&resolve_cmd_free_mu, NULL);
-
-  cmd_register("resolve", "resolve",
-      "resolve <target> [-v]",
-      "DNS lookup for a hostname or IP address",
+static const cmd_decl_t resolve_decl = {
+  .module      = "resolve",
+  .name        = "resolve",
+  .usage       = "resolve <target> [-v]",
+  .description = "DNS lookup for a hostname or IP address",
+  .help_long   =
       "Performs a DNS lookup on the given target.\n"
       "\n"
       "By default, returns only A records. Use -v (verbose) to query\n"
@@ -1117,9 +1114,22 @@ resolve_register_commands(void)
       "  resolve google.com -v\n"
       "  resolve 8.8.8.8\n"
       "  resolve 2001:4860:4860::8888",
-      USERNS_GROUP_EVERYONE, 0, CMD_SCOPE_ANY, METHOD_T_ANY, resolve_cmd_resolve, NULL, NULL, "res",
-      ad_resolve, (uint8_t)(sizeof(ad_resolve) / sizeof(ad_resolve[0])),
-      NULL, NULL);
+  .group       = USERNS_GROUP_EVERYONE,
+  .scope       = CMD_SCOPE_ANY,
+  .methods     = METHOD_T_ANY,
+  .cb          = resolve_cmd_resolve,
+  .abbrev      = "res",
+  .arg_desc    = ad_resolve,
+  .arg_count   = (uint8_t)(sizeof(ad_resolve) / sizeof(ad_resolve[0])),
+};
+
+// Register the !resolve user command.
+void
+resolve_register_commands(void)
+{
+  pthread_mutex_init(&resolve_cmd_free_mu, NULL);
+
+  cmd_register(&resolve_decl);
 }
 
 // Statistics

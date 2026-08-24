@@ -397,21 +397,24 @@ cmd_show_knowledge_corpus(const cmd_ctx_t *ctx)
 
 // Registration
 
-void
-knowledge_register_commands(void)
-{
-  // /knowledge root (container).
-  cmd_register("knowledge", "knowledge",
-      "knowledge",
-      "Knowledge corpus administration",
-      NULL,
-      USERNS_GROUP_ADMIN, 100, CMD_SCOPE_PRIVATE, METHOD_T_ANY,
-      cmd_knowledge_root, NULL, NULL, NULL, NULL, 0, NULL, NULL);
+static const cmd_decl_t knowledge_decl = {
+  .module      = "knowledge",
+  .name        = "knowledge",
+  .usage       = "knowledge",
+  .description = "Knowledge corpus administration",
+  .group       = USERNS_GROUP_ADMIN,
+  .level       = 100,
+  .scope       = CMD_SCOPE_PRIVATE,
+  .methods     = METHOD_T_ANY,
+  .cb          = cmd_knowledge_root,
+};
 
-  // /knowledge ingest <corpus> <path> [base-url]
-  cmd_register("knowledge", "ingest",
-      "knowledge ingest <corpus> <path|url> [base-url]",
-      "Ingest a file, directory or URL into a corpus",
+static const cmd_decl_t knowledge_ingest_decl = {
+  .module      = "knowledge",
+  .name        = "ingest",
+  .usage       = "knowledge ingest <corpus> <path|url> [base-url]",
+  .description = "Ingest a file, directory or URL into a corpus",
+  .help_long   =
       "Slurps the file (or every .md/.markdown/.txt in a directory),"
       " splits into chunks, and writes them to the named corpus."
       " Creates the corpus on first use. Embeddings are submitted"
@@ -427,75 +430,156 @@ knowledge_register_commands(void)
       " arrives asynchronously, so give botmanctl a -w. An argument"
       " longer than 255 bytes is silently truncated by the command"
       " parser, which this path cannot detect.",
-      USERNS_GROUP_ADMIN, 100, CMD_SCOPE_PRIVATE, METHOD_T_ANY,
-      cmd_knowledge_ingest, NULL, "knowledge", "i",
-      ad_kw_ingest, (uint8_t)(sizeof(ad_kw_ingest) / sizeof(ad_kw_ingest[0])), NULL, NULL);
+  .group       = USERNS_GROUP_ADMIN,
+  .level       = 100,
+  .scope       = CMD_SCOPE_PRIVATE,
+  .methods     = METHOD_T_ANY,
+  .cb          = cmd_knowledge_ingest,
+  .parent_path = "knowledge",
+  .abbrev      = "i",
+  .arg_desc    = ad_kw_ingest,
+  .arg_count   = (uint8_t)(sizeof(ad_kw_ingest) / sizeof(ad_kw_ingest[0])),
+};
 
-  // /knowledge corpus (container) + /knowledge corpus {upsert,del}
-  cmd_register("knowledge", "corpus",
-      "knowledge corpus",
-      "Corpus management (upsert, del)",
-      NULL,
-      USERNS_GROUP_ADMIN, 100, CMD_SCOPE_PRIVATE, METHOD_T_ANY,
-      cmd_knowledge_corpus_root, NULL, "knowledge", NULL, NULL, 0, NULL, NULL);
+static const cmd_decl_t knowledge_corpus_decl = {
+  .module      = "knowledge",
+  .name        = "corpus",
+  .usage       = "knowledge corpus",
+  .description = "Corpus management (upsert, del)",
+  .group       = USERNS_GROUP_ADMIN,
+  .level       = 100,
+  .scope       = CMD_SCOPE_PRIVATE,
+  .methods     = METHOD_T_ANY,
+  .cb          = cmd_knowledge_corpus_root,
+  .parent_path = "knowledge",
+};
 
-  cmd_register("knowledge", "upsert",
-      "knowledge corpus upsert <name>",
-      "Create (or ensure) a named corpus; thin wrapper over"
-      " knowledge_corpus_upsert()",
+static const cmd_decl_t knowledge_corpus_upsert_decl = {
+  .module      = "knowledge",
+  .name        = "upsert",
+  .usage       = "knowledge corpus upsert <name>",
+  .description = "Create (or ensure) a named corpus; thin wrapper over"
+                 " knowledge_corpus_upsert()",
+  .help_long   =
       "Useful as a bootstrap step — bm-restore.sh uses this to create"
       " an acquired-content corpus before binding it via"
       " bot.<name>.llm.acquired_corpus. Idempotent: re-running is a"
       " no-op when the corpus already exists.",
-      USERNS_GROUP_ADMIN, 100, CMD_SCOPE_PRIVATE, METHOD_T_ANY,
-      cmd_knowledge_corpus_upsert, NULL, "knowledge/corpus", "u",
-      ad_kw_corpus_upsert,
-      (uint8_t)(sizeof(ad_kw_corpus_upsert) / sizeof(ad_kw_corpus_upsert[0])), NULL, NULL);
+  .group       = USERNS_GROUP_ADMIN,
+  .level       = 100,
+  .scope       = CMD_SCOPE_PRIVATE,
+  .methods     = METHOD_T_ANY,
+  .cb          = cmd_knowledge_corpus_upsert,
+  .parent_path = "knowledge/corpus",
+  .abbrev      = "u",
+  .arg_desc    = ad_kw_corpus_upsert,
+  .arg_count   = (uint8_t)(sizeof(ad_kw_corpus_upsert)
+                 / sizeof(ad_kw_corpus_upsert[0])),
+};
 
-  cmd_register("knowledge", "del",
-      "knowledge corpus del <name>",
-      "Delete a corpus and all its chunks + embeddings",
-      NULL,
-      USERNS_GROUP_ADMIN, 100, CMD_SCOPE_PRIVATE, METHOD_T_ANY,
-      cmd_knowledge_corpus_del, NULL, "knowledge/corpus", "d",
-      ad_kw_corpus_del,
-      (uint8_t)(sizeof(ad_kw_corpus_del) / sizeof(ad_kw_corpus_del[0])), NULL, NULL);
+static const cmd_decl_t knowledge_corpus_del_decl = {
+  .module      = "knowledge",
+  .name        = "del",
+  .usage       = "knowledge corpus del <name>",
+  .description = "Delete a corpus and all its chunks + embeddings",
+  .group       = USERNS_GROUP_ADMIN,
+  .level       = 100,
+  .scope       = CMD_SCOPE_PRIVATE,
+  .methods     = METHOD_T_ANY,
+  .cb          = cmd_knowledge_corpus_del,
+  .parent_path = "knowledge/corpus",
+  .abbrev      = "d",
+  .arg_desc    = ad_kw_corpus_del,
+  .arg_count   = (uint8_t)(sizeof(ad_kw_corpus_del)
+                 / sizeof(ad_kw_corpus_del[0])),
+};
+
+static const cmd_decl_t knowledge_stats_decl = {
+  .module      = "knowledge",
+  .name        = "stats",
+  .usage       = "knowledge stats [<corpus>]",
+  .description = "Show per-corpus or subsystem-wide statistics",
+  .group       = USERNS_GROUP_ADMIN,
+  .level       = 100,
+  .scope       = CMD_SCOPE_ANY,
+  .methods     = METHOD_T_ANY,
+  .cb          = cmd_knowledge_stats,
+  .parent_path = "knowledge",
+  .abbrev      = "s",
+  .arg_desc    = ad_kw_stats,
+  .arg_count   = (uint8_t)(sizeof(ad_kw_stats) / sizeof(ad_kw_stats[0])),
+};
+
+static const cmd_decl_t show_knowledge_decl = {
+  .module      = "knowledge",
+  .name        = "knowledge",
+  .usage       = "show knowledge",
+  .description = "Show knowledge subsystem state",
+  .group       = USERNS_GROUP_ADMIN,
+  .level       = 100,
+  .scope       = CMD_SCOPE_ANY,
+  .methods     = METHOD_T_ANY,
+  .cb          = cmd_show_knowledge,
+  .parent_path = "show",
+  .abbrev      = "kw",
+};
+
+static const cmd_decl_t show_knowledge_corpora_decl = {
+  .module      = "knowledge",
+  .name        = "corpora",
+  .usage       = "show knowledge corpora",
+  .description = "List all ingested corpora",
+  .group       = USERNS_GROUP_ADMIN,
+  .level       = 100,
+  .scope       = CMD_SCOPE_ANY,
+  .methods     = METHOD_T_ANY,
+  .cb          = cmd_show_knowledge_corpora,
+  .parent_path = "show/knowledge",
+};
+
+static const cmd_decl_t show_knowledge_corpus_decl = {
+  .module      = "knowledge",
+  .name        = "corpus",
+  .usage       = "show knowledge corpus <name>",
+  .description = "Preview the 20 most recently ingested chunks of a corpus",
+  .group       = USERNS_GROUP_ADMIN,
+  .level       = 100,
+  .scope       = CMD_SCOPE_ANY,
+  .methods     = METHOD_T_ANY,
+  .cb          = cmd_show_knowledge_corpus,
+  .parent_path = "show/knowledge",
+  .abbrev      = "c",
+  .arg_desc    = ad_kw_corpus_show,
+  .arg_count   = (uint8_t)(sizeof(ad_kw_corpus_show)
+                 / sizeof(ad_kw_corpus_show[0])),
+};
+
+void
+knowledge_register_commands(void)
+{
+  // /knowledge root (container).
+  cmd_register(&knowledge_decl);
+
+  // /knowledge ingest <corpus> <path> [base-url]
+  cmd_register(&knowledge_ingest_decl);
+
+  // /knowledge corpus (container) + /knowledge corpus {upsert,del}
+  cmd_register(&knowledge_corpus_decl);
+  cmd_register(&knowledge_corpus_upsert_decl);
+  cmd_register(&knowledge_corpus_del_decl);
 
   // /knowledge stats [<corpus>]
-  cmd_register("knowledge", "stats",
-      "knowledge stats [<corpus>]",
-      "Show per-corpus or subsystem-wide statistics",
-      NULL,
-      USERNS_GROUP_ADMIN, 100, CMD_SCOPE_ANY, METHOD_T_ANY,
-      cmd_knowledge_stats, NULL, "knowledge", "s",
-      ad_kw_stats, (uint8_t)(sizeof(ad_kw_stats) / sizeof(ad_kw_stats[0])), NULL, NULL);
+  cmd_register(&knowledge_stats_decl);
 
   // /show knowledge — subsystem state. Shares the "knowledge" name
   // with the /knowledge root above; tree position (parent "show" vs
   // parent NULL) keeps them distinct at dispatch time.
-  cmd_register("knowledge", "knowledge",
-      "show knowledge",
-      "Show knowledge subsystem state",
-      NULL,
-      USERNS_GROUP_ADMIN, 100, CMD_SCOPE_ANY, METHOD_T_ANY,
-      cmd_show_knowledge, NULL, "show", "kw", NULL, 0, NULL, NULL);
+  cmd_register(&show_knowledge_decl);
 
   // /show knowledge corpora — list all corpora.
-  cmd_register("knowledge", "corpora",
-      "show knowledge corpora",
-      "List all ingested corpora",
-      NULL,
-      USERNS_GROUP_ADMIN, 100, CMD_SCOPE_ANY, METHOD_T_ANY,
-      cmd_show_knowledge_corpora, NULL, "show/knowledge", NULL, NULL, 0, NULL, NULL);
+  cmd_register(&show_knowledge_corpora_decl);
 
   // /show knowledge corpus <name> — preview recent chunks. Same name
   // as /knowledge corpus above; parent path disambiguates.
-  cmd_register("knowledge", "corpus",
-      "show knowledge corpus <name>",
-      "Preview the 20 most recently ingested chunks of a corpus",
-      NULL,
-      USERNS_GROUP_ADMIN, 100, CMD_SCOPE_ANY, METHOD_T_ANY,
-      cmd_show_knowledge_corpus, NULL, "show/knowledge", "c",
-      ad_kw_corpus_show,
-      (uint8_t)(sizeof(ad_kw_corpus_show) / sizeof(ad_kw_corpus_show[0])), NULL, NULL);
+  cmd_register(&show_knowledge_corpus_decl);
 }

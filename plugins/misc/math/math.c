@@ -106,15 +106,25 @@ static const cmd_nl_t math_nl = {
   .example_count = (uint8_t)(sizeof(math_examples) / sizeof(math_examples[0])),
 };
 
+static const cmd_decl_t math_decl = {
+  .module      = MATH_CTX,
+  .name        = "math",
+  .usage       = "math <expression>",
+  .description = "Evaluate a mathematical expression",
+  .group       = "everyone",
+  .scope       = CMD_SCOPE_ANY,
+  .methods     = METHOD_T_ANY,
+  .cb          = math_cmd,
+  .abbrev      = "ma",
+  .arg_desc    = math_ad,
+  .arg_count   = 1,
+  .nl          = &math_nl,
+};
+
 static bool
 math_init(void)
 {
-  if(cmd_register(MATH_CTX, "math",
-      "math <expression>",
-      "Evaluate a mathematical expression",
-      NULL,
-      "everyone", 0, CMD_SCOPE_ANY, METHOD_T_ANY, math_cmd, NULL, NULL, "ma",
-      math_ad, 1, NULL, &math_nl) != SUCCESS)
+  if(cmd_register(&math_decl) != SUCCESS)
     return(FAIL);
 
   return(SUCCESS);

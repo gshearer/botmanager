@@ -1646,7 +1646,7 @@ chatbot_nl_kv_suffix(const char *key, const char *botname,
 // NL hint. The tree only goes ~2 levels deep in the current codebase
 // (root + one layer of subcommands for show/set/bot), so we also walk
 // children of each root here. Deeper NL hints are still opt-in via
-// cmd_register(...) — a plugin author nesting past depth 1 would add
+// a cmd_decl_t.nl hint — a plugin author nesting past depth 1 would add
 // another layer below, handled by the recursive walk inside this cb.
 
 static void

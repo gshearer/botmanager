@@ -452,52 +452,87 @@ cmd_show_dossiers_candidates(const cmd_ctx_t *ctx)
 
 // Registration — /show dossiers container
 
-void
-dossier_show_register_candidates(void)
-{
-  cmd_register("dossier", "dossiers",
-      "show dossiers [<subcommand>]",
-      "Dossier listings and candidates",
-      NULL,
-      USERNS_GROUP_ADMIN, 100, CMD_SCOPE_ANY, METHOD_T_ANY,
-      cmd_show_dossiers_root, NULL, "show", NULL,
-      NULL, 0, NULL, NULL);
+static const cmd_decl_t show_dossiers_decl = {
+  .module      = "dossier",
+  .name        = "dossiers",
+  .usage       = "show dossiers [<subcommand>]",
+  .description = "Dossier listings and candidates",
+  .group       = USERNS_GROUP_ADMIN,
+  .level       = 100,
+  .scope       = CMD_SCOPE_ANY,
+  .methods     = METHOD_T_ANY,
+  .cb          = cmd_show_dossiers_root,
+  .parent_path = "show",
+};
 
-  cmd_register("dossier", "candidates",
-      "show dossiers candidates <bot> <user>",
-      "MFA-match dossier candidates for a user",
+static const cmd_decl_t show_dossiers_candidates_decl = {
+  .module      = "dossier",
+  .name        = "candidates",
+  .usage       = "show dossiers candidates <bot> <user>",
+  .description = "MFA-match dossier candidates for a user",
+  .help_long   =
       "Reconstructs each dossier's MFA string from its signatures\n"
       "and checks against the user's registered MFA patterns. Only\n"
       "IRC-method dossiers participate today; other methods are\n"
       "skipped. The <bot> argument drives userns lookup.",
-      USERNS_GROUP_ADMIN, 100, CMD_SCOPE_ANY, METHOD_T_ANY,
-      cmd_show_dossiers_candidates, NULL, "show/dossiers", NULL,
-      ad_show_dossiers_candidates,
-      (uint8_t)(sizeof(ad_show_dossiers_candidates)
-               / sizeof(ad_show_dossiers_candidates[0])),
-      NULL, NULL);
+  .group       = USERNS_GROUP_ADMIN,
+  .level       = 100,
+  .scope       = CMD_SCOPE_ANY,
+  .methods     = METHOD_T_ANY,
+  .cb          = cmd_show_dossiers_candidates,
+  .parent_path = "show/dossiers",
+  .arg_desc    = ad_show_dossiers_candidates,
+  .arg_count   = (uint8_t)(sizeof(ad_show_dossiers_candidates)
+                 / sizeof(ad_show_dossiers_candidates[0])),
+};
+
+void
+dossier_show_register_candidates(void)
+{
+  cmd_register(&show_dossiers_decl);
+  cmd_register(&show_dossiers_candidates_decl);
 }
 
 // Registration
 
-void
-dossier_show_register_commands(void)
-{
-  cmd_register("dossier", "dossier",
-      "show dossier [<id>]",
-      "List dossiers in the working namespace, or detail one by id",
+static const cmd_decl_t show_dossier_decl = {
+  .module      = "dossier",
+  .name        = "dossier",
+  .usage       = "show dossier [<id>]",
+  .description = "List dossiers in the working namespace, or detail one by id",
+  .help_long   =
       "Without <id>, renders a colorized table of every dossier in\n"
       "the cd'd userns. With <id>, displays that dossier's identity,\n"
       "signatures, and facts. The dossier must belong to the cd'd\n"
       "namespace. Use the 'stats' subcommand for process-wide counters.",
-      USERNS_GROUP_ADMIN, 100, CMD_SCOPE_ANY, METHOD_T_ANY,
-      cmd_show_dossier, NULL, "show", "dos", ad_show_dossier,
-      (uint8_t)(sizeof(ad_show_dossier) / sizeof(ad_show_dossier[0])), NULL, NULL);
+  .group       = USERNS_GROUP_ADMIN,
+  .level       = 100,
+  .scope       = CMD_SCOPE_ANY,
+  .methods     = METHOD_T_ANY,
+  .cb          = cmd_show_dossier,
+  .parent_path = "show",
+  .abbrev      = "dos",
+  .arg_desc    = ad_show_dossier,
+  .arg_count   = (uint8_t)(sizeof(ad_show_dossier)
+                 / sizeof(ad_show_dossier[0])),
+};
 
-  cmd_register("dossier", "stats",
-      "show dossier stats",
-      "Process-wide dossier subsystem counters",
-      NULL,
-      USERNS_GROUP_ADMIN, 100, CMD_SCOPE_ANY, METHOD_T_ANY,
-      cmd_show_dossier_stats, NULL, "show/dossier", NULL, NULL, 0, NULL, NULL);
+static const cmd_decl_t show_dossier_stats_decl = {
+  .module      = "dossier",
+  .name        = "stats",
+  .usage       = "show dossier stats",
+  .description = "Process-wide dossier subsystem counters",
+  .group       = USERNS_GROUP_ADMIN,
+  .level       = 100,
+  .scope       = CMD_SCOPE_ANY,
+  .methods     = METHOD_T_ANY,
+  .cb          = cmd_show_dossier_stats,
+  .parent_path = "show/dossier",
+};
+
+void
+dossier_show_register_commands(void)
+{
+  cmd_register(&show_dossier_decl);
+  cmd_register(&show_dossier_stats_decl);
 }

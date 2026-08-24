@@ -731,30 +731,38 @@ acquire_cmd_source_trigger(const cmd_ctx_t *ctx)
 // /acquire source trigger, /acquire digest-test. A2 shipped only the
 // /acquire root stub.
 
-void
-acquire_register_commands(void)
-{
-  cmd_register(ACQUIRE_CTX, ACQUIRE_CTX,
-      "acquire",
-      "Acquisition engine commands",
-      NULL,
-      USERNS_GROUP_ADMIN, 100, CMD_SCOPE_PRIVATE, METHOD_T_ANY,
-      acquire_cmd_root, NULL, NULL, NULL, NULL, 0, NULL, NULL);
+static const cmd_decl_t cmd_decl = {
+  .module      = ACQUIRE_CTX,
+  .name        = ACQUIRE_CTX,
+  .usage       = "acquire",
+  .description = "Acquisition engine commands",
+  .group       = USERNS_GROUP_ADMIN,
+  .level       = 100,
+  .scope       = CMD_SCOPE_PRIVATE,
+  .methods     = METHOD_T_ANY,
+  .cb          = acquire_cmd_root,
+};
 
-  // /show acquire — subsystem state. Shares the "acquire" name with
-  // the /acquire root above; tree position (parent "show" vs parent
-  // NULL) keeps them distinct at dispatch time. Mirrors the
-  // /show knowledge pattern.
-  cmd_register(ACQUIRE_CTX, "acquire",
-      "show acquire",
-      "Show acquisition engine state + lifetime counters",
-      NULL,
-      USERNS_GROUP_ADMIN, 100, CMD_SCOPE_ANY, METHOD_T_ANY,
-      acq_cmd_show_acquire, NULL, "show", "acq", NULL, 0, NULL, NULL);
+static const cmd_decl_t show_acquire_decl = {
+  .module      = ACQUIRE_CTX,
+  .name        = "acquire",
+  .usage       = "show acquire",
+  .description = "Show acquisition engine state + lifetime counters",
+  .group       = USERNS_GROUP_ADMIN,
+  .level       = 100,
+  .scope       = CMD_SCOPE_ANY,
+  .methods     = METHOD_T_ANY,
+  .cb          = acq_cmd_show_acquire,
+  .parent_path = "show",
+  .abbrev      = "acq",
+};
 
-  cmd_register(ACQUIRE_CTX, "trigger",
-      "acquire trigger <bot> <topic>",
-      "Fire a proactive query for a registered (bot, topic) pair",
+static const cmd_decl_t trigger_decl = {
+  .module      = ACQUIRE_CTX,
+  .name        = "trigger",
+  .usage       = "acquire trigger <bot> <topic>",
+  .description = "Fire a proactive query for a registered (bot, topic) pair",
+  .help_long   =
       "Bypasses the per-bot tick cadence and weight-random topic"
       " picker: the named topic runs its proactive query right now,"
       " through the same SXNG → fetch → digest → ingest chain the"
@@ -765,25 +773,40 @@ acquire_register_commands(void)
       " reached. Topics with no concrete `query` (template-only)"
       " cannot be proactively fired and will be declined with"
       " no_query.",
-      USERNS_GROUP_ADMIN, 100, CMD_SCOPE_PRIVATE, METHOD_T_ANY,
-      acquire_cmd_trigger, NULL, ACQUIRE_CTX, NULL,
-      NULL, 0, NULL, NULL);
+  .group       = USERNS_GROUP_ADMIN,
+  .level       = 100,
+  .scope       = CMD_SCOPE_PRIVATE,
+  .methods     = METHOD_T_ANY,
+  .cb          = acquire_cmd_trigger,
+  .parent_path = ACQUIRE_CTX,
+};
 
-  cmd_register(ACQUIRE_CTX, "fire",
-      "acquire fire <bot> <topic> <subject>",
-      "Enqueue a reactive job end-to-end for (bot, topic, subject)",
+static const cmd_decl_t fire_decl = {
+  .module      = ACQUIRE_CTX,
+  .name        = "fire",
+  .usage       = "acquire fire <bot> <topic> <subject>",
+  .description = "Enqueue a reactive job end-to-end for (bot, topic, subject)",
+  .help_long   =
       "Bypasses the chat-line keyword scanner: synthesises the exact"
       " (bot, topic, subject) tuple that a matching chat mention would"
       " produce, and kicks the per-bot drain so the query fires within"
       " ~1 s. Honours the dedup LRU and rate limiter.",
-      USERNS_GROUP_ADMIN, 100, CMD_SCOPE_PRIVATE, METHOD_T_ANY,
-      acquire_cmd_fire, NULL, ACQUIRE_CTX, NULL,
-      NULL, 0, NULL, NULL);
+  .group       = USERNS_GROUP_ADMIN,
+  .level       = 100,
+  .scope       = CMD_SCOPE_PRIVATE,
+  .methods     = METHOD_T_ANY,
+  .cb          = acquire_cmd_fire,
+  .parent_path = ACQUIRE_CTX,
+};
 
-  cmd_register(ACQUIRE_CTX, "digest-test",
-      "acquire digest-test <topic> <body>",
+static const cmd_decl_t digest_test_decl = {
+  .module      = ACQUIRE_CTX,
+  .name        = "digest-test",
+  .usage       = "acquire digest-test <topic> <body>",
+  .description =
       "Summarize + relevance-score an inline body via the configured"
       " chat model",
+  .help_long   =
       "Submits the given body to the acquisition digester as if it"
       " had been fetched by the reactive/active pipeline. Prints the"
       " relevance score and summary paragraph once the LLM responds.\n"
@@ -791,26 +814,33 @@ acquire_register_commands(void)
       "Useful for tuning the digester's prompt or sampling the"
       " distribution of scores on known-relevant / known-irrelevant"
       " text fixtures before letting the engine run unattended.",
-      USERNS_GROUP_ADMIN, 100, CMD_SCOPE_PRIVATE, METHOD_T_ANY,
-      acquire_cmd_digest_test, NULL, ACQUIRE_CTX, NULL,
-      NULL, 0, NULL, NULL);
+  .group       = USERNS_GROUP_ADMIN,
+  .level       = 100,
+  .scope       = CMD_SCOPE_PRIVATE,
+  .methods     = METHOD_T_ANY,
+  .cb          = acquire_cmd_digest_test,
+  .parent_path = ACQUIRE_CTX,
+};
 
-  // /acquire source <subcommand> — grouping node for feed-related
-  // admin commands. The root stub emits a short usage line.
-  cmd_register(ACQUIRE_CTX, "source",
-      "acquire source <subcommand>",
-      "Personality-declared feed admin commands",
-      NULL,
-      USERNS_GROUP_ADMIN, 100, CMD_SCOPE_PRIVATE, METHOD_T_ANY,
-      acquire_cmd_source_root, NULL, ACQUIRE_CTX, NULL,
-      NULL, 0, NULL, NULL);
+static const cmd_decl_t source_decl = {
+  .module      = ACQUIRE_CTX,
+  .name        = "source",
+  .usage       = "acquire source <subcommand>",
+  .description = "Personality-declared feed admin commands",
+  .group       = USERNS_GROUP_ADMIN,
+  .level       = 100,
+  .scope       = CMD_SCOPE_PRIVATE,
+  .methods     = METHOD_T_ANY,
+  .cb          = acquire_cmd_source_root,
+  .parent_path = ACQUIRE_CTX,
+};
 
-  // /acquire source trigger <bot> <url> — arm a declared feed for the
-  // next tick. Parent path "acquire source" (space-separated) puts
-  // this under the source grouping node above.
-  cmd_register(ACQUIRE_CTX, "trigger",
-      "acquire source trigger <bot> <url>",
-      "Arm a personality-declared feed to fire on the next tick",
+static const cmd_decl_t acquire_source_trigger_decl = {
+  .module      = ACQUIRE_CTX,
+  .name        = "trigger",
+  .usage       = "acquire source trigger <bot> <url>",
+  .description = "Arm a personality-declared feed to fire on the next tick",
+  .help_long   =
       "Locates the feed whose URL matches (case-insensitive) on the"
       " named bot and zeroes its last-fetched timestamp. The next"
       " acq_feeds_tick will therefore select it, honouring the shared"
@@ -820,9 +850,36 @@ acquire_register_commands(void)
       "Does not wait for the fetch to complete — returns immediately"
       " once the slot is armed. Watch the clam log for the resulting"
       " `feed fetch`, `feed RSS`, and `ingested` lines.",
-      USERNS_GROUP_ADMIN, 100, CMD_SCOPE_PRIVATE, METHOD_T_ANY,
-      acquire_cmd_source_trigger, NULL, "acquire/source", NULL,
-      NULL, 0, NULL, NULL);
+  .group       = USERNS_GROUP_ADMIN,
+  .level       = 100,
+  .scope       = CMD_SCOPE_PRIVATE,
+  .methods     = METHOD_T_ANY,
+  .cb          = acquire_cmd_source_trigger,
+  .parent_path = "acquire/source",
+};
+
+void
+acquire_register_commands(void)
+{
+  cmd_register(&cmd_decl);
+
+  // /show acquire — subsystem state. Shares the "acquire" name with
+  // the /acquire root above; tree position (parent "show" vs parent
+  // NULL) keeps them distinct at dispatch time. Mirrors the
+  // /show knowledge pattern.
+  cmd_register(&show_acquire_decl);
+  cmd_register(&trigger_decl);
+  cmd_register(&fire_decl);
+  cmd_register(&digest_test_decl);
+
+  // /acquire source <subcommand> — grouping node for feed-related
+  // admin commands. The root stub emits a short usage line.
+  cmd_register(&source_decl);
+
+  // /acquire source trigger <bot> <url> — arm a declared feed for the
+  // next tick. Parent path "acquire source" (space-separated) puts
+  // this under the source grouping node above.
+  cmd_register(&acquire_source_trigger_decl);
 }
 
 // A8 — corpus lifecycle sweep

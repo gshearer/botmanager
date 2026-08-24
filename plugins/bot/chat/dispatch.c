@@ -724,46 +724,77 @@ text_dispatch_message(bot_inst_t *inst, const method_msg_t *msg)
 // Command registration                                                //
 // ------------------------------------------------------------------ //
 
+static const cmd_decl_t identify_decl = {
+  .module      = "chat",
+  .name        = "identify",
+  .usage       = "identify <username> <password>",
+  .description = "Authenticate with the bot",
+  .group       = USERNS_GROUP_EVERYONE,
+  .scope       = CMD_SCOPE_PRIVATE,
+  .methods     = METHOD_T_ANY,
+  .cb          = cmd_identify,
+  .arg_desc    = text_ad_identify,
+  .arg_count   = 2,
+};
+
+static const cmd_decl_t deauth_decl = {
+  .module      = "chat",
+  .name        = "deauth",
+  .usage       = "deauth",
+  .description = "End your authenticated session",
+  .group       = USERNS_GROUP_EVERYONE,
+  .scope       = CMD_SCOPE_ANY,
+  .methods     = METHOD_T_ANY,
+  .cb          = cmd_deauth,
+};
+
+static const cmd_decl_t register_decl = {
+  .module      = "chat",
+  .name        = "register",
+  .usage       = "register <password>",
+  .description = "Set password for a discovered account",
+  .group       = USERNS_GROUP_EVERYONE,
+  .scope       = CMD_SCOPE_PRIVATE,
+  .methods     = METHOD_T_ANY,
+  .cb          = cmd_register_user,
+  .abbrev      = "reg",
+  .arg_desc    = text_ad_register,
+  .arg_count   = 1,
+};
+
+static const cmd_decl_t id_decl = {
+  .module      = "chat",
+  .name        = "id",
+  .usage       = "id [nickname]",
+  .description = "Show identity info for yourself, a nick, or the channel",
+  .group       = USERNS_GROUP_EVERYONE,
+  .scope       = CMD_SCOPE_ANY,
+  .methods     = METHOD_T_ANY,
+  .cb          = cmd_id,
+  .arg_desc    = text_ad_id,
+  .arg_count   = 1,
+};
+
 bool
 text_dispatch_register(void)
 {
-  if(cmd_register("chat", "identify",
-        "identify <username> <password>",
-        "Authenticate with the bot",
-        NULL,
-        USERNS_GROUP_EVERYONE, 0, CMD_SCOPE_PRIVATE, METHOD_T_ANY, cmd_identify, NULL,
-        NULL, NULL, text_ad_identify, 2, NULL, NULL) != SUCCESS)
+  if(cmd_register(&identify_decl) != SUCCESS)
     return(FAIL);
 
-  if(cmd_register("chat", "deauth",
-        "deauth",
-        "End your authenticated session",
-        NULL,
-        USERNS_GROUP_EVERYONE, 0, CMD_SCOPE_ANY, METHOD_T_ANY, cmd_deauth, NULL, NULL,
-        NULL, NULL, 0, NULL, NULL) != SUCCESS)
+  if(cmd_register(&deauth_decl) != SUCCESS)
   {
     cmd_unregister_path("identify");
     return(FAIL);
   }
 
-  if(cmd_register("chat", "register",
-        "register <password>",
-        "Set password for a discovered account",
-        NULL,
-        USERNS_GROUP_EVERYONE, 0, CMD_SCOPE_PRIVATE, METHOD_T_ANY, cmd_register_user,
-        NULL, NULL, "reg", text_ad_register, 1, NULL, NULL) != SUCCESS)
+  if(cmd_register(&register_decl) != SUCCESS)
   {
     cmd_unregister_path("deauth");
     cmd_unregister_path("identify");
     return(FAIL);
   }
 
-  if(cmd_register("chat", "id",
-        "id [nickname]",
-        "Show identity info for yourself, a nick, or the channel",
-        NULL,
-        USERNS_GROUP_EVERYONE, 0, CMD_SCOPE_ANY, METHOD_T_ANY, cmd_id,
-        NULL, NULL, NULL, text_ad_id, 1, NULL, NULL) != SUCCESS)
+  if(cmd_register(&id_decl) != SUCCESS)
   {
     cmd_unregister_path("register");
     cmd_unregister_path("deauth");

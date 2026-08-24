@@ -144,16 +144,25 @@ cmd_show_memstore(const cmd_ctx_t *ctx)
 // as it claimed it. The two "memory" concepts are distinct — AGENTS.md
 // §Two Different "Memory" Concepts.
 
+static const cmd_decl_t show_memstore_decl = {
+  .module      = "memory",
+  .name        = "memstore",
+  .usage       = "show memstore",
+  .description = "Show bot memory store state (facts, log, decay)",
+  .group       = USERNS_GROUP_ADMIN,
+  .level       = 100,
+  .scope       = CMD_SCOPE_ANY,
+  .methods     = METHOD_T_ANY,
+  .cb          = cmd_show_memstore,
+  .parent_path = "show",
+  .abbrev      = "ms",
+};
+
 void
 memory_register_cmds_internal(void)
 {
   // /show memstore — bot memory subsystem state (decay, totals).
-  cmd_register("memory", "memstore",
-      "show memstore",
-      "Show bot memory store state (facts, log, decay)",
-      NULL,
-      USERNS_GROUP_ADMIN, 100, CMD_SCOPE_ANY, METHOD_T_ANY,
-      cmd_show_memstore, NULL, "show", "ms", NULL, 0, NULL, NULL);
+  cmd_register(&show_memstore_decl);
 
   // /bot <name> embedbackfill — the mutating half, so it hangs off /bot
   // rather than /show (feedback_show_vs_bot_verbs).

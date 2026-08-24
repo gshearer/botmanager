@@ -1221,31 +1221,107 @@ static const cmd_arg_desc_t atk_heal_args[] = {
   { "nick", CMD_ARG_NONE, CMD_ARG_OPTIONAL, ATK_NICK_SZ - 1, NULL },
 };
 
+static const cmd_decl_t attack_decl = {
+  .module      = "attack",
+  .name        = "attack",
+  .usage       = "attack <nick>|--end",
+  .description = "Attack another combatant in the pit.",
+  .help_long   =
+      "Every combatant enters with full health. Damage is rolled the "
+      "same way for everyone, and a blow in the top band counts as a "
+      "critical hit; the first to reach 0 hit points ends the round "
+      "and, where the protocol allows it, leaves the channel feet "
+      "first. You may strike once per wave — once every living "
+      "combatant has swung, the wave turns and anyone may go again. "
+      "Targets must be registered users who are present in the room. "
+      "A blow occasionally goes wide and lands on every combatant but "
+      "the one who swung, for the same damage each — "
+      "`plugin.attack.aoe_chance_pct` is how often, and it needs at "
+      "least two others standing. "
+      "A fight also has a life of its own and expires on its own "
+      "clock; `attack --end` stops one early, and anyone who can "
+      "attack can end it.",
+  .group       = USERNS_GROUP_USER,
+  .scope       = CMD_SCOPE_PUBLIC,
+  .methods     = METHOD_T_ANY,
+  .cb          = atk_cmd_attack,
+  .arg_desc    = atk_attack_args,
+  .arg_count   = (uint8_t)(sizeof(atk_attack_args)
+                 / sizeof(atk_attack_args[0])),
+};
+
+static const cmd_decl_t attack_reload_decl = {
+  .module      = "attack",
+  .name        = "reload",
+  .usage       = "attack reload",
+  .description = "Re-read the character sheets from disk.",
+  .help_long   =
+      "Re-scans `plugin.attack.classes_path`, re-parses every sheet in "
+      "it, and swaps the whole registry at once — a sheet that fails "
+      "validation leaves the previously loaded set untouched for every "
+      "other class. Replies with the tally and names each rejected "
+      "file; the log carries the line number and the reason. Note that "
+      "a combatant nicknamed `reload` cannot be attacked, because this "
+      "child resolves before the root command's argument.",
+  .group       = USERNS_GROUP_ADMIN,
+  .scope       = CMD_SCOPE_ANY,
+  .methods     = METHOD_T_ANY,
+  .cb          = atk_cmd_reload,
+  .parent_path = "attack",
+};
+
+static const cmd_decl_t heal_decl = {
+  .module      = "attack",
+  .name        = "heal",
+  .usage       = "heal [nick]",
+  .description = "Mend a combatant instead of striking one.",
+  .help_long   =
+      "Only a combatant whose character class knows healing may heal — "
+      "`show attack classes` says which do. Healing spends your turn "
+      "for the wave exactly as an attack does, so it is a trade and "
+      "never a free action, and it is the one thing a class can do that "
+      "another cannot. With no argument you mend yourself, which is "
+      "allowed and is the common case. How much is restored is rolled "
+      "by the pit, not by your class: a minor mend restores "
+      "`plugin.attack.heal.minor_min`..`minor_max` hit points and a "
+      "major one `major_min`..`major_max`. Nobody can be healed past "
+      "the health they started with, and the number announced is always "
+      "the number the health bar moved.",
+  .group       = USERNS_GROUP_USER,
+  .scope       = CMD_SCOPE_PUBLIC,
+  .methods     = METHOD_T_ANY,
+  .cb          = atk_cmd_heal,
+  .arg_desc    = atk_heal_args,
+  .arg_count   = (uint8_t)(sizeof(atk_heal_args) / sizeof(atk_heal_args[0])),
+};
+
+static const cmd_decl_t defer_decl = {
+  .module      = "attack",
+  .name        = "defer",
+  .usage       = "defer",
+  .description = "Give up your turn for a heavier next one.",
+  .help_long   =
+      "Surrendering a turn buys a bonus on your next attack or heal. "
+      "The bonus is rolled by the pit — `plugin.attack.defer.step_min_pct` "
+      "to `step_max_pct` — and deferrals ADD, so hesitating twice is "
+      "worth roughly twice as much; `plugin.attack.defer.bonus_cap_pct` "
+      "is the hard ceiling and defaults to at most double damage. You "
+      "may defer `plugin.attack.defer.max` times per round. It costs "
+      "your turn for the wave exactly as swinging does, and the bonus "
+      "scales the number only: the words you speak still come from the "
+      "band your roll landed in, and the ⚡ badge on the line is what "
+      "explains the difference. A bonus dies with its round if you never "
+      "get to spend it.",
+  .group       = USERNS_GROUP_USER,
+  .scope       = CMD_SCOPE_PUBLIC,
+  .methods     = METHOD_T_ANY,
+  .cb          = atk_cmd_defer,
+};
+
 bool
 atk_commands_register(void)
 {
-  if(cmd_register("attack", "attack",
-        "attack <nick>|--end",
-        "Attack another combatant in the pit.",
-        "Every combatant enters with full health. Damage is rolled the "
-        "same way for everyone, and a blow in the top band counts as a "
-        "critical hit; the first to reach 0 hit points ends the round "
-        "and, where the protocol allows it, leaves the channel feet "
-        "first. You may strike once per wave — once every living "
-        "combatant has swung, the wave turns and anyone may go again. "
-        "Targets must be registered users who are present in the room. "
-        "A blow occasionally goes wide and lands on every combatant but "
-        "the one who swung, for the same damage each — "
-        "`plugin.attack.aoe_chance_pct` is how often, and it needs at "
-        "least two others standing. "
-        "A fight also has a life of its own and expires on its own "
-        "clock; `attack --end` stops one early, and anyone who can "
-        "attack can end it.",
-        USERNS_GROUP_USER, 0, CMD_SCOPE_PUBLIC, METHOD_T_ANY,
-        atk_cmd_attack, NULL, NULL, NULL,
-        atk_attack_args,
-        (uint8_t)(sizeof(atk_attack_args) / sizeof(atk_attack_args[0])),
-        NULL, NULL) != SUCCESS)
+  if(cmd_register(&attack_decl) != SUCCESS)
     return(FAIL);
 
   // A child, not an argument — and the trade is deliberate. Children
@@ -1254,19 +1330,7 @@ atk_commands_register(void)
   // is admin-only and rare, while `!heal` and `!defer` are frequent and
   // player-facing and therefore earn roots of their own. `--end` has no
   // such problem: an IRC nickname can never begin with '-'.
-  if(cmd_register("attack", "reload",
-        "attack reload",
-        "Re-read the character sheets from disk.",
-        "Re-scans `plugin.attack.classes_path`, re-parses every sheet in "
-        "it, and swaps the whole registry at once — a sheet that fails "
-        "validation leaves the previously loaded set untouched for every "
-        "other class. Replies with the tally and names each rejected "
-        "file; the log carries the line number and the reason. Note that "
-        "a combatant nicknamed `reload` cannot be attacked, because this "
-        "child resolves before the root command's argument.",
-        USERNS_GROUP_ADMIN, 0, CMD_SCOPE_ANY, METHOD_T_ANY,
-        atk_cmd_reload, NULL, "attack", NULL,
-        NULL, 0, NULL, NULL) != SUCCESS)
+  if(cmd_register(&attack_reload_decl) != SUCCESS)
     return(FAIL);
 
   // A ROOT, not a child of `attack` — the opposite trade to `reload`
@@ -1274,46 +1338,12 @@ atk_commands_register(void)
   // root's argument, so `attack heal` as a child would make a combatant
   // nicknamed `heal` unattackable; the verb is frequent and
   // player-facing, so it earns a name of its own instead.
-  if(cmd_register("attack", "heal",
-        "heal [nick]",
-        "Mend a combatant instead of striking one.",
-        "Only a combatant whose character class knows healing may heal — "
-        "`show attack classes` says which do. Healing spends your turn "
-        "for the wave exactly as an attack does, so it is a trade and "
-        "never a free action, and it is the one thing a class can do that "
-        "another cannot. With no argument you mend yourself, which is "
-        "allowed and is the common case. How much is restored is rolled "
-        "by the pit, not by your class: a minor mend restores "
-        "`plugin.attack.heal.minor_min`..`minor_max` hit points and a "
-        "major one `major_min`..`major_max`. Nobody can be healed past "
-        "the health they started with, and the number announced is always "
-        "the number the health bar moved.",
-        USERNS_GROUP_USER, 0, CMD_SCOPE_PUBLIC, METHOD_T_ANY,
-        atk_cmd_heal, NULL, NULL, NULL,
-        atk_heal_args,
-        (uint8_t)(sizeof(atk_heal_args) / sizeof(atk_heal_args[0])),
-        NULL, NULL) != SUCCESS)
+  if(cmd_register(&heal_decl) != SUCCESS)
     return(FAIL);
 
   // A ROOT for the same reason `heal` is one: frequent, player-facing,
   // and it must never make a combatant nicknamed `defer` unattackable.
-  if(cmd_register("attack", "defer",
-        "defer",
-        "Give up your turn for a heavier next one.",
-        "Surrendering a turn buys a bonus on your next attack or heal. "
-        "The bonus is rolled by the pit — `plugin.attack.defer.step_min_pct` "
-        "to `step_max_pct` — and deferrals ADD, so hesitating twice is "
-        "worth roughly twice as much; `plugin.attack.defer.bonus_cap_pct` "
-        "is the hard ceiling and defaults to at most double damage. You "
-        "may defer `plugin.attack.defer.max` times per round. It costs "
-        "your turn for the wave exactly as swinging does, and the bonus "
-        "scales the number only: the words you speak still come from the "
-        "band your roll landed in, and the ⚡ badge on the line is what "
-        "explains the difference. A bonus dies with its round if you never "
-        "get to spend it.",
-        USERNS_GROUP_USER, 0, CMD_SCOPE_PUBLIC, METHOD_T_ANY,
-        atk_cmd_defer, NULL, NULL, NULL,
-        NULL, 0, NULL, NULL) != SUCCESS)
+  if(cmd_register(&defer_decl) != SUCCESS)
     return(FAIL);
 
   // The read-only views hang off the core `show` parent, not off this

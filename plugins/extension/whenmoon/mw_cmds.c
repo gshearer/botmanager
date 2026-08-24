@@ -173,68 +173,107 @@ wm_cmd_show_mw(const cmd_ctx_t *ctx)
 // Registration                                                        //
 // ------------------------------------------------------------------ //
 
+static const cmd_decl_t whenmoon_mw_decl = {
+  .module      = "whenmoon",
+  .name        = "mw",
+  .usage       = "whenmoon mw <enable|disable|global> ...",
+  .description = "Marketwatch (mw) controls: per-exchange poll enable/disable,"
+                 " plus global on/off cascade.",
+  .help_long   = "Subverbs: enable <exch>, disable <exch>, global <on|off>."
+                 " Persists via plugin.whenmoon.mw.{enabled,<exch>.enabled,"
+                 "<exch>.poll_sec}. Global on cascades to per-exchange tasks"
+                 " already marked enabled; global off cancels them but leaves"
+                 " per-exchange flags intact so a subsequent global on resumes"
+                 " without re-enabling individually.",
+  .group       = USERNS_GROUP_ADMIN,
+  .level       = 100,
+  .scope       = CMD_SCOPE_ANY,
+  .methods     = METHOD_T_ANY,
+  .cb          = wm_cmd_whenmoon_mw_parent,
+  .parent_path = "whenmoon",
+};
+
+static const cmd_decl_t whenmoon_mw_enable_decl = {
+  .module      = "whenmoon",
+  .name        = "enable",
+  .usage       = "whenmoon mw enable <exchange>",
+  .description = "Enable marketwatch polling for the named exchange.",
+  .help_long   = "Idempotent. Spawns the per-exchange periodic task at the"
+                 " configured cadence when the global flag is also on.",
+  .group       = USERNS_GROUP_ADMIN,
+  .level       = 100,
+  .scope       = CMD_SCOPE_ANY,
+  .methods     = METHOD_T_ANY,
+  .cb          = wm_cmd_whenmoon_mw_enable,
+  .parent_path = "whenmoon/mw",
+};
+
+static const cmd_decl_t whenmoon_mw_disable_decl = {
+  .module      = "whenmoon",
+  .name        = "disable",
+  .usage       = "whenmoon mw disable <exchange>",
+  .description = "Disable marketwatch polling for the named exchange.",
+  .help_long   = "Idempotent. Cancels the periodic task, clears the pair"
+                 " table, and persists the disabled state. Ring memory is"
+                 " retained for a fast subsequent re-enable.",
+  .group       = USERNS_GROUP_ADMIN,
+  .level       = 100,
+  .scope       = CMD_SCOPE_ANY,
+  .methods     = METHOD_T_ANY,
+  .cb          = wm_cmd_whenmoon_mw_disable,
+  .parent_path = "whenmoon/mw",
+};
+
+static const cmd_decl_t whenmoon_mw_global_decl = {
+  .module      = "whenmoon",
+  .name        = "global",
+  .usage       = "whenmoon mw global <on|off>",
+  .description = "Globally enable or disable the marketwatch subsystem.",
+  .help_long   = "Cascades to every per-exchange flag that is already enabled:"
+                 " on spawns missing tasks, off cancels active ones. Per-"
+                 " exchange enable flags are NOT cleared, so a later 'global"
+                 " on' resumes the same set without per-exchange re-enabling.",
+  .group       = USERNS_GROUP_ADMIN,
+  .level       = 100,
+  .scope       = CMD_SCOPE_ANY,
+  .methods     = METHOD_T_ANY,
+  .cb          = wm_cmd_whenmoon_mw_global,
+  .parent_path = "whenmoon/mw",
+};
+
+static const cmd_decl_t show_whenmoon_mw_decl = {
+  .module      = "whenmoon",
+  .name        = "mw",
+  .usage       = "show whenmoon mw [<exchange>]",
+  .description = "Marketwatch state. No arg = per-exchange summary table."
+                 " With arg = per-exchange detail (top-10 by |pct_24h| and"
+                 " top-10 by vol_24h_quote when available).",
+  .group       = USERNS_GROUP_ADMIN,
+  .level       = 100,
+  .scope       = CMD_SCOPE_ANY,
+  .methods     = METHOD_T_ANY,
+  .cb          = wm_cmd_show_mw,
+  .parent_path = "show/whenmoon",
+};
+
 bool
 mw_cmds_register(void)
 {
   // /whenmoon mw — state-changing parent.
-  if(cmd_register("whenmoon", "mw",
-        "whenmoon mw <enable|disable|global> ...",
-        "Marketwatch (mw) controls: per-exchange poll enable/disable,"
-        " plus global on/off cascade.",
-        "Subverbs: enable <exch>, disable <exch>, global <on|off>."
-        " Persists via plugin.whenmoon.mw.{enabled,<exch>.enabled,"
-        "<exch>.poll_sec}. Global on cascades to per-exchange tasks"
-        " already marked enabled; global off cancels them but leaves"
-        " per-exchange flags intact so a subsequent global on resumes"
-        " without re-enabling individually.",
-        USERNS_GROUP_ADMIN, 100, CMD_SCOPE_ANY, METHOD_T_ANY,
-        wm_cmd_whenmoon_mw_parent, NULL, "whenmoon", NULL,
-        NULL, 0, NULL, NULL) != SUCCESS)
+  if(cmd_register(&whenmoon_mw_decl) != SUCCESS)
     return(FAIL);
 
-  if(cmd_register("whenmoon", "enable",
-        "whenmoon mw enable <exchange>",
-        "Enable marketwatch polling for the named exchange.",
-        "Idempotent. Spawns the per-exchange periodic task at the"
-        " configured cadence when the global flag is also on.",
-        USERNS_GROUP_ADMIN, 100, CMD_SCOPE_ANY, METHOD_T_ANY,
-        wm_cmd_whenmoon_mw_enable, NULL, "whenmoon/mw", NULL,
-        NULL, 0, NULL, NULL) != SUCCESS)
+  if(cmd_register(&whenmoon_mw_enable_decl) != SUCCESS)
     return(FAIL);
 
-  if(cmd_register("whenmoon", "disable",
-        "whenmoon mw disable <exchange>",
-        "Disable marketwatch polling for the named exchange.",
-        "Idempotent. Cancels the periodic task, clears the pair"
-        " table, and persists the disabled state. Ring memory is"
-        " retained for a fast subsequent re-enable.",
-        USERNS_GROUP_ADMIN, 100, CMD_SCOPE_ANY, METHOD_T_ANY,
-        wm_cmd_whenmoon_mw_disable, NULL, "whenmoon/mw", NULL,
-        NULL, 0, NULL, NULL) != SUCCESS)
+  if(cmd_register(&whenmoon_mw_disable_decl) != SUCCESS)
     return(FAIL);
 
-  if(cmd_register("whenmoon", "global",
-        "whenmoon mw global <on|off>",
-        "Globally enable or disable the marketwatch subsystem.",
-        "Cascades to every per-exchange flag that is already enabled:"
-        " on spawns missing tasks, off cancels active ones. Per-"
-        " exchange enable flags are NOT cleared, so a later 'global"
-        " on' resumes the same set without per-exchange re-enabling.",
-        USERNS_GROUP_ADMIN, 100, CMD_SCOPE_ANY, METHOD_T_ANY,
-        wm_cmd_whenmoon_mw_global, NULL, "whenmoon/mw", NULL,
-        NULL, 0, NULL, NULL) != SUCCESS)
+  if(cmd_register(&whenmoon_mw_global_decl) != SUCCESS)
     return(FAIL);
 
   // /show whenmoon mw [<exch>] — observability.
-  if(cmd_register("whenmoon", "mw",
-        "show whenmoon mw [<exchange>]",
-        "Marketwatch state. No arg = per-exchange summary table."
-        " With arg = per-exchange detail (top-10 by |pct_24h| and"
-        " top-10 by vol_24h_quote when available).",
-        NULL,
-        USERNS_GROUP_ADMIN, 100, CMD_SCOPE_ANY, METHOD_T_ANY,
-        wm_cmd_show_mw, NULL, "show/whenmoon", NULL,
-        NULL, 0, NULL, NULL) != SUCCESS)
+  if(cmd_register(&show_whenmoon_mw_decl) != SUCCESS)
     return(FAIL);
 
   return(SUCCESS);

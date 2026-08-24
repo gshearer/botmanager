@@ -276,31 +276,48 @@ wm_cmd_show_exchange(const cmd_ctx_t *ctx)
 // Registration                                                        //
 // ------------------------------------------------------------------ //
 
+static const cmd_decl_t show_whenmoon_orders_decl = {
+  .module      = "whenmoon",
+  .name        = "orders",
+  .usage       = "show whenmoon orders [exchange]",
+  .description = "List open orders across registered exchanges.",
+  .help_long   = "Without an argument, fires one async list_orders call per"
+                 " registered exchange — each exchange's response arrives as a"
+                 " separate reply. With an argument, queries that single"
+                 " exchange. Auth-gated: exchanges without configured API keys"
+                 " reply with 'error: <name>: api keys not configured'.",
+  .group       = USERNS_GROUP_ADMIN,
+  .level       = 100,
+  .scope       = CMD_SCOPE_ANY,
+  .methods     = METHOD_T_ANY,
+  .cb          = wm_cmd_show_orders,
+  .parent_path = "show/whenmoon",
+};
+
+static const cmd_decl_t show_whenmoon_exchange_decl = {
+  .module      = "whenmoon",
+  .name        = "exchange",
+  .usage       = "show whenmoon exchange [name]",
+  .description = "Snapshot of registered exchanges and their capabilities.",
+  .help_long   = "Per-exchange row: sandbox flag, auth state, advertised"
+                 " rps/burst, cached product count (active/total), local"
+                 " active-market count routed to that exchange.",
+  .group       = USERNS_GROUP_ADMIN,
+  .level       = 100,
+  .scope       = CMD_SCOPE_ANY,
+  .methods     = METHOD_T_ANY,
+  .cb          = wm_cmd_show_exchange,
+  .parent_path = "show/whenmoon",
+  .abbrev      = "exch",
+};
+
 bool
 wm_exch_register_verbs(void)
 {
-  if(cmd_register("whenmoon", "orders",
-        "show whenmoon orders [exchange]",
-        "List open orders across registered exchanges.",
-        "Without an argument, fires one async list_orders call per"
-        " registered exchange — each exchange's response arrives as a"
-        " separate reply. With an argument, queries that single"
-        " exchange. Auth-gated: exchanges without configured API keys"
-        " reply with 'error: <name>: api keys not configured'.",
-        USERNS_GROUP_ADMIN, 100, CMD_SCOPE_ANY, METHOD_T_ANY,
-        wm_cmd_show_orders, NULL, "show/whenmoon", NULL,
-        NULL, 0, NULL, NULL) != SUCCESS)
+  if(cmd_register(&show_whenmoon_orders_decl) != SUCCESS)
     return(FAIL);
 
-  if(cmd_register("whenmoon", "exchange",
-        "show whenmoon exchange [name]",
-        "Snapshot of registered exchanges and their capabilities.",
-        "Per-exchange row: sandbox flag, auth state, advertised"
-        " rps/burst, cached product count (active/total), local"
-        " active-market count routed to that exchange.",
-        USERNS_GROUP_ADMIN, 100, CMD_SCOPE_ANY, METHOD_T_ANY,
-        wm_cmd_show_exchange, NULL, "show/whenmoon", "exch",
-        NULL, 0, NULL, NULL) != SUCCESS)
+  if(cmd_register(&show_whenmoon_exchange_decl) != SUCCESS)
     return(FAIL);
 
   return(SUCCESS);

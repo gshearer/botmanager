@@ -858,6 +858,211 @@ static const char *const reachycmd_kind_filter[] = {
   REACHYCMD_METHOD_KIND, NULL,
 };
 
+static const cmd_decl_t bot_do_decl = {
+  .module      = REACHYCMD_CTX,
+  .name        = "do",
+  .usage       = "bot <name> do <move>",
+  .description = "Play one of the robot's emotion moves.",
+  .help_long   =
+      "The move is played by the robot's own daemon, on its own clock; "
+      "botman only names it and is told whether it started. Names come "
+      "from `show bot <name> moves`. A name the library does not hold "
+      "comes back as an http 404 rather than silence. The bot must "
+      "have the reachy method bound; any other bot is refused by name.",
+  .group       = USERNS_GROUP_ADMIN,
+  .level       = REACHYCMD_LEVEL,
+  .scope       = CMD_SCOPE_ANY,
+  .methods     = METHOD_T_ANY,
+  .cb          = reachycmd_do,
+  .parent_path = "bot",
+  .arg_desc    = reachycmd_do_args,
+  .arg_count   = (uint8_t)(sizeof(reachycmd_do_args)
+                 / sizeof(reachycmd_do_args[0])),
+  .kind_filter = reachycmd_kind_filter,
+};
+
+static const cmd_decl_t bot_say_decl = {
+  .module      = REACHYCMD_CTX,
+  .name        = "say",
+  .usage       = "bot <name> say <text>",
+  .description = "Make the robot speak a line aloud.",
+  .help_long   =
+      "Three hops: the text is synthesized by the tts model named in "
+      "bot.<name>.reachy.tts_model, the resulting WAV is uploaded to "
+      "the robot, and the robot plays it. Turn `bot <name> wobble on` "
+      "first and the head moves in time with the words. The voice and "
+      "rate come from bot.<name>.reachy.tts_voice and .tts_speed — "
+      "per bot, so two creatures sharing one body keep their own "
+      "voices; the model row itself is registered with "
+      "`llm add model tts ...`.",
+  .group       = USERNS_GROUP_ADMIN,
+  .level       = REACHYCMD_LEVEL,
+  .scope       = CMD_SCOPE_ANY,
+  .methods     = METHOD_T_ANY,
+  .cb          = reachycmd_say,
+  .parent_path = "bot",
+  .arg_desc    = reachycmd_say_args,
+  .arg_count   = (uint8_t)(sizeof(reachycmd_say_args)
+                 / sizeof(reachycmd_say_args[0])),
+  .kind_filter = reachycmd_kind_filter,
+};
+
+static const cmd_decl_t bot_wake_decl = {
+  .module      = REACHYCMD_CTX,
+  .name        = "wake",
+  .usage       = "bot <name> wake",
+  .description = "Bring the robot up out of rest.",
+  .help_long   =
+      "Enables the motors, then plays the daemon's wake_up move: the "
+      "head rises, the body re-centres, the antennas come down. Both "
+      "steps are needed — the daemon never raises torque on its own, "
+      "and a limp robot plays the whole move without stirring. Safe to "
+      "repeat; the motion takes about two and a half seconds.",
+  .group       = USERNS_GROUP_ADMIN,
+  .level       = REACHYCMD_LEVEL,
+  .scope       = CMD_SCOPE_ANY,
+  .methods     = METHOD_T_ANY,
+  .cb          = reachycmd_wake,
+  .parent_path = "bot",
+  .kind_filter = reachycmd_kind_filter,
+};
+
+static const cmd_decl_t bot_sleep_decl = {
+  .module      = REACHYCMD_CTX,
+  .name        = "sleep",
+  .usage       = "bot <name> sleep",
+  .description = "Settle the robot back into rest.",
+  .help_long   =
+      "Plays the daemon's goto_sleep move: the robot lowers itself "
+      "into its shell over about two and a half seconds, and the "
+      "daemon drops torque once it arrives. It is then limp, and only "
+      "`bot <name> wake` will lift it again. `show bot <name> robot` "
+      "reports which of the two states it is in.",
+  .group       = USERNS_GROUP_ADMIN,
+  .level       = REACHYCMD_LEVEL,
+  .scope       = CMD_SCOPE_ANY,
+  .methods     = METHOD_T_ANY,
+  .cb          = reachycmd_sleep,
+  .parent_path = "bot",
+  .kind_filter = reachycmd_kind_filter,
+};
+
+static const cmd_decl_t bot_volume_decl = {
+  .module      = REACHYCMD_CTX,
+  .name        = "volume",
+  .usage       = "bot <name> volume <0-100>",
+  .description = "Set the robot's speaker level.",
+  .help_long   =
+      "Writes bot.<name>.reachy.volume and then applies it. The KV row "
+      "is the control surface and the robot is a cache of it: the "
+      "method driver re-applies that number on every connect, reload "
+      "and restart, so this is the level the bot keeps rather than the "
+      "level it happens to be at.",
+  .group       = USERNS_GROUP_ADMIN,
+  .level       = REACHYCMD_LEVEL,
+  .scope       = CMD_SCOPE_ANY,
+  .methods     = METHOD_T_ANY,
+  .cb          = reachycmd_volume,
+  .parent_path = "bot",
+  .arg_desc    = reachycmd_volume_args,
+  .arg_count   = (uint8_t)(sizeof(reachycmd_volume_args)
+                 / sizeof(reachycmd_volume_args[0])),
+  .kind_filter = reachycmd_kind_filter,
+};
+
+static const cmd_decl_t bot_track_decl = {
+  .module      = REACHYCMD_CTX,
+  .name        = "track",
+  .usage       = "bot <name> track <on|off> [weight]",
+  .description = "Make the robot follow faces with its head.",
+  .help_long   =
+      "Face detection and the head motion that follows it both run on "
+      "the robot; botman only switches them on. The weight is how "
+      "strongly the head is pulled toward the face, from 0.0 to 1.0, "
+      "and defaults to 0.6 — high enough to be obviously alive, low "
+      "enough not to snap. It is stored in "
+      "bot.<name>.reachy.tracking_weight, where `off` is simply 0, and "
+      "re-applied whenever the bot connects.",
+  .group       = USERNS_GROUP_ADMIN,
+  .level       = REACHYCMD_LEVEL,
+  .scope       = CMD_SCOPE_ANY,
+  .methods     = METHOD_T_ANY,
+  .cb          = reachycmd_track,
+  .parent_path = "bot",
+  .arg_desc    = reachycmd_track_args,
+  .arg_count   = (uint8_t)(sizeof(reachycmd_track_args)
+                 / sizeof(reachycmd_track_args[0])),
+  .kind_filter = reachycmd_kind_filter,
+};
+
+static const cmd_decl_t bot_wobble_decl = {
+  .module      = REACHYCMD_CTX,
+  .name        = "wobble",
+  .usage       = "bot <name> wobble <on|off>",
+  .description = "Let played audio drive the robot's head.",
+  .help_long   =
+      "With wobbling enabled, ANY sound the daemon plays moves the "
+      "head in time with it. It costs nothing and it is what makes the "
+      "robot look like it is speaking rather than broadcasting. Stored "
+      "in bot.<name>.reachy.wobble and re-applied on every connect.",
+  .group       = USERNS_GROUP_ADMIN,
+  .level       = REACHYCMD_LEVEL,
+  .scope       = CMD_SCOPE_ANY,
+  .methods     = METHOD_T_ANY,
+  .cb          = reachycmd_wobble,
+  .parent_path = "bot",
+  .arg_desc    = reachycmd_wobble_args,
+  .arg_count   = (uint8_t)(sizeof(reachycmd_wobble_args)
+                 / sizeof(reachycmd_wobble_args[0])),
+  .kind_filter = reachycmd_kind_filter,
+};
+
+static const cmd_decl_t show_bot_robot_decl = {
+  .module      = REACHYCMD_CTX,
+  .name        = "robot",
+  .usage       = "show bot <name> robot",
+  .description = "What the bot's robot is doing right now.",
+  .help_long   =
+      "Two live reads in one card: the daemon's own status — its "
+      "state, version, whether it still holds the camera and "
+      "microphone, and the face it is currently tracking — and the "
+      "microphone array's direction of arrival, which is the bearing "
+      "it last heard a voice on and whether it is hearing one now. It "
+      "also reports whether the motors are on at all, which is the "
+      "difference between a robot ignoring you and one that "
+      "physically cannot answer.",
+  .group       = USERNS_GROUP_ADMIN,
+  .level       = REACHYCMD_LEVEL,
+  .scope       = CMD_SCOPE_ANY,
+  .methods     = METHOD_T_ANY,
+  .cb          = reachycmd_show,
+  .parent_path = "show/bot",
+  .kind_filter = reachycmd_kind_filter,
+};
+
+static const cmd_decl_t show_bot_moves_decl = {
+  .module      = REACHYCMD_CTX,
+  .name        = "moves",
+  .usage       = "show bot <name> moves [filter]",
+  .description = "The emotion moves the robot knows.",
+  .help_long   =
+      "Asks the robot's daemon for the move library it ships with — 84 "
+      "recordings at daemon 1.9.0 — and prints them four to a line. A "
+      "filter narrows the list to names containing it, case "
+      "insensitively, which is the fast way to find every dance or "
+      "every way of saying no. Play one with `bot <name> do <move>`.",
+  .group       = USERNS_GROUP_ADMIN,
+  .level       = REACHYCMD_LEVEL,
+  .scope       = CMD_SCOPE_ANY,
+  .methods     = METHOD_T_ANY,
+  .cb          = reachycmd_list,
+  .parent_path = "show/bot",
+  .arg_desc    = reachycmd_list_args,
+  .arg_count   = (uint8_t)(sizeof(reachycmd_list_args)
+                 / sizeof(reachycmd_list_args[0])),
+  .kind_filter = reachycmd_kind_filter,
+};
+
 // Uniformly ADMIN at REACHYCMD_LEVEL — reading verbs as well as moving
 // ones — because that is what the parent enforces and a registration
 // must say what is enforced. Abbrevs are NULL throughout: an abbrev
@@ -866,149 +1071,35 @@ static const char *const reachycmd_kind_filter[] = {
 static bool
 reachycmd_register(void)
 {
-  if(cmd_register(REACHYCMD_CTX, "do",
-        "bot <name> do <move>",
-        "Play one of the robot's emotion moves.",
-        "The move is played by the robot's own daemon, on its own clock; "
-        "botman only names it and is told whether it started. Names come "
-        "from `show bot <name> moves`. A name the library does not hold "
-        "comes back as an http 404 rather than silence. The bot must "
-        "have the reachy method bound; any other bot is refused by name.",
-        USERNS_GROUP_ADMIN, REACHYCMD_LEVEL, CMD_SCOPE_ANY, METHOD_T_ANY,
-        reachycmd_do, NULL, "bot", NULL,
-        reachycmd_do_args,
-        (uint8_t)(sizeof(reachycmd_do_args) / sizeof(reachycmd_do_args[0])),
-        reachycmd_kind_filter, NULL) != SUCCESS)
+  if(cmd_register(&bot_do_decl) != SUCCESS)
     return(FAIL);
 
-  if(cmd_register(REACHYCMD_CTX, "say",
-        "bot <name> say <text>",
-        "Make the robot speak a line aloud.",
-        "Three hops: the text is synthesized by the tts model named in "
-        "bot.<name>.reachy.tts_model, the resulting WAV is uploaded to "
-        "the robot, and the robot plays it. Turn `bot <name> wobble on` "
-        "first and the head moves in time with the words. The voice and "
-        "rate come from bot.<name>.reachy.tts_voice and .tts_speed — "
-        "per bot, so two creatures sharing one body keep their own "
-        "voices; the model row itself is registered with "
-        "`llm add model tts ...`.",
-        USERNS_GROUP_ADMIN, REACHYCMD_LEVEL, CMD_SCOPE_ANY, METHOD_T_ANY,
-        reachycmd_say, NULL, "bot", NULL,
-        reachycmd_say_args,
-        (uint8_t)(sizeof(reachycmd_say_args)
-                  / sizeof(reachycmd_say_args[0])),
-        reachycmd_kind_filter, NULL) != SUCCESS)
+  if(cmd_register(&bot_say_decl) != SUCCESS)
     return(FAIL);
 
-  if(cmd_register(REACHYCMD_CTX, "wake",
-        "bot <name> wake",
-        "Bring the robot up out of rest.",
-        "Enables the motors, then plays the daemon's wake_up move: the "
-        "head rises, the body re-centres, the antennas come down. Both "
-        "steps are needed — the daemon never raises torque on its own, "
-        "and a limp robot plays the whole move without stirring. Safe to "
-        "repeat; the motion takes about two and a half seconds.",
-        USERNS_GROUP_ADMIN, REACHYCMD_LEVEL, CMD_SCOPE_ANY, METHOD_T_ANY,
-        reachycmd_wake, NULL, "bot", NULL,
-        NULL, 0, reachycmd_kind_filter, NULL) != SUCCESS)
+  if(cmd_register(&bot_wake_decl) != SUCCESS)
     return(FAIL);
 
-  if(cmd_register(REACHYCMD_CTX, "sleep",
-        "bot <name> sleep",
-        "Settle the robot back into rest.",
-        "Plays the daemon's goto_sleep move: the robot lowers itself "
-        "into its shell over about two and a half seconds, and the "
-        "daemon drops torque once it arrives. It is then limp, and only "
-        "`bot <name> wake` will lift it again. `show bot <name> robot` "
-        "reports which of the two states it is in.",
-        USERNS_GROUP_ADMIN, REACHYCMD_LEVEL, CMD_SCOPE_ANY, METHOD_T_ANY,
-        reachycmd_sleep, NULL, "bot", NULL,
-        NULL, 0, reachycmd_kind_filter, NULL) != SUCCESS)
+  if(cmd_register(&bot_sleep_decl) != SUCCESS)
     return(FAIL);
 
-  if(cmd_register(REACHYCMD_CTX, "volume",
-        "bot <name> volume <0-100>",
-        "Set the robot's speaker level.",
-        "Writes bot.<name>.reachy.volume and then applies it. The KV row "
-        "is the control surface and the robot is a cache of it: the "
-        "method driver re-applies that number on every connect, reload "
-        "and restart, so this is the level the bot keeps rather than the "
-        "level it happens to be at.",
-        USERNS_GROUP_ADMIN, REACHYCMD_LEVEL, CMD_SCOPE_ANY, METHOD_T_ANY,
-        reachycmd_volume, NULL, "bot", NULL,
-        reachycmd_volume_args,
-        (uint8_t)(sizeof(reachycmd_volume_args)
-                  / sizeof(reachycmd_volume_args[0])),
-        reachycmd_kind_filter, NULL) != SUCCESS)
+  if(cmd_register(&bot_volume_decl) != SUCCESS)
     return(FAIL);
 
-  if(cmd_register(REACHYCMD_CTX, "track",
-        "bot <name> track <on|off> [weight]",
-        "Make the robot follow faces with its head.",
-        "Face detection and the head motion that follows it both run on "
-        "the robot; botman only switches them on. The weight is how "
-        "strongly the head is pulled toward the face, from 0.0 to 1.0, "
-        "and defaults to 0.6 — high enough to be obviously alive, low "
-        "enough not to snap. It is stored in "
-        "bot.<name>.reachy.tracking_weight, where `off` is simply 0, and "
-        "re-applied whenever the bot connects.",
-        USERNS_GROUP_ADMIN, REACHYCMD_LEVEL, CMD_SCOPE_ANY, METHOD_T_ANY,
-        reachycmd_track, NULL, "bot", NULL,
-        reachycmd_track_args,
-        (uint8_t)(sizeof(reachycmd_track_args)
-                  / sizeof(reachycmd_track_args[0])),
-        reachycmd_kind_filter, NULL) != SUCCESS)
+  if(cmd_register(&bot_track_decl) != SUCCESS)
     return(FAIL);
 
-  if(cmd_register(REACHYCMD_CTX, "wobble",
-        "bot <name> wobble <on|off>",
-        "Let played audio drive the robot's head.",
-        "With wobbling enabled, ANY sound the daemon plays moves the "
-        "head in time with it. It costs nothing and it is what makes the "
-        "robot look like it is speaking rather than broadcasting. Stored "
-        "in bot.<name>.reachy.wobble and re-applied on every connect.",
-        USERNS_GROUP_ADMIN, REACHYCMD_LEVEL, CMD_SCOPE_ANY, METHOD_T_ANY,
-        reachycmd_wobble, NULL, "bot", NULL,
-        reachycmd_wobble_args,
-        (uint8_t)(sizeof(reachycmd_wobble_args)
-                  / sizeof(reachycmd_wobble_args[0])),
-        reachycmd_kind_filter, NULL) != SUCCESS)
+  if(cmd_register(&bot_wobble_decl) != SUCCESS)
     return(FAIL);
 
   // The two read-only views hang off `show/bot`, per feedback that
   // /show observes and /bot changes. Both report the LIVE robot; the
   // KV rows are what it will be told next time it connects, and the two
   // may legitimately disagree between a `set bot ...` and that connect.
-  if(cmd_register(REACHYCMD_CTX, "robot",
-        "show bot <name> robot",
-        "What the bot's robot is doing right now.",
-        "Two live reads in one card: the daemon's own status — its "
-        "state, version, whether it still holds the camera and "
-        "microphone, and the face it is currently tracking — and the "
-        "microphone array's direction of arrival, which is the bearing "
-        "it last heard a voice on and whether it is hearing one now. It "
-        "also reports whether the motors are on at all, which is the "
-        "difference between a robot ignoring you and one that "
-        "physically cannot answer.",
-        USERNS_GROUP_ADMIN, REACHYCMD_LEVEL, CMD_SCOPE_ANY, METHOD_T_ANY,
-        reachycmd_show, NULL, "show/bot", NULL,
-        NULL, 0, reachycmd_kind_filter, NULL) != SUCCESS)
+  if(cmd_register(&show_bot_robot_decl) != SUCCESS)
     return(FAIL);
 
-  if(cmd_register(REACHYCMD_CTX, "moves",
-        "show bot <name> moves [filter]",
-        "The emotion moves the robot knows.",
-        "Asks the robot's daemon for the move library it ships with — 84 "
-        "recordings at daemon 1.9.0 — and prints them four to a line. A "
-        "filter narrows the list to names containing it, case "
-        "insensitively, which is the fast way to find every dance or "
-        "every way of saying no. Play one with `bot <name> do <move>`.",
-        USERNS_GROUP_ADMIN, REACHYCMD_LEVEL, CMD_SCOPE_ANY, METHOD_T_ANY,
-        reachycmd_list, NULL, "show/bot", NULL,
-        reachycmd_list_args,
-        (uint8_t)(sizeof(reachycmd_list_args)
-                  / sizeof(reachycmd_list_args[0])),
-        reachycmd_kind_filter, NULL) != SUCCESS)
+  if(cmd_register(&show_bot_moves_decl) != SUCCESS)
     return(FAIL);
 
   clam(CLAM_INFO, REACHYCMD_CTX,

@@ -372,26 +372,37 @@ cmd_db_orphans_userns(const cmd_ctx_t *ctx)
 // Registration
 // -----------------------------------------------------------------------
 
-void
-cmd_db_register(void)
-{
-  cmd_register("cmd", "db",
-      "db <subcommand> ...",
-      "Admin janitoring (delete kv, ...)",
-      NULL,
-      USERNS_GROUP_ADMIN, DB_CMD_LEVEL, CMD_SCOPE_ANY, METHOD_T_ANY,
-      cmd_db, NULL, NULL, NULL, NULL, 0, NULL, NULL);
+static const cmd_decl_t db_decl = {
+  .module      = "cmd",
+  .name        = "db",
+  .usage       = "db <subcommand> ...",
+  .description = "Admin janitoring (delete kv, ...)",
+  .group       = USERNS_GROUP_ADMIN,
+  .level       = DB_CMD_LEVEL,
+  .scope       = CMD_SCOPE_ANY,
+  .methods     = METHOD_T_ANY,
+  .cb          = cmd_db,
+};
 
-  cmd_register("cmd", "delete",
-      "db delete <what> ...",
-      "Delete persisted state (kv, ...)",
-      NULL,
-      USERNS_GROUP_ADMIN, DB_CMD_LEVEL, CMD_SCOPE_ANY, METHOD_T_ANY,
-      cmd_db_delete, NULL, "db", NULL, NULL, 0, NULL, NULL);
+static const cmd_decl_t db_delete_decl = {
+  .module      = "cmd",
+  .name        = "delete",
+  .usage       = "db delete <what> ...",
+  .description = "Delete persisted state (kv, ...)",
+  .group       = USERNS_GROUP_ADMIN,
+  .level       = DB_CMD_LEVEL,
+  .scope       = CMD_SCOPE_ANY,
+  .methods     = METHOD_T_ANY,
+  .cb          = cmd_db_delete,
+  .parent_path = "db",
+};
 
-  cmd_register("cmd", "kv",
-      "db delete kv <key>",
-      "Drop one KV key from memory and the database",
+static const cmd_decl_t db_delete_kv_decl = {
+  .module      = "cmd",
+  .name        = "kv",
+  .usage       = "db delete kv <key>",
+  .description = "Drop one KV key from memory and the database",
+  .help_long   =
       "Removes exactly one configuration key — whole-key match, never a\n"
       "prefix — from the live registry and its persisted row. Use it to\n"
       "sweep orphans a schema change stranded (keys no longer owned by any\n"
@@ -404,20 +415,35 @@ cmd_db_register(void)
       "\n"
       "Example:\n"
       "  db delete kv plugin.ask.system",
-      USERNS_GROUP_ADMIN, DB_CMD_LEVEL, CMD_SCOPE_ANY, METHOD_T_ANY,
-      cmd_db_delete_kv, NULL, "db/delete", NULL,
-      ad_db_delete_kv, 1, NULL, NULL);
+  .group       = USERNS_GROUP_ADMIN,
+  .level       = DB_CMD_LEVEL,
+  .scope       = CMD_SCOPE_ANY,
+  .methods     = METHOD_T_ANY,
+  .cb          = cmd_db_delete_kv,
+  .parent_path = "db/delete",
+  .arg_desc    = ad_db_delete_kv,
+  .arg_count   = 1,
+};
 
-  cmd_register("cmd", "orphans",
-      "db orphans <what>",
-      "Report persisted state nothing claims (kv, userns)",
-      NULL,
-      USERNS_GROUP_ADMIN, DB_CMD_LEVEL, CMD_SCOPE_ANY, METHOD_T_ANY,
-      cmd_db_orphans, NULL, "db", NULL, NULL, 0, NULL, NULL);
+static const cmd_decl_t db_orphans_decl = {
+  .module      = "cmd",
+  .name        = "orphans",
+  .usage       = "db orphans <what>",
+  .description = "Report persisted state nothing claims (kv, userns)",
+  .group       = USERNS_GROUP_ADMIN,
+  .level       = DB_CMD_LEVEL,
+  .scope       = CMD_SCOPE_ANY,
+  .methods     = METHOD_T_ANY,
+  .cb          = cmd_db_orphans,
+  .parent_path = "db",
+};
 
-  cmd_register("cmd", "kv",
-      "db orphans kv",
-      "List persisted KV rows no live entry claims",
+static const cmd_decl_t db_orphans_kv_decl = {
+  .module      = "cmd",
+  .name        = "kv",
+  .usage       = "db orphans kv",
+  .description = "List persisted KV rows no live entry claims",
+  .help_long   =
       "Every configuration key a plugin registers is a live binding over a\n"
       "durable database row. Unloading the plugin drops the binding and\n"
       "keeps the row — that is what makes a reload cost no reconfiguration\n"
@@ -426,12 +452,20 @@ cmd_db_register(void)
       "A row also lands here when a schema change retires the key. Core\n"
       "cannot tell the two apart and never prunes on its own; when you are\n"
       "sure a key is retired, drop it with db delete kv <key>.",
-      USERNS_GROUP_ADMIN, DB_CMD_LEVEL, CMD_SCOPE_ANY, METHOD_T_ANY,
-      cmd_db_orphans_kv, NULL, "db/orphans", NULL, NULL, 0, NULL, NULL);
+  .group       = USERNS_GROUP_ADMIN,
+  .level       = DB_CMD_LEVEL,
+  .scope       = CMD_SCOPE_ANY,
+  .methods     = METHOD_T_ANY,
+  .cb          = cmd_db_orphans_kv,
+  .parent_path = "db/orphans",
+};
 
-  cmd_register("cmd", "userns",
-      "db orphans userns",
-      "List rows keyed to a userns id that no longer exists",
+static const cmd_decl_t db_orphans_userns_decl = {
+  .module      = "cmd",
+  .name        = "userns",
+  .usage       = "db orphans userns",
+  .description = "List rows keyed to a userns id that no longer exists",
+  .help_long   =
       "A user namespace id is not stable. scripts/bm-wipe.sh drops it and\n"
       "the daemon recreates it, so every id can move, and rows elsewhere\n"
       "that stored one are then pointing at nothing. Nothing raises: reads\n"
@@ -446,6 +480,21 @@ cmd_db_register(void)
       "This reads the rows instead, over every table the catalog says has\n"
       "an ns_id column — so a plugin's new table needs no registration\n"
       "here. Run it after any wipe+restore.",
-      USERNS_GROUP_ADMIN, DB_CMD_LEVEL, CMD_SCOPE_ANY, METHOD_T_ANY,
-      cmd_db_orphans_userns, NULL, "db/orphans", NULL, NULL, 0, NULL, NULL);
+  .group       = USERNS_GROUP_ADMIN,
+  .level       = DB_CMD_LEVEL,
+  .scope       = CMD_SCOPE_ANY,
+  .methods     = METHOD_T_ANY,
+  .cb          = cmd_db_orphans_userns,
+  .parent_path = "db/orphans",
+};
+
+void
+cmd_db_register(void)
+{
+  cmd_register(&db_decl);
+  cmd_register(&db_delete_decl);
+  cmd_register(&db_delete_kv_decl);
+  cmd_register(&db_orphans_decl);
+  cmd_register(&db_orphans_kv_decl);
+  cmd_register(&db_orphans_userns_decl);
 }

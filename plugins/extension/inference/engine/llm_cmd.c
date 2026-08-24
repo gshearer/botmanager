@@ -2193,97 +2193,228 @@ cmd_llm_del_usage(const cmd_ctx_t *ctx)
   cmd_reply(ctx, "usage: llm del service <name>  |  llm del model <name>");
 }
 
+static const cmd_decl_t llm_decl = {
+  .module      = "llm",
+  .name        = "llm",
+  .usage       = "llm",
+  .description = "LLM model registry",
+  .group       = USERNS_GROUP_ADMIN,
+  .level       = 100,
+  .scope       = CMD_SCOPE_ANY,
+  .methods     = METHOD_T_ANY,
+  .cb          = cmd_llm_root,
+};
+
+static const cmd_decl_t llm_add_decl = {
+  .module      = "llm",
+  .name        = "add",
+  .usage       = "llm add <service|model> ...",
+  .description = "Create an LLM service or model",
+  .group       = USERNS_GROUP_ADMIN,
+  .level       = 100,
+  .scope       = CMD_SCOPE_ANY,
+  .methods     = METHOD_T_ANY,
+  .cb          = cmd_llm_add_usage,
+  .parent_path = "llm",
+  .abbrev      = "a",
+};
+
+static const cmd_decl_t llm_add_service_decl = {
+  .module      = "llm",
+  .name        = "service",
+  .usage       = "llm add service <name> <base_url>",
+  .description = "Register an OpenAI-compatible provider (base URL)",
+  .group       = USERNS_GROUP_ADMIN,
+  .level       = 100,
+  .scope       = CMD_SCOPE_ANY,
+  .methods     = METHOD_T_ANY,
+  .cb          = cmd_llm_add_service,
+  .parent_path = "llm/add",
+  .abbrev      = "s",
+  .arg_desc    = ad_add_service,
+  .arg_count   = (uint8_t)(sizeof(ad_add_service) / sizeof(ad_add_service[0])),
+};
+
+static const cmd_decl_t llm_add_model_decl = {
+  .module      = "llm",
+  .name        = "model",
+  .usage       = "llm add model <chat|embed|image|stt|tts> <name> <service>"
+                 " <model_id>",
+  .description = "Register a model against a service",
+  .group       = USERNS_GROUP_ADMIN,
+  .level       = 100,
+  .scope       = CMD_SCOPE_ANY,
+  .methods     = METHOD_T_ANY,
+  .cb          = cmd_llm_add_model,
+  .parent_path = "llm/add",
+  .abbrev      = "m",
+  .arg_desc    = ad_add_model,
+  .arg_count   = (uint8_t)(sizeof(ad_add_model) / sizeof(ad_add_model[0])),
+};
+
+static const cmd_decl_t llm_del_decl = {
+  .module      = "llm",
+  .name        = "del",
+  .usage       = "llm del <service|model> <name>",
+  .description = "Delete an LLM service or model",
+  .group       = USERNS_GROUP_ADMIN,
+  .level       = 100,
+  .scope       = CMD_SCOPE_ANY,
+  .methods     = METHOD_T_ANY,
+  .cb          = cmd_llm_del_usage,
+  .parent_path = "llm",
+  .abbrev      = "d",
+};
+
+static const cmd_decl_t llm_del_service_decl = {
+  .module      = "llm",
+  .name        = "service",
+  .usage       = "llm del service <name>",
+  .description = "Delete a service (blocked while models reference it)",
+  .group       = USERNS_GROUP_ADMIN,
+  .level       = 100,
+  .scope       = CMD_SCOPE_ANY,
+  .methods     = METHOD_T_ANY,
+  .cb          = cmd_llm_del_service,
+  .parent_path = "llm/del",
+  .abbrev      = "s",
+  .arg_desc    = ad_del_one,
+  .arg_count   = 1,
+};
+
+static const cmd_decl_t llm_del_model_decl = {
+  .module      = "llm",
+  .name        = "model",
+  .usage       = "llm del model <name>",
+  .description = "Delete a defined model",
+  .group       = USERNS_GROUP_ADMIN,
+  .level       = 100,
+  .scope       = CMD_SCOPE_ANY,
+  .methods     = METHOD_T_ANY,
+  .cb          = cmd_llm_del_model,
+  .parent_path = "llm/del",
+  .abbrev      = "m",
+  .arg_desc    = ad_del_one,
+  .arg_count   = 1,
+};
+
+static const cmd_decl_t llm_service_decl = {
+  .module      = "llm",
+  .name        = "service",
+  .usage       = "llm service <name> refresh",
+  .description = "Refresh a service's cached /models list",
+  .group       = USERNS_GROUP_ADMIN,
+  .level       = 100,
+  .scope       = CMD_SCOPE_ANY,
+  .methods     = METHOD_T_ANY,
+  .cb          = cmd_llm_service,
+  .parent_path = "llm",
+  .abbrev      = "sv",
+  .arg_desc    = ad_llm_service,
+  .arg_count   = (uint8_t)(sizeof(ad_llm_service) / sizeof(ad_llm_service[0])),
+};
+
+static const cmd_decl_t llm_probe_decl = {
+  .module      = "llm",
+  .name        = "probe",
+  .usage       = "llm probe <name>",
+  .description = "Re-probe an embed model's output dimension",
+  .group       = USERNS_GROUP_ADMIN,
+  .level       = 100,
+  .scope       = CMD_SCOPE_ANY,
+  .methods     = METHOD_T_ANY,
+  .cb          = cmd_llm_probe,
+  .parent_path = "llm",
+  .abbrev      = "pb",
+  .arg_desc    = ad_llm_probe,
+  .arg_count   = (uint8_t)(sizeof(ad_llm_probe) / sizeof(ad_llm_probe[0])),
+};
+
+static const cmd_decl_t llm_test_decl = {
+  .module      = "llm",
+  .name        = "test",
+  .usage       = "llm test <name> [prompt]",
+  .description = "Probe an LLM model synchronously",
+  .group       = USERNS_GROUP_ADMIN,
+  .level       = 100,
+  .scope       = CMD_SCOPE_ANY,
+  .methods     = METHOD_T_ANY,
+  .cb          = cmd_llm_test,
+  .parent_path = "llm",
+  .abbrev      = "t",
+  .arg_desc    = ad_llm_test,
+  .arg_count   = (uint8_t)(sizeof(ad_llm_test) / sizeof(ad_llm_test[0])),
+};
+
+static const cmd_decl_t show_llm_decl = {
+  .module      = "llm",
+  .name        = "llm",
+  .usage       = "show llm",
+  .description = "Show LLM subsystem state",
+  .group       = USERNS_GROUP_ADMIN,
+  .level       = 100,
+  .scope       = CMD_SCOPE_ANY,
+  .methods     = METHOD_T_ANY,
+  .cb          = cmd_show_llm,
+  .parent_path = "show",
+  .abbrev      = "llm",
+};
+
+static const cmd_decl_t show_llm_models_decl = {
+  .module      = "llm",
+  .name        = "models",
+  .usage       = "show llm models [type]",
+  .description = "List registered LLM models, optionally one kind",
+  .group       = USERNS_GROUP_USER,
+  .scope       = CMD_SCOPE_ANY,
+  .methods     = METHOD_T_ANY,
+  .cb          = cmd_llm_list,
+  .parent_path = "show/llm",
+  .abbrev      = "m",
+  .arg_desc    = ad_show_models,
+  .arg_count   = (uint8_t)(sizeof(ad_show_models) / sizeof(ad_show_models[0])),
+};
+
+static const cmd_decl_t show_llm_service_decl = {
+  .module      = "llm",
+  .name        = "service",
+  .usage       = "show llm service [<name> [models]]",
+  .description = "Show LLM services (list, detail, or cached /models)",
+  .group       = USERNS_GROUP_ADMIN,
+  .level       = 100,
+  .scope       = CMD_SCOPE_ANY,
+  .methods     = METHOD_T_ANY,
+  .cb          = cmd_show_llm_service,
+  .parent_path = "show/llm",
+  .abbrev      = "s",
+  .arg_desc    = ad_show_service,
+  .arg_count   = (uint8_t)(sizeof(ad_show_service)
+                 / sizeof(ad_show_service[0])),
+};
+
 void
 llm_register_commands(void)
 {
-  cmd_register("llm", "llm",
-      "llm",
-      "LLM model registry",
-      NULL,
-      USERNS_GROUP_ADMIN, 100, CMD_SCOPE_ANY, METHOD_T_ANY,
-      cmd_llm_root, NULL, NULL, NULL, NULL, 0, NULL, NULL);
+  cmd_register(&llm_decl);
 
   // add → { service, model }
-  cmd_register("llm", "add",
-      "llm add <service|model> ...",
-      "Create an LLM service or model",
-      NULL,
-      USERNS_GROUP_ADMIN, 100, CMD_SCOPE_ANY, METHOD_T_ANY,
-      cmd_llm_add_usage, NULL, "llm", "a", NULL, 0, NULL, NULL);
-
-  cmd_register("llm", "service",
-      "llm add service <name> <base_url>",
-      "Register an OpenAI-compatible provider (base URL)",
-      NULL,
-      USERNS_GROUP_ADMIN, 100, CMD_SCOPE_ANY, METHOD_T_ANY,
-      cmd_llm_add_service, NULL, "llm/add", "s", ad_add_service,
-      (uint8_t)(sizeof(ad_add_service) / sizeof(ad_add_service[0])),
-      NULL, NULL);
-
-  cmd_register("llm", "model",
-      "llm add model <chat|embed|image|stt|tts> <name> <service> <model_id>",
-      "Register a model against a service",
-      NULL,
-      USERNS_GROUP_ADMIN, 100, CMD_SCOPE_ANY, METHOD_T_ANY,
-      cmd_llm_add_model, NULL, "llm/add", "m", ad_add_model,
-      (uint8_t)(sizeof(ad_add_model) / sizeof(ad_add_model[0])), NULL, NULL);
+  cmd_register(&llm_add_decl);
+  cmd_register(&llm_add_service_decl);
+  cmd_register(&llm_add_model_decl);
 
   // del → { service, model }
-  cmd_register("llm", "del",
-      "llm del <service|model> <name>",
-      "Delete an LLM service or model",
-      NULL,
-      USERNS_GROUP_ADMIN, 100, CMD_SCOPE_ANY, METHOD_T_ANY,
-      cmd_llm_del_usage, NULL, "llm", "d", NULL, 0, NULL, NULL);
-
-  cmd_register("llm", "service",
-      "llm del service <name>",
-      "Delete a service (blocked while models reference it)",
-      NULL,
-      USERNS_GROUP_ADMIN, 100, CMD_SCOPE_ANY, METHOD_T_ANY,
-      cmd_llm_del_service, NULL, "llm/del", "s", ad_del_one, 1, NULL, NULL);
-
-  cmd_register("llm", "model",
-      "llm del model <name>",
-      "Delete a defined model",
-      NULL,
-      USERNS_GROUP_ADMIN, 100, CMD_SCOPE_ANY, METHOD_T_ANY,
-      cmd_llm_del_model, NULL, "llm/del", "m", ad_del_one, 1, NULL, NULL);
+  cmd_register(&llm_del_decl);
+  cmd_register(&llm_del_service_decl);
+  cmd_register(&llm_del_model_decl);
 
   // service <name> <action> (refresh)
-  cmd_register("llm", "service",
-      "llm service <name> refresh",
-      "Refresh a service's cached /models list",
-      NULL,
-      USERNS_GROUP_ADMIN, 100, CMD_SCOPE_ANY, METHOD_T_ANY,
-      cmd_llm_service, NULL, "llm", "sv", ad_llm_service,
-      (uint8_t)(sizeof(ad_llm_service) / sizeof(ad_llm_service[0])),
-      NULL, NULL);
+  cmd_register(&llm_service_decl);
 
   // Abbrev is "pb" not "p": the llm-bot plugin claims "p" for
   // /llm personality later in init, and a collision aborts plugin load.
-  cmd_register("llm", "probe",
-      "llm probe <name>",
-      "Re-probe an embed model's output dimension",
-      NULL,
-      USERNS_GROUP_ADMIN, 100, CMD_SCOPE_ANY, METHOD_T_ANY,
-      cmd_llm_probe, NULL, "llm", "pb", ad_llm_probe,
-      (uint8_t)(sizeof(ad_llm_probe) / sizeof(ad_llm_probe[0])), NULL, NULL);
-
-  cmd_register("llm", "test",
-      "llm test <name> [prompt]",
-      "Probe an LLM model synchronously",
-      NULL,
-      USERNS_GROUP_ADMIN, 100, CMD_SCOPE_ANY, METHOD_T_ANY,
-      cmd_llm_test, NULL, "llm", "t", ad_llm_test,
-      (uint8_t)(sizeof(ad_llm_test) / sizeof(ad_llm_test[0])), NULL, NULL);
-
-  cmd_register("llm", "llm",
-      "show llm",
-      "Show LLM subsystem state",
-      NULL,
-      USERNS_GROUP_ADMIN, 100, CMD_SCOPE_ANY, METHOD_T_ANY,
-      cmd_show_llm, NULL, "show", "llm", NULL, 0, NULL, NULL);
+  cmd_register(&llm_probe_decl);
+  cmd_register(&llm_test_decl);
+  cmd_register(&show_llm_decl);
 
   // ⭐ The one verb in this file that is not admin (operator's ruling,
   // 2026-08-23). It prints service names, model names, model ids and
@@ -2295,21 +2426,6 @@ llm_register_commands(void)
   // walks ancestors. ⚠ `user` is not `everyone` — an unidentified caller
   // is refused with not_authenticated, which is a named refusal telling
   // them to identify rather than a missing surface.
-  cmd_register("llm", "models",
-      "show llm models [type]",
-      "List registered LLM models, optionally one kind",
-      NULL,
-      USERNS_GROUP_USER, 0, CMD_SCOPE_ANY, METHOD_T_ANY,
-      cmd_llm_list, NULL, "show/llm", "m", ad_show_models,
-      (uint8_t)(sizeof(ad_show_models) / sizeof(ad_show_models[0])),
-      NULL, NULL);
-
-  cmd_register("llm", "service",
-      "show llm service [<name> [models]]",
-      "Show LLM services (list, detail, or cached /models)",
-      NULL,
-      USERNS_GROUP_ADMIN, 100, CMD_SCOPE_ANY, METHOD_T_ANY,
-      cmd_show_llm_service, NULL, "show/llm", "s", ad_show_service,
-      (uint8_t)(sizeof(ad_show_service) / sizeof(ad_show_service[0])),
-      NULL, NULL);
+  cmd_register(&show_llm_models_decl);
+  cmd_register(&show_llm_service_decl);
 }

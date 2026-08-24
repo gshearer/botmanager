@@ -414,6 +414,92 @@ static const cmd_arg_desc_t fr_status_args[] = {
 // because the filing path answers an empty line with it, is the same.
 static char fr_status_usage[CMD_USAGE_SZ];
 
+static const cmd_decl_t feature_decl = {
+  .module      = "featreq",
+  .name        = "feature",
+  .usage       = fr_feature_usage,
+  .description = "Ask for a feature, or report a bug.",
+  .help_long   =
+      "Writes your request to the board every bot shares — it is not "
+      "scoped to this channel or this namespace. --type defaults to "
+      "`feat` (a feature you would like); use `bug` for something "
+      "broken and `change` for something that should work "
+      "differently. `bug <description>` is the same thing said "
+      "shorter. The description is capped at "
+      "plugin.featreq.max_desc_cols characters. Read the board back "
+      "with `show feature`, and one request in full with `show "
+      "feature <id>`. Note that a description beginning with `status` "
+      "or `note` is read as one of the owner's subcommands — start it "
+      "with anything else.",
+  .group       = USERNS_GROUP_USER,
+  .scope       = CMD_SCOPE_ANY,
+  .methods     = METHOD_T_ANY,
+  .cb          = fr_cmd_feature,
+  .abbrev      = "feat",
+};
+
+static const cmd_decl_t bug_decl = {
+  .module      = "featreq",
+  .name        = "bug",
+  .usage       = FR_BUG_USAGE,
+  .description = "Report something broken.",
+  .help_long   =
+      "Files a bug on the same board `feature` writes to, and is "
+      "exactly `feature --type bug <description>`. Everything true of "
+      "that verb is true here: the board is global rather than scoped "
+      "to this channel, the description is capped at "
+      "plugin.featreq.max_desc_cols characters, and `show feature` "
+      "reads it back. A leading --type still overrides, for the rare "
+      "line that turns out not to be a bug after all.",
+  .group       = USERNS_GROUP_USER,
+  .scope       = CMD_SCOPE_ANY,
+  .methods     = METHOD_T_ANY,
+  .cb          = fr_cmd_bug,
+};
+
+static const cmd_decl_t feature_status_decl = {
+  .module      = "featreq",
+  .name        = "status",
+  .usage       = fr_status_usage,
+  .description = "Move a request along the board (owner).",
+  .help_long   =
+      "Sets the request's status and stamps the moment it changed. "
+      "Accepts `new`, `in-prog`, `completed` and `canceled` (also "
+      "`done` and `cancelled`). The request itself is never edited or "
+      "deleted, only moved; `feature note` is where an answer to one "
+      "goes.",
+  .group       = USERNS_GROUP_OWNER,
+  .level       = 65535,
+  .scope       = CMD_SCOPE_ANY,
+  .methods     = METHOD_T_ANY,
+  .cb          = fr_cmd_status,
+  .parent_path = "feature",
+  .arg_desc    = fr_status_args,
+  .arg_count   = (uint8_t)(sizeof(fr_status_args) / sizeof(fr_status_args[0])),
+};
+
+static const cmd_decl_t feature_note_decl = {
+  .module      = "featreq",
+  .name        = "note",
+  .usage       = FR_NOTE_USAGE,
+  .description = "Write the answer onto a request (owner).",
+  .help_long   =
+      "Attaches a note to the request and stamps when it was written. "
+      "This is where an investigation's answer lives once the row is "
+      "closed — `show feature <id>` prints it under the description, "
+      "so it outlasts the channel it was worked out in. The board "
+      "itself does not show notes; the card does. A second note "
+      "replaces the first and `--clear` removes it, which is the only "
+      "way anything on a request is ever unwritten. The note is "
+      "capped at plugin.featreq.max_note_cols characters.",
+  .group       = USERNS_GROUP_OWNER,
+  .level       = 65535,
+  .scope       = CMD_SCOPE_ANY,
+  .methods     = METHOD_T_ANY,
+  .cb          = fr_cmd_note,
+  .parent_path = "feature",
+};
+
 bool
 fr_commands_register(void)
 {
@@ -427,76 +513,23 @@ fr_commands_register(void)
   snprintf(fr_status_usage, sizeof(fr_status_usage),
       "feature status <id> %s", values);
 
-  if(cmd_register("featreq", "feature",
-        fr_feature_usage,
-        "Ask for a feature, or report a bug.",
-        "Writes your request to the board every bot shares — it is not "
-        "scoped to this channel or this namespace. --type defaults to "
-        "`feat` (a feature you would like); use `bug` for something "
-        "broken and `change` for something that should work "
-        "differently. `bug <description>` is the same thing said "
-        "shorter. The description is capped at "
-        "plugin.featreq.max_desc_cols characters. Read the board back "
-        "with `show feature`, and one request in full with `show "
-        "feature <id>`. Note that a description beginning with `status` "
-        "or `note` is read as one of the owner's subcommands — start it "
-        "with anything else.",
-        USERNS_GROUP_USER, 0, CMD_SCOPE_ANY, METHOD_T_ANY,
-        fr_cmd_feature, NULL, NULL, "feat",
-        NULL, 0, NULL, NULL) != SUCCESS)
+  if(cmd_register(&feature_decl) != SUCCESS)
     return(FAIL);
 
   // A root command of its own rather than an alias: an alias renames a
   // verb, and what makes this one worth having is the argument it
   // supplies. Reporting something broken is most of what the board
   // receives, and `feature --type bug` is a lot of typing to say it.
-  if(cmd_register("featreq", "bug",
-        FR_BUG_USAGE,
-        "Report something broken.",
-        "Files a bug on the same board `feature` writes to, and is "
-        "exactly `feature --type bug <description>`. Everything true of "
-        "that verb is true here: the board is global rather than scoped "
-        "to this channel, the description is capped at "
-        "plugin.featreq.max_desc_cols characters, and `show feature` "
-        "reads it back. A leading --type still overrides, for the rare "
-        "line that turns out not to be a bug after all.",
-        USERNS_GROUP_USER, 0, CMD_SCOPE_ANY, METHOD_T_ANY,
-        fr_cmd_bug, NULL, NULL, NULL,
-        NULL, 0, NULL, NULL) != SUCCESS)
+  if(cmd_register(&bug_decl) != SUCCESS)
     return(FAIL);
 
-  if(cmd_register("featreq", "status",
-        fr_status_usage,
-        "Move a request along the board (owner).",
-        "Sets the request's status and stamps the moment it changed. "
-        "Accepts `new`, `in-prog`, `completed` and `canceled` (also "
-        "`done` and `cancelled`). The request itself is never edited or "
-        "deleted, only moved; `feature note` is where an answer to one "
-        "goes.",
-        USERNS_GROUP_OWNER, 65535, CMD_SCOPE_ANY, METHOD_T_ANY,
-        fr_cmd_status, NULL, "feature", NULL,
-        fr_status_args,
-        (uint8_t)(sizeof(fr_status_args) / sizeof(fr_status_args[0])),
-        NULL, NULL) != SUCCESS)
+  if(cmd_register(&feature_status_decl) != SUCCESS)
     return(FAIL);
 
   // No arg spec, so ctx->args reaches the handler whole — see
   // fr_cmd_note. That costs the framework's usage reply on a missing
   // argument, which the handler answers with FR_NOTE_USAGE itself.
-  if(cmd_register("featreq", "note",
-        FR_NOTE_USAGE,
-        "Write the answer onto a request (owner).",
-        "Attaches a note to the request and stamps when it was written. "
-        "This is where an investigation's answer lives once the row is "
-        "closed — `show feature <id>` prints it under the description, "
-        "so it outlasts the channel it was worked out in. The board "
-        "itself does not show notes; the card does. A second note "
-        "replaces the first and `--clear` removes it, which is the only "
-        "way anything on a request is ever unwritten. The note is "
-        "capped at plugin.featreq.max_note_cols characters.",
-        USERNS_GROUP_OWNER, 65535, CMD_SCOPE_ANY, METHOD_T_ANY,
-        fr_cmd_note, NULL, "feature", NULL,
-        NULL, 0, NULL, NULL) != SUCCESS)
+  if(cmd_register(&feature_note_decl) != SUCCESS)
     return(FAIL);
 
   return(SUCCESS);

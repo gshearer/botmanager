@@ -354,17 +354,59 @@ whenmoon_show_root_cb(const cmd_ctx_t *ctx)
 // Verb registration                                                   //
 // ------------------------------------------------------------------ //
 
+static const cmd_decl_t whenmoon_decl = {
+  .module      = "whenmoon",
+  .name        = "whenmoon",
+  .usage       = "whenmoon <subcommand> ...",
+  .description = "Whenmoon market + downloader + strategy controls.",
+  .help_long   = "Subcommands: market, download, strategy.",
+  .group       = USERNS_GROUP_ADMIN,
+  .level       = 100,
+  .scope       = CMD_SCOPE_ANY,
+  .methods     = METHOD_T_ANY,
+  .cb          = whenmoon_root_cb,
+  .abbrev      = "wm",
+};
+
+static const cmd_decl_t whenmoon_manual_decl = {
+  .module      = "whenmoon",
+  .name        = "manual",
+  .usage       = "whenmoon manual",
+  .description = "Operator halt: flip every market into MANUAL mode regardless"
+                 " of position state. Strategies keep emitting advice but no"
+                 " synthetic or real fills are produced. Synthetic backtest"
+                 " markets are not touched. Recovery: per-market"
+                 " `/whenmoon market mode <id> <paper|real>` (still requires"
+                 " flat position) or `/whenmoon market force` to unwind.",
+  .group       = USERNS_GROUP_ADMIN,
+  .level       = 100,
+  .scope       = CMD_SCOPE_ANY,
+  .methods     = METHOD_T_ANY,
+  .cb          = whenmoon_manual_cb,
+  .parent_path = "whenmoon",
+};
+
+static const cmd_decl_t show_whenmoon_decl = {
+  .module      = "whenmoon",
+  .name        = "whenmoon",
+  .usage       = "show whenmoon <subcommand> ...",
+  .description = "Whenmoon read-only state.",
+  .help_long   = "Subcommands: markets, balances, indicators, download,"
+                 " strategy.",
+  .group       = USERNS_GROUP_ADMIN,
+  .level       = 100,
+  .scope       = CMD_SCOPE_ANY,
+  .methods     = METHOD_T_ANY,
+  .cb          = whenmoon_show_root_cb,
+  .parent_path = "show",
+  .abbrev      = "wm",
+};
+
 static bool
 whenmoon_register_root_verbs(void)
 {
   // /whenmoon — state-changing parent.
-  if(cmd_register("whenmoon", "whenmoon",
-        "whenmoon <subcommand> ...",
-        "Whenmoon market + downloader + strategy controls.",
-        "Subcommands: market, download, strategy.",
-        USERNS_GROUP_ADMIN, 100, CMD_SCOPE_ANY, METHOD_T_ANY,
-        whenmoon_root_cb, NULL, NULL, "wm",
-        NULL, 0, NULL, NULL) != SUCCESS)
+  if(cmd_register(&whenmoon_decl) != SUCCESS)
     return(FAIL);
 
   // /whenmoon manual — operator halt. Flips every market in
@@ -372,33 +414,37 @@ whenmoon_register_root_verbs(void)
   // flat-position rule that wm_market_set_mode enforces. Open positions
   // freeze (no auto-flatten); subsequent strategy signals are
   // short-circuited at market_engine.c's MANUAL check.
-  if(cmd_register("whenmoon", "manual",
-        "whenmoon manual",
-        "Operator halt: flip every market into MANUAL mode regardless"
-        " of position state. Strategies keep emitting advice but no"
-        " synthetic or real fills are produced. Synthetic backtest"
-        " markets are not touched. Recovery: per-market"
-        " `/whenmoon market mode <id> <paper|real>` (still requires"
-        " flat position) or `/whenmoon market force` to unwind.",
-        NULL,
-        USERNS_GROUP_ADMIN, 100, CMD_SCOPE_ANY, METHOD_T_ANY,
-        whenmoon_manual_cb, NULL, "whenmoon", NULL,
-        NULL, 0, NULL, NULL) != SUCCESS)
+  if(cmd_register(&whenmoon_manual_decl) != SUCCESS)
     return(FAIL);
 
   // /show whenmoon — observability parent. Parent path "show" already
   // exists (registered by core).
-  if(cmd_register("whenmoon", "whenmoon",
-        "show whenmoon <subcommand> ...",
-        "Whenmoon read-only state.",
-        "Subcommands: markets, balances, indicators, download, strategy.",
-        USERNS_GROUP_ADMIN, 100, CMD_SCOPE_ANY, METHOD_T_ANY,
-        whenmoon_show_root_cb, NULL, "show", "wm",
-        NULL, 0, NULL, NULL) != SUCCESS)
+  if(cmd_register(&show_whenmoon_decl) != SUCCESS)
     return(FAIL);
 
   return(SUCCESS);
 }
+
+static const cmd_decl_t show_whenmoon_balances_decl = {
+  .module      = "whenmoon",
+  .name        = "balances",
+  .usage       = "show whenmoon balances [exchange] [fresh]",
+  .description =
+      "Account-balance snapshot. Cache-first: reads the per-exchange"
+      " cache instantly with a vintage line (the scheduled poll keeps"
+      " real-mode exchanges warm; real fills fast-forward it). No arg ="
+      " every registered exchange; <exchange> = just that one. Add"
+      " `fresh` to force a blocking live refresh. A cache miss (e.g. a"
+      " paper-only deploy) also falls back to one blocking fetch."
+      " Doubles as a key check (per-currency balance/hold/available, or"
+      " the auth error).",
+  .group       = USERNS_GROUP_ADMIN,
+  .level       = 100,
+  .scope       = CMD_SCOPE_ANY,
+  .methods     = METHOD_T_ANY,
+  .cb          = whenmoon_show_balances_cmd,
+  .parent_path = "show/whenmoon",
+};
 
 static bool
 whenmoon_register_show_verbs(void)
@@ -407,20 +453,7 @@ whenmoon_register_show_verbs(void)
   // [sessions|<id>]` are both registered by wm_show_market_register_verbs
   // in market_cmds.c — they share one handler that owns the session
   // snapshot + detail-card machinery.
-  if(cmd_register("whenmoon", "balances",
-        "show whenmoon balances [exchange] [fresh]",
-        "Account-balance snapshot. Cache-first: reads the per-exchange"
-        " cache instantly with a vintage line (the scheduled poll keeps"
-        " real-mode exchanges warm; real fills fast-forward it). No arg ="
-        " every registered exchange; <exchange> = just that one. Add"
-        " `fresh` to force a blocking live refresh. A cache miss (e.g. a"
-        " paper-only deploy) also falls back to one blocking fetch."
-        " Doubles as a key check (per-currency balance/hold/available, or"
-        " the auth error).",
-        NULL,
-        USERNS_GROUP_ADMIN, 100, CMD_SCOPE_ANY, METHOD_T_ANY,
-        whenmoon_show_balances_cmd, NULL, "show/whenmoon", NULL,
-        NULL, 0, NULL, NULL) != SUCCESS)
+  if(cmd_register(&show_whenmoon_balances_decl) != SUCCESS)
     return(FAIL);
 
   return(SUCCESS);

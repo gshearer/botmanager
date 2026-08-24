@@ -488,12 +488,13 @@ static const cmd_nl_t weather_weather_nl = {
 
 // Plugin lifecycle
 
-static bool
-weather_init(void)
-{
-  if(cmd_register(WEATHER_CTX, "weather",
-      "weather [-h | -d] <zipcode | city>",
-      "Show weather for a US zipcode or city (current / hourly / daily)",
+static const cmd_decl_t weather_decl = {
+  .module      = WEATHER_CTX,
+  .name        = "weather",
+  .usage       = "weather [-h | -d] <zipcode | city>",
+  .description = "Show weather for a US zipcode or city (current / hourly /"
+                 " daily)",
+  .help_long   =
       "Queries the OpenWeather One Call 4.0 API. Accepts either a US\n"
       "zipcode or a city name (geocoded via OpenWeather's\n"
       "direct-geocoding endpoint).\n"
@@ -511,9 +512,20 @@ weather_init(void)
       "Example: !weather 90210\n"
       "         !weather -h Cincinnati\n"
       "         !weather -d 10001",
-      "everyone", 0, CMD_SCOPE_ANY, METHOD_T_ANY,
-      weather_cmd_weather, NULL, NULL, "w",
-      weather_ad_weather, 1, NULL, &weather_weather_nl) != SUCCESS)
+  .group       = "everyone",
+  .scope       = CMD_SCOPE_ANY,
+  .methods     = METHOD_T_ANY,
+  .cb          = weather_cmd_weather,
+  .abbrev      = "w",
+  .arg_desc    = weather_ad_weather,
+  .arg_count   = 1,
+  .nl          = &weather_weather_nl,
+};
+
+static bool
+weather_init(void)
+{
+  if(cmd_register(&weather_decl) != SUCCESS)
     return(FAIL);
 
   clam(CLAM_INFO, WEATHER_CTX, "weather command plugin initialized");

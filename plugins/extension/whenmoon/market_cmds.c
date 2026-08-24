@@ -723,68 +723,162 @@ wm_market_parent_cb(const cmd_ctx_t *ctx)
 // Registration                                                        //
 // ------------------------------------------------------------------ //
 
+static const cmd_decl_t whenmoon_market_decl = {
+  .module      = "whenmoon",
+  .name        = "market",
+  .usage       = "whenmoon market <start|stop|mode|force|sync> ...",
+  .description =
+      "Add or remove a live market and manage its session."
+      " Starts: WS subscribe + live-ring 1m backfill."
+      " Stops: unsubscribe + clear enabled flag."
+      " Mode: change the market's mode (manual|paper|real)."
+      " Force: operator-issued forced trade (manual+paper synth fill"
+      " or real-mode submit, all gates honored)."
+      " Sync: force a fresh reconcile of real-mode cash + re-anchor the"
+      " daily-loss baseline (usually unnecessary — flat markets"
+      " auto-reconcile from the balance cache).",
+  .group       = USERNS_GROUP_ADMIN,
+  .level       = 100,
+  .scope       = CMD_SCOPE_ANY,
+  .methods     = METHOD_T_ANY,
+  .cb          = wm_market_parent_cb,
+  .parent_path = "whenmoon",
+};
+
+static const cmd_decl_t whenmoon_market_start_decl = {
+  .module      = "whenmoon",
+  .name        = "start",
+  .usage       = "whenmoon market start <exch>-<base>-<quote>",
+  .description =
+      "Start a market: WS subscribe, live-ring backfill (300 rows of"
+      " 1m candles via REST), and persist (wm_market.enabled=true)"
+      " so it survives daemon restarts. History catch-up is not"
+      " automatic — drive `/whenmoon download <market>` for a"
+      " deeper history.",
+  .group       = USERNS_GROUP_ADMIN,
+  .level       = 100,
+  .scope       = CMD_SCOPE_ANY,
+  .methods     = METHOD_T_ANY,
+  .cb          = wm_market_cmd_start,
+  .parent_path = "whenmoon/market",
+};
+
+static const cmd_decl_t whenmoon_market_stop_decl = {
+  .module      = "whenmoon",
+  .name        = "stop",
+  .usage       = "whenmoon market stop <exch>-<base>-<quote>",
+  .description = "Stop a market: WS unsubscribe, drop from the live set, and"
+                 " flip wm_market.enabled=false so it does not resume on next"
+                 " plugin start.",
+  .group       = USERNS_GROUP_ADMIN,
+  .level       = 100,
+  .scope       = CMD_SCOPE_ANY,
+  .methods     = METHOD_T_ANY,
+  .cb          = wm_market_cmd_stop,
+  .parent_path = "whenmoon/market",
+};
+
+static const cmd_decl_t whenmoon_market_mode_decl = {
+  .module      = "whenmoon",
+  .name        = "mode",
+  .usage       = "whenmoon market mode <exch>-<base>-<quote>"
+                 " <manual|paper|real>",
+  .description =
+      "Change a market's mode. PAPER = synthetic fills against the"
+      " cached mark + paper-stats accumulation. REAL = exchange"
+      " submission + risk gates (daily-loss bps, max-notional,"
+      " pending-cap, mark staleness) + real-stats accumulation."
+      " MANUAL = strategies"
+      " still receive ticks and log advice but the market takes no"
+      " action; force-trades (WM-MK-4) drive the position. Refused"
+      " when the market currently holds a position — flatten first.",
+  .group       = USERNS_GROUP_ADMIN,
+  .level       = 100,
+  .scope       = CMD_SCOPE_ANY,
+  .methods     = METHOD_T_ANY,
+  .cb          = wm_market_cmd_mode,
+  .parent_path = "whenmoon/market",
+};
+
+static const cmd_decl_t whenmoon_market_force_decl = {
+  .module      = "whenmoon",
+  .name        = "force",
+  .usage       = "whenmoon market force <exch>-<base>-<quote>[@<instance>]"
+                 " <buy|sell> <qty> [<px>]",
+  .description =
+      "Operator-issued forced trade. Bypasses strategy advisors and"
+      " the market's mode gate. Manual + paper modes: synthetic fill"
+      " at <px> or last ticker (paper applies synth slippage only on"
+      " the fallback path). Real mode: limit order via the exchange"
+      " abstraction (credentials, daily-loss, pending-cap, and"
+      " max-notional gates apply; fill arrives asynchronously). Giving"
+      " an explicit <px> also waives the mark-staleness gate — the"
+      " price is yours, not one inferred from a feed. Same"
+      " fill ledger choke point as accepted strategy advice — stats"
+      " accumulate in the current mode's ledger. Refused on"
+      " sell-against-flat (manual+paper) and any real-mode gate trip.",
+  .group       = USERNS_GROUP_ADMIN,
+  .level       = 100,
+  .scope       = CMD_SCOPE_ANY,
+  .methods     = METHOD_T_ANY,
+  .cb          = wm_market_cmd_force,
+  .parent_path = "whenmoon/market",
+};
+
+static const cmd_decl_t whenmoon_market_sync_decl = {
+  .module      = "whenmoon",
+  .name        = "sync",
+  .usage       = "whenmoon market sync <exch>-<base>-<quote>",
+  .description =
+      "Force a fresh reconcile of the market's REAL-mode cash ledger"
+      " against the live quote-currency `available` balance on its bound"
+      " exchange, and re-anchor the daily-loss baseline. Real order"
+      " sizing is size_frac * cash. Usually unnecessary: a flat market"
+      " auto-reconciles from the balance cache (the scheduled poll, an"
+      " on-demand `/show whenmoon balances`, or a real fill), and"
+      " switching into real mode also reconciles. Use this to force a"
+      " refresh after an external deposit/withdrawal. Blocks on an"
+      " authenticated account fetch; requires exchange credentials.",
+  .group       = USERNS_GROUP_ADMIN,
+  .level       = 100,
+  .scope       = CMD_SCOPE_ANY,
+  .methods     = METHOD_T_ANY,
+  .cb          = wm_market_cmd_sync,
+  .parent_path = "whenmoon/market",
+};
+
+static const cmd_decl_t show_whenmoon_indicators_decl = {
+  .module      = "whenmoon",
+  .name        = "indicators",
+  .usage       = "show whenmoon indicators <exch>-<base>-<quote> <gran>"
+                 " latest",
+  .description = "Print the latest closed bar's indicator block for the named"
+                 " market and granularity (1m|5m|15m|1h|4h|1d). NaN slots"
+                 " indicate insufficient history for that indicator's window.",
+  .group       = USERNS_GROUP_ADMIN,
+  .level       = 100,
+  .scope       = CMD_SCOPE_ANY,
+  .methods     = METHOD_T_ANY,
+  .cb          = wm_market_cmd_indicators,
+  .parent_path = "show/whenmoon",
+};
+
 bool
 wm_market_register_verbs(void)
 {
-  if(cmd_register("whenmoon", "market",
-        "whenmoon market <start|stop|mode|force|sync> ...",
-        "Add or remove a live market and manage its session."
-        " Starts: WS subscribe + live-ring 1m backfill."
-        " Stops: unsubscribe + clear enabled flag."
-        " Mode: change the market's mode (manual|paper|real)."
-        " Force: operator-issued forced trade (manual+paper synth fill"
-        " or real-mode submit, all gates honored)."
-        " Sync: force a fresh reconcile of real-mode cash + re-anchor the"
-        " daily-loss baseline (usually unnecessary — flat markets"
-        " auto-reconcile from the balance cache).",
-        NULL,
-        USERNS_GROUP_ADMIN, 100, CMD_SCOPE_ANY, METHOD_T_ANY,
-        wm_market_parent_cb, NULL, "whenmoon", NULL,
-        NULL, 0, NULL, NULL) != SUCCESS)
+  if(cmd_register(&whenmoon_market_decl) != SUCCESS)
     return(FAIL);
 
-  if(cmd_register("whenmoon", "start",
-        "whenmoon market start <exch>-<base>-<quote>",
-        "Start a market: WS subscribe, live-ring backfill (300 rows of"
-        " 1m candles via REST), and persist (wm_market.enabled=true)"
-        " so it survives daemon restarts. History catch-up is not"
-        " automatic — drive `/whenmoon download <market>` for a"
-        " deeper history.",
-        NULL,
-        USERNS_GROUP_ADMIN, 100, CMD_SCOPE_ANY, METHOD_T_ANY,
-        wm_market_cmd_start, NULL, "whenmoon/market", NULL,
-        NULL, 0, NULL, NULL) != SUCCESS)
+  if(cmd_register(&whenmoon_market_start_decl) != SUCCESS)
     return(FAIL);
 
-  if(cmd_register("whenmoon", "stop",
-        "whenmoon market stop <exch>-<base>-<quote>",
-        "Stop a market: WS unsubscribe, drop from the live set, and"
-        " flip wm_market.enabled=false so it does not resume on next"
-        " plugin start.",
-        NULL,
-        USERNS_GROUP_ADMIN, 100, CMD_SCOPE_ANY, METHOD_T_ANY,
-        wm_market_cmd_stop, NULL, "whenmoon/market", NULL,
-        NULL, 0, NULL, NULL) != SUCCESS)
+  if(cmd_register(&whenmoon_market_stop_decl) != SUCCESS)
     return(FAIL);
 
   // WM-MK-2: per-market mode change. Refuses non-flat transitions to
   // keep paper / real ledgers from contaminating each other when the
   // market still holds a position. Persists via market_persist.
-  if(cmd_register("whenmoon", "mode",
-        "whenmoon market mode <exch>-<base>-<quote>"
-        " <manual|paper|real>",
-        "Change a market's mode. PAPER = synthetic fills against the"
-        " cached mark + paper-stats accumulation. REAL = exchange"
-        " submission + risk gates (daily-loss bps, max-notional,"
-        " pending-cap, mark staleness) + real-stats accumulation."
-        " MANUAL = strategies"
-        " still receive ticks and log advice but the market takes no"
-        " action; force-trades (WM-MK-4) drive the position. Refused"
-        " when the market currently holds a position — flatten first.",
-        NULL,
-        USERNS_GROUP_ADMIN, 100, CMD_SCOPE_ANY, METHOD_T_ANY,
-        wm_market_cmd_mode, NULL, "whenmoon/market", NULL,
-        NULL, 0, NULL, NULL) != SUCCESS)
+  if(cmd_register(&whenmoon_market_mode_decl) != SUCCESS)
     return(FAIL);
 
   // WM-MK-4: operator-issued forced trade. Bypasses strategy advisors
@@ -792,55 +886,16 @@ wm_market_register_verbs(void)
   // points as accepted strategy advice — apply_fill_locked for synth
   // modes, real_submit_locked (with the real-mode gates) for real mode.
   // An explicit px waives mark-staleness alone (OBS-62).
-  if(cmd_register("whenmoon", "force",
-        "whenmoon market force <exch>-<base>-<quote>[@<instance>]"
-        " <buy|sell> <qty> [<px>]",
-        "Operator-issued forced trade. Bypasses strategy advisors and"
-        " the market's mode gate. Manual + paper modes: synthetic fill"
-        " at <px> or last ticker (paper applies synth slippage only on"
-        " the fallback path). Real mode: limit order via the exchange"
-        " abstraction (credentials, daily-loss, pending-cap, and"
-        " max-notional gates apply; fill arrives asynchronously). Giving"
-        " an explicit <px> also waives the mark-staleness gate — the"
-        " price is yours, not one inferred from a feed. Same"
-        " fill ledger choke point as accepted strategy advice — stats"
-        " accumulate in the current mode's ledger. Refused on"
-        " sell-against-flat (manual+paper) and any real-mode gate trip.",
-        NULL,
-        USERNS_GROUP_ADMIN, 100, CMD_SCOPE_ANY, METHOD_T_ANY,
-        wm_market_cmd_force, NULL, "whenmoon/market", NULL,
-        NULL, 0, NULL, NULL) != SUCCESS)
+  if(cmd_register(&whenmoon_market_force_decl) != SUCCESS)
     return(FAIL);
 
   // WM-REAL-CASH-1: on-demand real-cash reconciliation. Binds the real
   // ledger to the live quote-currency balance so real order sizing
   // deploys actual funds; also runs implicitly on switching to real mode.
-  if(cmd_register("whenmoon", "sync",
-        "whenmoon market sync <exch>-<base>-<quote>",
-        "Force a fresh reconcile of the market's REAL-mode cash ledger"
-        " against the live quote-currency `available` balance on its bound"
-        " exchange, and re-anchor the daily-loss baseline. Real order"
-        " sizing is size_frac * cash. Usually unnecessary: a flat market"
-        " auto-reconciles from the balance cache (the scheduled poll, an"
-        " on-demand `/show whenmoon balances`, or a real fill), and"
-        " switching into real mode also reconciles. Use this to force a"
-        " refresh after an external deposit/withdrawal. Blocks on an"
-        " authenticated account fetch; requires exchange credentials.",
-        NULL,
-        USERNS_GROUP_ADMIN, 100, CMD_SCOPE_ANY, METHOD_T_ANY,
-        wm_market_cmd_sync, NULL, "whenmoon/market", NULL,
-        NULL, 0, NULL, NULL) != SUCCESS)
+  if(cmd_register(&whenmoon_market_sync_decl) != SUCCESS)
     return(FAIL);
 
-  if(cmd_register("whenmoon", "indicators",
-        "show whenmoon indicators <exch>-<base>-<quote> <gran> latest",
-        "Print the latest closed bar's indicator block for the named"
-        " market and granularity (1m|5m|15m|1h|4h|1d). NaN slots"
-        " indicate insufficient history for that indicator's window.",
-        NULL,
-        USERNS_GROUP_ADMIN, 100, CMD_SCOPE_ANY, METHOD_T_ANY,
-        wm_market_cmd_indicators, NULL, "show/whenmoon", NULL,
-        NULL, 0, NULL, NULL) != SUCCESS)
+  if(cmd_register(&show_whenmoon_indicators_decl) != SUCCESS)
     return(FAIL);
 
   return(SUCCESS);
@@ -1562,35 +1617,52 @@ wm_show_market_cmd(const cmd_ctx_t *ctx)
   }
 }
 
+static const cmd_decl_t show_whenmoon_markets_decl = {
+  .module      = "whenmoon",
+  .name        = "markets",
+  .usage       = "show whenmoon markets",
+  .description =
+      "Market subscriptions: one row per distinct (exchange, product)"
+      " with the live last-trade price and, per candle grain (1m…1d),"
+      " the % move from that grain's latest completed candle close.",
+  .group       = USERNS_GROUP_ADMIN,
+  .level       = 100,
+  .scope       = CMD_SCOPE_ANY,
+  .methods     = METHOD_T_ANY,
+  .cb          = wm_show_market_cmd,
+  .parent_path = "show/whenmoon",
+  .abbrev      = "mar",
+};
+
+static const cmd_decl_t show_whenmoon_market_decl = {
+  .module      = "whenmoon",
+  .name        = "market",
+  .usage       = "show whenmoon market [sessions|<id>]",
+  .description = "No arg: the subscriptions table (as `markets`)."
+                 " `sessions` (abbr `ses`): every trading session with side,"
+                 " trade count, starting vs current equity, total P/L, and the"
+                 " entry price + move-from-entry for open longs."
+                 " `<id>`: a per-session detail card plus recent fills tails.",
+  .group       = USERNS_GROUP_ADMIN,
+  .level       = 100,
+  .scope       = CMD_SCOPE_ANY,
+  .methods     = METHOD_T_ANY,
+  .cb          = wm_show_market_cmd,
+  .parent_path = "show/whenmoon",
+  .abbrev      = "mk",
+};
+
 bool
 wm_show_market_register_verbs(void)
 {
   // Subscriptions overview: `show whenmoon markets` (abbr `mar`).
-  if(cmd_register("whenmoon", "markets",
-        "show whenmoon markets",
-        "Market subscriptions: one row per distinct (exchange, product)"
-        " with the live last-trade price and, per candle grain (1m…1d),"
-        " the % move from that grain's latest completed candle close.",
-        NULL,
-        USERNS_GROUP_ADMIN, 100, CMD_SCOPE_ANY, METHOD_T_ANY,
-        wm_show_market_cmd, NULL, "show/whenmoon", "mar",
-        NULL, 0, NULL, NULL) != SUCCESS)
+  if(cmd_register(&show_whenmoon_markets_decl) != SUCCESS)
     return(FAIL);
 
   // Session table + detail card: `show whenmoon market [sessions|<id>]`
   // (abbr `mk`; `sessions` abbr `ses`). Shares the one handler above, so
   // `market` with no arg mirrors `markets`.
-  if(cmd_register("whenmoon", "market",
-        "show whenmoon market [sessions|<id>]",
-        "No arg: the subscriptions table (as `markets`)."
-        " `sessions` (abbr `ses`): every trading session with side,"
-        " trade count, starting vs current equity, total P/L, and the"
-        " entry price + move-from-entry for open longs."
-        " `<id>`: a per-session detail card plus recent fills tails.",
-        NULL,
-        USERNS_GROUP_ADMIN, 100, CMD_SCOPE_ANY, METHOD_T_ANY,
-        wm_show_market_cmd, NULL, "show/whenmoon", "mk",
-        NULL, 0, NULL, NULL) != SUCCESS)
+  if(cmd_register(&show_whenmoon_market_decl) != SUCCESS)
     return(FAIL);
 
   return(SUCCESS);

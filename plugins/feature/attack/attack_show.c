@@ -1129,74 +1129,106 @@ atk_show_rules(const cmd_ctx_t *ctx)
 // Registration                                                        //
 // ------------------------------------------------------------------ //
 
+static const cmd_decl_t show_attack_decl = {
+  .module      = "attack",
+  .name        = "attack",
+  .usage       = "show attack",
+  .description = "The current round in this pit.",
+  .help_long   =
+      "Draws the round burning in this room: every combatant's health, "
+      "what they have dealt and taken, the heaviest blow struck, and "
+      "who has yet to swing this wave. In a direct message, where there "
+      "is no room to speak of, it shows whichever brawl in the "
+      "namespace was last touched. A finished round keeps its card "
+      "until the next one opens.",
+  .group       = USERNS_GROUP_EVERYONE,
+  .scope       = CMD_SCOPE_ANY,
+  .methods     = METHOD_T_ANY,
+  .cb          = atk_show_round,
+  .parent_path = "show",
+};
+
+static const cmd_decl_t show_attack_scores_decl = {
+  .module      = "attack",
+  .name        = "scores",
+  .usage       = "show attack scores",
+  .description = "Lifetime standings for every combatant.",
+  .help_long   =
+      "Everyone in this namespace who has ever fought, ordered by the "
+      "damage they have dealt: rounds entered, kills, deaths, damage "
+      "given and taken, critical hits, and their heaviest single blow. "
+      "The row count is `plugin.attack.scoreboard_rows`.",
+  .group       = USERNS_GROUP_EVERYONE,
+  .scope       = CMD_SCOPE_ANY,
+  .methods     = METHOD_T_ANY,
+  .cb          = atk_show_scores,
+  .parent_path = "show/attack",
+};
+
+static const cmd_decl_t show_attack_classes_decl = {
+  .module      = "attack",
+  .name        = "classes",
+  .usage       = "show attack classes",
+  .description = "The character classes a combatant may be dealt.",
+  .help_long   =
+      "One row per loaded character sheet: how many damage moves it "
+      "carries, how many afflictions it can inflict, how many heals it "
+      "knows, and what it is. Below the table, what the four damage "
+      "tiers actually pay at the current tunables. A class changes "
+      "only the WORDS the pit speaks — the engine rolls the same "
+      "numbers for everybody, and a sheet with forty critical lines "
+      "hits exactly as hard as one with a single line. Everyone in a "
+      "round is dealt a different class, and a brawl with more "
+      "combatants than there are sheets starts repeating them. Sheets "
+      "live in `plugin.attack.classes_path` and are re-read by `attack "
+      "reload`.",
+  .group       = USERNS_GROUP_EVERYONE,
+  .scope       = CMD_SCOPE_ANY,
+  .methods     = METHOD_T_ANY,
+  .cb          = atk_show_classes,
+  .parent_path = "show/attack",
+};
+
+static const cmd_decl_t show_attack_rules_decl = {
+  .module      = "attack",
+  .name        = "rules",
+  .usage       = "show attack rules",
+  .description = "How the pit works, at the numbers it is running now.",
+  .help_long   =
+      "The whole game in one card: what a swing rolls, what a mend "
+      "restores, what surrendering a turn buys, how an affliction pays "
+      "itself out, when a blow goes wide, and what ends a round. Every "
+      "figure is read from the live tunables rather than written down, "
+      "so the card cannot go stale when an operator turns a knob — the "
+      "damage bands at the foot come from the same function the "
+      "renderer asks, and describe the pit exactly as it will play the "
+      "next blow.",
+  .group       = USERNS_GROUP_EVERYONE,
+  .scope       = CMD_SCOPE_ANY,
+  .methods     = METHOD_T_ANY,
+  .cb          = atk_show_rules,
+  .parent_path = "show/attack",
+};
+
 // everyone/0, unlike `show whenmoon`: the pit is an amusement, and
 // anyone watching the fight should be able to read the board. The `show`
 // parent is core-provided and already exists.
 bool
 atk_show_register(void)
 {
-  if(cmd_register("attack", "attack",
-        "show attack",
-        "The current round in this pit.",
-        "Draws the round burning in this room: every combatant's health, "
-        "what they have dealt and taken, the heaviest blow struck, and "
-        "who has yet to swing this wave. In a direct message, where there "
-        "is no room to speak of, it shows whichever brawl in the "
-        "namespace was last touched. A finished round keeps its card "
-        "until the next one opens.",
-        USERNS_GROUP_EVERYONE, 0, CMD_SCOPE_ANY, METHOD_T_ANY,
-        atk_show_round, NULL, "show", NULL,
-        NULL, 0, NULL, NULL) != SUCCESS)
+  if(cmd_register(&show_attack_decl) != SUCCESS)
     return(FAIL);
 
-  if(cmd_register("attack", "scores",
-        "show attack scores",
-        "Lifetime standings for every combatant.",
-        "Everyone in this namespace who has ever fought, ordered by the "
-        "damage they have dealt: rounds entered, kills, deaths, damage "
-        "given and taken, critical hits, and their heaviest single blow. "
-        "The row count is `plugin.attack.scoreboard_rows`.",
-        USERNS_GROUP_EVERYONE, 0, CMD_SCOPE_ANY, METHOD_T_ANY,
-        atk_show_scores, NULL, "show/attack", NULL,
-        NULL, 0, NULL, NULL) != SUCCESS)
+  if(cmd_register(&show_attack_scores_decl) != SUCCESS)
     return(FAIL);
 
-  if(cmd_register("attack", "classes",
-        "show attack classes",
-        "The character classes a combatant may be dealt.",
-        "One row per loaded character sheet: how many damage moves it "
-        "carries, how many afflictions it can inflict, how many heals it "
-        "knows, and what it is. Below the table, what the four damage "
-        "tiers actually pay at the current tunables. A class changes "
-        "only the WORDS the pit speaks — the engine rolls the same "
-        "numbers for everybody, and a sheet with forty critical lines "
-        "hits exactly as hard as one with a single line. Everyone in a "
-        "round is dealt a different class, and a brawl with more "
-        "combatants than there are sheets starts repeating them. Sheets "
-        "live in `plugin.attack.classes_path` and are re-read by `attack "
-        "reload`.",
-        USERNS_GROUP_EVERYONE, 0, CMD_SCOPE_ANY, METHOD_T_ANY,
-        atk_show_classes, NULL, "show/attack", NULL,
-        NULL, 0, NULL, NULL) != SUCCESS)
+  if(cmd_register(&show_attack_classes_decl) != SUCCESS)
     return(FAIL);
 
   // No nickname collision to trade against, unlike `attack reload`: this
   // hangs off core's `show` parent, so a combatant called `rules` is as
   // attackable as anyone else.
-  if(cmd_register("attack", "rules",
-        "show attack rules",
-        "How the pit works, at the numbers it is running now.",
-        "The whole game in one card: what a swing rolls, what a mend "
-        "restores, what surrendering a turn buys, how an affliction pays "
-        "itself out, when a blow goes wide, and what ends a round. Every "
-        "figure is read from the live tunables rather than written down, "
-        "so the card cannot go stale when an operator turns a knob — the "
-        "damage bands at the foot come from the same function the "
-        "renderer asks, and describe the pit exactly as it will play the "
-        "next blow.",
-        USERNS_GROUP_EVERYONE, 0, CMD_SCOPE_ANY, METHOD_T_ANY,
-        atk_show_rules, NULL, "show/attack", NULL,
-        NULL, 0, NULL, NULL) != SUCCESS)
+  if(cmd_register(&show_attack_rules_decl) != SUCCESS)
     return(FAIL);
 
   return(SUCCESS);

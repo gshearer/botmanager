@@ -195,20 +195,53 @@ static const cmd_nl_t chat_hush_nl = {
   .dispatch_text = "bot $bot hush",
 };
 
+static const cmd_decl_t bot_hush_decl = {
+  .module      = "chat",
+  .name        = "hush",
+  .usage       = "bot <name> hush <duration>",
+  .description = "Mute a chat bot's replies for a duration",
+  .help_long   =
+      "Suppresses all replies from the named bot for the given\n"
+      "duration. Sets bot.<name>.behavior.mute_until to (now + duration).\n"
+      "Auto-clears when the deadline passes, or manually via\n"
+      "/set kv bot.<name>.behavior.mute_until 0.",
+  .group       = USERNS_GROUP_ADMIN,
+  .level       = 100,
+  .scope       = CMD_SCOPE_ANY,
+  .methods     = METHOD_T_ANY,
+  .cb          = cmd_bot_hush,
+  .parent_path = "bot",
+  .arg_desc    = ad_bot_hush,
+  .arg_count   = (uint8_t)(sizeof(ad_bot_hush) / sizeof(ad_bot_hush[0])),
+  .nl          = &chat_hush_nl,
+};
+
+static const cmd_decl_t bot_refresh_prompts_decl = {
+  .module      = "chat",
+  .name        = "refresh_prompts",
+  .usage       = "bot <name> refresh_prompts",
+  .description = "Re-sync a chat bot's cached personality + interests",
+  .help_long   =
+      "Personality body and output contract are read fresh from disk on\n"
+      "every reply, so edits to those files already take effect without\n"
+      "this command. Use this after editing the personality file's\n"
+      "`interests:` frontmatter block, or any time you want to force\n"
+      "bot.<name>.behavior.personality and bot.<name>.behavior.contract to be\n"
+      "re-read from KV. Re-parses the interests block into the\n"
+      "reactive-topic cache and re-registers topics with the\n"
+      "acquisition engine.",
+  .group       = USERNS_GROUP_ADMIN,
+  .level       = 100,
+  .scope       = CMD_SCOPE_ANY,
+  .methods     = METHOD_T_ANY,
+  .cb          = cmd_bot_refresh_prompts,
+  .parent_path = "bot",
+};
+
 bool
 chatbot_cmds_register(void)
 {
-  if(cmd_register("chat", "hush",
-        "bot <name> hush <duration>",
-        "Mute a chat bot's replies for a duration",
-        "Suppresses all replies from the named bot for the given\n"
-        "duration. Sets bot.<name>.behavior.mute_until to (now + duration).\n"
-        "Auto-clears when the deadline passes, or manually via\n"
-        "/set kv bot.<name>.behavior.mute_until 0.",
-        USERNS_GROUP_ADMIN, 100, CMD_SCOPE_ANY, METHOD_T_ANY,
-        cmd_bot_hush, NULL, "bot", NULL,
-        ad_bot_hush, (uint8_t)(sizeof(ad_bot_hush) / sizeof(ad_bot_hush[0])),
-        NULL, &chat_hush_nl) != SUCCESS)
+  if(cmd_register(&bot_hush_decl) != SUCCESS)
     return(FAIL);
 
   if(chatbot_dossiersweep_cmd_register() != SUCCESS)
@@ -217,20 +250,7 @@ chatbot_cmds_register(void)
   if(chatbot_show_verbs_register() != SUCCESS)
     goto fail_show_verbs;
 
-  if(cmd_register("chat", "refresh_prompts",
-        "bot <name> refresh_prompts",
-        "Re-sync a chat bot's cached personality + interests",
-        "Personality body and output contract are read fresh from disk on\n"
-        "every reply, so edits to those files already take effect without\n"
-        "this command. Use this after editing the personality file's\n"
-        "`interests:` frontmatter block, or any time you want to force\n"
-        "bot.<name>.behavior.personality and bot.<name>.behavior.contract to be\n"
-        "re-read from KV. Re-parses the interests block into the\n"
-        "reactive-topic cache and re-registers topics with the\n"
-        "acquisition engine.",
-        USERNS_GROUP_ADMIN, 100, CMD_SCOPE_ANY, METHOD_T_ANY,
-        cmd_bot_refresh_prompts, NULL, "bot", NULL,
-        NULL, 0, NULL, NULL) != SUCCESS)
+  if(cmd_register(&bot_refresh_prompts_decl) != SUCCESS)
     goto fail_refresh_prompts;
 
   if(chatbot_deferred_register() != SUCCESS)

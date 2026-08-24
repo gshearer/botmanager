@@ -714,19 +714,28 @@ static const cmd_nl_t rawg_nl = {
 // Registration — driven by the service half's plugin lifecycle
 // ----------------------------------------------------------------------
 
+static const cmd_decl_t rawg_decl = {
+  .module      = RAWG_CTX,
+  .name        = "rawg",
+  .usage       = rawg_usage,
+  .description =
+      "Video-game info, search, and what's trending — from the RAWG "
+      "database (rawg.io)",
+  .group       = "everyone",
+  .scope       = CMD_SCOPE_ANY,
+  .methods     = METHOD_T_ANY,
+  .cb          = rawg_cmd,
+  .abbrev      = "game",
+  .nl          = &rawg_nl,
+};
+
 // The registry records RAWG_CTX as the providing module: after the merge
 // the rawg plugin itself owns this command, and `/show commands` should
 // say so.
 bool
 rawg_cmd_register(void)
 {
-  if(cmd_register(RAWG_CTX, "rawg", rawg_usage,
-      "Video-game info, search, and what's trending — from the RAWG "
-      "database (rawg.io)",
-      NULL,
-      "everyone", 0, CMD_SCOPE_ANY, METHOD_T_ANY,
-      rawg_cmd, NULL, NULL, "game",
-      NULL, 0, NULL, &rawg_nl) != SUCCESS)
+  if(cmd_register(&rawg_decl) != SUCCESS)
     return(FAIL);
 
   clam(CLAM_INFO, RAWGCMD_CTX, "!rawg registered");

@@ -799,29 +799,38 @@ fr_show_handler(const cmd_ctx_t *ctx)
 // Registration                                                        //
 // ------------------------------------------------------------------ //
 
+static const cmd_decl_t show_feature_decl = {
+  .module      = "featreq",
+  .name        = "feature",
+  .usage       = "show feature [id] [--all] [--type <t>] [--status <s>] "
+                 "[--sort <new|old|status>]",
+  .description = "The feature-request board.",
+  .help_long   =
+      "With no argument, draws every request still OPEN, newest "
+      "first: id, what kind it is, where it has got to, who asked, "
+      "which bot heard it, how long ago, and the request itself. "
+      "Completed and canceled requests are left out, because the "
+      "default board is a worklist — --all puts them back, and "
+      "naming one with --status asks for it directly. Give an id for "
+      "one request in full, whatever its status. --type narrows to "
+      "feat / bug / change, --status to new / in-prog / completed / "
+      "canceled. --sort old is queue order, oldest first — what to "
+      "work on next — and --sort status groups the board by where "
+      "each request has got to rather than by when it arrived. The "
+      "board is global — every bot and every namespace reads the "
+      "same one.",
+  .group       = USERNS_GROUP_USER,
+  .scope       = CMD_SCOPE_ANY,
+  .methods     = METHOD_T_ANY,
+  .cb          = fr_show_handler,
+  .parent_path = "show",
+  .abbrev      = "feat",
+};
+
 bool
 fr_show_register(void)
 {
-  if(cmd_register("featreq", "feature",
-        "show feature [id] [--all] [--type <t>] [--status <s>] "
-        "[--sort <new|old|status>]",
-        "The feature-request board.",
-        "With no argument, draws every request still OPEN, newest "
-        "first: id, what kind it is, where it has got to, who asked, "
-        "which bot heard it, how long ago, and the request itself. "
-        "Completed and canceled requests are left out, because the "
-        "default board is a worklist — --all puts them back, and "
-        "naming one with --status asks for it directly. Give an id for "
-        "one request in full, whatever its status. --type narrows to "
-        "feat / bug / change, --status to new / in-prog / completed / "
-        "canceled. --sort old is queue order, oldest first — what to "
-        "work on next — and --sort status groups the board by where "
-        "each request has got to rather than by when it arrived. The "
-        "board is global — every bot and every namespace reads the "
-        "same one.",
-        USERNS_GROUP_USER, 0, CMD_SCOPE_ANY, METHOD_T_ANY,
-        fr_show_handler, NULL, "show", "feat",
-        NULL, 0, NULL, NULL) != SUCCESS)
+  if(cmd_register(&show_feature_decl) != SUCCESS)
     return(FAIL);
 
   return(SUCCESS);

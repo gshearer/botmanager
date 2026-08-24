@@ -331,43 +331,68 @@ static const cmd_arg_desc_t uq_del_args[] = {
   { "id", CMD_ARG_DIGITS, CMD_ARG_REQUIRED, 18, NULL },
 };
 
+static const cmd_decl_t quote_decl = {
+  .module      = "userquote",
+  .name        = "quote",
+  .usage       = "quote [-v] [-i <id>] [sayer]",
+  .description = "Recall a saved quote (least-recently-seen first).",
+  .help_long   = "With no argument, cycles the quote book for this namespace. "
+                 "Give a name to recall that person's quotes, -i <id> for a "
+                 "specific one, or -v for the full provenance card.",
+  .group       = USERNS_GROUP_EVERYONE,
+  .scope       = CMD_SCOPE_ANY,
+  .methods     = METHOD_T_ANY,
+  .cb          = uq_cmd_recall,
+  .abbrev      = "\"",
+  .nl          = &uq_recall_nl,
+};
+
+static const cmd_decl_t quote_add_decl = {
+  .module      = "userquote",
+  .name        = "add",
+  .usage       = "quote add [<sayer> <text>]",
+  .description = "Save a quote. With no arguments, quotes the last thing said "
+                 "in the channel.",
+  .help_long   =
+      "`quote add <sayer> <text>` saves an explicit quote under the "
+      "search key <sayer>. `quote add` on its own captures the most "
+      "recent line in the channel and attributes it to whoever said "
+      "it (resolved to their username when known).",
+  .group       = USERNS_GROUP_USER,
+  .scope       = CMD_SCOPE_ANY,
+  .methods     = METHOD_T_ANY,
+  .cb          = uq_cmd_add,
+  .parent_path = "quote",
+};
+
+static const cmd_decl_t quote_del_decl = {
+  .module      = "userquote",
+  .name        = "del",
+  .usage       = "quote del <id>",
+  .description = "Delete a quote by id (registered users, level >= 100).",
+  .group       = USERNS_GROUP_USER,
+  .level       = 100,
+  .scope       = CMD_SCOPE_ANY,
+  .methods     = METHOD_T_ANY,
+  .cb          = uq_cmd_del,
+  .parent_path = "quote",
+  .arg_desc    = uq_del_args,
+  .arg_count   = 1,
+};
+
 bool
 uq_commands_register(void)
 {
   // Root: recall. Alias `"` mirrors the old quotebot muscle memory.
-  if(cmd_register("userquote", "quote",
-        "quote [-v] [-i <id>] [sayer]",
-        "Recall a saved quote (least-recently-seen first).",
-        "With no argument, cycles the quote book for this namespace. "
-        "Give a name to recall that person's quotes, -i <id> for a "
-        "specific one, or -v for the full provenance card.",
-        USERNS_GROUP_EVERYONE, 0, CMD_SCOPE_ANY, METHOD_T_ANY,
-        uq_cmd_recall, NULL, NULL, "\"",
-        NULL, 0, NULL, &uq_recall_nl) != SUCCESS)
+  if(cmd_register(&quote_decl) != SUCCESS)
     return(FAIL);
 
   // quote add — registered users, any level.
-  if(cmd_register("userquote", "add",
-        "quote add [<sayer> <text>]",
-        "Save a quote. With no arguments, quotes the last thing said "
-        "in the channel.",
-        "`quote add <sayer> <text>` saves an explicit quote under the "
-        "search key <sayer>. `quote add` on its own captures the most "
-        "recent line in the channel and attributes it to whoever said "
-        "it (resolved to their username when known).",
-        USERNS_GROUP_USER, 0, CMD_SCOPE_ANY, METHOD_T_ANY,
-        uq_cmd_add, NULL, "quote", NULL,
-        NULL, 0, NULL, NULL) != SUCCESS)
+  if(cmd_register(&quote_add_decl) != SUCCESS)
     return(FAIL);
 
   // quote del — registered users at level >= 100.
-  if(cmd_register("userquote", "del",
-        "quote del <id>",
-        "Delete a quote by id (registered users, level >= 100).",
-        NULL,
-        USERNS_GROUP_USER, 100, CMD_SCOPE_ANY, METHOD_T_ANY,
-        uq_cmd_del, NULL, "quote", NULL,
-        uq_del_args, 1, NULL, NULL) != SUCCESS)
+  if(cmd_register(&quote_del_decl) != SUCCESS)
     return(FAIL);
 
   // `show quotes` hangs off the observability root, not off `quote`.

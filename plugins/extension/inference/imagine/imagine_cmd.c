@@ -1403,19 +1403,52 @@ static const char imagine_cmd_help[] =
     "  !show imagine\n"
     "  !show imagine queue";
 
+static const cmd_decl_t imagine_decl = {
+  .module      = IMG_CMD_CTX,
+  .name        = "imagine",
+  .usage       = "imagine [-m <model>] <prompt>",
+  .description = "Text-to-image generation (stateless)",
+  .help_long   = imagine_cmd_help,
+  .group       = USERNS_GROUP_EVERYONE,
+  .scope       = CMD_SCOPE_ANY,
+  .methods     = METHOD_T_ANY,
+  .cb          = imagine_cmd_handler,
+  .abbrev      = "ig",
+};
+
+static const cmd_decl_t show_imagine_decl = {
+  .module      = IMG_CMD_CTX,
+  .name        = "imagine",
+  .usage       = "show imagine",
+  .description = "Report the model, settings and hosting !imagine would use"
+                 " here",
+  .group       = USERNS_GROUP_EVERYONE,
+  .scope       = CMD_SCOPE_ANY,
+  .methods     = METHOD_T_ANY,
+  .cb          = show_imagine_handler,
+  .parent_path = "show",
+};
+
+static const cmd_decl_t show_imagine_queue_decl = {
+  .module      = IMG_CMD_CTX,
+  .name        = "queue",
+  .usage       = "show imagine queue",
+  .description = "List the !imagine renders running and waiting",
+  .group       = USERNS_GROUP_EVERYONE,
+  .scope       = CMD_SCOPE_ANY,
+  .methods     = METHOD_T_ANY,
+  .cb          = show_imagine_queue_handler,
+  .parent_path = "show/imagine",
+  .abbrev      = "q",
+};
+
 static bool
 imagine_cmd_init(void)
 {
-  if(cmd_register(IMG_CMD_CTX, "imagine", "imagine [-m <model>] <prompt>",
-      "Text-to-image generation (stateless)", imagine_cmd_help,
-      USERNS_GROUP_EVERYONE, 0, CMD_SCOPE_ANY, METHOD_T_ANY,
-      imagine_cmd_handler, NULL, NULL, "ig", NULL, 0, NULL, NULL) != SUCCESS)
+  if(cmd_register(&imagine_decl) != SUCCESS)
     return(FAIL);
 
-  if(cmd_register(IMG_CMD_CTX, "imagine", "show imagine",
-      "Report the model, settings and hosting !imagine would use here", NULL,
-      USERNS_GROUP_EVERYONE, 0, CMD_SCOPE_ANY, METHOD_T_ANY,
-      show_imagine_handler, NULL, "show", NULL, NULL, 0, NULL, NULL)
+  if(cmd_register(&show_imagine_decl)
       != SUCCESS)
   {
     cmd_unregister_path("imagine");
@@ -1425,11 +1458,7 @@ imagine_cmd_init(void)
   // A child rather than an argument: the queue is a different question
   // from the setup, and only this one changes between two reads a second
   // apart. cmd_unregister_path("show/imagine") takes the subtree with it.
-  if(cmd_register(IMG_CMD_CTX, "queue", "show imagine queue",
-      "List the !imagine renders running and waiting", NULL,
-      USERNS_GROUP_EVERYONE, 0, CMD_SCOPE_ANY, METHOD_T_ANY,
-      show_imagine_queue_handler, NULL, "show/imagine", "q", NULL, 0,
-      NULL, NULL) != SUCCESS)
+  if(cmd_register(&show_imagine_queue_decl) != SUCCESS)
   {
     cmd_unregister_path("imagine");
     cmd_unregister_path("show/imagine");

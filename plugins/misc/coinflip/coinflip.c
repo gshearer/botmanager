@@ -90,16 +90,25 @@ static const cmd_nl_t coinflip_nl = {
       / sizeof(coinflip_examples[0])),
 };
 
+static const cmd_decl_t coinflip_decl = {
+  .module      = COINFLIP_CTX,
+  .name        = "coinflip",
+  .usage       = "coinflip",
+  .description = "Flip a coin",
+  .help_long   = "Flip a fair coin and hear about it.\n"
+                 "Takes no arguments; the coin has already made up its mind.",
+  .group       = "everyone",
+  .scope       = CMD_SCOPE_ANY,
+  .methods     = METHOD_T_ANY,
+  .cb          = coinflip_cmd,
+  .abbrev      = "cf",
+  .nl          = &coinflip_nl,
+};
+
 static bool
 coinflip_init(void)
 {
-  if(cmd_register(COINFLIP_CTX, "coinflip",
-      "coinflip",
-      "Flip a coin",
-      "Flip a fair coin and hear about it.\n"
-      "Takes no arguments; the coin has already made up its mind.",
-      "everyone", 0, CMD_SCOPE_ANY, METHOD_T_ANY, coinflip_cmd, NULL, NULL,
-      "cf", NULL, 0, NULL, &coinflip_nl) != SUCCESS)
+  if(cmd_register(&coinflip_decl) != SUCCESS)
     return(FAIL);
 
   return(SUCCESS);

@@ -1105,90 +1105,184 @@ cmd_show_status(const cmd_ctx_t *ctx)
 
 // Registration
 
-void
-cmd_show_register(void)
-{
-  cmd_register("cmd", "kv",
-      "show kv [prefix]",
-      "Show configuration values",
-      NULL,
-      USERNS_GROUP_ADMIN, 100, CMD_SCOPE_ANY, METHOD_T_ANY,
-      cmd_show_kv, NULL, "show", "k", ad_show_kv, 1, NULL, NULL);
+static const cmd_decl_t show_kv_decl = {
+  .module      = "cmd",
+  .name        = "kv",
+  .usage       = "show kv [prefix]",
+  .description = "Show configuration values",
+  .group       = USERNS_GROUP_ADMIN,
+  .level       = 100,
+  .scope       = CMD_SCOPE_ANY,
+  .methods     = METHOD_T_ANY,
+  .cb          = cmd_show_kv,
+  .parent_path = "show",
+  .abbrev      = "k",
+  .arg_desc    = ad_show_kv,
+  .arg_count   = 1,
+};
 
-  cmd_register("cmd", "methods",
-      "show methods",
-      "List method types and instances",
-      NULL,
-      USERNS_GROUP_ADMIN, 100, CMD_SCOPE_ANY, METHOD_T_ANY,
-      cmd_show_methods, NULL, "show", "m", NULL, 0, NULL, NULL);
+static const cmd_decl_t show_methods_decl = {
+  .module      = "cmd",
+  .name        = "methods",
+  .usage       = "show methods",
+  .description = "List method types and instances",
+  .group       = USERNS_GROUP_ADMIN,
+  .level       = 100,
+  .scope       = CMD_SCOPE_ANY,
+  .methods     = METHOD_T_ANY,
+  .cb          = cmd_show_methods,
+  .parent_path = "show",
+  .abbrev      = "m",
+};
 
-  cmd_register("cmd", "status",
-      "show status",
-      "System health dashboard",
-      NULL,
-      USERNS_GROUP_EVERYONE, 0, CMD_SCOPE_ANY, METHOD_T_ANY,
-      cmd_show_status, NULL, "show", "st", NULL, 0, NULL, NULL);
+static const cmd_decl_t show_status_decl = {
+  .module      = "cmd",
+  .name        = "status",
+  .usage       = "show status",
+  .description = "System health dashboard",
+  .group       = USERNS_GROUP_EVERYONE,
+  .scope       = CMD_SCOPE_ANY,
+  .methods     = METHOD_T_ANY,
+  .cb          = cmd_show_status,
+  .parent_path = "show",
+  .abbrev      = "st",
+};
 
-  cmd_register("cmd", "schema",
-      "show schema [plugin [group]]",
-      "Show plugin entity schemas",
-      NULL,
-      USERNS_GROUP_ADMIN, 100, CMD_SCOPE_ANY, METHOD_T_ANY,
-      cmd_show_schema, NULL, "show", "sc", ad_show_schema, 2, NULL, NULL);
+static const cmd_decl_t show_schema_decl = {
+  .module      = "cmd",
+  .name        = "schema",
+  .usage       = "show schema [plugin [group]]",
+  .description = "Show plugin entity schemas",
+  .group       = USERNS_GROUP_ADMIN,
+  .level       = 100,
+  .scope       = CMD_SCOPE_ANY,
+  .methods     = METHOD_T_ANY,
+  .cb          = cmd_show_schema,
+  .parent_path = "show",
+  .abbrev      = "sc",
+  .arg_desc    = ad_show_schema,
+  .arg_count   = 2,
+};
 
-  cmd_register("cmd", "sockets",
-      "show sockets",
-      "List active socket sessions",
-      NULL,
-      USERNS_GROUP_ADMIN, 100, CMD_SCOPE_ANY, METHOD_T_ANY,
-      cmd_show_sockets, NULL, "show", "sock", NULL, 0, NULL, NULL);
+static const cmd_decl_t show_sockets_decl = {
+  .module      = "cmd",
+  .name        = "sockets",
+  .usage       = "show sockets",
+  .description = "List active socket sessions",
+  .group       = USERNS_GROUP_ADMIN,
+  .level       = 100,
+  .scope       = CMD_SCOPE_ANY,
+  .methods     = METHOD_T_ANY,
+  .cb          = cmd_show_sockets,
+  .parent_path = "show",
+  .abbrev      = "sock",
+};
 
-  cmd_register("cmd", "curl",
-      "show curl",
-      "Show curl subsystem state",
-      NULL,
-      USERNS_GROUP_ADMIN, 100, CMD_SCOPE_ANY, METHOD_T_ANY,
-      cmd_show_curl, NULL, "show", "cu", NULL, 0, NULL, NULL);
+static const cmd_decl_t show_curl_decl = {
+  .module      = "cmd",
+  .name        = "curl",
+  .usage       = "show curl",
+  .description = "Show curl subsystem state",
+  .group       = USERNS_GROUP_ADMIN,
+  .level       = 100,
+  .scope       = CMD_SCOPE_ANY,
+  .methods     = METHOD_T_ANY,
+  .cb          = cmd_show_curl,
+  .parent_path = "show",
+  .abbrev      = "cu",
+};
 
-  cmd_register("cmd", "resolve",
-      "show resolve",
-      "Show resolver statistics",
-      NULL,
-      USERNS_GROUP_ADMIN, 100, CMD_SCOPE_ANY, METHOD_T_ANY,
-      cmd_show_resolve, NULL, "show", "dns", NULL, 0, NULL, NULL);
+static const cmd_decl_t show_resolve_decl = {
+  .module      = "cmd",
+  .name        = "resolve",
+  .usage       = "show resolve",
+  .description = "Show resolver statistics",
+  .group       = USERNS_GROUP_ADMIN,
+  .level       = 100,
+  .scope       = CMD_SCOPE_ANY,
+  .methods     = METHOD_T_ANY,
+  .cb          = cmd_show_resolve,
+  .parent_path = "show",
+  .abbrev      = "dns",
+};
 
-  cmd_register("cmd", "db",
-      "show db",
-      "Show database pool details",
-      NULL,
-      USERNS_GROUP_ADMIN, 100, CMD_SCOPE_ANY, METHOD_T_ANY,
-      cmd_show_db, NULL, "show", "d", NULL, 0, NULL, NULL);
+static const cmd_decl_t show_db_decl = {
+  .module      = "cmd",
+  .name        = "db",
+  .usage       = "show db",
+  .description = "Show database pool details",
+  .group       = USERNS_GROUP_ADMIN,
+  .level       = 100,
+  .scope       = CMD_SCOPE_ANY,
+  .methods     = METHOD_T_ANY,
+  .cb          = cmd_show_db,
+  .parent_path = "show",
+  .abbrev      = "d",
+};
 
-  cmd_register("cmd", "identities",
-      "show identities <botname>",
-      "Show temporary identities in a bot's user namespace",
-      NULL,
-      USERNS_GROUP_ADMIN, 100, CMD_SCOPE_ANY, METHOD_T_ANY,
-      cmd_show_identities, NULL, "show", "ident",
-      ad_show_identities, 1, NULL, NULL);
+static const cmd_decl_t show_identities_decl = {
+  .module      = "cmd",
+  .name        = "identities",
+  .usage       = "show identities <botname>",
+  .description = "Show temporary identities in a bot's user namespace",
+  .group       = USERNS_GROUP_ADMIN,
+  .level       = 100,
+  .scope       = CMD_SCOPE_ANY,
+  .methods     = METHOD_T_ANY,
+  .cb          = cmd_show_identities,
+  .parent_path = "show",
+  .abbrev      = "ident",
+  .arg_desc    = ad_show_identities,
+  .arg_count   = 1,
+};
 
-  // /show pool — thread pool dashboard.
-  cmd_register("cmd", "pool",
-      "show pool",
-      "Thread pool dashboard (workers, persist threads, jobs)",
+static const cmd_decl_t show_pool_decl = {
+  .module      = "cmd",
+  .name        = "pool",
+  .usage       = "show pool",
+  .description = "Thread pool dashboard (workers, persist threads, jobs)",
+  .help_long   =
       "Renders worker counts, idle/active breakdown, utilization\n"
       "bar against the configured max, persistent thread list, and\n"
       "lifetime job counter. Config knobs (min, spare, max_idle, wait)\n"
       "live in KV under core.pool.*.",
-      USERNS_GROUP_ADMIN, 100, CMD_SCOPE_ANY, METHOD_T_ANY,
-      cmd_show_pool, NULL, "show", NULL, NULL, 0, NULL, NULL);
+  .group       = USERNS_GROUP_ADMIN,
+  .level       = 100,
+  .scope       = CMD_SCOPE_ANY,
+  .methods     = METHOD_T_ANY,
+  .cb          = cmd_show_pool,
+  .parent_path = "show",
+};
 
-  cmd_register("cmd", "version",
-      "show version",
-      "Show botmanager version and build number",
-      NULL,
-      USERNS_GROUP_EVERYONE, 0, CMD_SCOPE_ANY, METHOD_T_ANY,
-      cmd_show_version, NULL, "show", "ver", NULL, 0, NULL, NULL);
+static const cmd_decl_t show_version_decl = {
+  .module      = "cmd",
+  .name        = "version",
+  .usage       = "show version",
+  .description = "Show botmanager version and build number",
+  .group       = USERNS_GROUP_EVERYONE,
+  .scope       = CMD_SCOPE_ANY,
+  .methods     = METHOD_T_ANY,
+  .cb          = cmd_show_version,
+  .parent_path = "show",
+  .abbrev      = "ver",
+};
+
+void
+cmd_show_register(void)
+{
+  cmd_register(&show_kv_decl);
+  cmd_register(&show_methods_decl);
+  cmd_register(&show_status_decl);
+  cmd_register(&show_schema_decl);
+  cmd_register(&show_sockets_decl);
+  cmd_register(&show_curl_decl);
+  cmd_register(&show_resolve_decl);
+  cmd_register(&show_db_decl);
+  cmd_register(&show_identities_decl);
+
+  // /show pool — thread pool dashboard.
+  cmd_register(&show_pool_decl);
+  cmd_register(&show_version_decl);
 
   // /show extract {root,stats} is registered by the chat plugin as of R2.
 }

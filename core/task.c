@@ -864,16 +864,25 @@ task_cmd_show(const cmd_ctx_t *ctx)
     cmd_reply(ctx, "  " CLR_GRAY "(none)" CLR_RESET);
 }
 
+static const cmd_decl_t show_tasks_decl = {
+  .module      = "task",
+  .name        = "tasks",
+  .usage       = "show tasks",
+  .description = "List all active tasks",
+  .group       = USERNS_GROUP_ADMIN,
+  .level       = 100,
+  .scope       = CMD_SCOPE_ANY,
+  .methods     = METHOD_T_ANY,
+  .cb          = task_cmd_show,
+  .parent_path = "show",
+  .abbrev      = "t",
+};
+
 // Register the "show tasks" command with the command subsystem.
 void
 task_register_commands(void)
 {
-  cmd_register("task", "tasks",
-      "show tasks",
-      "List all active tasks",
-      NULL,
-      USERNS_GROUP_ADMIN, 100, CMD_SCOPE_ANY, METHOD_T_ANY,
-      task_cmd_show, NULL, "show", "t", NULL, 0, NULL, NULL);
+  cmd_register(&show_tasks_decl);
 }
 
 // Initialize the task subsystem.

@@ -244,12 +244,12 @@ static const cmd_nl_t dice_nl = {
       / sizeof(dice_examples[0])),
 };
 
-static bool
-dice_init(void)
-{
-  if(cmd_register(DICE_CTX, "dice",
-      "dice [numsides [numdice]]",
-      "Roll dice",
+static const cmd_decl_t dice_decl = {
+  .module      = DICE_CTX,
+  .name        = "dice",
+  .usage       = "dice [numsides [numdice]]",
+  .description = "Roll dice",
+  .help_long   =
       "Roll dice and hear how it went.\n"
       "numsides is one of 4, 6, 8, 12 or 20 — 20 if you don't say.\n"
       "numdice is 1 to 5 — 1 if you don't say.\n"
@@ -258,10 +258,20 @@ dice_init(void)
       "  !dice        one 20-sided die\n"
       "  !dice 6      one 6-sided die\n"
       "  !dice 6 3    three 6-sided dice, and their total",
-      "everyone", 0, CMD_SCOPE_ANY, METHOD_T_ANY, dice_cmd, NULL, NULL,
-      "d", dice_args,
-      (uint8_t)(sizeof(dice_args) / sizeof(dice_args[0])),
-      NULL, &dice_nl) != SUCCESS)
+  .group       = "everyone",
+  .scope       = CMD_SCOPE_ANY,
+  .methods     = METHOD_T_ANY,
+  .cb          = dice_cmd,
+  .abbrev      = "d",
+  .arg_desc    = dice_args,
+  .arg_count   = (uint8_t)(sizeof(dice_args) / sizeof(dice_args[0])),
+  .nl          = &dice_nl,
+};
+
+static bool
+dice_init(void)
+{
+  if(cmd_register(&dice_decl) != SUCCESS)
     return(FAIL);
 
   return(SUCCESS);

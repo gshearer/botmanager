@@ -658,56 +658,83 @@ wm_dl_parent_show_download(const cmd_ctx_t *ctx)
 // Registration                                                        //
 // ------------------------------------------------------------------ //
 
+static const cmd_decl_t whenmoon_download_decl = {
+  .module      = "whenmoon",
+  .name        = "download",
+  .usage       = "whenmoon download <exch>-<base>-<quote>"
+                 " [--gaps] [<date> [<date>]] | cancel <job_id>"
+                 "  (date = MM/dd/yyyy or YYYY-MM-DD)",
+  .description =
+      "Idempotent candle backfill. With no dates it freshens the"
+      " tail: one fetch job over [newest stored bar, now] (a market"
+      " with no candles yet deep-backfills instead). --gaps forces a"
+      " full row-gap scan of wm_candles_<id>, one job per hole — use"
+      " it to repair interior gaps. A dated range scans that window.",
+  .group       = USERNS_GROUP_ADMIN,
+  .level       = 100,
+  .scope       = CMD_SCOPE_ANY,
+  .methods     = METHOD_T_ANY,
+  .cb          = wm_dl_cmd_download,
+  .parent_path = "whenmoon",
+};
+
+static const cmd_decl_t show_whenmoon_download_decl = {
+  .module      = "whenmoon",
+  .name        = "download",
+  .usage       = "show whenmoon download <verb>",
+  .description = "Download engine observability.",
+  .group       = USERNS_GROUP_ADMIN,
+  .level       = 100,
+  .scope       = CMD_SCOPE_ANY,
+  .methods     = METHOD_T_ANY,
+  .cb          = wm_dl_parent_show_download,
+  .parent_path = "show/whenmoon",
+};
+
+static const cmd_decl_t show_whenmoon_download_status_decl = {
+  .module      = "whenmoon",
+  .name        = "status",
+  .usage       = "show whenmoon download status",
+  .description = "Job list with state, pages, and rows.",
+  .group       = USERNS_GROUP_ADMIN,
+  .level       = 100,
+  .scope       = CMD_SCOPE_ANY,
+  .methods     = METHOD_T_ANY,
+  .cb          = wm_dl_cmd_show_download_status,
+  .parent_path = "show/whenmoon/download",
+};
+
+static const cmd_decl_t show_whenmoon_download_candles_decl = {
+  .module      = "whenmoon",
+  .name        = "candles",
+  .usage       = "show whenmoon download candles"
+                 " <exch>-<base>-<quote>"
+                 " <date> <date>  (date = MM/dd/yyyy or YYYY-MM-DD)",
+  .description = "Print the stored 1m candles over the window, CSV-style.",
+  .group       = USERNS_GROUP_ADMIN,
+  .level       = 100,
+  .scope       = CMD_SCOPE_ANY,
+  .methods     = METHOD_T_ANY,
+  .cb          = wm_dl_cmd_show_download_candles,
+  .parent_path = "show/whenmoon/download",
+};
+
 bool
 wm_dl_register_verbs(void)
 {
   // /whenmoon download <market> [--gaps] [start] [end]  — freshen/scan
   // /whenmoon download cancel <job_id>                  — cancel job
-  if(cmd_register("whenmoon", "download",
-        "whenmoon download <exch>-<base>-<quote>"
-        " [--gaps] [<date> [<date>]] | cancel <job_id>"
-        "  (date = MM/dd/yyyy or YYYY-MM-DD)",
-        "Idempotent candle backfill. With no dates it freshens the"
-        " tail: one fetch job over [newest stored bar, now] (a market"
-        " with no candles yet deep-backfills instead). --gaps forces a"
-        " full row-gap scan of wm_candles_<id>, one job per hole — use"
-        " it to repair interior gaps. A dated range scans that window.",
-        NULL,
-        USERNS_GROUP_ADMIN, 100, CMD_SCOPE_ANY, METHOD_T_ANY,
-        wm_dl_cmd_download, NULL, "whenmoon", NULL,
-        NULL, 0, NULL, NULL) != SUCCESS)
+  if(cmd_register(&whenmoon_download_decl) != SUCCESS)
     return(FAIL);
 
   // /show whenmoon download parent.
-  if(cmd_register("whenmoon", "download",
-        "show whenmoon download <verb>",
-        "Download engine observability.",
-        NULL,
-        USERNS_GROUP_ADMIN, 100, CMD_SCOPE_ANY, METHOD_T_ANY,
-        wm_dl_parent_show_download, NULL, "show/whenmoon", NULL,
-        NULL, 0, NULL, NULL) != SUCCESS)
+  if(cmd_register(&show_whenmoon_download_decl) != SUCCESS)
     return(FAIL);
 
-  if(cmd_register("whenmoon", "status",
-        "show whenmoon download status",
-        "Job list with state, pages, and rows.",
-        NULL,
-        USERNS_GROUP_ADMIN, 100, CMD_SCOPE_ANY, METHOD_T_ANY,
-        wm_dl_cmd_show_download_status, NULL,
-        "show/whenmoon/download", NULL,
-        NULL, 0, NULL, NULL) != SUCCESS)
+  if(cmd_register(&show_whenmoon_download_status_decl) != SUCCESS)
     return(FAIL);
 
-  if(cmd_register("whenmoon", "candles",
-        "show whenmoon download candles"
-        " <exch>-<base>-<quote>"
-        " <date> <date>  (date = MM/dd/yyyy or YYYY-MM-DD)",
-        "Print the stored 1m candles over the window, CSV-style.",
-        NULL,
-        USERNS_GROUP_ADMIN, 100, CMD_SCOPE_ANY, METHOD_T_ANY,
-        wm_dl_cmd_show_download_candles, NULL,
-        "show/whenmoon/download", NULL,
-        NULL, 0, NULL, NULL) != SUCCESS)
+  if(cmd_register(&show_whenmoon_download_candles_decl) != SUCCESS)
     return(FAIL);
 
   return(SUCCESS);

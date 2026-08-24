@@ -932,18 +932,26 @@ static const cmd_nl_t tmdb_nl = {
 // Registration — driven by the service half's plugin lifecycle
 // ----------------------------------------------------------------------
 
+static const cmd_decl_t tmdb_decl = {
+  .module      = TMDB_CTX,
+  .name        = "tmdb",
+  .usage       = tmdb_usage,
+  .description = "Movie, TV, and actor info from The Movie Database"
+                 " (themoviedb.org)",
+  .group       = "everyone",
+  .scope       = CMD_SCOPE_ANY,
+  .methods     = METHOD_T_ANY,
+  .cb          = tmdb_cmd,
+  .nl          = &tmdb_nl,
+};
+
 // The registry records TMDB_CTX as the providing module: after the merge
 // the tmdb plugin itself owns this command, and `/show commands` should
 // say so.
 bool
 tmdb_cmd_register(void)
 {
-  if(cmd_register(TMDB_CTX, "tmdb", tmdb_usage,
-      "Movie, TV, and actor info from The Movie Database (themoviedb.org)",
-      NULL,
-      "everyone", 0, CMD_SCOPE_ANY, METHOD_T_ANY,
-      tmdb_cmd, NULL, NULL, NULL,
-      NULL, 0, NULL, &tmdb_nl) != SUCCESS)
+  if(cmd_register(&tmdb_decl) != SUCCESS)
     return(FAIL);
 
   clam(CLAM_INFO, TMDBCMD_CTX, "!tmdb registered");

@@ -792,164 +792,342 @@ irc_cmd_show_servers(const cmd_ctx_t *ctx)
 
 // Command registration
 
+static const cmd_decl_t irc_decl = {
+  .module      = "irc",
+  .name        = "irc",
+  .usage       = "irc <subcommand> ...",
+  .description = "IRC plugin commands",
+  .help_long   = "Manage IRC networks, servers, and channels.\n"
+                 "  /irc network ...  — manage networks\n"
+                 "  /irc server  ...  — manage servers\n"
+                 "  /irc channel ...  — manage channels\n"
+                 "  /irc join ...     — join a channel\n"
+                 "  /irc part ...     — leave a channel\n"
+                 "  /irc schema  ...  — show entity schemas",
+  .group       = USERNS_GROUP_ADMIN,
+  .level       = 100,
+  .scope       = CMD_SCOPE_ANY,
+  .methods     = METHOD_T_ANY,
+  .cb          = irc_cmd_irc,
+};
+
+static const cmd_decl_t irc_network_decl = {
+  .module      = "irc",
+  .name        = "network",
+  .usage       = "irc network <list|del> [name]",
+  .description = "Manage IRC networks",
+  .help_long   =
+      "Manage the IRC network registry. Networks are named groups\n"
+      "that organize IRC servers.\n"
+      "  /irc network list        — list all networks\n"
+      "  /irc network del <name>  — delete a network and its servers",
+  .group       = USERNS_GROUP_ADMIN,
+  .level       = 500,
+  .scope       = CMD_SCOPE_ANY,
+  .methods     = METHOD_T_ANY,
+  .cb          = irc_cmd_network,
+  .parent_path = "irc",
+  .abbrev      = "net",
+};
+
+static const cmd_decl_t network_list_decl = {
+  .module      = "irc",
+  .name        = "list",
+  .usage       = "irc network list",
+  .description = "List all IRC networks",
+  .group       = USERNS_GROUP_ADMIN,
+  .level       = 500,
+  .scope       = CMD_SCOPE_ANY,
+  .methods     = METHOD_T_ANY,
+  .cb          = irc_cmd_network_list,
+  .parent_path = "network",
+  .abbrev      = "l",
+};
+
+static const cmd_decl_t network_del_decl = {
+  .module      = "irc",
+  .name        = "del",
+  .usage       = "irc network del <name>",
+  .description = "Delete a network and its servers",
+  .group       = USERNS_GROUP_ADMIN,
+  .level       = 500,
+  .scope       = CMD_SCOPE_ANY,
+  .methods     = METHOD_T_ANY,
+  .cb          = irc_cmd_network_del,
+  .parent_path = "network",
+  .abbrev      = "d",
+  .arg_desc    = ad_irc_netname,
+  .arg_count   = 1,
+};
+
+static const cmd_decl_t irc_server_decl = {
+  .module      = "irc",
+  .name        = "server",
+  .usage       = "irc server <add|del|list> ...",
+  .description = "Manage IRC servers",
+  .help_long   = "Manage IRC servers within networks.\n"
+                 "  /irc server add <net> <host> [port]  — add a server\n"
+                 "  /irc server del <net> <host>         — remove a server\n"
+                 "  /irc server list [net]               — list servers",
+  .group       = USERNS_GROUP_ADMIN,
+  .level       = 500,
+  .scope       = CMD_SCOPE_ANY,
+  .methods     = METHOD_T_ANY,
+  .cb          = irc_cmd_server,
+  .parent_path = "irc",
+  .abbrev      = "srv",
+};
+
+static const cmd_decl_t server_add_decl = {
+  .module      = "irc",
+  .name        = "add",
+  .usage       = "irc server add <network> <host> [port]",
+  .description = "Add a server to a network",
+  .group       = USERNS_GROUP_ADMIN,
+  .level       = 500,
+  .scope       = CMD_SCOPE_ANY,
+  .methods     = METHOD_T_ANY,
+  .cb          = irc_cmd_server_add,
+  .parent_path = "server",
+  .abbrev      = "a",
+  .arg_desc    = ad_irc_srv_add,
+  .arg_count   = 3,
+};
+
+static const cmd_decl_t server_del_decl = {
+  .module      = "irc",
+  .name        = "del",
+  .usage       = "irc server del <network> <host>",
+  .description = "Remove a server from a network",
+  .group       = USERNS_GROUP_ADMIN,
+  .level       = 500,
+  .scope       = CMD_SCOPE_ANY,
+  .methods     = METHOD_T_ANY,
+  .cb          = irc_cmd_server_del,
+  .parent_path = "server",
+  .abbrev      = "d",
+  .arg_desc    = ad_irc_srv_del,
+  .arg_count   = 2,
+};
+
+static const cmd_decl_t server_list_decl = {
+  .module      = "irc",
+  .name        = "list",
+  .usage       = "irc server list [network]",
+  .description = "List servers",
+  .group       = USERNS_GROUP_ADMIN,
+  .level       = 500,
+  .scope       = CMD_SCOPE_ANY,
+  .methods     = METHOD_T_ANY,
+  .cb          = irc_cmd_server_list,
+  .parent_path = "server",
+  .abbrev      = "l",
+  .arg_desc    = ad_irc_srv_list,
+  .arg_count   = 1,
+};
+
+static const cmd_decl_t irc_channel_decl = {
+  .module      = "irc",
+  .name        = "channel",
+  .usage       = "irc channel <add|del|list> ...",
+  .description = "Manage IRC channels for a bot",
+  .help_long   =
+      "Manage IRC channel configuration for bot instances.\n"
+      "  /irc channel add <bot> <#channel> [key]  — add a channel\n"
+      "  /irc channel del <bot> <#channel>        — remove a channel\n"
+      "  /irc channel list <bot>                  — list channels",
+  .group       = USERNS_GROUP_ADMIN,
+  .level       = 500,
+  .scope       = CMD_SCOPE_ANY,
+  .methods     = METHOD_T_ANY,
+  .cb          = irc_cmd_channel,
+  .parent_path = "irc",
+  .abbrev      = "ch",
+};
+
+static const cmd_decl_t channel_add_decl = {
+  .module      = "irc",
+  .name        = "add",
+  .usage       = "irc channel add <bot> <#channel> [key]",
+  .description = "Add a channel to a bot",
+  .group       = USERNS_GROUP_ADMIN,
+  .level       = 500,
+  .scope       = CMD_SCOPE_ANY,
+  .methods     = METHOD_T_ANY,
+  .cb          = irc_cmd_channel_add,
+  .parent_path = "channel",
+  .abbrev      = "a",
+  .arg_desc    = ad_irc_chan_add,
+  .arg_count   = 3,
+};
+
+static const cmd_decl_t channel_del_decl = {
+  .module      = "irc",
+  .name        = "del",
+  .usage       = "irc channel del <bot> <#channel>",
+  .description = "Remove a channel from a bot",
+  .group       = USERNS_GROUP_ADMIN,
+  .level       = 500,
+  .scope       = CMD_SCOPE_ANY,
+  .methods     = METHOD_T_ANY,
+  .cb          = irc_cmd_channel_del,
+  .parent_path = "channel",
+  .abbrev      = "d",
+  .arg_desc    = ad_irc_chan_del,
+  .arg_count   = 2,
+};
+
+static const cmd_decl_t channel_list_decl = {
+  .module      = "irc",
+  .name        = "list",
+  .usage       = "irc channel list <bot>",
+  .description = "List channels for a bot",
+  .group       = USERNS_GROUP_ADMIN,
+  .level       = 500,
+  .scope       = CMD_SCOPE_ANY,
+  .methods     = METHOD_T_ANY,
+  .cb          = irc_cmd_channel_list,
+  .parent_path = "channel",
+  .abbrev      = "l",
+  .arg_desc    = ad_irc_chan_list,
+  .arg_count   = 1,
+};
+
+static const cmd_decl_t irc_join_decl = {
+  .module      = "irc",
+  .name        = "join",
+  .usage       = "irc join <bot> <#channel>",
+  .description = "Instruct a bot to join a channel",
+  .help_long   =
+      "Sends a JOIN command for the specified channel on the bot's\n"
+      "IRC connection. If a channel key is configured, it is sent\n"
+      "automatically. The bot must be connected to IRC.",
+  .group       = USERNS_GROUP_ADMIN,
+  .level       = 500,
+  .scope       = CMD_SCOPE_ANY,
+  .methods     = METHOD_T_ANY,
+  .cb          = irc_cmd_join,
+  .parent_path = "irc",
+  .arg_desc    = ad_irc_chan_del,
+  .arg_count   = 2,
+};
+
+static const cmd_decl_t irc_part_decl = {
+  .module      = "irc",
+  .name        = "part",
+  .usage       = "irc part <bot> <#channel>",
+  .description = "Instruct a bot to leave a channel",
+  .help_long   =
+      "Sends a PART command for the specified channel on the bot's\n"
+      "IRC connection. The bot must be connected to IRC.",
+  .group       = USERNS_GROUP_ADMIN,
+  .level       = 500,
+  .scope       = CMD_SCOPE_ANY,
+  .methods     = METHOD_T_ANY,
+  .cb          = irc_cmd_part,
+  .parent_path = "irc",
+  .arg_desc    = ad_irc_chan_del,
+  .arg_count   = 2,
+};
+
+static const cmd_decl_t irc_irc_schema_decl = {
+  .module      = "irc",
+  .name        = "irc-schema",
+  .usage       = "irc schema [group]",
+  .description = "Show IRC entity schemas",
+  .help_long   = "Display configurable properties for IRC entities.\n"
+                 "  /irc schema          — list available schema groups\n"
+                 "  /irc schema channel  — show channel properties\n"
+                 "  /irc schema server   — show server properties",
+  .group       = USERNS_GROUP_ADMIN,
+  .level       = 100,
+  .scope       = CMD_SCOPE_ANY,
+  .methods     = METHOD_T_ANY,
+  .cb          = irc_cmd_schema,
+  .parent_path = "irc",
+  .abbrev      = "schema",
+};
+
+static const cmd_decl_t show_show_irc_decl = {
+  .module      = "irc",
+  .name        = "show-irc",
+  .usage       = "show irc <subcommand> ...",
+  .description = "IRC network and server information",
+  .help_long   =
+      "Display IRC network and server configuration.\n"
+      "  /show irc networks  — list defined networks\n"
+      "  /show irc servers   — list servers (optionally by network)",
+  .group       = USERNS_GROUP_ADMIN,
+  .level       = 100,
+  .scope       = CMD_SCOPE_ANY,
+  .methods     = METHOD_T_ANY,
+  .cb          = irc_cmd_show_irc,
+  .parent_path = "show",
+  .abbrev      = "irc",
+};
+
+static const cmd_decl_t show_irc_networks_decl = {
+  .module      = "irc",
+  .name        = "networks",
+  .usage       = "show irc networks",
+  .description = "List IRC networks",
+  .help_long   = "Lists all defined IRC networks and the number of servers\n"
+                 "configured for each.",
+  .group       = USERNS_GROUP_ADMIN,
+  .level       = 100,
+  .scope       = CMD_SCOPE_ANY,
+  .methods     = METHOD_T_ANY,
+  .cb          = irc_cmd_show_networks,
+  .parent_path = "show-irc",
+  .abbrev      = "n",
+};
+
+static const cmd_decl_t show_irc_servers_decl = {
+  .module      = "irc",
+  .name        = "servers",
+  .usage       = "show irc servers [network]",
+  .description = "List IRC servers",
+  .help_long   = "Lists IRC servers with address, port, priority, and TLS\n"
+                 "settings. If a network name is given, only servers for\n"
+                 "that network are shown.",
+  .group       = USERNS_GROUP_ADMIN,
+  .level       = 100,
+  .scope       = CMD_SCOPE_ANY,
+  .methods     = METHOD_T_ANY,
+  .cb          = irc_cmd_show_servers,
+  .parent_path = "show-irc",
+  .abbrev      = "s",
+  .arg_desc    = ad_irc_srv_list,
+  .arg_count   = 1,
+};
+
 // Register all /irc and /show irc operator commands. Called from irc_init().
 void
 irc_register_commands(void)
 {
   // Register /irc root parent command.
-  cmd_register("irc", "irc",
-      "irc <subcommand> ...",
-      "IRC plugin commands",
-      "Manage IRC networks, servers, and channels.\n"
-      "  /irc network ...  — manage networks\n"
-      "  /irc server  ...  — manage servers\n"
-      "  /irc channel ...  — manage channels\n"
-      "  /irc join ...     — join a channel\n"
-      "  /irc part ...     — leave a channel\n"
-      "  /irc schema  ...  — show entity schemas",
-      USERNS_GROUP_ADMIN, 100, CMD_SCOPE_ANY, METHOD_T_ANY, irc_cmd_irc,
-      NULL, NULL, NULL, NULL, 0, NULL, NULL);
+  cmd_register(&irc_decl);
 
   // Register subcommands under /irc.
-  cmd_register("irc", "network",
-      "irc network <list|del> [name]",
-      "Manage IRC networks",
-      "Manage the IRC network registry. Networks are named groups\n"
-      "that organize IRC servers.\n"
-      "  /irc network list        — list all networks\n"
-      "  /irc network del <name>  — delete a network and its servers",
-      USERNS_GROUP_ADMIN, 500, CMD_SCOPE_ANY, METHOD_T_ANY, irc_cmd_network,
-      NULL, "irc", "net", NULL, 0, NULL, NULL);
-
-  cmd_register("irc", "list",
-      "irc network list",
-      "List all IRC networks",
-      NULL,
-      USERNS_GROUP_ADMIN, 500, CMD_SCOPE_ANY, METHOD_T_ANY,
-      irc_cmd_network_list, NULL, "network", "l", NULL, 0, NULL, NULL);
-
-  cmd_register("irc", "del",
-      "irc network del <name>",
-      "Delete a network and its servers",
-      NULL,
-      USERNS_GROUP_ADMIN, 500, CMD_SCOPE_ANY, METHOD_T_ANY,
-      irc_cmd_network_del, NULL, "network", "d", ad_irc_netname, 1, NULL, NULL);
-
-  cmd_register("irc", "server",
-      "irc server <add|del|list> ...",
-      "Manage IRC servers",
-      "Manage IRC servers within networks.\n"
-      "  /irc server add <net> <host> [port]  — add a server\n"
-      "  /irc server del <net> <host>         — remove a server\n"
-      "  /irc server list [net]               — list servers",
-      USERNS_GROUP_ADMIN, 500, CMD_SCOPE_ANY, METHOD_T_ANY, irc_cmd_server,
-      NULL, "irc", "srv", NULL, 0, NULL, NULL);
-
-  cmd_register("irc", "add",
-      "irc server add <network> <host> [port]",
-      "Add a server to a network",
-      NULL,
-      USERNS_GROUP_ADMIN, 500, CMD_SCOPE_ANY, METHOD_T_ANY,
-      irc_cmd_server_add, NULL, "server", "a", ad_irc_srv_add, 3, NULL, NULL);
-
-  cmd_register("irc", "del",
-      "irc server del <network> <host>",
-      "Remove a server from a network",
-      NULL,
-      USERNS_GROUP_ADMIN, 500, CMD_SCOPE_ANY, METHOD_T_ANY,
-      irc_cmd_server_del, NULL, "server", "d", ad_irc_srv_del, 2, NULL, NULL);
-
-  cmd_register("irc", "list",
-      "irc server list [network]",
-      "List servers",
-      NULL,
-      USERNS_GROUP_ADMIN, 500, CMD_SCOPE_ANY, METHOD_T_ANY,
-      irc_cmd_server_list, NULL, "server", "l", ad_irc_srv_list, 1, NULL, NULL);
-
-  cmd_register("irc", "channel",
-      "irc channel <add|del|list> ...",
-      "Manage IRC channels for a bot",
-      "Manage IRC channel configuration for bot instances.\n"
-      "  /irc channel add <bot> <#channel> [key]  — add a channel\n"
-      "  /irc channel del <bot> <#channel>        — remove a channel\n"
-      "  /irc channel list <bot>                  — list channels",
-      USERNS_GROUP_ADMIN, 500, CMD_SCOPE_ANY, METHOD_T_ANY,
-      irc_cmd_channel, NULL, "irc", "ch", NULL, 0, NULL, NULL);
-
-  cmd_register("irc", "add",
-      "irc channel add <bot> <#channel> [key]",
-      "Add a channel to a bot",
-      NULL,
-      USERNS_GROUP_ADMIN, 500, CMD_SCOPE_ANY, METHOD_T_ANY,
-      irc_cmd_channel_add, NULL, "channel", "a", ad_irc_chan_add, 3, NULL, NULL);
-
-  cmd_register("irc", "del",
-      "irc channel del <bot> <#channel>",
-      "Remove a channel from a bot",
-      NULL,
-      USERNS_GROUP_ADMIN, 500, CMD_SCOPE_ANY, METHOD_T_ANY,
-      irc_cmd_channel_del, NULL, "channel", "d", ad_irc_chan_del, 2, NULL, NULL);
-
-  cmd_register("irc", "list",
-      "irc channel list <bot>",
-      "List channels for a bot",
-      NULL,
-      USERNS_GROUP_ADMIN, 500, CMD_SCOPE_ANY, METHOD_T_ANY,
-      irc_cmd_channel_list, NULL, "channel", "l", ad_irc_chan_list, 1, NULL, NULL);
-
-  cmd_register("irc", "join",
-      "irc join <bot> <#channel>",
-      "Instruct a bot to join a channel",
-      "Sends a JOIN command for the specified channel on the bot's\n"
-      "IRC connection. If a channel key is configured, it is sent\n"
-      "automatically. The bot must be connected to IRC.",
-      USERNS_GROUP_ADMIN, 500, CMD_SCOPE_ANY, METHOD_T_ANY, irc_cmd_join,
-      NULL, "irc", NULL, ad_irc_chan_del, 2, NULL, NULL);
-
-  cmd_register("irc", "part",
-      "irc part <bot> <#channel>",
-      "Instruct a bot to leave a channel",
-      "Sends a PART command for the specified channel on the bot's\n"
-      "IRC connection. The bot must be connected to IRC.",
-      USERNS_GROUP_ADMIN, 500, CMD_SCOPE_ANY, METHOD_T_ANY, irc_cmd_part,
-      NULL, "irc", NULL, ad_irc_chan_del, 2, NULL, NULL);
-
-  cmd_register("irc", "irc-schema",
-      "irc schema [group]",
-      "Show IRC entity schemas",
-      "Display configurable properties for IRC entities.\n"
-      "  /irc schema          — list available schema groups\n"
-      "  /irc schema channel  — show channel properties\n"
-      "  /irc schema server   — show server properties",
-      USERNS_GROUP_ADMIN, 100, CMD_SCOPE_ANY, METHOD_T_ANY, irc_cmd_schema,
-      NULL, "irc", "schema", NULL, 0, NULL, NULL);
+  cmd_register(&irc_network_decl);
+  cmd_register(&network_list_decl);
+  cmd_register(&network_del_decl);
+  cmd_register(&irc_server_decl);
+  cmd_register(&server_add_decl);
+  cmd_register(&server_del_decl);
+  cmd_register(&server_list_decl);
+  cmd_register(&irc_channel_decl);
+  cmd_register(&channel_add_decl);
+  cmd_register(&channel_del_decl);
+  cmd_register(&channel_list_decl);
+  cmd_register(&irc_join_decl);
+  cmd_register(&irc_part_decl);
+  cmd_register(&irc_irc_schema_decl);
 
   // Register /show irc subcommand tree.
   // Internal name "show-irc" avoids collision with root /irc.
   // Abbreviation "irc" allows /show irc resolution.
-  cmd_register("irc", "show-irc",
-      "show irc <subcommand> ...",
-      "IRC network and server information",
-      "Display IRC network and server configuration.\n"
-      "  /show irc networks  — list defined networks\n"
-      "  /show irc servers   — list servers (optionally by network)",
-      USERNS_GROUP_ADMIN, 100, CMD_SCOPE_ANY, METHOD_T_ANY,
-      irc_cmd_show_irc, NULL, "show", "irc", NULL, 0, NULL, NULL);
-
-  cmd_register("irc", "networks",
-      "show irc networks",
-      "List IRC networks",
-      "Lists all defined IRC networks and the number of servers\n"
-      "configured for each.",
-      USERNS_GROUP_ADMIN, 100, CMD_SCOPE_ANY, METHOD_T_ANY,
-      irc_cmd_show_networks, NULL, "show-irc", "n", NULL, 0, NULL, NULL);
-
-  cmd_register("irc", "servers",
-      "show irc servers [network]",
-      "List IRC servers",
-      "Lists IRC servers with address, port, priority, and TLS\n"
-      "settings. If a network name is given, only servers for\n"
-      "that network are shown.",
-      USERNS_GROUP_ADMIN, 100, CMD_SCOPE_ANY, METHOD_T_ANY,
-      irc_cmd_show_servers, NULL, "show-irc", "s", ad_irc_srv_list, 1, NULL, NULL);
+  cmd_register(&show_show_irc_decl);
+  cmd_register(&show_irc_networks_decl);
+  cmd_register(&show_irc_servers_decl);
 }

@@ -3589,14 +3589,12 @@ plugin_load_autoload(const char *plugin_dir)
 
 // Command registration
 
-// Register plugin commands. Must be called after admin_init().
-void
-plugin_register_commands(void)
-{
-  // /show plugin — read-only subcommand of /show.
-  cmd_register("plugin", "plugin",
-      "show plugin [all | <name>]",
-      "List installed plugins or show plugin details",
+static const cmd_decl_t show_plugin_decl = {
+  .module      = "plugin",
+  .name        = "plugin",
+  .usage       = "show plugin [all | <name>]",
+  .description = "List installed plugins or show plugin details",
+  .help_long   =
       "Shows loaded plugins with type, kind, state, and approximate\n"
       "memory usage. Memory is estimated by matching each plugin's\n"
       "kind against tracked allocation module names.\n\n"
@@ -3605,39 +3603,75 @@ plugin_register_commands(void)
       "Use show plugin <name> to show detailed information about\n"
       "a specific plugin including features, config keys, schema\n"
       "groups, and lifecycle callbacks.",
-      USERNS_GROUP_OWNER, USERNS_OWNER_LEVEL, CMD_SCOPE_ANY, METHOD_T_ANY,
-      plugin_cmd_show, NULL, "show", "plug", ad_show_plugin, 1, NULL, NULL);
+  .group       = USERNS_GROUP_OWNER,
+  .level       = USERNS_OWNER_LEVEL,
+  .scope       = CMD_SCOPE_ANY,
+  .methods     = METHOD_T_ANY,
+  .cb          = plugin_cmd_show,
+  .parent_path = "show",
+  .abbrev      = "plug",
+  .arg_desc    = ad_show_plugin,
+  .arg_count   = 1,
+};
 
-  // /plugin — root command for plugin management.
-  cmd_register("plugin", "plugin",
-      "plugin <subcommand> ...",
-      "Manage plugins",
-      NULL,
-      USERNS_GROUP_OWNER, USERNS_OWNER_LEVEL, CMD_SCOPE_ANY, METHOD_T_ANY,
-      plugin_cmd_plugin, NULL, NULL, "plug", NULL, 0, NULL, NULL);
+static const cmd_decl_t plugin_decl = {
+  .module      = "plugin",
+  .name        = "plugin",
+  .usage       = "plugin <subcommand> ...",
+  .description = "Manage plugins",
+  .group       = USERNS_GROUP_OWNER,
+  .level       = USERNS_OWNER_LEVEL,
+  .scope       = CMD_SCOPE_ANY,
+  .methods     = METHOD_T_ANY,
+  .cb          = plugin_cmd_plugin,
+  .abbrev      = "plug",
+};
 
-  cmd_register("plugin", "load",
-      "plugin load <name>",
-      "Load a plugin",
+static const cmd_decl_t plugin_load_decl = {
+  .module      = "plugin",
+  .name        = "load",
+  .usage       = "plugin load <name>",
+  .description = "Load a plugin",
+  .help_long   =
       "Loads a plugin by name from the plugin directory. The .so\n"
       "file is located by matching the embedded plugin name against\n"
       "the requested name. After loading, the plugin is resolved,\n"
       "initialized, and started automatically.",
-      USERNS_GROUP_OWNER, USERNS_OWNER_LEVEL, CMD_SCOPE_ANY, METHOD_T_ANY,
-      plugin_cmd_load, NULL, "plugin", NULL, ad_plugin_cmd_name, 1, NULL, NULL);
+  .group       = USERNS_GROUP_OWNER,
+  .level       = USERNS_OWNER_LEVEL,
+  .scope       = CMD_SCOPE_ANY,
+  .methods     = METHOD_T_ANY,
+  .cb          = plugin_cmd_load,
+  .parent_path = "plugin",
+  .arg_desc    = ad_plugin_cmd_name,
+  .arg_count   = 1,
+};
 
-  cmd_register("plugin", "unload",
-      "plugin unload <name>",
-      "Unload a plugin",
+static const cmd_decl_t plugin_unload_decl = {
+  .module      = "plugin",
+  .name        = "unload",
+  .usage       = "plugin unload <name>",
+  .description = "Unload a plugin",
+  .help_long   =
       "Unloads a plugin by name. The plugin is stopped, deinitialized,\n"
       "and removed from memory. Fails if another loaded plugin depends\n"
       "on a feature this plugin provides.",
-      USERNS_GROUP_OWNER, USERNS_OWNER_LEVEL, CMD_SCOPE_ANY, METHOD_T_ANY,
-      plugin_cmd_unload, NULL, "plugin", NULL, ad_plugin_cmd_name, 1, NULL, NULL);
+  .group       = USERNS_GROUP_OWNER,
+  .level       = USERNS_OWNER_LEVEL,
+  .scope       = CMD_SCOPE_ANY,
+  .methods     = METHOD_T_ANY,
+  .cb          = plugin_cmd_unload,
+  .parent_path = "plugin",
+  .arg_desc    = ad_plugin_cmd_name,
+  .arg_count   = 1,
+};
 
-  cmd_register("plugin", "reload",
-      "plugin reload <name>",
-      "Reload a plugin and everything that requires it",
+static const cmd_decl_t plugin_reload_decl = {
+  .module      = "plugin",
+  .name        = "reload",
+  .usage       = "plugin reload <name>",
+  .description = "Reload a plugin and everything that requires it",
+  .help_long   =
       "Unloads and loads a plugin back from the same .so, cycling\n"
       "every loaded plugin that transitively requires a feature it\n"
       "provides — a strategy cannot outlive the whenmoon it links\n"
@@ -3650,12 +3684,23 @@ plugin_register_commands(void)
       "(destroy the bot first) or the plugin is a synthetic core\n"
       "provider. KV rows survive the cycle — the persisted row is the\n"
       "durable value and registration re-reads it.",
-      USERNS_GROUP_OWNER, USERNS_OWNER_LEVEL, CMD_SCOPE_ANY, METHOD_T_ANY,
-      plugin_cmd_reload, NULL, "plugin", NULL, ad_plugin_cmd_name, 1, NULL, NULL);
+  .group       = USERNS_GROUP_OWNER,
+  .level       = USERNS_OWNER_LEVEL,
+  .scope       = CMD_SCOPE_ANY,
+  .methods     = METHOD_T_ANY,
+  .cb          = plugin_cmd_reload,
+  .parent_path = "plugin",
+  .arg_desc    = ad_plugin_cmd_name,
+  .arg_count   = 1,
+};
 
-  cmd_register("plugin", "audit",
-      "plugin audit <name> | all",
-      "Report the registrations a plugin's teardown must account for",
+static const cmd_decl_t plugin_audit_decl = {
+  .module      = "plugin",
+  .name        = "audit",
+  .usage       = "plugin audit <name> | all",
+  .description = "Report the registrations a plugin's teardown must account"
+                 " for",
+  .help_long   =
       "Sweeps every registry that retains a pointer — commands, KV,\n"
       "clam subscribers, bot KV contributors and driver bindings,\n"
       "method drivers, tasks, in-flight curl requests, the dlsym\n"
@@ -3673,8 +3718,29 @@ plugin_register_commands(void)
       "the plugin registers under.\n\n"
       "Report-only: this command never unloads or refuses anything.\n"
       "Use plugin audit all for a one-line summary per plugin.",
-      USERNS_GROUP_OWNER, USERNS_OWNER_LEVEL, CMD_SCOPE_ANY, METHOD_T_ANY,
-      plugin_cmd_audit, NULL, "plugin", NULL, ad_plugin_cmd_name, 1, NULL, NULL);
+  .group       = USERNS_GROUP_OWNER,
+  .level       = USERNS_OWNER_LEVEL,
+  .scope       = CMD_SCOPE_ANY,
+  .methods     = METHOD_T_ANY,
+  .cb          = plugin_cmd_audit,
+  .parent_path = "plugin",
+  .arg_desc    = ad_plugin_cmd_name,
+  .arg_count   = 1,
+};
+
+// Register plugin commands. Must be called after admin_init().
+void
+plugin_register_commands(void)
+{
+  // /show plugin — read-only subcommand of /show.
+  cmd_register(&show_plugin_decl);
+
+  // /plugin — root command for plugin management.
+  cmd_register(&plugin_decl);
+  cmd_register(&plugin_load_decl);
+  cmd_register(&plugin_unload_decl);
+  cmd_register(&plugin_reload_decl);
+  cmd_register(&plugin_audit_decl);
 }
 
 // Synthetic core providers.

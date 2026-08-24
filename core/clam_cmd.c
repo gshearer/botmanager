@@ -831,25 +831,28 @@ cmd_show_clam(const cmd_ctx_t *ctx)
 
 // Lifecycle
 
-void
-clam_cmd_init(void)
-{
-  pthread_mutex_init(&clam_cmd_mutex, NULL);
-  clam_cmd_ready = true;
+static const cmd_decl_t clam_decl = {
+  .module      = "clam_cmd",
+  .name        = "clam",
+  .usage       = "clam <subcommand>",
+  .description = "Manage user subscriptions to the CLAM event bus",
+  .help_long   = "Subscriptions route matching CLAM messages to one or more\n"
+                 "destinations. Subverbs: subscribe, unsubscribe. Reads go\n"
+                 "through show clam.",
+  .group       = USERNS_GROUP_ADMIN,
+  .level       = 100,
+  .scope       = CMD_SCOPE_ANY,
+  .methods     = METHOD_T_ANY,
+  .cb          = cmd_clam_root,
+};
 
-  // /clam (admin container).
-  cmd_register("clam_cmd", "clam",
-      "clam <subcommand>",
-      "Manage user subscriptions to the CLAM event bus",
-      "Subscriptions route matching CLAM messages to one or more\n"
-      "destinations. Subverbs: subscribe, unsubscribe. Reads go\n"
-      "through show clam.",
-      USERNS_GROUP_ADMIN, 100, CMD_SCOPE_ANY, METHOD_T_ANY,
-      cmd_clam_root, NULL, NULL, NULL, NULL, 0, NULL, NULL);
-
-  cmd_register("clam_cmd", "subscribe",
-      "clam subscribe <name> <sev 0-7> [<regex>|-] [<dests>]",
-      "Subscribe to CLAM messages with optional filter and destinations",
+static const cmd_decl_t clam_subscribe_decl = {
+  .module      = "clam_cmd",
+  .name        = "subscribe",
+  .usage       = "clam subscribe <name> <sev 0-7> [<regex>|-] [<dests>]",
+  .description = "Subscribe to CLAM messages with optional filter and"
+                 " destinations",
+  .help_long   =
       "Destinations are comma-separated; each is one of:\n"
       "  here                                 (the reply context)\n"
       "  <bot>:<method>:<target>              (e.g. lessclam:irc:#botman)\n"
@@ -857,26 +860,57 @@ clam_cmd_init(void)
       "If no destinations are supplied, defaults to 'here'.\n"
       "Pass '-' for <regex> to skip the filter when specifying dests.\n"
       "The regex is POSIX ERE matched against \"<context> <msg>\".",
-      USERNS_GROUP_ADMIN, 100, CMD_SCOPE_ANY, METHOD_T_ANY,
-      cmd_clam_subscribe, NULL, "clam", "sub",
-      ad_subscribe,
-      (uint8_t)(sizeof(ad_subscribe) / sizeof(ad_subscribe[0])), NULL, NULL);
+  .group       = USERNS_GROUP_ADMIN,
+  .level       = 100,
+  .scope       = CMD_SCOPE_ANY,
+  .methods     = METHOD_T_ANY,
+  .cb          = cmd_clam_subscribe,
+  .parent_path = "clam",
+  .abbrev      = "sub",
+  .arg_desc    = ad_subscribe,
+  .arg_count   = (uint8_t)(sizeof(ad_subscribe) / sizeof(ad_subscribe[0])),
+};
 
-  cmd_register("clam_cmd", "unsubscribe",
-      "clam unsubscribe <name>",
-      "Remove a CLAM subscription by name",
-      NULL,
-      USERNS_GROUP_ADMIN, 100, CMD_SCOPE_ANY, METHOD_T_ANY,
-      cmd_clam_unsubscribe, NULL, "clam", "unsub",
-      ad_unsubscribe,
-      (uint8_t)(sizeof(ad_unsubscribe) / sizeof(ad_unsubscribe[0])), NULL, NULL);
+static const cmd_decl_t clam_unsubscribe_decl = {
+  .module      = "clam_cmd",
+  .name        = "unsubscribe",
+  .usage       = "clam unsubscribe <name>",
+  .description = "Remove a CLAM subscription by name",
+  .group       = USERNS_GROUP_ADMIN,
+  .level       = 100,
+  .scope       = CMD_SCOPE_ANY,
+  .methods     = METHOD_T_ANY,
+  .cb          = cmd_clam_unsubscribe,
+  .parent_path = "clam",
+  .abbrev      = "unsub",
+  .arg_desc    = ad_unsubscribe,
+  .arg_count   = (uint8_t)(sizeof(ad_unsubscribe) / sizeof(ad_unsubscribe[0])),
+};
 
-  cmd_register("clam_cmd", "clam",
-      "show clam",
-      "List all CLAM subscriptions",
-      NULL,
-      USERNS_GROUP_ADMIN, 100, CMD_SCOPE_ANY, METHOD_T_ANY,
-      cmd_show_clam, NULL, "show", NULL, NULL, 0, NULL, NULL);
+static const cmd_decl_t show_clam_decl = {
+  .module      = "clam_cmd",
+  .name        = "clam",
+  .usage       = "show clam",
+  .description = "List all CLAM subscriptions",
+  .group       = USERNS_GROUP_ADMIN,
+  .level       = 100,
+  .scope       = CMD_SCOPE_ANY,
+  .methods     = METHOD_T_ANY,
+  .cb          = cmd_show_clam,
+  .parent_path = "show",
+};
+
+void
+clam_cmd_init(void)
+{
+  pthread_mutex_init(&clam_cmd_mutex, NULL);
+  clam_cmd_ready = true;
+
+  // /clam (admin container).
+  cmd_register(&clam_decl);
+  cmd_register(&clam_subscribe_decl);
+  cmd_register(&clam_unsubscribe_decl);
+  cmd_register(&show_clam_decl);
 }
 
 // Must run before clam_exit() AND before bot_exit / method_exit so the

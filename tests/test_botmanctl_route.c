@@ -537,6 +537,52 @@ row_overlong_line_refused_whole(void)
   close(a);
 }
 
+static const cmd_decl_t slowecho_decl = {
+  .module      = "test",
+  .name        = "slowecho",
+  .usage       = "slowecho <token>",
+  .description = "Answer <token> from a pool worker after a delay",
+  .group       = "everyone",
+  .scope       = CMD_SCOPE_ANY,
+  .methods     = METHOD_T_ANY,
+  .cb          = echo_cmd,
+  .arg_desc    = echo_args,
+  .arg_count   = 1,
+};
+
+static const cmd_decl_t hold_decl = {
+  .module      = "test",
+  .name        = "hold",
+  .usage       = "hold",
+  .description = "Occupy the dispatch window, then answer",
+  .group       = "everyone",
+  .scope       = CMD_SCOPE_ANY,
+  .methods     = METHOD_T_ANY,
+  .cb          = hold_cmd,
+};
+
+static const cmd_decl_t mirror_decl = {
+  .module      = "test",
+  .name        = "mirror",
+  .usage       = "mirror <text>",
+  .description = "Answer with the size of the argument that arrived",
+  .group       = "everyone",
+  .scope       = CMD_SCOPE_ANY,
+  .methods     = METHOD_T_ANY,
+  .cb          = mirror_cmd,
+};
+
+static const cmd_decl_t forge_decl = {
+  .module      = "test",
+  .name        = "forge",
+  .usage       = "forge",
+  .description = "Reply with a token that carries CR and LF",
+  .group       = "everyone",
+  .scope       = CMD_SCOPE_ANY,
+  .methods     = METHOD_T_ANY,
+  .cb          = forge_cmd,
+};
+
 int
 main(void)
 {
@@ -559,25 +605,10 @@ main(void)
   botmanctl_register_config();
   kv_set("core.botmanctl.sockpath", route_sock);
 
-  cmd_register("test", "slowecho", "slowecho <token>",
-      "Answer <token> from a pool worker after a delay", NULL,
-      "everyone", 0, CMD_SCOPE_ANY, METHOD_T_ANY, echo_cmd, NULL,
-      NULL, NULL, echo_args, 1, NULL, NULL);
-
-  cmd_register("test", "hold", "hold",
-      "Occupy the dispatch window, then answer", NULL,
-      "everyone", 0, CMD_SCOPE_ANY, METHOD_T_ANY, hold_cmd, NULL,
-      NULL, NULL, NULL, 0, NULL, NULL);
-
-  cmd_register("test", "mirror", "mirror <text>",
-      "Answer with the size of the argument that arrived", NULL,
-      "everyone", 0, CMD_SCOPE_ANY, METHOD_T_ANY, mirror_cmd, NULL,
-      NULL, NULL, NULL, 0, NULL, NULL);
-
-  cmd_register("test", "forge", "forge",
-      "Reply with a token that carries CR and LF", NULL,
-      "everyone", 0, CMD_SCOPE_ANY, METHOD_T_ANY, forge_cmd, NULL,
-      NULL, NULL, NULL, 0, NULL, NULL);
+  cmd_register(&slowecho_decl);
+  cmd_register(&hold_decl);
+  cmd_register(&mirror_decl);
+  cmd_register(&forge_decl);
 
   botmanctl_register_method();
 

@@ -711,8 +711,8 @@ cmd_show_bots(const cmd_ctx_t *ctx)
 }
 
 // /show bot <name> [<verb> [args...]] — detailed bot status or a
-// method-scoped verb registered under "show/bot" via cmd_register(, NULL)
-// with a kind_filter that names a method the bot has bound.
+// method-scoped verb registered under "show/bot" with a kind_filter
+// that names a method the bot has bound.
 
 static const cmd_arg_desc_t ad_show_bot[] = {
   { "name", CMD_ARG_ALNUM, CMD_ARG_REQUIRED,                BOT_NAME_SZ - 1, NULL },
@@ -1202,96 +1202,232 @@ static const cmd_nl_t show_bot_nl = {
 
 // Registration
 
+static const cmd_decl_t bot_decl = {
+  .module      = "bot",
+  .name        = "bot",
+  .usage       = "bot <subcommand> ...",
+  .description = "Manage bot instances",
+  .help_long   = "Manages bot instances.\n"
+                 "Subcommands: add del start stop addmethod delmethod",
+  .group       = USERNS_GROUP_ADMIN,
+  .level       = 100,
+  .scope       = CMD_SCOPE_ANY,
+  .methods     = METHOD_T_ANY,
+  .cb          = admin_cmd_bot,
+};
+
+static const cmd_decl_t bot_add_decl = {
+  .module      = "bot",
+  .name        = "add",
+  .usage       = "bot add <name> [<kind>]",
+  .description = "Create a bot instance",
+  .help_long   = "Creates a new bot instance. Give it methods with\n"
+                 "/bot addmethod, then start it.\n"
+                 "<kind> names the bot plugin that gives the bot a mind and\n"
+                 "defaults to the only one loaded (chat); name it explicitly\n"
+                 "only when more than one exists.\n"
+                 "Example: bot add mybot",
+  .group       = USERNS_GROUP_ADMIN,
+  .level       = 100,
+  .scope       = CMD_SCOPE_ANY,
+  .methods     = METHOD_T_ANY,
+  .cb          = admin_cmd_bot_add,
+  .parent_path = "bot",
+  .arg_desc    = ad_bot_name_kind,
+  .arg_count   = 2,
+};
+
+static const cmd_decl_t bot_del_decl = {
+  .module      = "bot",
+  .name        = "del",
+  .usage       = "bot del <name>",
+  .description = "Destroy a bot instance",
+  .help_long   = "Stops (if running) and destroys the named bot.\n"
+                 "Removes the bot's KV namespace and database records.",
+  .group       = USERNS_GROUP_ADMIN,
+  .level       = 100,
+  .scope       = CMD_SCOPE_ANY,
+  .methods     = METHOD_T_ANY,
+  .cb          = admin_cmd_bot_del,
+  .parent_path = "bot",
+  .arg_desc    = ad_bot_name,
+  .arg_count   = 1,
+};
+
+static const cmd_decl_t bot_start_decl = {
+  .module      = "bot",
+  .name        = "start",
+  .usage       = "bot start <name>",
+  .description = "Start a bot",
+  .help_long   = "Starts the named bot. Creates method instances and\n"
+                 "initiates connections. The bot must have at least one\n"
+                 "method added.",
+  .group       = USERNS_GROUP_ADMIN,
+  .level       = 100,
+  .scope       = CMD_SCOPE_ANY,
+  .methods     = METHOD_T_ANY,
+  .cb          = admin_cmd_bot_start,
+  .parent_path = "bot",
+  .arg_desc    = ad_bot_name,
+  .arg_count   = 1,
+};
+
+static const cmd_decl_t bot_stop_decl = {
+  .module      = "bot",
+  .name        = "stop",
+  .usage       = "bot stop <name>",
+  .description = "Stop a bot",
+  .help_long   = "Stops the named bot. Disconnects method instances,\n"
+                 "and drains in-flight work.",
+  .group       = USERNS_GROUP_ADMIN,
+  .level       = 100,
+  .scope       = CMD_SCOPE_ANY,
+  .methods     = METHOD_T_ANY,
+  .cb          = admin_cmd_bot_stop,
+  .parent_path = "bot",
+  .arg_desc    = ad_bot_name,
+  .arg_count   = 1,
+};
+
+static const cmd_decl_t bot_addmethod_decl = {
+  .module      = "bot",
+  .name        = "addmethod",
+  .usage       = "bot addmethod <name> <method>",
+  .description = "Add a method to a bot",
+  .help_long   = "Adds a method plugin to a bot. The bot must be in CREATED\n"
+                 "state (not running). Configure method settings via set\n"
+                 "before starting.\n"
+                 "Example: bot addmethod mybot irc",
+  .group       = USERNS_GROUP_ADMIN,
+  .level       = 100,
+  .scope       = CMD_SCOPE_ANY,
+  .methods     = METHOD_T_ANY,
+  .cb          = admin_cmd_bot_bind,
+  .parent_path = "bot",
+  .abbrev      = "am",
+  .arg_desc    = ad_bot_method,
+  .arg_count   = 2,
+};
+
+static const cmd_decl_t bot_delmethod_decl = {
+  .module      = "bot",
+  .name        = "delmethod",
+  .usage       = "bot delmethod <name> <method>",
+  .description = "Remove a method from a bot",
+  .help_long   = "Removes a method from a bot. The bot must be in CREATED\n"
+                 "state (not running).",
+  .group       = USERNS_GROUP_ADMIN,
+  .level       = 100,
+  .scope       = CMD_SCOPE_ANY,
+  .methods     = METHOD_T_ANY,
+  .cb          = admin_cmd_bot_unbind,
+  .parent_path = "bot",
+  .abbrev      = "dm",
+  .arg_desc    = ad_bot_method,
+  .arg_count   = 2,
+};
+
+static const cmd_decl_t show_bots_decl = {
+  .module      = "bot",
+  .name        = "bots",
+  .usage       = "show bots",
+  .description = "List all bot instances",
+  .help_long   =
+      "Shows a colorized table of all bot instances with their bound\n"
+      "method kinds, state, command count, and namespace.",
+  .group       = USERNS_GROUP_ADMIN,
+  .level       = 100,
+  .scope       = CMD_SCOPE_ANY,
+  .methods     = METHOD_T_ANY,
+  .cb          = cmd_show_bots,
+  .parent_path = "show",
+};
+
+static const cmd_decl_t show_bot_decl = {
+  .module      = "bot",
+  .name        = "bot",
+  .usage       = "show bot <name> [<verb> [args...]]",
+  .description = "Show bot details or a verb the bot's methods offer",
+  .help_long   =
+      "With just <name>, renders identity: state, autostart, methods,\n"
+      "identities. With a trailing verb, dispatches to the first child of\n"
+      "show/bot whose name matches and whose kind_filter is either empty\n"
+      "or names a method this bot has bound (every bot: personas,\n"
+      "memories, stats, candidates, knowledge, interests, model).",
+  .group       = USERNS_GROUP_ADMIN,
+  .level       = 100,
+  .scope       = CMD_SCOPE_ANY,
+  .methods     = METHOD_T_ANY,
+  .cb          = cmd_show_bot,
+  .parent_path = "show",
+  .arg_desc    = ad_show_bot,
+  .arg_count   = (uint8_t)(sizeof(ad_show_bot)/sizeof(ad_show_bot[0])),
+  .nl          = &show_bot_nl,
+};
+
+static const cmd_decl_t say_decl = {
+  .module      = "bot",
+  .name        = "say",
+  .usage       = "say <bot> <target> <message>",
+  .description = "Make a bot emit a line to a channel or nick",
+  .help_long   =
+      "Sends <message> through the named running bot's first bound\n"
+      "method to <target> (an IRC #channel the bot has joined, or a\n"
+      "nick for a DM). Used for out-of-band announcements.\n"
+      "Example: say botman #cabal cp1 [mako] scored avg $/mo=812",
+  .group       = USERNS_GROUP_ADMIN,
+  .level       = 100,
+  .scope       = CMD_SCOPE_ANY,
+  .methods     = METHOD_T_ANY,
+  .cb          = admin_cmd_say,
+  .arg_desc    = ad_say,
+  .arg_count   = (uint8_t)(sizeof(ad_say) / sizeof(ad_say[0])),
+};
+
+static const cmd_decl_t quit_decl = {
+  .module      = "bot",
+  .name        = "quit",
+  .usage       = "quit [reason]",
+  .description = "Graceful shutdown",
+  .help_long   =
+      "Initiates a graceful shutdown of BotManager. All in-flight\n"
+      "work is drained, plugins are unloaded in reverse dependency\n"
+      "order, and resources are released cleanly.\n"
+      "\n"
+      "[reason] is the rest of the line and is passed to every method\n"
+      "as the bot goes down: on IRC it becomes the QUIT message the\n"
+      "channel sees, in place of the default \"shutting down\".\n"
+      "Example: quit rebuilding the kraken feed, back in two minutes",
+  .group       = USERNS_GROUP_OWNER,
+  .level       = USERNS_OWNER_LEVEL,
+  .scope       = CMD_SCOPE_ANY,
+  .methods     = METHOD_T_ANY,
+  .cb          = admin_cmd_quit,
+  .arg_desc    = ad_quit,
+  .arg_count   = (uint8_t)(sizeof(ad_quit) / sizeof(ad_quit[0])),
+};
+
 // Register bot management commands and /quit.
 void
 bot_register_commands(void)
 {
   // Bot management: parent command + subcommands. Every bot-scoped
   // subcommand takes an explicit <name> argument -- no session state.
-  cmd_register("bot", "bot",
-      "bot <subcommand> ...",
-      "Manage bot instances",
-      "Manages bot instances.\n"
-      "Subcommands: add del start stop addmethod delmethod",
-      USERNS_GROUP_ADMIN, 100, CMD_SCOPE_ANY, METHOD_T_ANY, admin_cmd_bot, NULL, NULL, NULL, NULL, 0, NULL, NULL);
-
-  cmd_register("bot", "add",
-      "bot add <name> [<kind>]",
-      "Create a bot instance",
-      "Creates a new bot instance. Give it methods with\n"
-      "/bot addmethod, then start it.\n"
-      "<kind> names the bot plugin that gives the bot a mind and\n"
-      "defaults to the only one loaded (chat); name it explicitly\n"
-      "only when more than one exists.\n"
-      "Example: bot add mybot",
-      USERNS_GROUP_ADMIN, 100, CMD_SCOPE_ANY, METHOD_T_ANY, admin_cmd_bot_add, NULL, "bot", NULL,
-      ad_bot_name_kind, 2, NULL, NULL);
-
-  cmd_register("bot", "del",
-      "bot del <name>",
-      "Destroy a bot instance",
-      "Stops (if running) and destroys the named bot.\n"
-      "Removes the bot's KV namespace and database records.",
-      USERNS_GROUP_ADMIN, 100, CMD_SCOPE_ANY, METHOD_T_ANY, admin_cmd_bot_del, NULL, "bot", NULL,
-      ad_bot_name, 1, NULL, NULL);
-
-  cmd_register("bot", "start",
-      "bot start <name>",
-      "Start a bot",
-      "Starts the named bot. Creates method instances and\n"
-      "initiates connections. The bot must have at least one\n"
-      "method added.",
-      USERNS_GROUP_ADMIN, 100, CMD_SCOPE_ANY, METHOD_T_ANY, admin_cmd_bot_start, NULL, "bot", NULL,
-      ad_bot_name, 1, NULL, NULL);
-
-  cmd_register("bot", "stop",
-      "bot stop <name>",
-      "Stop a bot",
-      "Stops the named bot. Disconnects method instances,\n"
-      "and drains in-flight work.",
-      USERNS_GROUP_ADMIN, 100, CMD_SCOPE_ANY, METHOD_T_ANY, admin_cmd_bot_stop, NULL, "bot", NULL,
-      ad_bot_name, 1, NULL, NULL);
-
-  cmd_register("bot", "addmethod",
-      "bot addmethod <name> <method>",
-      "Add a method to a bot",
-      "Adds a method plugin to a bot. The bot must be in CREATED\n"
-      "state (not running). Configure method settings via set\n"
-      "before starting.\n"
-      "Example: bot addmethod mybot irc",
-      USERNS_GROUP_ADMIN, 100, CMD_SCOPE_ANY, METHOD_T_ANY, admin_cmd_bot_bind, NULL, "bot", "am",
-      ad_bot_method, 2, NULL, NULL);
-
-  cmd_register("bot", "delmethod",
-      "bot delmethod <name> <method>",
-      "Remove a method from a bot",
-      "Removes a method from a bot. The bot must be in CREATED\n"
-      "state (not running).",
-      USERNS_GROUP_ADMIN, 100, CMD_SCOPE_ANY, METHOD_T_ANY, admin_cmd_bot_unbind, NULL, "bot", "dm",
-      ad_bot_method, 2, NULL, NULL);
+  cmd_register(&bot_decl);
+  cmd_register(&bot_add_decl);
+  cmd_register(&bot_del_decl);
+  cmd_register(&bot_start_decl);
+  cmd_register(&bot_stop_decl);
+  cmd_register(&bot_addmethod_decl);
+  cmd_register(&bot_delmethod_decl);
 
   // /show bots — summary table of all bots.
-  cmd_register("bot", "bots",
-      "show bots",
-      "List all bot instances",
-      "Shows a colorized table of all bot instances with their bound\n"
-      "method kinds, state, command count, and namespace.",
-      USERNS_GROUP_ADMIN, 100, CMD_SCOPE_ANY, METHOD_T_ANY, cmd_show_bots, NULL, "show", NULL,
-      NULL, 0, NULL, NULL);
+  cmd_register(&show_bots_decl);
 
   // /show bot <name> [<verb> ...] -- detailed bot status, or a
   // method-scoped verb registered as a child of "show/bot" via
-  // cmd_register(, NULL) with a matching kind_filter.
-  cmd_register("bot", "bot",
-      "show bot <name> [<verb> [args...]]",
-      "Show bot details or a verb the bot's methods offer",
-      "With just <name>, renders identity: state, autostart, methods,\n"
-      "identities. With a trailing verb, dispatches to the first child of\n"
-      "show/bot whose name matches and whose kind_filter is either empty\n"
-      "or names a method this bot has bound (every bot: personas,\n"
-      "memories, stats, candidates, knowledge, interests, model).",
-      USERNS_GROUP_ADMIN, 100, CMD_SCOPE_ANY, METHOD_T_ANY, cmd_show_bot, NULL, "show", NULL,
-      ad_show_bot, (uint8_t)(sizeof(ad_show_bot)/sizeof(ad_show_bot[0])), NULL, &show_bot_nl);
+  // cmd_register with a matching kind_filter.
+  cmd_register(&show_bot_decl);
 
   // Context-sensitive help: /help show bot <name> lists the verbs
   // registered under "show/bot" that this bot's methods admit.
@@ -1304,28 +1440,6 @@ bot_register_commands(void)
 
   // /say <bot> <target> <message> — out-of-band announce through a
   // running bot's method (IRC channel post). Top-level command.
-  cmd_register("bot", "say",
-      "say <bot> <target> <message>",
-      "Make a bot emit a line to a channel or nick",
-      "Sends <message> through the named running bot's first bound\n"
-      "method to <target> (an IRC #channel the bot has joined, or a\n"
-      "nick for a DM). Used for out-of-band announcements.\n"
-      "Example: say botman #cabal cp1 [mako] scored avg $/mo=812",
-      USERNS_GROUP_ADMIN, 100, CMD_SCOPE_ANY, METHOD_T_ANY, admin_cmd_say, NULL,
-      NULL, NULL, ad_say, (uint8_t)(sizeof(ad_say) / sizeof(ad_say[0])),
-      NULL, NULL);
-
-  cmd_register("bot", "quit", "quit [reason]",
-      "Graceful shutdown",
-      "Initiates a graceful shutdown of BotManager. All in-flight\n"
-      "work is drained, plugins are unloaded in reverse dependency\n"
-      "order, and resources are released cleanly.\n"
-      "\n"
-      "[reason] is the rest of the line and is passed to every method\n"
-      "as the bot goes down: on IRC it becomes the QUIT message the\n"
-      "channel sees, in place of the default \"shutting down\".\n"
-      "Example: quit rebuilding the kraken feed, back in two minutes",
-      USERNS_GROUP_OWNER, USERNS_OWNER_LEVEL, CMD_SCOPE_ANY, METHOD_T_ANY, admin_cmd_quit, NULL,
-      NULL, NULL, ad_quit, (uint8_t)(sizeof(ad_quit) / sizeof(ad_quit[0])),
-      NULL, NULL);
+  cmd_register(&say_decl);
+  cmd_register(&quit_decl);
 }

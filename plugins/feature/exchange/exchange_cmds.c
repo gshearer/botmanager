@@ -378,28 +378,43 @@ exch_cmd_root(const cmd_ctx_t *ctx)
   cmd_reply(ctx, "usage: /exchange tickers <exchange>");
 }
 
+static const cmd_decl_t exchange_decl = {
+  .module      = "exchange",
+  .name        = "exchange",
+  .usage       = "exchange <subcommand>",
+  .description = "Exchange abstraction operator verbs.",
+  .help_long   = "Root for /exchange ... operator verbs. Today: `tickers`.",
+  .group       = USERNS_GROUP_ADMIN,
+  .level       = 100,
+  .scope       = CMD_SCOPE_ANY,
+  .methods     = METHOD_T_ANY,
+  .cb          = exch_cmd_root,
+};
+
+static const cmd_decl_t exchange_tickers_decl = {
+  .module      = "exchange",
+  .name        = "tickers",
+  .usage       = "exchange tickers <exchange>",
+  .description = "Bulk-ticker snapshot from one exchange.",
+  .help_long   = "Calls the named exchange's bulk all-pairs ticker endpoint"
+                 " and prints the snapshot table (first 50 rows, with a"
+                 " '... N more' trailer when truncated). Public market data;"
+                 " no auth gate. NaN / UINT64_MAX sentinels print as '-'.",
+  .group       = USERNS_GROUP_ADMIN,
+  .level       = 100,
+  .scope       = CMD_SCOPE_ANY,
+  .methods     = METHOD_T_ANY,
+  .cb          = exch_cmd_tickers,
+  .parent_path = "exchange",
+};
+
 bool
 exchange_register_verbs(void)
 {
-  if(cmd_register("exchange", "exchange",
-        "exchange <subcommand>",
-        "Exchange abstraction operator verbs.",
-        "Root for /exchange ... operator verbs. Today: `tickers`.",
-        USERNS_GROUP_ADMIN, 100, CMD_SCOPE_ANY, METHOD_T_ANY,
-        exch_cmd_root, NULL, NULL, NULL,
-        NULL, 0, NULL, NULL) != SUCCESS)
+  if(cmd_register(&exchange_decl) != SUCCESS)
     return(FAIL);
 
-  if(cmd_register("exchange", "tickers",
-        "exchange tickers <exchange>",
-        "Bulk-ticker snapshot from one exchange.",
-        "Calls the named exchange's bulk all-pairs ticker endpoint"
-        " and prints the snapshot table (first 50 rows, with a"
-        " '... N more' trailer when truncated). Public market data;"
-        " no auth gate. NaN / UINT64_MAX sentinels print as '-'.",
-        USERNS_GROUP_ADMIN, 100, CMD_SCOPE_ANY, METHOD_T_ANY,
-        exch_cmd_tickers, NULL, "exchange", NULL,
-        NULL, 0, NULL, NULL) != SUCCESS)
+  if(cmd_register(&exchange_tickers_decl) != SUCCESS)
     return(FAIL);
 
   return(SUCCESS);

@@ -1136,21 +1136,30 @@ static const cmd_nl_t stock_nl = {
 // Plugin lifecycle
 // ----------------------------------------------------------------------
 
-static bool
-stock_init(void)
-{
-  if(cmd_register(STOCK_CTX, "stock",
-      "stock [-v] <@list|symbol…> | stock -s <words> | stock --list"
-      " | stock --add|--del <list> <symbols…>",
-      "Stock, ETF, fund, index, FX and commodity quotes",
+static const cmd_decl_t stock_decl = {
+  .module      = STOCK_CTX,
+  .name        = "stock",
+  .usage       = "stock [-v] <@list|symbol…> | stock -s <words> | stock --list"
+                 " | stock --add|--del <list> <symbols…>",
+  .description = "Stock, ETF, fund, index, FX and commodity quotes",
+  .help_long   =
       "Quote one or more symbols, or a saved list with @name. "
       "--list shows your lists; --add creates or appends to one and "
       "--del removes symbols (a list disappears when its last symbol "
       "does). Lists are private to your namespace and holding or "
       "changing one requires a known user.",
-      "everyone", 0, CMD_SCOPE_ANY, METHOD_T_ANY,
-      stock_cmd, NULL, NULL, "$",
-      NULL, 0, NULL, &stock_nl) != SUCCESS)
+  .group       = "everyone",
+  .scope       = CMD_SCOPE_ANY,
+  .methods     = METHOD_T_ANY,
+  .cb          = stock_cmd,
+  .abbrev      = "$",
+  .nl          = &stock_nl,
+};
+
+static bool
+stock_init(void)
+{
+  if(cmd_register(&stock_decl) != SUCCESS)
     return(FAIL);
 
   clam(CLAM_INFO, STOCK_CTX, "stock command plugin initialized");

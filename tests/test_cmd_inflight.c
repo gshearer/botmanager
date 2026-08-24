@@ -193,6 +193,41 @@ static const cmd_arg_desc_t need_one[] = {
   { "word", CMD_ARG_NONE, CMD_ARG_REQUIRED, 0, NULL },
 };
 
+static const cmd_decl_t tinflight_decl = {
+  .module      = "test",
+  .name        = "tinflight",
+  .usage       = "tinflight",
+  .description = "probe",
+  .group       = USERNS_GROUP_EVERYONE,
+  .scope       = CMD_SCOPE_ANY,
+  .methods     = METHOD_T_ANY,
+  .cb          = probe_cmd,
+};
+
+static const cmd_decl_t tinflightarg_decl = {
+  .module      = "test",
+  .name        = "tinflightarg",
+  .usage       = "tinflightarg <word>",
+  .description = "probe",
+  .group       = USERNS_GROUP_EVERYONE,
+  .scope       = CMD_SCOPE_ANY,
+  .methods     = METHOD_T_ANY,
+  .cb          = probe_cmd,
+  .arg_desc    = need_one,
+  .arg_count   = 1,
+};
+
+static const cmd_decl_t tinflightpair_decl = {
+  .module      = "test",
+  .name        = "tinflightpair",
+  .usage       = "tinflightpair",
+  .description = "probe",
+  .group       = USERNS_GROUP_EVERYONE,
+  .scope       = CMD_SCOPE_ANY,
+  .methods     = METHOD_T_ANY,
+  .cb          = pair_cmd,
+};
+
 int
 main(void)
 {
@@ -200,17 +235,9 @@ main(void)
   clam_init();
   cmd_init();
 
-  cmd_register("test", "tinflight", "tinflight", "probe", NULL,
-      USERNS_GROUP_EVERYONE, 0, CMD_SCOPE_ANY, METHOD_T_ANY,
-      probe_cmd, NULL, NULL, NULL, NULL, 0, NULL, NULL);
-
-  cmd_register("test", "tinflightarg", "tinflightarg <word>", "probe", NULL,
-      USERNS_GROUP_EVERYONE, 0, CMD_SCOPE_ANY, METHOD_T_ANY,
-      probe_cmd, NULL, NULL, NULL, need_one, 1, NULL, NULL);
-
-  cmd_register("test", "tinflightpair", "tinflightpair", "probe", NULL,
-      USERNS_GROUP_EVERYONE, 0, CMD_SCOPE_ANY, METHOD_T_ANY,
-      pair_cmd, NULL, NULL, NULL, NULL, 0, NULL, NULL);
+  cmd_register(&tinflight_decl);
+  cmd_register(&tinflightarg_decl);
+  cmd_register(&tinflightpair_decl);
 
   case_handler_sees_itself();
   case_parse_refusal_still_leaves();

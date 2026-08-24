@@ -533,6 +533,32 @@ static const char wordnik_dict_help[] =
     "  !dict -v brusque\n"
     "  !dict ad hoc";
 
+static const cmd_decl_t wotd_decl = {
+  .module      = WORDNIK_CTX,
+  .name        = "wotd",
+  .usage       = WORDNIK_CMD_USAGE,
+  .description = "Word of the day via Wordnik (wordnik.com)",
+  .help_long   = wordnik_help,
+  .group       = USERNS_GROUP_EVERYONE,
+  .scope       = CMD_SCOPE_ANY,
+  .methods     = METHOD_T_ANY,
+  .cb          = wordnik_cmd,
+  .nl          = &wordnik_nl,
+};
+
+static const cmd_decl_t dict_decl = {
+  .module      = WORDNIK_CTX,
+  .name        = "dict",
+  .usage       = WORDNIK_DICT_USAGE,
+  .description = "Dictionary lookup via Wordnik (wordnik.com)",
+  .help_long   = wordnik_dict_help,
+  .group       = USERNS_GROUP_EVERYONE,
+  .scope       = CMD_SCOPE_ANY,
+  .methods     = METHOD_T_ANY,
+  .cb          = wordnik_dict_cmd,
+  .nl          = &wordnik_dict_nl,
+};
+
 // The registry records WORDNIK_CTX as the providing module: the wordnik
 // plugin itself owns these commands, and `/show commands` should say so.
 // The two are raised together — !dict without !wotd (or the reverse) is a
@@ -540,20 +566,10 @@ static const char wordnik_dict_help[] =
 bool
 wordnik_cmd_register(void)
 {
-  if(cmd_register(WORDNIK_CTX, "wotd", WORDNIK_CMD_USAGE,
-      "Word of the day via Wordnik (wordnik.com)",
-      wordnik_help,
-      USERNS_GROUP_EVERYONE, 0, CMD_SCOPE_ANY, METHOD_T_ANY,
-      wordnik_cmd, NULL, NULL, NULL,
-      NULL, 0, NULL, &wordnik_nl) != SUCCESS)
+  if(cmd_register(&wotd_decl) != SUCCESS)
     return(FAIL);
 
-  if(cmd_register(WORDNIK_CTX, "dict", WORDNIK_DICT_USAGE,
-      "Dictionary lookup via Wordnik (wordnik.com)",
-      wordnik_dict_help,
-      USERNS_GROUP_EVERYONE, 0, CMD_SCOPE_ANY, METHOD_T_ANY,
-      wordnik_dict_cmd, NULL, NULL, NULL,
-      NULL, 0, NULL, &wordnik_dict_nl) != SUCCESS)
+  if(cmd_register(&dict_decl) != SUCCESS)
   {
     cmd_unregister_path("wotd");
     return(FAIL);

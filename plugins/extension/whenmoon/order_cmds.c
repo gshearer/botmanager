@@ -356,54 +356,86 @@ wm_order_parent_cb(const cmd_ctx_t *ctx)
 // Registration                                                        //
 // ------------------------------------------------------------------ //
 
+static const cmd_decl_t whenmoon_order_decl = {
+  .module      = "whenmoon",
+  .name        = "order",
+  .usage       = "whenmoon order <verb> ...",
+  .description = "Ad-hoc order management against any registered exchange.",
+  .help_long   = "Subcommands: buy <market_id> <limit|market> <qty> [<price>],"
+                 " sell <market_id> <limit|market> <qty> [<price>],"
+                 " cancel <exchange> <order_id>.\n"
+                 "Orders here are independent of the whenmoon market"
+                 " subsystem — no book, no strategy, no PnL attribution.",
+  .group       = USERNS_GROUP_ADMIN,
+  .level       = 100,
+  .scope       = CMD_SCOPE_ANY,
+  .methods     = METHOD_T_ANY,
+  .cb          = wm_order_parent_cb,
+  .parent_path = "whenmoon",
+  .abbrev      = "or",
+};
+
+static const cmd_decl_t whenmoon_order_buy_decl = {
+  .module      = "whenmoon",
+  .name        = "buy",
+  .usage       = "whenmoon order buy <exch>-<base>-<quote>"
+                 " <limit|market> <qty> [<price>]",
+  .description = "Submit a buy order against the named exchange.",
+  .help_long   = "limit orders require a <price>; market orders do not."
+                 " Market-buys interpret <qty> as quote-currency notional"
+                 " (e.g. USD); market-sells and limits interpret <qty> as"
+                 " base-currency size.",
+  .group       = USERNS_GROUP_ADMIN,
+  .level       = 100,
+  .scope       = CMD_SCOPE_ANY,
+  .methods     = METHOD_T_ANY,
+  .cb          = wm_order_cmd_buy,
+  .parent_path = "whenmoon/order",
+};
+
+static const cmd_decl_t whenmoon_order_sell_decl = {
+  .module      = "whenmoon",
+  .name        = "sell",
+  .usage       = "whenmoon order sell <exch>-<base>-<quote>"
+                 " <limit|market> <qty> [<price>]",
+  .description = "Submit a sell order against the named exchange.",
+  .help_long   = "Symmetric to /whenmoon order buy. <qty> is base-currency"
+                 " size in every mode (market and limit alike).",
+  .group       = USERNS_GROUP_ADMIN,
+  .level       = 100,
+  .scope       = CMD_SCOPE_ANY,
+  .methods     = METHOD_T_ANY,
+  .cb          = wm_order_cmd_sell,
+  .parent_path = "whenmoon/order",
+};
+
+static const cmd_decl_t whenmoon_order_cancel_decl = {
+  .module      = "whenmoon",
+  .name        = "cancel",
+  .usage       = "whenmoon order cancel <exchange> <order-id>",
+  .description = "Cancel a resting order at the named exchange.",
+  .group       = USERNS_GROUP_ADMIN,
+  .level       = 100,
+  .scope       = CMD_SCOPE_ANY,
+  .methods     = METHOD_T_ANY,
+  .cb          = wm_order_cmd_cancel,
+  .parent_path = "whenmoon/order",
+};
+
 bool
 wm_order_register_verbs(void)
 {
   // /whenmoon order parent.
-  if(cmd_register("whenmoon", "order",
-        "whenmoon order <verb> ...",
-        "Ad-hoc order management against any registered exchange.",
-        "Subcommands: buy <market_id> <limit|market> <qty> [<price>],"
-        " sell <market_id> <limit|market> <qty> [<price>],"
-        " cancel <exchange> <order_id>.\n"
-        "Orders here are independent of the whenmoon market"
-        " subsystem — no book, no strategy, no PnL attribution.",
-        USERNS_GROUP_ADMIN, 100, CMD_SCOPE_ANY, METHOD_T_ANY,
-        wm_order_parent_cb, NULL, "whenmoon", "or",
-        NULL, 0, NULL, NULL) != SUCCESS)
+  if(cmd_register(&whenmoon_order_decl) != SUCCESS)
     return(FAIL);
 
-  if(cmd_register("whenmoon", "buy",
-        "whenmoon order buy <exch>-<base>-<quote>"
-        " <limit|market> <qty> [<price>]",
-        "Submit a buy order against the named exchange.",
-        "limit orders require a <price>; market orders do not."
-        " Market-buys interpret <qty> as quote-currency notional"
-        " (e.g. USD); market-sells and limits interpret <qty> as"
-        " base-currency size.",
-        USERNS_GROUP_ADMIN, 100, CMD_SCOPE_ANY, METHOD_T_ANY,
-        wm_order_cmd_buy, NULL, "whenmoon/order", NULL,
-        NULL, 0, NULL, NULL) != SUCCESS)
+  if(cmd_register(&whenmoon_order_buy_decl) != SUCCESS)
     return(FAIL);
 
-  if(cmd_register("whenmoon", "sell",
-        "whenmoon order sell <exch>-<base>-<quote>"
-        " <limit|market> <qty> [<price>]",
-        "Submit a sell order against the named exchange.",
-        "Symmetric to /whenmoon order buy. <qty> is base-currency"
-        " size in every mode (market and limit alike).",
-        USERNS_GROUP_ADMIN, 100, CMD_SCOPE_ANY, METHOD_T_ANY,
-        wm_order_cmd_sell, NULL, "whenmoon/order", NULL,
-        NULL, 0, NULL, NULL) != SUCCESS)
+  if(cmd_register(&whenmoon_order_sell_decl) != SUCCESS)
     return(FAIL);
 
-  if(cmd_register("whenmoon", "cancel",
-        "whenmoon order cancel <exchange> <order-id>",
-        "Cancel a resting order at the named exchange.",
-        NULL,
-        USERNS_GROUP_ADMIN, 100, CMD_SCOPE_ANY, METHOD_T_ANY,
-        wm_order_cmd_cancel, NULL, "whenmoon/order", NULL,
-        NULL, 0, NULL, NULL) != SUCCESS)
+  if(cmd_register(&whenmoon_order_cancel_decl) != SUCCESS)
     return(FAIL);
 
   return(SUCCESS);

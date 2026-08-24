@@ -310,38 +310,32 @@ reg_check_collisions_locked(const char *name, const char *abbrev,
 // Allocate, populate, and link a new cmd_def_t into the global list.
 // Caller must hold cmd_mutex.
 static cmd_def_t *
-reg_populate_def(const char *module, const char *name,
-    const char *usage, const char *description,
-    const char *help_long, const char *group, uint16_t level,
-    cmd_scope_t scope, method_type_t methods, cmd_cb_t cb, void *data,
-    const char *abbrev, const cmd_arg_desc_t *arg_desc,
-    uint8_t arg_count, const char *const *kind_filter,
-    const cmd_nl_t *nl, cmd_def_t *parent)
+reg_populate_def(const cmd_decl_t *decl, cmd_def_t *parent)
 {
   cmd_def_t *d = mem_alloc("cmd", "def", sizeof(*d));
   memset(d, 0, sizeof(*d));
 
-  if(module != NULL)
-    strlcpy(d->module, module, CMD_MODULE_SZ);
+  if(decl->module != NULL)
+    strlcpy(d->module, decl->module, CMD_MODULE_SZ);
 
-  strlcpy(d->name, name, CMD_NAME_SZ);
+  strlcpy(d->name, decl->name, CMD_NAME_SZ);
 
-  if(abbrev != NULL && abbrev[0] != '\0')
-    strlcpy(d->abbrev, abbrev, CMD_NAME_SZ);
+  if(decl->abbrev != NULL && decl->abbrev[0] != '\0')
+    strlcpy(d->abbrev, decl->abbrev, CMD_NAME_SZ);
 
-  d->usage       = usage;
-  d->description = description;
-  d->help_long   = help_long;
+  d->usage       = decl->usage;
+  d->description = decl->description;
+  d->help_long   = decl->help_long;
 
-  strlcpy(d->group, group, USERNS_GROUP_SZ);
-  d->level   = level;
-  d->scope   = scope;
-  d->cb      = cb;
-  d->data    = data;
-  d->arg_desc    = arg_desc;
-  d->arg_count   = arg_count;
-  d->kind_filter = kind_filter;
-  d->nl          = nl;
+  strlcpy(d->group, decl->group, USERNS_GROUP_SZ);
+  d->level   = decl->level;
+  d->scope   = decl->scope;
+  d->cb      = decl->cb;
+  d->data    = decl->data;
+  d->arg_desc    = decl->arg_desc;
+  d->arg_count   = decl->arg_count;
+  d->kind_filter = decl->kind_filter;
+  d->nl          = decl->nl;
 
   // Link to parent if specified.
   if(parent != NULL)
@@ -354,12 +348,12 @@ reg_populate_def(const char *module, const char *name,
   // Method type scoping. Subcommands inherit their parent's bitmask
   // when they pass METHOD_T_ANY; explicit bitmasks are ANDed with
   // the parent to prevent a child from widening visibility.
-  if(parent != NULL && methods == METHOD_T_ANY)
+  if(parent != NULL && decl->methods == METHOD_T_ANY)
     d->methods = parent->methods;
   else if(parent != NULL)
-    d->methods = methods & parent->methods;
+    d->methods = decl->methods & parent->methods;
   else
-    d->methods = methods;
+    d->methods = decl->methods;
 
   // Prepend to global list.
   d->next = cmd_list;
@@ -371,45 +365,41 @@ reg_populate_def(const char *module, const char *name,
 
 // Register a command globally.
 bool
-cmd_register(const char *module, const char *name,
-    const char *usage, const char *description,
-    const char *help_long, const char *group, uint16_t level,
-    cmd_scope_t scope, method_type_t methods, cmd_cb_t cb, void *data,
-    const char *parent_path, const char *abbrev,
-    const cmd_arg_desc_t *arg_desc, uint8_t arg_count,
-    const char *const *kind_filter,
-    const cmd_nl_t *nl)
+cmd_register(const cmd_decl_t *decl)
 {
   // The owning object is whoever called us. Core is link_whole'd into
   // botman with export_dynamic, so a plugin reaches this symbol through
   // the PLT and the return address lands in the plugin's own mapping.
   const void *owner_pc = __builtin_return_address(0);
 
-  if(name == NULL || name[0] == '\0' || cb == NULL)
+  if(decl == NULL || decl->name == NULL || decl->name[0] == '\0'
+      || decl->cb == NULL)
   {
     clam(CLAM_WARN, "cmd_register", "invalid arguments");
     return(FAIL);
   }
 
-  if(group == NULL || group[0] == '\0')
+  if(decl->group == NULL || decl->group[0] == '\0')
   {
     clam(CLAM_WARN, "cmd_register",
-        "'%s': group name is required", name);
+        "'%s': group name is required", decl->name);
     return(FAIL);
   }
 
   // Validate arg spec if provided.
-  if(arg_desc != NULL && arg_count > 0
-      && !reg_validate_args(name, arg_desc, arg_count))
+  if(decl->arg_desc != NULL && decl->arg_count > 0
+      && !reg_validate_args(decl->name, decl->arg_desc, decl->arg_count))
     return(FAIL);
 
   // Validate NL hint invariants if provided.
-  if(nl != NULL)
+  if(decl->nl != NULL)
   {
+    const cmd_nl_t *nl = decl->nl;
+
     if(nl->when == NULL || nl->syntax == NULL)
     {
       clam(CLAM_WARN, "cmd_register",
-          "'%s': nl without when/syntax; rejecting", name);
+          "'%s': nl without when/syntax; rejecting", decl->name);
       return(FAIL);
     }
 
@@ -417,7 +407,7 @@ cmd_register(const char *module, const char *name,
     {
       clam(CLAM_WARN, "cmd_register",
           "'%s': nl requires >=2 examples; got %u",
-          name, (unsigned)nl->example_count);
+          decl->name, (unsigned)nl->example_count);
       return(FAIL);
     }
 
@@ -425,7 +415,7 @@ cmd_register(const char *module, const char *name,
     {
       clam(CLAM_WARN, "cmd_register",
           "'%s': nl slot_count %u exceeds CMD_MAX_ARGS %d",
-          name, (unsigned)nl->slot_count, CMD_MAX_ARGS);
+          decl->name, (unsigned)nl->slot_count, CMD_MAX_ARGS);
       return(FAIL);
     }
   }
@@ -437,37 +427,37 @@ cmd_register(const char *module, const char *name,
     pthread_mutex_lock(&cmd_mutex);
 
     // Resolve parent if specified (needed for scoped collision check).
-    if(parent_path != NULL && parent_path[0] != '\0')
+    if(decl->parent_path != NULL && decl->parent_path[0] != '\0')
     {
-      parent = resolve_parent_path_locked(parent_path);
+      parent = resolve_parent_path_locked(decl->parent_path);
 
       if(parent == NULL)
       {
         pthread_mutex_unlock(&cmd_mutex);
         clam(CLAM_WARN, "cmd_register",
-            "'%s': parent command '%s' not found", name, parent_path);
+            "'%s': parent command '%s' not found", decl->name,
+            decl->parent_path);
         return(FAIL);
       }
     }
 
-    if(!reg_check_collisions_locked(name, abbrev, parent, kind_filter))
+    if(!reg_check_collisions_locked(decl->name, decl->abbrev, parent,
+        decl->kind_filter))
     {
       pthread_mutex_unlock(&cmd_mutex);
       return(FAIL);
     }
 
-    d = reg_populate_def(module, name, usage, description,
-        help_long, group, level, scope, methods, cb, data, abbrev,
-        arg_desc, arg_count, kind_filter, nl, parent);
+    d = reg_populate_def(decl, parent);
 
     d->owner_pc = owner_pc;
 
     pthread_mutex_unlock(&cmd_mutex);
 
     clam(CLAM_DEBUG, "cmd_register",
-        "registered '%s' (module: %s, group: %s, level: %u%s%s)", name,
-        module ? module : "(none)", group,
-        (unsigned)level,
+        "registered '%s' (module: %s, group: %s, level: %u%s%s)",
+        decl->name, decl->module ? decl->module : "(none)", decl->group,
+        (unsigned)decl->level,
         d->parent ? ", parent: " : "",
         d->parent ? d->parent->name : "");
   }
@@ -2936,6 +2926,60 @@ static const cmd_nl_t version_nl = {
                              / sizeof(version_examples[0])),
 };
 
+static const cmd_decl_t help_decl = {
+  .module      = "cmd",
+  .name        = "help",
+  .usage       = "help [-v] [command ...] | help kv <key>",
+  .description = "Command reference",
+  .help_long   = "Lists all commands available on this bot instance.\n"
+                 "Use help <command> to see usage and subcommands.\n"
+                 "Use help -v <command> for verbose help.\n"
+                 "Use help kv <key> for configuration key help.",
+  .group       = USERNS_GROUP_EVERYONE,
+  .scope       = CMD_SCOPE_ANY,
+  .methods     = METHOD_T_ANY,
+  .cb          = cmd_builtin_help,
+  .abbrev      = "h",
+  .nl          = &help_nl,
+};
+
+static const cmd_decl_t show_decl = {
+  .module      = "cmd",
+  .name        = "show",
+  .usage       = "show <subcommand> ...",
+  .description = "Show system information",
+  .group       = USERNS_GROUP_ADMIN,
+  .level       = 100,
+  .scope       = CMD_SCOPE_ANY,
+  .methods     = METHOD_T_ANY,
+  .cb          = cmd_builtin_show,
+  .abbrev      = "sh",
+};
+
+static const cmd_decl_t set_decl = {
+  .module      = "cmd",
+  .name        = "set",
+  .usage       = "set <subcommand> ...",
+  .description = "Configure system settings",
+  .group       = USERNS_GROUP_ADMIN,
+  .level       = 100,
+  .scope       = CMD_SCOPE_ANY,
+  .methods     = METHOD_T_ANY,
+  .cb          = cmd_builtin_set,
+};
+
+static const cmd_decl_t version_decl = {
+  .module      = "cmd",
+  .name        = "version",
+  .usage       = "version",
+  .description = "Show program version",
+  .group       = USERNS_GROUP_EVERYONE,
+  .scope       = CMD_SCOPE_ANY,
+  .methods     = METHOD_T_ANY,
+  .cb          = cmd_builtin_version,
+  .nl          = &version_nl,
+};
+
 // Initialize the command subsystem. Sets up the mutex and registers
 // built-in commands (help, version).
 void
@@ -2946,30 +2990,10 @@ cmd_init(void)
   pthread_mutex_init(&cmd_inflight_mutex, NULL);
 
   // Register core built-in commands.
-  cmd_register("cmd", "help",
-      "help [-v] [command ...] | help kv <key>",
-      "Command reference",
-      "Lists all commands available on this bot instance.\n"
-      "Use help <command> to see usage and subcommands.\n"
-      "Use help -v <command> for verbose help.\n"
-      "Use help kv <key> for configuration key help.",
-      USERNS_GROUP_EVERYONE, 0, CMD_SCOPE_ANY, METHOD_T_ANY,
-      cmd_builtin_help, NULL, NULL, "h", NULL, 0, NULL, &help_nl);
-
-  cmd_register("cmd", "show", "show <subcommand> ...",
-      "Show system information", NULL,
-      USERNS_GROUP_ADMIN, 100, CMD_SCOPE_ANY, METHOD_T_ANY,
-      cmd_builtin_show, NULL, NULL, "sh", NULL, 0, NULL, NULL);
-
-  cmd_register("cmd", "set", "set <subcommand> ...",
-      "Configure system settings", NULL,
-      USERNS_GROUP_ADMIN, 100, CMD_SCOPE_ANY, METHOD_T_ANY,
-      cmd_builtin_set, NULL, NULL, NULL, NULL, 0, NULL, NULL);
-
-  cmd_register("cmd", "version", "version",
-      "Show program version", NULL,
-      USERNS_GROUP_EVERYONE, 0, CMD_SCOPE_ANY, METHOD_T_ANY,
-      cmd_builtin_version, NULL, NULL, NULL, NULL, 0, NULL, &version_nl);
+  cmd_register(&help_decl);
+  cmd_register(&show_decl);
+  cmd_register(&set_decl);
+  cmd_register(&version_decl);
 
   cmd_ready = true;
 

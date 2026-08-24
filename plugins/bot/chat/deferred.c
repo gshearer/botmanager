@@ -1441,89 +1441,133 @@ static const cmd_nl_t remind_nl = {
   .dispatch_text = NULL,
 };
 
+static const cmd_decl_t remind_decl = {
+  .module      = "chat",
+  .name        = "remind",
+  .usage       = "remind <duration|back> <message>",
+  .description = "Set a reminder the bot delivers when it comes due",
+  .help_long   =
+      "Stores a reminder and delivers it in the bot's own voice once\n"
+      "due (checked every behavior.soul.interval_secs, default 60 s).\n"
+      "Durations read like 30s, 5m, 2h or 1d, up to 30 days. Set in a\n"
+      "channel it is delivered there; set in a DM it comes back as a\n"
+      "DM. Sugar over the same deferred spine /in uses, so 'in list'\n"
+      "and 'in cancel' see reminders too. Survives restarts and\n"
+      "reloads.\n"
+      "\n"
+      "Say 'back' instead of a duration to be reminded when you are\n"
+      "next around rather than at a set time. Since you are here when\n"
+      "you ask, it waits out a quiet period first\n"
+      "(behavior.soul.deferred.back_quiet_secs, default 30 min) and\n"
+      "then delivers on the next thing you say.",
+  .group       = USERNS_GROUP_EVERYONE,
+  .scope       = CMD_SCOPE_ANY,
+  .methods     = METHOD_T_ANY,
+  .cb          = cmd_remind,
+  .arg_desc    = ad_remind,
+  .arg_count   = (uint8_t)(sizeof(ad_remind) / sizeof(ad_remind[0])),
+  .nl          = &remind_nl,
+};
+
+static const cmd_decl_t in_decl = {
+  .module      = "chat",
+  .name        = "in",
+  .usage       = "in <duration|back> <command> [args]",
+  .description = "Run a command later, as you, and report back in voice",
+  .help_long   =
+      "Schedules any conversational command to run after a delay, in\n"
+      "your name: 'in 20m weather 45069'. When it fires the bot runs\n"
+      "the command as you — your permissions are re-checked at that\n"
+      "moment, and a refusal is spoken, never silent — captures the\n"
+      "output and tells you the outcome in its own voice, in the\n"
+      "channel or DM you asked from.\n"
+      "\n"
+      "Only commands the bot can reach conversationally qualify, and\n"
+      "only top-level ones. Durations read like 30s, 5m, 2h or 1d, up\n"
+      "to 30 days. 'in list' shows what you have pending; 'in cancel\n"
+      "<id>' drops one.\n"
+      "\n"
+      "Say 'back' instead of a duration — 'in back weather 45069' —\n"
+      "to have it run when you are next around rather than at a set\n"
+      "time. Since you are here when you ask, it waits out a quiet\n"
+      "period first (behavior.soul.deferred.back_quiet_secs, default\n"
+      "30 min) and then runs on the next thing you say.",
+  .group       = USERNS_GROUP_EVERYONE,
+  .scope       = CMD_SCOPE_ANY,
+  .methods     = METHOD_T_ANY,
+  .cb          = cmd_in,
+  .arg_desc    = ad_in,
+  .arg_count   = (uint8_t)(sizeof(ad_in) / sizeof(ad_in[0])),
+  .nl          = &in_nl,
+};
+
+static const cmd_decl_t in_list_decl = {
+  .module      = "chat",
+  .name        = "list",
+  .usage       = "in list",
+  .description = "List your pending deferred work",
+  .help_long   = "Everything you have waiting — reminders and scheduled\n"
+                 "commands alike — with the id 'in cancel' takes.",
+  .group       = USERNS_GROUP_EVERYONE,
+  .scope       = CMD_SCOPE_ANY,
+  .methods     = METHOD_T_ANY,
+  .cb          = cmd_in_list,
+  .parent_path = "in",
+};
+
+static const cmd_decl_t in_cancel_decl = {
+  .module      = "chat",
+  .name        = "cancel",
+  .usage       = "in cancel <id>",
+  .description = "Cancel one pending deferred item by id",
+  .help_long   =
+      "Drops a pending item. Yours to cancel means the request came\n"
+      "from you; an admin may cancel any row in the namespace.",
+  .group       = USERNS_GROUP_EVERYONE,
+  .scope       = CMD_SCOPE_ANY,
+  .methods     = METHOD_T_ANY,
+  .cb          = cmd_in_cancel,
+  .parent_path = "in",
+  .arg_desc    = ad_in_cancel,
+  .arg_count   = (uint8_t)(sizeof(ad_in_cancel) / sizeof(ad_in_cancel[0])),
+};
+
+static const cmd_decl_t show_deferred_decl = {
+  .module      = "chat",
+  .name        = "deferred",
+  .usage       = "show deferred [<nick>]",
+  .description = "Pending deferred work in the working namespace",
+  .help_long   =
+      "Namespace-wide view of everything waiting to fire: id, who\n"
+      "asked, source, kind, how long until it is due and the venue it\n"
+      "will land in. With a nick, only that person's rows.",
+  .group       = USERNS_GROUP_ADMIN,
+  .level       = 100,
+  .scope       = CMD_SCOPE_ANY,
+  .methods     = METHOD_T_ANY,
+  .cb          = cmd_show_deferred,
+  .parent_path = "show",
+  .arg_desc    = ad_show_deferred,
+  .arg_count   = (uint8_t)(sizeof(ad_show_deferred)
+                 / sizeof(ad_show_deferred[0])),
+};
+
 bool
 chatbot_deferred_register(void)
 {
-  if(cmd_register("chat", "remind",
-        "remind <duration|back> <message>",
-        "Set a reminder the bot delivers when it comes due",
-        "Stores a reminder and delivers it in the bot's own voice once\n"
-        "due (checked every behavior.soul.interval_secs, default 60 s).\n"
-        "Durations read like 30s, 5m, 2h or 1d, up to 30 days. Set in a\n"
-        "channel it is delivered there; set in a DM it comes back as a\n"
-        "DM. Sugar over the same deferred spine /in uses, so 'in list'\n"
-        "and 'in cancel' see reminders too. Survives restarts and\n"
-        "reloads.\n"
-        "\n"
-        "Say 'back' instead of a duration to be reminded when you are\n"
-        "next around rather than at a set time. Since you are here when\n"
-        "you ask, it waits out a quiet period first\n"
-        "(behavior.soul.deferred.back_quiet_secs, default 30 min) and\n"
-        "then delivers on the next thing you say.",
-        USERNS_GROUP_EVERYONE, 0, CMD_SCOPE_ANY, METHOD_T_ANY,
-        cmd_remind, NULL, NULL, NULL,
-        ad_remind, (uint8_t)(sizeof(ad_remind) / sizeof(ad_remind[0])),
-        NULL, &remind_nl) != SUCCESS)
+  if(cmd_register(&remind_decl) != SUCCESS)
     return(FAIL);
 
-  if(cmd_register("chat", "in",
-        "in <duration|back> <command> [args]",
-        "Run a command later, as you, and report back in voice",
-        "Schedules any conversational command to run after a delay, in\n"
-        "your name: 'in 20m weather 45069'. When it fires the bot runs\n"
-        "the command as you — your permissions are re-checked at that\n"
-        "moment, and a refusal is spoken, never silent — captures the\n"
-        "output and tells you the outcome in its own voice, in the\n"
-        "channel or DM you asked from.\n"
-        "\n"
-        "Only commands the bot can reach conversationally qualify, and\n"
-        "only top-level ones. Durations read like 30s, 5m, 2h or 1d, up\n"
-        "to 30 days. 'in list' shows what you have pending; 'in cancel\n"
-        "<id>' drops one.\n"
-        "\n"
-        "Say 'back' instead of a duration — 'in back weather 45069' —\n"
-        "to have it run when you are next around rather than at a set\n"
-        "time. Since you are here when you ask, it waits out a quiet\n"
-        "period first (behavior.soul.deferred.back_quiet_secs, default\n"
-        "30 min) and then runs on the next thing you say.",
-        USERNS_GROUP_EVERYONE, 0, CMD_SCOPE_ANY, METHOD_T_ANY,
-        cmd_in, NULL, NULL, NULL,
-        ad_in, (uint8_t)(sizeof(ad_in) / sizeof(ad_in[0])),
-        NULL, &in_nl) != SUCCESS)
+  if(cmd_register(&in_decl) != SUCCESS)
     goto fail_in;
 
-  if(cmd_register("chat", "list",
-        "in list",
-        "List your pending deferred work",
-        "Everything you have waiting — reminders and scheduled\n"
-        "commands alike — with the id 'in cancel' takes.",
-        USERNS_GROUP_EVERYONE, 0, CMD_SCOPE_ANY, METHOD_T_ANY,
-        cmd_in_list, NULL, "in", NULL, NULL, 0, NULL, NULL) != SUCCESS)
+  if(cmd_register(&in_list_decl) != SUCCESS)
     goto fail_list;
 
-  if(cmd_register("chat", "cancel",
-        "in cancel <id>",
-        "Cancel one pending deferred item by id",
-        "Drops a pending item. Yours to cancel means the request came\n"
-        "from you; an admin may cancel any row in the namespace.",
-        USERNS_GROUP_EVERYONE, 0, CMD_SCOPE_ANY, METHOD_T_ANY,
-        cmd_in_cancel, NULL, "in", NULL,
-        ad_in_cancel,
-        (uint8_t)(sizeof(ad_in_cancel) / sizeof(ad_in_cancel[0])),
-        NULL, NULL) != SUCCESS)
+  if(cmd_register(&in_cancel_decl) != SUCCESS)
     goto fail_cancel;
 
-  if(cmd_register("chat", "deferred",
-        "show deferred [<nick>]",
-        "Pending deferred work in the working namespace",
-        "Namespace-wide view of everything waiting to fire: id, who\n"
-        "asked, source, kind, how long until it is due and the venue it\n"
-        "will land in. With a nick, only that person's rows.",
-        USERNS_GROUP_ADMIN, 100, CMD_SCOPE_ANY, METHOD_T_ANY,
-        cmd_show_deferred, NULL, "show", NULL,
-        ad_show_deferred,
-        (uint8_t)(sizeof(ad_show_deferred) / sizeof(ad_show_deferred[0])),
-        NULL, NULL) != SUCCESS)
+  if(cmd_register(&show_deferred_decl) != SUCCESS)
     goto fail_show;
 
   return(SUCCESS);

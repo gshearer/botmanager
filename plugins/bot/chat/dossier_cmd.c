@@ -45,18 +45,26 @@ llm_verb_dossiersweep(const cmd_ctx_t *ctx)
   cmd_reply(ctx, buf);
 }
 
+static const cmd_decl_t bot_dossiersweep_decl = {
+  .module      = "llm",
+  .name        = "dossiersweep",
+  .usage       = "bot <name> dossiersweep",
+  .description = "Fire one LLM fact-extraction sweep for this bot now",
+  .group       = USERNS_GROUP_ADMIN,
+  .level       = 100,
+  .scope       = CMD_SCOPE_ANY,
+  .methods     = METHOD_T_ANY,
+  .cb          = llm_verb_dossiersweep,
+  .parent_path = "bot",
+  .abbrev      = "dsweep",
+};
+
 // Kind-agnostic (kind_filter NULL): a kind_filter names method kinds,
 // and a fact sweep is the mind's work, not any one method's.
 bool
 chatbot_dossiersweep_cmd_register(void)
 {
-  if(cmd_register("llm", "dossiersweep",
-        "bot <name> dossiersweep",
-        "Fire one LLM fact-extraction sweep for this bot now",
-        NULL,
-        USERNS_GROUP_ADMIN, 100, CMD_SCOPE_ANY, METHOD_T_ANY,
-        llm_verb_dossiersweep, NULL, "bot", "dsweep",
-        NULL, 0, NULL, NULL) != SUCCESS)
+  if(cmd_register(&bot_dossiersweep_decl) != SUCCESS)
     return(FAIL);
 
   return(SUCCESS);
@@ -309,58 +317,83 @@ cmd_dossier_fact_del(const cmd_ctx_t *ctx)
 
 // Registration
 
-void
-dossier_register_commands(void)
-{
-  // /dossier (container)
-  cmd_register("dossier", "dossier",
-      "dossier <subcommand> ...",
-      "Dossier admin mutators",
-      "Manages dossiers in a namespace.\n"
-      "Subcommands: merge, split, fact",
-      USERNS_GROUP_ADMIN, 100, CMD_SCOPE_ANY, METHOD_T_ANY,
-      cmd_dossier_root, NULL, NULL, NULL,
-      NULL, 0, NULL, NULL);
+static const cmd_decl_t dossier_decl = {
+  .module      = "dossier",
+  .name        = "dossier",
+  .usage       = "dossier <subcommand> ...",
+  .description = "Dossier admin mutators",
+  .help_long   = "Manages dossiers in a namespace.\n"
+                 "Subcommands: merge, split, fact",
+  .group       = USERNS_GROUP_ADMIN,
+  .level       = 100,
+  .scope       = CMD_SCOPE_ANY,
+  .methods     = METHOD_T_ANY,
+  .cb          = cmd_dossier_root,
+};
 
-  cmd_register("dossier", "merge",
-      "dossier merge <bot> <username> <id> [<id>...]",
-      "Merge dossiers into the first id and attach to user",
+static const cmd_decl_t dossier_merge_decl = {
+  .module      = "dossier",
+  .name        = "merge",
+  .usage       = "dossier merge <bot> <username> <id> [<id>...]",
+  .description = "Merge dossiers into the first id and attach to user",
+  .help_long   =
       "First id is the survivor. Remaining ids are absorbed via\n"
       "dossier_merge(), then the survivor is attached to the named\n"
       "user via dossier_set_user(). All ids must be in the named\n"
       "bot's userns.",
-      USERNS_GROUP_ADMIN, 100, CMD_SCOPE_ANY, METHOD_T_ANY,
-      cmd_dossier_merge, NULL, "dossier", "m",
-      ad_dossier_merge,
-      (uint8_t)(sizeof(ad_dossier_merge) / sizeof(ad_dossier_merge[0])),
-      NULL, NULL);
+  .group       = USERNS_GROUP_ADMIN,
+  .level       = 100,
+  .scope       = CMD_SCOPE_ANY,
+  .methods     = METHOD_T_ANY,
+  .cb          = cmd_dossier_merge,
+  .parent_path = "dossier",
+  .abbrev      = "m",
+  .arg_desc    = ad_dossier_merge,
+  .arg_count   = (uint8_t)(sizeof(ad_dossier_merge)
+                 / sizeof(ad_dossier_merge[0])),
+};
 
-  cmd_register("dossier", "split",
-      "dossier split <signature_id>",
-      "Detach a signature into a new dossier (facts not migrated)",
+static const cmd_decl_t dossier_split_decl = {
+  .module      = "dossier",
+  .name        = "split",
+  .usage       = "dossier split <signature_id>",
+  .description = "Detach a signature into a new dossier (facts not migrated)",
+  .help_long   =
       "Best-effort split: the named signature row is reassigned to\n"
       "a brand-new dossier in the same namespace, inheriting the\n"
       "source dossier's display_label. Facts stay on the source --\n"
       "dossier_facts has no source-signature provenance. The source\n"
       "must retain at least one remaining signature.",
-      USERNS_GROUP_ADMIN, 100, CMD_SCOPE_ANY, METHOD_T_ANY,
-      cmd_dossier_split, NULL, "dossier", NULL,
-      ad_dossier_split,
-      (uint8_t)(sizeof(ad_dossier_split) / sizeof(ad_dossier_split[0])),
-      NULL, NULL);
+  .group       = USERNS_GROUP_ADMIN,
+  .level       = 100,
+  .scope       = CMD_SCOPE_ANY,
+  .methods     = METHOD_T_ANY,
+  .cb          = cmd_dossier_split,
+  .parent_path = "dossier",
+  .arg_desc    = ad_dossier_split,
+  .arg_count   = (uint8_t)(sizeof(ad_dossier_split)
+                 / sizeof(ad_dossier_split[0])),
+};
 
-  // /dossier fact (container)
-  cmd_register("dossier", "fact",
-      "dossier fact",
-      "Dossier-fact mutators (set, del)",
-      NULL,
-      USERNS_GROUP_ADMIN, 100, CMD_SCOPE_ANY, METHOD_T_ANY,
-      cmd_dossier_fact_root, NULL, "dossier", NULL,
-      NULL, 0, NULL, NULL);
+static const cmd_decl_t dossier_fact_decl = {
+  .module      = "dossier",
+  .name        = "fact",
+  .usage       = "dossier fact",
+  .description = "Dossier-fact mutators (set, del)",
+  .group       = USERNS_GROUP_ADMIN,
+  .level       = 100,
+  .scope       = CMD_SCOPE_ANY,
+  .methods     = METHOD_T_ANY,
+  .cb          = cmd_dossier_fact_root,
+  .parent_path = "dossier",
+};
 
-  cmd_register("dossier", "set",
-      "dossier fact set <dossier_id> <kind> <key> <value> [conf]",
-      "Admin-seed a fact on a dossier (source=admin_seed)",
+static const cmd_decl_t dossier_fact_set_decl = {
+  .module      = "dossier",
+  .name        = "set",
+  .usage       = "dossier fact set <dossier_id> <kind> <key> <value> [conf]",
+  .description = "Admin-seed a fact on a dossier (source=admin_seed)",
+  .help_long   =
       "Writes a single fact onto a dossier, bypassing the LLM\n"
       "extractor. The row is stamped source='admin_seed' and upserted\n"
       "with REPLACE merge policy, so a subsequent admin set overrides\n"
@@ -388,15 +421,24 @@ dossier_register_commands(void)
       "  /dossier fact set 42 attribute pronouns she/her\n"
       "  /dossier fact set 42 preference favorite_editor neovim 0.9\n"
       "  /dossier fact set 17 relation employer \"ACME Corp\"",
-      USERNS_GROUP_ADMIN, 100, CMD_SCOPE_ANY, METHOD_T_ANY,
-      cmd_dossier_fact_set, NULL, "dossier/fact", "s",
-      ad_dossier_fact_set,
-      (uint8_t)(sizeof(ad_dossier_fact_set) / sizeof(ad_dossier_fact_set[0])),
-      NULL, NULL);
+  .group       = USERNS_GROUP_ADMIN,
+  .level       = 100,
+  .scope       = CMD_SCOPE_ANY,
+  .methods     = METHOD_T_ANY,
+  .cb          = cmd_dossier_fact_set,
+  .parent_path = "dossier/fact",
+  .abbrev      = "s",
+  .arg_desc    = ad_dossier_fact_set,
+  .arg_count   = (uint8_t)(sizeof(ad_dossier_fact_set)
+                 / sizeof(ad_dossier_fact_set[0])),
+};
 
-  cmd_register("dossier", "del",
-      "dossier fact del <fact_id>",
-      "Delete a dossier-fact by id",
+static const cmd_decl_t dossier_fact_del_decl = {
+  .module      = "dossier",
+  .name        = "del",
+  .usage       = "dossier fact del <fact_id>",
+  .description = "Delete a dossier-fact by id",
+  .help_long   =
       "Removes a single row from dossier_facts. The id is the row's\n"
       "own primary key (NOT the dossier_id). Find it via\n"
       "/show dossier <dossier_id>, which renders each fact with its\n"
@@ -408,11 +450,30 @@ dossier_register_commands(void)
       "Examples:\n"
       "  /dossier fact del 312\n"
       "  /dossier fact del 9",
-      USERNS_GROUP_ADMIN, 100, CMD_SCOPE_PRIVATE, METHOD_T_ANY,
-      cmd_dossier_fact_del, NULL, "dossier/fact", "d",
-      ad_dossier_fact_del,
-      (uint8_t)(sizeof(ad_dossier_fact_del) / sizeof(ad_dossier_fact_del[0])),
-      NULL, NULL);
+  .group       = USERNS_GROUP_ADMIN,
+  .level       = 100,
+  .scope       = CMD_SCOPE_PRIVATE,
+  .methods     = METHOD_T_ANY,
+  .cb          = cmd_dossier_fact_del,
+  .parent_path = "dossier/fact",
+  .abbrev      = "d",
+  .arg_desc    = ad_dossier_fact_del,
+  .arg_count   = (uint8_t)(sizeof(ad_dossier_fact_del)
+                 / sizeof(ad_dossier_fact_del[0])),
+};
+
+void
+dossier_register_commands(void)
+{
+  // /dossier (container)
+  cmd_register(&dossier_decl);
+  cmd_register(&dossier_merge_decl);
+  cmd_register(&dossier_split_decl);
+
+  // /dossier fact (container)
+  cmd_register(&dossier_fact_decl);
+  cmd_register(&dossier_fact_set_decl);
+  cmd_register(&dossier_fact_del_decl);
 
   // /show dossiers + /show dossiers candidates (implemented in
   // dossier_show.c — delegated so candidates rendering stays next to

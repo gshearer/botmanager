@@ -183,6 +183,43 @@ typedef void (*cmd_cb_t)(const cmd_ctx_t *ctx);
 typedef void (*cmd_help_extender_t)(const cmd_ctx_t *ctx,
     const char *rest);
 
+// Filled in by CMD-FEAT-1; declared here so cmd_decl_t can carry the
+// field from birth.
+typedef struct cmd_feat cmd_feat_t;
+
+// Everything cmd_register needs, named. Designated-initialised at every
+// site: an omitted field is zero, which is the "not used" value for all
+// of them. Added fields therefore cost existing callers nothing — that
+// property is the whole reason this is a struct and not sixteen
+// parameters.
+//
+// The struct itself is read and finished with before cmd_register
+// returns; what it points at is not. usage, description, help_long,
+// arg_desc, kind_filter and nl are all kept by the registry, so each
+// must outlive the registration — a string literal, or static storage
+// the registrant owns.
+typedef struct
+{
+  const char           *module;       // clam context + owning plugin
+  const char           *name;
+  const char           *usage;
+  const char           *description;
+  const char           *help_long;
+  const char           *group;        // userns group, e.g. "everyone"
+  uint16_t              level;
+  cmd_scope_t           scope;
+  method_type_t         methods;      // METHOD_T_ANY, or a bitmask of types
+  cmd_cb_t              cb;
+  void                 *data;         // opaque, handed back to cb
+  const char           *parent_path;  // NULL = register at root
+  const char           *abbrev;       // NULL = no short form
+  const cmd_arg_desc_t *arg_desc;
+  uint8_t               arg_count;
+  const char *const    *kind_filter;  // NULL-terminated method kinds
+  const cmd_nl_t       *nl;           // NULL = invisible to the NL bridge
+  const cmd_feat_t     *feat;         // NULL = declares no optional feature
+} cmd_decl_t;
+
 // Register a command in the unified command tree.
 //
 // All commands — show views, set handlers, actions — use this single
@@ -202,18 +239,8 @@ typedef void (*cmd_help_extender_t)(const cmd_ctx_t *ctx,
 // kind_filter is a NULL-terminated array of *method* kind strings; a
 // verb registered under "bot" or "show/bot" is offered to a bot when
 // the filter is NULL (every bot) or names a method that bot has bound.
-// Storage is caller-owned and must be static -- the registry keeps the
-// pointer.
-// nl is an optional static caller-owned natural-language hint.
-bool cmd_register(const char *module, const char *name,
-    const char *usage, const char *description,
-    const char *help_long,
-    const char *group, uint16_t level,
-    cmd_scope_t scope, method_type_t methods, cmd_cb_t cb, void *data,
-    const char *parent_path, const char *abbrev,
-    const cmd_arg_desc_t *arg_desc, uint8_t arg_count,
-    const char *const *kind_filter,
-    const cmd_nl_t *nl);
+// nl is an optional natural-language hint.
+bool cmd_register(const cmd_decl_t *decl);
 
 // Unregister a command and its entire subtree, addressed with the same
 // slash-delimited grammar cmd_register() uses for parent_path:

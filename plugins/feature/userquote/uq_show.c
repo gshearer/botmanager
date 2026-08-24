@@ -285,19 +285,28 @@ static const cmd_nl_t uq_show_nl = {
   .example_count = (uint8_t)(sizeof(uq_show_examples) / sizeof(uq_show_examples[0])),
 };
 
+static const cmd_decl_t show_quotes_decl = {
+  .module      = "userquote",
+  .name        = "quotes",
+  .usage       = "show quotes",
+  .description = "Telemetry for this namespace's quote book.",
+  .help_long   = "Counts, the span the book covers, how much of it has never "
+                 "been recalled, and who is quoted most. Scoped to the same "
+                 "namespace `quote` recalls from.",
+  .group       = USERNS_GROUP_EVERYONE,
+  .scope       = CMD_SCOPE_ANY,
+  .methods     = METHOD_T_ANY,
+  .cb          = uq_cmd_show,
+  .parent_path = "show",
+  .abbrev      = "\"",
+  .nl          = &uq_show_nl,
+};
+
 // Abbrev `"` mirrors the root recall's, so `show "` is the whole card.
 bool
 uq_show_register(void)
 {
-  return(cmd_register("userquote", "quotes",
-        "show quotes",
-        "Telemetry for this namespace's quote book.",
-        "Counts, the span the book covers, how much of it has never "
-        "been recalled, and who is quoted most. Scoped to the same "
-        "namespace `quote` recalls from.",
-        USERNS_GROUP_EVERYONE, 0, CMD_SCOPE_ANY, METHOD_T_ANY,
-        uq_cmd_show, NULL, "show", "\"",
-        NULL, 0, NULL, &uq_show_nl));
+  return(cmd_register(&show_quotes_decl));
 }
 
 void

@@ -644,19 +644,27 @@ memory_verb_embedbackfill(const cmd_ctx_t *ctx)
   cmd_reply(ctx, buf);
 }
 
+static const cmd_decl_t bot_embedbackfill_decl = {
+  .module      = "memory",
+  .name        = "embedbackfill",
+  .usage       = "bot <name> embedbackfill",
+  .description = "Embed conversation-log rows the live path never got to",
+  .group       = USERNS_GROUP_ADMIN,
+  .level       = 100,
+  .scope       = CMD_SCOPE_ANY,
+  .methods     = METHOD_T_ANY,
+  .cb          = memory_verb_embedbackfill,
+  .parent_path = "bot",
+  .abbrev      = "ebf",
+};
+
 // Kind-agnostic (kind_filter NULL): a kind_filter names method kinds,
 // and embedding the conversation log is the mind's work, not any one
 // method's.
 bool
 memory_backfill_cmd_register(void)
 {
-  if(cmd_register("memory", "embedbackfill",
-        "bot <name> embedbackfill",
-        "Embed conversation-log rows the live path never got to",
-        NULL,
-        USERNS_GROUP_ADMIN, 100, CMD_SCOPE_ANY, METHOD_T_ANY,
-        memory_verb_embedbackfill, NULL, "bot", "ebf",
-        NULL, 0, NULL, NULL) != SUCCESS)
+  if(cmd_register(&bot_embedbackfill_decl) != SUCCESS)
     return(FAIL);
 
   return(SUCCESS);

@@ -2741,5 +2741,5 @@ bot_get_handle(const bot_inst_t *inst)
 // The per-kind verb registries (bot_show_verb_* and bot_verb_*) have
 // been removed; verbs are now children of "show/bot" and "bot" in the
 // unified command tree, filtered by a per-command kind_filter. See
-// cmd_register(, NULL)'s kind_filter parameter and core/bot_cmd.c's
+// cmd_decl_t.kind_filter and core/bot_cmd.c's
 // help_ext_* + cmd_show_bot / admin_cmd_bot dispatchers.

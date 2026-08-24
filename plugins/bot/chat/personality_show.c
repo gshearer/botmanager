@@ -80,18 +80,25 @@ cmd_show_personalities(const cmd_ctx_t *ctx)
   }
 }
 
+static const cmd_decl_t show_personalities_decl = {
+  .module      = "chat",
+  .name        = "personalities",
+  .usage       = "show personalities",
+  .description = "List personality files in bot.chat.personalitypath",
+  .help_long   = "Lists every *.txt file in the configured personalitypath,\n"
+                 "parsing each file's frontmatter for name, version, and\n"
+                 "description. Personalities with parse errors are shown in\n"
+                 "red with the error message. No file bodies are read.",
+  .group       = USERNS_GROUP_ADMIN,
+  .level       = 100,
+  .scope       = CMD_SCOPE_ANY,
+  .methods     = METHOD_T_ANY,
+  .cb          = cmd_show_personalities,
+  .parent_path = "show",
+};
+
 bool
 chatbot_personality_show_register(void)
 {
-  return(cmd_register("chat", "personalities",
-      "show personalities",
-      "List personality files in bot.chat.personalitypath",
-      "Lists every *.txt file in the configured personalitypath,\n"
-      "parsing each file's frontmatter for name, version, and\n"
-      "description. Personalities with parse errors are shown in\n"
-      "red with the error message. No file bodies are read.",
-      USERNS_GROUP_ADMIN, 100, CMD_SCOPE_ANY, METHOD_T_ANY,
-      cmd_show_personalities, NULL, "show", NULL,
-      NULL, 0,
-      NULL, NULL));
+  return(cmd_register(&show_personalities_decl));
 }

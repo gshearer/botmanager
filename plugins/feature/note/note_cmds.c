@@ -212,20 +212,30 @@ static const cmd_nl_t note_nl = {
   .example_count = (uint8_t)(sizeof(note_examples) / sizeof(note_examples[0])),
 };
 
+static const cmd_decl_t note_decl = {
+  .module      = "note",
+  .name        = "note",
+  .usage       = "note <user> <message>",
+  .description = "Leave a message for another user, delivered when they're"
+                 " next seen.",
+  .help_long   =
+      "The recipient must be a user of this namespace and must have been "
+      "idle longer than plugin.note.min_idle_secs — if they were just "
+      "here, tell them yourself. The note is announced wherever they next "
+      "speak, addressed to them, then marked delivered.",
+  .group       = USERNS_GROUP_USER,
+  .scope       = CMD_SCOPE_ANY,
+  .methods     = METHOD_T_ANY,
+  .cb          = note_cmd_leave,
+  .arg_desc    = note_args,
+  .arg_count   = (uint8_t)(sizeof(note_args) / sizeof(note_args[0])),
+  .nl          = &note_nl,
+};
+
 bool
 note_commands_register(void)
 {
-  if(cmd_register("note", "note",
-        "note <user> <message>",
-        "Leave a message for another user, delivered when they're next seen.",
-        "The recipient must be a user of this namespace and must have been "
-        "idle longer than plugin.note.min_idle_secs — if they were just "
-        "here, tell them yourself. The note is announced wherever they next "
-        "speak, addressed to them, then marked delivered.",
-        USERNS_GROUP_USER, 0, CMD_SCOPE_ANY, METHOD_T_ANY,
-        note_cmd_leave, NULL, NULL, NULL,
-        note_args, (uint8_t)(sizeof(note_args) / sizeof(note_args[0])),
-        NULL, &note_nl) != SUCCESS)
+  if(cmd_register(&note_decl) != SUCCESS)
     return(FAIL);
 
   return(SUCCESS);

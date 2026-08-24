@@ -539,12 +539,12 @@ cmd_set_bot(const cmd_ctx_t *ctx)
 
 // Registration
 
-void
-cmd_set_register(void)
-{
-  cmd_register("cmd", "kv",
-      "set kv <key> <value> | set kv --clear|--delete <key>",
-      "Set a configuration value",
+static const cmd_decl_t set_kv_decl = {
+  .module      = "cmd",
+  .name        = "kv",
+  .usage       = "set kv <key> <value> | set kv --clear|--delete <key>",
+  .description = "Set a configuration value",
+  .help_long   =
       "--clear empties a STR key — the empty value `set kv` could not\n"
       "otherwise express, since a bare key fails arg parsing and \"\" is\n"
       "stored as two literal quote characters. Refused on every other\n"
@@ -568,13 +568,23 @@ cmd_set_register(void)
       "Examples:\n"
       "  set kv --clear plugin.urlgrabber.crawler_agent\n"
       "  set kv --delete plugin.tmdb.language",
-      USERNS_GROUP_ADMIN, 100, CMD_SCOPE_ANY, METHOD_T_ANY,
-      cmd_set_kv, NULL, "set", NULL, ad_set_kv, 2, NULL, NULL);
+  .group       = USERNS_GROUP_ADMIN,
+  .level       = 100,
+  .scope       = CMD_SCOPE_ANY,
+  .methods     = METHOD_T_ANY,
+  .cb          = cmd_set_kv,
+  .parent_path = "set",
+  .arg_desc    = ad_set_kv,
+  .arg_count   = 2,
+};
 
-  cmd_register("cmd", "bot",
-      "set bot <bot> [<method>] <key> <value> | "
-      "set bot <bot> --clear|--delete [<method>] <key>",
-      "Set a per-bot configuration value (sugar over set kv)",
+static const cmd_decl_t set_bot_decl = {
+  .module      = "cmd",
+  .name        = "bot",
+  .usage       = "set bot <bot> [<method>] <key> <value> | "
+                 "set bot <bot> --clear|--delete [<method>] <key>",
+  .description = "Set a per-bot configuration value (sugar over set kv)",
+  .help_long   =
       "Builds the namespaced KV path for a bot. Three-arg form writes\n"
       "bot.<bot>.<key>; four-arg form writes bot.<bot>.<method>.<key>\n"
       "and requires <method> to name a method the bot has bound. Which\n"
@@ -592,7 +602,19 @@ cmd_set_register(void)
       "  set bot mini reachy attention.mode name\n"
       "  set bot mini --clear behavior.aka\n"
       "  set bot mini --delete reachy tts_voice",
-      USERNS_GROUP_ADMIN, 100, CMD_SCOPE_ANY, METHOD_T_ANY,
-      cmd_set_bot, NULL, "set", NULL, ad_set_bot,
-      (uint8_t)(sizeof(ad_set_bot) / sizeof(ad_set_bot[0])), NULL, NULL);
+  .group       = USERNS_GROUP_ADMIN,
+  .level       = 100,
+  .scope       = CMD_SCOPE_ANY,
+  .methods     = METHOD_T_ANY,
+  .cb          = cmd_set_bot,
+  .parent_path = "set",
+  .arg_desc    = ad_set_bot,
+  .arg_count   = (uint8_t)(sizeof(ad_set_bot) / sizeof(ad_set_bot[0])),
+};
+
+void
+cmd_set_register(void)
+{
+  cmd_register(&set_kv_decl);
+  cmd_register(&set_bot_decl);
 }

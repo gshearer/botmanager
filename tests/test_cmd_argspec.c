@@ -151,6 +151,32 @@ run_parse_cases(void)
   }
 }
 
+static const cmd_decl_t targspecpair_decl = {
+  .module      = "test",
+  .name        = "targspecpair",
+  .usage       = "targspecpair <first> [second]",
+  .description = "argspec probe",
+  .group       = USERNS_GROUP_EVERYONE,
+  .scope       = CMD_SCOPE_ANY,
+  .methods     = METHOD_T_ANY,
+  .cb          = record_cmd,
+  .arg_desc    = ad_pair,
+  .arg_count   = 2,
+};
+
+static const cmd_decl_t targspecrest_decl = {
+  .module      = "test",
+  .name        = "targspecrest",
+  .usage       = "targspecrest <line>",
+  .description = "argspec probe",
+  .group       = USERNS_GROUP_EVERYONE,
+  .scope       = CMD_SCOPE_ANY,
+  .methods     = METHOD_T_ANY,
+  .cb          = record_cmd,
+  .arg_desc    = ad_rest,
+  .arg_count   = 1,
+};
+
 int
 main(void)
 {
@@ -158,20 +184,24 @@ main(void)
   clam_init();
   cmd_init();
 
-  cmd_register("test", "targspecpair", "targspecpair <first> [second]",
-      "argspec probe", NULL, USERNS_GROUP_EVERYONE, 0, CMD_SCOPE_ANY,
-      METHOD_T_ANY, record_cmd, NULL, NULL, NULL, ad_pair, 2, NULL, NULL);
-
-  cmd_register("test", "targspecrest", "targspecrest <line>",
-      "argspec probe", NULL, USERNS_GROUP_EVERYONE, 0, CMD_SCOPE_ANY,
-      METHOD_T_ANY, record_cmd, NULL, NULL, NULL, ad_rest, 1, NULL, NULL);
+  cmd_register(&targspecpair_decl);
+  cmd_register(&targspecrest_decl);
 
   for(size_t i = 0; i < sizeof(maxlen_cases) / sizeof(maxlen_cases[0]); i++)
   {
-    bool got = cmd_register("test", maxlen_cases[i].cmd,
-        maxlen_cases[i].cmd, "argspec probe", NULL,
-        USERNS_GROUP_EVERYONE, 0, CMD_SCOPE_ANY, METHOD_T_ANY,
-        noop_cmd, NULL, NULL, NULL, maxlen_cases[i].desc, 1, NULL, NULL);
+    const cmd_decl_t decl = {
+      .module      = "test",
+      .name        = maxlen_cases[i].cmd,
+      .usage       = maxlen_cases[i].cmd,
+      .description = "argspec probe",
+      .group       = USERNS_GROUP_EVERYONE,
+      .scope       = CMD_SCOPE_ANY,
+      .methods     = METHOD_T_ANY,
+      .cb          = noop_cmd,
+      .arg_desc    = maxlen_cases[i].desc,
+      .arg_count   = 1,
+    };
+    bool got = cmd_register(&decl);
 
     test_check_bool(SUITE, maxlen_cases[i].name,
         maxlen_cases[i].want, got);

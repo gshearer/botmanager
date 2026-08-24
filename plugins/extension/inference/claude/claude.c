@@ -1081,13 +1081,12 @@ release:
 // Plugin lifecycle                                                    //
 // ------------------------------------------------------------------ //
 
-static bool
-claude_init(void)
-{
-  int64_t ts;
-  if(cmd_register(CLAUDE_CTX, CLAUDE_CTX,
-      "claude [--model <name>] [--effort <level>] <prompt>",
-      "Run the claude CLI with <prompt>, reply with its stdout",
+static const cmd_decl_t cmd_decl = {
+  .module      = CLAUDE_CTX,
+  .name        = CLAUDE_CTX,
+  .usage       = "claude [--model <name>] [--effort <level>] <prompt>",
+  .description = "Run the claude CLI with <prompt>, reply with its stdout",
+  .help_long   =
       "Owner-only bridge to the claude CLI. The prompt is prefixed"
       " by the preamble at plugin.claude.preamble_path (default:"
       " prompts/claude_builtin.txt in the project root) and passed as"
@@ -1110,21 +1109,36 @@ claude_init(void)
       "\n"
       "Configuration lives under plugin.claude.*. See"
       " plugins/extension/inference/claude/AGENTS.md.",
-      USERNS_GROUP_OWNER, USERNS_OWNER_LEVEL,
-      CMD_SCOPE_ANY, METHOD_T_ANY,
-      claude_cmd, NULL,
-      NULL, NULL,
-      claude_cmd_args,
-      sizeof(claude_cmd_args) / sizeof(claude_cmd_args[0]),
-      NULL, NULL) != SUCCESS)
+  .group       = USERNS_GROUP_OWNER,
+  .level       = USERNS_OWNER_LEVEL,
+  .scope       = CMD_SCOPE_ANY,
+  .methods     = METHOD_T_ANY,
+  .cb          = claude_cmd,
+  .arg_desc    = claude_cmd_args,
+  .arg_count   = sizeof(claude_cmd_args) / sizeof(claude_cmd_args[0]),
+};
+
+static const cmd_decl_t show_cmd_decl = {
+  .module      = CLAUDE_CTX,
+  .name        = CLAUDE_CTX,
+  .usage       = "show claude",
+  .description = "List known --model names and --effort levels for /claude",
+  .group       = USERNS_GROUP_OWNER,
+  .level       = USERNS_OWNER_LEVEL,
+  .scope       = CMD_SCOPE_ANY,
+  .methods     = METHOD_T_ANY,
+  .cb          = claude_show_cmd,
+  .parent_path = "show",
+};
+
+static bool
+claude_init(void)
+{
+  int64_t ts;
+  if(cmd_register(&cmd_decl) != SUCCESS)
     return(FAIL);
 
-  if(cmd_register(CLAUDE_CTX, CLAUDE_CTX, "show claude",
-      "List known --model names and --effort levels for /claude", NULL,
-      USERNS_GROUP_OWNER, USERNS_OWNER_LEVEL,
-      CMD_SCOPE_ANY, METHOD_T_ANY,
-      claude_show_cmd, NULL,
-      "show", NULL, NULL, 0, NULL, NULL) != SUCCESS)
+  if(cmd_register(&show_cmd_decl) != SUCCESS)
   {
     cmd_unregister_path(CLAUDE_CTX);
     return(FAIL);

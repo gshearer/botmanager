@@ -630,72 +630,110 @@ wm_strategy_parent_cb(const cmd_ctx_t *ctx)
 // Registration                                                            //
 // ----------------------------------------------------------------------- //
 
+static const cmd_decl_t whenmoon_strategy_decl = {
+  .module      = "whenmoon",
+  .name        = "strategy",
+  .usage       = "whenmoon strategy <verb> ...",
+  .description = "Trading-strategy registry controls.",
+  .help_long   = "Subcommands: attach <market_id> <name>,"
+                 " detach <market_id> <name>,"
+                 " reload <name>.",
+  .group       = USERNS_GROUP_ADMIN,
+  .level       = 100,
+  .scope       = CMD_SCOPE_ANY,
+  .methods     = METHOD_T_ANY,
+  .cb          = wm_strategy_parent_cb,
+  .parent_path = "whenmoon",
+};
+
+static const cmd_decl_t whenmoon_strategy_attach_decl = {
+  .module      = "whenmoon",
+  .name        = "attach",
+  .usage       = "whenmoon strategy attach <market_id> <strategy_name>",
+  .description = "Attach a strategy to a running market."
+                 " Registers per-attachment KV override slots at"
+                 " plugin.whenmoon.market.<id>.strategy.<name>.<param>"
+                 " and runs the strategy's init() callback. Strategy must"
+                 " already be loaded (visible via /show whenmoon strategy)."
+                 " A market holds exactly one strategy (WM-MI-3) — attaching"
+                 " to an occupied market fails; detach first.",
+  .group       = USERNS_GROUP_ADMIN,
+  .level       = 100,
+  .scope       = CMD_SCOPE_ANY,
+  .methods     = METHOD_T_ANY,
+  .cb          = wm_strategy_cmd_attach,
+  .parent_path = "whenmoon/strategy",
+};
+
+static const cmd_decl_t whenmoon_strategy_detach_decl = {
+  .module      = "whenmoon",
+  .name        = "detach",
+  .usage       = "whenmoon strategy detach <market_id> <strategy_name>",
+  .description =
+      "Detach a strategy from a running market."
+      " Calls the strategy's finalize() and frees the per-attachment"
+      " context. KV override slots persist for inspection.",
+  .group       = USERNS_GROUP_ADMIN,
+  .level       = 100,
+  .scope       = CMD_SCOPE_ANY,
+  .methods     = METHOD_T_ANY,
+  .cb          = wm_strategy_cmd_detach,
+  .parent_path = "whenmoon/strategy",
+};
+
+static const cmd_decl_t whenmoon_strategy_reload_decl = {
+  .module      = "whenmoon",
+  .name        = "reload",
+  .usage       = "whenmoon strategy reload <strategy_name>",
+  .description = "Detach all attachments, dlclose the strategy plugin,"
+                 " dlopen it (picks up a fresh build), re-init, and re-attach"
+                 " the captured attachments automatically (WM-RELOAD-1); the"
+                 " reply carries detached/reattached counts and misses are"
+                 " logged.",
+  .group       = USERNS_GROUP_ADMIN,
+  .level       = 100,
+  .scope       = CMD_SCOPE_ANY,
+  .methods     = METHOD_T_ANY,
+  .cb          = wm_strategy_cmd_reload,
+  .parent_path = "whenmoon/strategy",
+};
+
+static const cmd_decl_t show_whenmoon_strategy_decl = {
+  .module      = "whenmoon",
+  .name        = "strategy",
+  .usage       = "show whenmoon strategy [<name>]",
+  .description = "List loaded strategies (no arg) or show details for one.",
+  .help_long   = "With no argument: one-line per loaded strategy with name,"
+                 " version, grains_mask, param count, and live attachment"
+                 " count.\n"
+                 "With a name: full meta + param schema + per-attachment"
+                 " bars_seen / signals_emitted / last_signal.",
+  .group       = USERNS_GROUP_ADMIN,
+  .level       = 100,
+  .scope       = CMD_SCOPE_ANY,
+  .methods     = METHOD_T_ANY,
+  .cb          = wm_strategy_cmd_show,
+  .parent_path = "show/whenmoon",
+};
+
 bool
 wm_strategy_register_verbs(void)
 {
   // /whenmoon strategy parent.
-  if(cmd_register("whenmoon", "strategy",
-        "whenmoon strategy <verb> ...",
-        "Trading-strategy registry controls.",
-        "Subcommands: attach <market_id> <name>,"
-        " detach <market_id> <name>,"
-        " reload <name>.",
-        USERNS_GROUP_ADMIN, 100, CMD_SCOPE_ANY, METHOD_T_ANY,
-        wm_strategy_parent_cb, NULL, "whenmoon", NULL,
-        NULL, 0, NULL, NULL) != SUCCESS)
+  if(cmd_register(&whenmoon_strategy_decl) != SUCCESS)
     return(FAIL);
 
-  if(cmd_register("whenmoon", "attach",
-        "whenmoon strategy attach <market_id> <strategy_name>",
-        "Attach a strategy to a running market."
-        " Registers per-attachment KV override slots at"
-        " plugin.whenmoon.market.<id>.strategy.<name>.<param>"
-        " and runs the strategy's init() callback. Strategy must"
-        " already be loaded (visible via /show whenmoon strategy)."
-        " A market holds exactly one strategy (WM-MI-3) — attaching"
-        " to an occupied market fails; detach first.",
-        NULL,
-        USERNS_GROUP_ADMIN, 100, CMD_SCOPE_ANY, METHOD_T_ANY,
-        wm_strategy_cmd_attach, NULL, "whenmoon/strategy", NULL,
-        NULL, 0, NULL, NULL) != SUCCESS)
+  if(cmd_register(&whenmoon_strategy_attach_decl) != SUCCESS)
     return(FAIL);
 
-  if(cmd_register("whenmoon", "detach",
-        "whenmoon strategy detach <market_id> <strategy_name>",
-        "Detach a strategy from a running market."
-        " Calls the strategy's finalize() and frees the per-attachment"
-        " context. KV override slots persist for inspection.",
-        NULL,
-        USERNS_GROUP_ADMIN, 100, CMD_SCOPE_ANY, METHOD_T_ANY,
-        wm_strategy_cmd_detach, NULL, "whenmoon/strategy", NULL,
-        NULL, 0, NULL, NULL) != SUCCESS)
+  if(cmd_register(&whenmoon_strategy_detach_decl) != SUCCESS)
     return(FAIL);
 
-  if(cmd_register("whenmoon", "reload",
-        "whenmoon strategy reload <strategy_name>",
-        "Detach all attachments, dlclose the strategy plugin,"
-        " dlopen it (picks up a fresh build), re-init, and re-attach"
-        " the captured attachments automatically (WM-RELOAD-1); the"
-        " reply carries detached/reattached counts and misses are"
-        " logged.",
-        NULL,
-        USERNS_GROUP_ADMIN, 100, CMD_SCOPE_ANY, METHOD_T_ANY,
-        wm_strategy_cmd_reload, NULL, "whenmoon/strategy", NULL,
-        NULL, 0, NULL, NULL) != SUCCESS)
+  if(cmd_register(&whenmoon_strategy_reload_decl) != SUCCESS)
     return(FAIL);
 
   // /show whenmoon strategy
-  if(cmd_register("whenmoon", "strategy",
-        "show whenmoon strategy [<name>]",
-        "List loaded strategies (no arg) or show details for one.",
-        "With no argument: one-line per loaded strategy with name,"
-        " version, grains_mask, param count, and live attachment"
-        " count.\n"
-        "With a name: full meta + param schema + per-attachment"
-        " bars_seen / signals_emitted / last_signal.",
-        USERNS_GROUP_ADMIN, 100, CMD_SCOPE_ANY, METHOD_T_ANY,
-        wm_strategy_cmd_show, NULL, "show/whenmoon", NULL,
-        NULL, 0, NULL, NULL) != SUCCESS)
+  if(cmd_register(&show_whenmoon_strategy_decl) != SUCCESS)
     return(FAIL);
 
   return(SUCCESS);

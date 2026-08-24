@@ -1145,193 +1145,406 @@ cmd_set_user_groupdesc(const cmd_ctx_t *ctx)
 
 // Registration
 
-void
-userns_register_commands(void)
-{
-  cmd_register("userns", "user",
-      "user <subcommand> ...",
-      "User and group management",
+static const cmd_decl_t user_decl = {
+  .module      = "userns",
+  .name        = "user",
+  .usage       = "user <subcommand> ...",
+  .description = "User and group management",
+  .help_long   =
       "Manages namespaces, users, groups, MFA patterns, and permissions.\n"
       "Set the working namespace with user cd <namespace>.\n"
       "Subcommands: cd addns delns add del password addmfa delmfa\n"
       "autoidentify addgroup delgroup grant revoke",
-      USERNS_GROUP_ADMIN, 100, CMD_SCOPE_ANY, METHOD_T_ANY,
-      cmd_user_parent, NULL, NULL, "u", NULL, 0, NULL, NULL);
+  .group       = USERNS_GROUP_ADMIN,
+  .level       = 100,
+  .scope       = CMD_SCOPE_ANY,
+  .methods     = METHOD_T_ANY,
+  .cb          = cmd_user_parent,
+  .abbrev      = "u",
+};
 
-  // Children of /user.
-  cmd_register("userns", "cd",
-      "user cd <namespace>",
-      "Set working namespace",
-      NULL,
-      USERNS_GROUP_ADMIN, 100, CMD_SCOPE_ANY, METHOD_T_ANY,
-      cmd_user_cd, NULL, "user", NULL, ad_user_cd, 1, NULL, NULL);
+static const cmd_decl_t user_cd_decl = {
+  .module      = "userns",
+  .name        = "cd",
+  .usage       = "user cd <namespace>",
+  .description = "Set working namespace",
+  .group       = USERNS_GROUP_ADMIN,
+  .level       = 100,
+  .scope       = CMD_SCOPE_ANY,
+  .methods     = METHOD_T_ANY,
+  .cb          = cmd_user_cd,
+  .parent_path = "user",
+  .arg_desc    = ad_user_cd,
+  .arg_count   = 1,
+};
 
-  cmd_register("userns", "addns",
-      "user addns <namespace>",
-      "Create a user namespace",
+static const cmd_decl_t user_addns_decl = {
+  .module      = "userns",
+  .name        = "addns",
+  .usage       = "user addns <namespace>",
+  .description = "Create a user namespace",
+  .help_long   =
       "Creates a new user namespace with the given name. The namespace\n"
       "is seeded with built-in groups (owner, admin, user, everyone)\n"
       "and the @owner user.",
-      USERNS_GROUP_ADMIN, 100, CMD_SCOPE_ANY, METHOD_T_ANY,
-      cmd_user_addns, NULL, "user", NULL, ad_user_addns, 1, NULL, NULL);
+  .group       = USERNS_GROUP_ADMIN,
+  .level       = 100,
+  .scope       = CMD_SCOPE_ANY,
+  .methods     = METHOD_T_ANY,
+  .cb          = cmd_user_addns,
+  .parent_path = "user",
+  .arg_desc    = ad_user_addns,
+  .arg_count   = 1,
+};
 
-  cmd_register("userns", "delns",
-      "user delns <namespace>",
-      "Delete a user namespace",
-      "Deletes a user namespace and all its users, groups, and\n"
-      "memberships. Any bots bound to this namespace will have\n"
-      "their binding cleared.",
-      USERNS_GROUP_ADMIN, 100, CMD_SCOPE_ANY, METHOD_T_ANY,
-      cmd_user_delns, NULL, "user", NULL, ad_user_delns, 1, NULL, NULL);
+static const cmd_decl_t user_delns_decl = {
+  .module      = "userns",
+  .name        = "delns",
+  .usage       = "user delns <namespace>",
+  .description = "Delete a user namespace",
+  .help_long   = "Deletes a user namespace and all its users, groups, and\n"
+                 "memberships. Any bots bound to this namespace will have\n"
+                 "their binding cleared.",
+  .group       = USERNS_GROUP_ADMIN,
+  .level       = 100,
+  .scope       = CMD_SCOPE_ANY,
+  .methods     = METHOD_T_ANY,
+  .cb          = cmd_user_delns,
+  .parent_path = "user",
+  .arg_desc    = ad_user_delns,
+  .arg_count   = 1,
+};
 
-  cmd_register("userns", "add",
-      "user add <username> <password>",
-      "Create a user",
+static const cmd_decl_t user_add_decl = {
+  .module      = "userns",
+  .name        = "add",
+  .usage       = "user add <username> <password>",
+  .description = "Create a user",
+  .help_long   =
       "Creates a new user in the working namespace. The password\n"
       "must meet the password policy (length, uppercase, lowercase,\n"
       "digit, and symbol). The user is automatically added to the\n"
       "everyone and user groups at level 0.",
-      USERNS_GROUP_ADMIN, 100, CMD_SCOPE_ANY, METHOD_T_ANY,
-      cmd_user_add, NULL, "user", NULL, ad_user_add, 2, NULL, NULL);
+  .group       = USERNS_GROUP_ADMIN,
+  .level       = 100,
+  .scope       = CMD_SCOPE_ANY,
+  .methods     = METHOD_T_ANY,
+  .cb          = cmd_user_add,
+  .parent_path = "user",
+  .arg_desc    = ad_user_add,
+  .arg_count   = 2,
+};
 
-  cmd_register("userns", "del",
-      "user del <username>",
-      "Delete a user",
+static const cmd_decl_t user_del_decl = {
+  .module      = "userns",
+  .name        = "del",
+  .usage       = "user del <username>",
+  .description = "Delete a user",
+  .help_long   =
       "Deletes a user and all their group memberships. This action\n"
       "cannot be undone.",
-      USERNS_GROUP_ADMIN, 100, CMD_SCOPE_ANY, METHOD_T_ANY,
-      cmd_user_del, NULL, "user", NULL, ad_user_del, 1, NULL, NULL);
+  .group       = USERNS_GROUP_ADMIN,
+  .level       = 100,
+  .scope       = CMD_SCOPE_ANY,
+  .methods     = METHOD_T_ANY,
+  .cb          = cmd_user_del,
+  .parent_path = "user",
+  .arg_desc    = ad_user_del,
+  .arg_count   = 1,
+};
 
-  // Self-service. Every other /user child is admin-gated; permission is
-  // checked on the resolved leaf, not the parent chain, so an ordinary
-  // user reaches this one and nothing else under /user.
-  cmd_register("userns", "password",
-      "user password <oldpassword> <newpassword>",
-      "Change your own password",
+static const cmd_decl_t user_password_decl = {
+  .module      = "userns",
+  .name        = "password",
+  .usage       = "user password <oldpassword> <newpassword>",
+  .description = "Change your own password",
+  .help_long   =
       "Changes the password of the currently authenticated user. The\n"
       "current password must be supplied and verify, and the new one\n"
       "must meet the password policy. Private messages only, since\n"
       "both passwords appear in the command line.",
-      USERNS_GROUP_USER, 0, CMD_SCOPE_PRIVATE, METHOD_T_ANY,
-      cmd_user_password, NULL, "user", NULL, ad_user_password, 2, NULL, NULL);
+  .group       = USERNS_GROUP_USER,
+  .scope       = CMD_SCOPE_PRIVATE,
+  .methods     = METHOD_T_ANY,
+  .cb          = cmd_user_password,
+  .parent_path = "user",
+  .arg_desc    = ad_user_password,
+  .arg_count   = 2,
+};
 
-  cmd_register("userns", "addmfa",
-      "user addmfa <username> <pattern>",
-      "Add an MFA pattern for a user",
-      "Adds an MFA pattern for the specified user. Pattern must\n"
-      "be in handle!username@hostname format with glob (* and ?)\n"
-      "supported in handle and hostname. Security constraints:\n"
-      "at least 3 non-glob handle chars and 6 non-glob hostname\n"
-      "chars. Regular expressions are not supported.",
-      USERNS_GROUP_ADMIN, 100, CMD_SCOPE_ANY, METHOD_T_ANY,
-      cmd_user_addmfa, NULL, "user", NULL, ad_user_addmfa, 2, NULL, NULL);
+static const cmd_decl_t user_addmfa_decl = {
+  .module      = "userns",
+  .name        = "addmfa",
+  .usage       = "user addmfa <username> <pattern>",
+  .description = "Add an MFA pattern for a user",
+  .help_long   = "Adds an MFA pattern for the specified user. Pattern must\n"
+                 "be in handle!username@hostname format with glob (* and ?)\n"
+                 "supported in handle and hostname. Security constraints:\n"
+                 "at least 3 non-glob handle chars and 6 non-glob hostname\n"
+                 "chars. Regular expressions are not supported.",
+  .group       = USERNS_GROUP_ADMIN,
+  .level       = 100,
+  .scope       = CMD_SCOPE_ANY,
+  .methods     = METHOD_T_ANY,
+  .cb          = cmd_user_addmfa,
+  .parent_path = "user",
+  .arg_desc    = ad_user_addmfa,
+  .arg_count   = 2,
+};
 
-  cmd_register("userns", "delmfa",
-      "user delmfa <username> <pattern>",
-      "Remove an MFA pattern from a user",
-      NULL,
-      USERNS_GROUP_ADMIN, 100, CMD_SCOPE_ANY, METHOD_T_ANY,
-      cmd_user_delmfa, NULL, "user", NULL, ad_user_delmfa, 2, NULL, NULL);
+static const cmd_decl_t user_delmfa_decl = {
+  .module      = "userns",
+  .name        = "delmfa",
+  .usage       = "user delmfa <username> <pattern>",
+  .description = "Remove an MFA pattern from a user",
+  .group       = USERNS_GROUP_ADMIN,
+  .level       = 100,
+  .scope       = CMD_SCOPE_ANY,
+  .methods     = METHOD_T_ANY,
+  .cb          = cmd_user_delmfa,
+  .parent_path = "user",
+  .arg_desc    = ad_user_delmfa,
+  .arg_count   = 2,
+};
 
-  cmd_register("userns", "autoidentify",
-      "user autoidentify <username> <on|off>",
-      "Enable or disable autoidentify for a user",
+static const cmd_decl_t user_autoidentify_decl = {
+  .module      = "userns",
+  .name        = "autoidentify",
+  .usage       = "user autoidentify <username> <on|off>",
+  .description = "Enable or disable autoidentify for a user",
+  .help_long   =
       "When autoidentify is enabled, the bot automatically creates\n"
       "an authenticated session for a user whose MFA pattern matches\n"
       "an incoming message, without requiring `identify`.",
-      USERNS_GROUP_ADMIN, 100, CMD_SCOPE_ANY, METHOD_T_ANY,
-      cmd_user_autoidentify, NULL, "user", "ai", ad_user_autoidentify, 2, NULL, NULL);
+  .group       = USERNS_GROUP_ADMIN,
+  .level       = 100,
+  .scope       = CMD_SCOPE_ANY,
+  .methods     = METHOD_T_ANY,
+  .cb          = cmd_user_autoidentify,
+  .parent_path = "user",
+  .abbrev      = "ai",
+  .arg_desc    = ad_user_autoidentify,
+  .arg_count   = 2,
+};
 
-  cmd_register("userns", "addgroup",
-      "user addgroup <name> <description>",
-      "Create a group",
-      "Creates a new group in the working namespace with the\n"
-      "given name and description.",
-      USERNS_GROUP_ADMIN, 100, CMD_SCOPE_ANY, METHOD_T_ANY,
-      cmd_user_addgroup, NULL, "user", "ag", ad_user_addgroup, 2, NULL, NULL);
+static const cmd_decl_t user_addgroup_decl = {
+  .module      = "userns",
+  .name        = "addgroup",
+  .usage       = "user addgroup <name> <description>",
+  .description = "Create a group",
+  .help_long   = "Creates a new group in the working namespace with the\n"
+                 "given name and description.",
+  .group       = USERNS_GROUP_ADMIN,
+  .level       = 100,
+  .scope       = CMD_SCOPE_ANY,
+  .methods     = METHOD_T_ANY,
+  .cb          = cmd_user_addgroup,
+  .parent_path = "user",
+  .abbrev      = "ag",
+  .arg_desc    = ad_user_addgroup,
+  .arg_count   = 2,
+};
 
-  cmd_register("userns", "delgroup",
-      "user delgroup <name>",
-      "Delete a group",
-      "Deletes a group and all its memberships. Built-in groups\n"
-      "(owner, admin, user, everyone) cannot be deleted.",
-      USERNS_GROUP_ADMIN, 100, CMD_SCOPE_ANY, METHOD_T_ANY,
-      cmd_user_delgroup, NULL, "user", "dg", ad_user_delgroup, 1, NULL, NULL);
+static const cmd_decl_t user_delgroup_decl = {
+  .module      = "userns",
+  .name        = "delgroup",
+  .usage       = "user delgroup <name>",
+  .description = "Delete a group",
+  .help_long   = "Deletes a group and all its memberships. Built-in groups\n"
+                 "(owner, admin, user, everyone) cannot be deleted.",
+  .group       = USERNS_GROUP_ADMIN,
+  .level       = 100,
+  .scope       = CMD_SCOPE_ANY,
+  .methods     = METHOD_T_ANY,
+  .cb          = cmd_user_delgroup,
+  .parent_path = "user",
+  .abbrev      = "dg",
+  .arg_desc    = ad_user_delgroup,
+  .arg_count   = 1,
+};
 
-  cmd_register("userns", "grant",
-      "user grant <username> <group> <level>",
-      "Grant group membership",
-      "Adds a user to a group with the specified privilege level\n"
-      "(0-65535). If already a member, updates the level.",
-      USERNS_GROUP_ADMIN, 100, CMD_SCOPE_ANY, METHOD_T_ANY,
-      cmd_user_grant, NULL, "user", "gr", ad_user_grant, 3, NULL, NULL);
+static const cmd_decl_t user_grant_decl = {
+  .module      = "userns",
+  .name        = "grant",
+  .usage       = "user grant <username> <group> <level>",
+  .description = "Grant group membership",
+  .help_long   = "Adds a user to a group with the specified privilege level\n"
+                 "(0-65535). If already a member, updates the level.",
+  .group       = USERNS_GROUP_ADMIN,
+  .level       = 100,
+  .scope       = CMD_SCOPE_ANY,
+  .methods     = METHOD_T_ANY,
+  .cb          = cmd_user_grant,
+  .parent_path = "user",
+  .abbrev      = "gr",
+  .arg_desc    = ad_user_grant,
+  .arg_count   = 3,
+};
 
-  cmd_register("userns", "revoke",
-      "user revoke <username> <group>",
-      "Revoke group membership",
-      "Removes a user from a group.",
-      USERNS_GROUP_ADMIN, 100, CMD_SCOPE_ANY, METHOD_T_ANY,
-      cmd_user_revoke, NULL, "user", "re", ad_user_revoke, 2, NULL, NULL);
+static const cmd_decl_t user_revoke_decl = {
+  .module      = "userns",
+  .name        = "revoke",
+  .usage       = "user revoke <username> <group>",
+  .description = "Revoke group membership",
+  .help_long   = "Removes a user from a group.",
+  .group       = USERNS_GROUP_ADMIN,
+  .level       = 100,
+  .scope       = CMD_SCOPE_ANY,
+  .methods     = METHOD_T_ANY,
+  .cb          = cmd_user_revoke,
+  .parent_path = "user",
+  .abbrev      = "re",
+  .arg_desc    = ad_user_revoke,
+  .arg_count   = 2,
+};
 
-  // /show users — table of all users in the working namespace.
-  cmd_register("userns", "users",
-      "show users",
-      "List users in the working namespace",
-      "Renders a colorized table of every user in the working\n"
-      "namespace with their last-seen time and description.",
-      USERNS_GROUP_ADMIN, 100, CMD_SCOPE_ANY, METHOD_T_ANY,
-      cmd_show_users, NULL, "show", "us", NULL, 0, NULL, NULL);
+static const cmd_decl_t show_users_decl = {
+  .module      = "userns",
+  .name        = "users",
+  .usage       = "show users",
+  .description = "List users in the working namespace",
+  .help_long   = "Renders a colorized table of every user in the working\n"
+                 "namespace with their last-seen time and description.",
+  .group       = USERNS_GROUP_ADMIN,
+  .level       = 100,
+  .scope       = CMD_SCOPE_ANY,
+  .methods     = METHOD_T_ANY,
+  .cb          = cmd_show_users,
+  .parent_path = "show",
+  .abbrev      = "us",
+};
 
-  // /show user <name> — single-user detail.
-  cmd_register("userns", "user",
-      "show user <username>",
-      "Show user details",
+static const cmd_decl_t show_user_decl = {
+  .module      = "userns",
+  .name        = "user",
+  .usage       = "show user <username>",
+  .description = "Show user details",
+  .help_long   =
       "With <username>, displays UUID, description, group memberships,\n"
       "and MFA patterns. For the namespace-wide user list, use\n"
       "/show users. This is the auth record only — for the facts and\n"
       "conversation the bot has accumulated, use show dossier <name>.",
-      USERNS_GROUP_ADMIN, 100, CMD_SCOPE_ANY, METHOD_T_ANY,
-      cmd_show_user, NULL, "show", "u", ad_show_user,
-      (uint8_t)(sizeof(ad_show_user) / sizeof(ad_show_user[0])), NULL, NULL);
+  .group       = USERNS_GROUP_ADMIN,
+  .level       = 100,
+  .scope       = CMD_SCOPE_ANY,
+  .methods     = METHOD_T_ANY,
+  .cb          = cmd_show_user,
+  .parent_path = "show",
+  .abbrev      = "u",
+  .arg_desc    = ad_show_user,
+  .arg_count   = (uint8_t)(sizeof(ad_show_user) / sizeof(ad_show_user[0])),
+};
 
-  cmd_register("userns", "userns",
-      "show userns",
-      "List all namespaces",
-      "Lists all defined user namespaces.",
-      USERNS_GROUP_ADMIN, 100, CMD_SCOPE_ANY, METHOD_T_ANY,
-      cmd_show_userns, NULL, "show", "ns", NULL, 0, NULL, NULL);
+static const cmd_decl_t show_userns_decl = {
+  .module      = "userns",
+  .name        = "userns",
+  .usage       = "show userns",
+  .description = "List all namespaces",
+  .help_long   = "Lists all defined user namespaces.",
+  .group       = USERNS_GROUP_ADMIN,
+  .level       = 100,
+  .scope       = CMD_SCOPE_ANY,
+  .methods     = METHOD_T_ANY,
+  .cb          = cmd_show_userns,
+  .parent_path = "show",
+  .abbrev      = "ns",
+};
 
-  cmd_register("userns", "group",
-      "show group [name]",
-      "List groups or show group members",
-      "Without arguments, lists all groups. With a group name,\n"
-      "shows the members and their privilege levels.",
-      USERNS_GROUP_ADMIN, 100, CMD_SCOPE_ANY, METHOD_T_ANY,
-      cmd_show_group, NULL, "show", "gr", ad_show_group, 1, NULL, NULL);
+static const cmd_decl_t show_group_decl = {
+  .module      = "userns",
+  .name        = "group",
+  .usage       = "show group [name]",
+  .description = "List groups or show group members",
+  .help_long   = "Without arguments, lists all groups. With a group name,\n"
+                 "shows the members and their privilege levels.",
+  .group       = USERNS_GROUP_ADMIN,
+  .level       = 100,
+  .scope       = CMD_SCOPE_ANY,
+  .methods     = METHOD_T_ANY,
+  .cb          = cmd_show_group,
+  .parent_path = "show",
+  .abbrev      = "gr",
+  .arg_desc    = ad_show_group,
+  .arg_count   = 1,
+};
 
-  // /set user — administrative user settings. Unlike the rest of the
-  // tree this command carries its own arguments as well as a child:
-  // `set user <username> pass <password>` puts a variable in the slot
-  // where the resolver looks for a subcommand, so anything that is not
-  // the literal "groupdesc" falls through to the argument parser.
-  cmd_register("userns", "user",
-      "set user <username> pass <password>",
-      "Set a user's password",
+static const cmd_decl_t set_user_decl = {
+  .module      = "userns",
+  .name        = "user",
+  .usage       = "set user <username> pass <password>",
+  .description = "Set a user's password",
+  .help_long   =
       "Resets another user's password without their old password, on\n"
       "the authority of your admin rights. Use this to recover an\n"
       "account whose holder is locked out; users change their own\n"
       "password with user password. Private messages only — the new\n"
       "password appears on the command line.\n"
       "Subcommand: groupdesc",
-      USERNS_GROUP_ADMIN, 100, CMD_SCOPE_ANY, METHOD_T_ANY,
-      cmd_set_user, NULL, "set", "u", ad_set_user, 3, NULL, NULL);
+  .group       = USERNS_GROUP_ADMIN,
+  .level       = 100,
+  .scope       = CMD_SCOPE_ANY,
+  .methods     = METHOD_T_ANY,
+  .cb          = cmd_set_user,
+  .parent_path = "set",
+  .abbrev      = "u",
+  .arg_desc    = ad_set_user,
+  .arg_count   = 3,
+};
 
-  cmd_register("userns", "groupdesc",
-      "set user groupdesc <group> <description>",
-      "Set a group's description",
-      "Updates the description for an existing group in the\n"
-      "working namespace.",
-      USERNS_GROUP_ADMIN, 100, CMD_SCOPE_ANY, METHOD_T_ANY,
-      cmd_set_user_groupdesc, NULL, "set/user", NULL,
-      ad_set_user_groupdesc, 2, NULL, NULL);
+static const cmd_decl_t set_user_groupdesc_decl = {
+  .module      = "userns",
+  .name        = "groupdesc",
+  .usage       = "set user groupdesc <group> <description>",
+  .description = "Set a group's description",
+  .help_long   = "Updates the description for an existing group in the\n"
+                 "working namespace.",
+  .group       = USERNS_GROUP_ADMIN,
+  .level       = 100,
+  .scope       = CMD_SCOPE_ANY,
+  .methods     = METHOD_T_ANY,
+  .cb          = cmd_set_user_groupdesc,
+  .parent_path = "set/user",
+  .arg_desc    = ad_set_user_groupdesc,
+  .arg_count   = 2,
+};
+
+void
+userns_register_commands(void)
+{
+  cmd_register(&user_decl);
+
+  // Children of /user.
+  cmd_register(&user_cd_decl);
+  cmd_register(&user_addns_decl);
+  cmd_register(&user_delns_decl);
+  cmd_register(&user_add_decl);
+  cmd_register(&user_del_decl);
+
+  // Self-service. Every other /user child is admin-gated; permission is
+  // checked on the resolved leaf, not the parent chain, so an ordinary
+  // user reaches this one and nothing else under /user.
+  cmd_register(&user_password_decl);
+  cmd_register(&user_addmfa_decl);
+  cmd_register(&user_delmfa_decl);
+  cmd_register(&user_autoidentify_decl);
+  cmd_register(&user_addgroup_decl);
+  cmd_register(&user_delgroup_decl);
+  cmd_register(&user_grant_decl);
+  cmd_register(&user_revoke_decl);
+
+  // /show users — table of all users in the working namespace.
+  cmd_register(&show_users_decl);
+
+  // /show user <name> — single-user detail.
+  cmd_register(&show_user_decl);
+  cmd_register(&show_userns_decl);
+  cmd_register(&show_group_decl);
+
+  // /set user — administrative user settings. Unlike the rest of the
+  // tree this command carries its own arguments as well as a child:
+  // `set user <username> pass <password>` puts a variable in the slot
+  // where the resolver looks for a subcommand, so anything that is not
+  // the literal "groupdesc" falls through to the argument parser.
+  cmd_register(&set_user_decl);
+  cmd_register(&set_user_groupdesc_decl);
 }

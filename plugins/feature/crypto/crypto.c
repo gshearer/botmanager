@@ -1541,14 +1541,15 @@ static const cmd_nl_t crypto_nl = {
 
 // Plugin lifecycle
 
-static bool
-crypto_init(void)
-{
-  if(cmd_register(CRYPTO_CTX, "crypto",
+static const cmd_decl_t crypto_decl = {
+  .module      = CRYPTO_CTX,
+  .name        = "crypto",
+  .usage       =
       "crypto [options] [@list|symbol|rank|range…] | crypto --verbose <symbol>"
       " | crypto --mcap | crypto --list"
       " | crypto --add|--del <list> <symbols…>",
-      "Show cryptocurrency market data from CoinMarketCap",
+  .description = "Show cryptocurrency market data from CoinMarketCap",
+  .help_long   =
       "Quote coins by symbol, rank or range, or a saved list with @name. "
       "--verbose (-v) gives one coin the full card: price history, "
       "supply, tags, the chains it is deployed on and its links. "
@@ -1558,9 +1559,18 @@ crypto_init(void)
       "--del removes symbols (a list disappears when its last symbol "
       "does). Lists are private to your namespace and holding or "
       "changing one requires a known user.",
-      "everyone", 0, CMD_SCOPE_ANY, METHOD_T_ANY,
-      crypto_cmd_crypto, NULL, NULL, "c",
-      NULL, 0, NULL, &crypto_nl) != SUCCESS)
+  .group       = "everyone",
+  .scope       = CMD_SCOPE_ANY,
+  .methods     = METHOD_T_ANY,
+  .cb          = crypto_cmd_crypto,
+  .abbrev      = "c",
+  .nl          = &crypto_nl,
+};
+
+static bool
+crypto_init(void)
+{
+  if(cmd_register(&crypto_decl) != SUCCESS)
     return(FAIL);
 
   clam(CLAM_INFO, CRYPTO_CTX, "crypto command plugin initialized");

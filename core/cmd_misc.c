@@ -31,13 +31,21 @@ static const cmd_arg_desc_t ad_ping[] = {
 
 // Registration
 
+static const cmd_decl_t ping_decl = {
+  .module      = "cmd",
+  .name        = "ping",
+  .usage       = "ping [args]",
+  .description = "Reply with PONG, echoing any arguments",
+  .group       = USERNS_GROUP_EVERYONE,
+  .scope       = CMD_SCOPE_ANY,
+  .methods     = METHOD_T_ANY,
+  .cb          = cmd_ping,
+  .arg_desc    = ad_ping,
+  .arg_count   = 1,
+};
+
 void
 cmd_misc_register(void)
 {
-  cmd_register("cmd", "ping",
-      "ping [args]",
-      "Reply with PONG, echoing any arguments",
-      NULL,
-      USERNS_GROUP_EVERYONE, 0, CMD_SCOPE_ANY, METHOD_T_ANY,
-      cmd_ping, NULL, NULL, NULL, ad_ping, 1, NULL, NULL);
+  cmd_register(&ping_decl);
 }

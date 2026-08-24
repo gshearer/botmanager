@@ -79,18 +79,26 @@ cmd_show_contracts(const cmd_ctx_t *ctx)
   }
 }
 
-bool
-chatbot_contract_show_register(void)
-{
-  return(cmd_register("chat", "contracts",
-      "show contracts",
-      "List output contract files in bot.chat.contractpath",
+static const cmd_decl_t show_contracts_decl = {
+  .module      = "chat",
+  .name        = "contracts",
+  .usage       = "show contracts",
+  .description = "List output contract files in bot.chat.contractpath",
+  .help_long   =
       "Lists every *.txt file in the configured contractpath,\n"
       "parsing each file's frontmatter for name and description.\n"
       "Contracts with parse errors are shown in red with the error\n"
       "message. No file bodies are read.",
-      USERNS_GROUP_ADMIN, 100, CMD_SCOPE_ANY, METHOD_T_ANY,
-      cmd_show_contracts, NULL, "show", NULL,
-      NULL, 0,
-      NULL, NULL));
+  .group       = USERNS_GROUP_ADMIN,
+  .level       = 100,
+  .scope       = CMD_SCOPE_ANY,
+  .methods     = METHOD_T_ANY,
+  .cb          = cmd_show_contracts,
+  .parent_path = "show",
+};
+
+bool
+chatbot_contract_show_register(void)
+{
+  return(cmd_register(&show_contracts_decl));
 }
