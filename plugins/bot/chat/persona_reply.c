@@ -64,16 +64,31 @@ typedef struct
   char             plain[PERSONA_REPLY_LINE_SZ];
 } persona_req_t;
 
+// The one delivery path. A persona body teaches "/me ", so the model
+// writes emotes here exactly as it does in conversation — and this slot
+// hands its line to method_send directly rather than through the reply
+// pipeline, which is where the framing used to be applied. Untranslated
+// it reached the channel as the literal four characters.
 static void
 persona_req_send(persona_req_t *r, const char *line)
 {
   method_inst_t *inst = method_find(r->to.inst_name);
+  size_t         emote_off;
 
   // The instance the command was run on may have been reloaded away
   // while the model was thinking; there is then nowhere to answer, and
   // no second address to guess at (OBS-29).
   if(inst != NULL)
-    method_send(inst, verb_reply_to_addr(&r->to), line);
+  {
+    emote_off = chatbot_emote_prefix_len(line);
+
+    if(emote_off != 0)
+      method_send_emote(inst, verb_reply_to_addr(&r->to),
+          line + emote_off);
+
+    else
+      method_send(inst, verb_reply_to_addr(&r->to), line);
+  }
 
   chatbot_hold_unlink(&r->hold);
   mem_free(r);

@@ -1229,6 +1229,26 @@ anti_repeat_blocks_line(const chatbot_req_t *r, const char *line)
   return(false);
 }
 
+// Which of the two emote spellings the model used, if either. The rule
+// itself is documented at CHATBOT_EMOTE_PREFIX; what belongs here is
+// why it is a function: persona_reply.c puts a model's line on the wire
+// too, and a second copy of the compare would drift the day a third
+// spelling shows up.
+size_t
+chatbot_emote_prefix_len(const char *line)
+{
+  if(strncmp(line, CHATBOT_EMOTE_PREFIX, CHATBOT_EMOTE_PREFIX_LEN) == 0
+      && line[CHATBOT_EMOTE_PREFIX_LEN] != '\0')
+    return(CHATBOT_EMOTE_PREFIX_LEN);
+
+  if(strncasecmp(line, CHATBOT_ACTION_PREFIX,
+        CHATBOT_ACTION_PREFIX_LEN) == 0
+      && line[CHATBOT_ACTION_PREFIX_LEN] != '\0')
+    return(CHATBOT_ACTION_PREFIX_LEN);
+
+  return(0);
+}
+
 // Rewrite the typeable markup a model can actually produce (`**bold**`,
 // `<red>…</red>`) into the abstract colour markers method_send resolves
 // per driver, then hand the line over. Translating here rather than
@@ -1320,24 +1340,17 @@ send_reply_line(chatbot_req_t *r, const char *line)
   if(anti_repeat_blocks_line(r, line))
     return;
 
-  if(strncmp(line, "/me ", 4) == 0 && line[4] != '\0')
+  // CV-5 — "/me catches it", or the bare CTCP verb some models reach
+  // for instead; either way the channel gets a framed action.
   {
-    r->nonskip_lines_sent++;
-    send_line_marked(r, line + 4, true);
-    return;
-  }
+    size_t emote_off = chatbot_emote_prefix_len(line);
 
-  // CV-5 — Some LLMs emit the CTCP verb ("ACTION catches it") when
-  // they mean "/me catches it". Accept the bare verb as an alias so
-  // the channel sees a properly-framed emote instead of a literal
-  // "ACTION ..." PRIVMSG.
-  if(strncasecmp(line, CHATBOT_ACTION_PREFIX,
-        CHATBOT_ACTION_PREFIX_LEN) == 0 &&
-     line[CHATBOT_ACTION_PREFIX_LEN] != '\0')
-  {
-    r->nonskip_lines_sent++;
-    send_line_marked(r, line + CHATBOT_ACTION_PREFIX_LEN, true);
-    return;
+    if(emote_off != 0)
+    {
+      r->nonskip_lines_sent++;
+      send_line_marked(r, line + emote_off, true);
+      return;
+    }
   }
 
   // Slash-command suppression. The LLM is instructed to emit slash

@@ -746,6 +746,13 @@ void chatbot_reply_submit_vision(chatbot_state_t *st,
     const method_msg_t *msg, const char *source_url,
     char *image_b64, const char *image_mime);
 
+// Non-zero when `line` is an action rather than speech, and then the
+// offset of the action text within it (see CHATBOT_EMOTE_PREFIX).
+// Every path that puts a model's line on the wire asks here -- the
+// streaming pipeline and persona_reply.c's one-shot flourish -- so the
+// two spellings are recognised in one place. `line` must be non-NULL.
+size_t chatbot_emote_prefix_len(const char *line);
+
 // Compile the image-intent regex used by the reply pipeline (I3).
 // Called once from chatbot_plugin_init; safe to call repeatedly (noops
 // if already compiled). Returns SUCCESS or FAIL on regex compile error.
@@ -828,11 +835,16 @@ bool chatbot_floor_take(chatbot_floor_t *f, const char *channel, time_t now,
 // SKIPs several direct lines in a row. Silence is the lesser evil.
 #define CHATBOT_CV4_FALLBACK_COOLDOWN_SECS 90
 
-// Some LLMs emit the raw CTCP verb ("ACTION catches it") when they mean
-// "/me catches it". Accept the bare verb as an alias so the channel
-// sees a properly-framed emote instead of a literal "ACTION ..."
-// PRIVMSG. Keep the prefix and its length together so the strncasecmp
-// site and the `line + N` bump stay in sync.
+// The two spellings of "this line is an action, not speech". "/me " is
+// the IRC convention the capability block teaches; the bare CTCP verb
+// is what a model hands back when it skips past the convention to the
+// wire format, and it is accepted as an alias so the channel sees a
+// properly-framed emote rather than a literal "ACTION ..." PRIVMSG.
+// Keep each prefix beside its length so the compare and the `line + N`
+// bump stay in sync; chatbot_emote_prefix_len matches both and is the
+// only place either is spelled out.
+#define CHATBOT_EMOTE_PREFIX               "/me "
+#define CHATBOT_EMOTE_PREFIX_LEN           4
 #define CHATBOT_ACTION_PREFIX              "ACTION "
 #define CHATBOT_ACTION_PREFIX_LEN          7
 
