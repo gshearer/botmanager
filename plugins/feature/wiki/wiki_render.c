@@ -680,12 +680,23 @@ void
 wiki_render_status(const cmd_ctx_t *ctx, wm_status_t status,
     const char *message, const char *what)
 {
-  char line[WIKI_TEXT_SZ];
+  char     line[WIKI_TEXT_SZ];
+  uint32_t wait;
 
   switch(status)
   {
     case WM_NOT_FOUND:
       snprintf(line, sizeof(line), "Nothing on Wikidata for %s.", what);
+      break;
+
+    // The one refusal that comes with a number, so it is the one that
+    // can tell whoever asked when to come back. wm_retry_after() is a
+    // live remainder and can already have run out; a floor of one second
+    // keeps that from rendering as "in 0s".
+    case WM_RATE_LIMITED:
+      wait = wm_retry_after();
+      snprintf(line, sizeof(line), "Wikimedia is rate-limiting us — ask "
+          "about %s again in %us.", what, wait > 0 ? wait : 1u);
       break;
 
     case WM_UNAVAILABLE:

@@ -17,6 +17,7 @@
 
 #include "wikimedia.h"
 
+#include <errno.h>
 #include <pthread.h>
 #include <stdatomic.h>
 #include <time.h>
@@ -183,6 +184,17 @@ typedef struct
 
 // Module state
 
+// The Wikimedia backoff, as a CLOCK_MONOTONIC second at which it lifts;
+// 0 means none is armed. Written by whichever curl worker sees a 429 and
+// read by every entry point, so it is atomic and never takes a lock —
+// the read sits on the hot path of every call.
+//
+// ⚠ It lives in the mapping, so a plugin reload forgets it. That is
+// accepted: a reload is operator-driven and rare, and persisting a
+// fifteen-second timer through the database would cost more than the
+// handful of requests it saves.
+static atomic_int_least64_t wm_backoff_until;
+
 // Every request this plugin puts on the wire, so wm_stop() can cancel
 // them and wait out their callbacks before wm_deinit() destroys what
 // those callbacks touch (PLUGIN.md §Lifecycle Contract).
@@ -218,6 +230,13 @@ static const plugin_kv_entry_t wm_kv_schema[] = {
   { "plugin.wikimedia.cache_ttl",  KV_UINT32, "86400",
     "Resolution / menu / property-word cache TTL (seconds). Entities are "
     "near-static; 0 disables caching.", NULL, NULL },
+  { "plugin.wikimedia.backoff",    KV_UINT32, "15",
+    "Seconds to stand down for when Wikimedia rate-limits us and sends no "
+    "usable Retry-After. Their own header wins where they send one.",
+    NULL, NULL },
+  { "plugin.wikimedia.backoff_max", KV_UINT32, "300",
+    "Ceiling on any single backoff (seconds). A Retry-After longer than "
+    "this is honoured only up to here.", NULL, NULL },
   { "plugin.wikimedia.user_agent", KV_STR, WM_UA_DEFAULT,
     "User-Agent sent to Wikimedia. Their etiquette policy asks for a "
     "descriptive one naming the project and a contact address.",
@@ -233,6 +252,10 @@ static bool         wm_launch(wm_work_t *w, uint8_t slot, const char *url,
                         curl_done_cb_t cb, void *user);
 static struct json_object *wm_body(const curl_response_t *resp,
                         wm_status_t *status, char *msg, size_t msg_cap);
+
+static int64_t      wm_mono(void);
+static void         wm_backoff_arm(const curl_response_t *resp);
+static async_rc_t   wm_backoff_refuse(wm_verb_t verb, wm_cb_u cb, void *user);
 
 static bool         wm_resolve_cache_get(const char *key, wm_resolve_res_t *out,
                         time_t now, uint32_t ttl);
@@ -253,6 +276,7 @@ static wm_work_t   *wm_work_open(wm_verb_t verb, void *user);
 static void         wm_work_finish(wm_work_t *w);
 static void         wm_work_fail(wm_work_t *w, wm_status_t status,
                         const char *msg);
+static void         wm_work_fail_wire(wm_work_t *w, const char *msg);
 static void         wm_work_abandon(wm_work_t *w);
 static void         wm_leg_retire(wm_work_t *w);
 

@@ -42,6 +42,10 @@ wm_get(const char *url, curl_done_cb_t cb, void *user)
   curl_request_set_user_agent(cr, kv_get_str("plugin.wikimedia.user_agent"));
   curl_request_add_header(cr, "Accept: application/json");
 
+  // The only header worth a capture slot here: it is how a refusal says
+  // how long to stand down for, and wm_backoff_arm() is guessing without it.
+  curl_request_capture_header(cr, "Retry-After");
+
   to = (uint32_t)kv_get_uint("plugin.wikimedia.timeout");
 
   if(to > 0)
@@ -61,6 +65,12 @@ wm_launch(wm_work_t *w, uint8_t slot, const char *url, curl_done_cb_t cb,
 {
   curl_request_t *cr;
 
+  // The choke point every leg passes through, so this is where the
+  // backoff is actually kept: a chain admitted before the window opened
+  // does not get to spend the rest of its legs inside it.
+  if(wm_retry_after() > 0)
+    return(FAIL);
+
   if(w->slot[slot] == 0
       && curl_flight_open(&wm_flight, &w->slot[slot]) != SUCCESS)
     return(FAIL);
@@ -71,6 +81,92 @@ wm_launch(wm_work_t *w, uint8_t slot, const char *url, curl_done_cb_t cb,
     return(FAIL);
 
   return(curl_flight_relay(&wm_flight, cr, &w->slot[slot]));
+}
+
+// ----------------------------------------------------------------------
+// The backoff — Wikimedia's Retry-After, honoured
+// ----------------------------------------------------------------------
+
+static int64_t
+wm_mono(void)
+{
+  struct timespec ts;
+
+  clock_gettime(CLOCK_MONOTONIC, &ts);
+  return((int64_t)ts.tv_sec);
+}
+
+uint32_t
+wm_retry_after(void)
+{
+  int64_t until = atomic_load(&wm_backoff_until);
+  int64_t now   = wm_mono();
+
+  return(until > now ? (uint32_t)(until - now) : 0);
+}
+
+// Arm the backoff off a refusal that has just come back. Their
+// Retry-After wins where it is the plain delta-seconds form; the
+// HTTP-date form the RFC also permits has never been seen from these
+// hosts, and falls back to the configured default rather than earning a
+// date parser.
+//
+// An armed backoff is only ever extended, never shortened: several
+// workers can be holding refusals from the same window, and one that
+// lands late with a smaller remainder must not cut the earlier one short.
+static void
+wm_backoff_arm(const curl_response_t *resp)
+{
+  const char *hdr  = curl_response_header(resp, "Retry-After");
+  uint32_t    cap  = (uint32_t)kv_get_uint("plugin.wikimedia.backoff_max");
+  int64_t     secs = (int64_t)kv_get_uint("plugin.wikimedia.backoff");
+  int64_t     want;
+  int64_t     seen;
+
+  if(hdr != NULL)
+  {
+    char *end = NULL;
+    long  v;
+
+    errno = 0;
+    v     = strtol(hdr, &end, 10);
+
+    if(errno == 0 && end != hdr && v > 0)
+      secs = (int64_t)v;
+  }
+
+  if(secs < 1)
+    secs = 1;
+
+  if(cap > 0 && secs > (int64_t)cap)
+    secs = (int64_t)cap;
+
+  want = wm_mono() + secs;
+  seen = atomic_load(&wm_backoff_until);
+
+  // compare_exchange reloads `seen` on failure, so the guard re-reads.
+  while(seen < want
+      && !atomic_compare_exchange_weak(&wm_backoff_until, &seen, want))
+    ;
+
+  clam(CLAM_WARN, WIKIMEDIA_CTX,
+      "wikimedia is rate-limiting us; standing down for %llds",
+      (long long)secs);
+}
+
+// Refuse a call outright because the backoff is armed. The caller's
+// callback runs with WM_RATE_LIMITED before this returns and nothing
+// reaches the wire, which is the whole point of honouring a Retry-After
+// — a request sent inside the window earns a longer one.
+static async_rc_t
+wm_backoff_refuse(wm_verb_t verb, wm_cb_u cb, void *user)
+{
+  wm_work_t *w = wm_work_open(verb, user);
+
+  w->cb = cb;
+  wm_work_fail(w, WM_RATE_LIMITED, "wikimedia is rate-limiting us");
+
+  return(ASYNC_AIRBORNE);
 }
 
 // ----------------------------------------------------------------------
@@ -111,6 +207,19 @@ wm_body(const curl_response_t *resp, wm_status_t *status, char *msg,
   if(resp->status == 404)
   {
     *status = WM_NOT_FOUND;
+    return(NULL);
+  }
+
+  // Their edge refuses with 429 and x-envoy-ratelimited, and a 503 under
+  // load carries the same Retry-After. A 503 without one is an outage
+  // rather than a limit, and stays an ordinary transport failure.
+  if(resp->status == 429
+      || (resp->status == 503
+          && curl_response_header(resp, "Retry-After") != NULL))
+  {
+    *status = WM_RATE_LIMITED;
+    wm_backoff_arm(resp);
+    snprintf(msg, msg_cap, "wikimedia is rate-limiting us");
     return(NULL);
   }
 
@@ -505,6 +614,9 @@ wm_work_finish(wm_work_t *w)
     curl_flight_close(&wm_flight, slot[i]);
 }
 
+// Terminal: this delivers the failure and frees `w`. Nothing may touch
+// the work afterwards, and in particular nothing may follow it with a
+// wm_work_finish() — that reads a freed work and delivers a second time.
 static void
 wm_work_fail(wm_work_t *w, wm_status_t status, const char *msg)
 {
@@ -547,6 +659,16 @@ wm_work_fail(wm_work_t *w, wm_status_t status, const char *msg)
   }
 
   wm_work_finish(w);
+}
+
+// Terminal, and the shape every "the wire gave us nothing" site wants:
+// while a backoff is armed, that IS the reason nothing came back, and a
+// leg refused locally is indistinguishable from a leg nobody answered.
+// Only one of the two statuses can tell whoever asked when to come back.
+static void
+wm_work_fail_wire(wm_work_t *w, const char *msg)
+{
+  wm_work_fail(w, wm_retry_after() > 0 ? WM_RATE_LIMITED : WM_TRANSPORT, msg);
 }
 
 // A pre-flight refusal: nothing is airborne, nobody has been told, and
@@ -759,7 +881,7 @@ wm_resolve_merge(wm_work_t *w)
     if(w->u.resolve.reached)
       wm_work_fail(w, WM_NOT_FOUND, "");
     else
-      wm_work_fail(w, WM_TRANSPORT, "neither wikidata searcher answered");
+      wm_work_fail_wire(w, "neither wikidata searcher answered");
 
     return;
   }
@@ -771,7 +893,7 @@ wm_resolve_merge(wm_work_t *w)
   res->n = n;
 
   if(wm_window_fetch(w, 2) != SUCCESS)
-    wm_work_fail(w, WM_TRANSPORT, "could not weigh the candidate window");
+    wm_work_fail_wire(w, "could not weigh the candidate window");
 }
 
 // Leg (c): label, description, article title and sitelink count for the
@@ -919,7 +1041,7 @@ wm_claims_dispatch(wm_work_t *w)
 
   if(launched == 0)
   {
-    wm_work_fail(w, WM_TRANSPORT, "could not query wikidata");
+    wm_work_fail_wire(w, "could not query wikidata");
     return;
   }
 
@@ -1126,7 +1248,7 @@ wm_claims_choose(wm_work_t *w)
     if(reached)
       wm_work_fail(w, WM_NOT_FOUND, "");
     else
-      wm_work_fail(w, WM_TRANSPORT, "wikidata did not answer");
+      wm_work_fail_wire(w, "wikidata did not answer");
 
     return;
   }
@@ -1234,7 +1356,7 @@ wm_menu_props_done(const curl_response_t *resp)
 
   if(need < 0 || (size_t)need >= sizeof(url)
       || wm_launch(w, 0, url, wm_menu_meta_done, w) != SUCCESS)
-    wm_work_fail(w, WM_TRANSPORT, "could not read the property menu");
+    wm_work_fail_wire(w, "could not read the property menu");
 }
 
 static void
@@ -1378,7 +1500,7 @@ wm_prose_sitelink_done(const curl_response_t *resp)
   }
 
   if(wm_prose_fetch(w, title) != SUCCESS)
-    wm_work_fail(w, WM_TRANSPORT, "could not fetch the article");
+    wm_work_fail_wire(w, "could not fetch the article");
 }
 
 static void
@@ -1500,7 +1622,7 @@ wm_facts_p31_done(const curl_response_t *resp)
   strlcpy(res->class_qid, w->u.facts.class[0], sizeof(res->class_qid));
 
   if(wm_facts_menu_next(w) != SUCCESS)
-    wm_work_fail(w, WM_TRANSPORT, "could not read the property menu");
+    wm_work_fail_wire(w, "could not read the property menu");
 }
 
 static bool
@@ -1535,7 +1657,7 @@ wm_facts_menu_done(const wm_menu_res_t *menu, void *user)
   else if(++w->u.facts.at_class < w->u.facts.n_class)
   {
     if(wm_facts_menu_next(w) != SUCCESS)
-      wm_work_fail(w, WM_TRANSPORT, "could not read the property menu");
+      wm_work_fail_wire(w, "could not read the property menu");
 
     return;
   }
@@ -1547,7 +1669,7 @@ wm_facts_menu_done(const wm_menu_res_t *menu, void *user)
 
   if(need < 0 || (size_t)need >= sizeof(url)
       || wm_launch(w, 1, url, wm_facts_claims_done, w) != SUCCESS)
-    wm_work_fail(w, WM_TRANSPORT, "could not read the item");
+    wm_work_fail_wire(w, "could not read the item");
 }
 
 static void
@@ -1679,7 +1801,7 @@ wm_reverse_dispatch(wm_work_t *w)
 
   if(launched == 0)
   {
-    wm_work_fail(w, WM_TRANSPORT, "could not query wikidata");
+    wm_work_fail_wire(w, "could not query wikidata");
     return;
   }
 
@@ -1765,7 +1887,7 @@ wm_reverse_choose(wm_work_t *w)
     if(w->u.reverse.reached)
       wm_work_fail(w, WM_NOT_FOUND, "");
     else
-      wm_work_fail(w, WM_TRANSPORT, "wikidata did not answer");
+      wm_work_fail_wire(w, "wikidata did not answer");
 
     return;
   }
@@ -1779,7 +1901,7 @@ wm_reverse_choose(wm_work_t *w)
   res->total = w->u.reverse.total[pick];
 
   if(wm_window_fetch(w, 3) != SUCCESS)
-    wm_work_fail(w, WM_TRANSPORT, "could not weigh the matches");
+    wm_work_fail_wire(w, "could not weigh the matches");
 }
 
 // ----------------------------------------------------------------------
@@ -1805,6 +1927,10 @@ wm_resolve_async(const char *name, wm_resolve_cb_t cb, void *user)
 
   if(key[0] == '\0' || wm_urlencode(key, enc, sizeof(enc)) >= sizeof(enc))
     return(ASYNC_FAILED_UNDELIVERED);
+
+  if(wm_retry_after() > 0)
+    return(wm_backoff_refuse(WM_VERB_RESOLVE,
+        (wm_cb_u){ .resolve = cb }, user));
 
   ttl = (uint32_t)kv_get_uint("plugin.wikimedia.cache_ttl");
 
@@ -1875,6 +2001,10 @@ wm_claims_async(const char *qid, const char *property, wm_claims_cb_t cb,
   if(word[0] == '\0')
     return(ASYNC_FAILED_UNDELIVERED);
 
+  if(wm_retry_after() > 0)
+    return(wm_backoff_refuse(WM_VERB_CLAIMS,
+        (wm_cb_u){ .claims = cb }, user));
+
   w = wm_work_open(WM_VERB_CLAIMS, user);
   w->cb.claims = cb;
   strlcpy(w->u.claims.word, word, sizeof(w->u.claims.word));
@@ -1910,6 +2040,9 @@ wm_menu_async(const char *class_qid, wm_menu_cb_t cb, void *user)
 
   if(cb == NULL || !wm_is_qid(class_qid, 'Q'))
     return(ASYNC_FAILED_UNDELIVERED);
+
+  if(wm_retry_after() > 0)
+    return(wm_backoff_refuse(WM_VERB_MENU, (wm_cb_u){ .menu = cb }, user));
 
   wm_qid_norm(class_qid, id, sizeof(id));
   ttl = (uint32_t)kv_get_uint("plugin.wikimedia.cache_ttl");
@@ -1952,6 +2085,9 @@ wm_prose_async(const char *title, bool full, wm_prose_cb_t cb, void *user)
 
   if(cb == NULL || title == NULL || title[0] == '\0')
     return(ASYNC_FAILED_UNDELIVERED);
+
+  if(wm_retry_after() > 0)
+    return(wm_backoff_refuse(WM_VERB_PROSE, (wm_cb_u){ .prose = cb }, user));
 
   w = wm_work_open(WM_VERB_PROSE, user);
   w->cb.prose    = cb;
@@ -2000,6 +2136,10 @@ wm_property_async(const char *word, wm_property_cb_t cb, void *user)
   if(norm[0] == '\0')
     return(ASYNC_FAILED_UNDELIVERED);
 
+  if(wm_retry_after() > 0)
+    return(wm_backoff_refuse(WM_VERB_PROPERTY,
+        (wm_cb_u){ .property = cb }, user));
+
   w = wm_work_open(WM_VERB_PROPERTY, user);
   w->cb.property = cb;
   strlcpy(w->u.property.word, norm, sizeof(w->u.property.word));
@@ -2036,6 +2176,10 @@ wm_facts_async(const char *qid, wm_facts_cb_t cb, void *user)
   if(cb == NULL || !wm_is_qid(qid, 'Q'))
     return(ASYNC_FAILED_UNDELIVERED);
 
+  if(wm_retry_after() > 0)
+    return(wm_backoff_refuse(WM_VERB_FACTS,
+        (wm_cb_u){ .facts = cb }, user));
+
   w = wm_work_open(WM_VERB_FACTS, user);
   w->cb.facts = cb;
   wm_qid_norm(qid, w->u.facts.res.qid, WM_QID_SZ);
@@ -2069,6 +2213,10 @@ wm_reverse_async(const char *property, const char *value_qid,
   if(word[0] == '\0')
     return(ASYNC_FAILED_UNDELIVERED);
 
+  if(wm_retry_after() > 0)
+    return(wm_backoff_refuse(WM_VERB_REVERSE,
+        (wm_cb_u){ .resolve = cb }, user));
+
   w = wm_work_open(WM_VERB_REVERSE, user);
   w->cb.resolve = cb;
   strlcpy(w->u.reverse.word, word, sizeof(w->u.reverse.word));
@@ -2100,6 +2248,7 @@ wm_init(void)
 {
   pthread_mutex_init(&wm_cache_mu, NULL);
   curl_flight_init(&wm_flight);
+  atomic_init(&wm_backoff_until, 0);
   memset(wm_resolve_cache, 0, sizeof(wm_resolve_cache));
   memset(wm_menu_cache, 0, sizeof(wm_menu_cache));
   memset(wm_prop_cache, 0, sizeof(wm_prop_cache));

@@ -754,6 +754,15 @@ wiki_probe_done(const wm_property_res_t *p, void *user)
 {
   wiki_req_t *r = user;
 
+  // A backoff refuses every call after this one too, so working through
+  // the rest of the split would only spell out unproven readings and end
+  // in the same refusal. Say it once, now, with the wait attached.
+  if(p->status == WM_RATE_LIMITED)
+  {
+    wiki_failed(r, p->status, p->message, r->subject);
+    return;
+  }
+
   r->split[r->at].viable = p->status == WM_OK && p->n > 0;
   r->at++;
   wiki_split_probe(r);
@@ -802,9 +811,12 @@ wiki_split_subject(const wm_resolve_res_t *res, void *user)
     return;
   }
 
+  // The reading is unproven, so it is not the thing to name back: the
+  // question was the whole line, and "could not reach Wikidata for
+  // isaac" is a worse answer than the one the user typed.
   if(res->status != WM_OK)
   {
-    wiki_failed(r, res->status, res->message, r->split[r->at].stem);
+    wiki_failed(r, res->status, res->message, r->subject);
     return;
   }
 

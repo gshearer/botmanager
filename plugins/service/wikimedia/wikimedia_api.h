@@ -32,6 +32,31 @@
 // rides api.php.
 //
 // ----------------------------------------------------------------------
+// The backoff, and why a refusal is not an answer
+// ----------------------------------------------------------------------
+//
+// Wikimedia rate-limits by IP at the edge and says so plainly: HTTP 429
+// with `x-envoy-ratelimited: true` and a `Retry-After` in seconds. A
+// handful of !wiki commands inside a minute is enough to earn one.
+//
+// That Retry-After is honoured. The first 429 arms a process-wide
+// backoff, and until it expires every verb here refuses IN PLACE with
+// WM_RATE_LIMITED and puts nothing on the wire — a request sent inside
+// the window earns a longer one. The backoff is deliberately not
+// per-host: the limit is applied to our address rather than to an
+// endpoint, so Wikidata's refusal is Wikipedia's too. A cache hit is
+// still served; it costs no traffic.
+//
+// ⛔ WM_RATE_LIMITED, like WM_TRANSPORT, is the ABSENCE of an answer and
+// never one. Reading either as "no value recorded" is how a channel gets
+// told a living person is dead.
+//
+// Nothing here retries for the caller. A backoff outlives most single
+// requests, and the only party that knows whether anyone is still
+// waiting for this answer is the caller — so the service reports the
+// wait and lets whoever asked decide.
+//
+// ----------------------------------------------------------------------
 // Normalization the service owns (the consumer only presents)
 // ----------------------------------------------------------------------
 //
@@ -98,9 +123,11 @@
 typedef enum
 {
   WM_OK = 0,
-  WM_NOT_FOUND,   // resolved cleanly to nothing — an empty, not a bad guess
-  WM_TRANSPORT,   // the wire, or an answer this plugin could not parse
-  WM_UNAVAILABLE  // refused locally: the plugin is stopping
+  WM_NOT_FOUND,    // resolved cleanly to nothing — an empty, not a bad guess
+  WM_TRANSPORT,    // the wire, or an answer this plugin could not parse
+  WM_RATE_LIMITED, // Wikimedia is throttling us; wm_retry_after() says for
+                   // how long, and NOTHING reached the wire to earn it
+  WM_UNAVAILABLE   // refused locally: the plugin is stopping
 } wm_status_t;
 
 // ----------------------------------------------------------------------
@@ -299,10 +326,11 @@ typedef void (*wm_facts_cb_t)(const wm_facts_res_t *, void *user);
 // a stopping plugin, a request that could not be submitted) always
 // leaves `user` yours to free. See include/async.h.
 //
-// ⚠ ASYNC_AIRBORNE does not mean "later". All four answer a warm cache
-// IN PLACE, before the call returns, so a caller holding a lock across
-// one of them can re-enter itself through its own callback. Take that
-// seriously or call from a task worker. Per verb: wm_resolve_async and
+// ⚠ ASYNC_AIRBORNE does not mean "later". Every verb can answer IN
+// PLACE, before the call returns — off a warm cache, or off an armed
+// backoff, which refuses all of them — so a caller holding a lock
+// across one of them can re-enter itself through its own callback. Take
+// that seriously or call from a task worker. Per verb: wm_resolve_async and
 // wm_menu_async cache their whole result, and wm_property_async is that
 // same cache read directly, so it answers a known word in place every
 // time; wm_claims_async caches only the word→property step, so a hit
@@ -383,6 +411,14 @@ async_rc_t wm_facts_async(const char *qid, wm_facts_cb_t cb, void *user);
 // `total` carries how many matched before the window.
 async_rc_t wm_reverse_async(const char *property, const char *value_qid,
     wm_resolve_cb_t cb, void *user);
+
+// Seconds left on the Wikimedia backoff, or 0 when none is armed.
+//
+// Read it when a call answers WM_RATE_LIMITED, to tell whoever asked how
+// long to wait. It is a live remainder rather than a snapshot taken when
+// the refusal happened, so 0 is a real answer — it means the window has
+// already passed, and it presents as "try again now", never as "0s".
+uint32_t wm_retry_after(void);
 
 #endif // WIKIMEDIA_INTERNAL
 
@@ -567,6 +603,30 @@ wm_reverse_async(const char *property, const char *value_qid,
     __atomic_store_n(&cached, fn, __ATOMIC_RELEASE);
   }
   return(fn(property, value_qid, cb, user));
+}
+
+static inline uint32_t
+wm_retry_after(void)
+{
+  typedef uint32_t (*fn_t)(void);
+  static fn_t cached = NULL;
+  fn_t        fn     = __atomic_load_n(&cached, __ATOMIC_ACQUIRE);
+
+  if(fn == NULL)
+  {
+    union { void *obj; fn_t fn; } u;
+
+    u.obj = plugin_dlsym_cached(WIKIMEDIA_CTX, "wm_retry_after",
+        (void **)&cached);
+    if(u.obj == NULL)
+    {
+      clam(CLAM_FATAL, WIKIMEDIA_CTX, "dlsym failed: wm_retry_after");
+      abort();
+    }
+    fn = u.fn;
+    __atomic_store_n(&cached, fn, __ATOMIC_RELEASE);
+  }
+  return(fn());
 }
 
 #endif // !WIKIMEDIA_INTERNAL && !WIKIMEDIA_TYPES_ONLY
