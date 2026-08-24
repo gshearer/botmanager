@@ -152,11 +152,17 @@ not; a heal line names hit points restored, never damage dealt.
 
 ## Registry has room — but count before adding a file
 
-There are currently **34 sheets against 40 registry slots**
-(`ATK_CLASSES_MAX`). Six free slots is not many: once they are gone,
-another class means **removing one first**, or raising
-`ATK_CLASSES_MAX` in `attack.h` and rebuilding. A sheet beyond the cap
-is a load failure, not a silent no-op.
+**`show attack classes` prints the occupancy in its header** —
+`34/40 slots`, and the fraction turns yellow once the registry is full.
+Read it there rather than counting files; a number written down here
+rots. When the slots are gone, another class means **removing one
+first**, or raising `ATK_CLASSES_MAX` in `attack.h` and rebuilding.
+
+⚠ A sheet beyond the cap is **not** a rejection you will hear about.
+`atk_scan_dir()` `break`s at the cap in readdir order: the file is never
+opened, never parsed, and never named in the load report that
+`attack reload` prints. One `CLAM_WARN` in the log is the entire account of
+it, which is why the roster names the cap.
 
 ### Existing classes — do not duplicate a niche
 

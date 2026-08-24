@@ -831,9 +831,17 @@ atk_show_classes(const cmd_ctx_t *ctx)
     return;
   }
 
+  // The registry is ATK_CLASSES_MAX slots and the cap is hard: atk_scan_dir
+  // stops at it, so a sheet past the last slot is never parsed and its
+  // class can never be dealt. The only account of that today is one
+  // CLAM_WARN, and nobody reading this roster is reading the log — so the
+  // occupancy rides in the header, and goes yellow once the next sheet
+  // dropped in that directory would be the one nobody sees.
   snprintf(line, sizeof(line),
-      "🎭 " CLR_BOLD "ATTACK — CHARACTER CLASSES" CLR_RESET
-      CLR_GRAY " (%s)" CLR_RESET, t.classes_path);
+      "🎭 " CLR_BOLD "ATTACK — CHARACTER CLASSES" CLR_RESET "  %s%u/%d slots"
+      CLR_RESET CLR_GRAY "  (%s)" CLR_RESET,
+      n >= ATK_CLASSES_MAX ? CLR_YELLOW : CLR_GRAY,
+      n, ATK_CLASSES_MAX, t.classes_path);
   cmd_reply(ctx, line);
 
   atk_rule(rule, sizeof(rule), ATK_W_CLASSES);
