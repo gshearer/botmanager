@@ -92,19 +92,20 @@ irc_send_raw(irc_state_t *st, const char *fmt, ...)
   return(SUCCESS);
 }
 
-// PRIVMSG builder with 512-byte line splitting (IRC RFC 2812).
+// PRIVMSG builder, splitting against IRC_PRIVMSG_LINE_BUDGET rather than
+// the RFC's 512 — that constant carries the reason.
 bool
 irc_send_privmsg(irc_state_t *st, const char *target, const char *text)
 {
   // Overhead: "PRIVMSG <target> :<text>\r\n"
   // 10 = strlen("PRIVMSG ") + strlen(" :") = 8 + 2
   size_t overhead = 10 + strlen(target) + 2;  // +2 for \r\n
-  size_t max_text = 510 - 10 - strlen(target);
+  size_t max_text = IRC_PRIVMSG_LINE_BUDGET - 10 - strlen(target);
   size_t text_len;
   const char *pos;
   size_t remaining;
 
-  if(max_text < 1 || overhead > 510)
+  if(max_text < 1 || overhead > IRC_PRIVMSG_LINE_BUDGET)
   {
     clam(CLAM_WARN, "irc", "target too long for PRIVMSG: '%s'", target);
     return(FAIL);

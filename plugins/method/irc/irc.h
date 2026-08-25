@@ -9,6 +9,25 @@
 
 #define IRC_BUF_SZ      4096
 #define IRC_LINE_SZ     512
+
+// Ceiling on the line this driver actually emits, before its CRLF — the
+// budget irc_send_privmsg splits against.
+//
+// Not 510. The RFC's 512 counts the prefix the SERVER prepends,
+// ":nick!user@host ", which we do not know when we format the line and
+// which moves with the nick, the ident and whatever the host is cloaked
+// to. Budgeting only for our own bytes was measured wrong on 2026-08-25:
+// a locally-correct 509-byte PRIVMSG reached other clients at 557, and
+// ngIRCd cut it to 510 with a "[CUT]" marker where the tail had been.
+//
+// Computing the difference exactly is the wrong fix — the prefix varies
+// per connection, and clients and servers in the wild are not uniformly
+// strict about the limit anyway (operator ruling, 2026-08-25). 400 leaves
+// ~110 bytes of headroom, against the 48 this network actually prepends
+// — a margin, deliberately, not a proof: a long enough nick and an
+// uncloaked host can still outgrow any fixed number, and the point of a
+// round one is that it does not pretend otherwise.
+#define IRC_PRIVMSG_LINE_BUDGET 400
 #define IRC_NICK_SZ     32
 #define IRC_HOST_SZ     256
 
