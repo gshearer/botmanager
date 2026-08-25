@@ -379,6 +379,18 @@ typedef void (*wm_facts_cb_t)(const wm_facts_res_t *, void *user);
 // reaches Robert Duvall), the second is prominence-blind (a Viennese
 // merchant outranks Ludwig Wittgenstein). The whole window is returned
 // because every consumer needs the alternates.
+//
+// ⛔ Default relevance only — `srqiprofile` popularity profiles were
+// measured and REFUSED, not overlooked. `popular_inclinks_pv` is tuned
+// for Wikipedia's link graph, where scholarly items do not dominate: it
+// answered "Paris" with a ramp in the 14th arrondissement and "Python"
+// with scientific articles. Do not re-propose them.
+//
+// ⚠ The measured score is 10 of 11 on names the resolver was TUNED on,
+// so it is a floor and not an estimate; the standing miss is a
+// transposed typo ("einstien", "beehtoven"), which wbsearchentities'
+// alias tolerance does not cover. `tests/wikimedia/` scores this on
+// names it has never seen.
 async_rc_t wm_resolve_async(const char *name, wm_resolve_cb_t cb,
     void *user);
 

@@ -33,6 +33,19 @@
 # falls through to search, which scrapes and digests whatever it finds - so
 # the case would score honesty by writing junk into a live corpus.
 
+# BASELINE, ratified by the operator 2026-08-24 on `a1210d0`:
+#
+#   mode A   resolve 13/14  answer 20/21  clean 1/1  honest 1/1   94%
+#   mode B   resolve  1/1   answer  4/6   clean 3/3  honest 0/1   72%
+#   mode C   resolve  1/1   answer  1/1   clean  -   honest  -   100%
+#
+# Mode A has scored byte-identically on three separate runs, so a move in
+# it is a real regression.  Mode B's misses are the model, not the
+# pipeline: routed 9/18 with every case saying "look up", and asked who
+# composed the opera Gwendoline it resolved the ACTRESS and then invented
+# a composer three runs running.  Mode C's reactive case is skipped inside
+# the dedup hour, which is why its denominator moves.
+
 # --- mode A: typed, deterministic, a change here is a real regression ------
 A	stephen fry	Q192912	1957	
 A	jimmy carter	Q23685	2024	
