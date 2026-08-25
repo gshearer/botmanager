@@ -699,7 +699,13 @@ print_usage(const char *prog)
   printf("Usage: %s [options] [command [args...]]\n", prog);
   printf("  -s <path>   Socket path (default: ~/.config/botmanager/%s)\n",
       DEFAULT_SOCK_NAME);
-  printf("  -S <sev>    Subscribe to CLAM messages (severity 0-7)\n");
+  // The names are what the log prints, and DBG5 is 7 rather than 5 —
+  // asking for -S 5 and receiving nothing looks exactly like a broken
+  // subscription. Numbering is include/clam.h; a renumber lands here too.
+  printf("  -S <sev>    Subscribe to CLAM messages at this severity and\n");
+  printf("              above (0 = FATAL, 7 = DBG5). The log's own names:\n");
+  printf("                0 FATAL  1 WARN  2 INFO  3 DBG   4 DBG2\n");
+  printf("                5 DBG3   6 DBG4  7 DBG5\n");
   printf("  -r <regex>  Filter against \"<context> <msg>\" (requires -S)\n");
   printf("  -A <bot>    Attach to a bot: stream its observe-trace\n");
   printf("              (sugar for -S 3 -r 'bot=<bot>\\b')\n");
