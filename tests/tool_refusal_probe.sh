@@ -35,6 +35,13 @@
 # silent run: a second SKIPped direct turn inside 90 s is suppressed by
 # CHATBOT_CV4_FALLBACK_COOLDOWN_SECS on purpose.
 #
+# ⚠⚠ SCORE FROM THE TRANSCRIPTS, NOT THE CONSOLE.  The per-run line prints
+# the first 130 bytes only, and replies to a low-entropy question converge on
+# their opening: three dict answers shared a ~110-byte opener and read as
+# byte-identical on the console while their md5s and lengths all differed
+# (298/338/340).  That misreads as a stuck sampler.  $OUT/<arm>-<run>.txt
+# holds the whole reply and the daemon slice that produced it.
+#
 # ── it also counts deliveries ────────────────────────────────────────────────
 # Every row is claimed by EVERY chat bot in the namespace (root TODO.md
 # §CLAIM-RACE), so `deliveries=` is the count of bots that delivered the one
