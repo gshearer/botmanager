@@ -41,6 +41,7 @@ static const fr_word_t fr_types[] = {
 static const fr_word_t fr_statuses[] = {
   { "new",         NULL,        CLR_CYAN,   false },
   { "in progress", "in-prog",   CLR_YELLOW, false },
+  { "on hold",     "on-hold",   CLR_ORANGE, false },
   { "completed",   "done",      CLR_GREEN,  true  },
   { "canceled",    "cancelled", CLR_GRAY,   true  },
 };

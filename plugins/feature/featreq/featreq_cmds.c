@@ -464,7 +464,8 @@ static const cmd_decl_t feature_status_decl = {
   .description = "Move a request along the board (owner).",
   .help_long   =
       "Sets the request's status and stamps the moment it changed. "
-      "Accepts `new`, `in-prog`, `completed` and `canceled` (also "
+      "Accepts `new`, `in-prog`, `on-hold`, `completed` and "
+      "`canceled` (also "
       "`done` and `cancelled`). The request itself is never edited or "
       "deleted, only moved; `feature note` is where an answer to one "
       "goes.",

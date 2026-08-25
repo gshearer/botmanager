@@ -88,6 +88,7 @@ typedef enum
 {
   FR_ST_NEW = 0,
   FR_ST_PROG,
+  FR_ST_HOLD,
   FR_ST_DONE,
   FR_ST_CANCEL,
 } fr_status_t;
