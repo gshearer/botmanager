@@ -41,6 +41,14 @@ interests:
       ]
     },
     {
+      "name": "physics",
+      "mode": "mixed",
+      "proactive_weight": 10,
+      "encyclopedic": true,
+      "query": "theory of relativity",
+      "keywords": ["relativity", "quantum mechanics", "thermodynamics"]
+    },
+    {
       "name": "waifu",
       "mode": "mixed",
       "proactive_weight": 50,

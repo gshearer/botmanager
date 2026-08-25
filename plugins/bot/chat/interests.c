@@ -193,6 +193,8 @@ mp_topic_from_obj(struct json_object *obj,
       out->max_sources = (uint32_t)ms;
   }
 
+  json_get_bool(obj, "encyclopedic", &out->encyclopedic);
+
   json_get_str(obj, "query",
       out->query, sizeof(out->query));
   json_get_str(obj, "query_template",
@@ -250,8 +252,8 @@ mp_topic_from_obj(struct json_object *obj,
 
 // Each array element is a JSON object with `name` + `mode` (required) and
 // optional `proactive_weight`, `cadence_secs`, `max_sources`,
-// `keywords` (array of strings), `query`, `query_template`, and
-// `upcoming_query`.
+// `encyclopedic`, `keywords` (array of strings), `query`,
+// `query_template`, and `upcoming_query`.
 //
 // Validation is per-topic: malformed entries log WARN and skip; well-formed
 // entries keep flowing. Outer-JSON parse failure is the only hard-fail path.

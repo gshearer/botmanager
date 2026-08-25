@@ -26,14 +26,11 @@
 // SXNG hookup — the searxng plugin is dlopen'd with RTLD_LOCAL so we
 // cannot link against sxng_search directly. Resolve it on first use
 // via plugin_dlsym and cache the function pointer; a missing plugin
-// turns every reactive job into a WARN-and-skip.
-//
-// Pull in the searxng types (sxng_result_t, sxng_response_t,
-// sxng_done_cb_t, sxng_category_t) but skip both the real prototype
-// and the abort-on-miss shim — we want WARN-and-skip semantics, so
-// the function pointer is materialised below via our own dlsym path.
-#define SEARXNG_TYPES_ONLY
-#include "searxng_api.h"
+// turns every reactive job into a WARN-and-skip. acquire_priv.h pulls
+// in the types (sxng_result_t, sxng_response_t, sxng_done_cb_t,
+// sxng_category_t) and skips both the real prototype and the
+// abort-on-miss shim, so the pointer is materialised below by our own
+// dlsym path.
 
 typedef bool (*acq_sxng_search_fn_t)(const char *query,
     sxng_category_t category, size_t n_wanted,
@@ -55,52 +52,10 @@ static acq_sxng_search_fn_t  acquire_sxng_search = NULL;
 // (referenced by acq_bot_kick_submit_deferred before its definition).
 static void acq_bot_kick_drain(task_t *t);
 
-// Acquisition job context — heap-owned, carried through every async hop.
-// Freed exactly once at the terminal leaf (or early abort). A7 extended
-// this context from reactive-only to shared use: both the reactive drain
-// and the proactive picker emit the same ctx shape and feed the same
-// SXNG → fetch → digest → ingest chain. The `is_proactive` flag steers
-// only log-line wording and the stats-bump path.
-
-typedef struct
-{
-  char  bot_name   [ACQUIRE_BOT_NAME_SZ];
-  char  topic_name [ACQUIRE_TOPIC_NAME_SZ];
-  char  subject    [ACQUIRE_SUBJECT_SZ];
-  char  dest_corpus[ACQUIRE_CORPUS_NAME_SZ];
-
-  // Snapshotted from the topic so async callbacks don't need to
-  // re-consult the live registry (avoids re-taking acquire_entries_lock
-  // from the worker thread, and the topic list may have been replaced).
-  char            keywords_csv[ACQUIRE_KEYWORD_SZ * ACQUIRE_KEYWORDS_MAX + ACQUIRE_KEYWORDS_MAX];
-  char            query[ACQUIRE_TOPIC_QUERY_SZ];
-  sxng_category_t category;
-
-  // Per-topic override for max_sources_per_query, snapshotted from the
-  // topic at ctx-build time. 0 = inherit acquire_cfg.max_sources_per_query.
-  // Nonzero values are still clamped to the global cap so a personality
-  // cannot exceed the site-wide safety ceiling.
-  uint32_t topic_max_sources;
-
-  // Number of sources we'll fetch for this job. Decremented once per
-  // curl callback — the LAST one frees the ctx.
-  uint32_t pending_sources;
-  pthread_mutex_t lock;
-
-  // Count of chunks successfully inserted. Used to bump
-  // acquire_topic_stats.total_ingested in one UPSERT at termination.
-  uint32_t n_inserted;
-
-  // Set by the proactive picker; false for the reactive drain. Controls
-  // stats UPSERT column (last_proactive vs last_reactive) and the
-  // wording emitted by async pipeline log lines.
-  bool is_proactive;
-} reactive_job_ctx_t;
-
 // One-liner used in the async pipeline's log strings so a single
 // `acq_reactive_*` callback can narrate either path without branching.
 static inline const char *
-acq_ctx_mode(const reactive_job_ctx_t *ctx)
+acq_ctx_mode(const acq_job_ctx_t *ctx)
 {
   return(ctx->is_proactive ? "proactive" : "reactive");
 }
@@ -259,8 +214,8 @@ acq_topic_stats_bump(const char *bot, const char *topic,
 
 // Terminal release: decrements pending_sources and, on zero, writes
 // stats and frees the ctx. Safe to call from any thread.
-static void
-reactive_job_release_source(reactive_job_ctx_t *ctx)
+void
+acq_job_release_source(acq_job_ctx_t *ctx)
 {
   bool last;
   uint32_t n_inserted;
@@ -290,7 +245,7 @@ reactive_job_release_source(reactive_job_ctx_t *ctx)
 
 // Per-source ctx (I1).
 //
-// The shared reactive_job_ctx_t fans N parallel curl fetches from one
+// The shared acq_job_ctx_t fans N parallel curl fetches from one
 // SXNG query via pending_sources. Image extraction needs per-source
 // state (the page URL plus the harvested image array) that must
 // survive from the curl callback (where the raw HTML is still valid)
@@ -301,13 +256,13 @@ reactive_job_release_source(reactive_job_ctx_t *ctx)
 // The source ctx is allocated in acq_reactive_sxng_done right before
 // curl_get, carried as curl's user_data, and handed through as
 // digest's user_data. acq_source_release frees the source ctx and
-// propagates a single reactive_job_release_source call to the parent,
-// so the refcount accounting at the reactive_job_ctx_t layer is
+// propagates a single acq_job_release_source call to the parent,
+// so the refcount accounting at the acq_job_ctx_t layer is
 // preserved exactly.
 
 typedef struct
 {
-  reactive_job_ctx_t  *parent;
+  acq_job_ctx_t  *parent;
   char                 page_url[KNOWLEDGE_IMAGE_URL_SZ];
   acq_image_extract_t *images;      // NULL when extraction disabled / empty
   size_t               n_images;
@@ -320,7 +275,7 @@ acq_source_release(acq_source_ctx_t *src)
     return;
 
   if(src->parent != NULL)
-    reactive_job_release_source(src->parent);
+    acq_job_release_source(src->parent);
 
   if(src->images != NULL)
     mem_free(src->images);
@@ -329,7 +284,6 @@ acq_source_release(acq_source_ctx_t *src)
 }
 
 // Forward declarations for the async pipeline.
-static void acq_reactive_start_search(reactive_job_ctx_t *ctx);
 static void acq_reactive_sxng_done(const sxng_response_t *resp);
 static void acq_reactive_curl_done(const curl_response_t *cresp);
 static void acq_reactive_digest_done(
@@ -368,8 +322,21 @@ acq_sxng_resolve(void)
   return(fn);
 }
 
-static void
-acq_reactive_start_search(reactive_job_ctx_t *ctx)
+// Offer the job to each source in preference order and stop at the
+// first one that takes it. Only a topic that asked for it is offered
+// the encyclopedia, and only a subject that resolves to an entity is
+// kept by it, so the search path stays the common one.
+void
+acq_job_dispatch(acq_job_ctx_t *ctx)
+{
+  if(ctx->encyclopedic && acq_wiki_try(ctx))
+    return;
+
+  acq_reactive_start_search(ctx);
+}
+
+void
+acq_reactive_start_search(acq_job_ctx_t *ctx)
 {
   acq_sxng_search_fn_t sxng = acq_sxng_resolve();
 
@@ -419,13 +386,13 @@ acq_reactive_start_search(reactive_job_ctx_t *ctx)
 
 // curl_get callback: extract images off the raw HTML, strip + digest,
 // release the per-source ctx on error. The per-source ctx wraps the
-// shared reactive_job_ctx_t; image state must be stashed here because
+// shared acq_job_ctx_t; image state must be stashed here because
 // the raw `cresp->body` is freed before the digest callback fires.
 static void
 acq_reactive_curl_done(const curl_response_t *cresp)
 {
   acq_source_ctx_t   *src = (acq_source_ctx_t *)cresp->user_data;
-  reactive_job_ctx_t *ctx = src->parent;
+  acq_job_ctx_t *ctx = src->parent;
 
   bool     imgs_on;
   char *stripped;
@@ -666,7 +633,7 @@ static void
 acq_reactive_digest_done(const acquire_digest_response_t *resp)
 {
   acq_source_ctx_t   *src = (acq_source_ctx_t *)resp->user_data;
-  reactive_job_ctx_t *ctx = src->parent;
+  acq_job_ctx_t *ctx = src->parent;
 
   uint32_t threshold;
   if(!resp->ok || resp->summary == NULL || resp->summary[0] == '\0')
@@ -713,7 +680,7 @@ acq_reactive_digest_done(const acquire_digest_response_t *resp)
 static void
 acq_reactive_sxng_done(const sxng_response_t *resp)
 {
-  reactive_job_ctx_t *ctx = (reactive_job_ctx_t *)resp->user_data;
+  acq_job_ctx_t *ctx = (acq_job_ctx_t *)resp->user_data;
 
   uint32_t cap;
   size_t take;
@@ -766,7 +733,7 @@ acq_reactive_sxng_done(const sxng_response_t *resp)
     if(r->url[0] == '\0')
     {
       // Release this slot's refcount and continue.
-      reactive_job_release_source(ctx);
+      acq_job_release_source(ctx);
       continue;
     }
 
@@ -798,7 +765,7 @@ acq_reactive_sxng_done(const sxng_response_t *resp)
             "%s: curl_request_create failed url='%s'",
             acq_ctx_mode(ctx), r->url);
         mem_free(src);
-        reactive_job_release_source(ctx);
+        acq_job_release_source(ctx);
         continue;
       }
 
@@ -810,7 +777,7 @@ acq_reactive_sxng_done(const sxng_response_t *resp)
             "%s: curl_request_submit failed url='%s'",
             acq_ctx_mode(ctx), r->url);
         mem_free(src);
-        reactive_job_release_source(ctx);
+        acq_job_release_source(ctx);
         continue;
       }
     }
@@ -826,11 +793,11 @@ acq_reactive_sxng_done(const sxng_response_t *resp)
 
 // Allocate + populate a job ctx from a dequeued job. Takes a read-
 // locked snapshot of the topic; caller holds acquire_entries_lock.
-static reactive_job_ctx_t *
+static acq_job_ctx_t *
 acq_reactive_build_ctx(const acquire_bot_entry_t *e,
     const acquire_topic_t *t, const char *subject)
 {
-  reactive_job_ctx_t *ctx = mem_alloc(ACQUIRE_CTX, "reactive_ctx",
+  acq_job_ctx_t *ctx = mem_alloc(ACQUIRE_CTX, "reactive_ctx",
       sizeof(*ctx));
 
   memset(ctx, 0, sizeof(*ctx));
@@ -845,6 +812,7 @@ acq_reactive_build_ctx(const acquire_bot_entry_t *e,
   acq_build_query(t, subject, ctx->query, sizeof(ctx->query));
   ctx->category = sxng_category_from_name(t->category);
   ctx->topic_max_sources = t->max_sources;
+  ctx->encyclopedic      = t->encyclopedic;
 
   return(ctx);
 }
@@ -857,7 +825,7 @@ acq_reactive_process_one(acquire_bot_entry_t *e,
 {
   const acquire_topic_t *t_ref;
   uint32_t max_per_hour;
-  reactive_job_ctx_t    *ctx;
+  acq_job_ctx_t    *ctx;
   pthread_mutex_lock(&acquire_stat_mutex);
   acquire_stats.total_reactive_drained++;
   pthread_mutex_unlock(&acquire_stat_mutex);
@@ -902,7 +870,7 @@ acq_reactive_process_one(acquire_bot_entry_t *e,
 
   pthread_rwlock_unlock(&acquire_entries_lock);
 
-  acq_reactive_start_search(ctx);
+  acq_job_dispatch(ctx);
 }
 
 // Proactive path (A7) — picks one topic per tick by weighted-random
@@ -1007,7 +975,7 @@ acq_proactive_fire_locked(acquire_bot_entry_t *e, size_t topic_idx,
   uint32_t max_per_hour;
   uint32_t counter;
   const char *q;
-  reactive_job_ctx_t *ctx;
+  acq_job_ctx_t *ctx;
   bool is_upcoming;
   if(out_query != NULL && out_query_sz > 0)
     out_query[0] = '\0';
@@ -1072,6 +1040,7 @@ acq_proactive_fire_locked(acquire_bot_entry_t *e, size_t topic_idx,
 
   acq_build_keywords_csv(t, ctx->keywords_csv, sizeof(ctx->keywords_csv));
   ctx->topic_max_sources = t->max_sources;
+  ctx->encyclopedic      = t->encyclopedic;
 
   ctx->is_proactive = true;
 
@@ -1089,8 +1058,8 @@ acq_proactive_fire_locked(acquire_bot_entry_t *e, size_t topic_idx,
 
   // Spec defers the celeb gate for proactive runs (no {subject}
   // substitution, so the query text is author-controlled). Straight
-  // to search.
-  acq_reactive_start_search(ctx);
+  // to the source list.
+  acq_job_dispatch(ctx);
   return(ACQ_PROACTIVE_OK);
 }
 

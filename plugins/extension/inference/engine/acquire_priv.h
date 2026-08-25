@@ -17,6 +17,12 @@
 
 #include <pthread.h>
 
+// The job context below carries a resolved SXNG category. Types only —
+// the search itself is reached by dlsym, so a missing searxng plugin
+// must WARN and skip rather than fail to link (acquire_reactive.c).
+#define SEARXNG_TYPES_ONLY
+#include "searxng_api.h"
+
 // -----------------------------------------------------------------------
 // Pre-move public API, now plugin-internal.
 // -----------------------------------------------------------------------
@@ -337,6 +343,77 @@ extern acquire_stats_t      acquire_stats;
 extern pthread_mutex_t      acquire_ingest_cb_mutex;
 extern acquire_ingest_cb_t  acquire_ingest_cb;
 extern void                *acquire_ingest_user;
+
+// -----------------------------------------------------------------------
+// One acquisition job — heap-owned, carried through every async hop and
+// freed exactly once at the terminal leaf (or an early abort).
+// -----------------------------------------------------------------------
+//
+// It started as the reactive drain's private context; A7 gave the same
+// shape to the proactive picker, and the wikimedia source path is the
+// third caller, which is what moved it here. `is_proactive` steers only
+// log wording and which stats column the termination stamps.
+//
+// A job names an errand, not a source. Which source it is offered to is
+// acq_job_dispatch's decision, and a source that cannot answer hands the
+// job on rather than failing it.
+
+typedef struct
+{
+  char  bot_name   [ACQUIRE_BOT_NAME_SZ];
+  char  topic_name [ACQUIRE_TOPIC_NAME_SZ];
+  char  subject    [ACQUIRE_SUBJECT_SZ];
+  char  dest_corpus[ACQUIRE_CORPUS_NAME_SZ];
+
+  // Snapshotted from the topic so async callbacks don't need to
+  // re-consult the live registry (avoids re-taking acquire_entries_lock
+  // from the worker thread, and the topic list may have been replaced).
+  char            keywords_csv[ACQUIRE_KEYWORD_SZ * ACQUIRE_KEYWORDS_MAX + ACQUIRE_KEYWORDS_MAX];
+  char            query[ACQUIRE_TOPIC_QUERY_SZ];
+  sxng_category_t category;
+
+  // Per-topic override for max_sources_per_query, snapshotted from the
+  // topic at ctx-build time. 0 = inherit acquire_cfg.max_sources_per_query.
+  // Nonzero values are still clamped to the global cap so a personality
+  // cannot exceed the site-wide safety ceiling.
+  uint32_t topic_max_sources;
+
+  // Snapshotted from the topic: try wikimedia before SXNG.
+  bool encyclopedic;
+
+  // Number of sources we'll fetch for this job. Decremented once per
+  // curl callback — the LAST one frees the ctx.
+  uint32_t pending_sources;
+  pthread_mutex_t lock;
+
+  // Count of chunks successfully inserted. Used to bump
+  // acquire_topic_stats.total_ingested in one UPSERT at termination.
+  uint32_t n_inserted;
+
+  // Set by the proactive picker; false for the reactive drain. Controls
+  // stats UPSERT column (last_proactive vs last_reactive) and the
+  // wording emitted by async pipeline log lines.
+  bool is_proactive;
+} acq_job_ctx_t;
+
+// Offer the job to the first source that will take it, then hand it
+// over: the callee owns `ctx` from the call on, and no caller may touch
+// it afterwards. Defined in acquire_reactive.c.
+void acq_job_dispatch(acq_job_ctx_t *ctx);
+
+// The search source: SXNG → curl → digest → ingest. Also the fallback
+// every other source lands on, which is why acquire_wiki.c can see it.
+void acq_reactive_start_search(acq_job_ctx_t *ctx);
+
+// Terminal release for one source of a job: on the last one it writes
+// the topic stats and frees the ctx. Safe from any thread.
+void acq_job_release_source(acq_job_ctx_t *ctx);
+
+// The encyclopedia source (acquire_wiki.c). Returns false when it will
+// not run at all — the wikimedia plugin is not loaded, or the service
+// refused the submit — and the caller then owns `ctx` still and falls
+// through to the search path. True means the job has been handed over.
+bool acq_wiki_try(acq_job_ctx_t *ctx);
 
 // Shared helpers (defined in acq_html.c).
 size_t acq_strip_html(const char *in, size_t in_len,

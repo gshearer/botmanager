@@ -102,6 +102,8 @@
 #define WM_DTYPE_SZ       32   // "wikibase-item", "time", "external-id", …
 #define WM_DATE_SZ        16   // "-0044-03-15" and every shorter precision
 #define WM_MSG_SZ         128
+#define WM_PAGE_URL_SZ    640  // an article's own address: the host plus
+                               // an encoded WM_TITLE_SZ title, with room
 
 #define WM_CANDIDATES_MAX 20   // the merged window, and a reverse query's
 #define WM_CLAIMS_MAX     12   // statements carried for one property
@@ -304,6 +306,16 @@ typedef struct
   char        title[WM_TITLE_SZ];
   char        qid[WM_QID_SZ];          // the article's item ("" if none)
   char        description[WM_DESC_SZ]; // summary only
+
+  // Where this article lives, built from the title the wiki settled on
+  // rather than the one that was asked for -- a redirect answers under
+  // its target. The host is this service's business (the language is a
+  // knob), which is why the consumer is handed the address instead of
+  // assembling one, and a consumer filing the prose somewhere needs it:
+  // an article's URL is what makes a stored copy citable and what tells
+  // a re-fetch of the same page from a fetch of a different one.
+  char        url[WM_PAGE_URL_SZ];
+
   const char *text;                    // borrowed: callback lifetime only
   size_t      len;
 } wm_prose_res_t;

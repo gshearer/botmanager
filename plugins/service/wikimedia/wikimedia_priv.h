@@ -311,6 +311,7 @@ static void         wm_claims_labels_done(const curl_response_t *resp);
 static void         wm_menu_props_done(const curl_response_t *resp);
 static void         wm_menu_meta_done(const curl_response_t *resp);
 
+static void         wm_page_url(const char *title, char *out, size_t cap);
 static void         wm_prose_sitelink_done(const curl_response_t *resp);
 static bool         wm_prose_fetch(wm_work_t *w, const char *title);
 static void         wm_prose_done(const curl_response_t *resp);

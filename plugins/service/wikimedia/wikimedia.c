@@ -1424,6 +1424,37 @@ wm_menu_meta_done(const curl_response_t *resp)
 // wm_prose_async — the other half of Wikimedia
 // ----------------------------------------------------------------------
 
+// An article's own address, the form a human would paste: spaces are
+// underscores on every wiki, and '_' survives percent-encoding
+// untouched. Built from whichever title the wiki finally answered
+// under, so a redirect names its target.
+static void
+wm_page_url(const char *title, char *out, size_t cap)
+{
+  char base[128];
+  char under[WM_TITLE_SZ];
+  char enc[WM_ENC_SZ];
+  int  need;
+
+  strlcpy(under, title, sizeof(under));
+
+  for(char *p = under; *p != '\0'; p++)
+    if(*p == ' ')
+      *p = '_';
+
+  if(wm_urlencode(under, enc, sizeof(enc)) >= sizeof(enc))
+  {
+    out[0] = '\0';
+    return;
+  }
+
+  wm_wiki_base(base, sizeof(base));
+  need = snprintf(out, cap, "%s/wiki/%s", base, enc);
+
+  if(need < 0 || (size_t)need >= cap)
+    out[0] = '\0';
+}
+
 // Fetch the article. The lead summary comes from the REST endpoint,
 // which carries the description and the QID in one 2 KB answer; the
 // whole article comes from the action API, where an explaintext extract
@@ -1564,6 +1595,8 @@ wm_prose_done(const curl_response_t *resp)
 
   res->len    = strlen(res->text);
   res->status = WM_OK;
+
+  wm_page_url(res->title, res->url, sizeof(res->url));
 
   // The text is borrowed from the parsed body, so the delivery has to
   // happen while that body is still alive — the one place in this file

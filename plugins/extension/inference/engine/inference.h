@@ -476,6 +476,16 @@ typedef struct
   // dispatch time, so a personality can ask for fewer but not more.
   uint32_t        max_sources;
 
+  // Reach for an encyclopedia before reaching for a search engine.
+  // Wikipedia is encyclopedic and not current, so the choice belongs to
+  // the topic and not to the engine: for "AI research" one fetch of
+  // clean prose beats whatever a search picks, and for "AI news this
+  // week" it is strictly worse. It is a preference and never a
+  // replacement — a subject that resolves to no entity falls through to
+  // the search path unchanged, as does one asked for while wikimedia is
+  // unloaded.
+  bool            encyclopedic;
+
   char            keywords[ACQUIRE_KEYWORDS_MAX][ACQUIRE_KEYWORD_SZ];
   size_t          n_keywords;
 
