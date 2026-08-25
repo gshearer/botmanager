@@ -92,6 +92,15 @@ irc_send_raw(irc_state_t *st, const char *fmt, ...)
   return(SUCCESS);
 }
 
+// A UTF-8 continuation byte, 10xxxxxx. The splitter below holds a byte
+// COUNT, so src[count] is the first byte it is not sending: if that byte
+// continues a character, the cut is inside one.
+static bool
+irc_utf8_is_cont(unsigned char b)
+{
+  return((b & 0xc0) == 0x80);
+}
+
 // PRIVMSG builder, splitting against IRC_PRIVMSG_LINE_BUDGET rather than
 // the RFC's 512 — that constant carries the reason.
 bool
@@ -139,7 +148,32 @@ irc_send_privmsg(irc_state_t *st, const char *target, const char *text)
         last_space--;
 
       if(last_space > max_text / 2)
+      {
+        // A space is one byte and the text resumes after it, so this cut
+        // already lands on a character boundary.
         chunk = last_space;
+      }
+
+      else
+      {
+        // No usable space, so the cut is a raw byte offset and can fall
+        // inside a multi-byte character — half of it ending one message
+        // and half opening the next, which is two mojibake bytes rather
+        // than one character. Back up to where the character starts.
+        //
+        // A sequence is at most four bytes, so this is at most three
+        // steps. Input needing more is not UTF-8, and the byte cut is
+        // then the honest answer: framing garbage correctly is not worth
+        // a walk that might not terminate.
+        size_t back = 0;
+
+        while(back < 3 && chunk > 1 &&
+            irc_utf8_is_cont((unsigned char)pos[chunk]))
+        {
+          chunk--;
+          back++;
+        }
+      }
     }
 
     copy = chunk;
