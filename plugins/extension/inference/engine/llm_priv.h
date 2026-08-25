@@ -55,6 +55,7 @@ void llm_exit(void);
 // Model introspection.
 bool     llm_model_exists(const char *name);
 bool     llm_model_kind(const char *name, llm_kind_t *out);
+bool     llm_model_max_context(const char *name, uint32_t *out);
 uint32_t llm_model_embed_dim(const char *name);
 
 // Also declared (identically) in the public inference.h so external

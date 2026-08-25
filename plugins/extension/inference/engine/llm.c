@@ -1036,6 +1036,35 @@ llm_model_kind(const char *name, llm_kind_t *out)
   return(ok);
 }
 
+// The declared window in TOKENS, disabled models included: a caller
+// sizing a prompt needs the number whether or not the row is currently
+// serving. FAIL means "no such model", which is not the same answer as
+// a window of zero.
+bool
+llm_model_max_context(const char *name, uint32_t *out)
+{
+  bool ok;
+  if(name == NULL || out == NULL)
+    return(FAIL);
+
+  ok = FAIL;
+
+  pthread_rwlock_rdlock(&llm_models_lock);
+
+  for(llm_model_t *m = llm_models_head; m != NULL; m = m->next)
+  {
+    if(strcmp(m->name, name) == 0)
+    {
+      *out = m->max_context;
+      ok = SUCCESS;
+      break;
+    }
+  }
+
+  pthread_rwlock_unlock(&llm_models_lock);
+  return(ok);
+}
+
 uint32_t
 llm_model_embed_dim(const char *name)
 {

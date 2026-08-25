@@ -15,7 +15,9 @@
 
 #include <json-c/json.h>
 
+#include <errno.h>
 #include <inttypes.h>
+#include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -77,15 +79,18 @@ llm_model_id_canon(const char *model_id)
 #define LLM_TBL_LEAD    3
 #define LLM_TBL_SVC    13     // "hiigara-image"
 #define LLM_TBL_NAME    9     // "gpt56luna"
-#define LLM_TBL_MID     6     // `kind` in the survey, `ctx`/`dim` when filtered
+// 7 digits, because a declared context window is now a real one: the
+// Gemini rows carry 1,048,576. The two columns come out of the elastic
+// model-id cell below, which had five to spare.
+#define LLM_TBL_MID     8     // `kind` in the survey, `ctx`/`dim` when filtered
 #define LLM_TBL_REQ     5
 #define LLM_TBL_ERR     4
 #define LLM_TBL_AVG     6     // "123.4s"
 #define LLM_TBL_SEP     2
 
 // The model id is elastic and takes whatever is left of DISPLAY_COLS —
-// thirty-one columns when every cell before it fits its own, comfortably
-// past the twenty-six of "RadixArk/Qwen3.8-27B-NVFP4".
+// twenty-nine columns when every cell before it fits its own, still past
+// the twenty-six of "RadixArk/Qwen3.8-27B-NVFP4".
 
 typedef struct
 {
@@ -1517,6 +1522,94 @@ cmd_llm_del_model(const cmd_ctx_t *ctx)
   cmd_reply(ctx, "ok");
 }
 
+// /llm set model <name> max_context <tokens>
+//
+// max_context is otherwise seeded once, at `llm add model`, from the
+// service's cached /models entry — and only a vLLM-style service
+// publishes max_model_len there. Gemini and OpenAI rows therefore land
+// on the llm.max_context_tokens placeholder and had no way off it,
+// which is fine until something sizes a prompt against the number.
+//
+// ⛔ There is no probe behind this. A provider's published window is a
+// document, not an endpoint: a request that overruns comes back 400, and
+// a 400 from Google means quota just as often as it means length.
+static void
+cmd_llm_set_model(const cmd_ctx_t *ctx)
+{
+  const char  *name;
+  const char  *field;
+  const char  *value;
+  char        *e_name;
+  char        *endp;
+  db_result_t *res;
+  unsigned long tokens;
+  char         sql[256];
+  char         msg[512];
+
+  if(ctx->parsed == NULL || ctx->parsed->argc < 3)
+  {
+    cmd_reply(ctx, "usage: llm set model <name> max_context <tokens>");
+    return;
+  }
+
+  name  = ctx->parsed->argv[0];
+  field = ctx->parsed->argv[1];
+  value = ctx->parsed->argv[2];
+
+  if(strcasecmp(field, "max_context") != 0)
+  {
+    cmd_reply(ctx, "error: only 'max_context' is settable");
+    return;
+  }
+
+  errno  = 0;
+  tokens = strtoul(value, &endp, 10);
+
+  if(errno != 0 || endp == value || *endp != '\0'
+      || tokens == 0 || tokens > UINT32_MAX)
+  {
+    cmd_reply(ctx, "error: max_context must be a positive token count");
+    return;
+  }
+
+  e_name = db_escape(name);
+
+  if(e_name == NULL)
+  {
+    cmd_reply(ctx, "error: database unavailable");
+    return;
+  }
+
+  snprintf(sql, sizeof(sql),
+      "UPDATE llm_models SET max_context=%lu WHERE name='%s'",
+      tokens, e_name);
+  mem_free(e_name);
+
+  res = db_result_alloc();
+
+  if(db_query(sql, res) != SUCCESS || !res->ok)
+  {
+    snprintf(msg, sizeof(msg), "update failed: %s", res->error);
+    cmd_reply(ctx, msg);
+    db_result_free(res);
+    return;
+  }
+
+  if(res->rows_affected == 0)
+  {
+    snprintf(msg, sizeof(msg), "no such model: %s", name);
+    cmd_reply(ctx, msg);
+    db_result_free(res);
+    return;
+  }
+
+  db_result_free(res);
+  llm_models_reload();
+
+  snprintf(msg, sizeof(msg), "%s max_context = %lu tokens", name, tokens);
+  cmd_reply(ctx, msg);
+}
+
 // /llm test: a bounded synchronous probe.
 //
 // This is the documented exception to the daemon's non-blocking rule
@@ -2151,6 +2244,12 @@ static const cmd_arg_desc_t ad_del_one[] = {
   { "name", CMD_ARG_NONE, CMD_ARG_REQUIRED, LLM_MODEL_NAME_SZ - 1, NULL },
 };
 
+static const cmd_arg_desc_t ad_set_model[] = {
+  { "name",  CMD_ARG_NONE, CMD_ARG_REQUIRED, LLM_MODEL_NAME_SZ - 1, NULL },
+  { "field", CMD_ARG_NONE, CMD_ARG_REQUIRED, 32,                    NULL },
+  { "value", CMD_ARG_NONE, CMD_ARG_REQUIRED, 20,                    NULL },
+};
+
 static const cmd_arg_desc_t ad_llm_service[] = {
   { "name",   CMD_ARG_NONE, CMD_ARG_REQUIRED, LLM_MODEL_NAME_SZ - 1, NULL },
   { "action", CMD_ARG_NONE, CMD_ARG_REQUIRED, 16,                    NULL },
@@ -2177,7 +2276,7 @@ static const cmd_arg_desc_t ad_show_service[] = {
 static void
 cmd_llm_root(const cmd_ctx_t *ctx)
 {
-  cmd_reply(ctx, "usage: /llm <add|del|service|probe|test> ...");
+  cmd_reply(ctx, "usage: /llm <add|del|set|service|probe|test> ...");
 }
 
 static void
@@ -2191,6 +2290,12 @@ static void
 cmd_llm_del_usage(const cmd_ctx_t *ctx)
 {
   cmd_reply(ctx, "usage: llm del service <name>  |  llm del model <name>");
+}
+
+static void
+cmd_llm_set_usage(const cmd_ctx_t *ctx)
+{
+  cmd_reply(ctx, "usage: llm set model <name> max_context <tokens>");
 }
 
 static const cmd_decl_t llm_decl = {
@@ -2264,6 +2369,36 @@ static const cmd_decl_t llm_del_decl = {
   .cb          = cmd_llm_del_usage,
   .parent_path = "llm",
   .abbrev      = "d",
+};
+
+static const cmd_decl_t llm_set_decl = {
+  .module      = "llm",
+  .name        = "set",
+  .usage       = "llm set model <name> <field> <value>",
+  .description = "Amend a registered model's declared properties",
+  .group       = USERNS_GROUP_ADMIN,
+  .level       = 100,
+  .scope       = CMD_SCOPE_ANY,
+  .methods     = METHOD_T_ANY,
+  .cb          = cmd_llm_set_usage,
+  .parent_path = "llm",
+  .abbrev      = "st",
+};
+
+static const cmd_decl_t llm_set_model_decl = {
+  .module      = "llm",
+  .name        = "model",
+  .usage       = "llm set model <name> max_context <tokens>",
+  .description = "Declare a model's context window in tokens",
+  .group       = USERNS_GROUP_ADMIN,
+  .level       = 100,
+  .scope       = CMD_SCOPE_ANY,
+  .methods     = METHOD_T_ANY,
+  .cb          = cmd_llm_set_model,
+  .parent_path = "llm/set",
+  .abbrev      = "m",
+  .arg_desc    = ad_set_model,
+  .arg_count   = (uint8_t)(sizeof(ad_set_model) / sizeof(ad_set_model[0])),
 };
 
 static const cmd_decl_t llm_del_service_decl = {
@@ -2406,6 +2541,9 @@ llm_register_commands(void)
   cmd_register(&llm_del_decl);
   cmd_register(&llm_del_service_decl);
   cmd_register(&llm_del_model_decl);
+
+  cmd_register(&llm_set_decl);
+  cmd_register(&llm_set_model_decl);
 
   // service <name> <action> (refresh)
   cmd_register(&llm_service_decl);

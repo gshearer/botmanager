@@ -154,6 +154,13 @@ void chatbot_personality_free(struct chatbot_personality_s *p);
 // with a narrower allowlist never pays for what it does not offer.
 #define CHATBOT_NL_COMMANDS_MAX_BYTES  16384
 
+// ...and the ceiling is no longer the only bound, because 16 KiB was
+// half of a fixed 32 KiB buffer and is twice a CHATBOT_PROMPT_MIN one.
+// The block now also takes at most this fraction of whatever budget the
+// request actually got, so the two numbers keep their old relationship
+// on a large prompt and stop swallowing a small one.
+#define CHATBOT_NL_COMMANDS_BUDGET_DIV 4
+
 // Personality record (in-memory copy of a personalities table row).
 //
 // `body` is the persona-shaping content. The output contract is loaded
@@ -811,7 +818,26 @@ bool chatbot_floor_take(chatbot_floor_t *f, const char *channel, time_t now,
 
 // inference.h (already included above) provides knowledge_image_t.
 
-#define CHATBOT_PROMPT_SZ                  (32 * 1024)
+// System-prompt budget. There is no single right size: the buffer counts
+// bytes, the model counts tokens, and the registered chat models differ
+// by more than two orders of magnitude. So the size is derived per
+// request from the model in use (chatbot_prompt_budget, reply.c) and
+// these only bound the answer.
+//
+// MIN is also the answer for a model the registry cannot describe: an
+// unknown window is one we must assume is small.
+#define CHATBOT_PROMPT_MIN                 (8 * 1024)
+#define CHATBOT_PROMPT_MAX                 (256 * 1024)
+
+// Deliberately pessimistic — English averages nearer four. Under-
+// estimating bytes per token under-fills the prompt, which costs
+// context; over-estimating overruns the model's window, which costs the
+// whole request.
+#define CHATBOT_BYTES_PER_TOKEN            3
+
+// Slack between our estimate and the provider's tokeniser, which is not
+// ours and never will be.
+#define CHATBOT_PROMPT_HEADROOM_TOKENS     512
 #define CHATBOT_IMAGE_SUBJECT_SZ           128
 
 // Deterministic one-liner emitted by the CV-4 fallback when a reply
@@ -927,7 +953,7 @@ typedef struct
   // Byte budget for the RECENT CONVERSATION block, snapshot from
   // `memory.rag_max_context_chars` at submit time for the same reason
   // the knowledge budget is. 0 means unbounded — the whole system
-  // prompt is still capped by CHATBOT_PROMPT_SZ.
+  // prompt is still capped by the per-request budget.
   uint32_t        memory_max_chars;
 
   // Image-splice knobs (I2). rag_images_per_reply doubles as the master

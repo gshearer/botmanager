@@ -742,6 +742,33 @@ llm_model_kind(const char *name, llm_kind_t *out)
   return(fn(name, out));
 }
 
+// The model's declared context window in TOKENS. FAIL means the registry
+// has no such row — the caller cannot infer a window and must fall back
+// to something it can defend. ⭑ Read it per request: `llm model set`
+// mutates the registry at runtime, so a cached copy goes stale silently.
+static inline bool
+llm_model_max_context(const char *name, uint32_t *out)
+{
+  typedef bool (*fn_t)(const char *, uint32_t *);
+  static fn_t cached = NULL;
+  fn_t        fn     = __atomic_load_n(&cached, __ATOMIC_ACQUIRE);
+
+  if(fn == NULL)
+  {
+    union { void *obj; fn_t fn; } u;
+
+    u.obj = plugin_dlsym_cached("inference", "llm_model_max_context", (void **)&cached);
+    if(u.obj == NULL)
+    {
+      clam(CLAM_FATAL, "inference", "dlsym failed: llm_model_max_context");
+      abort();
+    }
+    fn = u.fn;
+    __atomic_store_n(&cached, fn, __ATOMIC_RELEASE);
+  }
+  return(fn(name, out));
+}
+
 // SUCCESS with *out filled if this model has been seen since *out.since;
 // FAIL if it has not, which is NOT the same as zero requests — a registered
 // model that has never run has no row. `out->since` is filled either way.
