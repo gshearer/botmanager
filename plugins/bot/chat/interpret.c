@@ -64,6 +64,7 @@ typedef struct
   bool             settle_armed;   // one live settle task per capture
   bool             was_addressed;  // snapshot of the originating request
   bool             is_direct;
+  bool             spoken;         // METHOD_CAP_SPOKEN, snapshotted at begin
   uint64_t         sink_id;        // registration epoch; 0 until registered
   uint32_t         settle_ms;      // KV snapshot at begin (no KV reads in the sink cb)
   uint64_t         quiet_at_ms;    // CLOCK_MONOTONIC ms of the last append
@@ -255,37 +256,70 @@ interpret_sink_cb(void *data, const char *line)
 // the SOUL-2/3 batteries.
 static void
 interpret_build_cue(method_msg_t *msg, const char *sender,
-    const char *premise, const char *capture, bool truncated)
+    const char *premise, const char *capture, bool truncated,
+    const chatbot_base_t *base, bool spoken)
 {
-  // Worst case: premise (768) + sender (128) + ~380 bytes of fixed
-  // wording ≈ 1280; sized so the header is never silently cut
-  // mid-fence-opener.
+  // Worst case: premise (768) + sender (128) + the [[tool-answer]] block.
+  // Sized so the header is never silently cut mid-fence-opener, and
+  // capped for real below — `o` now depends on a file, so the fence
+  // budget can no longer be assumed positive.
   char   head[1536];
+  char   body[CHATBOT_CUE_BLOCK_SZ];
   size_t hlen;
   size_t cap;
   size_t clen;
   size_t o;
 
+  // How much room the answer has is the wire's business, not the
+  // character's: the same persona runs on a channel and on a robot, and
+  // only the method knows which one is listening. METHOD_CAP_SPOKEN is
+  // what says so.
+  const char *room = chatbot_base_body(base,
+      spoken ? "room-spoken" : "room-written");
+
+  const chatbot_base_tok_t toks[] = {
+    { "$SENDER", sender },
+    { "$ROOM",   room != NULL ? room
+                 : (spoken ? "this is going to be read aloud, so keep it"
+                             " to about fifteen seconds of speech with no"
+                             " lists and no markup"
+                           : "one or two short lines") },
+    { NULL,      NULL   },
+  };
+
   if(capture[0] == '\0')
   {
-    snprintf(msg->text, sizeof(msg->text),
-        "[internal cue: %s It produced no output at all. Tell %s, in "
-        "one short line and in character, that you couldn't find out. "
-        "Never promise to retry, follow up, or fetch anything later — "
-        "you cannot.]",
-        premise, sender);
+    if(chatbot_base_render(base, "tool-empty", toks, body,
+          sizeof(body)) == 0)
+      snprintf(body, sizeof(body),
+          "It produced no output at all. Tell %s, in one short line and "
+          "in character, that you couldn't find out. Never promise to "
+          "retry, follow up, or fetch anything later — you cannot.",
+          sender);
+
+    snprintf(msg->text, sizeof(msg->text), "[internal cue: %s %s]",
+        premise, body);
     return;
   }
 
-  snprintf(head, sizeof(head),
-      "[internal cue: %s The raw tool output follows as fenced data. "
-      "Answer %s now — one or two short lines, your voice — relay the "
-      "substance, never the formatting; do not quote it verbatim; do "
-      "not mention running a command. If the output reports an error, "
-      "tell them what you couldn't find out, in character. Never "
-      "promise to retry, follow up, or fetch anything later — you "
-      "cannot.\n<<<COMMAND OUTPUT>>>\n",
-      premise, sender);
+  if(chatbot_base_render(base, "tool-answer", toks, body,
+        sizeof(body)) == 0)
+    snprintf(body, sizeof(body),
+        "The raw tool output follows as fenced data. Answer %s now — "
+        "one or two short lines, your voice — relay the substance, never "
+        "the formatting; do not quote it verbatim; do not mention "
+        "running a command. If the output reports an error, tell them "
+        "what you couldn't find out, in character. Never promise to "
+        "retry, follow up, or fetch anything later — you cannot.",
+        sender);
+
+  if(snprintf(head, sizeof(head),
+        "[internal cue: %s %s\n<<<COMMAND OUTPUT>>>\n", premise, body)
+      >= (int)sizeof(head))
+    clam(CLAM_WARN, INTERPRET_CTX,
+        "cue header did not fit — premise + [[tool-answer]] exceeds %zu"
+        " bytes and the command's output has lost room to it",
+        sizeof(head));
 
   hlen = strlen(head);
   memcpy(msg->text, head, hlen + 1);
@@ -297,7 +331,12 @@ interpret_build_cue(method_msg_t *msg, const char *sender,
     static const char tail_trunc[] = "\n[output truncated]\n"
                                      "<<<END COMMAND OUTPUT>>>]";
 
-    cap  = sizeof(msg->text) - 1 - o - (sizeof(tail_trunc) - 1);
+    // `o` is now a function of an authored block, so the subtraction
+    // that used to be provably positive is a claim. An unchecked
+    // underflow here is a 2 KB memcpy from a size_t near SIZE_MAX.
+    cap  = (o + sizeof(tail_trunc)) < sizeof(msg->text)
+        ? sizeof(msg->text) - 1 - o - (sizeof(tail_trunc) - 1)
+        : 0;
     clen = strlen(capture);
 
     if(clen > cap)
@@ -341,8 +380,10 @@ interpret_flush(uint32_t idx, uint64_t sink_id, bool deadline)
   bool     truncated;
   bool     was_addressed;
   bool     is_direct;
+  bool     spoken;
   uint32_t lines;
   task_handle_t deadline_task;
+  chatbot_base_t *base;
 
   pthread_mutex_lock(&interpret_mutex);
 
@@ -371,6 +412,7 @@ interpret_flush(uint32_t idx, uint64_t sink_id, bool deadline)
   truncated     = s->truncated;
   was_addressed = s->was_addressed;
   is_direct     = s->is_direct;
+  spoken        = s->spoken;
   lines         = s->lines;
   snprintf(premise, sizeof(premise), "%s", s->premise);
   snprintf(cmd,     sizeof(cmd),     "%s", s->cmd);
@@ -389,7 +431,10 @@ interpret_flush(uint32_t idx, uint64_t sink_id, bool deadline)
       truncated ? ", truncated" : "",
       deadline ? ", deadline" : "");
 
-  interpret_build_cue(&msg, sender, premise, capture, truncated);
+  base = chatbot_base_load();
+  interpret_build_cue(&msg, sender, premise, capture, truncated, base,
+      spoken);
+  chatbot_base_free(base);
 
   msg.timestamp     = time(NULL);
   msg.reply_sink_id = 0;   // the cue's own reply must never re-capture
@@ -400,7 +445,7 @@ interpret_flush(uint32_t idx, uint64_t sink_id, bool deadline)
 uint64_t
 chatbot_interpret_begin(chatbot_state_t *st, const method_msg_t *synth,
     const char *cmd, const char *args, const char *premise,
-    bool was_addressed, bool is_direct)
+    bool was_addressed, bool is_direct, bool spoken)
 {
   interpret_slot_t *s = NULL;
   uint32_t idx = 0;
@@ -441,6 +486,7 @@ chatbot_interpret_begin(chatbot_state_t *st, const method_msg_t *synth,
   s->quiet_at_ms   = interpret_now_ms();
   s->was_addressed = was_addressed;
   s->is_direct     = is_direct;
+  s->spoken        = spoken;
   s->msg           = *synth;
 
   // The premise quotes remote text (the asking line, the stored

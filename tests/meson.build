@@ -131,6 +131,25 @@ test_hold = executable('test_hold',
   dependencies : core_deps,
 )
 
+# The base prompt's block parser. It reads a file a human edits, which
+# is the whole point of it existing, so malformed input is the expected
+# case rather than the adversarial one — and a body that silently
+# swallows the block below it reaches the model as prose. The suite
+# compiles the one translation unit and stubs the single loader symbol
+# it does not exercise; BASE_TXT_PATH makes the shipped document a case,
+# because nothing else here would notice it stop validating.
+test_baseprompt = executable('test_baseprompt',
+  'test_baseprompt.c',
+  '../plugins/bot/chat/baseprompt.c',
+  c_args : ['-DBASE_TXT_PATH="' + meson.project_source_root()
+            + '/personalities/base.txt"'],
+  include_directories : [include_directories('.'), inc_include,
+                         inference_include,
+                         include_directories('../plugins/bot/chat')],
+  link_with : [test_harness, libcore],
+  dependencies : core_deps,
+)
+
 # whenmoon's barrier for a deferred task that re-arms itself. A drain
 # that returns while a body is still inside the plugin is a dlclose over
 # live code and says nothing at the time — OBS-43 crashed a reload
@@ -483,6 +502,7 @@ test('shorturl_token', test_shorturl_token)
 test('db_txn', test_db_txn)
 test('cooldown', test_cooldown)
 test('hold', test_hold)
+test('baseprompt', test_baseprompt)
 test('warm_chain', test_warm_chain)
 test('fact_merge', test_fact_merge)
 test('knowledge_dedup', test_knowledge_dedup)

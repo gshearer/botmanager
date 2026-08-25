@@ -27,6 +27,32 @@
 #define CHATBOT_PERSONALITY_DIR "./personalities"
 #define CHATBOT_CONTRACT_DIR    "./personalities/contracts"
 
+// The base prompt sits in the personality directory under a reserved
+// stem: it is the document an author reaches for next to the personas,
+// and `ls personalities/` should say so. Reserved means the persona
+// loader and the /show personalities scan both refuse it — a bot whose
+// behavior.personality is "base" would otherwise load the shared
+// document as a character.
+#define CHATBOT_BASE_STEM       "base"
+
+// The slash-line shape chatbot_nl_extract_cmd() parses, spelled once so
+// the [[commands]] block substitutes what the parser actually accepts.
+#define CHATBOT_NL_CMD_SHAPE    "/<name> <args>"
+
+// Working buffer for one rendered base block. The largest today is the
+// COMMANDS preamble at roughly 500 bytes; the rest are a paragraph.
+#define CHATBOT_BASE_RENDER_SZ  2048
+
+// …except in the interpret cue, where the block shares one METHOD_TEXT_SZ
+// message with the premise AND the command's own output. The head buffer
+// there is 1536 and carries `[internal cue: ` + premise
+// (INTERPRET_PREMISE_SZ) + ' ' + this + the fence opener:
+// 15 + 768 + 1 + 704 + 22 = 1510. Raising either one narrows what is
+// left for the answer the persona is being asked to read.
+#define CHATBOT_CUE_BLOCK_SZ    704
+#define CHATBOT_BASE_BLOCKS_MAX 32
+#define CHATBOT_BASE_TOKEN_SZ   32
+
 // Header-only view of a personality file (frontmatter parse only).
 // Used by /show personalities to render a catalogue row without
 // slurping the body or the contract. `ok == false` means the parse
@@ -87,6 +113,67 @@ bool chatbot_contract_read_header(const char *name, persona_header_t *hdr);
 // Walk bot.chat.contractpath and invoke cb() once per *.txt stem.
 size_t chatbot_contract_scan(chatbot_personality_visit_cb cb, void *data);
 
+// The base prompt — the third authoring tier, and the only one that is
+// not selectable per bot. Personality says who the bot is, the contract
+// says how its output must look, and this says everything both of them
+// would otherwise have to repeat: the anti-injection clauses, the
+// command preamble, the register a tool's answer comes back in, and the
+// two lines the bot says when it has nothing.
+//
+// Read fresh per request, exactly as the personality and contract are,
+// so an edit is live on the next reply with no reload. A load that
+// fails — file missing, a required block gone, a required $TOKEN edited
+// out — returns NULL having said why; the caller falls back to its
+// compiled default rather than generating without the clause.
+//
+// Not thread-safe and not meant to be shared: a request owns one.
+struct chatbot_base_s;
+typedef struct chatbot_base_s chatbot_base_t;
+
+// One substitution offered to chatbot_base_render. `name` carries its
+// own '$' ("$NICK"); a NULL name terminates the array. An unmatched
+// token in the prose is copied through verbatim, so a bare '$' is safe.
+typedef struct
+{
+  const char *name;
+  const char *value;
+} chatbot_base_tok_t;
+
+chatbot_base_t *chatbot_base_load(void);
+void            chatbot_base_free(chatbot_base_t *b);
+
+// The two halves chatbot_base_load is made of, split so the parser can
+// be exercised without a filesystem or a KV registry. chatbot_base_parse
+// TAKES OWNERSHIP of `raw` — which must be mem_alloc'd and
+// NUL-terminated — and never fails; chatbot_base_validate is what decides
+// whether the document is usable, writing the first problem it finds into
+// `err` for the caller to report with the path it knows.
+chatbot_base_t *chatbot_base_parse(char *raw);
+bool            chatbot_base_validate(const chatbot_base_t *b, char *err,
+                    size_t err_sz);
+
+// Body of one named block, trimmed and NUL-terminated, valid until
+// chatbot_base_free. NULL names a block this file does not carry —
+// which, for anything in the required table, cannot happen in a base
+// that loaded.
+const char *chatbot_base_body(const chatbot_base_t *b, const char *name);
+
+// Render `block` into dst with $TOKEN substitution. Returns bytes
+// written, 0 when the block is absent. Truncates rather than failing:
+// a prompt clause that arrives short is better than one that does not
+// arrive.
+size_t chatbot_base_render(const chatbot_base_t *b, const char *block,
+    const chatbot_base_tok_t *toks, char *dst, size_t dst_sz);
+
+// Copy ONE line of a block into dst, rotating between uses. For the
+// lines the bot says for itself, where saying the same eight characters
+// every time is the defect: an author gives the block as many
+// alternatives as they like, one per line, and a single-line block
+// still always returns that line. NULL when the block is absent or
+// empty — the caller keeps its compiled default.
+const char *chatbot_base_pick(const chatbot_base_t *b, const char *name,
+    char *dst, size_t dst_sz);
+
 // Release heap-alloc'd fields inside *p. Safe on zero-initialised or
 // partially-populated structures; idempotent (zeroes the freed slots).
 void chatbot_personality_free(struct chatbot_personality_s *p);
@@ -119,6 +206,21 @@ void chatbot_personality_free(struct chatbot_personality_s *p);
 #define CHATBOT_PERSONALITY_DESC_SZ   200
 #define CHATBOT_PERSONALITY_BODY_SZ   (16 * 1024)
 #define CHATBOT_PERSONALITY_PATH_SZ   512
+
+// The parsed base prompt. Block bodies point into `raw`, which holds
+// the whole document with a NUL written where each `[[header]]` line
+// began — so however many blocks a file carries it costs two
+// allocations, and no body is ever copied.
+struct chatbot_base_s
+{
+  char  *raw;
+  struct
+  {
+    const char *name;
+    const char *body;
+  } blk[CHATBOT_BASE_BLOCKS_MAX];
+  size_t n;
+};
 
 // Opaque blob storing the personality's `interests:` frontmatter section
 // as JSON. Parsed lazily by chatbot_interests_parse() at bot start; empty
@@ -869,7 +971,12 @@ bool chatbot_floor_take(chatbot_floor_t *f, const char *channel, time_t now,
 // Keep each prefix beside its length so the compare and the `line + N`
 // bump stay in sync; chatbot_emote_prefix_len matches both and is the
 // only place either is spelled out.
-#define CHATBOT_EMOTE_PREFIX               "/me "
+// The action verb and the prefix that carries it. Two names because the
+// parser wants the trailing space and the prose does not — and because
+// the base prompt substitutes this into a sentence an author wrote, so
+// the runtime and the document must agree on it exactly once.
+#define CHATBOT_EMOTE_VERB                 "/me"
+#define CHATBOT_EMOTE_PREFIX               CHATBOT_EMOTE_VERB " "
 #define CHATBOT_EMOTE_PREFIX_LEN           4
 #define CHATBOT_ACTION_PREFIX              "ACTION "
 #define CHATBOT_ACTION_PREFIX_LEN          7
@@ -939,6 +1046,7 @@ typedef struct
   char            personality_name[CHATBOT_PERSONALITY_NAME_SZ];
   char           *personality_body;    // mem_alloc'd
   char           *contract_body;       // mem_alloc'd; chatbot_contract_read
+  chatbot_base_t *base;                // chatbot_base_load; NULL = compiled defaults
   char           *system_prompt;       // mem_alloc'd, assembled
 
   // Knowledge binding: semicolon-separated corpus list from
@@ -1110,9 +1218,12 @@ bool chatbot_persona_reply(void *handle, const cmd_ctx_t *ctx,
 // the output fence follow it. Control bytes are flattened on copy.
 // Returns 0 when no slot is free (caller dispatches uncaptured — the
 // channel gets the verbatim block, never silence).
+// `spoken` is METHOD_CAP_SPOKEN, snapshotted here because the flush runs
+// on a task worker long after the request is gone — and because it, not
+// the persona, decides how much room the answer has.
 uint64_t chatbot_interpret_begin(chatbot_state_t *st,
     const method_msg_t *synth, const char *cmd, const char *args,
-    const char *premise, bool was_addressed, bool is_direct);
+    const char *premise, bool was_addressed, bool is_direct, bool spoken);
 
 // Retract every live capture owned by `st` (bot stop), or every
 // capture regardless of owner (plugin stop). Sinks are unregistered

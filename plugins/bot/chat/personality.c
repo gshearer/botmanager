@@ -123,6 +123,17 @@ mp_resolve_path(const char *name, char *out, size_t sz)
   if(name == NULL || name[0] == '\0')
     return(false);
 
+  // Reserved: base.txt is the shared prompt document, not a persona.
+  // Loading it as one would splice every block header into the system
+  // prompt as though a character had written them.
+  if(strcmp(name, CHATBOT_BASE_STEM) == 0)
+  {
+    clam(CLAM_WARN, "chatbot",
+        "'%s' is the base prompt, not a personality — refused",
+        CHATBOT_BASE_STEM);
+    return(false);
+  }
+
   // Defence in depth: refuse paths with directory separators in the
   // stem so an attacker-controlled bot.<name>.behavior.personality
   // can't escape the personalitypath root.
@@ -601,6 +612,10 @@ chatbot_personality_scan(chatbot_personality_visit_cb cb, void *data)
 
     memcpy(stem, nm, slen);
     stem[slen] = '\0';
+
+    // The base prompt shares this directory and is not a character.
+    if(strcmp(stem, CHATBOT_BASE_STEM) == 0)
+      continue;
 
     cb(stem, data);
     count++;

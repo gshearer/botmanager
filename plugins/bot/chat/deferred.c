@@ -504,7 +504,8 @@ deferred_deliver_run(chatbot_state_t *st, bot_inst_t *bot, uint32_t ns_id,
   // sees. Slot exhaustion returns 0 and the command's own output goes
   // to the wire verbatim — never silence.
   msg->reply_sink_id = chatbot_interpret_begin(st, msg, verb, args,
-      premise, false, false);
+      premise, false, false,
+      (method_inst_caps(msg->inst) & METHOD_CAP_SPOKEN) != 0);
 
   if(args[0] != '\0')
     snprintf(msg->text, sizeof(msg->text), "%s%s %s", prefix, verb, args);
