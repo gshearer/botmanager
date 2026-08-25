@@ -652,8 +652,11 @@ report() {
 
   [ "${EXTRA[Bsent]:-0}" -gt 0 ] && printf '           routed %s/%s   flipped cases %s\n' \
       "${EXTRA[Brouted]:-0}" "${EXTRA[Bsent]:-0}" "${EXTRA[Bflip]:-0}"
-  [ "$SKIPPED" -gt 0 ] && printf '           %d case(s) skipped: refused after %d attempts\n' \
-      "$SKIPPED" "$RETRY_MAX"
+  # Skips are never failures and never scores; each one said why when it
+  # happened, so this is only the count.
+  [ "$SKIPPED" -gt 0 ] && printf \
+      '           %d case(s) skipped and NOT scored - see the notes above\n' \
+      "$SKIPPED"
 
   {
     for m in A B C; do
