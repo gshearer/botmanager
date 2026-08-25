@@ -248,8 +248,7 @@ tmdb_render_title(const cmd_ctx_t *ctx, const tmdb_title_t *t, bool verbose)
 
     if(t->year > 0)
       snprintf(line, sizeof(line),
-          CLR_BOLD "%s" CLR_RESET " (" CLR_YELLOW "%d" CLR_RESET ") "
-          CLR_GRAY "· %s" CLR_RESET,
+          CLR_BOLD "%s" CLR_RESET " " CLR_GRAY "(%d) · %s" CLR_RESET,
           t->title, t->year, meta);
     else
       snprintf(line, sizeof(line),
@@ -551,7 +550,7 @@ tmdb_render_list(const cmd_ctx_t *ctx, const tmdb_req_t *r,
     char label[80];
 
     if(h->year > 0)
-      snprintf(year, sizeof(year), " (" CLR_YELLOW "%d" CLR_RESET ")", h->year);
+      snprintf(year, sizeof(year), " " CLR_GRAY "(%d)" CLR_RESET, h->year);
     else
       year[0] = '\0';
 
