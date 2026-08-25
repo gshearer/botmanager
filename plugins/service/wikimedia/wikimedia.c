@@ -728,13 +728,14 @@ wm_resolve_cirrus_done(const curl_response_t *resp)
 
   if(root == NULL)
   {
+    w->u.resolve.cirrus_st = status;
     clam(CLAM_WARN, WIKIMEDIA_CTX, "search leg failed: %s",
         msg[0] != '\0' ? msg : "no match");
     wm_leg_retire(w);
     return;
   }
 
-  w->u.resolve.reached = true;
+  w->u.resolve.cirrus_st = WM_OK;
   query = json_get_obj(root, "query");
   hits  = query != NULL ? json_get_array(query, "search") : NULL;
   len   = hits != NULL ? (int)json_object_array_length(hits) : 0;
@@ -778,13 +779,14 @@ wm_resolve_wbs_done(const curl_response_t *resp)
 
   if(root == NULL)
   {
+    w->u.resolve.wbs_st = status;
     clam(CLAM_WARN, WIKIMEDIA_CTX, "alias leg failed: %s",
         msg[0] != '\0' ? msg : "no match");
     wm_leg_retire(w);
     return;
   }
 
-  w->u.resolve.reached = true;
+  w->u.resolve.wbs_st = WM_OK;
   hits = json_get_array(root, "search");
   len  = hits != NULL ? (int)json_object_array_length(hits) : 0;
 
@@ -876,12 +878,14 @@ wm_resolve_merge(wm_work_t *w)
   if(n == 0)
   {
     // A nonsense query answers cleanly with nothing, and that is an
-    // empty rather than a bad guess — but only if a searcher answered
-    // at all.
-    if(w->u.resolve.reached)
+    // empty rather than a bad guess — but only when BOTH searchers
+    // answered. A refused leg looked at nothing, so its silence says
+    // nothing about whether the subject exists, and one of the two is
+    // enough to make the whole window's emptiness meaningless.
+    if(w->u.resolve.cirrus_st == WM_OK && w->u.resolve.wbs_st == WM_OK)
       wm_work_fail(w, WM_NOT_FOUND, "");
     else
-      wm_work_fail_wire(w, "neither wikidata searcher answered");
+      wm_work_fail_wire(w, "a wikidata searcher was refused");
 
     return;
   }
@@ -1003,6 +1007,14 @@ wm_claims_dispatch(wm_work_t *w)
   // The +1 guard keeps `w` alive across the whole submit loop even when
   // every leg completes before the loop returns.
   atomic_store(&w->pending, (uint_least8_t)(w->u.claims.n_cand + 1));
+
+  // Before the first launch, never after one: WM_OK is 0 and the work is
+  // zeroed, so a candidate that never flies would read as one that
+  // answered with nothing — and a leg can complete on a curl worker
+  // between its own wm_launch() and the next statement here, so a seed
+  // written after the launch would race its own answer back to unread.
+  for(uint8_t i = 0; i < w->u.claims.n_cand; i++)
+    w->u.claims.got[i].status = WM_TRANSPORT;
 
   for(uint8_t i = 0; i < w->u.claims.n_cand; i++)
   {
@@ -1221,14 +1233,22 @@ wm_claims_choose(wm_work_t *w)
   uint8_t          n_ids;
   int              need;
   bool             answered = false;
-  bool             reached  = false;
+  bool             all_in   = true;
+
+  // The fall-through below stops at the first candidate that HAS a
+  // statement, so the reachability sweep is its own loop over every
+  // candidate — a later one being refused is exactly the case that must
+  // not be reported as "this item records no such property".
+  for(uint8_t i = 0; i < w->u.claims.n_cand; i++)
+  {
+    if(w->u.claims.got[i].status != WM_OK)
+      all_in = false;
+  }
 
   for(uint8_t i = 0; i < w->u.claims.n_cand && !answered; i++)
   {
     const wm_claims_res_t *got  = &w->u.claims.got[i];
     const wm_property_t   *cand = &w->u.claims.cand[i];
-
-    reached |= got->status == WM_OK;
 
     if(got->status != WM_OK || got->n == 0)
       continue;
@@ -1243,12 +1263,13 @@ wm_claims_choose(wm_work_t *w)
 
   if(!answered)
   {
-    // Nothing recorded, and nothing wrong either — unless no candidate
-    // was reachable at all, which is a different answer entirely.
-    if(reached)
+    // Nothing recorded, and nothing wrong either — but only when EVERY
+    // candidate answered. One refused leg and this is not "the item
+    // records no date of death", it is "we did not get to look".
+    if(all_in)
       wm_work_fail(w, WM_NOT_FOUND, "");
     else
-      wm_work_fail_wire(w, "wikidata did not answer");
+      wm_work_fail_wire(w, "wikidata did not answer for every property");
 
     return;
   }
@@ -1797,6 +1818,10 @@ wm_reverse_dispatch(wm_work_t *w)
   // every leg completes before the loop returns.
   atomic_store(&w->pending, (uint_least8_t)(w->u.reverse.n_cand + 1));
 
+  // Before the first launch, for the reason wm_claims_run gives.
+  for(uint8_t i = 0; i < w->u.reverse.n_cand; i++)
+    w->u.reverse.st[i] = WM_TRANSPORT;
+
   for(uint8_t i = 0; i < w->u.reverse.n_cand; i++)
   {
     char      url[WM_URL_SZ];
@@ -1863,13 +1888,14 @@ wm_reverse_leg_done(const curl_response_t *resp)
 
   if(root == NULL)
   {
+    w->u.reverse.st[idx] = status;
     clam(CLAM_WARN, WIKIMEDIA_CTX, "reverse leg failed: %s",
         msg[0] != '\0' ? msg : "no match");
     wm_leg_retire(w);
     return;
   }
 
-  w->u.reverse.reached = true;
+  w->u.reverse.st[idx] = WM_OK;
   query = json_get_obj(root, "query");
   info  = query != NULL ? json_get_obj(query, "searchinfo") : NULL;
   hits  = query != NULL ? json_get_array(query, "search") : NULL;
@@ -1914,13 +1940,21 @@ wm_reverse_choose(wm_work_t *w)
 
   if(!answered)
   {
-    // Nothing holds that statement, and nothing is wrong either —
-    // unless no candidate was reachable at all, which is a different
-    // answer entirely.
-    if(w->u.reverse.reached)
+    bool all_in = true;
+
+    for(uint8_t i = 0; i < w->u.reverse.n_cand; i++)
+    {
+      if(w->u.reverse.st[i] != WM_OK)
+        all_in = false;
+    }
+
+    // Nothing holds that statement, and nothing is wrong either — but
+    // only when EVERY candidate answered. One refused leg and "nobody
+    // holds this statement" is a claim about pages nothing looked at.
+    if(all_in)
       wm_work_fail(w, WM_NOT_FOUND, "");
     else
-      wm_work_fail_wire(w, "wikidata did not answer");
+      wm_work_fail_wire(w, "wikidata did not answer for every property");
 
     return;
   }
@@ -1981,6 +2015,11 @@ wm_resolve_async(const char *name, wm_resolve_cb_t cb, void *user)
   w = wm_work_open(WM_VERB_RESOLVE, user);
   w->cb.resolve = cb;
   strlcpy(w->u.resolve.key, key, sizeof(w->u.resolve.key));
+
+  // Neither leg has answered yet, and a leg whose launch fails never
+  // will — WM_OK is 0, so "nobody answered" has to be written down.
+  w->u.resolve.cirrus_st = WM_TRANSPORT;
+  w->u.resolve.wbs_st    = WM_TRANSPORT;
 
   // The +1 guard keeps `w` alive across both submits even when the
   // first leg completes before the second is built.

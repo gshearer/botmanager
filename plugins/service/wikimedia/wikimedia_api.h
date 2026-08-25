@@ -56,6 +56,24 @@
 // waiting for this answer is the caller — so the service reports the
 // wait and lets whoever asked decide.
 //
+// ⛔⛔ The same rule binds every fan-out INSIDE this service, and it is
+// the one that is easy to get wrong: WM_NOT_FOUND may be reported only
+// when EVERY leg answered. Three verbs fan out — the merged resolver's
+// two searchers, the claims candidate set, the reverse candidate set —
+// and each of them used to report an empty result as WM_NOT_FOUND once
+// ANY leg had answered. A refused leg looked at nothing, so its silence
+// is not evidence of absence: half a candidate window came back as
+// Wikidata's considered opinion that no such thing exists, and a
+// three-property fan-out with one property fetched came back as "this
+// item records no height".
+//
+// ⚠ WM_OK is 0 and the work is zeroed, so "nobody answered yet" has to
+// be written down: every fan-out seeds its per-leg status slots to
+// WM_TRANSPORT BEFORE its first launch — after one, a leg completing on
+// a curl worker would race its own answer back to unread — and each leg
+// writes only its own slot, which is also what keeps two legs off one
+// shared flag.
+//
 // ----------------------------------------------------------------------
 // Normalization the service owns (the consumer only presents)
 // ----------------------------------------------------------------------

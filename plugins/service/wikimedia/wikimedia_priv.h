@@ -104,7 +104,14 @@ struct wm_work
       uint8_t n_cirrus;
       char    wbs[WM_SEARCH_LIMIT][WM_QID_SZ];     // leg b, alias-tolerant
       uint8_t n_wbs;
-      bool    reached;                             // either searcher answered
+
+      // Each leg's own verdict, written by that leg alone and read after
+      // the fan-out barrier. WM_OK is 0 and the work is zeroed, so a leg
+      // that never flew would read as one that answered — every launch
+      // seeds these to WM_TRANSPORT and each leg promotes its own.
+      wm_status_t cirrus_st;                       // leg a
+      wm_status_t wbs_st;                          // leg b
+
       wm_resolve_res_t res;
     } resolve;
 
@@ -162,10 +169,10 @@ struct wm_work
 
       // One candidate's matches, filled by that candidate's own leg and
       // read only after the fan-out barrier.
-      char    got[WM_PROP_CANDIDATES][WM_REVERSE_LIMIT][WM_QID_SZ];
-      uint8_t n_got[WM_PROP_CANDIDATES];
-      int32_t total[WM_PROP_CANDIDATES];
-      bool    reached;
+      char        got[WM_PROP_CANDIDATES][WM_REVERSE_LIMIT][WM_QID_SZ];
+      uint8_t     n_got[WM_PROP_CANDIDATES];
+      int32_t     total[WM_PROP_CANDIDATES];
+      wm_status_t st[WM_PROP_CANDIDATES];   // see resolve's, same rule
 
       wm_resolve_res_t res;
     } reverse;
