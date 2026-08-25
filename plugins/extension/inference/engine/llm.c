@@ -1223,14 +1223,107 @@ llm_role_str(llm_role_t r)
 // msg buffer.
 #define LLM_PROMPT_LOG_CHUNK   800
 
+// Four bytes for the longest UTF-8 sequence, two for the longest escape,
+// one for the NUL. Below this a slice could fit nothing and the walk
+// below would not advance; above it the "took nothing" case is
+// unreachable and needs no branch.
+_Static_assert(LLM_PROMPT_LOG_CHUNK >= 5,
+    "a prompt chunk must hold at least one escaped character");
+
+// Bytes in the UTF-8 sequence this lead byte opens. A malformed lead —
+// a stray continuation byte — counts as one, so a corrupt prompt still
+// makes progress instead of wedging the walk.
+static size_t
+llm_utf8_seq_len(unsigned char lead)
+{
+  if(lead < 0x80)           return(1);
+  if((lead & 0xe0) == 0xc0) return(2);
+  if((lead & 0xf0) == 0xe0) return(3);
+  if((lead & 0xf8) == 0xf0) return(4);
+
+  return(1);
+}
+
+// Escape as much of `src` as fits in `out`, and return the input bytes
+// consumed.
+//
+// Two things a naive `%.*s` of an 800-byte slice gets wrong, both
+// measured 2026-08-25 against a real 26 KB system prompt:
+//
+//   - clam() flattens every interior newline to a space (msg_flatten,
+//     core/clam.c) — deliberately, because one clam line is one line to
+//     the file writer, the subscriber stream and any IRC destination.
+//     A prompt trace is the one caller that needs the breaks back, so
+//     they go out as the two characters \n and the reader inverts it.
+//     A backslash is doubled to keep that inversion unambiguous.
+//   - a fixed byte slice cuts multi-byte characters in half. These
+//     prompts are full of em-dashes; the halves land in different log
+//     lines and neither is a character.
+//
+// Never splits a sequence and never emits half an escape, so each chunk
+// is independently well-formed.
+static size_t
+llm_prompt_escape_slice(const char *src, size_t len, char *out,
+    size_t out_sz)
+{
+  size_t in = 0;
+  size_t o  = 0;
+
+  while(in < len)
+  {
+    unsigned char c   = (unsigned char)src[in];
+    size_t        seq = llm_utf8_seq_len(c);
+    bool          esc = (c == '\n' || c == '\r' || c == '\\');
+
+    // A sequence running past the end of the content is truncated input,
+    // not a sequence; emit what is there rather than reading past it.
+    if(seq > len - in)
+      seq = len - in;
+
+    if(o + (esc ? 2 : seq) + 1 > out_sz)
+      break;
+
+    if(c == '\n')
+    {
+      out[o++] = '\\';
+      out[o++] = 'n';
+    }
+
+    else if(c == '\r')
+    {
+      out[o++] = '\\';
+      out[o++] = 'r';
+    }
+
+    else if(c == '\\')
+    {
+      out[o++] = '\\';
+      out[o++] = '\\';
+    }
+
+    else
+    {
+      memcpy(out + o, src + in, seq);
+      o += seq;
+    }
+
+    in += seq;
+  }
+
+  out[o] = '\0';
+  return(in);
+}
+
 static void
 llm_clam_prompt_content(const char *what, size_t idx, size_t n,
     const char *role, const char *content)
 {
+  char   chunk[LLM_PROMPT_LOG_CHUNK + 1];
   size_t len = (content == NULL) ? 0 : strlen(content);
-
-  size_t total;
+  size_t total = 0;
   size_t off;
+  size_t part;
+
   if(len == 0)
   {
     clam(CLAM_DEBUG5, "llm",
@@ -1239,21 +1332,24 @@ llm_clam_prompt_content(const char *what, size_t idx, size_t n,
     return;
   }
 
-  total = (len + LLM_PROMPT_LOG_CHUNK - 1) / LLM_PROMPT_LOG_CHUNK;
-  off = 0;
+  // Count first. Escaping and the UTF-8 boundary both make a chunk's
+  // input span variable, so part=N/M is no longer arithmetic on len —
+  // and N/M is what tells a reader the trace is complete.
+  for(off = 0; off < len; total++)
+    off += llm_prompt_escape_slice(content + off, len - off,
+        chunk, sizeof(chunk));
 
-  for(size_t part = 1; part <= total; part++)
+  // len stays the byte length of the ORIGINAL content: it is what a
+  // reassembled prompt is checked against, and the escaped form is
+  // longer by however many breaks it carried.
+  for(off = 0, part = 1; off < len; part++)
   {
-    size_t take = len - off;
-
-    if(take > LLM_PROMPT_LOG_CHUNK)
-      take = LLM_PROMPT_LOG_CHUNK;
+    off += llm_prompt_escape_slice(content + off, len - off,
+        chunk, sizeof(chunk));
 
     clam(CLAM_DEBUG5, "llm",
-        "prompt %s msg[%zu/%zu] role=%s part=%zu/%zu len=%zu: %.*s",
-        what, idx, n, role, part, total, len,
-        (int)take, content + off);
-    off += take;
+        "prompt %s msg[%zu/%zu] role=%s part=%zu/%zu len=%zu: %s",
+        what, idx, n, role, part, total, len, chunk);
   }
 }
 
