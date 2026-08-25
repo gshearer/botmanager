@@ -521,8 +521,14 @@ irc_join_channels(irc_state_t *st)
 
   kv_iterate_prefix(chan_prefix, irc_chan_collect_cb, &cc);
 
+  // Silence here is what made one bot's absence from its own channel
+  // invisible: registration had succeeded and the state was AVAILABLE.
   if(cc.count == 0)
+  {
+    clam(CLAM_WARN, "irc", "no channels configured under '%s' — %s joins "
+        "nothing", chan_prefix, st->cur_nick);
     return;
+  }
 
   // Join each channel that has autojoin enabled.
   for(uint32_t i = 0; i < cc.count; i++)
@@ -2206,6 +2212,55 @@ irc_init_networks(void)
         "restored %u network configuration entries", restored);
 }
 
+// Re-declare the per-channel KV group for every channel the database
+// remembers. It has to happen in init(): the only other thing that
+// materializes these keys is core's kv_claim_orphans(), which runs
+// *after* bot_restore() — so a bot whose RPL_WELCOME beats that call
+// walks an empty channel list and joins nothing, silently.
+//
+// Registering the group rather than the raw rows is also what survives a
+// plugin reload: core reclaims every Class-A KV entry at unload, and
+// nothing else re-declares these.
+void
+irc_init_channels(void)
+{
+  db_result_t *r = db_result_alloc();
+  uint32_t     restored = 0;
+
+  // Keys are "bot.<botname>.irc.chan.<channel>.<property>", so the two
+  // segments the group needs are 2 and 5, and DISTINCT collapses however
+  // many properties each channel carries down to the one pair.
+  if(db_query("SELECT DISTINCT split_part(key, '.', 2) AS bot, "
+      "split_part(key, '.', 5) AS chan FROM kv "
+      "WHERE key LIKE 'bot.%.irc.chan.%'", r) != SUCCESS)
+  {
+    // Indistinguishable from "no channels are configured" unless it says
+    // so, and every bot then autojoins nothing for the whole run.
+    clam(CLAM_WARN, "irc", "channel restore failed: %s",
+        r->error[0] != '\0' ? r->error : "(no driver error)");
+    db_result_free(r);
+    return;
+  }
+
+  for(uint32_t i = 0; i < r->rows; i++)
+  {
+    const char *botname = db_result_get(r, i, 0);
+    const char *channel = db_result_get(r, i, 1);
+
+    if(botname == NULL || botname[0] == '\0' ||
+        channel == NULL || channel[0] == '\0')
+      continue;
+
+    if(plugin_kv_group_register(&irc_kv_groups[0], botname, channel) > 0)
+      restored++;
+  }
+
+  db_result_free(r);
+
+  if(restored > 0)
+    clam(CLAM_INFO, "irc", "restored %u channel configurations", restored);
+}
+
 // Collect unique server names within a network. Shared between
 // irc_resolve_server() and irc_commands.c listing functions.
 void
@@ -2301,9 +2356,11 @@ irc_init(void)
 {
   // KV schema auto-registered by plugin loader.
 
-  // Restore dynamic irc.net.* entries from DB so kv_load() can populate
-  // them. Must happen before kv_load() which runs after all plugins init.
+  // Restore the dynamic irc.net.* and bot.*.irc.chan.* entries from the
+  // DB so kv_load() can populate them. Must happen before kv_load(),
+  // which runs once every plugin has init'd.
   irc_init_networks();
+  irc_init_channels();
 
   // Register all /irc and /show irc operator commands.
   irc_register_commands();

@@ -227,6 +227,7 @@ void irc_srv_list_cb(const char *key, kv_type_t type,
 void irc_chan_collect_cb(const char *key, kv_type_t type,
     const char *val, void *data);
 void irc_init_networks(void);
+void irc_init_channels(void);
 
 // A referenced socket session, or NULL when there is none. The caller
 // must sock_release() it — that reference is the whole reason a send
