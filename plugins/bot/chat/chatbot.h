@@ -1008,6 +1008,16 @@ typedef struct
   uint32_t        skip_sentinels_seen;
   uint32_t        nonskip_lines_sent;
 
+  // What the channel actually heard, accumulated line by line as each
+  // one clears the wire in send_line_marked. conversation_log is the
+  // record of what was SAID, and the model's raw output is not that:
+  // the NL bridge's slash-line and the SKIP sentinel are both stripped
+  // before the wire, while the CV-4 fallback reaches it without ever
+  // having been in resp->content. Written only from the curl worker
+  // that owns this request, which runs llm_chunk and llm_done in turn.
+  char            spoken[MEM_MSG_TEXT_SZ];
+  size_t          spoken_len;
+
   // CV-6 — Recent-own-replies anti-repeat slice. Populated in
   // chatbot_reply_submit via memory_recent_own_replies; rendered in
   // assemble_prompt step 4b so the persona's "do not repeat yourself"

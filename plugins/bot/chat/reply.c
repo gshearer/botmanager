@@ -1249,6 +1249,36 @@ chatbot_emote_prefix_len(const char *line)
   return(0);
 }
 
+// Remember one line exactly as the channel received it, so llm_done can
+// log what was said rather than what the model produced. The two differ
+// on every routed turn: the NL bridge's slash-line and the whole-line
+// SKIP sentinel are stripped above, and a row carrying either comes back
+// as one of the bot's own "recent replies" under a do-not-repeat
+// instruction -- which is how a turn that had the answer in hand
+// declines to give it. An emote keeps its "/me " so the record reads the
+// way the older whole-response one did.
+static void
+spoken_append(chatbot_req_t *r, const char *line, bool emote)
+{
+  size_t room;
+  int    n;
+
+  if(line == NULL || line[0] == '\0')
+    return;
+
+  room = sizeof(r->spoken) - r->spoken_len;
+
+  if(room <= 1)
+    return;
+
+  n = snprintf(r->spoken + r->spoken_len, room, "%s%s%s",
+      r->spoken_len > 0 ? "\n" : "", emote ? "/me " : "", line);
+
+  r->spoken_len = (n > 0 && (size_t)n < room)
+      ? r->spoken_len + (size_t)n
+      : sizeof(r->spoken) - 1;
+}
+
 // Rewrite the typeable markup a model can actually produce (`**bold**`,
 // `<red>…</red>`) into the abstract colour markers method_send resolves
 // per driver, then hand the line over. Translating here rather than
@@ -1273,6 +1303,10 @@ send_line_marked(chatbot_req_t *r, const char *line, bool emote)
 
   else
     method_send(r->method, r->reply_target, marked);
+
+  // The pre-markup line, because conversation_log holds prose and not
+  // wire control codes.
+  spoken_append(r, line, emote);
 }
 
 // TURN-1: did the bot just ask something? Last non-space byte only —
@@ -1501,6 +1535,7 @@ llm_done(const llm_chat_response_t *resp)
     if(allowed)
     {
       method_send(r->method, r->reply_target, CHATBOT_DIRECT_FALLBACK_TEXT);
+      spoken_append(r, CHATBOT_DIRECT_FALLBACK_TEXT, false);
       r->nonskip_lines_sent++;
       clam(CLAM_WARN, "chatbot",
           "bot=%s persona=%s: direct-address SKIP fallback fired"
@@ -1519,23 +1554,32 @@ llm_done(const llm_chat_response_t *resp)
   }
 
   // Log as EXCHANGE_OUT so future RAG pulls can reference own replies
-  // (gated by memory.embed_own_replies at the memory layer).
-  log.ns_id        = (int)r->ns_id;
-  log.user_id_or_0 = r->user_id;
-  log.dossier_id   = r->dossier_id;
-  snprintf(log.bot_name, sizeof(log.bot_name),
-      "%s", bot_inst_name(r->st->inst));
-  snprintf(log.method,  sizeof(log.method),
-      "%s", method_inst_kind(r->method));
-  snprintf(log.channel, sizeof(log.channel), "%s", r->channel);
-  log.kind = MEM_MSG_EXCHANGE_OUT;
-  snprintf(log.text, sizeof(log.text), "%s", resp->content);
+  // (gated by memory.embed_own_replies at the memory layer). What goes
+  // in is r->spoken -- the lines that reached the channel -- and a turn
+  // that spoke none logs none: a slash-line the bridge consumed and a
+  // SKIP the sentinel swallowed are not utterances, and the only live
+  // reader of these rows is the recent-own-replies anti-repeat slice,
+  // which acts on them as if they were.
+  if(r->spoken[0] != '\0')
+  {
+    log.ns_id        = (int)r->ns_id;
+    log.user_id_or_0 = r->user_id;
+    log.dossier_id   = r->dossier_id;
+    snprintf(log.bot_name, sizeof(log.bot_name),
+        "%s", bot_inst_name(r->st->inst));
+    snprintf(log.method,  sizeof(log.method),
+        "%s", method_inst_kind(r->method));
+    snprintf(log.channel, sizeof(log.channel), "%s", r->channel);
+    log.kind = MEM_MSG_EXCHANGE_OUT;
+    strlcpy(log.text, r->spoken, sizeof log.text);
 
-  memory_log_message(&log);
+    memory_log_message(&log);
+  }
 
   chatbot_inflight_record_reply(r->st, r->reply_target, time(NULL));
 
-  // NL-command bridge — after logging so the reply-text is persisted.
+  // NL-command bridge — on the raw content, which is where the
+  // slash-line still is.
   reply_nl_bridge(r, resp->content);
 
   req_free(r);
