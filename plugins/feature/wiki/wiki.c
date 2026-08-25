@@ -335,8 +335,9 @@ wiki_parse(const char *args, wiki_req_t *r)
   const char *rest;
   char       *p;
   char       *eq;
-  bool        list = false;
-  bool        menu = false;
+  char       *quote_end = NULL;
+  bool        list      = false;
+  bool        menu      = false;
   size_t      n;
 
   strlcpy(buf, args != NULL ? args : "", sizeof(buf));
@@ -396,15 +397,24 @@ wiki_parse(const char *args, wiki_req_t *r)
 
   if(*p == '"')
   {
+    quote_end = strchr(p + 1, '"');
+
+    // A quote with no partner is a line that ran out mid-pin, not a
+    // syntax error: drop the stray and read what is left the way an
+    // unquoted line is read. Refusing costs more than the lost pin does,
+    // because the asker is often the NL bridge, and a usage line reaches
+    // the persona there as though it were the answer. Core's own
+    // rest-of-line parser reads a lone quote the same way.
+    if(quote_end == NULL)
+      p++;
+  }
+
+  if(quote_end != NULL)
+  {
     // Quotes pin the subject outright — the one escape from the split.
-    char *close = strchr(p + 1, '"');
-
-    if(close == NULL)
-      return(false);
-
-    *close = '\0';
+    *quote_end = '\0';
     strlcpy(r->subject, p + 1, sizeof(r->subject));
-    p = close + 1;
+    p = quote_end + 1;
 
     while(*p == ' ')
       p++;
