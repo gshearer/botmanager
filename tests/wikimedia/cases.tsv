@@ -1,0 +1,86 @@
+# The WIKIMEDIA validation battery's fixture.  One case per line, five
+# TAB-separated fields:
+#
+#   mode <TAB> input <TAB> expect_qid <TAB> expect_substr <TAB> forbid_substr
+#
+# mode           A typed !wiki (no model) - B natural language through the
+#                bridge - C corpus acquisition.
+# input          For A, the !wiki argument line, quoting and flags included.
+#                For B, what is said to the bot in #botman.  For C, the
+#                acquisition subject, or the literal @trigger for the
+#                proactive form (which resolves the topic's own query).
+# expect_qid     Qnnn  the resolution must land on that item.
+#                (empty) no confident match is expected - the honest axis
+#                        applies and the reply must own up rather than invent.
+#                -     resolve is not scored: a fact, menu, reverse or prose
+#                      reply carries no id to read, and asking for one again
+#                      would be a second round trip against a rate limit.
+# expect_substr  '|'-separated alternatives, case-insensitive; any one hit
+#                passes the answer axis.  Empty means the axis does not apply.
+# forbid_substr  '|'-separated, case-insensitive; every one of them must be
+#                absent.  This is the hallucination guard.  Empty means the
+#                axis does not apply.
+#
+# Coverage is spread deliberately across entity types because the P1963
+# property menu is per type - a battery of only people proves nothing about
+# films or elements.  The eleven names the resolver was TUNED on
+# (TODO.md/ACHIEVED.md, WIKIMEDIA-2) are deliberately NOT the battery: scoring
+# a resolver on its own training set measures nothing.  Two of them appear
+# once each, as fact-form cases where the property and not the resolution is
+# what is under test.
+#
+# There is no mode-C no-match case on purpose.  A subject wikimedia declines
+# falls through to search, which scrapes and digests whatever it finds - so
+# the case would score honesty by writing junk into a live corpus.
+
+# --- mode A: typed, deterministic, a change here is a real regression ------
+A	stephen fry	Q192912	1957	
+A	jimmy carter	Q23685	2024	
+A	radiohead	Q44190	Thom Yorke	
+A	the godfather	Q47703	Coppola	
+A	barcelona	Q1492	Spain|Catalonia	football club
+A	mercury	Q308	planet	
+A	red fox	Q8332	Vulpes|carnivor	
+A	the night watch	Q219831	Rembrandt	
+A	minecraft	Q49740	Mojang|Persson|sandbox	
+A	hermione granger	Q174009	Rowling|Harry Potter	
+# STANDING FAILURE.  wbsearchentities is alias-tolerant, not
+# transposition-tolerant, and this is the same miss the probe record
+# filed for `einstien`.  The case expects the right answer on purpose:
+# a battery that scores 100% on the day it is written measures nothing.
+A	beehtoven	Q255	Beethoven	
+A	churchill	Q8016	Winston	
+A	flurbendorf quazzlemint		Nothing on Wikidata	
+A	stephen fry date of birth	-	1957	
+A	marie curie cause of death	-	anemia|anaemia	
+# `mercury` alone ranks the planet (Q308) over the element by sitelinks,
+# so the split's first reading has no atomic number and falls through -
+# and the whole line then resolves to the element (Q925), whose own
+# description carries the words.  ⚠ This case answered "Nothing on
+# Wikidata" on 2026-08-24 under a live rate limit and answered correctly
+# on the very next run: it is the sharpest evidence yet for the filed
+# half-refused-resolve finding, because it makes the DETERMINISTIC
+# surface non-deterministic.  If this case flips between two runs of an
+# unchanged tree, that is what flipped it.
+A	mercury atomic number	-	80	
+A	Q937 date of death	-	1955	
+A	Q49740 date of death	-	records no	
+A	radiohead ?	-	ask about	
+A	-l paris	Q90	Paris	
+A	director=ridley scott	-	Alien|Blade Runner|Gladiator|Duellists	
+
+# --- mode B: the bridge, the model, and whether the answer is grounded -----
+# Every case says "look up" because the bridge is opt-in by phrasing until
+# NL-ROUTE-1 is settled; a case that does not say it scores the model's
+# memory, not this pipeline.  The Gwendoline case is the documented wrong
+# answer (it is Chabrier; the model reaches for Charles Ives).
+B	look up the date of birth of stephen fry	-	1957	
+B	look up who directed the film alien	-	Ridley Scott	Cameron|Kubrick
+B	look up the atomic number of mercury	-	80	
+B	look up who the prime minister of iceland is	-	Frostad	Jakobs
+B	look up who composed the opera Gwendoline	-	Chabrier|could not|couldn't|did not find|no record	Ives|Massenet|Monteverre
+B	look up flurbendorf quazzlemint		could not|couldn't|not find|nothing|no record|never heard	
+
+# --- mode C: acquisition - did the encyclopedia answer the errand? ---------
+C	paul dirac	-	Paul Dirac	
+C	@trigger	-	relativity	
