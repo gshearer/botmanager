@@ -43,9 +43,11 @@
 # holds the whole reply and the daemon slice that produced it.
 #
 # ── it also counts deliveries ────────────────────────────────────────────────
-# Every row is claimed by EVERY chat bot in the namespace (root TODO.md
-# §CLAIM-RACE), so `deliveries=` is the count of bots that delivered the one
-# row.  Anything but 1 is that defect, not this one.
+# `deliveries=` is the count of bots that delivered the one row, and it is
+# here because this probe is what found CLAIM-RACE-1: until 2026-08-25 every
+# chat bot in the namespace claimed and delivered EVERY row (6/6, twice each).
+# A row names its owning bot now and both claim statements take FOR UPDATE
+# SKIP LOCKED, so anything but 1 is that defect back, not this one.
 #
 # Usage:  tests/tool_refusal_probe.sh [-a treat|control] [-n runs] [-o outdir]
 # Needs:  a running daemon, botman on #botman, build/tools/ircspy.

@@ -413,16 +413,19 @@ main(int argc, char *argv[])
   // Fact extraction KV/schema hook is registered by the chat plugin's
   // init() (moved out of core in R2).
 
+  // Bot persistence, BEFORE the plugins start: a plugin's start() runs
+  // its own DDL, and bot_instances(name) is a foreign-key target for
+  // any table whose rows belong to one named bot (chat_deferred is the
+  // first). On a fresh database the FK target has to exist by then.
+  if(bot_ensure_tables() != SUCCESS)
+    clam(CLAM_WARN, "main", "bot table creation failed, continuing");
+
   // Start plugins (begin active operation, dependency order).
   if(plugin_start_all() != SUCCESS)
   {
     clam(CLAM_FATAL, "main", "plugin startup failed");
     goto shutdown;
   }
-
-  // Bot persistence: create tables and restore saved instances.
-  if(bot_ensure_tables() != SUCCESS)
-    clam(CLAM_WARN, "main", "bot table creation failed, continuing");
 
   bot_restore();
 

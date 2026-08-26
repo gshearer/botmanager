@@ -304,8 +304,21 @@ note_db_claim(uint32_t ns_id, const char *recipient, note_row_t *out,
 
   // Claim and read in one statement. The innermost SELECT picks the
   // oldest pending notes; the UPDATE stamps them; RETURNING hands back
-  // exactly the rows this caller won. A second bot witnessing the same
-  // line reaches an empty set and stays quiet.
+  // exactly the rows this caller won.
+  //
+  // FOR UPDATE SKIP LOCKED is what makes that last clause true, and it
+  // is not decoration: note_attach_bot subscribes one observer per bot,
+  // so two bots in one channel witness the same speaker and race here
+  // on the same (ns_id, recipient). `delivered_at IS NULL` lives only
+  // in this inner SELECT — never in the outer UPDATE — so a second
+  // statement that blocked on the row lock would re-check a predicate
+  // that cannot exclude an already-claimed row and RETURNING would read
+  // the same mail out twice. Skipping the lock makes the loser reach
+  // the empty set the comment here used to merely assert. (The chat
+  // spine's claim had the identical defect: root ACHIEVED.md,
+  // CLAIM-RACE-1.) A note is a person's mail and any bot may deliver
+  // it, so long as exactly one does — no owner column, unlike
+  // chat_deferred.
   //
   // The outer SELECT is not redundant: RETURNING yields rows in whatever
   // order the UPDATE touched them, which is not the inner ORDER BY. Sort
@@ -314,7 +327,8 @@ note_db_claim(uint32_t ns_id, const char *recipient, note_row_t *out,
       "WITH claimed AS ("
       "UPDATE %s SET delivered_at = NOW() WHERE id IN ("
       "SELECT id FROM %s WHERE ns_id = %" PRIu32 " AND recipient = '%s'"
-      " AND delivered_at IS NULL ORDER BY id ASC LIMIT %" PRIu32 ")"
+      " AND delivered_at IS NULL ORDER BY id ASC LIMIT %" PRIu32
+      " FOR UPDATE SKIP LOCKED)"
       " RETURNING id, sender, body,"
       " EXTRACT(EPOCH FROM created_at)::BIGINT AS created_epoch)"
       " SELECT id, sender, body, created_epoch FROM claimed"

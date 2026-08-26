@@ -1102,9 +1102,10 @@ pricewatch_report(const pricewatch_sweep_t *sweep, const pricewatch_row_t *row,
       " That watch was a one-shot and is spent now", seen, row->pair,
       price, pricewatch_dir_word(row->dir), limit);
 
-  if(chatbot_deferred_insert(sweep->ns_id, row->dossier_id, &msg,
-      row->method_name, "pricewatch", DEFERRED_KIND_SAY, body, NULL, 0,
-      false, PRICEWATCH_REPORT_TTL_SECS) != SUCCESS)
+  if(chatbot_deferred_insert(sweep->bot_name, sweep->ns_id,
+      row->dossier_id, &msg, row->method_name, "pricewatch",
+      DEFERRED_KIND_SAY, body, NULL, 0, false,
+      PRICEWATCH_REPORT_TTL_SECS) != SUCCESS)
   {
     // The watch is spent and the report is not written, so this
     // crossing is lost. Loud, because it is the one outcome here that

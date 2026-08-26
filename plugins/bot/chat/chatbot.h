@@ -1302,7 +1302,15 @@ void chatbot_deferred_ensure_schema(void);
 // whole: a chore composing one synthetically must fill it from a
 // dossier signature (the dcfc359 rule) or the delivered cue resolves
 // to no dossier and the reply loses the person's memory.
-bool chatbot_deferred_insert(uint32_t ns_id, int64_t dossier,
+//
+// ⚠⚠ `bot_name` is the row's OWNER and the whole of its ownership: it
+// is the only bot that will ever claim, deliver, count or cancel this
+// row, and deleting that bot deletes the row with it (FK, ON DELETE
+// CASCADE). Every writer already has the name to hand — a chore takes
+// it as its first parameter, a verb has `bot_inst_name(ctx->bot)` —
+// so there is no correct way to pass someone else's.
+bool chatbot_deferred_insert(const char *bot_name, uint32_t ns_id,
+    int64_t dossier,
     const method_msg_t *msg, const char *method_name, const char *source,
     deferred_kind_t kind, const char *body, const char *cmd_name,
     uint64_t secs, bool on_presence, uint64_t expires_secs);

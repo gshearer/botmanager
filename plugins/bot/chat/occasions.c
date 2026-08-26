@@ -256,7 +256,7 @@ chatbot_occasions_run(const char *bot_name, uint32_t ns_id, bot_inst_t *bot)
 
     occasions_compose_wish(wish, sizeof(wish), label);
 
-    if(chatbot_deferred_insert(ns_id, dossier, &msg, method_name,
+    if(chatbot_deferred_insert(bot_name, ns_id, dossier, &msg, method_name,
         "occasion", DEFERRED_KIND_SAY, wish, NULL, 0, true,
         OCCASIONS_WISH_TTL_SECS) != SUCCESS)
     {

@@ -13,9 +13,12 @@
 //
 // Exactly-once is the DB's, never this mapping's: the claim-then-read
 // UPDATE is the guard, so a reload or a crash mid-window delivers late
-// rather than twice or never. Everything durable a later chore needs
-// — a birthday wish waiting on a sighting, a follow-up question —
-// lands in this same table.
+// rather than twice or never. It takes BOTH halves to mean that — the
+// row names its owning bot, and the claim skips locked rows — and
+// until 2026-08-25 it had neither, so two bots in one namespace each
+// delivered every row and one spoke through the other's method.
+// Everything durable a later chore needs — a birthday wish waiting on
+// a sighting, a follow-up question — lands in this same table.
 //
 // A row's moment is either a clock or a person. `due_at` names the
 // first; `deliver_on_presence` names the second (CARE-2), and the two
@@ -66,6 +69,9 @@
 // than this is a paging problem, not a listing problem.
 #define DEFERRED_LIST_MAX       20
 
+// `bot_name = '<escaped 64-char name>'` and nothing else.
+#define DEFERRED_BOT_PRED_SZ    160
+
 // Claim RETURNING order. The fire path reads by index and the column
 // list below is the only place the order is written, so the two live
 // together and an inserted column breaks one build, not one delivery.
@@ -98,6 +104,8 @@ chatbot_deferred_ensure_schema(void)
       "CREATE TABLE IF NOT EXISTS chat_deferred ("
       " id           BIGSERIAL    PRIMARY KEY,"
       " ns_id        INTEGER      NOT NULL REFERENCES userns(id) ON DELETE CASCADE,"
+      " bot_name     VARCHAR(64)  NOT NULL"
+      "   REFERENCES bot_instances(name) ON DELETE CASCADE,"
       " dossier_id   BIGINT       REFERENCES dossier(id) ON DELETE SET NULL,"
       " source       VARCHAR(16)  NOT NULL,"
       " kind         SMALLINT     NOT NULL,"
@@ -119,9 +127,33 @@ chatbot_deferred_ensure_schema(void)
       " delivered_at TIMESTAMPTZ"
       ")", res);
 
+  // A table that predates the column cannot take it in one statement:
+  // the column is NOT NULL and the rows already there name no owner,
+  // so they go first. The tree wipes rather than migrates, and what
+  // was there was probe exhaust and a handful of chores.
   (void)db_query(
-      "CREATE INDEX IF NOT EXISTS idx_chat_deferred_due"
-      " ON chat_deferred(ns_id, due_at) WHERE delivered_at IS NULL", res);
+      "ALTER TABLE chat_deferred ADD COLUMN IF NOT EXISTS"
+      " bot_name VARCHAR(64)", res);
+  (void)db_query("DELETE FROM chat_deferred WHERE bot_name IS NULL", res);
+  (void)db_query(
+      "ALTER TABLE chat_deferred ALTER COLUMN bot_name SET NOT NULL", res);
+  // DROP-then-ADD is the idempotent form: ADD CONSTRAINT alone is not,
+  // and the name is the one Postgres gives the FK in the CREATE above,
+  // so a fresh table and a migrated one end up identical.
+  (void)db_query(
+      "ALTER TABLE chat_deferred"
+      " DROP CONSTRAINT IF EXISTS chat_deferred_bot_name_fkey,"
+      " ADD CONSTRAINT chat_deferred_bot_name_fkey FOREIGN KEY (bot_name)"
+      " REFERENCES bot_instances(name) ON DELETE CASCADE", res);
+
+  // The claim's predicate leads with (ns_id, bot_name), so the index
+  // must. The old (ns_id, due_at) name is dropped rather than left
+  // beside it — every reader of this table is bot-scoped now.
+  (void)db_query("DROP INDEX IF EXISTS idx_chat_deferred_due", res);
+  (void)db_query(
+      "CREATE INDEX IF NOT EXISTS idx_chat_deferred_bot_due"
+      " ON chat_deferred(ns_id, bot_name, due_at)"
+      " WHERE delivered_at IS NULL", res);
 
   db_result_free(res);
 }
@@ -192,11 +224,36 @@ chatbot_row_owner_pred(const method_msg_t *msg, char *dst, size_t cap)
   return(ok);
 }
 
+// The other half of every predicate on this table: which bot owes the
+// work. A row belongs to ONE named bot — it is what that bot promised
+// a person, in a venue that bot is on — and until 2026-08-25 nothing
+// in the SQL said so, so two bots in one namespace each claimed and
+// delivered every row and one of them spoke through the other's
+// method. Returns FAIL when the name will not escape, and a caller
+// that cannot name its bot must refuse rather than widen to all of
+// them.
+static bool
+deferred_bot_pred(const char *bot_name, char *dst, size_t cap)
+{
+  char *e  = db_escape(bot_name);
+  bool  ok = FAIL;
+
+  if(e != NULL)
+  {
+    snprintf(dst, cap, "bot_name = '%s'", e);
+    mem_free(e);
+    ok = SUCCESS;
+  }
+
+  return(ok);
+}
+
 // The count behind the per-owner rate limit, or -1 when the count could
 // not be taken. A limit whose test failed must refuse, not admit: the
 // caller distinguishes the two and says which happened.
 static int64_t
-deferred_pending_for(uint32_t ns_id, const char *owner_pred)
+deferred_pending_for(uint32_t ns_id, const char *bot_pred,
+    const char *owner_pred)
 {
   db_result_t *res;
   const char  *cell;
@@ -205,7 +262,8 @@ deferred_pending_for(uint32_t ns_id, const char *owner_pred)
 
   snprintf(sql, sizeof(sql),
       "SELECT COUNT(*) FROM chat_deferred WHERE ns_id = %" PRIu32
-      " AND delivered_at IS NULL AND %s", ns_id, owner_pred);
+      " AND %s AND delivered_at IS NULL AND %s",
+      ns_id, bot_pred, owner_pred);
 
   res = db_result_alloc();
 
@@ -224,7 +282,7 @@ deferred_pending_for(uint32_t ns_id, const char *owner_pred)
 // The one insert both verbs and every chore go through; the contract
 // is chatbot.h's.
 bool
-chatbot_deferred_insert(uint32_t ns_id, int64_t dossier,
+chatbot_deferred_insert(const char *bot_name, uint32_t ns_id, int64_t dossier,
     const method_msg_t *msg, const char *method_name, const char *source,
     deferred_kind_t kind, const char *body, const char *cmd_name,
     uint64_t secs, bool on_presence, uint64_t expires_secs)
@@ -234,7 +292,7 @@ chatbot_deferred_insert(uint32_t ns_id, int64_t dossier,
   enum
   {
     E_SENDER = 0, E_NICK, E_USER, E_HOST, E_VID, E_META, E_METH,
-    E_CHAN, E_BODY, E_CMD, E_COUNT,
+    E_CHAN, E_BODY, E_CMD, E_BOT, E_COUNT,
   };
   char *e[E_COUNT];
   bool  ok    = FAIL;
@@ -250,6 +308,7 @@ chatbot_deferred_insert(uint32_t ns_id, int64_t dossier,
   e[E_CHAN]   = db_escape(msg->channel);
   e[E_BODY]   = db_escape(body);
   e[E_CMD]    = db_escape(cmd_name != NULL ? cmd_name : "");
+  e[E_BOT]    = db_escape(bot_name);
 
   for(size_t i = 0; i < E_COUNT; i++)
     if(e[i] == NULL)
@@ -285,15 +344,15 @@ chatbot_deferred_insert(uint32_t ns_id, int64_t dossier,
 
     snprintf(sql, sizeof(sql),
         "INSERT INTO chat_deferred"
-        " (ns_id, dossier_id, source, kind, sender, nickname, username,"
-        "  hostname, verified_id, metadata, method_name, channel, body,"
-        "  cmd_name, deliver_on_presence, due_at, expires_at)"
-        " VALUES (%" PRIu32 ", %s, '%s', %d, '%s', '%s', '%s', '%s',"
+        " (ns_id, bot_name, dossier_id, source, kind, sender, nickname,"
+        "  username, hostname, verified_id, metadata, method_name, channel,"
+        "  body, cmd_name, deliver_on_presence, due_at, expires_at)"
+        " VALUES (%" PRIu32 ", '%s', %s, '%s', %d, '%s', '%s', '%s', '%s',"
         " '%s', '%s', '%s', '%s', '%s', '%s', %s,"
         " NOW() + %llu * INTERVAL '1 second', %s)",
-        ns_id, dossier_cell, source, (int)kind, e[E_SENDER], e[E_NICK],
-        e[E_USER], e[E_HOST], e[E_VID], e[E_META], e[E_METH], e[E_CHAN],
-        e[E_BODY], e[E_CMD], on_presence ? "TRUE" : "FALSE",
+        ns_id, e[E_BOT], dossier_cell, source, (int)kind, e[E_SENDER],
+        e[E_NICK], e[E_USER], e[E_HOST], e[E_VID], e[E_META], e[E_METH],
+        e[E_CHAN], e[E_BODY], e[E_CMD], on_presence ? "TRUE" : "FALSE",
         (unsigned long long)secs, expires_cell);
 
     ok = db_exec(sql, DEFERRED_CTX);
@@ -628,41 +687,56 @@ chatbot_deferred_run_due(const char *bot_name, uint32_t ns_id,
     chatbot_state_t *st, bot_inst_t *bot)
 {
   db_result_t *res;
+  char         bot_pred[DEFERRED_BOT_PRED_SZ];
   char         sql[2048];
   uint32_t     rows;
   time_t       now;
 
-  // Claim-then-read in one statement (note_db_claim's shape): two
-  // racing witnesses cannot both deliver a row, and the claim is what
-  // makes delivery restart- and reload-safe — the guard is in the DB,
-  // not in this mapping. The recurrence insert rides the same
-  // statement, so a daemon that dies mid-tick never double-schedules:
-  // the claim IS the write barrier.
+  if(deferred_bot_pred(bot_name, bot_pred, sizeof(bot_pred)) != SUCCESS)
+  {
+    clam(CLAM_WARN, DEFERRED_CTX, "bot=%s deferred claim skipped —"
+        " the bot name would not escape", bot_name);
+    return;
+  }
+
+  // Claim-then-read in one statement, and both halves of exactly-once
+  // are in the SQL because neither is in this mapping. OWNERSHIP is
+  // `bot_pred`: every chat bot in a namespace ticks the same sweep, so
+  // without it each one claims and delivers every row (measured
+  // 2026-08-25, 6 rows, 12 deliveries). ATOMICITY is SKIP LOCKED:
+  // `delivered_at IS NULL` sits only in the inner SELECT, so a second
+  // statement that blocked on the row lock would re-check a predicate
+  // that cannot exclude a row already claimed and RETURNING would hand
+  // it out twice — the lock is skipped instead, and one bot's own
+  // overlapping ticks lose cleanly. The recurrence insert rides the
+  // same statement, so a daemon that dies mid-tick never
+  // double-schedules: the claim IS the write barrier.
   snprintf(sql, sizeof(sql),
       "WITH claimed AS ("
       "UPDATE chat_deferred SET delivered_at = NOW() WHERE id IN ("
-      "SELECT id FROM chat_deferred WHERE ns_id = %" PRIu32
+      "SELECT id FROM chat_deferred WHERE ns_id = %" PRIu32 " AND %s"
       " AND delivered_at IS NULL AND deliver_on_presence = FALSE"
       " AND due_at <= NOW()"
-      " ORDER BY due_at ASC LIMIT %d)"
+      " ORDER BY due_at ASC LIMIT %d FOR UPDATE SKIP LOCKED)"
       " RETURNING " DEFERRED_CLAIM_COLS ","
       // Carried past the projection the deliver path reads so the
       // recurrence INSERT below can copy the row whole. dossier_id is
       // not repeated here — the claim columns already carry it, and a
       // duplicate name would make the SELECT below ambiguous.
-      " ns_id, deliver_on_presence, expires_at),"
+      " ns_id, bot_name, deliver_on_presence, expires_at),"
       " renewed AS ("
       "INSERT INTO chat_deferred"
-      " (ns_id, dossier_id, source, kind, sender, nickname, username,"
-      "  hostname, verified_id, metadata, method_name, channel, body,"
-      "  cmd_name, repeat_secs, deliver_on_presence, due_at, expires_at)"
-      " SELECT ns_id, dossier_id, source, kind, sender, nickname, username,"
-      "  hostname, verified_id, metadata, method_name, channel, body,"
-      "  cmd_name, repeat_secs, deliver_on_presence,"
+      " (ns_id, bot_name, dossier_id, source, kind, sender, nickname,"
+      "  username, hostname, verified_id, metadata, method_name, channel,"
+      "  body, cmd_name, repeat_secs, deliver_on_presence, due_at,"
+      "  expires_at)"
+      " SELECT ns_id, bot_name, dossier_id, source, kind, sender, nickname,"
+      "  username, hostname, verified_id, metadata, method_name, channel,"
+      "  body, cmd_name, repeat_secs, deliver_on_presence,"
       "  NOW() + repeat_secs * INTERVAL '1 second', expires_at"
       " FROM claimed WHERE repeat_secs >= %d AND NOT expired)"
       " SELECT * FROM claimed ORDER BY id ASC",
-      ns_id, DEFERRED_CLAIM_MAX, DEFERRED_REPEAT_MIN);
+      ns_id, bot_pred, DEFERRED_CLAIM_MAX, DEFERRED_REPEAT_MIN);
 
   res = db_result_alloc();
 
@@ -702,17 +776,27 @@ chatbot_deferred_presence_scan(const char *bot_name, uint32_t ns_id,
     chatbot_presence_row_t *out, uint32_t max)
 {
   db_result_t *res;
+  char         bot_pred[DEFERRED_BOT_PRED_SZ];
   char         sql[1024];
   uint32_t     n = 0;
 
+  if(deferred_bot_pred(bot_name, bot_pred, sizeof(bot_pred)) != SUCCESS)
+  {
+    clam(CLAM_WARN, DEFERRED_CTX, "bot=%s presence scan skipped —"
+        " the bot name would not escape", bot_name);
+    return(0);
+  }
+
   // Expiry belongs to the tick, never to the sighting: a window that
   // closed while its subject was away must not sit in the cache waiting
-  // to be spoken days late. Claim-and-log, same as the due sweep.
+  // to be spoken days late. Claim-and-log, same as the due sweep, and
+  // bot-scoped for the same reason — a row expires on its own bot's
+  // tick or nobody's.
   snprintf(sql, sizeof(sql),
       "UPDATE chat_deferred SET delivered_at = NOW()"
-      " WHERE ns_id = %" PRIu32 " AND delivered_at IS NULL"
+      " WHERE ns_id = %" PRIu32 " AND %s AND delivered_at IS NULL"
       " AND deliver_on_presence AND expires_at IS NOT NULL"
-      " AND expires_at < NOW() RETURNING id, source", ns_id);
+      " AND expires_at < NOW() RETURNING id, source", ns_id, bot_pred);
 
   res = db_result_alloc();
 
@@ -737,9 +821,9 @@ chatbot_deferred_presence_scan(const char *bot_name, uint32_t ns_id,
   // and the cache is all it will have to go on.
   snprintf(sql, sizeof(sql),
       "SELECT id, nickname, sender, source FROM chat_deferred"
-      " WHERE ns_id = %" PRIu32 " AND delivered_at IS NULL"
+      " WHERE ns_id = %" PRIu32 " AND %s AND delivered_at IS NULL"
       " AND deliver_on_presence AND due_at <= NOW()"
-      " ORDER BY due_at ASC LIMIT %" PRIu32, ns_id, max);
+      " ORDER BY due_at ASC LIMIT %" PRIu32, ns_id, bot_pred, max);
 
   res = db_result_alloc();
 
@@ -772,13 +856,25 @@ chatbot_deferred_deliver_presence(const char *bot_name, uint32_t ns_id,
     chatbot_state_t *st, bot_inst_t *bot, int64_t id)
 {
   db_result_t *res;
+  char         bot_pred[DEFERRED_BOT_PRED_SZ];
   char         sql[1024];
 
+  if(deferred_bot_pred(bot_name, bot_pred, sizeof(bot_pred)) != SUCCESS)
+  {
+    clam(CLAM_WARN, DEFERRED_CTX, "bot=%s presence claim skipped —"
+        " the bot name would not escape", bot_name);
+    return;
+  }
+
+  // One row, by id, and `delivered_at IS NULL` is in the UPDATE itself
+  // — Postgres re-checks it after taking the row lock, so this claim
+  // was always atomic on its own. What it lacked is the owner: the
+  // cache it reads from is this bot's now, and so is the claim.
   snprintf(sql, sizeof(sql),
       "UPDATE chat_deferred SET delivered_at = NOW()"
-      " WHERE id = %" PRId64 " AND ns_id = %" PRIu32
+      " WHERE id = %" PRId64 " AND ns_id = %" PRIu32 " AND %s"
       " AND delivered_at IS NULL AND deliver_on_presence"
-      " RETURNING " DEFERRED_CLAIM_COLS, id, ns_id);
+      " RETURNING " DEFERRED_CLAIM_COLS, id, ns_id, bot_pred);
 
   res = db_result_alloc();
 
@@ -791,9 +887,9 @@ chatbot_deferred_deliver_presence(const char *bot_name, uint32_t ns_id,
     return;
   }
 
-  // Zero rows is the ordinary losing side of a race — two bots in one
-  // namespace both saw the line and the other one is delivering it.
-  // Nothing to say about that.
+  // Zero rows is the ordinary losing side of a race — this bot's own
+  // sighting and its tick reached the same row, and one of them got
+  // there first. Nothing to say about that.
   if(res->rows > 0)
     deferred_deliver_row(bot_name, ns_id, st, bot, res, 0, time(NULL));
 
@@ -810,6 +906,7 @@ typedef struct
   chatbot_state_t *st;
   userns_t        *ns;
   const char      *method_name;
+  char             bot_pred[DEFERRED_BOT_PRED_SZ];
   char             owner_pred[768];
   uint64_t         secs;
   bool             on_presence;
@@ -884,7 +981,9 @@ deferred_ask_open(const cmd_ctx_t *ctx, const char *duration,
   }
 
   if(chatbot_row_owner_pred(ctx->msg, a->owner_pred,
-      sizeof(a->owner_pred)) != SUCCESS)
+      sizeof(a->owner_pred)) != SUCCESS
+      || deferred_bot_pred(bot_inst_name(ctx->bot), a->bot_pred,
+          sizeof(a->bot_pred)) != SUCCESS)
   {
     cmd_reply(ctx, "failed to prepare the request");
     return(FAIL);
@@ -893,7 +992,10 @@ deferred_ask_open(const cmd_ctx_t *ctx, const char *duration,
   cap = (uint32_t)kv_get_bot_uint_or_default(bot_inst_name(ctx->bot),
       "behavior.soul.deferred.max_pending");
 
-  pending = deferred_pending_for(a->ns->id, a->owner_pred);
+  // The cap is a per-bot knob and the refusal says "pending with me",
+  // so the count is this bot's rows: what another bot owes you is
+  // between you and it.
+  pending = deferred_pending_for(a->ns->id, a->bot_pred, a->owner_pred);
 
   if(pending < 0)
   {
@@ -932,7 +1034,8 @@ cmd_remind(const cmd_ctx_t *ctx)
   if(deferred_ask_open(ctx, ctx->parsed->argv[0], &a) != SUCCESS)
     return;
 
-  if(chatbot_deferred_insert(a.ns->id, chatbot_resolve_dossier(a.st, ctx->msg),
+  if(chatbot_deferred_insert(bot_inst_name(ctx->bot), a.ns->id,
+      chatbot_resolve_dossier(a.st, ctx->msg),
       ctx->msg, a.method_name, "remind", DEFERRED_KIND_SAY,
       ctx->parsed->argv[1], NULL, a.secs, a.on_presence, 0) != SUCCESS)
   {
@@ -1077,7 +1180,8 @@ cmd_in(const cmd_ctx_t *ctx)
   else
     snprintf(body, sizeof(body), "%s", verb);
 
-  if(chatbot_deferred_insert(a.ns->id, chatbot_resolve_dossier(a.st, ctx->msg),
+  if(chatbot_deferred_insert(bot_inst_name(ctx->bot), a.ns->id,
+      chatbot_resolve_dossier(a.st, ctx->msg),
       ctx->msg, a.method_name, "in", DEFERRED_KIND_RUN, body, verb,
       a.secs, a.on_presence, 0) != SUCCESS)
   {
@@ -1177,6 +1281,7 @@ cmd_in_list(const cmd_ctx_t *ctx)
 {
   db_result_t *res;
   userns_t    *ns = bot_get_userns(ctx->bot);
+  char         bot_pred[DEFERRED_BOT_PRED_SZ];
   char         pred[768];
   char         sql[1536];
 
@@ -1186,7 +1291,12 @@ cmd_in_list(const cmd_ctx_t *ctx)
     return;
   }
 
-  if(chatbot_row_owner_pred(ctx->msg, pred, sizeof(pred)) != SUCCESS)
+  // Scoped to this bot, like every other statement here: a listing
+  // that showed you rows this bot will never deliver would be lying
+  // about who owes you what.
+  if(chatbot_row_owner_pred(ctx->msg, pred, sizeof(pred)) != SUCCESS
+      || deferred_bot_pred(bot_inst_name(ctx->bot), bot_pred,
+          sizeof(bot_pred)) != SUCCESS)
   {
     cmd_reply(ctx, "failed to prepare the query");
     return;
@@ -1194,8 +1304,9 @@ cmd_in_list(const cmd_ctx_t *ctx)
 
   snprintf(sql, sizeof(sql),
       "SELECT " DEFERRED_LIST_COLS " FROM chat_deferred"
-      " WHERE ns_id = %u AND delivered_at IS NULL AND %s"
-      " ORDER BY due_at ASC LIMIT %d", ns->id, pred, DEFERRED_LIST_MAX);
+      " WHERE ns_id = %u AND %s AND delivered_at IS NULL AND %s"
+      " ORDER BY due_at ASC LIMIT %d",
+      ns->id, bot_pred, pred, DEFERRED_LIST_MAX);
 
   res = db_result_alloc();
 
@@ -1244,6 +1355,7 @@ cmd_in_cancel(const cmd_ctx_t *ctx)
 {
   db_result_t *res;
   userns_t    *ns = bot_get_userns(ctx->bot);
+  char         bot_pred[DEFERRED_BOT_PRED_SZ];
   char         pred[768];
   char         sql[1536];
   char         ack[96];
@@ -1257,6 +1369,13 @@ cmd_in_cancel(const cmd_ctx_t *ctx)
 
   id = (int64_t)strtoll(ctx->parsed->argv[0], NULL, 10);
 
+  if(deferred_bot_pred(bot_inst_name(ctx->bot), bot_pred,
+      sizeof(bot_pred)) != SUCCESS)
+  {
+    cmd_reply(ctx, "failed to prepare the query");
+    return;
+  }
+
   if(chatbot_caller_is_admin(ctx, ns))
     snprintf(pred, sizeof(pred), "TRUE");
 
@@ -1268,11 +1387,12 @@ cmd_in_cancel(const cmd_ctx_t *ctx)
 
   // DELETE, not a claim: a cancelled row is not late work, it is work
   // that never happens, and leaving a tombstone would only confuse the
-  // pending count.
+  // pending count. Even an admin cancels only what THIS bot owes —
+  // the id came off a listing that was scoped the same way.
   snprintf(sql, sizeof(sql),
       "DELETE FROM chat_deferred WHERE id = %" PRId64
-      " AND ns_id = %u AND delivered_at IS NULL AND %s RETURNING id",
-      id, ns->id, pred);
+      " AND ns_id = %u AND %s AND delivered_at IS NULL AND %s RETURNING id",
+      id, ns->id, bot_pred, pred);
 
   res = db_result_alloc();
 
@@ -1330,6 +1450,10 @@ cmd_show_deferred(const cmd_ctx_t *ctx)
     mem_free(e_nick);
   }
 
+  // Deliberately NOT bot-scoped, unlike every other statement on this
+  // table: `/show` observes, and an observer's whole job is to see the
+  // namespace, not one bot's corner of it. It also runs from a console
+  // session where there is no bot to scope to.
   snprintf(sql, sizeof(sql),
       "SELECT " DEFERRED_LIST_COLS " FROM chat_deferred"
       " WHERE ns_id = %u AND delivered_at IS NULL%s"

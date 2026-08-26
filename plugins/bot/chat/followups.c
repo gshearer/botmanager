@@ -402,7 +402,7 @@ chatbot_followups_run(const char *bot_name, uint32_t ns_id, bot_inst_t *bot)
     if(ttl < FOLLOWUPS_MIN_WINDOW_SECS)
       ttl = FOLLOWUPS_MIN_WINDOW_SECS;
 
-    if(chatbot_deferred_insert(ns_id, dossier, &msg, method_name,
+    if(chatbot_deferred_insert(bot_name, ns_id, dossier, &msg, method_name,
         "followup", DEFERRED_KIND_SAY, ask, NULL, 0, true, ttl) != SUCCESS)
     {
       // The claim is spent and the row is not written, so this event is
