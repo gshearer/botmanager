@@ -84,8 +84,12 @@ esac
 OUT=${OUT:-$(mktemp -d "/tmp/toolprobe-$ARM-XXXX")}
 mkdir -p "$OUT"
 
+# `show kv` matches by PREFIX, so bot.<b>.irc.nick also returns nick2 and
+# nick3 — anchor on the exact key or NICK comes back three lines long and
+# every reply-matching sed downstream silently stops matching.
 NICK=$("$ROOT/build/tools/botmanctl" -- show kv "bot.$BOT.irc.nick" 2>/dev/null \
-        | sed 's/\x1b\[[0-9;]*m//g' | sed -n 's/.*= *\([^ ]*\) *(STR).*/\1/p')
+        | sed 's/\x1b\[[0-9;]*m//g' \
+        | sed -n "s/^ *bot\.$BOT\.irc\.nick *= *\([^ ]*\) *(STR).*/\1/p" | head -1)
 NICK=${NICK:-$BOT}
 
 SPY_LOG="$OUT/ircspy.log"; SPY_FIFO="$OUT/in.fifo"; SPY_CTL="/tmp/toolprobe-$$.sock"
