@@ -35,6 +35,15 @@
 # silent run: a second SKIPped direct turn inside 90 s is suppressed by
 # CHATBOT_CV4_FALLBACK_COOLDOWN_SECS on purpose.
 #
+# ⚠⚠ THE CONTROL ARM SATURATES AND THE TREAT ARM DOES NOT.  Six identical
+# `dict serendipity` asks in one window (08-26) drew ONE answer and five
+# SKIPs — the persona declining to repeat an answer it had just given, not
+# the CV-4 cooldown — against 4 spoken of 6 on the refusal arm, where each
+# run has a fresh failure to describe.  So n=6 buys ~4 refusal readings and
+# ~1 success reading.  Vary the control's SUBJECT per run if you need more
+# than one, and never read a run of SKIPs as a regression without checking
+# what the bot said earlier in the same window.
+#
 # ⚠⚠ SCORE FROM THE TRANSCRIPTS, NOT THE CONSOLE.  The per-run line prints
 # the first 130 bytes only, and replies to a low-entropy question converge on
 # their opening: three dict answers shared a ~110-byte opener and read as
