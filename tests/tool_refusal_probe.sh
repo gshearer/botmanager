@@ -155,8 +155,15 @@ one_run() {
   # The axis is the PRIME DIRECTIVE, not correctness: [[tool-answer]] says
   # "never a mention of having run anything", so naming the machinery to the
   # channel is the failure whether or not the answer itself was right.
+  #
+  # ⚠⚠ DELIBERATELY OVER-BROAD.  A false CLEAN is the dangerous direction —
+  # it reports a prompt fix as working when it is not.  The first version of
+  # this pattern matched "the tool" and passed "the wotd tool just told me it
+  # wants a date or -v", which is a worse leak than the one under repair.
+  # So: any command name, any flag, any word for the plumbing.  Expect some
+  # false LEAKS and read $OUT/<arm>-<run>.txt before believing either verdict.
   if   [ -z "$reply" ]; then verdict=SILENT
-  elif grep -qiE 'the tool|the command|usage line|tool output|dispatch|slash' <<<"$reply"
+  elif grep -qiE 'tool|command|usage|argument|parameter|flag|syntax|dispatch|slash|api|[-]v\b|wotd|dict\b|output' <<<"$reply"
   then verdict=LEAKS-MACHINERY
   else verdict=CLEAN
   fi
