@@ -294,6 +294,7 @@ chatbot_followups_run(const char *bot_name, uint32_t ns_id, bot_inst_t *bot)
       "  WHERE dossier_id = df.dossier_id"
       "  ORDER BY last_seen DESC LIMIT 1) sg ON TRUE"
       " WHERE d.ns_id = %" PRIu32 " AND df.fact_key LIKE '%s%%'"
+      " AND " MEM_SRC_CHORE_KEYABLE("df.source")
       " ORDER BY df.dossier_id, df.fact_key, df.last_seen DESC"
       " LIMIT %d",
       ns_id, FOLLOWUPS_KEY_PREFIX, FOLLOWUPS_ROWS_MAX);

@@ -7,6 +7,9 @@
 // input is a `birthday` fact the extractor wrote from something the
 // person themselves said, and the wish goes back to the venue that fact
 // was observed in. Nothing here is derived, aggregated or inferred.
+// The scan below enforces that rather than assuming it
+// (MEM_SRC_CHORE_KEYABLE): an admin-seeded birthday is not something
+// the person said, so this chore does not wish on one.
 //
 // The shape every fact-driven chore reuses:
 //
@@ -177,6 +180,7 @@ chatbot_occasions_run(const char *bot_name, uint32_t ns_id, bot_inst_t *bot)
       "  WHERE dossier_id = df.dossier_id"
       "  ORDER BY last_seen DESC LIMIT 1) sg ON TRUE"
       " WHERE d.ns_id = %" PRIu32 " AND df.fact_key = 'birthday'"
+      " AND " MEM_SRC_CHORE_KEYABLE("df.source")
       " ORDER BY df.dossier_id, df.last_seen DESC"
       " LIMIT %d",
       ns_id, OCCASIONS_ROWS_MAX);

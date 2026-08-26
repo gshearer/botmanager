@@ -1132,6 +1132,7 @@ soul_chore_weather(soul_sched_t *s, uint32_t chore,
       "  ORDER BY last_seen DESC LIMIT 1) sg ON TRUE"
       " WHERE d.ns_id = %" PRIu32
       " AND df.fact_key LIKE 'city_of_interest:%%'"
+      " AND " MEM_SRC_CHORE_KEYABLE("df.source")
       " ORDER BY df.dossier_id, df.last_seen DESC"
       " LIMIT %d",
       s->ns_id, SOUL_WX_ROWS_MAX);

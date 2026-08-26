@@ -291,6 +291,25 @@ void memory_decay_sweep(void);
 
 void memory_get_stats(memory_stats_t *out);
 
+// The initiative rule as SQL (CHATBOT.md §The initiative rule): a chore
+// speaks unprompted, so it may key only on a fact the subject put there
+// themselves — an ask they made or something they said. Every chore's
+// fact scan carries this; the reply path does not, because answering a
+// question needs no authorization to open one.
+//
+// ⚠ NOT MEM_SRC_RANK, which is its inverse. That ladder ranks a source's
+// authority to overwrite and puts `admin_seed` at the top; this asks
+// whether the subject is the one who spoke, and `admin_seed` is exactly
+// the source that fails it. An admin gate authorizes a write, never
+// speech about the person written about.
+//
+// An allowlist rather than `<> 'admin_seed'`, and that is the whole
+// point: an analytic producer added tomorrow — a sentiment sweep, an
+// activity profiler — is excluded because nobody named it, instead of
+// included because nobody remembered to.
+#define MEM_SRC_CHORE_KEYABLE(col) \
+    "(" col " IN ('llm_extract', 'user_stated', 'nl_observe'))"
+
 // Test hooks (MEMORY_TEST_HOOKS only)
 
 #ifdef MEMORY_TEST_HOOKS
