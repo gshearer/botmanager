@@ -92,7 +92,6 @@ static uint64_t         llm_stat_prompt   = 0;
 static uint64_t         llm_stat_compl    = 0;
 static uint64_t         llm_stat_time_ms  = 0;
 static uint32_t         llm_active_count  = 0;
-static uint32_t         llm_queued_count  = 0;
 
 // When the counters below started counting. All of this is process state, so
 // a /plugin reload inference puts it back to zero — which reads as "this
@@ -3695,8 +3694,6 @@ llm_get_stats(llm_stats_t *out)
   pthread_mutex_lock(&llm_active_mutex);
   out->active = llm_active_count;
   pthread_mutex_unlock(&llm_active_mutex);
-
-  out->queued = llm_queued_count;
 }
 
 // FAIL means this model has no row, which is NOT the same as zero requests:

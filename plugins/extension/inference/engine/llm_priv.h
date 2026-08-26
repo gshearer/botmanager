@@ -23,10 +23,16 @@
 // these; only llm.c / llm_cmd.c and the inference.c lifecycle glue do).
 // -----------------------------------------------------------------------
 
+// ⛔ There is no `queued` here and there never was one that counted: the
+// engine has an in-flight set and no queue of its own. A `llm_queued_count`
+// was declared, reported out of llm_get_stats and never incremented
+// anywhere in the tree; it was deleted 2026-08-26 rather than filled in,
+// because the queue that matters belongs to the command surface — `!ask`
+// and `!imagine` each own theirs, with their own per-caller quotas — and
+// below them core/curl owns the only other one (core.curl.max_active).
 typedef struct
 {
   uint32_t active;
-  uint32_t queued;
   uint64_t total_requests;
   uint64_t total_retries;
   uint64_t total_errors;

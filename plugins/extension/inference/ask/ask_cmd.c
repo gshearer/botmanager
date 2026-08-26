@@ -5,6 +5,7 @@
 //   !a <query>            short alias
 //   !ask -m <model> ...   pick a specific model from the per-bot allowlist
 //   !show ask             the request !ask would make, and under what limits
+//   !show ask queue       what is running and what is waiting
 //
 // There is deliberately NO conversation memory and no context carry —
 // each call is an independent request (this is not the `chat` method,
@@ -33,6 +34,11 @@
 // prompt_prepend_file cascade most-specific-non-empty-wins. The per-bot
 // and per-(bot,protocol) keys are contributed dynamically at bot-create /
 // method-bind time — see ask_kv_bot_cb / ask_kv_proto_cb.
+//
+// ⛔ The queue knobs at the bottom are the exception and they are NOT
+// contributed per bot: queue shape is plugin-global infrastructure, and a
+// fair-use quota that differed per bot would not be one — the same ruling
+// imagine's schema carries, and the same reason.
 static const plugin_kv_entry_t ask_kv_schema[] = {
   { "plugin.ask.default",    KV_STR,    "gfll",
     "Default chat model for !ask when no -m is given" },
@@ -67,6 +73,23 @@ static const plugin_kv_entry_t ask_kv_schema[] = {
   { "plugin.ask.prompt_prepend_file", KV_STR, "../prompts/ask_default.txt",
     "Path to a .txt file whose contents are prepended (as a system prompt)"
     " to every !ask query; bot / protocol tiers may override" },
+  // The defaults are sized for a cloud endpoint, which is what
+  // plugin.ask.default ships pointing at. A bot pointed at the local
+  // cluster wants max_inflight lowered instead: vLLM never refuses, it
+  // queues unbounded behind --max-num-seqs, so contention there makes
+  // every concurrent request slower rather than queued — which is the
+  // road to the llm.timeout_secs wall.
+  { "plugin.ask.max_inflight", KV_UINT32, "4",
+    "Queries running concurrently; the rest wait in the queue" },
+  { "plugin.ask.max_queue",    KV_UINT32, "32",
+    "Queries waiting behind the in-flight ones before !ask refuses"
+    " (0 = unbounded)" },
+  { "plugin.ask.max_per_user", KV_UINT32, "2",
+    "Queue entries one authenticated user may hold at once, in flight"
+    " included" },
+  { "plugin.ask.max_per_anonymous", KV_UINT32, "2",
+    "Queue entries shared by ALL unauthenticated callers, on every method,"
+    " in flight included" },
 };
 
 // -----------------------------------------------------------------------
@@ -749,11 +772,187 @@ ask_wrap_take(const char *s, size_t len, size_t cols)
 }
 
 // -----------------------------------------------------------------------
+// The queue
+// -----------------------------------------------------------------------
+//
+// Two lists under one lock: a pending FIFO and an unordered in-flight set.
+// A request is on exactly one of them from the moment the handler enqueues
+// it until its completion frees it, which is what makes a per-caller quota
+// simply "count your nodes in both".
+//
+// Nothing here ever blocks a caller. The handler appends and pumps; the
+// pump submits while there are free slots; the engine's curl worker calls
+// ask_done, which emits the answer, unlinks, and pumps again. ask_lock is
+// never held across a cmd_reply, a KV read, or a submit.
+
+static pthread_mutex_t ask_lock       = PTHREAD_MUTEX_INITIALIZER;
+static ask_req_t      *ask_queue_head = NULL;   // next to submit
+static ask_req_t      *ask_queue_tail = NULL;
+static ask_req_t      *ask_active     = NULL;   // in-flight set (unordered)
+static uint32_t        ask_depth      = 0;      // queued, excluding in flight
+static uint32_t        ask_active_n   = 0;      // in flight
+static uint32_t        ask_id_seq     = 0;      // monotonic within a busy period
+
+// A KV knob that must never be zero, since zero would stall the pump or
+// deny every caller.
+static uint32_t
+ask_kv_count(const char *key, uint32_t fallback)
+{
+  uint32_t v = (uint32_t)kv_get_uint(key);
+
+  return(v > 0 ? v : fallback);
+}
+
+// The queue identity of a caller: their authenticated username, or the one
+// shared anonymous bucket. Callers must copy the result — for the anonymous
+// case it is a string literal, for the other it is ctx-lifetime.
+static const char *
+ask_owner_of(const cmd_ctx_t *ctx)
+{
+  if(ctx->username != NULL && ctx->username[0] != '\0')
+    return(ctx->username);
+
+  return(ASK_ANON_OWNER);
+}
+
+// How many entries `owner` holds across both lists. Caller holds ask_lock.
+static uint32_t
+ask_owner_count_locked(const char *owner)
+{
+  uint32_t n = 0;
+
+  for(const ask_req_t *r = ask_active; r != NULL; r = r->next)
+    if(strcasecmp(r->owner, owner) == 0)
+      n++;
+
+  for(const ask_req_t *r = ask_queue_head; r != NULL; r = r->next)
+    if(strcasecmp(r->owner, owner) == 0)
+      n++;
+
+  return(n);
+}
+
+// Unlink r from the in-flight set. Caller must NOT hold ask_lock.
+static void
+ask_active_drop(ask_req_t *r)
+{
+  ask_req_t **link;
+
+  pthread_mutex_lock(&ask_lock);
+
+  for(link = &ask_active; *link != NULL; link = &(*link)->next)
+    if(*link == r)
+    {
+      *link = r->next;
+      r->next = NULL;
+      ask_active_n--;
+      break;
+    }
+
+  pthread_mutex_unlock(&ask_lock);
+}
+
+// Hand r to the inference engine. On SUCCESS the request owns r and
+// ask_done fires exactly once on a curl worker — r must not be touched
+// again here. On FAIL no callback will ever fire and r is still ours.
+static bool
+ask_submit_one(ask_req_t *r)
+{
+  llm_message_t     msgs[2];
+  llm_chat_params_t p;
+  size_t            n = 0;
+
+  memset(msgs, 0, sizeof(msgs));   // header: blocks ptr must be zeroed
+
+  // Both message bodies are the request's own storage, so they outlive
+  // this frame — which they must, since the pump may run here from a curl
+  // worker with the originating dispatch long gone.
+  if(r->prepend[0] != '\0')
+  {
+    msgs[n].role    = LLM_ROLE_SYSTEM;
+    msgs[n].content = r->prepend;
+    n++;
+  }
+
+  msgs[n].role    = LLM_ROLE_USER;
+  msgs[n].content = r->query;
+  n++;
+
+  p            = (llm_chat_params_t){ 0 };
+  p.max_tokens = r->max_tokens;
+  p.effort     = r->effort;
+
+  r->begin = time(NULL);
+
+  // llm_chat_submit uses SUCCESS(=false)/FAIL(=true): on a successful
+  // enqueue the async request OWNS r and frees it via ask_done. A plain
+  // `!llm_chat_submit(...)` inverts that — it took the failure branch on
+  // SUCCESS, freeing r out from under the in-flight request (use-after-
+  // free + double-free in ask_done). Compare against SUCCESS explicitly.
+  if(llm_chat_submit(r->model, &p, msgs, n, ask_done, NULL, r) != SUCCESS)
+    return(FAIL);
+
+  return(SUCCESS);
+}
+
+// Fill every free in-flight slot from the FIFO. Safe to call from any
+// thread with ask_lock unheld; a request that fails to submit synchronously
+// is reported, dropped, and the drain continues.
+static void
+ask_pump(void)
+{
+  for(;;)
+  {
+    ask_req_t *r;
+    uint32_t   max_inflight;
+
+    // Read the knob outside the lock: KV has a lock of its own and this
+    // one is never held across another.
+    max_inflight = ask_kv_count("plugin.ask.max_inflight", 1);
+
+    pthread_mutex_lock(&ask_lock);
+
+    if(ask_queue_head == NULL || ask_active_n >= max_inflight)
+    {
+      // Fully idle: restart numbering so a quiet channel sees #1 again
+      // rather than #4711.
+      if(ask_queue_head == NULL && ask_active_n == 0)
+        ask_id_seq = 0;
+
+      pthread_mutex_unlock(&ask_lock);
+      return;
+    }
+
+    r              = ask_queue_head;
+    ask_queue_head = r->next;
+
+    if(ask_queue_head == NULL)
+      ask_queue_tail = NULL;
+
+    ask_depth--;
+
+    r->next    = ask_active;
+    ask_active = r;
+    ask_active_n++;
+
+    pthread_mutex_unlock(&ask_lock);
+
+    if(ask_submit_one(r) == SUCCESS)
+      continue;                        // in flight; keep filling slots
+
+    cmd_reply(&r->ctx, "ask: failed to submit query (model unavailable?)");
+    ask_active_drop(r);
+    mem_free(r);
+  }
+}
+
+// -----------------------------------------------------------------------
 // Async completion
 // -----------------------------------------------------------------------
 
 // Runs on a curl worker thread: emit the answer line-by-line (flood-
-// capped) and free the per-request closure. Light work only.
+// capped), free the per-request closure, then release the slot it held and
+// pump the next request. Light work only.
 static void
 ask_done(const llm_chat_response_t *resp)
 {
@@ -777,8 +976,7 @@ ask_done(const llm_chat_response_t *resp)
     snprintf(line, sizeof(line), "ask: %s",
         resp->error != NULL ? resp->error : "no response");
     cmd_reply(&ctx, line);
-    mem_free(r);
-    return;
+    goto cleanup;
   }
 
   max_lines = r->max_lines;
@@ -876,7 +1074,11 @@ ask_done(const llm_chat_response_t *resp)
         " narrower question or raise plugin.ask.max_tokens)");
 
   mem_free(text);
+
+cleanup:
+  ask_active_drop(r);
   mem_free(r);
+  ask_pump();
 }
 
 // -----------------------------------------------------------------------
@@ -896,10 +1098,13 @@ ask_cmd_handler(const cmd_ctx_t *ctx)
   llm_effort_t       effort;
   char               query[METHOD_TEXT_SZ];
   char               reply[ASK_CMD_REPLY_SZ];
-  char               prepend[ASK_PREPEND_SZ];
-  llm_message_t      msgs[2];
-  size_t             n;
-  llm_chat_params_t  p;
+  bool               anon;
+  uint32_t           quota;
+  uint32_t           held;
+  uint32_t           max_queue;
+  uint32_t           max_inflight;
+  uint32_t           ahead = 0;
+  bool               waiting;
 
   static const char usage[] =
       "Usage: ask [-m <model>] [-e <effort>] <query>"
@@ -952,11 +1157,17 @@ ask_cmd_handler(const cmd_ctx_t *ctx)
     return;
   }
 
+  // Everything the request will need is snapshotted here, on the dispatch
+  // thread. The submit that consumes it may run much later on a curl
+  // worker draining behind somebody else's completion, and no live KV or
+  // prepend file is read off that thread.
   r = mem_alloc(ASK_CMD_CTX, "req", sizeof(*r));
   memset(r, 0, sizeof(*r));
-  r->ctx       = *ctx;
-  r->max_lines = scope.max_lines;
-  r->max_cols  = scope.max_cols;
+  r->ctx        = *ctx;
+  r->effort     = effort;
+  r->max_tokens = scope.max_tokens;
+  r->max_lines  = scope.max_lines;
+  r->max_cols   = scope.max_cols;
 
   if(ctx->msg != NULL)
     r->msg = *ctx->msg;
@@ -967,41 +1178,85 @@ ask_cmd_handler(const cmd_ctx_t *ctx)
   r->ctx.parsed   = NULL;
   r->ctx.data     = NULL;
 
-  memset(msgs, 0, sizeof(msgs));   // header: blocks ptr must be zeroed
-  n = 0;
+  strlcpy(r->owner, ask_owner_of(ctx), sizeof r->owner);
+  strlcpy(r->model, model,             sizeof r->model);
+  strlcpy(r->query, query,             sizeof r->query);
 
   // Prepend-file contents become the one-shot system prompt. Resolved
   // most-specific-first (protocol -> bot -> plugin) and read fresh so
-  // edits to the file take effect without a reload. prepend outlives the
-  // submit call (llm_chat_submit copies internally).
-  if(ask_read_prepend(bot_name, proto, prepend, sizeof(prepend)) == SUCCESS)
+  // edits to the file take effect without a reload. FAIL leaves the buffer
+  // empty, which is exactly "no system message" — the return carries
+  // nothing the buffer does not.
+  (void)ask_read_prepend(bot_name, proto, r->prepend, sizeof(r->prepend));
+
+  // Every knob the admission test needs is read before the lock is taken:
+  // KV has a lock of its own, and ask_lock is never held across it.
+  anon         = (strcasecmp(r->owner, ASK_ANON_OWNER) == 0);
+  quota        = ask_kv_count(anon ? "plugin.ask.max_per_anonymous"
+                                   : "plugin.ask.max_per_user", 1);
+  max_queue    = (uint32_t)kv_get_uint("plugin.ask.max_queue");
+  max_inflight = ask_kv_count("plugin.ask.max_inflight", 1);
+
+  pthread_mutex_lock(&ask_lock);
+
+  held = ask_owner_count_locked(r->owner);
+
+  if(held >= quota)
   {
-    msgs[n].role    = LLM_ROLE_SYSTEM;
-    msgs[n].content = prepend;
-    n++;
-  }
+    pthread_mutex_unlock(&ask_lock);
 
-  msgs[n].role    = LLM_ROLE_USER;
-  msgs[n].content = query;
-  n++;
+    if(anon)
+      snprintf(reply, sizeof(reply),
+          "ask: %u quer%s already running for unidentified users — "
+          "identify yourself for your own slot, or try again shortly",
+          quota, quota == 1 ? "y is" : "ies are");
+    else
+      snprintf(reply, sizeof(reply),
+          "ask: you already have %u quer%s in the queue — "
+          "let %s finish first",
+          quota, quota == 1 ? "y" : "ies", quota == 1 ? "it" : "them");
 
-  p            = (llm_chat_params_t){ 0 };
-  p.max_tokens = scope.max_tokens;
-  p.effort     = effort;
-
-  // model/msgs/query are caller-owned only until submit returns
-  // (the callee copies internally) — all live here for the call.
-  //
-  // llm_chat_submit uses SUCCESS(=false)/FAIL(=true): on a successful
-  // enqueue the async request OWNS r and frees it via ask_done. A plain
-  // `!llm_chat_submit(...)` inverts that — it took the failure branch on
-  // SUCCESS, freeing r out from under the in-flight request (use-after-
-  // free + double-free in ask_done). Compare against SUCCESS explicitly.
-  if(llm_chat_submit(model, &p, msgs, n, ask_done, NULL, r) != SUCCESS)
-  {
-    cmd_reply(ctx, "ask: failed to submit query (model unavailable?)");
+    cmd_reply(ctx, reply);
     mem_free(r);
+    return;
   }
+
+  if(max_queue > 0 && ask_depth >= max_queue)
+  {
+    pthread_mutex_unlock(&ask_lock);
+    cmd_reply(ctx, "ask: too many questions queued right now — "
+        "try again shortly");
+    mem_free(r);
+    return;
+  }
+
+  r->id = ++ask_id_seq;
+
+  if(ask_queue_tail != NULL)
+    ask_queue_tail->next = r;
+  else
+    ask_queue_head = r;
+
+  ask_queue_tail = r;
+  ask_depth++;
+
+  // Everything already committed has to finish before this one starts.
+  waiting = (ask_active_n + ask_depth) > max_inflight;
+
+  if(waiting)
+    ahead = ask_active_n + ask_depth - 1;
+
+  pthread_mutex_unlock(&ask_lock);
+
+  if(waiting)
+  {
+    snprintf(reply, sizeof(reply), "ask: queued as #%u (%u ahead)",
+        r->id, ahead);
+    cmd_reply(ctx, reply);
+  }
+
+  // r may complete and be freed inside this call — do not touch it after.
+  ask_pump();
 }
 
 // -----------------------------------------------------------------------
@@ -1183,6 +1438,35 @@ ask_card_accepts(const cmd_ctx_t *ctx, const char *model)
   ask_card(ctx, "accepts", value);
 }
 
+// `queue` — a one-line summary, plus the three quotas that are configured
+// and invisible. A caller refused with "queue full" has no way to learn the
+// number otherwise. The rows themselves are `!show ask queue`.
+static void
+ask_card_queue(const cmd_ctx_t *ctx, uint32_t running, uint32_t max_inflight,
+    uint32_t depth)
+{
+  char     value[ASK_CMD_REPLY_SZ];
+  char     deep [32];
+  uint32_t max_queue;
+
+  max_queue = (uint32_t)kv_get_uint("plugin.ask.max_queue");
+
+  if(max_queue > 0)
+    snprintf(deep, sizeof(deep), "%u deep", max_queue);
+  else
+    strlcpy(deep, "unbounded", sizeof deep);
+
+  snprintf(value, sizeof(value),
+      "%s  (%u/%u running, %u waiting)   " CLR_GRAY
+      "quotas %u/user · %u/anon · %s" CLR_RESET,
+      running > 0 ? CLR_YELLOW "busy" CLR_RESET : "idle",
+      running, max_inflight, depth,
+      ask_kv_count("plugin.ask.max_per_user", 1),
+      ask_kv_count("plugin.ask.max_per_anonymous", 1),
+      deep);
+  ask_card(ctx, "queue", value);
+}
+
 static void
 show_ask_handler(const cmd_ctx_t *ctx)
 {
@@ -1192,10 +1476,19 @@ show_ask_handler(const cmd_ctx_t *ctx)
   const char       *proto;
   const char       *model;
   char              value[ASK_CMD_REPLY_SZ];
+  uint32_t          running;
+  uint32_t          depth;
+  uint32_t          max_inflight;
 
-  bot_name = (ctx->bot != NULL) ? bot_inst_name(ctx->bot) : NULL;
-  proto    = ask_proto(ctx);
+  bot_name     = (ctx->bot != NULL) ? bot_inst_name(ctx->bot) : NULL;
+  proto        = ask_proto(ctx);
+  max_inflight = ask_kv_count("plugin.ask.max_inflight", 1);
   ask_scope_resolve(bot_name, proto, &scope);
+
+  pthread_mutex_lock(&ask_lock);
+  running = ask_active_n;
+  depth   = ask_depth;
+  pthread_mutex_unlock(&ask_lock);
 
   memset(&st, 0, sizeof(st));
   st.scope = &scope;
@@ -1246,7 +1539,204 @@ show_ask_handler(const cmd_ctx_t *ctx)
       ask_card_text(ctx, "allowed", CLR_WHITE, st.allowed);
   }
 
-  ask_card_text(ctx, "others", CLR_CYAN, "!show llm models chat");
+  ask_card_queue(ctx, running, max_inflight, depth);
+  ask_card_text(ctx, "others", CLR_CYAN,
+      "!show llm models chat  ·  !show ask queue");
+}
+
+// -----------------------------------------------------------------------
+// !show ask queue — what is running and what is waiting
+//
+// A second view rather than a tail on the card, because the two answer
+// different questions — *what would happen if I asked* and *what is
+// happening now* — and only the second changes between two reads a second
+// apart.
+// -----------------------------------------------------------------------
+
+// Copy the first ASK_PREVIEW_CHARS bytes of the query into out, flattening
+// control characters to spaces (a query is single-line here) and appending
+// an ellipsis when it was longer than the window. ASCII-oriented: a
+// truncation may land mid-UTF-8, which at worst garbles one preview glyph
+// — acceptable for a status line.
+static void
+ask_query_preview(const char *query, char *out, size_t out_sz)
+{
+  size_t i;
+
+  for(i = 0; i < ASK_PREVIEW_CHARS && query[i] != '\0'; i++)
+  {
+    unsigned char c = (unsigned char)query[i];
+
+    out[i] = (c < 0x20) ? ' ' : (char)c;
+  }
+
+  if(query[i] != '\0' && i + 4 <= out_sz)
+  {
+    memcpy(out + i, "\xe2\x80\xa6", 3);   // U+2026 HORIZONTAL ELLIPSIS
+    i += 3;
+  }
+
+  out[i] = '\0';
+}
+
+// Caller holds ask_lock.
+static void
+ask_snap(const ask_req_t *r, ask_snap_t *out)
+{
+  out->id    = r->id;
+  out->begin = r->begin;
+  strlcpy(out->owner,  r->owner,                   sizeof out->owner);
+  strlcpy(out->model,  r->model,                   sizeof out->model);
+  strlcpy(out->effort, llm_effort_wire(r->effort), sizeof out->effort);
+  ask_query_preview(r->query, out->text, sizeof(out->text));
+}
+
+// One fixed-width cell plus the grid's separator. The cell arrives already
+// coloured: markers count no columns, so padding sees through them.
+static void
+ask_q_cell(char *line, size_t cap, const char *text, int width, bool right)
+{
+  char cell[ASK_CELL_SZ];
+
+  strlcpy(cell, text, sizeof cell);
+
+  if(right)
+    display_align_right(cell, sizeof cell, width);
+  else
+    display_align_left(cell, sizeof cell, width);
+
+  display_cat(line, cap, cell);
+  display_cat(line, cap, "  ");
+}
+
+static void
+ask_q_head(const cmd_ctx_t *ctx)
+{
+  char line[ASK_CMD_REPLY_SZ];
+
+  // Indent first, emphasis second: cmd_reply_table_head reads the margin
+  // off the head with strspn, and a leading colour marker would hide it.
+  snprintf(line, sizeof(line), "%*s" CLR_BOLD, ASK_Q_LEAD, "");
+
+  ask_q_cell(line, sizeof(line), "id",     ASK_Q_ID,     false);
+  ask_q_cell(line, sizeof(line), "who",    ASK_Q_WHO,    false);
+  ask_q_cell(line, sizeof(line), "model",  ASK_Q_MODEL,  false);
+  ask_q_cell(line, sizeof(line), "effort", ASK_Q_EFFORT, false);
+  ask_q_cell(line, sizeof(line), "age",    ASK_Q_AGE,    true);
+  display_cat(line, sizeof(line), "query" CLR_RESET);
+  cmd_reply_table_head(ctx, line);
+}
+
+// One row. `running` decides the lead glyph and whether there is an age to
+// print at all — a queued request has never been submitted, so its `begin`
+// is 0 and the elapsed time it would imply is fifty-six years.
+static void
+ask_q_row(const cmd_ctx_t *ctx, const ask_snap_t *s, bool running, time_t now)
+{
+  char line[ASK_CMD_REPLY_SZ];
+  char cell[ASK_CELL_SZ];
+  int  left;
+
+  snprintf(line, sizeof(line), "%s ",
+      running ? CLR_GREEN "▸" CLR_RESET : " ");
+
+  snprintf(cell, sizeof(cell), CLR_GRAY "#%u" CLR_RESET, s->id);
+  ask_q_cell(line, sizeof(line), cell, ASK_Q_ID, false);
+
+  snprintf(cell, sizeof(cell), CLR_CYAN "%s" CLR_RESET, s->owner);
+  ask_q_cell(line, sizeof(line), cell, ASK_Q_WHO, false);
+
+  snprintf(cell, sizeof(cell), CLR_WHITE "%s" CLR_RESET, s->model);
+  ask_q_cell(line, sizeof(line), cell, ASK_Q_MODEL, false);
+
+  // An unset effort is not a missing reading: it means the request omits
+  // the field and the service's own reasoning_effort decides.
+  if(s->effort[0] != '\0')
+    snprintf(cell, sizeof(cell), "%s", s->effort);
+  else
+    strlcpy(cell, CLR_GRAY "—" CLR_RESET, sizeof cell);
+
+  ask_q_cell(line, sizeof(line), cell, ASK_Q_EFFORT, false);
+
+  if(running && s->begin > 0 && now >= s->begin)
+    snprintf(cell, sizeof(cell), "%lds", (long)(now - s->begin));
+  else
+    strlcpy(cell, CLR_GRAY "—" CLR_RESET, sizeof cell);
+
+  ask_q_cell(line, sizeof(line), cell, ASK_Q_AGE, true);
+
+  // Measured rather than assumed: display_align_left lets a cell wider than
+  // its column win, by design, so a long nick shifts everything right of it
+  // and the query is what pays.
+  // ⚠ One column off the budget for the ellipsis: display_fit reserves its
+  // mark out of the BYTE budget, not the column budget, and a last cell has
+  // no padding to absorb the extra.
+  left = DISPLAY_COLS - (int)display_vis_len(line) - 1;
+
+  display_fit(s->text, left > 1 ? left : 1, cell, sizeof(cell), "…");
+  display_cat(line, sizeof(line), cell);
+  cmd_reply(ctx, line);
+}
+
+static void
+show_ask_queue_handler(const cmd_ctx_t *ctx)
+{
+  ask_snap_t active[ASK_SHOW_MAX];
+  ask_snap_t queued[ASK_SHOW_MAX];
+  uint32_t   n_active = 0;
+  uint32_t   n_queued = 0;
+  uint32_t   depth;
+  uint32_t   running;
+  uint32_t   max_inflight;
+  time_t     now;
+  char       line[ASK_CMD_REPLY_SZ];
+
+  max_inflight = ask_kv_count("plugin.ask.max_inflight", 1);
+  now          = time(NULL);
+
+  // Snapshot under the lock, emit after releasing it — cmd_reply re-enters
+  // the delivery path, so the mutex is never held across a send.
+  pthread_mutex_lock(&ask_lock);
+
+  running = ask_active_n;
+  depth   = ask_depth;
+
+  for(const ask_req_t *r = ask_active; r != NULL && n_active < ASK_SHOW_MAX;
+      r = r->next)
+    ask_snap(r, &active[n_active++]);
+
+  for(const ask_req_t *r = ask_queue_head; r != NULL && n_queued < ASK_SHOW_MAX;
+      r = r->next)
+    ask_snap(r, &queued[n_queued++]);
+
+  pthread_mutex_unlock(&ask_lock);
+
+  snprintf(line, sizeof(line), CLR_BOLD "ask" CLR_RESET "  ·  queue   "
+      CLR_GRAY "%u/%u running, %u waiting" CLR_RESET,
+      running, max_inflight, depth);
+  cmd_reply(ctx, line);
+
+  if(n_active == 0 && n_queued == 0)
+  {
+    cmd_reply(ctx, "  " CLR_GRAY "(nothing in the pipe)" CLR_RESET);
+    return;
+  }
+
+  ask_q_head(ctx);
+
+  for(uint32_t i = 0; i < n_active; i++)
+    ask_q_row(ctx, &active[i], true, now);
+
+  for(uint32_t i = 0; i < n_queued; i++)
+    ask_q_row(ctx, &queued[i], false, now);
+
+  // ⛔ Never silently: a cut-off list reads as "that is all of them".
+  if(depth > n_queued)
+  {
+    snprintf(line, sizeof(line), "  " CLR_GRAY "… +%u more waiting" CLR_RESET,
+        depth - n_queued);
+    cmd_reply(ctx, line);
+  }
 }
 
 // -----------------------------------------------------------------------
@@ -1261,6 +1751,7 @@ static const char ask_cmd_help[] =
     "  ask -m <model> ...   pick a specific model from the allowlist\n"
     "  ask -e <effort> ...  how hard that model thinks before answering\n"
     "  show ask             the request !ask would make on this bot\n"
+    "  show ask queue       what is running and what is waiting\n"
     "\n"
     "Either flag may appear anywhere in the line; everything left over is\n"
     "the query, so a question may safely begin with a dash.\n"
@@ -1278,6 +1769,10 @@ static const char ask_cmd_help[] =
     "\n"
     "Answers are STATELESS — no memory is kept and no conversation\n"
     "history is carried between calls (this is not the chat bot).\n"
+    "\n"
+    "Queries run a few at a time and the rest queue, each tagged with an\n"
+    "id. You may hold two queue entries at once; everyone who has not\n"
+    "identified shares two between them.\n"
     "\n"
     "Examples:\n"
     "  !ask why is the sky blue\n"
@@ -1310,6 +1805,19 @@ static const cmd_decl_t show_ask_decl = {
   .parent_path = "show",
 };
 
+static const cmd_decl_t show_ask_queue_decl = {
+  .module      = ASK_CMD_CTX,
+  .name        = "queue",
+  .usage       = "show ask queue",
+  .description = "List the !ask queries running and waiting",
+  .group       = USERNS_GROUP_EVERYONE,
+  .scope       = CMD_SCOPE_ANY,
+  .methods     = METHOD_T_ANY,
+  .cb          = show_ask_queue_handler,
+  .parent_path = "show/ask",
+  .abbrev      = "q",
+};
+
 static bool
 ask_cmd_init(void)
 {
@@ -1319,6 +1827,16 @@ ask_cmd_init(void)
   if(cmd_register(&show_ask_decl) != SUCCESS)
   {
     cmd_unregister_path("ask");
+    return(FAIL);
+  }
+
+  // A child rather than an argument: the queue is a different question
+  // from the setup, and only this one changes between two reads a second
+  // apart. cmd_unregister_path("show/ask") takes the subtree with it.
+  if(cmd_register(&show_ask_queue_decl) != SUCCESS)
+  {
+    cmd_unregister_path("ask");
+    cmd_unregister_path("show/ask");
     return(FAIL);
   }
 
@@ -1335,17 +1853,43 @@ ask_cmd_init(void)
 static void
 ask_cmd_deinit(void)
 {
+  ask_req_t *r;
+
   bot_kv_contributor_unregister((void *)&ask_kv_cookie);
 
   cmd_unregister_path("ask");
   cmd_unregister_path("show/ask");
+
+  // Drop the queued (not-yet-submitted) closures we still own. An in-flight
+  // request is owned by the engine: its callback frees it, and the engine's
+  // unmap listener NULLs that callback when this mapping goes away — so the
+  // in-flight set is deliberately left alone here. Freeing it would race the
+  // window between this deinit and the unload, where a completion can still
+  // land in live code holding a freed request.
+  pthread_mutex_lock(&ask_lock);
+
+  r = ask_queue_head;
+
+  while(r != NULL)
+  {
+    ask_req_t *next = r->next;
+
+    mem_free(r);
+    r = next;
+  }
+
+  ask_queue_head = NULL;
+  ask_queue_tail = NULL;
+  ask_depth      = 0;
+  pthread_mutex_unlock(&ask_lock);
+
   clam(CLAM_INFO, ASK_CMD_CTX, "ask command plugin deinitialized");
 }
 
 const plugin_desc_t bm_plugin_desc = {
   .api_version     = PLUGIN_API_VERSION,
   .name            = "ask_cmd",
-  .version         = "1.0",
+  .version         = "2.0",
   .type            = PLUGIN_MISC,
   .kind            = "ask",
   .provides        = { { .name = "cmd_ask" } },
