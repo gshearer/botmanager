@@ -2123,67 +2123,129 @@ help_arg_form(const cmd_def_t *c, const char *parent_path)
   return(u);
 }
 
+// One visible command, snapshotted for a listing — a root in the
+// index, a child in a subcommand table.
+//
+// A listing is collected under cmd_mutex and drawn without it —
+// cmd_reply's delivery path re-enters the mutex, and a def can be
+// unregistered the moment the lock is dropped. So every cell a row can
+// draw is copied here, the description included: that one is a
+// registrant's static string, and the registrant may be a plugin on its
+// way out. `args` is empty when the row has no second line; the index
+// never fills it.
+typedef struct
+{
+  char name[CMD_NAME_SZ];
+  char abbrev[CMD_NAME_SZ];
+  char desc[CMD_HELP_DESC_COLS * 4 + 8];
+  char args[CMD_HELP_ARGS_COLS * 4 + 8];
+} help_row_t;
+
+static int
+help_row_cmp(const void *a, const void *b)
+{
+  const help_row_t *ra = a;
+  const help_row_t *rb = b;
+
+  return(strcasecmp(ra->name, rb->name));
+}
+
 // Print child table for a command. Returns number of children shown.
+//
+// Alphabetical, like the root index: a child is prepended to its
+// parent's sibling chain at registration, so walking that chain hands
+// out reverse registration order — `plugin` listed reload before load
+// because load was declared first. The snapshot is what makes the sort
+// possible, and it also closes the window the old walk left open, where
+// the lock was dropped for each cmd_reply and `c->sibling` read back
+// afterwards.
 static uint32_t
 help_show_children(const cmd_ctx_t *ctx, const cmd_def_t *d,
     const char *parent_path)
 {
-  uint32_t count = 0;
-  bool header_sent = false;
+  help_row_t *rows;
+  uint32_t    cap = 0;
+  uint32_t    n   = 0;
+  uint32_t    i;
 
   pthread_mutex_lock(&cmd_mutex);
-  for(cmd_def_t *c = d->children; c != NULL; c = c->sibling)
+
+  // Nothing may move the chain while the lock is held, so its length
+  // bounds the snapshot exactly — the access filter only trims it.
+  for(const cmd_def_t *c = d->children; c != NULL; c = c->sibling)
+    cap++;
+
+  if(cap == 0)
   {
+    pthread_mutex_unlock(&cmd_mutex);
+
+    return(0);
+  }
+
+  rows = mem_alloc("cmd", "help_children", (size_t)cap * sizeof(*rows));
+
+  for(const cmd_def_t *c = d->children; c != NULL && n < cap;
+      c = c->sibling)
+  {
+    const char *cargs;
+
     if(!help_check_access(ctx, c))
       continue;
 
-    {
-    const char *cname = c->name;
-    const char *cabbrev = (c->abbrev[0] != '\0') ? c->abbrev : "-";
-    const char *cdesc = c->description ? c->description : "";
-    // Both buffers are sized in BYTES for a fitted result measured in
-    // COLUMNS: a UTF-8 column costs up to four of them.
+    strlcpy(rows[n].name, c->name, sizeof(rows[n].name));
+    strlcpy(rows[n].abbrev, (c->abbrev[0] != '\0') ? c->abbrev : "-",
+        sizeof(rows[n].abbrev));
+    display_fit((c->description != NULL) ? c->description : "",
+        CMD_HELP_DESC_COLS, rows[n].desc, sizeof(rows[n].desc), "…");
+
+    cargs = help_arg_form(c, parent_path);
+
+    if(cargs != NULL)
+      display_fit(cargs, CMD_HELP_ARGS_COLS, rows[n].args,
+          sizeof(rows[n].args), "…");
+
+    else
+      rows[n].args[0] = '\0';
+
+    n++;
+  }
+
+  pthread_mutex_unlock(&cmd_mutex);
+
+  if(n == 0)
+  {
+    mem_free(rows);
+
+    return(0);
+  }
+
+  qsort(rows, n, sizeof(*rows), help_row_cmp);
+
+  cmd_reply_table_head(ctx, CMD_HELP_HEAD);
+
+  for(i = 0; i < n; i++)
+  {
     char line[512];
-    char fit[CMD_HELP_ARGS_COLS * 4 + 8];
 
-    if(!header_sent)
-    {
-      // Two lines go out, and cmd_reply's delivery path re-enters this
-      // mutex — the same reason every other reply here brackets it.
-      pthread_mutex_unlock(&cmd_mutex);
-      cmd_reply_table_head(ctx, CMD_HELP_HEAD);
-      pthread_mutex_lock(&cmd_mutex);
-      header_sent = true;
-    }
-
-    const char *cargs = help_arg_form(c, parent_path);
-
-    display_fit(cdesc, CMD_HELP_DESC_COLS, fit, sizeof(fit), "…");
-    snprintf(line, sizeof(line), CMD_HELP_ROW, cname, cabbrev, fit);
-    pthread_mutex_unlock(&cmd_mutex);
+    snprintf(line, sizeof(line), CMD_HELP_ROW,
+        rows[i].name, rows[i].abbrev, rows[i].desc);
     cmd_reply(ctx, line);
-    pthread_mutex_lock(&cmd_mutex);
 
     // The row says what the verb does; this says how to type it. It is
     // a second LINE rather than a fourth column because the grid above
     // already runs past DISPLAY_COLS on its longest descriptions, so
     // there is no width left to spend.
-    if(cargs != NULL)
+    if(rows[i].args[0] != '\0')
     {
-      display_fit(cargs, CMD_HELP_ARGS_COLS, fit, sizeof(fit), "…");
       snprintf(line, sizeof(line),
-          CMD_HELP_ARGS_INDENT CLR_GRAY "%s" CLR_RESET, fit);
-      pthread_mutex_unlock(&cmd_mutex);
+          CMD_HELP_ARGS_INDENT CLR_GRAY "%s" CLR_RESET, rows[i].args);
       cmd_reply(ctx, line);
-      pthread_mutex_lock(&cmd_mutex);
-    }
-
-    count++;
     }
   }
-  pthread_mutex_unlock(&cmd_mutex);
 
-  return count;
+  mem_free(rows);
+
+  return(n);
 }
 
 // /help kv [name] — display help text for a KV configuration key.
@@ -2270,30 +2332,6 @@ cmd_help_kv(const cmd_ctx_t *ctx, const char *name)
 // still reads as a gap when the names either side fill their cell.
 #define CMD_HELP_INDEX_GAP  2
 
-// One visible root command, snapshotted for the index.
-//
-// The listing is collected under cmd_mutex and drawn without it —
-// cmd_reply's delivery path re-enters the mutex, and a def can be
-// unregistered the moment the lock is dropped. So every cell a row can
-// draw is copied here, the description included: that one is a
-// registrant's static string, and the registrant may be a plugin on its
-// way out.
-typedef struct
-{
-  char name[CMD_NAME_SZ];
-  char abbrev[CMD_NAME_SZ];
-  char desc[CMD_HELP_DESC_COLS * 4 + 8];
-} help_row_t;
-
-static int
-help_row_cmp(const void *a, const void *b)
-{
-  const help_row_t *ra = a;
-  const help_row_t *rb = b;
-
-  return(strcasecmp(ra->name, rb->name));
-}
-
 // Snapshot every root command the caller may see, alphabetically.
 //
 // On a non-zero return, *out is a mem_alloc'd array the caller frees;
@@ -2331,6 +2369,7 @@ help_collect_roots(const cmd_ctx_t *ctx, help_row_t **out)
         sizeof(rows[n].abbrev));
     display_fit((d->description != NULL) ? d->description : "",
         CMD_HELP_DESC_COLS, rows[n].desc, sizeof(rows[n].desc), "…");
+    rows[n].args[0] = '\0';
     n++;
   }
 
