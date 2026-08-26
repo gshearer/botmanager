@@ -255,7 +255,8 @@ The command surfaces filed beside these engines (`ask`, `claude`,
 | `acquire` | plugins/extension/inference/engine/acquire_digest.c | autonomous knowledge acquire (`ACQUIRE_CTX`) |
 | `inference` | plugins/extension/inference/engine/inference.c | inference engine top-level (`INFERENCE_CTX`) |
 | `knowledge` | plugins/extension/inference/engine/knowledge_file.c | knowledge corpus subsystem |
-| `llm` | plugins/extension/inference/engine/llm_cmd.c | `/llm` command surface |
+| `llm` | plugins/extension/inference/engine/llm.c, llm_cmd.c | LLM engine and the `/llm` command surface |
+| `llm.unmap` | plugins/extension/inference/engine/llm.c | replies dropped because their requester was unloaded, and callbacks still running in a departing mapping (`LLM_UNMAP_CTX`). **Its own context so it can be subscribed without the engine's other forty lines** — a dropped reply has no path back to its caller, so this bus is the notification |
 
 ## Feature plugins (`plugins/feature/`)
 

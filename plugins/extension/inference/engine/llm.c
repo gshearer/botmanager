@@ -3834,8 +3834,12 @@ llm_delivery_into_locked(uintptr_t lo, uintptr_t hi)
 // them ourselves. The request itself is left to finish and free
 // normally; it simply delivers to nobody.
 //
-// ⭑ Say which requests, not how many. A dropped reply is hunted from
-// the other end — the user saw silence, so the words to hand are the
+// ⭑ These lines are the notification, not a trace of one. Handing the
+// caller a synthesised failure was declined (operator, 08-26) — the
+// requester's mapping is the thing going away — so LLM_UNMAP_CTX puts
+// them on the bus under their own context and a subscriber routes them
+// wherever a human is. Say which requests, not how many: a dropped
+// reply is hunted from the other end, so the words to hand are the
 // model and the kind, never "in-flight request". The count-only line
 // this replaced was in the log for the 08-23 !imagine loss, two lines
 // under `reloading 'imagine_cmd'`, and was not found.
@@ -3929,17 +3933,17 @@ llm_unmap_cb(uintptr_t lo, uintptr_t hi, void *data)
   pthread_mutex_unlock(&llm_active_mutex);
 
   for(uint32_t i = 0; i < named; i++)
-    clam(CLAM_WARN, "llm", "in-flight %s request to '%s' lost its requester "
-        "to an unload; it will complete and deliver nothing",
+    clam(CLAM_WARN, LLM_UNMAP_CTX, "in-flight %s request to '%s' lost its "
+        "requester to an unload; it will complete and deliver nothing",
         llm_kind_to_str(note[i].kind), note[i].model);
 
   if(orphaned > named)
-    clam(CLAM_WARN, "llm", "%u further in-flight request(s) lost the same "
-        "requester, unnamed", orphaned - named);
+    clam(CLAM_WARN, LLM_UNMAP_CTX, "%u further in-flight request(s) lost the "
+        "same requester, unnamed", orphaned - named);
 
   if(stuck > 0)
-    clam(CLAM_WARN, "llm", "%u consumer callback(s) still running inside "
-        "the departing mapping after %u s; the unload proceeds without "
+    clam(CLAM_WARN, LLM_UNMAP_CTX, "%u consumer callback(s) still running "
+        "inside the departing mapping after %u s; the unload proceeds without "
         "them", stuck, LLM_UNMAP_DRAIN_SECS);
 }
 

@@ -165,6 +165,15 @@ void llm_iterate_active(llm_iter_cb_t cb, void *data);
 // copied out and the rest are counted.
 #define LLM_UNMAP_NAMED_MAX   8
 
+// The sweep's own context, apart from the engine's general `llm`. A
+// dropped reply is the one engine event with no path back to whoever
+// asked for it — delivering a synthesised failure to a caller whose
+// mapping is going away was declined (operator, 08-26; the dlclose
+// zombie of `RCH-UNMAP-1`), so the bus is the notification and a
+// subscriber needs to select these lines without taking all forty of
+// llm.c's. Registered in `CLAM.md`.
+#define LLM_UNMAP_CTX         "llm.unmap"
+
 // Per-model request-dialect negotiation (LLM-DIALECT-1).
 #define LLM_DIR_FIELD_SZ    64   // canonical builder field / wire name
 #define LLM_MAX_DIRECTIVES  8    // learned directives per model (room to grow)
