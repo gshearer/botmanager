@@ -2255,18 +2255,243 @@ cmd_help_kv(const cmd_ctx_t *ctx, const char *name)
     cmd_reply(ctx, "(no description available)");
 }
 
+// The command index — every root command the caller may see, in one
+// alphabetical listing, in either of two shapes.
+//
+// The long shape is the grid above, one command per line with its
+// description. That is a fine reference on a terminal and a flood on
+// IRC, where sixty lines answer "what can you do?" one message at a
+// time; so the default shape is the names alone, packed into as many
+// columns as DISPLAY_COLS affords, and `--long` asks for the other.
+
+#define CMD_HELP_INDEX_INDENT  "  "
+
+// Gutter between two name cells. Two columns is the narrowest gap that
+// still reads as a gap when the names either side fill their cell.
+#define CMD_HELP_INDEX_GAP  2
+
+// One visible root command, snapshotted for the index.
+//
+// The listing is collected under cmd_mutex and drawn without it —
+// cmd_reply's delivery path re-enters the mutex, and a def can be
+// unregistered the moment the lock is dropped. So every cell a row can
+// draw is copied here, the description included: that one is a
+// registrant's static string, and the registrant may be a plugin on its
+// way out.
+typedef struct
+{
+  char name[CMD_NAME_SZ];
+  char abbrev[CMD_NAME_SZ];
+  char desc[CMD_HELP_DESC_COLS * 4 + 8];
+} help_row_t;
+
+static int
+help_row_cmp(const void *a, const void *b)
+{
+  const help_row_t *ra = a;
+  const help_row_t *rb = b;
+
+  return(strcasecmp(ra->name, rb->name));
+}
+
+// Snapshot every root command the caller may see, alphabetically.
+//
+// On a non-zero return, *out is a mem_alloc'd array the caller frees;
+// on zero it is NULL and there is nothing to free.
+static uint32_t
+help_collect_roots(const cmd_ctx_t *ctx, help_row_t **out)
+{
+  help_row_t *rows;
+  uint32_t    cap;
+  uint32_t    n = 0;
+
+  pthread_mutex_lock(&cmd_mutex);
+
+  // Every root command is a def, so the registry's own count bounds the
+  // listing — and nothing may move it while the lock is held.
+  cap = cmd_def_count;
+
+  if(cap == 0)
+  {
+    pthread_mutex_unlock(&cmd_mutex);
+    *out = NULL;
+
+    return(0);
+  }
+
+  rows = mem_alloc("cmd", "help_index", (size_t)cap * sizeof(*rows));
+
+  for(cmd_def_t *d = cmd_list; d != NULL && n < cap; d = d->next)
+  {
+    if(d->parent != NULL || !help_check_access(ctx, d))
+      continue;
+
+    strlcpy(rows[n].name, d->name, sizeof(rows[n].name));
+    strlcpy(rows[n].abbrev, (d->abbrev[0] != '\0') ? d->abbrev : "-",
+        sizeof(rows[n].abbrev));
+    display_fit((d->description != NULL) ? d->description : "",
+        CMD_HELP_DESC_COLS, rows[n].desc, sizeof(rows[n].desc), "…");
+    n++;
+  }
+
+  pthread_mutex_unlock(&cmd_mutex);
+
+  if(n == 0)
+  {
+    mem_free(rows);
+    *out = NULL;
+
+    return(0);
+  }
+
+  qsort(rows, n, sizeof(*rows), help_row_cmp);
+  *out = rows;
+
+  return(n);
+}
+
+// Names only, in columns. The fill is row-major: on IRC each row is a
+// separate message that can arrive on its own, so the alphabet has to
+// read in the order the messages do, which is what rules out ls's
+// down-then-across.
+static void
+help_index_columns(const cmd_ctx_t *ctx, const help_row_t *rows,
+    uint32_t n)
+{
+  const int avail = DISPLAY_COLS - (int)(sizeof CMD_HELP_INDEX_INDENT - 1);
+  int       width = 0;
+  int       cols;
+  uint32_t  i;
+
+  for(i = 0; i < n; i++)
+  {
+    int len = (int)strlen(rows[i].name);
+
+    if(len > width)
+      width = len;
+  }
+
+  width += CMD_HELP_INDEX_GAP;
+  cols   = (width <= avail) ? avail / width : 1;
+
+  for(i = 0; i < n; i += (uint32_t)cols)
+  {
+    uint32_t end = i + (uint32_t)cols;
+    uint32_t j;
+    char     line[512];
+
+    if(end > n)
+      end = n;
+
+    strlcpy(line, CMD_HELP_INDEX_INDENT, sizeof(line));
+
+    for(j = i; j < end; j++)
+    {
+      char cell[CMD_NAME_SZ + 16];
+
+      snprintf(cell, sizeof(cell), CLR_CYAN "%s" CLR_RESET, rows[j].name);
+
+      // The last cell of a row has nothing to line up against, and
+      // padding it would send trailing spaces down the wire.
+      if(j + 1 < end)
+        display_align_left(cell, sizeof(cell), width);
+
+      display_cat(line, sizeof(line), cell);
+    }
+
+    cmd_reply(ctx, line);
+  }
+}
+
+static void
+help_index_described(const cmd_ctx_t *ctx, const help_row_t *rows,
+    uint32_t n)
+{
+  uint32_t i;
+
+  cmd_reply_table_head(ctx, CMD_HELP_HEAD);
+
+  for(i = 0; i < n; i++)
+  {
+    char line[512];
+
+    snprintf(line, sizeof(line), CMD_HELP_ROW,
+        rows[i].name, rows[i].abbrev, rows[i].desc);
+    cmd_reply(ctx, line);
+  }
+}
+
+static void
+help_show_index(const cmd_ctx_t *ctx, bool verbose)
+{
+  help_row_t *rows;
+  uint32_t    n = help_collect_roots(ctx, &rows);
+  char        line[64];
+
+  cmd_reply(ctx, CLR_BOLD CLR_CYAN "Available commands" CLR_RESET);
+
+  if(n == 0)
+  {
+    cmd_reply(ctx, CLR_GRAY "none" CLR_RESET);
+
+    return;
+  }
+
+  if(verbose)
+    help_index_described(ctx, rows, n);
+
+  else
+    help_index_columns(ctx, rows, n);
+
+  snprintf(line, sizeof(line), CLR_GRAY "%u command%s" CLR_RESET,
+      n, (n == 1) ? "" : "s");
+  cmd_reply(ctx, line);
+
+  cmd_reply(ctx, verbose
+      ? CLR_GRAY "Use " CLR_RESET "help <command>"
+        CLR_GRAY " for detailed information." CLR_RESET
+      : CLR_GRAY "Use " CLR_RESET "help <command>"
+        CLR_GRAY " for detail, or " CLR_RESET "help --long"
+        CLR_GRAY " for descriptions." CLR_RESET);
+
+  mem_free(rows);
+}
+
+// The verbose flag taken off the front of `args`, in any of its three
+// spellings. Returns what follows it — the empty string when the flag
+// was the whole line — or NULL when there is no flag to take.
+static const char *
+help_take_verbose(const char *args)
+{
+  static const char *const flags[] = { "-v", "--verbose", "--long" };
+  size_t i;
+
+  for(i = 0; i < sizeof(flags) / sizeof(flags[0]); i++)
+  {
+    size_t len = strlen(flags[i]);
+
+    if(strncmp(args, flags[i], len) == 0
+        && (args[len] == '\0' || args[len] == ' ' || args[len] == '\t'))
+      return(help_skip_ws(args + len));
+  }
+
+  return(NULL);
+}
+
 // Built-in: help -- list all available commands, or show verbose help
 // for a specific command.
 //
 // Usage:
-//   /help            -- list all root commands
-//   /help <command>  -- show usage and subcommands
-//   /help -v <cmd>   -- verbose help (description + help_long)
-//   /help kv <key>   -- show help for a KV configuration key
+//   /help              -- list all root commands, names only
+//   /help --long       -- that list with abbreviations and descriptions
+//   /help <command>    -- show usage and subcommands
+//   /help -v <cmd>     -- verbose help (description + help_long)
+//   /help kv <key>     -- show help for a KV configuration key
 static void
 cmd_builtin_help(const cmd_ctx_t *ctx)
 {
   const char *args;
+  const char *after_flag;
   const char *hp;
   const char *rest;
   cmd_def_t *d;
@@ -2279,65 +2504,21 @@ cmd_builtin_help(const cmd_ctx_t *ctx)
   size_t hi = 0;
   bool verbose = false;
 
-  // No arguments: list all root commands.
-  if(ctx->args == NULL || ctx->args[0] == '\0')
-  {
-    char count_line[64];
-    uint32_t count = 0;
+  args = help_skip_ws((ctx->args != NULL) ? ctx->args : "");
 
-    cmd_reply(ctx, CLR_BOLD CLR_CYAN "Available commands" CLR_RESET);
-    cmd_reply_table_head(ctx, CMD_HELP_HEAD);
+  after_flag = help_take_verbose(args);
 
-    pthread_mutex_lock(&cmd_mutex);
-    for(cmd_def_t *d = cmd_list; d != NULL; d = d->next)
-    {
-      const char *name;
-      const char *abbrev;
-      const char *desc;
-      char line[512];
-      char fit[CMD_HELP_ARGS_COLS * 4 + 8];
-
-      if(d->parent != NULL)
-        continue;
-      if(!help_check_access(ctx, d))
-        continue;
-
-      name = d->name;
-      abbrev = (d->abbrev[0] != '\0') ? d->abbrev : "-";
-      desc = d->description ? d->description : "";
-      display_fit(desc, CMD_HELP_DESC_COLS, fit, sizeof(fit), "…");
-      snprintf(line, sizeof(line), CMD_HELP_ROW, name, abbrev, fit);
-
-      pthread_mutex_unlock(&cmd_mutex);
-      cmd_reply(ctx, line);
-      pthread_mutex_lock(&cmd_mutex);
-      count++;
-    }
-    pthread_mutex_unlock(&cmd_mutex);
-
-    snprintf(count_line, sizeof(count_line),
-        CLR_GRAY "%u command%s" CLR_RESET, count, count == 1 ? "" : "s");
-    cmd_reply(ctx, count_line);
-    cmd_reply(ctx, CLR_GRAY "Use " CLR_RESET "help <command>"
-        CLR_GRAY " for detailed information." CLR_RESET);
-    return;
-  }
-
-  // Parse -v flag.
-  args = ctx->args;
-
-  if(strncmp(args, "-v ", 3) == 0 || strncmp(args, "-v\t", 3) == 0)
+  if(after_flag != NULL)
   {
     verbose = true;
-    args += 3;
-    while(*args == ' ' || *args == '\t')
-      args++;
+    args    = after_flag;
   }
 
-  else if(strcmp(args, "-v") == 0)
+  // Nothing named: the index, in whichever shape the flag asked for.
+  if(args[0] == '\0')
   {
-    // -v with no command argument: error.
-    cmd_reply(ctx, "usage: help [-v] [command ...]");
+    help_show_index(ctx, verbose);
+
     return;
   }
 
@@ -3088,9 +3269,10 @@ static const cmd_nl_t version_nl = {
 static const cmd_decl_t help_decl = {
   .module      = "cmd",
   .name        = "help",
-  .usage       = "help [-v] [command ...] | help kv <key>",
+  .usage       = "help [-v|--long] [command ...] | help kv <key>",
   .description = "Command reference",
   .help_long   = "Lists all commands available on this bot instance.\n"
+                 "Use help --long for that list with descriptions.\n"
                  "Use help <command> to see usage and subcommands.\n"
                  "Use help -v <command> for verbose help.\n"
                  "Use help kv <key> for configuration key help.",
