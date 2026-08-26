@@ -3834,6 +3834,12 @@ llm_delivery_into_locked(uintptr_t lo, uintptr_t hi)
 // them ourselves. The request itself is left to finish and free
 // normally; it simply delivers to nobody.
 //
+// ⭑ Say which requests, not how many. A dropped reply is hunted from
+// the other end — the user saw silence, so the words to hand are the
+// model and the kind, never "in-flight request". The count-only line
+// this replaced was in the log for the 08-23 !imagine loss, two lines
+// under `reloading 'imagine_cmd'`, and was not found.
+//
 // ⭑ Dropping them is not enough on its own. The chunk callback of a
 // streaming request runs on the curl thread with no lock of ours held,
 // so this sweep also waits out every delivery window opened before the
@@ -3855,9 +3861,11 @@ llm_delivery_into_locked(uintptr_t lo, uintptr_t hi)
 static void
 llm_unmap_cb(uintptr_t lo, uintptr_t hi, void *data)
 {
-  uint32_t        orphaned = 0;
-  uint32_t        stuck    = 0;
-  struct timespec deadline;
+  llm_orphan_note_t note[LLM_UNMAP_NAMED_MAX];
+  uint32_t          named    = 0;
+  uint32_t          orphaned = 0;
+  uint32_t          stuck    = 0;
+  struct timespec   deadline;
 
   (void)data;
 
@@ -3892,6 +3900,13 @@ llm_unmap_cb(uintptr_t lo, uintptr_t hi, void *data)
     r->chunk_cb      = NULL;
     r->user_data     = NULL;
     orphaned++;
+
+    if(named < LLM_UNMAP_NAMED_MAX)
+    {
+      note[named].kind = r->kind;
+      strlcpy(note[named].model, r->model_name, sizeof note[named].model);
+      named++;
+    }
   }
 
   stuck = llm_delivery_into_locked(lo, hi);
@@ -3913,9 +3928,14 @@ llm_unmap_cb(uintptr_t lo, uintptr_t hi, void *data)
 
   pthread_mutex_unlock(&llm_active_mutex);
 
-  if(orphaned > 0)
-    clam(CLAM_WARN, "llm", "%u in-flight request(s) lost their requester "
-        "to an unload; they will complete and deliver nothing", orphaned);
+  for(uint32_t i = 0; i < named; i++)
+    clam(CLAM_WARN, "llm", "in-flight %s request to '%s' lost its requester "
+        "to an unload; it will complete and deliver nothing",
+        llm_kind_to_str(note[i].kind), note[i].model);
+
+  if(orphaned > named)
+    clam(CLAM_WARN, "llm", "%u further in-flight request(s) lost the same "
+        "requester, unnamed", orphaned - named);
 
   if(stuck > 0)
     clam(CLAM_WARN, "llm", "%u consumer callback(s) still running inside "

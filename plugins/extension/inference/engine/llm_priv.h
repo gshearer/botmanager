@@ -158,6 +158,13 @@ void llm_iterate_active(llm_iter_cb_t cb, void *data);
 #define LLM_STOP_DRAIN_SECS   10
 #define LLM_UNMAP_DRAIN_SECS  2
 
+// How many orphaned requests the unmap sweep names individually. The
+// name is the whole point of the line — a vanished reply is hunted by
+// the model that was going to produce it, never by the word "request" —
+// but the sweep cannot clam() under llm_active_mutex, so the names are
+// copied out and the rest are counted.
+#define LLM_UNMAP_NAMED_MAX   8
+
 // Per-model request-dialect negotiation (LLM-DIALECT-1).
 #define LLM_DIR_FIELD_SZ    64   // canonical builder field / wire name
 #define LLM_MAX_DIRECTIVES  8    // learned directives per model (room to grow)
@@ -364,6 +371,15 @@ struct llm_request
   // Freelist linkage.
   struct llm_request   *next_free;
 };
+
+// What the unmap sweep carries out from under llm_active_mutex so it can
+// name an orphaned request once the lock is dropped. A copy, not a
+// pointer: the request keeps running and the sweep has no claim on it.
+typedef struct
+{
+  llm_kind_t kind;
+  char       model[LLM_MODEL_NAME_SZ];
+} llm_orphan_note_t;
 
 // Shared state between llm.c and llm_cmd.c. Defined in llm.c.
 extern llm_model_t     *llm_models_head;
