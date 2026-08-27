@@ -190,15 +190,33 @@ wiki_alias_of(const char *word)
 
 // Age is the one question Wikidata cannot be asked: nothing stores it.
 // It is a birth date, a death date that may not exist, and arithmetic.
+//
+// "dead" and "alive" ask that same question from the other end, and
+// they are answered HERE rather than by a P570 row in the alias table
+// above, because a living person holds no death statement at all: P570
+// would answer "is he dead" with an empty, which is also what an
+// unfilled field looks like. The two-leg form knows the difference.
 static bool
 wiki_is_age(const char *word)
 {
-  return(strcasecmp(word, "age") == 0 || strcasecmp(word, "how old") == 0);
+  static const char *const words[] = {
+    "age", "how old", "alive", "still alive", "dead", "is dead"
+  };
+
+  for(size_t i = 0; i < sizeof(words) / sizeof(words[0]); i++)
+  {
+    if(strcasecmp(word, words[i]) == 0)
+      return(true);
+  }
+
+  return(false);
 }
 
 static const char wiki_usage[] =
-    "wiki [-v] [-l] [-n <count>] <subject> [property] | "
-    "wiki <subject> ? | wiki <property>=<value> | wiki Q<id> [property]";
+    // ⚠ 136 bytes: /help renders this into CMD_USAGE_SZ + 16 behind a
+    // "usage: " prefix and TRUNCATES silently past it.
+    "wiki [-v] [-l] [-n N] <subject> [property] | wiki <subject> ? | "
+    "wiki <property>=<value> | wiki Q<id> | wiki <person> age";
 
 // Is this token a Wikidata item id? The service checks again at its own
 // boundary before pasting one into a URL; this is the grammar's check,
@@ -966,6 +984,8 @@ static const cmd_nl_example_t wiki_examples[] = {
     .invocation = "/wiki marie curie cause of death" },
   { .utterance  = "who's in green day these days?",
     .invocation = "/wiki \"green day\" members" },
+  { .utterance  = "is clint eastwood dead?",
+    .invocation = "/wiki clint eastwood age" },
 };
 
 static const cmd_nl_t wiki_nl = {
@@ -1001,7 +1021,11 @@ static const cmd_decl_t wiki_decl = {
       "band and not the colour's day. Quote the subject to pin it "
       "(`wiki \"green day\" members`), or name it by id (`wiki Q937 "
       "born`). A trailing ? lists what can be asked about a thing of that "
-      "type. `<property>=<value>` runs the query backwards and finds what "
+      "type. `wiki <person> age` — or `alive`, or `dead` — is the one "
+      "question Wikidata cannot be asked, because nothing stores it: it "
+      "is answered from the birth date plus whether a death date exists, "
+      "so the living get an age and the dead get the age they reached. "
+      "`<property>=<value>` runs the query backwards and finds what "
       "holds that statement. -l shows the candidates with their ids, -n "
       "caps a list, and -v gives the long card with the article's "
       "opening — it takes the whole line as the subject and splits no "
