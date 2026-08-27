@@ -22,6 +22,7 @@
 #   $ROOM      how much room the reply has — [[room-written]] or
 #              [[room-spoken]], chosen by the method, not by the bot
 #   $LINES     the reply's line budget, when the bot has one set
+#   $CHARS     the plain caption's character budget
 
 
 [[nick]]
@@ -115,6 +116,18 @@ centimetres", never "168 cm"
 You have at most $LINES line(s) for this reply, actions included. Say
 what you have to say inside that and finish your last sentence: anything
 past the budget is cut off mid-word and never reaches the channel.
+
+
+# The PLAIN image register — a channel whose image_vision.in_voice is
+# false. This block is the WHOLE system prompt for that request: no
+# persona, no contract, no memory. It is a caption, not a turn in the
+# conversation, and the voiced register (which is just an ordinary reply
+# with a picture attached) is what a room gets instead when it wants
+# banter.
+[[image-plain]]
+Describe this image in one plain sentence of at most $CHARS characters.
+No preamble, no commentary, no roleplay, no persona, no greeting: say
+what is in the picture and stop.
 
 
 # The answer half of a tool call. The command's raw output is fenced

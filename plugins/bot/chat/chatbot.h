@@ -43,6 +43,12 @@
 // COMMANDS preamble at roughly 500 bytes; the rest are a paragraph.
 #define CHATBOT_BASE_RENDER_SZ  2048
 
+// Room above the plain caption's character budget for the model to
+// finish its sentence. The budget is what the instruction asks for and
+// what llm_done enforces; this only stops max_tokens from being the
+// thing that cuts the line off.
+#define CHATBOT_VISION_PLAIN_SLACK_TOKENS  32
+
 // …except in the interpret cue, where the block shares one METHOD_TEXT_SZ
 // message with the premise AND the command's own output. The head buffer
 // there is 1536 and carries `[internal cue: ` + premise
@@ -848,12 +854,18 @@ void chatbot_reply_submit(chatbot_state_t *st, const method_msg_t *msg,
 
 // Image-vision sibling of chatbot_reply_submit. Seeds the vision
 // fields (image_b64 ownership transfers in from the caller; mime is
-// copied; source URL is captured for logging) and otherwise follows
-// the same pipeline as the text path. On any early failure the
+// copied; source URL is captured for logging). On any early failure the
 // function takes ownership of image_b64 and frees it.
+//
+// `in_voice` is the channel's register, decided at the gate in vision.c
+// and carried across the fetch — never re-read here, because the
+// operator may have flipped the key while the image was on the wire and
+// the answer has to match the gate that admitted it. True follows the
+// text path all the way; false branches early to a plain caption that
+// shares nothing below the request but the two-block user turn.
 void chatbot_reply_submit_vision(chatbot_state_t *st,
     const method_msg_t *msg, const char *source_url,
-    char *image_b64, const char *image_mime);
+    char *image_b64, const char *image_mime, bool in_voice);
 
 // Non-zero when `line` is an action rather than speech, and then the
 // offset of the action text within it (see CHATBOT_EMOTE_PREFIX).
@@ -1103,6 +1115,16 @@ typedef struct
   char           *image_b64;                       // mem_alloc'd, freed in req_free
   char            image_mime[32];
   char            image_source_url[1024];
+
+  // IV4-3: the plain register. Set from the channel's `in_voice` key at
+  // the gate, carried across the fetch on chatbot_vision_ctx_t. A plain
+  // request is a SECOND SHAPE, not a flag on the voiced one — no
+  // persona, no contract, no RAG, no dossier and no conversation log,
+  // because a mechanical caption is not a turn in the conversation.
+  // vision_plain_submit() builds it; llm_done folds and truncates its
+  // one line to plain_max_chars.
+  bool            vision_plain;
+  uint32_t        plain_max_chars;
 
   char            chat_model[64];
   float           temperature;

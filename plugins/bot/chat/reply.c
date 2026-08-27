@@ -1515,6 +1515,69 @@ llm_chunk(llm_request_t *req, const char *delta, size_t delta_len,
   }
 }
 
+// Fold a plain-register completion into the one line the channel gets.
+// Whitespace runs — newlines included — become single spaces, and
+// anything past `budget` bytes is cut at the last space that fits, or at
+// the last UTF-8 boundary when the budget lands mid-word. The IRC driver
+// folds line breaks itself (irc_fold_line_breaks), but that is one
+// driver's courtesy rather than a contract, and the robot is a method
+// too.
+//
+// The budget is bytes, not codepoints. Cutting at a space keeps that
+// honest for every alphabet that has spaces; the boundary walk is what
+// covers the rest.
+static void
+vision_plain_flatten(const char *src, uint32_t budget, char *dst,
+    size_t dst_sz)
+{
+  size_t o    = 0;
+  size_t word = 0;                        // offset of the last space that fits
+  size_t cap;                             // bytes of content that fit, + 1
+  size_t i;
+
+  cap = (size_t)budget + 1 < dst_sz ? (size_t)budget + 1 : dst_sz;
+
+  for(i = 0; src[i] != '\0' && o + 1 < dst_sz; i++)
+  {
+    unsigned char c = (unsigned char)src[i];
+
+    if(c < 0x20 || c == 0x7f) c = ' ';
+
+    if(c == ' ' && (o == 0 || dst[o - 1] == ' '))
+      continue;
+
+    // Only a space inside the budget is a candidate cut point; one past
+    // it would put the cut where the caller asked us not to.
+    if(c == ' ' && o + 1 < cap) word = o;
+
+    dst[o++] = (char)c;
+  }
+
+  while(o > 0 && dst[o - 1] == ' ') o--;
+  dst[o] = '\0';
+
+  if(o < cap)
+    return;
+
+  // Over budget. Prefer the last whole word inside it; failing that, back
+  // up to a codepoint boundary so the ellipsis lands on valid text.
+  if(word > 0)
+    o = word;
+
+  else
+  {
+    o = cap - 1;
+    while(o > 0 && ((unsigned char)dst[o] & 0xC0) == 0x80) o--;
+  }
+
+  while(o > 0 && dst[o - 1] == ' ') o--;
+
+  if(o + sizeof("\xe2\x80\xa6") <= dst_sz)
+    strlcpy(dst + o, "\xe2\x80\xa6", dst_sz - o);   // U+2026, one character
+  else
+    dst[o] = '\0';
+}
+
 static void
 llm_done(const llm_chat_response_t *resp)
 {
@@ -1550,7 +1613,21 @@ llm_done(const llm_chat_response_t *resp)
   if(r->stream_flushed < resp->content_len)
   {
     const char *tail = resp->content + r->stream_flushed;
-    if(tail[0] != '\0')
+
+    // The plain register never streamed, so this tail is the whole
+    // answer and it is the only line that will be sent. The instruction
+    // and max_tokens do the real work; this is the backstop for a model
+    // that wrote a second paragraph anyway.
+    if(r->vision_plain)
+    {
+      char one[METHOD_TEXT_SZ];
+
+      vision_plain_flatten(tail, r->plain_max_chars, one, sizeof(one));
+      if(one[0] != '\0')
+        send_reply_line(r, one);
+    }
+
+    else if(tail[0] != '\0')
       send_reply_line(r, tail);
   }
 
@@ -1567,7 +1644,13 @@ llm_done(const llm_chat_response_t *resp)
   // and adds a per-(method, target) anti-repeat window so the canned
   // string cannot spam the channel when the LLM SKIPs several direct
   // lines within CHATBOT_CV4_FALLBACK_COOLDOWN_SECS.
+  // ⚠ The plain register is exempt. It is a direct address by
+  // construction (chatbot_reply_submit_vision sets that for every image),
+  // it has no persona contract to violate and it was never told what
+  // SKIP means — so a model that emitted the word would otherwise have
+  // the bot say "nothing to say" at a picture nobody asked about.
   if(r->is_direct_address &&
+     !r->vision_plain &&
      r->nonskip_lines_sent == 0 &&
      r->skip_sentinels_seen > 0)
   {
@@ -1614,7 +1697,9 @@ llm_done(const llm_chat_response_t *resp)
   // SKIP the sentinel swallowed are not utterances, and the only live
   // reader of these rows is the recent-own-replies anti-repeat slice,
   // which acts on them as if they were.
-  if(r->spoken[0] != '\0')
+  // A caption is not a turn in the conversation, and the plain path never
+  // resolved a dossier to file one against — see chatbot_req_t.
+  if(r->spoken[0] != '\0' && !r->vision_plain)
   {
     log.ns_id        = (int)r->ns_id;
     log.user_id_or_0 = r->user_id;
@@ -3521,18 +3606,119 @@ chatbot_reply_submit(chatbot_state_t *st, const method_msg_t *msg,
   }
 }
 
+// Vision model ladder: the bot's vision override, then its chat model,
+// then the daemon default. Both registers resolve through this — the
+// plain path branches before the voiced path's setup runs, and neither
+// is entitled to a different answer about which model can see.
+static void
+vision_resolve_model(const char *botname, char *dst, size_t dst_sz)
+{
+  const char *cm;
+
+  cm = kv_get_bot_str(botname, "behavior.image_vision.model");
+
+  if(cm == NULL || cm[0] == '\0')
+    cm = kv_get_bot_str(botname, "chat_model");
+
+  if(cm == NULL || cm[0] == '\0')
+    cm = kv_get_str("llm.default_chat_model");
+
+  snprintf(dst, dst_sz, "%s", cm != NULL ? cm : "");
+}
+
+// The vision user turn: the line that carried the URL, then the image.
+// Identical in both registers — they differ in what the SYSTEM message
+// says and in how the answer is delivered, never in what is shown.
+static void
+vision_user_blocks(const chatbot_req_t *r, llm_content_block_t *blocks)
+{
+  blocks[0].kind       = LLM_CONTENT_TEXT;
+  blocks[0].text       = r->text;
+  blocks[1].kind       = LLM_CONTENT_IMAGE_BASE64;
+  blocks[1].image_mime = r->image_mime;
+  blocks[1].image_b64  = r->image_b64;
+}
+
+// The plain register: one mechanical sentence about the picture, no
+// persona in the loop. Takes the caller's inflight bump the way
+// assemble_and_submit does — on any failure it gives it back and frees r.
+//
+// stream = false is what keeps this small: llm_done already sends the
+// whole body as one tail when the server did not stream, so llm_chunk
+// never runs, the line splitter never runs, and exactly one line reaches
+// the channel.
+static void
+vision_plain_submit(chatbot_req_t *r)
+{
+  const char         *botname = bot_inst_name(r->st->inst);
+  llm_message_t       messages[2];
+  llm_content_block_t user_blocks[2];
+  llm_chat_params_t   params;
+  chatbot_base_tok_t  toks[2];
+  char                system[CHATBOT_BASE_RENDER_SZ];
+  char                budget[16];
+
+  memset(messages,    0, sizeof(messages));
+  memset(user_blocks, 0, sizeof(user_blocks));
+  memset(&params,     0, sizeof(params));
+
+  // 0 here is not a budget, so the declared default answers instead.
+  r->plain_max_chars = (uint32_t)kv_get_bot_uint_or_default(botname,
+      "behavior.image_vision.plain_max_chars");
+
+  snprintf(budget, sizeof(budget), "%u", r->plain_max_chars);
+  toks[0].name  = "$CHARS";
+  toks[0].value = budget;
+  toks[1].name  = NULL;
+  toks[1].value = NULL;
+
+  if(chatbot_base_render(r->base, "image-plain", toks, system,
+        sizeof(system)) == 0)
+    snprintf(system, sizeof(system),
+        "Describe this image in one plain sentence of at most %s"
+        " characters. No preamble, no commentary, no roleplay.", budget);
+
+  messages[0].role     = LLM_ROLE_SYSTEM;
+  messages[0].content  = system;
+  messages[1].role     = LLM_ROLE_USER;
+  vision_user_blocks(r, user_blocks);
+  messages[1].blocks   = user_blocks;
+  messages[1].n_blocks = 2;
+
+  r->max_tokens = r->plain_max_chars / CHATBOT_BYTES_PER_TOKEN
+      + CHATBOT_VISION_PLAIN_SLACK_TOKENS;
+
+  params.temperature = r->temperature;
+  params.max_tokens  = r->max_tokens;
+  params.effort      = r->effort;
+  params.stream      = false;
+
+  clam(CLAM_DEBUG, "vision",
+      "submit bot=%s target=%s register=plain chars=%u url='%s'",
+      botname, r->reply_target, r->plain_max_chars, r->image_source_url);
+
+  if(llm_chat_submit(r->chat_model, &params, messages, 2,
+        llm_done, NULL, r) != SUCCESS)
+  {
+    clam(CLAM_WARN, "vision",
+        "plain llm_chat_submit failed (model='%s')", r->chat_model);
+    inflight_bump(r->st, -1);
+    req_free(r);
+  }
+}
+
 // IV3 — sibling of chatbot_reply_submit for the image-vision path.
 // Ownership contract: on any exit (success or failure) this function
 // takes responsibility for image_b64 — if an error returns before
 // r->image_b64 is attached, the caller's pointer is freed here.
 void
 chatbot_reply_submit_vision(chatbot_state_t *st, const method_msg_t *msg,
-    const char *source_url, char *image_b64, const char *image_mime)
+    const char *source_url, char *image_b64, const char *image_mime,
+    bool in_voice)
 {
   uint32_t top_k;
   uint32_t rr_cap;
   userns_t *ns;
-  const char *cm;
   const char *cl;
   const char *botname;
   chatbot_personality_t p = {0};
@@ -3572,10 +3758,43 @@ chatbot_reply_submit_vision(chatbot_state_t *st, const method_msg_t *msg,
 
   // Attach vision payload — from this point on req_free releases b64.
   r->vision_active = true;
+  r->vision_plain  = !in_voice;
   r->image_b64     = image_b64;
   snprintf(r->image_mime,       sizeof(r->image_mime),       "%s", image_mime);
   snprintf(r->image_source_url, sizeof(r->image_source_url), "%s",
       source_url != NULL ? source_url : "");
+
+  // The plain register branches here rather than at the dispatch tail,
+  // because everything between the two points exists to serve a persona
+  // this path does not have: two file reads for the personality and the
+  // contract, a dossier resolve, the recent-replies query and the RAG
+  // round trip. A caption should not cost any of them, and a bot with no
+  // personality set should still be able to answer one.
+  if(r->vision_plain)
+  {
+    botname = bot_inst_name(st->inst);
+
+    vision_resolve_model(botname, r->chat_model, sizeof(r->chat_model));
+
+    if(r->chat_model[0] == '\0')
+    {
+      clam(CLAM_WARN, "vision",
+          "no chat model configured for bot '%s' — skipping", botname);
+      req_free(r);
+      return;
+    }
+
+    // Read fresh per request, like every other prompt input: an edit to
+    // base.txt is live on the next caption.
+    r->base        = chatbot_base_load();
+    r->temperature = (float)kv_get_bot_uint(botname,
+        "speak_temperature") / 100.0f;
+    r->effort      = reply_bot_effort(botname);
+
+    inflight_bump(st, +1);
+    vision_plain_submit(r);
+    return;
+  }
 
   // Snapshot active personality name.
   pthread_rwlock_rdlock(&st->lock);
@@ -3671,15 +3890,7 @@ chatbot_reply_submit_vision(chatbot_state_t *st, const method_msg_t *msg,
   r->subject_max_age_days   = 0;
   r->images_recency_ordered = false;
 
-  // Resolve vision model: per-bot vision.model → chat_model → global default.
-  cm = kv_get_bot_str(botname, "behavior.image_vision.model");
-  if(cm == NULL || cm[0] == '\0')
-  {
-    cm = kv_get_bot_str(botname, "chat_model");
-  }
-  if(cm == NULL || cm[0] == '\0')
-    cm = kv_get_str("llm.default_chat_model");
-  snprintf(r->chat_model, sizeof(r->chat_model), "%s", cm ? cm : "");
+  vision_resolve_model(botname, r->chat_model, sizeof(r->chat_model));
 
   r->temperature = (float)kv_get_bot_uint(botname,
       "speak_temperature") / 100.0f;

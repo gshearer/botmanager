@@ -465,6 +465,11 @@ static const plugin_kv_entry_t chatbot_inst_schema[] = {
     " past 10 MiB.", NULL },
   { "behavior.image_vision.max_inflight", KV_UINT32, "1",
     "Concurrent vision fetches per bot.", NULL },
+  { "behavior.image_vision.plain_max_chars", KV_UINT32, "200",
+    "Character budget for a PLAIN vision reply — the register a channel"
+    " gets when its image_vision.in_voice is false. The model is asked"
+    " for one sentence inside this and the answer is folded to one line"
+    " and cut at the last word that fits.", NULL },
   { "behavior.image_vision.max_lines", KV_UINT32, "3",
     "Lines a voiced vision reply may put on the wire. 0 inherits"
     " behavior.max_reply_lines. Vision is where the persona is at its"

@@ -633,7 +633,7 @@ vision_on_fetch_done(const curl_response_t *resp)
 
   // Ownership transfer: b64 is now owned by the reply pipeline.
   chatbot_reply_submit_vision(ctx->st, &synth, ctx->image_url,
-      b64, mime_canon);
+      b64, mime_canon, ctx->in_voice);
   b64 = NULL;
 
   method_release(method);
