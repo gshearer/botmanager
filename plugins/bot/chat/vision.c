@@ -384,9 +384,11 @@ chatbot_vision_maybe_submit(chatbot_state_t *st, const method_msg_t *msg)
   ctx->is_action = msg->is_action;
   ctx->in_voice  = in_voice;
 
-  ctx->max_bytes = (uint32_t)kv_get_bot_uint(botname,
+  // 0 is not a size, so the declaration answers instead of a constant
+  // written down here a second time (include/kv.h, kv_get_str's rule
+  // about restating a default — this site had drifted to 8 MB).
+  ctx->max_bytes = (uint32_t)kv_get_bot_uint_or_default(botname,
       "behavior.image_vision.max_bytes");
-  if(ctx->max_bytes == 0) ctx->max_bytes = 8 * 1000 * 1000;
 
   // Fire the fetch.
   req = curl_request_create(CURL_METHOD_GET, image_url,

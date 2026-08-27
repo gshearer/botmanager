@@ -459,10 +459,14 @@ static const plugin_kv_entry_t chatbot_inst_schema[] = {
   { "behavior.image_vision.url_cooldown_secs", KV_UINT32, "600",
     "Minimum seconds before the same image URL re-triggers in the same"
     " channel.", NULL },
-  { "behavior.image_vision.max_bytes", KV_UINT32, "8000000",
-    "Reject image bodies larger than this. Bounded above by"
-    " core.curl.max_response_sz; operator must bump that too for caps"
-    " past 10 MiB.", NULL },
+  { "behavior.image_vision.max_bytes", KV_UINT32, "3000000",
+    "Reject image bodies larger than this. MUST stay under"
+    " core.curl.max_response_sz (4 MiB as declared), which aborts the"
+    " transfer first and reports it as a network fault rather than an"
+    " oversized picture — there is no per-request curl cap to raise"
+    " instead. 3 MB is well past what a vision model looks at: they"
+    " downscale on ingest, so the extra bytes cost wire time, RAM and"
+    " base64 inflation and buy no signal.", NULL },
   { "behavior.image_vision.max_inflight", KV_UINT32, "1",
     "Concurrent vision fetches per bot.", NULL },
   { "behavior.image_vision.plain_max_chars", KV_UINT32, "200",
