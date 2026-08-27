@@ -2375,6 +2375,38 @@ llm_parse_embed_response(llm_request_t *req, const char *body, size_t len)
   return(SUCCESS);
 }
 
+// Explain a 2xx image response that carried no payload. Such a reply is
+// not a parse failure — it is the provider declining in a shape the
+// OpenAI images schema has no field for, and reporting the missing key
+// named the symptom rather than the reason. Surface what actually came
+// back: the provider's own message where there is one, the URL case
+// (which names its own fix), and otherwise a prefix of the body, which
+// is the only evidence there is. Newlines are collapsed so the result
+// stays one log line and one IRC line.
+static void
+llm_image_no_payload_err(llm_request_t *req, const char *body, size_t len)
+{
+  char msg[LLM_ERR_SZ];
+
+  if(llm_extract_str(body, len, "\"message\"", msg, sizeof(msg)) > 0)
+    snprintf(req->errbuf, sizeof(req->errbuf),
+        "provider returned no image (http %ld): %.200s",
+        req->http_status, msg);
+
+  else if(util_memstr(body, len, "\"url\"") != NULL)
+    snprintf(req->errbuf, sizeof(req->errbuf),
+        "provider returned an image URL, not base64"
+        " -- response_format was not honoured");
+
+  else
+    snprintf(req->errbuf, sizeof(req->errbuf),
+        "provider returned no image (http %ld): %.180s",
+        req->http_status, body);
+
+  for(char *p = req->errbuf; *p != '\0'; p++)
+    if(*p == '\n' || *p == '\r') *p = ' ';
+}
+
 // Parse a text-to-image response: {"data":[{"b64_json":"<base64>",
 // "revised_prompt":"..."}]}. The base64 payload can be megabytes, so we
 // locate its bounds and append the raw slice straight into req->assembled
@@ -2394,7 +2426,7 @@ llm_parse_image_response(llm_request_t *req, const char *body, size_t len)
 
   if(key == NULL)
   {
-    snprintf(req->errbuf, sizeof(req->errbuf), "no b64_json in response");
+    llm_image_no_payload_err(req, body, len);
     return(FAIL);
   }
 
