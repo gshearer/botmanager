@@ -1660,6 +1660,8 @@ chatbot_start(void *handle)
 
   botname = bot_inst_name(st->inst);
 
+  chatbot_vision_register_channels(st);
+
   ns = bot_get_userns(st->inst);
   ns_id = ns != NULL ? ns->id : 0;
   if(ns_id == 0)

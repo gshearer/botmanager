@@ -51,6 +51,12 @@ typedef struct
   char             image_url       [1024];
   uint32_t         max_bytes;
   bool             is_action;
+
+  // The channel's register, snapshotted at the gate. Read here rather
+  // than in vision_on_fetch_done on purpose: the operator may flip the
+  // key while the image is on the wire, and the register must match the
+  // gate that admitted it.
+  bool             in_voice;
 } chatbot_vision_ctx_t;
 
 static bool vision_cooldown_hot(chatbot_vision_cd_t *ring,
@@ -62,6 +68,109 @@ static void vision_url_cd_key(const char *target, const char *url,
 static bool vision_magic_ok(const char *body, size_t len,
     const char *mime);
 static void vision_on_fetch_done(const curl_response_t *resp);
+
+// ----------------------------------------------------------------------
+// Per-channel keys
+// ----------------------------------------------------------------------
+
+#define VISION_SUFFIX_ENABLED   "enabled"
+#define VISION_SUFFIX_IN_VOICE  "in_voice"
+
+#define VISION_MAX_SCAN_CHANS   64
+
+// Compose bot.<bot>.<kind>.chan.<channel>.image_vision.<suffix>, so the
+// knob sits beside that channel's other settings. Any leading channel
+// sigil is dropped to match the IRC channel keyspace, which stores
+// "cabal" and not "#cabal" — a key composed with the '#' is a different
+// key that nothing ever sets. Every component is width-bounded because a
+// composed key that overruns KV_KEY_SZ addresses a DIFFERENT, shorter
+// key, which then answers with somebody else's value (kv.h, above
+// KV_KEY_SZ: this tree has paid for it once).
+static void
+vision_chan_key(char *buf, size_t bufsz, const char *bot, const char *kind,
+    const char *channel, const char *suffix)
+{
+  const char *name = channel;
+
+  if(name[0] == '#' || name[0] == '&' || name[0] == '+' || name[0] == '!')
+    name++;
+
+  snprintf(buf, bufsz, "bot.%.32s.%.16s.chan.%.48s.image_vision.%s",
+      bot, kind, name, suffix);
+}
+
+// Register a channel's two knobs together, so a channel is never half
+// configured. kv_register rehydrates any persisted value from the DB (we
+// are well past kv_load), so an operator's earlier `enabled true`
+// survives a reload; a re-register of a live key is refused and WARNs
+// that the declaration did not take, so the kv_exists gate is what makes
+// every call after the first a no-op.
+static void
+vision_chan_register(const char *bot, const char *kind, const char *channel)
+{
+  char key[KV_KEY_SZ];
+
+  vision_chan_key(key, sizeof(key), bot, kind, channel,
+      VISION_SUFFIX_ENABLED);
+  if(kv_exists(key))
+    return;
+
+  kv_register(key, KV_BOOL, "false", NULL, NULL,
+      "image-vision: describe images pasted in this channel."
+      " ANDed with behavior.image_vision.enabled, never a substitute"
+      " for it.");
+
+  vision_chan_key(key, sizeof(key), bot, kind, channel,
+      VISION_SUFFIX_IN_VOICE);
+
+  kv_register(key, KV_BOOL, "false", NULL, NULL,
+      "image-vision: answer this channel in the persona's voice rather"
+      " than with one plain sentence.");
+}
+
+typedef struct
+{
+  char     names[VISION_MAX_SCAN_CHANS][METHOD_CHANNEL_SZ];
+  uint32_t count;
+  size_t   prefix_len;
+} vision_scan_t;
+
+// kv_iterate_prefix callback — runs UNDER THE KV LOCK, so it collects and
+// calls nothing (a kv_* call from here deadlocks the daemon). Key shape
+// is bot.<bot>.<kind>.chan.<channel>.<property>; the channel is the
+// segment between the prefix and the next '.'.
+static void
+vision_scan_cb(const char *key, kv_type_t type, const char *value,
+    void *data)
+{
+  vision_scan_t *sc = data;
+  const char    *suffix;
+  const char    *dot;
+  size_t         nlen;
+
+  (void)type;
+  (void)value;
+
+  if(sc->count >= VISION_MAX_SCAN_CHANS)
+    return;
+
+  suffix = key + sc->prefix_len;
+  dot    = strchr(suffix, '.');
+  if(dot == NULL)
+    return;
+
+  nlen = (size_t)(dot - suffix);
+  if(nlen == 0 || nlen >= METHOD_CHANNEL_SZ)
+    return;
+
+  for(uint32_t i = 0; i < sc->count; i++)
+    if(strncmp(sc->names[i], suffix, nlen) == 0 && sc->names[i][nlen] == '\0')
+      return;                             // already collected
+
+  memcpy(sc->names[sc->count], suffix, nlen);
+  sc->names[sc->count][nlen] = '\0';
+  sc->count++;
+}
 
 // ----------------------------------------------------------------------
 // Public API
@@ -90,6 +199,44 @@ chatbot_vision_state_destroy(chatbot_state_t *st)
   pthread_mutex_destroy(&st->vision_flight_mutex);
 }
 
+void
+chatbot_vision_register_channels(chatbot_state_t *st)
+{
+  const char    *botname;
+  const char    *kind;
+  method_inst_t *inst;
+  char           prefix[KV_KEY_SZ];
+  vision_scan_t  sc;
+  uint32_t       i;
+
+  if(st == NULL) return;
+
+  botname = bot_inst_name(st->inst);
+  if(botname == NULL || botname[0] == '\0') return;
+
+  // No binding yet means there is no kind to compose with. The gate in
+  // chatbot_vision_maybe_submit registers the channel it is asked about,
+  // so a bot that binds later loses nothing but the head start.
+  inst = bot_first_method(st->inst);
+  if(inst == NULL) return;
+
+  kind = method_inst_kind(inst);
+
+  memset(&sc, 0, sizeof(sc));
+  snprintf(prefix, sizeof(prefix), "bot.%.32s.%.16s.chan.", botname, kind);
+  sc.prefix_len = strlen(prefix);
+
+  kv_iterate_prefix(prefix, vision_scan_cb, &sc);
+
+  // Register outside the iterate: kv_register under the KV lock deadlocks.
+  // `kind` points into the instance, so the reference is held until the
+  // last key is composed.
+  for(i = 0; i < sc.count; i++)
+    vision_chan_register(botname, kind, sc.names[i]);
+
+  method_release(inst);
+}
+
 bool
 chatbot_vision_maybe_submit(chatbot_state_t *st, const method_msg_t *msg)
 {
@@ -105,7 +252,7 @@ chatbot_vision_maybe_submit(chatbot_state_t *st, const method_msg_t *msg)
   uint32_t    cooldown;
   uint32_t    url_cd;
   uint32_t    max_inflight;
-  bool        allow_dm;
+  bool        in_voice = false;
   time_t      now;
   chatbot_vision_ctx_t *ctx;
   curl_request_t *req;
@@ -119,9 +266,37 @@ chatbot_vision_maybe_submit(chatbot_state_t *st, const method_msg_t *msg)
   if(kv_get_bot_uint(botname,
       "behavior.image_vision.enabled") == 0) return(false);
 
-  // Public-only gate. Empty channel means DM.
-  allow_dm = (kv_get_bot_uint(botname, "behavior.image_vision.allow_dm") != 0);
-  if(msg->channel[0] == '\0' && !allow_dm) return(false);
+  // Where the line came from decides the second gate. A channel needs
+  // its own key set as well as the master switch above; a DM has no
+  // channel key, is opt-in through allow_dm, and always answers plain —
+  // a DM is one-to-one, and the banter register is a channel
+  // performance.
+  if(msg->channel[0] != '\0')
+  {
+    const char *kind;
+    char        key[KV_KEY_SZ];
+
+    // A synthetic message carries no instance and so has no kind to
+    // compose with; refusing beats addressing a malformed key.
+    if(msg->inst == NULL) return(false);
+
+    kind = method_inst_kind(msg->inst);
+
+    // Covers a channel joined since chatbot_start scanned. kv_exists
+    // inside makes this a no-op on every call but the first.
+    vision_chan_register(botname, kind, msg->channel);
+
+    vision_chan_key(key, sizeof(key), botname, kind, msg->channel,
+        VISION_SUFFIX_ENABLED);
+    if(kv_get_uint(key) == 0) return(false);
+
+    vision_chan_key(key, sizeof(key), botname, kind, msg->channel,
+        VISION_SUFFIX_IN_VOICE);
+    in_voice = (kv_get_uint(key) != 0);
+  }
+
+  else if(kv_get_bot_uint(botname,
+      "behavior.image_vision.allow_dm") == 0) return(false);
 
   // URL detection.
   if(!util_find_image_url(msg->text, image_url, sizeof(image_url)))
@@ -207,6 +382,7 @@ chatbot_vision_maybe_submit(chatbot_state_t *st, const method_msg_t *msg)
   snprintf(ctx->text,            sizeof(ctx->text),            "%s", msg->text);
   snprintf(ctx->image_url,       sizeof(ctx->image_url),       "%s", image_url);
   ctx->is_action = msg->is_action;
+  ctx->in_voice  = in_voice;
 
   ctx->max_bytes = (uint32_t)kv_get_bot_uint(botname,
       "behavior.image_vision.max_bytes");
@@ -247,7 +423,8 @@ chatbot_vision_maybe_submit(chatbot_state_t *st, const method_msg_t *msg)
   }
 
   clam(CLAM_DEBUG, "vision",
-      "fetching url='%s' max_bytes=%u", image_url, ctx->max_bytes);
+      "fetching url='%s' max_bytes=%u in_voice=%d",
+      image_url, ctx->max_bytes, (int)ctx->in_voice);
   return(true);
 }
 
