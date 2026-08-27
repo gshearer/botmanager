@@ -162,7 +162,7 @@ bool reachy_play_move(const char *move, reachy_done_cb_t cb,
 // `wake_up` never enables them. So waking is two calls — motors first,
 // the move second — while sleeping is one. A wake_up sent to a limp
 // robot is accepted, returns a uuid, "completes", and moves nothing;
-// there is no error on any surface. See `reachy/TODO.md §RCH-WAKE-1`.
+// there is no error on any surface (`4ef0cef`).
 //
 // Both return as soon as the daemon has ACCEPTED the move (~13 ms). The
 // motion itself takes ~2.5 s and is visible in GET /api/move/running

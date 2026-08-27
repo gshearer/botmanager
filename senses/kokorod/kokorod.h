@@ -27,7 +27,8 @@ int main(int, char **);
 #define KOKOROD_CLIENT_TIMEOUT  10
 
 // The output stage exists to satisfy two facts measured against the real
-// robot on 2026-08-03 (charter §C3), and both are load-bearing:
+// robot on 2026-08-03 (plugins/method/reachy/AGENTS.md §The audio
+// ground truth), and both are load-bearing:
 //
 //   Mono is SILENTLY unplayable. The robot's ALSA sink is a dmix bound to
 //   exactly two channels; a mono upload is accepted, play_sound answers 200,

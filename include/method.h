@@ -33,6 +33,12 @@ typedef enum
 
 // Method type bitmask: each driver kind gets one bit.
 // Used by cmd_def_t.methods to scope command visibility per method.
+//
+// A new kind needs its bit HERE and a row in core/method.c's table, in
+// the same commit: method_type_bit() returns 0 for a name it does not
+// know, and every gate that consumes it tests `inst_type != 0 && ...`,
+// so a missing row makes each one FAIL OPEN — a command with a narrowed
+// mask silently reaches the method it was scoped away from.
 typedef uint32_t method_type_t;
 
 #define METHOD_T_BOTMANCTL ((method_type_t)1U << 1)
@@ -235,6 +241,10 @@ typedef struct
       method_joined_channel_cb_t cb, void *data);
 
   // Get the bot's own identity on this method (e.g., current IRC nick).
+  // Optional, but leaving it NULL costs more than it looks: the chat
+  // bot's address classifier gets no name to match on, so EVERY line
+  // arrives as WITNESS and the driver's own addressing is all that is
+  // left deciding who was spoken to.
   bool (*get_self)(void *handle, char *buf, size_t buf_sz);
 
   // Strongest removal this driver could apply to `target` in `channel`

@@ -209,7 +209,7 @@ traceback in `journalctl -u reachy-mini-daemon` rather than a clean startup.
 
 ⭑ **The head throws the same amount on every syllable, and that is settled as
 WON'T FIX — operator, 2026-08-07.** `kokorod` peak-normalises to −3 dBFS
-(deliberately — see §C3, Kokoro is inaudible over the motors otherwise), which
+(deliberately — see `AGENTS.md §The audio ground truth`, Kokoro is inaudible over the motors otherwise), which
 holds `_loudness_gain` at its ceiling for **49–66% of voiced frames**, so the
 loud half of every utterance is flat. `RCH-SWAY-1` measured the whole
 mechanism and it *works*: the wobble is tapped off a GStreamer tee **upstream
@@ -225,7 +225,7 @@ is 0.00 dB, the hardware ceiling**, so it comes entirely out of loudness —
 but even a free fix would have waited. **Read that as standing posture for
 every reachy limitation, not a ruling about the wobble**: prefer waiting to
 working around, because a workaround for a gap upstream is about to close is
-a maintenance burden we chose. Full arithmetic: `TODO.md §SWAY-TRUTH`.
+a maintenance burden we chose. Full arithmetic: `AGENTS.md §SWAY-TRUTH`.
 
 ⭑ **Reusable, measured 2026-08-07: the robot's volume control is exactly
 0.6 dB per unit, linear in dB, over a full 60 dB range.** `POST
