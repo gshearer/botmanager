@@ -588,11 +588,18 @@ admin_cmd_bot(const cmd_ctx_t *ctx)
   const cmd_def_t *child;
   cmd_ctx_t sub;
 
-  if(p == NULL) { cmd_reply(ctx, "usage: bot <subcommand> ..."); return; }
+  if(p == NULL)
+  {
+    cmd_result_set(ctx, CMD_RESULT_REFUSED);
+    cmd_reply(ctx, "usage: bot <subcommand> ...");
+    return;
+  }
+
   while(*p == ' ' || *p == '\t') p++;
 
   if(*p == '\0')
   {
+    cmd_result_set(ctx, CMD_RESULT_REFUSED);
     cmd_reply(ctx, "usage: bot <subcommand> ...");
     return;
   }
@@ -946,6 +953,7 @@ cmd_show_bot(const cmd_ctx_t *ctx)
   if(ctx->parsed == NULL || ctx->parsed->argc < 1
       || ctx->parsed->argv[0][0] == '\0')
   {
+    cmd_result_set(ctx, CMD_RESULT_REFUSED);
     cmd_reply(ctx, "usage: show bot <name> [<verb> [args...]]");
     return;
   }

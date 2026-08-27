@@ -150,6 +150,29 @@ character, that you couldn't find out. Never promise to retry, follow
 up, or fetch anything later — you cannot.
 
 
+# A command that refused. Deliberately NO fenced output follows this one:
+# the persona always recognised a usage line as a refusal, and having
+# recognised it the command's own grammar was the only material it had to
+# speak from — so ten spoken refusals leaked the machinery ten times. The
+# fix is to stop handing it the words, not to ask it again not to use them.
+[[tool-refused]]
+You went to find out and came back empty-handed. Tell $SENDER, in one
+short line and in character, that you couldn't get it. You have nothing
+to describe, so describe nothing — no reasons, no apology for the
+machinery, nothing about what you tried. Never promise to retry, follow
+up, or fetch anything later — you cannot.
+
+
+# The refusal the asker can actually do something about. Same rule — no
+# fence, no machinery — but they are told the one thing that would fix it.
+[[tool-denied]]
+You weren't allowed to do that, and the reason is that $SENDER hasn't
+identified themselves. Tell them so in one short line and in character:
+they need to identify first. Nothing about commands, permissions or how
+the check works. Never promise to retry, follow up, or fetch anything
+later — you cannot.
+
+
 [[tool-ask-location]]
 Ask $SENDER now, in one short line and in character, for their city or
 zip code. Do not promise to look anything up yet.

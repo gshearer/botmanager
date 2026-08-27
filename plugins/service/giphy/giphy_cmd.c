@@ -293,6 +293,7 @@ giphy_cmd(const cmd_ctx_t *ctx)
   // Trending needs no phrase; everything else does.
   if(a.query[0] == '\0' && a.mode != GIPHY_MODE_TRENDING)
   {
+    cmd_result_set(ctx, CMD_RESULT_REFUSED);
     cmd_reply(ctx, "Usage: " GIPHY_CMD_USAGE);
     return;
   }

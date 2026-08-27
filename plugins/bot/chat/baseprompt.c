@@ -40,6 +40,8 @@ static const struct
   { "image-plain",       "$CHARS"          },
   { "tool-answer",       "$SENDER $ROOM"   },
   { "tool-empty",        "$SENDER"         },
+  { "tool-refused",      "$SENDER"         },
+  { "tool-denied",       "$SENDER"         },
   { "tool-ask-location", "$SENDER"         },
   { "nothing-to-say",    NULL              },
   { "cannot-do",         NULL              },

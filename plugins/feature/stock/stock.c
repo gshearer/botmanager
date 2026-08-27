@@ -913,6 +913,7 @@ stock_list_cmd(const cmd_ctx_t *ctx, const stock_args_t *a)
 
   if(ctx->username == NULL || ctx->username[0] == '\0')
   {
+    cmd_result_set(ctx, CMD_RESULT_DENIED);
     cmd_reply(ctx, "Lists belong to a user — identify first, "
         "then you can change one.");
     return;

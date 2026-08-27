@@ -825,6 +825,7 @@ chatbot_show_extract_stats_cmd(const cmd_ctx_t *ctx)
 static void
 chatbot_show_extract_cmd(const cmd_ctx_t *ctx)
 {
+  cmd_result_set(ctx, CMD_RESULT_REFUSED);
   cmd_reply(ctx, "usage: /show extract stats");
 }
 

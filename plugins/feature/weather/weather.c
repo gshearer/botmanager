@@ -414,6 +414,7 @@ weather_cmd_weather(const cmd_ctx_t *ctx)
 
   if(input == NULL || input[0] == '\0')
   {
+    cmd_result_set(ctx, CMD_RESULT_REFUSED);
     cmd_reply(ctx, "Usage: weather [-h | -d] <zipcode | city>");
     return;
   }

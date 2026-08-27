@@ -168,6 +168,31 @@ typedef struct
 // both cmd_ctx_t and cmd_decl_t hold one and both precede it.
 typedef struct cmd_feat cmd_feat_t;
 
+// What a command's output MEANS. Without it an answer and a refusal are
+// the same thing to a consumer — one line of text — and the only consumer
+// that cannot recover from the confusion is a language model, which will
+// relay a usage line to a channel because relaying is what it was asked
+// to do and the usage line is the only material it was given.
+//
+// It rides on the ctx rather than on the handler's return, because a
+// command that answers from a curl completion has already returned by the
+// time it knows: an async command deep-copies the ctx alongside its
+// request (method_msg_t does the same for reply_sink_id), sets the result
+// on that copy, and cmd_reply reads it off whichever ctx it is handed.
+//
+// OK is 0, so a two-state test separates an answer from a refusal and
+// loses only WHICH refusal — never the other way round.
+//
+// ⭑ A command that looked and found nothing definite ("no such symbol")
+// reports OK. That is a true fact about the world and the caller is
+// entitled to hear it. REFUSED and DENIED are facts about US.
+typedef enum
+{
+  CMD_RESULT_OK      = 0,  // an answer — relay it
+  CMD_RESULT_REFUSED = 1,  // bad arguments, or we could not run it at all
+  CMD_RESULT_DENIED  = 2,  // caller may not do this; identifying would fix it
+} cmd_result_t;
+
 // Context passed to command callbacks. Contains everything needed
 // to process the command and send a response. Tagged struct so other
 // headers (e.g., bot.h) can forward-declare it without a cycle.
@@ -186,6 +211,10 @@ struct cmd_ctx
   // guard exactly as arg_desc is.
   const char          *name;      // registered name, never NULL
   const cmd_feat_t    *feat;      // what it declared, or NULL
+
+  // Set through cmd_result_set(), never written directly — the handler
+  // holds this struct const and the accessor owns the one cast.
+  cmd_result_t         result;    // CMD_RESULT_OK until a command says otherwise
 };
 #ifndef BM_CMD_CTX_T_DEFINED
 #define BM_CMD_CTX_T_DEFINED
@@ -401,6 +430,14 @@ bool cmd_dispatch_resolved(bot_inst_t *inst, const method_msg_t *msg,
 // reply_sink_id is diverted to that sink instead — see §Reply sinks.
 bool cmd_reply(const cmd_ctx_t *ctx, const char *text);
 
+// Declare what this command's output means, before the cmd_reply that
+// carries it. Every reply made through this ctx from here on is tagged,
+// so an async command sets it on the ctx copy it kept with its request.
+//
+// A command that never calls this answers CMD_RESULT_OK, which is the
+// behaviour every caller had before the result existed.
+void cmd_result_set(const cmd_ctx_t *ctx, cmd_result_t result);
+
 // Reply with `plain`, in the bot's persona where this command declared
 // CMD_FEAT_VOICE, its cmd.<name>.in_voice knob is on, and a mind will
 // take it. Anything else falls through to cmd_reply, so the line is
@@ -461,7 +498,8 @@ bool cmd_reply_table_head(const cmd_ctx_t *ctx, const char *head);
 // cmd_sink_unregister() returns, fn is not running and will never run
 // again for that id — that guarantee is what lets a plugin retract its
 // sinks in stop() before its mapping goes away.
-typedef void (*cmd_sink_fn_t)(void *data, const char *line);
+typedef void (*cmd_sink_fn_t)(void *data, const char *line,
+    cmd_result_t result);
 
 // Returns the new sink id (non-zero), or 0 on a NULL fn.
 uint64_t cmd_sink_register(cmd_sink_fn_t fn, void *data);
@@ -472,7 +510,7 @@ void cmd_sink_unregister(uint64_t id);
 // Deliver one line to sink `id`. Returns false when the id is stale —
 // the caller falls through to normal delivery. cmd_reply is the
 // intended caller; collectors never call this themselves.
-bool cmd_sink_deliver(uint64_t id, const char *line);
+bool cmd_sink_deliver(uint64_t id, const char *line, cmd_result_t result);
 
 // Command definition accessors (cmd_def_t is opaque outside cmd.c).
 

@@ -107,6 +107,7 @@ uq_cmd_recall(const cmd_ctx_t *ctx)
           break;
 
         case 'h':
+          cmd_result_set(ctx, CMD_RESULT_REFUSED);
           cmd_reply(ctx, "usage: quote [-v] [-i <id>] [sayer]");
           return;
 
@@ -173,6 +174,7 @@ uq_cmd_add(const cmd_ctx_t *ctx)
 
     if(channel == NULL || channel[0] == '\0')
     {
+      cmd_result_set(ctx, CMD_RESULT_REFUSED);
       cmd_reply(ctx, "usage: quote add <sayer> <text>  "
           "(the no-arg form only works in a channel)");
       return;
@@ -223,6 +225,7 @@ uq_cmd_add(const cmd_ctx_t *ctx)
 
     if(klen == 0 || klen >= sizeof(sayer))
     {
+      cmd_result_set(ctx, CMD_RESULT_REFUSED);
       cmd_reply(ctx, "usage: quote add <sayer> <text>");
       return;
     }
@@ -234,6 +237,7 @@ uq_cmd_add(const cmd_ctx_t *ctx)
 
     if(*sp == '\0')
     {
+      cmd_result_set(ctx, CMD_RESULT_REFUSED);
       cmd_reply(ctx, "usage: quote add <sayer> <text>");
       return;
     }
@@ -280,6 +284,7 @@ uq_cmd_del(const cmd_ctx_t *ctx)
 
   if(ids == NULL)
   {
+    cmd_result_set(ctx, CMD_RESULT_REFUSED);
     cmd_reply(ctx, "usage: quote del <id>");
     return;
   }

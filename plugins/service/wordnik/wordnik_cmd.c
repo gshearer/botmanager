@@ -206,6 +206,7 @@ wordnik_cmd(const cmd_ctx_t *ctx)
 
   if(a.bad_arg)
   {
+    cmd_result_set(ctx, CMD_RESULT_REFUSED);
     cmd_reply(ctx, "Usage: " WORDNIK_CMD_USAGE);
     return;
   }
@@ -404,6 +405,7 @@ wordnik_dict_cmd(const cmd_ctx_t *ctx)
 
   if(word[0] == '\0')
   {
+    cmd_result_set(ctx, CMD_RESULT_REFUSED);
     cmd_reply(ctx, "Usage: " WORDNIK_DICT_USAGE);
     return;
   }

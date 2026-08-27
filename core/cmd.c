@@ -1067,6 +1067,18 @@ cmd_arg_maxlen(const cmd_arg_desc_t *desc)
 // Refuse an over-long argument rather than cutting it down to fit. A
 // truncated URL or path still passes validation and still reaches the
 // callback, so silence here is the one outcome the parser must not have.
+// Every way the argument parser can turn a command down. Tagging the
+// reply is what keeps a bot from reading our own grammar out to a
+// channel; returning false is what the four call sites already did.
+static bool
+cmd_arg_refuse(const cmd_ctx_t *ctx, const char *text)
+{
+  cmd_result_set(ctx, CMD_RESULT_REFUSED);
+  cmd_reply(ctx, text);
+
+  return(false);
+}
+
 static bool
 cmd_arg_reject_long(const cmd_arg_desc_t *desc, size_t maxlen,
     const cmd_ctx_t *ctx)
@@ -1075,9 +1087,8 @@ cmd_arg_reject_long(const cmd_arg_desc_t *desc, size_t maxlen,
 
   snprintf(buf, sizeof(buf), "%s too long (max %zu characters)",
       desc->name != NULL ? desc->name : "argument", maxlen);
-  cmd_reply(ctx, buf);
 
-  return(false);
+  return(cmd_arg_refuse(ctx, buf));
 }
 
 static bool
@@ -1140,8 +1151,8 @@ cmd_parse_args(const char *args, const cmd_arg_desc_t *desc,
       {
         char buf[CMD_USAGE_SZ + 16];
         snprintf(buf, sizeof(buf), "usage: %s", usage);
-        cmd_reply(ctx, buf);
-        return false;
+
+        return(cmd_arg_refuse(ctx, buf));
       }
 
       break;
@@ -1189,8 +1200,7 @@ cmd_parse_args(const char *args, const cmd_arg_desc_t *desc,
         snprintf(buf, sizeof(buf), "invalid %s (%s)",
             desc[i].name ? desc[i].name : "argument",
             cmd_arg_type_reason(desc[i].type));
-        cmd_reply(ctx, buf);
-        return false;
+        return(cmd_arg_refuse(ctx, buf));
       }
 
       return true;
@@ -1241,8 +1251,7 @@ cmd_parse_args(const char *args, const cmd_arg_desc_t *desc,
       snprintf(buf, sizeof(buf), "invalid %s (%s)",
           desc[i].name ? desc[i].name : "argument",
           cmd_arg_type_reason(desc[i].type));
-      cmd_reply(ctx, buf);
-      return false;
+      return(cmd_arg_refuse(ctx, buf));
     }
   }
 
@@ -1858,7 +1867,7 @@ cmd_sink_unregister(uint64_t id)
 }
 
 bool
-cmd_sink_deliver(uint64_t id, const char *line)
+cmd_sink_deliver(uint64_t id, const char *line, cmd_result_t result)
 {
   bool diverted = false;
 
@@ -1875,7 +1884,7 @@ cmd_sink_deliver(uint64_t id, const char *line)
       // complete while a delivery is inside the callback, so after
       // cmd_sink_unregister returns the owner may tear down whatever
       // `data` points at with no callback in flight.
-      s->fn(s->data, line);
+      s->fn(s->data, line, result);
       diverted = true;
       break;
     }
@@ -1887,6 +1896,18 @@ cmd_sink_deliver(uint64_t id, const char *line)
 }
 
 // Reply helper
+
+// The handler holds its ctx const — core owns the struct (it is an
+// automatic in cmd_dispatch_run) and this is the one place that writes
+// through it, so the cast lives here instead of at 17 plugin call sites.
+void
+cmd_result_set(const cmd_ctx_t *ctx, cmd_result_t result)
+{
+  if(ctx == NULL)
+    return;
+
+  ((cmd_ctx_t *)ctx)->result = result;
+}
 
 // A reply may be minutes younger than the message that asked for it: an
 // async command copies the whole method_msg_t and answers once its HTTP
@@ -1913,7 +1934,7 @@ cmd_reply(const cmd_ctx_t *ctx, const char *text)
   // the wire, so a collector torn down mid-flight degrades to normal
   // delivery rather than silence.
   if(ctx->msg->reply_sink_id != 0
-      && cmd_sink_deliver(ctx->msg->reply_sink_id, text))
+      && cmd_sink_deliver(ctx->msg->reply_sink_id, text, ctx->result))
     return(SUCCESS);
 
   inst = method_find(ctx->msg->inst_name);
@@ -2259,6 +2280,7 @@ cmd_help_kv(const cmd_ctx_t *ctx, const char *name)
 
   if(name[0] == '\0')
   {
+    cmd_result_set(ctx, CMD_RESULT_REFUSED);
     cmd_reply(ctx, "usage: help kv <key>");
     cmd_reply(ctx, "Show the description and type of a configuration key.");
     return;
@@ -2742,6 +2764,7 @@ cmd_builtin_version(const cmd_ctx_t *ctx)
 static void
 cmd_builtin_show(const cmd_ctx_t *ctx)
 {
+  cmd_result_set(ctx, CMD_RESULT_REFUSED);
   cmd_reply(ctx, "usage: show <subcommand> ...");
 }
 
@@ -2749,6 +2772,7 @@ cmd_builtin_show(const cmd_ctx_t *ctx)
 static void
 cmd_builtin_set(const cmd_ctx_t *ctx)
 {
+  cmd_result_set(ctx, CMD_RESULT_REFUSED);
   cmd_reply(ctx, "usage: set <subcommand> ...");
 }
 

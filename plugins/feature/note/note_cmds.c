@@ -67,6 +67,7 @@ note_cmd_leave(const cmd_ctx_t *ctx)
 
   if(ctx->parsed == NULL || ctx->parsed->argc < 2)
   {
+    cmd_result_set(ctx, CMD_RESULT_REFUSED);
     cmd_reply(ctx, "usage: note <user> <message>");
     return;
   }

@@ -66,6 +66,7 @@ typedef struct
   bool             is_direct;
   bool             spoken;         // METHOD_CAP_SPOKEN, snapshotted at begin
   uint64_t         sink_id;        // registration epoch; 0 until registered
+  cmd_result_t     result;         // worst any delivered line carried
   uint32_t         settle_ms;      // KV snapshot at begin (no KV reads in the sink cb)
   uint64_t         quiet_at_ms;    // CLOCK_MONOTONIC ms of the last append
   task_handle_t    settle_task;
@@ -217,7 +218,7 @@ interpret_deadline_fire(task_t *t)
 // thread called cmd_reply. Append + timestamp refresh only; the settle
 // task does the rest.
 static void
-interpret_sink_cb(void *data, const char *line)
+interpret_sink_cb(void *data, const char *line, cmd_result_t result)
 {
   interpret_slot_t *s = data;
   uint32_t idx = (uint32_t)(s - interpret_slots);
@@ -229,6 +230,11 @@ interpret_sink_cb(void *data, const char *line)
     pthread_mutex_unlock(&interpret_mutex);
     return;
   }
+
+  // A command that prints a header and then refuses has said both; the
+  // refusal is what the persona must not read out, so it wins.
+  if(result > s->result)
+    s->result = result;
 
   interpret_append_scrubbed(s, line);
   s->quiet_at_ms = interpret_now_ms();
@@ -257,7 +263,7 @@ interpret_sink_cb(void *data, const char *line)
 static void
 interpret_build_cue(method_msg_t *msg, const char *sender,
     const char *premise, const char *capture, bool truncated,
-    const chatbot_base_t *base, bool spoken)
+    const chatbot_base_t *base, bool spoken, cmd_result_t result)
 {
   // Worst case: premise (768) + sender (128) + the [[tool-answer]] block.
   // Sized so the header is never silently cut mid-fence-opener, and
@@ -286,6 +292,30 @@ interpret_build_cue(method_msg_t *msg, const char *sender,
                            : "one or two short lines") },
     { NULL,      NULL   },
   };
+
+  // A refusal is the one output no wording can save. The persona reads
+  // the fence correctly every time and still has nothing but the
+  // command's own grammar to speak from, so the fence does not go: it
+  // is told it came back empty-handed and given nothing to paraphrase.
+  // CMD_RESULT_OK covers a command that looked and found nothing
+  // definite — that is an answer, and it is relayed like any other.
+  if(result != CMD_RESULT_OK)
+  {
+    const char *blk = result == CMD_RESULT_DENIED ? "tool-denied"
+                                                  : "tool-refused";
+
+    if(chatbot_base_render(base, blk, toks, body, sizeof(body)) == 0)
+      snprintf(body, sizeof(body),
+          "You went to find out and came back empty-handed. Tell %s, in "
+          "one short line and in character, that you couldn't get it — "
+          "you have nothing to describe, so describe nothing. Never "
+          "promise to retry, follow up, or fetch anything later — you "
+          "cannot.", sender);
+
+    snprintf(msg->text, sizeof(msg->text), "[internal cue: %s %s]",
+        premise, body);
+    return;
+  }
 
   if(capture[0] == '\0')
   {
@@ -382,6 +412,7 @@ interpret_flush(uint32_t idx, uint64_t sink_id, bool deadline)
   bool     is_direct;
   bool     spoken;
   uint32_t lines;
+  cmd_result_t  result;
   task_handle_t deadline_task;
   chatbot_base_t *base;
 
@@ -422,6 +453,7 @@ interpret_flush(uint32_t idx, uint64_t sink_id, bool deadline)
   snprintf(sender, sizeof(sender), "%s",
       s->msg.nickname[0] != '\0' ? s->msg.nickname : s->msg.sender);
   memcpy(capture, s->buf, s->len + 1);
+  result = s->result;
   memset(s, 0, sizeof(*s));
   pthread_mutex_unlock(&interpret_mutex);
 
@@ -433,7 +465,7 @@ interpret_flush(uint32_t idx, uint64_t sink_id, bool deadline)
 
   base = chatbot_base_load();
   interpret_build_cue(&msg, sender, premise, capture, truncated, base,
-      spoken);
+      spoken, result);
   chatbot_base_free(base);
 
   msg.timestamp     = time(NULL);
