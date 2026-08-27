@@ -15,6 +15,7 @@
 #include "util.h"
 
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 #include <time.h>
 
@@ -407,6 +408,11 @@ chatbot_vision_maybe_submit(chatbot_state_t *st, const method_msg_t *msg)
 
   curl_request_set_follow_redirects(req, false);
 
+  // Headers arrive before the body, so this survives a transfer curl
+  // aborts mid-download — which is the one failure vision cannot
+  // otherwise explain. See the size arm of vision_on_fetch_done.
+  curl_request_capture_header(req, "Content-Length");
+
   // Named before the submit, not after: once the transfer is on the
   // wire the completion callback owns `ctx` and may already have freed
   // it, and `req` with it.
@@ -532,8 +538,33 @@ vision_on_fetch_done(const curl_response_t *resp)
 
   if(resp->status != 200)
   {
-    clam(CLAM_WARN, "vision",
-        "fetch failed url='%s' status=%ld", ctx->image_url, resp->status);
+    const char *clen = curl_response_header(resp, "Content-Length");
+    uint64_t    declared;
+    uint64_t    ceiling;
+
+    // A transport error with a declared length over core's ceiling is
+    // the size abort, and it is worth saying so in these words: curl
+    // kills the transfer from its write callback, which surfaces here
+    // as status=0 — a network fault, which is not what happened. The
+    // plugin's own max_bytes check below cannot reach this case,
+    // because curl stops the body before it can ever be exceeded.
+    declared = clen != NULL ? strtoull(clen, NULL, 10) : 0;
+    ceiling  = kv_get_uint("core.curl.max_response_sz");
+
+    if(declared != 0 && ceiling != 0 && declared > ceiling)
+      clam(CLAM_WARN, "vision",
+          "fetch refused url='%s' declared=%llu bytes over the"
+          " core.curl.max_response_sz ceiling of %llu — raise that"
+          " (global, all transfers) or paste a smaller image",
+          ctx->image_url, (unsigned long long)declared,
+          (unsigned long long)ceiling);
+
+    else
+      clam(CLAM_WARN, "vision",
+          "fetch failed url='%s' status=%ld curl=%d err='%s'",
+          ctx->image_url, resp->status, resp->curl_code,
+          resp->error != NULL ? resp->error : "(none)");
+
     goto done;
   }
 
