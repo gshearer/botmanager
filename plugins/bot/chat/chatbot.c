@@ -178,6 +178,12 @@ static const plugin_kv_entry_t chatbot_inst_schema[] = {
     " plugin.chat.default_contract.", NULL },
   { "behavior.witness_log", KV_BOOL, "true",
     "Log WITNESS messages (bot not addressed) to conversation_log", NULL },
+  { "behavior.max_reply_lines", KV_UINT32, "0",
+    "Lines this bot may put on the wire in one reply, emotes included."
+    " 0 is unlimited and is the shipped behaviour. The model is told the"
+    " budget so it can land its own ending; the count is the backstop."
+    " A vision reply reads behavior.image_vision.max_lines first.",
+    NULL },
   { "behavior.max_inflight", KV_UINT32, "2",
     "Concurrent LLM reply cap for this bot", NULL },
   { "behavior.mute_until", KV_UINT32, "0",
@@ -459,6 +465,11 @@ static const plugin_kv_entry_t chatbot_inst_schema[] = {
     " past 10 MiB.", NULL },
   { "behavior.image_vision.max_inflight", KV_UINT32, "1",
     "Concurrent vision fetches per bot.", NULL },
+  { "behavior.image_vision.max_lines", KV_UINT32, "3",
+    "Lines a voiced vision reply may put on the wire. 0 inherits"
+    " behavior.max_reply_lines. Vision is where the persona is at its"
+    " most talkative, which is why it gets a tighter default than the"
+    " general knob.", NULL },
   { "behavior.image_vision.skip_knowledge", KV_BOOL, "true",
     "Skip knowledge-corpus RAG on the vision path. Memory (facts +"
     " conversation) is still retrieved for persona coherence.", NULL },

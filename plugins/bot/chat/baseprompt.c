@@ -36,6 +36,7 @@ static const struct
   { "commands",          "$CMDSHAPE"       },
   { "room-written",      NULL              },
   { "room-spoken",       NULL              },
+  { "line-budget",       "$LINES"          },
   { "tool-answer",       "$SENDER $ROOM"   },
   { "tool-empty",        "$SENDER"         },
   { "tool-ask-location", "$SENDER"         },

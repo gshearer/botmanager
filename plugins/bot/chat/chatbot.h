@@ -1108,6 +1108,13 @@ typedef struct
   float           temperature;
   uint32_t        max_tokens;
 
+  // Lines this reply may put on the wire, snapshotted at submit so a
+  // mid-reply `set kv` cannot tear off. 0 is unlimited, which is the
+  // shipped default and byte-for-byte the behaviour that predates the
+  // knob. Counted against nonskip_lines_sent below, and told to the
+  // model as well — the counter is the backstop, not the mechanism.
+  uint32_t        max_lines;
+
   // Reply-only reasoning effort, resolved from bot.<name>.reasoning_effort
   // at submit time. UNSET — the common case — leaves the service's own
   // llm.service.<name>.reasoning_effort in charge. Deliberately absent

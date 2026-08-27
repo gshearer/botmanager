@@ -1379,6 +1379,20 @@ send_reply_line(chatbot_req_t *r, const char *line)
 
   if(line == NULL || line[0] == '\0') return;
 
+  // The budget, before every gate below. A line the cap refuses never
+  // reached the wire, so it must not arm the floor, stamp the anti-repeat
+  // ring, or count as a SKIP the CV-4 fallback would read — and once the
+  // cap has bitten, nonskip_lines_sent is by definition non-zero, so that
+  // fallback cannot fire anyway. The model was told this budget in the
+  // prompt; this is the backstop for a model that talked past it.
+  if(r->max_lines != 0 && r->nonskip_lines_sent >= r->max_lines)
+  {
+    clam(CLAM_DEBUG, "chatbot",
+        "bot=%s persona=%s: line budget spent (%u) — dropping line",
+        bot_inst_name(r->st->inst), r->personality_name, r->max_lines);
+    return;
+  }
+
   // Whole-line SKIP check on a local copy so we don't mutate the
   // streaming buffer.
   llen = strlen(line);
@@ -2580,6 +2594,30 @@ prompt_emit_tail(char *buf, size_t pos, size_t cap, const chatbot_req_t *r)
         "\n");
   }
 
+  // The line budget, when one is in force. Emitted here rather than
+  // baked into a contract because the number is a runtime knob and no
+  // authored file can know it; omitted entirely at 0, which is what
+  // makes an unlimited reply byte-identical to a build without the cap.
+  if(r->max_lines != 0)
+  {
+    char lines[16];
+    const chatbot_base_tok_t toks[] = {
+      { "$LINES", lines },
+      { NULL,     NULL  },
+    };
+    char fb[CHATBOT_BASE_RENDER_SZ];
+
+    snprintf(lines, sizeof(lines), "%u", r->max_lines);
+    snprintf(fb, sizeof(fb),
+        "Note: you have at most %s line(s) for this reply, actions"
+        " included. Say what you have to say inside that and finish"
+        " your last sentence — anything past the budget is cut off"
+        " mid-word and never reaches the channel.", lines);
+
+    pos = prompt_emit_base(buf, pos, cap, r, "line-budget", toks, fb,
+        "\n");
+  }
+
   // Output contract last — maximum recency in working memory.
   if(r->contract_body != NULL && r->contract_body[0] != '\0' && pos < cap)
     pos += snprintf(buf + pos, cap - pos,
@@ -3122,6 +3160,25 @@ retrieve_cb(const mem_fact_t *facts, size_t n_facts,
 // where this setting has always lived). A typo is named HERE rather than
 // sent: the provider would answer it with a 400 the reply path reports as
 // a bare failure, with nothing pointing at the KV that caused it.
+// Lines this reply may put on the wire. The vision knob wins where it is
+// set because that is the path the cap was written for — the persona is
+// the renderer there and five lines of banter is its natural output —
+// and 0 in either position means unlimited, which is the shipped default
+// and the behaviour that predates the knob.
+static uint32_t
+reply_max_lines(const char *botname, bool vision)
+{
+  uint32_t n = 0;
+
+  if(vision)
+    n = (uint32_t)kv_get_bot_uint(botname, "behavior.image_vision.max_lines");
+
+  if(n == 0)
+    n = (uint32_t)kv_get_bot_uint(botname, "behavior.max_reply_lines");
+
+  return(n);
+}
+
 static llm_effort_t
 reply_bot_effort(const char *botname)
 {
@@ -3320,6 +3377,7 @@ chatbot_reply_submit(chatbot_state_t *st, const method_msg_t *msg,
       "speak_temperature") / 100.0f;   // stored as int*100
 
   r->max_tokens = (uint32_t)kv_get_bot_uint(botname, "max_reply_tokens");
+  r->max_lines  = reply_max_lines(botname, r->vision_active);
 
   // Read fresh per request, like the personality and the contract: an
   // edit to base.txt is live on the next reply. NULL means the file is
@@ -3627,6 +3685,7 @@ chatbot_reply_submit_vision(chatbot_state_t *st, const method_msg_t *msg,
       "speak_temperature") / 100.0f;
 
   r->max_tokens = (uint32_t)kv_get_bot_uint(botname, "max_reply_tokens");
+  r->max_lines  = reply_max_lines(botname, r->vision_active);
 
   // Read fresh per request, like the personality and the contract: an
   // edit to base.txt is live on the next reply. NULL means the file is

@@ -21,6 +21,7 @@
 #   $CMDSHAPE  the exact slash-line shape the bridge parses
 #   $ROOM      how much room the reply has — [[room-written]] or
 #              [[room-spoken]], chosen by the method, not by the bot
+#   $LINES     the reply's line budget, when the bot has one set
 
 
 [[nick]]
@@ -103,6 +104,17 @@ this is going to be read aloud, so you have about fifteen seconds of
 speech: no lists, no columns, no URLs, no markup of any kind, and units
 said the way a person says them — "a hundred and sixty-eight
 centimetres", never "168 cm"
+
+
+# Emitted only when the bot has a line budget set (behavior.max_reply_lines,
+# or behavior.image_vision.max_lines on a vision reply). At the shipped
+# default of 0 this block never appears at all. The count is enforced on
+# the wire whatever this says — the point of telling the model is that it
+# gets to choose where to stop, instead of being cut off mid-word.
+[[line-budget]]
+You have at most $LINES line(s) for this reply, actions included. Say
+what you have to say inside that and finish your last sentence: anything
+past the budget is cut off mid-word and never reaches the channel.
 
 
 # The answer half of a tool call. The command's raw output is fenced
