@@ -378,7 +378,8 @@ bool memory_test_inject_embedding(int64_t id, const char *model,
 // carries a task instruction, the documents never do. Measured on the
 // live corpus, this exact wording puts 14/14 labelled queries at rank 1
 // where raw manages 11/14 and misses three short ones entirely.
-// Rewording it measurably loses ground — see TODO.md §EMBED-4.
+// Rewording it measurably loses ground — see MEMSTORE.md
+// §Query-side instruction.
 #define MEM_RECALL_INSTRUCT_SZ  256
 #define MEM_RECALL_QUERY_SZ     (MEM_MSG_TEXT_SZ + MEM_RECALL_INSTRUCT_SZ + 32)
 #define MEM_DEF_RECALL_INSTRUCT \

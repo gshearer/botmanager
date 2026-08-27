@@ -5,7 +5,8 @@ this when the SD card dies, the robot is replaced, the 4090 host is rebuilt, or
 someone asks "what would it take to do this again?"
 
 **This is a runbook, not a design document.** The *why* behind every choice
-lives in `TODO.md §C` (charter) and `ACHIEVED.md` (what shipped, with SHAs).
+lives in `AGENTS.md` (the leaf guide) and `ACHIEVED.md` (what shipped, with
+SHAs).
 This file only tells you what to type and in what order.
 
 ## ⚠ Honesty about what is verified
@@ -392,7 +393,8 @@ build/tools/botmanctl set kv plugin.reachyapi.bridge_url http://reachy.iot.hiiga
 
 # Phase 5 — build and load the plugins
 
-Three plugins, layered protocol/misc → service (`TODO.md §C4`):
+Three plugins, layered protocol/misc → service (`AGENTS.md §Ports, layers
+and the KV map`):
 
 ```sh
 ninja -C build
@@ -501,6 +503,6 @@ Specifically, touch this file whenever you: add or move a systemd unit, change
 a model or its path, add a KV the bring-up needs, change a default that
 bring-up depends on (`--floor-db` especially), or discover a new hardware trap.
 
-Related: `TODO.md §C` (charter, every measured fact) · `ACHIEVED.md` (what
+Related: `AGENTS.md` (the leaf guide, every measured fact) · `ACHIEVED.md` (what
 shipped, with SHAs, and the per-chunk gotchas) · `scripts/AGENTS.md`
 (`reachy_mic_probe.sh`) · `TASKROUTER.md` (the reachy row).
