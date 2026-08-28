@@ -344,7 +344,12 @@ admin_cmd_say(const cmd_ctx_t *ctx)
     return;
   }
 
-  if(!method_send(method, target, message))
+  // `!rc` is wrong here and was for the life of this command: method_send
+  // answers SUCCESS/FAIL, and SUCCESS is `false` (common.h). Every say
+  // that reached the wire reported "send failed" and every real failure
+  // reported "sent" — a lie that five separate contexts wrote down as a
+  // known quirk rather than a defect. Test the enum, never its truthiness.
+  if(method_send(method, target, message) != SUCCESS)
   {
     method_release(method);
     clam(CLAM_WARN, "bot_say", "send failed: bot=%s target=%s", name, target);
