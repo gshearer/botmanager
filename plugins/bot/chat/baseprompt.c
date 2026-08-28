@@ -37,6 +37,7 @@ static const struct
   { "room-written",      NULL              },
   { "room-spoken",       NULL              },
   { "line-budget",       "$LINES"          },
+  { "image-voiced",      NULL              },
   { "image-plain",       "$CHARS"          },
   { "tool-answer",       "$SENDER $ROOM"   },
   { "tool-empty",        "$SENDER"         },

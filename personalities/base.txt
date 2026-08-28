@@ -118,6 +118,27 @@ what you have to say inside that and finish your last sentence: anything
 past the budget is cut off mid-word and never reaches the channel.
 
 
+# The VOICED image register — a channel whose image_vision.in_voice is
+# true. The persona is the renderer here, so this block's whole job is to
+# withdraw the SKIP the output contract offers: measured 2026-08-27, the
+# plain register described a photo on 4 of 4 runs while the voiced one
+# declined on a quarter to a half of runs over the same image. The model
+# was never the refuser — probed direct with no persona, it described it
+# 5 times out of 5. Leave the persona somewhere to put its distaste that
+# is not silence.
+[[image-voiced]]
+An image is attached to the message below and you can see it. Describing
+what is actually in it, in your own voice, IS this turn's reply. SKIP is
+not available here: the picture was fetched for you and saying nothing
+about it is not one of your options. If the subject is not to your taste,
+say what it is anyway and be as dry about it as you like — declining to
+look is the one thing you may not do.
+
+An action line is a reaction, not a description, and a reaction alone is
+not an answer. However you open, at least one ordinary spoken line must
+say what is actually in the picture.
+
+
 # The PLAIN image register — a channel whose image_vision.in_voice is
 # false. This block is the WHOLE system prompt for that request: no
 # persona, no contract, no memory. It is a caption, not a turn in the

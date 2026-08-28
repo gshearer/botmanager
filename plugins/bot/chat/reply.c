@@ -1371,11 +1371,47 @@ line_ends_in_question(const char *line)
 // that ignored the soft "do not repeat" instruction in the prompt
 // can't put a verbatim copy of a prior reply on the wire. A directly
 // addressed turn is exempt — see anti_repeat_blocks_line.
+// Is this whole line the contract's SKIP sentinel?
+//
+// The contract asks for "the single word SKIP on a line by itself" and a
+// model under pressure decorates it — `<SKIP>` reached #botman twice on
+// 2026-08-27 as literal text, which is both a PRIME DIRECTIVE violation
+// and a turn that never counted as a skip, so the CV-4 fallback could not
+// see it either. Strip one layer of wrapper punctuation before the
+// compare. A human line that is nothing but the word SKIP, however
+// dressed, is one the contract already reserved.
+// Defined below with the vision submits; llm_done's plain-register
+// retry is its other caller.
+static void vision_plain_submit(chatbot_req_t *r);
+
+static bool
+line_is_skip_sentinel(const char *line)
+{
+  char   probe[32];
+  size_t llen;
+  size_t lo = 0;
+  size_t hi;
+
+  llen = strlen(line);
+  if(llen >= sizeof(probe))
+    return(false);
+
+  memcpy(probe, line, llen + 1);
+  trim_ws_inplace(probe);
+
+  hi = strlen(probe);
+
+  while(lo < hi && strchr("<[({*_`'\"", probe[lo]) != NULL) lo++;
+  while(hi > lo && strchr(">])}*_`'\".!", probe[hi - 1]) != NULL) hi--;
+
+  probe[hi] = '\0';
+
+  return(strcasecmp(probe + lo, "SKIP") == 0);
+}
+
 static void
 send_reply_line(chatbot_req_t *r, const char *line)
 {
-  char probe[32];
-  size_t llen;
 
   if(line == NULL || line[0] == '\0') return;
 
@@ -1393,21 +1429,13 @@ send_reply_line(chatbot_req_t *r, const char *line)
     return;
   }
 
-  // Whole-line SKIP check on a local copy so we don't mutate the
-  // streaming buffer.
-  llen = strlen(line);
-  if(llen < sizeof(probe))
+  if(line_is_skip_sentinel(line))
   {
-    memcpy(probe, line, llen + 1);
-    trim_ws_inplace(probe);
-    if(strcasecmp(probe, "SKIP") == 0)
-    {
-      r->skip_sentinels_seen++;
-      clam(CLAM_DEBUG, "chatbot",
-          "bot=%s persona=%s: SKIP sentinel — suppressing line",
-          bot_inst_name(r->st->inst), r->personality_name);
-      return;
-    }
+    r->skip_sentinels_seen++;
+    clam(CLAM_DEBUG, "chatbot",
+        "bot=%s persona=%s: SKIP sentinel — suppressing line \"%.16s\"",
+        bot_inst_name(r->st->inst), r->personality_name, line);
+    return;
   }
 
   // CV-13 — Drop outgoing lines that are byte-for-byte or near-
@@ -1460,6 +1488,7 @@ send_reply_line(chatbot_req_t *r, const char *line)
     chatbot_floor_arm(&r->st->floor, r->channel, time(NULL));
 
   r->nonskip_lines_sent++;
+  r->prose_lines_sent++;
   send_line_marked(r, line, false);
 }
 
@@ -1629,6 +1658,43 @@ llm_done(const llm_chat_response_t *resp)
 
     else if(tail[0] != '\0')
       send_reply_line(r, tail);
+  }
+
+  // A voiced vision turn that said nothing falls through to the plain
+  // register rather than to CV-4's canned line. The picture was fetched,
+  // the model can see it, and "couldn't tell you." is a lie about a
+  // photograph sitting in the request — the operator's rule is that an
+  // image which passes the gates gets described.
+  //
+  // The request is REUSED, not rebuilt: the hold is linked, the method
+  // held, image_b64 still owned, and model/temperature/effort/base all
+  // resolved. Only the per-turn output state is reset. vision_plain is
+  // true from here on, so this can fire at most once — the plain
+  // register has no persona and no SKIP to take.
+  // ⚠ The test is PROSE lines, not lines. A persona answering a picture
+  // with "/me squints at the image" and nothing else has taken its turn
+  // by every other counter in this file and described nothing — measured
+  // on hedgehogg 2026-08-27, three times in four.
+  if(r->vision_active && !r->vision_plain && r->prose_lines_sent == 0)
+  {
+    clam(CLAM_WARN, "vision",
+        "bot=%s persona=%s: voiced reply described nothing"
+        " (prose=0 emotes=%u skips=%u) — retrying in the plain register",
+        bot_inst_name(r->st->inst), r->personality_name,
+        r->nonskip_lines_sent, r->skip_sentinels_seen);
+
+    r->stream_pos           = 0;
+    r->stream_flushed       = 0;
+    r->skip_sentinels_seen  = 0;
+    r->nonskip_lines_sent   = 0;
+    r->prose_lines_sent     = 0;
+    r->spoken[0]            = '\0';
+    r->spoken_len           = 0;
+    r->vision_plain         = true;
+
+    inflight_bump(r->st, +1);
+    vision_plain_submit(r);
+    return;
   }
 
   // CV-4 — Deterministic fallback. A direct-address reply that
@@ -2678,6 +2744,26 @@ prompt_emit_tail(char *buf, size_t pos, size_t cap, const chatbot_req_t *r)
     pos = prompt_emit_base(buf, pos, cap, r, "action-at-bot", toks, fb,
         "\n");
   }
+
+  // A picture is on the table and the persona is the one describing it.
+  // Emitted only on the voiced register — the plain one has no persona,
+  // no contract and therefore no SKIP to withdraw. This is the clause
+  // that makes the two registers agree: measured 2026-08-27, plain
+  // described a photo 4/4 while voiced declined on 25-50% of runs over
+  // the same image, because the contract offers SKIP and the character
+  // took it. The model itself never refused — probed direct, 5/5.
+  if(r->vision_active && !r->vision_plain)
+    pos = prompt_emit_base(buf, pos, cap, r, "image-voiced", NULL,
+        "Note: an image is attached to the message below and you can"
+        " see it. Describing what is actually in it, in your own voice,"
+        " IS this turn's reply. SKIP is not available here — the picture"
+        " was fetched for you and saying nothing about it is not one of"
+        " your options. If the subject is not to your taste, say what it"
+        " is anyway and be as dry about it as you like; declining to"
+        " look is what you may not do. An action line is a reaction, not"
+        " a description, and a reaction alone is not an answer: however"
+        " you open, at least one ordinary spoken line must say what is"
+        " actually in the picture.", "\n");
 
   // The line budget, when one is in force. Emitted here rather than
   // baked into a contract because the number is a runtime knob and no

@@ -1171,6 +1171,13 @@ typedef struct
   uint32_t        skip_sentinels_seen;
   uint32_t        nonskip_lines_sent;
 
+  // Of those, the ones that were SPEECH rather than an emote. An emote
+  // is a reaction and a reaction is not an answer — the vision path
+  // needs the distinction because "/me squints at the image" is a
+  // complete turn by nonskip_lines_sent's reckoning and describes
+  // nothing. Bumped only at the plain-line site in send_reply_line.
+  uint32_t        prose_lines_sent;
+
   // What the channel actually heard, accumulated line by line as each
   // one clears the wire in send_line_marked. conversation_log is the
   // record of what was SAID, and the model's raw output is not that:
