@@ -116,6 +116,11 @@ double wm_mk_kv_get_double(const char *market_id_str, const char *suffix,
 // wm_market_session_refresh_kv; see WM_MARKET_DEFAULT_MARK_MAX_AGE_MS.
 int64_t wm_mk_mark_max_age_ms(const whenmoon_market_t *mk);
 
+// WM-MAKER-1: true when this market submits real orders post_only —
+// maker treatment bought at the price of a REJECTION whenever the order
+// would cross. Read fresh; declared in wm_market_session_refresh_kv.
+bool wm_mk_post_only(const whenmoon_market_t *mk);
+
 // Signal entry point. Idempotent w.r.t. position direction:
 // no-op when the strategy advice already matches the current state.
 // Risk gates (daily-loss, max-notional, pending-cap) apply only when

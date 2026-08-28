@@ -116,6 +116,24 @@ wm_mk_kv_get_uint(const char *market_id_str, const char *suffix,
   return(kv_get_uint(path));
 }
 
+static bool
+wm_mk_kv_get_bool(const char *market_id_str, const char *suffix,
+    const char *def_str, bool def_val, const char *help)
+{
+  char path[WM_MK_KV_BUF_SZ];
+
+  snprintf(path, sizeof(path),
+      "plugin.whenmoon.market.%s.%s", market_id_str, suffix);
+
+  if(!kv_exists(path))
+  {
+    if(kv_register(path, KV_BOOL, def_str, NULL, NULL, help) != SUCCESS)
+      return(def_val);
+  }
+
+  return(kv_get_int(path) != 0);
+}
+
 // OBS-62: the real-submit mark-staleness bound, in ms. Read fresh at
 // each submit so an operator `/set kv` retunes it without restarting the
 // market — the same reason wm_mk_paper_loss_halt_frac above reads fresh.
@@ -132,6 +150,21 @@ wm_mk_mark_max_age_ms(const whenmoon_market_t *mk)
       "plugin.whenmoon.market.%s.mark_max_age_ms", mk->market_id_str);
 
   return((int64_t)kv_get_uint(path));
+}
+
+// WM-MAKER-1: this market's maker-execution switch. Same fresh-read
+// discipline as the bound above — arming it takes effect on the next
+// signal, not the next session refresh — and declared in the same
+// place, so a bare read here is the registered declaration's answer.
+bool
+wm_mk_post_only(const whenmoon_market_t *mk)
+{
+  char path[WM_MK_KV_BUF_SZ];
+
+  snprintf(path, sizeof(path),
+      "plugin.whenmoon.market.%s.post_only", mk->market_id_str);
+
+  return(kv_get_int(path) != 0);
 }
 
 // Caller MUST NOT hold mk->lock — KV reads can lazy-register, and
@@ -205,6 +238,16 @@ wm_market_session_refresh_kv(whenmoon_market_t *mk)
       " arrived longer ago than this — the gate that asks whether the"
       " market being priced against is still there. 0 disables it."
       " Operator force-trades carrying an explicit price are exempt.");
+
+  // WM-MAKER-1: declare the maker-execution switch so `/set kv` finds
+  // it from the moment the market exists. Read fresh by wm_mk_post_only
+  // at submit time, like the bound above.
+  (void)wm_mk_kv_get_bool(mk->market_id_str, "post_only", "false", false,
+      "Real-mode maker execution. When set, real submits carry post_only:"
+      " the venue REJECTS an order that would cross instead of filling it"
+      " as a taker (120 bps/side against 60). Off by default because this"
+      " path prices at the mark, which crosses roughly half the time, and"
+      " a rejected signal is dropped rather than repriced.");
 
   // WM-BREAKER-1: register the breaker knobs so `/set kv` finds them
   // before the first paper fill. Deliberately NOT cached in the

@@ -368,6 +368,7 @@ wm_market_engine_real_submit_locked(whenmoon_market_t *mk,
   int64_t                     mark_age_ms;
   const char                 *side_str;
   bool                        is_buy;
+  bool                        post_only;
 
   (void)sig;   // reserved for future audit hooks
 
@@ -509,6 +510,12 @@ wm_market_engine_real_submit_locked(whenmoon_market_t *mk,
 
   // Mint COID into a local buffer first; only commit to the pending
   // row after every fail-able op succeeds.
+  // WM-MAKER-1: maker execution is per-market and off by default. Read
+  // fresh, under mk->lock, for the same reason the knobs above are — the
+  // per-market keys carry NULL change-callbacks, so a KV read here can
+  // never re-enter market code.
+  post_only = wm_mk_post_only(mk);
+
   {
     char coid[EXCHANGE_CLIENT_OID_SZ];
 
@@ -519,7 +526,7 @@ wm_market_engine_real_submit_locked(whenmoon_market_t *mk,
     }
 
     wm_live_build_place_order_req(&req, mk->product_id, side_str,
-        clipped_qty, mark_px, coid, false);
+        clipped_qty, mark_px, coid, post_only);
 
     // Append the pending row BEFORE the async call so a synchronous-
     // FAIL done_cb finds it. The done_cb owns the post-fail reap.
@@ -550,8 +557,9 @@ wm_market_engine_real_submit_locked(whenmoon_market_t *mk,
   }
 
   clam(CLAM_INFO, WM_LIVE_CTX,
-      "%s submit %s qty=%.6g px=%.4f coid=%s",
-      mk->market_id_str, side_str, clipped_qty, mark_px, req.client_oid);
+      "%s submit %s qty=%.6g px=%.4f%s coid=%s",
+      mk->market_id_str, side_str, clipped_qty, mark_px,
+      post_only ? " post_only" : "", req.client_oid);
 
   return(SUCCESS);
 

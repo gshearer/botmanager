@@ -7,6 +7,10 @@
 // or a market book — these orders are unrelated to the market
 // subsystem and never touch any whenmoon position state.
 //
+// Order types: `market`, `limit`, and `maker` — a limit carrying
+// post_only, which the venue rejects rather than crossing. See the
+// buy/sell help text for why that rejection is the feature (WM-MAKER-1).
+//
 // Async reply pattern: the command callback returns before the
 // exchange responds, so cmd_ctx_t is gone by the time the typed
 // callback fires. The handler captures the reply target into a
@@ -108,14 +112,18 @@ wm_order_place_done(const exchange_order_result_t *res, void *user)
   }
   else
   {
+    // post_only is echoed from the VENUE's decoded order, not from
+    // what we sent: an accepted maker order is the only proof the
+    // flag reached the book rather than being dropped en route.
     snprintf(reply, sizeof(reply),
-        "%s: placed: %s %s %s qty=%.8g px=%.8g",
+        "%s: placed: %s %s %s qty=%.8g px=%.8g%s",
         ac->label,
         res->order.order_id,
         res->order.product_id,
         res->order.side,
         res->order.size,
-        res->order.price);
+        res->order.price,
+        res->order.post_only ? " post_only" : "");
   }
 
   wm_order_async_send(ac, reply);
@@ -139,12 +147,13 @@ wm_order_cmd_buysell(const cmd_ctx_t *ctx, const char *side)
   exchange_place_order_req_t req;
   wm_order_async_ctx_t      *ac;
   bool                       is_market;
+  bool                       post_only = false;
   double                     qty;
   double                     price = 0.0;
 
   snprintf(usage, sizeof(usage),
       "usage: /whenmoon order %s <exch>-<base>-<quote>"
-      " <limit|market> <qty> [<price>]", side);
+      " <limit|maker|market> <qty> [<price>]", side);
 
   p = ctx->args != NULL ? ctx->args : "";
 
@@ -172,13 +181,20 @@ wm_order_cmd_buysell(const cmd_ctx_t *ctx, const char *side)
     return;
   }
 
-  if(strcmp(type_tok, "limit") == 0)
+  // `maker` is a limit order carrying post_only, and the distinction is
+  // the whole reason this slot has three values instead of two: a limit
+  // priced at or through the opposing side CROSSES and pays taker — 120
+  // bps against 60 on this venue. post_only asks the book to reject such
+  // an order instead of filling it, so `maker` is the type to reach for
+  // whenever paying taker would be worse than not trading at all.
+  if(strcmp(type_tok, "limit") == 0 || strcmp(type_tok, "maker") == 0)
   {
     is_market = false;
+    post_only = (strcmp(type_tok, "maker") == 0);
 
     if(!wm_dl_next_token(&p, px_tok, sizeof(px_tok)))
     {
-      cmd_reply(ctx, "limit orders require a price");
+      cmd_reply(ctx, "limit and maker orders require a price");
       return;
     }
 
@@ -202,7 +218,7 @@ wm_order_cmd_buysell(const cmd_ctx_t *ctx, const char *side)
   }
   else
   {
-    cmd_reply(ctx, "type must be 'limit' or 'market'");
+    cmd_reply(ctx, "type must be 'limit', 'maker' or 'market'");
     return;
   }
 
@@ -233,8 +249,9 @@ wm_order_cmd_buysell(const cmd_ctx_t *ctx, const char *side)
   else
   {
     snprintf(req.tif, sizeof(req.tif), "GTC");
-    req.size  = qty;
-    req.price = price;
+    req.size      = qty;
+    req.price     = price;
+    req.post_only = post_only;
   }
 
   snprintf(label, sizeof(label), "order %s %s", side, id_tok);
@@ -361,9 +378,9 @@ static const cmd_decl_t whenmoon_order_decl = {
   .name        = "order",
   .usage       = "whenmoon order <verb> ...",
   .description = "Ad-hoc order management against any registered exchange.",
-  .help_long   = "Subcommands: buy <market_id> <limit|market> <qty> [<price>],"
-                 " sell <market_id> <limit|market> <qty> [<price>],"
-                 " cancel <exchange> <order_id>.\n"
+  .help_long   = "Subcommands: buy <market_id> <limit|maker|market> <qty>"
+                 " [<price>], sell <market_id> <limit|maker|market> <qty>"
+                 " [<price>], cancel <exchange> <order_id>.\n"
                  "Orders here are independent of the whenmoon market"
                  " subsystem — no book, no strategy, no PnL attribution.",
   .group       = USERNS_GROUP_ADMIN,
@@ -379,12 +396,13 @@ static const cmd_decl_t whenmoon_order_buy_decl = {
   .module      = "whenmoon",
   .name        = "buy",
   .usage       = "whenmoon order buy <exch>-<base>-<quote>"
-                 " <limit|market> <qty> [<price>]",
+                 " <limit|maker|market> <qty> [<price>]",
   .description = "Submit a buy order against the named exchange.",
-  .help_long   = "limit orders require a <price>; market orders do not."
-                 " Market-buys interpret <qty> as quote-currency notional"
-                 " (e.g. USD); market-sells and limits interpret <qty> as"
-                 " base-currency size.",
+  .help_long   = "limit and maker orders require a <price>; market orders"
+                 " do not. Market-buys interpret <qty> as quote-currency"
+                 " notional (e.g. USD); market-sells, limits and makers"
+                 " interpret <qty> as base-currency size.\n"
+                 "'maker' is a limit order submitted post_only: the venue REJECTS it rather than filling it if it would cross, which is what buys maker fees (60 bps/side here) instead of taker (120). A rejection is the flag working, not an error — reprice and resubmit.",
   .group       = USERNS_GROUP_ADMIN,
   .level       = 100,
   .scope       = CMD_SCOPE_ANY,
@@ -397,10 +415,11 @@ static const cmd_decl_t whenmoon_order_sell_decl = {
   .module      = "whenmoon",
   .name        = "sell",
   .usage       = "whenmoon order sell <exch>-<base>-<quote>"
-                 " <limit|market> <qty> [<price>]",
+                 " <limit|maker|market> <qty> [<price>]",
   .description = "Submit a sell order against the named exchange.",
   .help_long   = "Symmetric to /whenmoon order buy. <qty> is base-currency"
-                 " size in every mode (market and limit alike).",
+                 " size in every mode (market, limit and maker alike).\n"
+                 "'maker' is a limit order submitted post_only: the venue REJECTS it rather than filling it if it would cross, which is what buys maker fees (60 bps/side here) instead of taker (120). A rejection is the flag working, not an error — reprice and resubmit.",
   .group       = USERNS_GROUP_ADMIN,
   .level       = 100,
   .scope       = CMD_SCOPE_ANY,
