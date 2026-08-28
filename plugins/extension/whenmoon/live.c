@@ -1769,8 +1769,8 @@ wm_live_quote_alloc_bound_locked(whenmoon_market_t *mk, double avail)
       "Real-mode quote-balance allocation cap: fraction of the exchange"
       " 'available' quote balance this market may deploy (1.0 = whole"
       " balance). Bounds the cash ledger (bankroll); size_frac then sizes"
-      " each order off the capped cash and max_notional caps per-order"
-      " notional. Composes with quote_alloc_max — most-restrictive wins.");
+      " each order off the capped cash and max_notional_sats caps"
+      " per-order notional. Composes with quote_alloc_max — most-restrictive wins.");
 
   max = wm_mk_kv_get_double(mk->market_id_str, "quote_alloc_max",
       "0.0", WM_MARKET_DEFAULT_QUOTE_ALLOC_MAX,
