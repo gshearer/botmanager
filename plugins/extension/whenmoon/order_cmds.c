@@ -26,6 +26,7 @@
 #include "exchange_api.h"
 #include "method.h"
 #include "alloc.h"
+#include "clam.h"
 #include "cmd.h"
 #include "common.h"
 
@@ -125,6 +126,16 @@ wm_order_place_done(const exchange_order_result_t *res, void *user)
         res->order.price,
         res->order.post_only ? " post_only" : "");
   }
+
+  // Log it as well as reply. wm_order_async_send routes through a
+  // method instance, so a command issued from botmanctl — or one whose
+  // instance went away during the round trip — silently loses the only
+  // account the venue ever gives of what happened to real money. The
+  // driver does not log a create failure either (it is delivered into
+  // `res->err` and nowhere else), so without this line a rejection is
+  // recoverable from nothing.
+  clam(res->err[0] != '\0' ? CLAM_WARN : CLAM_INFO, WHENMOON_CTX,
+      "%s", reply);
 
   wm_order_async_send(ac, reply);
   mem_free(ac);
@@ -314,6 +325,9 @@ wm_order_cancel_done(const exchange_order_result_t *res, void *user)
             ? res->order.order_id
             : "(ack)");
   }
+
+  clam(res->err[0] != '\0' ? CLAM_WARN : CLAM_INFO, WHENMOON_CTX,
+      "%s", reply);
 
   wm_order_async_send(ac, reply);
   mem_free(ac);
