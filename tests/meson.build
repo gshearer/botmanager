@@ -182,6 +182,23 @@ test_ws_binding = executable('test_ws_binding',
   link_with : [test_harness],
 )
 
+# The satoshi arithmetic every armed whenmoon control is evaluated
+# against (WM-NUMERAIRE-1). It decides how much real money a market may
+# commit and every wrong answer it can give is silent: an inverted
+# conversion, a leg misread as bitcoin, or a stack that moves with the
+# bitcoin price and hands the drawdown breaker a dip to trip on.
+# numeraire.c includes no whenmoon header — the leaf property
+# warm_chain.c and ws_binding.c rest on — and calls nothing but libc and
+# libm, so no core is linked.
+test_numeraire = executable('test_numeraire',
+  'test_numeraire.c',
+  '../plugins/extension/whenmoon/numeraire.c',
+  include_directories : [include_directories('.'), inc_include,
+                         include_directories('../plugins/extension/whenmoon')],
+  link_with : [test_harness],
+  dependencies : [m_dep],
+)
+
 # The FACT-1 ladder is SQL, so its suite drives psql against the
 # configured database inside a rolled-back transaction, and SKIPs when
 # that database is unreachable. It needs no core symbols — only the
@@ -527,3 +544,4 @@ test('method_stats', test_method_stats)
 test('botmanctl_route', test_botmanctl_route)
 test('shutdown_reason', test_shutdown_reason)
 test('ws_binding', test_ws_binding)
+test('numeraire', test_numeraire)

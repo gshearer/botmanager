@@ -7,6 +7,7 @@
 #include "market.h"
 #include "market_cmds.h"
 #include "market_engine.h"
+#include "numeraire.h"
 #include "live.h"
 #include "strategy.h"
 #include "dl_commands.h"
@@ -622,8 +623,8 @@ wm_market_cmd_force(const cmd_ctx_t *ctx)
     px_override = strtod(px_tok, NULL);
 
   // WM-FORCE-INST-1: instance-aware like every other market verb, so
-  // the discretionary fund's manual order surface (and the A3 tripwire
-  // hook below) can address `@instance` markets.
+  // the treasury's manual order surface (and the tripwire hook below)
+  // can address `@instance` markets.
   if(wm_market_parse_instance_id(id_tok, exch, sizeof(exch), base,
          sizeof(base), quote, sizeof(quote), instance,
          sizeof(instance)) != SUCCESS)
@@ -678,12 +679,12 @@ wm_market_cmd_force(const cmd_ctx_t *ctx)
   pthread_mutex_unlock(&mk->lock);
   pthread_rwlock_unlock(&st->markets->arr_lock);
 
-  // WM-DISC-1 A3: synth-mode force fills evaluate the discretionary
-  // tripwire here. Real force trades are checked when the exchange
-  // fill lands in wm_market_engine_record_external_fill — submissions
-  // don't move equity, fills do.
+  // Synth-mode force fills evaluate the treasury tripwire here. Real
+  // force trades are checked when the exchange fill lands in
+  // wm_market_engine_record_external_fill — submissions don't move the
+  // stack, fills do.
   if(ok == SUCCESS && mode != WM_MARKET_MODE_REAL)
-    wm_live_disc_freeze_check(id_str);
+    wm_live_treasury_freeze_check(id_str);
 
   if(ok != SUCCESS)
   {
@@ -786,8 +787,9 @@ static const cmd_decl_t whenmoon_market_mode_decl = {
   .description =
       "Change a market's mode. PAPER = synthetic fills against the"
       " cached mark + paper-stats accumulation. REAL = exchange"
-      " submission + risk gates (daily-loss bps, max-notional,"
-      " pending-cap, mark staleness) + real-stats accumulation."
+      " submission + risk gates (daily satoshi drawdown, per-order"
+      " satoshi cap, pending-cap, mark staleness) + real-stats"
+      " accumulation."
       " MANUAL = strategies"
       " still receive ticks and log advice but the market takes no"
       " action; force-trades (WM-MK-4) drive the position. Refused"
@@ -810,8 +812,9 @@ static const cmd_decl_t whenmoon_market_force_decl = {
       " the market's mode gate. Manual + paper modes: synthetic fill"
       " at <px> or last ticker (paper applies synth slippage only on"
       " the fallback path). Real mode: limit order via the exchange"
-      " abstraction (credentials, daily-loss, pending-cap, and"
-      " max-notional gates apply; fill arrives asynchronously). Giving"
+      " abstraction (credentials, daily satoshi drawdown, pending-cap"
+      " and per-order satoshi cap gates apply; fill arrives"
+      " asynchronously). Giving"
       " an explicit <px> also waives the mark-staleness gate — the"
       " price is yours, not one inferred from a feed. Same"
       " fill ledger choke point as accepted strategy advice — stats"
@@ -1427,10 +1430,49 @@ wm_obs_render_card(const cmd_ctx_t *ctx,
 
   snprintf(line, sizeof(line),
       "  params:      fee_bps=%.1f slip_bps=%.1f size_frac=%.2f"
-      " max_notional=%.2f daily_loss_bps=%.1f pending_cap=%u",
+      " max_notional_sats=%.0f daily_dd_bps=%.1f pending_cap=%u",
       snap->fee_bps, snap->slip_bps, snap->size_frac,
-      snap->max_notional, snap->daily_loss_bps, snap->pending_cap);
+      snap->max_notional_sats, snap->daily_drawdown_bps,
+      snap->pending_cap);
   cmd_reply(ctx, line);
+
+  // WM-NUMERAIRE-1: the book in the office's own unit — the figure the
+  // drawdown breaker and the per-order cap are both evaluated against,
+  // shown beside the quote-currency ledger above rather than instead of
+  // it (CFO.md sec. 2: judge in one numeral, report in two).
+  {
+    wm_market_mode_t         book = (snap->mode == WM_MARKET_MODE_PAPER)
+        ? WM_MARKET_MODE_PAPER : WM_MARKET_MODE_REAL;
+    const wm_market_stats_t *bs   = &snap->stats[book];
+    double                   pos  =
+        (snap->position.side == WM_MARKET_POS_LONG)
+            ? snap->position.qty : 0.0;
+    // The mark is stamped by a signal or a fill; a market that has only
+    // ever ticked has none, and its ticker is the honest valuation.
+    double                   px   = (snap->last_mark_px > 0.0)
+        ? snap->last_mark_px : snap->last_ticker_px;
+    wm_btc_leg_t             leg  = wm_numeraire_leg(snap->product_id);
+    double                   sats;
+
+    if(wm_numeraire_stack_sats(leg, px, bs->cash, pos, &sats))
+      snprintf(line, sizeof(line), "  stack:       %.0f sats (%s book)",
+          sats, wm_market_mode_name(book));
+
+    // Two different failures, and telling them apart is the whole
+    // value of the line: one is a market this office cannot measure at
+    // all, the other is a price that has not arrived yet.
+    else if(leg == WM_BTC_LEG_NONE)
+      snprintf(line, sizeof(line),
+          "  stack:       " CLR_GRAY "unpriceable — %s has no bitcoin"
+          " leg" CLR_RESET, snap->product_id);
+
+    else
+      snprintf(line, sizeof(line),
+          "  stack:       " CLR_GRAY "unpriced — no mark or ticker"
+          " observed yet" CLR_RESET);
+
+    cmd_reply(ctx, line);
+  }
 
   snprintf(line, sizeof(line),
       "  pending:     %u of %u", snap->pending_n, snap->pending_cap);

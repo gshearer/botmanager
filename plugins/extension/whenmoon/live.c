@@ -36,6 +36,7 @@
 
 #include "market.h"
 #include "market_engine.h"
+#include "numeraire.h"
 #include "whenmoon.h"
 #include "whenmoon_strategy.h"
 
@@ -119,7 +120,7 @@ static void wm_live_ws_user_event_cb(const exchange_ws_event_t *ev,
     void *user);
 static void wm_live_binding_drop(wm_live_ws_binding_t *b);
 static void wm_live_fills_poll_tick(task_t *t);
-static void wm_live_disc_register_kvs(void);
+static void wm_live_treasury_register_kvs(void);
 
 #define WM_LIVE_FILLS_POLL_SEC         30
 #define WM_LIVE_FILLS_POLL_OVERLAP_MS  (60 * 1000)
@@ -361,8 +362,7 @@ wm_market_engine_real_submit_locked(whenmoon_market_t *mk,
   exchange_capabilities_t     caps;
   wm_live_market_done_ctx_t  *ctx;
   wm_market_pending_t        *pending;
-  double                      starting_cash;
-  double                      daily_cap;
+  char                        why[192];
   double                      clipped_qty;
   int64_t                     mark_max_age_ms;
   int64_t                     mark_age_ms;
@@ -412,24 +412,21 @@ wm_market_engine_real_submit_locked(whenmoon_market_t *mk,
     return(FAIL);
   }
 
-  // Gate 2: daily-loss cap. wm_market_apply_fill_locked maintains the
-  // daily anchor — we read state here, not compute. Cap of 0 disables
-  // the gate.
-  starting_cash = mk->session.stats[WM_MARKET_MODE_REAL].starting_cash;
-  daily_cap     = starting_cash * (mk->session.daily_loss_bps / 10000.0);
-
-  if(daily_cap > 0.0
-      && mk->session.stats[WM_MARKET_MODE_REAL].realized_pnl_today
-         <= -daily_cap)
+  // Gate 2: daily drawdown, measured in SATOSHIS (WM-NUMERAIRE-1). Its
+  // predecessor measured realized PnL in quote currency, and under a
+  // bitcoin mandate that is wrong in both directions: it halted a
+  // market through the bitcoin dip the office had already agreed to
+  // sit through, and it stayed silent through a round trip that ended
+  // holding fewer satoshis than doing nothing. The satoshi stack is
+  // flat while the book holds bitcoin and moves only when it deviates,
+  // which is the thing worth breaking on. Cap of 0 disables the gate;
+  // the whole test lives beside the anchor it reads.
+  if(wm_market_daily_drawdown_tripped_locked(mk, mark_px, wm_now_ms(),
+      why, sizeof(why)))
   {
-    ERRSET("daily loss cap tripped (%.4f <= -%.4f)",
-        mk->session.stats[WM_MARKET_MODE_REAL].realized_pnl_today,
-        daily_cap);
-    clam(CLAM_WARN, WM_LIVE_CTX,
-        "%s real submit FAIL: daily loss %.4f <= cap %.4f",
-        mk->market_id_str,
-        mk->session.stats[WM_MARKET_MODE_REAL].realized_pnl_today,
-        -daily_cap);
+    ERRSET("%s", why);
+    clam(CLAM_WARN, WM_LIVE_CTX, "%s real submit FAIL: %s",
+        mk->market_id_str, why);
     return(FAIL);
   }
 
@@ -445,22 +442,44 @@ wm_market_engine_real_submit_locked(whenmoon_market_t *mk,
     return(FAIL);
   }
 
-  // Gate 4: max-notional. Clip qty rather than reject — degraded
-  // sizing matches paper-mode behaviour.
+  // Gate 4: per-order cap, in SATOSHIS (WM-NUMERAIRE-1), converted to a
+  // quote notional at this market's own mark. A breach CLIPS the qty
+  // rather than rejecting it — degraded sizing matches paper-mode
+  // behaviour — but a cap that cannot be converted REFUSES, because a
+  // cap the engine cannot express is not a larger one.
   clipped_qty = qty;
 
-  if(mk->session.max_notional > 0.0
-      && clipped_qty * mark_px > mk->session.max_notional)
+  if(mk->session.max_notional_sats > 0.0)
   {
-    double next = mk->session.max_notional / mark_px;
+    double cap_quote;
 
-    clam(CLAM_INFO, WM_LIVE_CTX,
-        "%s real submit notional clip qty %.6g -> %.6g"
-        " (cap=%.4f mark=%.4f)",
-        mk->market_id_str, clipped_qty, next,
-        mk->session.max_notional, mark_px);
+    if(!wm_numeraire_sats_to_quote(wm_numeraire_leg(mk->product_id),
+        mark_px, mk->session.max_notional_sats, &cap_quote))
+    {
+      ERRSET("per-order cap armed (%.0f sats) but %s cannot be priced in"
+          " satoshis (product %s, mark %.4f)",
+          mk->session.max_notional_sats, mk->market_id_str,
+          mk->product_id, mark_px);
+      clam(CLAM_WARN, WM_LIVE_CTX,
+          "%s real submit FAIL: max_notional_sats=%.0f but product %s"
+          " has no bitcoin leg to price it against",
+          mk->market_id_str, mk->session.max_notional_sats,
+          mk->product_id);
+      return(FAIL);
+    }
 
-    clipped_qty = next;
+    if(clipped_qty * mark_px > cap_quote)
+    {
+      double next = cap_quote / mark_px;
+
+      clam(CLAM_INFO, WM_LIVE_CTX,
+          "%s real submit notional clip qty %.6g -> %.6g"
+          " (cap=%.0f sats = %.4f quote, mark=%.4f)",
+          mk->market_id_str, clipped_qty, next,
+          mk->session.max_notional_sats, cap_quote, mark_px);
+
+      clipped_qty = next;
+    }
   }
 
   // Gate 5: mark staleness (OBS-62). Every gate above asks a question
@@ -1556,9 +1575,9 @@ wm_live_engine_start(void)
   st = whenmoon_get_state();
   if(st == NULL) return;
 
-  // WM-DISC-1: surface the discretionary-treasury knobs to /set kv
+  // WM-NUMERAIRE-1: surface the treasury knobs to /set kv
   // before any fill can consult them.
-  wm_live_disc_register_kvs();
+  wm_live_treasury_register_kvs();
 
   if(exchange_name_list(names, WM_LIVE_MAX_EXCHANGES, &n_names) != SUCCESS)
     n_names = 0;
@@ -2053,57 +2072,70 @@ wm_live_reconcile_from_accounts(const char *exchange,
 }
 
 // ----------------------------------------------------------------------- //
-// WM-DISC-1: discretionary-treasury freeze tripwire (CFO.md sec. 3)       //
+// WM-NUMERAIRE-1: treasury freeze tripwire (CFO.md sec. 3)                //
 // ----------------------------------------------------------------------- //
 
 // All three knobs default inert; the tripwire arms only when every one
 // is set. Registered at engine start so /set kv finds them before the
 // first fill; read FRESH at each real fill, breaker-style.
-#define WM_DISC_KV_DEPOSIT   "plugin.whenmoon.disc.deposit_usd"
-#define WM_DISC_KV_FRAC      "plugin.whenmoon.disc.freeze_frac"
-#define WM_DISC_KV_MARKETS   "plugin.whenmoon.disc.markets"
+//
+// This was WM-DISC-1's `disc.*` namespace, and it measured the fund's
+// equity in dollars against a dollar deposit. Under the 2026-08-28
+// mandate that is a machine for doing the one thing CFO.md sec. 2
+// forbids: a bitcoin dip would drop the dollar equity through the
+// floor and flip every market to manual, on a move the operator had
+// already accepted unconditionally. The floor is now the office's
+// opening SATOSHI stack, which a bitcoin move does not touch — the
+// tripwire fires when the fund's deviations lost satoshis, and only
+// then. The two-treasury split the old name described is gone with the
+// same amendment; there is one treasury.
+#define WM_TREASURY_KV_BASELINE  "plugin.whenmoon.treasury.baseline_sats"
+#define WM_TREASURY_KV_FRAC      "plugin.whenmoon.treasury.freeze_frac"
+#define WM_TREASURY_KV_MARKETS   "plugin.whenmoon.treasury.markets"
 
 // Compile cap on designated markets + list-KV working buffer.
-#define WM_DISC_MAX_MARKETS  16
-#define WM_DISC_LIST_BUF_SZ  (WM_DISC_MAX_MARKETS * WM_MARKET_ID_STR_SZ)
+#define WM_TREASURY_MAX_MARKETS  16
+#define WM_TREASURY_LIST_BUF_SZ  (WM_TREASURY_MAX_MARKETS * WM_MARKET_ID_STR_SZ)
 
 static void
-wm_live_disc_register_kvs(void)
+wm_live_treasury_register_kvs(void)
 {
-  if(!kv_exists(WM_DISC_KV_DEPOSIT) &&
-     kv_register(WM_DISC_KV_DEPOSIT, KV_DOUBLE, "0.0", NULL, NULL,
-         "Discretionary treasury (whenmoon CFO.md sec. 3): operator"
-         " deposit in quote currency. 0 = fund unconfigured. The"
-         " DISC-FREEZE tripwire arms only when deposit_usd,"
-         " freeze_frac, and markets are all set.") != SUCCESS)
+  if(!kv_exists(WM_TREASURY_KV_BASELINE) &&
+     kv_register(WM_TREASURY_KV_BASELINE, KV_DOUBLE, "0.0", NULL, NULL,
+         "Treasury baseline in SATOSHIS (whenmoon CFO.md sec. 1): the"
+         " stack the freeze floor is measured against. 0 = unconfigured."
+         " The freeze tripwire arms only when baseline_sats, freeze_frac"
+         " and markets are all set.") != SUCCESS)
     clam(CLAM_WARN, WM_LIVE_CTX, "kv_register failed: %s",
-        WM_DISC_KV_DEPOSIT);
+        WM_TREASURY_KV_BASELINE);
 
-  if(!kv_exists(WM_DISC_KV_FRAC) &&
-     kv_register(WM_DISC_KV_FRAC, KV_DOUBLE, "0.0", NULL, NULL,
-         "Discretionary treasury freeze fraction: fund equity <"
-         " deposit_usd * (1 - freeze_frac) after a fill on a"
-         " designated market flips every designated market to MANUAL"
-         " (positions kept) and emits one DISC-FREEZE warn."
-         " 0 disables.") != SUCCESS)
+  if(!kv_exists(WM_TREASURY_KV_FRAC) &&
+     kv_register(WM_TREASURY_KV_FRAC, KV_DOUBLE, "0.0", NULL, NULL,
+         "Treasury freeze fraction: a summed stack below baseline_sats *"
+         " (1 - freeze_frac) after a fill on a designated market flips"
+         " every designated market to MANUAL (positions kept) and emits"
+         " one TREASURY-FREEZE warn. Measured in satoshis, so holding"
+         " bitcoin through a price move cannot trip it. 0 disables.")
+         != SUCCESS)
     clam(CLAM_WARN, WM_LIVE_CTX, "kv_register failed: %s",
-        WM_DISC_KV_FRAC);
+        WM_TREASURY_KV_FRAC);
 
-  if(!kv_exists(WM_DISC_KV_MARKETS) &&
-     kv_register(WM_DISC_KV_MARKETS, KV_STR, "", NULL, NULL,
-         "Discretionary treasury designated markets: comma-separated"
-         " market_id_str list, exact match, no whitespace. The fund"
-         " trades ONLY through these; the freeze tripwire sums each"
-         " market's book cash + marked position (paper-mode markets"
-         " read their paper book, all others the real book).") != SUCCESS)
+  if(!kv_exists(WM_TREASURY_KV_MARKETS) &&
+     kv_register(WM_TREASURY_KV_MARKETS, KV_STR, "", NULL, NULL,
+         "Treasury designated markets: comma-separated market_id_str"
+         " list, exact match, no whitespace. The treasury trades ONLY"
+         " through these; the freeze tripwire sums each market's stack"
+         " in satoshis (paper-mode markets read their paper book, all"
+         " others the real book). A designated market with no bitcoin"
+         " leg cannot be summed and is skipped with a warn.") != SUCCESS)
     clam(CLAM_WARN, WM_LIVE_CTX, "kv_register failed: %s",
-        WM_DISC_KV_MARKETS);
+        WM_TREASURY_KV_MARKETS);
 }
 
 // Exact-match membership test against the comma-separated designated-
 // market list. No whitespace tolerance — the KV help states the format.
 static bool
-wm_disc_market_listed(const char *list, const char *market_id_str)
+wm_treasury_market_listed(const char *list, const char *market_id_str)
 {
   const char *p    = list;
   size_t      want = strlen(market_id_str);
@@ -2125,62 +2157,64 @@ wm_disc_market_listed(const char *list, const char *market_id_str)
   return(false);
 }
 
-// WM-DISC-1 A3: evaluated after the fund's only two order paths —
-// real exchange fills (wm_market_engine_record_external_fill) and
-// operator force trades in synth modes (the /whenmoon market force
-// verb) — always AFTER the fill's locks are released. Strategy-driven
-// paper fills are deliberately not hooked: strategies never trade the
-// fund. Mirrors the WM-BREAKER-1 shape at fund scope: sum designated
-// markets' book equity (paper-mode markets read their paper book so
-// the Part B rehearsal can drill the tripwire; REAL and frozen MANUAL
-// markets read the real book), breach -> every designated market
-// flips MANUAL.
+// Evaluated after the treasury's only two order paths — real exchange
+// fills (wm_market_engine_record_external_fill) and operator force
+// trades in synth modes (the /whenmoon market force verb) — always
+// AFTER the fill's locks are released. Strategy-driven paper fills are
+// deliberately not hooked: strategies never trade the treasury.
+// Mirrors the WM-BREAKER-1 shape at fund scope: sum the designated
+// markets' stacks in satoshis (paper-mode markets read their paper
+// book so a rehearsal can drill the tripwire; REAL and frozen MANUAL
+// markets read the real book), breach -> every designated market flips
+// MANUAL.
 //
 // Locking: the walk takes one mk->lock at a time under the arr rdlock,
 // never two — two designated markets filling concurrently must not
-// ABBA-deadlock. The summed equity is therefore a near-instant
+// ABBA-deadlock. The summed stack is therefore a near-instant
 // composite, not an atomic snapshot: breaker-grade arithmetic, not
-// accounting. Each market's position is marked at its own freshest
-// mark; for the just-filled market that IS the fill px
-// (apply_fill_locked updates last_mark_px before we run). A designated
-// market that is not running contributes zero — conservative by
-// construction (invisible capital leans the tripwire toward freezing).
+// accounting. Each market is marked at its own freshest mark; for the
+// just-filled market that IS the fill px (apply_fill_locked updates
+// last_mark_px before we run). A designated market that is not
+// running, or whose product has no bitcoin leg to price, contributes
+// nothing — conservative by construction, since invisible capital
+// leans the tripwire toward freezing. That is why the skip warns.
 void
-wm_live_disc_freeze_check(const char *filled_market_id_str)
+wm_live_treasury_freeze_check(const char *filled_market_id_str)
 {
   whenmoon_state_t  *st;
-  whenmoon_market_t *fund[WM_DISC_MAX_MARKETS];
-  char               list[WM_DISC_LIST_BUF_SZ];
+  whenmoon_market_t *fund[WM_TREASURY_MAX_MARKETS];
+  char               list[WM_TREASURY_LIST_BUF_SZ];
   char              *tok;
   char              *save = NULL;
   const char        *val;
-  double             deposit;
+  double             baseline;
   double             frac;
-  double             floor_eq;
-  double             equity  = 0.0;
-  uint32_t           n_fund  = 0;
-  uint32_t           n_paper = 0;
-  uint32_t           n_real  = 0;
-  uint32_t           flipped = 0;
+  double             floor_sats;
+  double             stack     = 0.0;
+  uint32_t           n_fund    = 0;
+  uint32_t           n_paper   = 0;
+  uint32_t           n_real    = 0;
+  uint32_t           n_skipped = 0;
+  uint32_t           flipped   = 0;
   uint32_t           i;
 
   if(filled_market_id_str == NULL)
     return;
 
-  deposit = kv_get_double(WM_DISC_KV_DEPOSIT);
-  frac    = kv_get_double(WM_DISC_KV_FRAC);
+  baseline = kv_get_double(WM_TREASURY_KV_BASELINE);
+  frac     = kv_get_double(WM_TREASURY_KV_FRAC);
 
-  if(deposit <= 0.0 || frac <= 0.0)
+  if(baseline <= 0.0 || frac <= 0.0)
     return;
 
-  val = kv_get_str(WM_DISC_KV_MARKETS);
+  val = kv_get_str(WM_TREASURY_KV_MARKETS);
 
   if(val == NULL || val[0] == '\0')
     return;
 
   snprintf(list, sizeof(list), "%s", val);
 
-  if(!wm_disc_market_listed(list, filled_market_id_str))
+  if(!wm_treasury_market_listed(list, filled_market_id_str))
     return;
 
   st = whenmoon_get_state();
@@ -2188,12 +2222,12 @@ wm_live_disc_freeze_check(const char *filled_market_id_str)
   if(st == NULL || st->markets == NULL)
     return;
 
-  floor_eq = deposit * (1.0 - frac);
+  floor_sats = baseline * (1.0 - frac);
 
   pthread_rwlock_rdlock(&st->markets->arr_lock);
 
   for(tok = strtok_r(list, ",", &save);
-      tok != NULL && n_fund < WM_DISC_MAX_MARKETS;
+      tok != NULL && n_fund < WM_TREASURY_MAX_MARKETS;
       tok = strtok_r(NULL, ",", &save))
   {
     whenmoon_market_t *mk = wm_market_lookup_by_id(st, tok);
@@ -2205,23 +2239,36 @@ wm_live_disc_freeze_check(const char *filled_market_id_str)
 
     {
       // Book selection: a PAPER-mode designated market contributes its
-      // paper book (the Part B rehearsal fund is all-paper); everything
-      // else — REAL, and MANUAL after a freeze — contributes the real
-      // book. A fund must never mix books: paper cash in a real fund
-      // masks a real breach, hence the warn below.
+      // paper book (a rehearsal fund is all-paper); everything else —
+      // REAL, and MANUAL after a freeze — contributes the real book. A
+      // fund must never mix books: paper cash in a real fund masks a
+      // real breach, hence the warn below.
       wm_market_mode_t book =
           (mk->session.mode == WM_MARKET_MODE_PAPER)
               ? WM_MARKET_MODE_PAPER : WM_MARKET_MODE_REAL;
-      const wm_market_stats_t *bs = &mk->session.stats[book];
-      double pos = (mk->session.position.side == WM_MARKET_POS_LONG)
-          ? mk->session.position.qty : 0.0;
+      double mk_sats;
 
-      equity += bs->cash + pos * mk->session.last_mark_px;
+      if(wm_market_stack_sats_locked(mk, book,
+          wm_market_valuation_px_locked(mk), &mk_sats))
+      {
+        stack += mk_sats;
 
-      if(book == WM_MARKET_MODE_PAPER)
-        n_paper++;
+        if(book == WM_MARKET_MODE_PAPER)
+          n_paper++;
+        else
+          n_real++;
+      }
+
       else
-        n_real++;
+      {
+        n_skipped++;
+        clam(CLAM_WARN, WM_LIVE_CTX,
+            "treasury: designated market %s (product %s, mark %.4f) has"
+            " no satoshi price and is omitted from the fund stack — an"
+            " omission leans the tripwire toward freezing; fix %s",
+            mk->market_id_str, mk->product_id,
+            wm_market_valuation_px_locked(mk), WM_TREASURY_KV_MARKETS);
+      }
     }
 
     pthread_mutex_unlock(&mk->lock);
@@ -2230,11 +2277,11 @@ wm_live_disc_freeze_check(const char *filled_market_id_str)
 
   if(n_paper > 0 && n_real > 0)
     clam(CLAM_WARN, WM_LIVE_CTX,
-        "disc fund mixes books: %u paper-mode + %u real/manual"
-        " designated market(s) — paper cash inflates fund equity;"
-        " fix %s", n_paper, n_real, WM_DISC_KV_MARKETS);
+        "treasury fund mixes books: %u paper-mode + %u real/manual"
+        " designated market(s) — paper cash inflates the fund stack;"
+        " fix %s", n_paper, n_real, WM_TREASURY_KV_MARKETS);
 
-  if(equity >= floor_eq)
+  if(stack >= floor_sats)
   {
     pthread_rwlock_unlock(&st->markets->arr_lock);
     return;
@@ -2266,10 +2313,10 @@ wm_live_disc_freeze_check(const char *filled_market_id_str)
 
   if(flipped > 0)
     clam(CLAM_WARN, WM_LIVE_CTX,
-        "DISC-FREEZE: fund equity %.2f breached floor %.2f"
-        " (deposit %.2f, freeze_frac %.4g) — %u designated market(s)"
-        " -> manual, positions kept, pending operator review"
-        " (tripping fill: %s)",
-        equity, floor_eq, deposit, frac, flipped,
+        "TREASURY-FREEZE: fund stack %.0f sats breached floor %.0f"
+        " (baseline %.0f, freeze_frac %.4g, %u market(s) omitted) — %u"
+        " designated market(s) -> manual, positions kept, pending"
+        " operator review (tripping fill: %s)",
+        stack, floor_sats, baseline, frac, n_skipped, flipped,
         filled_market_id_str);
 }

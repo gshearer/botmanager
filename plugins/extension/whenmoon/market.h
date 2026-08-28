@@ -90,6 +90,14 @@ typedef struct
   double   realized_pnl_lifetime;
   double   realized_pnl_today;
   int64_t  daily_anchor_ms;
+
+  // WM-NUMERAIRE-1: this book's stack, in satoshis, as it stood when
+  // `daily_anchor_ms` was last rolled — the denominator the real-mode
+  // drawdown breaker measures against. 0 = not yet established; the
+  // first evaluation after a roll stamps it. Not a P&L: it is a
+  // mark-to-market score, and under the office's numeraire a book
+  // sitting in bitcoin holds it flat however the price moves.
+  double   stack_anchor_sats;
   double   lifetime_fees;
   uint64_t lifetime_fills_count;
   int64_t  last_fill_ms;
@@ -185,8 +193,8 @@ typedef struct
   double                fee_bps;
   double                slip_bps;
   double                size_frac;
-  double                max_notional;
-  double                daily_loss_bps;
+  double                max_notional_sats;
+  double                daily_drawdown_bps;
   uint32_t              pending_cap;
 
   // WM-MK-6: equity-samples ring, shared across modes (the chunk's
@@ -210,8 +218,8 @@ typedef struct
 #define WM_MARKET_DEFAULT_FEE_BPS              5.0
 #define WM_MARKET_DEFAULT_SLIP_BPS             5.0
 #define WM_MARKET_DEFAULT_SIZE_FRAC            0.25
-#define WM_MARKET_DEFAULT_DAILY_LOSS_BPS     200.0
-#define WM_MARKET_DEFAULT_MAX_NOTIONAL         0.0
+#define WM_MARKET_DEFAULT_DAILY_DRAWDOWN_BPS 200.0
+#define WM_MARKET_DEFAULT_MAX_NOTIONAL_SATS    0.0
 #define WM_MARKET_DEFAULT_PENDING_CAP            8u
 
 // WM-BREAKER-1: paper-mode drawdown circuit breaker. When a paper
@@ -717,8 +725,8 @@ typedef struct
   double                fee_bps;
   double                slip_bps;
   double                size_frac;
-  double                max_notional;
-  double                daily_loss_bps;
+  double                max_notional_sats;
+  double                daily_drawdown_bps;
   uint32_t              pending_cap;
 
   // WM-MK-6: pre-computed risk-adjusted metrics. Computed under

@@ -7,8 +7,9 @@
 //
 // No per-exchange enable switch exists — registration of the exchange
 // (creds present + market in REAL mode) is the only gate beyond the
-// per-market risk caps (daily_loss_bps, max_notional, pending_cap,
-// mark_max_age_ms).
+// per-market risk caps (daily_drawdown_bps, max_notional_sats,
+// pending_cap, mark_max_age_ms — the first two denominated in satoshis
+// per WM-NUMERAIRE-1).
 // Operator-side halt is /whenmoon manual, which flips every market into
 // MANUAL mode and short-circuits the real-submit path.
 //
@@ -64,8 +65,10 @@ void wm_live_ws_resub_all(struct whenmoon_state *st,
 // Caller MUST hold `mk->lock`. Returns SUCCESS only when the order was
 // queued at the exchange abstraction; FAIL on gate trip, sizer hold,
 // OOM, or submit error (errbuf populated when non-NULL). FAIL leaves
-// no pending row. Gate cascade: credentials, daily_loss_bps,
-// pending-cap, max-notional clip, mark staleness.
+// no pending row. Gate cascade: credentials, daily satoshi drawdown,
+// pending-cap, per-order satoshi cap (clips the qty; refuses outright
+// when the market has no bitcoin leg to convert against), mark
+// staleness.
 //
 // OBS-62: `px_named` says the price came from the operator rather than
 // from a mark this plugin inferred (a force-trade's explicit px), and
@@ -77,17 +80,18 @@ bool wm_market_engine_real_submit_locked(whenmoon_market_t *mk,
     const wm_strategy_signal_t *sig, bool px_named,
     char *errbuf, size_t errbuf_sz);
 
-// WM-DISC-1: discretionary-treasury freeze tripwire (CFO.md sec. 3).
-// Called after a fill is recorded and the fill path's locks are
-// released: real exchange fills (record_external_fill) and synth-mode
-// operator force trades (the market force verb). Reads
-// plugin.whenmoon.disc.* fresh; no-op until the fund is configured
-// (deposit_usd, freeze_frac, markets all set) and the filled market is
-// designated. Equity reads each designated market's book by its mode
-// (PAPER -> paper book, REAL/MANUAL -> real book). On breach flips
+// WM-NUMERAIRE-1: treasury freeze tripwire (CFO.md sec. 3). Called
+// after a fill is recorded and the fill path's locks are released: real
+// exchange fills (record_external_fill) and synth-mode operator force
+// trades (the market force verb). Reads plugin.whenmoon.treasury.*
+// fresh; no-op until the fund is configured (baseline_sats,
+// freeze_frac, markets all set) and the filled market is designated.
+// The fund's size is summed in SATOSHIS, each designated market's book
+// chosen by its mode (PAPER -> paper book, REAL/MANUAL -> real book),
+// so a bitcoin price move cannot breach the floor. On breach flips
 // every designated market to MANUAL (positions kept) and emits one
-// DISC-FREEZE CLAM_WARN.
-void wm_live_disc_freeze_check(const char *filled_market_id_str);
+// TREASURY-FREEZE CLAM_WARN.
+void wm_live_treasury_freeze_check(const char *filled_market_id_str);
 
 #endif // WHENMOON_INTERNAL
 

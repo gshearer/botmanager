@@ -14,6 +14,7 @@
 #include "live.h"
 #include "market.h"
 #include "market_persist.h"
+#include "numeraire.h"
 #include "whenmoon.h"
 #include "whenmoon_strategy.h"
 
@@ -180,8 +181,8 @@ wm_market_session_refresh_kv(whenmoon_market_t *mk)
   double   fee_bps;
   double   slip_bps;
   double   size_frac;
-  double   max_notional;
-  double   daily_loss_bps;
+  double   max_notional_sats;
+  double   daily_drawdown_bps;
 
   if(mk == NULL)
     return;
@@ -209,15 +210,22 @@ wm_market_session_refresh_kv(whenmoon_market_t *mk)
       "Default sizer fraction. Strategy advisors may override; force-"
       "trades take an explicit qty and ignore this knob.");
 
-  max_notional = wm_mk_kv_get_double(mk->market_id_str, "max_notional",
-      "0.0", WM_MARKET_DEFAULT_MAX_NOTIONAL,
-      "Real-mode per-order notional cap (quote currency). 0 = uncapped.");
+  max_notional_sats = wm_mk_kv_get_double(mk->market_id_str,
+      "max_notional_sats", "0.0", WM_MARKET_DEFAULT_MAX_NOTIONAL_SATS,
+      "Real-mode per-order cap in SATOSHIS (WM-NUMERAIRE-1), converted"
+      " to a quote notional at this market's own mark on every submit."
+      " 0 = uncapped. A market with no bitcoin leg (eth-usd) cannot"
+      " make that conversion and REFUSES every real submit while this"
+      " is armed — arm it on a btc-quoted or btc-based market.");
 
-  daily_loss_bps = wm_mk_kv_get_double(mk->market_id_str,
-      "daily_loss_bps", "200.0", WM_MARKET_DEFAULT_DAILY_LOSS_BPS,
-      "Real-mode daily realized-loss cap, basis points of starting"
-      " cash. Real-mode signals FAIL closed once realized PnL since"
-      " the day-anchor breaches -starting_cash * bps/10000.");
+  daily_drawdown_bps = wm_mk_kv_get_double(mk->market_id_str,
+      "daily_drawdown_bps", "200.0", WM_MARKET_DEFAULT_DAILY_DRAWDOWN_BPS,
+      "Real-mode daily drawdown cap, basis points of the day-opening"
+      " SATOSHI stack (WM-NUMERAIRE-1). Real-mode signals FAIL closed"
+      " once the book's stack falls that far below where the day began."
+      " Measured in the office's numeraire, so a bitcoin price move"
+      " does not trip it — only a deviation that lost satoshis does."
+      " 0 disables; same no-bitcoin-leg refusal as max_notional_sats.");
 
   pending_cap = wm_mk_kv_get_uint(mk->market_id_str, "pending_cap",
       "8", WM_MARKET_DEFAULT_PENDING_CAP,
@@ -289,12 +297,12 @@ wm_market_session_refresh_kv(whenmoon_market_t *mk)
       mk->session.stats[i].cash = starting_cash;
   }
 
-  mk->session.fee_bps        = fee_bps;
-  mk->session.slip_bps       = slip_bps;
-  mk->session.size_frac      = size_frac;
-  mk->session.max_notional   = max_notional;
-  mk->session.daily_loss_bps = daily_loss_bps;
-  mk->session.pending_cap    = (uint32_t)pending_cap;
+  mk->session.fee_bps            = fee_bps;
+  mk->session.slip_bps           = slip_bps;
+  mk->session.size_frac          = size_frac;
+  mk->session.max_notional_sats  = max_notional_sats;
+  mk->session.daily_drawdown_bps = daily_drawdown_bps;
+  mk->session.pending_cap        = (uint32_t)pending_cap;
 
   pthread_mutex_unlock(&mk->lock);
 }
@@ -309,9 +317,9 @@ wm_mk_utc_day_floor_ms(int64_t ts_ms)
   return((ts_ms / 86400000LL) * 86400000LL);
 }
 
-// Roll the per-mode daily PnL accumulator on UTC midnight. Caller
-// holds mk->lock. Idempotent — first call after midnight resets
-// realized_pnl_today; same-day calls are no-ops.
+// Roll the per-mode daily accumulators on UTC midnight. Caller holds
+// mk->lock. Idempotent — the first call after midnight resets today's
+// realized PnL and clears the satoshi anchor; same-day calls are no-ops.
 static void
 wm_mk_roll_daily_anchor_locked(wm_market_stats_t *st, int64_t ts_ms)
 {
@@ -326,7 +334,117 @@ wm_mk_roll_daily_anchor_locked(wm_market_stats_t *st, int64_t ts_ms)
   {
     st->daily_anchor_ms     = today_floor;
     st->realized_pnl_today  = 0.0;
+    st->stack_anchor_sats   = 0.0;
   }
+}
+
+// ------------------------------------------------------------------ //
+// WM-NUMERAIRE-1: the office's unit, at the risk gates               //
+// ------------------------------------------------------------------ //
+
+// The freshest price this market can value a book at. `last_mark_px` is
+// only stamped by a signal or a fill, so a market that has ticks but has
+// never traded carries 0 there while `last_px` is live — and its cash is
+// still worth satoshis. Preferring the mark keeps a valuation consistent
+// with the ledger that produced it; falling back to the ticker is what
+// stops an idle designated market dropping out of the treasury stack on
+// every fill elsewhere in the fund. 0 means this market has seen no
+// price at all, and callers must refuse rather than invent one.
+double
+wm_market_valuation_px_locked(const whenmoon_market_t *mk)
+{
+  if(mk == NULL)
+    return(0.0);
+
+  return(mk->session.last_mark_px > 0.0 ? mk->session.last_mark_px
+                                        : mk->last_px);
+}
+
+bool
+wm_market_stack_sats_locked(const whenmoon_market_t *mk,
+    wm_market_mode_t mode, double mark_px, double *out_sats)
+{
+  const wm_market_stats_t *st;
+  double                   pos;
+
+  if(mk == NULL || out_sats == NULL)
+    return(false);
+
+  st  = &mk->session.stats[mode];
+  pos = (mk->session.position.side == WM_MARKET_POS_LONG)
+      ? mk->session.position.qty
+      : 0.0;
+
+  return(wm_numeraire_stack_sats(wm_numeraire_leg(mk->product_id),
+      mark_px, st->cash, pos, out_sats));
+}
+
+// Gate 2 of the real-submit cascade. Two conditions refuse and both are
+// the same answer to the caller — do not place this order — so they
+// share a return and differ only in `why`:
+//
+//   - the day's satoshi stack has fallen `daily_drawdown_bps` below
+//     where the day opened;
+//   - the stack cannot be computed at all, because this market has no
+//     bitcoin leg or has never seen a mark. That is a REFUSAL, not a
+//     pass: an armed control that cannot measure its subject has
+//     stopped controlling, and the fix is one KV edit.
+//
+// The anchor is stamped lazily on first evaluation after a roll rather
+// than written at midnight, because nothing runs at midnight — the day
+// opens whenever this market is next asked to act. It is not persisted
+// here (a DB write per submit is not worth it); a restart re-stamps and
+// the day's measurement restarts with it.
+bool
+wm_market_daily_drawdown_tripped_locked(whenmoon_market_t *mk,
+    double mark_px, int64_t now_ms, char *why, size_t why_sz)
+{
+  wm_market_stats_t *st;
+  double             stack;
+  double             floor_sats;
+
+  if(mk == NULL || why == NULL || why_sz == 0)
+    return(true);
+
+  why[0] = '\0';
+
+  if(mk->session.daily_drawdown_bps <= 0.0)
+    return(false);
+
+  st = &mk->session.stats[WM_MARKET_MODE_REAL];
+
+  wm_mk_roll_daily_anchor_locked(st, now_ms);
+
+  if(!wm_market_stack_sats_locked(mk, WM_MARKET_MODE_REAL, mark_px,
+      &stack))
+  {
+    snprintf(why, why_sz,
+        "daily drawdown cap armed (%.1f bps) but %s cannot be priced in"
+        " satoshis (product %s, mark %.4f)",
+        mk->session.daily_drawdown_bps, mk->market_id_str,
+        mk->product_id, mark_px);
+    return(true);
+  }
+
+  if(st->stack_anchor_sats <= 0.0)
+  {
+    st->stack_anchor_sats = stack;
+    return(false);
+  }
+
+  floor_sats = st->stack_anchor_sats
+      * (1.0 - mk->session.daily_drawdown_bps / 10000.0);
+
+  if(stack > floor_sats)
+    return(false);
+
+  snprintf(why, why_sz,
+      "daily drawdown cap tripped: stack %.0f sats <= floor %.0f"
+      " (day open %.0f, cap %.1f bps)",
+      stack, floor_sats, st->stack_anchor_sats,
+      mk->session.daily_drawdown_bps);
+
+  return(true);
 }
 
 // ------------------------------------------------------------------ //
@@ -736,7 +854,7 @@ wm_market_apply_fill_locked(whenmoon_market_t *mk, wm_market_mode_t mode,
 
     // WM-BREAKER-1: paper-mode drawdown circuit breaker. A bleeding
     // paper strategy otherwise runs until a human notices — the only
-    // automated brake before this was real-mode daily_loss_bps. Flip
+    // automated brake before this was real-mode daily_drawdown_bps. Flip
     // to MANUAL (position kept — same semantics as `/whenmoon
     // manual`; flatten or resume is the operator's call) and alert.
     // Synthetic backtest markets are exempt: research runs must ride
@@ -1278,10 +1396,10 @@ wm_market_engine_record_external_fill(const char *market_id_str,
   pthread_mutex_unlock(&mk->lock);
   pthread_rwlock_unlock(&st->markets->arr_lock);
 
-  // WM-DISC-1 A3: evaluate the discretionary-fund tripwire now that
+  // WM-NUMERAIRE-1: evaluate the treasury tripwire now that
   // this fill's locks are down — the checker re-walks the designated
   // markets one lock at a time.
-  wm_live_disc_freeze_check(market_id_str);
+  wm_live_treasury_freeze_check(market_id_str);
 
   // Outside the lock: never hold mk->lock across the async submit (it
   // can re-enter clam/registry paths — see the clam-reentry deadlock

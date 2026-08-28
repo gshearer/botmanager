@@ -348,6 +348,8 @@ wm_mp_json_one_stats(wm_mp_buf_t *out, const wm_market_stats_t *st)
   wm_mp_buf_printf(out, "%.10g", st->realized_pnl_today);
   wm_mp_buf_puts(out, ",\"daily_anchor_ms\":");
   wm_mp_buf_printf(out, "%" PRId64, st->daily_anchor_ms);
+  wm_mp_buf_puts(out, ",\"stack_anchor_sats\":");
+  wm_mp_buf_printf(out, "%.10g", st->stack_anchor_sats);
   wm_mp_buf_puts(out, ",\"lifetime_fees\":");
   wm_mp_buf_printf(out, "%.10g", st->lifetime_fees);
   wm_mp_buf_puts(out, ",\"lifetime_fills_count\":");
@@ -456,7 +458,8 @@ wm_mp_build_upsert_locked(const whenmoon_market_t *mk)
       " last_mark_px, last_mark_ms, last_signal, has_last_signal,"
       " fills_n_paper, fills_head_paper,"
       " fills_n_real, fills_head_real,"
-      " fee_bps, slip_bps, size_frac, max_notional, daily_loss_bps,"
+      " fee_bps, slip_bps, size_frac, max_notional_sats,"
+      " daily_drawdown_bps,"
       " pending_cap, pending_n)"
       " VALUES (");
 
@@ -495,8 +498,8 @@ wm_mp_build_upsert_locked(const whenmoon_market_t *mk)
   wm_mp_buf_printf(&sql, "%.10g,", s->fee_bps);
   wm_mp_buf_printf(&sql, "%.10g,", s->slip_bps);
   wm_mp_buf_printf(&sql, "%.10g,", s->size_frac);
-  wm_mp_buf_printf(&sql, "%.10g,", s->max_notional);
-  wm_mp_buf_printf(&sql, "%.10g,", s->daily_loss_bps);
+  wm_mp_buf_printf(&sql, "%.10g,", s->max_notional_sats);
+  wm_mp_buf_printf(&sql, "%.10g,", s->daily_drawdown_bps);
   wm_mp_buf_printf(&sql, "%u,",    s->pending_cap);
   wm_mp_buf_printf(&sql, "%u",     s->pending_n);
 
@@ -523,8 +526,8 @@ wm_mp_build_upsert_locked(const whenmoon_market_t *mk)
       " fee_bps = EXCLUDED.fee_bps,"
       " slip_bps = EXCLUDED.slip_bps,"
       " size_frac = EXCLUDED.size_frac,"
-      " max_notional = EXCLUDED.max_notional,"
-      " daily_loss_bps = EXCLUDED.daily_loss_bps,"
+      " max_notional_sats = EXCLUDED.max_notional_sats,"
+      " daily_drawdown_bps = EXCLUDED.daily_drawdown_bps,"
       " pending_cap = EXCLUDED.pending_cap,"
       " pending_n = EXCLUDED.pending_n,"
       " updated_at = NOW()");
@@ -860,6 +863,7 @@ wm_mp_load_stats(struct json_object *obj, wm_market_stats_t *out)
   out->realized_pnl_lifetime = wm_mp_jdouble(obj, "realized_pnl_lifetime", 0.0);
   out->realized_pnl_today    = wm_mp_jdouble(obj, "realized_pnl_today",    0.0);
   out->daily_anchor_ms       = wm_mp_jint64 (obj, "daily_anchor_ms",       0);
+  out->stack_anchor_sats     = wm_mp_jdouble(obj, "stack_anchor_sats",     0.0);
   out->lifetime_fees         = wm_mp_jdouble(obj, "lifetime_fees",         0.0);
   out->lifetime_fills_count  = (uint64_t)wm_mp_jint64(obj,
       "lifetime_fills_count", 0);
@@ -1060,8 +1064,8 @@ wm_market_persist_restore_all(whenmoon_state_t *st)
          " last_signal::text, has_last_signal,"
          " fills_n_paper, fills_head_paper,"
          " fills_n_real, fills_head_real,"
-         " fee_bps, slip_bps, size_frac, max_notional,"
-         " daily_loss_bps, pending_cap, pending_n,"
+         " fee_bps, slip_bps, size_frac, max_notional_sats,"
+         " daily_drawdown_bps, pending_cap, pending_n,"
          " instance"   // WM-MI-2: col 26, matched against mk->instance
          "  FROM wm_market_state", res) != SUCCESS || !res->ok)
   {
@@ -1200,10 +1204,10 @@ wm_market_persist_restore_all(whenmoon_state_t *st)
     if(cell != NULL) mk->session.size_frac = strtod(cell, NULL);
 
     cell = db_result_get(res, i, 22);
-    if(cell != NULL) mk->session.max_notional = strtod(cell, NULL);
+    if(cell != NULL) mk->session.max_notional_sats = strtod(cell, NULL);
 
     cell = db_result_get(res, i, 23);
-    if(cell != NULL) mk->session.daily_loss_bps = strtod(cell, NULL);
+    if(cell != NULL) mk->session.daily_drawdown_bps = strtod(cell, NULL);
 
     cell = db_result_get(res, i, 24);
     if(cell != NULL) mk->session.pending_cap = (uint32_t)strtoul(cell, NULL, 10);

@@ -103,13 +103,41 @@ void wm_market_session_refresh_kv(whenmoon_market_t *mk);
 //      per-market real `cash` ledger to a fraction of, and/or an absolute
 //      ceiling on, the shared quote `available` (most-restrictive wins).
 //      Applied inside wm_live_apply_real_cash_locked at reconcile time, to
-//      both cash and (on a baseline re-anchor) starting_cash — so the
-//      daily-loss cap is relative to allocated capital, not the full
-//      balance.
-//   2. size_frac    sizes each order as a fraction of that capped cash.
-//   3. max_notional caps the resulting per-order notional.
+//      both cash and (on a baseline re-anchor) starting_cash.
+//      ⭑ These two stay in QUOTE currency under WM-NUMERAIRE-1, and
+//      deliberately: they divide up one shared quote balance between the
+//      markets contending for it, so the shared resource is the honest
+//      unit. Withholding bankroll can only decline a purchase — it can
+//      never force a sale — so the defect that put every other cap into
+//      satoshis does not reach them, and quote_alloc_frac already gives
+//      a unit-free lever for the same intent.
+//   2. size_frac         sizes each order as a fraction of that capped cash.
+//   3. max_notional_sats caps the per-order notional, in SATOSHIS, converted
+//      at this market's own mark (WM-NUMERAIRE-1).
 double wm_mk_kv_get_double(const char *market_id_str, const char *suffix,
     const char *def_str, double def_val, const char *help);
+
+// The freshest price this market can value a book at: `last_mark_px`
+// when a signal or fill has stamped one, else the last ticker price. 0
+// when this market has seen no price at all — refuse, never substitute.
+// Caller holds mk->lock.
+double wm_market_valuation_px_locked(const whenmoon_market_t *mk);
+
+// WM-NUMERAIRE-1: this book expressed in the office's unit of account —
+// its bitcoin leg plus its other leg marked at `mark_px`. False when the
+// market has no bitcoin leg, or has a leg to mark and no usable mark;
+// `*out_sats` is then untouched and the caller must refuse rather than
+// substitute a rate. Caller holds mk->lock.
+bool wm_market_stack_sats_locked(const whenmoon_market_t *mk,
+    wm_market_mode_t mode, double mark_px, double *out_sats);
+
+// True when a real submit must be refused: either the day's satoshi
+// stack has fallen daily_drawdown_bps below the day's opening stack, or
+// the stack is not computable while the cap is armed. `why` (non-NULL,
+// non-empty) carries which. Stamps the day's anchor on first evaluation
+// after a UTC roll. Caller holds mk->lock.
+bool wm_market_daily_drawdown_tripped_locked(whenmoon_market_t *mk,
+    double mark_px, int64_t now_ms, char *why, size_t why_sz);
 
 // OBS-62: this market's mark-staleness bound in ms, read fresh (0 =
 // the operator disabled the gate). Declared in

@@ -555,7 +555,8 @@ whenmoon_init(void)
   }
 
   // Real-mode per-market submit path. Per-market risk caps
-  // (daily_loss_bps, pending-cap, max-notional) gate the cascade;
+  // (daily satoshi drawdown, pending-cap, per-order satoshi cap)
+  // gate the cascade;
   // operator halt is /whenmoon manual which flips every market into
   // MANUAL mode and short-circuits the submit path on the next signal.
   if(wm_live_engine_init() != SUCCESS)

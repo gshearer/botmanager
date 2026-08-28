@@ -537,12 +537,12 @@ wm_market_session_init(wm_market_session_t *s)
     s->stats[i].daily_anchor_ms = 0;
   }
 
-  s->fee_bps        = WM_MARKET_DEFAULT_FEE_BPS;
-  s->slip_bps       = WM_MARKET_DEFAULT_SLIP_BPS;
-  s->size_frac      = WM_MARKET_DEFAULT_SIZE_FRAC;
-  s->max_notional   = WM_MARKET_DEFAULT_MAX_NOTIONAL;
-  s->daily_loss_bps = WM_MARKET_DEFAULT_DAILY_LOSS_BPS;
-  s->pending_cap    = WM_MARKET_DEFAULT_PENDING_CAP;
+  s->fee_bps            = WM_MARKET_DEFAULT_FEE_BPS;
+  s->slip_bps           = WM_MARKET_DEFAULT_SLIP_BPS;
+  s->size_frac          = WM_MARKET_DEFAULT_SIZE_FRAC;
+  s->max_notional_sats  = WM_MARKET_DEFAULT_MAX_NOTIONAL_SATS;
+  s->daily_drawdown_bps = WM_MARKET_DEFAULT_DAILY_DRAWDOWN_BPS;
+  s->pending_cap        = WM_MARKET_DEFAULT_PENDING_CAP;
 }
 
 // WM-MKT-ARR-UAF-1: LOCK-FREE. The caller MUST hold
@@ -657,12 +657,12 @@ wm_market_session_snapshot(whenmoon_market_t *mk,
   out->last_ticker_px = mk->last_px;
   out->last_ticker_ms = mk->last_tick_ms;
 
-  out->fee_bps        = s->fee_bps;
-  out->slip_bps       = s->slip_bps;
-  out->size_frac      = s->size_frac;
-  out->max_notional   = s->max_notional;
-  out->daily_loss_bps = s->daily_loss_bps;
-  out->pending_cap    = s->pending_cap;
+  out->fee_bps            = s->fee_bps;
+  out->slip_bps           = s->slip_bps;
+  out->size_frac          = s->size_frac;
+  out->max_notional_sats  = s->max_notional_sats;
+  out->daily_drawdown_bps = s->daily_drawdown_bps;
+  out->pending_cap        = s->pending_cap;
 
   // WM-MK-6: pre-compute risk-adjusted metrics under the lock so
   // off-lock renderers + sweep scoring read scalars instead of
