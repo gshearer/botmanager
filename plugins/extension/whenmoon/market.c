@@ -1184,6 +1184,20 @@ wm_market_on_event(const exchange_ws_event_t *ev, void *user)
         mk->last_px      = t->price;
         mk->last_tick_ms = t->time_ms;
         mk->last_feed_ms = recv_ms;
+
+        // WM-MAKER-REST-1: keep the touch, but only when the driver
+        // published one. `exchange_ws_ticker_t` guarantees `price` and
+        // nothing else — a driver with no ticker channel synthesizes
+        // price from trades and leaves these 0, and 0 is "no book", not
+        // "free". Stamping last_book_ms only beside a real quote is what
+        // lets the submit gate tell a stale book from an absent one.
+        if(t->best_bid > 0.0 && t->best_ask > 0.0)
+        {
+          mk->last_bid_px  = t->best_bid;
+          mk->last_ask_px  = t->best_ask;
+          mk->last_book_ms = recv_ms;
+        }
+
         pthread_mutex_unlock(&mk->lock);
       }
       pthread_rwlock_unlock(&st->markets->arr_lock);

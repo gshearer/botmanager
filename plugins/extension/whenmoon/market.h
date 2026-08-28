@@ -428,6 +428,24 @@ typedef struct whenmoon_market
   // claim a strategy sets for itself. Transient, and an append-only
   // field per the WM-MK-2 discipline. 0 = nothing observed yet.
   int64_t               last_feed_ms;
+
+  // WM-MAKER-REST-1: top of book as of the last TICKER event, with its
+  // own arrival stamp. A resting (post_only) order is priced at the
+  // touch and never at `last_px` — the last TRADE — because an order
+  // posted at the last trade crosses roughly half the time and the venue
+  // then refuses it, which is why post_only shipped disarmed.
+  //
+  // `last_feed_ms` above cannot serve as the freshness stamp for these:
+  // it is advanced by trade events too, and a trade carries no book, so
+  // a market seeing only trades would pass a staleness gate while
+  // holding a book from minutes ago. Stamped only alongside a quote the
+  // driver actually published — `exchange_ws_ticker_t` declares
+  // best_bid/best_ask but only guarantees `price`, and a driver with no
+  // ticker channel (gemini MD v2) leaves them 0. 0 = no book observed.
+  // Transient, and append-only per the WM-MK-2 discipline.
+  double                last_bid_px;
+  double                last_ask_px;
+  int64_t               last_book_ms;
 } whenmoon_market_t;
 
 struct whenmoon_markets

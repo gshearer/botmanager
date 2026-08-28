@@ -364,8 +364,10 @@ wm_market_engine_real_submit_locked(whenmoon_market_t *mk,
   wm_market_pending_t        *pending;
   char                        why[192];
   double                      clipped_qty;
+  double                      limit_px;
   int64_t                     mark_max_age_ms;
   int64_t                     mark_age_ms;
+  int64_t                     book_age_ms;
   const char                 *side_str;
   bool                        is_buy;
   bool                        post_only;
@@ -534,6 +536,67 @@ wm_market_engine_real_submit_locked(whenmoon_market_t *mk,
   // per-market keys carry NULL change-callbacks, so a KV read here can
   // never re-enter market code.
   post_only = wm_mk_post_only(mk);
+  limit_px  = mark_px;
+
+  // Gate 6 (WM-MAKER-REST-1): a resting order is priced at the TOUCH.
+  // Every gate above asks whether we may trade; this one asks at what
+  // price a maker order can actually rest.
+  //
+  // `mark_px` is the last TRADE. An order posted there crosses about
+  // half the time, the venue refuses it as post-only, the done callback
+  // reaps the pending row, and nothing reprices — which is exactly why
+  // post_only shipped disarmed. Resting on our own side of the book
+  // cannot cross by construction: a buy joins the bid, a sell the ask.
+  //
+  // ⛔ A missing or stale book REFUSES the submit. It must never fall
+  // back to `mark_px` — that silent fallback IS the defect this gate
+  // removes, and it would reintroduce it precisely when the feed is
+  // least trustworthy. A check that could not complete denies.
+  //
+  // Not chasing a rejection is deliberate, not an omission: a post-only
+  // refusal means the book moved through our price, and repricing to
+  // follow it is what turns a maker strategy into a taker strategy with
+  // extra steps — at 120 against 60 bps that is the whole edge. If
+  // rejections prove common once measured, that buys a bounded retry.
+  //
+  // `px_named` keeps the operator's price: they priced that order, and
+  // an operator naming a limit has already chosen where it rests.
+  if(post_only && !px_named)
+  {
+    double touch = is_buy ? mk->last_bid_px : mk->last_ask_px;
+
+    if(mk->last_book_ms == 0 || touch <= 0.0)
+    {
+      ERRSET("post_only armed but no top of book seen on %s"
+          " (driver publishes no ticker book?)", mk->market_id_str);
+      clam(CLAM_WARN, WM_LIVE_CTX,
+          "%s real submit FAIL: post_only armed, no book to rest on",
+          mk->market_id_str);
+      return(FAIL);
+    }
+
+    book_age_ms = wm_now_ms() - mk->last_book_ms;
+
+    if(mark_max_age_ms > 0 && book_age_ms > mark_max_age_ms)
+    {
+      ERRSET("post_only armed but book stale: top of book %lldms ago,"
+          " bound %lldms", (long long)book_age_ms,
+          (long long)mark_max_age_ms);
+      clam(CLAM_WARN, WM_LIVE_CTX,
+          "%s real submit FAIL: post_only armed, book %lldms old >"
+          " mark_max_age_ms %lldms",
+          mk->market_id_str, (long long)book_age_ms,
+          (long long)mark_max_age_ms);
+      return(FAIL);
+    }
+
+    limit_px = touch;
+
+    clam(CLAM_INFO, WM_LIVE_CTX,
+        "%s resting %s at the touch %.8g (mark %.8g, book %lldms old)",
+        mk->market_id_str, side_str, limit_px, mark_px,
+        (long long)book_age_ms);
+  }
 
   {
     char coid[EXCHANGE_CLIENT_OID_SZ];
@@ -545,7 +608,7 @@ wm_market_engine_real_submit_locked(whenmoon_market_t *mk,
     }
 
     wm_live_build_place_order_req(&req, mk->product_id, side_str,
-        clipped_qty, mark_px, coid, post_only);
+        clipped_qty, limit_px, coid, post_only);
 
     // Append the pending row BEFORE the async call so a synchronous-
     // FAIL done_cb finds it. The done_cb owns the post-fail reap.
@@ -554,7 +617,7 @@ wm_market_engine_real_submit_locked(whenmoon_market_t *mk,
 
     snprintf(pending->coid, sizeof(pending->coid), "%s", coid);
     snprintf(pending->side, sizeof(pending->side), "%s", side_str);
-    pending->limit_px      = mark_px;
+    pending->limit_px      = limit_px;
     pending->submitted_qty = clipped_qty;
     pending->submitted_ms  = mark_ms;
 
