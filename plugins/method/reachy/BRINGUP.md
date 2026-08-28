@@ -482,9 +482,11 @@ build/tools/botmanctl "say <bot> voice the mouth is wired to the brain"
 ```
 
 That last line is the **mouth-only rig**: it drives `method_send` without
-needing the ear, the brain or a human. ⚠ It reports **`send failed` even when
-the line is spoken perfectly** — that is the `SUCCESS == false` trap in the
-`say` command, not a robot fault. The truth is `/tmp/botman.log`: look for
+needing the ear, the brain or a human. ⭑ It used to report **`send failed`
+even when the line was spoken perfectly** — the `SUCCESS == false` trap in
+`say`, fixed 2026-08-27 (`e26bf3c`), so `sent:` now means sent and
+`send failed:` now means failed. On a daemon older than that commit, read it
+inverted. Either way the truth is `/tmp/botman.log`: look for
 `reachy … says "…" (… tts N ms, upload N ms, play N ms)`.
 
 Then speak to the robot and confirm the transcript reaches the brain in the
