@@ -1111,7 +1111,13 @@ wm_bt_sweep_run_one(wm_bt_pool_t *pool, uint32_t iter,
   memset(result, 0, sizeof(*result));
   memcpy(result->indices, indices,
       sizeof(result->indices[0]) * pool->plan->n_axes);
-  result->score = WM_BT_RESULT_NOSCORE;
+
+  // Both scores start unavailable, so a row that returns on any of the
+  // failure paths below carries "no answer" rather than a zero — and a
+  // zero here would read as "matched the hold exactly", which is a real
+  // and interesting result that this row did not earn.
+  result->score     = WM_BT_RESULT_NOSCORE;
+  result->sat_score = WM_BT_RESULT_NOSCORE;
 
   // Allocate the synthetic id BEFORE any KV writes so the writer
   // already has its addressable scope.
