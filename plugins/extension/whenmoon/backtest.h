@@ -237,6 +237,17 @@ typedef struct wm_backtest_result
   // NULL/0 otherwise.
   wm_bt_equity_pt_t            *equity;
   uint32_t                      n_equity;
+
+  // WM-INSTR-1: the price the terminal book was marked at — the close
+  // of the LAST 1m bar inside the run's windows, which is the same bar
+  // wm_bt_bench_return draws its exit close from. `trade`'s session
+  // mark is stamped from it, so every reader of
+  // `cash + qty x last_mark_px` values an open position at the end of
+  // the tape rather than at the entry that opened it. 0 when the run
+  // walked no in-window 1m bar; the mark is then left where the engine
+  // put it and terminal equity is a per-fill sample again.
+  double                        final_mark_px;
+  int64_t                       final_mark_ms;
 } wm_backtest_result_t;
 
 // ----------------------------------------------------------------------- //
@@ -284,6 +295,32 @@ void wm_backtest_snapshot_free(wm_backtest_snapshot_t *snap);
 // price (*out untouched).
 bool wm_bt_bench_return(const wm_backtest_snapshot_t *snap,
     const wm_bt_window_t *win, double *out);
+
+// End-of-run account equity from a session snapshot: PAPER cash plus
+// the open long marked at `last_mark_px`. The ONE place a snapshot
+// becomes a number — the report renderers, the sweep's score selector
+// and the walk-forward per-fold post-pass all come here, because when
+// this arithmetic lived in three copies a stale mark was wrong in three
+// places and visible in none (WM-INSTR-1). What `last_mark_px` means at
+// the end of a backtest is settled by wm_backtest_run_iteration_with_id,
+// which stamps the terminal bar's close over the last fill price.
+double wm_bt_compute_equity(const wm_market_session_snapshot_t *snap);
+
+// WM-INSTR-1: the compounded buy-and-hold GROWTH RATIO (final/initial,
+// not a return) over a run's whole window set — the product of
+// (1 + wm_bt_bench_return) across each window, or over the whole
+// snapshot when n_windows == 0. It is the denominator of a satoshi
+// score: the benchmark is holding the asset and holding is free, so a
+// book is measured in units of the asset rather than of cash.
+// FAIL when any window fails to price (*out untouched); a ratio is
+// otherwise always positive, since wm_bt_bench_return refuses a
+// non-positive boundary close.
+// A multi-window (walk-forward) ratio compounds only the in-window
+// stretches, matching a book that trades only inside them — but the
+// book itself carries a position across the train gaps between them,
+// so the two are exactly comparable only on a single-window run.
+bool wm_bt_bench_ratio(const wm_backtest_snapshot_t *snap,
+    const wm_bt_window_t *windows, uint32_t n_windows, double *out);
 
 // ----------------------------------------------------------------------- //
 // Iteration                                                               //

@@ -993,7 +993,7 @@ wm_bt_cmd_run(const cmd_ctx_t *ctx)
         " [<name>=<v|[v,...]|lo:step:hi>] (repeatable)"
         " [--fee-bps N] [--slip-bps N] [--size-frac F] [--cash N]"
         " [--config <path.json>] [--threads N]"
-        " [--rank-by realized|sharpe|sortino|equity|pf]"
+        " [--rank-by realized|sharpe|sortino|equity|pf|sat]"
         " [--top-n K] [--perfold-top N]"
         " [--walk-forward train=Td:test=Md:step=Sd]"
         " [--oos-tail PCT]"
@@ -1166,7 +1166,7 @@ wm_bt_cmd_run(const cmd_ctx_t *ctx)
         {
           cmd_reply(ctx,
               "bad --rank-by"
-              " (expected realized|sharpe|sortino|equity|pf)");
+              " (expected realized|sharpe|sortino|equity|pf|sat)");
           wm_backtest_snapshot_free(snap);
           return;
         }
@@ -2220,7 +2220,7 @@ static const cmd_decl_t whenmoon_backtest_run_decl = {
                  " [<name>=<v|[v,...]|lo:step:hi>] (repeatable)"
                  " [--fee-bps N] [--slip-bps N] [--size-frac F] [--cash N]"
                  " [--config <path.json>] [--threads N]"
-                 " [--rank-by realized|sharpe|sortino|equity|pf]"
+                 " [--rank-by realized|sharpe|sortino|equity|pf|sat]"
                  " [--top-n K] [--perfold-top N]"
                  " [--walk-forward train=Td:test=Md:step=Sd]"
                  " [--oos-tail PCT]"
@@ -2229,6 +2229,10 @@ static const cmd_decl_t whenmoon_backtest_run_decl = {
   .description = "Run a backtest against a compiled .wm snapshot — single"
                  " iteration, parameter sweep, walk-forward, or OOS-tail"
                  " validation.",
+  // ⚠ This literal sits AT the 4,095-byte ceiling C99 obliges an
+  // implementation to support, and -Wpedantic says so. Anything added
+  // here has to be paid for by trimming something else; it is one
+  // literal, so it cannot be split across statements.
   .help_long   =
       "mmap's the .wm file (compiled via /whenmoon backtest compile)"
       " and walks the strategy through a paper trade book. Range +"
@@ -2250,7 +2254,9 @@ static const cmd_decl_t whenmoon_backtest_run_decl = {
       " shaped {\"params\": {\"name\": <scalar|list|{start,step,end}>,"
       " ...}}. Inline `name=value` axes override matching entries"
       " loaded from --config, regardless of argv order.\n"
-      "--rank-by selects the ranking metric (default realized).\n"
+      "--rank-by selects the ranking metric (default realized); `sat`"
+      " is the satoshi score — terminal equity over the same window's"
+      " buy-and-hold, minus 1, so 0 means it merely held.\n"
       "--top-n caps the number of top rows shown after the run"
       " (default 20 when sweeping, 1 otherwise) and the number of"
       " rows the OOS post-pass validates.\n"
@@ -2288,23 +2294,21 @@ static const cmd_decl_t whenmoon_backtest_run_decl = {
       " plugin.whenmoon.backtest.report_path (defaulting to"
       " $HOME/.local/share/botmanager/backtests/) containing"
       " manifest.json, iterations.jsonl, top-N.txt, report.md, and"
-      " a charts/ subdir. Single-config runs also write equity.jsonl"
-      " (daily MTM marks) + fills.jsonl; every run's metrics carry"
-      " mtm_max_dd + daily_sharpe_ann from the same daily marks"
-      " (per-fill max_drawdown only observes fill days).\n"
+      " a charts/ subdir; single-config runs add equity.jsonl (daily"
+      " MTM marks) + fills.jsonl. Every metrics row carries"
+      " mtm_max_dd + daily_sharpe_ann from those daily marks"
+      " (per-fill max_drawdown only observes fill days), plus"
+      " sat_score, the bench_ratio it divided by, and the tape's"
+      " last close (final_mark_px) the book was valued at.\n"
       "--charts forces Lightweight Charts HTML emission for this"
       " run (default-off unless"
       " plugin.whenmoon.backtest.charts_enabled=true). SINGLE-CONFIG"
       " RUNS ONLY: charts are a per-trade analysis artifact, so a"
-      " parameter sweep skips them (it would emit trades x grains x"
-      " top-K files) and emits only the ranked metrics — re-run the"
-      " chosen config with no sweep axes to chart it. One file per"
-      " matched buy→sell trade pair, for EVERY grain the snapshot"
-      " carries (1m..1d), written to charts/trade-M-<gran>.html, so"
-      " the count is round-trip-trades x grains. An index.html landing"
-      " page is also written at the sweep root: summary cards, swept"
-      " args + metrics, and a per-trade P/L table whose rows link to"
-      " each trade's per-grain charts — open it first.",
+      " parameter sweep skips them — re-run the chosen config with no"
+      " sweep axes to chart it. One charts/trade-M-<gran>.html per"
+      " matched buy→sell pair per grain the snapshot carries (1m..1d)."
+      " Open the sweep root's index.html first: cards, args, metrics,"
+      " and a per-trade P/L table linking to each trade's charts.",
   .group       = USERNS_GROUP_ADMIN,
   .level       = 100,
   .scope       = CMD_SCOPE_ANY,

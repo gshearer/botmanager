@@ -32,7 +32,6 @@
 #include "strategy.h"
 #include "whenmoon.h"
 #include "whenmoon_strategy.h"
-#include "wm_bt_report.h"   // wm_bt_compute_equity (per-fold post-pass)
 
 #include "alloc.h"
 #include "clam.h"
@@ -93,6 +92,7 @@ wm_bt_sweep_score_parse(const char *tok, wm_bt_sweep_score_t *out)
   if(strcasecmp(tok, "sortino")  == 0) { *out = WM_BT_SCORE_SORTINO;       return(SUCCESS); }
   if(strcasecmp(tok, "equity")   == 0) { *out = WM_BT_SCORE_EQUITY;        return(SUCCESS); }
   if(strcasecmp(tok, "pf")       == 0) { *out = WM_BT_SCORE_PROFIT_FACTOR; return(SUCCESS); }
+  if(strcasecmp(tok, "sat")      == 0) { *out = WM_BT_SCORE_SAT;           return(SUCCESS); }
 
   return(FAIL);
 }
@@ -107,19 +107,37 @@ wm_bt_sweep_score_name(wm_bt_sweep_score_t s)
     case WM_BT_SCORE_SORTINO:       return("sortino");
     case WM_BT_SCORE_EQUITY:        return("equity");
     case WM_BT_SCORE_PROFIT_FACTOR: return("pf");
+    case WM_BT_SCORE_SAT:           return("sat");
   }
 
   return("?");
 }
 
 double
+wm_bt_sat_score(const wm_market_session_snapshot_t *snap, double bench_ratio)
+{
+  double start_cash;
+  double sat;
+
+  if(snap == NULL || !isfinite(bench_ratio) || bench_ratio <= 0.0)
+    return(WM_BT_RESULT_NOSCORE);
+
+  start_cash = snap->stats[WM_MARKET_MODE_PAPER].starting_cash;
+
+  if(!isfinite(start_cash) || start_cash <= 0.0)
+    return(WM_BT_RESULT_NOSCORE);
+
+  sat = wm_bt_compute_equity(snap) / start_cash / bench_ratio - 1.0;
+
+  return(isfinite(sat) ? sat : WM_BT_RESULT_NOSCORE);
+}
+
+double
 wm_bt_sweep_score_value(const wm_market_session_snapshot_t *snap,
-    wm_bt_sweep_score_t score)
+    wm_bt_sweep_score_t score, double bench_ratio)
 {
   const wm_market_stats_t *st;
   double                   v;
-  double                   equity;
-  double                   position_value;
 
   if(snap == NULL)
     return(WM_BT_RESULT_NOSCORE);
@@ -133,14 +151,15 @@ wm_bt_sweep_score_value(const wm_market_session_snapshot_t *snap,
       break;
 
     case WM_BT_SCORE_EQUITY:
-      // Match the legacy `wm_trade_snapshot_t.equity` shape:
-      // cash + position * mark.
-      position_value = (snap->position.side == WM_MARKET_POS_LONG)
-          ? snap->position.qty * snap->last_mark_px
-          : 0.0;
-      equity         = st->cash + position_value;
-      v              = equity;
+      v = wm_bt_compute_equity(snap);
       break;
+
+    // A zero-trade book is a real satoshi score and a bad one — it sat
+    // in cash while the asset moved — so this selector deliberately
+    // does NOT take the degenerate-to-NOSCORE exit the ratio metrics
+    // below take.
+    case WM_BT_SCORE_SAT:
+      return(wm_bt_sat_score(snap, bench_ratio));
 
     // WM-MK-6 restores Sharpe / Sortino / PF on top of the per-market
     // session: snapshot carries pre-computed Sharpe + Sortino from the
@@ -1064,31 +1083,18 @@ typedef struct
   const char                 *window_kind;
   uint32_t                    n_windows_per_iter;
 
+  // WM-INSTR-1: the buy-and-hold growth over `iter_windows`, resolved
+  // once at sweep start. It is a property of the tape, so every row
+  // divides by the same number and no row needs an equity curve to be
+  // scored in satoshis. bench_ok false = the tape could not price a
+  // window; every row's sat score is then NOSCORE.
+  double                      bench_ratio;
+  bool                        bench_ok;
+
   // Shared outputs: workers write into out_results[iter] only, no
   // collisions.
   wm_bt_sweep_result_t       *results;
 } wm_bt_pool_t;
-
-// Compute equity (cash + position * mark) from a synth-market snapshot
-// in PAPER mode. Mirrors the legacy `wm_trade_snapshot_t.equity` shape
-// so persist + render output stay consistent across the rip.
-static double
-wm_bt_synth_equity(const wm_market_session_snapshot_t *snap)
-{
-  const wm_market_stats_t *st;
-  double                   position_value;
-
-  if(snap == NULL)
-    return(0.0);
-
-  st = &snap->stats[WM_MARKET_MODE_PAPER];
-
-  position_value = (snap->position.side == WM_MARKET_POS_LONG)
-      ? snap->position.qty * snap->last_mark_px
-      : 0.0;
-
-  return(st->cash + position_value);
-}
 
 static void
 wm_bt_sweep_run_one(wm_bt_pool_t *pool, uint32_t iter,
@@ -1148,8 +1154,18 @@ wm_bt_sweep_run_one(wm_bt_pool_t *pool, uint32_t iter,
   result->bars_replayed = bt_result.bars_replayed;
   result->n_windows     = pool->n_windows_per_iter;
   result->score         = wm_bt_sweep_score_value(&bt_result.trade,
-      pool->plan->score);
+      pool->plan->score, pool->bench_ratio);
   result->run_id_db     = (int64_t)iter + 1;
+
+  // WM-INSTR-1: the satoshi score rides every row whether or not it is
+  // what the sweep ranked on, because it is the only score here that
+  // answers the question the treasury asks.
+  result->bench_ratio   = pool->bench_ratio;
+  result->bench_ok      = pool->bench_ok;
+  result->sat_score     = pool->bench_ok
+      ? wm_bt_sat_score(&bt_result.trade, pool->bench_ratio)
+      : WM_BT_RESULT_NOSCORE;
+  result->final_mark_px = bt_result.final_mark_px;
 
   // WM-BT-8: transfer ownership of the deep fills buffer to the result
   // row. wm_bt_cmd_run's post-pass loop walks the table and frees each
@@ -1295,6 +1311,22 @@ wm_bt_sweep_run(whenmoon_state_t *st,
       pool.n_windows_per_iter = 1;
       break;
   }
+
+  // WM-INSTR-1: price the hold once. Every iteration walks the same
+  // tape over the same windows, so the benchmark cannot vary by
+  // configuration — and pricing it here rather than per row is what
+  // lets a whole sweep be ranked in satoshis without retaining one
+  // equity curve per iteration, which is the reason it could not be
+  // before. A tape too thin to price leaves bench_ok false and every
+  // row's sat score NOSCORE; the sweep still runs on its own metric.
+  pool.bench_ok = wm_bt_bench_ratio(snap, pool.iter_windows,
+      pool.iter_n_windows, &pool.bench_ratio) == SUCCESS;
+
+  if(!pool.bench_ok)
+    clam(CLAM_WARN, WM_SWEEP_CTX,
+        "no buy-and-hold benchmark over the %s window set:"
+        " satoshi scores unavailable for this sweep",
+        pool.window_kind);
 
   threads = mem_alloc("whenmoon.sweep", "threads",
       sizeof(*threads) * plan->workers);
@@ -1485,7 +1517,7 @@ wm_bt_topk_render_row(const wm_bt_sweep_plan_t *plan,
         &r->trade.stats[WM_MARKET_MODE_PAPER];
     uint32_t                  n_fills =
         (uint32_t)st_paper->lifetime_fills_count;
-    double                    equity  = wm_bt_synth_equity(&r->trade);
+    double                    equity  = wm_bt_compute_equity(&r->trade);
 
     if(is_oos && r->have_oos)
     {
@@ -1658,6 +1690,7 @@ wm_bt_sweep_run_oos_validation(whenmoon_state_t *st,
   uint32_t              n;
   uint32_t              n_validated = 0;
   wm_backtest_params_t  oos_params;
+  double                tail_ratio  = 0.0;
 
   (void)market_id_db;
 
@@ -1688,6 +1721,13 @@ wm_bt_sweep_run_oos_validation(whenmoon_state_t *st,
       snprintf(err, err_cap, "oos tail empty");
     return(FAIL);
   }
+
+  // WM-INSTR-1: the tail is a DIFFERENT window from the head sweep, so
+  // it owes its own hold ratio — scoring an out-of-sample book against
+  // the in-sample benchmark is the mistake this argument exists to make
+  // unavailable. 0 on failure, which the selector answers as NOSCORE.
+  if(wm_bt_bench_ratio(snap, oos_tail, 1, &tail_ratio) != SUCCESS)
+    tail_ratio = 0.0;
 
   n     = plan->total_iters;
   top_k = plan->top_k > n ? n : plan->top_k;
@@ -1793,7 +1833,8 @@ wm_bt_sweep_run_oos_validation(whenmoon_state_t *st,
 
       results[src_iter].have_oos     = true;
       results[src_iter].oos_score    =
-          wm_bt_sweep_score_value(&bt_result.trade, plan->score);
+          wm_bt_sweep_score_value(&bt_result.trade, plan->score,
+              tail_ratio);
       results[src_iter].oos_realized = st_paper->realized_pnl_lifetime;
       results[src_iter].oos_n_trades =
           (uint32_t)st_paper->lifetime_fills_count;
@@ -1878,6 +1919,7 @@ wm_bt_perfold_one_row(whenmoon_state_t *st, wm_backtest_snapshot_t *snap,
     folds[w].start_ts_ms = win->start_ts_ms;
     folds[w].end_ts_ms   = win->end_ts_ms;
     folds[w].ok          = false;
+    folds[w].sat_score   = WM_BT_RESULT_NOSCORE;
 
     // WM-RIGOR-2: the fold's buy-and-hold benchmark is independent of
     // the iteration outcome — compute it up front so even a failed
@@ -1926,6 +1968,13 @@ wm_bt_perfold_one_row(whenmoon_state_t *st, wm_backtest_snapshot_t *snap,
       // inside `win`, so these are per-fold readings by construction).
       folds[w].mtm_max_dd       = bt_result.mtm_max_dd;
       folds[w].daily_sharpe_ann = bt_result.daily_sharpe_ann;
+
+      // WM-INSTR-1: each fold is its own book over its own window, so
+      // it divides by its own hold — the one place a per-fold satoshi
+      // score can be had honestly.
+      if(folds[w].bench_ok)
+        folds[w].sat_score = wm_bt_sat_score(&bt_result.trade,
+            1.0 + folds[w].bench_return);
     }
 
     // Per-fold charts are not needed; free the captured fills buffer.

@@ -434,24 +434,6 @@ wm_bt_build_params_obj(const wm_bt_sweep_plan_t *plan,
   return(obj);
 }
 
-double
-wm_bt_compute_equity(const wm_market_session_snapshot_t *snap)
-{
-  const wm_market_stats_t *st;
-  double                   position_value;
-
-  if(snap == NULL)
-    return(0.0);
-
-  st = &snap->stats[WM_MARKET_MODE_PAPER];
-
-  position_value = (snap->position.side == WM_MARKET_POS_LONG)
-      ? snap->position.qty * snap->last_mark_px
-      : 0.0;
-
-  return(st->cash + position_value);
-}
-
 static struct json_object *
 wm_bt_build_metrics_obj(const wm_bt_sweep_result_t *result)
 {
@@ -504,6 +486,19 @@ wm_bt_build_metrics_obj(const wm_bt_sweep_result_t *result)
   wm_bt_obj_add_double(obj, "daily_sharpe_ann", result->daily_sharpe_ann);
   json_object_object_add(obj, "mtm_days",
       json_object_new_int64((int64_t)result->mtm_days));
+
+  // WM-INSTR-1: `final_equity` above marks the book at `final_mark_px`
+  // — the last bar of the tape, not the last fill — and `sat_score` is
+  // that equity divided by `bench_ratio`, the growth of simply holding
+  // the asset over the same window. Score in satoshis from here; the
+  // daily curve in equity.jsonl is for the shape, not the endpoint,
+  // and a sweep never had one. NaN sat_score = no benchmark.
+  wm_bt_obj_add_double(obj, "final_mark_px",    result->final_mark_px);
+  wm_bt_obj_add_double(obj, "bench_ratio",
+      result->bench_ok ? result->bench_ratio : (double)NAN);
+  wm_bt_obj_add_double(obj, "sat_score",
+      WM_BT_SCORE_MISSING(result->sat_score)
+          ? (double)NAN : result->sat_score);
 
   return(obj);
 }
@@ -580,6 +575,9 @@ wm_bt_build_windows_arr(const wm_bt_sweep_result_t *result)
     // Sharpe over its in-window 1d closes.
     wm_bt_obj_add_double(obj, "mtm_max_dd",       f->mtm_max_dd);
     wm_bt_obj_add_double(obj, "daily_sharpe_ann", f->daily_sharpe_ann);
+    wm_bt_obj_add_double(obj, "sat_score",
+        WM_BT_SCORE_MISSING(f->sat_score)
+            ? (double)NAN : f->sat_score);
 
     json_object_array_add(arr, obj);
   }
@@ -1510,7 +1508,10 @@ wm_bt_render_report_md(const char *sweep_dir,
       top_k, wm_bt_sweep_score_name(plan->score));
 
   // Header row: Rank, Iter, [Score | Head/OOS Score], <axes>,
-  // trades, fills, realized, sharpe, sortino, pf, drawdown, equity, ms.
+  // trades, fills, realized, sharpe, sortino, pf, drawdown, equity,
+  // sat, ms. `sat` rides every table whatever the sweep ranked on
+  // (WM-INSTR-1) — it is the only column that says whether the row
+  // beat doing nothing.
   fputs("| Rank | Iter |", fp);
 
   if(is_oos)
@@ -1522,7 +1523,7 @@ wm_bt_render_report_md(const char *sweep_dir,
     fprintf(fp, " %s |", plan->axes[a].name);
 
   fputs(" trades | fills | realized | sharpe | sortino | pf |"
-        " drawdown | equity | ms |\n", fp);
+        " drawdown | equity | sat | ms |\n", fp);
 
   // Separator.
   fputs("|---|---|", fp);
@@ -1535,7 +1536,7 @@ wm_bt_render_report_md(const char *sweep_dir,
   for(a = 0; a < plan->n_axes; a++)
     fputs("---|", fp);
 
-  fputs("---|---|---|---|---|---|---|---|---|\n", fp);
+  fputs("---|---|---|---|---|---|---|---|---|---|\n", fp);
 
   // Rows.
   for(i = 0; i < top_k; i++)
@@ -1568,7 +1569,7 @@ wm_bt_render_report_md(const char *sweep_dir,
         fprintf(fp, " %s |", cell);
       }
 
-      fputs(" - | - | FAIL | - | - | - | - | - | - |\n", fp);
+      fputs(" - | - | FAIL | - | - | - | - | - | - | - |\n", fp);
       continue;
     }
 
@@ -1620,6 +1621,13 @@ wm_bt_render_report_md(const char *sweep_dir,
     wm_bt_md_fmt_double(equity, "%.4f", cell, sizeof(cell));
     fprintf(fp, " %s |", cell);
 
+    if(WM_BT_SCORE_MISSING(r->sat_score))
+      snprintf(cell, sizeof(cell), "n/a");
+    else
+      wm_bt_md_fmt_double(r->sat_score, "%+.4f", cell, sizeof(cell));
+
+    fprintf(fp, " %s |", cell);
+
     fprintf(fp, " %" PRIu64 " |\n", r->wallclock_ms);
   }
 
@@ -1649,8 +1657,8 @@ wm_bt_render_report_md(const char *sweep_dir,
           " (own book from starting cash, strategy warmed by prior"
           " history); realized PnL / return are non-compounding.\n\n");
       fprintf(fp, "| Fold | Start (UTC) | End (UTC) | Trades |"
-                  " Realized | Return %% | Equity | ok |\n");
-      fprintf(fp, "|---|---|---|---|---|---|---|---|\n");
+                  " Realized | Return %% | Equity | Sat | ok |\n");
+      fprintf(fp, "|---|---|---|---|---|---|---|---|---|\n");
 
       for(f = 0; f < best->n_folds; f++)
       {
@@ -1674,6 +1682,13 @@ wm_bt_render_report_md(const char *sweep_dir,
 
         wm_bt_md_fmt_double(fm->final_equity, "%.2f",
             cell, sizeof(cell));
+        fprintf(fp, " %s |", cell);
+
+        if(WM_BT_SCORE_MISSING(fm->sat_score))
+          snprintf(cell, sizeof(cell), "n/a");
+        else
+          wm_bt_md_fmt_double(fm->sat_score, "%+.4f", cell, sizeof(cell));
+
         fprintf(fp, " %s | %s |\n", cell, fm->ok ? "y" : "n");
 
         if(fm->ok)
@@ -2770,6 +2785,7 @@ wm_bt_render_index_html(const char *sweep_dir,
         ? fixed_params->starting_cash : WM_MARKET_DEFAULT_STARTING_CASH;
     const char *ec = eq >= WM_MARKET_DEFAULT_STARTING_CASH ? "pos" : "neg";
     const char *rc = rpnl >= 0.0 ? "pos" : "neg";
+    const char *sc;
     double   bench_ret  = 0.0;
     bool     have_bench;
     char     eq_str[48];
@@ -2778,6 +2794,7 @@ wm_bt_render_index_html(const char *sweep_dir,
     char     dd_str[32];
     char     pf_str[32];
     char     rt_str[32];
+    char     sat_str[32];
 
     have_bench = wm_bt_bench_return(snap, NULL, &bench_ret) == SUCCESS;
 
@@ -2791,7 +2808,27 @@ wm_bt_render_index_html(const char *sweep_dir,
     wm_bt_fmt_num(pf, 2, pf_str, sizeof(pf_str));
     snprintf(rt_str, sizeof(rt_str), "%u", rt);
 
+    // WM-INSTR-1: the headline the treasury reads. Zero is the whole
+    // point of the card — a run that merely matched the asset it was
+    // benchmarked against, which every other card here would call a
+    // triumph on a rising tape.
+    if(WM_BT_SCORE_MISSING(best->sat_score))
+    {
+      snprintf(sat_str, sizeof(sat_str), "n/a");
+      sc = "";
+    }
+
+    else
+    {
+      // Signed explicitly: the sign IS the reading, and an unsigned
+      // "0.1234" on this card reads as a 12% return to anyone who has
+      // not read the definition. Small by construction — no grouping.
+      snprintf(sat_str, sizeof(sat_str), "%+.4f", best->sat_score);
+      sc = best->sat_score >= 0.0 ? "pos" : "neg";
+    }
+
     fputs("<div class=\"cards\">\n", fp);
+    wm_bt_emit_card(fp, "Satoshi score", "sat_score",    sc, sat_str);
     wm_bt_emit_card(fp, "Best equity",   "equity",       ec, eq_str);
     wm_bt_emit_card(fp, "Realized P/L",  "realized_pnl", rc, rpnl_str);
     wm_bt_emit_card(fp, "Profit factor", "pf",           "", pf_str);
@@ -3043,9 +3080,11 @@ wm_bt_render_index_html(const char *sweep_dir,
 // the dashboard needs no CDN — only the shared assets/report.css + the
 // report.js wmSortTable handler (the top-K table reuses class "trades").
 
-// Format one score value for a cell / label / SVG title. Diverging score
-// metrics (realized P/L, equity) read as currency; ratio metrics (pf,
-// sharpe, sortino) as a grouped 3-decimal number. NOSCORE → "n/a".
+// Format one score value for a cell / label / SVG title. Currency score
+// metrics (realized P/L, equity) read as money; the satoshi score to
+// four places, which is the precision the office quotes it at and one
+// more than the ratio metrics (pf, sharpe, sortino) get.
+// NOSCORE → "n/a".
 static void
 wm_bt_fmt_score(wm_bt_sweep_score_t sc, double v, char *out, size_t cap)
 {
@@ -3057,6 +3096,10 @@ wm_bt_fmt_score(wm_bt_sweep_score_t sc, double v, char *out, size_t cap)
 
   if(sc == WM_BT_SCORE_REALIZED || sc == WM_BT_SCORE_EQUITY)
     wm_bt_fmt_usd(v, out, cap);
+
+  else if(sc == WM_BT_SCORE_SAT)
+    wm_bt_fmt_num(v, 4, out, cap);
+
   else
     wm_bt_fmt_num(v, 3, out, cap);
 }
@@ -3308,8 +3351,12 @@ wm_bt_emit_heatmap_svg(FILE *fp, const wm_bt_sweep_plan_t *plan,
   const wm_bt_sweep_axis_t *axx = &plan->axes[ax_x];
   const wm_bt_sweep_axis_t *axy = &plan->axes[ax_y];
   const char               *sname = wm_bt_sweep_score_name(plan->score);
+  // A satoshi score is signed about a meaningful zero — beating the
+  // hold or not — so it takes the diverging ramp with the currency
+  // metrics rather than the ratio metrics' sequential one.
   bool      diverging = (plan->score == WM_BT_SCORE_REALIZED ||
-                         plan->score == WM_BT_SCORE_EQUITY);
+                         plan->score == WM_BT_SCORE_EQUITY  ||
+                         plan->score == WM_BT_SCORE_SAT);
   uint32_t  nx        = axx->n_values;
   uint32_t  ny        = axy->n_values;
   double    gmin      =  INFINITY;
@@ -3743,6 +3790,7 @@ wm_bt_render_sweep_html(const char *sweep_dir,
         ? fixed_params->starting_cash : WM_MARKET_DEFAULT_STARTING_CASH;
     const char *ec   = eq >= WM_MARKET_DEFAULT_STARTING_CASH ? "pos" : "neg";
     const char *rc   = rpnl >= 0.0 ? "pos" : "neg";
+    const char *sc;
     double      bench_ret  = 0.0;
     bool        have_bench;
     char        eq_str[48];
@@ -3751,6 +3799,7 @@ wm_bt_render_sweep_html(const char *sweep_dir,
     char        dd_str[32];
     char        pf_str[32];
     char        rt_str[32];
+    char        sat_str[32];
     char        params[256];
 
     have_bench = wm_bt_bench_return(snap, NULL, &bench_ret) == SUCCESS;
@@ -3773,7 +3822,27 @@ wm_bt_render_sweep_html(const char *sweep_dir,
     wm_bt_fmt_num(pf, 2, pf_str, sizeof(pf_str));
     snprintf(rt_str, sizeof(rt_str), "%u", rt);
 
+    // WM-INSTR-1: the headline the treasury reads. Zero is the whole
+    // point of the card — a run that merely matched the asset it was
+    // benchmarked against, which every other card here would call a
+    // triumph on a rising tape.
+    if(WM_BT_SCORE_MISSING(best->sat_score))
+    {
+      snprintf(sat_str, sizeof(sat_str), "n/a");
+      sc = "";
+    }
+
+    else
+    {
+      // Signed explicitly: the sign IS the reading, and an unsigned
+      // "0.1234" on this card reads as a 12% return to anyone who has
+      // not read the definition. Small by construction — no grouping.
+      snprintf(sat_str, sizeof(sat_str), "%+.4f", best->sat_score);
+      sc = best->sat_score >= 0.0 ? "pos" : "neg";
+    }
+
     fputs("<div class=\"cards\">\n", fp);
+    wm_bt_emit_card(fp, "Satoshi score", "sat_score",    sc, sat_str);
     wm_bt_emit_card(fp, "Best equity",   "equity",       ec, eq_str);
     wm_bt_emit_card(fp, "Realized P/L",  "realized_pnl", rc, rpnl_str);
     wm_bt_emit_card(fp, "Profit factor", "pf",           "", pf_str);

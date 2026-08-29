@@ -54,6 +54,12 @@ typedef enum
   WM_BT_SCORE_SORTINO       = 2,
   WM_BT_SCORE_EQUITY        = 3,
   WM_BT_SCORE_PROFIT_FACTOR = 4,
+  // WM-INSTR-1. The benchmark-relative one: what the book is worth in
+  // units of the traded asset at the end against what it was worth at
+  // the start. Zero means the run ended holding exactly as much of the
+  // asset as never trading would have, and every other selector here
+  // scores that outcome as a triumph on a rising tape.
+  WM_BT_SCORE_SAT           = 5,
 } wm_bt_sweep_score_t;
 
 bool        wm_bt_sweep_score_parse(const char *tok,
@@ -171,6 +177,13 @@ typedef struct
   // fold drawdown — per-fill max_drawdown only observes fill days.
   double    mtm_max_dd;
   double    daily_sharpe_ann;
+
+  // WM-INSTR-1: this fold's satoshi score, wm_bt_sat_score over
+  // `final_equity` and the fold's own hold ratio (1 + bench_return).
+  // WM_BT_RESULT_NOSCORE when !bench_ok or the fold started with no
+  // cash; NOT zero, which is the score of a fold that exactly matched
+  // holding.
+  double    sat_score;
 } wm_bt_fold_metric_t;
 
 // ----------------------------------------------------------------------- //
@@ -226,7 +239,31 @@ typedef struct
   uint32_t              mtm_days;
   wm_bt_equity_pt_t    *equity;
   uint32_t              n_equity;
+
+  // WM-INSTR-1: the satoshi score and the numbers behind it. Every row
+  // of one sweep shares `bench_ratio` — the hold is a property of the
+  // tape and the window set, not of the configuration — so the sweep
+  // computes it once and copies it here, which is what makes a whole
+  // sweep rankable in satoshis without one equity curve per row.
+  // `sat_score` is WM_BT_RESULT_NOSCORE when !bench_ok.
+  // `final_mark_px` is the terminal close `trade`'s equity was marked
+  // at (wm_backtest_result_t carries the contract).
+  double                bench_ratio;
+  bool                  bench_ok;
+  double                sat_score;
+  double                final_mark_px;
 } wm_bt_sweep_result_t;
+
+// WM-INSTR-1: the satoshi score of one finished book —
+// `(final_equity / start_cash) / bench_ratio - 1`, where `bench_ratio`
+// is the hold's growth over the same window set (wm_bt_bench_ratio).
+// Positive means the run ended owning more of the asset than never
+// having traded; zero means it exactly matched holding, which is what
+// a return-shaped metric reads as a win. Returns WM_BT_RESULT_NOSCORE
+// when the book started with no cash, when `bench_ratio` is not a
+// positive finite number, or when the result is not finite.
+double wm_bt_sat_score(const wm_market_session_snapshot_t *snap,
+    double bench_ratio);
 
 // Score extraction from a synth-market snapshot. NaN/inf collapse to
 // 0.0. Reads from `.stats[WM_MARKET_MODE_PAPER]`. The legacy book
@@ -235,8 +272,12 @@ typedef struct
 // the SHARPE / SORTINO / PROFIT_FACTOR selectors collapse to
 // NOSCORE so the renderer sorts them to the bottom rather than
 // misleading the operator with a phantom zero.
+// `bench_ratio` is consumed by WM_BT_SCORE_SAT alone and must be the
+// hold ratio over the SAME window set this snapshot was run against —
+// pass 0 from a caller that has none, and the selector answers NOSCORE
+// rather than scoring against a benchmark it did not measure.
 double wm_bt_sweep_score_value(const wm_market_session_snapshot_t *snap,
-    wm_bt_sweep_score_t score);
+    wm_bt_sweep_score_t score, double bench_ratio);
 
 // ----------------------------------------------------------------------- //
 // Per-iteration KV cleanup                                                //

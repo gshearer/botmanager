@@ -776,6 +776,8 @@ wm_backtest_run_iteration_with_id(whenmoon_state_t *st,
   const wm_market_stats_t        *ps;
   double                          win_rate;
   wm_bt_mtm_t                     mtm;
+  double                          final_mark_px = 0.0;
+  int64_t                         final_mark_ms = 0;
   bool                            defer;
   wm_strategy_signal_t            pend[8];
   uint32_t                        pend_n        = 0;
@@ -911,6 +913,7 @@ wm_backtest_run_iteration_with_id(whenmoon_state_t *st,
   {
     wm_gran_t                g;
     const wm_candle_full_t  *bar;
+    bool                     in_window;
 
     g = wm_bt_next_grain(cursors, rings);
 
@@ -918,6 +921,13 @@ wm_backtest_run_iteration_with_id(whenmoon_state_t *st,
       break;
 
     bar = &rings[g][cursors[g].idx];
+
+    // Three consumers below ask the same question of this bar — the
+    // strategy dispatch, the daily mark and the terminal mark — so it
+    // is asked once. A full-range run declares no windows and every
+    // bar is in one.
+    in_window = (n_windows == 0) ||
+        wm_bt_in_any_window(windows, n_windows, bar->ts_close_ms);
 
     // WM-RIGOR-5 (--fill next-open): execute advice deferred from the
     // bar that emitted it at THIS 1m bar's open ± slip, stamped at the
@@ -961,53 +971,47 @@ wm_backtest_run_iteration_with_id(whenmoon_state_t *st,
     // cursor — the aggregator and ctx mark caches stay coherent —
     // but the strategy never sees them, so the synth market records
     // fills only during windowed ranges.
-    if(cursors[g].subscribed)
+    if(cursors[g].subscribed && in_window)
     {
-      bool in_window = (n_windows == 0) ||
-          wm_bt_in_any_window(windows, n_windows, bar->ts_close_ms);
+      uint64_t pre_emitted;
 
-      if(in_window)
+      // Single-advisor dispatch, matching wm_strategy_dispatch_bar
+      // (WM-MI-3): the subscribed grain's bar updates the ctx mark
+      // cache and fires on_bar. A strategy tracks its own internal
+      // position across bars.
+      ctx.bars_seen++;
+      ctx.last_bar_ts_ms = bar->ts_close_ms;
+      ctx.last_mark_px   = bar->close;
+      ctx.last_mark_ms   = bar->ts_close_ms;
+
+      pre_emitted = ctx.signals_emitted;
+      on_bar_fn(&ctx, &snap->mkt, g, bar);
+
+      if(ctx.signals_emitted > pre_emitted &&
+         ctx.last_signal.score != 0.0)
       {
-        uint64_t pre_emitted;
-
-        // Single-advisor dispatch, matching wm_strategy_dispatch_bar
-        // (WM-MI-3): the subscribed grain's bar updates the ctx mark
-        // cache and fires on_bar. A strategy tracks its own internal
-        // position across bars.
-        ctx.bars_seen++;
-        ctx.last_bar_ts_ms = bar->ts_close_ms;
-        ctx.last_mark_px   = bar->close;
-        ctx.last_mark_ms   = bar->ts_close_ms;
-
-        pre_emitted = ctx.signals_emitted;
-        on_bar_fn(&ctx, &snap->mkt, g, bar);
-
-        if(ctx.signals_emitted > pre_emitted &&
-           ctx.last_signal.score != 0.0)
+        // WM-RIGOR-5: the emit shim recorded the signal on the ctx
+        // but never reached the engine (ctx->mkt == NULL) — queue it
+        // for execution at the next 1m bar's open. The cap covers the
+        // worst same-ts bar cluster (one winning signal per bar,
+        // <= 6 bars share a close ts); overflow is counted and
+        // reported, never silent.
+        if(defer)
         {
-          // WM-RIGOR-5: the emit shim recorded the signal on the ctx
-          // but never reached the engine (ctx->mkt == NULL) — queue
-          // it for execution at the next 1m bar's open. The cap
-          // covers the worst same-ts bar cluster (one winning signal
-          // per bar, <= 6 bars share a close ts); overflow is counted
-          // and reported, never silent.
-          if(defer)
-          {
-            if(pend_n < (uint32_t)(sizeof(pend) / sizeof(pend[0])))
-              pend[pend_n++] = ctx.last_signal;
-            else
-              pend_dropped++;
-          }
+          if(pend_n < (uint32_t)(sizeof(pend) / sizeof(pend[0])))
+            pend[pend_n++] = ctx.last_signal;
+          else
+            pend_dropped++;
         }
-
-        bars_replayed++;
-
-        // Drain the (<= 1) fill this bar produced into the lossless
-        // accumulator before the 256-slot ring can overwrite it. Only
-        // the single winning advisor acts, so the engine adds at most
-        // one fill per bar; the drain loop is defensive.
-        wm_bt_fills_drain(sess, &acc_fills, &acc_n, &acc_cap, &prev_fn);
       }
+
+      bars_replayed++;
+
+      // Drain the (<= 1) fill this bar produced into the lossless
+      // accumulator before the 256-slot ring can overwrite it. Only
+      // the single winning advisor acts, so the engine adds at most
+      // one fill per bar; the drain loop is defensive.
+      wm_bt_fills_drain(sess, &acc_fills, &acc_n, &acc_cap, &prev_fn);
     }
 
     // WM-RIGOR-4: mark the book at every 1d close. The 1d bar's
@@ -1019,9 +1023,7 @@ wm_backtest_run_iteration_with_id(whenmoon_state_t *st,
     // trades on 1d. Windowed runs mark only in-window days, keeping
     // fold stats undiluted by the flat train/warmup stretches where
     // the strategy never fires.
-    if(g == WM_GRAN_1D &&
-       (n_windows == 0 ||
-        wm_bt_in_any_window(windows, n_windows, bar->ts_close_ms)))
+    if(g == WM_GRAN_1D && in_window)
     {
       double eq = sess->stats[WM_MARKET_MODE_PAPER].cash;
 
@@ -1029,6 +1031,19 @@ wm_backtest_run_iteration_with_id(whenmoon_state_t *st,
         eq += sess->position.qty * bar->close;
 
       wm_bt_mtm_mark(&mtm, bar->ts_close_ms, eq);
+    }
+
+    // WM-INSTR-1: remember the freshest in-window price so the book can
+    // be valued at the end of the tape. 1m because that is the finest
+    // grain and the one wm_bt_bench_return prices its window from — a
+    // terminal equity and a benchmark drawn from different bars cannot
+    // be divided into a satoshi score. Outside the `subscribed` gate
+    // for the same reason the daily mark above is: a strategy that
+    // trades on 1d still ends its run at a 1m price.
+    if(g == WM_GRAN_1M && in_window)
+    {
+      final_mark_px = bar->close;
+      final_mark_ms = bar->ts_close_ms;
     }
 
     cursors[g].idx++;
@@ -1047,6 +1062,21 @@ wm_backtest_run_iteration_with_id(whenmoon_state_t *st,
   }
 
   finalize_fn(&ctx);
+
+  // WM-INSTR-1: value the book at the END OF THE TAPE, not at its last
+  // fill. The engine stamps `last_mark_px` only when an order executes,
+  // which is right for a live market being marked by its own ledger and
+  // wrong for a finished backtest: a run holding a position on the last
+  // bar had every equity reader pricing it at the entry that opened it.
+  // Measured 2026-08-29 on a run that entered 2.5 months before its
+  // corpus ended — 1,332,891 reported against 1,972,632 true, a 48%
+  // understatement. Nothing executes after this point, so the stamp
+  // reaches only the snapshot.
+  if(final_mark_px > 0.0)
+  {
+    sess->last_mark_px = final_mark_px;
+    sess->last_mark_ms = final_mark_ms;
+  }
 
   // Snapshot the synth market's session before tearing it down.
   if(wm_market_session_snapshot(synth_mk, &out->trade) != SUCCESS)
@@ -1074,6 +1104,9 @@ wm_backtest_run_iteration_with_id(whenmoon_state_t *st,
   // series (NULL unless params->want_equity_series).
   wm_bt_mtm_finish(&mtm, out);
 
+  out->final_mark_px = final_mark_px;
+  out->final_mark_ms = final_mark_ms;
+
   fills_paper    =
       out->trade.stats[WM_MARKET_MODE_PAPER].lifetime_fills_count;
   realized_paper =
@@ -1087,9 +1120,11 @@ wm_backtest_run_iteration_with_id(whenmoon_state_t *st,
 
   // One summary line per backtest. Counters come from the PAPER ledger
   // (the synth market trades paper-only). win_rate is the hit rate over
-  // closed round-trip trades (n_wins + n_losses == n_trades). Currency
-  // is realized-only: end == start + profit exactly, so any position
-  // still open at the final bar contributes no unrealized PnL here.
+  // closed round-trip trades (n_wins + n_losses == n_trades). `end` is
+  // realized-only — end == start + profit exactly — so `equity` sits
+  // beside it carrying the terminal mark-to-market instead: the two
+  // differ by exactly the unrealized PnL of a position still open on
+  // the last bar, which is the number WM-INSTR-1 was about.
   // data_days reports the span of 1m history loaded into the snapshot
   // (1440 1m bars = one day).
   ps       = &out->trade.stats[WM_MARKET_MODE_PAPER];
@@ -1098,12 +1133,13 @@ wm_backtest_run_iteration_with_id(whenmoon_state_t *st,
 
   clam(CLAM_INFO, WM_BT_CTX,
       "backtest %s/%s: trades=%u wins=%u losses=%u win_rate=%.1f%%"
-      " start=%.2f end=%.2f profit=%+.2f data_days=%.1f"
-      " bars=%u fills=%" PRIu64 " wallclock_ms=%" PRIu64,
+      " start=%.2f end=%.2f profit=%+.2f equity=%.2f mark=%.2f"
+      " data_days=%.1f bars=%u fills=%" PRIu64 " wallclock_ms=%" PRIu64,
       snap->source_market_id, sname,
       ps->n_trades, ps->n_wins, ps->n_losses, win_rate,
       ps->starting_cash, ps->starting_cash + realized_paper,
-      realized_paper, (double)snap->bars_loaded_1m / 1440.0,
+      realized_paper, wm_bt_compute_equity(&out->trade), final_mark_px,
+      (double)snap->bars_loaded_1m / 1440.0,
       bars_replayed, fills_paper, out->wallclock_ms);
 
   // WM-RIGOR-5: one accounting line per next-open run. `dropped` > 0
@@ -1406,4 +1442,64 @@ wm_bt_bench_return(const wm_backtest_snapshot_t *snap,
 
   *out = exit_close / entry_close - 1.0;
   return(SUCCESS);
+}
+
+bool
+wm_bt_bench_ratio(const wm_backtest_snapshot_t *snap,
+    const wm_bt_window_t *windows, uint32_t n_windows, double *out)
+{
+  double   ratio = 1.0;
+  uint32_t i;
+
+  if(snap == NULL || out == NULL)
+    return(FAIL);
+
+  if(n_windows == 0)
+  {
+    double whole;
+
+    if(wm_bt_bench_return(snap, NULL, &whole) != SUCCESS)
+      return(FAIL);
+
+    *out = 1.0 + whole;
+    return(SUCCESS);
+  }
+
+  if(windows == NULL)
+    return(FAIL);
+
+  for(i = 0; i < n_windows; i++)
+  {
+    double win_return;
+
+    if(wm_bt_bench_return(snap, &windows[i], &win_return) != SUCCESS)
+      return(FAIL);
+
+    ratio *= 1.0 + win_return;
+  }
+
+  *out = ratio;
+  return(SUCCESS);
+}
+
+// ----------------------------------------------------------------------- //
+// End-of-run equity                                                       //
+// ----------------------------------------------------------------------- //
+
+double
+wm_bt_compute_equity(const wm_market_session_snapshot_t *snap)
+{
+  const wm_market_stats_t *st;
+  double                   position_value;
+
+  if(snap == NULL)
+    return(0.0);
+
+  st = &snap->stats[WM_MARKET_MODE_PAPER];
+
+  position_value = (snap->position.side == WM_MARKET_POS_LONG)
+      ? snap->position.qty * snap->last_mark_px
+      : 0.0;
+
+  return(st->cash + position_value);
 }
