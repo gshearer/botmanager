@@ -276,6 +276,7 @@ The command surfaces filed beside these engines (`ask`, `claude`,
 | `strategy.kedge` | plugins/extension/whenmoon/strategy/kedge/ | kedge strategy log (`KDG_LOG_CTX`) |
 | `strategy.sextant` | plugins/extension/whenmoon/strategy/sextant/ | sextant census-probe strategy log (`SXT_LOG_CTX`) |
 | `strategy.testing` | plugins/extension/whenmoon/strategy/testing/ | testing strategy log (`TST_LOG_CTX`) |
+| `strategy.gale` | plugins/extension/whenmoon/strategy/gale/ | gale strategy log (`GALE_LOG_CTX`) |
 | `userquote` | plugins/feature/userquote/ | quote book: schema, add/recall/del, migration (`UQ_CTX`) |
 | `whenmoon` | plugins/extension/whenmoon/ | top-level whenmoon (`WHENMOON_CTX`) |
 | `whenmoon mw` | plugins/extension/whenmoon/mw.c | marketwatch subsystem op log (`MW_CTX`) |
