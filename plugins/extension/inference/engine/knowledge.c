@@ -80,6 +80,7 @@ knowledge_load_config(void)
   const char *em;
   c.enabled               = kv_get_uint("knowledge.enabled") != 0;
   c.rag_top_k             = (uint32_t)kv_get_uint("knowledge.rag_top_k");
+  c.rag_lexical_k         = (uint32_t)kv_get_uint("knowledge.rag_lexical_k");
   c.rag_max_context_chars = (uint32_t)kv_get_uint("knowledge.rag_max_context_chars");
   c.chunk_max_chars       = (uint32_t)kv_get_uint("knowledge.chunk_max_chars");
   c.embed_batch_size      = (uint32_t)kv_get_uint("knowledge.embed_batch_size");
@@ -90,8 +91,15 @@ knowledge_load_config(void)
   if(c.rag_top_k == 0)
     c.rag_top_k = KNOWLEDGE_DEF_RAG_TOP_K;
 
-  if(c.rag_max_context_chars == 0)
-    c.rag_max_context_chars = KNOWLEDGE_DEF_RAG_MAX_CTX_CHARS;
+  // Both channels' slots come out of one delivery buffer, so the
+  // lexical width is bounded by what the dense width left. Zero is a
+  // real value here (the channel off), never a stand-in for the
+  // default -- `set kv --delete` is how the default comes back.
+  if(c.rag_top_k > KNOWLEDGE_HITS_MAX)
+    c.rag_top_k = KNOWLEDGE_HITS_MAX;
+
+  if(c.rag_lexical_k > KNOWLEDGE_HITS_MAX - c.rag_top_k)
+    c.rag_lexical_k = KNOWLEDGE_HITS_MAX - c.rag_top_k;
 
   if(c.chunk_max_chars == 0)
     c.chunk_max_chars = KNOWLEDGE_DEF_CHUNK_MAX_CHARS;
@@ -143,10 +151,18 @@ knowledge_register_kv(void)
       " (empty = inherit memory.embed_model)");
   kv_register("knowledge.rag_top_k", KV_UINT32, "5",
       knowledge_kv_changed, NULL,
-      "Top-K chunks returned per knowledge_retrieve");
-  kv_register("knowledge.rag_max_context_chars", KV_UINT32, "3072",
+      "Chunks the cosine channel contributes per knowledge_retrieve");
+  kv_register("knowledge.rag_lexical_k", KV_UINT32, "3",
       knowledge_kv_changed, NULL,
-      "Max characters of knowledge context injected into the prompt");
+      "Chunks the lexical channel contributes per knowledge_retrieve,"
+      " ranked by the rarity of the query terms they carry. 0 turns the"
+      " channel off and leaves retrieval purely by cosine.");
+  kv_register("knowledge.rag_max_context_chars", KV_UINT32, "6144",
+      knowledge_kv_changed, NULL,
+      "Max characters of knowledge context injected into the prompt."
+      " Budget for rag_top_k + rag_lexical_k chunks of chunk_max_chars,"
+      " or the block truncates and the tail of the ranking never"
+      " reaches the model. 0 = no separate cap.");
   kv_register("knowledge.chunk_max_chars", KV_UINT32, "1200",
       knowledge_kv_changed, NULL,
       "Max characters per chunk produced by the ingest chunker."
@@ -388,6 +404,17 @@ knowledge_ensure_tables(void)
   knowledge_run_ddl(
       "CREATE UNIQUE INDEX IF NOT EXISTS knowledge_chunks_dedup"
       " ON knowledge_chunks(corpus, source_url, section_heading, md5(text))");
+
+  // The lexical retrieval channel's index. 'english' rather than
+  // 'simple' for its stop-word list: it is what reduces "what do you
+  // know about pacoloco for archlinux" to the two lexemes that carry
+  // the question. A text search configuration has to be a constant
+  // here -- an index expression must be IMMUTABLE -- so a corpus in
+  // another language rides an English stemmer and loses only the
+  // stemming, never the exact-token match the channel exists for.
+  knowledge_run_ddl(
+      "CREATE INDEX IF NOT EXISTS idx_knowledge_chunks_fts"
+      " ON knowledge_chunks USING GIN (to_tsvector('english', text))");
 
   knowledge_run_ddl(
       "CREATE TABLE IF NOT EXISTS knowledge_chunk_embeddings ("
@@ -1376,46 +1403,9 @@ knowledge_insert_image(int64_t chunk_id, const char *url,
   return(ok ? SUCCESS : FAIL);
 }
 
-// Retrieval
-
-typedef struct
-{
-  int64_t  id;
-  float    score;
-} knowledge_hit_t;
-
-// Keep the top-K (highest score) in a descending-sorted array.
-static void
-knowledge_topk_insert(knowledge_hit_t *buf, size_t cap, size_t *n,
-    int64_t id, float score)
-{
-  size_t pos;
-  if(*n < cap)
-  {
-    size_t pos = *n;
-    while(pos > 0 && buf[pos - 1].score < score)
-    {
-      buf[pos] = buf[pos - 1];
-      pos--;
-    }
-    buf[pos].id = id;
-    buf[pos].score = score;
-    (*n)++;
-    return;
-  }
-
-  if(score <= buf[cap - 1].score)
-    return;
-
-  pos = cap - 1;
-  while(pos > 0 && buf[pos - 1].score < score)
-  {
-    buf[pos] = buf[pos - 1];
-    pos--;
-  }
-  buf[pos].id = id;
-  buf[pos].score = score;
-}
+// Retrieval. The ranking types are in knowledge_priv.h and the four
+// pure functions over them are in knowledge_rank.c, where a test can
+// compile them without the subsystem behind them.
 
 // Build a SQL `IN ('a','b',...)` clause from a semicolon-separated
 // corpus list. Escapes each name via db_escape, trims whitespace,
@@ -1467,23 +1457,111 @@ knowledge_build_corpus_in_clause(const char *list,
   return(n);
 }
 
-// Cosine-scan the named corpora's embeddings against qvec. `corpus_list`
-// is the raw semicolon-separated list; names are parsed, trimmed,
-// SQL-escaped, and joined into an IN clause. Up to
-// KNOWLEDGE_CORPUS_LIST_MAX names; excess silently truncated.
+// The lexical channel, as one statement. Substitutions, in order:
+// escaped query, minimum lexeme length, corpus IN clause, corpus IN
+// clause, max document-frequency fraction, corpus IN clause, row cap.
+//
+// The shape is idf, not term frequency: a chunk is ranked by how RARE
+// the query terms it carries are, because that is precisely what a
+// mean-pooled sentence embedding throws away. `pacoloco` reaches one
+// chunk in 34,029 and contributes ln(34029/1); `archlinux` reaches 179
+// and contributes ln(34029/179), which is the right relative weight and
+// the opposite of what cosine gives them.
+//
+// plainto_tsquery('simple', ...) and not to_tsquery: the lexemes come
+// out of an 'english' tsvector already stemmed, so re-stemming them is
+// wrong, and 'simple' also spares us quoting whatever punctuation
+// survived into a lexeme.
+#define KNOWLEDGE_LEXICAL_SQL \
+    "WITH ql AS (" \
+    "  SELECT DISTINCT lexeme FROM unnest(to_tsvector('english', '%s'))" \
+    "   WHERE length(lexeme) >= %d" \
+    "), tot AS (" \
+    "  SELECT GREATEST(COUNT(*), 1)::float8 AS n" \
+    "    FROM knowledge_chunks WHERE corpus IN %s" \
+    "), df AS (" \
+    "  SELECT ql.lexeme," \
+    "         (SELECT COUNT(*) FROM knowledge_chunks k" \
+    "           WHERE k.corpus IN %s" \
+    "             AND to_tsvector('english', k.text)" \
+    "                 @@ plainto_tsquery('simple', ql.lexeme)) AS n" \
+    "    FROM ql" \
+    "), sel AS (" \
+    "  SELECT df.lexeme, ln(tot.n / df.n) AS idf FROM df, tot" \
+    "   WHERE df.n > 0 AND df.n::float8 <= tot.n * %f" \
+    ")" \
+    " SELECT k.id, SUM(sel.idf) AS idf" \
+    "   FROM sel JOIN knowledge_chunks k" \
+    "     ON k.corpus IN %s" \
+    "    AND to_tsvector('english', k.text)" \
+    "        @@ plainto_tsquery('simple', sel.lexeme)" \
+    "  GROUP BY k.id ORDER BY idf DESC, k.id LIMIT %zu"
+
+// Rank the corpora's chunks by the rarity of the query terms they
+// carry, filling r->lex. Costs one GIN lookup per surviving lexeme
+// against an index the cosine channel does not need, and is skipped
+// entirely when the caller asked for no lexical slots.
 static void
-knowledge_scan(const char *corpus_list, const char *model, uint32_t dim,
-    const float *qvec, knowledge_hit_t *buf, size_t cap, size_t *n_out)
+knowledge_lexical_scan(const char *in_clause, const char *query,
+    knowledge_rank_t *r)
 {
-  char in_clause[1200];
-  size_t n_names = knowledge_build_corpus_in_clause(corpus_list,
-      in_clause, sizeof(in_clause));
+  char *e_query;
+  char *sql;
+  size_t sz;
+  db_result_t *res;
+
+  e_query = db_escape(query);
+  if(e_query == NULL)
+    return;
+
+  sz = sizeof(KNOWLEDGE_LEXICAL_SQL) + strlen(e_query)
+      + (3 * strlen(in_clause)) + 128;
+  sql = mem_alloc("knowledge", "lexical_sql", sz);
+
+  snprintf(sql, sz, KNOWLEDGE_LEXICAL_SQL,
+      e_query, KNOWLEDGE_LEX_MIN_LEXEME, in_clause, in_clause,
+      KNOWLEDGE_LEX_MAX_DF_FRACTION, in_clause,
+      (size_t)KNOWLEDGE_LEX_CAND_MAX);
+
+  res = db_result_alloc();
+
+  if(db_query(sql, res) == SUCCESS && res->ok)
+  {
+    for(uint32_t i = 0; i < res->rows && r->n_lex < KNOWLEDGE_LEX_CAND_MAX; i++)
+    {
+      const char *id_s  = db_result_get(res, i, 0);
+      const char *idf_s = db_result_get(res, i, 1);
+
+      if(id_s == NULL || idf_s == NULL)
+        continue;
+
+      r->lex[r->n_lex].id  = (int64_t)strtoll(id_s, NULL, 10);
+      r->lex[r->n_lex].idf = strtof(idf_s, NULL);
+      r->lex[r->n_lex].cos = 0.0f;
+      r->n_lex++;
+    }
+  }
+
+  else if(res->error[0] != '\0')
+    clam(CLAM_WARN, "knowledge", "lexical scan: %s", res->error);
+
+  db_result_free(res);
+  mem_free(sql);
+  mem_free(e_query);
+}
+
+// Cosine-scan the named corpora's embeddings against r->qvec, filling
+// r->dense -- and, in the same pass, stamping the cosine onto any
+// lexical candidate it walks over, which is where those get their
+// tiebreak for free. `in_clause` is a built corpus IN (...) fragment.
+static void
+knowledge_scan(const char *in_clause, const char *model,
+    knowledge_rank_t *r)
+{
   char *e_model;
   size_t sz;
   db_result_t *res;
   char *sql;
-  if(n_names == 0)
-    return;
 
   e_model = db_escape(model);
   if(e_model == NULL)
@@ -1497,7 +1575,7 @@ knowledge_scan(const char *corpus_list, const char *model, uint32_t dim,
       " FROM knowledge_chunk_embeddings e JOIN knowledge_chunks x"
       " ON e.chunk_id = x.id"
       " WHERE x.corpus IN %s AND e.model = '%s' AND e.dim = %u",
-      in_clause, e_model, dim);
+      in_clause, e_model, r->dim);
 
   res = db_result_alloc();
 
@@ -1520,13 +1598,26 @@ knowledge_scan(const char *corpus_list, const char *model, uint32_t dim,
     int64_t id;
     if(id_s == NULL || vec_s == NULL) continue;
 
-    rv = knowledge_bytea_to_vec(vec_s, dim);
+    rv = knowledge_bytea_to_vec(vec_s, r->dim);
     if(rv == NULL) continue;
 
-    score = knowledge_cosine(qvec, rv, dim);
+    score = knowledge_cosine(r->qvec, rv, r->dim);
     id = (int64_t)strtoll(id_s, NULL, 10);
 
-    knowledge_topk_insert(buf, cap, n_out, id, score);
+    knowledge_topk_insert(r->dense, r->dense_cap, &r->n_dense, id, score);
+
+    // The lexical candidates are a handful of ids against a corpus-wide
+    // walk, so a linear probe here costs nothing measurable beside the
+    // dot product that produced `score`.
+    for(size_t j = 0; j < r->n_lex; j++)
+    {
+      if(r->lex[j].id == id)
+      {
+        r->lex[j].cos = score;
+        break;
+      }
+    }
+
     mem_free(rv);
   }
 
@@ -1578,6 +1669,12 @@ knowledge_parse_chunk_row(const db_result_t *r, uint32_t row,
     "id, corpus, source_url, section_heading, text," \
     " EXTRACT(EPOCH FROM created)::bigint"
 
+// Deliver in RANKING order, which is not the order the SELECT returns
+// them in. It matters because the consumer's byte budget fills from the
+// front and stops: reply.c's KNOWLEDGE fence takes chunks until it is
+// full, so a hit's position in this array decides whether it reaches
+// the model at all. Delivering in id order -- which is what a bare walk
+// of the result rows gives you -- spent that budget at random.
 static void
 knowledge_deliver_hits(const knowledge_hit_t *hits, size_t n,
     knowledge_retrieve_cb_t cb, void *user)
@@ -1587,10 +1684,11 @@ knowledge_deliver_hits(const knowledge_hit_t *hits, size_t n,
 
   if(n > 0)
   {
-    // top_k caps at 64 and each id renders to ≤21 bytes ("%" PRId64 plus
-    // comma), so in_list fits comfortably below 2 KB; the sql buffer is
-    // sized at 4 KB to absorb it with headroom for the SELECT cols.
-    char in_list[32 * 64];
+    // Both channels' slots come out of KNOWLEDGE_HITS_MAX and each id
+    // renders to <=21 bytes ("%" PRId64 plus comma), so in_list fits
+    // comfortably below 2 KB; the sql buffer is sized at 4 KB to absorb
+    // it with headroom for the SELECT cols.
+    char in_list[32 * KNOWLEDGE_HITS_MAX];
     char sql[4096];
     db_result_t *res;
     knowledge_build_in_list(in_list, sizeof(in_list), hits, n);
@@ -1604,24 +1702,32 @@ knowledge_deliver_hits(const knowledge_hit_t *hits, size_t n,
 
     if(db_query(sql, res) == SUCCESS && res->ok && res->rows > 0)
     {
+      // Sized by HITS rather than by rows: the array is indexed by
+      // hit and each hit writes at most one entry, so the write is in
+      // bounds by construction instead of by an invariant living in
+      // another function. `n` >= 1 here, and the allocator does not
+      // take a zero.
       chunks = mem_alloc("knowledge", "rag_chunks",
-          sizeof(knowledge_chunk_t) * res->rows);
+          sizeof(knowledge_chunk_t) * n);
 
-      for(uint32_t i = 0; i < res->rows; i++)
+      // Walk the HITS and find each one's row, rather than walking the
+      // rows -- that is the whole of the ordering fix. A row a hit
+      // names but the SELECT did not return (deleted between the scan
+      // and now) simply leaves a gap the loop steps over.
+      for(size_t h = 0; h < n; h++)
       {
-        knowledge_parse_chunk_row(res, i, &chunks[nc]);
-
-        // Stamp the score from the hit buffer (SELECT order may
-        // differ from ranking order; match by id).
-        for(size_t h = 0; h < n; h++)
+        for(uint32_t i = 0; i < res->rows; i++)
         {
-          if(hits[h].id == chunks[nc].id)
-          {
-            chunks[nc].score = hits[h].score;
-            break;
-          }
+          const char *id_s = db_result_get(res, i, 0);
+
+          if(id_s == NULL || (int64_t)strtoll(id_s, NULL, 10) != hits[h].id)
+            continue;
+
+          knowledge_parse_chunk_row(res, i, &chunks[nc]);
+          chunks[nc].score = hits[h].score;
+          nc++;
+          break;
         }
-        nc++;
       }
     }
 
@@ -1634,36 +1740,73 @@ knowledge_deliver_hits(const knowledge_hit_t *hits, size_t n,
 }
 
 static void
-knowledge_retrieve_with_vec(const char *corpus, const char *model,
-    uint32_t dim, const float *qvec, uint32_t top_k,
+knowledge_retrieve_with_vec(const char *corpus_list, const char *query,
+    const char *model, uint32_t dim, const float *qvec, uint32_t top_k,
     knowledge_retrieve_cb_t cb, void *user)
 {
-  knowledge_hit_t buf[64];
-  size_t          n;
-  if(top_k == 0 || top_k > 64)
+  knowledge_rank_t  rank;
+  knowledge_hit_t   out[KNOWLEDGE_HITS_MAX];
+  knowledge_cfg_t   cfg;
+  char              in_clause[1200];
+  size_t            lex_k;
+  size_t            n_out;
+
+  knowledge_cfg_snapshot(&cfg);
+
+  if(top_k == 0 || top_k > KNOWLEDGE_HITS_MAX)
+    top_k = cfg.rag_top_k;
+
+  if(top_k == 0 || top_k > KNOWLEDGE_HITS_MAX)
+    top_k = KNOWLEDGE_DEF_RAG_TOP_K;
+
+  lex_k = cfg.rag_lexical_k;
+
+  if(lex_k > KNOWLEDGE_HITS_MAX - top_k)
+    lex_k = KNOWLEDGE_HITS_MAX - top_k;
+
+  if(knowledge_build_corpus_in_clause(corpus_list,
+        in_clause, sizeof(in_clause)) == 0)
   {
-    knowledge_cfg_t c;
-    knowledge_cfg_snapshot(&c);
-    top_k = c.rag_top_k;
-    if(top_k == 0 || top_k > 64)
-      top_k = KNOWLEDGE_DEF_RAG_TOP_K;
+    cb(NULL, 0, user);
+    return;
   }
 
-  n = 0;
+  memset(&rank, 0, sizeof(rank));
+  rank.qvec      = qvec;
+  rank.dim       = dim;
+  rank.dense_cap = top_k;
 
-  knowledge_scan(corpus, model, dim, qvec, buf, top_k, &n);
+  // Lexical first: the cosine walk stamps its candidates as it goes.
+  if(lex_k > 0)
+    knowledge_lexical_scan(in_clause, query, &rank);
 
-  knowledge_deliver_hits(buf, n, cb, user);
+  knowledge_scan(in_clause, model, &rank);
+
+  knowledge_lex_sort(rank.lex, rank.n_lex);
+
+  n_out = knowledge_interleave(&rank, lex_k, out, sizeof(out) / sizeof(out[0]));
+
+  knowledge_deliver_hits(out, n_out, cb, user);
 }
 
 typedef struct
 {
   char                     corpus[KNOWLEDGE_CORPUS_NAME_SZ];
   char                     model[KNOWLEDGE_EMBED_MODEL_SZ];
+  char                    *query;                 // mem_strdup'd; freed here
   uint32_t                 top_k;
   knowledge_retrieve_cb_t  cb;
   void                    *user;
 } knowledge_retrieval_ctx_t;
+
+static void
+knowledge_retrieval_ctx_free(knowledge_retrieval_ctx_t *c)
+{
+  if(c->query != NULL)
+    mem_free(c->query);
+
+  mem_free(c);
+}
 
 static void
 knowledge_retrieve_embed_done(const llm_embed_response_t *resp)
@@ -1675,14 +1818,14 @@ knowledge_retrieve_embed_done(const llm_embed_response_t *resp)
     clam(CLAM_WARN, "knowledge", "retrieve embed failed: %s",
         resp->error ? resp->error : "(no detail)");
     c->cb(NULL, 0, c->user);
-    mem_free(c);
+    knowledge_retrieval_ctx_free(c);
     return;
   }
 
-  knowledge_retrieve_with_vec(c->corpus, c->model, resp->dim,
+  knowledge_retrieve_with_vec(c->corpus, c->query, c->model, resp->dim,
       resp->vectors[0], c->top_k, c->cb, c->user);
 
-  mem_free(c);
+  knowledge_retrieval_ctx_free(c);
 }
 
 bool
@@ -1714,6 +1857,10 @@ knowledge_retrieve(const char *corpus, const char *query,
 
   snprintf(c->corpus, sizeof(c->corpus), "%s", corpus);
   snprintf(c->model,  sizeof(c->model),  "%s", model);
+
+  // The lexical channel runs off the query text, on the embed
+  // callback's thread, long after the caller's buffer may be gone.
+  c->query = mem_strdup("knowledge", "rag_query", query);
   c->top_k = top_k;
   c->cb    = cb;
   c->user  = user;
@@ -1726,7 +1873,7 @@ knowledge_retrieve(const char *corpus, const char *query,
     clam(CLAM_WARN, "knowledge",
         "retrieve embed submit failed (model '%s')", model);
     cb(NULL, 0, user);
-    mem_free(c);
+    knowledge_retrieval_ctx_free(c);
     return(FAIL);
   }
 
@@ -2019,6 +2166,7 @@ knowledge_init(void)
   memset(&knowledge_cfg, 0, sizeof(knowledge_cfg));
   knowledge_cfg.enabled               = true;
   knowledge_cfg.rag_top_k             = KNOWLEDGE_DEF_RAG_TOP_K;
+  knowledge_cfg.rag_lexical_k         = KNOWLEDGE_DEF_RAG_LEXICAL_K;
   knowledge_cfg.rag_max_context_chars = KNOWLEDGE_DEF_RAG_MAX_CTX_CHARS;
   knowledge_cfg.chunk_max_chars       = KNOWLEDGE_DEF_CHUNK_MAX_CHARS;
   knowledge_cfg.embed_batch_size      = KNOWLEDGE_DEF_EMBED_BATCH_SIZE;

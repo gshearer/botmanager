@@ -168,6 +168,12 @@ CREATE INDEX IF NOT EXISTS idx_knowledge_chunks_corpus ON knowledge_chunks(corpu
 -- See plugins/extension/inference/KNOWLEDGE.md §Idempotency.
 CREATE UNIQUE INDEX IF NOT EXISTS knowledge_chunks_dedup
   ON knowledge_chunks(corpus, source_url, section_heading, md5(text));
+-- Lexical retrieval channel: the rare-term half of knowledge_retrieve,
+-- beside the cosine scan. 'english' for its stop-word list; an index
+-- expression must be IMMUTABLE so the configuration cannot be a knob.
+-- See plugins/extension/inference/KNOWLEDGE.md §The two channels.
+CREATE INDEX IF NOT EXISTS idx_knowledge_chunks_fts
+  ON knowledge_chunks USING GIN (to_tsvector('english', text));
 
 CREATE TABLE IF NOT EXISTS knowledge_chunk_embeddings (
   chunk_id  BIGINT      PRIMARY KEY REFERENCES knowledge_chunks(id) ON DELETE CASCADE,

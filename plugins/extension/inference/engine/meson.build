@@ -5,6 +5,7 @@ inference_sources = [
   'llm.c',
   'llm_cmd.c',
   'knowledge.c',
+  'knowledge_rank.c',
   'knowledge_cmd.c',
   'knowledge_file.c',
   'knowledge_fetch.c',

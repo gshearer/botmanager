@@ -145,8 +145,95 @@ void knowledge_get_stats(knowledge_stats_t *out);
 #define KW_KV_FETCH_TIMEOUT  "knowledge.fetch_timeout_secs"
 
 #define KNOWLEDGE_DEF_RAG_TOP_K          5
-#define KNOWLEDGE_DEF_RAG_MAX_CTX_CHARS  3072
+#define KNOWLEDGE_DEF_RAG_LEXICAL_K      3
+#define KNOWLEDGE_DEF_RAG_MAX_CTX_CHARS  6144
 #define KNOWLEDGE_DEF_CHUNK_MAX_CHARS    1200
+
+// Hits one retrieve may deliver, across both channels. It is also the
+// ceiling knowledge_images_for_chunks and knowledge_build_in_list are
+// sized against, so the two channels share it rather than each taking
+// 64 of their own.
+#define KNOWLEDGE_HITS_MAX               64
+
+// Lexical candidates pulled back before the cosine tiebreak picks the
+// lexical slots. Wider than the slots themselves because the idf sum
+// ties readily -- four chunks matching one rare term all score it
+// exactly, and which of them is worth a slot is a question only the
+// dense score answers.
+#define KNOWLEDGE_LEX_CAND_MAX           32
+
+// A query lexeme this short is an addressee, an interjection or an
+// abbreviation far more often than it is a subject -- "hh:" opening an
+// IRC line is the shape -- and it carries a rare-token idf that buries
+// the term the human actually asked about. Measured on the archwiki
+// corpus: with 1- and 2-character lexemes admitted, "hh: what do you
+// know about pacoloco" ranks a screenshot page above the Pacoloco one.
+#define KNOWLEDGE_LEX_MIN_LEXEME         3
+
+// A lexeme carried by more than this share of the corpus discriminates
+// nothing -- it is the corpus's own subject matter -- and it is also
+// the one that costs the most to aggregate. 5% keeps "pacman" and
+// "arch" out of an Arch wiki ranking while leaving room for a term
+// like "proxy"; at 0.5% the ceiling starts cutting real subjects.
+#define KNOWLEDGE_LEX_MAX_DF_FRACTION    0.05
+
+// ---- Retrieval ranking (knowledge_rank.c) -----------------------------
+// Pure arithmetic over the two retrieval channels. No database, no
+// allocator, no lock — which is what lets tests/test_knowledge_rank.c
+// compile the unit on its own.
+
+typedef struct
+{
+  int64_t  id;
+  float    score;
+} knowledge_hit_t;
+
+// A lexical candidate. `idf` is what the SQL ranked it by — the summed
+// inverse document frequency of the query lexemes it carries — and
+// `cos` is filled in by the cosine walk that runs afterwards, purely to
+// break the ties `idf` leaves. Four chunks that each carry one rare
+// term score it identically, and only the embedder has an opinion about
+// which of them is about the question.
+typedef struct
+{
+  int64_t  id;
+  float    idf;
+  float    cos;
+} knowledge_lex_t;
+
+// One retrieval's working set. Lives on the retrieving thread's stack
+// for the length of a single knowledge_retrieve; the cosine walk reads
+// `lex` while it fills `dense`, which is why the two share a frame.
+typedef struct
+{
+  const float      *qvec;
+  uint32_t          dim;
+
+  knowledge_hit_t   dense[KNOWLEDGE_HITS_MAX];
+  size_t            dense_cap;
+  size_t            n_dense;
+
+  knowledge_lex_t   lex[KNOWLEDGE_LEX_CAND_MAX];
+  size_t            n_lex;
+} knowledge_rank_t;
+
+void knowledge_topk_insert(knowledge_hit_t *buf, size_t cap, size_t *n,
+    int64_t id, float score);
+
+void knowledge_lex_sort(knowledge_lex_t *lex, size_t n);
+
+// Appends unless `out` already carries that id. ⛔ BOTH channels must
+// push through this, not just the lexical one: the two rank the same
+// corpora, so a duplicate is ordinary, and a merged list longer than
+// the set of distinct rows behind it overflows the array
+// knowledge_deliver_hits sizes from it.
+void knowledge_hit_push(knowledge_hit_t *out, size_t *n, size_t cap,
+    int64_t id, float score);
+
+// Returns the number of hits written to `out`, in delivery order.
+size_t knowledge_interleave(const knowledge_rank_t *r, size_t lex_k,
+    knowledge_hit_t *out, size_t out_cap);
+
 
 // Range knowledge.chunk_max_chars is clamped to at load. The floor
 // keeps every splitter's advance strictly positive against
@@ -173,6 +260,7 @@ typedef struct
 {
   bool     enabled;
   uint32_t rag_top_k;
+  uint32_t rag_lexical_k;
   uint32_t rag_max_context_chars;
   uint32_t chunk_max_chars;
   uint32_t embed_batch_size;

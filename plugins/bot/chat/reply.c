@@ -2419,9 +2419,12 @@ prompt_emit_knowledge(char *buf, size_t pos, size_t cap,
     return pos;
 
   block_start = pos;
+  // 0 is "no separate cap", not "use the default" -- restating
+  // knowledge.rag_max_context_chars' default here is exactly how the
+  // two drift, and the outer `cap` still bounds the write either way.
   block_cap_bytes = r->knowledge_max_chars > 0
       ? (size_t)r->knowledge_max_chars
-      : 3072;
+      : cap;
 
   pos += snprintf(buf + pos, cap - pos,
       "<<<KNOWLEDGE (corpora: %s)>>>\n", r->knowledge_corpus);

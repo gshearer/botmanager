@@ -255,9 +255,18 @@ cmd_show_knowledge(const cmd_ctx_t *ctx)
   knowledge_cfg_t cfg;
   char effective_model[KNOWLEDGE_EMBED_MODEL_SZ];
   char line[256];
+  char max_ctx[16];
   knowledge_get_stats(&g);
 
   knowledge_cfg_snapshot(&cfg);
+
+  // 0 is a value, not an unset: the reply pipeline reads it as "no
+  // separate cap" and the prompt buffer is then the only bound.
+  if(cfg.rag_max_context_chars == 0)
+    strlcpy(max_ctx, "uncapped", sizeof(max_ctx));
+
+  else
+    snprintf(max_ctx, sizeof(max_ctx), "%u", cfg.rag_max_context_chars);
 
   knowledge_effective_embed_model(effective_model, sizeof(effective_model));
 
@@ -270,11 +279,13 @@ cmd_show_knowledge(const cmd_ctx_t *ctx)
   cmd_reply(ctx, line);
 
   snprintf(line, sizeof(line),
-      "  enabled=%s embed_model='%s'%s top_k=%u max_ctx_chars=%u chunk_max=%u",
+      "  enabled=%s embed_model='%s'%s top_k=%u lexical_k=%u"
+      " max_ctx_chars=%s chunk_max=%u",
       cfg.enabled ? "yes" : "no",
       effective_model,
       cfg.embed_model[0] != '\0' ? "" : " (inherited)",
-      cfg.rag_top_k, cfg.rag_max_context_chars, cfg.chunk_max_chars);
+      cfg.rag_top_k, cfg.rag_lexical_k,
+      max_ctx, cfg.chunk_max_chars);
   cmd_reply(ctx, line);
 }
 

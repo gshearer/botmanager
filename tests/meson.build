@@ -217,6 +217,19 @@ test_fact_merge = executable('test_fact_merge',
 # from knowledge_priv.h so it cannot drift from the one production
 # sends, and that header is all this needs — no plugin symbols, hence
 # no libcore.
+# The two-channel merge. Both defects it guards aborted the daemon and
+# neither was visible by reading, so the unit was split out of
+# knowledge.c (knowledge_rank.c) to be compiled straight into this
+# binary: it is pure, so no database, allocator or lock comes with it.
+test_knowledge_rank = executable('test_knowledge_rank',
+  'test_knowledge_rank.c',
+  '../plugins/extension/inference/engine/knowledge_rank.c',
+  include_directories : [include_directories('.'), inc_include,
+                         include_directories(
+                             '../plugins/extension/inference/engine')],
+  link_with : [test_harness],
+)
+
 test_knowledge_dedup = executable('test_knowledge_dedup',
   'test_knowledge_dedup.c',
   include_directories : [include_directories('.'), inc_include,
@@ -522,6 +535,7 @@ test('hold', test_hold)
 test('baseprompt', test_baseprompt)
 test('warm_chain', test_warm_chain)
 test('fact_merge', test_fact_merge)
+test('knowledge_rank', test_knowledge_rank)
 test('knowledge_dedup', test_knowledge_dedup)
 test('kv_bot', test_kv_bot)
 test('set_bot', test_set_bot)
