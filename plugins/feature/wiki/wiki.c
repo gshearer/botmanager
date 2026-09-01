@@ -213,8 +213,6 @@ wiki_is_age(const char *word)
 }
 
 static const char wiki_usage[] =
-    // ⚠ 136 bytes: /help renders this into CMD_USAGE_SZ + 16 behind a
-    // "usage: " prefix and TRUNCATES silently past it.
     "wiki [-v] [-l] [-n N] <subject> [property] | wiki <subject> ? | "
     "wiki <property>=<value> | wiki Q<id> | wiki <person> age";
 

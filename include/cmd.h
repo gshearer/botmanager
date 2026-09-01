@@ -430,6 +430,14 @@ bool cmd_dispatch_resolved(bot_inst_t *inst, const method_msg_t *msg,
 // reply_sink_id is diverted to that sink instead — see §Reply sinks.
 bool cmd_reply(const cmd_ctx_t *ctx, const char *text);
 
+// Reply with a command's usage line behind the "usage: " prefix. A usage
+// string is a caller-owned pointer with no declared cap -- CMD_USAGE_SZ
+// bounds the buffers a caller may choose to BUILD one in, never the
+// string a registration hands core -- so the prefix is applied against
+// the length actually present. Nothing is written for a NULL or empty
+// usage.
+void cmd_reply_usage(const cmd_ctx_t *ctx, const char *usage);
+
 // Declare what this command's output means, before the cmd_reply that
 // carries it. Every reply made through this ctx from here on is tagged,
 // so an async command sets it on the ctx copy it kept with its request.
@@ -618,6 +626,9 @@ void cmd_exit(void);
 #include "task.h"
 #include "validate.h"
 #include "version.h"
+
+// What cmd_reply_usage() writes ahead of a usage string.
+#define CMD_USAGE_PREFIX "usage: "
 
 // Upper bound on the number of definitions cmd_unregister_path() will
 // remove in one call. A subtree larger than this is a registration bug,

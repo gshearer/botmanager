@@ -825,13 +825,7 @@ help_one_verb(const cmd_ctx_t *ctx, const cmd_def_t *parent,
   desc  = cmd_get_description(child);
   lng   = cmd_get_help_long(child);
 
-  if(usage != NULL && usage[0] != '\0')
-  {
-    char line[256];
-
-    snprintf(line, sizeof(line), "usage: %s", usage);
-    cmd_reply(ctx, line);
-  }
+  cmd_reply_usage(ctx, usage);
 
   if(desc != NULL && desc[0] != '\0')
     cmd_reply(ctx, desc);

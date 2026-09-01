@@ -1149,10 +1149,12 @@ cmd_parse_args(const char *args, const cmd_arg_desc_t *desc,
       // No more input. Check if remaining args are optional.
       if(!(desc[i].flags & CMD_ARG_OPTIONAL))
       {
-        char buf[CMD_USAGE_SZ + 16];
-        snprintf(buf, sizeof(buf), "usage: %s", usage);
+        // The usage line IS the refusal here, so the result is declared
+        // before it goes out rather than by cmd_arg_refuse after it.
+        cmd_result_set(ctx, CMD_RESULT_REFUSED);
+        cmd_reply_usage(ctx, usage);
 
-        return(cmd_arg_refuse(ctx, buf));
+        return(false);
       }
 
       break;
@@ -1962,6 +1964,44 @@ cmd_reply(const cmd_ctx_t *ctx, const char *text)
   return(rc);
 }
 
+// Every site that rendered this inline sized its buffer off CMD_USAGE_SZ
+// and cut whatever ran past it without a word -- wiki's grammar line lost
+// its last clause that way (#75). The stack path covers every usage in
+// the tree; the heap path is what makes the cut impossible rather than
+// merely unlikely.
+void
+cmd_reply_usage(const cmd_ctx_t *ctx, const char *usage)
+{
+  char   stack[CMD_USAGE_SZ + 16];
+  size_t ulen;
+
+  if(ctx == NULL || usage == NULL || usage[0] == '\0')
+    return;
+
+  ulen = strlen(usage);
+
+  // The heap line is assembled by length rather than by strlcpy: the
+  // size gcc can prove about it spans the whole size_t range, and its
+  // access attribute on strlcpy reads that as a possible null
+  // destination (-Wnonnull, ASan builds only). We hold the pointer and
+  // the length here, so the length-taking call is the right one anyway.
+  if(ulen + sizeof(CMD_USAGE_PREFIX) > sizeof stack)
+  {
+    char *heap = mem_alloc("cmd", "usage_line", ulen + sizeof(CMD_USAGE_PREFIX));
+
+    memcpy(heap, CMD_USAGE_PREFIX, sizeof(CMD_USAGE_PREFIX) - 1);
+    memcpy(heap + sizeof(CMD_USAGE_PREFIX) - 1, usage, ulen + 1);
+    cmd_reply(ctx, heap);
+    mem_free(heap);
+
+    return;
+  }
+
+  strlcpy(stack, CMD_USAGE_PREFIX, sizeof stack);
+  strlcat(stack, usage, sizeof stack);
+  cmd_reply(ctx, stack);
+}
+
 // The four misc toys each wrote this out, and the wording drifted between
 // them; the fixed half now lives in the declaration where it can be read
 // beside the command it speaks for.
@@ -2678,12 +2718,7 @@ cmd_builtin_help(const cmd_ctx_t *ctx)
     const char *usage_copy = d->usage;
     pthread_mutex_unlock(&cmd_mutex);
 
-    if(usage_copy != NULL && usage_copy[0] != '\0')
-    {
-      char line[CMD_USAGE_SZ + 16];
-      snprintf(line, sizeof(line), "usage: %s", usage_copy);
-      cmd_reply(ctx, line);
-    }
+    cmd_reply_usage(ctx, usage_copy);
 
     ext(ctx, rest);
     return;
@@ -2698,12 +2733,7 @@ cmd_builtin_help(const cmd_ctx_t *ctx)
   pthread_mutex_unlock(&cmd_mutex);
 
   // Always show usage line.
-  if(usage != NULL && usage[0] != '\0')
-  {
-    char line[CMD_USAGE_SZ + 16];
-    snprintf(line, sizeof(line), "usage: %s", usage);
-    cmd_reply(ctx, line);
-  }
+  cmd_reply_usage(ctx, usage);
 
   if(verbose)
   {

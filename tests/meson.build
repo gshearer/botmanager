@@ -380,6 +380,13 @@ test_cmd_inflight = executable('test_cmd_inflight',
   dependencies : core_deps,
 )
 
+test_cmd_usage_line = executable('test_cmd_usage_line',
+  'test_cmd_usage_line.c',
+  include_directories : [include_directories('.'), inc_include],
+  link_with : [test_harness, libcore],
+  dependencies : core_deps,
+)
+
 # The kraken WS multiplexer names a slot by its index in two places that
 # outlive the lock hold which made the index true — across the reconcile
 # emit window and across the ack round trip — while compaction reshuffles
@@ -564,6 +571,7 @@ test('curl_submit_wait', test_curl_submit_wait)
 test('curl_flight', test_curl_flight)
 test('cmd_argspec', test_cmd_argspec)
 test('cmd_inflight', test_cmd_inflight)
+test('cmd_usage_line', test_cmd_usage_line)
 test('kraken_ws_channels', test_kraken_ws_channels)
 test('wikimedia_parse', test_wikimedia_parse)
 test('gemini_ws_channels', test_gemini_ws_channels)
