@@ -11,6 +11,7 @@ inference_sources = [
   'knowledge_fetch.c',
   'acquire.c',
   'acquire_html.c',
+  'acquire_strip.c',
   'acquire_cmd.c',
   'acquire_reactive.c',
   'acquire_wiki.c',

@@ -230,6 +230,22 @@ test_knowledge_rank = executable('test_knowledge_rank',
   link_with : [test_harness],
 )
 
+# The acquisition engine's HTML-to-text stripper. It fed every acquired
+# chunk in the tree and spent months emitting 97-99% inline JavaScript
+# without a word — a parser whose failure is a WEAKER DIGEST, never an
+# error, which is why it needs rows. Pure, so acquire_strip.c compiles
+# straight in and no libcore comes with it; the image extractor it was
+# split out of reaches the allocator, a lock and the config.
+test_acq_strip = executable('test_acq_strip',
+  'test_acq_strip.c',
+  '../plugins/extension/inference/engine/acquire_strip.c',
+  include_directories : [include_directories('.'), inc_include,
+                         include_directories(
+                             '../plugins/extension/inference/engine'),
+                         include_directories('../plugins/service/searxng')],
+  link_with : [test_harness],
+)
+
 test_knowledge_dedup = executable('test_knowledge_dedup',
   'test_knowledge_dedup.c',
   include_directories : [include_directories('.'), inc_include,
@@ -536,6 +552,7 @@ test('baseprompt', test_baseprompt)
 test('warm_chain', test_warm_chain)
 test('fact_merge', test_fact_merge)
 test('knowledge_rank', test_knowledge_rank)
+test('acq_strip', test_acq_strip)
 test('knowledge_dedup', test_knowledge_dedup)
 test('kv_bot', test_kv_bot)
 test('set_bot', test_set_bot)

@@ -1,5 +1,5 @@
 // botmanager — MIT
-// Acquisition engine: HTML-to-text stripper + image extractor.
+// Acquisition engine: image extractor.
 
 #include "acquire_priv.h"
 #include "knowledge_priv.h"
@@ -9,119 +9,6 @@
 #include <stdlib.h>
 #include <string.h>
 #include <strings.h>
-
-// Minimal in-place HTML-to-text stripper for digest input. Walks the
-// input once:
-//   - Tags (<...>) are elided. Script/style blocks are stripped as
-//     ordinary tags; their contents remain but the digester tolerates
-//     the noise fine.
-//   - A small set of entities is decoded (&amp; &lt; &gt; &quot;
-//     &apos; &nbsp; &#38; &#039;). Unknown entities copy through.
-//   - Whitespace runs collapse to single spaces.
-//   - Leading/trailing whitespace trimmed.
-//
-// The output is NUL-terminated, guaranteed <= out_cap - 1 bytes.
-// Returns bytes written (excl. NUL).
-size_t
-acq_strip_html(const char *in, size_t in_len, char *out, size_t out_cap)
-{
-  size_t w;
-  bool   last_ws;
-  if(out_cap == 0) return(0);
-
-  w = 0;
-  last_ws = true;
-
-  for(size_t i = 0; i < in_len && w + 1 < out_cap; i++)
-  {
-    unsigned char c = (unsigned char)in[i];
-
-    // Tag elision.
-    if(c == '<')
-    {
-      while(i < in_len && in[i] != '>')
-        i++;
-      continue;
-    }
-
-    // Entity decode (very small table).
-    if(c == '&')
-    {
-      // Find the ';' within a short window.
-      size_t end = i + 1;
-
-      while(end < in_len && end - i < 8 && in[end] != ';')
-        end++;
-
-      if(end < in_len && in[end] == ';')
-      {
-        size_t len = end - i - 1;
-        const char *ent = in + i + 1;
-        char decoded = 0;
-
-        if(len == 3 && strncasecmp(ent, "amp", 3) == 0)   decoded = '&';
-        else if(len == 2 && strncasecmp(ent, "lt", 2) == 0)   decoded = '<';
-        else if(len == 2 && strncasecmp(ent, "gt", 2) == 0)   decoded = '>';
-        else if(len == 4 && strncasecmp(ent, "quot", 4) == 0) decoded = '"';
-        else if(len == 4 && strncasecmp(ent, "apos", 4) == 0) decoded = '\'';
-        else if(len == 4 && strncasecmp(ent, "nbsp", 4) == 0) decoded = ' ';
-        else if(len >= 2 && ent[0] == '#')
-        {
-          // Numeric entity — accept decimal only, common subset.
-          long v = strtol(ent + 1, NULL, 10);
-          if(v > 0 && v < 128) decoded = (char)v;
-        }
-
-        if(decoded != 0)
-        {
-          if(decoded == ' ' || decoded == '\t' || decoded == '\n')
-          {
-            if(!last_ws)
-            {
-              out[w++] = ' ';
-              last_ws = true;
-            }
-          }
-
-          else
-          {
-            out[w++] = decoded;
-            last_ws  = false;
-          }
-
-          i = end;                // jump past ';'
-          continue;
-        }
-
-        // Unknown entity — skip the whole &...; token to avoid noise.
-        i = end;
-        continue;
-      }
-
-      // No terminator — treat '&' as literal.
-    }
-
-    if(c == '\r' || c == '\n' || c == '\t' || c == ' ')
-    {
-      if(!last_ws)
-      {
-        out[w++] = ' ';
-        last_ws  = true;
-      }
-      continue;
-    }
-
-    out[w++] = (char)c;
-    last_ws  = false;
-  }
-
-  // Trim trailing whitespace.
-  while(w > 0 && out[w - 1] == ' ')
-    w--;
-
-  out[w] = '\0';
-  return(w);
-}
 
 // I1 — image extractor.
 //
