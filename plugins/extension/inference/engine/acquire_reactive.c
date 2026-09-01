@@ -769,6 +769,12 @@ acq_reactive_sxng_done(const sxng_response_t *resp)
         continue;
       }
 
+      // This is a page fetch like any other, and until 2026-08-31 it
+      // was the only one in the tree that sent no headers at all —
+      // a Chrome User-Agent off `core.curl.user_agent` with no Fetch
+      // Metadata behind it, which is the shape a WAF refuses.
+      knowledge_fetch_nav_headers(cr);
+
       (void)curl_request_set_prio(cr, CURL_PRIO_BULK);
 
       if(curl_request_submit(cr) != SUCCESS)
@@ -791,14 +797,24 @@ acq_reactive_sxng_done(const sxng_response_t *resp)
     return;
 }
 
-// Allocate + populate a job ctx from a dequeued job. Takes a read-
-// locked snapshot of the topic; caller holds acquire_entries_lock.
+// Allocate + populate a job ctx. Takes a read-locked snapshot of the
+// topic; caller holds acquire_entries_lock.
+//
+// Both firing paths land here on purpose. They used to keep a builder
+// each, and the proactive copy silently omitted `category` — so every
+// scheduled run searched SXNG_CAT_GENERAL whatever the topic declared,
+// and a `"category": "news"` topic was fed encyclopedia entries and news
+// front pages for as long as it ran. One builder is what stops the next
+// field going the same way.
+//
+// `query` is the proactive picker's already-chosen text; NULL derives it
+// from the topic's template against `subject`.
 static acq_job_ctx_t *
-acq_reactive_build_ctx(const acquire_bot_entry_t *e,
-    const acquire_topic_t *t, const char *subject)
+acq_job_ctx_build(const acquire_bot_entry_t *e, const acquire_topic_t *t,
+    const char *subject, const char *query, bool is_proactive)
 {
-  acq_job_ctx_t *ctx = mem_alloc(ACQUIRE_CTX, "reactive_ctx",
-      sizeof(*ctx));
+  acq_job_ctx_t *ctx = mem_alloc(ACQUIRE_CTX,
+      is_proactive ? "proactive_ctx" : "reactive_ctx", sizeof(*ctx));
 
   memset(ctx, 0, sizeof(*ctx));
   pthread_mutex_init(&ctx->lock, NULL);
@@ -809,10 +825,16 @@ acq_reactive_build_ctx(const acquire_bot_entry_t *e,
   snprintf(ctx->dest_corpus, sizeof(ctx->dest_corpus), "%s", e->dest_corpus);
 
   acq_build_keywords_csv(t, ctx->keywords_csv, sizeof(ctx->keywords_csv));
-  acq_build_query(t, subject, ctx->query, sizeof(ctx->query));
-  ctx->category = sxng_category_from_name(t->category);
+
+  if(query != NULL)
+    snprintf(ctx->query, sizeof(ctx->query), "%s", query);
+  else
+    acq_build_query(t, subject, ctx->query, sizeof(ctx->query));
+
+  ctx->category          = sxng_category_from_name(t->category);
   ctx->topic_max_sources = t->max_sources;
   ctx->encyclopedic      = t->encyclopedic;
+  ctx->is_proactive      = is_proactive;
 
   return(ctx);
 }
@@ -866,7 +888,7 @@ acq_reactive_process_one(acquire_bot_entry_t *e,
     return;
   }
 
-  ctx = acq_reactive_build_ctx(e, t_ref, job->subject);
+  ctx = acq_job_ctx_build(e, t_ref, job->subject, NULL, false);
 
   pthread_rwlock_unlock(&acquire_entries_lock);
 
@@ -1025,24 +1047,8 @@ acq_proactive_fire_locked(acquire_bot_entry_t *e, size_t topic_idx,
 
   // Build the ctx. Subject = topic name: a scheduled run has no chat
   // line to lift one from, and it is what any image harvested off the
-  // page is filed under. Keywords CSV still comes off the topic so the
-  // digester has the same lexical anchors as the reactive path.
-  ctx = mem_alloc(ACQUIRE_CTX, "proactive_ctx",
-      sizeof(*ctx));
-  memset(ctx, 0, sizeof(*ctx));
-  pthread_mutex_init(&ctx->lock, NULL);
-
-  snprintf(ctx->bot_name,    sizeof(ctx->bot_name),    "%s", e->name);
-  snprintf(ctx->topic_name,  sizeof(ctx->topic_name),  "%s", t->name);
-  snprintf(ctx->subject,     sizeof(ctx->subject),     "%s", t->name);
-  snprintf(ctx->dest_corpus, sizeof(ctx->dest_corpus), "%s", e->dest_corpus);
-  snprintf(ctx->query,       sizeof(ctx->query),       "%s", q);
-
-  acq_build_keywords_csv(t, ctx->keywords_csv, sizeof(ctx->keywords_csv));
-  ctx->topic_max_sources = t->max_sources;
-  ctx->encyclopedic      = t->encyclopedic;
-
-  ctx->is_proactive = true;
+  // page is filed under.
+  ctx = acq_job_ctx_build(e, t, t->name, q, true);
 
   if(out_query != NULL && out_query_sz > 0)
     snprintf(out_query, out_query_sz, "%s", q);

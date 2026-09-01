@@ -10,6 +10,7 @@
 
 #include "common.h"
 #include "clam.h"
+#include "curl.h"
 #include "kv.h"
 #include "alloc.h"
 
@@ -346,5 +347,15 @@ typedef struct cmd_ctx cmd_ctx_t;
 
 void knowledge_fetch_start(const cmd_ctx_t *ctx, const char *corpus,
     const char *url);
+
+// Put the header set a browser sends on a top-level navigation onto
+// `req`. Every page fetch in this plugin owes them: a browser
+// User-Agent -- which is what `core.curl.user_agent` holds -- arriving
+// with no Fetch Metadata beside it contradicts itself, and a
+// fingerprinting WAF scores the contradiction rather than the UA. It
+// refuses with an HTTP/2 RST_STREAM sent before any status line, so the
+// block reaches us as a *transport* error and reads as a flaky network.
+// Reasoning and the measurement: leaf `AGENTS.md §Key Points`.
+void knowledge_fetch_nav_headers(curl_request_t *req);
 
 #endif // BM_KNOWLEDGE_PRIV_H

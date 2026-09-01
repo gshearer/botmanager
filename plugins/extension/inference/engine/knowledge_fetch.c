@@ -65,14 +65,15 @@ kw_content_is_text(const char *ct)
       || strstr(lower, "text") != NULL);
 }
 
+// The headers a browser sends on a top-level navigation, in the order
+// it sends them. A copy of urlgrabber's array rather than an include:
+// an extension may not depend on a feature (PLUGIN.md §Layer Rules),
+// and seven string literals are the cheaper of the two wrongs. Within
+// this plugin, though, there is one copy and this is it — acquisition
+// fetches through here too.
 void
-knowledge_fetch_start(const cmd_ctx_t *ctx, const char *corpus,
-    const char *url)
+knowledge_fetch_nav_headers(curl_request_t *req)
 {
-  // The headers a browser sends on a top-level navigation, in the order
-  // it sends them. A copy of urlgrabber's array rather than an include:
-  // an extension may not depend on a feature (PLUGIN.md §Layer Rules),
-  // and seven string literals are the cheaper of the two wrongs.
   static const char *const nav_headers[] = {
     "Accept: text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
     "Accept-Language: en-US,en;q=0.9",
@@ -83,6 +84,16 @@ knowledge_fetch_start(const cmd_ctx_t *ctx, const char *corpus,
     "Sec-Fetch-User: ?1"
   };
 
+  // The curl core prepends, so walk the list backwards to land it on
+  // the wire in browser order.
+  for(size_t i = sizeof(nav_headers) / sizeof(nav_headers[0]); i > 0; i--)
+    curl_request_add_header(req, nav_headers[i - 1]);
+}
+
+void
+knowledge_fetch_start(const cmd_ctx_t *ctx, const char *corpus,
+    const char *url)
+{
   kw_fetch_t     *fc;
   curl_request_t *req;
   const char     *ua;
@@ -138,10 +149,7 @@ knowledge_fetch_start(const cmd_ctx_t *ctx, const char *corpus,
     return;
   }
 
-  // The curl core prepends, so walk the list backwards to land it on
-  // the wire in browser order.
-  for(size_t i = sizeof(nav_headers) / sizeof(nav_headers[0]); i > 0; i--)
-    curl_request_add_header(req, nav_headers[i - 1]);
+  knowledge_fetch_nav_headers(req);
 
   ua = kv_get_str(KW_KV_FETCH_UA);
 
