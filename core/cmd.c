@@ -1503,6 +1503,100 @@ cmd_permits(bot_inst_t *inst, const method_msg_t *msg, const cmd_def_t *def)
   return(check_permission(ns, username, def->group, def->level));
 }
 
+// Help interception — one answer to `--help`, on every surface
+
+static const char *help_skip_ws(const char *p);
+
+// Does `args` ask for help, rather than carry an argument?
+//
+// `--help` is unambiguous — nothing in this tree takes it as a value —
+// so it counts wherever the argument list opens with it. `-h` and the
+// bare word `help` are not: `!weather -h Cincinnati` is an hourly
+// forecast and `!ask help me finish this` is a question. Those two
+// count only when they are the whole argument list, which is what makes
+// the interception safe to run on every command rather than the handful
+// that thought to check.
+static bool
+args_ask_for_help(const char *args)
+{
+  if(args == NULL)
+    return(false);
+
+  if(strncmp(args, "--help", 6) == 0
+      && (args[6] == '\0' || args[6] == ' ' || args[6] == '\t'))
+    return(true);
+
+  if(strncmp(args, "-h", 2) == 0 && help_skip_ws(args + 2)[0] == '\0')
+    return(true);
+
+  return(strncasecmp(args, "help", 4) == 0
+      && help_skip_ws(args + 4)[0] == '\0');
+}
+
+// The resolved command's path in the space-delimited form /help parses
+// back — "show feature" for the leaf `feature`. def_path_locked already
+// walks the parent chain for the slash-joined registration form; the
+// separator is the only difference between them, and rewriting it is
+// cheaper than a second walk that could drift from the first.
+// Caller must hold cmd_mutex.
+static void
+help_path_locked(const cmd_def_t *d, char *out, size_t sz)
+{
+  def_path_locked(d, out, sz);
+
+  for(char *p = out; *p != '\0'; p++)
+  {
+    if(*p == '/')
+      *p = ' ';
+  }
+}
+
+// Answer a help request with the help system's own output, so that
+// `show feature --help` and `help show feature` cannot drift apart.
+// `path` is a resolved command path; cmd_mutex must NOT be held.
+//
+// The callback is core's own `cmd_builtin_help`, which is why it is
+// invoked with no in-flight record: there is no mapping here that can
+// go away underneath it.
+// returns: SUCCESS, or FAIL when no `help` command is registered
+static bool
+help_redirect(const char *path, bot_inst_t *inst, const method_msg_t *msg,
+    const char *username)
+{
+  cmd_def_t *help_cmd;
+  cmd_cb_t   cb;
+  void      *data;
+  cmd_ctx_t  ctx;
+
+  pthread_mutex_lock(&cmd_mutex);
+  help_cmd = def_find_locked("help");
+
+  if(help_cmd == NULL || help_cmd->cb == NULL)
+  {
+    pthread_mutex_unlock(&cmd_mutex);
+
+    return(FAIL);
+  }
+
+  cb   = help_cmd->cb;
+  data = help_cmd->data;
+  pthread_mutex_unlock(&cmd_mutex);
+
+  ctx = (cmd_ctx_t){
+    .bot      = inst,
+    .msg      = msg,
+    .args     = path,
+    .username = username,
+    .parsed   = NULL,
+    .data     = data,
+    .name     = "help",
+  };
+
+  cb(&ctx);
+
+  return(SUCCESS);
+}
+
 bool
 cmd_dispatch(bot_inst_t *inst, const method_msg_t *msg)
 {
@@ -1604,64 +1698,29 @@ cmd_dispatch(bot_inst_t *inst, const method_msg_t *msg)
   // Resolve subcommand if the matched command has children.
   resolve_subcmd_locked(&d, &args);
 
-  // Check for "help" trailing keyword — redirect to help system.
+  // A help request is answered by the help system, whatever this
+  // command would have made of the token. See args_ask_for_help.
+  if(args_ask_for_help(args))
   {
-    const char *ha = args;
-    while(*ha == ' ' || *ha == '\t') ha++;
-    if(strncasecmp(ha, "help", 4) == 0
-        && (ha[4] == '\0' || ha[4] == ' ' || ha[4] == '\t'))
-    {
-      // Build the resolved command path for the help system.
-      // Walk up the parent chain to build the path.
-      char help_args[METHOD_TEXT_SZ] = {0};
-      char *parts[16];
-      int depth = 0;
-      size_t off = 0;
-      cmd_def_t *help_cmd;
+    char path[CMD_USAGE_SZ];
 
-      for(cmd_def_t *p = d; p != NULL && depth < 16; p = p->parent)
-        parts[depth++] = p->name;
+    help_path_locked(d, path, sizeof(path));
+    pthread_mutex_unlock(&cmd_mutex);
 
-      for(int pi = depth - 1; pi >= 0; pi--)
-      {
-        size_t nlen = strlen(parts[pi]);
-        if(off + nlen + 1 < sizeof(help_args))
-        {
-          if(off > 0)
-            help_args[off++] = ' ';
-          memcpy(help_args + off, parts[pi], nlen);
-          off += nlen;
-        }
-      }
-      help_args[off] = '\0';
+    // The identity matters here: help hides what the caller may not
+    // run, so an admin asking about a gated command has to be
+    // recognised as one. The redirect predated the resolve and passed
+    // NULL, which answered every operator as an anonymous one.
+    username = bot_identity_resolve(inst, msg->inst, msg->sender,
+        msg->metadata, ubuf, sizeof(ubuf)) ? ubuf : NULL;
 
-      // Find the help command and dispatch to it.
-      help_cmd = def_find_locked("help");
-      if(help_cmd != NULL && help_cmd->cb != NULL)
-      {
-        cmd_cb_t help_cb = help_cmd->cb;
-        cmd_ctx_t help_ctx;
-
-        pthread_mutex_unlock(&cmd_mutex);
-
-        // Build a synthetic context with the path as args.
-        help_ctx = (cmd_ctx_t){
-          .bot = inst,
-          .msg = msg,
-          .args = help_args,
-          .username = NULL,
-          .parsed = NULL,
-          .data = help_cmd->data,
-        };
-
-        help_cb(&help_ctx);
-        __atomic_fetch_add(&cmd_stat_dispatches, 1, __ATOMIC_RELAXED);
-        bot_inc_cmd_count(inst);
-        return(SUCCESS);
-      }
-      pthread_mutex_unlock(&cmd_mutex);
+    if(help_redirect(path, inst, msg, username) != SUCCESS)
       return(FAIL);
-    }
+
+    __atomic_fetch_add(&cmd_stat_dispatches, 1, __ATOMIC_RELAXED);
+    bot_inc_cmd_count(inst);
+
+    return(SUCCESS);
   }
 
   // Method type check: reject if the command is not visible on this method.
@@ -3121,6 +3180,8 @@ cmd_dispatch_as(const char *cmd_name, const char *args,
   char arg_bufs[CMD_MAX_ARGS][CMD_ARG_SZ];
   cmd_inflight_t node;
   char cmd_leaf[CMD_NAME_SZ];
+  char help_path[CMD_USAGE_SZ];
+  bool want_help;
 
   if(cmd_name == NULL || cmd_name[0] == '\0')
     return(FAIL);
@@ -3143,6 +3204,14 @@ cmd_dispatch_as(const char *cmd_name, const char *args,
 
   // Resolve subcommand if the matched command has children.
   resolve_subcmd_locked(&d, &args);
+
+  // `d` is only valid under the lock, and the reply this redirect needs
+  // is synthesized below — so the path is taken here and the answer
+  // sent there.
+  want_help = args_ask_for_help(args);
+
+  if(want_help)
+    help_path_locked(d, help_path, sizeof(help_path));
 
   // Method type check.
   inst_type = method_inst_type(inst);
@@ -3172,6 +3241,24 @@ cmd_dispatch_as(const char *cmd_name, const char *args,
 
   if(reply_route != NULL)
     strlcpy(msg.reply_route, reply_route, sizeof(msg.reply_route));
+
+  // The same interception cmd_dispatch makes: an asserted-identity
+  // surface must not give a different answer to `--help` than a bot
+  // does. Ahead of the permission check for the same reason it is
+  // there — help_check_access hides what this caller may not run, and
+  // reports an unrunnable command exactly as it reports an absent one.
+  // ⚠ It sees no userns on this path (the context carries a bot, and
+  // this one has none), so a caller downgraded with botmanctl's `AS`
+  // is answered as an anonymous one.
+  if(want_help)
+  {
+    if(help_redirect(help_path, NULL, &msg, username) != SUCCESS)
+      return(FAIL);
+
+    __atomic_add_fetch(&cmd_stat_dispatches, 1, __ATOMIC_RELAXED);
+
+    return(SUCCESS);
+  }
 
   // Permission check — same formula as cmd_dispatch.
   if(!check_permission(ns, username, req_group, req_level))
