@@ -2411,12 +2411,25 @@ prompt_emit_knowledge(char *buf, size_t pos, size_t cap,
 {
   size_t block_start;
   size_t block_cap_bytes;
+  size_t n_emitted;
+  time_t now = time(NULL);
   char safe_sec[KNOWLEDGE_SECTION_SZ];
   char safe_txt[KNOWLEDGE_CHUNK_TEXT_SZ];
   char safe_url[KNOWLEDGE_SOURCE_URL_SZ];
 
+  // Traced empty, and before the early return, for the reason the
+  // memory block is (see prompt_emit_memory): "knowledge contributed
+  // nothing" is a result, and a silent return makes a working trace
+  // indistinguishable from a broken one.
   if(n_kchunks == 0 || pos >= cap)
+  {
+    clam(CLAM_DEBUG, "rag",
+        "trace=kblock target=%s rows=0/%zu bytes=0 cap=%u corpora=%s",
+        r->reply_target, n_kchunks, r->knowledge_max_chars,
+        r->knowledge_corpus);
+
     return pos;
+  }
 
   block_start = pos;
   // 0 is "no separate cap", not "use the default" -- restating
@@ -2428,6 +2441,8 @@ prompt_emit_knowledge(char *buf, size_t pos, size_t cap,
 
   pos += snprintf(buf + pos, cap - pos,
       "<<<KNOWLEDGE (corpora: %s)>>>\n", r->knowledge_corpus);
+
+  n_emitted = 0;
 
   for(size_t i = 0; i < n_kchunks && pos < cap; i++)
   {
@@ -2453,10 +2468,30 @@ prompt_emit_knowledge(char *buf, size_t pos, size_t cap,
     else
       pos += snprintf(buf + pos, cap - pos,
           "- %s%s\n", safe_txt, url_suffix);
+
+    n_emitted++;
+
+    // One line per chunk that actually reached the prompt — the rows the
+    // byte budget cut never appear, because this traces the PROMPT and
+    // not the retrieval. `corpus` is the field with no other reporter:
+    // a bot binds several corpora and they are ranked as one pool, so
+    // which one won a slot is invisible everywhere else, including in
+    // the block itself.
+    clam(CLAM_DEBUG, "rag",
+        "trace=kinject target=%s corpus=%s cos=%.3f id=%" PRId64
+        " age=%lldd head='%.90s'",
+        r->reply_target, kchunks[i].corpus, (double)kchunks[i].score,
+        kchunks[i].id,
+        (long long)((now - kchunks[i].created) / 86400), safe_txt);
   }
 
   if(pos < cap)
     pos += snprintf(buf + pos, cap - pos, "<<<END KNOWLEDGE>>>\n\n");
+
+  clam(CLAM_DEBUG, "rag",
+      "trace=kblock target=%s rows=%zu/%zu bytes=%zu cap=%u corpora=%s",
+      r->reply_target, n_emitted, n_kchunks, pos - block_start,
+      r->knowledge_max_chars, r->knowledge_corpus);
 
   return pos;
 }

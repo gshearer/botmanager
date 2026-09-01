@@ -235,7 +235,7 @@ halves. Same shape as `gemini` / `gemini.ws`.
 | `irc` | plugins/method/irc/irc_protocol.c | IRC method driver |
 | `memory` | plugins/bot/chat/memory_rag.c | chat memory subsystem + RAG |
 | `nl_bridge` | plugins/bot/chat/reply.c | natural-language bridge surface |
-| `rag` | plugins/bot/chat/reply.c | what retrieval actually put in the prompt — one `trace=inject` line per surviving RECENT CONVERSATION row (`src=recall` vs `src=mention`, with cosine) plus a `trace=block` summary |
+| `rag` | plugins/bot/chat/reply.c | what retrieval actually put in the prompt. Conversation memory: one `trace=inject` line per surviving RECENT CONVERSATION row (`src=recall` vs `src=mention`, with cosine) plus a `trace=block` summary. Knowledge: one `trace=kinject` line per surviving chunk carrying `corpus=` and `age=` plus a `trace=kblock` summary — **`corpus` has no other reporter**, since a bot's corpora are ranked as one pool and the block itself names only the list |
 | `nl_observe` | plugins/bot/chat/nl_observe.c | post-dispatch chat observer (`OBS_CTX`) |
 | `occasions` | plugins/bot/chat/occasions.c | the occasions chore — a birthday claimed for the year and the wish held until its subject turns up (`OCCASIONS_CTX`) |
 | `pricewatch` | plugins/bot/chat/pricewatch.c | the price watch — watchlist curation, the ticker sweep, and each crossing claimed once into a deferred report (`PRICEWATCH_CTX`) |
