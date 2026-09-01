@@ -208,13 +208,13 @@ static const plugin_kv_entry_t chatbot_inst_schema[] = {
     " row stays disarmed for this long first, and the next thing you say"
     " after that delivers it. 0 = the default 1800 (30 minutes).", NULL },
   { "behavior.soul.weather.enabled", KV_BOOL, "false",
-    "Proactive weather watch: each sweep scans the namespace's"
-    " city_of_interest facts (written by the NL bridge observer after"
-    " a successful /weather), fetches active NWS alerts per distinct"
-    " coordinate and announces fresh ones in persona — once per alert,"
-    " claimed as 'wxalert:<id>' in the soul's shared chat_soul_claims"
-    " ledger. Off by default: unprompted speech is an operator"
-    " decision.", NULL },
+    "Proactive weather watch: each sweep takes one location per person"
+    " — a stated postal_code, else location, else the newest"
+    " city_of_interest the NL bridge observer wrote after a successful"
+    " /weather — fetches active NWS alerts per distinct coordinate and"
+    " announces fresh ones in persona, once per alert, claimed as"
+    " 'wxalert:<id>' in the soul's shared chat_soul_claims ledger. Off"
+    " by default: unprompted speech is an operator decision.", NULL },
   { "behavior.soul.weather.interval_secs", KV_UINT32, "600",
     "Seconds between weather watch sweeps (min 5). The soul tick still"
     " paces the floor: a sweep fires on the first tick after this"

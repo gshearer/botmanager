@@ -436,9 +436,10 @@ soul_on_seen(const char *bot_name, const method_msg_t *msg)
 
 // ---------- chore: weather (D8) ----------
 //
-// The watch: every dossier in the bot's namespace that carries a
-// city_of_interest fact (written by nl_observe after a successful
-// bridged /weather) is a standing request to keep an eye on that sky.
+// The watch: every dossier in the bot's namespace that says where its
+// person is — a stated postal_code or location, or failing those a
+// city_of_interest fact — is a standing request to keep an eye on that
+// sky.
 // Each run scans the watch list, geocodes on this worker thread (the
 // sync geocoders are worker-only and internally cached), collapses
 // shared coordinates, and fans one weathergov_alerts_async out per
@@ -1115,10 +1116,14 @@ soul_chore_weather(soul_sched_t *s, uint32_t chore,
     return(false);
   }
 
-  // The watch list (fact 7): each dossier's NEWEST city_of_interest
-  // fact — a user who moved their attention watches one sky, their
-  // current one — with the newest signature as the deliverable
-  // identity and the fact's channel as the delivery room.
+  // The watch list (fact 7): one row per dossier, picked down a
+  // ladder. A postal code geocodes to exactly one place; a city string
+  // geocodes to the first row of a name search, and a stated home
+  // still beats a place they merely asked about — so postal_code beats
+  // location beats the newest city_of_interest. Within a rung the
+  // newest wins: a user who moved their attention watches one sky,
+  // their current one. The newest signature is the deliverable
+  // identity and the fact's channel is the delivery room.
   snprintf(sql, sizeof(sql),
       "SELECT DISTINCT ON (df.dossier_id) df.fact_value, df.channel,"
       " d.display_label, COALESCE(sg.nickname,''),"
@@ -1131,9 +1136,12 @@ soul_chore_weather(soul_sched_t *s, uint32_t chore,
       "  WHERE dossier_id = df.dossier_id"
       "  ORDER BY last_seen DESC LIMIT 1) sg ON TRUE"
       " WHERE d.ns_id = %" PRIu32
-      " AND df.fact_key LIKE 'city_of_interest:%%'"
+      " AND (df.fact_key IN ('postal_code', 'location')"
+      "  OR df.fact_key LIKE 'city_of_interest:%%')"
       " AND " MEM_SRC_CHORE_KEYABLE("df.source")
-      " ORDER BY df.dossier_id, df.last_seen DESC"
+      " ORDER BY df.dossier_id,"
+      " CASE df.fact_key WHEN 'postal_code' THEN 0"
+      " WHEN 'location' THEN 1 ELSE 2 END, df.last_seen DESC"
       " LIMIT %d",
       s->ns_id, SOUL_WX_ROWS_MAX);
 
