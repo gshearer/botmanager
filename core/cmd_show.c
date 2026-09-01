@@ -868,9 +868,9 @@ cmd_show_version(const cmd_ctx_t *ctx)
 {
   char buf[128];
 
-  snprintf(buf, sizeof(buf), "BotManager v%u.%u (build #%u)",
+  snprintf(buf, sizeof(buf), "BotManager v%u.%u.%u",
       (uint32_t)BM_VERSION_MAJOR, (uint32_t)BM_VERSION_MINOR,
-      (uint32_t)BM_BUILD_NUM);
+      (uint32_t)BM_VERSION_BUILD);
   cmd_reply(ctx, buf);
 }
 

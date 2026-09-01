@@ -58,7 +58,10 @@ ninja -C build -t clean && ninja -C build 2>&1 | grep -c 'warning:'
 ```
 
 `scripts/gen_version_h.sh` runs every build and bumps the `BUILDNUM` file
-at the project root.
+at the project root. The version is `major.minor.build`: major and minor are
+set in `meson.build` (`bm_version_major` / `bm_version_minor`), and the build
+number counts builds of that pair. `BUILDNUM` stores the pair it is counting
+for, so bumping minor — or major — restarts the build number at 0.
 
 ## Test
 

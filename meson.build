@@ -1,5 +1,5 @@
 project('botmanager', 'c',
-  version : '0.1',
+  version : '0.2',
   default_options : [
     'c_std=gnu11',
     'warning_level=3',
@@ -32,9 +32,10 @@ if get_option('optimization') != '0' and get_option('b_sanitize') == 'none'
 endif
 
 bm_version_major = '0'
-bm_version_minor = '1'
+bm_version_minor = '2'
 
-# Generate version.h with auto-incrementing build number.
+# Generate version.h. Version is major.minor.build; the build number counts
+# builds of the current major.minor and restarts at 0 when either changes.
 # This runs on every build, ensuring the build number always advances.
 gen_version = custom_target('version_h',
   output : 'version.h',
