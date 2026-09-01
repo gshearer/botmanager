@@ -23,6 +23,23 @@ Description=kokorod — Kokoro TTS server (reachy senses)
 Documentation=https://github.com/k2-fsa/sherpa-onnx
 After=default.target
 
+# ⚠⚠ HOST GATE (2026-08-30). /home/doc and /mnt/fast are both shared
+# out to the parent host and to the other LXC containers under
+# /mnt/fast/lxc, so this unit file AND the default.target.wants/ symlink
+# that enables it are visible on every one of them — as are the venvs,
+# binaries and model weights the unit refers to. Without this gate each
+# of those hosts started its own copy.
+#
+# The marker lives on the container rootfs, which is NOT either shared
+# mount, so it exists on this host and nowhere else. Deliberately a file
+# rather than ConditionHost=: a hostname is renameable, and a rename
+# would disable autostart silently with no error anywhere. Create it
+# when installing this unit:
+#     sudo touch /etc/botmanager-host
+# A failed condition makes systemd SKIP the unit quietly — Result is
+# success, not failed — so Restart= does not engage.
+ConditionPathExists=/etc/botmanager-host
+
 [Service]
 Type=simple
 WorkingDirectory=/mnt/fast/doc/projects/botmanager/senses/kokorod
