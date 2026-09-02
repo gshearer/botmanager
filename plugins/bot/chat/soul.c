@@ -47,6 +47,7 @@
 #define SOUL_WX_POINTS_MAX            32
 #define SOUL_WX_WATCHERS_MAX          8
 #define SOUL_WX_CUE_ALERTS_MAX        3
+#define SOUL_WX_CHAN_SLOTS            16
 
 // "wxalert:" + a CAP urn (WEATHERGOV_ID_SZ, measured 96 of 200).
 #define SOUL_WX_CLAIM_KEY_SZ          (WEATHERGOV_ID_SZ + 16)
@@ -463,7 +464,7 @@ typedef struct
   int64_t dossier_id;                  // who the per-person budget bills
   char  label[METHOD_NICKNAME_SZ];
   char  city[128];                     // fact_value, as the user typed it
-  char  channel[METHOD_CHANNEL_SZ];    // where the fact was observed; "" = DM
+  char  channel[METHOD_CHANNEL_SZ];    // room resolved at announce; "" = DM
   char  sender[METHOD_SENDER_SZ];
   chat_identity_t who;
 } soul_wx_watcher_t;
@@ -695,6 +696,98 @@ soul_wx_append(char *buf, size_t cap, size_t *off, const char *fmt, ...)
   if(*off > cap)   *off  = cap;
 }
 
+// ---------- watcher -> room ----------
+//
+// A weather warning is a group-chat message. The room is therefore a
+// property of where the bot and the watcher can see each other NOW,
+// and not of where the watcher once happened to state their address —
+// which is what `dossier_facts.channel` records, and which pinned every
+// later alert into the DM a home was first mentioned in.
+//
+// First joined channel holding the watcher wins; join order breaks the
+// tie and nothing here prefers one room over another. A watcher in none
+// of them — reachable on the method but sharing no channel with the bot
+// — keeps an empty channel and falls through to the DM target the
+// grouping below already builds. That case is rare and is deliberately
+// given no further accounting.
+
+typedef struct
+{
+  char   channels[SOUL_WX_CHAN_SLOTS][METHOD_CHANNEL_SZ];
+  size_t n_channels;
+} soul_wx_chan_collect_t;
+
+static void
+soul_wx_collect_joined_cb(const char *channel, void *data)
+{
+  soul_wx_chan_collect_t *cc = data;
+
+  if(channel == NULL || channel[0] == '\0')
+    return;
+
+  if(cc->n_channels >= SOUL_WX_CHAN_SLOTS)
+    return;
+
+  snprintf(cc->channels[cc->n_channels], METHOD_CHANNEL_SZ, "%s", channel);
+  cc->n_channels++;
+}
+
+// One enumeration per channel places every watcher in it, so the cost
+// is the bot's channel count rather than channels x watchers.
+typedef struct
+{
+  soul_wx_sweep_t *sweep;
+  const char      *channel;
+} soul_wx_room_fill_t;
+
+static void
+soul_wx_room_member_cb(const char *nick, void *data)
+{
+  soul_wx_room_fill_t *f = data;
+
+  if(nick == NULL || nick[0] == '\0')
+    return;
+
+  for(uint8_t p = 0; p < f->sweep->n_points; p++)
+    for(uint8_t wi = 0; wi < f->sweep->points[p].n_watchers; wi++)
+    {
+      soul_wx_watcher_t *w = &f->sweep->points[p].watchers[wi];
+
+      if(w->channel[0] != '\0')        // already placed; first room keeps them
+        continue;
+
+      if(strcasecmp(w->label, nick) == 0)
+        snprintf(w->channel, sizeof(w->channel), "%s", f->channel);
+    }
+}
+
+// Called on the batch worker with `method` held for the whole task.
+// Neither callback reaches back into the driver, so the roster is
+// copied out before any member enumeration begins.
+static void
+soul_wx_resolve_rooms(soul_wx_sweep_t *sweep, method_inst_t *method)
+{
+  soul_wx_chan_collect_t cc;
+
+  for(uint8_t p = 0; p < sweep->n_points; p++)
+    for(uint8_t wi = 0; wi < sweep->points[p].n_watchers; wi++)
+      sweep->points[p].watchers[wi].channel[0] = '\0';
+
+  memset(&cc, 0, sizeof(cc));
+  method_list_joined_channels(method, soul_wx_collect_joined_cb, &cc);
+
+  for(size_t ci = 0; ci < cc.n_channels; ci++)
+  {
+    soul_wx_room_fill_t fill;
+
+    fill.sweep   = sweep;
+    fill.channel = cc.channels[ci];
+
+    method_list_channel(method, cc.channels[ci], soul_wx_room_member_cb,
+        &fill);
+  }
+}
+
 static bool
 soul_wx_watcher_in_target(const soul_wx_watcher_t *w,
     const soul_wx_target_t *t)
@@ -866,6 +959,10 @@ soul_wx_batch_task(task_t *t)
 
   if(st != NULL && method != NULL)
   {
+    // Rooms first: grouping, the voice gate's per-person billing and
+    // the cue's own wording all read watcher->channel.
+    soul_wx_resolve_rooms(sweep, method);
+
     floor = soul_wx_severity_floor(sweep->bot_name);
 
     // Pass 1 — collect the sweep's DISTINCT alerts (by CAP id) across
@@ -1123,9 +1220,10 @@ soul_chore_weather(soul_sched_t *s, uint32_t chore,
   // location beats the newest city_of_interest. Within a rung the
   // newest wins: a user who moved their attention watches one sky,
   // their current one. The newest signature is the deliverable
-  // identity and the fact's channel is the delivery room.
+  // identity; the delivery room is resolved from live channel
+  // membership at announce time, never from where the fact was said.
   snprintf(sql, sizeof(sql),
-      "SELECT DISTINCT ON (df.dossier_id) df.fact_value, df.channel,"
+      "SELECT DISTINCT ON (df.dossier_id) df.fact_value,"
       " d.display_label, COALESCE(sg.nickname,''),"
       " COALESCE(sg.username,''), COALESCE(sg.hostname,''),"
       " COALESCE(sg.verified_id,''), df.dossier_id"
@@ -1184,12 +1282,12 @@ soul_chore_weather(soul_sched_t *s, uint32_t chore,
     char               pkey[32];
 
     db_result_copy(city,  sizeof(city),  res, i, 0);
-    db_result_copy(label, sizeof(label), res, i, 3);
+    db_result_copy(label, sizeof(label), res, i, 2);
 
     // Signature nickname first, dossier label as fallback; a row with
     // neither is unaddressable and skipped whole.
     if(label[0] == '\0')
-      db_result_copy(label, sizeof(label), res, i, 2);
+      db_result_copy(label, sizeof(label), res, i, 1);
 
     if(city[0] == '\0' || label[0] == '\0')
       continue;
@@ -1237,14 +1335,13 @@ soul_chore_weather(soul_sched_t *s, uint32_t chore,
 
     // Only a DM cue bills a person — see the announce loop — but the
     // id rides every watcher so the two target kinds stay symmetric.
-    did           = db_result_get(res, i, 7);
+    did           = db_result_get(res, i, 6);
     w->dossier_id = did != NULL ? strtoll(did, NULL, 10) : 0;
 
-    db_result_copy(w->channel,     sizeof(w->channel),     res, i, 1);
-    db_result_copy(w->who.nickname,    sizeof(w->who.nickname),    res, i, 3);
-    db_result_copy(w->who.username,    sizeof(w->who.username),    res, i, 4);
-    db_result_copy(w->who.hostname,    sizeof(w->who.hostname),    res, i, 5);
-    db_result_copy(w->who.verified_id, sizeof(w->who.verified_id), res, i, 6);
+    db_result_copy(w->who.nickname,    sizeof(w->who.nickname),    res, i, 2);
+    db_result_copy(w->who.username,    sizeof(w->who.username),    res, i, 3);
+    db_result_copy(w->who.hostname,    sizeof(w->who.hostname),    res, i, 4);
+    db_result_copy(w->who.verified_id, sizeof(w->who.verified_id), res, i, 5);
     snprintf(w->sender, sizeof(w->sender), "%s", label);
   }
 
