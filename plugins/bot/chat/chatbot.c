@@ -2883,7 +2883,8 @@ const bot_driver_t chatbot_driver = {
   // CARE-4 says a banged command is answered by the tool, and it still
   // is: nothing reaches this slot unless a command surface asked for it
   // (bot.h §bot_persona_reply) and its own knob is on.
-  .persona_reply = chatbot_persona_reply,
+  .persona_reply  = chatbot_persona_reply,
+  .remember_event = chatbot_remember_event,
 };
 
 static bool

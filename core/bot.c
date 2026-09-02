@@ -448,6 +448,64 @@ bot_msg_handler(const method_msg_t *msg, void *data)
   bot_release(bot);
 }
 
+// Record an event in a bot's own memory. The command surfaces are the
+// only things that know what they did -- their output leaves over
+// method_send and never comes back past the bot -- so this is the door
+// they say so through, and it goes down to core for exactly the reason
+// bot_persona_reply does: the memory belongs to `chat` and PLUGIN.md
+// Rule 2 forbids a feature plugin reaching up into it.
+//
+// Nothing is sent to the room. A caller that wants both speaks for
+// itself and then calls this.
+bool
+bot_remember_event(const char *botname, const char *method_kind,
+    const char *channel, const char *text)
+{
+  bot_inst_t         *bot;
+  const bot_driver_t *drv;
+  void               *handle;
+  uint64_t            id = 0;
+  bool                kept;
+
+  if(botname == NULL || text == NULL || text[0] == '\0')
+    return(false);
+
+  // ⛔ Deliberately not bot_find() + `->id`. That is the shape
+  // bot_persona_reply uses and it is safe THERE because the dispatcher
+  // handed it a bot already known live for the command's duration; here
+  // the caller has only a name, and a bot_destroy between the lookup
+  // returning and the id being read would be a read of freed memory.
+  // The id comes out under the lock instead, and the acquire below
+  // takes it from there — an id that no longer resolves simply fails,
+  // which is the same answer as a bot that has gone.
+  pthread_mutex_lock(&bot_mutex);
+
+  for(bot_inst_t *b = bot_list; b != NULL; b = b->next)
+    if(strncasecmp(b->name, botname, BOT_NAME_SZ) == 0)
+    {
+      id = b->id;
+      break;
+    }
+
+  pthread_mutex_unlock(&bot_mutex);
+
+  if(id == 0)
+    return(false);
+
+  if(!bot_driver_acquire(id, &bot, &drv, &handle))
+    return(false);
+
+  if(drv->remember_event == NULL)
+  {
+    bot_release(bot);
+    return(false);
+  }
+
+  kept = drv->remember_event(handle, method_kind, channel, text);
+  bot_release(bot);
+  return(kept);
+}
+
 // A command surface asking the mind for a line in its own voice. The
 // reference discipline is bot_msg_handler's, for the same reason: the
 // vtable and the handle belong to a plugin that a /plugin reload may

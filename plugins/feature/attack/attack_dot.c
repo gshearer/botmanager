@@ -79,6 +79,20 @@ atk_dot_speak(const atk_dot_due_t *d, const atk_tunables_t *t,
       (d->noun[0] != '\0') ? d->noun : atk_fallback_noun(d->kind),
       (int)force);
 
+  // The third way a combatant dies, and the one that needs no context at
+  // all — the bot marks come off the roster, which is the only place
+  // this task can ask (board #86).
+  {
+    atk_player_t src_row = { 0 };
+    atk_player_t vic_row = { 0 };
+
+    atk_db_player_get(d->round_id, d->source, &src_row);
+    atk_db_player_get(d->round_id, d->victim, &vic_row);
+
+    atk_bot_remember_death(method_inst_kind(inst), d->channel,
+        src_row.bot, d->source_nick, vic_row.bot, d->victim_nick);
+  }
+
   method_release(inst);
 }
 

@@ -217,6 +217,47 @@ atk_bot_account(const userns_t *ns, const char *botname, char *out, size_t cap)
 }
 
 // ------------------------------------------------------------------ //
+// What a combatant remembers                                          //
+// ------------------------------------------------------------------ //
+
+// A bot that fought through a command has no record of having fought:
+// the pit answers over cmd_reply, which never reaches the bot's own
+// message path, so hedgehogg was killed in #cabal and then asked "gg"
+// about a match it had never heard of (board #86).
+//
+// Only the death is kept. It is the one thing about a brawl anybody
+// still knows an hour later, and it is what the pit's own ledger keeps
+// too — a round ended with `--end` records no slayer, no kill and no
+// death, and this agrees with it rather than inventing a memory the
+// scoreboard does not have.
+void
+atk_bot_remember_death(const char *method_kind, const char *channel,
+    const char *slayer_bot, const char *slayer_nick,
+    const char *fallen_bot, const char *fallen_nick)
+{
+  char line[ATK_LINE_SZ];
+
+  // Written in the third person on purpose: it is filed as something
+  // the bot WITNESSED, not as something it said, so it reads back the
+  // way anything else it saw happen does.
+  if(slayer_bot != NULL && slayer_bot[0] != '\0')
+  {
+    snprintf(line, sizeof(line), "%s killed %s in the duelling pit.",
+        slayer_nick, fallen_nick);
+    bot_remember_event(slayer_bot, method_kind, channel, line);
+  }
+
+  // Both, when a bot kills a bot: each remembers its own half, and
+  // neither is told about the other's.
+  if(fallen_bot != NULL && fallen_bot[0] != '\0')
+  {
+    snprintf(line, sizeof(line), "%s was killed by %s in the duelling pit.",
+        fallen_nick, slayer_nick);
+    bot_remember_event(fallen_bot, method_kind, channel, line);
+  }
+}
+
+// ------------------------------------------------------------------ //
 // The turn                                                            //
 // ------------------------------------------------------------------ //
 

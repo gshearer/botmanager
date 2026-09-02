@@ -1,5 +1,8 @@
 // botmanager — MIT
-// /remember and /forget — keeping a fact the moment somebody says it.
+// /remember and /forget — keeping a fact the moment somebody says it,
+// and chatbot_remember_event(), which keeps what HAPPENED the moment it
+// happens: the bot_driver_t slot a command surface uses to tell this
+// bot about something it did that it would otherwise never see.
 #define CHATBOT_INTERNAL
 #include "chatbot.h"
 
@@ -394,4 +397,56 @@ chatbot_remember_register(void)
 fail_forget:
   cmd_unregister_path("remember");
   return(FAIL);
+}
+
+// ------------------------------------------------------------------ //
+// The remember_event slot                                             //
+// ------------------------------------------------------------------ //
+
+// Something a command surface did on this bot's behalf, written into
+// its memory as an overheard line.
+//
+// WITNESS and not EXCHANGE_OUT, and the distinction is the whole point:
+// the bot did not SAY this, and a line it said is not what recall gives
+// back (memory.h). Filed as something true of the room, it comes back
+// like any other thing the bot saw happen.
+//
+// `dossier_id` is left at 0 — nobody in particular said it. The column
+// is nullable and memory_log_message writes NULL for a zero, which is
+// the honest answer: an event has a room and a time, not a speaker.
+bool
+chatbot_remember_event(void *handle, const char *method_kind,
+    const char *channel, const char *text)
+{
+  chatbot_state_t *st = handle;
+  userns_t        *ns;
+  mem_msg_t        out = {0};
+
+  if(st == NULL || text == NULL || text[0] == '\0')
+    return(false);
+
+  ns = bot_get_userns(st->inst);
+
+  if(ns == NULL)
+    return(false);
+
+  out.ns_id        = (int)ns->id;
+  out.user_id_or_0 = 0;
+  out.dossier_id   = 0;
+  out.kind         = MEM_MSG_WITNESS;
+
+  snprintf(out.bot_name, sizeof(out.bot_name), "%s",
+      bot_inst_name(st->inst));
+  snprintf(out.method,  sizeof(out.method),  "%s",
+      method_kind != NULL ? method_kind : "");
+  snprintf(out.channel, sizeof(out.channel), "%s",
+      channel != NULL ? channel : "");
+  snprintf(out.text,    sizeof(out.text),    "%s", text);
+
+  memory_log_message(&out);
+
+  clam(CLAM_DEBUG, "chatbot", "bot=%s remembered on %s: %.120s",
+      out.bot_name, out.channel, out.text);
+
+  return(true);
 }

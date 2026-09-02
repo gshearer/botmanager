@@ -1236,6 +1236,12 @@ const char *verb_reply_to_addr(const verb_reply_to_t *to);
 bool chatbot_persona_reply(void *handle, const cmd_ctx_t *ctx,
     const char *instruction, const char *plain, const char *tail);
 
+// The bot_driver_t.remember_event slot — remember.c. Writes one
+// WITNESS row: what a command surface did on this bot's behalf, which
+// its own message path never sees.
+bool chatbot_remember_event(void *handle, const char *method_kind,
+    const char *channel, const char *text);
+
 // ---- interpret.c ----
 // (Below chatbot_req_t — the begin call reads the request record.)
 

@@ -68,6 +68,12 @@ typedef struct
   // phrasing. See bot_persona_reply below for why it exists.
   bool (*persona_reply)(void *handle, const cmd_ctx_t *ctx,
       const char *instruction, const char *plain, const char *tail);
+
+  // Optional: record that `text` happened, as something this bot
+  // witnessed rather than something it said. `channel` is the room it
+  // happened in. See bot_remember_event below for what it is for.
+  bool (*remember_event)(void *handle, const char *method_kind,
+      const char *channel, const char *text);
 } bot_driver_t;
 
 typedef struct
@@ -174,6 +180,32 @@ void bot_iterate(bot_iter_cb_t cb, void *data);
 // may carry colour markers of its own; a model's cannot, by design.
 bool bot_persona_reply(const cmd_ctx_t *ctx, const char *instruction,
     const char *plain, const char *tail);
+
+// Tell the mind driving `botname` that something happened to it.
+//
+// ⭑⭑ It exists because a bot that ACTS THROUGH A COMMAND has no record
+// of having acted. A command surface answers over cmd_reply /
+// method_send, which never touches the bot's own message path, so
+// nothing it does that way is in its memory: the duelling pit shipped a
+// bot combatant that fought, won, died and was asked "gg" about a match
+// it had no record of (board #86). The command surface is the only
+// thing that knows the event happened, and this is how it says so.
+//
+// Recorded as WITNESSED, not as something the bot said — it is a fact
+// about the room. That is also the only kind that comes back: a bot's
+// own replies are not what recall returns.
+//
+// ⚠ One line per EVENT, never per step. This writes to the bot's
+// conversation memory and its retrieval corpus, so a caller that logs
+// every move of a game poisons both. Ask what the bot would still know
+// an hour later and record that.
+//
+// `method_kind` is the method's kind string ("irc"), not an instance
+// name. False means nothing was recorded: no such bot, no mind bound,
+// or no remember_event slot. There is no delivery and nothing is said
+// in the room -- this is memory, not speech.
+bool bot_remember_event(const char *botname, const char *method_kind,
+    const char *channel, const char *text);
 
 const char *bot_driver_name(const bot_inst_t *inst);
 uint32_t bot_method_count(const bot_inst_t *inst);

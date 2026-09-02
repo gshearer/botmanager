@@ -847,6 +847,17 @@ atk_cmd_attack(const cmd_ctx_t *ctx)
 
         if(atk_eject(ctx, &t, src_nick, victim[i].nick) != METHOD_EJECT_NONE)
           ejected++;
+
+        // The roster row carries the bot mark; the victim struct is the
+        // turn's own and does not.
+        {
+          atk_player_t fell_row;
+
+          if(atk_db_player_get(round.id, victim[i].user, &fell_row))
+            atk_bot_remember_death(method_inst_kind(ctx->msg->inst),
+                ctx->msg->channel, src_bot, src_nick,
+                fell_row.bot, victim[i].nick);
+        }
       }
 
     if(fell > 0)
@@ -960,6 +971,12 @@ atk_cmd_attack(const cmd_ctx_t *ctx)
 
     clam(CLAM_INFO, ATK_CTX, "round %" PRId64 ": %s slew %s (eject=%d)",
         round.id, ctx->username, tgt_user, (int)force);
+
+    // After the door, not before: a bot that just KILLed itself off the
+    // network is reconnecting, and the memory is written here rather
+    // than in the room, so neither waits on the other.
+    atk_bot_remember_death(method_inst_kind(ctx->msg->inst),
+        ctx->msg->channel, src_bot, src_nick, tgt_bot, nick);
   }
 
   // Outside the lock, and it has to be: the mind is reached through an

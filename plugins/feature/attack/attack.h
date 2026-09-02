@@ -1194,6 +1194,20 @@ bool atk_bot_account(const userns_t *ns, const char *botname,
 bool atk_commands_register(void);
 void atk_commands_unregister(void);
 
+// Tell whichever of the two combatants is a bot how the fight ended.
+// `slayer_bot` / `fallen_bot` are the `bot` marks off the two player
+// rows, empty for a person, and either or both may be empty — the call
+// is a no-op then, which is the common case.
+//
+// ⚠ ONE call per DEATH, and nothing per turn: this writes to a mind's
+// conversation memory and its retrieval corpus (include/bot.h), and a
+// blow-by-blow would drown both. A round that ends without a death
+// records nothing, exactly as the pit's own ledger does — `--end` takes
+// no slayer, no kill and no death either.
+void atk_bot_remember_death(const char *method_kind, const char *channel,
+    const char *slayer_bot, const char *slayer_nick,
+    const char *fallen_bot, const char *fallen_nick);
+
 // Is `nick` in the room this context names? A method that tracks no
 // members answers "cannot tell", which reads as present.
 bool atk_target_present(const cmd_ctx_t *ctx, const char *nick);
