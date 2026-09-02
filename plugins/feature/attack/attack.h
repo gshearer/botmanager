@@ -100,6 +100,25 @@
 #define ATK_BKV_IN_VOICE   "attack.in_voice"
 #define ATK_BKV_TURN_DELAY "attack.turn_delay_secs"
 
+// The FIXED half of the prompt a bot's own turn is retold through, in
+// the shape include/cmd.h §cmd_feat_t describes: the imperative, and
+// nothing that varies per swing.
+//
+// ⚠ The two nicknames are NOT part of it and are composed per call.
+// They read as ordinary words in the rendered line — "botman shifts the
+// local pressure and claude_test's nose runs red" names both and says
+// which is which only by grammar — and a model handed that alone gets
+// the roles backwards often enough to matter: the first live gate came
+// back with "I strobed botman", the bot naming itself as its own
+// target. Saying who is who is the `facts` half of the same idea
+// (include/cmd.h §cmd_reply_voiced).
+#define ATK_VOICE_FRAMING \
+  "Announce it in one short line, in your own voice, as something you " \
+  "did. Keep every number exactly as it is given, and do not emote."
+
+// The whole instruction, names and all. `cap` wants ATK_VOICE_SZ.
+#define ATK_VOICE_SZ 512
+
 // Storage bounds. The table prefix is a SQL identifier, so it is
 // validated as strict alnum/underscore before it can reach a query.
 #define ATK_PREFIX_SZ      32                 // table-name prefix

@@ -13,6 +13,7 @@
 
 #include "bot.h"
 #include "colors.h"
+#include "kv.h"
 #include "util.h"
 
 #include <ctype.h>
@@ -369,6 +370,52 @@ atk_enrol(int64_t round_id, uint32_t ns_id, const char *username,
 // attack <nick>                                                       //
 // ------------------------------------------------------------------ //
 
+// Is this combatant's own turn told in its own voice? True only for a
+// bot whose operator switched the knob on, and never for a fatal blow:
+// the mind answers asynchronously and the plugin's one law is that
+// every death line goes out before the first eject.
+static bool
+atk_voice_turn(const char *src_bot, bool fatal)
+{
+  return(src_bot[0] != '\0' && !fatal &&
+      kv_get_bot_uint(src_bot, ATK_BKV_IN_VOICE) != 0);
+}
+
+// The line, once the turn lock is gone. A false return from the mind
+// means nothing was said and the line is ours again; a true one means
+// it speaks, on every path including its own failure, and we must not.
+static void
+atk_speak_turn(const cmd_ctx_t *ctx, bool voiced, const char *line,
+    const char *src_nick, const char *tgt_nick)
+{
+  char instruction[ATK_VOICE_SZ];
+
+  if(!voiced)
+    return;
+
+  // Composed per call, which the callee's contract allows: it copies
+  // what it is given, so a stack buffer is the whole lifetime needed
+  // (plugins/misc/dice is the precedent).
+  snprintf(instruction, sizeof(instruction),
+      "You are %s, a combatant in a channel duelling game, and this is "
+      "your own turn against %s. %s",
+      src_nick, tgt_nick, ATK_VOICE_FRAMING);
+
+  if(!bot_persona_reply(ctx, instruction, line))
+    cmd_reply(ctx, line);
+}
+
+// A bot is standing in a pit if either of these names one, and a
+// combatant that cannot ask for its turn needs something to take it.
+// Call it with the turn lock RELEASED: waking takes a lock of its own,
+// and this file nests neither inside the other.
+static void
+atk_bot_wake_if(const char *src_bot, const char *tgt_bot)
+{
+  if(src_bot[0] != '\0' || tgt_bot[0] != '\0')
+    atk_bot_wake();
+}
+
 static void atk_cmd_attack(const cmd_ctx_t *ctx);
 
 // A turn taken by something that is not a command. attack_bot.c builds a
@@ -411,6 +458,10 @@ atk_cmd_attack(const cmd_ctx_t *ctx)
   char            tgt_bot[ATK_BOT_SZ];
   char            src_class[ATK_CLASS_NAME_SZ];
   char            line[ATK_LINE_SZ];
+  // The blow line held back for the mind to retell. `line` is reused by
+  // the death branch below, and this must survive the unlock.
+  char            voice_line[ATK_LINE_SZ];
+  bool            voiced = false;
   char            roster[ATK_ROSTER_SZ];
   int32_t         dmg;
   int32_t         new_hp;
@@ -562,6 +613,13 @@ atk_cmd_attack(const cmd_ctx_t *ctx)
 
     pthread_mutex_unlock(&atk_turn_lock);
     cmd_reply(ctx, line);
+
+    // Enrolment is behind us, so a bot may have just walked into a pit
+    // on a turn that was then refused — and it now owes a wave nothing
+    // is going to take for it. Both refusals below need this for the
+    // same reason. (Attack a person, then attack a bot in the same
+    // wave: the second enrols the bot and stops at this gate.)
+    atk_bot_wake_if(src_bot, tgt_bot);
     return;
   }
 
@@ -569,6 +627,7 @@ atk_cmd_attack(const cmd_ctx_t *ctx)
   {
     pthread_mutex_unlock(&atk_turn_lock);
     cmd_reply(ctx, "☠ That one is already cooling. Find a living quarrel.");
+    atk_bot_wake_if(src_bot, tgt_bot);
     return;
   }
 
@@ -692,7 +751,20 @@ atk_cmd_attack(const cmd_ctx_t *ctx)
     {
       atk_render_dot_inflict(line, sizeof(line), src_nick, nick,
           wound.kind, wound.noun, spoken ? &move : NULL, bonus);
-      cmd_reply(ctx, line);
+
+      // An affliction is a turn like any other and a bot's is told the
+      // same way — otherwise its voice would come and go with a die
+      // roll, which reads as a fault rather than a mechanic. Only the
+      // INFLICT line: the ticks belong to the decay task, which has no
+      // context and no bot to ask. A refusal is never voiced; the pit's
+      // own words are the honest ones for a fault.
+      voiced = atk_voice_turn(src_bot, false);
+
+      if(voiced)
+        color_translate(voice_line, sizeof voice_line, line, NULL);
+
+      else
+        cmd_reply(ctx, line);
     }
 
     else if(landed == ATK_INFLICT_CAPPED)
@@ -710,11 +782,14 @@ atk_cmd_attack(const cmd_ctx_t *ctx)
 
     pthread_mutex_unlock(&atk_turn_lock);
 
+    atk_speak_turn(ctx, voiced, voice_line, src_nick, nick);
+
     // Last, and with no lock held: the task system is deliberately kept
     // off the turn path entirely.
     if(landed == ATK_INFLICT_LANDED)
       atk_dot_wake();
 
+    atk_bot_wake_if(src_bot, tgt_bot);
     return;
   }
 
@@ -754,6 +829,11 @@ atk_cmd_attack(const cmd_ctx_t *ctx)
       clam(CLAM_INFO, ATK_CTX, "round %" PRId64 ": %" PRIu32 " of %" PRIu32
           " fallen ejected after the sweep", round.id, ejected, fell);
 
+    // A sweep is not voiced: it speaks one line per victim, and a mind
+    // asked to retell several at once either drops some or invents an
+    // order the ledger did not write. The sheet's words are the honest
+    // rendering of a turn that landed on more than one person.
+    atk_bot_wake_if(src_bot, tgt_bot);
     return;
   }
 
@@ -779,6 +859,7 @@ atk_cmd_attack(const cmd_ctx_t *ctx)
   {
     pthread_mutex_unlock(&atk_turn_lock);
     cmd_reply(ctx, "☠ The blow landed nowhere — the pit's ledger refused it.");
+    atk_bot_wake_if(src_bot, tgt_bot);
     return;
   }
 
@@ -797,7 +878,34 @@ atk_cmd_attack(const cmd_ctx_t *ctx)
     atk_render_blow(line, sizeof(line), src_nick, nick, tier,
         spoken ? &move : NULL, dmg, bonus, new_hp, tgt.hp_max);
 
-  cmd_reply(ctx, line);
+  // A bot's own turn is retold by its persona rather than by the sheet
+  // the pit dealt it: the sheet decides what it can DO, and the
+  // personality file decides how it sounds (operator ruling, FR#83).
+  //
+  // ⛔ Not cmd_reply_voiced(): that is gated on the per-COMMAND knob
+  // `cmd.attack.in_voice`, which cannot say "this combatant and not
+  // that one" — every human's line would go through a model too. The
+  // per-bot knob is the only one that can express the condition, so
+  // this reaches the same seam underneath it.
+  //
+  // ⚠ Never on a fatal blow. The mind answers asynchronously, and the
+  // plugin's one law is that every death line goes out before the first
+  // eject — a voiced blow would land after both, out of order and
+  // possibly after the fallen had already been removed from the room.
+  // The trout keeps its own words for the same reason it always has.
+  voiced = atk_voice_turn(src_bot, fatal);
+
+  // Strip the colour markers before the mind ever sees them. A marker is
+  // \x01 plus a code letter, and a model handed one reproduces the
+  // letter without the byte: the first live gate came back with
+  // "Pclaude_test", the purple marker's P welded onto the nickname. The
+  // room loses nothing — persona_reply's answer is re-marked up on the
+  // way out, from the typeable markup a model can actually produce.
+  if(voiced)
+    color_translate(voice_line, sizeof voice_line, line, NULL);
+
+  else
+    cmd_reply(ctx, line);
 
   // The killing blow speaks in the slayer's own voice where their sheet
   // has one, and in the engine's plain words where it does not.
@@ -825,12 +933,14 @@ atk_cmd_attack(const cmd_ctx_t *ctx)
         round.id, ctx->username, tgt_user, (int)force);
   }
 
-  // A bot is now standing in this pit, and a combatant that cannot ask
-  // for its turn needs something to take it: without this the wave stops
-  // at the bot and every other combatant is stuck on one blow. Outside
-  // the lock, because waking takes a lock of its own.
-  if(src_bot[0] != '\0' || tgt_bot[0] != '\0')
-    atk_bot_wake();
+  // Outside the lock, and it has to be: the mind is reached through an
+  // async submit that logs on its way out, and this tree does not hold a
+  // lock across a clam(). A false return means nothing was said — no
+  // persona, no chat model, the conversational half switched off — and
+  // the line is ours again.
+  atk_speak_turn(ctx, voiced, voice_line, src_nick, nick);
+
+  atk_bot_wake_if(src_bot, tgt_bot);
 }
 
 // ------------------------------------------------------------------ //
