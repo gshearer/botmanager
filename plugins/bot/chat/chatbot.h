@@ -1234,7 +1234,7 @@ const char *verb_reply_to_addr(const verb_reply_to_t *to);
 // leaving the caller to reply for itself -- when the conversational
 // half is off, no persona resolves, or the request cannot be launched.
 bool chatbot_persona_reply(void *handle, const cmd_ctx_t *ctx,
-    const char *instruction, const char *plain);
+    const char *instruction, const char *plain, const char *tail);
 
 // ---- interpret.c ----
 // (Below chatbot_req_t — the begin call reads the request record.)

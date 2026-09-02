@@ -461,7 +461,7 @@ bot_msg_handler(const method_msg_t *msg, void *data)
 // LLM round trip would stall every reload for the length of one.
 bool
 bot_persona_reply(const cmd_ctx_t *ctx, const char *instruction,
-    const char *plain)
+    const char *plain, const char *tail)
 {
   bot_inst_t         *bot;
   const bot_driver_t *drv;
@@ -484,7 +484,7 @@ bot_persona_reply(const cmd_ctx_t *ctx, const char *instruction,
     return(false);
   }
 
-  spoke = drv->persona_reply(handle, ctx, instruction, plain);
+  spoke = drv->persona_reply(handle, ctx, instruction, plain, tail);
   bot_release(bot);
   return(spoke);
 }

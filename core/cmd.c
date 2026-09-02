@@ -2100,7 +2100,10 @@ cmd_reply_voiced(const cmd_ctx_t *ctx, const char *plain, const char *facts)
 
   // False means the mind declined and owes nothing, so the line is ours
   // to send. True means it will speak, including on its own failure.
-  if(!bot_persona_reply(ctx, instruction, plain))
+  // No tail: a toy's result IS its sentence, so there is no half of the
+  // line the mind must be kept away from. A surface with a structured
+  // value to protect passes one (include/bot.h).
+  if(!bot_persona_reply(ctx, instruction, plain, NULL))
     cmd_reply(ctx, plain);
 }
 

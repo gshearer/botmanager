@@ -300,7 +300,7 @@ atk_sweep_turn(const cmd_ctx_t *ctx, const atk_round_t *round,
   // away. The health tail is the named target's, exactly as it would be
   // on an ordinary blow.
   atk_render_blow(line, sizeof(line), src_nick, tgt_nick, tier, move, dmg,
-      bonus, victim[aimed].hp_left, victim[aimed].hp_max);
+      bonus, victim[aimed].hp_left, victim[aimed].hp_max, NULL, 0);
   cmd_reply(ctx, line);
 
   atk_render_sweep(line, sizeof(line), tier, dmg, victim, n);
@@ -386,7 +386,7 @@ atk_voice_turn(const char *src_bot, bool fatal)
 // it speaks, on every path including its own failure, and we must not.
 static void
 atk_speak_turn(const cmd_ctx_t *ctx, bool voiced, const char *line,
-    const char *src_nick, const char *tgt_nick)
+    const char *tally, const char *src_nick, const char *tgt_nick)
 {
   char instruction[ATK_VOICE_SZ];
 
@@ -401,7 +401,27 @@ atk_speak_turn(const cmd_ctx_t *ctx, bool voiced, const char *line,
       "your own turn against %s. %s",
       src_nick, tgt_nick, ATK_VOICE_FRAMING);
 
-  if(!bot_persona_reply(ctx, instruction, line))
+  // The tally goes as the seam's `tail`, not inside the line: it is a
+  // number this code already knows and must never make a round trip
+  // through a model to reach the room. Board #85 — hedgehogg dropped
+  // the remaining-hitpoints block about one line in four, and no
+  // amount of instruction fixes that, because it is the wrong split.
+  if(bot_persona_reply(ctx, instruction, line, tally))
+    return;
+
+  // The mind declined and owes nothing, so the line is ours — and it is
+  // ours WHOLE: the tally was split off for the model's benefit, not the
+  // room's, and a fallback that forgot it would reproduce the very bug
+  // the split exists to close.
+  if(tally[0] != '\0')
+  {
+    char whole[ATK_LINE_SZ + ATK_TALLY_SZ];
+
+    snprintf(whole, sizeof(whole), "%s %s", line, tally);
+    cmd_reply(ctx, whole);
+  }
+
+  else
     cmd_reply(ctx, line);
 }
 
@@ -461,6 +481,9 @@ atk_cmd_attack(const cmd_ctx_t *ctx)
   // The blow line held back for the mind to retell. `line` is reused by
   // the death branch below, and this must survive the unlock.
   char            voice_line[ATK_LINE_SZ];
+  // The remaining-health block, held apart from the prose so a mind
+  // never gets the chance to lose it (board #85).
+  char            tally[ATK_TALLY_SZ];
   bool            voiced = false;
   char            roster[ATK_ROSTER_SZ];
   int32_t         dmg;
@@ -758,7 +781,8 @@ atk_cmd_attack(const cmd_ctx_t *ctx)
       // INFLICT line: the ticks belong to the decay task, which has no
       // context and no bot to ask. A refusal is never voiced; the pit's
       // own words are the honest ones for a fault.
-      voiced = atk_voice_turn(src_bot, false);
+      voiced   = atk_voice_turn(src_bot, false);
+      tally[0] = '\0';   // an affliction moves no health this turn
 
       if(voiced)
         color_translate(voice_line, sizeof voice_line, line, NULL);
@@ -782,7 +806,7 @@ atk_cmd_attack(const cmd_ctx_t *ctx)
 
     pthread_mutex_unlock(&atk_turn_lock);
 
-    atk_speak_turn(ctx, voiced, voice_line, src_nick, nick);
+    atk_speak_turn(ctx, voiced, voice_line, tally, src_nick, nick);
 
     // Last, and with no lock held: the task system is deliberately kept
     // off the turn path entirely.
@@ -871,12 +895,19 @@ atk_cmd_attack(const cmd_ctx_t *ctx)
   // aside for the one joke no class may override. It carries no deferral
   // badge for the same reason it carries no health tally: the fight is
   // over, and nothing about the blow needs explaining any more.
+  // Decided before the render, because a voiced turn is rendered
+  // differently: its tally comes out into `tally` rather than onto the
+  // end of the line.
+  voiced   = atk_voice_turn(src_bot, fatal);
+  tally[0] = '\0';
+
   if(crit && fatal)
     atk_render_trout(line, sizeof(line), src_nick, nick, dmg);
 
   else
     atk_render_blow(line, sizeof(line), src_nick, nick, tier,
-        spoken ? &move : NULL, dmg, bonus, new_hp, tgt.hp_max);
+        spoken ? &move : NULL, dmg, bonus, new_hp, tgt.hp_max,
+        voiced ? tally : NULL, sizeof(tally));
 
   // A bot's own turn is retold by its persona rather than by the sheet
   // the pit dealt it: the sheet decides what it can DO, and the
@@ -893,8 +924,6 @@ atk_cmd_attack(const cmd_ctx_t *ctx)
   // eject — a voiced blow would land after both, out of order and
   // possibly after the fallen had already been removed from the room.
   // The trout keeps its own words for the same reason it always has.
-  voiced = atk_voice_turn(src_bot, fatal);
-
   // Strip the colour markers before the mind ever sees them. A marker is
   // \x01 plus a code letter, and a model handed one reproduces the
   // letter without the byte: the first live gate came back with
@@ -938,7 +967,7 @@ atk_cmd_attack(const cmd_ctx_t *ctx)
   // lock across a clam(). A false return means nothing was said — no
   // persona, no chat model, the conversational half switched off — and
   // the line is ours again.
-  atk_speak_turn(ctx, voiced, voice_line, src_nick, nick);
+  atk_speak_turn(ctx, voiced, voice_line, tally, src_nick, nick);
 
   atk_bot_wake_if(src_bot, tgt_bot);
 }

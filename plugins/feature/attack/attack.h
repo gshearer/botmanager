@@ -148,6 +148,9 @@
 // it always fits inside the sentence that carries it; a roster longer
 // than this would not survive an IRC line anyway.
 #define ATK_ROSTER_SZ      320
+// "[nick — hp/hp hp]" with its two gray markers: a nick, two numbers
+// that atk_fmt_num never touches (start_hp clamps at 100000), and slack.
+#define ATK_TALLY_SZ       (ATK_NICK_SZ + 48)
 
 // One un-expanded move, as a character sheet writes it. The arithmetic
 // that fixes this number, and that ATK_LINE_SZ above is sized from:
@@ -1026,9 +1029,15 @@ atk_flavour_t atk_severity(const atk_tunables_t *t, int32_t dmg);
 //           neutral line stands in.
 //
 // `bonus_pct` renders the deferral badge; 0 draws none.
+// `tally_out` NULL puts the remaining-health block on the end of `out`,
+// which is every ordinary line. Non-NULL takes it out and writes it
+// there instead, for a caller handing the prose to a persona: the block
+// is a fact and a mind may not be trusted to reproduce one (board #85).
+// Empty when the blow was fatal, which carries no tally either way.
 void atk_render_blow(char *out, size_t cap, const char *src_nick,
     const char *tgt_nick, atk_flavour_t tier, const atk_move_t *move,
-    int32_t dmg, uint32_t bonus_pct, int32_t hp, int32_t hp_max);
+    int32_t dmg, uint32_t bonus_pct, int32_t hp, int32_t hp_max,
+    char *tally_out, size_t tally_cap);
 
 // One finished heal line, dressed as the peer of a blow so that mending
 // reads as one turn among turns rather than as a system notice. The split
@@ -1207,6 +1216,12 @@ void atk_turn_take(const cmd_ctx_t *ctx);
 // `show attack classes`, where a reader asking what a class's `critical`
 // moves are worth can find it.
 void atk_flav_bands(const cmd_ctx_t *ctx, const atk_tunables_t *t);
+
+// The remaining-health block both renderers end on, and the one part of
+// a voiced turn the mind is not allowed to write. `cap` wants
+// ATK_TALLY_SZ.
+void atk_render_tally(char *out, size_t cap, const char *tgt_nick,
+    int32_t hp, int32_t hp_max);
 
 // Attach `show attack` and `show attack scores` beneath the core `show`
 // parent. Called from atk_commands_register().

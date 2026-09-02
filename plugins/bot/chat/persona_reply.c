@@ -47,6 +47,10 @@
 // essay gets cut rather than dropped.
 #define PERSONA_REPLY_LINE_SZ  512
 
+// A caller's structured remainder — a score, a health tally, a price.
+// Small on purpose: it is a value and its framing, never a sentence.
+#define PERSONA_REPLY_TAIL_SZ  160
+
 typedef struct
 {
   // Teardown accounting. Linked at allocation, unlinked on the one free
@@ -63,6 +67,10 @@ typedef struct
   // promise exactly one reply: every path that cannot produce a better
   // line sends this one instead.
   char             plain[PERSONA_REPLY_LINE_SZ];
+
+  // The half of the line the mind may not write, appended to whatever
+  // goes out. Empty for a caller whose answer is all phrasing.
+  char             tail[PERSONA_REPLY_TAIL_SZ];
 } persona_req_t;
 
 // The one delivery path. A persona body teaches "/me ", so the model
@@ -74,21 +82,36 @@ static void
 persona_req_send(persona_req_t *r, const char *line)
 {
   method_inst_t *inst = method_find(r->to.inst_name);
+  char           out[PERSONA_REPLY_LINE_SZ + PERSONA_REPLY_TAIL_SZ];
   size_t         emote_off;
+
+  // The caller's facts, appended to the mind's phrasing — and appended
+  // HERE rather than at any one call site because this is the single
+  // delivery path, so a tail cannot be lost down a fallback branch.
+  //
+  // The tail is not budgeted against the line: it is the part that has
+  // to survive, so an over-long answer is what gets cut. `line` is
+  // already capped at PERSONA_REPLY_LINE_SZ, which is what makes the
+  // arithmetic below a formality rather than a policy.
+  if(r->tail[0] != '\0')
+    snprintf(out, sizeof(out), "%s %s", line, r->tail);
+
+  else
+    strlcpy(out, line, sizeof(out));
 
   // The instance the command was run on may have been reloaded away
   // while the model was thinking; there is then nowhere to answer, and
   // no second address to guess at (OBS-29).
   if(inst != NULL)
   {
-    emote_off = chatbot_emote_prefix_len(line);
+    emote_off = chatbot_emote_prefix_len(out);
 
     if(emote_off != 0)
       method_send_emote(inst, verb_reply_to_addr(&r->to),
-          line + emote_off);
+          out + emote_off);
 
     else
-      method_send(inst, verb_reply_to_addr(&r->to), line);
+      method_send(inst, verb_reply_to_addr(&r->to), out);
   }
 
   chatbot_hold_unlink(&r->hold);
@@ -164,7 +187,7 @@ persona_done(const llm_chat_response_t *resp)
 // goes out on every path, including a model that never answers well.
 bool
 chatbot_persona_reply(void *handle, const cmd_ctx_t *ctx,
-    const char *instruction, const char *plain)
+    const char *instruction, const char *plain, const char *tail)
 {
   chatbot_state_t       *st = handle;
   chatbot_personality_t  p  = {0};
@@ -271,6 +294,9 @@ chatbot_persona_reply(void *handle, const cmd_ctx_t *ctx,
   chatbot_hold_link(&r->hold, st, r);
   verb_reply_to_snapshot(&r->to, ctx);
   strlcpy(r->plain, plain, sizeof r->plain);
+
+  if(tail != NULL)
+    strlcpy(r->tail, tail, sizeof r->tail);
 
   memset(messages, 0, sizeof(messages));
   messages[0].role    = LLM_ROLE_SYSTEM;

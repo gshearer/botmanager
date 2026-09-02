@@ -225,11 +225,31 @@ atk_noun_render(char *out, size_t cap, atk_dot_kind_t kind,
 // colorization, the deferral badge and the health tail are the engine's
 // own. The TIER is the engine's too, and is passed in rather than read
 // off the move — it is the roll's dressing, and it must be right even in
+
+// What is left of the combatant this turn was aimed at. Its own function
+// because it is the one part of a line that is a FACT rather than a
+// phrasing, and two renderers plus the voiced path all have to say it
+// the same way — a bot's turn is written by its persona, and the tally
+// is appended to what the mind wrote rather than trusted to it (board
+// #85: the model dropped it about one line in four). The nick inside the
+// gray block stays plain so the block reads as one.
+void
+atk_render_tally(char *out, size_t cap, const char *tgt_nick,
+    int32_t hp, int32_t hp_max)
+{
+  if(out == NULL || cap == 0)
+    return;
+
+  snprintf(out, cap, CLR_GRAY "[%s — %d/%d hp]" CLR_RESET,
+      tgt_nick, hp, hp_max);
+}
+
 // the case where the attacker's class had nothing to say.
 void
 atk_render_blow(char *out, size_t cap, const char *src_nick,
     const char *tgt_nick, atk_flavour_t tier, const atk_move_t *move,
-    int32_t dmg, uint32_t bonus_pct, int32_t hp, int32_t hp_max)
+    int32_t dmg, uint32_t bonus_pct, int32_t hp, int32_t hp_max,
+    char *tally_out, size_t tally_cap)
 {
   char src  [ATK_NICK_SZ + 8];
   char tgt  [ATK_NICK_SZ + 8];
@@ -255,15 +275,37 @@ atk_render_blow(char *out, size_t cap, const char *src_nick,
     snprintf(badge, sizeof(badge),
         " " CLR_BOLD CLR_YELLOW "⚡+%" PRIu32 "%%" CLR_RESET, bonus_pct);
 
-  // The survivor's remaining health rides on every non-fatal line; the
-  // nick inside the gray block stays plain so the block reads as one.
+  // The survivor's remaining health rides on every non-fatal line.
   // A fatal blow carries no tally — the death line that follows says it.
+  //
+  // `tally_out` is what splits the line for a VOICED turn: the prose is
+  // the mind's to rewrite and the tally is not, so a caller that intends
+  // to hand one to a persona asks for them apart and never has to take
+  // the block back off a rendered string.
   if(hp > 0)
-    snprintf(out, cap, "%s%s%s " CLR_GRAY "[%s — %d/%d hp]" CLR_RESET,
-        atk_tier_emoji[tier], body, badge, tgt_nick, hp, hp_max);
+  {
+    char tally[ATK_TALLY_SZ];
+
+    atk_render_tally(tally, sizeof(tally), tgt_nick, hp, hp_max);
+
+    if(tally_out != NULL)
+    {
+      strlcpy(tally_out, tally, tally_cap);
+      snprintf(out, cap, "%s%s%s", atk_tier_emoji[tier], body, badge);
+    }
+
+    else
+      snprintf(out, cap, "%s%s%s %s",
+          atk_tier_emoji[tier], body, badge, tally);
+  }
 
   else
+  {
+    if(tally_out != NULL)
+      tally_out[0] = '\0';
+
     snprintf(out, cap, "%s%s%s", atk_tier_emoji[tier], body, badge);
+  }
 }
 
 // A heal wears the same shape as a blow — glyph, colorized names, the
@@ -304,8 +346,12 @@ atk_render_heal(char *out, size_t cap, const char *src_nick,
         " " CLR_BOLD CLR_YELLOW "⚡+%" PRIu32 "%%" CLR_RESET, bonus_pct);
 
   // A heal always leaves somebody standing, so the tally always rides.
-  snprintf(out, cap, "✚ %s%s " CLR_GRAY "[%s — %d/%d hp]" CLR_RESET,
-      body, badge, tgt_nick, hp, hp_max);
+  {
+    char tally[ATK_TALLY_SZ];
+
+    atk_render_tally(tally, sizeof(tally), tgt_nick, hp, hp_max);
+    snprintf(out, cap, "✚ %s%s %s", body, badge, tally);
+  }
 }
 
 // The line a blow that went wide speaks after the class move has had its

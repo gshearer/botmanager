@@ -61,8 +61,13 @@ typedef struct
   // onto the mind; false leaves it with the caller, which is why a
   // mind that declines must not have spoken. ctx is valid for this
   // call only, so a mind answering later copies what it needs.
+  //
+  // `tail` is the part of the line the mind may NOT write: appended
+  // verbatim to whatever goes out, on every path including the
+  // fallbacks. NULL or empty for a caller whose answer is entirely a
+  // phrasing. See bot_persona_reply below for why it exists.
   bool (*persona_reply)(void *handle, const cmd_ctx_t *ctx,
-      const char *instruction, const char *plain);
+      const char *instruction, const char *plain, const char *tail);
 } bot_driver_t;
 
 typedef struct
@@ -151,8 +156,24 @@ void bot_iterate(bot_iter_cb_t cb, void *data);
 // declined. The driver reference is held for the length of the call
 // and no longer; a mind that answers asynchronously owns that wait
 // itself, exactly as it does for on_message.
+//
+// ⭑⭑ `tail` is the half of the line that is a FACT rather than a
+// phrasing, and it is appended verbatim to whatever is sent -- the
+// mind's answer, or `plain` on any path that falls back to it. Pass
+// NULL when the whole line is a phrasing, which is every toy whose
+// result IS its sentence.
+//
+// It exists because a caller cannot append to an answer that arrives
+// after this returns, and asking the model to reproduce a structured
+// value instead does not work: the duelling pit shipped without it and
+// its bot combatant dropped the remaining-hitpoints block from about
+// one line in four (board #85). A number the caller already knows must
+// never make a round trip through a model to reach the channel.
+//
+// ⚠ It is appended AFTER the mind's markup is translated, so a tail
+// may carry colour markers of its own; a model's cannot, by design.
 bool bot_persona_reply(const cmd_ctx_t *ctx, const char *instruction,
-    const char *plain);
+    const char *plain, const char *tail);
 
 const char *bot_driver_name(const bot_inst_t *inst);
 uint32_t bot_method_count(const bot_inst_t *inst);
