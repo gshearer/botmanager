@@ -132,6 +132,10 @@ atk_schema_ensure(void)
       " wave        INTEGER      NOT NULL DEFAULT 1,"
       " blows       INTEGER      NOT NULL DEFAULT 0,"
       " opener      VARCHAR(31)  NOT NULL DEFAULT '',"
+      // The bot whose pit this is. Denormalised for the same reason
+      // <p>_dots carries method/channel: attack_bot.c's turn task holds
+      // no cmd_ctx_t and has to find the mind from a bare row.
+      " bot         VARCHAR(64)  NOT NULL DEFAULT '',"
       " slayer      VARCHAR(31)  NOT NULL DEFAULT '',"
       " fallen      VARCHAR(31)  NOT NULL DEFAULT '',"
       " top_crit    INTEGER      NOT NULL DEFAULT 0,"
@@ -178,6 +182,9 @@ atk_schema_ensure(void)
       " heals      INTEGER     NOT NULL DEFAULT 0,"
       " defers     SMALLINT    NOT NULL DEFAULT 0,"
       " bonus_pct  INTEGER     NOT NULL DEFAULT 0,"
+      // Non-empty names the bot instance fighting under this row, and is
+      // the only mark of one. Nothing renders it (FR#83).
+      " bot        VARCHAR(64) NOT NULL DEFAULT '',"
       " joined_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),"
       " died_at   TIMESTAMPTZ,"
       " PRIMARY KEY (round_id, username)"
@@ -269,6 +276,26 @@ atk_schema_ensure(void)
       "CREATE INDEX IF NOT EXISTS idx_%s_victim"
       " ON %s(round_id, victim) WHERE state = 0",
       t.dots, t.dots);
+
+  if(atk_run_ddl(sql) != SUCCESS)
+    goto out;
+
+  // The four CREATEs above are IF NOT EXISTS, which says nothing about
+  // the columns of a table that already exists — and these two arrived
+  // after the pit had been played in. ADD COLUMN IF NOT EXISTS is
+  // idempotent and costs one no-op statement per boot, which is
+  // cheaper than the alternative: dropping four tables that hold a
+  // lifetime record somebody earned.
+  snprintf(sql, sizeof(sql),
+      "ALTER TABLE %s ADD COLUMN IF NOT EXISTS"
+      " bot VARCHAR(64) NOT NULL DEFAULT ''", t.rounds);
+
+  if(atk_run_ddl(sql) != SUCCESS)
+    goto out;
+
+  snprintf(sql, sizeof(sql),
+      "ALTER TABLE %s ADD COLUMN IF NOT EXISTS"
+      " bot VARCHAR(64) NOT NULL DEFAULT ''", t.players);
 
   if(atk_run_ddl(sql) != SUCCESS)
     goto out;
@@ -368,7 +395,8 @@ atk_db_round_find(uint32_t ns_id, const char *method, const char *channel,
       // Two clocks: the whole age from started_at for the retirement line,
       // and the silence from last_action, which is what ends the game.
       " EXTRACT(EPOCH FROM (NOW() - started_at))::bigint,"
-      " EXTRACT(EPOCH FROM (NOW() - last_action))::bigint"
+      " EXTRACT(EPOCH FROM (NOW() - last_action))::bigint,"
+      " method, channel, bot"
       " FROM %s WHERE ns_id = %" PRIu32 " AND method = '%s'"
       " AND channel = '%s' AND state = %d",
       t.rounds, ns_id, e_meth, e_chan, ATK_ROUND_ACTIVE);
@@ -383,6 +411,9 @@ atk_db_round_find(uint32_t ns_id, const char *method, const char *channel,
     out->top_crit = atk_col_i32(res, 0, 3);
     out->age      = atk_col_i64(res, 0, 4);
     out->idle     = atk_col_i64(res, 0, 5);
+    atk_col_str(out->method,  sizeof(out->method),  res, 0, 6);
+    atk_col_str(out->channel, sizeof(out->channel), res, 0, 7);
+    atk_col_str(out->bot,     sizeof(out->bot),     res, 0, 8);
     hit = true;
   }
 
@@ -412,13 +443,14 @@ atk_db_round_abandon(int64_t round_id)
 
 int64_t
 atk_db_round_open(uint32_t ns_id, const char *method, const char *channel,
-    const char *opener)
+    const char *opener, const char *bot)
 {
   atk_tables_t t;
   db_result_t *res      = NULL;
   char        *e_meth   = NULL;
   char        *e_chan   = NULL;
   char        *e_opener = NULL;
+  char        *e_bot    = NULL;
   char         sql[1024];
   int64_t      id = -1;
 
@@ -428,14 +460,15 @@ atk_db_round_open(uint32_t ns_id, const char *method, const char *channel,
   e_meth   = db_escape(method  != NULL ? method  : "");
   e_chan   = db_escape(channel != NULL ? channel : "");
   e_opener = db_escape(opener  != NULL ? opener  : "");
+  e_bot    = db_escape(bot     != NULL ? bot     : "");
 
-  if(e_meth == NULL || e_chan == NULL || e_opener == NULL)
+  if(e_meth == NULL || e_chan == NULL || e_opener == NULL || e_bot == NULL)
     goto out;
 
   snprintf(sql, sizeof(sql),
-      "INSERT INTO %s (ns_id, method, channel, opener)"
-      " VALUES (%" PRIu32 ", '%s', '%s', '%s') RETURNING id",
-      t.rounds, ns_id, e_meth, e_chan, e_opener);
+      "INSERT INTO %s (ns_id, method, channel, opener, bot)"
+      " VALUES (%" PRIu32 ", '%s', '%s', '%s', '%s') RETURNING id",
+      t.rounds, ns_id, e_meth, e_chan, e_opener, e_bot);
 
   res = db_result_alloc();
 
@@ -452,6 +485,7 @@ out:
   if(e_meth   != NULL) mem_free(e_meth);
   if(e_chan   != NULL) mem_free(e_chan);
   if(e_opener != NULL) mem_free(e_opener);
+  if(e_bot    != NULL) mem_free(e_bot);
 
   return(id);
 }
@@ -469,12 +503,13 @@ out:
 // their sheet by being struck again.
 bool
 atk_db_player_enrol(int64_t round_id, uint32_t ns_id, const char *username,
-    const char *nickname, const char *class, int32_t hp)
+    const char *nickname, const char *class, int32_t hp, const char *bot)
 {
   atk_tables_t t;
   char        *e_user  = NULL;
   char        *e_nick  = NULL;
   char        *e_class = NULL;
+  char        *e_bot   = NULL;
   char         sql[1536];
   uint32_t     affected = 0;
   bool         fresh    = false;
@@ -485,15 +520,19 @@ atk_db_player_enrol(int64_t round_id, uint32_t ns_id, const char *username,
   e_user  = db_escape(username);
   e_nick  = db_escape(nickname != NULL ? nickname : "");
   e_class = db_escape(class    != NULL ? class    : "");
+  e_bot   = db_escape(bot      != NULL ? bot      : "");
 
-  if(e_user == NULL || e_nick == NULL || e_class == NULL)
+  if(e_user == NULL || e_nick == NULL || e_class == NULL || e_bot == NULL)
     goto out;
 
+  // `bot` rides the INSERT only, exactly as `class` does and for a
+  // related reason: what a combatant IS was settled when they walked in,
+  // and no later blow may rewrite it.
   snprintf(sql, sizeof(sql),
       "WITH enrolled AS ("
       " INSERT INTO %s (round_id, ns_id, username, nickname, class,"
-      " hp, hp_max)"
-      " VALUES (%" PRId64 ", %" PRIu32 ", '%s', '%s', '%s', %d, %d)"
+      " hp, hp_max, bot)"
+      " VALUES (%" PRId64 ", %" PRIu32 ", '%s', '%s', '%s', %d, %d, '%s')"
       " ON CONFLICT (round_id, username) DO NOTHING"
       " RETURNING 1"
       ")"
@@ -502,7 +541,7 @@ atk_db_player_enrol(int64_t round_id, uint32_t ns_id, const char *username,
       " ON CONFLICT (ns_id, username) DO UPDATE SET"
       " rounds = %s.rounds + 1, nickname = EXCLUDED.nickname,"
       " last_seen = NOW()",
-      t.players, round_id, ns_id, e_user, e_nick, e_class, hp, hp,
+      t.players, round_id, ns_id, e_user, e_nick, e_class, hp, hp, e_bot,
       t.scores, ns_id, e_user, e_nick, t.scores);
 
   if(atk_exec(sql, "player enrol", &affected) == SUCCESS)
@@ -512,6 +551,7 @@ out:
   if(e_user  != NULL) mem_free(e_user);
   if(e_nick  != NULL) mem_free(e_nick);
   if(e_class != NULL) mem_free(e_class);
+  if(e_bot   != NULL) mem_free(e_bot);
 
   return(fresh);
 }
@@ -537,7 +577,8 @@ atk_db_player_get(int64_t round_id, const char *username,
     return(false);
 
   snprintf(sql, sizeof(sql),
-      "SELECT nickname, hp, hp_max, last_wave, class, defers, bonus_pct"
+      "SELECT nickname, hp, hp_max, last_wave, class, defers, bonus_pct,"
+      " bot"
       " FROM %s WHERE round_id = %" PRId64 " AND username = '%s'",
       t.players, round_id, e_user);
 
@@ -552,6 +593,7 @@ atk_db_player_get(int64_t round_id, const char *username,
     atk_col_str(out->class, sizeof(out->class), res, 0, 4);
     out->defers    = atk_col_i32(res, 0, 5);
     out->bonus_pct = atk_col_i32(res, 0, 6);
+    atk_col_str(out->bot, sizeof(out->bot), res, 0, 7);
     hit = true;
   }
 
@@ -617,6 +659,191 @@ atk_db_classes_dealt(int64_t round_id, atk_dealt_t *out)
   db_result_free(res);
 
   return(out->n);
+}
+
+
+// ------------------------------------------------------------------ //
+// Bot combatants                                                      //
+// ------------------------------------------------------------------ //
+
+// Everyone whose turn it is and who is not going to ask for it. The
+// wave gate is expressed here exactly as the turn path expresses it --
+// alive, and behind the round's wave -- so a bot is due for precisely
+// as long as a person in its place would be owed a swing.
+//
+// The idle clock is deliberately NOT applied: this returns `idle` and
+// lets the caller judge it against the tunable, because the tunable is
+// the caller's and a query that silently dropped a timed-out round
+// would look identical to one where no bot was due.
+uint32_t
+atk_db_bot_due(atk_bot_due_t *out, uint32_t cap)
+{
+  atk_tables_t t;
+  db_result_t *res = NULL;
+  char         sql[1024];
+  uint32_t     n = 0;
+
+  if(out == NULL || cap == 0 || atk_tables_resolve(&t) != SUCCESS)
+    return(0);
+
+  snprintf(sql, sizeof(sql),
+      "SELECT r.id, r.ns_id, r.wave, r.method, r.channel, p.bot,"
+      " p.username, p.nickname,"
+      " EXTRACT(EPOCH FROM (NOW() - r.last_action))::bigint"
+      " FROM %s p JOIN %s r ON r.id = p.round_id"
+      " WHERE r.state = %d AND p.bot <> '' AND p.hp > 0"
+      " AND p.last_wave < r.wave"
+      " ORDER BY r.last_action LIMIT %" PRIu32,
+      t.players, t.rounds, ATK_ROUND_ACTIVE, cap);
+
+  res = db_result_alloc();
+
+  if(db_query(sql, res) == SUCCESS && res->ok)
+  {
+    for(n = 0; n < res->rows && n < cap; n++)
+    {
+      out[n].round_id = atk_col_i64(res, n, 0);
+      out[n].ns_id    = (uint32_t)atk_col_i32(res, n, 1);
+      out[n].wave     = atk_col_i32(res, n, 2);
+
+      atk_col_str(out[n].method,  sizeof(out[n].method),  res, n, 3);
+      atk_col_str(out[n].channel, sizeof(out[n].channel), res, n, 4);
+      atk_col_str(out[n].bot,     sizeof(out[n].bot),     res, n, 5);
+      atk_col_str(out[n].user,    sizeof(out[n].user),    res, n, 6);
+      atk_col_str(out[n].nick,    sizeof(out[n].nick),    res, n, 7);
+
+      out[n].idle = atk_col_i64(res, n, 8);
+    }
+  }
+
+  db_result_free(res);
+  return(n);
+}
+
+// Is there a bot in the pit at all? Asked once at start(), and again on
+// every tick that found nothing due -- a bot waiting out its turn delay
+// is not due and must not start the retirement clock.
+uint32_t
+atk_db_bot_live(void)
+{
+  atk_tables_t t;
+  db_result_t *res = NULL;
+  char         sql[512];
+  uint32_t     n = 0;
+
+  if(atk_tables_resolve(&t) != SUCCESS)
+    return(0);
+
+  snprintf(sql, sizeof(sql),
+      "SELECT COUNT(*) FROM %s p JOIN %s r ON r.id = p.round_id"
+      " WHERE r.state = %d AND p.bot <> '' AND p.hp > 0",
+      t.players, t.rounds, ATK_ROUND_ACTIVE);
+
+  res = db_result_alloc();
+
+  if(db_query(sql, res) == SUCCESS && res->ok && res->rows == 1)
+    n = (uint32_t)atk_col_i32(res, 0, 0);
+
+  db_result_free(res);
+  return(n);
+}
+
+// Who a bot may swing at: everyone else still standing, by the name the
+// room knows them by, because the turn path resolves a NICK and not an
+// account. A row whose nickname was never recorded falls back to its
+// username, which is what the display code does for the same reason.
+uint32_t
+atk_db_bot_opponents(int64_t round_id, const char *except_user,
+    char out[][ATK_NICK_SZ], uint32_t cap)
+{
+  atk_tables_t t;
+  db_result_t *res    = NULL;
+  char        *e_user = NULL;
+  char         sql[512];
+  uint32_t     n = 0;
+
+  if(out == NULL || cap == 0 || except_user == NULL ||
+      atk_tables_resolve(&t) != SUCCESS)
+    return(0);
+
+  e_user = db_escape(except_user);
+
+  if(e_user == NULL)
+    return(0);
+
+  snprintf(sql, sizeof(sql),
+      "SELECT CASE WHEN nickname <> '' THEN nickname ELSE username END"
+      // Aliased because Postgres names an unlabelled CASE after its ELSE
+      // column, which makes an ORDER BY on that name ambiguous and
+      // errors the whole query -- the bug ATK-9 paid for.
+      " AS shown"
+      " FROM %s WHERE round_id = %" PRId64 " AND hp > 0"
+      " AND username <> '%s' ORDER BY shown LIMIT %" PRIu32,
+      t.players, round_id, e_user, cap);
+
+  res = db_result_alloc();
+
+  if(db_query(sql, res) == SUCCESS && res->ok)
+    for(n = 0; n < res->rows && n < cap; n++)
+      atk_col_str(out[n], ATK_NICK_SZ, res, n, 0);
+
+  db_result_free(res);
+  mem_free(e_user);
+
+  return(n);
+}
+
+
+// A turn that did not happen. The combatant's swing is spent and the
+// wave turns behind them, and NOTHING else moves: no `blows`, no
+// lifetime row, and — the one that matters — no `last_action`.
+//
+// Touching the round's clock would make a bot that keeps passing an
+// immortality spell: the idle clock is what ends a game, and a pit
+// nobody is playing in any more would never reach it.
+//
+// Deliberately not atk_db_turn_spend() with the tallies skipped: that
+// function is a turn that DID something and paid for it, and a pass
+// that inflated `blows` would put swings on a scoreboard nobody threw
+// (ATK-OVERKILL-1's lesson, one write path further along).
+bool
+atk_db_turn_pass(int64_t round_id, const char *username, int32_t wave)
+{
+  atk_tables_t t;
+  char        *e_user = NULL;
+  char         sql[1024];
+  bool         ok = FAIL;
+
+  if(round_id <= 0 || username == NULL || atk_tables_resolve(&t) != SUCCESS)
+    return(FAIL);
+
+  e_user = db_escape(username);
+
+  if(e_user == NULL)
+    return(FAIL);
+
+  snprintf(sql, sizeof(sql),
+      "BEGIN;"
+
+      "UPDATE %s SET last_wave = %d"
+      " WHERE round_id = %" PRId64 " AND username = '%s';"
+
+      // The same clause every other turn carries, and it is why this
+      // exists at all: a combatant who cannot be made to swing must
+      // still be got out of everybody else's way.
+      "UPDATE %s r SET wave = r.wave + 1 WHERE r.id = %" PRId64
+      " AND NOT EXISTS (SELECT 1 FROM %s p WHERE p.round_id = r.id"
+      " AND p.hp > 0 AND p.last_wave < r.wave);"
+
+      "COMMIT;",
+
+      t.players, wave, round_id, e_user,
+      t.rounds, round_id, t.players);
+
+  ok = atk_exec(sql, "turn pass", NULL);
+
+  mem_free(e_user);
+  return(ok);
 }
 
 bool

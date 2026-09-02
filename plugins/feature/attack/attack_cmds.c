@@ -54,7 +54,12 @@ atk_presence_cb(const char *nick, void *data)
 
 // Is `nick` in this room? A driver with no member tracking enumerates
 // nobody, which must read as "cannot tell", never as "absent".
-static bool
+//
+// Not static since ATK-BOT-2: the turn task asks it BEFORE it commits to
+// a target, because unlike a person a bot cannot read the refusal and
+// pick somebody else — it would come back to the same absent name every
+// tick and say so out loud each time.
+bool
 atk_target_present(const cmd_ctx_t *ctx, const char *nick)
 {
   atk_presence_t p = { .nick = nick, .seen = 0, .found = false };
@@ -71,11 +76,27 @@ atk_target_present(const cmd_ctx_t *ctx, const char *nick)
 // Anything else is a ghost.
 static bool
 atk_resolve_target(const cmd_ctx_t *ctx, const userns_t *ns,
-    const char *nick, char *out, size_t cap)
+    const char *nick, char *out, size_t cap, char *bot, size_t bot_cap)
 {
+  char name[ATK_BOT_SZ];
+
+  bot[0] = '\0';
+
   if(bot_identity_resolve(ctx->bot, ctx->msg->inst, nick, NULL,
       out, cap) && out[0] != '\0')
     return(true);
+
+  // A bot the operator has let into the pit, before the namespace is
+  // asked: its account is created on demand and would answer the lookup
+  // below from then on, which would leave a bot that has since been
+  // switched OFF still addressable. Asking here keeps the knob the whole
+  // of the permission it is meant to be.
+  if(atk_bot_resolve(ctx->msg->inst, nick, name, sizeof(name)) &&
+      atk_bot_account(ns, name, out, cap))
+  {
+    strlcpy(bot, name, bot_cap);
+    return(true);
+  }
 
   if(userns_user_lookup_ci(ns, nick, out, cap))
     return(true);
@@ -324,7 +345,7 @@ atk_sweep_turn(const cmd_ctx_t *ctx, const atk_round_t *round,
 // the read of the pool against the write that grows it.
 static bool
 atk_enrol(int64_t round_id, uint32_t ns_id, const char *username,
-    const char *nickname, int32_t hp, atk_dealt_t *dealt,
+    const char *nickname, int32_t hp, const char *bot, atk_dealt_t *dealt,
     atk_player_t *out)
 {
   char class[ATK_CLASS_NAME_SZ];
@@ -334,8 +355,12 @@ atk_enrol(int64_t round_id, uint32_t ns_id, const char *username,
   if(atk_db_player_get(round_id, username, out))
     return(true);
 
+  // A bot is dealt a sheet on this line like everybody else. The sheet
+  // it draws decides its mechanics and, for a bot, nothing else: its
+  // words come from its own persona (ATK-BOT-3).
   atk_class_deal(dealt, class, sizeof(class));
-  atk_db_player_enrol(round_id, ns_id, username, nickname, class, hp);
+  atk_db_player_enrol(round_id, ns_id, username, nickname, class, hp,
+      bot != NULL ? bot : "");
 
   return(atk_db_player_get(round_id, username, out));
 }
@@ -343,6 +368,18 @@ atk_enrol(int64_t round_id, uint32_t ns_id, const char *username,
 // ------------------------------------------------------------------ //
 // attack <nick>                                                       //
 // ------------------------------------------------------------------ //
+
+static void atk_cmd_attack(const cmd_ctx_t *ctx);
+
+// A turn taken by something that is not a command. attack_bot.c builds a
+// cmd_ctx_t of its own and comes in here, which is the whole of what
+// makes a bot a combatant rather than a second implementation of one:
+// there is no bot branch anywhere below this line.
+void
+atk_turn_take(const cmd_ctx_t *ctx)
+{
+  atk_cmd_attack(ctx);
+}
 
 static void
 atk_cmd_attack(const cmd_ctx_t *ctx)
@@ -368,6 +405,10 @@ atk_cmd_attack(const cmd_ctx_t *ctx)
   const char     *channel;
   const char     *src_nick;
   char            tgt_user[ATK_USER_SZ];
+  // Empty unless the combatant is a bot, in which case it names the
+  // instance. Both are needed at enrolment and neither is rendered.
+  char            src_bot[ATK_BOT_SZ];
+  char            tgt_bot[ATK_BOT_SZ];
   char            src_class[ATK_CLASS_NAME_SZ];
   char            line[ATK_LINE_SZ];
   char            roster[ATK_ROSTER_SZ];
@@ -416,7 +457,14 @@ atk_cmd_attack(const cmd_ctx_t *ctx)
   src_nick = (ctx->msg->nickname[0] != '\0')
       ? ctx->msg->nickname : ctx->username;
 
-  if(!atk_resolve_target(ctx, ns, nick, tgt_user, sizeof(tgt_user)))
+  // Whoever is swinging may be a bot too — attack_bot.c's task enters
+  // this same function through a synthetic context, so the answer is
+  // read off the nick rather than threaded down from the caller.
+  if(!atk_bot_resolve(ctx->msg->inst, src_nick, src_bot, sizeof(src_bot)))
+    src_bot[0] = '\0';
+
+  if(!atk_resolve_target(ctx, ns, nick, tgt_user, sizeof(tgt_user),
+        tgt_bot, sizeof(tgt_bot)))
   {
     snprintf(line, sizeof(line),
         "⚔ " CLR_PURPLE "%s" CLR_RESET
@@ -464,7 +512,8 @@ atk_cmd_attack(const cmd_ctx_t *ctx)
 
   if(round.id <= 0)
   {
-    round.id   = atk_db_round_open(ns->id, method, channel, ctx->username);
+    round.id   = atk_db_round_open(ns->id, method, channel, ctx->username,
+        bot_inst_name(ctx->bot));
     round.wave = 1;
 
     if(round.id <= 0)
@@ -488,9 +537,9 @@ atk_cmd_attack(const cmd_ctx_t *ctx)
   atk_db_classes_dealt(round.id, &dealt);
 
   if(!atk_enrol(round.id, ns->id, ctx->username, src_nick,
-         (int32_t)t.start_hp, &dealt, &src) ||
+         (int32_t)t.start_hp, src_bot, &dealt, &src) ||
      !atk_enrol(round.id, ns->id, tgt_user, nick,
-         (int32_t)t.start_hp, &dealt, &tgt))
+         (int32_t)t.start_hp, tgt_bot, &dealt, &tgt))
   {
     pthread_mutex_unlock(&atk_turn_lock);
     cmd_reply(ctx, "☠ The pit will not answer — the roster is unreadable.");
@@ -775,6 +824,13 @@ atk_cmd_attack(const cmd_ctx_t *ctx)
     clam(CLAM_INFO, ATK_CTX, "round %" PRId64 ": %s slew %s (eject=%d)",
         round.id, ctx->username, tgt_user, (int)force);
   }
+
+  // A bot is now standing in this pit, and a combatant that cannot ask
+  // for its turn needs something to take it: without this the wave stops
+  // at the bot and every other combatant is stuck on one blow. Outside
+  // the lock, because waking takes a lock of its own.
+  if(src_bot[0] != '\0' || tgt_bot[0] != '\0')
+    atk_bot_wake();
 }
 
 // ------------------------------------------------------------------ //
@@ -810,6 +866,7 @@ atk_cmd_heal(const cmd_ctx_t *ctx)
   const char    *nick;
   const char    *src_nick;
   char           tgt_user[ATK_USER_SZ];
+  char           tgt_bot[ATK_BOT_SZ];
   char           src_class[ATK_CLASS_NAME_SZ];
   char           line[ATK_LINE_SZ];
   char           roster[ATK_ROSTER_SZ];
@@ -852,7 +909,10 @@ atk_cmd_heal(const cmd_ctx_t *ctx)
 
   else
   {
-    if(!atk_resolve_target(ctx, ns, nick, tgt_user, sizeof(tgt_user)))
+    // Mending never enrols anybody — a target has to be in the fight
+    // already — so the bot mark this writes is read by nobody.
+    if(!atk_resolve_target(ctx, ns, nick, tgt_user, sizeof(tgt_user),
+          tgt_bot, sizeof(tgt_bot)))
     {
       snprintf(line, sizeof(line),
           "✚ " CLR_GREEN "%s" CLR_RESET

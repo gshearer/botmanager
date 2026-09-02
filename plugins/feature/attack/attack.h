@@ -14,6 +14,7 @@
 
 #ifdef ATTACK_INTERNAL
 
+#include "bot.h"
 #include "clam.h"
 #include "cmd.h"
 #include "common.h"
@@ -79,6 +80,26 @@
 #define ATK_KV_DEFER_HI    "plugin.attack.defer.step_max_pct"
 #define ATK_KV_DEFER_CAP   "plugin.attack.defer.bonus_cap_pct"
 
+// The turn task that swings for a bot combatant. Its cadence is the
+// pit's, not a bot's: the per-bot turn_delay_secs paces one bot's
+// answer, this paces how often anybody's is noticed at all.
+#define ATK_KV_BOT_TICK    "plugin.attack.bot.tick_secs"
+#define ATK_KV_BOT_LINGER  "plugin.attack.bot.linger_secs"
+
+// ---- Per-bot keys (attack_bot.c) ---------------------------------- //
+//
+// These are the BARE SUFFIXES of `bot.<botname>.attack.*`, laid over
+// every bot by a KV contributor rather than declared in the plugin
+// schema, and they are read with kv_get_bot_uint(botname, suffix): the
+// key is never composed at a call site (include/kv.h, per-bot keys).
+//
+// They are the whole of a bot's participation. `enabled` at 0 -- the
+// default, and the operator's ruling -- means the pit does not know the
+// bot's name at all, exactly as it did before any of this existed.
+#define ATK_BKV_ENABLED    "attack.enabled"
+#define ATK_BKV_IN_VOICE   "attack.in_voice"
+#define ATK_BKV_TURN_DELAY "attack.turn_delay_secs"
+
 // Storage bounds. The table prefix is a SQL identifier, so it is
 // validated as strict alnum/underscore before it can reach a query.
 #define ATK_PREFIX_SZ      32                 // table-name prefix
@@ -87,6 +108,7 @@
 #define ATK_NICK_SZ        METHOD_NICKNAME_SZ // 64
 #define ATK_CHAN_SZ        METHOD_CHANNEL_SZ  // 128
 #define ATK_METHOD_SZ      64                 // method instance name
+#define ATK_BOT_SZ         BOT_NAME_SZ        // 64; '' where a row is a person
 #define ATK_MAX_PLAYERS    32                 // per round, for the show card
 // A character sheet's stem, and the `class` column that stores it. It
 // lives up here with the other storage bounds rather than down in the
@@ -224,6 +246,8 @@ typedef struct
   uint32_t defer_step_lo;    // smallest bonus one deferral adds
   uint32_t defer_step_hi;    // largest (>= defer_step_lo)
   uint32_t defer_cap_pct;    // hard ceiling on accumulated bonus
+  uint32_t bot_tick_secs;    // how often the turn task looks for a due bot
+  uint32_t bot_linger_secs;  // how long it stays queued with nothing to do
 } atk_tunables_t;
 
 // The four table names for the configured prefix, resolved together so
@@ -250,6 +274,12 @@ typedef struct
   // lands resets last_action, so a lively pit never goes stale.
   int64_t age;
   int64_t idle;
+  // The room and the bot whose pit this is, denormalised for exactly the
+  // reason <p>_dots carries method/channel: attack_bot.c's task holds no
+  // cmd_ctx_t and must address both from a bare row.
+  char    method [ATK_METHOD_SZ];
+  char    channel[ATK_CHAN_SZ];
+  char    bot    [ATK_BOT_SZ];
 } atk_round_t;
 
 // One combatant's standing within a round. `class` is the sheet stem
@@ -269,6 +299,11 @@ typedef struct
   int32_t last_wave;
   int32_t defers;      // deferrals spent this round
   int32_t bonus_pct;   // additive bonus pending for the next turn
+  // Non-empty names the bot instance standing here, and is the ONLY
+  // mark of one: it is not assumed equal to `username`, and nothing
+  // renders it. A combatant's kind is not the room's business
+  // (FR#83 -- a personality may be masquerading as a person).
+  char    bot[ATK_BOT_SZ];
 } atk_player_t;
 
 // One resolved turn, ready to be written. The `*_user` names are
@@ -438,10 +473,20 @@ typedef struct
 // How many afflictions one decay iteration may service — and so how
 // much it may say into a channel in one pass. Anything over the bound
 // waits for the next tick rather than flooding the room.
+// Bot combatants owed a swing that one tick will answer. Far smaller
+// than the decay batch: every entry costs a whole turn, and a pit with
+// more than a handful of bots standing in it is not a pit.
+#define ATK_BOT_BATCH 8
+
 #define ATK_DOT_BATCH 32
 
 // Mid-range: the pit's decay is neither urgent nor background scavenging.
 #define ATK_DOT_PRIO  128
+
+// A bot's turn sits one step behind decay: an affliction already
+// committed its damage and is only paying it out, while this is a whole
+// turn that has not happened yet and can wait a tick.
+#define ATK_BOT_PRIO  129
 
 // One live affliction, due now, as the decay task sees it. `method` and
 // `channel` come off the row itself: the task holds no command context
@@ -473,6 +518,22 @@ typedef struct
   // "this wound is over" whatever stranded it.
   bool           stale;
 } atk_dot_due_t;
+
+// One bot combatant owed a swing, as its turn task sees it. Everything
+// here is off the two rows: the task holds no cmd_ctx_t and builds a
+// synthetic one from exactly these fields.
+typedef struct
+{
+  int64_t  round_id;
+  uint32_t ns_id;
+  int32_t  wave;
+  char     method [ATK_METHOD_SZ];
+  char     channel[ATK_CHAN_SZ];
+  char     bot    [ATK_BOT_SZ];    // the instance whose turn this is
+  char     user   [ATK_USER_SZ];   // the account it fights under
+  char     nick   [ATK_NICK_SZ];   // what the room calls it
+  int64_t  idle;                   // seconds since the round last moved
+} atk_bot_due_t;
 
 // One decay tick, resolved and ready to be written. `dmg` is this tick's
 // share of the plan and `dealt` what the victim actually lost — the same
@@ -738,9 +799,11 @@ bool atk_db_round_find(uint32_t ns_id, const char *method,
 // Retire a round nobody came back to.
 bool atk_db_round_abandon(int64_t round_id);
 
-// Open a round. Returns the new id (>0) or -1.
+// Open a round. Returns the new id (>0) or -1. `bot` names the mind
+// whose room this is; it is written once here and read back by a caller
+// that has no cmd_ctx_t to ask.
 int64_t atk_db_round_open(uint32_t ns_id, const char *method,
-    const char *channel, const char *opener);
+    const char *channel, const char *opener, const char *bot);
 
 // Enrol a combatant at full health, bumping <p>_scores.rounds iff they
 // were not already in this round. Returns true when newly enrolled.
@@ -752,9 +815,11 @@ int64_t atk_db_round_open(uint32_t ns_id, const char *method,
 // set this round's roster answered for: no two combatants in one round
 // share a class, and the turn lock is the whole of what enforces it. The
 // column carries no unique index — see attack_db.c.
+// `bot` names the bot instance fighting under this row, or is empty for
+// a person; like `class` it rides the INSERT alone.
 bool atk_db_player_enrol(int64_t round_id, uint32_t ns_id,
     const char *username, const char *nickname, const char *class,
-    int32_t hp);
+    int32_t hp, const char *bot);
 
 bool atk_db_player_get(int64_t round_id, const char *username,
     atk_player_t *out);
@@ -763,6 +828,22 @@ bool atk_db_player_get(int64_t round_id, const char *username,
 // written. A round nobody has enrolled in yet answers zero, which is the
 // correct empty set and not an error.
 uint32_t atk_db_classes_dealt(int64_t round_id, atk_dealt_t *out);
+
+// Bot combatants owed a swing in a round that is still active. Writes at
+// most `cap` rows and returns how many. The idle clock is NOT applied
+// here — the caller owns that test, because it owns the tunable that
+// answers it.
+uint32_t atk_db_bot_due(atk_bot_due_t *out, uint32_t cap);
+
+// Is any bot standing in any live round? The cheap question start()
+// asks before it queues a periodic for an hour to find out.
+uint32_t atk_db_bot_live(void);
+
+// The living in `round_id` other than `except_user`, as display nicks,
+// into `out`. Returns how many were written. This is who a bot may
+// swing at.
+uint32_t atk_db_bot_opponents(int64_t round_id, const char *except_user,
+    char out[][ATK_NICK_SZ], uint32_t cap);
 
 // Comma-joined display names of the living who have not swung in
 // `wave`. Writes an empty string when nobody is pending.
@@ -812,6 +893,11 @@ bool atk_db_heal_apply(const atk_heal_t *heal);
 // in the ledger and in the code, and this is not the place to be clever.
 bool atk_db_turn_spend(int64_t round_id, uint32_t ns_id,
     const char *username, const char *nickname, int32_t wave);
+
+// Spend a turn that did nothing at all. See attack_db.c for why this is
+// not turn_spend with the tallies left out, and for the one thing it
+// must never touch.
+bool atk_db_turn_pass(int64_t round_id, const char *username, int32_t wave);
 
 // Surrender a turn for a bonus on the next one. One transaction: the
 // deferral is counted, the accumulated bonus is written, and the wave is
@@ -1018,10 +1104,80 @@ void atk_dot_wake(void);
 // freed memory on the next tick.
 void atk_dot_stop(void);
 
+
+// ---- A bot in the pit (attack_bot.c) ------------------------------- //
+//
+// A bot combatant is a person as far as every other part of this plugin
+// is concerned: it holds a userns account, enrols, is dealt a sheet,
+// bleeds and dies on the same paths. This file owns only the two things
+// that differ -- how the pit learns its name, and (ATK-BOT-2) who takes
+// its turn.
+
+// Lay `bot.<botname>.attack.*` over every bot, and take it back. Class A
+// either way (PLUGIN.md), so the unregister is courtesy, not duty --
+// but the stored callback pointer is ours and dies with the mapping.
+void atk_bot_kv_register(void);
+void atk_bot_kv_unregister(void);
+
+// True when this bot has been let into the pit. Every other question in
+// this file is downstream of it.
+bool atk_bot_enabled(const char *botname);
+
+// Does `nick`, on the method `inst` serves, name a bot that may fight?
+// Writes the BOT INSTANCE name -- not a username -- and answers false
+// for an unknown nick and for a bot whose knob is off, which is what
+// keeps a disabled bot unaddressable even once it owns an account.
+//
+// A bot answers to its instance name and to the three nicks its method
+// is configured with, because a bot that lost its primary nick is still
+// the one standing in the room.
+bool atk_bot_resolve(method_inst_t *inst, const char *nick,
+    char *out, size_t cap);
+
+// ---- The turn task ------------------------------------------------ //
+//
+// Its shape is the decay task's, deliberately: one periodic for every
+// namespace, woken on demand, self-retiring once the pit has no bot in
+// it, and it never returns TASK_FATAL. See attack_dot.c for the pattern
+// and AGENTS.md for why the two are separate tasks.
+
+// Queue the task if it is not already queued, and clear its idle clock.
+// Call it OUTSIDE atk_turn_lock — it takes a lock of its own and the
+// pit's law is that no lock is held across another subsystem.
+void atk_bot_wake(void);
+
+// From start(): a bot standing in a round the previous incarnation was
+// swinging for is still standing there, and the task that swung is gone.
+void atk_bot_resume(void);
+
+// From deinit(), before anything else: a periodic left pointing into an
+// unloaded mapping is a jump into freed memory.
+void atk_bot_stop(void);
+
+// The namespace account a bot fights under, created on demand and
+// without a password: a combatant that never authenticates has no use
+// for one, and the account is what makes <p>_scores key the lifetime
+// record the same way it keys everybody else's.
+bool atk_bot_account(const userns_t *ns, const char *botname,
+    char *out, size_t cap);
+
 // ---- Command surface (attack_cmds.c) ------------------------------- //
 
 bool atk_commands_register(void);
 void atk_commands_unregister(void);
+
+// Is `nick` in the room this context names? A method that tracks no
+// members answers "cannot tell", which reads as present.
+bool atk_target_present(const cmd_ctx_t *ctx, const char *nick);
+
+// `!attack <nick>`, entered from somewhere that is not a command. The
+// turn task hands it a synthetic cmd_ctx_t and every step downstream --
+// the refusals, the wave gate, enrolment, the roll, the tier, the
+// sheet, the transaction, the announce, the eject -- runs exactly as it
+// does for a person. That is the whole point: a bot plays the game, it
+// does not have a second copy of it. Never call it holding
+// atk_turn_lock; it takes the lock itself.
+void atk_turn_take(const cmd_ctx_t *ctx);
 
 // ---- The read-only views (attack_show.c) --------------------------- //
 

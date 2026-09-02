@@ -70,6 +70,13 @@ static const plugin_kv_entry_t atk_kv_schema[] = {
     "Seconds between the ticks of an affliction" },
   { ATK_KV_DOT_STACK,   KV_UINT32, "3",
     "Afflictions one combatant may carry at once within a round" },
+  { ATK_KV_BOT_TICK,    KV_UINT32, "5",
+    "Seconds between sweeps for a bot combatant owing a swing; the "
+    "per-bot attack.turn_delay_secs is what paces the answer itself" },
+  { ATK_KV_BOT_LINGER,  KV_UINT32, "3600",
+    "Seconds the turn task stays queued after the last bot leaves the "
+    "pit, before it removes itself" },
+
   { ATK_KV_DOT_LINGER,  KV_UINT32, "3600",
     "Seconds the decay task stays queued after the last affliction "
     "clears, before it removes itself" },
@@ -161,6 +168,12 @@ atk_tunables_load(atk_tunables_t *out)
                                      ATK_DOT_STACK_CAP);
   out->dot_linger_secs = atk_clamp(kv_get_uint(ATK_KV_DOT_LINGER), 60, 86400);
 
+  // A floor of one second, not zero: a periodic on a zero interval is a
+  // spin, and the pacing a reader actually wants is the per-bot
+  // turn_delay_secs rather than this.
+  out->bot_tick_secs   = atk_clamp(kv_get_uint(ATK_KV_BOT_TICK), 1, 300);
+  out->bot_linger_secs = atk_clamp(kv_get_uint(ATK_KV_BOT_LINGER), 60, 86400);
+
   out->heal_major_pct = atk_clamp(kv_get_uint(ATK_KV_HEAL_PCT),    0, 100);
   out->heal_minor_min = atk_clamp(kv_get_uint(ATK_KV_HEAL_MIN_LO), 1, 100000);
   out->heal_minor_max = atk_clamp(kv_get_uint(ATK_KV_HEAL_MIN_HI), 1, 100000);
@@ -197,6 +210,10 @@ atk_init(void)
     return(FAIL);
   }
 
+  // Lay bot.<name>.attack.* over every bot. Core back-fills the ones
+  // that already exist, so a reload re-attaches the knobs.
+  atk_bot_kv_register();
+
   clam(CLAM_INFO, ATK_CTX, "attack plugin initialized");
   return(SUCCESS);
 }
@@ -225,6 +242,11 @@ atk_start(void)
   // method instance exists — which cancels the very rows it came to save.
   atk_dot_resume();
 
+  // Same lazy start and the same reason: a bot standing in a live round
+  // outlives the mapping that was swinging for it, and a daemon whose
+  // pit has never held one must not carry a periodic to find that out.
+  atk_bot_resume();
+
   return(SUCCESS);
 }
 
@@ -235,8 +257,10 @@ atk_deinit(void)
   // unloaded .so is a jump into freed memory, and the task queue outlives
   // this plugin.
   atk_dot_stop();
+  atk_bot_stop();
 
   atk_class_free();
+  atk_bot_kv_unregister();
   atk_commands_unregister();
   clam(CLAM_INFO, ATK_CTX, "attack plugin deinitialized");
 }
