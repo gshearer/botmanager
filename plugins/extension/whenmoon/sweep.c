@@ -614,7 +614,7 @@ wm_bt_sweep_axis_add(wm_bt_sweep_plan_t *plan,
   }
 
   memset(axis, 0, sizeof(*axis));
-  snprintf(axis->name, sizeof(axis->name), "%s", buf);
+  strlcpy(axis->name, buf, sizeof(axis->name));
   axis->type = p->type;
 
   // Range form (lo:step:hi) when the values text contains ':' before
@@ -1129,8 +1129,8 @@ wm_bt_sweep_run_one(wm_bt_pool_t *pool, uint32_t iter,
   if(wm_bt_sweep_apply_iter_kv(synth_id, pool->strategy_name,
          pool->plan, indices, err, sizeof(err)) != SUCCESS)
   {
-    snprintf(result->err, sizeof(result->err),
-        "%s", err[0] != '\0' ? err : "kv apply failed");
+    strlcpy(result->err, err[0] != '\0' ? err : "kv apply failed",
+        sizeof(result->err));
     wm_bt_sweep_drop_iter_kv(synth_id);
     return;
   }
@@ -1143,8 +1143,8 @@ wm_bt_sweep_run_one(wm_bt_pool_t *pool, uint32_t iter,
 
   if(!iter_ok)
   {
-    snprintf(result->err, sizeof(result->err),
-        "%s", err[0] != '\0' ? err : "iteration failed");
+    strlcpy(result->err, err[0] != '\0' ? err : "iteration failed",
+        sizeof(result->err));
     wm_bt_sweep_drop_iter_kv(synth_id);
     return;
   }
@@ -1810,9 +1810,9 @@ wm_bt_sweep_run_oos_validation(whenmoon_state_t *st,
     if(wm_bt_sweep_apply_iter_kv(synth_id, strategy_name, plan,
            indices, iter_err, sizeof(iter_err)) != SUCCESS)
     {
-      snprintf(results[src_iter].oos_err,
-          sizeof(results[src_iter].oos_err),
-          "%s", iter_err[0] != '\0' ? iter_err : "kv apply failed");
+      strlcpy(results[src_iter].oos_err,
+          iter_err[0] != '\0' ? iter_err : "kv apply failed",
+          sizeof(results[src_iter].oos_err));
       wm_bt_sweep_drop_iter_kv(synth_id);
       continue;
     }
@@ -1827,9 +1827,9 @@ wm_bt_sweep_run_oos_validation(whenmoon_state_t *st,
 
     if(!iter_ok)
     {
-      snprintf(results[src_iter].oos_err,
-          sizeof(results[src_iter].oos_err),
-          "%s", iter_err[0] != '\0' ? iter_err : "oos iter failed");
+      strlcpy(results[src_iter].oos_err,
+          iter_err[0] != '\0' ? iter_err : "oos iter failed",
+          sizeof(results[src_iter].oos_err));
       continue;
     }
 

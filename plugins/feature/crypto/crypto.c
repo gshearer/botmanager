@@ -981,7 +981,7 @@ crypto_reply_verbose(const cmd_ctx_t *ctx,
   char   supply_c[32], supply_t[32], supply_m[32];
   char   pairs[24];
   char   line[CRYPTO_REPLY_SZ];
-  char   tail[CRYPTO_REPLY_SZ];
+  char   tail[CRYPTO_REPLY_SZ - 128];  // leaves room for the line it folds into
   char   date_clean[COINMARKETCAP_DATE_SZ];
   char  *tpos;
   double turnover = 0.0;

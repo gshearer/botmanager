@@ -50,13 +50,29 @@
 #define IRC_EJECT_REASON_SZ 200
 
 // IRC network/server configuration name limits.
+//
+// A server is named in configuration by its address with dots and colons
+// dashed out, and that name is a KV key *segment* rather than a hostname:
+// the whole composed key has to fit KV_KEY_SZ, or it addresses a
+// different, shorter row (include/kv.h). So this bounds the segment, the
+// static assert below proves the longest key made from it fits, and the
+// `host` argument validators bound the address to match — an address too
+// long to key is refused at the boundary instead of collapsing onto
+// another server's row.
 #define IRC_NET_NAME_SZ 32
-#define IRC_SRV_NAME_SZ IRC_HOST_SZ
+#define IRC_SRV_NAME_SZ 128
 
 // KV key prefix for IRC network configuration.
 // Full key format: irc.net.<NETWORK>.<SERVER>.<PROPERTY>
 // Properties: address, port, priority, tls, tls_verify
 #define IRC_NET_PREFIX  "irc.net."
+
+// Longest of them, and the one to re-check when a property is added:
+// prefix + network + '.' + server + ".no_output_queueing".
+_Static_assert((sizeof(IRC_NET_PREFIX) - 1) + (IRC_NET_NAME_SZ - 1) + 1
+    + (IRC_SRV_NAME_SZ - 1) + (sizeof(".no_output_queueing") - 1) + 1
+    <= KV_KEY_SZ,
+    "irc.net.<network>.<server>.<property> must fit a KV key");
 
 // Maximum networks, servers, and channels for listing.
 #define IRC_MAX_NETS    64
@@ -488,13 +504,13 @@ static const cmd_arg_desc_t ad_irc_netname[] = {
 
 static const cmd_arg_desc_t ad_irc_srv_add[] = {
   { "network", CMD_ARG_CUSTOM,   CMD_ARG_REQUIRED, IRC_NET_NAME_SZ - 1, irc_valid_name },
-  { "host",    CMD_ARG_HOSTNAME, CMD_ARG_REQUIRED, IRC_HOST_SZ - 1,     NULL },
+  { "host",    CMD_ARG_HOSTNAME, CMD_ARG_REQUIRED, IRC_SRV_NAME_SZ - 1, NULL },
   { "port",    CMD_ARG_PORT,     CMD_ARG_OPTIONAL, 8,                   NULL },
 };
 
 static const cmd_arg_desc_t ad_irc_srv_del[] = {
   { "network", CMD_ARG_CUSTOM,   CMD_ARG_REQUIRED, IRC_NET_NAME_SZ - 1, irc_valid_name },
-  { "host",    CMD_ARG_HOSTNAME, CMD_ARG_REQUIRED, IRC_HOST_SZ - 1,     NULL },
+  { "host",    CMD_ARG_HOSTNAME, CMD_ARG_REQUIRED, IRC_SRV_NAME_SZ - 1, NULL },
 };
 
 static const cmd_arg_desc_t ad_irc_srv_list[] = {

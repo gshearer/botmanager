@@ -817,14 +817,14 @@ cb_ws_dispatch_l2(struct json_object *event, int64_t frame_time_ms,
       // Map Advanced Trade "bid" / "offer" onto legacy "buy" / "sell"
       // so existing consumers that switch on side strings keep working.
       if(strcmp(side, "bid") == 0)
-        snprintf(u.changes[u.n_changes].side,
-            sizeof(u.changes[u.n_changes].side), "buy");
+        strlcpy(u.changes[u.n_changes].side, "buy",
+            sizeof(u.changes[u.n_changes].side));
       else if(strcmp(side, "offer") == 0 || strcmp(side, "ask") == 0)
-        snprintf(u.changes[u.n_changes].side,
-            sizeof(u.changes[u.n_changes].side), "sell");
+        strlcpy(u.changes[u.n_changes].side, "sell",
+            sizeof(u.changes[u.n_changes].side));
       else
-        snprintf(u.changes[u.n_changes].side,
-            sizeof(u.changes[u.n_changes].side), "%s", side);
+        strlcpy(u.changes[u.n_changes].side, side,
+            sizeof(u.changes[u.n_changes].side));
 
       u.changes[u.n_changes].price = strtod(price_s, NULL);
       u.changes[u.n_changes].size  = strtod(qty_s,   NULL);

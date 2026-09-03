@@ -1289,7 +1289,10 @@ atk_report_bad(atk_load_report_t *rep, const char *file)
   rep->rejected++;
 
   if(rep->n_bad < ATK_CLASSES_MAX)
-    snprintf(rep->bad[rep->n_bad++], ATK_SHEET_FILE_SZ, "%s", file);
+  {
+    strlcpy(rep->bad[rep->n_bad], file, sizeof(rep->bad[rep->n_bad]));
+    rep->n_bad++;
+  }
 }
 
 // Build a whole new registry from `dir`. Runs entirely outside
@@ -1350,7 +1353,17 @@ atk_scan_dir(const char *dir, atk_class_t **out, uint32_t cap,
     memcpy(stem, file, len - 4);
     stem[len - 4] = '\0';
 
-    snprintf(path, sizeof(path), "%s/%s", dir, file);
+    // `path` is sized for a directory plus a stem plus ".txt", and the
+    // stem was bounded above — but a truncated path names a different
+    // file, so the construction is checked rather than assumed.
+    if(snprintf(path, sizeof(path), "%s/%s", dir, file) >= (int)sizeof(path))
+    {
+      clam(CLAM_WARN, ATK_CTX, "%s: path too long to open under '%s'",
+          file, dir);
+      atk_report_bad(rep, file);
+      continue;
+    }
+
     c = atk_sheet_parse(path, file, stem);
 
     if(c == NULL)

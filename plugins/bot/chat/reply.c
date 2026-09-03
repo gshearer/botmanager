@@ -633,14 +633,18 @@ nl_bridge_handle_kv(chatbot_req_t *r, const char *suffix)
   // Try bot-scoped first, then literal. Per-bot KVs (chat_model,
   // behavior.personality) live under bot.<name>.*; global KVs (e.g.
   // llm.default_chat_model) are matched by the literal form.
-  snprintf(key, sizeof(key), "bot.%s.%s", botname, suffix);
-  nl = kv_get_nl(key);
+  //
+  // Either form is skipped when it will not fit: a key that overruns
+  // KV_KEY_SZ addresses a different, shorter row (include/kv.h), and the
+  // suffix here arrives from the model rather than from a validator.
+  nl = NULL;
 
-  if(nl == NULL)
-  {
-    snprintf(key, sizeof(key), "%s", suffix);
+  if(snprintf(key, sizeof(key), "bot.%s.%s", botname, suffix)
+      < (int)sizeof(key))
     nl = kv_get_nl(key);
-  }
+
+  if(nl == NULL && strlcpy(key, suffix, sizeof(key)) < sizeof(key))
+    nl = kv_get_nl(key);
 
   if(nl == NULL)
   {
@@ -967,7 +971,10 @@ reply_nl_bridge(chatbot_req_t *r, const char *text)
   {
     const char *nick = r->who.nickname[0] != '\0' ? r->who.nickname : r->sender;
     char        excerpt[240];
-    char        premise[512];
+    // Sized for everything the cue composes below, so the only thing
+    // ever clipped is the excerpt — deliberately, and with an ellipsis.
+    char        premise[METHOD_SENDER_SZ + sizeof(excerpt) + sizeof(cmd)
+                        + sizeof(args) + 32];
 
     // The cue quotes the asking line for grounding; a pasted wall must
     // not starve the fence budget the collector computes downstream.
@@ -3445,10 +3452,10 @@ chatbot_reply_submit(chatbot_state_t *st, const method_msg_t *msg,
   r->is_action_at_bot  = msg->is_action && was_addressed;
   r->nl_bridge_off     = nl_bridge_off;
 
-  snprintf(r->sender,          sizeof(r->sender),          "%s", msg->sender);
-  snprintf(r->sender_metadata, sizeof(r->sender_metadata), "%s", msg->metadata);
+  strlcpy(r->sender,          msg->sender,   sizeof(r->sender));
+  strlcpy(r->sender_metadata, msg->metadata, sizeof(r->sender_metadata));
   chat_identity_take(&r->who, msg);
-  snprintf(r->channel,         sizeof(r->channel),         "%s", msg->channel);
+  strlcpy(r->channel,         msg->channel,  sizeof(r->channel));
 
   // Frame the incoming line as an emote when it is a /me action, unless
   // the coalesce path already prepended "* <sender> ". Without this, the
@@ -3457,11 +3464,12 @@ chatbot_reply_submit(chatbot_state_t *st, const method_msg_t *msg,
   if(msg->is_action && strncmp(msg->text, "* ", 2) != 0)
     snprintf(r->text, sizeof(r->text), "* %s %s", msg->sender, msg->text);
   else
-    snprintf(r->text, sizeof(r->text), "%s", msg->text);
+    strlcpy(r->text, msg->text, sizeof(r->text));
 
   // Reply target = channel if public, else sender for DM.
-  snprintf(r->reply_target, sizeof(r->reply_target), "%s",
-      msg->channel[0] != '\0' ? msg->channel : msg->sender);
+  strlcpy(r->reply_target,
+      msg->channel[0] != '\0' ? msg->channel : msg->sender,
+      sizeof(r->reply_target));
 
   // Snapshot active personality name under the state rwlock.
   pthread_rwlock_rdlock(&st->lock);
@@ -3867,18 +3875,19 @@ chatbot_reply_submit_vision(chatbot_state_t *st, const method_msg_t *msg,
   r->is_direct_address = true;
   r->is_action_at_bot  = msg->is_action;
 
-  snprintf(r->sender,          sizeof(r->sender),          "%s", msg->sender);
-  snprintf(r->sender_metadata, sizeof(r->sender_metadata), "%s", msg->metadata);
+  strlcpy(r->sender,          msg->sender,   sizeof(r->sender));
+  strlcpy(r->sender_metadata, msg->metadata, sizeof(r->sender_metadata));
   chat_identity_take(&r->who, msg);
-  snprintf(r->channel,         sizeof(r->channel),         "%s", msg->channel);
+  strlcpy(r->channel,         msg->channel,  sizeof(r->channel));
 
   if(msg->is_action && strncmp(msg->text, "* ", 2) != 0)
     snprintf(r->text, sizeof(r->text), "* %s %s", msg->sender, msg->text);
   else
-    snprintf(r->text, sizeof(r->text), "%s", msg->text);
+    strlcpy(r->text, msg->text, sizeof(r->text));
 
-  snprintf(r->reply_target, sizeof(r->reply_target), "%s",
-      msg->channel[0] != '\0' ? msg->channel : msg->sender);
+  strlcpy(r->reply_target,
+      msg->channel[0] != '\0' ? msg->channel : msg->sender,
+      sizeof(r->reply_target));
 
   // Attach vision payload — from this point on req_free releases b64.
   r->vision_active = true;

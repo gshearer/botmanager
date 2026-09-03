@@ -824,8 +824,13 @@ imagine_cmd_handler(const cmd_ctx_t *ctx)
   {
     char merged[IMG_PROMPT_SZ];
 
-    snprintf(merged, sizeof(merged), "%s %s", prepend, prompt);
-    snprintf(prompt, sizeof(prompt), "%s", merged);
+    if(snprintf(merged, sizeof(merged), "%s %s", prepend, prompt)
+        >= (int)sizeof(merged))
+      clam(CLAM_WARN, IMG_CMD_CTX,
+          "style preamble and prompt exceed %zu bytes — prompt clipped",
+          sizeof(merged));
+
+    strlcpy(prompt, merged, sizeof(prompt));
   }
 
   r = mem_alloc(IMG_CMD_CTX, "req", sizeof(*r));

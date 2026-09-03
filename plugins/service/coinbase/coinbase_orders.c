@@ -509,19 +509,22 @@ cb_parse_order(struct json_object *obj, coinbase_order_t *out)
   if(strcmp(tif_long, "GOOD_UNTIL_CANCELLED")    == 0
       || strcmp(tif_long, "GOOD_UNTIL_CANCELED") == 0
       || strcmp(tif_long, "GTC")                 == 0)
-    snprintf(out->tif, sizeof(out->tif), "GTC");
+    strlcpy(out->tif, "GTC", sizeof(out->tif));
   else if(strcmp(tif_long, "IMMEDIATE_OR_CANCEL") == 0
       || strcmp(tif_long, "IOC")                  == 0)
-    snprintf(out->tif, sizeof(out->tif), "IOC");
+    strlcpy(out->tif, "IOC", sizeof(out->tif));
   else if(strcmp(tif_long, "FILL_OR_KILL") == 0
       || strcmp(tif_long, "FOK")           == 0)
-    snprintf(out->tif, sizeof(out->tif), "FOK");
+    strlcpy(out->tif, "FOK", sizeof(out->tif));
   else if(strcmp(tif_long, "GOOD_UNTIL_DATE_TIME") == 0
       || strcmp(tif_long, "GTD")                   == 0
       || strcmp(tif_long, "GTT")                   == 0)
-    snprintf(out->tif, sizeof(out->tif), "GTT");
+    strlcpy(out->tif, "GTT", sizeof(out->tif));
+
+  // An unmapped form the venue has added since: keep what fits, so it
+  // shows up in the order card as something to go and look at.
   else
-    snprintf(out->tif, sizeof(out->tif), "%s", tif_long);
+    strlcpy(out->tif, tif_long, sizeof(out->tif));
 
   // Numeric strings.
   {

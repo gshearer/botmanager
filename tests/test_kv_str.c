@@ -212,10 +212,8 @@ case_declared_default_and_clear(void)
 static void
 case_help_outlives_its_storage(void)
 {
-  char       *owned = mem_alloc("test", "help", 64);
+  char       *owned = mem_strdup("test", "help", "the caller's storage");
   const char *held;
-
-  strlcpy(owned, "the caller's storage", 64);
 
   kv_register("t.help", KV_UINT32, "1", NULL, NULL, owned);
 
@@ -228,8 +226,7 @@ case_help_outlives_its_storage(void)
       true, held != owned);
 
   // The caller's storage goes away, exactly as its mapping does.
-  memset(owned, 'z', 63);
-  owned[63] = '\0';
+  memset(owned, 'z', strlen(owned));
   mem_free(owned);
 
   test_check_str(SUITE, "the held pointer survives its storage",

@@ -264,6 +264,25 @@ id_group_cb(const char *group, uint16_t level, void *data)
   st->count++;
 }
 
+// Compose a nick's "nick!user@host" MFA string from the method's context
+// map. Writes an empty string when the method has no context for the
+// nick, and equally when the composition would not fit: a truncated MFA
+// names a different identity, so it names none.
+static void
+id_build_mfa(method_inst_t *inst, const char *nick, char *out, size_t out_sz)
+{
+  char host[METHOD_META_SZ] = {0};
+
+  out[0] = '\0';
+
+  if(method_get_context(inst, nick, host, sizeof(host)) != SUCCESS
+      || host[0] == '\0')
+    return;
+
+  if(snprintf(out, out_sz, "%s!%s", nick, host) >= (int)out_sz)
+    out[0] = '\0';
+}
+
 // Pad a string to exactly `width` display columns with trailing spaces.
 // Only handles ASCII strings (no embedded color codes or multi-byte).
 static void
@@ -300,13 +319,7 @@ id_format_nick(const cmd_ctx_t *ctx, userns_t *ns,
   char mfa_str[METHOD_META_SZ] = {0};
 
   if(ctx->msg->inst != NULL)
-  {
-    char host[METHOD_META_SZ] = {0};
-
-    if(method_get_context(ctx->msg->inst, nick,
-        host, sizeof(host)) == SUCCESS && host[0] != '\0')
-      snprintf(mfa_str, sizeof(mfa_str), "%s!%s", nick, host);
-  }
+    id_build_mfa(ctx->msg->inst, nick, mfa_str, sizeof(mfa_str));
 
   // Try to resolve identity: full resolution first, then a bare
   // pattern match (recognized, but autoidentify is off and no temp
@@ -520,13 +533,7 @@ cmd_id(const cmd_ctx_t *ctx)
     char mfa_str[METHOD_META_SZ] = {0};
 
     if(ctx->msg->inst != NULL)
-    {
-      char host[METHOD_META_SZ] = {0};
-
-      if(method_get_context(ctx->msg->inst, target,
-          host, sizeof(host)) == SUCCESS && host[0] != '\0')
-        snprintf(mfa_str, sizeof(mfa_str), "%s!%s", target, host);
-    }
+      id_build_mfa(ctx->msg->inst, target, mfa_str, sizeof(mfa_str));
 
     id_format_self(ctx, ns, target, mfa_str[0] != '\0' ? mfa_str : NULL);
     return;

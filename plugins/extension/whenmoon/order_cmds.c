@@ -36,7 +36,10 @@
 #include <string.h>
 
 #define WM_ORDER_TARGET_SZ   128
-#define WM_ORDER_LABEL_SZ     96
+
+// Widest label is a cancel: "order cancel <exchange>/<order-id>", so it
+// holds an exchange token and a whole venue order id, not a market name.
+#define WM_ORDER_LABEL_SZ    128
 
 // Heap-owned reply target captured at handler entry. The instance is
 // captured by NAME: the order round trip outlives the dispatching turn,
@@ -101,7 +104,9 @@ static void
 wm_order_place_done(const exchange_order_result_t *res, void *user)
 {
   wm_order_async_ctx_t *ac = user;
-  char                  reply[256];
+  // The label is echoed whole and so is the venue's error text, so the
+  // reply is sized from both rather than rounded off.
+  char                  reply[sizeof(ac->label) + sizeof(res->err) + 192];
 
   if(ac == NULL)
     return;
@@ -305,7 +310,9 @@ static void
 wm_order_cancel_done(const exchange_order_result_t *res, void *user)
 {
   wm_order_async_ctx_t *ac = user;
-  char                  reply[256];
+  // The label is echoed whole and so is the venue's error text, so the
+  // reply is sized from both rather than rounded off.
+  char                  reply[sizeof(ac->label) + sizeof(res->err) + 192];
 
   if(ac == NULL)
     return;

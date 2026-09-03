@@ -685,14 +685,14 @@ acq_extract_images(const char *html, size_t html_len,
       acq_extract_attr(p, tag_end, "content",  content, sizeof(content));
 
       if(strcasecmp(prop, "og:image") == 0 && og_image[0] == '\0')
-        snprintf(og_image, sizeof(og_image), "%s", content);
+        strlcpy(og_image, content, sizeof(og_image));
 
       else if(strcasecmp(nameb, "twitter:image") == 0
           && twitter_image[0] == '\0')
-        snprintf(twitter_image, sizeof(twitter_image), "%s", content);
+        strlcpy(twitter_image, content, sizeof(twitter_image));
 
       else if(strcasecmp(prop, "og:title") == 0 && og_title[0] == '\0')
-        snprintf(og_title, sizeof(og_title), "%s", content);
+        strlcpy(og_title, content, sizeof(og_title));
     }
 
     p = tag_end + 1;

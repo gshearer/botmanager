@@ -506,6 +506,18 @@ irc_chan_collect_cb(const char *key, kv_type_t type,
   cc->count++;
 }
 
+// Compose one of a channel's KV keys. False when it would not fit: a key
+// that overruns KV_KEY_SZ addresses a different, shorter row, and this
+// project has already paid once for two long channel names collapsing
+// onto one (include/kv.h).
+static bool
+irc_chan_key(char *out, size_t out_sz, const char *prefix,
+    const char *chan, const char *prop)
+{
+  return(snprintf(out, out_sz, "%s%s%s", prefix, chan, prop)
+      < (int)out_sz);
+}
+
 static void
 irc_join_channels(irc_state_t *st)
 {
@@ -537,16 +549,25 @@ irc_join_channels(irc_state_t *st)
     uint64_t autojoin;
     const char *chankey;
 
-    // Check autojoin.
-    snprintf(key, sizeof(key), "%s%s.autojoin", chan_prefix, cc.names[i]);
+    // Check autojoin. Silence would be wrong here for the same reason
+    // the empty list above is: the channel is configured, and not
+    // joining it is the thing nobody could see.
+    if(!irc_chan_key(key, sizeof(key), chan_prefix, cc.names[i],
+        ".autojoin"))
+    {
+      clam(CLAM_WARN, "irc", "channel name too long to key — not joining "
+          "#%s", cc.names[i]);
+      continue;
+    }
+
     autojoin = kv_get_uint(key);
 
     if(autojoin == 0)
       continue;
 
     // Read channel key (password).
-    snprintf(key, sizeof(key), "%s%s.key", chan_prefix, cc.names[i]);
-    chankey = kv_get_str(key);
+    chankey = irc_chan_key(key, sizeof(key), chan_prefix, cc.names[i],
+        ".key") ? kv_get_str(key) : NULL;
 
     if(chankey != NULL && chankey[0] != '\0')
     {

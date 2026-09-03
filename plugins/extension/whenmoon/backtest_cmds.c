@@ -542,7 +542,7 @@ wm_bt_parse_walk_spec(const char *tok, wm_bt_walk_spec_t *out)
   if(strlen(tok) >= sizeof(buf))
     return(FAIL);
 
-  snprintf(buf, sizeof(buf), "%s", tok);
+  strlcpy(buf, tok, sizeof(buf));
   memset(out, 0, sizeof(*out));
 
   for(seg = strtok_r(buf, ":", &save); seg != NULL;
@@ -957,10 +957,12 @@ wm_bt_cmd_run(const cmd_ctx_t *ctx)
   char                       tok[256]                      = {0};
   char                       val_tok[256]                  = {0};
   char                       err[320];
-  char                       reply[640];
   char                       sweep_id[160]                 = {0};
   char                       report_root[1024]             = {0};
   char                       sweep_dir[1024]               = {0};
+  // The queued-run reply quotes the results directory, so it is a whole
+  // path plus wording rather than a round number.
+  char                       reply[sizeof(sweep_dir) + 512];
   wm_backtest_params_t       params;
   wm_backtest_snapshot_t    *snap          = NULL;
   loaded_strategy_t         *ls;
@@ -1438,7 +1440,8 @@ wm_bt_cmd_run(const cmd_ctx_t *ctx)
     snprintf(job->sweep_id,  sizeof(job->sweep_id),  "%s", sweep_id);
     snprintf(job->sweep_dir, sizeof(job->sweep_dir), "%s", sweep_dir);
 
-    snprintf(task_name, sizeof(task_name), "wm-btrun:%s", name_tok);
+    snprintf(task_name, sizeof(task_name), "wm-btrun:%.*s",
+        (int)(sizeof(task_name) - sizeof("wm-btrun:")), name_tok);
 
     // Build the reply BEFORE task_add: once submitted, the worker owns
     // `snap` and may free it, so `snap->*` must not be read afterward.
@@ -1901,7 +1904,8 @@ wm_bt_cmd_compile(const cmd_ctx_t *ctx)
   snprintf(job->market, sizeof(job->market), "%s", pair_tok);
   snprintf(job->path,   sizeof(job->path),   "%s", path_tok);
 
-  snprintf(task_name, sizeof(task_name), "wm-btcompile:%s", pair_tok);
+  snprintf(task_name, sizeof(task_name), "wm-btcompile:%.*s",
+      (int)(sizeof(task_name) - sizeof("wm-btcompile:")), pair_tok);
 
   t = task_add(task_name, TASK_THREAD, WM_BT_COMPILE_TASK_PRIORITY,
       wm_bt_compile_task_cb, job);
@@ -2010,7 +2014,7 @@ wm_bt_cmd_list(const cmd_ctx_t *ctx)
 {
   char                  report_root[1024] = {0};
   char                  err[320]          = {0};
-  char                  reply[640];
+  char                  reply[sizeof(report_root) + 256];
   char                  manifest_path[2048];
   wm_bt_dir_listing_t   listing;
   uint32_t              i;
@@ -2118,7 +2122,7 @@ wm_bt_cmd_show(const cmd_ctx_t *ctx)
   char        report_root[1024]  = {0};
   char        err[320]           = {0};
   char        path[2048];
-  char        reply[640];
+  char        reply[sizeof(report_root) + sizeof(sweep_tok) + 256];
   char        line[640];
   FILE       *fp;
 

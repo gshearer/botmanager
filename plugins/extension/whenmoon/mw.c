@@ -1612,7 +1612,7 @@ mw_start(void)
     size_t     k;
 
     memset(ex, 0, sizeof(*ex));
-    snprintf(ex->name, sizeof(ex->name), "%s", names[i]);
+    strlcpy(ex->name, names[i], sizeof(ex->name));
 
     if(pthread_mutex_init(&ex->lock, NULL) != 0)
     {

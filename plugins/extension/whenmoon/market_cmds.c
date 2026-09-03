@@ -408,7 +408,9 @@ wm_market_cmd_mode(const cmd_ctx_t *ctx)
   char              instance[WM_INSTANCE_LABEL_SZ] = {0};
   char              id_str[WM_MARKET_ID_STR_SZ];
   char              err[160] = {0};
-  char              reply[200];
+  // Sized from the parts rather than guessed: a reply here carries the
+  // market id and the whole of `err`, plus its own wording.
+  char              reply[sizeof(err) + sizeof(id_str) + 128];
   wm_market_mode_t  mode;
 
   st = whenmoon_get_state();
@@ -513,7 +515,7 @@ wm_market_cmd_sync(const cmd_ctx_t *ctx)
   char               quote[16];
   char               id_str[WM_MARKET_ID_STR_SZ];
   char               err[160] = {0};
-  char               reply[224];
+  char               reply[sizeof(err) + sizeof(id_str) + 128];
   double             cash = 0.0;
 
   st = whenmoon_get_state();
@@ -591,7 +593,8 @@ wm_market_cmd_force(const cmd_ctx_t *ctx)
   char               instance[WM_INSTANCE_LABEL_SZ] = {0};
   char               id_str[WM_MARKET_ID_STR_SZ];
   char               errbuf[192]  = {0};
-  char               reply[256];
+  char               reply[sizeof(errbuf) + sizeof(id_str)
+                           + sizeof(side_tok) + 128];
   double             qty;
   double             px_override = 0.0;
   char               side_ch;

@@ -299,6 +299,7 @@ tmdb_person_known_for(struct json_object *root, char *out, size_t cap)
   struct json_object *cast;
   char   names[TMDB_KNOWNFOR_MAX][TMDB_TITLE_SZ];
   double pops[TMDB_KNOWNFOR_MAX];
+  int    order[TMDB_KNOWNFOR_MAX];
   int    have = 0;
   int    len;
   size_t pos  = 0;
@@ -374,33 +375,29 @@ tmdb_person_known_for(struct json_object *root, char *out, size_t cap)
     }
 
     pops[slot] = pop;
-    snprintf(names[slot], sizeof(names[slot]), "%s", nm);
+    order[slot] = slot;
+    strlcpy(names[slot], nm, sizeof(names[slot]));
   }
 
-  // Selection-sort the captured entries by popularity, descending.
+  // Selection-sort by popularity, descending. The titles stay where they
+  // were captured and `order` is permuted instead — a title is up to
+  // TMDB_TITLE_SZ bytes and there is nothing to be gained by moving it.
   for(int a = 0; a < have; a++)
   {
-    int  best = a;
-    char tn[TMDB_TITLE_SZ];
-    double tp;
+    int best = a;
+    int t;
 
     for(int b = a + 1; b < have; b++)
-      if(pops[b] > pops[best])
+      if(pops[order[b]] > pops[order[best]])
         best = b;
 
-    if(best == a)
-      continue;
-
-    tp = pops[a]; pops[a] = pops[best]; pops[best] = tp;
-    snprintf(tn, sizeof(tn), "%s", names[a]);
-    snprintf(names[a], sizeof(names[a]), "%s", names[best]);
-    snprintf(names[best], sizeof(names[best]), "%s", tn);
+    t = order[a]; order[a] = order[best]; order[best] = t;
   }
 
   for(int a = 0; a < have; a++)
   {
     int need = snprintf(out + pos, cap - pos, "%s%s",
-        a > 0 ? ", " : "", names[a]);
+        a > 0 ? ", " : "", names[order[a]]);
 
     if(need < 0 || (size_t)need >= cap - pos)
     {

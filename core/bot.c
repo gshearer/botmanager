@@ -1423,7 +1423,7 @@ bot_identity_resolve(bot_inst_t *inst, method_inst_t *method,
   meta[0] = '\0';
 
   if(metadata != NULL && metadata[0] != '\0')
-    snprintf(meta, sizeof(meta), "%s", metadata);
+    strlcpy(meta, metadata, sizeof(meta));
 
   else if(method != NULL && sender != NULL && sender[0] != '\0')
   {
@@ -1431,7 +1431,14 @@ bot_identity_resolve(bot_inst_t *inst, method_inst_t *method,
 
     if(method_get_context(method, sender, host, sizeof(host)) == SUCCESS
         && host[0] != '\0')
-      snprintf(meta, sizeof(meta), "%s!%s", sender, host);
+    {
+      // A truncated MFA is a different identity, so it is no identity:
+      // the patterns it would match are not the sender's, and this is
+      // the call that decides who a message is acting as.
+      if(snprintf(meta, sizeof(meta), "%s!%s", sender, host)
+          >= (int)sizeof(meta))
+        meta[0] = '\0';
+    }
   }
 
   if(meta[0] == '\0')

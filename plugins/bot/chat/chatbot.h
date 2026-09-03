@@ -1041,7 +1041,10 @@ typedef struct
   chat_identity_t who;
   char            channel[METHOD_CHANNEL_SZ];
   char            reply_target[METHOD_CHANNEL_SZ];
-  char            text[METHOD_TEXT_SZ];
+  // Holds the *framed* line, not the raw one: an emote arrives as a bare
+  // verb and is re-framed "* <sender> <text>" before the model sees it,
+  // so the field is a whole method text plus that prefix.
+  char            text[METHOD_TEXT_SZ + METHOD_SENDER_SZ + 2];
 
   uint32_t        ns_id;
   int             user_id;

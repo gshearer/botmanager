@@ -1213,7 +1213,9 @@ cmd_in(const cmd_ctx_t *ctx)
 static void
 deferred_render(const cmd_ctx_t *ctx, const db_result_t *res, bool with_who)
 {
-  char line[512];
+  // Wide enough for every field below at its own declared limit, so no
+  // listed row is ever clipped.
+  char line[640];
 
   for(uint32_t i = 0; i < res->rows; i++)
   {

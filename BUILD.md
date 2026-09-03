@@ -57,6 +57,22 @@ reports on the files it recompiled:
 ninja -C build -t clean && ninja -C build 2>&1 | grep -c 'warning:'
 ```
 
+⚠ **A clean `build` is not a clean tree, and you have to run all three.**
+At `-O2` gcc's value-range propagation proves away most
+`-Wformat-truncation`; at the `-O1` the sanitizer configurations use it
+cannot. Forty sites across core and ten plugins were invisible in `build`
+and warned in `build-asan` and `build-tsan` until 2026-09-03. The two
+sanitizers do not even report the same set, because their instrumentation
+changes what the optimizer can see.
+
+`-Wformat-truncation` at the level `-Wall` turns on fires only where the
+return value is **unused**, so what it reports is an unhandled truncation
+rather than a certain one. Two fixes, and a `(void)` cast is neither:
+handle it where truncation means something (a KV key or a path that does
+not fit names a *different* row or file — `include/kv.h`), or size the
+destination for what it can actually receive, deriving that from the
+parts rather than rounding to a number that will rot.
+
 `scripts/gen_version_h.sh` runs every build and bumps the `BUILDNUM` file
 at the project root. The version is `major.minor.build`: major and minor are
 set in `meson.build` (`bm_version_major` / `bm_version_minor`), and the build
