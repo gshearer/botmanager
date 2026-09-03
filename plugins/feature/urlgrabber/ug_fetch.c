@@ -766,10 +766,8 @@ ug_fetch(const char *method_name, const char *channel, const char *url)
   if(method_name == NULL || channel == NULL || url == NULL)
     return;
 
-  if((fc = mem_alloc(UG_CTX, "fetchctx", sizeof(*fc))) == NULL)
-    return;
+  fc = mem_alloc(UG_CTX, "fetchctx", sizeof(*fc));
 
-  memset(fc, 0, sizeof(*fc));
   snprintf(fc->method,  sizeof(fc->method),  "%s", method_name);
   snprintf(fc->channel, sizeof(fc->channel), "%s", channel);
   snprintf(fc->url,     sizeof(fc->url),     "%s", url);
