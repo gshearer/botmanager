@@ -202,6 +202,14 @@ struct cmd_ctx
   const method_msg_t  *msg;       // full message context
   const char          *args;      // raw arguments after command name
   const char          *username;  // authenticated username, or NULL
+
+  // The namespace `username` is resolved against. Normally NULL, and a
+  // context that carries a bot leaves it that way — core reaches
+  // through the bot. cmd_dispatch_as has no bot and is handed a
+  // namespace instead, so that path names it here; it is the only one
+  // that has to.
+  userns_t            *ns;
+
   const cmd_args_t    *parsed;    // pre-parsed args, or NULL if no spec
   void                *data;      // opaque callback data from registration
 

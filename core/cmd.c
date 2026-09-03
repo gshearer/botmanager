@@ -1555,13 +1555,17 @@ help_path_locked(const cmd_def_t *d, char *out, size_t sz)
 // `show feature --help` and `help show feature` cannot drift apart.
 // `path` is a resolved command path; cmd_mutex must NOT be held.
 //
+// `inst` and `ns` are the two ways a caller's identity gets resolved
+// and every caller has exactly one of them: a bot to reach through, or
+// a namespace handed over because there is no bot. See ctx_userns.
+//
 // The callback is core's own `cmd_builtin_help`, which is why it is
 // invoked with no in-flight record: there is no mapping here that can
 // go away underneath it.
 // returns: SUCCESS, or FAIL when no `help` command is registered
 static bool
-help_redirect(const char *path, bot_inst_t *inst, const method_msg_t *msg,
-    const char *username)
+help_redirect(const char *path, bot_inst_t *inst, userns_t *ns,
+    const method_msg_t *msg, const char *username)
 {
   cmd_def_t *help_cmd;
   cmd_cb_t   cb;
@@ -1584,6 +1588,7 @@ help_redirect(const char *path, bot_inst_t *inst, const method_msg_t *msg,
 
   ctx = (cmd_ctx_t){
     .bot      = inst,
+    .ns       = ns,
     .msg      = msg,
     .args     = path,
     .username = username,
@@ -1714,7 +1719,7 @@ cmd_dispatch(bot_inst_t *inst, const method_msg_t *msg)
     username = bot_identity_resolve(inst, msg->inst, msg->sender,
         msg->metadata, ubuf, sizeof(ubuf)) ? ubuf : NULL;
 
-    if(help_redirect(path, inst, msg, username) != SUCCESS)
+    if(help_redirect(path, inst, NULL, msg, username) != SUCCESS)
       return(FAIL);
 
     __atomic_fetch_add(&cmd_stat_dispatches, 1, __ATOMIC_RELAXED);
@@ -2170,6 +2175,23 @@ cmd_reply_table_head(const cmd_ctx_t *ctx, const char *head)
 #define CMD_HELP_ARGS_COLS \
     (DISPLAY_COLS - (int)(sizeof CMD_HELP_ARGS_INDENT - 1) - 1)
 
+// The namespace a context's `username` is resolved against. Two
+// dispatchers build a cmd_ctx and they come by it differently:
+// cmd_dispatch has a bot and reaches through it, cmd_dispatch_as has no
+// bot and is handed one, which it names on the context. Resolving that
+// in one place is what stops the two drifting into different answers
+// about the same caller — they did until featreq #82, where every
+// command read as forbidden to a botmanctl session that had asserted
+// any identity but @owner.
+static userns_t *
+ctx_userns(const cmd_ctx_t *ctx)
+{
+  if(ctx->ns != NULL)
+    return(ctx->ns);
+
+  return((ctx->bot != NULL) ? bot_get_userns(ctx->bot) : NULL);
+}
+
 // Permission check: can the caller see this command in help listings?
 static bool
 help_check_access(const cmd_ctx_t *ctx, const cmd_def_t *d)
@@ -2180,10 +2202,8 @@ help_check_access(const cmd_ctx_t *ctx, const cmd_def_t *d)
   if(mt != 0 && !(d->methods & mt))
     return(false);
 
-  {
-    userns_t *ns = (ctx->bot != NULL) ? bot_get_userns(ctx->bot) : NULL;
-    return(check_permission(ns, ctx->username, d->group, d->level));
-  }
+  return(check_permission(ctx_userns(ctx), ctx->username,
+      d->group, d->level));
 }
 
 static const char *
@@ -3250,12 +3270,12 @@ cmd_dispatch_as(const char *cmd_name, const char *args,
   // does. Ahead of the permission check for the same reason it is
   // there — help_check_access hides what this caller may not run, and
   // reports an unrunnable command exactly as it reports an absent one.
-  // ⚠ It sees no userns on this path (the context carries a bot, and
-  // this one has none), so a caller downgraded with botmanctl's `AS`
-  // is answered as an anonymous one.
+  // The namespace goes with it: this path has no bot to reach through,
+  // and visibility judged without one answers every asserted identity
+  // as anonymous — which is to say, hides everything.
   if(want_help)
   {
-    if(help_redirect(help_path, NULL, &msg, username) != SUCCESS)
+    if(help_redirect(help_path, NULL, ns, &msg, username) != SUCCESS)
       return(FAIL);
 
     __atomic_add_fetch(&cmd_stat_dispatches, 1, __ATOMIC_RELAXED);
@@ -3286,8 +3306,11 @@ cmd_dispatch_as(const char *cmd_name, const char *args,
   // voiced -- bot_persona_reply refuses without a bot. The identity is
   // filled anyway: the two ctx builders disagreeing about which fields
   // they populate is how a later feature acquires a silent dead path.
+  // .ns is that identity's other half here: with no bot, it is the only
+  // thing anything downstream can resolve the caller against.
   ctx = (cmd_ctx_t){
     .bot      = NULL,
+    .ns       = ns,
     .msg      = &msg,
     .args     = args,
     .username = username,
