@@ -198,7 +198,10 @@ wm_market_session_refresh_kv(whenmoon_market_t *mk)
   fee_bps = wm_mk_kv_get_double(mk->market_id_str, "fee_bps",
       "5.0", WM_MARKET_DEFAULT_FEE_BPS,
       "Per-side fee in basis points of executed notional. Applied to"
-      " every paper fill; real fills carry the actual exchange fee.");
+      " every paper fill; real fills carry the actual exchange fee."
+      " Also the reserve the sizer holds back so a buy's fee comes out"
+      " of its own size_frac slice — set below the venue's real rate"
+      " and a size_frac of 1.0 still overdraws.");
 
   slip_bps = wm_mk_kv_get_double(mk->market_id_str, "slip_bps",
       "5.0", WM_MARKET_DEFAULT_SLIP_BPS,
@@ -1183,6 +1186,7 @@ wm_market_engine_on_signal_with_mk(whenmoon_market_t *mk, double mark_px,
   wm_mk_advice_t     advice;
   wm_market_mode_t   mode;
   double             qty;
+  double             unit_cost;
   double             slip;
   double             fill_px;
   double             fee_bps;
@@ -1257,11 +1261,44 @@ wm_market_engine_on_signal_with_mk(whenmoon_market_t *mk, double mark_px,
   fee_bps  = mk->session.fee_bps;
   slip_bps = mk->session.slip_bps;
 
-  // Sizer: buys open `size_frac * cash / mark`; sells close the full
-  // open long qty. Real-mode caps + gate trips are owned by
+  // Synthetic slippage is a paper fiction; a real order leaves as a
+  // limit at the mark and cannot fill through it. Resolved here rather
+  // than at fill time because a buy has to be sized against the price
+  // it will actually pay.
+  slip    = (mode == WM_MARKET_MODE_REAL)
+            ? 0.0 : mark_px * (slip_bps / 10000.0);
+  fill_px = (advice == WM_MK_ADVICE_BUY) ? mark_px + slip
+                                         : mark_px - slip;
+
+  if(fill_px <= 0.0)
+  {
+    pthread_mutex_unlock(&mk->lock);
+    return;
+  }
+
+  // Sizer: a buy spends `size_frac` of cash IN TOTAL, so it divides by
+  // what one unit costs to acquire — the fill price plus the fee riding
+  // on it — and not by the price alone. Dividing by the price and
+  // charging the fee afterwards buys more than the cash on hand: at
+  // size_frac 1.0 that is a position worth more than the equity backing
+  // it and a cash ledger that goes negative on every open. Sells close
+  // the full open long qty. Real-mode caps + gate trips are owned by
   // wm_market_engine_real_submit_locked (single source of truth).
   if(advice == WM_MK_ADVICE_BUY)
-    qty = (mk->session.stats[mode].cash * mk->session.size_frac) / mark_px;
+  {
+    unit_cost = fill_px * (1.0 + fee_bps / 10000.0);
+
+    // fee_bps is an unbounded operator knob; a rebate of a full 10000
+    // makes a unit free and the fraction of cash it buys unbounded.
+    if(unit_cost <= 0.0)
+    {
+      pthread_mutex_unlock(&mk->lock);
+      return;
+    }
+
+    qty = (mk->session.stats[mode].cash * mk->session.size_frac)
+        / unit_cost;
+  }
 
   else /* sell — close the full open long */
     qty = mk->session.position.qty;
@@ -1300,17 +1337,7 @@ wm_market_engine_on_signal_with_mk(whenmoon_market_t *mk, double mark_px,
     return;
   }
 
-  // Paper mode: synthetic slippage + immediate apply_fill.
-  slip    = mark_px * (slip_bps / 10000.0);
-  fill_px = (advice == WM_MK_ADVICE_BUY) ? mark_px + slip
-                                         : mark_px - slip;
-
-  if(fill_px <= 0.0)
-  {
-    pthread_mutex_unlock(&mk->lock);
-    return;
-  }
-
+  // Paper mode: fill at the slipped price resolved above, immediately.
   notional = qty * fill_px;
   fee      = notional * (fee_bps / 10000.0);
 
