@@ -214,6 +214,10 @@ atk_init(void)
   // that already exist, so a reload re-attaches the knobs.
   atk_bot_kv_register();
 
+  // And the other direction: what a bot standing in the pit can be
+  // asked about while the brawl is still going on (board #88).
+  atk_bot_situation_register();
+
   clam(CLAM_INFO, ATK_CTX, "attack plugin initialized");
   return(SUCCESS);
 }
@@ -260,6 +264,7 @@ atk_deinit(void)
   atk_bot_stop();
 
   atk_class_free();
+  atk_bot_situation_unregister();
   atk_bot_kv_unregister();
   atk_commands_unregister();
   clam(CLAM_INFO, ATK_CTX, "attack plugin deinitialized");

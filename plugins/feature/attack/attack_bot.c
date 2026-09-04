@@ -258,6 +258,177 @@ atk_bot_remember_death(const char *method_kind, const char *channel,
 }
 
 // ------------------------------------------------------------------ //
+// What a combatant knows while it is still standing                   //
+// ------------------------------------------------------------------ //
+
+// Stable per-plugin address, like the KV cookie above.
+static const char atk_bot_situation_cookie;
+
+// The death is all a bot REMEMBERS (above), and that is right: a
+// blow-by-blow in a retrieval corpus drowns it. But a bot mid-brawl
+// still has to be able to answer *"why did you hit me"* while the brawl
+// is happening, and it could not — the pit's own lines never reach its
+// message path, and chat hands a `!attack` line to the command half
+// without logging it, so a bot fought a whole round in #cabal and met
+// the next question with *"I have no record of the fight"* (board #88).
+//
+// So the state is PULLED, once, at the moment a prompt is built, and
+// nothing is stored: what is true of a fight is true for minutes.
+//
+// ⚠ Three indexed queries, on the thread assembling the prompt. The
+// knob is asked first and answers for every bot in the tree that is not
+// in the pit, which is all of them nearly all of the time.
+static size_t
+atk_bot_situation(const char *botname, const char *method_name,
+    const char *channel, char *out, size_t out_sz, void *user)
+{
+  atk_card_row_t  rows[ATK_MAX_PLAYERS];
+  atk_dot_mark_t  marks[ATK_MAX_PLAYERS];
+  atk_card_t      card;
+  atk_tunables_t  tun;
+  userns_t       *ns;
+  bot_inst_t     *inst;
+  char            others[ATK_ROSTER_SZ];
+  char            ails[ATK_TALLY_SZ];
+  size_t          n_others = 0;
+  size_t          n_ails   = 0;
+  uint32_t        shown;
+  uint32_t        n_marks;
+  uint32_t        self     = ATK_MAX_PLAYERS;
+
+  (void)user;
+
+  // A direct message names no room, and atk_db_card_find widens to the
+  // whole namespace when the channel is empty — which would tell a bot
+  // in a DM about a brawl it is not in.
+  if(channel == NULL || channel[0] == '\0')
+    return(0);
+
+  if(!atk_bot_enabled(botname))
+    return(0);
+
+  inst = bot_find(botname);
+
+  if(inst == NULL)
+    return(0);
+
+  ns = bot_get_userns(inst);
+
+  if(ns == NULL)
+    return(0);
+
+  if(!atk_db_card_find(ns->id, method_name, channel, &card))
+    return(0);
+
+  atk_tunables_load(&tun);
+
+  // Same comparison, in the same direction, as every other reader: a
+  // round nobody has swung in for longer than the idle ceiling is over,
+  // whatever the row still says. Telling a bot it is fighting in a fight
+  // that finished is the mirror of the bug this fixes.
+  if(card.state != ATK_ROUND_ACTIVE
+      || card.idle > (int64_t)tun.round_max_idle_secs)
+    return(0);
+
+  shown   = atk_db_card_roster(card.id, rows, ATK_MAX_PLAYERS, NULL);
+  n_marks = atk_db_dot_marks(card.id, marks, ATK_MAX_PLAYERS);
+
+  for(uint32_t i = 0; i < shown; i++)
+    if(strcasecmp(rows[i].user, botname) == 0)
+    {
+      self = i;
+      break;
+    }
+
+  // On the card but not in it: the roster is the round's, and a bot may
+  // be watching a fight between two other people in its own channel.
+  if(self == ATK_MAX_PLAYERS)
+    return(0);
+
+  others[0] = '\0';
+
+  // A roster longer than the buffer simply stops: the sentence is a
+  // situational nudge, not a scoreboard, and `show attack` is where a
+  // complete one lives.
+  for(uint32_t i = 0; i < shown && n_others + 1 < sizeof(others); i++)
+  {
+    int wrote;
+
+    if(i == self || rows[i].hp <= 0)
+      continue;
+
+    wrote = snprintf(others + n_others, sizeof(others) - n_others,
+        "%s%s (%s, %d of %d)", (n_others > 0) ? ", " : "",
+        rows[i].name, rows[i].class, rows[i].hp, rows[i].hp_max);
+
+    if(wrote < 0 || (size_t)wrote >= sizeof(others) - n_others)
+    {
+      // Truncated mid-combatant. Drop the partial rather than name
+      // somebody at half a hitpoint total.
+      others[n_others] = '\0';
+      break;
+    }
+
+    n_others += (size_t)wrote;
+  }
+
+  ails[0] = '\0';
+
+  for(uint32_t i = 0; i < n_marks; i++)
+  {
+    if(strcasecmp(marks[i].victim, botname) != 0)
+      continue;
+
+    for(uint32_t k = 0; k < marks[i].n && n_ails + 1 < sizeof(ails); k++)
+    {
+      int wrote = snprintf(ails + n_ails, sizeof(ails) - n_ails,
+          "%s%s", (n_ails > 0) ? ", " : "",
+          atk_fallback_noun(marks[i].kinds[k]));
+
+      if(wrote < 0 || (size_t)wrote >= sizeof(ails) - n_ails)
+      {
+        ails[n_ails] = '\0';
+        break;
+      }
+
+      n_ails += (size_t)wrote;
+    }
+
+    break;
+  }
+
+  // One sentence, in the second person, describing only what the bot
+  // can see for itself. No numbers a combatant does not have — the
+  // engine's rolls, the tunables, the class registry — and no
+  // instruction on how to fight: the turn is taken for it by the task
+  // above, and a persona that starts typing !attack into a room is a
+  // regression, not a feature.
+  return((size_t)snprintf(out, out_sz,
+      "You are in a fight in %s right now (wave %d). You are a %s"
+      " on %d of %d hitpoints%s%s, you have dealt %d and taken %d,"
+      " and still standing against you: %s.",
+      channel, card.wave, rows[self].class, rows[self].hp,
+      rows[self].hp_max,
+      (ails[0] != '\0') ? ", suffering " : "",
+      (ails[0] != '\0') ? ails : "",
+      rows[self].dmg_given, rows[self].dmg_taken,
+      (others[0] != '\0') ? others : "nobody"));
+}
+
+void
+atk_bot_situation_register(void)
+{
+  bot_situation_register(atk_bot_situation,
+      (void *)&atk_bot_situation_cookie);
+}
+
+void
+atk_bot_situation_unregister(void)
+{
+  bot_situation_unregister((void *)&atk_bot_situation_cookie);
+}
+
+// ------------------------------------------------------------------ //
 // The turn                                                            //
 // ------------------------------------------------------------------ //
 

@@ -324,6 +324,17 @@ test_kv_reset = executable('test_kv_reset',
 # landed leaves the older row to be adopted, so a strategy an operator
 # DETACHED re-attaches itself on the next reload (OBS-59). Same recording
 # driver as kv_reset above — the statements sent are the subject.
+# The pull seam a mind uses to learn it is standing in a fight (#88).
+# A registry holding a plugin's function pointer, joined into a prompt
+# block: the join, the buffer-bounded length and the unload reclaim all
+# fail silently, and the last one fails into freed memory.
+test_bot_situation = executable('test_bot_situation',
+  'test_bot_situation.c',
+  include_directories : [include_directories('.'), inc_include],
+  link_with : [test_harness, libcore],
+  dependencies : core_deps,
+)
+
 test_kv_reclaim = executable('test_kv_reclaim',
   'test_kv_reclaim.c',
   include_directories : [include_directories('.'), inc_include],
@@ -582,6 +593,7 @@ test('set_bot', test_set_bot)
 test('kv_str', test_kv_str)
 test('kv_default', test_kv_default)
 test('kv_reset', test_kv_reset)
+test('bot_situation', test_bot_situation)
 test('kv_reclaim', test_kv_reclaim)
 test('curl_submit_wait', test_curl_submit_wait)
 test('curl_flight', test_curl_flight)

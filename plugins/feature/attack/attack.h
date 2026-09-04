@@ -1147,6 +1147,13 @@ void atk_dot_stop(void);
 void atk_bot_kv_register(void);
 void atk_bot_kv_unregister(void);
 
+// The pull seam a mind uses to find out it is in a fight (include/bot.h
+// §Situational providers). Registered beside the KV contributor and
+// dropped in the same place, for the same reason: a callback left
+// pointing into an unloaded mapping is a jump into freed memory.
+void atk_bot_situation_register(void);
+void atk_bot_situation_unregister(void);
+
 // True when this bot has been let into the pit. Every other question in
 // this file is downstream of it.
 bool atk_bot_enabled(const char *botname);

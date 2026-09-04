@@ -207,6 +207,58 @@ bool bot_persona_reply(const cmd_ctx_t *ctx, const char *instruction,
 bool bot_remember_event(const char *botname, const char *method_kind,
     const char *channel, const char *text);
 
+// ---------------------------------------------------------------------------
+// Situational providers -- what is happening TO a bot right now
+// ---------------------------------------------------------------------------
+//
+// The PULL counterpart of bot_remember_event, and deliberately not the
+// same thing. That seam answers *"what should this bot still know an
+// hour from now"*; this one answers *"what is true of it at this
+// instant"*, which must never be stored -- a mind that remembers a
+// hitpoint total remembers a stale one, and a blow-by-blow written into
+// a retrieval corpus poisons it.
+//
+// It exists because a bot acting through a COMMAND is invisible to
+// itself twice over, and both blind spots are laws worth keeping. The
+// command half of `chat` short-circuits before the conversational one,
+// so even a human's `!attack <bot>` is never logged as chat; and the
+// surface answers over cmd_reply, which never touches the bot's own
+// message path. A bot fought a whole round in #cabal on 2026-09-03 and
+// met the next question with *"I have no record of the fight"* (board
+// #88). Neither law should bend for that; the state belongs in the
+// prompt, fresh, and nowhere else.
+//
+// A provider writes at most `out_sz - 1` bytes plus a NUL into `out`
+// and returns what it wrote. ⭑⭑ **Returning 0 is the usual answer** --
+// nothing is happening to this bot, in this room, right now -- and the
+// provider owes it CHEAPLY: this runs once per reply, on the path that
+// assembles the prompt. Answer from a knob or a flag before you answer
+// from a database.
+//
+// ⚠ It runs on whatever thread is building the prompt (for `chat`, a
+// curl worker inside the retrieval callback) and holds no lock of
+// core's. A provider that blocks blocks that one reply.
+//
+// ⚠ `method_name` is the method INSTANCE name ("hedgehogg_irc"), not
+// the kind bot_remember_event takes. A room is a (method instance,
+// channel) pair — a bot may hold two instances of one kind — and every
+// surface that stores a room stores it that way.
+typedef size_t (*bot_situation_cb_t)(const char *botname,
+    const char *method_name, const char *channel,
+    char *out, size_t out_sz, void *user);
+
+// `user` is the unregistration cookie and must be unique per provider.
+// Unregister before the plugin unloads, or the stored pointer dangles;
+// reclaim below is the backstop, not the plan.
+void bot_situation_register(bot_situation_cb_t cb, void *user);
+void bot_situation_unregister(void *user);
+
+// Every provider's answer about `botname`, one per line, into `out`.
+// Returns the bytes written -- 0 means nothing is happening and the
+// caller should emit no block at all rather than an empty one.
+size_t bot_situation_collect(const char *botname, const char *method_name,
+    const char *channel, char *out, size_t out_sz);
+
 const char *bot_driver_name(const bot_inst_t *inst);
 uint32_t bot_method_count(const bot_inst_t *inst);
 
@@ -380,6 +432,10 @@ void bot_kv_contributor_unregister(void *user);
 // Returns the number of contributors removed.
 uint32_t bot_reclaim_contributors_owned(uintptr_t lo, uintptr_t hi);
 
+// The same, for the situation-provider table: one function pointer and
+// a cookie per row, both dying at dlclose. Returns the number removed.
+uint32_t bot_reclaim_situations_owned(uintptr_t lo, uintptr_t hi);
+
 // Bots executing inside a driver vtable that lies in [lo,hi) right now:
 // a message delivery in flight, or the deferred teardown of a driver a
 // reload has already detached. Both are Class-B references core cannot
@@ -403,6 +459,7 @@ typedef void (*bot_audit_cb_t)(const char *subject, const char *field,
     const void *ptr, void *data);
 
 void bot_audit_iterate_contributors(bot_audit_cb_t cb, void *data);
+void bot_audit_iterate_situations(bot_audit_cb_t cb, void *data);
 void bot_audit_iterate_bindings(bot_audit_cb_t cb, void *data);
 
 // Must be called after db_init().

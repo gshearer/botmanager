@@ -2748,6 +2748,65 @@ prompt_emit_base(char *buf, size_t pos, size_t cap, const chatbot_req_t *r,
   return(pos + (size_t)snprintf(buf + pos, cap - pos, "%s%s", text, sep));
 }
 
+// What is happening TO this bot at this instant, asked of whatever
+// plugins know (core `bot_situation_collect`).
+//
+// A game a bot plays through a command surface is invisible to it
+// otherwise, twice over: chatbot_on_message hands a command-shaped line
+// to the command half and never logs it as chat, and the surface
+// answers over cmd_reply, which never comes back past the bot. Both are
+// deliberate, so the state reaches the mind here instead — live, per
+// reply, and never written down (board #88).
+//
+// Emitted last of the retrieved blocks, ahead of only the reminder and
+// the contract: it is the most perishable thing in the prompt and the
+// likeliest to be what the user just asked about.
+static size_t
+prompt_emit_situation(char *buf, size_t pos, size_t cap,
+    const chatbot_req_t *r)
+{
+  char  raw [CHATBOT_SITUATION_SZ];
+  char  safe[CHATBOT_SITUATION_SZ];
+  char *line;
+  char *save = NULL;
+
+  if(pos >= cap)
+    return pos;
+
+  if(bot_situation_collect(bot_inst_name(r->st->inst),
+        method_inst_name(r->method), r->channel, raw, sizeof(raw)) == 0)
+    return pos;
+
+  pos += snprintf(buf + pos, cap - pos, "\n<<<YOUR SITUATION>>>\n");
+
+  if(pos < cap)
+    pos = prompt_emit_base(buf, pos, cap, r, "situation", NULL,
+        "The lines below are your own circumstances at this moment, not"
+        " something anyone told you. They are true now and will not be"
+        " true for long: speak from them, never quote them as a memory,"
+        " and do not narrate them unless they are what you were asked"
+        " about.", "\n");
+
+  // One provider per line. Sanitized like every other spliced block —
+  // a provider renders nicknames it took off the wire.
+  for(line = strtok_r(raw, "\n", &save);
+      line != NULL && pos < cap;
+      line = strtok_r(NULL, "\n", &save))
+  {
+    sanitize_copy(safe, sizeof(safe), line);
+
+    if(safe[0] == '\0')
+      continue;
+
+    pos += snprintf(buf + pos, cap - pos, "- %s\n", safe);
+  }
+
+  if(pos < cap)
+    pos += snprintf(buf + pos, cap - pos, "<<<END SITUATION>>>\n");
+
+  return pos;
+}
+
 static size_t
 prompt_emit_tail(char *buf, size_t pos, size_t cap, const chatbot_req_t *r)
 {
@@ -3008,6 +3067,10 @@ assemble_prompt(chatbot_req_t *r, const mem_fact_t *facts, size_t nf,
 
   // 4d. CV-6 recent-own-replies anti-repeat slice.
   pos = prompt_emit_recent_replies(buf, pos, work_cap, r);
+
+  // 4e. Live state a plugin holds about this bot -- a brawl it is
+  // standing in right now, and anything later that works the same way.
+  pos = prompt_emit_situation(buf, pos, work_cap, r);
 
   // 5 / 5a / 5b / 6. Anti-injection reminder, address/action nudges,
   // contract — copied back from the scratch buffer into the space held

@@ -54,7 +54,7 @@ regex (the literal context portion, before any `<placeholder>`).
 | `bot_exit` | core/bot.c | bot subsystem teardown |
 | `bot_init` | core/bot.c | bot subsystem init |
 | `bot_msg` | core/bot.c | inbound message routed to a bot |
-| `bot_reclaim` | core/bot.c | Class-A reclamation of a plugin's KV contributors |
+| `bot_reclaim` | core/bot.c | Class-A reclamation of a plugin's KV contributors and situation providers |
 | `bot_register_driver_kv` | core/bot.c | per-driver KV registration |
 | `bot_register_method_kv` | core/bot.c | per-method KV registration |
 | `bot_release` | core/bot.c | a delivery running the driver teardown a reload deferred to it |

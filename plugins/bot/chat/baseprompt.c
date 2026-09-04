@@ -31,6 +31,7 @@ static const struct
   { "images",            NULL              },
   { "context-guard",     NULL              },
   { "policy-reminder",   NULL              },
+  { "situation",         NULL              },
   { "direct-address",    NULL              },
   { "action-at-bot",     "$SENDER $EMOTE"  },
   { "commands",          "$CMDSHAPE"       },

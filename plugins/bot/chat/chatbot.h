@@ -269,6 +269,13 @@ struct chatbot_base_s
 // on a large prompt and stop swallowing a small one.
 #define CHATBOT_NL_COMMANDS_BUDGET_DIV 4
 
+// What every registered situation provider may say about this bot, in
+// total, on one reply (core `bot_situation_collect`). Small on purpose:
+// this is the state of a game in progress, not a record of it, and it
+// competes with the facts, the corpus and the conversation for the same
+// budget. One brawl's roster renders comfortably inside 512 bytes.
+#define CHATBOT_SITUATION_SZ  1024
+
 // Personality record (in-memory copy of a personalities table row).
 //
 // `body` is the persona-shaping content. The output contract is loaded

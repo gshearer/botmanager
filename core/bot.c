@@ -849,6 +849,184 @@ bot_audit_iterate_contributors(bot_audit_cb_t cb, void *data)
   pthread_mutex_unlock(&bot_kv_contrib_mutex);
 }
 
+// Situational providers
+// ---------------------------------------------------------------------------
+//
+// A plugin that knows something about a bot which the bot cannot know
+// about itself registers here, and the mind asks on its way to building
+// a prompt (see bot.h for why the question cannot be answered from
+// memory). Same discipline as the contributor table above and for the
+// same reason: snapshot under the lock, call unlocked -- a provider is
+// plugin code that may take a lock of its own or a database round trip,
+// and neither belongs under a core registry's mutex.
+
+#define BOT_SITUATION_MAX  4
+
+typedef struct
+{
+  bot_situation_cb_t cb;
+  void              *user;
+  const void        *owner_pc;  // register call site; identifies the owner
+} bot_situation_ent_t;
+
+static bot_situation_ent_t bot_situations[BOT_SITUATION_MAX];
+static uint32_t            bot_situation_count = 0;
+static pthread_mutex_t     bot_situation_mutex = PTHREAD_MUTEX_INITIALIZER;
+
+// Compact the tail down over slot `i`. Caller holds bot_situation_mutex.
+static void
+bot_situation_drop_at(uint32_t i)
+{
+  for(uint32_t j = i + 1; j < bot_situation_count; j++)
+    bot_situations[j - 1] = bot_situations[j];
+
+  bot_situation_count--;
+}
+
+void
+bot_situation_register(bot_situation_cb_t cb, void *user)
+{
+  const void *owner_pc = __builtin_return_address(0);
+
+  if(cb == NULL)
+    return;
+
+  pthread_mutex_lock(&bot_situation_mutex);
+
+  if(bot_situation_count >= BOT_SITUATION_MAX)
+  {
+    pthread_mutex_unlock(&bot_situation_mutex);
+    clam(CLAM_WARN, "bot",
+        "situation provider table full (%d); dropping registration",
+        BOT_SITUATION_MAX);
+    return;
+  }
+
+  bot_situations[bot_situation_count].cb       = cb;
+  bot_situations[bot_situation_count].user     = user;
+  bot_situations[bot_situation_count].owner_pc = owner_pc;
+  bot_situation_count++;
+
+  pthread_mutex_unlock(&bot_situation_mutex);
+}
+
+void
+bot_situation_unregister(void *user)
+{
+  pthread_mutex_lock(&bot_situation_mutex);
+
+  for(uint32_t i = 0; i < bot_situation_count; i++)
+    if(bot_situations[i].user == user)
+    {
+      bot_situation_drop_at(i);
+      break;
+    }
+
+  pthread_mutex_unlock(&bot_situation_mutex);
+}
+
+uint32_t
+bot_reclaim_situations_owned(uintptr_t lo, uintptr_t hi)
+{
+  uint32_t removed = 0;
+  uint32_t i       = 0;
+
+  if(lo >= hi)
+    return(0);
+
+  pthread_mutex_lock(&bot_situation_mutex);
+
+  while(i < bot_situation_count)
+  {
+    uintptr_t pc = (uintptr_t)bot_situations[i].owner_pc;
+
+    // `i` stays put so the entry shifted into it is tested next round.
+    if(pc >= lo && pc < hi)
+    {
+      bot_situation_drop_at(i);
+      removed++;
+    }
+
+    else
+      i++;
+  }
+
+  pthread_mutex_unlock(&bot_situation_mutex);
+
+  if(removed > 0)
+    clam(CLAM_DEBUG, "bot_reclaim",
+        "reclaimed %u situation provider(s)", removed);
+
+  return(removed);
+}
+
+size_t
+bot_situation_collect(const char *botname, const char *method_name,
+    const char *channel, char *out, size_t out_sz)
+{
+  bot_situation_ent_t snap[BOT_SITUATION_MAX];
+  uint32_t            n;
+  size_t              pos = 0;
+
+  if(botname == NULL || out == NULL || out_sz == 0)
+    return(0);
+
+  out[0] = '\0';
+
+  pthread_mutex_lock(&bot_situation_mutex);
+  n = bot_situation_count;
+  memcpy(snap, bot_situations, n * sizeof(snap[0]));
+  pthread_mutex_unlock(&bot_situation_mutex);
+
+  for(uint32_t i = 0; i < n && pos + 1 < out_sz; i++)
+  {
+    // The provider's return value says whether it spoke; the BUFFER
+    // says how much, because a provider that miscounts its own
+    // snprintf would otherwise move `pos` past its NUL and splice the
+    // next answer into the slack.
+    if(snap[i].cb(botname, method_name, channel, out + pos,
+          out_sz - pos, snap[i].user) == 0)
+      continue;
+
+    pos += strnlen(out + pos, out_sz - pos);
+
+    if(pos + 1 < out_sz)
+    {
+      out[pos++] = '\n';
+      out[pos]   = '\0';
+    }
+  }
+
+  // Providers are joined by a newline, not terminated by one: the
+  // caller decides its own separator from the block it is building.
+  if(pos > 0 && out[pos - 1] == '\n')
+    out[--pos] = '\0';
+
+  return(pos);
+}
+
+void
+bot_audit_iterate_situations(bot_audit_cb_t cb, void *data)
+{
+  char subject[32];
+
+  if(cb == NULL)
+    return;
+
+  pthread_mutex_lock(&bot_situation_mutex);
+
+  for(uint32_t i = 0; i < bot_situation_count; i++)
+  {
+    const bot_situation_ent_t *e = &bot_situations[i];
+
+    snprintf(subject, sizeof(subject), "situation[%u]", i);
+    cb(subject, "cb",   fn_addr(&e->cb), data);
+    cb(subject, "user", e->user,         data);
+  }
+
+  pthread_mutex_unlock(&bot_situation_mutex);
+}
+
 void
 bot_audit_iterate_bindings(bot_audit_cb_t cb, void *data)
 {

@@ -1810,6 +1810,7 @@ plugin_reclaim(const plugin_rec_t *target)
   n += kv_reclaim_owned(map.lo, map.hi);
   n += clam_reclaim_owned(map.lo, map.hi);
   n += bot_reclaim_contributors_owned(map.lo, map.hi);
+  n += bot_reclaim_situations_owned(map.lo, map.hi);
 
   // What core cannot reach, it can at least announce. Listeners drop
   // their own pointers into this range; whatever they do not drop, the
@@ -1956,6 +1957,7 @@ plugin_audit(const char *plugin_name, plugin_audit_emit_t emit, void *data)
 
   bot_audit_iterate_bindings(audit_bot_cb, &ctx);
   bot_audit_iterate_contributors(audit_bot_cb, &ctx);
+  bot_audit_iterate_situations(audit_bot_cb, &ctx);
   method_audit_iterate(audit_method_cb, &ctx);
   clam_audit_iterate(audit_clam_cb, &ctx);
   task_iterate(audit_task_cb, &ctx);
