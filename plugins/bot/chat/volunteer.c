@@ -41,6 +41,90 @@ typedef struct
   float    seed_vec[CHATBOT_VOLUNTEER_EMBED_DIM_MAX];
 } volunteer_job_t;
 
+// What the cascade decided: which room, and which of the topic's `for:`
+// nicks are actually standing in it. Only the present ones may be
+// named — addressing an absent person is useless, and it discloses an
+// association to a room they are not in to hear it.
+
+typedef struct
+{
+  char   channel[METHOD_CHANNEL_SZ];
+  char   present[ACQUIRE_INTERESTED_MAX][ACQUIRE_NICK_SZ];
+  size_t n_present;
+} volunteer_pick_t;
+
+// The topic's `for:` list, lifted out of the bot's topic cache. Held
+// across the channel walk, so it is copied rather than pointed at.
+
+typedef struct
+{
+  char   nicks[ACQUIRE_INTERESTED_MAX][ACQUIRE_NICK_SZ];
+  size_t n;
+} volunteer_care_t;
+
+// Which of `want`'s nicks are in the room being enumerated. The
+// callback only writes to this struct — it never reaches back into the
+// driver, which is what makes it safe under method_list_channel.
+
+typedef struct
+{
+  const volunteer_care_t *want;
+  volunteer_pick_t       *found;
+} volunteer_presence_t;
+
+static void
+volunteer_presence_cb(const char *nick, void *data)
+{
+  volunteer_presence_t *p = data;
+
+  if(nick == NULL || nick[0] == '\0')
+    return;
+
+  for(size_t i = 0; i < p->want->n; i++)
+  {
+    if(strcasecmp(p->want->nicks[i], nick) != 0)
+      continue;
+
+    for(size_t k = 0; k < p->found->n_present; k++)
+      if(strcasecmp(p->found->present[k], nick) == 0)
+        return;
+
+    if(p->found->n_present < ACQUIRE_INTERESTED_MAX)
+      strlcpy(p->found->present[p->found->n_present++], nick,
+          ACQUIRE_NICK_SZ);
+
+    return;
+  }
+}
+
+// Copy the topic's `for:` list out of the topic cache under the rdlock.
+// Topics are matched by name, which is what acquire hands back on the
+// ingest callback.
+
+static void
+volunteer_care_load(chatbot_state_t *st, const char *topic_name,
+    volunteer_care_t *out)
+{
+  out->n = 0;
+
+  pthread_rwlock_rdlock(&st->lock);
+
+  for(size_t i = 0; i < st->n_topics; i++)
+  {
+    const acquire_topic_t *t = &st->topics[i];
+
+    if(strcmp(t->name, topic_name) != 0)
+      continue;
+
+    for(size_t k = 0; k < t->n_interested; k++)
+      strlcpy(out->nicks[out->n++], t->interested[k], ACQUIRE_NICK_SZ);
+
+    break;
+  }
+
+  pthread_rwlock_unlock(&st->lock);
+}
+
 // Channel discovery — ask the bot's method driver for the channels it
 // is currently joined to, and pick the first one that passes the
 // remaining gates. Live membership, not KV configuration: a bot that
@@ -313,11 +397,11 @@ volunteer_channel_last_activity(chatbot_state_t *st, const char *chan)
 
 // Gate cascade. Each gate that drops logs a CLAM_DEBUG line naming the
 // reason so operators can tune. Returns true if the post should proceed.
-// On success, `chosen_chan` is populated.
+// On success, `pick` is populated.
 
 static bool
 volunteer_cascade(chatbot_state_t *st, volunteer_job_t *job,
-    char *chosen_chan, size_t chosen_chan_sz)
+    volunteer_pick_t *pick)
 {
   const char *bot_name = job->bot_name;
   uint32_t    relevance = job->relevance;
@@ -327,6 +411,9 @@ volunteer_cascade(chatbot_state_t *st, volunteer_job_t *job,
   uint32_t max_quiet;
   uint32_t chan_cooldown;
   volunteer_chan_collect_t cc;
+  volunteer_care_t     care;
+  volunteer_presence_t presence;
+  char fallback[METHOD_CHANNEL_SZ] = {0};
   method_inst_t *method;
   uint32_t thresh;
   uint32_t hcap;
@@ -472,8 +559,9 @@ volunteer_cascade(chatbot_state_t *st, volunteer_job_t *job,
 
   // (e) Channel iteration. Ask the bot's method driver for its live
   //     set of joined channels, then pick the first that passes
-  //     cooldown + quiet windows. Must match the method we'll later
-  //     submit to (volunteer_submit also uses bot_first_method).
+  //     cooldown + quiet windows — preferring, where the topic names
+  //     people, one they are actually in. Must match the method we'll
+  //     later submit to (volunteer_submit also uses bot_first_method).
   method = bot_first_method(st->inst);
   if(method == NULL)
   {
@@ -485,16 +573,15 @@ volunteer_cascade(chatbot_state_t *st, volunteer_job_t *job,
   memset(&cc, 0, sizeof(cc));
   method_list_joined_channels(method, volunteer_collect_joined_cb, &cc);
 
-  // The roster is copied out; nothing below this line touches the
-  // instance again.
-  method_release(method);
-
   if(cc.n_channels == 0)
   {
+    method_release(method);
     clam(CLAM_DEBUG, "chatbot",
         "volunteer skip bot=%s reason=no_joined_channels", bot_name);
     return(false);
   }
+
+  volunteer_care_load(st, job->topic_name, &care);
 
   // KV defaults are pinned at schema registration; 0 means "gate
   // disabled" (not "use the compiled default"). Read raw.
@@ -575,8 +662,49 @@ volunteer_cascade(chatbot_state_t *st, volunteer_job_t *job,
       continue;
     }
 
-    // Channel passed all gates.
-    snprintf(chosen_chan, chosen_chan_sz, "%s", chan);
+    // Channel passed all gates. Where the topic names nobody, the
+    // first one wins exactly as it always has.
+    if(care.n == 0)
+    {
+      strlcpy(pick->channel, chan, sizeof(pick->channel));
+      method_release(method);
+      return(true);
+    }
+
+    // Otherwise keep the first passing room as the fallback and go on
+    // looking for one the interested are standing in.
+    if(fallback[0] == '\0')
+      strlcpy(fallback, chan, sizeof(fallback));
+
+    presence.want  = &care;
+    presence.found = pick;
+    pick->n_present = 0;
+
+    method_list_channel(method, chan, volunteer_presence_cb, &presence);
+
+    if(pick->n_present > 0)
+    {
+      strlcpy(pick->channel, chan, sizeof(pick->channel));
+      method_release(method);
+      clam(CLAM_DEBUG, "chatbot",
+          "volunteer venue bot=%s chan=%s topic=%s interested_present=%zu",
+          bot_name, chan, job->topic_name, pick->n_present);
+      return(true);
+    }
+  }
+
+  method_release(method);
+
+  // Nobody who cares is anywhere we can speak. Post the line unaddressed
+  // rather than not at all — the topic is still the bot's own interest.
+  if(fallback[0] != '\0')
+  {
+    strlcpy(pick->channel, fallback, sizeof(pick->channel));
+    pick->n_present = 0;
+    clam(CLAM_DEBUG, "chatbot",
+        "volunteer venue bot=%s chan=%s topic=%s interested_present=0"
+        " (none joined) — posting unaddressed",
+        bot_name, fallback, job->topic_name);
     return(true);
   }
 
@@ -593,10 +721,12 @@ volunteer_cascade(chatbot_state_t *st, volunteer_job_t *job,
 
 static void
 volunteer_submit(chatbot_state_t *st, const volunteer_job_t *job,
-    const char *chan)
+    const volunteer_pick_t *pick)
 {
   bot_inst_t *inst = st->inst;
+  const char *chan = pick->channel;
   chatbot_volunteer_slot_t *slot;
+  char   care[ACQUIRE_INTERESTED_MAX * (ACQUIRE_NICK_SZ + 2) + 64] = {0};
   time_t now;
   method_msg_t msg;
   method_inst_t *method;
@@ -636,23 +766,53 @@ volunteer_submit(chatbot_state_t *st, const volunteer_job_t *job,
   snprintf(msg.sender,   sizeof(msg.sender),  "acquire-seed");
   snprintf(msg.channel,  sizeof(msg.channel), "%s", chan);
 
+  // ⛔ The cue says WHO to address and never WHY. A `for:` list is
+  // configuration an operator typed, not something anybody told this
+  // bot — so naming someone is addressing them, and the bot must not
+  // imply it knows anything about them. See CHATBOT.md §The initiative
+  // rule for the ruling this rests on.
+  if(pick->n_present > 0)
+  {
+    size_t w = 0;
+
+    for(size_t i = 0; i < pick->n_present && w < sizeof(care); i++)
+      w += (size_t)snprintf(care + w, sizeof(care) - w, "%s%s",
+          i == 0 ? " Address the line by nick to " :
+          (i + 1 == pick->n_present ? " and " : ", "),
+          pick->present[i]);
+
+    // ⚠ The prohibition is not politeness and it is not padding. Given
+    // a nick beside a topic and no reason, a model supplies one:
+    // measured on the first cut of this cue, which said only "<nick> is
+    // in the room", hedgehogg wrote *"doc is here watching his crypto
+    // portfolio breathe easier"* — an invented claim about a person,
+    // volunteered to a channel, of exactly the kind CARE-0 exists to
+    // stop. Naming is addressing; the cue has to say so out loud.
+    if(w < sizeof(care))
+      snprintf(care + w, sizeof(care) - w,
+          ". You know nothing about %s beyond the nick — say nothing"
+          " about them, their interests or their opinions.",
+          pick->n_present == 1 ? "them" : "any of them");
+  }
+
   // The seed is the *user turn* of a single-message exchange. Persona
   // body + anti-injection reminder + RAG all run above it; the model
   // produces either a short in-character mention or a SKIP line.
   snprintf(msg.text, sizeof(msg.text),
       "[internal cue: you've just read something new about '%s' "
-      "(topic=%s, relevance=%u) via your regular feeds. If it's worth "
+      "(topic=%s, relevance=%u) via your regular feeds.%s If it's worth "
       "mentioning in %s right now, post a single short in-character "
       "line referencing it. If it's not channel-appropriate or not "
       "worth bringing up, reply with SKIP on its own line. Do not "
       "explain yourself.]",
-      job->subject, job->topic_name, job->relevance, chan);
+      job->subject, job->topic_name, job->relevance, care, chan);
 
   clam(CLAM_INFO, "chatbot",
       "volunteer posted bot=%s chan=%s subject='%s' chunk=%" PRId64
-      " relevance=%u mode=%s",
+      " relevance=%u mode=%s addressed=%zu",
       job->bot_name, chan, job->subject, job->chunk_id, job->relevance,
-      job->mode == ACQUIRE_INGEST_PROACTIVE ? "proactive" : "reactive");
+      job->mode == ACQUIRE_INGEST_PROACTIVE ? "proactive" : "reactive",
+      pick->n_present);
 
   // Stamp attempt + bump hourly counter BEFORE submit so two
   // back-to-back ingests don't both pass the hourly cap race. The
@@ -705,7 +865,7 @@ static void
 volunteer_task(task_t *t)
 {
   volunteer_job_t *job = t->data;
-  char chan[METHOD_CHANNEL_SZ];
+  volunteer_pick_t pick;
   chatbot_state_t *st;
   bot_inst_t *inst;
 
@@ -731,8 +891,10 @@ volunteer_task(task_t *t)
     return;
   }
 
-  if(volunteer_cascade(st, job, chan, sizeof(chan)))
-    volunteer_submit(st, job, chan);
+  memset(&pick, 0, sizeof(pick));
+
+  if(volunteer_cascade(st, job, &pick))
+    volunteer_submit(st, job, &pick);
 
   mem_free(job);
   t->state = TASK_ENDED;
