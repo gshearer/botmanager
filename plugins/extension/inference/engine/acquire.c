@@ -301,12 +301,6 @@ acquire_entry_free_topics(acquire_bot_entry_t *e)
     e->topics = NULL;
   }
 
-  if(e->topic_proactive_counter != NULL)
-  {
-    mem_free(e->topic_proactive_counter);
-    e->topic_proactive_counter = NULL;
-  }
-
   if(e->feeds != NULL)
   {
     mem_free(e->feeds);
@@ -597,14 +591,6 @@ acquire_register_topics(const char *bot_name,
     e->topics = mem_alloc(ACQUIRE_CTX, "topic_list",
         n_topics * sizeof(acquire_topic_t));
     memcpy(e->topics, topics, n_topics * sizeof(acquire_topic_t));
-
-    // A7 sidecar: one uint32_t per topic, index-aligned with
-    // e->topics. Allocated in lockstep with the topic list; freed by
-    // acquire_entry_free_topics. Zero-initialised so the first
-    // proactive fire for each topic picks topic->query (counter==0,
-    // counter%10 != 9).
-    e->topic_proactive_counter = mem_alloc(ACQUIRE_CTX,
-        "topic_proactive_counter", n_topics * sizeof(uint32_t));
 
     // Feed flattening. Sum declared feeds across all topics, then
     // allocate three parallel arrays. feed_state[] is zero-initialised

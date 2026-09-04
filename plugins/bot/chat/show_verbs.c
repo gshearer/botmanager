@@ -619,19 +619,6 @@ verb_llm_knowledge(const cmd_ctx_t *ctx, bot_inst_t *bot, const char *rest)
 // engine (no direct registry access); stats come from a single JOIN-
 // shaped SELECT keyed on bot_name.
 
-static const char *
-verb_interests_mode_label(acquire_mode_t m)
-{
-  switch(m)
-  {
-    case ACQUIRE_MODE_ACTIVE:   return("active");
-    case ACQUIRE_MODE_REACTIVE: return("reactive");
-    case ACQUIRE_MODE_MIXED:    return("mixed");
-  }
-
-  return("?");
-}
-
 // Stack-resident row of acquire_topic_stats columns collected for the
 // bot. `found` distinguishes "row exists in DB" from "no stats row yet"
 // so we can render "-" where the topic has never fired.
@@ -639,8 +626,8 @@ typedef struct
 {
   char      topic_name[ACQUIRE_TOPIC_NAME_SZ];
   bool      found;
-  char      last_proactive[40];   // ISO-8601 or "-"
-  char      last_reactive [40];
+  char      last_proactive[16];   // "MM-DD HH:MMZ" or "-"
+  char      last_reactive [16];
   uint64_t  total_queries;
   uint64_t  total_ingested;
 } verb_interests_stats_t;
@@ -664,9 +651,9 @@ verb_interests_load_stats(const char *bot_name,
   snprintf(sql, sizeof(sql),
       "SELECT topic_name,"
       " COALESCE(to_char(last_proactive AT TIME ZONE 'UTC',"
-      "   'YYYY-MM-DD\"T\"HH24:MI:SS\"Z\"'), '-'),"
+      "   'MM-DD HH24:MI\"Z\"'), '-'),"
       " COALESCE(to_char(last_reactive  AT TIME ZONE 'UTC',"
-      "   'YYYY-MM-DD\"T\"HH24:MI:SS\"Z\"'), '-'),"
+      "   'MM-DD HH24:MI\"Z\"'), '-'),"
       " total_queries, total_ingested"
       " FROM acquire_topic_stats WHERE bot_name = '%s'",
       bot_esc);
@@ -774,11 +761,10 @@ verb_llm_interests(const cmd_ctx_t *ctx, bot_inst_t *bot, const char *rest)
   for(size_t i = 0; i < n; i++)
   {
     snprintf(line, sizeof(line),
-        "  %-12.*s mode=%-8s weight=%-3u kw=%-2zu"
+        "  %-26.*s attention=%-3u names=%-2zu"
         "  q=%-4" PRIu64 " ing=%-4" PRIu64
-        "  last_proactive=%s  last_reactive=%s",
+        "  proactive=%-12s reactive=%s",
         (int)sizeof(topics[i].name) - 1, topics[i].name,
-        verb_interests_mode_label(topics[i].mode),
         topics[i].proactive_weight,
         topics[i].n_keywords,
         stats[i].total_queries,

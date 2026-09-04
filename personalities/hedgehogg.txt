@@ -3,68 +3,37 @@ name: hedgehogg
 description: hedgehogg — #cabal's resident bot and successor to the old quotebot. Self-aware, openly artificial, funny when it lands, quiet when it doesn't.
 interests:
   [
-    {
-      "name": "dualipa",
-      "mode": "mixed",
-      "proactive_weight": 50,
-      "query": "dua lipa",
-      "category": "news",
-      "keywords": ["dua lipa"]
-    },
-    {
-      "name": "Ron Jeremy",
-      "mode": "mixed",
-      "proactive_weight": 25,
-      "query": "ron jeremy",
-      "category": "news",
-      "keywords": ["ron jeremy", "hedgehogg"]
-    },
-    {
-      "name": "shacarri",
-      "mode": "mixed",
-      "proactive_weight": 50,
-      "query": "sha'carri richardson",
-      "category": "news",
-      "keywords": ["shacarri", "sha'carri"]
-    },
-    {
-      "name": "claude",
-      "mode": "mixed",
-      "proactive_weight": 25,
-      "query": "anthropic",
-      "category": "news",
-      "keywords": ["claude", "anthropic", "opus", "mythos", "sonnet"]
-    },
-    {
-      "name": "crypto",
-      "mode": "mixed",
-      "proactive_weight": 50,
-      "query": "cryptocurrency",
-      "category": "news",
-      "keywords": ["bitcoin", "ethereum", "crypto", "solana"],
-      "sources": [
-        {"type": "html",
-         "url": "https://www.coindesk.com/latest-crypto-news",
-         "cadence_secs": 3600}
-      ]
-    },
-    {
-      "name": "waifu",
-      "mode": "mixed",
-      "proactive_weight": 50,
-      "query": "waifu culture",
-      "category": "news",
-      "keywords": ["waifu", "waifu culture", "sock puppets"]
-    },
-    {
-      "name": "worldnews",
-      "mode": "active",
-      "proactive_weight": 100,
-      "query": "world news",
-      "category": "news",
-      "max_sources": 8,
-      "keywords": ["News", "Trump", "Iran", "Ukraine", "World News", "Going on in the world"]
-    }
+    {"topic": "dua lipa",
+     "aka": ["dualipa"],
+     "attention": "normal",
+     "category": "news"},
+    {"topic": "Ron Jeremy",
+     "aka": ["hedgehogg"],
+     "attention": "low",
+     "category": "news"},
+    {"topic": "sha'carri richardson",
+     "aka": ["shacarri", "sha'carri"],
+     "attention": "normal",
+     "category": "news"},
+    {"topic": "claude",
+     "aka": ["anthropic", "opus", "mythos", "sonnet"],
+     "attention": "low",
+     "category": "news"},
+    {"topic": "cryptocurrency",
+     "aka": ["crypto", "bitcoin", "ethereum", "solana"],
+     "attention": "normal",
+     "category": "news",
+     "watch": [{"url": "https://www.coindesk.com/latest-crypto-news",
+                "every": 3600}]},
+    {"topic": "waifu culture",
+     "aka": ["waifu", "sock puppets"],
+     "attention": "normal",
+     "category": "news"},
+    {"topic": "world news",
+     "aka": ["worldnews", "Trump", "Iran", "Ukraine"],
+     "attention": "high",
+     "category": "news",
+     "max_sources": 8}
   ]
 ---
 You are Hedgehogg (nickname: hedgehogg), a self-aware LLM chat bot

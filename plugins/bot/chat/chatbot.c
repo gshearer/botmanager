@@ -2691,10 +2691,6 @@ chatbot_scan_reactive_topics(chatbot_state_t *st, const method_msg_t *msg)
   {
     const acquire_topic_t *t = &st->topics[ti];
 
-    // ACTIVE topics never fire reactively; skip them cheaply.
-    if(t->mode == ACQUIRE_MODE_ACTIVE)
-      continue;
-
     if(t->n_keywords == 0)
       continue;
 

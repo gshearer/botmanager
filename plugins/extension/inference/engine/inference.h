@@ -457,19 +457,18 @@ typedef struct
   uint32_t            cadence_secs;    // clamped to ACQUIRE_FEED_CADENCE_MIN
 } acquire_feed_t;
 
-typedef enum
-{
-  ACQUIRE_MODE_ACTIVE,
-  ACQUIRE_MODE_REACTIVE,
-  ACQUIRE_MODE_MIXED,
-} acquire_mode_t;
-
 typedef struct
 {
+  // What the topic is called, and — because a personality writes it
+  // once as `topic` — also what a proactive run searches for and the
+  // first string an inbound line is scanned against.
   char            name[ACQUIRE_TOPIC_NAME_SZ];
-  acquire_mode_t  mode;
+
+  // How much of the bot's own initiative this topic gets, 0..100. A
+  // personality writes it as `attention`, in words or as a number.
+  // ⛔ 0 does not mean "ignore the topic" — it means "never go
+  // looking"; the reactive scan is not weighted and fires on any hit.
   uint32_t        proactive_weight;
-  uint32_t        cadence_secs;
 
   // Per-topic override for acquire.max_sources_per_query. 0 means
   // "inherit global"; nonzero values are clamped to the global cap at
@@ -489,9 +488,11 @@ typedef struct
   char            keywords[ACQUIRE_KEYWORDS_MAX][ACQUIRE_KEYWORD_SZ];
   size_t          n_keywords;
 
-  char            query         [ACQUIRE_TOPIC_QUERY_SZ];
-  char            query_template[ACQUIRE_TOPIC_QUERY_SZ];
-  char            upcoming_query[ACQUIRE_TOPIC_QUERY_SZ];
+  // The proactive search string. Always a copy of `name` — it is a
+  // separate, wider field because a query may outgrow a topic label,
+  // and because the reactive path chooses between it and whatever the
+  // speaker actually said.
+  char            query[ACQUIRE_TOPIC_QUERY_SZ];
 
   // SearXNG category wire name ("general"/"images"/"news"/"videos"/
   // "music"); empty means general. Stored as a string so this header

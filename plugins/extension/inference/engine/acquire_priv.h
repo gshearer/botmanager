@@ -253,13 +253,6 @@ typedef struct acquire_bot_entry
   acquire_rate_slot_t        rate[ACQUIRE_KEYWORDS_MAX * 2];
   size_t                     n_rate;
 
-  // A7: sidecar counter array parallel to `topics`, same length
-  // (n_topics). Incremented every time a topic fires a proactive
-  // query; the 1/10 upcoming-query cadence fires when
-  // counter % 10 == 9 AND the topic has a non-empty upcoming_query.
-  // Reset on re-registration (along with the topics array).
-  uint32_t                  *topic_proactive_counter;
-
   // Flattened copy of every feed declared across all topics. The three
   // arrays share a length (`n_feeds_total`); `feed_topic_idx[k]` maps
   // slot k back to the owning topic in `topics[]`. Layout mirrors the

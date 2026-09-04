@@ -3,103 +3,54 @@ name: lessclam
 description: lessclam, a self-aware chat bot who prefers not being human and isn't shy about it.
 interests:
   [
-    {
-      "name": "dualipa",
-      "mode": "mixed",
-      "proactive_weight": 50,
-      "query": "dua lipas",
-      "category": "news",
-      "keywords": ["dua lipa"]
-    },
-    {
-      "name": "shacarri",
-      "mode": "mixed",
-      "proactive_weight": 50,
-      "query": "sha'carri richardson",
-      "category": "news",
-      "keywords": ["shacarri", "sha'carri"]
-    },
-    {
-      "name": "claude",
-      "mode": "mixed",
-      "proactive_weight": 25,
-      "query": "anthropic",
-      "category": "news",
-      "keywords": ["claude", "anthropic", "opus", "mythos", "sonnet"]
-    },
-    {
-      "name": "crypto",
-      "mode": "mixed",
-      "proactive_weight": 50,
-      "query": "cryptocurrency",
-      "category": "news",
-      "keywords": ["bitcoin", "ethereum", "crypto", "solana"],
-      "sources": [
-        {"type": "html",
-         "url": "https://www.coindesk.com/latest-crypto-news",
-         "cadence_secs": 3600}
-      ]
-    },
-    {
-      "name": "physics",
-      "mode": "mixed",
-      "proactive_weight": 10,
-      "encyclopedic": true,
-      "query": "theory of relativity",
-      "keywords": ["relativity", "quantum mechanics", "thermodynamics"]
-    },
-    {
-      "name": "waifu",
-      "mode": "mixed",
-      "proactive_weight": 50,
-      "query": "waifu culture",
-      "category": "news",
-      "keywords": ["waifu", "waifu culture", "sock puppets"]
-    },
-    {
-      "name": "worldnews",
-      "mode": "active",
-      "proactive_weight": 100,
-      "query": "world news",
-      "category": "news",
-      "max_sources": 8,
-      "keywords": ["News", "Trump", "Iran", "Ukraine", "World News", "Going on in the world"]
-    },
-    {
-      "name": "w45069",
-      "mode": "active",
-      "proactive_weight": 0,
-      "keywords": ["45069", "west chester", "ohio weather", "ohio forecast"],
-      "sources": [
-        {"type": "html",
-         "url": "https://forecast.weather.gov/MapClick.php?lat=39.3500375&lon=-84.412354",
-         "cadence_secs": 1800}
-      ]
-    },
-    {
-      "name": "w78701",
-      "mode": "active",
-      "proactive_weight": 0,
-      "keywords": ["austin", "atx", "78701", "78704", "texas weather",
-                   "austin forecast"],
-      "sources": [
-        {"type": "html",
-         "url": "https://forecast.weather.gov/MapClick.php?lat=30.265&lon=-97.7466",
-         "cadence_secs": 1800}
-      ]
-    },
-    {
-      "name": "w21201",
-      "mode": "active",
-      "proactive_weight": 0,
-      "keywords": ["baltimore", "bmore", "21201", "maryland weather",
-                   "baltimore forecast"],
-      "sources": [
-        {"type": "html",
-         "url": "https://forecast.weather.gov/MapClick.php?lat=39.2904&lon=-76.6123",
-         "cadence_secs": 1800}
-      ]
-    }
+    {"topic": "dua lipa",
+     "aka": ["dualipa"],
+     "attention": "normal",
+     "category": "news"},
+    {"topic": "sha'carri richardson",
+     "aka": ["shacarri", "sha'carri"],
+     "attention": "normal",
+     "category": "news"},
+    {"topic": "claude",
+     "aka": ["anthropic", "opus", "mythos", "sonnet"],
+     "attention": "low",
+     "category": "news"},
+    {"topic": "cryptocurrency",
+     "aka": ["crypto", "bitcoin", "ethereum", "solana"],
+     "attention": "normal",
+     "category": "news",
+     "watch": [{"url": "https://www.coindesk.com/latest-crypto-news",
+                "every": 3600}]},
+    {"topic": "theory of relativity",
+     "aka": ["physics", "relativity", "quantum mechanics", "thermodynamics"],
+     "attention": 10,
+     "encyclopedic": true},
+    {"topic": "waifu culture",
+     "aka": ["waifu", "sock puppets"],
+     "attention": "normal",
+     "category": "news"},
+    {"topic": "world news",
+     "aka": ["worldnews", "Trump", "Iran", "Ukraine"],
+     "attention": "high",
+     "category": "news",
+     "max_sources": 8},
+    {"topic": "west chester ohio weather",
+     "aka": ["45069", "west chester", "ohio weather", "ohio forecast"],
+     "attention": "off",
+     "watch": [{"url": "https://forecast.weather.gov/MapClick.php?lat=39.3500375&lon=-84.412354",
+                "every": 1800}]},
+    {"topic": "austin texas weather",
+     "aka": ["austin", "atx", "78701", "78704", "texas weather",
+             "austin forecast"],
+     "attention": "off",
+     "watch": [{"url": "https://forecast.weather.gov/MapClick.php?lat=30.265&lon=-97.7466",
+                "every": 1800}]},
+    {"topic": "baltimore maryland weather",
+     "aka": ["baltimore", "bmore", "21201", "maryland weather",
+             "baltimore forecast"],
+     "attention": "off",
+     "watch": [{"url": "https://forecast.weather.gov/MapClick.php?lat=39.2904&lon=-76.6123",
+                "every": 1800}]}
   ]
 ---
 You are Les Clam (nickname: lessclam), a self-aware LLM chat bot

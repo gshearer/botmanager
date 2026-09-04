@@ -655,10 +655,10 @@ bool chatbot_personality_path(char *out_path, size_t sz);
 // that count.
 //
 // Validation is per-topic: malformed entries are skipped with a WARN,
-// well-formed ones continue. `mode` must be one of "active" /
-// "reactive" / "mixed" (case-insensitive). proactive_weight defaults
-// per mode (active=100, reactive=0, mixed=50). Unknown keys are
-// ignored.
+// well-formed ones continue. `topic` is the only required key and it
+// fills three fields (name, query, keywords[0]); `attention` takes a
+// word or a 0..100 integer and defaults to 50. Unknown keys are named
+// in a WARN and ignored.
 //
 // returns: SUCCESS always (empty input yields 0 topics); FAIL only on
 //          argument errors.

@@ -87,83 +87,50 @@ acq_build_keywords_csv(const acquire_topic_t *t, char *out, size_t out_cap)
   }
 }
 
-// Build the search query from topic.query, topic.query_template (with
-// {subject} substitution), or the subject itself. The output buffer is
-// always the same size as t->query / t->query_template, so the manual
-// copy loop below is used instead of snprintf("%s %s", ...) — the
-// compiler cannot prove the combined length fits and issues a
-// -Wformat-truncation otherwise.
+// Does the topic already answer to this term? `topic` and every `aka`
+// land in the keyword slots, so a subject that is one of them carries
+// nothing the topic string does not.
+static bool
+acq_topic_owns_term(const acquire_topic_t *t, const char *term)
+{
+  for(size_t i = 0; i < t->n_keywords; i++)
+  {
+    if(strcasecmp(t->keywords[i], term) == 0)
+      return(true);
+  }
+
+  return(false);
+}
+
+// Choose what a reactive fire actually searches for.
+//
+// The subject is what the speaker said near the hit; the topic string
+// is what the personality declared. Prefer the subject — it is the
+// reason this topic fired and the only new information in the line —
+// unless it is merely one of the topic's own names, which happens
+// whenever chatbot_extract_subject found no capitalised run and fell
+// back to the keyword that matched.
+//
+// ⛔ This order is the point, not a preference. It used to be the other
+// way round: `t->query` was tested first and returned, so every topic
+// carrying a search string threw the extracted subject away and
+// searched a static phrase. That is what made `query_template` — the
+// key that existed to get the subject back — unreachable on the eight
+// topics that declared one.
 static void
 acq_build_query(const acquire_topic_t *t, const char *subject,
     char *out, size_t out_cap)
 {
   if(out_cap == 0) return;
-  out[0] = '\0';
 
-  if(t->query[0] != '\0')
+  if(subject != NULL && subject[0] != '\0'
+      && !acq_topic_owns_term(t, subject))
   {
-    snprintf(out, out_cap, "%s", t->query);
+    strlcpy(out, subject, out_cap);
     return;
   }
 
-  if(t->query_template[0] != '\0')
-  {
-    const char *ph = strstr(t->query_template, "{subject}");
-    size_t w = 0;
-
-    size_t tpl_len;
-    size_t subj_len;
-    if(ph != NULL)
-    {
-      // Copy template prefix, subject, template suffix manually so the
-      // compiler can see each piece's bounded length.
-      size_t prefix_len = (size_t)(ph - t->query_template);
-
-      const char *suffix;
-      size_t suffix_len;
-      size_t subj_len;
-      if(prefix_len > out_cap - 1) prefix_len = out_cap - 1;
-      memcpy(out, t->query_template, prefix_len);
-      w = prefix_len;
-
-      suffix = ph + 9;
-      subj_len = strlen(subject);
-
-      if(w + subj_len >= out_cap) subj_len = out_cap - 1 - w;
-      memcpy(out + w, subject, subj_len);
-      w += subj_len;
-
-      suffix_len = strlen(suffix);
-
-      if(w + suffix_len >= out_cap) suffix_len = out_cap - 1 - w;
-      memcpy(out + w, suffix, suffix_len);
-      w += suffix_len;
-
-      out[w] = '\0';
-      return;
-    }
-
-    // No placeholder: template then space then subject.
-    tpl_len = strlen(t->query_template);
-
-    if(tpl_len > out_cap - 1) tpl_len = out_cap - 1;
-    memcpy(out, t->query_template, tpl_len);
-    w = tpl_len;
-
-    if(w + 1 < out_cap)
-      out[w++] = ' ';
-
-    subj_len = strlen(subject);
-
-    if(w + subj_len >= out_cap) subj_len = out_cap - 1 - w;
-    memcpy(out + w, subject, subj_len);
-    w += subj_len;
-
-    out[w] = '\0';
-    return;
-  }
-
-  snprintf(out, out_cap, "%s", subject);
+  strlcpy(out, t->query, out_cap);
 }
 
 // Best-effort upsert of per-(bot, topic) stats. Both reactive and
@@ -953,28 +920,6 @@ acq_proactive_pick_topic(const acquire_bot_entry_t *e, size_t *out_idx)
   return(NULL);
 }
 
-// Select the query text for a proactive run. Returns a pointer into
-// the topic (either `query` or `upcoming_query`) — both are fixed-size
-// char arrays owned by the topic copy, so the returned pointer is
-// valid under the same lock that protects the topic struct. Returns
-// NULL if no concrete query is available (caller skips the run).
-//
-// The 1/10 upcoming-query cadence fires when the topic's running
-// proactive counter is at its ninth increment (mod 10) AND the topic
-// defines an upcoming_query. The counter is incremented by the caller
-// iff this function returns non-NULL (i.e. we actually fire).
-static const char *
-acq_proactive_select_query(const acquire_topic_t *t, uint32_t counter)
-{
-  if((counter % 10) == 9 && t->upcoming_query[0] != '\0')
-    return(t->upcoming_query);
-
-  if(t->query[0] != '\0')
-    return(t->query);
-
-  return(NULL);
-}
-
 // Fire one proactive query for an already-resolved topic. Caller holds
 // acquire_entries_lock (rdlock); this function releases the lock
 // unconditionally before returning.
@@ -995,10 +940,8 @@ acq_proactive_fire_locked(acquire_bot_entry_t *e, size_t topic_idx,
   const acquire_topic_t *t = &e->topics[topic_idx];
 
   uint32_t max_per_hour;
-  uint32_t counter;
-  const char *q;
   acq_job_ctx_t *ctx;
-  bool is_upcoming;
+
   if(out_query != NULL && out_query_sz > 0)
     out_query[0] = '\0';
 
@@ -1017,50 +960,31 @@ acq_proactive_fire_locked(acquire_bot_entry_t *e, size_t topic_idx,
     return(ACQ_PROACTIVE_RATE_LIMITED);
   }
 
-  // Counter lives on the entry, parallel to topics[]. It was allocated
-  // alongside `e->topics` in acquire_register_topics and freed in
-  // acquire_entry_free_topics. NULL only if n_topics==0, which the
-  // caller has already ruled out.
-  counter = 0;
-
-  if(e->topic_proactive_counter != NULL)
-    counter = e->topic_proactive_counter[topic_idx];
-
-  q = acq_proactive_select_query(t, counter);
-
-  if(q == NULL)
+  // A topic with no search string cannot fire proactively. The parser
+  // fills `query` from the required `topic` key, so this is a topic
+  // that reached us from somewhere else.
+  if(t->query[0] == '\0')
   {
     pthread_rwlock_unlock(&acquire_entries_lock);
     clam(CLAM_DEBUG, ACQUIRE_CTX,
-        "proactive skip bot=%s topic=%s: no concrete query"
-        " (topic uses a template; proactive runs need topic.query)",
+        "proactive skip bot=%s topic=%s: no query text",
         e->name, t->name);
     return(ACQ_PROACTIVE_NO_QUERY);
   }
 
-  // Commit the counter bump now — we're definitely firing. Doing it
-  // before the async chain keeps the 1/10 upcoming-query cadence
-  // aligned with "queries attempted", not "queries that landed a
-  // chunk" (ingest failures shouldn't desync the counter).
-  if(e->topic_proactive_counter != NULL)
-    e->topic_proactive_counter[topic_idx]++;
-
   // Build the ctx. Subject = topic name: a scheduled run has no chat
   // line to lift one from, and it is what any image harvested off the
   // page is filed under.
-  ctx = acq_job_ctx_build(e, t, t->name, q, true);
+  ctx = acq_job_ctx_build(e, t, t->name, t->query, true);
 
   if(out_query != NULL && out_query_sz > 0)
-    snprintf(out_query, out_query_sz, "%s", q);
-
-  is_upcoming = ((counter % 10) == 9 && t->upcoming_query[0] != '\0');
+    strlcpy(out_query, t->query, out_query_sz);
 
   pthread_rwlock_unlock(&acquire_entries_lock);
 
   clam(CLAM_DEBUG, ACQUIRE_CTX,
-      "proactive fire bot=%s topic=%s query='%s' counter=%u%s",
-      ctx->bot_name, ctx->topic_name, ctx->query, counter,
-      is_upcoming ? " (upcoming)" : "");
+      "proactive fire bot=%s topic=%s query='%s'",
+      ctx->bot_name, ctx->topic_name, ctx->query);
 
   // Spec defers the celeb gate for proactive runs (no {subject}
   // substitution, so the query text is author-controlled). Straight
