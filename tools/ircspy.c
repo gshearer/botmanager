@@ -12,6 +12,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <strings.h>
 #include <sys/socket.h>
 #include <sys/un.h>
 #include <unistd.h>
@@ -383,6 +384,8 @@ handle_privmsg(const char *params, const char *nick)
   // fmtline decorates clean with a channel and a nick, so it is sized from
   // all three rather than from clean alone.
   char fmtline[BUF_SZ + 2 * CMD_SZ + 16];
+  char *body;
+  size_t blen;
 
   if(sp == NULL)
     return;
@@ -404,10 +407,39 @@ handle_privmsg(const char *params, const char *nick)
   snprintf(clean, sizeof(clean), "%s", text);
   strip_irc_fmt(clean);
 
+  // CTCP rides inside an ordinary PRIVMSG as \x01<VERB> [args]\x01, and
+  // both delimiters are invisible in a terminal — so an undecoded ACTION
+  // prints as though the sender had typed the word "ACTION" at the start
+  // of a normal line. That misreading cost a feature-request round trip
+  // (#84): the bot's framing was correct and only this view of it was
+  // not. Decode here rather than strip the byte in strip_irc_fmt, which
+  // would keep the lie and lose the evidence.
+  //
   // nick arrives as a bare pointer into the parsed line; bound it to the
   // same width the channel already gets.
-  snprintf(fmtline, sizeof(fmtline), "[%s] <%.*s> %s",
-      chan, (int)sizeof(chan) - 1, nick, clean);
+  if(clean[0] == '\x01')
+  {
+    body = clean + 1;
+    blen = strlen(body);
+
+    // The closing delimiter is convention, not guarantee: a line the
+    // server truncated arrives with only the opening one.
+    if(blen > 0 && body[blen - 1] == '\x01')
+      body[blen - 1] = '\0';
+
+    if(strncasecmp(body, "ACTION ", 7) == 0)
+      snprintf(fmtline, sizeof(fmtline), "[%s] * %.*s %s",
+          chan, (int)sizeof(chan) - 1, nick, body + 7);
+
+    else
+      snprintf(fmtline, sizeof(fmtline), "[%s] [CTCP %.*s] %s",
+          chan, (int)sizeof(chan) - 1, nick, body);
+  }
+
+  else
+    snprintf(fmtline, sizeof(fmtline), "[%s] <%.*s> %s",
+        chan, (int)sizeof(chan) - 1, nick, clean);
+
   printf("%s\n", fmtline);
   fflush(stdout);
   ctl_send_line(fmtline);
