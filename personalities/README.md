@@ -159,50 +159,103 @@ reply, the same way it retrieves from any other knowledge corpus
 (like the Arch wiki). End result: the bot can casually mention things
 it has "read" recently without anyone asking it to.
 
+### The five keys
+
+A topic is a thing the character follows, written the way a human would
+say it. There are five keys, and only the first is required.
+
+```yaml
+interests:
+  [
+    {"topic": "cryptocurrency",
+     "aka": ["bitcoin", "ethereum", "solana"],
+     "for": ["doc"],
+     "attention": "normal",
+     "watch": ["https://www.coindesk.com/latest-crypto-news"]}
+  ]
+```
+
+| Key | Required | Type | Default | What it is |
+|---|---|---|---|---|
+| `topic` | **yes** | string | — | The thing. It is the topic's name, the string a proactive search runs, **and** the first substring inbound chat is scanned against — one string doing all three. ≤ 63 chars. |
+| `aka` | no | string[] | `[]` | Its other names. Triggers and alias search terms. `topic` + `aka` share 16 slots, ≤ 63 chars each. |
+| `for` | no | string[] | `[]` | Nicks who care. When there is news, the bot prefers a channel one of them is in and addresses the line to whoever is there. Empty = address the room. Max 8. |
+| `attention` | no | word or int | `normal` | How much of the bot's own initiative this topic gets: `off` / `low` / `normal` / `high` (0 / 25 / 50 / 100), or a bare `0`–`100`. |
+| `watch` | no | string[] or object[] | `[]` | Feed URLs polled on their own schedule. A bare URL, or `{"url": …, "every": 1800}`. Max 8. |
+
+Three advanced keys exist and are deliberately absent from the example:
+
+| Key | Type | Default | What it is |
+|---|---|---|---|
+| `category` | string | `general` | SearXNG category: `general`, `images`, `news`, `videos`, `music`. Steers searches only; feeds ignore it. **If your topic is news, say so** — a news topic searching `general` returns front pages and reads as working. |
+| `encyclopedic` | bool | `false` | Try Wikipedia before the search engine. Good for "what is X", bad for "what happened to X this week". |
+| `max_sources` | int | `0` | Per-topic override for `acquire.max_sources_per_query`. `0` inherits; a topic may ask for fewer results, never more. |
+
+**Any other key is named in a WARN and ignored** — a typo'd `"wach"`
+tells you so rather than vanishing.
+
 ### How a topic actually fires (mental model)
 
-A single topic can drive **three independent paths** that all dump into
-the same corpus. You don't need all three — pick what fits.
+A single topic drives **three independent paths** that all dump into the
+same corpus. You don't need all three — pick what fits.
 
 ```
                           ┌─────────────────┐
-chat line matches kw   →  │ reactive search │  → SXNG → fetch → digest → corpus
+chat line matches a name →│ reactive search │  → SXNG → fetch → digest → corpus
                           └─────────────────┘
                           ┌─────────────────┐
 periodic tick          →  │ proactive search│  → SXNG → fetch → digest → corpus
                           └─────────────────┘
                           ┌─────────────────┐
-per-source cadence     →  │ feed dispatcher │  → fetch → digest → corpus
+per-feed cadence       →  │ feed dispatcher │  → fetch → digest → corpus
                           └─────────────────┘
 ```
 
-| Path | Driven by | Topic fields it reads |
+| Path | Driven by | What it searches |
 |---|---|---|
-| **Reactive search** | Someone says one of your `keywords` in chat | `keywords[]`, `query_template`, `category` |
-| **Proactive search** | Per-bot tick (every `acquire.tick_cadence_secs`, default 600s), weighted random pick | `query`, `upcoming_query`, `proactive_weight`, `category` |
-| **Feed dispatcher** | Each `sources[]` entry's own `cadence_secs` | `sources[]` (URLs are fetched verbatim — keywords/queries are NOT used here) |
+| **Reactive search** | Someone says `topic` or one of its `aka` names in chat | **What they said**, not the topic. The engine lifts the longest capitalised run near the hit — so `solana just shipped Firedancer` searches *Firedancer*. It falls back to `topic` when the line contained nothing more specific than the name that matched. |
+| **Proactive search** | Per-bot tick (`acquire.tick_cadence_secs`, default 600 s), weighted random pick by `attention` | `topic`, verbatim. A scheduled run has no chat line to lift a subject from. |
+| **Feed dispatcher** | Each `watch` entry's own `every` | Nothing — the URL is fetched verbatim. Names and queries are not used here. |
 
-These paths are **independent**. A `sources[]` URL fires on its own
-schedule whether or not the keywords match. A keyword match fires a
-SearXNG search whether or not you have explicit sources. If you want
-"only my curated URLs, no SearXNG," see the recipes below.
+These paths are **independent**. A `watch` URL fires on its own schedule
+whether or not anyone says anything. A name match fires a search whether
+or not you have feeds.
+
+⚠ **`attention: off` does not switch a topic off.** It means *"never go
+looking"* — the proactive picker skips it. The reactive scan is not
+weighted and still fires on any name match. There is no "poll but never
+chase" setting; a topic's names are always live triggers.
 
 ### What "reactive" really means
 
 Common misconception: *"I want the bot to fetch my URL when someone
-mentions a keyword."* That is **not** what `keywords` + `sources` does.
-Keywords trigger SearXNG searches. The `sources[]` URLs fetch on their
-own cadence and populate the corpus. The bot answers about your topic
-on a keyword mention because the *corpus retrieval* (RAG) surfaces the
-relevant chunk — not because the keyword "called" your source.
+mentions a name."* That is **not** what names + `watch` does. A name
+match fires a SearXNG search. The `watch` URLs fetch on their own
+cadence and populate the corpus. The bot answers about your topic on a
+mention because *corpus retrieval* (RAG) surfaces the relevant chunk —
+not because the name "called" your feed.
 
 If your URL is being polled regularly, the corpus has fresh content,
 and RAG does the rest naturally.
 
+### A name is an unanchored substring
+
+`topic` and every `aka` entry are matched as plain substrings,
+case-insensitively, anywhere in a line. Nothing warns you about an
+unfortunate one, because the parser cannot tell it from a deliberate
+one:
+
+- `"AI"` fires on *said*, *again*, *maintain*.
+- `"away"` fires on *always*. `"home"` fires on *homework*.
+- `"News"` fires on essentially every line containing the word.
+
+Prefer a phrase: `"smart home"` over `"home"`, `"LLM inference"` over
+`"AI"`.
+
 ### It must be valid JSON, NOT YAML
 
-`json-c` parses this block. YAML pipe form (`|`) silently produces
-zero topics. Keep it as a real JSON array:
+`json-c` parses this block. YAML pipe form (`|`) silently produces zero
+topics. Keep it as a real JSON array:
 
 ```yaml
 interests:
@@ -212,202 +265,158 @@ interests:
   ]
 ```
 
-Newlines inside the JSON are fine; the slurper preserves them.
+> **Gotchas that silently kill the whole block:**
+> - **A blank line inside the array.** The value runs from `interests:`
+>   until a blank line or `---`, so a blank line between two objects
+>   truncates the JSON mid-array and registers **nothing**. This is the
+>   most common one by a distance.
+> - Forgotten closing quote on a key — e.g. `"category: "news"` — breaks
+>   that topic and often cascades to the whole array.
+> - A trailing comma is *not* one of these: json-c accepts it. If the
+>   block looks malformed to you and still parses, the failure is
+>   semantic — a wrong key name, or a missing `topic`.
+> - When in doubt, paste the block (without the `interests:` prefix)
+>   into `python3 -m json.tool` to confirm it parses.
 
-> **Common gotchas that silently kill the whole block:**
-> - Trailing comma after the last `,` in an object or array.
-> - Forgotten closing quote on a key — e.g. `"category: "news"` (missing
->   the `"` after the key name) breaks the parser for that topic AND
->   often cascades to drop the whole array.
-> - Unknown field names are silently ignored. `"search_mode": "news"`
->   compiles fine but does nothing — the field is `"category"`.
-> - When in doubt, paste the block (without the `interests:` prefix) into
->   `python3 -m json.tool` to confirm it parses.
+**Confirm it, don't assume it.** The block is not re-read per message —
+it is handed to the engine at bind time. After editing it, run:
 
-### Topic object fields
-
-| Field              | Required | Type     | Default            | Notes                                                                    |
-|--------------------|----------|----------|--------------------|--------------------------------------------------------------------------|
-| `name`             | yes      | string   | —                  | Short label (`archlinux`, `kernel`). Used in logs and the subject row.  |
-| `mode`             | yes      | string   | —                  | `"active"`, `"reactive"`, or `"mixed"` (case-insensitive).              |
-| `keywords`         | no       | string[] | `[]`               | Triggers reactive matches when they appear in a message. Max 16.        |
-| `query`            | no\*     | string   | `""`               | Literal query string for the proactive path.                            |
-| `query_template`   | no\*     | string   | `""`               | Template with `{subject}` — filled per reactive hit.                    |
-| `upcoming_query`   | no       | string   | `""`               | Fires every 10th proactive tick when set (look-ahead queries).          |
-| `proactive_weight` | no       | int 0-100| mode-dependent†   | Weighted-random selector for proactive ticks. `0` = reactive-only.      |
-| `cadence_secs`     | no       | int      | `0` (engine default) | Reserved — currently parsed but not consumed. Use per-source cadence instead. |
-| `max_sources`      | no       | int      | `0` (inherit)      | Per-topic override for `acquire.max_sources_per_query`. `0` inherits the global cap. Upper bound is `plugin.searxng.max_results`. |
-| `category`         | no       | string   | `"general"`        | SearXNG category: `general`, `images`, `news`, `videos`, `music`. Steers SXNG paths only; feeds ignore it. |
-| `sources`          | no       | object[] | `[]`               | Explicit RSS/HTML feed URLs (see below). Max 8 per topic.               |
-
-\*`query` or `query_template` should be set for anything other than a
-pure-reactive keyword-only topic. If both are empty the topic never
-produces a query proactively (reactive falls back to the matched
-subject as the query).
-
-†Default `proactive_weight`: `active` = 100, `reactive` = 0, `mixed` =
-50.
-
-### Mode semantics
-
-| Mode        | Fires on keyword hits (reactive) | Fires on proactive tick | Typical default weight |
-|-------------|----------------------------------|-------------------------|------------------------|
-| `active`    | yes                              | yes                     | 100                    |
-| `reactive`  | yes                              | no                      | 0                      |
-| `mixed`     | yes                              | yes (lower weight)      | 50                     |
-
-### Source feeds (RSS / HTML)
-
-A `sources` array on a topic declares explicit URLs the acquisition
-engine polls *in addition to* the SearXNG path. Each entry is one of:
-
-```json
-{"type": "rss",  "url": "https://example.com/feed.xml", "cadence_secs": 3600}
-{"type": "html", "url": "https://example.com/news",     "cadence_secs": 7200}
+```sh
+tools/botmanctl -- bot <name> refresh_prompts
 ```
 
-| Field          | Required | Type   | Notes                                                         |
-|----------------|----------|--------|---------------------------------------------------------------|
-| `type`         | yes      | string | `"rss"` (RSS 2.0 / Atom, auto-detected) or `"html"`.          |
-| `url`          | yes      | string | `http://` or `https://` only. Loopback / RFC1918 rejected.    |
-| `cadence_secs` | no       | int    | Clamped up to 300s minimum. Defaults to the clamp floor.      |
+It reports what it parsed on a line of its own: `interests: 7 topics
+registered`, or `interests: DECLARED BUT NONE PARSED — check the JSON
+block`, or that the bot has no `acquired_corpus` and registered nothing
+at all.
+
+### `for:` — addressing the people who care
+
+`for` names people, and naming is all it does. When the topic ingests
+something new, the volunteer path prefers a channel one of those nicks
+is in and tells the bot to address the line to whoever is actually
+there. Nobody in any room it can speak in? It posts unaddressed.
+
+⛔ **The bot is told the nick and nothing else, on purpose.** A `for:`
+list is configuration you typed; nobody told the bot anything about
+these people, so it may name them and may not say or imply why it did.
+Do not add a persona sentence explaining the list — the bot cannot
+answer *"how do you know I care about that?"* and must not sound like
+it can.
+
+### `watch` — feed URLs (RSS / HTML)
+
+A `watch` array declares URLs the acquisition engine polls *in addition
+to* the search paths. Each entry is a bare URL string or an object:
+
+```json
+"watch": [
+  "https://archlinux.org/news/",
+  {"url": "https://archlinux.org/feeds/news/", "every": 3600, "type": "rss"}
+]
+```
+
+| Field | Required | Type | Notes |
+|---|---|---|---|
+| `url` | yes | string | `http://` or `https://` only. Loopback / RFC1918 rejected. |
+| `every` | no | int | Seconds. Clamped up to a 300 s minimum, which is also the default. |
+| `type` | no | string | `"html"` (default) or `"rss"` (RSS 2.0 / Atom, auto-detected). |
 
 Behavior:
 
 - **RSS/Atom** → libxml2 parses the feed, extracts each item's title +
-  body, dedupes against a per-source seen-GUID ring (256 entries),
-  and sends survivors through the digest → ingest pipeline.
+  body, dedupes against a per-feed seen-GUID ring (256 entries), and
+  sends survivors through the digest → ingest pipeline.
 - **HTML** → libxml2 XPath prefers `<article>` or `<main>` subtrees;
   falls back to full-body tag-strip. Uses `<title>` as the subject.
-- **Conditional GET** — ETag / Last-Modified are remembered
-  in-memory; subsequent fetches carry `If-None-Match` /
-  `If-Modified-Since`. A `304` skips the whole digest chain.
-- **Body-hash dedup** — even without server-side 304, an unchanged
+- **Conditional GET** — ETag / Last-Modified are remembered in-memory;
+  subsequent fetches carry `If-None-Match` / `If-Modified-Since`. A
+  `304` skips the whole digest chain.
+- **Body-hash dedup** — even without a server-side 304, an unchanged
   body short-circuits.
-- **State is in-memory only.** Restart or personality reload =
-  first tick re-fetches; chunk-id ring and ingest-edge dedup absorb
+- **State is in-memory only.** Restart or personality reload = first
+  tick re-fetches; the chunk-id ring and ingest-edge dedup absorb the
   duplicates.
 - **Global kill switch:** `tools/botmanctl set kv acquire.sources_enabled false`.
 
-### Full `interests:` example (real patterns, trimmed)
+### Full `interests:` example
 
 ```yaml
 interests:
   [
-    {
-      "name": "archlinux",
-      "mode": "active",
-      "proactive_weight": 100,
-      "query": "archlinux news this week",
-      "upcoming_query": "archlinux upcoming release notes",
-      "category": "news",
-      "keywords": ["archlinux", "arch linux", "pacman", "AUR"],
-      "sources": [
-        {"type": "rss",  "url": "https://archlinux.org/feeds/news/", "cadence_secs": 3600},
-        {"type": "html", "url": "https://archlinux.org/news/",       "cadence_secs": 7200}
-      ]
-    },
-    {
-      "name": "linux",
-      "mode": "mixed",
-      "proactive_weight": 30,
-      "query": "linux kernel news this week",
-      "category": "news",
-      "keywords": ["linux", "kernel", "sysadmin"]
-    },
-    {
-      "name": "systemd",
-      "mode": "reactive",
-      "keywords": ["systemd", "journalctl", "systemctl", "OnCalendar"],
-      "query_template": "{subject} systemd documentation"
-    }
+    {"topic": "arch linux",
+     "aka": ["archlinux", "pacman", "AUR", "pkgbuild"],
+     "attention": "high",
+     "category": "news",
+     "watch": [
+       {"url": "https://archlinux.org/feeds/news/", "every": 3600, "type": "rss"},
+       {"url": "https://archlinux.org/news/",       "every": 7200}
+     ]},
+    {"topic": "linux kernel",
+     "aka": ["kernel", "initramfs", "mkinitcpio", "dkms"],
+     "attention": 30,
+     "category": "news"},
+    {"topic": "systemd",
+     "aka": ["journalctl", "systemctl", "unit file", "OnCalendar"],
+     "attention": "off"}
   ]
 ```
 
 ### Common patterns (recipes)
 
-Pick the recipe that matches your intent — these are the four shapes
-that account for ~95% of real topic configs.
-
-**1. Pure SearXNG search topic (no curated URLs)**
-
-The bot autonomously searches the web for the topic on a tick, and also
-when chat mentions a keyword.
+**1. A topic the bot brings up on its own and reacts to**
 
 ```json
-{
-  "name": "ai-news",
-  "mode": "active",
-  "query": "ai industry news this week",
-  "category": "news",
-  "keywords": ["openai", "anthropic", "llm"]
-}
+{"topic": "LLM inference",
+ "aka": ["vLLM", "llama.cpp", "context window", "tool use"],
+ "attention": "high",
+ "category": "news"}
 ```
 
-**2. Pure feed topic (no SearXNG at all)**
-
-The bot only learns from URLs you've explicitly listed. No web search
-will ever fire for this topic. The keyword field is used purely to hint
-the digest LLM what's relevant in the fetched pages.
+**2. Curated feeds, minimal searching**
 
 ```json
-{
-  "name": "verge-ai",
-  "mode": "active",
-  "proactive_weight": 0,
-  "keywords": ["ai", "llm"],
-  "sources": [
-    {"type": "html", "url": "https://www.theverge.com/ai-artificial-intelligence",
-     "cadence_secs": 1800}
-  ]
-}
+{"topic": "verge ai coverage",
+ "attention": "off",
+ "watch": [{"url": "https://www.theverge.com/ai-artificial-intelligence",
+            "every": 1800}]}
 ```
 
-Why `mode: "active"` + `proactive_weight: 0`? Because `mode: "active"`
-makes the chat scanner *skip the topic for reactive triggers*, and
-`proactive_weight: 0` keeps the proactive picker from ever selecting
-it. The result: SXNG never runs, only the feed.
+`attention: off` stops the proactive picker ever selecting it, so the
+feed is the only *scheduled* source. ⚠ The topic string is still a
+trigger, so pick one nobody says in chat — that is what makes this
+recipe quiet, not a mode setting.
 
-**3. Hybrid — feeds plus reactive search backup**
+**3. Reactive lookup, no feed**
 
-You have a curated feed but you also want SearXNG to fill in when chat
-brings up specifics not on your feed.
+Quiet until somebody says the word, then searches what they said.
 
 ```json
-{
-  "name": "kernel",
-  "mode": "reactive",
-  "keywords": ["kernel", "linux 6.", "scheduler"],
-  "query_template": "{subject} linux kernel",
-  "sources": [
-    {"type": "rss", "url": "https://www.kernel.org/feeds/all.atom.xml",
-     "cadence_secs": 3600}
-  ]
-}
+{"topic": "systemd",
+ "aka": ["journalctl", "systemctl", "unit file"],
+ "attention": "off"}
 ```
 
-**4. Reactive lookup, no feed**
-
-Quiet when nobody's talking about it; fires a SearXNG search the moment
-a keyword shows up.
+**4. A topic somebody in particular follows**
 
 ```json
-{
-  "name": "systemd",
-  "mode": "reactive",
-  "keywords": ["systemd", "journalctl", "systemctl"],
-  "query_template": "{subject} systemd documentation"
-}
+{"topic": "cryptocurrency",
+ "aka": ["crypto", "bitcoin", "ethereum", "solana"],
+ "for": ["doc"],
+ "attention": "normal",
+ "category": "news"}
 ```
 
-### Picking `mode` (decision table)
+### Picking `attention` (decision table)
 
-| Want | `mode` | Notes |
-|---|---|---|
-| Bot brings the topic up on its own AND reacts to chat | `active` | Default `proactive_weight` 100 — turn down if it dominates picks. |
-| Bot only speaks up when chat mentions it | `reactive` | Default `proactive_weight` 0 — never picked proactively. |
-| Light proactive coverage, plus reactive | `mixed` | Default `proactive_weight` 50. |
-| Curated URLs only, no web search ever | `active` + `proactive_weight: 0` | Counter-intuitive: `active` disables the *reactive scanner*, weight 0 disables the *proactive picker*. Feeds are unaffected. |
+| Want | `attention` |
+|---|---|
+| The bot's headline interest — brings it up often | `high` (100) |
+| A normal interest | `normal` (50), the default |
+| Follows it, rarely raises it unprompted | `low` (25), or any integer |
+| Never goes looking; still answers when it comes up | `off` (0) |
+
+⚠ `off` is not "ignore". Every topic is scanned reactively regardless.
 
 ### Inspecting
 
@@ -562,14 +571,16 @@ Common failure modes:
 
 | Symptom                                              | Cause / fix                                                                 |
 |------------------------------------------------------|-----------------------------------------------------------------------------|
-| `parse error: continue` + `zero topics parsed`       | Trailing comma in JSON, missing closing quote on a key (`"category: "news"`), or YAML `|` form. Validate with `python3 -m json.tool`. |
-| Topic seems to ignore a field you set                | Field name typo — unknown keys are silently dropped. Common: `search_mode` (should be `category`), `kind` (should be `type` inside `sources`). |
-| Bot fires SearXNG when you only wanted a feed        | Reactive scanner triggers on `keywords[]` regardless of `sources`. Use `mode: "active"` + `proactive_weight: 0` to silence both SXNG paths. |
-| Feed seems to fetch on the wrong cadence             | `cadence_secs` lives on each `sources[]` entry, not the topic. Topic-level `cadence_secs` is currently a no-op. Per-feed minimum is 300s. |
+| `parse error: continue` + `zero topics parsed`       | A blank line inside the topic array (it ends the value), a missing closing quote on a key (`"category: "news"`), or YAML `|` form. Note json-c *accepts* a trailing comma. Validate with `python3 -m json.tool`. |
+| `interests: DECLARED BUT NONE PARSED`                | The reply from `bot <name> refresh_prompts`. Read the WARN lines in the log — each names the topic index and what was wrong with it. |
+| `interests: bot has no acquired_corpus`              | The block is fine; the bot has nowhere to put what it reads. Set `bot.<n>.acquired_corpus`. |
+| `interests[N] (topic='…'): unknown key '…'`          | Key name typo. Common: `search_mode` (it is `category`), `keywords` / `mode` / `query` (all removed — see §The five keys). |
+| Bot fires SearXNG when you only wanted a feed        | Every topic is scanned reactively; there is no setting that stops it. `attention: off` silences the *proactive* path only. Give the topic a `topic`/`aka` nobody says in chat. |
+| Feed seems to fetch on the wrong cadence             | `every` lives on each `watch` entry, not on the topic. Minimum, and default, is 300 s. |
 | Bot replies in third person                          | Contract not loading (check `bot.<n>.behavior.contract`) or persona is too weak on voice. |
 | Bot emits markdown / emoji / parentheticals          | Contract missing a wire rule, or persona body is overriding it.             |
-| `interests[N]: missing or unknown 'mode'`            | `mode` must be `active`, `reactive`, or `mixed`.                            |
-| `interests[N].sources[M]: unknown type='...'`        | Only `rss` and `html` are supported today.                                  |
+| `interests[N]: missing or empty 'topic'`             | `topic` is the one required key.                                            |
+| `interests[N].watch[M]: unknown type='...'`          | Only `rss` and `html` are supported today.                                  |
 | `/weather paris` appears as literal chat text        | NL bridge disabled. Set `bot.<n>.behavior.nl_bridge_cmds`.                  |
 | Bot claims to be an AI                               | Add an explicit "never break character" clause to the *persona* body.       |
 
