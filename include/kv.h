@@ -69,6 +69,13 @@ typedef void (*kv_cb_t)(const char *key, void *data);
 
 // Fails if the key already exists or the default is bad for the type.
 // help must be static storage; cb may be NULL.
+//
+// ⚠⚠ `default_val` is what the key reads when NOTHING is stored under it,
+// which after the first boot is rarely true: kv_load() lays a persisted
+// row over the declaration and that row wins. So EDITING A DEFAULT IS
+// INERT on any deployment that has already run — the rebuild is correct
+// and the live value does not move. kv_reset() (`set kv --delete`) is
+// what re-adopts the new declaration and drops the row with it.
 bool kv_register(const char *key, kv_type_t type, const char *default_val,
     kv_cb_t cb, void *cb_data, const char *help);
 
