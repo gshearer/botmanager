@@ -202,6 +202,27 @@ typedef struct
   float    cos;
 } knowledge_lex_t;
 
+// One corpus a bot is bound to, and how much of its score survives.
+// The binding string is `name[:weight]`, `;`-separated, so a corpus is
+// ingested ONCE and shared: two bots with opposite priorities bind the
+// same 33k rows and only their multipliers differ.
+typedef struct
+{
+  char   name[KNOWLEDGE_CORPUS_NAME_SZ];
+  float  weight;
+} knowledge_corpus_weight_t;
+
+// Names one binding string may carry. Also bounds the clause built from
+// it: 16 * (64 quoted + 3 punctuation) is ~1k, which is what the
+// callers' `in_clause` buffers are sized for.
+#define KNOWLEDGE_CORPUS_LIST_MAX        16
+
+// Weight a binding with no `:weight` carries, and the range a written
+// one is clamped to. 0.0 is legal and means bound but never retrieved —
+// a corpus you are ingesting into and do not yet trust.
+#define KNOWLEDGE_CORPUS_WEIGHT_DEF      1.0f
+#define KNOWLEDGE_CORPUS_WEIGHT_MAX      4.0f
+
 // One retrieval's working set. Lives on the retrieving thread's stack
 // for the length of a single knowledge_retrieve; the cosine walk reads
 // `lex` while it fills `dense`, which is why the two share a frame.
@@ -234,6 +255,27 @@ void knowledge_hit_push(knowledge_hit_t *out, size_t *n, size_t cap,
 // Returns the number of hits written to `out`, in delivery order.
 size_t knowledge_interleave(const knowledge_rank_t *r, size_t lex_k,
     knowledge_hit_t *out, size_t out_cap);
+
+// Split a `bot.<n>.corpus` binding into names and weights. Returns how
+// many entries were written; a name longer than the field, or an entry
+// that is only whitespace, is dropped the way an unknown corpus already
+// is. The bytes come off a KV value, so every reading here is a policy
+// decision and tests/test_knowledge_corpus.c holds them.
+size_t knowledge_parse_corpus_list(const char *list,
+    knowledge_corpus_weight_t *out, size_t out_cap);
+
+// Drop the entries that can never contribute a row. Returns the new
+// count. ⛔ Retrieval must call this BEFORE building its IN clause:
+// weighting a zero-weight corpus's rows to 0.0 would still let them
+// fill a top-K that nothing else reached, and they would still count
+// toward the lexical channel's document frequencies.
+size_t knowledge_corpus_weight_compact(knowledge_corpus_weight_t *w,
+    size_t n);
+
+// KNOWLEDGE_CORPUS_WEIGHT_DEF for a name the list did not carry, which
+// is what an empty binding gives every row.
+float knowledge_corpus_weight_of(const knowledge_corpus_weight_t *w,
+    size_t n, const char *name);
 
 
 // Range knowledge.chunk_max_chars is clamped to at load. The floor

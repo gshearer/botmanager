@@ -139,8 +139,13 @@ static const plugin_kv_entry_t chatbot_inst_schema[] = {
     " service value on purpose (they are background or one-line work and"
     " a raised effort buys them nothing).", NULL },
   { "corpus", KV_STR, "",
-    "Knowledge corpora to retrieve from, semicolon-separated (e.g."
-    " 'archwiki;linuxfoundation'). Each name must exist in"
+    "Knowledge corpora to retrieve from, semicolon-separated, each"
+    " optionally weighted as name:weight (e.g."
+    " 'archwiki:0.4;linuxfoundation'). The weight scales that corpus's"
+    " retrieval score, so one corpus is ingested once and shared by bots"
+    " that want it at different strengths; an unwritten weight is 1.0,"
+    " the range is 0.0 to 4.0, and 0.0 means bound but never retrieved."
+    " A corpus name cannot contain ':'. Each name must exist in"
     " knowledge_corpora; unknown names in the list are silently ignored."
     " Empty = no knowledge retrieval for this bot.", NULL },
   { "acquired_corpus", KV_STR, "",

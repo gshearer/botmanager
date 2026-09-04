@@ -246,6 +246,21 @@ test_acq_strip = executable('test_acq_strip',
   link_with : [test_harness],
 )
 
+# The corpus binding `bot.<n>.corpus` carries: names, and the weights
+# that let two bots share one ingested corpus at opposite strengths. Its
+# whole failure mode is silent — a misread weight answers out of the
+# wrong corpus and errors nowhere — and two of its readings are
+# outright opposite (an unwritten weight against a written zero). Same
+# pure unit as the merge above, compiled in the same way.
+test_knowledge_corpus = executable('test_knowledge_corpus',
+  'test_knowledge_corpus.c',
+  '../plugins/extension/inference/engine/knowledge_rank.c',
+  include_directories : [include_directories('.'), inc_include,
+                         include_directories(
+                             '../plugins/extension/inference/engine')],
+  link_with : [test_harness],
+)
+
 test_knowledge_dedup = executable('test_knowledge_dedup',
   'test_knowledge_dedup.c',
   include_directories : [include_directories('.'), inc_include,
@@ -559,6 +574,7 @@ test('baseprompt', test_baseprompt)
 test('warm_chain', test_warm_chain)
 test('fact_merge', test_fact_merge)
 test('knowledge_rank', test_knowledge_rank)
+test('knowledge_corpus', test_knowledge_corpus)
 test('acq_strip', test_acq_strip)
 test('knowledge_dedup', test_knowledge_dedup)
 test('kv_bot', test_kv_bot)

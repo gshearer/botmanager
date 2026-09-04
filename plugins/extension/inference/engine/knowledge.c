@@ -1407,45 +1407,33 @@ knowledge_insert_image(int64_t chunk_id, const char *url,
 // pure functions over them are in knowledge_rank.c, where a test can
 // compile them without the subsystem behind them.
 
-// Build a SQL `IN ('a','b',...)` clause from a semicolon-separated
-// corpus list. Escapes each name via db_escape, trims whitespace,
-// skips empty entries, and writes into `out` (NUL-terminated). Returns
-// the number of names that made it into the clause; 0 means the list
-// was empty and `out` now holds `()` (caller should treat as empty).
+// Build a SQL `IN ('a','b',...)` clause over already-parsed corpus
+// names (knowledge_parse_corpus_list is where the binding string is
+// read). Escapes each name via db_escape and writes into `out`
+// (NUL-terminated). Returns the number of names that made it into the
+// clause; 0 means there was nothing to select and `out` now holds `()`,
+// which the callers treat as empty rather than sending.
 //
 // `out_sz` should be >= 1024; KNOWLEDGE_CORPUS_LIST_MAX * (64 quoted +
 // 3 punctuation) = ~1k is the worst case at our 16-name cap.
-#define KNOWLEDGE_CORPUS_LIST_MAX   16
-
 static size_t
-knowledge_build_corpus_in_clause(const char *list,
-    char *out, size_t out_sz)
+knowledge_build_corpus_in_clause(const knowledge_corpus_weight_t *w,
+    size_t n_w, char *out, size_t out_sz)
 {
-  char copy[512];
   size_t pos;
-  char *saveptr;
   size_t n;
-  snprintf(copy, sizeof(copy), "%s", list != NULL ? list : "");
 
   pos = 0;
   pos += (size_t)snprintf(out + pos, out_sz - pos, "(");
 
-  saveptr = NULL;
   n = 0;
-  for(char *tok = strtok_r(copy, ";", &saveptr);
-      tok != NULL && n < KNOWLEDGE_CORPUS_LIST_MAX;
-      tok = strtok_r(NULL, ";", &saveptr))
-  {
-    size_t tlen;
-    char *e;
-    while(*tok == ' ' || *tok == '\t') tok++;
-    tlen = strlen(tok);
-    while(tlen > 0 && (tok[tlen-1] == ' ' || tok[tlen-1] == '\t'))
-      tok[--tlen] = '\0';
-    if(tok[0] == '\0') continue;
 
-    e = db_escape(tok);
-    if(e == NULL) continue;
+  for(size_t i = 0; i < n_w; i++)
+  {
+    char *e = db_escape(w[i].name);
+
+    if(e == NULL)
+      continue;
 
     pos += (size_t)snprintf(out + pos, out_sz - pos,
         "%s'%s'", n == 0 ? "" : ",", e);
@@ -1490,19 +1478,25 @@ knowledge_build_corpus_in_clause(const char *list,
     "  SELECT df.lexeme, ln(tot.n / df.n) AS idf FROM df, tot" \
     "   WHERE df.n > 0 AND df.n::float8 <= tot.n * %f" \
     ")" \
-    " SELECT k.id, SUM(sel.idf) AS idf" \
+    " SELECT k.id, SUM(sel.idf) AS idf, k.corpus" \
     "   FROM sel JOIN knowledge_chunks k" \
     "     ON k.corpus IN %s" \
     "    AND to_tsvector('english', k.text)" \
     "        @@ plainto_tsquery('simple', sel.lexeme)" \
-    "  GROUP BY k.id ORDER BY idf DESC, k.id LIMIT %zu"
+    "  GROUP BY k.id, k.corpus ORDER BY idf DESC, k.id LIMIT %zu"
 
 // Rank the corpora's chunks by the rarity of the query terms they
 // carry, filling r->lex. Costs one GIN lookup per surviving lexeme
 // against an index the cosine channel does not need, and is skipped
 // entirely when the caller asked for no lexical slots.
+//
+// ⚠ The corpus weight has to be applied HERE as well as in the cosine
+// walk, or the dial only half works: this channel holds
+// knowledge.rag_lexical_k reserved slots and would keep filling them at
+// full strength from a corpus the operator turned down.
 static void
-knowledge_lexical_scan(const char *in_clause, const char *query,
+knowledge_lexical_scan(const char *in_clause,
+    const knowledge_corpus_weight_t *w, size_t n_w, const char *query,
     knowledge_rank_t *r)
 {
   char *e_query;
@@ -1529,14 +1523,16 @@ knowledge_lexical_scan(const char *in_clause, const char *query,
   {
     for(uint32_t i = 0; i < res->rows && r->n_lex < KNOWLEDGE_LEX_CAND_MAX; i++)
     {
-      const char *id_s  = db_result_get(res, i, 0);
-      const char *idf_s = db_result_get(res, i, 1);
+      const char *id_s   = db_result_get(res, i, 0);
+      const char *idf_s  = db_result_get(res, i, 1);
+      const char *corpus = db_result_get(res, i, 2);
 
-      if(id_s == NULL || idf_s == NULL)
+      if(id_s == NULL || idf_s == NULL || corpus == NULL)
         continue;
 
       r->lex[r->n_lex].id  = (int64_t)strtoll(id_s, NULL, 10);
-      r->lex[r->n_lex].idf = strtof(idf_s, NULL);
+      r->lex[r->n_lex].idf = strtof(idf_s, NULL)
+          * knowledge_corpus_weight_of(w, n_w, corpus);
       r->lex[r->n_lex].cos = 0.0f;
       r->n_lex++;
     }
@@ -1554,8 +1550,16 @@ knowledge_lexical_scan(const char *in_clause, const char *query,
 // r->dense -- and, in the same pass, stamping the cosine onto any
 // lexical candidate it walks over, which is where those get their
 // tiebreak for free. `in_clause` is a built corpus IN (...) fragment.
+//
+// The corpus weight scales the score before the heap sees it, so the
+// ranker never learns what a corpus is: knowledge_topk_insert,
+// knowledge_lex_sort and knowledge_interleave are unchanged by the
+// dial, and so are their cases. ⛔ It is deliberately not a SQL-side
+// CASE — this channel scores in C anyway, and the lexical one would
+// need one inside a statement that is already six CTEs.
 static void
-knowledge_scan(const char *in_clause, const char *model,
+knowledge_scan(const char *in_clause,
+    const knowledge_corpus_weight_t *w, size_t n_w, const char *model,
     knowledge_rank_t *r)
 {
   char *e_model;
@@ -1571,7 +1575,7 @@ knowledge_scan(const char *in_clause, const char *model,
   sql = mem_alloc("knowledge", "scan_sql", sz);
 
   snprintf(sql, sz,
-      "SELECT e.chunk_id, e.vec"
+      "SELECT e.chunk_id, e.vec, x.corpus"
       " FROM knowledge_chunk_embeddings e JOIN knowledge_chunks x"
       " ON e.chunk_id = x.id"
       " WHERE x.corpus IN %s AND e.model = '%s' AND e.dim = %u",
@@ -1591,17 +1595,19 @@ knowledge_scan(const char *in_clause, const char *model,
 
   for(uint32_t i = 0; i < res->rows; i++)
   {
-    const char *id_s  = db_result_get(res, i, 0);
-    const char *vec_s = db_result_get(res, i, 1);
+    const char *id_s   = db_result_get(res, i, 0);
+    const char *vec_s  = db_result_get(res, i, 1);
+    const char *corpus = db_result_get(res, i, 2);
     float *rv;
     float score;
     int64_t id;
-    if(id_s == NULL || vec_s == NULL) continue;
+    if(id_s == NULL || vec_s == NULL || corpus == NULL) continue;
 
     rv = knowledge_bytea_to_vec(vec_s, r->dim);
     if(rv == NULL) continue;
 
-    score = knowledge_cosine(r->qvec, rv, r->dim);
+    score = knowledge_cosine(r->qvec, rv, r->dim)
+        * knowledge_corpus_weight_of(w, n_w, corpus);
     id = (int64_t)strtoll(id_s, NULL, 10);
 
     knowledge_topk_insert(r->dense, r->dense_cap, &r->n_dense, id, score);
@@ -1744,12 +1750,14 @@ knowledge_retrieve_with_vec(const char *corpus_list, const char *query,
     const char *model, uint32_t dim, const float *qvec, uint32_t top_k,
     knowledge_retrieve_cb_t cb, void *user)
 {
-  knowledge_rank_t  rank;
-  knowledge_hit_t   out[KNOWLEDGE_HITS_MAX];
-  knowledge_cfg_t   cfg;
-  char              in_clause[1200];
-  size_t            lex_k;
-  size_t            n_out;
+  knowledge_rank_t          rank;
+  knowledge_hit_t           out[KNOWLEDGE_HITS_MAX];
+  knowledge_cfg_t           cfg;
+  knowledge_corpus_weight_t weights[KNOWLEDGE_CORPUS_LIST_MAX];
+  char                      in_clause[1200];
+  size_t                    n_weights;
+  size_t                    lex_k;
+  size_t                    n_out;
 
   knowledge_cfg_snapshot(&cfg);
 
@@ -1764,7 +1772,15 @@ knowledge_retrieve_with_vec(const char *corpus_list, const char *query,
   if(lex_k > KNOWLEDGE_HITS_MAX - top_k)
     lex_k = KNOWLEDGE_HITS_MAX - top_k;
 
-  if(knowledge_build_corpus_in_clause(corpus_list,
+  // A zero-weight corpus is dropped before the clause is built rather
+  // than scored to zero afterwards: it must contribute no rows to a
+  // top-K nothing else filled, and no documents to the lexical
+  // channel's frequency census either.
+  n_weights = knowledge_parse_corpus_list(corpus_list, weights,
+      KNOWLEDGE_CORPUS_LIST_MAX);
+  n_weights = knowledge_corpus_weight_compact(weights, n_weights);
+
+  if(knowledge_build_corpus_in_clause(weights, n_weights,
         in_clause, sizeof(in_clause)) == 0)
   {
     cb(NULL, 0, user);
@@ -1778,9 +1794,9 @@ knowledge_retrieve_with_vec(const char *corpus_list, const char *query,
 
   // Lexical first: the cosine walk stamps its candidates as it goes.
   if(lex_k > 0)
-    knowledge_lexical_scan(in_clause, query, &rank);
+    knowledge_lexical_scan(in_clause, weights, n_weights, query, &rank);
 
-  knowledge_scan(in_clause, model, &rank);
+  knowledge_scan(in_clause, weights, n_weights, model, &rank);
 
   knowledge_lex_sort(rank.lex, rank.n_lex);
 
@@ -1972,6 +1988,7 @@ knowledge_images_by_subject(const char *corpus_list,
     const char *subject, size_t limit, uint32_t max_age_days,
     knowledge_image_t *out, size_t out_cap)
 {
+  knowledge_corpus_weight_t weights[KNOWLEDGE_CORPUS_LIST_MAX];
   char in_clause[1200];
   char *e_subj;
   char age_clause[64];
@@ -1990,7 +2007,14 @@ knowledge_images_by_subject(const char *corpus_list,
   // Build the corpus IN (...) fragment. Empty list is a legit degenerate
   // case — behave like a sync-empty short-circuit so callers don't need
   // to pre-check.
-  n_names = knowledge_build_corpus_in_clause(corpus_list,
+  //
+  // ⭑ The binding's weights are parsed only so the syntax cannot
+  // diverge from retrieval's, and are then deliberately IGNORED: an
+  // image is looked up by subject, not ranked, so there is nothing here
+  // for a multiplier to scale.
+  n_names = knowledge_parse_corpus_list(corpus_list, weights,
+      KNOWLEDGE_CORPUS_LIST_MAX);
+  n_names = knowledge_build_corpus_in_clause(weights, n_names,
       in_clause, sizeof(in_clause));
 
   if(n_names == 0)

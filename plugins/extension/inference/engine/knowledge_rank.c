@@ -1,6 +1,7 @@
 // botmanager — MIT
-// The knowledge store's ranking arithmetic: the cosine top-K heap, and
-// the merge that interleaves it with the lexical channel.
+// The knowledge store's ranking arithmetic: the cosine top-K heap, the
+// merge that interleaves it with the lexical channel, and the corpus
+// weights both channels scale their scores by.
 //
 // Split out of knowledge.c so it can be compiled into a test without
 // the subsystem behind it — every function here is pure, touches no
@@ -10,9 +11,138 @@
 // overflowed the array sized from the distinct rows behind it, and a
 // made-no-progress guard broke the whole merge when the lexical side
 // ran dry, throwing away the cosine hits behind it.
-// Cases: tests/test_knowledge_rank.c.
+// Cases: tests/test_knowledge_rank.c, tests/test_knowledge_corpus.c.
 
 #include "knowledge_priv.h"
+
+#include <stdlib.h>
+#include <string.h>
+
+// Trim spaces and tabs off both ends of `s`, in place. Returns the new
+// start; the caller's pointer is not moved for it.
+static char *
+knowledge_trim(char *s)
+{
+  size_t len;
+
+  while(*s == ' ' || *s == '\t')
+    s++;
+
+  len = strlen(s);
+
+  while(len > 0 && (s[len - 1] == ' ' || s[len - 1] == '\t'))
+    s[--len] = '\0';
+
+  return(s);
+}
+
+// Split `name[:weight];name[:weight];…` into the array the two scans
+// multiply by. The bytes are a KV value a human typed, so every reading
+// below is a decision rather than an accident:
+//
+//   - the split is on the LAST colon, so a corpus somebody already
+//     created with a colon in its name degrades to the default weight
+//     instead of silently becoming a different corpus;
+//   - a weight strtof cannot read at all (`archwiki:abc`) is a weight
+//     that was not written, never one written as zero — the two
+//     readings are opposite and only one of them is recoverable — and
+//     since it cannot have been a weight, the colon stays part of the
+//     name, which is what the rule above protects. Nothing at all after
+//     the colon (`archwiki:`) is the one exception: no name ends in a
+//     colon, so that is a weight somebody meant to type;
+//   - anything outside [0, KNOWLEDGE_CORPUS_WEIGHT_MAX] clamps, and the
+//     test is written so that a NaN lands on 0.0 rather than propagating
+//     into every score the corpus produces.
+size_t
+knowledge_parse_corpus_list(const char *list,
+    knowledge_corpus_weight_t *out, size_t out_cap)
+{
+  char    copy[512];
+  char   *saveptr;
+  size_t  n;
+
+  strlcpy(copy, list != NULL ? list : "", sizeof(copy));
+
+  saveptr = NULL;
+  n = 0;
+
+  for(char *tok = strtok_r(copy, ";", &saveptr);
+      tok != NULL && n < out_cap;
+      tok = strtok_r(NULL, ";", &saveptr))
+  {
+    float  weight = KNOWLEDGE_CORPUS_WEIGHT_DEF;
+    char  *colon  = strrchr(tok, ':');
+    char  *name;
+
+    if(colon != NULL)
+    {
+      char  *end = NULL;
+      float  v   = strtof(colon + 1, &end);
+
+      if(end != colon + 1)
+      {
+        weight = !(v >= 0.0f) ? 0.0f
+            : (v > KNOWLEDGE_CORPUS_WEIGHT_MAX
+                ? KNOWLEDGE_CORPUS_WEIGHT_MAX : v);
+        *colon = '\0';
+      }
+
+      // strtof consumed nothing and left only whitespace behind it: an
+      // omitted weight rather than a name, so the colon goes.
+      else if(*knowledge_trim(colon + 1) == '\0')
+        *colon = '\0';
+    }
+
+    name = knowledge_trim(tok);
+
+    if(name[0] == '\0')
+      continue;
+
+    // A name that does not fit the field is dropped rather than
+    // truncated: no corpus can be longer than the column, so the
+    // truncation could only ever match the wrong one.
+    if(strlcpy(out[n].name, name, sizeof(out[n].name))
+        >= sizeof(out[n].name))
+      continue;
+
+    out[n].weight = weight;
+    n++;
+  }
+
+  return(n);
+}
+
+size_t
+knowledge_corpus_weight_compact(knowledge_corpus_weight_t *w, size_t n)
+{
+  size_t keep = 0;
+
+  for(size_t i = 0; i < n; i++)
+  {
+    if(w[i].weight <= 0.0f)
+      continue;
+
+    if(keep != i)
+      w[keep] = w[i];
+
+    keep++;
+  }
+
+  return(keep);
+}
+
+float
+knowledge_corpus_weight_of(const knowledge_corpus_weight_t *w, size_t n,
+    const char *name)
+{
+  for(size_t i = 0; i < n; i++)
+  {
+    if(strcmp(w[i].name, name) == 0)
+      return(w[i].weight);
+  }
+
+  return(KNOWLEDGE_CORPUS_WEIGHT_DEF);
+}
 
 // Keep the top-K (highest score) in a descending-sorted array.
 void
