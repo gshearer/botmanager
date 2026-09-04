@@ -292,6 +292,7 @@ atk_bot_situation(const char *botname, const char *method_name,
   char            ails[ATK_TALLY_SZ];
   size_t          n_others = 0;
   size_t          n_ails   = 0;
+  size_t          pos;
   uint32_t        shown;
   uint32_t        n_marks;
   uint32_t        self     = ATK_MAX_PLAYERS;
@@ -403,7 +404,7 @@ atk_bot_situation(const char *botname, const char *method_name,
   // instruction on how to fight: the turn is taken for it by the task
   // above, and a persona that starts typing !attack into a room is a
   // regression, not a feature.
-  return((size_t)snprintf(out, out_sz,
+  snprintf(out, out_sz,
       "You are in a fight in %s right now (wave %d). You are a %s"
       " on %d of %d hitpoints%s%s, you have dealt %d and taken %d,"
       " and still standing against you: %s.",
@@ -412,7 +413,34 @@ atk_bot_situation(const char *botname, const char *method_name,
       (ails[0] != '\0') ? ", suffering " : "",
       (ails[0] != '\0') ? ails : "",
       rows[self].dmg_given, rows[self].dmg_taken,
-      (others[0] != '\0') ? others : "nobody"));
+      (others[0] != '\0') ? others : "nobody");
+
+  // Ask the BUFFER how much of that landed, never snprintf: it reports
+  // what it WANTED to write, and past a truncated sentence the chatter
+  // would be spliced beyond its own NUL where nothing ever reads it.
+  // The same discipline bot_situation_collect applies to this function.
+  pos = strnlen(out, out_sz);
+
+  // Then what the room has actually SEEN happen, so a combatant can
+  // trade banter about the fight instead of only reciting its own sheet
+  // (board #90). It comes after the standing sentence on purpose: that
+  // sentence is what is true, this is only what was said about it, and
+  // a buffer that runs short should shed the chatter first.
+  //
+  // The newline goes down first and is taken back if the pit has
+  // nothing to say, so a quiet round is not one dangling separator.
+  if(pos + 1 < out_sz)
+  {
+    out[pos] = '\n';
+
+    if(atk_chatter_recent(card.id, out + pos + 1, out_sz - pos - 1) == 0)
+      out[pos] = '\0';
+
+    else
+      pos = strnlen(out, out_sz);
+  }
+
+  return(pos);
 }
 
 void

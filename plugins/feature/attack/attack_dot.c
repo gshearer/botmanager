@@ -205,6 +205,11 @@ atk_dot_service(const atk_dot_due_t *d, const atk_tunables_t *t)
         dmg, new_hp, victim.hp_max, d->kind, d->noun,
         spoken ? &move : NULL);
 
+  // The decay task narrates into the same record the turn path does: a
+  // wound that ticked between two lines is exactly the kind of thing a
+  // combatant is asked about (board #90).
+  atk_chatter_note(d->round_id, line);
+
   pthread_mutex_unlock(&atk_turn_lock);
 
   atk_dot_speak(d, t, inst, line, fatal);

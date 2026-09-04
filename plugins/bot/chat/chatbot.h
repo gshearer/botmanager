@@ -274,7 +274,15 @@ struct chatbot_base_s
 // this is the state of a game in progress, not a record of it, and it
 // competes with the facts, the corpus and the conversation for the same
 // budget. One brawl's roster renders comfortably inside 512 bytes.
-#define CHATBOT_SITUATION_SZ  1024
+//
+// Raised from 1024 for board #90, which gave the duelling pit a second
+// thing to say: after its standing sentence it hands over the handful
+// of narration lines the room has just seen, so a combatant can banter
+// about the fight rather than only recite its own sheet. Eight lines of
+// pit chatter is ~1.1 KiB on top of a ~250-byte sentence. A provider
+// that overruns this is TRUNCATED, never refused -- so a provider puts
+// what is true first and what is merely colour last.
+#define CHATBOT_SITUATION_SZ  2048
 
 // Personality record (in-memory copy of a personalities table row).
 //

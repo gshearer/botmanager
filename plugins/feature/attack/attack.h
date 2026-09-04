@@ -152,6 +152,25 @@
 // that atk_fmt_num never touches (start_hp clamps at 100000), and slack.
 #define ATK_TALLY_SZ       (ATK_NICK_SZ + 48)
 
+// ---- The pit's own chatter ---------------------------------------- //
+//
+// A narration line as the SITUATION block hands it to a mind: colour
+// markers stripped, because a model handed one reproduces the code
+// letter without the \x01 behind it (attack_cmds.c has the scar --
+// "Pclaude_test", the purple marker's P welded onto a nickname).
+// Stripping is never expansion, so a line that fitted ATK_LINE_SZ fits
+// here; the bound is what an IRC line could carry in the first place.
+#define ATK_CHATTER_LINE_SZ 400
+// The ring is global, not per-round: rounds are few and short-lived, and
+// a fixed table costs one mutex and no lifecycle. Entries carry their
+// round id and a stale round's simply age out -- which is why there is
+// no forget() and nothing to call at --end.
+#define ATK_CHATTER_MAX     48
+// How many of a round's most recent lines a combatant is shown. The
+// whole round would drown the sentence that matters (its own standing),
+// and CHATBOT_SITUATION_SZ has to hold both.
+#define ATK_CHATTER_SHOW    8
+
 // One un-expanded move, as a character sheet writes it. The arithmetic
 // that fixes this number, and that ATK_LINE_SZ above is sized from:
 //
@@ -1146,6 +1165,30 @@ void atk_dot_stop(void);
 // but the stored callback pointer is ours and dies with the mapping.
 void atk_bot_kv_register(void);
 void atk_bot_kv_unregister(void);
+
+// ---- The pit's own chatter ---------------------------------------- //
+//
+// What the room SAW happen, kept only so a combatant can banter about
+// it. The pit answers over cmd_reply() and the decay task over
+// method_send(), neither of which comes back past the bot, so a
+// combatant that had just been hit could describe its hitpoints and
+// nothing that produced them (board #90).
+//
+// Nothing here is persisted and nothing reaches a mind's memory or its
+// retrieval corpus: a blow-by-blow drowns both, which is the standing
+// ruling this ring must not be read as bending. It is pulled at prompt
+// time and it dies with the mapping.
+
+// Record one narration line against a round. `line` may carry colour
+// markers; the ring stores it stripped. Safe to call under
+// atk_turn_lock -- the ring takes only its own lock and calls nothing.
+void atk_chatter_note(int64_t round_id, const char *line);
+
+// The round's most recent lines, oldest first, one per line, each
+// already tagged. Writes nothing and returns 0 when the round has said
+// nothing yet. Never splits a line: a line that will not fit whole is
+// dropped along with every OLDER one, so the newest always survive.
+size_t atk_chatter_recent(int64_t round_id, char *out, size_t out_sz);
 
 // The pull seam a mind uses to find out it is in a fight (include/bot.h
 // §Situational providers). Registered beside the KV contributor and

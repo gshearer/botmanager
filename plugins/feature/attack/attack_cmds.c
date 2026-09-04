@@ -301,9 +301,11 @@ atk_sweep_turn(const cmd_ctx_t *ctx, const atk_round_t *round,
   // on an ordinary blow.
   atk_render_blow(line, sizeof(line), src_nick, tgt_nick, tier, move, dmg,
       bonus, victim[aimed].hp_left, victim[aimed].hp_max, NULL, 0);
+  atk_chatter_note(round->id, line);
   cmd_reply(ctx, line);
 
   atk_render_sweep(line, sizeof(line), tier, dmg, victim, n);
+  atk_chatter_note(round->id, line);
   cmd_reply(ctx, line);
 
   // EVERY death line goes out here, before the caller ejects anybody —
@@ -319,6 +321,7 @@ atk_sweep_turn(const cmd_ctx_t *ctx, const atk_round_t *round,
 
       atk_render_death(line, sizeof(line), src_nick, victim[i].nick,
           own ? &last : NULL);
+      atk_chatter_note(round->id, line);
       cmd_reply(ctx, line);
     }
 
@@ -379,6 +382,27 @@ atk_voice_turn(const char *src_bot, bool fatal)
 {
   return(src_bot[0] != '\0' && !fatal &&
       kv_get_bot_uint(src_bot, ATK_BKV_IN_VOICE) != 0);
+}
+
+// What the ROOM hears, handed to the pit's own record of the fight so a
+// combatant can be asked about it later in the round (board #90). On a
+// voiced turn the tally is split off for the mind's benefit (board #85)
+// and rejoins the line on the wire, so it must rejoin it here too --
+// otherwise the pit's account is the one line missing the number every
+// other line carries.
+static void
+atk_chatter_turn(int64_t round_id, const char *line, const char *tally)
+{
+  char whole[ATK_LINE_SZ + ATK_TALLY_SZ];
+
+  if(tally == NULL || tally[0] == '\0')
+  {
+    atk_chatter_note(round_id, line);
+    return;
+  }
+
+  snprintf(whole, sizeof(whole), "%s %s", line, tally);
+  atk_chatter_note(round_id, whole);
 }
 
 // The line, once the turn lock is gone. A false return from the mind
@@ -774,6 +798,7 @@ atk_cmd_attack(const cmd_ctx_t *ctx)
     {
       atk_render_dot_inflict(line, sizeof(line), src_nick, nick,
           wound.kind, wound.noun, spoken ? &move : NULL, bonus);
+      atk_chatter_note(round.id, line);
 
       // An affliction is a turn like any other and a bot's is told the
       // same way — otherwise its voice would come and go with a die
@@ -920,6 +945,8 @@ atk_cmd_attack(const cmd_ctx_t *ctx)
         spoken ? &move : NULL, dmg, bonus, new_hp, tgt.hp_max,
         voiced ? tally : NULL, sizeof(tally));
 
+  atk_chatter_turn(round.id, line, tally);
+
   // A bot's own turn is retold by its persona rather than by the sheet
   // the pit dealt it: the sheet decides what it can DO, and the
   // personality file decides how it sounds (operator ruling, FR#83).
@@ -956,6 +983,7 @@ atk_cmd_attack(const cmd_ctx_t *ctx)
         == SUCCESS);
 
     atk_render_death(line, sizeof(line), src_nick, nick, own ? &last : NULL);
+    atk_chatter_note(round.id, line);
     cmd_reply(ctx, line);
   }
 
@@ -1248,6 +1276,7 @@ atk_cmd_heal(const cmd_ctx_t *ctx)
   // narration.
   atk_render_heal(line, sizeof(line), src_nick, nick,
       spoken ? &move : NULL, delta, bonus, tgt.hp + delta, tgt.hp_max);
+  atk_chatter_note(round.id, line);
   cmd_reply(ctx, line);
 
   pthread_mutex_unlock(&atk_turn_lock);
@@ -1384,6 +1413,7 @@ atk_cmd_defer(const cmd_ctx_t *ctx)
   // Announced under the lock, so two turns cannot interleave their
   // narration.
   atk_render_defer(line, sizeof(line), src_nick, next);
+  atk_chatter_note(round.id, line);
   cmd_reply(ctx, line);
 
   pthread_mutex_unlock(&atk_turn_lock);

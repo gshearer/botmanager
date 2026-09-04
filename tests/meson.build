@@ -335,6 +335,19 @@ test_bot_situation = executable('test_bot_situation',
   dependencies : core_deps,
 )
 
+# The pit's chatter ring, compiled straight in: it is plugin-internal and
+# its arithmetic slices bytes into a prompt buffer, which is the one way
+# it can be wrong without anybody noticing. libcore is here for
+# color_translate and nothing else.
+test_attack_chatter = executable('test_attack_chatter',
+  'test_attack_chatter.c',
+  '../plugins/feature/attack/attack_chatter.c',
+  include_directories : [include_directories('.'), inc_include,
+                         include_directories('../plugins/feature/attack')],
+  link_with : [test_harness, libcore],
+  dependencies : core_deps,
+)
+
 test_kv_reclaim = executable('test_kv_reclaim',
   'test_kv_reclaim.c',
   include_directories : [include_directories('.'), inc_include],
@@ -594,6 +607,7 @@ test('kv_str', test_kv_str)
 test('kv_default', test_kv_default)
 test('kv_reset', test_kv_reset)
 test('bot_situation', test_bot_situation)
+test('attack_chatter', test_attack_chatter)
 test('kv_reclaim', test_kv_reclaim)
 test('curl_submit_wait', test_curl_submit_wait)
 test('curl_flight', test_curl_flight)
