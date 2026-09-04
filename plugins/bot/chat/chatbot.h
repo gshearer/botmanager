@@ -671,11 +671,26 @@ bool chatbot_interests_parse(const char *json,
 bool chatbot_cmds_register(void);
 void chatbot_cmds_unregister(void);
 
+// What an interest-registration pass did. Only the operator-facing
+// caller -- /bot <name> refresh_prompts -- acts on this; the two
+// hot-path callers ignore it. Every non-zero value means the bot came
+// out of the pass carrying no topics, and each names a different thing
+// for the operator to go and fix, so a two-state test of this loses
+// which one, never whether.
+typedef enum
+{
+  CHATBOT_INTERESTS_REGISTERED = 0, // parsed and handed to the engine
+  CHATBOT_INTERESTS_NONE,           // the personality declares none
+  CHATBOT_INTERESTS_UNPARSED,       // a block was declared, nothing came out
+  CHATBOT_INTERESTS_NO_CORPUS,      // no acquired_corpus -- nowhere to put them
+  CHATBOT_INTERESTS_FAILED,         // unreadable persona, or the engine refused
+} chatbot_interests_rc_t;
+
 // Re-register the active personality's reactive-topic cache with the
 // acquisition engine. Defined in chatbot.c. Called from /bot <name>
 // refresh_prompts (commands.c) after clearing st->registered_persona
 // so the gate inside reliably re-runs chatbot_register_interests.
-void chatbot_ensure_interests(chatbot_state_t *st);
+chatbot_interests_rc_t chatbot_ensure_interests(chatbot_state_t *st);
 
 // Register the /bot <name> dossiersweep verb (llm-kind filtered). Called
 // from chatbot_cmds_register(). Implemented in dossier_cmd.c. Dossier

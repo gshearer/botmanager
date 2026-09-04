@@ -1520,47 +1520,50 @@ chatbot_destroy(void *handle)
   mem_free(st);
 }
 
-static void chatbot_register_interests(chatbot_state_t *st);
+static chatbot_interests_rc_t chatbot_register_interests(chatbot_state_t *st);
 
 // Idempotent registration gate. Called from chatbot_start (eager),
 // chatbot_observe (lazy retry), and commands.c's /bot <name>
 // refresh_prompts path (explicit operator-driven re-sync). Compares
 // the currently active personality name against the one reflected in
-// the cached topic list; if they match, returns without work.
-// Otherwise runs the registration pass and updates the snapshot on
-// success. Failure is silent on the hot path — the WARN inside
-// chatbot_register_interests is the single source of truth for the
-// operator.
-void
+// the cached topic list; if they match, the cache is already current
+// and the pass is skipped. The WARN inside chatbot_register_interests
+// remains the detail for the log; the returned outcome is the summary
+// for whoever asked.
+chatbot_interests_rc_t
 chatbot_ensure_interests(chatbot_state_t *st)
 {
+  chatbot_interests_rc_t rc;
   char active[CHATBOT_PERSONALITY_NAME_SZ];
   char registered[CHATBOT_PERSONALITY_NAME_SZ];
 
-  if(st == NULL) return;
+  if(st == NULL) return(CHATBOT_INTERESTS_FAILED);
 
   pthread_rwlock_rdlock(&st->lock);
-  snprintf(active,     sizeof(active),     "%s", st->active_name);
-  snprintf(registered, sizeof(registered), "%s", st->registered_persona);
+  strlcpy(active,     st->active_name,        sizeof(active));
+  strlcpy(registered, st->registered_persona, sizeof(registered));
   pthread_rwlock_unlock(&st->lock);
 
   if(active[0] == '\0')
-    return;
+    return(CHATBOT_INTERESTS_NONE);
 
+  // Cache already reflects this persona — a skipped pass is a
+  // registered one, and n_topics is what it registered.
   if(strcmp(active, registered) == 0)
-    return;
+    return(CHATBOT_INTERESTS_REGISTERED);
 
-  chatbot_register_interests(st);
+  rc = chatbot_register_interests(st);
 
   // Re-check under the wrlock: if active_name changed again while the
   // worker ran, leave registered_persona empty so the next call re-runs.
   pthread_rwlock_wrlock(&st->lock);
   if(strcmp(st->active_name, active) == 0 && st->n_topics > 0)
-    snprintf(st->registered_persona,
-        sizeof(st->registered_persona), "%s", active);
+    strlcpy(st->registered_persona, active, sizeof(st->registered_persona));
   else
     st->registered_persona[0] = '\0';
   pthread_rwlock_unlock(&st->lock);
+
+  return(rc);
 }
 
 // Register the bot's interests (if any) with the acquisition engine.
@@ -1568,12 +1571,14 @@ chatbot_ensure_interests(chatbot_state_t *st)
 // and hands them to acquire_register_topics. No-op when the bot lacks
 // an acquired_corpus KV or an active personality. All per-bot side
 // effects are best-effort: a missing corpus, parse failure, etc. logs
-// a WARN and the bot otherwise starts normally.
-static void
+// a WARN and the bot otherwise starts normally — the returned outcome
+// says which of those happened without anyone having to read the log.
+static chatbot_interests_rc_t
 chatbot_register_interests(chatbot_state_t *st)
 {
   const char *botname = bot_inst_name(st->inst);
   acquire_topic_t topics[CHATBOT_TOPIC_CACHE_MAX];
+  chatbot_interests_rc_t rc;
   size_t n;
   chatbot_personality_t p;
   char persona[CHATBOT_PERSONALITY_NAME_SZ];
@@ -1582,7 +1587,7 @@ chatbot_register_interests(chatbot_state_t *st)
   corpus = kv_get_bot_str(botname, "acquired_corpus");
 
   if(corpus == NULL || corpus[0] == '\0')
-    return;
+    return(CHATBOT_INTERESTS_NO_CORPUS);
 
   // Grab the active personality name under the rwlock so we don't race
   // personality switches (KV writes to bot.<name>.behavior.personality). A bot
@@ -1591,7 +1596,7 @@ chatbot_register_interests(chatbot_state_t *st)
   // callback, which re-runs registration at that point.
 
   pthread_rwlock_rdlock(&st->lock);
-  snprintf(persona, sizeof(persona), "%s", st->active_name);
+  strlcpy(persona, st->active_name, sizeof(persona));
   pthread_rwlock_unlock(&st->lock);
 
   if(persona[0] == '\0')
@@ -1600,7 +1605,7 @@ chatbot_register_interests(chatbot_state_t *st)
         "bot='%s' has acquired_corpus='%s' but no active personality;"
         " skipping interest registration",
         botname, corpus);
-    return;
+    return(CHATBOT_INTERESTS_NONE);
   }
 
   if(chatbot_personality_read(persona, &p) != SUCCESS)
@@ -1608,7 +1613,7 @@ chatbot_register_interests(chatbot_state_t *st)
     clam(CLAM_WARN, "chatbot",
         "bot='%s' personality='%s' not readable; skipping interests",
         botname, persona);
-    return;
+    return(CHATBOT_INTERESTS_FAILED);
   }
 
   // Upsert the destination corpus so the engine can write into it
@@ -1625,44 +1630,56 @@ chatbot_register_interests(chatbot_state_t *st)
       sizeof(topics) / sizeof(topics[0]), &n) == SUCCESS && n > 0)
   {
     if(acquire_register_topics(botname, topics, n, corpus) == SUCCESS)
+    {
+      rc = CHATBOT_INTERESTS_REGISTERED;
       clam(CLAM_INFO, "chatbot",
           "bot='%s' registered %zu acquisition topic(s) from "
           "personality='%s' into corpus='%s'",
           botname, n, persona, corpus);
+    }
+
     else
+    {
+      rc = CHATBOT_INTERESTS_FAILED;
       clam(CLAM_WARN, "chatbot",
           "bot='%s' acquire_register_topics failed", botname);
+    }
 
     // Cache the parsed topics on the bot state so the reactive scanner
     // on the on_message hot path can match keywords without re-parsing
-    // the personality JSON on every inbound line.
+    // the personality JSON on every inbound line. The cache is worth
+    // keeping even when the engine refused them — the scanner is ours.
     pthread_rwlock_wrlock(&st->lock);
-    if(n > CHATBOT_TOPIC_CACHE_MAX) n = CHATBOT_TOPIC_CACHE_MAX;
     memcpy(st->topics, topics, n * sizeof(topics[0]));
     st->n_topics = n;
     pthread_rwlock_unlock(&st->lock);
   }
 
-  else if(n == 0 && p.interests_json != NULL && p.interests_json[0] != '\0')
-  {
-    clam(CLAM_WARN, "chatbot",
-        "bot='%s' personality='%s' declared interests but zero parsed;"
-        " check interests_json content",
-        botname, persona);
-
-    pthread_rwlock_wrlock(&st->lock);
-    st->n_topics = 0;
-    pthread_rwlock_unlock(&st->lock);
-  }
-
   else
   {
+    // A declared block that yields nothing is the interesting case: a
+    // trailing comma reads exactly like a personality with no interests
+    // unless somebody says so out loud.
+    if(p.interests_json != NULL && p.interests_json[0] != '\0')
+    {
+      rc = CHATBOT_INTERESTS_UNPARSED;
+      clam(CLAM_WARN, "chatbot",
+          "bot='%s' personality='%s' declared interests but zero parsed;"
+          " check interests_json content",
+          botname, persona);
+    }
+
+    else
+      rc = CHATBOT_INTERESTS_NONE;
+
     pthread_rwlock_wrlock(&st->lock);
     st->n_topics = 0;
     pthread_rwlock_unlock(&st->lock);
   }
 
   chatbot_personality_free(&p);
+
+  return(rc);
 }
 
 static bool

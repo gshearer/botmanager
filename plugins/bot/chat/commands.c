@@ -113,11 +113,18 @@ cmd_bot_hush(const cmd_ctx_t *ctx)
 //   - st->topics[] / st->registered_persona so the reactive-topic cache
 //     is re-parsed from the personality's `interests:` frontmatter --
 //     useful after editing that block without renaming the persona.
+//
+// The interests half is the half that goes wrong, and it goes wrong
+// quietly: a trailing comma in the JSON block yields zero topics, one
+// WARN in a log nobody has open, and an otherwise cheerful reply. So the
+// re-sync reports what it parsed on a line of its own.
 static void
 cmd_bot_refresh_prompts(const cmd_ctx_t *ctx)
 {
   chatbot_state_t *st = bot_get_handle(ctx->bot);
+  chatbot_interests_rc_t rc;
   char buf[256];
+  size_t n_topics = 0;
   const char *contract;
   const char *persona;
   const char *botname;
@@ -152,13 +159,46 @@ cmd_bot_refresh_prompts(const cmd_ctx_t *ctx)
   st->registered_persona[0] = '\0';
   pthread_rwlock_unlock(&st->lock);
 
-  chatbot_ensure_interests(st);
+  rc = chatbot_ensure_interests(st);
 
   snprintf(buf, sizeof(buf),
       "refreshed '%s': personality='%s' contract='%s'",
       botname,
       persona[0]  ? persona  : "(none)",
       contract[0] ? contract : "(none)");
+  cmd_reply(ctx, buf);
+
+  switch(rc)
+  {
+    case CHATBOT_INTERESTS_REGISTERED:
+      pthread_rwlock_rdlock(&st->lock);
+      n_topics = st->n_topics;
+      pthread_rwlock_unlock(&st->lock);
+
+      snprintf(buf, sizeof(buf), "  interests: %zu topic%s registered",
+          n_topics, n_topics == 1 ? "" : "s");
+      break;
+
+    case CHATBOT_INTERESTS_UNPARSED:
+      strlcpy(buf, "  interests: DECLARED BUT NONE PARSED"
+          " — check the JSON block", sizeof(buf));
+      break;
+
+    case CHATBOT_INTERESTS_NO_CORPUS:
+      strlcpy(buf, "  interests: bot has no acquired_corpus"
+          " — nothing registered", sizeof(buf));
+      break;
+
+    case CHATBOT_INTERESTS_FAILED:
+      strlcpy(buf, "  interests: registration FAILED — see log",
+          sizeof(buf));
+      break;
+
+    case CHATBOT_INTERESTS_NONE:
+      strlcpy(buf, "  interests: none declared", sizeof(buf));
+      break;
+  }
+
   cmd_reply(ctx, buf);
 }
 
