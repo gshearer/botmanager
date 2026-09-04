@@ -19,7 +19,7 @@
 static const plugin_kv_entry_t fr_kv_schema[] = {
   { FR_KV_TABLE,     KV_STR,    "feature_requests",
     "Postgres table name for the request board (bare SQL identifier)" },
-  { FR_KV_MAX_DESC,  KV_UINT32, "200",
+  { FR_KV_MAX_DESC,  KV_UINT32, "250",
     "Longest description a request may carry, in characters" },
   { FR_KV_LIST_ROWS, KV_UINT32, "20",
     "Rows one `show feature` draws (0 = the default; 100 is the ceiling)" },
