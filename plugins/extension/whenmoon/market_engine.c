@@ -666,8 +666,8 @@ wm_market_stats_profit_factor(const wm_market_stats_t *st)
 // Caller MUST hold mk->lock.
 void
 wm_market_apply_fill_locked(whenmoon_market_t *mk, wm_market_mode_t mode,
-    char side, double qty, double exec_px, double fee, int64_t ts_ms,
-    const char *reason)
+    char side, double qty, double exec_px, double fee, double slippage,
+    int64_t ts_ms, const char *reason)
 {
   wm_market_session_t *s;
   wm_market_stats_t   *st;
@@ -813,7 +813,7 @@ wm_market_apply_fill_locked(whenmoon_market_t *mk, wm_market_mode_t mode,
   slot->qty            = qty;
   slot->price          = exec_px;
   slot->fee            = fee;
-  slot->slippage       = 0.0;        // synth slip is the caller's job
+  slot->slippage       = slippage;
   slot->realized_pnl   = realized;
   slot->cash_after     = st->cash;
   slot->position_after = position_after;
@@ -1343,8 +1343,8 @@ wm_market_engine_on_signal_with_mk(whenmoon_market_t *mk, double mark_px,
 
   wm_market_apply_fill_locked(mk, mode,
       (advice == WM_MK_ADVICE_BUY) ? 'b' : 's',
-      qty, fill_px, fee, sig->ts_ms != 0 ? sig->ts_ms : mark_ms,
-      sig->reason);
+      qty, fill_px, fee, qty * slip,
+      sig->ts_ms != 0 ? sig->ts_ms : mark_ms, sig->reason);
 
   (void)wm_market_persist_locked(mk);
 
@@ -1410,8 +1410,11 @@ wm_market_engine_record_external_fill(const char *market_id_str,
     }
   }
 
+  // Slippage 0: the venue priced this fill and we synthesized nothing.
+  // What a real order gave up against its own limit is a different
+  // quantity and is not this field's.
   wm_market_apply_fill_locked(mk, WM_MARKET_MODE_REAL, side, qty, exec_px,
-      fee, ts_ms, reason);
+      fee, 0.0, ts_ms, reason);
 
   (void)wm_market_persist_locked(mk);
 
@@ -1563,8 +1566,8 @@ wm_market_engine_force_trade_locked(whenmoon_market_t *mk, char side,
 
   fills_pre = mk->session.stats[mode].lifetime_fills_count;
 
-  wm_market_apply_fill_locked(mk, mode, side, qty, exec_px, fee, ts_ms,
-      reason != NULL ? reason : "force-operator");
+  wm_market_apply_fill_locked(mk, mode, side, qty, exec_px, fee,
+      qty * slip, ts_ms, reason != NULL ? reason : "force-operator");
 
   fills_post = mk->session.stats[mode].lifetime_fills_count;
 

@@ -53,10 +53,17 @@ double wm_market_stats_profit_factor(const wm_market_stats_t *st);
 // oversell beyond open long qty) drop a CLAM_WARN and no-op — short
 // support is a future chunk.
 //
+// `slippage` is the synth slip already priced into `exec_px`, as a
+// quote-currency total (per-unit slip x qty) and positive on both sides
+// — a buy pays it, a sell forgoes it. Recorded, never charged: the cash
+// ledger moves on `exec_px`, which carries it. Only a caller can supply
+// it, having seen the unslipped mark; pass 0.0 where nothing was
+// synthesized, real fills above all.
+//
 // `reason` may be NULL; copied into the fill ring slot's reason field.
 void wm_market_apply_fill_locked(whenmoon_market_t *mk,
     wm_market_mode_t mode, char side, double qty, double exec_px,
-    double fee, int64_t ts_ms, const char *reason);
+    double fee, double slippage, int64_t ts_ms, const char *reason);
 
 // Set the market mode. Returns SUCCESS on a valid value AND a flat
 // position; FAIL otherwise (`errbuf` filled, may be NULL).

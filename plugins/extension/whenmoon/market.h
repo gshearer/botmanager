@@ -144,7 +144,8 @@ typedef struct
   double   qty;
   double   price;
   double   fee;
-  double   slippage;
+  double   slippage;         // synth slip already inside `price`, as a
+                             // quote total; 0 on a real (venue) fill
   double   realized_pnl;
   double   cash_after;
   double   position_after;   // signed
