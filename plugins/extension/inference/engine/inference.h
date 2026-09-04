@@ -430,6 +430,8 @@ typedef void (*knowledge_retrieve_cb_t)(const knowledge_chunk_t *chunks,
 #define ACQUIRE_TOPIC_CATEGORY_SZ  16   // SearXNG category wire name
 #define ACQUIRE_KEYWORD_SZ         64
 #define ACQUIRE_KEYWORDS_MAX       16
+#define ACQUIRE_INTERESTED_MAX     8
+#define ACQUIRE_NICK_SZ            32
 #define ACQUIRE_BOT_NAME_SZ        64
 #define ACQUIRE_CORPUS_NAME_SZ     64
 #define ACQUIRE_DIGEST_SUMMARY_SZ  1200
@@ -487,6 +489,15 @@ typedef struct
 
   char            keywords[ACQUIRE_KEYWORDS_MAX][ACQUIRE_KEYWORD_SZ];
   size_t          n_keywords;
+
+  // Nicks who care about this topic, from the personality's `for:`
+  // list. ⛔ The acquisition engine never reads this and must not
+  // start — it is here rather than in a chat-side table because
+  // chatbot_state_t.topics[] already *is* an acquire_topic_t[], and a
+  // parallel array indexed by position is a bug farm. Verbatim as
+  // written; nick comparison is case-insensitive at the point of use.
+  char            interested[ACQUIRE_INTERESTED_MAX][ACQUIRE_NICK_SZ];
+  size_t          n_interested;
 
   // The proactive search string. Always a copy of `name` — it is a
   // separate, wider field because a query may outgrow a topic label,

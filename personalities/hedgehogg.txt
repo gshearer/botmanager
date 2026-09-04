@@ -21,6 +21,7 @@ interests:
      "category": "news"},
     {"topic": "cryptocurrency",
      "aka": ["crypto", "bitcoin", "ethereum", "solana"],
+     "for": ["doc"],
      "attention": "normal",
      "category": "news",
      "watch": [{"url": "https://www.coindesk.com/latest-crypto-news",

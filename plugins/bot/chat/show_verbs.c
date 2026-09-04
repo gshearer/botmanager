@@ -760,17 +760,34 @@ verb_llm_interests(const cmd_ctx_t *ctx, bot_inst_t *bot, const char *rest)
 
   for(size_t i = 0; i < n; i++)
   {
+    char care[ACQUIRE_INTERESTED_MAX * (ACQUIRE_NICK_SZ + 1) + 8] = {0};
+
+    // `for=` only appears on a topic that declares one — most do not,
+    // and an empty column on every row would cost width the two
+    // timestamps already spent.
+    if(topics[i].n_interested > 0)
+    {
+      size_t w = (size_t)snprintf(care, sizeof(care), "  for=");
+
+      for(size_t k = 0; k < topics[i].n_interested && w < sizeof(care); k++)
+        w += (size_t)snprintf(care + w, sizeof(care) - w, "%s%.*s",
+            k > 0 ? "," : "",
+            (int)sizeof(topics[i].interested[k]) - 1,
+            topics[i].interested[k]);
+    }
+
     snprintf(line, sizeof(line),
         "  %-26.*s attention=%-3u names=%-2zu"
         "  q=%-4" PRIu64 " ing=%-4" PRIu64
-        "  proactive=%-12s reactive=%s",
+        "  proactive=%-12s reactive=%s%s",
         (int)sizeof(topics[i].name) - 1, topics[i].name,
         topics[i].proactive_weight,
         topics[i].n_keywords,
         stats[i].total_queries,
         stats[i].total_ingested,
         stats[i].last_proactive,
-        stats[i].last_reactive);
+        stats[i].last_reactive,
+        care);
     cmd_reply(ctx, line);
   }
 

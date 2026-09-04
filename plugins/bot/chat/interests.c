@@ -22,7 +22,7 @@
 // undocumented in the common example. Anything else is a typo, and a
 // typo that vanishes silently is the whole reason this list exists.
 static const char *const mp_known_keys[] = {
-  "topic", "aka", "attention", "watch",
+  "topic", "aka", "for", "attention", "watch",
   "category", "encyclopedic", "max_sources",
 };
 
@@ -214,13 +214,15 @@ mp_feed_from_json(struct json_object *item,
   return(true);
 }
 
-// Append a JSON array of strings to the keyword slots, skipping
-// non-string and empty entries. Returns the number of entries that did
+// Append a JSON array of strings to a fixed-width slot table, skipping
+// non-string and empty entries. `slots` is the whole table so the
+// arithmetic below stays inside one object; `aka` and `for` differ only
+// in slot width and capacity. Returns the number of entries that did
 // not fit — the caller names the topic in the warning, this does not
 // know it.
 static size_t
-mp_append_keywords(struct json_object *arr,
-    char (*dest)[ACQUIRE_KEYWORD_SZ], size_t *n, size_t cap)
+mp_append_strings(struct json_object *arr, char *slots, size_t slot_sz,
+    size_t *n, size_t cap)
 {
   size_t len     = (size_t)json_object_array_length(arr);
   size_t dropped = 0;
@@ -244,7 +246,7 @@ mp_append_keywords(struct json_object *arr,
       continue;
     }
 
-    strlcpy(dest[*n], s, ACQUIRE_KEYWORD_SZ);
+    strlcpy(slots + (*n * slot_sz), s, slot_sz);
     (*n)++;
   }
 
@@ -257,6 +259,7 @@ mp_topic_from_obj(struct json_object *obj,
     acquire_topic_t *out, size_t idx)
 {
   struct json_object *aka;
+  struct json_object *care;
   struct json_object *watch;
   size_t dropped;
 
@@ -290,8 +293,8 @@ mp_topic_from_obj(struct json_object *obj,
 
   if(aka != NULL)
   {
-    dropped = mp_append_keywords(aka, out->keywords, &out->n_keywords,
-        ACQUIRE_KEYWORDS_MAX);
+    dropped = mp_append_strings(aka, (char *)out->keywords,
+        ACQUIRE_KEYWORD_SZ, &out->n_keywords, ACQUIRE_KEYWORDS_MAX);
 
     if(dropped > 0)
       clam(CLAM_WARN, "chatbot",
@@ -299,6 +302,25 @@ mp_topic_from_obj(struct json_object *obj,
           " %d-name limit — truncated",
           idx, out->name, dropped, dropped == 1 ? "y" : "ies",
           ACQUIRE_KEYWORDS_MAX);
+  }
+
+  // `for` — the nicks who care. Empty means address the room. It
+  // selects an addressee and is never a claim about anybody; see
+  // CHATBOT.md §The initiative rule for why it must never become a
+  // dossier fact.
+  care = json_get_array(obj, "for");
+
+  if(care != NULL)
+  {
+    dropped = mp_append_strings(care, (char *)out->interested,
+        ACQUIRE_NICK_SZ, &out->n_interested, ACQUIRE_INTERESTED_MAX);
+
+    if(dropped > 0)
+      clam(CLAM_WARN, "chatbot",
+          "interests[%zu] (topic='%s'): %zu 'for' nick%s past the"
+          " %d-name limit — truncated",
+          idx, out->name, dropped, dropped == 1 ? "" : "s",
+          ACQUIRE_INTERESTED_MAX);
   }
 
   // `watch` — feed URLs polled on their own cadence, independent of
@@ -344,7 +366,7 @@ mp_topic_from_obj(struct json_object *obj,
 }
 
 // Each array element is a JSON object with `topic` (required) and
-// optional `aka`, `attention`, `watch`, plus the advanced
+// optional `aka`, `for`, `attention`, `watch`, plus the advanced
 // `category`, `encyclopedic` and `max_sources`.
 //
 // Validation is per-topic: malformed entries log WARN and skip; well-formed
@@ -401,9 +423,9 @@ chatbot_interests_parse(const char *json,
     {
       clam(CLAM_DEBUG2, "chatbot",
           "interests[%zu] parsed: topic='%s' attention=%u"
-          " names=%zu watch=%zu",
+          " names=%zu for=%zu watch=%zu",
           i, out[n].name, out[n].proactive_weight,
-          out[n].n_keywords, out[n].n_feeds);
+          out[n].n_keywords, out[n].n_interested, out[n].n_feeds);
       n++;
     }
   }
