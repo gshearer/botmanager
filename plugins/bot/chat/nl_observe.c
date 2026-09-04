@@ -43,6 +43,9 @@ typedef struct
   // instance can be reloaded away meanwhile (method.h §method_msg_t).
   char            inst_name[METHOD_NAME_SZ];
   bot_inst_t     *bot;
+  // Read after the dossier resolves, which is the earliest point there
+  // is anything to ask the question of.
+  nl_observe_policy_t policy;
 } nl_observe_task_data_t;
 
 typedef bool (*geocode_city_fn_t)(const char *, char *, size_t);
@@ -135,6 +138,28 @@ canonicalize_location(const char *in, char *out, size_t out_sz)
 
   while(j > 0 && out[j - 1] == '_') j--;
   out[j] = '\0';
+}
+
+// The SOUL-WX-LADDER, asked as a yes/no: does this dossier already
+// carry a place on any rung? Two round trips rather than one because
+// `memory_get_dossier_fact_by_key` answers for an exact key and one
+// family at a time, and the ladder is three keys in two shapes.
+//
+// ⚠ No source filter, deliberately — unlike the chore scans, which ask
+// whether the SUBJECT put a fact there. This asks only whether anything
+// is already known, and an admin-seeded home is exactly as much a
+// reason for a tool use to keep quiet as a stated one.
+static bool
+nl_observe_has_location(int64_t dossier_id)
+{
+  mem_dossier_fact_t f;
+
+  if(memory_get_dossier_fact_by_key(dossier_id, "postal_code",
+        "city_of_interest:", &f) == SUCCESS)
+    return(true);
+
+  return(memory_get_dossier_fact_by_key(dossier_id, "location",
+        "location:", &f) == SUCCESS);
 }
 
 static void
@@ -232,6 +257,16 @@ nl_observe_task(task_t *t)
     goto done;
   }
 
+  // First write wins on the command path: a tool use may furnish a
+  // dossier that knows nowhere, never revise one that does.
+  if(d->policy == NL_OBSERVE_IF_NO_LOCATION && nl_observe_has_location(did))
+  {
+    clam(CLAM_DEBUG, OBS_CTX,
+        "did=%lld already has a location; '%s' not noted",
+        (long long)did, d->user_label);
+    goto done;
+  }
+
   memset(&fact, 0, sizeof(fact));
   fact.dossier_id = did;
   fact.kind       = MEM_FACT_ATTRIBUTE;
@@ -264,7 +299,8 @@ done:
 void
 chatbot_nl_observe_location_slot(bot_inst_t *bot,
     const method_msg_t *msg, uint32_t ns_id,
-    const cmd_nl_t *nl, const char *args_post_subst)
+    const cmd_nl_t *nl, const char *args_post_subst,
+    nl_observe_policy_t policy)
 {
   // v1 observes only the single-slot CMD_NL_ARG_LOCATION case — the only
   // current consumer (/weather). Multi-slot tokenisation is a future
@@ -292,8 +328,9 @@ chatbot_nl_observe_location_slot(bot_inst_t *bot,
   d = mem_alloc(OBS_CTX, "task_data", sizeof(*d));
 
   memset(d, 0, sizeof(*d));
-  d->ns_id = ns_id;
-  d->bot   = bot;
+  d->ns_id  = ns_id;
+  d->bot    = bot;
+  d->policy = policy;
   strlcpy(d->inst_name, msg->inst_name, sizeof d->inst_name);
   snprintf(d->sender,      sizeof(d->sender),      "%s", msg->sender);
   snprintf(d->channel,     sizeof(d->channel),     "%s", msg->channel);

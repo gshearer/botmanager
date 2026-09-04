@@ -835,17 +835,36 @@ bool chatbot_nl_extract_cmd(const char *text,
 
 // ---- nl_observe.c ----
 
-// Post-dispatch observer for NL-bridged commands. Called from
-// reply_nl_bridge right after cmd_dispatch, this inspects the command's
-// declarative slot table and, for typed slots we care about
-// (CMD_NL_ARG_LOCATION today), schedules an async task that records
-// the appropriate chat-specific side effect (dossier fact upsert).
-// No reply is emitted; pure side effect. `msg` is the bridge's fully
-// identity-populated synth message — the observer's dossier resolve
-// needs the whole tuple (CHAT-NLOBSERVE-1).
+// May the observer teach a dossier that already knows where its person
+// is? The two invocation paths answer differently and it is not a
+// preference: a bridged ask is a conversation with the bot, while a
+// typed command is a tool use — and `!weather miami` for a friend's
+// hurricane must not silently relocate the asker's own watch. So the
+// higher-intent path keeps teaching and the tool use writes only into
+// a dossier that has no location on any rung of the SOUL-WX-LADDER
+// (`postal_code`, `location`, `city_of_interest:*`).
+typedef enum
+{
+  NL_OBSERVE_ALWAYS = 0,
+  NL_OBSERVE_IF_NO_LOCATION
+} nl_observe_policy_t;
+
+// Post-dispatch observer for a command carrying typed NL slots. It
+// inspects the command's declarative slot table and, for typed slots we
+// care about (CMD_NL_ARG_LOCATION today), schedules an async task that
+// records the appropriate chat-specific side effect (dossier fact
+// upsert). No reply is emitted; pure side effect. `msg` must carry the
+// whole identity tuple — the observer's dossier resolve needs it, not
+// just sender + metadata (CHAT-NLOBSERVE-1).
+//
+// Three callers, and each states its own policy above: the NL bridge
+// (reply.c), a deferred `/in <cmd>` firing (deferred.c), and a banged
+// command (chatbot.c, which observes on the command half's behalf —
+// `AGENTS.md §The two halves` forbids dispatch.c from reaching here).
 void chatbot_nl_observe_location_slot(bot_inst_t *bot,
     const method_msg_t *msg, uint32_t ns_id,
-    const cmd_nl_t *nl, const char *args_post_subst);
+    const cmd_nl_t *nl, const char *args_post_subst,
+    nl_observe_policy_t policy);
 
 // True when a location label is a bare 5-digit US zip. Routing gate
 // shared by every geocode site in the plugin: the CITY geocoder FAILs

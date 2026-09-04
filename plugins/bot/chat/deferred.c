@@ -586,7 +586,13 @@ deferred_deliver_run(chatbot_state_t *st, bot_inst_t *bot, uint32_t ns_id,
   // The same post-dispatch observer the bridge runs (reply.c): a
   // scheduled /weather is as much a standing request as a spoken one,
   // so the location slot writes its city_of_interest fact either way.
-  chatbot_nl_observe_location_slot(bot, msg, ns_id, cmd_get_nl(def), args);
+  //
+  // ⭑ ALWAYS, where a banged command is first-write-wins: scheduling a
+  // command is a deliberate act aimed at a future moment, which is the
+  // same high-intent signal a spoken ask carries. Unchanged behaviour —
+  // if that reading is ever revisited, it is one enum value here.
+  chatbot_nl_observe_location_slot(bot, msg, ns_id, cmd_get_nl(def), args,
+      NL_OBSERVE_ALWAYS);
 }
 
 // Deliver one already-claimed row. Both claim paths land here, so the

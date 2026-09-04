@@ -36,7 +36,24 @@ void text_identity_observe(bot_inst_t *inst, const method_msg_t *msg);
 // true when `msg` opened with the bot's command prefix — dispatched,
 // denied, or an unknown verb — meaning the caller must NOT hand the line
 // to the conversational half. Returns false for ordinary talk.
-bool text_dispatch_message(bot_inst_t *inst, const method_msg_t *msg);
+// What the command half handed to cmd_dispatch, for a caller that wants
+// to observe it. Filled only when text_dispatch_message returns true;
+// `verb` is the root token, `args` the remainder, both trimmed of the
+// prefix and of each other.
+//
+// ⭑ This exists so the command half can be OBSERVED without calling
+// anybody: `AGENTS.md §The two halves` forbids dispatch.c from reaching
+// into the conversational half, and a struct of what it did is not a
+// call into anything. chatbot.c reads it and decides what to do.
+typedef struct
+{
+  char verb[CMD_NAME_SZ];
+  char args[METHOD_TEXT_SZ];
+} text_cmd_seen_t;
+
+// `seen` may be NULL for a caller that only wants the ownership answer.
+bool text_dispatch_message(bot_inst_t *inst, const method_msg_t *msg,
+    text_cmd_seen_t *seen);
 
 // Emit the command-half rows of the `/show bot <name>` summary. Composed
 // with the conversational rows by the unified :default verb in

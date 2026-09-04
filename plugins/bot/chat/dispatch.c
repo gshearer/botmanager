@@ -692,8 +692,36 @@ text_prefix_for(bot_inst_t *inst, const method_msg_t *msg)
   return((pfx != NULL && pfx[0] != '\0') ? pfx : cmd_get_prefix(inst));
 }
 
+// Split what followed the prefix into its root verb and the remainder.
+// Neither is parsed further — the command is the authority on its own
+// arguments, and this only has to name the verb well enough for a
+// registry lookup.
+static void
+text_cmd_seen_fill(text_cmd_seen_t *seen, const char *rest)
+{
+  const char *args = rest;
+  size_t      vlen;
+
+  while(*args != '\0' && *args != ' ' && *args != '\t')
+    args++;
+
+  vlen = (size_t)(args - rest);
+
+  if(vlen >= sizeof(seen->verb))
+    vlen = sizeof(seen->verb) - 1;
+
+  memcpy(seen->verb, rest, vlen);
+  seen->verb[vlen] = '\0';
+
+  while(*args == ' ' || *args == '\t')
+    args++;
+
+  strlcpy(seen->args, args, sizeof(seen->args));
+}
+
 bool
-text_dispatch_message(bot_inst_t *inst, const method_msg_t *msg)
+text_dispatch_message(bot_inst_t *inst, const method_msg_t *msg,
+    text_cmd_seen_t *seen)
 {
   const char *prefix;
   const char *rest;
@@ -719,6 +747,9 @@ text_dispatch_message(bot_inst_t *inst, const method_msg_t *msg)
 
   if(*rest == '\0' || *rest == ' ' || *rest == '\t')
     return(false);
+
+  if(seen != NULL)
+    text_cmd_seen_fill(seen, rest);
 
   // The return value is deliberately discarded. An unknown verb or a
   // denied command is still command traffic, and handing either to the

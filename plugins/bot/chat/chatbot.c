@@ -2865,10 +2865,42 @@ chatbot_observe(chatbot_state_t *st, const method_msg_t *msg)
 // by the model. The reverse direction (NL wanting to run a command) does
 // NOT come back through here — it goes out through the core cmd registry
 // from reply.c, which is what keeps the two halves from circling.
+// A command someone typed is the strong half of *"how do you know?"* —
+// you asked me — so `!weather 45069` teaches the same `city_of_interest`
+// fact that "what's the weather in 45069" already did. Only the slot
+// observer runs: the line is still command traffic and is still not
+// logged, scored or answered as chat.
+//
+// ⭑⭑ It lives HERE rather than in dispatch.c because the command half
+// never calls into the conversational one (`AGENTS.md §The two halves`).
+// The permitted direction is this one — the conversational half reaching
+// commands through the core registry — so dispatch.c reports the verb it
+// dispatched and this side does the observing.
+//
+// ⭑ And it runs BEFORE the behavior.chat.enabled gate below, on purpose:
+// a command-only bot has no conversational half to speak the fact back
+// with, but it is still being asked, and its dossiers still learn.
+static void
+chatbot_observe_command(chatbot_state_t *st, const method_msg_t *msg,
+    const text_cmd_seen_t *seen)
+{
+  userns_t *ns = bot_get_userns(st->inst);
+
+  if(ns == NULL)
+    return;
+
+  // cmd_find is a root lookup and cmd_get_nl takes a NULL def, so an
+  // unknown verb reaches the observer as "no slots" and stops there.
+  chatbot_nl_observe_location_slot(st->inst, msg, ns->id,
+      cmd_get_nl(cmd_find(seen->verb)), seen->args,
+      NL_OBSERVE_IF_NO_LOCATION);
+}
+
 static void
 chatbot_on_message(void *handle, const method_msg_t *msg)
 {
   chatbot_state_t *st = handle;
+  text_cmd_seen_t  seen;
 
   if(st == NULL || msg == NULL) return;
 
@@ -2880,8 +2912,11 @@ chatbot_on_message(void *handle, const method_msg_t *msg)
 
   text_identity_observe(st->inst, msg);
 
-  if(text_dispatch_message(st->inst, msg))
+  if(text_dispatch_message(st->inst, msg, &seen))
+  {
+    chatbot_observe_command(st, msg, &seen);
     return;
+  }
 
   if(kv_get_bot_uint(bot_inst_name(st->inst), "behavior.chat.enabled") == 0)
     return;

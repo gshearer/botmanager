@@ -1045,7 +1045,7 @@ reply_nl_bridge(chatbot_req_t *r, const char *text)
   // Receives the synth whole — its dossier resolve needs the identity
   // tuple, not just sender + metadata (CHAT-NLOBSERVE-1).
   chatbot_nl_observe_location_slot(r->st->inst, &synth, r->ns_id,
-      nl, args);
+      nl, args, NL_OBSERVE_ALWAYS);
 }
 
 // Drop ASCII whitespace from both ends of `s` in place, returning s.
