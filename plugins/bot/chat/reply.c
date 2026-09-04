@@ -1275,14 +1275,24 @@ anti_repeat_blocks_line(const chatbot_req_t *r, const char *line)
 size_t
 chatbot_emote_prefix_len(const char *line)
 {
+  size_t off;
+
   if(strncmp(line, CHATBOT_EMOTE_PREFIX, CHATBOT_EMOTE_PREFIX_LEN) == 0
       && line[CHATBOT_EMOTE_PREFIX_LEN] != '\0')
     return(CHATBOT_EMOTE_PREFIX_LEN);
 
-  if(strncasecmp(line, CHATBOT_ACTION_PREFIX,
+  // Past the CTCP delimiter, where the model wrote one. send_reply_line
+  // asks this while the line is still exactly what the model typed —
+  // color_markup_translate, which drops a bare \x01 as a forgery, runs
+  // after — so a compare anchored at byte 0 misses the frame, the
+  // translate then eats both delimiters, and the channel gets a literal
+  // "ACTION ..." in place of an emote.
+  off = (line[0] == CHATBOT_CTCP_DELIM) ? 1 : 0;
+
+  if(strncasecmp(line + off, CHATBOT_ACTION_PREFIX,
         CHATBOT_ACTION_PREFIX_LEN) == 0
-      && line[CHATBOT_ACTION_PREFIX_LEN] != '\0')
-    return(CHATBOT_ACTION_PREFIX_LEN);
+      && line[off + CHATBOT_ACTION_PREFIX_LEN] != '\0')
+    return(off + CHATBOT_ACTION_PREFIX_LEN);
 
   return(0);
 }
@@ -1461,8 +1471,19 @@ send_reply_line(chatbot_req_t *r, const char *line)
 
     if(emote_off != 0)
     {
+      char   action[METHOD_TEXT_SZ];
+      size_t alen = strlcpy(action, line + emote_off, sizeof(action));
+
+      // The frame's closing half, when the model wrote the whole wire
+      // form. color_markup_translate would drop it on the way out, but
+      // spoken_append keeps the untranslated line and conversation_log
+      // holds prose rather than wire bytes.
+      if(alen > 0 && alen < sizeof(action)
+          && action[alen - 1] == CHATBOT_CTCP_DELIM)
+        action[alen - 1] = '\0';
+
       r->nonskip_lines_sent++;
-      send_line_marked(r, line + emote_off, true);
+      send_line_marked(r, action, true);
       return;
     }
   }

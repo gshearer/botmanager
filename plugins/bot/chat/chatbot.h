@@ -917,7 +917,8 @@ void chatbot_reply_submit_vision(chatbot_state_t *st,
     char *image_b64, const char *image_mime, bool in_voice);
 
 // Non-zero when `line` is an action rather than speech, and then the
-// offset of the action text within it (see CHATBOT_EMOTE_PREFIX).
+// offset of the action text within it -- past a CTCP opening delimiter
+// too, where the model wrote one (see CHATBOT_EMOTE_PREFIX).
 // Every path that puts a model's line on the wire asks here -- the
 // streaming pipeline and persona_reply.c's one-shot flourish -- so the
 // two spellings are recognised in one place. `line` must be non-NULL.
@@ -1041,6 +1042,11 @@ bool chatbot_floor_take(chatbot_floor_t *f, const char *channel, time_t now,
 #define CHATBOT_EMOTE_PREFIX_LEN           4
 #define CHATBOT_ACTION_PREFIX              "ACTION "
 #define CHATBOT_ACTION_PREFIX_LEN          7
+
+// A model that reached all the way to the wire format wrote the CTCP
+// frame around the verb as well, so the verb is recognised delimited or
+// bare — the IRC driver is equally tolerant of the inbound direction.
+#define CHATBOT_CTCP_DELIM                 '\001'
 
 // Hard caps for the EXCHANGE_IN mention-expansion block. The KV knobs
 // (bot.<n>.behavior.mention.{top_k,max_dossiers}) are clamped to these.
