@@ -40,6 +40,13 @@ void knowledge_exit(void);
 bool knowledge_corpus_upsert(const char *name, const char *description);
 bool knowledge_corpus_delete(const char *name);
 
+// Scoped delete: every chunk of `corpus` whose source_url starts with
+// `url_prefix`, which must already be canonical (util_url_canon).
+// *out_removed carries the row count; the return distinguishes a
+// failed statement from a prefix that matched nothing.
+bool knowledge_corpus_prune(const char *corpus, const char *url_prefix,
+    uint32_t *out_removed);
+
 typedef void (*knowledge_corpus_iter_cb_t)(const char *name,
     const char *description, int64_t chunk_count,
     time_t last_ingested, void *user);

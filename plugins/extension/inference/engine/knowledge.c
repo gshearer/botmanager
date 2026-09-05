@@ -989,6 +989,82 @@ knowledge_corpus_delete(const char *name)
   return(ok ? SUCCESS : FAIL);
 }
 
+// Delete every chunk in `corpus` whose source_url begins with
+// `url_prefix` — the scoped counterpart to knowledge_corpus_delete().
+// A source that stops being refreshed leaves rows behind that
+// retrieval still ranks, and there was no way to remove them short of
+// psql (board #94).
+//
+// The match is a PREFIX because a prefix is the granularity a *source*
+// has. A feed's chunks are stored under each item's own article URL
+// (acq_feed_emit_item passes the item link), so the watch URL that
+// produced them matches none of them exactly — the site does.
+//
+// starts_with() rather than LIKE: a URL is full of bytes LIKE reads as
+// wildcards, and this statement deletes rows.
+//
+// Unlike knowledge_page_supersede() this carries no page_chunked
+// guard. That guard keeps an *automatic* collapse off a file-ingested
+// corpus; a prune is an operator naming a URL, and on archwiki taking
+// all 43 chunks of a page is exactly what was asked for. Embeddings
+// and images follow on the foreign keys' ON DELETE CASCADE.
+//
+// `url_prefix` is matched verbatim, so it must already be in the
+// canonical spelling the rows were written with (util_url_canon).
+bool
+knowledge_corpus_prune(const char *corpus, const char *url_prefix,
+    uint32_t *out_removed)
+{
+  char *e_corp;
+  char *e_pfx;
+  char *sql;
+  size_t sql_sz;
+  db_result_t *res;
+  bool ok;
+
+  if(out_removed != NULL)
+    *out_removed = 0;
+
+  if(!knowledge_ready || corpus == NULL || corpus[0] == '\0'
+      || url_prefix == NULL || url_prefix[0] == '\0')
+    return(FAIL);
+
+  e_corp = db_escape(corpus);
+  e_pfx  = db_escape(url_prefix);
+
+  if(e_corp == NULL || e_pfx == NULL)
+  {
+    if(e_corp != NULL) mem_free(e_corp);
+    if(e_pfx  != NULL) mem_free(e_pfx);
+    return(FAIL);
+  }
+
+  sql_sz = strlen(e_corp) + strlen(e_pfx) + 128;
+  sql = mem_alloc("knowledge", "prune_sql", sql_sz);
+
+  snprintf(sql, sql_sz,
+      "DELETE FROM knowledge_chunks"
+      " WHERE corpus = '%s' AND starts_with(source_url, '%s')",
+      e_corp, e_pfx);
+
+  res = db_result_alloc();
+  ok = (db_query(sql, res) == SUCCESS) && res->ok;
+
+  if(ok)
+  {
+    if(out_removed != NULL)
+      *out_removed = res->rows_affected;
+  }
+  else if(res->error[0] != '\0')
+    clam(CLAM_WARN, "knowledge", "corpus prune: %s", res->error);
+
+  db_result_free(res);
+  mem_free(sql);
+  mem_free(e_corp);
+  mem_free(e_pfx);
+  return(ok ? SUCCESS : FAIL);
+}
+
 uint32_t
 knowledge_corpus_iterate(knowledge_corpus_iter_cb_t cb, void *user)
 {

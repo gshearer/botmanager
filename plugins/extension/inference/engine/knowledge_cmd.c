@@ -8,6 +8,7 @@
 #include "db.h"
 #include "userns.h"
 #include "method.h"
+#include "util.h"
 
 #include <inttypes.h>
 #include <stdio.h>
@@ -21,10 +22,11 @@ static void
 cmd_knowledge_root(const cmd_ctx_t *ctx)
 {
   cmd_reply(ctx, "usage: /knowledge <subcommand>");
-  cmd_reply(ctx, "  ingest <corpus> <path>   — ingest a file or directory");
-  cmd_reply(ctx, "  corpus upsert <name>     — create (or ensure) a named corpus");
-  cmd_reply(ctx, "  corpus del <name>        — delete a corpus (cascades)");
-  cmd_reply(ctx, "  stats [<corpus>]         — subsystem or per-corpus stats");
+  cmd_reply(ctx, "  ingest <corpus> <path>      — ingest a file or directory");
+  cmd_reply(ctx, "  corpus upsert <name>        — create (or ensure) a named corpus");
+  cmd_reply(ctx, "  corpus del <name>           — delete a corpus (cascades)");
+  cmd_reply(ctx, "  corpus prune <name> <url>   — delete one source's chunks");
+  cmd_reply(ctx, "  stats [<corpus>]            — subsystem or per-corpus stats");
   cmd_reply(ctx, "reads: /show knowledge corpora | /show knowledge corpus <name>");
 }
 
@@ -45,11 +47,22 @@ static const cmd_arg_desc_t ad_kw_ingest[] = {
 // A path that opens with an http(s) scheme is a URL, and nothing on this
 // filesystem can be one. That is the whole detection: the two forms
 // cannot collide, so neither needs a flag to tell them apart.
+//
+// Returns the first byte of the authority so a caller needing a URL to
+// carry more than its scheme can say so without spelling the two
+// prefixes a second time; NULL when `s` names neither scheme.
+static const char *
+kw_url_authority(const char *s)
+{
+  if(strncasecmp(s, "http://",  7) == 0) return(s + 7);
+  if(strncasecmp(s, "https://", 8) == 0) return(s + 8);
+  return(NULL);
+}
+
 static bool
 kw_arg_is_url(const char *s)
 {
-  return(strncasecmp(s, "http://", 7) == 0
-      || strncasecmp(s, "https://", 8) == 0);
+  return(kw_url_authority(s) != NULL);
 }
 
 static void
@@ -138,8 +151,9 @@ static void
 cmd_knowledge_corpus_root(const cmd_ctx_t *ctx)
 {
   cmd_reply(ctx, "usage: /knowledge corpus <subcommand>");
-  cmd_reply(ctx, "  upsert <name>   — create a named corpus (idempotent)");
-  cmd_reply(ctx, "  del    <name>   — delete a corpus (cascades)");
+  cmd_reply(ctx, "  upsert <name>       — create a named corpus (idempotent)");
+  cmd_reply(ctx, "  del    <name>       — delete a corpus (cascades)");
+  cmd_reply(ctx, "  prune  <name> <url> — delete the chunks one source left behind");
 }
 
 static const cmd_arg_desc_t ad_kw_corpus_upsert[] = {
@@ -172,6 +186,61 @@ cmd_knowledge_corpus_del(const cmd_ctx_t *ctx)
     return;
   }
   cmd_reply(ctx, "deleted.");
+}
+
+static const cmd_arg_desc_t ad_kw_corpus_prune[] = {
+  { "corpus", CMD_ARG_ALNUM, CMD_ARG_REQUIRED, KNOWLEDGE_CORPUS_NAME_SZ - 1, NULL },
+  { "url",    CMD_ARG_NONE,  CMD_ARG_REQUIRED, 0, NULL },
+};
+
+static void
+cmd_knowledge_corpus_prune(const cmd_ctx_t *ctx)
+{
+  const char *corpus = ctx->parsed->argv[0];
+  const char *url    = ctx->parsed->argv[1];
+
+  // util_url_canon() will not run at all unless the buffer holds the
+  // input plus two, and the parser caps an argument at CMD_ARG_SZ - 1.
+  char canon[CMD_ARG_SZ + 2];
+  char line[512];
+  const char *authority;
+  uint32_t removed;
+
+  // A prune names a site. Refusing a bare scheme is the whole guard
+  // the prefix match needs — anything shorter than a host is the
+  // corpus, and /knowledge corpus del already spells that.
+  authority = kw_url_authority(url);
+
+  if(authority == NULL || authority[0] == '\0')
+  {
+    cmd_reply(ctx, "error: url must be an http(s) URL naming at least a host");
+    return;
+  }
+
+  // Match the rows as they were written: the acquire seam stores
+  // source_url through util_url_canon(), so a pasted URL goes through
+  // the same door before it is compared.
+  util_url_canon(url, canon, sizeof(canon));
+
+  if(knowledge_corpus_prune(corpus, canon, &removed) != SUCCESS)
+  {
+    cmd_reply(ctx, "error: prune failed");
+    return;
+  }
+
+  if(removed == 0)
+  {
+    snprintf(line, sizeof(line),
+        "no chunks in '%s' start with %s — check the corpus name, and"
+        " that the prefix names the site rather than the feed.",
+        corpus, canon);
+    cmd_reply(ctx, line);
+    return;
+  }
+
+  snprintf(line, sizeof(line),
+      "pruned %u chunk(s) from '%s' under %s.", removed, corpus, canon);
+  cmd_reply(ctx, line);
 }
 
 // ---- /knowledge stats [<corpus>] ----
@@ -456,7 +525,7 @@ static const cmd_decl_t knowledge_corpus_decl = {
   .module      = "knowledge",
   .name        = "corpus",
   .usage       = "knowledge corpus",
-  .description = "Corpus management (upsert, del)",
+  .description = "Corpus management (upsert, del, prune)",
   .group       = USERNS_GROUP_ADMIN,
   .level       = 100,
   .scope       = CMD_SCOPE_PRIVATE,
@@ -503,6 +572,37 @@ static const cmd_decl_t knowledge_corpus_del_decl = {
   .arg_desc    = ad_kw_corpus_del,
   .arg_count   = (uint8_t)(sizeof(ad_kw_corpus_del)
                  / sizeof(ad_kw_corpus_del[0])),
+};
+
+static const cmd_decl_t knowledge_corpus_prune_decl = {
+  .module      = "knowledge",
+  .name        = "prune",
+  .usage       = "knowledge corpus prune <corpus> <url>",
+  .description = "Delete the chunks one source left behind in a corpus",
+  .help_long   =
+      "Deletes every chunk of <corpus> whose source_url starts with"
+      " <url>, and the embeddings and images hanging off them. This is"
+      " what a source that stops being refreshed needs: dropping an"
+      " interest's watch entry leaves its scraped pages in the corpus,"
+      " still ranked by retrieval, with nothing ever superseding them."
+      " The match is a PREFIX, because a feed's chunks are stored under"
+      " each article's own URL and not the feed's — so name the site"
+      " ('https://www.coindesk.com/') rather than the feed URL you"
+      " removed. The URL is canonicalised the same way an ingested one"
+      " is, and the reply names the prefix that was actually used."
+      " Unlike /knowledge corpus del this leaves the corpus itself in"
+      " place, and unlike the automatic page supersede it applies to a"
+      " file-ingested corpus too.",
+  .group       = USERNS_GROUP_ADMIN,
+  .level       = 100,
+  .scope       = CMD_SCOPE_PRIVATE,
+  .methods     = METHOD_T_ANY,
+  .cb          = cmd_knowledge_corpus_prune,
+  .parent_path = "knowledge/corpus",
+  .abbrev      = "p",
+  .arg_desc    = ad_kw_corpus_prune,
+  .arg_count   = (uint8_t)(sizeof(ad_kw_corpus_prune)
+                 / sizeof(ad_kw_corpus_prune[0])),
 };
 
 static const cmd_decl_t knowledge_stats_decl = {
@@ -574,10 +674,11 @@ knowledge_register_commands(void)
   // /knowledge ingest <corpus> <path> [base-url]
   cmd_register(&knowledge_ingest_decl);
 
-  // /knowledge corpus (container) + /knowledge corpus {upsert,del}
+  // /knowledge corpus (container) + /knowledge corpus {upsert,del,prune}
   cmd_register(&knowledge_corpus_decl);
   cmd_register(&knowledge_corpus_upsert_decl);
   cmd_register(&knowledge_corpus_del_decl);
+  cmd_register(&knowledge_corpus_prune_decl);
 
   // /knowledge stats [<corpus>]
   cmd_register(&knowledge_stats_decl);
