@@ -38,8 +38,6 @@ static const plugin_kv_entry_t sxng_kv_schema[] = {
     "Per-request timeout in seconds" },
   { "plugin.searxng.max_results",  KV_UINT32, "10",
     "Default result cap per query (hard max 32)" },
-  { "plugin.searxng.min_results",  KV_UINT32, "1",
-    "Floor on results returned per query (clamped to max_results)" },
   { "plugin.searxng.safesearch",   KV_UINT32, "1",
     "SafeSearch level: 0=off, 1=moderate, 2=strict" },
   { "plugin.searxng.news_query",   KV_STR,    "headlines",
@@ -530,7 +528,6 @@ sxng_search(const char *query, sxng_category_t category, size_t n_wanted,
   curl_request_t *cr;
   const char *endpoint;
   uint32_t kv_max;
-  uint32_t kv_min;
   sxng_req_t *r;
   sxng_req_t dead;
 
@@ -553,24 +550,17 @@ sxng_search(const char *query, sxng_category_t category, size_t n_wanted,
   }
 
   kv_max = (uint32_t)kv_get_uint_or_default("plugin.searxng.max_results");
-  kv_min = (uint32_t)kv_get_uint_or_default("plugin.searxng.min_results");
   safe = (uint32_t)kv_get_uint("plugin.searxng.safesearch");
   to_sec = (uint32_t)kv_get_uint("plugin.searxng.timeout_secs");
 
   if(kv_max > SXNG_HARDMAX_RESULTS)
     kv_max = SXNG_HARDMAX_RESULTS;
 
-  // Result floor. Can never exceed the per-query cap. A caller passing 0
-  // still means "use the default cap" (preserves the inference layer's
-  // contract), so the floor only ever raises an explicit-but-too-small
-  // request up to kv_min.
-  if(kv_min > kv_max)
-    kv_min = kv_max;
-
+  // The ceiling is a resource guard on a shared backend, not policy: how
+  // many results a query wants is the caller's, and both consumers choose
+  // for themselves. 0 still asks for as many as the ceiling allows.
   if(n_wanted == 0 || n_wanted > kv_max)
     n_wanted = kv_max;
-  if(n_wanted < kv_min)
-    n_wanted = kv_min;
 
   if(safe > 2)
     safe = 2;

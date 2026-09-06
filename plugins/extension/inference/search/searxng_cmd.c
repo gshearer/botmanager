@@ -11,9 +11,10 @@
 //
 // Every command accepts an optional "-n <count>" prefix to request a
 // specific number of results (clamped to plugin.searxng.max_results);
-// with no -n the count defaults to plugin.searxng.min_results. Results
-// are formatted with category-appropriate metadata (image dimensions,
-// video length, news publication date).
+// with no -n the count comes from bot.<name>.searxng.results, and from
+// plugin.searxng_cmd.results where that bot has not been given one.
+// Results are formatted with category-appropriate metadata (image
+// dimensions, video length, news publication date).
 //
 // !news alone — with no query — is the one exception to "a search needs
 // words": it runs the standing plugin.searxng.news_query and prints
@@ -30,11 +31,51 @@
 
 #include "shorturl_api.h"
 
+#include "bot.h"        // bot_inst_name, bot_kv_contributor_register
 #include "kv.h"
 
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+
+// ------------------------------------------------------------------ //
+// How many results a bare search returns                              //
+// ------------------------------------------------------------------ //
+//
+// Three tiers, narrowest first: an explicit -n, then this bot, then the
+// plugin. One row is the operator's ruling — an IRC user asking a
+// question expects an answer, not a page of them.
+//
+// The count lives here and not in the searxng service because it is a
+// property of the CALL SITE: the service's other consumer is the
+// acquisition engine, which sizes its own traffic per topic, and a
+// number held down there reached across the boundary to overrule it.
+
+// The bare per-bot suffix. Spelled once; the accessors compose the key.
+#define SEARXNG_BKV_RESULTS  "searxng.results"
+
+static const plugin_kv_entry_t searxng_cmd_kv_schema[] = {
+  { "plugin.searxng_cmd.results", KV_UINT32, "1",
+    "Results a bare !s returns, for bots that set no count of their own" },
+};
+
+// Stable per-plugin address; register and unregister match on it.
+static const char searxng_cmd_kv_cookie;
+
+// Fires once per bot, and again for every existing bot when this plugin
+// reloads, so the key re-attaches itself. Self-contained by contract
+// (include/bot.h): kv_register and nothing that retakes the bot lock.
+static void
+searxng_cmd_kv_bot_cb(const char *botname, void *user)
+{
+  char key[KV_KEY_SZ];
+
+  (void)user;
+
+  snprintf(key, sizeof(key), "bot.%s." SEARXNG_BKV_RESULTS, botname);
+  kv_register(key, KV_UINT32, "0", NULL, NULL,
+      "Results a bare !s returns for this bot (0 inherits the plugin tier)");
+}
 
 // Forward declarations for cmd_register binding.
 static void searxng_cmd_general(const cmd_ctx_t *ctx);
@@ -419,7 +460,7 @@ searxng_cmd_parse_flags(const char *args, char *query, size_t cap,
 }
 
 // Submit one search at the given category. Parses the optional -n flag,
-// resolves the requested result count against plugin.searxng.min_results,
+// resolves the requested result count against the bot and plugin tiers,
 // and owns the per-call closure allocation; on submit failure the closure
 // is freed in-line and an error reply is emitted. The async path always
 // frees on its own.
@@ -474,11 +515,19 @@ searxng_cmd_dispatch(const cmd_ctx_t *ctx, sxng_category_t category)
     }
   }
 
-  // No -n (or "-n 0") falls back to the configured floor. The service
-  // clamps the final count to [min_results, max_results], so an
-  // over-large -n is honoured only up to max_results.
+  // No -n (or "-n 0") falls through the tiers: this bot first, the plugin
+  // behind it. A session with no bot — botmanctl, cmd_dispatch_as — reads
+  // 0 for the bot tier by contract and lands on the plugin one. The
+  // service honours whatever comes out of here, up to max_results.
   if(!have_n || n_wanted == 0)
-    n_wanted = (uint32_t)kv_get_uint_or_default("plugin.searxng.min_results");
+  {
+    const char *bot_name = (ctx->bot != NULL) ? bot_inst_name(ctx->bot) : NULL;
+
+    n_wanted = (uint32_t)kv_get_bot_uint(bot_name, SEARXNG_BKV_RESULTS);
+
+    if(n_wanted == 0)
+      n_wanted = (uint32_t)kv_get_uint_or_default("plugin.searxng_cmd.results");
+  }
 
   r = mem_alloc(SEARXNG_CMD_CTX, "req", sizeof(*r));
   memset(r, 0, sizeof(*r));
@@ -572,7 +621,8 @@ static const char searxng_cmd_help[] =
     "\n"
     "Add \"-n <count>\" to request a specific number of results\n"
     "(capped at plugin.searxng.max_results). With no -n the count\n"
-    "defaults to plugin.searxng.min_results.\n"
+    "comes from bot.<name>.searxng.results, or plugin.searxng_cmd.results\n"
+    "for a bot that has not been given one.\n"
     "\n"
     "!news on its own takes no query: it prints the current headlines\n"
     "(story and link, one per line) from the standing search in\n"
@@ -622,6 +672,9 @@ searxng_cmd_init(void)
     }
   }
 
+  bot_kv_contributor_register(searxng_cmd_kv_bot_cb, NULL,
+      (void *)&searxng_cmd_kv_cookie);
+
   clam(CLAM_INFO, SEARXNG_CMD_CTX,
       "searxng command plugin initialized");
   return(SUCCESS);
@@ -630,6 +683,7 @@ searxng_cmd_init(void)
 static void
 searxng_cmd_deinit(void)
 {
+  bot_kv_contributor_unregister((void *)&searxng_cmd_kv_cookie);
   searxng_cmd_unregister_all();
   clam(CLAM_INFO, SEARXNG_CMD_CTX,
       "searxng command plugin deinitialized");
@@ -649,8 +703,9 @@ const plugin_desc_t bm_plugin_desc = {
     { .name = "service_shorturl" },
   },
   .requires_count  = 3,
-  .kv_schema       = NULL,
-  .kv_schema_count = 0,
+  .kv_schema       = searxng_cmd_kv_schema,
+  .kv_schema_count = sizeof(searxng_cmd_kv_schema)
+                     / sizeof(searxng_cmd_kv_schema[0]),
   .init            = searxng_cmd_init,
   .start           = NULL,
   .stop            = NULL,

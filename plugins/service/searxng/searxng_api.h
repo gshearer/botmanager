@@ -166,8 +166,12 @@ typedef void (*sxng_done_cb_t)(const sxng_response_t *resp);
 #ifdef SEARXNG_INTERNAL
 
 // Submit a SearXNG search. Caps n_wanted at SXNG_MAX_RESULTS and at the
-// plugin-configured per-request limit. `category` selects the SearXNG
-// category bucket; SXNG_CAT_GENERAL is the no-op default.
+// plugin-configured per-request limit, and 0 asks for that limit — but
+// the count is otherwise yours and nothing here raises it. A floor lived
+// here until 2026-09-06 and it reached across the boundary: a number set
+// for one consumer's presentation silently rewrote the other's traffic
+// budget. `category` selects the SearXNG category bucket;
+// SXNG_CAT_GENERAL is the no-op default.
 //
 // On success the callback fires with ok=true and 0+ results. On
 // transport, HTTP, or parse failure the callback fires with ok=false
