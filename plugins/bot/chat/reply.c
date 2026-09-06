@@ -3759,17 +3759,36 @@ chatbot_reply_submit(chatbot_state_t *st, const method_msg_t *msg,
     }
   }
 
-  // Knowledge-corpus binding: `bot.<name>.corpus` (semicolon-
-  // separated list). Empty = no corpus retrieval; non-empty chains into
-  // knowledge_retrieve after the memory pass completes. knowledge_top_k
-  // stays 0 so the knowledge subsystem falls back to its own KV default
-  // (rag_top_k).
+  // Knowledge-corpus binding: `bot.<name>.corpus` (semicolon-separated
+  // `name[:weight]` list). Empty = no corpus retrieval; non-empty chains
+  // into knowledge_retrieve after the memory pass completes.
+  //
+  // ⭑ Which corpora a bot reads, and how heavily, have always been the
+  // bot's own decision — how MUCH it reads was the plugin's. These two
+  // close half of that gap on the tier the rest of the binding already
+  // lives on: a bot answering support questions and a bot in a games
+  // channel want different amounts of encyclopedia, and neither should
+  // have to move a knob that changes the other.
+  //
+  // ⚠ 0 means INHERIT, not none, and each is inherited from a different
+  // place. `top_k` goes to the engine untouched — knowledge_retrieve
+  // already reads 0 as "use knowledge.rag_top_k", so there is nothing to
+  // resolve here and restating that default would be a second copy of
+  // it. `max_chars` never reaches the engine at all: it bounds what
+  // prompt_emit_knowledge renders, which is entirely ours, so the
+  // fallback to the plugin-wide budget is resolved here because there is
+  // nowhere else it could be.
   cl = kv_get_bot_str(botname, "corpus");
   snprintf(r->knowledge_corpus, sizeof(r->knowledge_corpus),
       "%s", cl ? cl : "");
-  r->knowledge_top_k = 0;
-  r->knowledge_max_chars = (uint32_t)kv_get_uint(
-      "knowledge.rag_max_context_chars");
+  r->knowledge_top_k = (uint32_t)kv_get_bot_uint(botname,
+      "behavior.knowledge.top_k");
+  r->knowledge_max_chars = (uint32_t)kv_get_bot_uint(botname,
+      "behavior.knowledge.max_chars");
+
+  if(r->knowledge_max_chars == 0)
+    r->knowledge_max_chars = (uint32_t)kv_get_uint(
+        "knowledge.rag_max_context_chars");
   r->memory_max_chars = (uint32_t)kv_get_uint(
       "memory.rag_max_context_chars");
 
@@ -4219,9 +4238,16 @@ chatbot_reply_submit_vision(chatbot_state_t *st, const method_msg_t *msg,
   if(kv_get_bot_uint(botname, "behavior.image_vision.skip_knowledge") != 0)
     r->knowledge_corpus[0] = '\0';
 
-  r->knowledge_top_k = 0;
-  r->knowledge_max_chars = (uint32_t)kv_get_uint(
-      "knowledge.rag_max_context_chars");
+  // Same two knobs, same meaning as the reply path — a vision turn that
+  // did not skip its corpus is retrieving against the same budget.
+  r->knowledge_top_k = (uint32_t)kv_get_bot_uint(botname,
+      "behavior.knowledge.top_k");
+  r->knowledge_max_chars = (uint32_t)kv_get_bot_uint(botname,
+      "behavior.knowledge.max_chars");
+
+  if(r->knowledge_max_chars == 0)
+    r->knowledge_max_chars = (uint32_t)kv_get_uint(
+        "knowledge.rag_max_context_chars");
   r->memory_max_chars = (uint32_t)kv_get_uint(
       "memory.rag_max_context_chars");
 

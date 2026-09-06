@@ -372,6 +372,27 @@ static const plugin_kv_entry_t chatbot_inst_schema[] = {
     " dialogue in as live turns invites the model to answer it."
     " 0 applies no age filter.", NULL },
 
+  // --- behavior.knowledge.* — how much corpus this bot reads -----------
+  // The companion to `bot.<name>.corpus`, which says WHICH corpora and
+  // how heavily each counts. These say how much of the result reaches
+  // the prompt, on the same per-bot tier, because a bot answering
+  // support questions and a bot in a games channel want different
+  // amounts of encyclopedia and neither should have to move a knob that
+  // changes the other.
+  { "behavior.knowledge.top_k", KV_UINT32, "0",
+    "Chunks the cosine channel retrieves per reply for THIS bot."
+    " 0 inherits the plugin-wide knowledge.rag_top_k, which is where"
+    " the default lives — the engine resolves it, so a bot that never"
+    " sets this is byte-identical to one built before the key existed."
+    " ⚠ The lexical channel is NOT covered: knowledge.rag_lexical_k is"
+    " still plugin-wide for every bot, because knowledge_retrieve takes"
+    " no parameter for it.", NULL },
+  { "behavior.knowledge.max_chars", KV_UINT32, "0",
+    "Byte budget for THIS bot's KNOWLEDGE prompt block, trimmed from the"
+    " tail once exceeded. 0 inherits knowledge.rag_max_context_chars."
+    " Bounds rendering only and never reaches the engine, so it cannot"
+    " change what was retrieved — only how much of it is spent.", NULL },
+
   // --- behavior.mention.* — mention-expansion knobs --------------------
   { "behavior.mention.top_k", KV_UINT32, "6",
     "Facts per mentioned dossier to inject into EXCHANGE_IN replies."
