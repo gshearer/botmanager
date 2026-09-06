@@ -149,6 +149,22 @@ void db_result_set_col_name(db_result_t *r, uint32_t col, const char *name);
 void db_result_set_value(db_result_t *r, uint32_t row, uint32_t col,
     const char *val);
 
+// Every statement path below shares one recovery rule, and it has a
+// cost worth knowing before you write a caller.
+//
+// A pooled connection outlives the server it was dialled against. When
+// a statement fails, the pool asks the driver whether the connection is
+// still there; if it is not, it redials the slot and runs the statement
+// ONCE more. That is what keeps a Postgres restart from stranding the
+// daemon — but it means a statement can reach the engine twice.
+//
+// It is safe for the reason autocommit exists: a lone statement is its
+// own transaction, so one the server never acknowledged was never
+// committed and crash recovery discards it. The window that is NOT
+// covered is a commit that succeeded and whose acknowledgement died on
+// the way back. A caller who cannot survive that — anything that
+// appends rather than sets — belongs in a db_txn_* handle, which is
+// never redialled and fails loudly instead.
 bool db_query(const char *sql, db_result_t *result);
 
 // Run one statement for its effect, logging a failure under `clam_ctx`
