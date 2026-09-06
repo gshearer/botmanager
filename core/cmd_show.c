@@ -654,7 +654,6 @@ show_db_cb(uint16_t slot, db_conn_state_t state, uint64_t queries,
   {
     case DB_CONN_IDLE:   state_str = "idle";   state_clr = CLR_CYAN;  break;
     case DB_CONN_ACTIVE: state_str = "active"; state_clr = CLR_GREEN; break;
-    case DB_CONN_FAIL:   state_str = "failed"; state_clr = CLR_RED;   break;
     default:             state_str = "?";      state_clr = CLR_GRAY;  break;
   }
 
@@ -684,10 +683,11 @@ cmd_show_db(const cmd_ctx_t *ctx)
   db_get_pool_stats(&ds);
 
   snprintf(buf, sizeof(buf),
-      "db pool: %u total, %u idle, %u active, %u failed, "
-      "%lu queries, %lu errors",
-      ds.total, ds.idle, ds.active, ds.failed,
-      (unsigned long)ds.queries, (unsigned long)ds.errors);
+      "db pool: %u total, %u idle, %u active, "
+      "%lu queries, %lu errors, %lu dropped",
+      ds.total, ds.idle, ds.active,
+      (unsigned long)ds.queries, (unsigned long)ds.errors,
+      (unsigned long)ds.dropped);
   cmd_reply(ctx, buf);
 
   if(ds.total > 0)
@@ -1075,13 +1075,13 @@ cmd_show_status(const cmd_ctx_t *ctx)
       "  " CLR_CYAN "db pool" CLR_RESET "   "
       CLR_BOLD "%u" CLR_RESET " total  "
       "%u idle  %u active  "
-      "%s%u failed" CLR_RESET "  "
       CLR_GRAY "%lu queries" CLR_RESET "  "
-      "%s%lu errors" CLR_RESET,
+      "%s%lu errors" CLR_RESET "  "
+      "%s%lu dropped" CLR_RESET,
       ds.total, ds.idle, ds.active,
-      err_color(ds.failed), ds.failed,
       (unsigned long)ds.queries,
-      err_color(ds.errors), (unsigned long)ds.errors);
+      err_color(ds.errors), (unsigned long)ds.errors,
+      err_color(ds.dropped), (unsigned long)ds.dropped);
   cmd_reply(ctx, buf);
 
   plugin_get_stats(&pls);

@@ -27,6 +27,82 @@ conn_release(db_conn_t *c)
   pthread_mutex_unlock(&c->mutex);
 }
 
+// Discard a slot whose server has gone. The slot is emptied rather
+// than left FAIL: an empty slot is redialled by pass 2 of the next
+// acquire, where a FAIL one would sit there being counted.
+// Connection must be locked by caller.
+static void
+conn_drop(db_conn_t *c)
+{
+  clam(CLAM_WARN, "db", "connection #%u lost its server after %lu queries",
+      c->id, (unsigned long)c->queries);
+
+  conn_close(c);
+
+  __atomic_add_fetch(&db_stat_dropped, 1, __ATOMIC_RELAXED);
+}
+
+// Decide what a failed statement means for the connection under it, and
+// give the slot back its handle where it can. A driver ping answers
+// from local state, so this costs nothing when the statement simply had
+// bad SQL — the common case by far.
+//
+// returns: true when the connection was dead, has been redialled, and
+//          the caller may run its statement again; false when the
+//          statement failed on its own merits, or when the redial
+//          failed and the slot has been emptied (`c->handle` is then
+//          NULL and the caller must not touch it).
+// Connection must be locked by caller.
+static bool
+conn_recover(db_conn_t *c)
+{
+  if(driver->ping(c->handle) == SUCCESS)
+    return(false);
+
+  __atomic_add_fetch(&db_stat_dropped, 1, __ATOMIC_RELAXED);
+
+  if(driver->reset(c->handle) != SUCCESS)
+  {
+    clam(CLAM_WARN, "db", "connection #%u died and would not redial: %s",
+        c->id, driver->error(c->handle));
+    conn_close(c);
+    return(false);
+  }
+
+  clam(CLAM_INFO, "db", "connection #%u died mid-statement; redialled",
+      c->id);
+
+  c->state = DB_CONN_ACTIVE;
+  c->created = time(NULL);
+  return(true);
+}
+
+// Clear what the first attempt left behind. A retry hands the caller's
+// own result back to the driver, and a driver only writes `error` when
+// it fails — so without this a statement that succeeded on the redial
+// would carry the corpse's error message home with it.
+static void
+result_reset(db_result_t *r)
+{
+  r->ok       = false;
+  r->error[0] = '\0';
+}
+
+// Account one statement against the pool and its slot. Every attempt is
+// counted, so a statement retried on a redialled connection lands here
+// twice — which is the honest reading: the wire carried it twice, and
+// the first attempt really did error.
+static void
+stat_query(db_conn_t *c, bool ok)
+{
+  __atomic_add_fetch(&db_stat_queries, 1, __ATOMIC_RELAXED);
+
+  if(ok != SUCCESS)
+    __atomic_add_fetch(&db_stat_errors, 1, __ATOMIC_RELAXED);
+
+  c->queries++;
+}
+
 // Acquire a connection from the pool.
 // Two passes: first reuse an idle connection, then create a new one.
 // returns: locked connection in ACTIVE state, or NULL if none available
@@ -34,6 +110,11 @@ static db_conn_t *
 conn_acquire(void)
 {
   // Pass 1: find an idle connection with a live handle.
+  //
+  // A pooled handle outlives the server it was dialled against, and a
+  // driver that has not touched the socket since cannot know that — so
+  // the ping here catches only a peer already proven gone, and the
+  // failure path is what catches the first statement to discover it.
   for(uint16_t i = 0; i < db_pcfg.max_conns; i++)
   {
     db_conn_t *c = &pool[i];
@@ -43,6 +124,13 @@ conn_acquire(void)
 
     if(c->handle != NULL && c->state == DB_CONN_IDLE)
     {
+      if(driver->ping(c->handle) != SUCCESS)
+      {
+        conn_drop(c);
+        pthread_mutex_unlock(&c->mutex);
+        continue;
+      }
+
       c->state = DB_CONN_ACTIVE;
       return(c);  // locked
     }
@@ -195,6 +283,18 @@ async_ctx_free(db_async_ctx_t *ctx)
   mem_free(ctx);
 }
 
+// Run the queued statement once, on whichever of the two driver entry
+// points the context was built for.
+static bool
+async_run(db_conn_t *c, db_async_ctx_t *ctx, db_result_t *result)
+{
+  if(ctx->params != NULL)
+    return(driver->query_params(c->handle, ctx->sql,
+        (const char *const *)ctx->params, ctx->n_params, result));
+
+  return(driver->query(c->handle, ctx->sql, result));
+}
+
 // Async query task callback.
 static void
 async_cb(task_t *t)
@@ -216,19 +316,16 @@ async_cb(task_t *t)
 
   result = db_result_alloc();
 
-  if(ctx->params != NULL)
-    ok = driver->query_params(c->handle, ctx->sql,
-        (const char *const *)ctx->params, ctx->n_params, result);
+  ok = async_run(c, ctx, result);
+  stat_query(c, ok);
 
-  else
-    ok = driver->query(c->handle, ctx->sql, result);
+  if(ok != SUCCESS && conn_recover(c))
+  {
+    result_reset(result);
+    ok = async_run(c, ctx, result);
+    stat_query(c, ok);
+  }
 
-  __atomic_add_fetch(&db_stat_queries, 1, __ATOMIC_RELAXED);
-
-  if(ok != SUCCESS)
-    __atomic_add_fetch(&db_stat_errors, 1, __ATOMIC_RELAXED);
-
-  c->queries++;
   conn_release(c);
 
   // Invoke user callback (takes ownership of result).
@@ -266,6 +363,14 @@ db_init(const db_driver_t *drv)
   if(drv == NULL)
   {
     clam(CLAM_FATAL, "db_init", "no driver provided");
+    return(FAIL);
+  }
+
+  // The pool leans on these two on every acquire and every failure, so
+  // a driver without them would not survive its first outage.
+  if(drv->ping == NULL || drv->reset == NULL)
+  {
+    clam(CLAM_FATAL, "db_init", "%s driver has no ping/reset", drv->name);
     return(FAIL);
   }
 
@@ -483,13 +588,15 @@ db_query(const char *sql, db_result_t *result)
   clam(CLAM_DEBUG, "db_query", "sql: %s", sql);
 
   ret = driver->query(c->handle, sql, result);
+  stat_query(c, ret);
 
-  __atomic_add_fetch(&db_stat_queries, 1, __ATOMIC_RELAXED);
+  if(ret != SUCCESS && conn_recover(c))
+  {
+    result_reset(result);
+    ret = driver->query(c->handle, sql, result);
+    stat_query(c, ret);
+  }
 
-  if(ret != SUCCESS)
-    __atomic_add_fetch(&db_stat_errors, 1, __ATOMIC_RELAXED);
-
-  c->queries++;
   conn_release(c);
 
   return(ret);
@@ -519,13 +626,15 @@ db_query_params(const char *sql, const char *const *params,
   clam(CLAM_DEBUG, "db_query", "sql: %s (%u param(s))", sql, n_params);
 
   ret = driver->query_params(c->handle, sql, params, n_params, result);
+  stat_query(c, ret);
 
-  __atomic_add_fetch(&db_stat_queries, 1, __ATOMIC_RELAXED);
+  if(ret != SUCCESS && conn_recover(c))
+  {
+    result_reset(result);
+    ret = driver->query_params(c->handle, sql, params, n_params, result);
+    stat_query(c, ret);
+  }
 
-  if(ret != SUCCESS)
-    __atomic_add_fetch(&db_stat_errors, 1, __ATOMIC_RELAXED);
-
-  c->queries++;
   conn_release(c);
 
   return(ret);
@@ -590,12 +699,35 @@ db_query_params_async(const char *sql, const char *const *params,
   return(ASYNC_AIRBORNE);
 }
 
+// A stream hands rows to its caller as they arrive, so one that dies
+// partway cannot simply be run again — the caller would see the first
+// rows twice. This shim is how the facade tells the two cases apart: a
+// connection that died before the first row is safe to redial and
+// re-run, one that died after it is not.
+typedef struct
+{
+  db_row_cb_t  cb;
+  void        *data;
+  uint32_t     delivered;
+} stream_guard_t;
+
+static bool
+stream_guard_cb(uint32_t row, uint32_t cols, const char *const *values,
+    void *data)
+{
+  stream_guard_t *g = data;
+
+  g->delivered++;
+  return(g->cb(row, cols, values, g->data));
+}
+
 bool
 db_query_stream(const char *sql, db_row_cb_t row_cb, void *data,
     char *err, size_t err_cap)
 {
-  db_conn_t *c;
-  bool       ret;
+  stream_guard_t guard;
+  db_conn_t     *c;
+  bool           ret;
 
   if(!db_ready || driver == NULL || sql == NULL || row_cb == NULL)
   {
@@ -622,14 +754,32 @@ db_query_stream(const char *sql, db_row_cb_t row_cb, void *data,
 
   clam(CLAM_DEBUG, "db_query_stream", "sql: %s", sql);
 
-  ret = driver->query_stream(c->handle, sql, row_cb, data, err, err_cap);
+  guard.cb        = row_cb;
+  guard.data      = data;
+  guard.delivered = 0;
 
-  __atomic_add_fetch(&db_stat_queries, 1, __ATOMIC_RELAXED);
+  ret = driver->query_stream(c->handle, sql, stream_guard_cb, &guard,
+      err, err_cap);
+  stat_query(c, ret);
 
   if(ret != SUCCESS)
-    __atomic_add_fetch(&db_stat_errors, 1, __ATOMIC_RELAXED);
+  {
+    // The redial happens either way — the slot must not go back to the
+    // pool holding a corpse — but re-running the statement is only safe
+    // while the caller has seen nothing of the first attempt.
+    bool redialled = conn_recover(c);
 
-  c->queries++;
+    if(redialled && guard.delivered == 0)
+    {
+      if(err != NULL && err_cap > 0)
+        err[0] = '\0';
+
+      ret = driver->query_stream(c->handle, sql, stream_guard_cb, &guard,
+          err, err_cap);
+      stat_query(c, ret);
+    }
+  }
+
   conn_release(c);
 
   return(ret);
@@ -669,6 +819,13 @@ db_txn_begin(char *err, size_t err_cap)
 
   if(driver->txn(c->handle, DB_TXN_BEGIN, err, err_cap) != SUCCESS)
   {
+    // Nothing has been issued yet, so this one could in principle be
+    // redialled and retried — but a caller who cannot get a transaction
+    // is already written to cope, and the useful half of the answer is
+    // that the slot must not be handed on.
+    if(driver->ping(c->handle) != SUCCESS)
+      conn_drop(c);
+
     conn_release(c);
     return(NULL);
   }
@@ -709,15 +866,11 @@ txn_run(db_txn_t *txn, const char *sql, const char *const *params,
   else
     ret = driver->query(txn->conn->handle, sql, result);
 
-  __atomic_add_fetch(&db_stat_queries, 1, __ATOMIC_RELAXED);
+  stat_query(txn->conn, ret);
 
   if(ret != SUCCESS)
-  {
-    __atomic_add_fetch(&db_stat_errors, 1, __ATOMIC_RELAXED);
     txn->failed = true;
-  }
 
-  txn->conn->queries++;
   return(ret);
 }
 
@@ -740,18 +893,29 @@ db_txn_query_params(db_txn_t *txn, const char *sql,
 static bool
 txn_end(db_txn_t *txn, db_txn_op_t op)
 {
-  char err[DB_ERROR_SZ] = {0};
-  bool ret;
+  db_conn_t *c = txn->conn;
+  char       err[DB_ERROR_SZ] = {0};
+  bool       ret;
 
-  ret = driver->txn(txn->conn->handle, op, err, sizeof(err));
+  ret = driver->txn(c->handle, op, err, sizeof(err));
 
   if(op == DB_TXN_COMMIT && ret != SUCCESS)
   {
     __atomic_add_fetch(&db_stat_errors, 1, __ATOMIC_RELAXED);
-    driver->txn(txn->conn->handle, DB_TXN_ROLLBACK, NULL, 0);
+    driver->txn(c->handle, DB_TXN_ROLLBACK, NULL, 0);
   }
 
-  conn_release(txn->conn);
+  // ⛔ A transaction is never redialled mid-flight. A reset drops the
+  // server-side transaction, so every statement already issued would
+  // vanish and the COMMIT after it would report success over nothing —
+  // the one failure this pool must never convert into a quiet one. A
+  // caller whose connection died is told so by `txn->failed` and by
+  // this ender's return; all this path may do is refuse to pass the
+  // corpse to whoever acquires next.
+  if(driver->ping(c->handle) != SUCCESS)
+    conn_drop(c);
+
+  conn_release(c);
   mem_free(txn);
 
   // Logged with the pin already given back: a clam() subscriber is free
@@ -837,7 +1001,6 @@ db_get_pool_stats(db_pool_stats_t *out)
       {
         case DB_CONN_IDLE:   out->idle++;   break;
         case DB_CONN_ACTIVE: out->active++; break;
-        case DB_CONN_FAIL:   out->failed++; break;
       }
     }
 
@@ -846,6 +1009,7 @@ db_get_pool_stats(db_pool_stats_t *out)
 
   out->queries = __atomic_load_n(&db_stat_queries, __ATOMIC_RELAXED);
   out->errors  = __atomic_load_n(&db_stat_errors, __ATOMIC_RELAXED);
+  out->dropped = __atomic_load_n(&db_stat_dropped, __ATOMIC_RELAXED);
 }
 
 const db_driver_t *

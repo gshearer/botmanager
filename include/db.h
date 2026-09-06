@@ -16,11 +16,14 @@
 // exactly one statement.
 #define DB_PARAMS_MAX  32
 
+// A slot's two resting states. There is deliberately no third for a
+// broken connection: a slot whose server has gone is emptied on sight
+// and redialled by the next acquire, so the pool is never found holding
+// one. What an outage leaves behind is the `dropped` count below.
 typedef enum
 {
   DB_CONN_IDLE,     // connected, not in use
-  DB_CONN_ACTIVE,   // claimed by a query
-  DB_CONN_FAIL      // connection has failed
+  DB_CONN_ACTIVE    // claimed by a query
 } db_conn_state_t;
 
 // Row/column data returned by a query. Callers must call
@@ -64,8 +67,18 @@ typedef struct
                    const char *user, const char *pass);
 
   void (*disconnect)(void *handle);
+
+  // Required, both of them: they are the pool's only way to tell a
+  // statement that failed on its own merits from one that failed
+  // because the server underneath it is gone. ping() must answer from
+  // local state alone — no round trip — because the pool asks it on
+  // every acquire; it may therefore say a handle is live right up until
+  // the first I/O discovers otherwise, which is why the pool also asks
+  // it again after a failure. reset() redials in place and must clear
+  // any transaction the handle was carrying.
   bool (*ping)(void *handle);
   bool (*reset)(void *handle);
+
   bool (*query)(void *handle, const char *sql, db_result_t *result);
 
   // Optional streaming read - NULL if the driver doesn't implement it.
@@ -97,9 +110,13 @@ typedef struct
   uint16_t total;     // slots with live connections
   uint16_t idle;      // idle connections
   uint16_t active;    // connections currently in use
-  uint16_t failed;    // connections in failed state
   uint64_t queries;   // lifetime query count
   uint64_t errors;    // lifetime query errors
+
+  // Lifetime count of connections found dead and reclaimed. The pool
+  // has no broken-slot gauge to read instead — it redials on sight — so
+  // this is the one number that says an outage happened at all.
+  uint64_t dropped;
 } db_pool_stats_t;
 
 // Must be called before db_init(). Defaults: max_conns=10,
@@ -288,6 +305,7 @@ static bool               db_ready = false;
 // Atomic, no lock needed.
 static uint64_t           db_stat_queries = 0;
 static uint64_t           db_stat_errors  = 0;
+static uint64_t           db_stat_dropped = 0;
 
 // Passed through task system. `params` is NULL on the plain path; on
 // the bound path it holds n_params deep copies, any of which may be
