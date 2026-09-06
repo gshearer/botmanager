@@ -644,7 +644,10 @@ typedef enum
 // ATK_CLASS_NAME_SZ is up with the storage bounds: a combatant's class is
 // part of their round row, so atk_player_t needs it long before here.
 #define ATK_CLASS_DESC_SZ  74          // 70 by the grammar, + NUL + slack
-#define ATK_CLASSES_MAX    40          // registry slots
+// The registry has no cap: the sheet directory is operator-controlled and
+// lives outside the build, so the number of sheets is not a build-time
+// fact. This is the quantum one growth step adds, nothing more.
+#define ATK_CLASSES_GROW   16          // registry slots one growth adds
 #define ATK_MOVES_MAX     128          // per section, the hard array bound
 #define ATK_MOVE_GROW      32          // moves one mem_realloc adds
 #define ATK_SHEET_SZ    (128 * 1024)   // one sheet, read whole
@@ -710,9 +713,14 @@ typedef struct
 {
   uint32_t accepted;
   uint32_t rejected;
-  uint32_t n_bad;                                    // names actually kept
-  char     bad[ATK_CLASSES_MAX][ATK_SHEET_FILE_SZ];
+  uint32_t n_bad;                              // names in `bad`
+  uint32_t cap_bad;                            // rows `bad` has room for
+  char   (*bad)[ATK_SHEET_FILE_SZ];            // grown by the scan, or NULL
 } atk_load_report_t;
+
+// Release a report's rejected-file list. Every caller that passed a report
+// to atk_class_load() owes this call, and it is safe on a zeroed one.
+void atk_report_free(atk_load_report_t *rep);
 
 // Re-scan the sheet directory and swap in a whole new registry. The scan
 // and the parse happen OUTSIDE the registry lock; only the pointer swap
@@ -738,16 +746,24 @@ bool atk_class_pick(char *out, size_t cap);
 //
 // It is bounded by the registry it filters rather than by the roster: a
 // round can hold any number of combatants, but never more distinct classes
-// than there are sheets to deal.
+// than there are sheets to deal. atk_dealt_init() takes that bound off the
+// live registry, so the set is exactly as big as the thing it constrains.
 typedef struct
 {
   uint32_t n;
-  char     type[ATK_CLASSES_MAX][ATK_CLASS_NAME_SZ];
+  uint32_t cap;                                // == the registry count
+  char   (*type)[ATK_CLASS_NAME_SZ];           // cap rows, or NULL at cap 0
 } atk_dealt_t;
 
+// Size an empty set against the live registry. Pairs with atk_dealt_free();
+// atk_db_classes_dealt() calls it for you, and is how a turn gets one.
+void atk_dealt_init(atk_dealt_t *dealt);
+void atk_dealt_free(atk_dealt_t *dealt);
+
 // Record `type` as taken — idempotent, and a no-op once the set is full.
-// The overflow can only ever under-constrain the next deal, which costs a
-// duplicate and never a wrong class.
+// Full means the round already holds one of every sheet, so the overflow
+// can only ever under-constrain the next deal: it costs a duplicate, which
+// the deal was about to hand out anyway, and never a wrong class.
 void atk_dealt_add(atk_dealt_t *dealt, const char *type);
 
 // Deal a class no one in this round already holds, and record it in
@@ -788,8 +804,12 @@ bool atk_class_move(const char *type, atk_section_t sec,
 // predicate, not SUCCESS/FAIL: true means yes.
 bool atk_class_has(const char *type, atk_section_t sec);
 
-// Copy the registry into `out`, alphabetical. Returns rows written.
-uint32_t atk_class_list(atk_class_info_t *out, uint32_t cap);
+// The whole registry, alphabetical, in an array the caller must mem_free().
+// Writes the row count to `*n` and returns NULL only when nothing is
+// loaded. Allocated for the caller rather than filled into a buffer they
+// sized: only the lock knows how many classes there are, and a count read
+// before the lock is a truncation waiting for the next sheet.
+atk_class_info_t *atk_class_list(uint32_t *n);
 
 // Expand {attacker} {target} {damage} {heal} {affliction} in `tmpl`.
 // A NULL substitution is a token the loader guaranteed absent from this
@@ -868,6 +888,10 @@ bool atk_db_player_get(int64_t round_id, const char *username,
 // Every class already dealt in this round, into `out`. Returns the number
 // written. A round nobody has enrolled in yet answers zero, which is the
 // correct empty set and not an error.
+//
+// It calls atk_dealt_init() on `out` for you, so `out` need not be
+// initialised — and the caller owes an atk_dealt_free() whatever the
+// return value was.
 uint32_t atk_db_classes_dealt(int64_t round_id, atk_dealt_t *out);
 
 // Bot combatants owed a swing in a round that is still active. Writes at

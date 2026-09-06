@@ -13,6 +13,7 @@
 #define ATTACK_INTERNAL
 #include "attack.h"
 
+#include "alloc.h"
 #include "colors.h"
 #include "display.h"
 #include "util.h"
@@ -815,33 +816,30 @@ atk_classes_row(const cmd_ctx_t *ctx, const atk_class_info_t *info)
 static void
 atk_show_classes(const cmd_ctx_t *ctx)
 {
-  atk_tunables_t   t;
-  atk_class_info_t info[ATK_CLASSES_MAX];
-  char             line[ATK_LINE_SZ];
-  char             rule[ATK_LINE_SZ];
-  uint32_t         n;
-  uint32_t         i;
+  atk_tunables_t    t;
+  atk_class_info_t *info;
+  char              line[ATK_LINE_SZ];
+  char              rule[ATK_LINE_SZ];
+  uint32_t          n;
+  uint32_t          i;
 
   atk_tunables_load(&t);
-  n = atk_class_list(info, ATK_CLASSES_MAX);
+  info = atk_class_list(&n);
 
-  if(n == 0)
+  if(info == NULL)
   {
     cmd_reply(ctx, "☠ No character classes are loaded.");
     return;
   }
 
-  // The registry is ATK_CLASSES_MAX slots and the cap is hard: atk_scan_dir
-  // stops at it, so a sheet past the last slot is never parsed and its
-  // class can never be dealt. The only account of that today is one
-  // CLAM_WARN, and nobody reading this roster is reading the log — so the
-  // occupancy rides in the header, and goes yellow once the next sheet
-  // dropped in that directory would be the one nobody sees.
+  // A plain count, because there is nothing to count it against: the
+  // registry grows with the directory, so every sheet an operator drops
+  // in there is one the pit can deal. The occupancy fraction and its
+  // yellow at-cap warning went out with the cap they described.
   snprintf(line, sizeof(line),
-      "🎭 " CLR_BOLD "ATTACK — CHARACTER CLASSES" CLR_RESET "  %s%u/%d slots"
-      CLR_RESET CLR_GRAY "  (%s)" CLR_RESET,
-      n >= ATK_CLASSES_MAX ? CLR_YELLOW : CLR_GRAY,
-      n, ATK_CLASSES_MAX, t.classes_path);
+      "🎭 " CLR_BOLD "ATTACK — CHARACTER CLASSES" CLR_RESET
+      CLR_GRAY "  %u loaded  (%s)" CLR_RESET,
+      n, t.classes_path);
   cmd_reply(ctx, line);
 
   atk_rule(rule, sizeof(rule), ATK_W_CLASSES);
@@ -860,6 +858,8 @@ atk_show_classes(const cmd_ctx_t *ctx)
   cmd_reply(ctx, CLR_GRAY
       "  every class rolls the same numbers; a sheet supplies only the "
       "words." CLR_RESET);
+
+  mem_free(info);
 }
 
 // ------------------------------------------------------------------ //

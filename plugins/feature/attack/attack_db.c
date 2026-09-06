@@ -625,7 +625,8 @@ atk_db_classes_dealt(int64_t round_id, atk_dealt_t *out)
   if(out == NULL)
     return(0);
 
-  memset(out, 0, sizeof(*out));
+  // Sizes the set against the live registry; the caller frees it.
+  atk_dealt_init(out);
 
   if(round_id <= 0 || atk_tables_resolve(&t) != SUCCESS)
     return(0);
@@ -635,8 +636,8 @@ atk_db_classes_dealt(int64_t round_id, atk_dealt_t *out)
   // reloads, and the names beyond it are ones no deal could draw anyway.
   snprintf(sql, sizeof(sql),
       "SELECT DISTINCT class FROM %s"
-      " WHERE round_id = %" PRId64 " AND class <> '' LIMIT %d",
-      t.players, round_id, ATK_CLASSES_MAX);
+      " WHERE round_id = %" PRId64 " AND class <> '' LIMIT %" PRIu32,
+      t.players, round_id, out->cap);
 
   res = db_result_alloc();
 

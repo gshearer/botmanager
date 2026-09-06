@@ -369,6 +369,37 @@ atk_enrol(int64_t round_id, uint32_t ns_id, const char *username,
   return(atk_db_player_get(round_id, username, out));
 }
 
+// Both sides of one turn, and the whole life of the round's dealt-class
+// set. That set is sized against the live registry, so it is heap — and
+// scoping it here is what keeps that honest: a turn has half a dozen ways
+// to leave atk_cmd_attack() and nothing past enrolment has any use for
+// the set, so it is born, read, grown by two deals and gone, on one path,
+// with one free.
+//
+// The caller must hold atk_turn_lock: it is the only thing serialising
+// the read of the pool against the writes that grow it.
+static bool
+atk_enrol_pair(int64_t round_id, uint32_t ns_id, int32_t hp,
+    const char *src_user, const char *src_nick, const char *src_bot,
+    atk_player_t *src,
+    const char *tgt_user, const char *tgt_nick, const char *tgt_bot,
+    atk_player_t *tgt)
+{
+  atk_dealt_t dealt;
+  bool        ok;
+
+  atk_db_classes_dealt(round_id, &dealt);
+
+  ok = atk_enrol(round_id, ns_id, src_user, src_nick, hp, src_bot,
+            &dealt, src) &&
+       atk_enrol(round_id, ns_id, tgt_user, tgt_nick, hp, tgt_bot,
+            &dealt, tgt);
+
+  atk_dealt_free(&dealt);
+
+  return(ok);
+}
+
 // ------------------------------------------------------------------ //
 // attack <nick>                                                       //
 // ------------------------------------------------------------------ //
@@ -487,9 +518,6 @@ atk_cmd_attack(const cmd_ctx_t *ctx)
   // run after the lock is released and after every death line has gone.
   atk_victim_t    victim[ATK_MAX_PLAYERS];
   uint32_t        n_victim = 0;
-  // The classes this round has already handed out. Loaded once at
-  // enrolment and grown by each deal, so no two combatants share a sheet.
-  atk_dealt_t     dealt;
   userns_t       *ns;
   const char     *nick;
   const char     *method;
@@ -632,12 +660,9 @@ atk_cmd_attack(const cmd_ctx_t *ctx)
   // carries no unique index, because uniqueness has to be able to yield
   // when the registry runs dry (attack_class.c, atk_class_deal()).
 
-  atk_db_classes_dealt(round.id, &dealt);
-
-  if(!atk_enrol(round.id, ns->id, ctx->username, src_nick,
-         (int32_t)t.start_hp, src_bot, &dealt, &src) ||
-     !atk_enrol(round.id, ns->id, tgt_user, nick,
-         (int32_t)t.start_hp, tgt_bot, &dealt, &tgt))
+  if(!atk_enrol_pair(round.id, ns->id, (int32_t)t.start_hp,
+        ctx->username, src_nick, src_bot, &src,
+        tgt_user,      nick,     tgt_bot, &tgt))
   {
     pthread_mutex_unlock(&atk_turn_lock);
     cmd_reply(ctx, "☠ The pit will not answer — the roster is unreadable.");
@@ -1453,6 +1478,8 @@ atk_cmd_reload(const cmd_ctx_t *ctx)
         rep.bad[i]);
     cmd_reply(ctx, line);
   }
+
+  atk_report_free(&rep);
 }
 
 // CMD_ARG_NONE, not CMD_ARG_ALNUM: an IRC nickname legally contains

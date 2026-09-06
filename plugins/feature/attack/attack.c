@@ -239,6 +239,7 @@ atk_start(void)
   atk_class_load(&rep);
   clam(CLAM_INFO, ATK_CTX, "%u character class(es) loaded, %u rejected",
       rep.accepted, rep.rejected);
+  atk_report_free(&rep);
 
   // Afflictions outlive the mapping that was ticking them, and the task
   // does not. Never a bare atk_dot_wake() here: a periodic's first

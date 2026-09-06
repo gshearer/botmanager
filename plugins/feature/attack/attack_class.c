@@ -526,11 +526,27 @@ static const atk_builtin_move_t atk_brawler[] = {
 // and atk_class_lock is NEVER held across file I/O. A load builds a
 // whole new registry outside the lock, swaps it in under the lock, and
 // frees the old one afterwards.
-static atk_class_t     *atk_classes[ATK_CLASSES_MAX];
+// The array is heap and grows with the directory: the sheets live outside
+// the build and an operator may install as many as they like, so a fixed
+// bound here would be a rebuild standing between them and their 41st class.
+static atk_class_t    **atk_classes;
 static uint32_t         atk_class_n;
 static pthread_mutex_t  atk_class_lock = PTHREAD_MUTEX_INITIALIZER;
 
 static void atk_class_destroy(atk_class_t *);
+
+// One growth step for any of this file's open-ended arrays. The allocator
+// is strict — it aborts rather than returning NULL, and mem_realloc will
+// not take one — so the only branch here is first-time versus grow.
+static void *
+atk_grow(void *base, uint32_t *cap, size_t elem, const char *name)
+{
+  *cap = (*cap == 0) ? ATK_CLASSES_GROW : *cap * 2;
+
+  return((base == NULL)
+      ? mem_alloc(ATK_CTX, name, (size_t)*cap * elem)
+      : mem_realloc(base, (size_t)*cap * elem));
+}
 
 // ------------------------------------------------------------------ //
 // Text helpers                                                        //
@@ -1288,17 +1304,33 @@ atk_report_bad(atk_load_report_t *rep, const char *file)
 {
   rep->rejected++;
 
-  if(rep->n_bad < ATK_CLASSES_MAX)
-  {
-    strlcpy(rep->bad[rep->n_bad], file, sizeof(rep->bad[rep->n_bad]));
-    rep->n_bad++;
-  }
+  if(rep->n_bad == rep->cap_bad)
+    rep->bad = atk_grow(rep->bad, &rep->cap_bad, sizeof(rep->bad[0]),
+        "rejected");
+
+  strlcpy(rep->bad[rep->n_bad], file, sizeof(rep->bad[0]));
+  rep->n_bad++;
+}
+
+void
+atk_report_free(atk_load_report_t *rep)
+{
+  if(rep == NULL || rep->bad == NULL)
+    return;
+
+  mem_free(rep->bad);
+  rep->bad     = NULL;
+  rep->cap_bad = 0;
+  rep->n_bad   = 0;
 }
 
 // Build a whole new registry from `dir`. Runs entirely outside
 // atk_class_lock: nothing here may touch the live registry.
+//
+// `*out` starts NULL and comes back holding `*cap` slots of which the
+// return value are filled; the caller frees it either way.
 static uint32_t
-atk_scan_dir(const char *dir, atk_class_t **out, uint32_t cap,
+atk_scan_dir(const char *dir, atk_class_t ***out, uint32_t *cap,
     atk_load_report_t *rep)
 {
   DIR           *d;
@@ -1324,18 +1356,6 @@ atk_scan_dir(const char *dir, atk_class_t **out, uint32_t cap,
 
     if(len < ATK_STEM_MIN || strcmp(file + len - 4, ".txt") != 0)
       continue;
-
-    // The registry is full. Say so, and say it once: a sheet silently
-    // never looked at is a class nobody can be dealt, and this is the
-    // one path in the loader that would otherwise refuse without a
-    // reason.
-    if(n >= cap)
-    {
-      clam(CLAM_WARN, ATK_CTX,
-          "'%s' and any sheet after it were not read — the registry holds "
-          "at most %u classes", file, cap);
-      break;
-    }
 
     if(len - 4 > ATK_CLASS_NAME_SZ - 1)
     {
@@ -1393,7 +1413,10 @@ atk_scan_dir(const char *dir, atk_class_t **out, uint32_t cap,
             c->type, spoken);
     }
 
-    out[n++] = c;
+    if(n == *cap)
+      *out = atk_grow(*out, cap, sizeof(**out), "registry");
+
+    (*out)[n++] = c;
     rep->accepted++;
   }
 
@@ -1407,8 +1430,9 @@ atk_class_load(atk_load_report_t *rep)
 {
   atk_tunables_t    t;
   atk_load_report_t local;
-  atk_class_t      *fresh[ATK_CLASSES_MAX];
-  atk_class_t      *old  [ATK_CLASSES_MAX];
+  atk_class_t     **fresh     = NULL;
+  atk_class_t     **old       = NULL;
+  uint32_t          cap_fresh = 0;
   uint32_t          n_fresh;
   uint32_t          n_old;
   uint32_t          i;
@@ -1417,10 +1441,9 @@ atk_class_load(atk_load_report_t *rep)
     rep = &local;
 
   memset(rep, 0, sizeof(*rep));
-  memset(fresh, 0, sizeof(fresh));
 
   atk_tunables_load(&t);
-  n_fresh = atk_scan_dir(t.classes_path, fresh, ATK_CLASSES_MAX, rep);
+  n_fresh = atk_scan_dir(t.classes_path, &fresh, &cap_fresh, rep);
 
   // D7 — there is always a class. A daemon where the sheets were never
   // deployed still has a pit that speaks.
@@ -1429,6 +1452,9 @@ atk_class_load(atk_load_report_t *rep)
     clam(CLAM_WARN, ATK_CTX,
         "no character sheets in '%s' — falling back to the built-in "
         "brawler", t.classes_path);
+
+    if(cap_fresh == 0)
+      fresh = atk_grow(fresh, &cap_fresh, sizeof(*fresh), "registry");
 
     fresh[0] = atk_brawler_build();
     n_fresh  = 1;
@@ -1440,10 +1466,10 @@ atk_class_load(atk_load_report_t *rep)
   // atk_class_lock held.
   pthread_mutex_lock(&atk_class_lock);
 
-  memcpy(old, atk_classes, sizeof(old));
+  old   = atk_classes;
   n_old = atk_class_n;
 
-  memcpy(atk_classes, fresh, sizeof(atk_classes));
+  atk_classes = fresh;
   atk_class_n = n_fresh;
 
   pthread_mutex_unlock(&atk_class_lock);
@@ -1451,28 +1477,39 @@ atk_class_load(atk_load_report_t *rep)
   for(i = 0; i < n_old; i++)
     atk_class_destroy(old[i]);
 
+  // NULL on the very first load, and mem_free(NULL) aborts.
+  if(old != NULL)
+    mem_free(old);
+
+  // A caller who wanted no report still made one, and it owns memory.
+  if(rep == &local)
+    atk_report_free(rep);
+
   return(n_fresh);
 }
 
 void
 atk_class_free(void)
 {
-  atk_class_t *old[ATK_CLASSES_MAX];
-  uint32_t     n;
-  uint32_t     i;
+  atk_class_t **old;
+  uint32_t      n;
+  uint32_t      i;
 
   pthread_mutex_lock(&atk_class_lock);
 
-  memcpy(old, atk_classes, sizeof(old));
-  n = atk_class_n;
+  old = atk_classes;
+  n   = atk_class_n;
 
-  memset(atk_classes, 0, sizeof(atk_classes));
+  atk_classes = NULL;
   atk_class_n = 0;
 
   pthread_mutex_unlock(&atk_class_lock);
 
   for(i = 0; i < n; i++)
     atk_class_destroy(old[i]);
+
+  if(old != NULL)
+    mem_free(old);
 }
 
 // ------------------------------------------------------------------ //
@@ -1551,13 +1588,47 @@ atk_dealt_holds(const atk_dealt_t *dealt, const char *type)
   return(false);
 }
 
+// The set is sized once, here, and never grows: its whole job is to name
+// classes the registry could still deal, and there are exactly
+// atk_class_n of those. A round carrying more distinct stems than that has
+// outlived a sheet reload, and the surplus names are ones no deal could
+// draw anyway.
+void
+atk_dealt_init(atk_dealt_t *dealt)
+{
+  if(dealt == NULL)
+    return;
+
+  memset(dealt, 0, sizeof(*dealt));
+
+  pthread_mutex_lock(&atk_class_lock);
+  dealt->cap = atk_class_n;
+  pthread_mutex_unlock(&atk_class_lock);
+
+  if(dealt->cap > 0)
+    dealt->type = mem_alloc(ATK_CTX, "dealt",
+        (size_t)dealt->cap * sizeof(dealt->type[0]));
+}
+
+void
+atk_dealt_free(atk_dealt_t *dealt)
+{
+  if(dealt == NULL || dealt->type == NULL)
+    return;
+
+  mem_free(dealt->type);
+  dealt->type = NULL;
+  dealt->cap  = 0;
+  dealt->n    = 0;
+}
+
 void
 atk_dealt_add(atk_dealt_t *dealt, const char *type)
 {
   if(dealt == NULL || type == NULL || type[0] == '\0')
     return;
 
-  if(dealt->n >= ATK_CLASSES_MAX || atk_dealt_holds(dealt, type))
+  if(dealt->n >= dealt->cap || atk_dealt_holds(dealt, type))
     return;
 
   snprintf(dealt->type[dealt->n], sizeof(dealt->type[0]), "%s", type);
@@ -1567,10 +1638,10 @@ atk_dealt_add(atk_dealt_t *dealt, const char *type)
 void
 atk_class_deal(atk_dealt_t *dealt, char *out, size_t cap)
 {
-  uint32_t free_ix[ATK_CLASSES_MAX];    // registry slots nobody holds yet
-  uint32_t n_free = 0;
-  uint32_t i;
-  bool     crowded = false;
+  const char *pick   = NULL;
+  uint32_t    n_free = 0;
+  uint32_t    i;
+  bool        crowded = false;
 
   if(out == NULL || cap == 0)
     return;
@@ -1581,9 +1652,16 @@ atk_class_deal(atk_dealt_t *dealt, char *out, size_t cap)
 
   if(atk_class_n > 0)
   {
+    // Reservoir sampling: the k'th class nobody holds replaces the
+    // standing pick with probability 1/k, which leaves every free class
+    // equally likely after one pass. The list of free slots it replaces
+    // was the last thing in this plugin sized by a compile-time cap, and
+    // materialising it bought nothing — this walks the same registry
+    // once and allocates nothing on a turn.
     for(i = 0; i < atk_class_n; i++)
-      if(!atk_dealt_holds(dealt, atk_classes[i]->type))
-        free_ix[n_free++] = i;
+      if(!atk_dealt_holds(dealt, atk_classes[i]->type) &&
+         util_rand((int)++n_free) == 0)
+        pick = atk_classes[i]->type;
 
     // Out of sheets: the pit speaking beats the pit being unique, so the
     // draw widens back to the whole registry rather than refusing. It is
@@ -1591,8 +1669,7 @@ atk_class_deal(atk_dealt_t *dealt, char *out, size_t cap)
     crowded = (n_free == 0);
 
     snprintf(out, cap, "%s", crowded
-        ? atk_classes[util_rand((int)atk_class_n)]->type
-        : atk_classes[free_ix[util_rand((int)n_free)]]->type);
+        ? atk_classes[util_rand((int)atk_class_n)]->type : pick);
   }
 
   pthread_mutex_unlock(&atk_class_lock);
@@ -1697,23 +1774,40 @@ atk_class_has(const char *type, atk_section_t sec)
   return(has);
 }
 
-uint32_t
-atk_class_list(atk_class_info_t *out, uint32_t cap)
+atk_class_info_t *
+atk_class_list(uint32_t *n_out)
 {
-  uint32_t n = 0;
-  uint32_t i;
+  atk_class_info_t *out;
+  uint32_t          n = 0;
+  uint32_t          i;
 
-  if(out == NULL || cap == 0)
-    return(0);
+  if(n_out == NULL)
+    return(NULL);
+
+  *n_out = 0;
 
   pthread_mutex_lock(&atk_class_lock);
 
-  for(i = 0; i < atk_class_n && n < cap; i++)
+  if(atk_class_n == 0)
+  {
+    pthread_mutex_unlock(&atk_class_lock);
+    return(NULL);
+  }
+
+  // Allocated with the lock held, which is the one place the size is
+  // knowable: a count read before taking it is a truncation waiting for
+  // the next sheet, and that truncation is what this whole change
+  // removed. Nothing is ever locked under the allocator, so the order is
+  // safe, and this is a /show path rather than a turn.
+  out = mem_alloc(ATK_CTX, "classlist",
+      (size_t)atk_class_n * sizeof(*out));
+
+  for(i = 0; i < atk_class_n; i++)
   {
     const atk_class_t *c = atk_classes[i];
     uint32_t           k = n;
 
-    // Insertion sort on the way out: the registry is at most 32 entries
+    // Insertion sort on the way out: the registry is a few dozen entries
     // and the view wants them alphabetical.
     while(k > 0 && strcmp(out[k - 1].type, c->type) > 0)
     {
@@ -1731,5 +1825,7 @@ atk_class_list(atk_class_info_t *out, uint32_t cap)
 
   pthread_mutex_unlock(&atk_class_lock);
 
-  return(n);
+  *n_out = n;
+
+  return(out);
 }
